@@ -3,109 +3,21 @@
 #endif
 #include "error_reporter.h"
 #include "../common.h"
+#include "diag_style.h"
 #include <errno.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#include <io.h>
-#include <windows.h>
-#ifndef isatty
-#define isatty _isatty
-#endif
-#ifndef fileno
-#define fileno _fileno
-#endif
-#else
-#include <unistd.h>
-#endif
-
 #define INITIAL_ERROR_CAPACITY 16
 #define MAX_ERRORS_DEFAULT 100
-#define ANSI_COLOR_RED "\x1b[31m"
-#define ANSI_COLOR_YELLOW "\x1b[33m"
-#define ANSI_COLOR_BLUE "\x1b[34m"
-#define ANSI_COLOR_CYAN "\x1b[36m"
-#define ANSI_COLOR_RESET "\x1b[0m"
-#define ANSI_BOLD "\x1b[1m"
-
 /* Maximum source-line width in the snippet before truncation with "..." */
 #define SNIPPET_MAX_COLS 120
 
 /* All diagnostic output goes to stderr so it doesn't pollute stdout pipelines */
 #define DIAG_STREAM stderr
-
-#ifdef _WIN32
-/* Enable VT sequences on Windows once per process */
-static void error_reporter_enable_vt_windows(void) {
-  static int done = 0;
-  if (done)
-    return;
-  done = 1;
-  HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
-  if (h == INVALID_HANDLE_VALUE)
-    return;
-  DWORD mode = 0;
-  if (!GetConsoleMode(h, &mode))
-    return;
-  SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-}
-#endif
-
-static int error_reporter_should_use_color(void) {
-  static int cached = -1;
-  if (cached >= 0) return cached;
-
-  /* CLICOLOR_FORCE=1 overrides everything (force color even when not a tty) */
-  const char *force = getenv("CLICOLOR_FORCE");
-  if (force && force[0] != '\0' && strcmp(force, "0") != 0) {
-#ifdef _WIN32
-    error_reporter_enable_vt_windows();
-#endif
-    cached = 1;
-    return cached;
-  }
-
-  /* NO_COLOR disables color (https://no-color.org/) */
-  const char *no_color = getenv("NO_COLOR");
-  if (no_color && no_color[0] != '\0') {
-    cached = 0;
-    return cached;
-  }
-
-  /* TERM=dumb - no sequences */
-  const char *term = getenv("TERM");
-  if (term && strcmp(term, "dumb") == 0) {
-    cached = 0;
-    return cached;
-  }
-
-  /* CLICOLOR=0 disables even when tty */
-  const char *clicolor = getenv("CLICOLOR");
-  if (clicolor && strcmp(clicolor, "0") == 0) {
-    cached = 0;
-    return cached;
-  }
-
-  /* Only color when stderr is a tty */
-  int fd = fileno(DIAG_STREAM);
-  if (fd < 0) {
-    cached = 0;
-    return cached;
-  }
-  if (!isatty(fd)) {
-    cached = 0;
-    return cached;
-  }
-
-#ifdef _WIN32
-  error_reporter_enable_vt_windows();
-#endif
-  cached = 1;
-  return cached;
-}
 
 /* The code a diagnostic reports under: its own, when an analysis stamped a
    finer one (the memory/range checks' M0101..M0119), otherwise its type's. */
@@ -695,6 +607,300 @@ void error_reporter_add_warning_span_suggestion(ErrorReporter *reporter,
                             message, suggestion);
 }
 
+/* ---- rendering -----------------------------------------------------------
+ * A diagnostic is drawn as a titled rule, the message, then a source table
+ * framed by rules that cross the line-number gutter:
+ *
+ *   -- error[E0004] ------------------------------------------------
+ *     Type mismatch: expected 'int64', found 'string'
+ *
+ *     ----+----------------------------------------------------------
+ *         |  badtype.mettle:9:24
+ *     ----+----------------------------------------------------------
+ *       8 |  var s: string = "hello";
+ *       9 |  var n: int64 = add(s, 2);
+ *         :                     ^ parameter 'a' expects 'int64', ...
+ *      10 |  println("{n}");
+ *     ----+----------------------------------------------------------
+ *
+ *     help  drop the quotes: a numeric literal is 42, not "42"
+ *
+ * Notes attached to a diagnostic share the frame, each behind its own crossing
+ * rule, so one error reads as one object rather than three stacked blocks. The
+ * glyphs above are the ASCII fallback; a UTF-8 terminal gets box characters.
+ */
+
+static char *snippet_truncate(const char *line);
+
+#define DIAG_MARGIN 2
+#define DIAG_TAB_WIDTH 4
+#define DIAG_GUTTER_MIN 3
+/* Room for the tab-expanded copy of a source line. */
+#define DIAG_LINE_BUFFER (SNIPPET_MAX_COLS * DIAG_TAB_WIDTH + 8)
+
+/* Append to a fixed buffer, saturating at its end rather than running off it. */
+static size_t diag_append(char *buf, size_t cap, size_t at, const char *fmt,
+                          ...) {
+  if (at + 1 >= cap) {
+    return at;
+  }
+  va_list args;
+  va_start(args, fmt);
+  int written = vsnprintf(buf + at, cap - at, fmt, args);
+  va_end(args);
+  if (written < 0) {
+    return at;
+  }
+  at += (size_t)written;
+  return (at + 1 >= cap) ? cap - 1 : at;
+}
+
+static const char *error_severity_sgr(ErrorSeverity severity) {
+  switch (severity) {
+  case DIAG_SEVERITY_ERROR:
+    return diag_sgr_error();
+  case DIAG_SEVERITY_WARNING:
+    return diag_sgr_warning();
+  default:
+    return diag_sgr_note();
+  }
+}
+
+static const char *error_severity_text(ErrorSeverity severity) {
+  switch (severity) {
+  case DIAG_SEVERITY_ERROR:
+    return "error";
+  case DIAG_SEVERITY_WARNING:
+    return "warning";
+  case DIAG_SEVERITY_NOTE:
+  case DIAG_SEVERITY_NOTE_OF:
+    return "note";
+  default:
+    return "unknown";
+  }
+}
+
+/* Indent of the gutter's vertical bar, and the column source text starts in. */
+static void diag_gutter_lead(FILE *out, size_t gutter) {
+  for (size_t i = 0; i < DIAG_MARGIN + gutter + 1; i++) {
+    fputc(' ', out);
+  }
+}
+
+/* "  12 |  <source>" */
+static void diag_row_source(FILE *out, size_t gutter, size_t line,
+                            const char *text) {
+  const DiagGlyphs *g = diag_glyphs();
+  fprintf(out, "%*s%s%*zu %s%s  ", DIAG_MARGIN, "", diag_sgr_dim(),
+          (int)gutter, line, g->v, diag_sgr_reset());
+  diag_write_source(out, text ? text : "");
+  fputc('\n', out);
+}
+
+/* "     |  <text>" -- a caption row inside the frame. */
+static void diag_row_text(FILE *out, size_t gutter, const char *text) {
+  const DiagGlyphs *g = diag_glyphs();
+  diag_gutter_lead(out, gutter);
+  fprintf(out, "%s%s%s  %s\n", diag_sgr_dim(), g->v, diag_sgr_reset(),
+          text ? text : "");
+}
+
+/* "     :        ^^^ label" -- the caret row under a source row. */
+static void diag_row_caret(FILE *out, size_t gutter, const char *caret,
+                           const char *label, const char *sgr) {
+  const DiagGlyphs *g = diag_glyphs();
+  diag_gutter_lead(out, gutter);
+  fprintf(out, "%s%s%s  %s%s", diag_sgr_dim(), g->dotted, diag_sgr_reset(), sgr,
+          caret);
+  if (label && label[0]) {
+    fprintf(out, " %s", label);
+  }
+  fprintf(out, "%s\n", diag_sgr_reset());
+}
+
+static size_t error_report_max_line(const ErrorReport *e) {
+  /* The frame quotes one line of trailing context for a report with a
+     snippet. */
+  return e->code_snippet ? e->location.line + 1 : e->location.line;
+}
+
+/* One report's rows inside the shared frame: an optional caption, the quoted
+   source with its neighbours, and the caret. */
+static void diag_render_section(ErrorReporter *reporter, const ErrorReport *e,
+                                size_t gutter, int with_context,
+                                const char *primary_file) {
+  FILE *out = DIAG_STREAM;
+  const char *sev_sgr = error_severity_sgr(e->severity);
+  const char *filename = e->filename ? e->filename : reporter->filename;
+
+  /* A note names itself and, when it points somewhere else, says where. */
+  if (e->severity == DIAG_SEVERITY_NOTE ||
+      e->severity == DIAG_SEVERITY_NOTE_OF) {
+    char caption[1024];
+    size_t at = 0;
+    at = diag_append(caption, sizeof(caption), at, "%snote%s  %s", sev_sgr,
+                     diag_sgr_reset(), e->message ? e->message : "");
+    if (filename && (!primary_file || strcmp(filename, primary_file) != 0)) {
+      at = diag_append(caption, sizeof(caption), at, "  %s%s:%zu:%zu%s",
+                       diag_sgr_dim(), filename, e->location.line,
+                       e->location.column, diag_sgr_reset());
+    } else if (!e->code_snippet) {
+      diag_append(caption, sizeof(caption), at, "  %sline %zu%s",
+                  diag_sgr_dim(), e->location.line, diag_sgr_reset());
+    }
+    diag_row_text(out, gutter, caption);
+  }
+
+  if (!e->code_snippet) {
+    return;
+  }
+
+  const char *source_code = e->source_code ? e->source_code
+                                           : reporter->source_code;
+  const size_t line = e->location.line;
+
+  char *prev = NULL;
+  char *next = NULL;
+  if (with_context) {
+    char *prev_raw = (line > 1) ? error_reporter_get_line_from_source(
+                                      source_code, line - 1)
+                                : NULL;
+    char *next_raw = error_reporter_get_line_from_source(source_code, line + 1);
+    prev = snippet_truncate(prev_raw);
+    next = snippet_truncate(next_raw);
+    free(prev_raw);
+    free(next_raw);
+  }
+  char *snippet = snippet_truncate(e->code_snippet);
+
+  char expanded[DIAG_LINE_BUFFER];
+  if (prev) {
+    diag_expand_tabs(prev, expanded, sizeof(expanded), DIAG_TAB_WIDTH);
+    diag_row_source(out, gutter, line - 1, expanded);
+  }
+
+  diag_expand_tabs(snippet ? snippet : "", expanded, sizeof(expanded),
+                   DIAG_TAB_WIDTH);
+  diag_row_source(out, gutter, line, expanded);
+
+  size_t caret_len = (e->span.length > 0) ? e->span.length : 1;
+  size_t caret_column = e->location.column;
+  /* Clamp the caret to the snippet, which was truncated at SNIPPET_MAX_COLS.
+   * A column past that point used to underflow `SNIPPET_MAX_COLS - lead`
+   * into a length near SIZE_MAX, which wrapped the caret line's size back
+   * down to something small and left the leading-spaces loop writing past
+   * it. An error 149 columns into a long line was enough. */
+  if (caret_column > SNIPPET_MAX_COLS) {
+    caret_column = SNIPPET_MAX_COLS + 1;
+    caret_len = 1;
+  } else if (caret_column > 0 &&
+             caret_column - 1 + caret_len > SNIPPET_MAX_COLS) {
+    caret_len = SNIPPET_MAX_COLS - (caret_column - 1);
+  }
+  /* Point at the character the reader sees, not the byte offset: a line
+     indented with tabs puts them a tab stop apart on screen. */
+  caret_column = diag_expanded_column(snippet ? snippet : "", caret_column,
+                                      DIAG_TAB_WIDTH);
+
+  char *caret_line = error_reporter_create_caret_line(caret_column, caret_len);
+  if (caret_line) {
+    diag_row_caret(out, gutter, caret_line, e->span_label, sev_sgr);
+    free(caret_line);
+  }
+
+  if (next) {
+    diag_expand_tabs(next, expanded, sizeof(expanded), DIAG_TAB_WIDTH);
+    diag_row_source(out, gutter, line + 1, expanded);
+  }
+
+  free(prev);
+  free(snippet);
+  free(next);
+}
+
+/* Draw one diagnostic and the notes that belong to it as a single frame. */
+static void diag_render_group(ErrorReporter *reporter, const ErrorReport *e,
+                              const ErrorReport *const *notes,
+                              size_t note_count) {
+  FILE *out = DIAG_STREAM;
+  const DiagGlyphs *g = diag_glyphs();
+  const char *sev_sgr = error_severity_sgr(e->severity);
+  const char *reset = diag_sgr_reset();
+  const char *filename = e->filename ? e->filename : reporter->filename;
+
+  /* The rule names the place. Keeping it file:line:col makes it the one line
+     a terminal or an editor can turn into a jump. */
+  char where[1024];
+  if (filename) {
+    snprintf(where, sizeof(where), "%s%s%s%s:%zu:%zu%s", diag_sgr_bold(),
+             filename, reset, diag_sgr_dim(), e->location.line,
+             e->location.column, reset);
+  } else {
+    snprintf(where, sizeof(where), "%sline %zu, column %zu%s", diag_sgr_dim(),
+             e->location.line, e->location.column, reset);
+  }
+  diag_rule(out, 0, where, "");
+
+  /* "error[E0004]: message", hanging-indented so a long message stays in a
+     block instead of running back to column zero. The first line is intact:
+     this is the line tooling greps for. */
+  char lead[128];
+  size_t lead_width;
+  if (e->severity == DIAG_SEVERITY_NOTE ||
+      e->severity == DIAG_SEVERITY_NOTE_OF) {
+    snprintf(lead, sizeof(lead), "%s%s%s: ", sev_sgr,
+             error_severity_text(e->severity), reset);
+    lead_width = strlen(error_severity_text(e->severity)) + 2;
+  } else {
+    snprintf(lead, sizeof(lead), "%s%s%s%s[%s]%s: ", sev_sgr,
+             error_severity_text(e->severity), reset, diag_sgr_dim(),
+             error_report_code(e), reset);
+    lead_width = strlen(error_severity_text(e->severity)) +
+                 strlen(error_report_code(e)) + 4;
+  }
+  diag_wrap(out, lead, lead_width, e->message ? e->message : "", NULL);
+
+  /* Widest line number anywhere in the frame sets the gutter. */
+  size_t max_line = error_report_max_line(e);
+  for (size_t i = 0; i < note_count; i++) {
+    size_t candidate = error_report_max_line(notes[i]);
+    if (candidate > max_line) {
+      max_line = candidate;
+    }
+  }
+  size_t gutter = error_reporter_count_digits(max_line);
+  if (gutter < DIAG_GUTTER_MIN) {
+    gutter = DIAG_GUTTER_MIN;
+  }
+
+  int framed = e->code_snippet != NULL;
+  for (size_t i = 0; !framed && i < note_count; i++) {
+    framed = notes[i]->code_snippet != NULL || notes[i]->message != NULL;
+  }
+  if (framed) {
+    fputc('\n', out);
+    diag_rule_junction(out, DIAG_MARGIN, gutter, g->tee_down);
+    diag_render_section(reporter, e, gutter, 1, filename);
+    for (size_t i = 0; i < note_count; i++) {
+      diag_rule_junction(out, DIAG_MARGIN, gutter, g->tee_cross);
+      diag_render_section(reporter, notes[i], gutter, 0, filename);
+    }
+    diag_rule_junction(out, DIAG_MARGIN, gutter, g->tee_up);
+  }
+
+  const char *help = e->suggestion;
+  for (size_t i = 0; !help && i < note_count; i++) {
+    help = notes[i]->suggestion;
+  }
+  if (help) {
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "%*s%shelp%s: ", DIAG_MARGIN, "",
+             diag_sgr_cyan(), reset);
+    fputc('\n', out);
+    diag_wrap(out, prefix, DIAG_MARGIN + 6, help, NULL);
+  }
+}
+
 void error_reporter_print_errors(ErrorReporter *reporter) {
   if (!reporter)
     return;
@@ -706,45 +912,54 @@ void error_reporter_print_errors(ErrorReporter *reporter) {
 
   for (size_t i = 0; i < reporter->count; i++) {
     const ErrorReport *e = &reporter->errors[i];
-    /* NOTE_OF entries are printed by their parent, skip here */
+    /* NOTE_OF entries are drawn inside their parent's frame, skip here */
     if (e->severity == DIAG_SEVERITY_NOTE_OF)
       continue;
-    error_reporter_print_error(reporter, e);
-    /* Print any immediately-following NOTE_OF entries */
+
+    const ErrorReport *notes[16];
+    size_t note_count = 0;
     for (size_t j = i + 1;
          j < reporter->count &&
-         reporter->errors[j].severity == DIAG_SEVERITY_NOTE_OF;
+         reporter->errors[j].severity == DIAG_SEVERITY_NOTE_OF &&
+         note_count < sizeof(notes) / sizeof(notes[0]);
          j++) {
-      error_reporter_print_error(reporter, &reporter->errors[j]);
+      notes[note_count++] = &reporter->errors[j];
     }
-    if (i < reporter->count - 1) {
-      fprintf(DIAG_STREAM, "\n");
-    }
+
+    diag_render_group(reporter, e, notes, note_count);
+    fprintf(DIAG_STREAM, "\n");
   }
 
   int error_count = error_reporter_get_error_count(reporter);
   if (error_count > 0) {
-    const int use_color = error_reporter_should_use_color();
-    const char *bold_red = use_color ? ANSI_COLOR_RED ANSI_BOLD : "";
-    const char *cyan = use_color ? ANSI_COLOR_CYAN : "";
-    const char *reset = use_color ? ANSI_COLOR_RESET : "";
+    const char *cyan = diag_sgr_cyan();
+    const char *reset = diag_sgr_reset();
     int warning_count = error_reporter_get_warning_count(reporter);
-    fprintf(DIAG_STREAM, "\n%serror%s: could not compile", bold_red, reset);
+    char summary[512];
+    size_t at = 0;
+    at = diag_append(summary, sizeof(summary), at, "could not compile");
     if (reporter->filename)
-      fprintf(DIAG_STREAM, " `%s`", reporter->filename);
-    fprintf(DIAG_STREAM, " due to %d previous error%s", error_count,
-            error_count == 1 ? "" : "s");
+      at = diag_append(summary, sizeof(summary), at, " `%s`",
+                       reporter->filename);
+    at = diag_append(summary, sizeof(summary), at,
+                     " due to %d previous error%s", error_count,
+                     error_count == 1 ? "" : "s");
     if (warning_count > 0)
-      fprintf(DIAG_STREAM, "; %d warning%s emitted", warning_count,
-              warning_count == 1 ? "" : "s");
-    fprintf(DIAG_STREAM, "\n");
+      diag_append(summary, sizeof(summary), at, "; %d warning%s emitted",
+                  warning_count, warning_count == 1 ? "" : "s");
+
+    diag_rule(DIAG_STREAM, 0, NULL, NULL);
+    fprintf(DIAG_STREAM, "%*s%serror%s: %s\n", DIAG_MARGIN, "",
+            diag_sgr_error(), reset, summary);
 
     /* Point at the first error's code for the explain command */
     for (size_t i = 0; i < reporter->count; i++) {
       if (reporter->errors[i].severity == DIAG_SEVERITY_ERROR) {
         fprintf(DIAG_STREAM,
-                "%shelp%s: for more about this error, run `mettle explain %s`\n",
-                cyan, reset, error_report_code(&reporter->errors[i]));
+                "%*s%shelp%s: for more about this error, run `mettle explain "
+                "%s`\n",
+                DIAG_MARGIN, "", cyan, reset,
+                error_report_code(&reporter->errors[i]));
         break;
       }
     }
@@ -776,167 +991,14 @@ static char *snippet_truncate(const char *line) {
   return buf;
 }
 
+/* Draw a single report on its own. The comptime interpreter reports one
+   diagnostic at a time as it runs, so it needs this entry point rather than
+   the whole-reporter drain above. */
 void error_reporter_print_error(ErrorReporter *reporter,
                                 const ErrorReport *error) {
   if (!reporter || !error)
     return;
-
-  const int use_color = error_reporter_should_use_color();
-  const char *severity_color = "";
-  const char *severity_text = "";
-  const char *reset = "";
-  const char *help_color = "";
-
-  switch (error->severity) {
-  case DIAG_SEVERITY_ERROR:
-    severity_color = use_color ? ANSI_COLOR_RED ANSI_BOLD : "";
-    severity_text = "error";
-    break;
-  case DIAG_SEVERITY_WARNING:
-    severity_color = use_color ? ANSI_COLOR_YELLOW ANSI_BOLD : "";
-    severity_text = "warning";
-    break;
-  case DIAG_SEVERITY_NOTE:
-  case DIAG_SEVERITY_NOTE_OF:
-    severity_color = use_color ? ANSI_COLOR_CYAN ANSI_BOLD : "";
-    severity_text = "note";
-    break;
-  default:
-    severity_text = "unknown";
-    break;
-  }
-
-  reset     = use_color ? ANSI_COLOR_RESET : "";
-  help_color = use_color ? ANSI_COLOR_CYAN : "";
-
-  /* Header: "error[E0002]: message" (notes carry no code) */
-  if (error->severity == DIAG_SEVERITY_NOTE ||
-      error->severity == DIAG_SEVERITY_NOTE_OF) {
-    fprintf(DIAG_STREAM, "%s%s%s: %s\n", severity_color, severity_text, reset,
-            error->message);
-  } else {
-    fprintf(DIAG_STREAM, "%s%s[%s]%s: %s\n",
-            severity_color, severity_text,
-            error_report_code(error),
-            reset, error->message);
-  }
-
-  /* Location */
-  if (error->severity == DIAG_SEVERITY_NOTE_OF ||
-      error->severity == DIAG_SEVERITY_NOTE) {
-    /* Notes with a snippet render a compact location+snippet like errors do
-       (below); bare notes just name the location. */
-    const char *filename = error->filename ? error->filename : reporter->filename;
-    if (error->code_snippet) {
-      if (filename) {
-        fprintf(DIAG_STREAM, "  --> %s:%zu:%zu\n", filename,
-                error->location.line, error->location.column);
-      }
-      size_t gutter_width = error_reporter_count_digits(error->location.line);
-      char *snippet = snippet_truncate(error->code_snippet);
-      fprintf(DIAG_STREAM, "%*s |\n", (int)gutter_width, "");
-      fprintf(DIAG_STREAM, "%*zu | %s\n", (int)gutter_width,
-              error->location.line, snippet ? snippet : "");
-      size_t caret_len = (error->span.length > 0) ? error->span.length : 1;
-      char *caret_line =
-          error_reporter_create_caret_line(error->location.column, caret_len);
-      if (caret_line) {
-        fprintf(DIAG_STREAM, "%*s | %s%s%s\n", (int)gutter_width, "",
-                severity_color, caret_line, reset);
-        free(caret_line);
-      }
-      free(snippet);
-    } else if (filename) {
-      fprintf(DIAG_STREAM, "   = %snote%s at %s:%zu:%zu\n",
-              help_color, reset,
-              filename, error->location.line, error->location.column);
-    }
-  } else {
-    const char *filename = error->filename ? error->filename : reporter->filename;
-    if (filename) {
-      fprintf(DIAG_STREAM, "  --> %s:%zu:%zu\n", filename,
-              error->location.line, error->location.column);
-    } else {
-      fprintf(DIAG_STREAM, "  --> line %zu, column %zu\n",
-              error->location.line, error->location.column);
-    }
-  }
-
-  /* Code snippet with caret (+ context), skipped for bare notes without span */
-  if (error->code_snippet &&
-      error->severity != DIAG_SEVERITY_NOTE_OF &&
-      error->severity != DIAG_SEVERITY_NOTE) {
-    const char *source_code =
-        error->source_code ? error->source_code : reporter->source_code;
-    const size_t line = error->location.line;
-    const size_t prev_line = (line > 1) ? (line - 1) : 0;
-    const size_t next_line = line + 1;
-
-    char *prev_raw = prev_line ? error_reporter_get_line_from_source(
-                                     source_code, prev_line)
-                               : NULL;
-    char *next_raw = error_reporter_get_line_from_source(source_code,
-                                                         next_line);
-
-    char *prev = snippet_truncate(prev_raw);
-    char *snippet = snippet_truncate(error->code_snippet);
-    char *next = snippet_truncate(next_raw);
-    free(prev_raw);
-    free(next_raw);
-
-    size_t max_line_num = next ? next_line : line;
-    size_t gutter_width = error_reporter_count_digits(max_line_num);
-
-    fprintf(DIAG_STREAM, "%*s |\n", (int)gutter_width, "");
-
-    if (prev) {
-      fprintf(DIAG_STREAM, "%*zu | %s\n", (int)gutter_width, prev_line, prev);
-    }
-
-    fprintf(DIAG_STREAM, "%*zu | %s\n", (int)gutter_width, line,
-            snippet ? snippet : "");
-
-    size_t caret_len = (error->span.length > 0) ? error->span.length : 1;
-    size_t caret_column = error->location.column;
-    /* Clamp the caret to the snippet, which was truncated at SNIPPET_MAX_COLS.
-     * A column past that point used to underflow `SNIPPET_MAX_COLS - lead`
-     * into a length near SIZE_MAX, which wrapped the caret line's size back
-     * down to something small and left the leading-spaces loop writing past
-     * it. An error 149 columns into a long line was enough. */
-    if (caret_column > SNIPPET_MAX_COLS) {
-      caret_column = SNIPPET_MAX_COLS + 1;
-      caret_len = 1;
-    } else if (caret_column > 0 &&
-               caret_column - 1 + caret_len > SNIPPET_MAX_COLS) {
-      caret_len = SNIPPET_MAX_COLS - (caret_column - 1);
-    }
-    char *caret_line =
-        error_reporter_create_caret_line(caret_column, caret_len);
-    if (caret_line) {
-      if (error->span_label) {
-        fprintf(DIAG_STREAM, "%*s | %s%s %s%s\n", (int)gutter_width, "",
-                severity_color, caret_line, error->span_label, reset);
-      } else {
-        fprintf(DIAG_STREAM, "%*s | %s%s%s\n", (int)gutter_width, "",
-                severity_color, caret_line, reset);
-      }
-      free(caret_line);
-    }
-
-    if (next) {
-      fprintf(DIAG_STREAM, "%*zu | %s\n", (int)gutter_width, next_line, next);
-    }
-
-    free(prev);
-    free(snippet);
-    free(next);
-  }
-
-  /* Suggestion / help line */
-  if (error->suggestion) {
-    fprintf(DIAG_STREAM, "   = %shelp%s: %s\n", help_color, reset,
-            error->suggestion);
-  }
+  diag_render_group(reporter, error, NULL, 0);
 }
 
 int error_reporter_has_errors(ErrorReporter *reporter) {

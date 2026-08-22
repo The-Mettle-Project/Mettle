@@ -227,6 +227,7 @@ rem The swap runtime is written in Mettle and compiled by the compiler this
 rem build produces, so it is staged after bin\mettle.exe exists.
 
 :plan_diagnostics
+call :cc src\error\diag_style.c obj\error\diag_style.o
 call :cc src\error\error_reporter.c obj\error\error_reporter.o
 REM error_explain.c renders the driver's optimization report: frontend-side.
 if not defined BACKEND_ONLY call :cc src\error\error_explain.c obj\error\error_explain.o
@@ -321,7 +322,7 @@ for %%o in (obj\linker\*.o) do call set "AROBJS=%%AROBJS%% %%o"
 for %%o in (obj\compiler\*.o) do call set "AROBJS=%%AROBJS%% %%o"
 REM The diagnostics reporter is frontend-neutral (raw source text + SourceLocation,
 REM no AST) and the backend comptime interpreter reports through it -> libmtlc.
-%AR% rcs bin\mtlc.lib %AROBJS% obj\debug\debug_info.o obj\error\error_reporter.o
+%AR% rcs bin\mtlc.lib %AROBJS% obj\debug\debug_info.o obj\error\error_reporter.o obj\error\diag_style.o
 if errorlevel 1 exit /b 1
 
 %AR% rcs bin\mtlc.lib obj\common.o obj\mtlc_api.o obj\mtlc_build.o obj\mtlc_lib_fallbacks.o obj\mtlc_crash_fallback.o obj\runtime\verify_owned.o obj\runtime\host_runtime.o

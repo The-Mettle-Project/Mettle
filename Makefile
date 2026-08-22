@@ -64,7 +64,7 @@ LINKER_SOURCES = $(wildcard $(SRCDIR)/linker/*.c)
 # error_reporter.c is frontend-NEUTRAL (renders against raw source text +
 # SourceLocation; no AST) and the backend's comptime interpreter reports
 # through it, so it belongs to libmtlc. error_explain.c stays driver-side.
-DIAG_SOURCES = $(SRCDIR)/error/error_reporter.c
+DIAG_SOURCES = $(SRCDIR)/error/error_reporter.c $(SRCDIR)/error/diag_style.c
 ERROR_SOURCES = $(SRCDIR)/error/error_explain.c
 DEBUG_SOURCES = $(SRCDIR)/debug/debug_info.c
 COMPILER_SOURCES = $(SRCDIR)/compiler/compiler_context.c $(SRCDIR)/compiler/compiler_crash.c
