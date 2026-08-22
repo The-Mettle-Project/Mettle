@@ -3,6 +3,7 @@
 #endif
 #include "main.h"
 #include "common.h"
+#include "parser/ast_dump.h"
 #include "parser/ast_print.h"
 #include "codegen/binary/startup.h"
 #include "codegen/binary/mir_annotate.h"
@@ -3218,6 +3219,8 @@ int main(int argc, char *argv[]) {
       options.generate_debug_symbols = 1;
       options.generate_line_mapping = 1;
       options.generate_stack_trace_support = 1;
+    } else if (strcmp(argv[i], "--dump-ast") == 0) {
+      options.dump_ast = 1;
     } else if (strcmp(argv[i], "--dump-ir") == 0) {
       options.dump_ir = 1;
     } else if (strcmp(argv[i], "--ml-opt") == 0) {
@@ -4233,6 +4236,31 @@ static void compile_dump_device_ir(IRProgram *program,
   free(ir_output);
 }
 
+static void compile_dump_ast(ASTNode *program, const char *output_filename) {
+  char *ast_output = build_sidecar_filename(output_filename, ".ast");
+  if (!ast_output) {
+    fprintf(stderr,
+            "Warning: Failed to allocate AST output filename for '%s'\n",
+            output_filename ? output_filename : "<output>");
+    return;
+  }
+  FILE *ast_file = fopen(ast_output, "w");
+  if (!ast_file) {
+    fprintf(stderr, "Warning: Could not create AST file '%s': %s\n",
+            ast_output, strerror(errno));
+  } else {
+    int ast_ok = ast_dump_program(ast_file, program);
+    if (fclose(ast_file) != 0) {
+      ast_ok = 0;
+    }
+    if (!ast_ok) {
+      fprintf(stderr, "Warning: Failed to write AST dump to '%s'\n",
+              ast_output);
+    }
+  }
+  free(ast_output);
+}
+
 int compile_file(const char *input_filename, const char *output_filename,
                  CompilerOptions *options) {
   CompilerProfile profile;
@@ -4414,6 +4442,9 @@ int compile_file(const char *input_filename, const char *output_filename,
   if (!parse_ok) {
     result = 1;
     goto cleanup;
+  }
+  if (options->dump_ast) {
+    compile_dump_ast(program, output_filename);
   }
 
   // Resolve imports (flatten imported module ASTs into the main program)
@@ -5228,6 +5259,7 @@ void print_usage(const char *program_name) {
   printf("  --tracy-dir <dir>   Tracy repo root (default: TRACY_DIR env, then "
          ".mettle\\tracy_dir)\n");
   printf("  -d, --debug         Enable debug output and symbols\n");
+  printf("  --dump-ast          Write parsed AST sidecar (.ast)\n");
   printf("  --dump-ir           Write optimized IR sidecar (.ir) without debug metadata\n");
   printf("  --simd-report       Report what each @simd loop became (needs -O/--release)\n");
   printf("  --explain           Report every optimization decision in the input file --\n"

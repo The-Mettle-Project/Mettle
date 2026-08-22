@@ -80,6 +80,7 @@ divergence. See [ML-driven IR optimization](ml-opt.md).
 | `--annotate-lines=A-B` | A focused codegen report for those source lines. |
 | `--annotate-fn=NAME` | Restrict the annotate reports to one function. |
 | `--annotate-hot[=N]` | The top N codegen hotspots. Default 8. |
+| `--dump-ast` | Write the parsed AST to a `.ast` sidecar. |
 | `--dump-ir` | Write the optimized IR to a `.ir` sidecar. |
 
 `--explain` needs `-O` or `--release`, because there are no decisions to

@@ -365,7 +365,20 @@ $repoRoot = (Resolve-Path ".").Path
 
 
 $cases = @(
-  @{ Name = "ok_global_int"; Path = "tests/ok_global_int.mettle"; ShouldSucceed = $true },
+  @{
+    Name              = "ok_global_int"
+    Path              = "tests/ok_global_int.mettle"
+    ShouldSucceed     = $true
+    Args              = @("--dump-ast")
+    ArtifactSuffix    = ".ast"
+    ArtifactMustMatch = @(
+      'AST_PROGRAM declarations=2',
+      'AST_VAR_DECLARATION name="g" type="int32"',
+      'AST_FUNCTION_DECLARATION name="main" parameters=\[\] return_type="int32"',
+      'AST_RETURN_STATEMENT',
+      'AST_IDENTIFIER name="g"'
+    )
+  },
   @{ Name = "only_struct"; Path = "tests/only_struct.mettle"; ShouldSucceed = $true },
   @{ Name = "array_index"; Path = "tests/test_array_index.mettle"; ShouldSucceed = $true },
   @{ Name = "control_flow"; Path = "tests/test_control_flow.mettle"; ShouldSucceed = $true },
@@ -2726,6 +2739,26 @@ foreach ($case in $cases) {
                   $reason = "IR output matched forbidden pattern '$pattern'"
                   break
                 }
+              }
+            }
+          }
+        }
+        if ($passed -and $case.ContainsKey("ArtifactMustMatch") -and $case.ArtifactMustMatch) {
+          $artifact = "$outFile$($case.ArtifactSuffix)"
+          if (-not (Test-Path $artifact)) {
+            $passed = $false
+            $reason = "Expected artifact '$artifact' was not written"
+          }
+          else {
+            $artifactText = Get-Content -Path $artifact -Raw
+            foreach ($pattern in @($case.ArtifactMustMatch)) {
+              if ([string]::IsNullOrWhiteSpace($pattern)) {
+                continue
+              }
+              if ($artifactText -notmatch $pattern) {
+                $passed = $false
+                $reason = "Artifact '$artifact' missing required pattern '$pattern'"
+                break
               }
             }
           }

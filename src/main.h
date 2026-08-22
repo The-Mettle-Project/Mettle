@@ -29,6 +29,7 @@ typedef struct {
   const char *input_filename;
   const char *output_filename;
   int debug_mode;
+  int dump_ast;
   int dump_ir;
   int ml_opt; /* --ml-opt: run the learned ML optimizer pass on the IR */
   int emit_ptx; /* --emit-ptx: lower declared kernels to PTX .entry, no object */
