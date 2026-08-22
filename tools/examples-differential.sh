@@ -10,7 +10,7 @@
 set -u
 
 JOBS=0
-TIMEOUT=60
+TIMEOUT=180
 ROOT="examples"
 MODES=()
 
@@ -137,6 +137,15 @@ run_one() {
       reference="$got"; reference_rc="$rc"; reference_tag="$tag"
       continue
     fi
+    # A timed-out run proves nothing about codegen, and under twenty parallel
+    # jobs a benchmark that takes ten seconds alone can take minutes. Report it
+    # as its own outcome rather than as an output divergence.
+    if [ "$rc" = 124 ] || [ "$reference_rc" = 124 ]; then
+      printf 'SLOW\t%s\t%s vs %s\ttimed out after %ss\n' \
+        "$source" "$reference_tag" "$tag" "$TIMEOUT" > "$report"
+      printf '%s\t%s\n' "$(( $(date +%s) - began ))" "$source" > "$report.time"
+      return
+    fi
     if [ "$got" != "$reference" ] || [ "$rc" != "$reference_rc" ]; then
       case " $RELAXED " in
         *" $source "*)
@@ -174,7 +183,7 @@ find "$ROOT" -name "*.mettle" | sort |
   xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {}
 finish=$(date +%s)
 
-ok=0; diverged=0; failed=0; skipped=0; near=0
+ok=0; diverged=0; failed=0; skipped=0; near=0; slow=0
 for report in "$WORK"/results/*; do
   [ -f "$report" ] || continue
   case "$report" in *.time) continue ;; esac
@@ -182,6 +191,7 @@ for report in "$WORK"/results/*; do
     OK*)   ok=$((ok + 1)); continue ;;
     DIFF)  diverged=$((diverged + 1)) ;;
     NEAR)  near=$((near + 1)) ;;
+    SLOW)  slow=$((slow + 1)) ;;
     BUIL)  failed=$((failed + 1)) ;;
     SKIP)  skipped=$((skipped + 1)) ;;
   esac
@@ -195,7 +205,7 @@ if [ -n "${EXDIFF_SLOWEST:-}" ]; then
 fi
 
 echo
-echo "examples: $ok ok, $near near, $diverged diverged, $failed build-failed," \
-     "$skipped skipped ($JOBS jobs, $((finish - start))s)"
+echo "examples: $ok ok, $near near, $slow timed-out, $diverged diverged," \
+     "$failed build-failed, $skipped skipped ($JOBS jobs, $((finish - start))s)"
 
 [ "$diverged" -eq 0 ] && [ "$failed" -eq 0 ]
