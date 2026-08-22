@@ -868,6 +868,8 @@ void error_reporter_print_errors(ErrorReporter *reporter) {
     return;
   }
 
+  diag_style_output_begin();
+
   for (size_t i = 0; i < reporter->count; i++) {
     const ErrorReport *e = &reporter->errors[i];
     /* NOTE_OF entries are drawn inside their parent's frame, skip here */
@@ -922,6 +924,8 @@ void error_reporter_print_errors(ErrorReporter *reporter) {
       }
     }
   }
+
+  diag_style_output_end();
 }
 
 /* Truncate a source line for display if it exceeds SNIPPET_MAX_COLS.
@@ -953,7 +957,9 @@ void error_reporter_print_error(ErrorReporter *reporter,
                                 const ErrorReport *error) {
   if (!reporter || !error)
     return;
+  diag_style_output_begin();
   diag_render_group(reporter, error, NULL, 0);
+  diag_style_output_end();
 }
 
 int error_reporter_has_errors(ErrorReporter *reporter) {

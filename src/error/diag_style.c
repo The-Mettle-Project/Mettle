@@ -27,6 +27,15 @@
 #define DIAG_COLUMNS_FALLBACK 90u
 
 #ifdef _WIN32
+static UINT g_saved_output_cp = 0;
+static int g_output_depth = 0;
+
+static int diag_stderr_is_console(void) {
+  HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+  DWORD mode = 0;
+  return h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode);
+}
+
 static void diag_enable_vt(void) {
   static int done = 0;
   if (done) {
@@ -43,6 +52,37 @@ static void diag_enable_vt(void) {
   }
 }
 #endif
+
+void diag_style_output_begin(void) {
+#ifdef _WIN32
+  if (g_output_depth++ > 0) {
+    return;
+  }
+  if (!diag_style_unicode() || !diag_stderr_is_console()) {
+    return;
+  }
+  UINT current = GetConsoleOutputCP();
+  if (current == CP_UTF8) {
+    return;
+  }
+  if (SetConsoleOutputCP(CP_UTF8)) {
+    g_saved_output_cp = current;
+  }
+#endif
+}
+
+void diag_style_output_end(void) {
+#ifdef _WIN32
+  if (g_output_depth > 0 && --g_output_depth > 0) {
+    return;
+  }
+  if (g_saved_output_cp) {
+    fflush(stderr);
+    SetConsoleOutputCP(g_saved_output_cp);
+    g_saved_output_cp = 0;
+  }
+#endif
+}
 
 static int diag_stderr_is_tty(void) {
   int fd = fileno(DIAG_STREAM);
@@ -112,7 +152,9 @@ int diag_style_unicode(void) {
   }
 
 #ifdef _WIN32
-  cached = (GetConsoleOutputCP() == CP_UTF8) ? 1 : 0;
+  cached = (GetConsoleOutputCP() == CP_UTF8 || diag_stderr_is_console())
+               ? 1
+               : 0;
 #else
   {
     const char *locale = getenv("LC_ALL");
@@ -226,10 +268,21 @@ static const DiagGlyphs g_unicode_glyphs = {
     "\xE2\x94\x94\xE2\x94\x80",
     "\xE2\x86\x92",
     "\xC2\xB7",
+    "\xE2\x94\x8C",
+    "\xE2\x94\x90",
+    "\xE2\x94\x94",
+    "\xE2\x94\x98",
+    "\xE2\x94\x9C",
+    "\xE2\x94\xA4",
+    "\xE2\x9C\x93",
+    "\xE2\x9C\x97",
+    "\xE2\x96\x88",
+    "\xE2\x96\x91",
 };
 
 static const DiagGlyphs g_ascii_glyphs = {
     "-", "|", ":", "+", "+", "+", "\\_", "->", "-",
+    "+", "+", "+", "+", "+", "+", "*", "!", "#", ".",
 };
 
 const DiagGlyphs *diag_glyphs(void) {

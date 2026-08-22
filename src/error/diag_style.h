@@ -8,6 +8,8 @@ int diag_style_color(void);
 int diag_style_unicode(void);
 
 int diag_style_wrap(void);
+void diag_style_output_begin(void);
+void diag_style_output_end(void);
 size_t diag_style_columns(void);
 
 const char *diag_sgr_reset(void);
@@ -34,6 +36,16 @@ typedef struct {
   const char *elbow;
   const char *arrow;
   const char *bullet;
+  const char *corner_tl;
+  const char *corner_tr;
+  const char *corner_bl;
+  const char *corner_br;
+  const char *tee_right;
+  const char *tee_left;
+  const char *check;
+  const char *cross;
+  const char *block_full;
+  const char *block_empty;
 } DiagGlyphs;
 
 const DiagGlyphs *diag_glyphs(void);
