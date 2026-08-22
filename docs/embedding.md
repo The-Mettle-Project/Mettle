@@ -1,185 +1,231 @@
 # Writing a frontend for libmtlc
 
-libmtlc is a standalone compiler backend. Any frontend can lower its own
-language into libmtlc's IR and drive the pipeline (custom IR, the classical +
-GNN optimizers, native x86-64 / ARM64 / PTX / SPIR-V codegen, and native PE/ELF
-linking) through the public C API in [`include/mtlc/`](../include/mtlc). Your
-frontend includes only those headers and links only `bin/mtlc.lib` (Windows) or
-`bin/libmtlc.a` (Linux). It never touches a backend-internal header.
+libmtlc is the backend: the IR, the optimizers, code generation for x86-64,
+ARM64, PTX, and SPIR-V, and native linking. Mettle is one frontend that drives
+it. This page shows you how to write another.
 
-The reference Mettle frontend is one consumer; [`examples/calc`](../examples/calc)
-is a second, deliberately unrelated one: a tiny C-like language in a single
-file. This document walks the same path.
+Everything here uses only the public headers in
+[`include/mtlc/`](../include/mtlc/). Nothing reaches into the compiler's own
+sources.
 
-Self-containment is audited, not assumed: the test suite computes the
-archive's external-symbol closure with `nm` and fails if any lib member
-references a driver/frontend symbol it doesn't define (`libmtlc_selfcontained`
-gate), and builds+runs the calc example against the library alone
-(`calc_frontend` gate).
+## The shape of it
 
-This page is the tutorial. The full backend reference lives in
-[`docs/libmtlc/`](libmtlc/README.md): the [API contract for every
-function](libmtlc/api.md), [the IR model](libmtlc/ir.md), [the type
-system](libmtlc/types.md), [the pipeline and per-target
-limits](libmtlc/pipeline.md), and [internals](libmtlc/internals.md).
+Four steps, in order:
 
-## The public surface
+1. Create a context and a builder.
+2. Build IR: declare functions, emit their bodies.
+3. Finish the builder, which gives you a module.
+4. Optimize the module, then emit an object or link an executable.
 
-| Header | What it gives you |
-|--------|-------------------|
-| [`mtlc/type.h`](../include/mtlc/type.h) | `MtlcType`, the backend type descriptor, and `mtlc_type_scalar()` |
-| [`mtlc/build.h`](../include/mtlc/build.h) | the IR builder: functions, values, instructions, control flow |
-| [`mtlc/module.h`](../include/mtlc/module.h) | `MtlcModule`, an opaque unit of IR |
-| [`mtlc/context.h`](../include/mtlc/context.h) | `MtlcContext`, a backend session holding the optimization knobs |
-| [`mtlc/pipeline.h`](../include/mtlc/pipeline.h) | `mtlc_optimize`, `mtlc_apply_ml_opt`, `mtlc_emit_object`, `mtlc_build_executable` |
-| [`mtlc/target.h`](../include/mtlc/target.h) | architecture / object-format / link-target enums |
+## A complete example
 
-## 1. Build IR
-
-Create a builder, declare functions, and emit an instruction stream. Values are
-opaque `MtlcValue` handles; control flow is explicit labels and branches (your
-frontend lowers its own `if`/`while`/`for`).
+This program builds two functions, `twice` and `main`, optimizes them, and
+links an executable that exits 42.
 
 ```c
 #include <mtlc/build.h>
-
-const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
-MtlcBuilder *b = mtlc_builder_create();
-
-/* fn add(a, b) { return a + b; } */
-const char *pn[] = {"a", "b"};
-const MtlcType *pt[] = {i64, i64};
-MtlcFn *add = mtlc_builder_function(b, "add", i64, pn, pt, 2, /*extern=*/0);
-MtlcValue sum = mtlc_binary(add, "+", mtlc_fn_param(add, 0),
-                            mtlc_fn_param(add, 1), i64);
-mtlc_return(add, sum);
-
-/* fn main() { return add(40, 2); } */
-MtlcFn *m = mtlc_builder_function(b, "main", i64, NULL, NULL, 0, 0);
-MtlcValue args[] = {mtlc_const_int(m, i64, 40), mtlc_const_int(m, i64, 2)};
-mtlc_return(m, mtlc_call(m, "add", args, 2, i64));
-
-MtlcModule *module = mtlc_builder_finish(b);  /* consumes the builder */
-```
-
-`mtlc_builder_finish` populates the module's type registry and symbol table (the
-tables codegen reads) from the types you declared, then hands back a module.
-Calls resolve by name, so functions may be defined in any order.
-
-## 2. Optimize
-
-```c
+#include <mtlc/mtlc.h>
 #include <mtlc/pipeline.h>
+#include <stdio.h>
 
-MtlcContext *ctx = mtlc_context_create();
-mtlc_context_set_opt_level(ctx, 1);
-mtlc_context_set_whole_program(ctx, 1);   /* single-exe: every call site visible */
-mtlc_optimize(ctx, module);
-/* optional: mtlc_context_set_ml_opt(ctx, 1); mtlc_apply_ml_opt(ctx, module, NULL); */
+static void on_diag(void *ud, MtlcDiagSeverity sev, const char *msg) {
+  (void)ud;
+  fprintf(stderr, "%s: %s\n", mtlc_diag_severity_name(sev), msg);
+}
+
+int main(void) {
+  MtlcContext *ctx = mtlc_context_create();
+  MtlcBuilder *b = mtlc_builder_create();
+  mtlc_builder_set_diagnostic_handler(b, on_diag, NULL);
+
+  const MtlcType *i64 = mtlc_type_scalar(MTLC_TYPE_INT64);
+  const char *names[1] = {"n"};
+  const MtlcType *types[1] = {i64};
+
+  MtlcFn *twice = mtlc_builder_function(b, "twice", i64, names, types, 1, 0);
+  MtlcValue n = mtlc_fn_param(twice, 0);
+  MtlcValue two = mtlc_const_int(twice, i64, 2);
+  mtlc_return(twice, mtlc_binary_op(twice, MTLC_BINOP_MUL, n, two, i64));
+
+  MtlcFn *m = mtlc_builder_function(b, "main", i64, NULL, NULL, 0, 0);
+  MtlcValue args[1] = {mtlc_const_int(m, i64, 21)};
+  mtlc_return(m, mtlc_call(m, "twice", args, 1, i64));
+
+  MtlcModule *mod = mtlc_builder_finish(b);
+  if (!mod) { fprintf(stderr, "build failed\n"); return 1; }
+
+  mtlc_context_set_runtime_directory(ctx, "runtime");
+  mtlc_context_set_opt_level(ctx, 2);
+  if (!mtlc_optimize(ctx, mod)) {
+    fprintf(stderr, "%s\n", mtlc_context_last_error(ctx));
+    return 1;
+  }
+  if (!mtlc_build_executable(ctx, mod, "tiny_out.exe")) {
+    fprintf(stderr, "%s\n", mtlc_context_last_error(ctx));
+    return 1;
+  }
+  printf("built tiny_out.exe (%zu functions)\n",
+         mtlc_module_function_count(mod));
+
+  mtlc_module_destroy(mod);
+  mtlc_context_destroy(ctx);
+  return 0;
+}
 ```
 
-The optimizer decides for itself which calls to inline. Four builder calls
-override that, and they are the neutral form of the reference frontend's
-decorators:
+Build and run it:
+
+```bash
+gcc -I include tiny.c bin/libmtlc.a -ldbghelp -o tiny
+./tiny
+./tiny_out.exe
+```
+
+```text
+built tiny_out.exe (2 functions)
+```
+
+`tiny_out.exe` exits 42. On Linux, drop `-ldbghelp`.
+
+## The runtime directory
+
+`mtlc_build_executable` needs the runtime objects. Point the context at the
+directory holding them before you link:
 
 ```c
-mtlc_fn_set_inline(helper);           /* past the size/count heuristics */
-mtlc_fn_set_inline_required(helper);  /* and fail the build on a surviving call */
-mtlc_fn_set_noinline(helper);         /* keep it a real call */
-mtlc_fn_set_pure(helper);             /* hoist loop-invariant calls out of loops */
+mtlc_context_set_runtime_directory(ctx, "runtime");
 ```
 
-They matter most in a GPU module: a device helper left out of line becomes a
-call whose ABI cost every work item pays. `mtlc_fn_set_noinline` is how a
-frontend keeps one deliberately.
+Without it the call fails with `set the libmtlc runtime directory first`. The
+objects ship in `bin/runtime`.
 
-## 3. Emit code
+## Errors
 
-Emit a relocatable object, or go all the way to a native executable (on Windows
-this uses libmtlc's own internal PE linker, with no external toolchain):
+The builder latches. Once a call fails, the builder records the error, every
+later call is a no-op, and `mtlc_builder_finish` returns NULL. That lets you
+emit a whole function without checking each call, and test once at the end.
+
+`mtlc_builder_ok(b)` is that test. `mtlc_fn_ok(fn)` asks the same question
+through a function handle, which is more convenient mid-body.
+
+`mtlc_builder_error(b)` gives the first recorded message. It dies with the
+builder, and `mtlc_builder_finish` consumes the builder on both paths, so
+install a diagnostic handler if you want to know which call was at fault while
+the offending frontend code is still on the stack.
+
+For the pipeline, `mtlc_context_last_error(ctx)` carries the message and
+`mtlc_context_clear_error(ctx)` resets it.
+
+## Types
+
+Types are immortal. `mtlc_type_scalar`, `mtlc_type_pointer`,
+`mtlc_type_array`, `mtlc_type_struct`, and `mtlc_type_function_pointer` return
+canonical `const MtlcType *` values that live as long as the process. You never
+free one, and two calls with the same arguments give you the same pointer.
+
+[The type system](libmtlc/types.md) has the kinds and the layout rules.
+
+## Declaring and defining
+
+`mtlc_builder_function(builder, name, return_type, param_names, param_types,
+param_count, is_extern)` returns a function builder to emit a body into. Pass
+NULL, NULL, 0 for no parameters. A void function uses
+`mtlc_type_scalar(MTLC_TYPE_VOID)`.
+
+With `is_extern` non-zero it declares a body-less external symbol and returns
+NULL. `mtlc_builder_declare_function` is the same thing with an unambiguous
+result: 1 on success, 0 on failure.
+
+The first non-extern function named `main` becomes the entry point for
+`mtlc_build_executable`.
+
+## Emitting a body
+
+Values are `MtlcValue`, returned by the emitters and passed back in.
+`MTLC_NO_VALUE` stands for no value, which is what a void call gives you.
+
+| Call | Emits |
+|------|-------|
+| `mtlc_fn_param(fn, i)` | The i-th parameter |
+| `mtlc_const_int`, `mtlc_const_float` | A constant |
+| `mtlc_local(fn, name, type)` | A local slot |
+| `mtlc_binary_op(fn, op, lhs, rhs, type)` | A binary operation |
+| `mtlc_unary_op(fn, op, operand, type)` | A unary operation |
+| `mtlc_call(fn, callee, args, n, type)` | A call by name |
+| `mtlc_cast`, `mtlc_address_of` | A conversion, an address |
+| `mtlc_load`, `mtlc_store` | Memory access |
+| `mtlc_load_element`, `mtlc_store_element`, `mtlc_element_address` | Indexed access |
+| `mtlc_load_field`, `mtlc_store_field`, `mtlc_field_address` | Field access |
+| `mtlc_return(fn, value)` | A return |
+
+`mtlc_binary_op` takes an enum, `MTLC_BINOP_MUL` and its siblings.
+`mtlc_binary` takes the operator as text, `"*"`, for a frontend that already
+carries operator strings. An operator neither recognizes fails the builder with
+a diagnostic naming it.
+
+Both forms take the result type, which is baked onto the instruction so code
+generation never re-derives it.
+
+## Control flow
 
 ```c
-mtlc_build_executable(ctx, module, "a.exe");   /* or mtlc_emit_object(ctx, module, "a.o") */
-
-mtlc_module_destroy(module);
-mtlc_context_destroy(ctx);
+MtlcLabel done = mtlc_label_new(fn, "done");
+mtlc_branch_if_zero_to(fn, cond, done);
+/* ... */
+mtlc_label_here(fn, done);
 ```
 
-## Build your frontend
+`mtlc_label_new`, `mtlc_label_here`, `mtlc_jump_to`, and
+`mtlc_branch_if_zero_to` work with `MtlcLabel` handles. The string forms,
+`mtlc_label`, `mtlc_jump`, and `mtlc_branch_if_zero`, take names instead.
 
-Inside a checkout, build the library and link against it in place:
+`mtlc_builder_finish` verifies that every branch target is defined.
 
-```bash
-# Windows, after .\build.bat
-gcc -Iinclude my_frontend.c bin/mtlc.lib -o my_frontend.exe -ldbghelp
+## The pipeline
 
-# Linux, after `make libmtlc`
-cc -Iinclude my_frontend.c bin/libmtlc.a -o my_frontend
+```c
+mtlc_context_set_opt_level(ctx, 2);
+mtlc_optimize(ctx, mod);
 ```
 
-`-ldbghelp` on Windows satisfies the crash reporter's stack-walk imports; the
-library needs nothing else beyond system libraries.
+| Call | Does |
+|------|------|
+| `mtlc_optimize(ctx, mod)` | Run the optimizer for the host |
+| `mtlc_optimize_for(ctx, mod, arch)` | Run it for a named architecture |
+| `mtlc_apply_ml_opt(ctx, mod, stats)` | Run the learned optimizer, filling in `MtlcMlOptStats` |
+| `mtlc_emit_object(ctx, mod, path)` | Write a native object for the host |
+| `mtlc_emit(ctx, mod, arch, path)` | Write for `MTLC_ARCH_X86_64`, `ARM64`, `PTX`, or `SPIRV` |
+| `mtlc_build_executable(ctx, mod, path)` | Object plus link |
 
-## Getting just the backend
+Each returns non-zero on success.
 
-You do not need the whole repository in your project. The backend is exactly two
-things: the headers in `include/mtlc/` and the static library. The one-line
-fetchers download the prebuilt release into `./libmtlc`:
+Context settings that change the run: `mtlc_context_set_opt_level`,
+`mtlc_context_set_ml_opt`, `mtlc_context_set_whole_program`,
+`mtlc_context_set_explain`, and the PTX target setters.
 
-```bash
-# Linux
-curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/get-libmtlc.sh | sh
-```
+[The pipeline](libmtlc/pipeline.md) covers the pass families and each
+generator's limits.
 
-```powershell
-# Windows
-irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/get-libmtlc.ps1 | iex
-```
+## Ownership
 
-Both accept overrides: a specific tag (`LIBMTLC_VERSION`) and a target directory
-(`LIBMTLC_DIR`, default `./libmtlc`).
+`mtlc_builder_finish` consumes the builder. Do not also destroy it. Destroying
+a builder you have not finished frees everything it holds.
 
-From a checkout instead, stage the same folder from source with
-`make dist-libmtlc` (Linux) or `.\tools\dist-libmtlc.ps1` (Windows), or do a
-system install with a pkg-config file:
+The module is yours; free it with `mtlc_module_destroy`. The context is yours;
+free it with `mtlc_context_destroy`. Types are never freed.
 
-```bash
-make install-libmtlc PREFIX=/usr/local   # honors DESTDIR
-cc $(pkg-config --cflags libmtlc) -c my_frontend.c -o my_frontend.o
-cc my_frontend.o $(pkg-config --libs libmtlc) -o my_frontend
-```
+`mtlc_module_adopt_ir` takes ownership of a raw IR program, for a frontend that
+built IR through the internal representation directly.
 
-The frontend links libmtlc's owned host runtime and startup through the package
-flags. It does not link a host C runtime.
+## A larger example
 
-## Scope of the builder today
+[`examples/calc`](../examples/calc) is a complete second frontend: a lexer, a
+recursive-descent parser, and lowering into the IR builder, for a small C-like
+language with functions, locals, `if`, `while`, and recursion. It uses only the
+public API, which is what makes it the frontend-agnostic proof.
 
-`mtlc/build.h` covers the imperative core a real language needs: functions
-(including `extern` declarations resolved from the owned runtime or an OS API), module
-globals with initializers, parameters, locals, assignment, integer/float
-arithmetic and comparisons, casts (including int/pointer conversions), pointer
-types (`mtlc_type_pointer`), memory (`mtlc_load` / `mtlc_store` /
-`mtlc_address_of`, with array indexing as pointer arithmetic), calls, and
-label/branch control flow.
-The `public_api` test gate exercises every one of those against all four
-targets. Struct/aggregate *layout helpers* are the one construct not yet
-wrapped (the `MtlcType` fields for them are public; field access is
-base-pointer + offset arithmetic today); wrapping them is additive.
+## See also
 
-## Targets through the public API
-
-`mtlc_emit(ctx, module, arch, path)` reaches every backend:
-
-| `MtlcArch` | Product |
-|---|---|
-| `MTLC_ARCH_X86_64` | host-format relocatable object (or `mtlc_build_executable` for a linked binary) |
-| `MTLC_ARCH_ARM64` | AArch64 ELF64 relocatable object (AAPCS64) |
-| `MTLC_ARCH_PTX` | NVIDIA PTX module (text) |
-| `MTLC_ARCH_SPIRV` | SPIR-V binary module (OpenCL 2.0) |
-
-Every target accepts unoptimized IR. For optimized output, call
-`mtlc_optimize_for(ctx, module, arch)` with the same consumer architecture;
-ARM64/PTX/SPIR-V receive only target-neutral transformations and never the
-x86-only full pipeline.
-
-See also: [compilation pipeline](compilation.md), [GPU offload](gpu.md).
+- [libmtlc reference](libmtlc/README.md)
+- [The API](libmtlc/api.md)
+- [Mettle and libmtlc](mettle-and-libmtlc.md)
