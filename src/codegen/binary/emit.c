@@ -2112,9 +2112,6 @@ int code_generator_binary_emit_local_string_store(
   return 1;
 }
 
-/* A string value is carried as a pointer to its two words, so storing one into
- * a global is the local store with the destination reached through the symbol's
- * address instead of a frame offset. */
 static int code_generator_binary_emit_global_string_store(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const char *symbol_name, int declare_external,

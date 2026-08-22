@@ -715,16 +715,6 @@ static Token lexer_lex_identifier_or_keyword(Lexer *lexer) {
   return token;
 }
 
-/* Read the body of a string literal into `buffer`, stopping at the quote that
- * closes it. Answers whether that quote was found.
- *
- * With `interpolation_aware`, a quote inside a `{...}` opens a literal nested
- * in the interpolated expression rather than closing this one, so
- * `"{a + "-" + b}"` reads as a single string, which is what the documented
- * "parsed with the normal grammar" promises. A scan that instead runs to the
- * end of the file means the quote really did close the literal, and the caller
- * reads it again without this, so a stray '{' still reports as an unterminated
- * brace rather than swallowing the rest of the file. */
 static int lexer_read_string_body(Lexer *lexer, char *buffer,
                                   size_t *buffer_pos_out,
                                   int interpolation_aware) {
@@ -845,13 +835,6 @@ static Token lexer_lex_string_literal(Lexer *lexer) {
   return token;
 }
 
-/* Whether a line ending in this token leaves an expression waiting for its
- * right-hand side, so the newline is not the end of a statement and a long
- * expression can be broken across lines wherever it reads best.
- *
- * A statement can legitimately end in '>' (the close of a generic type) or '*'
- * (a pointer type), so neither of those continues a line; write the break
- * before the operator's left operand or inside parentheses instead. */
 static int lexer_token_continues_line(TokenType type) {
   switch (type) {
   case TOKEN_PLUS:

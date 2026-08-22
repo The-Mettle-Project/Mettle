@@ -3206,7 +3206,8 @@ static ASTNode *parser_parse_interpolated_string(Parser *parser,
       if (value[i] == '"') {
         in_nested = !in_nested;
       } else if (in_nested) {
-        /* a brace inside a nested literal is text, not structure */
+        i++;
+        continue;
       } else if (value[i] == '{') {
         depth++;
       } else if (value[i] == '}' && --depth == 0) {
@@ -4090,11 +4091,6 @@ ASTNode *parser_parse_binary_expression(Parser *parser, int min_precedence) {
     char *operator = strdup(parser->current_token.value);
     parser_advance(parser);
 
-    /* Past the operator the expression is unfinished, so a line break here is
-     * only formatting. The lexer already carries most operators across a
-     * newline on its own; it cannot do that for '*' or '>', which also end a
-     * pointer type and a generic argument list, and this is where those two
-     * stop being ambiguous. */
     while (parser->current_token.type == TOKEN_NEWLINE) {
       parser_advance(parser);
     }
