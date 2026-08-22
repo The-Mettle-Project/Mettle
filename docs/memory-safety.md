@@ -1,347 +1,158 @@
-# Checked access: `--safe`
+# Memory safety
 
-Mettle's bounds and null checks exist only in debug builds. `--release` drops
-them, which is why a program that reads past an array there returns whatever
-happened to be in the next words rather than saying so. That is the ordinary
-bargain in a systems language: you can have the checks or you can have the
-speed.
+What the compiler proves about memory before your program runs, and what
+`--safe` checks while it runs.
 
-`--safe` refuses the bargain. It checks every memory access at every
-optimization level, and then spends the compiler's effort proving the checks
-away rather than deleting them unproven. The question stops being "can we
-afford to check" and becomes "how much of the checking can we prove is
-unnecessary".
+Two rules shape all of it. The compiler reports only what it can prove, so a
+diagnostic here is a fact rather than a suspicion. And it never rejects a
+program for want of an annotation: there is nothing to write, and nothing to
+silence.
+
+## Compile-time diagnostics
+
+These run on every build. Each is reported once, at the line that does the
+damage, with the line that set it up named in the message.
+
+| Code | What it catches |
+|------|-----------------|
+| M0101 | Use after free |
+| M0102 | Double free |
+| M0103 | Returning the address of a stack local |
+| M0104 | Storing a stack address in a global |
+| M0105 | Constant array index out of bounds |
+| M0106 | A memory operation that overflows a stack array |
+| M0107 | Memory leak |
+| M0108 | Use after a pointer freed by a call |
+| M0109 | Double free through a call |
+| M0110 | A borrowed interior pointer outliving its scope |
+| M0111 | A borrowed pointer invalidated by realloc |
+| M0112 | A borrowed pointer invalidated by free |
+| M0113 | Dereference of a null pointer |
+| M0114 | Dereference of an unmapped constant address |
+| M0117 | A loop index running past the end of an array |
+
+`mettle explain M0101` prints the reasoning and the fix for any of them.
+
+### Use after free and double free
+
+```mettle
+var p: int32* = malloc(16);
+free(p);
+free(p);
+```
+
+```text
+warning[M0102]: Double free of `p` (already freed at line 6)
+```
+
+Reading through the pointer instead gives:
+
+```text
+warning[M0101]: Use of `p` after it was freed (freed at line 6); this is
+use-after-free
+```
+
+Both are conservative. They fire when the freed pointer and the second use are
+provably the same allocation on the same path.
+
+### Escaping stack addresses
+
+Returning the address of a local, or of a field inside one, fails the build:
+
+```mettle
+fn leak() -> int32* {
+  var p: P;
+  return &p.x;
+}
+```
+
+```text
+error[M0103]: Returning the address of stack local `p`; the frame is destroyed
+when this function returns, so the caller receives a dangling pointer
+```
+
+Storing one in a global is the same mistake with a longer fuse, and it draws
+M0104.
+
+### Leaks
+
+M0107 fires when an allocation never escapes the function, is never returned,
+stored, or passed on, and is never freed. It stays quiet when ownership leaves
+the function, because then the leak is somebody else's to prove.
+
+### Constant out-of-bounds
+
+An index the compiler can fold is checked against the array's declared size:
+
+```mettle
+var a: int32[4];
+a[7] = 1;
+```
+
+```text
+error[E0003]: Array index 7 is out of bounds for 'int32[4]' (size 4)
+```
+
+M0117 covers the loop version, where the bound and the length are both known
+and the bound is larger:
+
+```mettle
+var a: int64[8];
+var i: int32 = 0;
+while (i < 9) { a[i] = (int64)i; i = i + 1; }
+```
+
+```text
+error[M0117]: This loop runs `i` up to 8, but `a` has 8 elements (valid
+indexes 0..7); the final iteration reads or writes past the end
+```
+
+The same mistake written as `for i in 0..9` is missed today and traps at run
+time instead. [Known limitations](known-limitations.md) tracks it.
+
+## Run-time checks with --safe
+
+`--safe` inserts a check on every memory access the compiler could not prove
+in bounds, and it keeps them under `--release`.
 
 ```bash
-mettle --build --release --safe app.mettle -o app.exe
+mettle --safe --build program.mettle
 ```
 
-## What it catches
+A failed check stops the program and names the access:
 
-Everything below is caught at `--release`, with the optimizer on:
-
-| | Example |
-|---|---|
-| Reading or writing past an array | `var a: int32[4]; a[i]` where `i` reaches 4 |
-| A negative index | `a[-1]`, including through a computed index |
-| Past the end of a heap block | `p = malloc(16); p[16]` |
-| Use after free | `free(p); p[0]` |
-| Use after free through another pointer | `q = p; free(q); p[0]` |
-| A pointer kept across `realloc` | `q = realloc(p, n); p[0]` |
-| Running off one allocation into the next | `p` and `q` adjacent, `p[distance_to_q]` |
-| A null dereference | `p = 0; p[0]` |
-| Past a stack local, through a pointer | `f(&a[0], i)` where `i` leaves `a` |
-| Past a global, through a pointer | `f(&TABLE[0], i)` |
-
-Two of those are worth separating out.
-
-**Running off one allocation into the next** is what an address-only check gets
-wrong. An access is bounded by *the allocation its pointer came from*, not by
-whatever allocation the computed address happens to land in. So the check is
-handed the base pointer and the displacement separately, and resolves the base.
-A check that only asked "is this address inside something live" would wave it
-through.
-
-**Through a pointer** is the case that needs the runtime at all. Indexing a
-local or a global directly never reaches it: the size is right there in the
-program, so the check is a comparison against a constant, or is proved away.
-It is only once a pointer into one is carried somewhere the size does not
-travel with it that anything has to be looked up.
-
-## What it costs
-
-Measured against the same programs built without the flag, both timed back to
-back and the median of the per-pair ratios taken:
-
-| Benchmark | Overhead | Accesses | Settled at compile time | Checked at run time |
-|---|---|---|---|---|
-| dot_product | 1.00x | 34 | 8 | 26 |
-| crc32 | 1.00x | 31 | 4 | 27 |
-| word_count | 1.00x | 31 | 5 | 26 |
-| transpose | 1.00x | 35 | 6 | 29 |
-| popcount | 1.01x | 31 | 4 | 27 |
-| minmax_scan | 1.02x | 34 | 6 | 28 |
-| base64_encode | 1.02x | 57 | 15 | 42 |
-| reverse_i32 | 1.04x | 33 | 7 | 26 |
-| matvec | 1.05x | 37 | 8 | 29 |
-| grep | 1.05x | 32 | 4 | 28 |
-| binary_search | 1.08x | 33 | 5 | 28 |
-| heapsort | 1.64x | 54 | 16 | 38 |
-
-Only a quarter to a third of accesses are settled at compile time, and the
-overhead is still mostly nothing at all. That is because the two halves work on
-different things. Proving removes a check; where nothing can be proved, the
-remaining job is to make the check cheap, and a check that walks the map to ask
-which allocation a pointer belongs to costs around a hundred cycles while a
-comparison against an answer already in a register costs about three.
-
-The third thing that has to be true is that the checks do not cost the program
-its ordinary code quality. A check is a call, and for a while any function
-holding one lost register allocation entirely, because the backend defers a
-function whose callee it cannot find a signature for and the runtime's entry
-points were never declared. Declaring them took `--safe` from compiling the
-whole program with the spill-everything backend to compiling essentially all of
-it with the register allocator, which is most of what the figures above
-changed. A checked build should differ from an unchecked one by its checks and
-nothing else.
-
-Being a call costs a second thing, and it is subtler. The allocator has to
-assume a call happens, so every value live across one needs a register the call
-would not clobber, and there are seven of those. A nested loop carrying two
-pointers, two counters, two resolved spans and two indices has spent them all
-before it reaches the value it just loaded, which then goes to the stack on
-every iteration; a float accumulator has nowhere to live at all, because no XMM
-register survives a call on both calling conventions. So the two runtime calls
-the checking machinery puts in loops give some registers back. The check saves
-and restores RAX and the volatile XMM lanes around itself, which costs nothing
-because it is entered only when the comparison in front of it fails. The span
-resolution saves the XMM lanes, which costs eight instructions, but the
-compiler hoisted it in front of the loop, so that is once per loop against once
-per element. Where the allocator ends up using none of the registers this hands
-back, the saving is dropped again rather than paid for nothing. `transpose` and
-`matvec` are the two this is measurable on: 1.5x and 2.9x before it.
-
-So a loop that indexes one pointer resolves that allocation once in front of
-itself, and each access inside becomes a subtract, a compare, and a branch that
-is never taken. Failing the comparison is not a verdict: it calls the full
-check, which is what keeps this exact for an interior pointer reading
-backwards, for an allocation that has been freed, and for anything else the
-comparison alone cannot judge. heapsort went from 15.3x to 2.5x on that change
-alone, without a single extra access being proved.
-
-dot_product is free for a different reason. A loop walking `a[i]` for `i` in
-`[0, n)` touches one contiguous range, so one check covers what a check per
-element was covering, and the loop body is then empty of calls again and the
-vectorizer takes it back. Checks in a hot loop are not merely expensive: they
-block the kernel that does the work.
-
-That is why the whole-range check is worth reaching for even where the loop is
-not a straight line. The body may branch, so long as it rejoins: an `if/else`
-inside the loop does not change how many times the loop runs, so a check
-covering the range the header test describes still describes what the loop will
-touch. What it may not do is leave early. A loop that can `break`, or an access
-the body reaches only on some iterations, keeps its per-access checks, because
-one check for the whole range would claim iterations that never happened and
-accuse a program that stayed in bounds. word_count is the shape this buys: a
-byte loop whose body is a four-way comparison, back to the SIMD scan it had
-without the flag.
-
-The index does not have to be the counter. It has to be a straight line in one,
-which is what most of them turn out to be once the arithmetic is read rather
-than pattern-matched:
-
-| Written | Read as |
-|---|---|
-| `a[i]` starting from 1 | the counter, from where it starts |
-| `mat[base + j]` | the counter displaced by a value the loop holds still |
-| `src[n - 1 - i]` | the counter with a coefficient of -1, walked backwards |
-| `b[j * N + i]` | the counter scaled by N, displaced by `i` |
-| `m[idx]`, `idx = row_base; idx++` | a counter that starts somewhere only the run knows |
-
-Each gives a first and a last index, and the bytes between them are one
-contiguous range whatever the coefficient does in between: an allocation is
-contiguous, so checking from the lowest byte to the highest is exactly checking
-every byte the loop touches, gaps included. A negative coefficient puts the low
-end at the last iteration rather than the first, and that is the whole of the
-difference. `reverse_i32` and `minmax_scan` are the two this is most visible on;
-both go from several times the unchecked build to level with it, because the
-loop body ends up empty of checks and the vectorizer takes it back.
-
-Reading the arithmetic that way also means reading what the program means by a
-name. `var N: int32 = 32;` at the top of a file is a constant in everything but
-spelling, and a stride of N is a known stride once nothing in the program
-assigns N. That is checked across the whole program, and taking N's address
-counts as assigning it.
-
-**A call in the body does not stop any of this.** One check standing in for a
-loop's worth is taken before the loop runs, so what matters is not whether the
-body calls out but whether the call can reach something that takes the memory
-away. A loop around a helper is one of the commonest shapes there is, and a
-helper that computes cannot free anything, so the question is asked of the
-call graph rather than assumed:
-
-- a callee whose body is in this program is read, and everything it calls
-- `free` and `realloc` are the answer, under either spelling
-- a call through a pointer, a launch, or inline assembly is refused
-- so is a write to anything that is not the callee's own local, since the
-  pointer the loop walks could be reachable that way
-- an extern with no body here is refused, except for the handful of C library
-  entry points whose contracts say what they do
-
-The caller has to hold up its end too: if it handed out the address of the
-pointer, the bound or the counter, a callee could move one of them, and a range
-worked out before the loop would stop describing what the loop walks.
-
-`popcount` and `grep` are what this was worth. Both are a byte loop around a
-helper, both were several times the unchecked build, and both are now level
-with it.
-
-heapsort is the honest end. Its sift-down indexes by `child` and `swap_idx`,
-which no loop bounds, so the checks stay and land in a loop that is already
-mostly compare-and-swap.
-
-`--explain` reports where a program sits:
-
-```
--- memory safety: base64_encode.mettle ----------
-  57 accesses, 15 settled at compile time (26%), 42 checked at run time
-  4 proved in place, 11 folded into a check covering a whole loop
-  3 compare against a known extent, 23 against an allocation the loop resolves
-  once, 16 ask the runtime which allocation the pointer came from
-  line 30 in base64_encode: the object's size is not known here, so the runtime
-  is asked which allocation the pointer came from
-      30 | var c0: int32 = (int32)(uint8)src[i];
+```text
+Fatal error: `a[]` is outside its bounds
 ```
 
-Every access lands in exactly one of those buckets and they add up, so a run
-that looks wrong can be read rather than guessed at.
+The process exits with status 1.
 
-`METTLE_SAFETY_TRACE=1` prints why each proof gave up, which from the outside
-is otherwise indistinguishable from a limit of the analysis.
+Most checks cost nothing, because the compiler removes the ones it can settle
+statically. It recognizes an index written as a multiple of a loop counter plus
+an invariant plus a constant, and proves that shape in bounds against the
+array's length. A loop over `0..n` indexing an array of `n` elements gets no
+checks at all.
 
-## How the checks go away
+What is left is the accesses that genuinely depend on run-time values.
+Measured over the benchmark suite the cost ranges from nothing to a small
+multiple, depending on how much of the indexing the compiler could settle.
 
-Five arguments, tried in order. Each is a claim that the access can never leave
-its object, and a wrong claim is a miscompile that reads as a safe program, so
-anything that cannot be pinned down exactly leaves the check alone.
+## What is not covered
 
-**A constant index.** `a[3]` against a fixed-size object. This needs a short
-walk back through the instructions, because lowering scales every subscript
-through a multiply into a temporary, so even `a[3]` arrives as a temporary
-rather than as the twelve it obviously is.
+The compiler proves what it can see. It stays quiet about the rest:
 
-**A counted loop over a fixed-size object.** `for i in 0..8` over `int32[8]`
-reaches at most offset 28, and the object is 32 bytes. The index has to start
-at zero and step by a constant, nothing else in the body may move it, and the
-bound has to be a constant.
+- Memory reached through a `cstring` or a `rawptr` handed in by C. There is
+  no length to check against.
+- Aliasing between two pointers it cannot relate.
+- Integer overflow. Arithmetic wraps, by design.
+- Data races between threads.
+- Anything inside an `asm` block.
 
-**An index its own arithmetic bounds.** `alpha[(bits >> 2) & 63]` cannot leave
-`[0, 63]` whatever `bits` holds, because a non-negative mask clears every
-higher bit including the sign. That is the shape of every table lookup.
+`--safe` checks bounds. It is not a sanitizer and it does not track ownership
+across the C boundary.
 
-**One check for a loop's whole range.** Where the object's size is not known,
-a counted loop still touches one contiguous range, so the per-element checks
-become a single check in front of the loop. The range must be exactly what the
-loop touches: too large accuses a correct program, too small misses a real
-overrun. That is why the body has to be straight line, since a conditional
-access touches a subset, and why it must contain no calls, since one of them
-could free the block partway through.
+## See also
 
-The loop shapes this reads are wider than the simplest one. The test may carry
-arithmetic (`while (i + 3 <= len)`), the index may step by more than one, and
-the variable an access indexes by need not be the one the test bounds: a loop
-reading three bytes and writing four advances two counters, and the second is
-pinned to the first by both starting at zero and both stepping by a constant.
-
-**One check for a bounded index.** A masked index reaches the same range every
-iteration, so where the object's size is unknown the check still lifts out of
-the loop, with a constant length.
-
-What none of those settle still gets checked, but against an allocation the
-enclosing loop resolved once rather than by asking the runtime each time. That
-applies wherever the loop cannot release what it is walking and the pointer
-either holds still or is a fixed one displaced, which covers most indexing
-even when nothing about the index itself can be argued.
-
-## The shape of the implementation
-
-The compiler marks every access during lowering and resolves the marks
-immediately afterwards, before the optimizer runs. Nothing downstream ever sees
-a safety opcode: the optimizer, the interpreter and all three code generators
-work on ordinary IR.
-
-Running before the optimizer is deliberate. Loops still have the canonical
-shape the bound proofs read most easily, and a foreign opcode drifting through
-a pass schedule full of exact-shape recognizers would be silently mishandled.
-The cost is that a check which would become provable only after inlining stays.
-
-There is a related hazard worth naming, because it bit during development. A
-loop recognizer scans a body for the pattern it knows, ignores what it does
-not, and then replaces the whole body. Handed a loop containing a check, it
-matched anyway and erased the check along with everything else, so the mode was
-silently absent in exactly the hot loops it exists to cover. Recognizers now
-refuse a body holding safety bookkeeping, and one fixture per recognizer family
-holds them to it.
-
-At run time, a map from address to owning allocation answers what survives. It
-is a three-level table over the address space holding one region id per
-16-byte granule, and ids index descriptors carrying each allocation's start and
-length. Heap blocks are described as they are allocated, globals once at the
-top of `main`, and a stack local for as long as its frame is alive, though only
-where a pointer to it actually leaves: every indexed array has its address
-taken, and describing on that alone would charge two calls per call to
-functions that never needed it.
-
-A described local is also aligned and padded to the map's 16-byte resolution,
-because two objects sharing one of those units cannot both be described and the
-runtime refuses to guess between them. Without that, the access most worth
-catching is the one that goes uncovered: an overrun of a few bytes lands
-exactly in the unit an object shares with its neighbour. Freeing does not clear the granules; it marks the descriptor dead and
-leaves them naming it, which is what lets a pointer kept across the free be
-reported as use-after-free rather than read back as untracked memory. The
-descriptor is reclaimed once a later allocation has taken every granule it
-held.
-
-Pointers stay ordinary machine pointers. The ABI, struct layouts and every
-foreign call are exactly as they were.
-
-## What it does not catch
-
-**Memory Mettle did not allocate.** Anything the runtime was never told about
-reads as unowned and is allowed through. A foreign library's pointer is not
-something the runtime can judge, and trapping on it would reject correct
-programs, which is the one thing this design refuses to do.
-
-**A pointer walked clear of every allocation.** This is the same rule biting a
-pointer that did start out valid. `p = p + n` far enough, and `p` no longer
-lands inside anything the runtime knows, so the access reads as untracked
-rather than as an overrun. What carries provenance here is the pointer's
-value, and a value outside every live region carries none: the runtime cannot
-tell which allocation it should have belonged to. Indexing (`p[i]`) is
-unaffected, since the base is still the pointer the allocation handed out and
-only the displacement moves. Catching the walked-off case needs bounds
-travelling with the pointer, which is the fat-pointer design this one avoids
-in order to leave the ABI alone.
-
-
-
-**The allocator itself.** An allocator writes a header below the pointer it
-returns, threads its free list through the bodies of released blocks, and
-poisons them on the way out. Against the model those read as an overrun and a
-use-after-free, and they are neither, so the module defining the heap entry
-points is not checked and calls into it are bracketed so work done on its
-behalf is skipped as well.
-
-**Reuse.** Once a freed block has been handed out again, a stale pointer to it
-resolves to the new owner and is bounds-checked against that. No scheme without
-a quarantine can do better, and how long reuse is delayed is the allocator's
-policy rather than the checker's.
-
-**Anything that is not a memory access.** Integer overflow, uninitialized
-reads, and data races are all out of scope. The compile-time memory analyzer
-([docs/borrow-checker.md](borrow-checker.md)) covers some of that ground
-statically and reports leaks, which nothing here does.
-
-**A loop that calls something which can free.** The whole-loop check is taken
-before the loop runs, so it cannot speak for memory a callee takes away
-halfway through. Where that is a real possibility the loop keeps its per-access
-checks, which is what makes the use-after-free reportable; see above for how
-the question is decided.
-
-## Trying it
-
-```bash
-mettle --build --release --safe tests/test_safe_use_after_free.mettle -o uaf.exe
-./uaf.exe
-```
-
-```
-Fatal error: use of memory after it was freed: 1 bytes at offset 0 of a 16 byte
-allocation (line 10)
-```
-
-The fixtures under `tests/test_safe_*.mettle` cover both directions. Each bad
-program is built with and without the flag, so the trap is shown to come from
-the check rather than from some unrelated change, and each clean program is
-required to return the same answer either way. Several are sized so that a
-range one byte too large would reject them.
+- [Borrow checker](borrow-checker.md)
+- [Heap allocation](heap-allocation.md)
+- [Diagnostics](diagnostics.md)
