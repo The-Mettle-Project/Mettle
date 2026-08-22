@@ -1890,6 +1890,27 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       }
       return type_checker_type_value(checker, symbol->type, expression);
     }
+    /* A bare function name is the function, so it types as a pointer to it --
+     * which is what makes `run(mix)` work and what makes `i < wm_count` (the
+     * call written without its parentheses) the type error it always was. A
+     * function symbol carries its RETURN type in `symbol->type`, so handing
+     * that back let a missing `()` sail through the checker and lower to a
+     * comparison against nothing. */
+    if (symbol->kind == SYMBOL_FUNCTION) {
+      Type *fn_return = symbol->data.function.return_type
+                            ? symbol->data.function.return_type
+                            : checker->builtin_void;
+      Type *fn_pointer = type_create_function_pointer(
+          symbol->data.function.parameter_types,
+          symbol->data.function.parameter_count, fn_return);
+      if (!fn_pointer) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "Failed to create function pointer type for '%s'", id->name);
+        return NULL;
+      }
+      return fn_pointer;
+    }
     if (type_is_comptime_only(symbol->type)) {
       return symbol->type;
     }
@@ -3132,11 +3153,42 @@ int type_checker_check_expression(TypeChecker *checker, ASTNode *expression) {
 }
 
 // Enhanced binary expression type checking
+/* `while (i < wm_count)` where wm_count is a function: the name alone is a
+ * pointer to the function, so the comparison is against an address rather than
+ * against the value the author meant. Naming the missing parentheses beats
+ * whatever the operator rules say about pointers a line later. */
+static int type_checker_report_call_without_parens(TypeChecker *checker,
+                                                   ASTNode *operand) {
+  if (!operand || operand->type != AST_IDENTIFIER || !operand->data) {
+    return 0;
+  }
+  Identifier *id = (Identifier *)operand->data;
+  Symbol *symbol = id ? type_checker_resolve_identifier(checker, id) : NULL;
+  if (!symbol || symbol->kind != SYMBOL_FUNCTION) {
+    return 0;
+  }
+  type_checker_set_error_at_location(
+      checker, operand->location,
+      "'%s' is a function, not a value; write '%s(%s)' to call it", id->name,
+      id->name, symbol->data.function.parameter_count ? "..." : "");
+  return 1;
+}
+
 Type *type_checker_check_binary_expression(TypeChecker *checker,
                                            BinaryExpression *binop,
                                            SourceLocation location) {
   if (!checker || !binop)
     return NULL;
+
+  /* Equality is left alone: `if (handler == on_event)` compares two function
+   * addresses and means exactly what it says. Every other operator on a
+   * function is the missing-parentheses mistake. */
+  if (binop->operator && strcmp(binop->operator, "==") != 0 &&
+      strcmp(binop->operator, "!=") != 0 &&
+      (type_checker_report_call_without_parens(checker, binop->left) ||
+       type_checker_report_call_without_parens(checker, binop->right))) {
+    return NULL;
+  }
 
   Type *left_type = type_checker_infer_type(checker, binop->left);
   Type *right_type = type_checker_infer_type(checker, binop->right);
