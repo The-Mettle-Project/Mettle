@@ -1059,6 +1059,24 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
                                            out_value);
     }
 
+    /* A function's name in value position is its address, which is what the
+     * type checker read it as and what `&name` spells out. Falling through to
+     * the symbol read below named a local that was never declared, so
+     * `apply(twice, 7)` compiled and then jumped through whatever the slot
+     * happened to hold.
+     *
+     * The type the CHECKER settled on decides this, not the symbol table: by
+     * lowering time the local scopes are popped, so a local named after a
+     * function finds the function here. `var value: int32 = 3;` beside a
+     * `fn value()` would otherwise read the function's address. */
+    if (symbol && symbol->kind == SYMBOL_FUNCTION &&
+        expression->resolved_type &&
+        expression->resolved_type->kind == TYPE_FUNCTION_POINTER) {
+      return ir_emit_address_of_symbol(
+          context, function, ir_local_ir_name(context, identifier->name),
+          expression->location, out_value);
+    }
+
     *out_value =
         ir_operand_symbol(ir_local_ir_name(context, identifier->name));
     if (!out_value->name) {

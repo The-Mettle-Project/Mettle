@@ -6,6 +6,15 @@ struct Ops { plus: fn(int32, int32) -> int32; neg: fn(int32) -> int32; }
 const OPS: Ops = { plus: &plus, neg: &neg };
 const DIRECT: fn(int32, int32) -> int32 = &plus;
 @noinline fn apply(f: fn(int32, int32) -> int32, a: int32, b: int32) -> int32 { return f(a, b); }
+@noinline fn twice(a: int32) -> int32 { return a * 2; }
+@noinline fn takes(f: fn(int32) -> int32, v: int32) -> int32 { return f(v); }
+@noinline fn hands_back() -> fn(int32) -> int32 { return twice; }
+/* A local named after a function: by IR-lowering time the local scopes are
+ * popped, so the name finds the function unless the checker's type decides. */
+@noinline fn shadowed() -> int32 {
+  var twice: int32 = 3;
+  return twice;
+}
 fn main() -> int32 {
   if (OPS.plus(2, 3) != 5) { return 1; }
   if (OPS.neg(4) != -4) { return 2; }
@@ -15,5 +24,10 @@ fn main() -> int32 {
   if (fp(1.5, 2.5) != 4.0) { return 5; }
   var bp: fn(int32) -> bool = &retbool;
   if (!bp(1)) { return 6; }
+  if (takes(twice, 5) != 10) { return 7; }
+  var bare: fn(int32) -> int32 = twice;
+  if (bare(6) != 12) { return 8; }
+  if (hands_back()(7) != 14) { return 9; }
+  if (shadowed() != 3) { return 10; }
   return 0;
 }
