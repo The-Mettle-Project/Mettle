@@ -3554,10 +3554,139 @@ static void adapt_wrap_if_needed(ASTNode **slot, ASTNode *owner,
   *slot = wrapper;
 }
 
+typedef struct {
+  const char *name;
+  const char *type_name;
+} AdaptLocalType;
+
+typedef struct {
+  AdaptLocalType *items;
+  size_t count;
+  size_t capacity;
+} AdaptLocals;
+
+static void adapt_locals_collect(ASTNode *node, AdaptLocals *locals) {
+  if (!node) {
+    return;
+  }
+  if (node->type == AST_VAR_DECLARATION) {
+    VarDeclaration *vd = (VarDeclaration *)node->data;
+    if (vd && vd->name && vd->type_name) {
+      if (locals->count == locals->capacity) {
+        size_t grown = locals->capacity ? locals->capacity * 2 : 8;
+        AdaptLocalType *items = (AdaptLocalType *)realloc(
+            locals->items, grown * sizeof(AdaptLocalType));
+        if (!items) {
+          return;
+        }
+        locals->items = items;
+        locals->capacity = grown;
+      }
+      locals->items[locals->count].name = vd->name;
+      locals->items[locals->count].type_name = vd->type_name;
+      locals->count++;
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    adapt_locals_collect(node->children[i], locals);
+  }
+}
+
+static const char *adapt_local_type(const AdaptLocals *locals,
+                                    const char *name) {
+  if (!locals || !name) {
+    return NULL;
+  }
+  for (size_t i = locals->count; i-- > 0;) {
+    if (locals->items[i].name && strcmp(locals->items[i].name, name) == 0) {
+      return locals->items[i].type_name;
+    }
+  }
+  return NULL;
+}
+
+static size_t mono_base_type_length(const char *type_str);
+
+static const char *adapt_field_type(Program *prog, const char *struct_type,
+                                    const char *field) {
+  size_t base_length;
+  if (!prog || !struct_type || !field) {
+    return NULL;
+  }
+  base_length = mono_base_type_length(struct_type);
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    StructDeclaration *sd = NULL;
+    if (!decl || decl->type != AST_STRUCT_DECLARATION) {
+      continue;
+    }
+    sd = (StructDeclaration *)decl->data;
+    if (!sd || !sd->name || strlen(sd->name) != base_length ||
+        strncmp(sd->name, struct_type, base_length) != 0) {
+      continue;
+    }
+    for (size_t f = 0; f < sd->field_count; f++) {
+      if (sd->field_names[f] && strcmp(sd->field_names[f], field) == 0) {
+        return sd->field_types[f];
+      }
+    }
+    return NULL;
+  }
+  return NULL;
+}
+
+static const char *adapt_expression_type(ASTNode *node,
+                                         const AdaptLocals *locals,
+                                         Program *prog) {
+  if (!node) {
+    return NULL;
+  }
+  switch (node->type) {
+  case AST_IDENTIFIER: {
+    Identifier *id = (Identifier *)node->data;
+    return id ? adapt_local_type(locals, id->name) : NULL;
+  }
+  case AST_INDEX_EXPRESSION: {
+    ArrayIndexExpression *index = (ArrayIndexExpression *)node->data;
+    return index ? adapt_expression_type(index->array, locals, prog) : NULL;
+  }
+  case AST_UNARY_EXPRESSION: {
+    UnaryExpression *unary = (UnaryExpression *)node->data;
+    if (unary && unary->operator&& strcmp(unary->operator, "*") == 0) {
+      return adapt_expression_type(unary->operand, locals, prog);
+    }
+    return NULL;
+  }
+  case AST_MEMBER_ACCESS: {
+    MemberAccess *member = (MemberAccess *)node->data;
+    if (!member || !member->member) {
+      return NULL;
+    }
+    return adapt_field_type(
+        prog, adapt_expression_type(member->object, locals, prog),
+        member->member);
+  }
+  default:
+    return NULL;
+  }
+}
+
+static const char *adapt_assignment_target_type(const Assignment *assign,
+                                                const AdaptLocals *locals,
+                                                Program *prog) {
+  if (!assign) {
+    return NULL;
+  }
+  if (!assign->target) {
+    return adapt_local_type(locals, assign->variable_name);
+  }
+  return adapt_expression_type(assign->target, locals, prog);
+}
+
 static void adapt_walk(ASTNode *node, const char *current_return_type,
                        ASTNode **top_decls, size_t top_count,
                        AdaptCache *cache, ASTNode *program, Program *prog,
-                       int *had_error) {
+                       int *had_error, const AdaptLocals *locals) {
   if (!node || node->type == AST_LAMBDA_EXPRESSION ||
       node->type == AST_CLOSURE_ADAPT_EXPRESSION)
     return;
@@ -3577,6 +3706,14 @@ static void adapt_walk(ASTNode *node, const char *current_return_type,
         rs->values[0] = rs->value;
       }
     }
+  } else if (node->type == AST_ASSIGNMENT) {
+    Assignment *assign = (Assignment *)node->data;
+    if (assign && assign->value) {
+      adapt_wrap_if_needed(
+          &assign->value, node,
+          adapt_assignment_target_type(assign, locals, prog), top_decls,
+          top_count, cache, program, prog, had_error);
+    }
   } else if (node->type == AST_FUNCTION_CALL) {
     CallExpression *call = (CallExpression *)node->data;
     if (call && !call->object && call->function_name) {
@@ -3595,17 +3732,20 @@ static void adapt_walk(ASTNode *node, const char *current_return_type,
 
   for (size_t i = 0; i < node->child_count; i++)
     adapt_walk(node->children[i], current_return_type, top_decls, top_count,
-              cache, program, prog, had_error);
+              cache, program, prog, had_error, locals);
 }
 
 static void adapt_process_fn(ASTNode *fnnode, ASTNode **top_decls,
                              size_t top_count, AdaptCache *cache,
                              ASTNode *program, Program *prog, int *had_error) {
   FunctionDeclaration *fd = (FunctionDeclaration *)fnnode->data;
+  AdaptLocals locals = {0};
   if (!fd || !fd->body)
     return;
+  adapt_locals_collect(fd->body, &locals);
   adapt_walk(fd->body, fd->return_type, top_decls, top_count, cache, program,
-            prog, had_error);
+            prog, had_error, &locals);
+  free(locals.items);
 }
 
 int closure_adapt_program(ASTNode *program, ErrorReporter *reporter) {

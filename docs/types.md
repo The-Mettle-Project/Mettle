@@ -262,7 +262,7 @@ fn main() -> int32 {
 }
 ```
 
-Adaptation applies at the point a plain function or lambda literal is directly written into an `Fn(...)` boundary (a call argument, a `var` declaration, or a `return`). A thin value already sitting in a variable, or assigned into an `Fn(...)`-typed struct field, is not yet adapted; write `&func` (or the lambda literal) directly at the boundary. Like every binding in Mettle, a local holding a closure states its type explicitly - `var f: Fn(int32) -> int32 = ...`. See [known limitations](known-limitations.md).
+Adaptation applies at the point a plain function or lambda literal is directly written into an `Fn(...)` boundary (a call argument, a `var` declaration, a `return`, or an assignment to a variable, a struct field, an array element or a field reached through a pointer). A thin value already sitting in a variable is not yet adapted; write `&func` (or the lambda literal) directly at the boundary. Like every binding in Mettle, a local holding a closure states its type explicitly - `var f: Fn(int32) -> int32 = ...`. See [known limitations](known-limitations.md).
 
 ## Array Types
 

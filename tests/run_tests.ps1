@@ -12639,6 +12639,8 @@ $runFixtures = @(
      What = "a closure taking or returning a struct, string or tagged enum lost it" },
   @{ Name = "deref_aggregate"; Path = "tests/codegen/deref_aggregate.mettle"
      What = "dereferencing a pointer to an aggregate copied only its first word" },
+  @{ Name = "closure_field_assign"; Path = "tests/codegen/closure_field_assign.mettle"
+     What = "assigning a plain function or non-capturing lambda into an Fn(...) target was refused instead of adapted" },
   @{ Name = "generic_enum_nested_ctor"; Path = "tests/codegen/generic_enum_nested_ctor.mettle"
      What = "a constructor nested in another constructor resolved to whichever instantiation of the enum came last" },
   @{ Name = "errdefer_result"; Path = "tests/codegen/errdefer_result.mettle"

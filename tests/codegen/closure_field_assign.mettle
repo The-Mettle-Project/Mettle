@@ -1,0 +1,48 @@
+struct Holder {
+  step: Fn(int64) -> int64;
+  label: string;
+}
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+fn plus_one(x: int64) -> int64 { return x + 1; }
+
+fn adder(n: int64) -> Fn(int64) -> int64 {
+  return fn(x: int64) -> int64 { return x + n; };
+}
+
+fn main() -> int32 {
+  var h: Holder;
+
+  h.step = fn(x: int64) -> int64 { return x * 2; };
+  h.label = "l";
+  if (h.step(opaque(5)) != 10) { return 1; }
+
+  h.step = &plus_one;
+  if (h.step(opaque(5)) != 6) { return 2; }
+
+  h.step = adder(opaque(10));
+  if (h.step(opaque(5)) != 15) { return 3; }
+
+  var g: Fn(int64) -> int64 = fn(x: int64) -> int64 { return x * 3; };
+  if (g(opaque(5)) != 15) { return 4; }
+
+  g = fn(x: int64) -> int64 { return x * 4; };
+  if (g(opaque(5)) != 20) { return 5; }
+
+  g = &plus_one;
+  if (g(opaque(5)) != 6) { return 6; }
+
+  var hs: Holder[2];
+  hs[0].step = fn(x: int64) -> int64 { return x * 5; };
+  hs[1].step = &plus_one;
+  if (hs[0].step(opaque(3)) != 15) { return 7; }
+  if (hs[1].step(opaque(3)) != 4) { return 8; }
+
+  var p: Holder* = &h;
+  p->step = fn(x: int64) -> int64 { return x - 1; };
+  if (p->step(opaque(9)) != 8) { return 9; }
+  if (h.step(opaque(9)) != 8) { return 10; }
+
+  return 0;
+}
