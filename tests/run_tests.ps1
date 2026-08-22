@@ -12623,6 +12623,8 @@ $runFixtures = @(
      What = "predicated counting dropped a merge label a second branch still reached" },
   @{ Name = "aggregate_copy_keeps_rcx"; Path = "tests/codegen/aggregate_copy_keeps_rcx.mettle"
      What = "a rep movsb aggregate copy clobbered a value the allocator kept in RCX" },
+  @{ Name = "closure_aggregates"; Path = "tests/codegen/closure_aggregates.mettle"
+     What = "a closure taking or returning a struct, string or tagged enum lost it" },
   @{ Name = "deref_aggregate"; Path = "tests/codegen/deref_aggregate.mettle"
      What = "dereferencing a pointer to an aggregate copied only its first word" },
   @{ Name = "multi_return_aggregates"; Path = "tests/codegen/multi_return_aggregates.mettle"

@@ -4329,6 +4329,39 @@ int code_generator_binary_emit_call_indirect(
     }
   }
 
+  if (instruction->value_type &&
+      code_generator_abi_classify(instruction->value_type) ==
+          ABI_PASS_INDIRECT) {
+    size_t return_size = code_generator_abi_type_size(instruction->value_type);
+    if (instruction->dest.kind == IR_OPERAND_SYMBOL && instruction->dest.name) {
+      const CgSym *destination_symbol =
+          code_generator_lookup_symbol(generator, instruction->dest.name);
+      if (!destination_symbol || !destination_symbol->type ||
+          code_generator_type_is_aggregate(destination_symbol->type)) {
+        if (!code_generator_binary_emit_struct_destination_address(
+                generator, context, instruction->dest.name, BINARY_GP_RDX) ||
+            !code_generator_binary_emit_rep_movsb(generator, context,
+                                                  BINARY_GP_RAX,
+                                                  BINARY_GP_RDX,
+                                                  return_size)) {
+          if (!generator->has_error) {
+            code_generator_set_error(
+                generator, "Out of memory copying indirect call result");
+          }
+          return 0;
+        }
+        return 1;
+      }
+    }
+    if (instruction->dest.kind == IR_OPERAND_TEMP && instruction->dest.name &&
+        !binary_indirect_temp_add(context, instruction->dest.name,
+                                  return_size)) {
+      code_generator_set_error(generator,
+                               "Out of memory tagging indirect-return temp");
+      return 0;
+    }
+  }
+
   if (!code_generator_binary_emit_destination_store(generator, context,
                                                     &instruction->dest,
                                                     BINARY_GP_RAX)) {

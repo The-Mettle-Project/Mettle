@@ -1,0 +1,114 @@
+struct P { x: int64; y: int64; }
+struct Wide { a: int64; b: int64; c: int64; d: int64; }
+
+enum Val {
+  I(int64),
+  S(string),
+  Nothing
+}
+
+@noinline fn opaque(n: int64) -> int64 { return n; }
+
+@noinline fn named_sum(p: P) -> int64 { return p.x + p.y; }
+
+@noinline fn through_param(f: Fn(P) -> int64, p: P) -> int64 { return f(p); }
+
+fn main() -> int32 {
+  var base: P;
+  base.x = 1; base.y = 2;
+
+  var plain: Fn(P) -> int64 = fn(p: P) -> int64 { return p.x + p.y; };
+  if (plain(base) != 3) { return 1; }
+
+  var adapted: Fn(P) -> int64 = &named_sum;
+  if (adapted(base) != 3) { return 2; }
+
+  if (through_param(plain, base) != 3) { return 3; }
+
+  var k: int64 = opaque(10);
+  var capturing: Fn(P) -> int64 = fn(p: P) -> int64 { return p.x + p.y + k; };
+  if (capturing(base) != 13) { return 4; }
+
+  var mixed: Fn(int64, P) -> int64 = fn(n: int64, p: P) -> int64 {
+    return n + p.x + p.y;
+  };
+  if (mixed(opaque(4), base) != 7) { return 5; }
+
+  var wide: Wide;
+  wide.a = 1; wide.b = 2; wide.c = 3; wide.d = 4;
+  var wide_sum: Fn(Wide) -> int64 = fn(w: Wide) -> int64 {
+    return w.a + w.b + w.c + w.d;
+  };
+  if (wide_sum(wide) != 10) { return 6; }
+
+  var text: string = "hello";
+  var text_len: Fn(string) -> int64 = fn(s: string) -> int64 {
+    return (int64)s.length;
+  };
+  if (text_len(text) != 5) { return 7; }
+
+  var tagged: Val = I(41);
+  var tag_of: Fn(Val) -> int64 = fn(v: Val) -> int64 {
+    match (v) {
+      case I(n): { return n; }
+      case S(s): { return 100; }
+      case Nothing: { return 0 - 1; }
+    }
+    return 0 - 2;
+  };
+  if (tag_of(tagged) != 41) { return 8; }
+  tagged = S("named");
+  if (tag_of(tagged) != 100) { return 9; }
+  tagged = Nothing();
+  if (tag_of(tagged) != 0 - 1) { return 10; }
+
+  var make: Fn(int64) -> P = fn(n: int64) -> P {
+    var r: P;
+    r.x = n;
+    r.y = n + 1;
+    return r;
+  };
+  var made: P = make(opaque(7));
+  if (made.x != 7 || made.y != 8) { return 11; }
+  if (named_sum(make(opaque(20))) != 41) { return 12; }
+
+  var make_wide: Fn(int64) -> Wide = fn(n: int64) -> Wide {
+    var r: Wide;
+    r.a = n; r.b = n + 1; r.c = n + 2; r.d = n + 3;
+    return r;
+  };
+  var wide_made: Wide = make_wide(opaque(1));
+  if (wide_made.a != 1 || wide_made.b != 2 || wide_made.c != 3 ||
+      wide_made.d != 4) {
+    return 13;
+  }
+
+  var pick: Fn(int64) -> string = fn(n: int64) -> string {
+    if (n > 0) { return "positive"; }
+    return "other";
+  };
+  if (pick(opaque(1)) != "positive") { return 14; }
+  if (pick(opaque(0)) != "other") { return 15; }
+
+  var wrap: Fn(int64) -> Val = fn(n: int64) -> Val { return I(n); };
+  if (tag_of(wrap(opaque(9))) != 9) { return 16; }
+
+  var roundtrip: Fn(P) -> P = fn(p: P) -> P {
+    var r: P;
+    r.x = p.y;
+    r.y = p.x;
+    return r;
+  };
+  var swapped: P = roundtrip(base);
+  if (swapped.x != 2 || swapped.y != 1) { return 17; }
+  if (base.x != 1 || base.y != 2) { return 18; }
+
+  var mutate: Fn(P) -> int64 = fn(p: P) -> int64 {
+    p.x = 99;
+    return p.x + p.y;
+  };
+  if (mutate(base) != 101) { return 19; }
+  if (base.x != 1) { return 20; }
+
+  return 0;
+}

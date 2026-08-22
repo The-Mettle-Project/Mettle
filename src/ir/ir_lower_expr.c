@@ -37,6 +37,73 @@ int ir_lower_statement_or_expression(IRLoweringContext *context,
 }
 
 
+static int ir_indirect_arg_passes_by_address(Type *type) {
+  return type && type->name &&
+         (type->kind == TYPE_STRUCT || type->kind == TYPE_TAGGED_ENUM) &&
+         type->size > 8 && type->size <= (size_t)INT_MAX;
+}
+
+static int ir_indirect_return_passes_by_pointer(Type *type) {
+  return type && type->name &&
+         (type->kind == TYPE_STRUCT || type->kind == TYPE_STRING ||
+          type->kind == TYPE_TAGGED_ENUM) &&
+         type->size > 8 && type->size <= (size_t)INT_MAX;
+}
+
+static int ir_make_indirect_return_slot(IRLoweringContext *context,
+                                        IRFunction *function, Type *type,
+                                        SourceLocation location,
+                                        IROperand *out_address) {
+  char *slot_name = ir_new_label_name(context, "agg_ret");
+
+  if (!slot_name) {
+    ir_set_error(context, "Out of memory while reserving an aggregate return");
+    return 0;
+  }
+  if (!ir_emit_local_declaration(context, function, slot_name, type->name,
+                                 location) ||
+      !ir_emit_address_of_symbol(context, function, slot_name, location,
+                                 out_address)) {
+    free(slot_name);
+    ir_operand_destroy(out_address);
+    return 0;
+  }
+  free(slot_name);
+  return 1;
+}
+
+static int ir_pass_aggregate_argument_by_address(IRLoweringContext *context,
+                                                 IRFunction *function,
+                                                 IROperand *argument,
+                                                 Type *type,
+                                                 SourceLocation location) {
+  char *copy_name = ir_new_label_name(context, "agg_arg");
+  IROperand copy_address = ir_operand_none();
+
+  if (!copy_name) {
+    ir_set_error(context, "Out of memory while copying aggregate argument");
+    return 0;
+  }
+  if (!ir_emit_local_declaration(context, function, copy_name, type->name,
+                                 location) ||
+      !ir_emit_address_of_symbol(context, function, copy_name, location,
+                                 &copy_address)) {
+    free(copy_name);
+    ir_operand_destroy(&copy_address);
+    return 0;
+  }
+  free(copy_name);
+  if (!ir_try_emit_aggregate_address_memcpy(context, function, &copy_address,
+                                            argument, type, location)) {
+    ir_operand_destroy(&copy_address);
+    ir_set_error(context, "Cannot pass this aggregate through an indirect call");
+    return 0;
+  }
+  ir_operand_destroy(argument);
+  *argument = copy_address;
+  return 1;
+}
+
 int ir_lower_call_expression(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *expression,
                                     IROperand *out_value) {
@@ -717,16 +784,56 @@ int ir_lower_call_expression(IRLoweringContext *context,
     }
   }
 
+  if (call->callee_closure_env || is_func_ptr_var) {
+    for (size_t i = 0; i < call->argument_count; i++) {
+      Type *argument_type =
+          call->arguments[i] ? call->arguments[i]->resolved_type : NULL;
+      if (!ir_indirect_arg_passes_by_address(argument_type)) {
+        continue;
+      }
+      if (!ir_pass_aggregate_argument_by_address(context, function,
+                                                 &arguments[i], argument_type,
+                                                 call->arguments[i]->location)) {
+        for (size_t j = 0; j < call->argument_count; j++) {
+          ir_operand_destroy(&arguments[j]);
+        }
+        free(arguments);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+    }
+  }
+
+  IROperand indirect_return_address = ir_operand_none();
+  if ((call->callee_closure_env || is_func_ptr_var) &&
+      ir_indirect_return_passes_by_pointer(expression->resolved_type) &&
+      !ir_make_indirect_return_slot(context, function,
+                                    expression->resolved_type,
+                                    expression->location,
+                                    &indirect_return_address)) {
+    for (size_t i = 0; i < call->argument_count; i++)
+      ir_operand_destroy(&arguments[i]);
+    free(arguments);
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+
   if (call->callee_closure_env) {
     /* Closure call: the variable holds an 8-byte pointer to a heap record whose
      * field 0 is the code pointer. Load the code pointer, then call it passing
      * the record pointer (the environment) as a hidden leading argument that the
      * lifted function receives as its first parameter. */
+    size_t lead = 1;
+    size_t at = 0;
     IROperand code = ir_operand_none();
+    if (indirect_return_address.kind != IR_OPERAND_NONE) {
+      lead = 2;
+    }
     if (!ir_make_temp_operand(context, &code)) {
       for (size_t i = 0; i < call->argument_count; i++)
         ir_operand_destroy(&arguments[i]);
       free(arguments);
+      ir_operand_destroy(&indirect_return_address);
       ir_operand_destroy(&destination);
       return 0;
     }
@@ -743,22 +850,28 @@ int ir_lower_call_expression(IRLoweringContext *context,
         ir_operand_destroy(&arguments[i]);
       free(arguments);
       ir_operand_destroy(&code);
+      ir_operand_destroy(&indirect_return_address);
       ir_operand_destroy(&destination);
       return 0;
     }
 
-    IROperand *cargs = calloc(call->argument_count + 1, sizeof(IROperand));
+    IROperand *cargs = calloc(call->argument_count + lead, sizeof(IROperand));
     if (!cargs) {
       for (size_t i = 0; i < call->argument_count; i++)
         ir_operand_destroy(&arguments[i]);
       free(arguments);
       ir_operand_destroy(&code);
+      ir_operand_destroy(&indirect_return_address);
       ir_operand_destroy(&destination);
       return 0;
     }
-    cargs[0] = ir_operand_symbol(call->function_name);
+    if (lead == 2) {
+      cargs[at++] = indirect_return_address;
+      indirect_return_address = ir_operand_none();
+    }
+    cargs[at++] = ir_operand_symbol(call->function_name);
     for (size_t i = 0; i < call->argument_count; i++)
-      cargs[i + 1] = arguments[i];
+      cargs[at + i] = arguments[i];
     free(arguments);
 
     IRInstruction cinstr = {0};
@@ -766,10 +879,13 @@ int ir_lower_call_expression(IRLoweringContext *context,
     cinstr.location = expression->location;
     cinstr.dest = destination;
     cinstr.lhs = code;
+    cinstr.value_type = expression->resolved_type
+                            ? mtlc_type_from_frontend(expression->resolved_type)
+                            : NULL;
     cinstr.arguments = cargs;
-    cinstr.argument_count = call->argument_count + 1;
+    cinstr.argument_count = call->argument_count + lead;
     int ok = ir_emit(context, function, &cinstr);
-    for (size_t i = 0; i < call->argument_count + 1; i++)
+    for (size_t i = 0; i < call->argument_count + lead; i++)
       ir_operand_destroy(&cargs[i]);
     free(cargs);
     ir_operand_destroy(&code);
@@ -781,11 +897,33 @@ int ir_lower_call_expression(IRLoweringContext *context,
     return 1;
   }
 
+  IROperand *emitted_arguments = arguments;
+  size_t emitted_argument_count = call->argument_count;
+  IROperand *prefixed_arguments = NULL;
+  if (indirect_return_address.kind != IR_OPERAND_NONE) {
+    prefixed_arguments = calloc(call->argument_count + 1, sizeof(IROperand));
+    if (!prefixed_arguments) {
+      for (size_t i = 0; i < call->argument_count; i++)
+        ir_operand_destroy(&arguments[i]);
+      free(arguments);
+      ir_operand_destroy(&indirect_return_address);
+      ir_operand_destroy(&destination);
+      ir_set_error(context, "Out of memory while lowering an indirect call");
+      return 0;
+    }
+    prefixed_arguments[0] = indirect_return_address;
+    indirect_return_address = ir_operand_none();
+    for (size_t i = 0; i < call->argument_count; i++)
+      prefixed_arguments[i + 1] = arguments[i];
+    emitted_arguments = prefixed_arguments;
+    emitted_argument_count = call->argument_count + 1;
+  }
+
   IRInstruction instruction = {0};
   instruction.location = expression->location;
   instruction.dest = destination;
-  instruction.arguments = arguments;
-  instruction.argument_count = call->argument_count;
+  instruction.arguments = emitted_arguments;
+  instruction.argument_count = emitted_argument_count;
   instruction.value_type = expression->resolved_type
                                ? mtlc_type_from_frontend(expression->resolved_type)
                                : NULL;
@@ -795,9 +933,10 @@ int ir_lower_call_expression(IRLoweringContext *context,
     instruction.lhs = ir_operand_symbol(call->function_name);
     if (instruction.lhs.kind != IR_OPERAND_SYMBOL || !instruction.lhs.name) {
       ir_operand_destroy(&instruction.lhs);
-      for (size_t i = 0; i < call->argument_count; i++) {
-        ir_operand_destroy(&arguments[i]);
+      for (size_t i = 0; i < emitted_argument_count; i++) {
+        ir_operand_destroy(&emitted_arguments[i]);
       }
+      free(prefixed_arguments);
       free(arguments);
       ir_operand_destroy(&destination);
       ir_set_error(context,
@@ -817,17 +956,19 @@ int ir_lower_call_expression(IRLoweringContext *context,
   }
 
   if (!ir_emit(context, function, &instruction)) {
-    for (size_t i = 0; i < call->argument_count; i++) {
-      ir_operand_destroy(&arguments[i]);
+    for (size_t i = 0; i < emitted_argument_count; i++) {
+      ir_operand_destroy(&emitted_arguments[i]);
     }
+    free(prefixed_arguments);
     free(arguments);
     ir_operand_destroy(&destination);
     return 0;
   }
 
-  for (size_t i = 0; i < call->argument_count; i++) {
-    ir_operand_destroy(&arguments[i]);
+  for (size_t i = 0; i < emitted_argument_count; i++) {
+    ir_operand_destroy(&emitted_arguments[i]);
   }
+  free(prefixed_arguments);
   free(arguments);
 
   *out_value = destination;
@@ -2036,12 +2177,51 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       }
     }
 
+    for (size_t i = 0; i < fp_call->argument_count; i++) {
+      Type *argument_type =
+          fp_call->arguments[i] ? fp_call->arguments[i]->resolved_type : NULL;
+      if (!ir_indirect_arg_passes_by_address(argument_type)) {
+        continue;
+      }
+      if (!ir_pass_aggregate_argument_by_address(
+              context, function, &arguments[i], argument_type,
+              fp_call->arguments[i]->location)) {
+        for (size_t j = 0; j < fp_call->argument_count; j++) {
+          ir_operand_destroy(&arguments[j]);
+        }
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+    }
+
+    IROperand indirect_return_address = ir_operand_none();
+    if (ir_indirect_return_passes_by_pointer(expression->resolved_type) &&
+        !ir_make_indirect_return_slot(context, function,
+                                      expression->resolved_type,
+                                      expression->location,
+                                      &indirect_return_address)) {
+      for (size_t i = 0; i < fp_call->argument_count; i++) {
+        ir_operand_destroy(&arguments[i]);
+      }
+      free(arguments);
+      ir_operand_destroy(&func_ptr);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
     if (func_type && func_type->kind == TYPE_FUNCTION_POINTER &&
         func_type->closure_env) {
       /* Closure value: func_ptr is the environment pointer. Load the code
        * pointer from field 0 and pass the environment as a hidden leading
        * argument. */
+      size_t lead = 1;
+      size_t at = 0;
       IROperand code = ir_operand_none();
+      if (indirect_return_address.kind != IR_OPERAND_NONE) {
+        lead = 2;
+      }
       if (!ir_make_temp_operand(context, &code)) {
         for (size_t i = 0; i < fp_call->argument_count; i++)
           ir_operand_destroy(&arguments[i]);
@@ -2063,32 +2243,43 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
         free(arguments);
         ir_operand_destroy(&func_ptr);
         ir_operand_destroy(&code);
+        ir_operand_destroy(&indirect_return_address);
         ir_operand_destroy(&destination);
         return 0;
       }
-      IROperand *cargs = calloc(fp_call->argument_count + 1, sizeof(IROperand));
+      IROperand *cargs =
+          calloc(fp_call->argument_count + lead, sizeof(IROperand));
       if (!cargs) {
         for (size_t i = 0; i < fp_call->argument_count; i++)
           ir_operand_destroy(&arguments[i]);
         free(arguments);
         ir_operand_destroy(&func_ptr);
         ir_operand_destroy(&code);
+        ir_operand_destroy(&indirect_return_address);
         ir_operand_destroy(&destination);
         return 0;
       }
-      cargs[0] = func_ptr;
+      if (lead == 2) {
+        cargs[at++] = indirect_return_address;
+        indirect_return_address = ir_operand_none();
+      }
+      cargs[at++] = func_ptr;
       for (size_t i = 0; i < fp_call->argument_count; i++)
-        cargs[i + 1] = arguments[i];
+        cargs[at + i] = arguments[i];
       free(arguments);
       IRInstruction cinstr = {0};
       cinstr.op = IR_OP_CALL_INDIRECT;
       cinstr.location = expression->location;
       cinstr.dest = destination;
       cinstr.lhs = code;
+      cinstr.value_type =
+          expression->resolved_type
+              ? mtlc_type_from_frontend(expression->resolved_type)
+              : NULL;
       cinstr.arguments = cargs;
-      cinstr.argument_count = fp_call->argument_count + 1;
+      cinstr.argument_count = fp_call->argument_count + lead;
       int ok = ir_emit(context, function, &cinstr);
-      for (size_t i = 0; i < fp_call->argument_count + 1; i++)
+      for (size_t i = 0; i < fp_call->argument_count + lead; i++)
         ir_operand_destroy(&cargs[i]);
       free(cargs);
       ir_operand_destroy(&code);
@@ -2100,28 +2291,59 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       return 1;
     }
 
+    IROperand *emitted_arguments = arguments;
+    size_t emitted_argument_count = fp_call->argument_count;
+    IROperand *prefixed_arguments = NULL;
+    if (indirect_return_address.kind != IR_OPERAND_NONE) {
+      prefixed_arguments =
+          calloc(fp_call->argument_count + 1, sizeof(IROperand));
+      if (!prefixed_arguments) {
+        for (size_t i = 0; i < fp_call->argument_count; i++) {
+          ir_operand_destroy(&arguments[i]);
+        }
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&indirect_return_address);
+        ir_operand_destroy(&destination);
+        ir_set_error(context, "Out of memory while lowering an indirect call");
+        return 0;
+      }
+      prefixed_arguments[0] = indirect_return_address;
+      indirect_return_address = ir_operand_none();
+      for (size_t i = 0; i < fp_call->argument_count; i++)
+        prefixed_arguments[i + 1] = arguments[i];
+      emitted_arguments = prefixed_arguments;
+      emitted_argument_count = fp_call->argument_count + 1;
+    }
+
     IRInstruction instruction = {0};
     instruction.op = IR_OP_CALL_INDIRECT;
     instruction.location = expression->location;
     instruction.dest = destination;
     // For indirect calls, we use lhs to hold the function pointer operand
     instruction.lhs = func_ptr;
-    instruction.arguments = arguments;
-    instruction.argument_count = fp_call->argument_count;
+    instruction.value_type =
+        expression->resolved_type
+            ? mtlc_type_from_frontend(expression->resolved_type)
+            : NULL;
+    instruction.arguments = emitted_arguments;
+    instruction.argument_count = emitted_argument_count;
 
     if (!ir_emit(context, function, &instruction)) {
-      for (size_t i = 0; i < fp_call->argument_count; i++) {
-        ir_operand_destroy(&arguments[i]);
+      for (size_t i = 0; i < emitted_argument_count; i++) {
+        ir_operand_destroy(&emitted_arguments[i]);
       }
+      free(prefixed_arguments);
       free(arguments);
       ir_operand_destroy(&func_ptr);
       ir_operand_destroy(&destination);
       return 0;
     }
 
-    for (size_t i = 0; i < fp_call->argument_count; i++) {
-      ir_operand_destroy(&arguments[i]);
+    for (size_t i = 0; i < emitted_argument_count; i++) {
+      ir_operand_destroy(&emitted_arguments[i]);
     }
+    free(prefixed_arguments);
     free(arguments);
     ir_operand_destroy(&func_ptr);
 
