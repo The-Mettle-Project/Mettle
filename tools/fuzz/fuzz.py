@@ -154,6 +154,14 @@ def main():
         fbk_bc, _ = build(args.compiler, src, dbg, release=False, no_mir=True)
         fbk_rc = run(dbg)[0] if fbk_bc == 0 else None
 
+        # Same again at release. The fallback emitter carries its own
+        # register promotion, and a global promoted there once lived in a
+        # register with no load at entry and no store at exit -- invisible
+        # to every comparison above, because MIR takes those functions
+        # whenever it can.
+        rfb_bc, _ = build(args.compiler, src, rel, release=True, no_mir=True)
+        rfb_rc = run(rel)[0] if rfb_bc == 0 else None
+
         if dbg_rc != rel_rc:
             attr = attribute(args.compiler, src, rel, dbg_rc)
             save_repro(f"EXIT DIVERGENCE: debug={dbg_rc}, release={rel_rc}"
@@ -161,6 +169,9 @@ def main():
         elif fbk_rc is not None and fbk_rc != dbg_rc:
             save_repro(f"BACKEND DIVERGENCE at -O0: mir={dbg_rc},"
                        f" fallback={fbk_rc}")
+        elif rfb_rc is not None and rfb_rc != rel_rc:
+            save_repro(f"BACKEND DIVERGENCE at --release: mir={rel_rc},"
+                       f" fallback={rfb_rc}")
         elif is_crash(dbg_rc) and is_crash(rel_rc):
             save_repro(f"both crash (rc={dbg_rc}) -- possible UB in generator")
         elif args.keep:
