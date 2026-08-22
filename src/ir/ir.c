@@ -5217,7 +5217,20 @@ static void ir_dead_fn_mark(const IrFnNameTable *table, const char *name,
   }
 }
 
-int ir_program_eliminate_dead_functions(IRProgram *program) {
+int ir_init_image_is_all_zero(const IRModuleSymbol *symbol) {
+  if (!symbol || !symbol->init_bytes || symbol->init_bytes_size == 0 ||
+      symbol->init_reloc_count > 0) {
+    return 0;
+  }
+  for (size_t i = 0; i < symbol->init_bytes_size; i++) {
+    if (symbol->init_bytes[i] != 0) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+int ir_program_eliminate_dead_functions(IRProgram *program, int keep_exports) {
   IrFnNameTable table;
   unsigned char *live = NULL;
   size_t *worklist = NULL;
@@ -5251,9 +5264,11 @@ int ir_program_eliminate_dead_functions(IRProgram *program) {
         live[i] = 1;
         worklist[worklist_count++] = i;
         found_main = 1;
-      } else if (program->functions[i]->is_exported) {
-        /* `export fn` says something outside this program may call it, so
-         * reachability from main does not decide whether it is needed. */
+      } else if (program->functions[i]->is_kernel ||
+                 (keep_exports && program->functions[i]->is_exported)) {
+        /* A GPU entry point is launched by the driver against the emitted
+         * module, so no instruction in this program has to name it. `export fn`
+         * roots only when something outside this program is joining the link. */
         live[i] = 1;
         worklist[worklist_count++] = i;
       }

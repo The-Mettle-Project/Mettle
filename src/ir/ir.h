@@ -924,9 +924,22 @@ void ir_gpu_call_graph_destroy(IRGpuCallGraph *graph);
  * from `main`. A function is considered referenced when any instruction of a
  * live function names it in `text` (direct calls), a SYMBOL operand
  * (function-pointer uses), or a STRING operand (dispatch-by-name). Programs
- * without a `main` (library objects) are left untouched. Run it after
- * inlining so fully-inlined helpers are swept too. Returns 1 on success
- * (including no-op), 0 on allocation failure. */
-int ir_program_eliminate_dead_functions(IRProgram *program);
+ * without a `main` (library objects) are left untouched. GPU entry points root
+ * unconditionally, because the driver launches them against the emitted module
+ * rather than through any instruction here. `export fn` roots only when
+ * `keep_exports` is set: an executable image publishes no symbol table for
+ * anything outside to call through, so unless a foreign object is joining the
+ * link, an exported helper nothing in the program reaches is as dead as an
+ * internal one. Run it once before optimization to keep the pipeline off bodies
+ * that will not ship, and again after inlining so fully-inlined helpers are
+ * swept too. Returns 1 on success (including no-op), 0 on allocation failure. */
+int ir_program_eliminate_dead_functions(IRProgram *program, int keep_exports);
+
+/* True when a module symbol's folded initializer image is nothing but zero
+ * bytes and carries no relocations, so reserving the space costs the object
+ * file nothing. `var wm: Fact[100];` is written as a zero image now that an
+ * uninitialized aggregate starts zeroed, and writing those bytes out was a
+ * quarter of some binaries. */
+int ir_init_image_is_all_zero(const IRModuleSymbol *symbol);
 
 #endif // IR_H

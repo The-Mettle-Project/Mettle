@@ -32,19 +32,27 @@ int tolower(int character);
 void *malloc(mt_size size);
 void free(void *memory);
 
+/* read_buffer is allocated on the first buffered read and only for a file
+ * opened read-only, which is what lets fgets stop asking the kernel for one
+ * byte at a time. See mt_stream_read. */
 typedef struct MtFile {
   mt_i64 handle;
   mt_u32 flags;
   mt_i64 child_pid;
+  unsigned char *read_buffer;
+  int read_fill;
+  int read_pos;
 } MtFile;
 
 #define MT_FILE_READ 1u
 #define MT_FILE_WRITE 2u
+#define MT_FILE_BUFFERED 4u
 #define MT_FILE_STANDARD 0x80000000u
+#define MT_FILE_BUFFER_BYTES 8192
 
-static MtFile mt_stdin_file = {0, MT_FILE_STANDARD | MT_FILE_READ, 0};
-static MtFile mt_stdout_file = {1, MT_FILE_STANDARD | MT_FILE_WRITE, 0};
-static MtFile mt_stderr_file = {2, MT_FILE_STANDARD | MT_FILE_WRITE, 0};
+static MtFile mt_stdin_file = {0, MT_FILE_STANDARD | MT_FILE_READ, 0, 0, 0, 0};
+static MtFile mt_stdout_file = {1, MT_FILE_STANDARD | MT_FILE_WRITE, 0, 0, 0, 0};
+static MtFile mt_stderr_file = {2, MT_FILE_STANDARD | MT_FILE_WRITE, 0, 0, 0, 0};
 #if defined(_WIN32)
 static int mt_errno_value;
 #else
@@ -983,7 +991,13 @@ void *fopen(const char *path, const char *mode) {
   file->handle = (mt_i64)handle;
   file->flags = (access & MT_GENERIC_READ ? MT_FILE_READ : 0u) |
                 (access & MT_GENERIC_WRITE ? MT_FILE_WRITE : 0u);
+  if (file->flags == MT_FILE_READ) {
+    file->flags |= MT_FILE_BUFFERED;
+  }
   file->child_pid = 0;
+  file->read_buffer = MT_NULL;
+  file->read_fill = 0;
+  file->read_pos = 0;
   if (append) {
     SetFilePointerEx(handle, 0, MT_NULL, MT_FILE_END);
   }
@@ -997,6 +1011,7 @@ int fclose(void *stream) {
     return file ? 0 : -1;
   }
   int result = CloseHandle((void *)(mt_i64)file->handle) ? 0 : -1;
+  free(file->read_buffer);
   free(file);
   return result;
 }
@@ -1233,6 +1248,9 @@ void *popen(const char *command, const char *mode) {
   file->handle = (mt_i64)read_pipe;
   file->flags = MT_FILE_READ;
   file->child_pid = (mt_i64)process.process;
+  file->read_buffer = MT_NULL;
+  file->read_fill = 0;
+  file->read_pos = 0;
   return file;
 }
 
@@ -1246,6 +1264,7 @@ int pclose(void *stream) {
   (void)WaitForSingleObject(process, 0xffffffffu);
   (void)GetExitCodeProcess(process, &status);
   CloseHandle(process);
+  free(file->read_buffer);
   free(file);
   return (int)status;
 }
@@ -1957,21 +1976,145 @@ int mprotect(void *address, mt_size length, int protection) {
                                         length, protection, 0, 0, 0));
 }
 
+/* Size-classed heap over a few large mappings.
+ *
+ * Every allocation used to be its own mmap and every free its own munmap. That
+ * is one syscall each way, a page fault on first touch, and a whole 4 KiB page
+ * for a four-byte string. A compile that allocates three hundred thousand
+ * times therefore spent most of its wall clock in the kernel: on this repo's
+ * own 1500-line sample the Linux build took 1.5 s where the Windows build,
+ * which reaches HeapAlloc, took 0.55 s.
+ *
+ * The header stays 16 bytes so the payload keeps its 16-byte alignment, and
+ * base[0] still distinguishes the two shapes: a small block stores its class
+ * plus one (1..MT_HEAP_CLASS_COUNT), a large one stores its mapping size,
+ * which is always at least a page. Small blocks come off a per-class free list
+ * or a bump pointer into the current chunk, and go back to the free list on
+ * free; the chunk itself is never unmapped, which is what makes the common
+ * allocate/free/allocate cycle syscall-free. Allocations above
+ * MT_HEAP_LARGE_MIN keep the old one-mapping-each behaviour, so a program that
+ * allocates and releases big buffers still returns that memory to the kernel.
+ *
+ * The classes are the powers of two from 16 to 16384, so a class index is one
+ * shift away from a size and back, with no table to carry. A finer ladder would
+ * waste less memory per block, but this file is linked into every Mettle binary
+ * and the arithmetic to walk a finer ladder costs more bytes there than the
+ * fragmentation is worth.
+ *
+ * Losing the one-mapping-per-allocation layout also loses the guard page that
+ * made a heap overrun fault immediately. MTLC_POISON_FREED_OPERANDS and the
+ * memory diagnostics cover that ground deliberately instead. */
+#define MT_HEAP_HEADER 16
+#define MT_HEAP_CLASS_COUNT 11
+#define MT_HEAP_LARGE_MIN 16384
+#define MT_HEAP_CHUNK_MIN (256u * 1024u)
+#define MT_HEAP_CHUNK_MAX (8u * 1024u * 1024u)
+#define MT_HEAP_CLASS_BYTES(c) ((mt_size)16 << (c))
+
+static void *mt_heap_free_list[MT_HEAP_CLASS_COUNT];
+static char *mt_heap_bump;
+static mt_size mt_heap_bump_left;
+static mt_size mt_heap_chunk_size;
+static volatile int mt_heap_lock;
+
+static int mt_heap_class_of(mt_size size) {
+  if (size <= 16) {
+    return 0;
+  }
+  return 60 - __builtin_clzll((mt_u64)size - 1);
+}
+
+/* Out of line and cold: uncontended acquire is one exchange. */
+__attribute__((noinline)) static void mt_heap_lock_contended(void) {
+  int spins = 0;
+  while (__atomic_exchange_n(&mt_heap_lock, 1, __ATOMIC_ACQUIRE)) {
+    if (++spins > 64) {
+      mt_syscall6(MT_SYS_SCHED_YIELD, 0, 0, 0, 0, 0, 0);
+      spins = 0;
+    }
+  }
+}
+
+static void mt_heap_acquire(void) {
+  if (__atomic_exchange_n(&mt_heap_lock, 1, __ATOMIC_ACQUIRE)) {
+    mt_heap_lock_contended();
+  }
+}
+
+static void mt_heap_release(void) {
+  __atomic_store_n(&mt_heap_lock, 0, __ATOMIC_RELEASE);
+}
+
+/* Out of line: this is the only place the mmap syscall sequence is written, and
+ * both the large-allocation path and the chunk refill reach it. */
+__attribute__((noinline)) static void *mt_heap_map(mt_size bytes) {
+  void *mapping = mmap(MT_NULL, bytes, MT_PROT_READ | MT_PROT_WRITE,
+                       MT_MAP_PRIVATE | MT_MAP_ANONYMOUS, -1, 0);
+  return mapping == (void *)-1 ? MT_NULL : mapping;
+}
+
+/* Cold: once per chunk, which is once per few thousand allocations. Caller
+ * holds the heap lock. */
+__attribute__((noinline)) static int mt_heap_refill(void) {
+  mt_size want = mt_heap_chunk_size ? mt_heap_chunk_size * 2
+                                    : (mt_size)MT_HEAP_CHUNK_MIN;
+  char *chunk;
+  if (want > MT_HEAP_CHUNK_MAX) {
+    want = MT_HEAP_CHUNK_MAX;
+  }
+  chunk = (char *)mt_heap_map(want);
+  if (!chunk) {
+    return 0;
+  }
+  /* The tail of the old chunk is abandoned rather than tracked: it is at most
+   * one block, against a chunk of a quarter megabyte or more. */
+  mt_heap_bump = chunk;
+  mt_heap_bump_left = want;
+  mt_heap_chunk_size = want;
+  return 1;
+}
+
+/* One block off the size-class lists, header included. Out of line so malloc
+ * stays a handful of instructions on the path that hits a free list. */
+__attribute__((noinline)) static mt_u64 *mt_heap_take(int class_index) {
+  mt_u64 *base;
+  mt_size block_bytes = MT_HEAP_CLASS_BYTES(class_index) + MT_HEAP_HEADER;
+
+  mt_heap_acquire();
+  base = (mt_u64 *)mt_heap_free_list[class_index];
+  if (base) {
+    mt_heap_free_list[class_index] = *(void **)(base + 2);
+  } else if (mt_heap_bump_left >= block_bytes || mt_heap_refill()) {
+    base = (mt_u64 *)mt_heap_bump;
+    mt_heap_bump += block_bytes;
+    mt_heap_bump_left -= block_bytes;
+  }
+  mt_heap_release();
+  return base;
+}
+
 void *malloc(mt_size size) {
+  mt_u64 *base;
+  mt_u64 tag;
+
   if (size == 0) {
     size = 1;
   }
-  if (size > MT_SIZE_MAX - 16) {
+  if (size > MT_HEAP_LARGE_MIN) {
+    if (size > MT_SIZE_MAX - MT_HEAP_HEADER) {
+      return MT_NULL;
+    }
+    tag = (mt_u64)size + MT_HEAP_HEADER;
+    base = (mt_u64 *)mt_heap_map((mt_size)tag);
+  } else {
+    int class_index = mt_heap_class_of(size);
+    tag = (mt_u64)(class_index + 1);
+    base = mt_heap_take(class_index);
+  }
+  if (!base) {
     return MT_NULL;
   }
-  mt_size mapping_size = size + 16;
-  mt_u64 *base = (mt_u64 *)mmap(MT_NULL, mapping_size,
-                                 MT_PROT_READ | MT_PROT_WRITE,
-                                 MT_MAP_PRIVATE | MT_MAP_ANONYMOUS, -1, 0);
-  if (base == (void *)-1) {
-    return MT_NULL;
-  }
-  base[0] = mapping_size;
+  base[0] = tag;
   base[1] = size;
   __atomic_add_fetch(&mt_allocation_count, 1, __ATOMIC_RELAXED);
   return base + 2;
@@ -1981,7 +2124,14 @@ void *calloc(mt_size count, mt_size size) {
   if (size && count > MT_SIZE_MAX / size) {
     return MT_NULL;
   }
-  return malloc(count * size);
+  mt_size total = count * size;
+  void *memory = malloc(total);
+  /* A recycled block carries whatever the last owner left in it, so unlike the
+   * one-mapping-each heap this cannot lean on mmap handing back zeroed pages. */
+  if (memory && total) {
+    memset(memory, 0, total);
+  }
+  return memory;
 }
 
 void free(void *memory) {
@@ -1990,7 +2140,14 @@ void free(void *memory) {
   }
   mt_u64 *base = (mt_u64 *)memory - 2;
   __atomic_add_fetch(&mt_free_count, 1, __ATOMIC_RELAXED);
-  munmap(base, base[0]);
+  if (base[0] > MT_HEAP_CLASS_COUNT) {
+    munmap(base, base[0]);
+    return;
+  }
+  mt_heap_acquire();
+  *(void **)memory = mt_heap_free_list[base[0] - 1];
+  mt_heap_free_list[base[0] - 1] = base;
+  mt_heap_release();
 }
 
 void *realloc(void *memory, mt_size size) {
@@ -2003,6 +2160,13 @@ void *realloc(void *memory, mt_size size) {
   }
   mt_u64 *base = (mt_u64 *)memory - 2;
   mt_size old_size = base[1];
+  /* Growing inside the block it already occupies is the common case behind
+   * every doubling array in the compiler, and it costs nothing. */
+  if (base[0] <= MT_HEAP_CLASS_COUNT &&
+      size <= MT_HEAP_CLASS_BYTES(base[0] - 1)) {
+    base[1] = size;
+    return memory;
+  }
   void *replacement = malloc(size);
   if (!replacement) {
     return MT_NULL;
@@ -2052,8 +2216,11 @@ void *fopen(const char *path, const char *mode) {
     return MT_NULL;
   }
   file->handle = fd;
-  file->flags = 0;
+  file->flags = flags == MT_O_RDONLY ? (MT_FILE_READ | MT_FILE_BUFFERED) : 0u;
   file->child_pid = 0;
+  file->read_buffer = MT_NULL;
+  file->read_fill = 0;
+  file->read_pos = 0;
   return file;
 }
 
@@ -2064,6 +2231,7 @@ int fclose(void *stream) {
     return file ? 0 : -1;
   }
   int result = close((int)file->handle);
+  free(file->read_buffer);
   free(file);
   return result;
 }
@@ -2723,6 +2891,9 @@ void *popen(const char *command, const char *mode) {
   file->handle = descriptors[0];
   file->flags = MT_FILE_READ;
   file->child_pid = pid;
+  file->read_buffer = MT_NULL;
+  file->read_fill = 0;
+  file->read_pos = 0;
   return file;
 }
 
@@ -2734,6 +2905,7 @@ int pclose(void *stream) {
   }
   mt_i64 pid = file->child_pid;
   close((int)file->handle);
+  free(file->read_buffer);
   free(file);
   int status = 0;
   for (;;) {
@@ -2756,12 +2928,86 @@ int system(const char *command) {
 #endif
 }
 
+/* Every read above this goes straight to the kernel: the copy through the
+ * buffer would cost more than the syscall it saves. */
+#define MT_FILE_BUFFER_BYPASS (MT_FILE_BUFFER_BYTES / 2)
+
+/* Reads through a per-file buffer when the file was opened read-only. fgets
+ * used to ask the kernel for a single byte per character, which is fine on a
+ * local disk and ruinous anywhere a syscall is expensive: reading one 46 MB
+ * table under WSL took three and a third million read() calls and five
+ * minutes. Standard streams and pipes stay unbuffered, so a program that
+ * hands its descriptor to a child, or interleaves reads with writes, sees
+ * exactly the bytes it did before. */
+static mt_ssize mt_stream_read(MtFile *file, void *buffer, mt_size bytes) {
+  unsigned char *out = (unsigned char *)buffer;
+  mt_size done = 0;
+
+  if (!(file->flags & MT_FILE_BUFFERED)) {
+    return mt_file_read(file, buffer, bytes);
+  }
+
+  while (done < bytes) {
+    mt_size available = (mt_size)(file->read_fill - file->read_pos);
+    mt_size wanted = bytes - done;
+
+    if (available == 0) {
+      mt_ssize filled;
+      if (wanted >= MT_FILE_BUFFER_BYPASS) {
+        filled = mt_file_read(file, out + done, wanted);
+        if (filled <= 0) {
+          break;
+        }
+        done += (mt_size)filled;
+        continue;
+      }
+      if (!file->read_buffer) {
+        file->read_buffer = (unsigned char *)malloc(MT_FILE_BUFFER_BYTES);
+        if (!file->read_buffer) {
+          file->flags &= ~MT_FILE_BUFFERED;
+          break;
+        }
+      }
+      filled = mt_file_read(file, file->read_buffer, MT_FILE_BUFFER_BYTES);
+      if (filled <= 0) {
+        break;
+      }
+      file->read_fill = (int)filled;
+      file->read_pos = 0;
+      available = (mt_size)filled;
+    }
+
+    if (available > wanted) {
+      available = wanted;
+    }
+    memcpy(out + done, file->read_buffer + file->read_pos, available);
+    file->read_pos += (int)available;
+    done += available;
+  }
+
+  if (done == 0 && bytes != 0) {
+    return 0;
+  }
+  return (mt_ssize)done;
+}
+
+/* Bytes read ahead of what the caller has consumed. Seek and tell have to
+ * account for them: the kernel's offset is that far past the stream's. */
+static mt_size mt_stream_pending(const MtFile *file) {
+  return (mt_size)(file->read_fill - file->read_pos);
+}
+
+static void mt_stream_discard(MtFile *file) {
+  file->read_fill = 0;
+  file->read_pos = 0;
+}
+
 mt_size fread(void *buffer, mt_size size, mt_size count, void *stream) {
   if (!stream || (size && count > MT_SIZE_MAX / size)) {
     return 0;
   }
   mt_size bytes = size * count;
-  mt_ssize result = mt_file_read((MtFile *)stream, buffer, bytes);
+  mt_ssize result = mt_stream_read((MtFile *)stream, buffer, bytes);
   if (result <= 0 || size == 0) {
     return 0;
   }
@@ -2810,7 +3056,7 @@ char *fgets(char *buffer, int size, void *stream) {
   }
   while (used + 1 < size) {
     mt_u8 byte = 0;
-    mt_ssize result = mt_file_read((MtFile *)stream, &byte, 1);
+    mt_ssize result = mt_stream_read((MtFile *)stream, &byte, 1);
     if (result != 1) {
       break;
     }
@@ -2842,15 +3088,25 @@ int fputc(int character, void *stream) {
 }
 
 int fseek(void *stream, long offset, int origin) {
+  MtFile *file = (MtFile *)stream;
   if (!stream || origin < 0 || origin > 2) {
     mt_errno_value = 22;
     return -1;
   }
-  return mt_file_seek((MtFile *)stream, (mt_i64)offset, origin) < 0 ? -1 : 0;
+  /* A seek from the current position has to start from where the caller
+   * thinks it is, not from where the read-ahead left the descriptor. */
+  if (origin == 1) {
+    offset -= (long)mt_stream_pending(file);
+  }
+  mt_stream_discard(file);
+  return mt_file_seek(file, (mt_i64)offset, origin) < 0 ? -1 : 0;
 }
 
 long ftell(void *stream) {
   mt_i64 position = stream ? mt_file_seek((MtFile *)stream, 0, 1) : -1;
+  if (position >= 0) {
+    position -= (mt_i64)mt_stream_pending((MtFile *)stream);
+  }
   return (long)position;
 }
 

@@ -2756,8 +2756,37 @@ static int mir_call_may_write_globals(CodeGenerator *g, const IRFunction *irf,
  * uses, so it needs no new encoder support and the allocator schedules the
  * pointers and temps normally. Used to copy an INDIRECT struct into a caller's
  * hidden return slot (and, later, for whole-struct assignment and arguments). */
+/* Above this many bytes a block copy stops being unrolled. Each unrolled word
+ * costs a load and a store, about sixteen bytes of code, so a 608-byte struct
+ * -- a rule table entry, an engine's config record -- was expanding to more
+ * than a kilobyte of moves at every copy site. `rep movsb` is a dozen
+ * instructions whatever the count, and the microcoded copy beats a long
+ * straight-line run once the count is this large anyway. Below the threshold
+ * the unrolled form still wins: it needs no register marshalling and leaves
+ * the function a leaf. */
+#define MIR_STRUCT_COPY_UNROLL_MAX 128
+
 static int mir_emit_struct_copy(MirFunction *fn, MirVregId dst_base,
                                 MirVregId src_base, int size) {
+  if (size > MIR_STRUCT_COPY_UNROLL_MAX) {
+    /* Same shape the memcpy call lowering uses: put destination, source and
+     * count in the active convention's first three integer argument registers
+     * and let MIR_REP_MOVSB be the copy. */
+    const BinaryAbi *abi = code_generator_binary_active_abi();
+    if (abi && abi->int_param_count >= 3) {
+      return mir_emit1(fn, MIR_MOV,
+                       mir_op_phys(abi->int_param_registers[0], MIR_RC_GP),
+                       mir_op_vreg(dst_base), mir_op_none(), 8, 0, 0) &&
+             mir_emit1(fn, MIR_MOV,
+                       mir_op_phys(abi->int_param_registers[1], MIR_RC_GP),
+                       mir_op_vreg(src_base), mir_op_none(), 8, 0, 0) &&
+             mir_emit1(fn, MIR_MOV,
+                       mir_op_phys(abi->int_param_registers[2], MIR_RC_GP),
+                       mir_op_imm(size), mir_op_none(), 8, 0, 0) &&
+             mir_emit1(fn, MIR_REP_MOVSB, mir_op_symbol("memcpy"),
+                       mir_op_none(), mir_op_none(), 8, 0, 0);
+    }
+  }
   for (int k = 0; k < size;) {
     int rem = size - k;
     int w = rem >= 8 ? 8 : (rem >= 4 ? 4 : (rem >= 2 ? 2 : 1));

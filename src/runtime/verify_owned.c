@@ -299,16 +299,27 @@ int mettle_verify_owned_executable(const char *path, char *reason,
     return 0;
   }
   fclose(file);
-  if ((size_t)length >= 4u && data[0] == 0x7fu && data[1] == 'E' &&
-      data[2] == 'L' && data[3] == 'F') {
-    result = verify_elf(data, (size_t)length, reason, reason_size);
-  } else if ((size_t)length >= 2u && data[0] == 'M' && data[1] == 'Z') {
-    result = verify_pe(data, (size_t)length, reason, reason_size);
-  } else {
-    set_reason(reason, reason_size, "linked output is not PE32+ or ELF64");
-  }
+  result = mettle_verify_owned_image(data, (size_t)length, reason, reason_size);
   free(data);
   return result;
+}
+
+int mettle_verify_owned_image(const unsigned char *data, size_t size,
+                              char *reason, size_t reason_size) {
+  if (reason && reason_size) reason[0] = '\0';
+  if (!data) {
+    set_reason(reason, reason_size, "missing executable image");
+    return 0;
+  }
+  if (size >= 4u && data[0] == 0x7fu && data[1] == 'E' && data[2] == 'L' &&
+      data[3] == 'F') {
+    return verify_elf(data, size, reason, reason_size);
+  }
+  if (size >= 2u && data[0] == 'M' && data[1] == 'Z') {
+    return verify_pe(data, size, reason, reason_size);
+  }
+  set_reason(reason, reason_size, "linked output is not PE32+ or ELF64");
+  return 0;
 }
 
 int mettle_link_argument_uses_forbidden_runtime(const char *argument) {

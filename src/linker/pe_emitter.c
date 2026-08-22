@@ -4,6 +4,7 @@
 
 #include "linker/import_lib.h"
 #include "linker/relocation.h"
+#include "runtime/verify_owned.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -1682,7 +1683,13 @@ int pe_emit_executable(LinkResolution *resolution, const char *output_path,
     goto cleanup;
   }
 
-  file = fopen(output_path, "wb");
+  /* Read/write, so the ownership check below can read the image back through
+   * this handle. Opening a finished executable is what a virus scanner charges
+   * for, and it was costing more than the whole link: remove any previous
+   * output first so this open finds no old image to inspect, and never open
+   * the file a second time. */
+  remove(output_path);
+  file = fopen(output_path, "w+b");
   if (!file) {
     mettle_set_error(error_message_out, "Failed to open PE output file '%s'",
                  output_path);
@@ -1701,11 +1708,45 @@ int pe_emit_executable(LinkResolution *resolution, const char *output_path,
     goto cleanup;
   }
 
-  ok = 1;
+  {
+    char ownership_error[256];
+    long written = 0;
+    unsigned char *image = NULL;
+
+    if (fflush(file) != 0 || fseek(file, 0, SEEK_END) != 0 ||
+        (written = ftell(file)) < 0 || fseek(file, 0, SEEK_SET) != 0) {
+      mettle_set_error(error_message_out,
+                   "Failed to re-read the emitted PE image for verification");
+      goto cleanup;
+    }
+    image = (unsigned char *)malloc((size_t)written ? (size_t)written : 1u);
+    if (!image ||
+        fread(image, 1u, (size_t)written, file) != (size_t)written) {
+      free(image);
+      mettle_set_error(error_message_out,
+                   "Failed to load the emitted PE image for verification");
+      goto cleanup;
+    }
+    ownership_error[0] = '\0';
+    ok = mettle_verify_owned_image(image, (size_t)written, ownership_error,
+                                   sizeof(ownership_error));
+    free(image);
+    if (!ok) {
+      mettle_set_error(error_message_out, "%s",
+                   ownership_error[0] ? ownership_error
+                                      : "emitted image is not owned");
+      goto cleanup;
+    }
+  }
 
 cleanup:
   if (file) {
     fclose(file);
+    if (!ok) {
+      /* Half an image, or one that failed the ownership check: leaving it
+       * behind would let a later step mistake it for a finished executable. */
+      remove(output_path);
+    }
   }
   pe_import_plan_destroy(&import_plan);
   pe_destroy_import_libraries(libraries, library_count);

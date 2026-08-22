@@ -465,8 +465,11 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
    * image (`var t: int32[4] = [1, 2, 3, 4];`, and every global aggregate
    * `const`) or is plain zero-filled storage of its laid-out size. The image
    * goes to .data with its relocations; the zero case stays in .bss, where it
-   * costs nothing in the object file. Handled ahead of the scalar path, whose
-   * type check is shared with ABI decisions and must keep rejecting them. */
+   * costs nothing in the object file. An all-zero image counts as the zero
+   * case: since an uninitialized aggregate starts zeroed, `var wm: Fact[100];`
+   * arrives here carrying five kilobytes of nothing. Handled ahead of the
+   * scalar path, whose type check is shared with ABI decisions and must keep
+   * rejecting them. */
   if (type->kind == MTLC_TYPE_STRUCT || type->kind == MTLC_TYPE_ARRAY) {
     size_t aggregate_size = type->size;
     size_t aggregate_alignment = type->alignment ? type->alignment : 8;
@@ -490,7 +493,8 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
           sym->name);
       return 0;
     }
-    if (sym->init_bytes && sym->init_bytes_size > 0) {
+    if (sym->init_bytes && sym->init_bytes_size > 0 &&
+        !ir_init_image_is_all_zero(sym)) {
       return code_generator_binary_emit_global_aggregate_image(
           generator, link_name, sym, aggregate_alignment);
     }

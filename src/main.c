@@ -1225,6 +1225,11 @@ cleanup:
 }
 #endif /* !_WIN32 */
 
+/* Set when the linker that produced the executable already proved it owns
+ * its runtime, so the driver does not open the finished file to prove it
+ * again: on Windows that second open is what a virus scanner charges for. */
+static int g_link_output_ownership_verified;
+
 #ifdef _WIN32
 typedef struct {
   char **items;
@@ -2417,6 +2422,10 @@ static int mettle_link_object_file(const char *object_filename,
       if (mettle_link_internal(object_paths, object_is_default, object_count,
                                  executable_filename, 0, options) == 0) {
         build_result = 0;
+        /* The internal PE emitter checked the image it wrote, from the handle
+         * it already had. Reopening the file to check it again is what a virus
+         * scanner charges for. */
+        g_link_output_ownership_verified = 1;
       } else if (linker_mode == LINKER_MODE_INTERNAL) {
         fprintf(stderr, "Error: Internal linker failed to produce an executable\n");
       } else if (!has_gcc && !has_link) {
@@ -3701,7 +3710,7 @@ int main(int argc, char *argv[]) {
                                      build_output_filename,
                                      auto_runtime_directory, &options);
 #endif
-    if (result == 0) {
+    if (result == 0 && !g_link_output_ownership_verified) {
       char ownership_error[256];
       if (!mettle_verify_owned_executable(build_output_filename,
                                            ownership_error,
@@ -4882,6 +4891,29 @@ int compile_file(const char *input_filename, const char *output_filename,
     }
   }
 
+  /* Executable builds sweep functions unreachable from main. Importing a
+   * stdlib module emits the whole module, so without this every binary carries
+   * the unused siblings of each function it actually calls. Skipped for
+   * profile/tracy/debug-hook builds, whose instrumentation tables enumerate
+   * every function. */
+  int sweep_dead_functions = options->building_executable && !options->tracy &&
+                             !compiler_options_use_profile_runtime(options) &&
+                             !options->debug_hooks;
+  /* A foreign object on the link line (`--link-arg caller.o`) may call any
+   * `export fn` without a single Mettle instruction naming it, so the exports
+   * have to stay rooted whenever one is present. */
+  int keep_exports = options->link_argument_count > 0;
+
+  /* Sweep once before the optimizer: a body that will not ship should not cost
+   * a full pipeline first. The optimizer never synthesizes a call to a Mettle
+   * function, so nothing dropped here can come back. */
+  if (sweep_dead_functions &&
+      !ir_program_eliminate_dead_functions(ir_program, keep_exports)) {
+    fprintf(stderr, "Error: Failed to eliminate dead functions\n");
+    result = 1;
+    goto cleanup;
+  }
+
   if (options->optimize) {
     compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);
     phase_start = compiler_profile_begin(&profile);
@@ -4898,15 +4930,10 @@ int compile_file(const char *input_filename, const char *output_filename,
     ir_note_simd_contracts_unverified(ir_program);
   }
 
-  /* Executable builds: drop functions unreachable from main. Importing a
-   * stdlib module emits the whole module, so without this every binary
-   * carries the unused siblings of each function it actually calls. Runs
-   * after the optimizer so functions the inliner fully absorbed are swept
-   * too. Skipped for profile/tracy builds, whose instrumentation tables
-   * enumerate every function. */
-  if (options->building_executable && !options->tracy &&
-      !compiler_options_use_profile_runtime(options) && !options->debug_hooks &&
-      !ir_program_eliminate_dead_functions(ir_program)) {
+  /* And again after the optimizer, so a helper the inliner absorbed into its
+   * only caller is swept as well. */
+  if (sweep_dead_functions &&
+      !ir_program_eliminate_dead_functions(ir_program, keep_exports)) {
     fprintf(stderr, "Error: Failed to eliminate dead functions\n");
     result = 1;
     goto cleanup;

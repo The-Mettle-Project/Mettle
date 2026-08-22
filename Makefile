@@ -125,7 +125,11 @@ bundle-stdlib: | $(BINDIR)
 # function/datum so the ELF link's --gc-sections can drop whatever a given
 # program does not use.
 RUNTIME_OBJ_CFLAGS = $(FREESTANDING_CFLAGS) -D_GNU_SOURCE -Isrc
-FREESTANDING_CFLAGS = -std=c99 -O2 -ffreestanding -fno-builtin \
+# -fno-ident: without it every runtime object carries a .comment naming the
+# host gcc, and the linker copies it into the executable -- a section, a
+# section header and a producer string in every Mettle binary, for a compiler
+# that did not write the program.
+FREESTANDING_CFLAGS = -std=c99 -O2 -ffreestanding -fno-builtin -fno-ident \
 	-fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
 	-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 	-ffunction-sections -fdata-sections -fno-jump-tables $(ARCH_CFLAGS)
@@ -148,7 +152,7 @@ $(HOST_STARTUP_OBJECT): $(RUNTIMEDIR)/host_startup.c | $(OBJDIR)
 bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 	rm -rf $(BINDIR)/runtime
 	cp -r $(RUNTIMEDIR) $(BINDIR)/runtime
-	$(CC) $(FREESTANDING_CFLAGS) -c $(RUNTIMEDIR)/freestanding.c -o $(OBJDIR)/runtime/freestanding.o
+	$(CC) $(FREESTANDING_CFLAGS) -Os -c $(RUNTIMEDIR)/freestanding.c -o $(OBJDIR)/runtime/freestanding.o
 	cp $(OBJDIR)/runtime/freestanding.o $(BINDIR)/runtime/freestanding.o
 	cp $(HOST_STARTUP_OBJECT) $(BINDIR)/runtime/host_startup.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(STDLIBDIR)/tracy_helpers.c -o $(OBJDIR)/runtime/tracy_helpers.o

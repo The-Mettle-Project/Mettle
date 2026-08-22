@@ -7161,7 +7161,7 @@ try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $peEmitterExe = Join-Path $tmpDir "pe_emitter_test.exe"
 
-  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests/pe_emitter_test.c src/common.c src/lexer/lexer.c src/error/error_reporter.c src/linker/coff_reader.c src/linker/symbol_resolve.c src/linker/relocation.c src/linker/pe_emitter.c src/linker/import_lib.c src/codegen/binary_emitter.c src/codegen/elf_emitter.c -Isrc -Isrc/codegen -o $peEmitterExe 2>&1 | Out-String
+  $compileHarness = & gcc -Wall -Wextra -std=c99 -g -O0 -D_GNU_SOURCE tests/pe_emitter_test.c src/common.c src/lexer/lexer.c src/error/error_reporter.c src/linker/coff_reader.c src/linker/symbol_resolve.c src/linker/relocation.c src/linker/pe_emitter.c src/linker/import_lib.c src/runtime/verify_owned.c src/codegen/binary_emitter.c src/codegen/elf_emitter.c -Isrc -Isrc/codegen -o $peEmitterExe 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "PE-emitter harness compile failed: $compileHarness"
   }
@@ -9518,7 +9518,10 @@ try {
 
   $current = @{}
   foreach ($line in ($rotOut -split "`r?`n")) {
-    if ($line -match '^\[loop-fp\] function=(\S+) loop=\S+ fp=(\S+) claimed=(\d)') {
+    # Unanchored: PowerShell decorates the FIRST line a native program writes to
+    # stderr with "mettle.exe : ", so anchoring here made the gate depend on
+    # which function happened to report first.
+    if ($line -match '\[loop-fp\] function=(\S+) loop=\S+ fp=(\S+) claimed=(\d)') {
       if ($Matches[1] -like 'rc_*') {
         $current[$Matches[1]] = @{ Fp = $Matches[2]; Claimed = $Matches[3] }
       }
