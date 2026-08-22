@@ -1,0 +1,84 @@
+/* The accumulate if-conversion turns `if (c) { s = s + x; }` inside a loop
+ * into an unconditional `s = s + x * c`. It used to retire the merge labels
+ * the guard reached without asking whether anything else reached them, and a
+ * short-circuit `&&` lowers to two branches at the same else label. */
+
+@noinline fn count_and(a: int32*, n: int32, lo: int32, hi: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] >= lo && a[i] <= hi) {
+      c = c + 1;
+    }
+    i = i + 1;
+  }
+  return c;
+}
+
+@noinline fn sum_and(a: int32*, n: int32, lo: int32) -> int32 {
+  var s: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] > lo && a[i] < 90) {
+      s = s + a[i];
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+@noinline fn count_or(a: int32*, n: int32, lo: int32, hi: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] < lo || a[i] > hi) {
+      c = c + 1;
+    }
+    i = i + 1;
+  }
+  return c;
+}
+
+@noinline fn count_single(a: int32*, n: int32, lo: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] > lo) {
+      c = c + 1;
+    }
+    i = i + 1;
+  }
+  return c;
+}
+
+/* A guard whose arm never runs: the accumulator stays at its start value and
+ * the label the guard reached is still the target of the outer test. */
+@noinline fn never(n: int32) -> int32 {
+  var c: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (c > 0 && c < 3) {
+      c = c + 1;
+    }
+    i = i + 1;
+  }
+  return c;
+}
+
+fn main() -> int32 {
+  var a: int32[16];
+  var i: int32 = 0;
+  while (i < 16) {
+    a[i] = i * 7 - 10;
+    i = i + 1;
+  }
+
+  if (count_and(&a[0], 16, 0, 50) != 7) { return 1; }
+  if (count_and(&a[0], 16, -5, 95) != 15) { return 2; }
+  if (count_and(&a[0], 16, 100, 200) != 0) { return 3; }
+  if (sum_and(&a[0], 16, 10) != 594) { return 4; }
+  if (count_or(&a[0], 16, 0, 50) != 9) { return 5; }
+  if (count_single(&a[0], 16, 10) != 13) { return 6; }
+  if (never(20) != 0) { return 7; }
+  return 0;
+}

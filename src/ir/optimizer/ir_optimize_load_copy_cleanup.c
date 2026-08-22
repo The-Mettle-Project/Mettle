@@ -1117,6 +1117,25 @@ static int ir_accum_load_is_redundant(const IRFunction *function, size_t lo,
   return 0;
 }
 
+/* Whether any jump or branch still names `label`. The accumulate rewrite below
+ * retires the guard it converted, and may only retire the labels that guard
+ * reached if nothing else reaches them. */
+static int ir_accum_label_is_reached(const IRFunction *function,
+                                     const char *label) {
+  if (!label) {
+    return 1;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if ((ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+         ins->op == IR_OP_BRANCH_EQ) &&
+        ins->text && strcmp(ins->text, label) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* Turn a counted-under-a-condition accumulator into an unconditional one.
  *
  * `if (a[i] > t) { c = c + 1; }` is the ordinary way to count matches, and no
@@ -1325,8 +1344,21 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
           function->instructions[jump] = sum;
         }
         ir_instruction_make_nop(&function->instructions[i]);
-        ir_instruction_make_nop(&function->instructions[else_label]);
-        ir_instruction_make_nop(&function->instructions[end_label]);
+        /* Both labels can have a second predecessor. A short-circuit `&&`
+         * lowers to two branches at the same else label, so retiring it on
+         * behalf of the inner guard alone left the outer branch pointing at
+         * nothing -- codegen refused the function, and the shapes that did not
+         * refuse it counted the wrong thing. Retire each only once the guard
+         * that just went away held its last reference; remove_unused_labels
+         * collects whatever this leaves behind. */
+        if (!ir_accum_label_is_reached(function,
+                                       function->instructions[else_label].text)) {
+          ir_instruction_make_nop(&function->instructions[else_label]);
+        }
+        if (!ir_accum_label_is_reached(function,
+                                       function->instructions[end_label].text)) {
+          ir_instruction_make_nop(&function->instructions[end_label]);
+        }
         if (changed) {
           *changed = 1;
         }
