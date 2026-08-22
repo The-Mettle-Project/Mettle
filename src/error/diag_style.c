@@ -235,7 +235,7 @@ static const DiagGlyphs g_unicode_glyphs = {
     "\xE2\x94\xAC", /* tee_down  */
     "\xE2\x94\xBC", /* tee_cross */
     "\xE2\x94\xB4", /* tee_up    */
-    "\xE2\x94\x94", /* elbow     */
+    "\xE2\x94\x94\xE2\x94\x80", /* elbow (two columns, like the ASCII one) */
     "\xE2\x86\x92", /* arrow     */
     "\xC2\xB7",     /* bullet    */
 };
@@ -287,45 +287,131 @@ void diag_repeat(FILE *out, const char *glyph, size_t n) {
   }
 }
 
-/* ---- rules --------------------------------------------------------------- */
+/* ---- rules ---------------------------------------------------------------
+ * Rules and highlighted source are assembled into a buffer, because --explain
+ * builds its whole report in memory before deciding where it goes. The stream
+ * forms below are thin wrappers over the buffer forms. */
+
+typedef struct {
+  char *buf;
+  size_t cap;
+  size_t len;
+} DiagBuf;
+
+static void db_puts(DiagBuf *b, const char *s) {
+  if (!s || !b->cap) {
+    return;
+  }
+  size_t n = strlen(s);
+  size_t room = (b->cap > b->len + 1) ? b->cap - b->len - 1 : 0;
+  if (n > room) {
+    n = room;
+  }
+  memcpy(b->buf + b->len, s, n);
+  b->len += n;
+  b->buf[b->len] = '\0';
+}
+
+static void db_write(DiagBuf *b, const char *s, size_t n) {
+  if (!s || !b->cap) {
+    return;
+  }
+  size_t room = (b->cap > b->len + 1) ? b->cap - b->len - 1 : 0;
+  if (n > room) {
+    n = room;
+  }
+  memcpy(b->buf + b->len, s, n);
+  b->len += n;
+  b->buf[b->len] = '\0';
+}
+
+static void db_repeat(DiagBuf *b, const char *s, size_t n) {
+  while (n--) {
+    db_puts(b, s);
+  }
+}
+
+size_t diag_rule_into(char *buf, size_t cap, size_t indent, const char *label,
+                      const char *label_sgr) {
+  if (!buf || !cap) {
+    return 0;
+  }
+  buf[0] = '\0';
+  DiagBuf b = {buf, cap, 0};
+  const DiagGlyphs *g = diag_glyphs();
+  const char *dim = diag_sgr_dim();
+  const char *reset = diag_sgr_reset();
+  size_t columns = diag_style_columns();
+
+  db_repeat(&b, " ", indent);
+  size_t drawn = indent;
+
+  db_puts(&b, dim);
+  db_repeat(&b, g->h, 2);
+  drawn += 2;
+
+  if (label && label[0]) {
+    db_puts(&b, " ");
+    drawn++;
+    db_puts(&b, reset);
+    db_puts(&b, label_sgr ? label_sgr : "");
+    db_puts(&b, label);
+    db_puts(&b, reset);
+    drawn += diag_visible_width(label);
+    /* A label wider than the terminal ends the rule rather than trailing a
+       lone space off the edge. */
+    if (columns > drawn + 1) {
+      db_puts(&b, dim);
+      db_puts(&b, " ");
+      drawn++;
+      if (columns > drawn) {
+        db_repeat(&b, g->h, columns - drawn);
+      }
+      db_puts(&b, reset);
+      return b.len;
+    }
+  }
+
+  if (columns > drawn) {
+    db_puts(&b, dim);
+    db_repeat(&b, g->h, columns - drawn);
+  }
+  db_puts(&b, reset);
+  return b.len;
+}
+
+size_t diag_rule_junction_into(char *buf, size_t cap, size_t indent,
+                               size_t gutter, const char *junction) {
+  if (!buf || !cap) {
+    return 0;
+  }
+  buf[0] = '\0';
+  DiagBuf b = {buf, cap, 0};
+  const DiagGlyphs *g = diag_glyphs();
+  size_t columns = diag_style_columns();
+
+  db_repeat(&b, " ", indent);
+  db_puts(&b, diag_sgr_dim());
+  db_repeat(&b, g->h, gutter + 1);
+  db_puts(&b, junction);
+
+  size_t drawn = indent + gutter + 2;
+  if (columns > drawn) {
+    db_repeat(&b, g->h, columns - drawn);
+  }
+  db_puts(&b, diag_sgr_reset());
+  return b.len;
+}
 
 void diag_rule(FILE *out, size_t indent, const char *label,
                const char *label_sgr) {
   if (!out) {
     return;
   }
-  const DiagGlyphs *g = diag_glyphs();
-  const char *dim = diag_sgr_dim();
-  const char *reset = diag_sgr_reset();
-  size_t columns = diag_style_columns();
-
-  for (size_t i = 0; i < indent; i++) {
-    fputc(' ', out);
-  }
-  size_t drawn = indent;
-
-  fprintf(out, "%s", dim);
-  diag_repeat(out, g->h, 2);
-  drawn += 2;
-
-  if (label && label[0]) {
-    fputc(' ', out);
-    drawn++;
-    fprintf(out, "%s%s%s%s", reset, label_sgr ? label_sgr : "", label, reset);
-    drawn += diag_visible_width(label);
-    /* A label wider than the terminal ends the rule rather than trailing a
-       lone space off the edge. */
-    if (columns > drawn + 1) {
-      fprintf(out, "%s ", dim);
-      drawn++;
-    }
-  }
-
-  if (columns > drawn) {
-    fprintf(out, "%s", dim);
-    diag_repeat(out, g->h, columns - drawn);
-  }
-  fprintf(out, "%s\n", reset);
+  char line[2048];
+  diag_rule_into(line, sizeof(line), indent, label, label_sgr);
+  fputs(line, out);
+  fputc('\n', out);
 }
 
 void diag_rule_junction(FILE *out, size_t indent, size_t gutter,
@@ -333,23 +419,10 @@ void diag_rule_junction(FILE *out, size_t indent, size_t gutter,
   if (!out) {
     return;
   }
-  const DiagGlyphs *g = diag_glyphs();
-  const char *dim = diag_sgr_dim();
-  const char *reset = diag_sgr_reset();
-  size_t columns = diag_style_columns();
-
-  for (size_t i = 0; i < indent; i++) {
-    fputc(' ', out);
-  }
-  fprintf(out, "%s", dim);
-  diag_repeat(out, g->h, gutter + 1);
-  fputs(junction, out);
-
-  size_t drawn = indent + gutter + 2;
-  if (columns > drawn) {
-    diag_repeat(out, g->h, columns - drawn);
-  }
-  fprintf(out, "%s\n", reset);
+  char line[2048];
+  diag_rule_junction_into(line, sizeof(line), indent, gutter, junction);
+  fputs(line, out);
+  fputc('\n', out);
 }
 
 /* ---- wrapping ------------------------------------------------------------ */
@@ -453,13 +526,18 @@ static int diag_word_in(const char *const *table, const char *word,
   return 0;
 }
 
-void diag_write_source(FILE *out, const char *text) {
-  if (!out || !text) {
-    return;
+size_t diag_source_into(char *buf, size_t cap, const char *text) {
+  if (!buf || !cap) {
+    return 0;
   }
+  buf[0] = '\0';
+  if (!text) {
+    return 0;
+  }
+  DiagBuf b = {buf, cap, 0};
   if (!diag_style_color()) {
-    fputs(text, out);
-    return;
+    db_puts(&b, text);
+    return b.len;
   }
 
   const char *reset = diag_sgr_reset();
@@ -468,8 +546,10 @@ void diag_write_source(FILE *out, const char *text) {
   while (*p) {
     /* Comments run to end of line. */
     if (p[0] == '/' && (p[1] == '/' || p[1] == '*')) {
-      fprintf(out, "%s%s%s", diag_sgr_dim(), p, reset);
-      return;
+      db_puts(&b, diag_sgr_dim());
+      db_puts(&b, p);
+      db_puts(&b, reset);
+      return b.len;
     }
 
     /* String and character literals. */
@@ -485,8 +565,9 @@ void diag_write_source(FILE *out, const char *text) {
       if (*p) {
         p++;
       }
-      fprintf(out, "%s%.*s%s", diag_sgr_green(), (int)(p - start), start,
-              reset);
+      db_puts(&b, diag_sgr_green());
+      db_write(&b, start, (size_t)(p - start));
+      db_puts(&b, reset);
       continue;
     }
 
@@ -499,7 +580,9 @@ void diag_write_source(FILE *out, const char *text) {
       if (*p == '!') {
         p++;
       }
-      fprintf(out, "%s%.*s%s", diag_sgr_blue(), (int)(p - start), start, reset);
+      db_puts(&b, diag_sgr_blue());
+      db_write(&b, start, (size_t)(p - start));
+      db_puts(&b, reset);
       continue;
     }
 
@@ -509,8 +592,9 @@ void diag_write_source(FILE *out, const char *text) {
       while (diag_ident_char(*p) || (*p == '.' && p[1] >= '0' && p[1] <= '9')) {
         p++;
       }
-      fprintf(out, "%s%.*s%s", diag_sgr_yellow(), (int)(p - start), start,
-              reset);
+      db_puts(&b, diag_sgr_yellow());
+      db_write(&b, start, (size_t)(p - start));
+      db_puts(&b, reset);
       continue;
     }
 
@@ -528,16 +612,39 @@ void diag_write_source(FILE *out, const char *text) {
         color = diag_sgr_cyan();
       }
       if (color) {
-        fprintf(out, "%s%.*s%s", color, (int)len, start, reset);
+        db_puts(&b, color);
+        db_write(&b, start, len);
+        db_puts(&b, reset);
       } else {
-        fprintf(out, "%.*s", (int)len, start);
+        db_write(&b, start, len);
       }
       continue;
     }
 
-    fputc(*p, out);
+    db_write(&b, p, 1);
     p++;
   }
+  return b.len;
+}
+
+void diag_write_source(FILE *out, const char *text) {
+  if (!out || !text) {
+    return;
+  }
+  if (!diag_style_color()) {
+    fputs(text, out);
+    return;
+  }
+  /* Worst case is one SGR pair around every character. */
+  size_t cap = strlen(text) * 12 + 64;
+  char *buf = malloc(cap);
+  if (!buf) {
+    fputs(text, out);
+    return;
+  }
+  diag_source_into(buf, cap, text);
+  fputs(buf, out);
+  free(buf);
 }
 
 /* ---- tabs ---------------------------------------------------------------- */

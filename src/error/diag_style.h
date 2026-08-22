@@ -82,6 +82,16 @@ void diag_rule(FILE *out, size_t indent, const char *label,
 void diag_rule_junction(FILE *out, size_t indent, size_t gutter,
                         const char *junction);
 
+/* The same three, rendered into a caller's buffer instead of a stream, for the
+   --explain report: it assembles the whole report in memory first so it can
+   re-wrap it to the terminal, or divert it to a sidecar file. Each returns the
+   length written and NUL-terminates. No trailing newline. */
+size_t diag_rule_into(char *buf, size_t cap, size_t indent, const char *label,
+                      const char *label_sgr);
+size_t diag_rule_junction_into(char *buf, size_t cap, size_t indent,
+                               size_t gutter, const char *junction);
+size_t diag_source_into(char *buf, size_t cap, const char *text);
+
 /* Write `text` word-wrapped to the terminal width. The first line is prefixed
    with `first_prefix` (already styled, and `first_width` display columns wide);
    continuation lines are indented to match. */

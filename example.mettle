@@ -1,0 +1,24 @@
+import "std/io";
+
+@simd! fn sum(a: int32*, n: int64) -> int64 {
+    var total: int64 = 0;
+    var i: int64 = 0;
+
+    while (i < n) {
+        total = total + (int64)a[i];
+        i = i + 1;
+    }
+
+    return total;
+}
+
+fn main() -> int32 {
+    var data: int32[8];
+
+    for i in 0..8 {
+        data[i] = (int32)i + 1;
+    }
+
+    println("sum = {sum(&data[0], 8)}");
+    return 0;
+}

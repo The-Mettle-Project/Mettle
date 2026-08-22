@@ -2,6 +2,7 @@
 #include "common.h"
 #include "../ir_explain_memory.h"
 #include "../ir_explain_safety.h"
+#include "../../error/diag_style.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -504,63 +505,7 @@ int ir_explain_location_enabled(const SourceLocation *location) {
  * Same policy as error_reporter.c (CLICOLOR_FORCE > NO_COLOR > TERM=dumb >
  * CLICOLOR=0 > stderr-is-a-tty), kept local because that helper is private. */
 
-#ifdef _WIN32
-static void ir_explain_enable_vt(void) {
-  static int done = 0;
-  if (done) {
-    return;
-  }
-  done = 1;
-  HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
-  if (h == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD mode = 0;
-  if (GetConsoleMode(h, &mode)) {
-    SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-  }
-}
-#endif
-
-static int ir_explain_use_color(void) {
-  static int cached = -1;
-  if (cached >= 0) {
-    return cached;
-  }
-  const char *force = getenv("CLICOLOR_FORCE");
-  if (force && force[0] != '\0' && strcmp(force, "0") != 0) {
-#ifdef _WIN32
-    ir_explain_enable_vt();
-#endif
-    cached = 1;
-    return cached;
-  }
-  const char *no_color = getenv("NO_COLOR");
-  if (no_color && no_color[0] != '\0') {
-    cached = 0;
-    return cached;
-  }
-  const char *term = getenv("TERM");
-  if (term && strcmp(term, "dumb") == 0) {
-    cached = 0;
-    return cached;
-  }
-  const char *clicolor = getenv("CLICOLOR");
-  if (clicolor && strcmp(clicolor, "0") == 0) {
-    cached = 0;
-    return cached;
-  }
-  int fd = explain_fileno(stderr);
-  if (fd < 0 || !explain_isatty(fd)) {
-    cached = 0;
-    return cached;
-  }
-#ifdef _WIN32
-  ir_explain_enable_vt();
-#endif
-  cached = 1;
-  return cached;
-}
+static int ir_explain_use_color(void) { return diag_style_color(); }
 
 #define EXPLAIN_GREEN "\x1b[32m"
 #define EXPLAIN_RED "\x1b[31m"
@@ -572,60 +517,11 @@ static const char *clr(const char *code) {
   return ir_explain_use_color() ? code : "";
 }
 
-/* ---- UTF-8 vs ASCII -------------------------------------------------------
- * The report's glyphs (└ → ── —) are UTF-8. A Windows console on a legacy
- * codepage (the default outside `chcp 65001`) renders those bytes as
- * mojibake, and PowerShell 5.1 decodes redirected stderr with the console CP
- * too. So: glyphs only when the target provably renders UTF-8 -- a console
- * whose output CP is UTF-8 on Windows, a UTF-8 locale on POSIX -- and ASCII
- * art everywhere else (including all redirected output, where we cannot know
- * what will decode it). */
+static int ir_explain_use_unicode(void) { return diag_style_unicode(); }
 
-static int ir_explain_use_unicode(void) {
-  static int cached = -1;
-  if (cached >= 0) {
-    return cached;
-  }
-#ifdef _WIN32
-  int fd = explain_fileno(stderr);
-  if (fd >= 0 && explain_isatty(fd)) {
-    cached = (GetConsoleOutputCP() == CP_UTF8) ? 1 : 0;
-  } else {
-    cached = 0;
-  }
-#else
-  int fd = explain_fileno(stderr);
-  /* A report going to a file or a pipe reads as ASCII, matching the Windows
-   * arm above. Only a terminal that asked for UTF-8 gets the glyphs. */
-  if (fd >= 0 && explain_isatty(fd)) {
-    const char *locale = getenv("LC_ALL");
-    if (!locale || !locale[0]) {
-      locale = getenv("LC_CTYPE");
-    }
-    if (!locale || !locale[0]) {
-      locale = getenv("LANG");
-    }
-    cached = (locale && (strstr(locale, "UTF-8") || strstr(locale, "utf8") ||
-                         strstr(locale, "UTF8")))
-                 ? 1
-                 : 0;
-  } else {
-    cached = 0;
-  }
-#endif
-  return cached;
-}
-
-/* Tree-corner / arrow / rule glyphs, with ASCII fallbacks. */
-static const char *glyph_elbow(void) {
-  return ir_explain_use_unicode() ? "\xE2\x94\x94" : "\\_";
-}
-static const char *glyph_rule(void) {
-  return ir_explain_use_unicode() ? "\xE2\x94\x80\xE2\x94\x80" : "--";
-}
-static const char *glyph_arrow(void) {
-  return ir_explain_use_unicode() ? "\xE2\x86\x92" : "->";
-}
+/* Tree-corner and arrow glyphs, with ASCII fallbacks. */
+static const char *glyph_elbow(void) { return diag_glyphs()->elbow; }
+static const char *glyph_arrow(void) { return diag_glyphs()->arrow; }
 
 /* ---- source echo ------------------------------------------------------------
  * A verdict that says "line 38" makes the reader open the file to find out
@@ -738,8 +634,10 @@ static void ir_explain_echo_one(size_t line, size_t strip) {
     memcpy(cut + sizeof(cut) - 5, " ...", 5);
     text = cut;
   }
-  ir_explain_emit("   %s%5zu |%s %s\n", clr(EXPLAIN_DIM), line,
-                  clr(EXPLAIN_RESET), text);
+  char painted[1024];
+  diag_source_into(painted, sizeof(painted), text);
+  ir_explain_emit("   %s%5zu %s%s %s%c", clr(EXPLAIN_DIM), line,
+                  diag_glyphs()->v, clr(EXPLAIN_RESET), painted, 10);
 }
 
 /* Echo the source a remark is about. A short loop is quoted whole, so the
@@ -1865,10 +1763,12 @@ static void ir_explain_print_header(const char *what) {
   const char *file = g_explain_focus_file
                          ? ir_explain_path_basename(g_explain_focus_file)
                          : "<input>";
-  const char *rule = glyph_rule();
-  ir_explain_emit("\n%s%s %s: %s %s%s%s%s%s%s\n", clr(EXPLAIN_BOLD), rule,
-                  what, file, rule, rule, rule, rule, rule,
-                  clr(EXPLAIN_RESET));
+  char label[512];
+  snprintf(label, sizeof(label), "%s%s: %s%s", clr(EXPLAIN_BOLD), what, file,
+           clr(EXPLAIN_RESET));
+  char line[2048];
+  diag_rule_into(line, sizeof(line), 0, label, "");
+  ir_explain_emit("%c%s%c", 10, line, 10);
 }
 
 /* ---- "where to start" -------------------------------------------------------
@@ -3106,22 +3006,7 @@ static char *ir_explain_sidecar_path(void) {
  * which is the only reader whose width we know. */
 
 static int ir_explain_terminal_columns(void) {
-#ifdef _WIN32
-  CONSOLE_SCREEN_BUFFER_INFO info;
-  HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
-  if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &info)) {
-    int width = info.srWindow.Right - info.srWindow.Left + 1;
-    if (width > 0) {
-      return width;
-    }
-  }
-#else
-  struct winsize ws;
-  if (ioctl(explain_fileno(stderr), TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
-    return (int)ws.ws_col;
-  }
-#endif
-  return 0;
+  return (int)diag_style_columns();
 }
 
 /* Visible columns in `line` (ANSI escape sequences occupy none), counting a
@@ -3350,10 +3235,13 @@ void ir_explain_finalize(int force_stderr) {
   } else {
     /* The digest: the report's conclusions in five lines, plus the path.
      * Regressions lead -- they must never hide inside a sidecar. */
-    fprintf(stderr, "\n%s%s optimization report %s%s%s%s%s%s%s\n",
-            clr(EXPLAIN_BOLD), glyph_rule(), glyph_rule(), glyph_rule(),
-            glyph_rule(), glyph_rule(), glyph_rule(), glyph_rule(),
-            clr(EXPLAIN_RESET));
+    {
+      char label[64];
+      snprintf(label, sizeof(label), "%soptimization report%s",
+               clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET));
+      fputc(10, stderr);
+      diag_rule(stderr, 0, label, "");
+    }
     if (g_digest.changes_regressed > 0) {
       fprintf(stderr,
               "  %s%s%zu optimization%s REGRESSED since the last build%s "
@@ -4244,9 +4132,14 @@ void ir_explain_ml_opt(const char *path) {
   if (!f) {
     return;
   }
-  const char *rule = glyph_rule();
-  fprintf(stderr, "\n%s%s ml-opt: model-driven IR optimizations %s%s%s%s%s\n\n",
-          clr(EXPLAIN_BOLD), rule, rule, rule, rule, rule, clr(EXPLAIN_RESET));
+  {
+    char label[96];
+    snprintf(label, sizeof(label), "%sml-opt: model-driven IR optimizations%s",
+             clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET));
+    fputc(10, stderr);
+    diag_rule(stderr, 0, label, "");
+    fputc(10, stderr);
+  }
 
   char ln[1024];
   char cur_fn[256] = "";
