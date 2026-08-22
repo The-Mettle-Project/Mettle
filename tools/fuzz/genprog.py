@@ -422,7 +422,8 @@ class Gen:
                     for _ in range(self.rng.randint(1, 3)):
                         op = self.rng.choice(["*", "+", "-", "^", "&", "|"])
                         k = self.rng.randint(1, 255)
-                        self.emit(f"{arr}[{i}] = {arr}[{i}] {op} {k};")
+                        self.emit(
+                            f"{arr}[{i}] = (uint8)({arr}[{i}] {op} {k});")
                 self.counted_loop(0, n, map_body, fuzz_start=True)
         if self.rng.random() < 0.5:  # byte sum
             s = self.fresh("bs")
@@ -492,11 +493,11 @@ class Gen:
                 k, j = self.rng.randint(2, 50), self.rng.randint(0, 99)
                 self.emit(f"{u} = ({u} * {k} + {j}) & 65535;")
             elif kind == "udiv":
-                self.emit(f"{u} = {u} / {self.rng.randint(2, 97)};")
+                self.emit(f"{u} = (uint32)({u} / {self.rng.randint(2, 97)});")
             elif kind == "umod":
                 self.emit(f"{u} = {u} % {self.rng.randint(2, 97)};")
             elif kind == "ushr":
-                self.emit(f"{u} = {u} >> {self.rng.randint(1, 15)};")
+                self.emit(f"{u} = (uint32)({u} >> {self.rng.randint(1, 15)});")
             elif kind == "zmul":
                 k, j = self.rng.randint(2, 21), self.rng.randint(0, 99)
                 self.emit(f"{z} = ({z} * {k} + {j}) & 32767;")
@@ -528,9 +529,9 @@ class Gen:
         use_xor = self.rng.random() < 0.5
 
         def body(i):
-            self.emit(f"{u} = {u} * {k} + {j};")
+            self.emit(f"{u} = (uint32)({u} * {k} + {j});")
             if use_xor:
-                self.emit(f"{u} = {u} ^ ({u} >> {shift});")
+                self.emit(f"{u} = (uint32)({u} ^ ({u} >> {shift}));")
         self.counted_loop(0, n, body)
         roll = self.rng.random()
         if roll < 0.35:
@@ -796,7 +797,8 @@ class Gen:
             ops = []
             for _ in range(r.randint(1, 3)):
                 op = r.choice(["*", "+", "-", "^", "&", "|"])
-                ops.append(f"a[i] = a[i] {op} {r.randint(1, 255)};")
+                ops.append(
+                    f"a[i] = (uint8)(a[i] {op} {r.randint(1, 255)});")
             self.helpers.append(
                 f"fn {name}(a: uint8*, n: int64) {{\n"
                 + self.kernel_loop(ops) + "\n}")
