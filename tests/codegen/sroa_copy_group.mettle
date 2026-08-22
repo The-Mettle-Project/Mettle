@@ -1,0 +1,61 @@
+struct Pt {
+  x: int64;
+  y: int64;
+
+  method norm() -> int64 {
+    return this.x * this.x + this.y * this.y;
+  }
+
+  method shifted(k: int64) -> Pt {
+    var p: Pt;
+    p.x = this.x + k;
+    p.y = this.y - k;
+    return p;
+  }
+}
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+fn main() -> int32 {
+  var acc: int64 = opaque(7);
+
+  {
+    var p: Pt;
+    p.x = acc % 31;
+    p.y = 3;
+    acc = acc + p.norm() + p.shifted(2).x;
+  }
+  {
+    var p: Pt;
+    p.x = acc % 31;
+    p.y = 3;
+    acc = acc + p.norm() + p.shifted(2).x;
+  }
+  {
+    var p: Pt;
+    p.x = acc % 31;
+    p.y = 3;
+    acc = acc + p.norm() + p.shifted(2).x;
+  }
+  {
+    var p: Pt;
+    p.x = acc % 31;
+    p.y = 3;
+    acc = acc + p.norm() + p.shifted(2).x;
+  }
+  {
+    var p: Pt;
+    p.x = acc % 31;
+    p.y = 3;
+    acc = acc + p.norm() + p.shifted(2).x;
+  }
+  {
+    var p: Pt;
+    p.x = acc % 31;
+    p.y = 3;
+    acc = acc + p.norm() + p.shifted(2).x;
+  }
+
+  if (acc != 2397) { return 1; }
+  return 0;
+}

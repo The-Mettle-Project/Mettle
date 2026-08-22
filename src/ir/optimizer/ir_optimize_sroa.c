@@ -486,14 +486,19 @@ typedef struct {
   int visited; /* component walk state */
 } IRSroaRec;
 
-static void ir_sroa_rec_add_partner(IRSroaRec *rec, size_t other) {
+static void ir_sroa_rec_add_partner(IRSroaRec *recs, size_t owner,
+                                    size_t other) {
+  IRSroaRec *rec = &recs[owner];
   for (size_t p = 0; p < rec->partner_count; p++) {
     if (rec->partners[p] == other) {
       return;
     }
   }
   if (rec->partner_count >= IR_SROA_MAX_GROUP) {
+    rec->comp_fail = 1;
     rec->eligible = 0;
+    recs[other].comp_fail = 1;
+    recs[other].eligible = 0;
     return;
   }
   rec->partners[rec->partner_count++] = other;
@@ -615,8 +620,8 @@ int ir_sroa_pass(IRFunction *function, int *changed) {
             continue;
           }
           if (de && se) {
-            ir_sroa_rec_add_partner(&recs[de->member], se->member);
-            ir_sroa_rec_add_partner(&recs[se->member], de->member);
+            ir_sroa_rec_add_partner(recs, de->member, se->member);
+            ir_sroa_rec_add_partner(recs, se->member, de->member);
           } else {
             /* Partner is a param/return temp or scalar, not an aggregate
              * local: the old group builder abandoned the whole group. */

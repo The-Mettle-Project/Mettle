@@ -15,6 +15,19 @@ enum Val {
 
 struct Holder { tag: int32; v: Val; other: int32; }
 
+@noinline fn built_float(x: float64) -> Val { return F(x); }
+
+@noinline fn scaled_float(x: float64) -> Val { return F(x * 2.0); }
+
+@noinline fn from_int(n: int64) -> Val { return F((float64)n); }
+
+@noinline fn float_of(v: Val) -> float64 {
+  match (v) {
+    case F(f): { return f; }
+    default: { return 0.0 - 1.0; }
+  }
+}
+
 /* A tagged enum at global scope: the aggregate path in the global emitter
  * listed struct and array only, so this was refused outright. */
 var stored: Val;
@@ -92,5 +105,20 @@ fn main() -> int32 {
   stored_list[1] = S("g");
   if (as_int(stored_list[1]) != 100) { return 20; }
   if (as_int(stored_list[0]) != 0) { return 21; }
+
+  if (float_of(built_float(3.25)) != 3.25) { return 22; }
+  if (float_of(built_float(0.0 - 2.5)) != 0.0 - 2.5) { return 23; }
+  if (float_of(scaled_float(1.5)) != 3.0) { return 24; }
+  if (float_of(from_int(7)) != 7.0) { return 25; }
+  if (float_of(F(4.75)) != 4.75) { return 26; }
+
+  var running: float64 = 0.0;
+  var k: int64 = 0;
+  while (k < 6) {
+    running = running + float_of(built_float((float64)k * 0.5));
+    k = k + 1;
+  }
+  if (running != 7.5) { return 27; }
+
   return 0;
 }

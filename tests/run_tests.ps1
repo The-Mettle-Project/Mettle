@@ -12637,6 +12637,8 @@ $runFixtures = @(
      What = "a closure taking or returning a struct, string or tagged enum lost it" },
   @{ Name = "deref_aggregate"; Path = "tests/codegen/deref_aggregate.mettle"
      What = "dereferencing a pointer to an aggregate copied only its first word" },
+  @{ Name = "sroa_copy_group"; Path = "tests/codegen/sroa_copy_group.mettle"
+     What = "SROA dropped a copy-partner edge past its group limit and split half a copy-linked group" },
   @{ Name = "generic_enum_with_generics"; Path = "tests/codegen/generic_enum_with_generics.mettle"
      What = "a file declaring its own generic could no longer instantiate a generic enum such as Option or Result" },
   @{ Name = "enum_self_pointer"; Path = "tests/codegen/enum_self_pointer.mettle"

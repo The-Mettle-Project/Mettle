@@ -1013,6 +1013,13 @@ int ir_emit_tagged_enum_construct(IRLoweringContext *context,
       store_payload.dest = payload_address;
       store_payload.lhs = payload_source;
       store_payload.rhs = ir_operand_int(payload_size);
+      ir_access_apply_alias_class(&store_payload, payload_type);
+      if (payload_size <= 8 &&
+          (payload_type->kind == TYPE_FLOAT32 ||
+           payload_type->kind == TYPE_FLOAT64)) {
+        ir_assign_apply_float_bits(&store_payload, &store_payload.lhs,
+                                   ir_type_float_bits(payload_type));
+      }
       if (!ir_emit(context, function, &store_payload)) {
         free(payload_temp_name);
         ir_operand_destroy(&payload_source);
