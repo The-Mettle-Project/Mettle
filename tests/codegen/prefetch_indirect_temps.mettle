@@ -1,0 +1,39 @@
+import "std/mem";
+
+@noinline fn gather(table: int32*, index: int32*, n: int64) -> int64 {
+  var total: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    total = total + (int64)table[index[i]];
+    i = i + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var n: int64 = 4096;
+  var table: int32* = malloc(n * 4);
+  var index: int32* = malloc(n * 4);
+  if (table == 0 || index == 0) { return 1; }
+
+  var i: int64 = 0;
+  while (i < n) {
+    table[i] = (int32)(i * 3 + 1);
+    index[i] = (int32)((i * 977) % n);
+    i = i + 1;
+  }
+
+  var expected: int64 = 0;
+  i = 0;
+  while (i < n) {
+    var slot: int64 = (i * 977) % n;
+    expected = expected + slot * 3 + 1;
+    i = i + 1;
+  }
+
+  if (gather(table, index, n) != expected) { return 2; }
+
+  free(table);
+  free(index);
+  return 0;
+}
