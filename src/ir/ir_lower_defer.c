@@ -289,6 +289,60 @@ int ir_emit_deferred_scopes_non_err(IRLoweringContext *context,
   return 1;
 }
 
+static Type *ir_returned_symbol_type(IRLoweringContext *context,
+                                     IRFunction *function,
+                                     const IROperand *value) {
+  if (!function || !value || value->kind != IR_OPERAND_SYMBOL || !value->name) {
+    return NULL;
+  }
+  for (size_t i = function->instruction_count; i-- > 0;) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->text &&
+        in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+        strcmp(in->dest.name, value->name) == 0) {
+      return ir_resolve_named_type(context, in->text);
+    }
+  }
+  return ir_lookup_symbol_type(context, value->name);
+}
+
+static int ir_emit_errdefer_condition(IRLoweringContext *context,
+                                      IRFunction *function,
+                                      const IROperand *value,
+                                      SourceLocation location,
+                                      IROperand *out_condition) {
+  Type *value_type = ir_returned_symbol_type(context, function, value);
+  IROperand address = ir_operand_none();
+  IRInstruction load = {0};
+
+  if (!value_type || value_type->kind != TYPE_TAGGED_ENUM) {
+    *out_condition = (value->kind == IR_OPERAND_NONE) ? ir_operand_int(0)
+                                                      : ir_operand_copy(value);
+    return 1;
+  }
+
+  if (!ir_emit_address_of_symbol(context, function, value->name, location,
+                                 &address)) {
+    return 0;
+  }
+  if (!ir_make_temp_operand(context, out_condition)) {
+    ir_operand_destroy(&address);
+    return 0;
+  }
+  load.op = IR_OP_LOAD;
+  load.location = location;
+  load.dest = *out_condition;
+  load.lhs = address;
+  load.rhs = ir_operand_int(4);
+  if (!ir_emit(context, function, &load)) {
+    ir_operand_destroy(out_condition);
+    ir_operand_destroy(&address);
+    return 0;
+  }
+  ir_operand_destroy(&address);
+  return 1;
+}
+
 int ir_emit_return_with_defers(IRLoweringContext *context,
                                       IRFunction *function,
                                       IRDeferScope *defers, IROperand *value,
@@ -299,7 +353,13 @@ int ir_emit_return_with_defers(IRLoweringContext *context,
 
   if (defers) {
     IROperand is_error = ir_operand_none();
+    IROperand condition = ir_operand_none();
+    if (!ir_emit_errdefer_condition(context, function, value, location,
+                                    &condition)) {
+      return 0;
+    }
     if (!ir_make_temp_operand(context, &is_error)) {
+      ir_operand_destroy(&condition);
       return 0;
     }
 
@@ -307,12 +367,13 @@ int ir_emit_return_with_defers(IRLoweringContext *context,
     set_error.op = IR_OP_ASSIGN;
     set_error.location = location;
     set_error.dest = is_error;
-    set_error.lhs =
-        (value->kind == IR_OPERAND_NONE) ? ir_operand_int(0) : *value;
+    set_error.lhs = condition;
     if (!ir_emit(context, function, &set_error)) {
+      ir_operand_destroy(&condition);
       ir_operand_destroy(&is_error);
       return 0;
     }
+    ir_operand_destroy(&condition);
 
     char *success_label = ir_new_label_name(context, "errdefer_ok");
     char *end_label = ir_new_label_name(context, "errdefer_end");

@@ -1,0 +1,54 @@
+import "std/core";
+
+var fired: int64 = 0;
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+@noinline fn note() -> void { fired = fired + 1; }
+
+@noinline fn work(n: int64) -> Result<int64, string> {
+  errdefer note();
+  if (n == 1) { return Err("bad"); }
+  return Ok(7);
+}
+
+@noinline fn optional(n: int64) -> Option<int64> {
+  errdefer note();
+  if (n == 1) { return None; }
+  return Some(3);
+}
+
+@noinline fn both(n: int64) -> Result<int64, string> {
+  var stage: int64 = 0;
+  errdefer note();
+  defer note();
+  stage = 1;
+  if (n == 1) { return Err("one"); }
+  return Ok(stage);
+}
+
+fn main() -> int32 {
+  work(opaque(0));
+  if (fired != 0) { return 1; }
+
+  work(opaque(1));
+  if (fired != 1) { return 2; }
+
+  fired = 0;
+  optional(opaque(0));
+  if (fired != 0) { return 3; }
+
+  fired = 0;
+  optional(opaque(1));
+  if (fired != 1) { return 4; }
+
+  fired = 0;
+  both(opaque(0));
+  if (fired != 1) { return 5; }
+
+  fired = 0;
+  both(opaque(1));
+  if (fired != 2) { return 6; }
+
+  return 0;
+}

@@ -12639,6 +12639,8 @@ $runFixtures = @(
      What = "a closure taking or returning a struct, string or tagged enum lost it" },
   @{ Name = "deref_aggregate"; Path = "tests/codegen/deref_aggregate.mettle"
      What = "dereferencing a pointer to an aggregate copied only its first word" },
+  @{ Name = "errdefer_result"; Path = "tests/codegen/errdefer_result.mettle"
+     What = "errdefer read the address of a returned tagged enum instead of its tag, so it fired on success" },
   @{ Name = "match_binding_shadow"; Path = "tests/codegen/match_binding_shadow.mettle"
      What = "a match arm binding shared a slot with a same-named local of another type" },
   @{ Name = "sroa_copy_group"; Path = "tests/codegen/sroa_copy_group.mettle"
