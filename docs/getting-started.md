@@ -75,6 +75,8 @@ you want it optimized.
 arguments:
 
 ```mettle
+import "std/io";
+
 fn main(argc: int32, argv: cstring*) -> int32 {
   println("argc={argc}");
   return 0;

@@ -19,7 +19,6 @@ A kernel file is compiled with `mettle --emit-ptx`. Use the `kernel` keyword for
 GPU entry points (it parses like `fn` and is emitted as a PTX `.entry`):
 
 ```mettle
-// kernels.mettle  ->  mettle --emit-ptx kernels.mettle -o kernels.ptx
 kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
   if (i < n) {
@@ -103,8 +102,8 @@ Kernels can allocate statically sized scalar arrays in semantic address spaces:
 
 ```mettle
 kernel staged(x: float32*, out: float32*, n: int32) {
-  workgroup var tile: float32[256]; // one array shared by the workgroup
-  private var scratch: int32[4];    // one array per work-item
+  workgroup var tile: float32[256];
+  private var scratch: int32[4];
   var lane: int32 = thread.x;
   if (lane < 256 && lane < n) { tile[lane] = x[lane]; }
   barrier(workgroup, global, acq_rel);
@@ -124,7 +123,7 @@ arena whose byte size is supplied by the host launch:
 ```mettle
 kernel dynamic_staged(x: float32*, out: float32*, n: int32) {
   workgroup var values: float32*;
-  workgroup var metadata: uint32*; // aliases the same arena base
+  workgroup var metadata: uint32*;
   var lane: int32 = thread.x;
   if (lane < n) {
     values[lane] = x[lane];
@@ -326,7 +325,6 @@ kernel gemm_region(a: uint16*, b: uint16*, c: float32*, d: float32*,
                 lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
 }
 
-// Host side: one 32-lane subgroup per 16x16 output region.
 dispatch gemm_region[
   grid: ((n + 15) / 16, (m + 15) / 16, 1),
   block: (32, 1, 1)
@@ -851,12 +849,9 @@ import "std/io";
 import "std/mem";
 import "std/gpu";
 
-// Declaring the kernel host-side is what makes `dispatch` check its arguments.
 extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
 
 fn main() -> int32 {
-  // Driver up, module loaded, kernel names bound. Each failure names itself,
-  // including the driver's own PTX JIT log.
   if (gpu_open("kernels.ptx") == 0) { return 1; }
 
   var n: int32 = 1 << 20;
@@ -867,14 +862,12 @@ fn main() -> int32 {
   var i: int32 = 0;
   while (i < n) { ha[i] = (float32)i; hb[i] = (float32)(2 * i); i = i + 1; }
 
-  // device buffers (you own VRAM)
   var da: int64 = gpu_malloc(bytes);
   var db: int64 = gpu_malloc(bytes);
   var dc: int64 = gpu_malloc(bytes);
   gpu_to_device(da, (uint8*)ha, bytes);
   gpu_to_device(db, (uint8*)hb, bytes);
 
-  // launch: one line replaces param-packing + cuLaunchKernel + sync
   dispatch vadd[work: n](da, db, dc, n);
 
   gpu_to_host((uint8*)hc, dc, bytes);
@@ -895,7 +888,6 @@ mettle --emit-ptx kernels.mettle -o kernels.ptx \
 ```
 
 ```mettle
-// kernel_decls.mettle, generated
 extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
 ```
 
@@ -947,7 +939,7 @@ a server can size its launches to the card it actually landed on:
 var buffer: uint8[128];
 println("{gpu_device_name(0, &buffer[0], 128)}: {gpu_sm_count(0)} SMs");
 
-var blocks: int32 = gpu_sm_count(0) * 4;   // four blocks per multiprocessor
+var blocks: int32 = gpu_sm_count(0) * 4;
 dispatch resident[blocks, 256](state, n);
 ```
 

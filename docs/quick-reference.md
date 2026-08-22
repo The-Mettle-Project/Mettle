@@ -173,6 +173,7 @@ Runs on every path out of the scope, in reverse order of declaration.
 ## Heap
 
 ```mettle
+import "std/io";
 import "std/mem";
 
 fn main() -> int32 {
@@ -270,6 +271,8 @@ println("read: {line}");
 ## Command-line arguments
 
 ```mettle
+import "std/io";
+
 fn main(argc: int32, argv: cstring*) -> int32 {
   println("argc={argc}");
   return 0;

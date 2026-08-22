@@ -1,8 +1,8 @@
 # Documentation
 
-This repository holds two things. **Mettle** is a typed, assembly-inspired
-systems language. **libmtlc** is the native compiler backend it drives, which
-any frontend can drive instead. The documentation is organized the same way.
+This repository holds two things. Mettle is a typed, assembly-inspired
+systems language. libmtlc is the native compiler backend it drives, which any
+frontend can drive instead. The documentation is organized the same way.
 
 ## Start here
 

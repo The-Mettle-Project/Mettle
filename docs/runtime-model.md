@@ -133,6 +133,8 @@ A function can be replaced in a running process. The compiler contributes a
 boundary and a point; the runtime contributes a staged store.
 
 ```mettle
+import "std/io";
+
 extern fn mettle_swap_stage(slot: rawptr, replacement: rawptr) -> int32;
 
 @swappable fn policy_v1(n: int32) -> int32 { return n + 1; }
