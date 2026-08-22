@@ -1,470 +1,194 @@
 # Compilation
 
-The `mettle` command is the reference driver: it runs the Mettle frontend
-(lexer, parser, semantic analysis) to lower source into libmtlc IR, then drives
-the backend (optimize, code generation, link). This document describes how to
-compile Mettle programs with it and the options it accepts. To drive the backend
-from a different frontend, see [Writing a frontend for libmtlc](embedding.md).
+The `mettle` driver: what it produces, the options that change that, and the
+subcommands that do something other than compile.
 
-## Compiler Usage
+## The short version
 
 ```bash
-mettle [options] <input.mettle>
-mettle help [topic]
+mettle --build hello.mettle
+```
+
+That compiles and links an executable next to the source. Drop `--build` and
+you get an object file instead. Add `--release` when you want it optimized.
+
+The compiler takes one entry file. It resolves imports transitively and hands
+the backend one program, so you never compile imported files separately.
+
+## Input and output
+
+| Option | Effect |
+|--------|--------|
+| `-i <file>` | The entry file. A positional path works too. |
+| `-o <file>` | Output path. Defaults to `output.obj` or `output.o`, or the executable path with `--build`. |
+| `-I <dir>` | Add an import search directory. Repeatable. |
+| `--stdlib <dir>` | Set the stdlib root. |
+| `--prelude` | Auto-import `std/prelude`. |
+
+## What to emit
+
+| Option | Product |
+|--------|---------|
+| `--emit-obj` | A native object. This is the default. |
+| `--build` | An executable: PE on Windows, ELF on Linux. |
+| `--emit-arm64` | A self-contained AArch64 Linux executable. |
+| `--emit-arm64-obj` | An AArch64 relocatable object. The default on an ARM host. |
+| `--emit-ptx` | Declared kernels as NVIDIA PTX. |
+| `--emit-spirv` | Declared kernels as OpenCL SPIR-V. |
+
+[Linker and build pipelines](linker-build-pipelines.md) covers which linker
+runs for each combination. [GPU offload](gpu.md) covers the device targets.
+
+## Optimization
+
+| Option | Effect |
+|--------|--------|
+| `-O`, `--optimize` | Turn the optimizer on. |
+| `-r`, `--release` | Optimize for size. Implies `-O`, strips comments, drops unreachable functions. |
+| `--safe` | Check every memory access not proven in bounds. Kept under `--release`. |
+| `--native-heap` | Route `new` and the `malloc` family through `std/alloc`. |
+
+Three passes go further, and each pays for itself in a different currency.
+
+`--pgo` interprets `main()` at compile time and feeds the measured call
+frequencies to the optimizer, so a hot callee bypasses the inliner's size
+budget. No instrumented build and no training run. It implies `-O`. See
+[Profile-guided optimization](pgo.md).
+
+`--verify` executes each function's before-and-after IR on generated inputs
+after every pass and compares. A diverging pass is reported with a
+counterexample, quarantined for that function, and the build continues from
+the validated IR. It implies `-O`. See
+[Translation validation](translation-validation.md).
+
+`--ml-opt` runs a learned optimizer after the classical passes. Every rewrite
+it applies is re-executed through the validation interpreter and discarded on
+divergence. `--ml-opt-speculative` also applies its unproven proposals, which
+stand only when the validator can execute the function and finds no
+divergence. See [ML-driven IR optimization](ml-opt.md).
+
+## Reports
+
+| Option | Report |
+|--------|--------|
+| `--explain` | Every optimization decision, with the reason whenever the optimizer declined. |
+| `--explain=SELECTOR` | One slice: `missed`, `fixable`, `proven`, `loops`, `calls`, a function name, or a decision code. |
+| `--explain-json` | Also write `<stem>.explain.json`. Implies `--explain`. |
+| `--simd-report` | What each `@simd` loop became. |
+| `--annotate-asm` | The emitted assembly with the codegen decision behind each instruction, a cost model, recovered loops, a register-lifetime map, and an instruction mix. Implies `-O`. |
+| `--asm-syntax=S` | `intel`, `att`, or `both` for `--annotate-asm`. Default `both`. |
+| `--annotate-lines=A-B` | A focused codegen report for those source lines. |
+| `--annotate-fn=NAME` | Restrict the annotate reports to one function. |
+| `--annotate-hot[=N]` | The top N codegen hotspots. Default 8. |
+| `--dump-ir` | Write the optimized IR to a `.ir` sidecar. |
+
+`--explain` needs `-O` or `--release`, because there are no decisions to
+report without the optimizer. A repeat run leads with what changed since the
+last build, regressions first.
+
+[The `--explain-json` schema](explain-json.md) documents the machine-readable
+form.
+
+## Debugging
+
+| Option | Effect |
+|--------|--------|
+| `-d`, `--debug` | Debug output and symbols. |
+| `-g`, `--debug-symbols` | Debug symbols. |
+| `-l`, `--line-mapping` | Source line mapping. |
+| `-s`, `--stack-trace` | Embed crash traceback support. |
+| `--debug-format <fmt>` | `dwarf`, `stabs`, or `map`. Default `dwarf`. |
+| `--debug-hooks` | Instrument for the interactive debugger. Needs `-O0`. |
+
+## Profiling
+
+| Option | Effect |
+|--------|--------|
+| `--profile` | Per-phase compilation timings. |
+| `--profile-runtime` | Function-level run-time timing. Disables inlining. |
+| `--profile-runtime-ops` | Op-class counters per function, after optimization. |
+| `--profile-blocks` | Per-basic-block counters to a `.mprof` sidecar. Implies `--profile-runtime`. |
+| `--tracy` | Link `std/tracy` with the Tracy profiler. Needs `--build`. |
+| `--tracy-dir <dir>` | Tracy repo root. Defaults to `TRACY_DIR`, then `.mettle/tracy_dir`. |
+
+`--profile-blocks` writes to the path in `METTLE_PROFILE_OUT`, and fuses with
+`--annotate-asm` into a combined codegen profile view.
+
+## GPU
+
+| Option | Effect |
+|--------|--------|
+| `--gpu-info` | Report local GPUs, driver, ptxas, and the target `--emit-ptx` would pick. Takes no input file. |
+| `--gpu-arch=A` | `native`, `gb10`, `portable`, `sm_NN`, or `compute_NN`. |
+| `--ptx-version=M.m` | Override the emitted PTX ISA version. |
+| `--emit-kernel-decls[=F]` | Also write each kernel's host-side `extern kernel` declaration. |
+| `--report-occupancy` | Registers per thread and the occupancy ceiling, from `ptxas -v`. |
+| `--sms=N` | SM count for the fill thresholds. |
+| `--gpu-checks` | Emit the trap for each `gpu_assert`. |
+| `--report-launches` | Every dispatch site with the grid and block the compiler can fold. |
+| `--gpu-tensor-tuple-budget=N` | PTX resident-fragment ceiling. |
+
+[GPU offload](gpu.md) covers all of it in context.
+
+## Linking
+
+| Option | Effect |
+|--------|--------|
+| `--linker <mode>` | `auto`, `internal`, `gcc`, or `msvc`. Default `internal` with `--build`. |
+| `--link-arg <arg>` | An extra linker argument. Repeatable. |
+| `--static` | Accepted for compatibility. Owned ELF builds are always static. |
+
+## Diagnostics
+
+`--error-format=F` picks `human`, the default, or `json`, which writes one
+JSON object per diagnostic on stderr for tooling.
+[Diagnostics](diagnostics.md) documents both.
+
+## Subcommands
+
+```bash
+mettle help <topic>
 mettle docs [topic]
+mettle explain <CODE>
+mettle test <file> [--filter=S]
+mettle trace <file> <fn> [args...]
 ```
 
-The input file is the main source file. Imports are resolved relative to it. By default the compiler produces a native object (`output.obj` on Windows, `output.o` on Linux). `--build` produces a native executable directly: on Windows it emits a COFF object and links with the built-in PE linker; on Linux it emits an ELF object and links it with the platform C toolchain.
-
-`std/...` imports use the stdlib bundled with the compiler by default. You do not need to copy `stdlib/` into every project directory. Use `--stdlib <dir>` only when you want to override the bundled stdlib.
-
-## Built-In Help and Docs
-
-The compiler includes topic-oriented help commands:
-
-- `mettle help` prints CLI usage.
-- `mettle help build` explains the Windows build flow.
-- `mettle help runtime` explains the runtime model and the two opt-in helper objects (aliases: `heap`, `gc`).
-- `mettle docs` lists the main documentation entry points and their paths.
-
-Available topics: `build`, `runtime` (aliases `heap`, `gc`), `interop`, `stdlib`, `web`.
-
-## Options
-
-`-o <file>` output object file (default `output.obj` / `output.o`, or executable path when used with `--build`). `-i <file>` input file (alternative to positional argument). `-I <dir>` add import search directory (repeatable). `--stdlib <dir>` set the stdlib root (default: bundled stdlib, then `./stdlib`). `--build` builds a native executable with Mettle's startup and owned runtime. Windows uses COFF and the internal PE linker by default. Linux emits a static ELF executable. `--static` is a compatible no op. `--musl` is rejected. `--emit-obj` emits a native object. `--emit-arm64` emits a direct self contained AArch64 Linux image. `--emit-arm64-obj` emits an AArch64 Linux object for the full owned runtime link path. `--linker <internal|auto|gcc|msvc>` selects the Windows linker path. `--link-arg <arg>` passes an extra linker argument, subject to the owned runtime dependency gate. `--tracy` is rejected because external Tracy needs a C++ runtime. Use `--profile-runtime` instead. `--prelude` imports `std/prelude`. `-d`, `-g`, `-l`, and `-s` control debug output, symbols, line maps, and crash traces. `-O` and `--release` enable optimization. `--emit-ptx` and `--emit-spirv` emit GPU modules. `--simd-report` and `--explain` report optimizer choices. `-h` and `--help` print usage. See [Imports](imports.md) for import paths and stdlib selection.
-<!-- Target-qualified device/native modes. -->
-Runtime rule: every native build supplies Mettle's startup and freestanding
-runtime. Linux output is always static. `--static` is a compatible no op.
-`--musl` and `--tracy` fail because they would add a C or C++ runtime.
-
-GPU/native target qualification: `--emit-ptx` and `--emit-spirv` emit only
-functions declared with `kernel`; ordinary `fn` declarations are not entry
-points. Without `--gpu-arch`, PTX targets the local GPU (compute capability
-queried through `nvidia-smi`, architecture-specific `a` variant from `sm_90`
-onward); with no visible GPU it falls back to PTX 8.8 / `sm_121a` for GB10. Use
-`--gpu-arch=gb10|portable|sm_NN|compute_NN` and optionally
-`--ptx-version=M.m` to select backend policy explicitly.
-`--gpu-tensor-tuple-budget=N` selects the PTX-only resident-fragment ceiling
-(`0` uses the architecture default), allowing an external measurement harness
-to compare resident and exact-replay variants without changing source or shared
-IR. Native Linux object/build
-emission supports x86-64 and AArch64. Arm uses ELF64 and AAPCS64 with owned
-startup and service code. The explicit `--emit-arm64` command is the older
-self-contained smoke product, not the normal native object path.
-
-## Compilation Pipeline
-
-The compiler runs these phases in order:
-
-1. **Lexing** - tokenize source
-2. **Parsing** - build AST
-3. **Import resolution** - resolve and inline `import` directives
-4. **Monomorphization** - expand generic functions and structs into concrete instantiations
-5. **Type checking** - semantic analysis and symbol resolution
-6. **IR lowering** - convert AST to intermediate representation
-7. **Optimization** (optional, `-O`) - copy/constant propagation, integer folding/simplification, branch cleanup, unreachable IR cleanup, and control-flow/codegen branch peepholes
-8. **Code generation** - emit a native object (COFF on Windows, ELF on Linux)
-
-`--release` uses the same optimization pipeline as `-O` and additionally lowers without runtime null/bounds trap checks. Use `-O` for optimized builds that still keep those generated checks.
-
-### Token String Views
-
-Lexer tokens carry a `StringView` (`data` pointer + `length`) in addition to a null-terminated `value` string. This gives parser and diagnostics code direct token extents without requiring repeated `strlen`.
-
-### String Interning
-
-Identifier-like token text is interned: each distinct string is stored once in a global hash table, and subsequent occurrences reuse the same pointer. This reduces memory for repeated names and enables fast pointer-first equality checks in semantic structures.
-
-The AST and symbol/type metadata intern name-bearing strings (identifier names, member names, type names, and type parameter names). The intern table is process-global for a compilation run and is cleared after compilation, so interned pointers are not reused across compiler invocations.
-
-## Build Pipeline
-
-### Recommended Windows Flow
-
-1. Default end-to-end build: `mettle --build main.mettle -o main.exe`
-2. Optional extra libraries: `mettle --build main.mettle -o main.exe --link-arg -lcustomdll`
-3. External linker fallback: `mettle --build --linker auto main.mettle -o main.exe`
-
-`--build` keeps compilation inside Mettle's COFF object emitter, owned runtime,
-and internal PE linker. That path needs no target C toolchain. The linker probes
-Win32 DLLs such as `kernel32`, `user32`, `gdi32`, `advapi32`, and `ws2_32`.
-It never probes a C runtime DLL. `--linker auto` may use GCC or link.exe as a
-linker only. Both fallback paths disable default startup and libraries.
-Optional crash, profile, debug, and atomic code uses the same owned ABI.
-
-### Linux Flow
-
-On Linux, `--build` uses the native ELF backend end to end:
-
-```bash
-mettle --build main.mettle -o main
-```
-
-The compiler emits an ELF object and links it with `ld` plus Mettle's startup
-and freestanding runtime. If it needs GCC to parse extra linker arguments, it
-uses GCC only as a driver with all startup and default libraries disabled.
-The result is a static `ET_EXEC` file with no interpreter or dynamic section.
-
-The Linux path supports the syscall-backed standard-library variants (`*.linux.mettle`), runtime stack traces (`-d`/`-s`), `--profile-runtime`, and embedded DWARF sections in ELF objects.
-
-### Tracy profiling (`--tracy`)
-
-Owned runtime mode rejects external Tracy because TracyClient.cpp needs a C++
-runtime. Use `--profile-runtime`, which ships as owned runtime code. The old
-Tracy setup text below applies only to unsupported custom builds that relax the
-owned runtime rule.
-
-Build with live Tracy instrumentation (compiles `stdlib/tracy_helpers.c` and `TracyClient.cpp` from your Tracy repo):
-
-```powershell
-mettle --build --tracy app.mettle -o app.exe
-```
-
-Tracy repo resolution order: `--tracy-dir <path>`, then `TRACY_DIR`, then `.mettle\tracy_dir` in the current directory, then `examples\tracy_demo\tracy_dir.local.bat`. The resolved path is saved to `.mettle\tracy_dir` for later builds.
-
-With MSVC (`cl`), Tracy objects link through the internal PE linker. With MinGW only (`g++`, no `cl`), Mettle uses `g++` for the final link and pulls in `secur32` / `dbghelp` automatically.
-
-Without `--tracy`, programs that import `std/tracy` still link the bundled no-op `tracy_helpers.o` stub so the same source builds for release and profiled runs.
-
-See [`examples/tracy_demo/`](../examples/tracy_demo/) for a full demo and [`stdlib/std/tracy.mettle`](../stdlib/std/tracy.mettle) for the API.
-
-### Runtime profiling (`--profile-runtime`)
-
-Build with profiling instrumentation:
-
-```powershell
-mettle --build --release --profile-runtime bench.mettle -o bench.exe
-```
-
-Every compiled Mettle function (non-`extern`, with a body) gets entry/exit hooks. At process exit the runtime prints a flat table to stderr (sorted by inclusive time) and a caller/callee call graph:
-
-```
-Runtime profile:
-function             location                             calls    total_us    avg_ns    self_us     pct
-__inl_helper_0       examples/sort_insertion.mettle:42    200      1200      6000      1200      25.0%
-helper               examples/sort_insertion.mettle:1     0        0         0         0         0.0%
-work                 examples/sort_insertion.mettle:9     1        43000     43000000  5000      100.0%
-main                 examples/sort_insertion.mettle:17    1        43000     43000000  200       100.0%
-
-Runtime profile (call graph):
-main
-  work  1 calls  43000 us
-    __inl_helper_0  200 calls  1200 us
-```
-
-Each profile row includes a `file:line` location taken from the function definition (or from the call site for inlined bodies). When the optimizer inlines a callee, duplicated hooks get distinct `__inl_<name>_<N>` ids so you can still see hot inline sites.
-
-v1 limitations: function-level only (no loop or inlined-pattern probes), Windows + direct COFF backend only, single-threaded stats, and meaningful overhead from per-call timing. Profile hooks are inserted in IR before optimization; when the inliner expands a callee, those hooks are duplicated at each call site so inlined functions still appear in the report.
-
-### Compiler debugging / internal errors (ICE)
-
-If the compiler crashes or hits a fatal internal failure, it prints an **internal compiler error** report to stderr with:
-
-- compilation phase and IR pass name (when known)
-- source file and function name
-- IR instruction index and text (when available)
-- last tracked compiler action (with `--debug-compiler`)
-- native C backtrace
-
-Example:
-
-```
-Mettle internal compiler error: access violation (0xC0000005)
-
-Phase: IR optimization
-Pass: memcpy_inline
-File: examples/grep/grep.mettle
-Function: fill_buffer
-IR instruction: #184
-  %tmp42 = memcpy_inline %src, %size, ...
-
-Last action:
-  collecting temp uses for IR_OP_MEMCPY_INLINE
-
-Compiler backtrace:
-  #0 mettle_compiler_ice_report at src/compiler/compiler_crash.c:282 (0x...)
-  #1 main at src/main.c:123 (0x...)
-  ...
-
-Please rerun with:
-  mettle --dump-ir --debug-compiler examples/grep/grep.mettle
-```
-
-`--debug-compiler` enables fine-grained last-action tracking and writes an IR snapshot (`<input>.ice.ir`) when an ICE occurs.
-
-### Manual Object Link Flow
-
-1. Compile: `mettle main.mettle -o main.obj` (or `main.o` on Linux)
-2. Link: `gcc -nostartfiles main.obj -o main.exe -lkernel32` on Windows, or use the platform linker on Linux. Use `-nostartfiles` on Windows when linking compiler-emitted startup yourself.
-
-The emitted entry point does not call any Mettle runtime initialization. Programs that do not use `-d`/`-s` crash tracebacks or `std/thread` interlocked atomics link **zero** Mettle runtime objects, even when they use `new` or string concatenation.
-
-Link the relevant helper object(s) only when your program references their symbols:
-
-- `crash_handler.o` if the program references `mettle_crash_`* (compiled with `-d`, `-s`, `-g`, or with IR null/bounds traps left enabled).
-- `atomics.o` if the program references `mettle_atomic_*` (any use of `std/thread`'s `atomic_compare_exchange_i32` / `_exchange_i32` / `_inc_i32` / `_dec_i32`).
-- `profile.o` if the program references `mettle_profile_*` (compiled with `--profile-runtime`).
-
-```bash
-gcc -nostartfiles main.o \
-    path/to/runtime/crash_handler.o \
-    path/to/runtime/atomics.o \
-    -o main -lkernel32
-```
-
-Omit either object when the corresponding symbols are not referenced.
-
-For concurrency, import `std/thread` (Windows) or `std/thread_posix` and call `CreateThread`/`pthread_create` directly. Mettle has no built-in `async`/`spawn`/`Channel<T>` keywords.
-
-**Programs with `main(argc, argv)`:** If your entry point has the signature
-`fn main(argc: int32, argv: cstring*) -> int32`, the owned startup parses the
-Windows command line or reads the initial Linux process stack before `main`.
-
-## Compiler Diagnostics
-
-Compile-time errors and warnings are printed with a stable error code, the
-source location, a code snippet with a caret pointing at the offending span
-(plus one line of surrounding context), and, where possible, a `help:`
-suggestion. Output is colorized on a TTY and respects `NO_COLOR`,
-`CLICOLOR`/`CLICOLOR_FORCE`, and `TERM=dumb`. Up to 100 diagnostics are
-reported per run rather than stopping at the first.
-
-Error codes: `E0001` lexical, `E0002` syntax, `E0003` semantic, `E0004`
-type, `E0005` scope, `E0006` I/O, `E0007` internal. They are stable across
-versions and useful for `grep` and documentation.
-
-### "Did you mean?" suggestions
-
-When you reference an undefined variable or function, the compiler searches
-every name visible in the current scope chain and, if one is a close match
-(case-insensitive Levenshtein distance within a length-scaled threshold),
-suggests it:
-
-```text
-error[E0003]: Undefined variable 'countr'
-  --> app.mettle:5:10
-  |
-4 |   var counter: int32 = 41;
-5 |   return countr + 1;
-  |          ^^^^^^
-6 | }
-   = help: did you mean 'counter'? (or declare 'countr' before using it)
-```
-
-The suggestion is scope-aware: only symbols actually reachable from the
-error site are considered. If nothing is close enough, the diagnostic falls
-back to the generic "declare it before using it" guidance, so unrelated
-names never produce a misleading suggestion.
-
-### The `--explain` report
-
-`--explain` (with `-O`/`--release`) prints what the optimizer did to the main
-input file and why. It reads top to bottom in three parts.
-
-The report covers the main input file only. `--explain-all` drops that filter
-and analyzes every module the program imports, the standard library included,
-which is what you want when the loop you care about was inlined from elsewhere.
-
-**Where to start.** The findings that have a fix, ranked by what the compiler
-can stand behind.
-
-A line marked `spills` comes first. It is a whole function that missed the
-register-allocating backend, so every value in it goes through the stack: a
-cost already measured over the whole function, where every other line is a
-prediction about one loop. The line says how large the function is and which
-construct made it ineligible, including the common case where the function
-never wrote the construct and inlining brought it in.
-
-Then the loop and call findings. A fix marked `proven` was applied to a clone of
-the function and re-checked, so the advice is a result rather than a belief. A
-fix marked `step 1` was also applied to a clone, and the loop still did not
-vectorize: it is worth making and it is not the whole job, and the remark says
-what blocks the loop next. Then advice that names a cause, ahead of the
-checklist the compiler falls back on when it cannot. Then loop depth: the same
-fix inside a nested loop is worth more.
-
-One line per distinct piece of advice, with `(+N more sites)` where the same
-change is needed in several places: four loops wanting the same edit are one
-decision to make. Advice that says there is nothing to change is labelled `note:` rather
-than `fix:` and never appears here, so the list stays a list of work.
-
-**The findings**, in source order. One line per decision, tagged with its
-stable decision code, then the source it is about, then the reason, the fix,
-and the proof:
-
-```text
-  where to start (2 of 3 missed optimizations have a fix; "proven" = applied to a clone and re-checked, "step 1" = applied and the loop still needs more):
-    1. spills main (282 instrs)  move the vectorized loop into a function of its own
-                                 contains the affine-map kernel `simd_affine_map` in a form the register allocator's inline passthrough doesn't cover yet: kernel inlined from `saxpy` @ line 157
-    2. proven sum_bytes:27       declare the accumulator as int64
-
-  saxpy (loop @ line 12): vectorized -> vfmadd231ps, 8-wide float32  [vectorized]
-  sum_bytes (loop @ line 27): NOT vectorized  [byte-sum-narrow-acc]
-      27 | for i in 0..n {
-      28 |     total = total + (int32)data[i];
-      \_ reason: this is a byte-sum loop, but the vpsadbw kernel accumulates into int64
-      \_ fix: declare the accumulator as int64
-      \_ verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpsadbw
-```
-
-A loop of five lines or fewer is quoted whole; anything longer shows its first
-line. `mettle explain byte-sum-narrow-acc` prints the paragraph behind the
-bracketed code.
-
-**The memory and backend sections.** Compile-time memory-safety findings, then
-which functions reached the register-allocating backend and what stopped the
-rest. Functions are grouped by cause, largest first, and each cause is a
-sentence about the code rather than the gate's internal reason code. A SIMD
-kernel the allocator cannot pass through gets the opposite advice from
-everything else: the kernel still runs at full vector speed, so on a small
-function there is nothing worth doing, and only past 64 optimized IR
-instructions does moving the loop into its own function pay for itself.
-
-Two more things the report does on its own. A re-run leads with what changed
-since the last `--explain` build, regressions first, using a baseline written
-beside the output. And a report past 200 lines goes to
-`<output-stem>.explain.txt` with a digest on stderr, so a large program does
-not flood the terminal. The digest carries the first "where to start" entry,
-so the short form still says what to do rather than only how the build went.
-
-A reason can run past 300 columns. Written to a terminal the report folds to
-that terminal's width, indenting continuations inside the elbow so the tree
-still reads. Redirected, piped or written to the sidecar it stays one line per
-fact, so `grep reason:` returns whole reasons. `METTLE_EXPLAIN_COLUMNS` forces
-a width.
-
-`--explain=SELECTOR` narrows the prose to one slice: `missed` drops the
-successes, `fixable` keeps only what has a fix, `proven` keeps what the
-compiler confirmed, `loops` and `calls` split by kind, and anything else is
-read as a function name and then as a decision code. The JSON sidecar ignores
-the selector and stays whole-file.
-
-### Type-mismatch suggestions
-
-Mettle converts nothing implicitly, so a mismatch almost always has one
-concrete answer. The `help:` line gives it rather than restating the error:
-
-| Situation | Suggestion |
-|---|---|
-| number where a string belongs | quote it: a string literal is `"42"` |
-| string where a number belongs | drop the quotes |
-| numeric to numeric | cast explicitly, and what the cast costs (a discarded fraction, a wrapping narrow) |
-| value where a pointer belongs | take the address: `&value` |
-| pointer where a value belongs | read through it: `*value` or `value[0]` |
-| number where a `bool` belongs | compare explicitly: `value != 0` |
-| `string` against `cstring` | cast between the two representations |
-
-## Runtime Crash Tracebacks
-
-Compile with `-s` or `-d` to embed runtime crash traceback support in the generated program. This adds failure path metadata for Mettle function names and source locations and installs the owned crash handler at startup. Windows uses the Windows exception API. Linux uses raw signal syscalls. Both produce the same stack trace format from the same embedded tables.
-
-On the default `--build` path, `-s` works without an assembler. The compiler embeds `mettle_debug_functions` and `mettle_debug_locations`, then Mettle's own entry calls `mettle_crash_startup` before `main`. IR null and bounds traps call `mettle_crash_trap` when `-s` is active. Example:
-
-```powershell
-mettle --build -s tests\test_runtime_null_deref_check.mettle -o demo.exe
-.\demo.exe
-```
-
-```text
-Fatal error: Null pointer dereference
-Stack trace:
-  #0 main at tests\test_runtime_null_deref_check.mettle:9:10 (0x000000014000106A)
-```
-
-- `-s` enables embedded runtime crash tracebacks without the rest of debug mode.
-- `-d` enables debug output and also implies embedded runtime crash tracebacks.
-- `--release` still disables generated null/bounds runtime checks, so only native crashes remain traceable there.
-
-A fatal fault prints the exception or signal, the faulting address, and a
-symbolized stack trace. Compiler generated null and bounds traps print the same
-shape. Frames outside registered Mettle debug info show as `<unknown>`.
-
-Windows example (native access violation):
-
-```text
-Unhandled runtime exception 0xC0000005 (access violation)
-Exception address: 0x00007FF7DFD71046
-write access violation at 0x0000000000000001
-Stack trace:
-  #0 leaf_crash at app.mettle:2:3 (0x00007FF7DFD71046)
-  #1 intermediate at app.mettle:6:3 (0x00007FF7DFD71080)
-  #2 main at app.mettle:10:3 (0x00007FF7DFD710A0)
-```
-
-POSIX example (null dereference via SIGSEGV):
-
-```text
-Unhandled runtime signal 11 (segmentation fault (invalid memory access))
-Faulting address: 0x0000000000000000  (null pointer dereference)
-Fault instruction: 0x000057AD4388733D
-Stack trace:
-  #0 compute_total at app.mettle:12:5 (0x000057AD4388733D)
-  #1 main at app.mettle:20:3 (0x000057AD438873CE)
-```
-
-Compiler-generated runtime traps are formatted the same on both platforms:
-
-```text
-Fatal error: Null pointer dereference
-Stack trace:
-  #0 main at app.mettle:9:10 (0x00007FF7DFD71046)
-```
-
-The signal handler runs on a dedicated alternate stack so that a stack-overflow `SIGSEGV` can still be reported rather than silently re-faulting, and uses only async-signal-safe primitives.
-
-## Stack Safety Diagnostics
-
-The compiler emits a warning for unusually large function stack frames (currently 256 KiB). This is intended as an early signal for stack overflow risk in deeply nested calls or thread stacks with limited reserve.
-
-On Windows x64, Mettle now emits stack probing (`___chkstk_ms`) for large frame allocations (>4 KiB) before subtracting `rsp`, to avoid guard-page skips.
-
-The warning threshold is currently fixed and may become configurable in a future release.
-
-## Compiler debugging
-
-`--dump-ir` writes the IR as a sidecar next to `-o`, appending `.ir` to the
-output name. Compiling to `app.obj` writes `app.obj.ir`. The dump is taken after
-optimization, so it shows what the backend received:
-
-| Flag              | Output                                             |
-| ----------------- | -------------------------------------------------- |
-| `--dump-ir`       | `<output>.ir`, the post-optimizer IR               |
-| `-d` / `--debug`  | the same sidecar, plus debug symbols and log output |
-
-Each function is printed as a header, then its basic blocks with instruction
-ranges and predecessor and successor edges:
-
-```
-function main {
-  block 0 <entry> [0..52] preds: - succs: -
-       1: local @s : int32
-       2: @s <- 0
-```
-
-```powershell
-mettle --dump-ir -O app.mettle -o app.obj
-```
-
-For optimization decisions, use `--explain`, which reports each loop and call
-the optimizer considered along with its reason. For per-pass behavior,
-`--verify` validates every pass against the reference interpreter and names the
-pass that diverges.
-
-With object emission or `--build`, `-g` embeds binary DWARF 4
-sections (`.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_str`,
-`.debug_frame`) in native objects (ELF on Linux; COFF/PE on Windows as supported by the active linker path) for GDB/LLDB. Locals and
-parameters kept in GP registers by the optimizer (for example `r12` to `r15`) are
-described with `DW_OP_regN` location expressions; stack-homed symbols use
-`DW_OP_fbreg`. Runtime stack-trace tables (`-s`) are embedded in COFF objects on the default object / `--build` path (`.rdata` symbols `mettle_debug_functions`, `mettle_debug_locations`, plus `mettle_crash_startup`). They are separate from `-g` DWARF sections: `-s` alone enables tracebacks without emitting `.debug_*`.
-
-## Testing
-
-The test suite compiles and runs a set of programs. Run:
-
-```powershell
-.\tests\run_tests.ps1
-.\tests\run_tests.ps1 -BuildCompiler
-.\tests\run_tests.ps1 -SkipRuntime
-```
-
-`-BuildCompiler` rebuilds the compiler before running. `-SkipRuntime` skips optional runtime executable tests.
+`help` covers build, runtime, interop, stdlib, web, diagnostics, verify, and
+test; `help all` prints every topic. `docs` prints the path of the matching
+documentation file.
+
+`explain` takes a diagnostic code such as `E0004` or `M0103`, or an
+[`--explain` decision code](explain-json.md) such as `dot-shape-address`.
+`explain list` prints the index.
+
+`test` runs the `@test` functions in the compile-time interpreter, with no
+codegen and no linking. `trace` interprets one function and prints a
+line-by-line value trace. [Compile-time execution](testing.md) covers both.
+
+## Environment variables
+
+These change compiler behavior and are meant for debugging the compiler
+itself.
+
+| Variable | Effect |
+|----------|--------|
+| `METTLE_PGO_HOT` | Call-frequency threshold for `--pgo`. |
+| `METTLE_SKIP_PASS` | Skip a named optimizer pass, for bisecting a miscompile. |
+| `METTLE_TIME_IR_PASSES` | Time each IR pass. |
+| `METTLE_TRACE_IR_PASSES` | Trace each IR pass. |
+| `METTLE_TIME_CODEGEN` | Time code generation. |
+| `METTLE_LINEAR_ALLOC` | Use the linear register allocator in place of the graph-coloring default. |
+| `METTLE_MIR_DUMP` | Dump MIR with register assignments. |
+| `METTLE_NO_SIMD` | Turn the vectorizers off. |
+| `METTLE_LINK_GC_REPORT` | Report what link-time section collection removed. |
+| `METTLE_VERIFY_STATS` | Statistics from `--verify`. |
+| `METTLE_PROFILE_OUT` | Output path for `--profile-blocks`. |
+| `NO_COLOR`, `CLICOLOR_FORCE` | Turn diagnostic color off or on. |
+| `TRACY_DIR` | Tracy repo root for `--tracy`. |
+
+## See also
+
+- [Linker and build pipelines](linker-build-pipelines.md)
+- [Diagnostics](diagnostics.md)
+- [Getting started](getting-started.md)

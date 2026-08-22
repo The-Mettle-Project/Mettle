@@ -1,217 +1,154 @@
-# The `--explain-json` schema
+# The --explain-json schema
 
-`mettle --release --explain-json <file>` writes `<output-stem>.explain.json` beside the output: a
-machine-readable account of what the compiler did to that file. It is what editors and analysis
-tools read; the prose report on stderr says the same things to a person.
+`--explain-json` writes `<output-stem>.explain.json` beside the object or
+executable: the same report [`--explain`](compilation.md) prints, in a form an
+editor or an analysis tool can read. It implies `--explain`, which needs `-O`
+or `--release`.
 
 ```bash
-mettle -i app.mettle -o build/app.obj --release --explain-json
+mettle --release --explain-json --build program.mettle -o program.exe
 ```
 
-The report covers the **focus file** only. Imported modules compile into the same program but their
-loops and calls are not the file you asked about, so they are filtered out.
-
-## Design
-
-Two rules the schema keeps:
-
-- **The prose is for people; the ids are for tools.** Every decision carries a stable `code`
-  alongside its `reason`. Wordings get improved as we learn how to say things better; ids do not
-  move. Anything matching on the English text will break, and deserves to.
-- **Additive versions.** `schema` is `2`. Every schema 1 key still means exactly what it did, so a
-  consumer written against 1 keeps working. New information arrives as new keys.
+The current schema is version 2. A reader should check `schema` and refuse a
+number it does not know.
 
 ## Top level
 
-| Key | |
-|--|--|
-| `schema` | Format version. Currently `2`. |
-| `source` | Basename of the focus file. |
-| `changes` | What flipped since the previous explain build of this file. |
-| `startHere` | The top findings that have a fix, ranked the way the prose report ranks them. Each entry carries a `kind`: `backend` for a whole function that missed the register allocator (fields `fn`, `instructions`, `why`, `fix`), `remark` for a loop or call decision (fields `fn`, `line`, `code`, `fix`, `proven`, `stillBlocked`, `depth`, `sites`). `backend` entries come first: they are a measured cost over a whole function, where a remark is a prediction about one loop. |
-| `remarks` | Every optimizer decision: loops, calls, branches, allocations, contracts. |
-| `functions` | One row per function: weight in and out, decisions, backend outcome, cost. |
-| `loops` | What the backend measured about each loop: cycles, bottleneck port, depth. |
-| `callGraph` | Caller/callee edges with sites inlined, sites refused, callee weight. |
-| `hotspots` | Every decision with a modelled cost, heaviest first. |
-| `passes` | What each optimization pass did to this file. |
-| `memory` | Compile-time memory-safety findings. |
-| `backend` | Register-allocation coverage, grouped by why a function missed it. |
-| `stats` | The one-line totals. |
+| Field | Type | Contents |
+|-------|------|----------|
+| `schema` | number | Schema version, currently 2 |
+| `source` | string | The entry file |
+| `changes` | object | What moved since the last build |
+| `remarks` | array | Every optimization decision |
+| `startHere` | array | The decisions worth acting on first |
+| `safety` | object | `--safe` checks that survived elision |
+| `memory` | array | Memory diagnostics for this file |
+| `backend` | object | How much of the program reached the register-allocating backend |
+| `functions` | array | Per-function totals |
+| `loops` | array | Per-loop cost model |
+| `callGraph` | array | Caller and callee pairs with inlining outcomes |
+| `hotspots` | array | The costliest sites |
+| `passes` | array | What each optimizer pass did |
+| `stats` | object | Whole-run counters |
 
-## `remarks`
+## remarks
 
-One entry per decision the optimizer made.
+One entry per decision. This is the same material `--explain` prints.
 
-| Field | |
-|--|--|
-| `kind` | `loop`, `call`, `function` or `other`. |
-| `fn` | The function the decision was made in. |
-| `entity` | `loop`, ``call to `f` ``, `branch`, `allocation`, ... |
-| `line`, `column` | 1-based position of the construct. |
-| `endLine` | Last line the construct covers, so an editor can highlight a whole loop. Absent when unknown. |
-| `positive` | `true` when the optimizer did the good thing. |
-| `headline` | The one-line verdict. |
-| `reason` | Why, when it declined. May be null. |
-| `fix` | What to change. May be null. |
-| `verified` | Set only when the compiler **applied that fix to a clone, re-ran its own optimizer, and confirmed the result**. Never a guess. The kernel it names is the one the edit produces: each simulation is pinned in the test suite against the same loop written by hand. |
-| `stillBlocked` | Set when the compiler applied that fix to a clone and the loop **still** did not vectorize: the text is the obstacle that surfaced next. `fix` remains worth making, and it is not the whole job. Mutually exclusive with `verified`, and shown as `step 1` in the prose plan. |
-| `code` | The stable decision id. See below. |
-| `callee` | For calls, the callee's name. |
-| `depth` | Loop nest depth, 1 for a top-level loop. |
-| `trivial` | `true` for housekeeping a reader can collapse: inlining a one-line stdlib wrapper. |
-| `advisory` | `true` when `fix` says there is nothing to change: the loop is at its floor, or the gap is the compiler's. Not work to do, and never ranked in `startHere`. |
-| `quantities` | Whatever the pass measured: `calleeInstructions`, `iterations`. |
-| `count`, `lineEnd`, `calls` | Present when a run of identical refusals was folded into one entry. |
+| Field | Type | Contents |
+|-------|------|----------|
+| `kind` | string | `loop` or `call` |
+| `fn` | string | The function holding the site |
+| `entity` | string | What the decision was about, such as ``call to `scale` `` |
+| `line`, `column`, `endLine` | number | Where it is |
+| `positive` | bool | True when the optimizer did the thing |
+| `headline` | string | The verdict in words |
+| `reason` | string or null | Why it declined |
+| `fix` | string or null | What to change |
+| `verified` | bool or null | Whether the fix was applied to a clone and re-checked |
+| `stillBlocked` | bool or null | Whether the fix leaves the loop blocked on something else |
+| `callee` | string or null | For a call remark |
+| `depth` | number | Loop nesting depth |
+| `code` | string | The decision code, such as `store-only-fill` |
+| `quantities` | object | Numbers behind the verdict, such as `calleeInstructions` |
 
-### Decision ids
-
-Every id has a page of its own. `mettle explain <id>` prints what the compiler saw, whether it
-is a gap in the compiler or a fact about the code, and what to change. `mettle explain list`
-indexes them. The prose report prints the id in brackets after each verdict, so the line and its
-long form are one command apart.
-
-Vectorization refusals use the analyzer's own diagnosis ids:
-
-`call-in-body`, `extern-call-in-body`, `indirect-call`, `alloc-in-body`, `inline-asm`,
-`control-flow`, `early-exit`, `int16-elements`, `int64-elements`, `serial-recurrence`,
-`mixed-float-widths`, `byte-sum-narrow-acc`, `int32-sum-narrow-acc`, `inlined-param-local`,
-`body-local`, `dot-shape-address`, `store-only-fill`, `unrecognized-shape`
-
-Inlining refusals: `callee-no-body`, `callee-noinline`, `callee-denylisted`,
-`too-many-parameters`, `callee-parameter-names`, `callee-over-budget`, `callee-call-count`,
-`callee-inline-asm`, `callee-has-loop`, `callee-no-return`, `callee-has-kernel`, `recursive`,
-`caller-over-budget`, `argument-count`, `rounds-exhausted`
-
-Positive outcomes: `vectorized`, `vectorized-inner`, `outer-of-nest`, `eliminated`, `inlined`,
-`unrolled`, `hoisted`, `if-converted`, `prefetched`, `layout-optimized`, `noalloc-verified`
-
-A new diagnosis adds an id. It never hides under an existing one.
-
-## `startHere`
-
-Line order answers "what happened". This answers "what do I change", and an editor showing a
-fix-it panel should not have to re-derive the order or guess at the tie-breaks.
-
-| Field | |
-|--|--|
-| `fn`, `line` | Which finding. Join onto `remarks` by (`fn`, `line`). |
-| `code` | Its stable decision id. |
-| `fix` | The full suggestion, untruncated (the prose report cuts it to fit a line). |
-| `proven` | `true` when the compiler applied the fix to a clone, re-ran its own optimizer, and confirmed it. |
-| `depth` | Loop nest depth, a sort key after `proven` and specificity. |
-| `sites` | How many findings this entry stands for. One line per distinct piece of advice: four loops needing the same change are one decision and four edits. Advice, not code, because one code can cover several causes with different fixes. |
-
-At most five entries, one per distinct fix, and empty when nothing in the file has a fix. Advice
-that says there is nothing to change (`advisory`) is never here. Unlike the prose report, this array
-ignores `--explain=SELECTOR`.
-
-## `functions`
-
-The report's spine: what the whole pipeline achieved on each function.
-
-| Field | |
-|--|--|
-| `fn`, `line` | Name and where it starts. |
-| `instructionsBefore`, `instructionsAfter` | Non-nop IR weight entering and leaving the optimizer. The difference is what the pipeline achieved. |
-| `loops`, `loopsVectorized` | Loop decisions recorded against it. |
-| `callsInlined`, `callsRefused` | Call decisions. |
-| `backendOk`, `backendReason`, `backendInstructions` | Whether it reached the register-allocating backend, and the gate's reason when it did not. |
-| `spills`, `regsUsed` | From the register allocator. |
-| `throughput`, `hotCost` | Summed reciprocal throughput and its loop-depth-weighted form, both in centicycles. |
-| `vectorOps`, `estimatedSpans` | Vector ops emitted; spans whose cost fell back to an opcode estimate. |
-
-## `loops`
-
-Every loop the backend measured, whether or not the optimizer had anything to say about it. Join
-onto `remarks` by (`fn`, `line`).
-
-| Field | |
-|--|--|
-| `fn`, `line`, `endLine`, `depth` | Which loop. |
-| `cyclesPerIter` | **Centicycles**: `720` is 7.2 cycles per iteration. Modelled from the port pressure of the emitted instructions, not measured. |
-| `bottleneck` | The execution port the model says saturates first. |
-| `hasKernel` | A SIMD kernel is present in the body. |
-| `estimated` | Some span's cost came from an opcode estimate rather than a measured table entry. |
-
-## `hotspots`
-
-Every decision with a number on it, sorted by `cost` descending. Line order buries the loop that
-costs the program its afternoon under a cold one-liner; this is the order to show a user.
-
-| Field | |
-|--|--|
-| `fn`, `line`, `kind` | Which decision. |
-| `code` | Its stable id, when it has one. |
-| `cost` | Loops: modelled cycles times nest weight. Calls: callee weight times the nest weight of the loop containing the site. Ten per nest level, capped at three levels. |
-
-A static proxy. Nothing here has run the program. With `--pgo` the frequencies
-are measured and the ranking follows them.
-
-## `passes`
-
-What each optimization pass did to this file, heaviest first.
-
-| Field | |
-|--|--|
-| `pass` | Pass name, as `METTLE_SKIP_PASS` and `METTLE_TIME_IR_PASSES` spell it. |
-| `runs`, `changedRuns` | Times it executed, and times it reported a change. The fixpoint driver re-runs passes until nothing moves. |
-| `instructionsRemoved` | Net non-nop instructions removed across those runs. Negative means the pass added instructions, which vectorization and unrolling legitimately do. |
-| `effects` | Per-opcode net change, keyed by the mnemonic `ir_opcode_name` gives. Positive removed that opcode, negative introduced it. |
-| `sites` | Up to twelve `{fn, line, delta}` entries, heaviest first: where the pass moved instructions. |
-
-`effects` and `sites` come from diffing the function's shape either side of every
-pass run, so they describe what a pass did without the pass having to report it:
+`mettle explain <code>` prints the long form of any `code` value.
 
 ```json
-{ "pass": "simd_affine_map_float", "runs": 19, "changedRuns": 4,
-  "instructionsRemoved": 51,
-  "effects": { "binary": 29, "load": 7, "store": 5, "label": 5, "jump": 5,
-               "branch_zero": 5, "simd_affine_map_f32": -5 },
-  "sites": [ { "fn": "saxpy", "line": 13, "delta": 8 },
-             { "fn": "with_call", "line": 20, "delta": 4 } ] }
+{
+  "kind": "loop",
+  "fn": "main",
+  "line": 7,
+  "positive": false,
+  "headline": "NOT vectorized",
+  "reason": "the loop fills the stack array `xs`, whose address is retaken on every iteration; the fill kernel indexes off one invariant base pointer, and a fresh base each iteration is not one",
+  "fix": "bind the array to a pointer once before the loop (`var p: int32* = &xs[0];`) and write `p[i]` in the body",
+  "code": "store-only-fill",
+  "depth": 1,
+  "column": 3,
+  "endLine": 7
+}
 ```
 
-That reads as: the vectorizer replaced 29 scalar arithmetic instructions, 7 loads, 5 stores and a
-loop's worth of control flow with 5 SIMD kernel instructions, at `saxpy:13` and `with_call:20`.
+## startHere
 
-## `callGraph`
+The subset of `remarks` that carries a fix, ranked. Each entry has `kind`,
+`fn`, `line`, `code`, `fix`, `proven`, `stillBlocked`, `depth`, and `sites`.
 
-One edge per caller/callee pair: `caller`, `callee`, `inlined`, `refused`, `calleeInstructions`.
+`proven` is the important one: true means the compiler applied that fix to a
+clone and confirmed it worked.
 
-## `changes`
+## changes
 
-`baseline` is false on the first explain build of a file, true afterwards. `entries` carries every
-decision that flipped: `kind`, `fn`, `line`, `direction` (`improved` or `regressed`), and the
-`reason` for regressions.
+`baseline` is true on a first build, when there is nothing to compare against.
+Otherwise `entries` lists what improved and what regressed since the last
+build of the same file.
 
-The baseline lives beside the output as `<stem>.explain.base`, so keeping a stable output path is
-what makes this section work.
+## functions
 
-## `memory` and `backend`
+| Field | Contents |
+|-------|----------|
+| `fn`, `line` | Which function |
+| `instructionsBefore`, `instructionsAfter` | IR instruction count around optimization |
+| `loops`, `loopsVectorized` | Loop counts |
+| `callsInlined`, `callsRefused` | Inlining outcomes |
+| `backendOk` | Whether it reached the register-allocating backend |
+| `backendInstructions`, `backendReason` | Size and, when it did not, why |
+| `spills`, `regsUsed` | Register allocation results |
+| `throughput`, `hotCost` | Cost model output |
+| `vectorOps`, `estimatedSpans` | Vector work and estimated live spans |
 
-`memory` carries the compile-time memory-safety findings for the file (`severity`, `line`,
-`headline`, `fix`). `backend` reports register-allocation coverage: `ok`, `total`, `instructions`,
-`okInstructions`, and `groups` of functions that missed it, each with the `reason`, the
-`consequence`, a `fix`, and its `members`. A group's `fix` carries `advisory: true` when it says
-nothing needs doing, matching the `note:` the prose report prints for it.
+## loops
 
-Whether a group is advisory turns on how big its functions are. A SIMD kernel the allocator cannot
-pass through costs only the scalar code around it, which on a small function is not worth an edit;
-past 64 optimized IR instructions the same fallback is the largest single cost in the file, so the
-advice becomes an instruction and the group is ranked into `startHere`. Each member carries a
-`kernelLine` when the report can say which loop the kernel came from, including the case where the
-function never wrote one: inlining brings a callee's vectorized loop in with it, and the member
-line then names the call instead.
+`fn`, `line`, `endLine`, `depth`, `cyclesPerIter`, `bottleneck` (the port or
+unit that limits it, such as `store`), `hasKernel` (whether a vectorizer
+claimed it), and `estimated`.
 
-## Consumers
+## backend
 
-- The CLion plugin in the [MettleMisc](https://github.com/The-Mettle-Project/MettleMisc)
-  project reads all of it.
-- `tests/run_tests.ps1` pins the shape in `explain_changes_and_json`.
+`ok` and `total` count functions, `instructions` and `okInstructions` count IR
+instructions, and `groups` explains each reason a function missed the
+register-allocating backend:
+
+```json
+{
+  "reason": "contains a call form the register allocator doesn't support yet",
+  "functions": 1,
+  "instructions": 109,
+  "consequence": "every value in the function is kept on the stack instead of in registers",
+  "fix": null,
+  "members": [{"fn": "main", "instructions": 109}]
+}
+```
+
+## passes
+
+One entry per optimizer pass that ran: `pass`, `runs`, `changedRuns`,
+`instructionsRemoved`, an `effects` breakdown by category, and `sites` naming
+the functions and lines it touched with a `delta` each.
+
+## safety
+
+`enabled` says whether `--safe` was on. `survivors` lists the checks that
+static elision could not remove, which is where the run-time cost lives.
+
+## memory
+
+The [memory diagnostics](memory-safety.md) for this file, each with its code,
+location, and message.
+
+## stats
+
+`loopsVectorized`, `loopsScalar`, `fixesVerified`, `callsInlined`,
+`callsRefused`, `changesImproved`, `changesRegressed`, and `hadBaseline`.
+
+## A related sidecar
+
+`--annotate-asm` writes `<stem>.annot.json` alongside its printed report, with
+the per-instruction codegen provenance. That is a different schema, and
+[Compilation](compilation.md) covers the flag.
 
 ## See also
 
-- [Compilation](compilation.md) for `--explain`, `--annotate-asm` and the other report flags.
-- [Control Flow](control-flow.md#vectorization-contracts) for `@simd` and what makes a loop
-  vectorizable.
+- [Compilation](compilation.md)
+- [Diagnostics](diagnostics.md)

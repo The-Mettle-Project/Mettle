@@ -1,157 +1,153 @@
 # Diagnostics
 
-libmtlc ships a frontend-neutral diagnostics reporter (`src/error`): it renders
-compile problems against raw source text and source positions, with rustc-style
-rich output, a stable error code, the source snippet with the offending range
-underlined, an inline label saying what was expected, attached notes pointing at
-related code, and a concrete `help:` suggestion. It knows nothing about any AST,
-so the Mettle frontend and the backend (for example the compile-time
-interpreter) both report through it. The examples below are from the Mettle
-frontend.
+What the compiler prints when something is wrong, how to read it, and how to
+get it as JSON.
 
-```
-error[E0003]: Function 'add' expects 2 arguments, got 3
-  --> app.mettle:6:20
+## The shape of a diagnostic
+
+```text
+error[M0118]: Integer 300 is out of range for 'int8'
+  --> bad.mettle:2:17
   |
-5 | fn main() -> int64 {
-6 |     var r: int64 = add(1, 2, 3);
-  |                    ^^^ expected 2 arguments, got 3
-7 |     var s: float64 = add(1, 2);
-note: function 'add' defined here
-  --> app.mettle:1:4
-  |
-1 | fn add(a: int64, b: int64) -> int64 {
-  |    ^^^
-
-error: could not compile `app.mettle` due to 1 previous error
-help: for more about this error, run `mettle explain E0003`
+1 | fn main() -> int32 {
+2 |   var x: int8 = 300;
+  |                 ^^^ does not fit in 'int8' (-128..127)
+3 |   var y: int64 = 1;
+   = help: 'int8' holds -128..127. Widen the type, or cast to say the wrap is
+     meant: (int8)value
 ```
 
-## Behavior
+The first line gives severity, code, and the problem. The arrow gives file,
+line, and column. The snippet shows a line either side, with a caret span
+under the offending text and a short label saying what is wrong there. A
+`help` line says what to do about it.
 
-- **All errors in one compile.** The type checker recovers after a bad
-  statement or declaration and keeps checking, so a file with four mistakes
-  reports four errors, not one per rebuild. A variable whose initializer
-  fails is still registered with its declared type, so later uses of it do
-  not cascade into bogus `Undefined variable` errors.
-- **One mistake, one diagnostic.** A failed statement resynchronizes inside
-  the block it belongs to. The block still consumes its own closing brace, so
-  the rest of the function never reaches file scope to be read as broken
-  declarations. Repeated errors at one location are dropped as well.
-  `tests/err_syntax_no_cascade.mettle` and
-  `tests/err_syntax_missing_operand.mettle` assert the error count, so a
-  return of the old cascade fails the suite.
-- **The message names what the parser found.** A missing operand reports the
-  operator it was read past and the token that turned up instead, as in
-  `Expected an expression after '+', found ';'`. Where the construct is
-  known, the message names it: `Expected '(' after 'if'`.
-- **Advice comes from context.** A comma where `)` was due describes the
-  paren it belongs to. A parameter or argument list is told the list ends
-  there; a condition or a grouped expression is told it holds one value and
-  that Mettle has no tuples.
-- **Foreign keywords get named.** `let`, `def`, `func`, `int`, `float`,
-  `char` and the rest report the Mettle spelling in one line rather than
-  decomposing into grammar complaints.
-- **Typo suggestions.** Undefined names get a Levenshtein-based
-  "did you mean 'count'?" over every symbol in scope.
-- **A summary footer** counts errors and warnings and names the `explain`
-  code for the first error.
+Some diagnostics add `note` lines that point at a second location, the
+declaration a call disagrees with, or the iteration a generated declaration
+came from.
 
-## Warnings
+## Recovery
 
-- `unused variable 'x'` - a local was never read. Prefix the name with `_`
-  to opt out (`var _x: ...`). Only the main compile unit is checked;
-  imported modules stay quiet.
-- `Unreachable code` - a statement follows a `return`/terminator.
-- Memory-safety warnings and errors (`M0101`..`M0117`): use-after-free,
-  double free, leaks, out-of-bounds constant indexing, escaping stack
-  addresses, and borrow-checker lifetime findings. See
-  [borrow-checker.md](borrow-checker.md). `M0101` and `M0102` also cover the
-  aliased forms, where one allocation is reachable under two names and freeing
-  through either invalidates both; the message names the alias rather than
-  using a separate code.
-- Integer range errors (`M0118`, `M0119`): a compile-time integer that does
-  not fit where it is stored, and a narrowing conversion written without a
-  cast. See [Type conversions](types.md).
+The compiler does not stop at the first error. It reports every one it can
+reach, then summarizes:
 
-## `mettle explain <CODE>`
-
-Extended documentation for any code, with an example and how to fix it:
-
-```
-$ mettle explain E0004
-$ mettle explain M0103
-$ mettle explain dot-shape-address    # an --explain decision code
-$ mettle explain list                 # index of every code
+```text
+error: could not compile `bad.mettle` due to 2 previous errors
+help: for more about this error, run `mettle explain M0118`
 ```
 
-The lookup is forgiving: it folds case, treats `_` and `-` alike, and strips
-brackets and backticks so a code pasted out of a report works. A fragment
-resolves when it is unique (`mettle explain dot` prints `dot-shape-address`)
-and lists the candidates when it is not (`mettle explain budget` shows both
-budget refusals). A typo gets the nearest code.
+The parser resyncs at block boundaries, so one missing brace does not cascade
+into a page of nonsense.
 
-Two families of code share the command. Diagnostic codes name a compile error
-or warning. Decision codes name an optimizer verdict: the `--explain` report
-prints one in brackets after every line, and `--explain-json` carries the same
-string in its `code` field. See [The `--explain-json` schema](explain-json.md)
-for the full list.
+## Severities
 
-Diagnostic codes are stable across compiler versions:
+`error` fails the build. `warning` does not. Most of the
+[memory diagnostics](memory-safety.md) are warnings, because the code they
+describe is legal and wrong. The ones that cannot possibly be meant, such as
+returning the address of a local, are errors.
+
+## Explaining a code
+
+```bash
+mettle explain M0110
+```
+
+```text
+M0110: Borrowed interior pointer outlives its scope
+
+A pointer into a stack value (a field, an array element) escapes the
+scope that owns the value, e.g. saved to an outer variable inside a
+block. When the block exits the pointee dies.
+
+Fix: shorten the pointer's lifetime to the value's scope, or move
+the value itself to the outer scope / heap.
+```
+
+`mettle explain list` prints the index. The same command explains an
+[`--explain` decision code](explain-json.md) such as `store-only-fill`.
+
+## The codes
+
+Compiler errors:
 
 | Code | Meaning |
 |------|---------|
 | E0001 | Lexical error |
 | E0002 | Syntax error |
-| E0003 | Semantic error (undefined name, duplicate, bad call, ...) |
+| E0003 | Semantic error |
 | E0004 | Type mismatch |
 | E0005 | Scope error |
-| E0006 | I/O error |
+| E0006 | Input or output error |
 | E0007 | Internal compiler error |
-| M0101..M0117 | Memory-safety findings (`mettle explain list`) |
+
+Memory and range diagnostics:
+
+| Code | Meaning |
+|------|---------|
+| M0101 | Use after free |
+| M0102 | Double free |
+| M0103 | Returning the address of a stack local |
+| M0104 | Storing a stack address in a global |
+| M0105 | Constant array index out of bounds |
+| M0106 | Memory operation overflows a stack array |
+| M0107 | Memory leak |
+| M0108 | Use after call-freed pointer |
+| M0109 | Double free via call |
+| M0110 | Borrowed interior pointer outlives its scope |
+| M0111 | Borrowed pointer invalidated by realloc |
+| M0112 | Borrowed pointer invalidated by free |
+| M0113 | Dereference of a null pointer |
+| M0114 | Dereference of an unmapped constant address |
+| M0115 | Shift count at or past the operand width |
+| M0116 | Division or modulo by a constant zero |
+| M0117 | Loop index runs past the end of the array |
 | M0118 | Integer out of range for its destination |
 | M0119 | Narrowing conversion needs a cast |
 
-A memory finding reports under its own `M` code rather than the generic
-`E0003`, so `mettle explain M0107` works on the diagnostic in front of you.
+[Memory safety](memory-safety.md) and [Borrow checker](borrow-checker.md)
+cover the M codes in context.
 
-## Machine-readable output: `--error-format=json`
+## JSON output
 
-For editors and CI, `--error-format=json` prints one JSON object per
-diagnostic on stderr (NDJSON):
+`--error-format=json` writes one JSON object per diagnostic to stderr, for
+editors and other tools:
 
-```json
-{"severity":"error","code":"E0004","message":"Type mismatch: expected 'int64', found 'string'",
- "file":"app.mettle","line":2,"column":20,"length":5,
- "label":"expected 'int64', found 'string'",
- "help":"use numeric literal without quotes: 42",
- "notes":[{"message":"...","file":"...","line":1,"column":4,"length":3}]}
+```bash
+mettle --error-format=json bad.mettle -o bad.obj
 ```
 
-Fields: `severity` (`error`|`warning`|`note`), stable `code`, `message`,
-1-based `line`/`column`, `length` (characters to underline), optional
-`label` (inline caret text) and `help` (suggestion), and `notes` (related
-locations such as "previous declaration here").
+```json
+{"severity":"error","code":"M0118","message":"Integer 300 is out of range for 'int8'","file":"bad.mettle","line":2,"column":17,"length":3,"label":"does not fit in 'int8' (-128..127)","help":"'int8' holds -128..127. Widen the type, or cast to say the wrap is meant: (int8)value","notes":[]}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `severity` | `error` or `warning` |
+| `code` | The diagnostic code |
+| `message` | The headline |
+| `file`, `line`, `column` | Where it starts |
+| `length` | How many columns the caret spans |
+| `label` | The short text under the caret |
+| `help` | The suggested fix, or absent |
+| `notes` | Secondary locations, each with its own message |
+
+The objects are newline-delimited, one per line, so a reader can consume them
+as they arrive.
 
 ## Color
 
-ANSI color is used when stderr is a terminal. Overrides: `NO_COLOR` (off),
-`CLICOLOR=0` (off), `CLICOLOR_FORCE=1` (force on), `TERM=dumb` (off).
-Windows consoles get VT sequences enabled automatically.
+Diagnostics are colored when stderr is a terminal. `NO_COLOR` turns that off
+and `CLICOLOR_FORCE` turns it on regardless.
 
-## Related tooling
+## Optimization remarks
 
-- `--explain` / `--explain-json` - optimization decision report (what
-  vectorized/inlined and why not). `--explain=SELECTOR` narrows the prose to
-  `missed`, `fixable`, `proven`, `loops`, `calls`, one function, or one
-  decision code.
-  `--explain-all` widens the same report to imported modules and the stdlib.
-- `--annotate-asm`, `--annotate-lines=A-B` - codegen provenance.
-- `--annotate-hot[=N]` - the top N codegen hotspots, hottest loops by
-  cycles per iteration and functions by weighted cost. Defaults to 8.
-- `--profile-runtime-ops` - per-function runtime op-class counters, taken after
-  optimization.
-- `--debug-format <dwarf|stabs|map>` - debug information format, `dwarf` by
-  default.
-- Compile-time memory diagnostics run automatically; disable interprocedural
-  analysis with `METTLE_NO_MEM_INTERPROC=1`.
+Diagnostics say what is wrong with the program. Remarks say what the optimizer
+did with it, and they come from [`--explain`](compilation.md), a separate
+report. Every fix it suggests has been applied to a clone and re-checked
+before printing.
+
+## See also
+
+- [Compilation](compilation.md)
+- [Memory safety](memory-safety.md)
+- [The --explain-json schema](explain-json.md)
