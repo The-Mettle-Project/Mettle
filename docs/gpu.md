@@ -1,6 +1,6 @@
-# GPU Offload
+# GPU offload
 
-libmtlc has two GPU code generators, **NVIDIA PTX** and **SPIR-V** (OpenCL),
+libmtlc has two GPU code generators, NVIDIA PTX and SPIR-V (OpenCL),
 both emitted from the same IR with no `nvcc`, no `cudart`, and no LLVM. Through
 the reference frontend, kernels are written in Mettle, compiled to a `.ptx`
 module with `--emit-ptx` (or a `.spv` module with `--emit-spirv`), and, for the
@@ -9,7 +9,7 @@ CUDA path, launched from a normal Mettle host program via the
 (A frontend driving libmtlc directly reaches the same generators through
 `mtlc_emit`; see [Writing a frontend for libmtlc](embedding.md).)
 
-The model is **two-stage and explicit**: kernels live in their own file, the
+The model is two-stage and explicit: kernels live in their own file, the
 host manages device memory itself, and `dispatch` only performs the launch. This
 mirrors how real GPU code manages persistent VRAM.
 
@@ -70,7 +70,7 @@ same for every frontend and GPU backend.
 
 ### Decorators on device code
 
-[Function decorators](declarations.md#function-decorators) apply to device
+[Function decorators](declarations.md#decorators) apply to device
 helpers under `-O`, and they buy more here than on the host. A helper left out
 of line becomes a PTX `.func` reached by `call.uni`: the call ABI's parameter
 space, plus a register allocation that stops at the call boundary, paid once
@@ -90,7 +90,7 @@ a plain DAG of direct calls.
 
 `@pure` hoists a loop-invariant call out of a kernel's loop. A helper that
 writes nothing gets the same treatment by inference, so `@pure` is what you
-write when the callee could fault — a load through a pointer — and you want it
+write when the callee could fault   a load through a pointer   and you want it
 hoisted anyway.
 
 A frontend driving libmtlc directly reaches all four through
@@ -827,10 +827,10 @@ The answer comes from the CUDA driver itself, loaded on demand: the compiler
 links no CUDA library and starts normally on a machine with no NVIDIA driver at
 all. Detection settles two things `--emit-ptx` would otherwise have to guess:
 
-- **The `.target`.** The compute capability the driver reports, taking the
+- The `.target`. The compute capability the driver reports, taking the
   architecture-specific `sm_NNa` form from compute capability 9.0 onward when
   the installed `ptxas` confirms that form exists.
-- **The `.version`.** A PTX ISA above what the local driver understands fails
+- The `.version`. A PTX ISA above what the local driver understands fails
   inside `cuModuleLoadData` at run time with nothing but a status code to
   explain it, so the emitted ISA is capped at what this driver can load.
 
@@ -1084,7 +1084,7 @@ validation guide; do not enable it on a workstation.
 
 ## SPIR-V (OpenCL) target
 
-The same kernels compile to **SPIR-V** with `--emit-spirv`, targeting the
+The same kernels compile to SPIR-V with `--emit-spirv`, targeting the
 OpenCL 2.0 execution environment (Physical64 addressing, the `Kernel`
 capability, the OpenCL memory model). This is the flavor that fits Mettle's
 kernel ABI unchanged: kernels take raw typed pointers and do pointer arithmetic
@@ -1133,8 +1133,9 @@ which `spirv-val --target-env opencl2.0` confirms.
 
 ## Notes and limits
 
-- Without `--gpu-arch`, the CLI targets the local GPU: it queries the driver
-  (`nvidia-smi`) for the device's compute capability and selects the matching
+- Without `--gpu-arch`, the CLI targets the local GPU: it asks the CUDA
+  driver for the device's compute capability, falling back to `nvidia-smi`
+  when the driver library is out of reach, and selects the matching
   `sm_NN` target, using the architecture-specific `a` variant from `sm_90`
   onward so the full tensor instruction surface is available. When no GPU or
   driver is visible (headless or cross-compiling hosts), the default is
@@ -1145,7 +1146,7 @@ which `spirv-val --target-env opencl2.0` confirms.
   Status-returning `gpu_launch_3d` remains available when recovery is required.
   Provider-neutral launch attributes beyond geometry, dynamic shared bytes, and
   stream are not represented yet.
-- Kernels and host code live in **separate files** (the kernel file is compiled
+- Kernels and host code live in separate files (the kernel file is compiled
   with `--emit-ptx`; the host with `--build`).
 
 See `examples/gpu_vadd/` for the complete x86-64 CUDA host example and
