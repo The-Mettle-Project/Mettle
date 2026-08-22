@@ -1,0 +1,69 @@
+enum Shape {
+  Dot,
+  Named(string),
+  Scaled(float64),
+  Count(int64)
+}
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+@noinline fn shape_of(i: int64) -> Shape {
+  if (i == 0) { return Dot; }
+  if (i == 1) { return Named("abc"); }
+  if (i == 2) { return Scaled(2.5); }
+  return Count(i * 3);
+}
+
+@noinline fn adder(n: int64) -> Fn(int64) -> int64 {
+  return fn(x: int64) -> int64 { return x + n; };
+}
+
+@noinline fn sink(v: int64) -> int64 { return v + 1; }
+
+fn main() -> int32 {
+  var s: Shape = shape_of(opaque(0));
+  var w: int64 = match (s) {
+    case Dot: 1
+    case Named(t): (int64)t.length
+    case Scaled(f): (int64)(f * 2.0)
+    case Count(n): n
+  };
+  if (w != 1) { return 1; }
+
+  var t: int64 = sink(w);
+  if (t != 2) { return 2; }
+
+  var f: Fn(int64) -> int64 = adder(10);
+  if (f(5) != 15) { return 3; }
+
+  var n: int64 = 0;
+  var i: int64 = 0;
+  while (i < 6) {
+    n = n + i;
+    i = i + 1;
+  }
+  if (n != 15) { return 4; }
+
+  var named: Shape = shape_of(opaque(1));
+  match (named) {
+    case Named(t): { if ((int64)t.length != 3) { return 5; } }
+    default: { return 6; }
+  }
+  if (t != 2) { return 7; }
+
+  var scaled: Shape = shape_of(opaque(2));
+  match (scaled) {
+    case Scaled(f): { if (f != 2.5) { return 8; } }
+    default: { return 9; }
+  }
+  if (f(1) != 11) { return 10; }
+
+  var counted: Shape = shape_of(opaque(4));
+  match (counted) {
+    case Count(n): { if (n != 12) { return 11; } }
+    default: { return 12; }
+  }
+  if (n != 15) { return 13; }
+
+  return 0;
+}

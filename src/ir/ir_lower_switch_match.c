@@ -308,6 +308,7 @@ int ir_lower_match_statement(IRLoweringContext *context,
   char *end_label = NULL;
   char **arm_labels = NULL;
   char *default_label = NULL;
+  int bound_scope = 0;
   int ok = 0;
 
   if (!context || !function || !statement ||
@@ -465,10 +466,13 @@ int ir_lower_match_statement(IRLoweringContext *context,
       }
     }
 
+    ir_local_scope_enter(context);
+    bound_scope = 1;
     if (arm->binding_name && variant_idx >= 0) {
       Type *payload_type = subject_type->tagged_variant_payloads[variant_idx];
       int payload_size = 0;
       IROperand payload_address = ir_operand_none();
+      const char *bound_name = NULL;
 
       if (!payload_type || !payload_type->name) {
         ir_set_error(context, "Match binding '%s' has no payload to bind",
@@ -476,9 +480,11 @@ int ir_lower_match_statement(IRLoweringContext *context,
         goto cleanup;
       }
 
+      bound_name =
+          ir_local_bind(context, arm->binding_name, payload_type->name);
       payload_size = (payload_type->size > 0) ? (int)payload_type->size
                                               : ir_type_storage_size(payload_type);
-      if (!ir_emit_local_declaration(context, function, arm->binding_name,
+      if (!ir_emit_local_declaration(context, function, bound_name,
                                      payload_type->name, statement->location) ||
           !ir_emit_address_with_offset(context, function, &subject_address,
                                        subject_type->tagged_data_offset,
@@ -491,7 +497,7 @@ int ir_lower_match_statement(IRLoweringContext *context,
         IROperand binding_address = ir_operand_none();
         IRInstruction copy = {0};
 
-        if (!ir_emit_address_of_symbol(context, function, arm->binding_name,
+        if (!ir_emit_address_of_symbol(context, function, bound_name,
                                        statement->location,
                                        &binding_address)) {
           ir_operand_destroy(&payload_address);
@@ -532,7 +538,7 @@ int ir_lower_match_statement(IRLoweringContext *context,
         ir_access_apply_alias_class(&load, payload_type);
         payload_value.float_bits = load.dest.float_bits;
         if (!ir_emit(context, function, &load) ||
-            !ir_emit_symbol_assignment(context, function, arm->binding_name,
+            !ir_emit_symbol_assignment(context, function, bound_name,
                                        &payload_value, statement->location)) {
           ir_operand_destroy(&payload_value);
           ir_operand_destroy(&payload_address);
@@ -550,6 +556,9 @@ int ir_lower_match_statement(IRLoweringContext *context,
       goto cleanup;
     }
 
+    ir_local_scope_leave(context);
+    bound_scope = 0;
+
     if (!ir_emit_jump_instruction(context, function, end_label,
                                   statement->location)) {
       goto cleanup;
@@ -564,6 +573,9 @@ int ir_lower_match_statement(IRLoweringContext *context,
   ok = 1;
 
 cleanup:
+  if (bound_scope) {
+    ir_local_scope_leave(context);
+  }
   if (arm_labels) {
     for (size_t i = 0; i < match->arm_count; i++) {
       free(arm_labels[i]);
@@ -597,6 +609,7 @@ int ir_lower_match_expression(IRLoweringContext *context,
   char *end_label = NULL;
   char **arm_labels = NULL;
   char *default_label = NULL;
+  int bound_scope = 0;
   int ok = 0;
 
   if (!context || !function || !expression || !out_value ||
@@ -770,10 +783,13 @@ int ir_lower_match_expression(IRLoweringContext *context,
       }
     }
 
+    ir_local_scope_enter(context);
+    bound_scope = 1;
     if (arm->binding_name && variant_idx >= 0) {
       Type *payload_type = subject_type->tagged_variant_payloads[variant_idx];
       int payload_size = 0;
       IROperand payload_address = ir_operand_none();
+      const char *bound_name = NULL;
 
       if (!payload_type || !payload_type->name) {
         ir_set_error(context, "Match binding '%s' has no payload to bind",
@@ -781,10 +797,12 @@ int ir_lower_match_expression(IRLoweringContext *context,
         goto cleanup;
       }
 
+      bound_name =
+          ir_local_bind(context, arm->binding_name, payload_type->name);
       payload_size = (payload_type->size > 0)
                          ? (int)payload_type->size
                          : ir_type_storage_size(payload_type);
-      if (!ir_emit_local_declaration(context, function, arm->binding_name,
+      if (!ir_emit_local_declaration(context, function, bound_name,
                                      payload_type->name,
                                      expression->location) ||
           !ir_emit_address_with_offset(context, function, &subject_address,
@@ -799,7 +817,7 @@ int ir_lower_match_expression(IRLoweringContext *context,
         IROperand binding_address = ir_operand_none();
         IRInstruction copy = {0};
 
-        if (!ir_emit_address_of_symbol(context, function, arm->binding_name,
+        if (!ir_emit_address_of_symbol(context, function, bound_name,
                                        expression->location,
                                        &binding_address)) {
           ir_operand_destroy(&payload_address);
@@ -838,7 +856,7 @@ int ir_lower_match_expression(IRLoweringContext *context,
         ir_access_apply_alias_class(&load, payload_type);
         payload_value.float_bits = load.dest.float_bits;
         if (!ir_emit(context, function, &load) ||
-            !ir_emit_symbol_assignment(context, function, arm->binding_name,
+            !ir_emit_symbol_assignment(context, function, bound_name,
                                        &payload_value,
                                        expression->location)) {
           ir_operand_destroy(&payload_value);
@@ -867,6 +885,9 @@ int ir_lower_match_expression(IRLoweringContext *context,
     }
     ir_operand_destroy(&arm_value);
 
+    ir_local_scope_leave(context);
+    bound_scope = 0;
+
     if (!ir_emit_jump_instruction(context, function, end_label,
                                   expression->location)) {
       goto cleanup;
@@ -886,6 +907,9 @@ int ir_lower_match_expression(IRLoweringContext *context,
   ok = 1;
 
 cleanup:
+  if (bound_scope) {
+    ir_local_scope_leave(context);
+  }
   if (arm_labels) {
     for (size_t i = 0; i < match->arm_count; i++) {
       free(arm_labels[i]);

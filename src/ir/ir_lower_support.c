@@ -56,8 +56,10 @@ const char *ir_local_bind(IRLoweringContext *context, const char *name,
   }
 
   const char *ir_name = NULL;
+  const char *reusable = NULL;
   int seen = 0;
   int owns = 0;
+  int active = 0;
   for (size_t i = 0; i < context->local_binding_count; i++) {
     const IRLocalBinding *b = &context->local_bindings[i];
     if (strcmp(b->name, name) != 0) {
@@ -70,10 +72,16 @@ const char *ir_local_bind(IRLoweringContext *context, const char *name,
      * nested inside another `var x`'s scope is a second variable, and sharing
      * the slot made the inner one write through -- the outer read 5 back from
      * an inner block that set 5, and a loop body's `var x` survived the loop. */
-    if (!b->active && ir_local_type_text_matches(b->type_text, type_text)) {
-      ir_name = b->ir_name;
-      break;
+    if (b->active) {
+      active = 1;
+      continue;
     }
+    if (!reusable && ir_local_type_text_matches(b->type_text, type_text)) {
+      reusable = b->ir_name;
+    }
+  }
+  if (!active) {
+    ir_name = reusable;
   }
   if (!ir_name) {
     if (!seen) {

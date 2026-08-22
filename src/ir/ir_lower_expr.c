@@ -867,7 +867,8 @@ int ir_lower_call_expression(IRLoweringContext *context,
     load.op = IR_OP_LOAD;
     load.location = expression->location;
     load.dest = code;
-    load.lhs = ir_operand_symbol(call->function_name);
+    load.lhs =
+        ir_operand_symbol(ir_local_ir_name(context, call->function_name));
     load.rhs = ir_operand_int(8);
     int load_ok = ir_emit(context, function, &load);
     ir_operand_destroy(&load.lhs);
@@ -895,7 +896,8 @@ int ir_lower_call_expression(IRLoweringContext *context,
       cargs[at++] = indirect_return_address;
       indirect_return_address = ir_operand_none();
     }
-    cargs[at++] = ir_operand_symbol(call->function_name);
+    cargs[at++] =
+        ir_operand_symbol(ir_local_ir_name(context, call->function_name));
     for (size_t i = 0; i < call->argument_count; i++)
       cargs[at + i] = arguments[i];
     free(arguments);
@@ -962,7 +964,8 @@ int ir_lower_call_expression(IRLoweringContext *context,
     instruction.argument_types = ir_indirect_slot_types(
         call->arguments, call->argument_count,
         emitted_argument_count - call->argument_count);
-    instruction.lhs = ir_operand_symbol(call->function_name);
+    instruction.lhs =
+        ir_operand_symbol(ir_local_ir_name(context, call->function_name));
     if (instruction.lhs.kind != IR_OPERAND_SYMBOL || !instruction.lhs.name) {
       free(instruction.argument_types);
       ir_operand_destroy(&instruction.lhs);
