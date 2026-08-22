@@ -1,471 +1,371 @@
-# Standard Library
+# Standard library
 
-The standard library lives under `stdlib/`. Modules are imported by path. The `std/` prefix is resolved under the stdlib root (default bundled auto-detect then `./stdlib`).
+The modules under `stdlib/std`. Import one by path, `import "std/io";`, or
+pass [`--prelude`](compilation.md) to get the common ones without asking.
 
-## Platform Support
+Signatures below are copied from the source. A module lists only what it
+exports; a module with no `export` at all is entirely public.
 
-The compiler and standard library support Windows x86_64, Linux x86_64, and
-Linux AArch64. libmtlc emits native COFF and ELF64 objects with no external
-assembler. Use `make` on Linux and `build.bat` on Windows.
+Several modules ship a `.linux.mettle` sibling. A `std/` import with no
+extension picks the platform half on its own, so `import "std/io"` is right on
+both systems.
 
-**Cross platform modules:** `std/io`, `std/mem`, `std/math`, `std/conv`, `std/utf8`,
-`std/process`, `std/dir`, `std/net`, and `std/thread` bind to Mettle's owned
-runtime and work on Windows and Linux.
+## std/core
 
-**Windows only:** `std/win32` and `std/ui` expose Win32 services. `std/net` and
-`std/thread` select Linux variants through the import resolver when needed.
+`Result` and `Option`, the two tagged enums the rest of the library returns.
 
-**Linux compatibility:** `std/net_posix` and `std/thread_posix` keep older
-source APIs. Their symbols still come from the owned syscall runtime. They do
-not link a POSIX or pthread library.
+```mettle
+export enum Result<T, E> { Ok(T), Err(E) }
+export enum Option<T> { Some(T), None }
+```
+
+`Result` is for a call that could not do what it was asked, and the error arm
+carries why. `Option` is for a value that may not be there. Read either with
+[`match`](control-flow.md).
 
 ## std/io
 
-Console and file I/O. `print` and `println` take a `string` and write its `length` bytes (they never scan for a terminator, so `println("done")` costs one write. `print_err` and `println_err` do the same to stderr. `print_cstr` and `println_cstr` are the boundary forms, for a NUL-terminated pointer that came from C or from a byte buffer the program terminated itself. Values print through interpolation: `println("{n}")`. `putchar` writes one character and `getchar` reads one; `puts` is the raw C-shaped write. `cstr(s: string, alloc: fn(int64) -> rawptr) -> cstring` marshals a string into a NUL-terminated copy for a C call, taking the allocator so the copy is visible in the signature (a string literal needs none of this) it is already terminated in rodata). File operations: `fopen`, `fclose`, `fread`, `fwrite`, `fputs`, `fgets`, `fflush`. File handles are `cstring` (opaque `FILE*`). Stream accessors: `get_stdin`, `get_stdout`, `get_stderr`.
+Console and file input and output. Both platforms.
 
-`read_line(buf, cap, fp)` reads one line into `buf` and returns a view of it
-without the newline, handling both line endings; `read_line_stdin(buf, cap)` is
-the same from standard input. The view borrows `buf`, so it lives as long as
-the buffer and the next call overwrites it. An empty view means an empty line
-or end of input.
+| Function | Effect |
+|----------|--------|
+| `print(msg: string)` | Write to stdout |
+| `println(msg: string)` | Write to stdout with a newline |
+| `print_err(msg: string)` | Write to stderr |
+| `println_err(msg: string)` | Write to stderr with a newline |
+| `newline()` | Write one newline |
+| `print_cstr(s: cstring)` | Write nul-terminated bytes |
+| `println_cstr(s: cstring)` | The same with a newline |
 
-```mettle
-var buf: uint8[256];
-var line: string = read_line_stdin(buf, 256);
-for c in line { ... }
-```
-
-## std/mem
-
-Memory management. The owned runtime exports `malloc`, `calloc`, `realloc`,
-`free`, `memset`, `memcpy`, `memmove`, and `memcmp`. Helpers include
-`alloc_zeroed` and `buf_dup`. `new` uses the same owned zeroed allocator. See
-[Heap Allocation](heap-allocation.md).
-
-Allocation is typed: these hand out and take `rawptr`, an address with no
-element type that converts to and from any pointer. So
+Values reach the output through [interpolation](expressions.md), so there is
+one print function and it takes a `string`:
 
 ```mettle
-var a: int32* = malloc(n * 4);
-defer free(a);
+var n: int32 = 42;
+println("answer is {n}");
 ```
 
-needs no cast in either direction, and releasing an `int32` buffer does not
-require claiming it holds characters.
+Files come through the C standard library, declared here so you can call them
+directly:
 
-## std/math
+| Function | Effect |
+|----------|--------|
+| `fopen(filename: cstring, mode: cstring) -> cstring` | Open a file |
+| `fclose(fp: cstring) -> int32` | Close it |
+| `fread(buf: cstring, size: int64, count: int64, fp: cstring) -> int64` | Read |
+| `fwrite(buf: cstring, size: int64, count: int64, fp: cstring) -> int64` | Write |
+| `fgets(buf: cstring, size: int32, fp: cstring) -> cstring` | Read a line |
+| `get_stdin()`, `get_stdout()`, `get_stderr()` | The standard streams |
 
-Mathematics, implemented entirely in Mettle. Nothing in this module binds a C math library: the elementary functions are built from IEEE 754 bit manipulation, argument reduction, and polynomial kernels.
+Two wrappers make line reading pleasant, returning a `string` view of the
+buffer you hand them:
 
-**Bit access.** `f64_bits`, `f64_from_bits`, `f64_raw_exponent`, `ldexp`, `frexp`. `INF`, `NAN`.
+| Function | Effect |
+|----------|--------|
+| `read_line(buf: cstring, cap: int32, fp: cstring) -> string` | One line from a file |
+| `read_line_stdin(buf: cstring, cap: int32) -> string` | One line from stdin |
 
-**Constants** (functions, because top-level `const` is restricted to integers): `PI`, `TAU`, `HALF_PI`, `QUARTER_PI`, `E`, `SQRT2`, `SQRT1_2`, `LN2`, `LN10`, `LOG2E`, `LOG10E`, `LOG10_2`, `EPSILON`, `F32_EPSILON`, `MAX_FINITE`, `MIN_POSITIVE`, `DEG_PER_RAD`, `RAD_PER_DEG`.
-
-**Classification.** `is_nan`, `is_inf`, `is_finite`, `signbit`.
-
-**Sign and magnitude.** `fabs`, `copysign`, `fsign`, `fmin`, `fmax`, `fclamp`, `saturate`.
-
-**Rounding.** `floor`, `ceil`, `trunc`, `round` (halfway away from zero), `fract`, `fmod` (exact, by scaled subtraction).
-
-**Roots and powers.** `sqrt`, `rsqrt`, `cbrt`, `hypot` (overflow-safe), `pow` (exact for integer exponents by repeated squaring).
-
-**Exponential and logarithm.** `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`. `expm1` and `log1p` avoid the cancellation that `exp(x)-1` and `log(1+x)` suffer near zero.
-
-**Trigonometry.** `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, and the hyperbolics `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`.
-
-**Angles.** `degrees`, `radians`, `wrap`, `wrap_angle`, `angle_diff`.
-
-**Interpolation.** `lerp`, `inv_lerp`, `remap`, `smoothstep`, `smootherstep`.
-
-**Comparison.** `approx_eq` (combined absolute and relative tolerance), `approx_zero`.
-
-**Integers.** `abs`, `labs`, `min`, `max`, `clamp`, `isign`, `ipow`, `isqrt`, `gcd`, `lcm`, `is_pow2`, `next_pow2`, `ilog2`, `idiv_floor` and `imod_floor` (round toward negative infinity, unlike the truncating `/` and `%`).
-
-**float32 helpers.** `f32_abs`, `f32_min`, `f32_max`, `f32_clamp`, `f32_lerp`, `f32_sqrt`.
-
-Accuracy: kernels carry enough terms that truncation error sits below the rounding error, giving roughly 1 ulp across the normal range. Trigonometric argument reduction uses a two-part split of pi/2, which holds full precision to about |x| = 1e8 and degrades beyond that. `tests/test_std_math.mettle` checks the module against independently computed reference values and identity sweeps, at both optimization levels.
-
-## std/utf8
-
-Reads a string's bytes as UTF-8. A `string` is a view of bytes and a `char` is
-one byte, which is the right pair for protocol and buffer work and the wrong
-one for text; this is the other half.
-
-A scalar value is an `int32`. It needs no type of its own: it is a number
-between 0 and 0x10FFFF, and giving it one would make every byte-oriented
-function in `std/conv` choose a side it has no business choosing.
-
-The two readings of a string sit side by side, and you tell them apart by
-reading them:
-
-```mettle
-for b in s { ... }                    // bytes, one `char` each
-
-var i: int64 = 0;                     // characters, one int32 each
-while (i < (int64)s.length) {
-  var cp: int32 = utf8_at(s, i);
-  i = i + utf8_span(s, i);
-}
-```
-
-Decoding: `utf8_at(s, i)` is the character starting at BYTE offset `i`,
-`utf8_span(s, i)` is how many bytes it occupies (always at least 1, so a walk
-always advances), `utf8_count(s)` is how many characters `s` holds, and
-`utf8_valid(s)` is whether every byte is part of a well-formed sequence.
-`utf8_offset(s, n)` is the byte offset where character `n` begins, which is
-O(length) because finding the n'th character means counting the ones before it.
-
-Encoding: `utf8_len(cp)` is how many bytes `cp` needs, `utf8_encode(buf, cp)`
-writes them and returns the count, and `utf8_string(buf, cp)` returns a view of
-what it wrote, which is how a scalar value reaches `print`.
-
-Malformed input never stops the program and never stalls it. A bad byte decodes
-to U+FFFD and spans exactly one byte, so a walk always terminates and garbage
-reads as garbage rather than being invented into text. What UTF-8 says is not a
-character is refused with it: an over-long encoding (the trick that smuggles a
-NUL or a `/` past a naive check), a surrogate half, and anything above
-U+10FFFF. Encoding refuses the same values and writes U+FFFD, so the output of
-an encode is always something a decode can read.
+`cstr(s: string, alloc: fn(int64) -> rawptr) -> cstring` copies a `string`
+into nul-terminated memory from the allocator you pass, for handing to C.
 
 ## std/conv
 
-Conversions, character classification, and string operations. The owned runtime
-supplies `atoi` and `atol`. The rest of the module is Mettle code.
+Character tests, string slicing and searching, and number conversion. Both
+platforms.
 
-### Characters
+Character tests take and return [`char`](types.md):
 
-`is_digit`, `is_upper`, `is_lower`, `is_alpha`, `is_alnum` and `is_space` take
-a `char` and answer `bool`, so they read as the questions they are:
+```text
+is_digit  is_upper  is_lower  is_alpha  is_alnum  is_space
+to_lower  to_upper  digit_to_char  char_to_digit
+```
+
+Building a `string`:
+
+| Function | Effect |
+|----------|--------|
+| `str_from_bytes(p: cstring, n: int64) -> string` | View n bytes |
+| `str_from_cstr(s: cstring) -> string` | View up to the nul |
+| `str_slice(s: string, start: int64, len: int64) -> string` | A sub-view |
+
+Searching and trimming:
+
+| Function | Effect |
+|----------|--------|
+| `str_find(s: string, needle: string) -> Option<int64>` | Byte offset of the first match |
+| `str_find_byte(s: string, c: int32) -> Option<int64>` | Offset of a byte |
+| `str_contains(s: string, needle: string) -> int32` | 1 when present |
+| `str_starts_with(s: string, prefix: string) -> int32` | 1 when it does |
+| `str_ends_with(s: string, suffix: string) -> int32` | 1 when it does |
+| `str_eq_at(s: string, offset: int64, needle: string) -> int32` | Compare at an offset |
+| `str_trim(s: string) -> string` | Both ends |
+| `str_trim_start(s: string) -> string` | Leading space |
+| `str_trim_end(s: string) -> string` | Trailing space |
+| `str_split_once(s: string, sep: string) -> Option<StrSplit>` | First split |
+
+`StrSplit` is a struct holding the two halves.
+
+Numbers:
+
+| Function | Effect |
+|----------|--------|
+| `str_to_i64(s: string) -> Result<int64, string>` | Parse, with a reason on failure |
+| `str_to_i64_or(s: string, fallback: int64) -> int64` | Parse or fall back |
+| `i64_to_str(n: int64, buf: uint8*, buf_len: int64) -> string` | Format into your buffer |
+| `int_to_dec(buf: uint8*, n: int64) -> int32` | Digits written |
+| `format_i64(buf: uint8*, buf_len: int32, pattern: string, value: int64) -> int32` | Pattern format |
+
+`cstr_len`, `streq`, and `cstr_ncmp` work on `cstring` for the C boundary.
+
+## std/math
+
+Floating-point maths in Mettle source, no libm on the link line. Both
+platforms.
+
+Constants are functions, so `PI()` and `E()`:
+
+```text
+PI  TAU  HALF_PI  QUARTER_PI  E  SQRT2  SQRT1_2
+LN2  LN10  LOG2E  LOG10E  LOG10_2  INF  NAN
+EPSILON  F32_EPSILON  MAX_FINITE  MIN_POSITIVE
+DEG_PER_RAD  RAD_PER_DEG
+```
+
+Classification: `is_nan`, `is_inf`, `is_finite`, `signbit`.
+
+Sign and range: `fabs`, `copysign`, `fsign`, `fmin`, `fmax`, `fclamp`,
+`saturate`.
+
+Rounding: `trunc`, `floor`, `ceil`, `round`, `fract`, `fmod`.
+
+Powers and roots: `sqrt`, `rsqrt`, `hypot`, `cbrt`, `pow`, `ldexp`, `frexp`.
+
+Exponential and logarithm: `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`,
+`log1p`.
+
+Trigonometry: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`.
+
+Bit access: `f64_bits(x) -> int64`, `f64_from_bits(b) -> float64`,
+`f64_raw_exponent(x) -> int32`.
+
+Every one takes and returns `float64`.
+
+## std/mem
+
+Raw memory moves. Both platforms.
+
+| Function | Effect |
+|----------|--------|
+| `mem_zero(p: cstring, n: int64) -> cstring` | Fill with zero |
+| `mem_fill(p: cstring, value: int32, n: int64) -> cstring` | Fill with a byte |
+| `mem_copy(dst: cstring, src: cstring, n: int64) -> cstring` | Copy, no overlap |
+| `mem_move(dst: cstring, src: cstring, n: int64) -> cstring` | Copy, overlap allowed |
+| `mem_equal(a: cstring, b: cstring, n: int64) -> int32` | 1 when equal |
+| `mem_compare(a: cstring, b: cstring, n: int64) -> int32` | Ordering |
+| `mem_find_byte(p: cstring, value: int32, n: int64) -> int64` | Offset or -1 |
+| `alloc_zeroed(n: int64) -> rawptr` | Allocate and zero |
+| `buf_dup(src: rawptr, len: int64) -> rawptr` | Allocate a copy |
+
+## std/alloc
+
+Mettle's own thread-safe heap, written in Mettle. Both platforms.
+[Heap allocation](heap-allocation.md) covers when to reach for it.
+
+The short names allocate from a shared default heap:
+
+| Function | Effect |
+|----------|--------|
+| `mx_alloc(n: int64) -> rawptr` | Allocate |
+| `mx_calloc(count: int64, size: int64) -> rawptr` | Allocate and zero |
+| `mx_realloc(p: rawptr, newsize: int64) -> rawptr` | Resize |
+| `mx_free(p: rawptr)` | Release |
+| `mx_stats() -> MemStats` | Counters |
+
+For a heap of your own:
+
+| Function | Effect |
+|----------|--------|
+| `mem_heap_create() -> MemHeap*` | New heap |
+| `mem_alloc(h: MemHeap*, n: int64) -> rawptr` | Allocate from it |
+| `mem_calloc(h: MemHeap*, count: int64, size: int64) -> rawptr` | Allocate and zero |
+| `mem_realloc(h: MemHeap*, p: rawptr, newsize: int64) -> rawptr` | Resize |
+| `mem_free(h: MemHeap*, p: rawptr)` | Release |
+| `mem_heap_stats(h: MemHeap*) -> MemStats` | Counters |
+| `mem_heap_destroy(h: MemHeap*)` | Tear down |
+| `mem_default_heap() -> MemHeap*` | The heap the `mx_` names use |
+
+The `mettle_heap_*` names are the hooks
+[`--native-heap`](heap-allocation.md) redirects the language's own allocation
+through.
+
+A null result is the integer `0`:
 
 ```mettle
-for c in line {
-  if (is_alpha(c) || is_digit(c)) { ... }
-}
+var buf: rawptr = mx_alloc(1024);
+if (buf == 0) { return 1; }
 ```
 
-`to_upper` and `to_lower` return the other case, or the character unchanged
-when it has no other case. `char_to_digit` gives the value of a digit character
-and `digit_to_char` gives the character for a value; neither validates, so ask
-`is_digit` first when the input is not already known good. All of these are
-ASCII: a byte above 127 is part of some multi-byte encoding this module does
-not decode, and calling it a letter would be a guess.
+## std/arena
 
-### Bytes to string
+Bump allocation with a whole-region reset. Both platforms. Good for work with
+one clear end, a request, a frame, a parse.
 
-`str_from_bytes(p, n)` is the view of `n` bytes at `p`, and `str_from_cstr(s)`
-is the view of a NUL-terminated pointer up to its terminator. Neither copies,
-so the buffer has to outlive the view. These are the bridge from bytes that
-arrived from the outside world -- a `read`, an FFI return -- to everything
-below.
+| Function | Effect |
+|----------|--------|
+| `arena_init(default_chunk_size: int64) -> Arena*` | New arena |
+| `arena_alloc(a: Arena*, n: int64) -> rawptr` | Bump |
+| `arena_alloc_zeroed(a: Arena*, n: int64) -> rawptr` | Bump and zero |
+| `arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> rawptr` | Bump to an alignment |
+| `arena_save(a: Arena*) -> ArenaSave` | Mark a point |
+| `arena_restore(a: Arena*, save: ArenaSave)` | Roll back to it |
+| `arena_reset(a: Arena*)` | Release everything, keep the chunks |
+| `arena_free(a: Arena*)` | Release everything |
+| `arena_stats(a: Arena*) -> ArenaStats` | Counters |
 
-### Strings
+## std/strbuf
 
-These take and return `string`, which is a borrowed view of a pointer and a
-length. **Every function that returns a `string` returns a view into its
-input.** Nothing allocates, nothing copies, and a view dies with the bytes it
-was cut from, so a view of a heap string is invalid once that buffer is freed.
+A growable byte buffer over an [arena](#stdarena). Both platforms.
 
-| | |
-|---|---|
-| `str_slice(s, start, len)` | the view at `start`, clamped to what `s` holds |
-| `str_starts_with(s, prefix)` / `str_ends_with(s, suffix)` | 1 or 0 |
-| `str_eq_at(s, offset, needle)` | whether `needle`'s bytes sit at `offset` |
-| `str_find(s, needle)` | first index, or -1 |
-| `str_find_byte(s, c)` | first index of a byte, or -1 |
-| `str_contains(s, needle)` | 1 or 0 |
-| `str_trim(s)` / `str_trim_start(s)` / `str_trim_end(s)` | whitespace removed |
-| `str_split_once(s, sep)` | `(head, tail, found)` |
-| `str_to_i64(s)` | `(value, ok)`; needs no terminator |
-| `i64_to_str(n, buf, buf_len)` | writes into `buf`, returns a view of it |
+| Function | Effect |
+|----------|--------|
+| `strbuf_new(arena: Arena*, initial_cap: int64) -> StrBuf*` | New buffer |
+| `strbuf_len(b: StrBuf*) -> int64` | Bytes written |
+| `strbuf_append_byte(b: StrBuf*, c: uint8) -> int32` | One byte |
+| `strbuf_append_bytes(b: StrBuf*, src: cstring, n: int64) -> int32` | n bytes |
+| `strbuf_append_cstr(b: StrBuf*, s: cstring) -> int32` | Up to the nul |
+| `strbuf_append_string(b: StrBuf*, s: string) -> int32` | A string view |
+| `strbuf_append_int(b: StrBuf*, n: int64) -> int32` | Signed decimal |
+| `strbuf_append_uint(b: StrBuf*, n: uint64) -> int32` | Unsigned decimal |
+| `strbuf_append_hex(b: StrBuf*, n: uint64) -> int32` | Hexadecimal |
+| `strbuf_finish_cstr(b: StrBuf*) -> cstring` | Terminate and hand back |
 
-There is no `str_eq`: `==` and `!=` compare contents (see
-[Types](types.md#comparison)).
+## std/utf8
 
-`str_slice` clamps rather than trusting its arguments, so a slice taken from a
-search that returned -1 is an empty view instead of a pointer past the buffer.
-`str_to_i64` requires the whole view to be digits, because a caller who wanted
-a prefix can slice one first, and a partial parse that silently succeeds is the
-harder bug. `i64_to_str` returns an empty view when the buffer cannot hold the
-number, since a truncated number reads as a different number.
+Code points over the byte view a [`string`](types.md) gives you. Both
+platforms.
 
-```mettle
-var head: string = "";
-var tail: string = "";
-var found: int32 = 0;
-(head, tail, found) = str_split_once("id=907", "=");
+| Function | Effect |
+|----------|--------|
+| `utf8_at(s: string, i: int64) -> int32` | Code point at a byte offset |
+| `utf8_span(s: string, i: int64) -> int64` | Bytes in the character at i |
+| `utf8_count(s: string) -> int64` | Characters, not bytes |
+| `utf8_offset(s: string, index: int64) -> int64` | Byte offset of character n |
+| `utf8_valid(s: string) -> bool` | Well-formed |
+| `utf8_len(cp: int32) -> int64` | Bytes a code point needs |
+| `utf8_encode(buf: cstring, cp: int32) -> int64` | Write one, return the length |
+| `utf8_string(buf: cstring, cp: int32) -> string` | Write one, return a view |
 
-var value: int64 = 0;
-var ok: int32 = 0;
-(value, ok) = str_to_i64(tail);        // 907, no allocation anywhere
-```
+## std/osmem
 
-### The C boundary
+Pages from the operating system, under the heap. Both platforms, with a
+`.linux` half.
 
-`atoi`, `atol`, `cstr_len`, `streq`, and `cstr_ncmp` take `cstring` because a C
-library reads up to a NUL. Mettle code working in Mettle should use the `str_*`
-functions above. `int_to_dec` and `format_i64` write into a caller buffer and
-take `uint8*`, which is what that buffer is; they append a terminator so the
-result can be handed to C.
-
-String helpers are named `cstr_len` and `cstr_ncmp` rather than `strlen` and
-`strncmp`. The freestanding runtime is linked into every program and defines the
-C names already, and a module export lands in that same flat symbol namespace.
-A program may still define such a name: runtime symbols are defaults that a
-program object overrides (see docs/linker-build-pipelines.md).
-
-## std/process
-
-Process control. `exit` terminates the program with an exit code. `rand`, `srand` for pseudo-random numbers.
-
-## std/win32
-
-Native Win32 bindings for Windows-only programs. The module exports prefixed raw bindings such as `Win32_GetLastError`, `Win32_GetStdHandle`, `Win32_WriteFile`, `Win32_GetSystemMetrics`, and `Win32_MessageBoxA`, plus friendlier wrappers such as `win32_last_error`, `win32_stdout`, `win32_write_stdout`, `win32_get_system_metrics`, `win32_tick_count64`, and `win32_sleep_ms`.
-
-The internal PE linker probes explicit Win32 DLLs such as `kernel32`, `user32`,
-`gdi32`, `advapi32`, and `ws2_32`. It does not probe C runtime DLLs. External
-linkers still need an import library for any extra OS or vendor DLL.
-
-## std/ui
-
-Windows-only native GUI framework built on Win32 (`user32` + `gdi32`). Does not work on Linux. Import with `import "std/ui";` and build with the internal linker:
-
-```bash
-mettle --build --linker internal app.mettle -o app.exe
-```
-
-App and window lifecycle:
-
-- `ui_init()` registers the shared window class (safe to call multiple times)
-- `ui_window_create(title, x, y, width, height, window_proc) -> int64` creates a top-level window; pass `&your_proc` as the callback
-- `ui_window_create_centered(title, width, height, window_proc) -> int64` centers a top-level window on the primary display
-- `UiAppConfig` + `ui_app_run(config)` provide a tiny app shell for create/show/run
-- `ui_window_show(hwnd)` displays the window
-- `ui_window_hide`, `ui_window_close`, `ui_window_move`, `ui_window_set_pos`, `ui_window_set_title`
-- `ui_window_client_rect(hwnd) -> UiRect`, `ui_window_rect(hwnd) -> UiRect`, `ui_client_width`, `ui_client_height`
-- `ui_run_message_loop() -> int32` runs until `ui_quit(code)` or `WM_DESTROY`
-- `ui_shutdown()` unregisters the window class (optional)
-
-Window procedure helpers:
-
-- `ui_def_window_proc(hwnd, msg, wparam, lparam)` forwards to `DefWindowProcA`
-- Message constants such as `UI_WM_PAINT()`, `UI_WM_COMMAND()`, `UI_WM_TIMER()`, `UI_WM_SIZE()`, `UI_WM_KEYDOWN()`, mouse messages, and `UI_WM_DESTROY()`
-- `ui_command_id(wparam)` / `ui_command_notify(wparam)` decode `WM_COMMAND`
-- `ui_size_width(lparam)` / `ui_size_height(lparam)` decode `WM_SIZE`
-- `ui_mouse_x(lparam)` / `ui_mouse_y(lparam)` decode mouse coordinates
-- `ui_set_user_data(hwnd, value)` / `ui_get_user_data(hwnd)` expose `GWLP_USERDATA`
-- `ui_timer_start(hwnd, id, elapsed_ms)` / `ui_timer_stop(hwnd, id)` wrap Win32 timers
-
-Geometry, layout, and theme helpers:
-
-- `UiRect`, `UiPoint`, `UiSize`, `UiInsets`, `UiLayoutCursor`, `UiTheme`, `UiFontConfig`
-- `ui_rect_xywh`, `ui_make_rect`, `ui_rect_width`, `ui_rect_height`, `ui_rect_inset`, `ui_rect_offset`, `ui_rect_contains`
-- `ui_stack_vertical`, `ui_stack_horizontal`, `ui_stack_next`, `ui_stack_next_h`
-- `ui_row_rect(&parent, index, row_height, gap)` and `ui_column_rect(&parent, index, count, gap)`
-- `ui_default_theme()` returns a practical neutral/accent color set
-- `ui_rgb`, `ui_color_r`, `ui_color_g`, `ui_color_b`, `ui_scale`
-
-Drawing and fonts (typically inside `UI_WM_PAINT`):
-
-- `ui_begin_paint(hwnd, &ps) -> hdc`, `ui_end_paint(hwnd, &ps)`
-- `ui_fill_rect_color`, `ui_fill_rect_color_rect`, `ui_frame_rect_color`
-- `ui_draw_line`, `ui_draw_rect_outline`, `ui_draw_ellipse_outline`
-- `ui_draw_text`, `ui_draw_text_color`, `ui_draw_text_transparent`
-- `ui_draw_text_rect`, `ui_draw_text_rect_color` with `UI_DT_*` flags
-- `ui_create_font`, `ui_create_font_config`, `ui_control_set_font`, `ui_select_object`, `ui_delete_object`
-- `ui_rgb(r, g, b)` builds a `COLORREF`
-
-Common controls (child windows):
-
-- Generic creation: `UiControlConfig`, `ui_control_create`, `ui_control_create_raw`
-- `ui_button_create(parent, x, y, w, h, label, id)`
-- `ui_button_create_default(...)` for the default push button
-- `ui_checkbox_create`, `ui_checkbox_is_checked`, `ui_checkbox_set_checked`
-- `ui_radio_create`, `ui_groupbox_create`
-- `ui_label_create(parent, x, y, w, h, text, id)`
-- `ui_label_create_center(...)`
-- `ui_textbox_create(parent, x, y, w, h, id)`
-- `ui_textbox_create_multiline(...)`
-- `ui_listbox_create`, `ui_listbox_add`, `ui_listbox_clear`, `ui_listbox_selected`, `ui_listbox_select`
-- `ui_combobox_create`, `ui_combobox_add`, `ui_combobox_clear`, `ui_combobox_selected`, `ui_combobox_select`
-- `ui_control_set_text(control, text)` / `ui_control_get_text(control, buf, max_len)`
-- `ui_control_move`, `ui_control_move_rect`, `ui_control_show`, `ui_control_hide`, `ui_control_enable`, `ui_control_focus`
-
-Menus and dialogs:
-
-- `ui_menu_create`, `ui_menu_popup_create`, `ui_menu_append_item`, `ui_menu_append_separator`, `ui_menu_append_popup`
-- `ui_window_set_menu(hwnd, menu)`, `ui_menu_destroy(menu)`
-- `ui_alert(owner, title, text)` displays an informational message box
-
-See `examples/ui_demo/ui_demo.mettle` for a documentation browser that dynamically scans `docs/`, loads Markdown at runtime, and renders styled headings, lists, and code blocks.
-
-## std/system
-
-Process spawning. `system(cmd: cstring) -> int32` uses the owned process layer.
-It starts `cmd.exe /c` with CreateProcess on Windows and `sh -c` with direct
-process system calls on Linux.
-
-## std/dir
-
-Directory and file operations backed by the owned runtime. Directory scans use
-FindFirstFile on Windows and getdents on Linux. No helper source or link flag is
-needed.
-
-## std/http
-
-HTTP fetch (MVP). `http_fetch_to_file(url: cstring, output_path: cstring) -> int32` downloads a URL to a file using curl. Requires curl in PATH. Returns curl's exit code (0 = success).
-
-## std/net
-
-Winsock2 bindings for Windows only. Does not work on Linux. The internal PE linker resolves `ws2_32.dll` directly; external GCC/MSVC linking may still require `-lws2_32` or `ws2_32.lib`. Constants include address/socket/protocol values (`AF_INET`, `SOCK_STREAM`, `IPPROTO_TCP`) and common socket options (`SOL_SOCKET`, `SO_REUSEADDR`) plus shutdown values (`SD_RECEIVE`, `SD_SEND`, `SD_BOTH`).
-
-Core functions: `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `shutdown`, `closesocket`, `setsockopt`. Lifecycle: `net_init`, `net_cleanup`, `net_last_error`.
-
-`net_init`/`net_cleanup` are thread-safe and reference-counted. Multiple threads can call `net_init` safely; Winsock startup happens once and cleanup happens when the last caller releases via `net_cleanup`. Extra cleanup calls are treated as no-op for robustness.
-
-Convenience helpers:
-- `socket_tcp`, `socket_udp`
-- `sockaddr_in(ip, port)`, `sockaddr_in_any(port)`
-- `set_reuseaddr(sock, enabled)`
-- `send_all(sock, buf, len)` (looping send until full write or error)
-- `net_is_initialized()`
-
-For HTTP responses, prefer sending header and body in separate `send_all` calls. If you omit `Content-Length`, include `Connection: close` and close the socket after sending.
-
-## std/net_posix
-
-Compatibility socket bindings for Linux. The names map to the owned socket,
-error, close, and atomic ABI. No helper source or host library is needed.
-
-Constants include address/socket/protocol values (`AF_INET_POSIX`, `SOCK_STREAM_POSIX`, `IPPROTO_TCP_POSIX`) and socket options (`SOL_SOCKET_POSIX`, `SO_REUSEADDR_POSIX`). Note: macOS uses different values for `SOL_SOCKET` (0xFFFF) and `SO_REUSEADDR` (4) than Linux (1 and 2).
-
-Core functions: `socket`, `close_fd`, `posix_bind`, `posix_listen`, `posix_accept`, `posix_connect`, `posix_send`, `posix_recv`, `posix_shutdown`, `posix_setsockopt`. Lifecycle: `net_posix_init`, `net_posix_cleanup`, `net_posix_last_error`.
-
-`net_posix_init`/`net_posix_cleanup` are thread-safe and reference-counted for API compatibility with `std/net`, though POSIX sockets don't require initialization.
-
-Convenience wrappers:
-- `socket_tcp_posix`, `socket_udp_posix`
-- `sockaddr_in_posix(ip, port)`, `sockaddr_in_any_posix(port)`
-- `set_reuseaddr_posix(sock, enabled)`
-- `send_all_posix(sock, buf, len)` (looping send until full write or error)
-- `net_posix_is_initialized()`
-
-The function names are prefixed with `posix_` to avoid conflicts with the Windows `std/net` module when writing cross-platform code.
+| Function | Effect |
+|----------|--------|
+| `os_page_size() -> int64` | Page size |
+| `os_mem_map(n: int64) -> cstring` | Map n bytes |
+| `os_mem_unmap(p: cstring, n: int64)` | Unmap |
+| `os_mem_protect_noaccess(p: cstring, n: int64)` | Make a range unreadable |
 
 ## std/thread
 
-Windows Win32 thread primitives. Includes:
-- Thread APIs: `CreateThread`, `WaitForSingleObject`, `CloseHandle`, `GetCurrentThreadId`, `Sleep`
-- Mutex APIs: `CreateMutexA`, `ReleaseMutex` with wrappers (`mutex_create`, `mutex_lock`, `mutex_unlock`, `mutex_close`)
-- Atomics: `InterlockedCompareExchange`, `InterlockedExchange`, `InterlockedIncrement`, `InterlockedDecrement` with wrapper helpers
-- Spin lock helpers: `spin_try_lock`, `spin_lock`, `spin_unlock` for short critical sections
+Threads, mutexes, and atomics. Both platforms, with a `.linux` half and a
+`thread_posix` variant.
 
-`CreateThread` accepts a function pointer `fn(cstring) -> uint32` for the thread entry. Pass `&my_thread_proc` directly; no C bridge is required. See [Types](types.md#function-pointer-type) for function pointer syntax.
+Threads: `thread_join(handle: int64, timeout_ms: uint32) -> uint32`,
+`thread_join_infinite`, `thread_detach`, `thread_close`,
+`thread_sleep_ms(milliseconds: uint32)`.
 
-## std/thread_posix
+Mutexes: `mutex_create`, `mutex_create_owned`, `mutex_lock(mutex, timeout_ms)`,
+`mutex_lock_infinite`, `mutex_unlock`, `mutex_close`.
 
-Source compatible thread names for Linux. `pthread_create`, `pthread_join`,
-mutexes, condition variables, sleep, and atomics use owned clone and futex code.
-No pthread library is linked.
+Atomics on an `int32*`: `atomic_compare_exchange_i32`, `atomic_exchange_i32`,
+`atomic_inc_i32`, `atomic_dec_i32`.
 
-## std/tracy
+Spin locks on an `int32*`: `spin_try_lock`, `spin_lock`, `spin_unlock`.
 
-[Tracy](https://github.com/wolfpld/tracy) ABI bindings. The owned build links a
-local no op helper when code refers to this module. External TracyClient.cpp is
-rejected because it needs a C++ runtime. Use `--profile-runtime` for profiling.
+Wait results come back as `WAIT_OBJECT_0()`, `WAIT_TIMEOUT()`, or
+`WAIT_FAILED()`, and `INFINITE()` is the timeout that never expires.
 
-**Zones:** `tracy_zone`, `tracy_zone_colored`, `tracy_zone_on_demand` (respects `tracy_connected()` for on-demand builds). End with `defer tracy_scope_end(z)` (alias of `tracy_zone_end`). Zone text/name/value/color helpers available.
+## std/net
 
-**Ergonomics:** `tracy_color_input`, `tracy_color_update`, `tracy_color_render`, `tracy_color_load`, `tracy_color_warn`; `tracy_plot_setup_number`, `tracy_plot_setup_memory`; `tracy_malloc` / `tracy_heap_free` (tracked heap for memory timeline).
+TCP and UDP sockets. Windows, over Winsock. On Linux import
+`std/net_posix` instead; `std/prelude` leaves both out for that reason.
 
-**Frames, plots, messages:** `tracy_frame_mark`, `tracy_plot`, `tracy_plot_int`, `tracy_message`, `tracy_message_colored`, `tracy_app_info`. Thread names: `tracy_set_thread_name`. Connection: `tracy_connected`, `tracy_startup`, `tracy_shutdown`.
+Setup: `net_init() -> Result<int32, int32>`, `net_cleanup()`,
+`net_is_initialized()`, `net_last_error()`.
 
-Full demonstrative program: [`examples/tracy_demo/`](../examples/tracy_demo/).
+Sockets: `socket_tcp() -> Result<int64, int32>`,
+`socket_udp() -> Result<int64, int32>`.
 
-```powershell
-mettle --build --tracy app.mettle -o app.exe
-# or: examples\tracy_demo\build.bat
-```
+Addresses: `sockaddr_in(ip: cstring, port: int32) -> Result<cstring, int32>`,
+`sockaddr_in_any(port: int32) -> Result<cstring, int32>`.
 
-Set `TRACY_DIR`, pass `--tracy-dir <path>`, or create `.mettle\tracy_dir` with the Tracy repo root.
+Options: `set_reuseaddr`, `set_nonblocking`, `set_nodelay`.
 
-Manual link (advanced, MSVC + internal linker):
+Transfer: `send_all(sock: int64, buf: cstring, len: int32) -> Result<int32, int32>`.
 
-```powershell
-cl /c /DTRACY_ENABLE /I <tracy>\public stdlib\tracy_helpers.c
-cl /c /DTRACY_ENABLE /I <tracy>\public <tracy>\public\TracyClient.cpp /TP
-mettle --build app.mettle -o app.exe --link-arg stdlib\tracy_helpers.obj --link-arg TracyClient.obj
-```
+The Winsock constants are functions: `AF_INET()`, `SOCK_STREAM()`,
+`SOCK_DGRAM()`, `IPPROTO_TCP()`, `IPPROTO_UDP()`, `SOL_SOCKET()`,
+`SO_REUSEADDR()`, `SD_RECEIVE()`, `SD_SEND()`, `SD_BOTH()`, `INADDR_ANY()`,
+`INVALID_SOCKET()`, `SOCKET_ERROR()`, `FIONBIO()`, `TCP_NODELAY()`.
 
-## std/prelude
+## std/http
 
-The prelude re-exports `std/io`, `std/math`, `std/conv`, `std/mem`, `std/process`, and `std/net`. Use with `--prelude` to automatically import these modules without explicit `import` statements. The prelude is opt-in; it is not loaded by default. On Linux, `--prelude` will fail at link time because it pulls in `std/net` (Windows-only). Use explicit imports instead.
+`http_fetch_to_file(url: cstring, output_path: cstring) -> int32` downloads a
+URL to a file.
 
-```bash
-mettle --prelude --build main.mettle -o main.exe
-```
+## std/dir
+
+Paths and directories. Windows.
+
+| Function | Effect |
+|----------|--------|
+| `dir_exists(path: cstring) -> int32` | 1 when it does |
+| `dir_create(path: cstring) -> int32` | Create one |
+| `file_exists(path: cstring) -> int32` | 1 when it does |
+| `getcwd(buf: cstring, size: int32) -> int32` | Working directory |
+| `dir_list_md_files(root_dir, paths_buf, paths_size, max_files) -> int32` | List `.md` files under a root |
+
+## std/process
+
+Three C entry points: `exit(code: int32)`, `rand() -> int32`, and
+`srand(seed: int32)`.
+
+## std/system
+
+`system(cmd: cstring) -> int32` runs a shell command.
+
+## std/bench
+
+`bench_time_us() -> int64` reads a microsecond clock. Both platforms, with a
+`.linux` half.
 
 ## std/gpu
 
-NVIDIA CUDA Driver API bindings plus ergonomic helpers for running PTX kernels
-on the GPU. Thin bindings over `nvcuda` (the OS driver, no `cudart`, no `nvcc`).
-Link the driver import stub at build time (`--link-arg <CUDA>/lib/x64/cuda.lib`
-on Windows; `-lcuda` on Linux).
+Device memory, streams, and launches for the [GPU targets](gpu.md).
 
-Raw bindings cover context/device queries, module loading, device/managed and
-stream-ordered allocation, blocking/asynchronous copies, streams, events,
-kernel launch, and synchronization.
+## std/tracy
 
-Getting running (`gpu_open` is the whole of bring-up; each failure below it
-writes what happened to stderr):
+Zones and frame marks for the Tracy profiler. Needs
+[`--tracy`](compilation.md) at build time.
 
-- `gpu_open(ptx_path: cstring) -> int32`: initialize CUDA on device 0, load the
-  PTX file, and bind its kernel names for `dispatch`. `1` when ready, `0` after
-  reporting why not. `gpu_open_on(ordinal, path)` chooses the device.
-- `gpu_module_file(path: cstring) -> int64`: read a PTX file and load it,
-  naming a missing file, an empty one, or a JIT failure.
-- `gpu_module_ex(image: uint8*, status_out: int32*) -> int64`: the same load
-  with the driver's status handed back instead of reported.
-- `gpu_jit_log() -> cstring`: the driver's PTX JIT log from the last load.
-- `gpu_error_name(status) -> cstring` / `gpu_error_text(status) -> cstring`:
-  a `CUresult` as `CUDA_ERROR_INVALID_PTX` and as the driver's own sentence.
+## std/ui
 
-What this machine has, at run time (`mettle --gpu-info` answers the same
-questions at build time):
+Win32 window and message-loop helpers. Windows.
 
-- `gpu_device_count()`, `gpu_sm_count(ordinal)`, `gpu_warp_size(ordinal)`,
-  `gpu_max_threads_per_block(ordinal)`,
-  `gpu_max_shared_memory_per_block(ordinal)`, `gpu_is_integrated(ordinal)`,
-  `gpu_driver_version()`.
-- `gpu_compute_capability(ordinal) -> int32`: `major * 10 + minor`, so `120`
-  is `sm_120`.
-- `gpu_total_memory(ordinal) -> int64`.
-- `gpu_device_name(ordinal, buffer: uint8*, capacity: int32) -> string`: the
-  name, as a borrowed view over `buffer`.
+## std/win32
 
-Helpers (return handles directly; `0` on failure):
+Raw Win32 declarations the other Windows modules build on.
 
-- `gpu_init() -> int64`: initialize CUDA on device 0 and create a context.
-  `gpu_init_on(ordinal)` chooses the device.
-- `gpu_module(ptx_image: uint8*) -> int64`: load a module from a
-  null-terminated PTX image in host memory.
-- `gpu_func(mod: int64, name: cstring) -> int64`: resolve a kernel by name.
-- `gpu_malloc(bytes: int64) -> int64`, `gpu_free(dptr: int64)`.
-- `gpu_managed_malloc` / `gpu_managed_free`: one unified-address pointer for
-  the host and GPU (important on GB10 UMA).
-- `gpu_malloc_async` / `gpu_free_async`: stream-ordered allocation.
-- `gpu_to_device(dst: int64, src: uint8*, bytes: int64)`,
-  `gpu_to_host(dst: uint8*, src: int64, bytes: int64)`.
-- `gpu_stream_create`, `gpu_stream_sync`, `gpu_stream_destroy`, asynchronous
-  copy helpers, and event create/record/wait/timing helpers.
-- `gpu_sync()`: wraps `cuCtxSynchronize`.
-- `mtlc_gpu_launch_checked`: stable checked provider ABI used by semantic
-  [`dispatch`](gpu.md); the CUDA provider maps its 3-D launch descriptor to
-  `cuLaunchKernel`, and a refused enqueue names the kernel, the grid and block
-  it was given, and the driver's status before terminating.
-- `gpu_launch(f, grid, block, params, nargs)`: low-level asynchronous 1-D
-  helper returning CUDA's status for manual error handling.
-- `gpu_launch_on` and `gpu_launch_3d`: explicit stream, 3-D geometry, and
-  dynamic shared-memory launch configuration.
+## std/prelude
 
-See [GPU Offload](gpu.md) for kernel syntax (`kernel`, `thread.x`, `dispatch`)
-and a complete example.
+Imports `std/core`, `std/io`, `std/math`, `std/conv`, `std/mem`, and
+`std/process`, and re-exports them. [`--prelude`](compilation.md) imports it
+for you. Networking stays out, because it is platform-split.
+
+## See also
+
+- [Heap allocation](heap-allocation.md)
+- [C interoperability](c-interop.md)
+- [Modules and imports](modules.md)

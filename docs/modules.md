@@ -1,74 +1,176 @@
-# Modules
+# Modules and imports
 
-Mettle code is organized into source files. The compiler starts from one entry file, resolves its imports transitively, then lowers the result into one combined program for the backend.
+A module is a source file. The compiler starts from one entry file, walks its
+imports, and lowers the whole graph into one program. You do not compile
+imported files separately.
 
-For path resolution, namespace and selective import details, compiler options, `mettle.deps`, platform guards, and `import_str`, see [Imports](imports.md).
-
-## Import Syntax
+## Importing
 
 ```mettle
-import "module_name";
-import "path/to/module";
 import "std/io";
-import "path/to/module" as mod;
-import { name1, name2 } from "path/to/module";
-import "std/net" if windows;
+import "lib/helper";
 ```
 
-Plain imports add public declarations to the global scope. Namespaced imports expose public declarations as `alias.name`. Selective imports add exactly the selected declarations to the global scope and keep any dependency helpers internal.
+A plain import adds the module's public declarations to the current file's
+global scope. `import` appends `.mettle` when the path has no extension.
 
-## Export
-
-Declarations can be exported with the `export` keyword:
+### Namespaced
 
 ```mettle
-export fn forty_two() -> int32 {
-  return 42;
-}
+import "lib/helper" as h;
+```
 
+```mettle
+println("{h.thrice(14)}");
+```
+
+The alias is a compile-time namespace and reaches public members only. A
+public function's private helper is still compiled, under an internal name,
+and `h.secret()` does not resolve.
+
+Exported enum variants are namespace members too, so `status.NotFound` works
+after `import "http_status" as status`.
+
+### Selective
+
+```mettle
+import { twice } from "lib/helper";
+```
+
+Exactly the named top-level declarations enter the global scope. The names
+must be declarations; import an enum and its variants come with it.
+
+Selecting a name the module does not export is an error, and the message
+carries the import chain. The resolver still pulls in whatever the selection
+depends on, functions it calls, globals it reads, types in its signature, and
+gives those internal names.
+
+### Platform guards
+
+```mettle
+import "std/net" if windows;
+import "std/net_posix" if linux;
+```
+
+The guard is `windows` or `linux`. An import for the other platform is dropped
+before the path is resolved, so that file need not exist on this machine.
+Guards work on all three import forms.
+
+### Embedding a file
+
+`import_str` reads a file at compile time and embeds its bytes as a `string`:
+
+```mettle
+var page: string = import_str "lib/data.txt";
+```
+
+It may appear anywhere a string literal may. The value has `.chars` and
+`.length`, and the bytes are nul-terminated so they can cross to C.
+`import_str` uses the path exactly as written and adds no extension.
+
+## Exporting
+
+`export` marks a declaration as part of the module's public surface:
+
+```mettle
+export fn twice(x: int32) -> int32 { return x * 2; }
 export var answer: int32 = 42;
-export struct Point { ... }
-export enum Dir { ... }
+export struct Point { x: int32; y: int32; }
+export enum Dir { Up = 1, Down = 2 }
 export extern fn puts(msg: cstring) -> int32 = "puts";
 ```
 
-If a module has no `export` declarations, every top-level declaration is public for backward compatibility. If a module uses `export` anywhere, only exported declarations are part of its source-level public surface. Non-exported declarations can still be compiled when public declarations depend on them, but the import resolver rewrites those helpers to internal names.
+A module that uses `export` anywhere keeps everything else private. A module
+with no `export` at all is entirely public, which is what makes a small
+single-file helper work with no ceremony.
 
-Export applies only to declarations defined in the current file. You cannot export a forward declaration whose definition lives in another file; the declaration and definition must be in the same module.
+Each declaration needs its own `export`, methods included. Exporting a struct
+does not export the functions that give it methods:
 
-Exporting a struct makes its methods visible with the struct. Methods do not need separate `export` markers.
+```mettle
+export struct Point { x: int32; y: int32; }
+export fn Point_sum(p: Point) -> int32 { return p.x + p.y; }
+```
 
-## Re-exports
+Without the second `export`, an importer holding a `Point` gets:
 
-There is no `export import` syntax. Re-export happens through the resolved program:
+```text
+error[E0003]: Undefined method 'Point.sum' (expected function 'Point_sum')
+```
 
-- If module A imports B and A has no explicit `export`, A's importers receive A's declarations plus the public declarations A imported.
-- If A uses `export`, only A's exported declarations are public, plus any public imported declarations that remain part of A's exported surface through normal import resolution.
+`export` covers declarations in the current file. A forward declaration whose
+definition lives elsewhere cannot be exported; both halves belong in one
+module.
 
-The `std/prelude` module uses the first pattern: it imports common stdlib modules and has no explicit export list, so importers receive those public declarations.
+The `private` keyword is unrelated to visibility. It selects per-work-item
+storage inside a [GPU kernel](gpu.md).
 
-## Visibility
+## Re-exporting
 
-Module visibility is private by omission when a module uses at least one
-`export`. The `private` keyword is unrelated: inside GPU kernels, `private var`
-selects per-work-item storage and cannot qualify a module declaration.
+There is no `export import`. Re-export falls out of resolution: a module with
+no `export` of its own passes on both its declarations and the public
+declarations it imported. `std/prelude` works that way, which is why importing
+it brings the common modules with it.
 
-Use `export` for the API you intend other files to call. Keep helper functions, helper structs, and implementation globals unexported. Plain, namespaced, and selective imports all respect that source-level boundary.
+## Path resolution
 
-## Circular and Duplicate Imports
+For `import` and `import_str` alike, the resolver tries, in order:
 
-The resolver tracks canonical file paths while walking the import graph.
+1. The path as an absolute path.
+2. `std/` under the stdlib root.
+3. Package roots named in `mettle.deps` files, found by walking up from the
+   importing file.
+4. Relative to the importing file.
+5. The `-I` directories, in the order given.
+6. The path as written, relative to the working directory.
 
-- Duplicate plain imports of an already resolved module are skipped.
-- Circular imports are reported with the import chain and the repeated traversal is skipped.
-- Namespaced and selective imports are not treated as duplicate plain imports, because their source-level surfaces can differ.
+`std/` resolves against the stdlib bundled next to the compiler, then against
+`./stdlib`. `--stdlib <dir>` overrides the root. On Linux, a `std/` import
+with no extension prefers a `<name>.linux.mettle` sibling when one exists,
+which is how `std/io` and `std/net` reach their platform halves.
 
-Example diagnostic:
+`mettle.deps` maps a package name to a directory:
+
+```text
+mylib=./packages/mylib
+vendor_json=C:/deps/json
+```
+
+With that file in or above the importing file's directory,
+`import "mylib/widget";` resolves to `./packages/mylib/widget.mettle`. A
+relative root is read relative to the `mettle.deps` file holding it.
+
+## Duplicate and circular imports
+
+The resolver tracks canonical paths as it walks.
+
+- A second plain import of a resolved module is skipped.
+- A circular import is reported and the repeat traversal is skipped.
+- A namespaced or selective import is not treated as a duplicate of a plain
+  one, because each form exposes a different surface.
+
+Diagnostics carry the chain:
 
 ```text
 Circular import of 'cycle_a' (import chain: main.mettle -> cycle_b -> cycle_a)
+Could not resolve imported file 'lib/math' (import chain: main.mettle -> util.mettle)
 ```
 
-## Build Integration
+## Options
 
-The compiler takes one entry point, either with `-i <file>` or a positional input file. You do not compile each imported `.mettle` file separately; one compiler invocation walks the dependency graph and emits the requested output.
+| Option | Effect |
+|--------|--------|
+| `-I <dir>` | Add an import search directory. Repeatable. |
+| `--stdlib <dir>` | Set the stdlib root. |
+| `--prelude` | Auto-import `std/prelude`, so `println` and friends need no import. |
+| `-i <file>` | Name the entry file. A positional path works too. |
+
+```bash
+mettle -I tests/lib -I vendor main.mettle -o output.obj
+```
+
+## See also
+
+- [Standard library](standard-library.md)
+- [Compilation](compilation.md)
+- [Declarations](declarations.md)
