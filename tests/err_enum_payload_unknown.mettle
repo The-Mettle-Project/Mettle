@@ -1,0 +1,10 @@
+enum List {
+  Nil,
+  Cons(Cell*)
+}
+
+struct Cell { head: int64; tail: List; }
+
+fn main() -> int32 {
+  return 0;
+}

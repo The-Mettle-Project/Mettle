@@ -2003,6 +2003,7 @@ $cases = @(
   @{ Name = "err_array_index_oob_const_negative"; Path = "tests/err_array_index_oob_const_negative.mettle"; ShouldSucceed = $false; Pattern = "out of bounds" },
   @{ Name = "err_null_deref_const"; Path = "tests/err_null_deref_const.mettle"; ShouldSucceed = $false; Pattern = "Null pointer dereference" },
   @{ Name = "member_through_ptr"; Path = "tests/err_codegen_member_expr.mettle"; ShouldSucceed = $true },
+  @{ Name = "err_enum_payload_unknown"; Path = "tests/err_enum_payload_unknown.mettle"; ShouldSucceed = $false; Pattern = "carries a payload of unknown type" },
   @{ Name = "err_function_arg_count"; Path = "tests/err_function_arg_count.mettle"; ShouldSucceed = $false; Pattern = "expects .* arguments, got" },
   @{ Name = "err_function_arg_type"; Path = "tests/err_function_arg_type.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
   @{ Name = "err_gpu_kernel_return"; Path = "tests/err_gpu_kernel_return.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_result' must return void" },
@@ -12636,6 +12637,8 @@ $runFixtures = @(
      What = "a closure taking or returning a struct, string or tagged enum lost it" },
   @{ Name = "deref_aggregate"; Path = "tests/codegen/deref_aggregate.mettle"
      What = "dereferencing a pointer to an aggregate copied only its first word" },
+  @{ Name = "enum_self_pointer"; Path = "tests/codegen/enum_self_pointer.mettle"
+     What = "a tagged enum variant holding a pointer to its own type lost its payload" },
   @{ Name = "string_globals"; Path = "tests/codegen/string_globals.mettle"
      What = "a string stored into a global was lost, or refused outright by the direct object backend" },
   @{ Name = "line_continuation"; Path = "tests/codegen/line_continuation.mettle"

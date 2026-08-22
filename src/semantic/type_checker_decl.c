@@ -253,6 +253,20 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
 //   offset 0              : int32 _tag  (4 bytes)
 //   offset data_offset    : payload union (largest payload, alignment-padded)
 // ---------------------------------------------------------------------------
+static int type_checker_payload_is_self_pointer(const char *payload_type,
+                                                const char *type_name) {
+  size_t base_length;
+
+  if (!payload_type || !type_name)
+    return 0;
+  base_length = strlen(payload_type);
+  if (base_length == 0 || payload_type[base_length - 1] != '*')
+    return 0;
+  base_length--;
+  return base_length == strlen(type_name) &&
+         strncmp(payload_type, type_name, base_length) == 0;
+}
+
 Type *type_checker_build_tagged_enum_type(TypeChecker *checker,
                                                   const char *type_name,
                                                   EnumDeclaration *enum_decl) {
@@ -267,8 +281,15 @@ Type *type_checker_build_tagged_enum_type(TypeChecker *checker,
     if (!pt)
       continue;
     Type *payload_ty = type_checker_get_type_by_name(checker, pt);
-    if (!payload_ty)
+    if (!payload_ty) {
+      if (type_checker_payload_is_self_pointer(pt, type_name)) {
+        if (sizeof(void *) > max_payload_size)
+          max_payload_size = sizeof(void *);
+        if (sizeof(void *) > max_payload_align)
+          max_payload_align = sizeof(void *);
+      }
       continue;
+    }
     if (payload_ty->size > max_payload_size)
       max_payload_size = payload_ty->size;
     if (payload_ty->alignment > max_payload_align)
@@ -315,6 +336,10 @@ Type *type_checker_build_tagged_enum_type(TypeChecker *checker,
     const char *pt = enum_decl->variants[i].payload_type;
     te->tagged_variant_payloads[i] =
         pt ? type_checker_get_type_by_name(checker, pt) : NULL;
+    if (pt && !te->tagged_variant_payloads[i] &&
+        type_checker_payload_is_self_pointer(pt, type_name)) {
+      te->tagged_variant_payloads[i] = type_checker_pointer_to(checker, te);
+    }
   }
 
   type_checker_intern_type(checker, te);
@@ -329,6 +354,19 @@ int type_checker_process_tagged_enum(TypeChecker *checker,
       type_checker_build_tagged_enum_type(checker, enum_decl->name, enum_decl);
   type_checker_set_qualified_name(checker, te,
                                   enum_decl_node->location.filename);
+  if (te && enum_decl->type_param_count == 0) {
+    for (size_t i = 0; i < enum_decl->variant_count; i++) {
+      if (enum_decl->variants[i].payload_type &&
+          !te->tagged_variant_payloads[i]) {
+        type_checker_set_error_at_location(
+            checker, enum_decl_node->location,
+            "Variant '%s' of enum '%s' carries a payload of unknown type '%s'",
+            enum_decl->variants[i].name, enum_decl->name,
+            enum_decl->variants[i].payload_type);
+        return 0;
+      }
+    }
+  }
   if (!te) {
     type_checker_set_error_at_location(checker, enum_decl_node->location,
                                        "Failed to create tagged enum type '%s'",

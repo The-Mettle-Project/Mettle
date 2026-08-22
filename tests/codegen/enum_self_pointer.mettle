@@ -1,0 +1,56 @@
+enum Chain {
+  End,
+  Link(Chain*)
+}
+
+enum Mixed {
+  Empty,
+  Count(int64),
+  Next(Mixed*),
+  Label(string)
+}
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+@noinline fn depth(c: Chain*) -> int64 {
+  match (*c) {
+    case End: { return 0; }
+    case Link(next): { return 1 + depth(next); }
+  }
+}
+
+@noinline fn walk(m: Mixed*) -> int64 {
+  match (*m) {
+    case Empty: { return 0; }
+    case Count(n): { return n; }
+    case Next(p): { return 10 + walk(p); }
+    case Label(t): { return (int64)t.length; }
+  }
+}
+
+fn main() -> int32 {
+  var e: Chain = End;
+  var l1: Chain = Link(&e);
+  var l2: Chain = Link(&l1);
+  var l3: Chain = Link(&l2);
+  if (depth(&l3) != 3) { return 1; }
+  if (depth(&e) != 0) { return 2; }
+
+  var counted: Mixed = Count(opaque(7));
+  if (walk(&counted) != 7) { return 3; }
+
+  var labelled: Mixed = Label("four");
+  if (walk(&labelled) != 4) { return 4; }
+
+  var one: Mixed = Next(&counted);
+  var two: Mixed = Next(&one);
+  if (walk(&two) != 27) { return 5; }
+
+  var empty: Mixed = Empty;
+  var wrapped: Mixed = Next(&empty);
+  if (walk(&wrapped) != 10) { return 6; }
+
+  if (sizeof(Chain) < 16) { return 7; }
+
+  return 0;
+}
