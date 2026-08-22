@@ -3733,6 +3733,7 @@ void ir_explain_finalize(int force_stderr) {
   } else {
     /* The digest: the report's conclusions in five lines, plus the path.
      * Regressions lead -- they must never hide inside a sidecar. */
+    diag_style_output_begin();
     {
       char label[64];
       snprintf(label, sizeof(label), "%soptimization report%s",
@@ -3776,6 +3777,7 @@ void ir_explain_finalize(int force_stderr) {
     fprintf(stderr, "  full report (%zu lines): %s%s%s\n\n",
             ir_explain_report_lines(), clr(EXPLAIN_BOLD), sidecar,
             clr(EXPLAIN_RESET));
+    diag_style_output_end();
   }
 
   free(sidecar);
