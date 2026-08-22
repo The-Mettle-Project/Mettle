@@ -22,6 +22,32 @@ static size_t ir_load_copy_count_symbol_reads(const IRInstruction *ins,
   return count;
 }
 
+/* The symbol an operand names, or NULL. Mirrors ir_operand_is_symbol_named's
+ * rule so the tally below counts exactly what the scan it replaces looked at. */
+static const char *ir_load_copy_mentioned_name(const IROperand *operand) {
+  return (operand && operand->kind == IR_OPERAND_SYMBOL) ? operand->name : NULL;
+}
+
+static size_t ir_load_copy_count_symbol_mentions(const IRInstruction *ins,
+                                                 const char *sym) {
+  size_t count = 0;
+  if (ir_operand_is_symbol_named(&ins->dest, sym)) {
+    count++;
+  }
+  if (ir_operand_is_symbol_named(&ins->lhs, sym)) {
+    count++;
+  }
+  if (ir_operand_is_symbol_named(&ins->rhs, sym)) {
+    count++;
+  }
+  for (size_t a = 0; a < ins->argument_count; a++) {
+    if (ir_operand_is_symbol_named(&ins->arguments[a], sym)) {
+      count++;
+    }
+  }
+  return count;
+}
+
 static void ir_load_copy_replace_operand(IROperand *operand, const char *sym,
                                          const char *temp) {
   if (!ir_operand_is_symbol_named(operand, sym)) {
@@ -1393,9 +1419,68 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* Every symbol an ADDRESS_OF names, and how many times each symbol is read,
+ * both in one walk.
+ *
+ * The pass asked each of those questions per candidate copy and answered by
+ * scanning the whole function, so a straight-line body of assignments cost the
+ * square of its length. Folding a copy neither creates nor removes an
+ * ADDRESS_OF -- a symbol whose address is taken is skipped before any rewrite
+ * -- so that set holds for the whole pass; the read counts do change, and are
+ * rebuilt when a fold actually lands, which is rare next to the number of
+ * candidates rejected. */
+static int ir_load_copy_build_facts(const IRFunction *function,
+                                    IRNameIndex *address_taken,
+                                    IRNameIndex *reads) {
+  if (address_taken) {
+    if (!ir_name_index_init(address_taken, function->instruction_count)) {
+      return 0;
+    }
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ins->op == IR_OP_ADDRESS_OF && ins->lhs.kind == IR_OPERAND_SYMBOL &&
+          ins->lhs.name) {
+        ir_name_index_insert(address_taken, ins->lhs.name, 1);
+      }
+    }
+  }
+  if (!ir_name_index_init(reads, function->instruction_count)) {
+    if (address_taken) {
+      ir_name_index_destroy(address_taken);
+    }
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name) {
+      ir_name_index_add(reads, ins->lhs.name, 1);
+    }
+    if (ins->rhs.kind == IR_OPERAND_SYMBOL && ins->rhs.name) {
+      ir_name_index_add(reads, ins->rhs.name, 1);
+    }
+    if (ins->op == IR_OP_STORE && ins->dest.kind == IR_OPERAND_SYMBOL &&
+        ins->dest.name) {
+      ir_name_index_add(reads, ins->dest.name, 1);
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      if (ins->arguments[a].kind == IR_OPERAND_SYMBOL &&
+          ins->arguments[a].name) {
+        ir_name_index_add(reads, ins->arguments[a].name, 1);
+      }
+    }
+  }
+  return 1;
+}
+
 int ir_eliminate_load_symbol_copy_pass(IRFunction *function,
                                               int *changed) {
+  IRNameIndex address_taken;
+  IRNameIndex reads;
+
   if (!function) {
+    return 0;
+  }
+  if (!ir_load_copy_build_facts(function, &address_taken, &reads)) {
     return 0;
   }
 
@@ -1456,13 +1541,12 @@ int ir_eliminate_load_symbol_copy_pass(IRFunction *function,
 
     /* An address-taken symbol can be read through memory the operand scan
      * below cannot see. */
-    if (ir_symbol_address_taken(function, sym)) {
+    if (ir_name_index_find(&address_taken, sym, NULL)) {
       continue;
     }
 
-    for (j = 0; j < function->instruction_count; j++) {
-      total_reads += ir_load_copy_count_symbol_reads(&function->instructions[j],
-                                                     sym);
+    if (!ir_name_index_find(&reads, sym, &total_reads)) {
+      total_reads = 0;
     }
 
     /* Scan the straight-line window after the assign. It ends at the first
@@ -1492,6 +1576,21 @@ int ir_eliminate_load_symbol_copy_pass(IRFunction *function,
         break;
       }
       window_reads += ir_load_copy_count_symbol_reads(ins, sym);
+      /* Two reasons to stop early, both of which leave the outcome unchanged.
+       * Past six reads the fold is rejected below whatever follows. And once
+       * the window holds every read of the symbol in the function, nothing
+       * later reads it: no further instruction can add a read, make the use
+       * unsafe, or need rewriting, so the window ends here. Without this the
+       * scan runs to the end of the function for every candidate, which is
+       * quadratic in a straight-line body. */
+      if (window_reads > 6) {
+        window_end = j + 1;
+        break;
+      }
+      if (total_reads > 0 && window_reads == total_reads) {
+        window_end = j + 1;
+        break;
+      }
     }
 
     if (unsafe_use || window_reads == 0 || window_reads > 6) {
@@ -1516,50 +1615,75 @@ int ir_eliminate_load_symbol_copy_pass(IRFunction *function,
     }
 
     ir_instruction_make_nop(assign);
+    /* The rewrite moved reads off `sym` and onto `temp`, so the tally is stale.
+     * A landed fold is rare next to the candidates rejected above, which is why
+     * this is a rebuild rather than an incremental update. */
+    ir_name_index_destroy(&reads);
+    if (!ir_load_copy_build_facts(function, NULL, &reads)) {
+      ir_name_index_destroy(&address_taken);
+      return 0;
+    }
     if (changed) {
       *changed = 1;
     }
   }
 
+  ir_name_index_destroy(&address_taken);
+  ir_name_index_destroy(&reads);
+
   /* Folding a copy can leave its DECLARE_LOCAL dead (the inliner's parameter
    * local once every read is rewritten to the argument temp). A dead
    * declaration in a loop body still spoils the vectorizers' body-shape
    * matching and the --explain diagnosis, so sweep declarations whose symbol
-   * no other instruction references. */
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    IRInstruction *decl = &function->instructions[i];
-    int referenced = 0;
-
-    if (decl->op != IR_OP_DECLARE_LOCAL ||
-        decl->dest.kind != IR_OPERAND_SYMBOL || !decl->dest.name) {
-      continue;
+   * no other instruction references.
+   *
+   * Asking that per declaration by scanning the function is quadratic, and a
+   * body of assignments is nearly all declarations. One tally of how often each
+   * symbol is named answers it: the declaration is dead when the only mentions
+   * left are its own. Retiring one takes its mentions back out, which is what
+   * the scan's "skip NOPs" did. */
+  {
+    IRNameIndex mentions;
+    if (!ir_name_index_init(&mentions, function->instruction_count)) {
+      return 0;
     }
-
-    for (size_t j = 0; j < function->instruction_count && !referenced; j++) {
-      const IRInstruction *ins = &function->instructions[j];
-      if (j == i || ins->op == IR_OP_NOP) {
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ins->op == IR_OP_NOP) {
         continue;
       }
-      if (ir_operand_is_symbol_named(&ins->dest, decl->dest.name) ||
-          ir_operand_is_symbol_named(&ins->lhs, decl->dest.name) ||
-          ir_operand_is_symbol_named(&ins->rhs, decl->dest.name)) {
-        referenced = 1;
-        break;
-      }
+      ir_name_index_add(&mentions, ir_load_copy_mentioned_name(&ins->dest), 1);
+      ir_name_index_add(&mentions, ir_load_copy_mentioned_name(&ins->lhs), 1);
+      ir_name_index_add(&mentions, ir_load_copy_mentioned_name(&ins->rhs), 1);
       for (size_t a = 0; a < ins->argument_count; a++) {
-        if (ir_operand_is_symbol_named(&ins->arguments[a], decl->dest.name)) {
-          referenced = 1;
-          break;
-        }
+        ir_name_index_add(&mentions,
+                          ir_load_copy_mentioned_name(&ins->arguments[a]), 1);
       }
     }
 
-    if (!referenced) {
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      IRInstruction *decl = &function->instructions[i];
+      size_t total = 0;
+      size_t own;
+
+      if (decl->op != IR_OP_DECLARE_LOCAL ||
+          decl->dest.kind != IR_OPERAND_SYMBOL || !decl->dest.name) {
+        continue;
+      }
+
+      own = ir_load_copy_count_symbol_mentions(decl, decl->dest.name);
+      if (ir_name_index_find(&mentions, decl->dest.name, &total) &&
+          total > own) {
+        continue;
+      }
+
+      ir_name_index_sub(&mentions, decl->dest.name, own);
       ir_instruction_make_nop(decl);
       if (changed) {
         *changed = 1;
       }
     }
+    ir_name_index_destroy(&mentions);
   }
 
   return 1;

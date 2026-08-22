@@ -75,30 +75,55 @@ void cg_time_report(void) {
   }
 }
 
+/* Index of the first instruction after each position that emits bytes, or the
+ * instruction count when there is none.
+ *
+ * The optimizer retires an instruction by turning it into a NOP rather than
+ * removing it, so an optimized function carries long runs of them. Walking such
+ * a run per jump to decide fall-through is quadratic in a function with many
+ * jumps. One backward pass answers it for every position. */
+static size_t *code_generator_binary_build_next_emitting(
+    const IRFunction *function) {
+  size_t count = function->instruction_count;
+  size_t *next = (size_t *)malloc((count ? count : 1) * sizeof(size_t));
+
+  if (!next) {
+    return NULL;
+  }
+  for (size_t i = count; i-- > 0;) {
+    if (i + 1 >= count) {
+      next[i] = count;
+      continue;
+    }
+    IROpcode op = function->instructions[i + 1].op;
+    next[i] = (op == IR_OP_LABEL || op == IR_OP_NOP ||
+               op == IR_OP_DECLARE_LOCAL)
+                  ? next[i + 1]
+                  : i + 1;
+  }
+  return next;
+}
+
 /* Does the IR_OP_JUMP at `index` target the code that immediately follows it?
  *
  * Only instructions that emit no bytes may sit in between. Labels qualify (a
  * label is a name for a position); so do NOPs and local declarations, which the
- * emitter drops. Any other opcode means the jump really does skip something. */
-static int code_generator_binary_jump_is_fallthrough(const IRFunction *function,
-                                                     size_t index) {
+ * emitter drops. Any other opcode means the jump really does skip something.
+ *
+ * Which is to say: the target's label sits after the jump and before the next
+ * instruction that emits anything. */
+static int code_generator_binary_jump_is_fallthrough(
+    const IRFunction *function, size_t index, const BinaryLabelIndex *labels,
+    const size_t *next_emitting) {
   const IRInstruction *jmp = &function->instructions[index];
-  if (!jmp->text || !jmp->text[0]) {
+  size_t target;
+
+  if (!jmp->text || !jmp->text[0] || !labels || !next_emitting) {
     return 0;
   }
-  for (size_t k = index + 1; k < function->instruction_count; k++) {
-    const IRInstruction *in = &function->instructions[k];
-    if (in->op == IR_OP_LABEL) {
-      if (in->text && strcmp(in->text, jmp->text) == 0) {
-        return 1;
-      }
-      continue; /* a different label: falling through it reaches the same place */
-    }
-    if (in->op != IR_OP_NOP && in->op != IR_OP_DECLARE_LOCAL) {
-      return 0;
-    }
-  }
-  return 0;
+  target = binary_label_index_find(labels, jmp->text);
+  return target != (size_t)-1 && target > index &&
+         target < next_emitting[index];
 }
 
 int code_generator_emit_binary_function(CodeGenerator *generator,
@@ -209,18 +234,27 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
    * The pad sits before the label, so the back-edge jumps past it and only a
    * fall-through into the loop decodes it, once. */
   cg_t = cg_time_begin();
+  /* Both the alignment scan and the fall-through test below ask where a label
+   * is; one index serves both, and lives until the emit loop is done. */
+  BinaryLabelIndex labels;
+  size_t *next_emitting = NULL;
+  if (!binary_label_index_build(ir_function, &labels)) {
+    if (annot) mir_annotate_end_function();
+    binary_function_context_destroy(&context);
+    return 0;
+  }
+  next_emitting = code_generator_binary_build_next_emitting(ir_function);
+  if (!next_emitting) {
+    binary_label_index_destroy(&labels);
+    if (annot) mir_annotate_end_function();
+    binary_function_context_destroy(&context);
+    return 0;
+  }
   char *align_label = NULL;
   if (ir_function->instruction_count > 0) {
     align_label = (char *)calloc(ir_function->instruction_count, 1);
   }
   if (align_label) {
-    BinaryLabelIndex labels;
-    if (!binary_label_index_build(ir_function, &labels)) {
-      free(align_label);
-      if (annot) mir_annotate_end_function();
-      binary_function_context_destroy(&context);
-      return 0;
-    }
     for (size_t b = 0; b < ir_function->instruction_count; b++) {
       const IRInstruction *br = &ir_function->instructions[b];
       size_t d;
@@ -245,7 +279,6 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
                              : 1;
       }
     }
-    binary_label_index_destroy(&labels);
   }
 
   cg_time_end("baseline align scan", cg_t);
@@ -260,7 +293,8 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
      * for nothing. Only zero-byte instructions may sit in between; anything
      * that emits code means the jump really is a jump. */
     if (ir_function->instructions[i].op == IR_OP_JUMP &&
-        code_generator_binary_jump_is_fallthrough(ir_function, i)) {
+        code_generator_binary_jump_is_fallthrough(ir_function, i, &labels,
+                                                  next_emitting)) {
       i++;
       continue;
     }
@@ -470,6 +504,8 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     return 0;
   }
 
+  binary_label_index_destroy(&labels);
+  free(next_emitting);
   cg_time_end("baseline emit loop", cg_t);
 mir_shared_append:
   cg_t = cg_time_begin();

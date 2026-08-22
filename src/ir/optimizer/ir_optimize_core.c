@@ -1922,6 +1922,45 @@ void ir_name_index_insert(IRNameIndex *index, const char *name, size_t value) {
   index->values[slot] = value;
 }
 
+void ir_name_index_add(IRNameIndex *index, const char *name, size_t delta) {
+  size_t mask;
+  size_t slot;
+
+  if (!index || !index->capacity || !name) {
+    return;
+  }
+  mask = index->capacity - 1;
+  slot = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (index->names[slot]) {
+    if (strcmp(index->names[slot], name) == 0) {
+      index->values[slot] += delta;
+      return;
+    }
+    slot = (slot + 1) & mask;
+  }
+  index->names[slot] = name;
+  index->values[slot] = delta;
+}
+
+void ir_name_index_sub(IRNameIndex *index, const char *name, size_t delta) {
+  size_t mask;
+  size_t slot;
+
+  if (!index || !index->capacity || !name) {
+    return;
+  }
+  mask = index->capacity - 1;
+  slot = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (index->names[slot]) {
+    if (strcmp(index->names[slot], name) == 0) {
+      index->values[slot] =
+          (index->values[slot] > delta) ? index->values[slot] - delta : 0;
+      return;
+    }
+    slot = (slot + 1) & mask;
+  }
+}
+
 int ir_name_index_find(const IRNameIndex *index, const char *name,
                        size_t *out_value) {
   size_t mask;

@@ -490,6 +490,10 @@ int ir_name_index_init(IRNameIndex *index, size_t expected);
 void ir_name_index_insert(IRNameIndex *index, const char *name, size_t value);
 int ir_name_index_find(const IRNameIndex *index, const char *name,
                        size_t *out_value);
+/* Adds to a name's value, starting from zero. */
+void ir_name_index_add(IRNameIndex *index, const char *name, size_t delta);
+/* Subtracts, clamping at zero. */
+void ir_name_index_sub(IRNameIndex *index, const char *name, size_t delta);
 void ir_name_index_destroy(IRNameIndex *index);
 
 int ir_find_next_non_nop(const IRFunction *function, size_t start_index,
