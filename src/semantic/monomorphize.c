@@ -1476,10 +1476,13 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
   }
 }
 
+static GenericDef *find_generic_def(MonoContext *ctx, const char *name);
+
 static void rewrite_generic_type_name_in_place(char **slot,
                                                const char **type_params,
                                                const char **concrete_types,
-                                               size_t type_param_count) {
+                                               size_t type_param_count,
+                                               MonoContext *ctx) {
   char *type_str = *slot;
   size_t len = strlen(type_str);
   size_t ptr_count = 0;
@@ -1518,6 +1521,14 @@ static void rewrite_generic_type_name_in_place(char **slot,
   core[len] = '\0';
 
   if (parse_generic_type_name(core, &base, &args, &arg_count)) {
+    if (ctx && !find_generic_def(ctx, base)) {
+      free(base);
+      for (size_t i = 0; i < arg_count; i++)
+        free(args[i]);
+      free(args);
+      free(core);
+      return;
+    }
     char *mangled = mangle_name(base, args, arg_count);
     size_t new_len = strlen(mangled) + ptr_count +
                      (array_suffix ? strlen(array_suffix) : 0) + 1;
@@ -1546,7 +1557,7 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
   case AST_VAR_DECLARATION: {
     VarDeclaration *vd = (VarDeclaration *)node->data;
     if (vd && vd->type_name) {
-      rewrite_generic_type_name_in_place(&vd->type_name, NULL, NULL, 0);
+      rewrite_generic_type_name_in_place(&vd->type_name, NULL, NULL, 0, ctx);
     }
     if (vd && vd->initializer)
       rewrite_generic_references(vd->initializer, ctx);
@@ -1603,11 +1614,11 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
       for (size_t i = 0; i < fd->parameter_count; i++) {
         if (fd->parameter_types[i]) {
           rewrite_generic_type_name_in_place(&fd->parameter_types[i], NULL,
-                                             NULL, 0);
+                                             NULL, 0, ctx);
         }
       }
       if (fd->return_type) {
-        rewrite_generic_type_name_in_place(&fd->return_type, NULL, NULL, 0);
+        rewrite_generic_type_name_in_place(&fd->return_type, NULL, NULL, 0, ctx);
       }
       if (fd->body)
         rewrite_generic_references(fd->body, ctx);
@@ -1620,7 +1631,7 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
       for (size_t i = 0; i < sd->field_count; i++) {
         if (sd->field_types[i]) {
           rewrite_generic_type_name_in_place(&sd->field_types[i], NULL, NULL,
-                                             0);
+                                             0, ctx);
         }
       }
       for (size_t i = 0; i < sd->method_count; i++) {
@@ -1633,11 +1644,11 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
         for (size_t p = 0; p < md->parameter_count; p++) {
           if (md->parameter_types[p]) {
             rewrite_generic_type_name_in_place(&md->parameter_types[p], NULL,
-                                               NULL, 0);
+                                               NULL, 0, ctx);
           }
         }
         if (md->return_type) {
-          rewrite_generic_type_name_in_place(&md->return_type, NULL, NULL, 0);
+          rewrite_generic_type_name_in_place(&md->return_type, NULL, NULL, 0, ctx);
         }
         if (md->body) {
           rewrite_generic_references(md->body, ctx);

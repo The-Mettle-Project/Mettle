@@ -12637,6 +12637,8 @@ $runFixtures = @(
      What = "a closure taking or returning a struct, string or tagged enum lost it" },
   @{ Name = "deref_aggregate"; Path = "tests/codegen/deref_aggregate.mettle"
      What = "dereferencing a pointer to an aggregate copied only its first word" },
+  @{ Name = "generic_enum_with_generics"; Path = "tests/codegen/generic_enum_with_generics.mettle"
+     What = "a file declaring its own generic could no longer instantiate a generic enum such as Option or Result" },
   @{ Name = "enum_self_pointer"; Path = "tests/codegen/enum_self_pointer.mettle"
      What = "a tagged enum variant holding a pointer to its own type lost its payload" },
   @{ Name = "string_globals"; Path = "tests/codegen/string_globals.mettle"

@@ -1,0 +1,75 @@
+import "std/core";
+
+struct Cell<T> {
+  v: T;
+
+  method get() -> T {
+    return this.v;
+  }
+}
+
+struct Pair<A, B> {
+  first: A;
+  second: B;
+}
+
+@noinline fn ident<T>(x: T) -> T {
+  return x;
+}
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+@noinline fn wrap(v: int64) -> Option<int64> {
+  if (v < 0) { return None; }
+  return Some(v);
+}
+
+@noinline fn parse(v: int64) -> Result<int64, string> {
+  if (v == 0) { return Err("zero"); }
+  return Ok(v * 2);
+}
+
+@noinline fn unwrap_or(o: Option<int64>, fallback: int64) -> int64 {
+  return match (o) {
+    case Some(v): v
+    case None: fallback
+  };
+}
+
+fn main() -> int32 {
+  var c: Cell<int64>;
+  c.v = opaque(4);
+  if (ident<int64>(c.get()) != 4) { return 1; }
+
+  var o: Option<int64> = wrap(opaque(9));
+  if (unwrap_or(o, 0) != 9) { return 2; }
+
+  var missing: Option<int64> = wrap(opaque(0 - 1));
+  if (unwrap_or(missing, 77) != 77) { return 3; }
+
+  var r: Result<int64, string> = parse(opaque(5));
+  var got: int64 = match (r) {
+    case Ok(v): v
+    case Err(e): (int64)e.length
+  };
+  if (got != 10) { return 4; }
+
+  var bad: Result<int64, string> = parse(opaque(0));
+  var why: int64 = match (bad) {
+    case Ok(v): v
+    case Err(e): (int64)e.length
+  };
+  if (why != 4) { return 5; }
+
+  var p: Pair<int64, int64>;
+  p.first = opaque(2);
+  p.second = opaque(3);
+  var boxed: Option<int64> = Some(p.first + p.second);
+  if (unwrap_or(boxed, 0) != 5) { return 6; }
+
+  var fc: Cell<float64>;
+  fc.v = 1.5;
+  if (ident<float64>(fc.get()) != 1.5) { return 7; }
+
+  return 0;
+}
