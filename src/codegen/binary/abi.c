@@ -537,13 +537,7 @@ int code_generator_binary_instruction_in_backward_loop(
  * answer is no -- which is every forward jump, and a function built out of
  * if/else is almost entirely forward jumps. That made frame preparation
  * quadratic in the size of a branch-heavy function. */
-typedef struct {
-  const char **names;
-  size_t *indices;
-  size_t capacity;
-} BinaryLabelIndex;
-
-static void binary_label_index_destroy(BinaryLabelIndex *index) {
+void binary_label_index_destroy(BinaryLabelIndex *index) {
   if (!index) {
     return;
   }
@@ -554,8 +548,8 @@ static void binary_label_index_destroy(BinaryLabelIndex *index) {
   index->capacity = 0;
 }
 
-static int binary_label_index_build(const IRFunction *function,
-                                    BinaryLabelIndex *index) {
+int binary_label_index_build(const IRFunction *function,
+                             BinaryLabelIndex *index) {
   size_t capacity = 16;
   size_t mask;
 
@@ -596,9 +590,8 @@ static int binary_label_index_build(const IRFunction *function,
   return 1;
 }
 
-/* SIZE_MAX when the name defines no label. */
-static size_t binary_label_index_find(const BinaryLabelIndex *index,
-                                      const char *name) {
+size_t binary_label_index_find(const BinaryLabelIndex *index,
+                               const char *name) {
   size_t mask;
   size_t slot;
 

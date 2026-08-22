@@ -12,6 +12,21 @@
  * Raw clock() ticks: clock()'s units do not reliably match CLOCKS_PER_SEC
  * across the toolchains this builds with, and a number in the wrong units is
  * worse than none. */
+/* Label name -> the earliest instruction index defining it. Both the frame
+ * planner and the emitter ask where a branch's target label is; answering by
+ * scanning is quadratic in a function that is mostly branches. */
+typedef struct {
+  const char **names;
+  size_t *indices;
+  size_t capacity;
+} BinaryLabelIndex;
+
+int binary_label_index_build(const IRFunction *function,
+                             BinaryLabelIndex *index);
+/* SIZE_MAX when the name defines no label. */
+size_t binary_label_index_find(const BinaryLabelIndex *index, const char *name);
+void binary_label_index_destroy(BinaryLabelIndex *index);
+
 int cg_time_enabled(void);
 double cg_time_begin(void);
 void cg_time_end(const char *name, double started);

@@ -214,8 +214,16 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     align_label = (char *)calloc(ir_function->instruction_count, 1);
   }
   if (align_label) {
+    BinaryLabelIndex labels;
+    if (!binary_label_index_build(ir_function, &labels)) {
+      free(align_label);
+      if (annot) mir_annotate_end_function();
+      binary_function_context_destroy(&context);
+      return 0;
+    }
     for (size_t b = 0; b < ir_function->instruction_count; b++) {
       const IRInstruction *br = &ir_function->instructions[b];
+      size_t d;
       if (br->op != IR_OP_JUMP && br->op != IR_OP_BRANCH_ZERO &&
           br->op != IR_OP_BRANCH_EQ) {
         continue;
@@ -223,22 +231,21 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
       if (!br->text || !br->text[0]) {
         continue;
       }
-      for (size_t d = 0; d < b; d++) {
-        const IRInstruction *lb = &ir_function->instructions[d];
-        if (lb->op == IR_OP_LABEL && lb->text &&
-            strcmp(lb->text, br->text) == 0) {
-          /* 1 = align, 2 = align wider: the body from here to this back-edge is
-           * big enough that the extra padding costs nothing next to it. The
-           * FURTHEST back-edge decides, so a nested loop sharing a header is
-           * measured at its full extent. */
-          align_label[d] = (b - d >= BINARY_LOOP_BIG_IR_INSTRUCTIONS ||
-                            align_label[d] == 2)
-                               ? 2
-                               : 1;
-          break;
-        }
+      /* Scanning the prefix for the target label costs the whole function for
+       * every forward branch, which a body built out of if/else is made of. */
+      d = binary_label_index_find(&labels, br->text);
+      if (d != (size_t)-1 && d < b) {
+        /* 1 = align, 2 = align wider: the body from here to this back-edge is
+         * big enough that the extra padding costs nothing next to it. The
+         * FURTHEST back-edge decides, so a nested loop sharing a header is
+         * measured at its full extent. */
+        align_label[d] = (b - d >= BINARY_LOOP_BIG_IR_INSTRUCTIONS ||
+                          align_label[d] == 2)
+                             ? 2
+                             : 1;
       }
     }
+    binary_label_index_destroy(&labels);
   }
 
   cg_time_end("baseline align scan", cg_t);
