@@ -1,0 +1,53 @@
+/* A global stepped by one matches the pointer-induction promotion shape, and
+ * that path recorded the register in register_symbols only. The prologue's
+ * load and the epilogue's store both key off register_global_symbols, so the
+ * global lived in a register that was never filled and never written back and
+ * every write to it was dropped. The MIR backend handled it correctly, so the
+ * fallback backend had to be reached -- `-s` does it by disabling MIR. */
+
+var counter: int32 = 0;
+var total: int64 = 0;
+var log: int32[8];
+var slot: int32 = 0;
+
+@noinline fn bump() { counter = counter + 1; }
+
+@noinline fn bump_by(k: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < k) {
+    counter = counter + 1;
+    i = i + 1;
+  }
+  return counter;
+}
+
+@noinline fn step_down() { counter = counter - 1; }
+
+@noinline fn wide() { total = total + 4; }
+
+@noinline fn note(v: int32) {
+  log[slot] = v;
+  slot = slot + 1;
+}
+
+fn main() -> int32 {
+  bump();
+  bump();
+  if (counter != 2) { return 1; }
+
+  if (bump_by(3) != 5) { return 2; }
+  if (counter != 5) { return 3; }
+
+  step_down();
+  if (counter != 4) { return 4; }
+
+  wide();
+  wide();
+  if (total != 8) { return 5; }
+
+  note(7);
+  note(8);
+  if (slot != 2) { return 6; }
+  if (log[0] != 7 || log[1] != 8) { return 7; }
+  return 0;
+}

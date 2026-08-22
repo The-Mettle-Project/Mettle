@@ -831,6 +831,25 @@ int code_generator_binary_promote_hot_symbols(
           continue;
         }
 
+        /* Globals belong to the promotion loop below, which records them in
+         * register_global_symbols as well. This path records only
+         * register_symbols, and the prologue's load and the epilogue's store
+         * both key off the other table -- so a global promoted here lived in a
+         * register that was never filled from memory and never written back.
+         * `n = n + 1` on a global int32 matches the pointer-step shape
+         * exactly, so every write to such a counter was dropped. */
+        {
+          const CgSym *global_symbol =
+              generator->ir_program
+                  ? code_generator_lookup_symbol(generator, name)
+                  : NULL;
+          if (global_symbol && global_symbol->kind == CG_SYM_VARIABLE &&
+              global_symbol->scope &&
+              global_symbol->scope->type == CG_SCOPE_GLOBAL) {
+            continue;
+          }
+        }
+
         type = code_generator_binary_get_resolved_type(
             generator,
             is_pointer_step ? "int32*" : "int64",

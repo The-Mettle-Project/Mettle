@@ -12611,6 +12611,8 @@ $runFixtures = @(
      What = "a codegen check failed" },
   @{ Name = "enums_match"; Path = "tests/codegen/enums_match.mettle"
      What = "a codegen check failed" },
+  @{ Name = "global_counter_promotion"; Path = "tests/codegen/global_counter_promotion.mettle"
+     What = "a register-promoted global counter lost its writes" },
   @{ Name = "scoped_shadowing"; Path = "tests/codegen/scoped_shadowing.mettle"
      What = "a shadowing var shared the slot of the one it shadows" },
   @{ Name = "unsigned_through_temp"; Path = "tests/codegen/unsigned_through_temp.mettle"
@@ -12663,8 +12665,13 @@ $runFixtures = @(
      What = "a range-driven rewrite proved the wrong thing" }
 )
 foreach ($fixture in $runFixtures) {
+  # trace_release runs the same fixture with stack-trace support on. That
+  # combination disables the MIR backend, so it is the only thing exercising
+  # the fallback emitter on this corpus -- which is where a promoted global
+  # counter lost every write to it.
   foreach ($mode in @(@{ Name = "debug"; Args = @() },
-                      @{ Name = "release"; Args = @("--release") })) {
+                      @{ Name = "release"; Args = @("--release") },
+                      @{ Name = "trace_release"; Args = @("-s", "--release") })) {
     $caseName = "$($fixture.Name)_$($mode.Name)"
     try {
       $total++
