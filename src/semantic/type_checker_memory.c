@@ -1521,6 +1521,9 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
       BorrowKill why = is_realloc ? BORROW_REALLOC : BORROW_FREE;
       MemLocal *consumed = mem_expr_as_local(ctx, call->arguments[0]);
       mem_free_event(ctx, consumed, expr->location, NULL);
+      if (consumed && is_realloc && consumed->freed == MEM_FREED_DEFINITE) {
+        consumed->freed = MEM_FREED_MAYBE;
+      }
       if (consumed) {
         /* interior pointers borrowed from it (`&buf[i]`) become dangling, and
          * so does every whole-pointer alias of it (`q = buf`) */

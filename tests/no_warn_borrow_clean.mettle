@@ -53,6 +53,24 @@ fn clean_read_first() -> int32 {
     return v;
 }
 
+// The other safe realloc idiom: a failed realloc leaves the original block
+// alive, so the failure path owns it and must free it. That free is correct,
+// not a double free of the pointer realloc consumed on the success path.
+fn clean_realloc_free_on_failure() -> int32 {
+    var buf: cstring = malloc(8);
+    buf[0] = 3;
+    var grown: cstring = realloc(buf, 64);
+    if (grown == 0) {
+        free(buf);
+        return 0;
+    }
+    buf = grown;
+    var r: int32 = (int32)buf[0];
+    free(buf);
+    return r;
+}
+
 fn main() -> int32 {
-    return clean_safe_realloc() + clean_disjoint_free() + clean_repoint() + clean_read_first();
+    return clean_safe_realloc() + clean_disjoint_free() + clean_repoint() +
+           clean_read_first() + clean_realloc_free_on_failure();
 }
