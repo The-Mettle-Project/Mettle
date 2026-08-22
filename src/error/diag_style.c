@@ -55,19 +55,7 @@ static void diag_enable_vt(void) {
 
 void diag_style_output_begin(void) {
 #ifdef _WIN32
-  if (g_output_depth++ > 0) {
-    return;
-  }
-  if (!diag_style_unicode() || !diag_stderr_is_console()) {
-    return;
-  }
-  UINT current = GetConsoleOutputCP();
-  if (current == CP_UTF8) {
-    return;
-  }
-  if (SetConsoleOutputCP(CP_UTF8)) {
-    g_saved_output_cp = current;
-  }
+  g_output_depth++;
 #endif
 }
 
@@ -152,9 +140,20 @@ int diag_style_unicode(void) {
   }
 
 #ifdef _WIN32
-  cached = (GetConsoleOutputCP() == CP_UTF8 || diag_stderr_is_console())
-               ? 1
-               : 0;
+  if (GetConsoleOutputCP() == CP_UTF8) {
+    cached = 1;
+  } else if (diag_stderr_is_console()) {
+    UINT previous = GetConsoleOutputCP();
+    fflush(stderr);
+    if (SetConsoleOutputCP(CP_UTF8)) {
+      g_saved_output_cp = previous;
+      cached = 1;
+    } else {
+      cached = 0;
+    }
+  } else {
+    cached = 0;
+  }
 #else
   {
     const char *locale = getenv("LC_ALL");

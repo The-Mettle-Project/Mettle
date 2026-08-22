@@ -3226,14 +3226,17 @@ void ir_explain_finalize(int force_stderr) {
     if (forced && forced[0]) {
       columns = atoi(forced);
     }
+    diag_style_output_begin();
     if (columns >= 40) {
       ir_explain_write_wrapped(stderr, (size_t)columns);
     } else {
       fwrite(g_report_buf, 1, g_report_len, stderr);
     }
+    diag_style_output_end();
   } else {
     /* The digest: the report's conclusions in five lines, plus the path.
      * Regressions lead -- they must never hide inside a sidecar. */
+    diag_style_output_begin();
     {
       char label[64];
       snprintf(label, sizeof(label), "%soptimization report%s",
@@ -3277,6 +3280,7 @@ void ir_explain_finalize(int force_stderr) {
     fprintf(stderr, "  full report (%zu lines): %s%s%s\n\n",
             ir_explain_report_lines(), clr(EXPLAIN_BOLD), sidecar,
             clr(EXPLAIN_RESET));
+    diag_style_output_end();
   }
 
   free(sidecar);
@@ -4135,9 +4139,11 @@ void ir_explain_ml_opt(const char *path) {
     char label[96];
     snprintf(label, sizeof(label), "%sml-opt: model-driven IR optimizations%s",
              clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET));
+    diag_style_output_begin();
     fputc(10, stderr);
     diag_rule(stderr, 0, label, "");
     fputc(10, stderr);
+    diag_style_output_end();
   }
 
   char ln[1024];
