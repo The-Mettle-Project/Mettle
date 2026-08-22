@@ -437,9 +437,165 @@ static int ir_try_vectorize_simd_minmax_i32_at(IRFunction *function,
                                     &fused, changed);
 }
 
+static int ir_prefix_sum_symbol_is_body_local(const IRFunction *function,
+                                              size_t header_index,
+                                              size_t body_start,
+                                              size_t body_end,
+                                              const char *name) {
+  if (!function || !name) {
+    return 0;
+  }
+  for (size_t i = header_index; i < function->instruction_count; i++) {
+    const IRInstruction *ins = NULL;
+    if (i >= body_start && i < body_end) {
+      continue;
+    }
+    ins = &function->instructions[i];
+    if (ir_operand_is_symbol_named(&ins->lhs, name) ||
+        ir_operand_is_symbol_named(&ins->rhs, name)) {
+      return 0;
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      if (ir_operand_is_symbol_named(&ins->arguments[a], name)) {
+        return 0;
+      }
+    }
+    if (ins->op == IR_OP_STORE &&
+        ir_operand_is_symbol_named(&ins->dest, name)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static const char *ir_prefix_sum_stored_source(const IRFunction *function,
+                                              size_t store_index,
+                                              const IROperand *value) {
+  if (!function || !value) {
+    return NULL;
+  }
+  if (value->kind == IR_OPERAND_SYMBOL && value->name) {
+    return value->name;
+  }
+  if (value->kind != IR_OPERAND_TEMP || !value->name) {
+    return NULL;
+  }
+  for (size_t i = store_index; i-- > 0;) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name ||
+        strcmp(ins->dest.name, value->name) != 0) {
+      continue;
+    }
+    if ((ins->op != IR_OP_CAST && ins->op != IR_OP_ASSIGN) ||
+        ins->lhs.kind != IR_OPERAND_SYMBOL || !ins->lhs.name) {
+      return NULL;
+    }
+    return ins->lhs.name;
+  }
+  return NULL;
+}
+
+static const char *ir_prefix_sum_body_accumulator(const IRFunction *function,
+                                                  size_t branch_index,
+                                                  size_t jump_index) {
+  const char *accumulator = NULL;
+  int accumulated = 0;
+
+  if (!function) {
+    return NULL;
+  }
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    const char *stored = NULL;
+    if (ins->op != IR_OP_STORE) {
+      continue;
+    }
+    stored = ir_prefix_sum_stored_source(function, i, &ins->lhs);
+    if (!stored || (accumulator && strcmp(accumulator, stored) != 0)) {
+      return NULL;
+    }
+    accumulator = stored;
+  }
+  if (!accumulator) {
+    return NULL;
+  }
+  for (size_t i = branch_index + 1; i < jump_index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_BINARY && ins->text && strcmp(ins->text, "+") == 0 &&
+        !ins->is_float && ir_operand_is_symbol_named(&ins->dest, accumulator) &&
+        (ir_operand_is_symbol_named(&ins->lhs, accumulator) ||
+         ir_operand_is_symbol_named(&ins->rhs, accumulator))) {
+      accumulated = 1;
+      continue;
+    }
+    if (ir_operand_is_symbol_named(&ins->dest, accumulator)) {
+      return NULL;
+    }
+  }
+  return accumulated ? accumulator : NULL;
+}
+
+static int ir_prefix_sum_accumulator_is_zeroed(const IRFunction *function,
+                                               size_t limit,
+                                               const char *accumulator) {
+  const char *type = NULL;
+  int zeroed = 0;
+
+  if (!function || !accumulator) {
+    return 0;
+  }
+  type = ir_function_local_declared_type(function, accumulator);
+  if (!type || strcmp(type, "int64") != 0) {
+    return 0;
+  }
+  for (size_t i = 0; i < limit; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_DECLARE_LOCAL || ins->op == IR_OP_NOP) {
+      continue;
+    }
+    if (ins->dest.kind != IR_OPERAND_SYMBOL || !ins->dest.name ||
+        strcmp(ins->dest.name, accumulator) != 0) {
+      continue;
+    }
+    if (ins->op != IR_OP_ASSIGN || !ir_operand_is_int_value(&ins->lhs, 0)) {
+      return 0;
+    }
+    zeroed = 1;
+  }
+  return zeroed;
+}
+
+static int ir_prefix_sum_stores_accumulator(const IRFunction *function,
+                                            size_t store_index,
+                                            const IROperand *value,
+                                            const char *accumulator) {
+  if (!function || !value || !accumulator) {
+    return 0;
+  }
+  if (ir_operand_is_symbol_named(value, accumulator)) {
+    return 1;
+  }
+  if (value->kind != IR_OPERAND_TEMP || !value->name) {
+    return 0;
+  }
+  for (size_t i = store_index; i-- > 0;) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name ||
+        strcmp(ins->dest.name, value->name) != 0) {
+      continue;
+    }
+    if (ins->op != IR_OP_CAST && ins->op != IR_OP_ASSIGN) {
+      return 0;
+    }
+    return ir_operand_is_symbol_named(&ins->lhs, accumulator);
+  }
+  return 0;
+}
+
 static int ir_body_is_prefix_sum_loop(const IRFunction *function,
-                                      size_t branch_index, size_t jump_index,
-                                      const char *iv, const char *src_base,
+                                      size_t header_index, size_t branch_index,
+                                      size_t jump_index, const char *iv,
+                                      const char *src_base,
                                       const char *dst_base,
                                       const char *sum_symbol) {
   int saw_load = 0;
@@ -484,6 +640,10 @@ static int ir_body_is_prefix_sum_loop(const IRFunction *function,
       if (strcmp(base, dst_base) != 0 || elem_size != 4 || step != 4) {
         return 0;
       }
+      if (!ir_prefix_sum_stores_accumulator(function, i, &ins->lhs,
+                                            sum_symbol)) {
+        return 0;
+      }
       saw_store = 1;
       continue;
     }
@@ -492,6 +652,13 @@ static int ir_body_is_prefix_sum_loop(const IRFunction *function,
         ir_operand_is_symbol_named(&ins->dest, sum_symbol)) {
       saw_sum_add = 1;
       continue;
+    }
+    if (ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, iv) != 0 &&
+        !ir_prefix_sum_symbol_is_body_local(function, header_index,
+                                            branch_index + 1, jump_index,
+                                            ins->dest.name)) {
+      return 0;
     }
     if (ins->op == IR_OP_CAST || ins->op == IR_OP_BINARY) {
       continue;
@@ -548,19 +715,11 @@ static int ir_try_fuse_prefix_sum_i32_at(IRFunction *function,
     }
   }
 
-  for (size_t i = 0; i < bounds.branch_index + 1; i++) {
-    const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_ASSIGN &&
-        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
-        ir_operand_is_int_value(&ins->lhs, 0)) {
-      const char *type = ir_function_local_declared_type(function, ins->dest.name);
-      if (type && strcmp(type, "int64") == 0 && !sum_symbol &&
-          !ir_operand_is_symbol_named(&ins->dest, iv_symbol)) {
-        sum_symbol = ins->dest.name;
-      }
-    }
-  }
-  if (!sum_symbol) {
+  sum_symbol = ir_prefix_sum_body_accumulator(function, bounds.branch_index,
+                                             bounds.jump_index);
+  if (!sum_symbol || strcmp(sum_symbol, iv_symbol) == 0 ||
+      !ir_prefix_sum_accumulator_is_zeroed(function, header_index,
+                                           sum_symbol)) {
     return 1;
   }
 
@@ -593,7 +752,7 @@ static int ir_try_fuse_prefix_sum_i32_at(IRFunction *function,
       !ir_symbol_is_i32_ptr_param(function, dst_base)) {
     return 1;
   }
-  if (!ir_body_is_prefix_sum_loop(function, bounds.branch_index,
+  if (!ir_body_is_prefix_sum_loop(function, header_index, bounds.branch_index,
                                   bounds.jump_index, iv_symbol, src_base,
                                   dst_base, sum_symbol)) {
     return 1;
@@ -796,19 +955,11 @@ static int ir_try_fuse_prefix_sum_ptr_at(IRFunction *function,
     return 1;
   }
 
-  for (size_t i = 0; i < bounds.branch_index + 1; i++) {
-    const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_ASSIGN &&
-        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
-        ir_operand_is_int_value(&ins->lhs, 0)) {
-      const char *type =
-          ir_function_local_declared_type(function, ins->dest.name);
-      if (type && strcmp(type, "int64") == 0 && !sum_symbol) {
-        sum_symbol = ins->dest.name;
-      }
-    }
-  }
-  if (!sum_symbol) {
+  sum_symbol = ir_prefix_sum_body_accumulator(function, bounds.branch_index,
+                                             bounds.jump_index);
+  if (!sum_symbol || !ir_prefix_sum_accumulator_is_zeroed(function,
+                                                          header_index,
+                                                          sum_symbol)) {
     return 1;
   }
 
@@ -825,6 +976,11 @@ static int ir_try_fuse_prefix_sum_ptr_at(IRFunction *function,
         !ir_operand_is_symbol_named(&ins->dest, dst_p)) {
       return 1;
     }
+    if (ins->op == IR_OP_STORE &&
+        !ir_prefix_sum_stores_accumulator(function, i, &ins->lhs,
+                                          sum_symbol)) {
+      return 1;
+    }
     if (ins->op == IR_OP_LOAD || ins->op == IR_OP_STORE) {
       continue;
     }
@@ -832,6 +988,15 @@ static int ir_try_fuse_prefix_sum_ptr_at(IRFunction *function,
         !ins->is_float && ins->dest.kind == IR_OPERAND_SYMBOL &&
         ir_operand_is_symbol_named(&ins->dest, sum_symbol)) {
       continue;
+    }
+    if (ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, src_p) != 0 &&
+        strcmp(ins->dest.name, dst_p) != 0 &&
+        !ir_prefix_sum_symbol_is_body_local(function, header_index,
+                                            bounds.branch_index + 1,
+                                            bounds.jump_index,
+                                            ins->dest.name)) {
+      return 1;
     }
     if (ins->op == IR_OP_CAST || ins->op == IR_OP_BINARY) {
       continue;

@@ -12624,6 +12624,8 @@ $runFixtures = @(
      What = "predicated counting dropped a merge label a second branch still reached" },
   @{ Name = "aggregate_copy_keeps_rcx"; Path = "tests/codegen/aggregate_copy_keeps_rcx.mettle"
      What = "a rep movsb aggregate copy clobbered a value the allocator kept in RCX" },
+  @{ Name = "prefix_sum_accumulator"; Path = "tests/codegen/prefix_sum_accumulator.mettle"
+     What = "the prefix-sum kernel claimed a loop whose accumulator or extra writes it got wrong" },
   @{ Name = "closure_aggregates"; Path = "tests/codegen/closure_aggregates.mettle"
      What = "a closure taking or returning a struct, string or tagged enum lost it" },
   @{ Name = "deref_aggregate"; Path = "tests/codegen/deref_aggregate.mettle"

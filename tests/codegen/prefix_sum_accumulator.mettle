@@ -1,0 +1,76 @@
+import "std/mem";
+
+fn prefix_sum(src: int32*, dst: int32*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int64)src[i];
+    dst[i] = (int32)sum;
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn scaled_scan(src: int32*, dst: int32*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int64)src[i];
+    dst[i] = (int32)(sum * 2);
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn shadowed_scan(src: int32*, dst: int32*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  var seen: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int64)src[i];
+    seen = seen + 1;
+    dst[i] = (int32)sum;
+    i = i + 1;
+  }
+  return sum + seen;
+}
+
+fn main() -> int32 {
+  var n: int64 = 300;
+  var src: int32* = malloc(n * 4);
+  var dst: int32* = malloc(n * 4);
+  if (src == 0 || dst == 0) { return 1; }
+
+  var i: int64 = 0;
+  while (i < n) {
+    src[i] = (int32)(i + 1);
+    i = i + 1;
+  }
+
+  var expected: int64 = n * (n + 1) / 2;
+
+  var carried: int64 = 0;
+  carried = carried + n;
+
+  var total: int64 = prefix_sum(src, dst, n);
+  if (total != expected) { return 2; }
+  if (dst[0] != 1) { return 3; }
+  if (dst[1] != 3) { return 4; }
+  if ((int64)dst[n - 1] != expected) { return 5; }
+  if (carried != n) { return 6; }
+
+  var scaled: int64 = scaled_scan(src, dst, n);
+  if (scaled != expected) { return 7; }
+  if (dst[0] != 2) { return 8; }
+  if (dst[1] != 6) { return 9; }
+  if ((int64)dst[n - 1] != expected * 2) { return 10; }
+
+  var counted: int64 = shadowed_scan(src, dst, n);
+  if (counted != expected + n) { return 11; }
+  if (dst[0] != 1) { return 12; }
+  if ((int64)dst[n - 1] != expected) { return 13; }
+
+  free(src);
+  free(dst);
+  return 0;
+}
