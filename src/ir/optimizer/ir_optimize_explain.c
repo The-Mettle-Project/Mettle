@@ -2171,12 +2171,9 @@ static void ir_explain_render_start_here(void) {
   }
 
   size_t rank = 0;
-  size_t columns = diag_style_columns();
-  size_t avail = columns > location_width + 32 ? columns - location_width - 32
-                                               : 52;
   for (size_t i = 0; i < backend_shown; i++) {
     char fix[240];
-    ir_explain_fit(backend_plan[i].fix, avail, fix, sizeof(fix));
+    snprintf(fix, sizeof(fix), "%s", backend_plan[i].fix);
     char row[600];
     char plain[640];
     snprintf(row, sizeof(row), "  %s%2zu%s  %s%-6s%s  %-*s  %s",
@@ -2206,8 +2203,7 @@ static void ir_explain_render_start_here(void) {
                clr(EXPLAIN_DIM), sites[i] - 1, sites[i] == 2 ? "" : "s",
                clr(EXPLAIN_RESET));
     }
-    ir_explain_fit(r->fix, sites[i] > 1 ? (avail > 18 ? avail - 18 : 40) : avail,
-                   fix, sizeof(fix));
+    snprintf(fix, sizeof(fix), "%s", r->fix);
     /* The caveat has to survive the truncation that trims the fix text, or the
      * plan reads as "do this and you are done" for a fix we know is partial. */
     const char *status = r->verified ? "proven" : (r->partial ? "step 1" : "");
@@ -3038,19 +3034,13 @@ void ir_explain_flush(void) {
       }
     }
     if (sample) {
-      char row[240];
-      char plain[280];
-      snprintf(row, sizeof(row),
-               "  %sthe bracketed id after a verdict has a longer "
-               "explanation: mettle explain %s%s",
-               clr(EXPLAIN_DIM), sample, clr(EXPLAIN_RESET));
-      snprintf(plain, sizeof(plain),
-               "  %sthe bracketed id after a verdict has a longer "
-               "explanation: mettle explain %s%s",
-               clr(EXPLAIN_DIM), sample, clr(EXPLAIN_RESET));
-      ir_explain_row_text(row, plain);
+      ir_explain_box_end();
+      ir_explain_emit("  %sthe bracketed id after a verdict has a longer "
+                      "explanation: mettle explain %s%s\n",
+                      clr(EXPLAIN_DIM), sample, clr(EXPLAIN_RESET));
+    } else {
+      ir_explain_box_end();
     }
-    ir_explain_box_end();
     ir_explain_emit("\n");
   }
   ir_explain_json_raw("],");
