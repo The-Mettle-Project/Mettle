@@ -755,6 +755,177 @@ int code_generator_binary_function_can_promote_rsi_rdi(
   return 1;
 }
 
+/* Every symbol's promotion score, accumulated in one walk of the function.
+ *
+ * The selection loop below picks one symbol per available register, and it
+ * used to call code_generator_binary_function_symbol_score for each candidate,
+ * which walks the whole function. That is registers x symbols x instructions:
+ * on a function with thousands of locals it was the single largest cost in the
+ * compiler, larger than every IR pass put together. The score of a name does
+ * not change while the loop runs, so it is computed once here.
+ *
+ * The tally must match the scorer exactly: an operand credits the symbol it
+ * names, and separately credits an alias target when the alias resolves to a
+ * different name (the scorer returns on the direct match before it looks at
+ * the alias, so the same operand never counts twice for one name). */
+typedef struct {
+  const char **names;
+  size_t *scores;
+  size_t capacity;
+  size_t count;
+} BinarySymbolScores;
+
+static void binary_symbol_scores_destroy(BinarySymbolScores *map) {
+  if (!map) {
+    return;
+  }
+  free(map->names);
+  free(map->scores);
+  map->names = NULL;
+  map->scores = NULL;
+  map->capacity = 0;
+  map->count = 0;
+}
+
+static int binary_symbol_scores_grow(BinarySymbolScores *map);
+
+static int binary_symbol_scores_add(BinarySymbolScores *map, const char *name,
+                                    size_t weight) {
+  size_t mask;
+  size_t i;
+
+  if (!name || !name[0]) {
+    return 1;
+  }
+  if (map->capacity == 0 || (map->count + 1) * 4 >= map->capacity * 3) {
+    if (!binary_symbol_scores_grow(map)) {
+      return 0;
+    }
+  }
+  mask = map->capacity - 1;
+  i = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (map->names[i]) {
+    if (strcmp(map->names[i], name) == 0) {
+      map->scores[i] += weight;
+      return 1;
+    }
+    i = (i + 1) & mask;
+  }
+  map->names[i] = name;
+  map->scores[i] = weight;
+  map->count++;
+  return 1;
+}
+
+static int binary_symbol_scores_grow(BinarySymbolScores *map) {
+  size_t capacity = map->capacity ? map->capacity * 2 : 64;
+  const char **names = (const char **)calloc(capacity, sizeof(*names));
+  size_t *scores = (size_t *)calloc(capacity, sizeof(*scores));
+  size_t mask = capacity - 1;
+
+  if (!names || !scores) {
+    free(names);
+    free(scores);
+    return 0;
+  }
+  for (size_t old = 0; old < map->capacity; old++) {
+    size_t i;
+    if (!map->names[old]) {
+      continue;
+    }
+    i = (size_t)mettle_fnv1a_hash(map->names[old]) & mask;
+    while (names[i]) {
+      i = (i + 1) & mask;
+    }
+    names[i] = map->names[old];
+    scores[i] = map->scores[old];
+  }
+  free(map->names);
+  free(map->scores);
+  map->names = names;
+  map->scores = scores;
+  map->capacity = capacity;
+  return 1;
+}
+
+static size_t binary_symbol_scores_get(const BinarySymbolScores *map,
+                                       const char *name) {
+  size_t mask;
+  size_t i;
+
+  if (!map || !map->capacity || !name) {
+    return 0;
+  }
+  mask = map->capacity - 1;
+  i = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (map->names[i]) {
+    if (strcmp(map->names[i], name) == 0) {
+      return map->scores[i];
+    }
+    i = (i + 1) & mask;
+  }
+  return 0;
+}
+
+static int binary_symbol_scores_credit(const BinaryFunctionContext *context,
+                                       BinarySymbolScores *map,
+                                       const IROperand *operand,
+                                       size_t weight) {
+  const char *alias_target = NULL;
+
+  if (!operand || operand->kind != IR_OPERAND_SYMBOL || !operand->name) {
+    return 1;
+  }
+  if (!binary_symbol_scores_add(map, operand->name, weight)) {
+    return 0;
+  }
+  alias_target =
+      binary_symbol_alias_table_get(&context->symbol_aliases, operand->name);
+  if (alias_target && strcmp(alias_target, operand->name) != 0) {
+    return binary_symbol_scores_add(map, alias_target, weight);
+  }
+  return 1;
+}
+
+static int binary_symbol_scores_build(const BinaryFunctionContext *context,
+                                      const IRFunction *function,
+                                      const size_t *loop_weights,
+                                      BinarySymbolScores *map) {
+  memset(map, 0, sizeof(*map));
+  if (!context || !function) {
+    return 1;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    size_t weight = loop_weights ? loop_weights[i] : 1;
+    if (!instruction) {
+      continue;
+    }
+    if (!binary_symbol_scores_credit(context, map, &instruction->dest,
+                                     weight) ||
+        !binary_symbol_scores_credit(context, map, &instruction->lhs, weight) ||
+        !binary_symbol_scores_credit(context, map, &instruction->rhs, weight)) {
+      return 0;
+    }
+    for (size_t a = 0; a < instruction->argument_count; a++) {
+      if (!binary_symbol_scores_credit(context, map, &instruction->arguments[a],
+                                       weight)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static size_t binary_symbol_score_of(const BinarySymbolScores *map,
+                                     const char *name) {
+  size_t score = binary_symbol_scores_get(map, name);
+  if (name && strstr(name, "__ptr_") != NULL) {
+    score *= 2;
+  }
+  return score;
+}
+
 int code_generator_binary_promote_hot_symbols(
     CodeGenerator *generator, BinaryFunctionContext *context,
     IRFunction *ir_function) {
@@ -785,6 +956,17 @@ int code_generator_binary_promote_hot_symbols(
         generator,
         "Failed to allocate loop-weight metadata for direct object function "
         "'%s'",
+        ir_function->name);
+    return 0;
+  }
+  BinarySymbolScores symbol_scores;
+  if (!binary_symbol_scores_build(context, ir_function, loop_weights,
+                                  &symbol_scores)) {
+    binary_symbol_scores_destroy(&symbol_scores);
+    free(loop_weights);
+    code_generator_set_error(
+        generator,
+        "Failed to allocate promotion scores for direct object function '%s'",
         ir_function->name);
     return 0;
   }
@@ -864,6 +1046,8 @@ int code_generator_binary_promote_hot_symbols(
                 (int)promotion_registers[promoted_count]) ||
             !code_generator_binary_context_add_saved_register(
                 context, promotion_registers[promoted_count])) {
+          binary_symbol_scores_destroy(&symbol_scores);
+          free(loop_weights);
           return 0;
         }
         promoted_count++;
@@ -897,9 +1081,7 @@ int code_generator_binary_promote_hot_symbols(
         continue;
       }
 
-      size_t score =
-          code_generator_binary_function_symbol_score(context, ir_function,
-                                                      name, loop_weights);
+      size_t score = binary_symbol_score_of(&symbol_scores, name);
       if (score > best_score) {
         best_score = score;
         best_name = name;
@@ -935,9 +1117,7 @@ int code_generator_binary_promote_hot_symbols(
           continue;
         }
 
-        size_t score =
-            code_generator_binary_function_symbol_score(context, ir_function,
-                                                        name, loop_weights);
+        size_t score = binary_symbol_score_of(&symbol_scores, name);
         if (score > best_score) {
           best_score = score;
           best_name = name;
@@ -979,8 +1159,7 @@ int code_generator_binary_promote_hot_symbols(
               !code_generator_binary_type_is_gp_promotable(symbol->type)) {
             continue;
           }
-          score = code_generator_binary_function_symbol_score(
-              context, ir_function, name, loop_weights);
+          score = binary_symbol_score_of(&symbol_scores, name);
           if (score > best_score) {
             best_score = score;
             best_name = name;
@@ -1011,8 +1190,7 @@ int code_generator_binary_promote_hot_symbols(
               !code_generator_binary_type_is_gp_promotable(symbol->type)) {
             continue;
           }
-          score = code_generator_binary_function_symbol_score(
-              context, ir_function, name, loop_weights);
+          score = binary_symbol_score_of(&symbol_scores, name);
           if (score > best_score) {
             best_score = score;
             best_name = name;
@@ -1033,6 +1211,7 @@ int code_generator_binary_promote_hot_symbols(
       code_generator_set_error(
           generator, "Out of memory while promoting global '%s' in '%s'",
           best_name, ir_function->name);
+      binary_symbol_scores_destroy(&symbol_scores);
       free(loop_weights);
       return 0;
     }
@@ -1045,11 +1224,13 @@ int code_generator_binary_promote_hot_symbols(
           generator,
           "Failed to promote hot symbol '%s' in direct object function '%s'",
           best_name, ir_function->name);
+      binary_symbol_scores_destroy(&symbol_scores);
       free(loop_weights);
       return 0;
     }
   }
 
+  binary_symbol_scores_destroy(&symbol_scores);
   free(loop_weights);
   return 1;
 }

@@ -54,6 +54,19 @@ typedef struct {
   IRProgram *program;
   IRAliasFunction *functions;
   size_t function_count;
+  /* Callee pointer -> its slot, open addressed. The propagation rounds resolve
+   * one slot per call site per round; a scan of every function there is
+   * quadratic in a program that is mostly functions. */
+  const IRFunction **slot_keys;
+  size_t *slot_values;
+  size_t slot_count;
+  /* Function name -> every slot holding it, open addressed with one entry per
+   * function so a repeated name simply occupies several probes. Poisoning
+   * consults this once per symbol operand in the program; scanning every
+   * function there is quadratic in a program that is mostly functions. */
+  const char **name_keys;
+  size_t *name_values;
+  size_t name_count;
   char **root_names;
   size_t root_count;
   size_t root_capacity;
@@ -178,8 +191,94 @@ static int alias_set_contains(const IRAliasRootSet *set, int root) {
 
 /* ------------------------------------------------------------------- lookups */
 
+static size_t alias_slot_hash(const IRFunction *function, size_t mask) {
+  uintptr_t bits = (uintptr_t)function;
+  bits ^= bits >> 33;
+  bits *= (uintptr_t)0xff51afd7ed558ccdULL;
+  bits ^= bits >> 33;
+  return (size_t)bits & mask;
+}
+
+static void alias_slot_index_destroy(IRAliasFacts *facts) {
+  free(facts->slot_keys);
+  free(facts->slot_values);
+  free(facts->name_keys);
+  free(facts->name_values);
+  facts->slot_keys = NULL;
+  facts->slot_values = NULL;
+  facts->name_keys = NULL;
+  facts->name_values = NULL;
+  facts->slot_count = 0;
+  facts->name_count = 0;
+}
+
+static void alias_slot_index_build(IRAliasFacts *facts) {
+  size_t want = 8;
+  size_t mask;
+
+  alias_slot_index_destroy(facts);
+  while (want < facts->function_count * 2) {
+    want *= 2;
+  }
+  facts->slot_keys = calloc(want, sizeof(*facts->slot_keys));
+  facts->slot_values = calloc(want, sizeof(*facts->slot_values));
+  if (!facts->slot_keys || !facts->slot_values) {
+    alias_slot_index_destroy(facts);
+    return; /* lookups fall back to the scan below */
+  }
+  facts->name_keys = calloc(want, sizeof(*facts->name_keys));
+  facts->name_values = calloc(want, sizeof(*facts->name_values));
+  if (!facts->name_keys || !facts->name_values) {
+    alias_slot_index_destroy(facts);
+    return;
+  }
+  facts->slot_count = want;
+  facts->name_count = want;
+  mask = want - 1;
+  for (size_t f = 0; f < facts->function_count; f++) {
+    const IRFunction *function = facts->program->functions[f];
+    size_t i;
+    if (!function) {
+      continue;
+    }
+    i = alias_slot_hash(function, mask);
+    while (facts->slot_keys[i]) {
+      if (facts->slot_keys[i] == function) {
+        break; /* first slot for a repeated pointer wins, as the scan did */
+      }
+      i = (i + 1) & mask;
+    }
+    if (!facts->slot_keys[i]) {
+      facts->slot_keys[i] = function;
+      facts->slot_values[i] = f;
+    }
+    if (!function->name) {
+      continue;
+    }
+    /* One entry per function, never deduplicated: two functions sharing a name
+     * must both be reachable, because the scan this replaces poisoned both. */
+    i = mettle_fnv1a_hash(function->name) & mask;
+    while (facts->name_keys[i]) {
+      i = (i + 1) & mask;
+    }
+    facts->name_keys[i] = function->name;
+    facts->name_values[i] = f;
+  }
+}
+
 static size_t alias_function_slot(const IRAliasFacts *facts,
                                   const IRFunction *function) {
+  if (facts->slot_count) {
+    size_t mask = facts->slot_count - 1;
+    size_t i = alias_slot_hash(function, mask);
+    while (facts->slot_keys[i]) {
+      if (facts->slot_keys[i] == function) {
+        return facts->slot_values[i];
+      }
+      i = (i + 1) & mask;
+    }
+    return (size_t)-1;
+  }
   for (size_t f = 0; f < facts->function_count; f++) {
     if (facts->program->functions[f] == function) {
       return f;
@@ -372,6 +471,17 @@ static void alias_poison_named_function(IRAliasFacts *facts,
   if (!operand || operand->kind != IR_OPERAND_SYMBOL || !operand->name) {
     return;
   }
+  if (facts->name_count) {
+    size_t mask = facts->name_count - 1;
+    size_t i = mettle_fnv1a_hash(operand->name) & mask;
+    while (facts->name_keys[i]) {
+      if (strcmp(facts->name_keys[i], operand->name) == 0) {
+        facts->functions[facts->name_values[i]].poisoned = 1;
+      }
+      i = (i + 1) & mask;
+    }
+    return;
+  }
   for (size_t g = 0; g < program->function_count; g++) {
     if (program->functions[g] && program->functions[g]->name &&
         strcmp(program->functions[g]->name, operand->name) == 0) {
@@ -490,6 +600,10 @@ void ir_alias_facts_reset(void) {
     free(g_alias.functions[f].params);
   }
   free(g_alias.functions);
+  free(g_alias.slot_keys);
+  free(g_alias.slot_values);
+  free(g_alias.name_keys);
+  free(g_alias.name_values);
   for (size_t r = 0; r < g_alias.root_count; r++) {
     free(g_alias.root_names[r]);
   }
@@ -869,6 +983,7 @@ void ir_alias_facts_build(IRProgram *program) {
     memset(&g_alias, 0, sizeof(g_alias));
     return;
   }
+  alias_slot_index_build(&g_alias);
   alias_poison_escaping_functions(&g_alias);
   if (!alias_seed_parameters(&g_alias)) {
     ir_alias_facts_reset();

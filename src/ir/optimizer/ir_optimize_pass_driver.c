@@ -40,8 +40,13 @@ static struct {
 } g_ir_named_ms[IR_PASS_TIME_NAMED_MAX];
 static size_t g_ir_named_count = 0;
 
-static double ir_pass_now_ms(void) {
-  return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+/* Raw clock() ticks, not a converted figure: clock()'s units do not reliably
+ * match CLOCKS_PER_SEC across the toolchains this builds with (the owned
+ * freestanding runtime returns microseconds while mingw reports 1000), and a
+ * number in the wrong units is worse than none. The same policy the safety
+ * resolver already follows. Runs are comparable, which is what this is for. */
+static double ir_pass_now_ticks(void) {
+  return (double)clock();
 }
 
 static void ir_pass_time_add_named(const char *name, double ms) {
@@ -64,23 +69,23 @@ static void ir_pass_time_add_named(const char *name, double ms) {
 /* Timing hooks for program-level passes (the inliner, pure-call LICM) that
  * don't go through the per-function drivers. begin returns 0 when disabled. */
 double ir_pass_time_begin(void) {
-  return ir_pass_time_enabled() ? ir_pass_now_ms() : 0.0;
+  return ir_pass_time_enabled() ? ir_pass_now_ticks() : 0.0;
 }
 
 void ir_pass_time_end(const char *name, double begin_ms) {
   if (!ir_pass_time_enabled() || begin_ms == 0.0) {
     return;
   }
-  ir_pass_time_add_named(name, ir_pass_now_ms() - begin_ms);
+  ir_pass_time_add_named(name, ir_pass_now_ticks() - begin_ms);
 }
 
 void ir_pass_time_report(void) {
   if (!ir_pass_time_enabled()) {
     return;
   }
-  fprintf(stderr, "-- IR pass times (cumulative) --\n");
+  fprintf(stderr, "-- IR pass times (cumulative clock() ticks) --\n");
   for (int dumped = 0; dumped < 40; dumped++) {
-    double best = 0.5; /* drop sub-half-millisecond noise */
+    double best = 0.5; /* drop sub-tick noise */
     int best_fix = -1;
     size_t best_named = (size_t)-1;
     for (int i = 0; i < IR_OPT_PASS_COUNT; i++) {
@@ -98,12 +103,12 @@ void ir_pass_time_report(void) {
       }
     }
     if (best_fix >= 0) {
-      fprintf(stderr, "  %-32s %10.1f ms  (%llu runs)\n",
+      fprintf(stderr, "  %-32s %12.0f  (%llu runs)\n",
               ir_opt_pass_name((IROptPassId)best_fix), g_ir_pass_ms[best_fix],
               g_ir_pass_runs[best_fix]);
       g_ir_pass_ms[best_fix] = 0.0;
     } else if (best_named != (size_t)-1) {
-      fprintf(stderr, "  %-32s %10.1f ms  (%llu runs)\n",
+      fprintf(stderr, "  %-32s %12.0f  (%llu runs)\n",
               g_ir_named_ms[best_named].name, g_ir_named_ms[best_named].ms,
               g_ir_named_ms[best_named].runs);
       g_ir_named_ms[best_named].ms = 0.0;
@@ -455,7 +460,7 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
     return 0;
   }
   if (ir_pass_time_enabled()) {
-    g_ir_pass_ms[pass_id] += ir_pass_now_ms() - t0;
+    g_ir_pass_ms[pass_id] += ir_pass_now_ticks() - t0;
     g_ir_pass_runs[pass_id]++;
   }
   ir_explain_pass_end(function, pass_name, pass_changed);
