@@ -1071,7 +1071,8 @@ int code_generator_binary_instruction_result_is_float64(
     function_type = code_generator_binary_indirect_callee_type(
         generator, context, instruction);
     return code_generator_binary_resolved_type_float_bits(
-               function_type ? function_type->fn_return_type : NULL) != 0;
+               function_type ? function_type->fn_return_type
+                             : instruction->value_type) != 0;
 
   case IR_OP_CAST:
     /* Any floating target marks the dest temp, float32 as well as float64.
@@ -1136,9 +1137,13 @@ int code_generator_binary_instruction_result_float_bits(
   case IR_OP_CALL_INDIRECT:
     function_type = code_generator_binary_indirect_callee_type(
         generator, context, instruction);
-    return function_type ? code_generator_binary_resolved_type_float_bits(
-                               function_type->fn_return_type)
-                         : 64;
+    if (!function_type) {
+      int bits = code_generator_binary_resolved_type_float_bits(
+          instruction->value_type);
+      return bits ? bits : 64;
+    }
+    return code_generator_binary_resolved_type_float_bits(
+        function_type->fn_return_type);
 
   case IR_OP_CAST: {
     MtlcType *t = generator && generator->ir_program
@@ -3315,7 +3320,8 @@ int code_generator_binary_validate_indirect_call(
     return 0;
   }
 
-  if (instruction->argument_count != function_type->fn_param_count) {
+  if (instruction->argument_count < function_type->fn_param_count ||
+      instruction->argument_count - function_type->fn_param_count > 1) {
     code_generator_set_error(
         generator,
         "Indirect call argument mismatch while lowering direct object "
@@ -4159,6 +4165,33 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
   return 1;
 }
 
+static MtlcType *binary_indirect_slot_type(const IRInstruction *instruction,
+                                           MtlcType *function_type,
+                                           size_t hidden_slots, size_t slot) {
+  if (function_type && function_type->fn_param_types) {
+    if (slot < hidden_slots) {
+      return NULL;
+    }
+    if (slot - hidden_slots < function_type->fn_param_count) {
+      return function_type->fn_param_types[slot - hidden_slots];
+    }
+    return NULL;
+  }
+  if (instruction->argument_types && slot < instruction->argument_count) {
+    return instruction->argument_types[slot];
+  }
+  return NULL;
+}
+
+static size_t binary_indirect_hidden_slots(const IRInstruction *instruction,
+                                           MtlcType *function_type) {
+  if (!function_type ||
+      instruction->argument_count <= function_type->fn_param_count) {
+    return 0;
+  }
+  return instruction->argument_count - function_type->fn_param_count;
+}
+
 int code_generator_binary_emit_call_indirect(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IRInstruction *instruction) {
@@ -4182,6 +4215,7 @@ int code_generator_binary_emit_call_indirect(
                                                  instruction);
 
   const BinaryAbi *abi = code_generator_binary_active_abi();
+  size_t hidden_slots = binary_indirect_hidden_slots(instruction, function_type);
   size_t indirect_arg_count = instruction->argument_count;
   int *arg_is_float =
       indirect_arg_count > 0 ? calloc(indirect_arg_count, sizeof(int)) : NULL;
@@ -4197,9 +4231,8 @@ int code_generator_binary_emit_call_indirect(
     return 0;
   }
   for (size_t i = 0; i < indirect_arg_count; i++) {
-    MtlcType *parameter_type = function_type && function_type->fn_param_types
-                               ? function_type->fn_param_types[i]
-                               : NULL;
+    MtlcType *parameter_type =
+        binary_indirect_slot_type(instruction, function_type, hidden_slots, i);
     arg_is_float[i] =
         code_generator_binary_resolved_type_float_bits(parameter_type) ? 1 : 0;
   }
@@ -4249,9 +4282,7 @@ int code_generator_binary_emit_call_indirect(
     if (loc->kind != BINARY_ARG_ON_STACK) continue;
     int slot_offset = abi->shadow_space_size + loc->stack_offset;
     MtlcType *parameter_type =
-        function_type && function_type->fn_param_types
-            ? function_type->fn_param_types[i]
-            : NULL;
+        binary_indirect_slot_type(instruction, function_type, hidden_slots, i);
     if (!code_generator_binary_emit_call_argument_load(
             generator, context, &instruction->arguments[i], parameter_type,
             BINARY_GP_R10) ||
@@ -4271,9 +4302,7 @@ int code_generator_binary_emit_call_indirect(
     const BinaryArgLocation *loc = &arg_locations[i];
     if (loc->kind == BINARY_ARG_ON_STACK) continue;
     MtlcType *parameter_type =
-        function_type && function_type->fn_param_types
-            ? function_type->fn_param_types[i]
-            : NULL;
+        binary_indirect_slot_type(instruction, function_type, hidden_slots, i);
     int param_fbits =
         code_generator_binary_resolved_type_float_bits(parameter_type);
     if ((loc->kind == BINARY_ARG_IN_XMM_REGISTER &&
@@ -4312,9 +4341,11 @@ int code_generator_binary_emit_call_indirect(
     return 0;
   }
 
-  if (function_type) {
-    int ret_fbits = code_generator_binary_resolved_type_float_bits(
-        function_type->fn_return_type);
+  {
+    MtlcType *return_type = function_type ? function_type->fn_return_type
+                                          : instruction->value_type;
+    int ret_fbits =
+        code_generator_binary_resolved_type_float_bits(return_type);
     if ((ret_fbits == 32 &&
          !binary_emit_movd_reg_xmm(&context->code, BINARY_GP_RAX,
                                    BINARY_XMM0)) ||

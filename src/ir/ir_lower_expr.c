@@ -37,6 +37,32 @@ int ir_lower_statement_or_expression(IRLoweringContext *context,
 }
 
 
+static MtlcType **ir_indirect_slot_types(ASTNode **argument_nodes,
+                                        size_t argument_count, size_t lead) {
+  MtlcType **slot_types = NULL;
+
+  if (argument_count + lead == 0) {
+    return NULL;
+  }
+  slot_types = calloc(argument_count + lead, sizeof(*slot_types));
+  if (!slot_types) {
+    return NULL;
+  }
+  for (size_t i = 0; i < argument_count; i++) {
+    Type *argument_type =
+        argument_nodes && argument_nodes[i] ? argument_nodes[i]->resolved_type
+                                            : NULL;
+    if (!argument_type || argument_type->kind == TYPE_STRUCT ||
+        argument_type->kind == TYPE_ARRAY ||
+        argument_type->kind == TYPE_STRING ||
+        argument_type->kind == TYPE_TAGGED_ENUM) {
+      continue;
+    }
+    slot_types[lead + i] = mtlc_type_from_frontend(argument_type);
+  }
+  return slot_types;
+}
+
 static int ir_indirect_arg_passes_by_address(Type *type) {
   return type && type->name &&
          (type->kind == TYPE_STRUCT || type->kind == TYPE_TAGGED_ENUM) &&
@@ -884,7 +910,10 @@ int ir_lower_call_expression(IRLoweringContext *context,
                             : NULL;
     cinstr.arguments = cargs;
     cinstr.argument_count = call->argument_count + lead;
+    cinstr.argument_types =
+        ir_indirect_slot_types(call->arguments, call->argument_count, lead);
     int ok = ir_emit(context, function, &cinstr);
+    free(cinstr.argument_types);
     for (size_t i = 0; i < call->argument_count + lead; i++)
       ir_operand_destroy(&cargs[i]);
     free(cargs);
@@ -930,8 +959,12 @@ int ir_lower_call_expression(IRLoweringContext *context,
 
   if (is_func_ptr_var) {
     instruction.op = IR_OP_CALL_INDIRECT;
+    instruction.argument_types = ir_indirect_slot_types(
+        call->arguments, call->argument_count,
+        emitted_argument_count - call->argument_count);
     instruction.lhs = ir_operand_symbol(call->function_name);
     if (instruction.lhs.kind != IR_OPERAND_SYMBOL || !instruction.lhs.name) {
+      free(instruction.argument_types);
       ir_operand_destroy(&instruction.lhs);
       for (size_t i = 0; i < emitted_argument_count; i++) {
         ir_operand_destroy(&emitted_arguments[i]);
@@ -956,6 +989,7 @@ int ir_lower_call_expression(IRLoweringContext *context,
   }
 
   if (!ir_emit(context, function, &instruction)) {
+    free(instruction.argument_types);
     for (size_t i = 0; i < emitted_argument_count; i++) {
       ir_operand_destroy(&emitted_arguments[i]);
     }
@@ -964,6 +998,8 @@ int ir_lower_call_expression(IRLoweringContext *context,
     ir_operand_destroy(&destination);
     return 0;
   }
+  free(instruction.argument_types);
+  instruction.argument_types = NULL;
 
   for (size_t i = 0; i < emitted_argument_count; i++) {
     ir_operand_destroy(&emitted_arguments[i]);
@@ -2278,7 +2314,10 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
               : NULL;
       cinstr.arguments = cargs;
       cinstr.argument_count = fp_call->argument_count + lead;
+      cinstr.argument_types = ir_indirect_slot_types(
+          fp_call->arguments, fp_call->argument_count, lead);
       int ok = ir_emit(context, function, &cinstr);
+      free(cinstr.argument_types);
       for (size_t i = 0; i < fp_call->argument_count + lead; i++)
         ir_operand_destroy(&cargs[i]);
       free(cargs);
@@ -2328,8 +2367,12 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
             : NULL;
     instruction.arguments = emitted_arguments;
     instruction.argument_count = emitted_argument_count;
+    instruction.argument_types = ir_indirect_slot_types(
+        fp_call->arguments, fp_call->argument_count,
+        emitted_argument_count - fp_call->argument_count);
 
     if (!ir_emit(context, function, &instruction)) {
+      free(instruction.argument_types);
       for (size_t i = 0; i < emitted_argument_count; i++) {
         ir_operand_destroy(&emitted_arguments[i]);
       }
@@ -2339,6 +2382,8 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       ir_operand_destroy(&destination);
       return 0;
     }
+    free(instruction.argument_types);
+    instruction.argument_types = NULL;
 
     for (size_t i = 0; i < emitted_argument_count; i++) {
       ir_operand_destroy(&emitted_arguments[i]);
