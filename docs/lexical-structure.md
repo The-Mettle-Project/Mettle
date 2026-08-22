@@ -1,155 +1,143 @@
-# Lexical Structure
+# Lexical structure
 
-This document covers the low-level syntax of Mettle: comments, identifiers, keywords, literals, and operators.
+How the compiler turns Mettle source text into tokens: comments, names,
+literals, and the words you cannot use as names.
+
+## Source text
+
+Source files are UTF-8 and end in `.mettle`. A byte-order mark at the start of
+a file is skipped. Line endings may be LF or CRLF.
+
+Outside string literals, spaces, tabs, and newlines separate tokens and carry
+no other meaning. A statement ends at a semicolon or at the end of a line, so
+both of these are one statement:
+
+```mettle
+var a: int32 = 1;
+var b: int32 = 2
+```
+
+An expression may span lines. The compiler keeps reading while the statement is
+plainly unfinished, so a long call or a long arithmetic chain can be broken
+across lines without a continuation marker.
 
 ## Comments
 
-Line comments start with `//` and extend to the end of the line. Everything after `//` is ignored by the compiler.
+`//` starts a comment that runs to the end of the line. `/*` starts a comment
+that ends at the matching `*/`. An unterminated block comment is a lexical
+error.
 
 ```mettle
-// Line comment: everything from // to end of line is ignored
-var x: int32 = 42;  // inline comment
+// this line is a comment
+var n: int32 = 0;  /* so is this */
 ```
-
-Block comments are written `/* ... */` and may span multiple lines:
-
-```mettle
-/* This is a block comment.
-   It can span multiple lines. */
-var x: int32 = 42; /* inline block comment */
-```
-
-Block comments **nest**, so you can comment out a region that already
-contains a block comment:
-
-```mettle
-/* outer
-   /* inner */
-   still commented */
-var ready: int32 = 1;
-```
-
-An unterminated block comment (missing the final `*/`) is a lexer error.
-
-The sequences `//`, `/*`, and `*/` inside a string literal are not treated as comments; they become part of the string. For example, `"http://example.com"` produces a string containing `http://example.com` with no comment.
 
 ## Identifiers
 
-Identifiers name variables, functions, types, and other program elements. They must start with a letter or underscore, followed by any combination of letters, digits, or underscores. Identifiers are case-sensitive. There is no documented length limit; the lexer accepts identifiers until it hits a non-alphanumeric character. Identifiers are strictly ASCII; Unicode identifiers are not supported. The lexer uses `isalpha` and `isalnum`, which treat only ASCII letters and digits as valid. The compiler interns identifier-like names for memory efficiency; see [Compilation](compilation.md#string-interning).
+An identifier starts with a letter or `_` and continues with letters, digits,
+and `_`. Identifiers are case sensitive.
 
-```
-my_var
-_private
-Vector3
+A local you declare and never read draws a warning. Rename it with a leading
+underscore to keep it on purpose:
+
+```text
+warning[E0003]: unused variable 'r'
+   = help: remove it, or rename it to '_r' to keep it intentionally
 ```
 
 ## Keywords
 
-The following words are reserved and cannot be used as identifiers.
+These words are reserved and cannot name anything:
 
-Declarations: `import`, `import_str`, `extern`, `export`, `var`, `const`, `fn`, `kernel`, `struct`, `enum`, `trait`, `impl`, `where`, `method`; GPU storage qualifiers: `workgroup`, `private`. Control flow: `if`, `else`, `while`, `for`, `switch`, `case`, `default`, `match`, `break`, `continue`, `return`, `defer`, `errdefer`, `dispatch`, `barrier`. Other: `asm`, `this`, `new`. Types: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`.
-
-`kernel` declares a GPU entry point, `workgroup var` / `private var` declare static device storage, `barrier(...)` synchronizes a workgroup, and `dispatch` launches a kernel; see [GPU Offload](gpu.md). `in` (used in range-based `for i in lo..hi`) is a *contextual* keyword: it is only special in that position and remains usable as an ordinary identifier elsewhere.
-
-`this` is only valid inside method bodies; it refers to the receiver. Using `this` as a variable name outside a method produces an error. `new` is an expression keyword, not a statement keyword; it appears in expressions like `var p: T* = new T` and cannot start a statement by itself.
-
-Several built-in names are **not** reserved words, so they are ordinary identifiers that happen to have built-in meaning: the type names `bool`, `cstring`, and `void`; the `bool` constants `true` and `false`; the compile-time forms `sizeof`, `assert`, and `assert_eq`; the closure type constructor `Fn`; and the GPU built-ins (`thread`, `block`, `block_dim`, `grid_dim`, and the `subgroup_*`, `atomic_*`, and `tensor_*` families).
-
-x86 mnemonics and register names (`add`, `mov`, `cmp`, `call`, `ret`, `push`, `pop`, `lea`, `jmp`, `eax` through `r15`, and similar) are recognized as distinct tokens for the reserved inline-assembly syntax, matched case-insensitively. They are still accepted wherever an identifier is expected, so a variable named `add` or `cmp` compiles normally.
-
-## Numeric Literals
-
-Decimal literals use digits: `42`, `0`. A leading zero does not select octal: `007` is decimal 7. Hexadecimal: `0x1A`, `0xFF`, `0Xdead`. Binary: `0b1010`, `0B1111`. Floating-point: `3.14`, `0.5`. Invalid literals (e.g. empty hex after `0x`) produce lexical errors.
-
-**Exponent notation** is supported on decimal literals: `1e10`, `1.5E+3`, `2.220446049250313e-16`. An `e` or `E` starts an exponent only when followed by an optional sign and at least one digit; otherwise it is left to the next token, so an identifier butted against a number still lexes separately. A literal is floating-point if it contains a `.` or an exponent, which means `1e10` is a `float64` rather than an integer. Exponents apply to decimal literals only: hexadecimal digits include `e`, so `0x1E` is the integer 30.
-
-The lexer will not consume a `.` that begins a `..` range, so `1..5` lexes as three tokens rather than as the float `1.` followed by `.5`.
-
-A leading minus is not part of the literal. The expression `-17` is parsed as the unary minus operator applied to the literal `17`. So `var x: int8 = -128` is valid: the literal `128` is negated to `-128`, which fits in `int8`. Integer literals are parsed as decimal strings and must fit within the target type when used; the implementation uses `strtol`/`strtoull` internally. There is no formal maximum; values that overflow the target type may produce implementation-defined behavior.
-
-Underscores in numeric literals (e.g. `1_000_000`) are not supported. The underscore would terminate the number and start an identifier. Use `1000000` instead.
-
-## Character Literals
-
-A character literal is a single character in single quotes, or one escape sequence. The supported escapes are `\n`, `\t`, `\r`, `\\`, `\'`, and `\0`; any other escape is a lexical error.
-
-```mettle
-var newline: int32 = '\n';   // 10
-var letter:  int32 = 'A';    // 65
+```text
+asm       barrier   break     case      const     continue  default
+defer     dispatch  else      enum      errdefer  export    extern
+fn        for       if        impl      import    import_str
+kernel    match     method    new       private   return    struct
+switch    this      trait     var       where     while     workgroup
 ```
 
-**A character literal is an integer literal.** The lexer converts it to the numeric value of the byte, so `'A'` and `65` are indistinguishable after lexing, and a character literal is usable anywhere an integer literal is, including in `const` initializers and `switch` case values. There is no distinct character type.
+The built-in type names are also reserved: `int8`, `int16`, `int32`, `int64`,
+`uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`.
 
-A literal containing more than one character, or a raw newline, is a lexical error. Note that `\"` is not among the character escapes; a double quote inside single quotes is just an ordinary character.
+Some names are recognized by position and stay usable elsewhere: `bool`,
+`char`, `cstring`, `rawptr`, `comptime`, `in`, `sizeof`, `typeof`, `Fn`,
+`Type`, `Field`. Writing one where a type belongs gets you that type. Writing
+one as a variable name works.
 
-## String Literals
+Inside an `asm` block the x86-64 mnemonics and register names are recognized
+too, and they match without regard to case. They mean nothing outside a block.
 
-Strings are enclosed in double quotes. The compiler processes escape sequences before storing the value. Supported escapes: `\n` (newline, LF), `\t` (tab), `\r` (carriage return), `\\` (backslash), `\"` (double quote), `\0` (null byte). Unknown escape sequences are preserved literally: the backslash and the following character are both stored. For example, `"\q"` produces the two characters `\` and `q`, not a single character. String literals have type `string` (see [Types](types.md)).
+## Integer literals
 
-```mettle
-var msg: string = "Hello\nWorld\t\"quoted\"";
-```
-
-Multiline strings are supported. A newline inside the quotes is stored as a literal newline; the string continues until the closing quote. An unterminated string (no closing quote before end of file) produces a lexical error. There is no documented maximum length; strings are limited by available memory and source file size.
-
-A quote inside a `{...}` [interpolation](expressions.md#string-interpolation) opens a literal nested in that expression rather than closing the one around it, so `"{name + "-" + suffix}"` is one string. Outside an interpolation the first unescaped quote still ends the literal, and a stray `{` is reported as an unterminated brace, not as a string that ran to the end of the file.
-
-## Line Continuation
-
-A statement ends at a newline (or at `;`), but only where the statement is complete. A line that ends with an operator still waiting for its right-hand side continues on the next line, so a long expression can be broken wherever it reads best:
+Decimal, hexadecimal with `0x`, and binary with `0b`. Hex digits and the `x`
+or `b` marker may be upper or lower case.
 
 ```mettle
-var total: int64 =
-    base * scale +
-    offset;
-
-if (ready &&
-    count > 0) { ... }
+var d: int32 = 1000;
+var h: int32 = 0xFF;
+var b: int32 = 0b1010;
 ```
 
-This covers every binary and compound-assignment operator, `=`, `->`, `.`, and `..`. Text inside `( )` or `[ ]` continues across newlines regardless of what the line ends with.
+An integer literal with no other context is `int32`. Assigning it to a wider
+type converts it in place, so `var n: int64 = 42` is exact. A literal too big
+for its destination is rejected by [M0118](diagnostics.md).
 
-Two spellings need the break somewhere else. A line ending in `*` or `>` is ambiguous, because `var p: int32*` and `var c: Cell<int64>` are complete statements; the continuation applies once the parser has committed to reading `*` or `>` as a binary operator, which it has after the left operand and the operator are both in hand. In practice that means `a *` and `a >` do continue a line, while a pointer type or a generic argument list still ends one.
+## Float literals
 
-## Operators and Punctuation
-
-Assignment `=`. Compound assignment `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`. Increment `++` and decrement `--`. Comparison `==`, `!=`, `<`, `>`, `<=`, `>=`. Logical `&&`, `||`. Arithmetic `+`, `-`, `*`, `/`, `%`. Unary `-` (negation), `*` (dereference), `&` (address-of). Member access `.`. Arrow `->`. Range `..` (exclusive) and `..=` (inclusive), used in `for i in lo..hi`. Brackets `( )`, `{ }`, `[ ]`. Delimiters `:`, `;`, `,`. The `@` sigil introduces a loop attribute (`@simd` / `@simd!`); see [Control Flow](control-flow.md#vectorization-contracts).
-
-**Compound assignment:** `target OP= value` is exact syntactic sugar for `target = target OP value`, where `OP` is one of `+ - * / % & | ^ << >>`. The target is evaluated as an ordinary assignment target (identifier, struct field, array element, or pointer dereference) and must be a valid lvalue. For example, `count += 1` is identical to `count = count + 1`, and `mask &= 0xFF` is identical to `mask = mask & 0xFF`. Compound assignment is a statement (also valid as a `for`-loop initializer or increment), not an expression, so it does not produce a value. See [Expressions](expressions.md).
-
-**Increment and decrement:** `target++` and `target--` are the one-step forms of `+=` and `-=`, taking the same targets and desugaring the same way: `i++` is `i = i + 1`. They are statements, so they yield no value, and `++target` and `--target` mean exactly what the postfix spellings mean. Nothing observes the order, because there is nothing to observe: a step that produces no value cannot be read before or after itself, so `a[i++] = i++` is not a question Mettle has to answer. Using one where a value is expected is an error that says so. A sub-word target needs the same cast `+=` needs, because the step promotes to `int32` before it is stored back: `u++` on a `uint8` is [M0119](diagnostics.md), and `u = (uint8)(u + 1)` is how it is written.
+A run of digits with a `.` in it is `float64`. To get a `float32`, name the
+type or cast.
 
 ```mettle
-i++;              // i = i + 1
---count;          // count = count - 1
-a[2]++;           // any assignment target works
-for (var k: int32 = 0; k < 5; k++) { total += k; }
+var d: float64 = 3.14;
+var f: float32 = (float32)3.14;
 ```
 
-**Operator precedence:** every binary operator is left-associative. From tightest to loosest: multiplicative (`*`, `/`, `%`), additive (`+`, `-`), shifts (`<<`, `>>`), relational (`<`, `<=`, `>`, `>=`), equality (`==`, `!=`), bitwise AND (`&`), bitwise XOR (`^`), bitwise OR (`|`), logical AND (`&&`), logical OR (`||`). Postfix forms (call, member access, indexing), then unary operators, then casts all bind tighter than any binary operator. So `a + b * c` parses as `a + (b * c)`, `a << 1 < b` parses as `(a << 1) < b`, and `a < b == c` parses as `(a < b) == c`. See [Expressions](expressions.md) for the full table. Use parentheses to override.
+## Character literals
 
-**Modulo:** The modulo operator `%` returns the remainder of integer division. It requires integer operands. See [Expressions](expressions.md).
-
-**Bitwise operators:** Bitwise AND (`&`), OR (`|`), XOR (`^`), complement (`~`), and shifts (`<<`, `>>`) are supported for integer types. The unary `&` is address-of; the binary `&` is bitwise AND. Context disambiguates.
-
-**Logical operators:** Short-circuit logical AND (`&&`) and OR (`||`) are supported.
-
-**Arrow `->`:** The arrow serves two roles. In function signatures it denotes the return type: `fn f() -> int32`. In expressions it denotes pointer field access: `ptr->field`. Both uses appear in the same program:
+A single character in single quotes has type `char`, which is one byte. The
+escapes are `\n`, `\t`, `\r`, `\`, `\'`, and `\0`. Any other escape is an
+error.
 
 ```mettle
-struct Point { x: int32; y: int32; }
-
-fn get_x(p: Point*) -> int32 {
-  return p->x;
-}
+var c: char = 'h';
+var nl: char = '\n';
 ```
 
+## String literals
 
-## Lexer Token Model (Implementation Note)
+Text in double quotes has type `string`. The escapes are `\n`, `\t`, `\r`,
+`\`, `\"`, and `\0`. An unrecognized escape is kept as the backslash followed
+by the character.
 
-Tokens produced by the lexer carry both:
+Every string literal is scanned for interpolation. `{expr}` splices the value
+of `expr` into the text, and `{{` writes one literal `{`:
 
-- `value`: a null-terminated C string used by parser and semantic phases.
-- `lexeme`: a string view (`data` pointer + `length`) for length-aware token text handling without `strlen`.
+```mettle
+var n: int32 = 7;
+println("n is {n}, twice is {n * 2}, a brace is {{");
+```
 
-For identifier-like tokens, `value` points to an interned global string (deduplicated across the compilation). This enables fast pointer-based equality checks for names in later phases.
+```text
+n is 7, twice is 14, a brace is {
+```
+
+[Expressions](expressions.md#string-interpolation) covers what may appear
+inside the braces and which types print how.
+
+## Operators and punctuation
+
+```text
++   -   *   /   %   ~   !   &   |   ^   <<  >>
+&&  ||  ==  !=  <   >   <=  >=
+=   +=  -=  *=  /=  %=  &=  |=  ^=  <<= >>=
+++  --  ->  .   ..  ,   ;   :   @
+(   )   {   }   [   ]
+```
+
+[Expressions](expressions.md#precedence) gives the precedence table.
+
+## See also
+
+- [Types](types.md)
+- [Declarations](declarations.md)
