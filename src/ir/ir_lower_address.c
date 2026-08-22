@@ -400,9 +400,13 @@ int ir_try_emit_aggregate_symbol_memcpy(
   }
   /* `string` copies whole, like the struct it is: sixteen bytes, not the one
    * word a plain store would move, which would leave the length reading
-   * whatever happened to sit beside the pointer. */
+   * whatever happened to sit beside the pointer. A tagged enum has the same
+   * shape -- a discriminant beside the widest payload -- so `vs[0] = I(21)`
+   * moved the tag and left the payload behind, and the match that read it
+   * back saw whatever the slot already held. */
   if (!dest_type ||
-      (dest_type->kind != TYPE_STRUCT && dest_type->kind != TYPE_STRING)) {
+      (dest_type->kind != TYPE_STRUCT && dest_type->kind != TYPE_STRING &&
+       dest_type->kind != TYPE_TAGGED_ENUM)) {
     return 0;
   }
   if (dest_type->size == 0 || dest_type->size > (size_t)INT_MAX) {
@@ -538,9 +542,13 @@ int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
   }
   /* `string` copies whole, like the struct it is: sixteen bytes, not the one
    * word a plain store would move, which would leave the length reading
-   * whatever happened to sit beside the pointer. */
+   * whatever happened to sit beside the pointer. A tagged enum has the same
+   * shape -- a discriminant beside the widest payload -- so `vs[0] = I(21)`
+   * moved the tag and left the payload behind, and the match that read it
+   * back saw whatever the slot already held. */
   if (!dest_type ||
-      (dest_type->kind != TYPE_STRUCT && dest_type->kind != TYPE_STRING)) {
+      (dest_type->kind != TYPE_STRUCT && dest_type->kind != TYPE_STRING &&
+       dest_type->kind != TYPE_TAGGED_ENUM)) {
     return 0;
   }
   if (dest_type->size == 0 || dest_type->size > (size_t)INT_MAX) {

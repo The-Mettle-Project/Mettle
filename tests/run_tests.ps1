@@ -12611,6 +12611,8 @@ $runFixtures = @(
      What = "a codegen check failed" },
   @{ Name = "enums_match"; Path = "tests/codegen/enums_match.mettle"
      What = "a codegen check failed" },
+  @{ Name = "tagged_enum_aggregate"; Path = "tests/codegen/tagged_enum_aggregate.mettle"
+     What = "a tagged enum copied as one word and left its payload behind" },
   @{ Name = "global_counter_promotion"; Path = "tests/codegen/global_counter_promotion.mettle"
      What = "a register-promoted global counter lost its writes" },
   @{ Name = "scoped_shadowing"; Path = "tests/codegen/scoped_shadowing.mettle"
