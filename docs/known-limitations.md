@@ -70,20 +70,6 @@ A plain function value already sitting in a variable is not adapted to a
 closure type. Take the address at the point you need it, `&twice`, which is
 accepted at a declaration, an argument, a return, and an assignment.
 
-## Diagnostics that miss cases
-
-M0117, the loop index that runs past the end of an array, fires for the
-`while` form and misses the range-`for` form, even though `mettle explain
-M0117` uses the range form as its example:
-
-```mettle
-var a: int64[8];
-for i in 0..9 { a[i] = (int64)i; }
-```
-
-That compiles and traps at run time. The same mistake written as a `while` loop
-is caught while compiling.
-
 ## Borrow analysis
 
 Analysis is conservative and stays within one function. Borrows are tracked

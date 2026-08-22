@@ -98,8 +98,7 @@ and the bound is larger:
 
 ```mettle
 var a: int64[8];
-var i: int32 = 0;
-while (i < 9) { a[i] = (int64)i; i = i + 1; }
+for i in 0..9 { a[i] = (int64)i; }
 ```
 
 ```text
@@ -107,8 +106,10 @@ error[M0117]: This loop runs `i` up to 8, but `a` has 8 elements (valid
 indexes 0..7); the final iteration reads or writes past the end
 ```
 
-The same mistake written as `for i in 0..9` is missed today and traps at run
-time instead. [Known limitations](known-limitations.md) tracks it.
+The same three spellings are covered: `for i in 0..9`, `for i in 0..=8`, and
+the `while` loop they desugar to. The check needs a constant start, a constant
+bound, one `i = i + 1`, and no way out of the loop early, so anything it cannot
+prove it leaves alone.
 
 ## Run-time checks with --safe
 

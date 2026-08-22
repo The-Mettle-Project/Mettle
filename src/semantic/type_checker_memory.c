@@ -1743,13 +1743,25 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
   switch (statement->type) {
   case AST_VAR_DECLARATION: {
     VarDeclaration *decl = (VarDeclaration *)statement->data;
-    if (!decl || !decl->name || !decl->type_name) {
+    if (!decl || !decl->name) {
+      return;
+    }
+    const char *decl_type = decl->type_name;
+    if (!decl_type) {
+      long long structural_start = 0;
+      if (decl->structural_type && decl->initializer &&
+          type_checker_eval_integer_constant_with_checker(
+              ctx->checker, decl->initializer, &structural_start)) {
+        decl_type = "int64";
+      }
+    }
+    if (!decl_type) {
       return;
     }
     if (decl->initializer) {
       mem_walk_expr(ctx, decl->initializer);
     }
-    mem_add_local(ctx, decl->name, decl->type_name, statement->location, -1);
+    mem_add_local(ctx, decl->name, decl_type, statement->location, -1);
     if (decl->initializer) {
       mem_apply_assignment(ctx, decl->name, decl->initializer,
                            statement->location);

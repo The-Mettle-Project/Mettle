@@ -619,6 +619,18 @@ $cases = @(
     Pattern       = 'error\[M0117\]: This loop runs `j` up to 8, but `a` has 8 elements'
   },
   @{
+    Name          = "err_mem_loop_oob_rangefor"
+    Path          = "tests/err_mem_loop_oob_rangefor.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'error\[M0117\]: This loop runs `j` up to 8, but `a` has 8 elements'
+  },
+  @{
+    Name          = "err_mem_loop_oob_rangefor_inclusive"
+    Path          = "tests/err_mem_loop_oob_rangefor_inclusive.mettle"
+    ShouldSucceed = $false
+    Pattern       = 'error\[M0117\]: This loop runs `i` up to 8, but `a` has 8 elements'
+  },
+  @{
     # Constant arithmetic: division by a literal zero is a guaranteed trap.
     Name          = "err_mem_div_zero"
     Path          = "tests/err_mem_div_zero.mettle"

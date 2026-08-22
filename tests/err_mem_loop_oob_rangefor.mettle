@@ -1,0 +1,11 @@
+fn main() -> int32 {
+    var a: int64[8];
+    var total: int64 = 0;
+    for i in 0..8 {
+        a[i] = (int64)i;
+    }
+    for j in 0..9 {
+        total = total + a[j];
+    }
+    return (int32)total;
+}
