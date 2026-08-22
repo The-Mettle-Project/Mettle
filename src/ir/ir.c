@@ -2448,24 +2448,26 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
     break;
   case IR_OP_SIMD_FILL: {
     char value[128];
+    char start[128];
+    char offset[128];
+    int pointer_walk = instruction->argument_count > 1 &&
+                       instruction->arguments[1].int_value == 1;
     ir_format_operand(instruction->argument_count > 2 ? &instruction->arguments[2]
                                                       : NULL,
                       value, sizeof(value));
+    ir_format_operand(instruction->argument_count > 3 ? &instruction->arguments[3]
+                                                      : NULL,
+                      start, sizeof(start));
+    ir_format_operand(instruction->argument_count > 4 ? &instruction->arguments[4]
+                                                      : NULL,
+                      offset, sizeof(offset));
     written = snprintf(
-        buffer, buffer_size, "simd_fill(%s=%s, %s=%s, size=%lld, value=%s)",
-        (instruction->argument_count > 1 &&
-         instruction->arguments[1].int_value == 1)
-            ? "begin"
-            : "base",
-        lhs,
-        (instruction->argument_count > 1 &&
-         instruction->arguments[1].int_value == 1)
-            ? "end"
-            : "len",
-        rhs,
+        buffer, buffer_size,
+        "simd_fill(%s=%s, %s=%s, size=%lld, value=%s, start=%s, offset=%s)",
+        pointer_walk ? "begin" : "base", lhs, pointer_walk ? "end" : "len", rhs,
         instruction->argument_count > 0 ? instruction->arguments[0].int_value
                                         : 0,
-        value);
+        value, start, offset);
     break;
   }
   case IR_OP_SIMD_MATMUL_N32:

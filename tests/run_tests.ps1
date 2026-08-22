@@ -12624,6 +12624,8 @@ $runFixtures = @(
      What = "predicated counting dropped a merge label a second branch still reached" },
   @{ Name = "aggregate_copy_keeps_rcx"; Path = "tests/codegen/aggregate_copy_keeps_rcx.mettle"
      What = "a rep movsb aggregate copy clobbered a value the allocator kept in RCX" },
+  @{ Name = "row_fill_offset"; Path = "tests/codegen/row_fill_offset.mettle"
+     What = "a row fill applied its row offset twice, writing past the row it was given" },
   @{ Name = "const_pool_placement"; Path = "tests/codegen/const_pool_placement.mettle"
      What = "a pooled float constant was relocated to a slot no path reaches" },
   @{ Name = "prefetch_indirect_temps"; Path = "tests/codegen/prefetch_indirect_temps.mettle"

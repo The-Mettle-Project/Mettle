@@ -733,6 +733,30 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
         var = ir_operand_none();
       }
 
+      /* The shift no longer reads the index add, and the row pointer carries
+       * what it contributed. Retire it when nothing else reads it: left in
+       * place it is dead code that still describes an offset, and a later
+       * recognizer can charge that offset on top of the row pointer. */
+      {
+        IRInstruction *idx_ins = &function->instructions[idx_pos];
+        if (idx_ins->dest.kind == IR_OPERAND_TEMP && idx_ins->dest.name) {
+          int read_elsewhere = 0;
+          for (size_t j = 0; j < function->instruction_count; j++) {
+            if (j == idx_pos) {
+              continue;
+            }
+            if (ir_row_instruction_reads_temp(&function->instructions[j],
+                                              idx_ins->dest.name)) {
+              read_elsewhere = 1;
+              break;
+            }
+          }
+          if (!read_elsewhere) {
+            ir_instruction_make_nop(idx_ins);
+          }
+        }
+      }
+
       /* Preheader, inserted at the header label: declarations, the scaled
        * offset when the hoisted half is a runtime symbol, then one add per
        * row. Build each instruction with owned storage; insertion copies. */

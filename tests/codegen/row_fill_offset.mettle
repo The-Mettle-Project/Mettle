@@ -1,0 +1,88 @@
+import "std/mem";
+
+var HD: int64 = 0;
+var NH: int64 = 0;
+
+@noinline fn opaque(n: int64) -> int64 { return n; }
+
+fn zero_rows(a: float32*) {
+  var h: int64 = 0;
+  while (h < NH) {
+    var ob: int64 = h * HD;
+    var i: int64 = 0;
+    while (i < HD) { a[ob + i] = 0.0; i = i + 1; }
+    h = h + 1;
+  }
+}
+
+fn set_rows(a: int32*, v: int32) {
+  var h: int64 = 0;
+  while (h < NH) {
+    var ob: int64 = h * HD;
+    var i: int64 = 0;
+    while (i < HD) { a[ob + i] = v; i = i + 1; }
+    h = h + 1;
+  }
+}
+
+fn accumulate_rows(a: float32*, src: float32*) {
+  var h: int64 = 0;
+  while (h < NH) {
+    var ob: int64 = h * HD;
+    var i: int64 = 0;
+    while (i < HD) { a[ob + i] = 0.0; i = i + 1; }
+    i = 0;
+    while (i < HD) { a[ob + i] = a[ob + i] + src[i]; i = i + 1; }
+    h = h + 1;
+  }
+}
+
+fn main() -> int32 {
+  HD = opaque(8);
+  NH = opaque(4);
+  var n: int64 = NH * HD;
+
+  var a: float32* = (float32*)malloc(n * 4);
+  var src: float32* = (float32*)malloc(HD * 4);
+  var b: int32* = (int32*)malloc(n * 4);
+  if (a == 0 || src == 0 || b == 0) { return 1; }
+
+  var k: int64 = 0;
+  while (k < HD) { src[k] = (float32)(k + 1); k = k + 1; }
+
+  k = 0;
+  while (k < n) { a[k] = 999.0; k = k + 1; }
+  zero_rows(a);
+  k = 0;
+  while (k < n) {
+    if (a[k] != 0.0) { return 2; }
+    k = k + 1;
+  }
+
+  k = 0;
+  while (k < n) { b[k] = 0 - 1; k = k + 1; }
+  set_rows(b, 7);
+  k = 0;
+  while (k < n) {
+    if (b[k] != 7) { return 3; }
+    k = k + 1;
+  }
+
+  k = 0;
+  while (k < n) { a[k] = 999.0; k = k + 1; }
+  accumulate_rows(a, src);
+  var h: int64 = 0;
+  while (h < NH) {
+    var i: int64 = 0;
+    while (i < HD) {
+      if (a[h * HD + i] != (float32)(i + 1)) { return 4; }
+      i = i + 1;
+    }
+    h = h + 1;
+  }
+
+  free(a);
+  free(src);
+  free(b);
+  return 0;
+}

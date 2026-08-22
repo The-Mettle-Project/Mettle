@@ -407,6 +407,17 @@ static int ir_fill_try_indexed(IRFunction *function, size_t header_index,
     return FILL_NO_MATCH;
   }
 
+  /* An index add the address chain never reads is not this loop's offset.
+   * hoist_row_pointers folds the invariant half into a row pointer and leaves
+   * the original `offset + iv` behind with no consumer; charging its offset
+   * here would displace the base a second time. */
+  if (idx_add) {
+    const IROperand *consumer = shl ? &shl->lhs : &addr->rhs;
+    if (!ir_operand_is_temp_named(consumer, idx_add->dest.name)) {
+      return FILL_NO_MATCH;
+    }
+  }
+
   /* Validate the offset half of `offset + iv` when present. */
   const IROperand *offset_op = NULL;
   const IRInstruction *offset_producer = NULL;
