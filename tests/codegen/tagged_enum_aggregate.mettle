@@ -15,6 +15,11 @@ enum Val {
 
 struct Holder { tag: int32; v: Val; other: int32; }
 
+/* A tagged enum at global scope: the aggregate path in the global emitter
+ * listed struct and array only, so this was refused outright. */
+var stored: Val;
+var stored_list: Val[2];
+
 @noinline fn as_int(v: Val) -> int64 {
   match (v) {
     case I(n): { return n; }
@@ -80,5 +85,12 @@ fn main() -> int32 {
   hs[1].v = P(pt);
   if (as_int(hs[0].v) != 7) { return 16; }
   if (as_int(hs[1].v) != 12) { return 17; }
+  stored = I(55);
+  if (as_int(stored) != 55) { return 18; }
+  stored = P(pt);
+  if (as_int(stored) != 12) { return 19; }
+  stored_list[1] = S("g");
+  if (as_int(stored_list[1]) != 100) { return 20; }
+  if (as_int(stored_list[0]) != 0) { return 21; }
   return 0;
 }

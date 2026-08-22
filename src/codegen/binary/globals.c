@@ -461,16 +461,18 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
         generator, link_name, sym->has_initializer ? sym->init_string : NULL);
   }
 
-  /* Aggregates: a global struct or array either carries a folded initializer
-   * image (`var t: int32[4] = [1, 2, 3, 4];`, and every global aggregate
+  /* Aggregates: a global struct, array or tagged enum either carries a folded
+   * initializer image (`var t: int32[4] = [1, 2, 3, 4];`, and every aggregate
    * `const`) or is plain zero-filled storage of its laid-out size. The image
    * goes to .data with its relocations; the zero case stays in .bss, where it
    * costs nothing in the object file. An all-zero image counts as the zero
    * case: since an uninitialized aggregate starts zeroed, `var wm: Fact[100];`
    * arrives here carrying five kilobytes of nothing. Handled ahead of the
    * scalar path, whose type check is shared with ABI decisions and must keep
-   * rejecting them. */
-  if (type->kind == MTLC_TYPE_STRUCT || type->kind == MTLC_TYPE_ARRAY) {
+   * rejecting them -- a tagged enum reaching it was refused outright, so a
+   * program could not declare one at global scope at all. */
+  if (type->kind == MTLC_TYPE_STRUCT || type->kind == MTLC_TYPE_ARRAY ||
+      type->kind == MTLC_TYPE_TAGGED_ENUM) {
     size_t aggregate_size = type->size;
     size_t aggregate_alignment = type->alignment ? type->alignment : 8;
     size_t aggregate_section = 0;
