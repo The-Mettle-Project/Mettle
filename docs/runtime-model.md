@@ -1,193 +1,210 @@
-# Owned Runtime Model
+# Runtime model
 
-Every native Mettle product uses a runtime that this project owns. It does not
-link libc, a C startup package, a compiler support library, pthread, musl, UCRT,
-MSVCRT, or a C++ runtime.
+What an emitted Mettle program assumes of the operating system, and what it
+carries with it.
 
-Mettle still has no garbage collector, async scheduler, thread pool, or hidden
-background service. The required runtime is small, but it is real. It owns the
-startup path and each basic service that generated code and libmtlc need.
+Every native product uses a runtime this project owns. Nothing links libc, a C
+startup package, a compiler support library, pthread, musl, UCRT, MSVCRT, or a
+C++ runtime.
 
-## Required runtime
+There is still no garbage collector, no async scheduler, no thread pool, and no
+background service. The runtime is small and it is real: it owns the startup
+path and each basic service that generated code needs.
 
-| Service | Windows x86_64 | Linux x86_64 and AArch64 |
-|---|---|---|
+## What the runtime provides
+
+| Service | Windows x86-64 | Linux x86-64 and AArch64 |
+|---------|----------------|--------------------------|
 | Entry | `mettle_start` | `_start` |
 | Arguments | `GetCommandLineA` parser | Initial process stack |
 | Exit | `ExitProcess` | `exit` system call |
 | Heap | Process heap APIs | Anonymous memory maps |
 | Files and console | Kernel32 file APIs | File system calls |
-| Threads | Kernel32 thread and wait APIs | `clone` and `futex` system calls |
-| Thread local state | Fiber local storage | Owned TLS image and thread pointer setup |
-| Sockets | Winsock when requested | Socket system calls |
+| Threads | Kernel32 thread and wait APIs | `clone` and `futex` |
+| Thread-local state | Fiber local storage | Owned TLS image and thread pointer |
+| Sockets | Winsock, when asked for | Socket system calls |
 | Clocks | Kernel32 clocks | Clock system calls |
-| Process launch | `CreateProcessA` | `fork`, `execve`, and `wait4` system calls |
+| Process launch | `CreateProcessA` | `fork`, `execve`, `wait4` |
 
-The source lives in `src/runtime/freestanding.c`. It does not include a standard
-C header. It compiles with freestanding flags and has no unresolved symbol on
-Linux. Its Windows object refers only to OS imports.
+The source is `src/runtime/freestanding.c`. It includes no standard C header,
+compiles with freestanding flags, and has no unresolved symbol on Linux. Its
+Windows object refers only to OS imports.
 
-The runtime exports familiar ABI names such as `malloc`, `calloc`, `memcpy`,
-`puts`, `strtod`, `clock_gettime`, and `pthread_create`. Those names do not mean
-that a host C library supplies them. Mettle supplies them. The POSIX thread
-names exist only as a source compatibility layer over the owned clone and futex
-code.
+It exports familiar ABI names: `malloc`, `calloc`, `memcpy`, `puts`, `strtod`,
+`clock_gettime`, `pthread_create`. Mettle supplies all of them. The pthread
+names are a source-compatibility layer over the owned clone and futex code.
 
-## Startup objects
+## Startup
 
-`src/codegen/binary/startup.c` writes the target startup object. It supports the
-Windows x86_64 COFF ABI, the Linux x86_64 ELF ABI, and the Linux AArch64 ELF ABI.
-The startup code initializes the owned runtime, passes arguments to `main`, runs
-optional diagnostic hooks, and exits through the OS.
+`src/codegen/binary/startup.c` writes the startup object for the target. It
+covers the Windows x86-64 COFF ABI, the Linux x86-64 ELF ABI, and the Linux
+AArch64 ELF ABI. The startup code initializes the runtime, passes arguments to
+`main`, runs any diagnostic hooks, and exits through the OS.
 
-`src/runtime/host_startup.c` provides the same entry contract for the reference
-compiler and for C programs that embed libmtlc.
+`src/runtime/host_startup.c` gives the same entry contract to the reference
+compiler and to C programs embedding libmtlc.
 
-## Optional owned code
+## Optional objects
 
-The linker adds these objects only when a program asks for their feature:
+The linker adds these only when the program asks for the feature:
 
-* `crash_handler.o` prints source locations and stack frames.
-* `profile.o` records and prints the runtime profile.
-* `debug.o` implements interactive debug hooks on Windows.
-* `tracy_helpers.o` supplies the local no op Tracy ABI when external Tracy is
-  not in use.
+| Object | Provides |
+|--------|----------|
+| `crash_handler.o` | Source locations and stack frames on a fault |
+| `profile.o` | The runtime profile |
+| `debug.o` | Interactive debug hooks on Windows |
+| `swap.o` | Code swapping |
+| `tracy_helpers.o` | A local no-op Tracy ABI |
 
-These objects use the same owned ABI. They do not add a host runtime.
+They use the same owned ABI and add no host runtime.
 
-External Tracy needs a C++ runtime, so `--tracy` fails in owned runtime mode.
-Use `--profile-runtime` for the built in profiler.
+External Tracy needs a C++ runtime, so `--tracy` fails under the owned runtime
+rule. `--profile-runtime` is the built-in alternative.
 
 ## Link rules
 
 Windows uses the internal PE linker by default. The GCC fallback passes
 `-nostdlib`, `-nostartfiles`, and `-nodefaultlibs`, selects `mettle_start`, and
-links only requested OS libraries.
+links only the OS libraries asked for.
 
-Linux uses `ld` directly when it can. Its GCC fallback uses GCC only as a linker
-driver and passes the same three no runtime switches. Every Linux executable is
-a static `ET_EXEC` image. `--static` remains as a compatible no op. `--musl`
-fails because linking musl would break the owned runtime rule.
+Linux uses `ld` directly when it can, and uses GCC purely as a link driver with
+the same three switches otherwise. Every Linux executable is a static
+`ET_EXEC`. `--static` is accepted and does nothing, since that is already true.
+`--musl` fails, because linking musl would break the rule.
 
-## Hard checks
+[Linker and build pipelines](linker-build-pipelines.md) has the full matrix.
 
-Mettle audits each executable before it reports success.
+## The checks
 
-For PE32+ it reads normal and delayed import tables and rejects names for UCRT,
-MSVCRT, VCRuntime, the Microsoft C++ library, libgcc, libstdc++, and
+The compiler audits each executable before reporting success.
+
+For PE32+ it reads the normal and delayed import tables and rejects names from
+UCRT, MSVCRT, VCRuntime, the Microsoft C++ library, libgcc, libstdc++, and
 libwinpthread.
 
-For ELF64 it requires `ET_EXEC` and rejects `PT_INTERP` and `PT_DYNAMIC`.
+For ELF64 it requires `ET_EXEC` and rejects `PT_INTERP` and `PT_DYNAMIC`. That
+is why no shared library ever links on Linux.
 
-The driver also rejects link arguments that name a C, compiler, or thread
-runtime. Build scripts audit the compiler itself. The libmtlc build combines the
-whole archive and checks its final external symbol set.
+The driver also rejects a link argument naming a C, compiler, or thread
+runtime. The build scripts audit the compiler itself, and the libmtlc build
+combines the whole archive and checks its final external symbol set.
 
-## Target rule
+## Adding a target
 
-A new native target is not complete until it has all four parts:
+A native target is finished when it has four things:
 
 1. An owned entry object.
-2. An owned service layer for every ABI symbol that code generation can emit.
-3. A link path with all default startup and libraries disabled.
+2. An owned service layer for every ABI symbol code generation can emit.
+3. A link path with all default startup files and libraries disabled.
 4. A format check that rejects hidden runtime dependencies.
 
-This rule applies to the reference compiler, libmtlc embedders, generated
-programs, optional diagnostics, and both internal and external linker paths.
+This holds for the reference compiler, for libmtlc embedders, for generated
+programs, for the optional diagnostics, and for both linker paths.
 
-## Excision is gated, not claimed
+## Excision is gated
 
-Every optional runtime component is absent from a binary that did not ask for
-it, and the absence is checked on every build rather than asserted:
+Every optional component is absent from a binary that did not ask for it, and
+the absence is checked on every build.
 
 | Component | Present only with |
-|---|---|
+|-----------|-------------------|
 | Safety runtime | `--safe` |
-| Crash handler and backtrace | `-s` / `--stack-trace` |
+| Crash handler and backtrace | `-s`, `--stack-trace` |
 | Runtime profiler | `--profile-runtime` |
 | Debug hook server | `--debug-hooks` |
 
-The `runtime_components_excisable` case builds `tests/runtime_excision_probe.mettle`
-twice per component and searches the emitted binary for a string only that
-component contains. Absent without the flag, present with it.
+The `runtime_components_excisable` test builds
+`tests/runtime_excision_probe.mettle` twice per component and searches the
+binary for a string only that component contains. Absent without the flag,
+present with it.
 
-The second direction is the point. An absence check on its own passes when the
-marker never appears at all, which would make the gate a decoration; requiring
-the same marker to appear when the feature *is* requested is what gives the
-absence meaning. The size difference is the same story in another form: the
-probe links at 67 KB plain and 141 KB under `--safe`.
+The second direction is the point. An absence check alone passes when the
+marker never appears at all, which makes the gate a decoration. Requiring the
+marker to appear when the feature is requested is what gives the absence
+meaning. The sizes tell the same story: the probe links at 67 KB plain and
+141 KB under `--safe`.
 
-This is the property that has to hold before the runtime grows. What is
-excisable is optional; what is optional is a feature; what is mandatory is a
-tax. A component that cannot be left out has stopped being optional, and this
-gate is what would notice.
+A component that cannot be left out has stopped being optional, and this gate
+is what would notice.
 
 ## Code swapping
 
-A function can be replaced in a running process. The compiler's part is a
-boundary and a point; the runtime's part is a staged store.
+A function can be replaced in a running process. The compiler contributes a
+boundary and a point; the runtime contributes a staged store.
 
 ```mettle
 extern fn mettle_swap_stage(slot: rawptr, replacement: rawptr) -> int32;
 
-fn policy_v1(n: int32) -> int32 { return n + 1; }
-fn policy_v2(n: int32) -> int32 { return n * 10; }
+@swappable fn policy_v1(n: int32) -> int32 { return n + 1; }
+@swappable fn policy_v2(n: int32) -> int32 { return n * 10; }
 
 var policy: fn(int32) -> int32 = &policy_v1;
 
 fn main() -> int32 {
-    policy(5);                                  // 6
-    mettle_swap_stage(&policy, &policy_v2);
-    policy(5);                                  // still 6: staged, not applied
-    quiesce;
-    policy(5);                                  // 50
-    return 0;
+  println("{policy(5)}");
+  mettle_swap_stage(&policy, &policy_v2);
+  println("{policy(5)}");
+  quiesce;
+  println("{policy(5)}");
+  return 0;
 }
 ```
 
-**Staging is not applying.** `mettle_swap_stage` records an intent. The call
-right after it still runs the old function. Only `quiesce;` applies staged
-swaps, so a replacement can never land halfway through an operation the
+```text
+6
+6
+50
+```
+
+Staging is separate from applying. `mettle_swap_stage` records an intent, and
+the call right after it still runs the old function. Only `quiesce;` applies
+staged swaps, so a replacement cannot land halfway through an operation the
 programmer treated as one. Nothing is applied on a timer, at a safepoint the
-compiler chose, or inside the staging call.
+compiler picked, or inside the staging call.
 
-**The binding is a slot, not a patched instruction.** Applying a swap is one
-pointer-sized store. Nothing writes to executable memory, the process never
-needs W^X toggled, and a thread already inside the old body finishes there
-because that body is still resident. Rewriting instructions in place would
-need every other thread halted first, and stopping the world is exactly the
-unauthored control flow the runtime rules forbid.
+The binding is a slot. Applying a swap is one pointer-sized store. Nothing
+writes to executable memory, the process never toggles W^X, and a thread
+already inside the old body finishes there, because that body is still
+resident. Rewriting instructions in place would mean halting every other
+thread first, and stopping the world is the unauthored control flow these
+rules exist to forbid.
 
-**`@swappable` keeps the boundary.** A swap redirects a call, so the call has
-to survive. The decorator implies `@noinline`, and `@swappable` with
+`@swappable` keeps the call site. A swap redirects a call, so the call has to
+survive, and the decorator implies `@noinline`. `@swappable` together with
 `@inline` is refused: an inlined body has no call to redirect and no single
 place to name.
 
-**It is opt-in and provable.** A program with no `quiesce;` never references
+It is opt-in and provable. A program with no `quiesce;` never references
 `mettle_swap_` and never links `swap.o`, which the excision gate checks on
-every build. The cost of swappability is paid where it is asked for.
+every build.
 
 The staging table is fixed-size and allocates nothing, so a swap cannot fail
 for want of memory at the moment a program is trying to replace the code that
 was going wrong. Restaging a slot replaces the earlier intent.
 
-## The runtime is being written in Mettle
+## The runtime is moving to Mettle
 
 A runtime you cannot inspect is indistinguishable from a runtime that is
-lying. The rule is that it reads as source, steps in the same debugger and
+lying. The rule is that it reads as source, steps in the same debugger, and
 appears in the same profiler, which a component written in C does not do for a
 Mettle programmer.
 
-The swap runtime is the first component to comply. `src/runtime/swap.mettle`
-is compiled by the compiler this build produces, after that compiler is
-linked, and staged into `bin/runtime/` beside its source. It is ordinary
-Mettle code, so `-d`, `--debug-hooks` and `--profile-runtime` reach it the
-same way they reach a program. It is also smaller than the C it replaced.
+The swap runtime complies first. `src/runtime/swap.mettle` is compiled by the
+compiler this build produces, after that compiler is linked, and staged into
+`bin/runtime/` beside its source. It is ordinary Mettle code, so `-d`,
+`--debug-hooks`, and `--profile-runtime` reach it as they reach a program. It
+is also smaller than the C it replaced.
 
-The newest component leads rather than being exempt: a rule that applies only
-to future work is a rule nobody has tested. The remaining five
-(`crash_handler`, `profile`, `safety`, `debug`, `freestanding`) each call an
+The newest component leads rather than being exempt, because a rule that
+applies only to future work is a rule nobody has tested. The remaining five,
+`crash_handler`, `profile`, `safety`, `debug`, and `freestanding`, each call an
 operating system directly, so porting them needs Mettle bindings for page
-mapping, exception handling and process control first. `swap` was the honest
-place to start because it touches none of that: a fixed table and
-pointer-sized stores.
+mapping, exception handling, and process control first. `swap` was the honest
+place to start: a fixed table and pointer-sized stores, and no OS surface at
+all.
+
+## See also
+
+- [Linker and build pipelines](linker-build-pipelines.md)
+- [C interoperability](c-interop.md)
+- [Heap allocation](heap-allocation.md)

@@ -1,79 +1,77 @@
-# Native ABI Interoperability
+# C interoperability
 
-Mettle can call symbols that follow the target native ABI and can access native
-globals. This does not permit a C runtime. Use `std/win32`, `std/thread`, and
-`std/net` for common OS APIs.
+Mettle calls symbols that follow the target's native ABI, and C calls back
+into Mettle. This page covers the declarations, the types that cross the
+boundary, the struct rules, and linking.
 
-## Calling Native Functions
+There is no C runtime underneath. A Mettle program's `malloc` and `puts` come
+from Mettle's own runtime, and a link argument naming a C or compiler runtime
+fails. Reach the operating system through `std/win32`, `std/thread`, and
+`std/net`.
 
-Declare native functions with `extern fn`. Use the `= "symbol"` suffix when the
-link name differs. Parameters and return types must match the target ABI.
-Windows x86_64 uses the Microsoft ABI. Linux x86_64 uses System V. Linux
-AArch64 uses AAPCS64.
+## Calling out
+
+Declare the function with `extern fn`. Add `= "symbol"` when the link name
+differs from the Mettle name.
 
 ```mettle
 extern fn puts(msg: cstring) -> int32 = "puts";
 extern fn malloc(size: int64) -> rawptr = "malloc";
-
-fn main() -> int32 {
-  puts("Hello");
-  var p: int32* = malloc(100);
-  return 0;
-}
 ```
-
-The example names come from Mettle's owned runtime. They do not resolve to
-libc. Link arguments that name a C or compiler runtime fail.
-
-## Native Win32
-
-For Win32 APIs, import `std/win32` instead of repeating raw extern declarations:
 
 ```mettle
-import "std/win32";
+puts("Hello");
+var p: int32* = malloc(100);
+```
 
-fn main() -> int32 {
-  win32_write_stdout("hello\n", 6);
-  win32_sleep_ms(10);
-  return 0;
+Parameter and return types must match what the other side declares. The
+convention comes from the target: the Microsoft ABI on Windows x86-64, System
+V on Linux x86-64, AAPCS64 on Linux AArch64.
+
+## Calling in
+
+Mark a Mettle function `export` and C can call it by name:
+
+```mettle
+export fn add_two(a: int32, b: int32) -> int32 {
+  return a + b;
 }
 ```
 
-With the internal linker, common Windows DLLs are probed directly:
-
-```bash
-mettle --build main.mettle -o main.exe
+```c
+extern int32_t add_two(int32_t a, int32_t b);
 ```
 
-The default native import set includes `kernel32`, `user32`, `gdi32`,
-`advapi32`, and `ws2_32`. It excludes UCRT and MSVCRT. If you call another OS
-or vendor DLL, pass it with `--link-arg -lname` or an import library path.
+Calls between two Mettle functions use Mettle's own convention. Both sides
+agree, so it makes no difference to a Mettle program, and it is why the
+platform rule is applied to the functions reachable from outside: `extern`
+callees, `export`ed functions, and `main`.
 
 ## cstring and rawptr
 
-`cstring` is an alias for `uint8*`: a pointer to bytes a C function reads up to
-a NUL. Use it for C `char*`. `cstring` and `uint8*` are interchangeable.
+`cstring` is `uint8*`: a pointer to bytes that a C function reads up to a nul.
+Use it for C's `char*`. `cstring` and `uint8*` are interchangeable.
 
 `rawptr` is an address with no element type, C's `void*`, and what an
 allocator hands out. It converts to and from every pointer type in both
-directions, so `var p: int32* = malloc(n);` and `free(p)` both need no cast.
-It cannot be indexed, dereferenced, or offset, because it names no element.
+directions, so `var p: int32* = malloc(n);` and `free(p)` need no cast. It
+cannot be indexed, dereferenced, or offset, because it names no element.
 
-### Passing a Mettle string to C
+## Passing a string to C
 
-A `string` is a pointer and a length with **no terminator**. NUL-termination is
-a property of this boundary, not of the type.
+A [`string`](types.md) is a pointer and a length, with no terminator.
+Termination is a property of this boundary.
 
-A string *literal* is already terminated in rodata, so it flows straight into a
-`cstring` parameter and allocates nothing:
+A string literal is already terminated in read-only memory, so it flows
+straight into a `cstring` parameter and allocates nothing:
 
 ```mettle
 var fp: cstring = fopen("data.txt", "rb");
 ```
 
-Anything built at run time needs a terminated copy, and `cstr` from `std/io` is
-where that copy happens. It takes the allocator it comes from, so the cost is
-in the signature rather than in the punctuation at the call:
+Anything built at run time needs a terminated copy. `cstr` from
+[`std/io`](standard-library.md) makes one, and it takes the allocator to make
+it from, so the cost sits in the signature:
 
 ```mettle
 var path: cstring = cstr(name, &malloc);
@@ -81,31 +79,16 @@ defer free(path);
 var fp: cstring = fopen(path, "rb");
 ```
 
-`cstr` returns 0 when the allocator does. For a C function that takes a pointer
-and a length rather than a terminated string, pass `s.chars` and `s.length`
-directly, no copy is needed.
+`cstr` returns 0 when the allocator does.
 
-## Passing Structs to C
+For a C function that takes a pointer and a length, pass `s.chars` and
+`s.length` and copy nothing.
 
-Structs are laid out in declaration order. For C interop, define the struct to match the C layout exactly. Field order, types, and alignment must be compatible. Padding between fields follows the target ABI.
+## Structs by value
 
-On Windows, Mettle follows the Microsoft x64 aggregate rule for struct-by-value calls:
-
-- structs sized exactly 1, 2, 4, or 8 bytes pass and return directly in one integer register
-- all other aggregate sizes pass indirectly by pointer
-- indirect returns use a hidden first argument in RCX, and the callee returns that pointer in RAX
-
-On Linux, Mettle follows the System V AMD64 rule instead. System V cuts the struct into 8-byte chunks and gives each one a class:
-
-- 16 bytes or less passes in registers, one per eightbyte: a general register for an eightbyte holding any integer or pointer field, an XMM register for one holding only floats. A `{int64, double}` therefore arrives as one of each, and a `{double, double}` as two XMMs
-- anything larger is MEMORY: the caller copies the bytes into the outgoing stack area by value, rather than passing a pointer
-- a struct of 16 bytes or less is *returned* the same way, in RAX/RDX or XMM0/XMM1, so no hidden pointer is involved
-
-Both rules are covered for Mettle calling C functions that take or return structs by value, including `--emit-obj` builds linked with Mettle's internal linker. C calling exported Mettle functions with struct-by-value arguments or returns is not yet supported: that needs the same classification on the callee side.
-
-Calls between two Mettle functions use Mettle's own convention rather than the platform ABI. Both sides agree, so it makes no difference to a Mettle program, and it is why the platform rule is applied to `extern` callees specifically.
-
-When a C API expects a pointer to a struct, pass `&my_struct` or a `T*` variable.
+Define the struct to match the C layout: same field order, same types. Fields
+are laid out in declaration order, each on its own alignment, with the whole
+struct padded to its widest member.
 
 ```mettle
 struct SockAddrIn {
@@ -116,24 +99,71 @@ struct SockAddrIn {
 }
 ```
 
-## Linking
+On Windows, Mettle follows the Microsoft x64 aggregate rule:
 
-On Windows, the recommended path is to let Mettle do the assemble/link step for you:
+- A struct of exactly 1, 2, 4, or 8 bytes passes and returns in one integer
+  register.
+- Every other size passes indirectly, by pointer.
+- An indirect return uses a hidden first argument in RCX, and the callee
+  returns that pointer in RAX.
+
+On Linux, Mettle follows System V, which cuts the struct into eight-byte
+chunks and classifies each:
+
+- 16 bytes or less passes in registers, one per eightbyte. A chunk holding
+  integers or pointers takes a general register; a chunk holding only floats
+  takes an XMM. So `{int64, double}` arrives as one of each, and
+  `{double, double}` as two XMMs.
+- Anything larger is MEMORY: the caller copies the bytes into the outgoing
+  stack area.
+- A struct of 16 bytes or less returns the same way, in RAX and RDX or XMM0
+  and XMM1, with no hidden pointer.
+
+Both rules work in both directions: Mettle calling a C function that takes or
+returns a struct by value, and C calling an exported Mettle function that
+does.
+
+When the C API wants a pointer to a struct, pass `&my_struct` or a `T*`.
+
+## Win32
+
+Import [`std/win32`](standard-library.md) rather than repeating raw `extern`
+declarations:
+
+```mettle
+import "std/win32";
+```
+
+```mettle
+win32_write_stdout("hello\n", 6);
+win32_sleep_ms(10);
+```
+
+The internal linker probes the common Windows DLLs directly, so an ordinary
+build needs no import libraries:
 
 ```bash
 mettle --build main.mettle -o main.exe
 ```
 
-The internal linker resolves common Win32 APIs and owned runtime symbols. Use
-`--link-arg -lcustomdll` or an import library path for an extra DLL. Raw COFF
-objects can also be passed through `--link-arg`. The final PE import audit still
-runs after those additions.
+The default import set is `kernel32`, `user32`, `gdi32`, `advapi32`, and
+`ws2_32`. UCRT and MSVCRT are excluded. For another DLL, pass
+`--link-arg -lname` or an import library path. Raw COFF objects go through
+`--link-arg` too, and the PE import audit still runs afterwards.
 
-For Windows builds, prefer the internal linker path above. It is the path covered by current struct ABI and Win32 interop tests.
+## Linux
 
-## Linux Networking
+A Linux build is freestanding: no libc on the link line, and no shared library
+ever links, because the ELF writer refuses a `PT_INTERP`. Static archives work
+against the owned subset.
 
-Use `std/net` for portable Windows and Linux source. Older code can import
-`std/net_posix` on Linux. Its socket, error, atomic, and yield names all come
-from Mettle's owned syscall runtime. No helper C source or pthread link flag is
-needed.
+For sockets, `std/net` covers both platforms from one source. `std/net_posix`
+is the older Linux-only path. Its socket, error, atomic, and yield names come
+from Mettle's own syscall runtime, so no helper C source and no pthread flag
+is needed.
+
+## See also
+
+- [Runtime model](runtime-model.md)
+- [Linker and build pipelines](linker-build-pipelines.md)
+- [Types](types.md)
