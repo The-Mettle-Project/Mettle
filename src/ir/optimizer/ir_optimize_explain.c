@@ -501,10 +501,6 @@ int ir_explain_location_enabled(const SourceLocation *location) {
   return ir_explain_file_enabled(location->filename);
 }
 
-/* ---- color ---------------------------------------------------------------
- * Same policy as error_reporter.c (CLICOLOR_FORCE > NO_COLOR > TERM=dumb >
- * CLICOLOR=0 > stderr-is-a-tty), kept local because that helper is private. */
-
 static int ir_explain_use_color(void) { return diag_style_color(); }
 
 #define EXPLAIN_GREEN "\x1b[32m"
@@ -519,7 +515,6 @@ static const char *clr(const char *code) {
 
 static int ir_explain_use_unicode(void) { return diag_style_unicode(); }
 
-/* Tree-corner and arrow glyphs, with ASCII fallbacks. */
 static const char *glyph_elbow(void) { return diag_glyphs()->elbow; }
 static const char *glyph_arrow(void) { return diag_glyphs()->arrow; }
 

@@ -607,38 +607,14 @@ void error_reporter_add_warning_span_suggestion(ErrorReporter *reporter,
                             message, suggestion);
 }
 
-/* ---- rendering -----------------------------------------------------------
- * A diagnostic is drawn as a titled rule, the message, then a source table
- * framed by rules that cross the line-number gutter:
- *
- *   -- error[E0004] ------------------------------------------------
- *     Type mismatch: expected 'int64', found 'string'
- *
- *     ----+----------------------------------------------------------
- *         |  badtype.mettle:9:24
- *     ----+----------------------------------------------------------
- *       8 |  var s: string = "hello";
- *       9 |  var n: int64 = add(s, 2);
- *         :                     ^ parameter 'a' expects 'int64', ...
- *      10 |  println("{n}");
- *     ----+----------------------------------------------------------
- *
- *     help  drop the quotes: a numeric literal is 42, not "42"
- *
- * Notes attached to a diagnostic share the frame, each behind its own crossing
- * rule, so one error reads as one object rather than three stacked blocks. The
- * glyphs above are the ASCII fallback; a UTF-8 terminal gets box characters.
- */
 
 static char *snippet_truncate(const char *line);
 
 #define DIAG_MARGIN 2
 #define DIAG_TAB_WIDTH 4
 #define DIAG_GUTTER_MIN 3
-/* Room for the tab-expanded copy of a source line. */
 #define DIAG_LINE_BUFFER (SNIPPET_MAX_COLS * DIAG_TAB_WIDTH + 8)
 
-/* Append to a fixed buffer, saturating at its end rather than running off it. */
 static size_t diag_append(char *buf, size_t cap, size_t at, const char *fmt,
                           ...) {
   if (at + 1 >= cap) {
@@ -680,14 +656,12 @@ static const char *error_severity_text(ErrorSeverity severity) {
   }
 }
 
-/* Indent of the gutter's vertical bar, and the column source text starts in. */
 static void diag_gutter_lead(FILE *out, size_t gutter) {
   for (size_t i = 0; i < DIAG_MARGIN + gutter + 1; i++) {
     fputc(' ', out);
   }
 }
 
-/* "  12 |  <source>" */
 static void diag_row_source(FILE *out, size_t gutter, size_t line,
                             const char *text) {
   const DiagGlyphs *g = diag_glyphs();
@@ -697,7 +671,6 @@ static void diag_row_source(FILE *out, size_t gutter, size_t line,
   fputc('\n', out);
 }
 
-/* "     |  <text>" -- a caption row inside the frame. */
 static void diag_row_text(FILE *out, size_t gutter, const char *text) {
   const DiagGlyphs *g = diag_glyphs();
   diag_gutter_lead(out, gutter);
@@ -705,7 +678,6 @@ static void diag_row_text(FILE *out, size_t gutter, const char *text) {
           text ? text : "");
 }
 
-/* "     :        ^^^ label" -- the caret row under a source row. */
 static void diag_row_caret(FILE *out, size_t gutter, const char *caret,
                            const char *label, const char *sgr) {
   const DiagGlyphs *g = diag_glyphs();
@@ -719,13 +691,9 @@ static void diag_row_caret(FILE *out, size_t gutter, const char *caret,
 }
 
 static size_t error_report_max_line(const ErrorReport *e) {
-  /* The frame quotes one line of trailing context for a report with a
-     snippet. */
   return e->code_snippet ? e->location.line + 1 : e->location.line;
 }
 
-/* One report's rows inside the shared frame: an optional caption, the quoted
-   source with its neighbours, and the caret. */
 static void diag_render_section(ErrorReporter *reporter, const ErrorReport *e,
                                 size_t gutter, int with_context,
                                 const char *primary_file) {
@@ -733,7 +701,6 @@ static void diag_render_section(ErrorReporter *reporter, const ErrorReport *e,
   const char *sev_sgr = error_severity_sgr(e->severity);
   const char *filename = e->filename ? e->filename : reporter->filename;
 
-  /* A note names itself and, when it points somewhere else, says where. */
   if (e->severity == DIAG_SEVERITY_NOTE ||
       e->severity == DIAG_SEVERITY_NOTE_OF) {
     char caption[1024];
@@ -797,8 +764,6 @@ static void diag_render_section(ErrorReporter *reporter, const ErrorReport *e,
              caret_column - 1 + caret_len > SNIPPET_MAX_COLS) {
     caret_len = SNIPPET_MAX_COLS - (caret_column - 1);
   }
-  /* Point at the character the reader sees, not the byte offset: a line
-     indented with tabs puts them a tab stop apart on screen. */
   caret_column = diag_expanded_column(snippet ? snippet : "", caret_column,
                                       DIAG_TAB_WIDTH);
 
@@ -818,7 +783,6 @@ static void diag_render_section(ErrorReporter *reporter, const ErrorReport *e,
   free(next);
 }
 
-/* Draw one diagnostic and the notes that belong to it as a single frame. */
 static void diag_render_group(ErrorReporter *reporter, const ErrorReport *e,
                               const ErrorReport *const *notes,
                               size_t note_count) {
@@ -828,8 +792,6 @@ static void diag_render_group(ErrorReporter *reporter, const ErrorReport *e,
   const char *reset = diag_sgr_reset();
   const char *filename = e->filename ? e->filename : reporter->filename;
 
-  /* The rule names the place. Keeping it file:line:col makes it the one line
-     a terminal or an editor can turn into a jump. */
   char where[1024];
   if (filename) {
     snprintf(where, sizeof(where), "%s%s%s%s:%zu:%zu%s", diag_sgr_bold(),
@@ -841,9 +803,6 @@ static void diag_render_group(ErrorReporter *reporter, const ErrorReport *e,
   }
   diag_rule(out, 0, where, "");
 
-  /* "error[E0004]: message", hanging-indented so a long message stays in a
-     block instead of running back to column zero. The first line is intact:
-     this is the line tooling greps for. */
   char lead[128];
   size_t lead_width;
   if (e->severity == DIAG_SEVERITY_NOTE ||
@@ -860,7 +819,6 @@ static void diag_render_group(ErrorReporter *reporter, const ErrorReport *e,
   }
   diag_wrap(out, lead, lead_width, e->message ? e->message : "", NULL);
 
-  /* Widest line number anywhere in the frame sets the gutter. */
   size_t max_line = error_report_max_line(e);
   for (size_t i = 0; i < note_count; i++) {
     size_t candidate = error_report_max_line(notes[i]);
@@ -991,9 +949,6 @@ static char *snippet_truncate(const char *line) {
   return buf;
 }
 
-/* Draw a single report on its own. The comptime interpreter reports one
-   diagnostic at a time as it runs, so it needs this entry point rather than
-   the whole-reporter drain above. */
 void error_reporter_print_error(ErrorReporter *reporter,
                                 const ErrorReport *error) {
   if (!reporter || !error)

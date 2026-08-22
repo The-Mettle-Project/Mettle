@@ -26,8 +26,6 @@
 #define DIAG_COLUMNS_MAX 110u
 #define DIAG_COLUMNS_FALLBACK 90u
 
-/* ---- capability probes --------------------------------------------------- */
-
 #ifdef _WIN32
 static void diag_enable_vt(void) {
   static int done = 0;
@@ -96,11 +94,6 @@ int diag_style_color(void) {
   return cached;
 }
 
-/* Glyphs only when the target provably renders UTF-8: a console whose output
-   codepage is UTF-8 on Windows, a UTF-8 locale on POSIX. Redirected output
-   never qualifies, because we cannot know what will decode it -- PowerShell
-   5.1 reads a redirected stderr through the console codepage, which turns the
-   box characters into mojibake in every captured build log. */
 int diag_style_unicode(void) {
   static int cached = -1;
   if (cached >= 0) {
@@ -189,8 +182,7 @@ size_t diag_style_columns(void) {
   if (!detected) {
     detected = DIAG_COLUMNS_FALLBACK;
   }
-  /* One column short of the true width: a rule that fills the last cell wraps
-     on some terminals and leaves a blank line behind. */
+
   if (detected > 1) {
     detected--;
   }
@@ -203,8 +195,6 @@ size_t diag_style_columns(void) {
   cached = detected;
   return cached;
 }
-
-/* ---- palette ------------------------------------------------------------- */
 
 #define DIAG_SGR(name, seq)                                                    \
   const char *diag_sgr_##name(void) {                                          \
@@ -226,29 +216,25 @@ DIAG_SGR(note, "\x1b[1;36m")
 
 #undef DIAG_SGR
 
-/* ---- glyphs -------------------------------------------------------------- */
-
 static const DiagGlyphs g_unicode_glyphs = {
-    "\xE2\x94\x80", /* h         */
-    "\xE2\x94\x82", /* v         */
-    "\xC2\xB7",     /* dotted    */
-    "\xE2\x94\xAC", /* tee_down  */
-    "\xE2\x94\xBC", /* tee_cross */
-    "\xE2\x94\xB4", /* tee_up    */
-    "\xE2\x94\x94\xE2\x94\x80", /* elbow (two columns, like the ASCII one) */
-    "\xE2\x86\x92", /* arrow     */
-    "\xC2\xB7",     /* bullet    */
+    "\xE2\x94\x80",
+    "\xE2\x94\x82",
+    "\xC2\xB7",
+    "\xE2\x94\xAC",
+    "\xE2\x94\xBC",
+    "\xE2\x94\xB4",
+    "\xE2\x94\x94\xE2\x94\x80",
+    "\xE2\x86\x92",
+    "\xC2\xB7",
 };
 
 static const DiagGlyphs g_ascii_glyphs = {
-    "-", "|", ":", "-", "+", "-", "\\_", "->", "-",
+    "-", "|", ":", "+", "+", "+", "\\_", "->", "-",
 };
 
 const DiagGlyphs *diag_glyphs(void) {
   return diag_style_unicode() ? &g_unicode_glyphs : &g_ascii_glyphs;
 }
-
-/* ---- measuring ----------------------------------------------------------- */
 
 size_t diag_visible_width(const char *s) {
   if (!s) {
@@ -269,7 +255,7 @@ size_t diag_visible_width(const char *s) {
       }
       continue;
     }
-    /* Count a UTF-8 sequence once: continuation bytes carry no width. */
+
     if (((unsigned char)*s & 0xC0) != 0x80) {
       width++;
     }
@@ -286,11 +272,6 @@ void diag_repeat(FILE *out, const char *glyph, size_t n) {
     fputs(glyph, out);
   }
 }
-
-/* ---- rules ---------------------------------------------------------------
- * Rules and highlighted source are assembled into a buffer, because --explain
- * builds its whole report in memory before deciding where it goes. The stream
- * forms below are thin wrappers over the buffer forms. */
 
 typedef struct {
   char *buf;
@@ -349,8 +330,15 @@ size_t diag_rule_into(char *buf, size_t cap, size_t indent, const char *label,
   db_puts(&b, dim);
   db_repeat(&b, g->h, 2);
   drawn += 2;
+  if (!label || !label[0]) {
+    if (columns > drawn) {
+      db_repeat(&b, g->h, columns - drawn);
+    }
+    db_puts(&b, reset);
+    return b.len;
+  }
 
-  if (label && label[0]) {
+  {
     db_puts(&b, " ");
     drawn++;
     db_puts(&b, reset);
@@ -358,8 +346,7 @@ size_t diag_rule_into(char *buf, size_t cap, size_t indent, const char *label,
     db_puts(&b, label);
     db_puts(&b, reset);
     drawn += diag_visible_width(label);
-    /* A label wider than the terminal ends the rule rather than trailing a
-       lone space off the edge. */
+
     if (columns > drawn + 1) {
       db_puts(&b, dim);
       db_puts(&b, " ");
@@ -425,8 +412,6 @@ void diag_rule_junction(FILE *out, size_t indent, size_t gutter,
   fputc('\n', out);
 }
 
-/* ---- wrapping ------------------------------------------------------------ */
-
 void diag_wrap(FILE *out, const char *first_prefix, size_t first_width,
                const char *text, const char *text_sgr) {
   if (!out || !text) {
@@ -447,7 +432,7 @@ void diag_wrap(FILE *out, const char *first_prefix, size_t first_width,
   const char *p = text;
   int first = 1;
   while (*p) {
-    /* A newline in the message is honoured as a hard break. */
+
     const char *nl = strchr(p, '\n');
     const char *limit = nl ? nl : p + strlen(p);
 
@@ -456,7 +441,7 @@ void diag_wrap(FILE *out, const char *first_prefix, size_t first_width,
       size_t take = remaining;
       if (take > body) {
         take = body;
-        /* Back up to the last space so words stay whole. */
+
         size_t cut = take;
         while (cut > 0 && p[cut] != ' ') {
           cut--;
@@ -489,13 +474,6 @@ void diag_wrap(FILE *out, const char *first_prefix, size_t first_width,
     }
   }
 }
-
-/* ---- source highlighting -------------------------------------------------
- * A deliberately small lexer: it colours what a reader scans for (keywords,
- * types, literals, comments, attributes) and leaves everything else alone. It
- * does not share the frontend's lexer on purpose -- this module renders against
- * raw source text and knows nothing about any token stream, which is what lets
- * the backend's comptime interpreter report through the same reporter. */
 
 static const char *const g_control_keywords[] = {
     "fn",      "if",       "else",     "for",      "while",    "return",
@@ -544,7 +522,7 @@ size_t diag_source_into(char *buf, size_t cap, const char *text) {
   const char *p = text;
 
   while (*p) {
-    /* Comments run to end of line. */
+
     if (p[0] == '/' && (p[1] == '/' || p[1] == '*')) {
       db_puts(&b, diag_sgr_dim());
       db_puts(&b, p);
@@ -552,7 +530,6 @@ size_t diag_source_into(char *buf, size_t cap, const char *text) {
       return b.len;
     }
 
-    /* String and character literals. */
     if (*p == '"' || *p == '\'') {
       char quote = *p;
       const char *start = p++;
@@ -571,7 +548,6 @@ size_t diag_source_into(char *buf, size_t cap, const char *text) {
       continue;
     }
 
-    /* Attributes: @simd, @inline!, @noalloc. */
     if (*p == '@') {
       const char *start = p++;
       while (diag_ident_char(*p)) {
@@ -586,7 +562,6 @@ size_t diag_source_into(char *buf, size_t cap, const char *text) {
       continue;
     }
 
-    /* Numbers, including 0x / 0b / float / suffixes. */
     if (*p >= '0' && *p <= '9') {
       const char *start = p;
       while (diag_ident_char(*p) || (*p == '.' && p[1] >= '0' && p[1] <= '9')) {
@@ -598,7 +573,6 @@ size_t diag_source_into(char *buf, size_t cap, const char *text) {
       continue;
     }
 
-    /* Identifiers and keywords. */
     if (diag_ident_char(*p)) {
       const char *start = p;
       while (diag_ident_char(*p)) {
@@ -635,7 +609,7 @@ void diag_write_source(FILE *out, const char *text) {
     fputs(text, out);
     return;
   }
-  /* Worst case is one SGR pair around every character. */
+
   size_t cap = strlen(text) * 12 + 64;
   char *buf = malloc(cap);
   if (!buf) {
@@ -646,8 +620,6 @@ void diag_write_source(FILE *out, const char *text) {
   fputs(buf, out);
   free(buf);
 }
-
-/* ---- tabs ---------------------------------------------------------------- */
 
 size_t diag_expand_tabs(const char *in, char *out, size_t cap,
                         size_t tab_width) {
@@ -697,7 +669,7 @@ size_t diag_expanded_column(const char *in, size_t column, size_t tab_width) {
       display++;
     }
   }
-  /* Columns past the end of the line keep their raw offset. */
+
   display += (index + 1 < column) ? (column - 1 - index) : 0;
   return display + 1;
 }
