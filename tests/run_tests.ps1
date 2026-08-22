@@ -2142,6 +2142,8 @@ $cases = @(
   @{ Name = "diag_parser_no_cascade"; Path = "tests/diag_parser_no_cascade.mettle"; ShouldSucceed = $false
      Pattern = "Expected '\(' after 'if'"
      OutputMustNotMatch = @("Expected '\(', found identifier", "due to [4-9] previous") },
+  @{ Name = "diag_wide_column"; Path = "tests/diag_wide_column.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @("Expected an expression after '='") },
   @{ Name = "diag_dup_note"; Path = "tests/diag_dup_note.mettle"; ShouldSucceed = $false
      OutputMustMatch = @("Duplicate declaration of 'x'", "previous declaration of 'x' is here") },
   @{ Name = "diag_call_notes"; Path = "tests/diag_call_notes.mettle"; ShouldSucceed = $false

@@ -4,6 +4,7 @@
 #include "error_reporter.h"
 #include "../common.h"
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -896,14 +897,21 @@ void error_reporter_print_error(ErrorReporter *reporter,
             snippet ? snippet : "");
 
     size_t caret_len = (error->span.length > 0) ? error->span.length : 1;
-    /* Clamp caret so it doesn't extend past truncation point */
-    if (error->location.column > 0 &&
-        error->location.column - 1 + caret_len > SNIPPET_MAX_COLS) {
-      size_t remaining = SNIPPET_MAX_COLS - (error->location.column - 1);
-      caret_len = remaining > 0 ? remaining : 1;
+    size_t caret_column = error->location.column;
+    /* Clamp the caret to the snippet, which was truncated at SNIPPET_MAX_COLS.
+     * A column past that point used to underflow `SNIPPET_MAX_COLS - lead`
+     * into a length near SIZE_MAX, which wrapped the caret line's size back
+     * down to something small and left the leading-spaces loop writing past
+     * it. An error 149 columns into a long line was enough. */
+    if (caret_column > SNIPPET_MAX_COLS) {
+      caret_column = SNIPPET_MAX_COLS + 1;
+      caret_len = 1;
+    } else if (caret_column > 0 &&
+               caret_column - 1 + caret_len > SNIPPET_MAX_COLS) {
+      caret_len = SNIPPET_MAX_COLS - (caret_column - 1);
     }
     char *caret_line =
-        error_reporter_create_caret_line(error->location.column, caret_len);
+        error_reporter_create_caret_line(caret_column, caret_len);
     if (caret_line) {
       if (error->span_label) {
         fprintf(DIAG_STREAM, "%*s | %s%s %s%s\n", (int)gutter_width, "",
@@ -1003,7 +1011,15 @@ char *error_reporter_create_caret_line(size_t column, size_t length) {
   if (column == 0)
     return NULL;
 
-  size_t caret_length = (column - 1) + (length > 0 ? length : 1);
+  size_t lead = column - 1;
+  size_t marks = length > 0 ? length : 1;
+  /* A span reaching past the end of the address space is a bad span, not a
+   * caret line. Answering NULL beats wrapping the sum and allocating less
+   * than the loops below go on to write. */
+  if (marks > SIZE_MAX - lead - 1) {
+    return NULL;
+  }
+  size_t caret_length = lead + marks;
   char *caret_line = malloc(caret_length + 1);
   if (!caret_line)
     return NULL;

@@ -1,0 +1,8 @@
+// An error column past the snippet truncation width. Clamping the caret used
+// to underflow into a length near SIZE_MAX, which wrapped the caret line's
+// allocation small and left the leading-spaces loop writing past it.
+fn main() -> int32 {
+   var a: int32 = 1; // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   var b: int32 =                                                                                                                                @@@;
+   return 0;
+}
