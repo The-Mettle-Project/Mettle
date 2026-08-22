@@ -1,0 +1,119 @@
+struct S { a: int64; b: int64; c: int64; }
+struct Wide { a: int64; b: int64; c: int64; d: int64; e: int64; }
+struct Pair { lo: int32; hi: int32; }
+
+enum Val {
+  I(int64),
+  P(S),
+  T(string),
+  Nothing
+}
+
+@noinline fn take(s: S) -> int64 { return s.a + s.b + s.c; }
+
+@noinline fn deref_arg(p: S*) -> int64 { return take(*p); }
+
+@noinline fn deref_copy(p: S*) -> S { var v: S = *p; return v; }
+
+@noinline fn deref_return(p: S*) -> S { return *p; }
+
+@noinline fn deref_field(p: S*) -> int64 { return (*p).b; }
+
+@noinline fn wide_sum(w: Wide) -> int64 {
+  return w.a + w.b + w.c + w.d + w.e;
+}
+
+@noinline fn deref_wide(p: Wide*) -> int64 { return wide_sum(*p); }
+
+@noinline fn val_of(v: Val) -> int64 {
+  match (v) {
+    case I(n): { return n; }
+    case P(s): { return s.a + s.b + s.c; }
+    case T(t): { return 100; }
+    case Nothing: { return 0 - 1; }
+  }
+  return 0 - 2;
+}
+
+@noinline fn deref_enum(p: Val*) -> int64 { return val_of(*p); }
+
+@noinline fn deref_string(p: string*) -> string { return *p; }
+
+@noinline fn pair_sum(q: Pair) -> int64 {
+  return (int64)q.lo + (int64)q.hi;
+}
+
+@noinline fn deref_pair(p: Pair*) -> int64 { return pair_sum(*p); }
+
+@noinline fn opaque(x: int64) -> int64 { return x; }
+
+fn main() -> int32 {
+  var s: S;
+  s.a = 1; s.b = 2; s.c = 3;
+  var sp: S* = &s;
+
+  if (deref_arg(sp) != 6) { return 1; }
+  if (deref_field(sp) != 2) { return 2; }
+
+  var copied: S = deref_copy(sp);
+  if (copied.a != 1 || copied.b != 2 || copied.c != 3) { return 3; }
+
+  var returned: S = deref_return(sp);
+  if (returned.a != 1 || returned.b != 2 || returned.c != 3) { return 4; }
+
+  var inline_copy: S = *sp;
+  if (inline_copy.a != 1 || inline_copy.b != 2 || inline_copy.c != 3) {
+    return 5;
+  }
+
+  s.b = 20;
+  if (inline_copy.b != 2) { return 6; }
+  if (deref_arg(sp) != 24) { return 7; }
+  s.b = 2;
+
+  var w: Wide;
+  w.a = 1; w.b = 2; w.c = 3; w.d = 4; w.e = 5;
+  if (deref_wide(&w) != 15) { return 8; }
+
+  var q: Pair;
+  q.lo = 7; q.hi = 9;
+  if (deref_pair(&q) != 16) { return 9; }
+
+  var v: Val = P(s);
+  var vp: Val* = &v;
+  if (deref_enum(vp) != 6) { return 10; }
+
+  var pulled: Val = *vp;
+  if (val_of(pulled) != 6) { return 11; }
+
+  v = I(41);
+  if (deref_enum(vp) != 41) { return 12; }
+  v = T("named");
+  if (deref_enum(vp) != 100) { return 13; }
+  v = Nothing();
+  if (deref_enum(vp) != 0 - 1) { return 14; }
+
+  var text: string = "hello";
+  var tp: string* = &text;
+  var text_copy: string = deref_string(tp);
+  if (text_copy != "hello") { return 15; }
+
+  var direct_text: string = *tp;
+  if (direct_text != "hello") { return 16; }
+
+  var items: S[3];
+  var i: int64 = 0;
+  while (i < 3) {
+    items[i].a = i + 1;
+    items[i].b = i + 2;
+    items[i].c = i + 3;
+    i = i + 1;
+  }
+  var idx: int64 = opaque(2);
+  var elem_ptr: S* = &items[idx];
+  if (deref_arg(elem_ptr) != 12) { return 17; }
+  var elem: S = *elem_ptr;
+  if (elem.a != 3 || elem.b != 4 || elem.c != 5) { return 18; }
+
+  return 0;
+}

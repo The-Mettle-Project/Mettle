@@ -966,6 +966,64 @@ int ir_emit_condition_true_branch(IRLoweringContext *context,
   return 1;
 }
 
+static int ir_try_load_aggregate_by_value(IRLoweringContext *context,
+                                          IRFunction *function,
+                                          IROperand *address, Type *value_type,
+                                          SourceLocation location,
+                                          IROperand *out_value) {
+  char *agg_name = NULL;
+  IROperand dest_addr = ir_operand_none();
+  IRInstruction store = {0};
+  int ok = 0;
+
+  if (!value_type || !value_type->name ||
+      (value_type->kind != TYPE_STRUCT && value_type->kind != TYPE_ARRAY &&
+       value_type->kind != TYPE_STRING &&
+       value_type->kind != TYPE_TAGGED_ENUM) ||
+      value_type->size <= 8 || value_type->size > (size_t)INT_MAX) {
+    return -1;
+  }
+
+  agg_name = ir_new_label_name(context, "agg_byval");
+  if (!agg_name) {
+    ir_operand_destroy(address);
+    ir_set_error(context, "Out of memory while copying aggregate value");
+    return 0;
+  }
+  ok = ir_emit_local_declaration(context, function, agg_name, value_type->name,
+                                 location) &&
+       ir_emit_address_of_symbol(context, function, agg_name, location,
+                                 &dest_addr);
+  if (!ok) {
+    free(agg_name);
+    ir_operand_destroy(&dest_addr);
+    ir_operand_destroy(address);
+    return 0;
+  }
+
+  store.op = IR_OP_STORE;
+  store.location = location;
+  store.dest = dest_addr;
+  store.lhs = *address;
+  store.rhs = ir_operand_int((long long)value_type->size);
+  ok = ir_emit(context, function, &store);
+  ir_operand_destroy(&dest_addr);
+  ir_operand_destroy(address);
+  *address = ir_operand_none();
+  if (!ok) {
+    free(agg_name);
+    return 0;
+  }
+
+  *out_value = ir_operand_symbol(agg_name);
+  free(agg_name);
+  if (!out_value->name) {
+    ir_set_error(context, "Out of memory while copying aggregate value");
+    return 0;
+  }
+  return 1;
+}
+
 int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
                                ASTNode *expression, IROperand *out_value) {
   if (!context || !function || !expression || !out_value) {
@@ -1629,6 +1687,15 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
         ir_operand_destroy(&address);
         ir_set_error(context, "Cannot dereference unknown type");
         return 0;
+      }
+
+      {
+        int handled = ir_try_load_aggregate_by_value(
+            context, function, &address, target_type, expression->location,
+            out_value);
+        if (handled >= 0) {
+          return handled;
+        }
       }
 
       IROperand destination = ir_operand_none();
