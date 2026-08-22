@@ -3747,10 +3747,16 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                      : 1;
     int swf = st ? code_generator_binary_resolved_type_float_bits(st) : 0;
     if ((sw == 1 || sw == 2 || sw == 4) && swf == 0 && dw >= sw) {
-      /* Widening (or same-width) from a known narrow integer source: canonicalize
-       * by extending from the source width per the source signedness. */
-      return mir_emit1(fn, ssigned ? MIR_MOVSX : MIR_MOVZX, dst, a,
-                       mir_op_none(), sw, !ssigned, 0);
+      /* Widening from a known narrow integer source extends by the SOURCE
+       * signedness, which is what gives those bits their value. Same width is
+       * not a widening but a reinterpretation, and there the destination
+       * decides: a uint32 lives in its register zero-extended, so
+       * `(uint32)int32_value` has to clear the high half. Extending by the
+       * source there left `(uint32)x >> 1` shifting a sign-extended value, and
+       * a right shift is exactly where the high half stops being invisible. */
+      int extend_signed = (dw == sw) ? dsigned : ssigned;
+      return mir_emit1(fn, extend_signed ? MIR_MOVSX : MIR_MOVZX, dst, a,
+                       mir_op_none(), sw, !extend_signed, 0);
     }
     if (dw == 8) {
       /* Widening to 64 bits from an 8-byte or unknown source: a plain move. */

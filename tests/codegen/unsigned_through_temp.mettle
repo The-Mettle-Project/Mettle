@@ -1,0 +1,64 @@
+/* Unsigned arithmetic whose left operand is a temp rather than a named local.
+ * The fallback emitter read signedness off the operand's type in context,
+ * which knows nothing about a temp, so `(int64)((uint64)x >> 1)` shifted
+ * arithmetically while the same expression through a uint64 local did not. */
+
+@noinline fn opaque64(x: int64) -> int64 { return x; }
+@noinline fn opaque32(x: int32) -> int32 { return x; }
+
+@noinline fn shr_direct(x: int64) -> int64 {
+  return (int64)((uint64)x >> 1);
+}
+
+@noinline fn shr_via_local(x: int64) -> int64 {
+  var u: uint64 = (uint64)x;
+  var s: uint64 = u >> 1;
+  return (int64)s;
+}
+
+@noinline fn shr_variable(x: int64, n: int64) -> int64 {
+  return (int64)((uint64)x >> n);
+}
+
+@noinline fn div_direct(x: int64) -> int64 {
+  return (int64)((uint64)x / 2);
+}
+
+@noinline fn div_variable(x: int64, d: int64) -> int64 {
+  return (int64)((uint64)x / (uint64)d);
+}
+
+@noinline fn mod_direct(x: int64) -> int64 {
+  return (int64)((uint64)x % 3);
+}
+
+@noinline fn mod_variable(x: int64, d: int64) -> int64 {
+  return (int64)((uint64)x % (uint64)d);
+}
+
+@noinline fn shr32(x: int32) -> int32 {
+  return (int32)((uint32)x >> 1);
+}
+
+fn main() -> int32 {
+  var neg: int64 = opaque64(0 - 1);
+  var half: int64 = 9223372036854775807;
+
+  if (shr_direct(neg) != half) { return 1; }
+  if (shr_via_local(neg) != half) { return 2; }
+  if (shr_variable(neg, 1) != half) { return 3; }
+  if (div_direct(neg) != half) { return 4; }
+  if (div_variable(neg, 2) != half) { return 5; }
+
+  /* 0xFFFFFFFFFFFFFFF8 mod 3 is 2; the signed remainder of -8 is -2. */
+  if (mod_direct(opaque64(0 - 8)) != 2) { return 6; }
+  if (mod_variable(opaque64(0 - 8), 3) != 2) { return 7; }
+
+  if (shr32(opaque32(0 - 1)) != 2147483647) { return 8; }
+
+  /* Signed shapes must keep their signed answers. */
+  if ((neg >> 1) != 0 - 1) { return 9; }
+  if ((opaque64(0 - 8) / 3) != 0 - 2) { return 10; }
+  if ((opaque64(0 - 8) % 3) != 0 - 2) { return 11; }
+  return 0;
+}

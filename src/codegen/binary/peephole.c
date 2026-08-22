@@ -646,7 +646,13 @@ int code_generator_binary_emit_integer_binary_to_rax(
    * signed arithmetic. */
   MtlcType *lhs_type = code_generator_binary_get_operand_type_in_context(
       generator, context, &instruction->lhs);
-  int lhs_unsigned = binary_type_is_unsigned_integer(lhs_type);
+  /* The instruction's own flag comes first. Lowering sets it from the source
+   * types, and it is the only thing that survives when the left operand is a
+   * temp: `(int64)((uint64)x >> 1)` shifts a temp the context knows nothing
+   * about, so asking the context alone answered "signed" and emitted SAR on a
+   * value that was unsigned in the source. */
+  int lhs_unsigned = instruction->is_unsigned ||
+                     binary_type_is_unsigned_integer(lhs_type);
 
   if ((strcmp(op, "/") == 0 || strcmp(op, "%") == 0) &&
       instruction->rhs.kind == IR_OPERAND_INT) {
@@ -2416,8 +2422,13 @@ int code_generator_binary_emit_rax_binary_rhs(
                                     BINARY_GP_R10);
   }
   if (strcmp(op, "/") == 0 || strcmp(op, "%") == 0) {
-    if (!binary_emit_cqo(&context->code) ||
-        !binary_emit_idiv_reg(&context->code, BINARY_GP_R10)) {
+    if (lhs_unsigned) {
+      if (!binary_emit_xor_reg_reg32(&context->code, BINARY_GP_RDX) ||
+          !binary_emit_div_reg(&context->code, BINARY_GP_R10)) {
+        return 0;
+      }
+    } else if (!binary_emit_cqo(&context->code) ||
+               !binary_emit_idiv_reg(&context->code, BINARY_GP_R10)) {
       return 0;
     }
     if (strcmp(op, "%") == 0) {
@@ -2441,9 +2452,10 @@ int code_generator_binary_emit_rax_binary_rhs(
   if (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0) {
     return binary_emit_mov_reg_reg(&context->code, BINARY_GP_RCX,
                                    BINARY_GP_R10) &&
-           binary_emit_shift_reg_cl(&context->code,
-                                    strcmp(op, "<<") == 0 ? 4 : 7,
-                                    BINARY_GP_RAX);
+           binary_emit_shift_reg_cl(
+               &context->code,
+               strcmp(op, "<<") == 0 ? 4 : (lhs_unsigned ? 5 : 7),
+               BINARY_GP_RAX);
   }
 
   return 0;

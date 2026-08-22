@@ -12606,6 +12606,8 @@ $runFixtures = @(
      What = "a codegen check failed" },
   @{ Name = "enums_match"; Path = "tests/codegen/enums_match.mettle"
      What = "a codegen check failed" },
+  @{ Name = "unsigned_through_temp"; Path = "tests/codegen/unsigned_through_temp.mettle"
+     What = "an unsigned shift, divide or remainder through a temp went signed" },
   @{ Name = "if_convert_accumulate"; Path = "tests/codegen/if_convert_accumulate.mettle"
      What = "predicated counting dropped a merge label a second branch still reached" },
   @{ Name = "aggregate_copy_keeps_rcx"; Path = "tests/codegen/aggregate_copy_keeps_rcx.mettle"
