@@ -67,6 +67,8 @@ class Gen:
         self.live_vars = []          # int64 scalars currently in scope
         self.helpers = []            # emitted helper function source blocks
         self.helper_sigs = []        # (name, nparams) int64 helpers
+        self.unary_helpers = []      # names of 1-param int64 helpers
+        self.applier = None          # fn(fn(int64)->int64, int64) -> int64
         self.float_helpers = {}      # kind -> name
         self.kernels = {}            # kind -> name (pointer-param SIMD bait)
         self.structs = []            # dicts: name, fields, make, fold
@@ -177,6 +179,10 @@ class Gen:
             (8,  self.stmt_struct),
             (6,  self.stmt_global),
             (5,  self.stmt_matmul),
+            (7,  self.stmt_shadow),
+            (7,  self.stmt_unsigned_temp),
+            (6,  self.stmt_guarded_accum),
+            (5,  self.stmt_fnptr),
         ]
         total = sum(w for w, _ in kinds)
         roll = self.rng.uniform(0, total)
@@ -540,6 +546,128 @@ class Gen:
             self.emit(f"{u} = {u} >> {self.rng.randint(1, 15)};")
         self.emit(f"{acc} = ({acc} + (int64){u}) & {MASK};")
 
+    # ---- scope statement -----------------------------------------------------
+    def stmt_shadow(self):
+        """A block or loop body declaring a name an enclosing scope already
+        holds. Lowering used to hand the inner one the outer's slot, so the
+        inner write landed on the outer variable, and a for initializer had no
+        scope at all. Both readings are observed."""
+        acc = self.ensure_acc()
+        v = self.fresh("sh")
+        outer = self.rng.randint(1, 5000)
+        inner = self.rng.randint(1, 5000)
+        self.emit(f"var {v}: int64 = {outer};")
+        shape = self.rng.randint(0, 2)
+        if shape == 0:
+            self.emit("{")
+            self.indent += 1
+            self.emit(f"var {v}: int64 = {inner};")
+            self.emit(f"{acc} = ({acc} + {v}) & {MASK};")
+            self.indent -= 1
+            self.emit("}")
+        elif shape == 1:
+            n = self.rng.randint(1, 5)
+
+            def body(i):
+                self.emit(f"var {v}: int64 = {inner} + {i};")
+                self.emit(f"{acc} = ({acc} + {v}) & {MASK};")
+
+            self.counted_loop(0, n, body)
+        else:
+            n = self.rng.randint(1, 5)
+            iv = self.fresh("i")
+            self.emit(f"var {iv}: int64 = {outer};")
+            self.emit(f"for {iv}: int64 in 0..{n} {{")
+            self.indent += 1
+            self.emit(f"{acc} = ({acc} + {iv}) & {MASK};")
+            self.indent -= 1
+            self.emit("}")
+            self.emit(f"{acc} = ({acc} + {iv}) & {MASK};")
+        self.emit(f"{acc} = ({acc} + {v}) & {MASK};")
+
+    # ---- unsigned-through-temp statement -------------------------------------
+    def stmt_unsigned_temp(self):
+        """An unsigned shift, divide or remainder whose left operand is a cast
+        rather than a named local. The signedness has to come off the
+        instruction, since a temp carries no type the backend can look up."""
+        acc = self.ensure_acc()
+        v = self.fresh("ut")
+        self.emit(f"var {v}: int64 = {self.atom(1)} & {MASK};")
+        pick = self.rng.randint(0, 3)
+        if pick == 0:
+            k = self.rng.randint(1, 40)
+            self.emit(f"{acc} = ({acc} + (int64)((uint64){v} >> {k})) & {MASK};")
+        elif pick == 1:
+            k = self.rng.randint(2, 97)
+            self.emit(f"{acc} = ({acc} + (int64)((uint64){v} / {k})) & {MASK};")
+        elif pick == 2:
+            k = self.rng.randint(2, 97)
+            self.emit(f"{acc} = ({acc} + (int64)((uint64){v} % {k})) & {MASK};")
+        else:
+            w = self.fresh("uw")
+            self.emit(f"var {w}: int32 = (int32)({v} & 65535);")
+            k = self.rng.randint(1, 15)
+            self.emit(
+                f"{acc} = ({acc} + (int64)((int32)((uint32){w} >> {k}))) & {MASK};")
+
+    # ---- guarded accumulator statement ---------------------------------------
+    def stmt_guarded_accum(self):
+        """`if (a && b) { s = s + x; }` in a loop: the accumulate
+        if-conversion rewrites this, and a short-circuit `&&` puts two
+        branches on one merge label."""
+        acc = self.ensure_acc()
+        arr = self.fresh("ga")
+        n = self.rng.randint(4, 40)
+        s = self.fresh("gs")
+        self.emit(f"var {arr}: int64[{n}];")
+        c = self.rng.randint(1, 30)
+        d = self.rng.randint(0, 99)
+        self.counted_loop(0, n, lambda i: self.emit(
+            f"{arr}[{i}] = ({i} * {c} + {d}) & {MASK};"))
+        self.emit(f"var {s}: int64 = 0;")
+        lo = self.rng.randint(0, 200)
+        hi = lo + self.rng.randint(1, 900)
+        op = self.rng.choice(["&&", "||"])
+        kind = self.rng.randint(0, 2)
+
+        def body(i):
+            self.emit(f"if ({arr}[{i}] >= {lo} {op} {arr}[{i}] <= {hi}) {{")
+            self.indent += 1
+            if kind == 0:
+                self.emit(f"{s} = ({s} + 1) & {MASK};")
+            elif kind == 1:
+                self.emit(f"{s} = ({s} + {arr}[{i}]) & {MASK};")
+            else:
+                self.emit(f"{s} = ({s} + {i} * 3) & {MASK};")
+            self.indent -= 1
+            self.emit("}")
+
+        self.counted_loop(0, n, body, fuzz_start=True)
+        self.emit(f"{acc} = ({acc} + {s}) & {MASK};")
+
+    # ---- function-pointer statement ------------------------------------------
+    def stmt_fnptr(self):
+        """A named function used as a value by its bare name, which is its
+        address. Typing it as a function pointer without lowering it as one
+        read an undeclared local and jumped through it."""
+        if not self.unary_helpers:
+            return
+        name = self.rng.choice(self.unary_helpers)
+        acc = self.ensure_acc()
+        arg = self.rng.randint(0, 999)
+        pick = self.rng.randint(0, 2)
+        if pick == 0:
+            fp = self.fresh("fp")
+            self.emit(f"var {fp}: fn(int64) -> int64 = {name};")
+            self.emit(f"{acc} = ({acc} + {fp}({arg})) & {MASK};")
+        elif pick == 1 and self.applier:
+            self.emit(
+                f"{acc} = ({acc} + {self.applier}({name}, {arg})) & {MASK};")
+        else:
+            fp = self.fresh("fp")
+            self.emit(f"var {fp}: fn(int64) -> int64 = &{name};")
+            self.emit(f"{acc} = ({acc} + {fp}({arg})) & {MASK};")
+
     # ---- struct statement ----------------------------------------------------
     def stmt_struct(self):
         """Struct return + by-value param + whole-struct copy + field
@@ -683,6 +811,20 @@ class Gen:
             body.append("}")
             self.helpers.append("\n".join(body))
             self.helper_sigs.append((name, np))
+            if np == 1 and not deco.startswith("@inline"):
+                self.unary_helpers.append(name)
+
+    def gen_applier(self):
+        """A higher-order helper, so a bare function name has somewhere to be
+        passed as an argument."""
+        if not self.unary_helpers:
+            return
+        name = self.fresh("ap")
+        self.helpers.append(
+            f"fn {name}(f: fn(int64) -> int64, v: int64) -> int64 {{\n"
+            f"  return f(v) & {MASK};\n"
+            "}")
+        self.applier = name
 
     def gen_float_helpers(self):
         # (float32, float32) -> float64 : f32 binop temps cross the call ABI
@@ -842,6 +984,7 @@ class Gen:
         if self.rng.random() < 0.6:
             self.gen_globals(self.rng.randint(1, 2))
         self.gen_helpers(self.rng.randint(1, 3))
+        self.gen_applier()
         self.gen_float_helpers()
         self.gen_kernels()
 
