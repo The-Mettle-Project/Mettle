@@ -441,9 +441,39 @@ static int ir_unroll_rename_copy_temps(IRInstruction *out,
   return 1;
 }
 
+/* The counted-loop parser's first gate, without the symbol map it needs for
+ * everything after: a loop header is a label whose next real instruction is the
+ * exit branch. Checking it here costs a step or two, and it is the difference
+ * between rejecting a label immediately and building a map of every constant
+ * that reaches it first -- which is a scan of the whole prefix, per label. A
+ * body built out of if/else is nearly all labels and no loops, so that scan was
+ * the largest single cost in compiling one. Kept in step with
+ * ir_try_parse_counted_while_loop: it must reject nothing the parser accepts. */
+static int ir_unroll_header_reaches_branch(const IRFunction *function,
+                                           size_t header_index) {
+  size_t branch_index = 0;
+  const IRInstruction *branch = NULL;
+
+  if (!ir_find_next_non_nop(function, header_index + 1, &branch_index)) {
+    return 0;
+  }
+  branch = &function->instructions[branch_index];
+  if (branch->op == IR_OP_BRANCH_ZERO && branch->text) {
+    return 1;
+  }
+  if (!ir_find_next_non_nop(function, branch_index + 1, &branch_index)) {
+    return 0;
+  }
+  branch = &function->instructions[branch_index];
+  return branch->op == IR_OP_BRANCH_ZERO && branch->text != NULL;
+}
+
 static int ir_try_unroll_loop_at(IRFunction *function, size_t header_index,
                                  int *changed) {
   IRSymbolValueMap symbol_map;
+  if (!ir_unroll_header_reaches_branch(function, header_index)) {
+    return 1;
+  }
   if (!ir_temp_value_map_init(&symbol_map)) {
     return 0;
   }
@@ -1327,20 +1357,69 @@ int ir_reduction_unroll_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* Which labels a later jump comes back to.
+ *
+ * A counted loop's header is a label with a back-edge, and the parser demands
+ * one before it accepts anything. Testing that per label by scanning forward is
+ * quadratic, and testing it at all only after building a map of every constant
+ * reaching the label is worse: that map costs a walk of the whole prefix, and
+ * an if/else body is nearly all labels and no loops, so every one of them paid
+ * it to be rejected. One walk answers it for every label. */
+static int ir_unroll_mark_loop_headers(const IRFunction *function,
+                                       IRNameIndex *headers) {
+  IRNameIndex labels;
+
+  if (!ir_name_index_init(&labels, function->instruction_count)) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_LABEL && instruction->text) {
+      ir_name_index_insert(&labels, instruction->text, i);
+    }
+  }
+  if (!ir_name_index_init(headers, function->instruction_count)) {
+    ir_name_index_destroy(&labels);
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    size_t target = 0;
+    if (instruction->op != IR_OP_JUMP || !instruction->text) {
+      continue;
+    }
+    if (ir_name_index_find(&labels, instruction->text, &target) &&
+        target < i) {
+      ir_name_index_insert(headers, instruction->text, target);
+    }
+  }
+  ir_name_index_destroy(&labels);
+  return 1;
+}
+
 int ir_unroll_small_const_bound_loops_pass(IRFunction *function,
                                                   int *changed) {
+  IRNameIndex loop_headers;
+
   if (!function) {
+    return 0;
+  }
+  if (!ir_unroll_mark_loop_headers(function, &loop_headers)) {
     return 0;
   }
 
   int local_changed = 0;
   for (size_t i = 0; i < function->instruction_count; i++) {
-    if (function->instructions[i].op != IR_OP_LABEL) {
+    if (function->instructions[i].op != IR_OP_LABEL ||
+        !function->instructions[i].text ||
+        !ir_name_index_find(&loop_headers, function->instructions[i].text,
+                            NULL)) {
       continue;
     }
 
     int unrolled = 0;
     if (!ir_try_unroll_loop_at(function, i, &unrolled)) {
+      ir_name_index_destroy(&loop_headers);
       return 0;
     }
     if (unrolled) {
@@ -1349,6 +1428,7 @@ int ir_unroll_small_const_bound_loops_pass(IRFunction *function,
     }
   }
 
+  ir_name_index_destroy(&loop_headers);
   if (local_changed && changed) {
     *changed = 1;
   }

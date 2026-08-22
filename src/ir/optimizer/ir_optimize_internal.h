@@ -475,6 +475,23 @@ int ir_find_label_index(const IRFunction *function, const char *label,
 int ir_find_last_writer_before(const IRFunction *function, size_t before_index,
                                       IROperandKind kind, const char *name,
                                       size_t *writer_index);
+/* Name -> value, open addressed, for the label questions the branch passes ask
+ * once per branch or once per label. Asking them by scanning the function is
+ * quadratic in a function that is mostly branches, which anything built out of
+ * if/else is. The names are borrowed from the IR and must outlive the index. */
+typedef struct {
+  const char **names;
+  size_t *values;
+  size_t capacity;
+} IRNameIndex;
+
+int ir_name_index_init(IRNameIndex *index, size_t expected);
+/* First insertion for a name wins, matching the scans these replace. */
+void ir_name_index_insert(IRNameIndex *index, const char *name, size_t value);
+int ir_name_index_find(const IRNameIndex *index, const char *name,
+                       size_t *out_value);
+void ir_name_index_destroy(IRNameIndex *index);
+
 int ir_find_next_non_nop(const IRFunction *function, size_t start_index,
                                 size_t *out_index);
 int ir_find_next_non_nop_in_block(const IRFunction *function,

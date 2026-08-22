@@ -6,6 +6,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Codegen stage timing, the counterpart of METTLE_TIME_IR_PASSES.
+ * Codegen is the large majority of compile time on a big function, and until
+ * this there was no way to see inside it. Enabled by METTLE_TIME_CODEGEN.
+ * Raw clock() ticks: clock()'s units do not reliably match CLOCKS_PER_SEC
+ * across the toolchains this builds with, and a number in the wrong units is
+ * worse than none. */
+int cg_time_enabled(void);
+double cg_time_begin(void);
+void cg_time_end(const char *name, double started);
+void cg_time_report(void);
+
 #define BINARY_TEXT_SECTION_ALIGNMENT 16
 #define BINARY_FUNCTION_STACK_SLOT_SIZE 8
 

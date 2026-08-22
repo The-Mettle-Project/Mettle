@@ -8,6 +8,73 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <time.h>
+
+#define CG_TIME_MAX 48
+static struct {
+  const char *name;
+  double ticks;
+  unsigned long long runs;
+} g_cg_times[CG_TIME_MAX];
+static size_t g_cg_time_count;
+
+int cg_time_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = getenv("METTLE_TIME_CODEGEN") ? 1 : 0;
+  }
+  return cached;
+}
+
+double cg_time_begin(void) {
+  return cg_time_enabled() ? (double)clock() : 0.0;
+}
+
+void cg_time_end(const char *name, double started) {
+  double spent;
+  if (!cg_time_enabled() || !name) {
+    return;
+  }
+  spent = (double)clock() - started;
+  for (size_t i = 0; i < g_cg_time_count; i++) {
+    if (g_cg_times[i].name == name ||
+        strcmp(g_cg_times[i].name, name) == 0) {
+      g_cg_times[i].ticks += spent;
+      g_cg_times[i].runs++;
+      return;
+    }
+  }
+  if (g_cg_time_count < CG_TIME_MAX) {
+    g_cg_times[g_cg_time_count].name = name;
+    g_cg_times[g_cg_time_count].ticks = spent;
+    g_cg_times[g_cg_time_count].runs = 1;
+    g_cg_time_count++;
+  }
+}
+
+void cg_time_report(void) {
+  if (!cg_time_enabled()) {
+    return;
+  }
+  fprintf(stderr, "-- codegen stage times (cumulative clock() ticks) --\n");
+  for (size_t dumped = 0; dumped < g_cg_time_count; dumped++) {
+    double best = -1.0;
+    size_t pick = g_cg_time_count;
+    for (size_t i = 0; i < g_cg_time_count; i++) {
+      if (g_cg_times[i].ticks > best) {
+        best = g_cg_times[i].ticks;
+        pick = i;
+      }
+    }
+    if (pick == g_cg_time_count) {
+      break;
+    }
+    fprintf(stderr, "  %-34s %12.0f  (%llu runs)\n", g_cg_times[pick].name,
+            g_cg_times[pick].ticks, g_cg_times[pick].runs);
+    g_cg_times[pick].ticks = -2.0;
+  }
+}
+
 /* Does the IR_OP_JUMP at `index` target the code that immediately follows it?
  *
  * Only instructions that emit no bytes may sit in between. Labels qualify (a
@@ -51,10 +118,12 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     return 0;
   }
 
+  double cg_t = cg_time_begin();
   if (!code_generator_binary_prepare_function_context(generator, ir_function,
                                                       &context)) {
     return 0;
   }
+  cg_time_end("prepare_function_context", cg_t);
 
   free(generator->current_function_name);
   if (ir_function->name) {
@@ -95,11 +164,13 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
    * with a complete prologue..epilogue and resolves its own label fixups; all
    * downstream emission (.text append, relocations, debug symbols) is shared. */
   if (mir_function_is_eligible(generator, ir_function)) {
+    cg_t = cg_time_begin();
     if (!code_generator_binary_emit_function_via_mir(generator,
                                                      ir_function, &context)) {
       binary_function_context_destroy(&context);
       return 0;
     }
+    cg_time_end("emit_function_via_mir", cg_t);
     return_offset = context.code.size;
     goto mir_shared_append;
   }
@@ -137,6 +208,7 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
    *
    * The pad sits before the label, so the back-edge jumps past it and only a
    * fall-through into the loop decodes it, once. */
+  cg_t = cg_time_begin();
   char *align_label = NULL;
   if (ir_function->instruction_count > 0) {
     align_label = (char *)calloc(ir_function->instruction_count, 1);
@@ -169,6 +241,8 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     }
   }
 
+  cg_time_end("baseline align scan", cg_t);
+  cg_t = cg_time_begin();
   size_t annot_prev_off = context.code.size;
   int annot_prev_idx = -1;
   for (size_t i = 0; i < ir_function->instruction_count;) {
@@ -389,7 +463,9 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     return 0;
   }
 
+  cg_time_end("baseline emit loop", cg_t);
 mir_shared_append:
+  cg_t = cg_time_begin();
   emitter = code_generator_get_binary_emitter(generator);
   if (!emitter) {
     code_generator_set_error(generator, "Binary emitter is not initialized");
@@ -510,6 +586,7 @@ mir_shared_append:
   }
 
   binary_function_context_destroy(&context);
+  cg_time_end("shared append", cg_t);
   return 1;
 }
 int code_generator_generate_program_binary_object(CodeGenerator *generator) {
@@ -587,6 +664,7 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator) {
     }
   }
   free(emit_order);
+  cg_time_report();
 
   /* Global variables: an integer `const` folds to a CG_SYM_CONSTANT at every
    * use site and carries no storage (IR_MODSYM_CONSTANT, not represented

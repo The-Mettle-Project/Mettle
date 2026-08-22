@@ -1612,8 +1612,100 @@ int ir_remove_redundant_jumps_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+/* Label name -> its instruction index, collected in one walk.
+ *
+ * Jump threading resolves a branch's target label, then the target of the jump
+ * it lands on, up to a bounded depth. Resolving each by scanning the function
+ * is quadratic in a function that is mostly branches. Threading rewrites branch
+ * targets only -- it never moves or retires a label -- so one map serves the
+ * whole pass. */
+typedef struct {
+  const char **names;
+  size_t *indices;
+  size_t capacity;
+} IRLabelPosIndex;
+
+static void ir_label_pos_index_destroy(IRLabelPosIndex *index) {
+  if (!index) {
+    return;
+  }
+  free(index->names);
+  free(index->indices);
+  index->names = NULL;
+  index->indices = NULL;
+  index->capacity = 0;
+}
+
+static int ir_label_pos_index_build(const IRFunction *function,
+                                    IRLabelPosIndex *index) {
+  size_t capacity = 16;
+  size_t mask;
+
+  index->names = NULL;
+  index->indices = NULL;
+  index->capacity = 0;
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  while (capacity < function->instruction_count * 2) {
+    capacity *= 2;
+  }
+  index->names = (const char **)calloc(capacity, sizeof(*index->names));
+  index->indices = (size_t *)calloc(capacity, sizeof(*index->indices));
+  if (!index->names || !index->indices) {
+    ir_label_pos_index_destroy(index);
+    return 0;
+  }
+  index->capacity = capacity;
+  mask = capacity - 1;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    size_t slot;
+    if (instruction->op != IR_OP_LABEL || !instruction->text) {
+      continue;
+    }
+    slot = (size_t)mettle_fnv1a_hash(instruction->text) & mask;
+    while (index->names[slot]) {
+      if (strcmp(index->names[slot], instruction->text) == 0) {
+        break; /* the first definition wins, as the scan did */
+      }
+      slot = (slot + 1) & mask;
+    }
+    if (!index->names[slot]) {
+      index->names[slot] = instruction->text;
+      index->indices[slot] = i;
+    }
+  }
+  return 1;
+}
+
+static int ir_label_pos_index_find(const IRLabelPosIndex *index,
+                                   const char *name, size_t *out_index) {
+  size_t mask;
+  size_t slot;
+
+  if (!index->capacity || !name) {
+    return 0;
+  }
+  mask = index->capacity - 1;
+  slot = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (index->names[slot]) {
+    if (strcmp(index->names[slot], name) == 0) {
+      *out_index = index->indices[slot];
+      return 1;
+    }
+    slot = (slot + 1) & mask;
+  }
+  return 0;
+}
+
 int ir_thread_jump_targets_pass(IRFunction *function, int *changed) {
+  IRLabelPosIndex labels;
+
   if (!function) {
+    return 0;
+  }
+  if (!ir_label_pos_index_build(function, &labels)) {
     return 0;
   }
 
@@ -1629,7 +1721,7 @@ int ir_thread_jump_targets_pass(IRFunction *function, int *changed) {
     const char *current_target = instruction->text;
     for (int depth = 0; depth < 32; depth++) {
       size_t label_index = 0;
-      if (!ir_find_label_index(function, current_target, &label_index)) {
+      if (!ir_label_pos_index_find(&labels, current_target, &label_index)) {
         break;
       }
 
@@ -1650,6 +1742,7 @@ int ir_thread_jump_targets_pass(IRFunction *function, int *changed) {
     if (strcmp(current_target, instruction->text) != 0) {
       char *target_copy = mettle_strdup(current_target);
       if (!target_copy) {
+        ir_label_pos_index_destroy(&labels);
         return 0;
       }
       mettle_free_string(instruction->text);
@@ -1660,6 +1753,7 @@ int ir_thread_jump_targets_pass(IRFunction *function, int *changed) {
     }
   }
 
+  ir_label_pos_index_destroy(&labels);
   return 1;
 }
 
@@ -1902,15 +1996,99 @@ static int ir_label_is_referenced(const IRFunction *function,
   return 0;
 }
 
+/* The set of label names some branch targets, collected in one walk.
+ *
+ * Asking ir_label_is_referenced per label scans the function per label, which
+ * is quadratic in a function that is mostly labels -- anything built out of
+ * if/else. Retiring a label never removes a branch, so one set answers every
+ * question this pass asks. */
+typedef struct {
+  const char **names;
+  size_t capacity;
+} IRLabelRefSet;
+
+static void ir_label_ref_set_destroy(IRLabelRefSet *set) {
+  if (!set) {
+    return;
+  }
+  free(set->names);
+  set->names = NULL;
+  set->capacity = 0;
+}
+
+static int ir_label_ref_set_build(const IRFunction *function,
+                                  IRLabelRefSet *set) {
+  size_t capacity = 16;
+  size_t mask;
+
+  set->names = NULL;
+  set->capacity = 0;
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  while (capacity < function->instruction_count * 2) {
+    capacity *= 2;
+  }
+  set->names = (const char **)calloc(capacity, sizeof(*set->names));
+  if (!set->names) {
+    return 0;
+  }
+  set->capacity = capacity;
+  mask = capacity - 1;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    size_t slot;
+    if (!instruction->text ||
+        (instruction->op != IR_OP_JUMP &&
+         instruction->op != IR_OP_BRANCH_ZERO &&
+         instruction->op != IR_OP_BRANCH_EQ)) {
+      continue;
+    }
+    slot = (size_t)mettle_fnv1a_hash(instruction->text) & mask;
+    while (set->names[slot]) {
+      if (strcmp(set->names[slot], instruction->text) == 0) {
+        break;
+      }
+      slot = (slot + 1) & mask;
+    }
+    set->names[slot] = instruction->text;
+  }
+  return 1;
+}
+
+static int ir_label_ref_set_contains(const IRLabelRefSet *set,
+                                     const char *name) {
+  size_t mask;
+  size_t slot;
+
+  if (!set->capacity || !name) {
+    return 0;
+  }
+  mask = set->capacity - 1;
+  slot = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (set->names[slot]) {
+    if (strcmp(set->names[slot], name) == 0) {
+      return 1;
+    }
+    slot = (slot + 1) & mask;
+  }
+  return 0;
+}
+
 int ir_remove_unused_labels_pass(IRFunction *function, int *changed) {
+  IRLabelRefSet referenced;
+
   if (!function) {
+    return 0;
+  }
+  if (!ir_label_ref_set_build(function, &referenced)) {
     return 0;
   }
 
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
     if (instruction->op == IR_OP_LABEL && instruction->text &&
-        !ir_label_is_referenced(function, instruction->text)) {
+        !ir_label_ref_set_contains(&referenced, instruction->text)) {
       ir_instruction_make_nop(instruction);
       if (changed) {
         *changed = 1;
@@ -1918,6 +2096,7 @@ int ir_remove_unused_labels_pass(IRFunction *function, int *changed) {
     }
   }
 
+  ir_label_ref_set_destroy(&referenced);
   return 1;
 }
 

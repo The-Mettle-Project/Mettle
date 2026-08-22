@@ -1881,6 +1881,80 @@ static int ir_collect_operand_temp_use(IRTempUseMap *uses,
   return ir_temp_use_map_add(uses, operand->name);
 }
 
+int ir_name_index_init(IRNameIndex *index, size_t expected) {
+  size_t capacity = 16;
+
+  if (!index) {
+    return 0;
+  }
+  index->names = NULL;
+  index->values = NULL;
+  index->capacity = 0;
+  while (capacity < expected * 2) {
+    capacity *= 2;
+  }
+  index->names = (const char **)calloc(capacity, sizeof(*index->names));
+  index->values = (size_t *)calloc(capacity, sizeof(*index->values));
+  if (!index->names || !index->values) {
+    ir_name_index_destroy(index);
+    return 0;
+  }
+  index->capacity = capacity;
+  return 1;
+}
+
+void ir_name_index_insert(IRNameIndex *index, const char *name, size_t value) {
+  size_t mask;
+  size_t slot;
+
+  if (!index || !index->capacity || !name) {
+    return;
+  }
+  mask = index->capacity - 1;
+  slot = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (index->names[slot]) {
+    if (strcmp(index->names[slot], name) == 0) {
+      return;
+    }
+    slot = (slot + 1) & mask;
+  }
+  index->names[slot] = name;
+  index->values[slot] = value;
+}
+
+int ir_name_index_find(const IRNameIndex *index, const char *name,
+                       size_t *out_value) {
+  size_t mask;
+  size_t slot;
+
+  if (!index || !index->capacity || !name) {
+    return 0;
+  }
+  mask = index->capacity - 1;
+  slot = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (index->names[slot]) {
+    if (strcmp(index->names[slot], name) == 0) {
+      if (out_value) {
+        *out_value = index->values[slot];
+      }
+      return 1;
+    }
+    slot = (slot + 1) & mask;
+  }
+  return 0;
+}
+
+void ir_name_index_destroy(IRNameIndex *index) {
+  if (!index) {
+    return;
+  }
+  free(index->names);
+  free(index->values);
+  index->names = NULL;
+  index->values = NULL;
+  index->capacity = 0;
+}
+
 int ir_collect_instruction_temp_uses(IRTempUseMap *uses,
                                             const IRInstruction *instruction) {
   if (!uses || !instruction) {
