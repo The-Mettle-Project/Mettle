@@ -568,12 +568,24 @@ int type_checker_check_for_statement(TypeChecker *checker,
     }
   }
 
-  if (for_stmt->increment &&
-      !type_checker_check_expression(checker, for_stmt->increment)) {
-    free(post_init_snapshot);
-    type_checker_init_tracker_exit_scope(checker);
-    symbol_table_exit_scope(checker->symbol_table);
-    return 0;
+  if (for_stmt->increment) {
+    /* An assignment carries a target, and only the statement checker looks at
+     * one: as an expression it answers with the type of the value and never
+     * asks where it is going. The initializer above already dispatches this
+     * way; the step did not, so `for (var i: int32 = 0; i < 3; nosuch = i + 1)`
+     * named an undeclared variable, type-checked clean, and reached codegen. */
+    int step_ok = (for_stmt->increment->type == AST_ASSIGNMENT ||
+                   for_stmt->increment->type == AST_FUNCTION_CALL)
+                      ? type_checker_check_statement(checker,
+                                                     for_stmt->increment)
+                      : type_checker_check_expression(checker,
+                                                      for_stmt->increment);
+    if (!step_ok) {
+      free(post_init_snapshot);
+      type_checker_init_tracker_exit_scope(checker);
+      symbol_table_exit_scope(checker->symbol_table);
+      return 0;
+    }
   }
 
   checker->loop_depth++;

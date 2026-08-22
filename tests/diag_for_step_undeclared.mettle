@@ -1,0 +1,8 @@
+// The step of a `for` carries an assignment, and only the statement checker
+// looks at an assignment's target. Checked as an expression it answered with
+// the type of the value, so an undeclared name here reached codegen.
+fn main() -> int32 {
+  for (var i: int32 = 0; i < 3; nosuch = i + 1) {
+  }
+  return 0;
+}
