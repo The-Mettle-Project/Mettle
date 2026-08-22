@@ -932,7 +932,7 @@ $cases = @(
     OutputMustMatch = @(
       'where to start',
       'proven sum_ints:76',
-      'sum_ints \(loop @ line 76\): NOT vectorized\s+\[int32-sum-narrow-acc\]',
+      'sum_ints \(loop @ line 76\): NOT vectorized  \[int32-sum-narrow-acc\]',
       # the loop body itself, quoted under the verdict
       '77 \|     s = s \+ a\[i\];',
       'findings hidden by --explain=sum_ints',
@@ -1013,7 +1013,7 @@ $cases = @(
     Args          = @("--release", "--explain=outer-of-nest")
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
-      'matvec \(loop @ line \d+\): NOT vectorized\s+\[outer-of-nest\]',
+      'matvec \(loop @ line \d+\): NOT vectorized  \[outer-of-nest\]',
       'only innermost loops are vectorized'
     )
     OutputMustNotMatch = @(
@@ -1061,12 +1061,12 @@ $cases = @(
       # usually written. Iteration 0 compares the seed with itself, so the
       # counter is reset to 0 and the kernel claims it.
       'extent_from_first \(loop @ line 24\): vectorized -> 4-wide float64 vmaxpd',
-      'count_above \(loop @ line 36\): NOT vectorized\s+\[predicated-count\]',
+      'count_above \(loop @ line 36\): NOT vectorized  \[predicated-count\]',
       'over float elements there is nothing to change here',
-      'clamp_all \(loop @ line 46\): NOT vectorized\s+\[clamp-store\]',
-      'green_sum \(loop @ line 60\): NOT vectorized\s+\[strided-access\]',
+      'clamp_all \(loop @ line 46\): NOT vectorized  \[clamp-store\]',
+      'green_sum \(loop @ line 60\): NOT vectorized  \[strided-access\]',
       'the loop steps 3 elements at a time',
-      'row_sum \(loop @ line 71\): NOT vectorized\s+\[dot-shape-address\]',
+      'row_sum \(loop @ line 71\): NOT vectorized  \[dot-shape-address\]',
       'add a loop-invariant term to the counter'
     )
     OutputMustNotMatch = @(
@@ -1106,7 +1106,7 @@ $cases = @(
     Args          = @("-O", "--explain=main")
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
-      'main \(loop @ line 31\): NOT vectorized\s+\[outer-of-nest\]',
+      'main \(loop @ line 31\): NOT vectorized  \[outer-of-nest\]',
       "the call to ``sum_bytes`` on line 32 was inlined, so that callee's loop \(line 13\) now sits in this body",
       'note: nothing to change on this line'
     )
@@ -1129,7 +1129,7 @@ $cases = @(
     OutputMustMatch = @(
       # the fold happens on a space, and the continuation indents inside the
       # elbow so it still reads as subordinate to its verdict
-      'the body contains a nested loop \(line 38\), and only innermost\s+\|\r?\n\s+\|\s+loops are vectorized',
+      'the body contains a nested loop \(line 38\), and only innermost\r?\n {9}loops are vectorized',
       # the source echo keeps its gutter
       '38 \| for c in 0\.\.cols \{'
     )

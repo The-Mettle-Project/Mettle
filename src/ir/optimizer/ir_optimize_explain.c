@@ -505,8 +505,6 @@ static int ir_explain_use_color(void) { return diag_style_color(); }
 
 #define EXPLAIN_GREEN "\x1b[32m"
 #define EXPLAIN_RED "\x1b[31m"
-#define EXPLAIN_YELLOW "\x1b[33m"
-#define EXPLAIN_CYAN "\x1b[36m"
 #define EXPLAIN_DIM "\x1b[2m"
 #define EXPLAIN_BOLD "\x1b[1m"
 #define EXPLAIN_RESET "\x1b[0m"
@@ -519,111 +517,6 @@ static int ir_explain_use_unicode(void) { return diag_style_unicode(); }
 
 static const char *glyph_elbow(void) { return diag_glyphs()->elbow; }
 static const char *glyph_arrow(void) { return diag_glyphs()->arrow; }
-
-static void ir_explain_emit_marked(char kind, const char *const *fields,
-                                   size_t nf, const char *plain);
-static void ir_explain_box_begin(const char *title, const char *plain);
-static void ir_explain_box_end(void);
-static void ir_explain_row_text(const char *content, const char *plain);
-
-static size_t ir_explain_cat(char *out, size_t cap, size_t at, const char *s) {
-  if (!s || at + 1 >= cap) {
-    return at;
-  }
-  size_t n = strlen(s);
-  size_t room = cap - at - 1;
-  if (n > room) {
-    n = room;
-  }
-  memcpy(out + at, s, n);
-  at += n;
-  out[at] = '\0';
-  return at;
-}
-
-static void ir_explain_emit_verdict(const IRExplainRemark *r, const char *left,
-                                    const char *headline) {
-  char body[1024];
-  size_t at = 0;
-  body[0] = '\0';
-  at = ir_explain_cat(body, sizeof(body), at, "  ");
-  at = ir_explain_cat(body, sizeof(body), at, clr(EXPLAIN_BOLD));
-  at = ir_explain_cat(body, sizeof(body), at, left);
-  at = ir_explain_cat(body, sizeof(body), at, clr(EXPLAIN_RESET));
-  at = ir_explain_cat(body, sizeof(body), at, ": ");
-  at = ir_explain_cat(body, sizeof(body), at,
-                      clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED));
-  at = ir_explain_cat(body, sizeof(body), at, headline);
-  at = ir_explain_cat(body, sizeof(body), at, clr(EXPLAIN_RESET));
-
-  char plain[1400];
-  if (r->code && r->code[0]) {
-    char tag[96];
-    snprintf(tag, sizeof(tag), "[%s]", r->code);
-    size_t used = diag_visible_width(body);
-    size_t want = diag_style_columns();
-    size_t pad = 2;
-    if (want > used + strlen(tag) + 2) {
-      pad = want - used - strlen(tag);
-    }
-    snprintf(plain, sizeof(plain), "%s%*s%s%s%s", body, (int)pad, "",
-             clr(EXPLAIN_DIM), tag, clr(EXPLAIN_RESET));
-  } else {
-    snprintf(plain, sizeof(plain), "%s", body);
-  }
-
-  const char *fields[4];
-  fields[0] = r->positive ? "1" : "0";
-  fields[1] = r->code ? r->code : "";
-  fields[2] = left;
-  fields[3] = headline;
-  ir_explain_emit_marked('V', fields, 4, plain);
-}
-
-#define EX_MARK 1
-#define EX_SEP 2
-#define EX_BODY 3
-#define EX_KEY_COLUMN 12
-#define EX_BOX_INDENT 2
-
-static void ir_explain_emit_marked(char kind, const char *const *fields,
-                                   size_t nf, const char *plain) {
-  ir_explain_emit("%c%c", EX_MARK, kind);
-  for (size_t i = 0; i < nf; i++) {
-    ir_explain_emit("%c%s", EX_SEP, fields[i] ? fields[i] : "");
-  }
-  ir_explain_emit("%c%s%c", EX_BODY, plain ? plain : "", 10);
-}
-
-static void ir_explain_box_begin(const char *title, const char *plain) {
-  const char *fields[1];
-  fields[0] = title;
-  ir_explain_emit_marked('B', fields, 1, plain ? plain : "");
-}
-
-static void ir_explain_box_end(void) {
-  ir_explain_emit_marked('E', NULL, 0, "");
-}
-
-static void ir_explain_row_text(const char *content, const char *plain) {
-  const char *fields[1];
-  fields[0] = content;
-  ir_explain_emit_marked('T', fields, 1, plain ? plain : content);
-}
-
-
-static void ir_explain_emit_detail(const char *key, const char *key_color,
-                                   const char *text, const char *text_color) {
-  char plain[2048];
-  snprintf(plain, sizeof(plain), "      %s%s %s%s:%s %s%s%s",
-           clr(EXPLAIN_DIM), glyph_elbow(), clr(key_color), key,
-           clr(EXPLAIN_RESET), clr(text_color), text, clr(EXPLAIN_RESET));
-  const char *fields[3];
-  fields[0] = key;
-  fields[1] = key_color;
-  fields[2] = text;
-  ir_explain_emit_marked('D', fields, 3, plain);
-}
 
 /* ---- source echo ------------------------------------------------------------
  * A verdict that says "line 38" makes the reader open the file to find out
@@ -738,15 +631,8 @@ static void ir_explain_echo_one(size_t line, size_t strip) {
   }
   char painted[1024];
   diag_source_into(painted, sizeof(painted), text);
-  char plain[1200];
-  snprintf(plain, sizeof(plain), "   %s%5zu %s%s %s", clr(EXPLAIN_DIM),
-           line, diag_glyphs()->v, clr(EXPLAIN_RESET), painted);
-  char num[32];
-  snprintf(num, sizeof(num), "%zu", line);
-  const char *fields[2];
-  fields[0] = num;
-  fields[1] = painted;
-  ir_explain_emit_marked('S', fields, 2, plain);
+  ir_explain_emit("   %s%5zu %s%s %s%c", clr(EXPLAIN_DIM), line,
+                  diag_glyphs()->v, clr(EXPLAIN_RESET), painted, 10);
 }
 
 /* Echo the source a remark is about. A short loop is quoted whole, so the
@@ -1438,6 +1324,23 @@ size_t ir_explain_inlined_calls_in_range(const char *function_name,
     }
   }
   return hits;
+}
+
+/* The bracketed decision id that follows a verdict, ready to paste into
+ * `mettle explain`. Empty when the pass recorded no id (positive housekeeping
+ * remarks mostly), so the line reads exactly as it did before. Two rotating
+ * buffers let one emit call carry two tags. */
+static const char *ir_explain_code_tag(const IRExplainRemark *r) {
+  static MTLC_THREAD_LOCAL char buf[2][96];
+  static MTLC_THREAD_LOCAL int slot = 0;
+  if (!r->code || !r->code[0] || strcmp(r->code, "none") == 0) {
+    return "";
+  }
+  char *out = buf[slot];
+  slot = (slot + 1) & 1;
+  snprintf(out, sizeof(buf[0]), "  %s[%s]%s", clr(EXPLAIN_DIM), r->code,
+           clr(EXPLAIN_RESET));
+  return out;
 }
 
 static int ir_explain_remark_compare(const void *a, const void *b) {
@@ -2143,22 +2046,11 @@ static void ir_explain_render_start_here(void) {
     }
   }
 
-  {
-    char title[200];
-    char plain[240];
-    snprintf(title, sizeof(title),
-             "%swhere to start%s  %s%zu of %zu missed optimization%s ha%s a "
-             "fix%s",
-             clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET), clr(EXPLAIN_DIM),
-             actionable, missed, missed == 1 ? "" : "s",
-             actionable == 1 ? "s" : "ve", clr(EXPLAIN_RESET));
-    snprintf(plain, sizeof(plain),
-             "  %swhere to start%s (%zu of %zu missed optimization%s ha%s a "
-             "fix)",
-             clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET), actionable, missed,
-             missed == 1 ? "" : "s", actionable == 1 ? "s" : "ve");
-    ir_explain_box_begin(title, plain);
-  }
+  ir_explain_emit("  %swhere to start%s (%zu of %zu missed optimization%s "
+                  "ha%s a fix; \"proven\" = applied to a clone and re-checked, "
+                  "\"step 1\" = applied and the loop still needs more):\n",
+                  clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET), actionable, missed,
+                  missed == 1 ? "" : "s", actionable == 1 ? "s" : "ve");
   if (backend_shown > 0) {
     snprintf(g_digest.start_here, sizeof(g_digest.start_here), "%s  %s",
              backend_plan[0].location, backend_plan[0].fix);
@@ -2172,52 +2064,32 @@ static void ir_explain_render_start_here(void) {
 
   size_t rank = 0;
   for (size_t i = 0; i < backend_shown; i++) {
-    char fix[240];
-    snprintf(fix, sizeof(fix), "%s", backend_plan[i].fix);
-    char row[600];
-    char plain[640];
-    snprintf(row, sizeof(row), "  %s%2zu%s  %s%-6s%s  %-*s  %s",
-             clr(EXPLAIN_DIM), ++rank, clr(EXPLAIN_RESET), clr(EXPLAIN_RED),
-             "spills", clr(EXPLAIN_RESET), (int)location_width,
-             backend_plan[i].location, fix);
-    snprintf(plain, sizeof(plain), "    %zu. %s%-6s%s %-*s  %s", rank,
-             clr(EXPLAIN_RED), "spills", clr(EXPLAIN_RESET),
-             (int)location_width, backend_plan[i].location, fix);
-    ir_explain_row_text(row, plain);
-    char why[600];
-    char why_plain[640];
-    snprintf(why, sizeof(why), "  %s%*s  %s%s", clr(EXPLAIN_DIM),
-             (int)location_width + 10, "", backend_plan[i].why,
-             clr(EXPLAIN_RESET));
-    snprintf(why_plain, sizeof(why_plain), "       %s%-6s %-*s  %s%s",
-             clr(EXPLAIN_DIM), "", (int)location_width, "",
-             backend_plan[i].why, clr(EXPLAIN_RESET));
-    ir_explain_row_text(why, why_plain);
+    char fix[200];
+    ir_explain_fit(backend_plan[i].fix, 84, fix, sizeof(fix));
+    ir_explain_emit("    %zu. %s%-6s%s %-*s  %s\n", ++rank, clr(EXPLAIN_RED),
+                    "spills", clr(EXPLAIN_RESET), (int)location_width,
+                    backend_plan[i].location, fix);
+    ir_explain_emit("       %s%-6s %-*s  %s%s\n", clr(EXPLAIN_DIM), "",
+                    (int)location_width, "", backend_plan[i].why,
+                    clr(EXPLAIN_RESET));
   }
   for (size_t i = 0; i < shown; i++) {
     const IRExplainRemark *r = &g_remarks[order[i]];
-    char fix[240];
+    char fix[200];
     char spread[48] = "";
     if (sites[i] > 1) {
       snprintf(spread, sizeof(spread), " %s(+%zu more site%s)%s",
                clr(EXPLAIN_DIM), sites[i] - 1, sites[i] == 2 ? "" : "s",
                clr(EXPLAIN_RESET));
     }
-    snprintf(fix, sizeof(fix), "%s", r->fix);
+    ir_explain_fit(r->fix, sites[i] > 1 ? 66 : 84, fix, sizeof(fix));
     /* The caveat has to survive the truncation that trims the fix text, or the
      * plan reads as "do this and you are done" for a fix we know is partial. */
     const char *status = r->verified ? "proven" : (r->partial ? "step 1" : "");
-    char row[700];
-    char plain[740];
-    snprintf(row, sizeof(row), "  %s%2zu%s  %s%-6s%s  %-*s  %s%s",
-             clr(EXPLAIN_DIM), ++rank, clr(EXPLAIN_RESET),
-             clr(r->verified ? EXPLAIN_GREEN : EXPLAIN_DIM), status,
-             clr(EXPLAIN_RESET), (int)location_width, location[i], fix, spread);
-    snprintf(plain, sizeof(plain), "    %zu. %s%-6s%s %-*s  %s%s", rank,
-             clr(r->verified ? EXPLAIN_GREEN : EXPLAIN_DIM), status,
-             clr(EXPLAIN_RESET), (int)location_width, location[i], fix,
-             spread);
-    ir_explain_row_text(row, plain);
+    ir_explain_emit("    %zu. %s%-6s%s %-*s  %s%s\n", ++rank,
+                    clr(r->verified ? EXPLAIN_GREEN : EXPLAIN_DIM), status,
+                    clr(EXPLAIN_RESET), (int)location_width, location[i], fix,
+                    spread);
   }
   /* The lines above stand for `covered` findings, not `shown` of them, since
    * each folds its own sites. The remainder is what no line represents. */
@@ -2226,15 +2098,10 @@ static void ir_explain_render_start_here(void) {
     covered += sites[i];
   }
   if (actionable > covered) {
-    char row[160];
-    char plain[200];
-    snprintf(row, sizeof(row), "  %s... and %zu more below%s", clr(EXPLAIN_DIM),
-             actionable - covered, clr(EXPLAIN_RESET));
-    snprintf(plain, sizeof(plain), "       %s... and %zu more below%s",
-             clr(EXPLAIN_DIM), actionable - covered, clr(EXPLAIN_RESET));
-    ir_explain_row_text(row, plain);
+    ir_explain_emit("       %s... and %zu more below%s\n", clr(EXPLAIN_DIM),
+                    actionable - covered, clr(EXPLAIN_RESET));
   }
-  ir_explain_box_end();
+  ir_explain_emit("\n");
 }
 
 /* One remark as a JSON object in the "remarks" array. `kind` is explicit so
@@ -2868,12 +2735,6 @@ void ir_explain_flush(void) {
   if (g_remark_count == 0) {
     ir_explain_emit("  (no loops or calls to report)\n\n");
   } else {
-    {
-      char title[64];
-      snprintf(title, sizeof(title), "%sfindings%s", clr(EXPLAIN_BOLD),
-               clr(EXPLAIN_RESET));
-      ir_explain_box_begin(title, "");
-    }
     char *suppressed = calloc(g_remark_count, 1);
     for (size_t i = 0; i < g_remark_count; i++) {
       const IRExplainRemark *r = &g_remarks[i];
@@ -2902,27 +2763,32 @@ void ir_explain_flush(void) {
           ir_explain_group_callee_list(g_remarks, i, callees,
                                        sizeof(callees));
           if (show) {
-            char left[320];
-            snprintf(left, sizeof(left), "%s (%zu calls, lines %zu-%zu)",
-                     r->function_name, group_count, r->line, last_line);
-            ir_explain_emit_verdict(r, left, r->headline);
+            ir_explain_emit("  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s%s\n",
+                            clr(EXPLAIN_BOLD), r->function_name,
+                            clr(EXPLAIN_RESET), group_count, r->line, last_line,
+                            clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
+                            r->headline, clr(EXPLAIN_RESET),
+                            ir_explain_code_tag(r));
             if (r->reason) {
-              ir_explain_emit_detail("reason", EXPLAIN_DIM, r->reason, "");
+              ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
+                              glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
             }
             if (r->fix) {
-              ir_explain_emit_detail(r->advisory ? "note" : "fix",
-                                     r->advisory ? EXPLAIN_DIM : EXPLAIN_CYAN,
-                                     r->fix, "");
+              ir_explain_emit("      %s%s fix: %s%s\n", clr(EXPLAIN_DIM),
+                              glyph_elbow(), r->fix, clr(EXPLAIN_RESET));
             }
             if (r->verified) {
-              ir_explain_emit_detail("verified", EXPLAIN_GREEN, r->verified,
-                                     EXPLAIN_GREEN);
+              ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
+                              glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
+                              clr(EXPLAIN_RESET));
             }
             if (r->partial) {
-              ir_explain_emit_detail("still blocked", EXPLAIN_YELLOW,
-                                     r->partial, "");
+              ir_explain_emit("      %s%s still blocked: %s%s\n",
+                              clr(EXPLAIN_DIM), glyph_elbow(), r->partial,
+                              clr(EXPLAIN_RESET));
             }
-            ir_explain_emit_detail("calls", EXPLAIN_DIM, callees, EXPLAIN_DIM);
+            ir_explain_emit("      %s%s calls: %s%s\n", clr(EXPLAIN_DIM),
+                            glyph_elbow(), callees, clr(EXPLAIN_RESET));
           }
           if (strcmp(r->headline, "NOT inlined") == 0) {
             g_digest.calls_refused += group_count;
@@ -2942,32 +2808,36 @@ void ir_explain_flush(void) {
       }
 
       if (show) {
-        char left[320];
-        snprintf(left, sizeof(left), "%s (%s @ line %zu)", r->function_name,
-                 r->entity, r->line);
-        ir_explain_emit_verdict(r, left, r->headline);
+        ir_explain_emit("  %s%s%s (%s @ line %zu): %s%s%s%s\n",
+                        clr(EXPLAIN_BOLD), r->function_name, clr(EXPLAIN_RESET),
+                        r->entity, r->line,
+                        clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
+                        r->headline, clr(EXPLAIN_RESET),
+                        ir_explain_code_tag(r));
         /* The line itself, but only where there is something to act on:
          * quoting the source under every successful inline would treble the
          * report and say nothing. */
         if (r->reason) {
           ir_explain_echo_source_range(r->line, r->end_line);
-          ir_explain_emit_detail("reason", EXPLAIN_DIM, r->reason, "");
+          ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
         }
         if (r->fix) {
           /* "fix: nothing to change here" is a contradiction. Where the
            * advice describes the loop instead of instructing anyone, the
            * label says so. */
-          ir_explain_emit_detail(r->advisory ? "note" : "fix",
-                                 r->advisory ? EXPLAIN_DIM : EXPLAIN_CYAN,
-                                 r->fix, "");
+          ir_explain_emit("      %s%s %s: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), r->advisory ? "note" : "fix", r->fix,
+                          clr(EXPLAIN_RESET));
         }
         if (r->verified) {
-          ir_explain_emit_detail("verified", EXPLAIN_GREEN, r->verified,
-                                 EXPLAIN_GREEN);
+          ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
+                          clr(EXPLAIN_RESET));
         }
         if (r->partial) {
-          ir_explain_emit_detail("still blocked", EXPLAIN_YELLOW, r->partial,
-                                 "");
+          ir_explain_emit("      %s%s still blocked: %s%s\n", clr(EXPLAIN_DIM),
+                          glyph_elbow(), r->partial, clr(EXPLAIN_RESET));
         }
       }
       if (r->verified) {
@@ -3034,12 +2904,9 @@ void ir_explain_flush(void) {
       }
     }
     if (sample) {
-      ir_explain_box_end();
       ir_explain_emit("  %sthe bracketed id after a verdict has a longer "
                       "explanation: mettle explain %s%s\n",
                       clr(EXPLAIN_DIM), sample, clr(EXPLAIN_RESET));
-    } else {
-      ir_explain_box_end();
     }
     ir_explain_emit("\n");
   }
@@ -3170,24 +3037,6 @@ static void ir_explain_write_wrapped_line(FILE *out, const char *line,
     indent++;
   }
   size_t hang = indent + 3;
-  {
-    size_t width = 0;
-    for (size_t i = indent; i < len && width <= 26; i++) {
-      if (line[i] == 0x1b) {
-        while (i < len && line[i] != 'm') {
-          i++;
-        }
-        continue;
-      }
-      if (line[i] == ':' && i + 1 < len && line[i + 1] == ' ') {
-        hang = indent + width + 2;
-        break;
-      }
-      if (((unsigned char)line[i] & 0xC0) != 0x80) {
-        width++;
-      }
-    }
-  }
   if (hang + 24 > columns) {
     hang = indent; /* a narrow terminal needs the width more than the shape */
   }
@@ -3234,371 +3083,35 @@ static void ir_explain_write_wrapped_line(FILE *out, const char *line,
   fputc('\n', out);
 }
 
-static size_t ex_field_split(char *line, char **fields, size_t max) {
-  size_t n = 0;
-  char *p = line;
-  while (n < max) {
-    char *sep = strchr(p, EX_SEP);
-    char *body = strchr(p, EX_BODY);
-    if (!sep || (body && body < sep)) {
-      break;
-    }
-    *sep = '\0';
-    p = sep + 1;
-    fields[n++] = p;
-  }
-  char *body = strchr(p, EX_BODY);
-  if (body) {
-    *body = '\0';
-  }
-  return n;
-}
-
-static size_t ex_chunk(const char *text, size_t budget) {
-  size_t width = 0, i = 0, last_space = 0;
-  while (text[i]) {
-    if (text[i] == ' ') {
-      if (width >= budget) {
-        break;
-      }
-      last_space = i;
-    }
-    if (((unsigned char)text[i] & 0xC0) != 0x80) {
-      if (width >= budget) {
-        break;
-      }
-      width++;
-    }
-    i++;
-  }
-  if (!text[i]) {
-    return i;
-  }
-  if (last_space > 0) {
-    return last_space;
-  }
-  return i;
-}
-
-static void ex_hline(FILE *out, size_t inner, const char *left,
-                     const char *right, const char *title) {
-  const DiagGlyphs *g = diag_glyphs();
-  fprintf(out, "%*s%s%s", EX_BOX_INDENT, "", clr(EXPLAIN_DIM), left);
-  size_t drawn = 0;
-  fputs(g->h, out);
-  drawn++;
-  if (title && title[0]) {
-    fprintf(out, " %s%s%s ", clr(EXPLAIN_RESET), title, clr(EXPLAIN_DIM));
-    drawn += diag_visible_width(title) + 2;
-  }
-  for (size_t i = drawn; i < inner + 2; i++) {
-    fputs(g->h, out);
-  }
-  fprintf(out, "%s%s%c", right, clr(EXPLAIN_RESET), 10);
-}
-
-static size_t ex_chunk_styled(const char *text, size_t budget) {
-  size_t width = 0, i = 0, last_space = 0;
-  while (text[i]) {
-    if (text[i] == 27) {
-      i++;
-      if (text[i] == 91) {
-        i++;
-        while (text[i] && text[i] != 109) {
-          i++;
-        }
-        if (text[i]) {
-          i++;
-        }
-      }
-      continue;
-    }
-    if (width >= budget) {
-      break;
-    }
-    if (text[i] == 32 && i > 0) {
-      last_space = i;
-    }
-    if (((unsigned char)text[i] & 0xC0) != 0x80) {
-      width++;
-    }
-    i++;
-  }
-  if (!text[i]) {
-    return i;
-  }
-  return last_space > 0 ? last_space : i;
-}
-
-static void ex_row_raw(FILE *out, size_t inner, const char *content,
-                       size_t len, size_t hang) {
-  const DiagGlyphs *g = diag_glyphs();
-  char cut[4096];
-  size_t n = len < sizeof(cut) - 1 ? len : sizeof(cut) - 1;
-  memcpy(cut, content, n);
-  cut[n] = 0;
-  size_t w = diag_visible_width(cut) + hang;
-  fprintf(out, "%*s%s%s%s ", EX_BOX_INDENT, "", clr(EXPLAIN_DIM), g->v,
-          clr(EXPLAIN_RESET));
-  if (hang) {
-    fprintf(out, "%*s", (int)hang, "");
-  }
-  fputs(cut, out);
-  size_t pad = inner > w ? inner - w : 0;
-  fprintf(out, "%s%*s %s%s%s%c", clr(EXPLAIN_RESET), (int)pad, "",
-          clr(EXPLAIN_DIM), g->v, clr(EXPLAIN_RESET), 10);
-}
-
-static void ex_row(FILE *out, size_t inner, const char *content) {
-  const char *p = content;
-  size_t hang = 0;
-  for (;;) {
-    size_t budget = inner > hang ? inner - hang : inner;
-    size_t take = ex_chunk_styled(p, budget);
-    if (take == 0) {
-      take = strlen(p);
-    }
-    ex_row_raw(out, inner, p, take, hang);
-    p += take;
-    while (*p == 32) {
-      p++;
-    }
-    if (!*p) {
-      return;
-    }
-    hang = 4;
-  }
-}
-
-static void ex_row_keyed(FILE *out, size_t inner, const char *key,
-                         const char *key_color, const char *text) {
-  size_t budget = inner > EX_KEY_COLUMN + 8 ? inner - EX_KEY_COLUMN : inner;
-  const char *p = text;
-  int first = 1;
-  while (*p) {
-    size_t take = ex_chunk(p, budget);
-    if (take == 0) {
-      take = strlen(p);
-    }
-    char row[2048];
-    size_t at = 0;
-    if (first) {
-      at += (size_t)snprintf(row + at, sizeof(row) - at, "  %s%-*s%s",
-                             clr(key_color), EX_KEY_COLUMN - 2, key,
-                             clr(EXPLAIN_RESET));
-      first = 0;
-    } else {
-      at += (size_t)snprintf(row + at, sizeof(row) - at, "%*s", EX_KEY_COLUMN,
-                             "");
-    }
-    snprintf(row + at, sizeof(row) - at, "%.*s", (int)take, p);
-    ex_row(out, inner, row);
-    p += take;
-    while (*p == ' ') {
-      p++;
-    }
-  }
-}
-
-static void ex_render_verdict(FILE *out, size_t inner, char **f, size_t nf) {
-  if (nf < 4) {
-    return;
-  }
-  const DiagGlyphs *g = diag_glyphs();
-  int positive = f[0][0] == '1';
-  const char *code = f[1];
-  const char *left = f[2];
-  const char *headline = f[3];
-
-  char head[1024];
-  snprintf(head, sizeof(head), "%s%s%s  %s%s%s",
-           clr(positive ? EXPLAIN_GREEN : EXPLAIN_RED),
-           positive ? g->check : g->cross, clr(EXPLAIN_RESET),
-           clr(EXPLAIN_BOLD), left, clr(EXPLAIN_RESET));
-
-  if (code && code[0]) {
-    char tag[96];
-    snprintf(tag, sizeof(tag), "[%s]", code);
-    size_t used = diag_visible_width(head);
-    size_t tagw = diag_visible_width(tag);
-    if (inner > used + tagw + 2) {
-      size_t pad = inner - used - tagw;
-      char row[1200];
-      snprintf(row, sizeof(row), "%s%*s%s%s%s", head, (int)pad, "",
-               clr(EXPLAIN_DIM), tag, clr(EXPLAIN_RESET));
-      ex_row(out, inner, row);
-    } else {
-      ex_row(out, inner, head);
-    }
-  } else {
-    ex_row(out, inner, head);
-  }
-
-  char sub[1024];
-  snprintf(sub, sizeof(sub), "     %s%s%s",
-           clr(positive ? EXPLAIN_GREEN : EXPLAIN_RED), headline,
-           clr(EXPLAIN_RESET));
-  ex_row(out, inner, sub);
-}
-
-static void ex_render_source(FILE *out, size_t inner, char **f, size_t nf) {
-  if (nf < 2) {
-    return;
-  }
-  const DiagGlyphs *g = diag_glyphs();
-  char row[2048];
-  snprintf(row, sizeof(row), "     %s%5s %s%s %s", clr(EXPLAIN_DIM), f[0], g->v,
-           clr(EXPLAIN_RESET), f[1]);
-  ex_row(out, inner, row);
-}
-
-static void ir_explain_render_terminal(FILE *out, size_t columns) {
-  const DiagGlyphs *g = diag_glyphs();
-  size_t inner = columns > EX_BOX_INDENT + 8 ? columns - EX_BOX_INDENT - 4 : 40;
-  int open = 0;
-  char last_kind = 0;
-
+static void ir_explain_write_wrapped(FILE *out, size_t columns) {
   size_t start = 0;
   for (size_t i = 0; i <= g_report_len; i++) {
-    if (i != g_report_len && g_report_buf[i] != '\n') {
-      continue;
+    if (i == g_report_len || g_report_buf[i] == '\n') {
+      ir_explain_write_wrapped_line(out, g_report_buf + start, i - start,
+                                    columns);
+      start = i + 1;
     }
-    size_t len = i - start;
-    const char *raw = g_report_buf + start;
-    start = i + 1;
-
-    if (len < 2 || raw[0] != EX_MARK) {
-      if (open) {
-        ex_hline(out, inner, g->corner_bl, g->corner_br, NULL);
-        open = 0;
-        last_kind = 0;
-      }
-      ir_explain_write_wrapped_line(out, raw, len, columns);
-      continue;
-    }
-
-    char *line = malloc(len + 1);
-    if (!line) {
-      continue;
-    }
-    memcpy(line, raw, len);
-    line[len] = '\0';
-
-    char kind = line[1];
-    char *fields[8];
-    size_t nf = ex_field_split(line + 1, fields, 8);
-
-    if (kind == 'B') {
-      if (open) {
-        ex_hline(out, inner, g->corner_bl, g->corner_br, NULL);
-      }
-      ex_hline(out, inner, g->corner_tl, g->corner_tr, nf ? fields[0] : NULL);
-      open = 1;
-      last_kind = 'B';
-      free(line);
-      continue;
-    }
-    if (kind == 'E') {
-      if (open) {
-        ex_hline(out, inner, g->corner_bl, g->corner_br, NULL);
-        open = 0;
-      }
-      last_kind = 0;
-      free(line);
-      continue;
-    }
-    if (!open) {
-      ex_hline(out, inner, g->corner_tl, g->corner_tr, NULL);
-      open = 1;
-      last_kind = 0;
-    }
-
-    switch (kind) {
-    case 'V':
-      if (last_kind && last_kind != 'B') {
-        ex_hline(out, inner, g->tee_right, g->tee_left, NULL);
-      }
-      ex_render_verdict(out, inner, fields, nf);
-      break;
-    case 'S':
-      if (last_kind == 'V') {
-        ex_row(out, inner, "");
-      }
-      ex_render_source(out, inner, fields, nf);
-      break;
-    case 'D':
-      if (last_kind == 'V' || last_kind == 'S') {
-        ex_row(out, inner, "");
-      }
-      if (nf >= 3) {
-        ex_row_keyed(out, inner, fields[0], fields[1], fields[2]);
-      }
-      break;
-    case 'T':
-      if (nf >= 1) {
-        ex_row(out, inner, fields[0]);
-      }
-      break;
-    default:
-      break;
-    }
-    last_kind = kind;
-    free(line);
-  }
-
-  if (open) {
-    ex_hline(out, inner, g->corner_bl, g->corner_br, NULL);
   }
 }
 
-static const char *ex_strip_marker(const char *line, size_t *len) {
-  if (*len < 2 || line[0] != EX_MARK) {
-    return line;
-  }
-  for (size_t i = 0; i < *len; i++) {
-    if (line[i] == EX_BODY) {
-      *len -= i + 1;
-      return line + i + 1;
-    }
-  }
-  *len = 0;
-  return line;
-}
-
-static void ex_write_unmarked(FILE *out, int strip_ansi) {
-  size_t start = 0;
-  for (size_t i = 0; i <= g_report_len; i++) {
-    if (i != g_report_len && g_report_buf[i] != '\n') {
-      continue;
-    }
-    size_t len = i - start;
-    const char *raw = g_report_buf + start;
-    start = i + 1;
-    int is_end = len >= 2 && raw[0] == EX_MARK && raw[1] == 'E';
-    if (is_end) {
-      continue;
-    }
-    const char *text = ex_strip_marker(raw, &len);
-    for (size_t k = 0; k < len; k++) {
-      if (strip_ansi && text[k] == '\x1b' && k + 1 < len &&
-          text[k + 1] == '[') {
-        k += 2;
-        while (k < len && text[k] != 'm') {
-          k++;
-        }
-        continue;
-      }
-      fputc(text[k], out);
-    }
-    fputc(10, out);
-  }
-}
-
+/* Write the buffer with ANSI color sequences stripped (the report renders
+ * with stderr in mind; a file must stay plain). */
 static int ir_explain_write_plain(FILE *out) {
-  ex_write_unmarked(out, 1);
+  for (size_t i = 0; i < g_report_len; i++) {
+    if (g_report_buf[i] == '\x1b' && i + 1 < g_report_len &&
+        g_report_buf[i + 1] == '[') {
+      i += 2;
+      while (i < g_report_len && g_report_buf[i] != 'm') {
+        i++;
+      }
+      continue;
+    }
+    if (fputc(g_report_buf[i], out) == EOF) {
+      return 0;
+    }
+  }
   return 1;
 }
-
 
 /* Render the deferred plan and put it back where it belongs: after the changes
  * block, before the remarks. Splicing beats printing it at the end -- the plan
@@ -3714,16 +3227,13 @@ void ir_explain_finalize(int force_stderr) {
       columns = atoi(forced);
     }
     if (columns >= 40) {
-      diag_style_output_begin();
-      ir_explain_render_terminal(stderr, (size_t)columns);
-      diag_style_output_end();
+      ir_explain_write_wrapped(stderr, (size_t)columns);
     } else {
-      ex_write_unmarked(stderr, 0);
+      fwrite(g_report_buf, 1, g_report_len, stderr);
     }
   } else {
     /* The digest: the report's conclusions in five lines, plus the path.
      * Regressions lead -- they must never hide inside a sidecar. */
-    diag_style_output_begin();
     {
       char label[64];
       snprintf(label, sizeof(label), "%soptimization report%s",
@@ -3767,7 +3277,6 @@ void ir_explain_finalize(int force_stderr) {
     fprintf(stderr, "  full report (%zu lines): %s%s%s\n\n",
             ir_explain_report_lines(), clr(EXPLAIN_BOLD), sidecar,
             clr(EXPLAIN_RESET));
-    diag_style_output_end();
   }
 
   free(sidecar);
