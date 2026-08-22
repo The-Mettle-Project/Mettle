@@ -7453,6 +7453,16 @@ static int mir_all_uses_in_range(const MirFunction *fn, MirVregId v, size_t lo,
  * *loop_end. Returns first_use (and leaves *loop_end = first_use) when no
  * enclosing loop encloses first_use -- the caller must not relocate then, since
  * a non-loop position need not dominate the constant's other uses. */
+static int mir_insert_point_is_reached(const MirFunction *fn, size_t insert) {
+  const MirInst *previous = NULL;
+
+  if (insert == 0 || insert >= fn->insn_count) {
+    return 1;
+  }
+  previous = &fn->insns[insert - 1];
+  return previous->op != MIR_JMP && previous->op != MIR_RET;
+}
+
 static size_t mir_const_insert_index(const MirFunction *fn, size_t first_use,
                                      size_t *loop_end) {
   size_t insert = first_use;
@@ -7517,6 +7527,7 @@ static void mir_place_const_pool(MirFunction *fn) {
     size_t loop_end = first;
     size_t insert = mir_const_insert_index(fn, first, &loop_end);
     if (insert <= def + 1 || insert == first ||
+        !mir_insert_point_is_reached(fn, insert) ||
         !mir_all_uses_in_range(fn, v, insert, loop_end)) {
       continue;
     }
@@ -7539,6 +7550,7 @@ static void mir_place_const_pool(MirFunction *fn) {
     size_t loop_end = first;
     size_t insert = mir_const_insert_index(fn, first, &loop_end);
     if (insert <= def + 1 || insert == first ||
+        !mir_insert_point_is_reached(fn, insert) ||
         !mir_all_uses_in_range(fn, v, insert, loop_end)) {
       continue;
     }

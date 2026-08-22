@@ -1,0 +1,66 @@
+import "std/mem";
+
+struct Scanner { text: uint8*; len: int32; pos: int32; }
+
+@noinline fn opaque(n: int64) -> int64 { return n; }
+
+fn scan_number(p: Scanner*) -> float64 {
+  var sign: float64 = 1.0;
+  if (p->pos < p->len && p->text[p->pos] == 45) {
+    sign = -1.0;
+    p->pos += 1;
+  }
+  var value: float64 = 0.0;
+  while (p->pos < p->len) {
+    var c: int32 = (int32)p->text[p->pos];
+    if (c < 48 || c > 57) { break; }
+    value = value * 10.0 + (float64)(c - 48);
+    p->pos += 1;
+  }
+  if (p->pos < p->len && p->text[p->pos] == 46) {
+    p->pos += 1;
+    var scale: float64 = 0.1;
+    while (p->pos < p->len) {
+      var c: int32 = (int32)p->text[p->pos];
+      if (c < 48 || c > 57) { break; }
+      value = value + (float64)(c - 48) * scale;
+      scale = scale * 0.1;
+      p->pos += 1;
+    }
+  }
+  return sign * value;
+}
+
+fn scan_at(buffer: uint8*, source: cstring, count: int64) -> float64 {
+  var i: int64 = 0;
+  while (i < count) {
+    buffer[i] = (uint8)source[i];
+    i = i + 1;
+  }
+  buffer[count] = 0;
+  var s: Scanner;
+  s.text = buffer;
+  s.len = (int32)opaque(count);
+  s.pos = 0;
+  return scan_number(&s);
+}
+
+fn main() -> int32 {
+  var buffer: uint8* = malloc(64);
+  if (buffer == 0) { return 1; }
+
+  var a: float64 = scan_at(buffer, "123.45", 6);
+  if (a < 123.4499 || a > 123.4501) { return 2; }
+
+  var b: float64 = scan_at(buffer, "-8.25", 5);
+  if (b < 0.0 - 8.2501 || b > 0.0 - 8.2499) { return 3; }
+
+  var c: float64 = scan_at(buffer, "70", 2);
+  if (c != 70.0) { return 4; }
+
+  var d: float64 = scan_at(buffer, "0.001", 5);
+  if (d < 0.0009 || d > 0.0011) { return 5; }
+
+  free(buffer);
+  return 0;
+}
