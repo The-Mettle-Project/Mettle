@@ -1,91 +1,80 @@
-# Zero-run profile-guided optimization: `--pgo`
+# Profile-guided optimization
 
-Classic PGO demands three steps: build instrumented, run a training
-workload, rebuild with the profile. Almost nobody does it. libmtlc collapses
-the loop to one flag: the backend **interprets your program's own `main()`
-while compiling it** (deterministic, sandboxed, externs modeled as pure,
-fuel-capped at 64M steps) and feeds the measured execution frequencies
-straight into the optimizer. The `mettle` driver exposes this as `--pgo`.
+`--pgo` measures which functions your program calls most, then tells the
+optimizer. It does that by running `main()` at compile time. There is no
+instrumented build and no training run.
 
-```
-$ mettle --release --pgo app.mettle -o app.obj
-pgo: interpreted main() at compile time - 63785953 steps (partial (fuel cap 64M steps)),
-     2 functions touched, hot threshold 1024 calls
-pgo:   keyed_step: 214046 calls  [hot]
+```bash
+mettle --pgo --release --build program.mettle
 ```
 
-## What the profile drives
+`--pgo` implies `-O`.
 
-**Hot-callee inlining.** The inliner's static caps exist because, without
-evidence, inlining a large callee is a code-size gamble. A measured-hot
-callee (>= `METTLE_PGO_HOT` calls, default 1024) IS the evidence: it gets
-the same budget override an explicit `@inline` grants - the 128-instruction
-budget widens to 512 and the 2-call glue cap to 6. The denylist and
-structural guards still apply. Unprofiled builds keep the static heuristic;
-profiled cold code can now use tighter budgets to avoid training-run code-size
-bloat.
+## What it does
 
-**Hotness-aware thresholds.** The interpreter also records body-step counts
-and source-keyed execution counts for IR sites, giving the optimizer a
-lightweight block profile that survives ordinary early rewrites and inlining.
-When a profile is present, code-size/speed thresholds adapt:
+The compiler interprets `main()` in the same
+[compile-time interpreter](testing.md) that runs `mettle test`, counting calls
+as it goes. Any function whose count clears the threshold is treated as hot,
+and a hot callee bypasses the inliner's static size budget the same way an
+explicit `@inline` does.
 
-- measured-hot callees and callers get wider inline budgets;
-- measured-cold callees get tighter discretionary inline budgets;
-- constant-trip full unrolling uses 16 trips for cold sites, 64 trips normally,
-  and 128 trips for hot sites;
-- indirect-access software prefetching is skipped for cold sites and can use a
-  wider look-ahead distance for hot sites.
+The interpretation is deterministic and sandboxed. It reads no files and
+touches no devices.
 
-No-profile builds keep the old static thresholds. `METTLE_PGO_HOT=<n>` is the
-shared threshold for hot function calls and source/block-like site counts.
+## What it prints
 
-Inlining is the gateway optimization: once the call boundary dissolves,
-constant arguments propagate into the callee's body. Combined with the
-constant-folding upgrade below, a hot helper called with a compile-time key
-
-```mettle
-fn keyed_step(x: int64, k: int64) -> int64 {
-    var m: int64 = k;
-    m = m ^ (m >> 13);  m = m * 31;  m = m + 7;
-    /* ... 40 rounds ... */
-    return (x << 1) ^ m;
-}
+```text
+pgo: interpreted main() at compile time - 17053 steps (ran to completion), 9
+functions touched, hot threshold 1024 calls
+pgo:   helper: 1000 calls
+pgo:   print: 1 calls
+pgo:   get_stdout: 1 calls
+pgo:   fwrite: 1 calls
+pgo:   println: 1 calls
 ```
 
-collapses to a single precomputed constant per call site: measured **2.1x**
-end to end on the 30M-iteration driver (830ms -> 395ms, identical output),
-from one flag.
+The first line says how far it got. "ran to completion" means the whole of
+`main()` was interpreted. A program that reaches something the interpreter
+cannot model stops there, and the counts up to that point are still used.
 
-## The constant-folding upgrade underneath
+## The threshold
 
-Landing PGO exposed a general optimizer gap: constant propagation knew a
-variable's value but only *invalidated* it on arithmetic writes instead of
-*computing* the new one, so `m = m ^ K; m = m * P; ...` chains never
-folded. The pass now evaluates an integer `dest = a op b` the moment its
-operands are proven constant, narrowing the result to the destination's
-declared width (the canonical-homes contract: temps compute at 64-bit,
-typed homes wrap on write). Operands are consulted, never rewritten, so
-partially-constant expressions keep the shapes the SIMD recognizers
-pattern-match. This fires in every `-O` build, not just under `--pgo`.
+`METTLE_PGO_HOT` sets the call count that makes a function hot:
 
-Both features were validated by `--verify` (translation validation) across
-the example corpus and all of MettleWarband - 7225 pass applications, zero
-divergences.
+```bash
+METTLE_PGO_HOT=100 mettle --pgo --release --build program.mettle
+```
 
-## Semantics and limits
+Lower it to inline more, raise it to inline less.
 
-- The interpreted run is approximate where the program touches the outside
-  world: unknown externs return 0 and write nothing. Compute-bound code
-  profiles faithfully; I/O-driven control flow profiles as "cold", which
-  only means static heuristics apply there.
-- Fuel exhaustion yields a partial profile - the first 64M steps of a
-  program are usually exactly its hot loops.
-- No main(), or main() outside the interpretable subset: the profile is
-  absent and `--pgo` is a no-op (reported, never silent).
-- The profile is deterministic, so builds stay reproducible.
+## Seeing the effect
 
-`METTLE_PGO_HOT=<n>` adjusts the hot threshold. See also
-[translation-validation.md](translation-validation.md) (the `--verify`
-machinery this shares its interpreter with) and [testing.md](testing.md)
-(`mettle test` / `mettle trace`).
+Pair it with [`--explain`](compilation.md) to watch inlining decisions change:
+
+```bash
+mettle --pgo --release --explain --build program.mettle
+```
+
+```text
+main (call to `helper` @ line 5): inlined  [inlined]
+```
+
+Build the same file without `--pgo` and compare. A callee that was refused for
+size and is now inlined is what `--pgo` bought.
+
+## When it helps
+
+It helps when the hot path runs through a callee just over the inliner's size
+budget, which the static heuristic has no way to know is hot. It does nothing
+when `main()` does not exercise the real workload, since the counts come from
+that one interpreted run.
+
+A program whose real hot path depends on input the interpreter never sees will
+measure the wrong thing. Give `main()` a representative default path if you
+want `--pgo` to be worth turning on.
+
+## See also
+
+- [Compile-time execution](testing.md)
+- [Compilation](compilation.md)
+- [Translation validation](translation-validation.md)

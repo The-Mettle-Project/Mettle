@@ -1,104 +1,121 @@
-# Compile-time execution: `mettle test` and `mettle trace`
+# Compile-time execution
 
-libmtlc contains a reference interpreter for its IR, and the `mettle` driver
-exposes two everyday workflows that run on it (no codegen, no linker, no process
-spawn), so feedback is effectively instant:
+The compiler carries an interpreter for its own IR. Two subcommands put it in
+your hands: `mettle test` runs your tests without building anything, and
+`mettle trace` shows you what a function did, line by line.
 
-## `mettle test`: tests that live inside the compiler
+Neither generates code and neither links, so both answer instantly.
+
+## Writing a test
+
+Mark a function `@test`. It takes no arguments and returns `int32`, where 0
+means it passed.
 
 ```mettle
-fn fib(n: int64) -> int64 {
-    if (n < 2) { return n; }
-    return fib(n - 1) + fib(n - 2);
+@test fn adds() -> int32 {
+  if (1 + 1 != 2) { return 1; }
+  return 0;
 }
 
-@test fn test_fib() -> int64 {
-    assert_eq(fib(0), 0);
-    assert_eq(fib(10), 55);
-    assert(fib(12) > fib(11));
-    return 0;
+@test fn slices() -> int32 {
+  var s: string = "hello";
+  if (s.length != 5) { return 1; }
+  return 0;
 }
 ```
 
-```
-$ mettle test app.mettle
+## Running them
 
+```bash
+mettle test program.mettle
+```
+
+```text
+running 2 tests (compile-time interpreter, no codegen)
+test adds ... ok
+test slices ... ok
+
+2 passed (program.mettle)
+```
+
+A failure names the value that came back:
+
+```text
+test fails ... FAILED (returned 3; a test must return 0)
+
+1 passed, 1 failed (program.mettle)
+```
+
+`--filter=S` runs the tests whose names contain `S`:
+
+```bash
+mettle test program.mettle --filter=add
+```
+
+```text
 running 1 test (compile-time interpreter, no codegen)
-test test_fib ... ok
-
-1 passed (app.mettle)
+test adds ... ok
 ```
 
-- `@test` functions take no parameters and return `int64` (0 = pass). They
-  are **type-checked in every build** - broken tests fail a normal compile -
-  but their code is **compiled out of normal binaries**, so tests cost
-  nothing at runtime and need no separate build target.
-- `assert(cond)` and `assert_eq(left, right)` are test builtins the
-  interpreter implements natively. A failure renders as a full compiler
-  diagnostic with the source snippet, a caret on the assertion, and the
-  actual values:
+Tests are stripped from a normal build, so `@test` functions cost nothing in
+the program you ship.
 
-  ```
-  error[E0003]: assertion failed in test 'test_fib_wrong'
-    --> app.mettle:24:5
-  24 |     assert_eq(fib(10), 54);
-     |     ^^^^^^^^^ left: 55, right: 54
-  ```
+## Tracing a function
 
-  Calling them outside a `@test` function is a compile error.
-- **Every test doubles as a memory sanitizer.** The interpreter owns the
-  heap, so an allocation a test never frees is reported with its allocation
-  line - sanitizer findings without ever running a binary:
+`mettle trace <file> <fn> [args...]` interprets one function with the
+arguments you give and prints the source with the values beside it:
 
-  ```
-  test test_leaky ... ok, but LEAKED
-  warning[E0003]: test 'test_leaky' leaked 24 bytes: this allocation is never freed
-    --> app.mettle:37:1
-  ```
-
-  Null dereferences and out-of-bounds accesses fail the test the same way.
-- `--filter=SUBSTR` runs matching tests only. Add `-O`/`--release` to test
-  the optimized IR instead of the debug shape.
-- A test using constructs outside the interpretable subset (strings,
-  closures, real I/O) is reported `skipped` with the reason - run those
-  through a normal `--build`.
-
-Exit code is nonzero when any test fails, so `mettle test` slots straight
-into CI.
-
-## `mettle trace` - see your function run, line by line
-
-```
-$ mettle trace app.mettle sum_range 0 10
-
-trace: sum_range(lo=0, hi=10)
-
-   6 | fn sum_range(lo: int64, hi: int64) -> int64 {
-   7 |     var total: int64 = 0;                            <- total = 0
-   8 |     var i: int64 = lo;                               <- i = 0
-   9 |     while (i < hi) {
-  10 |         total = total + i;                           <- total = 0, 1, 3, 6, ..., 45 (10x)
-  11 |         i = i + 1;                                   <- i = 1, 2, 3, 4, ..., 10 (10x)
-  12 |     }
-  13 |     return total;
-
-returns 45
+```bash
+mettle trace program.mettle total 4
 ```
 
-Print-debugging without prints: the function is interpreted on the given
-arguments and its source is printed with the values every line produced -
-loop iterations are compressed to first samples, the last value, and a
-count. Int and float parameters take the CLI values in order; pointer
-parameters get a synthesized 33-element seeded buffer (shown as
-`<buf:33 x int64>`). Crashes report the guard trap instead of a value.
+```text
+trace: total(n=4)
 
-## How this differs from other languages
+   1 | fn total(n: int32) -> int32 {
+   2 |   var sum: int32 = 0;                <- sum = 0
+   3 |   var i: int32 = 0;                  <- i = 0
+   4 |   while (i < n) {
+   5 |     sum = sum + i;                   <- sum = 0, 1, 3, 6 (4x)
+   6 |     i = i + 1;                       <- i = 1, 2, 3, 4 (4x)
+   7 |   }
+   8 |   return sum;
 
-`zig test` / `cargo test` / `go test` compile, link, and execute a test
-binary. Mettle interprets the IR inside the compiler process: there is no
-artifact, feedback scales with test size rather than program size, heap
-misuse is caught by construction, and assertion values come back through
-the same diagnostic pipeline as compile errors. The same interpreter powers
-`--verify` (translation validation of the optimizer itself, see
-[translation-validation.md](translation-validation.md)), so the semantics
-your tests run on are the semantics the optimizer is held to.
+returns 6
+```
+
+A line inside a loop shows the sequence of values it took and how many times
+it ran, so a wrong recurrence shows up as the wrong series rather than as a
+wrong final answer.
+
+## What the interpreter can run
+
+It models real memory, so most code runs:
+
+- Integers, floats, `bool`, `char`
+- Strings with their actual bytes, including literals and interpolation
+- Structs and arrays, passed and returned by value
+- Globals, with their initializers
+- Heap allocation and the modeled string externs
+- Closures, called through function-address tokens
+- Tagged enums, `match`, `defer`
+
+It stops at what it cannot model: a call into a foreign library whose behavior
+it does not know, inline assembly, and anything that reads the operating
+system. A function that reaches one of those reports an unsupported construct
+rather than guessing.
+
+## The same interpreter elsewhere
+
+Three other features run on it, which is why its coverage matters:
+
+- [`--pgo`](pgo.md) interprets `main()` to measure call frequencies.
+- [`--verify`](translation-validation.md) executes each function before and
+  after every optimizer pass and compares.
+- `comptime for` expands over compile-time values.
+
+## See also
+
+- [Declarations](declarations.md)
+- [Translation validation](translation-validation.md)
+- [Profile-guided optimization](pgo.md)

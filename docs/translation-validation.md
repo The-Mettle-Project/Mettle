@@ -1,219 +1,122 @@
-# Translation validation: `--verify`
+# Translation validation
 
-libmtlc can prove its own optimizer honest. With `--verify`, the backend
-validates **every optimization pass, on every function, during the compile**:
-whenever a pass changes a function's IR, the before-IR and after-IR are both
-executed by a built-in reference interpreter on identical generated inputs,
-and every observable is compared. If a pass changed behavior, the compiler:
+`--verify` holds the optimizer to the standard the optimizer holds your code
+to. After every pass, on every function the pass changed, it runs the IR from
+before and the IR from after on the same generated inputs and compares what
+they did.
 
-1. **names the exact pass and function**,
-2. **prints a concrete counterexample** (the inputs and the differing
-   observation), and
-3. **quarantines the pass for that function and recompiles from the
-   validated pre-pass IR** - the emitted binary is always built from IR that
-   passed validation.
-
-```
-$ mettle --verify --build app.mettle -o app.exe
-
-verify: MISCOMPILE CAUGHT: pass 'constant_and_branch_simplify' changed the
-        observable behavior of function 'scale'
-  counterexample (input set 0): scale(<buf:33 elems>, 8, 11)
-  divergence: return value was -7316370850897153118, is now -4463642014434965641
-  action: pre-pass IR restored; 'constant_and_branch_simplify' quarantined
-          for 'scale'; compilation continues from validated IR
-
-translation validation: 1 MISCOMPILE CAUGHT & QUARANTINED (64 validated)
+```bash
+mettle --verify --build program.mettle
 ```
 
-A clean compile ends with:
+`--verify` implies `-O`.
 
+## What it checks
+
+Each changed function is executed on six input sets in the
+[compile-time interpreter](testing.md), before the pass and after it. Matching
+behavior validates that application of that pass. Differing behavior is a
+miscompile, caught at the moment it is introduced.
+
+The claim "this optimization is correct" is not accepted from the optimizer on
+its own authority.
+
+## A clean run
+
+```text
+translation validation: OK - 70 pass applications validated on 6 input sets each
 ```
-translation validation: OK - 6761 pass applications validated on 6 input sets each
+
+The count is pass applications, one per pass per function that pass touched.
+
+## A caught miscompile
+
+```text
+verify: MISCOMPILE CAUGHT: pass 'sroa' changed the observable behavior of
+function 'total'
+  counterexample (input set 2): total(7)
+  divergence: return value was 28, is now 21
+  action: pre-pass IR restored; 'sroa' quarantined for 'total'; compilation
+  continues from validated IR
 ```
 
-The nearest comparable tool is Alive2 for LLVM - an external research
-harness. Mettle's validation is built into the compiler, runs per function at
-compile time, produces runnable counterexamples, and self-heals.
+Four things happen, in order. The pass is named. A runnable counterexample is
+printed, the call with the arguments that exposed it, where a pointer argument
+shows as `<buf:N elems>` and a string as `<string:N>`. The divergence is
+stated: a changed return value, a changed global, a changed buffer, or a
+changed sequence of calls out to `extern` functions. Then the compiler
+restores the pre-pass IR, quarantines that pass for that function only, and
+carries on.
 
-The same differential harness also gates the learned optimizer
-unconditionally: every [`--ml-opt`](ml-opt.md) model disposition is executed
-through it before it is allowed to stand, no `--verify` flag required. That
-gate is what makes the model's unproven rewrite class usable at all
-(`--ml-opt-speculative`) - an untrusted pass architecture where soundness is
-a property of the pipeline, not of the pass.
+The build finishes. The binary is correct, and it is built from IR that
+validated. The summary counts what was caught:
 
-## What is compared
+```text
+translation validation: 1 MISCOMPILE CAUGHT & QUARANTINED (69 validated)
+```
 
-Each function runs on 6 generated input sets (boundary-ish ints, floats,
-seeded buffers for pointer parameters, NUL-terminated text for `cstring`).
-The observation of a run is:
+## What it skips
 
-- the **return value** (integers bit-exact; floats within a small relative
-  tolerance, because vectorized `+` reductions legitimately reassociate),
-- the **final bytes of every buffer** (pointer arguments and heap
-  allocations),
-- the **ordered trace of extern calls** with their arguments **and the bytes
-  each pointer argument addressed at call time** (capped at 96 bytes) - an
-  unknown extern is modeled as pure and returns 0, but it is traced, so a
-  pass that deletes, duplicates, or reorders an `fwrite` still diverges, and
-  so does one that corrupts a locally-built buffer whose pointer VALUE is
-  identical in both runs,
-- the **final values of touched globals**.
+Some functions cannot be executed, and the summary says which and why:
 
-Uninitialized local variables and local array storage read **deterministic
-poison** (`0xA5`), not zero: native code gives them stack or register
-garbage, so a zero-defaulting interpreter would be blind to a transform that
-deletes an initializing store (`@neg <- 0` before a sign test). Heap `new`
-stays zeroed, matching codegen's `HEAP_ZERO_MEMORY`. Both machines poison
-identically, so only a transform that changes whether a read sees its
-initialization can diverge on it. Both of these observation holes were found
-in practice by the learned optimizer's speculative delete action
-([`--ml-opt-speculative`](ml-opt.md)) within its first hour of being enabled:
-it deleted exactly the two store shapes the harness could not see.
+```text
+  not validated: read_config (no executable inputs (traps/fuel on all sets))
+```
 
-Runtime guard traps (`mettle_crash_trap*`, the compiler's own null/bounds
-checks) abort a run cleanly. Two runs that both guard-trap are equivalent
-even if the crash point moved (the usual debug-checks contract); a pass that
-makes a *completing* program trap - or a trapping program complete - is a
-divergence.
+The interpreter models memory, strings, structs, globals, and closures. It
+stops at calls into foreign code whose behavior it cannot know, at inline
+assembly, and at anything that reads the operating system. It also stops when
+a function exhausts its step budget on every input set.
 
-## What is validated
+Skipped applications are counted separately, so a run that validated little
+does not look like a run that validated everything:
 
-All per-function passes: the fixpoint scalar pipeline (CSE, constant folding,
-strength reduction, loop unrolling, SROA, ...) and every SIMD
-recognizer/vectorizer. The interpreter implements the documented scalar
-semantics of each SIMD kernel op from `ir.h`, so a vectorizer that emits a
-kernel whose semantics differ from the loop it replaced is caught - the
-`iv-start-zero` class of historical bugs is exactly this shape.
+```text
+translation validation: OK - 12 pass applications validated on 6 input sets each; 40 skipped
+```
 
-Not validated (reported per function in the summary):
+## What it cannot see
 
-- functions with `string`/struct-typed parameters or locals the input
-  generator cannot synthesize,
-- functions using `call_indirect` (closures) or inline asm,
-- program-level passes (the inliner, pure-call hoisting),
-- functions whose runs trap or exhaust fuel on all six input sets.
+Validation compares observable behavior on generated inputs. Two limits follow
+from that.
 
-A skipped function is compiled normally; skipping is loud, never silent.
+Inputs are generated, so a bug that needs one specific value may go unseen. The
+input sets are small and structured rather than exhaustive.
 
-## Soundness of the net itself
-
-A **false positive** (the input generator provoking a difference that could
-not occur in a real execution) costs only optimization: the function keeps
-its validated pre-pass IR. It can never miscompile. A **false negative** is
-possible in principle - six input sets are not a proof - but the inputs
-exercise loop bodies, boundaries, and aliased memory, and every historical
-Mettle miscompile class (wrong constant, wrong sign, wrong first index,
-clobbered accumulator) diverges on almost any input.
-
-## Findings to date
-
-The learned optimizer's speculative delete action red-teamed this harness on
-its first day and found four observation weaknesses (extern pointed-to bytes,
-zero-filled locals, an undocumented in/out kernel contract in
-`IR_OP_LOWER_BOUND_I32`, and input sets that never exercised
-index-pair-dependent loop bodies) - all fixed; see
-[ml-opt.md](ml-opt.md#speculative-mode---ml-opt-speculative).
-
-On its first run over MettleWarband (~20k lines), `--verify` caught two real
-latent soundness bugs in `null_check_licm`, both now fixed:
-
-- hoisting a null-check trap above a loop with **no proof the loop runs**:
-  a legal state (null pointer + zero-trip loop) began trapping. Fixed by
-  guarding the hoisted check with a re-evaluation of the loop entry
-  condition.
-- hoisting a null-check that sat **under a condition inside the loop body**
-  (`if (keep) { buf[i] = x; }`): iterations that never reached the check
-  began trapping. Fixed by requiring a straight control-line from loop entry
-  to the check.
-
-## Self-test
-
-`METTLE_VERIFY_BREAK="pass_name[:function]"` deliberately corrupts one IR
-constant right after the named pass, proving the whole detect -> report ->
-quarantine -> heal loop end to end. The regression suite runs this on every
-build (`verify_sabotage_caught`), alongside `verify_clean` and
-`verify_nullcheck_zerotrip`.
+Behavior reached only through an `extern` pointer's bytes is invisible, because
+the interpreter does not know what is behind that pointer.
 
 ## Cost
 
-Roughly 2-4x compile time; small programs stay well under a second. Two
-things keep it cheap: interpreter machines grow their buffer/trace storage
-on demand instead of zeroing full-capacity arrays per run, and the pre-pass
-IR snapshot is cached per function and reused (validity proven by content
-comparison) across the majority of pass applications that change nothing.
-`METTLE_VERIFY_STATS=1` prints a breakdown of where validation time went.
-Use `--verify` in CI, before releases, or whenever a release-mode result
-looks suspicious. It implies `-O`.
+Every changed function is executed twelve times, so `--verify` is far slower
+than a normal build. It is a tool for a suspicious build or a bisect, not for
+every compile.
 
-## Pointing the same check at two functions: `swap-check`
+`METTLE_VERIFY_STATS=1` prints where the time went:
 
-The question a hot swap asks is whether a new function is compatible with the
-old one at the call boundary it replaces. That is the same shape of question
-translation validation already answers, so the same machinery answers it,
-aimed at two functions instead of at one function before and after a pass:
+```text
+  verify stats: snapshots 15000 ms (77 copies, 433 cache hits), machine setup
+  0 ms, before-runs 109000 ms (420), after-runs 16000 ms (420)
+```
+
+## Bisecting to a pass
+
+When you have a miscompile and want to know which pass caused it,
+`METTLE_SKIP_PASS` turns passes off by name or numeric id:
 
 ```bash
-mettle swap-check app.mettle --old render_v1 --new render_v2
+METTLE_SKIP_PASS=sroa mettle --release --build program.mettle
 ```
 
-The check runs on lowered IR before optimization, so the verdict is about what
-the two functions mean rather than about what any pass did to them. There are
-four outcomes.
+It takes a comma-separated list, and the names cover both the fixpoint passes
+and the named-sequence stages such as the vectorizers and SLP. Turn suspects
+off until the program is correct, and the last one you turned off is the
+culprit.
 
-**REFUSED**, before any input is generated, when the signatures differ. A swap
-keeps the boundary it replaces; changing the signature changes every caller,
-which is a rebuild rather than a swap. This is also a soundness requirement:
-the gate runs the old body under the new function's signature, so comparing
-across different signatures would not mean anything.
+`--verify` usually finds it for you first, and with a counterexample attached.
 
-**DIVERGED**, with a counterexample naming the input:
+## See also
 
-```
-swap-check: DIVERGED - 'near_v2' does not match 'near_v1'
-  return value was 5, is now 100
-  (input set 0) near_v2(5)
-```
-
-**UNVERIFIABLE** (exit code 2), when the gate cannot run these functions at
-all, reporting what blocked it. This is deliberately distinct from OK: "not
-checked" must never read as "checked and fine".
-
-**OK**, meaning the two agreed on every generated input set.
-
-### What OK covers, and what it does not
-
-Inputs come from two places. A fixed table probes shapes: buffer spans, index
-pairs, negative values, large magnitudes. On top of that, the gate harvests the
-integer constants the two functions actually **compare against** and tests each
-one and the value just past it, because a constant a function is tested against
-is a boundary and a boundary is where a rewrite goes wrong.
-
-That second half is what the fixed table structurally cannot do. These two
-differ at exactly `n == 100`:
-
-```mettle
-fn far_v1(n: int32) -> int32 { if (n > 100)  { return 100; } return n; }
-fn far_v2(n: int32) -> int32 { if (n >= 100) { return 99;  } return n; }
-```
-
-No entry in the shape table reaches 100, so before harvesting this pair was
-reported OK. Now it is caught, with the input named:
-
-```
-swap-check: DIVERGED - 'far_v2' does not match 'far_v1'
-  return value was 100, is now 99
-  (input set 6) far_v2(100)
-```
-
-It is still a differential test, not a proof. Harvesting reaches boundaries the
-functions name; it does not reach a boundary that emerges from arithmetic
-neither function writes as a constant, and it says nothing about inputs it did
-not try. The passing verdict reports how many input sets actually ran and says
-plainly that it is a test.
-
-Harvesting is bounded (at most six distinct constants) and applies only to this
-standalone gate. The per-pass `--verify` path deliberately does not harvest: it
-compares one function across a transformation, its table is tuned for that, and
-every build pays its cost.
+- [Compile-time execution](testing.md)
+- [Compilation](compilation.md)
+- [ML-driven IR optimization](ml-opt.md)
