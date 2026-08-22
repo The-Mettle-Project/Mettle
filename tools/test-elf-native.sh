@@ -217,15 +217,25 @@ fn main() -> int32 {
 # std/net with the Winsock-flavoured API (socket_tcp / closesocket / net_init /
 # net_cleanup) works on Linux through socket system calls.
 run_case_out unified_net 0 'tcp socket ok' 'import "std/io";
+import "std/core";
 import "std/net";
 fn main() -> int32 {
-  net_init();
-  var s: int64 = socket_tcp();
-  if (s < 0) { net_cleanup(); return 1; }
-  closesocket(s);
-  net_cleanup();
-  println("tcp socket ok");
-  return 0;
+  match (net_init()) {
+    case Ok(ready): { }
+    case Err(code): { return 1; }
+  }
+  match (socket_tcp()) {
+    case Ok(s): {
+      closesocket(s);
+      net_cleanup();
+      println("tcp socket ok");
+      return 0;
+    }
+    case Err(code): {
+      net_cleanup();
+      return 1;
+    }
+  }
 }'
 
 # The standard prelude resolves through the owned runtime.

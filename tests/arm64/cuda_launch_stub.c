@@ -40,16 +40,46 @@ static int stub_out64(int64_t *out) {
   if (out) *out = 0;
   return 0;
 }
-int cuInit(unsigned flags) { (void)flags; return 0; }
-int cuDeviceGet(int64_t *device, int ordinal) { (void)ordinal; return stub_out64(device); }
-int cuDeviceGetAttribute(int64_t *value, int attribute, int64_t device) {
-  (void)attribute; (void)device; return stub_out64(value);
+static int stub_out32(int32_t *out) {
+  if (out) *out = 0;
+  return 0;
 }
-int cuCtxCreate_v2(int64_t *ctx, unsigned flags, int64_t device) {
+int cuInit(unsigned flags) { (void)flags; return 0; }
+int cuDeviceGet(int32_t *device, int32_t ordinal) { (void)ordinal; return stub_out32(device); }
+int cuDeviceGetAttribute(int32_t *value, int32_t attribute, int32_t device) {
+  (void)attribute; (void)device; return stub_out32(value);
+}
+int cuDeviceGetCount(int32_t *count) { return stub_out32(count); }
+int cuDeviceGetName(char *name, int32_t length, int32_t device) {
+  (void)device;
+  if (name && length > 0) name[0] = '\0';
+  return 0;
+}
+int cuDeviceTotalMem_v2(int64_t *bytes, int32_t device) {
+  (void)device; return stub_out64(bytes);
+}
+int cuDriverGetVersion(int32_t *version) { return stub_out32(version); }
+int cuGetErrorName(int32_t code, const char **out) {
+  (void)code;
+  if (out) *out = "CUDA_STUB";
+  return 0;
+}
+int cuGetErrorString(int32_t code, const char **out) {
+  (void)code;
+  if (out) *out = "stubbed CUDA driver";
+  return 0;
+}
+int cuCtxCreate_v2(int64_t *ctx, unsigned flags, int32_t device) {
   (void)flags; (void)device; return stub_out64(ctx);
 }
 int cuCtxSynchronize(void) { return 0; }
 int cuModuleLoadData(int64_t *module, const void *image) { (void)image; return stub_out64(module); }
+int cuModuleLoadDataEx(int64_t *module, const void *image, uint32_t count,
+                       int32_t *options, int64_t *values) {
+  (void)image; (void)count; (void)options; (void)values;
+  return stub_out64(module);
+}
+int cuModuleUnload(int64_t module) { (void)module; return 0; }
 int cuModuleGetFunction(int64_t *function, int64_t module, const char *name) {
   (void)module; (void)name; return stub_out64(function);
 }
@@ -113,4 +143,25 @@ int cuGraphDestroy(int64_t graph) { (void)graph; return 0; }
  * defines it, but this link is plain glibc. */
 void *__acrt_iob_func(int index) {
   return index == 0 ? (void *)stdin : index == 1 ? (void *)stdout : (void *)stderr;
+}
+
+/* `"{code}"` in std/gpu's diagnostics lowers to this runtime helper. The
+ * bundled string runtime supplies it; this link does not have it, and the
+ * dispatch test only reaches it on a failure path, so a small ring of
+ * buffers is enough to keep one message's digits apart. `string` is a
+ * 16-byte view: `chars` at offset 0, `length` at offset 8. */
+typedef struct {
+  const char *chars;
+  uint64_t length;
+} MettleStringView;
+
+MettleStringView mettle_string_from_int(int64_t value) {
+  static char rings[4][24];
+  static unsigned next_ring;
+  char *out = rings[next_ring++ % 4];
+  int written = snprintf(out, sizeof(rings[0]), "%lld", (long long)value);
+  MettleStringView view;
+  view.chars = out;
+  view.length = written > 0 ? (uint64_t)written : 0u;
+  return view;
 }
