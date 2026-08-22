@@ -1,0 +1,61 @@
+import "std/core";
+
+struct Cell<T> {
+  v: T;
+
+  method get() -> T { return this.v; }
+}
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+fn main() -> int32 {
+  var inner: Cell<int64>;
+  inner.v = opaque(5);
+
+  var held: Option<Cell<int64>> = Some(inner);
+  var got: int64 = match (held) {
+    case Some(c): c.get()
+    case None: 0 - 1
+  };
+  if (got != 5) { return 1; }
+
+  var nested: Option<Option<int64>> = Some(Some(opaque(4)));
+  var flat: int64 = match (nested) {
+    case Some(o): match (o) { case Some(v): v case None: 0 - 1 }
+    case None: 0 - 2
+  };
+  if (flat != 4) { return 2; }
+
+  var empty: Option<Option<int64>> = Some(None);
+  var inner_empty: int64 = match (empty) {
+    case Some(o): match (o) { case Some(v): v case None: 7 }
+    case None: 0 - 2
+  };
+  if (inner_empty != 7) { return 3; }
+
+  var wrapped: Result<Option<int64>, string> = Ok(Some(opaque(9)));
+  var deep: int64 = match (wrapped) {
+    case Ok(o): match (o) { case Some(v): v case None: 0 - 1 }
+    case Err(e): (int64)e.length
+  };
+  if (deep != 9) { return 4; }
+
+  var failed: Result<Option<int64>, string> = Err("nope");
+  var why: int64 = match (failed) {
+    case Ok(o): match (o) { case Some(v): v case None: 0 - 1 }
+    case Err(e): (int64)e.length
+  };
+  if (why != 4) { return 5; }
+
+  var boxed: Option<Cell<float64>>;
+  var fc: Cell<float64>;
+  fc.v = 1.5;
+  boxed = Some(fc);
+  var f: float64 = match (boxed) {
+    case Some(c): c.get()
+    case None: 0.0
+  };
+  if (f != 1.5) { return 6; }
+
+  return 0;
+}

@@ -2537,7 +2537,10 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       }
 
       if (payload_type && call->argument_count == 1) {
+        Type *saved_target = checker->aggregate_target_type;
+        checker->aggregate_target_type = payload_type;
         Type *arg_type = type_checker_infer_type(checker, call->arguments[0]);
+        checker->aggregate_target_type = saved_target;
         if (!arg_type) {
           return NULL;
         }
