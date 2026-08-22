@@ -12606,6 +12606,8 @@ $runFixtures = @(
      What = "a codegen check failed" },
   @{ Name = "enums_match"; Path = "tests/codegen/enums_match.mettle"
      What = "a codegen check failed" },
+  @{ Name = "scoped_shadowing"; Path = "tests/codegen/scoped_shadowing.mettle"
+     What = "a shadowing var shared the slot of the one it shadows" },
   @{ Name = "unsigned_through_temp"; Path = "tests/codegen/unsigned_through_temp.mettle"
      What = "an unsigned shift, divide or remainder through a temp went signed" },
   @{ Name = "if_convert_accumulate"; Path = "tests/codegen/if_convert_accumulate.mettle"

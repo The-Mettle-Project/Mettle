@@ -64,9 +64,13 @@ const char *ir_local_bind(IRLoweringContext *context, const char *name,
       continue;
     }
     seen = 1;
-    /* A redeclaration at the same type shares the earlier binding's slot, so
-     * it keeps its name and the emitted IR is unchanged. */
-    if (ir_local_type_text_matches(b->type_text, type_text)) {
+    /* A binding whose scope has ended can lend its slot: two `var x: int32` in
+     * sibling blocks are never live at once, so sharing costs nothing and the
+     * emitted IR is unchanged. One that is still active cannot. A `var x`
+     * nested inside another `var x`'s scope is a second variable, and sharing
+     * the slot made the inner one write through -- the outer read 5 back from
+     * an inner block that set 5, and a loop body's `var x` survived the loop. */
+    if (!b->active && ir_local_type_text_matches(b->type_text, type_text)) {
       ir_name = b->ir_name;
       break;
     }
