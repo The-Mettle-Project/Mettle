@@ -1,521 +1,239 @@
-# Control Flow
+# Control flow
 
-Mettle provides structured control flow: conditionals, loops, and switches. All control structures use braces for the body.
+Branching, looping, matching, and the statements that run on the way out of a
+scope.
 
-## Assignment
+## if
 
-Assignment uses `=`. The left side must be an lvalue (variable, struct field, array element, or dereferenced pointer). Assignment is a statement; it does not produce a value for use in larger expressions.
-
-```mettle
-x = 42;
-ptr->field = value;
-arr[i] = x;
-```
-
-**Compound assignment** (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) is syntactic sugar for `target = target OP value`, where `OP` is the corresponding binary operator. The left side must be the same kind of lvalue as for plain assignment. Compound assignment is a statement. It produces no value for use in a larger expression. It is valid in `for`-loop initializers and increments.
-
-**Increment and decrement** (`++`, `--`) are the one-step forms of `+=` and `-=` over the same targets: `i++` is `i = i + 1`, `--count` is `count = count - 1`. They are statements like the compound assignments they stand for, so the prefix and postfix spellings are the same statement, and neither yields a value to read.
+The condition goes in parentheses and the body in braces. Braces are required
+even for one statement.
 
 ```mettle
-count += 1;
-arr[i] *= 2;
-for (var i: int32 = 0; i < 10; i += 1) {
-  // ...
-}
-```
-
-See [Lexical Structure](lexical-structure.md#operators-and-punctuation) for the full operator list.
-
-**Type mismatches** produce a compile error. Assigning a value of incompatible type (e.g. `x = 3.14` where `x` is `int32`) is rejected; the compiler does not silently truncate.
-
-## If and Else
-
-The `if` statement evaluates a condition. If true, the then branch runs. The optional `else` branch runs when the condition is false. The condition must be a **numeric type** (integer or floating-point); zero is false, non-zero is true. A pointer is not a valid condition. Compare it: write `if (ptr != 0)` to test for non-null.
-
-```mettle
-if (x > 0) {
-  // ...
-} else if (x < 0) {
-  // `else if` is parsed as part of the if statement
+if (n < 0) {
+  return 0;
+} else if (n == 0) {
+  return 1;
 } else {
-  // ...
+  return n;
 }
 ```
 
-`else if` chaining is fully supported as a contiguous sequence of conditions, avoiding deep AST nesting. There is no separate `elseif` keyword.
+The condition is a `bool`. Comparison and the logical operators produce one,
+and an integer converts to one, with any nonzero value counting as `true`.
 
-## While
-
-The `while` loop evaluates the condition. If true, the body runs and the condition is evaluated again. The loop exits when the condition is false.
-
-```mettle
-while (condition) {
-  // ...
-}
-```
-
-Common patterns:
+## while
 
 ```mettle
-// Iterate over an array
 var i: int32 = 0;
-while (i < len) {
-  arr[i] = arr[i] * 2;
+while (i < 5) {
+  total = total + i;
   i = i + 1;
 }
+```
 
-// Infinite loop (e.g. accept loop in a server)
-while (1) {
-  // ...
+## for over a range
+
+`for i in lo..hi` counts from `lo` up to but not including `hi`. The counter
+is the only binding in the language that takes its type from its surroundings,
+and it takes it from the bound:
+
+```mettle
+for i in 0..5 {
+  total = total + a[i];
 }
 ```
 
-An infinite loop is written `while (1)`; the condition is always true.
-
-## For
-
-The `for` loop has an initializer, condition, and increment. The initializer runs once. The condition is evaluated before each iteration; if false, the loop exits. The increment runs after each iteration. The initializer can declare a variable. Condition and increment are optional, so `for (;;)` is a valid infinite loop.
+Write the type when you want a different one:
 
 ```mettle
-for (var i: int32 = 0; i < 10; i = i + 1) {
-  // ...
+for i: int64 in 0..n {
+  sum = sum + a[i];
 }
 ```
 
-**Scope:** A variable declared in the initializer (e.g. `var i`) is scoped to the loop. It is not accessible after the loop exits.
+The bounds are evaluated once, before the first iteration.
 
-**Infinite loop:** Use `for (;;)` when all three parts are omitted. This is idiomatic in systems code.
+## for over a string
 
-### Range-based for
-
-`for i in lo..hi { ... }` iterates `i` over a half-open range. `lo..hi` is
-**exclusive** of `hi`; `lo..=hi` is **inclusive**:
+`for c in s` walks the bytes of a `string`, binding each as a `char`:
 
 ```mettle
-for i in 0..n      { sum = sum + a[i]; }   // i = 0, 1, ..., n-1
-for i in 0..=n     { /* i = 0, 1, ..., n */ }
-for i: int64 in 0..count { /* loop variable typed explicitly */ }
-```
-
-The loop variable's type is inferred from the start bound, or you may annotate
-it (`for i: int64 in ...`). A range-based `for` desugars at parse time into the
-ordinary counted `for` above: the start bound is evaluated once, the end bound
-is re-evaluated each iteration (so hoist a call-valued bound yourself if that
-matters). Labels work as usual: `outer: for i in 0..n { ... }`.
-
-> The `..`/`..=` distinction here is exclusive/inclusive. Note that switch-case
-> ranges (`case lo..hi:`) use `..` as **inclusive**, a historical inconsistency
-> to be aware of.
-
-## Vectorization contracts
-
-A counted loop may carry a `@simd` attribute that asks the optimizer to
-vectorize it. This only has effect under `-O` / `--release` (the auto-vectorizer
-runs only when optimizing); plain debug builds print one note that the contracts
-were not checked.
-
-```mettle
-@simd  for i in 0..n { c[i] = a[i] + b[i]; }   // best-effort: warn if not vectorized
-@simd! for i in 0..n { c[i] = a[i] + b[i]; }   // contract: compile ERROR if not vectorized
-```
-
-- **`@simd`** is a hint. If the loop vectorizes, nothing is printed; if it does
-  not, the compiler emits a *warning* explaining why and keeps the scalar loop.
-- **`@simd!`** is a hard contract. If the loop does not vectorize, compilation
-  **fails** with an error and a precise reason; the performance guarantee
-  cannot silently regress.
-
-Both attributes also apply to `while` loops. The diagnostic names the cause when
-it can determine it: a function call in the body, control flow (a nested loop or
-data-dependent branch), an unsupported element width (16- or 64-bit integers
-have no kernel), a loop-carried serial recurrence (a scalar computed from its
-own previous value through a non-reassociable operation (`*`, `/`, a shift, or
-a bitwise or xor op), so the iterations form a dependency chain, e.g. a hash, an
-RNG, or an IIR filter), or, when none of those apply, that no vectorizer
-recognized the loop's shape. The recurrence cause is found by backward
-data-flow analysis, and `+`/`-` reductions are excluded from it, because those
-reassociate and vectorize.
-
-`@simd` may also sit on a **function**, where it becomes the default contract
-for *every* counted loop in the body that does not carry its own `@simd`:
-
-```mettle
-@simd! fn sum(a: int32*, n: int64) -> int64 {
-  var s: int64 = 0;
-  var i: int64 = 0;
-  while (i < n) { s = s + (int64)a[i]; i = i + 1; }   // inherits @simd! from the function
-  return s;
+var s: string = "hello";
+for c in s {
+  print("{c}");
 }
 ```
 
-A per-loop attribute always wins over the function default, so you can place a
-function-wide `@simd` and still relax (or tighten) an individual loop. Note that
-`@simd!` on a function is a hard contract on *all* its counted loops. If the
-body mixes vectorizable and non-vectorizable loops, annotate the loops
-individually instead. See [Function decorators](declarations.md#function-decorators).
+The subject is evaluated once, so `for c in read_line(buf, 256, f)` reads one
+line and then walks it.
 
-### `--simd-report`
+## break and continue
 
-Pass `--simd-report` (with `-O`/`--release`) to have the compiler report what
-each `@simd` loop became:
+`break` leaves the innermost loop. `continue` starts its next iteration.
 
-```
-kernels.mettle:10:10: note: @simd loop vectorized (simd_dot_i8)
-kernels.mettle:21:9:  warning: @simd loop was not vectorized: the loop body contains a function call
-```
-
-This makes the optimizer's decision legible instead of a black box: you can see
-exactly which kernel a loop lowered to, or why it stayed scalar.
-
-## Switch
-
-The `switch` statement evaluates an expression and compares it to each `case` value. Case values must be compile-time constant integer expressions (including enum variants and `true`/`false`). When a case matches, its body runs. Use `break` to exit the switch. Use `continue` inside a loop that contains the switch to continue the loop. Only one `default` clause is allowed.
-
-**Range cases:** A case may match an inclusive interval with `case lo..hi:`, where both bounds are compile-time constant integer expressions and `lo <= hi`. The case runs when the switch value is in `[lo, hi]`. Cases are tested top to bottom and the first match wins, so a single-value case listed before an overlapping range still takes precedence.
-
-**Fall-through:** Unlike some languages, Mettle does not enforce `break`. If you omit it, execution falls through to the next case (C-style behavior). To avoid accidental bugs, always end each case with `break` explicitly unless you intend fall-through.
-
-**Exhaustiveness:** `switch` over raw integers may omit matching cases and continue after the statement if no case matches. `switch` over `enum` or `bool` must be exhaustive unless a `default` clause is present.
+A loop may carry a label, and then `break` and `continue` can name which loop
+they mean:
 
 ```mettle
-switch (expr) {
-  case 1:
-    // ...
-    break;
-  case 2:
-    // ...
-    break;
-  case 3..9:        // inclusive range: matches 3 through 9
-    // ...
-    break;
-  default:
-    // ...
-}
-```
-
-## Match
-
-The `match` statement branches on a tagged enum and optionally binds the payload of a variant. The subject expression must have a tagged-enum type.
-
-```mettle
-match (value) {
-  case Some(v): {
-    return v;
-  }
-  case None: {
-    return 0;
+outer: for i in 0..3 {
+  for j in 0..3 {
+    if (j == 2) { continue outer; }
+    if (i == 2) { break outer; }
+    println("{i},{j}");
   }
 }
 ```
 
-**Arms:** Each `case` arm has a variant name and a block body. Use `case VariantName(binding):` when that variant carries a payload and you want to bind it to a local name. Use `case VariantName:` for payloadless variants.
-
-**Default arm:** `default:` is allowed. Without `default`, the match must cover every variant of the tagged enum.
-
-**No fall-through:** `match` arms do not fall through. Once an arm matches, its block runs and control continues after the `match`.
-
-### match as an expression
-
-`match` also exists in an expression form that yields a value. Each arm body is a single value-yielding expression rather than a block, and arms may be separated by commas, newlines, or semicolons:
-
-```mettle
-fn unwrap_or(o: Option, fallback: int32) -> int32 {
-  return match (o) {
-    case Some(value): value
-    case None: fallback
-  };
-}
-
-var doubled: int32 = match (Some(10)) {
-  case Some(v): v
-  default: 0
-} * 2;
+```text
+0,0
+0,1
+1,0
+1,1
 ```
 
-All arm bodies must have a compatible type, and because the expression has to produce a value, it must be exhaustive: cover every variant or supply a `default`. The statement form above is the right choice when the arms run several statements or diverge; the expression form is the right choice when each arm is a single value.
+## switch
 
-## Break and Continue
+`switch` branches on an integer. Each `case` takes a constant and a braced
+body, and `default` catches the rest.
 
-`break` exits the innermost loop or switch. `continue` skips to the next iteration of the innermost loop. Both are context-checked; they are valid only inside loops or switches. Using them elsewhere is a compile error.
-
-**Important:** a bare `break` or `continue` targets the **innermost** enclosing loop or switch. Inside nested loops, `break` exits the inner loop and leaves the outer one running. Inside a `switch` that sits in a loop, `break` exits the switch and the loop keeps going; write `continue` to skip to the next loop iteration. To reach further out, label the loop and name it (see below).
+Control falls through from one case into the next. End a case with `break` to
+leave the switch:
 
 ```mettle
-while (1) {
-  switch (cmd) {
-    case 0:
-      break;      // exits switch only, loop continues
-    case 1:
-      continue;   // skips to next loop iteration (exits switch and continues loop)
-    case 2:
-      break;      // exits switch
-  }
-  // ...
+switch (code) {
+  case 1: { println("one"); break; }
+  case 2: { println("two"); break; }
+  default: { println("other"); }
 }
 ```
 
-### Labeled break and continue
+With `code` set to 1 that prints `one`. Dropping the `break` statements makes
+it print `one`, `two`, and `other`.
 
-A `while` or `for` loop may carry a label, written `name:` immediately before
-the loop keyword. `break name` then exits that labeled loop, and
-`continue name` jumps to the next iteration of that labeled loop, regardless of
-how deeply nested the statement is:
+A plain enum is 8 bytes and does not decay to an integer, so cast it first:
 
 ```mettle
-outer: for (var i: int32 = 0; i < n; i = i + 1) {
-  for (var j: int32 = 0; j < m; j = j + 1) {
-    if (grid[i][j] == target) {
-      break outer;     // exits BOTH loops
-    }
-    if (skip[j]) {
-      continue outer;  // next i, abandoning the rest of the j loop
-    }
-  }
+enum Color { Red = 1, Green = 2, Blue = 3 }
+```
+
+```mettle
+switch ((int32)c) {
+  case 1: { println("red"); break; }
+  case 2: { println("green"); break; }
+  default: { println("other"); }
 }
 ```
 
-Rules and limits:
+## match
 
-- Labels attach only to `while` and `for` loops. Writing `name:` before any
-  other statement is a compile error.
-- The label in `break name` / `continue name` must match the label of an
-  enclosing loop; an unknown label is a compile error
-  (`'break NAME' has no matching labeled loop`).
-- `continue name` requires the target to be a loop (every labeled loop is, so
-  this always holds for valid labels).
-- Unlabeled `break`/`continue` still target the innermost loop or switch as
-  before.
-- Labels live in their own namespace and do not collide with variable or
-  function names.
-- The jump runs the deferred statements of every scope it leaves, innermost
-  first, including the labeled loop's own body. See
-  [Jumping out of a scope](#jumping-out-of-a-scope).
-
-## Return
-
-`return` exits the current function. A function with a return type must provide a value: `return value`. A void function uses `return` with no value.
+`match` reads a tagged enum. Each `case` names a variant, binds its payload,
+and takes a braced body:
 
 ```mettle
-return;
-return value;
-```
-
-## Short-Circuit Evaluation
-
-Logical operators `&&` and `||` support short-circuit evaluation. For pointer checks like `ptr != 0 && ptr->field > 0`, a single condition is safe:
-
-```mettle
-if (ptr != 0 && ptr->field > 0) {
-  // ...
+enum Shape {
+  Circle(float64),
+  Square(int32),
+  Empty
 }
 ```
 
-## Defer and Errdefer
-
-`defer` runs a statement when the current scope exits. `errdefer` runs one when
-the function returns a non-zero value. Deferred statements run in reverse order
-of declaration, so the last one written runs first.
-
-Every example below was compiled and run, and the output shown is what it
-printed.
-
-### Forms
-
 ```mettle
-defer cleanup();          // a call
-defer count = count + 1;  // an assignment
-defer {                   // a block
-  flush();
-  close(handle);
-}
-errdefer rollback();      // a call, on a non-zero return
-```
-
-A deferred direct call copies its argument values where the `defer` is written.
-In a loop, `defer print("{i}")` records `i` as it stands on that iteration, so
-the calls print `0`, `1`, `2`. Method calls and calls through a function pointer
-read their operands at scope exit, so copy the value into a local first if you
-need the one from the defer point:
-
-```mettle
-var current: int32 = i;
-defer obj.m(current);
-```
-
-### Order
-
-```mettle
-fn lifo() -> int32 {
-  defer println("first");
-  defer println("second");
-  defer println("third");
-  println("body");
-  return 0;
+match (s) {
+  case Circle(r): { return 3.0 * r * r; }
+  case Square(w): { return (float64)(w * w); }
+  case Empty: { return 0.0; }
 }
 ```
 
-```
-body
-third
-second
-first
+Every variant must have a case, or the match must end with `default`. Leaving
+one out fails the build, so adding a variant later shows you every place that
+has to change:
+
+```text
+error[E0003]: Non-exhaustive match on 'Opt': variant 'None' not covered; add
+a 'case None:' arm or a 'default:' arm
 ```
 
-### Scope
+`match` takes tagged enums only. Handing it a plain enum is an error:
 
-A block runs its deferred statements when the block ends. The function runs its
-own when it returns.
+```text
+error[E0003]: match expression must be a tagged enum type, got 'Color'
+```
+
+The same shape reads a [`Result` or an `Option`](types.md):
 
 ```mettle
-fn nested() -> int32 {
-  defer println("outer cleanup");
-  {
-    defer println("inner cleanup");
-    println("inner body");
-  }
-  println("after block");
-  return 0;
+match (half(8)) {
+  case Ok(v): { println("ok {v}"); }
+  case Err(e): { println("err {e}"); }
 }
 ```
 
-```
-inner body
-inner cleanup
-after block
-outer cleanup
-```
+When two enums in scope share a variant name, qualify the constructor:
+`Shape.Square(4)`. The `case` labels stay bare.
 
-A loop body is a block, so a `defer` written inside one runs at the end of each
-iteration:
+## return
+
+`return expr` leaves the function with a value. A function declared with no
+return type leaves with a bare `return`, or by running off the end.
+
+## defer and errdefer
+
+`defer` runs a statement when the enclosing scope ends, whichever way control
+leaves it: falling off the end, `return`, `break`, `continue`, or a `return`
+out of a `switch` case. Deferred statements run in reverse order of
+declaration.
+
+Inside a loop body, a `defer` runs at the end of each iteration:
 
 ```mettle
-fn each() -> int32 {
-  var i: int32 = 0;
-  while (i < 3) {
-    defer println("iteration cleanup");
-    println("iteration start");
-    i = i + 1;
-  }
-  return 0;
+for i in 0..2 {
+  defer println("end {i}");
+  println("body {i}");
 }
 ```
 
-```
-iteration start
-iteration cleanup
-iteration start
-iteration cleanup
-iteration start
-iteration cleanup
+```text
+body 0
+end 0
+body 1
+end 1
 ```
 
-### Errdefer
+`errdefer` runs only on the error path, meaning a return of an `Err`. It pairs
+with `defer` for work that has to be undone when a step fails.
+[Declarations](declarations.md) shows both together.
 
-`errdefer` is valid only inside a function. The rule is a convention on the
-return value: zero means success, and every other value means an error.
+## comptime for
+
+`comptime for` runs while compiling and leaves nothing behind at run time. The
+loop is expanded once per element and the binding is a compile-time value.
+
+Inside a function it generates statements:
 
 ```mettle
-fn work(n: int32) -> int32 {
-  defer println("defer always");
-  errdefer println("errdefer only");
-  if (n == 1) {
-    return 42;
-  }
-  return 0;
+comptime for f in typeof(Point).fields {
+  println("field {f.name} at {f.offset}");
 }
 ```
 
-`work(0)` prints `defer always`. `work(1)` prints `errdefer only`, then
-`defer always`. The same split applies when a function body ends without a
-`return`.
+At file scope it generates declarations, and each generated name must come
+from the binding. [Declarations](declarations.md) covers `ident(...)` and the
+rules that go with it.
 
-### Jumping out of a scope
+A compile-time binding cannot become a run-time value. Assigning `f` itself to
+an `int64` is an error, because generated code gets the trust hand-written
+code gets.
 
-`break` and `continue` run the deferred statements of every scope they leave,
-innermost first, before the jump. So does `return`.
+## asm
 
-```mettle
-fn scan() -> int32 {
-  var i: int32 = 0;
-  while (i < 3) {
-    defer println("iteration cleanup");
-    println("iteration start");
-    i = i + 1;
-    if (i == 2) { break; }
-  }
-  println("after loop");
-  return 0;
-}
-```
+An `asm` block holds x86-64 instructions. Mnemonics and register names inside
+it are recognized without regard to case, and they mean nothing outside it.
+The optimizer does not look inside a block, and a loop containing one does not
+vectorize.
 
-```
-iteration start
-iteration cleanup
-iteration start
-iteration cleanup
-after loop
-```
+## See also
 
-`break name` and `continue name` leave more scopes, so they run more. Both loop
-bodies below clean up, inner first:
-
-```mettle
-fn find() -> int32 {
-  outer: while (1) {
-    defer println("outer cleanup");
-    var j: int32 = 0;
-    while (j < 2) {
-      defer println("inner cleanup");
-      break outer;
-    }
-  }
-  println("after loops");
-  return 0;
-}
-```
-
-```
-inner cleanup
-outer cleanup
-after loops
-```
-
-A `switch` case body is a scope of its own, and it cleans up when the case
-ends, whether the case breaks out or falls through to the next label:
-
-```mettle
-fn pick(v: int32) -> int32 {
-  switch (v) {
-    case 1: {
-      defer println("case cleanup");
-      println("case 1");
-      break;
-    }
-  }
-  println("after switch");
-  return 0;
-}
-```
-
-```
-case 1
-case cleanup
-after switch
-```
-
-A `break` inside a `switch` exits the switch, so it runs the case body's
-deferred statements and leaves an enclosing loop's alone. Those run when the
-iteration ends, as usual.
-
-`errdefer` is the exception: it belongs to the function's return, and a jump is
-not one. A `break` past an `errdefer` does not fire it.
-
-### Cost
-
-Each `defer` copies its arguments and adds the deferred statement to the exit
-path of its scope. A function with `errdefer` compiles two exit paths and picks
-one by testing the return value. Clean up by hand in a hot loop where that
-matters.
-
-## Unreachable Code
-The compiler emits a warning for unreachable statements that appear after an unconditional `return`, `break`, or `continue` in the same block.
+- [Expressions](expressions.md)
+- [Declarations](declarations.md)
+- [Types](types.md)

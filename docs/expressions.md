@@ -1,235 +1,191 @@
 # Expressions
 
-Expressions produce values. They appear in initializers, assignments, function arguments, and control flow conditions.
+Operators, precedence, casts, calls, and string interpolation.
 
-**Operator precedence** (highest first):
+## Precedence
 
-Three tiers bind tighter than every binary operator. From tightest:
+Tightest first. Every binary operator groups left to right.
 
-| Tier | Forms | Example |
-|------|-------|---------|
-| Postfix | call, generic call, member access `.` and `->`, indexing `[]` | `a.b[i].c(x)` |
-| Unary | `-`, `+`, `*`, `&`, `~`, `!` | `-x`, `!y`, `*p`, `&v`, `~mask` |
-| Cast | `(Type)expr` | `(int64)x` |
+| Level | Operators |
+|-------|-----------|
+| 13 | `.` member access |
+| 11 | `*` `/` `%` |
+| 10 | `+` `-` |
+| 9 | `<<` `>>` |
+| 8 | `<` `<=` `>` `>=` |
+| 7 | `==` `!=` |
+| 6 | `&` |
+| 5 | `^` |
+| 4 | `|` |
+| 3 | `&&` |
+| 2 | `||` |
 
-Postfix forms chain left to right; unary operators are right-associative. A cast binds tighter than any binary operator but looser than postfix, so `(int64)p->len` casts the field, not the pointer.
+Two of these catch people out. Addition binds tighter than shift, so
+`1 << 2 + 1` is `1 << 3`, which is 8. The bitwise operators bind looser than
+comparison, so `a & b == c` is `a & (b == c)`. Parenthesize when you mean the
+other thing.
 
-Binary operators, all **left-associative**, from tightest to loosest:
+Unary `-`, `!`, `~`, `&`, and a cast bind tighter than any binary operator.
 
-| Precedence | Operators | Example |
-|------------|-----------|---------|
-| 1 | Multiplicative `*`, `/`, `%` | `a * b`, `a % b` |
-| 2 | Additive `+`, `-` | `a + b` |
-| 3 | Shifts `<<`, `>>` | `a << 1` |
-| 4 | Relational `<`, `<=`, `>`, `>=` | `a < b` |
-| 5 | Equality `==`, `!=` | `a == b` |
-| 6 | Bitwise AND `&` | `a & b` |
-| 7 | Bitwise XOR `^` | `a ^ b` |
-| 8 | Bitwise OR `\|` | `a \| b` |
-| 9 | Logical AND `&&` | `a && b` |
-| 10 | Logical OR `\|\|` | `a \|\| b` |
+## Arithmetic
 
-The shift level sits between additive and relational, as in C: `a << 1 < b` parses as `(a << 1) < b`, and `a + b << c` parses as `(a + b) << c`. Comparisons do not chain specially, so `a < b == c` parses as `(a < b) == c`, comparing a 0/1 result against `c`. Use parentheses to clarify or override.
+`+`, `-`, `*`, `/`, `%`, and unary `-`. Integer `/` truncates toward zero and
+`%` takes the sign of the left operand.
 
-## Literals
+Overflow wraps. The compiler emits the machine's own instructions and adds no
+check.
 
-Numeric literals: decimal (`42`), hexadecimal (`0xFF`), binary (`0b1010`), floating-point (`3.14`). String literals: `"hello"`. The null pointer: `0` (for pointer types).
+Dividing by a constant zero fails the build, as [M0116](diagnostics.md):
 
-**Negative literals:** A leading minus is not part of the literal. The expression `-17` is parsed as the unary minus operator applied to the literal `17`. This matters for boundary values: `var x: int8 = -128` is valid because the literal `128` is negated to `-128`, which fits in `int8`. If `-128` were a literal, some implementations might reject it.
-
-**Literal default types:** A bare integer literal like `42` has type `int32` when the context does not require a specific type. Floating-point literals default to `float64`. Where a literal is stored somewhere narrower, its value is checked rather than its type, so `var b: uint8 = 200;` needs no cast and `var h: int32 = 2654435761;` is reported as out of range. See [Types](types.md) for conversion rules.
-
-## Aggregate Literals
-
-An **array literal** is `[a, b, c]`, and a **struct literal** is `{ field: value, ... }`. The repeat form `[value; count]` writes one value `count` times, which is how a large table is filled without spelling out every element.
-
-```mettle
-const TABLE: int32[4] = [10, 20, 30, 40];
-const ZEROED: uint8[256] = [0; 256];
-const ORIGIN: Pt = { x: 1.0, y: 2.0 };
-const GRID: Pt[2] = [{ x: 1.0, y: 2.0 }, { x: 3.0, y: 4.0 }];
+```text
+error[M0116]: Division by a constant zero; this traps the moment it executes
 ```
 
-An aggregate literal has **no type of its own**. It takes the type of what it initializes, which in Mettle is always written down, since every `var` and `const` states its type. That is why it may only appear where that type is known: as the initializer of a `var` or `const`, or as the right-hand side of an assignment. Anywhere else is a compile error.
+## Bitwise and shifts
 
-The rules:
+`&`, `|`, `^`, `~`, `<<`, `>>`. A right shift of a signed value is
+arithmetic and of an unsigned value is logical.
 
-- **Fields may be given in any order**, and any field left out keeps the zero it starts as. Naming a field twice, or naming one the struct does not have, is an error.
-- **An array literal may be shorter than the array**; the remaining elements stay zero. Longer is an error.
-- **Every element must be a compile-time constant.** Literals, other constants, `sizeof`, arithmetic over those, `&some_function`, `&some_global`, `0` for a pointer, a string literal, and nested aggregate literals all qualify. A function call does not.
-- **Nesting matches the type**: `{ ... }` initializes a struct, `[ ... ]` initializes an array, and the two do not substitute for one another.
+Shifting by a constant at or past the operand's width draws
+[M0115](diagnostics.md), a warning, because the hardware masks the count:
 
-Because the whole literal is constant, it folds to the laid-out bytes of the value. A global one becomes those bytes in the object file's data, with the linker filling the pointer-sized holes (a function's address, another global's address, a string's characters). A local one is copied in from that same constant rather than stored element by element, so a large table costs one block copy.
-
-A trailing comma is allowed in both forms. Array literals may be written across as many lines as they need; so may struct literals.
-
-## Identifiers and Member Access
-
-An identifier denotes a variable, parameter, or function. A built-in type name (`int32`, `string`, ...) in value position is a compile-time `Type` value. Member access uses `.` for struct fields and string fields; on a `Type` value it yields a compile-time `Field`. Pointer field access uses `->`. `offsetof(Point.x)` is a compile-time integer: the byte offset of that field from the frontend type table.
-
-```mettle
-x
-obj.field
-ptr->field
-s.chars
-s.length
+```text
+warning[M0115]: Shift by 32 on a 32-bit value (`int32`); the hardware masks
+the shift count, so this does not produce the zero the code reads as
 ```
 
-## Arithmetic and Comparison
+## Comparison and logic
 
-Arithmetic: `+`, `-`, `*`, `/`, `%`. Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`. Operands must have compatible types. Integer division truncates toward zero. Modulo `%` returns the remainder and requires integer operands.
+`<`, `<=`, `>`, `>=`, `==`, `!=` produce a `bool`. `&&` and `||` produce a
+`bool` and stop as soon as the answer is known, so the right side is not
+evaluated when the left settles it.
 
-```mettle
-a + b
-a - b
-a * b
-a / b
-a % b
-a == b
-a != b
-a < b
-a <= b
-a > b
-a >= b
-```
-
-**Bitwise operators:** Bitwise AND (`&`), OR (`|`), XOR (`^`), complement (`~`), and shifts (`<<`, `>>`) are supported for integer types. Unary `&` is address-of; binary `&` is bitwise AND. Context disambiguates.
-
-**Logical operators:** Short-circuit logical AND (`&&`) and OR (`||`) are supported.
-
-**Division by zero:** Integer division by zero produces undefined behavior. On x86-64, `idiv` raises a divide exception (#DE), typically resulting in a crash. The compiler does not insert runtime checks. Floating-point division by zero produces infinity or NaN per IEEE 754.
-
-## Unary Operators
-
-Negation `-x`. Logical NOT `!x` (returns 1 if x is 0, otherwise 0). Dereference `*p` (loads the value at the pointer). Address-of `&x` (produces a pointer to x). Address-of requires an assignable expression (lvalue).
+`!` negates. Store the result in a `bool` when you want to print it:
 
 ```mettle
--x       // negation
-!x       // logical NOT
-*p       // dereference
-&x       // address-of
+var ok: bool = !(a > 3);
+println("{ok}");
 ```
 
-**Null dereference:** In normal builds, the compiler emits runtime null checks for dynamic pointer dereference/indexing and traps with a fatal message on null. In `--release`, those generated checks are disabled; dereferencing a null pointer is undefined behavior and typically crashes. See [Types](types.md#pointer-types).
+## Assignment
 
-**Address-of on non-lvalues:** Taking the address of a temporary or non-assignable expression is a compile error. For example, `&(x + 1)` and `&42` are invalid. The operand must be a variable, struct field, array element, or dereferenced pointer. The error message is "Address-of operator requires an assignable expression".
+`=` assigns. The compound forms `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`,
+`^=`, `<<=`, `>>=` read, apply, and write back.
 
-## Indexing
-
-Arrays and pointers support indexing. The index must be an integer. The expression `arr[i]` or `ptr[i]` computes the address of the element and loads or stores as appropriate in context.
-
-**Element size:** Indexing advances by the size of the element type, not by bytes. For `int32* p`, the expression `p[1]` accesses the next `int32` (4 bytes). For `uint8*` or `cstring`, `ptr[i]` advances by 1 byte. This matches C semantics.
-
-To pass an array to a function that expects a pointer, use `&arr[0]` or `&buf[0]`. The function parameter should have type `T*`:
+`++` and `--` are statements that add or subtract one:
 
 ```mettle
-fn sum(buf: int32*, len: int32) -> int32 {
-  var total: int32 = 0;
-  var i: int32 = 0;
-  while (i < len) {
-    total = total + buf[i];
-    i = i + 1;
-  }
-  return total;
-}
-
-var data: int32[10];
-// ...
-var result: int32 = sum(&data[0], 10);
+var i: int32 = 0;
+i++;
+i--;
 ```
 
-## Function and Method Calls
+## Casts
 
-Function calls: `name(args)`. Method calls: `obj.method(args)`. Arguments are evaluated left to right. The number and types must match the declaration.
+`(T)expr` converts. It moves between integer widths, between integers and
+floats, between `char` and integers, and between pointer types.
 
 ```mettle
-add(1, 2)
-puts("hello")
-obj.method(args)
+var c: char = 'h';
+var code: int32 = c;
+var back: char = (char)(code + 1);
 ```
 
-**Argument type mismatches:** Argument types must be assignable to the parameter types. Incompatible types (e.g. passing `float64` where `int32` is expected) produce a compile error. Implicit conversions (e.g. `int32` to `int64`) are applied when the type checker allows them. See [Types](types.md#type-conversions).
+Widening needs no cast. Narrowing one integer into a smaller one does, and the
+compiler says which conversion it wanted:
 
-**Function pointers:** Use the `fn(param_types) -> return_type` type to store and pass function addresses. Take the address with `&func` and call like a normal function: `fp(args)`. See [Types](types.md#function-pointer-type) for details.
+```text
+error[M0119]: Narrowing conversion from 'int64' to 'int8' needs a cast
+```
 
-## Allocation
+## Member access and indexing
 
-The `new` expression allocates a zero-initialized value with a direct `calloc(1, size)` call and returns a pointer. Mettle does not link a heap runtime for this. See [Heap Allocation](heap-allocation.md) for details.
+`a.b` reads a field of a struct value. `p->b` reads a field through a pointer.
+`a[i]` indexes an array, a pointer, or a `string`.
 
 ```mettle
-var p: MyStruct* = new MyStruct;
+var p: Point = { x: 3, y: 4 };
+var q: Point* = &p;
+println("{p.x} {q->y}");
 ```
 
-**Initialization:** `new` allocates memory that is **zeroed**. All bytes of the allocated object are set to zero before the pointer is returned.
+Indexing a `string` yields a `char`. Indexing a pointer walks by the pointee's
+size, so `b[i].x` on a `Body*` reads the i-th element's field.
 
-**Allocation failure:** `new` uses the owned zeroed allocator. If allocation
-fails, the result is null.
+`s.length` is the byte count of a `string` and `s.chars` is the `uint8*`
+behind it.
 
-## Expression Evaluation Order
+## Address-of
 
-**Function arguments** are evaluated left to right. The first argument is fully evaluated before the second, and so on.
+`&x` takes the address of a variable, a field, or an element. `&f` takes the
+address of a named function, which is how a plain function reaches a `Fn`
+parameter or field.
 
-**Binary operands** (e.g. `a + b`, `x == y`) are evaluated in an implementation-defined order. Do not rely on the order of evaluation for side effects; use separate statements if the order matters.
+The compiler reports an address that would outlive what it points at, as
+[M0103](diagnostics.md) for a returned stack local and
+[M0104](diagnostics.md) for one stored in a global.
 
-## Cast Expressions
-
-Explicit type casting is supported using the `(Type)expression` syntax. This allows explicit conversions between different numeric types, pointer types, and between integers and pointers.
+## Calls
 
 ```mettle
-var f: float64 = 3.14;
-var i: int64 = (int64)f;
-
-var ptr: int32* = (int32*)0;
-var addr: int64 = (int64)ptr;
+var n: int32 = add(2, 3);
 ```
 
-Valid cast conversions include:
-- Any numeric type (integer or float) to any other numeric type.
-- Any pointer type to any other pointer type.
-- Any integer type to any pointer type, and vice versa.
-- Function pointers to other function pointers, or to/from regular pointers and integers.
+Arguments pass by value, structs included. A generic call names its type
+arguments: `id<int64>(7)`.
 
-Casting across different sizes might result in zero-extension, sign-extension, or truncation, depending on the target type and the sign of the source type. Floating-point to integer conversions truncate towards zero.
+A method call is `value.method(args)` or `pointer->method(args)`.
+[Declarations](declarations.md) covers how the compiler finds the function
+behind it.
 
-## Boolean Context
+Writing a function's name with no parentheses gives you the function itself,
+which has a function-pointer type. It does not call it.
 
-In control flow conditions (`if`, `while`, `for`), the condition must be a numeric type (integer or floating-point). Zero is false; non-zero is true. A pointer is not a valid condition. Write `ptr != 0` to test for null.
+## sizeof and typeof
 
-Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) produce `int32` with value 0 (false) or 1 (true). These values can be used directly in conditions. See [Control Flow](control-flow.md).
+`sizeof(T)` is the size of a type in bytes, settled at compile time.
+`typeof(T)` is a compile-time `Type` value, for use with
+[`comptime for`](control-flow.md).
 
-## String Expressions
+## Lambdas
 
-**Concatenation:** The `+` operator concatenates two `string` values. Both operands must be `string`; the result is a heap-backed string whose `.chars` points to a freshly allocated buffer and whose `.length` is the sum of the operand lengths. The allocation is emitted as a direct `calloc(1, size)` call.
-
-**Indexing:** Use `s.chars[i]` to access the i-th byte of a string. The `.chars` field is a pointer; indexing advances by 1 byte (element size of `uint8`). Pointer indexing is not bounds-checked; ensure `i < s.length` to avoid undefined behavior.
-
-## String Interpolation
-
-`{expr}` inside a string literal embeds the expression's value:
+A lambda is an expression:
 
 ```mettle
-var n: int32 = 42;
-var who: string = "world";
-println("hello {who}, n={n}, twice={n * 2}");
+var dbl: fn(int32) -> int32 = fn(x: int32) -> int32 { return x * 2; };
 ```
 
-The parser splits the literal and desugars it to `+` concatenation, so an
-interpolated literal is an ordinary `string` expression. Each `{...}` holds one
-full expression, parsed with the normal grammar; braces inside it nest, so an
-expression that itself contains braces survives the scan.
+Stored in a `Fn(...)` it may capture. [Declarations](declarations.md) covers
+the capture rules.
 
-Accepted value types: every integer type, `bool` (prints `true`/`false`),
-`float32`/`float64`, and `string` (spliced as-is). Any other type is a compile
-error naming the type. Conversions run through the string runtime
-(`mettle_string_from_int` / `_uint` / `_bool` / `_f64` in
-`src/runtime/string.mettle`), linked only by programs that interpolate.
+## String interpolation
 
-Floats print in fixed form with up to six fractional digits, trailing zeros
-trimmed to at least one (`2.0`, `3.5`, `0.333333`). At or above 1e17, and below
-1e-4, the form switches to a decimal exponent (`1.234568e20`, `1.0e-5`).
-Non-finite values print `nan`, `inf`, `-inf`. Formatting is deterministic; it
-is not shortest-round-trip.
+Every string literal is scanned for `{expr}`. The expression is evaluated and
+its text spliced in. `{{` writes one literal `{`.
 
-Escapes: only `{` is special. `{{` produces a literal `{`; `}` is an ordinary
-character everywhere except as the terminator of an open interpolation.
-`{}` (empty) and an unterminated `{` are compile errors.
+```mettle
+var i: int32 = 7;
+var d: float64 = 2.5;
+var c: char = 'z';
+var s: string = "txt";
+println("{i} {d} {c} {s} {i * 2 + 1} {(int64)i}");
+```
+
+```text
+7 2.5 z txt 15 7
+```
+
+Any expression may appear inside the braces: arithmetic, a cast, a field
+access, an index, a call. Every scalar type prints in its own way. A `char`
+prints as the character and a `uint8` as the number. A `bool` prints `true` or
+`false`.
+
+The braces are part of the literal, so interpolation works in any string, and
+[`print`](standard-library.md) and `println` are ordinary functions taking one
+`string`.
+
+## See also
+
+- [Types](types.md)
+- [Control flow](control-flow.md)
+- [Declarations](declarations.md)
