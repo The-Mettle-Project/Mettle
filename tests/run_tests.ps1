@@ -2155,7 +2155,8 @@ $cases = @(
      OutputMustMatch = @("\^\^\^\^\^ expected 'int64', found 'string'") },
   @{ Name = "diag_unused_var"; Path = "tests/diag_unused_var.mettle"; ShouldSucceed = $true
      OutputMustMatch = @("unused variable 'scratch'", "rename it to '_scratch'")
-     OutputMustNotMatch = @("unused variable '_intentional'", "unused variable 'used'") },
+     OutputMustNotMatch = @("unused variable '_intentional'", "unused variable 'used'",
+                            "unused variable 'captured'") },
   @{ Name = "diag_json_format"; Path = "tests/diag_json_format.mettle"; ShouldSucceed = $false
      Args = @("--error-format=json")
      Pattern = '"severity":"error"'

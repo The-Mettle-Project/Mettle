@@ -2023,6 +2023,8 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       return NULL;
     }
 
+    type_checker_mark_captures_used(checker, lam);
+
     /* The lambda value is an 8-byte function pointer (thin) or closure pointer.
      * Name its type with its canonical signature `fn(a,b)->R` (no spaces) so an
      * inferred `var f = <lambda>` local is sized as a pointer by the backend. */

@@ -205,6 +205,8 @@ void type_checker_report_type_mismatch_node(TypeChecker *checker,
 size_t type_checker_node_span_length(const ASTNode *node);
 void type_checker_note_declared_here(TypeChecker *checker,
                                      const Symbol *symbol, const char *what);
+void type_checker_mark_captures_used(TypeChecker *checker,
+                                    const FunctionDeclaration *lam);
 void type_checker_warn_unused_locals(TypeChecker *checker);
 void type_checker_register_test_builtin(TypeChecker *checker, const char *name,
                                         size_t parameter_count);

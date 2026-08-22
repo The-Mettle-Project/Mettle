@@ -289,6 +289,18 @@ void type_checker_report_assign_mismatch(TypeChecker *checker,
 /* Warn about locals declared in the current (about-to-close) scope that were
    never read. `_`-prefixed names opt out; only the main compile unit is
    checked so imported/stdlib code stays quiet. */
+void type_checker_mark_captures_used(TypeChecker *checker,
+                                    const FunctionDeclaration *lam) {
+  if (!checker || !lam || !lam->captured_names) {
+    return;
+  }
+  for (size_t i = 0; i < lam->captured_count; i++) {
+    if (lam->captured_names[i]) {
+      symbol_table_lookup(checker->symbol_table, lam->captured_names[i]);
+    }
+  }
+}
+
 void type_checker_warn_unused_locals(TypeChecker *checker) {
   if (!checker || !checker->error_reporter)
     return;

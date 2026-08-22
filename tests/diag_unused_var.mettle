@@ -2,5 +2,7 @@ fn main() -> int64 {
     var scratch: int64 = 5;
     var _intentional: int64 = 6;
     var used: int64 = 2;
-    return used;
+    var captured: int64 = 3;
+    var add: Fn(int64) -> int64 = fn(v: int64) -> int64 { return v + captured; };
+    return used + add(1);
 }
