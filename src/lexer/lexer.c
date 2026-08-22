@@ -268,6 +268,7 @@ Lexer *lexer_create(const char *source) {
   lexer->error_message = NULL;
   lexer->has_error = 0;
   lexer->continuation_depth = 0;
+  lexer->last_significant = TOKEN_NEWLINE;
 
   return lexer;
 }
@@ -714,26 +715,31 @@ static Token lexer_lex_identifier_or_keyword(Lexer *lexer) {
   return token;
 }
 
-static Token lexer_lex_string_literal(Lexer *lexer) {
-  Token token = {TOKEN_EOF, NULL, {NULL, 0}, lexer->line, lexer->column, 0};
-  lexer->position++;
-  lexer->column++;
-
-  size_t buffer_size = lexer->length - lexer->position;
-  char *buffer = malloc(buffer_size + 1);
-  if (!buffer) {
-    token.type = TOKEN_ERROR;
-    token.value = strdup("Memory allocation failed");
-    lexer_set_error(lexer, token.value);
-    return token;
-  }
-
+/* Read the body of a string literal into `buffer`, stopping at the quote that
+ * closes it. Answers whether that quote was found.
+ *
+ * With `interpolation_aware`, a quote inside a `{...}` opens a literal nested
+ * in the interpolated expression rather than closing this one, so
+ * `"{a + "-" + b}"` reads as a single string, which is what the documented
+ * "parsed with the normal grammar" promises. A scan that instead runs to the
+ * end of the file means the quote really did close the literal, and the caller
+ * reads it again without this, so a stray '{' still reports as an unterminated
+ * brace rather than swallowing the rest of the file. */
+static int lexer_read_string_body(Lexer *lexer, char *buffer,
+                                  size_t *buffer_pos_out,
+                                  int interpolation_aware) {
   size_t buffer_pos = 0;
+  size_t depth = 0;
+  int in_nested = 0;
 
-  while (lexer->position < lexer->length &&
-         lexer->source[lexer->position] != '"') {
-    if (lexer->source[lexer->position] == '\\' &&
-        lexer->position + 1 < lexer->length) {
+  while (lexer->position < lexer->length) {
+    char c = lexer->source[lexer->position];
+
+    if (c == '"' && !(interpolation_aware && depth > 0)) {
+      break;
+    }
+
+    if (c == '\\' && lexer->position + 1 < lexer->length) {
       lexer->position++;
       lexer->column++;
 
@@ -764,11 +770,61 @@ static Token lexer_lex_string_literal(Lexer *lexer) {
       }
       lexer->position++;
       lexer->column++;
-    } else {
-      buffer[buffer_pos++] = lexer->source[lexer->position];
-      lexer->position++;
-      lexer->column++;
+      continue;
     }
+
+    if (interpolation_aware) {
+      if (!in_nested && depth == 0 && c == '{' &&
+          lexer->position + 1 < lexer->length &&
+          lexer->source[lexer->position + 1] == '{') {
+        buffer[buffer_pos++] = '{';
+        buffer[buffer_pos++] = '{';
+        lexer->position += 2;
+        lexer->column += 2;
+        continue;
+      }
+      if (depth > 0 && c == '"') {
+        in_nested = !in_nested;
+      } else if (!in_nested) {
+        if (c == '{') {
+          depth++;
+        } else if (c == '}' && depth > 0) {
+          depth--;
+        }
+      }
+    }
+
+    buffer[buffer_pos++] = c;
+    lexer->position++;
+    lexer->column++;
+  }
+
+  *buffer_pos_out = buffer_pos;
+  return lexer->position < lexer->length;
+}
+
+static Token lexer_lex_string_literal(Lexer *lexer) {
+  Token token = {TOKEN_EOF, NULL, {NULL, 0}, lexer->line, lexer->column, 0};
+  lexer->position++;
+  lexer->column++;
+
+  size_t buffer_size = lexer->length - lexer->position;
+  char *buffer = malloc(buffer_size + 1);
+  if (!buffer) {
+    token.type = TOKEN_ERROR;
+    token.value = strdup("Memory allocation failed");
+    lexer_set_error(lexer, token.value);
+    return token;
+  }
+
+  size_t body_position = lexer->position;
+  size_t body_column = lexer->column;
+  size_t buffer_pos = 0;
+
+  if (!lexer_read_string_body(lexer, buffer, &buffer_pos, 1)) {
+    lexer->position = body_position;
+    lexer->column = body_column;
+    lexer_read_string_body(lexer, buffer, &buffer_pos, 0);
   }
 
   if (lexer->position >= lexer->length) {
@@ -789,13 +845,59 @@ static Token lexer_lex_string_literal(Lexer *lexer) {
   return token;
 }
 
-Token lexer_next_token(Lexer *lexer) {
+/* Whether a line ending in this token leaves an expression waiting for its
+ * right-hand side, so the newline is not the end of a statement and a long
+ * expression can be broken across lines wherever it reads best.
+ *
+ * A statement can legitimately end in '>' (the close of a generic type) or '*'
+ * (a pointer type), so neither of those continues a line; write the break
+ * before the operator's left operand or inside parentheses instead. */
+static int lexer_token_continues_line(TokenType type) {
+  switch (type) {
+  case TOKEN_PLUS:
+  case TOKEN_MINUS:
+  case TOKEN_DIVIDE:
+  case TOKEN_PERCENT:
+  case TOKEN_AMPERSAND:
+  case TOKEN_PIPE:
+  case TOKEN_CARET:
+  case TOKEN_LSHIFT:
+  case TOKEN_RSHIFT:
+  case TOKEN_AND_AND:
+  case TOKEN_OR_OR:
+  case TOKEN_EQUALS_EQUALS:
+  case TOKEN_NOT_EQUALS:
+  case TOKEN_LESS_THAN:
+  case TOKEN_LESS_EQUALS:
+  case TOKEN_GREATER_EQUALS:
+  case TOKEN_EQUALS:
+  case TOKEN_PLUS_EQUALS:
+  case TOKEN_MINUS_EQUALS:
+  case TOKEN_STAR_EQUALS:
+  case TOKEN_SLASH_EQUALS:
+  case TOKEN_PERCENT_EQUALS:
+  case TOKEN_AMP_EQUALS:
+  case TOKEN_PIPE_EQUALS:
+  case TOKEN_CARET_EQUALS:
+  case TOKEN_LSHIFT_EQUALS:
+  case TOKEN_RSHIFT_EQUALS:
+  case TOKEN_ARROW:
+  case TOKEN_DOT:
+  case TOKEN_DOT_DOT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static Token lexer_scan_token(Lexer *lexer) {
   Token token = {TOKEN_EOF, NULL, {NULL, 0}, lexer->line, lexer->column, 0};
 
   while (lexer->position < lexer->length &&
          isspace(lexer->source[lexer->position])) {
     if (lexer->source[lexer->position] == '\n') {
-      if (lexer->continuation_depth > 0) {
+      if (lexer->continuation_depth > 0 ||
+          lexer_token_continues_line(lexer->last_significant)) {
         lexer->position++;
         lexer->line++;
         lexer->column = 1;
@@ -1170,11 +1272,21 @@ Token lexer_next_token(Lexer *lexer) {
   return token;
 }
 
+Token lexer_next_token(Lexer *lexer) {
+  Token token = lexer_scan_token(lexer);
+
+  if (token.type != TOKEN_NEWLINE) {
+    lexer->last_significant = token.type;
+  }
+  return token;
+}
+
 Token lexer_peek_token(Lexer *lexer) {
   size_t saved_position = lexer->position;
   size_t saved_line = lexer->line;
   size_t saved_column = lexer->column;
   size_t saved_continuation_depth = lexer->continuation_depth;
+  TokenType saved_last_significant = lexer->last_significant;
 
   Token token = lexer_next_token(lexer);
 
@@ -1182,6 +1294,7 @@ Token lexer_peek_token(Lexer *lexer) {
   lexer->line = saved_line;
   lexer->column = saved_column;
   lexer->continuation_depth = saved_continuation_depth;
+  lexer->last_significant = saved_last_significant;
 
   return token;
 }

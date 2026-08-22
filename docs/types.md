@@ -376,7 +376,7 @@ var b: Direction = East;
 
 **Enums are opaque.** An enum is its own type, distinct from every integer type and from every other enum. Nothing converts implicitly in either direction: `var n: int32 = North;`, `var d: Direction = 2;`, `North + 1`, and `if (d == 0)` are all compile errors, and so is passing a `Direction` where a `Color` is expected or comparing the two. A `switch` on an enum takes variant names as its cases. The only way across the boundary is a written cast: `(int64)d` reads the variant's value, and `(Direction)val` builds an enum from an integer read from a C API or a file. The cast is the one place where a reader can see that a number is being trusted to be a member of the set.
 
-Enums can be compared with integers and used in `switch` cases. They can be exported for use in other modules (see [Declarations](declarations.md)).
+An enum can be exported for use in other modules (see [Declarations](declarations.md)).
 
 ## Tagged Enum Types
 

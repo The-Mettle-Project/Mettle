@@ -92,6 +92,25 @@ var msg: string = "Hello\nWorld\t\"quoted\"";
 
 Multiline strings are supported. A newline inside the quotes is stored as a literal newline; the string continues until the closing quote. An unterminated string (no closing quote before end of file) produces a lexical error. There is no documented maximum length; strings are limited by available memory and source file size.
 
+A quote inside a `{...}` [interpolation](expressions.md#string-interpolation) opens a literal nested in that expression rather than closing the one around it, so `"{name + "-" + suffix}"` is one string. Outside an interpolation the first unescaped quote still ends the literal, and a stray `{` is reported as an unterminated brace, not as a string that ran to the end of the file.
+
+## Line Continuation
+
+A statement ends at a newline (or at `;`), but only where the statement is complete. A line that ends with an operator still waiting for its right-hand side continues on the next line, so a long expression can be broken wherever it reads best:
+
+```mettle
+var total: int64 =
+    base * scale +
+    offset;
+
+if (ready &&
+    count > 0) { ... }
+```
+
+This covers every binary and compound-assignment operator, `=`, `->`, `.`, and `..`. Text inside `( )` or `[ ]` continues across newlines regardless of what the line ends with.
+
+Two spellings need the break somewhere else. A line ending in `*` or `>` is ambiguous, because `var p: int32*` and `var c: Cell<int64>` are complete statements; the continuation applies once the parser has committed to reading `*` or `>` as a binary operator, which it has after the left operand and the operator are both in hand. In practice that means `a *` and `a >` do continue a line, while a pointer type or a generic argument list still ends one.
+
 ## Operators and Punctuation
 
 Assignment `=`. Compound assignment `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`. Increment `++` and decrement `--`. Comparison `==`, `!=`, `<`, `>`, `<=`, `>=`. Logical `&&`, `||`. Arithmetic `+`, `-`, `*`, `/`, `%`. Unary `-` (negation), `*` (dereference), `&` (address-of). Member access `.`. Arrow `->`. Range `..` (exclusive) and `..=` (inclusive), used in `for i in lo..hi`. Brackets `( )`, `{ }`, `[ ]`. Delimiters `:`, `;`, `,`. The `@` sigil introduces a loop attribute (`@simd` / `@simd!`); see [Control Flow](control-flow.md#vectorization-contracts).

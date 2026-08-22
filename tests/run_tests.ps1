@@ -12636,6 +12636,10 @@ $runFixtures = @(
      What = "a closure taking or returning a struct, string or tagged enum lost it" },
   @{ Name = "deref_aggregate"; Path = "tests/codegen/deref_aggregate.mettle"
      What = "dereferencing a pointer to an aggregate copied only its first word" },
+  @{ Name = "string_globals"; Path = "tests/codegen/string_globals.mettle"
+     What = "a string stored into a global was lost, or refused outright by the direct object backend" },
+  @{ Name = "line_continuation"; Path = "tests/codegen/line_continuation.mettle"
+     What = "an expression broken across lines, or a string literal nested inside an interpolation, was read wrong" },
   @{ Name = "multi_return_aggregates"; Path = "tests/codegen/multi_return_aggregates.mettle"
      What = "a string or struct returned among several values lost everything past its first word" },
   @{ Name = "pointers"; Path = "tests/codegen/pointers.mettle"

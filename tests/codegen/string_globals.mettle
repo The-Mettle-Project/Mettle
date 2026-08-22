@@ -1,0 +1,66 @@
+var label: string = "init";
+var slot: string;
+var pair: string[3];
+
+struct Holder { name: string; count: int32; }
+
+var held: Holder;
+
+@noinline fn opaque(v: int32) -> int32 { return v; }
+
+@noinline fn set_label(v: string) -> void { label = v; }
+
+@noinline fn grow(times: int32) -> string {
+  var i: int32 = 0;
+  while (i < times) {
+    label = label + "-{i}";
+    i = i + 1;
+  }
+  return label;
+}
+
+fn main() -> int32 {
+  if (label != "init") { return 1; }
+
+  label = "second";
+  if (label != "second") { return 2; }
+
+  set_label("third");
+  if (label != "third") { return 3; }
+
+  label = label + "!";
+  if (label != "third!") { return 4; }
+
+  label = "init";
+  if (grow(3) != "init-0-1-2") { return 5; }
+
+  slot = "filled";
+  if (slot != "filled") { return 6; }
+
+  var picked: string = label;
+  label = slot;
+  slot = picked;
+  if (label != "filled") { return 7; }
+  if (slot != "init-0-1-2") { return 8; }
+
+  pair[0] = "a";
+  pair[1] = "b";
+  pair[2] = pair[0] + pair[1];
+  if (pair[2] != "ab") { return 9; }
+
+  held.name = "held";
+  held.count = opaque(4);
+  if (held.name != "held" || held.count != 4) { return 10; }
+
+  held.name = held.name + "-{held.count}";
+  if (held.name != "held-4") { return 11; }
+
+  var i: int32 = 0;
+  while (i < 4) {
+    label = "round{i}";
+    i = i + 1;
+  }
+  if (label != "round3") { return 12; }
+
+  return 0;
+}

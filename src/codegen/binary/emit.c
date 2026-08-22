@@ -2112,6 +2112,44 @@ int code_generator_binary_emit_local_string_store(
   return 1;
 }
 
+/* A string value is carried as a pointer to its two words, so storing one into
+ * a global is the local store with the destination reached through the symbol's
+ * address instead of a frame offset. */
+static int code_generator_binary_emit_global_string_store(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const char *symbol_name, int declare_external,
+    BinaryGpRegister source_register) {
+  BinaryGpRegister address = BINARY_GP_R10;
+  BinaryGpRegister scratch = BINARY_GP_R11;
+
+  if (!generator || !context || !symbol_name || symbol_name[0] == '\0') {
+    return 0;
+  }
+  if (source_register == address) {
+    address = BINARY_GP_RAX;
+  }
+  if (source_register == scratch) {
+    scratch = BINARY_GP_RAX;
+  }
+
+  if (!code_generator_binary_emit_symbol_address(generator, context,
+                                                 symbol_name, declare_external,
+                                                 address)) {
+    return 0;
+  }
+  if (!binary_emit_mov_reg_mem(&context->code, scratch, source_register, 0) ||
+      !binary_emit_mov_mem_reg(&context->code, address, 0, scratch) ||
+      !binary_emit_mov_reg_mem(&context->code, scratch, source_register, 8) ||
+      !binary_emit_mov_mem_reg(&context->code, address, 8, scratch)) {
+    code_generator_set_error(generator,
+                             "Out of memory while storing string global '%s' "
+                             "in function '%s'",
+                             symbol_name, context->function_name);
+    return 0;
+  }
+  return 1;
+}
+
 static int binary_canonicalize_narrow_reg_for_type(
     BinaryFunctionContext *context, MtlcType *type, BinaryGpRegister reg);
 
@@ -2181,10 +2219,16 @@ int code_generator_binary_emit_destination_store(
     if (symbol && symbol->type && symbol->type->kind == MTLC_TYPE_STRING) {
       if (offset <= 0) {
         if (symbol->scope && symbol->scope->type == CG_SCOPE_GLOBAL) {
+          const char *link_name =
+              code_generator_get_link_symbol_name(generator, destination->name);
+          if (link_name && link_name[0] != '\0') {
+            return code_generator_binary_emit_global_string_store(
+                generator, context, link_name, symbol->is_extern,
+                source_register);
+          }
           code_generator_set_error(
-              generator,
-              "Direct object backend does not yet support string global stores "
-              "in function '%s'",
+              generator, "Invalid global string symbol '%s' in function '%s'",
+              destination->name ? destination->name : "<unnamed>",
               context->function_name);
         } else {
           code_generator_set_error(generator,

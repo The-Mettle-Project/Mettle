@@ -1,0 +1,70 @@
+struct Cell<T> { v: T; }
+
+@noinline fn opaque(v: int32) -> int32 { return v; }
+
+@noinline fn scale(a: int32, b: float64) ->
+    float64 {
+  return (float64)a *
+         b +
+         1.0;
+}
+
+fn main() -> int32 {
+  var total: int64 =
+      1 +
+      2 *
+      3;
+  if (total != 7) { return 1; }
+
+  total = total *
+          2 -
+          4;
+  if (total != 10) { return 2; }
+
+  var p: int32*
+  var one: int32 = opaque(4)
+  p = &one
+  if (*p != 4) { return 3; }
+
+  var c: Cell<int64>
+  c.v = 9
+  if (c.v != 9) { return 4; }
+
+  var flag: bool = total >
+                   5 &&
+                   total <
+                   100 ||
+                   false;
+  if (!flag) { return 5; }
+
+  var text: string = "a" +
+                     "b" +
+                     "c";
+  if (text != "abc") { return 6; }
+
+  if (scale(3, 2.0) !=
+      7.0) { return 7; }
+
+  var acc: int32 = 0;
+  for i in 0..
+             4 {
+    acc = acc +
+          i;
+  }
+  if (acc != 6) { return 8; }
+
+  var name: string = "pea";
+  var joined: string = "{name + "-" + name}";
+  if (joined != "pea-pea") { return 9; }
+
+  var braced: string = "{name + "}" + name}";
+  if (braced != "pea}pea") { return 10; }
+
+  var mixed: string = "{{ {opaque(3)} }}";
+  if (mixed != "{{ 3 }}") { return 11; }
+
+  var quoted: string = "say \"{name}\"";
+  if (quoted != "say \"pea\"") { return 12; }
+
+  return 0;
+}

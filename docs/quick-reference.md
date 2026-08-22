@@ -68,7 +68,7 @@ enum Status { Ok = 0, Error = 1 }
 fn main() -> int32 {
   var s: Status = Ok;
   switch (s) {
-    case 0:
+    case Ok:
       return 0;
     default:
       return 1;

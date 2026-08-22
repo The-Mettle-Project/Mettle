@@ -187,6 +187,7 @@ typedef struct {
   char *error_message;
   int has_error;
   size_t continuation_depth;
+  TokenType last_significant;
 } Lexer;
 
 // Function declarations
