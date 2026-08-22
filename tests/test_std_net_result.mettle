@@ -1,0 +1,55 @@
+import "std/core";
+import "std/net";
+
+// std/net's own wrappers answer Result. This exercises every one of them
+// without opening a connection: a socket is made and closed, an address is
+// built and freed, and each failure arm is reachable code the checker had to
+// prove exhaustive.
+fn main() -> int32 {
+  match (net_init()) {
+    case Ok(ready): { }
+    case Err(code): { return 1; }
+  }
+
+  var sock: int64 = 0;
+  match (socket_tcp()) {
+    case Ok(s): { sock = s; }
+    case Err(code): { net_cleanup(); return 2; }
+  }
+  if (sock == INVALID_SOCKET()) { return 3; }
+
+  var udp: int64 = 0;
+  match (socket_udp()) {
+    case Ok(s): { udp = s; }
+    case Err(code): { return 4; }
+  }
+
+  match (sockaddr_in("127.0.0.1", 8080)) {
+    case Ok(addr): {
+      if (addr == 0) { return 5; }
+      free(addr);
+    }
+    case Err(code): { return 6; }
+  }
+
+  match (sockaddr_in_any(9090)) {
+    case Ok(addr): {
+      if (addr == 0) { return 7; }
+      free(addr);
+    }
+    case Err(code): { return 8; }
+  }
+
+  // Sending on an unconnected socket fails, and the reason arrives as a code.
+  var buf: uint8[4];
+  buf[0] = 65; buf[1] = 66; buf[2] = 67; buf[3] = 68;
+  match (send_all(sock, &buf[0], 4)) {
+    case Ok(sent): { return 9; }
+    case Err(code): { if (code == 0) { return 10; } }
+  }
+
+  closesocket(sock);
+  closesocket(udp);
+  net_cleanup();
+  return 55;
+}

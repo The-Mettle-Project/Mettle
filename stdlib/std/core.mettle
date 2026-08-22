@@ -1,6 +1,22 @@
+// Mettle standard library: the two shapes every fallible call reports through.
+//
+// `Result` is for a call that could not do what it was asked: the error arm
+// carries why. `Option` is for a value that may simply not be there, which is
+// an ordinary outcome and needs no reason attached. A lookup that finds
+// nothing returns `None`; a parse that meets a letter where it needed a digit
+// returns `Err`.
+//
+// Both are exhaustive: a `match` with no `default` must name every arm, so a
+// failure cannot be read as a success by forgetting to check a flag.
+
 export enum Result<T, E> {
   Ok(T),
   Err(E)
+}
+
+export enum Option<T> {
+  Some(T),
+  None
 }
 
 export fn std_ok() -> int32 {

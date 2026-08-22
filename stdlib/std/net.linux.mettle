@@ -12,6 +12,7 @@
 // native ELF target. The runtime implements the Linux side with direct system
 // calls and keeps its error value in owned thread local storage.
 
+import "std/core";
 import "std/mem";
 import "std/thread";
 
@@ -75,16 +76,16 @@ export fn WSAGetLastError() -> int32 { return posix_get_errno(); }
 
 // ─── Convenience wrappers (identical to std/net) ────────────────────────────
 
-export fn net_init() -> int32 {
+export fn net_init() -> Result<int32, int32> {
   spin_lock(&net_ref_lock);
   if (net_ref_count > 0) {
     net_ref_count = net_ref_count + 1;
     spin_unlock(&net_ref_lock);
-    return 0;
+    return Ok(0);
   }
   net_ref_count = 1;
   spin_unlock(&net_ref_lock);
-  return 0;
+  return Ok(0);
 }
 
 export fn net_cleanup() -> int32 {
@@ -102,12 +103,17 @@ export fn net_last_error() -> int32 {
   return posix_get_errno();
 }
 
-export fn socket_tcp() -> int64 {
-  return socket(AF_INET(), SOCK_STREAM(), IPPROTO_TCP());
+// A TCP or UDP socket, or the errno that stopped one being made.
+export fn socket_tcp() -> Result<int64, int32> {
+  var s: int64 = socket(AF_INET(), SOCK_STREAM(), IPPROTO_TCP());
+  if (s == INVALID_SOCKET()) { return Err(net_last_error()); }
+  return Ok(s);
 }
 
-export fn socket_udp() -> int64 {
-  return socket(AF_INET(), SOCK_DGRAM(), IPPROTO_UDP());
+export fn socket_udp() -> Result<int64, int32> {
+  var s: int64 = socket(AF_INET(), SOCK_DGRAM(), IPPROTO_UDP());
+  if (s == INVALID_SOCKET()) { return Err(net_last_error()); }
+  return Ok(s);
 }
 
 export fn net_is_initialized() -> int32 {
@@ -123,10 +129,10 @@ export fn net_is_initialized() -> int32 {
 // Build a sockaddr_in structure for IPv4. The struct layout is identical
 // between Winsock and POSIX (16 bytes: sin_family u16, sin_port u16,
 // sin_addr u32, padding 8B).
-// Returns a malloc'd 16-byte buffer the caller must free() after use.
-export fn sockaddr_in(ip: cstring, port: int32) -> cstring {
+// The Ok arm is a malloc'd 16-byte buffer the caller must free() after use.
+export fn sockaddr_in(ip: cstring, port: int32) -> Result<cstring, int32> {
   var buf: cstring = malloc(16);
-  if (buf == 0) { return 0; }
+  if (buf == 0) { return Err(0); }
   memset(buf, 0, 16);
   buf[0] = 2;     // AF_INET, little-endian
   buf[1] = 0;
@@ -138,20 +144,20 @@ export fn sockaddr_in(ip: cstring, port: int32) -> cstring {
   buf[5] = (uint8)(addr / 256);
   buf[6] = (uint8)(addr / 65536);
   buf[7] = (uint8)(addr / 16777216);
-  return buf;
+  return Ok(buf);
 }
 
 // Build sockaddr_in for 0.0.0.0:port.
-export fn sockaddr_in_any(port: int32) -> cstring {
+export fn sockaddr_in_any(port: int32) -> Result<cstring, int32> {
   var buf: cstring = malloc(16);
-  if (buf == 0) { return 0; }
+  if (buf == 0) { return Err(0); }
   memset(buf, 0, 16);
   buf[0] = 2;
   buf[1] = 0;
   var net_port: int32 = htons(port);
   buf[2] = (uint8)net_port;
   buf[3] = (uint8)(net_port / 256);
-  return buf;
+  return Ok(buf);
 }
 
 // Set SO_REUSEADDR to enabled (1) or disabled (0).
@@ -164,13 +170,14 @@ export fn set_reuseaddr(sock: int64, enabled: int32) -> int32 {
   return setsockopt(sock, SOL_SOCKET(), SO_REUSEADDR(), &opt[0], 4);
 }
 
-// Send all bytes in buf[0..len). Returns total sent, or -1 on error.
-export fn send_all(sock: int64, buf: cstring, len: int32) -> int32 {
+// Send every byte in buf[0..len). A short write is retried; a failed one ends
+// the loop with the errno, so a partial send cannot be read as a whole one.
+export fn send_all(sock: int64, buf: cstring, len: int32) -> Result<int32, int32> {
   var total: int32 = 0;
   while (total < len) {
     var sent: int32 = send(sock, &buf[total], len - total, 0);
-    if (sent <= 0) { return -1; }
+    if (sent <= 0) { return Err(net_last_error()); }
     total = total + sent;
   }
-  return total;
+  return Ok(total);
 }

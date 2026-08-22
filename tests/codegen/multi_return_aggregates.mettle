@@ -1,3 +1,4 @@
+import "std/core";
 import "std/conv";
 
 struct P { x: int32; y: int32; z: int32; }
@@ -60,16 +61,17 @@ fn main() -> int32 {
 
   var h: string = "";
   var tl: string = "";
-  var found: int32 = 0;
-  (h, tl, found) = str_split_once("key=value", "=");
-  if (found != 1) { return 14; }
+  match (str_split_once("key=value", "=")) {
+    case Some(kv): { h = kv.head; tl = kv.tail; }
+    case None: { return 14; }
+  }
   if (h != "key") { return 15; }
   if (tl != "value") { return 16; }
 
-  (h, tl, found) = str_split_once("novalue", "=");
-  if (found != 0) { return 17; }
-  if (h != "novalue") { return 18; }
-  if (tl != "") { return 19; }
+  match (str_split_once("novalue", "=")) {
+    case Some(kv): { return 17; }
+    case None: { }
+  }
 
   return 0;
 }

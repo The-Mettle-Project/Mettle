@@ -26,6 +26,7 @@
 // NOTE: This module is for Linux and macOS only.  On Windows, use std/net
 // (Winsock2) instead.
 
+import "std/core";
 import "std/mem";
 
 // Guard + reference count for thread-safe net_posix_init / net_posix_cleanup.
@@ -141,11 +142,11 @@ export fn posix_spin_unlock(lock_var: int32*) {
 // net_posix_cleanup are provided for source-level compatibility with code
 // written against std/net.  They are reference-counted and thread-safe.
 
-export fn net_posix_init() -> int32 {
+export fn net_posix_init() -> Result<int32, int32> {
   posix_spin_lock(&posix_net_ref_lock);
   posix_net_ref_count = posix_net_ref_count + 1;
   posix_spin_unlock(&posix_net_ref_lock);
-  return 0;
+  return Ok(0);
 }
 
 export fn net_posix_cleanup() -> int32 {
@@ -169,22 +170,27 @@ export fn net_posix_is_initialized() -> int32 {
 
 // ─── Convenience wrappers ───────────────────────────────────────────────────
 
-export fn socket_tcp_posix() -> int64 {
-  return socket(AF_INET_POSIX(), SOCK_STREAM_POSIX(), IPPROTO_TCP_POSIX());
+// A TCP or UDP socket, or the errno that stopped one being made.
+export fn socket_tcp_posix() -> Result<int64, int32> {
+  var s: int64 = socket(AF_INET_POSIX(), SOCK_STREAM_POSIX(), IPPROTO_TCP_POSIX());
+  if (s < 0) { return Err(net_posix_last_error()); }
+  return Ok(s);
 }
 
-export fn socket_udp_posix() -> int64 {
-  return socket(AF_INET_POSIX(), SOCK_DGRAM_POSIX(), IPPROTO_UDP_POSIX());
+export fn socket_udp_posix() -> Result<int64, int32> {
+  var s: int64 = socket(AF_INET_POSIX(), SOCK_DGRAM_POSIX(), IPPROTO_UDP_POSIX());
+  if (s < 0) { return Err(net_posix_last_error()); }
+  return Ok(s);
 }
 
 // Build a sockaddr_in structure for IPv4.
 // Returns a malloc'd 16-byte buffer the caller must free() after use.
 //   ip   – dotted-quad string, e.g. "127.0.0.1"
 //   port – port number in host byte order
-export fn sockaddr_in_posix(ip: cstring, port: int32) -> cstring {
+export fn sockaddr_in_posix(ip: cstring, port: int32) -> Result<cstring, int32> {
   var buf: cstring = malloc(16);
   if (buf == 0) {
-    return 0;
+    return Err(0);
   }
   memset(buf, 0, 16);
 
@@ -204,14 +210,14 @@ export fn sockaddr_in_posix(ip: cstring, port: int32) -> cstring {
   buf[6] = (uint8)(addr / 65536);
   buf[7] = (uint8)(addr / 16777216);
 
-  return buf;
+  return Ok(buf);
 }
 
 // Build sockaddr_in for 0.0.0.0:port (bind to all interfaces).
-export fn sockaddr_in_any_posix(port: int32) -> cstring {
+export fn sockaddr_in_any_posix(port: int32) -> Result<cstring, int32> {
   var buf: cstring = malloc(16);
   if (buf == 0) {
-    return 0;
+    return Err(0);
   }
 
   memset(buf, 0, 16);
@@ -224,7 +230,7 @@ export fn sockaddr_in_any_posix(port: int32) -> cstring {
 
   // sin_addr = 0 (INADDR_ANY) – already zeroed by memset
 
-  return buf;
+  return Ok(buf);
 }
 
 // Set SO_REUSEADDR to enabled (1) or disabled (0).
@@ -244,15 +250,16 @@ export fn set_reuseaddr_posix(sock: int64, enabled: int32) -> int32 {
   return posix_setsockopt(sock, SOL_SOCKET_POSIX(), SO_REUSEADDR_POSIX(), &opt[0], 4);
 }
 
-// Send all bytes in buf[0..len).  Returns total bytes sent, or -1 on error.
-export fn send_all_posix(sock: int64, buf: cstring, len: int64) -> int64 {
+// Send every byte in buf[0..len). A short write is retried; a failed one ends
+// the loop with the errno, so a partial send cannot be read as a whole one.
+export fn send_all_posix(sock: int64, buf: cstring, len: int64) -> Result<int64, int32> {
   var total: int64 = 0;
   while (total < len) {
     var sent: int64 = posix_send(sock, &buf[total], len - total, 0);
     if (sent <= 0) {
-      return -1;
+      return Err(net_posix_last_error());
     }
     total = total + sent;
   }
-  return total;
+  return Ok(total);
 }

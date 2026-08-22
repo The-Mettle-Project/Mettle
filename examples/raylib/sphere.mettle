@@ -196,13 +196,7 @@ fn arg_value(arg: cstring, prefix: string) -> int64 {
   }
   var tail: string = str_slice(s, (int64)prefix.length,
                                (int64)s.length - (int64)prefix.length);
-  var value: int64 = 0;
-  var ok: int32 = 0;
-  (value, ok) = str_to_i64(tail);
-  if (ok == 0) {
-    return -1;
-  }
-  return value;
+  return str_to_i64_or(tail, -1);
 }
 
 fn arg_is(arg: cstring, name: string) -> int32 {

@@ -4,26 +4,33 @@
 // The internal PE linker resolves ws2_32.dll directly. External/manual links
 // may still need -lws2_32 or ws2_32.lib.
 //
-// Usage pattern with defer for automatic cleanup:
-//   net_init();
-//   var sock: int64 = socket(AF_INET, SOCK_STREAM, 0);
+// The wrappers here answer `Result`, so the socket and the reason it could not
+// be opened arrive on separate arms and neither can be read as the other:
+//
+//   match (net_init()) {
+//     case Ok(ready): { }
+//     case Err(code): { return code; }
+//   }
+//   var sock: int64 = 0;
+//   match (socket_tcp()) {
+//     case Ok(s): { sock = s; }
+//     case Err(code): { net_cleanup(); return code; }
+//   }
 //   defer closesocket(sock);
 //   ... connect / send / recv ...
 //   net_cleanup();
 //
-// Server pattern with client socket cleanup:
-//   var server_sock: int64 = socket(AF_INET, SOCK_STREAM, 0);
-//   defer closesocket(server_sock);
-//   bind(server_sock, addr, 16);
-//   listen(server_sock, 5);
-//   while (1) {
-//     var client: int64 = accept(server_sock, ...);
-//     if (client != INVALID_SOCKET()) {
-//       defer closesocket(client);
-//       ... handle client ...
-//     }
+// The extern declarations are the operating system's own contract and keep it,
+// so `accept` still answers INVALID_SOCKET() and the code comes from
+// net_last_error():
+//
+//   var client: int64 = accept(server_sock, ...);
+//   if (client != INVALID_SOCKET()) {
+//     defer closesocket(client);
+//     ... handle client ...
 //   }
 
+import "std/core";
 import "std/mem";
 import "std/thread";
 
@@ -91,22 +98,28 @@ export extern fn ntohl(netlong: int32) -> int32 = "ntohl";
 export extern fn inet_addr(cp: cstring) -> int32 = "inet_addr";
 
 // ─── Convenience wrappers ───────────────────────────────────────────────────
+//
+// The extern declarations above are the operating system's own contract and
+// keep it: a socket call answers -1, and the code for why is fetched
+// separately. These wrappers are Mettle's, so they answer `Result` and carry
+// the code in the failure arm, which means a caller cannot use a socket it
+// never got.
 
-// Initialize Winsock 2.2.  Returns 0 on success.
-export fn net_init() -> int32 {
+// Initialize Winsock 2.2.
+export fn net_init() -> Result<int32, int32> {
   spin_lock(&net_ref_lock);
 
   if (net_ref_count > 0) {
     net_ref_count = net_ref_count + 1;
     spin_unlock(&net_ref_lock);
-    return 0;
+    return Ok(0);
   }
 
   // WSADATA is 408 bytes on x64 Windows. We allocate a raw buffer.
   var wsa_buf: cstring = malloc(408);
   if (wsa_buf == 0) {
     spin_unlock(&net_ref_lock);
-    return -1;
+    return Err(0);
   }
 
   // 0x0202 = version 2.2
@@ -116,7 +129,8 @@ export fn net_init() -> int32 {
     net_ref_count = 1;
   }
   spin_unlock(&net_ref_lock);
-  return result;
+  if (result != 0) { return Err(result); }
+  return Ok(0);
 }
 
 // Shut down Winsock.  Returns 0 on success.
@@ -144,12 +158,17 @@ export fn net_last_error() -> int32 {
   return WSAGetLastError();
 }
 
-export fn socket_tcp() -> int64 {
-  return socket(AF_INET(), SOCK_STREAM(), IPPROTO_TCP());
+// A TCP or UDP socket, or the error code that stopped one being made.
+export fn socket_tcp() -> Result<int64, int32> {
+  var s: int64 = socket(AF_INET(), SOCK_STREAM(), IPPROTO_TCP());
+  if (s == INVALID_SOCKET()) { return Err(net_last_error()); }
+  return Ok(s);
 }
 
-export fn socket_udp() -> int64 {
-  return socket(AF_INET(), SOCK_DGRAM(), IPPROTO_UDP());
+export fn socket_udp() -> Result<int64, int32> {
+  var s: int64 = socket(AF_INET(), SOCK_DGRAM(), IPPROTO_UDP());
+  if (s == INVALID_SOCKET()) { return Err(net_last_error()); }
+  return Ok(s);
 }
 
 export fn net_is_initialized() -> int32 {
@@ -163,13 +182,13 @@ export fn net_is_initialized() -> int32 {
 }
 
 // Build a sockaddr_in structure for IPv4.
-// Returns a malloc'd 16-byte buffer the caller must free() after use.
+// The Ok arm is a malloc'd 16-byte buffer the caller must free() after use.
 //   ip   – dotted-quad string, e.g. "127.0.0.1"
 //   port – port number in host byte order
-export fn sockaddr_in(ip: cstring, port: int32) -> cstring {
+export fn sockaddr_in(ip: cstring, port: int32) -> Result<cstring, int32> {
   var buf: cstring = malloc(16);
   if (buf == 0) {
-    return 0;
+    return Err(0);
   }
   // Zero it out
   memset(buf, 0, 16);
@@ -190,14 +209,14 @@ export fn sockaddr_in(ip: cstring, port: int32) -> cstring {
   buf[6] = (uint8)(addr / 65536);
   buf[7] = (uint8)(addr / 16777216);
 
-  return buf;
+  return Ok(buf);
 }
 
 // Build sockaddr_in for 0.0.0.0:port.
-export fn sockaddr_in_any(port: int32) -> cstring {
+export fn sockaddr_in_any(port: int32) -> Result<cstring, int32> {
   var buf: cstring = malloc(16);
   if (buf == 0) {
-    return 0;
+    return Err(0);
   }
 
   memset(buf, 0, 16);
@@ -208,7 +227,7 @@ export fn sockaddr_in_any(port: int32) -> cstring {
   buf[2] = (uint8)net_port;
   buf[3] = (uint8)(net_port / 256);
 
-  return buf;
+  return Ok(buf);
 }
 
 // Set SO_REUSEADDR to enabled (1) or disabled (0).
@@ -242,15 +261,16 @@ export fn set_nodelay(sock: int64, enabled: int32) -> int32 {
   return setsockopt(sock, IPPROTO_TCP(), TCP_NODELAY(), &opt[0], 4);
 }
 
-// Send all bytes in buf[0..len). Returns total sent, or -1 on error.
-export fn send_all(sock: int64, buf: cstring, len: int32) -> int32 {
+// Send every byte in buf[0..len). A short write is retried; a failed one ends
+// the loop with the code, so a partial send cannot be read as a whole one.
+export fn send_all(sock: int64, buf: cstring, len: int32) -> Result<int32, int32> {
   var total: int32 = 0;
   while (total < len) {
     var sent: int32 = send(sock, &buf[total], len - total, 0);
     if (sent <= 0) {
-      return -1;
+      return Err(net_last_error());
     }
     total = total + sent;
   }
-  return total;
+  return Ok(total);
 }

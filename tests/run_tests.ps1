@@ -1458,6 +1458,7 @@ $cases = @(
   @{ Name = "tagged_enum_bare_none"; Path = "tests/test_tagged_enum_bare_none.mettle"; ShouldSucceed = $true },
   @{ Name = "tagged_enum_qualified_ctor"; Path = "tests/test_tagged_enum_qualified_ctor.mettle"; ShouldSucceed = $true },
   @{ Name = "std_result"; Path = "tests/test_std_result.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_net_result"; Path = "tests/test_std_net_result.mettle"; ShouldSucceed = $true },
   @{ Name = "plain_enum_qualified"; Path = "tests/test_plain_enum_qualified.mettle"; ShouldSucceed = $true },
   @{ Name = "arena_basic"; Path = "tests/test_arena_basic.mettle"; ShouldSucceed = $true },
   @{ Name = "arena_align"; Path = "tests/test_arena_align.mettle"; ShouldSucceed = $true },

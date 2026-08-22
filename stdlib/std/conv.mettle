@@ -1,6 +1,11 @@
 // Mettle standard library: Conversions
 //
 // String/number conversions, character classification, and encoding helpers.
+//
+// A lookup that finds nothing answers `None`. A parse that cannot read what
+// it was given answers `Err` with the reason.
+
+import "std/core";
 
 // Owned runtime conversions
 // These ABI names bind to Mettle's owned conversion code.
@@ -150,38 +155,41 @@ export fn str_ends_with(s: string, suffix: string) -> int32 {
   return str_eq_at(s, (int64)s.length - (int64)suffix.length, suffix);
 }
 
-// The index of the first occurrence of `needle`, or -1. An empty needle
-// matches at 0, which is what makes `str_find(s, "") == 0` agree with
+// The index where `needle` first appears. Absence is an ordinary answer here,
+// so it comes back as `None` and cannot be mistaken for position -1. An empty
+// needle matches at 0, which is what makes `str_find(s, "")` agree with
 // `str_starts_with(s, "")`.
-export fn str_find(s: string, needle: string) -> int64 {
+export fn str_find(s: string, needle: string) -> Option<int64> {
   var n: int64 = (int64)s.length;
   var m: int64 = (int64)needle.length;
 
-  if (m > n) { return -1; }
+  if (m > n) { return None; }
 
   var i: int64 = 0;
   while (i + m <= n) {
-    if (str_eq_at(s, i, needle) == 1) { return i; }
+    if (str_eq_at(s, i, needle) == 1) { return Some(i); }
     i = i + 1;
   }
-  return -1;
+  return None;
 }
 
 export fn str_contains(s: string, needle: string) -> int32 {
-  if (str_find(s, needle) < 0) { return 0; }
-  return 1;
+  match (str_find(s, needle)) {
+    case Some(at): { return 1; }
+    case None: { return 0; }
+  }
 }
 
-// The index of the first byte equal to `c`, or -1. Cheaper than str_find for
-// the single-byte case, which is most of them.
-export fn str_find_byte(s: string, c: int32) -> int64 {
+// The index of the first byte equal to `c`. Cheaper than str_find for the
+// single-byte case, which is most of them.
+export fn str_find_byte(s: string, c: int32) -> Option<int64> {
   var n: int64 = (int64)s.length;
   var i: int64 = 0;
   while (i < n) {
-    if ((int32)s.chars[i] == c) { return i; }
+    if ((int32)s.chars[i] == c) { return Some(i); }
     i = i + 1;
   }
-  return -1;
+  return None;
 }
 
 export fn str_trim_start(s: string) -> string {
@@ -207,26 +215,40 @@ export fn str_trim(s: string) -> string {
   return str_trim_start(str_trim_end(s));
 }
 
-// Split at the first `sep`. Returns the part before it, the part after it, and
-// 1 when the separator was found. When it was not, the whole string comes back
-// as the head with 0, so a caller that ignores the flag still sees every byte
-// exactly once.
-export fn str_split_once(s: string, sep: string) -> (string, string, int32) {
-  var at: int64 = str_find(s, sep);
-  if (at < 0) {
-    return (s, str_slice(s, (int64)s.length, 0), 0);
-  }
-  var after: int64 = at + (int64)sep.length;
-  return (str_slice(s, 0, at), str_slice(s, after, (int64)s.length - after), 1);
+// The two halves of a split: what came before the separator and what came
+// after it. Both are views into the string that was split.
+export struct StrSplit {
+  head: string;
+  tail: string;
 }
 
-// Parse a decimal integer, with an optional leading sign. Returns the value
-// and whether the WHOLE view was digits: a partial parse is a failure here,
-// because a caller that wanted a prefix can slice one first. Unlike atoi this
-// needs no terminator, so it reads a field out of a buffer without copying.
-export fn str_to_i64(s: string) -> (int64, int32) {
+// Split at the first `sep`. `None` says the separator is not in `s` at all,
+// which leaves `s` itself as the only sensible reading of the whole and needs
+// no second copy of it handed back.
+export fn str_split_once(s: string, sep: string) -> Option<StrSplit> {
+  var at: int64 = 0;
+  match (str_find(s, sep)) {
+    case Some(found): { at = found; }
+    case None: { return None; }
+  }
+  var after: int64 = at + (int64)sep.length;
+  var out: StrSplit;
+  out.head = str_slice(s, 0, at);
+  out.tail = str_slice(s, after, (int64)s.length - after);
+  return Some(out);
+}
+
+// Parse a decimal integer, with an optional leading sign. The WHOLE view has
+// to be digits: a partial parse is an error here, because a caller that wanted
+// a prefix can slice one first. Unlike atoi this needs no terminator, so it
+// reads a field out of a buffer without copying.
+//
+// The error arm carries what was wrong, so a caller reporting a bad config
+// line has something to print. Where only the number matters,
+// `str_to_i64_or(s, 0)` reads the fallback in one line.
+export fn str_to_i64(s: string) -> Result<int64, string> {
   var n: int64 = (int64)s.length;
-  if (n == 0) { return (0, 0); }
+  if (n == 0) { return Err("empty"); }
 
   var i: int64 = 0;
   var negative: int32 = 0;
@@ -236,18 +258,27 @@ export fn str_to_i64(s: string) -> (int64, int32) {
   } else if (s[0] == '+') {
     i = 1;
   }
-  if (i >= n) { return (0, 0); }
+  if (i >= n) { return Err("sign with no digits"); }
 
   var value: int64 = 0;
   while (i < n) {
     var c: char = s[i];
-    if (!is_digit(c)) { return (0, 0); }
+    if (!is_digit(c)) { return Err("not a decimal digit"); }
     value = value * 10 + (int64)char_to_digit(c);
     i = i + 1;
   }
 
-  if (negative == 1) { return (0 - value, 1); }
-  return (value, 1);
+  if (negative == 1) { return Ok(0 - value); }
+  return Ok(value);
+}
+
+// The parsed value, or `fallback` when the view does not hold a number. For
+// the callers that have a sensible default and no one to report to.
+export fn str_to_i64_or(s: string, fallback: int64) -> int64 {
+  match (str_to_i64(s)) {
+    case Ok(v): { return v; }
+    case Err(why): { return fallback; }
+  }
 }
 
 // Write `n` as decimal into `buf` and return a view of what was written. The

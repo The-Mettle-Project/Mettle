@@ -4,7 +4,17 @@
 //
 // Each check returns its own code so a failure names the function that broke.
 
+import "std/core";
 import "std/conv"
+
+// The checks below want a plain number to compare, so these unwrap once here
+// and every assertion stays one line.
+fn at(o: Option<int64>, missing: int64) -> int64 {
+    match (o) {
+        case Some(i): { return i; }
+        case None: { return missing; }
+    }
+}
 
 fn main() -> int32 {
     var s: string = "hello world";
@@ -22,17 +32,17 @@ fn main() -> int32 {
     if (str_starts_with(s, "world") != 0) { return 7; }
     if (str_ends_with(s, "world") != 1) { return 8; }
     if (str_ends_with(s, "hello") != 0) { return 9; }
-    if (str_find(s, "o") != 4) { return 10; }
-    if (str_find(s, "world") != 6) { return 11; }
-    if (str_find(s, "zebra") != 0 - 1) { return 12; }
-    if (str_find_byte(s, 32) != 5) { return 13; }        // the space
+    if (at(str_find(s, "o"), 0 - 1) != 4) { return 10; }
+    if (at(str_find(s, "world"), 0 - 1) != 6) { return 11; }
+    if (at(str_find(s, "zebra"), 0 - 1) != 0 - 1) { return 12; }
+    if (at(str_find_byte(s, 32), 0 - 1) != 5) { return 13; }  // the space
     if (str_contains(s, "lo w") != 1) { return 14; }
     if (str_contains(s, "lo  w") != 0) { return 15; }
 
     // A needle longer than the haystack cannot match, and must not read past.
-    if (str_find("ab", "abc") != 0 - 1) { return 16; }
+    if (at(str_find("ab", "abc"), 0 - 1) != 0 - 1) { return 16; }
     // An empty needle matches at the start, agreeing with starts_with.
-    if (str_find(s, "") != 0) { return 17; }
+    if (at(str_find(s, ""), 0 - 1) != 0) { return 17; }
     if (str_starts_with(s, "") != 1) { return 18; }
 
     // Trimming, including strings that are all space or empty.
@@ -43,41 +53,50 @@ fn main() -> int32 {
     if (str_trim("") != "") { return 23; }
     if (str_trim("none") != "none") { return 24; }
 
-    // Splitting. The head/tail cover every byte exactly once either way.
+    // Splitting. The head and tail together cover every byte before and after
+    // the separator; a separator that is absent answers None.
     var head: string = "";
     var tail: string = "";
-    var found: int32 = 0;
-    (head, tail, found) = str_split_once("key=value", "=");
-    if (found != 1) { return 25; }
+    match (str_split_once("key=value", "=")) {
+        case Some(kv): { head = kv.head; tail = kv.tail; }
+        case None: { return 25; }
+    }
     if (head != "key") { return 26; }
     if (tail != "value") { return 27; }
 
-    (head, tail, found) = str_split_once("novalue", "=");
-    if (found != 0) { return 28; }
-    if (head != "novalue") { return 29; }
-    if (tail != "") { return 30; }
+    match (str_split_once("novalue", "=")) {
+        case Some(kv): { return 28; }
+        case None: { }
+    }
 
-    // Parsing, with no terminator anywhere in sight.
+    // Parsing, with no terminator anywhere in sight. A failure is unreachable
+    // through Ok, so the sentinel below can only come from the Err arm.
     var value: int64 = 0;
-    var ok: int32 = 0;
-    (value, ok) = str_to_i64("1234");
-    if (ok != 1 || value != 1234) { return 31; }
-    (value, ok) = str_to_i64("-42");
-    if (ok != 1 || value != 0 - 42) { return 32; }
-    (value, ok) = str_to_i64("+7");
-    if (ok != 1 || value != 7) { return 33; }
-    (value, ok) = str_to_i64("12a");
-    if (ok != 0) { return 34; }                          // partial is a failure
-    (value, ok) = str_to_i64("");
-    if (ok != 0) { return 35; }
-    (value, ok) = str_to_i64("-");
-    if (ok != 0) { return 36; }
+    if (str_to_i64_or("1234", 0 - 1) != 1234) { return 31; }
+    if (str_to_i64_or("-42", 0 - 1) != 0 - 42) { return 32; }
+    if (str_to_i64_or("+7", 0 - 1) != 7) { return 33; }
+    if (str_to_i64_or("12a", 0 - 1) != 0 - 1) { return 34; }  // partial fails
+    if (str_to_i64_or("", 0 - 1) != 0 - 1) { return 35; }
+    if (str_to_i64_or("-", 0 - 1) != 0 - 1) { return 36; }
+
+    // The error arm says what was wrong.
+    match (str_to_i64("12a")) {
+        case Ok(v): { return 43; }
+        case Err(why): { if (why != "not a decimal digit") { return 44; } }
+    }
+    match (str_to_i64("")) {
+        case Ok(v): { return 45; }
+        case Err(why): { if (why != "empty") { return 46; } }
+    }
 
     // Parsing a field sliced straight out of a larger buffer.
     var record: string = "id=907;";
-    (head, tail, found) = str_split_once(record, "=");
-    (value, ok) = str_to_i64(str_slice(tail, 0, (int64)tail.length - 1));
-    if (ok != 1 || value != 907) { return 37; }
+    match (str_split_once(record, "=")) {
+        case Some(kv): { tail = kv.tail; }
+        case None: { return 37; }
+    }
+    value = str_to_i64_or(str_slice(tail, 0, (int64)tail.length - 1), 0 - 1);
+    if (value != 907) { return 37; }
 
     // Formatting into a caller-owned buffer, returned as a view of it.
     var buf: uint8[32];
@@ -88,8 +107,9 @@ fn main() -> int32 {
     if (i64_to_str(4096, &buf[0], 4) != "") { return 41; }
 
     // Round trip.
-    (value, ok) = str_to_i64(i64_to_str(0 - 987654, &buf[0], 32));
-    if (ok != 1 || value != 0 - 987654) { return 42; }
+    if (str_to_i64_or(i64_to_str(0 - 987654, &buf[0], 32), 0) != 0 - 987654) {
+        return 42;
+    }
 
     return 88;
 }
