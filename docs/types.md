@@ -432,6 +432,26 @@ different payloads can sit in one function. Where there is no destination to
 read, qualify it: `Result.Ok(f)` is not a type, but `MyEnum.Variant(x)` picks
 the variant of a named non-generic enum.
 
+`std/core` also declares `Option<T>`, for the other question:
+
+```mettle
+export enum Option<T> {
+  Some(T),
+  None
+}
+```
+
+The two are not interchangeable. `Result` is for a call that could not do what
+it was asked, and its `Err` arm carries why. `Option` is for a value that may
+simply not be there, which is an ordinary outcome with nothing to explain.
+`str_find` answers `Option<int64>` because a needle that is absent is not an
+error; `str_to_i64` answers `Result<int64, string>` because a letter where a
+digit belonged is.
+
+Both are exhaustive. A `match` with no `default` has to name every arm, so a
+failure cannot be read as a success by forgetting to check a flag, which is
+what a sentinel return allows and what the standard library used to do.
+
 ## Generic Type Parameters
 
 Functions and structs can be generic. Type parameters are declared in angle brackets: `fn f<T>(...)` or `struct S<T> { ... }`. Instantiation uses the same syntax: `f<int32>(args)` or `var x: Pair<int32, float64>`.
