@@ -35,7 +35,7 @@ Two claims, and they depend on each other:
    optimizations that survived the classical optimizer and that the shipped
    model's graph cannot represent.
 
-2. **The translation-validation gate is a labelling oracle.** The pass already
+2. The translation-validation gate is a labelling oracle. The pass already
    executes every proposed rewrite through a reference interpreter against a
    pre-rewrite snapshot. That machinery, built to keep an untrusted model honest,
    also produces free supervised labels on real code: validated proposals are
@@ -67,8 +67,8 @@ Two claims, and they depend on each other:
    One sub-claim has to be retired before it is made, though. The obvious
    headline, "the model predicts which of its own proposals the validator will
    reject", does not survive its own control. Predicting rejection from the
-   **instruction kind alone**, ten empirical rates fitted on train and applied to
-   held-out, scores **0.963 AUC** (`risk_baseline.py`). Stores in
+   instruction kind alone, ten empirical rates fitted on train and applied to
+   held-out, scores 0.963 AUC (`risk_baseline.py`). Stores in
    `mem_copy`-shaped code are nearly always rejected, and that single fact
    carries most of the signal. A risk head is only interesting if it clears that
    by a wide margin, and it should be described as instruction-type prediction
@@ -86,7 +86,7 @@ is the gate. Semantic candidate generation and validator-derived supervision are
 not two independent ideas that happen to share a model; neither is much use here
 without the other.
 
-A third idea, **adaptive depth**, was tried and did not work. Replacing eight
+A third idea, adaptive depth, was tried and did not work. Replacing eight
 fixed layers with one shared block plus a learned halting scalar cut parameters
 from 10.8M to 3.3M, and cost accuracy across the board: held-out GVN F1 0.636
 against 0.845-0.889, risk AUC 0.970 against 0.988-0.996, barely clear of the
@@ -116,25 +116,25 @@ post-classical IR, in a different repository that was never harvested.
 | | shape-key held-out set | MettleWarband |
 |---|---|---|
 | exact shape-key match in training | 0% by construction | 9.6% (linked stdlib) |
-| median max shape similarity | 0.529 | **0.333** |
-| functions >= 0.7 similar | 29.3% | **11.2%** |
+| median max shape similarity | 0.529 | 0.333 |
+| functions >= 0.7 similar | 29.3% | 11.2% |
 
 Speculative `DELETE`, whole-program build, counting the gate's verdicts:
 
 | model | proposals | validated | rejected | reject rate |
 |---|---|---|---|---|
-| `gnn_genius` (shipped) | 27 776 | **895** | 115 | 11.4% |
+| `gnn_genius` (shipped) | 27 776 | 895 | 115 | 11.4% |
 | `oracle_A` (new data, shipped architecture) | 592 | 197 | 28 | 12.4% |
 | `oracle_C` (+ semantic + pointer) | 1 129 | 326 | 42 | 11.4% |
 
 Three readings, in order of importance:
 
-1. **The precision advantage is gone.** All three models sit at 11-12%. The
+1. The precision advantage is gone. All three models sit at 11-12%. The
    twentyfold reduction measured on the held-out split does not exist here for
    any variant. It was distribution-fitting.
-2. **Recall is worse, and the shipped model wins.** 895 against 326 and 197. A
+2. Recall is worse, and the shipped model wins. 895 against 326 and 197. A
    model trained on these labels is a regression on code from outside the corpus.
-3. **Semantic features are the part that partially generalizes.** `oracle_C`
+3. Semantic features are the part that partially generalizes. `oracle_C`
    finds 65% more than `oracle_A` at identical precision. `oracle_A` memorized
    which sites in the toolchain get rejected and went quiet on unfamiliar code;
    `oracle_C`'s node identity is structural, so it kept proposing. That ordering
@@ -143,7 +143,7 @@ Three readings, in order of importance:
 
 The model-free path is the one that holds up. On the same unseen codebase,
 `sem_probe.py` proposes 820 semantic-only reuse candidates, none overlapping the
-shipped pass, and the gate validates **103 against 17 rejections**, more sound
+shipped pass, and the gate validates 103 against 17 rejections, more sound
 rewrites in one application than the 111 found across roughly 500 toolchain
 programs. Precision falls out of distribution (14.2% rejected against 0.9%),
 which is exactly what eight probes of evidence should do on unfamiliar code, and
@@ -266,7 +266,7 @@ the output domain rather than a fixable bug, and claiming those as semantic
 matches would be dishonest. Genuinely identical comparisons are still linked by
 the syntactic edge, which is exact for them.
 
-**This is a feature, never a proof.** Fingerprint agreement is evidence of value
+This is a feature, never a proof. Fingerprint agreement is evidence of value
 equality. The interpreter gate remains the sole authority on whether any proposal
 is sound, exactly as it is today.
 
@@ -285,7 +285,7 @@ real IR: 3222 unique function bodies, 175222 instructions
   functions containing a gap pair  : 419/3222 (13.0%)
 ```
 
-On the same population of nodes, semantic identity finds **just under twice** as
+On the same population of nodes, semantic identity finds just under twice as
 many dominating reuse candidates as syntactic identity (3292 against 1675), and
 over half of them have no syntactic edge at all.
 
@@ -328,7 +328,7 @@ semantic-only reuse candidates, adjudicated by the interpreter gate
 Every one of these proposals sits at an instruction the shipped `--ml-opt` pass
 does not touch. That is checked, not assumed: the probe reads the pass's own
 disposition file for the same program and drops any proposal that overlaps it.
-Across 429 compiled sources the overlap is **0**.
+Across 429 compiled sources the overlap is 0.
 
 **Of the 112 proposals the interpreter could rule on, 111 were confirmed
 behaviour-preserving and 1 was rejected.** Every validated row survived the
@@ -370,7 +370,7 @@ dominance analysis in `ml_gnn.c`, which really is sound by construction. The pro
 above quietly violated the assumption: its `COPY` dispositions carry no proof at
 all, and 116 of them were applied without adjudication as a result.
 
-**The PTR variant would violate it by design.** A pointer head that names its own
+The PTR variant would violate it by design. A pointer head that names its own
 reuse target emits a `COPY` whose source a neural network chose, and the old
 predicate would let that through unvalidated on any function the interpreter
 cannot run.
@@ -464,9 +464,9 @@ them. Neither is much use here without the other.
 Until the C port exists, the semantic candidates serve as distractors that the
 head learns to decline, which is useful training but not the payoff.
 
-**Measured, and it came out exactly as predicted.** With the trained variant C
+Measured, and it came out exactly as predicted. With the trained variant C
 running in the compiler under `METTLE_ML_PTR=1` across 70 example programs
-(`ptr_probe.py`), the head produced **one** proposal the sound analysis had not
+(`ptr_probe.py`), the head produced one proposal the sound analysis had not
 already made. Not because it is inaccurate, it is 99.3% correct across 1805
 candidate sites and 90.2% correct at naming the target on the 51 sites that have
 one, but because it reproduces its teacher. Trained to imitate a syntactic
@@ -505,7 +505,7 @@ vectors: the validator-certified action, and a `risk` vector marking where the
 gate rejected a proposal. The full repository yields roughly 6600 functions and
 8400 adjudicated labels in about a minute.
 
-A **risk head** trained on those labels predicts whether the gate will reject a
+A risk head trained on those labels predicts whether the gate will reject a
 proposal before making it. If it works, speculative mode stops spending validator
 time on proposals it is going to lose.
 
@@ -514,7 +514,7 @@ It needs a floor, and the floor is high. Baselines on the same held-out split
 
 | baseline | parameters | AUC |
 |---|---|---|
-| rejection rate per instruction kind | 10 | **0.963** |
+| rejection rate per instruction kind | 10 | 0.963 |
 | rejection rate per (kind, operator) | ~60 | 0.956 |
 | logistic regression on the 9 node features + one-hot kind | ~19 | 0.862 |
 
@@ -531,7 +531,7 @@ it avoid and how many sound rewrites does it lose? At threshold 0.3:
 | kind-only baseline (10 numbers) | 0.31 | 0.081 | 317/382 (83%) |
 | kind+op baseline | 0.32 | 0.085 | 324/382 (85%) |
 | features + logistic regression | 0.25 | 0.044 | 263/382 (69%) |
-| **GNN, variant A (10.8M)** | **0.34** | **0.048** | **360/382 (94%)** |
+| GNN, variant A (10.8M) | 0.34 | 0.048 | 360/382 (94%) |
 
 The GNN keeps *more* proposals than the kind baseline, at *half* its rejection
 rate, and retains 43 more sound rewrites. That is a real margin and it is the
@@ -546,7 +546,7 @@ validation work and keep 94% of what that work would have found.
 Two mistakes were made and corrected while building this, both of which would
 have produced impressive and meaningless numbers.
 
-**Duplicate leakage, twice.** The first held-out split was by source file. Every
+Duplicate leakage, twice. The first held-out split was by source file. Every
 Mettle binary links the same stdlib, so `mem_copy`, `strncmp`, and friends appear
 with byte-identical bodies in program after program: 72% of held-out function
 instances had an exact twin in training, and the risk head scored 0.997 AUC by
@@ -582,12 +582,12 @@ pass trained on real builds: a corpus of compiled programs is overwhelmingly
 duplicated by the standard library and by inlining, and hash-level deduplication
 does not detect it. Measure the split; do not assume it.
 
-**Probe collisions.** The first probe design used uniform 64-bit leaves, which
+Probe collisions. The first probe design used uniform 64-bit leaves, which
 made every comparison indistinguishable from the constant 0, and a `^\S+$` test
 for copy sources accepted `__acrt_iob_func(2)` as a name, so distinct calls
 aliased to one value. Both inflated the measured syntactic/semantic gap.
 
-**Train/inference text skew.** Feature-level parity between `obs.py` and
+Train/inference text skew. Feature-level parity between `obs.py` and
 `ml_obs.c` is necessary and not sufficient: identical features fed through a
 mistranscribed forward pass still give different answers, and again nothing
 crashes. `check_forward.py` closes that by dumping the compiler's raw
@@ -611,19 +611,19 @@ recognize as a definition at all. Every accumulator instruction in the
 canonicalized corpora silently lost its def and all of its def-use edges. That
 affects the corpora the shipped model trained on too.
 
-With **trained** checkpoints the two implementations agree on:
+With trained checkpoints the two implementations agree on:
 
 | variant | nodes | agreement |
 |---|---|---|
-| A baseline (9 features, 8 edges) | 20347 | **100.00%** |
-| B +OBS (45 features, 12 edges) | 17043 | **99.99%** (1 node) |
+| A baseline (9 features, 8 edges) | 20347 | 100.00% |
+| B +OBS (45 features, 12 edges) | 17043 | 99.99% (1 node) |
 
 The baseline is exact. The OBS variant differs on a single node, and the residual
 is localized rather than mysterious:
 
-- the OBS **features** are verified exactly against 48 bodies, 40 of them
+- the OBS features are verified exactly against 48 bodies, 40 of them
   sampled from the real harvested corpus, by `obs_golden.txt`,
-- the OBS **value edges** (types 8 and 9) are verified exactly against the same
+- the OBS value edges (types 8 and 9) are verified exactly against the same
   48 bodies,
 - so what is left is the dominance-derived edges (10 and 11), where the Python
   and C dominator computations are separate implementations.
@@ -657,7 +657,7 @@ its `^(\S+)\s*(=|<-)` pattern happily backtracks onto the `=` inside the argumen
 list, and `ml_gnn.c` reaches a different conclusion. The feature difference is
 real but small enough that a trained model's margins absorb it entirely.
 
-It is also **not** introduced by any of this work, the baseline variant, using
+It is also not introduced by any of this work, the baseline variant, using
 only the nine original features and eight original edges, shows it too. Fixing it
 properly means making the assignment-operator search ignore `=` inside
 parentheses on both sides, which changes what `gnn_genius.bin` predicts and so is
@@ -712,11 +712,11 @@ Verified:
 
 Not done:
 
-- **the pointer head is wired but off by default** (`METTLE_ML_PTR=1`). It was
+- the pointer head is wired but off by default (`METTLE_ML_PTR=1`). It was
   blocked on the provenance fix above, which is now in. Enabling it by default
   waits on evidence from `ptr_probe.py` that the targets it names actually clear
   the gate.
-- **true DAgger converged after one round, with no gain.** `dagger_round.py` did
+- true DAgger converged after one round, with no gain. `dagger_round.py` did
   the real thing, exported variant C, compiled the corpus with it in the loop,
   and trained on the gate's verdicts about the proposals *that* model made. Every
   metric came back flat or marginally worse (acc 0.9918 to 0.9916, DELETE F1
@@ -724,7 +724,7 @@ Not done:
 
   The labels explain it. Round 1's harvest, with the shipped model in the loop,
   contained 808 hard negatives out of 5033 adjudicated proposals (16.1%). Round
-  2's, with `oracle_C` in the loop, contained **3 out of 4136 (0.1%)**. There was
+  2's, with `oracle_C` in the loop, contained 3 out of 4136 (0.1%). There was
   nothing left to correct.
 
   A control settles which it is. Warm-restarting variant A on the SAME rows, no
@@ -739,7 +739,7 @@ Not done:
   Going further needs *exploration* during harvesting, proposing past the
   model's own confidence to manufacture new failure modes, which is a different
   mechanism, not more of this one.
-- **no end-to-end compile-time result yet.** Every number below is held-out
+- no end-to-end compile-time result yet. Every number below is held-out
   classification, not measured optimization quality on real builds.
 
 `gnn_genius.bin` is untouched and `--ml-opt` loads it exactly as before. The

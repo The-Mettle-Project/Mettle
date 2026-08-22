@@ -39,7 +39,7 @@ Signedness matters: it selects signed vs unsigned division, remainder,
 comparison, and right-shift, and whether a narrow load sign- or zero-extends.
 `mtlc_type_is_unsigned` reports the classification the backend uses.
 
-**The `STRING` caveat.** `MTLC_TYPE_STRING` is the Mettle frontend's string
+The `STRING` caveat. `MTLC_TYPE_STRING` is the Mettle frontend's string
 type: an 8-byte handle whose heap layout and helper kernels are defined by that
 frontend's lowering. A foreign frontend should model its strings explicitly
 (for example `mtlc_type_pointer(mtlc_type_scalar(MTLC_TYPE_UINT8))` for a
@@ -78,13 +78,13 @@ typedef struct MtlcType {
 } MtlcType;
 ```
 
-Descriptors are **immutable after construction** as far as the backend is
+Descriptors are immutable after construction as far as the backend is
 concerned; nothing in libmtlc writes to one.
 
 ## Canonical constructors and the immortality contract
 
-Everything in the API that accepts a `const MtlcType *` **borrows** it, and the
-module's type registry stores the pointer **by reference and never frees it**.
+Everything in the API that accepts a `const MtlcType *` borrows it, and the
+module's type registry stores the pointer by reference and never frees it.
 So every descriptor you hand the backend must outlive every module that saw it.
 The canonical constructors make that trivial:
 
@@ -122,7 +122,7 @@ const MtlcType *mtlc_type_function_pointer(const MtlcType *return_type,
 - `mtlc_type_struct` computes the layout under the standard C rule: each field
   goes at the next offset satisfying its own alignment, the struct's alignment
   is the widest field's, and the size rounds up to that alignment. Structs
-  intern **by name**, which is what keeps the registry unambiguous: the same
+  intern by name, which is what keeps the registry unambiguous: the same
   declaration returns the same descriptor, and a redeclaration with a different
   layout returns NULL instead of silently shadowing the first.
 - `mtlc_type_function_pointer` interns by signature, with the canonical name
@@ -137,7 +137,7 @@ and never free the results.
 
 ## Names must parse
 
-The IR carries types **by name** in two places: a local declaration and a cast
+The IR carries types by name in two places: a local declaration and a cast
 record the type's name, and function signatures record parameter/return type
 names. Code generators resolve those names through the module type registry.
 The builder registers every descriptor it saw under `type->name` (falling back
@@ -149,7 +149,7 @@ to the kind name), so:
   example `"global:float32*"`) so distinct spaces cannot collide;
 - arrays register as `"<element>[<count>]"`, structs under the name given to
   `mtlc_type_struct`, and function pointers as `"ret(*)(p0,p1)"`;
-- a hand-built descriptor **must have a unique, stable `name`**, or two
+- a hand-built descriptor must have a unique, stable `name`, or two
   different structs would collide under the fallback kind name. Using
   `mtlc_type_struct` makes this automatic, since it interns by name and rejects
   a conflicting reuse.
@@ -180,7 +180,7 @@ mtlc_store_field(fn, p, ppoint, mtlc_type_field_index(point, "y"),
 
 Two limitations remain:
 
-1. **No aggregate locals through `mtlc_local`**: a struct value lives behind a
+1. No aggregate locals through `mtlc_local`: a struct value lives behind a
    pointer (a `malloc` result, or `mtlc_address_of` on storage you declared),
    and field access is the pointer arithmetic above, which is what it compiles
    to anyway.

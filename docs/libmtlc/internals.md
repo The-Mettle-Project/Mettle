@@ -40,7 +40,7 @@ src/
 
 Everything above is archived into `bin/mtlc.lib` / `bin/libmtlc.a`. One
 subtlety: `src/ir/` also contains the Mettle lowering TUs (`ir_lowering.c`,
-`ir_lower_*.c`); those are frontend-side and are deliberately **not** archived
+`ir_lower_*.c`); those are frontend-side and are deliberately not archived
 (the build scripts list the IR core explicitly to exclude them). The Mettle
 reference frontend (`src/lexer`, `src/parser`, `src/semantic`,
 `src/frontend/`, `src/main.c`, `src/error/error_explain.c`, plus those
@@ -50,10 +50,10 @@ lowering TUs) links against the archive to form `bin/mettle`.
 
 Three mechanisms, all enforced by the suite:
 
-1. **No frontend includes.** No TU in the archive includes a
+1. No frontend includes. No TU in the archive includes a
    parser/semantic/AST header. The diagnostics reporter needs only
    `src/source_location.h` (a dependency-free header shared with the frontend).
-2. **Fallback member.** Two backend TUs reference symbols the reference driver
+2. Fallback member. Two backend TUs reference symbols the reference driver
    normally provides (`string_is_interned` from the lexer's intern table, and
    the Windows crash reporter's exception namer). `mtlc_lib_fallbacks.c` is a
    dedicated archive member with plain (strong) default definitions. Archive
@@ -62,7 +62,7 @@ Three mechanisms, all enforced by the suite:
    definitions as direct objects ahead of the archive, so no duplicate ever
    occurs. (A weak-symbol approach does not work here: on PE/COFF a weak-only
    archive member is never extracted to satisfy a reference.)
-3. **The audit gate.** `libmtlc_selfcontained` in `tests/run_tests.ps1`
+3. The audit gate. `libmtlc_selfcontained` in `tests/run_tests.ps1`
    computes the archive's external symbol closure with `nm` (undefined minus
    defined across all members) and fails if anything in it matches the
    project's naming conventions. The current build also combines the whole
@@ -75,21 +75,21 @@ full builder surface to all four targets.
 
 ## Ownership and threading rules
 
-- **Append clones.** `ir_function_append_instruction` deep-clones every
+- Append clones. `ir_function_append_instruction` deep-clones every
   operand and duplicates `text`. Builders and lowering passes construct
   instructions on the stack with borrowed operand aliases and discard them
   after appending. Nothing retains caller memory.
-- **Types are borrowed, forever.** The module type registry and symbol table
+- Types are borrowed, forever. The module type registry and symbol table
   store `MtlcType *` by reference and never free them. Canonical descriptors
   are immortal by construction; the reference frontend's translation arena
   outlives its compile.
-- **Per-compile mutable state is thread-local.** The compiler session context
+- Per-compile mutable state is thread-local. The compiler session context
   uses owned FLS or native TLS; the explain/annotate diagnostic sinks and the
   pointer-type intern cache use `MTLC_THREAD_LOCAL` (`common.h`). The rule for
   new code: a mutable file-scope variable in the archive must be thread-local
   or it is a bug. This is what lets two frontends compile concurrently on
   separate threads.
-- **Owned thread local storage.** The Windows runtime implements the compiler
+- Owned thread local storage. The Windows runtime implements the compiler
   emulated TLS ABI with FLS. Linux startup and clone paths install each thread
   pointer. Frontends do not select another thread runtime.
 
@@ -107,19 +107,19 @@ observes codegen decisions through thread-local capture sinks.
 
 ## Adding things
 
-**A builder capability** is additive: new function in `include/mtlc/build.h`,
+A builder capability is additive: new function in `include/mtlc/build.h`,
 implementation in `src/mtlc_build.c` emitting existing IR ops (mirror the
 instruction shapes the reference lowering emits; `ir.md` documents them), a
 case in `tests/public_api_test.c`, and a note in the docs. If codegen must
 learn a new shape, that is a backend change first.
 
-**An IR instruction** touches: the opcode enum and dump/interp support in
+An IR instruction touches: the opcode enum and dump/interp support in
 `src/ir/`, every consumer that must handle it (x86-64 MIR and baseline, and
 explicit rejection or support in arm64/ptx/spirv), the optimizer's feature
 scan if passes must see it, and the differential fuzzer's generator if it is
 reachable from source.
 
-**A target** follows the PTX/SPIR-V pattern: one emitter TU consuming
+A target follows the PTX/SPIR-V pattern: one emitter TU consuming
 `IRProgram` + the module tables with no frontend knowledge, an `MtlcArch`
 case in `mtlc_emit`, a driver flag if the reference frontend should expose it,
 and a suite gate that validates output structurally plus an external validator

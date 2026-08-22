@@ -80,20 +80,20 @@ A microbenchmark rewards a compiler for recognizing one loop. These programs are
 built so that recognizing one loop buys almost nothing, while everything an
 application actually spends time on is on the clock.
 
-1. **Three phases at least.** Each program generates its input, transforms it,
+1. Three phases at least. Each program generates its input, transforms it,
    and checks the result, so no single loop owns the measurement.
-2. **The two sources are mirrors.** Same functions in the same order, same
+2. The two sources are mirrors. Same functions in the same order, same
    control flow, same types. Neither side is unrolled, annotated, or hand tuned;
    no `@simd`, no `@inline`, no pointer tricks on one side only.
-3. **Control flow follows the data.** Recursive descent, switch dispatch, probe
+3. Control flow follows the data. Recursive descent, switch dispatch, probe
    loops, greedy backtracking, hash chains, heap sift paths, frontier
    expansion. The branch predictor and the prefetcher both have to work.
-4. **The input is made in the process from a fixed seed.** No files, no clock,
+4. The input is made in the process from a fixed seed. No files, no clock,
    no environment, and every machine gets identical work.
-5. **A checksum covers the whole result.** A pair is accepted only when Mettle
+5. A checksum covers the whole result. A pair is accepted only when Mettle
    and C print the same one, which pins both the timing loop and the answer.
    `huffman` and `lz77` also print a roundtrip mismatch count.
-6. **Float constants are exact in binary.** A decimal like `0.35` has to be
+6. Float constants are exact in binary. A decimal like `0.35` has to be
    rounded when it is parsed, and two front ends need not round it the same way,
    which would fork the checksum before the program ran. `physics_grid` sticks
    to integers and dyadic fractions, and its collision response is written in

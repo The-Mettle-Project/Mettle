@@ -7,25 +7,25 @@ IR through the builder.
 
 Conventions that hold across the whole API:
 
-- **Return codes.** Functions that can fail return `int`: 1 on success, 0 on
+- Return codes. Functions that can fail return `int`: 1 on success, 0 on
   failure. There is no error-code enum and no `errno`-style state.
-- **Diagnostics.** Every failure carries a human-readable message. By default
+- Diagnostics. Every failure carries a human-readable message. By default
   it goes to `stderr`; install a handler (`mtlc_context_set_diagnostic_handler`,
   `mtlc_builder_set_diagnostic_handler`) to capture it instead, or read the last
   one back with `mtlc_context_last_error` / `mtlc_builder_error`. See
   [diag.h](#diagh).
-- **NULL tolerance.** Setters and destroyers accept NULL and do nothing.
+- NULL tolerance. Setters and destroyers accept NULL and do nothing.
   Getters on NULL return 0/NULL. Constructors return NULL on allocation
   failure.
-- **String ownership.** Unless a function's contract says otherwise, string
+- String ownership. Unless a function's contract says otherwise, string
   arguments are copied; the caller keeps ownership of what it passed in.
-- **Type ownership.** `const MtlcType *` arguments are borrowed and must stay
+- Type ownership. `const MtlcType *` arguments are borrowed and must stay
   valid for the life of the module they end up in. The canonical constructors
   (`mtlc_type_scalar`, `mtlc_type_pointer`, `mtlc_type_pointer_in`,
   `mtlc_type_array`, `mtlc_type_struct`, `mtlc_type_function_pointer`) return
   immortal descriptors that satisfy this automatically. See
   [The type system](types.md).
-- **Thread safety.** There is no shared mutable global state in the backend
+- Thread safety. There is no shared mutable global state in the backend
   (per-compile diagnostic state is thread-local). One thread may own one
   compilation at a time: a builder, the module it produces, and the context
   driving it must all be used from a single thread, but two threads can each
@@ -109,6 +109,15 @@ Route pipeline diagnostics (optimize, ML-opt, codegen, link) to `handler`
 instead of `stderr`. `user_data` is passed back unchanged and is neither copied
 nor freed; a NULL handler restores the default.
 
+```c
+int mtlc_context_set_runtime_directory(MtlcContext *ctx, const char *path);
+const char *mtlc_context_runtime_directory(const MtlcContext *ctx);
+```
+
+Where the runtime objects live. `mtlc_build_executable` needs them and fails
+with `set the libmtlc runtime directory first` until one is set. The path is
+copied. The setter returns non-zero on success. They ship in `bin/runtime`.
+
 `mtlc_context_last_error` returns the most recent error, or NULL if there has
 been none. It is the low-ceremony alternative to a handler: call a pipeline
 entry point and, on a 0 return, ask what happened.
@@ -163,7 +172,7 @@ const char *mtlc_context_explain_focus_file(const MtlcContext *ctx);
 
 Enables optimization-decision reporting (each vectorization/inlining decision,
 with a reason when declined). `focus_file`, when non-NULL, limits remarks to
-locations whose filename matches it. **The string is borrowed, not copied**; it
+locations whose filename matches it. The string is borrowed, not copied; it
 must outlive every `mtlc_optimize` call that uses this context.
 
 ```c
@@ -317,7 +326,7 @@ meaningful with the `MtlcFn` that produced them and never cross functions.
 `MTLC_NO_VALUE` is the "no value" sentinel: a void call's result, a void
 return's operand, and every error return.
 
-**Error latching.** The builder is designed so a lowering pass can emit
+Error latching. The builder is designed so a lowering pass can emit
 straight-line calls without checking each one: any internal failure (allocation,
 bad handle, NULL argument) latches an error on the builder. Subsequent calls
 become no-ops returning `MTLC_NO_VALUE`, and `mtlc_builder_finish` returns
@@ -356,7 +365,7 @@ void mtlc_builder_destroy(MtlcBuilder *builder);
 MtlcModule *mtlc_builder_finish(MtlcBuilder *builder);
 ```
 
-`finish` **consumes the builder** in all cases: on success it returns the
+`finish` consumes the builder in all cases: on success it returns the
 module (never call `mtlc_builder_destroy` afterwards); on failure it frees
 everything and returns NULL. `destroy` is for abandoning a build you have not
 finished.
@@ -379,7 +388,7 @@ MtlcFn *mtlc_builder_function(MtlcBuilder *builder, const char *name,
 Declares a function. `name` and every `param_names[i]` are copied. Types are
 borrowed (use canonical descriptors). With `is_extern` nonzero this declares a
 body-less external symbol resolved at link time. Owned runtime and explicit OS
-symbols work on the executable path. It **returns NULL by design**; do not treat that NULL as an
+symbols work on the executable path. It returns NULL by design; do not treat that NULL as an
 error. Otherwise it returns a function builder to emit the body into.
 
 ```c
@@ -398,6 +407,23 @@ names do not matter, which for an extern they usually do not.
 const MtlcType *pt[] = {i64};
 mtlc_builder_declare_function(b, "malloc", mtlc_type_pointer(i64), NULL, pt, 1);
 ```
+
+```c
+int mtlc_fn_set_inline(MtlcFn *fn);
+int mtlc_fn_set_inline_required(MtlcFn *fn);
+int mtlc_fn_set_noinline(MtlcFn *fn);
+int mtlc_fn_set_pure(MtlcFn *fn);
+```
+
+Inlining policy for one function, the frontend-neutral form of Mettle's
+`@inline`, `@inline!`, `@noinline`, and `@pure`. The optimizer decides for
+itself otherwise. `set_inline_required` is a contract: a surviving call site
+fails the build rather than quietly delivering less. `set_pure` says the result
+depends only on the arguments, which lets a loop-invariant call be hoisted even
+when the callee could fault. Each returns non-zero on success.
+
+They apply to device helpers as well as host functions. See
+[GPU offload](../gpu.md).
 
 ```c
 MtlcFn *mtlc_builder_kernel(MtlcBuilder *builder, const char *name,
@@ -822,6 +848,18 @@ must supply `mtlc_gpu_launch_checked`; `std/gpu` supplies the CUDA Driver
 provider, while another runtime can implement the same symbol. Both native
 host backends accept this operation; AArch64 uses the AAPCS64 register and
 overflow-stack layout for all eleven provider arguments.
+
+```c
+MtlcValue mtlc_function_address(MtlcFn *fn, const char *name);
+MtlcValue mtlc_call_indirect(MtlcFn *fn, MtlcValue callee,
+                             const MtlcValue *args, size_t arg_count,
+                             const MtlcType *return_type);
+```
+
+`function_address` yields the address of a named function as a value, which is
+how a frontend builds a dispatch table or hands a callback out.
+`call_indirect` calls through such a value. Without a typed function-pointer
+symbol, the arguments classify as integer or pointer.
 
 ```c
 MtlcValue mtlc_cast(MtlcFn *fn, MtlcValue value, const MtlcType *type);

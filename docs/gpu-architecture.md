@@ -30,15 +30,15 @@ and CUDA's ordering rules on unified memory.
 The implementation has four layers. A feature is rejected if it shortcuts this
 boundary for convenience.
 
-1. **Frontend:** parses Mettle syntax and diagnoses language/ABI errors. It may
+1. Frontend: parses Mettle syntax and diagnoses language/ABI errors. It may
    identify a function as a kernel, but must not know PTX opcodes, SPIR-V IDs,
    CUDA versions, or GB10 instruction encodings.
-2. **Public IR/libmtlc:** carries target-neutral kernel identity, address spaces,
+2. Public IR/libmtlc: carries target-neutral kernel identity, address spaces,
    launch geometry, synchronization scope/order, and typed GPU operations. Any
    frontend must be able to construct the same module through `include/mtlc`.
-3. **Code generators:** map neutral IR onto PTX or SPIR-V. Target profiles and
+3. Code generators: map neutral IR onto PTX or SPIR-V. Target profiles and
    capability checks live here, not in the parser or type checker.
-4. **Runtime providers:** implement allocation, module loading, streams, events,
+4. Runtime providers: implement allocation, module loading, streams, events,
    launches, and graphs. `std/gpu` currently provides CUDA Driver bindings; the
    language and IR contracts must permit HIP/OpenCL providers without changing
    source semantics.
@@ -82,8 +82,8 @@ capability rejection, and PTX, SPIR-V, x86-64, and AArch64 products.
 | Real-device differential/sanitizer harness | working on development NVIDIA hardware | one cross-host CUDA Driver harness checks 3-D indices, odd tails, device calls, loops/math, static/dynamic workgroup memory, explicit and optimizer-generated async staging, contended u32/u64 atomics and release/acquire visibility, barriers, subgroup reductions/scans/exchange/ballot/votes, arbitrary-width row softmax and affine layer normalization, poisoned-padding f16/f32 tensor MMA, native FP8, direct/chain/runtime MXFP4, NVFP4, and mixed dense FP6 with independent scale chunks, a four-K-tile resident chain, two- and four-stage staged tensor pipelines, a 32x32x64 runtime-K resident GEMM plus incomplete-K commit bypass, a 19x23x21 tensor/scalar tail-complete GEMM plus scalar-only K=7 path, and natural-width parameters; all 32 cases pass on compute 12.0 with memcheck at 0 errors and racecheck at 0 hazards; strict Spark mode requires native AArch64 + integrated compute 12.1 and has not yet been recorded here |
 | Source-expressed AI correctness primitives | working baseline | arbitrary-width/padded-stride f32 softmax and affine layer normalization; padded multi-tile and tail-complete tensor/scalar f16/f32 GEMMs; native FP8, mixed FP6, MXFP4, and NVFP4 direct/chain/runtime accumulation; and explicit two- and four-stage async-copy/tensor pipelines pass CPU numerical oracles on compute 12.0; they prove exact expressiveness and correctness, not general fusion, compiler-generated tiling/pipeline rotation, GB10 tuning, or competitive throughput |
 | GPU fusion, compiler-generated tiling/layout, memory planning, cost model, autotuning | early partial foundation | exact adjacent, single-update loop, automatic copy staging, explicit N-stage staged-tensor accumulation, a separate exact epilogue, and fail-closed backend-private MMA/epilogue residency (including unique loop exits) have neutral legality, native/public construction, negative gates, verifier rechecks, inspectable PTX decisions, and offline assembly; PTX generates physical grids for larger stable byte-addressable logical tiles, chooses A/B fragment reuse, prices every resident output subtile plus epilogue temporaries, and now selects native full-K versus cooperative M/N/K edges inside each bounded whole-matrix region, including backend-local opposite-layout normalization, resident direct-MMA unscaled E4M3/E5M2 interiors, and resident block-scaled FP8/FP6/FP4 interiors with exact cooperative tails and guarded packed loads; a backend-only tuple budget produces reproducible resident/replay variants, an offline profiler records hashed resource and static-instruction evidence, and a device-free selector computes explicit-model occupancy/Pareto results or consumes hash-bound paired timings with corrected significance/effect gates without inventing a winner; automatic launch-grid/batch generation, physical layout transforms, buffer rotation, multi-exit/graph-wide fusion, whole-kernel memory planning, on-device measurement collection/cache integration, and GB10 performance evidence are not implemented |
-| Graph capture/replay and multi-device execution | **not implemented** | runtime and neutral launch-graph IR needed |
-| Real GB10 differential/performance result | **not yet recorded** | the self-hosted Spark workflow and strict correctness/sanitizer gate exist, but a passing compute-12.0 development GPU is not substituted for AArch64/GB10 evidence; competitive performance workloads remain pending |
+| Graph capture/replay and multi-device execution | not implemented | runtime and neutral launch-graph IR needed |
+| Real GB10 differential/performance result | not yet recorded | the self-hosted Spark workflow and strict correctness/sanitizer gate exist, but a passing compute-12.0 development GPU is not substituted for AArch64/GB10 evidence; competitive performance workloads remain pending |
 
 This is a foundation, not parity with CUDA, HIP, SYCL, or Triton. Claiming
 otherwise before the acceptance gates below pass would be false.
@@ -192,14 +192,14 @@ on named workloads, not a favorable microbenchmark.
 
 ## Required test tiers
 
-1. **Every commit:** frontend diagnostics, public-IR boundary test, PTX/SPIR-V
+1. Every commit: frontend diagnostics, public-IR boundary test, PTX/SPIR-V
    structural checks, `ptxas` when available, native AArch64 object/link/ABI.
-2. **GPU runner:** execute every kernel against a deterministic CPU oracle under
+2. GPU runner: execute every kernel against a deterministic CPU oracle under
    compute-sanitizer, including odd sizes, misalignment, aliasing, NaN/Inf,
    integer boundaries, and launch failures.
-3. **DGX Spark:** repeat correctness on GB10, then record ptxas registers/spills,
+3. DGX Spark: repeat correctness on GB10, then record ptxas registers/spills,
    Nsight metrics, warm/cold timings, memory use, and thermally steady results.
-4. **Release:** no performance claim without stored inputs, baselines, raw data,
+4. Release: no performance claim without stored inputs, baselines, raw data,
    compiler/toolkit versions, and confidence intervals.
 
 ## Primary references

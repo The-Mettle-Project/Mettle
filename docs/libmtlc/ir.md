@@ -10,12 +10,12 @@ surface.
 
 A module is:
 
-- an ordered list of **functions**, each a linear instruction stream (there is
+- an ordered list of functions, each a linear instruction stream (there is
   no nesting; basic blocks are implied by labels and terminators);
-- a **type registry**: a name-to-descriptor table (`"int64"` maps to the int64
+- a type registry: a name-to-descriptor table (`"int64"` maps to the int64
   descriptor, `"float32*"` to the pointer descriptor) that code generators use
   to resolve any type name the IR carries;
-- a **module symbol table**: one entry per function and global with its kind,
+- a module symbol table: one entry per function and global with its kind,
   type signature, extern flag, link name, and (for globals) the folded
   constant initializer.
 
@@ -26,11 +26,11 @@ never fills them by hand.
 
 A function body computes over two kinds of values:
 
-- **Temporaries.** Every value-producing instruction (`mtlc_binary`,
+- Temporaries. Every value-producing instruction (`mtlc_binary`,
   `mtlc_call`, `mtlc_load`, ...) defines a fresh single-assignment temporary.
   Temps are not storage: you cannot assign to them, and their handle is only
   the name of that one computed value.
-- **Storage.** Parameters, locals (`mtlc_local`), and global references
+- Storage. Parameters, locals (`mtlc_local`), and global references
   (`mtlc_global_ref`) name mutable slots. Reading the handle reads the current
   value; `mtlc_assign` writes it. Storage is how values cross basic blocks:
   the IR has no phi nodes, so a value needed after a branch merge must live in
@@ -76,32 +76,32 @@ What the builder emits, in terms of the semantics codegen implements:
 
 Semantics worth spelling out:
 
-- **Result types drive selection.** `mtlc_binary`'s `result_type` decides
+- Result types drive selection. `mtlc_binary`'s `result_type` decides
   everything the instruction encoder needs: operand width, signed vs unsigned
   `/ % < <= > >=` and `>>`, and float vs integer arithmetic. The backend never
   re-infers types from context, so a wrong `result_type` is a silent
   miscompile, not an error.
-- **Comparisons produce 0/1 integers.** `==`,`!=`,`<`,`<=`,`>`,`>=` yield an
+- Comparisons produce 0/1 integers. `==`,`!=`,`<`,`<=`,`>`,`>=` yield an
   integer 0 or 1 (give them an integer result type). `&&` and `||` here are
-  **bitwise** over those 0/1 values, not short-circuit: both operands are
+  bitwise over those 0/1 values, not short-circuit: both operands are
   always evaluated. A frontend that needs C-style short-circuit evaluation
   lowers it with branches (pattern below).
-- **Integer overflow wraps.** Arithmetic is native two's complement; there are
+- Integer overflow wraps. Arithmetic is native two's complement; there are
   no traps and no undefined-overflow assumptions in the backend.
-- **Atomic width is not inferred from the result.** The intrinsic identity
+- Atomic width is not inferred from the result. The intrinsic identity
   carries u32/u64 independently of whether the operation returns the old value
   or `void` (store). This keeps load/store/RMW/CAS lowering identical for every
   frontend and prevents a u64 store from being narrowed through a void result.
-- **Division by zero** is whatever the target does (a fault on the CPU
+- Division by zero is whatever the target does (a fault on the CPU
   targets). The backend inserts no checks; frontends that promise checks emit
   them as IR.
-- **Loads extend by element signedness.** A `uint8/16/32` load zero-extends
+- Loads extend by element signedness. A `uint8/16/32` load zero-extends
   into the 64-bit temp; a signed load sign-extends. That is why `mtlc_load`
   takes the element type rather than a byte count.
-- **Pointers are integers with a type.** Pointer arithmetic is ordinary
+- Pointers are integers with a type. Pointer arithmetic is ordinary
   integer arithmetic on the address value; scale indexes by the element size
   yourself. `mtlc_cast` converts between pointer and integer freely.
-- **Asynchronous staging is replayable and CFG-balanced.**
+- Asynchronous staging is replayable and CFG-balanced.
   `IR_OP_ASYNC_COPY`, `IR_OP_ASYNC_COMMIT`, and `IR_OP_ASYNC_WAIT` carry
   matching scalar types, global/workgroup provenance, element count,
   4/8/16-byte transaction size, cache hint, and pending-group bound. A
@@ -111,7 +111,7 @@ Semantics worth spelling out:
   Completion is per work-item, so cross-item consumption still requires an
   ordered workgroup barrier. Optimizer-generated copies carry provenance only
   for dumps/diagnostics; their semantics are identical to explicit copies.
-- **Tensor transfers remain replayable.** `IR_OP_TENSOR_TRANSFER` carries the
+- Tensor transfers remain replayable. `IR_OP_TENSOR_TRANSFER` carries the
   complete rank, direction, element, bounds, scope, global extents/byte strides,
   tile extents, and element strides plus typed raw pointers, signed coordinates,
   and an optional opaque prepared view. It never carries a CUDA tensor-map,
@@ -119,7 +119,7 @@ Semantics worth spelling out:
   workgroup-uniform execution and operands. A backend may use the view only as
   an acceleration precondition for the same descriptor; PTX otherwise performs
   cooperative rank-aware replay, while an unsupported SPIR-V profile rejects.
-- **Tensor epilogues do not expose fragments.** `IR_OP_TENSOR_EPILOGUE` carries
+- Tensor epilogues do not expose fragments. `IR_OP_TENSOR_EPILOGUE` carries
   a complete logical MxN descriptor plus typed destination/bias pointers,
   selected compute scalars, and runtime strides. Shared verification checks the
   exact operand signature and scope-uniform execution. PTX replays it as an
@@ -127,7 +127,7 @@ Semantics worth spelling out:
   behind the same semantics. A loop handoff additionally requires its exit jump
   to be the epilogue label's only predecessor; the shared operation never gains
   a fragment field. Current SPIR-V rejects explicitly.
-- **Subgroups are implementation-sized.** The semantic intrinsic family carries
+- Subgroups are implementation-sized. The semantic intrinsic family carries
   local ID, size, uniform u32/f32 broadcast, varying-source shuffle,
   add/min/max reductions, inclusive/exclusive add scans, word-addressed ballot,
   and any/all votes without naming a warp or wave. Collectives must
@@ -136,7 +136,7 @@ Semantics worth spelling out:
   targets. Reductions and votes are subgroup-uniform; shuffle and scan results
   are work-item-varying. Ballot requests a 32-bit word so wider masks are not
   silently narrowed; an unavailable word is zero.
-- **Tensor operations are descriptor-exact.** `IR_OP_TENSOR_MMA` carries a
+- Tensor operations are descriptor-exact. `IR_OP_TENSOR_MMA` carries a
   target-neutral `MtlcTensorMmaDesc`, typed memory operands, and a canonical
   A/B/C/D sequence of any runtime leading dimensions. Its neutral tile count is
   one by default; a count above one concatenates equal-sized operand bundles and
@@ -169,7 +169,7 @@ Semantics worth spelling out:
   descriptor/stride connectivity, and the scope-specific CFG or handoff shape.
   The public builder triggers both transforms through ordinary operations; no
   frontend-private annotation is required.
-- **Whole-problem regions are exact and separate.** `IR_OP_TENSOR_MATMUL`
+- Whole-problem regions are exact and separate. `IR_OP_TENSOR_MATMUL`
   carries one ordinary MMA operand bundle followed by unsigned row origin,
   column origin, and problem M/N/K. The descriptor M/N bound the output region;
   descriptor K is a preferred exact native chunk. In-range outputs cover all
@@ -186,7 +186,7 @@ Semantics worth spelling out:
   2:4, A's stride counts two stored values per logical group and metadata stays
   logical under transpose. Unsupported numeric/sparse tails are capability
   errors; no shared field names WMMA, a warp, `mma.sp`, or an NVIDIA fragment.
-- **Collective uniformity is scope-sensitive.** Before PTX or SPIR-V emission,
+- Collective uniformity is scope-sensitive. Before PTX or SPIR-V emission,
   the shared device call graph classifies values as workgroup-uniform,
   subgroup-uniform, or work-item-varying and marks control-dependent CFG
   regions. A subgroup collective may execute under subgroup-uniform control; a
@@ -199,13 +199,13 @@ Semantics worth spelling out:
 
 The rules the instruction stream must satisfy:
 
-1. **Labels are function-scoped** and must be unique within the function.
+1. Labels are function-scoped and must be unique within the function.
    Forward references are fine (jump first, define later).
-2. **A label starts a basic block.** Falling into a label from the preceding
+2. A label starts a basic block. Falling into a label from the preceding
    instruction is allowed and means what it looks like.
-3. **`mtlc_branch_if_zero` is the only conditional.** Taken on zero, falls
+3. `mtlc_branch_if_zero` is the only conditional. Taken on zero, falls
    through on nonzero.
-4. **Every path must end at `mtlc_return`.** The builder does not synthesize
+4. Every path must end at `mtlc_return`. The builder does not synthesize
    returns, and a body that can run off the end is invalid. The cheap
    guarantee is an unconditional `mtlc_return` at the end of lowering (dead if
    unreachable; the optimizer removes it).
@@ -257,10 +257,10 @@ produces, and irreducible graphs are untested territory.
 At `mtlc_builder_finish`:
 
 - Every distinct `MtlcType` that passed through the builder is registered in
-  the **type registry** under its canonical name (plus all scalar names, always).
+  the type registry under its canonical name (plus all scalar names, always).
   This is how a `DECLARE_LOCAL` carrying `"int64*"` or a parameter list carrying
   `"float32"` resolves to layout during code generation.
-- Each declared function becomes a **module symbol** with kind, extern flag,
+- Each declared function becomes a module symbol with kind, extern flag,
   return type, and parameter types. Each global becomes a variable symbol with
   its type and folded initializer. Code generators read this table to emit
   global storage, classify call arguments, and decide what is defined here
@@ -278,12 +278,12 @@ consume kernel IR directly. A runtime provider must define that stable symbol;
 
 ## What each consumer requires
 
-**The optimizer** accepts anything the builder produces and preserves these
+The optimizer accepts anything the builder produces and preserves these
 rules. Use `mtlc_optimize_for` when the target is known. The generic
 `mtlc_optimize` takes the conservative kernel-reachable neutral path for a
 module containing kernels and the full x86-64 path otherwise.
 
-**x86-64 codegen** consumes optimized or unoptimized IR. This is the only
+x86-64 codegen consumes optimized or unoptimized IR. This is the only
 target with full coverage of the instruction set above, including
 `mtlc_address_of` and mixed float/integer bodies.
 

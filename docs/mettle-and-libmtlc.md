@@ -2,7 +2,7 @@
 
 Mettle is a frontend. It owns the language: lexing, parsing, type checking,
 memory safety analysis, monomorphization, and lowering to IR. Everything after
-that IR exists is **libmtlc**: the optimizers, code generation for x86-64 /
+that IR exists is libmtlc: the optimizers, code generation for x86-64 /
 ARM64 / PTX / SPIR-V, and native PE and ELF linking.
 
 They are two halves of one toolchain and they live in one repository. The
@@ -55,7 +55,7 @@ into the archive. Adding a translation unit means deciding which list it joins.
 
 ## Is libmtlc still a separate artifact?
 
-**Yes.** Living in this repository changed how it is *developed*, not how it is
+Yes. Living in this repository changed how it is *developed*, not how it is
 *consumed*. Every release attaches a backend-only asset,
 `libmtlc-<tag>-<target>.zip` on Windows and `.tar.gz` on Linux, carrying the
 `include/mtlc/` headers, the static archive, and the freestanding runtime
@@ -77,7 +77,7 @@ lands. From a checkout, `make install-libmtlc` does a system install with a
 pkg-config file, so a consumer builds with
 `cc $(pkg-config --cflags --libs libmtlc) app.c` and never mentions Mettle.
 
-What did change: libmtlc is no longer a **separately versioned dependency** of
+What did change: libmtlc is no longer a separately versioned dependency of
 this repository. There used to be a `libmtlc.version` pin here and a fetch step
 that pulled a matching build; both are gone, and the backend is compiled from
 `src/` along with everything else. So the two versions are no longer

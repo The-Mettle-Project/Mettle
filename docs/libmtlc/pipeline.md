@@ -37,24 +37,24 @@ For x86-64, `mtlc_optimize_for` runs a fixpoint pass pipeline over every
 function, with pre-inline and post-fixpoint phases around it. The pass families,
 by the modules that implement them (`src/ir/optimizer/`):
 
-- **Foundation**: common-subexpression elimination, dead-temp removal,
+- Foundation: common-subexpression elimination, dead-temp removal,
   constant/copy propagation, constant folding, branch simplification and dead
   branch cleanup, rotate fusion, small-function inlining (driven by a function
   index built up front).
-- **Loop recognizers**: counted-loop parsing feeding small-loop unrolling and
+- Loop recognizers: counted-loop parsing feeding small-loop unrolling and
   reduction unrolling; loop-invariant null-check hoisting; word-count and
   div-by-power-of-two idioms; popcount and Collatz step loops; min/max,
   prefix-sum, lower-bound, dot-product, and memcmp scans.
-- **SIMD lowering** (x86-64 AVX2): integer and float horizontal sums, dot
+- SIMD lowering (x86-64 AVX2): integer and float horizontal sums, dot
   products, affine maps, fills, clamps, scale/reverse memory maps, byte-map
   chains, insertion-sort and shift-loop kernels, and the general `@simd`
   vectorizer for map/reduce loops. These rewrite loops into dedicated IR
   opcodes that only the x86-64 backend implements, so they are excluded from
   the target-neutral schedule.
-- **Memory**: scalar replacement of aggregate locals (SROA), memcpy
+- Memory: scalar replacement of aggregate locals (SROA), memcpy
   constant-size lowering, load-to-copy cleanup, congruent
   induction-variable elimination.
-- **Hotness policy**: a zero-run PGO estimate (or measured frequencies when
+- Hotness policy: a zero-run PGO estimate (or measured frequencies when
   the driver ran `--pgo`) sets code-size versus speed thresholds per site.
 
 Knobs read from the context:
@@ -137,7 +137,7 @@ the linker. This is the only target implementing the full IR surface.
 
 ### AArch64
 
-`mtlc_emit(MTLC_ARCH_ARM64)` writes an **ELF64 relocatable object** with
+`mtlc_emit(MTLC_ARCH_ARM64)` writes an ELF64 relocatable object with
 `EM_AARCH64`, normal function/global symbols, `.text/.rodata/.data/.bss`, and
 AAELF64 `CALL26`, page-address, low-12, and absolute-data relocations. Calls use
 AAPCS64's independent `x0..x7` and `v0..v7` banks plus 8-byte overflow stack
@@ -175,7 +175,7 @@ and emits syscall based stubs (bump pointer `malloc`/`calloc`/
 the DGX Spark GB10 profile (`.version 8.8`, `.target sm_121a`); embedding
 frontends can select another backend profile with
 `mtlc_context_set_ptx_target`.
-**Every function marked as a kernel becomes a GPU entry point** (`.visible
+Every function marked as a kernel becomes a GPU entry point (`.visible
 .entry`). Ordinary functions reached by a kernel become non-entry `.func`
 definitions; unrelated host functions are omitted. Parameters are scalars and
 raw device pointers. PTX has unlimited typed virtual
@@ -315,7 +315,7 @@ Design notes that matter to consumers:
   convert that same pointer to their exact typed storage-class pointer at each
   access. An OpenCL adapter binds it as a local-memory argument sized from the
   neutral launch's dynamic byte count.
-- Control flow maps **directly** onto SPIR-V blocks (`OpBranch` /
+- Control flow maps directly onto SPIR-V blocks (`OpBranch` /
   `OpBranchConditional`). The structured-control-flow rules
   (`OpSelectionMerge`/`OpLoopMerge`) bind only the `Shader` capability;
   `Kernel` modules may branch freely, which `spirv-val` confirms.
@@ -352,7 +352,7 @@ validator and survive an `spirv-opt -O` round trip.
 `mtlc_build_executable` = emit object + synthesize startup + link + clean up
 temporaries.
 
-**Windows (the internal PE linker).** No external toolchain and no Windows SDK:
+Windows (the internal PE linker). No external toolchain and no Windows SDK:
 
 1. A startup object exports `mettle_start`. It initializes the owned runtime,
    parses arguments when needed, calls `main`, and exits through Kernel32.
@@ -366,7 +366,7 @@ The Mettle driver's `--build` uses the same linker with a wider default DLL
 set and user-supplied `--link-arg` libraries; the library entry point keeps
 the minimal set.
 
-**ELF hosts.** The object links with Mettle's `_start` and freestanding runtime.
+ELF hosts. The object links with Mettle's `_start` and freestanding runtime.
 The direct path uses `ld`. A GCC fallback disables its startup and all default
 libraries. The output must be static `ET_EXEC` with no interpreter or dynamic
 section. The same rule covers x86_64 and AArch64 Linux objects.
@@ -375,14 +375,14 @@ section. The same rule covers x86_64 and AArch64 Linux objects.
 
 Independent of unit tests, three mechanisms check the pipeline end to end:
 
-- **Translation validation** (`--verify` in the driver): every pass, on every
+- Translation validation (`--verify` in the driver): every pass, on every
   function it changed, is validated by executing before-IR and after-IR in the
   reference interpreter on identical inputs and comparing all observables; a
   divergence names the pass, prints a counterexample, quarantines the pass for
   that function, and recompiles.
-- **The differential fuzzer** (`tools/fuzz/`): generated UB-free programs
+- The differential fuzzer (`tools/fuzz/`): generated UB-free programs
   compiled at `-O0` and `--release`, failing on any behavioral divergence.
-- **The suite gates**: `public_api` (builder to all four targets, native run
+- The suite gates: `public_api` (builder to all four targets, native run
   asserted), `calc_frontend` (a real second frontend), `ptx_emit_*` /
   `spirv_emit_*` (external validators when installed), and
   `libmtlc_selfcontained` (the symbol-closure audit).
