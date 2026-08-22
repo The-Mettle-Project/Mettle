@@ -1428,8 +1428,14 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       }
     }
 
+    /* The initializer declares a variable scoped to the loop, so it needs
+     * a scope of its own: without one the loop variable stayed the live
+     * binding for its name after the loop ended, and a `for i in 0..3`
+     * beside an outer `i` left that outer name reading 3. */
+    ir_local_scope_enter(context);
     if (!ir_lower_statement_or_expression(context, function,
                                           for_data->initializer)) {
+      ir_local_scope_leave(context);
       free(condition_label);
       free(step_label);
       free(end_label);
@@ -1439,6 +1445,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (for_data->unroll_factor > 1 &&
         !ir_emit_unroll_marker(context, function, for_data->unroll_factor,
                                statement->location)) {
+      ir_local_scope_leave(context);
       free(condition_label);
       free(step_label);
       free(end_label);
@@ -1447,6 +1454,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
 
     if (!ir_emit_label_instruction(context, function, condition_label,
                                    statement->location)) {
+      ir_local_scope_leave(context);
       free(condition_label);
       free(step_label);
       free(end_label);
@@ -1456,6 +1464,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (for_data->condition) {
       if (!ir_emit_condition_false_branch(context, function,
                                           for_data->condition, end_label)) {
+        ir_local_scope_leave(context);
         free(condition_label);
         free(step_label);
         free(end_label);
@@ -1465,6 +1474,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
 
     if (!ir_push_labeled_control_frame(context, end_label, step_label,
                                        for_data->label, defers)) {
+      ir_local_scope_leave(context);
       free(condition_label);
       free(step_label);
       free(end_label);
@@ -1475,6 +1485,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
                                                  for_data->body, defers);
     ir_pop_control_frame(context);
     if (!body_ok) {
+      ir_local_scope_leave(context);
       free(condition_label);
       free(step_label);
       free(end_label);
@@ -1483,6 +1494,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
 
     if (!ir_emit_label_instruction(context, function, step_label,
                                    statement->location)) {
+      ir_local_scope_leave(context);
       free(condition_label);
       free(step_label);
       free(end_label);
@@ -1491,6 +1503,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
 
     if (!ir_lower_statement_or_expression(context, function,
                                           for_data->increment)) {
+      ir_local_scope_leave(context);
       free(condition_label);
       free(step_label);
       free(end_label);
@@ -1501,6 +1514,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
                                   statement->location) ||
         !ir_emit_label_instruction(context, function, end_label,
                                    statement->location)) {
+      ir_local_scope_leave(context);
       free(condition_label);
       free(step_label);
       free(end_label);
@@ -1510,12 +1524,14 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     if (for_simd_id >= 0 &&
         !ir_emit_simd_marker(context, function, 'E', for_simd_id, 0,
                              statement->location)) {
+      ir_local_scope_leave(context);
       free(condition_label);
       free(step_label);
       free(end_label);
       return 0;
     }
 
+    ir_local_scope_leave(context);
     free(condition_label);
     free(step_label);
     free(end_label);

@@ -75,6 +75,24 @@
   return total + (int64)n;
 }
 
+/* A for initializer declares a variable scoped to the loop, so an outer name
+ * it shadows has to survive the loop unchanged. */
+@noinline fn range_for_shadow() -> int32 {
+  var i: int32 = 77;
+  for i in 0..3 {
+    if (i > 2) { return 0 - 1; }
+  }
+  return i;
+}
+
+@noinline fn counted_for_shadow() -> int32 {
+  var j: int32 = 88;
+  for (var j: int32 = 0; j < 3; j = j + 1) {
+    if (j > 2) { return 0 - 1; }
+  }
+  return j;
+}
+
 fn main() -> int32 {
   if (block_shadow() != 1) { return 1; }
   if (loop_shadow() != 1) { return 2; }
@@ -82,5 +100,7 @@ fn main() -> int32 {
   if (siblings() != 7) { return 4; }
   if (nested() != 1) { return 5; }
   if (retyped() != 19) { return 6; }
+  if (range_for_shadow() != 77) { return 7; }
+  if (counted_for_shadow() != 88) { return 8; }
   return 0;
 }
