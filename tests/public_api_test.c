@@ -2510,8 +2510,12 @@ int main(int argc, char **argv) {
       mtlc_context_ptx_tensor_tuple_budget(ctx) != 0) {
     return fail("default GB10 PTX context profile");
   }
-  if (!mtlc_context_set_runtime_directory(ctx, "bin/runtime") ||
-      strcmp(mtlc_context_runtime_directory(ctx), "bin/runtime") != 0) {
+  const char *runtime_dir = getenv("MTLC_RUNTIME_DIR");
+  if (!runtime_dir || !runtime_dir[0]) {
+    runtime_dir = "bin/runtime";
+  }
+  if (!mtlc_context_set_runtime_directory(ctx, runtime_dir) ||
+      strcmp(mtlc_context_runtime_directory(ctx), runtime_dir) != 0) {
     return fail("freestanding runtime context path");
   }
   if (mtlc_context_set_ptx_target(ctx, "sm_bad", 8, 8)) {

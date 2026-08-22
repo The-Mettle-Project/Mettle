@@ -66,6 +66,31 @@ function Skip-WindowsOnly {
 # dropped and the same program is built through the platform's own linker.
 $script:InternalLinkerArgs = if ($script:OnWindows) { @("--linker", "internal") } else { @() }
 
+# The C-harness cases link against the backend archive each build produces, and
+# the archive carries the host platform's name. Resolving it beside the
+# compiler under test keeps a build staged somewhere other than bin/ (a Linux
+# tree built with BINDIR=bin-linux, say) working with the same code path.
+$script:BinDir = Split-Path -Parent $CompilerPath
+if ([string]::IsNullOrWhiteSpace($script:BinDir)) { $script:BinDir = "bin" }
+$script:BackendArchive = Join-Path $script:BinDir `
+  $(if ($script:OnWindows) { "mtlc.lib" } else { "libmtlc.a" })
+
+# The entry object the freestanding public-API link starts from. The Makefile
+# and build.bat both stage it beside the runtime objects; the obj/ copy is the
+# older location and still answers on a Windows tree.
+$script:HostStartupObject = @(
+  (Join-Path $script:BinDir "runtime/host_startup.o"),
+  "obj/runtime/host_startup.o"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+# dbghelp backs the Windows symbolizer. POSIX resolves through the dynamic
+# loader, so it links -ldl and -pthread in its place.
+$script:HostSymbolizerLibs = if ($script:OnWindows) {
+  @("-ldbghelp")
+} else {
+  @("-ldl", "-pthread")
+}
+
 # Every failure in the suite is reported through Write-CaseResult, so this is
 # the one place that has to remember them for the failure log written at the end
 # of the run. A long green scrollback buries the handful of lines that matter.
@@ -12941,16 +12966,18 @@ $calcGcc = Get-Command gcc -ErrorAction SilentlyContinue
 if (-not $calcGcc) {
   Write-Host "[SKIP] calc_frontend (gcc not found)"
 }
-elseif (-not (Test-Path "bin/mtlc.lib")) {
-  Write-Host "[SKIP] calc_frontend (bin/mtlc.lib not present)"
+elseif (-not (Test-Path $script:BackendArchive)) {
+  Write-Host "[SKIP] calc_frontend ($script:BackendArchive not present)"
 }
 else {
   $total++
   try {
     if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $calcExe = Join-Path $tmpDir "calc.exe"
-    $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Iinclude `
-      examples/calc/calc.c bin/mtlc.lib -o $calcExe -ldbghelp 2>&1 | Out-String
+    $calcArgs = @("-Wall", "-Wextra", "-std=c99", "-Iinclude",
+                  "examples/calc/calc.c", $script:BackendArchive,
+                  "-o", $calcExe) + $script:HostSymbolizerLibs
+    $buildOut = & $calcGcc.Source @calcArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "building the calc frontend failed: $buildOut" }
     $cases = @(
       @{ src = "examples/calc/programs/factorial.calc"; expect = 120 },
@@ -12959,7 +12986,9 @@ else {
     foreach ($c in $cases) {
       $name = [System.IO.Path]::GetFileNameWithoutExtension($c.src)
       $exe = Join-Path $tmpDir ("calc_" + $name + ".exe")
+      $env:MTLC_RUNTIME_DIR = Join-Path $script:BinDir "runtime"
       $emit = & $calcExe $c.src $exe 2>&1 | Out-String
+      Remove-Item Env:\MTLC_RUNTIME_DIR -ErrorAction SilentlyContinue
       if ($LASTEXITCODE -ne 0) { throw "calc failed on $($c.src): $emit" }
       if (-not (Test-Path $exe)) { throw "no executable produced for $($c.src)" }
       & $exe | Out-Null
@@ -12980,16 +13009,19 @@ else {
 if (-not $calcGcc) {
   Write-Host "[SKIP] optimizer_float_copy (gcc not found)"
 }
-elseif (-not (Test-Path "bin/mtlc.lib")) {
-  Write-Host "[SKIP] optimizer_float_copy (bin/mtlc.lib not present)"
+elseif (-not (Test-Path $script:BackendArchive)) {
+  Write-Host "[SKIP] optimizer_float_copy ($script:BackendArchive not present)"
 }
 else {
   $total++
   try {
     if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
     $floatCopyExe = Join-Path $tmpDir "optimizer_float_copy_test.exe"
-    $buildOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Isrc -Iinclude `
-      tests/optimizer_float_copy_test.c bin/mtlc.lib -o $floatCopyExe -ldbghelp 2>&1 | Out-String
+    $floatCopyArgs = @("-Wall", "-Wextra", "-std=c99", "-Isrc", "-Iinclude",
+                       "tests/optimizer_float_copy_test.c",
+                       $script:BackendArchive,
+                       "-o", $floatCopyExe) + $script:HostSymbolizerLibs
+    $buildOut = & $calcGcc.Source @floatCopyArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "building optimizer_float_copy_test failed: $buildOut"
     }
@@ -13017,8 +13049,11 @@ else {
 if (-not $calcGcc) {
   Write-Host "[SKIP] public_api (gcc not found)"
 }
-elseif (-not (Test-Path "bin/mtlc.lib")) {
-  Write-Host "[SKIP] public_api (bin/mtlc.lib not present)"
+elseif (-not (Test-Path $script:BackendArchive)) {
+  Write-Host "[SKIP] public_api ($script:BackendArchive not present)"
+}
+elseif (-not $script:HostStartupObject) {
+  Write-Host "[SKIP] public_api (host startup object not present)"
 }
 else {
   $total++
@@ -13028,26 +13063,53 @@ else {
     $pubOut = Join-Path $tmpDir "pubapi"
     New-Item -ItemType Directory -Force $pubOut | Out-Null
     $pubObj = Join-Path $tmpDir "public_api_test.o"
-    $compileOut = & $calcGcc.Source -Wall -Wextra -std=c99 -Iinclude `
-      -ffreestanding -fno-builtin -fno-stack-protector `
-      -fno-asynchronous-unwind-tables -fno-unwind-tables `
-      -mno-stack-arg-probe -include src/runtime/host_redirect.h `
-      -c tests/public_api_test.c -o $pubObj 2>&1 | Out-String
+    # -mno-stack-arg-probe is an MS-ABI switch; the SysV target has no probe to
+    # turn off and rejects it.
+    $pubCompileArgs = @("-Wall", "-Wextra", "-std=c99", "-Iinclude",
+                        "-ffreestanding", "-fno-builtin", "-fno-stack-protector",
+                        "-fno-asynchronous-unwind-tables", "-fno-unwind-tables")
+    if ($script:OnWindows) { $pubCompileArgs += "-mno-stack-arg-probe" }
+    $pubCompileArgs += @("-include", "src/runtime/host_redirect.h",
+                         "-c", "tests/public_api_test.c", "-o", $pubObj)
+    $compileOut = & $calcGcc.Source @pubCompileArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "compiling public_api_test failed: $compileOut" }
-    $pubLinkArgs = @(
-      '-nostdlib', '-nostartfiles', '-nodefaultlibs',
-      '-Wl,--disable-runtime-pseudo-reloc',
-      '-Wl,-e,mettle_start,--gc-sections',
-      'obj/runtime/host_startup.o', $pubObj, 'bin/mtlc.lib',
-      '-o', $pubExe, '-lkernel32', '-ldbghelp')
+    # Windows enters at mettle_start and needs the Win32 imports; the owned ELF
+    # enters at _start, links nothing, and must come out non-PIE so the product
+    # is an ET_EXEC with no interpreter.
+    $pubLinkArgs = @('-nostdlib', '-nostartfiles', '-nodefaultlibs')
+    if ($script:OnWindows) {
+      $pubLinkArgs += @('-Wl,--disable-runtime-pseudo-reloc',
+                        '-Wl,-e,mettle_start,--gc-sections')
+    } else {
+      $pubLinkArgs += @('-no-pie', '-Wl,-e,_start,--gc-sections')
+    }
+    $pubLinkArgs += @($script:HostStartupObject, $pubObj, $script:BackendArchive,
+                      '-o', $pubExe)
+    if ($script:OnWindows) { $pubLinkArgs += @('-lkernel32', '-ldbghelp') }
     $buildOut = & $calcGcc.Source @pubLinkArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "linking public_api_test failed: $buildOut" }
-    $pubImports = & objdump -p $pubExe 2>&1 | Out-String
-    if ($pubImports -match "msvcrt|ucrt|vcruntime|api-ms-win-crt|libgcc|libstdc|libwinpthread") {
-      throw "public_api_test imports a C or compiler runtime: $pubImports"
+    if ($script:OnWindows) {
+      $pubImports = & objdump -p $pubExe 2>&1 | Out-String
+      if ($pubImports -match "msvcrt|ucrt|vcruntime|api-ms-win-crt|libgcc|libstdc|libwinpthread") {
+        throw "public_api_test imports a C or compiler runtime: $pubImports"
+      }
+    } else {
+      # The same audit in ELF terms: a dynamic section or an interpreter would
+      # mean a host runtime came along.
+      $pubElfType = & readelf -h $pubExe 2>&1 | Out-String
+      if ($pubElfType -notmatch "EXEC \(Executable file\)") {
+        throw "public_api_test is not an ET_EXEC: $pubElfType"
+      }
+      $pubSegments = & readelf -l $pubExe 2>&1 | Out-String
+      if ($pubSegments -match "INTERP|DYNAMIC") {
+        throw "public_api_test carries an interpreter or dynamic section: $pubSegments"
+      }
     }
+    $env:MTLC_RUNTIME_DIR = Join-Path $script:BinDir "runtime"
     $runOut = & $pubExe $pubOut 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "public_api_test failed: $runOut" }
+    $pubRunStatus = $LASTEXITCODE
+    Remove-Item Env:\MTLC_RUNTIME_DIR -ErrorAction SilentlyContinue
+    if ($pubRunStatus -ne 0) { throw "public_api_test failed: $runOut" }
     if ($ptxas) {
       $pubPortablePtx = Join-Path $pubOut "pubapi_kernel_compute75.ptx"
       $pubPortableCubin = Join-Path $pubOut "pubapi_kernel_compute75.cubin"
