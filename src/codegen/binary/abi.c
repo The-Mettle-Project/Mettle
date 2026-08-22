@@ -529,6 +529,93 @@ int code_generator_binary_instruction_in_backward_loop(
   return 0;
 }
 
+/* Label name -> the earliest instruction index that defines it.
+ *
+ * The loop-weight walk asks, for every jump, whether some earlier label matches
+ * its target. Answering that by scanning the prefix costs nothing when the
+ * answer is yes and the label is near, and costs the whole function when the
+ * answer is no -- which is every forward jump, and a function built out of
+ * if/else is almost entirely forward jumps. That made frame preparation
+ * quadratic in the size of a branch-heavy function. */
+typedef struct {
+  const char **names;
+  size_t *indices;
+  size_t capacity;
+} BinaryLabelIndex;
+
+static void binary_label_index_destroy(BinaryLabelIndex *index) {
+  if (!index) {
+    return;
+  }
+  free(index->names);
+  free(index->indices);
+  index->names = NULL;
+  index->indices = NULL;
+  index->capacity = 0;
+}
+
+static int binary_label_index_build(const IRFunction *function,
+                                    BinaryLabelIndex *index) {
+  size_t capacity = 16;
+  size_t mask;
+
+  memset(index, 0, sizeof(*index));
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  while (capacity < function->instruction_count * 2) {
+    capacity *= 2;
+  }
+  index->names = (const char **)calloc(capacity, sizeof(*index->names));
+  index->indices = (size_t *)calloc(capacity, sizeof(*index->indices));
+  if (!index->names || !index->indices) {
+    binary_label_index_destroy(index);
+    return 0;
+  }
+  index->capacity = capacity;
+  mask = capacity - 1;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    size_t slot;
+    if (!instruction || instruction->op != IR_OP_LABEL || !instruction->text ||
+        !instruction->text[0]) {
+      continue;
+    }
+    slot = (size_t)mettle_fnv1a_hash(instruction->text) & mask;
+    while (index->names[slot]) {
+      if (strcmp(index->names[slot], instruction->text) == 0) {
+        break; /* the earliest definition wins, as the prefix scan did */
+      }
+      slot = (slot + 1) & mask;
+    }
+    if (!index->names[slot]) {
+      index->names[slot] = instruction->text;
+      index->indices[slot] = i;
+    }
+  }
+  return 1;
+}
+
+/* SIZE_MAX when the name defines no label. */
+static size_t binary_label_index_find(const BinaryLabelIndex *index,
+                                      const char *name) {
+  size_t mask;
+  size_t slot;
+
+  if (!index || !index->capacity || !name) {
+    return (size_t)-1;
+  }
+  mask = index->capacity - 1;
+  slot = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (index->names[slot]) {
+    if (strcmp(index->names[slot], name) == 0) {
+      return index->indices[slot];
+    }
+    slot = (slot + 1) & mask;
+  }
+  return (size_t)-1;
+}
+
 size_t *code_generator_binary_build_loop_weights(
     const IRFunction *function) {
   if (!function) {
@@ -551,29 +638,32 @@ size_t *code_generator_binary_build_loop_weights(
    * matching how often the instruction actually executes. Without compounding,
    * a hot innermost temporary (e.g. the insertion-sort scan value) ties with
    * every outer-loop variable and loses the register-promotion contest. */
+  BinaryLabelIndex labels;
+  if (!binary_label_index_build(function, &labels)) {
+    free(weights);
+    return NULL;
+  }
   for (size_t jump_index = 0; jump_index < count; jump_index++) {
     const IRInstruction *jump = &function->instructions[jump_index];
+    size_t label_index;
     if (!jump || jump->op != IR_OP_JUMP || !jump->text) {
       continue;
     }
 
-    for (size_t label_index = 0; label_index < jump_index; label_index++) {
-      const IRInstruction *label = &function->instructions[label_index];
-      if (!label || label->op != IR_OP_LABEL || !label->text ||
-          strcmp(label->text, jump->text) != 0) {
-        continue;
-      }
+    label_index = binary_label_index_find(&labels, jump->text);
+    if (label_index == (size_t)-1 || label_index >= jump_index) {
+      continue; /* a forward jump, or no such label: not a loop back-edge */
+    }
 
-      for (size_t i = label_index; i <= jump_index; i++) {
-        /* Cap to avoid overflow on pathologically deep nesting; 4^10 already
-         * dwarfs any realistic outer-loop score. */
-        if (weights[i] <= (size_t)BINARY_LOOP_WEIGHT_CAP) {
-          weights[i] *= 4;
-        }
+    for (size_t i = label_index; i <= jump_index; i++) {
+      /* Cap to avoid overflow on pathologically deep nesting; 4^10 already
+       * dwarfs any realistic outer-loop score. */
+      if (weights[i] <= (size_t)BINARY_LOOP_WEIGHT_CAP) {
+        weights[i] *= 4;
       }
-      break;
     }
   }
+  binary_label_index_destroy(&labels);
 
   return weights;
 }
