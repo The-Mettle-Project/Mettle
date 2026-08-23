@@ -79,7 +79,7 @@ def page_shell(title, description, body, nav_current, depth=1, extra_head=""):
 {extra_head}</head>
 <body>
 <header class="bar"><div class="wrap">
-  <a class="brand" href="{up}index.html"><b>Mettle</b><span>compiler</span></a>
+  <a class="brand" href="{up}index.html"><img src="{up}assets/mark.svg" alt="" width="22" height="22" />Mettle</a>
   <nav>{nav_html}</nav>
 </div></header>
 <main class="wrap">

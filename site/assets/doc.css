@@ -6,24 +6,34 @@
   --ink-faint:#897f67;
   --red:#a3301c;
   --line:rgba(33,28,20,.18);
+  --surround:#e2d5b2;
   --serif:"Crimson Pro",Georgia,"Times New Roman",serif;
   --mono:"Courier Prime",ui-monospace,"Courier New",monospace;
 }
 
 *{box-sizing:border-box}
+
+/* The page is a page: one portrait sheet on a darker surround, with real
+   margins. The sheet is the body itself, so no page needs extra markup. */
+html{background:var(--surround)}
 body{
-  margin:0;background:var(--paper);color:var(--ink);
+  max-width:48rem;margin:34px auto;min-height:calc(100vh - 68px);
+  background:var(--paper);color:var(--ink);
+  border:1px solid var(--line);
   font-family:var(--serif);font-size:19px;line-height:1.6;
 }
 a{color:var(--red);text-decoration:none}
 a:hover{text-decoration:underline}
 a:focus-visible,input:focus-visible{outline:2px solid var(--red);outline-offset:2px}
 
-.wrap{max-width:44rem;margin:0 auto;padding:0 24px}
+.wrap{padding:0 56px}
 
-header.bar{border-bottom:1px solid var(--line);margin-bottom:44px}
-header.bar .wrap{display:flex;align-items:baseline;gap:20px;flex-wrap:wrap;padding-top:18px;padding-bottom:14px}
-.brand{color:var(--ink);font-weight:700;font-size:21px}
+header.bar{border-bottom:1px solid var(--line);margin-bottom:48px}
+header.bar .wrap{display:flex;align-items:center;gap:20px;flex-wrap:wrap;
+  padding-top:26px;padding-bottom:16px}
+.brand{color:var(--ink);font-weight:700;font-size:21px;
+  display:inline-flex;align-items:center;gap:9px}
+.brand img{width:22px;height:22px;display:block}
 .brand span{display:none}
 .bar nav{margin-left:auto;display:flex;gap:16px;font-family:var(--mono);font-size:13px}
 .bar nav a{color:var(--ink-soft)}
@@ -64,8 +74,14 @@ pre code{background:none;padding:0}
 .codelist .t{color:var(--ink-soft)}
 @media(max-width:640px){.codelist .c{display:block;min-width:0}}
 
-footer.foot{margin-top:64px;border-top:1px solid var(--line);padding:18px 0 48px;
+footer.foot{margin-top:72px;border-top:1px solid var(--line);padding:18px 0 56px;
   font-family:var(--mono);font-size:12px;color:var(--ink-faint)}
 footer.foot a{color:var(--ink-faint)}
 footer.foot .wrap{display:flex;gap:16px;flex-wrap:wrap}
 footer.foot .sp{margin-left:auto}
+
+@media(max-width:52rem){
+  body{margin:0;border:0;min-height:100vh}
+  .wrap{padding:0 24px}
+  header.bar .wrap{padding-top:18px}
+}
