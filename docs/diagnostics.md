@@ -6,21 +6,28 @@ get it as JSON.
 ## The shape of a diagnostic
 
 ```text
+-- bad.mettle:2:17 -------------------------------------------------------
 error[M0118]: Integer 300 is out of range for 'int8'
-  --> bad.mettle:2:17
-  |
-1 | fn main() -> int32 {
-2 |   var x: int8 = 300;
-  |                 ^^^ does not fit in 'int8' (-128..127)
-3 |   var y: int64 = 1;
-   = help: 'int8' holds -128..127. Widen the type, or cast to say the wrap is
-     meant: (int8)value
+
+  ----+--------------------------------------------------------------------
+    1 |  fn main() -> int32 {
+    2 |    var x: int8 = 300;
+      :                  ^^^ does not fit in 'int8' (-128..127)
+    3 |    var y: int64 = 1;
+  ----+--------------------------------------------------------------------
+
+  help: 'int8' holds -128..127. Widen the type, or cast to say the wrap is meant: (int8)value
 ```
 
-The first line gives severity, code, and the problem. The arrow gives file,
-line, and column. The snippet shows a line either side, with a caret span
-under the offending text and a short label saying what is wrong there. A
-`help` line says what to do about it.
+The rule gives file, line and column, so a terminal or an editor can turn it
+into a jump. The next line gives severity, code, and the problem. The frame
+quotes the line with one either side, a caret span under the offending text,
+and a short label saying what is wrong there. A `help` line says what to do
+about it.
+
+On a terminal the frame is drawn with box characters and the source is
+syntax-coloured; redirected output gets the ASCII form above, with no colour
+and no line wrapping.
 
 Some diagnostics add `note` lines that point at a second location, the
 declaration a call disagrees with, or the iteration a generated declaration
