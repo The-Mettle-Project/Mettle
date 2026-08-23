@@ -5,6 +5,115 @@ collector: memory you take, you return.
 
 Every example here compiles and runs.
 
+## Stack or heap
+
+A `var` is on the stack. It costs nothing to allocate, it is zeroed for you,
+and it dies at the closing brace of the block that declared it.
+
+```mettle
+var p: Point;
+var buf: int32[4];
+```
+
+The heap is for the cases the stack cannot serve. There are three, and they
+are the only three:
+
+| Reach for the heap when | Because the stack cannot |
+|-------------------------|--------------------------|
+| The value must outlive the function | The frame is gone at `return` |
+| The size is not known while compiling | An array size must be a constant |
+| The value is large | The stack has a fixed ceiling, under 1 MB |
+
+Everything else belongs on the stack. It is faster, it needs no null check,
+and there is nothing to free.
+
+### Outliving the function
+
+Returning a struct by value copies it out, so the stack is fine:
+
+```mettle
+fn scaled_on_stack(k: int32) -> Point {
+  var p: Point;
+  p.x = 3 * k;
+  p.y = 4 * k;
+  return p;
+}
+```
+
+Returning a *pointer* to a local is not, and the compiler stops you:
+
+```mettle
+fn broken() -> Point* {
+  var p: Point;
+  return &p;
+}
+```
+
+```text
+error[M0103]: Returning the address of stack local `p`; the frame is destroyed
+when this function returns, so the caller receives a dangling pointer
+```
+
+When the caller genuinely needs a pointer, allocate one:
+
+```mettle
+fn scaled_on_heap(k: int32) -> Point* {
+  var p: Point* = new Point;
+  p->x = 3 * k;
+  p->y = 4 * k;
+  return p;
+}
+```
+
+Now ownership moves to the caller, and the caller frees it. Prefer the
+by-value form when the struct is small: it needs no allocation and no free.
+
+### Sizes known while compiling
+
+An array on the stack takes a constant size. A size computed at run time is
+rejected:
+
+```mettle
+var xs: int32[n];
+```
+
+```text
+error[E0003]: Undefined type 'int32[n]'
+```
+
+That is what `malloc(n * sizeof(int32))` is for.
+
+### Large values
+
+The stack ceiling is fixed and the compiler does not check it for you. A
+768 KB array works; a 1 MB one compiles clean and dies on entry to the
+function:
+
+```text
+exit=0xC00000FD    (STATUS_STACK_OVERFLOW)
+```
+
+There is no diagnostic for this. Anything approaching a megabyte belongs on
+the heap, where the same 16 MB allocation succeeds and reports failure through
+a null pointer you can test.
+
+### Side by side
+
+```mettle
+var on_stack: Point;
+var on_heap: Point* = new Point;
+defer free(on_heap);
+
+var fixed: int32[4];
+var sized: int32* = malloc(4 * sizeof(int32));
+if (sized == 0) { return 1; }
+defer free(sized);
+```
+
+Both start zeroed. The left column ends itself; the right column is yours to
+end. Reach `on_stack.x` with a dot and `on_heap->x` with an arrow, because one
+is a value and the other is a pointer.
+
 ## The short answer
 
 One value of a struct type:
