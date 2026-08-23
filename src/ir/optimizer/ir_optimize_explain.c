@@ -1336,6 +1336,12 @@ static const char *ir_explain_code_tag(const IRExplainRemark *r) {
   if (!r->code || !r->code[0] || strcmp(r->code, "none") == 0) {
     return "";
   }
+  /* On a success the headline already names what happened, and the id is
+   * the same word again. It carries information only on a refusal, where it
+   * names the reason and is the argument to `mettle explain`. */
+  if (r->positive) {
+    return "";
+  }
   char *out = buf[slot];
   slot = (slot + 1) & 1;
   snprintf(out, sizeof(buf[0]), "  %s[%s]%s", clr(EXPLAIN_DIM), r->code,
@@ -2047,8 +2053,7 @@ static void ir_explain_render_start_here(void) {
   }
 
   ir_explain_emit("  %swhere to start%s (%zu of %zu missed optimization%s "
-                  "ha%s a fix; \"proven\" = applied to a clone and re-checked, "
-                  "\"step 1\" = applied and the loop still needs more):\n",
+                  "ha%s a fix)\n",
                   clr(EXPLAIN_BOLD), clr(EXPLAIN_RESET), actionable, missed,
                   missed == 1 ? "" : "s", actionable == 1 ? "s" : "ve");
   if (backend_shown > 0) {
@@ -2063,6 +2068,8 @@ static void ir_explain_render_start_here(void) {
   }
 
   size_t rank = 0;
+  int saw_proven = 0;
+  int saw_partial = 0;
   for (size_t i = 0; i < backend_shown; i++) {
     char fix[200];
     ir_explain_fit(backend_plan[i].fix, 84, fix, sizeof(fix));
@@ -2086,6 +2093,8 @@ static void ir_explain_render_start_here(void) {
     /* The caveat has to survive the truncation that trims the fix text, or the
      * plan reads as "do this and you are done" for a fix we know is partial. */
     const char *status = r->verified ? "proven" : (r->partial ? "step 1" : "");
+    saw_proven |= r->verified ? 1 : 0;
+    saw_partial |= (!r->verified && r->partial) ? 1 : 0;
     ir_explain_emit("    %zu. %s%-6s%s %-*s  %s%s\n", ++rank,
                     clr(r->verified ? EXPLAIN_GREEN : EXPLAIN_DIM), status,
                     clr(EXPLAIN_RESET), (int)location_width, location[i], fix,
@@ -2100,6 +2109,18 @@ static void ir_explain_render_start_here(void) {
   if (actionable > covered) {
     ir_explain_emit("       %s... and %zu more below%s\n", clr(EXPLAIN_DIM),
                     actionable - covered, clr(EXPLAIN_RESET));
+  }
+  /* The badges are only worth explaining on a report that uses them. */
+  if (saw_proven || saw_partial) {
+    ir_explain_emit("       %s%s%s%s\n", clr(EXPLAIN_DIM),
+                    saw_proven ? "proven = applied to a clone and re-checked"
+                               : "",
+                    saw_partial ? (saw_proven ? ";  step 1 = applied, the loop "
+                                               "still needs more"
+                                             : "step 1 = applied, the loop still "
+                                               "needs more")
+                                : "",
+                    clr(EXPLAIN_RESET));
   }
   ir_explain_emit("\n");
 }
@@ -2280,12 +2301,12 @@ static void ir_explain_memory_flush(void) {
   if (!g_explain) {
     return;
   }
-  ir_explain_print_header("memory report");
+  /* A section whose whole content is "nothing to report" costs four lines to
+   * say what its absence already says. */
   if (g_mem_count == 0) {
-    ir_explain_emit("  %sno memory diagnostics in this file%s\n\n",
-                    clr(EXPLAIN_DIM), clr(EXPLAIN_RESET));
     return;
   }
+  ir_explain_print_header("memory report");
   size_t errors = 0, warnings = 0;
   for (size_t i = 0; i < g_mem_count; i++) {
     if (g_mem[i].severity) {
