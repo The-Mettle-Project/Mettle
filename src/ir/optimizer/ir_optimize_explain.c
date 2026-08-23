@@ -1368,6 +1368,7 @@ static int ir_explain_remark_compare(const void *a, const void *b) {
  * the line range and a deduplicated callee list. Remarks carrying a verified
  * line are never folded: each is a per-site proof. */
 
+#define IR_EXPLAIN_DOCS_BASE "https://suidvandiewereld.github.io/Mettle"
 #define IR_EXPLAIN_GROUP_MIN 4
 #define IR_EXPLAIN_GROUP_LIST_MAX 6
 
@@ -2928,6 +2929,8 @@ void ir_explain_flush(void) {
       ir_explain_emit("  %sthe bracketed id after a verdict has a longer "
                       "explanation: mettle explain %s%s\n",
                       clr(EXPLAIN_DIM), sample, clr(EXPLAIN_RESET));
+      ir_explain_emit("  %s%s/explain/%s.html%s\n", clr(EXPLAIN_DIM),
+                      IR_EXPLAIN_DOCS_BASE, sample, clr(EXPLAIN_RESET));
     }
     ir_explain_emit("\n");
   }

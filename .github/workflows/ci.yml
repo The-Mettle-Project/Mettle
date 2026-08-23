@@ -180,6 +180,14 @@ jobs:
       - name: Runtime C harness
         run: make test CC=${{ matrix.cc }}
 
+      # site/explain/ is generated from the help tables in
+      # src/error/error_explain.c. A code whose prose changed without the
+      # pages being regenerated would leave the site telling a different
+      # story from the terminal, so the gate is here rather than in review.
+      - name: Code reference is in step with the compiler
+        if: matrix.cc == 'gcc'
+        run: python3 tools/gen-site-reference.py --compiler ./bin/mettle --check
+
       - name: Native ELF backend tests
         run: bash tools/test-elf-native.sh
 
