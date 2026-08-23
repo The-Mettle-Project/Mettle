@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dot-shape-address: Dot product with an address the kernel cannot follow — Mettle</title>
+<meta name="description" content="dot-shape-address: Dot product with an address the kernel cannot follow" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><b>Mettle</b><span>compiler</span></a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<div class="crumb"><a href="../index.html">Mettle</a> / <a href="index.html">Codes</a> / dot-shape-address</div>
+<div class="kicker">Why a loop did not vectorize</div>
+<h1><span class="code">dot-shape-address</span>Dot product with an address the kernel cannot follow</h1>
+<p class="lede">printed by <code>--explain</code> in brackets after a verdict.</p>
+<pre><code>mettle explain dot-shape-address</code></pre>
+
+<p>The loop is a float multiply-accumulate, which is exactly the FMA dot product kernel&#x27;s shape, but the addresses do not match. The kernel needs each base to be a plain pointer indexed by the loop counter: <code>a[i]</code>, not <code>a[r * cols + i]</code>.</p>
+<p>Example, an inner product over one row of a matrix:</p>
+<pre><code>for r in 0..rows {
+    var row: float32* = &amp;m[r * cols];   // hoisted, invariant here
+    for c in 0..cols {
+        acc = acc + row[c] * x[c];      // now `base[i]`
+    }
+}</code></pre>
+<p>Fix: lift the invariant part of the index into a pointer before the loop. The report checks first: when the other half of the index changes every iteration the access really is non-unit-stride, and the report says so instead of giving advice that cannot work.</p>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li><li><a href="int16-elements.html"><span class="c">int16-elements</span><span class="t">16-bit integer elements have no kernel</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap"><div class="row">
+  <span>Generated from <code>src/error/error_explain.c</code> &mdash; the same text <code>mettle explain</code> prints.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></div></footer>
+</body>
+</html>

@@ -808,6 +808,77 @@ static const char *decision_group_title(DecisionGroup group) {
   return "Optimizer decisions";
 }
 
+static void explain_json_string(const char *s) {
+  putchar('"');
+  for (const unsigned char *p = (const unsigned char *)s; p && *p; p++) {
+    switch (*p) {
+    case '"':
+      fputs("\\\"", stdout);
+      break;
+    case '\\':
+      fputs("\\\\", stdout);
+      break;
+    case '\n':
+      fputs("\\n", stdout);
+      break;
+    case '\r':
+      fputs("\\r", stdout);
+      break;
+    case '\t':
+      fputs("\\t", stdout);
+      break;
+    default:
+      if (*p < 0x20) {
+        printf("\\u%04x", *p);
+      } else {
+        putchar((int)*p);
+      }
+    }
+  }
+  putchar('"');
+}
+
+static const char *decision_group_slug(DecisionGroup group) {
+  switch (group) {
+  case DECISION_VECTOR_REFUSAL:
+    return "vectorization-refusal";
+  case DECISION_INLINE_REFUSAL:
+    return "inline-refusal";
+  case DECISION_APPLIED:
+    return "applied";
+  }
+  return "other";
+}
+
+static void print_code_json(void) {
+  printf("{\"schema\":1,\"codes\":[");
+  for (size_t i = 0; i < DOCS_COUNT; i++) {
+    printf("%s{\"code\":", i ? "," : "");
+    explain_json_string(DOCS[i].code);
+    printf(",\"kind\":\"diagnostic\",\"group\":\"diagnostic\",\"groupTitle\":");
+    explain_json_string("Compile diagnostics");
+    printf(",\"title\":");
+    explain_json_string(DOCS[i].title);
+    printf(",\"body\":");
+    explain_json_string(DOCS[i].body);
+    printf("}");
+  }
+  for (size_t i = 0; i < DECISIONS_COUNT; i++) {
+    printf(",{\"code\":");
+    explain_json_string(DECISIONS[i].code);
+    printf(",\"kind\":\"decision\",\"group\":");
+    explain_json_string(decision_group_slug(DECISIONS[i].group));
+    printf(",\"groupTitle\":");
+    explain_json_string(decision_group_title(DECISIONS[i].group));
+    printf(",\"title\":");
+    explain_json_string(DECISIONS[i].title);
+    printf(",\"body\":");
+    explain_json_string(DECISIONS[i].body);
+    printf("}");
+  }
+  printf("]}\n");
+}
+
 static void print_code_list(void) {
   printf("Diagnostic codes (compile errors and warnings):\n");
   for (size_t i = 0; i < DOCS_COUNT; i++) {
@@ -966,6 +1037,12 @@ static const char *nearest_code(const char *code) {
 int mettle_explain_error_code(const char *code) {
   if (!code || strcmp(code, "list") == 0 || strcmp(code, "all") == 0) {
     print_code_list();
+    return 0;
+  }
+  /* site/explain/ is generated from these tables, so a page cannot drift
+   * from what the compiler says in the terminal. */
+  if (strcmp(code, "--json") == 0) {
+    print_code_json();
     return 0;
   }
 

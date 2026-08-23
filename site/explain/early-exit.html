@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>early-exit: The loop can leave before its trip count — Mettle</title>
+<meta name="description" content="early-exit: The loop can leave before its trip count" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><b>Mettle</b><span>compiler</span></a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<div class="crumb"><a href="../index.html">Mettle</a> / <a href="index.html">Codes</a> / early-exit</div>
+<div class="kicker">Why a loop did not vectorize</div>
+<h1><span class="code">early-exit</span>The loop can leave before its trip count</h1>
+<p class="lede">printed by <code>--explain</code> in brackets after a verdict.</p>
+<pre><code>mettle explain early-exit</code></pre>
+
+<p>A <code>break</code> or an early <code>return</code> means the number of iterations is not known when the loop starts. A kernel that processes eight elements per step could run past the element the loop meant to stop at.</p>
+<p>Fix: where the search and the work are separable, do the work in a counted loop and the search in its own. A <code>break</code> on the last iteration costs nothing to keep scalar.</p>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="int16-elements.html"><span class="c">int16-elements</span><span class="t">16-bit integer elements have no kernel</span></a></li><li><a href="int64-elements.html"><span class="c">int64-elements</span><span class="t">64-bit integer elements have no kernel</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap"><div class="row">
+  <span>Generated from <code>src/error/error_explain.c</code> &mdash; the same text <code>mettle explain</code> prints.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></div></footer>
+</body>
+</html>
