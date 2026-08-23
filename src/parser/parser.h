@@ -52,7 +52,18 @@ typedef struct {
    * many error returns in the declaration parsers free of cleanup they would
    * only get wrong. */
   ASTNode *pending_composed_name;
+  /* How many expressions enclose the one being parsed. Every nesting level is
+   * a frame in the recursive descent, so without a ceiling deep enough input
+   * exhausts the stack and the process dies with no diagnostic at all. */
+  int expression_depth;
 } Parser;
+
+/* Nesting levels one expression may carry. Overflow on a 1 MB stack was
+ * measured between 60000 and 70000 levels, so this sits an order of magnitude
+ * clear of it, and far above the deepest expression real code contains. A
+ * chain like `a + b + c` costs nothing here: same-precedence operators are
+ * folded in a loop, and only true nesting recurses. */
+#define PARSER_MAX_EXPRESSION_DEPTH 4096
 
 // Function declarations
 Parser *parser_create(Lexer *lexer);
@@ -103,6 +114,8 @@ void parser_set_error(Parser *parser, const char *message);
 void parser_set_error_with_suggestion(Parser *parser, const char *message,
                                       const char *suggestion);
 void parser_refine_error(Parser *parser, const char *message);
+void parser_report_expression_too_deep(Parser *parser);
+void parser_report_block_too_deep(Parser *parser);
 void parser_recover_from_error(Parser *parser);
 void parser_synchronize(Parser *parser);
 /* Skip to the next statement boundary that belongs to the block opened at

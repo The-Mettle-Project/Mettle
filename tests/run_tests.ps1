@@ -5577,6 +5577,70 @@ catch {
   Write-CaseResult -Name "utf8_bom_source" -Passed $false -Reason $_.Exception.Message
 }
 
+# Recursion ceilings. Each shape below recurses through a different path in the
+# parser, and every one of them used to exhaust the stack and kill the process
+# with no diagnostic at all. The deep-but-legal case guards the other side: the
+# ceiling must stay clear of anything a program would really write.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $compilerFullPath = (Resolve-Path $CompilerPath).Path
+  $deepDir = Join-Path $tmpDir "parser-depth"
+  if (Test-Path $deepDir) { Remove-Item -Path $deepDir -Recurse -Force }
+  New-Item -Path $deepDir -ItemType Directory | Out-Null
+
+  $deep = 200000
+  $shapes = @(
+    @{ n = "parens"; body = ("(" * $deep) + "1" + (")" * $deep); want = "Expression nests more than" },
+    @{ n = "chain";  body = (@("1") * $deep) -join "+";          want = "Expression nests more than" },
+    @{ n = "not";    body = ("!" * $deep) + "1";                 want = "Expression nests more than" },
+    @{ n = "bnot";   body = ("~" * $deep) + "1";                 want = "Expression nests more than" },
+    @{ n = "cast";   body = ("(int32)" * $deep) + "1";           want = "Expression nests more than" },
+    @{ n = "call";   body = ("f(" * $deep) + "1" + (")" * $deep); want = "Expression nests more than" }
+  )
+  foreach ($shape in $shapes) {
+    $src = Join-Path $deepDir ("deep_" + $shape.n + ".mettle")
+    [System.IO.File]::WriteAllText($src,
+      "fn f(n: int32) -> int32 { return n; }`nfn main() -> int32 {`n  var x: int32 = " +
+      $shape.body + ";`n  return x;`n}`n")
+    $out = & $compilerFullPath $src -o (Join-Path $deepDir "deep.obj") 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($code -eq 0) { throw "$($shape.n): nesting $deep deep was accepted" }
+    # A stack overflow shows up as a negative status on Windows and 139 on
+    # POSIX. Either means the ceiling did not hold.
+    if ($code -lt 0 -or $code -eq 139) { throw "$($shape.n): crashed (status $code) rather than reporting" }
+    if ($out -notmatch [regex]::Escape($shape.want)) {
+      throw "$($shape.n): expected '$($shape.want)', got: $out"
+    }
+  }
+
+  $blockSrc = Join-Path $deepDir "deep_blocks.mettle"
+  $nest = 60000
+  [System.IO.File]::WriteAllText($blockSrc,
+    "fn main() -> int32 {`n" + ("if (1) {`n" * $nest) + "  var z: int32 = 1;`n" +
+    ("}`n" * $nest) + "  return 0;`n}`n")
+  $blockOut = & $compilerFullPath $blockSrc -o (Join-Path $deepDir "deep.obj") 2>&1 | Out-String
+  $blockCode = $LASTEXITCODE
+  if ($blockCode -eq 0) { throw "blocks: nesting $nest deep was accepted" }
+  if ($blockCode -lt 0 -or $blockCode -eq 139) { throw "blocks: crashed (status $blockCode) rather than reporting" }
+  if ($blockOut -notmatch "Blocks nest more than") { throw "blocks: expected a depth diagnostic, got: $blockOut" }
+
+  # Deep but legal: well past anything hand-written, comfortably inside the
+  # ceiling, and it has to still compile.
+  $okSrc = Join-Path $deepDir "deep_ok.mettle"
+  [System.IO.File]::WriteAllText($okSrc,
+    "fn main() -> int32 {`n  var x: int32 = " + ("(" * 1000) + "1" + (")" * 1000) +
+    ";`n  return x;`n}`n")
+  $okOut = & $compilerFullPath $okSrc -o (Join-Path $deepDir "ok.obj") 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "1000 levels should compile, got: $okOut" }
+
+  Write-CaseResult -Name "parser_depth_ceiling" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "parser_depth_ceiling" -Passed $false -Reason $_.Exception.Message
+}
+
 # mettle.deps package resolution test: compile from a temp project using a package alias.
 $total++
 try {

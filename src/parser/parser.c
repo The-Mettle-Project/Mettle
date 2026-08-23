@@ -81,6 +81,7 @@ Parser *parser_create_with_error_reporter(Lexer *lexer,
   parser->gpu_mode = 0;
   parser->comptime_depth = 0;
   parser->pending_composed_name = NULL;
+  parser->expression_depth = 0;
 
   if (parser->current_token.type == TOKEN_ERROR) {
     parser_report_lexer_token_error(parser, &parser->current_token);
@@ -1877,11 +1878,39 @@ ASTNode *parser_parse_errdefer_statement(Parser *parser) {
   return parser_parse_defer_or_errdefer(parser, TOKEN_ERRDEFER);
 }
 
+void parser_report_expression_too_deep(Parser *parser) {
+  char message[PARSER_ERROR_BUF_SIZE];
+  snprintf(message, sizeof(message),
+           "Expression nests more than %d levels deep",
+           PARSER_MAX_EXPRESSION_DEPTH);
+  parser_set_error_with_suggestion(
+      parser, message,
+      "split it into named parts: each `var` holding a sub-expression is one "
+      "level less");
+}
+
+void parser_report_block_too_deep(Parser *parser) {
+  char message[PARSER_ERROR_BUF_SIZE];
+  snprintf(message, sizeof(message), "Blocks nest more than %d levels deep",
+           PARSER_MAX_EXPRESSION_DEPTH);
+  parser_set_error_with_suggestion(
+      parser, message,
+      "lift the inner blocks into functions of their own");
+}
+
 ASTNode *parser_parse_expression(Parser *parser) {
   if (!parser)
     return NULL;
 
-  return parser_parse_binary_expression(parser, 0);
+  if (parser->expression_depth >= PARSER_MAX_EXPRESSION_DEPTH) {
+    parser_report_expression_too_deep(parser);
+    return NULL;
+  }
+
+  parser->expression_depth++;
+  ASTNode *expression = parser_parse_binary_expression(parser, 0);
+  parser->expression_depth--;
+  return expression;
 }
 
 int parser_is_identifier_like(TokenType type) {
@@ -3561,8 +3590,18 @@ ASTNode *parser_parse_unary_expression(Parser *parser) {
 
   SourceLocation location = parser_current_location(parser);
 
+  /* A run of prefix operators, and a run of casts, each recurse here without
+   * passing through parser_parse_expression, so they answer to the ceiling
+   * themselves. */
+  if (parser->expression_depth >= PARSER_MAX_EXPRESSION_DEPTH) {
+    parser_report_expression_too_deep(parser);
+    return NULL;
+  }
+
   if (parser->current_token.type == TOKEN_LPAREN) {
+    parser->expression_depth++;
     ASTNode *cast = parser_parse_cast_expression(parser);
+    parser->expression_depth--;
     if (cast) {
       return cast;
     }
@@ -3572,7 +3611,9 @@ ASTNode *parser_parse_unary_expression(Parser *parser) {
     const char *operator = parser->current_token.value;
     parser_advance(parser);
 
+    parser->expression_depth++;
     ASTNode *operand = parser_parse_unary_expression(parser);
+    parser->expression_depth--;
     if (!operand) {
       return NULL;
     }
@@ -4082,11 +4123,25 @@ ASTNode *parser_parse_binary_expression(Parser *parser, int min_precedence) {
   if (!left)
     return NULL;
 
+  /* Operators of one precedence fold left here rather than recursing, so this
+   * loop deepens the tree without deepening the parser. The later passes walk
+   * that tree recursively, so the fold has to answer to the same ceiling; the
+   * count is restored on the way out so a sibling expression starts level. */
+  int enclosing_depth = parser->expression_depth;
+
   while (parser_is_binary_operator(parser->current_token.type)) {
     SourceLocation location = parser_current_location(parser);
     int precedence = parser_get_operator_precedence(parser->current_token.type);
     if (precedence < min_precedence)
       break;
+
+    if (parser->expression_depth >= PARSER_MAX_EXPRESSION_DEPTH) {
+      parser->expression_depth = enclosing_depth;
+      ast_destroy_node(left);
+      parser_report_expression_too_deep(parser);
+      return NULL;
+    }
+    parser->expression_depth++;
 
     char *operator = strdup(parser->current_token.value);
     parser_advance(parser);
@@ -4099,6 +4154,7 @@ ASTNode *parser_parse_binary_expression(Parser *parser, int min_precedence) {
     if (!right) {
       free(operator);
       ast_destroy_node(left);
+      parser->expression_depth = enclosing_depth;
       return NULL;
     }
 
@@ -4106,6 +4162,7 @@ ASTNode *parser_parse_binary_expression(Parser *parser, int min_precedence) {
     free(operator);
   }
 
+  parser->expression_depth = enclosing_depth;
   return left;
 }
 
@@ -7073,6 +7130,18 @@ ASTNode *parser_parse_block(Parser *parser) {
 
   // Expect '{'
   if (!parser_expect(parser, TOKEN_LBRACE)) {
+    return NULL;
+  }
+
+  /* Blocks nest through the statement parser the way expressions nest through
+   * the expression parser, and the passes that walk them recurse the same way,
+   * so they answer to the same ceiling. brace_depth already counts the braces
+   * consumed, so the guard reads it rather than keeping a second tally across
+   * this function's several exits. The check follows the '{' rather than
+   * preceding it: a refusal that consumed nothing would leave the caller
+   * looking at the same token and trying again forever. */
+  if (parser->brace_depth >= PARSER_MAX_EXPRESSION_DEPTH) {
+    parser_report_block_too_deep(parser);
     return NULL;
   }
 
