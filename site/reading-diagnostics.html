@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Reading a diagnostic — Mettle</title>
+<title>Reading a diagnostic: Mettle</title>
 <meta name="description" content="How to read a Mettle compiler diagnostic: the frame, the caret, notes, help, and the codes behind them." />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -87,8 +87,8 @@ wrong. The ones that cannot possibly be intended, such as returning the address
 of a local, are errors.</p>
 
 <h2>The codes</h2>
-<p><code>E0001</code>–<code>E0007</code> are the compiler's categories: lexical,
-syntax, semantic, type, scope, I/O, internal. <code>M0101</code>–<code>M0119</code>
+<p><code>E0001</code> to <code>E0007</code> are the compiler's categories: lexical,
+syntax, semantic, type, scope, I/O, internal. <code>M0101</code> to <code>M0119</code>
 come from the memory, borrow and range analyses, which stamp a finer code over
 the category they would otherwise carry.</p>
 <pre><code>mettle explain E0003

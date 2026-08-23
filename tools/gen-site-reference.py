@@ -231,7 +231,7 @@ def code_page(entry, groups):
 <h2>Related</h2>
 <ul class="codelist">{related}</ul>
 """
-    return page_shell(f"{code}: {title} — Mettle", f"{code}: {title}", body,
+    return page_shell(f"{code}: {title} | Mettle", f"{code}: {title}", body,
                       "Codes", depth=1)
 
 
@@ -286,7 +286,7 @@ pages are generated from that table.</p>
 
 {''.join(sections)}
 """
-    return page_shell("Codes — Mettle", "Every diagnostic and optimizer "
+    return page_shell("Codes | Mettle", "Every diagnostic and optimizer "
                       "decision code the Mettle compiler can print.", body,
                       "Codes", depth=1).replace("</main>", "</main>" + script)
 

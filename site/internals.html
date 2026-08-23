@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Inside the compiler — Mettle</title>
+<title>Inside the compiler: Mettle</title>
 <meta name="description" content="A tour of the Mettle compiler pipeline: what each stage does and which codes it can print." />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -79,7 +79,7 @@ diagnostics, and the range checks. They run at compile time on code that is
 otherwise legal, which is why most of what they print are warnings.</p>
 <p>Reports <a href="explain/E0003.html">E0003</a>,
 <a href="explain/E0004.html">E0004</a>, <a href="explain/E0005.html">E0005</a>,
-and the whole <a href="explain/index.html">M0101–M0119</a> range: use after
+and the whole <a href="explain/index.html">M0101 to M0119</a> range: use after
 free, double free, stack addresses that escape, leaks, borrowed pointers
 invalidated by <code>realloc</code> or <code>free</code>, null and out-of-bounds
 access, shift and divide constants, loop indexes that run past the end, and
@@ -95,10 +95,10 @@ before.</p>
 
 <h2>Optimizer</h2>
 <p>Around forty passes. Loop canonical form runs first, because every recognizer
-behind it assumes that form. Then the core simplifications to a fixpoint — copy
-and constant propagation, CSE, branch simplification, reassociation, dead write
-elimination, jump threading — then a recognizer worklist, then a tail of
-lowering cleanups.</p>
+behind it assumes that form. Then the core simplifications run to a fixpoint:
+copy and constant propagation, CSE, branch simplification, reassociation, dead
+write elimination, jump threading. After those comes a recognizer worklist, then
+a tail of lowering cleanups.</p>
 <p>A convergence check fails the build when the fixpoint does not settle, so a
 pair of passes that undo each other is caught rather than spun on.</p>
 <p>Reports every <a href="explain/index.html">decision code</a>: the 24 reasons a
@@ -108,9 +108,9 @@ the optimizer applied. This is what <code>--explain</code> prints.</p>
 <h2>Code generation</h2>
 <p>Four targets and one shared object writer. On x86-64 there are two backends
 and most functions take the first: MIR, a machine-level IR with real register
-allocation — Chaitin-Briggs graph colouring by default, over the full general
-set plus <code>xmm0–15</code>, with <code>R10</code> and <code>R11</code> held
-back as scratch.</p>
+allocation. It colours by Chaitin-Briggs, over the full general set plus
+<code>xmm0</code> to <code>xmm15</code>, holding <code>R10</code> and
+<code>R11</code> back as scratch.</p>
 <p>When MIR cannot take a function it falls back to a spill-everything backend
 that keeps every value on the stack. The
 <a href="reading-the-report.html">backend report</a> names which functions fell

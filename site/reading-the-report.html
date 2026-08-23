@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Reading the --explain report — Mettle</title>
+<title>Reading the --explain report: Mettle</title>
 <meta name="description" content="How to read Mettle's optimization report: verdicts, decision codes, reason and fix lines, and the fixes the compiler proved before printing." />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -64,17 +64,17 @@ a link: <code>mettle explain store-only-fill</code>, or
 <p>One line per fact, so a pattern that matches a whole reason keeps matching
 one line.</p>
 <ul>
-  <li><b>reason</b> — the specific shape the compiler found, in the terms of the
+  <li><b>reason</b>. The specific shape the compiler found, in the terms of the
   rule that declined. Not a category; the actual thing about this loop.</li>
-  <li><b>fix</b> — what to write instead. Where the honest answer is that
+  <li><b>fix</b>. What to write instead. Where the honest answer is that
   nothing should change, the label reads <code>note</code> and the entry is kept
   out of the ranking.</li>
-  <li><b>verified</b> — the compiler applied the fix to a clone of the function,
+  <li><b>verified</b>. The compiler applied the fix to a clone of the function,
   re-ran the optimizer, and reports what happened. Advice that fails that check
   is replaced or withdrawn, never printed.</li>
-  <li><b>still blocked</b> — the fix helped and was not enough; this says what
+  <li><b>still blocked</b>. The fix helped and was not enough; this says what
   is left.</li>
-  <li><b>calls</b> — repeated identical call remarks fold into one entry with a
+  <li><b>calls</b>. Repeated identical call remarks fold into one entry with a
   line range and a deduplicated callee census.</li>
 </ul>
 
@@ -83,9 +83,9 @@ one line.</p>
 and the wrong order to decide what to do. The block at the top answers "what do
 I change", ranked by what the compiler can stand behind:</p>
 <ul>
-  <li><code>proven</code> — applied to a clone and re-checked.</li>
-  <li><code>step 1</code> — applied, and the loop still needs more.</li>
-  <li>no badge — suggested, not simulated.</li>
+  <li><code>proven</code>: applied to a clone and re-checked.</li>
+  <li><code>step 1</code>: applied, and the loop still needs more.</li>
+  <li>no badge: suggested, not simulated.</li>
 </ul>
 <p>Whole-function codegen fallbacks lead the ranking. A loop remark is a
 prediction about one loop; a fallback is a measurement over a whole function
