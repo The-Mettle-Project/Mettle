@@ -17,10 +17,8 @@
   <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
 </div></header>
 <main class="wrap">
-<div class="crumb"><a href="../index.html">Mettle</a> / <a href="index.html">Codes</a> / M0117</div>
-<div class="kicker">Compile diagnostics</div>
 <h1><span class="code">M0117</span>Loop index runs past the end of the array</h1>
-<p class="lede">printed by the compiler as an error or warning.</p>
+<p class="lede">Reported by the compiler as an error or warning.</p>
 <pre><code>mettle explain M0117</code></pre>
 
 <p>The loop&#x27;s upper bound and the array&#x27;s length are both known at compile time, and the bound is the larger. The final iteration reads or writes past the end.</p>
@@ -33,9 +31,9 @@ for i in 0..9 { a[i] = i; }   // M0117: valid indexes are 0..7</code></pre>
 <ul class="codelist"><li><a href="E0001.html"><span class="c">E0001</span><span class="t">Lexical error</span></a></li><li><a href="E0002.html"><span class="c">E0002</span><span class="t">Syntax error</span></a></li><li><a href="E0003.html"><span class="c">E0003</span><span class="t">Semantic error</span></a></li><li><a href="E0004.html"><span class="c">E0004</span><span class="t">Type mismatch</span></a></li><li><a href="E0005.html"><span class="c">E0005</span><span class="t">Scope error</span></a></li><li><a href="E0006.html"><span class="c">E0006</span><span class="t">I/O error</span></a></li><li><a href="E0007.html"><span class="c">E0007</span><span class="t">Internal compiler error</span></a></li><li><a href="M0101.html"><span class="c">M0101</span><span class="t">Use after free</span></a></li></ul>
 
 </main>
-<footer class="foot"><div class="wrap"><div class="row">
-  <span>Generated from <code>src/error/error_explain.c</code> &mdash; the same text <code>mettle explain</code> prints.</span>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
   <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
-</div></div></footer>
+</div></footer>
 </body>
 </html>

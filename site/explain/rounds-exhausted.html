@@ -17,10 +17,8 @@
   <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
 </div></header>
 <main class="wrap">
-<div class="crumb"><a href="../index.html">Mettle</a> / <a href="index.html">Codes</a> / rounds-exhausted</div>
-<div class="kicker">Why a call was not inlined</div>
 <h1><span class="code">rounds-exhausted</span>Inlining rounds ran out before this call was revisited</h1>
-<p class="lede">printed by <code>--explain</code> in brackets after a verdict.</p>
+<p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain rounds-exhausted</code></pre>
 
 <p>The callee passes every check. The call site only appeared late, exposed by an earlier round of inlining, and the round limit was reached before the inliner came back to it.</p>
@@ -30,9 +28,9 @@
 <ul class="codelist"><li><a href="callee-no-body.html"><span class="c">callee-no-body</span><span class="t">The callee has no body to inline</span></a></li><li><a href="callee-noinline.html"><span class="c">callee-noinline</span><span class="t">The callee is marked @noinline</span></a></li><li><a href="callee-denylisted.html"><span class="c">callee-denylisted</span><span class="t">The callee is on the compiler&#x27;s inline denylist</span></a></li><li><a href="too-many-parameters.html"><span class="c">too-many-parameters</span><span class="t">The callee takes more than 16 parameters</span></a></li><li><a href="callee-parameter-names.html"><span class="c">callee-parameter-names</span><span class="t">The callee&#x27;s parameter names are unavailable</span></a></li><li><a href="callee-over-budget.html"><span class="c">callee-over-budget</span><span class="t">The callee&#x27;s body is over the inline size budget</span></a></li><li><a href="callee-call-count.html"><span class="c">callee-call-count</span><span class="t">The callee makes more calls than the inline call-count budget allows</span></a></li><li><a href="callee-inline-asm.html"><span class="c">callee-inline-asm</span><span class="t">The callee contains inline assembly</span></a></li></ul>
 
 </main>
-<footer class="foot"><div class="wrap"><div class="row">
-  <span>Generated from <code>src/error/error_explain.c</code> &mdash; the same text <code>mettle explain</code> prints.</span>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
   <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
-</div></div></footer>
+</div></footer>
 </body>
 </html>

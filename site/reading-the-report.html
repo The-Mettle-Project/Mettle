@@ -13,7 +13,7 @@
 </head>
 <body>
 <header class="bar"><div class="wrap">
-  <a class="brand" href="index.html"><b>Mettle</b><span>compiler</span></a>
+  <a class="brand" href="index.html">Mettle</a>
   <nav>
     <a href="index.html">Home</a>
     <a href="internals.html">Internals</a>
@@ -24,12 +24,10 @@
 </div></header>
 <main class="wrap">
 
-<div class="crumb"><a href="index.html">Mettle</a> / The report</div>
-<div class="kicker">How to read the output</div>
-<h1>Anatomy of the optimization report</h1>
-<p class="lede">A diagnostic tells you the program is wrong. The report tells
-you what the optimizer did with a program that is right, and names what stopped
-it where it stopped.</p>
+<h1>Reading the report</h1>
+<p class="lede">A diagnostic says the program is wrong. The report says what the
+optimizer did with a program that is right, and what stopped it where it
+stopped.</p>
 
 <pre><code>mettle example.mettle --release --explain -o example.exe</code></pre>
 
@@ -54,72 +52,50 @@ it where it stopped.</p>
       └─ calls: println (x9), array_sum, gcd, lo_byte, print (x8)</code></pre>
 
 <h2>The verdict line</h2>
-<p>Every finding is one line, and it always reads the same way:</p>
 <pre><code>main (loop @ line 18): NOT vectorized  [store-only-fill]
 └──┬─┘ └──────┬──────┘  └──────┬─────┘  └───────┬───────┘
 function    what it is       verdict       decision code</code></pre>
-<p>The <b>decision code</b> in brackets appears only on a refusal, because on a
-success the verdict already says what happened. It is the name of the specific
-rule that declined, and it is a link: <code>mettle explain store-only-fill</code>
-in the terminal, or <a href="explain/store-only-fill.html">the page for it</a>
-here.</p>
+<p>The decision code appears only on a refusal, because on a success the verdict
+already says what happened. It names the specific rule that declined, and it is
+a link: <code>mettle explain store-only-fill</code>, or
+<a href="explain/store-only-fill.html">its page here</a>.</p>
 
 <h2>The detail lines</h2>
-<p>Under a refusal, up to five things can follow. Each is one line per fact, so
-a pattern that matches a whole reason keeps matching one line.</p>
-
-<div class="stage">
-  <div class="n"><b>reason</b>why it declined</div>
-  <div><p>The specific shape the compiler found, in the terms of the rule that
-  declined. Not a category &mdash; the actual thing about this loop.</p></div>
-</div>
-
-<div class="stage">
-  <div class="n"><b>fix</b>what to change</div>
-  <div><p>What to write instead. Where the honest answer is that nothing should
-  change, the label says <code>note</code> rather than <code>fix</code>, and
-  that entry is kept out of the ranking below.</p></div>
-</div>
-
-<div class="stage">
-  <div class="n"><b>verified</b>the fix was proved</div>
-  <div><p>The compiler applied the suggested fix to a clone of the function,
-  re-ran the optimizer on it, and looked at the result. This line reports what
-  actually happened when it did. Advice that failed that check is never
-  printed &mdash; it is replaced or withdrawn.</p></div>
-</div>
-
-<div class="stage">
-  <div class="n"><b>still blocked</b>a partial fix</div>
-  <div><p>The fix helped and was not enough. The loop still does not vectorize,
-  and this says what is left.</p></div>
-</div>
-
-<div class="stage">
-  <div class="n"><b>calls</b>a folded group</div>
-  <div><p>Repeated identical call remarks fold into one entry with a line range
-  and a deduplicated callee census, so a caller that refuses forty sites is one
-  entry rather than forty.</p></div>
-</div>
+<p>One line per fact, so a pattern that matches a whole reason keeps matching
+one line.</p>
+<ul>
+  <li><b>reason</b> — the specific shape the compiler found, in the terms of the
+  rule that declined. Not a category; the actual thing about this loop.</li>
+  <li><b>fix</b> — what to write instead. Where the honest answer is that
+  nothing should change, the label reads <code>note</code> and the entry is kept
+  out of the ranking.</li>
+  <li><b>verified</b> — the compiler applied the fix to a clone of the function,
+  re-ran the optimizer, and reports what happened. Advice that fails that check
+  is replaced or withdrawn, never printed.</li>
+  <li><b>still blocked</b> — the fix helped and was not enough; this says what
+  is left.</li>
+  <li><b>calls</b> — repeated identical call remarks fold into one entry with a
+  line range and a deduplicated callee census.</li>
+</ul>
 
 <h2>Where to start</h2>
 <p>The findings are in source order, which is the right order to read a file in
 and the wrong order to decide what to do. The block at the top answers "what do
-I change" instead, ranked by what the compiler can stand behind:</p>
+I change", ranked by what the compiler can stand behind:</p>
 <ul>
-  <li><code>proven</code> &mdash; applied to a clone and re-checked.</li>
-  <li><code>step 1</code> &mdash; applied, and the loop still needs more.</li>
-  <li>no badge &mdash; suggested, not simulated.</li>
+  <li><code>proven</code> — applied to a clone and re-checked.</li>
+  <li><code>step 1</code> — applied, and the loop still needs more.</li>
+  <li>no badge — suggested, not simulated.</li>
 </ul>
 <p>Whole-function codegen fallbacks lead the ranking. A loop remark is a
 prediction about one loop; a fallback is a measurement over a whole function
 that already happened, and it costs every value in that function a register.</p>
 
-<h2>The other two sections</h2>
-<p><b>memory report</b> repeats the memory and lifetime findings for the file,
-and is only printed when there are any. <b>backend report</b> says how much of
-the program reached the register-allocating backend, and groups whatever fell
-back to baseline codegen by cause, largest first.</p>
+<h2>The other sections</h2>
+<p>The memory report repeats the memory and lifetime findings, and is printed
+only when there are any. The backend report says how much of the program reached
+the register-allocating backend, and groups whatever fell back to baseline
+codegen by cause, largest first.</p>
 
 <h2>Narrowing it down</h2>
 <pre><code>--explain=matvec              one function
@@ -136,24 +112,22 @@ document.</p>
 <h2>For tools</h2>
 <p><code>--explain-json</code> also writes
 <code>&lt;output-stem&gt;.explain.json</code>: the same findings as structured
-data, plus a <code>startHere</code> array carrying the ranking above so an
-editor does not have to re-derive it. <code>--explain-all</code> covers every
-file rather than just the one being compiled.</p>
-<p>A long report is written to <code>&lt;output-stem&gt;.explain.txt</code> and
-stderr gets a digest with the path. <code>METTLE_EXPLAIN_REPORT_LINES</code>
-sets the threshold; <code>0</code> keeps everything on stderr.</p>
+data, plus a <code>startHere</code> array carrying the ranking above.
+<code>--explain-all</code> covers every file rather than the one being
+compiled.</p>
+<p>A long report goes to <code>&lt;output-stem&gt;.explain.txt</code> and stderr
+gets a digest with the path. <code>METTLE_EXPLAIN_REPORT_LINES</code> sets the
+threshold; <code>0</code> keeps everything on stderr.</p>
 
-<div class="callout">
-  <b>The rule this report follows</b>
-  <p>Every fix it suggests has been applied to a clone and re-checked before
-  printing. If the compiler cannot prove the advice works, it either says so or
-  says nothing.</p>
-</div>
+<h2>The rule it follows</h2>
+<p>Every fix the report suggests has been applied to a clone and re-checked
+before printing. If the compiler cannot prove the advice works, it either says
+so or says nothing.</p>
 
 </main>
-<footer class="foot"><div class="wrap"><div class="row">
-  <span>Part of the Mettle compiler documentation.</span>
+<footer class="foot"><div class="wrap">
+  <span>Mettle compiler documentation.</span>
   <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
-</div></div></footer>
+</div></footer>
 </body>
 </html>

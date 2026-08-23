@@ -12,7 +12,7 @@ import "std/io";
     return total;
 }
 
-fn main() -> int32 {
+@noinline fn main() -> int32 {
     var data: int32[8];
 
     for i in 0..8 {

@@ -17,10 +17,8 @@
   <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
 </div></header>
 <main class="wrap">
-<div class="crumb"><a href="../index.html">Mettle</a> / <a href="index.html">Codes</a> / hoisted</div>
-<div class="kicker">What the optimizer applied</div>
 <h1><span class="code">hoisted</span>A call was lifted out of the loop</h1>
-<p class="lede">printed by <code>--explain</code> in brackets after a verdict.</p>
+<p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain hoisted</code></pre>
 
 <p>The callee is @pure and its arguments do not change across iterations, so the result cannot change either. It is computed once before the loop.</p>
@@ -30,9 +28,9 @@
 <ul class="codelist"><li><a href="vectorized.html"><span class="c">vectorized</span><span class="t">The loop became a SIMD kernel</span></a></li><li><a href="vectorized-inner.html"><span class="c">vectorized-inner</span><span class="t">The inner loop of a nest became a kernel</span></a></li><li><a href="outer-of-nest.html"><span class="c">outer-of-nest</span><span class="t">The outer loop of a nest, reported for context</span></a></li><li><a href="eliminated.html"><span class="c">eliminated</span><span class="t">The loop was removed</span></a></li><li><a href="inlined.html"><span class="c">inlined</span><span class="t">The call was inlined</span></a></li><li><a href="unrolled.html"><span class="c">unrolled</span><span class="t">The loop was unrolled</span></a></li><li><a href="if-converted.html"><span class="c">if-converted</span><span class="t">A branch became branchless arithmetic</span></a></li><li><a href="prefetched.html"><span class="c">prefetched</span><span class="t">A prefetch was inserted</span></a></li></ul>
 
 </main>
-<footer class="foot"><div class="wrap"><div class="row">
-  <span>Generated from <code>src/error/error_explain.c</code> &mdash; the same text <code>mettle explain</code> prints.</span>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
   <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
-</div></div></footer>
+</div></footer>
 </body>
 </html>

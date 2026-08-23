@@ -17,10 +17,8 @@
   <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
 </div></header>
 <main class="wrap">
-<div class="crumb"><a href="../index.html">Mettle</a> / <a href="index.html">Codes</a> / int16-elements</div>
-<div class="kicker">Why a loop did not vectorize</div>
 <h1><span class="code">int16-elements</span>16-bit integer elements have no kernel</h1>
-<p class="lede">printed by <code>--explain</code> in brackets after a verdict.</p>
+<p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain int16-elements</code></pre>
 
 <p>The loop loads or stores int16/uint16. Mettle ships kernels for 8-bit and 32-bit integers and for both float widths, but not for 16-bit.</p>
@@ -31,9 +29,9 @@
 <ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li><li><a href="int64-elements.html"><span class="c">int64-elements</span><span class="t">64-bit integer elements have no kernel</span></a></li></ul>
 
 </main>
-<footer class="foot"><div class="wrap"><div class="row">
-  <span>Generated from <code>src/error/error_explain.c</code> &mdash; the same text <code>mettle explain</code> prints.</span>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
   <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
-</div></div></footer>
+</div></footer>
 </body>
 </html>

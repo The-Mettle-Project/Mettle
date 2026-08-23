@@ -1,6 +1,6 @@
 # libmtlc fetcher (Windows): get ONLY the backend (headers + static library).
 #
-#   irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/get-libmtlc.ps1 | iex
+#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/get-libmtlc.ps1 | iex
 #
 # Downloads the prebuilt libmtlc release for Windows x64 and unpacks it into
 # .\libmtlc (include\ + lib\). That folder is everything a frontend links
@@ -18,7 +18,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$repo = "The-Mettle-Project/Mettle"
+$repo = "suidvandiewereld/Mettle"
 $target = "windows-x64"
 
 function Say($m)  { Write-Host $m -ForegroundColor Blue }

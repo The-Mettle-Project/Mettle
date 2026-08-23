@@ -85,10 +85,10 @@ def page_shell(title, description, body, nav_current, depth=1, extra_head=""):
 <main class="wrap">
 {body}
 </main>
-<footer class="foot"><div class="wrap"><div class="row">
-  <span>Generated from <code>src/error/error_explain.c</code> &mdash; the same text <code>mettle explain</code> prints.</span>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
   <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
-</div></div></footer>
+</div></footer>
 </body>
 </html>
 """
@@ -209,23 +209,21 @@ def inline(text):
 def code_page(entry, groups):
     code = entry["code"]
     title = entry["title"]
-    group_title = entry["groupTitle"]
     is_diag = entry["kind"] == "diagnostic"
 
     siblings = [e for e in groups[entry["group"]] if e["code"] != code]
     related = "".join(
-        f'<li><a href="{esc(e["code"])}.html"><span class="c">{esc(e["code"])}</span>'
+        f'<li><a href="{esc(e["code"])}.html">'
+        f'<span class="c">{esc(e["code"])}</span>'
         f'<span class="t">{esc(e["title"])}</span></a></li>'
         for e in siblings[:8])
 
-    where = ("printed by the compiler as an error or warning"
+    where = ("Reported by the compiler as an error or warning."
              if is_diag else
-             "printed by <code>--explain</code> in brackets after a verdict")
+             "Reported by <code>--explain</code> after a verdict.")
 
-    body = f"""<div class="crumb"><a href="../index.html">Mettle</a> / <a href="index.html">Codes</a> / {esc(code)}</div>
-<div class="kicker">{esc(group_title)}</div>
-<h1><span class="code">{esc(code)}</span>{esc(title)}</h1>
-<p class="lede">{where}.</p>
+    body = f"""<h1><span class="code">{esc(code)}</span>{esc(title)}</h1>
+<p class="lede">{where}</p>
 <pre><code>mettle explain {esc(code)}</code></pre>
 
 {render_body(entry["body"])}
@@ -245,74 +243,52 @@ def index_page(entries, groups):
             continue
         rows = "".join(
             f'<li data-code="{esc(e["code"].lower())}" '
-            f'data-title="{esc(e["title"].lower())}" data-group="{esc(slug)}">'
+            f'data-title="{esc(e["title"].lower())}">'
             f'<a href="{esc(e["code"])}.html">'
             f'<span class="c">{esc(e["code"])}</span>'
             f'<span class="t">{esc(e["title"])}</span></a></li>'
             for e in items)
         sections.append(
-            f'<section data-group="{esc(slug)}">'
-            f"<h2>{esc(title)}</h2><p>{esc(blurb)}</p>"
+            f"<section><h2>{esc(title)}</h2><p>{esc(blurb)}</p>"
             f'<ul class="codelist">{rows}</ul></section>')
-
-    buttons = "".join(
-        f'<button type="button" data-filter="{esc(slug)}" aria-pressed="false">'
-        f"{esc(title)}</button>"
-        for slug, title, _ in GROUP_ORDER if groups.get(slug))
 
     script = """<script>
 (function(){
   var q=document.getElementById('q'),count=document.getElementById('count');
   var items=[].slice.call(document.querySelectorAll('.codelist li[data-code]'));
-  var sections=[].slice.call(document.querySelectorAll('section[data-group]'));
-  var buttons=[].slice.call(document.querySelectorAll('.tags button'));
-  var group='';
+  var sections=[].slice.call(document.querySelectorAll('section'));
   function apply(){
     var t=q.value.trim().toLowerCase(),shown=0;
     items.forEach(function(li){
-      var ok=(!t||li.dataset.code.indexOf(t)>=0||li.dataset.title.indexOf(t)>=0)
-        &&(!group||li.dataset.group===group);
+      var ok=!t||li.dataset.code.indexOf(t)>=0||li.dataset.title.indexOf(t)>=0;
       li.hidden=!ok; if(ok)shown++;
     });
     sections.forEach(function(s){
       s.hidden=!s.querySelector('li[data-code]:not([hidden])');
     });
-    count.textContent=shown+' of '+items.length;
+    count.textContent=t?(shown+' of '+items.length):'';
   }
   q.addEventListener('input',apply);
-  buttons.forEach(function(b){
-    b.addEventListener('click',function(){
-      group=(group===b.dataset.filter)?'':b.dataset.filter;
-      buttons.forEach(function(o){
-        o.setAttribute('aria-pressed',String(o.dataset.filter===group));
-      });
-      apply();
-    });
-  });
   apply();
 })();
 </script>"""
 
-    body = f"""<div class="crumb"><a href="../index.html">Mettle</a> / Codes</div>
-<div class="kicker">Reference</div>
-<h1>Every code the compiler can print</h1>
-<p class="lede">{len(entries)} of them. Each is also available in the terminal as
-<code>mettle explain &lt;CODE&gt;</code> &mdash; these pages are generated from the
-same table, so they say the same thing.</p>
+    body = f"""<h1>Codes</h1>
+<p class="lede">Every diagnostic and optimizer decision the compiler can print.
+The same text is available as <code>mettle explain &lt;CODE&gt;</code>; these
+pages are generated from that table.</p>
 
 <div class="filter">
-  <input id="q" type="search" placeholder="filter by code or title, e.g. store-only or narrowing"
+  <input id="q" type="search" placeholder="filter by code or title"
          autocomplete="off" spellcheck="false" aria-label="Filter codes" />
   <span class="count" id="count"></span>
 </div>
-<div class="tags">{buttons}</div>
 
 {''.join(sections)}
 """
     return page_shell("Codes — Mettle", "Every diagnostic and optimizer "
                       "decision code the Mettle compiler can print.", body,
-                      "Codes", depth=1, extra_head="") .replace(
-                          "</main>", "</main>\n" + script)
+                      "Codes", depth=1).replace("</main>", "</main>" + script)
 
 
 def load_codes(compiler):

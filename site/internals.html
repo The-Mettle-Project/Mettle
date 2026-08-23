@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Inside the compiler — Mettle</title>
-<meta name="description" content="A tour of the Mettle compiler pipeline: what each stage does, what it can tell you, and which codes it can print." />
+<meta name="description" content="A tour of the Mettle compiler pipeline: what each stage does and which codes it can print." />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -13,7 +13,7 @@
 </head>
 <body>
 <header class="bar"><div class="wrap">
-  <a class="brand" href="index.html"><b>Mettle</b><span>compiler</span></a>
+  <a class="brand" href="index.html">Mettle</a>
   <nav>
     <a href="index.html">Home</a>
     <a href="internals.html" aria-current="page">Internals</a>
@@ -24,12 +24,10 @@
 </div></header>
 <main class="wrap">
 
-<div class="crumb"><a href="index.html">Mettle</a> / Internals</div>
-<div class="kicker">The pipeline</div>
 <h1>Inside the compiler</h1>
-<p class="lede">Every stage below can be asked what it did. That is the point of
-this compiler: the diagnostics and the optimization report are not decoration on
-top of the pipeline, they are the pipeline explaining itself.</p>
+<p class="lede">Every stage can be asked what it did. The diagnostics and the
+optimization report are not decoration on top of the pipeline; they are the
+pipeline explaining itself.</p>
 
 <pre><code>source
   │  lexer            src/lexer
@@ -60,163 +58,108 @@ executable</code></pre>
 text anywhere in the pipeline, and no LLVM.</p>
 
 <h2>Lexer</h2>
-<div class="stage">
-  <div class="n"><b>src/lexer</b>source → tokens</div>
-  <div>
-    <p>Keywords resolve through two length-bucketed sorted tables: language
-    keywords matched exactly, inline-assembly mnemonics and register names
-    matched case-insensitively. A binary search within one length bucket
-    settles a lookup in a few comparisons, which matters because most
-    identifiers are not keywords. Identifiers are interned, so later phases
-    compare pointers rather than strings.</p>
-    <p><b>Reports:</b> <a href="explain/E0001.html">E0001</a> when a byte
-    cannot become a token.</p>
-  </div>
-</div>
+<p>Keywords resolve through two length-bucketed sorted tables: language keywords
+matched exactly, inline-assembly mnemonics and register names matched
+case-insensitively. A binary search within one length bucket settles a lookup in
+a few comparisons, which matters because most identifiers are not keywords.
+Identifiers are interned, so later phases compare pointers.</p>
+<p>Reports <a href="explain/E0001.html">E0001</a> when a byte cannot become a
+token.</p>
 
 <h2>Parser</h2>
-<div class="stage">
-  <div class="n"><b>src/parser</b>tokens → AST</div>
-  <div>
-    <p>Recursive descent. Error recovery resynchronizes at block boundaries, so
-    one missing brace reports once rather than cascading &mdash; which is why a
-    Mettle syntax error is usually one diagnostic and not a page of them.</p>
-    <p><b>Reports:</b> <a href="explain/E0002.html">E0002</a>.</p>
-  </div>
-</div>
+<p>Recursive descent. Error recovery resynchronizes at block boundaries, so one
+missing brace reports once rather than cascading, which is why a Mettle syntax
+error is usually one diagnostic and not a page of them.</p>
+<p>Reports <a href="explain/E0002.html">E0002</a>.</p>
 
 <h2>Semantic analysis</h2>
-<div class="stage">
-  <div class="n"><b>src/semantic</b>AST → checked AST</div>
-  <div>
-    <p>Types, scopes, traits, <code>comptime</code> expansion, and the analyses
-    that make this stage the loudest in the compiler: the borrow checker, the
-    memory diagnostics, and the range checks. They run at compile time on code
-    that is otherwise legal, which is why most of what they print are warnings.</p>
-    <p><b>Reports:</b> <a href="explain/E0003.html">E0003</a>,
-    <a href="explain/E0004.html">E0004</a>,
-    <a href="explain/E0005.html">E0005</a>, and the whole
-    <a href="explain/index.html">M0101–M0119</a> range &mdash; use after free,
-    double free, stack addresses that escape, leaks, borrowed pointers
-    invalidated by <code>realloc</code> or <code>free</code>, null and
-    out-of-bounds access, shift and divide constants, loop indexes that run past
-    the end, and narrowing conversions.</p>
-  </div>
-</div>
+<p>Types, scopes, traits, <code>comptime</code> expansion, and the analyses that
+make this the loudest stage in the compiler: the borrow checker, the memory
+diagnostics, and the range checks. They run at compile time on code that is
+otherwise legal, which is why most of what they print are warnings.</p>
+<p>Reports <a href="explain/E0003.html">E0003</a>,
+<a href="explain/E0004.html">E0004</a>, <a href="explain/E0005.html">E0005</a>,
+and the whole <a href="explain/index.html">M0101–M0119</a> range: use after
+free, double free, stack addresses that escape, leaks, borrowed pointers
+invalidated by <code>realloc</code> or <code>free</code>, null and out-of-bounds
+access, shift and divide constants, loop indexes that run past the end, and
+narrowing conversions.</p>
 
 <h2>IR lowering</h2>
-<div class="stage">
-  <div class="n"><b>src/ir</b>checked AST → IR</div>
-  <div>
-    <p>A function becomes a list of named-value instructions with labels and
-    branches. Types are attached to instructions, so code generation never
-    re-derives one. This is also the seam another frontend would enter through:
-    everything below here is <code>libmtlc</code> and knows nothing about
-    Mettle's syntax.</p>
-    <p><b>See it:</b> <code>--emit-ir</code>, and <code>--dump-ast</code> for
-    the stage before.</p>
-  </div>
-</div>
+<p>A function becomes a list of named-value instructions with labels and
+branches. Types are attached to instructions, so code generation never re-derives
+one. This is the seam another frontend would enter through: everything below is
+<code>libmtlc</code>, and knows nothing about Mettle's syntax.</p>
+<p>See it with <code>--emit-ir</code>, or <code>--dump-ast</code> for the stage
+before.</p>
 
 <h2>Optimizer</h2>
-<div class="stage">
-  <div class="n"><b>src/ir/optimizer</b>IR → optimized IR</div>
-  <div>
-    <p>Around forty passes. The shape is: loop canonical form first, because
-    every recognizer behind it assumes that form; then the core simplifications
-    to a fixpoint &mdash; copy and constant propagation, CSE, branch
-    simplification, reassociation, dead write elimination, jump threading; then
-    a recognizer worklist; then a tail of lowering cleanups.</p>
-    <p>A convergence check fails the build when the fixpoint does not settle, so
-    a pair of passes that undo each other is caught rather than spun on.</p>
-    <p><b>Reports:</b> every
-    <a href="explain/index.html">decision code</a> &mdash; the 24 reasons a loop
-    did not vectorize, the 15 reasons a call was not inlined, and the 11 things
-    the optimizer applied. This is what <code>--explain</code> prints.</p>
-  </div>
-</div>
+<p>Around forty passes. Loop canonical form runs first, because every recognizer
+behind it assumes that form. Then the core simplifications to a fixpoint — copy
+and constant propagation, CSE, branch simplification, reassociation, dead write
+elimination, jump threading — then a recognizer worklist, then a tail of
+lowering cleanups.</p>
+<p>A convergence check fails the build when the fixpoint does not settle, so a
+pair of passes that undo each other is caught rather than spun on.</p>
+<p>Reports every <a href="explain/index.html">decision code</a>: the 24 reasons a
+loop did not vectorize, the 15 reasons a call was not inlined, and the 11 things
+the optimizer applied. This is what <code>--explain</code> prints.</p>
 
 <h2>Code generation</h2>
-<div class="stage">
-  <div class="n"><b>src/codegen</b>IR → machine code</div>
-  <div>
-    <p>Four targets and one shared object writer. On x86-64 there are two
-    backends and most functions take the first: MIR, a machine-level IR with
-    real register allocation &mdash; Chaitin-Briggs graph colouring by default,
-    over the full general set plus <code>xmm0–15</code>, with <code>R10</code>
-    and <code>R11</code> held back as scratch.</p>
-    <p>When MIR cannot take a function, it falls back to a spill-everything
-    backend that keeps every value on the stack. The
-    <a href="reading-the-report.html">backend report</a> names which functions
-    fell back and why, because that fallback is the single largest thing that
-    can quietly cost you performance.</p>
-    <p><b>See it:</b> <code>--annotate-asm</code> for per-instruction
-    provenance, <code>--profile-blocks</code> for a block profile.</p>
-  </div>
-</div>
+<p>Four targets and one shared object writer. On x86-64 there are two backends
+and most functions take the first: MIR, a machine-level IR with real register
+allocation — Chaitin-Briggs graph colouring by default, over the full general
+set plus <code>xmm0–15</code>, with <code>R10</code> and <code>R11</code> held
+back as scratch.</p>
+<p>When MIR cannot take a function it falls back to a spill-everything backend
+that keeps every value on the stack. The
+<a href="reading-the-report.html">backend report</a> names which functions fell
+back and why, because that fallback is the largest thing that can quietly cost
+you performance.</p>
+<p>See it with <code>--annotate-asm</code> for per-instruction provenance, or
+<code>--profile-blocks</code> for a block profile.</p>
 
 <h2>Linker</h2>
-<div class="stage">
-  <div class="n"><b>src/linker</b>objects → executable</div>
-  <div>
-    <p>A complete PE linker of its own, plus ELF reading. Its distinctive rule
-    is that runtime objects' symbols are overridable defaults, so a program
-    defining <code>strlen</code> replaces the runtime's without a
-    duplicate-symbol error, while the runtime keeps calling its own. Link-time
-    section collection drops what nothing reaches.</p>
-    <p><b>Reports:</b> <a href="explain/E0006.html">E0006</a> for I/O.</p>
-  </div>
-</div>
+<p>A complete PE linker of its own, plus ELF reading. Its distinctive rule is
+that runtime objects' symbols are overridable defaults, so a program defining
+<code>strlen</code> replaces the runtime's without a duplicate-symbol error,
+while the runtime keeps calling its own. Link-time section collection drops what
+nothing reaches.</p>
+<p>Reports <a href="explain/E0006.html">E0006</a> for I/O.</p>
 
-<h2>The interpreter, and why it matters here</h2>
+<h2>The interpreter</h2>
 <p><code>src/ir/ir_interp.c</code> executes IR with a real memory model:
 strings with their bytes, structs, arrays, globals, heap allocation, closures.
-Four features run on it, and two of them are the reason the report can make the
-claims it does.</p>
-
-<div class="stage">
-  <div class="n"><b>mettle test</b></div>
-  <div><p>Runs <code>@test</code> functions with no code generation at all.</p></div>
-</div>
-<div class="stage">
-  <div class="n"><b>mettle trace</b></div>
-  <div><p>Prints a function's values line by line.</p></div>
-</div>
-<div class="stage">
-  <div class="n"><b>--pgo</b></div>
-  <div><p>Interprets <code>main()</code> at compile time and counts calls, so
-  layout and inlining decisions have real frequencies without a profiling
-  run.</p></div>
-</div>
-<div class="stage">
-  <div class="n"><b>--verify</b></div>
-  <div><p>Executes each function before and after every pass and compares.
-  A pass that diverges is quarantined for that function and the build continues
-  from validated IR.</p></div>
-</div>
-
-<div class="callout">
-  <b>Why the report can say "proven"</b>
-  <p>The same machinery is what lets <code>--explain</code> apply a suggested
-  fix to a clone of your function, re-run the optimizer on it, and report what
-  actually happened &mdash; rather than guessing that the advice would work.</p>
-</div>
-
-<h2>Where to go next</h2>
+Four features run on it.</p>
 <ul>
-  <li><a href="reading-diagnostics.html">Reading a diagnostic</a> &mdash; the
-  five parts of an error, and how to get them as JSON.</li>
-  <li><a href="reading-the-report.html">Reading the report</a> &mdash; verdicts,
-  decision codes, and the ranking.</li>
-  <li><a href="explain/index.html">Every code</a> &mdash; all 76, searchable.</li>
-  <li><a href="https://github.com/suidvandiewereld/Mettle/blob/main/docs/ARCHITECTURE.md">docs/ARCHITECTURE.md</a>
-  &mdash; the same tour in more depth, in the repository.</li>
+  <li><code>mettle test</code> runs <code>@test</code> functions with no code
+  generation at all.</li>
+  <li><code>mettle trace</code> prints a function's values line by line.</li>
+  <li><code>--pgo</code> interprets <code>main()</code> at compile time and
+  counts calls, so layout and inlining decisions have real frequencies without a
+  profiling run.</li>
+  <li><code>--verify</code> executes each function before and after every pass
+  and compares. A pass that diverges is quarantined for that function and the
+  build continues from validated IR.</li>
+</ul>
+<p>The same machinery is what lets <code>--explain</code> apply a suggested fix
+to a clone of your function, re-run the optimizer on it, and report what
+actually happened rather than guessing that the advice would work. That is why
+the report can say <code>proven</code>.</p>
+
+<h2>Further</h2>
+<ul>
+  <li><a href="reading-diagnostics.html">Reading a diagnostic</a></li>
+  <li><a href="reading-the-report.html">Reading the report</a></li>
+  <li><a href="explain/index.html">Every code</a></li>
+  <li><a href="https://github.com/suidvandiewereld/Mettle/blob/main/docs/ARCHITECTURE.md">docs/ARCHITECTURE.md</a>,
+  the same tour in more depth</li>
 </ul>
 
 </main>
-<footer class="foot"><div class="wrap"><div class="row">
-  <span>Part of the Mettle compiler documentation.</span>
+<footer class="foot"><div class="wrap">
+  <span>Mettle compiler documentation.</span>
   <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
-</div></div></footer>
+</div></footer>
 </body>
 </html>

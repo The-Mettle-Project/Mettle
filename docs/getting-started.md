@@ -7,13 +7,13 @@ Install the compiler, build a program, and take a short tour of the language.
 Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/install.sh | sh
 ```
 
 Windows, in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/install.ps1 | iex
 ```
 
 It installs to `~/.mettle` or `%LOCALAPPDATA%\Mettle` and adds that to your
@@ -95,7 +95,7 @@ working directory. `--stdlib <dir>` overrides that.
 
 The VS Code and Cursor extension, `mettle-syntax`, and the IntelliJ plugin,
 `clion-plugin`, live in the
-[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc) repository.
+[MettleMisc](https://github.com/suidvandiewereld/MettleMisc) repository.
 
 ## A short tour
 

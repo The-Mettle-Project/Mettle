@@ -21,7 +21,7 @@
 #endif
 
 #define MyAppName "Mettle"
-#define MyRepoUrl "https://github.com/The-Mettle-Project/Mettle"
+#define MyRepoUrl "https://github.com/suidvandiewereld/Mettle"
 
 ; The banner carries the version, so a release build whose version disagrees
 ; with the art would ship the wrong number. Only version-shaped builds are

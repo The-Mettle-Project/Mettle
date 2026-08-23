@@ -3,10 +3,10 @@
 <picture>
   <source
     media="(prefers-color-scheme: dark)"
-    srcset="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-dark.svg"
+    srcset="https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/docs/assets/mettle-dark.svg"
     width="120" height="120" />
   <img
-    src="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-light.svg"
+    src="https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/docs/assets/mettle-light.svg"
     alt="Mettle" width="120" height="120" />
 </picture>
 
@@ -55,13 +55,13 @@ Types are always written out, on every `var`.
 Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/install.sh | sh
 ```
 
 Windows, in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/install.ps1 | iex
 ```
 
 It installs to `~/.mettle` or `%LOCALAPPDATA%\Mettle` and puts that on your PATH.
@@ -175,7 +175,7 @@ C:
 ```
 
 The editor extensions live in
-[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc): `mettle-syntax`
+[MettleMisc](https://github.com/suidvandiewereld/MettleMisc): `mettle-syntax`
 for VS Code and Cursor, `clion-plugin` for the IntelliJ family.
 
 ## License

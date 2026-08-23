@@ -1,6 +1,6 @@
 # libmtlc docs fetcher (Windows): download the docs/libmtlc reference set.
 #
-#   irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/get-libmtlc-docs.ps1 | iex
+#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/get-libmtlc-docs.ps1 | iex
 #
 # Downloads the API reference, IR model, type system, pipeline, and internals
 # docs (docs/libmtlc/*.md) via the GitHub Contents API and writes them into
@@ -18,7 +18,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$repo = "The-Mettle-Project/Mettle"
+$repo = "suidvandiewereld/Mettle"
 
 function Say($m)  { Write-Host $m -ForegroundColor Blue }
 function Ok($m)   { Write-Host "ok $m" -ForegroundColor Green }

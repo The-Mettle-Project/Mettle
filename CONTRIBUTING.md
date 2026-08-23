@@ -58,7 +58,7 @@ docs/           language and tooling reference
 ```
 
 The VS Code and JetBrains extensions live in
-[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc).
+[MettleMisc](https://github.com/suidvandiewereld/MettleMisc).
 
 ## Building the compiler
 

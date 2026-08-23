@@ -64,12 +64,12 @@ repository.
 
 ```bash
 # Linux
-curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/get-libmtlc.sh | sh
+curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/get-libmtlc.sh | sh
 ```
 
 ```powershell
 # Windows
-irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/get-libmtlc.ps1 | iex
+irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/get-libmtlc.ps1 | iex
 ```
 
 Both accept `LIBMTLC_VERSION` to pin a tag and `LIBMTLC_DIR` to choose where it
