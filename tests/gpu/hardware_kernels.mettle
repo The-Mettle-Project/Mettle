@@ -669,7 +669,9 @@ kernel record_pipeline(out: float32*, src: float32*, p: RecParams) {
       k = k + 1;
     }
     var pick: int32 = i % 4;
-    var total: float32 = 0.0;
+    // A non-zero seed: fresh .local storage reads as zero, so a dropped
+    // store-back to a memory-homed scalar would still look right at 0.
+    var total: float32 = 100.0;
     rec_accumulate(&total, rec_span(&table[pick]));
     rec_accumulate(&total, p.beta);
     out[i] = total;

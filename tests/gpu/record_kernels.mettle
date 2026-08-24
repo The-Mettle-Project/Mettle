@@ -106,7 +106,9 @@ kernel record_nested(out: float32*, n: int32) {
 kernel scalar_address(out: float32*, n: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
   if (i < n) {
-    var acc: float32 = 0.0;
+    // A non-zero seed: fresh .local storage reads as zero, so a dropped
+    // store-back would still look right if this started at 0.
+    var acc: float32 = 100.0;
     var k: int32 = 0;
     while (k < 4) {
       accumulate(&acc, (float32)(k + i));

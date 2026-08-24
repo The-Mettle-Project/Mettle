@@ -7061,7 +7061,15 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
       char src[24];
       use_as(&fn, &in->lhs, dc, src);
       PtxVal dv;
-      if (db) {
+      if (db && db->val.mem_local) {
+        /* The home is memory, so the value lands in a scratch register and
+         * bind_value writes it through. Reusing the binding here would carry
+         * mem_local into the store-back check and drop the write. */
+        dv = (PtxVal){0};
+        dv.cls = dc;
+        dv.is_unsigned = db->val.is_unsigned;
+        dv.idx = new_reg(&fn, dc);
+      } else if (db) {
         dv = db->val;
       } else {
         dv = operand_desc(&fn, &in->lhs);

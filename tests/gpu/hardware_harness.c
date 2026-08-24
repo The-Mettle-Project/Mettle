@@ -379,7 +379,7 @@ static int test_record_pipeline(Harness *h) {
     float scaled_lo = src[i] * parameters_record.alpha;
     float scaled_hi = (float)i + parameters_record.alpha;
     float picked_lo = scaled_lo + (float)(i % 4);
-    expected[i] = (scaled_hi - picked_lo) + parameters_record.beta;
+    expected[i] = 100.0f + (scaled_hi - picked_lo) + parameters_record.beta;
   }
   if (!alloc_device(h, &dsrc, src, sizeof(float) * N) ||
       !alloc_device(h, &dout, NULL, sizeof(float) * N) ||
