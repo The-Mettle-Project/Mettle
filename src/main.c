@@ -2908,6 +2908,45 @@ static int detect_host_gpu_ptx_target(char *out, size_t out_size) {
  * file cannot disagree with the kernels it launches about their arguments or
  * their block shape, because the declarations are the kernels. Returns 1 on
  * success. */
+/* The bare type name a parameter or field spelling refers to: `Ray*` and
+ * `Ray[8]` both name `Ray`. Returns the length written, 0 when the spelling
+ * names nothing a struct declaration could match. */
+static size_t kernel_decl_base_type(const char *spelling, char *out,
+                                    size_t capacity) {
+  if (!spelling || !out || capacity == 0) return 0;
+  size_t n = 0;
+  while (spelling[n] && spelling[n] != '*' && spelling[n] != '[' &&
+         spelling[n] != ' ' && n + 1 < capacity) {
+    out[n] = spelling[n];
+    n++;
+  }
+  out[n] = 0;
+  return n;
+}
+
+/* Mark `name`'s struct declaration, and every struct its fields reach, as one
+ * the generated file has to carry. The host cannot import a declaration that
+ * names a record it has never seen. */
+static void kernel_decl_mark_record(Program *prog, char *wanted,
+                                    const char *name) {
+  if (!prog || !wanted || !name || !*name) return;
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    if (!decl || decl->type != AST_STRUCT_DECLARATION || !decl->data) continue;
+    StructDeclaration *record = (StructDeclaration *)decl->data;
+    if (!record->name || strcmp(record->name, name) != 0 || wanted[i]) continue;
+    wanted[i] = 1;
+    for (size_t f = 0; f < record->field_count; f++) {
+      char base[128];
+      if (record->field_types &&
+          kernel_decl_base_type(record->field_types[f], base, sizeof(base))) {
+        kernel_decl_mark_record(prog, wanted, base);
+      }
+    }
+    return;
+  }
+}
+
 static int write_kernel_declarations(ASTNode *program, const char *path,
                                      const char *source_name) {
   if (!program || program->type != AST_PROGRAM || !program->data) return 0;
@@ -2925,6 +2964,48 @@ static int write_kernel_declarations(ASTNode *program, const char *path,
           "// against the kernel as it was actually compiled. Do not edit:\n"
           "// re-emit it whenever the kernels change.\n\n",
           source_name ? source_name : "a GPU module");
+
+  /* Kernel parameters may name records, so those declarations come first and
+   * the file stays self-contained. */
+  char *wanted = prog->declaration_count
+                     ? (char *)calloc(prog->declaration_count, 1)
+                     : NULL;
+  if (prog->declaration_count && !wanted) {
+    fclose(out);
+    fprintf(stderr, "Error: out of memory writing the kernel declarations\n");
+    return 0;
+  }
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    if (!decl || decl->type != AST_FUNCTION_DECLARATION || !decl->data) continue;
+    FunctionDeclaration *fn = (FunctionDeclaration *)decl->data;
+    if (!fn->is_kernel || fn->is_extern) continue;
+    for (size_t p = 0; p < fn->parameter_count; p++) {
+      char base[128];
+      if (fn->parameter_types &&
+          kernel_decl_base_type(fn->parameter_types[p], base, sizeof(base))) {
+        kernel_decl_mark_record(prog, wanted, base);
+      }
+    }
+  }
+  size_t records = 0;
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    if (!wanted || !wanted[i]) continue;
+    StructDeclaration *record = (StructDeclaration *)prog->declarations[i]->data;
+    fprintf(out, "struct %s {\n", record->name ? record->name : "record");
+    for (size_t f = 0; f < record->field_count; f++) {
+      fprintf(out, "  %s: %s;\n",
+              record->field_names && record->field_names[f]
+                  ? record->field_names[f]
+                  : "field",
+              record->field_types && record->field_types[f]
+                  ? record->field_types[f]
+                  : "int64");
+    }
+    fprintf(out, "}\n\n");
+    records++;
+  }
+  free(wanted);
 
   size_t written = 0;
   for (size_t i = 0; i < prog->declaration_count; i++) {
@@ -2960,8 +3041,14 @@ static int write_kernel_declarations(ASTNode *program, const char *path,
     written++;
   }
   fclose(out);
-  printf("Generated kernel declarations: %s (%zu kernel%s)\n", path, written,
-         written == 1 ? "" : "s");
+  if (records) {
+    printf("Generated kernel declarations: %s (%zu kernel%s, %zu record%s)\n",
+           path, written, written == 1 ? "" : "s", records,
+           records == 1 ? "" : "s");
+  } else {
+    printf("Generated kernel declarations: %s (%zu kernel%s)\n", path, written,
+           written == 1 ? "" : "s");
+  }
   return 1;
 }
 

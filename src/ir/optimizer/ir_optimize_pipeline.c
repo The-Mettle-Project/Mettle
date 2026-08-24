@@ -295,6 +295,7 @@ static const IROptScheduledPass g_ir_portable_fixpoint_passes[] = {
     IR_OPT_PASS_WHEN_ALL(ELIMINATE_SINGLE_USE_FLOAT_SYMBOL_COPIES,
                          ir_eliminate_single_use_float_symbol_copies_pass,
                          IR_OPT_FEATURE_ASSIGN),
+    IR_OPT_PASS_ALWAYS(SROA, ir_sroa_pass),
     IR_OPT_PASS_ALWAYS(COMMON_SUBEXPRESSION_ELIMINATION,
                        ir_common_subexpression_elimination_pass),
     IR_OPT_PASS_ALWAYS(CONSTANT_AND_BRANCH_SIMPLIFY,

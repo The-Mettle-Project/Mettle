@@ -62,10 +62,53 @@ See the [GPU architecture and acceptance contract](gpu-architecture.md).
 An ordinary function called by a kernel is emitted as a non-entry device helper
 in both PTX and SPIR-V. Reachability is transitive and unrelated host functions
 are omitted; `kernel` remains the only launch-entry marker. Direct calls with
-scalar or pointer parameters/results are supported. Recursion, indirect calls,
-external calls, host launches from device code, and calling a kernel as a normal
-function are rejected by a shared IR call-graph verifier, so the rule is the
-same for every frontend and GPU backend.
+scalar, pointer, or record parameters/results are supported. Recursion, indirect
+calls, external calls, host launches from device code, and calling a kernel as a
+normal function are rejected by a shared IR call-graph verifier, so the rule is
+the same for every frontend and GPU backend.
+
+### Records
+
+Structs, fixed arrays, and arrays of structs work in device code the way they do
+on the host:
+
+```mettle
+struct Ray { origin: Vec3; direction: Vec3; depth: int32; }
+
+@noinline fn advance(ray: Ray*, t: float32) -> Vec3 { /* ... */ }
+
+kernel trace(hits: float32*, scene: Params) {
+  var ray: Ray;
+  var stack: Ray[8];
+  var top: int32 = 0;
+  /* ... */
+  var point: Vec3 = advance(&stack[top], 0.5);
+}
+```
+
+A record local, a record field, a runtime-indexed array of records, taking a
+record's address, passing one to a helper by value or by pointer, returning one,
+and assigning one whole are all available. A record is also a kernel parameter
+type, which is how a launch passes one settings block in place of eleven
+scalars.
+
+Under `-O` the shared optimizer splits a record whose fields are only ever read
+and written at constant offsets into separate scalars, so the common case costs
+no memory at all. A record it cannot split keeps per-thread storage: PTX uses
+`.local` and SPIR-V a Function-storage byte array. An address that leaves the
+function, as a call argument or stored into memory, is converted to a generic
+address first, so a helper never reads a local address as if it were global.
+
+A record parameter crosses the launch boundary as its own bytes, the same shape
+CUDA gives a struct argument, so `--emit-kernel-decls` writes the record
+declarations alongside the `extern kernel` lines and the generated file stays
+self-contained. Every field has to mean the same thing on both sides, so a
+record reaching a kernel holds scalars, pointers, fixed arrays, and nested
+records; a string, a closure, or a function pointer is refused at the source.
+
+The current OpenCL 2.0 SPIR-V profile has record locals, record arrays, and
+pointers to records. It has no by-value record call ABI, and says so rather than
+passing the wrong thing.
 
 ### Decorators on device code
 
@@ -1140,6 +1183,8 @@ which `spirv-val --target-env opencl2.0` confirms.
   stream are not represented yet.
 - Kernels and host code live in separate files (the kernel file is compiled
   with `--emit-ptx`; the host with `--build`).
+- A record kernel parameter is passed by value. The OpenCL 2.0 SPIR-V profile
+  rejects by-value record parameters and results; pass a pointer there.
 
 See `examples/gpu_vadd/` for the complete x86-64 CUDA host example and
 `tests/gpu/compute_kernels.mettle` for the assembler/validator kernel matrix.

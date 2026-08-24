@@ -118,6 +118,10 @@ int type_checker_are_compatible(Type *type1, Type *type2);
 void type_checker_init_builtin_types(TypeChecker *checker);
 Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name);
 int type_checker_is_integer_type(Type *type);
+/* One rule for what may cross the GPU launch boundary, shared by the kernel
+ * declaration check and the `dispatch` argument check so the two can never
+ * disagree about a type. */
+int type_checker_gpu_abi_type(const Type *type);
 int type_checker_is_discrete_type(Type *type);
 int type_checker_register_variant_constructor(TypeChecker *checker, Type *te,
                                               const char *enum_name,

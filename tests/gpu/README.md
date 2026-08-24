@@ -5,11 +5,15 @@ PTX/SPIR-V structure, and assembler acceptance. It does not claim device
 execution. `hardware_harness.c` is the real CUDA Driver differential gate.
 
 The harness compiles `hardware_kernels.mettle` with `-O`, loads the resulting
-PTX through the Driver API, and checks 32 independent contracts against CPU
+PTX through the Driver API, and checks 33 independent contracts against CPU
 oracles:
 
 - all XYZ thread, block, block-size, and grid-size indices;
 - odd-size guarded SAXPY through a reachable device helper;
+- records end to end: a record kernel parameter marshalled as its own bytes, a
+  record local, a runtime-indexed array of records, a by-value call taking and
+  returning a record, a whole-record assignment, and a pointer to a record
+  element handed to a device helper;
 - a counted-loop row norm and GPU math intrinsic;
 - workgroup/private storage plus a workgroup barrier;
 - explicit native 16-byte global-to-workgroup asynchronous staging with a

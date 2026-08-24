@@ -1,0 +1,13 @@
+struct Vec2 { x: float32; y: float32; }
+
+fn take(v: Vec2) -> float32 { return v.x + v.y; }
+
+kernel use_record(out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var v: Vec2;
+    v.x = 1.0;
+    v.y = 2.0;
+    out[i] = take(v);
+  }
+}

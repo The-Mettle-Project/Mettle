@@ -1,0 +1,11 @@
+struct Message { text: string; length: int32; }
+
+extern kernel consume(message: Message);
+
+fn main() -> int32 {
+  var m: Message;
+  m.text = "hello";
+  m.length = 5;
+  dispatch consume[1, 1](m);
+  return 0;
+}

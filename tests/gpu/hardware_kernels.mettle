@@ -629,3 +629,49 @@ kernel tensor_pipeline4_f16_f32(a: uint16*, b: uint16*,
              a_layout: row, b_layout: col, c_layout: row, d_layout: row,
              lda: 16, ldb: 16, ldc: 16, ldd: 16);
 }
+
+// Records in device code, end to end: a record kernel parameter, a record
+// local, an array of records indexed at runtime, a by-value call whose
+// parameter and result are both records, a whole-record assignment, and a
+// pointer to a record through a device helper.
+struct RecParams { count: int32; alpha: float32; beta: float32; }
+struct RecPair { lo: float32; hi: float32; }
+
+@noinline fn rec_scale(v: RecPair, k: float32) -> RecPair {
+  var r: RecPair;
+  r.lo = v.lo * k;
+  r.hi = v.hi + k;
+  return r;
+}
+
+@noinline fn rec_span(p: RecPair*) -> float32 {
+  return p->hi - p->lo;
+}
+
+// A scalar local whose address is taken loses its register home too.
+@noinline fn rec_accumulate(slot: float32*, value: float32) {
+  slot[0] = slot[0] + value;
+}
+
+kernel record_pipeline(out: float32*, src: float32*, p: RecParams) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < p.count) {
+    var seed: RecPair;
+    seed.lo = src[i];
+    seed.hi = (float32)i;
+    var scaled: RecPair = rec_scale(seed, p.alpha);
+    var copy: RecPair = scaled;
+    var table: RecPair[4];
+    var k: int32 = 0;
+    while (k < 4) {
+      table[k].lo = copy.lo + (float32)k;
+      table[k].hi = copy.hi;
+      k = k + 1;
+    }
+    var pick: int32 = i % 4;
+    var total: float32 = 0.0;
+    rec_accumulate(&total, rec_span(&table[pick]));
+    rec_accumulate(&total, p.beta);
+    out[i] = total;
+  }
+}

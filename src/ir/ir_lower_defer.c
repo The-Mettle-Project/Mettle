@@ -316,8 +316,14 @@ static int ir_emit_errdefer_condition(IRLoweringContext *context,
   IRInstruction load = {0};
 
   if (!value_type || value_type->kind != TYPE_TAGGED_ENUM) {
-    *out_condition = (value->kind == IR_OPERAND_NONE) ? ir_operand_int(0)
-                                                      : ir_operand_copy(value);
+    /* Only a tagged enum carries a discriminant an errdefer can read. A struct
+     * or an array has no scalar to test at all, and copying one here would ask
+     * every backend to load a whole record into a branch condition. */
+    int aggregate = value_type && (value_type->kind == TYPE_STRUCT ||
+                                   value_type->kind == TYPE_ARRAY);
+    *out_condition = (value->kind == IR_OPERAND_NONE || aggregate)
+                         ? ir_operand_int(0)
+                         : ir_operand_copy(value);
     return 1;
   }
 

@@ -17,26 +17,7 @@ void type_checker_set_launch_report(int enabled) {
 }
 
 static int gpu_launch_abi_type(const Type *type) {
-  if (!type) {
-    return 0;
-  }
-  switch (type->kind) {
-  case TYPE_INT8:
-  case TYPE_INT16:
-  case TYPE_INT32:
-  case TYPE_INT64:
-  case TYPE_UINT8:
-  case TYPE_UINT16:
-  case TYPE_UINT32:
-  case TYPE_UINT64:
-  case TYPE_BOOL:
-  case TYPE_FLOAT32:
-  case TYPE_FLOAT64:
-  case TYPE_POINTER:
-    return 1;
-  default:
-    return 0;
-  }
+  return type_checker_gpu_abi_type(type);
 }
 
 static int type_checker_check_gpu_launch(TypeChecker *checker,
@@ -239,7 +220,7 @@ static int type_checker_check_gpu_launch(TypeChecker *checker,
       type_checker_set_error_at_location(
           checker, launch->arguments[i]->location,
           "GPU launch argument %zu has unsupported ABI type '%s'; use a "
-          "scalar or pointer value",
+          "scalar, a pointer, or a record built from those",
           i, arg_type->name ? arg_type->name : "unknown");
       return 0;
     }

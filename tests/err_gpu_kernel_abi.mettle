@@ -1,7 +1,7 @@
-struct Pair {
-  x: float32;
-  y: float32;
+struct Message {
+  text: string;
+  length: int32;
 }
 
-kernel invalid_parameter(pair: Pair) {
+kernel invalid_parameter(message: Message) {
 }

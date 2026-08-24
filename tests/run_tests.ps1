@@ -2057,7 +2057,10 @@ $cases = @(
   @{ Name = "err_function_arg_count"; Path = "tests/err_function_arg_count.mettle"; ShouldSucceed = $false; Pattern = "expects .* arguments, got" },
   @{ Name = "err_function_arg_type"; Path = "tests/err_function_arg_type.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
   @{ Name = "err_gpu_kernel_return"; Path = "tests/err_gpu_kernel_return.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_result' must return void" },
-  @{ Name = "err_gpu_kernel_abi"; Path = "tests/err_gpu_kernel_abi.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_parameter' parameter 'pair' has unsupported ABI type 'Pair'" },
+  @{ Name = "err_gpu_kernel_abi"; Path = "tests/err_gpu_kernel_abi.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_parameter' parameter 'message' has unsupported ABI type 'Message'" },
+  @{ Name = "err_gpu_launch_record_abi"; Path = "tests/err_gpu_launch_record_abi.mettle"; ShouldSucceed = $false; Pattern = "GPU launch argument 0 has unsupported ABI type 'Message'" },
+  @{ Name = "err_gpu_spirv_record_parameter"; Path = "tests/err_gpu_spirv_record_parameter.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "no by-value record parameter ABI" },
+  @{ Name = "err_gpu_spirv_record_return"; Path = "tests/err_gpu_spirv_record_return.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "no by-value record call ABI" },
   @{ Name = "err_gpu_no_kernel"; Path = "tests/err_gpu_no_kernel.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "GPU module has no kernel entry points" },
   @{ Name = "err_gpu_recursive_device_call"; Path = "tests/err_gpu_recursive_device_call.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "GPU device call graph is recursive at 'recurse'" },
   @{ Name = "err_gpu_recursive_device_call_spirv"; Path = "tests/err_gpu_recursive_device_call.mettle"; ShouldSucceed = $false; Args = @("--emit-spirv"); Pattern = "GPU device call graph is recursive at 'recurse'" },
@@ -10461,6 +10464,7 @@ catch {
 # acceptance gate on CUDA development machines.
 $ptxas = Get-Command ptxas -ErrorAction SilentlyContinue
 foreach ($src in @("tests/gpu/compute_kernels.mettle",
+                   "tests/gpu/record_kernels.mettle",
                    "tests/gpu/subgroup_shuffle.mettle",
                    "tests/gpu/atomic_kernels.mettle",
                    "tests/gpu/async_copy.mettle",
@@ -10490,6 +10494,24 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
     if ($ptxText -notmatch "(?m)^\.target compute_75\r?$") { throw "portable PTX target is not compute_75" }
     if ($ptxText -match "ordinary_function_not_entry") {
       throw "unreachable ordinary function entered the PTX module"
+    }
+    if ($src -like "*record_kernels.mettle") {
+      # A record parameter crosses the launch boundary as its own bytes, the
+      # same shape CUDA gives a struct argument.
+      if ($ptxText -notmatch "\.param \.align 4 \.b8 record_parameter_p2\[12\]") {
+        throw "record kernel parameter did not use the byte-array param ABI"
+      }
+      # By value means the callee gets a copy it can write through.
+      if ($ptxText -notmatch "\.func \(\.param \.align 4 \.b8 scale2_ret\[8\]\) scale2\(") {
+        throw "record return did not use the byte-array return ABI"
+      }
+      if ($ptxText -notmatch "\.local .*scale2_p0_local") {
+        throw "record parameter was not copied into local storage"
+      }
+      # A local address handed to a helper has to become a generic address.
+      if ($ptxText -notmatch "cvta\.local\.u64") {
+        throw "record address escaping to a device call was not converted"
+      }
     }
     if ($src -like "*compute_kernels.mettle") {
       if ($ptxText -notmatch "(?m)^\.func \(\.param \.f32 scale_value_ret\) scale_value\(" -or

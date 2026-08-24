@@ -1,0 +1,16 @@
+struct Vec2 { x: float32; y: float32; }
+
+fn make(k: float32) -> Vec2 {
+  var v: Vec2;
+  v.x = k;
+  v.y = k;
+  return v;
+}
+
+kernel use_record(out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var v: Vec2 = make((float32)i);
+    out[i] = v.x + v.y;
+  }
+}

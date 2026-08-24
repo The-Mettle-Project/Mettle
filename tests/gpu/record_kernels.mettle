@@ -1,0 +1,117 @@
+// Records in device code: locals, arrays of records, pointers to records
+// through a device helper, by-value parameters and returns, whole-record
+// assignment, and a record kernel parameter.
+
+struct Vec2 { x: float32; y: float32; }
+struct Node { key: int32; next: int32; }
+struct Params { count: int32; alpha: float32; beta: float32; }
+struct Nested { head: Vec2; tail: Vec2; tag: int32; }
+
+@noinline fn dot2(a: Vec2*, b: Vec2*) -> float32 {
+  return a->x * b->x + a->y * b->y;
+}
+
+@noinline fn scale2(v: Vec2, k: float32) -> Vec2 {
+  var r: Vec2;
+  r.x = v.x * k;
+  r.y = v.y * k;
+  return r;
+}
+
+kernel record_local(out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var v: Vec2;
+    v.x = (float32)i;
+    v.y = 2.0;
+    out[i] = v.x + v.y;
+  }
+}
+
+kernel record_array(out: int32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var nodes: Node[8];
+    var k: int32 = 0;
+    while (k < 8) {
+      nodes[k].key = k * i;
+      nodes[k].next = k + 1;
+      k = k + 1;
+    }
+    var acc: int32 = 0;
+    var cur: int32 = 0;
+    while (cur < 8) {
+      acc = acc + nodes[cur].key;
+      cur = nodes[cur].next;
+    }
+    out[i] = acc;
+  }
+}
+
+kernel record_pointer(out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var a: Vec2;
+    var b: Vec2;
+    a.x = (float32)i;
+    a.y = 1.0;
+    b.x = 3.0;
+    b.y = 4.0;
+    out[i] = dot2(&a, &b);
+  }
+}
+
+kernel record_by_value(out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var a: Vec2;
+    a.x = (float32)i;
+    a.y = 2.0;
+    var scaled: Vec2 = scale2(a, 3.0);
+    var copy: Vec2 = scaled;
+    out[i] = copy.x + copy.y;
+  }
+}
+
+kernel record_parameter(out: float32*, src: float32*, p: Params) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < p.count) {
+    out[i] = src[i] * p.alpha + p.beta;
+  }
+}
+
+@inline fn span(box: Nested*) -> float32 {
+  return box->head.x + box->tail.y + (float32)box->tag;
+}
+
+kernel record_nested(out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var box: Nested;
+    box.head.x = (float32)i;
+    box.head.y = 1.0;
+    box.tail.x = 2.0;
+    box.tail.y = 3.0;
+    box.tag = i;
+    out[i] = span(&box);
+  }
+}
+
+// A scalar local whose address is taken loses its register home and gets the
+// same per-thread storage a record does.
+@noinline fn accumulate(slot: float32*, value: float32) {
+  slot[0] = slot[0] + value;
+}
+
+kernel scalar_address(out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    var acc: float32 = 0.0;
+    var k: int32 = 0;
+    while (k < 4) {
+      accumulate(&acc, (float32)(k + i));
+      k = k + 1;
+    }
+    out[i] = acc;
+  }
+}

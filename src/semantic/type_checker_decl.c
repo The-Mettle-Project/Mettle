@@ -1,10 +1,10 @@
 // Type checker: struct / enum / declaration processing.
 #include "type_checker_internal.h"
 
-/* The current PTX/SPIR-V kernel ABI is intentionally explicit: kernel
- * parameters are POD scalars or pointers to POD scalars. Rejecting aggregates,
- * strings, closures, and nested pointers here produces a source diagnostic
- * instead of a late target-emitter failure or, worse, an ABI mismatch. */
+/* The kernel ABI is intentionally explicit: a parameter is a POD scalar, a
+ * pointer, or a record built from those. Rejecting strings, closures, and
+ * function pointers here produces a source diagnostic instead of a late
+ * target-emitter failure or, worse, an ABI mismatch. */
 static int gpu_kernel_scalar_type(const Type *type) {
   if (!type) {
     return 0;
@@ -130,15 +130,47 @@ static int layoutable_global_initializer(TypeChecker *checker,
   }
 }
 
-static int gpu_kernel_parameter_type(const Type *type) {
-  if (!type) {
+static int gpu_kernel_value_type(const Type *type, int depth);
+
+/* A record crosses the launch boundary as its own bytes, so every field has to
+ * mean the same thing on the device as it does on the host. Scalars, fixed
+ * arrays, pointers, and nested records do; a string, a closure, or a function
+ * pointer is a host address with no device meaning. The depth bound keeps a
+ * self-referential type from walking forever. */
+int type_checker_gpu_abi_type(const Type *type) {
+  return gpu_kernel_value_type(type, 0);
+}
+
+static int gpu_kernel_value_type(const Type *type, int depth) {
+  if (!type || depth > 8) {
     return 0;
   }
   if (gpu_kernel_scalar_type(type)) {
     return 1;
   }
-  return type->kind == TYPE_POINTER && type->base_type &&
-         gpu_kernel_scalar_type(type->base_type);
+  switch (type->kind) {
+  case TYPE_POINTER:
+    return type->base_type && gpu_kernel_value_type(type->base_type, depth + 1);
+  case TYPE_ARRAY:
+    return type->base_type && gpu_kernel_value_type(type->base_type, depth + 1);
+  case TYPE_STRUCT:
+    if (!type->field_count) {
+      return 0;
+    }
+    for (size_t i = 0; i < type->field_count; i++) {
+      if (!type->field_types ||
+          !gpu_kernel_value_type(type->field_types[i], depth + 1)) {
+        return 0;
+      }
+    }
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int gpu_kernel_parameter_type(const Type *type) {
+  return gpu_kernel_value_type(type, 0);
 }
 
 // Struct type processing functions
@@ -1454,7 +1486,7 @@ int type_checker_process_declaration(TypeChecker *checker,
           type_checker_set_error_at_location(
               checker, declaration->location,
               "GPU kernel '%s' parameter '%s' has unsupported ABI type '%s'; "
-              "use a scalar or a pointer to a scalar",
+              "use a scalar, a pointer, or a record built from those",
               func_decl->name, func_decl->parameter_names[i],
               param_types[i]->name ? param_types[i]->name : "unknown");
           free(param_types);

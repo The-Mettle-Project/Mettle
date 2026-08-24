@@ -353,6 +353,59 @@ cleanup:
   return ok;
 }
 
+/* Records across the whole device surface: a record kernel parameter marshalled
+ * as its own bytes, a record local, a runtime-indexed array of records, a
+ * by-value call taking and returning a record, a whole-record assignment, and a
+ * pointer to a record element handed to a device helper. The oracle recomputes
+ * the same chain in C against the same layout. */
+typedef struct {
+  int32_t count;
+  float alpha;
+  float beta;
+} RecParams;
+
+static int test_record_pipeline(Harness *h) {
+  enum { N = 1013 };
+  float *src = (float *)malloc(sizeof(float) * N);
+  float *out = (float *)malloc(sizeof(float) * N);
+  float *expected = (float *)malloc(sizeof(float) * N);
+  CUdeviceptr dsrc = 0, dout = 0;
+  RecParams parameters_record = {N, 0.5f, 3.25f};
+  void *parameters[] = {&dout, &dsrc, &parameters_record};
+  int ok = 0;
+  if (!src || !out || !expected) goto cleanup;
+  for (int i = 0; i < N; i++) {
+    src[i] = (float)((i % 17) - 8);
+    float scaled_lo = src[i] * parameters_record.alpha;
+    float scaled_hi = (float)i + parameters_record.alpha;
+    float picked_lo = scaled_lo + (float)(i % 4);
+    expected[i] = (scaled_hi - picked_lo) + parameters_record.beta;
+  }
+  if (!alloc_device(h, &dsrc, src, sizeof(float) * N) ||
+      !alloc_device(h, &dout, NULL, sizeof(float) * N) ||
+      !launch(h, "record_pipeline", (N + 127) / 128, 1, 1, 128, 1, 1,
+              parameters) ||
+      !copy_from_device(h, out, dout, sizeof(float) * N))
+    goto cleanup;
+  for (int i = 0; i < N; i++) {
+    if (out[i] != expected[i]) {
+      fprintf(stderr, "record_pipeline mismatch i=%d: got %.9g expected %.9g\n",
+              i, out[i], expected[i]);
+      goto cleanup;
+    }
+  }
+  ok = 1;
+cleanup:
+  free_device(h, &dsrc);
+  free_device(h, &dout);
+  free(src);
+  free(out);
+  free(expected);
+  printf("[%s] records: kernel parameter, locals, arrays, by-value calls\n",
+         ok ? "PASS" : "FAIL");
+  return ok;
+}
+
 static int test_row_norm(Harness *h) {
   enum { ROWS = 37, COLS = 19 };
   float *input = (float *)malloc(sizeof(float) * ROWS * COLS);
@@ -2632,7 +2685,7 @@ int main(int argc, char **argv) {
             "--tensor-transfer-only requires exactly one --tensor-transfer module and rejects ordinary extension modules\n");
     return 2;
   }
-  total = tensor_transfer_only ? 2 : 23;
+  total = tensor_transfer_only ? 2 : 24;
   if (!tensor_transfer_only && mxfp4_path) total += 6;
   if (!tensor_transfer_only && mxfp6_path) total += 3;
   if (tensor_transfer_path &&
@@ -2704,6 +2757,7 @@ int main(int argc, char **argv) {
     passed += test_index_3d(&h);
     passed += test_saxpy_odd(&h);
     passed += test_row_norm(&h);
+    passed += test_record_pipeline(&h);
     passed += test_staged_copy(&h);
     passed += test_async_stage_u32x4(&h);
     passed += test_auto_stage_u32(&h);

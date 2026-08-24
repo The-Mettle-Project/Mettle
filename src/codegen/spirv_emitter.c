@@ -567,6 +567,10 @@ typedef struct {
   char *name;
   SpvDesc d;
   uint32_t var_id; /* OpVariable (Function ptr to kind_type(d.kind)) */
+  /* Non-zero for a record local: `var_id` holds the address of a separate
+   * byte-array OpVariable of this size rather than a scalar value. */
+  uint32_t record_bytes;
+  uint32_t record_storage;
 } SpvBind;
 
 typedef struct {
@@ -599,9 +603,11 @@ static SpvBind *add_bind(SpvFn *fn, const char *name, SpvDesc d) {
     fn->binds = realloc(fn->binds, fn->capbinds * sizeof(SpvBind));
   }
   b = &fn->binds[fn->nbinds++];
+  /* realloc hands back uninitialized bytes, so every field is written here.
+   * A stale record size would conjure storage for a scalar. */
+  memset(b, 0, sizeof(*b));
   b->name = strdup(name);
   b->d = d;
-  b->var_id = 0;
   return b;
 }
 static void track_builtin(SpvFn *fn, int builtin, uint32_t var) {
@@ -664,6 +670,12 @@ static SpvDesc desc_from_type(const MtlcType *type) {
     v.is_ptr = 1;
     v.is_unsigned = 1;
     v.elem = type->base_type ? type->base_type->kind : MTLC_TYPE_VOID;
+    if (type->base_type &&
+        (type->base_type->kind == MTLC_TYPE_STRUCT ||
+         type->base_type->kind == MTLC_TYPE_ARRAY ||
+         type->base_type->kind == MTLC_TYPE_TAGGED_ENUM)) {
+      v.elem = MTLC_TYPE_VOID;
+    }
     v.address_space = type->address_space == MTLC_ADDRESS_SPACE_DEFAULT
                           ? MTLC_ADDRESS_SPACE_GLOBAL
                           : type->address_space;
@@ -672,6 +684,24 @@ static SpvDesc desc_from_type(const MtlcType *type) {
     v.is_unsigned = kind_is_unsigned(type->kind);
     v.elem = MTLC_TYPE_VOID;
   }
+  return v;
+}
+
+/* A record has no scalar form here either: it lives in a Function-storage byte
+ * array and every access goes through its address. */
+static int spv_type_is_aggregate(const MtlcType *type) {
+  return type && (type->kind == MTLC_TYPE_STRUCT ||
+                  type->kind == MTLC_TYPE_ARRAY ||
+                  type->kind == MTLC_TYPE_TAGGED_ENUM);
+}
+
+static SpvDesc spv_record_desc(void) {
+  SpvDesc v = {0};
+  v.kind = MTLC_TYPE_POINTER;
+  v.is_ptr = 1;
+  v.is_unsigned = 1;
+  v.elem = MTLC_TYPE_VOID;
+  v.address_space = MTLC_ADDRESS_SPACE_PRIVATE;
   return v;
 }
 
@@ -2120,10 +2150,29 @@ static void emit_body_instr(SpvFn *fn, const IRInstruction *in) {
   case IR_OP_CALL:
     emit_call(fn, in);
     break;
-  case IR_OP_ADDRESS_OF:
-    mod_error(fn->m,
-              "SPIR-V: address-of (&local) not supported in device functions yet");
+  case IR_OP_ADDRESS_OF: {
+    SpvBind *home = (in->lhs.kind == IR_OPERAND_SYMBOL ||
+                     in->lhs.kind == IR_OPERAND_TEMP)
+                        ? find_bind(fn, in->lhs.name)
+                        : NULL;
+    if (!home || !in->dest.name) {
+      mod_error(fn->m, "SPIR-V: cannot take the address of '%s' in device code",
+                in->lhs.name ? in->lhs.name : "?");
+      break;
+    }
+    if (home->record_bytes) {
+      /* A record binding already holds its own address. */
+      store_name(fn, in->dest.name, materialize(fn, &in->lhs, MTLC_TYPE_UINT64));
+      break;
+    }
+    /* A scalar local is its own Function-storage variable, so its address is
+     * that variable read as an integer, and writes through it alias the name. */
+    uint32_t as_integer = new_id(fn->m);
+    emitv(&fn->m->functions, Op_ConvertPtrToU, 3, type_int(fn->m, 64),
+          as_integer, home->var_id);
+    store_name(fn, in->dest.name, as_integer);
     break;
+  }
   default:
     mod_error(fn->m, "SPIR-V: unsupported IR opcode %d in device function",
               in->op);
@@ -2209,6 +2258,18 @@ static void register_values(SpvFn *fn, IRFunction *func) {
     if (in->op == IR_OP_DECLARE_LOCAL ||
         in->op == IR_OP_ADDRESS_SPACE_ALLOC) {
       if (in->dest.name && !find_bind(fn, in->dest.name)) {
+        if (in->op == IR_OP_DECLARE_LOCAL &&
+            spv_type_is_aggregate(in->value_type)) {
+          size_t bytes = mtlc_type_size(in->value_type);
+          SpvBind *record = add_bind(fn, in->dest.name, spv_record_desc());
+          if (record && bytes && bytes <= UINT32_MAX) {
+            record->record_bytes = (uint32_t)bytes;
+          } else {
+            mod_error(fn->m, "SPIR-V: local '%s' has an unsupported record type",
+                      in->dest.name);
+          }
+          continue;
+        }
         add_bind(fn, in->dest.name,
                  in->value_type ? desc_from_type(in->value_type)
                                 : desc_from_typename(in->text));
@@ -2227,6 +2288,16 @@ static void register_values(SpvFn *fn, IRFunction *func) {
         add_bind(fn, in->dest.name, result_desc(fn, in));
       }
       break;
+    case IR_OP_ADDRESS_OF: {
+      if (find_bind(fn, in->dest.name)) break;
+      SpvBind *home = in->lhs.name ? find_bind(fn, in->lhs.name) : NULL;
+      SpvDesc d = spv_record_desc();
+      if (home && !home->record_bytes) {
+        d.elem = home->d.kind;
+      }
+      add_bind(fn, in->dest.name, d);
+      break;
+    }
     default:
       break;
     }
@@ -2256,6 +2327,28 @@ static uint32_t emit_device_function(SpvMod *m, IRFunction *func,
     mod_error(m, "SPIR-V: kernel '%s' must return void",
               func->name ? func->name : "?");
     return 0;
+  }
+  if (spv_type_is_aggregate(return_type)) {
+    mod_error(m,
+              "SPIR-V OpenCL 2.0 profile has no by-value record call ABI; "
+              "'%s' returns a record, so pass it through a pointer parameter",
+              func->name ? func->name : "?");
+    return 0;
+  }
+  for (size_t p = 0; p < func->parameter_count; p++) {
+    const MtlcType *pt = function_symbol &&
+                                 function_symbol->kind == IR_MODSYM_FUNCTION &&
+                                 p < function_symbol->param_count
+                             ? function_symbol->param_types[p]
+                             : NULL;
+    if (spv_type_is_aggregate(pt)) {
+      mod_error(m,
+                "SPIR-V OpenCL 2.0 profile has no by-value record parameter "
+                "ABI; parameter %zu of '%s' is a record, so pass a pointer to "
+                "it instead",
+                p, func->name ? func->name : "?");
+      return 0;
+    }
   }
 
   /* ---- build basic blocks from the label/branch stream ---- */
@@ -2412,6 +2505,20 @@ static uint32_t emit_device_function(SpvMod *m, IRFunction *func,
     b->var_id = new_id(m);
     emitv(&m->functions, Op_Variable, 3, pt, b->var_id, (unsigned)SC_Function);
   }
+  /* Record locals need storage as well as a home for its address. Both are
+   * Function-storage variables, so both must precede any executable
+   * instruction in the entry block. */
+  for (size_t i = 0; i < fn.nbinds; i++) {
+    SpvBind *b = &fn.binds[i];
+    if (!b->record_bytes) continue;
+    uint32_t bytes_type = kind_type(m, MTLC_TYPE_UINT8);
+    uint32_t array_type = type_array(m, bytes_type, b->record_bytes);
+    uint32_t pointer_type = type_pointer(m, SC_Function, array_type);
+    uint32_t storage = new_id(m);
+    emitv(&m->functions, Op_Variable, 3, pointer_type, storage,
+          (unsigned)SC_Function);
+    b->record_storage = storage;
+  }
   /* Declare every static allocation before emitting entry-block executable
    * instructions. Workgroup variables live at module scope; private variables
    * use Function storage and must be the first instructions in the entry
@@ -2490,6 +2597,14 @@ static uint32_t emit_device_function(SpvMod *m, IRFunction *func,
     emitv(&m->functions, Op_Store, 2, binding->var_id, as_integer);
   }
   free(allocation_variables);
+  for (size_t i = 0; i < fn.nbinds && !m->error; i++) {
+    SpvBind *b = &fn.binds[i];
+    if (!b->record_storage) continue;
+    uint32_t as_integer = new_id(m);
+    emitv(&m->functions, Op_ConvertPtrToU, 3, type_int(m, 64), as_integer,
+          b->record_storage);
+    emitv(&m->functions, Op_Store, 2, b->var_id, as_integer);
+  }
   /* store incoming parameters into their shadow variables */
   for (size_t p = 0; p < func->parameter_count; p++) {
     if (!func->parameter_names || !func->parameter_names[p]) continue;
