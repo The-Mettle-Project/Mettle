@@ -2172,6 +2172,7 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
       size_t exit_count = 0;
       int header_exit = -1;
       int viable = 1;
+      int strong = 1;
       int is_float = 0;
       int float_bits = 0;
       int is_unsigned = 0;
@@ -2206,14 +2207,18 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
               a.offset != region.offset || asize != size ||
               ins->is_float != (load_count || store_count ? is_float
                                                           : ins->is_float)) {
+            if (ins->op == IR_OP_LOAD) {
+              strong = 0;
+              continue;
+            }
             viable = 0;
             break;
           }
           if (ins->op == IR_OP_LOAD) {
             if (ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name ||
                 load_count >= RE_PROMOTE_MAX_SITES) {
-              viable = 0;
-              break;
+              strong = 0;
+              continue;
             }
             loads[load_count++] = i;
           } else {
@@ -2286,14 +2291,16 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
         }
       }
       if (getenv("METTLE_PROM_TRACE")) {
-        fprintf(stderr, "[prom]   viable=%d loads=%zu stores=%zu exits=%zu float=%d\n",
-                viable, load_count, store_count, exit_count, is_float);
+        fprintf(stderr, "[prom]   viable=%d strong=%d loads=%zu stores=%zu exits=%zu float=%d\n",
+                viable, strong, load_count, store_count, exit_count, is_float);
       }
       /* One load and one store per iteration already pay: the load leaves
        * the loop entirely and the store becomes a register move. */
-      if (!viable || store_count == 0 || load_count == 0 || exit_count == 0 ||
-          is_float) {
+      if (!viable || store_count == 0 || load_count == 0 || is_float) {
         continue; /* float promotion left for later; int is the parser case */
+      }
+      if (exit_count == 0) {
+        strong = 0;
       }
       (void)header_exit;
       {
@@ -2307,9 +2314,9 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
             (function->instructions[last - 1].op != IR_OP_RETURN &&
              function->instructions[last - 1].op != IR_OP_JUMP)) {
       if (getenv("METTLE_PROM_TRACE")) {
-        fprintf(stderr, "[prom]   bail: no-terminator\n");
+        fprintf(stderr, "[prom]   no-terminator: weak only\n");
       }
-          continue;
+          strong = 0;
         }
       }
 
@@ -2435,14 +2442,36 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
         ld->float_bits = keep_float_bits;
         ld->value_type = keep_type;
       }
-      for (size_t k = 0; k < store_count; k++) {
-        IRInstruction *st = &function->instructions[stores[k]];
-        IROperand value = ir_operand_copy(&st->lhs);
-        ir_instruction_destroy_storage(st);
-        memset(st, 0, sizeof(*st));
-        st->op = IR_OP_ASSIGN;
-        st->dest = ir_operand_symbol(local_name);
-        st->lhs = value;
+      if (strong) {
+        for (size_t k = 0; k < store_count; k++) {
+          IRInstruction *st = &function->instructions[stores[k]];
+          IROperand value = ir_operand_copy(&st->lhs);
+          ir_instruction_destroy_storage(st);
+          memset(st, 0, sizeof(*st));
+          st->op = IR_OP_ASSIGN;
+          st->dest = ir_operand_symbol(local_name);
+          st->lhs = value;
+        }
+      } else {
+        for (size_t k = 0; k < store_count; k++) {
+          IRInstruction upd = {0};
+          upd.op = IR_OP_ASSIGN;
+          upd.dest = ir_operand_symbol(local_name);
+          upd.lhs = ir_operand_copy(&function->instructions[stores[k]].lhs);
+          upd.location = function->instructions[stores[k]].location;
+          if (!ir_function_insert_instruction(function, stores[k] + 1, &upd)) {
+            ir_instruction_destroy_storage(&upd);
+            return 0;
+          }
+          ir_instruction_destroy_storage(&upd);
+          for (size_t m = k + 1; m < store_count; m++) {
+            stores[m]++;
+          }
+        }
+        if (changed) {
+          *changed = 1;
+        }
+        return 1;
       }
 
       /* Store-backs. Returns take theirs inline; branch exits are split: the
