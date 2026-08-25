@@ -162,6 +162,8 @@ static const IROptNamedPass g_ir_lowering_cleanup[] = {
     {"or_chain_bitset", ir_or_chain_to_bitset_pass,
      {IR_OPT_FEATURE_BRANCH_EQ | IR_OPT_FEATURE_BRANCH_ZERO,
       IR_OPT_REQUIRE_NONE}},
+    {"float_pow2_reciprocal", ir_float_divide_by_power_of_two_pass,
+     {IR_OPT_FEATURE_DIV, IR_OPT_REQUIRE_NONE}},
     {"redundancy_elim", ir_redundancy_elimination_pass,
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
     {"redundancy_copy_prop", ir_copy_and_constant_propagation_pass, {0, 0}},

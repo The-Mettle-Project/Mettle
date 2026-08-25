@@ -1708,6 +1708,54 @@ static int ir_simplify_branch(IRInstruction *instruction, int *changed) {
   return 1;
 }
 
+static int ir_float_pow2_reciprocal(const IROperand *operand, double *out) {
+  unsigned long long bits = 0;
+  double value = operand->float_value;
+  int exponent;
+  memcpy(&bits, &value, sizeof(bits));
+  if ((bits & 0x000FFFFFFFFFFFFFULL) != 0ULL) {
+    return 0;
+  }
+  exponent = (int)((bits >> 52) & 0x7FFULL);
+  if (operand->float_bits == 32) {
+    if (exponent < 923 || exponent > 1123) {
+      return 0;
+    }
+  } else if (exponent < 1 || exponent > 2045) {
+    return 0;
+  }
+  *out = 1.0 / value;
+  return 1;
+}
+
+int ir_float_divide_by_power_of_two_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+    double reciprocal = 0.0;
+    char *product;
+    if (instruction->op != IR_OP_BINARY || !instruction->is_float ||
+        !instruction->text || strcmp(instruction->text, "/") != 0 ||
+        instruction->rhs.kind != IR_OPERAND_FLOAT ||
+        !ir_float_pow2_reciprocal(&instruction->rhs, &reciprocal)) {
+      continue;
+    }
+    product = mettle_strdup("*");
+    if (!product) {
+      return 0;
+    }
+    free(instruction->text);
+    instruction->text = product;
+    instruction->rhs.float_value = reciprocal;
+    if (changed) {
+      *changed = 1;
+    }
+  }
+  return 1;
+}
+
 int ir_constant_and_branch_simplify_pass(IRFunction *function,
                                                 int *changed) {
   if (!function) {
