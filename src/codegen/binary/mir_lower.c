@@ -919,6 +919,12 @@ static void mir_call_trace(const char *sub) {
   }
 }
 
+static void mir_call_trace_named(const char *sub, const char *name) {
+  if (mir_env_trace()) {
+    fprintf(stderr, "MIR-CALLBAIL\t%s\t%s\n", sub, name ? name : "?");
+  }
+}
+
 /* The runtime abort traps the compiler injects for failed safety checks
  * (bounds, overflow, null, ...). They never return (puts+exit / handler abort),
  * so MIR can lower them as a self-contained terminal sequence. */
@@ -1212,7 +1218,7 @@ static int mir_call_is_supported(CodeGenerator *g,
   const CgSym *callee =
       g->ir_program ? code_generator_lookup_symbol(g, in->text) : NULL;
   if (!callee || callee->kind != CG_SYM_FUNCTION) {
-    mir_call_trace("not_known_function");
+    mir_call_trace_named("not_known_function", in->text);
     return 0;
   }
   MtlcType *ret = callee->data.function.return_type
@@ -2727,6 +2733,37 @@ static int mir_ir_function_may_write_global(CodeGenerator *g,
     }
   }
   return 0;
+}
+
+static int mir_operand_names_temp(const IROperand *op, const char *name) {
+  return op->kind == IR_OPERAND_TEMP && op->name && strcmp(op->name, name) == 0;
+}
+
+static int mir_address_only_feeds_calls(const IRFunction *irf,
+                                        const IRInstruction *take) {
+  const char *temp;
+  if (take->dest.kind != IR_OPERAND_TEMP || !take->dest.name) {
+    return 0;
+  }
+  temp = take->dest.name;
+  for (size_t j = 0; j < irf->instruction_count; j++) {
+    const IRInstruction *u = &irf->instructions[j];
+    int is_call = u->op == IR_OP_CALL || u->op == IR_OP_CALL_INDIRECT;
+    if (u == take) {
+      continue;
+    }
+    if (mir_operand_names_temp(&u->dest, temp) ||
+        mir_operand_names_temp(&u->lhs, temp) ||
+        mir_operand_names_temp(&u->rhs, temp)) {
+      return 0;
+    }
+    for (size_t a = 0; a < u->argument_count; a++) {
+      if (mir_operand_names_temp(&u->arguments[a], temp) && !is_call) {
+        return 0;
+      }
+    }
+  }
+  return 1;
 }
 
 static int mir_call_may_write_globals(CodeGenerator *g, const IRFunction *irf,
@@ -5993,6 +6030,26 @@ static int mir_op_low32_is_self_contained(MirOpcode op) {
  *
  * Only MOVZX qualifies. MOVSX asks for sign extension, which a 32-bit operation
  * does not perform. */
+static void mir_canonicalize_commutative(MirFunction *fn) {
+  if (!fn) {
+    return;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirInst *in = &fn->insns[i];
+    int commutative = in->op == MIR_ADD || in->op == MIR_IMUL ||
+                      in->op == MIR_AND || in->op == MIR_OR ||
+                      in->op == MIR_XOR;
+    if (!commutative || in->is_float) {
+      continue;
+    }
+    if (in->a.kind == MIR_OPK_IMM && in->b.kind != MIR_OPK_IMM) {
+      MirOperand swap = in->a;
+      in->a = in->b;
+      in->b = swap;
+    }
+  }
+}
+
 static void mir_narrow_zero_extended_ops(MirFunction *fn) {
   if (!fn) {
     return;
@@ -8290,6 +8347,9 @@ int code_generator_binary_emit_function_via_mir(
         !mir_name_map_has(&map, in->lhs.name)) {
       continue;
     }
+    if (mir_address_only_feeds_calls(ir_function, in)) {
+      continue;
+    }
     int present = 0;
     for (size_t j = 0; j < wb.at_count; j++) {
       if (strcmp(wb.at[j], in->lhs.name) == 0) {
@@ -8535,6 +8595,7 @@ int code_generator_binary_emit_function_via_mir(
 
   mir_fuse_mov_then_extend(&fn);
   mir_drop_dead_extensions(&fn);
+  mir_canonicalize_commutative(&fn);
   mir_narrow_zero_extended_ops(&fn);
   mir_fold_address_offsets(&fn);
   mir_cse_loads(&fn);

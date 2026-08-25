@@ -130,6 +130,27 @@ static int ir_pass_aggregate_argument_by_address(IRLoweringContext *context,
   return 1;
 }
 
+static void ir_declare_interpolation_helper(IRLoweringContext *context,
+                                            const char *name) {
+  IRModuleSymbol entry = {0};
+  MtlcType *params[1];
+  if (!context || !context->program || !name || !context->type_checker) {
+    return;
+  }
+  if (ir_program_lookup_symbol(context->program, name)) {
+    return;
+  }
+  params[0] = mtlc_type_from_frontend(context->type_checker->builtin_int64);
+  entry.name = (char *)name;
+  entry.kind = IR_MODSYM_FUNCTION;
+  entry.is_extern = 1;
+  entry.type = mtlc_type_from_frontend(context->type_checker->builtin_string);
+  entry.return_type = entry.type;
+  entry.param_types = params;
+  entry.param_count = 1;
+  ir_program_add_symbol(context->program, &entry);
+}
+
 int ir_lower_call_expression(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *expression,
                                     IROperand *out_value) {
@@ -326,6 +347,8 @@ int ir_lower_call_expression(IRLoweringContext *context,
     /* mettle_string_from_f64 takes the value's raw bits in a GP register (the
      * symbol-less call has no parameter types for float routing), so a float64
      * operand passes through untagged. */
+
+    ir_declare_interpolation_helper(context, helper);
 
     IROperand converted = ir_operand_none();
     if (!ir_make_temp_operand(context, &converted)) {

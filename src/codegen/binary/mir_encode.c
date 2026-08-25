@@ -2238,6 +2238,34 @@ static int mir_mem_operand_in_registers(const MirFunction *fn,
   return 1;
 }
 
+static int mir_mask_test_fusable(const MirFunction *fn, size_t i) {
+  const MirInst *and_op;
+  const MirInst *cmp;
+  const MirVreg *masked;
+  if (i + 1 >= fn->insn_count) {
+    return 0;
+  }
+  and_op = &fn->insns[i];
+  cmp = &fn->insns[i + 1];
+  if (and_op->op != MIR_AND || and_op->is_float ||
+      and_op->dst.kind != MIR_OPK_VREG || and_op->a.kind != MIR_OPK_VREG ||
+      and_op->b.kind != MIR_OPK_IMM || and_op->b.imm < 0 ||
+      and_op->b.imm > 2147483647LL) {
+    return 0;
+  }
+  if (cmp->op != MIR_CMPBR || cmp->is_float ||
+      (cmp->cc != 0x84 && cmp->cc != 0x85) || cmp->a.kind != MIR_OPK_VREG ||
+      cmp->a.vreg != and_op->dst.vreg || cmp->b.kind != MIR_OPK_IMM ||
+      cmp->b.imm != 0) {
+    return 0;
+  }
+  masked = &fn->vregs[and_op->dst.vreg];
+  if (!masked->in_register || masked->live_end != (int)(i + 1)) {
+    return 0;
+  }
+  return fn->vregs[and_op->a.vreg].in_register;
+}
+
 static int mir_byte_compare_fusable(const MirFunction *fn, size_t i) {
   const MirInst *load;
   const MirInst *cmp;
@@ -2303,6 +2331,7 @@ int mir_encode(MirFunction *fn) {
   } pending_tables[MIR_MAX_JUMP_TABLES];
   size_t pending_table_count = 0;
   size_t fused_byte_load = (size_t)-1;
+  size_t fused_mask_test = (size_t)-1;
 
   if (!mir_layout_frame(fn) || !mir_emit_prologue(fn)) {
     return 0;
@@ -2377,6 +2406,10 @@ int mir_encode(MirFunction *fn) {
     case MIR_AND:
     case MIR_OR:
     case MIR_XOR:
+      if (in->op == MIR_AND && mir_mask_test_fusable(fn, i)) {
+        fused_mask_test = i;
+        break;
+      }
       ok = encode_alu(fn, in);
       break;
     case MIR_IMUL:
@@ -3122,7 +3155,16 @@ int mir_encode(MirFunction *fn) {
         ok = 0;
         break;
       }
-      if (fused_byte_load != (size_t)-1 && fused_byte_load + 1 == i) {
+      if (fused_mask_test != (size_t)-1 && fused_mask_test + 1 == i) {
+        const MirInst *and_op = &fn->insns[i - 1];
+        BinaryGpRegister src =
+            (BinaryGpRegister)fn->vregs[and_op->a.vreg].phys;
+        if (!binary_emit_test_reg_imm32(&ctx->code, src,
+                                        (uint32_t)and_op->b.imm)) {
+          ok = enc_err(fn, "out of memory in fused mask test");
+          break;
+        }
+      } else if (fused_byte_load != (size_t)-1 && fused_byte_load + 1 == i) {
         const MirMem *m = &fn->insns[i - 1].a.mem;
         BinaryGpRegister mb = (BinaryGpRegister)fn->vregs[m->base].phys;
         int need_rex = (areg >= 4 && areg <= 7);

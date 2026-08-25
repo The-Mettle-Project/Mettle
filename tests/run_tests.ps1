@@ -6889,6 +6889,42 @@ catch {
   Write-CaseResult -Name "mir_global_aggregate_addr_coverage" -Passed $false -Reason $_.Exception.Message
 }
 
+# `"{x}"` lowers to a synthesized call to mettle_string_from_int. With no module
+# symbol declaring it, the gate reads it as an unknown callee and drops the WHOLE
+# enclosing function to the fallback emitter -- a hot loop that happens to print
+# a number ran 2.4x slower for it.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $exePath = Join-Path $tmpDir "test_mir_interpolation_coverage.exe"
+  $env:METTLE_MIR_TRACE = "1"
+  try {
+    $coverOut = & $CompilerPath "--build" "--emit-obj" "--linker" "internal" "--release" `
+      "tests/test_mir_interpolation_coverage.mettle" "-o" $exePath 2>&1 | Out-String
+  }
+  finally {
+    Remove-Item Env:\METTLE_MIR_TRACE -ErrorAction SilentlyContinue
+  }
+  if ($LASTEXITCODE -ne 0) {
+    throw "mir-interpolation coverage build failed: $coverOut"
+  }
+  if ($coverOut -notmatch 'MIR-(OK|BAIL)') {
+    throw "no MIR gate trace; METTLE_MIR_TRACE stopped reporting"
+  }
+  if ($coverOut -notmatch 'MIR-OK\s+hot_with_interpolation') {
+    throw "the gate declined hot_with_interpolation; interpolating a number stopped being register-allocatable"
+  }
+  & $exePath | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "mir-interpolation coverage program returned $LASTEXITCODE"
+  }
+  Write-CaseResult -Name "mir_interpolation_coverage" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "mir_interpolation_coverage" -Passed $false -Reason $_.Exception.Message
+}
+
 # MIR inline float32 affine-map passthrough: IR_OP_SIMD_AFFINE_MAP_F32 (the
 # float-copy / saxpy / `a*x+c` class) runs through the register-allocating
 # backend with its compile-time coefficients baked into the kernel broadcasts,
@@ -8442,7 +8478,7 @@ try {
     'shl\s+\$0x2,%\w+',
     '(?s)<scale_by_eight>.*shl\s+\$0x3,%\w+',
     '(?s)<zero_const>.*mov\s+\$0x0,',
-    '(?s)<even_branch>.*and\s+\$0x1,%\w+.*j(?:e|ne)',
+    '(?s)<even_branch>.*(?:and|test)\s+\$0x1,%\w+.*j(?:e|ne)',
     '(?s)<fused_mul_add>.*imul\s+%\w+,%\w+.*add\s+\$0x5,'
   )
   foreach ($pattern in $requiredPatterns) {

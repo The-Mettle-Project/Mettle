@@ -1,0 +1,29 @@
+import "std/io";
+import "std/mem";
+
+fn hot_with_interpolation(a: int32*, n: int32) -> int64 {
+  var s: int64 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    s = s + (int64)a[i] * (int64)(i + 1);
+    i += 1;
+  }
+  println("{s}");
+  return s;
+}
+
+fn main() -> int32 {
+  var n: int32 = 8;
+  var buf: int32* = malloc((int64)n * 4);
+  var i: int32 = 0;
+  while (i < n) {
+    buf[i] = i + 1;
+    i += 1;
+  }
+  var total: int64 = hot_with_interpolation(buf, n);
+  free(buf);
+  if (total == 204) {
+    return 0;
+  }
+  return 1;
+}
