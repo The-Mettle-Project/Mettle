@@ -1169,6 +1169,82 @@ static int mir_narrowing_avoid_reg(const MirFunction *fn, const MirVregId *map,
   return sv->in_register ? (int)sv->phys : -1;
 }
 
+#define MIR_MAX_WEIGHTED_DEPTH 3
+#define MIR_MAX_SPILL_COST (1 << 24)
+
+static unsigned char *mir_build_loop_depths(const MirFunction *fn) {
+  MirBackEdge *edges = NULL;
+  size_t edge_count = 0;
+  unsigned char *depth;
+  if (fn->insn_count == 0) {
+    return NULL;
+  }
+  depth = (unsigned char *)calloc(fn->insn_count, sizeof(*depth));
+  if (!depth) {
+    return NULL;
+  }
+  if (!mir_collect_back_edges(fn, &edges, &edge_count) || edge_count == 0) {
+    free(edges);
+    return depth;
+  }
+  for (size_t e = 0; e < edge_count; e++) {
+    int l = edges[e].l;
+    int b = edges[e].b;
+    int seen = 0;
+    if (l < 0 || b < l || (size_t)b >= fn->insn_count) {
+      continue;
+    }
+    for (size_t k = 0; k < e; k++) {
+      if (edges[k].l == l) {
+        seen = 1;
+        break;
+      }
+    }
+    if (seen) {
+      continue;
+    }
+    for (size_t k = e + 1; k < edge_count; k++) {
+      if (edges[k].l == l && edges[k].b > b && (size_t)edges[k].b < fn->insn_count) {
+        b = edges[k].b;
+      }
+    }
+    for (int i = l; i <= b; i++) {
+      if (depth[i] < MIR_MAX_WEIGHTED_DEPTH) {
+        depth[i]++;
+      }
+    }
+  }
+  free(edges);
+  return depth;
+}
+
+static int mir_scale_cost(int cost, int factor) {
+  long long scaled = (long long)cost * factor;
+  return scaled > MIR_MAX_SPILL_COST ? MIR_MAX_SPILL_COST : (int)scaled;
+}
+
+static void mir_note_operand_depth(const MirOperand *op, unsigned char depth,
+                                   unsigned char *use_depth, size_t n) {
+  MirVregId ids[2] = {MIR_VREG_NONE, MIR_VREG_NONE};
+  if (op->kind == MIR_OPK_VREG) {
+    ids[0] = op->vreg;
+  } else if (op->kind == MIR_OPK_MEM) {
+    ids[0] = op->mem.base;
+    ids[1] = op->mem.index;
+  }
+  for (int j = 0; j < 2; j++) {
+    if (ids[j] >= 0 && (size_t)ids[j] < n && use_depth[ids[j]] < depth) {
+      use_depth[ids[j]] = depth;
+    }
+  }
+}
+
+static int mir_spill_rank(const MirFunction *fn, const unsigned char *use_depth,
+                          MirVregId v) {
+  (void)fn;
+  return (int)use_depth[v];
+}
+
 static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool,
                            size_t gp_leaf_n,
                            const BinaryGpRegister *gp_cross_pool,
@@ -1235,12 +1311,27 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     reg_count[v] = __builtin_popcount(mask[v]);
     cost[v] = 1;
   }
+  unsigned char *loop_depth = mir_build_loop_depths(fn);
+  unsigned char *use_depth = (unsigned char *)calloc(N, sizeof(*use_depth));
+  if (!use_depth) {
+    free(loop_depth);
+    free(inter); free(mask); free(degree); free(cost); free(colorable);
+    free(removed); free(reg_count); free(metric); free(stack);
+    free(narrow_src);
+    return 0;
+  }
   for (size_t i = 0; i < fn->insn_count; i++) {
     const MirInst *in = &fn->insns[i];
     const MirOperand *ops[3] = {&in->dst, &in->a, &in->b};
+    unsigned char d = loop_depth ? loop_depth[i] : 0;
+    int weight = 1;
+    for (int k = 0; k < d; k++) {
+      weight *= 10;
+    }
     for (int k = 0; k < 3; k++) {
       const MirOperand *op = ops[k];
       MirVregId ids[2] = {MIR_VREG_NONE, MIR_VREG_NONE};
+      mir_note_operand_depth(op, d, use_depth, N);
       if (op->kind == MIR_OPK_VREG) {
         ids[0] = op->vreg;
       } else if (op->kind == MIR_OPK_MEM) {
@@ -1250,26 +1341,22 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
       for (int j = 0; j < 2; j++) {
         MirVregId id = ids[j];
         if (id >= 0 && (size_t)id < N && colorable[id]) {
-          cost[id]++;
+          cost[id] = mir_scale_cost(cost[id] + weight, 1);
         }
       }
     }
   }
-  for (size_t v = 0; v < N; v++) {
-    if (colorable[v] && fn->vregs[v].loop_carried) {
-      cost[v] *= 8; /* a loop-carried value is touched every iteration */
-    }
-  }
+  free(loop_depth);
   for (size_t i = 0; i < fn->iconst_count; i++) {
     MirVregId v = fn->iconsts[i].vreg;
     if (v >= 0 && (size_t)v < N && colorable[v]) {
-      cost[v] *= 64; /* spilling a pooled movabs constant reloads every trip */
+      cost[v] = mir_scale_cost(cost[v], 64);
     }
   }
   for (size_t i = 0; i < fn->fconst_count; i++) {
     MirVregId v = fn->fconsts[i].vreg;
     if (v >= 0 && (size_t)v < N && colorable[v]) {
-      cost[v] *= 32;
+      cost[v] = mir_scale_cost(cost[v], 32);
     }
   }
   for (size_t i = 0; i < fn->insn_count; i++) {
@@ -1277,7 +1364,7 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     if (in->op == MIR_LEA_FUNC && in->dst.kind == MIR_OPK_VREG) {
       MirVregId v = in->dst.vreg;
       if (v >= 0 && (size_t)v < N && colorable[v]) {
-        cost[v] *= 128; /* loop-invariant indirect-call targets are hot reloads */
+        cost[v] = mir_scale_cost(cost[v], 128);
       }
     }
   }
@@ -1343,51 +1430,45 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
   while (remaining > 0) {
     MirVregId pick = MIR_VREG_NONE;
     long long best_simplify = -1;
-    int best_simplify_lc = 1;
+    int best_simplify_rank = MIR_MAX_WEIGHTED_DEPTH + 1;
     for (size_t v = 0; v < N; v++) {
-      if (colorable[v] && !removed[v]) {
-        if (degree[v] < reg_count[v]) {
-          int lc = fn->vregs[v].loop_carried ? 1 : 0;
-          int better;
-          if (pick == MIR_VREG_NONE) {
-            better = 1;
-          } else if (lc != best_simplify_lc) {
-            better = (lc < best_simplify_lc);
-          } else {
-            better = (metric[v] < best_simplify);
-          }
-          if (better) {
-            best_simplify = metric[v];
-            best_simplify_lc = lc;
-            pick = (MirVregId)v;
-          }
+      if (colorable[v] && !removed[v] && degree[v] < reg_count[v]) {
+        int rank = mir_spill_rank(fn, use_depth, (MirVregId)v);
+        int better;
+        if (pick == MIR_VREG_NONE) {
+          better = 1;
+        } else if (rank != best_simplify_rank) {
+          better = (rank < best_simplify_rank);
+        } else {
+          better = (metric[v] < best_simplify);
+        }
+        if (better) {
+          best_simplify = metric[v];
+          best_simplify_rank = rank;
+          pick = (MirVregId)v;
         }
       }
     }
     if (pick == MIR_VREG_NONE) {
-      /* Spill candidate: prefer a NON-loop-carried node (a loop-carried base
-       * pointer / accumulator / induction var is reused every iteration, so
-       * spilling it reloads it each pass -- exactly backwards); within the same
-       * loop-carried class, minimise cost/(degree+1) (favour cheap to spill,
-       * high relief). */
       long long best = -1;
-      int best_lc = 1;
+      int best_rank = MIR_MAX_WEIGHTED_DEPTH + 1;
       for (size_t v = 0; v < N; v++) {
+        int rank;
+        int better;
         if (!colorable[v] || removed[v]) {
           continue;
         }
-        int lc = fn->vregs[v].loop_carried ? 1 : 0;
-        int better;
+        rank = mir_spill_rank(fn, use_depth, (MirVregId)v);
         if (pick == MIR_VREG_NONE) {
           better = 1;
-        } else if (lc != best_lc) {
-          better = (lc < best_lc); /* non-loop-carried first */
+        } else if (rank != best_rank) {
+          better = (rank < best_rank);
         } else {
           better = (metric[v] < best);
         }
         if (better) {
           best = metric[v];
-          best_lc = lc;
+          best_rank = rank;
           pick = (MirVregId)v;
         }
       }
@@ -1511,7 +1592,7 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
 #undef MIR_INTER_GET
   free(inter); free(mask); free(degree); free(cost); free(colorable);
   free(removed); free(reg_count); free(metric); free(stack);
-  free(narrow_src);
+  free(narrow_src); free(use_depth);
   return 1;
 }
 
