@@ -2237,19 +2237,225 @@ static int ir_instruction_references_label(const IRInstruction *instruction,
   return strcmp(instruction->text, label) == 0;
 }
 
-static int ir_label_is_referenced(const IRFunction *function,
-                                  const char *label) {
-  if (!function || !label) {
+static int ir_label_only_referenced_by(const IRFunction *function,
+                                       const char *label,
+                                       size_t expected_index) {
+  int found = 0;
+  if (!function || !label || expected_index >= function->instruction_count) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (!ir_instruction_references_label(&function->instructions[i], label)) {
+      continue;
+    }
+    if (i != expected_index) {
+      return 0;
+    }
+    found = 1;
+  }
+  return found;
+}
+
+static int ir_ascii_range_compare(const IRInstruction *instruction,
+                                  const char *op, long long bound,
+                                  const IROperand *value) {
+  return instruction && instruction->op == IR_OP_BINARY &&
+         !instruction->is_float && !instruction->is_unsigned &&
+         instruction->text && strcmp(instruction->text, op) == 0 &&
+         instruction->dest.kind == IR_OPERAND_TEMP &&
+         instruction->dest.name && instruction->rhs.kind == IR_OPERAND_INT &&
+         instruction->rhs.int_value == bound &&
+         ir_bitset_same_operand(&instruction->lhs, value);
+}
+
+static int ir_ascii_range_branch(const IRInstruction *branch,
+                                 const IRInstruction *compare) {
+  return branch && compare && branch->op == IR_OP_BRANCH_ZERO &&
+         branch->text && branch->lhs.kind == IR_OPERAND_TEMP &&
+         branch->lhs.name && compare->dest.kind == IR_OPERAND_TEMP &&
+         compare->dest.name &&
+         strcmp(branch->lhs.name, compare->dest.name) == 0;
+}
+
+static int ir_ascii_next(const IRFunction *function, size_t after,
+                         size_t *index) {
+  return after < function->instruction_count &&
+         ir_find_next_non_nop(function, after, index);
+}
+
+static int ir_ascii_casefold_rewrite(IRFunction *function,
+                                     const size_t index[14], int *changed) {
+  IRInstruction *lo1 = &function->instructions[index[0]];
+  IRInstruction *lo1_branch = &function->instructions[index[1]];
+  IRInstruction *hi1 = &function->instructions[index[2]];
+  IRInstruction *hi1_branch = &function->instructions[index[3]];
+  IRInstruction *lo2 = &function->instructions[index[7]];
+  IRInstruction *miss_label = &function->instructions[index[13]];
+  IROperand value = ir_operand_copy(&lo1->lhs);
+  IROperand fold = ir_operand_copy(&lo1->dest);
+  IROperand offset = ir_operand_copy(&lo2->dest);
+  IROperand guard = ir_operand_copy(&hi1->dest);
+  char *or_text = mettle_strdup("|");
+  char *sub_text = mettle_strdup("-");
+  char *cmp_text = mettle_strdup("<=");
+  char *miss = mettle_strdup(miss_label->text);
+
+  if (!value.name || !fold.name || !offset.name || !guard.name || !or_text ||
+      !sub_text || !cmp_text || !miss) {
+    ir_operand_destroy(&value);
+    ir_operand_destroy(&fold);
+    ir_operand_destroy(&offset);
+    ir_operand_destroy(&guard);
+    mettle_free_string(or_text);
+    mettle_free_string(sub_text);
+    mettle_free_string(cmp_text);
+    mettle_free_string(miss);
     return 0;
   }
 
+  ir_instruction_make_nop(lo1);
+  lo1->op = IR_OP_BINARY;
+  lo1->text = or_text;
+  lo1->dest = fold;
+  lo1->lhs = value;
+  lo1->rhs = ir_operand_int(32);
+
+  ir_instruction_make_nop(lo1_branch);
+  lo1_branch->op = IR_OP_BINARY;
+  lo1_branch->text = sub_text;
+  lo1_branch->dest = offset;
+  lo1_branch->lhs = ir_operand_copy(&lo1->dest);
+  lo1_branch->rhs = ir_operand_int(97);
+
+  ir_instruction_make_nop(hi1);
+  hi1->op = IR_OP_BINARY;
+  hi1->text = cmp_text;
+  hi1->dest = guard;
+  hi1->lhs = ir_operand_copy(&lo1_branch->dest);
+  hi1->rhs = ir_operand_int(25);
+  hi1->is_unsigned = 1;
+
+  ir_instruction_make_nop(hi1_branch);
+  hi1_branch->op = IR_OP_BRANCH_ZERO;
+  hi1_branch->lhs = ir_operand_copy(&hi1->dest);
+  hi1_branch->text = miss;
+
+  for (size_t i = index[5]; i <= index[12]; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+/* Fold the canonical short circuit form of
+ *
+ *   (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+ *
+ * into `(unsigned)((c | 32) - 'a') <= 25`. The internal labels must have no
+ * other incoming edge and every compare result must feed only its branch.
+ * These checks make deleting the second range safe even after inlining and
+ * earlier control flow rewrites. */
+int ir_ascii_casefold_range_pass(IRFunction *function, int *changed) {
+  IRTempUseMap uses;
+  int local_changed = 0;
+  if (!function || !ir_temp_use_map_init(&uses)) {
+    return 1;
+  }
   for (size_t i = 0; i < function->instruction_count; i++) {
-    if (ir_instruction_references_label(&function->instructions[i], label)) {
+    if (!ir_collect_instruction_temp_uses(&uses, &function->instructions[i])) {
+      ir_temp_use_map_destroy(&uses);
       return 1;
     }
   }
 
-  return 0;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    size_t at[14];
+    IRInstruction *ins;
+    int first_lowercase;
+    at[0] = i;
+    ins = &function->instructions[at[0]];
+    if (ins->op != IR_OP_BINARY || !ins->text ||
+        strcmp(ins->text, ">=") != 0 || ins->rhs.kind != IR_OPERAND_INT ||
+        (ins->rhs.int_value != 65 && ins->rhs.int_value != 97) ||
+        (ins->lhs.kind != IR_OPERAND_TEMP &&
+         ins->lhs.kind != IR_OPERAND_SYMBOL) ||
+        !ins->lhs.name) {
+      continue;
+    }
+    first_lowercase = ins->rhs.int_value == 97;
+    for (size_t k = 1; k < 14; k++) {
+      if (!ir_ascii_next(function, at[k - 1] + 1, &at[k])) {
+        at[0] = function->instruction_count;
+        break;
+      }
+    }
+    if (at[0] >= function->instruction_count) {
+      continue;
+    }
+
+    IRInstruction *lo1 = &function->instructions[at[0]];
+    IRInstruction *lo1_branch = &function->instructions[at[1]];
+    IRInstruction *hi1 = &function->instructions[at[2]];
+    IRInstruction *hi1_branch = &function->instructions[at[3]];
+    IRInstruction *success1 = &function->instructions[at[4]];
+    IRInstruction *hi1_fail = &function->instructions[at[5]];
+    IRInstruction *lo1_fail = &function->instructions[at[6]];
+    IRInstruction *lo2 = &function->instructions[at[7]];
+    IRInstruction *lo2_branch = &function->instructions[at[8]];
+    IRInstruction *hi2 = &function->instructions[at[9]];
+    IRInstruction *hi2_branch = &function->instructions[at[10]];
+    IRInstruction *success2 = &function->instructions[at[11]];
+    IRInstruction *hi2_fail = &function->instructions[at[12]];
+    IRInstruction *lo2_fail = &function->instructions[at[13]];
+    long long lo1_bound = first_lowercase ? 97 : 65;
+    long long hi1_bound = first_lowercase ? 122 : 90;
+    long long lo2_bound = first_lowercase ? 65 : 97;
+    long long hi2_bound = first_lowercase ? 90 : 122;
+
+    if (!ir_ascii_range_compare(lo1, ">=", lo1_bound, &lo1->lhs) ||
+        !ir_ascii_range_branch(lo1_branch, lo1) ||
+        !ir_ascii_range_compare(hi1, "<=", hi1_bound, &lo1->lhs) ||
+        !ir_ascii_range_branch(hi1_branch, hi1) ||
+        success1->op != IR_OP_JUMP || !success1->text ||
+        hi1_fail->op != IR_OP_LABEL || !hi1_fail->text ||
+        strcmp(hi1_fail->text, hi1_branch->text) != 0 ||
+        lo1_fail->op != IR_OP_LABEL || !lo1_fail->text ||
+        strcmp(lo1_fail->text, lo1_branch->text) != 0 ||
+        !ir_ascii_range_compare(lo2, ">=", lo2_bound, &lo1->lhs) ||
+        !ir_ascii_range_branch(lo2_branch, lo2) ||
+        !ir_ascii_range_compare(hi2, "<=", hi2_bound, &lo1->lhs) ||
+        !ir_ascii_range_branch(hi2_branch, hi2) ||
+        success2->op != IR_OP_JUMP || !success2->text ||
+        strcmp(success1->text, success2->text) != 0 ||
+        hi2_fail->op != IR_OP_LABEL || !hi2_fail->text ||
+        strcmp(hi2_fail->text, hi2_branch->text) != 0 ||
+        lo2_fail->op != IR_OP_LABEL || !lo2_fail->text ||
+        strcmp(lo2_fail->text, lo2_branch->text) != 0 ||
+        ir_temp_use_map_get(&uses, lo1->dest.name) != 1 ||
+        ir_temp_use_map_get(&uses, hi1->dest.name) != 1 ||
+        ir_temp_use_map_get(&uses, lo2->dest.name) != 1 ||
+        ir_temp_use_map_get(&uses, hi2->dest.name) != 1 ||
+        !ir_label_only_referenced_by(function, hi1_fail->text, at[3]) ||
+        !ir_label_only_referenced_by(function, lo1_fail->text, at[1]) ||
+        !ir_label_only_referenced_by(function, hi2_fail->text, at[10])) {
+      continue;
+    }
+
+    if (!ir_ascii_casefold_rewrite(function, at, changed)) {
+      ir_temp_use_map_destroy(&uses);
+      return 1;
+    }
+    local_changed = 1;
+  }
+
+  ir_temp_use_map_destroy(&uses);
+  if (local_changed) {
+    ir_function_clear_cfg(function);
+  }
+  return 1;
 }
 
 /* The set of label names some branch targets, collected in one walk.

@@ -14,6 +14,31 @@ import "std/io";
   return 0;
 }
 
+@noinline fn ascii_name_start(c: int32) -> int32 {
+  if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95) {
+    return 1;
+  }
+  return 0;
+}
+
+@noinline fn ascii_name_start_reverse(c: int32) -> int32 {
+  if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) {
+    return 1;
+  }
+  return 0;
+}
+
+fn ref_ascii_name_start(c: int32) -> int32 {
+  if (c >= 97) {
+    if (c <= 122) { return 1; }
+  }
+  if (c >= 65) {
+    if (c <= 90) { return 1; }
+  }
+  if (c == 95) { return 1; }
+  return 0;
+}
+
 fn ref_classify(c: int32) -> int32 {
   if (c == 32) { return 1; }
   if (c == 9) { return 1; }
@@ -35,6 +60,8 @@ fn main() -> int32 {
   var i: int32 = -300;
   while (i < 300) {
     if (classify(i) != ref_classify(i)) { println("classify mismatch at {i}"); return 1; }
+    if (ascii_name_start(i) != ref_ascii_name_start(i)) { println("ascii mismatch at {i}"); return 6; }
+    if (ascii_name_start_reverse(i) != ref_ascii_name_start(i)) { println("reverse ascii mismatch at {i}"); return 7; }
     i += 1;
   }
   var j: int64 = -100;
@@ -46,5 +73,9 @@ fn main() -> int32 {
   if (wide(big) != ref_wide(big)) { println("wide mismatch at big"); return 3; }
   if (wide(big + 1) != ref_wide(big + 1)) { println("wide mismatch at big+1"); return 4; }
   if (wide(-4294967295) != ref_wide(-4294967295)) { println("wide mismatch neg"); return 5; }
+  var min_i32: int32 = -2147483647 - 1;
+  var max_i32: int32 = 2147483647;
+  if (ascii_name_start(min_i32) != 0 || ascii_name_start_reverse(min_i32) != 0) { return 8; }
+  if (ascii_name_start(max_i32) != 0 || ascii_name_start_reverse(max_i32) != 0) { return 9; }
   return 0;
 }

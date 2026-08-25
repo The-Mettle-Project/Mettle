@@ -159,6 +159,8 @@ static const IROptNamedPass g_ir_lowering_cleanup[] = {
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
     {"select_field_load", ir_select_adjacent_field_pass,
      {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
+    {"ascii_casefold_range", ir_ascii_casefold_range_pass,
+     {IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
     {"or_chain_bitset", ir_or_chain_to_bitset_pass,
      {IR_OPT_FEATURE_BRANCH_EQ | IR_OPT_FEATURE_BRANCH_ZERO,
       IR_OPT_REQUIRE_NONE}},

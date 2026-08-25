@@ -1,4 +1,4 @@
-﻿param(
+param(
   [string]$CompilerPath = "",
   [switch]$BuildCompiler,
   [switch]$SkipRuntime,
@@ -12846,7 +12846,9 @@ $runFixtures = @(
      What = "an or-chain of equality tests answered differently as a bit test"
      AsmMustMatch = @(
        @{ Fn = "classify"; Pattern = "shl" },
-       @{ Fn = "wide"; Pattern = "shl" }) },
+       @{ Fn = "wide"; Pattern = "shl" },
+       @{ Fn = "ascii_name_start"; Pattern = "(?m)^\s+[0-9a-f]+\s+or\s+[a-z0-9]+,\s+[a-z0-9]+,\s+32\b" },
+       @{ Fn = "ascii_name_start_reverse"; Pattern = "(?m)^\s+[0-9a-f]+\s+or\s+[a-z0-9]+,\s+[a-z0-9]+,\s+32\b" }) },
   @{ Name = "switch_dense"; Path = "tests/codegen/switch_dense.mettle"
      What = "a dense switch answered the wrong arm"
      AsmMustMatch = @(
