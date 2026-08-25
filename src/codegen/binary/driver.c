@@ -143,6 +143,14 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     return 0;
   }
 
+  if (!mir_rewrite_string_concat_calls(ir_function)) {
+    code_generator_set_error(generator,
+                             "Out of memory while lowering string concat in "
+                             "'%s'",
+                             ir_function->name);
+    return 0;
+  }
+
   double cg_t = cg_time_begin();
   if (!code_generator_binary_prepare_function_context(generator, ir_function,
                                                       &context)) {

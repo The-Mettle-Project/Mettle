@@ -31,6 +31,31 @@ struct MettleStringScratch {
     bytes: uint8[32]
 }
 
+extern fn malloc(size: int64) -> rawptr = "malloc";
+
+export fn mettle_string_concat(a: string, b: string) -> string {
+    var total: int64 = (int64)a.length + (int64)b.length;
+    var buf: uint8* = malloc(total + 1);
+    var i: int64 = 0;
+    var n: int64 = (int64)a.length;
+    while (i < n) {
+        buf[i] = a.chars[i];
+        i = i + 1;
+    }
+    var j: int64 = 0;
+    var m: int64 = (int64)b.length;
+    while (j < m) {
+        buf[i] = b.chars[j];
+        i = i + 1;
+        j = j + 1;
+    }
+    buf[total] = (uint8)0;
+    var s: string;
+    s.chars = buf;
+    s.length = (uint64)total;
+    return s;
+}
+
 export fn mettle_string_from_uint(value: uint64) -> string {
     var scratch: MettleStringScratch* = new MettleStringScratch;
     var pos: int64 = 32;

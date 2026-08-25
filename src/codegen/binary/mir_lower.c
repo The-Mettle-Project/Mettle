@@ -1338,6 +1338,42 @@ static int mir_call_is_supported(CodeGenerator *g,
   return 1;
 }
 
+int mir_rewrite_string_concat_calls(IRFunction *ir_function) {
+  if (!ir_function) {
+    return 1;
+  }
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    IRInstruction *in = &ir_function->instructions[i];
+    if (in->op != IR_OP_BINARY || !in->text || strcmp(in->text, "+") != 0 ||
+        !in->value_type || in->value_type->kind != MTLC_TYPE_STRING ||
+        in->arguments) {
+      continue;
+    }
+    IROperand *args = calloc(2, sizeof(*args));
+    MtlcType **types = calloc(2, sizeof(*types));
+    char *name = mettle_strdup("mettle_string_concat");
+    if (!args || !types || !name) {
+      free(args);
+      free(types);
+      mettle_free_string(name);
+      return 0;
+    }
+    args[0] = in->lhs;
+    args[1] = in->rhs;
+    types[0] = in->value_type;
+    types[1] = in->value_type;
+    in->lhs = ir_operand_none();
+    in->rhs = ir_operand_none();
+    mettle_free_string(in->text);
+    in->text = name;
+    in->arguments = args;
+    in->argument_types = types;
+    in->argument_count = 2;
+    in->op = IR_OP_CALL;
+  }
+  return 1;
+}
+
 /* Pure-ish scan: returns 1 if every instruction is in the supported set and the
  * signature is GP-only. Uses generator for type queries; no MIR built yet. */
 int mir_function_is_eligible(CodeGenerator *generator,
@@ -6237,6 +6273,213 @@ static void mir_drop_dead_extensions(MirFunction *fn) {
   free(low32);
 }
 
+static size_t mir_label_index(const MirFunction *fn, const char *name);
+
+static int mir_vreg_defs_are_sext32(const MirFunction *fn, MirVregId v) {
+  int defs = 0;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op == MIR_NOP || in->dst.kind != MIR_OPK_VREG ||
+        in->dst.vreg != v) {
+      continue;
+    }
+    if (in->op == MIR_CMPBR || in->op == MIR_JCC || in->op == MIR_JMP) {
+      continue;
+    }
+    defs++;
+    if (in->op == MIR_MOVSX && in->width == 4) {
+      continue;
+    }
+    if (in->op == MIR_MOV && in->width == 4 && !in->is_unsigned &&
+        !in->is_float && in->a.kind == MIR_OPK_MEM) {
+      continue;
+    }
+    return 0;
+  }
+  return defs > 0;
+}
+
+static int mir_operand_reads_vreg(const MirOperand *op, MirVregId v) {
+  if (op->kind == MIR_OPK_VREG && op->vreg == v) {
+    return 1;
+  }
+  if (op->kind == MIR_OPK_MEM &&
+      (op->mem.base == v || op->mem.index == v)) {
+    return 1;
+  }
+  return 0;
+}
+
+static void mir_elide_guarded_sext(MirFunction *fn) {
+  if (!fn || fn->insn_count == 0) {
+    return;
+  }
+  size_t n = fn->insn_count;
+  unsigned char *visited = calloc(n, 1);
+  size_t *stack = malloc(n * sizeof(size_t));
+  if (!visited || !stack) {
+    free(visited);
+    free(stack);
+    return;
+  }
+  for (size_t g = 0; g < n; g++) {
+    const MirInst *guard = &fn->insns[g];
+    if (guard->op != MIR_CMPBR || guard->width != 8 || guard->cc != 0x8D ||
+        guard->is_float || guard->a.kind != MIR_OPK_VREG ||
+        guard->b.kind != MIR_OPK_VREG) {
+      continue;
+    }
+    MirVregId A = guard->a.vreg;
+    MirVregId B = guard->b.vreg;
+    if (A == B || !mir_vreg_defs_are_sext32(fn, A) ||
+        !mir_vreg_defs_are_sext32(fn, B)) {
+      continue;
+    }
+    memset(visited, 0, n);
+    size_t cand_movsx[8];
+    size_t cand_add[8];
+    size_t cand_count = 0;
+    size_t sp = 0;
+    if (g + 1 < n) {
+      stack[sp++] = g + 1;
+    }
+    while (sp) {
+      size_t i = stack[--sp];
+      if (i >= n || visited[i]) {
+        continue;
+      }
+      visited[i] = 1;
+      MirInst *in = &fn->insns[i];
+      if (in->op == MIR_NOP || in->op == MIR_LABEL) {
+        if (i + 1 < n) {
+          stack[sp++] = i + 1;
+        }
+        continue;
+      }
+      if (in->op == MIR_RET || in->op == MIR_CALL) {
+        continue;
+      }
+      if (in->op == MIR_JMP || in->op == MIR_JCC || in->op == MIR_CMPBR) {
+        if (in->dst.kind == MIR_OPK_LABEL && in->dst.sym) {
+          size_t t = mir_label_index(fn, in->dst.sym);
+          if (t != (size_t)-1 && t > g) {
+            stack[sp++] = t;
+          }
+        }
+        if (in->op != MIR_JMP && i + 1 < n) {
+          stack[sp++] = i + 1;
+        }
+        continue;
+      }
+      if (in->dst.kind == MIR_OPK_VREG &&
+          (in->dst.vreg == A || in->dst.vreg == B)) {
+        if (in->dst.vreg == A && in->op == MIR_MOVSX && in->width == 4 &&
+            in->a.kind == MIR_OPK_VREG) {
+          MirVregId C = in->a.vreg;
+          size_t def_at = (size_t)-1;
+          size_t use_count = 0;
+          int multi_def = 0;
+          for (size_t k = 0; k < n; k++) {
+            const MirInst *kk = &fn->insns[k];
+            if (kk->op == MIR_NOP) {
+              continue;
+            }
+            if (kk->dst.kind == MIR_OPK_VREG && kk->dst.vreg == C) {
+              if (def_at != (size_t)-1) {
+                multi_def = 1;
+                break;
+              }
+              def_at = k;
+            }
+            if (k != i &&
+                (mir_operand_reads_vreg(&kk->a, C) ||
+                 mir_operand_reads_vreg(&kk->b, C) ||
+                 (kk->dst.kind == MIR_OPK_MEM &&
+                  mir_operand_reads_vreg(&kk->dst, C)))) {
+              use_count++;
+            }
+          }
+          if (!multi_def && def_at != (size_t)-1 && use_count == 0 &&
+              visited[def_at] && cand_count < 8) {
+            MirInst *add = &fn->insns[def_at];
+            if (add->op == MIR_ADD && add->width == 8 && !add->is_float &&
+                add->dst.kind == MIR_OPK_VREG && add->dst.vreg == C &&
+                add->a.kind == MIR_OPK_VREG && add->a.vreg == A &&
+                add->b.kind == MIR_OPK_IMM && add->b.imm == 1) {
+              int clean = 1;
+              for (size_t k = def_at + 1; k < i; k++) {
+                const MirInst *kk = &fn->insns[k];
+                if (kk->op == MIR_NOP) {
+                  continue;
+                }
+                clean = 0;
+                break;
+              }
+              if (clean) {
+                cand_movsx[cand_count] = i;
+                cand_add[cand_count] = def_at;
+                cand_count++;
+              }
+            }
+          }
+        }
+        continue;
+      }
+      if (i + 1 < n) {
+        stack[sp++] = i + 1;
+      }
+    }
+    if (!cand_count) {
+      continue;
+    }
+    int sealed = 1;
+    for (size_t l = 0; l < n && sealed; l++) {
+      if (!visited[l] || fn->insns[l].op != MIR_LABEL ||
+          fn->insns[l].dst.kind != MIR_OPK_LABEL || !fn->insns[l].dst.sym) {
+        continue;
+      }
+      if (l > 0) {
+        const MirInst *prev = &fn->insns[l - 1];
+        size_t p = l - 1;
+        while (p > 0 && prev->op == MIR_NOP) {
+          prev = &fn->insns[--p];
+        }
+        if (!visited[p] && prev->op != MIR_JMP && prev->op != MIR_RET &&
+            prev->op != MIR_NOP) {
+          sealed = 0;
+          break;
+        }
+      }
+      for (size_t j = 0; j < n && sealed; j++) {
+        const MirInst *jj = &fn->insns[j];
+        if (visited[j] ||
+            (jj->op != MIR_JMP && jj->op != MIR_JCC && jj->op != MIR_CMPBR &&
+             jj->op != MIR_FCMPBR)) {
+          continue;
+        }
+        if (jj->dst.kind == MIR_OPK_LABEL && jj->dst.sym &&
+            strcmp(jj->dst.sym, fn->insns[l].dst.sym) == 0) {
+          sealed = 0;
+        }
+      }
+    }
+    if (!sealed) {
+      continue;
+    }
+    for (size_t c = 0; c < cand_count; c++) {
+      MirInst *add = &fn->insns[cand_add[c]];
+      MirInst *sext = &fn->insns[cand_movsx[c]];
+      add->dst = mir_op_vreg(A);
+      sext->op = MIR_NOP;
+      sext->dst = mir_op_none();
+      sext->a = mir_op_none();
+      sext->b = mir_op_none();
+    }
+  }
+  free(visited);
+  free(stack);
+}
+
 static void mir_fuse_mov_then_extend(MirFunction *fn) {
   if (!fn) {
     return;
@@ -8597,6 +8840,7 @@ int code_generator_binary_emit_function_via_mir(
   mir_drop_dead_extensions(&fn);
   mir_canonicalize_commutative(&fn);
   mir_narrow_zero_extended_ops(&fn);
+  mir_elide_guarded_sext(&fn);
   mir_fold_address_offsets(&fn);
   mir_cse_loads(&fn);
   mir_slp_pair_f64(&fn);

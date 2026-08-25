@@ -722,6 +722,8 @@ int mir_encode(MirFunction *fn);
 int mir_function_is_eligible(CodeGenerator *generator,
                              IRFunction *ir_function);
 
+int mir_rewrite_string_concat_calls(IRFunction *ir_function);
+
 /* Lower + allocate + encode an eligible function into context->code (full
  * prologue..epilogue, fixups resolved). Returns 0 on failure. */
 int code_generator_binary_emit_function_via_mir(

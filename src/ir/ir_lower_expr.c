@@ -151,6 +151,27 @@ static void ir_declare_interpolation_helper(IRLoweringContext *context,
   ir_program_add_symbol(context->program, &entry);
 }
 
+static void ir_declare_string_concat_helper(IRLoweringContext *context) {
+  IRModuleSymbol entry = {0};
+  MtlcType *params[2];
+  if (!context || !context->program || !context->type_checker) {
+    return;
+  }
+  if (ir_program_lookup_symbol(context->program, "mettle_string_concat")) {
+    return;
+  }
+  params[0] = mtlc_type_from_frontend(context->type_checker->builtin_string);
+  params[1] = params[0];
+  entry.name = (char *)"mettle_string_concat";
+  entry.kind = IR_MODSYM_FUNCTION;
+  entry.is_extern = 1;
+  entry.type = params[0];
+  entry.return_type = entry.type;
+  entry.param_types = params;
+  entry.param_count = 2;
+  ir_program_add_symbol(context->program, &entry);
+}
+
 int ir_lower_call_expression(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *expression,
                                     IROperand *out_value) {
@@ -1469,6 +1490,7 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
         /* String '+' becomes a heap-allocating concat kernel in codegen; mark
          * it so the `@noalloc` contract checker can see the allocation. */
         instruction.allocates = 1;
+        ir_declare_string_concat_helper(context);
         if (!ir_emit(context, function, &instruction)) {
           ir_operand_destroy(&right);
           ir_operand_destroy(&left);
