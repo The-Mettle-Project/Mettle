@@ -1009,6 +1009,25 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
  * size. Growth is bounded by a body-size cap, so deep expansion stops on its
  * own. Loop-bearing recursive bodies (a quicksort partition, a merge) expand
  * too: the label-rename map keeps each clone's loops disjoint. */
+static int ir_self_call_is_loop_resident(const IRFunction *function) {
+  char *in_loop = ir_build_in_loop_bitmap(function);
+  int resident = 0;
+  if (!in_loop) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_CALL && instruction->text &&
+        function->name && strcmp(instruction->text, function->name) == 0 &&
+        in_loop[i]) {
+      resident = 1;
+      break;
+    }
+  }
+  free(in_loop);
+  return resident;
+}
+
 static int ir_function_is_self_inline_candidate(const IRFunction *function,
                                                 size_t *self_call_count_out) {
   if (!function || !function->name || function->instruction_count == 0 ||
@@ -1019,7 +1038,6 @@ static int ir_function_is_self_inline_candidate(const IRFunction *function,
       (function->parameter_count > 0 && !function->parameter_names)) {
     return 0;
   }
-
   size_t self_calls = 0;
   int has_return = 0;
   for (size_t i = 0; i < function->instruction_count; i++) {
@@ -1121,6 +1139,9 @@ int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
     }
     int max_depth = ir_opt_self_inline_max_depth(function);
     size_t body_budget = ir_opt_self_inline_body_budget(function);
+    if (max_depth > 1 && ir_self_call_is_loop_resident(function)) {
+      max_depth = 1;
+    }
     for (int depth = 0; depth < max_depth; depth++) {
       if (ir_function_non_nop_instruction_count(function) >
           body_budget) {
