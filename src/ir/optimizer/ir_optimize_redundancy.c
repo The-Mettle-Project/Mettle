@@ -211,13 +211,6 @@ static int re_opcode_is_scalar(IROpcode op) {
   }
 }
 
-/* A call's arguments are values it receives, never storage it writes: the
- * callee gets a copy of `p`, and nothing it does can make the caller's `p`
- * name a different address. Storage a callee really can reach is reachable
- * some other way -- a global, or a local whose address was taken -- and
- * re_symbol_is_aliasable already refuses to cache those. The recognizer
- * opcodes are different: several of them name a second output in
- * `arguments[]`, so outside the call forms every operand still counts. */
 static int re_opcode_writes_through_arguments(IROpcode op) {
   return op != IR_OP_CALL && op != IR_OP_CALL_INDIRECT;
 }
@@ -1796,12 +1789,6 @@ int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed) {
 /* header's straight-line prefix, and the offset stays within a page of it.     */
 /* -------------------------------------------------------------------------- */
 
-/* A `for` header is a loop header too. Recognizing only `while` left every
- * `for (;;)` loop -- which is how a probe chain, a parser's element loop and a
- * match finder are all written -- outside both the invariant-load hoist and
- * the memory promotion, so word_freq reloaded all four of its table's arrays
- * from the table on every probe, each one a dependent load in front of the
- * cache miss it was computing the address for. */
 static int re_label_is_loop_header(const char *text) {
   if (!text) {
     return 0;
@@ -1858,10 +1845,6 @@ static int re_region_survives_log(const IRFunction *function,
   return 1;
 }
 
-/* Does this instruction dereference `addr`'s base far enough to prove that a
- * load reaching `reach` bytes from that base cannot fault? An access at
- * base+off of n bytes proves the object spans [0, off+n): the program itself
- * derived that address from this base and read it. */
 static int re_access_reaches(const IRFunction *function, const REDefs *defs,
                              const IRInstruction *ins, const REAddr *addr,
                              long long reach) {
@@ -1954,14 +1937,8 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
         continue;
       }
 
-      /* Dereferenceability: something that runs on every entry to the loop
-       * already reaches at least as far into this base, so the preheader copy
-       * cannot fault where the original could not. Two regions qualify: the
-       * header's straight-line prefix, and the straight-line preheader behind
-       * it -- which is where THIS pass puts the loads it has already hoisted.
-       * Without the second, hoisting the first field read out of a loop
-       * removed the evidence that let the next one move, and which field
-       * escaped depended on the order they happened to appear in. */
+      /* Dereferenceability: the prefix already touches this base, or this
+       * load IS in the prefix. */
       long long reach = addr.offset + load->rhs.int_value;
       int safe = i < prefix_end;
       for (size_t k = header + 1; k < prefix_end && !safe; k++) {
@@ -1973,7 +1950,7 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
         if (back->op == IR_OP_LABEL || back->op == IR_OP_JUMP ||
             back->op == IR_OP_RETURN || back->op == IR_OP_BRANCH_ZERO ||
             back->op == IR_OP_BRANCH_EQ) {
-          break; /* behind here control need not have come this way */
+          break;
         }
         safe = re_access_reaches(function, &defs, back, &addr, reach);
       }

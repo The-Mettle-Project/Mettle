@@ -1,20 +1,5 @@
-#include <stdlib.h>
 #include "ir_optimize_internal.h"
 #include "../ir_pgo.h"
-
-/* TEMPORARY tuning probe: env overrides for the inline budgets. */
-static size_t ir_opt_env_budget(const char *name, size_t fallback) {
-  const char *text = getenv(name);
-  size_t value = 0;
-  if (!text || !*text) {
-    return fallback;
-  }
-  while (*text >= '0' && *text <= '9') {
-    value = value * 10u + (size_t)(*text - '0');
-    text++;
-  }
-  return value > 0 ? value : fallback;
-}
 
 static long long ir_opt_hot_threshold(void) {
   return ir_pgo_hot_threshold();
@@ -79,18 +64,6 @@ int ir_opt_site_is_cold(const IRFunction *function, SourceLocation location) {
 }
 
 size_t ir_opt_inline_body_budget(const IRFunction *callee) {
-  size_t base = ir_opt_env_budget("MTL_INL_BODY",
-                                  IR_INLINE_MAX_NON_NOP_INSTRUCTIONS);
-  if (ir_opt_function_is_hot(callee)) {
-    return 4u * base;
-  }
-  if (ir_opt_function_is_cold(callee)) {
-    return base / 2u;
-  }
-  return base;
-}
-
-__attribute__((unused)) static size_t ir_opt_inline_body_budget_unused(const IRFunction *callee) {
   if (ir_opt_function_is_hot(callee)) {
     return 4u * IR_INLINE_MAX_NON_NOP_INSTRUCTIONS;
   }
@@ -101,29 +74,16 @@ __attribute__((unused)) static size_t ir_opt_inline_body_budget_unused(const IRF
 }
 
 size_t ir_opt_inline_nested_call_budget(const IRFunction *callee) {
-  size_t base = ir_opt_env_budget("MTL_INL_CALLS", 2u);
   if (ir_opt_function_is_hot(callee)) {
-    return 3u * base;
+    return 6u;
   }
   if (ir_opt_function_is_cold(callee)) {
     return 1u;
   }
-  return base;
+  return 2u;
 }
 
 size_t ir_opt_inline_caller_budget(const IRFunction *caller) {
-  size_t base = ir_opt_env_budget("MTL_INL_CALLER",
-                                  IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS);
-  if (ir_opt_function_is_hot(caller)) {
-    return 2u * base;
-  }
-  if (ir_opt_function_is_cold(caller)) {
-    return base / 2u;
-  }
-  return base;
-}
-
-__attribute__((unused)) static size_t ir_opt_inline_caller_budget_unused(const IRFunction *caller) {
   if (ir_opt_function_is_hot(caller)) {
     return 2u * IR_INLINE_MAX_CALLER_NON_NOP_INSTRUCTIONS;
   }

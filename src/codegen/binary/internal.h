@@ -518,6 +518,7 @@ int binary_emit_alu_rsp_imm32(BinaryCodeBuffer *buffer, unsigned char subopcode,
 int binary_emit_and_reg_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister reg, uint32_t immediate);
 int binary_emit_call_placeholder(BinaryCodeBuffer *buffer, size_t *displacement_offset_out);
 int binary_emit_call_reg(BinaryCodeBuffer *buffer, BinaryGpRegister reg);
+int binary_emit_jmp_reg(BinaryCodeBuffer *buffer, BinaryGpRegister reg);
 int binary_emit_cmovcc_reg_reg(BinaryCodeBuffer *buffer, unsigned char opcode, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_cmp_reg_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister reg, uint32_t immediate);
 int binary_emit_cmp_reg_reg(BinaryCodeBuffer *buffer, BinaryGpRegister lhs, BinaryGpRegister rhs);

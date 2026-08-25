@@ -1,14 +1,3 @@
-# Interleaved Mettle-vs-C runtime comparison.
-#
-# Same measurement discipline as ab.ps1 (pinned P-core, High priority,
-# alternating arm order, minimum over -Runs iterations) but the two arms are
-# the Mettle binary and the C binary for the same benchmark, so the ratio it
-# reports is the one the goal is stated in.
-#
-# Usage:
-#   .\tools\benchmark\mc.ps1 -Suite 3
-#   .\tools\benchmark\mc.ps1 -Benchmark json_parse -Runs 11 -CC clang
-
 param(
     [string]$Compiler = "bin\mettle.exe",
     [string[]]$Benchmark = @(),

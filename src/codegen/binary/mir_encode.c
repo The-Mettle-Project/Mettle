@@ -514,10 +514,6 @@ static int encode_alu(MirFunction *fn, const MirInst *in) {
         }
       }
     }
-    /* The same trick with a constant: `D = a +/- k` for a live in a register
-     * is one `lea D, [a + k]` instead of `mov D, a; add D, k`. This is what
-     * every `j = i + 1` lowers to, so it lands in the body of every counted
-     * loop whose bump is read into a different value than it overwrites. */
     if ((in->op == MIR_ADD || is_sub) && !w32 &&
         in->b.kind == MIR_OPK_IMM && in->b.imm >= -2147483647LL &&
         in->b.imm <= 2147483647LL && !operand_in_phys(fn, &in->a, D)) {
@@ -1351,10 +1347,6 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
   /* STORE: [base (+ index*scale + disp)] <- a, width bytes. */
   if (in->dst.kind == MIR_OPK_MEM) {
     int ok1, ok2;
-    /* A constant goes straight into the store. Staging it in a register first
-     * cost an instruction and a register per field, and a struct initializer
-     * is a run of them: json_parse's node allocator was rematerializing 0 four
-     * times and -1 twice per node. */
     int scalar_w = (in->width == 1 || in->width == 2 || in->width == 4 ||
                     in->width == 8);
     if (in->a.kind == MIR_OPK_IMM && scalar_w) {
@@ -1378,8 +1370,6 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
                                         in->width)) {
         return 1;
       }
-      /* A 64-bit constant too wide for the imm32 form: fall through and stage
-       * it in a register like any other value. */
     }
     if (in->dst.mem.index != MIR_VREG_NONE) {
       /* One direct SIB `mov [base+idx*scale+disp], val` at every width. A

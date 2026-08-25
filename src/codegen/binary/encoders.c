@@ -547,11 +547,6 @@ static int binary_emit_memory_access_sib_internal(
   return 1;
 }
 
-/* mov [base (+ index*scale) + disp], imm -- C6 /0 for a byte, C7 /0 otherwise.
- * Storing a constant needs no register at all, and materializing one first was
- * costing an instruction (and a register) per field of every struct a program
- * initializes. Width 8 takes only a sign-extendable imm32, which is all the C7
- * form encodes; the caller falls back to a register for anything wider. */
 int binary_emit_mov_mem_imm_width(BinaryCodeBuffer *buffer,
                                   BinaryGpRegister base, int has_index,
                                   BinaryGpRegister index, int scale,
@@ -1925,6 +1920,18 @@ int binary_emit_call_placeholder(BinaryCodeBuffer *buffer,
 
   *displacement_offset_out = buffer->size;
   return binary_code_buffer_append_u32(buffer, 0);
+}
+
+int binary_emit_jmp_reg(BinaryCodeBuffer *buffer, BinaryGpRegister reg) {
+  if (!buffer) {
+    return 0;
+  }
+  if ((int)reg >= 8 && !binary_emit_rex(buffer, 0, 0, 0, 1)) {
+    return 0;
+  }
+  return binary_code_buffer_append_u8(buffer, 0xFF) &&
+         binary_code_buffer_append_u8(buffer,
+                                      (unsigned char)(0xE0 | (reg & 7)));
 }
 
 int binary_emit_call_reg(BinaryCodeBuffer *buffer, BinaryGpRegister reg) {

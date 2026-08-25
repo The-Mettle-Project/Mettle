@@ -5559,16 +5559,6 @@ static int mir_addr_base_operand_kind(const IROperand *operand) {
           operand->kind == IR_OPERAND_SYMBOL);
 }
 
-/* `p->nodes[i].field` arrives as two adds: `%e = nodes + i*40` and then
- * `%a = %e + 8`. The constant-displacement fallback below folds the second one
- * and stops, leaving the first as a real `lea` -- once per field, because each
- * field builds its own copy of the element address. x86 carries both in one
- * operand, so fold the pair: [nodes + i*40 + 8].
- *
- * Only when the element address exists solely to carry this one access (a
- * single read, which is the shape every field access produces) and neither of
- * its operands is rewritten between the add and the access. Returns 1 with
- * the base, index and scale filled in, and `inner` set to the add to retire. */
 static int mir_addr_fold_through_inner_add(const IRFunction *f,
                                            const MirTempUseIndex *uses,
                                            const IROperand *outer_base,
@@ -5580,7 +5570,7 @@ static int mir_addr_fold_through_inner_add(const IRFunction *f,
     return 0;
   }
   if (mir_temp_read_count(uses, outer_base->name) != 1) {
-    return 0; /* another reader still needs the address in a register */
+    return 0;
   }
   long ii = mir_temp_def_index(uses, outer_base->name);
   if (ii < 0) {
@@ -5599,8 +5589,6 @@ static int mir_addr_fold_through_inner_add(const IRFunction *f,
     if (!mir_addr_base_operand_kind(b) || !mir_addr_base_operand_kind(x)) {
       continue;
     }
-    /* The index may already be scaled by a legal SIB factor, in which case the
-     * shift comes along too -- but only when nothing else reads it. */
     IROperand idx = *x;
     int sc = 1;
     long xdef = -1;
@@ -5816,10 +5804,10 @@ static void mir_compute_address_folds(const IRFunction *f,
           folds[i].index = deep_index;
           folds[i].scale = deep_scale;
           folds[i].disp = cst->int_value;
-          skip[ai] = 1;    /* the +const */
-          skip[inner] = 1; /* the element address it was built on */
+          skip[ai] = 1;
+          skip[inner] = 1;
           if (index_def >= 0) {
-            skip[index_def] = 1; /* the scale the SIB now carries */
+            skip[index_def] = 1;
           }
         } else {
           folds[i].valid = 1;
