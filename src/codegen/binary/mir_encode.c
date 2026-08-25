@@ -2157,9 +2157,6 @@ int mir_encode(MirFunction *fn) {
     const MirJumpTable *table;
   } pending_tables[MIR_MAX_JUMP_TABLES];
   size_t pending_table_count = 0;
-  size_t ret_count = 0;
-  size_t epilogue_length = 0;
-  int share_epilogue = 0;
 
   if (!mir_layout_frame(fn) || !mir_emit_prologue(fn)) {
     return 0;
@@ -2169,16 +2166,6 @@ int mir_encode(MirFunction *fn) {
                                   ctx->code.size - annot_base,
                                   ctx->code.data + annot_base);
   }
-
-  for (size_t i = 0; i < fn->insn_count; i++) {
-    if (fn->insns[i].op == MIR_RET) {
-      ret_count++;
-    }
-  }
-  epilogue_length = (fn->used_inline_vector ? 1u : 0u) + ctx->saved_xmm_count +
-                    ctx->saved_register_count +
-                    (ctx->omit_frame_pointer ? 2u : 3u);
-  share_epilogue = ret_count >= 3 && epilogue_length >= 3;
 
   /* Loop-header alignment: a label that is the target of a BACKWARD branch is a
    * loop top; pad it to BINARY_LOOP_ALIGN (like gcc -falign-loops) so the hot
@@ -3048,22 +3035,9 @@ int mir_encode(MirFunction *fn) {
       pending_table_count++;
       break;
     }
-    case MIR_RET: {
-      size_t rest = i + 1;
-      while (rest < fn->insn_count && fn->insns[rest].op == MIR_NOP) {
-        rest++;
-      }
-      if (!share_epilogue) {
-        ok = mir_emit_epilogue(fn);
-      } else if (rest < fn->insn_count) {
-        size_t off = 0;
-        if (!binary_emit_jmp_placeholder(&ctx->code, &off) ||
-            !binary_label_fixup_table_add(&ctx->label_fixups, ".mepi", off)) {
-          ok = enc_err(fn, "out of memory in shared epilogue jump");
-        }
-      }
+    case MIR_RET:
+      ok = mir_emit_epilogue(fn);
       break;
-    }
     default:
       ok = enc_err(fn, "unsupported MIR opcode in encoder");
       break;
@@ -3079,15 +3053,6 @@ int mir_encode(MirFunction *fn) {
     }
   }
   free(align_label);
-
-  if (share_epilogue) {
-    if (!binary_label_table_define(&ctx->labels, ".mepi", ctx->code.size)) {
-      return enc_err(fn, "duplicate shared epilogue label");
-    }
-    if (!mir_emit_epilogue(fn)) {
-      return 0;
-    }
-  }
 
   for (size_t t = 0; t < pending_table_count; t++) {
     const MirJumpTable *tbl = pending_tables[t].table;
