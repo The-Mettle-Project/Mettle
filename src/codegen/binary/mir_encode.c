@@ -2197,6 +2197,73 @@ static int mir_encode_label_index(const MirFunction *fn, const char *name) {
  * reaches the target either way. Alignment padding before a loop label is NOPs
  * too -- skipping it by falling through instead of branching over it is
  * harmless, since NOPs do nothing whichever way they are reached. */
+static int mir_vreg_is_byte_load(const MirFunction *fn, size_t before,
+                                 MirVregId v) {
+  size_t limit = before > 16 ? before - 16 : 0;
+  for (size_t k = before; k-- > limit;) {
+    const MirInst *in = &fn->insns[k];
+    if (in->dst.kind != MIR_OPK_VREG || in->dst.vreg != v) {
+      continue;
+    }
+    return in->op == MIR_MOV && !in->is_float && in->width == 1 &&
+           in->is_unsigned && in->a.kind == MIR_OPK_MEM;
+  }
+  return 0;
+}
+
+static int mir_mem_operand_in_registers(const MirFunction *fn,
+                                        const MirOperand *op) {
+  if (op->kind != MIR_OPK_MEM || op->mem.base == MIR_VREG_NONE ||
+      op->mem.phys_base_valid) {
+    return 0;
+  }
+  if (!fn->vregs[op->mem.base].in_register) {
+    return 0;
+  }
+  if (op->mem.index != MIR_VREG_NONE) {
+    if (!fn->vregs[op->mem.index].in_register) {
+      return 0;
+    }
+    if (op->mem.scale != 1 && op->mem.scale != 2 && op->mem.scale != 4 &&
+        op->mem.scale != 8) {
+      return 0;
+    }
+    if (fn->vregs[op->mem.index].phys == BINARY_GP_RSP) {
+      return 0;
+    }
+  }
+  if (fn->vregs[op->mem.base].phys == BINARY_GP_RSP) {
+    return 0;
+  }
+  return 1;
+}
+
+static int mir_byte_compare_fusable(const MirFunction *fn, size_t i) {
+  const MirInst *load;
+  const MirInst *cmp;
+  const MirVreg *loaded;
+  if (i + 1 >= fn->insn_count) {
+    return 0;
+  }
+  load = &fn->insns[i];
+  cmp = &fn->insns[i + 1];
+  if (load->op != MIR_MOV || load->is_float || load->width != 1 ||
+      !load->is_unsigned || load->dst.kind != MIR_OPK_VREG ||
+      !mir_mem_operand_in_registers(fn, &load->a)) {
+    return 0;
+  }
+  if (cmp->op != MIR_CMPBR || cmp->is_float ||
+      (cmp->cc != 0x84 && cmp->cc != 0x85) || cmp->b.kind != MIR_OPK_VREG ||
+      cmp->b.vreg != load->dst.vreg || cmp->a.kind != MIR_OPK_VREG) {
+    return 0;
+  }
+  loaded = &fn->vregs[load->dst.vreg];
+  if (!loaded->in_register || loaded->live_end != (int)(i + 1)) {
+    return 0;
+  }
+  return mir_vreg_is_byte_load(fn, i, cmp->a.vreg);
+}
+
 static int mir_jump_is_fallthrough(const MirFunction *fn, size_t index) {
   const MirInst *jmp = &fn->insns[index];
   if (jmp->dst.kind != MIR_OPK_LABEL || !jmp->dst.sym) {
@@ -2235,6 +2302,7 @@ int mir_encode(MirFunction *fn) {
     const MirJumpTable *table;
   } pending_tables[MIR_MAX_JUMP_TABLES];
   size_t pending_table_count = 0;
+  size_t fused_byte_load = (size_t)-1;
 
   if (!mir_layout_frame(fn) || !mir_emit_prologue(fn)) {
     return 0;
@@ -2298,6 +2366,10 @@ int mir_encode(MirFunction *fn) {
     case MIR_NOP:
       break;
     case MIR_MOV:
+      if (mir_byte_compare_fusable(fn, i)) {
+        fused_byte_load = i;
+        break;
+      }
       ok = encode_mov(fn, in);
       break;
     case MIR_ADD:
@@ -3050,7 +3122,32 @@ int mir_encode(MirFunction *fn) {
         ok = 0;
         break;
       }
-      if (in->width == 4) {
+      if (fused_byte_load != (size_t)-1 && fused_byte_load + 1 == i) {
+        const MirMem *m = &fn->insns[i - 1].a.mem;
+        BinaryGpRegister mb = (BinaryGpRegister)fn->vregs[m->base].phys;
+        int need_rex = (areg >= 4 && areg <= 7);
+        int emitted;
+        if (m->index != MIR_VREG_NONE) {
+          BinaryGpRegister mi = (BinaryGpRegister)fn->vregs[m->index].phys;
+          emitted = need_rex ? binary_emit_memory_access_sib_forced(
+                                   &ctx->code, 0, 0, 0x3A, 0, 0, areg, mb, mi,
+                                   m->scale, m->disp)
+                             : binary_emit_memory_access_sib(
+                                   &ctx->code, 0, 0, 0x3A, 0, 0, areg, mb, mi,
+                                   m->scale, m->disp);
+        } else {
+          emitted = need_rex ? binary_emit_memory_access_ex_forced(
+                                   &ctx->code, 0, 0, 0x3A, 0, 0, areg, mb,
+                                   m->disp)
+                             : binary_emit_memory_access_ex(&ctx->code, 0, 0,
+                                                            0x3A, 0, 0, areg,
+                                                            mb, m->disp);
+        }
+        if (!emitted) {
+          ok = enc_err(fn, "out of memory in fused byte compare");
+          break;
+        }
+      } else if (in->width == 4) {
         /* 4-byte (int32/uint32) compare: 32-bit cmp ignores garbage high bits a
          * 64-bit MIR value may carry (see encode_setcc). An immediate folds into
          * the 32-bit cmp directly (its low 32 bits are the constant); only a
