@@ -597,6 +597,39 @@ static int encode_imul(MirFunction *fn, const MirInst *in) {
                 code_generator_binary_immediate_fits_signed_32(in->b.imm);
   BinaryGpRegister D;
 
+  if (in->width == 4) {
+    int ok;
+    int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
+    BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
+    BinaryGpRegister stage = (target == SCRATCH_A) ? SCRATCH_B : SCRATCH_A;
+    if (b_imm32) {
+      BinaryGpRegister areg = value_reg(fn, &in->a, stage, &ok);
+      if (!ok || !binary_emit_imul_reg_reg_imm32_w32(code, target, areg,
+                                                     (uint32_t)in->b.imm)) {
+        return enc_err(fn, "out of memory in imul32 imm");
+      }
+    } else if (dst_in_reg && operand_in_phys(fn, &in->b, target)) {
+      BinaryGpRegister areg = value_reg(fn, &in->a, stage, &ok);
+      if (!ok || !binary_emit_imul_reg_reg32(code, target, areg)) {
+        return enc_err(fn, "out of memory in imul32");
+      }
+    } else {
+      BinaryGpRegister breg;
+      if (!operand_in_phys(fn, &in->a, target) &&
+          !materialize_into(fn, &in->a, target)) {
+        return 0;
+      }
+      breg = value_reg(fn, &in->b, stage, &ok);
+      if (!ok || !binary_emit_imul_reg_reg32(code, target, breg)) {
+        return enc_err(fn, "out of memory in imul32");
+      }
+    }
+    if (!dst_in_reg) {
+      return store_from(fn, &in->dst, SCRATCH_A);
+    }
+    return 1;
+  }
+
   if (dst_is_reg(fn, &in->dst, &D)) {
     int ok;
     if (b_imm32) {

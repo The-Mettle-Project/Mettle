@@ -1068,6 +1068,35 @@ int binary_emit_alu_reg_reg(BinaryCodeBuffer *buffer,
   return 1;
 }
 
+int binary_emit_imul_reg_reg32(BinaryCodeBuffer *buffer,
+                               BinaryGpRegister destination,
+                               BinaryGpRegister source) {
+  if (!buffer) {
+    return 0;
+  }
+  return binary_emit_rex(buffer, 0, destination >> 3, 0, source >> 3) &&
+         binary_code_buffer_append_u8(buffer, 0x0F) &&
+         binary_code_buffer_append_u8(buffer, 0xAF) &&
+         binary_code_buffer_append_u8(
+             buffer, (unsigned char)(0xC0 | ((destination & 7) << 3) |
+                                     (source & 7)));
+}
+
+int binary_emit_imul_reg_reg_imm32_w32(BinaryCodeBuffer *buffer,
+                                       BinaryGpRegister destination,
+                                       BinaryGpRegister source,
+                                       uint32_t immediate) {
+  if (!buffer) {
+    return 0;
+  }
+  return binary_emit_rex(buffer, 0, destination >> 3, 0, source >> 3) &&
+         binary_code_buffer_append_u8(buffer, 0x69) &&
+         binary_code_buffer_append_u8(
+             buffer, (unsigned char)(0xC0 | ((destination & 7) << 3) |
+                                     (source & 7))) &&
+         binary_code_buffer_append_u32(buffer, immediate);
+}
+
 int binary_emit_imul_reg_reg(BinaryCodeBuffer *buffer,
                                     BinaryGpRegister destination,
                                     BinaryGpRegister source) {

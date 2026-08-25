@@ -5970,6 +5970,7 @@ static int mir_op_low32_is_self_contained(MirOpcode op) {
   case MIR_XOR:
   case MIR_NEG:
   case MIR_NOT:
+  case MIR_IMUL:
     return 1;
   default:
     return 0;

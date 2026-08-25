@@ -541,6 +541,8 @@ int binary_emit_mul_reg(BinaryCodeBuffer *buffer, BinaryGpRegister src);
 int binary_emit_imul_reg(BinaryCodeBuffer *buffer, BinaryGpRegister src);
 int binary_emit_imul_reg_reg(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
 int binary_emit_imul_reg_reg_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source, uint32_t immediate);
+int binary_emit_imul_reg_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source);
+int binary_emit_imul_reg_reg_imm32_w32(BinaryCodeBuffer *buffer, BinaryGpRegister destination, BinaryGpRegister source, uint32_t immediate);
 /* As above, but the caller offers a free scratch register. Two of the
  * shift-and-add expansions need the multiplicand to survive the final add, so
  * without a scratch an in-place `x = x * C` has to fall back to imul and its
