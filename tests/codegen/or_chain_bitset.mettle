@@ -1,0 +1,50 @@
+import "std/io";
+
+@noinline fn classify(c: int32) -> int32 {
+  if (c == 32 || c == 9 || c == 10 || c == 13) {
+    return 1;
+  }
+  return 0;
+}
+
+@noinline fn wide(c: int64) -> int64 {
+  if (c == 1 || c == 5 || c == 62 || c == 40 || c == 7) {
+    return 1;
+  }
+  return 0;
+}
+
+fn ref_classify(c: int32) -> int32 {
+  if (c == 32) { return 1; }
+  if (c == 9) { return 1; }
+  if (c == 10) { return 1; }
+  if (c == 13) { return 1; }
+  return 0;
+}
+
+fn ref_wide(c: int64) -> int64 {
+  if (c == 1) { return 1; }
+  if (c == 5) { return 1; }
+  if (c == 62) { return 1; }
+  if (c == 40) { return 1; }
+  if (c == 7) { return 1; }
+  return 0;
+}
+
+fn main() -> int32 {
+  var i: int32 = -300;
+  while (i < 300) {
+    if (classify(i) != ref_classify(i)) { println("classify mismatch at {i}"); return 1; }
+    i += 1;
+  }
+  var j: int64 = -100;
+  while (j < 200) {
+    if (wide(j) != ref_wide(j)) { println("wide mismatch at {j}"); return 2; }
+    j += 1;
+  }
+  var big: int64 = 4294967296;
+  if (wide(big) != ref_wide(big)) { println("wide mismatch at big"); return 3; }
+  if (wide(big + 1) != ref_wide(big + 1)) { println("wide mismatch at big+1"); return 4; }
+  if (wide(-4294967295) != ref_wide(-4294967295)) { println("wide mismatch neg"); return 5; }
+  return 0;
+}

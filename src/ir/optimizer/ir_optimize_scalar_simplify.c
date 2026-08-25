@@ -1416,6 +1416,214 @@ static int ir_branch_eq_chain_shortcut_pass(IRFunction *function, int *changed) 
   return 1;
 }
 
+#define IR_BITSET_MIN_KEYS 4
+#define IR_BITSET_MAX_KEY 62
+#define IR_BITSET_SLOTS 7
+
+static int ir_bitset_same_operand(const IROperand *a, const IROperand *b) {
+  return a->kind == b->kind && a->name && b->name &&
+         strcmp(a->name, b->name) == 0 &&
+         (a->kind == IR_OPERAND_TEMP || a->kind == IR_OPERAND_SYMBOL);
+}
+
+static int ir_bitset_key_ok(long long *keys, size_t count, long long key) {
+  if (key < 0 || key > IR_BITSET_MAX_KEY) {
+    return 0;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (keys[i] == key) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ir_bitset_emit(IRFunction *function, size_t at, size_t last,
+                          const IROperand *value, long long mask,
+                          long long max_key, const char *miss, int *changed) {
+  static int counter;
+  char guard_name[48];
+  char one_name[48];
+  char shift_name[48];
+  char mask_name[48];
+  char and_name[48];
+  int id = counter++;
+  IRInstruction *slot;
+  snprintf(guard_name, sizeof(guard_name), "__bset_g%d", id);
+  snprintf(one_name, sizeof(one_name), "__bset_o%d", id);
+  snprintf(shift_name, sizeof(shift_name), "__bset_s%d", id);
+  snprintf(mask_name, sizeof(mask_name), "__bset_m%d", id);
+  snprintf(and_name, sizeof(and_name), "__bset_a%d", id);
+
+  for (size_t k = at; k <= last; k++) {
+    ir_instruction_make_nop(&function->instructions[k]);
+  }
+
+  slot = &function->instructions[at];
+  slot->op = IR_OP_BINARY;
+  slot->text = mettle_strdup("<=");
+  slot->dest = ir_operand_temp(guard_name);
+  slot->lhs = ir_operand_copy(value);
+  slot->rhs = ir_operand_int(max_key);
+  slot->is_unsigned = 1;
+
+  slot = &function->instructions[at + 1];
+  slot->op = IR_OP_BRANCH_ZERO;
+  slot->lhs = ir_operand_temp(guard_name);
+  slot->text = mettle_strdup(miss);
+
+  slot = &function->instructions[at + 2];
+  slot->op = IR_OP_ASSIGN;
+  slot->dest = ir_operand_temp(one_name);
+  slot->lhs = ir_operand_int(1);
+
+  slot = &function->instructions[at + 3];
+  slot->op = IR_OP_BINARY;
+  slot->text = mettle_strdup("<<");
+  slot->dest = ir_operand_temp(shift_name);
+  slot->lhs = ir_operand_temp(one_name);
+  slot->rhs = ir_operand_copy(value);
+
+  slot = &function->instructions[at + 4];
+  slot->op = IR_OP_ASSIGN;
+  slot->dest = ir_operand_temp(mask_name);
+  slot->lhs = ir_operand_int(mask);
+
+  slot = &function->instructions[at + 5];
+  slot->op = IR_OP_BINARY;
+  slot->text = mettle_strdup("&");
+  slot->dest = ir_operand_temp(and_name);
+  slot->lhs = ir_operand_temp(shift_name);
+  slot->rhs = ir_operand_temp(mask_name);
+
+  slot = &function->instructions[at + 6];
+  slot->op = IR_OP_BRANCH_ZERO;
+  slot->lhs = ir_operand_temp(and_name);
+  slot->text = mettle_strdup(miss);
+
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+int ir_or_chain_to_bitset_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 1;
+  }
+  IRTempUseMap uses;
+  if (!ir_temp_use_map_init(&uses)) {
+    return 1;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (!ir_collect_instruction_temp_uses(&uses, &function->instructions[i])) {
+      ir_temp_use_map_destroy(&uses);
+      return 1;
+    }
+  }
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *first = &function->instructions[i];
+    long long keys[IR_BITSET_MAX_KEY + 2];
+    size_t key_count = 0;
+    size_t scan;
+    size_t tail;
+    size_t branch;
+    size_t label;
+    long long mask = 0;
+    long long max_key = 0;
+    if (first->op != IR_OP_BRANCH_EQ || first->is_float || !first->text ||
+        first->rhs.kind != IR_OPERAND_INT ||
+        (first->lhs.kind != IR_OPERAND_TEMP &&
+         first->lhs.kind != IR_OPERAND_SYMBOL) ||
+        !first->lhs.name) {
+      continue;
+    }
+
+    scan = i;
+    while (scan < function->instruction_count) {
+      const IRInstruction *ins = &function->instructions[scan];
+      if (ins->op == IR_OP_NOP) {
+        scan++;
+        continue;
+      }
+      if (ins->op != IR_OP_BRANCH_EQ || ins->is_float || !ins->text ||
+          strcmp(ins->text, first->text) != 0 ||
+          ins->rhs.kind != IR_OPERAND_INT ||
+          !ir_bitset_same_operand(&ins->lhs, &first->lhs) ||
+          !ir_bitset_key_ok(keys, key_count, ins->rhs.int_value)) {
+        break;
+      }
+      keys[key_count++] = ins->rhs.int_value;
+      scan++;
+    }
+    if (key_count == 0) {
+      continue;
+    }
+
+    if (!ir_find_next_non_nop(function, scan, &tail)) {
+      continue;
+    }
+    {
+      const IRInstruction *cmp = &function->instructions[tail];
+      if (cmp->op != IR_OP_BINARY || cmp->is_float || !cmp->text ||
+          strcmp(cmp->text, "==") != 0 || cmp->rhs.kind != IR_OPERAND_INT ||
+          cmp->dest.kind != IR_OPERAND_TEMP || !cmp->dest.name ||
+          !ir_bitset_same_operand(&cmp->lhs, &first->lhs) ||
+          !ir_bitset_key_ok(keys, key_count, cmp->rhs.int_value) ||
+          ir_temp_use_map_get(&uses, cmp->dest.name) != 1) {
+        continue;
+      }
+      keys[key_count++] = cmp->rhs.int_value;
+    }
+    if (!ir_find_next_non_nop(function, tail + 1, &branch)) {
+      continue;
+    }
+    {
+      const IRInstruction *br = &function->instructions[branch];
+      const IRInstruction *cmp = &function->instructions[tail];
+      if (br->op != IR_OP_BRANCH_ZERO || br->lhs.kind != IR_OPERAND_TEMP ||
+          !br->lhs.name || !br->text ||
+          strcmp(br->lhs.name, cmp->dest.name) != 0) {
+        continue;
+      }
+    }
+    if (!ir_find_next_non_nop(function, branch + 1, &label)) {
+      continue;
+    }
+    {
+      const IRInstruction *lab = &function->instructions[label];
+      if (lab->op != IR_OP_LABEL || !lab->text ||
+          strcmp(lab->text, first->text) != 0) {
+        continue;
+      }
+    }
+    if (key_count < IR_BITSET_MIN_KEYS ||
+        branch - i + 1 < IR_BITSET_SLOTS) {
+      continue;
+    }
+    for (size_t k = 0; k < key_count; k++) {
+      mask |= 1LL << keys[k];
+      if (keys[k] > max_key) {
+        max_key = keys[k];
+      }
+    }
+    {
+      IROperand value = ir_operand_copy(&first->lhs);
+      char *miss = mettle_strdup(function->instructions[branch].text);
+      int ok = value.name && miss &&
+               ir_bitset_emit(function, i, branch, &value, mask, max_key, miss,
+                              changed);
+      ir_operand_destroy(&value);
+      mettle_free_string(miss);
+      ir_temp_use_map_destroy(&uses);
+      return ok ? 1 : 1;
+    }
+  }
+  ir_temp_use_map_destroy(&uses);
+  return 1;
+}
+
 static int ir_simplify_redundant_assign(IRInstruction *instruction,
                                         int *changed) {
   if (!instruction || instruction->op != IR_OP_ASSIGN ||

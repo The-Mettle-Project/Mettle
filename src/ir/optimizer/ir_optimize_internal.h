@@ -460,6 +460,8 @@ int ir_redundancy_elimination_pass(IRFunction *function, int *changed);
 /* Two arms that differ only in which neighbouring field they read: select the
  * field offset instead of the path. */
 int ir_select_adjacent_field_pass(IRFunction *function, int *changed);
+
+int ir_or_chain_to_bitset_pass(IRFunction *function, int *changed);
 /* `(int32)buf[i]` on an unsigned narrow element: the load already put the
  * whole value in the register. */
 int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed);

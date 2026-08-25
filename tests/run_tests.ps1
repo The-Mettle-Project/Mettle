@@ -12767,6 +12767,11 @@ $runFixtures = @(
      What = "a vector kernel run inside a register-allocated frame produced the wrong value" },
   @{ Name = "divmod_pairs"; Path = "tests/codegen/divmod_pairs.mettle"
      What = "a fused divide lost its quotient or its remainder" },
+  @{ Name = "or_chain_bitset"; Path = "tests/codegen/or_chain_bitset.mettle"
+     What = "an or-chain of equality tests answered differently as a bit test"
+     AsmMustMatch = @(
+       @{ Fn = "classify"; Pattern = "shl" },
+       @{ Fn = "wide"; Pattern = "shl" }) },
   @{ Name = "switch_dense"; Path = "tests/codegen/switch_dense.mettle"
      What = "a dense switch answered the wrong arm"
      AsmMustMatch = @(
