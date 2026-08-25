@@ -591,6 +591,8 @@ int binary_emit_mov_eax_eax(BinaryCodeBuffer *buffer);
  * an almost-full boundary's worth of NOPs for a marginal gain. */
 #define BINARY_LOOP_ALIGN 16u
 #define BINARY_LOOP_ALIGN_MAX_PAD 11u
+#define BINARY_LOOP_ALIGN_TIGHT_MAX_PAD 15u
+#define BINARY_LOOP_TIGHT_MIR_INSTRUCTIONS 20u
 #define BINARY_LOOP_ALIGN_BIG 32u
 #define BINARY_LOOP_ALIGN_BIG_MAX_PAD 31u
 #define BINARY_LOOP_BIG_MIR_INSTRUCTIONS 32u

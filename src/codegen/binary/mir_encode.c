@@ -2372,10 +2372,15 @@ int mir_encode(MirFunction *fn) {
          * big enough that the extra padding costs nothing next to it. The
          * FURTHEST back-edge decides, so a nested loop sharing a header is
          * measured at its full extent. */
-        align_label[d] = (b - (size_t)d >= BINARY_LOOP_BIG_MIR_INSTRUCTIONS ||
-                          align_label[d] == 2)
-                             ? 2
-                             : 1;
+        if (b - (size_t)d >= BINARY_LOOP_BIG_MIR_INSTRUCTIONS ||
+            align_label[d] == 2) {
+          align_label[d] = 2;
+        } else if (b - (size_t)d <= BINARY_LOOP_TIGHT_MIR_INSTRUCTIONS &&
+                   align_label[d] != 1) {
+          align_label[d] = 3;
+        } else {
+          align_label[d] = 1;
+        }
       }
     }
   }
@@ -2386,6 +2391,10 @@ int mir_encode(MirFunction *fn) {
     size_t annot_off = ctx->code.size;
     if (in->op == MIR_LABEL && align_label && align_label[i]) {
       if (align_label[i] == 2) {
+        ctx->wants_wide_loop_alignment = 1;
+        ok = binary_emit_align_code(&ctx->code, BINARY_LOOP_ALIGN_BIG,
+                                    BINARY_LOOP_ALIGN_BIG_MAX_PAD);
+      } else if (align_label[i] == 3) {
         ctx->wants_wide_loop_alignment = 1;
         ok = binary_emit_align_code(&ctx->code, BINARY_LOOP_ALIGN_BIG,
                                     BINARY_LOOP_ALIGN_BIG_MAX_PAD);

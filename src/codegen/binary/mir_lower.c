@@ -6275,7 +6275,8 @@ static void mir_drop_dead_extensions(MirFunction *fn) {
 
 static size_t mir_label_index(const MirFunction *fn, const char *name);
 
-static int mir_vreg_defs_are_sext32(const MirFunction *fn, MirVregId v) {
+static int mir_vreg_defs_are_sext32(const MirFunction *fn, MirVregId v,
+                                    const unsigned char *guarded_add) {
   int defs = 0;
   for (size_t i = 0; i < fn->insn_count; i++) {
     const MirInst *in = &fn->insns[i];
@@ -6294,6 +6295,29 @@ static int mir_vreg_defs_are_sext32(const MirFunction *fn, MirVregId v) {
         !in->is_float && in->a.kind == MIR_OPK_MEM) {
       continue;
     }
+    if (in->op == MIR_MOV && !in->is_float && in->a.kind == MIR_OPK_IMM &&
+        in->a.imm >= -2147483648LL && in->a.imm <= 2147483647LL) {
+      continue;
+    }
+    if (in->op == MIR_ADD && in->width == 8 && !in->is_float &&
+        in->a.kind == MIR_OPK_VREG && in->a.vreg == v &&
+        in->b.kind == MIR_OPK_IMM && in->b.imm == 1) {
+      if (guarded_add && guarded_add[i]) {
+        continue;
+      }
+      size_t nx = i + 1;
+      while (nx < fn->insn_count && fn->insns[nx].op == MIR_NOP) {
+        nx++;
+      }
+      if (nx < fn->insn_count && fn->insns[nx].op == MIR_MOVSX &&
+          fn->insns[nx].width == 4 &&
+          fn->insns[nx].dst.kind == MIR_OPK_VREG &&
+          fn->insns[nx].dst.vreg == v &&
+          fn->insns[nx].a.kind == MIR_OPK_VREG &&
+          fn->insns[nx].a.vreg == v) {
+        continue;
+      }
+    }
     return 0;
   }
   return defs > 0;
@@ -6310,34 +6334,125 @@ static int mir_operand_reads_vreg(const MirOperand *op, MirVregId v) {
   return 0;
 }
 
+static int mir_sext_label_covered(const MirFunction *fn, size_t l, size_t g,
+                                  const unsigned char *visited,
+                                  unsigned char *memo);
+
+static int mir_sext_site_covered(const MirFunction *fn, size_t at, size_t g,
+                                 const unsigned char *visited,
+                                 unsigned char *memo) {
+  size_t i = at;
+  while (i > 0) {
+    if (i == g) {
+      return 1;
+    }
+    if (fn->insns[i].op == MIR_LABEL) {
+      return mir_sext_label_covered(fn, i, g, visited, memo);
+    }
+    i--;
+  }
+  return 0;
+}
+
+static int mir_sext_label_covered(const MirFunction *fn, size_t l, size_t g,
+                                  const unsigned char *visited,
+                                  unsigned char *memo) {
+  if (memo[l] == 1 || memo[l] == 3) {
+    return 1;
+  }
+  if (memo[l] == 2) {
+    return 0;
+  }
+  memo[l] = 3;
+  const char *name = fn->insns[l].dst.sym;
+  if (!name) {
+    memo[l] = 2;
+    return 0;
+  }
+  if (l > 0) {
+    size_t p = l - 1;
+    while (p > 0 && fn->insns[p].op == MIR_NOP) {
+      p--;
+    }
+    const MirInst *prev = &fn->insns[p];
+    if (prev->op != MIR_JMP && prev->op != MIR_RET) {
+      if (!visited[p] || !mir_sext_site_covered(fn, p, g, visited, memo)) {
+        memo[l] = 2;
+        return 0;
+      }
+    }
+  }
+  for (size_t j = 0; j < fn->insn_count; j++) {
+    const MirInst *jj = &fn->insns[j];
+    if (jj->op != MIR_JMP && jj->op != MIR_JCC && jj->op != MIR_CMPBR &&
+        jj->op != MIR_FCMPBR) {
+      continue;
+    }
+    if (jj->dst.kind != MIR_OPK_LABEL || !jj->dst.sym ||
+        strcmp(jj->dst.sym, name) != 0) {
+      continue;
+    }
+    if (j == g) {
+      continue;
+    }
+    if (!visited[j] || !mir_sext_site_covered(fn, j, g, visited, memo)) {
+      memo[l] = 2;
+      return 0;
+    }
+  }
+  memo[l] = 1;
+  return 1;
+}
+
 static void mir_elide_guarded_sext(MirFunction *fn) {
   if (!fn || fn->insn_count == 0) {
     return;
   }
   size_t n = fn->insn_count;
   unsigned char *visited = calloc(n, 1);
+  unsigned char *covered = calloc(n, 1);
+  unsigned char *guarded_add = calloc(n, 1);
   size_t *stack = malloc(n * sizeof(size_t));
-  if (!visited || !stack) {
+  if (!visited || !covered || !guarded_add || !stack) {
     free(visited);
+    free(covered);
+    free(guarded_add);
     free(stack);
     return;
   }
   for (size_t g = 0; g < n; g++) {
     const MirInst *guard = &fn->insns[g];
-    if (guard->op != MIR_CMPBR || guard->width != 8 || guard->cc != 0x8D ||
-        guard->is_float || guard->a.kind != MIR_OPK_VREG ||
-        guard->b.kind != MIR_OPK_VREG) {
+    if (guard->op != MIR_CMPBR ||
+        (guard->width != 8 && guard->width != 4) || guard->cc != 0x8D ||
+        guard->is_float || guard->a.kind != MIR_OPK_VREG) {
       continue;
     }
     MirVregId A = guard->a.vreg;
-    MirVregId B = guard->b.vreg;
-    if (A == B || !mir_vreg_defs_are_sext32(fn, A) ||
-        !mir_vreg_defs_are_sext32(fn, B)) {
+    MirVregId B = MIR_VREG_NONE;
+    int b_is_mem = 0;
+    if (guard->b.kind == MIR_OPK_VREG) {
+      B = guard->b.vreg;
+      if (A == B) {
+        continue;
+      }
+      if (guard->width == 8 &&
+          !mir_vreg_defs_are_sext32(fn, B, guarded_add)) {
+        continue;
+      }
+    } else if (guard->width == 4 && (guard->b.kind == MIR_OPK_MEM ||
+                                     guard->b.kind == MIR_OPK_STACKHOME)) {
+      b_is_mem = 1;
+    } else {
+      continue;
+    }
+    if (!mir_vreg_defs_are_sext32(fn, A, guarded_add)) {
       continue;
     }
     memset(visited, 0, n);
+    visited[g] = 1;
     size_t cand_movsx[8];
     size_t cand_add[8];
+    unsigned char cand_inplace[8];
     size_t cand_count = 0;
     size_t sp = 0;
     if (g + 1 < n) {
@@ -6371,8 +6486,32 @@ static void mir_elide_guarded_sext(MirFunction *fn) {
         }
         continue;
       }
+      if (b_is_mem && (in->dst.kind == MIR_OPK_MEM ||
+                       in->dst.kind == MIR_OPK_STACKHOME)) {
+        continue;
+      }
       if (in->dst.kind == MIR_OPK_VREG &&
-          (in->dst.vreg == A || in->dst.vreg == B)) {
+          (in->dst.vreg == A || (B != MIR_VREG_NONE && in->dst.vreg == B))) {
+        if (in->dst.vreg == A && in->op == MIR_ADD && in->width == 8 &&
+            !in->is_float && in->a.kind == MIR_OPK_VREG && in->a.vreg == A &&
+            in->b.kind == MIR_OPK_IMM && in->b.imm == 1 && cand_count < 8) {
+          size_t nx = i + 1;
+          while (nx < n && fn->insns[nx].op == MIR_NOP) {
+            nx++;
+          }
+          if (nx < n && fn->insns[nx].op == MIR_MOVSX &&
+              fn->insns[nx].width == 4 &&
+              fn->insns[nx].dst.kind == MIR_OPK_VREG &&
+              fn->insns[nx].dst.vreg == A &&
+              fn->insns[nx].a.kind == MIR_OPK_VREG &&
+              fn->insns[nx].a.vreg == A) {
+            cand_movsx[cand_count] = nx;
+            cand_add[cand_count] = i;
+            cand_inplace[cand_count] = 1;
+            cand_count++;
+          }
+          continue;
+        }
         if (in->dst.vreg == A && in->op == MIR_MOVSX && in->width == 4 &&
             in->a.kind == MIR_OPK_VREG) {
           MirVregId C = in->a.vreg;
@@ -6418,6 +6557,7 @@ static void mir_elide_guarded_sext(MirFunction *fn) {
               if (clean) {
                 cand_movsx[cand_count] = i;
                 cand_add[cand_count] = def_at;
+                cand_inplace[cand_count] = 0;
                 cand_count++;
               }
             }
@@ -6432,44 +6572,17 @@ static void mir_elide_guarded_sext(MirFunction *fn) {
     if (!cand_count) {
       continue;
     }
-    int sealed = 1;
-    for (size_t l = 0; l < n && sealed; l++) {
-      if (!visited[l] || fn->insns[l].op != MIR_LABEL ||
-          fn->insns[l].dst.kind != MIR_OPK_LABEL || !fn->insns[l].dst.sym) {
+    memset(covered, 0, n);
+    for (size_t c = 0; c < cand_count; c++) {
+      if (!mir_sext_site_covered(fn, cand_add[c], g, visited, covered)) {
         continue;
       }
-      if (l > 0) {
-        const MirInst *prev = &fn->insns[l - 1];
-        size_t p = l - 1;
-        while (p > 0 && prev->op == MIR_NOP) {
-          prev = &fn->insns[--p];
-        }
-        if (!visited[p] && prev->op != MIR_JMP && prev->op != MIR_RET &&
-            prev->op != MIR_NOP) {
-          sealed = 0;
-          break;
-        }
-      }
-      for (size_t j = 0; j < n && sealed; j++) {
-        const MirInst *jj = &fn->insns[j];
-        if (visited[j] ||
-            (jj->op != MIR_JMP && jj->op != MIR_JCC && jj->op != MIR_CMPBR &&
-             jj->op != MIR_FCMPBR)) {
-          continue;
-        }
-        if (jj->dst.kind == MIR_OPK_LABEL && jj->dst.sym &&
-            strcmp(jj->dst.sym, fn->insns[l].dst.sym) == 0) {
-          sealed = 0;
-        }
-      }
-    }
-    if (!sealed) {
-      continue;
-    }
-    for (size_t c = 0; c < cand_count; c++) {
-      MirInst *add = &fn->insns[cand_add[c]];
+
       MirInst *sext = &fn->insns[cand_movsx[c]];
-      add->dst = mir_op_vreg(A);
+      if (!cand_inplace[c]) {
+        fn->insns[cand_add[c]].dst = mir_op_vreg(A);
+      }
+      guarded_add[cand_add[c]] = 1;
       sext->op = MIR_NOP;
       sext->dst = mir_op_none();
       sext->a = mir_op_none();
@@ -6477,6 +6590,8 @@ static void mir_elide_guarded_sext(MirFunction *fn) {
     }
   }
   free(visited);
+  free(covered);
+  free(guarded_add);
   free(stack);
 }
 
