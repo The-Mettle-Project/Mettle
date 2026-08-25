@@ -234,6 +234,7 @@ typedef enum {
   MIR_JMP,        /* -> label */
   MIR_JCC,        /* test a; cc -> label (cc carries jcc opcode) */
   MIR_CMPBR,      /* cmp a,b; cc -> label (fused compare-and-branch) */
+  MIR_JMP_TABLE,  /* jump through aux's label table, indexed by a */
   MIR_LABEL,      /* defines label (sym) at this point */
   MIR_PREFETCH,   /* prefetcht0 [a]: a is a MEM operand (usually [vreg+0]).
                      A read-only use of the address register(s); no def, and
@@ -649,6 +650,13 @@ int mir_emit(MirFunction *fn, const MirInst *inst);
 /* Take ownership of `block` (freed by mir_function_destroy) and return it, or
  * NULL on OOM (which also sets fn->has_error; `block` is freed). */
 void *mir_function_own_aux(MirFunction *fn, void *block);
+
+#define MIR_MAX_JUMP_TABLES 64
+
+typedef struct {
+  char **labels;
+  size_t count;
+} MirJumpTable;
 
 /* ---- inline kernel table (mir_kernel.c) --------------------------------- */
 

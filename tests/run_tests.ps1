@@ -12768,7 +12768,12 @@ $runFixtures = @(
   @{ Name = "divmod_pairs"; Path = "tests/codegen/divmod_pairs.mettle"
      What = "a fused divide lost its quotient or its remainder" },
   @{ Name = "switch_dense"; Path = "tests/codegen/switch_dense.mettle"
-     What = "a codegen check failed" },
+     What = "a dense switch answered the wrong arm"
+     AsmMustMatch = @(
+       @{ Fn = "dense"; Pattern = "jmp_table" },
+       @{ Fn = "negative_base"; Pattern = "jmp_table" },
+       @{ Fn = "holes"; Pattern = "jmp_table" },
+       @{ Fn = "dispatch_loop"; Pattern = "jmp_table" }) },
   @{ Name = "enums_match"; Path = "tests/codegen/enums_match.mettle"
      What = "a codegen check failed" },
   @{ Name = "tagged_enum_aggregate"; Path = "tests/codegen/tagged_enum_aggregate.mettle"
@@ -12880,6 +12885,15 @@ foreach ($fixture in $runFixtures) {
       & $fixtureExe | Out-Null
       if ($LASTEXITCODE -ne 0) {
         throw "$($fixture.What) (fixture check #$LASTEXITCODE)"
+      }
+      if ($fixture.AsmMustMatch -and $mode.Name -eq "release") {
+        foreach ($want in @($fixture.AsmMustMatch)) {
+          $asm = & $CompilerPath --build --release --annotate-asm `
+            "--annotate-fn=$($want.Fn)" $fixture.Path -o $fixtureExe 2>&1 | Out-String
+          if ($asm -notmatch $want.Pattern) {
+            throw "codegen for $($want.Fn) no longer matches '$($want.Pattern)'"
+          }
+        }
       }
       Write-CaseResult -Name $caseName -Passed $true
     }

@@ -234,6 +234,7 @@ const char *mir_opcode_name(MirOpcode op) {
   case MIR_JMP: return "jmp";
   case MIR_JCC: return "jcc";
   case MIR_CMPBR: return "cmpbr";
+  case MIR_JMP_TABLE: return "jmp_table";
   case MIR_LABEL: return "label";
   case MIR_CALL: return "call";
   case MIR_CALL_INDIRECT: return "call_indirect";

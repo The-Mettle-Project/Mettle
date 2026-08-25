@@ -15,6 +15,37 @@
 @noinline fn fallthrough_default(x: int32) -> int32 {
   switch (x) { case 5: return 50; default: return 99; }
 }
+@noinline fn negative_base(x: int32) -> int32 {
+  switch (x) {
+    case -6: return 1; case -5: return 2; case -4: return 3;
+    case -3: return 4; case -2: return 5; case -1: return 6;
+    case 0: return 7; default: return -1;
+  }
+}
+@noinline fn holes(x: int32) -> int32 {
+  switch (x) {
+    case 2: return 20; case 3: return 30; case 5: return 50;
+    case 8: return 80; case 9: return 90; case 11: return 110;
+    default: return 7;
+  }
+}
+@noinline fn dispatch_loop(ops: int32*, n: int32) -> int64 {
+  var acc: int64 = 1;
+  var i: int32 = 0;
+  while (i < n) {
+    switch (ops[i]) {
+      case 0: acc = acc + 1; break;
+      case 1: acc = acc * 2; break;
+      case 2: acc = acc - 3; break;
+      case 3: acc = acc ^ 9; break;
+      case 4: acc = acc + i; break;
+      case 5: acc = acc << 1; break;
+      default: acc = acc + 100;
+    }
+    i = i + 1;
+  }
+  return acc;
+}
 fn main() -> int32 {
   var t: int32 = 0;
   for i in 0..12 { t = t + dense(i); }
@@ -24,5 +55,21 @@ fn main() -> int32 {
   if (sparse(0) != 1 || sparse(1000) != 2 || sparse(100000) != 3) { return 4; }
   if (sparse(-50) != 4 || sparse(7) != -1) { return 5; }
   if (fallthrough_default(5) != 50 || fallthrough_default(6) != 99) { return 6; }
+
+  var n: int32 = 0;
+  for i in -6..0 { n = n + negative_base(i); }
+  if (n != 21) { return 7; }
+  if (negative_base(1) != -1 || negative_base(-7) != -1) { return 8; }
+
+  var h: int32 = 0;
+  for i in 0..11 { h = h + holes(i); }
+  if (h != 312) { return 9; }
+  if (holes(-1) != 7 || holes(12) != 7) { return 10; }
+
+  var ops: int32[16];
+  var k: int32 = 0;
+  while (k < 16) { ops[k] = k % 7; k = k + 1; }
+  var acc: int64 = dispatch_loop(ops, 16);
+  if (acc != 1262) { return 11; }
   return 0;
 }

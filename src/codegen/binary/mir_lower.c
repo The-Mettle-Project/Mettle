@@ -3415,6 +3415,21 @@ static int mir_lower_ir_kernel(MirFunction *fn, CodeGenerator *g,
   return 1;
 }
 
+static int mir_return_literal_is_canonical(const MirFunction *fn,
+                                          const IROperand *value) {
+  long long v;
+  int bits;
+  if (!value || value->kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  v = value->int_value;
+  bits = fn->scalar_return_width * 8;
+  if (fn->scalar_return_signed) {
+    return v >= -(1ll << (bits - 1)) && v < (1ll << (bits - 1));
+  }
+  return v >= 0 && v < (1ll << bits);
+}
+
 static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                                  BinaryFunctionContext *ctx, MirNameMap *map,
                                  const IRInstruction *in,
@@ -4049,8 +4064,9 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                            want / 8)) {
           return 0;
         }
-      } else if (fn->scalar_return_width == 1 || fn->scalar_return_width == 2 ||
-                 fn->scalar_return_width == 4) {
+      } else if ((fn->scalar_return_width == 1 || fn->scalar_return_width == 2 ||
+                  fn->scalar_return_width == 4) &&
+                 !mir_return_literal_is_canonical(fn, &in->lhs)) {
         /* Canonicalize a narrow integer return to 64 bits (the high RAX bits
          * are ABI-undefined for a sub-64-bit return, and MIR may have left
          * garbage there) so a caller using the full register is correct. */
@@ -7343,6 +7359,176 @@ static void mir_slp_pair_f64(MirFunction *fn) {
   }
 }
 
+static size_t mir_label_index(const MirFunction *fn, const char *name);
+
+#define MIR_JUMP_TABLE_MIN_CASES 5
+#define MIR_JUMP_TABLE_MAX_SPAN 512
+
+static int mir_jt_case(const MirInst *in, MirVregId *key, long long *value) {
+  if (in->op != MIR_CMPBR || in->is_float || in->cc != 0x84 || in->width != 8 ||
+      in->a.kind != MIR_OPK_VREG || in->b.kind != MIR_OPK_IMM ||
+      in->dst.kind != MIR_OPK_LABEL || !in->dst.sym) {
+    return 0;
+  }
+  if (*key != MIR_VREG_NONE && in->a.vreg != *key) {
+    return 0;
+  }
+  *key = in->a.vreg;
+  *value = in->b.imm;
+  return 1;
+}
+
+static char *mir_jt_own_name(MirFunction *fn, const char *name) {
+  char *copy = mettle_strdup(name);
+  if (!copy) {
+    return NULL;
+  }
+  if (fn->owned_sym_count >= fn->owned_sym_capacity) {
+    size_t nc = fn->owned_sym_capacity ? fn->owned_sym_capacity * 2 : 8;
+    char **grown = (char **)realloc(fn->owned_syms, nc * sizeof(char *));
+    if (!grown) {
+      free(copy);
+      return NULL;
+    }
+    fn->owned_syms = grown;
+    fn->owned_sym_capacity = nc;
+  }
+  fn->owned_syms[fn->owned_sym_count++] = copy;
+  return copy;
+}
+
+static void mir_build_jump_tables(MirFunction *fn) {
+  if (!fn || fn->insn_count == 0) {
+    return;
+  }
+  for (size_t i = 0; i + MIR_JUMP_TABLE_MIN_CASES < fn->insn_count; i++) {
+    MirVregId key = MIR_VREG_NONE;
+    long long value = 0;
+    if (!mir_jt_case(&fn->insns[i], &key, &value)) {
+      continue;
+    }
+    size_t j = i;
+    long long lo = value;
+    long long hi = value;
+    while (j < fn->insn_count && mir_jt_case(&fn->insns[j], &key, &value)) {
+      if (value < lo) {
+        lo = value;
+      }
+      if (value > hi) {
+        hi = value;
+      }
+      j++;
+    }
+    size_t cases = j - i;
+    long long span = hi - lo + 1;
+    if (cases < MIR_JUMP_TABLE_MIN_CASES || span > MIR_JUMP_TABLE_MAX_SPAN ||
+        span > 2 * (long long)cases || j >= fn->insn_count) {
+      i = j > i ? j - 1 : i;
+      continue;
+    }
+
+    const char *fallthrough = NULL;
+    if (fn->insns[j].op == MIR_LABEL && fn->insns[j].dst.kind == MIR_OPK_LABEL) {
+      fallthrough = fn->insns[j].dst.sym;
+    } else if (fn->insns[j].op == MIR_JMP &&
+               fn->insns[j].dst.kind == MIR_OPK_LABEL) {
+      fallthrough = fn->insns[j].dst.sym;
+    }
+    if (!fallthrough) {
+      i = j - 1;
+      continue;
+    }
+
+    char **slots = (char **)calloc((size_t)span, sizeof(char *));
+    MirJumpTable *table = (MirJumpTable *)calloc(1, sizeof(MirJumpTable));
+    if (!slots || !table) {
+      free(slots);
+      free(table);
+      return;
+    }
+    int duplicate = 0;
+    for (size_t k = i; k < j; k++) {
+      long long slot = fn->insns[k].b.imm - lo;
+      if (slots[slot]) {
+        duplicate = 1;
+        break;
+      }
+      slots[slot] = mir_jt_own_name(fn, fn->insns[k].dst.sym);
+      if (!slots[slot]) {
+        duplicate = 1;
+        break;
+      }
+    }
+    char *deflt = duplicate ? NULL : mir_jt_own_name(fn, fallthrough);
+    int forward = 1;
+    for (size_t k = i; k < j && forward; k++) {
+      size_t at = mir_label_index(fn, fn->insns[k].dst.sym);
+      if (at == (size_t)-1 || at <= j) {
+        forward = 0;
+      }
+    }
+    MirVregId biased = mir_new_vreg(fn, MIR_RC_GP, 8);
+    if (duplicate || !deflt || !forward || biased == MIR_VREG_NONE) {
+      free(slots);
+      free(table);
+      i = j - 1;
+      continue;
+    }
+    for (long long k = 0; k < span; k++) {
+      if (!slots[k]) {
+        slots[k] = deflt;
+      }
+    }
+    table->labels = slots;
+    table->count = (size_t)span;
+    if (!mir_function_own_aux(fn, table)) {
+      free(slots);
+      i = j - 1;
+      continue;
+    }
+    if (!mir_function_own_aux(fn, slots)) {
+      i = j - 1;
+      continue;
+    }
+
+    MirInst bias = {0};
+    bias.op = lo == 0 ? MIR_MOV : MIR_SUB;
+    bias.dst = mir_op_vreg(biased);
+    bias.a = mir_op_vreg(key);
+    bias.b = lo == 0 ? mir_op_none() : mir_op_imm(lo);
+    bias.width = 8;
+    bias.ir_index = fn->insns[i].ir_index;
+
+    MirInst guard = {0};
+    guard.op = MIR_CMPBR;
+    guard.dst = mir_op_label(deflt);
+    guard.a = mir_op_vreg(biased);
+    guard.b = mir_op_imm(span - 1);
+    guard.width = 8;
+    guard.is_unsigned = 1;
+    guard.cc = 0x87;
+    guard.ir_index = fn->insns[i].ir_index;
+
+    MirInst dispatch = {0};
+    dispatch.op = MIR_JMP_TABLE;
+    dispatch.a = mir_op_vreg(biased);
+    dispatch.width = 8;
+    dispatch.aux = table;
+    dispatch.ir_index = fn->insns[i].ir_index;
+
+    fn->insns[i] = bias;
+    fn->insns[i + 1] = guard;
+    fn->insns[i + 2] = dispatch;
+    for (size_t k = i + 3; k < j; k++) {
+      MirInst nop = {0};
+      nop.op = MIR_NOP;
+      nop.ir_index = -1;
+      fn->insns[k] = nop;
+    }
+    i = j - 1;
+  }
+}
+
 static void mir_rotate_loops(MirFunction *fn) {
   if (!fn || fn->insn_count < 3) {
     return;
@@ -7382,6 +7568,19 @@ static void mir_rotate_loops(MirFunction *fn) {
         nbe++;
       } else {
         other_edge = 1;
+      }
+    }
+    for (size_t k = 0; k < fn->insn_count && !other_edge; k++) {
+      const MirJumpTable *tbl;
+      if (fn->insns[k].op != MIR_JMP_TABLE || !fn->insns[k].aux) {
+        continue;
+      }
+      tbl = (const MirJumpTable *)fn->insns[k].aux;
+      for (size_t e = 0; e < tbl->count; e++) {
+        if (tbl->labels[e] && strcmp(tbl->labels[e], hname) == 0) {
+          other_edge = 1;
+          break;
+        }
       }
     }
     if (nbe != 1 || other_edge) {
@@ -8339,6 +8538,7 @@ int code_generator_binary_emit_function_via_mir(
   mir_fold_address_offsets(&fn);
   mir_cse_loads(&fn);
   mir_slp_pair_f64(&fn);
+  mir_build_jump_tables(&fn);
   mir_rotate_loops(&fn);
   mir_thread_branch_over_jump(&fn);
   mir_sink_cold_exits(&fn);

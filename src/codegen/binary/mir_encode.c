@@ -2152,6 +2152,14 @@ int mir_encode(MirFunction *fn) {
    * (the context's code buffer may already hold earlier functions). */
   size_t annot_base = ctx->code.size;
   int annot = mir_annotate_enabled();
+  struct {
+    size_t lea_off;
+    const MirJumpTable *table;
+  } pending_tables[MIR_MAX_JUMP_TABLES];
+  size_t pending_table_count = 0;
+  size_t ret_count = 0;
+  size_t epilogue_length = 0;
+  int share_epilogue = 0;
 
   if (!mir_layout_frame(fn) || !mir_emit_prologue(fn)) {
     return 0;
@@ -2161,6 +2169,16 @@ int mir_encode(MirFunction *fn) {
                                   ctx->code.size - annot_base,
                                   ctx->code.data + annot_base);
   }
+
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (fn->insns[i].op == MIR_RET) {
+      ret_count++;
+    }
+  }
+  epilogue_length = (fn->used_inline_vector ? 1u : 0u) + ctx->saved_xmm_count +
+                    ctx->saved_register_count +
+                    (ctx->omit_frame_pointer ? 2u : 3u);
+  share_epilogue = ret_count >= 3 && epilogue_length >= 3;
 
   /* Loop-header alignment: a label that is the target of a BACKWARD branch is a
    * loop top; pad it to BINARY_LOOP_ALIGN (like gcc -falign-loops) so the hot
@@ -3003,9 +3021,49 @@ int mir_encode(MirFunction *fn) {
       }
       break;
     }
-    case MIR_RET:
-      ok = mir_emit_epilogue(fn);
+    case MIR_JMP_TABLE: {
+      const MirJumpTable *tbl = (const MirJumpTable *)in->aux;
+      int rok;
+      BinaryGpRegister idx;
+      size_t lea_off = 0;
+      if (!tbl || pending_table_count >= MIR_MAX_JUMP_TABLES) {
+        ok = enc_err(fn, "jump table without a target list");
+        break;
+      }
+      idx = value_reg(fn, &in->a, SCRATCH_A, &rok);
+      if (!rok) {
+        ok = 0;
+        break;
+      }
+      if (!binary_emit_lea_reg_rip_placeholder(&ctx->code, SCRATCH_B,
+                                               &lea_off) ||
+          !emit_ext_load(&ctx->code, SCRATCH_A, SCRATCH_B, 1, idx, 4, 0, 4, 1) ||
+          !binary_emit_alu_reg_reg(&ctx->code, 0x01, SCRATCH_A, SCRATCH_B) ||
+          !binary_emit_jmp_reg(&ctx->code, SCRATCH_A)) {
+        ok = enc_err(fn, "out of memory in jump table");
+        break;
+      }
+      pending_tables[pending_table_count].lea_off = lea_off;
+      pending_tables[pending_table_count].table = tbl;
+      pending_table_count++;
       break;
+    }
+    case MIR_RET: {
+      size_t rest = i + 1;
+      while (rest < fn->insn_count && fn->insns[rest].op == MIR_NOP) {
+        rest++;
+      }
+      if (!share_epilogue) {
+        ok = mir_emit_epilogue(fn);
+      } else if (rest < fn->insn_count) {
+        size_t off = 0;
+        if (!binary_emit_jmp_placeholder(&ctx->code, &off) ||
+            !binary_label_fixup_table_add(&ctx->label_fixups, ".mepi", off)) {
+          ok = enc_err(fn, "out of memory in shared epilogue jump");
+        }
+      }
+      break;
+    }
     default:
       ok = enc_err(fn, "unsupported MIR opcode in encoder");
       break;
@@ -3021,6 +3079,44 @@ int mir_encode(MirFunction *fn) {
     }
   }
   free(align_label);
+
+  if (share_epilogue) {
+    if (!binary_label_table_define(&ctx->labels, ".mepi", ctx->code.size)) {
+      return enc_err(fn, "duplicate shared epilogue label");
+    }
+    if (!mir_emit_epilogue(fn)) {
+      return 0;
+    }
+  }
+
+  for (size_t t = 0; t < pending_table_count; t++) {
+    const MirJumpTable *tbl = pending_tables[t].table;
+    size_t table_off;
+    while ((ctx->code.size & 3u) != 0u) {
+      if (!binary_code_buffer_append_u8(&ctx->code, 0xCC)) {
+        return enc_err(fn, "out of memory in jump table");
+      }
+    }
+    table_off = ctx->code.size;
+    if (!binary_function_context_patch_rel32(ctx, pending_tables[t].lea_off,
+                                             table_off)) {
+      return enc_err(fn, "jump table out of range");
+    }
+    for (size_t e = 0; e < tbl->count; e++) {
+      BinaryLabelEntry *label = binary_label_table_get(&ctx->labels,
+                                                       tbl->labels[e]);
+      long long delta;
+      if (!label) {
+        return enc_err(fn, "undefined jump table target");
+      }
+      delta = (long long)label->offset - (long long)table_off;
+      if (delta < -2147483648LL || delta > 2147483647LL ||
+          !binary_code_buffer_append_u32(&ctx->code,
+                                         (uint32_t)(int32_t)delta)) {
+        return enc_err(fn, "jump table out of range");
+      }
+    }
+  }
 
   /* Resolve label/jump rel32 fixups against the defined labels. */
   if (!code_generator_binary_resolve_fixups(fn->generator, ctx,
