@@ -514,6 +514,20 @@ static int encode_alu(MirFunction *fn, const MirInst *in) {
         }
       }
     }
+    /* The same trick with a constant: `D = a +/- k` for a live in a register
+     * is one `lea D, [a + k]` instead of `mov D, a; add D, k`. This is what
+     * every `j = i + 1` lowers to, so it lands in the body of every counted
+     * loop whose bump is read into a different value than it overwrites. */
+    if ((in->op == MIR_ADD || is_sub) && !w32 &&
+        in->b.kind == MIR_OPK_IMM && in->b.imm >= -2147483647LL &&
+        in->b.imm <= 2147483647LL && !operand_in_phys(fn, &in->a, D)) {
+      BinaryGpRegister ra;
+      long long disp = is_sub ? -in->b.imm : in->b.imm;
+      if (operand_gp_reg(fn, &in->a, &ra) && ra != BINARY_GP_RSP &&
+          binary_emit_lea_reg_mem(code, D, ra, (int)disp)) {
+        return 1;
+      }
+    }
     if (operand_in_phys(fn, &in->b, D)) {
       /* b already occupies the destination register. */
       if (is_sub) {

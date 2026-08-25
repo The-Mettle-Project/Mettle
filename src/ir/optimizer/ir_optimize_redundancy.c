@@ -211,9 +211,20 @@ static int re_opcode_is_scalar(IROpcode op) {
   }
 }
 
-/* Count every write. The kernels and calls outside the scalar set can name
- * their outputs in dest, lhs, or rhs, so all three count there: an
- * over-counted name simply stops crossing blocks. */
+/* A call's arguments are values it receives, never storage it writes: the
+ * callee gets a copy of `p`, and nothing it does can make the caller's `p`
+ * name a different address. Storage a callee really can reach is reachable
+ * some other way -- a global, or a local whose address was taken -- and
+ * re_symbol_is_aliasable already refuses to cache those. The recognizer
+ * opcodes are different: several of them name a second output in
+ * `arguments[]`, so outside the call forms every operand still counts. */
+static int re_opcode_writes_through_arguments(IROpcode op) {
+  return op != IR_OP_CALL && op != IR_OP_CALL_INDIRECT;
+}
+
+/* Count every write. The kernels outside the scalar set can name their
+ * outputs in dest, lhs, or rhs, so all three count there: an over-counted
+ * name simply stops crossing blocks. */
 static int re_collect_defs(const IRFunction *function, REDefs *defs) {
   for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *ins = &function->instructions[i];
@@ -225,6 +236,9 @@ static int re_collect_defs(const IRFunction *function, REDefs *defs) {
       return 0;
     }
     if (re_opcode_is_scalar(ins->op) && ins->op != IR_OP_ROTATE_ADD) {
+      continue;
+    }
+    if (!re_opcode_writes_through_arguments(ins->op)) {
       continue;
     }
     if (!re_note_def(defs, &ins->lhs, i) || !re_note_def(defs, &ins->rhs, i)) {
@@ -1833,9 +1847,30 @@ static int re_region_survives_log(const IRFunction *function,
   return 1;
 }
 
+/* Does this instruction dereference `addr`'s base far enough to prove that a
+ * load reaching `reach` bytes from that base cannot fault? An access at
+ * base+off of n bytes proves the object spans [0, off+n): the program itself
+ * derived that address from this base and read it. */
+static int re_access_reaches(const IRFunction *function, const REDefs *defs,
+                             const IRInstruction *ins, const REAddr *addr,
+                             long long reach) {
+  const IROperand *ao = ins->op == IR_OP_LOAD    ? &ins->lhs
+                        : ins->op == IR_OP_STORE ? &ins->dest
+                                                 : NULL;
+  REAddr pa = {0};
+  if (!ao || ins->rhs.kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  re_resolve_addr(function, defs, ao, &pa, 0);
+  return pa.valid && pa.name && pa.is_address_of == addr->is_address_of &&
+         pa.kind == addr->kind && strcmp(pa.name, addr->name) == 0 &&
+         pa.offset >= 0 && pa.offset + ins->rhs.int_value >= reach;
+}
+
 /* One hoist per scan: an insertion moves every instruction behind it, which
  * stales the def-index map the address resolver walks, so the caller rebuilds
  * and rescans after each success. Returns 1 when a load moved. */
+
 static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
                                  const IRTempValueMap *addr_taken,
                                  int *changed) {
@@ -1908,21 +1943,28 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
         continue;
       }
 
-      /* Dereferenceability: the prefix already touches this base, or this
-       * load IS in the prefix. */
+      /* Dereferenceability: something that runs on every entry to the loop
+       * already reaches at least as far into this base, so the preheader copy
+       * cannot fault where the original could not. Two regions qualify: the
+       * header's straight-line prefix, and the straight-line preheader behind
+       * it -- which is where THIS pass puts the loads it has already hoisted.
+       * Without the second, hoisting the first field read out of a loop
+       * removed the evidence that let the next one move, and which field
+       * escaped depended on the order they happened to appear in. */
+      long long reach = addr.offset + load->rhs.int_value;
       int safe = i < prefix_end;
       for (size_t k = header + 1; k < prefix_end && !safe; k++) {
-        const IRInstruction *acc = &function->instructions[k];
-        const IROperand *ao = acc->op == IR_OP_LOAD    ? &acc->lhs
-                              : acc->op == IR_OP_STORE ? &acc->dest
-                                                       : NULL;
-        REAddr pa = {0};
-        if (!ao) {
-          continue;
+        safe = re_access_reaches(function, &defs, &function->instructions[k],
+                                 &addr, reach);
+      }
+      for (size_t k = header; k-- > 0 && !safe;) {
+        const IRInstruction *back = &function->instructions[k];
+        if (back->op == IR_OP_LABEL || back->op == IR_OP_JUMP ||
+            back->op == IR_OP_RETURN || back->op == IR_OP_BRANCH_ZERO ||
+            back->op == IR_OP_BRANCH_EQ) {
+          break; /* behind here control need not have come this way */
         }
-        re_resolve_addr(function, &defs, ao, &pa, 0);
-        safe = pa.valid && pa.name && pa.is_address_of == addr.is_address_of &&
-               pa.kind == addr.kind && strcmp(pa.name, addr.name) == 0;
+        safe = re_access_reaches(function, &defs, back, &addr, reach);
       }
       if (!safe) {
         continue;

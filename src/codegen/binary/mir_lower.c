@@ -5559,6 +5559,78 @@ static int mir_addr_base_operand_kind(const IROperand *operand) {
           operand->kind == IR_OPERAND_SYMBOL);
 }
 
+/* `p->nodes[i].field` arrives as two adds: `%e = nodes + i*40` and then
+ * `%a = %e + 8`. The constant-displacement fallback below folds the second one
+ * and stops, leaving the first as a real `lea` -- once per field, because each
+ * field builds its own copy of the element address. x86 carries both in one
+ * operand, so fold the pair: [nodes + i*40 + 8].
+ *
+ * Only when the element address exists solely to carry this one access (a
+ * single read, which is the shape every field access produces) and neither of
+ * its operands is rewritten between the add and the access. Returns 1 with
+ * the base, index and scale filled in, and `inner` set to the add to retire. */
+static int mir_addr_fold_through_inner_add(const IRFunction *f,
+                                           const MirTempUseIndex *uses,
+                                           const IROperand *outer_base,
+                                           const char *access_addr_name,
+                                           IROperand *base, IROperand *index,
+                                           int *scale, long *inner,
+                                           long *index_def) {
+  if (!outer_base || outer_base->kind != IR_OPERAND_TEMP || !outer_base->name) {
+    return 0;
+  }
+  if (mir_temp_read_count(uses, outer_base->name) != 1) {
+    return 0; /* another reader still needs the address in a register */
+  }
+  long ii = mir_temp_def_index(uses, outer_base->name);
+  if (ii < 0) {
+    return 0;
+  }
+  const IRInstruction *inner_add = &f->instructions[ii];
+  if (inner_add->op != IR_OP_BINARY || inner_add->is_float || !inner_add->text ||
+      strcmp(inner_add->text, "+") != 0) {
+    return 0;
+  }
+  const IROperand *order[2][2] = {{&inner_add->lhs, &inner_add->rhs},
+                                  {&inner_add->rhs, &inner_add->lhs}};
+  for (int t = 0; t < 2; t++) {
+    const IROperand *b = order[t][0];
+    const IROperand *x = order[t][1];
+    if (!mir_addr_base_operand_kind(b) || !mir_addr_base_operand_kind(x)) {
+      continue;
+    }
+    /* The index may already be scaled by a legal SIB factor, in which case the
+     * shift comes along too -- but only when nothing else reads it. */
+    IROperand idx = *x;
+    int sc = 1;
+    long xdef = -1;
+    if (x->kind == IR_OPERAND_TEMP && x->name &&
+        mir_temp_read_count(uses, x->name) == 1) {
+      long xi = mir_temp_def_index(uses, x->name);
+      IROperand decoded;
+      int decoded_scale;
+      if (xi >= 0 && mir_decode_scale(&f->instructions[xi], &decoded,
+                                      &decoded_scale) &&
+          mir_addr_base_operand_kind(&decoded)) {
+        idx = decoded;
+        sc = decoded_scale;
+        xdef = xi;
+      }
+    }
+    if (!mir_addr_fold_multiuse_safe(f, (size_t)ii, access_addr_name, b, &idx,
+                                     1)) {
+      continue;
+    }
+    *base = *b;
+    *index = idx;
+    *scale = sc;
+    *inner = ii;
+    *index_def = xdef;
+    return 1;
+  }
+  return 0;
+}
+
 static void mir_compute_address_folds(const IRFunction *f,
                                       const MirTempUseIndex *uses, char *skip,
                                       MirAddrFold *folds) {
@@ -5730,11 +5802,32 @@ static void mir_compute_address_folds(const IRFunction *f,
           ((addr_reads == 1 && !base_is_symbol) ||
            mir_addr_fold_multiuse_safe(f, (size_t)ai, addr->name, base, cst,
                                        addr_reads))) {
-        folds[i].valid = 1;
-        folds[i].base = *base;
-        folds[i].index = *cst;
-        folds[i].scale = 1;
-        skip[ai] = 1; /* fold the ptr+const add into the memory displacement */
+        IROperand deep_base;
+        IROperand deep_index;
+        int deep_scale = 1;
+        long inner = -1;
+        long index_def = -1;
+        if (addr_reads == 1 &&
+            mir_addr_fold_through_inner_add(f, uses, base, addr->name,
+                                            &deep_base, &deep_index,
+                                            &deep_scale, &inner, &index_def)) {
+          folds[i].valid = 1;
+          folds[i].base = deep_base;
+          folds[i].index = deep_index;
+          folds[i].scale = deep_scale;
+          folds[i].disp = cst->int_value;
+          skip[ai] = 1;    /* the +const */
+          skip[inner] = 1; /* the element address it was built on */
+          if (index_def >= 0) {
+            skip[index_def] = 1; /* the scale the SIB now carries */
+          }
+        } else {
+          folds[i].valid = 1;
+          folds[i].base = *base;
+          folds[i].index = *cst;
+          folds[i].scale = 1;
+          skip[ai] = 1; /* fold the ptr+const add into the memory displacement */
+        }
       }
     }
   }
