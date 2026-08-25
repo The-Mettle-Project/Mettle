@@ -533,7 +533,7 @@ static int encode_alu(MirFunction *fn, const MirInst *in) {
      * the SIB index can't be RSP, so swap operands if needed (ADD commutes).
      * MIR consumes condition flags only through explicit CMP, so LEA not
      * setting flags is fine. */
-    if (in->op == MIR_ADD && !w32 && !operand_in_phys(fn, &in->a, D) &&
+    if (in->op == MIR_ADD && !operand_in_phys(fn, &in->a, D) &&
         !operand_in_phys(fn, &in->b, D)) {
       BinaryGpRegister ra, rb;
       if (operand_gp_reg(fn, &in->a, &ra) && operand_gp_reg(fn, &in->b, &rb)) {
@@ -543,19 +543,22 @@ static int encode_alu(MirFunction *fn, const MirInst *in) {
           index = ra;
         }
         if (index != BINARY_GP_RSP &&
-            binary_emit_lea_reg_base_index_scale_disp(code, D, base, index, 1,
-                                                      0)) {
+            (w32 ? binary_emit_lea32_reg_base_index_scale_disp(code, D, base,
+                                                               index, 1, 0)
+                 : binary_emit_lea_reg_base_index_scale_disp(code, D, base,
+                                                             index, 1, 0))) {
           return 1;
         }
       }
     }
-    if ((in->op == MIR_ADD || is_sub) && !w32 &&
+    if ((in->op == MIR_ADD || is_sub) &&
         in->b.kind == MIR_OPK_IMM && in->b.imm >= -2147483647LL &&
         in->b.imm <= 2147483647LL && !operand_in_phys(fn, &in->a, D)) {
       BinaryGpRegister ra;
       long long disp = is_sub ? -in->b.imm : in->b.imm;
       if (operand_gp_reg(fn, &in->a, &ra) && ra != BINARY_GP_RSP &&
-          binary_emit_lea_reg_mem(code, D, ra, (int)disp)) {
+          (w32 ? binary_emit_lea32_reg_mem(code, D, ra, (int)disp)
+               : binary_emit_lea_reg_mem(code, D, ra, (int)disp))) {
         return 1;
       }
     }
@@ -604,8 +607,12 @@ static int encode_imul(MirFunction *fn, const MirInst *in) {
     BinaryGpRegister stage = (target == SCRATCH_A) ? SCRATCH_B : SCRATCH_A;
     if (b_imm32) {
       BinaryGpRegister areg = value_reg(fn, &in->a, stage, &ok);
-      if (!ok || !binary_emit_imul_reg_reg_imm32_w32(code, target, areg,
-                                                     (uint32_t)in->b.imm)) {
+      BinaryGpRegister mul_scratch =
+          (areg == stage) ? ((stage == SCRATCH_A) ? SCRATCH_B : SCRATCH_A)
+                          : stage;
+      if (!ok || !binary_emit_imul_reg_reg_imm32_scratch_w32(
+                     code, target, areg, (uint32_t)in->b.imm,
+                     mul_scratch != target, mul_scratch)) {
         return enc_err(fn, "out of memory in imul32 imm");
       }
     } else if (dst_in_reg && operand_in_phys(fn, &in->b, target)) {

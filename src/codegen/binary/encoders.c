@@ -823,6 +823,92 @@ int binary_emit_lea_reg_base_index_scale_disp(
   return 1;
 }
 
+int binary_emit_lea32_reg_mem(BinaryCodeBuffer *buffer,
+                              BinaryGpRegister destination,
+                              BinaryGpRegister base, int displacement) {
+  return binary_emit_memory_access_ex(buffer, 0, 0, 0x8D, 0, 0, destination,
+                                      base, displacement);
+}
+
+int binary_emit_lea32_reg_base_index_scale_disp(
+    BinaryCodeBuffer *buffer, BinaryGpRegister destination,
+    BinaryGpRegister base, BinaryGpRegister index, int scale,
+    int displacement) {
+  if (!buffer || index == BINARY_GP_RSP) {
+    return 0;
+  }
+
+  unsigned char scale_bits = 0;
+  switch (scale) {
+  case 1:
+    scale_bits = 0;
+    break;
+  case 2:
+    scale_bits = 1;
+    break;
+  case 4:
+    scale_bits = 2;
+    break;
+  case 8:
+    scale_bits = 3;
+    break;
+  default:
+    return 0;
+  }
+
+  int use_disp8 = displacement >= -128 && displacement <= 127;
+  unsigned char mod = 0;
+  if (displacement == 0 &&
+      (base & 7) != (BINARY_GP_RBP & 7)) {
+    mod = 0;
+  } else {
+    mod = use_disp8 ? 1 : 2;
+  }
+
+  if (!binary_emit_rex(buffer, 0, destination >> 3, index >> 3, base >> 3) ||
+      !binary_code_buffer_append_u8(buffer, 0x8D) ||
+      !binary_code_buffer_append_u8(
+          buffer, (unsigned char)((mod << 6) | ((destination & 7) << 3) | 4)) ||
+      !binary_code_buffer_append_u8(
+          buffer, (unsigned char)((scale_bits << 6) | ((index & 7) << 3) |
+                                  (base & 7)))) {
+    return 0;
+  }
+
+  if (mod == 1) {
+    return binary_code_buffer_append_u8(buffer,
+                                        (unsigned char)(int8_t)displacement);
+  }
+  if (mod == 2) {
+    return binary_code_buffer_append_u32(buffer,
+                                         (uint32_t)(int32_t)displacement);
+  }
+  return 1;
+}
+
+int binary_emit_shift_reg_imm8_32(BinaryCodeBuffer *buffer,
+                                  unsigned char subopcode,
+                                  BinaryGpRegister reg,
+                                  unsigned char immediate) {
+  if (!buffer) {
+    return 0;
+  }
+  if (immediate == 0) {
+    return 1;
+  }
+  if (!binary_emit_rex(buffer, 0, 0, 0, reg >> 3) ||
+      !binary_code_buffer_append_u8(buffer, immediate == 1 ? 0xD1 : 0xC1) ||
+      !binary_code_buffer_append_u8(
+          buffer,
+          (unsigned char)(0xC0 | ((subopcode & 7) << 3) | (reg & 7)))) {
+    return 0;
+  }
+  if (immediate != 1 && !binary_code_buffer_append_u8(buffer, immediate)) {
+    return 0;
+  }
+  return 1;
+}
+
 int binary_emit_lea_reg_reg(BinaryCodeBuffer *buffer,
                                    BinaryGpRegister destination,
                                    BinaryGpRegister lhs,
@@ -1166,12 +1252,81 @@ int binary_emit_imul_reg_reg_small_imm(BinaryCodeBuffer *buffer,
   return 1;
 }
 
-int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
-                                           BinaryGpRegister destination,
-                                           BinaryGpRegister source,
-                                           uint32_t immediate,
-                                           int have_scratch,
-                                           BinaryGpRegister scratch) {
+static int emit_mov_w(BinaryCodeBuffer *buffer, BinaryGpRegister dst,
+                      BinaryGpRegister src, int w) {
+  return w ? binary_emit_mov_reg_reg(buffer, dst, src)
+           : binary_emit_mov_reg_reg32(buffer, dst, src);
+}
+
+static int emit_neg_w(BinaryCodeBuffer *buffer, BinaryGpRegister reg, int w) {
+  return w ? binary_emit_neg_reg(buffer, reg)
+           : binary_emit_neg_reg32(buffer, reg);
+}
+
+static int emit_shl_w(BinaryCodeBuffer *buffer, BinaryGpRegister reg,
+                      unsigned char shift, int w) {
+  return w ? binary_emit_shift_reg_imm8(buffer, 4, reg, shift)
+           : binary_emit_shift_reg_imm8_32(buffer, 4, reg, shift);
+}
+
+static int emit_alu_w(BinaryCodeBuffer *buffer, unsigned char opcode,
+                      BinaryGpRegister dst, BinaryGpRegister src, int w) {
+  return w ? binary_emit_alu_reg_reg(buffer, opcode, dst, src)
+           : binary_emit_alu_reg_reg32(buffer, opcode, dst, src);
+}
+
+static int emit_lea_scaled_w(BinaryCodeBuffer *buffer, BinaryGpRegister dst,
+                             BinaryGpRegister base, BinaryGpRegister index,
+                             int scale, int w) {
+  return w ? binary_emit_lea_reg_base_index_scale_disp(buffer, dst, base,
+                                                       index, scale, 0)
+           : binary_emit_lea32_reg_base_index_scale_disp(buffer, dst, base,
+                                                         index, scale, 0);
+}
+
+static int emit_imul_small_imm_w(BinaryCodeBuffer *buffer,
+                                 BinaryGpRegister destination,
+                                 BinaryGpRegister source, int32_t immediate,
+                                 int w) {
+  if (w) {
+    return binary_emit_imul_reg_reg_small_imm(buffer, destination, source,
+                                              immediate);
+  }
+  int negate = 0;
+  if (immediate < 0) {
+    if (immediate == INT32_MIN) {
+      return 0;
+    }
+    negate = 1;
+    immediate = -immediate;
+  }
+  int scale = 0;
+  if (immediate == 3) {
+    scale = 2;
+  } else if (immediate == 5) {
+    scale = 4;
+  } else if (immediate == 9) {
+    scale = 8;
+  } else {
+    return 0;
+  }
+  if (!binary_emit_lea32_reg_base_index_scale_disp(buffer, destination, source,
+                                                   source, scale, 0)) {
+    return 0;
+  }
+  if (negate && !binary_emit_neg_reg32(buffer, destination)) {
+    return 0;
+  }
+  return 1;
+}
+
+static int binary_emit_imul_imm_scratch_width(BinaryCodeBuffer *buffer,
+                                              BinaryGpRegister destination,
+                                              BinaryGpRegister source,
+                                              uint32_t immediate,
+                                              int have_scratch,
+                                              BinaryGpRegister scratch,
+                                              int w) {
   if (!buffer) {
     return 0;
   }
@@ -1180,25 +1335,28 @@ int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
     return binary_emit_xor_reg_reg32(buffer, destination);
   }
   if (signed_immediate == 1) {
-    return binary_emit_mov_reg_reg(buffer, destination, source);
+    if (!w && destination == source) {
+      return binary_emit_movzx_reg_reg32(buffer, destination, source);
+    }
+    return emit_mov_w(buffer, destination, source, w);
   }
   if (signed_immediate == -1) {
-    return binary_emit_mov_reg_reg(buffer, destination, source) &&
-           binary_emit_neg_reg(buffer, destination);
+    return emit_mov_w(buffer, destination, source, w) &&
+           emit_neg_w(buffer, destination, w);
   }
 
   unsigned char shift = 0;
   if (binary_immediate_positive_power_of_two_i32(signed_immediate,
                                                  &shift)) {
-    return binary_emit_mov_reg_reg(buffer, destination, source) &&
-           binary_emit_shift_reg_imm8(buffer, 4, destination, shift);
+    return emit_mov_w(buffer, destination, source, w) &&
+           emit_shl_w(buffer, destination, shift, w);
   }
   if (signed_immediate != INT32_MIN &&
       binary_immediate_positive_power_of_two_i32(-signed_immediate,
                                                  &shift)) {
-    return binary_emit_mov_reg_reg(buffer, destination, source) &&
-           binary_emit_shift_reg_imm8(buffer, 4, destination, shift) &&
-           binary_emit_neg_reg(buffer, destination);
+    return emit_mov_w(buffer, destination, source, w) &&
+           emit_shl_w(buffer, destination, shift, w) &&
+           emit_neg_w(buffer, destination, w);
   }
   /* C = 2^k + 1 (3,5,9,17,33,...): source*(2^k+1) = (source<<k) + source. For
    * k<=3 a single LEA does it (scale 2/4/8), valid even when dst==src (LEA reads
@@ -1211,14 +1369,12 @@ int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
   if (signed_immediate >= 3 &&
       binary_immediate_positive_power_of_two_i32(signed_immediate - 1, &shift)) {
     if (shift >= 1 && shift <= 3 && source != BINARY_GP_RSP) {
-      return binary_emit_lea_reg_base_index_scale_disp(
-          buffer, destination, source, source, 1 << shift, 0);
+      return emit_lea_scaled_w(buffer, destination, source, source, 1 << shift, w);
     }
     if (destination != source) {
-      return binary_emit_mov_reg_reg(buffer, destination, source) &&
-             binary_emit_shift_reg_imm8(buffer, 4, destination, shift) &&
-             binary_emit_alu_reg_reg(buffer, 0x01 /* ADD */, destination,
-                                     source);
+      return emit_mov_w(buffer, destination, source, w) &&
+             emit_shl_w(buffer, destination, shift, w) &&
+             emit_alu_w(buffer, 0x01, destination, source, w);
     }
     /* dst == src: shift a COPY instead, so the original survives the add. The
      * chain is still shl+add, and the caller's scratch is free here. Without
@@ -1226,10 +1382,9 @@ int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
      * once its temp is folded into its destination -- falls back to imul and
      * pays a 3-cycle loop-carried latency instead of 2. */
     if (have_scratch && scratch != destination && scratch != BINARY_GP_RSP) {
-      return binary_emit_mov_reg_reg(buffer, scratch, source) &&
-             binary_emit_shift_reg_imm8(buffer, 4, scratch, shift) &&
-             binary_emit_alu_reg_reg(buffer, 0x01 /* ADD */, destination,
-                                     scratch);
+      return emit_mov_w(buffer, scratch, source, w) &&
+             emit_shl_w(buffer, scratch, shift, w) &&
+             emit_alu_w(buffer, 0x01, destination, scratch, w);
     }
   }
   /* C = 2^k - 1 (7,15,31,63,...): source*(2^k-1) = (source<<k) - source. Same
@@ -1241,13 +1396,13 @@ int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
   if (signed_immediate >= 7 && destination != source &&
       binary_immediate_positive_power_of_two_i32(signed_immediate + 1,
                                                  &shift)) {
-    return binary_emit_mov_reg_reg(buffer, destination, source) &&
-           binary_emit_shift_reg_imm8(buffer, 4, destination, shift) &&
-           binary_emit_alu_reg_reg(buffer, 0x29 /* SUB */, destination, source);
+    return emit_mov_w(buffer, destination, source, w) &&
+           emit_shl_w(buffer, destination, shift, w) &&
+           emit_alu_w(buffer, 0x29, destination, source, w);
   }
 
-  if (binary_emit_imul_reg_reg_small_imm(buffer, destination, source,
-                                         signed_immediate)) {
+  if (emit_imul_small_imm_w(buffer, destination, source, signed_immediate,
+                            w)) {
     return 1;
   }
 
@@ -1270,10 +1425,10 @@ int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
         k++;
       }
       if (k > 0 && (odd == 3 || odd == 5 || odd == 9)) {
-        if (binary_emit_lea_reg_base_index_scale_disp(
-                buffer, destination, source, source, (int)(odd - 1), 0) &&
-            binary_emit_shift_reg_imm8(buffer, 4, destination, k) &&
-            (!negate || binary_emit_neg_reg(buffer, destination))) {
+        if (emit_lea_scaled_w(buffer, destination, source, source, (int)(odd - 1),
+                w) &&
+            emit_shl_w(buffer, destination, k, w) &&
+            (!negate || emit_neg_w(buffer, destination, w))) {
           return 1;
         }
         return 0;
@@ -1285,7 +1440,7 @@ int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
                                  signed_immediate <= INT8_MAX
                              ? 0x6B
                              : 0x69;
-  if (!binary_emit_rex(buffer, 1, destination >> 3, 0, source >> 3) ||
+  if (!binary_emit_rex(buffer, w, destination >> 3, 0, source >> 3) ||
       !binary_code_buffer_append_u8(buffer, opcode) ||
       !binary_code_buffer_append_u8(
           buffer, (unsigned char)(0xC0 | ((destination & 7) << 3) |
@@ -1298,6 +1453,28 @@ int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
   }
 
   return 1;
+}
+
+int binary_emit_imul_reg_reg_imm32_scratch(BinaryCodeBuffer *buffer,
+                                           BinaryGpRegister destination,
+                                           BinaryGpRegister source,
+                                           uint32_t immediate,
+                                           int have_scratch,
+                                           BinaryGpRegister scratch) {
+  return binary_emit_imul_imm_scratch_width(buffer, destination, source,
+                                            immediate, have_scratch, scratch,
+                                            1);
+}
+
+int binary_emit_imul_reg_reg_imm32_scratch_w32(BinaryCodeBuffer *buffer,
+                                               BinaryGpRegister destination,
+                                               BinaryGpRegister source,
+                                               uint32_t immediate,
+                                               int have_scratch,
+                                               BinaryGpRegister scratch) {
+  return binary_emit_imul_imm_scratch_width(buffer, destination, source,
+                                            immediate, have_scratch, scratch,
+                                            0);
 }
 
 int binary_emit_imul_reg_reg_imm32(BinaryCodeBuffer *buffer,
