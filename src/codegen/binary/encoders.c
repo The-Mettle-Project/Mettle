@@ -1037,6 +1037,18 @@ int binary_emit_cmovcc_reg_reg(BinaryCodeBuffer *buffer,
                              (source & 7)));
 }
 
+int binary_emit_alu_reg_mem(BinaryCodeBuffer *buffer, unsigned char opcode,
+                            BinaryGpRegister destination,
+                            BinaryGpRegister base, int displacement,
+                            int width) {
+  if (!buffer || (width != 4 && width != 8)) {
+    return 0;
+  }
+  return binary_emit_memory_access_ex(buffer, 0, width == 8,
+                                      (unsigned char)(opcode | 0x02), 0, 0,
+                                      destination, base, displacement);
+}
+
 int binary_emit_alu_reg_reg(BinaryCodeBuffer *buffer,
                                    unsigned char opcode,
                                    BinaryGpRegister destination,

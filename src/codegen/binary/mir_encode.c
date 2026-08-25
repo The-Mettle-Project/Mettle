@@ -84,6 +84,31 @@ static int gp_home_load(MirFunction *fn, const MirVreg *v,
   return binary_emit_mov_reg_mem(code, dst, base, disp);
 }
 
+static int gp_home_mem(MirFunction *fn, const MirOperand *op,
+                       BinaryGpRegister *base, int *disp) {
+  if (op->kind == MIR_OPK_STACKHOME) {
+    *base = frame_base(fn);
+    *disp = frame_disp(fn, -op->disp);
+    return 1;
+  }
+  if (op->kind != MIR_OPK_VREG) {
+    return 0;
+  }
+  {
+    const MirVreg *v = &fn->vregs[op->vreg];
+    if (v->in_register || v->rclass != MIR_RC_GP) {
+      return 0;
+    }
+    if (v->address_taken &&
+        (v->home_width == 1 || v->home_width == 2 || v->home_width == 4)) {
+      return 0;
+    }
+    *base = frame_base(fn);
+    *disp = frame_disp(fn, -spill_off(v));
+  }
+  return 1;
+}
+
 /* Emit: target <- value of `op`. */
 static int materialize_into(MirFunction *fn, const MirOperand *op,
                             BinaryGpRegister target) {
@@ -431,6 +456,16 @@ static int emit_op_eq(MirFunction *fn, MirOpcode mop, unsigned char opc,
                ? 1
                : enc_err(fn, "out of memory in ALU imm");
   }
+  {
+    BinaryGpRegister mbase;
+    int mdisp;
+    if (gp_home_mem(fn, x, &mbase, &mdisp)) {
+      return binary_emit_alu_reg_mem(code, opc, target, mbase, mdisp,
+                                     width == 4 ? 4 : 8)
+                 ? 1
+                 : enc_err(fn, "out of memory in ALU mem");
+    }
+  }
   BinaryGpRegister scratch = (target == SCRATCH_A) ? SCRATCH_B : SCRATCH_A;
   int ok;
   BinaryGpRegister xr = value_reg(fn, x, scratch, &ok);
@@ -735,6 +770,8 @@ static int encode_setcc(MirFunction *fn, const MirInst *in) {
    * registers directly. setcc requires an 8-bit-addressable low reg, so it
    * always targets AL and the result is zero-extended into RAX, then stored. */
   int ok;
+  BinaryGpRegister cbase;
+  int cdisp;
   BinaryGpRegister areg = value_reg(fn, &in->a, SCRATCH_A, &ok);
   if (!ok) {
     return 0;
@@ -750,6 +787,10 @@ static int encode_setcc(MirFunction *fn, const MirInst *in) {
       if (!binary_emit_cmp_reg_imm_w32(code, areg, (uint32_t)in->b.imm)) {
         return enc_err(fn, "out of memory in cmp32 imm");
       }
+    } else if (gp_home_mem(fn, &in->b, &cbase, &cdisp)) {
+      if (!binary_emit_alu_reg_mem(code, 0x39, areg, cbase, cdisp, 4)) {
+        return enc_err(fn, "out of memory in cmp32 mem");
+      }
     } else {
       BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_B, &ok);
       if (!ok || !binary_emit_cmp_reg_reg32(code, areg, breg)) {
@@ -760,6 +801,10 @@ static int encode_setcc(MirFunction *fn, const MirInst *in) {
              code_generator_binary_immediate_fits_signed_32(in->b.imm)) {
     if (!binary_emit_cmp_reg_imm32(code, areg, (uint32_t)in->b.imm)) {
       return enc_err(fn, "out of memory in cmp imm");
+    }
+  } else if (gp_home_mem(fn, &in->b, &cbase, &cdisp)) {
+    if (!binary_emit_alu_reg_mem(code, 0x39, areg, cbase, cdisp, 8)) {
+      return enc_err(fn, "out of memory in cmp mem");
     }
   } else {
     BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_B, &ok);
@@ -2965,6 +3010,8 @@ int mir_encode(MirFunction *fn) {
     case MIR_CMPBR: {
       /* cmp a,b ; j<cc> label  (fused compare-and-branch). */
       int rok;
+      BinaryGpRegister cbase;
+      int cdisp;
       BinaryGpRegister areg = value_reg(fn, &in->a, SCRATCH_A, &rok);
       if (!rok) {
         ok = 0;
@@ -2981,6 +3028,12 @@ int mir_encode(MirFunction *fn) {
             ok = enc_err(fn, "out of memory in cmpbr32 imm");
             break;
           }
+        } else if (gp_home_mem(fn, &in->b, &cbase, &cdisp)) {
+          if (!binary_emit_alu_reg_mem(&ctx->code, 0x39, areg, cbase, cdisp,
+                                       4)) {
+            ok = enc_err(fn, "out of memory in cmpbr32 mem");
+            break;
+          }
         } else {
           BinaryGpRegister breg = value_reg(fn, &in->b, SCRATCH_B, &rok);
           if (!rok || !binary_emit_cmp_reg_reg32(&ctx->code, areg, breg)) {
@@ -2992,6 +3045,11 @@ int mir_encode(MirFunction *fn) {
                  code_generator_binary_immediate_fits_signed_32(in->b.imm)) {
         if (!binary_emit_cmp_reg_imm32(&ctx->code, areg, (uint32_t)in->b.imm)) {
           ok = enc_err(fn, "out of memory in cmpbr");
+          break;
+        }
+      } else if (gp_home_mem(fn, &in->b, &cbase, &cdisp)) {
+        if (!binary_emit_alu_reg_mem(&ctx->code, 0x39, areg, cbase, cdisp, 8)) {
+          ok = enc_err(fn, "out of memory in cmpbr mem");
           break;
         }
       } else {
