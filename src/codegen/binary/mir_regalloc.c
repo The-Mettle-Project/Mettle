@@ -497,13 +497,417 @@ static int mir_collect_back_edges(const MirFunction *fn,
   return 1;
 }
 
+#define MIR_LIVE_CFG_MAX_WORK 8000000u
+
+typedef struct {
+  size_t *slots;
+  size_t mask;
+} MirLabelMap;
+
+typedef struct {
+  int *block_of;
+  unsigned long long *live_in;
+  size_t block_count;
+  size_t words;
+} MirLiveCfg;
+
+static int mir_label_map_build(const MirFunction *fn, MirLabelMap *map) {
+  size_t label_count = 0;
+  size_t slot_count = 16;
+  map->slots = NULL;
+  map->mask = 0;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op == MIR_LABEL && in->dst.kind == MIR_OPK_LABEL && in->dst.sym) {
+      label_count++;
+    }
+  }
+  while (slot_count < label_count * 2) {
+    slot_count *= 2;
+  }
+  map->slots = (size_t *)calloc(slot_count, sizeof(*map->slots));
+  if (!map->slots) {
+    return 0;
+  }
+  map->mask = slot_count - 1;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    size_t h;
+    int duplicate = 0;
+    if (in->op != MIR_LABEL || in->dst.kind != MIR_OPK_LABEL || !in->dst.sym) {
+      continue;
+    }
+    h = mettle_fnv1a_hash(in->dst.sym) & map->mask;
+    while (map->slots[h]) {
+      if (strcmp(fn->insns[map->slots[h] - 1].dst.sym, in->dst.sym) == 0) {
+        duplicate = 1;
+        break;
+      }
+      h = (h + 1) & map->mask;
+    }
+    if (!duplicate) {
+      map->slots[h] = i + 1;
+    }
+  }
+  return 1;
+}
+
+static int mir_label_map_find(const MirFunction *fn, const MirLabelMap *map,
+                              const char *name) {
+  size_t h;
+  if (!name || !map->slots) {
+    return -1;
+  }
+  h = mettle_fnv1a_hash(name) & map->mask;
+  while (map->slots[h]) {
+    if (strcmp(fn->insns[map->slots[h] - 1].dst.sym, name) == 0) {
+      return (int)(map->slots[h] - 1);
+    }
+    h = (h + 1) & map->mask;
+  }
+  return -1;
+}
+
+static int mir_inst_ends_block(const MirInst *in) {
+  return in->op == MIR_JMP || in->op == MIR_JCC || in->op == MIR_CMPBR ||
+         in->op == MIR_FCMPBR || in->op == MIR_JMP_TABLE || in->op == MIR_RET ||
+         in->op == MIR_TRAP;
+}
+
+static void mir_live_bit_set(unsigned long long *set, size_t v) {
+  set[v >> 6] |= 1ull << (v & 63);
+}
+
+static int mir_live_bit_get(const unsigned long long *set, size_t v) {
+  return (set[v >> 6] & (1ull << (v & 63))) != 0;
+}
+
+static void mir_live_note_uses(const MirFunction *fn, const MirOperand *op,
+                               unsigned long long *use_set,
+                               const unsigned long long *def_set,
+                               int skip_plain_vreg) {
+  MirVregId ids[2] = {MIR_VREG_NONE, MIR_VREG_NONE};
+  if (op->kind == MIR_OPK_VREG) {
+    if (skip_plain_vreg) {
+      return;
+    }
+    ids[0] = op->vreg;
+  } else if (op->kind == MIR_OPK_MEM) {
+    ids[0] = op->mem.base;
+    ids[1] = op->mem.index;
+  } else {
+    return;
+  }
+  for (int k = 0; k < 2; k++) {
+    MirVregId v = ids[k];
+    if (v < 0 || (size_t)v >= fn->vreg_count) {
+      continue;
+    }
+    if (!mir_live_bit_get(def_set, (size_t)v)) {
+      mir_live_bit_set(use_set, (size_t)v);
+    }
+  }
+}
+
+static int mir_live_cfg_build(const MirFunction *fn, MirLiveCfg *cfg) {
+  MirLabelMap map;
+  unsigned char *leader = NULL;
+  int *block_start = NULL;
+  int *succ_head = NULL;
+  int *succ_next = NULL;
+  int *succ_block = NULL;
+  unsigned long long *use_set = NULL;
+  unsigned long long *def_set = NULL;
+  unsigned char *killable = NULL;
+  int *first_dst = NULL;
+  int *first_any = NULL;
+  size_t words = (fn->vreg_count + 63) / 64;
+  size_t nblocks = 0;
+  size_t succ_capacity = 0;
+  size_t succ_count = 0;
+  int ok = 0;
+  int changed = 1;
+
+  cfg->block_of = NULL;
+  cfg->live_in = NULL;
+  cfg->block_count = 0;
+  cfg->words = words;
+  if (fn->insn_count == 0 || fn->vreg_count == 0 || words == 0) {
+    return 0;
+  }
+  if ((unsigned long long)fn->insn_count * (unsigned long long)words >
+      MIR_LIVE_CFG_MAX_WORK) {
+    return 0;
+  }
+  if (!mir_label_map_build(fn, &map)) {
+    return 0;
+  }
+
+  leader = (unsigned char *)calloc(fn->insn_count, sizeof(*leader));
+  cfg->block_of = (int *)malloc(fn->insn_count * sizeof(*cfg->block_of));
+  killable = (unsigned char *)calloc(fn->vreg_count, sizeof(*killable));
+  first_dst = (int *)malloc(fn->vreg_count * sizeof(*first_dst));
+  first_any = (int *)malloc(fn->vreg_count * sizeof(*first_any));
+  if (!leader || !cfg->block_of || !killable || !first_dst || !first_any) {
+    goto done;
+  }
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    first_dst[v] = -1;
+    first_any[v] = -1;
+  }
+
+  leader[0] = 1;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op == MIR_LABEL) {
+      leader[i] = 1;
+    }
+    if (mir_inst_ends_block(in) && i + 1 < fn->insn_count) {
+      leader[i + 1] = 1;
+    }
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (leader[i]) {
+      nblocks++;
+    }
+    cfg->block_of[i] = (int)nblocks - 1;
+  }
+  block_start = (int *)malloc(nblocks * sizeof(*block_start));
+  succ_head = (int *)malloc(nblocks * sizeof(*succ_head));
+  if (!block_start || !succ_head) {
+    goto done;
+  }
+  {
+    size_t b = 0;
+    for (size_t i = 0; i < fn->insn_count; i++) {
+      if (leader[i]) {
+        block_start[b++] = (int)i;
+      }
+    }
+  }
+  for (size_t b = 0; b < nblocks; b++) {
+    succ_head[b] = -1;
+  }
+
+  succ_capacity = nblocks * 2 + 8;
+  succ_next = (int *)malloc(succ_capacity * sizeof(*succ_next));
+  succ_block = (int *)malloc(succ_capacity * sizeof(*succ_block));
+  if (!succ_next || !succ_block) {
+    goto done;
+  }
+  for (size_t b = 0; b < nblocks; b++) {
+    size_t last = (b + 1 < nblocks) ? (size_t)block_start[b + 1] - 1
+                                    : fn->insn_count - 1;
+    const MirInst *in = &fn->insns[last];
+    int targets[2];
+    int target_count = 0;
+    int fall_through = 1;
+    const MirJumpTable *table = NULL;
+    if (in->op == MIR_JMP) {
+      fall_through = 0;
+      targets[target_count++] = mir_label_map_find(fn, &map, in->dst.sym);
+    } else if (in->op == MIR_JCC || in->op == MIR_CMPBR ||
+               in->op == MIR_FCMPBR) {
+      targets[target_count++] = mir_label_map_find(fn, &map, in->dst.sym);
+    } else if (in->op == MIR_JMP_TABLE) {
+      fall_through = 0;
+      table = (const MirJumpTable *)in->aux;
+      if (!table) {
+        goto done;
+      }
+    } else if (in->op == MIR_RET || in->op == MIR_TRAP) {
+      fall_through = 0;
+    }
+    for (int t = 0; t < target_count; t++) {
+      if (targets[t] < 0) {
+        goto done;
+      }
+    }
+    if (fall_through && b + 1 >= nblocks) {
+      fall_through = 0;
+    }
+    {
+      size_t need = succ_count + (size_t)target_count + (fall_through ? 1u : 0u);
+      if (table) {
+        need += table->count;
+      }
+      if (need > succ_capacity) {
+        int *n1;
+        int *n2;
+        size_t grown = succ_capacity * 2 + need;
+        n1 = (int *)realloc(succ_next, grown * sizeof(*succ_next));
+        if (!n1) {
+          goto done;
+        }
+        succ_next = n1;
+        n2 = (int *)realloc(succ_block, grown * sizeof(*succ_block));
+        if (!n2) {
+          goto done;
+        }
+        succ_block = n2;
+        succ_capacity = grown;
+      }
+    }
+    for (int t = 0; t < target_count; t++) {
+      succ_block[succ_count] = cfg->block_of[targets[t]];
+      succ_next[succ_count] = succ_head[b];
+      succ_head[b] = (int)succ_count;
+      succ_count++;
+    }
+    if (table) {
+      for (size_t t = 0; t < table->count; t++) {
+        int target = mir_label_map_find(fn, &map, table->labels[t]);
+        if (target < 0) {
+          goto done;
+        }
+        succ_block[succ_count] = cfg->block_of[target];
+        succ_next[succ_count] = succ_head[b];
+        succ_head[b] = (int)succ_count;
+        succ_count++;
+      }
+    }
+    if (fall_through) {
+      succ_block[succ_count] = (int)b + 1;
+      succ_next[succ_count] = succ_head[b];
+      succ_head[b] = (int)succ_count;
+      succ_count++;
+    }
+  }
+
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    const MirOperand *ops[3] = {&in->dst, &in->a, &in->b};
+    for (int k = 0; k < 3; k++) {
+      MirVregId ids[2] = {MIR_VREG_NONE, MIR_VREG_NONE};
+      if (ops[k]->kind == MIR_OPK_VREG) {
+        ids[0] = ops[k]->vreg;
+      } else if (ops[k]->kind == MIR_OPK_MEM) {
+        ids[0] = ops[k]->mem.base;
+        ids[1] = ops[k]->mem.index;
+      }
+      for (int j = 0; j < 2; j++) {
+        MirVregId v = ids[j];
+        if (v < 0 || (size_t)v >= fn->vreg_count) {
+          continue;
+        }
+        if (first_any[v] < 0) {
+          first_any[v] = (int)i;
+        }
+        if (k == 0 && ops[k]->kind == MIR_OPK_VREG && first_dst[v] < 0) {
+          first_dst[v] = (int)i;
+        }
+      }
+    }
+  }
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    killable[v] = (first_dst[v] >= 0 && first_dst[v] == first_any[v] &&
+                   !fn->vregs[v].entry_live)
+                      ? 1
+                      : 0;
+  }
+
+  use_set = (unsigned long long *)calloc(nblocks * words, sizeof(*use_set));
+  def_set = (unsigned long long *)calloc(nblocks * words, sizeof(*def_set));
+  cfg->live_in =
+      (unsigned long long *)calloc(nblocks * words, sizeof(*cfg->live_in));
+  if (!use_set || !def_set || !cfg->live_in) {
+    goto done;
+  }
+  for (size_t b = 0; b < nblocks; b++) {
+    size_t lo = (size_t)block_start[b];
+    size_t hi = (b + 1 < nblocks) ? (size_t)block_start[b + 1] : fn->insn_count;
+    unsigned long long *u = use_set + b * words;
+    unsigned long long *d = def_set + b * words;
+    for (size_t i = lo; i < hi; i++) {
+      const MirInst *in = &fn->insns[i];
+      mir_live_note_uses(fn, &in->dst, u, d, 1);
+      mir_live_note_uses(fn, &in->a, u, d, 0);
+      mir_live_note_uses(fn, &in->b, u, d, 0);
+      if (in->dst.kind == MIR_OPK_VREG) {
+        MirVregId v = in->dst.vreg;
+        if (v >= 0 && (size_t)v < fn->vreg_count) {
+          if (killable[v] && first_dst[v] == (int)i) {
+            mir_live_bit_set(d, (size_t)v);
+          } else if (!mir_live_bit_get(d, (size_t)v)) {
+            mir_live_bit_set(u, (size_t)v);
+          }
+        }
+      }
+    }
+  }
+
+  while (changed) {
+    changed = 0;
+    for (size_t bi = nblocks; bi > 0; bi--) {
+      size_t b = bi - 1;
+      const unsigned long long *u = use_set + b * words;
+      const unsigned long long *d = def_set + b * words;
+      unsigned long long *in_set = cfg->live_in + b * words;
+      for (int e = succ_head[b]; e >= 0; e = succ_next[e]) {
+        const unsigned long long *s =
+            cfg->live_in + (size_t)succ_block[e] * words;
+        for (size_t w = 0; w < words; w++) {
+          unsigned long long next = in_set[w] | (s[w] & ~d[w]);
+          if (next != in_set[w]) {
+            in_set[w] = next;
+            changed = 1;
+          }
+        }
+      }
+      for (size_t w = 0; w < words; w++) {
+        unsigned long long next = in_set[w] | u[w];
+        if (next != in_set[w]) {
+          in_set[w] = next;
+          changed = 1;
+        }
+      }
+    }
+  }
+
+  cfg->block_count = nblocks;
+  ok = 1;
+
+done:
+  free(map.slots);
+  free(leader);
+  free(block_start);
+  free(succ_head);
+  free(succ_next);
+  free(succ_block);
+  free(use_set);
+  free(def_set);
+  free(killable);
+  free(first_dst);
+  free(first_any);
+  if (!ok) {
+    free(cfg->block_of);
+    free(cfg->live_in);
+    cfg->block_of = NULL;
+    cfg->live_in = NULL;
+    cfg->block_count = 0;
+  }
+  return ok;
+}
+
+static void mir_live_cfg_free(MirLiveCfg *cfg) {
+  free(cfg->block_of);
+  free(cfg->live_in);
+  cfg->block_of = NULL;
+  cfg->live_in = NULL;
+  cfg->block_count = 0;
+}
+
 /* One back-edge's worth of interval extension: any vreg whose interval crosses
  * the [l,b] boundary must stay live across the whole loop. */
 static void mir_extend_across_edge(MirFunction *fn, int l, int b,
+                                   const unsigned long long *header_live,
                                    int *changed) {
   for (size_t v = 0; v < fn->vreg_count; v++) {
     MirVreg *vr = &fn->vregs[v];
     if (vr->live_start == MIR_LIVE_NONE) {
+      continue;
+    }
+    if (header_live && !mir_live_bit_get(header_live, v)) {
       continue;
     }
     /* interval overlaps [l,b]? */
@@ -581,11 +985,22 @@ static void mir_compute_liveness(MirFunction *fn) {
   size_t edge_count = 0;
   int changed = 1;
   if (mir_collect_back_edges(fn, &edges, &edge_count)) {
+    MirLiveCfg cfg;
+    int have_cfg = edge_count > 0 && mir_live_cfg_build(fn, &cfg);
     while (changed) {
       changed = 0;
       for (size_t e = 0; e < edge_count; e++) {
-        mir_extend_across_edge(fn, edges[e].l, edges[e].b, &changed);
+        const unsigned long long *header_live = NULL;
+        if (have_cfg) {
+          header_live =
+              cfg.live_in + (size_t)cfg.block_of[edges[e].l] * cfg.words;
+        }
+        mir_extend_across_edge(fn, edges[e].l, edges[e].b, header_live,
+                               &changed);
       }
+    }
+    if (have_cfg) {
+      mir_live_cfg_free(&cfg);
     }
     free(edges);
     return;
@@ -604,7 +1019,7 @@ static void mir_compute_liveness(MirFunction *fn) {
       if (l < 0 || l >= b) {
         continue; /* forward branch: no loop back-edge */
       }
-      mir_extend_across_edge(fn, l, b, &changed);
+      mir_extend_across_edge(fn, l, b, NULL, &changed);
     }
   }
 }

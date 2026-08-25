@@ -8549,10 +8549,18 @@ int code_generator_binary_emit_function_via_mir(
   }
   {
     static int dump = -1;
+    static const char *dump_only = NULL;
     if (dump < 0) {
-      dump = getenv("METTLE_MIR_DUMP") ? 1 : 0;
+      const char *env = getenv("METTLE_MIR_DUMP");
+      dump = env ? 1 : 0;
+      if (env && env[0] && strcmp(env, "1") != 0) {
+        dump_only = env;
+      }
     }
-    if (dump) {
+    if (dump && (!dump_only || (ir_function->name &&
+                                strcmp(ir_function->name, dump_only) == 0))) {
+      fprintf(stderr, "; MIR function %s\n",
+              ir_function->name ? ir_function->name : "?");
       mir_function_dump(&fn, stderr);
     }
   }
