@@ -747,6 +747,7 @@ const char *ir_simd_bail_id_name(int id) {
   case IR_SIMD_BAIL_EARLY_EXIT:          return "early-exit";
   case IR_SIMD_BAIL_INT16_ELEMENTS:      return "int16-elements";
   case IR_SIMD_BAIL_INT64_ELEMENTS:      return "int64-elements";
+  case IR_SIMD_BAIL_RELOADED_BASE:       return "reloaded-base";
   case IR_SIMD_BAIL_SERIAL_RECURRENCE:   return "serial-recurrence";
   case IR_SIMD_BAIL_MIXED_FLOAT_WIDTHS:  return "mixed-float-widths";
   case IR_SIMD_BAIL_BYTE_SUM_NARROW_ACC: return "byte-sum-narrow-acc";
@@ -944,6 +945,31 @@ static void ir_type_element_name(const char *declared, char *out, size_t cap) {
   out[n] = '\0';
 }
 
+static const char *ir_simd_field_base_symbol(const IRFunction *function,
+                                             size_t begin, size_t at,
+                                             const IROperand *addr) {
+  if (addr->kind == IR_OPERAND_SYMBOL && addr->name) {
+    return addr->name;
+  }
+  if (addr->kind != IR_OPERAND_TEMP || !addr->name) {
+    return NULL;
+  }
+  for (size_t k = at; k-- > begin;) {
+    const IRInstruction *def = &function->instructions[k];
+    if (def->dest.kind != IR_OPERAND_TEMP || !def->dest.name ||
+        strcmp(def->dest.name, addr->name) != 0) {
+      continue;
+    }
+    if (def->op == IR_OP_BINARY && !def->is_float && def->text &&
+        strcmp(def->text, "+") == 0 && def->lhs.kind == IR_OPERAND_SYMBOL &&
+        def->lhs.name && def->rhs.kind == IR_OPERAND_INT) {
+      return def->lhs.name;
+    }
+    return NULL;
+  }
+  return NULL;
+}
+
 /* --explain: a deeper diagnosis than ir_simd_bail_reason, split into a reason
  * (what blocked vectorization), a fix (what the user can change), and a
  * machine-readable IRSimdBailId every branch must set. Best-effort but never
@@ -971,6 +997,8 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
   const char *int_accum_sym = NULL;
   int has_float_accum = 0, has_float_mul = 0;
   int load_count = 0, store_count = 0, byte_store_count = 0;
+  int reloaded_base_count = 0;
+  const char *reloaded_base_sym = NULL;
   int past_header = 0; /* seen the loop's own header label yet? */
   const char *body_local = NULL;
   /* A stack array whose address the body re-takes every iteration
@@ -1079,7 +1107,18 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
         } else if (sz == 4 && ins->op == IR_OP_LOAD) {
           has_i32_load = 1;
         } else if (sz == 8) {
-          has_i64 = 1;
+          const char *base =
+              (ins->op == IR_OP_LOAD && ins->dest.kind == IR_OPERAND_TEMP)
+                  ? ir_simd_field_base_symbol(function, begin, i, &ins->lhs)
+                  : NULL;
+          if (base) {
+            reloaded_base_count++;
+            if (!reloaded_base_sym) {
+              reloaded_base_sym = base;
+            }
+          } else {
+            has_i64 = 1;
+          }
         }
       }
       break;
@@ -1338,6 +1377,20 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
              "integer kernels exist");
     snprintf(fix, fix_cap, "use int32 arrays if the values fit");
     IR_SIMD_SET_DIAG(IR_SIMD_BAIL_INT64_ELEMENTS);
+    return;
+  }
+  if (reloaded_base_count > 0 &&
+      load_count + store_count > reloaded_base_count) {
+    snprintf(reason, reason_cap,
+             "the body re-reads the array's base pointer out of `%s` every "
+             "iteration; a store in the body could change that pointer, so the "
+             "read cannot be lifted out and the kernels have no base to hold "
+             "fixed for the whole loop",
+             reloaded_base_sym ? reloaded_base_sym : "a struct");
+    snprintf(fix, fix_cap,
+             "bind the base pointer to a local before the loop and index that "
+             "local in the body");
+    IR_SIMD_SET_DIAG(IR_SIMD_BAIL_RELOADED_BASE);
     return;
   }
   {

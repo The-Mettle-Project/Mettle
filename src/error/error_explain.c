@@ -368,6 +368,22 @@ static const DecisionDoc DECISIONS[] = {
      "Fix: use int32 where the range allows it. Four lanes per vector become\n"
      "eight. Where the values genuinely need 64 bits, this loop is at its\n"
      "floor for now.\n"},
+    {"reloaded-base", DECISION_VECTOR_REFUSAL,
+     "The base pointer is re-read every iteration",
+     "The array the loop indexes is reached through a pointer stored in a\n"
+     "struct: `t->counts[i] = 0`. The body writes through that pointer, and\n"
+     "nothing rules out the write landing on the pointer field itself, so the\n"
+     "compiler must re-read `t->counts` on every iteration. A kernel needs one\n"
+     "base for the whole loop, so the loop stays scalar.\n"
+     "\n"
+     "Fix: read the pointer once into a local and index the local.\n"
+     "\n"
+     "    var counts: int32* = t->counts;\n"
+     "    while (i < n) { counts[i] = 0; i += 1; }\n"
+     "\n"
+     "The local says the base does not change, which is what the loop meant.\n"
+     "This is a gap in the compiler's alias reasoning, not a fact about your\n"
+     "code.\n"},
     {"serial-recurrence", DECISION_VECTOR_REFUSAL,
      "The loop carries a serial recurrence",
      "A value is computed from its own previous value through an operation\n"
