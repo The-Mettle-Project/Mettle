@@ -506,7 +506,9 @@ typedef struct {
 
 typedef struct {
   int *block_of;
+  int *block_start;
   unsigned long long *live_in;
+  unsigned long long *live_out;
   size_t block_count;
   size_t words;
 } MirLiveCfg;
@@ -609,7 +611,34 @@ static void mir_live_note_uses(const MirFunction *fn, const MirOperand *op,
   }
 }
 
-static int mir_live_cfg_build(const MirFunction *fn, MirLiveCfg *cfg) {
+/* Add every vreg read by one operand to a live set. Unlike
+ * mir_live_note_uses, this runs while walking a block backwards, after the
+ * instruction's definition has already been removed from the live set. */
+static void mir_live_add_operand(const MirFunction *fn, const MirOperand *op,
+                                 unsigned long long *live,
+                                 int skip_plain_vreg) {
+  MirVregId ids[2] = {MIR_VREG_NONE, MIR_VREG_NONE};
+  if (op->kind == MIR_OPK_VREG) {
+    if (skip_plain_vreg) {
+      return;
+    }
+    ids[0] = op->vreg;
+  } else if (op->kind == MIR_OPK_MEM) {
+    ids[0] = op->mem.base;
+    ids[1] = op->mem.index;
+  } else {
+    return;
+  }
+  for (int k = 0; k < 2; k++) {
+    MirVregId v = ids[k];
+    if (v >= 0 && (size_t)v < fn->vreg_count) {
+      mir_live_bit_set(live, (size_t)v);
+    }
+  }
+}
+
+static int mir_live_cfg_build(const MirFunction *fn, MirLiveCfg *cfg,
+                              int precise_defs) {
   MirLabelMap map;
   unsigned char *leader = NULL;
   int *block_start = NULL;
@@ -629,7 +658,9 @@ static int mir_live_cfg_build(const MirFunction *fn, MirLiveCfg *cfg) {
   int changed = 1;
 
   cfg->block_of = NULL;
+  cfg->block_start = NULL;
   cfg->live_in = NULL;
+  cfg->live_out = NULL;
   cfg->block_count = 0;
   cfg->words = words;
   if (fn->insn_count == 0 || fn->vreg_count == 0 || words == 0) {
@@ -645,15 +676,20 @@ static int mir_live_cfg_build(const MirFunction *fn, MirLiveCfg *cfg) {
 
   leader = (unsigned char *)calloc(fn->insn_count, sizeof(*leader));
   cfg->block_of = (int *)malloc(fn->insn_count * sizeof(*cfg->block_of));
-  killable = (unsigned char *)calloc(fn->vreg_count, sizeof(*killable));
-  first_dst = (int *)malloc(fn->vreg_count * sizeof(*first_dst));
-  first_any = (int *)malloc(fn->vreg_count * sizeof(*first_any));
-  if (!leader || !cfg->block_of || !killable || !first_dst || !first_any) {
+  if (!precise_defs) {
+    killable = (unsigned char *)calloc(fn->vreg_count, sizeof(*killable));
+    first_dst = (int *)malloc(fn->vreg_count * sizeof(*first_dst));
+    first_any = (int *)malloc(fn->vreg_count * sizeof(*first_any));
+  }
+  if (!leader || !cfg->block_of ||
+      (!precise_defs && (!killable || !first_dst || !first_any))) {
     goto done;
   }
-  for (size_t v = 0; v < fn->vreg_count; v++) {
-    first_dst[v] = -1;
-    first_any[v] = -1;
+  if (!precise_defs) {
+    for (size_t v = 0; v < fn->vreg_count; v++) {
+      first_dst[v] = -1;
+      first_any[v] = -1;
+    }
   }
 
   leader[0] = 1;
@@ -774,36 +810,38 @@ static int mir_live_cfg_build(const MirFunction *fn, MirLiveCfg *cfg) {
     }
   }
 
-  for (size_t i = 0; i < fn->insn_count; i++) {
-    const MirInst *in = &fn->insns[i];
-    const MirOperand *ops[3] = {&in->dst, &in->a, &in->b};
-    for (int k = 0; k < 3; k++) {
-      MirVregId ids[2] = {MIR_VREG_NONE, MIR_VREG_NONE};
-      if (ops[k]->kind == MIR_OPK_VREG) {
-        ids[0] = ops[k]->vreg;
-      } else if (ops[k]->kind == MIR_OPK_MEM) {
-        ids[0] = ops[k]->mem.base;
-        ids[1] = ops[k]->mem.index;
-      }
-      for (int j = 0; j < 2; j++) {
-        MirVregId v = ids[j];
-        if (v < 0 || (size_t)v >= fn->vreg_count) {
-          continue;
+  if (!precise_defs) {
+    for (size_t i = 0; i < fn->insn_count; i++) {
+      const MirInst *in = &fn->insns[i];
+      const MirOperand *ops[3] = {&in->dst, &in->a, &in->b};
+      for (int k = 0; k < 3; k++) {
+        MirVregId ids[2] = {MIR_VREG_NONE, MIR_VREG_NONE};
+        if (ops[k]->kind == MIR_OPK_VREG) {
+          ids[0] = ops[k]->vreg;
+        } else if (ops[k]->kind == MIR_OPK_MEM) {
+          ids[0] = ops[k]->mem.base;
+          ids[1] = ops[k]->mem.index;
         }
-        if (first_any[v] < 0) {
-          first_any[v] = (int)i;
-        }
-        if (k == 0 && ops[k]->kind == MIR_OPK_VREG && first_dst[v] < 0) {
-          first_dst[v] = (int)i;
+        for (int j = 0; j < 2; j++) {
+          MirVregId v = ids[j];
+          if (v < 0 || (size_t)v >= fn->vreg_count) {
+            continue;
+          }
+          if (first_any[v] < 0) {
+            first_any[v] = (int)i;
+          }
+          if (k == 0 && ops[k]->kind == MIR_OPK_VREG && first_dst[v] < 0) {
+            first_dst[v] = (int)i;
+          }
         }
       }
     }
-  }
-  for (size_t v = 0; v < fn->vreg_count; v++) {
-    killable[v] = (first_dst[v] >= 0 && first_dst[v] == first_any[v] &&
-                   !fn->vregs[v].entry_live)
-                      ? 1
-                      : 0;
+    for (size_t v = 0; v < fn->vreg_count; v++) {
+      killable[v] = (first_dst[v] >= 0 && first_dst[v] == first_any[v] &&
+                     !fn->vregs[v].entry_live)
+                        ? 1
+                        : 0;
+    }
   }
 
   use_set = (unsigned long long *)calloc(nblocks * words, sizeof(*use_set));
@@ -826,7 +864,9 @@ static int mir_live_cfg_build(const MirFunction *fn, MirLiveCfg *cfg) {
       if (in->dst.kind == MIR_OPK_VREG) {
         MirVregId v = in->dst.vreg;
         if (v >= 0 && (size_t)v < fn->vreg_count) {
-          if (killable[v] && first_dst[v] == (int)i) {
+          if (precise_defs) {
+            mir_live_bit_set(d, (size_t)v);
+          } else if (killable[v] && first_dst[v] == (int)i) {
             mir_live_bit_set(d, (size_t)v);
           } else if (!mir_live_bit_get(d, (size_t)v)) {
             mir_live_bit_set(u, (size_t)v);
@@ -864,6 +904,26 @@ static int mir_live_cfg_build(const MirFunction *fn, MirLiveCfg *cfg) {
     }
   }
 
+  if (precise_defs) {
+    cfg->live_out =
+        (unsigned long long *)calloc(nblocks * words, sizeof(*cfg->live_out));
+    if (!cfg->live_out) {
+      goto done;
+    }
+    for (size_t b = 0; b < nblocks; b++) {
+      unsigned long long *out_set = cfg->live_out + b * words;
+      for (int e = succ_head[b]; e >= 0; e = succ_next[e]) {
+        const unsigned long long *s =
+            cfg->live_in + (size_t)succ_block[e] * words;
+        for (size_t w = 0; w < words; w++) {
+          out_set[w] |= s[w];
+        }
+      }
+    }
+
+    cfg->block_start = block_start;
+    block_start = NULL;
+  }
   cfg->block_count = nblocks;
   ok = 1;
 
@@ -881,9 +941,13 @@ done:
   free(first_any);
   if (!ok) {
     free(cfg->block_of);
+    free(cfg->block_start);
     free(cfg->live_in);
+    free(cfg->live_out);
     cfg->block_of = NULL;
+    cfg->block_start = NULL;
     cfg->live_in = NULL;
+    cfg->live_out = NULL;
     cfg->block_count = 0;
   }
   return ok;
@@ -891,9 +955,13 @@ done:
 
 static void mir_live_cfg_free(MirLiveCfg *cfg) {
   free(cfg->block_of);
+  free(cfg->block_start);
   free(cfg->live_in);
+  free(cfg->live_out);
   cfg->block_of = NULL;
+  cfg->block_start = NULL;
   cfg->live_in = NULL;
+  cfg->live_out = NULL;
   cfg->block_count = 0;
 }
 
@@ -986,7 +1054,7 @@ static void mir_compute_liveness(MirFunction *fn) {
   int changed = 1;
   if (mir_collect_back_edges(fn, &edges, &edge_count)) {
     MirLiveCfg cfg;
-    int have_cfg = edge_count > 0 && mir_live_cfg_build(fn, &cfg);
+    int have_cfg = edge_count > 0 && mir_live_cfg_build(fn, &cfg, 0);
     while (changed) {
       changed = 0;
       for (size_t e = 0; e < edge_count; e++) {
@@ -1702,6 +1770,15 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
 #define MIR_INTER_GET(a, b)                                                    \
   ((inter[(size_t)(a) * words + ((size_t)(b) >> 6)] >>                          \
     ((size_t)(b) & 63)) & 1u)
+#define MIR_INTER_ADD(a, b)                                                     \
+  do {                                                                          \
+    if ((a) != (b) && !MIR_INTER_GET((a), (b))) {                               \
+      MIR_INTER_SET((a), (b));                                                  \
+      MIR_INTER_SET((b), (a));                                                  \
+      degree[(a)]++;                                                            \
+      degree[(b)]++;                                                            \
+    }                                                                           \
+  } while (0)
 /* Walk vreg `a`'s neighbours. Popping set bits word by word skips the runs of
  * non-neighbours that testing 0..N one index at a time would visit, which is
  * what the three O(N) neighbour scans below used to spend their time on. Only
@@ -1784,19 +1861,147 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     }
   }
 
-  /* Interference graph: strict-overlapping colorable vregs of the same class. */
-  for (size_t a = 0; a < N; a++) {
-    if (!colorable[a]) {
-      continue;
-    }
-    for (size_t b = a + 1; b < N; b++) {
-      if (colorable[b] &&
-          mir_color_interferes(&fn->vregs[a], &fn->vregs[b])) {
-        MIR_INTER_SET(a, b);
-        MIR_INTER_SET(b, a);
-        degree[a]++;
-        degree[b]++;
+  /* Build interference from the control-flow liveness sets. The old interval
+   * graph made every value between its first and last textual use overlap. In a
+   * branch-heavy function that joined values from mutually exclusive arms into
+   * one large clique, even though no execution can keep those values live at the
+   * same time. Walking each block backwards adds the standard def-versus-live
+   * edges and keeps those arms separate. If the bounded CFG analysis cannot run,
+   * retain the interval graph as the conservative fallback. */
+  {
+    MirLiveCfg cfg;
+    /* The coloring core is quadratic in vreg count. Keep the more detailed
+     * graph on application-sized functions, where it changes allocation, and
+     * leave generated stress functions on the existing interval graph. */
+    size_t branch_count = 0;
+    for (size_t i = 0; i < fn->insn_count; i++) {
+      if (mir_inst_ends_block(&fn->insns[i])) {
+        branch_count++;
       }
+    }
+    static int interval_only = -1;
+    if (interval_only < 0) {
+      interval_only = getenv("METTLE_INTERVAL_INTERFERENCE") ? 1 : 0;
+    }
+    int use_cfg = !interval_only && N <= 512 && fn->insn_count >= 128 &&
+                  fn->insn_count <= 2048 && branch_count >= 8;
+    int have_cfg = use_cfg && mir_live_cfg_build(fn, &cfg, 1);
+    unsigned long long *live =
+        have_cfg ? (unsigned long long *)malloc(words * sizeof(*live)) : NULL;
+    int exact_graph = have_cfg && live;
+    if (exact_graph) {
+      for (size_t block = 0; block < cfg.block_count; block++) {
+        size_t lo = (size_t)cfg.block_start[block];
+        size_t hi = block + 1 < cfg.block_count
+                        ? (size_t)cfg.block_start[block + 1]
+                        : fn->insn_count;
+        memcpy(live, cfg.live_out + block * words,
+               words * sizeof(*live));
+        for (size_t at = hi; at-- > lo;) {
+          const MirInst *in = &fn->insns[at];
+          if (in->dst.kind == MIR_OPK_VREG) {
+            MirVregId d = in->dst.vreg;
+            if (d >= 0 && (size_t)d < N) {
+              if (colorable[d]) {
+                for (size_t w = 0; w < words; w++) {
+                  uint64_t bits = live[w];
+                  while (bits) {
+                    size_t v = w * 64 + (size_t)__builtin_ctzll(bits);
+                    bits &= bits - 1;
+                    if (v < N && colorable[v] &&
+                        fn->vregs[d].rclass == fn->vregs[v].rclass) {
+                      MIR_INTER_ADD((size_t)d, v);
+                    }
+                  }
+                }
+              }
+              live[(size_t)d >> 6] &= ~(1ull << ((size_t)d & 63));
+            }
+          }
+          mir_live_add_operand(fn, &in->dst, live, 1);
+          mir_live_add_operand(fn, &in->a, live, 0);
+          mir_live_add_operand(fn, &in->b, live, 0);
+        }
+      }
+
+      /* Parameters, constants, and the hidden return pointer can be live before
+       * the first MIR instruction. They need the pairwise edges that ordinary
+       * definitions inside the stream create. */
+      for (size_t a = 0; a < N; a++) {
+        if (!colorable[a] || !mir_live_bit_get(cfg.live_in, a)) {
+          continue;
+        }
+        for (size_t b = a + 1; b < N; b++) {
+          if (colorable[b] && mir_live_bit_get(cfg.live_in, b) &&
+              fn->vregs[a].rclass == fn->vregs[b].rclass) {
+            MIR_INTER_ADD(a, b);
+          }
+        }
+      }
+    } else {
+      for (size_t a = 0; a < N; a++) {
+        if (!colorable[a]) {
+          continue;
+        }
+        for (size_t b = a + 1; b < N; b++) {
+          if (colorable[b] &&
+              mir_color_interferes(&fn->vregs[a], &fn->vregs[b])) {
+            MIR_INTER_ADD(a, b);
+          }
+        }
+      }
+    }
+    int exact_pressure = 0;
+    int interval_pressure = 0;
+    if (exact_graph) {
+      uint64_t *interval_inter =
+          (uint64_t *)calloc(N * words, sizeof(*interval_inter));
+      int *interval_degree = (int *)calloc(N, sizeof(*interval_degree));
+      for (size_t a = 0; a < N; a++) {
+        if (!colorable[a]) {
+          continue;
+        }
+        if (degree[a] >= reg_count[a]) {
+          exact_pressure++;
+        }
+        if (interval_inter && interval_degree) {
+          for (size_t b = a + 1; b < N; b++) {
+            if (colorable[b] &&
+                mir_color_interferes(&fn->vregs[a], &fn->vregs[b])) {
+              interval_inter[a * words + (b >> 6)] |= 1ull << (b & 63);
+              interval_inter[b * words + (a >> 6)] |= 1ull << (a & 63);
+              interval_degree[a]++;
+              interval_degree[b]++;
+            }
+          }
+        }
+      }
+      if (interval_inter && interval_degree) {
+        for (size_t a = 0; a < N; a++) {
+          if (colorable[a] && interval_degree[a] >= reg_count[a]) {
+            interval_pressure++;
+          }
+        }
+        /* Exact liveness changes allocation only when it relieves broad
+         * pressure. A small edge change can reshuffle otherwise sound colors
+         * without removing enough contention to pay for that disruption. One
+         * full leaf register set is a stable, target-derived cutoff. */
+        if (interval_pressure - exact_pressure <
+            (int)MIR_GP_LEAF_POOL_MAX) {
+          free(inter);
+          free(degree);
+          inter = interval_inter;
+          degree = interval_degree;
+          interval_inter = NULL;
+          interval_degree = NULL;
+        }
+      }
+      free(interval_inter);
+      free(interval_degree);
+    }
+    free(live);
+    if (have_cfg) {
+      mir_live_cfg_free(&cfg);
     }
   }
 
@@ -2005,6 +2210,7 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
 #undef MIR_METRIC
 #undef MIR_INTER_SET
 #undef MIR_INTER_GET
+#undef MIR_INTER_ADD
   free(inter); free(mask); free(degree); free(cost); free(colorable);
   free(removed); free(reg_count); free(metric); free(stack);
   free(narrow_src); free(use_depth);
