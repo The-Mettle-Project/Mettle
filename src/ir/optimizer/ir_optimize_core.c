@@ -2053,6 +2053,7 @@ int ir_collect_instruction_temp_uses(IRTempUseMap *uses,
   case IR_OP_CALL_INDIRECT:
   case IR_OP_PREFETCH:
   case IR_OP_RETURN:
+  case IR_OP_SELECT:
     if (!ir_collect_operand_temp_use(uses, &instruction->lhs) ||
         !ir_collect_operand_temp_use(uses, &instruction->rhs)) {
       return 0;

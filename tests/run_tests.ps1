@@ -6925,6 +6925,44 @@ catch {
   Write-CaseResult -Name "mir_interpolation_coverage" -Passed $false -Reason $_.Exception.Message
 }
 
+# If-conversion is off by default, so nothing else in the suite compiles a
+# single IR_OP_SELECT. It shipped with three defects that only appeared under
+# METTLE_IF_CONVERT=1: a second branch into the else label it deletes (an
+# undefined-label ICE), a local declared inside an arm whose declaration the
+# splice removed, and -- the real one -- SELECT missing from the temp-use
+# collector, so dead-temp elimination erased the producers of its condition and
+# then-value. Build the shapes with the pass on and check the answer.
+foreach ($ifcMode in @("release", "debug")) {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "test_if_convert_shapes_$ifcMode.exe"
+    $args = @("--build", "--emit-obj", "--linker", "internal")
+    if ($ifcMode -eq "release") { $args += "--release" }
+    $args += @("tests/test_if_convert_shapes.mettle", "-o", $exePath)
+    $env:METTLE_IF_CONVERT = "1"
+    try {
+      $out = & $CompilerPath @args 2>&1 | Out-String
+      $rc = $LASTEXITCODE
+    }
+    finally {
+      Remove-Item Env:\METTLE_IF_CONVERT -ErrorAction SilentlyContinue
+    }
+    if ($rc -ne 0) {
+      throw "if-convert $ifcMode build failed: $out"
+    }
+    & $exePath | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "if-convert $ifcMode program returned $LASTEXITCODE (expected 0)"
+    }
+    Write-CaseResult -Name "if_convert_shapes_$ifcMode" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "if_convert_shapes_$ifcMode" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # MIR inline float32 affine-map passthrough: IR_OP_SIMD_AFFINE_MAP_F32 (the
 # float-copy / saxpy / `a*x+c` class) runs through the register-allocating
 # backend with its compile-time coefficients baked into the kernel broadcasts,

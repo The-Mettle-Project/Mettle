@@ -1,0 +1,65 @@
+import "std/io";
+
+fn shared_else_label(a: int64, b: int64) -> int64 {
+  var r: int64 = 0;
+  if (a > 0 && b > 0) {
+    r = a + b;
+  } else {
+    r = a - b;
+  }
+  return r;
+}
+
+fn select_from_temps(a: int64, b: int64) -> int64 {
+  var r: int64 = 7;
+  if (a > b) {
+    r = a * 3 + b;
+  } else {
+    r = b * 5 - a;
+  }
+  return r;
+}
+
+fn local_declared_in_arm(a: int64) -> int64 {
+  var r: int64 = 0;
+  if (a > 10) {
+    var t: int64 = a * 2;
+    r = t + 1;
+  } else {
+    var u: int64 = a * 4;
+    r = u - 1;
+  }
+  return r;
+}
+
+fn nested_diamonds(a: int64, b: int64) -> int64 {
+  var r: int64 = 0;
+  if (a > 0) {
+    r = a;
+  } else {
+    r = 0 - a;
+  }
+  if (b > 0) {
+    r = r + b;
+  } else {
+    r = r - b;
+  }
+  return r;
+}
+
+fn main() -> int32 {
+  var total: int64 = 0;
+  var i: int64 = -4;
+  while (i <= 20) {
+    total = total + shared_else_label(i, 20 - i);
+    total = total + select_from_temps(i, 20 - i);
+    total = total + local_declared_in_arm(i);
+    total = total + nested_diamonds(i, 20 - i);
+    i = i + 1;
+  }
+  println("{total}");
+  if (total == 3025) {
+    return 0;
+  }
+  return 1;
+}

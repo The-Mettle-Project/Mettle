@@ -79,8 +79,11 @@ static int ir_ifconv_scan_arm(const IRFunction *function, size_t start,
   memset(arm, 0, sizeof(*arm));
   for (size_t i = start; i < end; i++) {
     const IRInstruction *in = &function->instructions[i];
-    if (in->op == IR_OP_NOP || in->op == IR_OP_DECLARE_LOCAL) {
+    if (in->op == IR_OP_NOP) {
       continue;
+    }
+    if (in->op == IR_OP_DECLARE_LOCAL) {
+      return 0;
     }
     if (in->op != IR_OP_ASSIGN && in->op != IR_OP_BINARY &&
         in->op != IR_OP_UNARY && in->op != IR_OP_CAST) {
@@ -150,6 +153,23 @@ static const IROperand *ir_ifconv_arm_value(const IRIfConvArm *arm,
   return NULL;
 }
 
+static int ir_ifconv_label_referenced_outside(const IRFunction *function,
+                                              const char *label, size_t lo,
+                                              size_t hi) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (i >= lo && i < hi) {
+      continue;
+    }
+    if ((in->op == IR_OP_JUMP || in->op == IR_OP_BRANCH_ZERO ||
+         in->op == IR_OP_BRANCH_EQ) &&
+        in->text && strcmp(in->text, label) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int ir_ifconv_try_at(IRFunction *function, size_t branch_index,
                             int *changed) {
   const IRInstruction *branch = &function->instructions[branch_index];
@@ -203,6 +223,11 @@ static int ir_ifconv_try_at(IRFunction *function, size_t branch_index,
     }
   }
   if (join_label_index == (size_t)-1) {
+    return 1;
+  }
+
+  if (ir_ifconv_label_referenced_outside(function, else_label, branch_index,
+                                         join_label_index)) {
     return 1;
   }
 
@@ -347,7 +372,9 @@ int ir_if_convert_pass(IRFunction *function, int *changed) {
    * cmov`) and (b) a predictability gate (branch is only worth converting when
    * it actually mispredicts -- the zero-run PGO interpreter can supply
    * per-branch taken counts). The IR_OP_SELECT + MIR_CMOV lowering below it is
-   * correct and fuzz-clean; enable with METTLE_IF_CONVERT=1 to iterate. The
+   * correct; enable with METTLE_IF_CONVERT=1 to iterate, and keep
+   * tests/test_if_convert_shapes.mettle green -- it is the guard for the three
+   * defects this pass shipped with, all of which only appeared with it on. The
    * bigger cmov wins (merge/quicksort) need arm-store speculation this pass
    * does not yet do. */
   {
