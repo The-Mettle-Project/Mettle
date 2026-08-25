@@ -591,6 +591,7 @@ int binary_emit_mov_eax_eax(BinaryCodeBuffer *buffer);
 
 int binary_emit_align_code(BinaryCodeBuffer *buffer, size_t boundary, size_t max_pad);
 int binary_emit_mov_mem_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, int32_t immediate);
+int binary_emit_mov_mem_imm_width(BinaryCodeBuffer *buffer, BinaryGpRegister base, int has_index, BinaryGpRegister index, int scale, int displacement, long long value, int width);
 int binary_emit_mov_mem_reg(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, BinaryGpRegister source);
 int binary_emit_mov_mem_reg16(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, BinaryGpRegister source);
 int binary_emit_mov_mem_reg32(BinaryCodeBuffer *buffer, BinaryGpRegister base, int displacement, BinaryGpRegister source);

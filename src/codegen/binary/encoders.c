@@ -547,6 +547,47 @@ static int binary_emit_memory_access_sib_internal(
   return 1;
 }
 
+/* mov [base (+ index*scale) + disp], imm -- C6 /0 for a byte, C7 /0 otherwise.
+ * Storing a constant needs no register at all, and materializing one first was
+ * costing an instruction (and a register) per field of every struct a program
+ * initializes. Width 8 takes only a sign-extendable imm32, which is all the C7
+ * form encodes; the caller falls back to a register for anything wider. */
+int binary_emit_mov_mem_imm_width(BinaryCodeBuffer *buffer,
+                                  BinaryGpRegister base, int has_index,
+                                  BinaryGpRegister index, int scale,
+                                  int displacement, long long value,
+                                  int width) {
+  unsigned char opcode = (width == 1) ? 0xC6 : 0xC7;
+  int prefix16 = (width == 2);
+  int rex_w = (width == 8);
+  if (width != 1 && width != 2 && width != 4 && width != 8) {
+    return 0;
+  }
+  if (rex_w && (value < -2147483648LL || value > 2147483647LL)) {
+    return 0;
+  }
+  if (has_index) {
+    if (!binary_emit_memory_access_sib(buffer, prefix16, rex_w, opcode, 0, 0,
+                                       (BinaryGpRegister)0, base, index, scale,
+                                       displacement)) {
+      return 0;
+    }
+  } else if (!binary_emit_memory_access_ex(buffer, prefix16, rex_w, opcode, 0,
+                                           0, (BinaryGpRegister)0, base,
+                                           displacement)) {
+    return 0;
+  }
+  if (width == 1) {
+    return binary_code_buffer_append_u8(buffer, (unsigned char)value);
+  }
+  if (width == 2) {
+    return binary_code_buffer_append_u8(buffer, (unsigned char)(value & 0xFF)) &&
+           binary_code_buffer_append_u8(buffer,
+                                        (unsigned char)((value >> 8) & 0xFF));
+  }
+  return binary_code_buffer_append_u32(buffer, (uint32_t)(int32_t)value);
+}
+
 int binary_emit_memory_access_sib(BinaryCodeBuffer *buffer,
                                   int operand_size_prefix, int rex_w,
                                   unsigned char opcode1, int has_opcode2,

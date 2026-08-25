@@ -1351,6 +1351,36 @@ static int encode_mov(MirFunction *fn, const MirInst *in) {
   /* STORE: [base (+ index*scale + disp)] <- a, width bytes. */
   if (in->dst.kind == MIR_OPK_MEM) {
     int ok1, ok2;
+    /* A constant goes straight into the store. Staging it in a register first
+     * cost an instruction and a register per field, and a struct initializer
+     * is a run of them: json_parse's node allocator was rematerializing 0 four
+     * times and -1 twice per node. */
+    int scalar_w = (in->width == 1 || in->width == 2 || in->width == 4 ||
+                    in->width == 8);
+    if (in->a.kind == MIR_OPK_IMM && scalar_w) {
+      int has_index = in->dst.mem.index != MIR_VREG_NONE;
+      MirOperand bop = mir_op_vreg(in->dst.mem.base);
+      BinaryGpRegister base_reg = value_reg(fn, &bop, SCRATCH_B, &ok1);
+      BinaryGpRegister index_reg = BINARY_GP_RAX;
+      if (!ok1) {
+        return 0;
+      }
+      if (has_index) {
+        MirOperand iop = mir_op_vreg(in->dst.mem.index);
+        index_reg = value_reg(fn, &iop, SCRATCH_A, &ok2);
+        if (!ok2) {
+          return 0;
+        }
+      }
+      if (binary_emit_mov_mem_imm_width(&ctx->code, base_reg, has_index,
+                                        index_reg, in->dst.mem.scale,
+                                        in->dst.mem.disp, in->a.imm,
+                                        in->width)) {
+        return 1;
+      }
+      /* A 64-bit constant too wide for the imm32 form: fall through and stage
+       * it in a register like any other value. */
+    }
     if (in->dst.mem.index != MIR_VREG_NONE) {
       /* One direct SIB `mov [base+idx*scale+disp], val` at every width. A
        * byte store whose value register encodes as 4..7 needs a forced REX so

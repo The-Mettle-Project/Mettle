@@ -1796,9 +1796,20 @@ int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed) {
 /* header's straight-line prefix, and the offset stays within a page of it.     */
 /* -------------------------------------------------------------------------- */
 
+/* A `for` header is a loop header too. Recognizing only `while` left every
+ * `for (;;)` loop -- which is how a probe chain, a parser's element loop and a
+ * match finder are all written -- outside both the invariant-load hoist and
+ * the memory promotion, so word_freq reloaded all four of its table's arrays
+ * from the table on every probe, each one a dependent load in front of the
+ * cache miss it was computing the address for. */
 static int re_label_is_loop_header(const char *text) {
-  return text && (strncmp(text, "ir_while_", 9) == 0 ||
-                  strstr(text, "_lbl_ir_while_") != NULL);
+  if (!text) {
+    return 0;
+  }
+  return strncmp(text, "ir_while_", 9) == 0 ||
+         strstr(text, "_lbl_ir_while_") != NULL ||
+         strncmp(text, "ir_for_cond_", 12) == 0 ||
+         strstr(text, "_lbl_ir_for_cond_") != NULL;
 }
 
 static size_t re_loop_latch(const IRFunction *function, size_t header) {
