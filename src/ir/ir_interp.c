@@ -1955,8 +1955,10 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     machine->trace[machine->trace_count - 1].modelled = 1;
   }
 
-  if (arg_count >= 3 && strcmp(name, "fwrite") == 0) {
-    *result = ii_int_value(ii_as_int(&args[2]));
+  if (arg_count >= 4 && strcmp(name, "fwrite") == 0) {
+    long long size = ii_as_int(&args[1]);
+    long long count = ii_as_int(&args[2]);
+    *result = ii_int_value(size > 0 && ii_as_int(&args[3]) ? count : 0);
     return 1;
   }
 
@@ -1974,7 +1976,7 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
 
   if (arg_count >= 1 && (strcmp(name, "puts") == 0 ||
                          strcmp(name, "fputs") == 0)) {
-    *result = ii_int_value(1);
+    *result = ii_int_value(0);
     return 1;
   }
 

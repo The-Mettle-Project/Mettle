@@ -1,0 +1,68 @@
+import "std/io";
+
+fn stride_shift(data: int32*, len: int32) {
+  var i: int32 = 1;
+  var cur: int32* = data + 4;
+  while (i < len) {
+    var key: int32 = *cur;
+    var scan: int32* = cur;
+    var j: int32 = i - 1;
+    while (j >= 0) {
+      var prev: int32* = scan - 4;
+      var current: int32 = *prev;
+      if (current <= key) {
+        break;
+      }
+      *scan = current;
+      scan = prev;
+      j = j - 1;
+    }
+    *scan = key;
+    cur = cur + 4;
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  var a: int32[64];
+  var b: int32[64];
+  var i: int32 = 0;
+  while (i < 64) {
+    a[i] = (64 - i) * 3;
+    b[i] = a[i];
+    i = i + 1;
+  }
+
+  stride_shift(&a[0], 8);
+
+  i = 0;
+  while (i < 64) {
+    if (i % 4 != 0) {
+      if (a[i] != b[i]) {
+        println("strided_shift FAIL: off-stride element {i} moved");
+        return 1;
+      }
+    }
+    i = i + 1;
+  }
+
+  var seen: int64 = 0;
+  i = 0;
+  while (i < 64) {
+    seen = seen + (int64)a[i];
+    i = i + 1;
+  }
+  var want: int64 = 0;
+  i = 0;
+  while (i < 64) {
+    want = want + (int64)b[i];
+    i = i + 1;
+  }
+  if (seen != want) {
+    println("strided_shift FAIL: multiset changed");
+    return 1;
+  }
+
+  println("strided_shift OK");
+  return 0;
+}

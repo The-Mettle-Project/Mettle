@@ -40,12 +40,11 @@ static int ir_find_next_significant(const IRFunction *function,
 }
 
 static int ir_i32_shift_stride_is_element_step(long long stride, int elem_size) {
-  return elem_size == 4 && (stride == 4 || stride == 16);
+  return elem_size == 4 && stride == 4;
 }
 
 static int ir_i32_ptr_offset_is_element_step(const IROperand *operand) {
-  return ir_operand_is_int_value(operand, 4) ||
-         ir_operand_is_int_value(operand, 16);
+  return ir_operand_is_int_value(operand, 4);
 }
 
 static int ir_match_shift_loop_at(const IRFunction *function, size_t header_index,

@@ -4538,6 +4538,51 @@ catch {
   Write-CaseResult -Name "native_heap_threads" -Passed $false -Reason $_.Exception.Message
 }
 
+# The shift-loop recognizer, run rather than only matched. Its two IrMustMatch
+# cases above assert that simd_insertion_sort_i32 fires; neither ever executed
+# the program, and the debug build of test_opt_shift_loop segfaulted while
+# release "passed" because the rewrite replaced the broken loop. The strided
+# case is the one the recognizer must decline: it walks every fourth element,
+# so rewriting it as a contiguous sort moves data the program never touched.
+# All three run in both modes, and debug and release must agree.
+foreach ($shiftCase in @(
+  @{ Name = "opt_shift_loop_runs"; Path = "tests/test_opt_shift_loop.mettle"; Marker = "shift_loop OK" },
+  @{ Name = "opt_insertion_sort_stack_runs"; Path = "tests/test_opt_simd_insertion_sort_stack.mettle"; Marker = $null },
+  @{ Name = "opt_strided_shift_not_sorted"; Path = "tests/test_opt_strided_shift_not_sorted.mettle"; Marker = "strided_shift OK" }
+)) {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    foreach ($mode in @("debug", "release")) {
+      $exePath = Join-Path $tmpDir "$($shiftCase.Name)_$mode.exe"
+      $objPath = [System.IO.Path]::ChangeExtension($exePath, $script:ObjExt)
+      foreach ($artifactPath in @($exePath, $objPath)) {
+        if (Test-Path $artifactPath) {
+          Remove-Item -Path $artifactPath -Force -ErrorAction SilentlyContinue
+        }
+      }
+      $buildArgs = @("--build", "--linker", "internal", $shiftCase.Path, "-o", $exePath)
+      if ($mode -eq "release") { $buildArgs = @("--release") + $buildArgs }
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "$($shiftCase.Name) $mode build failed: $buildOut"
+      }
+      $runOut = & $exePath 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "$($shiftCase.Name) $mode exited with $LASTEXITCODE`: $runOut"
+      }
+      if ($shiftCase.Marker -and $runOut -notmatch [regex]::Escape($shiftCase.Marker)) {
+        throw "$($shiftCase.Name) $mode output missing '$($shiftCase.Marker)': $runOut"
+      }
+    }
+    Write-CaseResult -Name $shiftCase.Name -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $shiftCase.Name -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # The surface the friction report changed: implicit widening, the constant
 # range check, rawptr allocation, and the string/cstring boundary. Both build
 # modes, because the two release miscompiles this test found -- an aggregate
