@@ -3972,9 +3972,9 @@ try {
     $extra = $allocators[$allocator]
 
     $cleanExe = Join-Path $tmpDir "safe_heap_clean.$allocator.exe"
-    & $CompilerPath --build --safe --release @extra tests/test_safe_heap_clean.mettle -o $cleanExe 2>&1 | Out-Null
+    $cleanBuild = & $CompilerPath --build --safe --release @extra tests/test_safe_heap_clean.mettle -o $cleanExe 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
-      throw "--safe build of test_safe_heap_clean failed on $allocator"
+      throw "--safe build of test_safe_heap_clean failed on ${allocator}: $cleanBuild"
     }
     $cleanOut = & $cleanExe 2>&1 | Out-String
     if ($LASTEXITCODE -ne 18) {
