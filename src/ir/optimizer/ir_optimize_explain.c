@@ -4115,10 +4115,13 @@ void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
   }
   case IR_OP_SIMD_FIND: {
     int u8 = ins->argument_count > 1 && ins->arguments[1].int_value == 1;
+    int pred = ins->argument_count > 0 ? (int)ins->arguments[0].int_value : -1;
     snprintf(buf, cap,
-             "%s-wide %s search skip-ahead (AVX2 compare+movemask; the scalar "
-             "loop replays only the hit iteration, exits exact)",
-             u8 ? "32" : "8", u8 ? "byte" : "int32");
+             "%s-wide %s search skip-ahead (%s; the scalar loop replays the "
+             "stop iteration, exits exact)",
+             pred == 6 ? "16" : (u8 ? "32" : "8"),
+             pred == 6 ? "ASCII identifier" : (u8 ? "byte" : "int32"),
+             pred == 6 ? "SSE4.2 ranges" : "AVX2 compare+movemask");
     return;
   }
   case IR_OP_SIMD_OUTER_LANE_F64:

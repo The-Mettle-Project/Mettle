@@ -2827,6 +2827,7 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     long long pred = insn->arguments[0].int_value;
     long long elem_kind = insn->arguments[1].int_value;
     long long rhs_kind = insn->arguments[2].int_value;
+    long long first = 0;
     long long rhs_scalar = 0;
     unsigned long long b_base = 0;
     if (rhs_kind == 2) {
@@ -2836,8 +2837,12 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     } else if (!ii_fetch_int(machine, frame, &insn->arguments[3], &rhs_scalar)) {
       return 0;
     }
+    if (insn->argument_count > 4 &&
+        !ii_fetch_int(machine, frame, &insn->arguments[4], &first)) {
+      return 0;
+    }
     long long hit = n;
-    for (long long i = 0; i < n; i++) {
+    for (long long i = first; i < n; i++) {
       long long av, bv;
       if (elem_kind == 0) {
         int v;
@@ -2877,6 +2882,11 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
       case 3: match = av > bv; break;
       case 4: match = av <= bv; break;
       case 5: match = av >= bv; break;
+      case 6:
+        match = !((av >= 'a' && av <= 'z') ||
+                  (av >= 'A' && av <= 'Z') ||
+                  (av >= '0' && av <= '9') || av == '_');
+        break;
       default:
         ii_fail(machine, IR_INTERP_UNSUPPORTED, "simd_find predicate");
         return 0;
@@ -2886,7 +2896,7 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
         break;
       }
     }
-    machine->fuel -= n;
+    machine->fuel -= n > first ? n - first : 0;
     IRInterpValue out = ii_int_value(hit);
     return ii_store_dest(machine, frame, &insn->dest, &out);
   }

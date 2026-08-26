@@ -2703,9 +2703,19 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
   }
   case IR_OP_SIMD_FIND: {
     char base[128];
+    char start[128];
+    long long pred = instruction->argument_count > 0
+                         ? instruction->arguments[0].int_value
+                         : -1;
     ir_format_operand(&instruction->rhs, base, sizeof(base));
-    written = snprintf(buffer, buffer_size, "%s <- %s(a=%s, n=%s)", dest,
-                       ir_opcode_name(instruction->op), base, lhs);
+    if (instruction->argument_count > 4) {
+      ir_format_operand(&instruction->arguments[4], start, sizeof(start));
+    } else {
+      snprintf(start, sizeof(start), "0");
+    }
+    written = snprintf(buffer, buffer_size,
+                       "%s <- %s(a=%s, n=%s, pred=%lld, start=%s)", dest,
+                       ir_opcode_name(instruction->op), base, lhs, pred, start);
     break;
   }
   case IR_OP_SIMD_OUTER_LANE_F64:

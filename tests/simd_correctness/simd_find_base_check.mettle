@@ -58,6 +58,36 @@ fn match_ref(src: uint8*, i: int32, j: int32, limit: int32) -> int32 {
   return run;
 }
 
+@noinline fn ident_scan(src: uint8*, start: int32, limit: int32) -> int32 {
+  var i: int32 = start;
+  while (i < limit) {
+    var c: int32 = (int32)src[i];
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+        (c >= 48 && c <= 57) || c == 95) {
+      i = i + 1;
+    } else {
+      break;
+    }
+  }
+  return i;
+}
+
+// The extra stop state keeps this reference outside every find recognizer.
+@noinline fn ident_ref(src: uint8*, start: int32, limit: int32) -> int32 {
+  var i: int32 = start;
+  var stop: int32 = 0;
+  while (i < limit && stop == 0) {
+    var c: int32 = (int32)src[i];
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+        (c >= 48 && c <= 57) || c == 95) {
+      i = i + 1;
+    } else {
+      stop = 1;
+    }
+  }
+  return i;
+}
+
 fn main() -> int32 {
   var n: int32 = 4096;
   var buf: uint8* = malloc((int64)n);
@@ -83,6 +113,69 @@ fn main() -> int32 {
     }
     limit = limit + 1;
   }
+
+  // Every byte value checks the SSE range table, including NUL and bytes with
+  // the high bit set. The stop point is beyond one 16-byte block.
+  k = 0;
+  while (k < 160) {
+    buf[k] = (uint8)(97 + (k % 26));
+    k = k + 1;
+  }
+  var byte_value: int32 = 0;
+  while (byte_value < 256) {
+    buf[53] = (uint8)byte_value;
+    var got: int32 = ident_scan(buf, 3, 100);
+    var want_class: int32 = ident_ref(buf, 3, 100);
+    if (got != want_class) { fail("ident-byte", byte_value); }
+    buf[53] = 97;
+    byte_value = byte_value + 1;
+  }
+
+  // Vary both the address and the hit lane. This covers the first byte, both
+  // sides of the 16-byte boundary, several blocks, and the no-hit tail.
+  var start: int32 = 0;
+  while (start < 48) {
+    var hit: int32 = 0;
+    while (hit < 72) {
+      buf[start + hit] = 33;
+      if (ident_scan(buf, start, start + 80) !=
+          ident_ref(buf, start, start + 80)) {
+        fail("ident-hit", start * 100 + hit);
+      }
+      buf[start + hit] = (uint8)(65 + (hit % 26));
+      hit = hit + 1;
+    }
+    if (ident_scan(buf, start, start + 80) !=
+        ident_ref(buf, start, start + 80)) {
+      fail("ident-tail", start);
+    }
+    start = start + 1;
+  }
+  if (ident_scan(buf, 20, 20) != 20) { fail("ident-empty", 20); }
+
+  // Signed negative indices are valid when the pointer is biased into the
+  // allocation. They also exercise the full signed start range of the kernel.
+  var biased: uint8* = buf + 96;
+  k = -48;
+  while (k < 48) { biased[k] = 97; k = k + 1; }
+  biased[17] = 33;
+  if (ident_scan(biased, -37, 40) != ident_ref(biased, -37, 40)) {
+    fail("ident-negative", 37);
+  }
+
+  // Start eight bytes before a page edge. The kernel must hand this case back
+  // to the scalar loop instead of issuing a 16-byte read across the edge.
+  var edge_storage: uint8* = malloc(8256);
+  var edge_offset: int32 =
+      4096 - (int32)((int64)edge_storage & (int64)4095);
+  var edge: uint8* = edge_storage + edge_offset - 8;
+  k = 0;
+  while (k < 64) { edge[k] = 97; k = k + 1; }
+  edge[25] = 33;
+  if (ident_scan(edge, 0, 64) != ident_ref(edge, 0, 64)) {
+    fail("ident-page", edge_offset);
+  }
+  free(edge_storage);
 
   free(buf);
   if (g_fail == 0) { println("FIND SIMD: ALL OK"); return 0; }

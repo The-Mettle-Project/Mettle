@@ -1310,6 +1310,21 @@ int wcs_avx_vpmovmskb_reg_ymm(BinaryCodeBuffer *b, int gpr, int ymm) {
              b, (unsigned char)(0xC0 | ((gpr & 7) << 3) | (ymm & 7)));
 }
 
+/* pcmpistri xmm_ranges, m128, imm8, 66 0F 3A 63 /r ib. The instruction
+ * returns the selected byte index in ECX. */
+int wcs_sse42_pcmpistri_ranges_mem(BinaryCodeBuffer *b, int ranges_xmm,
+                                   int base, unsigned char control) {
+  if ((base & 7) == 4) return 0; /* no SIB form is needed by the caller */
+  return binary_code_buffer_append_u8(b, 0x66) &&
+         binary_emit_rex(b, 0, ranges_xmm >> 3, 0, base >> 3) &&
+         binary_code_buffer_append_u8(b, 0x0F) &&
+         binary_code_buffer_append_u8(b, 0x3A) &&
+         binary_code_buffer_append_u8(b, 0x63) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(((ranges_xmm & 7) << 3) | (base & 7))) &&
+         binary_code_buffer_append_u8(b, control);
+}
+
 /* Broadcast a 32-bit GPR value across all eight lanes of a ymm register. */
 int wcs_broadcast_i32_to_ymm(BinaryCodeBuffer *b, int ymm, int gpr) {
   return wcs_avx_vmovd_xmm_reg(b, ymm, gpr) &&

@@ -2266,6 +2266,7 @@ int code_generator_binary_emit_simd_minmax_i32(
 #define VFIND_GT 3
 #define VFIND_LE 4
 #define VFIND_GE 5
+#define VFIND_ASCII_IDENT_END 6
 
 /* jcc condition for `cmp elem32, key32` taking the HIT branch (signed forms
  * for the ordered predicates; the recognizer gates signedness). */
@@ -2280,14 +2281,86 @@ static unsigned char vfind_hit_cc(int pred) {
   }
 }
 
+/* Find the first byte outside [0-9A-Z_a-z], starting at an existing absolute
+ * index. PCMPISTRI tests 16 bytes at once and returns the first rejected byte
+ * in ECX. A block is read only when it stays within the current page. If fewer
+ * than 16 bytes remain, or the block would cross a page, the surviving scalar
+ * loop handles the tail. */
+static int code_generator_binary_emit_simd_find_ascii_ident(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRInstruction *instruction) {
+  BinaryCodeBuffer *b = &context->code;
+  if (instruction->argument_count != 5 ||
+      !code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->lhs,
+                                               BINARY_GP_R10) ||
+      !code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->rhs,
+                                               BINARY_GP_RDX) ||
+      !code_generator_binary_emit_operand_load(generator, context,
+                                               &instruction->arguments[4],
+                                               BINARY_GP_R11) ||
+      !wcs_add_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_R11) ||
+      !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX,
+                                 UINT64_C(0x7A615F5F5A413930)) ||
+      !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX)) {
+    return 0;
+  }
+
+  size_t top = b->size;
+  size_t to_done[4];
+  size_t n_done = 0;
+  size_t to_hit = 0;
+  if (!wcs_cmp_reg_reg64(b, BINARY_GP_R11, BINARY_GP_R10) ||
+      !wcs_jcc(b, 0x8D /* jge: start >= n */, &to_done[n_done++]) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_RAX, BINARY_GP_RDX) ||
+      !binary_emit_and_reg_imm32(b, BINARY_GP_RAX, 4095) ||
+      !wcs_cmp_reg_imm32(b, BINARY_GP_RAX, 4080) ||
+      !wcs_jcc(b, 0x87 /* ja: a 16-byte read would cross the page */,
+               &to_done[n_done++]) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_RAX, BINARY_GP_R10) ||
+      !wcs_sub_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R11) ||
+      !wcs_cmp_reg_imm8(b, BINARY_GP_RAX, 16) ||
+      !wcs_jcc(b, 0x8C /* jl: leave the short tail scalar */,
+               &to_done[n_done++]) ||
+      !wcs_sse42_pcmpistri_ranges_mem(b, BINARY_XMM0, BINARY_GP_RDX,
+                                      0x14) ||
+      !wcs_cmp_reg_imm8(b, BINARY_GP_RCX, 16) ||
+      !wcs_jcc(b, 0x85 /* jne: ECX is the first rejected byte */,
+               &to_hit) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 16) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_R11, 0, 16)) {
+    return 0;
+  }
+  {
+    size_t back = 0;
+    if (!wcs_jcc(b, 0, &back) || !wcs_patch_to(b, back, top) ||
+        !wcs_patch_here(b, to_hit) ||
+        !wcs_add_reg_reg64(b, BINARY_GP_R11, BINARY_GP_RCX)) {
+      return 0;
+    }
+  }
+  for (size_t i = 0; i < n_done; i++) {
+    if (!wcs_patch_here(b, to_done[i])) return 0;
+  }
+  if (!code_generator_binary_emit_destination_store(generator, context,
+                                                      &instruction->dest,
+                                                      BINARY_GP_R11)) {
+    return 0;
+  }
+  return 1;
+}
+
 int code_generator_binary_emit_simd_find(CodeGenerator *generator,
                                          BinaryFunctionContext *context,
                                          const IRInstruction *instruction) {
   BinaryCodeBuffer *b = NULL;
   if (!generator || !context || !instruction ||
-      instruction->argument_count != 4 || !instruction->arguments ||
+      (instruction->argument_count != 4 && instruction->argument_count != 5) ||
+      !instruction->arguments ||
       instruction->dest.kind != IR_OPERAND_SYMBOL ||
-      instruction->rhs.kind != IR_OPERAND_SYMBOL) {
+      (instruction->rhs.kind != IR_OPERAND_SYMBOL &&
+       instruction->rhs.kind != IR_OPERAND_TEMP)) {
     code_generator_set_error(generator, "Malformed simd_find");
     return 0;
   }
@@ -2297,6 +2370,21 @@ int code_generator_binary_emit_simd_find(CodeGenerator *generator,
   int u8 = (int)args[1].int_value == 1;
   int rhs_kind = (int)args[2].int_value;
   const IROperand *rhs = &args[3];
+  if (pred == VFIND_ASCII_IDENT_END) {
+    if (!u8 || rhs_kind != 0 || instruction->argument_count != 5 ||
+        args[3].kind != IR_OPERAND_INT) {
+      code_generator_set_error(generator, "Bad ASCII class simd_find encoding");
+      return 0;
+    }
+    return code_generator_binary_emit_simd_find_ascii_ident(
+        generator, context, instruction);
+  }
+  if (instruction->argument_count != 4 ||
+      instruction->rhs.kind != IR_OPERAND_SYMBOL || pred < VFIND_EQ ||
+      pred > VFIND_GE) {
+    code_generator_set_error(generator, "Bad simd_find encoding");
+    return 0;
+  }
   const int lanes = u8 ? 32 : 8;
   const int esz = u8 ? 1 : 4;
   const int two_arrays = (rhs_kind == 2);

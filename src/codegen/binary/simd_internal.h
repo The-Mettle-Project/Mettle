@@ -150,6 +150,8 @@ int wcs_avx_vpcmpeqb_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_avx_vpbroadcastb_ymm(BinaryCodeBuffer *b, int dst, int src_xmm);
 int wcs_avx_vmovmskps_reg_ymm(BinaryCodeBuffer *b, int gpr, int ymm);
 int wcs_avx_vpmovmskb_reg_ymm(BinaryCodeBuffer *b, int gpr, int ymm);
+int wcs_sse42_pcmpistri_ranges_mem(BinaryCodeBuffer *b, int ranges_xmm,
+                                   int base, unsigned char control);
 
 /* ---- broadcasts & horizontal reductions ---- */
 int wcs_avx_vmovd_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr);

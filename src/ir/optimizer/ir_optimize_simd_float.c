@@ -4317,6 +4317,283 @@ static int vfind_symbol_written_in(const IRFunction *function, size_t lo,
   return 0;
 }
 
+/* The lexer style `alpha || digit || '_'` loop has several short circuit
+ * branches, so the scalar predicate matcher below cannot claim it. After the
+ * ASCII range fold it has one stable, exact shape. Recognize that shape and
+ * plant a class search before the loop. The loop stays intact and checks the
+ * stop byte itself, just like every other find skip ahead. */
+#define VFIND_P_ASCII_IDENT_END 6
+
+static int vfind_same_operand(const IROperand *a, const IROperand *b) {
+  if (!a || !b || a->kind != b->kind) return 0;
+  if (a->kind == IR_OPERAND_INT) return a->int_value == b->int_value;
+  if (a->kind == IR_OPERAND_SYMBOL || a->kind == IR_OPERAND_TEMP) {
+    return a->name && b->name && strcmp(a->name, b->name) == 0;
+  }
+  return 0;
+}
+
+static int vfind_temp_from(const IROperand *operand,
+                           const IRInstruction *producer) {
+  return operand && producer && producer->dest.kind == IR_OPERAND_TEMP &&
+         producer->dest.name && operand->kind == IR_OPERAND_TEMP &&
+         operand->name && strcmp(operand->name, producer->dest.name) == 0;
+}
+
+static int vfind_binary_const(const IRInstruction *ins, const char *op,
+                              const IROperand *lhs, long long rhs) {
+  return ins && ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
+         strcmp(ins->text, op) == 0 && vfind_same_operand(&ins->lhs, lhs) &&
+         ins->rhs.kind == IR_OPERAND_INT && ins->rhs.int_value == rhs;
+}
+
+static int vfind_label_target(const IRInstruction *branch,
+                              const IRInstruction *label) {
+  return branch && label && branch->text && label->op == IR_OP_LABEL &&
+         label->text && strcmp(branch->text, label->text) == 0;
+}
+
+static int vfind_instruction_reads_symbol(const IRInstruction *ins,
+                                          const char *name) {
+  if (!ins || !name) return 0;
+  if (ir_operand_is_symbol_named(&ins->lhs, name) ||
+      ir_operand_is_symbol_named(&ins->rhs, name)) {
+    return 1;
+  }
+  for (size_t i = 0; i < ins->argument_count; i++) {
+    if (ir_operand_is_symbol_named(&ins->arguments[i], name)) return 1;
+  }
+  return 0;
+}
+
+static int vfind_symbol_is_signed_i32(const IRFunction *function,
+                                      const char *name) {
+  if (!function || !name) return 0;
+  for (size_t i = 0; i < function->parameter_count; i++) {
+    if (function->parameter_names && function->parameter_names[i] &&
+        strcmp(function->parameter_names[i], name) == 0) {
+      return function->parameter_types && function->parameter_types[i] &&
+             strcmp(function->parameter_types[i], "int32") == 0;
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_DECLARE_LOCAL &&
+        ir_operand_is_symbol_named(&ins->dest, name)) {
+      return ins->text && strcmp(ins->text, "int32") == 0;
+    }
+  }
+  return 0;
+}
+
+static int vfind_operand_fits_signed_i32(const IRFunction *function,
+                                         size_t at,
+                                         const IROperand *operand) {
+  IRValueRangeCtx ranges;
+  IRIntRange value;
+  ir_value_range_ctx_init(&ranges, function);
+  ir_value_range_of(&ranges, at, operand, &value);
+  ir_value_range_ctx_destroy(&ranges);
+  return value.lo >= INT32_MIN && value.hi <= INT32_MAX;
+}
+
+static int ir_try_vectorize_ascii_ident_find_at(IRFunction *function,
+                                                 size_t header_index,
+                                                 int *changed) {
+  size_t cmp_index = 0, branch_index = 0, jump_index = (size_t)-1;
+  size_t real[24];
+  size_t real_count = 0;
+  const IROperand *base = NULL;
+  IRInstruction fused = {0};
+
+  if (!function || header_index >= function->instruction_count ||
+      function->instructions[header_index].op != IR_OP_LABEL ||
+      !ir_label_is_while_header(function->instructions[header_index].text)) {
+    return 1;
+  }
+  if (!ir_find_next_non_nop(function, header_index + 1, &cmp_index) ||
+      !ir_find_next_non_nop(function, cmp_index + 1, &branch_index)) {
+    return 1;
+  }
+
+  IRInstruction *header = &function->instructions[header_index];
+  IRInstruction *bound_cmp = &function->instructions[cmp_index];
+  IRInstruction *bound_branch = &function->instructions[branch_index];
+  if (bound_cmp->op != IR_OP_BINARY || bound_cmp->is_float ||
+      !bound_cmp->text || strcmp(bound_cmp->text, "<") != 0 ||
+      bound_cmp->lhs.kind != IR_OPERAND_SYMBOL || !bound_cmp->lhs.name ||
+      (bound_cmp->rhs.kind != IR_OPERAND_SYMBOL &&
+       bound_cmp->rhs.kind != IR_OPERAND_TEMP &&
+       bound_cmp->rhs.kind != IR_OPERAND_INT) ||
+      bound_branch->op != IR_OP_BRANCH_ZERO || !bound_branch->text ||
+      !vfind_temp_from(&bound_branch->lhs, bound_cmp)) {
+    return 1;
+  }
+  const char *iv = bound_cmp->lhs.name;
+
+  for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
+    IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_JUMP && ins->text &&
+        strcmp(ins->text, header->text) == 0) {
+      jump_index = i;
+      break;
+    }
+    if (ins->op == IR_OP_LABEL && ins->text &&
+        strcmp(ins->text, bound_branch->text) == 0) {
+      break;
+    }
+  }
+  if (jump_index == (size_t)-1 ||
+      !ir_fused_loop_exit_is_adjacent(function, jump_index,
+                                       bound_branch->text)) {
+    return 1;
+  }
+  for (size_t i = branch_index + 1; i <= jump_index; i++) {
+    if (function->instructions[i].op == IR_OP_NOP) continue;
+    if (real_count >= sizeof(real) / sizeof(real[0])) return 1;
+    real[real_count++] = i;
+  }
+  if (real_count != 21) return 1;
+
+  IRInstruction *addr = &function->instructions[real[0]];
+  IRInstruction *load = &function->instructions[real[1]];
+  IRInstruction *assign = &function->instructions[real[2]];
+  IRInstruction *fold = &function->instructions[real[3]];
+  IRInstruction *sub = &function->instructions[real[4]];
+  IRInstruction *alpha = &function->instructions[real[5]];
+  IRInstruction *alpha_branch = &function->instructions[real[6]];
+  IRInstruction *alpha_jump = &function->instructions[real[7]];
+  IRInstruction *digit_label = &function->instructions[real[8]];
+  IRInstruction *digit_lo = &function->instructions[real[9]];
+  IRInstruction *digit_lo_branch = &function->instructions[real[10]];
+  IRInstruction *digit_hi = &function->instructions[real[11]];
+  IRInstruction *digit_hi_branch = &function->instructions[real[12]];
+  IRInstruction *digit_jump = &function->instructions[real[13]];
+  IRInstruction *digit_mid_label = &function->instructions[real[14]];
+  IRInstruction *underscore_label = &function->instructions[real[15]];
+  IRInstruction *underscore = &function->instructions[real[16]];
+  IRInstruction *underscore_branch = &function->instructions[real[17]];
+  IRInstruction *continue_label = &function->instructions[real[18]];
+  IRInstruction *increment = &function->instructions[real[19]];
+  IRInstruction *backedge = &function->instructions[real[20]];
+
+  if (addr->op != IR_OP_BINARY || addr->is_float || !addr->text ||
+      strcmp(addr->text, "+") != 0 || addr->dest.kind != IR_OPERAND_TEMP ||
+      !addr->dest.name || load->op != IR_OP_LOAD || !load->is_unsigned ||
+      !vfind_temp_from(&load->lhs, addr) ||
+      load->rhs.kind != IR_OPERAND_INT || load->rhs.int_value != 1 ||
+      assign->op != IR_OP_ASSIGN || assign->dest.kind != IR_OPERAND_SYMBOL ||
+      !assign->dest.name || !vfind_temp_from(&assign->lhs, load)) {
+    return 1;
+  }
+  if (ir_operand_is_symbol_named(&addr->lhs, iv)) base = &addr->rhs;
+  else if (ir_operand_is_symbol_named(&addr->rhs, iv)) base = &addr->lhs;
+  if (!base || (base->kind != IR_OPERAND_SYMBOL &&
+                base->kind != IR_OPERAND_TEMP) || !base->name ||
+      (base->kind == IR_OPERAND_TEMP &&
+       !ir_find_temp_producer_before(function, header_index, base->name)) ||
+      (bound_cmp->rhs.kind == IR_OPERAND_TEMP &&
+       (!bound_cmp->rhs.name ||
+        !ir_find_temp_producer_before(function, header_index,
+                                      bound_cmp->rhs.name))) ||
+      ir_symbol_address_taken(function, assign->dest.name)) {
+    return 1;
+  }
+  if (strcmp(assign->dest.name, iv) == 0 ||
+      (base->kind == IR_OPERAND_SYMBOL &&
+       (strcmp(base->name, iv) == 0 ||
+        strcmp(base->name, assign->dest.name) == 0)) ||
+      (bound_cmp->rhs.kind == IR_OPERAND_SYMBOL &&
+       (strcmp(bound_cmp->rhs.name, iv) == 0 ||
+        strcmp(bound_cmp->rhs.name, assign->dest.name) == 0))) {
+    return 1;
+  }
+
+  if (!vfind_binary_const(fold, "|", &assign->dest, 32) ||
+      !vfind_binary_const(sub, "-", &fold->dest, 97) ||
+      !vfind_binary_const(alpha, "<=", &sub->dest, 25) ||
+      !alpha->is_unsigned || alpha_branch->op != IR_OP_BRANCH_ZERO ||
+      !vfind_temp_from(&alpha_branch->lhs, alpha) ||
+      alpha_jump->op != IR_OP_JUMP ||
+      !vfind_label_target(alpha_branch, digit_label) ||
+      !vfind_label_target(alpha_jump, continue_label) ||
+      !vfind_binary_const(digit_lo, ">=", &assign->dest, 48) ||
+      digit_lo_branch->op != IR_OP_BRANCH_ZERO ||
+      !vfind_temp_from(&digit_lo_branch->lhs, digit_lo) ||
+      !vfind_label_target(digit_lo_branch, underscore_label) ||
+      !vfind_binary_const(digit_hi, "<=", &assign->dest, 57) ||
+      digit_hi_branch->op != IR_OP_BRANCH_ZERO ||
+      !vfind_temp_from(&digit_hi_branch->lhs, digit_hi) ||
+      !vfind_label_target(digit_hi_branch, digit_mid_label) ||
+      digit_jump->op != IR_OP_JUMP ||
+      !vfind_label_target(digit_jump, continue_label) ||
+      !vfind_binary_const(underscore, "==", &assign->dest, 95) ||
+      underscore_branch->op != IR_OP_BRANCH_ZERO ||
+      !vfind_temp_from(&underscore_branch->lhs, underscore) ||
+      strcmp(underscore_branch->text, bound_branch->text) != 0 ||
+      !ir_try_parse_direct_unit_increment(increment, iv) ||
+      backedge->op != IR_OP_JUMP || !backedge->text ||
+      strcmp(backedge->text, header->text) != 0) {
+    return 1;
+  }
+
+  /* The kernel advances in 64 bits. Signed int32 endpoints prove that this is
+   * exact even for a negative start: a unit step cannot wrap before reaching
+   * an int32 bound. */
+  if (!vfind_symbol_is_signed_i32(function, iv) ||
+      !vfind_operand_fits_signed_i32(function, header_index,
+                                     &bound_cmp->rhs)) {
+    return 1;
+  }
+
+  /* Skipping assignments to the source local is safe only when its value does
+   * not escape the loop. The stop iteration still replays and writes it on the
+   * hit path; this check also covers the no-hit path. */
+  for (size_t i = jump_index + 1; i < function->instruction_count; i++) {
+    if (vfind_instruction_reads_symbol(&function->instructions[i],
+                                       assign->dest.name)) {
+      return 1;
+    }
+  }
+
+  /* A second pass over the inserted loop must not plant a second kernel. */
+  for (size_t i = header_index; i-- > 0;) {
+    IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL) break;
+    if (ins->op == IR_OP_SIMD_FIND &&
+        ir_operand_is_symbol_named(&ins->dest, iv)) {
+      return 1;
+    }
+  }
+
+  fused.op = IR_OP_SIMD_FIND;
+  fused.location = header->location;
+  fused.dest = ir_operand_symbol(iv);
+  if (!ir_operand_clone(&bound_cmp->rhs, &fused.lhs) ||
+      !ir_operand_clone(base, &fused.rhs)) {
+    ir_instruction_destroy_storage(&fused);
+    return 0;
+  }
+  fused.arguments = calloc(5, sizeof(IROperand));
+  if (!fused.arguments) {
+    ir_instruction_destroy_storage(&fused);
+    return 0;
+  }
+  fused.argument_count = 5;
+  fused.arguments[0] = ir_operand_int(VFIND_P_ASCII_IDENT_END);
+  fused.arguments[1] = ir_operand_int(1);
+  fused.arguments[2] = ir_operand_int(0);
+  fused.arguments[3] = ir_operand_int(0);
+  fused.arguments[4] = ir_operand_symbol(iv);
+  if (!ir_function_insert_instruction(function, header_index, &fused)) {
+    ir_instruction_destroy_storage(&fused);
+    return 0;
+  }
+  ir_instruction_destroy_storage(&fused);
+  if (changed) *changed = 1;
+  return 1;
+}
+
 static int ir_try_vectorize_find_at(IRFunction *function, size_t header_index,
                                     int *changed, int *claimed_out,
                                     int install) {
@@ -4343,6 +4620,11 @@ static int ir_try_vectorize_find_at(IRFunction *function, size_t header_index,
   IROperand rhs_arg = {0};
   size_t init_index = (size_t)-1;
   IRInstruction fused = {0};
+
+  if (install &&
+      !ir_try_vectorize_ascii_ident_find_at(function, header_index, changed)) {
+    return 0;
+  }
 
   if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
                                 &branch_index, &jump_index, &bound, &matched)) {
