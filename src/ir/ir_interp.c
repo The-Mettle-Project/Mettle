@@ -155,6 +155,10 @@ struct IRInterpMachine {
   int held_mutex_count;
   unsigned long long next_thread_handle;
 
+  unsigned long long swap_slots[256];
+  unsigned long long swap_replacements[256];
+  long long swap_pending_count;
+
   /* Execution counting (zero-run PGO). */
   int count_enabled;
   struct {
@@ -1118,6 +1122,17 @@ static IIVar *ii_global_touch(IRInterpMachine *machine, const char *name) {
     var->value_size = is_float ? 0 : size;
     var->value_is_unsigned = is_unsigned;
   }
+  if (sym->init_symbol_ref) {
+    unsigned long long token = ii_function_token(machine, sym->init_symbol_ref);
+    if (!token) {
+      token = ii_global_storage(machine, sym->init_symbol_ref);
+    }
+    var = ii_env_upsert(&machine->globals, name);
+    if (var) {
+      var->value = ii_int_value((long long)token);
+    }
+    return var;
+  }
   if (sym->has_initializer) {
     if (sym->init_is_float) {
       /* A float initializer is always folded to a double's bit pattern,
@@ -1136,16 +1151,6 @@ static IIVar *ii_global_touch(IRInterpMachine *machine, const char *name) {
       unsigned long long chars = 0, record = 0;
       if (ii_string_literal(machine, sym->init_string, &chars, &record)) {
         var->value = ii_int_value((long long)chars);
-      }
-    } else if (sym->init_symbol_ref) {
-      unsigned long long token =
-          ii_function_token(machine, sym->init_symbol_ref);
-      if (!token) {
-        token = ii_global_storage(machine, sym->init_symbol_ref);
-      }
-      var = ii_env_upsert(&machine->globals, name);
-      if (var) {
-        var->value = ii_int_value((long long)token);
       }
     } else {
       var->value = ii_int_value(sym->init_bits);
@@ -1974,6 +1979,55 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
   }
 
   if (strcmp(name, "fflush") == 0) {
+    *result = ii_int_value(0);
+    return 1;
+  }
+
+  if (arg_count >= 2 && strcmp(name, "mettle_swap_stage") == 0) {
+    unsigned long long slot = (unsigned long long)ii_as_int(&args[0]);
+    unsigned long long replacement = (unsigned long long)ii_as_int(&args[1]);
+    if (!slot) {
+      *result = ii_int_value(0);
+      return 1;
+    }
+    for (long long i = 0; i < machine->swap_pending_count; i++) {
+      if (machine->swap_slots[i] == slot) {
+        machine->swap_replacements[i] = replacement;
+        *result = ii_int_value(1);
+        return 1;
+      }
+    }
+    if (machine->swap_pending_count >= 256) {
+      *result = ii_int_value(0);
+      return 1;
+    }
+    machine->swap_slots[machine->swap_pending_count] = slot;
+    machine->swap_replacements[machine->swap_pending_count] = replacement;
+    machine->swap_pending_count++;
+    *result = ii_int_value(1);
+    return 1;
+  }
+
+  if (strcmp(name, "mettle_swap_apply") == 0) {
+    long long applied = machine->swap_pending_count;
+    for (long long i = 0; i < applied; i++) {
+      if (!ii_mem_write(machine, machine->swap_slots[i], 8,
+                        machine->swap_replacements[i])) {
+        return -1;
+      }
+    }
+    machine->swap_pending_count = 0;
+    *result = ii_int_value(applied);
+    return 1;
+  }
+
+  if (strcmp(name, "mettle_swap_pending") == 0) {
+    *result = ii_int_value(machine->swap_pending_count);
+    return 1;
+  }
+
+  if (strcmp(name, "mettle_swap_discard") == 0) {
+    machine->swap_pending_count = 0;
     *result = ii_int_value(0);
     return 1;
   }
