@@ -4538,16 +4538,15 @@ catch {
   Write-CaseResult -Name "native_heap_threads" -Passed $false -Reason $_.Exception.Message
 }
 
-# The shift-loop recognizer, run rather than only matched. Its two IrMustMatch
-# cases above assert that simd_insertion_sort_i32 fires; neither ever executed
-# the program, and the debug build of test_opt_shift_loop segfaulted while
-# release "passed" because the rewrite replaced the broken loop. The strided
-# case is the one the recognizer must decline: it walks every fourth element,
-# so rewriting it as a contiguous sort moves data the program never touched.
-# All three run in both modes, and debug and release must agree.
+# The case the shift-loop recognizer must DECLINE. It walks every fourth
+# element, so rewriting it as a contiguous sort moves data the program never
+# touched. A predicate that accepted a four-element stride did exactly that,
+# and nothing caught it because the cases guarding the recognizer only ever
+# asked whether it had fired. The debug-versus-release differential below
+# cannot cover this one: with the predicate right the two modes agree, and
+# agreeing is the point -- what has to be pinned is that the rewrite never
+# happens.
 foreach ($shiftCase in @(
-  @{ Name = "opt_shift_loop_runs"; Path = "tests/test_opt_shift_loop.mettle"; Marker = "shift_loop OK" },
-  @{ Name = "opt_insertion_sort_stack_runs"; Path = "tests/test_opt_simd_insertion_sort_stack.mettle"; Marker = $null },
   @{ Name = "opt_strided_shift_not_sorted"; Path = "tests/test_opt_strided_shift_not_sorted.mettle"; Marker = "strided_shift OK" }
 )) {
   $total++
@@ -4580,6 +4579,85 @@ foreach ($shiftCase in @(
   catch {
     $failed++
     Write-CaseResult -Name $shiftCase.Name -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# Every recognizer case in $cases asserts that a kernel op appears in the
+# optimized IR and stops there: the table runner checks the exit code, the IR
+# patterns and the artifacts, and never runs the program it just built. So a
+# recognizer that fires and computes the WRONG answer passes. That is how a
+# shift-sort predicate accepting a four-element stride rewrote a strided walk
+# into a stride-1 sort while its case stayed green; against the source before
+# that fix, this block would have failed on the debug exit code alone, because
+# debug segfaulted.
+#
+# Debug does not run the recognizers, so it is the reference: build each program
+# both ways and compare what it prints and what it returns. The list comes from
+# $cases itself, so it cannot drift as recognizers are added, and it skips cases
+# that already carry their own output assertion -- $simdRuntimeCases and
+# anything with OutputMustMatch/Pattern are executed already.
+#
+# No Test-CaseIsMine here: $cases has ALREADY been narrowed to this shard's
+# share above, so calling it would shard an ex-shard and run about one case in
+# twelve. Serial and parallel runs have to cover the same set, and the only
+# evidence that they do is both reporting the same total.
+foreach ($case in $cases) {
+  if (-not ($case.ContainsKey("IrMustMatch") -and $case.IrMustMatch)) { continue }
+  if (-not ($case.ContainsKey("Path") -and $case.Path)) { continue }
+  if (-not $case.ShouldSucceed) { continue }
+  if ($case.ContainsKey("OutputMustMatch") -and $case.OutputMustMatch) { continue }
+  if ($case.ContainsKey("Pattern") -and $case.Pattern) { continue }
+
+  $total++
+  $recogName = "recognizer_runtime_" + $case.Name
+  try {
+    $recogOut = @{}
+    $recogExit = @{}
+    foreach ($recogMode in @("debug", "release")) {
+      $exePath = Join-Path $tmpDir ("{0}_rundiff_{1}.exe" -f $case.Name, $recogMode)
+      # Clear the object too: a stale one from the other mode is exactly what
+      # makes a debug-versus-release differential lie.
+      $objPath = [System.IO.Path]::ChangeExtension($exePath, $script:ObjExt)
+      foreach ($artifactPath in @($exePath, $objPath)) {
+        if (Test-Path $artifactPath) {
+          Remove-Item -Path $artifactPath -Force -ErrorAction SilentlyContinue
+        }
+      }
+      $buildArgs = @("--build", "--linker", "internal", $case.Path, "-o", $exePath)
+      if ($recogMode -eq "release") { $buildArgs = @("--release") + $buildArgs }
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exePath)) {
+        throw "$recogMode build failed: $buildOut"
+      }
+      $recogOut[$recogMode] = & $exePath 2>&1 | Out-String
+      $recogExit[$recogMode] = $LASTEXITCODE
+    }
+
+    if ($recogExit["debug"] -ne $recogExit["release"]) {
+      throw ("exit code differs: debug {0}, release {1}" -f $recogExit["debug"], $recogExit["release"])
+    }
+
+    # The only lines dropped are a benchmark's elapsed-time readings, and they
+    # are dropped because they differ between two runs of the SAME binary -- a
+    # measurement, not a mode signal. Anything that genuinely differs by mode
+    # belongs in the program as something mode-invariant: a filter grown to
+    # accommodate whatever a program prints is how a recognizer predicate gets
+    # widened until the tests pass.
+    $recogNorm = @{}
+    foreach ($recogMode in @("debug", "release")) {
+      $recogNorm[$recogMode] = (($recogOut[$recogMode] -split "`r?`n") |
+        Where-Object { $_ -notmatch '^\s*(Time|Per pass):\s*~?\s*\d+\s*(us|ms|ns)\s*$' }) -join "`n"
+    }
+    if ($recogNorm["debug"] -ne $recogNorm["release"]) {
+      throw ("output differs between debug and release`n--- debug ---`n{0}`n--- release ---`n{1}" -f `
+        $recogNorm["debug"], $recogNorm["release"])
+    }
+
+    Write-CaseResult -Name $recogName -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $recogName -Passed $false -Reason $_.Exception.Message
   }
 }
 
