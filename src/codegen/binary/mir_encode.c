@@ -2033,6 +2033,19 @@ static int mir_label_is_branch_target(const MirFunction *fn,
   }
   for (size_t k = 0; k < fn->insn_count; k++) {
     const MirInst *b = &fn->insns[k];
+    /* A switch case is named by the jump table rather than by a branch, and
+     * control reaching one carries whatever flags the dispatch left. */
+    if (b->op == MIR_JMP_TABLE) {
+      const MirJumpTable *tbl = (const MirJumpTable *)b->aux;
+      if (tbl) {
+        for (size_t t = 0; t < tbl->count; t++) {
+          if (tbl->labels[t] && strcmp(tbl->labels[t], name) == 0) {
+            return 1;
+          }
+        }
+      }
+      continue;
+    }
     if (b->op != MIR_JMP && b->op != MIR_JCC && b->op != MIR_CMPBR &&
         b->op != MIR_FCMPBR) {
       continue;
