@@ -1987,6 +1987,73 @@ static int mir_home_parameters(MirFunction *fn) {
   return 1;
 }
 
+/* Same operand, and reading it emits nothing: a vreg already in a register,
+ * or an immediate. A spilled operand would be staged with instructions of its
+ * own before the compare, which is exactly what must not happen between the
+ * compare whose flags are being reused and the branch reusing them. */
+/* A label no branch names is a fall-through marker, not a join: control
+ * cannot arrive there carrying different flags. */
+static int mir_label_is_branch_target(const MirFunction *fn,
+                                      const char *name) {
+  if (!name) {
+    return 1;
+  }
+  for (size_t k = 0; k < fn->insn_count; k++) {
+    const MirInst *b = &fn->insns[k];
+    if (b->op != MIR_JMP && b->op != MIR_JCC && b->op != MIR_CMPBR &&
+        b->op != MIR_FCMPBR) {
+      continue;
+    }
+    if (b->dst.kind == MIR_OPK_LABEL && b->dst.sym &&
+        strcmp(b->dst.sym, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Can this sit between a compare and a branch reusing its flags? Only if it
+ * emits nothing at all: a nop, a fall-through label, or a register copy the
+ * allocator already collapsed by giving both ends the same register. */
+static int mir_cmp_gap_is_empty(const MirFunction *fn, const MirInst *in) {
+  if (in->op == MIR_NOP) {
+    return 1;
+  }
+  if (in->op == MIR_LABEL) {
+    return in->dst.kind == MIR_OPK_LABEL &&
+           !mir_label_is_branch_target(fn, in->dst.sym);
+  }
+  if (in->op == MIR_MOV && !in->is_float && in->dst.kind == MIR_OPK_VREG &&
+      in->a.kind == MIR_OPK_VREG && in->dst.vreg != MIR_VREG_NONE &&
+      in->a.vreg != MIR_VREG_NONE &&
+      fn->vregs[in->dst.vreg].in_register &&
+      fn->vregs[in->a.vreg].in_register) {
+    return fn->vregs[in->dst.vreg].phys == fn->vregs[in->a.vreg].phys &&
+           fn->vregs[in->dst.vreg].rclass == fn->vregs[in->a.vreg].rclass;
+  }
+  return 0;
+}
+
+static int mir_cmp_operand_reusable(const MirFunction *fn,
+                                    const MirOperand *x,
+                                    const MirOperand *y) {
+  if (x->kind != y->kind) {
+    return 0;
+  }
+  if (x->kind == MIR_OPK_IMM) {
+    return x->imm == y->imm;
+  }
+  if (x->kind != MIR_OPK_VREG || x->vreg == MIR_VREG_NONE ||
+      y->vreg == MIR_VREG_NONE) {
+    return 0;
+  }
+  if (!fn->vregs[x->vreg].in_register || !fn->vregs[y->vreg].in_register) {
+    return 0;
+  }
+  return fn->vregs[x->vreg].phys == fn->vregs[y->vreg].phys &&
+         fn->vregs[x->vreg].rclass == fn->vregs[y->vreg].rclass;
+}
+
 static int mir_emit_prologue(MirFunction *fn) {
   BinaryFunctionContext *ctx = fn->context;
   BinaryCodeBuffer *code = &ctx->code;
@@ -2339,6 +2406,7 @@ int mir_encode(MirFunction *fn) {
   size_t pending_table_count = 0;
   size_t fused_byte_load = (size_t)-1;
   size_t fused_mask_test = (size_t)-1;
+  size_t prev_cmpbr = (size_t)-1;
 
   if (!mir_layout_frame(fn) || !mir_emit_prologue(fn)) {
     return 0;
@@ -3166,7 +3234,37 @@ int mir_encode(MirFunction *fn) {
       int rok;
       BinaryGpRegister cbase;
       int cdisp;
-      BinaryGpRegister areg = value_reg(fn, &in->a, SCRATCH_A, &rok);
+      BinaryGpRegister areg;
+      /* `a < b || (a == b && ...)` -- a lexicographic compare, and the shape
+       * every comparator and heap sift-down is written in -- emits the same
+       * cmp twice with two condition codes. Only the first branch stands
+       * between them and a jcc leaves the flags alone, so the second compare
+       * is recomputing what the register already holds. */
+      {
+        size_t p = i;
+        while (p > 0 && prev_cmpbr != p - 1 &&
+               mir_cmp_gap_is_empty(fn, &fn->insns[p - 1])) {
+          p--;
+        }
+        if (p > 0 && prev_cmpbr == p - 1) {
+          const MirInst *pv = &fn->insns[prev_cmpbr];
+          if (pv->width == in->width && pv->is_unsigned == in->is_unsigned &&
+              !pv->is_float && !in->is_float &&
+              mir_cmp_operand_reusable(fn, &pv->a, &in->a) &&
+              mir_cmp_operand_reusable(fn, &pv->b, &in->b)) {
+            size_t reuse_off = 0;
+            if (!binary_emit_jcc_placeholder(&ctx->code, in->cc,
+                                             &reuse_off) ||
+                !binary_label_fixup_table_add(&ctx->label_fixups,
+                                              in->dst.sym, reuse_off)) {
+              ok = enc_err(fn, "out of memory in cmpbr");
+            }
+            prev_cmpbr = i;
+            break;
+          }
+        }
+      }
+      areg = value_reg(fn, &in->a, SCRATCH_A, &rok);
       if (!rok) {
         ok = 0;
         break;
@@ -3252,6 +3350,7 @@ int mir_encode(MirFunction *fn) {
           !binary_label_fixup_table_add(&ctx->label_fixups, in->dst.sym, off)) {
         ok = enc_err(fn, "out of memory in cmpbr");
       }
+      prev_cmpbr = i;
       break;
     }
     case MIR_JMP_TABLE: {
