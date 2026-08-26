@@ -2120,6 +2120,45 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
   return machine->status == IR_INTERP_OK ? 0 : -1;
 }
 
+/* One outer-lane "uniform program": a linear chain over the loop index,
+ * evaluated in the integer domain until OL_U_CVT switches it to float. The op
+ * codes are the contract in ir_optimize_simd_float.c; an unknown one leaves
+ * the value alone, which cannot happen for IR this pass produced. */
+static double ii_outer_lane_uniform(const IRInstruction *insn, size_t prog,
+                                    size_t fconst_at, long long n_fconst,
+                                    long long index) {
+  long long micro = insn->arguments[prog].int_value;
+  long long iv = index;
+  double fv = 0.0;
+  int in_float = 0;
+  size_t at = prog + 1;
+  for (long long m = 0; m < micro; m++, at += 2) {
+    long long op = insn->arguments[at].int_value;
+    long long imm = insn->arguments[at + 1].int_value;
+    double k = 0.0;
+    if (op >= 10 && imm >= 0 && imm < n_fconst) {
+      k = insn->arguments[fconst_at + (size_t)imm].float_value;
+    }
+    switch (op) {
+    case 1: iv &= imm; break;                       /* AND */
+    case 2: iv |= imm; break;                       /* OR  */
+    case 3: iv ^= imm; break;                       /* XOR */
+    case 4: iv += imm; break;                       /* ADD */
+    case 5: iv -= imm; break;                       /* SUB */
+    case 6: iv *= imm; break;                       /* MUL */
+    case 7: iv = (long long)((unsigned long long)iv << imm); break;
+    case 8: iv >>= imm; break;                      /* SHR */
+    case 9: fv = (double)iv; in_float = 1; break;   /* CVT */
+    case 10: fv += k; break;                        /* FADD */
+    case 11: fv -= k; break;                        /* FSUB */
+    case 12: fv *= k; break;                        /* FMUL */
+    case 13: fv /= k; break;                        /* FDIV */
+    default: break;
+    }
+  }
+  return in_float ? fv : (double)iv;
+}
+
 /* ---------------- SIMD kernel ops (documented scalar semantics) ---------- */
 
 static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
@@ -2857,6 +2896,117 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     return ii_store_dest(machine, frame, &insn->dest, &out);
   }
 
+  case IR_OP_SIMD_OUTER_LANE_F64: {
+    /* Outer-loop lane vectorization of a float64 reduction. The kernel runs
+     * four outer iterations in lockstep to hide the inner recurrence's
+     * latency, and is documented bit-exact against the scalar loop it
+     * replaced -- so the scalar loop IS the model, and running it here is
+     * both simplest and exactly right.
+     *
+     * Serialized layout, mirroring ir_outer_vectorize_pass:
+     *   [0] inner comparison (0: <, 1: <=)   [1] inner step
+     *   [2] chain step count                 [3] uniform program count
+     *   [4] float constant count             [5] inner start index
+     *   [6] seed mode                        [7] seed constant (FLOAT)
+     * then 4 ints per chain step; then each uniform program as a micro count
+     * followed by that many (op, imm) pairs; then, when the seed mode is 1,
+     * the seed program in the same shape; then the float constants.
+     * dest = the accumulator, lhs = outer trip count, rhs = inner bound. */
+    enum { OL_ADD = 0, OL_SUB = 1, OL_MUL = 2, OL_DIV = 3 };
+    if (insn->argument_count < 8) {
+      ii_fail(machine, IR_INTERP_UNSUPPORTED, "outer_lane arity");
+      return 0;
+    }
+    long long outer_trips = 0, inner_bound = 0;
+    IRInterpValue total_v;
+    if (!ii_fetch_int(machine, frame, &insn->lhs, &outer_trips) ||
+        !ii_fetch_int(machine, frame, &insn->rhs, &inner_bound) ||
+        !ii_fetch(machine, frame, &insn->dest, &total_v)) {
+      return 0;
+    }
+    long long inner_cmp = insn->arguments[0].int_value;
+    long long istep = insn->arguments[1].int_value;
+    long long n_chain = insn->arguments[2].int_value;
+    long long n_unif = insn->arguments[3].int_value;
+    long long n_fconst = insn->arguments[4].int_value;
+    long long i0 = insn->arguments[5].int_value;
+    long long seed_mode = insn->arguments[6].int_value;
+    double seed_const = insn->arguments[7].float_value;
+    if (istep == 0 || n_chain < 0 || n_unif < 0 || n_fconst < 0) {
+      ii_fail(machine, IR_INTERP_UNSUPPORTED, "outer_lane encoding");
+      return 0;
+    }
+    /* Walk the variable-length tail once to find where each section starts. */
+    size_t at = 8;
+    size_t chain_at = at;
+    at += (size_t)(4 * n_chain);
+    size_t unif_at = at;
+    for (long long u = 0; u < n_unif; u++) {
+      if (at >= insn->argument_count) {
+        ii_fail(machine, IR_INTERP_UNSUPPORTED, "outer_lane encoding");
+        return 0;
+      }
+      at += 1 + (size_t)(2 * insn->arguments[at].int_value);
+    }
+    size_t seed_at = at;
+    if (seed_mode == 1) {
+      if (at >= insn->argument_count) {
+        ii_fail(machine, IR_INTERP_UNSUPPORTED, "outer_lane encoding");
+        return 0;
+      }
+      at += 1 + (size_t)(2 * insn->arguments[at].int_value);
+    }
+    size_t fconst_at = at;
+    if (fconst_at + (size_t)n_fconst > insn->argument_count) {
+      ii_fail(machine, IR_INTERP_UNSUPPORTED, "outer_lane encoding");
+      return 0;
+    }
+    double total = ii_as_float(&total_v);
+    for (long long p = 0; p < outer_trips; p++) {
+      double iacc = seed_const;
+      if (seed_mode == 1) {
+        iacc = ii_outer_lane_uniform(insn, seed_at, fconst_at, n_fconst, p);
+      }
+      for (long long i = i0;
+           inner_cmp ? (i <= inner_bound) : (i < inner_bound); i += istep) {
+        size_t step = chain_at;
+        for (long long sidx = 0; sidx < n_chain; sidx++, step += 4) {
+          long long op = insn->arguments[step].int_value;
+          long long side = insn->arguments[step + 1].int_value;
+          long long kind = insn->arguments[step + 2].int_value;
+          long long idx = insn->arguments[step + 3].int_value;
+          double term;
+          if (kind == 0) {
+            if (idx < 0 || idx >= n_fconst) {
+              ii_fail(machine, IR_INTERP_UNSUPPORTED, "outer_lane fconst");
+              return 0;
+            }
+            term = insn->arguments[fconst_at + (size_t)idx].float_value;
+          } else {
+            size_t prog = unif_at;
+            long long skip = idx;
+            while (skip-- > 0) {
+              prog += 1 + (size_t)(2 * insn->arguments[prog].int_value);
+            }
+            term = ii_outer_lane_uniform(insn, prog, fconst_at, n_fconst, i);
+          }
+          double lhs = side ? term : iacc;
+          double rhs = side ? iacc : term;
+          iacc = op == OL_ADD   ? lhs + rhs
+                 : op == OL_SUB ? lhs - rhs
+                 : op == OL_MUL ? lhs * rhs
+                                : lhs / rhs;
+        }
+        machine->fuel--;
+      }
+      total += iacc;
+    }
+    {
+      IRInterpValue out = ii_float_value(total);
+      return ii_store_dest(machine, frame, &insn->dest, &out);
+    }
+  }
+
   case IR_OP_SIMD_LCG_U32: {
     if (insn->argument_count < 3) {
       ii_fail(machine, IR_INTERP_UNSUPPORTED, "lcg arity");
@@ -3240,6 +3390,31 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       }
     }
     var->value = args[i];
+    /* A `string` parameter is passed by value: the callee gets its own copy
+     * of the {chars, length} record, so writing s.length in the callee does
+     * not reach into the caller's. Binding the caller's address straight
+     * through aliased the two -- `shorten(a)` setting s.length to 2 left the
+     * caller's `a` two characters long. */
+    if (fn->parameter_types && fn->parameter_types[i] &&
+        strcmp(fn->parameter_types[i], "string") == 0 &&
+        !var->value.is_float && var->value.i != 0) {
+      long long src_off = 0;
+      IIBuffer *src = ii_addr_to_buffer(
+          machine, (unsigned long long)var->value.i, 16, &src_off);
+      if (src) {
+        unsigned long long copy = ii_add_buffer_ex(machine, NULL, 16, 1);
+        if (!copy ||
+            !ii_frame_own(&frame, (size_t)((copy - II_ADDR_BASE) /
+                                           II_ADDR_STRIDE))) {
+          ii_fail(machine, IR_INTERP_TRAP, "string parameter copy");
+          goto done;
+        }
+        memcpy(machine->buffers[(copy - II_ADDR_BASE) / II_ADDR_STRIDE].data,
+               src->data + src_off, 16);
+        var->value = ii_int_value((long long)copy);
+        var->has_local_storage = 1;
+      }
+    }
     if (!var->value.is_float && var->value_size > 0 && var->value_size < 8) {
       var->value.i =
           ii_narrow_int(var->value.i, var->value_size, var->value_is_unsigned);
