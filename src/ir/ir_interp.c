@@ -1788,6 +1788,17 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
                           IRInterpValue *result) {
   *result = ii_int_value(0);
 
+  /* Match on the LINKAGE name, which is the function that actually runs.
+   * `extern fn strlen_c(msg: cstring) -> int64 = "strlen";` calls strlen,
+   * and the model has strlen -- but keyed on the source spelling it matched
+   * nothing, answered 0, and every length computed from it was wrong. */
+  {
+    const IRModuleSymbol *sym = ii_symbol(machine, name);
+    if (sym && sym->link_name && sym->link_name[0]) {
+      name = sym->link_name;
+    }
+  }
+
   if ((strcmp(name, "malloc") == 0 && arg_count == 1) ||
       (strcmp(name, "calloc") == 0 && arg_count == 2)) {
     long long size = ii_as_int(&args[0]);
