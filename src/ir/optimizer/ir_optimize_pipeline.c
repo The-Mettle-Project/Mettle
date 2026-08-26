@@ -469,16 +469,33 @@ static int ir_run_post_fixpoint_stages(IRFunction *function) {
   /* The recognizers start here, and every one of them assumes the form the
    * stage above was supposed to establish. Check it structurally before they
    * run: a canonicalizer whose matcher stopped firing converges just as
-   * quietly as one with nothing to do, and this is the difference. */
+   * quietly as one with nothing to do, and this is the difference.
+   *
+   * --verify is the one caller allowed to break the form on purpose: a
+   * divergence quarantines the offending pass and restores the pre-pass IR,
+   * so a canonicalizer that was supposed to run did not. That is a reported
+   * loss of optimization, not rot, and ir_verify.h promises it "costs only
+   * optimization, never correctness" -- aborting here charged a false
+   * positive in the input generator as a compiler crash. */
   {
     char detail[192];
     detail[0] = '\0';
     if (!ir_verify_loop_canonical_form(function, detail, sizeof(detail))) {
-      fprintf(stderr,
-              "mettle: internal error: loop canonical form does not hold in "
-              "function '%s': %s\n",
-              function->name ? function->name : "<anonymous>", detail);
-      mettle_compiler_ice("IR loop canonical form violated");
+      int quarantined = 0;
+      for (size_t i = 0; i < IR_ARRAY_COUNT(g_ir_loop_canonical_passes); i++) {
+        if (ir_verify_pass_quarantined(function,
+                                       g_ir_loop_canonical_passes[i].name)) {
+          quarantined = 1;
+          break;
+        }
+      }
+      if (!quarantined) {
+        fprintf(stderr,
+                "mettle: internal error: loop canonical form does not hold in "
+                "function '%s': %s\n",
+                function->name ? function->name : "<anonymous>", detail);
+        mettle_compiler_ice("IR loop canonical form violated");
+      }
     }
   }
 
