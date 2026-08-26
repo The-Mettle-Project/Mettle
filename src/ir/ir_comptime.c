@@ -378,6 +378,25 @@ static IRFunction *ict_find_function(IRProgram *program, const char *name) {
   return suffix_match;
 }
 
+static int ict_extern_returns_void(const IRProgram *program,
+                                   const char *link_name) {
+  if (!program || !link_name) {
+    return 0;
+  }
+  for (size_t i = 0; i < program->module_symbol_count; i++) {
+    const IRModuleSymbol *sym = &program->module_symbols[i];
+    const char *linked =
+        sym->link_name && sym->link_name[0] ? sym->link_name : sym->name;
+    if (!linked || strcmp(linked, link_name) != 0) {
+      continue;
+    }
+    if (sym->return_type && sym->return_type->kind == MTLC_TYPE_VOID) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int ir_comptime_trace(IRProgram *program, ErrorReporter *reporter,
                       const char *filename, const char *source,
                       const char *function_name, const char *const *args,
@@ -597,7 +616,8 @@ int ir_comptime_trace(IRProgram *program, ErrorReporter *reporter,
             ir_interp_extern_trace(machine, earlier);
         seen = prev && strcmp(prev->name, call->name) == 0;
       }
-      if (seen) {
+      if (seen || call->modelled ||
+          ict_extern_returns_void(program, call->name)) {
         continue;
       }
       if (named == 0) {

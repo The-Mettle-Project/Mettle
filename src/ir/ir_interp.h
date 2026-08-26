@@ -62,6 +62,10 @@ typedef struct {
    * changing how many objects a function builds; what the extern can observe
    * is the bytes, compared above. */
   unsigned char arg_is_pointer[8];
+  /* The interpreter answered this call itself. It is still recorded, because
+   * an output call is a side effect a pass must not delete or reorder, but
+   * the trace note must not report it as unmodelled. */
+  unsigned char modelled;
 } IRInterpExternCall;
 
 typedef struct IRInterpMachine IRInterpMachine;

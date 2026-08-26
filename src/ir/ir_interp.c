@@ -152,6 +152,9 @@ struct IRInterpMachine {
   void *value_hook_ctx;
   const IRFunction *value_hook_fn;
 
+  int held_mutex_count;
+  unsigned long long next_thread_handle;
+
   /* Execution counting (zero-run PGO). */
   int count_enabled;
   struct {
@@ -1729,6 +1732,7 @@ static void ii_trace_extern(IRInterpMachine *machine, const char *name,
     machine->trace_capacity = grown;
   }
   IRInterpExternCall *call = &machine->trace[machine->trace_count++];
+  call->modelled = 0;
   snprintf(call->name, sizeof(call->name), "%s", name);
   call->arg_count = arg_count > 8 ? 8 : arg_count;
   for (size_t i = 0; i < call->arg_count; i++) {
@@ -1935,6 +1939,175 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     }
   }
 
+  if (strcmp(name, "fwrite") == 0 || strcmp(name, "write") == 0 ||
+      strcmp(name, "putchar") == 0 || strcmp(name, "fputc") == 0 ||
+      strcmp(name, "putc") == 0 || strcmp(name, "puts") == 0 ||
+      strcmp(name, "fputs") == 0 || strcmp(name, "fflush") == 0) {
+    ii_trace_extern(machine, name, args, arg_count);
+    if (machine->status != IR_INTERP_OK) {
+      return -1;
+    }
+    machine->trace[machine->trace_count - 1].modelled = 1;
+  }
+
+  if (arg_count >= 3 && strcmp(name, "fwrite") == 0) {
+    *result = ii_int_value(ii_as_int(&args[2]));
+    return 1;
+  }
+
+  if (arg_count >= 3 && strcmp(name, "write") == 0) {
+    *result = ii_int_value(ii_as_int(&args[2]));
+    return 1;
+  }
+
+  if (arg_count >= 1 && (strcmp(name, "putchar") == 0 ||
+                         strcmp(name, "fputc") == 0 ||
+                         strcmp(name, "putc") == 0)) {
+    *result = ii_int_value(ii_as_int(&args[0]) & 0xFF);
+    return 1;
+  }
+
+  if (arg_count >= 1 && (strcmp(name, "puts") == 0 ||
+                         strcmp(name, "fputs") == 0)) {
+    *result = ii_int_value(1);
+    return 1;
+  }
+
+  if (strcmp(name, "fflush") == 0) {
+    *result = ii_int_value(0);
+    return 1;
+  }
+
+  if (arg_count >= 2 && (strcmp(name, "posix_cas_i32") == 0 ||
+                         strcmp(name, "posix_atomic_exchange_i32") == 0 ||
+                         strcmp(name, "posix_atomic_add_i32") == 0)) {
+    unsigned long long target = (unsigned long long)ii_as_int(&args[0]);
+    unsigned long long prior = 0;
+    if (!target || !ii_mem_read(machine, target, 4, &prior)) {
+      return -1;
+    }
+    {
+      int before = (int)(unsigned int)prior;
+      int next = before;
+      long long answer = (long long)before;
+      if (strcmp(name, "posix_cas_i32") == 0) {
+        answer = 0;
+        if (arg_count >= 3 && before == (int)ii_as_int(&args[1])) {
+          next = (int)ii_as_int(&args[2]);
+          answer = 1;
+        }
+      } else if (strcmp(name, "posix_atomic_exchange_i32") == 0) {
+        next = (int)ii_as_int(&args[1]);
+      } else {
+        next = (int)((unsigned int)before + (unsigned int)ii_as_int(&args[1]));
+      }
+      if (next != before &&
+          !ii_mem_write(machine, target, 4,
+                        (unsigned long long)(unsigned int)next)) {
+        return -1;
+      }
+      *result = ii_int_value(answer);
+      return 1;
+    }
+  }
+
+  if (arg_count >= 4 && (strcmp(name, "CreateThread") == 0 ||
+                         strcmp(name, "mettle_thread_create") == 0 ||
+                         strcmp(name, "pthread_create") == 0)) {
+    int answers_zero_on_success = strcmp(name, "pthread_create") == 0;
+    const char *thread_body_extern = NULL;
+    IRFunction *thread_body = ii_token_function(
+        machine, (unsigned long long)ii_as_int(&args[2]), &thread_body_extern);
+    unsigned long long handle_out =
+        answers_zero_on_success
+            ? (unsigned long long)ii_as_int(&args[0])
+            : (arg_count >= 6 ? (unsigned long long)ii_as_int(&args[5]) : 0);
+    if (machine->held_mutex_count > 0 || !thread_body ||
+        thread_body->instruction_count == 0) {
+      return -1;
+    }
+    {
+      IRInterpValue thread_arg = args[3];
+      IRInterpValue thread_result = ii_int_value(0);
+      if (!ii_exec_function(machine, thread_body, &thread_arg, 1,
+                            &thread_result)) {
+        return -1;
+      }
+    }
+    machine->next_thread_handle++;
+    if (handle_out &&
+        !ii_mem_write(machine, handle_out, answers_zero_on_success ? 8 : 4,
+                      machine->next_thread_handle)) {
+      return -1;
+    }
+    *result = ii_int_value(
+        answers_zero_on_success ? 0 : (long long)machine->next_thread_handle);
+    return 1;
+  }
+
+  if (arg_count >= 1 && (strcmp(name, "CreateMutexA") == 0 ||
+                         strcmp(name, "mettle_mutex_create") == 0)) {
+    machine->next_thread_handle++;
+    if (arg_count >= 2 && ii_as_int(&args[1]) != 0) {
+      machine->held_mutex_count++;
+    }
+    *result = ii_int_value((long long)machine->next_thread_handle);
+    return 1;
+  }
+
+  if (arg_count >= 1 && (strcmp(name, "pthread_mutex_lock") == 0 ||
+                         strcmp(name, "pthread_mutex_trylock") == 0 ||
+                         strcmp(name, "mettle_mutex_wait") == 0)) {
+    machine->held_mutex_count++;
+    *result = ii_int_value(0);
+    return 1;
+  }
+
+  if (arg_count >= 1 && (strcmp(name, "pthread_mutex_unlock") == 0 ||
+                         strcmp(name, "ReleaseMutex") == 0 ||
+                         strcmp(name, "mettle_mutex_release") == 0)) {
+    if (machine->held_mutex_count > 0) {
+      machine->held_mutex_count--;
+    }
+    *result =
+        ii_int_value(strcmp(name, "pthread_mutex_unlock") == 0 ? 0 : 1);
+    return 1;
+  }
+
+  if (strcmp(name, "GetCurrentThreadId") == 0 ||
+      strcmp(name, "mettle_thread_current_id") == 0 ||
+      strcmp(name, "pthread_self") == 0) {
+    *result = ii_int_value(1);
+    return 1;
+  }
+
+  if (strcmp(name, "CloseHandle") == 0 ||
+      strcmp(name, "mettle_thread_close") == 0 ||
+      strcmp(name, "mettle_mutex_close") == 0) {
+    *result = ii_int_value(1);
+    return 1;
+  }
+
+  if (strcmp(name, "pthread_join") == 0 ||
+      strcmp(name, "pthread_detach") == 0 ||
+      strcmp(name, "pthread_mutex_init") == 0 ||
+      strcmp(name, "pthread_mutex_destroy") == 0 ||
+      strcmp(name, "pthread_cond_init") == 0 ||
+      strcmp(name, "pthread_cond_destroy") == 0 ||
+      strcmp(name, "pthread_cond_wait") == 0 ||
+      strcmp(name, "pthread_cond_signal") == 0 ||
+      strcmp(name, "pthread_cond_broadcast") == 0 ||
+      strcmp(name, "mettle_thread_wait") == 0 ||
+      strcmp(name, "mettle_thread_detach") == 0 ||
+      strcmp(name, "WaitForSingleObject") == 0 ||
+      strcmp(name, "Sleep") == 0 ||
+      strcmp(name, "mettle_thread_sleep_ms") == 0 ||
+      strcmp(name, "usleep") == 0 || strcmp(name, "nanosleep") == 0 ||
+      strcmp(name, "posix_yield") == 0 || strcmp(name, "sched_yield") == 0) {
+    *result = ii_int_value(0);
+    return 1;
+  }
+
   /* The anonymous-memory primitives std/osmem builds os_mem_map on: mmap with
    * MAP_ANONYMOUS on Linux, VirtualAlloc with MEM_COMMIT on Windows. Both hand
    * back zeroed pages, which is calloc with a different spelling. Without them
@@ -2052,6 +2225,69 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     *result = ii_int_value(memcmp(abuf->data + a_off, bbuf->data + b_off,
                                   (size_t)n));
     return 1;
+  }
+
+  if (arg_count == 1 && (strcmp(name, "htons") == 0 ||
+                         strcmp(name, "ntohs") == 0 ||
+                         strcmp(name, "htonl") == 0 ||
+                         strcmp(name, "ntohl") == 0)) {
+    unsigned int host = (unsigned int)ii_as_int(&args[0]);
+    if (name[4] == 's') {
+      unsigned int v = host & 0xFFFFu;
+      *result = ii_int_value((long long)(((v & 0xFFu) << 8) | (v >> 8)));
+    } else {
+      *result = ii_int_value((long long)(unsigned int)(
+          ((host & 0xFFu) << 24) | ((host & 0xFF00u) << 8) |
+          ((host & 0xFF0000u) >> 8) | (host >> 24)));
+    }
+    return 1;
+  }
+
+  if (arg_count == 1 && strcmp(name, "inet_addr") == 0) {
+    unsigned long long addr = (unsigned long long)ii_as_int(&args[0]);
+    long long offset = 0;
+    IIBuffer *buf = ii_addr_to_buffer(machine, addr, 1, &offset);
+    if (!buf) {
+      return -1;
+    }
+    {
+      unsigned int parts[4] = {0, 0, 0, 0};
+      int part = 0;
+      int digits = 0;
+      long long i = offset;
+      int bad = 0;
+      for (; i < buf->size; i++) {
+        unsigned char c = buf->data[i];
+        if (c == 0) {
+          break;
+        }
+        if (c == '.') {
+          if (!digits || part >= 3) {
+            bad = 1;
+            break;
+          }
+          part++;
+          digits = 0;
+          continue;
+        }
+        if (c < '0' || c > '9') {
+          bad = 1;
+          break;
+        }
+        parts[part] = parts[part] * 10u + (unsigned int)(c - '0');
+        if (parts[part] > 255u || ++digits > 3) {
+          bad = 1;
+          break;
+        }
+      }
+      if (bad || part != 3 || !digits || i >= buf->size) {
+        *result = ii_int_value((long long)0xFFFFFFFFLL);
+        return 1;
+      }
+      *result = ii_int_value((long long)(unsigned int)(
+          parts[0] | (parts[1] << 8) | (parts[2] << 16) | (parts[3] << 24)));
+      return 1;
+    }
   }
 
   if (strcmp(name, "strlen") == 0 && arg_count == 1) {
