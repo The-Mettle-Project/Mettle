@@ -8045,18 +8045,34 @@ static size_t mir_label_index(const MirFunction *fn, const char *name) {
 
 /* True if MIR index p sits inside a loop body: some JMP/CMPBR back-edge after p
  * targets a label defined at or before p (it spans p). */
-static int mir_index_in_loop(const MirFunction *fn, size_t p) {
+/* Bounds of the tightest loop containing `p`: the back edge at `hi` jumps to the
+ * header at `lo`, and lo <= p < hi. The tightest is the one whose header sits
+ * latest, which is the innermost loop `p` belongs to. */
+static int mir_enclosing_loop(const MirFunction *fn, size_t p, size_t *lo,
+                              size_t *hi) {
+  int found = 0;
   for (size_t k = p + 1; k < fn->insn_count; k++) {
     const MirInst *in = &fn->insns[k];
-    if ((in->op == MIR_JMP || in->op == MIR_CMPBR) &&
-        in->dst.kind == MIR_OPK_LABEL && in->dst.sym) {
-      size_t t = mir_label_index(fn, in->dst.sym);
-      if (t != (size_t)-1 && t <= p) {
-        return 1;
-      }
+    if ((in->op != MIR_JMP && in->op != MIR_CMPBR) ||
+        in->dst.kind != MIR_OPK_LABEL || !in->dst.sym) {
+      continue;
+    }
+    size_t t = mir_label_index(fn, in->dst.sym);
+    if (t == (size_t)-1 || t > p) {
+      continue;
+    }
+    if (!found || t > *lo) {
+      *lo = t;
+      *hi = k;
+      found = 1;
     }
   }
-  return 0;
+  return found;
+}
+
+static int mir_index_in_loop(const MirFunction *fn, size_t p) {
+  size_t lo = 0, hi = 0;
+  return mir_enclosing_loop(fn, p, &lo, &hi);
 }
 
 static int mir_operand_uses_vreg(const MirOperand *op, MirVregId v) {
@@ -8389,17 +8405,32 @@ static void mir_sink_cold_exits(MirFunction *fn) {
     }
     /* The region has to end itself, or sinking it would fall into whatever
      * follows at the end of the function. A RET arm is cold on the return
-     * heuristic. A JMP arm rejoins the common path, so it is only worth
-     * sinking when the branch guarding it is an equality against a constant:
-     * `x == k` is false far more often than not, which makes the fall-through
-     * (the equal case) the arm to move out and the common path fall through
-     * to the code after it. */
+     * heuristic. A JMP arm is worth sinking on either of two grounds: it
+     * leaves the loop, which a loop by definition does once however many times
+     * it goes around; or the branch guarding it tests equality against a
+     * constant, which is false far more often than not, so the equal case is
+     * the arm to move out. Either way the common path stops jumping twice to
+     * reach the code after the arm. */
     MirOpcode tail = fn->insns[q - 1].op;
-    if (tail != MIR_RET &&
-        !(tail == MIR_JMP && br->cc == 0x85 && br->b.kind == MIR_OPK_IMM)) {
+    size_t loop_lo = 0, loop_hi = 0;
+    if (!mir_enclosing_loop(fn, p, &loop_lo, &loop_hi)) {
       continue;
     }
-    if (!mir_index_in_loop(fn, p)) {
+    int arm_is_cold = 0;
+    if (tail == MIR_RET) {
+      arm_is_cold = 1;
+    } else if (tail == MIR_JMP) {
+      if (br->cc == 0x85 && br->b.kind == MIR_OPK_IMM) {
+        arm_is_cold = 1;
+      } else {
+        const MirInst *out_jmp = &fn->insns[q - 1];
+        size_t t = (out_jmp->dst.kind == MIR_OPK_LABEL && out_jmp->dst.sym)
+                       ? mir_label_index(fn, out_jmp->dst.sym)
+                       : (size_t)-1;
+        arm_is_cold = t != (size_t)-1 && (t < loop_lo || t > loop_hi);
+      }
+    }
+    if (!arm_is_cold) {
       continue;
     }
 
