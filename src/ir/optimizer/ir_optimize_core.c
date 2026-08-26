@@ -1359,6 +1359,11 @@ static void ir_expression_map_clear(IRExpressionMap *map) {
     ir_expression_entry_destroy(&map->items[i]);
   }
   map->count = 0;
+  if (map->name_hashes) {
+    memset(map->name_hashes, 0, map->name_hash_capacity * sizeof(size_t));
+  }
+  map->name_hash_count = 0;
+  map->expr_valid = 0;
 }
 
 static void ir_expression_map_destroy(IRExpressionMap *map) {
@@ -1368,6 +1373,13 @@ static void ir_expression_map_destroy(IRExpressionMap *map) {
 
   ir_expression_map_clear(map);
   free(map->items);
+  free(map->name_hashes);
+  free(map->expr_slots);
+  map->name_hashes = NULL;
+  map->name_hash_capacity = 0;
+  map->expr_slots = NULL;
+  map->expr_capacity = 0;
+  map->expr_valid = 0;
   map->items = NULL;
   map->capacity = 0;
 }
@@ -1437,12 +1449,136 @@ static int ir_expression_entry_matches_instruction(
   }
 }
 
+static void ir_expression_map_note_name(IRExpressionMap *map,
+                                        const IROperand *operand);
+static int ir_expression_map_may_hold_name(const IRExpressionMap *map,
+                                           const char *name);
+static size_t ir_expr_operand_hash(const IROperand *operand) {
+  if (!operand) {
+    return 1u;
+  }
+  size_t h = (size_t)operand->kind * 2654435761u + 17u;
+  switch (operand->kind) {
+  case IR_OPERAND_INT:
+    h ^= (size_t)operand->int_value * 1099511628211u;
+    break;
+  case IR_OPERAND_TEMP:
+  case IR_OPERAND_SYMBOL:
+  case IR_OPERAND_STRING:
+  case IR_OPERAND_LABEL:
+    if (operand->name) {
+      h ^= (size_t)mettle_fnv1a_hash(operand->name);
+    }
+    break;
+  default:
+    /* IR_OPERAND_FLOAT contributes only its kind: equality there also weighs
+     * the IEEE width, and hashing less is always safe. */
+    break;
+  }
+  return h ? h : 1u;
+}
+
+static size_t ir_expr_shape_hash(IRExpressionKind kind, int is_float,
+                                 const char *op_text, const IROperand *lhs,
+                                 const IROperand *rhs) {
+  size_t h = (size_t)kind * 40503u + 1469598103u;
+  if (kind != IR_EXPR_ADDRESS_OF) {
+    h = h * 31u + (size_t)(is_float ? 1 : 0);
+    if (op_text) {
+      h ^= (size_t)mettle_fnv1a_hash(op_text);
+    }
+  }
+  /* Added, not ordered: the matcher accepts a commutative binary in either
+   * order, so the two must hash alike. For a non-commutative operator this
+   * only widens the bucket. */
+  size_t operands = ir_expr_operand_hash(lhs);
+  if (kind == IR_EXPR_BINARY) {
+    operands += ir_expr_operand_hash(rhs);
+  }
+  h ^= operands * 1099511628211u;
+  return h ? h : 1u;
+}
+
+static size_t ir_expr_entry_hash(const IRExpressionEntry *entry) {
+  return ir_expr_shape_hash(entry->kind, entry->is_float, entry->op_text,
+                            &entry->lhs, &entry->rhs);
+}
+
+static int ir_expr_instruction_hash(const IRInstruction *instruction,
+                                    size_t *out_hash) {
+  IRExpressionKind kind;
+  switch (instruction->op) {
+  case IR_OP_BINARY: kind = IR_EXPR_BINARY; break;
+  case IR_OP_UNARY: kind = IR_EXPR_UNARY; break;
+  case IR_OP_CAST: kind = IR_EXPR_CAST; break;
+  case IR_OP_ADDRESS_OF: kind = IR_EXPR_ADDRESS_OF; break;
+  default: return 0;
+  }
+  *out_hash = ir_expr_shape_hash(kind, instruction->is_float,
+                                 instruction->text, &instruction->lhs,
+                                 &instruction->rhs);
+  return 1;
+}
+
+static void ir_expression_map_index_put(IRExpressionMap *map, size_t index) {
+  size_t mask = map->expr_capacity - 1u;
+  size_t s = ir_expr_entry_hash(&map->items[index]) & mask;
+  while (map->expr_slots[s]) {
+    s = (s + 1u) & mask;
+  }
+  map->expr_slots[s] = index + 1u;
+}
+
+static int ir_expression_map_index_build(IRExpressionMap *map) {
+  size_t needed = 16;
+  while (needed < (map->count + 1u) * 2u) {
+    needed *= 2u;
+  }
+  if (map->expr_capacity < needed) {
+    size_t *slots = (size_t *)calloc(needed, sizeof(size_t));
+    if (!slots) {
+      return 0;
+    }
+    free(map->expr_slots);
+    map->expr_slots = slots;
+    map->expr_capacity = needed;
+  }
+  else {
+    memset(map->expr_slots, 0, map->expr_capacity * sizeof(size_t));
+  }
+  for (size_t i = 0; i < map->count; i++) {
+    ir_expression_map_index_put(map, i);
+  }
+  map->expr_valid = 1;
+  return 1;
+}
 static int ir_expression_map_find_matching_instruction(
     const IRExpressionMap *map, const IRInstruction *instruction) {
   if (!map || !instruction) {
     return -1;
   }
 
+  size_t wanted = 0;
+  IRExpressionMap *mutable_map = (IRExpressionMap *)map;
+  if (map->count != 0 && ir_expr_instruction_hash(instruction, &wanted)) {
+    if (!mutable_map->expr_valid && !ir_expression_map_index_build(mutable_map)) {
+      goto scan; /* out of memory: the walk still answers correctly */
+    }
+    size_t mask = map->expr_capacity - 1u;
+    size_t s = wanted & mask;
+    while (map->expr_slots[s]) {
+      size_t idx = map->expr_slots[s] - 1u;
+      if (idx < map->count &&
+          ir_expression_entry_matches_instruction(&map->items[idx],
+                                                  instruction)) {
+        return (int)idx;
+      }
+      s = (s + 1u) & mask;
+    }
+    return -1;
+  }
+
+scan:
   for (size_t i = 0; i < map->count; i++) {
     if (ir_expression_entry_matches_instruction(&map->items[i], instruction)) {
       return (int)i;
@@ -1487,6 +1623,7 @@ static int ir_expression_map_store_value_for_instruction(
     }
     ir_operand_destroy(&map->items[existing_index].value);
     map->items[existing_index].value = new_value;
+    ir_expression_map_note_name(map, &map->items[existing_index].value);
     return 1;
   }
 
@@ -1564,10 +1701,82 @@ static int ir_expression_map_store_value_for_instruction(
     return 0;
   }
 
+  ir_expression_map_note_name(map, &entry->lhs);
+  ir_expression_map_note_name(map, &entry->rhs);
+  ir_expression_map_note_name(map, &entry->value);
   map->count++;
+  if (map->expr_valid) {
+    if ((map->count + 1u) * 2u > map->expr_capacity) {
+      map->expr_valid = 0; /* rebuilt, larger, on the next lookup */
+    } else {
+      ir_expression_map_index_put(map, map->count - 1u);
+    }
+  }
   return 1;
 }
 
+/* 0 marks an empty slot, so a name hashing to 0 is nudged to 1. */
+static size_t ir_expr_name_hash(const char *name) {
+  size_t h = (size_t)mettle_fnv1a_hash(name);
+  return h ? h : (size_t)1;
+}
+
+static void ir_expression_map_note_name(IRExpressionMap *map,
+                                        const IROperand *operand) {
+  if (!operand || !operand->name ||
+      (operand->kind != IR_OPERAND_TEMP && operand->kind != IR_OPERAND_SYMBOL)) {
+    return;
+  }
+  if (map->name_hash_count * 4 >= map->name_hash_capacity * 3) {
+    size_t grown = map->name_hash_capacity ? map->name_hash_capacity * 2 : 64;
+    size_t *slots = (size_t *)calloc(grown, sizeof(size_t));
+    if (!slots) {
+      return; /* the set only ever proves absence; losing it costs speed */
+    }
+    for (size_t i = 0; i < map->name_hash_capacity; i++) {
+      size_t h = map->name_hashes[i];
+      if (!h) {
+        continue;
+      }
+      size_t s = h & (grown - 1u);
+      while (slots[s]) {
+        s = (s + 1u) & (grown - 1u);
+      }
+      slots[s] = h;
+    }
+    free(map->name_hashes);
+    map->name_hashes = slots;
+    map->name_hash_capacity = grown;
+  }
+  size_t h = ir_expr_name_hash(operand->name);
+  size_t mask = map->name_hash_capacity - 1u;
+  size_t s = h & mask;
+  while (map->name_hashes[s]) {
+    if (map->name_hashes[s] == h) {
+      return;
+    }
+    s = (s + 1u) & mask;
+  }
+  map->name_hashes[s] = h;
+  map->name_hash_count++;
+}
+
+static int ir_expression_map_may_hold_name(const IRExpressionMap *map,
+                                           const char *name) {
+  if (!map->name_hashes || !name) {
+    return map->count != 0;
+  }
+  size_t h = ir_expr_name_hash(name);
+  size_t mask = map->name_hash_capacity - 1u;
+  size_t s = h & mask;
+  while (map->name_hashes[s]) {
+    if (map->name_hashes[s] == h) {
+      return 1;
+    }
+    s = (s + 1u) & mask;
+  }
+  return 0;
+}
 static int ir_operand_matches_named(const IROperand *operand,
                                     IROperandKind kind, const char *name) {
   if (!operand || !name || operand->kind != kind || !operand->name) {
@@ -1599,6 +1808,14 @@ static void ir_expression_map_invalidate_named(IRExpressionMap *map,
     return;
   }
 
+  /* A name that has never been an operand of any entry in this map cannot
+   * match one, and a fresh temp -- which is most of what a straight-line
+   * function writes -- is exactly that. Skipping those turns the compaction
+   * from once per instruction into once per instruction that can matter. */
+  if (!ir_expression_map_may_hold_name(map, name)) {
+    return;
+  }
+
   size_t write = 0;
   for (size_t read = 0; read < map->count; read++) {
     IRExpressionEntry *entry = &map->items[read];
@@ -1617,6 +1834,9 @@ static void ir_expression_map_invalidate_named(IRExpressionMap *map,
     write++;
   }
 
+  if (write != map->count) {
+    map->expr_valid = 0; /* the surviving entries moved */
+  }
   map->count = write;
 }
 
@@ -1666,6 +1886,9 @@ static void ir_expression_map_invalidate_after_store(
     write++;
   }
 
+  if (write != map->count) {
+    map->expr_valid = 0; /* the surviving entries moved */
+  }
   map->count = write;
 }
 

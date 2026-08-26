@@ -141,6 +141,25 @@ typedef struct {
   IRExpressionEntry *items;
   size_t count;
   size_t capacity;
+  /* Hashes of every name that has been an operand of an entry in this map,
+   * open addressed, 0 = empty. Invalidation asks this first: a name that has
+   * never been an operand here cannot match any entry, so the scan is skipped
+   * outright. Insert-only, so it over-approximates as entries die, and a
+   * collision only costs one needless scan -- both directions stay correct,
+   * because the set is consulted only to prove absence. Storing hashes rather
+   * than the names keeps it clear of the operand strings' lifetimes. */
+  size_t *name_hashes;
+  size_t name_hash_capacity;
+  size_t name_hash_count;
+  /* Expression -> entry index, open addressed, 0 = empty, otherwise index+1.
+   * The hash is deliberately coarser than the matcher: operands are combined
+   * commutatively and floats contribute only their kind, so anything the
+   * matcher would call equal certainly collides, and the exact matcher still
+   * decides. A collision costs a comparison, never a wrong answer. Dropped
+   * whenever a compaction shifts the indices and rebuilt on the next lookup. */
+  size_t *expr_slots;
+  size_t expr_capacity;
+  int expr_valid;
 } IRExpressionMap;
 
 typedef struct {
