@@ -85,6 +85,11 @@ typedef struct {
      whatever the value currently points at. Zeroing the latter rewrote the
      string literal shared by every use of it. 0 = none allocated. */
   unsigned long long string_record;
+  /* Declared `cstring`/`rawptr`: a string literal assigned to one is its
+     CHARACTERS, where the same literal assigned to a `string` is its
+     {chars, length} record. The two are different addresses and only the
+     declaration says which is wanted. */
+  unsigned char is_cstring;
 } IIVar;
 
 typedef struct {
@@ -3724,6 +3729,10 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       long long count = 1;
       int parsed = ii_parse_local_type(insn->text, &elem_size, &count,
                                        &is_float, &is_unsigned);
+      var->is_cstring = (insn->text && (strcmp(insn->text, "cstring") == 0 ||
+                                        strcmp(insn->text, "rawptr") == 0))
+                            ? 1
+                            : 0;
       if (!parsed && vt &&
           ii_scalar_from_mtlc(vt, &elem_size, &is_float, &is_unsigned)) {
         /* Enum, pointer, or closure local behind a named type. */
@@ -3844,6 +3853,28 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
 
     case IR_OP_ASSIGN: {
       IRInterpValue value;
+      /* A string literal assigned to a `cstring` is its CHARACTERS; the same
+       * literal assigned to a `string` is its {chars, length} record. Only
+       * the destination's declaration says which, and taking the record for
+       * both made `local = "ok"` point a cstring at the record, so local[0]
+       * read a byte of the pointer rather than 'o'. The call path already
+       * chose between them this way for arguments. */
+      if (insn->lhs.kind == IR_OPERAND_STRING && insn->lhs.name &&
+          insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
+        IIVar *dest = ii_env_find(&frame.env, insn->dest.name);
+        if (dest && dest->is_cstring) {
+          unsigned long long chars = 0, record = 0;
+          if (!ii_string_literal(machine, insn->lhs.name, &chars, &record)) {
+            goto done;
+          }
+          value = ii_int_value((long long)chars);
+          if (!ii_store_dest(machine, &frame, &insn->dest, &value)) {
+            goto done;
+          }
+          pc++;
+          break;
+        }
+      }
       if (!ii_fetch(machine, &frame, &insn->lhs, &value) ||
           !ii_store_dest(machine, &frame, &insn->dest, &value)) {
         goto done;
