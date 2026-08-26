@@ -522,12 +522,21 @@ static IRVParamInfo irv_classify_param(const IRProgram *program,
       }
     }
     if (strchr(base, '*') == NULL) {
-      /* Pointer to a struct: a seeded byte region compared byte-for-byte,
-       * synthesized in 8-byte units so a few whole records fit. A rewrite
-       * that disturbs any field's bytes still diverges. Pointer-to-pointer
-       * stays unsupported: seeded bytes are not valid addresses to chase. */
+      /* Pointer to a struct: a seeded byte region compared byte-for-byte. A
+       * rewrite that disturbs any field's bytes still diverges.
+       * Pointer-to-pointer stays unsupported: seeded bytes are not valid
+       * addresses to chase.
+       *
+       * Sized in whole records when the type registry knows the pointee.
+       * Eight-byte units were the guess before, which makes "this run uses 33
+       * elements" untrue for any record that is not eight bytes: a body that
+       * reads p[32] then reads past the end of what was generated for it. A
+       * record whose own fields are pointers still traps, because seeded
+       * bytes are not addresses either -- std/alloc's heap helpers are that
+       * shape and remain unverifiable. */
+      int record = irv_aggregate_bytes(program, base);
       info.kind = IRV_PARAM_BUFFER;
-      info.elem_size = 8;
+      info.elem_size = record > 0 ? record : 8;
       info.elem_float = 0;
       return info;
     }
