@@ -441,6 +441,8 @@ typedef enum {
   IRV_PARAM_BUFFER,
   IRV_PARAM_CSTRING,
   IRV_PARAM_STRING,
+  IRV_PARAM_AGGREGATE,
+  IRV_PARAM_FUNCTION,
   IRV_PARAM_UNSUPPORTED
 } IRVParamKind;
 
@@ -448,15 +450,55 @@ typedef struct {
   IRVParamKind kind;
   int elem_size;   /* buffers: pointee element size */
   int elem_float;  /* buffers: pointee is float */
+  const char *type_name; /* functions: the `fn(...)->R` spelling to match */
 } IRVParamInfo;
 
-static IRVParamInfo irv_classify_param(const char *type) {
+/* A struct, array or tagged enum passed by value arrives as the address of
+ * its bytes, so a generated one is that many bytes of storage. Declining them
+ * left every function taking one unverifiable, which is a lot of them: a
+ * two-int Pair is as ordinary a parameter as there is. */
+static int irv_aggregate_bytes(const IRProgram *program, const char *type) {
+  MtlcType *t = program && type ? ir_program_lookup_type(program, type) : NULL;
+  if (!t || t->size == 0 || t->size > 4096) {
+    return 0;
+  }
+  if (t->kind != MTLC_TYPE_STRUCT && t->kind != MTLC_TYPE_ARRAY &&
+      t->kind != MTLC_TYPE_TAGGED_ENUM) {
+    return 0;
+  }
+  return (int)t->size;
+}
+
+static const char *irv_find_function_named(const IRProgram *program,
+                                           const char *want);
+
+static IRVParamInfo irv_classify_param(const IRProgram *program,
+                                       const char *type) {
   IRVParamInfo info;
   info.kind = IRV_PARAM_UNSUPPORTED;
   info.elem_size = 1;
   info.elem_float = 0;
+  info.type_name = type;
   if (!type) {
     return info;
+  }
+  /* A plain function pointer: the harness can hand over a real function's
+   * address, so the body's indirect call goes somewhere. `Fn(` -- a capturing
+   * closure -- is a pointer to a record whose field 0 is the code pointer, a
+   * different shape, and is still declined. */
+  if (strncmp(type, "fn(", 3) == 0) {
+    if (irv_find_function_named(program, type)) {
+      info.kind = IRV_PARAM_FUNCTION;
+    }
+    return info; /* nothing of that signature: say so as a parameter type */
+  }
+  {
+    int agg = irv_aggregate_bytes(program, type);
+    if (agg > 0) {
+      info.kind = IRV_PARAM_AGGREGATE;
+      info.elem_size = agg;
+      return info;
+    }
   }
   size_t len = strlen(type);
   if (len > 1 && type[len - 1] == '*') {
@@ -558,7 +600,93 @@ static double irv_float_arg(int run, size_t param_index) {
 
 /* Build one machine for the run, registering identical buffers and argument
  * values. Returns 0 on setup failure. */
+/* Render a signature the way a parameter type spells one: `fn(a,b)->r`.
+ * Returns 0 when any part is missing, so an unnameable candidate is skipped
+ * rather than matched by accident. */
+static int irv_render_signature(char *out, size_t cap, const char *const *params,
+                                size_t param_count, const char *ret) {
+  size_t off = 0;
+  size_t i = 0;
+  int n = snprintf(out, cap, "fn(");
+  if (n < 0 || (size_t)n >= cap || !ret) {
+    return 0;
+  }
+  off = (size_t)n;
+  for (i = 0; i < param_count; i++) {
+    if (!params || !params[i]) {
+      return 0;
+    }
+    n = snprintf(out + off, cap - off, "%s%s", i == 0 ? "" : ",", params[i]);
+    if (n < 0 || off + (size_t)n >= cap) {
+      return 0;
+    }
+    off += (size_t)n;
+  }
+  n = snprintf(out + off, cap - off, ")->%s", ret);
+  return n >= 0 && off + (size_t)n < cap;
+}
+
+/* A function in this program whose signature is exactly `want`.
+ *
+ * Declared externs come first: the interpreter models malloc and friends, and
+ * `fn(int64) -> rawptr` -- the allocator every std/io and std/str helper takes
+ * -- is by far the commonest function-typed parameter there is. A defined
+ * function is the fallback, and one that takes a function itself is skipped so
+ * a match cannot hand a function to itself. */
+static const char *irv_find_function_named(const IRProgram *program,
+                                           const char *want) {
+  char sig[192];
+  size_t i = 0;
+  if (!program || !want) {
+    return NULL;
+  }
+  for (i = 0; i < program->module_symbol_count; i++) {
+    const IRModuleSymbol *sym = &program->module_symbols[i];
+    const char *pnames[8];
+    size_t p = 0;
+    if (sym->kind != IR_MODSYM_FUNCTION || !sym->name || sym->param_count > 8 ||
+        !sym->return_type || !sym->return_type->name) {
+      continue;
+    }
+    for (p = 0; p < sym->param_count; p++) {
+      pnames[p] = (sym->param_types && sym->param_types[p])
+                      ? sym->param_types[p]->name
+                      : NULL;
+    }
+    if (irv_render_signature(sig, sizeof(sig), pnames, sym->param_count,
+                             sym->return_type->name) &&
+        strcmp(sig, want) == 0) {
+      return sym->name;
+    }
+  }
+  for (i = 0; i < program->function_count; i++) {
+    const IRFunction *fn = program->functions[i];
+    size_t p = 0;
+    int takes_function = 0;
+    if (!fn || !fn->name || !fn->return_type_name || fn->parameter_count > 8) {
+      continue;
+    }
+    for (p = 0; p < fn->parameter_count; p++) {
+      if (fn->parameter_types && fn->parameter_types[p] &&
+          strncmp(fn->parameter_types[p], "fn(", 3) == 0) {
+        takes_function = 1;
+      }
+    }
+    if (takes_function) {
+      continue;
+    }
+    if (irv_render_signature(sig, sizeof(sig),
+                             (const char *const *)fn->parameter_types,
+                             fn->parameter_count, fn->return_type_name) &&
+        strcmp(sig, want) == 0) {
+      return fn->name;
+    }
+  }
+  return NULL;
+}
+
 static int irv_setup_machine(IRInterpMachine *machine, IRFunction *shape,
+                             const IRProgram *program,
                              const IRVParamInfo *params, size_t param_count,
                              int run, IRInterpValue *args,
                              const long long *harvested_value) {
@@ -620,6 +748,42 @@ static int irv_setup_machine(IRInterpMachine *machine, IRFunction *shape,
       memcpy(record, &text_addr, 8);
       memcpy(record + 8, &length, 8);
       unsigned long long addr = ir_interp_add_buffer(machine, record, 16);
+      if (!addr) {
+        return 0;
+      }
+      args[p].i = (long long)addr;
+      args[p].f = 0;
+      args[p].is_float = 0;
+      break;
+    }
+    case IRV_PARAM_FUNCTION: {
+      const char *target = irv_find_function_named(program, params[p].type_name);
+      unsigned long long token =
+          target ? ir_interp_function_address(machine, target) : 0;
+      if (!token) {
+        return 0;
+      }
+      args[p].i = (long long)token;
+      args[p].f = 0;
+      args[p].is_float = 0;
+      break;
+    }
+    case IRV_PARAM_AGGREGATE: {
+      /* Deterministic small values: whatever the fields turn out to be, an
+       * integer stays small and a float stays finite and tiny, so nothing
+       * here manufactures an overflow the caller never could. */
+      long long bytes = params[p].elem_size;
+      unsigned char *init = (unsigned char *)malloc((size_t)bytes);
+      if (!init) {
+        return 0;
+      }
+      unsigned int seed = 0x2545F491u ^ (unsigned int)(p * 7919u) ^
+                          (unsigned int)(run * 104729u);
+      for (long long b = 0; b < bytes; b++) {
+        init[b] = (unsigned char)(irv_lcg_next(&seed) % 24);
+      }
+      unsigned long long addr = ir_interp_add_buffer(machine, init, bytes);
+      free(init);
       if (!addr) {
         return 0;
       }
@@ -998,6 +1162,11 @@ static void irv_format_call(const IRFunction *function,
     } else if (params[i].kind == IRV_PARAM_STRING) {
       snprintf(value, sizeof(value), "<string:%lld>",
                7 + (long long)run * 3 + (long long)i);
+    } else if (params[i].kind == IRV_PARAM_FUNCTION) {
+      snprintf(value, sizeof(value), "<%s>",
+               params[i].type_name ? params[i].type_name : "fn");
+    } else if (params[i].kind == IRV_PARAM_AGGREGATE) {
+      snprintf(value, sizeof(value), "<%d-byte value>", params[i].elem_size);
     } else {
       irv_format_value(&args[i], value, sizeof(value));
     }
@@ -1123,9 +1292,9 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
     return IRV_CHECK_UNVERIFIABLE;
   }
   for (size_t i = 0; i < param_count; i++) {
-    params[i] = irv_classify_param(function->parameter_types
-                                       ? function->parameter_types[i]
-                                       : NULL);
+    params[i] = irv_classify_param(program, function->parameter_types
+                                                ? function->parameter_types[i]
+                                                : NULL);
     if (params[i].kind == IRV_PARAM_UNSUPPORTED) {
       snprintf(result->skip_reason, sizeof(result->skip_reason),
                "parameter type '%s'",
@@ -1168,10 +1337,10 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
     const long long *boundary =
         (run >= IRV_INPUT_RUNS) ? &harvest->values[run - IRV_INPUT_RUNS] : NULL;
     const int shape_run = (run >= IRV_INPUT_RUNS) ? 0 : run;
-    if (!irv_setup_machine(machine_before, function, params, param_count,
-                           shape_run, args_before, boundary) ||
-        !irv_setup_machine(machine_after, function, params, param_count,
-                           shape_run, args_after, boundary)) {
+    if (!irv_setup_machine(machine_before, function, program, params,
+                           param_count, shape_run, args_before, boundary) ||
+        !irv_setup_machine(machine_after, function, program, params,
+                           param_count, shape_run, args_after, boundary)) {
       ir_interp_destroy(machine_before);
       ir_interp_destroy(machine_after);
       continue;
