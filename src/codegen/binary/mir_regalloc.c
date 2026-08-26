@@ -1883,8 +1883,8 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     if (interval_only < 0) {
       interval_only = getenv("METTLE_INTERVAL_INTERFERENCE") ? 1 : 0;
     }
-    int use_cfg = !interval_only && N <= 512 && fn->insn_count >= 128 &&
-                  fn->insn_count <= 2048 && branch_count >= 8;
+    int use_cfg = !interval_only && N <= 512 && fn->insn_count >= 8 &&
+                  fn->insn_count <= 2048 && branch_count >= 1;
     int have_cfg = use_cfg && mir_live_cfg_build(fn, &cfg, 1);
     unsigned long long *live =
         have_cfg ? (unsigned long long *)malloc(words * sizeof(*live)) : NULL;

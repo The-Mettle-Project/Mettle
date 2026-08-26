@@ -8374,17 +8374,29 @@ static void mir_sink_cold_exits(MirFunction *fn) {
     int ok = 1;
     for (size_t r = p + 1; r < q; r++) {
       MirOpcode op = fn->insns[r].op;
-      if (op == MIR_LABEL || op == MIR_JMP || op == MIR_JCC ||
-          op == MIR_CMPBR || op == MIR_FCMPBR) {
+      if (op == MIR_LABEL || op == MIR_JCC || op == MIR_CMPBR ||
+          op == MIR_FCMPBR) {
         ok = 0;
         break;
       }
-      if (op == MIR_RET && r != q - 1) {
+      if ((op == MIR_RET || op == MIR_JMP) && r != q - 1) {
         ok = 0;
         break;
       }
     }
-    if (!ok || fn->insns[q - 1].op != MIR_RET) {
+    if (!ok) {
+      continue;
+    }
+    /* The region has to end itself, or sinking it would fall into whatever
+     * follows at the end of the function. A RET arm is cold on the return
+     * heuristic. A JMP arm rejoins the common path, so it is only worth
+     * sinking when the branch guarding it is an equality against a constant:
+     * `x == k` is false far more often than not, which makes the fall-through
+     * (the equal case) the arm to move out and the common path fall through
+     * to the code after it. */
+    MirOpcode tail = fn->insns[q - 1].op;
+    if (tail != MIR_RET &&
+        !(tail == MIR_JMP && br->cc == 0x85 && br->b.kind == MIR_OPK_IMM)) {
       continue;
     }
     if (!mir_index_in_loop(fn, p)) {
@@ -8962,8 +8974,13 @@ int code_generator_binary_emit_function_via_mir(
   mir_build_jump_tables(&fn);
   mir_rotate_loops(&fn);
   mir_thread_branch_over_jump(&fn);
-  mir_sink_cold_exits(&fn);
+  /* The const pool decides where a materialization dominates its uses from the
+   * linear order, so it has to run while that order still reflects the control
+   * flow. Sinking moves a use out of line, where it is reached by a branch from
+   * above rather than by falling through, and a pool placed afterwards can land
+   * a definition on a path the use never takes. */
   mir_place_const_pool(&fn);
+  mir_sink_cold_exits(&fn);
 
   if (!mir_regalloc(&fn) || fn.has_error) {
     goto oom;
