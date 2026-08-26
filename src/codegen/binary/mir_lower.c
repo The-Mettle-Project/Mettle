@@ -8175,15 +8175,105 @@ static void mir_rotate_loops(MirFunction *fn) {
 }
 
 /* MIR index of the LABEL defining `name`, or (size_t)-1. */
-static size_t mir_label_index(const MirFunction *fn, const char *name) {
+static int mir_insn_defines_label(const MirInst *in, const char *name) {
+  return in->op == MIR_LABEL && in->dst.kind == MIR_OPK_LABEL && in->dst.sym &&
+         strcmp(in->dst.sym, name) == 0;
+}
+
+static size_t mir_label_index_scan(const MirFunction *fn, const char *name) {
   for (size_t i = 0; i < fn->insn_count; i++) {
-    const MirInst *in = &fn->insns[i];
-    if (in->op == MIR_LABEL && in->dst.kind == MIR_OPK_LABEL && in->dst.sym &&
-        strcmp(in->dst.sym, name) == 0) {
+    if (mir_insn_defines_label(&fn->insns[i], name)) {
       return i;
     }
   }
   return (size_t)-1;
+}
+
+static size_t mir_label_hash(const char *s) {
+  size_t h = (size_t)1469598103934665603ULL;
+  for (; *s; s++) {
+    h ^= (size_t)(unsigned char)*s;
+    h *= (size_t)1099511628211ULL;
+  }
+  return h;
+}
+
+static void mir_label_index_build(MirFunction *fn) {
+  size_t labels = 0;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op == MIR_LABEL && in->dst.kind == MIR_OPK_LABEL && in->dst.sym) {
+      labels++;
+    }
+  }
+  size_t capacity = 16;
+  while (capacity < labels * 2u) {
+    capacity *= 2u;
+  }
+  size_t *slots = (size_t *)calloc(capacity, sizeof(size_t));
+  if (!slots) {
+    return;
+  }
+  size_t mask = capacity - 1u;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op != MIR_LABEL || in->dst.kind != MIR_OPK_LABEL || !in->dst.sym) {
+      continue;
+    }
+    size_t h = mir_label_hash(in->dst.sym) & mask;
+    int duplicate = 0;
+    while (slots[h]) {
+      if (mir_insn_defines_label(&fn->insns[slots[h] - 1u], in->dst.sym)) {
+        duplicate = 1;
+        break;
+      }
+      h = (h + 1u) & mask;
+    }
+    if (!duplicate) {
+      slots[h] = i + 1u;
+    }
+  }
+  free(fn->label_slots);
+  fn->label_slots = slots;
+  fn->label_slot_capacity = capacity;
+  fn->label_slot_insns = fn->insn_count;
+}
+
+/* Answered from an index built in one walk. This was a full scan of the
+ * instruction stream per lookup, and mir_enclosing_loop resolves every branch
+ * target through it while itself being called once per branch, so an N-arm
+ * if/else function cost O(N^3): at 1600 arms, 2.56M calls totalling 13.7
+ * BILLION compares, and codegen was 99.8% of the compile. */
+static size_t mir_label_index(const MirFunction *fn, const char *name) {
+  if (!fn || !name) {
+    return (size_t)-1;
+  }
+  MirFunction *mutable_fn = (MirFunction *)fn;
+  if (!mutable_fn->label_slots ||
+      mutable_fn->label_slot_insns != fn->insn_count) {
+    mir_label_index_build(mutable_fn);
+  }
+  if (mutable_fn->label_slots) {
+    size_t mask = mutable_fn->label_slot_capacity - 1u;
+    size_t h = mir_label_hash(name) & mask;
+    while (mutable_fn->label_slots[h]) {
+      size_t candidate = mutable_fn->label_slots[h] - 1u;
+      if (candidate < fn->insn_count &&
+          mir_insn_defines_label(&fn->insns[candidate], name)) {
+        return candidate;
+      }
+      h = (h + 1u) & mask;
+    }
+  }
+  /* Absent from the map, which a rewrite that left insn_count alone can also
+   * mean. Rescanning keeps the answer right whatever a pass did, and rebuilds
+   * so the next lookup is cheap again. A branch to a label this function does
+   * not define is the only case that pays this twice. */
+  size_t found = mir_label_index_scan(fn, name);
+  if (found != (size_t)-1) {
+    mir_label_index_build(mutable_fn);
+  }
+  return found;
 }
 
 /* True if MIR index p sits inside a loop body: some JMP/CMPBR back-edge after p

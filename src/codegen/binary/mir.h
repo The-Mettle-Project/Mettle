@@ -633,6 +633,16 @@ typedef struct {
   int cur_ir_index;
 
   int has_error;
+
+  /* Label name -> instruction index, built on demand by mir_label_index.
+     Open addressed, power-of-two capacity, 0 = empty and any other value is
+     index+1. Only indices are stored: every probe re-reads the instruction it
+     names and compares the label there, so a stale entry fails to match and
+     falls back to a rescan rather than answering wrongly. That is what lets
+     the cache survive passes that rewrite the stream without telling it. */
+  size_t *label_slots;
+  size_t label_slot_capacity;
+  size_t label_slot_insns;
 } MirFunction;
 
 /* ---- construction ------------------------------------------------------- */

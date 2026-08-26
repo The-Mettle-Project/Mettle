@@ -30,6 +30,7 @@ void mir_function_destroy(MirFunction *fn) {
     free(fn->owned_aux[i]);
   }
   free(fn->owned_aux);
+  free(fn->label_slots);
   memset(fn, 0, sizeof(*fn));
 }
 
