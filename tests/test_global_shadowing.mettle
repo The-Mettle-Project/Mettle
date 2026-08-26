@@ -1,0 +1,54 @@
+import "std/io";
+
+// A local that shadows a module-level global. Locals and globals are both
+// addressed by name down to the backends, which key their frame slot, float,
+// string and declared-type tables on that name, so the local and the global
+// used to share one storage symbol. A struct local shadowing a scalar global
+// failed lowering outright ("Member access requires struct or string lvalue
+// object"), because the type came from the global; once the type resolved,
+// `pair()` still returned 9 instead of 7, reading the global's bytes through
+// the local's fields.
+
+struct P { x: int64; y: int64; }
+
+var s: int64 = 5;
+var t: string = "global";
+var n: int64 = 100;
+
+fn pair() -> int64 {
+  var s: P;
+  s.x = 3;
+  s.y = 4;
+  return s.x + s.y;
+}
+
+fn over_string() -> int64 {
+  var t: P;
+  t.x = 1;
+  t.y = 2;
+  return t.x + t.y;
+}
+
+fn scalar_local() -> int64 {
+  var n: int64 = 3;
+  n = n + 1;
+  return n;
+}
+
+fn reads_global() -> int64 {
+  return n;
+}
+
+fn global_still_visible() -> int64 {
+  return s;
+}
+
+fn main() -> int32 {
+  if (pair() != 7) { println("global_shadowing pair WRONG"); return 1; }
+  if (over_string() != 3) { println("global_shadowing string WRONG"); return 2; }
+  if (scalar_local() != 4) { println("global_shadowing scalar WRONG"); return 3; }
+  if (reads_global() != 100) { println("global_shadowing global WRONG"); return 4; }
+  if (global_still_visible() != 5) { println("global_shadowing visible WRONG"); return 5; }
+  println("global_shadowing OK");
+  return 0;
+}

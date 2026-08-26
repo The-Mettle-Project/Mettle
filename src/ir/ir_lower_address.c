@@ -948,18 +948,34 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
     }
 
     if (out_type) {
+      /* The local's own binding answers first. Lowering runs after the type
+       * checker popped its scopes, so symbol_table_lookup and the inference
+       * below reach the GLOBAL of the same name: a local shadowing a global
+       * took the global's type here, and `s.x` on a struct local shadowing a
+       * global `s` failed lowering as "Member access requires struct or string
+       * lvalue object". The address a line below already resolves through the
+       * binding; only the type did not. */
+      const IRLocalBinding *binding =
+          ir_local_binding_find(context, identifier->name);
+      Type *bound_type = (binding && binding->type_text)
+                             ? ir_resolve_named_type(context,
+                                                     binding->type_text)
+                             : NULL;
+
       Symbol *symbol =
-          context->symbol_table
-              ? symbol_table_lookup(context->symbol_table, identifier->name)
-              : NULL;
+          bound_type || !context->symbol_table
+              ? NULL
+              : symbol_table_lookup(context->symbol_table, identifier->name);
 
       if (symbol && symbol->kind == SYMBOL_CONSTANT) {
         ir_set_error(context, "Cannot take address of constant");
         return 0;
       }
 
-      if (symbol && (symbol->kind == SYMBOL_VARIABLE ||
-                     symbol->kind == SYMBOL_PARAMETER)) {
+      if (bound_type) {
+        *out_type = bound_type;
+      } else if (symbol && (symbol->kind == SYMBOL_VARIABLE ||
+                            symbol->kind == SYMBOL_PARAMETER)) {
         *out_type = symbol->type;
       } else {
         *out_type = ir_infer_expression_type(context, expression);

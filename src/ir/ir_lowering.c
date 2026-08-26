@@ -171,6 +171,16 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
     ir_function_destroy(function);
     return NULL;
   }
+  for (size_t i = 0; i < function_data->parameter_count; i++) {
+    if (!function_data->parameter_names[i]) {
+      continue;
+    }
+    ir_local_bind_parameter(context, function_data->parameter_names[i],
+                            function_data->parameter_types
+                                ? ir_backend_type_name(
+                                      function_data->parameter_types[i])
+                                : NULL);
+  }
 
   char *entry_label = ir_new_label_name(context, "entry");
   if (!entry_label) {

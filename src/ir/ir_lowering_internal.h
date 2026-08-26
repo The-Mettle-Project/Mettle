@@ -166,6 +166,9 @@ void ir_local_bindings_reset(IRLoweringContext *context);
 const char *ir_local_bind(IRLoweringContext *context, const char *name,
                           const char *type_text);
 
+const char *ir_local_bind_parameter(IRLoweringContext *context,
+                                    const char *name, const char *type_text);
+
 const char *ir_local_ir_name(IRLoweringContext *context, const char *name);
 
 const IRLocalBinding *ir_local_binding_find(IRLoweringContext *context,

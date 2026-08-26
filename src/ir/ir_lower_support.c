@@ -49,8 +49,9 @@ static int ir_local_type_text_matches(const char *a, const char *b) {
   return strcmp(a, b) == 0;
 }
 
-const char *ir_local_bind(IRLoweringContext *context, const char *name,
-                          const char *type_text) {
+static const char *ir_local_bind_impl(IRLoweringContext *context,
+                                      const char *name, const char *type_text,
+                                      int allow_rename) {
   if (!context || !name) {
     return name;
   }
@@ -83,8 +84,22 @@ const char *ir_local_bind(IRLoweringContext *context, const char *name,
   if (!active) {
     ir_name = reusable;
   }
+  /* A local shadowing a module-level global needs a name of its own for the
+   * same reason a local shadowing a local does: every backend keys its slot,
+   * float, string and declared-type tables on the name, so the local and the
+   * global shared one storage symbol. `var s: int64` at module scope with a
+   * `var s: P` inside a function read the global's bytes through the local's
+   * fields. */
+  int shadows_global = 0;
+  if (allow_rename && context->symbol_table) {
+    const Symbol *global = symbol_table_lookup(context->symbol_table, name);
+    shadows_global = global != NULL && global->kind == SYMBOL_VARIABLE;
+  }
+  if (!allow_rename) {
+    ir_name = name;
+  }
   if (!ir_name) {
-    if (!seen) {
+    if (!seen && !shadows_global) {
       ir_name = name;
     } else {
       size_t len = strlen(name) + 24;
@@ -127,6 +142,22 @@ const char *ir_local_bind(IRLoweringContext *context, const char *name,
   slot->active = 1;
   slot->owns_ir_name = owns;
   return ir_name;
+}
+
+const char *ir_local_bind(IRLoweringContext *context, const char *name,
+                          const char *type_text) {
+  return ir_local_bind_impl(context, name, type_text, 1);
+}
+
+/* A parameter is recorded so its declared type can be read back from the
+ * binding, and it keeps the source name: the backends home an incoming
+ * argument into the slot named by function->parameter_names, so renaming one
+ * here would leave every use looking for a slot the prologue never filled.
+ * Without the binding, a parameter shadowing a global resolved to the global's
+ * type, which is how a global named `s` broke std/io's `cstr(s: string)`. */
+const char *ir_local_bind_parameter(IRLoweringContext *context,
+                                    const char *name, const char *type_text) {
+  return ir_local_bind_impl(context, name, type_text, 0);
 }
 
 const IRLocalBinding *ir_local_binding_find(IRLoweringContext *context,

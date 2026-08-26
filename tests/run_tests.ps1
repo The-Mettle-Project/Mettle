@@ -6128,6 +6128,42 @@ foreach ($relFlag in @($true, $false)) {
   }
 }
 
+# A local or parameter that shadows a module-level global. Both are addressed by
+# name down to the backends, so the local and the global shared one storage
+# symbol: a struct local shadowing a scalar global failed lowering outright, and
+# once its type resolved it still read the global's bytes through its own
+# fields. A parameter keeps its name (the prologue homes the argument into the
+# slot that name refers to) and only needed its declared type recorded.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "test_global_shadowing_$variant.exe"
+    $buildArgs = @("--build")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests/test_global_shadowing.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "global-shadowing build ($variant) failed: $buildOut"
+    }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "global-shadowing ($variant) failed (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "global_shadowing OK") {
+      throw "global-shadowing ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "global_shadowing_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "global_shadowing_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # The MIR encoder stages a spilled base/index/value through a scratch register.
 # RDX was a candidate, but RDX is in the allocator's pool: staging over the live
 # loop counter it held made the counter run past its bound and the release build
