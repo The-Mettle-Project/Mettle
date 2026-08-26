@@ -1,0 +1,43 @@
+import "std/io";
+import "std/mem";
+
+fn mul32(a: int32, b: int32) -> int32 { return a * b; }
+fn add32(a: int32, b: int32) -> int32 { return a + b; }
+fn sub32(a: int32, b: int32) -> int32 { return a - b; }
+fn shl32(a: int32, b: int32) -> int32 { return a << b; }
+fn umul32(a: uint32, b: uint32) -> uint32 { return a * b; }
+fn add16(a: int16, b: int16) -> int16 { return (int16)(a + b); }
+fn add8(a: int8, b: int8) -> int8 { return (int8)(a + b); }
+
+fn report(name: string, got: int64, want: int64) -> int32 {
+  if (got == want) { return 0; }
+  println("FAIL {name}: got {got} want {want}");
+  return 1;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  var v: int32* = malloc(16);
+  v[0] = 65536; v[1] = 2147483647; v[2] = 1; v[3] = 31;
+
+  bad = bad + report("mul const", (int64)mul32(65536, 65536), 0);
+  bad = bad + report("mul runtime", (int64)mul32(v[0], v[0]), 0);
+  bad = bad + report("add const", (int64)add32(2147483647, 1), -2147483648);
+  bad = bad + report("add runtime", (int64)add32(v[1], v[2]), -2147483648);
+  bad = bad + report("sub const", (int64)sub32(-2147483648, 1), 2147483647);
+  bad = bad + report("shl const", (int64)shl32(1, 31), -2147483648);
+  bad = bad + report("shl runtime", (int64)shl32(v[2], v[3]), -2147483648);
+  bad = bad + report("umul", (int64)umul32(65536, 65536), 0);
+  bad = bad + report("add16", (int64)add16(32767, 1), -32768);
+  bad = bad + report("add8", (int64)add8(127, 1), -128);
+
+  /* The comparison a call feeds is where the missing wrap showed: the result
+   * used to be compared at the full width of the temp the inlined body left
+   * behind. */
+  if (mul32(65536, 65536) != 0) { println("FAIL mul compare"); bad = bad + 1; }
+  if (add32(v[1], v[2]) > 0) { println("FAIL add compare"); bad = bad + 1; }
+
+  free(v);
+  if (bad == 0) { println("inline narrow return: OK"); }
+  return bad;
+}

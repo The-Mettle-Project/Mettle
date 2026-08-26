@@ -1625,6 +1625,22 @@ $cases = @(
     ShouldSucceed = $true
   },
   @{
+    # A call to a narrow-integer function wraps its result to the return type
+    # in the return register; an inlined body has no such boundary and the
+    # temp it leaves behind carries the full 64 bits. Every arithmetic shape
+    # that can leave the type's range, at both optimization levels, since only
+    # the release build inlines.
+    Name          = "inline_narrow_return"
+    Path          = "tests/inline_narrow_return_check.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+  },
+  @{
+    Name          = "inline_narrow_return_debug"
+    Path          = "tests/inline_narrow_return_check.mettle"
+    ShouldSucceed = $true
+  },
+  @{
     # A two-bound range test folded to one unsigned compare after subtracting
     # the low bound. Checked against the same test written so the fold cannot
     # reach it, over 601 values including both int32 extremes, and over both

@@ -631,6 +631,129 @@ static int ir_function_assigns_symbol(const IRFunction *function,
   return 0;
 }
 
+/* The callee returns an integer narrower than a register, so the value an
+ * inlined RETURN hands back has to be wrapped the way the call's return
+ * register would have wrapped it. int64/uint64 and everything that is not an
+ * integer answer 0: there is nothing to wrap. */
+static int ir_inline_return_is_narrow_integer(const IRFunction *callee) {
+  static const char *const NARROW[] = {"int32", "uint32", "int16",
+                                       "uint16", "int8",  "uint8"};
+  size_t i = 0;
+  if (!callee || !callee->return_type_name) {
+    return 0;
+  }
+  for (i = 0; i < sizeof(NARROW) / sizeof(NARROW[0]); i++) {
+    if (strcmp(callee->return_type_name, NARROW[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Byte width of a named integer type; 0 for anything else. */
+static int ir_inline_integer_bytes(const char *type) {
+  if (!type) {
+    return 0;
+  }
+  if (strcmp(type, "int8") == 0 || strcmp(type, "uint8") == 0 ||
+      strcmp(type, "bool") == 0) {
+    return 1;
+  }
+  if (strcmp(type, "int16") == 0 || strcmp(type, "uint16") == 0) {
+    return 2;
+  }
+  if (strcmp(type, "int32") == 0 || strcmp(type, "uint32") == 0) {
+    return 4;
+  }
+  if (strcmp(type, "int64") == 0 || strcmp(type, "uint64") == 0) {
+    return 8;
+  }
+  return 0;
+}
+
+static const IRInstruction *ir_inline_sole_temp_def(const IRFunction *callee,
+                                                    const char *name) {
+  const IRInstruction *found = NULL;
+  size_t i = 0;
+  for (i = 0; i < callee->instruction_count; i++) {
+    const IRInstruction *in = &callee->instructions[i];
+    if (in->op == IR_OP_NOP || in->dest.kind != IR_OPERAND_TEMP ||
+        !in->dest.name || strcmp(in->dest.name, name) != 0) {
+      continue;
+    }
+    if (found) {
+      return NULL;
+    }
+    found = in;
+  }
+  return found;
+}
+
+/* Is this returned value already inside the return type, so that wrapping it
+ * would change nothing?
+ *
+ * Adding a wrap that says nothing is not free: it stands between a loop body
+ * and the recognizers that read it, and a clamp helper inlined into a fill
+ * loop stopped being a clamp kernel for one. So the ordinary shapes -- a
+ * parameter or local of the return type handed straight back, a literal, an
+ * explicit cast the programmer wrote, a load of exactly that many bytes, a
+ * comparison -- are proven narrow and left alone. Arithmetic is not: `a * b`
+ * on two int32 values is where the 64-bit temp escapes the type. */
+static int ir_inline_value_fits_return(const IRFunction *callee,
+                                       const IROperand *value, int bytes,
+                                       int depth) {
+  if (!value || bytes <= 0 || depth > 4) {
+    return 0;
+  }
+  if (value->kind == IR_OPERAND_INT) {
+    long long lo = -(1LL << (bytes * 8 - 1));
+    long long hi = (1LL << (bytes * 8)) - 1;
+    return bytes >= 8 || (value->int_value >= lo && value->int_value <= hi);
+  }
+  if (value->kind == IR_OPERAND_SYMBOL && value->name) {
+    int declared = ir_inline_integer_bytes(
+        ir_function_local_declared_type((IRFunction *)callee, value->name));
+    size_t p = 0;
+    for (p = 0; declared == 0 && p < callee->parameter_count; p++) {
+      if (callee->parameter_names && callee->parameter_names[p] &&
+          strcmp(callee->parameter_names[p], value->name) == 0) {
+        declared = ir_inline_integer_bytes(
+            callee->parameter_types ? callee->parameter_types[p] : NULL);
+      }
+    }
+    return declared > 0 && declared <= bytes;
+  }
+  if (value->kind != IR_OPERAND_TEMP || !value->name) {
+    return 0;
+  }
+  {
+    const IRInstruction *def = ir_inline_sole_temp_def(callee, value->name);
+    if (!def || def->is_float) {
+      return 0;
+    }
+    switch (def->op) {
+    case IR_OP_CAST: {
+      int cast_bytes = ir_inline_integer_bytes(def->text);
+      return cast_bytes > 0 && cast_bytes <= bytes;
+    }
+    case IR_OP_LOAD:
+      return def->rhs.kind == IR_OPERAND_INT && def->rhs.int_value > 0 &&
+             def->rhs.int_value <= bytes;
+    case IR_OP_ASSIGN:
+      return ir_inline_value_fits_return(callee, &def->lhs, bytes, depth + 1);
+    case IR_OP_BINARY:
+      /* A comparison yields 0 or 1; everything else can leave the type. */
+      return def->text &&
+             (strcmp(def->text, "==") == 0 || strcmp(def->text, "!=") == 0 ||
+              strcmp(def->text, "<") == 0 || strcmp(def->text, "<=") == 0 ||
+              strcmp(def->text, ">") == 0 || strcmp(def->text, ">=") == 0 ||
+              strcmp(def->text, "&&") == 0 || strcmp(def->text, "||") == 0);
+    default:
+      return 0;
+    }
+  }
+}
+
 static int ir_inline_call_instruction(IRInstructionVector *vector,
                                       const IRInstruction *call_instruction,
                                       const IRFunction *callee,
@@ -721,6 +844,26 @@ static int ir_inline_call_instruction(IRInstructionVector *vector,
           call_instruction->dest.kind != IR_OPERAND_NONE) {
         emitted.op = IR_OP_ASSIGN;
         emitted.location = call_instruction->location;
+        /* A call to a narrow-integer function delivers its result in the
+         * matching part of a register, so what the caller reads back is
+         * already wrapped to the return type. An inlined body has no such
+         * boundary and a temp carries the full 64 bits, so the assign becomes
+         * a cast. Without it `fn f(a: int32, b: int32) -> int32 { return a *
+         * b; }` inlined at `f(65536, 65536) == 0` compared 4294967296 against
+         * zero and answered false, where the call answered true. */
+        if (!source->is_float && ir_inline_return_is_narrow_integer(callee) &&
+            !ir_inline_value_fits_return(
+                callee, &source->lhs,
+                ir_inline_integer_bytes(callee->return_type_name), 0)) {
+          char *narrowed = mettle_strdup(callee->return_type_name);
+          if (!narrowed) {
+            ir_instruction_destroy_storage(&emitted);
+            free(inline_end_label);
+            goto cleanup;
+          }
+          emitted.op = IR_OP_CAST;
+          emitted.text = narrowed;
+        }
         /* The RETURN carries the narrowing contract: float_bits is the return
          * type's width (the destination precision) and lhs.float_bits is the
          * value's own width. Propagate both so the synthesized assign performs
