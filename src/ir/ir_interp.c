@@ -1891,6 +1891,50 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     *result = ii_int_value((long long)addr);
     return 1;
   }
+  /* The interlocked helpers std/thread is built on. With one thread of
+   * execution each is just the operation it names, performed exactly, and
+   * each returns the value the target held BEFORE it -- which is the whole
+   * contract callers rely on. Modelling them as 0 made a compare-and-swap
+   * report that it had failed on a target it had never read. */
+  if (arg_count >= 1 && strncmp(name, "mettle_atomic_", 14) == 0) {
+    unsigned long long target = (unsigned long long)ii_as_int(&args[0]);
+    unsigned long long prior = 0;
+    if (!target || !ii_mem_read(machine, target, 4, &prior)) {
+      return -1;
+    }
+    {
+      int before = (int)(unsigned int)prior;
+      int next = before;
+      if (strcmp(name, "mettle_atomic_compare_exchange_i32") == 0 &&
+          arg_count >= 3) {
+        if (before == (int)ii_as_int(&args[2])) {
+          next = (int)ii_as_int(&args[1]);
+        }
+      } else if (strcmp(name, "mettle_atomic_exchange_i32") == 0 &&
+                 arg_count >= 2) {
+        next = (int)ii_as_int(&args[1]);
+      } else if (strcmp(name, "mettle_atomic_inc_i32") == 0) {
+        next = (int)((unsigned int)before + 1u);
+      } else if (strcmp(name, "mettle_atomic_dec_i32") == 0) {
+        next = (int)((unsigned int)before - 1u);
+      } else {
+        return 0; /* an atomic this does not know: fall through to the trace */
+      }
+      if (next != before &&
+          !ii_mem_write(machine, target, 4, (unsigned long long)(unsigned int)next)) {
+        return -1;
+      }
+      /* inc/dec answer the NEW value, the interlocked add's return; the other
+       * two answer the old one. */
+      *result = ii_int_value(
+          (strcmp(name, "mettle_atomic_inc_i32") == 0 ||
+           strcmp(name, "mettle_atomic_dec_i32") == 0)
+              ? (long long)next
+              : (long long)before);
+      return 1;
+    }
+  }
+
   /* The anonymous-memory primitives std/osmem builds os_mem_map on: mmap with
    * MAP_ANONYMOUS on Linux, VirtualAlloc with MEM_COMMIT on Windows. Both hand
    * back zeroed pages, which is calloc with a different spelling. Without them
