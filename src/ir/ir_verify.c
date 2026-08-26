@@ -1235,10 +1235,19 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
        * the input is unusable; different fates on a trap is itself a
        * divergence (a pass must not add or remove traps). Fuel asymmetry is
        * inconclusive (vector kernels charge differently), so skip those. */
+      /* An access outside an object, or through a freed one, is the program
+       * being wrong rather than the program trapping: nothing defines what
+       * it does, so a pass that makes it disappear -- SROA promoting an array
+       * whose only out-of-range read is a constant negative index -- has
+       * removed no behavior anyone can appeal to. Inconclusive like fuel,
+       * where a runtime GUARD trap (the checks --safe inserts) is a real
+       * observation and is compared above. */
       int trap_before = outcome_before == IRV_RUN_SKIP &&
-                        strstr(detail_before, "fuel") == NULL;
+                        strstr(detail_before, "fuel") == NULL &&
+                        strstr(detail_before, "out of bounds") == NULL;
       int trap_after = outcome_after == IRV_RUN_SKIP &&
-                       strstr(detail_after, "fuel") == NULL;
+                       strstr(detail_after, "fuel") == NULL &&
+                       strstr(detail_after, "out of bounds") == NULL;
       if (trap_before != trap_after &&
           (outcome_before == IRV_RUN_OK || outcome_after == IRV_RUN_OK)) {
         snprintf(result->why, sizeof(result->why), "%s: %s",
