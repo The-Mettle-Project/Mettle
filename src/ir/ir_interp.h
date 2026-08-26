@@ -109,6 +109,13 @@ long long ir_interp_pointee_window(IRInterpMachine *machine,
                                    unsigned long long value,
                                    unsigned char *out, size_t capacity);
 
+/* The value a function's address has inside this machine: what `&f` yields and
+ * what an indirect call resolves back through. Names a defined function or a
+ * declared extern; 0 when neither exists. Lets a harness hand a function-typed
+ * parameter something callable. */
+unsigned long long ir_interp_function_address(IRInterpMachine *machine,
+                                              const char *name);
+
 /* Human-readable reason for the last non-OK status ("call_indirect",
  * "extern trace overflow", "local type 'string'", ...). */
 const char *ir_interp_status_detail(const IRInterpMachine *machine);

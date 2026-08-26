@@ -571,6 +571,11 @@ static unsigned long long ii_function_token(IRInterpMachine *machine,
   return 0;
 }
 
+unsigned long long ir_interp_function_address(IRInterpMachine *machine,
+                                              const char *name) {
+  return machine ? ii_function_token(machine, name) : 0;
+}
+
 /* Map a token back: a defined function to execute, or the extern's name. */
 static IRFunction *ii_token_function(IRInterpMachine *machine,
                                      unsigned long long token,
@@ -3400,6 +3405,14 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         goto done;
       }
       const MtlcType *vt = insn->value_type;
+      /* A named type the instruction did not carry resolved: ask the module
+       * type registry. Monomorphizing a generic produces names like
+       * `Option__int64` that nothing here can parse and that the lowering
+       * does not always attach a type to, and without this every function
+       * holding one was unverifiable -- std/str alone has four. */
+      if (!vt && insn->text && machine->program) {
+        vt = ir_program_lookup_type(machine->program, insn->text);
+      }
       if ((insn->text && strcmp(insn->text, "string") == 0) ||
           (vt && vt->kind == MTLC_TYPE_STRING)) {
         /* The string value convention: the local's value IS the address of a
