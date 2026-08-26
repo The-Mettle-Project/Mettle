@@ -701,6 +701,35 @@ static void irv_format_value(const IRInterpValue *value, char *buffer,
   }
 }
 
+/* Two values that are both addresses into interpreter memory: an address is
+ * the buffer's allocation order, which a pass changes by changing how many
+ * objects a function builds, so the numbers say nothing. What can be observed
+ * through them is the bytes. Answers 1 when both are addresses and their
+ * windows agree, 0 when they disagree or when only one of them is an address,
+ * and -1 when neither is (compare them as plain numbers instead). */
+static int irv_pointees_agree(IRInterpMachine *before, IRInterpMachine *after,
+                              const IRInterpValue *va,
+                              const IRInterpValue *vb) {
+  unsigned char wa[IR_INTERP_EXTERN_MEM_CAP];
+  unsigned char wb[IR_INTERP_EXTERN_MEM_CAP];
+  long long na = 0;
+  long long nb = 0;
+  if (va->is_float || vb->is_float) {
+    return -1;
+  }
+  na = ir_interp_pointee_window(before, (unsigned long long)va->i, wa,
+                                sizeof(wa));
+  nb = ir_interp_pointee_window(after, (unsigned long long)vb->i, wb,
+                                sizeof(wb));
+  if (na < 0 && nb < 0) {
+    return -1;
+  }
+  if (na < 0 || nb < 0 || na != nb) {
+    return 0;
+  }
+  return memcmp(wa, wb, (size_t)na) == 0;
+}
+
 /* Compare all observations of two completed runs. On mismatch, writes a
  * one-line description into `why` and returns 0. */
 static int irv_compare_observations(IRInterpMachine *before,
@@ -709,12 +738,17 @@ static int irv_compare_observations(IRInterpMachine *before,
                                     const IRInterpValue *ret_after,
                                     size_t input_buffer_count, char *why,
                                     size_t why_capacity) {
-  if (!irv_value_equal(ret_before, ret_after)) {
-    char a[48], b[48];
-    irv_format_value(ret_before, a, sizeof(a));
-    irv_format_value(ret_after, b, sizeof(b));
-    snprintf(why, why_capacity, "return value was %s, is now %s", a, b);
-    return 0;
+  {
+    int pointees = irv_pointees_agree(before, after, ret_before, ret_after);
+    if (pointees == 0 ||
+        (pointees < 0 && !irv_value_equal(ret_before, ret_after))) {
+      char a[48], b[48];
+      irv_format_value(ret_before, a, sizeof(a));
+      irv_format_value(ret_after, b, sizeof(b));
+      snprintf(why, why_capacity, "return value was %s, is now %s%s", a, b,
+               pointees == 0 ? " (different memory)" : "");
+      return 0;
+    }
   }
 
   /* Input buffers exist in both machines by construction. */
@@ -855,12 +889,16 @@ static int irv_compare_observations(IRInterpMachine *before,
         break;
       }
     }
-    if (!irv_value_equal(&va, &vb)) {
-      char a[48], b[48];
-      irv_format_value(&va, a, sizeof(a));
-      irv_format_value(&vb, b, sizeof(b));
-      snprintf(why, why_capacity, "global '%s' was %s, is now %s", name, a, b);
-      return 0;
+    {
+      int pointees = irv_pointees_agree(before, after, &va, &vb);
+      if (pointees == 0 || (pointees < 0 && !irv_value_equal(&va, &vb))) {
+        char a[48], b[48];
+        irv_format_value(&va, a, sizeof(a));
+        irv_format_value(&vb, b, sizeof(b));
+        snprintf(why, why_capacity, "global '%s' was %s, is now %s%s", name, a,
+                 b, pointees == 0 ? " (different memory)" : "");
+        return 0;
+      }
     }
   }
   return 1;

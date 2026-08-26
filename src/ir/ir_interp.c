@@ -1507,6 +1507,48 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
 
 /* ---------------- extern model ---------------- */
 
+long long ir_interp_pointee_window(IRInterpMachine *machine,
+                                   unsigned long long value,
+                                   unsigned char *out, size_t capacity) {
+  long long offset = 0;
+  long long avail = 0;
+  long long take = 0;
+  IIBuffer *buf = NULL;
+  if (!machine || !out || capacity == 0) {
+    return -1;
+  }
+  buf = ii_addr_to_buffer(machine, value, 0, &offset);
+  if (!buf) {
+    return -1;
+  }
+  avail = buf->size - offset;
+  if (avail <= 0) {
+    return 0;
+  }
+  take = avail < (long long)capacity ? avail : (long long)capacity;
+  memcpy(out, buf->data + offset, (size_t)take);
+  /* A word inside the window that is itself an address is not an observation:
+   * a string literal's buffer holds its characters and then the {chars,
+   * length} record, so the window behind a `cstring` carries the literal's own
+   * address, and that address is the buffer's index. Canonicalize every word
+   * that resolves to live memory; a pointer that stopped being one still
+   * shows up as a difference. */
+  for (long long w = 0; w + 8 <= take; w++) {
+    unsigned long long word = 0;
+    long long unused = 0;
+    if (((offset + w) & 7) != 0) {
+      continue;
+    }
+    memcpy(&word, out + w, 8);
+    if (word < II_ADDR_BASE || !ii_addr_to_buffer(machine, word, 0, &unused)) {
+      continue;
+    }
+    word = II_ADDR_BASE;
+    memcpy(out + w, &word, 8);
+  }
+  return take;
+}
+
 static void ii_trace_extern(IRInterpMachine *machine, const char *name,
                             const IRInterpValue *args, size_t arg_count) {
   if (machine->trace_count >= II_TRACE_CAP) {
@@ -1537,43 +1579,14 @@ static void ii_trace_extern(IRInterpMachine *machine, const char *name,
     /* Pointer argument: capture the bytes it addresses right now, up to the
      * cap or the end of its buffer. The extern observes memory at the moment
      * of the call, so the trace must too. */
-    long long offset = 0;
-    IIBuffer *buf = ii_addr_to_buffer(machine, (unsigned long long)args[i].i,
-                                      0, &offset);
-    if (!buf) {
+    long long take = ir_interp_pointee_window(
+        machine, (unsigned long long)args[i].i, call->arg_mem[i],
+        IR_INTERP_EXTERN_MEM_CAP);
+    if (take < 0) {
       continue;
     }
     call->arg_is_pointer[i] = 1;
-    long long avail = buf->size - offset;
-    if (avail <= 0) {
-      continue;
-    }
-    long long take =
-        avail < IR_INTERP_EXTERN_MEM_CAP ? avail : IR_INTERP_EXTERN_MEM_CAP;
-    memcpy(call->arg_mem[i], buf->data + offset, (size_t)take);
     call->arg_mem_len[i] = (unsigned short)take;
-    /* A word inside the window that is itself an address is not an
-     * observation. A string literal's buffer holds its characters and then
-     * the {chars, length} record, so the window behind a `cstring` argument
-     * carries the literal's own address -- and that address is the buffer's
-     * index, which moves whenever a pass changes how many objects the
-     * function builds. Canonicalize every word that resolves to live memory
-     * so only what the extern can actually read is compared; a pointer that
-     * turned into something that is not one still shows up. */
-    for (long long w = 0; w + 8 <= take; w++) {
-      unsigned long long word = 0;
-      long long unused = 0;
-      if (((offset + w) & 7) != 0) {
-        continue;
-      }
-      memcpy(&word, call->arg_mem[i] + w, 8);
-      if (word < II_ADDR_BASE ||
-          !ii_addr_to_buffer(machine, word, 0, &unused)) {
-        continue;
-      }
-      word = II_ADDR_BASE;
-      memcpy(call->arg_mem[i] + w, &word, 8);
-    }
   }
 }
 
@@ -2336,6 +2349,25 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
         }
       }
       machine->fuel -= bound > start ? bound - start : 0;
+      /* A loop counter still read after the loop: the kernel leaves it at
+       * max(start, bound), which is what the unit-stride loop leaves and is
+       * right for an empty loop too. The emitter writes this back; without
+       * it here, a fill whose counter is live read as a behavior change and
+       * the pass was quarantined for a program it compiles correctly. */
+      if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
+        long long final_value = bound > start ? bound : start;
+        int wide = insn->argument_count > 5 &&
+                   insn->arguments[5].kind == IR_OPERAND_INT &&
+                   insn->arguments[5].int_value == 64;
+        IRInterpValue out;
+        if (!wide) {
+          final_value = (long long)(int)final_value;
+        }
+        out = ii_int_value(final_value);
+        if (!ii_store_dest(machine, frame, &insn->dest, &out)) {
+          return 0;
+        }
+      }
       return 1;
     }
     if (mode == 1) {
@@ -2366,7 +2398,8 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
         return 0;
       }
       long long steps = 0;
-      for (long long off = start; off < bound; off += elem_size) {
+      long long off = start;
+      for (; off < bound; off += elem_size) {
         if (!ii_mem_write(machine, base + (unsigned long long)off,
                           (int)elem_size, fill_bits)) {
           return 0;
@@ -2374,6 +2407,14 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
         steps++;
       }
       machine->fuel -= steps;
+      /* Byte-offset walk with a live counter: the emitter leaves it at
+       * start plus the bytes walked. */
+      if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
+        IRInterpValue out = ii_int_value(off);
+        if (!ii_store_dest(machine, frame, &insn->dest, &out)) {
+          return 0;
+        }
+      }
       return 1;
     }
     ii_fail(machine, IR_INTERP_UNSUPPORTED, "simd_fill mode");

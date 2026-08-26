@@ -97,6 +97,18 @@ const char *ir_interp_global_name(const IRInterpMachine *machine, size_t index);
 IRInterpValue ir_interp_global_value(const IRInterpMachine *machine,
                                      size_t index);
 
+/* If `value` addresses live interpreter memory, copy up to `capacity` bytes
+ * from it into `out` and return how many; return -1 when it is not an address
+ * at all. Any word inside the window that is itself an address is
+ * canonicalized, because a buffer's numeric address is its allocation order
+ * and a pass is free to change how many objects a function builds. What can be
+ * observed through a pointer is the bytes, which is what this returns.
+ * `capacity` must be a multiple of 8 for the canonicalization to cover the
+ * whole window. */
+long long ir_interp_pointee_window(IRInterpMachine *machine,
+                                   unsigned long long value,
+                                   unsigned char *out, size_t capacity);
+
 /* Human-readable reason for the last non-OK status ("call_indirect",
  * "extern trace overflow", "local type 'string'", ...). */
 const char *ir_interp_status_detail(const IRInterpMachine *machine);
