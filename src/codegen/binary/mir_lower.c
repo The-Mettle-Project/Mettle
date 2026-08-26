@@ -6453,6 +6453,15 @@ static void mir_elide_guarded_sext(MirFunction *fn) {
     size_t cand_movsx[8];
     size_t cand_add[8];
     unsigned char cand_inplace[8];
+    /* 0: the add already targets A, just drop the sext.
+     * 1: the add targets a temp nothing else reads, so retarget it to A.
+     * 2: the temp IS read elsewhere -- json_parse stores `pos + 1` back
+     *    through the Parser between the add and the sext -- so leave both
+     *    the add and that reader alone and weaken the sext to a plain move.
+     *    The guard proves the value fits in int32, which is the whole content
+     *    of the sign extension; the copy that remains is what the allocator
+     *    coalesces away. */
+    unsigned char cand_weaken[8];
     size_t cand_count = 0;
     size_t sp = 0;
     if (g + 1 < n) {
@@ -6508,6 +6517,7 @@ static void mir_elide_guarded_sext(MirFunction *fn) {
             cand_movsx[cand_count] = nx;
             cand_add[cand_count] = i;
             cand_inplace[cand_count] = 1;
+            cand_weaken[cand_count] = 0;
             cand_count++;
           }
           continue;
@@ -6558,8 +6568,33 @@ static void mir_elide_guarded_sext(MirFunction *fn) {
                 cand_movsx[cand_count] = i;
                 cand_add[cand_count] = def_at;
                 cand_inplace[cand_count] = 0;
+                cand_weaken[cand_count] = 0;
                 cand_count++;
               }
+            }
+          }
+          /* The retarget above needs the temp to be private and adjacent.
+           * When it is neither, the sign extension is still redundant. */
+          if (!multi_def && def_at != (size_t)-1 && visited[def_at] &&
+              cand_count < 8) {
+            const MirInst *add = &fn->insns[def_at];
+            int already = 0;
+            for (size_t q = 0; q < cand_count; q++) {
+              if (cand_movsx[q] == i) {
+                already = 1;
+                break;
+              }
+            }
+            if (!already && add->op == MIR_ADD && add->width == 8 &&
+                !add->is_float && add->dst.kind == MIR_OPK_VREG &&
+                add->dst.vreg == C && add->a.kind == MIR_OPK_VREG &&
+                add->a.vreg == A && add->b.kind == MIR_OPK_IMM &&
+                add->b.imm == 1) {
+              cand_movsx[cand_count] = i;
+              cand_add[cand_count] = def_at;
+              cand_inplace[cand_count] = 0;
+              cand_weaken[cand_count] = 1;
+              cand_count++;
             }
           }
         }
@@ -6579,6 +6614,13 @@ static void mir_elide_guarded_sext(MirFunction *fn) {
       }
 
       MirInst *sext = &fn->insns[cand_movsx[c]];
+      if (cand_weaken[c]) {
+        sext->op = MIR_MOV;
+        sext->width = 8;
+        sext->is_unsigned = 0;
+        guarded_add[cand_add[c]] = 1;
+        continue;
+      }
       if (!cand_inplace[c]) {
         fn->insns[cand_add[c]].dst = mir_op_vreg(A);
       }

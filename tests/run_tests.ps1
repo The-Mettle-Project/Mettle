@@ -1609,6 +1609,22 @@ $cases = @(
   @{ Name = "modulo"; Path = "tests/test_modulo.mettle"; ShouldSucceed = $true },
   @{ Name = "logical_not"; Path = "tests/test_logical_not.mettle"; ShouldSucceed = $true },
   @{
+    # A cursor advanced through a pointer: the loop guard proves pos+1 fits
+    # in int32, but the new value is also stored back through the struct
+    # between the add and the extension, so the elision can only weaken the
+    # movsx to a copy. Runs at both levels; the transform is release-only but
+    # the answers must agree.
+    Name          = "sext_guard_weaken"
+    Path          = "tests/sext_guard_weaken_check.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+  },
+  @{
+    Name          = "sext_guard_weaken_debug"
+    Path          = "tests/sext_guard_weaken_check.mettle"
+    ShouldSucceed = $true
+  },
+  @{
     # Interpolation passes a float's raw bits in a GP register, so the
     # encoder has to cross the bank with movq. It used to read the vreg's
     # physical number as a GP register, and XMM0 and RAX are both 0, so

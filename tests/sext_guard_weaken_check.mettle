@@ -1,0 +1,106 @@
+// A cursor advanced through a pointer, which is the shape the guarded
+// sign-extension elision now handles in its weakened form: the loop guard
+// proves `pos < len`, so `pos + 1` fits in int32 and the movsx that re-extends
+// it is redundant -- but the new value is ALSO stored back through the struct
+// between the add and the extension, so the temp has another reader and the
+// pass can only weaken the extension to a copy rather than delete it.
+//
+// Every count below must match the scalar answer exactly. A wrong elision
+// shows up as a cursor that runs past its limit or wraps.
+import "std/io";
+
+struct Cursor {
+  pos: int32;
+  len: int32;
+  hits: int32;
+}
+
+@noinline fn advance_to_zero(c: Cursor*, data: uint8*) -> int32 {
+  var n: int32 = 0;
+  while (c->pos < c->len) {
+    if (data[c->pos] == 0) {
+      return n;
+    }
+    c->pos = c->pos + 1;
+    n = n + 1;
+  }
+  return n;
+}
+
+@noinline fn count_matching(c: Cursor*, data: uint8*, want: uint8) -> int32 {
+  while (c->pos < c->len) {
+    if (data[c->pos] == want) {
+      c->hits = c->hits + 1;
+    }
+    c->pos = c->pos + 1;
+  }
+  return c->hits;
+}
+
+// The same shape with a negative start, so a sign extension that really was
+// load-bearing would show up as a wildly wrong index.
+@noinline fn from_negative(c: Cursor*) -> int32 {
+  var sum: int32 = 0;
+  while (c->pos < c->len) {
+    sum = sum + c->pos;
+    c->pos = c->pos + 1;
+  }
+  return sum;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  var buf: uint8[64];
+
+  var i: int32 = 0;
+  while (i < 64) {
+    buf[i] = (uint8)(i % 7 + 1);
+    i = i + 1;
+  }
+  buf[20] = 0;
+
+  var c: Cursor;
+  c.pos = 0;
+  c.len = 64;
+  c.hits = 0;
+  var n: int32 = advance_to_zero(&c, &buf[0]);
+  if (n != 20) {
+    println("advance_to_zero = {n}, wanted 20");
+    bad = bad + 1;
+  }
+  if (c.pos != 20) {
+    println("cursor left at {c.pos}, wanted 20");
+    bad = bad + 1;
+  }
+
+  c.pos = 0;
+  c.len = 64;
+  c.hits = 0;
+  var m: int32 = count_matching(&c, &buf[0], 3);
+  // values cycle 1..7, so 3 appears at i%7==2: i = 2,9,16,...,58 -> 9 times,
+  // except buf[20] was overwritten with 0 and 20%7 == 6, so it is unaffected.
+  if (m != 9) {
+    println("count_matching = {m}, wanted 9");
+    bad = bad + 1;
+  }
+  if (c.pos != 64) {
+    println("cursor left at {c.pos}, wanted 64");
+    bad = bad + 1;
+  }
+
+  c.pos = 0 - 5;
+  c.len = 5;
+  c.hits = 0;
+  var s: int32 = from_negative(&c);
+  // -5 + -4 + -3 + -2 + -1 + 0 + 1 + 2 + 3 + 4 = -5
+  if (s != 0 - 5) {
+    println("from_negative = {s}, wanted -5");
+    bad = bad + 1;
+  }
+
+  println("sext guard weaken mismatches = {bad}");
+  if (bad != 0) {
+    return 1;
+  }
+  return 0;
+}
