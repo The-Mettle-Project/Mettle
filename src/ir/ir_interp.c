@@ -1048,14 +1048,16 @@ static IIVar *ii_global_touch(IRInterpMachine *machine, const char *name) {
   }
   if (sym->has_initializer) {
     if (sym->init_is_float) {
+      /* A float initializer is always folded to a double's bit pattern,
+       * whatever the global's declared width; a float32 global's four-byte
+       * home then rounds it, which is what the emitter does. Reading the low
+       * half of the double as a float instead read noise -- and for any value
+       * whose mantissa is zero in that half, which is every ordinary literal,
+       * the noise was 0: `var Gw: float32 = 1.25;` came back as zero. */
       double d = 0;
+      memcpy(&d, &sym->init_bits, 8);
       if (sym->type && sym->type->kind == MTLC_TYPE_FLOAT32) {
-        float f;
-        unsigned int bits = (unsigned int)sym->init_bits;
-        memcpy(&f, &bits, 4);
-        d = (double)f;
-      } else {
-        memcpy(&d, &sym->init_bits, 8);
+        d = (double)(float)d;
       }
       var->value = ii_float_value(d);
     } else if (sym->init_string) {
@@ -1170,7 +1172,24 @@ static unsigned long long ii_global_storage(IRInterpMachine *machine,
       if (!ii_string_literal(machine, reloc->string, &chars, &record)) {
         return 0;
       }
-      value = reloc->string_wants_record ? record : chars;
+      value = chars;
+      if (reloc->string_wants_record) {
+        /* The field IS the {chars, length} record, sixteen bytes at the
+         * field's own offset -- the pointer here and the length beside it,
+         * which is what the emitter writes and what every read of such a
+         * field expects. Storing the record's ADDRESS instead left the
+         * pointer half wrong and the length half whatever the folded image
+         * had, so `VH.s.length` on a struct global with a string field read 0
+         * where the program reads 6. */
+        unsigned long long length = (unsigned long long)strlen(reloc->string);
+        long long len_off = 0;
+        IIBuffer *len_buf = ii_addr_to_buffer(
+            machine, addr + reloc->offset + 8, 8, &len_off);
+        if (!len_buf) {
+          return 0;
+        }
+        memcpy(len_buf->data + len_off, &length, 8);
+      }
     } else if (reloc->symbol) {
       value = ii_function_token(machine, reloc->symbol);
       if (!value) {
