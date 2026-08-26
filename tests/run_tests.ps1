@@ -303,6 +303,7 @@ if ($Parallel) {
   $mergedTotal = 0
   $mergedFailed = 0
   $anyFailed = $false
+  $shardRosters = @()
   $mergedLog = New-Object System.Collections.Generic.List[string]
   foreach ($child in $children) {
     $child.Proc.WaitForExit()
@@ -325,6 +326,14 @@ if ($Parallel) {
       $anyFailed = $true
       $mergedLog.Add("[FAIL] shard $($child.Index) did not report a result")
     }
+    $coverage = Select-String -Path $child.Out -Pattern '^SHARD-COVERAGE roster=(\d+) ran=(\d+)$' | Select-Object -Last 1
+    if ($coverage) {
+      $shardRosters += [int]$coverage.Matches[0].Groups[1].Value
+    }
+    else {
+      $anyFailed = $true
+      $mergedLog.Add("[FAIL] shard $($child.Index) did not report coverage")
+    }
     # A shard that dies without reporting anything is itself the failure.
     if ($null -ne $childCode -and $childCode -ne 0 -and $shardFailed -eq 0) {
       $anyFailed = $true
@@ -336,6 +345,23 @@ if ($Parallel) {
     }
   }
 
+
+  # Coverage, not results. A shard that silently claims fewer cases still
+  # reports everything it ran as passing, so the suite goes green while testing
+  # less, and it gets quieter the more it drops. Every shard walks the same
+  # roster in the same order, so all of them must see the same roster size, and
+  # between them they must run it exactly once. This is the check that catches a
+  # block sharding an already-sharded list: that reported 1125/1125 with 25
+  # cases run by no shard at all.
+  $distinctRosters = @($shardRosters | Sort-Object -Unique)
+  if ($distinctRosters.Count -gt 1) {
+    $anyFailed = $true
+    $mergedLog.Add("[FAIL] shards disagree on the case roster: $($distinctRosters -join ', ')")
+  }
+  elseif ($distinctRosters.Count -eq 1 -and $distinctRosters[0] -ne $mergedTotal) {
+    $anyFailed = $true
+    $mergedLog.Add("[FAIL] roster is $($distinctRosters[0]) cases but the shards ran $mergedTotal between them")
+  }
   Write-Host ""
   Write-Host "Test summary: $($mergedTotal - $mergedFailed)/$mergedTotal passed across $Shards shards"
   if ($FailureLog) {
@@ -2729,20 +2755,21 @@ function Invoke-TableCases {
   return $results
 }
 
-if ($Shards -gt 1) {
-  $mine = @()
-  for ($i = 0; $i -lt $cases.Count; $i++) {
-    if (((([int][Math]::Floor($i / $script:CaseBlock)) % $Shards)) -eq $Shard) {
-      $mine += $cases[$i]
-    }
-  }
-  $cases = $mine
+# One sharding mechanism, not two. Test-CaseIsMine consumes one ordinal per
+# case in a fixed order, so every shard agrees about who owns what, and $cases
+# keeps meaning "every case" for the whole run. Narrowing $cases here instead
+# was a trap: a block written further down iterated it, sharded the already
+# sharded list, and ran about one case in twelve while the suite still reported
+# every test passing.
+$shardCases = @()
+foreach ($case in $cases) {
+  if (Test-CaseIsMine) { $shardCases += $case }
 }
 
-Write-Host "Running $($cases.Count) compile cases across $Jobs jobs..."
-$caseRuns = Invoke-TableCases -Cases $cases -Jobs $Jobs
+Write-Host "Running $($shardCases.Count) compile cases across $Jobs jobs..."
+$caseRuns = Invoke-TableCases -Cases $shardCases -Jobs $Jobs
 
-foreach ($case in $cases) {
+foreach ($case in $shardCases) {
   $caseName = $case.Name
   try {
     $total++
@@ -4597,10 +4624,7 @@ foreach ($shiftCase in @(
 # that already carry their own output assertion -- $simdRuntimeCases and
 # anything with OutputMustMatch/Pattern are executed already.
 #
-# No Test-CaseIsMine here: $cases has ALREADY been narrowed to this shard's
-# share above, so calling it would shard an ex-shard and run about one case in
-# twelve. Serial and parallel runs have to cover the same set, and the only
-# evidence that they do is both reporting the same total.
+# $cases is the whole table, so this shards the same way everything else does.
 foreach ($case in $cases) {
   if (-not ($case.ContainsKey("IrMustMatch") -and $case.IrMustMatch)) { continue }
   if (-not ($case.ContainsKey("Path") -and $case.Path)) { continue }
@@ -4611,6 +4635,8 @@ foreach ($case in $cases) {
   $total++
   $recogName = "recognizer_runtime_" + $case.Name
   try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+
     $recogOut = @{}
     $recogExit = @{}
     foreach ($recogMode in @("debug", "release")) {
@@ -7585,7 +7611,7 @@ try {
     throw "Symbol-resolve harness compile failed: $compileHarness"
   }
 
-  $cases = @(
+  $linkerMergeCases = @(
     @{ Path = "tests/test_linker_merge_entry.mettle"; Out = $fnEntryObj; Label = "function-entry" },
     @{ Path = "tests/test_linker_merge_provider.mettle"; Out = $fnProviderObj; Label = "function-provider" },
     @{ Path = "tests/test_linker_merge_data_entry.mettle"; Out = $dataEntryObj; Label = "data-entry" },
@@ -7597,7 +7623,7 @@ try {
     @{ Path = "tests/test_linker_unresolved_entry.mettle"; Out = $unresolvedObj; Label = "unresolved-entry" }
   )
 
-  foreach ($case in $cases) {
+  foreach ($case in $linkerMergeCases) {
     $objOut = & $CompilerPath --emit-obj $case.Path -o $case.Out 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "Symbol-resolve $($case.Label) object compile failed: $objOut"
@@ -13463,11 +13489,11 @@ else {
                   "-o", $calcExe) + $script:HostSymbolizerLibs
     $buildOut = & $calcGcc.Source @calcArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "building the calc frontend failed: $buildOut" }
-    $cases = @(
+    $calcProgramCases = @(
       @{ src = "examples/calc/programs/factorial.calc"; expect = 120 },
       @{ src = "examples/calc/programs/loops.calc"; expect = 55 }
     )
-    foreach ($c in $cases) {
+    foreach ($c in $calcProgramCases) {
       $name = [System.IO.Path]::GetFileNameWithoutExtension($c.src)
       $exe = Join-Path $tmpDir ("calc_" + $name + ".exe")
       $env:MTLC_RUNTIME_DIR = Join-Path $script:BinDir "runtime"
@@ -13786,6 +13812,7 @@ if ($FailureLog) {
 
 # The line the -Parallel driver reads back out of each shard.
 if ($Shards -gt 1) {
+  Write-Host "SHARD-COVERAGE roster=$script:CaseOrdinal ran=$total"
   Write-Host "SHARD-RESULT total=$total failed=$failed"
 }
 
