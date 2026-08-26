@@ -162,6 +162,8 @@ static const IROptNamedPass g_ir_lowering_cleanup[] = {
      {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
     {"hoist_invariant_loads", ir_hoist_invariant_loads_pass,
      {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
+    {"hoist_invariant_arith", ir_hoist_invariant_arith_pass,
+     {IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
     {"widen_subword_cast", ir_widen_subword_load_cast_pass,
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
     {"ascii_casefold_range", ir_ascii_casefold_range_pass,

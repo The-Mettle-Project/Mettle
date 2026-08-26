@@ -562,6 +562,217 @@ static int ir_row_operand_invariant(const IRFunction *function, size_t lo,
          !ir_symbol_address_taken(function, op->name);
 }
 
+/* Loop-invariant pure arithmetic.
+ *
+ * The other hoisters in this file each move one shape: a global's address, a
+ * row pointer, an invariant load. None move plain computation, so a loop that
+ * indexes `w->live[i]` while only `k` moves recomputed `i * 32` every
+ * iteration.
+ *
+ * Hoisting is not free: the result becomes live across the whole body, and a
+ * loop that was already using every register pays for that in spills far more
+ * than it saves in arithmetic. So this only moves a computation when doing so
+ * cannot RAISE pressure -- every operand it reads must have no other reader
+ * left in the loop, so the value moving out takes its inputs with it. That is
+ * checkable here, unlike the register demand itself, and it is the difference
+ * between scale_i32 getting 18% faster and physics_grid getting 12% slower.
+ *
+ * Divide and remainder are excluded: they trap on a zero divisor, and hoisting
+ * one runs it on iterations the loop would never have taken. The definition
+ * moves to the preheader, which dominates every point the original dominated.
+ * A header reachable only by a jump has no preheader and is skipped. */
+#define IR_LICM_MAX_PER_LOOP 8
+
+static int ir_licm_op_is_pure_arith(const IRInstruction *ins) {
+  if (!ins) {
+    return 0;
+  }
+  if (ins->op == IR_OP_CAST) {
+    return 1;
+  }
+  if (ins->op != IR_OP_BINARY || !ins->text) {
+    return 0;
+  }
+  return strcmp(ins->text, "/") != 0 && strcmp(ins->text, "%") != 0;
+}
+
+static int ir_licm_operand_named(const IROperand *op, const char **name) {
+  if (!op || !op->name) {
+    return 0;
+  }
+  if (op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL) {
+    *name = op->name;
+    return 1;
+  }
+  return 0;
+}
+
+/* Does `ins` read `name`, whether it is spelled a temp or a symbol? */
+static int ir_licm_instruction_reads(const IRInstruction *ins,
+                                     const char *name) {
+  const IROperand *slots[3] = {&ins->lhs, &ins->rhs,
+                               ins->op == IR_OP_STORE ? &ins->dest : NULL};
+  for (int k = 0; k < 3; k++) {
+    const IROperand *op = slots[k];
+    if (op && op->name &&
+        (op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL) &&
+        strcmp(op->name, name) == 0) {
+      return 1;
+    }
+  }
+  for (size_t a = 0; a < ins->argument_count; a++) {
+    const IROperand *op = &ins->arguments[a];
+    if (op->name &&
+        (op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL) &&
+        strcmp(op->name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Reads of `name` in [lo, hi), not counting the instruction at `skip`. */
+static size_t ir_licm_read_count(const IRFunction *function, size_t lo,
+                                 size_t hi, size_t skip, const char *name) {
+  size_t count = 0;
+  for (size_t i = lo; i < hi && i < function->instruction_count; i++) {
+    if (i != skip &&
+        ir_licm_instruction_reads(&function->instructions[i], name)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+static int ir_licm_written_in(const IRFunction *function, size_t lo, size_t hi,
+                              const char *name) {
+  for (size_t i = lo; i < hi && i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (!ir_instruction_writes_destination(ins) || !ins->dest.name) {
+      continue;
+    }
+    if ((ins->dest.kind == IR_OPERAND_TEMP ||
+         ins->dest.kind == IR_OPERAND_SYMBOL) &&
+        strcmp(ins->dest.name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int ir_hoist_invariant_arith_pass(IRFunction *function, int *changed) {
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    char loop_label[128];
+    size_t latch = 0;
+    size_t picked[IR_LICM_MAX_PER_LOOP];
+    size_t pick_count = 0;
+
+    {
+      const IRInstruction *label = &function->instructions[header];
+      if (label->op != IR_OP_LABEL ||
+          !ir_cleanup_label_is_loop_header(label->text) ||
+          snprintf(loop_label, sizeof(loop_label), "%s", label->text) >=
+              (int)sizeof(loop_label)) {
+        continue;
+      }
+    }
+    latch = ir_cleanup_loop_latch(function, header, loop_label);
+    /* Only small loops. A big body is already using every register it can get,
+     * and a value hoisted into it is live for the whole loop: physics_grid and
+     * interp_ast each lost more than 12% to exactly that, while the small
+     * integer loops that have registers to spare gained up to 18%. Size is the
+     * one proxy for spare pressure available here. */
+    if (!latch || header == 0 || latch - header > 40) {
+      continue;
+    }
+    {
+      size_t p = header - 1;
+      while (p > 0 && function->instructions[p].op == IR_OP_NOP) {
+        p--;
+      }
+      IROpcode prev = function->instructions[p].op;
+      if (prev == IR_OP_JUMP || prev == IR_OP_RETURN ||
+          prev == IR_OP_BRANCH_ZERO || prev == IR_OP_BRANCH_EQ) {
+        continue;
+      }
+    }
+
+    for (size_t i = header + 1; i < latch && pick_count < IR_LICM_MAX_PER_LOOP;
+         i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      const char *operands[2];
+      size_t operand_count = 0;
+      int ok = 1;
+      if (!ir_licm_op_is_pure_arith(ins) ||
+          ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name) {
+        continue;
+      }
+      if (ir_licm_written_in(function, header + 1, latch, ins->dest.name) &&
+          ir_licm_read_count(function, header + 1, latch, i,
+                             ins->dest.name) == 0) {
+        continue;
+      }
+      {
+        const IROperand *slots[2] = {&ins->lhs, &ins->rhs};
+        for (int k = 0; k < 2 && ok; k++) {
+          const char *name = NULL;
+          if (!ir_licm_operand_named(slots[k], &name)) {
+            if (slots[k]->kind != IR_OPERAND_NONE &&
+                slots[k]->kind != IR_OPERAND_INT &&
+                slots[k]->kind != IR_OPERAND_FLOAT) {
+              ok = 0;
+            }
+            continue;
+          }
+          if (ir_licm_written_in(function, header + 1, latch, name) ||
+              (slots[k]->kind == IR_OPERAND_SYMBOL &&
+               ir_symbol_address_taken(function, name))) {
+            ok = 0;
+            break;
+          }
+
+          operands[operand_count++] = name;
+        }
+      }
+      (void)operands;
+      if (!ok) {
+        continue;
+      }
+      picked[pick_count++] = i;
+    }
+
+    if (pick_count == 0) {
+      continue;
+    }
+    /* Clone first, then NOP, then insert the batch: one shift for the whole
+     * loop instead of one per instruction moved. */
+    for (size_t k = 0; k < pick_count; k++) {
+      IRInstruction hoisted;
+      if (!ir_clone_instruction_plain(&function->instructions[picked[k]],
+                                      &hoisted)) {
+        return 0;
+      }
+      ir_instruction_make_nop(&function->instructions[picked[k]]);
+      if (!ir_function_insert_instruction(function, header + k, &hoisted)) {
+        ir_instruction_destroy_storage(&hoisted);
+        return 0;
+      }
+      ir_instruction_destroy_storage(&hoisted);
+      for (size_t m = k + 1; m < pick_count; m++) {
+        picked[m]++;
+      }
+      latch++;
+    }
+    header += pick_count;
+    if (changed) {
+      *changed = 1;
+    }
+  }
+  return 1;
+}
 #define IR_ROW_MAX_CONSUMERS 8
 
 /* Hoist the invariant half of an indexed access out of the loop.
