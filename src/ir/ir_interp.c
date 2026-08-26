@@ -933,6 +933,32 @@ static long long ii_narrow_int(long long v, int size, int is_unsigned) {
 
 static int ii_var_write(IRInterpMachine *machine, IIVar *var,
                         const IRInterpValue *value) {
+  /* A string local owns its {chars, length} record and assignment copies into
+   * it -- `string` moves like the two-field struct it is. Rebinding the
+   * local's value to the source's record instead made two locals share one:
+   *
+   *     var head: string = ""; var tail: string = "";
+   *
+   * both pointed at the ONE record behind the "" literal, so the sixteen-byte
+   * store that later wrote `head` wrote `tail` and the literal with it, and
+   * head read back whatever was assigned last. A source that is not a
+   * readable record (a null, or a value that is not an address) still just
+   * rebinds, which is what a freshly-declared local wants. */
+  if (var->string_record && !value->is_float) {
+    unsigned long long src = (unsigned long long)ii_as_int(value);
+    long long src_off = 0;
+    IIBuffer *sbuf = src ? ii_addr_to_buffer(machine, src, 16, &src_off) : NULL;
+    long long dst_off = 0;
+    IIBuffer *dbuf = ii_addr_to_buffer(machine, var->string_record, 16,
+                                       &dst_off);
+    if (sbuf && dbuf) {
+      if (sbuf != dbuf || src_off != dst_off) {
+        memmove(dbuf->data + dst_off, sbuf->data + src_off, 16);
+      }
+      var->value = ii_int_value((long long)var->string_record);
+      return 1;
+    }
+  }
   if (var->agg_size > 0) {
     /* Aggregate: assignment through the name is a block copy from the source
      * address (a returned aggregate, another aggregate's storage, or a folded
