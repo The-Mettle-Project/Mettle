@@ -4589,7 +4589,6 @@ int toupper(int character) {
                                                : character;
 }
 
-/* The kernels live in a header so the interpreter runs the same arithmetic. */
 #include "mt_math.h"
 
 /* Program ABI: Mettle code binds these by name, e.g.

@@ -644,7 +644,6 @@ static size_t ir_licm_read_count(const IRFunction *function, size_t lo,
   return count;
 }
 
-/* How many instructions in [lo, hi) write `name`. */
 static size_t ir_licm_def_count(const IRFunction *function, size_t lo,
                                 size_t hi, const char *name) {
   size_t count = 0;
@@ -733,12 +732,6 @@ int ir_hoist_invariant_arith_pass(IRFunction *function, int *changed) {
                              ins->dest.name) == 0) {
         continue;
       }
-      /* One definition only. Two arms writing the same temp is what an
-       * inlined function with two returns produces, and hoisting both to the
-       * preheader leaves the body reading whichever landed last. Both arms
-       * become eligible the moment their operands are themselves hoisted --
-       * which this pass does -- so only the order it runs in has been keeping
-       * that from happening. */
       if (ir_licm_def_count(function, header + 1, latch, ins->dest.name) != 1) {
         continue;
       }

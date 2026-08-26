@@ -598,10 +598,6 @@ int ir_comptime_trace(IRProgram *program, ErrorReporter *reporter,
   }
 
   printf("\n");
-  /* Every extern the interpreter could not model answered 0, and those are
-   * exactly the calls it recorded. Saying so matters: tracing a function that
-   * calls sqrtf prints a confident number computed from 1.0/0, and without
-   * this line nothing tells the reader the run diverged from the program. */
   {
     size_t traced = ir_interp_extern_trace_count(machine);
     size_t named = 0;

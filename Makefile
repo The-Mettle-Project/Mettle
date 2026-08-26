@@ -3,12 +3,6 @@ CC = gcc
 #   make EXTRA_CFLAGS='-DMETTLE_VERSION_RAW=v0.13.0'
 # (bare token, stringified in main.c - avoids fragile quote escaping)
 EXTRA_CFLAGS =
-# -MMD -MP writes a .d file beside every object listing the headers it read,
-# and the -include at the bottom feeds them back. Without it an edit to a
-# header rebuilt nothing: adding a field to TypeChecker left every untouched
-# translation unit holding the old layout, and the compiler that came out
-# segfaulted in the type checker. The Windows build (tools/ccbuild.ps1) has
-# tracked headers all along.
 CFLAGS = -Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer -MMD -MP $(EXTRA_CFLAGS)
 # Native compiler build profile for DGX Spark. GCC/Clang versions without a
 # GB10-specific scheduler use ARMv9.2-A; GCC 15 / LLVM 21 users should override
@@ -85,7 +79,6 @@ FRONTEND_SOURCES = $(LEXER_SOURCES) $(PARSER_SOURCES) $(SEMANTIC_SOURCES) $(LOWE
 
 BACKEND_OBJECTS = $(BACKEND_SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 FRONTEND_OBJECTS = $(FRONTEND_SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
-# Header dependencies, one per object, written by -MMD above.
 DEPFILES = $(BACKEND_OBJECTS:.o=.d) $(FRONTEND_OBJECTS:.o=.d)
 HOST_RUNTIME_OBJECT = $(OBJDIR)/runtime/host_runtime.o
 HOST_STARTUP_OBJECT = $(OBJDIR)/runtime/host_startup.o

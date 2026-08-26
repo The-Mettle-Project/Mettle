@@ -75,7 +75,7 @@ class Gen:
         self.unary_helpers = []      # names of 1-param int64 helpers
         self.applier = None          # fn(fn(int64)->int64, int64) -> int64
         self.float_helpers = {}      # kind -> name
-        self.narrow_helpers = []     # (name, type, nparams) narrow-return
+        self.narrow_helpers = []
         self.kernels = {}            # kind -> name (pointer-param SIMD bait)
         self.structs = []            # dicts: name, fields, make, fold
         self.globals = []            # (name, pure_reader_name_or_None)
@@ -278,8 +278,6 @@ class Gen:
             probe = self.rng.choice([0, 1, big])
             self.emit(f"if ({call} == ({ty}){probe}) {{ "
                       f"{acc} = ({acc} + 7) & {MASK}; }}")
-        # Always: the result read straight through, with no typed local to
-        # wrap it on the way. This is the line the miscompile showed up on.
         self.emit(f"{acc} = ({acc} + (int64){call} * 3) & {MASK};")
 
     def stmt_call(self):
@@ -859,10 +857,6 @@ class Gen:
         inliner's proof that the others need nothing is what keeps a clamp
         helper recognizable to the vectorizers."""
         for ty in ("int32", "uint32", "int16", "uint16", "int8", "uint8"):
-            # int32 and uint32 always: they are the widths where the wrap the
-            # return type owes has nothing else to supply it. The frontend
-            # makes the narrower ones carry an explicit cast, and a constant
-            # fold narrows on the instruction's own type.
             if ty not in ("int32", "uint32") and self.rng.random() < 0.5:
                 continue
             name = self.fresh("nh")
@@ -1068,9 +1062,6 @@ class Gen:
         self.indent += 1
         self.emit("var acc: int64 = 1;")
         self.live_vars = ["acc"]
-        # One narrow-return call in every program, rather than waiting for the
-        # statement mix to roll one. The wrap a narrow return owes is cheap to
-        # exercise and was invisible to every other shape here.
         self.stmt_narrow_call()
         # ~8% jumbo mains: enough statements to trip the MIR size bail so
         # the fallback backend sees every shape too

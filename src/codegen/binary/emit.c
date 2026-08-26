@@ -6289,12 +6289,6 @@ int code_generator_binary_emit_instruction(
                                                           instruction);
 
   case IR_OP_INLINE_ASM:
-    /* The parser and the type checker accept an `asm` block, and no backend
-     * assembles one -- there is no assembler in this toolchain to hand the
-     * text to. Say so as a user error: reaching the default arm below reported
-     * a numeric opcode as an internal compiler error, with a backtrace and an
-     * invitation to rerun under --debug-compiler, for a program that is merely
-     * asking for something that does not exist. */
     generator->has_user_error = 1;
     code_generator_set_error(
         generator,

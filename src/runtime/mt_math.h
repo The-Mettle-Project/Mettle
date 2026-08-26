@@ -1,16 +1,6 @@
 #ifndef MTLC_RUNTIME_MT_MATH_H
 #define MTLC_RUNTIME_MT_MATH_H
 
-/* The freestanding math kernels, shared by the runtime that a program links
- * against and by the compiler's own interpreter.
- *
- * They live in a header because both need the SAME arithmetic. A program on a
- * freestanding target calls these for expf/logf/powf/sinf/cosf/tanhf, so an
- * interpreter with its own approximation -- or with the host's libm -- would
- * answer a slightly different number than the program it is describing. There
- * is nothing here but arithmetic: no libc, no external symbols, which is what
- * lets the compiler's archive stay self-contained.
- */
 
 static double mt_exp(double value) {
   if (value > 709.0) {
@@ -46,11 +36,6 @@ static double mt_exp(double value) {
   return result;
 }
 
-/* Natural log. Split the value into m * 2^e with m in [1, 2), then run the
- * atanh series on s = (m - 1) / (m + 1): over that range s stays under 1/3, so
- * s^2 is under 1/9 and the terms below land well inside double precision. The
- * scaling loops mirror mt_exp's rather than reaching for frexp, which this
- * runtime does not have. */
 static double mt_log(double value) {
   if (value < 0.0) {
     return 0.0 / 0.0;
@@ -92,7 +77,6 @@ static double mt_pow(double base, double exponent) {
     return exponent > 0.0 ? 0.0 : 1.0 / 0.0;
   }
   if (base < 0.0) {
-    /* Defined only for an integer exponent; the sign comes from its parity. */
     double truncated = (double)(long long)exponent;
     if (truncated != exponent) {
       return 0.0 / 0.0;
@@ -103,12 +87,6 @@ static double mt_pow(double base, double exponent) {
   return mt_exp(exponent * mt_log(base));
 }
 
-/* Sine, reduced to [-pi/2, pi/2] before the Taylor series so twelve terms are
- * comfortably inside double precision. The reduction is the plain subtract-a-
- * multiple-of-2pi kind, which loses low bits once the argument is large enough
- * that 2pi is no longer representable near it; past 2^52 nothing meaningful is
- * left to reduce, so that range answers NaN rather than a confident wrong
- * number. */
 static double mt_sin(double value) {
   const double two_pi = 6.2831853071795864769;
   const double pi = 3.1415926535897932385;
@@ -156,9 +134,6 @@ static double mt_tanh(double value) {
   return (twice - 1.0) / (twice + 1.0);
 }
 
-/* Newton iteration in single precision, which is what the program's sqrtf
- * does -- doing it in double and rounding once would land on a different
- * float for some inputs. */
 static float mt_sqrtf(float value) {
   if (value <= 0.0f) {
     return value == 0.0f ? value : 0.0f / 0.0f;
@@ -170,4 +145,4 @@ static float mt_sqrtf(float value) {
   return estimate;
 }
 
-#endif /* MTLC_RUNTIME_MT_MATH_H */
+#endif

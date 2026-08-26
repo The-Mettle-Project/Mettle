@@ -450,13 +450,9 @@ typedef struct {
   IRVParamKind kind;
   int elem_size;   /* buffers: pointee element size */
   int elem_float;  /* buffers: pointee is float */
-  const char *type_name; /* functions: the `fn(...)->R` spelling to match */
+  const char *type_name;
 } IRVParamInfo;
 
-/* A struct, array or tagged enum passed by value arrives as the address of
- * its bytes, so a generated one is that many bytes of storage. Declining them
- * left every function taking one unverifiable, which is a lot of them: a
- * two-int Pair is as ordinary a parameter as there is. */
 static int irv_aggregate_bytes(const IRProgram *program, const char *type) {
   MtlcType *t = program && type ? ir_program_lookup_type(program, type) : NULL;
   if (!t || t->size == 0 || t->size > 4096) {
@@ -482,15 +478,11 @@ static IRVParamInfo irv_classify_param(const IRProgram *program,
   if (!type) {
     return info;
   }
-  /* A plain function pointer: the harness can hand over a real function's
-   * address, so the body's indirect call goes somewhere. `Fn(` -- a capturing
-   * closure -- is a pointer to a record whose field 0 is the code pointer, a
-   * different shape, and is still declined. */
   if (strncmp(type, "fn(", 3) == 0) {
     if (irv_find_function_named(program, type)) {
       info.kind = IRV_PARAM_FUNCTION;
     }
-    return info; /* nothing of that signature: say so as a parameter type */
+    return info;
   }
   {
     int agg = irv_aggregate_bytes(program, type);
@@ -522,18 +514,6 @@ static IRVParamInfo irv_classify_param(const IRProgram *program,
       }
     }
     if (strchr(base, '*') == NULL) {
-      /* Pointer to a struct: a seeded byte region compared byte-for-byte. A
-       * rewrite that disturbs any field's bytes still diverges.
-       * Pointer-to-pointer stays unsupported: seeded bytes are not valid
-       * addresses to chase.
-       *
-       * Sized in whole records when the type registry knows the pointee.
-       * Eight-byte units were the guess before, which makes "this run uses 33
-       * elements" untrue for any record that is not eight bytes: a body that
-       * reads p[32] then reads past the end of what was generated for it. A
-       * record whose own fields are pointers still traps, because seeded
-       * bytes are not addresses either -- std/alloc's heap helpers are that
-       * shape and remain unverifiable. */
       int record = irv_aggregate_bytes(program, base);
       info.kind = IRV_PARAM_BUFFER;
       info.elem_size = record > 0 ? record : 8;
@@ -609,9 +589,6 @@ static double irv_float_arg(int run, size_t param_index) {
 
 /* Build one machine for the run, registering identical buffers and argument
  * values. Returns 0 on setup failure. */
-/* Render a signature the way a parameter type spells one: `fn(a,b)->r`.
- * Returns 0 when any part is missing, so an unnameable candidate is skipped
- * rather than matched by accident. */
 static int irv_render_signature(char *out, size_t cap, const char *const *params,
                                 size_t param_count, const char *ret) {
   size_t off = 0;
@@ -635,13 +612,6 @@ static int irv_render_signature(char *out, size_t cap, const char *const *params
   return n >= 0 && off + (size_t)n < cap;
 }
 
-/* A function in this program whose signature is exactly `want`.
- *
- * Declared externs come first: the interpreter models malloc and friends, and
- * `fn(int64) -> rawptr` -- the allocator every std/io and std/str helper takes
- * -- is by far the commonest function-typed parameter there is. A defined
- * function is the fallback, and one that takes a function itself is skipped so
- * a match cannot hand a function to itself. */
 static const char *irv_find_function_named(const IRProgram *program,
                                            const char *want) {
   char sig[192];
@@ -778,9 +748,6 @@ static int irv_setup_machine(IRInterpMachine *machine, IRFunction *shape,
       break;
     }
     case IRV_PARAM_AGGREGATE: {
-      /* Deterministic small values: whatever the fields turn out to be, an
-       * integer stays small and a float stays finite and tiny, so nothing
-       * here manufactures an overflow the caller never could. */
       long long bytes = params[p].elem_size;
       unsigned char *init = (unsigned char *)malloc((size_t)bytes);
       if (!init) {
@@ -874,12 +841,6 @@ static void irv_format_value(const IRInterpValue *value, char *buffer,
   }
 }
 
-/* Two values that are both addresses into interpreter memory: an address is
- * the buffer's allocation order, which a pass changes by changing how many
- * objects a function builds, so the numbers say nothing. What can be observed
- * through them is the bytes. Answers 1 when both are addresses and their
- * windows agree, 0 when they disagree or when only one of them is an address,
- * and -1 when neither is (compare them as plain numbers instead). */
 static int irv_pointees_agree(IRInterpMachine *before, IRInterpMachine *after,
                               const IRInterpValue *va,
                               const IRInterpValue *vb) {
@@ -945,24 +906,6 @@ static int irv_compare_observations(IRInterpMachine *before,
     }
   }
 
-  /* Runtime allocations are deliberately NOT compared.
-   *
-   * Which index an allocation lands on, and when it happens, are facts about
-   * this machine rather than about the program: a string literal materializes
-   * the first time control reaches it, a heap string when its interpolation
-   * runs, and moving a declaration out of a loop rotates that order while
-   * leaving the count identical. Comparing them by position read "Buzz"
-   * against "2" and then '7' against '4' -- each pair the same size -- and
-   * reported hoist_body_locals as a miscompile on six programs it compiles
-   * correctly. One of those quarantines then became a compiler abort
-   * downstream, so the cost of the check was higher than a lost optimization.
-   *
-   * Nothing is given up that the program can observe. Heap bytes become
-   * observable by being returned, by reaching an extern -- where the trace
-   * above compares the pointee, not the pointer -- by landing in a global, or
-   * by being written into a buffer the harness registered. All four are
-   * compared. A pass that corrupts a heap buffer nothing ever reads has
-   * changed nothing anyone can see. */
 
   /* Extern-call trace: deletion, duplication, or reordering is a divergence. */
   size_t trace_a = ir_interp_extern_trace_count(before);
@@ -1411,13 +1354,6 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
        * the input is unusable; different fates on a trap is itself a
        * divergence (a pass must not add or remove traps). Fuel asymmetry is
        * inconclusive (vector kernels charge differently), so skip those. */
-      /* An access outside an object, or through a freed one, is the program
-       * being wrong rather than the program trapping: nothing defines what
-       * it does, so a pass that makes it disappear -- SROA promoting an array
-       * whose only out-of-range read is a constant negative index -- has
-       * removed no behavior anyone can appeal to. Inconclusive like fuel,
-       * where a runtime GUARD trap (the checks --safe inserts) is a real
-       * observation and is compared above. */
       int trap_before = outcome_before == IRV_RUN_SKIP &&
                         strstr(detail_before, "fuel") == NULL &&
                         strstr(detail_before, "out of bounds") == NULL;
@@ -1434,6 +1370,15 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
       }
       snprintf(last_unusable, sizeof(last_unusable), "%s",
                outcome_before != IRV_RUN_OK ? detail_before : detail_after);
+      ir_interp_destroy(machine_before);
+      ir_interp_destroy(machine_after);
+      continue;
+    }
+
+    if (ir_interp_read_undefined(machine_before) ||
+        ir_interp_read_undefined(machine_after)) {
+      snprintf(last_unusable, sizeof(last_unusable),
+               "read something nothing had written");
       ir_interp_destroy(machine_before);
       ir_interp_destroy(machine_after);
       continue;
@@ -1460,10 +1405,6 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
   }
 
   if (usable_inputs == 0) {
-    /* Name what stopped the last set. "no executable inputs" on its own says
-     * a function went unvalidated without saying whether the generated
-     * arguments were wrong for it, the body traps on everything, or it simply
-     * needs more fuel -- and those want different answers. */
     if (last_unusable[0]) {
       snprintf(result->skip_reason, sizeof(result->skip_reason),
                "no executable inputs (%s)", last_unusable);

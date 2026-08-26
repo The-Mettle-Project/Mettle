@@ -62,9 +62,6 @@ typedef struct {
    * changing how many objects a function builds; what the extern can observe
    * is the bytes, compared above. */
   unsigned char arg_is_pointer[8];
-  /* The interpreter answered this call itself. It is still recorded, because
-   * an output call is a side effect a pass must not delete or reorder, but
-   * the trace note must not report it as unmodelled. */
   unsigned char modelled;
 } IRInterpExternCall;
 
@@ -92,6 +89,8 @@ IRInterpStatus ir_interp_run(IRInterpMachine *machine, IRFunction *function,
 size_t ir_interp_buffer_count(const IRInterpMachine *machine);
 const unsigned char *ir_interp_buffer_data(const IRInterpMachine *machine,
                                            size_t index, long long *size);
+int ir_interp_read_undefined(const IRInterpMachine *machine);
+
 size_t ir_interp_extern_trace_count(const IRInterpMachine *machine);
 const IRInterpExternCall *ir_interp_extern_trace(const IRInterpMachine *machine,
                                                  size_t index);
@@ -101,31 +100,13 @@ const char *ir_interp_global_name(const IRInterpMachine *machine, size_t index);
 IRInterpValue ir_interp_global_value(const IRInterpMachine *machine,
                                      size_t index);
 
-/* If `value` addresses live interpreter memory, copy up to `capacity` bytes
- * from it into `out` and return how many; return -1 when it is not an address
- * at all. Any word inside the window that is itself an address is
- * canonicalized, because a buffer's numeric address is its allocation order
- * and a pass is free to change how many objects a function builds. What can be
- * observed through a pointer is the bytes, which is what this returns.
- * `capacity` must be a multiple of 8 for the canonicalization to cover the
- * whole window. */
 long long ir_interp_pointee_window(IRInterpMachine *machine,
                                    unsigned long long value,
                                    unsigned char *out, size_t capacity);
 
-/* The value a function's address has inside this machine: what `&f` yields and
- * what an indirect call resolves back through. Names a defined function or a
- * declared extern; 0 when neither exists. Lets a harness hand a function-typed
- * parameter something callable. */
 unsigned long long ir_interp_function_address(IRInterpMachine *machine,
                                               const char *name);
 
-/* Was buffer `index` created to hold a string literal's bytes? Literals are
- * materialized the first time a run reaches one, so which index a given
- * literal lands on depends on the order control flow happens to visit them --
- * an artifact of this machine, not something the program can observe. A
- * harness comparing two runs' allocations positionally has to leave them out.
- */
 int ir_interp_buffer_is_literal(const IRInterpMachine *machine, size_t index);
 
 /* Human-readable reason for the last non-OK status ("call_indirect",

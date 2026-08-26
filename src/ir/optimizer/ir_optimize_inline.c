@@ -631,10 +631,6 @@ static int ir_function_assigns_symbol(const IRFunction *function,
   return 0;
 }
 
-/* The callee returns an integer narrower than a register, so the value an
- * inlined RETURN hands back has to be wrapped the way the call's return
- * register would have wrapped it. int64/uint64 and everything that is not an
- * integer answer 0: there is nothing to wrap. */
 static int ir_inline_return_is_narrow_integer(const IRFunction *callee) {
   static const char *const NARROW[] = {"int32", "uint32", "int16",
                                        "uint16", "int8",  "uint8"};
@@ -650,8 +646,6 @@ static int ir_inline_return_is_narrow_integer(const IRFunction *callee) {
   return 0;
 }
 
-/* Byte width of a named integer type, and whether it is unsigned; 0 bytes for
- * anything that is not an integer. */
 static int ir_inline_integer_bytes(const char *type, int *is_unsigned) {
   static const struct {
     const char *name;
@@ -675,13 +669,6 @@ static int ir_inline_integer_bytes(const char *type, int *is_unsigned) {
   return 0;
 }
 
-/* A value of `src` bytes and signedness already sits inside a return type of
- * `dst` bytes when it cannot need any bit the return would have changed.
- * Matching signedness at no greater width is the plain case. An unsigned
- * source STRICTLY narrower than a signed return is the other one: its whole
- * range is positive there. A same-width signedness change is not: a uint32
- * returned as int32 has to sign-extend, and the 64-bit temp holds the
- * zero-extended number instead. */
 static int ir_inline_width_fits(int src_bytes, int src_unsigned, int dst_bytes,
                                 int dst_unsigned) {
   if (src_bytes <= 0 || dst_bytes <= 0 || src_bytes > dst_bytes) {
@@ -711,16 +698,6 @@ static const IRInstruction *ir_inline_sole_temp_def(const IRFunction *callee,
   return found;
 }
 
-/* Is this returned value already inside the return type, so that wrapping it
- * would change nothing?
- *
- * Adding a wrap that says nothing is not free: it stands between a loop body
- * and the recognizers that read it, and a clamp helper inlined into a fill
- * loop stopped being a clamp kernel for one. So the ordinary shapes -- a
- * parameter or local of the return type handed straight back, a literal, an
- * explicit cast the programmer wrote, a load of exactly that many bytes, a
- * comparison -- are proven narrow and left alone. Arithmetic is not: `a * b`
- * on two int32 values is where the 64-bit temp escapes the type. */
 static int ir_inline_value_fits_return(const IRFunction *callee,
                                        const IROperand *value, int bytes,
                                        int is_unsigned, int depth) {
@@ -770,8 +747,6 @@ static int ir_inline_value_fits_return(const IRFunction *callee,
                                   is_unsigned);
     }
     case IR_OP_LOAD:
-      /* A sub-word load lands in the temp already extended the way its own
-       * signedness says, so it stands in for a value of that width. */
       return def->rhs.kind == IR_OPERAND_INT && def->rhs.int_value > 0 &&
              def->rhs.int_value <= 8 &&
              ir_inline_width_fits((int)def->rhs.int_value,
@@ -780,7 +755,6 @@ static int ir_inline_value_fits_return(const IRFunction *callee,
       return ir_inline_value_fits_return(callee, &def->lhs, bytes, is_unsigned,
                                          depth + 1);
     case IR_OP_BINARY:
-      /* A comparison yields 0 or 1; everything else can leave the type. */
       return def->text &&
              (strcmp(def->text, "==") == 0 || strcmp(def->text, "!=") == 0 ||
               strcmp(def->text, "<") == 0 || strcmp(def->text, "<=") == 0 ||
@@ -882,13 +856,6 @@ static int ir_inline_call_instruction(IRInstructionVector *vector,
           call_instruction->dest.kind != IR_OPERAND_NONE) {
         emitted.op = IR_OP_ASSIGN;
         emitted.location = call_instruction->location;
-        /* A call to a narrow-integer function delivers its result in the
-         * matching part of a register, so what the caller reads back is
-         * already wrapped to the return type. An inlined body has no such
-         * boundary and a temp carries the full 64 bits, so the assign becomes
-         * a cast. Without it `fn f(a: int32, b: int32) -> int32 { return a *
-         * b; }` inlined at `f(65536, 65536) == 0` compared 4294967296 against
-         * zero and answered false, where the call answered true. */
         int ret_unsigned = 0;
         int ret_bytes =
             ir_inline_integer_bytes(callee->return_type_name, &ret_unsigned);

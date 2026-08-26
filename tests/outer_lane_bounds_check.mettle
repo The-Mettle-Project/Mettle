@@ -1,9 +1,5 @@
 import "std/io";
 
-/* The outer-loop lane vectorizer serializes the INNER comparison and nothing
- * for the outer one, so its kernel always runs `p < P`. Each shape below is
- * the same reduction written with a different pair of comparisons, checked
- * against the same sum accumulated so the vectorizer cannot claim it. */
 
 fn lanes(P: int64, N: int64, outer_le: int32, inner_le: int32) -> float64 {
   var total: float64 = 0.0;
@@ -51,8 +47,6 @@ fn lanes(P: int64, N: int64, outer_le: int32, inner_le: int32) -> float64 {
   return total;
 }
 
-/* The reference: one accumulator, no separable inner reduction, so no
- * recognizer claims it. `steps` counts the divides the shape performs. */
 fn reference(outer_trips: int64, inner_trips: int64) -> float64 {
   var total: float64 = 0.0;
   var p: int64 = 0;
@@ -85,7 +79,6 @@ fn main() -> int32 {
   bad = bad + check("lt/le", lanes(P, N, 0, 1), reference(P, N + 1));
   bad = bad + check("le/le", lanes(P, N, 1, 1), reference(P + 1, N + 1));
 
-  /* A zero-trip outer loop under `<=` still runs once. */
   bad = bad + check("le zero", lanes(0, N, 1, 0), reference(1, N));
 
   if (bad == 0) { println("outer lane bounds: OK"); }

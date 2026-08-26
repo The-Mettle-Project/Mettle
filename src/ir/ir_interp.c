@@ -13,6 +13,7 @@
 #include <string.h>
 
 #define II_ADDR_BASE 0x0000200000000000ULL
+#define II_POISON_BYTE 0xA5
 #define II_ADDR_STRIDE 0x0000000001000000ULL /* 16 MiB per buffer slot */
 #define II_MAX_BUFFERS 65536
 #define II_MAX_DEPTH 256
@@ -79,17 +80,7 @@ typedef struct {
      the full width. */
   int value_size;
   int value_is_unsigned;
-  /* The {chars, length} record a string DECLARE_LOCAL allocated for this
-     name. A string local's VALUE is an address, and an assignment replaces it
-     with someone else's record -- a literal's, or another local's -- so a
-     re-executed declaration must re-zero the record it owns rather than
-     whatever the value currently points at. Zeroing the latter rewrote the
-     string literal shared by every use of it. 0 = none allocated. */
   unsigned long long string_record;
-  /* Declared `cstring`/`rawptr`: a string literal assigned to one is its
-     CHARACTERS, where the same literal assigned to a `string` is its
-     {chars, length} record. The two are different addresses and only the
-     declaration says which is wanted. */
   unsigned char is_cstring;
 } IIVar;
 
@@ -153,6 +144,7 @@ struct IRInterpMachine {
   const IRFunction *value_hook_fn;
 
   int held_mutex_count;
+  int read_undefined;
   unsigned long long next_thread_handle;
 
   unsigned long long swap_slots[256];
@@ -648,6 +640,13 @@ static int ii_mem_read(IRInterpMachine *machine, unsigned long long addr,
   }
   unsigned long long value = 0;
   memcpy(&value, buf->data + offset, (size_t)size);
+  for (int b = 0; b < size; b++) {
+    if (buf->data[offset + b] != II_POISON_BYTE) {
+      *out = value;
+      return 1;
+    }
+  }
+  machine->read_undefined = 1;
   *out = value;
   return 1;
 }
@@ -801,10 +800,6 @@ static int ii_parse_local_type(const char *text, int *elem_size, long long *coun
     }
     memcpy(base, text, base_len);
     base[base_len] = '\0';
-    /* Accumulate rather than atoll: overflowing it is undefined, and the
-     * value it lands on can be small enough to pass the bound below, which
-     * would model a huge array as a one-element one. The cap is reached long
-     * before the accumulation could wrap. */
     long long n = 0;
     const char *digit = bracket + 1;
     if (*digit < '0' || *digit > '9') {
@@ -875,7 +870,6 @@ static IRInterpValue ii_float_value(double v) {
  * differential to a deleted initializing store (`@neg <- 0` in print_int was
  * exactly that). Deterministic, identical in both machines - only a transform
  * that changes WHETHER a read sees its initialization can diverge on it. */
-#define II_POISON_BYTE 0xA5
 static IRInterpValue ii_poison_value(void) {
   IRInterpValue value;
   value.i = (long long)0xA5A5A5A5A5A5A5A5ULL;
@@ -900,10 +894,23 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
                             IRInterpValue *result);
 
 /* Read a variable, honoring slot-backed locals. */
+static int ii_value_is_poison(const IRInterpValue *value) {
+  unsigned long long bits;
+  if (value->is_float) {
+    return 0;
+  }
+  bits = (unsigned long long)value->i;
+  return bits == 0xA5A5A5A5A5A5A5A5ULL || bits == 0xA5A5A5A5ULL ||
+         (long long)bits == (long long)(int)0xA5A5A5A5;
+}
+
 static int ii_var_read(IRInterpMachine *machine, IIVar *var,
                        IRInterpValue *out) {
   if (!var->slotted) {
     *out = var->value;
+    if (ii_value_is_poison(out)) {
+      machine->read_undefined = 1;
+    }
     return 1;
   }
   unsigned long long raw = 0;
@@ -946,17 +953,6 @@ static long long ii_narrow_int(long long v, int size, int is_unsigned) {
 
 static int ii_var_write(IRInterpMachine *machine, IIVar *var,
                         const IRInterpValue *value) {
-  /* A string local owns its {chars, length} record and assignment copies into
-   * it -- `string` moves like the two-field struct it is. Rebinding the
-   * local's value to the source's record instead made two locals share one:
-   *
-   *     var head: string = ""; var tail: string = "";
-   *
-   * both pointed at the ONE record behind the "" literal, so the sixteen-byte
-   * store that later wrote `head` wrote `tail` and the literal with it, and
-   * head read back whatever was assigned last. A source that is not a
-   * readable record (a null, or a value that is not an address) still just
-   * rebinds, which is what a freshly-declared local wants. */
   if (var->string_record && !value->is_float) {
     unsigned long long src = (unsigned long long)ii_as_int(value);
     long long src_off = 0;
@@ -1135,12 +1131,6 @@ static IIVar *ii_global_touch(IRInterpMachine *machine, const char *name) {
   }
   if (sym->has_initializer) {
     if (sym->init_is_float) {
-      /* A float initializer is always folded to a double's bit pattern,
-       * whatever the global's declared width; a float32 global's four-byte
-       * home then rounds it, which is what the emitter does. Reading the low
-       * half of the double as a float instead read noise -- and for any value
-       * whose mantissa is zero in that half, which is every ordinary literal,
-       * the noise was 0: `var Gw: float32 = 1.25;` came back as zero. */
       double d = 0;
       memcpy(&d, &sym->init_bits, 8);
       if (sym->type && sym->type->kind == MTLC_TYPE_FLOAT32) {
@@ -1251,13 +1241,6 @@ static unsigned long long ii_global_storage(IRInterpMachine *machine,
       }
       value = chars;
       if (reloc->string_wants_record) {
-        /* The field IS the {chars, length} record, sixteen bytes at the
-         * field's own offset -- the pointer here and the length beside it,
-         * which is what the emitter writes and what every read of such a
-         * field expects. Storing the record's ADDRESS instead left the
-         * pointer half wrong and the length half whatever the folded image
-         * had, so `VH.s.length` on a struct global with a string field read 0
-         * where the program reads 6. */
         unsigned long long length = (unsigned long long)strlen(reloc->string);
         long long len_off = 0;
         IIBuffer *len_buf = ii_addr_to_buffer(
@@ -1330,6 +1313,10 @@ static int ii_fetch(IRInterpMachine *machine, IIFrame *frame,
     if (!operand->name) {
       *out = ii_int_value(0);
       return 1;
+    }
+    if (operand->kind == IR_OPERAND_TEMP &&
+        !ii_env_find(&frame->env, operand->name)) {
+      machine->read_undefined = 1;
     }
     IIVar *var = ii_resolve(machine, frame, operand);
     if (!var) {
@@ -1608,16 +1595,6 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
 
 /* ---------------- extern model ---------------- */
 
-/* The math externs, computed with the SAME kernels the program links against
- * on a freestanding target rather than modelled as zero.
- *
- * A program calling sqrtf got 0 back and every value downstream of it was
- * wrong: tests/test_runtime_float_math.mettle interpreted to 1 where it runs
- * to 0, and a function computing 1.0/sqrtf(x) interpreted an infinity. These
- * are total functions of their arguments with no memory effects, so there is
- * nothing to model -- and because src/runtime/mt_math.h is the same code
- * `extern fn expf(..) = "expf"` reaches at run time, the answer here is the
- * program's answer, not an approximation of it. */
 static int ii_extern_math(const char *name, const IRInterpValue *args,
                           size_t arg_count, IRInterpValue *out) {
   double x = 0.0;
@@ -1697,12 +1674,6 @@ long long ir_interp_pointee_window(IRInterpMachine *machine,
   }
   take = avail < (long long)capacity ? avail : (long long)capacity;
   memcpy(out, buf->data + offset, (size_t)take);
-  /* A word inside the window that is itself an address is not an observation:
-   * a string literal's buffer holds its characters and then the {chars,
-   * length} record, so the window behind a `cstring` carries the literal's own
-   * address, and that address is the buffer's index. Canonicalize every word
-   * that resolves to live memory; a pointer that stopped being one still
-   * shows up as a difference. */
   for (long long w = 0; w + 8 <= take; w++) {
     unsigned long long word = 0;
     long long unused = 0;
@@ -1865,10 +1836,6 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
                           IRInterpValue *result) {
   *result = ii_int_value(0);
 
-  /* Match on the LINKAGE name, which is the function that actually runs.
-   * `extern fn strlen_c(msg: cstring) -> int64 = "strlen";` calls strlen,
-   * and the model has strlen -- but keyed on the source spelling it matched
-   * nothing, answered 0, and every length computed from it was wrong. */
   {
     const IRModuleSymbol *sym = ii_symbol(machine, name);
     if (sym && sym->link_name && sym->link_name[0]) {
@@ -1900,11 +1867,6 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     *result = ii_int_value((long long)addr);
     return 1;
   }
-  /* The interlocked helpers std/thread is built on. With one thread of
-   * execution each is just the operation it names, performed exactly, and
-   * each returns the value the target held BEFORE it -- which is the whole
-   * contract callers rely on. Modelling them as 0 made a compare-and-swap
-   * report that it had failed on a target it had never read. */
   if (arg_count >= 1 && strncmp(name, "mettle_atomic_", 14) == 0) {
     unsigned long long target = (unsigned long long)ii_as_int(&args[0]);
     unsigned long long prior = 0;
@@ -1927,14 +1889,12 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
       } else if (strcmp(name, "mettle_atomic_dec_i32") == 0) {
         next = (int)((unsigned int)before - 1u);
       } else {
-        return 0; /* an atomic this does not know: fall through to the trace */
+        return 0;
       }
       if (next != before &&
           !ii_mem_write(machine, target, 4, (unsigned long long)(unsigned int)next)) {
         return -1;
       }
-      /* inc/dec answer the NEW value, the interlocked add's return; the other
-       * two answer the old one. */
       *result = ii_int_value(
           (strcmp(name, "mettle_atomic_inc_i32") == 0 ||
            strcmp(name, "mettle_atomic_dec_i32") == 0)
@@ -2164,12 +2124,6 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     return 1;
   }
 
-  /* The anonymous-memory primitives std/osmem builds os_mem_map on: mmap with
-   * MAP_ANONYMOUS on Linux, VirtualAlloc with MEM_COMMIT on Windows. Both hand
-   * back zeroed pages, which is calloc with a different spelling. Without them
-   * std/alloc's own allocator got 0 for every mapping and no program using
-   * --native-heap, an arena, or a string builder could be interpreted at all.
-   * The length is the second argument in both. */
   if ((strcmp(name, "mmap") == 0 && arg_count >= 2) ||
       (strcmp(name, "VirtualAlloc") == 0 && arg_count >= 2)) {
     long long size = ii_as_int(&args[1]);
@@ -2179,7 +2133,6 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     }
     addr = ir_interp_add_buffer(machine, NULL, size);
     if (!addr) {
-      /* Out of buffers is a failed mapping, which callers already handle. */
       *result = ii_int_value(strcmp(name, "mmap") == 0 ? -1 : 0);
       return 1;
     }
@@ -2664,10 +2617,6 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
   return machine->status == IR_INTERP_OK ? 0 : -1;
 }
 
-/* One outer-lane "uniform program": a linear chain over the loop index,
- * evaluated in the integer domain until OL_U_CVT switches it to float. The op
- * codes are the contract in ir_optimize_simd_float.c; an unknown one leaves
- * the value alone, which cannot happen for IR this pass produced. */
 static double ii_outer_lane_uniform(const IRInstruction *insn, size_t prog,
                                     size_t fconst_at, long long n_fconst,
                                     long long index) {
@@ -2684,19 +2633,19 @@ static double ii_outer_lane_uniform(const IRInstruction *insn, size_t prog,
       k = insn->arguments[fconst_at + (size_t)imm].float_value;
     }
     switch (op) {
-    case 1: iv &= imm; break;                       /* AND */
-    case 2: iv |= imm; break;                       /* OR  */
-    case 3: iv ^= imm; break;                       /* XOR */
-    case 4: iv += imm; break;                       /* ADD */
-    case 5: iv -= imm; break;                       /* SUB */
-    case 6: iv *= imm; break;                       /* MUL */
+    case 1: iv &= imm; break;
+    case 2: iv |= imm; break;
+    case 3: iv ^= imm; break;
+    case 4: iv += imm; break;
+    case 5: iv -= imm; break;
+    case 6: iv *= imm; break;
     case 7: iv = (long long)((unsigned long long)iv << imm); break;
-    case 8: iv >>= imm; break;                      /* SHR */
-    case 9: fv = (double)iv; in_float = 1; break;   /* CVT */
-    case 10: fv += k; break;                        /* FADD */
-    case 11: fv -= k; break;                        /* FSUB */
-    case 12: fv *= k; break;                        /* FMUL */
-    case 13: fv /= k; break;                        /* FDIV */
+    case 8: iv >>= imm; break;
+    case 9: fv = (double)iv; in_float = 1; break;
+    case 10: fv += k; break;
+    case 11: fv -= k; break;
+    case 12: fv *= k; break;
+    case 13: fv /= k; break;
     default: break;
     }
   }
@@ -2939,11 +2888,6 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
         }
       }
       machine->fuel -= bound > start ? bound - start : 0;
-      /* A loop counter still read after the loop: the kernel leaves it at
-       * max(start, bound), which is what the unit-stride loop leaves and is
-       * right for an empty loop too. The emitter writes this back; without
-       * it here, a fill whose counter is live read as a behavior change and
-       * the pass was quarantined for a program it compiles correctly. */
       if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
         long long final_value = bound > start ? bound : start;
         int wide = insn->argument_count > 5 &&
@@ -2997,8 +2941,6 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
         steps++;
       }
       machine->fuel -= steps;
-      /* Byte-offset walk with a live counter: the emitter leaves it at
-       * start plus the bytes walked. */
       if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
         IRInterpValue out = ii_int_value(off);
         if (!ii_store_dest(machine, frame, &insn->dest, &out)) {
@@ -3441,21 +3383,6 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
   }
 
   case IR_OP_SIMD_OUTER_LANE_F64: {
-    /* Outer-loop lane vectorization of a float64 reduction. The kernel runs
-     * four outer iterations in lockstep to hide the inner recurrence's
-     * latency, and is documented bit-exact against the scalar loop it
-     * replaced -- so the scalar loop IS the model, and running it here is
-     * both simplest and exactly right.
-     *
-     * Serialized layout, mirroring ir_outer_vectorize_pass:
-     *   [0] inner comparison (0: <, 1: <=)   [1] inner step
-     *   [2] chain step count                 [3] uniform program count
-     *   [4] float constant count             [5] inner start index
-     *   [6] seed mode                        [7] seed constant (FLOAT)
-     * then 4 ints per chain step; then each uniform program as a micro count
-     * followed by that many (op, imm) pairs; then, when the seed mode is 1,
-     * the seed program in the same shape; then the float constants.
-     * dest = the accumulator, lhs = outer trip count, rhs = inner bound. */
     enum { OL_ADD = 0, OL_SUB = 1, OL_MUL = 2, OL_DIV = 3 };
     if (insn->argument_count < 8) {
       ii_fail(machine, IR_INTERP_UNSUPPORTED, "outer_lane arity");
@@ -3480,7 +3407,6 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
       ii_fail(machine, IR_INTERP_UNSUPPORTED, "outer_lane encoding");
       return 0;
     }
-    /* Walk the variable-length tail once to find where each section starts. */
     size_t at = 8;
     size_t chain_at = at;
     at += (size_t)(4 * n_chain);
@@ -3934,11 +3860,6 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       }
     }
     var->value = args[i];
-    /* A `string` parameter is passed by value: the callee gets its own copy
-     * of the {chars, length} record, so writing s.length in the callee does
-     * not reach into the caller's. Binding the caller's address straight
-     * through aliased the two -- `shorten(a)` setting s.length to 2 left the
-     * caller's `a` two characters long. */
     if (fn->parameter_types && fn->parameter_types[i] &&
         strcmp(fn->parameter_types[i], "string") == 0 &&
         !var->value.is_float && var->value.i != 0) {
@@ -4124,11 +4045,6 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         goto done;
       }
       const MtlcType *vt = insn->value_type;
-      /* A named type the instruction did not carry resolved: ask the module
-       * type registry. Monomorphizing a generic produces names like
-       * `Option__int64` that nothing here can parse and that the lowering
-       * does not always attach a type to, and without this every function
-       * holding one was unverifiable -- std/str alone has four. */
       if (!vt && insn->text && machine->program) {
         vt = ir_program_lookup_type(machine->program, insn->text);
       }
@@ -4310,12 +4226,6 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
 
     case IR_OP_ASSIGN: {
       IRInterpValue value;
-      /* A string literal assigned to a `cstring` is its CHARACTERS; the same
-       * literal assigned to a `string` is its {chars, length} record. Only
-       * the destination's declaration says which, and taking the record for
-       * both made `local = "ok"` point a cstring at the record, so local[0]
-       * read a byte of the pointer rather than 'o'. The call path already
-       * chose between them this way for arguments. */
       if (insn->lhs.kind == IR_OPERAND_STRING && insn->lhs.name &&
           insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
         IIVar *dest = ii_env_find(&frame.env, insn->dest.name);
@@ -4699,12 +4609,6 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
           !ii_fetch(machine, &frame, &insn->lhs, &value)) {
         goto done;
       }
-      /* The return register carries the return type's width, so what the
-       * caller reads back is already wrapped -- the same transfer the
-       * parameter homing above models on the way in. Without this the
-       * interpreter answered `mul32(65536, 65536) == 0` false where the
-       * program answers true, and every narrowing a pass might drop looked
-       * correct to the verifier. */
       {
         int rsize = 8, rfloat = 0, runsigned = 0;
         long long rcount = 1;
@@ -4905,6 +4809,10 @@ const unsigned char *ir_interp_buffer_data(const IRInterpMachine *machine,
     *size = machine->buffers[index].size;
   }
   return machine->buffers[index].data;
+}
+
+int ir_interp_read_undefined(const IRInterpMachine *machine) {
+  return machine ? machine->read_undefined : 0;
 }
 
 size_t ir_interp_extern_trace_count(const IRInterpMachine *machine) {

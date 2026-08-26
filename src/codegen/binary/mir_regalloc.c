@@ -2171,13 +2171,6 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
    * hold the same value at the copy point and the freed-register check preserves
    * graph legality -- so it can never change behaviour, only remove a move.
    * Iterated to a fixpoint so a recoloured dst can in turn feed the next copy. */
-  /* Bounded, because the rewrite is not monotone: a vreg written by two
-   * different copies is pulled toward one source's register and then the
-   * other's, and each move makes the other copy eligible again. The colouring
-   * is legal after every single rewrite, so stopping early only leaves a move
-   * behind -- where running forever hangs the compiler, which is what a
-   * three-armed inlined `clamp` in a register-hungry function did. Sixteen
-   * rounds is far past what a converging chain of copies needs. */
   int coalesced = 1;
   int coalesce_rounds = 0;
   while (coalesced && coalesce_rounds++ < 16) {
