@@ -1,0 +1,111 @@
+// `v < LO || v > HI` is answered as one unsigned compare against HI - LO, after
+// subtracting LO. Values below LO wrap to a huge unsigned value, which is what
+// makes one compare cover both bounds.
+//
+// Every classification below is checked against the same test written so the
+// fold cannot reach it (the bounds arrive as parameters), across the boundary
+// values, negatives, and both ways the source spells the branch: a `continue`
+// that falls through and a `break` that jumps away.
+import "std/io";
+
+@noinline fn opaque_out_of_range(v: int32, lo: int32, hi: int32) -> int32 {
+  if (v < lo) {
+    return 1;
+  }
+  if (v > hi) {
+    return 1;
+  }
+  return 0;
+}
+
+fn folded_continue(data: int32*, n: int32) -> int32 {
+  var kept: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    var c: int32 = data[i];
+    if (c < 97 || c > 122) {
+      i += 1;
+      continue;
+    }
+    kept = kept + c;
+    i += 1;
+  }
+  return kept;
+}
+
+fn folded_break(data: int32*, n: int32) -> int32 {
+  var seen: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    var d: int32 = data[i];
+    if (d < 97 || d > 122) {
+      break;
+    }
+    seen = seen + 1;
+    i += 1;
+  }
+  return seen;
+}
+
+// A range one value wide, and one starting at zero, where the wrap is the whole
+// content of the fold.
+fn folded_single(v: int32) -> int32 {
+  if (v < 5 || v > 5) {
+    return 0;
+  }
+  return 1;
+}
+
+fn folded_from_zero(v: int32) -> int32 {
+  if (v < 0 || v > 9) {
+    return 0;
+  }
+  return 1;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  var v: int32 = 0 - 300;
+  while (v <= 300) {
+    var got: int32 = 0;
+    if (v < 97 || v > 122) {
+      got = 1;
+    }
+    if (got != opaque_out_of_range(v, 97, 122)) {
+      println("range 97..122 disagreed at {v}");
+      bad = bad + 1;
+    }
+    if (folded_single(v) != (1 - opaque_out_of_range(v, 5, 5))) {
+      println("single 5 disagreed at {v}");
+      bad = bad + 1;
+    }
+    if (folded_from_zero(v) != (1 - opaque_out_of_range(v, 0, 9))) {
+      println("range 0..9 disagreed at {v}");
+      bad = bad + 1;
+    }
+    v = v + 1;
+  }
+
+  // The loop forms, over a buffer that crosses every boundary.
+  var buf: int32[12];
+  buf[0] = 97; buf[1] = 122; buf[2] = 96; buf[3] = 123;
+  buf[4] = 0; buf[5] = 0 - 1; buf[6] = 110; buf[7] = 2147483647;
+  buf[8] = 0 - 2147483648; buf[9] = 98; buf[10] = 99; buf[11] = 100;
+
+  // kept = 97 + 122 + 110 + 98 + 99 + 100
+  if (folded_continue(&buf[0], 12) != 626) {
+    println("folded_continue = {folded_continue(&buf[0], 12)}, wanted 626");
+    bad = bad + 1;
+  }
+  // stops at index 2 (96)
+  if (folded_break(&buf[0], 12) != 2) {
+    println("folded_break = {folded_break(&buf[0], 12)}, wanted 2");
+    bad = bad + 1;
+  }
+
+  println("range fold mismatches = {bad}");
+  if (bad != 0) {
+    return 1;
+  }
+  return 0;
+}

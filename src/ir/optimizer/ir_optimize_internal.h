@@ -464,6 +464,7 @@ int ir_select_adjacent_field_pass(IRFunction *function, int *changed);
 
 int ir_or_chain_to_bitset_pass(IRFunction *function, int *changed);
 int ir_ascii_casefold_range_pass(IRFunction *function, int *changed);
+int ir_fold_range_test_pass(IRFunction *function, int *changed);
 int ir_float_divide_by_power_of_two_pass(IRFunction *function, int *changed);
 /* `(int32)buf[i]` on an unsigned narrow element: the load already put the
  * whole value in the register. */

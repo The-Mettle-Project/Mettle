@@ -2471,6 +2471,196 @@ static int ir_ascii_casefold_rewrite(IRFunction *function,
  * other incoming edge and every compare result must feed only its branch.
  * These checks make deleting the second range safe even after inlining and
  * earlier control flow rewrites. */
+/* `v < LO || v > HI` answered as one unsigned compare.
+ *
+ * Subtracting the low bound folds the two bounds into one: the values in
+ * range land in 0..HI-LO, and everything else -- including everything below
+ * LO, which wraps to a huge unsigned value -- lands above it. So a pair of
+ * signed compares with a branch each becomes a subtract, one unsigned
+ * compare, and one branch.
+ *
+ * word_freq tests `c < 97 || c > 122` once per byte of its document, in two
+ * places, and json_parse tests `c < 48 || c > 57` three times in
+ * scan_number. This runs AFTER ascii_casefold_range, which claims the
+ * two-range `A-Z or a-z` shape and produces something better than this
+ * would.
+ *
+ * The shape, as the short-circuit `||` lowers it:
+ *
+ *     %t   = v < LO
+ *     branch_zero %t -> ELSE
+ *     jump BODY
+ *   ELSE:
+ *     %t2  = v > HI
+ *     branch_zero %t2 -> SKIP
+ *   BODY:
+ *
+ * becomes
+ *
+ *     %s   = v - LO
+ *     %t   = %s >u (HI - LO)
+ *     branch_zero %t -> SKIP
+ *   BODY:
+ */
+/* How many jumps and branches name this label. */
+static size_t ir_label_reference_count(const IRFunction *function,
+                                       const char *name) {
+  size_t n = 0;
+  if (!name) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if ((in->op == IR_OP_JUMP || in->op == IR_OP_BRANCH_ZERO ||
+         in->op == IR_OP_BRANCH_EQ) &&
+        in->text && strcmp(in->text, name) == 0) {
+      n++;
+    }
+  }
+  return n;
+}
+
+static int ir_range_test_is_foldable(const IRInstruction *lo,
+                                     const IRInstruction *hi) {
+  if (lo->op != IR_OP_BINARY || hi->op != IR_OP_BINARY || lo->is_float ||
+      hi->is_float || !lo->text || !hi->text) {
+    return 0;
+  }
+  if (strcmp(lo->text, "<") != 0 || strcmp(hi->text, ">") != 0) {
+    return 0;
+  }
+  if (lo->rhs.kind != IR_OPERAND_INT || hi->rhs.kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  /* An unsigned dividend would already compare unsigned, and the wrap the
+   * fold relies on is only equivalent for a signed one. */
+  if (lo->is_unsigned || hi->is_unsigned) {
+    return 0;
+  }
+  if (lo->rhs.int_value > hi->rhs.int_value) {
+    return 0; /* empty range: the fold would invert it */
+  }
+  if (hi->rhs.int_value - lo->rhs.int_value > 2147483646LL) {
+    return 0; /* the span has to stay inside the compare's width */
+  }
+  if (lo->dest.kind != IR_OPERAND_TEMP || hi->dest.kind != IR_OPERAND_TEMP) {
+    return 0;
+  }
+  if (lo->lhs.kind != IR_OPERAND_TEMP && lo->lhs.kind != IR_OPERAND_SYMBOL) {
+    return 0;
+  }
+  return ir_operand_equals(&lo->lhs, &hi->lhs);
+}
+
+int ir_fold_range_test_pass(IRFunction *function, int *changed) {
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  for (size_t i = 0; i + 6 < function->instruction_count; i++) {
+    size_t at[7];
+    at[0] = i;
+    if (function->instructions[at[0]].op != IR_OP_BINARY) {
+      continue;
+    }
+    {
+      int ok = 1;
+      for (size_t k = 1; k < 7 && ok; k++) {
+        ok = ir_ascii_next(function, at[k - 1] + 1, &at[k]);
+      }
+      if (!ok) {
+        continue;
+      }
+    }
+    {
+      IRInstruction *lo = &function->instructions[at[0]];
+      IRInstruction *lo_branch = &function->instructions[at[1]];
+      IRInstruction *shortcut = &function->instructions[at[2]];
+      IRInstruction *else_label = &function->instructions[at[3]];
+      IRInstruction *hi = &function->instructions[at[4]];
+      IRInstruction *hi_branch = &function->instructions[at[5]];
+      IRInstruction *body_label = &function->instructions[at[6]];
+      long long span;
+
+      if (lo_branch->op != IR_OP_BRANCH_ZERO ||
+          !ir_operand_is_temp_named(&lo_branch->lhs, lo->dest.name) ||
+          !lo_branch->text) {
+        continue;
+      }
+      if (shortcut->op != IR_OP_JUMP || !shortcut->text) {
+        continue;
+      }
+      if (else_label->op != IR_OP_LABEL || !else_label->text ||
+          strcmp(else_label->text, lo_branch->text) != 0) {
+        continue;
+      }
+      if (hi_branch->op != IR_OP_BRANCH_ZERO ||
+          !ir_operand_is_temp_named(&hi_branch->lhs, hi->dest.name) ||
+          !hi_branch->text) {
+        continue;
+      }
+      /* Whatever control reaches when the high test passes has to be the
+       * same place the short-circuit jumped to. It is spelled two ways: the
+       * body's label sits right there (`if (...) { ... }`), or the body is
+       * itself a jump to the same target, which is how a `break` lowers. */
+      if (!body_label->text ||
+          (body_label->op != IR_OP_LABEL && body_label->op != IR_OP_JUMP) ||
+          strcmp(body_label->text, shortcut->text) != 0) {
+        continue;
+      }
+      /* The short-circuit's own label is about to go. Anything else that
+       * branches to it would land on the compare and read a subtraction that
+       * never happened on its path. */
+      if (ir_label_reference_count(function, else_label->text) != 1) {
+        continue;
+      }
+      if (!ir_range_test_is_foldable(lo, hi)) {
+        continue;
+      }
+      /* The short-circuit block must hold nothing but its jump, or the
+       * fold would drop whatever else it does. ir_ascii_next already
+       * skipped the nops, so adjacency in the index array says so. */
+      span = hi->rhs.int_value - lo->rhs.int_value;
+
+      {
+        long long low = lo->rhs.int_value;
+        IROperand value = ir_operand_copy(&lo->lhs);
+        char *sub_text = mettle_strdup("-");
+        char *cmp_text = mettle_strdup(">");
+        if (!sub_text || !cmp_text) {
+          ir_operand_destroy(&value);
+          mettle_free_string(sub_text);
+          mettle_free_string(cmp_text);
+          return 0;
+        }
+        /* lo becomes the subtract, hi becomes the unsigned compare. */
+        mettle_free_string(lo->text);
+        lo->text = sub_text;
+        ir_operand_destroy(&lo->rhs);
+        lo->rhs = ir_operand_int(low);
+
+        mettle_free_string(hi->text);
+        hi->text = cmp_text;
+        ir_operand_destroy(&hi->lhs);
+        hi->lhs = ir_operand_copy(&lo->dest);
+        ir_operand_destroy(&hi->rhs);
+        hi->rhs = ir_operand_int(span);
+        hi->is_unsigned = 1;
+        ir_operand_destroy(&value);
+      }
+
+      /* The low branch, its short-circuit jump and the else label all go:
+       * the single compare that replaced them falls straight into the
+       * branch that used to test the high bound. */
+      ir_instruction_make_nop(&function->instructions[at[1]]);
+      ir_instruction_make_nop(&function->instructions[at[2]]);
+      ir_instruction_make_nop(&function->instructions[at[3]]);
+      if (changed) {
+        *changed = 1;
+      }
+    }
+  }
+  return 1;
+}
 int ir_ascii_casefold_range_pass(IRFunction *function, int *changed) {
   IRTempUseMap uses;
   int local_changed = 0;

@@ -1625,6 +1625,21 @@ $cases = @(
     ShouldSucceed = $true
   },
   @{
+    # A two-bound range test folded to one unsigned compare after subtracting
+    # the low bound. Checked against the same test written so the fold cannot
+    # reach it, over 601 values including both int32 extremes, and over both
+    # the fall-through (continue) and jump-away (break) spellings.
+    Name          = "range_fold"
+    Path          = "tests/range_fold_check.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+  },
+  @{
+    Name          = "range_fold_debug"
+    Path          = "tests/range_fold_check.mettle"
+    ShouldSucceed = $true
+  },
+  @{
     # Interpolation passes a float's raw bits in a GP register, so the
     # encoder has to cross the bank with movq. It used to read the vreg's
     # physical number as a GP register, and XMM0 and RAX are both 0, so

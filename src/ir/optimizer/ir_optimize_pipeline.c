@@ -168,6 +168,10 @@ static const IROptNamedPass g_ir_lowering_cleanup[] = {
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
     {"ascii_casefold_range", ir_ascii_casefold_range_pass,
      {IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
+    /* After the casefold pass, which claims the two-range letter test and
+     * produces something better than a single subtract-and-compare. */
+    {"fold_range_test", ir_fold_range_test_pass,
+     {IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
     {"or_chain_bitset", ir_or_chain_to_bitset_pass,
      {IR_OPT_FEATURE_BRANCH_EQ | IR_OPT_FEATURE_BRANCH_ZERO,
       IR_OPT_REQUIRE_NONE}},
