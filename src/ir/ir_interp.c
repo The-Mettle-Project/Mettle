@@ -1891,6 +1891,40 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     *result = ii_int_value((long long)addr);
     return 1;
   }
+  /* The anonymous-memory primitives std/osmem builds os_mem_map on: mmap with
+   * MAP_ANONYMOUS on Linux, VirtualAlloc with MEM_COMMIT on Windows. Both hand
+   * back zeroed pages, which is calloc with a different spelling. Without them
+   * std/alloc's own allocator got 0 for every mapping and no program using
+   * --native-heap, an arena, or a string builder could be interpreted at all.
+   * The length is the second argument in both. */
+  if ((strcmp(name, "mmap") == 0 && arg_count >= 2) ||
+      (strcmp(name, "VirtualAlloc") == 0 && arg_count >= 2)) {
+    long long size = ii_as_int(&args[1]);
+    unsigned long long addr = 0;
+    if (size <= 0 || size > II_MAX_BUFFER_SIZE) {
+      return -1;
+    }
+    addr = ir_interp_add_buffer(machine, NULL, size);
+    if (!addr) {
+      /* Out of buffers is a failed mapping, which callers already handle. */
+      *result = ii_int_value(strcmp(name, "mmap") == 0 ? -1 : 0);
+      return 1;
+    }
+    *result = ii_int_value((long long)addr);
+    return 1;
+  }
+  if ((strcmp(name, "munmap") == 0 && arg_count >= 1) ||
+      (strcmp(name, "VirtualFree") == 0 && arg_count >= 1)) {
+    unsigned long long addr = (unsigned long long)ii_as_int(&args[0]);
+    long long offset = 0;
+    IIBuffer *buf = addr ? ii_addr_to_buffer(machine, addr, 0, &offset) : NULL;
+    if (buf && offset == 0) {
+      ii_reclaim_buffer(machine,
+                        (size_t)((buf->base - II_ADDR_BASE) / II_ADDR_STRIDE));
+    }
+    *result = ii_int_value(0);
+    return 1;
+  }
   if (strcmp(name, "free") == 0 && arg_count == 1) {
     unsigned long long addr = (unsigned long long)ii_as_int(&args[0]);
     if (addr == 0) {
