@@ -2540,7 +2540,12 @@ static int ir_range_test_is_foldable(const IRInstruction *lo,
   if (lo->rhs.int_value > hi->rhs.int_value) {
     return 0; /* empty range: the fold would invert it */
   }
-  if (hi->rhs.int_value - lo->rhs.int_value > 2147483646LL) {
+  /* Taken unsigned: the bounds are ordered, so this is their exact distance,
+   * where the signed subtraction would overflow on a pair of extreme literals
+   * and read as a small span. */
+  if ((unsigned long long)hi->rhs.int_value -
+          (unsigned long long)lo->rhs.int_value >
+      2147483646ULL) {
     return 0; /* the span has to stay inside the compare's width */
   }
   if (lo->dest.kind != IR_OPERAND_TEMP || hi->dest.kind != IR_OPERAND_TEMP) {
@@ -2553,8 +2558,22 @@ static int ir_range_test_is_foldable(const IRInstruction *lo,
 }
 
 int ir_fold_range_test_pass(IRFunction *function, int *changed) {
+  IRTempUseMap uses;
   if (!function || function->instruction_count == 0) {
     return 1;
+  }
+  /* The low compare's temp stops holding a truth value and starts holding
+   * `v - LO`, and the high compare's stops meaning `v > HI` and starts
+   * meaning out-of-range. Either one read anywhere but by its own branch
+   * would read the new meaning. */
+  if (!ir_temp_use_map_init(&uses)) {
+    return 1;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (!ir_collect_instruction_temp_uses(&uses, &function->instructions[i])) {
+      ir_temp_use_map_destroy(&uses);
+      return 1;
+    }
   }
   for (size_t i = 0; i + 6 < function->instruction_count; i++) {
     size_t at[7];
@@ -2616,6 +2635,10 @@ int ir_fold_range_test_pass(IRFunction *function, int *changed) {
       if (!ir_range_test_is_foldable(lo, hi)) {
         continue;
       }
+      if (ir_temp_use_map_get(&uses, lo->dest.name) != 1 ||
+          ir_temp_use_map_get(&uses, hi->dest.name) != 1) {
+        continue;
+      }
       /* The short-circuit block must hold nothing but its jump, or the
        * fold would drop whatever else it does. ir_ascii_next already
        * skipped the nops, so adjacency in the index array says so. */
@@ -2659,6 +2682,7 @@ int ir_fold_range_test_pass(IRFunction *function, int *changed) {
       }
     }
   }
+  ir_temp_use_map_destroy(&uses);
   return 1;
 }
 int ir_ascii_casefold_range_pass(IRFunction *function, int *changed) {
