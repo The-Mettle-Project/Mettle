@@ -1149,6 +1149,7 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
   int usable_inputs = 0;
   int stats = irv_stats_enabled();
   const int harvested = harvest ? harvest->count : 0;
+  char last_unusable[128] = "";
   for (int run = 0; run < IRV_INPUT_RUNS + harvested; run++) {
     double t0 = stats ? irv_now_ms() : 0.0;
     IRInterpMachine *machine_before = ir_interp_create(program);
@@ -1256,6 +1257,8 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
                  trap_after ? detail_after : detail_before);
         goto divergence;
       }
+      snprintf(last_unusable, sizeof(last_unusable), "%s",
+               outcome_before != IRV_RUN_OK ? detail_before : detail_after);
       ir_interp_destroy(machine_before);
       ir_interp_destroy(machine_after);
       continue;
@@ -1282,8 +1285,17 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
   }
 
   if (usable_inputs == 0) {
-    snprintf(result->skip_reason, sizeof(result->skip_reason),
-             "no executable inputs (traps/fuel on all sets)");
+    /* Name what stopped the last set. "no executable inputs" on its own says
+     * a function went unvalidated without saying whether the generated
+     * arguments were wrong for it, the body traps on everything, or it simply
+     * needs more fuel -- and those want different answers. */
+    if (last_unusable[0]) {
+      snprintf(result->skip_reason, sizeof(result->skip_reason),
+               "no executable inputs (%s)", last_unusable);
+    } else {
+      snprintf(result->skip_reason, sizeof(result->skip_reason),
+               "no executable inputs (traps/fuel on all sets)");
+    }
     return IRV_CHECK_NO_INPUT;
   }
   return IRV_CHECK_VALIDATED;
