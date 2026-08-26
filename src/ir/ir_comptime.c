@@ -579,6 +579,39 @@ int ir_comptime_trace(IRProgram *program, ErrorReporter *reporter,
   }
 
   printf("\n");
+  /* Every extern the interpreter could not model answered 0, and those are
+   * exactly the calls it recorded. Saying so matters: tracing a function that
+   * calls sqrtf prints a confident number computed from 1.0/0, and without
+   * this line nothing tells the reader the run diverged from the program. */
+  {
+    size_t traced = ir_interp_extern_trace_count(machine);
+    size_t named = 0;
+    for (size_t t = 0; t < traced; t++) {
+      const IRInterpExternCall *call = ir_interp_extern_trace(machine, t);
+      int seen = 0;
+      if (!call) {
+        continue;
+      }
+      for (size_t earlier = 0; earlier < t && !seen; earlier++) {
+        const IRInterpExternCall *prev =
+            ir_interp_extern_trace(machine, earlier);
+        seen = prev && strcmp(prev->name, call->name) == 0;
+      }
+      if (seen) {
+        continue;
+      }
+      if (named == 0) {
+        printf("%snote%s: no model for %s", dim, reset, call->name);
+      } else {
+        printf(", %s", call->name);
+      }
+      named++;
+    }
+    if (named > 0) {
+      printf(" -- each answered 0, so the values below may differ from a"
+             " real run\n\n");
+    }
+  }
   switch (status) {
   case IR_INTERP_OK: {
     char value[48];
