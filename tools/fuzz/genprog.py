@@ -49,6 +49,11 @@ DETERMINISM RULES (why a divergence is always a real miscompile):
     counts < width; divisors are nonzero (constants, or `| 1`-forced).
     Exception: uint32 in stmt_u32wrap wraps freely -- unsigned wrap mod
     2^width is defined semantics, so it is still deterministic
+  - a narrow RETURN TYPE wraps its value to that width by definition (it is
+    what the return register carries), so the narrow-return helpers in
+    stmt_narrow_call let their arithmetic overflow on purpose. That is the
+    shape an inlined body used to lose: with no call boundary the temp kept
+    all 64 bits and the comparison behind it read the unwrapped number
   - struct fields and arrays are always fully written before any read
 """
 
@@ -70,6 +75,7 @@ class Gen:
         self.unary_helpers = []      # names of 1-param int64 helpers
         self.applier = None          # fn(fn(int64)->int64, int64) -> int64
         self.float_helpers = {}      # kind -> name
+        self.narrow_helpers = []     # (name, type, nparams) narrow-return
         self.kernels = {}            # kind -> name (pointer-param SIMD bait)
         self.structs = []            # dicts: name, fields, make, fold
         self.globals = []            # (name, pure_reader_name_or_None)
@@ -183,6 +189,7 @@ class Gen:
             (7,  self.stmt_unsigned_temp),
             (6,  self.stmt_guarded_accum),
             (5,  self.stmt_fnptr),
+            (8,  self.stmt_narrow_call),
         ]
         total = sum(w for w, _ in kinds)
         roll = self.rng.uniform(0, total)
@@ -244,6 +251,36 @@ class Gen:
             f"{arr}[{i}] = ({i} * {c} + {d}) & {MASK};"))
         self.counted_loop(0, n, lambda j: self.emit(
             f"{acc} = ({acc} + {arr}[{j}]) & {MASK};"), fuzz_start=True)
+
+    def stmt_narrow_call(self):
+        """Call a narrow-integer helper whose arithmetic leaves the type, then
+        read the result the two ways that expose an unwrapped one: compare it
+        against a constant, and widen it to int64. A call wraps in the return
+        register; an inlined body has to be made to."""
+        if not self.narrow_helpers:
+            return
+        name, ty, np = self.rng.choice(self.narrow_helpers)
+        acc = self.ensure_acc()
+        big = {"int32": 2147483647, "uint32": 4294967295,
+               "int16": 32767, "uint16": 65535,
+               "int8": 127, "uint8": 255}[ty]
+        args = []
+        for _ in range(np):
+            if self.rng.random() < 0.5:
+                args.append(f"({ty}){self.rng.randint(0, big)}")
+            else:
+                args.append(f"({ty})(({self.atom(1)} & {big}))")
+        call = f"{name}({', '.join(args)})"
+        v = self.fresh("nv")
+        self.emit(f"var {v}: {ty} = {call};")
+        self.emit(f"{acc} = ({acc} + (int64){v}) & {MASK};")
+        if self.rng.random() < 0.6:
+            probe = self.rng.choice([0, 1, big])
+            self.emit(f"if ({call} == ({ty}){probe}) {{ "
+                      f"{acc} = ({acc} + 7) & {MASK}; }}")
+        # Always: the result read straight through, with no typed local to
+        # wrap it on the way. This is the line the miscompile showed up on.
+        self.emit(f"{acc} = ({acc} + (int64){call} * 3) & {MASK};")
 
     def stmt_call(self):
         if not self.helper_sigs:
@@ -814,6 +851,44 @@ class Gen:
             if np == 1 and not deco.startswith("@inline"):
                 self.unary_helpers.append(name)
 
+    def gen_narrow_helpers(self):
+        """Helpers returning an integer narrower than a register, doing
+        arithmetic that leaves the type. Each spelling of `return` matters:
+        an expression, a parameter handed back, an explicit cast, a value
+        through a local -- only the first has to be wrapped, and the
+        inliner's proof that the others need nothing is what keeps a clamp
+        helper recognizable to the vectorizers."""
+        for ty in ("int32", "uint32", "int16", "uint16", "int8", "uint8"):
+            # int32 and uint32 always: they are the widths where the wrap the
+            # return type owes has nothing else to supply it. The frontend
+            # makes the narrower ones carry an explicit cast, and a constant
+            # fold narrows on the instruction's own type.
+            if ty not in ("int32", "uint32") and self.rng.random() < 0.5:
+                continue
+            name = self.fresh("nh")
+            np = self.rng.choice([1, 2, 2])
+            params = ", ".join(f"p{j}: {ty}" for j in range(np))
+            op = self.rng.choice(["*", "+", "-", "*"])
+            if np == 1:
+                expr = f"p0 {op} p0"
+            else:
+                expr = f"p0 {op} p1"
+            shape = self.rng.randint(0, 3)
+            body = [f"fn {name}({params}) -> {ty} {{"]
+            if shape == 0:
+                body.append(f"  return {expr};")
+            elif shape == 1:
+                body.append(f"  var r: {ty} = {expr};")
+                body.append(f"  return r;")
+            elif shape == 2:
+                body.append(f"  return ({ty})({expr});")
+            else:
+                body.append(f"  if (p0 == ({ty})0) {{ return p0; }}")
+                body.append(f"  return {expr};")
+            body.append("}")
+            self.helpers.append(chr(10).join(body))
+            self.narrow_helpers.append((name, ty, np))
+
     def gen_applier(self):
         """A higher-order helper, so a bare function name has somewhere to be
         passed as an argument."""
@@ -986,12 +1061,17 @@ class Gen:
         self.gen_helpers(self.rng.randint(1, 3))
         self.gen_applier()
         self.gen_float_helpers()
+        self.gen_narrow_helpers()
         self.gen_kernels()
 
         self.emit("fn main() -> int32 {")
         self.indent += 1
         self.emit("var acc: int64 = 1;")
         self.live_vars = ["acc"]
+        # One narrow-return call in every program, rather than waiting for the
+        # statement mix to roll one. The wrap a narrow return owes is cheap to
+        # exercise and was invisible to every other shape here.
+        self.stmt_narrow_call()
         # ~8% jumbo mains: enough statements to trip the MIR size bail so
         # the fallback backend sees every shape too
         if self.rng.random() < 0.08:
