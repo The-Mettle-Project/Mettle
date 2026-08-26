@@ -1507,6 +1507,8 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
 
 /* ---------------- extern model ---------------- */
 
+
+
 long long ir_interp_pointee_window(IRInterpMachine *machine,
                                    unsigned long long value,
                                    unsigned char *out, size_t capacity) {
@@ -3402,12 +3404,47 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
           (vt && vt->kind == MTLC_TYPE_STRING)) {
         /* The string value convention: the local's value IS the address of a
          * { chars, length } record, and address-of yields that value. Never
-         * slot-backed. */
-        var->value = ii_poison_value();
+         * slot-backed.
+         *
+         * The record has to exist from the declaration on. `var s: string;`
+         * followed by `s.chars = buf` stores through the local's value, and
+         * leaving that value poisoned made the store land nowhere: read_line
+         * and read_line_stdin -- which every program importing std/io carries
+         * -- trapped on every generated input, and 250-odd files reported
+         * them as unvalidated. A declaration with no initializer gives them
+         * a zeroed record, which is the storage the compiled program gets.
+         * An initializer overwrites the value with its own record's address
+         * on the next instruction, exactly as before. */
         var->slotted = 0;
         var->agg_size = 0;
         var->value_size = 8;
         var->value_is_unsigned = 1;
+        if (var->has_local_storage && var->value.i) {
+          long long offset = 0;
+          IIBuffer *buf = ii_addr_to_buffer(
+              machine, (unsigned long long)var->value.i, 16, &offset);
+          if (buf) {
+            memset(buf->data + offset, 0, 16);
+            pc++;
+            break;
+          }
+        }
+        {
+          unsigned long long addr = ii_add_buffer_ex(machine, NULL, 16, 1);
+          if (!addr) {
+            ii_fail(machine, IR_INTERP_TRAP, "string record allocation");
+            goto done;
+          }
+          if (!ii_frame_own(&frame, (size_t)((addr - II_ADDR_BASE) /
+                                             II_ADDR_STRIDE))) {
+            ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+            goto done;
+          }
+          memset(machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE].data,
+                 0, 16);
+          var->value = ii_int_value((long long)addr);
+          var->has_local_storage = 1;
+        }
         pc++;
         break;
       }
@@ -3901,6 +3938,26 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       if (insn->lhs.kind != IR_OPERAND_NONE &&
           !ii_fetch(machine, &frame, &insn->lhs, &value)) {
         goto done;
+      }
+      /* The return register carries the return type's width, so what the
+       * caller reads back is already wrapped -- the same transfer the
+       * parameter homing above models on the way in. Without this the
+       * interpreter answered `mul32(65536, 65536) == 0` false where the
+       * program answers true, and every narrowing a pass might drop looked
+       * correct to the verifier. */
+      {
+        int rsize = 8, rfloat = 0, runsigned = 0;
+        long long rcount = 1;
+        if (fn->return_type_name &&
+            ii_parse_local_type(fn->return_type_name, &rsize, &rcount, &rfloat,
+                                &runsigned) &&
+            rcount == 1) {
+          if (!rfloat && !value.is_float && rsize > 0 && rsize < 8) {
+            value.i = ii_narrow_int(value.i, rsize, runsigned);
+          } else if (rfloat && rsize == 4 && value.is_float) {
+            value.f = (double)(float)value.f;
+          }
+        }
       }
       *result = value;
       ok = 1;
