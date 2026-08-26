@@ -945,27 +945,24 @@ static int irv_compare_observations(IRInterpMachine *before,
     }
   }
 
-  /* Runtime allocations: only comparable when allocation sequences match. */
-  size_t total_a = ir_interp_buffer_count(before);
-  size_t total_b = ir_interp_buffer_count(after);
-  if (total_a == total_b) {
-    for (size_t i = input_buffer_count; i < total_a; i++) {
-      long long size_a = 0, size_b = 0;
-      const unsigned char *a = ir_interp_buffer_data(before, i, &size_a);
-      const unsigned char *b = ir_interp_buffer_data(after, i, &size_b);
-      if (a && b && size_a == size_b &&
-          memcmp(a, b, (size_t)size_a) != 0) {
-        long long at = 0;
-        while (at < size_a && a[at] == b[at]) {
-          at++;
-        }
-        snprintf(why, why_capacity,
-                 "heap allocation %zu differs at byte %lld (0x%02X -> 0x%02X)",
-                 i, at, a[at], b[at]);
-        return 0;
-      }
-    }
-  }
+  /* Runtime allocations are deliberately NOT compared.
+   *
+   * Which index an allocation lands on, and when it happens, are facts about
+   * this machine rather than about the program: a string literal materializes
+   * the first time control reaches it, a heap string when its interpolation
+   * runs, and moving a declaration out of a loop rotates that order while
+   * leaving the count identical. Comparing them by position read "Buzz"
+   * against "2" and then '7' against '4' -- each pair the same size -- and
+   * reported hoist_body_locals as a miscompile on six programs it compiles
+   * correctly. One of those quarantines then became a compiler abort
+   * downstream, so the cost of the check was higher than a lost optimization.
+   *
+   * Nothing is given up that the program can observe. Heap bytes become
+   * observable by being returned, by reaching an extern -- where the trace
+   * above compares the pointee, not the pointer -- by landing in a global, or
+   * by being written into a buffer the harness registered. All four are
+   * compared. A pass that corrupts a heap buffer nothing ever reads has
+   * changed nothing anyone can see. */
 
   /* Extern-call trace: deletion, duplication, or reordering is a divergence. */
   size_t trace_a = ir_interp_extern_trace_count(before);
