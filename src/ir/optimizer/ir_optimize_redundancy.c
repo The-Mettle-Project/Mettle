@@ -909,6 +909,10 @@ static int re_instruction_write_region(const IRFunction *function,
   case IR_OP_BINARY:
   case IR_OP_UNARY:
   case IR_OP_CAST:
+  /* A select writes its destination and nothing else, exactly like the
+   * binary it replaced. Falling through to the default below told every
+   * cached load that memory had changed. */
+  case IR_OP_SELECT:
     /* Writing a variable a pointer can reach (a global, or a local whose
      * address escaped) is a store to that variable's storage. */
     if (ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
@@ -920,6 +924,13 @@ static int re_instruction_write_region(const IRFunction *function,
       }
       return 1;
     }
+    return 0;
+  case IR_OP_PREFETCH:
+    /* A hint with no architectural effect. It was landing in the default
+     * arm and killing every cached load, so the prefetch pass made the loop
+     * it was meant to speed up reload each base it had already read: the
+     * string-hash loop in json_parse walk fetched p->text twice an
+     * iteration, once on each side of the hint. */
     return 0;
   default:
     return 1; /* calls, kernels: anywhere */
