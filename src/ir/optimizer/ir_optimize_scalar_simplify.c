@@ -1507,7 +1507,13 @@ static int ir_bitset_emit(IRFunction *function, size_t at, size_t last,
   return 1;
 }
 
-int ir_or_chain_to_bitset_pass(IRFunction *function, int *changed) {
+/* Folds ONE chain and reports whether it did. The emit rewrites the
+ * instruction stream and invalidates the use map built above it, so a
+ * function holding several chains -- which is what inlining a predicate
+ * like `skip_ws` into every caller produces -- needs one call per chain. */
+static int ir_or_chain_to_bitset_once(IRFunction *function, int *changed,
+                                      int *folded) {
+  *folded = 0;
   if (!function) {
     return 1;
   }
@@ -1617,10 +1623,24 @@ int ir_or_chain_to_bitset_pass(IRFunction *function, int *changed) {
       ir_operand_destroy(&value);
       mettle_free_string(miss);
       ir_temp_use_map_destroy(&uses);
-      return ok ? 1 : 1;
+      *folded = ok;
+      return 1;
     }
   }
   ir_temp_use_map_destroy(&uses);
+  return 1;
+}
+
+int ir_or_chain_to_bitset_pass(IRFunction *function, int *changed) {
+  for (int round = 0; round < 64; round++) {
+    int folded = 0;
+    if (!ir_or_chain_to_bitset_once(function, changed, &folded)) {
+      return 0;
+    }
+    if (!folded) {
+      break;
+    }
+  }
   return 1;
 }
 
