@@ -288,6 +288,18 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
         "Failed to compute layout for struct '%s'", decl->name);
     return 0;
   }
+  /* Each field can sit within the single-object bound while the struct does
+   * not. The backend keeps frame offsets and local storage in `int`, so three
+   * 800 MB arrays in one struct arrived as a negative size and were reported
+   * as an internal compiler error. */
+  if (struct_type->size > (size_t)INT_MAX) {
+    free(field_types);
+    type_checker_set_error_at_location(
+        checker, struct_decl->location,
+        "Struct '%s' needs %zu bytes, past the %d-byte limit on one object",
+        decl->name, struct_type->size, INT_MAX);
+    return 0;
+  }
   free(field_types);
   type_checker_intern_type(checker, struct_type);
   type_checker_set_qualified_name(checker, struct_type,
