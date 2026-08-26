@@ -795,19 +795,44 @@ static int irv_compare_observations(IRInterpMachine *before,
       return 0;
     }
     for (size_t j = 0; j < a->arg_count; j++) {
-      if (!irv_value_equal(&a->args[j], &b->args[j])) {
+      /* An address is not an observation. A pass that changes how many
+       * objects a function builds moves every later allocation, so the
+       * pointer an extern receives differs while everything it can read
+       * through that pointer is identical -- which the byte comparison below
+       * is what actually checks. Comparing the numbers too reported SROA as a
+       * miscompile for splitting an unrelated struct. */
+      if (!a->arg_is_pointer[j] && !b->arg_is_pointer[j] &&
+          !irv_value_equal(&a->args[j], &b->args[j])) {
         snprintf(why, why_capacity, "extern call %zu (%s) argument %zu differs",
                  i, a->name, j);
         return 0;
       }
+      if (a->arg_is_pointer[j] != b->arg_is_pointer[j]) {
+        snprintf(why, why_capacity,
+                 "extern call %zu (%s) argument %zu %s a pointer", i, a->name,
+                 j, a->arg_is_pointer[j] ? "stopped being" : "became");
+        return 0;
+      }
       /* Pointer arguments: the extern reads memory, so the bytes the pointer
        * addressed at call time are part of the observation. */
-      if (a->arg_mem_len[j] != b->arg_mem_len[j] ||
-          (a->arg_mem_len[j] > 0 &&
-           memcmp(a->arg_mem[j], b->arg_mem[j], a->arg_mem_len[j]) != 0)) {
+      if (a->arg_mem_len[j] != b->arg_mem_len[j]) {
         snprintf(why, why_capacity,
-                 "extern call %zu (%s) argument %zu points to differing bytes",
-                 i, a->name, j);
+                 "extern call %zu (%s) argument %zu addresses %u bytes, now %u",
+                 i, a->name, j, (unsigned)a->arg_mem_len[j],
+                 (unsigned)b->arg_mem_len[j]);
+        return 0;
+      }
+      if (a->arg_mem_len[j] > 0 &&
+          memcmp(a->arg_mem[j], b->arg_mem[j], a->arg_mem_len[j]) != 0) {
+        unsigned at = 0;
+        while (at < a->arg_mem_len[j] && a->arg_mem[j][at] == b->arg_mem[j][at]) {
+          at++;
+        }
+        snprintf(why, why_capacity,
+                 "extern call %zu (%s) argument %zu points to differing bytes "
+                 "at offset %u of %u (0x%02X -> 0x%02X)",
+                 i, a->name, j, at, (unsigned)a->arg_mem_len[j],
+                 a->arg_mem[j][at], b->arg_mem[j][at]);
         return 0;
       }
     }

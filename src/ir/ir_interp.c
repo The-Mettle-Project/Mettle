@@ -1530,6 +1530,7 @@ static void ii_trace_extern(IRInterpMachine *machine, const char *name,
   for (size_t i = 0; i < call->arg_count; i++) {
     call->args[i] = args[i];
     call->arg_mem_len[i] = 0;
+    call->arg_is_pointer[i] = 0;
     if (args[i].is_float) {
       continue;
     }
@@ -1542,6 +1543,7 @@ static void ii_trace_extern(IRInterpMachine *machine, const char *name,
     if (!buf) {
       continue;
     }
+    call->arg_is_pointer[i] = 1;
     long long avail = buf->size - offset;
     if (avail <= 0) {
       continue;
@@ -1550,6 +1552,28 @@ static void ii_trace_extern(IRInterpMachine *machine, const char *name,
         avail < IR_INTERP_EXTERN_MEM_CAP ? avail : IR_INTERP_EXTERN_MEM_CAP;
     memcpy(call->arg_mem[i], buf->data + offset, (size_t)take);
     call->arg_mem_len[i] = (unsigned short)take;
+    /* A word inside the window that is itself an address is not an
+     * observation. A string literal's buffer holds its characters and then
+     * the {chars, length} record, so the window behind a `cstring` argument
+     * carries the literal's own address -- and that address is the buffer's
+     * index, which moves whenever a pass changes how many objects the
+     * function builds. Canonicalize every word that resolves to live memory
+     * so only what the extern can actually read is compared; a pointer that
+     * turned into something that is not one still shows up. */
+    for (long long w = 0; w + 8 <= take; w++) {
+      unsigned long long word = 0;
+      long long unused = 0;
+      if (((offset + w) & 7) != 0) {
+        continue;
+      }
+      memcpy(&word, call->arg_mem[i] + w, 8);
+      if (word < II_ADDR_BASE ||
+          !ii_addr_to_buffer(machine, word, 0, &unused)) {
+        continue;
+      }
+      word = II_ADDR_BASE;
+      memcpy(call->arg_mem[i] + w, &word, 8);
+    }
   }
 }
 

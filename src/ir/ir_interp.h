@@ -57,6 +57,11 @@ typedef struct {
    * in both machines, and only final buffer bytes are otherwise compared. */
   unsigned char arg_mem[8][IR_INTERP_EXTERN_MEM_CAP];
   unsigned short arg_mem_len[8];
+  /* The argument resolved to an address inside interpreter memory. Its
+   * numeric value is an allocation address, which a pass is free to change by
+   * changing how many objects a function builds; what the extern can observe
+   * is the bytes, compared above. */
+  unsigned char arg_is_pointer[8];
 } IRInterpExternCall;
 
 typedef struct IRInterpMachine IRInterpMachine;
