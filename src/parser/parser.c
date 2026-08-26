@@ -2498,9 +2498,55 @@ static int parser_literal_radix_hint(const char *value) {
   return 10;
 }
 
+typedef enum {
+  PARSER_LITERAL_OK = 0,
+  PARSER_LITERAL_INVALID,
+  PARSER_LITERAL_OVERFLOW
+} ParserLiteralScan;
+
+static ParserLiteralScan parser_scan_unsigned_literal(
+    const char *text, unsigned base, unsigned long long *out_value) {
+  const unsigned long long cutoff = ULLONG_MAX / base;
+  const unsigned long long cutlim = ULLONG_MAX % base;
+  unsigned long long value = 0;
+  int any = 0;
+
+  for (; *text != '\0'; text++) {
+    char c = *text;
+    unsigned digit;
+    if (c >= '0' && c <= '9') {
+      digit = (unsigned)(c - '0');
+    } else if (c >= 'a' && c <= 'f') {
+      digit = (unsigned)(c - 'a') + 10u;
+    } else if (c >= 'A' && c <= 'F') {
+      digit = (unsigned)(c - 'A') + 10u;
+    } else {
+      return PARSER_LITERAL_INVALID;
+    }
+    if (digit >= base) {
+      return PARSER_LITERAL_INVALID;
+    }
+    if (value > cutoff ||
+        (value == cutoff && (unsigned long long)digit > cutlim)) {
+      return PARSER_LITERAL_OVERFLOW;
+    }
+    value = value * base + (unsigned long long)digit;
+    any = 1;
+  }
+
+  if (!any) {
+    return PARSER_LITERAL_INVALID;
+  }
+  *out_value = value;
+  return PARSER_LITERAL_OK;
+}
+
 /*
  * Parses integer TOKEN_NUMBER lexeme text into long long bits and radix.
- * Handles decimal, hexadecimal (strtoull 16), and binary (0b) digits only.
+ * Handles decimal, hexadecimal, and binary (0b) digits only. Overflow is
+ * detected while accumulating rather than read back from errno: the owned
+ * runtime's strtoull wraps modulo 2^64 and never reports ERANGE, so every
+ * literal past UINT64_MAX used to be accepted with a wrapped value.
  */
 static int parser_parse_integer_literal_string(
     Parser *parser, const char *value, long long *out_value,
@@ -2510,17 +2556,16 @@ static int parser_parse_integer_literal_string(
   }
 
   int hint = parser_literal_radix_hint(value);
-
-  errno = 0;
-  char *end = NULL;
+  unsigned long long u = 0;
+  ParserLiteralScan scan;
 
   if (hint == 16) {
-    unsigned long long u = strtoull(value, &end, 16);
-    if (end == value || *end != '\0') {
+    scan = parser_scan_unsigned_literal(value + 2, 16u, &u);
+    if (scan == PARSER_LITERAL_INVALID) {
       parser_set_error(parser, "Invalid hexadecimal literal");
       return 0;
     }
-    if (errno == ERANGE) {
+    if (scan == PARSER_LITERAL_OVERFLOW) {
       parser_set_error(parser, "Hexadecimal literal is out of range");
       return 0;
     }
@@ -2530,54 +2575,37 @@ static int parser_parse_integer_literal_string(
   }
 
   if (hint == 2) {
-    const char *p = value + 2;
-    if (*p == '\0') {
+    scan = parser_scan_unsigned_literal(value + 2, 2u, &u);
+    if (scan == PARSER_LITERAL_INVALID) {
       parser_set_error(parser, "Invalid binary literal");
       return 0;
     }
-    unsigned long long u = 0;
-    while (*p) {
-      if (*p != '0' && *p != '1') {
-        parser_set_error(parser, "Invalid binary literal");
-        return 0;
-      }
-      if (u > (ULLONG_MAX >> 1)) {
-        parser_set_error(parser, "Binary literal is out of range");
-        return 0;
-      }
-      u = u * 2 + (unsigned long long)(*p - '0');
-      p++;
+    if (scan == PARSER_LITERAL_OVERFLOW) {
+      parser_set_error(parser, "Binary literal is out of range");
+      return 0;
     }
     *out_radix = 2;
     *out_value = (long long)u;
     return 1;
   }
 
-  long long s = strtoll(value, &end, 10);
-  if (end == value || *end != '\0') {
+  /* Past LLONG_MAX but still a uint64 keeps the bit pattern, exactly as the
+   * hexadecimal branch above does: without this a uint64 constant had to be
+   * written in hex -- 18446744073709551615 was rejected while
+   * 0xFFFFFFFFFFFFFFFF, the same value, was accepted. A leading '-' is not
+   * part of the literal (it lexes as unary minus), so this only ever widens
+   * the positive range. */
+  scan = parser_scan_unsigned_literal(value, 10u, &u);
+  if (scan == PARSER_LITERAL_INVALID) {
     parser_set_error(parser, "Invalid integer literal");
     return 0;
   }
-  if (errno == ERANGE) {
-    /* Past LLONG_MAX but still a uint64: retry unsigned and keep the bit
-     * pattern, exactly as the hexadecimal branch above already does. Without
-     * this, a uint64 constant had to be written in hex -- 18446744073709551615
-     * was rejected while 0xFFFFFFFFFFFFFFFF, the same value, was accepted. A
-     * leading '-' is not part of the literal (it lexes as unary minus), so
-     * this only ever widens the positive range. */
-    errno = 0;
-    end = NULL;
-    unsigned long long u = strtoull(value, &end, 10);
-    if (end == value || *end != '\0' || errno == ERANGE) {
-      parser_set_error(parser, "Decimal integer literal is out of range");
-      return 0;
-    }
-    *out_radix = 10;
-    *out_value = (long long)u;
-    return 1;
+  if (scan == PARSER_LITERAL_OVERFLOW) {
+    parser_set_error(parser, "Decimal integer literal is out of range");
+    return 0;
   }
   *out_radix = 10;
-  *out_value = s;
+  *out_value = (long long)u;
   return 1;
 }
 
