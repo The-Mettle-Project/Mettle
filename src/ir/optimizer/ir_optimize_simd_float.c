@@ -5378,6 +5378,16 @@ static int ir_try_vectorize_outer_lane_at(IRFunction *function,
     OL_DBG("outer compare decode failed");
     return 1;
   }
+  /* The serialized form carries the INNER comparison and nothing for the
+   * outer one, so the kernel runs `p < P` whatever the source said. A `<=`
+   * outer loop has one more iteration than that, and taking it as `<` dropped
+   * the last one: `while (p <= P)` summed five inner results where the scalar
+   * loop summed six. Decline the shape rather than answer it short. */
+  if (outer_cmp != 0) {
+    OL_DBG("outer compare is not '<'");
+    ir_operand_destroy(&outerP);
+    return 1;
+  }
   long long oj = ol_find_jump_to(function, outer_branch + 1, n, outer_label);
   if (oj < 0) {
     OL_DBG("no outer back-jump");

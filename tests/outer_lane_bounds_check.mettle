@@ -1,0 +1,93 @@
+import "std/io";
+
+/* The outer-loop lane vectorizer serializes the INNER comparison and nothing
+ * for the outer one, so its kernel always runs `p < P`. Each shape below is
+ * the same reduction written with a different pair of comparisons, checked
+ * against the same sum accumulated so the vectorizer cannot claim it. */
+
+fn lanes(P: int64, N: int64, outer_le: int32, inner_le: int32) -> float64 {
+  var total: float64 = 0.0;
+  if (outer_le == 0 && inner_le == 0) {
+    var p: int64 = 0;
+    while (p < P) {
+      var iacc: float64 = 1.0;
+      var i: int64 = 0;
+      while (i < N) { iacc = iacc / 1.5; i = i + 1; }
+      total = total + iacc;
+      p = p + 1;
+    }
+    return total;
+  }
+  if (outer_le == 1 && inner_le == 0) {
+    var p2: int64 = 0;
+    while (p2 <= P) {
+      var iacc2: float64 = 1.0;
+      var i2: int64 = 0;
+      while (i2 < N) { iacc2 = iacc2 / 1.5; i2 = i2 + 1; }
+      total = total + iacc2;
+      p2 = p2 + 1;
+    }
+    return total;
+  }
+  if (outer_le == 0 && inner_le == 1) {
+    var p3: int64 = 0;
+    while (p3 < P) {
+      var iacc3: float64 = 1.0;
+      var i3: int64 = 0;
+      while (i3 <= N) { iacc3 = iacc3 / 1.5; i3 = i3 + 1; }
+      total = total + iacc3;
+      p3 = p3 + 1;
+    }
+    return total;
+  }
+  var p4: int64 = 0;
+  while (p4 <= P) {
+    var iacc4: float64 = 1.0;
+    var i4: int64 = 0;
+    while (i4 <= N) { iacc4 = iacc4 / 1.5; i4 = i4 + 1; }
+    total = total + iacc4;
+    p4 = p4 + 1;
+  }
+  return total;
+}
+
+/* The reference: one accumulator, no separable inner reduction, so no
+ * recognizer claims it. `steps` counts the divides the shape performs. */
+fn reference(outer_trips: int64, inner_trips: int64) -> float64 {
+  var total: float64 = 0.0;
+  var p: int64 = 0;
+  while (p < outer_trips) {
+    var iacc: float64 = 1.0;
+    var i: int64 = 0;
+    while (i < inner_trips) {
+      iacc = iacc / 1.5;
+      i = i + 1;
+      if (iacc == 12345.0) { total = total + 1.0; }
+    }
+    total = total + iacc;
+    p = p + 1;
+  }
+  return total;
+}
+
+fn check(name: string, got: float64, want: float64) -> int32 {
+  if (got == want) { return 0; }
+  println("FAIL {name}: got {got} want {want}");
+  return 1;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  var P: int64 = 5;
+  var N: int64 = 4;
+  bad = bad + check("lt/lt", lanes(P, N, 0, 0), reference(P, N));
+  bad = bad + check("le/lt", lanes(P, N, 1, 0), reference(P + 1, N));
+  bad = bad + check("lt/le", lanes(P, N, 0, 1), reference(P, N + 1));
+  bad = bad + check("le/le", lanes(P, N, 1, 1), reference(P + 1, N + 1));
+
+  /* A zero-trip outer loop under `<=` still runs once. */
+  bad = bad + check("le zero", lanes(0, N, 1, 0), reference(1, N));
+
+  if (bad == 0) { println("outer lane bounds: OK"); }
+  return bad;
+}

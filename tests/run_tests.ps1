@@ -1625,6 +1625,21 @@ $cases = @(
     ShouldSucceed = $true
   },
   @{
+    # The outer-loop lane vectorizer serializes the INNER comparison and
+    # nothing for the outer one, so its kernel always runs `p < P`. Every
+    # combination of `<` and `<=` on the two loops, against a reduction
+    # written so no recognizer claims it.
+    Name          = "outer_lane_bounds"
+    Path          = "tests/outer_lane_bounds_check.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+  },
+  @{
+    Name          = "outer_lane_bounds_debug"
+    Path          = "tests/outer_lane_bounds_check.mettle"
+    ShouldSucceed = $true
+  },
+  @{
     # A call to a narrow-integer function wraps its result to the return type
     # in the return register; an inlined body has no such boundary and the
     # temp it leaves behind carries the full 64 bits. Every arithmetic shape
