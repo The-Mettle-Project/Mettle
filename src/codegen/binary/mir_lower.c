@@ -1196,6 +1196,40 @@ static int mir_arg_float_bits(CodeGenerator *g, const IRFunction *ir_function,
   return 0;
 }
 
+/* SysV hands an aggregate of 16 bytes or less back in registers rather than
+ * through a hidden out-pointer. MIR spills the eightbytes into the destination
+ * struct's home itself, which needs both of them to be INTEGER class -- an SSE
+ * eightbyte would have to cross banks on the way to memory, and no call the
+ * standard library makes returns one. Mirrors the fallback emitter's
+ * return_in_sysv_registers so the two agree on which calls take a hidden
+ * pointer. */
+static int mir_call_sysv_returns_in_gp_registers(CodeGenerator *g,
+                                                 const char *callee_name,
+                                                 MtlcType *ret,
+                                                 BinarySysvAggregate *out) {
+  BinarySysvAggregate agg;
+  size_t e = 0;
+  if (!out) {
+    out = &agg;
+  }
+  if (!callee_name ||
+      !code_generator_binary_active_abi()->counts_classes_separately ||
+      !code_generator_binary_function_is_abi_public(g, callee_name)) {
+    return 0;
+  }
+  if (!code_generator_binary_classify_sysv_aggregate(ret, out) ||
+      out->in_memory || out->eightbyte_count == 0 ||
+      out->eightbyte_count > 2) {
+    return 0;
+  }
+  for (e = 0; e < out->eightbyte_count; e++) {
+    if (out->classes[e] != BINARY_EIGHTBYTE_INTEGER) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int mir_call_is_supported(CodeGenerator *g,
                                  const IRFunction *ir_function,
                                  const IRInstruction *in) {
@@ -1231,14 +1265,22 @@ static int mir_call_is_supported(CodeGenerator *g,
    * Mettle functions keep the fast path: both sides agree on the convention
    * whatever it is, and `string` is a 16-byte aggregate that would otherwise
    * drag most of the standard library off MIR. */
+  int sysv_gp_return = 0;
   {
     const BinaryAbi *sysv_probe = code_generator_binary_active_abi();
     if (sysv_probe->counts_classes_separately &&
         code_generator_binary_function_is_abi_public(g, in->text)) {
       size_t a = 0;
       if (ret && code_generator_type_is_aggregate(ret)) {
-        mir_call_trace("sysv_extern_aggregate_ret");
-        return 0;
+        /* A 16-byte-or-less aggregate comes back in RAX/RDX; MIR spills it
+         * into the destination's home after the call. Anything larger, or
+         * carrying a float eightbyte, still goes to the baseline emitter. */
+        if (!mir_call_sysv_returns_in_gp_registers(g, in->text, ret, NULL) ||
+            mir_operand_struct_home_size(g, ir_function, &in->dest) == 0) {
+          mir_call_trace("sysv_extern_aggregate_ret");
+          return 0;
+        }
+        sysv_gp_return = 1;
       }
       for (a = 0; a < in->argument_count; a++) {
         MtlcType *pt = callee->data.function.parameter_types
@@ -1253,7 +1295,8 @@ static int mir_call_is_supported(CodeGenerator *g,
   }
 
   int hidden = 0;
-  if (ret && code_generator_abi_classify(ret) == ABI_PASS_INDIRECT) {
+  if (!sysv_gp_return && ret &&
+      code_generator_abi_classify(ret) == ABI_PASS_INDIRECT) {
     /* struct-by-value return: the caller passes a hidden out-pointer as the
      * first integer arg, pointed at the destination struct's home (a struct
      * LOCAL or a struct TEMP), so the callee writes the result directly there. */
@@ -4195,6 +4238,11 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
      * user arg up one slot. We point the hidden arg at the destination struct
      * LOCAL's home so the callee writes the result there directly. */
     int ret_indirect = 0;
+    /* SysV brings a small aggregate back in RAX/RDX instead, so the call takes
+     * no hidden out-pointer and the result is spilled into the destination's
+     * home after it returns. */
+    BinarySysvAggregate sysv_ret = {0};
+    int sysv_gp_return = 0;
     {
       const CgSym *rc =
           g->ir_program ? code_generator_lookup_symbol(g, in->text) : NULL;
@@ -4202,7 +4250,12 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
                        ? (rc->data.function.return_type ? rc->data.function.return_type
                                                         : rc->type)
                        : NULL;
-      if (rret && code_generator_abi_classify(rret) == ABI_PASS_INDIRECT &&
+      if (rret &&
+          mir_call_sysv_returns_in_gp_registers(g, in->text, rret, &sysv_ret) &&
+          (in->dest.kind == IR_OPERAND_SYMBOL ||
+           in->dest.kind == IR_OPERAND_TEMP)) {
+        sysv_gp_return = 1;
+      } else if (rret && code_generator_abi_classify(rret) == ABI_PASS_INDIRECT &&
           (in->dest.kind == IR_OPERAND_SYMBOL ||
            in->dest.kind == IR_OPERAND_TEMP)) {
         ret_indirect = 1;
@@ -4478,6 +4531,54 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
     if (ret_indirect) {
       /* The struct result was written into the dest local's home by the callee;
        * nothing to move out of RAX. */
+      return 1;
+    }
+    if (sysv_gp_return) {
+      /* Take the eightbytes out of RAX and RDX first: the address of the
+       * destination's home is computed after they are in vregs, so the
+       * allocator cannot hand the address register one that still holds a
+       * piece of the result. */
+      MirVregId parts[2] = {MIR_VREG_NONE, MIR_VREG_NONE};
+      BinaryGpRegister srcs[2] = {BINARY_GP_RAX, BINARY_GP_RDX};
+      size_t e = 0;
+      for (e = 0; e < sysv_ret.eightbyte_count; e++) {
+        parts[e] = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (parts[e] == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_MOV, mir_op_vreg(parts[e]),
+                       mir_op_phys(srcs[e], MIR_RC_GP), mir_op_none(), 8, 0,
+                       0)) {
+          return 0;
+        }
+      }
+      MirOperand dstsym = mir_value_operand(fn, g, ctx, map, &in->dest);
+      if (dstsym.kind != MIR_OPK_VREG) {
+        fn->has_error = 1;
+        return 0;
+      }
+      fn->vregs[dstsym.vreg].address_taken = 1;
+      {
+        const IRFunction *dirf =
+            ctx && ctx->function_name
+                ? code_generator_find_ir_function_binary(g, ctx->function_name)
+                : NULL;
+        int hb = mir_operand_struct_home_size(g, dirf, &in->dest);
+        if (hb > 0 && fn->vregs[dstsym.vreg].home_bytes < hb) {
+          fn->vregs[dstsym.vreg].home_bytes = hb;
+        }
+      }
+      MirVregId addr = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (addr == MIR_VREG_NONE ||
+          !mir_emit1(fn, MIR_LEA_LOCAL, mir_op_vreg(addr), dstsym,
+                     mir_op_none(), 8, 0, 0)) {
+        return 0;
+      }
+      for (e = 0; e < sysv_ret.eightbyte_count; e++) {
+        if (!mir_emit1(fn, MIR_MOV,
+                       mir_op_mem_vreg(addr, MIR_VREG_NONE, 1, (int)(e * 8u)),
+                       mir_op_vreg(parts[e]), mir_op_none(), 8, 0, 0)) {
+          return 0;
+        }
+      }
       return 1;
     }
     /* Move the return value out of RAX / XMM0 before anything clobbers it. */
