@@ -740,19 +740,6 @@ static int ir_optimize_portable_program_pipeline(
     if (gpu_only && (!graph.reachable || !graph.reachable[i])) continue;
     IRFunction *function = program->functions[i];
     ir_set_current_function_context(function);
-    /* Inlining copies a callee's body into every caller, and the cleanup stage
-     * that folds a chain of equality tests into one bitset test has already
-     * run by then. Half of json_parse's inlined `skip_ws` copies kept the
-     * four-compare chain for exactly that reason, in the hottest block of
-     * parse_object. Re-offer the fold to the bodies inlining just made. */
-    if (!ir_pass_name_is_skipped("or_chain_bitset")) {
-      int bitset_changed = 0;
-      mettle_compiler_ctx_set_pass_name("or_chain_bitset");
-      if (!ir_or_chain_to_bitset_pass(function, &bitset_changed)) {
-        ok = 0;
-        break;
-      }
-    }
     if (!ir_run_fixpoint_stage(function, &g_ir_portable_fixpoint_stage) ||
         !ir_function_rebuild_cfg(function)) {
       ok = 0;

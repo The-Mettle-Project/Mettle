@@ -242,6 +242,12 @@ int ir_instruction_writes_temp(const IRInstruction *instruction) {
   case IR_OP_CALL_INDIRECT:
   case IR_OP_NEW:
   case IR_OP_CAST:
+  /* A three-operand select and the LCG kernel both name their result in
+   * dest. Leaving them out told every caller the symbol was never written,
+   * which is the unsound direction: a pass that asks whether a variable is
+   * assigned anywhere concluded no and treated it as a constant. */
+  case IR_OP_SELECT:
+  case IR_OP_SIMD_LCG_U32:
     return 1;
   default:
     return 0;
@@ -295,6 +301,10 @@ int ir_instruction_writes_symbol(const IRInstruction *instruction) {
   case IR_OP_SIMD_VLOOP_I32:
   case IR_OP_SIMD_FIND:
   case IR_OP_SIMD_OUTER_LANE_F64:
+  case IR_OP_SELECT:
+  case IR_OP_SIMD_LCG_U32:
+  /* GPU shared/local allocation names its pointer in dest. */
+  case IR_OP_ADDRESS_SPACE_ALLOC:
     return 1;
   default:
     return 0;
@@ -347,6 +357,10 @@ int ir_instruction_writes_destination(const IRInstruction *instruction) {
   case IR_OP_SIMD_VLOOP_I32:
   case IR_OP_SIMD_FIND:
   case IR_OP_SIMD_OUTER_LANE_F64:
+  case IR_OP_SELECT:
+  case IR_OP_SIMD_LCG_U32:
+  /* GPU shared/local allocation names its pointer in dest. */
+  case IR_OP_ADDRESS_SPACE_ALLOC:
     return 1;
   default:
     return 0;
