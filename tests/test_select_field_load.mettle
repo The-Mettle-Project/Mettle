@@ -1,0 +1,70 @@
+import "std/io";
+
+struct Node {
+  freq: int64
+  left: int32
+  right: int32
+}
+
+struct Tree {
+  nodes: Node*
+  root: int32
+  count: int32
+}
+
+fn walk(t: Tree*, bits: uint8*, n: int32) -> int32 {
+  var node: int32 = t->root;
+  var leaves: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    var byte: int32 = (int32)bits[i >> 3];
+    var value: int32 = (byte >> (7 - (i & 7))) & 1;
+    if (value != 0) {
+      node = t->nodes[node].right;
+    } else {
+      node = t->nodes[node].left;
+    }
+    if (t->nodes[node].left < 0) {
+      leaves += 1;
+      node = t->root;
+    }
+    i += 1;
+  }
+  return leaves;
+}
+
+fn main() -> int32 {
+  var nodes: Node[16];
+  var i: int32 = 0;
+  while (i < 16) {
+    nodes[i].left = (i * 5 + 1) % 16;
+    nodes[i].right = (i * 7 + 3) % 16;
+    nodes[i].freq = (int64)i;
+    i += 1;
+  }
+  nodes[9].left = -1;
+  nodes[4].left = -1;
+
+  var t: Tree;
+  t.nodes = &nodes[0];
+  t.root = 0;
+  t.count = 16;
+
+  var bits: uint8[128];
+  var state: uint32 = 2463534242;
+  i = 0;
+  while (i < 128) {
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    bits[i] = (uint8)(state & 255);
+    i += 1;
+  }
+
+  var leaves: int32 = walk(&t, &bits[0], 1024);
+  println("leaves = {leaves}");
+  if (leaves > 0) {
+    return 0;
+  }
+  return 1;
+}

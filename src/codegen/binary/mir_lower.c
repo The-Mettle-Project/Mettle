@@ -8416,7 +8416,21 @@ static void mir_sink_cold_exits(MirFunction *fn) {
     if (!mir_enclosing_loop(fn, p, &loop_lo, &loop_hi)) {
       continue;
     }
+    int arm_calls = 0;
+    for (size_t r = p + 1; r < q; r++) {
+      if (fn->insns[r].op == MIR_CALL) {
+        arm_calls = 1;
+        break;
+      }
+    }
+    /* An arm that calls is not a rare fixup, it is the work. A dispatch chain's
+     * arms all look like equality tests, but exactly one of them runs every
+     * time, so moving them out of line costs the case that hits a jump it did
+     * not pay before, and buys nothing the call does not already swamp. */
     int arm_is_cold = 0;
+    if (arm_calls) {
+      continue;
+    }
     if (tail == MIR_RET) {
       arm_is_cold = 1;
     } else if (tail == MIR_JMP) {

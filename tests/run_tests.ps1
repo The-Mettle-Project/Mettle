@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$CompilerPath = "",
   [switch]$BuildCompiler,
   [switch]$SkipRuntime,
@@ -1608,6 +1608,18 @@ $cases = @(
   @{ Name = "bitwise"; Path = "tests/test_bitwise.mettle"; ShouldSucceed = $true },
   @{ Name = "modulo"; Path = "tests/test_modulo.mettle"; ShouldSucceed = $true },
   @{ Name = "logical_not"; Path = "tests/test_logical_not.mettle"; ShouldSucceed = $true },
+  @{
+    # A two-armed if that differs only in which adjacent field it reads is
+    # folded into one load at a computed offset. huffman decode depends on
+    # it: without the fold the arms become a data-dependent branch per bit,
+    # which the hardware cannot predict, and the benchmark lost 53% the one
+    # time a hoist reshaped the arms before the recognizer ran.
+    Name          = "select_field_load"
+    Path          = "tests/test_select_field_load.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+    IrMustMatch   = @("__fselm_", "__fselk_")
+  },
   @{
     Name           = "optimize_ir_passes"
     Path           = "tests/test_optimize_ir_passes.mettle"

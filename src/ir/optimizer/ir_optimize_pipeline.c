@@ -151,14 +151,19 @@ static const IROptNamedPass g_ir_post_recognizer_tail[] = {
  * instead of the one the programmer wrote. The two general passes behind them
  * retire the copies they leave; nothing later in the pipeline would. */
 static const IROptNamedPass g_ir_lowering_cleanup[] = {
+    /* This one matches the shape the programmer wrote: two arms that differ
+     * only in a field offset. The hoists below rewrite exactly those arms, and
+     * an arm reading a base the hoist lifted out no longer looks like its
+     * partner, so the branch survives as a data-dependent branch the hardware
+     * cannot predict. It goes first, where the shape is still intact. */
+    {"select_field_load", ir_select_adjacent_field_pass,
+     {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
     {"promote_loop_memory", ir_promote_loop_memory_pass,
      {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
     {"hoist_invariant_loads", ir_hoist_invariant_loads_pass,
      {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
     {"widen_subword_cast", ir_widen_subword_load_cast_pass,
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
-    {"select_field_load", ir_select_adjacent_field_pass,
-     {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
     {"ascii_casefold_range", ir_ascii_casefold_range_pass,
      {IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
     {"or_chain_bitset", ir_or_chain_to_bitset_pass,

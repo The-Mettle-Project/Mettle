@@ -1476,7 +1476,7 @@ static int sel_match_at(const IRFunction *function, size_t branch,
     return 0;
   }
   if (!sel_collect(function, branch + 1, else_label, &then_arm) ||
-      then_arm.count < 3) {
+      then_arm.count < 2) {
     return 0;
   }
   tail = &function->instructions[then_arm.index[then_arm.count - 1]];
