@@ -1,0 +1,12 @@
+fn main() -> int32 {
+  done: for (var i: int32 = 0; i < 5; i += 1) {
+    continue done;
+  }
+  for (var j: int32 = 0; j < 5; j += 1) {
+    continue done;
+  }
+  while (1 < 2) {
+    break done;
+  }
+  return 0;
+}

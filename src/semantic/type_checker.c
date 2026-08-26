@@ -50,6 +50,9 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   checker->current_function_decl = NULL;
   checker->loop_depth = 0;
   checker->switch_depth = 0;
+  checker->loop_labels = NULL;
+  checker->loop_label_count = 0;
+  checker->loop_label_capacity = 0;
   checker->tracked_var_names = NULL;
   checker->tracked_var_initialized = NULL;
   checker->tracked_var_scope_depth = NULL;
@@ -176,6 +179,7 @@ void type_checker_destroy(TypeChecker *checker) {
     free(checker->tracked_var_initialized);
     free(checker->tracked_var_scope_depth);
     free(checker->tracked_scope_markers);
+    free(checker->loop_labels);
     type_checker_buffer_extent_clear(checker);
 
     free(checker->error_message);

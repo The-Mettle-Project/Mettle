@@ -2052,7 +2052,11 @@ $cases = @(
   @{ Name = "err_undefined_var_typo"; Path = "tests/err_undefined_var_typo.mettle"; ShouldSucceed = $false; Pattern = "did you mean 'counter'" },
   @{ Name = "err_top_level_return"; Path = "tests/err_top_level_return.mettle"; ShouldSucceed = $false; Pattern = "Return statement outside of a function|This 'return' cannot stand at file scope" },
   @{ Name = "err_break_outside_loop"; Path = "tests/err_break_outside_loop.mettle"; ShouldSucceed = $false; Pattern = "'break' can only be used inside a loop or switch" },
-  @{ Name = "err_break_unknown_label"; Path = "tests/err_break_unknown_label.mettle"; ShouldSucceed = $false; Pattern = "no matching labeled loop" },
+  @{ Name = "err_break_unknown_label"; Path = "tests/err_break_unknown_label.mettle"; ShouldSucceed = $false; Pattern = "error\[E0003\]: 'break missing' has no matching labeled loop" },
+  # A label goes out of scope with its loop. Both of these named one that had
+  # already closed, and reaching IR lowering with either came out as an
+  # internal compiler error rather than a diagnostic.
+  @{ Name = "err_continue_unknown_label"; Path = "tests/err_continue_unknown_label.mettle"; ShouldSucceed = $false; Pattern = "(?s)'continue done' has no matching labeled loop.*'break done' has no matching labeled loop" },
   @{ Name = "err_continue_in_switch"; Path = "tests/err_continue_in_switch.mettle"; ShouldSucceed = $false; Pattern = "'continue' can only be used inside a loop" },
   @{ Name = "err_switch_range_inverted"; Path = "tests/err_switch_range_inverted.mettle"; ShouldSucceed = $false; Pattern = "Range lower bound" },
   @{ Name = "err_switch_duplicate_case"; Path = "tests/err_switch_duplicate_case.mettle"; ShouldSucceed = $false; Pattern = "Duplicate case value|duplicate case" },

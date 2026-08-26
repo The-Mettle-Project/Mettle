@@ -87,6 +87,12 @@ typedef struct {
   ASTNode *current_function_decl;
   int loop_depth;
   int switch_depth;
+  /* One entry per enclosing loop, holding its label or NULL. `break outer`
+   * names a loop that has to be one of these; without the stack an unknown
+   * label reached IR lowering and came out as an internal compiler error. */
+  const char **loop_labels;
+  size_t loop_label_count;
+  size_t loop_label_capacity;
   char **tracked_var_names;
   unsigned char *tracked_var_initialized;
   int *tracked_var_scope_depth;

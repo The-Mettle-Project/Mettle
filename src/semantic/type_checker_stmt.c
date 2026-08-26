@@ -1,6 +1,42 @@
 // Type checker: statement checking (if / for / switch / dispatch).
 #include "type_checker_internal.h"
 
+/* One entry per enclosing loop, holding its label or NULL. Pushing on failure
+ * is still safe: a loop whose label could not be recorded simply cannot be
+ * named, and the diagnostic that follows says so. */
+static int type_checker_push_loop_label(TypeChecker *checker,
+                                        const char *label) {
+  if (checker->loop_label_count == checker->loop_label_capacity) {
+    size_t grown =
+        checker->loop_label_capacity ? checker->loop_label_capacity * 2 : 8;
+    const char **table =
+        realloc((void *)checker->loop_labels, grown * sizeof(const char *));
+    if (!table) {
+      return 0;
+    }
+    checker->loop_labels = table;
+    checker->loop_label_capacity = grown;
+  }
+  checker->loop_labels[checker->loop_label_count++] = label;
+  return 1;
+}
+
+static void type_checker_pop_loop_label(TypeChecker *checker) {
+  if (checker->loop_label_count > 0) {
+    checker->loop_label_count--;
+  }
+}
+
+static int type_checker_loop_label_in_scope(const TypeChecker *checker,
+                                            const char *label) {
+  for (size_t i = 0; i < checker->loop_label_count; i++) {
+    if (checker->loop_labels[i] && strcmp(checker->loop_labels[i], label) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 // Validation functions for semantic analysis
 
 // Statement and expression validation functions
@@ -570,14 +606,17 @@ int type_checker_check_for_statement(TypeChecker *checker,
   }
 
   checker->loop_depth++;
+  type_checker_push_loop_label(checker, for_stmt->label);
   if (for_stmt->body &&
       !type_checker_check_statement(checker, for_stmt->body)) {
+    type_checker_pop_loop_label(checker);
     checker->loop_depth--;
     free(post_init_snapshot);
     type_checker_init_tracker_exit_scope(checker);
     symbol_table_exit_scope(checker->symbol_table);
     return 0;
   }
+  type_checker_pop_loop_label(checker);
   checker->loop_depth--;
 
   type_checker_init_tracker_restore(checker, post_init_snapshot,
@@ -1172,12 +1211,15 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
     }
 
     checker->loop_depth++;
+    type_checker_push_loop_label(checker, while_stmt->label);
     if (while_stmt->body &&
         !type_checker_check_statement(checker, while_stmt->body)) {
+      type_checker_pop_loop_label(checker);
       checker->loop_depth--;
       free(init_snapshot);
       return 0;
     }
+    type_checker_pop_loop_label(checker);
     checker->loop_depth--;
     type_checker_init_tracker_restore(checker, init_snapshot,
                                       init_snapshot_count);
@@ -1206,23 +1248,41 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
   case AST_QUIESCE_STATEMENT:
     return 1;
 
-  case AST_BREAK_STATEMENT:
+  case AST_BREAK_STATEMENT: {
+    LoopControlStatement *brk = (LoopControlStatement *)statement->data;
     if (checker->loop_depth <= 0 && checker->switch_depth <= 0) {
       type_checker_set_error_at_location(
           checker, statement->location,
           "'break' can only be used inside a loop or switch");
       return 0;
     }
+    if (brk && brk->target_label &&
+        !type_checker_loop_label_in_scope(checker, brk->target_label)) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "'break %s' has no matching labeled loop", brk->target_label);
+      return 0;
+    }
     return 1;
+  }
 
-  case AST_CONTINUE_STATEMENT:
+  case AST_CONTINUE_STATEMENT: {
+    LoopControlStatement *cont = (LoopControlStatement *)statement->data;
     if (checker->loop_depth <= 0) {
       type_checker_set_error_at_location(
           checker, statement->location,
           "'continue' can only be used inside a loop");
       return 0;
     }
+    if (cont && cont->target_label &&
+        !type_checker_loop_label_in_scope(checker, cont->target_label)) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "'continue %s' has no matching labeled loop", cont->target_label);
+      return 0;
+    }
     return 1;
+  }
 
   case AST_INLINE_ASM:
     return 1;
