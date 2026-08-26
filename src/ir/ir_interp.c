@@ -788,8 +788,22 @@ static int ii_parse_local_type(const char *text, int *elem_size, long long *coun
     }
     memcpy(base, text, base_len);
     base[base_len] = '\0';
-    long long n = atoll(bracket + 1);
-    if (n <= 0 || n > (1 << 24)) {
+    /* Accumulate rather than atoll: overflowing it is undefined, and the
+     * value it lands on can be small enough to pass the bound below, which
+     * would model a huge array as a one-element one. The cap is reached long
+     * before the accumulation could wrap. */
+    long long n = 0;
+    const char *digit = bracket + 1;
+    if (*digit < '0' || *digit > '9') {
+      return 0;
+    }
+    for (; *digit >= '0' && *digit <= '9'; digit++) {
+      n = n * 10 + (*digit - '0');
+      if (n > (1 << 24)) {
+        return 0;
+      }
+    }
+    if (n <= 0) {
       return 0;
     }
     if (strcmp(base, "cstring") == 0 || strcmp(base, "rawptr") == 0) {
