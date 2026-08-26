@@ -246,6 +246,26 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
       free(field_types);
       return 0;
     }
+    /* The placeholder registered above is what makes `next: Foo*` work, and it
+     * also makes `a: Foo` resolve, to a type whose size is still 0. Layout then
+     * gave the field no storage: `struct S { a: S; }` reached the backend at
+     * size 0 as an internal compiler error, and `struct S { a: S; v: int64; }`
+     * compiled with `a` silently overlapping `v`. */
+    const Type *field_base = field_types[i];
+    while (field_base && field_base->kind == TYPE_ARRAY) {
+      field_base = field_base->base_type;
+    }
+    if (field_base == struct_type) {
+      char error_msg[512];
+      snprintf(error_msg, sizeof(error_msg),
+               "Struct '%s' contains itself by value in field '%s'. A struct "
+               "cannot hold a copy of itself; store a pointer '%s*'",
+               decl->name, decl->field_names[i], decl->name);
+      type_checker_set_error_at_location(checker, struct_decl->location,
+                                         error_msg);
+      free(field_types);
+      return 0;
+    }
   }
 
   /* Populate the placeholder in place so pointers captured during field
@@ -268,7 +288,6 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
         "Failed to compute layout for struct '%s'", decl->name);
     return 0;
   }
-
   free(field_types);
   type_checker_intern_type(checker, struct_type);
   type_checker_set_qualified_name(checker, struct_type,

@@ -1846,7 +1846,8 @@ int code_generator_binary_prepare_function_context(
                      ? code_generator_named_type(generator,
                                                      instruction->text)
                      : NULL;
-    if (!local_type || local_type->kind == MTLC_TYPE_VOID || local_type->size == 0) {
+    if (!local_type || local_type->kind == MTLC_TYPE_VOID ||
+        (local_type->size == 0 && local_type->kind != MTLC_TYPE_STRUCT)) {
       code_generator_set_error(
           generator,
           "Direct object backend does not support local type '%s' in function "
@@ -1890,7 +1891,16 @@ int code_generator_binary_prepare_function_context(
             BINARY_SAFETY_GRANULE * BINARY_SAFETY_GRANULE;
       }
     }
-    if (local_storage_size <= 0) {
+    /* `struct Empty { }` is a deliberate shape: `comptime for` over a type's
+     * fields needs the zero-field case to iterate zero times. Declaring one as
+     * a local asked the frame for 0 bytes and was reported as an internal
+     * compiler error. Give it a byte so it has a distinct address, and keep
+     * rejecting a size that came out negative, which means the size overflowed
+     * on the way here. */
+    if (local_storage_size == 0) {
+      local_storage_size = 1;
+    }
+    if (local_storage_size < 0) {
       code_generator_set_error(generator,
                                "Invalid local storage size in function '%s'",
                                ir_function->name);

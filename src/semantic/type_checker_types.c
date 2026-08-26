@@ -47,10 +47,27 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
     return NULL;
   }
 
-  errno = 0;
-  char *end_ptr = NULL;
-  unsigned long long array_size_ull = strtoull(size_start, &end_ptr, 10);
-  if (errno != 0 || !end_ptr || end_ptr != rbracket) {
+  /* Scanned here rather than through strtoull: the owned runtime's strtoull
+   * wraps modulo 2^64 and never reports ERANGE, so `int64[2^64 + 1]` came back
+   * as an array of one element. A digit past the range is the type not naming
+   * an array size at all. */
+  unsigned long long array_size_ull = 0;
+  int size_is_literal = size_start < rbracket;
+  for (const char *digit = size_start; digit < rbracket; digit++) {
+    if (*digit < '0' || *digit > '9') {
+      size_is_literal = 0;
+      break;
+    }
+    if (array_size_ull > ULLONG_MAX / 10ull) {
+      return NULL;
+    }
+    array_size_ull *= 10ull;
+    if (array_size_ull > ULLONG_MAX - (unsigned long long)(*digit - '0')) {
+      return NULL;
+    }
+    array_size_ull += (unsigned long long)(*digit - '0');
+  }
+  if (!size_is_literal) {
     size_t size_name_len = (size_t)(rbracket - size_start);
     char *size_name = malloc(size_name_len + 1);
     if (!size_name) {
@@ -81,7 +98,13 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
   }
 
   size_t array_size = (size_t)array_size_ull;
-  if (base_type->size > 0 && array_size > SIZE_MAX / base_type->size) {
+  /* SIZE_MAX is not a bound any object can actually reach: the backend keeps
+   * frame offsets and local storage sizes in `int`, so an array whose bytes
+   * pass INT_MAX arrived there as a negative size and was reported as an
+   * internal compiler error. int64[1152921504606846976] fit under SIZE_MAX/8
+   * and did exactly that. */
+  if (base_type->size > 0 &&
+      array_size > (size_t)INT_MAX / base_type->size) {
     return NULL;
   }
 
