@@ -277,8 +277,27 @@ static BinaryGpRegister value_reg(MirFunction *fn, const MirOperand *op,
   case MIR_OPK_VREG: {
     const MirVreg *v = &fn->vregs[op->vreg];
     if (v->in_register) {
+      /* A vreg's phys number means nothing without its bank: XMM0 and RAX
+       * are both 0. Reading a float's bits into a GP register is a real
+       * request -- interpolation hands mettle_string_from_f64 the raw bits
+       * -- and it has to cross with movq. Casting the number straight to a
+       * GP register silently read RAX instead. */
+      if (v->rclass == MIR_RC_XMM) {
+        *ok = binary_emit_movq_reg_xmm(&fn->context->code, scratch,
+                                       (BinaryXmmRegister)v->phys);
+        if (!*ok) {
+          *ok = enc_err(fn, "out of memory moving a float to a GP register");
+        }
+        return scratch;
+      }
+      if (v->rclass != MIR_RC_GP) {
+        *ok = enc_err(fn, "a packed vector has no GP value form");
+        return scratch;
+      }
       return (BinaryGpRegister)v->phys;
     }
+    /* Spilled: the home slot holds the bits either way, so a GP load of the
+     * slot is the same value whichever bank wrote it. */
     *ok = gp_home_load(fn, v, scratch);
     return scratch;
   }
@@ -311,6 +330,14 @@ static int store_from(MirFunction *fn, const MirOperand *dst,
   case MIR_OPK_VREG: {
     const MirVreg *v = &fn->vregs[dst->vreg];
     if (v->in_register) {
+      /* Same bank confusion as value_reg, in the other direction. */
+      if (v->rclass == MIR_RC_XMM) {
+        return binary_emit_movq_xmm_reg(code, (BinaryXmmRegister)v->phys,
+                                        src_phys);
+      }
+      if (v->rclass != MIR_RC_GP) {
+        return enc_err(fn, "a packed vector has no GP value form");
+      }
       if ((BinaryGpRegister)v->phys != src_phys) {
         return binary_emit_mov_reg_reg(code, (BinaryGpRegister)v->phys,
                                        src_phys);
@@ -414,6 +441,9 @@ static int dst_is_reg(MirFunction *fn, const MirOperand *dst,
                       BinaryGpRegister *D_out) {
   if (dst->kind == MIR_OPK_VREG) {
     const MirVreg *v = &fn->vregs[dst->vreg];
+    if (v->rclass != MIR_RC_GP) {
+      return 0; /* not a GP register; store_from crosses the bank */
+    }
     if (v->in_register) {
       *D_out = (BinaryGpRegister)v->phys;
       return 1;
@@ -934,6 +964,9 @@ static int dst_is_xmm_reg(MirFunction *fn, const MirOperand *dst,
                           BinaryXmmRegister *D_out) {
   if (dst->kind == MIR_OPK_VREG) {
     const MirVreg *v = &fn->vregs[dst->vreg];
+    if (v->rclass == MIR_RC_GP) {
+      return 0; /* not an XMM register; xmm_store crosses the bank */
+    }
     if (v->in_register) {
       *D_out = (BinaryXmmRegister)v->phys;
       return 1;

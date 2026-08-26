@@ -1132,6 +1132,98 @@ static int ir_try_evaluate_integer_binary(const char *op, long long lhs,
   return 1;
 }
 
+/* `x / 2^k` -> `x * 2^-k` for a float divisor that is an exact power of two.
+ *
+ * This is the one float identity that needs no reassociation licence. Both
+ * forms scale by the same exact real value and round once, so they agree on
+ * every input including NaN, both infinities, both zeros, and the subnormals
+ * that round on the way out. Requiring the reciprocal to be normal is what
+ * buys that: if 2^-k were subnormal the reciprocal would itself be rounded,
+ * and the two forms would part company.
+ *
+ * A divide is 14 cycles and holds the divider for four; the multiply is four
+ * cycles and fully pipelined. physics_grid pays two of these per particle per
+ * step for `x / CELL_SIZE`. */
+static int ir_pow2_reciprocal(double c, int float_bits, double *out) {
+  uint64_t bits = 0;
+  uint64_t sign = 0;
+  int biased = 0;
+  int limit = float_bits == 32 ? 126 : 1022;
+  memcpy(&bits, &c, sizeof(bits));
+  sign = bits & 0x8000000000000000ull;
+  if ((bits & 0x000FFFFFFFFFFFFFull) != 0) {
+    return 0; /* mantissa bits set: not a power of two */
+  }
+  biased = (int)((bits >> 52) & 0x7FFull);
+  if (biased == 0 || biased == 0x7FF) {
+    return 0; /* zero or subnormal, or an infinity/NaN */
+  }
+  {
+    int k = biased - 1023;
+    if (k > limit || k < -limit) {
+      return 0;
+    }
+    bits = sign | ((uint64_t)(1023 - k) << 52);
+  }
+  memcpy(out, &bits, sizeof(bits));
+  return 1;
+}
+/* The divisor's value, when it is one the compiler already knows: a float
+ * literal, or a name bound to an immutable float global. Reading the global
+ * here rather than folding every float const at its use site is deliberate.
+ * Folding them all replaces one hoisted register with a materialization per
+ * use, which cost physics_grid 3.65% and cancelled the entire divide win.
+ * Only the divisor is worth substituting, because the rewrite consumes the
+ * constant rather than adding one: the divide's constant becomes the
+ * multiply's. */
+static int ir_float_divisor_value(const IROperand *rhs, double *out) {
+  const IRModuleSymbol *symbol;
+  if (rhs->kind == IR_OPERAND_FLOAT) {
+    *out = rhs->float_value;
+    return 1;
+  }
+  if (rhs->kind != IR_OPERAND_SYMBOL || !rhs->name) {
+    return 0;
+  }
+  symbol = ir_optimize_module_symbol(rhs->name);
+  if (!symbol || symbol->kind != IR_MODSYM_VARIABLE || symbol->is_extern ||
+      !symbol->is_immutable || !symbol->has_initializer ||
+      !symbol->init_is_float || symbol->init_symbol_ref) {
+    return 0;
+  }
+  memcpy(out, &symbol->init_bits, sizeof(*out));
+  return 1;
+}
+
+static int ir_try_fold_float_reciprocal(IRInstruction *instruction,
+                                        int *changed) {
+  double divisor = 0.0;
+  double reciprocal = 0.0;
+  if (!instruction || instruction->op != IR_OP_BINARY ||
+      !instruction->is_float || !instruction->text ||
+      strcmp(instruction->text, "/") != 0) {
+    return 1;
+  }
+  if (!ir_float_divisor_value(&instruction->rhs, &divisor)) {
+    return 1;
+  }
+  if (!ir_pow2_reciprocal(divisor, instruction->float_bits, &reciprocal)) {
+    return 1;
+  }
+  mettle_free_string(instruction->text);
+  instruction->text = mettle_strdup("*");
+  if (!instruction->text) {
+    return 0;
+  }
+  ir_operand_destroy(&instruction->rhs);
+  instruction->rhs = ir_operand_float_sized(reciprocal,
+                                            instruction->float_bits);
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
 static int ir_try_fold_integer_binary(IRInstruction *instruction,
                                       IRValueRangeCtx *ranges, size_t at,
                                       int *changed) {
@@ -1844,6 +1936,7 @@ int ir_constant_and_branch_simplify_pass(IRFunction *function,
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
     if (!ir_try_fold_integer_binary(instruction, &ranges, i, changed) ||
+        !ir_try_fold_float_reciprocal(instruction, changed) ||
         !ir_try_fold_integer_unary(instruction, changed) ||
         !ir_value_range_simplify(&ranges, i, instruction, changed) ||
         !ir_simplify_redundant_assign(instruction, changed) ||

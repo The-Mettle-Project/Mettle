@@ -1,0 +1,74 @@
+// String interpolation hands mettle_string_from_f64 the value's raw bits in a
+// GP register, so the encoder has to move a float across the bank boundary with
+// movq. It used to cast the vreg's physical number straight to a general
+// register, and since XMM0 and RAX are both number 0, the call read RAX.
+//
+// It only shows up while the value is still LIVE IN AN XMM REGISTER at the
+// call: once the allocator spills it, the reload from the home slot moves the
+// right bits either way. So main has to stay small enough that nothing spills,
+// which is why the checking lives in a callee that cannot be inlined back in.
+import "std/io";
+
+fn twice(x: float64) -> float64 {
+  return x * 2.0;
+}
+
+fn twice32(x: float32) -> float32 {
+  return x * 2.0;
+}
+
+@noinline fn want(s: string, expect: string) -> int32 {
+  if (s != expect) {
+    println("  got {s}, wanted {expect}");
+    return 1;
+  }
+  return 0;
+}
+
+@noinline fn want_one(s: string) -> int32 {
+  return want(s, "2.0");
+}
+
+@noinline fn want_pair(s: string, t: string) -> int32 {
+  if (want(s, "2.0") != 0) {
+    return 1;
+  }
+  return want(t, "6.0");
+}
+
+fn from_local() -> int32 {
+  var c: float64 = twice(1.0);
+  return want_one("{c}");
+}
+
+fn from_call() -> int32 {
+  return want_one("{twice(1.0)}");
+}
+
+fn from_two_live() -> int32 {
+  var c: float64 = twice(1.0);
+  var d: float64 = twice(3.0);
+  return want_pair("{c}", "{d}");
+}
+
+fn from_float32() -> int32 {
+  var f: float32 = twice32(1.0);
+  return want(from_float32_text(f), "2.0");
+}
+
+@noinline fn from_float32_text(f: float32) -> string {
+  return "{f}";
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  bad = bad + from_local();
+  bad = bad + from_call();
+  bad = bad + from_two_live();
+  bad = bad + from_float32();
+  println("float bits to GP mismatches = {bad}");
+  if (bad != 0) {
+    return 1;
+  }
+  return 0;
+}

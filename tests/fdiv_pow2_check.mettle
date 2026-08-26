@@ -1,0 +1,88 @@
+// Differential check for the `x / 2^k -> x * 2^-k` float identity. The two
+// forms must agree bit-for-bit on every input, so this compares the folded
+// divide against a multiply the optimizer cannot reach (the reciprocal arrives
+// through a function argument, which is opaque to the constant fold).
+import "std/io";
+
+fn scale_by(x: float64, r: float64) -> float64 {
+  return x * r;
+}
+
+fn scale_by32(x: float32, r: float32) -> float32 {
+  return x * r;
+}
+
+fn bits_of(x: float64) -> int64 {
+  var tmp: float64 = x;
+  var p: int64* = (int64*)(&tmp);
+  return *p;
+}
+
+fn report(tag: int32, a: float64, b: float64) -> int32 {
+  if (bits_of(a) == bits_of(b)) {
+    return 0;
+  }
+  println("  mismatch case {tag}: {a} vs {b}");
+  return 1;
+}
+
+fn check64(tag: int32, x: float64) -> int32 {
+  var bad: int32 = 0;
+  bad = bad + report(tag * 10 + 1, x / 2.0, scale_by(x, 0.5));
+  bad = bad + report(tag * 10 + 2, x / 16.0, scale_by(x, 0.0625));
+  bad = bad + report(tag * 10 + 3, x / 0.125, scale_by(x, 8.0));
+  bad = bad + report(tag * 10 + 4, x / -4.0, scale_by(x, -0.25));
+  bad = bad + report(tag * 10 + 5, x / 1.0, scale_by(x, 1.0));
+  return bad;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+
+  // Ordinary values, negatives, and both zeros.
+  bad = bad + check64(1, 1.0);
+  bad = bad + check64(2, -1.0);
+  bad = bad + check64(3, 3.0);
+  bad = bad + check64(4, 0.0);
+  bad = bad + check64(5, -0.0);
+  bad = bad + check64(6, 1e300);
+  bad = bad + check64(7, -1e300);
+
+  // Subnormals: the quotient rounds on the way out, which is where an
+  // inexact reciprocal would show up.
+  bad = bad + check64(8, 5e-324);
+  bad = bad + check64(9, -5e-324);
+  bad = bad + check64(10, 2.2250738585072014e-308);
+  bad = bad + check64(11, 1.5e-323);
+
+  // Values whose quotient lands in the subnormal range.
+  bad = bad + check64(12, 1e-320);
+  bad = bad + check64(13, 4.9e-324);
+
+  // Infinities and NaN.
+  var inf: float64 = 1e308 * 10.0;
+  var nan: float64 = inf - inf;
+  bad = bad + check64(14, inf);
+  bad = bad + check64(15, 0.0 - inf);
+  bad = bad + report(160, nan / 2.0, scale_by(nan, 0.5));
+
+  // A divisor that is NOT a power of two must be left alone and still agree
+  // with an honest divide.
+  bad = bad + report(170, 3.0 / 10.0, 0.3);
+
+  // float32 lane. The divisor has to be cast, or a bare float64 literal
+  // promotes the whole divide to float64 and the two sides round differently
+  // for reasons that have nothing to do with this identity.
+  var f: float32 = 3.5;
+  var q1: float32 = f / (float32)8.0;
+  bad = bad + report(180, (float64)q1, (float64)scale_by32(f, 0.125));
+  var fsub: float32 = 1e-44;
+  var q2: float32 = fsub / (float32)4.0;
+  bad = bad + report(190, (float64)q2, (float64)scale_by32(fsub, 0.25));
+
+  println("fdiv pow2 mismatches = {bad}");
+  if (bad != 0) {
+    return 1;
+  }
+  return 0;
+}

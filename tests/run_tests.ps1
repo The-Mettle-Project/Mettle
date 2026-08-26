@@ -1609,6 +1609,38 @@ $cases = @(
   @{ Name = "modulo"; Path = "tests/test_modulo.mettle"; ShouldSucceed = $true },
   @{ Name = "logical_not"; Path = "tests/test_logical_not.mettle"; ShouldSucceed = $true },
   @{
+    # Interpolation passes a float's raw bits in a GP register, so the
+    # encoder has to cross the bank with movq. It used to read the vreg's
+    # physical number as a GP register, and XMM0 and RAX are both 0, so
+    # every float printed while still live in a register showed RAX.
+    # Runs at both optimization levels: the release allocator keeps values
+    # in registers longer, but debug reproduced three of the four too.
+    Name          = "float_bits_to_gp"
+    Path          = "tests/test_float_bits_to_gp.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+  },
+  @{
+    Name          = "float_bits_to_gp_debug"
+    Path          = "tests/test_float_bits_to_gp.mettle"
+    ShouldSucceed = $true
+  },
+  @{
+    # `x / 2^k` becomes `x * 2^-k`, which is bit-identical because both
+    # scale by the same exact value and round once. The check compares the
+    # folded divide against a multiply the fold cannot reach, over
+    # subnormals, both zeros, both infinities and NaN.
+    Name          = "fdiv_pow2"
+    Path          = "tests/fdiv_pow2_check.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+  },
+  @{
+    Name          = "fdiv_pow2_debug"
+    Path          = "tests/fdiv_pow2_check.mettle"
+    ShouldSucceed = $true
+  },
+  @{
     # A two-armed if that differs only in which adjacent field it reads is
     # folded into one load at a computed offset. huffman decode depends on
     # it: without the fold the arms become a data-dependent branch per bit,

@@ -793,6 +793,7 @@ int ir_optimize_function_revectorize(IRFunction *function);
  * lookup). Set by the program pipeline around the per-function stage; NULL
  * outside it. */
 void ir_explain_set_program(IRProgram *program);
+const IRModuleSymbol *ir_optimize_module_symbol(const char *name);
 /* --explain hypothesis (ir_optimize_inline.c): pretend `callee_name` is
  * inline-eligible (@noinline removed, @inline added; *was_noinline_out says
  * which pretend the verified message should describe) and run inliner rounds

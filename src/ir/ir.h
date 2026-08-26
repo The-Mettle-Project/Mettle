@@ -736,6 +736,10 @@ typedef struct {
    * initializer and should report this as an error rather than silently
    * zero-initializing. */
   int has_unfoldable_initializer;
+  /* The source declared this global `const`. A pass may then read the
+   * folded initializer as the symbol's only value; without it a global's
+   * initializer says what the value STARTS as, not what it is. */
+  int is_immutable;
   /* Function signature (IR_MODSYM_FUNCTION), for call ABI classification. */
   MtlcType *return_type;    /* borrowed */
   MtlcType **param_types;   /* owned array of borrowed ptrs, or NULL */

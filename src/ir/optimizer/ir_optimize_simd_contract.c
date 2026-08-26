@@ -44,6 +44,16 @@ static MTLC_THREAD_LOCAL IRProgram *g_explain_program = NULL;
 
 void ir_explain_set_program(IRProgram *program) { g_explain_program = program; }
 
+/* The module symbol table of the program currently being optimized, for a
+ * per-function pass that needs to resolve a global by name. NULL outside a
+ * program stage, which simply means the pass declines. */
+const IRModuleSymbol *ir_optimize_module_symbol(const char *name) {
+  if (!g_explain_program || !name) {
+    return NULL;
+  }
+  return ir_program_lookup_symbol(g_explain_program, name);
+}
+
 static int ir_instruction_is_simd_marker(const IRInstruction *instruction) {
   return instruction && instruction->op == IR_OP_NOP && instruction->text &&
          strncmp(instruction->text, IR_SIMD_MARKER_PREFIX,
