@@ -4,6 +4,7 @@
  * meaning differs from what it documents, the before/after comparison in
  * ir_verify.c diverges and the pass is caught. */
 #include "ir_interp.h"
+#include "../runtime/mt_math.h"
 #include "../common.h"
 #include <limits.h>
 #include <math.h>
@@ -1599,6 +1600,73 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
 
 /* ---------------- extern model ---------------- */
 
+/* The math externs, computed with the SAME kernels the program links against
+ * on a freestanding target rather than modelled as zero.
+ *
+ * A program calling sqrtf got 0 back and every value downstream of it was
+ * wrong: tests/test_runtime_float_math.mettle interpreted to 1 where it runs
+ * to 0, and a function computing 1.0/sqrtf(x) interpreted an infinity. These
+ * are total functions of their arguments with no memory effects, so there is
+ * nothing to model -- and because src/runtime/mt_math.h is the same code
+ * `extern fn expf(..) = "expf"` reaches at run time, the answer here is the
+ * program's answer, not an approximation of it. */
+static int ii_extern_math(const char *name, const IRInterpValue *args,
+                          size_t arg_count, IRInterpValue *out) {
+  double x = 0.0;
+  double y = 0.0;
+  if (!name || arg_count < 1) {
+    return 0;
+  }
+  x = args[0].is_float ? args[0].f : (double)args[0].i;
+  if (arg_count > 1) {
+    y = args[1].is_float ? args[1].f : (double)args[1].i;
+  }
+  if (arg_count == 1) {
+    if (strcmp(name, "sqrtf") == 0) {
+      *out = ii_float_value((double)mt_sqrtf((float)x));
+      return 1;
+    }
+    if (strcmp(name, "expf") == 0) {
+      *out = ii_float_value((double)(float)mt_exp((double)(float)x));
+      return 1;
+    }
+    if (strcmp(name, "logf") == 0) {
+      *out = ii_float_value((double)(float)mt_log((double)(float)x));
+      return 1;
+    }
+    if (strcmp(name, "sinf") == 0) {
+      *out = ii_float_value((double)(float)mt_sin((double)(float)x));
+      return 1;
+    }
+    if (strcmp(name, "cosf") == 0) {
+      *out = ii_float_value((double)(float)mt_cos((double)(float)x));
+      return 1;
+    }
+    if (strcmp(name, "tanhf") == 0) {
+      *out = ii_float_value((double)(float)mt_tanh((double)(float)x));
+      return 1;
+    }
+    if (strcmp(name, "fabs") == 0) {
+      *out = ii_float_value(x < 0.0 ? -x : x);
+      return 1;
+    }
+    if (strcmp(name, "exp") == 0) {
+      *out = ii_float_value(mt_exp(x));
+      return 1;
+    }
+    if (strcmp(name, "tanh") == 0) {
+      *out = ii_float_value(mt_tanh(x));
+      return 1;
+    }
+  }
+  if (arg_count == 2 && strcmp(name, "powf") == 0) {
+    *out = ii_float_value((double)(float)mt_pow((double)(float)x,
+                                                (double)(float)y));
+    return 1;
+  }
+  return 0;
+}
+
 
 
 long long ir_interp_pointee_window(IRInterpMachine *machine,
@@ -2210,6 +2278,14 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     }
     *result = ii_int_value((long long)record);
     return 1;
+  }
+
+  {
+    IRInterpValue math_result = ii_float_value(0.0);
+    if (ii_extern_math(name, args, arg_count, &math_result)) {
+      *result = math_result;
+      return 1;
+    }
   }
 
   /* Unknown extern: pure model (returns 0), but the call is traced so a pass
