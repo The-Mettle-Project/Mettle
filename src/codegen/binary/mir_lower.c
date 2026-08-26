@@ -8281,17 +8281,60 @@ static size_t mir_label_index(const MirFunction *fn, const char *name) {
 /* Bounds of the tightest loop containing `p`: the back edge at `hi` jumps to the
  * header at `lo`, and lo <= p < hi. The tightest is the one whose header sits
  * latest, which is the innermost loop `p` belongs to. */
-static int mir_enclosing_loop(const MirFunction *fn, size_t p, size_t *lo,
-                              size_t *hi) {
-  int found = 0;
-  for (size_t k = p + 1; k < fn->insn_count; k++) {
-    const MirInst *in = &fn->insns[k];
-    if ((in->op != MIR_JMP && in->op != MIR_CMPBR) ||
-        in->dst.kind != MIR_OPK_LABEL || !in->dst.sym) {
-      continue;
+/* One back edge: the branch at `branch` jumps to a label defined at `target`,
+ * at or before it. Collected once per pass so the enclosing-loop query does not
+ * walk the whole function per candidate -- that walk was the O(N^2) left after
+ * the label lookup itself became an index. */
+typedef struct {
+  size_t target;
+  size_t branch;
+} MirBackEdge;
+
+static size_t mir_collect_back_edges(const MirFunction *fn,
+                                     MirBackEdge **out_edges) {
+  *out_edges = NULL;
+  size_t count = 0;
+  for (int pass = 0; pass < 2; pass++) {
+    size_t seen = 0;
+    for (size_t k = 0; k < fn->insn_count; k++) {
+      const MirInst *in = &fn->insns[k];
+      if ((in->op != MIR_JMP && in->op != MIR_CMPBR) ||
+          in->dst.kind != MIR_OPK_LABEL || !in->dst.sym) {
+        continue;
+      }
+      size_t t = mir_label_index(fn, in->dst.sym);
+      if (t == (size_t)-1 || t > k) {
+        continue;
+      }
+      if (pass == 1) {
+        (*out_edges)[seen].target = t;
+        (*out_edges)[seen].branch = k;
+      }
+      seen++;
     }
-    size_t t = mir_label_index(fn, in->dst.sym);
-    if (t == (size_t)-1 || t > p) {
+    if (pass == 0) {
+      count = seen;
+      if (count == 0) {
+        return 0;
+      }
+      *out_edges = (MirBackEdge *)malloc(count * sizeof(MirBackEdge));
+      if (!*out_edges) {
+        return 0;
+      }
+    }
+  }
+  return count;
+}
+
+/* Ascending in `branch`, so a tie on the header keeps the earliest back edge,
+ * exactly as the walk it replaces did. */
+static int mir_enclosing_loop_from(const MirBackEdge *edges, size_t edge_count,
+                                   size_t p, size_t *lo, size_t *hi) {
+  int found = 0;
+  for (size_t e = 0; e < edge_count; e++) {
+    size_t t = edges[e].target;
+    size_t k = edges[e].branch;
+    if (k <= p || t > p) {
       continue;
     }
     if (!found || t > *lo) {
@@ -8300,6 +8343,15 @@ static int mir_enclosing_loop(const MirFunction *fn, size_t p, size_t *lo,
       found = 1;
     }
   }
+  return found;
+}
+
+static int mir_enclosing_loop(const MirFunction *fn, size_t p, size_t *lo,
+                              size_t *hi) {
+  MirBackEdge *edges = NULL;
+  size_t edge_count = mir_collect_back_edges(fn, &edges);
+  int found = mir_enclosing_loop_from(edges, edge_count, p, lo, hi);
+  free(edges);
   return found;
 }
 
@@ -8607,6 +8659,10 @@ static void mir_sink_cold_exits(MirFunction *fn) {
   if (!moved) {
     return;
   }
+  /* Collected once: this loop only reads the stream, and the rewrite below runs
+   * after it finishes, so the edges stay accurate for every query here. */
+  MirBackEdge *back_edges = NULL;
+  size_t back_edge_count = mir_collect_back_edges(fn, &back_edges);
 
   for (size_t p = 0; p + 1 < fn->insn_count; p++) {
     const MirInst *br = &fn->insns[p];
@@ -8646,7 +8702,8 @@ static void mir_sink_cold_exits(MirFunction *fn) {
      * reach the code after the arm. */
     MirOpcode tail = fn->insns[q - 1].op;
     size_t loop_lo = 0, loop_hi = 0;
-    if (!mir_enclosing_loop(fn, p, &loop_lo, &loop_hi)) {
+    if (!mir_enclosing_loop_from(back_edges, back_edge_count, p, &loop_lo,
+                                 &loop_hi)) {
       continue;
     }
     int arm_calls = 0;
@@ -8720,6 +8777,7 @@ static void mir_sink_cold_exits(MirFunction *fn) {
 
   if (nsink == 0) {
     free(moved);
+    free(back_edges);
     free(sinks);
     return;
   }
@@ -8728,6 +8786,7 @@ static void mir_sink_cold_exits(MirFunction *fn) {
   MirInst *out = (MirInst *)malloc(total * sizeof(MirInst));
   if (!out) {
     free(moved);
+    free(back_edges);
     free(sinks);
     return;
   }
@@ -8763,6 +8822,7 @@ static void mir_sink_cold_exits(MirFunction *fn) {
   fn->insn_count = w;
   fn->insn_capacity = total;
   free(moved);
+  free(back_edges);
   free(sinks);
 }
 
