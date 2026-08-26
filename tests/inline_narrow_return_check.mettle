@@ -9,6 +9,13 @@ fn umul32(a: uint32, b: uint32) -> uint32 { return a * b; }
 fn add16(a: int16, b: int16) -> int16 { return (int16)(a + b); }
 fn add8(a: int8, b: int8) -> int8 { return (int8)(a + b); }
 
+/* Signedness, not just width: a value that already fits the return type's
+ * WIDTH still needs the wrap when the return type reads those bits with the
+ * other sign. */
+fn as_signed(p: uint32) -> int32 { return (int32)p; }
+fn as_unsigned(p: int32) -> uint32 { return (uint32)p; }
+fn byte_to_signed(p: uint8) -> int32 { return (int32)p; }
+
 fn report(name: string, got: int64, want: int64) -> int32 {
   if (got == want) { return 0; }
   println("FAIL {name}: got {got} want {want}");
@@ -36,6 +43,10 @@ fn main() -> int32 {
    * behind. */
   if (mul32(65536, 65536) != 0) { println("FAIL mul compare"); bad = bad + 1; }
   if (add32(v[1], v[2]) > 0) { println("FAIL add compare"); bad = bad + 1; }
+
+  bad = bad + report("uint32 as int32", (int64)as_signed(4294967295), -1);
+  bad = bad + report("int32 as uint32", (int64)as_unsigned(-1), 4294967295);
+  bad = bad + report("uint8 widened", (int64)byte_to_signed(255), 255);
 
   free(v);
   if (bad == 0) { println("inline narrow return: OK"); }

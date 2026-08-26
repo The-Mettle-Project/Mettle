@@ -650,25 +650,47 @@ static int ir_inline_return_is_narrow_integer(const IRFunction *callee) {
   return 0;
 }
 
-/* Byte width of a named integer type; 0 for anything else. */
-static int ir_inline_integer_bytes(const char *type) {
+/* Byte width of a named integer type, and whether it is unsigned; 0 bytes for
+ * anything that is not an integer. */
+static int ir_inline_integer_bytes(const char *type, int *is_unsigned) {
+  static const struct {
+    const char *name;
+    int bytes;
+    int is_unsigned;
+  } WIDTHS[] = {{"int8", 1, 0},   {"uint8", 1, 1},  {"bool", 1, 1},
+                {"int16", 2, 0},  {"uint16", 2, 1}, {"int32", 4, 0},
+                {"uint32", 4, 1}, {"int64", 8, 0},  {"uint64", 8, 1}};
+  size_t i = 0;
   if (!type) {
     return 0;
   }
-  if (strcmp(type, "int8") == 0 || strcmp(type, "uint8") == 0 ||
-      strcmp(type, "bool") == 0) {
-    return 1;
-  }
-  if (strcmp(type, "int16") == 0 || strcmp(type, "uint16") == 0) {
-    return 2;
-  }
-  if (strcmp(type, "int32") == 0 || strcmp(type, "uint32") == 0) {
-    return 4;
-  }
-  if (strcmp(type, "int64") == 0 || strcmp(type, "uint64") == 0) {
-    return 8;
+  for (i = 0; i < sizeof(WIDTHS) / sizeof(WIDTHS[0]); i++) {
+    if (strcmp(type, WIDTHS[i].name) == 0) {
+      if (is_unsigned) {
+        *is_unsigned = WIDTHS[i].is_unsigned;
+      }
+      return WIDTHS[i].bytes;
+    }
   }
   return 0;
+}
+
+/* A value of `src` bytes and signedness already sits inside a return type of
+ * `dst` bytes when it cannot need any bit the return would have changed.
+ * Matching signedness at no greater width is the plain case. An unsigned
+ * source STRICTLY narrower than a signed return is the other one: its whole
+ * range is positive there. A same-width signedness change is not: a uint32
+ * returned as int32 has to sign-extend, and the 64-bit temp holds the
+ * zero-extended number instead. */
+static int ir_inline_width_fits(int src_bytes, int src_unsigned, int dst_bytes,
+                                int dst_unsigned) {
+  if (src_bytes <= 0 || dst_bytes <= 0 || src_bytes > dst_bytes) {
+    return 0;
+  }
+  if (src_unsigned == dst_unsigned) {
+    return 1;
+  }
+  return src_unsigned && src_bytes < dst_bytes;
 }
 
 static const IRInstruction *ir_inline_sole_temp_def(const IRFunction *callee,
@@ -701,27 +723,36 @@ static const IRInstruction *ir_inline_sole_temp_def(const IRFunction *callee,
  * on two int32 values is where the 64-bit temp escapes the type. */
 static int ir_inline_value_fits_return(const IRFunction *callee,
                                        const IROperand *value, int bytes,
-                                       int depth) {
+                                       int is_unsigned, int depth) {
   if (!value || bytes <= 0 || depth > 4) {
     return 0;
   }
   if (value->kind == IR_OPERAND_INT) {
-    long long lo = -(1LL << (bytes * 8 - 1));
-    long long hi = (1LL << (bytes * 8)) - 1;
-    return bytes >= 8 || (value->int_value >= lo && value->int_value <= hi);
+    if (bytes >= 8) {
+      return 1;
+    }
+    if (is_unsigned) {
+      return value->int_value >= 0 &&
+             value->int_value <= (1LL << (bytes * 8)) - 1;
+    }
+    return value->int_value >= -(1LL << (bytes * 8 - 1)) &&
+           value->int_value <= (1LL << (bytes * 8 - 1)) - 1;
   }
   if (value->kind == IR_OPERAND_SYMBOL && value->name) {
+    int src_unsigned = 0;
     int declared = ir_inline_integer_bytes(
-        ir_function_local_declared_type((IRFunction *)callee, value->name));
+        ir_function_local_declared_type((IRFunction *)callee, value->name),
+        &src_unsigned);
     size_t p = 0;
     for (p = 0; declared == 0 && p < callee->parameter_count; p++) {
       if (callee->parameter_names && callee->parameter_names[p] &&
           strcmp(callee->parameter_names[p], value->name) == 0) {
         declared = ir_inline_integer_bytes(
-            callee->parameter_types ? callee->parameter_types[p] : NULL);
+            callee->parameter_types ? callee->parameter_types[p] : NULL,
+            &src_unsigned);
       }
     }
-    return declared > 0 && declared <= bytes;
+    return ir_inline_width_fits(declared, src_unsigned, bytes, is_unsigned);
   }
   if (value->kind != IR_OPERAND_TEMP || !value->name) {
     return 0;
@@ -733,14 +764,21 @@ static int ir_inline_value_fits_return(const IRFunction *callee,
     }
     switch (def->op) {
     case IR_OP_CAST: {
-      int cast_bytes = ir_inline_integer_bytes(def->text);
-      return cast_bytes > 0 && cast_bytes <= bytes;
+      int cast_unsigned = 0;
+      int cast_bytes = ir_inline_integer_bytes(def->text, &cast_unsigned);
+      return ir_inline_width_fits(cast_bytes, cast_unsigned, bytes,
+                                  is_unsigned);
     }
     case IR_OP_LOAD:
+      /* A sub-word load lands in the temp already extended the way its own
+       * signedness says, so it stands in for a value of that width. */
       return def->rhs.kind == IR_OPERAND_INT && def->rhs.int_value > 0 &&
-             def->rhs.int_value <= bytes;
+             def->rhs.int_value <= 8 &&
+             ir_inline_width_fits((int)def->rhs.int_value,
+                                  def->is_unsigned ? 1 : 0, bytes, is_unsigned);
     case IR_OP_ASSIGN:
-      return ir_inline_value_fits_return(callee, &def->lhs, bytes, depth + 1);
+      return ir_inline_value_fits_return(callee, &def->lhs, bytes, is_unsigned,
+                                         depth + 1);
     case IR_OP_BINARY:
       /* A comparison yields 0 or 1; everything else can leave the type. */
       return def->text &&
@@ -851,10 +889,12 @@ static int ir_inline_call_instruction(IRInstructionVector *vector,
          * a cast. Without it `fn f(a: int32, b: int32) -> int32 { return a *
          * b; }` inlined at `f(65536, 65536) == 0` compared 4294967296 against
          * zero and answered false, where the call answered true. */
+        int ret_unsigned = 0;
+        int ret_bytes =
+            ir_inline_integer_bytes(callee->return_type_name, &ret_unsigned);
         if (!source->is_float && ir_inline_return_is_narrow_integer(callee) &&
-            !ir_inline_value_fits_return(
-                callee, &source->lhs,
-                ir_inline_integer_bytes(callee->return_type_name), 0)) {
+            !ir_inline_value_fits_return(callee, &source->lhs, ret_bytes,
+                                         ret_unsigned, 0)) {
           char *narrowed = mettle_strdup(callee->return_type_name);
           if (!narrowed) {
             ir_instruction_destroy_storage(&emitted);
