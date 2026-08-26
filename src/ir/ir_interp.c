@@ -78,6 +78,13 @@ typedef struct {
      the full width. */
   int value_size;
   int value_is_unsigned;
+  /* The {chars, length} record a string DECLARE_LOCAL allocated for this
+     name. A string local's VALUE is an address, and an assignment replaces it
+     with someone else's record -- a literal's, or another local's -- so a
+     re-executed declaration must re-zero the record it owns rather than
+     whatever the value currently points at. Zeroing the latter rewrote the
+     string literal shared by every use of it. 0 = none allocated. */
+  unsigned long long string_record;
 } IIVar;
 
 typedef struct {
@@ -566,6 +573,22 @@ static unsigned long long ii_function_token(IRInterpMachine *machine,
     if (sym->kind == IR_MODSYM_FUNCTION && sym->name &&
         strcmp(sym->name, name) == 0) {
       return II_XFN_ADDR_BASE + (unsigned long long)i * II_FN_ADDR_STRIDE;
+    }
+  }
+  return 0;
+}
+
+int ir_interp_buffer_is_literal(const IRInterpMachine *machine,
+                                size_t index) {
+  size_t i = 0;
+  unsigned long long base = 0;
+  if (!machine || index >= machine->buffer_count) {
+    return 0;
+  }
+  base = machine->buffers[index].base;
+  for (i = 0; i < machine->literal_count; i++) {
+    if (machine->literals[i].chars == base) {
+      return 1;
     }
   }
   return 0;
@@ -3626,12 +3649,13 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         var->agg_size = 0;
         var->value_size = 8;
         var->value_is_unsigned = 1;
-        if (var->has_local_storage && var->value.i) {
+        if (var->string_record) {
           long long offset = 0;
-          IIBuffer *buf = ii_addr_to_buffer(
-              machine, (unsigned long long)var->value.i, 16, &offset);
+          IIBuffer *buf =
+              ii_addr_to_buffer(machine, var->string_record, 16, &offset);
           if (buf) {
             memset(buf->data + offset, 0, 16);
+            var->value = ii_int_value((long long)var->string_record);
             pc++;
             break;
           }
@@ -3651,6 +3675,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
                  0, 16);
           var->value = ii_int_value((long long)addr);
           var->has_local_storage = 1;
+          var->string_record = addr;
         }
         pc++;
         break;

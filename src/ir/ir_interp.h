@@ -116,6 +116,14 @@ long long ir_interp_pointee_window(IRInterpMachine *machine,
 unsigned long long ir_interp_function_address(IRInterpMachine *machine,
                                               const char *name);
 
+/* Was buffer `index` created to hold a string literal's bytes? Literals are
+ * materialized the first time a run reaches one, so which index a given
+ * literal lands on depends on the order control flow happens to visit them --
+ * an artifact of this machine, not something the program can observe. A
+ * harness comparing two runs' allocations positionally has to leave them out.
+ */
+int ir_interp_buffer_is_literal(const IRInterpMachine *machine, size_t index);
+
 /* Human-readable reason for the last non-OK status ("call_indirect",
  * "extern trace overflow", "local type 'string'", ...). */
 const char *ir_interp_status_detail(const IRInterpMachine *machine);
