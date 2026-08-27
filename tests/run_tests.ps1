@@ -2373,6 +2373,14 @@ $cases = @(
      Args = @("--verify")
      OutputMustMatch = @("translation validation: OK")
      OutputMustNotMatch = @("MISCOMPILE") },
+  # A narrow unsigned return type must narrow in the pre-pass run too: the
+  # rebuilt BEFORE function once dropped return_type_name, so any uint8/16/32
+  # result above the type's range read wide there and every pass that touched
+  # the function was quarantined on a phantom divergence.
+  @{ Name = "verify_unsigned_return"; Path = "tests/verify_unsigned_return.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     OutputMustMatch = @("translation validation: OK")
+     OutputMustNotMatch = @("MISCOMPILE") },
   @{ Name = "verify_sabotage_caught"; Path = "tests/verify_clean.mettle"; ShouldSucceed = $true
      Args = @("--verify")
      Env = @{ METTLE_VERIFY_BREAK = "constant_and_branch_simplify:dot" }

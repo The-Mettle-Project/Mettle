@@ -1,0 +1,22 @@
+fn rgb(r: uint32, g: uint32, b: uint32) -> uint32 {
+    return r | (g << 8) | (b << 16);
+}
+
+fn blend(a: uint32, b: uint32) -> uint32 {
+    return a + b;
+}
+
+fn narrow16(a: uint16, b: uint16) -> uint16 {
+    return a + b;
+}
+
+fn narrow8(a: uint8, b: uint8) -> uint8 {
+    return a + b;
+}
+
+fn main() -> int32 {
+    var g: uint32 = 4294967295;
+    var mixed: uint32 = rgb(7, g, 0) + blend(7, g);
+    var small: uint32 = (uint32)narrow16(60000, 60000) + (uint32)narrow8(200, 200);
+    return (int32)((mixed + small) & 255);
+}

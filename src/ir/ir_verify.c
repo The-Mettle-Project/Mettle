@@ -1261,6 +1261,7 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
   before_fn.parameter_names = function->parameter_names;
   before_fn.parameter_types = function->parameter_types;
   before_fn.parameter_count = function->parameter_count;
+  before_fn.return_type_name = function->return_type_name;
   before_fn.instructions = snapshot->instructions;
   before_fn.instruction_count = snapshot->instruction_count;
 
