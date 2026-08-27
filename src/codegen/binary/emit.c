@@ -2783,6 +2783,40 @@ int code_generator_binary_load_needs_sign_extend(
   return 1;
 }
 
+/* A 1- or 2-byte load arrives widened with movzx. A signed element has to come
+ * back as its own value before any 64-bit compare, divide or widening reads it;
+ * an unsigned one is tagged at lowering and stays zero-extended. Every scalar
+ * load path calls this, so the fused and folded address forms read a narrow
+ * integer the way the plain form does. */
+int code_generator_binary_widen_narrow_load(CodeGenerator *generator,
+                                            BinaryFunctionContext *context,
+                                            const IRInstruction *load, int size,
+                                            BinaryGpRegister value_register) {
+  if (!generator || !context || !load) {
+    return 0;
+  }
+  if ((size != 1 && size != 2) || load->is_float || load->is_unsigned) {
+    return 1;
+  }
+  if (!code_generator_binary_load_needs_sign_extend(generator, context,
+                                                   &load->dest, size)) {
+    return 1;
+  }
+  if (size == 1 ? binary_emit_movsx_reg_reg8(&context->code, value_register,
+                                             value_register)
+                : binary_emit_movsx_reg_reg16(&context->code, value_register,
+                                              value_register)) {
+    return 1;
+  }
+  if (!generator->has_error) {
+    code_generator_set_error(generator,
+                             "Out of memory while widening a narrow load in "
+                             "function '%s'",
+                             context->function_name);
+  }
+  return 0;
+}
+
 int code_generator_binary_emit_load(CodeGenerator *generator,
                                            BinaryFunctionContext *context,
                                            const IRInstruction *instruction) {
@@ -2856,24 +2890,8 @@ int code_generator_binary_emit_load(CodeGenerator *generator,
    * Skip when dest is int32. A load tagged is_unsigned (uint8/16/32 pointee, set
    * at lowering) must stay zero-extended -- without this its high bits get sign-
    * extended and 64-bit ops (compare/divide/(int64) widening) read garbage. */
-  /* Same for a 1- or 2-byte load: the movzx above widens it, and a signed
-   * pointee has to come back as its own value before any 64-bit compare or
-   * widening reads it. A load of an unsigned pointee is tagged and stays
-   * zero-extended. */
-  if ((size == 1 || size == 2) && !instruction->is_float &&
-      !instruction->is_unsigned &&
-      code_generator_binary_load_needs_sign_extend(generator, context,
-                                                   &instruction->dest, size) &&
-      !(size == 1 ? binary_emit_movsx_reg_reg8(&context->code, value_register,
-                                               value_register)
-                  : binary_emit_movsx_reg_reg16(&context->code, value_register,
-                                                value_register))) {
-    if (!generator->has_error) {
-      code_generator_set_error(generator,
-                               "Out of memory while emitting IR load in "
-                               "function '%s'",
-                               context->function_name);
-    }
+  if (!code_generator_binary_widen_narrow_load(generator, context, instruction,
+                                              size, value_register)) {
     return 0;
   }
   if (size == 4 && !instruction->is_float && !instruction->is_unsigned &&

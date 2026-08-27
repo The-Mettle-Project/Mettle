@@ -1554,6 +1554,10 @@ int code_generator_binary_try_emit_address_add_load(
     }
     return 0;
   }
+  if (!code_generator_binary_widen_narrow_load(generator, context, load, size,
+                                               BINARY_GP_RAX)) {
+    return 0;
+  }
   if (!code_generator_binary_emit_destination_store(generator, context,
                                                     &load->dest,
                                                     BINARY_GP_RAX)) {
@@ -2078,6 +2082,10 @@ int code_generator_binary_try_emit_offset_scaled_address_load(
       !binary_emit_movsxd_rax_eax(&context->code)) {
     return 0;
   }
+  if (!code_generator_binary_widen_narrow_load(generator, context, load, size,
+                                               BINARY_GP_RAX)) {
+    return 0;
+  }
   if (!code_generator_binary_emit_destination_store(generator, context,
                                                     &load->dest,
                                                     BINARY_GP_RAX)) {
@@ -2202,6 +2210,10 @@ int code_generator_binary_try_emit_scaled_address_load(
           "'%s'",
           context->function_name);
     }
+    return 0;
+  }
+  if (!code_generator_binary_widen_narrow_load(generator, context, load, size,
+                                               BINARY_GP_RAX)) {
     return 0;
   }
   if (!code_generator_binary_emit_destination_store(generator, context,

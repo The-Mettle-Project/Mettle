@@ -877,6 +877,7 @@ int code_generator_binary_is_compare_operator(const char *op);
 int code_generator_binary_is_marked_float64_symbol( const BinaryFunctionContext *context, const char *name);
 int code_generator_binary_label_reference_count( const IRFunction *function, const char *label);
 int code_generator_binary_load_needs_sign_extend( CodeGenerator *generator, BinaryFunctionContext *context, const IROperand *destination, int load_size);
+int code_generator_binary_widen_narrow_load(CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *load, int size, BinaryGpRegister value_register);
 int code_generator_binary_mark_float64_symbol( BinaryFunctionContext *context, const char *name);
 int code_generator_binary_mark_float_symbol( BinaryFunctionContext *context, const char *name, int bits);
 int code_generator_binary_marked_symbol_float_bits( const BinaryFunctionContext *context, const char *name);
