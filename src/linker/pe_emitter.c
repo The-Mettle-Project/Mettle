@@ -2,6 +2,7 @@
 #include "linker/linker_common.h"
 #include "../common.h"
 
+#include "linker/coff_reader.h"
 #include "linker/import_lib.h"
 #include "linker/relocation.h"
 #include "runtime/verify_owned.h"
@@ -226,22 +227,22 @@ static int pe_write_section_name(FILE *file, const char *name) {
   return fwrite(bytes, 1u, sizeof(bytes), file) == sizeof(bytes);
 }
 
-static uint32_t pe_characteristics_for_kind(CoffSectionKind kind) {
+static uint32_t pe_characteristics_for_kind(LinkSectionKind kind) {
   switch (kind) {
-  case COFF_SECTION_KIND_TEXT:
+  case LINK_SECTION_KIND_TEXT:
     return IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
-  case COFF_SECTION_KIND_RDATA:
+  case LINK_SECTION_KIND_RDATA:
     return IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
-  case COFF_SECTION_KIND_DATA:
+  case LINK_SECTION_KIND_DATA:
     return IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
            IMAGE_SCN_MEM_WRITE;
-  case COFF_SECTION_KIND_BSS:
+  case LINK_SECTION_KIND_BSS:
     return IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ |
            IMAGE_SCN_MEM_WRITE;
-  case COFF_SECTION_KIND_PDATA:
-  case COFF_SECTION_KIND_XDATA:
+  case LINK_SECTION_KIND_PDATA:
+  case LINK_SECTION_KIND_XDATA:
     return IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
-  case COFF_SECTION_KIND_UNKNOWN:
+  case LINK_SECTION_KIND_UNKNOWN:
   default:
     return IMAGE_SCN_MEM_READ;
   }
@@ -390,7 +391,7 @@ static int pe_collect_sections(const LinkResolution *resolution,
       continue;
     }
 
-    if (section->kind != COFF_SECTION_KIND_BSS && section->size > UINT32_MAX) {
+    if (section->kind != LINK_SECTION_KIND_BSS && section->size > UINT32_MAX) {
       mettle_set_error(error_message_out,
                    "Section '%s' exceeds PE raw-size limits",
                    section->name ? section->name : "<unknown>");
@@ -410,7 +411,7 @@ static int pe_collect_sections(const LinkResolution *resolution,
         pe_characteristics_for_kind(section->kind);
     layouts[layout_count].virtual_size = (uint32_t)section->virtual_size;
     layouts[layout_count].raw_size =
-        section->kind == COFF_SECTION_KIND_BSS ? 0u : (uint32_t)section->size;
+        section->kind == LINK_SECTION_KIND_BSS ? 0u : (uint32_t)section->size;
     layout_count++;
   }
 
@@ -452,7 +453,7 @@ static int pe_layout_sections(PeSectionLayout *layouts, size_t layout_count,
 
   for (i = 0u; i < layout_count; i++) {
     uint32_t aligned_virtual_size = 0u;
-    CoffSectionKind kind = layouts[i].source->kind;
+    LinkSectionKind kind = layouts[i].source->kind;
 
     layouts[i].virtual_address = current_rva;
     layouts[i].raw_offset = layouts[i].raw_size == 0u ? 0u : current_raw;
@@ -468,22 +469,22 @@ static int pe_layout_sections(PeSectionLayout *layouts, size_t layout_count,
     }
 
     switch (kind) {
-    case COFF_SECTION_KIND_TEXT:
+    case LINK_SECTION_KIND_TEXT:
       size_of_code += layouts[i].raw_size;
       if (base_of_code == 0u) {
         base_of_code = layouts[i].virtual_address;
       }
       break;
-    case COFF_SECTION_KIND_RDATA:
-    case COFF_SECTION_KIND_PDATA:
-    case COFF_SECTION_KIND_XDATA:
-    case COFF_SECTION_KIND_DATA:
+    case LINK_SECTION_KIND_RDATA:
+    case LINK_SECTION_KIND_PDATA:
+    case LINK_SECTION_KIND_XDATA:
+    case LINK_SECTION_KIND_DATA:
       size_of_init_data += layouts[i].raw_size;
       break;
-    case COFF_SECTION_KIND_BSS:
+    case LINK_SECTION_KIND_BSS:
       size_of_uninit_data += layouts[i].virtual_size;
       break;
-    case COFF_SECTION_KIND_UNKNOWN:
+    case LINK_SECTION_KIND_UNKNOWN:
     default:
       break;
     }

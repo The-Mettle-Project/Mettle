@@ -24,7 +24,7 @@ static uint64_t relocation_read_u64(const unsigned char *bytes) {
   return linker_read_u64(bytes);
 }
 
-static int relocation_section_is_debug_only(const CoffSection *section) {
+static int relocation_section_is_debug_only(const LinkSection *section) {
   const char *name = NULL;
 
   if (!section || !section->name) {
@@ -95,6 +95,7 @@ int link_apply_relocations(LinkResolution *resolution,
                            const LinkRelocationOptions *options,
                            char **error_message_out) {
   uint64_t image_base = 0;
+  size_t tls_size = 0;
   size_t object_index = 0;
 
   if (error_message_out) {
@@ -109,6 +110,13 @@ int link_apply_relocations(LinkResolution *resolution,
   if (options) {
     image_base = options->image_base;
   }
+  {
+    const LinkedSection *tls =
+        link_resolution_find_section(resolution, LINK_SECTION_KIND_TLS);
+    if (tls) {
+      tls_size = tls->virtual_size > tls->size ? tls->virtual_size : tls->size;
+    }
+  }
   for (object_index = 0; object_index < resolution->object_count;
        object_index++) {
     const LinkedInputObject *input = &resolution->objects[object_index];
@@ -120,7 +128,7 @@ int link_apply_relocations(LinkResolution *resolution,
 
     for (section_index = 0; section_index < input->object->section_count;
          section_index++) {
-      const CoffSection *source_section = &input->object->sections[section_index];
+      const LinkSection *source_section = &input->object->sections[section_index];
       size_t merged_section_index = LINKED_SECTION_INDEX_NONE;
       size_t relocation_index = 0;
 
@@ -145,36 +153,39 @@ int link_apply_relocations(LinkResolution *resolution,
       for (relocation_index = 0;
            relocation_index < source_section->relocation_count;
            relocation_index++) {
-        const CoffRelocation *relocation =
+        const LinkReloc *relocation =
             &source_section->relocations[relocation_index];
         LinkedSection *merged = &resolution->sections[merged_section_index];
         RelocationTarget target = {0};
         size_t patch_offset = input->section_merged_offsets[section_index] +
-                              (size_t)relocation->virtual_address;
+                              (size_t)relocation->offset;
         uint64_t patch_address = merged->virtual_address + patch_offset;
         int64_t addend = 0;
         int64_t value = 0;
         size_t width = 0;
 
         if (!relocation_resolve_target(resolution, input,
-                                       relocation->symbol_table_index, &target,
+                                       relocation->symbol_index, &target,
                                        error_message_out)) {
           return 0;
         }
 
-        switch (relocation->type) {
-        case COFF_RELOC_AMD64_ADDR64:
+        switch (relocation->kind) {
+        case LINK_RELOC_ABS64:
           width = 8u;
           break;
-        case COFF_RELOC_AMD64_ADDR32NB:
-        case COFF_RELOC_AMD64_REL32:
-        case COFF_RELOC_AMD64_SECREL:
+        case LINK_RELOC_PC32:
+        case LINK_RELOC_ABS32:
+        case LINK_RELOC_IMAGE_REL32:
+        case LINK_RELOC_SECREL32:
+        case LINK_RELOC_TPOFF32:
+        case LINK_RELOC_GOTPCREL32:
           width = 4u;
           break;
         default:
           mettle_set_error(error_message_out,
-                               "Unsupported relocation type %s for symbol '%s'",
-                               coff_relocation_type_name(relocation->type),
+                               "Unsupported relocation kind %s for symbol '%s'",
+                               link_reloc_kind_name(relocation->kind),
                                target.name);
           return 0;
         }
@@ -187,35 +198,51 @@ int link_apply_relocations(LinkResolution *resolution,
           return 0;
         }
 
-        if (width == 8u) {
+        if (relocation->addend_is_explicit) {
+          addend = relocation->addend;
+        } else if (width == 8u) {
           addend = (int64_t)relocation_read_u64(merged->data + patch_offset);
         } else {
           addend = (int64_t)(int32_t)linker_read_u32(merged->data + patch_offset);
         }
 
-        switch (relocation->type) {
-        case COFF_RELOC_AMD64_REL32:
+        switch (relocation->kind) {
+        case LINK_RELOC_PC32:
+        case LINK_RELOC_GOTPCREL32:
           value = (int64_t)target.virtual_address + addend -
-                  (int64_t)(patch_address + 4u);
+                  (int64_t)patch_address;
+          if (!relocation->addend_is_explicit) {
+            value -= 4;
+          }
           if (value < INT32_MIN || value > INT32_MAX) {
             mettle_set_error(error_message_out,
-                                 "REL32 relocation for symbol '%s' is out of range",
+                                 "PC32 relocation for symbol '%s' is out of range",
                                  target.name);
             return 0;
           }
           linker_write_u32(merged->data + patch_offset, (uint32_t)(int32_t)value);
           break;
-        case COFF_RELOC_AMD64_ADDR64:
+        case LINK_RELOC_ABS64:
           value = (int64_t)target.virtual_address + addend;
           if (value < 0) {
             mettle_set_error(error_message_out,
-                                 "ADDR64 relocation for symbol '%s' is negative",
+                                 "ABS64 relocation for symbol '%s' is negative",
                                  target.name);
             return 0;
           }
           linker_write_u64(merged->data + patch_offset, (uint64_t)value);
           break;
-        case COFF_RELOC_AMD64_ADDR32NB:
+        case LINK_RELOC_ABS32:
+          value = (int64_t)target.virtual_address + addend;
+          if (value < 0 || (uint64_t)value > UINT32_MAX) {
+            mettle_set_error(error_message_out,
+                                 "ABS32 relocation for symbol '%s' is out of range",
+                                 target.name);
+            return 0;
+          }
+          linker_write_u32(merged->data + patch_offset, (uint32_t)value);
+          break;
+        case LINK_RELOC_IMAGE_REL32:
           if (image_base != 0u && target.virtual_address >= image_base) {
             value = (int64_t)(target.virtual_address - image_base) + addend;
           } else {
@@ -223,21 +250,33 @@ int link_apply_relocations(LinkResolution *resolution,
           }
           if (value < 0 || (uint64_t)value > UINT32_MAX) {
             mettle_set_error(error_message_out,
-                                 "ADDR32NB relocation for symbol '%s' is out of range",
+                                 "IMAGE_REL32 relocation for symbol '%s' is out of range",
                                  target.name);
             return 0;
           }
           linker_write_u32(merged->data + patch_offset, (uint32_t)value);
           break;
-        case COFF_RELOC_AMD64_SECREL:
+        case LINK_RELOC_SECREL32:
           value = (int64_t)target.merged_offset + addend;
           if (value < 0 || (uint64_t)value > UINT32_MAX) {
             mettle_set_error(error_message_out,
-                                 "SECREL relocation for symbol '%s' is out of range",
+                                 "SECREL32 relocation for symbol '%s' is out of range",
                                  target.name);
             return 0;
           }
           linker_write_u32(merged->data + patch_offset, (uint32_t)value);
+          break;
+        case LINK_RELOC_TPOFF32:
+          value = (int64_t)target.merged_offset + addend - (int64_t)tls_size;
+          if (value < INT32_MIN || value > INT32_MAX) {
+            mettle_set_error(error_message_out,
+                                 "TPOFF32 relocation for symbol '%s' is out of range",
+                                 target.name);
+            return 0;
+          }
+          linker_write_u32(merged->data + patch_offset, (uint32_t)(int32_t)value);
+          break;
+        default:
           break;
         }
       }

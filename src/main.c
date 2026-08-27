@@ -680,7 +680,7 @@ static int parse_linker_mode(const char *text, LinkerMode *mode_out) {
  * split rather than inside either arm of it. */
 static int object_has_undefined_symbol_prefix(const char *object_path,
                                               const char *prefix) {
-  CoffObject *object = NULL;
+  LinkObject *object = NULL;
   char *error_message = NULL;
   size_t i = 0u;
   int found = 0;
@@ -689,14 +689,16 @@ static int object_has_undefined_symbol_prefix(const char *object_path,
     return 0;
   }
 
-  if (!coff_object_read(object_path, &object, &error_message)) {
+  if (!link_object_read(object_path, &object, &error_message)) {
     free(error_message);
     return 1;
   }
 
   for (i = 0u; i < object->symbol_count; i++) {
-    const CoffSymbol *symbol = &object->symbols[i];
-    if (symbol->is_auxiliary || symbol->section_number != 0 || !symbol->name) {
+    const LinkSymbol *symbol = &object->symbols[i];
+    if (symbol->is_auxiliary ||
+        symbol->section_index != LINK_SECTION_INDEX_UNDEFINED ||
+        !symbol->name) {
       continue;
     }
     if (strncmp(symbol->name, prefix, strlen(prefix)) == 0) {
@@ -706,7 +708,7 @@ static int object_has_undefined_symbol_prefix(const char *object_path,
   }
 
   free(error_message);
-  coff_object_destroy(object);
+  link_object_destroy(object);
   return found;
 }
 

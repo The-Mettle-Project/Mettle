@@ -251,6 +251,8 @@ static int link_object_adopt_coff_symbols(const CoffObject *coff, LinkObject *ob
         symbol->name = source->name ? mettle_strdup(source->name) : NULL;
         symbol->value = source->value;
         symbol->is_auxiliary = source->is_auxiliary;
+        symbol->aux_section_length =
+            source->has_auxiliary_record ? source->aux_section_length : 0u;
         symbol->section_index = LINK_SECTION_INDEX_UNDEFINED;
 
         if (source->is_auxiliary) {

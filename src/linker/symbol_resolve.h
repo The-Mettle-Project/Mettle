@@ -1,13 +1,13 @@
 #ifndef SYMBOL_RESOLVE_H
 #define SYMBOL_RESOLVE_H
 
-#include "linker/coff_reader.h"
+#include "linker/link_object.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
 #define LINKED_SECTION_INDEX_NONE ((size_t)-1)
-#define LINKED_SECTION_COUNT 6u
+#define LINKED_SECTION_COUNT 7u
 
 typedef struct {
   size_t object_index;
@@ -18,7 +18,7 @@ typedef struct {
 } LinkedSectionContribution;
 
 typedef struct {
-  CoffSectionKind kind;
+  LinkSectionKind kind;
   const char *name;
   unsigned char *data;
   size_t data_capacity;
@@ -39,7 +39,7 @@ typedef struct {
   int is_external;
   int is_local;
   int is_auxiliary;
-  int16_t section_number;
+  int64_t section_index;
   size_t merged_section_index;
   size_t merged_offset;
   uint64_t virtual_address;
@@ -47,7 +47,7 @@ typedef struct {
 
 typedef struct {
   char *path;
-  CoffObject *object;
+  LinkObject *object;
   size_t *section_merged_indices;
   size_t *section_merged_offsets;
   size_t *section_merged_sizes;
@@ -114,7 +114,7 @@ int link_resolution_build(const char **object_paths, size_t object_count,
 void link_resolution_destroy(LinkResolution *resolution);
 
 const LinkedSection *link_resolution_find_section(const LinkResolution *resolution,
-                                                  CoffSectionKind kind);
+                                                  LinkSectionKind kind);
 const LinkedSymbol *link_resolution_find_symbol(const LinkResolution *resolution,
                                                 const char *name);
 

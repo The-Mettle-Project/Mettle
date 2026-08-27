@@ -211,7 +211,7 @@ static int expect_rel32(const char *caller_path, const char *provider_path) {
     goto cleanup;
   }
 
-  text = link_resolution_find_section(resolution, COFF_SECTION_KIND_TEXT);
+  text = link_resolution_find_section(resolution, LINK_SECTION_KIND_TEXT);
   callee = link_resolution_find_symbol(resolution, "callee");
   if (!text || !callee || text->size < 4u) {
     result = report_failure("REL32 resolution produced invalid merged text",
@@ -250,7 +250,7 @@ static int expect_addr64(const char *holder_path, const char *provider_path) {
     goto cleanup;
   }
 
-  rdata = link_resolution_find_section(resolution, COFF_SECTION_KIND_RDATA);
+  rdata = link_resolution_find_section(resolution, LINK_SECTION_KIND_RDATA);
   target = link_resolution_find_symbol(resolution, TEST_TARGET_DATA_SYMBOL);
   if (!rdata || !target || rdata->size < 8u) {
     result = report_failure("ADDR64 resolution produced invalid merged rdata",
@@ -290,7 +290,7 @@ static int expect_addr32nb(const char *holder_path, const char *provider_path) {
     goto cleanup;
   }
 
-  data = link_resolution_find_section(resolution, COFF_SECTION_KIND_DATA);
+  data = link_resolution_find_section(resolution, LINK_SECTION_KIND_DATA);
   target = link_resolution_find_symbol(resolution, TEST_TARGET_DATA_SYMBOL);
   if (!data || !target || data->size < 4u) {
     result = report_failure("ADDR32NB resolution produced invalid merged data",
@@ -329,7 +329,7 @@ static int expect_secrel(const char *holder_path, const char *provider_path) {
     goto cleanup;
   }
 
-  data = link_resolution_find_section(resolution, COFF_SECTION_KIND_DATA);
+  data = link_resolution_find_section(resolution, LINK_SECTION_KIND_DATA);
   target = link_resolution_find_symbol(resolution, TEST_TARGET_DATA_SYMBOL);
   if (!data || !target || data->size < 4u) {
     result = report_failure("SECREL resolution produced invalid merged data",

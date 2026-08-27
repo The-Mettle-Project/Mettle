@@ -29,41 +29,43 @@
 #define IMAGE_SCN_ALIGN_8192BYTES 0x00E00000u
 
 
-static size_t link_section_index_from_kind(CoffSectionKind kind) {
+static size_t link_section_index_from_kind(LinkSectionKind kind) {
   switch (kind) {
-  case COFF_SECTION_KIND_TEXT:
+  case LINK_SECTION_KIND_TEXT:
     return 0u;
-  case COFF_SECTION_KIND_RDATA:
+  case LINK_SECTION_KIND_RDATA:
     return 1u;
-  case COFF_SECTION_KIND_DATA:
+  case LINK_SECTION_KIND_DATA:
     return 2u;
-  case COFF_SECTION_KIND_BSS:
+  case LINK_SECTION_KIND_BSS:
     return 3u;
-  case COFF_SECTION_KIND_PDATA:
+  case LINK_SECTION_KIND_PDATA:
     return 4u;
-  case COFF_SECTION_KIND_XDATA:
+  case LINK_SECTION_KIND_XDATA:
     return 5u;
-  case COFF_SECTION_KIND_UNKNOWN:
+  case LINK_SECTION_KIND_UNKNOWN:
   default:
     return LINKED_SECTION_INDEX_NONE;
   }
 }
 
-static const char *link_section_name_from_kind(CoffSectionKind kind) {
+static const char *link_section_name_from_kind(LinkSectionKind kind) {
   switch (kind) {
-  case COFF_SECTION_KIND_TEXT:
+  case LINK_SECTION_KIND_TEXT:
     return ".text";
-  case COFF_SECTION_KIND_RDATA:
+  case LINK_SECTION_KIND_RDATA:
     return ".rdata";
-  case COFF_SECTION_KIND_DATA:
+  case LINK_SECTION_KIND_DATA:
     return ".data";
-  case COFF_SECTION_KIND_BSS:
+  case LINK_SECTION_KIND_BSS:
     return ".bss";
-  case COFF_SECTION_KIND_PDATA:
+  case LINK_SECTION_KIND_PDATA:
     return ".pdata";
-  case COFF_SECTION_KIND_XDATA:
+  case LINK_SECTION_KIND_XDATA:
     return ".xdata";
-  case COFF_SECTION_KIND_UNKNOWN:
+  case LINK_SECTION_KIND_TLS:
+    return ".tls";
+  case LINK_SECTION_KIND_UNKNOWN:
   default:
     return "<unknown>";
   }
@@ -104,27 +106,27 @@ static size_t link_alignment_from_characteristics(uint32_t characteristics) {
   }
 }
 
-static size_t link_default_section_alignment(CoffSectionKind kind,
+static size_t link_default_section_alignment(LinkSectionKind kind,
                                              size_t fallback_alignment) {
   if (fallback_alignment > 1u) {
     return fallback_alignment;
   }
 
   switch (kind) {
-  case COFF_SECTION_KIND_TEXT:
-  case COFF_SECTION_KIND_RDATA:
-  case COFF_SECTION_KIND_DATA:
-  case COFF_SECTION_KIND_BSS:
-  case COFF_SECTION_KIND_PDATA:
-  case COFF_SECTION_KIND_XDATA:
+  case LINK_SECTION_KIND_TEXT:
+  case LINK_SECTION_KIND_RDATA:
+  case LINK_SECTION_KIND_DATA:
+  case LINK_SECTION_KIND_BSS:
+  case LINK_SECTION_KIND_PDATA:
+  case LINK_SECTION_KIND_XDATA:
     return 16u;
-  case COFF_SECTION_KIND_UNKNOWN:
+  case LINK_SECTION_KIND_UNKNOWN:
   default:
     return 1u;
   }
 }
 
-static size_t link_section_alignment(const CoffSection *section,
+static size_t link_section_alignment(const LinkSection *section,
                                      size_t fallback_alignment) {
   size_t alignment = 0;
 
@@ -132,8 +134,8 @@ static size_t link_section_alignment(const CoffSection *section,
     return 1u;
   }
 
-  alignment = link_alignment_from_characteristics(section->characteristics);
-  if (alignment != 0u) {
+  alignment = (size_t)section->alignment;
+  if (alignment > 1u) {
     return alignment;
   }
 
@@ -204,9 +206,9 @@ static int link_section_reserve_contributions(LinkedSection *section,
   return 1;
 }
 
-static size_t link_estimate_section_size(const CoffObject *object,
+static size_t link_estimate_section_size(const LinkObject *object,
                                          size_t section_index) {
-  const CoffSection *section = NULL;
+  const LinkSection *section = NULL;
   size_t size = 0;
   size_t i = 0;
   int saw_symbol = 0;
@@ -217,13 +219,14 @@ static size_t link_estimate_section_size(const CoffObject *object,
 
   section = &object->sections[section_index];
   for (i = 0; i < object->symbol_count; i++) {
-    const CoffSymbol *symbol = &object->symbols[i];
+    const LinkSymbol *symbol = &object->symbols[i];
 
-    if (symbol->is_auxiliary || !symbol->has_auxiliary_record || !symbol->name) {
+    if (symbol->is_auxiliary || symbol->aux_section_length == 0u ||
+        !symbol->name) {
       continue;
     }
-    if (symbol->storage_class != COFF_STORAGE_CLASS_STATIC ||
-        symbol->section_number != (int16_t)(section_index + 1u)) {
+    if (symbol->is_external ||
+        symbol->section_index != (int64_t)section_index) {
       continue;
     }
     if (strcmp(symbol->name, section->name) != 0) {
@@ -238,15 +241,16 @@ static size_t link_estimate_section_size(const CoffObject *object,
   if (section->virtual_size > size) {
     size = section->virtual_size;
   }
-  if (section->kind != COFF_SECTION_KIND_BSS) {
+  if (section->kind != LINK_SECTION_KIND_BSS) {
     return size;
   }
 
   for (i = 0; i < object->symbol_count; i++) {
-    const CoffSymbol *symbol = &object->symbols[i];
+    const LinkSymbol *symbol = &object->symbols[i];
     size_t end = 0;
 
-    if (symbol->is_auxiliary || symbol->section_number != (int16_t)(section_index + 1u)) {
+    if (symbol->is_auxiliary ||
+        symbol->section_index != (int64_t)section_index) {
       continue;
     }
     saw_symbol = 1;
@@ -264,9 +268,10 @@ static size_t link_estimate_section_size(const CoffObject *object,
 }
 
 static int link_resolution_init_sections(LinkResolution *resolution) {
-  static const CoffSectionKind kinds[LINKED_SECTION_COUNT] = {
-      COFF_SECTION_KIND_TEXT, COFF_SECTION_KIND_RDATA, COFF_SECTION_KIND_DATA,
-      COFF_SECTION_KIND_BSS, COFF_SECTION_KIND_PDATA, COFF_SECTION_KIND_XDATA};
+  static const LinkSectionKind kinds[LINKED_SECTION_COUNT] = {
+      LINK_SECTION_KIND_TEXT, LINK_SECTION_KIND_RDATA, LINK_SECTION_KIND_DATA,
+      LINK_SECTION_KIND_BSS,  LINK_SECTION_KIND_PDATA, LINK_SECTION_KIND_XDATA,
+      LINK_SECTION_KIND_TLS};
   size_t i = 0;
 
   if (!resolution) {
@@ -310,7 +315,7 @@ static int link_resolution_load_objects(LinkResolution *resolution,
       return 0;
     }
 
-    if (!coff_object_read(object_paths[i], &input->object, error_message_out)) {
+    if (!link_object_read(object_paths[i], &input->object, error_message_out)) {
       return 0;
     }
   }
@@ -338,15 +343,15 @@ typedef struct {
   size_t section_index;
 } GcWorkItem;
 
-static int link_section_is_gc_eligible(const CoffSection *section) {
+static int link_section_is_gc_eligible(const LinkSection *section) {
   if (!section->name || !strchr(section->name, '$')) {
     return 0;
   }
   switch (section->kind) {
-  case COFF_SECTION_KIND_TEXT:
-  case COFF_SECTION_KIND_RDATA:
-  case COFF_SECTION_KIND_DATA:
-  case COFF_SECTION_KIND_BSS:
+  case LINK_SECTION_KIND_TEXT:
+  case LINK_SECTION_KIND_RDATA:
+  case LINK_SECTION_KIND_DATA:
+  case LINK_SECTION_KIND_BSS:
     return 1;
   default:
     return 0;
@@ -431,7 +436,7 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
 
   for (object_index = 0; object_index < resolution->object_count;
        object_index++) {
-    const CoffObject *object = resolution->objects[object_index].object;
+    const LinkObject *object = resolution->objects[object_index].object;
     if (!object) {
       continue;
     }
@@ -458,7 +463,7 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
   for (object_index = 0; object_index < resolution->object_count;
        object_index++) {
     LinkedInputObject *input = &resolution->objects[object_index];
-    const CoffObject *object = input->object;
+    const LinkObject *object = input->object;
     size_t i = 0;
 
     if (!object) {
@@ -476,18 +481,17 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
     }
 
     for (i = 0; i < object->symbol_count; i++) {
-      const CoffSymbol *symbol = &object->symbols[i];
+      const LinkSymbol *symbol = &object->symbols[i];
       GcDefinition definition = {0};
 
       if (symbol->is_auxiliary || !symbol->name ||
-          symbol->storage_class != COFF_STORAGE_CLASS_EXTERNAL ||
-          symbol->section_number <= 0 ||
-          (size_t)symbol->section_number > object->section_count) {
+          !symbol->is_external || symbol->section_index < 0 ||
+          (size_t)symbol->section_index >= object->section_count) {
         continue;
       }
       definition.name = symbol->name;
       definition.object_index = object_index;
-      definition.section_index = (size_t)(symbol->section_number - 1);
+      definition.section_index = (size_t)symbol->section_index;
       definition.is_runtime_default = input->is_runtime_default;
       if (!gc_insert_definition(table, bucket_count, &definition,
                                 error_message_out)) {
@@ -498,15 +502,15 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
 
   for (object_index = 0; object_index < resolution->object_count;
        object_index++) {
-    const CoffObject *object = resolution->objects[object_index].object;
+    const LinkObject *object = resolution->objects[object_index].object;
     size_t i = 0;
 
     if (!object) {
       continue;
     }
     for (i = 0; i < object->section_count; i++) {
-      const CoffSection *section = &object->sections[i];
-      if (section->kind == COFF_SECTION_KIND_UNKNOWN) {
+      const LinkSection *section = &object->sections[i];
+      if (section->kind == LINK_SECTION_KIND_UNKNOWN) {
         continue;
       }
       if (!link_section_is_gc_eligible(section)) {
@@ -527,13 +531,13 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
   while (processed < worklist_count) {
     GcWorkItem item = worklist[processed++];
     LinkedInputObject *input = &resolution->objects[item.object_index];
-    const CoffObject *object = input->object;
-    const CoffSection *section = &object->sections[item.section_index];
+    const LinkObject *object = input->object;
+    const LinkSection *section = &object->sections[item.section_index];
     size_t r = 0;
 
     for (r = 0; r < section->relocation_count; r++) {
-      uint32_t symbol_index = section->relocations[r].symbol_table_index;
-      const CoffSymbol *symbol = NULL;
+      uint32_t symbol_index = section->relocations[r].symbol_index;
+      const LinkSymbol *symbol = NULL;
 
       if (symbol_index >= object->symbol_count) {
         continue;
@@ -543,11 +547,12 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
       if (symbol->is_auxiliary) {
         continue;
       }
-      if (symbol->section_number > 0 &&
-          (size_t)symbol->section_number <= object->section_count) {
+      if (symbol->section_index >= 0 &&
+          (size_t)symbol->section_index < object->section_count) {
         gc_mark(live, worklist, &worklist_count, item.object_index,
-                (size_t)(symbol->section_number - 1));
-      } else if (symbol->section_number == 0 && symbol->name) {
+                (size_t)symbol->section_index);
+      } else if (symbol->section_index == LINK_SECTION_INDEX_UNDEFINED &&
+                 symbol->name) {
         const GcDefinition *definition =
             gc_find_definition(table, bucket_count, symbol->name);
         if (definition) {
@@ -561,7 +566,7 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
   for (object_index = 0; object_index < resolution->object_count;
        object_index++) {
     LinkedInputObject *input = &resolution->objects[object_index];
-    const CoffObject *object = input->object;
+    const LinkObject *object = input->object;
     size_t i = 0;
 
     if (!object) {
@@ -587,15 +592,15 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
     for (object_index = 0; object_index < resolution->object_count;
          object_index++) {
       const LinkedInputObject *input = &resolution->objects[object_index];
-      const CoffObject *object = input->object;
+      const LinkObject *object = input->object;
       size_t i = 0;
 
       if (!object) {
         continue;
       }
       for (i = 0; i < object->section_count; i++) {
-        const CoffSection *section = &object->sections[i];
-        if (section->kind == COFF_SECTION_KIND_UNKNOWN ||
+        const LinkSection *section = &object->sections[i];
+        if (section->kind == LINK_SECTION_KIND_UNKNOWN ||
             section->size_of_raw_data == 0u) {
           continue;
         }
@@ -651,7 +656,7 @@ static int link_resolution_merge_sections(LinkResolution *resolution,
     }
 
     for (section_index = 0; section_index < section_count; section_index++) {
-      const CoffSection *section = &input->object->sections[section_index];
+      const LinkSection *section = &input->object->sections[section_index];
       size_t merged_index = link_section_index_from_kind(section->kind);
       size_t alignment = link_section_alignment(section, fallback_alignment);
       size_t contribution_size = 0;
@@ -679,7 +684,7 @@ static int link_resolution_merge_sections(LinkResolution *resolution,
         return 0;
       }
 
-      if (section->kind != COFF_SECTION_KIND_BSS) {
+      if (section->kind != LINK_SECTION_KIND_BSS) {
         if (!link_section_reserve_data(merged, start + section->size_of_raw_data,
                                        error_message_out)) {
           return 0;
@@ -921,14 +926,14 @@ static int link_resolution_build_symbols(LinkResolution *resolution,
     }
 
     for (symbol_index = 0; symbol_index < input->symbol_count; symbol_index++) {
-      const CoffSymbol *symbol = &input->object->symbols[symbol_index];
+      const LinkSymbol *symbol = &input->object->symbols[symbol_index];
       LinkedObjectSymbol *resolved = &input->symbols[symbol_index];
       size_t section_index = 0;
       size_t merged_index = LINKED_SECTION_INDEX_NONE;
 
       resolved->object_index = object_index;
       resolved->symbol_index = (uint32_t)symbol_index;
-      resolved->section_number = symbol->section_number;
+      resolved->section_index = symbol->section_index;
       resolved->merged_section_index = LINKED_SECTION_INDEX_NONE;
       resolved->is_auxiliary = symbol->is_auxiliary;
       resolved->name = mettle_strdup(symbol->name);
@@ -943,18 +948,18 @@ static int link_resolution_build_symbols(LinkResolution *resolution,
         continue;
       }
 
-      resolved->is_external = (symbol->storage_class == COFF_STORAGE_CLASS_EXTERNAL);
+      resolved->is_external = symbol->is_external;
       resolved->is_local = !resolved->is_external;
 
-      if (symbol->section_number > 0) {
-        section_index = (size_t)(symbol->section_number - 1);
+      if (symbol->section_index >= 0) {
+        section_index = (size_t)symbol->section_index;
         if (section_index >= input->object->section_count) {
           mettle_set_error(error_message_out,
-                                    "Symbol '%s' in '%s' refers to section %d "
+                                    "Symbol '%s' in '%s' refers to section %lld "
                                     "outside the section table",
                                     symbol->name ? symbol->name : "<unnamed>",
                                     input->path ? input->path : "<unknown>",
-                                    symbol->section_number);
+                                    (long long)symbol->section_index);
           return 0;
         }
 
@@ -967,15 +972,16 @@ static int link_resolution_build_symbols(LinkResolution *resolution,
         }
       }
 
-      if (symbol->section_number > 0 && input->section_gc_dead &&
-          input->section_gc_dead[(size_t)(symbol->section_number - 1)]) {
+      if (symbol->section_index >= 0 && input->section_gc_dead &&
+          input->section_gc_dead[(size_t)symbol->section_index]) {
         continue;
       }
       /* An undefined external nothing retained relocates against is dropped
        * rather than recorded, so it neither fails resolution nor becomes a
        * DLL import. Mettle objects declare every extern a module names, used
        * or not, and the runtime's dead code names libc symbols. */
-      if (symbol->section_number == 0 && input->symbol_gc_referenced &&
+      if (symbol->section_index == LINK_SECTION_INDEX_UNDEFINED &&
+          input->symbol_gc_referenced &&
           !input->symbol_gc_referenced[symbol_index]) {
         continue;
       }
@@ -1180,7 +1186,7 @@ void link_resolution_destroy(LinkResolution *resolution) {
     free(input->symbols);
     free(input->section_gc_dead);
     free(input->symbol_gc_referenced);
-    coff_object_destroy(input->object);
+    link_object_destroy(input->object);
   }
 
   for (section_index = 0; section_index < LINKED_SECTION_COUNT; section_index++) {
@@ -1200,7 +1206,7 @@ void link_resolution_destroy(LinkResolution *resolution) {
 }
 
 const LinkedSection *link_resolution_find_section(
-    const LinkResolution *resolution, CoffSectionKind kind) {
+    const LinkResolution *resolution, LinkSectionKind kind) {
   size_t section_index = link_section_index_from_kind(kind);
 
   if (!resolution || section_index == LINKED_SECTION_INDEX_NONE) {

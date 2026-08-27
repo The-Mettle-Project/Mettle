@@ -77,7 +77,7 @@ static int expect_function_merge(const char *entry_obj, const char *provider_obj
     goto cleanup;
   }
 
-  text = link_resolution_find_section(resolution, COFF_SECTION_KIND_TEXT);
+  text = link_resolution_find_section(resolution, LINK_SECTION_KIND_TEXT);
   if (!text || text->contribution_count != 2u || text->size == 0u) {
     result = report_failure("Merged .text section was not constructed as expected",
                             entry_obj);
@@ -131,8 +131,8 @@ static int expect_data_merge(const char *entry_obj, const char *provider_obj) {
     goto cleanup;
   }
 
-  text = link_resolution_find_section(resolution, COFF_SECTION_KIND_TEXT);
-  data = link_resolution_find_section(resolution, COFF_SECTION_KIND_DATA);
+  text = link_resolution_find_section(resolution, LINK_SECTION_KIND_TEXT);
+  data = link_resolution_find_section(resolution, LINK_SECTION_KIND_DATA);
   if (!text || text->contribution_count != 1u || !data ||
       data->contribution_count != 1u || data->size == 0u) {
     result = report_failure("Merged .text/.data sections were not constructed as expected",
@@ -176,7 +176,7 @@ static int expect_bss_merge(const char *entry_obj, const char *provider_obj) {
     goto cleanup;
   }
 
-  bss = link_resolution_find_section(resolution, COFF_SECTION_KIND_BSS);
+  bss = link_resolution_find_section(resolution, LINK_SECTION_KIND_BSS);
   if (!bss || bss->contribution_count != 1u || bss->virtual_size != 8u) {
     result = report_failure("Merged .bss section size was not preserved exactly",
                             provider_obj);
