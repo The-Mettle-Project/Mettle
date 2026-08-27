@@ -28,6 +28,87 @@ Parameter and return types must match what the other side declares. The
 convention comes from the target: the Microsoft ABI on Windows x86-64, System
 V on Linux x86-64, AAPCS64 on Linux AArch64.
 
+## What a name can resolve to
+
+`extern` declares a name; it does not conjure one. Nothing checks at compile
+time that the symbol exists, so a name nothing provides compiles cleanly and
+fails at the link:
+
+```text
+Warning: Internal linker PE emission failed: Unresolved external symbol 'sqrt'
+Error: Internal linker failed to produce an executable
+```
+
+```text
+(.text.main+0x18): undefined reference to `sqrt'
+collect2: error: ld returned 1 exit status
+```
+
+Two things can satisfy a name on Windows:
+
+- **The owned runtime.** The libc subset Mettle implements itself: `malloc`,
+  `free`, `printf`, `fopen`, `fwrite`, `memcpy`, `strlen`, `atoi`, `strtod`,
+  `qsort`, `rand`, `srand`, `abort`, `exit`, and around two hundred more.
+- **The Win32 DLL probe.** `kernel32`, `user32`, `gdi32`, `advapi32`, `ws2_32`.
+  This is where `GetStdHandle`, `ReadFile` and `CreateWindowExA` come from.
+  **UCRT and MSVCRT are not in the set**, so a C-library name that the owned
+  runtime does not carry has nowhere left to come from.
+
+On Linux there is only the first. No shared library ever links, so there is no
+equivalent of the DLL probe: the owned runtime is the whole surface, plus the
+syscall, socket and pthread entries the Linux build of it adds.
+
+To see the list for a target, read the symbols out of the runtime objects the
+build stages beside the compiler:
+
+```bash
+nm -g --defined-only bin/runtime/*.o | awk '$2=="T" {print $3}' | sort -u
+```
+
+### The edge that catches people
+
+**The float32 math functions are there and the float64 ones are not.**
+`sqrtf`, `sinf`, `cosf`, `powf`, `expf`, `logf` and `tanhf` all resolve,
+because code generation itself needs them. `sqrt`, `sin`, `cos`, `pow`, `log`
+and `exp` do not resolve at all.
+
+Do not reach for them through `extern`. Double-precision math is
+[`std/math`](standard-library.md), written in Mettle, so it has nothing to
+resolve and behaves the same on every target:
+
+```mettle
+import "std/math";
+
+var r: float64 = sqrt(16.0);      // 4.0
+var p: float64 = pow(2.0, 10.0);  // 1024.0
+```
+
+`std/math` exports its constants as functions - `PI()`, `TAU()`, `E()` and
+nine more - so they occupy those names. Declaring a `var TAU` of your own
+beside the import collides with one.
+
+### Where to go instead
+
+| Wanted | Not this | This |
+|---|---|---|
+| Double-precision math | `extern fn sqrt(...) = "sqrt"` | `import "std/math"` |
+| Wall clock, an RNG seed | `extern fn time(...) = "time"` | `bench_time_us()` from `std/bench` |
+| Win32 calls | a raw `extern` per entry | `import "std/win32"` |
+| Sockets | `extern` per platform | `import "std/net"` |
+| `rand`, `srand`, `exit` | — | `import "std/process"` (these *are* owned) |
+
+`time` is the one that bites, because seeding an RNG from it is such a common
+habit. It is a C-library name, not a Win32 one, so on Windows the DLL probe
+never sees it and MSVCRT is excluded; on Linux nothing provides it either.
+`clock` and `gettimeofday` *are* owned on both, if you want them raw.
+
+Linking a C runtime to fill the gap is not the way out. The build refuses
+the argument outright:
+
+```text
+Error: --link-arg '-lmsvcrt' names a forbidden C or compiler runtime
+```
+
 ## Calling in
 
 Mark a Mettle function `export` and C can call it by name:

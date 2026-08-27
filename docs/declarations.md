@@ -255,14 +255,63 @@ Without `export`, a declaration is private to its file.
 
 ## extern
 
-`extern` declares something the linker will supply, usually from C:
+`extern` declares something the linker will supply. The declaration is a
+promise, not a check: nothing verifies at compile time that the symbol
+exists, and a name nothing provides fails at the link instead.
+[C interoperability](c-interop.md) covers what can satisfy one.
+
+Without a link name, the Mettle name *is* the symbol:
 
 ```mettle
 extern fn strlen(s: cstring) -> int64;
 ```
 
-[C interoperability](c-interop.md) covers the calling convention and the types
-that cross the boundary.
+With `= "symbol"`, the two differ, which is how a C name that collides with
+something of yours gets a different spelling on this side:
+
+```mettle
+extern fn c_strlen(s: cstring) -> int64 = "strlen";
+```
+
+A name may carry only one link name. Declaring it twice against the same
+symbol is fine; against two different ones is an error:
+
+```text
+error[E0003]: Function 'c_print' redeclared with conflicting link name
+```
+
+`export extern fn` re-exports the binding, so a module can hand a symbol on to
+whatever imports it. That is how `std/process` offers `rand` and `srand`:
+
+```mettle
+export extern fn rand() -> int32 = "rand";
+```
+
+### extern var
+
+A global the linker supplies. It takes the same optional link name:
+
+```mettle
+extern var g_counter: int32;
+extern var g_flag: int32 = "c_side_flag";
+```
+
+Two rules, both because the definition lives on the other side:
+
+- The type must be written out. There is nothing here to infer it from.
+
+  ```text
+  error[E0002]: Extern variable declarations require an explicit type
+  ```
+
+- It cannot have an initializer. Whoever defines it initializes it.
+
+  ```text
+  error[E0002]: Extern variable declarations cannot have an initializer
+  ```
+
+[C interoperability](c-interop.md) covers the calling convention, the types
+that cross the boundary, and which names actually resolve.
 
 ## defer and errdefer
 
