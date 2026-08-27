@@ -574,7 +574,8 @@
       "mettle_exe": "examples/json_parse/json_parse.exe",
       "c_source": "examples/json_parse/json_parse.c",
       "c_exe": "examples/json_parse/json_parse_c.exe",
-      "build_script": "examples/json_parse/build.bat"
+      "build_script": "examples/json_parse/build.bat",
+      "set": 1
     },
     {
       "name": "interp_ast",
@@ -585,7 +586,8 @@
       "mettle_exe": "examples/interp_ast/interp_ast.exe",
       "c_source": "examples/interp_ast/interp_ast.c",
       "c_exe": "examples/interp_ast/interp_ast_c.exe",
-      "build_script": "examples/interp_ast/build.bat"
+      "build_script": "examples/interp_ast/build.bat",
+      "set": 1
     },
     {
       "name": "word_freq",
@@ -596,7 +598,8 @@
       "mettle_exe": "examples/word_freq/word_freq.exe",
       "c_source": "examples/word_freq/word_freq.c",
       "c_exe": "examples/word_freq/word_freq_c.exe",
-      "build_script": "examples/word_freq/build.bat"
+      "build_script": "examples/word_freq/build.bat",
+      "set": 1
     },
     {
       "name": "huffman",
@@ -607,7 +610,8 @@
       "mettle_exe": "examples/huffman/huffman.exe",
       "c_source": "examples/huffman/huffman.c",
       "c_exe": "examples/huffman/huffman_c.exe",
-      "build_script": "examples/huffman/build.bat"
+      "build_script": "examples/huffman/build.bat",
+      "set": 1
     },
     {
       "name": "lz77",
@@ -618,7 +622,8 @@
       "mettle_exe": "examples/lz77/lz77.exe",
       "c_source": "examples/lz77/lz77.c",
       "c_exe": "examples/lz77/lz77_c.exe",
-      "build_script": "examples/lz77/build.bat"
+      "build_script": "examples/lz77/build.bat",
+      "set": 1
     },
     {
       "name": "astar_grid",
@@ -629,7 +634,8 @@
       "mettle_exe": "examples/astar_grid/astar_grid.exe",
       "c_source": "examples/astar_grid/astar_grid.c",
       "c_exe": "examples/astar_grid/astar_grid_c.exe",
-      "build_script": "examples/astar_grid/build.bat"
+      "build_script": "examples/astar_grid/build.bat",
+      "set": 1
     },
     {
       "name": "regex_match",
@@ -640,7 +646,8 @@
       "mettle_exe": "examples/regex_match/regex_match.exe",
       "c_source": "examples/regex_match/regex_match.c",
       "c_exe": "examples/regex_match/regex_match_c.exe",
-      "build_script": "examples/regex_match/build.bat"
+      "build_script": "examples/regex_match/build.bat",
+      "set": 1
     },
     {
       "name": "physics_grid",
@@ -651,7 +658,104 @@
       "mettle_exe": "examples/physics_grid/physics_grid.exe",
       "c_source": "examples/physics_grid/physics_grid.c",
       "c_exe": "examples/physics_grid/physics_grid_c.exe",
-      "build_script": "examples/physics_grid/build.bat"
+      "build_script": "examples/physics_grid/build.bat",
+      "set": 1
+    },
+    {
+      "name": "bignum_mul",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "Bignum: factorial(1000) then wide schoolbook multiplies over base 2^32 limbs, decimal render x 24",
+      "mettle_source": "examples/bignum_mul/bignum_mul.mettle",
+      "mettle_exe": "examples/bignum_mul/bignum_mul.exe",
+      "c_source": "examples/bignum_mul/bignum_mul.c",
+      "c_exe": "examples/bignum_mul/bignum_mul_c.exe",
+      "build_script": "examples/bignum_mul/build.bat"
+    },
+    {
+      "name": "btree_index",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "B-tree: 50000 inserts with node splits, full lookup pass, half-miss pass, in-order walk x 3",
+      "mettle_source": "examples/btree_index/btree_index.mettle",
+      "mettle_exe": "examples/btree_index/btree_index.exe",
+      "c_source": "examples/btree_index/btree_index.c",
+      "c_exe": "examples/btree_index/btree_index_c.exe",
+      "build_script": "examples/btree_index/build.bat"
+    },
+    {
+      "name": "bytecode_vm",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "Bytecode VM: assemble a register program, run collatz over [2,9000) through a switch dispatch loop x 3",
+      "mettle_source": "examples/bytecode_vm/bytecode_vm.mettle",
+      "mettle_exe": "examples/bytecode_vm/bytecode_vm.exe",
+      "c_source": "examples/bytecode_vm/bytecode_vm.c",
+      "c_exe": "examples/bytecode_vm/bytecode_vm_c.exe",
+      "build_script": "examples/bytecode_vm/build.bat"
+    },
+    {
+      "name": "sudoku_solve",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "Sudoku: 120 generated puzzles, 61 holes each, bitmask propagation with MRV backtracking x 3",
+      "mettle_source": "examples/sudoku_solve/sudoku_solve.mettle",
+      "mettle_exe": "examples/sudoku_solve/sudoku_solve.exe",
+      "c_source": "examples/sudoku_solve/sudoku_solve.c",
+      "c_exe": "examples/sudoku_solve/sudoku_solve_c.exe",
+      "build_script": "examples/sudoku_solve/build.bat"
+    },
+    {
+      "name": "voxel_trace",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "Voxel trace: 64^3 grid, 200x150 rays, float64 DDA traversal with one reflection bounce x 3",
+      "mettle_source": "examples/voxel_trace/voxel_trace.mettle",
+      "mettle_exe": "examples/voxel_trace/voxel_trace.exe",
+      "c_source": "examples/voxel_trace/voxel_trace.c",
+      "c_exe": "examples/voxel_trace/voxel_trace_c.exe",
+      "build_script": "examples/voxel_trace/build.bat"
+    },
+    {
+      "name": "life_bits",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "Life: 512x1024 bit grid, 200 generations through word-parallel uint64 full adders x 3",
+      "mettle_source": "examples/life_bits/life_bits.mettle",
+      "mettle_exe": "examples/life_bits/life_bits.exe",
+      "c_source": "examples/life_bits/life_bits.c",
+      "c_exe": "examples/life_bits/life_bits_c.exe",
+      "build_script": "examples/life_bits/build.bat"
+    },
+    {
+      "name": "diff_lcs",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "Diff: 20 document pairs of 620 lines, line hashing, LCS dynamic programming, backtrack x 3",
+      "mettle_source": "examples/diff_lcs/diff_lcs.mettle",
+      "mettle_exe": "examples/diff_lcs/diff_lcs.exe",
+      "c_source": "examples/diff_lcs/diff_lcs.c",
+      "c_exe": "examples/diff_lcs/diff_lcs_c.exe",
+      "build_script": "examples/diff_lcs/build.bat"
+    },
+    {
+      "name": "csv_query",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "CSV query: generate 60000 rows, parse, hash group-by into 4096 groups, quicksort by value x 5",
+      "mettle_source": "examples/csv_query/csv_query.mettle",
+      "mettle_exe": "examples/csv_query/csv_query.exe",
+      "c_source": "examples/csv_query/csv_query.c",
+      "c_exe": "examples/csv_query/csv_query_c.exe",
+      "build_script": "examples/csv_query/build.bat"
     }
   ],
   "compile_benchmarks": [

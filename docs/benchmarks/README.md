@@ -63,6 +63,14 @@ Matched pairs: `.mettle` and `.c`.
 Matched pairs: `.mettle` and `.c`. Each entry is a small complete program that
 parses, builds, transforms, and verifies, rather than a loop over an array.
 
+Suite 3 has two sets. Set 1 is the original eight. Set 2 adds eight more chosen
+for shapes Set 1 never reaches: wide integer arithmetic, a cache-resident tree,
+an interpreter dispatch loop, unpredictable backtracking, float64 without
+`sqrt`, word-parallel bit arithmetic, a dense dynamic-programming table, and a
+parse-group-sort query pipeline. Run either with `-Set 1` or `-Set 2`.
+
+### Set 1
+
 | Name | Workload |
 |------|----------|
 | `json_parse` | Generate a 330 KB JSON catalogue, then tokenize and parse it into a node arena and walk the tree × 30 |
@@ -73,6 +81,25 @@ parses, builds, transforms, and verifies, rather than a loop over an array.
 | `astar_grid` | Grow a 192×192 cave, run 16 A* searches with a binary-heap open set × 3 |
 | `regex_match` | Compile 5 backtracking patterns, match each at every offset of 4000 log lines × 3 |
 | `physics_grid` | Bucket 8192 particles into a 64×64 grid, resolve neighbour collisions, integrate, 12 steps × 2 |
+
+### Set 2
+
+| Name | Workload | Ground it covers |
+|------|----------|------------------|
+| `bignum_mul` | factorial(1000), then wide schoolbook multiplies over base 2^32 limbs, then decimal rendering × 24 | 64-bit multiply and carry chains, 64/32 division |
+| `btree_index` | 50000 inserts with node splits, a full lookup pass, a half-miss pass, an in-order walk × 3 | 256-byte nodes, in-node shifting, recursive descent |
+| `bytecode_vm` | Assemble a register program, then run collatz over [2,9000) through a switch dispatch loop × 3 | Interpreter dispatch and a memory register file |
+| `sudoku_solve` | 120 generated puzzles, 61 holes each, bitmask propagation with MRV backtracking × 3 | Deep recursion, early exit, branches that never predict |
+| `voxel_trace` | 64^3 grid, 200×150 rays, float64 DDA traversal with one reflection bounce × 3 | float64 without `sqrt`, axis-aligned normals |
+| `life_bits` | 512×1024 bit grid, 200 generations through word-parallel uint64 full adders × 3 | Branch-free `uint64` bit arithmetic over a contiguous array |
+| `diff_lcs` | 20 document pairs of 620 lines, line hashing, LCS dynamic programming, backtrack × 3 | A 2.5 MB DP table with a serial row recurrence |
+| `csv_query` | Generate 60000 rows, parse, hash group-by into 4096 groups, quicksort by value × 5 | Integer parsing, open addressing, a comparison sort on records |
+
+`voxel_trace` is written without `sqrt` on purpose. Mettle's `std/math` `sqrt`
+is a Newton-Raphson iteration and C's is the hardware instruction, so the two
+do not agree bit for bit and a checksum over their results would fork. Axis-
+aligned normals and a slab traversal need no roots, which keeps rule 6 intact
+while still putting float64 arithmetic and division on the clock.
 
 ### The rules Suite 3 is written to
 
@@ -129,6 +156,9 @@ These are timed with `mettle --profile` (total compile ms).
 
 # One suite
 .\tools\benchmark\run-benchmarks.ps1 -Suite 3
+
+# One set within a suite
+.\tools\benchmark\run-benchmarks.ps1 -Suite 3 -Set 2
 
 # Subset
 .\tools\benchmark\run-benchmarks.ps1 -Benchmark fib,grep

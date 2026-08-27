@@ -1,0 +1,209 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const WORDS: int32 = 16;
+const ROWS: int32 = 512;
+const CELLS: int32 = 1024;
+const GENS: int32 = 200;
+const PASSES: int32 = 3;
+
+fn row_shl(src: uint64*, base: int32, i: int32) -> uint64 {
+  var cur: uint64 = src[base + i] >> 1;
+  if (i + 1 < WORDS) {
+    cur = cur | (src[base + i + 1] << 63);
+  }
+  return cur;
+}
+
+fn row_shr(src: uint64*, base: int32, i: int32) -> uint64 {
+  var cur: uint64 = src[base + i] << 1;
+  if (i > 0) {
+    cur = cur | (src[base + i - 1] >> 63);
+  }
+  return cur;
+}
+
+fn seed_grid(g: uint64*, seed: uint32) {
+  var state: uint32 = seed;
+  var i: int32 = 0;
+  while (i < ROWS * WORDS) {
+    g[i] = 0;
+    i += 1;
+  }
+  var r: int32 = 64;
+  while (r < ROWS - 64) {
+    var w: int32 = 2;
+    while (w < WORDS - 2) {
+      state = state ^ (state << 13);
+      state = state ^ (state >> 17);
+      state = state ^ (state << 5);
+      var hi: uint32 = state;
+      state = state ^ (state << 13);
+      state = state ^ (state >> 17);
+      state = state ^ (state << 5);
+      var lo: uint32 = state;
+      g[r * WORDS + w] = ((uint64)hi << 32) | (uint64)lo;
+      w += 1;
+    }
+    r += 1;
+  }
+}
+
+fn step(src: uint64*, dst: uint64*) {
+  var r: int32 = 0;
+  while (r < ROWS) {
+    var up: int32 = (r - 1) * WORDS;
+    var mid: int32 = r * WORDS;
+    var dn: int32 = (r + 1) * WORDS;
+    var has_up: int32 = 1;
+    var has_dn: int32 = 1;
+    if (r == 0) { has_up = 0; }
+    if (r == ROWS - 1) { has_dn = 0; }
+
+    var i: int32 = 0;
+    while (i < WORDS) {
+      var nw: uint64 = 0;
+      var nn: uint64 = 0;
+      var ne: uint64 = 0;
+      if (has_up != 0) {
+        nw = row_shr(src, up, i);
+        nn = src[up + i];
+        ne = row_shl(src, up, i);
+      }
+      var ww: uint64 = row_shr(src, mid, i);
+      var ee: uint64 = row_shl(src, mid, i);
+      var sw: uint64 = 0;
+      var ss: uint64 = 0;
+      var se: uint64 = 0;
+      if (has_dn != 0) {
+        sw = row_shr(src, dn, i);
+        ss = src[dn + i];
+        se = row_shl(src, dn, i);
+      }
+
+      var xa: uint64 = nw ^ nn;
+      var s0: uint64 = xa ^ ne;
+      var s1: uint64 = (nw & nn) | (xa & ne);
+
+      var xb: uint64 = ww ^ ee;
+      var t0: uint64 = xb ^ sw;
+      var t1: uint64 = (ww & ee) | (xb & sw);
+
+      var u0: uint64 = ss ^ se;
+      var u1: uint64 = ss & se;
+
+      var xc: uint64 = s0 ^ t0;
+      var c0: uint64 = xc ^ u0;
+      var k0: uint64 = (s0 & t0) | (xc & u0);
+
+      var xd: uint64 = s1 ^ t1;
+      var v0: uint64 = xd ^ u1;
+      var v1: uint64 = (s1 & t1) | (xd & u1);
+
+      var c1: uint64 = v0 ^ k0;
+      var k1: uint64 = v0 & k0;
+
+      var c2: uint64 = v1 ^ k1;
+      var c3: uint64 = v1 & k1;
+
+      var alive: uint64 = src[mid + i];
+      var high_clear: uint64 = ~c2 & ~c3;
+      var eq3: uint64 = c0 & c1 & high_clear;
+      var eq2: uint64 = ~c0 & c1 & high_clear;
+      dst[mid + i] = eq3 | (alive & eq2);
+      i += 1;
+    }
+    r += 1;
+  }
+}
+
+fn popcount64(v: uint64) -> int32 {
+  var x: uint64 = v;
+  var n: int32 = 0;
+  while (x != 0) {
+    x = x & (x - 1);
+    n += 1;
+  }
+  return n;
+}
+
+fn population(g: uint64*) -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (i < ROWS * WORDS) {
+    total = total + (int64)popcount64(g[i]);
+    i += 1;
+  }
+  return total;
+}
+
+fn round_trip(a: uint64*, b: uint64*, out_pop: int64*) -> uint64 {
+  seed_grid(a, 2463534242);
+  var h: uint64 = 14695981039346656037;
+  var src: uint64* = a;
+  var dst: uint64* = b;
+  var gen: int32 = 0;
+  while (gen < GENS) {
+    step(src, dst);
+    var tmp: uint64* = src;
+    src = dst;
+    dst = tmp;
+    if (gen % 8 == 0) {
+      h = h * 1000003 + (uint64)population(src);
+    }
+    gen += 1;
+  }
+  var pop: int64 = population(src);
+  var i: int32 = 0;
+  while (i < ROWS * WORDS) {
+    h = h ^ src[i];
+    h = h * 1099511628211;
+    i += 1;
+  }
+  h = h * 31 + (uint64)pop;
+  *out_pop = pop;
+  return h;
+}
+
+fn main() -> int32 {
+  var a: uint64* = malloc((int64)ROWS * WORDS * 8);
+  var b: uint64* = malloc((int64)ROWS * WORDS * 8);
+  if (a == 0 || b == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  println("Life: {ROWS}x{CELLS} bit grid, {GENS} generations, word-parallel adders");
+
+  var pop: int64 = 0;
+  var check: uint64 = round_trip(a, b, &pop);
+  println("  final population = {pop}");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var p2: int64 = 0;
+    bench_hash = bench_hash * 1000003 + round_trip(a, b, &p2);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(a);
+  free(b);
+  return 0;
+}

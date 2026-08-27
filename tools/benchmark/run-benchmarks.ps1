@@ -37,7 +37,8 @@ param(
     [string[]]$CFlags = @(),
     [int]$Runs = 0,
     [int]$Warmup = -1,
-    [int[]]$Suite = @()
+    [int[]]$Suite = @(),
+    [int[]]$Set = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,6 +96,32 @@ function Get-BenchmarkSuite {
     }
 
     return 1
+}
+
+function Get-BenchmarkSet {
+    param([object]$Bench)
+
+    if ($null -ne $Bench.set) {
+        return [int]$Bench.set
+    }
+
+    return 1
+}
+
+function Test-SetSelected {
+    param([int]$SetNumber)
+
+    if ($null -eq $Set -or $Set.Count -eq 0) {
+        return $true
+    }
+
+    foreach ($item in $Set) {
+        if ($item -eq $SetNumber) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Test-SuiteSelected {
@@ -709,7 +736,11 @@ function Write-SummaryTable {
 
     Write-Log ""
     Write-Log "=== Runtime summary (Mettle vs C, median) ==="
-    $suiteGroups = $RuntimeResults | Group-Object -Property { if ($null -ne $_.suite) { [int]$_.suite } else { 1 } } | Sort-Object Name
+    $suiteGroups = $RuntimeResults | Group-Object -Property {
+        $sv = if ($null -ne $_.suite) { [int]$_.suite } else { 1 }
+        $tv = if ($null -ne $_.set) { [int]$_.set } else { 1 }
+        if ($tv -gt 1) { "$sv Set $tv" } else { "$sv" }
+    } | Sort-Object Name
     foreach ($group in $suiteGroups) {
         Write-Log ""
         Write-Log "--- Suite $($group.Name) ---"
@@ -805,7 +836,8 @@ if ($null -ne $config.benchmarks -and $config.benchmarks.Count -gt 0) {
     foreach ($bench in $config.benchmarks) {
         $name = [string]$bench.name
         $suiteNumber = Get-BenchmarkSuite -Bench $bench
-        if (-not (Test-BenchmarkSelected -Name $name) -or -not (Test-SuiteSelected -SuiteNumber $suiteNumber)) {
+        $setNumber = Get-BenchmarkSet -Bench $bench
+        if (-not (Test-BenchmarkSelected -Name $name) -or -not (Test-SuiteSelected -SuiteNumber $suiteNumber) -or -not (Test-SetSelected -SetNumber $setNumber)) {
             continue
         }
 
@@ -880,6 +912,7 @@ if ($null -ne $config.benchmarks -and $config.benchmarks.Count -gt 0) {
                 name = $name
                 kind = if ($null -ne $bench.kind) { [string]$bench.kind } else { "runtime" }
                 suite = $suiteNumber
+                set = $setNumber
                 description = $description
                 mettle_us = if ($null -ne $mettleUs) { [uint64][math]::Round($mettleUs, 0) } else { $null }
                 c_us = if ($null -ne $cUs) { [uint64][math]::Round($cUs, 0) } else { $null }

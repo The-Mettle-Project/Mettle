@@ -23,6 +23,7 @@
 #   ./tools/benchmark/run-benchmarks.sh --runs 7 --warmup 2
 #   ./tools/benchmark/run-benchmarks.sh --benchmark fib,grep
 #   ./tools/benchmark/run-benchmarks.sh --suite 3
+#   ./tools/benchmark/run-benchmarks.sh --suite 3 --set 2
 #   ./tools/benchmark/run-benchmarks.sh --compile-only
 #   ./tools/benchmark/run-benchmarks.sh --skip-compile-benchmarks
 #   ./tools/benchmark/run-benchmarks.sh --cflags "-O3 -march=native"
@@ -44,6 +45,7 @@ CONFIG_PATH="docs/benchmarks/harness.json"
 COMPILER_PATH=""
 BENCH_FILTER=()
 SUITE_FILTER=()
+SET_FILTER=()
 USER_CFLAGS=()
 RUNS=0
 WARMUP=-1
@@ -69,6 +71,10 @@ while [[ $# -gt 0 ]]; do
         --suite)
             IFS=',' read -r -a _parts <<<"$2"
             SUITE_FILTER+=("${_parts[@]}")
+            shift ;;
+        --set)
+            IFS=',' read -r -a _parts <<<"$2"
+            SET_FILTER+=("${_parts[@]}")
             shift ;;
         --cflags)
             # shellcheck disable=SC2206
@@ -118,6 +124,15 @@ suite_selected() {
     [[ ${#SUITE_FILTER[@]} -eq 0 ]] && return 0
     for item in "${SUITE_FILTER[@]}"; do
         [[ "$item" == "$suite" ]] && return 0
+    done
+    return 1
+}
+
+set_selected() {
+    local setno="$1" item
+    [[ ${#SET_FILTER[@]} -eq 0 ]] && return 0
+    for item in "${SET_FILTER[@]}"; do
+        [[ "$item" == "$setno" ]] && return 0
     done
     return 1
 }
@@ -450,8 +465,10 @@ for ((bi = 0; bi < bench_count; bi++)); do
     bench=$(jq -c ".benchmarks[$bi]" <<<"$CONFIG")
     name=$(jq -r '.name' <<<"$bench")
     suite=$(jq -r '.suite // 1' <<<"$bench")
+    setno=$(jq -r '.set // 1' <<<"$bench")
     bench_selected "$name" || continue
     suite_selected "$suite" || continue
+    set_selected "$setno" || continue
 
     kind=$(jq -r '.kind // "runtime"' <<<"$bench")
     description=$(jq -r '.description // ""' <<<"$bench")
@@ -575,6 +592,7 @@ for ((bi = 0; bi < bench_count; bi++)); do
         --arg name "$name" \
         --arg kind "$kind" \
         --argjson suite "$suite" \
+        --argjson setno "$setno" \
         --arg description "$description" \
         --argjson mettle_us "$([[ -n "$mettle_us" ]] && awk -v v="$mettle_us" 'BEGIN{printf "%.0f", v}' || echo null)" \
         --argjson c_us "$([[ -n "$c_us" ]] && awk -v v="$c_us" 'BEGIN{printf "%.0f", v}' || echo null)" \
@@ -593,7 +611,7 @@ for ((bi = 0; bi < bench_count; bi++)); do
         --argjson c_exe_bytes "${c_exe_bytes:-null}" \
         --argjson size_relative "$size_ratio" \
         '{
-            name: $name, kind: $kind, suite: $suite, description: $description,
+            name: $name, kind: $kind, suite: $suite, set: $setno, description: $description,
             mettle_us: $mettle_us, c_us: $c_us, c_noinline_us: $c_noinline_us,
             mettle_runs_us: $mettle_runs_us, c_runs_us: $c_runs_us,
             mettle_stats: $mettle_stats, c_stats: $c_stats,
@@ -692,11 +710,15 @@ SUMMARY_JSON=$(jq -c '
 if [[ $QUIET -eq 0 ]]; then
     echo ""
     echo "=== Runtime summary (Mettle vs C, median) ==="
-    for suite_num in $(jq -r '[.[] | (.suite // 1)] | unique | .[]' <<<"$RESULTS_JSON"); do
+    for group_key in $(jq -r '[.[] | ((.suite // 1 | tostring) + ":" + (.set // 1 | tostring))] | unique | .[]' <<<"$RESULTS_JSON"); do
+        suite_num="${group_key%%:*}"
+        set_num="${group_key##*:}"
+        label="Suite $suite_num"
+        [[ "$set_num" != "1" ]] && label="Suite $suite_num Set $set_num"
         echo ""
-        echo "--- Suite $suite_num ---"
+        echo "--- $label ---"
         printf '%-16s %12s %12s %8s %8s %8s\n' "benchmark" "mettle" "c" "runtime" "compile" "size"
-        jq -r --argjson want "$suite_num" '.[] | select((.suite // 1) == $want) | [
+        jq -r --argjson want "$suite_num" --argjson wantset "$set_num" '.[] | select((.suite // 1) == $want and (.set // 1) == $wantset) | [
             .name,
             (if .mettle_ms != null then (.mettle_ms | tostring) + " ms" else "FAIL" end),
             (if .c_ms != null then (.c_ms | tostring) + " ms" else "FAIL" end),

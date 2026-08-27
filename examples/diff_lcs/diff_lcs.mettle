@@ -1,0 +1,282 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const DOCS: int32 = 20;
+const LINES_A: int32 = 620;
+const MAX_LINES: int32 = 800;
+const LINE_CAP: int32 = 64;
+const DP_STRIDE: int32 = 801;
+const PASSES: int32 = 3;
+
+struct Doc {
+  text: uint8*;
+  off: int32*;
+  len: int32*;
+  hash: int32*;
+  count: int32;
+}
+
+fn emit_cstr(dst: uint8*, pos: int32, s: cstring) -> int32 {
+  var i: int32 = 0;
+  while (s[i] != 0) {
+    dst[pos + i] = (uint8)s[i];
+    i += 1;
+  }
+  return pos + i;
+}
+
+fn emit_int(dst: uint8*, pos: int32, v: int32) -> int32 {
+  var tmp: uint8[16];
+  var n: int32 = 0;
+  var x: int32 = v;
+  if (x == 0) {
+    tmp[0] = 48;
+    n = 1;
+  }
+  while (x > 0) {
+    tmp[n] = (uint8)(48 + x % 10);
+    x = x / 10;
+    n += 1;
+  }
+  while (n > 0) {
+    n -= 1;
+    dst[pos] = tmp[n];
+    pos += 1;
+  }
+  return pos;
+}
+
+fn keyword(k: int32) -> cstring {
+  switch (k) {
+    case 0: return "resolve";
+    case 1: return "commit";
+    case 2: return "rebase";
+    case 3: return "collect";
+    case 4: return "verify";
+    case 5: return "expand";
+    case 6: return "reduce";
+    default: return "settle";
+  }
+}
+
+fn next_rand(state: uint32*) -> uint32 {
+  var s: uint32 = *state;
+  s = s ^ (s << 13);
+  s = s ^ (s >> 17);
+  s = s ^ (s << 5);
+  *state = s;
+  return s;
+}
+
+fn line_hash(text: uint8*, off: int32, len: int32) -> int32 {
+  var h: uint32 = 2166136261;
+  var i: int32 = 0;
+  while (i < len) {
+    h = h ^ (uint32)text[off + i];
+    h = h * 16777619;
+    i += 1;
+  }
+  return (int32)(h & 2147483647);
+}
+
+fn build_doc(d: Doc*, state: uint32*, lines: int32) {
+  var pos: int32 = 0;
+  var i: int32 = 0;
+  while (i < lines) {
+    d->off[i] = pos;
+    var r: uint32 = next_rand(state);
+    pos = emit_cstr(d->text, pos, "  ");
+    pos = emit_cstr(d->text, pos, keyword((int32)(r % 8)));
+    pos = emit_cstr(d->text, pos, "(node_");
+    pos = emit_int(d->text, pos, (int32)((r >> 3) % 4096));
+    pos = emit_cstr(d->text, pos, ", depth=");
+    pos = emit_int(d->text, pos, (int32)((r >> 15) % 64));
+    pos = emit_cstr(d->text, pos, ");");
+    d->len[i] = pos - d->off[i];
+    d->hash[i] = line_hash(d->text, d->off[i], d->len[i]);
+    i += 1;
+  }
+  d->count = lines;
+}
+
+fn derive_doc(dst: Doc*, src: Doc*, state: uint32*) {
+  var pos: int32 = 0;
+  var out: int32 = 0;
+  var i: int32 = 0;
+  while (i < src->count && out < MAX_LINES) {
+    var r: uint32 = next_rand(state) % 100;
+    if (r < 8) {
+      i += 1;
+    } else if (r < 14) {
+      dst->off[out] = pos;
+      var q: uint32 = next_rand(state);
+      pos = emit_cstr(dst->text, pos, "  inserted_");
+      pos = emit_int(dst->text, pos, (int32)(q % 9999));
+      pos = emit_cstr(dst->text, pos, ";");
+      dst->len[out] = pos - dst->off[out];
+      dst->hash[out] = line_hash(dst->text, dst->off[out], dst->len[out]);
+      out += 1;
+    } else {
+      dst->off[out] = pos;
+      var j: int32 = 0;
+      while (j < src->len[i]) {
+        dst->text[pos + j] = src->text[src->off[i] + j];
+        j += 1;
+      }
+      pos = pos + src->len[i];
+      dst->len[out] = src->len[i];
+      dst->hash[out] = src->hash[i];
+      out += 1;
+      i += 1;
+    }
+  }
+  dst->count = out;
+}
+
+fn lcs_fill(dp: int32*, a: Doc*, b: Doc*) -> int32 {
+  var na: int32 = a->count;
+  var nb: int32 = b->count;
+  var j: int32 = 0;
+  while (j <= nb) {
+    dp[j] = 0;
+    j += 1;
+  }
+  var i: int32 = 1;
+  while (i <= na) {
+    dp[i * DP_STRIDE] = 0;
+    var ah: int32 = a->hash[i - 1];
+    var row: int32 = i * DP_STRIDE;
+    var prev: int32 = (i - 1) * DP_STRIDE;
+    j = 1;
+    while (j <= nb) {
+      if (ah == b->hash[j - 1]) {
+        dp[row + j] = dp[prev + j - 1] + 1;
+      } else {
+        var up: int32 = dp[prev + j];
+        var left: int32 = dp[row + j - 1];
+        if (up >= left) {
+          dp[row + j] = up;
+        } else {
+          dp[row + j] = left;
+        }
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return dp[na * DP_STRIDE + nb];
+}
+
+fn backtrack(dp: int32*, a: Doc*, b: Doc*, out_same: int32*, out_del: int32*,
+             out_ins: int32*) -> uint64 {
+  var h: uint64 = 14695981039346656037;
+  var i: int32 = a->count;
+  var j: int32 = b->count;
+  var same: int32 = 0;
+  var del: int32 = 0;
+  var ins: int32 = 0;
+  while (i > 0 && j > 0) {
+    if (a->hash[i - 1] == b->hash[j - 1]) {
+      h = h ^ (uint64)a->hash[i - 1];
+      h = h * 1099511628211;
+      same += 1;
+      i -= 1;
+      j -= 1;
+    } else if (dp[(i - 1) * DP_STRIDE + j] >= dp[i * DP_STRIDE + j - 1]) {
+      h = h ^ (uint64)(a->hash[i - 1] + 1);
+      h = h * 1099511628211;
+      del += 1;
+      i -= 1;
+    } else {
+      h = h ^ (uint64)(b->hash[j - 1] + 2);
+      h = h * 1099511628211;
+      ins += 1;
+      j -= 1;
+    }
+  }
+  del += i;
+  ins += j;
+  *out_same = same;
+  *out_del = del;
+  *out_ins = ins;
+  return h;
+}
+
+fn round_trip(a: Doc*, b: Doc*, dp: int32*, out_lcs: int32*) -> uint64 {
+  var state: uint32 = 2463534242;
+  var h: uint64 = 1469598103934665603;
+  var total_lcs: int32 = 0;
+  var doc: int32 = 0;
+  while (doc < DOCS) {
+    build_doc(a, &state, LINES_A);
+    derive_doc(b, a, &state);
+    var lcs: int32 = lcs_fill(dp, a, b);
+    total_lcs += lcs;
+    var same: int32 = 0;
+    var del: int32 = 0;
+    var ins: int32 = 0;
+    var bh: uint64 = backtrack(dp, a, b, &same, &del, &ins);
+    h = h * 1000003 + bh;
+    h = h * 31 + (uint64)lcs;
+    h = h * 31 + (uint64)(same * 7 + del * 13 + ins * 17);
+    h = h * 31 + (uint64)b->count;
+    doc += 1;
+  }
+  *out_lcs = total_lcs;
+  return h;
+}
+
+fn main() -> int32 {
+  var a: Doc;
+  var b: Doc;
+  a.text = malloc((int64)MAX_LINES * LINE_CAP);
+  a.off = malloc((int64)MAX_LINES * 4);
+  a.len = malloc((int64)MAX_LINES * 4);
+  a.hash = malloc((int64)MAX_LINES * 4);
+  a.count = 0;
+  b.text = malloc((int64)MAX_LINES * LINE_CAP);
+  b.off = malloc((int64)MAX_LINES * 4);
+  b.len = malloc((int64)MAX_LINES * 4);
+  b.hash = malloc((int64)MAX_LINES * 4);
+  b.count = 0;
+  var dp: int32* = malloc((int64)DP_STRIDE * DP_STRIDE * 4);
+  if (a.text == 0 || b.text == 0 || dp == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  println("Diff: {DOCS} document pairs, {LINES_A} lines, LCS table {DP_STRIDE}x{DP_STRIDE}");
+
+  var lcs: int32 = 0;
+  var check: uint64 = round_trip(&a, &b, dp, &lcs);
+  println("  total LCS = {lcs}, derived lines = {b.count}");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var l2: int32 = 0;
+    bench_hash = bench_hash * 1000003 + round_trip(&a, &b, dp, &l2);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(a.text);
+  free(b.text);
+  free(dp);
+  return 0;
+}

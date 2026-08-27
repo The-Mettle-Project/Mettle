@@ -1,0 +1,325 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const ROWS: int32 = 60000;
+const TEXT_CAP: int64 = 4194304;
+const REGIONS: int32 = 16;
+const PRODUCTS: int32 = 256;
+const MAP_SLOTS: int32 = 16384;
+const MAP_MASK: int32 = 16383;
+const TOP_K: int32 = 24;
+const PASSES: int32 = 5;
+
+struct Group {
+  key: uint64;
+  qty: int64;
+  value: int64;
+  count: int32;
+  peak: int32;
+}
+
+fn emit_cstr(dst: uint8*, pos: int32, s: cstring) -> int32 {
+  var i: int32 = 0;
+  while (s[i] != 0) {
+    dst[pos + i] = (uint8)s[i];
+    i += 1;
+  }
+  return pos + i;
+}
+
+fn emit_int(dst: uint8*, pos: int32, v: int32) -> int32 {
+  var tmp: uint8[16];
+  var n: int32 = 0;
+  var x: int32 = v;
+  if (x == 0) {
+    tmp[0] = 48;
+    n = 1;
+  }
+  while (x > 0) {
+    tmp[n] = (uint8)(48 + x % 10);
+    x = x / 10;
+    n += 1;
+  }
+  while (n > 0) {
+    n -= 1;
+    dst[pos] = tmp[n];
+    pos += 1;
+  }
+  return pos;
+}
+
+fn emit_pad(dst: uint8*, pos: int32, v: int32, width: int32) -> int32 {
+  var tmp: uint8[16];
+  var n: int32 = 0;
+  var x: int32 = v;
+  if (x == 0) {
+    tmp[0] = 48;
+    n = 1;
+  }
+  while (x > 0) {
+    tmp[n] = (uint8)(48 + x % 10);
+    x = x / 10;
+    n += 1;
+  }
+  while (n < width) {
+    tmp[n] = 48;
+    n += 1;
+  }
+  while (n > 0) {
+    n -= 1;
+    dst[pos] = tmp[n];
+    pos += 1;
+  }
+  return pos;
+}
+
+fn next_rand(state: uint32*) -> uint32 {
+  var s: uint32 = *state;
+  s = s ^ (s << 13);
+  s = s ^ (s >> 17);
+  s = s ^ (s << 5);
+  *state = s;
+  return s;
+}
+
+fn generate_csv(text: uint8*, seed: uint32) -> int32 {
+  var state: uint32 = seed;
+  var pos: int32 = 0;
+  pos = emit_cstr(text, pos, "id,region,product,qty,price\n");
+  var row: int32 = 0;
+  while (row < ROWS) {
+    var r: uint32 = next_rand(&state);
+    pos = emit_int(text, pos, row + 1);
+    text[pos] = 44;
+    pos += 1;
+    pos = emit_cstr(text, pos, "region-");
+    pos = emit_pad(text, pos, (int32)(r % (uint32)REGIONS), 2);
+    text[pos] = 44;
+    pos += 1;
+    pos = emit_cstr(text, pos, "sku-");
+    pos = emit_pad(text, pos, (int32)((r >> 8) % (uint32)PRODUCTS), 5);
+    text[pos] = 44;
+    pos += 1;
+    pos = emit_int(text, pos, 1 + (int32)((r >> 17) % 50));
+    text[pos] = 44;
+    pos += 1;
+    pos = emit_int(text, pos, 100 + (int32)((r >> 5) % 9900));
+    text[pos] = 10;
+    pos += 1;
+    row += 1;
+  }
+  text[pos] = 0;
+  return pos;
+}
+
+fn scan_field(text: uint8*, pos: int32, stop: int32) -> int32 {
+  var p: int32 = pos;
+  while ((int32)text[p] != 44 && (int32)text[p] != 10 && p < stop) {
+    p += 1;
+  }
+  return p;
+}
+
+fn parse_int(text: uint8*, from: int32, to: int32) -> int32 {
+  var v: int32 = 0;
+  var p: int32 = from;
+  while (p < to) {
+    v = v * 10 + ((int32)text[p] - 48);
+    p += 1;
+  }
+  return v;
+}
+
+fn field_hash(text: uint8*, from: int32, to: int32, seed: uint64) -> uint64 {
+  var h: uint64 = seed;
+  var p: int32 = from;
+  while (p < to) {
+    h = h ^ (uint64)text[p];
+    h = h * 1099511628211;
+    p += 1;
+  }
+  return h;
+}
+
+fn map_reset(slots: int32*) {
+  var i: int32 = 0;
+  while (i < MAP_SLOTS) {
+    slots[i] = -1;
+    i += 1;
+  }
+}
+
+fn map_find(slots: int32*, groups: Group*, key: uint64, used: int32*) -> int32 {
+  var idx: int32 = (int32)(key & (uint64)MAP_MASK);
+  while (slots[idx] >= 0) {
+    if (groups[slots[idx]].key == key) {
+      return slots[idx];
+    }
+    idx = (idx + 1) & MAP_MASK;
+  }
+  var id: int32 = *used;
+  *used = id + 1;
+  groups[id].key = key;
+  groups[id].qty = 0;
+  groups[id].value = 0;
+  groups[id].count = 0;
+  groups[id].peak = 0;
+  slots[idx] = id;
+  return id;
+}
+
+fn ingest(text: uint8*, len: int32, slots: int32*, groups: Group*) -> int32 {
+  map_reset(slots);
+  var used: int32 = 0;
+  var pos: int32 = 0;
+  while (pos < len && (int32)text[pos] != 10) {
+    pos += 1;
+  }
+  pos += 1;
+  while (pos < len) {
+    var e: int32 = scan_field(text, pos, len);
+    pos = e + 1;
+
+    var rs: int32 = pos;
+    e = scan_field(text, pos, len);
+    var rh: uint64 = field_hash(text, rs, e, 14695981039346656037);
+    pos = e + 1;
+
+    var ps: int32 = pos;
+    e = scan_field(text, pos, len);
+    var ph: uint64 = field_hash(text, ps, e, rh);
+    pos = e + 1;
+
+    var qs: int32 = pos;
+    e = scan_field(text, pos, len);
+    var qty: int32 = parse_int(text, qs, e);
+    pos = e + 1;
+
+    var vs: int32 = pos;
+    e = scan_field(text, pos, len);
+    var price: int32 = parse_int(text, vs, e);
+    pos = e + 1;
+
+    var id: int32 = map_find(slots, groups, ph, &used);
+    groups[id].qty = groups[id].qty + (int64)qty;
+    groups[id].value = groups[id].value + (int64)qty * (int64)price;
+    groups[id].count += 1;
+    if (price > groups[id].peak) {
+      groups[id].peak = price;
+    }
+  }
+  return used;
+}
+
+fn group_less(a: Group*, b: Group*) -> int32 {
+  if (a->value != b->value) {
+    if (a->value > b->value) {
+      return 1;
+    }
+    return 0;
+  }
+  if (a->key < b->key) {
+    return 1;
+  }
+  return 0;
+}
+
+fn sort_groups(groups: Group*, lo: int32, hi: int32) {
+  if (lo >= hi) {
+    return;
+  }
+  var mid: int32 = lo + (hi - lo) / 2;
+  var pivot: Group = groups[mid];
+  var i: int32 = lo;
+  var j: int32 = hi;
+  while (i <= j) {
+    while (group_less(&groups[i], &pivot) != 0) {
+      i += 1;
+    }
+    while (group_less(&pivot, &groups[j]) != 0) {
+      j -= 1;
+    }
+    if (i <= j) {
+      var tmp: Group = groups[i];
+      groups[i] = groups[j];
+      groups[j] = tmp;
+      i += 1;
+      j -= 1;
+    }
+  }
+  sort_groups(groups, lo, j);
+  sort_groups(groups, i, hi);
+}
+
+fn round_trip(text: uint8*, slots: int32*, groups: Group*, out_groups: int32*) -> uint64 {
+  var len: int32 = generate_csv(text, 2463534242);
+  var used: int32 = ingest(text, len, slots, groups);
+  sort_groups(groups, 0, used - 1);
+
+  var h: uint64 = 1469598103934665603;
+  h = h * 31 + (uint64)len;
+  h = h * 31 + (uint64)used;
+  var i: int32 = 0;
+  while (i < TOP_K && i < used) {
+    h = h ^ groups[i].key;
+    h = h * 1099511628211;
+    h = h * 31 + (uint64)groups[i].qty;
+    h = h * 31 + (uint64)groups[i].value;
+    h = h * 31 + (uint64)(groups[i].count * 7 + groups[i].peak);
+    i += 1;
+  }
+  var total: int64 = 0;
+  i = 0;
+  while (i < used) {
+    total = total + groups[i].value;
+    i += 1;
+  }
+  h = h * 1000003 + (uint64)total;
+  *out_groups = used;
+  return h;
+}
+
+fn main() -> int32 {
+  var text: uint8* = malloc(TEXT_CAP);
+  var slots: int32* = malloc((int64)MAP_SLOTS * 4);
+  var groups: Group* = malloc((int64)MAP_SLOTS * sizeof(Group));
+  if (text == 0 || slots == 0 || groups == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  println("CSV query: {ROWS} rows, {REGIONS} regions x {PRODUCTS} products, group-by then sort");
+
+  var used: int32 = 0;
+  var check: uint64 = round_trip(text, slots, groups, &used);
+  println("  groups = {used}, top value = {groups[0].value}");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var g2: int32 = 0;
+    bench_hash = bench_hash * 1000003 + round_trip(text, slots, groups, &g2);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(text);
+  free(slots);
+  free(groups);
+  return 0;
+}
