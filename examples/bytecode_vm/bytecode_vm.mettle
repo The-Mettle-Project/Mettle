@@ -1,0 +1,269 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const CODE_CAP: int32 = 512;
+const MEM_CELLS: int32 = 65536;
+const NREG: int32 = 16;
+const RANGE_LO: int32 = 2;
+const RANGE_HI: int32 = 9000;
+const PASSES: int32 = 3;
+
+const OP_HALT: int32 = 0;
+const OP_LOADI: int32 = 1;
+const OP_MOV: int32 = 2;
+const OP_ADD: int32 = 3;
+const OP_SUB: int32 = 4;
+const OP_MUL: int32 = 5;
+const OP_DIV: int32 = 6;
+const OP_MOD: int32 = 7;
+const OP_LT: int32 = 8;
+const OP_EQ: int32 = 9;
+const OP_JMP: int32 = 10;
+const OP_JZ: int32 = 11;
+const OP_JNZ: int32 = 12;
+const OP_LOAD: int32 = 13;
+const OP_STORE: int32 = 14;
+const OP_ADDI: int32 = 15;
+const OP_GT: int32 = 16;
+
+struct Inst {
+  op: int32;
+  a: int32;
+  b: int32;
+  c: int32;
+  imm: int64;
+}
+
+struct Program {
+  code: Inst*;
+  count: int32;
+}
+
+fn emit(p: Program*, op: int32, a: int32, b: int32, c: int32, imm: int64) -> int32 {
+  var at: int32 = p->count;
+  p->code[at].op = op;
+  p->code[at].a = a;
+  p->code[at].b = b;
+  p->code[at].c = c;
+  p->code[at].imm = imm;
+  p->count += 1;
+  return at;
+}
+
+fn patch(p: Program*, at: int32, target: int32) {
+  p->code[at].imm = (int64)target;
+}
+
+fn assemble_collatz(p: Program*, lo: int32, hi: int32) {
+  p->count = 0;
+  emit(p, OP_LOADI, 0, 0, 0, (int64)lo);
+  emit(p, OP_LOADI, 1, 0, 0, (int64)hi);
+  emit(p, OP_LOADI, 8, 0, 0, 1);
+  emit(p, OP_LOADI, 9, 0, 0, 2);
+  emit(p, OP_LOADI, 10, 0, 0, 3);
+
+  var outer: int32 = p->count;
+  emit(p, OP_MOV, 2, 0, 0, 0);
+  emit(p, OP_LOADI, 3, 0, 0, 0);
+
+  var inner: int32 = p->count;
+  emit(p, OP_EQ, 4, 2, 8, 0);
+  var to_done: int32 = emit(p, OP_JNZ, 4, 0, 0, 0);
+  emit(p, OP_MOD, 5, 2, 9, 0);
+  var to_even: int32 = emit(p, OP_JZ, 5, 0, 0, 0);
+  emit(p, OP_MUL, 6, 2, 10, 0);
+  emit(p, OP_ADD, 2, 6, 8, 0);
+  var to_cont: int32 = emit(p, OP_JMP, 0, 0, 0, 0);
+
+  var even_at: int32 = p->count;
+  emit(p, OP_DIV, 2, 2, 9, 0);
+
+  var cont_at: int32 = p->count;
+  emit(p, OP_ADD, 3, 3, 8, 0);
+  emit(p, OP_JMP, 0, 0, 0, (int64)inner);
+
+  var done_at: int32 = p->count;
+  emit(p, OP_STORE, 0, 3, 0, 0);
+  emit(p, OP_ADD, 0, 0, 8, 0);
+  emit(p, OP_LT, 7, 0, 1, 0);
+  emit(p, OP_JNZ, 7, 0, 0, (int64)outer);
+  emit(p, OP_HALT, 0, 0, 0, 0);
+
+  patch(p, to_done, done_at);
+  patch(p, to_even, even_at);
+  patch(p, to_cont, cont_at);
+}
+
+fn run(p: Program*, reg: int64*, mem: int64*, out_steps: int64*) -> int64 {
+  var i: int32 = 0;
+  while (i < NREG) {
+    reg[i] = 0;
+    i += 1;
+  }
+  i = 0;
+  while (i < MEM_CELLS) {
+    mem[i] = 0;
+    i += 1;
+  }
+
+  var pc: int32 = 0;
+  var steps: int64 = 0;
+  var running: int32 = 1;
+  while (running != 0) {
+    var op: int32 = p->code[pc].op;
+    var a: int32 = p->code[pc].a;
+    var b: int32 = p->code[pc].b;
+    var c: int32 = p->code[pc].c;
+    var imm: int64 = p->code[pc].imm;
+    pc += 1;
+    steps += 1;
+
+    switch (op) {
+      case 0:
+        running = 0;
+        break;
+      case 1:
+        reg[a] = imm;
+        break;
+      case 2:
+        reg[a] = reg[b];
+        break;
+      case 3:
+        reg[a] = reg[b] + reg[c];
+        break;
+      case 4:
+        reg[a] = reg[b] - reg[c];
+        break;
+      case 5:
+        reg[a] = reg[b] * reg[c];
+        break;
+      case 6:
+        reg[a] = reg[b] / reg[c];
+        break;
+      case 7:
+        reg[a] = reg[b] % reg[c];
+        break;
+      case 8:
+        if (reg[b] < reg[c]) {
+          reg[a] = 1;
+        } else {
+          reg[a] = 0;
+        }
+        break;
+      case 9:
+        if (reg[b] == reg[c]) {
+          reg[a] = 1;
+        } else {
+          reg[a] = 0;
+        }
+        break;
+      case 10:
+        pc = (int32)imm;
+        break;
+      case 11:
+        if (reg[a] == 0) {
+          pc = (int32)imm;
+        }
+        break;
+      case 12:
+        if (reg[a] != 0) {
+          pc = (int32)imm;
+        }
+        break;
+      case 13:
+        reg[a] = mem[(int32)reg[b] & 65535];
+        break;
+      case 14:
+        mem[(int32)reg[a] & 65535] = reg[b];
+        break;
+      case 15:
+        reg[a] = reg[b] + imm;
+        break;
+      case 16:
+        if (reg[b] > reg[c]) {
+          reg[a] = 1;
+        } else {
+          reg[a] = 0;
+        }
+        break;
+      default:
+        running = 0;
+        break;
+    }
+  }
+
+  var h: uint64 = 14695981039346656037;
+  i = RANGE_LO;
+  while (i < RANGE_HI) {
+    h = h ^ (uint64)mem[i];
+    h = h * 1099511628211;
+    i += 1;
+  }
+  i = 0;
+  while (i < NREG) {
+    h = h * 31 + (uint64)reg[i];
+    i += 1;
+  }
+  *out_steps = steps;
+  return (int64)h;
+}
+
+fn round_trip(p: Program*, reg: int64*, mem: int64*, out_steps: int64*) -> uint64 {
+  assemble_collatz(p, RANGE_LO, RANGE_HI);
+  var steps: int64 = 0;
+  var r: int64 = run(p, reg, mem, &steps);
+  var h: uint64 = 1469598103934665603;
+  h = h * 1000003 + (uint64)r;
+  h = h * 31 + (uint64)p->count;
+  h = h * 31 + (uint64)steps;
+  *out_steps = steps;
+  return h;
+}
+
+fn main() -> int32 {
+  var code: Inst* = malloc((int64)CODE_CAP * sizeof(Inst));
+  var reg: int64* = malloc((int64)NREG * 8);
+  var mem: int64* = malloc((int64)MEM_CELLS * 8);
+  if (code == 0 || reg == 0 || mem == 0) {
+    println("malloc failed");
+    return 1;
+  }
+  var p: Program;
+  p.code = code;
+  p.count = 0;
+
+  println("Bytecode VM: collatz over [{RANGE_LO},{RANGE_HI}), {NREG} registers");
+
+  var steps: int64 = 0;
+  var check: uint64 = round_trip(&p, reg, mem, &steps);
+  println("  program = {p.count} instructions, executed {steps} steps");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var s2: int64 = 0;
+    bench_hash = bench_hash * 1000003 + round_trip(&p, reg, mem, &s2);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(code);
+  free(reg);
+  free(mem);
+  return 0;
+}

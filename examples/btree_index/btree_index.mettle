@@ -1,0 +1,266 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const T_ORDER: int32 = 8;
+const MAX_KEY: int32 = 15;
+const MAX_CHILD: int32 = 16;
+const NODE_CAP: int32 = 20480;
+const N_KEYS: int32 = 50000;
+const PASSES: int32 = 3;
+
+struct Node {
+  count: int32;
+  leaf: int32;
+  key: int64[15];
+  val: int32[15];
+  child: int32[16];
+}
+
+struct Tree {
+  node: Node*;
+  used: int32;
+  root: int32;
+}
+
+fn node_new(t: Tree*, leaf: int32) -> int32 {
+  var id: int32 = t->used;
+  t->used += 1;
+  t->node[id].count = 0;
+  t->node[id].leaf = leaf;
+  var i: int32 = 0;
+  while (i < MAX_CHILD) {
+    t->node[id].child[i] = -1;
+    i += 1;
+  }
+  return id;
+}
+
+fn tree_init(t: Tree*) {
+  t->used = 0;
+  t->root = node_new(t, 1);
+}
+
+fn split_child(t: Tree*, parent: int32, idx: int32) {
+  var full: int32 = t->node[parent].child[idx];
+  var fresh: int32 = node_new(t, t->node[full].leaf);
+  t->node[fresh].count = T_ORDER - 1;
+
+  var j: int32 = 0;
+  while (j < T_ORDER - 1) {
+    t->node[fresh].key[j] = t->node[full].key[j + T_ORDER];
+    t->node[fresh].val[j] = t->node[full].val[j + T_ORDER];
+    j += 1;
+  }
+  if (t->node[full].leaf == 0) {
+    j = 0;
+    while (j < T_ORDER) {
+      t->node[fresh].child[j] = t->node[full].child[j + T_ORDER];
+      j += 1;
+    }
+  }
+  t->node[full].count = T_ORDER - 1;
+
+  j = t->node[parent].count;
+  while (j > idx) {
+    t->node[parent].child[j + 1] = t->node[parent].child[j];
+    j -= 1;
+  }
+  t->node[parent].child[idx + 1] = fresh;
+
+  j = t->node[parent].count - 1;
+  while (j >= idx) {
+    t->node[parent].key[j + 1] = t->node[parent].key[j];
+    t->node[parent].val[j + 1] = t->node[parent].val[j];
+    j -= 1;
+  }
+  t->node[parent].key[idx] = t->node[full].key[T_ORDER - 1];
+  t->node[parent].val[idx] = t->node[full].val[T_ORDER - 1];
+  t->node[parent].count += 1;
+}
+
+fn insert_nonfull(t: Tree*, id: int32, key: int64, val: int32) {
+  var i: int32 = t->node[id].count - 1;
+  if (t->node[id].leaf != 0) {
+    while (i >= 0 && t->node[id].key[i] > key) {
+      t->node[id].key[i + 1] = t->node[id].key[i];
+      t->node[id].val[i + 1] = t->node[id].val[i];
+      i -= 1;
+    }
+    t->node[id].key[i + 1] = key;
+    t->node[id].val[i + 1] = val;
+    t->node[id].count += 1;
+    return;
+  }
+  while (i >= 0 && t->node[id].key[i] > key) {
+    i -= 1;
+  }
+  i += 1;
+  var kid: int32 = t->node[id].child[i];
+  if (t->node[kid].count == MAX_KEY) {
+    split_child(t, id, i);
+    if (key > t->node[id].key[i]) {
+      i += 1;
+    }
+    kid = t->node[id].child[i];
+  }
+  insert_nonfull(t, kid, key, val);
+}
+
+fn tree_insert(t: Tree*, key: int64, val: int32) {
+  var r: int32 = t->root;
+  if (t->node[r].count == MAX_KEY) {
+    var fresh: int32 = node_new(t, 0);
+    t->node[fresh].child[0] = r;
+    t->root = fresh;
+    split_child(t, fresh, 0);
+    insert_nonfull(t, fresh, key, val);
+    return;
+  }
+  insert_nonfull(t, r, key, val);
+}
+
+fn tree_lookup(t: Tree*, key: int64) -> int32 {
+  var id: int32 = t->root;
+  while (id >= 0) {
+    var lo: int32 = 0;
+    var hi: int32 = t->node[id].count;
+    while (lo < hi) {
+      var mid: int32 = (lo + hi) / 2;
+      if (t->node[id].key[mid] < key) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo < t->node[id].count && t->node[id].key[lo] == key) {
+      return t->node[id].val[lo];
+    }
+    if (t->node[id].leaf != 0) {
+      return -1;
+    }
+    id = t->node[id].child[lo];
+  }
+  return -1;
+}
+
+fn walk(t: Tree*, id: int32, acc: uint64*, seen: int32*, prev: int64*, ordered: int32*) {
+  var i: int32 = 0;
+  while (i < t->node[id].count) {
+    if (t->node[id].leaf == 0) {
+      walk(t, t->node[id].child[i], acc, seen, prev, ordered);
+    }
+    var k: int64 = t->node[id].key[i];
+    if (k <= *prev) {
+      *ordered = 0;
+    }
+    *prev = k;
+    *acc = (*acc ^ (uint64)k) * 1099511628211;
+    *acc = *acc + (uint64)t->node[id].val[i];
+    *seen += 1;
+    i += 1;
+  }
+  if (t->node[id].leaf == 0) {
+    walk(t, t->node[id].child[i], acc, seen, prev, ordered);
+  }
+}
+
+fn gen_key(state: uint32*) -> int64 {
+  var s: uint32 = *state;
+  s = s ^ (s << 13);
+  s = s ^ (s >> 17);
+  s = s ^ (s << 5);
+  *state = s;
+  return (int64)(s % 4000000) * 7 + 3;
+}
+
+fn round_trip(t: Tree*) -> uint64 {
+  tree_init(t);
+
+  var state: uint32 = 2463534242;
+  var i: int32 = 0;
+  while (i < N_KEYS) {
+    var k: int64 = gen_key(&state);
+    tree_insert(t, k, i + 1);
+    i += 1;
+  }
+
+  var h: uint64 = 14695981039346656037;
+  h = h * 31 + (uint64)t->used;
+
+  state = 2463534242;
+  var hits: int32 = 0;
+  i = 0;
+  while (i < N_KEYS) {
+    var k: int64 = gen_key(&state);
+    if (tree_lookup(t, k) > 0) {
+      hits += 1;
+    }
+    i += 1;
+  }
+  h = h * 1000003 + (uint64)hits;
+
+  var misses: int32 = 0;
+  state = 88675123;
+  i = 0;
+  while (i < N_KEYS / 2) {
+    var k: int64 = gen_key(&state) + 1;
+    if (tree_lookup(t, k) < 0) {
+      misses += 1;
+    }
+    i += 1;
+  }
+  h = h * 1000003 + (uint64)misses;
+
+  var acc: uint64 = 1469598103934665603;
+  var seen: int32 = 0;
+  var prev: int64 = -1;
+  var ordered: int32 = 1;
+  walk(t, t->root, &acc, &seen, &prev, &ordered);
+  h = h * 1000003 + acc;
+  h = h * 31 + (uint64)seen;
+  h = h * 31 + (uint64)ordered;
+  return h;
+}
+
+fn main() -> int32 {
+  var nodes: Node* = malloc((int64)NODE_CAP * sizeof(Node));
+  if (nodes == 0) {
+    println("malloc failed");
+    return 1;
+  }
+  var t: Tree;
+  t.node = nodes;
+  t.used = 0;
+  t.root = 0;
+
+  println("B-tree: {N_KEYS} inserts, order {T_ORDER}, node {sizeof(Node)} bytes");
+
+  var check: uint64 = round_trip(&t);
+  println("  nodes used = {t.used}, root = {t.root}");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    bench_hash = bench_hash * 1000003 + round_trip(&t);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(nodes);
+  return 0;
+}

@@ -1,0 +1,272 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const LIMBS: int32 = 1024;
+const FACT_N: int32 = 1000;
+const CHAIN: int32 = 3;
+const DEC_BASE: uint32 = 1000000000;
+const PASSES: int32 = 24;
+
+struct Bignum {
+  limb: uint32*;
+  len: int32;
+}
+
+fn bn_zero(a: Bignum*) {
+  var i: int32 = 0;
+  while (i < LIMBS) {
+    a->limb[i] = 0;
+    i += 1;
+  }
+  a->len = 0;
+}
+
+fn bn_set_u32(a: Bignum*, v: uint32) {
+  bn_zero(a);
+  if (v != 0) {
+    a->limb[0] = v;
+    a->len = 1;
+  }
+}
+
+fn bn_copy(dst: Bignum*, src: Bignum*) {
+  var i: int32 = 0;
+  while (i < src->len) {
+    dst->limb[i] = src->limb[i];
+    i += 1;
+  }
+  while (i < dst->len) {
+    dst->limb[i] = 0;
+    i += 1;
+  }
+  dst->len = src->len;
+}
+
+fn bn_mul_small(a: Bignum*, m: uint32) {
+  var carry: uint64 = 0;
+  var i: int32 = 0;
+  while (i < a->len) {
+    var cur: uint64 = (uint64)a->limb[i] * (uint64)m + carry;
+    a->limb[i] = (uint32)(cur & 4294967295);
+    carry = cur >> 32;
+    i += 1;
+  }
+  while (carry != 0 && i < LIMBS) {
+    a->limb[i] = (uint32)(carry & 4294967295);
+    carry = carry >> 32;
+    i += 1;
+  }
+  if (i > a->len) {
+    a->len = i;
+  }
+}
+
+fn bn_add_small(a: Bignum*, v: uint32) {
+  var carry: uint64 = (uint64)v;
+  var i: int32 = 0;
+  while (carry != 0 && i < LIMBS) {
+    var cur: uint64 = (uint64)a->limb[i] + carry;
+    a->limb[i] = (uint32)(cur & 4294967295);
+    carry = cur >> 32;
+    i += 1;
+  }
+  if (i > a->len) {
+    a->len = i;
+  }
+}
+
+fn bn_mul(dst: Bignum*, x: Bignum*, y: Bignum*) {
+  bn_zero(dst);
+  var total: int32 = x->len + y->len;
+  if (total > LIMBS) {
+    total = LIMBS;
+  }
+  var i: int32 = 0;
+  while (i < x->len) {
+    var carry: uint64 = 0;
+    var xi: uint64 = (uint64)x->limb[i];
+    var j: int32 = 0;
+    while (j < y->len && i + j < LIMBS) {
+      var cur: uint64 = xi * (uint64)y->limb[j] + (uint64)dst->limb[i + j] + carry;
+      dst->limb[i + j] = (uint32)(cur & 4294967295);
+      carry = cur >> 32;
+      j += 1;
+    }
+    var k: int32 = i + j;
+    while (carry != 0 && k < LIMBS) {
+      var cur2: uint64 = (uint64)dst->limb[k] + carry;
+      dst->limb[k] = (uint32)(cur2 & 4294967295);
+      carry = cur2 >> 32;
+      k += 1;
+    }
+    i += 1;
+  }
+  while (total > 0 && dst->limb[total - 1] == 0) {
+    total -= 1;
+  }
+  dst->len = total;
+}
+
+fn bn_divmod_small(a: Bignum*, d: uint32) -> uint32 {
+  var rem: uint64 = 0;
+  var i: int32 = a->len;
+  while (i > 0) {
+    i -= 1;
+    var cur: uint64 = (rem << 32) | (uint64)a->limb[i];
+    a->limb[i] = (uint32)(cur / (uint64)d);
+    rem = cur % (uint64)d;
+  }
+  var n: int32 = a->len;
+  while (n > 0 && a->limb[n - 1] == 0) {
+    n -= 1;
+  }
+  a->len = n;
+  return (uint32)rem;
+}
+
+fn bn_is_zero(a: Bignum*) -> int32 {
+  if (a->len == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+fn build_factorial(f: Bignum*, n: int32) {
+  bn_set_u32(f, 1);
+  var i: int32 = 2;
+  while (i <= n) {
+    bn_mul_small(f, (uint32)i);
+    i += 1;
+  }
+}
+
+fn build_seeded(a: Bignum*, seed: uint32, limbs: int32) {
+  bn_zero(a);
+  var state: uint32 = seed;
+  var i: int32 = 0;
+  while (i < limbs) {
+    state = state ^ (state << 13);
+    state = state ^ (state >> 17);
+    state = state ^ (state << 5);
+    a->limb[i] = state | 1;
+    i += 1;
+  }
+  a->len = limbs;
+}
+
+fn decimal_checksum(work: Bignum*, src: Bignum*, out_digits: int32*) -> uint64 {
+  bn_copy(work, src);
+  var h: uint64 = 14695981039346656037;
+  var digits: int32 = 0;
+  while (bn_is_zero(work) == 0) {
+    var chunk: uint32 = bn_divmod_small(work, DEC_BASE);
+    var c: int32 = 0;
+    while (c < 9) {
+      var d: uint32 = chunk % 10;
+      chunk = chunk / 10;
+      h = h ^ (uint64)d;
+      h = h * 1099511628211;
+      digits += 1;
+      c += 1;
+    }
+  }
+  *out_digits = digits;
+  return h;
+}
+
+fn round_trip(fact: Bignum*, seed_a: Bignum*, seed_b: Bignum*, prod: Bignum*,
+              acc: Bignum*, work: Bignum*, out_digits: int32*) -> uint64 {
+  build_factorial(fact, FACT_N);
+
+  var h: uint64 = 1469598103934665603;
+  h = h * 31 + (uint64)fact->len;
+
+  bn_copy(acc, fact);
+  var round: int32 = 0;
+  while (round < CHAIN) {
+    build_seeded(seed_a, (uint32)(2166136261 + (int64)round * 7919), 24 + round * 8);
+    build_seeded(seed_b, (uint32)(3735928559 + (int64)round * 104729), 24 + round * 8);
+    bn_mul(prod, seed_a, seed_b);
+    bn_add_small(prod, (uint32)(round + 1));
+    bn_mul(work, acc, prod);
+    bn_copy(acc, work);
+    h = h * 1000003 + (uint64)acc->len;
+    h = h ^ (uint64)prod->limb[0];
+    round += 1;
+  }
+
+  var digits: int32 = 0;
+  var dh: uint64 = decimal_checksum(work, acc, &digits);
+  h = h * 1000003 + dh;
+  h = h * 31 + (uint64)digits;
+  *out_digits = digits;
+  return h;
+}
+
+fn main() -> int32 {
+  var pool: uint32* = malloc((int64)LIMBS * 4 * 6);
+  if (pool == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  var fact: Bignum;
+  var seed_a: Bignum;
+  var seed_b: Bignum;
+  var prod: Bignum;
+  var acc: Bignum;
+  var work: Bignum;
+
+  fact.limb = pool;
+  fact.len = 0;
+  seed_a.limb = pool + LIMBS;
+  seed_a.len = 0;
+  seed_b.limb = pool + LIMBS * 2;
+  seed_b.len = 0;
+  prod.limb = pool + LIMBS * 3;
+  prod.len = 0;
+  acc.limb = pool + LIMBS * 4;
+  acc.len = 0;
+  work.limb = pool + LIMBS * 5;
+  work.len = 0;
+
+  bn_zero(&fact);
+  bn_zero(&seed_a);
+  bn_zero(&seed_b);
+  bn_zero(&prod);
+  bn_zero(&acc);
+  bn_zero(&work);
+
+  println("Bignum: factorial({FACT_N}) then {CHAIN} wide multiplies, base 2^32 limbs");
+
+  var digits: int32 = 0;
+  var check: uint64 = round_trip(&fact, &seed_a, &seed_b, &prod, &acc, &work, &digits);
+  println("  factorial limbs = {fact.len}, product limbs = {acc.len}, decimal digits = {digits}");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var d2: int32 = 0;
+    bench_hash = bench_hash * 1000003 + round_trip(&fact, &seed_a, &seed_b, &prod, &acc, &work, &d2);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(pool);
+  return 0;
+}
