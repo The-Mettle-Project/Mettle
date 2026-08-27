@@ -846,29 +846,69 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
 
       {
         const IRInstruction *shl = &function->instructions[s];
-        if (!(shl->op == IR_OP_BINARY && !shl->is_float && shl->text &&
-              strcmp(shl->text, "<<") == 0 &&
-              shl->rhs.kind == IR_OPERAND_INT && shl->rhs.int_value >= 1 &&
-              shl->rhs.int_value <= 3 && shl->lhs.kind == IR_OPERAND_TEMP &&
-              shl->lhs.name && shl->dest.kind == IR_OPERAND_TEMP &&
-              shl->dest.name &&
-              snprintf(sh_name, sizeof(sh_name), "%s", shl->dest.name) <
-                  (int)sizeof(sh_name))) {
+        /* A byte array scales by one, so the shift the pattern keys on is not
+         * emitted at all and `m[r + i]` reaches the consumer as the index add
+         * itself. Every string scan in the language has that shape, so the
+         * scale-1 form is matched here with the index add standing in for the
+         * shift and the same gates applied to it. */
+        int scaled =
+            shl->op == IR_OP_BINARY && !shl->is_float && shl->text &&
+            strcmp(shl->text, "<<") == 0 && shl->rhs.kind == IR_OPERAND_INT &&
+            shl->rhs.int_value >= 1 && shl->rhs.int_value <= 3 &&
+            shl->lhs.kind == IR_OPERAND_TEMP && shl->lhs.name &&
+            shl->dest.kind == IR_OPERAND_TEMP && shl->dest.name;
+        int unscaled = !scaled && shl->op == IR_OP_BINARY && !shl->is_float &&
+                       shl->text && strcmp(shl->text, "+") == 0 &&
+                       shl->dest.kind == IR_OPERAND_TEMP && shl->dest.name;
+        if (!scaled && !unscaled) {
           continue;
         }
-        k = shl->rhs.int_value;
+        if (snprintf(sh_name, sizeof(sh_name), "%s", shl->dest.name) >=
+            (int)sizeof(sh_name)) {
+          continue;
+        }
+        k = scaled ? shl->rhs.int_value : 0;
+
+        /* Cheap rejection first. Everything below this point walks the loop
+         * (the invariance tests) and then the whole function (the reader
+         * scan), and admitting the scale-1 form means every `+` in every loop
+         * is a candidate. Unless some instruction in this loop already reads
+         * the index as `base + %sh`, there is nothing to rewrite and those
+         * walks would only prove it. The loop body is the smaller thing to
+         * search, so search it first. */
+        {
+          int reachable = 0;
+          for (size_t j = s + 1; j < latch; j++) {
+            const IRInstruction *use = &function->instructions[j];
+            if (use->op == IR_OP_BINARY && !use->is_float && use->text &&
+                strcmp(use->text, "+") == 0 &&
+                use->lhs.kind == IR_OPERAND_SYMBOL && use->lhs.name &&
+                ir_operand_is_temp_named(&use->rhs, sh_name)) {
+              reachable = 1;
+              break;
+            }
+          }
+          if (!reachable) {
+            continue;
+          }
+        }
 
         /* The shifted value must be `invariant + counter`, defined in-loop. */
         const IRInstruction *idx = NULL;
-        for (size_t j = s; j-- > header + 1;) {
-          const IRInstruction *cand = &function->instructions[j];
-          if (ir_instruction_writes_destination(cand) &&
-              cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
-              strcmp(cand->dest.name, shl->lhs.name) == 0) {
-            idx = cand;
-            idx_pos = j;
-            break;
+        if (scaled) {
+          for (size_t j = s; j-- > header + 1;) {
+            const IRInstruction *cand = &function->instructions[j];
+            if (ir_instruction_writes_destination(cand) &&
+                cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
+                strcmp(cand->dest.name, shl->lhs.name) == 0) {
+              idx = cand;
+              idx_pos = j;
+              break;
+            }
           }
+        } else {
+          idx = shl;
+          idx_pos = s;
         }
         if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||
             strcmp(idx->text, "+") != 0) {
@@ -892,7 +932,8 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
           continue;
         }
         /* The moving half must still hold the index add's value at the
-         * shift: nothing may redefine it in between. */
+         * shift: nothing may redefine it in between. At scale 1 they are the
+         * same instruction, so there is no in between. */
         int redefined = 0;
         for (size_t j = idx_pos + 1; j < s; j++) {
           const IRInstruction *mid = &function->instructions[j];
@@ -956,7 +997,7 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
       char ptr_types[IR_ROW_MAX_CONSUMERS][64];
       char row_names[IR_ROW_MAX_CONSUMERS][48];
       char off_name[48];
-      int need_off_temp = inv.kind != IR_OPERAND_INT;
+      int need_off_temp = k != 0 && inv.kind != IR_OPERAND_INT;
       for (size_t c = 0; c < consumer_count && !bad; c++) {
         const IRInstruction *addr = &function->instructions[consumers[c]];
         const char *pt = ir_row_symbol_pointer_type(function, addr->lhs.name);
@@ -986,6 +1027,16 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
       {
         IRInstruction *shl = &function->instructions[s];
         ir_operand_destroy(&shl->lhs);
+        if (k == 0) {
+          /* At scale 1 this instruction IS the index add. The row pointer now
+           * carries the invariant half, so what the consumers still need from
+           * it is the moving half alone. */
+          ir_operand_destroy(&shl->rhs);
+          mettle_free_string(shl->text);
+          shl->text = NULL;
+          shl->op = IR_OP_ASSIGN;
+          shl->rhs = ir_operand_none();
+        }
         shl->lhs = var;
         var = ir_operand_none();
       }
@@ -994,7 +1045,7 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
        * what it contributed. Retire it when nothing else reads it: left in
        * place it is dead code that still describes an offset, and a later
        * recognizer can charge that offset on top of the row pointer. */
-      {
+      if (k != 0) {
         IRInstruction *idx_ins = &function->instructions[idx_pos];
         if (idx_ins->dest.kind == IR_OPERAND_TEMP && idx_ins->dest.name) {
           int read_elsewhere = 0;
@@ -1058,8 +1109,10 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
         add.text = mettle_strdup("+");
         add.dest = ir_operand_symbol(row_names[c]);
         add.lhs = ir_operand_symbol(base_names[c]);
-        add.rhs = need_off_temp ? ir_operand_temp(off_name)
-                                : ir_operand_int(inv.int_value << k);
+        add.rhs = need_off_temp
+                      ? ir_operand_temp(off_name)
+                      : (k == 0 ? ir_operand_copy(&inv)
+                                : ir_operand_int(inv.int_value << k));
         if (!add.text || !add.dest.name || !add.lhs.name ||
             !ir_function_insert_instruction(function, at, &add)) {
           failed = 1;
