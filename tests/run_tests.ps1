@@ -1389,17 +1389,24 @@ $cases = @(
     Name          = "runtime_null_deref_check"
     Path          = "tests/test_runtime_null_deref_check.mettle"
     ShouldSucceed = $true
+    # The program ends in `return *p` with p null. Dying IS the behaviour
+    # under test, so the run gate has nothing to say about it.
+    SkipRunDiff   = $true
   },
   @{
     Name          = "runtime_array_bounds_check"
     Path          = "tests/test_runtime_array_bounds_check.mettle"
     ShouldSucceed = $true
+    # -O keeps the bounds check and --release drops it by design, so the two
+    # modes are MEANT to disagree here.
+    SkipRunDiff   = $true
   },
   @{
     Name          = "stack_trace_support"
     Path          = "tests/test_runtime_null_deref_check.mettle"
     ShouldSucceed = $true
     Args          = @("-s")
+    SkipRunDiff   = $true
   },
   @{ Name = "pointer_param_address"; Path = "tests/test_pointer_param_address.mettle"; ShouldSucceed = $true },
   @{
@@ -4609,36 +4616,75 @@ foreach ($shiftCase in @(
   }
 }
 
-# Every recognizer case in $cases asserts that a kernel op appears in the
-# optimized IR and stops there: the table runner checks the exit code, the IR
-# patterns and the artifacts, and never runs the program it just built. So a
-# recognizer that fires and computes the WRONG answer passes. That is how a
-# shift-sort predicate accepting a four-element stride rewrote a strided walk
-# into a stride-1 sort while its case stayed green; against the source before
-# that fix, this block would have failed on the debug exit code alone, because
-# debug segfaulted.
+# Runs a built program with stdin closed and a wall-clock limit. Closing stdin
+# matters: a program that reads it inherits the console otherwise and eats the
+# operator's keystrokes, and a suite that hangs on one is worse than one that
+# fails on it.
+function Invoke-ProgramCapture {
+  param([string]$Path, [int]$TimeoutSeconds = 60)
+
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $Path
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardInput = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  $proc.StandardInput.Close()
+  $stdout = $proc.StandardOutput.ReadToEndAsync()
+  $stderr = $proc.StandardError.ReadToEndAsync()
+  if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+    try { $proc.Kill() } catch { }
+    return [pscustomobject]@{ Exit = -999; Output = "timed out after $TimeoutSeconds s" }
+  }
+  $text = $stdout.Result + $stderr.Result
+  return [pscustomobject]@{ Exit = $proc.ExitCode; Output = $text }
+}
+
+# An exit that means the process died rather than returned: a POSIX signal
+# (128+n) or a Windows structured exception (the 0xC0000000 range).
+function Test-ExitIsCrash {
+  param([int]$Code)
+  if ($Code -eq -999) { return $false }
+  # Decimal, not 0xC0000000: PowerShell parses a hex literal past Int32 as a
+  # NEGATIVE Int32, and comparing against that called every clean exit a crash.
+  # Windows reports a structured exception as a negative Int32, so widen before
+  # converting rather than casting a negative straight to uint32, which throws.
+  $u = [uint32]([int64]$Code -band 4294967295L)
+  if ($u -ge 3221225472 -and $u -lt 3489660928) { return $true }
+  # 128+signal is a POSIX shell convention. On Windows those are ordinary
+  # return values -- a test returning 155 is not a crash.
+  if (-not $script:OnWindows -and $Code -gt 128 -and $Code -lt 166) {
+    return $true
+  }
+  return $false
+}
+
+# A case that names a program, says the compile must succeed, and asserts
+# nothing about what the program does is only ever testing that the compiler
+# exited 0. The program itself is never run, so it can crash on every execution
+# and the case stays green -- which is how a recognizer that rewrote a strided
+# walk into a stride-1 sort kept a passing test, and how a std/net program that
+# died on SIGPIPE before reaching its last line kept another.
 #
-# Debug does not run the recognizers, so it is the reference: build each program
-# both ways and compare what it prints and what it returns. The list comes from
-# $cases itself, so it cannot drift as recognizers are added, and it skips cases
-# that already carry their own output assertion -- $simdRuntimeCases and
-# anything with OutputMustMatch/Pattern are executed already.
-#
-# $cases is the whole table, so this shards the same way everything else does.
+# Two things are checked here, because they catch different faults. Debug does
+# not run the recognizers, so debug against release catches a pass that changes
+# what the program computes. And neither build may DIE: a crash reproduces in
+# both modes, so the comparison alone would call it agreement.
 foreach ($case in $cases) {
-  if (-not ($case.ContainsKey("IrMustMatch") -and $case.IrMustMatch)) { continue }
   if (-not ($case.ContainsKey("Path") -and $case.Path)) { continue }
   if (-not $case.ShouldSucceed) { continue }
   if ($case.ContainsKey("OutputMustMatch") -and $case.OutputMustMatch) { continue }
+  if ($case.ContainsKey("OutputMustNotMatch") -and $case.OutputMustNotMatch) { continue }
   if ($case.ContainsKey("Pattern") -and $case.Pattern) { continue }
+  if ($case.ContainsKey("SkipRunDiff") -and $case.SkipRunDiff) { continue }
 
   $total++
-  $recogName = "recognizer_runtime_" + $case.Name
+  $recogName = "runs_" + $case.Name
   try {
     if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
 
-    $recogOut = @{}
-    $recogExit = @{}
+    $built = @{}
     foreach ($recogMode in @("debug", "release")) {
       $exePath = Join-Path $tmpDir ("{0}_rundiff_{1}.exe" -f $case.Name, $recogMode)
       # Clear the object too: a stale one from the other mode is exactly what
@@ -4652,26 +4698,51 @@ foreach ($case in $cases) {
       $buildArgs = @("--build", "--linker", "internal", $case.Path, "-o", $exePath)
       if ($recogMode -eq "release") { $buildArgs = @("--release") + $buildArgs }
       $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
-      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exePath)) {
-        throw "$recogMode build failed: $buildOut"
-      }
-      $recogOut[$recogMode] = & $exePath 2>&1 | Out-String
-      $recogExit[$recogMode] = $LASTEXITCODE
+      $built[$recogMode] = @{ Ok = ($LASTEXITCODE -eq 0 -and (Test-Path $exePath))
+                              Exe = $exePath; Log = $buildOut }
     }
 
-    if ($recogExit["debug"] -ne $recogExit["release"]) {
-      throw ("exit code differs: debug {0}, release {1}" -f $recogExit["debug"], $recogExit["release"])
+    # A module with no main is not a program; both modes agreeing that it will
+    # not link is the expected answer, not a failure.
+    if (-not $built["debug"].Ok -and -not $built["release"].Ok) {
+      Write-CaseResult -Name $recogName -Passed $true -Reason "no executable (library module)"
+      continue
+    }
+    if ($built["debug"].Ok -ne $built["release"].Ok) {
+      throw ("one mode linked and the other did not" +
+             "`n--- debug ---`n" + $built["debug"].Log +
+             "`n--- release ---`n" + $built["release"].Log)
+    }
+
+    $ran = @{}
+    foreach ($recogMode in @("debug", "release")) {
+      $ran[$recogMode] = Invoke-ProgramCapture -Path $built[$recogMode].Exe
+    }
+
+    foreach ($recogMode in @("debug", "release")) {
+      if (Test-ExitIsCrash -Code $ran[$recogMode].Exit) {
+        throw ("the $recogMode build died with exit $($ran[$recogMode].Exit): " +
+               $ran[$recogMode].Output)
+      }
+      if ($ran[$recogMode].Exit -eq -999) {
+        throw "the $recogMode build did not finish: $($ran[$recogMode].Output)"
+      }
+    }
+
+    if ($ran["debug"].Exit -ne $ran["release"].Exit) {
+      throw ("exit code differs: debug {0}, release {1}" -f $ran["debug"].Exit,
+             $ran["release"].Exit)
     }
 
     # The only lines dropped are a benchmark's elapsed-time readings, and they
-    # are dropped because they differ between two runs of the SAME binary -- a
+    # are dropped because they differ between two runs of the same binary -- a
     # measurement, not a mode signal. Anything that genuinely differs by mode
     # belongs in the program as something mode-invariant: a filter grown to
     # accommodate whatever a program prints is how a recognizer predicate gets
     # widened until the tests pass.
     $recogNorm = @{}
     foreach ($recogMode in @("debug", "release")) {
-      $recogNorm[$recogMode] = (($recogOut[$recogMode] -split "`r?`n") |
+      $recogNorm[$recogMode] = (($ran[$recogMode].Output -split "`r?`n") |
         Where-Object { $_ -notmatch '^\s*(Time|Per pass):\s*~?\s*\d+\s*(us|ms|ns)\s*$' }) -join "`n"
     }
     if ($recogNorm["debug"] -ne $recogNorm["release"]) {
