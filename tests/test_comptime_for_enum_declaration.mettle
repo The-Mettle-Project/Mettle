@@ -1,0 +1,26 @@
+// An `enum` in a `comptime for` body. Cloning a declaration the clone had no
+// case for produced a node with no payload, reported as "Invalid enum
+// declaration" from a declaration the program wrote correctly.
+
+struct One {
+    a: uint8;
+}
+
+comptime for f in typeof(One).fields {
+    enum Flag {
+        Off,
+        On,
+    }
+}
+
+fn main() -> int32 {
+    var lit: Flag = On;
+    var off: Flag = Off;
+    if ((int32)lit != 1) {
+        return 1;
+    }
+    if ((int32)off != 0) {
+        return 2;
+    }
+    return 0;
+}

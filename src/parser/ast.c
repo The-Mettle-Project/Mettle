@@ -913,6 +913,93 @@ ASTNode *ast_clone_node(ASTNode *node) {
     }
     break;
   }
+  case AST_ENUM_DECLARATION: {
+    EnumDeclaration *src = (EnumDeclaration *)node->data;
+    EnumDeclaration *dst = malloc(sizeof(EnumDeclaration));
+    if (!dst) {
+      free(clone);
+      return NULL;
+    }
+    dst->name = ast_intern_string(src ? src->name : NULL);
+    dst->is_exported = src ? src->is_exported : 0;
+    dst->variant_count = src ? src->variant_count : 0;
+    dst->variants = NULL;
+    dst->type_param_count = src ? src->type_param_count : 0;
+    dst->type_params = NULL;
+    if (dst->variant_count > 0) {
+      dst->variants = malloc(dst->variant_count * sizeof(EnumVariant));
+      if (!dst->variants) {
+        free(dst);
+        free(clone);
+        return NULL;
+      }
+      for (size_t i = 0; i < dst->variant_count; i++) {
+        dst->variants[i].name = ast_intern_string(src->variants[i].name);
+        dst->variants[i].payload_type =
+            ast_intern_string(src->variants[i].payload_type);
+        dst->variants[i].value = src->variants[i].value
+                                     ? ast_clone_node(src->variants[i].value)
+                                     : NULL;
+        if (dst->variants[i].value) {
+          ast_add_child(clone, dst->variants[i].value);
+        }
+      }
+    }
+    if (dst->type_param_count > 0 && src->type_params) {
+      dst->type_params = malloc(dst->type_param_count * sizeof(char *));
+      if (!dst->type_params) {
+        free(dst->variants);
+        free(dst);
+        free(clone);
+        return NULL;
+      }
+      for (size_t i = 0; i < dst->type_param_count; i++) {
+        dst->type_params[i] = ast_intern_string(src->type_params[i]);
+      }
+    } else {
+      dst->type_param_count = 0;
+    }
+    clone->data = dst;
+    break;
+  }
+  case AST_MATCH_STATEMENT: {
+    MatchStatement *src = (MatchStatement *)node->data;
+    MatchStatement *dst = malloc(sizeof(MatchStatement));
+    if (!dst) {
+      free(clone);
+      return NULL;
+    }
+    dst->is_expression = src ? src->is_expression : 0;
+    dst->arm_count = src ? src->arm_count : 0;
+    dst->arms = NULL;
+    dst->expression =
+        src && src->expression ? ast_clone_node(src->expression) : NULL;
+    if (dst->expression) {
+      ast_add_child(clone, dst->expression);
+    }
+    if (dst->arm_count > 0) {
+      dst->arms = malloc(dst->arm_count * sizeof(MatchArm));
+      if (!dst->arms) {
+        free(dst);
+        free(clone);
+        return NULL;
+      }
+      for (size_t i = 0; i < dst->arm_count; i++) {
+        dst->arms[i].variant_name =
+            ast_intern_string(src->arms[i].variant_name);
+        dst->arms[i].binding_name =
+            ast_intern_string(src->arms[i].binding_name);
+        dst->arms[i].is_default = src->arms[i].is_default;
+        dst->arms[i].body =
+            src->arms[i].body ? ast_clone_node(src->arms[i].body) : NULL;
+        if (dst->arms[i].body) {
+          ast_add_child(clone, dst->arms[i].body);
+        }
+      }
+    }
+    clone->data = dst;
+    break;
+  }
   default:
     break;
   }

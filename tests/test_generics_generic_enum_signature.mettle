@@ -1,0 +1,63 @@
+// A generic function whose signature names a generic enum. The monomorphizer
+// mangled `Opt<T>` to a name only it understands, but a generic enum is
+// instantiated by the type checker off the name the program wrote, so the
+// function went undefined along with its return type. `match` inside the
+// template exercises the clone of the body: the cloned match once carried no
+// payload at all.
+
+enum Opt<T> {
+    Some(T),
+    None,
+}
+
+struct Box<T> {
+    v: Opt<T>;
+}
+
+fn wrap<T>(v: T) -> Opt<T> {
+    return Some(v);
+}
+
+fn unwrap<T>(o: Opt<T>, d: T) -> T {
+    match (o) {
+        case Some(v): { return v; }
+        default: { return d; }
+    }
+}
+
+fn unwrap_expr<T>(o: Opt<T>, d: T) -> T {
+    return match (o) { case Some(v): v, default: d };
+}
+
+fn boxed<T>(b: Box<T>, d: T) -> T {
+    match (b.v) {
+        case Some(x): { return x; }
+        default: { return d; }
+    }
+}
+
+fn main() -> int32 {
+    if (unwrap<int64>(wrap<int64>(7), 0) != 7) {
+        return 1;
+    }
+    if (unwrap<int64>(None, 30) != 30) {
+        return 2;
+    }
+    if (unwrap_expr<int32>(wrap<int32>(9), 0) != 9) {
+        return 3;
+    }
+
+    var b: Box<int64>;
+    b.v = Some(12);
+    if (boxed<int64>(b, 0) != 12) {
+        return 4;
+    }
+
+    var empty: Box<int32>;
+    empty.v = None;
+    if (boxed<int32>(empty, 5) != 5) {
+        return 5;
+    }
+
+    return 0;
+}

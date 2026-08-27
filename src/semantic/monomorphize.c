@@ -58,6 +58,7 @@ static char *substitute_type_string(const char *type_str, char **param_names,
 static void substitute_types_in_ast(ASTNode *node, char **param_names,
                                     char **arg_names, size_t count,
                                     MonoContext *ctx);
+static GenericDef *find_generic_def(MonoContext *ctx, const char *name);
 
 static char *mangle_name(const char *base, char **type_args,
                            size_t type_arg_count) {
@@ -896,11 +897,19 @@ static char *substitute_type_string(const char *type_str, char **param_names,
           substitute_type_string(gen_args[i], param_names, arg_names, count, ctx);
     }
 
-    // Generate mangled name for this instantiation
-    char *mangled = mangle_name(gen_base, subst_args, gen_arg_count);
+    /* Only a generic this pass owns gets a mangled name. A generic enum is
+     * instantiated by the type checker instead, off the name the program
+     * wrote, so substituting inside its arguments is the whole job: mangling
+     * it here hands the type checker a name it has never heard of, and the
+     * function that returned it goes undefined along with the type.
+     * rewrite_generic_type_name_in_place makes the same check. */
+    int owned = !ctx || find_generic_def(ctx, gen_base) != NULL;
+    char *mangled = owned ? mangle_name(gen_base, subst_args, gen_arg_count)
+                          : written_generic_name(gen_base, subst_args,
+                                                 gen_arg_count);
 
     // Record this as an instantiation if not already recorded
-    if (ctx) {
+    if (ctx && owned) {
       int found = 0;
       for (size_t i = 0; i < ctx->instance_count; i++) {
         if (strcmp(ctx->instances[i].mangled_name, mangled) == 0) {

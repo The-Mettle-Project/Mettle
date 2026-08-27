@@ -1471,6 +1471,9 @@ $cases = @(
     Path          = "tests/test_narrowing_reverify.mettle"
     ShouldSucceed = $true
   },
+  # An `enum` in a `comptime for` body: cloning a declaration kind the clone had
+  # no case for left the node with no payload.
+  @{ Name = "comptime_for_enum_declaration"; Path = "tests/test_comptime_for_enum_declaration.mettle"; ShouldSucceed = $true },
   @{ Name = "integer_literal_wide"; Path = "tests/test_integer_literal_wide.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_mixed_locals"; Path = "tests/test_stack_mixed_locals.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_large_struct"; Path = "tests/test_stack_large_struct.mettle"; ShouldSucceed = $true },
@@ -1517,6 +1520,10 @@ $cases = @(
   @{ Name = "generics_multiple_instantiations"; Path = "tests/test_generics_multiple_instantiations.mettle"; ShouldSucceed = $true },
   @{ Name = "generics_nested_struct"; Path = "tests/test_generics_nested_struct.mettle"; ShouldSucceed = $true },
   @{ Name = "generics_generic_enum"; Path = "tests/test_generics_generic_enum.mettle"; ShouldSucceed = $true },
+  # A generic function whose signature names a generic enum, and `match` inside
+  # the template: the monomorphizer mangled a name only the type checker owns,
+  # and the body clone dropped the match payload outright.
+  @{ Name = "generics_generic_enum_signature"; Path = "tests/test_generics_generic_enum_signature.mettle"; ShouldSucceed = $true },
   @{ Name = "generics_return_struct"; Path = "tests/test_generics_return_struct.mettle"; ShouldSucceed = $true },
   @{ Name = "generics_float"; Path = "tests/test_generics_float.mettle"; ShouldSucceed = $true },
   @{ Name = "generics_new_heap"; Path = "tests/test_generics_new_heap.mettle"; ShouldSucceed = $true },
@@ -4970,7 +4977,8 @@ try {
     @{ Path = "tests/test_generics_method_body_instantiation.mettle"; ExitCode = 42; Label = "method-body-instantiation" },
     @{ Path = "tests/test_method_pointer_receiver.mettle"; ExitCode = 42; Label = "pointer-receiver" },
     @{ Path = "tests/test_generics_struct_field.mettle"; ExitCode = 42; Label = "struct-field-ordering" },
-    @{ Path = "tests/test_trait_methods_generic_dispatch.mettle"; ExitCode = 42; Label = "trait-dispatch" }
+    @{ Path = "tests/test_trait_methods_generic_dispatch.mettle"; ExitCode = 42; Label = "trait-dispatch" },
+    @{ Path = "tests/test_generics_generic_enum_signature.mettle"; ExitCode = 0; Label = "generic-enum-signature" }
   )
 
   foreach ($case in $genericRuntimeCases) {
