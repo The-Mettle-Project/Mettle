@@ -4652,10 +4652,23 @@ function Test-ExitIsCrash {
   # converting rather than casting a negative straight to uint32, which throws.
   $u = [uint32]([int64]$Code -band 4294967295L)
   if ($u -ge 3221225472 -and $u -lt 3489660928) { return $true }
-  # 128+signal is a POSIX shell convention. On Windows those are ordinary
-  # return values -- a test returning 155 is not a crash.
-  if (-not $script:OnWindows -and $Code -gt 128 -and $Code -lt 166) {
-    return $true
+  # 128+signal is a POSIX shell convention, and it collides with ordinary
+  # return values: a program returning 151 and one killed by signal 23 both
+  # arrive as 151, here and at the shell, so no test can separate them. Taking
+  # the whole 129..165 span therefore accused programs that simply returned a
+  # number in it -- test_labeled_while returns 407, whose low byte is 151, and
+  # test_generics_struct_methods returns 155, which another case in this very
+  # file asserts as its expected exit code.
+  #
+  # Name the signals that actually mean the process died instead. The residue
+  # is that a program returning exactly one of these is still misread; that is
+  # a smaller and rarer wrong answer than the span, and no amount of machinery
+  # removes it.
+  if (-not $script:OnWindows) {
+    #      SIGILL SIGTRAP SIGABRT SIGBUS SIGFPE SIGSEGV SIGPIPE SIGSYS
+    foreach ($fatal in @(132, 133, 134, 135, 136, 139, 141, 159)) {
+      if ($Code -eq $fatal) { return $true }
+    }
   }
   return $false
 }
