@@ -135,7 +135,20 @@ typedef struct {
   IROperand rhs;
   int is_float;
   IROperand value;
+  /* Cleared instead of compacted out, so a removal never shifts the indices
+   * that point at surviving entries. Compaction happens only once the dead
+   * outnumber the living. */
+  int alive;
 } IRExpressionEntry;
+
+/* One appearance of a name as an operand of an entry, chained per hash bucket.
+ * Append-only: an occurrence naming a dead entry is skipped, and the whole
+ * array is rebuilt when the map compacts. */
+typedef struct {
+  size_t name_hash;
+  size_t entry_index;
+  size_t next; /* index+1 into the occurrence array, 0 ends the chain */
+} IRExprNameOcc;
 
 typedef struct {
   IRExpressionEntry *items;
@@ -160,6 +173,18 @@ typedef struct {
   size_t *expr_slots;
   size_t expr_capacity;
   int expr_valid;
+  size_t dead_count;
+  /* name -> the entries naming it, so invalidating a name that IS an operand
+   * touches only those entries rather than walking the map. */
+  IRExprNameOcc *occ;
+  size_t occ_count;
+  size_t occ_capacity;
+  size_t *occ_heads;
+  size_t occ_head_capacity;
+  /* Entries carrying a SYMBOL operand: the only ones a store can invalidate. */
+  size_t *sym_entries;
+  size_t sym_count;
+  size_t sym_capacity;
 } IRExpressionMap;
 
 typedef struct {

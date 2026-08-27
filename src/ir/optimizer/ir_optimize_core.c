@@ -1356,9 +1356,17 @@ static void ir_expression_map_clear(IRExpressionMap *map) {
   }
 
   for (size_t i = 0; i < map->count; i++) {
-    ir_expression_entry_destroy(&map->items[i]);
+    if (map->items[i].alive) {
+      ir_expression_entry_destroy(&map->items[i]);
+    }
   }
   map->count = 0;
+  map->dead_count = 0;
+  map->occ_count = 0;
+  map->sym_count = 0;
+  if (map->occ_heads) {
+    memset(map->occ_heads, 0, map->occ_head_capacity * sizeof(size_t));
+  }
   if (map->name_hashes) {
     memset(map->name_hashes, 0, map->name_hash_capacity * sizeof(size_t));
   }
@@ -1375,6 +1383,15 @@ static void ir_expression_map_destroy(IRExpressionMap *map) {
   free(map->items);
   free(map->name_hashes);
   free(map->expr_slots);
+  free(map->occ);
+  free(map->occ_heads);
+  free(map->sym_entries);
+  map->occ = NULL;
+  map->occ_capacity = 0;
+  map->occ_heads = NULL;
+  map->occ_head_capacity = 0;
+  map->sym_entries = NULL;
+  map->sym_capacity = 0;
   map->name_hashes = NULL;
   map->name_hash_capacity = 0;
   map->expr_slots = NULL;
@@ -1547,11 +1564,130 @@ static int ir_expression_map_index_build(IRExpressionMap *map) {
     memset(map->expr_slots, 0, map->expr_capacity * sizeof(size_t));
   }
   for (size_t i = 0; i < map->count; i++) {
-    ir_expression_map_index_put(map, i);
+    if (map->items[i].alive) {
+      ir_expression_map_index_put(map, i);
+    }
   }
   map->expr_valid = 1;
   return 1;
 }
+static size_t ir_expr_name_hash(const char *name);
+
+static void ir_expression_map_add_occurrence(IRExpressionMap *map,
+                                             const IROperand *operand,
+                                             size_t entry_index) {
+  if (!operand || !operand->name ||
+      (operand->kind != IR_OPERAND_TEMP && operand->kind != IR_OPERAND_SYMBOL)) {
+    return;
+  }
+  if (map->occ_count == map->occ_capacity) {
+    size_t grown = map->occ_capacity ? map->occ_capacity * 2 : 64;
+    IRExprNameOcc *items =
+        (IRExprNameOcc *)realloc(map->occ, grown * sizeof(IRExprNameOcc));
+    if (!items) {
+      map->occ_head_capacity = 0; /* fall back to walking the map */
+      return;
+    }
+    map->occ = items;
+    map->occ_capacity = grown;
+  }
+  if (map->occ_head_capacity == 0 ||
+      map->occ_count * 4 >= map->occ_head_capacity * 3) {
+    size_t grown = map->occ_head_capacity ? map->occ_head_capacity * 2 : 128;
+    size_t *heads = (size_t *)calloc(grown, sizeof(size_t));
+    if (!heads) {
+      map->occ_head_capacity = 0;
+      return;
+    }
+    free(map->occ_heads);
+    map->occ_heads = heads;
+    map->occ_head_capacity = grown;
+    for (size_t i = 0; i < map->occ_count; i++) {
+      size_t b = map->occ[i].name_hash & (grown - 1u);
+      map->occ[i].next = map->occ_heads[b];
+      map->occ_heads[b] = i + 1u;
+    }
+  }
+  size_t h = ir_expr_name_hash(operand->name);
+  size_t bucket = h & (map->occ_head_capacity - 1u);
+  map->occ[map->occ_count].name_hash = h;
+  map->occ[map->occ_count].entry_index = entry_index;
+  map->occ[map->occ_count].next = map->occ_heads[bucket];
+  map->occ_heads[bucket] = map->occ_count + 1u;
+  map->occ_count++;
+}
+
+static void ir_expression_map_register_entry(IRExpressionMap *map,
+                                             size_t index) {
+  IRExpressionEntry *entry = &map->items[index];
+  ir_expression_map_add_occurrence(map, &entry->lhs, index);
+  ir_expression_map_add_occurrence(map, &entry->rhs, index);
+  ir_expression_map_add_occurrence(map, &entry->value, index);
+  if (entry->lhs.kind == IR_OPERAND_SYMBOL ||
+      entry->rhs.kind == IR_OPERAND_SYMBOL) {
+    if (map->sym_count == map->sym_capacity) {
+      size_t grown = map->sym_capacity ? map->sym_capacity * 2 : 32;
+      size_t *items = (size_t *)realloc(map->sym_entries, grown * sizeof(size_t));
+      if (!items) {
+        map->sym_capacity = 0;
+        map->sym_count = 0;
+        return; /* the store path then falls back to walking the map */
+      }
+      map->sym_entries = items;
+      map->sym_capacity = grown;
+    }
+    map->sym_entries[map->sym_count++] = index;
+  }
+}
+
+static void ir_expression_map_kill(IRExpressionMap *map, size_t index) {
+  if (!map->items[index].alive) {
+    return;
+  }
+  ir_expression_entry_destroy(&map->items[index]);
+  map->items[index].alive = 0;
+  map->dead_count++;
+}
+
+/* Once the dead outnumber the living, so the cost of rebuilding the indices is
+ * spread over the removals that caused it -- or once the occurrence array has
+ * outgrown the entries it describes. That second condition is not optional: an
+ * occurrence is only dropped by a rebuild, so a symbol written every iteration
+ * accumulates a chain of stale occurrences and walking it becomes the very
+ * cost the chain was meant to remove. */
+static void ir_expression_map_maybe_compact(IRExpressionMap *map) {
+  size_t live = map->count - map->dead_count;
+  int crowded = map->dead_count * 2 > map->count;
+  /* Measured against the LIVE entries, not every entry ever added: an
+   * occurrence naming a dead entry is exactly the stale weight a chain walk
+   * pays for, and comparing against the total let it grow without bound. */
+  int chained = map->occ_count > 32 && map->occ_count > (live + 1u) * 4u;
+  if (!crowded && !chained) {
+    return;
+  }
+  size_t write = 0;
+  for (size_t read = 0; read < map->count; read++) {
+    if (!map->items[read].alive) {
+      continue;
+    }
+    if (write != read) {
+      map->items[write] = map->items[read];
+    }
+    write++;
+  }
+  map->count = write;
+  map->dead_count = 0;
+  map->expr_valid = 0;
+  map->occ_count = 0;
+  map->sym_count = 0;
+  if (map->occ_heads) {
+    memset(map->occ_heads, 0, map->occ_head_capacity * sizeof(size_t));
+  }
+  for (size_t i = 0; i < map->count; i++) {
+    ir_expression_map_register_entry(map, i);
+  }
+}
+
 static int ir_expression_map_find_matching_instruction(
     const IRExpressionMap *map, const IRInstruction *instruction) {
   if (!map || !instruction) {
@@ -1568,7 +1704,7 @@ static int ir_expression_map_find_matching_instruction(
     size_t s = wanted & mask;
     while (map->expr_slots[s]) {
       size_t idx = map->expr_slots[s] - 1u;
-      if (idx < map->count &&
+      if (idx < map->count && map->items[idx].alive &&
           ir_expression_entry_matches_instruction(&map->items[idx],
                                                   instruction)) {
         return (int)idx;
@@ -1580,7 +1716,8 @@ static int ir_expression_map_find_matching_instruction(
 
 scan:
   for (size_t i = 0; i < map->count; i++) {
-    if (ir_expression_entry_matches_instruction(&map->items[i], instruction)) {
+    if (map->items[i].alive &&
+        ir_expression_entry_matches_instruction(&map->items[i], instruction)) {
       return (int)i;
     }
   }
@@ -1704,7 +1841,9 @@ static int ir_expression_map_store_value_for_instruction(
   ir_expression_map_note_name(map, &entry->lhs);
   ir_expression_map_note_name(map, &entry->rhs);
   ir_expression_map_note_name(map, &entry->value);
+  entry->alive = 1;
   map->count++;
+  ir_expression_map_register_entry(map, map->count - 1u);
   if (map->expr_valid) {
     if ((map->count + 1u) * 2u > map->expr_capacity) {
       map->expr_valid = 0; /* rebuilt, larger, on the next lookup */
@@ -1816,28 +1955,36 @@ static void ir_expression_map_invalidate_named(IRExpressionMap *map,
     return;
   }
 
-  size_t write = 0;
-  for (size_t read = 0; read < map->count; read++) {
-    IRExpressionEntry *entry = &map->items[read];
-    if (ir_expression_entry_uses_named(entry, kind, name)) {
-      ir_expression_entry_destroy(entry);
-      continue;
+  /* The name IS an operand here, so follow its chain and clear only the
+   * entries that actually name it. Walking the map instead was the other half
+   * of the quadratic: a symbol written every iteration matches this guard
+   * every time. */
+  if (map->occ_head_capacity != 0) {
+    size_t h = ir_expr_name_hash(name);
+    size_t o = map->occ_heads[h & (map->occ_head_capacity - 1u)];
+    while (o != 0) {
+      const IRExprNameOcc *occ = &map->occ[o - 1u];
+      o = occ->next;
+      if (occ->name_hash != h || occ->entry_index >= map->count) {
+        continue;
+      }
+      if (map->items[occ->entry_index].alive &&
+          ir_expression_entry_uses_named(&map->items[occ->entry_index], kind,
+                                         name)) {
+        ir_expression_map_kill(map, occ->entry_index);
+      }
     }
-
-    if (write != read) {
-      map->items[write] = map->items[read];
-      map->items[read].op_text = NULL;
-      map->items[read].lhs = ir_operand_none();
-      map->items[read].rhs = ir_operand_none();
-      map->items[read].value = ir_operand_none();
-    }
-    write++;
+    ir_expression_map_maybe_compact(map);
+    return;
   }
 
-  if (write != map->count) {
-    map->expr_valid = 0; /* the surviving entries moved */
+  for (size_t i = 0; i < map->count; i++) {
+    if (map->items[i].alive &&
+        ir_expression_entry_uses_named(&map->items[i], kind, name)) {
+      ir_expression_map_kill(map, i);
+    }
   }
-  map->count = write;
+  ir_expression_map_maybe_compact(map);
 }
 
 /* True if @operand names a symbol whose address is taken (and so could be
@@ -1867,29 +2014,33 @@ static void ir_expression_map_invalidate_after_store(
     return;
   }
 
-  size_t write = 0;
-  for (size_t read = 0; read < map->count; read++) {
-    IRExpressionEntry *entry = &map->items[read];
-    if (ir_operand_is_aliasable_symbol(addr_taken, &entry->lhs) ||
-        ir_operand_is_aliasable_symbol(addr_taken, &entry->rhs)) {
-      ir_expression_entry_destroy(entry);
+  /* Only an entry with a SYMBOL operand can be reached by a store, and those
+   * are listed, so the rest of the map is not walked. */
+  if (map->sym_capacity != 0) {
+    for (size_t i = 0; i < map->sym_count; i++) {
+      size_t idx = map->sym_entries[i];
+      if (idx >= map->count || !map->items[idx].alive) {
+        continue;
+      }
+      if (ir_operand_is_aliasable_symbol(addr_taken, &map->items[idx].lhs) ||
+          ir_operand_is_aliasable_symbol(addr_taken, &map->items[idx].rhs)) {
+        ir_expression_map_kill(map, idx);
+      }
+    }
+    ir_expression_map_maybe_compact(map);
+    return;
+  }
+
+  for (size_t i = 0; i < map->count; i++) {
+    if (!map->items[i].alive) {
       continue;
     }
-
-    if (write != read) {
-      map->items[write] = map->items[read];
-      map->items[read].op_text = NULL;
-      map->items[read].lhs = ir_operand_none();
-      map->items[read].rhs = ir_operand_none();
-      map->items[read].value = ir_operand_none();
+    if (ir_operand_is_aliasable_symbol(addr_taken, &map->items[i].lhs) ||
+        ir_operand_is_aliasable_symbol(addr_taken, &map->items[i].rhs)) {
+      ir_expression_map_kill(map, i);
     }
-    write++;
   }
-
-  if (write != map->count) {
-    map->expr_valid = 0; /* the surviving entries moved */
-  }
-  map->count = write;
+  ir_expression_map_maybe_compact(map);
 }
 
 int ir_common_subexpression_elimination_pass(IRFunction *function,
