@@ -973,6 +973,23 @@ static int ii_var_read(IRInterpMachine *machine, IIVar *var,
   return 1;
 }
 
+/* An integer just read from memory, widened the way its element type reads:
+ * signed sign-extends, unsigned zero-extends. Byte and half loads were pinned
+ * to zero-extension while the backends widened them with movzx whatever the
+ * type said. */
+static long long ii_widen_loaded_int(unsigned long long raw, int size,
+                                     int is_unsigned) {
+  if (is_unsigned) {
+    return (long long)raw;
+  }
+  switch (size) {
+  case 1: return (long long)(signed char)raw;
+  case 2: return (long long)(short)raw;
+  case 4: return (long long)(int)(unsigned int)raw;
+  default: return (long long)raw;
+  }
+}
+
 /* Narrow an integer to a declared width, the way a store to a narrow home
    does. Signedness decides which extension refills the high bits. */
 static long long ii_narrow_int(long long v, int size, int is_unsigned) {
@@ -4409,21 +4426,8 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
           value = ii_float_value(d);
         }
       } else {
-        long long v = (long long)raw;
-        /* Every integer load narrower than a word comes back as its element
-         * type reads: signed sign-extends, unsigned zero-extends. Byte and
-         * half loads were pinned to zero-extension while the backends widened
-         * them with movzx whatever the type said. */
-        if (!insn->is_unsigned) {
-          if (size == 1) {
-            v = (long long)(signed char)raw;
-          } else if (size == 2) {
-            v = (long long)(short)raw;
-          } else if (size == 4) {
-            v = (long long)(int)(unsigned int)raw;
-          }
-        }
-        value = ii_int_value(v);
+        value = ii_int_value(
+            ii_widen_loaded_int(raw, (int)size, insn->is_unsigned));
       }
       value.undefined = machine->last_read_undefined;
       if (!ii_store_dest(machine, &frame, &insn->dest, &value)) {

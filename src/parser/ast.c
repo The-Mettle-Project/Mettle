@@ -52,6 +52,184 @@ ASTNode *ast_create_node(ASTNodeType type, SourceLocation location) {
   return node;
 }
 
+/* Clone an if statement onto `clone`: condition, both branches, and every
+ * else-if pair. Its own function for the same reason the others are - the
+ * switch in ast_clone_node carries a case per node kind and is already far
+ * past what a reader can hold. */
+static int ast_clone_if_statement(ASTNode *clone, const IfStatement *src) {
+  IfStatement *dst = malloc(sizeof(IfStatement));
+  if (!dst) {
+    return 0;
+  }
+  dst->condition = src->condition ? ast_clone_node(src->condition) : NULL;
+  dst->then_branch = src->then_branch ? ast_clone_node(src->then_branch) : NULL;
+  dst->else_branch = src->else_branch ? ast_clone_node(src->else_branch) : NULL;
+  dst->else_if_count = src->else_if_count;
+  if (src->else_if_count > 0 && src->else_ifs) {
+    dst->else_ifs = malloc(src->else_if_count * sizeof(ElseIfClause));
+    if (!dst->else_ifs) {
+      free(dst);
+      return 0;
+    }
+    for (size_t i = 0; i < src->else_if_count; i++) {
+      dst->else_ifs[i].condition = ast_clone_node(src->else_ifs[i].condition);
+      dst->else_ifs[i].body = ast_clone_node(src->else_ifs[i].body);
+    }
+  } else {
+    dst->else_ifs = NULL;
+  }
+
+  /* Children are added in source order so the clone walks the way the original
+   * does. */
+  if (dst->condition) {
+    ast_add_child(clone, dst->condition);
+  }
+  if (dst->then_branch) {
+    ast_add_child(clone, dst->then_branch);
+  }
+  for (size_t i = 0; i < dst->else_if_count; i++) {
+    if (dst->else_ifs[i].condition) {
+      ast_add_child(clone, dst->else_ifs[i].condition);
+    }
+    if (dst->else_ifs[i].body) {
+      ast_add_child(clone, dst->else_ifs[i].body);
+    }
+  }
+  if (dst->else_branch) {
+    ast_add_child(clone, dst->else_branch);
+  }
+
+  clone->data = dst;
+  return 1;
+}
+
+/* Clone a return statement onto `clone`. A return carries either one value or
+ * a list, and `value` aliases the first of the list when there is one. */
+static int ast_clone_return_statement(ASTNode *clone,
+                                      const ReturnStatement *src) {
+  if (!src) {
+    return 1;
+  }
+  ReturnStatement *dst = malloc(sizeof(ReturnStatement));
+  if (!dst) {
+    return 0;
+  }
+  dst->value = NULL;
+  dst->values = NULL;
+  dst->value_count = src->value_count ? src->value_count : (src->value ? 1 : 0);
+  if (dst->value_count > 0) {
+    dst->values = calloc(dst->value_count, sizeof(ASTNode *));
+    if (!dst->values) {
+      free(dst);
+      return 0;
+    }
+    for (size_t i = 0; i < dst->value_count; i++) {
+      ASTNode *source_value =
+          src->values ? src->values[i] : (i == 0 ? src->value : NULL);
+      dst->values[i] = source_value ? ast_clone_node(source_value) : NULL;
+      if (!dst->values[i]) {
+        free(dst->values);
+        free(dst);
+        return 0;
+      }
+      ast_add_child(clone, dst->values[i]);
+    }
+    dst->value = dst->values[0];
+  }
+  clone->data = dst;
+  return 1;
+}
+
+/* Clone an enum declaration onto `clone`. Its own function because the switch
+ * in ast_clone_node carries a case per node kind and is already far past what
+ * a reader can hold. Returns 0 having freed nothing but its own partial work:
+ * the caller owns `clone`. */
+static int ast_clone_enum_declaration(ASTNode *clone, const EnumDeclaration *src) {
+  EnumDeclaration *dst = malloc(sizeof(EnumDeclaration));
+  if (!dst) {
+    return 0;
+  }
+  dst->name = ast_intern_string(src ? src->name : NULL);
+  dst->is_exported = src ? src->is_exported : 0;
+  dst->variant_count = src ? src->variant_count : 0;
+  dst->variants = NULL;
+  dst->type_param_count = src ? src->type_param_count : 0;
+  dst->type_params = NULL;
+
+  if (dst->variant_count > 0) {
+    dst->variants = malloc(dst->variant_count * sizeof(EnumVariant));
+    if (!dst->variants) {
+      free(dst);
+      return 0;
+    }
+    for (size_t i = 0; i < dst->variant_count; i++) {
+      dst->variants[i].name = ast_intern_string(src->variants[i].name);
+      dst->variants[i].payload_type =
+          ast_intern_string(src->variants[i].payload_type);
+      dst->variants[i].value = src->variants[i].value
+                                   ? ast_clone_node(src->variants[i].value)
+                                   : NULL;
+      if (dst->variants[i].value) {
+        ast_add_child(clone, dst->variants[i].value);
+      }
+    }
+  }
+
+  if (dst->type_param_count > 0 && src->type_params) {
+    dst->type_params = malloc(dst->type_param_count * sizeof(char *));
+    if (!dst->type_params) {
+      free(dst->variants);
+      free(dst);
+      return 0;
+    }
+    for (size_t i = 0; i < dst->type_param_count; i++) {
+      dst->type_params[i] = ast_intern_string(src->type_params[i]);
+    }
+  } else {
+    dst->type_param_count = 0;
+  }
+
+  clone->data = dst;
+  return 1;
+}
+
+/* Clone a match statement onto `clone`, subject and arms alike. */
+static int ast_clone_match_statement(ASTNode *clone, const MatchStatement *src) {
+  MatchStatement *dst = malloc(sizeof(MatchStatement));
+  if (!dst) {
+    return 0;
+  }
+  dst->is_expression = src ? src->is_expression : 0;
+  dst->arm_count = src ? src->arm_count : 0;
+  dst->arms = NULL;
+  dst->expression =
+      src && src->expression ? ast_clone_node(src->expression) : NULL;
+  if (dst->expression) {
+    ast_add_child(clone, dst->expression);
+  }
+
+  if (dst->arm_count > 0) {
+    dst->arms = malloc(dst->arm_count * sizeof(MatchArm));
+    if (!dst->arms) {
+      free(dst);
+      return 0;
+    }
+    for (size_t i = 0; i < dst->arm_count; i++) {
+      dst->arms[i].variant_name = ast_intern_string(src->arms[i].variant_name);
+      dst->arms[i].binding_name = ast_intern_string(src->arms[i].binding_name);
+      dst->arms[i].is_default = src->arms[i].is_default;
+      dst->arms[i].body =
+          src->arms[i].body ? ast_clone_node(src->arms[i].body) : NULL;
+      if (dst->arms[i].body) {
+        ast_add_child(clone, dst->arms[i].body);
+      }
+    }
+  }
+
+  clone->data = dst;
+  return 1;
+}
+
 ASTNode *ast_clone_node(ASTNode *node) {
   if (!node)
     return NULL;
@@ -657,81 +835,18 @@ ASTNode *ast_clone_node(ASTNode *node) {
     clone->data = dst;
     break;
   }
-  case AST_RETURN_STATEMENT: {
-    ReturnStatement *src = (ReturnStatement *)node->data;
-    if (src) {
-      ReturnStatement *dst = malloc(sizeof(ReturnStatement));
-      if (!dst) {
-        free(clone);
-        return NULL;
-      }
-      dst->value = NULL;
-      dst->values = NULL;
-      dst->value_count = src->value_count ? src->value_count
-                                          : (src->value ? 1 : 0);
-      if (dst->value_count > 0) {
-        dst->values = calloc(dst->value_count, sizeof(ASTNode *));
-        if (!dst->values) {
-          free(dst);
-          free(clone);
-          return NULL;
-        }
-        for (size_t i = 0; i < dst->value_count; i++) {
-          ASTNode *source_value = src->values
-                                      ? src->values[i]
-                                      : (i == 0 ? src->value : NULL);
-          dst->values[i] = source_value ? ast_clone_node(source_value) : NULL;
-          if (!dst->values[i]) {
-            free(dst->values);
-            free(dst);
-            free(clone);
-            return NULL;
-          }
-          ast_add_child(clone, dst->values[i]);
-        }
-        dst->value = dst->values[0];
-      }
-      clone->data = dst;
-    }
-    break;
-  }
-  case AST_IF_STATEMENT: {
-    IfStatement *src = (IfStatement *)node->data;
-    IfStatement *dst = malloc(sizeof(IfStatement));
-    if (!dst) {
+  case AST_RETURN_STATEMENT:
+    if (!ast_clone_return_statement(clone, (ReturnStatement *)node->data)) {
       free(clone);
       return NULL;
     }
-    dst->condition = src->condition ? ast_clone_node(src->condition) : NULL;
-    dst->then_branch =
-        src->then_branch ? ast_clone_node(src->then_branch) : NULL;
-    dst->else_branch =
-        src->else_branch ? ast_clone_node(src->else_branch) : NULL;
-    dst->else_if_count = src->else_if_count;
-    if (src->else_if_count > 0 && src->else_ifs) {
-      dst->else_ifs = malloc(src->else_if_count * sizeof(ElseIfClause));
-      for (size_t i = 0; i < src->else_if_count; i++) {
-        dst->else_ifs[i].condition = ast_clone_node(src->else_ifs[i].condition);
-        dst->else_ifs[i].body = ast_clone_node(src->else_ifs[i].body);
-      }
-    } else {
-      dst->else_ifs = NULL;
-    }
-    if (dst->condition)
-      ast_add_child(clone, dst->condition);
-    if (dst->then_branch)
-      ast_add_child(clone, dst->then_branch);
-    for (size_t i = 0; i < dst->else_if_count; i++) {
-      if (dst->else_ifs[i].condition)
-        ast_add_child(clone, dst->else_ifs[i].condition);
-      if (dst->else_ifs[i].body)
-        ast_add_child(clone, dst->else_ifs[i].body);
-    }
-    if (dst->else_branch)
-      ast_add_child(clone, dst->else_branch);
-    clone->data = dst;
     break;
-  }
+  case AST_IF_STATEMENT:
+    if (!ast_clone_if_statement(clone, (IfStatement *)node->data)) {
+      free(clone);
+      return NULL;
+    }
+    break;
   case AST_WHILE_STATEMENT: {
     WhileStatement *src = (WhileStatement *)node->data;
     WhileStatement *dst = malloc(sizeof(WhileStatement));
@@ -913,93 +1028,18 @@ ASTNode *ast_clone_node(ASTNode *node) {
     }
     break;
   }
-  case AST_ENUM_DECLARATION: {
-    EnumDeclaration *src = (EnumDeclaration *)node->data;
-    EnumDeclaration *dst = malloc(sizeof(EnumDeclaration));
-    if (!dst) {
+  case AST_ENUM_DECLARATION:
+    if (!ast_clone_enum_declaration(clone, (EnumDeclaration *)node->data)) {
       free(clone);
       return NULL;
     }
-    dst->name = ast_intern_string(src ? src->name : NULL);
-    dst->is_exported = src ? src->is_exported : 0;
-    dst->variant_count = src ? src->variant_count : 0;
-    dst->variants = NULL;
-    dst->type_param_count = src ? src->type_param_count : 0;
-    dst->type_params = NULL;
-    if (dst->variant_count > 0) {
-      dst->variants = malloc(dst->variant_count * sizeof(EnumVariant));
-      if (!dst->variants) {
-        free(dst);
-        free(clone);
-        return NULL;
-      }
-      for (size_t i = 0; i < dst->variant_count; i++) {
-        dst->variants[i].name = ast_intern_string(src->variants[i].name);
-        dst->variants[i].payload_type =
-            ast_intern_string(src->variants[i].payload_type);
-        dst->variants[i].value = src->variants[i].value
-                                     ? ast_clone_node(src->variants[i].value)
-                                     : NULL;
-        if (dst->variants[i].value) {
-          ast_add_child(clone, dst->variants[i].value);
-        }
-      }
-    }
-    if (dst->type_param_count > 0 && src->type_params) {
-      dst->type_params = malloc(dst->type_param_count * sizeof(char *));
-      if (!dst->type_params) {
-        free(dst->variants);
-        free(dst);
-        free(clone);
-        return NULL;
-      }
-      for (size_t i = 0; i < dst->type_param_count; i++) {
-        dst->type_params[i] = ast_intern_string(src->type_params[i]);
-      }
-    } else {
-      dst->type_param_count = 0;
-    }
-    clone->data = dst;
     break;
-  }
-  case AST_MATCH_STATEMENT: {
-    MatchStatement *src = (MatchStatement *)node->data;
-    MatchStatement *dst = malloc(sizeof(MatchStatement));
-    if (!dst) {
+  case AST_MATCH_STATEMENT:
+    if (!ast_clone_match_statement(clone, (MatchStatement *)node->data)) {
       free(clone);
       return NULL;
     }
-    dst->is_expression = src ? src->is_expression : 0;
-    dst->arm_count = src ? src->arm_count : 0;
-    dst->arms = NULL;
-    dst->expression =
-        src && src->expression ? ast_clone_node(src->expression) : NULL;
-    if (dst->expression) {
-      ast_add_child(clone, dst->expression);
-    }
-    if (dst->arm_count > 0) {
-      dst->arms = malloc(dst->arm_count * sizeof(MatchArm));
-      if (!dst->arms) {
-        free(dst);
-        free(clone);
-        return NULL;
-      }
-      for (size_t i = 0; i < dst->arm_count; i++) {
-        dst->arms[i].variant_name =
-            ast_intern_string(src->arms[i].variant_name);
-        dst->arms[i].binding_name =
-            ast_intern_string(src->arms[i].binding_name);
-        dst->arms[i].is_default = src->arms[i].is_default;
-        dst->arms[i].body =
-            src->arms[i].body ? ast_clone_node(src->arms[i].body) : NULL;
-        if (dst->arms[i].body) {
-          ast_add_child(clone, dst->arms[i].body);
-        }
-      }
-    }
-    clone->data = dst;
     break;
-  }
   default:
     break;
   }

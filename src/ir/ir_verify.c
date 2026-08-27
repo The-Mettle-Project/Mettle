@@ -872,31 +872,14 @@ static int irv_pointees_agree(IRInterpMachine *before, IRInterpMachine *after,
   return memcmp(wa, wb, (size_t)na) == 0;
 }
 
-/* Compare all observations of two completed runs. On mismatch, writes a
- * one-line description into `why` and returns 0. */
-static int irv_compare_observations(IRInterpMachine *before,
-                                    IRInterpMachine *after,
-                                    const IRInterpValue *ret_before,
-                                    const IRInterpValue *ret_after,
-                                    size_t input_buffer_count, char *why,
-                                    size_t why_capacity) {
-  {
-    int pointees = irv_pointees_agree(before, after, ret_before, ret_after);
-    if (pointees == 0 ||
-        (pointees < 0 && !irv_value_equal(ret_before, ret_after))) {
-      char a[48], b[48];
-      irv_format_value(ret_before, a, sizeof(a));
-      irv_format_value(ret_after, b, sizeof(b));
-      snprintf(why, why_capacity, "return value was %s, is now %s%s", a, b,
-               pointees == 0 ? " (different memory)" : "");
-      return 0;
-    }
-  }
-
-  /* Input buffers exist in both machines by construction. A run that hands one
-   * back to the OS (munmap, VirtualFree) releases the bytes with it, so a
-   * released buffer reads as absent: two runs that both released it agree, and
-   * only one of them doing so is the divergence. */
+/* Every input buffer, byte for byte. A run that hands one back to the OS
+ * (munmap, VirtualFree) releases the bytes with it, so a released buffer reads
+ * as absent: two runs that both released it agree, and only one of them doing
+ * so is the divergence. */
+static int irv_input_buffers_agree(IRInterpMachine *before,
+                                   IRInterpMachine *after,
+                                   size_t input_buffer_count, char *why,
+                                   size_t why_capacity) {
   for (size_t i = 0; i < input_buffer_count; i++) {
     long long size_a = 0, size_b = 0;
     const unsigned char *a = ir_interp_buffer_data(before, i, &size_a);
@@ -926,6 +909,34 @@ static int irv_compare_observations(IRInterpMachine *before,
                a[at], b[at]);
       return 0;
     }
+  }
+  return 1;
+}
+
+/* Compare all observations of two completed runs. On mismatch, writes a
+ * one-line description into `why` and returns 0. */
+static int irv_compare_observations(IRInterpMachine *before,
+                                    IRInterpMachine *after,
+                                    const IRInterpValue *ret_before,
+                                    const IRInterpValue *ret_after,
+                                    size_t input_buffer_count, char *why,
+                                    size_t why_capacity) {
+  {
+    int pointees = irv_pointees_agree(before, after, ret_before, ret_after);
+    if (pointees == 0 ||
+        (pointees < 0 && !irv_value_equal(ret_before, ret_after))) {
+      char a[48], b[48];
+      irv_format_value(ret_before, a, sizeof(a));
+      irv_format_value(ret_after, b, sizeof(b));
+      snprintf(why, why_capacity, "return value was %s, is now %s%s", a, b,
+               pointees == 0 ? " (different memory)" : "");
+      return 0;
+    }
+  }
+
+  if (!irv_input_buffers_agree(before, after, input_buffer_count, why,
+                               why_capacity)) {
+    return 0;
   }
 
 
