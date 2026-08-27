@@ -1069,7 +1069,11 @@ void ir_verify_maybe_sabotage(IRFunction *function, const char *pass_name,
 typedef enum {
   IRV_RUN_OK,
   IRV_RUN_GUARD_TRAP,  /* clean runtime-guard abort (mettle_crash_trap*) */
-  IRV_RUN_SKIP,        /* trap/fuel on this input: try another */
+  IRV_RUN_TRAP,        /* semantic trap: divide by zero, use after free */
+  IRV_RUN_RESOURCE,    /* the interpreter ran out, not the program: step fuel
+                          or call depth. A pass that inlines a call or peels
+                          an iteration moves both, so the two sides disagreeing
+                          says nothing about the program. */
   IRV_RUN_UNVERIFIABLE /* unsupported construct: give up on the function */
 } IRVRunOutcome;
 
@@ -1088,9 +1092,13 @@ static IRVRunOutcome irv_run_one(IRInterpMachine *machine, IRFunction *fn,
   case IR_INTERP_UNSUPPORTED:
     snprintf(detail, detail_capacity, "%s", ir_interp_status_detail(machine));
     return IRV_RUN_UNVERIFIABLE;
+  case IR_INTERP_FUEL:
+  case IR_INTERP_DEPTH:
+    snprintf(detail, detail_capacity, "%s", ir_interp_status_detail(machine));
+    return IRV_RUN_RESOURCE;
   default:
     snprintf(detail, detail_capacity, "%s", ir_interp_status_detail(machine));
-    return IRV_RUN_SKIP;
+    return IRV_RUN_TRAP;
   }
 }
 
@@ -1351,15 +1359,15 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
     }
 
     if (outcome_before != IRV_RUN_OK || outcome_after != IRV_RUN_OK) {
-      /* One side trapped or ran out of fuel. Same fate on both sides means
-       * the input is unusable; different fates on a trap is itself a
-       * divergence (a pass must not add or remove traps). Fuel asymmetry is
-       * inconclusive (vector kernels charge differently), so skip those. */
-      int trap_before = outcome_before == IRV_RUN_SKIP &&
-                        strstr(detail_before, "fuel") == NULL &&
+      /* One side trapped or ran out. Same fate on both sides means the input
+       * is unusable; a trap on one side only is itself a divergence (a pass
+       * must not add or remove traps). Running the interpreter out of fuel or
+       * call depth is not a fate the program chose, so it never counts.
+       * Neither does an out-of-bounds access: the generated inputs put those
+       * there, and which side notices first is not the pass's doing. */
+      int trap_before = outcome_before == IRV_RUN_TRAP &&
                         strstr(detail_before, "out of bounds") == NULL;
-      int trap_after = outcome_after == IRV_RUN_SKIP &&
-                       strstr(detail_after, "fuel") == NULL &&
+      int trap_after = outcome_after == IRV_RUN_TRAP &&
                        strstr(detail_after, "out of bounds") == NULL;
       if (trap_before != trap_after &&
           (outcome_before == IRV_RUN_OK || outcome_after == IRV_RUN_OK)) {

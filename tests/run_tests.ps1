@@ -2381,6 +2381,14 @@ $cases = @(
      Args = @("--verify")
      OutputMustMatch = @("translation validation: OK")
      OutputMustNotMatch = @("MISCOMPILE") },
+  # Running the interpreter out of step fuel is not a fate the program chose.
+  # The fuel report names only the function, so a message-text guard never saw
+  # it: simd_fill turning a 262144-iteration zero loop into a bulk fill spends
+  # far less fuel than the scalar loop, and the asymmetry read as a trap the
+  # pass had removed.
+  @{ Name = "verify_fuel_asymmetry"; Path = "tests/verify_fuel_asymmetry.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     OutputMustNotMatch = @("MISCOMPILE", "removed a trap") },
   @{ Name = "verify_sabotage_caught"; Path = "tests/verify_clean.mettle"; ShouldSucceed = $true
      Args = @("--verify")
      Env = @{ METTLE_VERIFY_BREAK = "constant_and_branch_simplify:dot" }

@@ -1,0 +1,13 @@
+extern fn malloc(size: int64) -> int64*;
+var vh: int64* = (int64*)0;
+var vh_cap: int64 = 0;
+
+fn build_table() -> int64 {
+  vh_cap = 262144;
+  vh = malloc(vh_cap * 8);
+  var i: int64 = 0;
+  while (i < vh_cap) { vh[i] = 0; i = i + 1; }
+  return vh_cap;
+}
+
+fn main() -> int32 { return (int32)(build_table() & 255); }
