@@ -1881,6 +1881,19 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
                                  int *changed) {
   const REDefs defs = *defs_in;
   static int counter;
+  /* Where the entry block ends. It runs before every loop in the function, so
+   * a base it dereferences is dereferenceable at any header; found once here
+   * rather than per candidate. */
+  size_t entry_end = 0;
+
+  while (entry_end < function->instruction_count) {
+    IROpcode op = function->instructions[entry_end].op;
+    if (op == IR_OP_LABEL || op == IR_OP_JUMP || op == IR_OP_RETURN ||
+        op == IR_OP_BRANCH_ZERO || op == IR_OP_BRANCH_EQ) {
+      break;
+    }
+    entry_end++;
+  }
 
   for (size_t header = 0; header < function->instruction_count; header++) {
     const IRInstruction *label = &function->instructions[header];
@@ -1964,6 +1977,24 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
           break;
         }
         safe = re_access_reaches(function, &defs, back, &addr, reach);
+      }
+      /* The walk above stops at the first label behind the header, so a base
+       * the function dereferenced earlier stops counting the moment anything
+       * branches in between. The entry block runs before every loop in the
+       * function whatever the control flow does, so an access there says the
+       * base is dereferenceable here too. `lcs_fill` reads `b->count` on the
+       * way in and then re-reads `b->hash` on every step of its inner loop
+       * for want of exactly this.
+       *
+       * Only asked about a parameter: what the entry block dereferences is
+       * what was handed in, and asking for every candidate that got this far
+       * cost more than the answer was worth. */
+      if (!safe && !addr.is_address_of &&
+          ir_function_symbol_is_parameter(function, addr.name)) {
+        for (size_t k = 0; k < entry_end && !safe; k++) {
+          safe = re_access_reaches(function, &defs, &function->instructions[k],
+                                   &addr, reach);
+        }
       }
       if (!safe) {
         continue;
