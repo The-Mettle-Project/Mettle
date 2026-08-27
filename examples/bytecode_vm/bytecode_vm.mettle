@@ -196,8 +196,8 @@ fn run(p: Program*, reg: int64*, mem: int64*, out_steps: int64*) -> int64 {
   var h: uint64 = 14695981039346656037;
   i = RANGE_LO;
   while (i < RANGE_HI) {
-    h = h ^ (uint64)mem[i];
-    h = h * 1099511628211;
+    h ^= (uint64)mem[i];
+    h *= 1099511628211;
     i += 1;
   }
   i = 0;

@@ -24,7 +24,7 @@ fn popcount9(v: int32) -> int32 {
   var n: int32 = 0;
   var x: int32 = v;
   while (x != 0) {
-    x = x & (x - 1);
+    x &= (x - 1);
     n += 1;
   }
   return n;
@@ -49,17 +49,17 @@ fn board_clear(b: Board*) {
 fn place(b: Board*, idx: int32, d: int32) {
   var bit: int32 = 1 << d;
   b->cell[idx] = d;
-  b->rowmask[idx / 9] = b->rowmask[idx / 9] | bit;
-  b->colmask[idx % 9] = b->colmask[idx % 9] | bit;
-  b->boxmask[box_of(idx)] = b->boxmask[box_of(idx)] | bit;
+  b->rowmask[idx / 9] |= bit;
+  b->colmask[idx % 9] |= bit;
+  b->boxmask[box_of(idx)] |= bit;
 }
 
 fn unplace(b: Board*, idx: int32, d: int32) {
   var bit: int32 = 1 << d;
   b->cell[idx] = 0;
-  b->rowmask[idx / 9] = b->rowmask[idx / 9] & ~bit;
-  b->colmask[idx % 9] = b->colmask[idx % 9] & ~bit;
-  b->boxmask[box_of(idx)] = b->boxmask[box_of(idx)] & ~bit;
+  b->rowmask[idx / 9] &= ~bit;
+  b->colmask[idx % 9] &= ~bit;
+  b->boxmask[box_of(idx)] &= ~bit;
 }
 
 fn candidates(b: Board*, idx: int32) -> int32 {
@@ -110,9 +110,9 @@ fn solve(b: Board*) -> int32 {
 
 fn next_rand(state: uint32*) -> uint32 {
   var s: uint32 = *state;
-  s = s ^ (s << 13);
-  s = s ^ (s >> 17);
-  s = s ^ (s << 5);
+  s ^= (s << 13);
+  s ^= (s >> 17);
+  s ^= (s << 5);
   *state = s;
   return s;
 }
@@ -191,11 +191,11 @@ fn round_trip(b: Board*, grid: int32*) -> uint64 {
     make_puzzle(b, grid, &state);
     var ok: int32 = solve(b);
     solved_count += ok;
-    total_nodes += b->nodes;
+    total_nodes = total_nodes + b->nodes;
     var i: int32 = 0;
     while (i < CELLS) {
       h = h ^ (uint64)b->cell[i];
-      h = h * 1099511628211;
+      h *= 1099511628211;
       i += 1;
     }
     h = h * 31 + (uint64)b->nodes;

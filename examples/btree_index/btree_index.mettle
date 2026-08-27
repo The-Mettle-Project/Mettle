@@ -167,9 +167,9 @@ fn walk(t: Tree*, id: int32, acc: uint64*, seen: int32*, prev: int64*, ordered: 
 
 fn gen_key(state: uint32*) -> int64 {
   var s: uint32 = *state;
-  s = s ^ (s << 13);
-  s = s ^ (s >> 17);
-  s = s ^ (s << 5);
+  s ^= (s << 13);
+  s ^= (s >> 17);
+  s ^= (s << 5);
   *state = s;
   return (int64)(s % 4000000) * 7 + 3;
 }

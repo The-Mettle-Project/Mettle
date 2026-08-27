@@ -57,7 +57,7 @@ static void bn_mul_small(Bignum *a, uint32_t m) {
     }
     while (carry != 0 && i < LIMBS) {
         a->limb[i] = (uint32_t)(carry & 4294967295u);
-        carry = carry >> 32;
+        carry >>= 32;
         i += 1;
     }
     if (i > a->len) {
@@ -149,9 +149,9 @@ static void build_seeded(Bignum *a, uint32_t seed, int32_t limbs) {
     uint32_t state = seed;
     int32_t i = 0;
     while (i < limbs) {
-        state = state ^ (state << 13);
-        state = state ^ (state >> 17);
-        state = state ^ (state << 5);
+        state ^= (state << 13);
+        state ^= (state >> 17);
+        state ^= (state << 5);
         a->limb[i] = state | 1u;
         i += 1;
     }
@@ -167,9 +167,9 @@ static uint64_t decimal_checksum(Bignum *work, Bignum *src, int32_t *out_digits)
         int32_t c = 0;
         while (c < 9) {
             uint32_t d = chunk % 10u;
-            chunk = chunk / 10u;
-            h = h ^ (uint64_t)d;
-            h = h * 1099511628211ULL;
+            chunk /= 10u;
+            h ^= (uint64_t)d;
+            h *= 1099511628211ULL;
             digits += 1;
             c += 1;
         }
@@ -195,7 +195,7 @@ static uint64_t round_trip(Bignum *fact, Bignum *seed_a, Bignum *seed_b, Bignum 
         bn_mul(work, acc, prod);
         bn_copy(acc, work);
         h = h * 1000003 + (uint64_t)acc->len;
-        h = h ^ (uint64_t)prod->limb[0];
+        h ^= (uint64_t)prod->limb[0];
         round += 1;
     }
 

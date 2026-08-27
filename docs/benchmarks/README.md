@@ -57,6 +57,8 @@ Matched pairs: `.mettle` and `.c`.
 | `radix_sort` | LSD radix sort, 4 digit passes, 4096 uint32 values × 200 |
 | `rle_encode` | Run-length encode 256 KB × 200 |
 | `bst_insert` | Build a 4096-node BST, recursive in-order traversal × 200 |
+| `bignum_mul` | factorial(1000), wide schoolbook multiplies over base 2^32 limbs, decimal rendering × 24 |
+| `life_bits` | 512×1024 bit grid, 200 Life generations through word-parallel uint64 full adders × 3 |
 
 ## Suite 3: applications
 
@@ -64,10 +66,19 @@ Matched pairs: `.mettle` and `.c`. Each entry is a small complete program that
 parses, builds, transforms, and verifies, rather than a loop over an array.
 
 Suite 3 has two sets. Set 1 is the original eight. Set 2 adds eight more chosen
-for shapes Set 1 never reaches: wide integer arithmetic, a cache-resident tree,
-an interpreter dispatch loop, unpredictable backtracking, float64 without
-`sqrt`, word-parallel bit arithmetic, a dense dynamic-programming table, and a
-parse-group-sort query pipeline. Run either with `-Set 1` or `-Set 2`.
+for shapes Set 1 never reaches: a cache-resident tree, an interpreter dispatch
+loop, unpredictable backtracking, float64 without `sqrt`, a reachability walk
+over an object graph, a dense dynamic-programming table, symbol resolution over
+a record stream, and a parse-group-sort query pipeline. Run either with
+`-Set 1` or `-Set 2`.
+
+The admission test for Set 2 is the one the rules already imply: **could a
+recognizer win this without making a real program faster?** If yes, it belongs
+in Suite 1 or 2, where a fixed shape is the point. A named textbook kernel is
+disqualifying however much time it takes, and so is any program where a single
+loop owns the measurement. Two candidates were written and rejected on exactly
+that ground: a bignum schoolbook multiply and a word-parallel Game of Life. Both
+are honest kernels, both are now in Suite 2, and neither is a Suite 3 program.
 
 ### Set 1
 
@@ -86,13 +97,13 @@ parse-group-sort query pipeline. Run either with `-Set 1` or `-Set 2`.
 
 | Name | Workload | Ground it covers |
 |------|----------|------------------|
-| `bignum_mul` | factorial(1000), then wide schoolbook multiplies over base 2^32 limbs, then decimal rendering × 24 | 64-bit multiply and carry chains, 64/32 division |
 | `btree_index` | 50000 inserts with node splits, a full lookup pass, a half-miss pass, an in-order walk × 3 | 256-byte nodes, in-node shifting, recursive descent |
 | `bytecode_vm` | Assemble a register program, then run collatz over [2,9000) through a switch dispatch loop × 3 | Interpreter dispatch and a memory register file |
 | `sudoku_solve` | 120 generated puzzles, 61 holes each, bitmask propagation with MRV backtracking × 3 | Deep recursion, early exit, branches that never predict |
 | `voxel_trace` | 64^3 grid, 200×150 rays, float64 DDA traversal with one reflection bounce × 3 | float64 without `sqrt`, axis-aligned normals |
-| `life_bits` | 512×1024 bit grid, 200 generations through word-parallel uint64 full adders × 3 | Branch-free `uint64` bit arithmetic over a contiguous array |
-| `diff_lcs` | 20 document pairs of 620 lines, line hashing, LCS dynamic programming, backtrack × 3 | A 2.5 MB DP table with a serial row recurrence |
+| `mark_sweep` | Build a 160000-object graph, mark from roots through a worklist, sweep, compact and remap, mutate, 3 cycles × 2 | Pointer chasing in a data-dependent order, forwarding remap |
+| `diff_lcs` | 90 document pairs of 240 lines, line hashing, LCS dynamic programming, backtrack to an edit script, replay and verify × 3 | A DP table with a serial row recurrence, then a replay pass |
+| `link_resolve` | Parse 1200 object records, intern 48000 symbols, resolve cross-unit references, apply relocations to a 1 MB image × 3 | Byte-stream parsing, string interning, probe chains |
 | `csv_query` | Generate 60000 rows, parse, hash group-by into 4096 groups, quicksort by value × 5 | Integer parsing, open addressing, a comparison sort on records |
 
 `voxel_trace` is written without `sqrt` on purpose. Mettle's `std/math` `sqrt`

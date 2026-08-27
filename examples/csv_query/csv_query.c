@@ -42,7 +42,7 @@ static int32_t emit_int(uint8_t *dst, int32_t pos, int32_t v) {
   }
   while (x > 0) {
     tmp[n] = (uint8_t)(48 + x % 10);
-    x = x / 10;
+    x /= 10;
     n += 1;
   }
   while (n > 0) {
@@ -63,7 +63,7 @@ static int32_t emit_pad(uint8_t *dst, int32_t pos, int32_t v, int32_t width) {
   }
   while (x > 0) {
     tmp[n] = (uint8_t)(48 + x % 10);
-    x = x / 10;
+    x /= 10;
     n += 1;
   }
   while (n < width) {
@@ -80,9 +80,9 @@ static int32_t emit_pad(uint8_t *dst, int32_t pos, int32_t v, int32_t width) {
 
 static uint32_t next_rand(uint32_t *state) {
   uint32_t s = *state;
-  s = s ^ (s << 13);
-  s = s ^ (s >> 17);
-  s = s ^ (s << 5);
+  s ^= (s << 13);
+  s ^= (s >> 17);
+  s ^= (s << 5);
   *state = s;
   return s;
 }
@@ -139,8 +139,8 @@ static uint64_t field_hash(uint8_t *text, int32_t from, int32_t to, uint64_t see
   uint64_t h = seed;
   int32_t p = from;
   while (p < to) {
-    h = h ^ (uint64_t)text[p];
-    h = h * 1099511628211ULL;
+    h ^= (uint64_t)text[p];
+    h *= 1099511628211ULL;
     p += 1;
   }
   return h;
@@ -206,8 +206,8 @@ static int32_t ingest(uint8_t *text, int32_t len, int32_t *slots, Group *groups)
     pos = e + 1;
 
     int32_t id = map_find(slots, groups, ph, &used);
-    groups[id].qty = groups[id].qty + (int64_t)qty;
-    groups[id].value = groups[id].value + (int64_t)qty * (int64_t)price;
+    groups[id].qty += (int64_t)qty;
+    groups[id].value += (int64_t)qty * (int64_t)price;
     groups[id].count += 1;
     if (price > groups[id].peak) {
       groups[id].peak = price;
@@ -266,8 +266,8 @@ static uint64_t round_trip(uint8_t *text, int32_t *slots, Group *groups, int32_t
   h = h * 31 + (uint64_t)used;
   int32_t i = 0;
   while (i < TOP_K && i < used) {
-    h = h ^ groups[i].key;
-    h = h * 1099511628211ULL;
+    h ^= groups[i].key;
+    h *= 1099511628211ULL;
     h = h * 31 + (uint64_t)groups[i].qty;
     h = h * 31 + (uint64_t)groups[i].value;
     h = h * 31 + (uint64_t)(groups[i].count * 7 + groups[i].peak);
@@ -276,7 +276,7 @@ static uint64_t round_trip(uint8_t *text, int32_t *slots, Group *groups, int32_t
   int64_t total = 0;
   i = 0;
   while (i < used) {
-    total = total + groups[i].value;
+    total += groups[i].value;
     i += 1;
   }
   h = h * 1000003 + (uint64_t)total;

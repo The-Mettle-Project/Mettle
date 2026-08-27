@@ -11,7 +11,7 @@ const PASSES: int32 = 3;
 fn row_shl(src: uint64*, base: int32, i: int32) -> uint64 {
   var cur: uint64 = src[base + i] >> 1;
   if (i + 1 < WORDS) {
-    cur = cur | (src[base + i + 1] << 63);
+    cur |= (src[base + i + 1] << 63);
   }
   return cur;
 }
@@ -19,7 +19,7 @@ fn row_shl(src: uint64*, base: int32, i: int32) -> uint64 {
 fn row_shr(src: uint64*, base: int32, i: int32) -> uint64 {
   var cur: uint64 = src[base + i] << 1;
   if (i > 0) {
-    cur = cur | (src[base + i - 1] >> 63);
+    cur |= (src[base + i - 1] >> 63);
   }
   return cur;
 }
@@ -35,13 +35,13 @@ fn seed_grid(g: uint64*, seed: uint32) {
   while (r < ROWS - 64) {
     var w: int32 = 2;
     while (w < WORDS - 2) {
-      state = state ^ (state << 13);
-      state = state ^ (state >> 17);
-      state = state ^ (state << 5);
+      state ^= (state << 13);
+      state ^= (state >> 17);
+      state ^= (state << 5);
       var hi: uint32 = state;
-      state = state ^ (state << 13);
-      state = state ^ (state >> 17);
-      state = state ^ (state << 5);
+      state ^= (state << 13);
+      state ^= (state >> 17);
+      state ^= (state << 5);
       var lo: uint32 = state;
       g[r * WORDS + w] = ((uint64)hi << 32) | (uint64)lo;
       w += 1;
@@ -122,7 +122,7 @@ fn popcount64(v: uint64) -> int32 {
   var x: uint64 = v;
   var n: int32 = 0;
   while (x != 0) {
-    x = x & (x - 1);
+    x &= (x - 1);
     n += 1;
   }
   return n;
@@ -132,7 +132,7 @@ fn population(g: uint64*) -> int64 {
   var total: int64 = 0;
   var i: int32 = 0;
   while (i < ROWS * WORDS) {
-    total = total + (int64)popcount64(g[i]);
+    total += (int64)popcount64(g[i]);
     i += 1;
   }
   return total;
@@ -157,8 +157,8 @@ fn round_trip(a: uint64*, b: uint64*, out_pop: int64*) -> uint64 {
   var pop: int64 = population(src);
   var i: int32 = 0;
   while (i < ROWS * WORDS) {
-    h = h ^ src[i];
-    h = h * 1099511628211;
+    h ^= src[i];
+    h *= 1099511628211;
     i += 1;
   }
   h = h * 31 + (uint64)pop;

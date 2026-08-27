@@ -200,8 +200,8 @@ static int64_t run(Program *p, int64_t *reg, int64_t *mem, int64_t *out_steps) {
   uint64_t h = 14695981039346656037ULL;
   i = RANGE_LO;
   while (i < RANGE_HI) {
-    h = h ^ (uint64_t)mem[i];
-    h = h * 1099511628211ULL;
+    h ^= (uint64_t)mem[i];
+    h *= 1099511628211ULL;
     i += 1;
   }
   i = 0;

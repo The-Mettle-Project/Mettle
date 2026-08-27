@@ -38,7 +38,7 @@ fn emit_int(dst: uint8*, pos: int32, v: int32) -> int32 {
   }
   while (x > 0) {
     tmp[n] = (uint8)(48 + x % 10);
-    x = x / 10;
+    x /= 10;
     n += 1;
   }
   while (n > 0) {
@@ -59,7 +59,7 @@ fn emit_pad(dst: uint8*, pos: int32, v: int32, width: int32) -> int32 {
   }
   while (x > 0) {
     tmp[n] = (uint8)(48 + x % 10);
-    x = x / 10;
+    x /= 10;
     n += 1;
   }
   while (n < width) {
@@ -76,9 +76,9 @@ fn emit_pad(dst: uint8*, pos: int32, v: int32, width: int32) -> int32 {
 
 fn next_rand(state: uint32*) -> uint32 {
   var s: uint32 = *state;
-  s = s ^ (s << 13);
-  s = s ^ (s >> 17);
-  s = s ^ (s << 5);
+  s ^= (s << 13);
+  s ^= (s >> 17);
+  s ^= (s << 5);
   *state = s;
   return s;
 }
@@ -135,8 +135,8 @@ fn field_hash(text: uint8*, from: int32, to: int32, seed: uint64) -> uint64 {
   var h: uint64 = seed;
   var p: int32 = from;
   while (p < to) {
-    h = h ^ (uint64)text[p];
-    h = h * 1099511628211;
+    h ^= (uint64)text[p];
+    h *= 1099511628211;
     p += 1;
   }
   return h;
@@ -202,8 +202,8 @@ fn ingest(text: uint8*, len: int32, slots: int32*, groups: Group*) -> int32 {
     pos = e + 1;
 
     var id: int32 = map_find(slots, groups, ph, &used);
-    groups[id].qty = groups[id].qty + (int64)qty;
-    groups[id].value = groups[id].value + (int64)qty * (int64)price;
+    groups[id].qty += (int64)qty;
+    groups[id].value += (int64)qty * (int64)price;
     groups[id].count += 1;
     if (price > groups[id].peak) {
       groups[id].peak = price;
@@ -262,8 +262,8 @@ fn round_trip(text: uint8*, slots: int32*, groups: Group*, out_groups: int32*) -
   h = h * 31 + (uint64)used;
   var i: int32 = 0;
   while (i < TOP_K && i < used) {
-    h = h ^ groups[i].key;
-    h = h * 1099511628211;
+    h ^= groups[i].key;
+    h *= 1099511628211;
     h = h * 31 + (uint64)groups[i].qty;
     h = h * 31 + (uint64)groups[i].value;
     h = h * 31 + (uint64)(groups[i].count * 7 + groups[i].peak);
@@ -272,7 +272,7 @@ fn round_trip(text: uint8*, slots: int32*, groups: Group*, out_groups: int32*) -
   var total: int64 = 0;
   i = 0;
   while (i < used) {
-    total = total + groups[i].value;
+    total += groups[i].value;
     i += 1;
   }
   h = h * 1000003 + (uint64)total;

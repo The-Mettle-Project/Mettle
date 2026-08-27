@@ -170,9 +170,9 @@ static void walk(Tree *t, int32_t id, uint64_t *acc, int32_t *seen, int64_t *pre
 
 static int64_t gen_key(uint32_t *state) {
     uint32_t s = *state;
-    s = s ^ (s << 13);
-    s = s ^ (s >> 17);
-    s = s ^ (s << 5);
+    s ^= (s << 13);
+    s ^= (s >> 17);
+    s ^= (s << 5);
     *state = s;
     return (int64_t)(s % 4000000u) * 7 + 3;
 }

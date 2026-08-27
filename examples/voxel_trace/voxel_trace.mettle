@@ -36,9 +36,9 @@ fn build_world(solid: uint8*, seed: uint32) {
     while (y < DIM) {
       var x: int32 = 0;
       while (x < DIM) {
-        state = state ^ (state << 13);
-        state = state ^ (state >> 17);
-        state = state ^ (state << 5);
+        state ^= (state << 13);
+        state ^= (state >> 17);
+        state ^= (state << 5);
         var v: uint8 = 0;
         if (y < 3) {
           v = 1;
@@ -115,17 +115,17 @@ fn trace(solid: uint8*, ox: float64, oy: float64, oz: float64,
     }
     if (tmx < tmy && tmx < tmz) {
       t = tmx;
-      tmx = tmx + idx;
+      tmx += idx;
       x += stepx;
       axis = 0;
     } else if (tmy < tmz) {
       t = tmy;
-      tmy = tmy + idy;
+      tmy += idy;
       y += stepy;
       axis = 1;
     } else {
       t = tmz;
-      tmz = tmz + idz;
+      tmz += idz;
       z += stepz;
       axis = 2;
     }
@@ -162,9 +162,9 @@ fn shade(solid: uint8*, h: Hit*, dx: float64, dy: float64, dz: float64) -> float
   var bounce: Hit;
   trace(solid, ox, oy, oz, rx, ry, rz, &bounce);
   if (bounce.found != 0) {
-    base = base * 0.5;
+    base *= 0.5;
   } else {
-    base = base + 0.125;
+    base += 0.125;
   }
   return base * atten;
 }
@@ -196,8 +196,8 @@ fn render(solid: uint8*, out_hits: int32*) -> uint64 {
       var q: int32 = (int32)(shade_v * 255.0);
       if (q < 0) { q = 0; }
       if (q > 255) { q = 255; }
-      h = h ^ (uint64)q;
-      h = h * 1099511628211;
+      h ^= (uint64)q;
+      h *= 1099511628211;
       px += 1;
     }
     py += 1;

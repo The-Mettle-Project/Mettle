@@ -28,7 +28,7 @@ static int32_t popcount9(int32_t v) {
   int32_t n = 0;
   int32_t x = v;
   while (x != 0) {
-    x = x & (x - 1);
+    x &= (x - 1);
     n += 1;
   }
   return n;
@@ -53,17 +53,17 @@ static void board_clear(Board *b) {
 static void place(Board *b, int32_t idx, int32_t d) {
   int32_t bit = 1 << d;
   b->cell[idx] = d;
-  b->rowmask[idx / 9] = b->rowmask[idx / 9] | bit;
-  b->colmask[idx % 9] = b->colmask[idx % 9] | bit;
-  b->boxmask[box_of(idx)] = b->boxmask[box_of(idx)] | bit;
+  b->rowmask[idx / 9] |= bit;
+  b->colmask[idx % 9] |= bit;
+  b->boxmask[box_of(idx)] |= bit;
 }
 
 static void unplace(Board *b, int32_t idx, int32_t d) {
   int32_t bit = 1 << d;
   b->cell[idx] = 0;
-  b->rowmask[idx / 9] = b->rowmask[idx / 9] & ~bit;
-  b->colmask[idx % 9] = b->colmask[idx % 9] & ~bit;
-  b->boxmask[box_of(idx)] = b->boxmask[box_of(idx)] & ~bit;
+  b->rowmask[idx / 9] &= ~bit;
+  b->colmask[idx % 9] &= ~bit;
+  b->boxmask[box_of(idx)] &= ~bit;
 }
 
 static int32_t candidates(Board *b, int32_t idx) {
@@ -114,9 +114,9 @@ static int32_t solve(Board *b) {
 
 static uint32_t next_rand(uint32_t *state) {
   uint32_t s = *state;
-  s = s ^ (s << 13);
-  s = s ^ (s >> 17);
-  s = s ^ (s << 5);
+  s ^= (s << 13);
+  s ^= (s >> 17);
+  s ^= (s << 5);
   *state = s;
   return s;
 }
@@ -195,11 +195,11 @@ static uint64_t round_trip(Board *b, int32_t *grid) {
     make_puzzle(b, grid, &state);
     int32_t ok = solve(b);
     solved_count += ok;
-    total_nodes += b->nodes;
+    total_nodes = total_nodes + b->nodes;
     int32_t i = 0;
     while (i < CELLS) {
       h = h ^ (uint64_t)b->cell[i];
-      h = h * 1099511628211ULL;
+      h *= 1099511628211ULL;
       i += 1;
     }
     h = h * 31 + (uint64_t)b->nodes;

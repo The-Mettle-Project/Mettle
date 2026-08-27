@@ -15,7 +15,7 @@
 static uint64_t row_shl(uint64_t *src, int32_t base, int32_t i) {
   uint64_t cur = src[base + i] >> 1;
   if (i + 1 < WORDS) {
-    cur = cur | (src[base + i + 1] << 63);
+    cur |= (src[base + i + 1] << 63);
   }
   return cur;
 }
@@ -23,7 +23,7 @@ static uint64_t row_shl(uint64_t *src, int32_t base, int32_t i) {
 static uint64_t row_shr(uint64_t *src, int32_t base, int32_t i) {
   uint64_t cur = src[base + i] << 1;
   if (i > 0) {
-    cur = cur | (src[base + i - 1] >> 63);
+    cur |= (src[base + i - 1] >> 63);
   }
   return cur;
 }
@@ -39,13 +39,13 @@ static void seed_grid(uint64_t *g, uint32_t seed) {
   while (r < ROWS - 64) {
     int32_t w = 2;
     while (w < WORDS - 2) {
-      state = state ^ (state << 13);
-      state = state ^ (state >> 17);
-      state = state ^ (state << 5);
+      state ^= (state << 13);
+      state ^= (state >> 17);
+      state ^= (state << 5);
       uint32_t hi = state;
-      state = state ^ (state << 13);
-      state = state ^ (state >> 17);
-      state = state ^ (state << 5);
+      state ^= (state << 13);
+      state ^= (state >> 17);
+      state ^= (state << 5);
       uint32_t lo = state;
       g[r * WORDS + w] = ((uint64_t)hi << 32) | (uint64_t)lo;
       w += 1;
@@ -126,7 +126,7 @@ static int32_t popcount64(uint64_t v) {
   uint64_t x = v;
   int32_t n = 0;
   while (x != 0) {
-    x = x & (x - 1);
+    x &= (x - 1);
     n += 1;
   }
   return n;
@@ -136,7 +136,7 @@ static int64_t population(uint64_t *g) {
   int64_t total = 0;
   int32_t i = 0;
   while (i < ROWS * WORDS) {
-    total = total + (int64_t)popcount64(g[i]);
+    total += (int64_t)popcount64(g[i]);
     i += 1;
   }
   return total;
@@ -161,8 +161,8 @@ static uint64_t round_trip(uint64_t *a, uint64_t *b, int64_t *out_pop) {
   int64_t pop = population(src);
   int32_t i = 0;
   while (i < ROWS * WORDS) {
-    h = h ^ src[i];
-    h = h * 1099511628211ULL;
+    h ^= src[i];
+    h *= 1099511628211ULL;
     i += 1;
   }
   h = h * 31 + (uint64_t)pop;

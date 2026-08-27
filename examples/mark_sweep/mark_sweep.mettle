@@ -1,0 +1,298 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const N_OBJ: int32 = 160000;
+const MAX_SLOTS: int32 = 6;
+const N_ROOTS: int32 = 96;
+const CYCLES: int32 = 3;
+const PASSES: int32 = 2;
+
+struct Obj {
+  kind: int32;
+  nslots: int32;
+  mark: int32;
+  payload: int32;
+  slot: int32[6];
+}
+
+struct Heap {
+  obj: Obj*;
+  count: int32;
+  work: int32*;
+  fwd: int32*;
+  root: int32*;
+  nroots: int32;
+  freed: int32;
+}
+
+fn next_rand(state: uint32*) -> uint32 {
+  var s: uint32 = *state;
+  s ^= (s << 13);
+  s ^= (s >> 17);
+  s ^= (s << 5);
+  *state = s;
+  return s;
+}
+
+fn build_graph(h: Heap*, state: uint32*) {
+  var n: int32 = N_OBJ;
+  h->count = n;
+  var i: int32 = 0;
+  while (i < n) {
+    var r: uint32 = next_rand(state);
+    h->obj[i].kind = (int32)(r % 4);
+    h->obj[i].payload = (int32)((r >> 3) % 65536);
+    h->obj[i].mark = 0;
+    var ns: int32 = 1 + (int32)((r >> 19) % (uint32)MAX_SLOTS);
+    h->obj[i].nslots = ns;
+    var s: int32 = 0;
+    while (s < MAX_SLOTS) {
+      h->obj[i].slot[s] = -1;
+      s += 1;
+    }
+    s = 0;
+    while (s < ns) {
+      var q: uint32 = next_rand(state);
+      var target: int32 = -1;
+      if (q % 8 < 2) {
+        var span: int32 = 1 + (int32)((q >> 4) % 512);
+        target = i + span;
+        if (target >= n) {
+          target = -1;
+        }
+      } else if (q % 8 < 3) {
+        target = (int32)((q >> 6) % (uint32)n);
+      }
+      h->obj[i].slot[s] = target;
+      s += 1;
+    }
+    i += 1;
+  }
+  i = 0;
+  while (i < N_ROOTS) {
+    var r2: uint32 = next_rand(state);
+    h->root[i] = (int32)(r2 % (uint32)n);
+    i += 1;
+  }
+  h->nroots = N_ROOTS;
+}
+
+fn mark_from_roots(h: Heap*) -> int32 {
+  var i: int32 = 0;
+  while (i < h->count) {
+    h->obj[i].mark = 0;
+    i += 1;
+  }
+  var top: int32 = 0;
+  i = 0;
+  while (i < h->nroots) {
+    var r: int32 = h->root[i];
+    if (r >= 0 && r < h->count && h->obj[r].mark == 0) {
+      h->obj[r].mark = 1;
+      h->work[top] = r;
+      top += 1;
+    }
+    i += 1;
+  }
+  var live: int32 = 0;
+  while (top > 0) {
+    top -= 1;
+    var id: int32 = h->work[top];
+    live += 1;
+    var ns: int32 = h->obj[id].nslots;
+    var s: int32 = 0;
+    while (s < ns) {
+      var t: int32 = h->obj[id].slot[s];
+      if (t >= 0 && h->obj[t].mark == 0) {
+        h->obj[t].mark = 1;
+        h->work[top] = t;
+        top += 1;
+      }
+      s += 1;
+    }
+  }
+  return live;
+}
+
+fn sweep(h: Heap*) -> int32 {
+  var dead: int32 = 0;
+  var i: int32 = 0;
+  while (i < h->count) {
+    if (h->obj[i].mark == 0) {
+      dead += 1;
+    }
+    i += 1;
+  }
+  h->freed = dead;
+  return dead;
+}
+
+fn compact(h: Heap*) -> int32 {
+  var n: int32 = h->count;
+  var live: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (h->obj[i].mark != 0) {
+      h->fwd[i] = live;
+      live += 1;
+    } else {
+      h->fwd[i] = -1;
+    }
+    i += 1;
+  }
+  i = 0;
+  while (i < n) {
+    if (h->obj[i].mark != 0) {
+      var dst: int32 = h->fwd[i];
+      h->obj[dst].kind = h->obj[i].kind;
+      h->obj[dst].nslots = h->obj[i].nslots;
+      h->obj[dst].payload = h->obj[i].payload;
+      h->obj[dst].mark = 1;
+      var s: int32 = 0;
+      while (s < MAX_SLOTS) {
+        var t: int32 = h->obj[i].slot[s];
+        if (t >= 0) {
+          h->obj[dst].slot[s] = h->fwd[t];
+        } else {
+          h->obj[dst].slot[s] = -1;
+        }
+        s += 1;
+      }
+    }
+    i += 1;
+  }
+  i = 0;
+  while (i < h->nroots) {
+    var r: int32 = h->root[i];
+    if (r >= 0) {
+      h->root[i] = h->fwd[r];
+    }
+    i += 1;
+  }
+  h->count = live;
+  return live;
+}
+
+fn mutate(h: Heap*, state: uint32*) {
+  var n: int32 = h->count;
+  if (n <= 1) {
+    return;
+  }
+  var edits: int32 = n / 6;
+  var e: int32 = 0;
+  while (e < edits) {
+    var r: uint32 = next_rand(state);
+    var id: int32 = (int32)(r % (uint32)n);
+    var ns: int32 = h->obj[id].nslots;
+    if (ns > 0) {
+      var s: int32 = (int32)((r >> 12) % (uint32)ns);
+      if ((r >> 20) % 3 == 0) {
+        h->obj[id].slot[s] = -1;
+      } else {
+        h->obj[id].slot[s] = (int32)((r >> 6) % (uint32)n);
+      }
+    }
+    e += 1;
+  }
+  var i: int32 = 0;
+  while (i < h->nroots) {
+    if (i % 3 == 0) {
+      var q: uint32 = next_rand(state);
+      h->root[i] = (int32)(q % (uint32)n);
+    }
+    i += 1;
+  }
+}
+
+fn verify(h: Heap*) -> uint64 {
+  var v: uint64 = 14695981039346656037;
+  var i: int32 = 0;
+  while (i < h->count) {
+    v = v ^ (uint64)h->obj[i].payload;
+    v *= 1099511628211;
+    v += (uint64)(h->obj[i].kind * 7 + h->obj[i].nslots);
+    var s: int32 = 0;
+    while (s < h->obj[i].nslots) {
+      v = v * 31 + (uint64)(h->obj[i].slot[s] + 2);
+      s += 1;
+    }
+    i += 1;
+  }
+  return v;
+}
+
+fn round_trip(h: Heap*, out_live: int32*) -> uint64 {
+  var state: uint32 = 2463534242;
+  build_graph(h, &state);
+
+  var res: uint64 = 1469598103934665603;
+  var cycle: int32 = 0;
+  while (cycle < CYCLES) {
+    var live: int32 = mark_from_roots(h);
+    var dead: int32 = sweep(h);
+    var kept: int32 = compact(h);
+    res = res * 1000003 + (uint64)live;
+    res = res * 31 + (uint64)dead;
+    res = res * 31 + (uint64)kept;
+    res = res * 1000003 + verify(h);
+    mutate(h, &state);
+    cycle += 1;
+  }
+  *out_live = h->count;
+  return res;
+}
+
+fn main() -> int32 {
+  var objs: Obj* = malloc((int64)N_OBJ * sizeof(Obj));
+  var work: int32* = malloc((int64)N_OBJ * 4);
+  var fwd: int32* = malloc((int64)N_OBJ * 4);
+  var root: int32* = malloc((int64)N_ROOTS * 4);
+  if (objs == 0 || work == 0 || fwd == 0 || root == 0) {
+    println("malloc failed");
+    return 1;
+  }
+  var h: Heap;
+  h.obj = objs;
+  h.count = 0;
+  h.work = work;
+  h.fwd = fwd;
+  h.root = root;
+  h.nroots = 0;
+  h.freed = 0;
+
+  println("Mark-sweep: {N_OBJ} objects, {N_ROOTS} roots, {CYCLES} collect-compact cycles");
+
+  var live: int32 = 0;
+  var check: uint64 = round_trip(&h, &live);
+  println("  surviving objects = {live}, object size = {sizeof(Obj)} bytes");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var l2: int32 = 0;
+    bench_hash = bench_hash * 1000003 + round_trip(&h, &l2);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(objs);
+  free(work);
+  free(fwd);
+  free(root);
+  return 0;
+}

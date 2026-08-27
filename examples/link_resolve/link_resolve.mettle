@@ -1,0 +1,387 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const UNITS: int32 = 1200;
+const DEFS_PER: int32 = 40;
+const REFS_PER: int32 = 72;
+const SHARED_POOL: int32 = 3000;
+const STREAM_CAP: int64 = 4194304;
+const MAX_DEFS: int32 = 65536;
+const MAX_REFS: int32 = 98304;
+const SLOTS: int32 = 131072;
+const SLOT_MASK: int32 = 131071;
+const IMAGE_SIZE: int32 = 1048576;
+const SECTIONS: int32 = 4;
+const PASSES: int32 = 3;
+
+struct Sym {
+  name_off: int32;
+  name_len: int32;
+  section: int32;
+  offset: int32;
+  unit: int32;
+}
+
+struct Ref {
+  name_off: int32;
+  name_len: int32;
+  site: int32;
+  kind: int32;
+  unit: int32;
+}
+
+struct Linker {
+  stream: uint8*;
+  stream_len: int32;
+  def: Sym*;
+  ndefs: int32;
+  ref: Ref*;
+  nrefs: int32;
+  slot: int32*;
+  image: uint8*;
+  dupes: int32;
+  unresolved: int32;
+}
+
+fn put_u32(buf: uint8*, pos: int32, v: uint32) -> int32 {
+  buf[pos] = (uint8)(v & 255);
+  buf[pos + 1] = (uint8)((v >> 8) & 255);
+  buf[pos + 2] = (uint8)((v >> 16) & 255);
+  buf[pos + 3] = (uint8)((v >> 24) & 255);
+  return pos + 4;
+}
+
+fn get_u32(buf: uint8*, pos: int32) -> uint32 {
+  var a: uint32 = (uint32)buf[pos];
+  var b: uint32 = (uint32)buf[pos + 1];
+  var c: uint32 = (uint32)buf[pos + 2];
+  var d: uint32 = (uint32)buf[pos + 3];
+  return a | (b << 8) | (c << 16) | (d << 24);
+}
+
+fn next_rand(state: uint32*) -> uint32 {
+  var s: uint32 = *state;
+  s ^= (s << 13);
+  s ^= (s >> 17);
+  s ^= (s << 5);
+  *state = s;
+  return s;
+}
+
+fn emit_name(buf: uint8*, pos: int32, prefix: int32, id: int32) -> int32 {
+  var start: int32 = pos + 4;
+  var p: int32 = start;
+  if (prefix >= 0) {
+    buf[p] = 117;
+    p += 1;
+    var u: int32 = prefix;
+    var digits: int32 = 1000;
+    while (digits > 0) {
+      buf[p] = (uint8)(48 + (u / digits) % 10);
+      p += 1;
+      digits /= 10;
+    }
+    buf[p] = 95;
+    p += 1;
+  } else {
+    buf[p] = 115;
+    p += 1;
+    buf[p] = 104;
+    p += 1;
+    buf[p] = 95;
+    p += 1;
+  }
+  var v: int32 = id;
+  var d2: int32 = 10000;
+  while (d2 > 0) {
+    buf[p] = (uint8)(48 + (v / d2) % 10);
+    p += 1;
+    d2 /= 10;
+  }
+  var len: int32 = p - start;
+  put_u32(buf, pos, (uint32)len);
+  return p;
+}
+
+fn generate_stream(l: Linker*, seed: uint32) -> int32 {
+  var state: uint32 = seed;
+  var pos: int32 = 0;
+  var unit: int32 = 0;
+  while (unit < UNITS) {
+    pos = put_u32(l->stream, pos, 1296649793);
+    pos = put_u32(l->stream, pos, (uint32)unit);
+    pos = put_u32(l->stream, pos, (uint32)DEFS_PER);
+    var d: int32 = 0;
+    while (d < DEFS_PER) {
+      var r: uint32 = next_rand(&state);
+      if (d % 4 == 0) {
+        pos = emit_name(l->stream, pos, -1, (int32)(r % (uint32)SHARED_POOL));
+      } else {
+        pos = emit_name(l->stream, pos, unit, d);
+      }
+      pos = put_u32(l->stream, pos, (uint32)((int32)(r >> 9) % SECTIONS));
+      pos = put_u32(l->stream, pos, (uint32)((r >> 3) % 60000));
+      d += 1;
+    }
+    pos = put_u32(l->stream, pos, (uint32)REFS_PER);
+    var f: int32 = 0;
+    while (f < REFS_PER) {
+      var q: uint32 = next_rand(&state);
+      if (q % 5 < 4) {
+        pos = emit_name(l->stream, pos, -1, (int32)((q >> 2) % (uint32)SHARED_POOL));
+      } else {
+        var other: int32 = (int32)((q >> 7) % (uint32)UNITS);
+        pos = emit_name(l->stream, pos, other, (int32)((q >> 17) % (uint32)DEFS_PER));
+      }
+      pos = put_u32(l->stream, pos, (uint32)((q >> 5) % (uint32)(IMAGE_SIZE - 8)));
+      pos = put_u32(l->stream, pos, (uint32)(q % 3));
+      f += 1;
+    }
+    unit += 1;
+  }
+  l->stream_len = pos;
+  return pos;
+}
+
+fn parse_stream(l: Linker*) -> int32 {
+  l->ndefs = 0;
+  l->nrefs = 0;
+  var pos: int32 = 0;
+  var units: int32 = 0;
+  while (pos < l->stream_len) {
+    var magic: uint32 = get_u32(l->stream, pos);
+    pos += 4;
+    if (magic != 1296649793) {
+      return -1;
+    }
+    var unit: int32 = (int32)get_u32(l->stream, pos);
+    pos += 4;
+    var ndefs: int32 = (int32)get_u32(l->stream, pos);
+    pos += 4;
+    var d: int32 = 0;
+    while (d < ndefs) {
+      var nlen: int32 = (int32)get_u32(l->stream, pos);
+      pos += 4;
+      if (l->ndefs < MAX_DEFS) {
+        l->def[l->ndefs].name_off = pos;
+        l->def[l->ndefs].name_len = nlen;
+        l->def[l->ndefs].unit = unit;
+      }
+      pos += nlen;
+      var sec: int32 = (int32)get_u32(l->stream, pos);
+      pos += 4;
+      var off: int32 = (int32)get_u32(l->stream, pos);
+      pos += 4;
+      if (l->ndefs < MAX_DEFS) {
+        l->def[l->ndefs].section = sec;
+        l->def[l->ndefs].offset = off;
+        l->ndefs += 1;
+      }
+      d += 1;
+    }
+    var nrefs: int32 = (int32)get_u32(l->stream, pos);
+    pos += 4;
+    var f: int32 = 0;
+    while (f < nrefs) {
+      var rlen: int32 = (int32)get_u32(l->stream, pos);
+      pos += 4;
+      if (l->nrefs < MAX_REFS) {
+        l->ref[l->nrefs].name_off = pos;
+        l->ref[l->nrefs].name_len = rlen;
+        l->ref[l->nrefs].unit = unit;
+      }
+      pos += rlen;
+      var site: int32 = (int32)get_u32(l->stream, pos);
+      pos += 4;
+      var kind: int32 = (int32)get_u32(l->stream, pos);
+      pos += 4;
+      if (l->nrefs < MAX_REFS) {
+        l->ref[l->nrefs].site = site;
+        l->ref[l->nrefs].kind = kind;
+        l->nrefs += 1;
+      }
+      f += 1;
+    }
+    units += 1;
+  }
+  return units;
+}
+
+fn name_hash(stream: uint8*, off: int32, len: int32) -> uint32 {
+  var h: uint32 = 2166136261;
+  var i: int32 = 0;
+  while (i < len) {
+    h ^= (uint32)stream[off + i];
+    h *= 16777619;
+    i += 1;
+  }
+  return h;
+}
+
+fn name_equal(stream: uint8*, a_off: int32, a_len: int32, b_off: int32, b_len: int32) -> int32 {
+  if (a_len != b_len) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < a_len) {
+    if (stream[a_off + i] != stream[b_off + i]) {
+      return 0;
+    }
+    i += 1;
+  }
+  return 1;
+}
+
+fn intern_defs(l: Linker*) {
+  var i: int32 = 0;
+  while (i < SLOTS) {
+    l->slot[i] = -1;
+    i += 1;
+  }
+  l->dupes = 0;
+  i = 0;
+  while (i < l->ndefs) {
+    var h: uint32 = name_hash(l->stream, l->def[i].name_off, l->def[i].name_len);
+    var idx: int32 = (int32)(h & (uint32)SLOT_MASK);
+    var placed: int32 = 0;
+    while (placed == 0) {
+      var cur: int32 = l->slot[idx];
+      if (cur < 0) {
+        l->slot[idx] = i;
+        placed = 1;
+      } else if (name_equal(l->stream, l->def[cur].name_off, l->def[cur].name_len,
+                            l->def[i].name_off, l->def[i].name_len) != 0) {
+        l->dupes += 1;
+        placed = 1;
+      } else {
+        idx = (idx + 1) & SLOT_MASK;
+      }
+    }
+    i += 1;
+  }
+}
+
+fn lookup(l: Linker*, off: int32, len: int32) -> int32 {
+  var h: uint32 = name_hash(l->stream, off, len);
+  var idx: int32 = (int32)(h & (uint32)SLOT_MASK);
+  while (l->slot[idx] >= 0) {
+    var cand: int32 = l->slot[idx];
+    if (name_equal(l->stream, l->def[cand].name_off, l->def[cand].name_len, off, len) != 0) {
+      return cand;
+    }
+    idx = (idx + 1) & SLOT_MASK;
+  }
+  return -1;
+}
+
+fn section_base(section: int32) -> uint32 {
+  return (uint32)(4096 + section * 262144);
+}
+
+fn resolve_and_relocate(l: Linker*) -> int32 {
+  var i: int32 = 0;
+  while (i < IMAGE_SIZE) {
+    l->image[i] = 0;
+    i += 1;
+  }
+  l->unresolved = 0;
+  var applied: int32 = 0;
+  i = 0;
+  while (i < l->nrefs) {
+    var target: int32 = lookup(l, l->ref[i].name_off, l->ref[i].name_len);
+    if (target < 0) {
+      l->unresolved += 1;
+    } else {
+      var addr: uint32 = section_base(l->def[target].section) + (uint32)l->def[target].offset;
+      var site: int32 = l->ref[i].site;
+      if (l->ref[i].kind == 1) {
+        addr = addr - (uint32)site - 4;
+      } else if (l->ref[i].kind == 2) {
+        addr += (uint32)(l->ref[i].unit * 16);
+      }
+      put_u32(l->image, site, addr ^ get_u32(l->image, site));
+      applied += 1;
+    }
+    i += 1;
+  }
+  return applied;
+}
+
+fn round_trip(l: Linker*, out_applied: int32*) -> uint64 {
+  generate_stream(l, 2463534242);
+  var units: int32 = parse_stream(l);
+  intern_defs(l);
+  var applied: int32 = resolve_and_relocate(l);
+
+  var h: uint64 = 1469598103934665603;
+  h = h * 31 + (uint64)units;
+  h = h * 31 + (uint64)l->ndefs;
+  h = h * 31 + (uint64)l->nrefs;
+  h = h * 31 + (uint64)l->dupes;
+  h = h * 31 + (uint64)l->unresolved;
+  h = h * 31 + (uint64)applied;
+  var i: int32 = 0;
+  while (i < IMAGE_SIZE) {
+    h = h ^ (uint64)l->image[i];
+    h *= 1099511628211;
+    i += 4;
+  }
+  *out_applied = applied;
+  return h;
+}
+
+fn main() -> int32 {
+  var l: Linker;
+  l.stream = malloc(STREAM_CAP);
+  l.def = malloc((int64)MAX_DEFS * sizeof(Sym));
+  l.ref = malloc((int64)MAX_REFS * sizeof(Ref));
+  l.slot = malloc((int64)SLOTS * 4);
+  l.image = malloc((int64)IMAGE_SIZE);
+  l.stream_len = 0;
+  l.ndefs = 0;
+  l.nrefs = 0;
+  l.dupes = 0;
+  l.unresolved = 0;
+  if (l.stream == 0 || l.def == 0 || l.ref == 0 || l.slot == 0 || l.image == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  println("Link resolve: {UNITS} units, {DEFS_PER} defs and {REFS_PER} refs each");
+
+  var applied: int32 = 0;
+  var check: uint64 = round_trip(&l, &applied);
+  println("  stream = {l.stream_len} bytes, defs = {l.ndefs}, refs = {l.nrefs}");
+  println("  duplicates = {l.dupes}, unresolved = {l.unresolved}, relocations = {applied}");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var a2: int32 = 0;
+    bench_hash = bench_hash * 1000003 + round_trip(&l, &a2);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(l.stream);
+  free(l.def);
+  free(l.ref);
+  free(l.slot);
+  free(l.image);
+  return 0;
+}

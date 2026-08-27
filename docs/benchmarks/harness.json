@@ -664,8 +664,7 @@
     {
       "name": "bignum_mul",
       "kind": "runtime",
-      "suite": 3,
-      "set": 2,
+      "suite": 2,
       "description": "Bignum: factorial(1000) then wide schoolbook multiplies over base 2^32 limbs, decimal render x 24",
       "mettle_source": "examples/bignum_mul/bignum_mul.mettle",
       "mettle_exe": "examples/bignum_mul/bignum_mul.exe",
@@ -724,8 +723,7 @@
     {
       "name": "life_bits",
       "kind": "runtime",
-      "suite": 3,
-      "set": 2,
+      "suite": 2,
       "description": "Life: 512x1024 bit grid, 200 generations through word-parallel uint64 full adders x 3",
       "mettle_source": "examples/life_bits/life_bits.mettle",
       "mettle_exe": "examples/life_bits/life_bits.exe",
@@ -738,7 +736,7 @@
       "kind": "runtime",
       "suite": 3,
       "set": 2,
-      "description": "Diff: 20 document pairs of 620 lines, line hashing, LCS dynamic programming, backtrack x 3",
+      "description": "Diff: 90 document pairs of 240 lines, line hashing, LCS dynamic programming, backtrack to an edit script, replay and verify x 3",
       "mettle_source": "examples/diff_lcs/diff_lcs.mettle",
       "mettle_exe": "examples/diff_lcs/diff_lcs.exe",
       "c_source": "examples/diff_lcs/diff_lcs.c",
@@ -756,6 +754,30 @@
       "c_source": "examples/csv_query/csv_query.c",
       "c_exe": "examples/csv_query/csv_query_c.exe",
       "build_script": "examples/csv_query/build.bat"
+    },
+    {
+      "name": "mark_sweep",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "Mark-sweep GC: build a 160000-object graph, mark from roots through a worklist, sweep, compact and remap, mutate, 3 cycles x 2",
+      "mettle_source": "examples/mark_sweep/mark_sweep.mettle",
+      "mettle_exe": "examples/mark_sweep/mark_sweep.exe",
+      "c_source": "examples/mark_sweep/mark_sweep.c",
+      "c_exe": "examples/mark_sweep/mark_sweep_c.exe",
+      "build_script": "examples/mark_sweep/build.bat"
+    },
+    {
+      "name": "link_resolve",
+      "kind": "runtime",
+      "suite": 3,
+      "set": 2,
+      "description": "Link resolve: parse 1200 object records, intern 48000 symbols, resolve cross-unit references, apply relocations to a 1 MB image x 3",
+      "mettle_source": "examples/link_resolve/link_resolve.mettle",
+      "mettle_exe": "examples/link_resolve/link_resolve.exe",
+      "c_source": "examples/link_resolve/link_resolve.c",
+      "c_exe": "examples/link_resolve/link_resolve_c.exe",
+      "build_script": "examples/link_resolve/build.bat"
     }
   ],
   "compile_benchmarks": [

@@ -54,7 +54,7 @@ fn bn_mul_small(a: Bignum*, m: uint32) {
   }
   while (carry != 0 && i < LIMBS) {
     a->limb[i] = (uint32)(carry & 4294967295);
-    carry = carry >> 32;
+    carry >>= 32;
     i += 1;
   }
   if (i > a->len) {
@@ -146,9 +146,9 @@ fn build_seeded(a: Bignum*, seed: uint32, limbs: int32) {
   var state: uint32 = seed;
   var i: int32 = 0;
   while (i < limbs) {
-    state = state ^ (state << 13);
-    state = state ^ (state >> 17);
-    state = state ^ (state << 5);
+    state ^= (state << 13);
+    state ^= (state >> 17);
+    state ^= (state << 5);
     a->limb[i] = state | 1;
     i += 1;
   }
@@ -164,9 +164,9 @@ fn decimal_checksum(work: Bignum*, src: Bignum*, out_digits: int32*) -> uint64 {
     var c: int32 = 0;
     while (c < 9) {
       var d: uint32 = chunk % 10;
-      chunk = chunk / 10;
-      h = h ^ (uint64)d;
-      h = h * 1099511628211;
+      chunk /= 10;
+      h ^= (uint64)d;
+      h *= 1099511628211;
       digits += 1;
       c += 1;
     }
@@ -192,7 +192,7 @@ fn round_trip(fact: Bignum*, seed_a: Bignum*, seed_b: Bignum*, prod: Bignum*,
     bn_mul(work, acc, prod);
     bn_copy(acc, work);
     h = h * 1000003 + (uint64)acc->len;
-    h = h ^ (uint64)prod->limb[0];
+    h ^= (uint64)prod->limb[0];
     round += 1;
   }
 

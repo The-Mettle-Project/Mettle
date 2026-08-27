@@ -40,9 +40,9 @@ static void build_world(uint8_t *solid, uint32_t seed) {
     while (y < DIM) {
       int32_t x = 0;
       while (x < DIM) {
-        state = state ^ (state << 13);
-        state = state ^ (state >> 17);
-        state = state ^ (state << 5);
+        state ^= (state << 13);
+        state ^= (state >> 17);
+        state ^= (state << 5);
         uint8_t v = 0;
         if (y < 3) {
           v = 1;
@@ -118,17 +118,17 @@ static void trace(uint8_t *solid, double ox, double oy, double oz, double dx, do
     }
     if (tmx < tmy && tmx < tmz) {
       t = tmx;
-      tmx = tmx + idx;
+      tmx += idx;
       x += stepx;
       axis = 0;
     } else if (tmy < tmz) {
       t = tmy;
-      tmy = tmy + idy;
+      tmy += idy;
       y += stepy;
       axis = 1;
     } else {
       t = tmz;
-      tmz = tmz + idz;
+      tmz += idz;
       z += stepz;
       axis = 2;
     }
@@ -165,9 +165,9 @@ static double shade(uint8_t *solid, Hit *h, double dx, double dy, double dz) {
   Hit bounce;
   trace(solid, ox, oy, oz, rx, ry, rz, &bounce);
   if (bounce.found != 0) {
-    base = base * 0.5;
+    base *= 0.5;
   } else {
-    base = base + 0.125;
+    base += 0.125;
   }
   return base * atten;
 }
@@ -199,8 +199,8 @@ static uint64_t render(uint8_t *solid, int32_t *out_hits) {
       int32_t q = (int32_t)(shade_v * 255.0);
       if (q < 0) { q = 0; }
       if (q > 255) { q = 255; }
-      h = h ^ (uint64_t)q;
-      h = h * 1099511628211ULL;
+      h ^= (uint64_t)q;
+      h *= 1099511628211ULL;
       px += 1;
     }
     py += 1;
