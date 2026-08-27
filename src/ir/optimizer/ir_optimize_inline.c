@@ -368,6 +368,7 @@ int ir_clone_instruction_plain(const IRInstruction *source,
   out->failure_memory_order = source->failure_memory_order;
   out->memory_scope = source->memory_scope;
   out->memory_regions = source->memory_regions;
+  out->alias_class = source->alias_class;
   out->async_copy_element_count = source->async_copy_element_count;
   out->async_copy_transaction_bytes = source->async_copy_transaction_bytes;
   out->async_copy_pending_groups = source->async_copy_pending_groups;
@@ -456,6 +457,7 @@ static int ir_clone_instruction_for_inline(const IRInstruction *source,
   out->failure_memory_order = source->failure_memory_order;
   out->memory_scope = source->memory_scope;
   out->memory_regions = source->memory_regions;
+  out->alias_class = source->alias_class;
   out->async_copy_element_count = source->async_copy_element_count;
   out->async_copy_transaction_bytes = source->async_copy_transaction_bytes;
   out->async_copy_pending_groups = source->async_copy_pending_groups;

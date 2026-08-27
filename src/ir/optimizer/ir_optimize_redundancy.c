@@ -2006,6 +2006,7 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
         body.float_bits = moved->float_bits;
         body.is_unsigned = moved->is_unsigned;
         body.value_type = moved->value_type;
+        body.alias_class = moved->alias_class;
         if (addr.offset != 0) {
           /* fold the offset into the lead add */
           IRInstruction *lead_in = &function->instructions[header];
@@ -2188,6 +2189,7 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
       int float_bits = 0;
       int is_unsigned = 0;
       MtlcType *value_type = NULL;
+      unsigned char promoted_class = IR_ALIAS_CLASS_NONE;
 
       for (size_t i = header + 1; i < latch && viable; i++) {
         const IRInstruction *ins = &function->instructions[i];
@@ -2246,6 +2248,9 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
             if (ins->value_type) {
               value_type = ins->value_type;
             }
+          }
+          if (ins->alias_class != IR_ALIAS_CLASS_NONE) {
+            promoted_class = ins->alias_class;
           }
           continue;
         }
@@ -2403,6 +2408,7 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
       pieces[3].is_unsigned = is_unsigned;
       pieces[3].float_bits = float_bits;
       pieces[3].value_type = value_type;
+      pieces[3].alias_class = promoted_class;
       for (int k = 0; k < 4; k++) {
         pieces[k].location = function->instructions[header].location;
       }
