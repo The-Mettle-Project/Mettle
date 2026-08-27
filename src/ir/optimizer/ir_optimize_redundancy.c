@@ -1800,6 +1800,110 @@ int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed) {
 /* header's straight-line prefix, and the offset stays within a page of it.     */
 /* -------------------------------------------------------------------------- */
 
+
+/* The constant this operand holds where control reaches `before`, if it holds
+ * one: a literal, or a name whose single write in the function put a literal
+ * there. */
+static int re_operand_entry_constant(const IRFunction *function,
+                                     const REDefs *defs, size_t before,
+                                     const IROperand *op, long long *out) {
+  if (!op) {
+    return 0;
+  }
+  if (op->kind == IR_OPERAND_INT) {
+    *out = op->int_value;
+    return 1;
+  }
+  if ((op->kind != IR_OPERAND_SYMBOL && op->kind != IR_OPERAND_TEMP) ||
+      !op->name) {
+    return 0;
+  }
+  (void)defs;
+  /* The write that reaches the header, not the only write in the function: a
+   * counter is written twice, once to start it and once to step it, and it is
+   * the first of those that says whether the loop is entered. Read from the
+   * straight-line block ahead of the header, which is the only run of
+   * instructions guaranteed to have executed. */
+  for (size_t k = before; k-- > 0;) {
+    const IRInstruction *ins = &function->instructions[k];
+    if (ins->op == IR_OP_LABEL || ins->op == IR_OP_JUMP ||
+        ins->op == IR_OP_RETURN || ins->op == IR_OP_BRANCH_ZERO ||
+        ins->op == IR_OP_BRANCH_EQ) {
+      return 0;
+    }
+    if (!ir_instruction_writes_destination(ins) ||
+        ins->dest.kind != op->kind || !ins->dest.name ||
+        strcmp(ins->dest.name, op->name) != 0) {
+      continue;
+    }
+    if (ins->op == IR_OP_ASSIGN && ins->lhs.kind == IR_OPERAND_INT) {
+      *out = ins->lhs.int_value;
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* Does this loop run at least once, whatever else is true?
+ *
+ * `while (i < CONST)` entered with `i` a known constant is decided here, and
+ * that settles a question the hoist keeps losing: a load in the body would
+ * have been executed anyway, so lifting it above the loop dereferences
+ * nothing the loop was not going to dereference. Buffer initialisation is
+ * this shape every time -- `while (i < SLOTS) { l->slot[i] = -1; i += 1; }`
+ * reloads `l->slot` per element and cannot reach the fill kernel without it.
+ *
+ * Only the compare the header itself branches on is read, and only against
+ * constants; anything else answers no. */
+static int re_loop_runs_at_least_once(const IRFunction *function,
+                                      const REDefs *defs, size_t header,
+                                      size_t latch) {
+  const IRInstruction *cmp = NULL;
+  const IRInstruction *branch = NULL;
+  long long lhs = 0;
+  long long rhs = 0;
+
+  for (size_t i = header + 1; i < latch; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP) {
+      continue;
+    }
+    if (ins->op == IR_OP_BINARY && ins->dest.kind == IR_OPERAND_TEMP) {
+      cmp = ins;
+      continue;
+    }
+    if (ins->op == IR_OP_BRANCH_ZERO) {
+      branch = ins;
+    }
+    break;
+  }
+  if (!cmp || !branch || !cmp->text || !cmp->dest.name ||
+      !ir_operand_is_temp_named(&branch->lhs, cmp->dest.name)) {
+    return 0;
+  }
+  if (!re_operand_entry_constant(function, defs, header, &cmp->lhs, &lhs) ||
+      !re_operand_entry_constant(function, defs, header, &cmp->rhs, &rhs)) {
+    return 0;
+  }
+  if (strcmp(cmp->text, "<") == 0) {
+    return lhs < rhs;
+  }
+  if (strcmp(cmp->text, "<=") == 0) {
+    return lhs <= rhs;
+  }
+  if (strcmp(cmp->text, ">") == 0) {
+    return lhs > rhs;
+  }
+  if (strcmp(cmp->text, ">=") == 0) {
+    return lhs >= rhs;
+  }
+  if (strcmp(cmp->text, "!=") == 0) {
+    return lhs != rhs;
+  }
+  return 0;
+}
+
 static int re_label_is_loop_header(const char *text) {
   if (!text) {
     return 0;
@@ -1936,6 +2040,24 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
       }
     }
 
+    /* How far into the body control gets without taking a branch, past the
+     * loop's own guard: a load before that runs on every iteration that runs
+     * at all. */
+    size_t body_prefix_end = latch;
+    {
+      size_t k = prefix_end + 1;
+      for (; k < latch; k++) {
+        IROpcode op = function->instructions[k].op;
+        if (op == IR_OP_BRANCH_ZERO || op == IR_OP_BRANCH_EQ ||
+            op == IR_OP_JUMP || op == IR_OP_LABEL || op == IR_OP_RETURN) {
+          break;
+        }
+      }
+      body_prefix_end = k;
+    }
+    int runs_at_least_once =
+        re_loop_runs_at_least_once(function, &defs, header, latch);
+
     for (size_t i = header + 1; i < latch; i++) {
       IRInstruction *load = &function->instructions[i];
       REAddr addr = {0};
@@ -1995,6 +2117,11 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
           safe = re_access_reaches(function, &defs, &function->instructions[k],
                                    &addr, reach);
         }
+      }
+      /* Or the loop is entered unconditionally and this load runs on the way
+       * through, so it was going to happen regardless of where it sits. */
+      if (!safe && i < body_prefix_end && runs_at_least_once) {
+        safe = 1;
       }
       if (!safe) {
         continue;
