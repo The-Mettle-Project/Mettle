@@ -3917,34 +3917,708 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
 
 /* ---------------- main execution loop ---------------- */
 
-static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
-                            const IRInterpValue *args, size_t arg_count,
-                            IRInterpValue *result) {
-  if (machine->depth >= II_MAX_DEPTH) {
-    ii_fail(machine, IR_INTERP_DEPTH, fn->name ? fn->name : "?");
+/* `%d = c ? a : b`. Both arms are evaluated, so neither may trap. */
+static int ii_op_select(IRInterpMachine *machine, IIFrame *frame,
+                         const IRInstruction *insn) {
+  /* Fused form (text != NULL): cond = (lhs <cmp> arguments[1]). Plain
+   * form: cond = (lhs != 0). Then dest = cond ? rhs : arguments[0]. */
+  long long truth = 0;
+  if (insn->text && insn->argument_count > 1) {
+    IRInterpValue a, b;
+    if (!ii_fetch(machine, frame, &insn->lhs, &a) ||
+        !ii_fetch(machine, frame, &insn->arguments[1], &b)) {
+      return 0;
+    }
+    long long x = ii_as_int(&a), y = ii_as_int(&b);
+    const char *op = insn->text;
+    if (insn->is_unsigned) {
+      unsigned long long ux = (unsigned long long)x, uy = (unsigned long long)y;
+      truth = strcmp(op, "<") == 0    ? ux < uy
+              : strcmp(op, "<=") == 0 ? ux <= uy
+              : strcmp(op, ">") == 0  ? ux > uy
+              : strcmp(op, ">=") == 0 ? ux >= uy
+              : strcmp(op, "==") == 0 ? ux == uy
+                                      : ux != uy;
+    } else {
+      truth = strcmp(op, "<") == 0    ? x < y
+              : strcmp(op, "<=") == 0 ? x <= y
+              : strcmp(op, ">") == 0  ? x > y
+              : strcmp(op, ">=") == 0 ? x >= y
+              : strcmp(op, "==") == 0 ? x == y
+                                      : x != y;
+    }
+  } else {
+    IRInterpValue cond;
+    if (!ii_fetch(machine, frame, &insn->lhs, &cond)) {
+      return 0;
+    }
+    truth = ii_as_int(&cond) != 0;
+  }
+  IRInterpValue out;
+  const IROperand *chosen =
+      truth ? &insn->rhs
+            : (insn->argument_count > 0 ? &insn->arguments[0] : NULL);
+  if (!chosen || !ii_fetch(machine, frame, chosen, &out) ||
+      !ii_store_dest(machine, frame, &insn->dest, &out)) {
     return 0;
   }
-  machine->depth++;
+  return 1;
+  return 1;
+}
 
-  IIFrame frame;
-  memset(&frame, 0, sizeof(frame));
-  frame.fn = fn;
+/* A direct call: an interpreted function, or one of the runtime and libc
+ * entries the machine models. */
+static int ii_op_call(IRInterpMachine *machine, IIFrame *frame,
+                       const IRInstruction *insn) {
+  if (!insn->text) {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "call without callee");
+    return 0;
+  }
+  IRInterpValue call_args[32];
+  size_t call_arg_count = insn->argument_count;
+  if (call_arg_count > 32) {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "call arity > 32");
+    return 0;
+  }
+  for (size_t i = 0; i < call_arg_count; i++) {
+    const IROperand *arg = &insn->arguments[i];
+    if (arg->kind == IR_OPERAND_STRING) {
+      unsigned long long chars = 0, record = 0;
+      if (!ii_string_literal(machine, arg->name, &chars, &record)) {
+        return 0;
+      }
+      call_args[i] = ii_int_value(
+          (long long)(ii_callee_param_is_cstring(machine, insn->text, i)
+                          ? chars
+                          : record));
+      continue;
+    }
+    if (!ii_fetch(machine, frame, arg, &call_args[i])) {
+      return 0;
+    }
+  }
+  if (!ii_copy_aggregate_args(machine, frame, insn->text, call_args,
+                              call_arg_count)) {
+    return 0;
+  }
+  IRFunction *callee = ii_find_function(machine, insn->text);
+  IRInterpValue call_result = ii_int_value(0);
+  if (callee && callee->instruction_count > 0) {
+    if (!ii_exec_function(machine, callee, call_args, call_arg_count,
+                          &call_result)) {
+      return 0;
+    }
+  } else {
+    machine->current_call_loc = insn->location;
+    size_t buffers_before = machine->buffer_count;
+    int handled =
+        ii_extern_call(machine, insn->text, call_args, call_arg_count,
+                       &call_result);
+    /* Attribute any heap allocation the extern model made (malloc,
+     * calloc, realloc) to this call site for leak reporting. String
+     * runtime records stay unattributed: string storage has no free story
+     * yet, exactly like the concat records ii_binary makes, so reporting
+     * one and not the other would flag every interpolation as a leak. */
+    if (strncmp(insn->text, "mettle_string_", 14) != 0) {
+      for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
+        machine->buffers[bi].alloc_line = insn->location.line;
+      }
+    }
+    if (handled < 0 || machine->status != IR_INTERP_OK) {
+      if (machine->status == IR_INTERP_OK) {
+        ii_fail(machine, IR_INTERP_TRAP, "extern call trap");
+      }
+      return 0;
+    }
+  }
+  if (!ii_store_dest(machine, frame, &insn->dest, &call_result)) {
+    return 0;
+  }
+  return 1;
+  return 1;
+}
 
-  int ok = 0;
+/* Heap allocation, with the poison and bounds a later access checks against. */
+static int ii_op_new(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn) {
+  long long size = 8;
+  if (insn->rhs.kind == IR_OPERAND_INT && insn->rhs.int_value > 0) {
+    size = insn->rhs.int_value;
+  } else if (insn->rhs.kind != IR_OPERAND_NONE) {
+    if (!ii_fetch_int(machine, frame, &insn->rhs, &size)) {
+      return 0;
+    }
+    if (size <= 0) {
+      size = 8;
+    }
+  }
+  unsigned long long addr = ir_interp_add_buffer(machine, NULL, size);
+  if (!addr) {
+    ii_fail(machine, IR_INTERP_TRAP, "new allocation");
+    return 0;
+  }
+  machine->buffers[machine->buffer_count - 1].alloc_line =
+      insn->location.line;
+  IRInterpValue value = ii_int_value((long long)addr);
+  if (!ii_store_dest(machine, frame, &insn->dest, &value)) {
+    return 0;
+  }
+  return 1;
+  return 1;
+}
 
-  /* Bind parameters, each narrowed to its declared width the way the callee's
-   * home for it is. A parameter reassigned in the body wraps there too. */
+/* A call through a value: a function pointer or a closure. */
+static int ii_op_call_indirect(IRInterpMachine *machine, IIFrame *frame,
+                                const IRInstruction *insn) {
+  IRInterpValue target;
+  if (!ii_fetch(machine, frame, &insn->lhs, &target)) {
+    return 0;
+  }
+  IRInterpValue call_args[32];
+  size_t call_arg_count = insn->argument_count;
+  if (call_arg_count > 32) {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "call arity > 32");
+    return 0;
+  }
+  for (size_t i = 0; i < call_arg_count; i++) {
+    const IROperand *arg = &insn->arguments[i];
+    if (arg->kind == IR_OPERAND_STRING) {
+      unsigned long long chars = 0, record = 0;
+      if (!ii_string_literal(machine, arg->name, &chars, &record)) {
+        return 0;
+      }
+      call_args[i] = ii_int_value((long long)record);
+      continue;
+    }
+    if (!ii_fetch(machine, frame, arg, &call_args[i])) {
+      return 0;
+    }
+  }
+  const char *extern_name = NULL;
+  IRFunction *callee = ii_token_function(
+      machine, (unsigned long long)ii_as_int(&target), &extern_name);
+  IRInterpValue call_result = ii_int_value(0);
+  if (callee && callee->instruction_count > 0) {
+    if (callee->name &&
+        !ii_copy_aggregate_args(machine, frame, callee->name, call_args,
+                                call_arg_count)) {
+      return 0;
+    }
+    if (!ii_exec_function(machine, callee, call_args, call_arg_count,
+                          &call_result)) {
+      return 0;
+    }
+  } else if (extern_name) {
+    machine->current_call_loc = insn->location;
+    size_t buffers_before = machine->buffer_count;
+    int handled = ii_extern_call(machine, extern_name, call_args,
+                                 call_arg_count, &call_result);
+    for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
+      machine->buffers[bi].alloc_line = insn->location.line;
+    }
+    if (handled < 0 || machine->status != IR_INTERP_OK) {
+      if (machine->status == IR_INTERP_OK) {
+        ii_fail(machine, IR_INTERP_TRAP, "extern call trap");
+      }
+      return 0;
+    }
+  } else {
+    ii_fail(machine, IR_INTERP_TRAP, "indirect call to a non-function");
+    return 0;
+  }
+  if (!ii_store_dest(machine, frame, &insn->dest, &call_result)) {
+    return 0;
+  }
+  return 1;
+  return 1;
+}
+
+/* `*addr <- value [size]`, including the block-copy form for anything wider
+ * than a machine word. */
+static int ii_op_store(IRInterpMachine *machine, IIFrame *frame,
+                        const IRInstruction *insn) {
+  unsigned long long addr;
+  long long size;
+  IRInterpValue value;
+  if (!ii_fetch_addr(machine, frame, &insn->dest, &addr) ||
+      !ii_fetch_int(machine, frame, &insn->rhs, &size) ||
+      !ii_fetch(machine, frame, &insn->lhs, &value)) {
+    return 0;
+  }
+  if (size != 1 && size != 2 && size != 4 && size != 8) {
+    /* Wider than a machine word: this is the block-copy form, where the
+     * value operand is the SOURCE ADDRESS rather than a value (whole-struct
+     * assignment, and the copy of an aggregate literal's constant image).
+     * Both regions are checked before either is touched. */
+    unsigned long long source = (unsigned long long)ii_as_int(&value);
+    long long dest_offset = 0;
+    long long source_offset = 0;
+    IIBuffer *dest_buffer =
+        ii_addr_to_buffer(machine, addr, size, &dest_offset);
+    IIBuffer *source_buffer =
+        ii_addr_to_buffer(machine, source, size, &source_offset);
+    if (!dest_buffer || !source_buffer) {
+      ii_fail(machine, IR_INTERP_TRAP,
+              "block copy out of bounds / after free");
+      return 0;
+    }
+    memmove(dest_buffer->data + dest_offset,
+            source_buffer->data + source_offset, (size_t)size);
+    return 1;
+  }
+  unsigned long long raw;
+  if (value.is_float || insn->is_float) {
+    if (size == 4) {
+      float f = (float)ii_as_float(&value);
+      unsigned int bits;
+      memcpy(&bits, &f, 4);
+      raw = bits;
+    } else if (size == 8) {
+      double d = ii_as_float(&value);
+      memcpy(&raw, &d, 8);
+    } else {
+      raw = (unsigned long long)ii_as_int(&value);
+    }
+    /* An int value stored with an int-typed instruction keeps int bits. */
+    if (!value.is_float && !insn->is_float) {
+      raw = (unsigned long long)value.i;
+    }
+  } else {
+    raw = (unsigned long long)value.i;
+  }
+  if (!ii_mem_write(machine, addr, (int)size, raw)) {
+    return 0;
+  }
+  return 1;
+  return 1;
+}
+
+/* Negation, complement and the not that yields 0 or 1. */
+static int ii_op_unary(IRInterpMachine *machine, IIFrame *frame,
+                        const IRInstruction *insn) {
+  IRInterpValue a, out;
+  if (!ii_fetch(machine, frame, &insn->lhs, &a)) {
+    return 0;
+  }
+  const char *op = insn->text ? insn->text : "?";
+  if (strcmp(op, "-") == 0) {
+    if (insn->is_float || a.is_float) {
+      double v = ii_as_float(&a);
+      out = ii_float_value(insn->float_bits == 32 ? (double)(-(float)v) : -v);
+    } else {
+      out = ii_int_value((long long)(0ULL - (unsigned long long)a.i));
+    }
+  } else if (strcmp(op, "!") == 0) {
+    out = ii_int_value(a.is_float ? a.f == 0.0 : a.i == 0);
+  } else if (strcmp(op, "~") == 0) {
+    out = ii_int_value(~ii_as_int(&a));
+  } else if (strcmp(op, "+") == 0) {
+    out = a;
+  } else {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "unary op");
+    return 0;
+  }
+  out.undefined = a.undefined;
+  if (!ii_store_dest(machine, frame, &insn->dest, &out)) {
+    return 0;
+  }
+  return 1;
+  return 1;
+}
+
+/* `dest <- src` between a temp and a local, either way round. */
+static int ii_op_assign(IRInterpMachine *machine, IIFrame *frame,
+                         const IRInstruction *insn) {
+  IRInterpValue value;
+  if (insn->lhs.kind == IR_OPERAND_STRING && insn->lhs.name &&
+      insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
+    IIVar *dest = ii_env_find(&frame->env, insn->dest.name);
+    if (dest && dest->is_cstring) {
+      unsigned long long chars = 0, record = 0;
+      if (!ii_string_literal(machine, insn->lhs.name, &chars, &record)) {
+        return 0;
+      }
+      value = ii_int_value((long long)chars);
+      if (!ii_store_dest(machine, frame, &insn->dest, &value)) {
+        return 0;
+      }
+      return 1;
+    }
+  }
+  if (!ii_fetch(machine, frame, &insn->lhs, &value) ||
+      !ii_store_dest(machine, frame, &insn->dest, &value)) {
+    return 0;
+  }
+  return 1;
+  return 1;
+}
+
+/* `%t <- *addr [size]`, widened the way the element type reads. */
+static int ii_op_load(IRInterpMachine *machine, IIFrame *frame,
+                       const IRInstruction *insn) {
+  unsigned long long addr;
+  long long size;
+  if (!ii_fetch_addr(machine, frame, &insn->lhs, &addr) ||
+      !ii_fetch_int(machine, frame, &insn->rhs, &size)) {
+    return 0;
+  }
+  if (size != 1 && size != 2 && size != 4 && size != 8) {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "load size");
+    return 0;
+  }
+  unsigned long long raw;
+  if (!ii_mem_read(machine, addr, (int)size, &raw)) {
+    return 0;
+  }
+  IRInterpValue value;
+  if (insn->is_float) {
+    if (size == 4) {
+      float f;
+      unsigned int bits = (unsigned int)raw;
+      memcpy(&f, &bits, 4);
+      value = ii_float_value((double)f);
+    } else {
+      double d;
+      memcpy(&d, &raw, 8);
+      value = ii_float_value(d);
+    }
+  } else {
+    value = ii_int_value(
+        ii_widen_loaded_int(raw, (int)size, insn->is_unsigned));
+  }
+  value.undefined = machine->last_read_undefined;
+  if (!ii_store_dest(machine, frame, &insn->dest, &value)) {
+    return 0;
+  }
+  return 1;
+  return 1;
+}
+
+/* `local @name : type`. The widest single opcode the interpreter has: it
+ * decides between a slot-backed register home, real storage for anything whose
+ * address is taken, and the string value convention, and it seeds each with
+ * the poison a read-before-write has to be able to see. Its own function
+ * because it was a third of ii_exec_function on its own.
+ *
+ * Returns 1 with the local established, 0 having failed the machine. The
+ * caller advances pc either way it used to. */
+/* Storage for a local that needs a real address: an array, or a scalar whose
+ * address is taken. Poisoned the way a stack slot is, in contrast to heap
+ * `new`, which stays zeroed to match HEAP_ZERO_MEMORY in codegen. A
+ * re-executed declaration (a loop body's local) reuses the storage it already
+ * owns and poisons it again, the way a reused stack slot behaves. */
+static int ii_give_local_storage(IRInterpMachine *machine, IIFrame *frame,
+                                 IIVar *var, long long count, int elem_size,
+                                 int is_float, int is_unsigned) {
+  unsigned long long addr = 0;
+  if (var->has_local_storage && var->value.i) {
+    long long offset = 0;
+    IIBuffer *buf =
+        ii_addr_to_buffer(machine, (unsigned long long)var->value.i,
+                          count * elem_size, &offset);
+    if (buf) {
+      ii_mark_bytes(buf, offset, count * elem_size, 0);
+      memset(buf->data + offset, II_POISON_BYTE, (size_t)(count * elem_size));
+      addr = (unsigned long long)var->value.i;
+    }
+  }
+  if (!addr) {
+    addr = ii_add_buffer_ex(machine, NULL, count * elem_size, 1);
+    if (!addr) {
+      ii_fail(machine, IR_INTERP_TRAP, "local storage allocation");
+      return 0;
+    }
+    if (!ii_frame_own(frame,
+                      (size_t)((addr - II_ADDR_BASE) / II_ADDR_STRIDE))) {
+      ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+      return 0;
+    }
+    memset(machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE].data,
+           II_POISON_BYTE, (size_t)(count * elem_size));
+    ii_mark_bytes(&machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE], 0,
+                  count * elem_size, 0);
+    var->has_local_storage = 1;
+  }
+  var->value = ii_int_value((long long)addr);
+  var->slotted = count == 1; /* arrays are accessed via &, not by name */
+  var->slot_size = elem_size;
+  var->slot_is_float = is_float;
+  var->slot_is_unsigned = is_unsigned;
+  return 1;
+}
+
+/* An aggregate local: storage of the type's size, reached through address-of,
+ * with whole-value assignment a block copy. Poisoned so a read before the
+ * first write is visible as one. A frame re-entering its own declaration
+ * reuses the storage it already owns. */
+static int ii_declare_aggregate_local(IRInterpMachine *machine, IIFrame *frame,
+                                      IIVar *var, long long agg_size) {
+  if (var->has_local_storage && var->value.i) {
+    long long offset = 0;
+    IIBuffer *buf = ii_addr_to_buffer(
+        machine, (unsigned long long)var->value.i, agg_size, &offset);
+    if (buf) {
+      memset(buf->data + offset, II_POISON_BYTE, (size_t)agg_size);
+      ii_mark_bytes(buf, offset, agg_size, 0);
+      return 1;
+    }
+  }
+  unsigned long long addr = ii_add_buffer_ex(machine, NULL, agg_size, 1);
+  if (!addr) {
+    ii_fail(machine, IR_INTERP_TRAP, "local storage allocation");
+    return 0;
+  }
+  if (!ii_frame_own(frame,
+                    (size_t)((addr - II_ADDR_BASE) / II_ADDR_STRIDE))) {
+    ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+    return 0;
+  }
+  memset(machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE].data,
+         II_POISON_BYTE, (size_t)agg_size);
+  ii_mark_bytes(&machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE], 0,
+                agg_size, 0);
+  var->value = ii_int_value((long long)addr);
+  var->slotted = 0;
+  var->agg_size = agg_size;
+  var->has_local_storage = 1;
+  return 1;
+}
+
+/* The string value convention: the local's value IS the address of a
+ * { chars, length } record, and address-of yields that value. Never
+ * slot-backed.
+ *
+ * The record has to exist from the declaration on. `var s: string;`
+ * followed by `s.chars = buf` stores through the local's value, and
+ * leaving that value poisoned made the store land nowhere: read_line and
+ * read_line_stdin -- which every program importing std/io carries -- trapped
+ * on every generated input, and 250-odd files reported them as unvalidated.
+ * A declaration with no initializer gives them a zeroed record, which is the
+ * storage the compiled program gets. An initializer overwrites the value
+ * with its own record's address on the next instruction, exactly as before. */
+static int ii_declare_string_local(IRInterpMachine *machine, IIFrame *frame,
+                                   IIVar *var) {
+  var->slotted = 0;
+  var->agg_size = 0;
+  var->value_size = 8;
+  var->value_is_unsigned = 1;
+  if (var->string_record) {
+    long long offset = 0;
+    IIBuffer *buf =
+        ii_addr_to_buffer(machine, var->string_record, 16, &offset);
+    if (buf) {
+      memset(buf->data + offset, 0, 16);
+      ii_mark_bytes(buf, offset, 16, 1);
+      var->value = ii_int_value((long long)var->string_record);
+      return 1;
+    }
+  }
+  {
+    unsigned long long addr = ii_add_buffer_ex(machine, NULL, 16, 1);
+    if (!addr) {
+      ii_fail(machine, IR_INTERP_TRAP, "string record allocation");
+      return 0;
+    }
+    if (!ii_frame_own(frame, (size_t)((addr - II_ADDR_BASE) /
+                                       II_ADDR_STRIDE))) {
+      ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+      return 0;
+    }
+    memset(machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE].data,
+           0, 16);
+    var->value = ii_int_value((long long)addr);
+    var->has_local_storage = 1;
+    var->string_record = addr;
+  }
+  return 1;
+}
+
+static int ii_op_declare_local(IRInterpMachine *machine, IIFrame *frame,
+                               IRFunction *fn, const IRInstruction *insn) {
+  if (insn->dest.kind != IR_OPERAND_SYMBOL || !insn->dest.name) {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "local declaration form");
+    return 0;
+  }
+  IIVar *var = ii_env_upsert(&frame->env, insn->dest.name);
+  if (!var) {
+    ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+    return 0;
+  }
+  const MtlcType *vt = insn->value_type;
+  if (!vt && insn->text && machine->program) {
+    vt = ir_program_lookup_type(machine->program, insn->text);
+  }
+  if ((insn->text && strcmp(insn->text, "string") == 0) ||
+      (vt && vt->kind == MTLC_TYPE_STRING)) {
+    return ii_declare_string_local(machine, frame, var);
+  }
+  int elem_size = 8, is_float = 0, is_unsigned = 0;
+  long long count = 1;
+  int parsed = ii_parse_local_type(insn->text, &elem_size, &count,
+                                   &is_float, &is_unsigned);
+  var->is_cstring = (insn->text && (strcmp(insn->text, "cstring") == 0 ||
+                                    strcmp(insn->text, "rawptr") == 0))
+                        ? 1
+                        : 0;
+  if (!parsed && vt &&
+      ii_scalar_from_mtlc(vt, &elem_size, &is_float, &is_unsigned)) {
+    /* Enum, pointer, or closure local behind a named type. */
+    parsed = 1;
+  }
+  if (!parsed && vt &&
+      (vt->kind == MTLC_TYPE_STRUCT || vt->kind == MTLC_TYPE_ARRAY ||
+       vt->kind == MTLC_TYPE_TAGGED_ENUM) &&
+      vt->size > 0) {
+    return ii_declare_aggregate_local(machine, frame, var,
+                                      (long long)vt->size);
+  }
+  if (!parsed) {
+    char what[96];
+    snprintf(what, sizeof(what), "local type '%s'",
+             insn->text ? insn->text : "?");
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, what);
+    return 0;
+  }
+  /* Arrays always get storage; scalars only when their address is
+   * taken somewhere in the function (aliasing must be observable). */
+  int need_slot = count > 1;
+  if (!need_slot) {
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      const IRInstruction *scan = &fn->instructions[i];
+      if (scan->op == IR_OP_ADDRESS_OF &&
+          scan->lhs.kind == IR_OPERAND_SYMBOL && scan->lhs.name &&
+          strcmp(scan->lhs.name, insn->dest.name) == 0) {
+        need_slot = 1;
+        break;
+      }
+    }
+  }
+  if (need_slot) {
+    if (!ii_give_local_storage(machine, frame, var, count, elem_size, is_float,
+                               is_unsigned)) {
+      return 0;
+    }
+  } else {
+    var->value = ii_poison_value();
+    var->slotted = 0;
+    if (is_float) {
+      var->value.is_float = 1;
+      var->value.f = -6510615.5; /* deterministic float poison */
+      var->value.i = 0;
+    }
+  }
+  /* Remember the declared integer width even when the local lives in a
+   * "register" here, so a write wraps at the width the program asked for.
+   * Pointers are already 8 bytes; a float32 home rounds writes to single
+   * precision (the -4 marker). */
+  var->value_size = is_float ? (elem_size == 4 ? -4 : 0) : elem_size;
+  var->value_is_unsigned = is_unsigned;
+  return 1;
+}
+
+/* Every label in the function, so a jump resolves by name in one lookup
+ * rather than a scan. Built once per frame. */
+static int ii_build_label_table(IRInterpMachine *machine, IIFrame *frame,
+                                 IRFunction *fn) {
+  size_t label_capacity = 8;
+  frame->labels = (IILabel *)malloc(label_capacity * sizeof(IILabel));
+  if (!frame->labels) {
+    ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+    return 0;
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *insn = &fn->instructions[i];
+    if (insn->op == IR_OP_LABEL && insn->text) {
+      if (frame->label_count >= label_capacity) {
+        label_capacity *= 2;
+        IILabel *grown =
+            (IILabel *)realloc(frame->labels, label_capacity * sizeof(IILabel));
+        if (!grown) {
+          ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+          return 0;
+        }
+        frame->labels = grown;
+      }
+      frame->labels[frame->label_count].label = insn->text;
+      frame->labels[frame->label_count].index = i;
+      frame->label_count++;
+    }
+  }
+  return 1;
+}
+
+/* A parameter whose address is taken needs real storage, not a register
+ * home: give it a slot and move the incoming value into it, so a write
+ * through the pointer and a read by name see the same bytes. */
+static int ii_home_addressed_parameters(IRInterpMachine *machine, IIFrame *frame,
+                                         IRFunction *fn) {
+  /* A scalar parameter whose address is taken gets a slot home now, so &p is
+   * a real address the way the backend homes it (before this, &p handed back
+   * the parameter's VALUE as an address). String and aggregate parameters
+   * stay register-resident: their values already ARE the addresses &p means. */
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *scan = &fn->instructions[i];
+    if (scan->op != IR_OP_ADDRESS_OF || scan->lhs.kind != IR_OPERAND_SYMBOL ||
+        !scan->lhs.name) {
+      continue;
+    }
+    IIVar *var = ii_env_find(&frame->env, scan->lhs.name);
+    if (!var || var->slotted) {
+      continue; /* only parameters live in the frame this early */
+    }
+    const char *ptype = NULL;
+    for (size_t p = 0; p < fn->parameter_count; p++) {
+      if (fn->parameter_names[p] &&
+          strcmp(fn->parameter_names[p], scan->lhs.name) == 0) {
+        ptype = fn->parameter_types ? fn->parameter_types[p] : NULL;
+        break;
+      }
+    }
+    int psize = 8, pfloat = 0, punsigned = 0;
+    long long pcount = 1;
+    if (!ptype || strcmp(ptype, "string") == 0 ||
+        !ii_parse_local_type(ptype, &psize, &pcount, &pfloat, &punsigned) ||
+        pcount != 1) {
+      continue;
+    }
+    unsigned long long addr = ii_add_buffer_ex(machine, NULL, psize, 1);
+    if (!addr ||
+        !ii_frame_own(frame, (size_t)((addr - II_ADDR_BASE) /
+                                       II_ADDR_STRIDE))) {
+      ii_fail(machine, IR_INTERP_TRAP, "parameter home allocation");
+      return 0;
+    }
+    IRInterpValue incoming = var->value;
+    var->slotted = 1;
+    var->slot_size = psize;
+    var->slot_is_float = pfloat;
+    var->slot_is_unsigned = punsigned;
+    var->has_local_storage = 1;
+    var->value = ii_int_value((long long)addr);
+    if (!ii_var_write(machine, var, &incoming)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Bind each parameter into the frame, narrowed to its declared width the way
+ * the callee's home for it is. A parameter reassigned in the body wraps there
+ * too. A string parameter gets its own copy of the 16-byte record, owned by
+ * the frame, so a callee writing through it cannot reach the caller's. */
+static int ii_bind_parameters(IRInterpMachine *machine, IIFrame *frame,
+                              IRFunction *fn, const IRInterpValue *args,
+                              size_t arg_count) {
   for (size_t i = 0; i < fn->parameter_count && i < arg_count; i++) {
-    IIVar *var = ii_env_upsert(&frame.env, fn->parameter_names[i]);
+    IIVar *var = ii_env_upsert(&frame->env, fn->parameter_names[i]);
     if (!var) {
       ii_fail(machine, IR_INTERP_TRAP, "out of memory");
-      goto done;
+      return 0;
     }
     {
       int psize = 8, pfloat = 0, punsigned = 0;
       long long pcount = 1;
-      const char *ptype =
-          fn->parameter_types ? fn->parameter_types[i] : NULL;
+      const char *ptype = fn->parameter_types ? fn->parameter_types[i] : NULL;
       if (ptype && ii_parse_local_type(ptype, &psize, &pcount, &pfloat,
                                        &punsigned) &&
           pcount == 1) {
@@ -3968,10 +4642,10 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       if (src) {
         unsigned long long copy = ii_add_buffer_ex(machine, NULL, 16, 1);
         if (!copy ||
-            !ii_frame_own(&frame, (size_t)((copy - II_ADDR_BASE) /
-                                           II_ADDR_STRIDE))) {
+            !ii_frame_own(frame,
+                          (size_t)((copy - II_ADDR_BASE) / II_ADDR_STRIDE))) {
           ii_fail(machine, IR_INTERP_TRAP, "string parameter copy");
-          goto done;
+          return 0;
         }
         memcpy(machine->buffers[(copy - II_ADDR_BASE) / II_ADDR_STRIDE].data,
                src->data + src_off, 16);
@@ -3987,79 +4661,33 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       var->value.f = (double)(float)var->value.f;
     }
   }
+  return 1;
+}
 
-  /* Pre-scan: label table + address-taken local set. */
-  size_t label_capacity = 8;
-  frame.labels = (IILabel *)malloc(label_capacity * sizeof(IILabel));
-  if (!frame.labels) {
-    ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
+                            const IRInterpValue *args, size_t arg_count,
+                            IRInterpValue *result) {
+  if (machine->depth >= II_MAX_DEPTH) {
+    ii_fail(machine, IR_INTERP_DEPTH, fn->name ? fn->name : "?");
+    return 0;
+  }
+  machine->depth++;
+
+  IIFrame frame;
+  memset(&frame, 0, sizeof(frame));
+  frame.fn = fn;
+
+  int ok = 0;
+
+  if (!ii_bind_parameters(machine, &frame, fn, args, arg_count)) {
     goto done;
   }
-  for (size_t i = 0; i < fn->instruction_count; i++) {
-    const IRInstruction *insn = &fn->instructions[i];
-    if (insn->op == IR_OP_LABEL && insn->text) {
-      if (frame.label_count >= label_capacity) {
-        label_capacity *= 2;
-        IILabel *grown =
-            (IILabel *)realloc(frame.labels, label_capacity * sizeof(IILabel));
-        if (!grown) {
-          ii_fail(machine, IR_INTERP_TRAP, "out of memory");
-          goto done;
-        }
-        frame.labels = grown;
-      }
-      frame.labels[frame.label_count].label = insn->text;
-      frame.labels[frame.label_count].index = i;
-      frame.label_count++;
-    }
-  }
 
-  /* A scalar parameter whose address is taken gets a slot home now, so &p is
-   * a real address the way the backend homes it (before this, &p handed back
-   * the parameter's VALUE as an address). String and aggregate parameters
-   * stay register-resident: their values already ARE the addresses &p means. */
-  for (size_t i = 0; i < fn->instruction_count; i++) {
-    const IRInstruction *scan = &fn->instructions[i];
-    if (scan->op != IR_OP_ADDRESS_OF || scan->lhs.kind != IR_OPERAND_SYMBOL ||
-        !scan->lhs.name) {
-      continue;
-    }
-    IIVar *var = ii_env_find(&frame.env, scan->lhs.name);
-    if (!var || var->slotted) {
-      continue; /* only parameters live in the frame this early */
-    }
-    const char *ptype = NULL;
-    for (size_t p = 0; p < fn->parameter_count; p++) {
-      if (fn->parameter_names[p] &&
-          strcmp(fn->parameter_names[p], scan->lhs.name) == 0) {
-        ptype = fn->parameter_types ? fn->parameter_types[p] : NULL;
-        break;
-      }
-    }
-    int psize = 8, pfloat = 0, punsigned = 0;
-    long long pcount = 1;
-    if (!ptype || strcmp(ptype, "string") == 0 ||
-        !ii_parse_local_type(ptype, &psize, &pcount, &pfloat, &punsigned) ||
-        pcount != 1) {
-      continue;
-    }
-    unsigned long long addr = ii_add_buffer_ex(machine, NULL, psize, 1);
-    if (!addr ||
-        !ii_frame_own(&frame, (size_t)((addr - II_ADDR_BASE) /
-                                       II_ADDR_STRIDE))) {
-      ii_fail(machine, IR_INTERP_TRAP, "parameter home allocation");
-      goto done;
-    }
-    IRInterpValue incoming = var->value;
-    var->slotted = 1;
-    var->slot_size = psize;
-    var->slot_is_float = pfloat;
-    var->slot_is_unsigned = punsigned;
-    var->has_local_storage = 1;
-    var->value = ii_int_value((long long)addr);
-    if (!ii_var_write(machine, var, &incoming)) {
-      goto done;
-    }
+  if (!ii_build_label_table(machine, &frame, fn)) {
+    goto done;
+  }
+  if (!ii_home_addressed_parameters(machine, &frame, fn)) {
+    goto done;
   }
 
   long long *exec_counts = ii_counts_for(machine, fn);
@@ -4140,229 +4768,19 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
     }
 
     case IR_OP_DECLARE_LOCAL: {
-      if (insn->dest.kind != IR_OPERAND_SYMBOL || !insn->dest.name) {
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, "local declaration form");
+      if (!ii_op_declare_local(machine, &frame, fn, insn)) {
         goto done;
       }
-      IIVar *var = ii_env_upsert(&frame.env, insn->dest.name);
-      if (!var) {
-        ii_fail(machine, IR_INTERP_TRAP, "out of memory");
-        goto done;
-      }
-      const MtlcType *vt = insn->value_type;
-      if (!vt && insn->text && machine->program) {
-        vt = ir_program_lookup_type(machine->program, insn->text);
-      }
-      if ((insn->text && strcmp(insn->text, "string") == 0) ||
-          (vt && vt->kind == MTLC_TYPE_STRING)) {
-        /* The string value convention: the local's value IS the address of a
-         * { chars, length } record, and address-of yields that value. Never
-         * slot-backed.
-         *
-         * The record has to exist from the declaration on. `var s: string;`
-         * followed by `s.chars = buf` stores through the local's value, and
-         * leaving that value poisoned made the store land nowhere: read_line
-         * and read_line_stdin -- which every program importing std/io carries
-         * -- trapped on every generated input, and 250-odd files reported
-         * them as unvalidated. A declaration with no initializer gives them
-         * a zeroed record, which is the storage the compiled program gets.
-         * An initializer overwrites the value with its own record's address
-         * on the next instruction, exactly as before. */
-        var->slotted = 0;
-        var->agg_size = 0;
-        var->value_size = 8;
-        var->value_is_unsigned = 1;
-        if (var->string_record) {
-          long long offset = 0;
-          IIBuffer *buf =
-              ii_addr_to_buffer(machine, var->string_record, 16, &offset);
-          if (buf) {
-            memset(buf->data + offset, 0, 16);
-            ii_mark_bytes(buf, offset, 16, 1);
-            var->value = ii_int_value((long long)var->string_record);
-            pc++;
-            break;
-          }
-        }
-        {
-          unsigned long long addr = ii_add_buffer_ex(machine, NULL, 16, 1);
-          if (!addr) {
-            ii_fail(machine, IR_INTERP_TRAP, "string record allocation");
-            goto done;
-          }
-          if (!ii_frame_own(&frame, (size_t)((addr - II_ADDR_BASE) /
-                                             II_ADDR_STRIDE))) {
-            ii_fail(machine, IR_INTERP_TRAP, "out of memory");
-            goto done;
-          }
-          memset(machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE].data,
-                 0, 16);
-          var->value = ii_int_value((long long)addr);
-          var->has_local_storage = 1;
-          var->string_record = addr;
-        }
-        pc++;
-        break;
-      }
-      int elem_size = 8, is_float = 0, is_unsigned = 0;
-      long long count = 1;
-      int parsed = ii_parse_local_type(insn->text, &elem_size, &count,
-                                       &is_float, &is_unsigned);
-      var->is_cstring = (insn->text && (strcmp(insn->text, "cstring") == 0 ||
-                                        strcmp(insn->text, "rawptr") == 0))
-                            ? 1
-                            : 0;
-      if (!parsed && vt &&
-          ii_scalar_from_mtlc(vt, &elem_size, &is_float, &is_unsigned)) {
-        /* Enum, pointer, or closure local behind a named type. */
-        parsed = 1;
-      }
-      if (!parsed && vt &&
-          (vt->kind == MTLC_TYPE_STRUCT || vt->kind == MTLC_TYPE_ARRAY ||
-           vt->kind == MTLC_TYPE_TAGGED_ENUM) &&
-          vt->size > 0) {
-        /* Aggregate local: storage of the type's size, reached through
-         * address-of; whole-value assignment is a block copy. */
-        long long agg_size = (long long)vt->size;
-        if (var->has_local_storage && var->value.i) {
-          long long offset = 0;
-          IIBuffer *buf = ii_addr_to_buffer(
-              machine, (unsigned long long)var->value.i, agg_size, &offset);
-          if (buf) {
-            memset(buf->data + offset, II_POISON_BYTE, (size_t)agg_size);
-            ii_mark_bytes(buf, offset, agg_size, 0);
-            pc++;
-            break;
-          }
-        }
-        unsigned long long addr = ii_add_buffer_ex(machine, NULL, agg_size, 1);
-        if (!addr) {
-          ii_fail(machine, IR_INTERP_TRAP, "local storage allocation");
-          goto done;
-        }
-        if (!ii_frame_own(&frame, (size_t)((addr - II_ADDR_BASE) /
-                                           II_ADDR_STRIDE))) {
-          ii_fail(machine, IR_INTERP_TRAP, "out of memory");
-          goto done;
-        }
-        memset(machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE].data,
-               II_POISON_BYTE, (size_t)agg_size);
-        ii_mark_bytes(&machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE],
-                      0, agg_size, 0);
-        var->value = ii_int_value((long long)addr);
-        var->slotted = 0;
-        var->agg_size = agg_size;
-        var->has_local_storage = 1;
-        pc++;
-        break;
-      }
-      if (!parsed) {
-        char what[96];
-        snprintf(what, sizeof(what), "local type '%s'",
-                 insn->text ? insn->text : "?");
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, what);
-        goto done;
-      }
-      /* Arrays always get storage; scalars only when their address is
-       * taken somewhere in the function (aliasing must be observable). */
-      int need_slot = count > 1;
-      if (!need_slot) {
-        for (size_t i = 0; i < fn->instruction_count; i++) {
-          const IRInstruction *scan = &fn->instructions[i];
-          if (scan->op == IR_OP_ADDRESS_OF &&
-              scan->lhs.kind == IR_OPERAND_SYMBOL && scan->lhs.name &&
-              strcmp(scan->lhs.name, insn->dest.name) == 0) {
-            need_slot = 1;
-            break;
-          }
-        }
-      }
-      if (need_slot) {
-        unsigned long long addr = 0;
-        if (var->has_local_storage && var->value.i) {
-          /* Re-executed declaration (a loop body's local): the same storage,
-           * poisoned again the way a reused stack slot is. */
-          long long offset = 0;
-          IIBuffer *buf = ii_addr_to_buffer(machine,
-                                            (unsigned long long)var->value.i,
-                                            count * elem_size, &offset);
-          if (buf) {
-            ii_mark_bytes(buf, offset, count * elem_size, 0);
-            memset(buf->data + offset, II_POISON_BYTE,
-                   (size_t)(count * elem_size));
-            addr = (unsigned long long)var->value.i;
-          }
-        }
-        if (!addr) {
-          addr = ii_add_buffer_ex(machine, NULL, count * elem_size, 1);
-          if (!addr) {
-            ii_fail(machine, IR_INTERP_TRAP, "local storage allocation");
-            goto done;
-          }
-          if (!ii_frame_own(&frame, (size_t)((addr - II_ADDR_BASE) /
-                                             II_ADDR_STRIDE))) {
-            ii_fail(machine, IR_INTERP_TRAP, "out of memory");
-            goto done;
-          }
-          /* Local storage is stack memory: poison it (heap `new` stays
-           * zeroed, matching HEAP_ZERO_MEMORY in codegen). */
-          memset(machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE].data,
-                 II_POISON_BYTE, (size_t)(count * elem_size));
-          ii_mark_bytes(
-              &machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE], 0,
-              count * elem_size, 0);
-          var->has_local_storage = 1;
-        }
-        var->value = ii_int_value((long long)addr);
-        var->slotted = count == 1; /* arrays are accessed via &, not by name */
-        var->slot_size = elem_size;
-        var->slot_is_float = is_float;
-        var->slot_is_unsigned = is_unsigned;
-      } else {
-        var->value = ii_poison_value();
-        var->slotted = 0;
-        if (is_float) {
-          var->value.is_float = 1;
-          var->value.f = -6510615.5; /* deterministic float poison */
-          var->value.i = 0;
-        }
-      }
-      /* Remember the declared integer width even when the local lives in a
-       * "register" here, so a write wraps at the width the program asked for.
-       * Pointers are already 8 bytes; a float32 home rounds writes to single
-       * precision (the -4 marker). */
-      var->value_size = is_float ? (elem_size == 4 ? -4 : 0) : elem_size;
-      var->value_is_unsigned = is_unsigned;
       pc++;
       break;
     }
-
     case IR_OP_ASSIGN: {
-      IRInterpValue value;
-      if (insn->lhs.kind == IR_OPERAND_STRING && insn->lhs.name &&
-          insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
-        IIVar *dest = ii_env_find(&frame.env, insn->dest.name);
-        if (dest && dest->is_cstring) {
-          unsigned long long chars = 0, record = 0;
-          if (!ii_string_literal(machine, insn->lhs.name, &chars, &record)) {
-            goto done;
-          }
-          value = ii_int_value((long long)chars);
-          if (!ii_store_dest(machine, &frame, &insn->dest, &value)) {
-            goto done;
-          }
-          pc++;
-          break;
-        }
-      }
-      if (!ii_fetch(machine, &frame, &insn->lhs, &value) ||
-          !ii_store_dest(machine, &frame, &insn->dest, &value)) {
+      if (!ii_op_assign(machine, &frame, insn)) {
         goto done;
       }
       pc++;
       break;
     }
-
     case IR_OP_ADDRESS_OF: {
       if (insn->lhs.kind != IR_OPERAND_SYMBOL || !insn->lhs.name) {
         ii_fail(machine, IR_INTERP_UNSUPPORTED, "address-of non-symbol");
@@ -4399,102 +4817,19 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
     }
 
     case IR_OP_LOAD: {
-      unsigned long long addr;
-      long long size;
-      if (!ii_fetch_addr(machine, &frame, &insn->lhs, &addr) ||
-          !ii_fetch_int(machine, &frame, &insn->rhs, &size)) {
-        goto done;
-      }
-      if (size != 1 && size != 2 && size != 4 && size != 8) {
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, "load size");
-        goto done;
-      }
-      unsigned long long raw;
-      if (!ii_mem_read(machine, addr, (int)size, &raw)) {
-        goto done;
-      }
-      IRInterpValue value;
-      if (insn->is_float) {
-        if (size == 4) {
-          float f;
-          unsigned int bits = (unsigned int)raw;
-          memcpy(&f, &bits, 4);
-          value = ii_float_value((double)f);
-        } else {
-          double d;
-          memcpy(&d, &raw, 8);
-          value = ii_float_value(d);
-        }
-      } else {
-        value = ii_int_value(
-            ii_widen_loaded_int(raw, (int)size, insn->is_unsigned));
-      }
-      value.undefined = machine->last_read_undefined;
-      if (!ii_store_dest(machine, &frame, &insn->dest, &value)) {
+      if (!ii_op_load(machine, &frame, insn)) {
         goto done;
       }
       pc++;
       break;
     }
-
     case IR_OP_STORE: {
-      unsigned long long addr;
-      long long size;
-      IRInterpValue value;
-      if (!ii_fetch_addr(machine, &frame, &insn->dest, &addr) ||
-          !ii_fetch_int(machine, &frame, &insn->rhs, &size) ||
-          !ii_fetch(machine, &frame, &insn->lhs, &value)) {
-        goto done;
-      }
-      if (size != 1 && size != 2 && size != 4 && size != 8) {
-        /* Wider than a machine word: this is the block-copy form, where the
-         * value operand is the SOURCE ADDRESS rather than a value (whole-struct
-         * assignment, and the copy of an aggregate literal's constant image).
-         * Both regions are checked before either is touched. */
-        unsigned long long source = (unsigned long long)ii_as_int(&value);
-        long long dest_offset = 0;
-        long long source_offset = 0;
-        IIBuffer *dest_buffer =
-            ii_addr_to_buffer(machine, addr, size, &dest_offset);
-        IIBuffer *source_buffer =
-            ii_addr_to_buffer(machine, source, size, &source_offset);
-        if (!dest_buffer || !source_buffer) {
-          ii_fail(machine, IR_INTERP_TRAP,
-                  "block copy out of bounds / after free");
-          goto done;
-        }
-        memmove(dest_buffer->data + dest_offset,
-                source_buffer->data + source_offset, (size_t)size);
-        pc++;
-        break;
-      }
-      unsigned long long raw;
-      if (value.is_float || insn->is_float) {
-        if (size == 4) {
-          float f = (float)ii_as_float(&value);
-          unsigned int bits;
-          memcpy(&bits, &f, 4);
-          raw = bits;
-        } else if (size == 8) {
-          double d = ii_as_float(&value);
-          memcpy(&raw, &d, 8);
-        } else {
-          raw = (unsigned long long)ii_as_int(&value);
-        }
-        /* An int value stored with an int-typed instruction keeps int bits. */
-        if (!value.is_float && !insn->is_float) {
-          raw = (unsigned long long)value.i;
-        }
-      } else {
-        raw = (unsigned long long)value.i;
-      }
-      if (!ii_mem_write(machine, addr, (int)size, raw)) {
+      if (!ii_op_store(machine, &frame, insn)) {
         goto done;
       }
       pc++;
       break;
     }
-
     case IR_OP_BINARY: {
       IRInterpValue a, b, out;
       if (!ii_fetch(machine, &frame, &insn->lhs, &a) ||
@@ -4511,36 +4846,12 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
     }
 
     case IR_OP_UNARY: {
-      IRInterpValue a, out;
-      if (!ii_fetch(machine, &frame, &insn->lhs, &a)) {
-        goto done;
-      }
-      const char *op = insn->text ? insn->text : "?";
-      if (strcmp(op, "-") == 0) {
-        if (insn->is_float || a.is_float) {
-          double v = ii_as_float(&a);
-          out = ii_float_value(insn->float_bits == 32 ? (double)(-(float)v) : -v);
-        } else {
-          out = ii_int_value((long long)(0ULL - (unsigned long long)a.i));
-        }
-      } else if (strcmp(op, "!") == 0) {
-        out = ii_int_value(a.is_float ? a.f == 0.0 : a.i == 0);
-      } else if (strcmp(op, "~") == 0) {
-        out = ii_int_value(~ii_as_int(&a));
-      } else if (strcmp(op, "+") == 0) {
-        out = a;
-      } else {
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, "unary op");
-        goto done;
-      }
-      out.undefined = a.undefined;
-      if (!ii_store_dest(machine, &frame, &insn->dest, &out)) {
+      if (!ii_op_unary(machine, &frame, insn)) {
         goto done;
       }
       pc++;
       break;
     }
-
     case IR_OP_ROTATE_ADD: {
       /* next = a + b; a = b; b = next  (dest=next, lhs=a, rhs=b) */
       IRInterpValue a, b;
@@ -4575,148 +4886,26 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
     }
 
     case IR_OP_SELECT: {
-      /* Fused form (text != NULL): cond = (lhs <cmp> arguments[1]). Plain
-       * form: cond = (lhs != 0). Then dest = cond ? rhs : arguments[0]. */
-      long long truth = 0;
-      if (insn->text && insn->argument_count > 1) {
-        IRInterpValue a, b;
-        if (!ii_fetch(machine, &frame, &insn->lhs, &a) ||
-            !ii_fetch(machine, &frame, &insn->arguments[1], &b)) {
-          goto done;
-        }
-        long long x = ii_as_int(&a), y = ii_as_int(&b);
-        const char *op = insn->text;
-        if (insn->is_unsigned) {
-          unsigned long long ux = (unsigned long long)x, uy = (unsigned long long)y;
-          truth = strcmp(op, "<") == 0    ? ux < uy
-                  : strcmp(op, "<=") == 0 ? ux <= uy
-                  : strcmp(op, ">") == 0  ? ux > uy
-                  : strcmp(op, ">=") == 0 ? ux >= uy
-                  : strcmp(op, "==") == 0 ? ux == uy
-                                          : ux != uy;
-        } else {
-          truth = strcmp(op, "<") == 0    ? x < y
-                  : strcmp(op, "<=") == 0 ? x <= y
-                  : strcmp(op, ">") == 0  ? x > y
-                  : strcmp(op, ">=") == 0 ? x >= y
-                  : strcmp(op, "==") == 0 ? x == y
-                                          : x != y;
-        }
-      } else {
-        IRInterpValue cond;
-        if (!ii_fetch(machine, &frame, &insn->lhs, &cond)) {
-          goto done;
-        }
-        truth = ii_as_int(&cond) != 0;
-      }
-      IRInterpValue out;
-      const IROperand *chosen =
-          truth ? &insn->rhs
-                : (insn->argument_count > 0 ? &insn->arguments[0] : NULL);
-      if (!chosen || !ii_fetch(machine, &frame, chosen, &out) ||
-          !ii_store_dest(machine, &frame, &insn->dest, &out)) {
+      if (!ii_op_select(machine, &frame, insn)) {
         goto done;
       }
       pc++;
       break;
     }
-
     case IR_OP_NEW: {
-      long long size = 8;
-      if (insn->rhs.kind == IR_OPERAND_INT && insn->rhs.int_value > 0) {
-        size = insn->rhs.int_value;
-      } else if (insn->rhs.kind != IR_OPERAND_NONE) {
-        if (!ii_fetch_int(machine, &frame, &insn->rhs, &size)) {
-          goto done;
-        }
-        if (size <= 0) {
-          size = 8;
-        }
-      }
-      unsigned long long addr = ir_interp_add_buffer(machine, NULL, size);
-      if (!addr) {
-        ii_fail(machine, IR_INTERP_TRAP, "new allocation");
-        goto done;
-      }
-      machine->buffers[machine->buffer_count - 1].alloc_line =
-          insn->location.line;
-      IRInterpValue value = ii_int_value((long long)addr);
-      if (!ii_store_dest(machine, &frame, &insn->dest, &value)) {
+      if (!ii_op_new(machine, &frame, insn)) {
         goto done;
       }
       pc++;
       break;
     }
-
     case IR_OP_CALL: {
-      if (!insn->text) {
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, "call without callee");
-        goto done;
-      }
-      IRInterpValue call_args[32];
-      size_t call_arg_count = insn->argument_count;
-      if (call_arg_count > 32) {
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, "call arity > 32");
-        goto done;
-      }
-      for (size_t i = 0; i < call_arg_count; i++) {
-        const IROperand *arg = &insn->arguments[i];
-        if (arg->kind == IR_OPERAND_STRING) {
-          unsigned long long chars = 0, record = 0;
-          if (!ii_string_literal(machine, arg->name, &chars, &record)) {
-            goto done;
-          }
-          call_args[i] = ii_int_value(
-              (long long)(ii_callee_param_is_cstring(machine, insn->text, i)
-                              ? chars
-                              : record));
-          continue;
-        }
-        if (!ii_fetch(machine, &frame, arg, &call_args[i])) {
-          goto done;
-        }
-      }
-      if (!ii_copy_aggregate_args(machine, &frame, insn->text, call_args,
-                                  call_arg_count)) {
-        goto done;
-      }
-      IRFunction *callee = ii_find_function(machine, insn->text);
-      IRInterpValue call_result = ii_int_value(0);
-      if (callee && callee->instruction_count > 0) {
-        if (!ii_exec_function(machine, callee, call_args, call_arg_count,
-                              &call_result)) {
-          goto done;
-        }
-      } else {
-        machine->current_call_loc = insn->location;
-        size_t buffers_before = machine->buffer_count;
-        int handled =
-            ii_extern_call(machine, insn->text, call_args, call_arg_count,
-                           &call_result);
-        /* Attribute any heap allocation the extern model made (malloc,
-         * calloc, realloc) to this call site for leak reporting. String
-         * runtime records stay unattributed: string storage has no free story
-         * yet, exactly like the concat records ii_binary makes, so reporting
-         * one and not the other would flag every interpolation as a leak. */
-        if (strncmp(insn->text, "mettle_string_", 14) != 0) {
-          for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
-            machine->buffers[bi].alloc_line = insn->location.line;
-          }
-        }
-        if (handled < 0 || machine->status != IR_INTERP_OK) {
-          if (machine->status == IR_INTERP_OK) {
-            ii_fail(machine, IR_INTERP_TRAP, "extern call trap");
-          }
-          goto done;
-        }
-      }
-      if (!ii_store_dest(machine, &frame, &insn->dest, &call_result)) {
+      if (!ii_op_call(machine, &frame, insn)) {
         goto done;
       }
       pc++;
       break;
     }
-
     case IR_OP_RETURN: {
       IRInterpValue value = ii_int_value(0);
       if (insn->lhs.kind != IR_OPERAND_NONE &&
@@ -4743,63 +4932,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
     }
 
     case IR_OP_CALL_INDIRECT: {
-      IRInterpValue target;
-      if (!ii_fetch(machine, &frame, &insn->lhs, &target)) {
-        goto done;
-      }
-      IRInterpValue call_args[32];
-      size_t call_arg_count = insn->argument_count;
-      if (call_arg_count > 32) {
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, "call arity > 32");
-        goto done;
-      }
-      for (size_t i = 0; i < call_arg_count; i++) {
-        const IROperand *arg = &insn->arguments[i];
-        if (arg->kind == IR_OPERAND_STRING) {
-          unsigned long long chars = 0, record = 0;
-          if (!ii_string_literal(machine, arg->name, &chars, &record)) {
-            goto done;
-          }
-          call_args[i] = ii_int_value((long long)record);
-          continue;
-        }
-        if (!ii_fetch(machine, &frame, arg, &call_args[i])) {
-          goto done;
-        }
-      }
-      const char *extern_name = NULL;
-      IRFunction *callee = ii_token_function(
-          machine, (unsigned long long)ii_as_int(&target), &extern_name);
-      IRInterpValue call_result = ii_int_value(0);
-      if (callee && callee->instruction_count > 0) {
-        if (callee->name &&
-            !ii_copy_aggregate_args(machine, &frame, callee->name, call_args,
-                                    call_arg_count)) {
-          goto done;
-        }
-        if (!ii_exec_function(machine, callee, call_args, call_arg_count,
-                              &call_result)) {
-          goto done;
-        }
-      } else if (extern_name) {
-        machine->current_call_loc = insn->location;
-        size_t buffers_before = machine->buffer_count;
-        int handled = ii_extern_call(machine, extern_name, call_args,
-                                     call_arg_count, &call_result);
-        for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
-          machine->buffers[bi].alloc_line = insn->location.line;
-        }
-        if (handled < 0 || machine->status != IR_INTERP_OK) {
-          if (machine->status == IR_INTERP_OK) {
-            ii_fail(machine, IR_INTERP_TRAP, "extern call trap");
-          }
-          goto done;
-        }
-      } else {
-        ii_fail(machine, IR_INTERP_TRAP, "indirect call to a non-function");
-        goto done;
-      }
-      if (!ii_store_dest(machine, &frame, &insn->dest, &call_result)) {
+      if (!ii_op_call_indirect(machine, &frame, insn)) {
         goto done;
       }
       pc++;
