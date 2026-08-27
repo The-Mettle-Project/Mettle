@@ -1,0 +1,258 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const DIM: int32 = 64;
+const VOXELS: int32 = 262144;
+const WIDTH: int32 = 200;
+const HEIGHT: int32 = 150;
+const MAX_STEPS: int32 = 192;
+const PASSES: int32 = 3;
+
+struct Hit {
+  t: float64;
+  vx: int32;
+  vy: int32;
+  vz: int32;
+  axis: int32;
+  sign: int32;
+  found: int32;
+}
+
+fn idx3(x: int32, y: int32, z: int32) -> int32 {
+  return (z * DIM + y) * DIM + x;
+}
+
+fn build_world(solid: uint8*, seed: uint32) {
+  var state: uint32 = seed;
+  var i: int32 = 0;
+  while (i < VOXELS) {
+    solid[i] = 0;
+    i += 1;
+  }
+  var z: int32 = 0;
+  while (z < DIM) {
+    var y: int32 = 0;
+    while (y < DIM) {
+      var x: int32 = 0;
+      while (x < DIM) {
+        state = state ^ (state << 13);
+        state = state ^ (state >> 17);
+        state = state ^ (state << 5);
+        var v: uint8 = 0;
+        if (y < 3) {
+          v = 1;
+        } else {
+          var col: int32 = (int32)(state % 1024);
+          var height: int32 = 4 + ((x * 7 + z * 13) % 19);
+          if (y < height && col < 210) {
+            v = 1;
+          }
+        }
+        solid[idx3(x, y, z)] = v;
+        x += 1;
+      }
+      y += 1;
+    }
+    z += 1;
+  }
+}
+
+fn trace(solid: uint8*, ox: float64, oy: float64, oz: float64,
+         dx: float64, dy: float64, dz: float64, h: Hit*) {
+  h->found = 0;
+  h->t = 0.0;
+  h->axis = 0;
+  h->sign = 0;
+
+  var x: int32 = (int32)ox;
+  var y: int32 = (int32)oy;
+  var z: int32 = (int32)oz;
+
+  var stepx: int32 = 1;
+  var stepy: int32 = 1;
+  var stepz: int32 = 1;
+  if (dx < 0.0) { stepx = -1; }
+  if (dy < 0.0) { stepy = -1; }
+  if (dz < 0.0) { stepz = -1; }
+
+  var idx: float64 = 1.0 / dx;
+  var idy: float64 = 1.0 / dy;
+  var idz: float64 = 1.0 / dz;
+  if (idx < 0.0) { idx = -idx; }
+  if (idy < 0.0) { idy = -idy; }
+  if (idz < 0.0) { idz = -idz; }
+
+  var bx: float64 = (float64)x;
+  var by: float64 = (float64)y;
+  var bz: float64 = (float64)z;
+
+  var tmx: float64 = 0.0;
+  var tmy: float64 = 0.0;
+  var tmz: float64 = 0.0;
+  if (stepx > 0) { tmx = (bx + 1.0 - ox) * idx; } else { tmx = (ox - bx) * idx; }
+  if (stepy > 0) { tmy = (by + 1.0 - oy) * idy; } else { tmy = (oy - by) * idy; }
+  if (stepz > 0) { tmz = (bz + 1.0 - oz) * idz; } else { tmz = (oz - bz) * idz; }
+
+  var t: float64 = 0.0;
+  var axis: int32 = 0;
+  var steps: int32 = 0;
+  while (steps < MAX_STEPS) {
+    if (x < 0 || y < 0 || z < 0 || x >= DIM || y >= DIM || z >= DIM) {
+      return;
+    }
+    if (solid[idx3(x, y, z)] != 0) {
+      h->found = 1;
+      h->t = t;
+      h->vx = x;
+      h->vy = y;
+      h->vz = z;
+      h->axis = axis;
+      if (axis == 0) { h->sign = stepx; }
+      if (axis == 1) { h->sign = stepy; }
+      if (axis == 2) { h->sign = stepz; }
+      return;
+    }
+    if (tmx < tmy && tmx < tmz) {
+      t = tmx;
+      tmx = tmx + idx;
+      x += stepx;
+      axis = 0;
+    } else if (tmy < tmz) {
+      t = tmy;
+      tmy = tmy + idy;
+      y += stepy;
+      axis = 1;
+    } else {
+      t = tmz;
+      tmz = tmz + idz;
+      z += stepz;
+      axis = 2;
+    }
+    steps += 1;
+  }
+}
+
+fn shade(solid: uint8*, h: Hit*, dx: float64, dy: float64, dz: float64) -> float64 {
+  var nx: float64 = 0.0;
+  var ny: float64 = 0.0;
+  var nz: float64 = 0.0;
+  if (h->axis == 0) { nx = (float64)(-h->sign); }
+  if (h->axis == 1) { ny = (float64)(-h->sign); }
+  if (h->axis == 2) { nz = (float64)(-h->sign); }
+
+  var lambert: float64 = nx * 0.5 + ny * 0.75 + nz * 0.25;
+  if (lambert < 0.0) {
+    lambert = 0.0;
+  }
+  var atten: float64 = 1.0 / (1.0 + h->t * 0.0625);
+  var base: float64 = 0.125 + lambert * 0.75;
+
+  var rx: float64 = dx;
+  var ry: float64 = dy;
+  var rz: float64 = dz;
+  if (h->axis == 0) { rx = -dx; }
+  if (h->axis == 1) { ry = -dy; }
+  if (h->axis == 2) { rz = -dz; }
+
+  var ox: float64 = (float64)h->vx + 0.5 + nx * 0.75;
+  var oy: float64 = (float64)h->vy + 0.5 + ny * 0.75;
+  var oz: float64 = (float64)h->vz + 0.5 + nz * 0.75;
+
+  var bounce: Hit;
+  trace(solid, ox, oy, oz, rx, ry, rz, &bounce);
+  if (bounce.found != 0) {
+    base = base * 0.5;
+  } else {
+    base = base + 0.125;
+  }
+  return base * atten;
+}
+
+fn render(solid: uint8*, out_hits: int32*) -> uint64 {
+  var h: uint64 = 14695981039346656037;
+  var hits: int32 = 0;
+  var ox: float64 = 32.5;
+  var oy: float64 = 40.5;
+  var oz: float64 = 2.5;
+
+  var py: int32 = 0;
+  while (py < HEIGHT) {
+    var v: float64 = ((float64)py / (float64)HEIGHT - 0.5) * 2.0;
+    var px: int32 = 0;
+    while (px < WIDTH) {
+      var u: float64 = ((float64)px / (float64)WIDTH - 0.5) * 2.0;
+      var dx: float64 = u * 1.5 + 0.0009765625;
+      var dy: float64 = -v + 0.0009765625;
+      var dz: float64 = 1.0;
+
+      var hit: Hit;
+      trace(solid, ox, oy, oz, dx, dy, dz, &hit);
+      var shade_v: float64 = 0.0;
+      if (hit.found != 0) {
+        hits += 1;
+        shade_v = shade(solid, &hit, dx, dy, dz);
+      }
+      var q: int32 = (int32)(shade_v * 255.0);
+      if (q < 0) { q = 0; }
+      if (q > 255) { q = 255; }
+      h = h ^ (uint64)q;
+      h = h * 1099511628211;
+      px += 1;
+    }
+    py += 1;
+  }
+  *out_hits = hits;
+  return h;
+}
+
+fn round_trip(solid: uint8*, out_hits: int32*) -> uint64 {
+  build_world(solid, 2463534242);
+  var hits: int32 = 0;
+  var r: uint64 = render(solid, &hits);
+  var h: uint64 = 1469598103934665603;
+  h = h * 1000003 + r;
+  h = h * 31 + (uint64)hits;
+  *out_hits = hits;
+  return h;
+}
+
+fn main() -> int32 {
+  var solid: uint8* = malloc((int64)VOXELS);
+  if (solid == 0) {
+    println("malloc failed");
+    return 1;
+  }
+
+  println("Voxel trace: {DIM}^3 grid, {WIDTH}x{HEIGHT} rays, DDA with one bounce");
+
+  var hits: int32 = 0;
+  var check: uint64 = round_trip(solid, &hits);
+  println("  primary hits = {hits}");
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    var h2: int32 = 0;
+    bench_hash = bench_hash * 1000003 + round_trip(solid, &h2);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(solid);
+  return 0;
+}

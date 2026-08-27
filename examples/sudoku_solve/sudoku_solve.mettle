@@ -1,0 +1,258 @@
+import "std/io";
+import "std/mem";
+import "std/bench";
+
+const CELLS: int32 = 81;
+const DIGIT_MASK: int32 = 1022;
+const PUZZLES: int32 = 120;
+const REMOVE: int32 = 61;
+const PASSES: int32 = 3;
+
+struct Board {
+  cell: int32*;
+  rowmask: int32*;
+  colmask: int32*;
+  boxmask: int32*;
+  nodes: int64;
+}
+
+fn box_of(idx: int32) -> int32 {
+  return (idx / 27) * 3 + (idx % 9) / 3;
+}
+
+fn popcount9(v: int32) -> int32 {
+  var n: int32 = 0;
+  var x: int32 = v;
+  while (x != 0) {
+    x = x & (x - 1);
+    n += 1;
+  }
+  return n;
+}
+
+fn board_clear(b: Board*) {
+  var i: int32 = 0;
+  while (i < CELLS) {
+    b->cell[i] = 0;
+    i += 1;
+  }
+  i = 0;
+  while (i < 9) {
+    b->rowmask[i] = 0;
+    b->colmask[i] = 0;
+    b->boxmask[i] = 0;
+    i += 1;
+  }
+  b->nodes = 0;
+}
+
+fn place(b: Board*, idx: int32, d: int32) {
+  var bit: int32 = 1 << d;
+  b->cell[idx] = d;
+  b->rowmask[idx / 9] = b->rowmask[idx / 9] | bit;
+  b->colmask[idx % 9] = b->colmask[idx % 9] | bit;
+  b->boxmask[box_of(idx)] = b->boxmask[box_of(idx)] | bit;
+}
+
+fn unplace(b: Board*, idx: int32, d: int32) {
+  var bit: int32 = 1 << d;
+  b->cell[idx] = 0;
+  b->rowmask[idx / 9] = b->rowmask[idx / 9] & ~bit;
+  b->colmask[idx % 9] = b->colmask[idx % 9] & ~bit;
+  b->boxmask[box_of(idx)] = b->boxmask[box_of(idx)] & ~bit;
+}
+
+fn candidates(b: Board*, idx: int32) -> int32 {
+  var used: int32 = b->rowmask[idx / 9] | b->colmask[idx % 9] | b->boxmask[box_of(idx)];
+  return DIGIT_MASK & ~used;
+}
+
+fn solve(b: Board*) -> int32 {
+  b->nodes += 1;
+  var best: int32 = -1;
+  var best_count: int32 = 10;
+  var best_mask: int32 = 0;
+  var i: int32 = 0;
+  while (i < CELLS) {
+    if (b->cell[i] == 0) {
+      var mask: int32 = candidates(b, i);
+      var count: int32 = popcount9(mask);
+      if (count == 0) {
+        return 0;
+      }
+      if (count < best_count) {
+        best_count = count;
+        best = i;
+        best_mask = mask;
+        if (count == 1) {
+          i = CELLS;
+        }
+      }
+    }
+    i += 1;
+  }
+  if (best < 0) {
+    return 1;
+  }
+  var d: int32 = 1;
+  while (d <= 9) {
+    if ((best_mask >> d) & 1) {
+      place(b, best, d);
+      if (solve(b) != 0) {
+        return 1;
+      }
+      unplace(b, best, d);
+    }
+    d += 1;
+  }
+  return 0;
+}
+
+fn next_rand(state: uint32*) -> uint32 {
+  var s: uint32 = *state;
+  s = s ^ (s << 13);
+  s = s ^ (s >> 17);
+  s = s ^ (s << 5);
+  *state = s;
+  return s;
+}
+
+fn build_solved(grid: int32*, state: uint32*) {
+  var band: int32[3];
+  var stack: int32[3];
+  var i: int32 = 0;
+  while (i < 3) {
+    band[i] = i;
+    stack[i] = i;
+    i += 1;
+  }
+  i = 2;
+  while (i > 0) {
+    var j: int32 = (int32)(next_rand(state) % (uint32)(i + 1));
+    var tmp: int32 = band[i];
+    band[i] = band[j];
+    band[j] = tmp;
+    var k: int32 = (int32)(next_rand(state) % (uint32)(i + 1));
+    tmp = stack[i];
+    stack[i] = stack[k];
+    stack[k] = tmp;
+    i -= 1;
+  }
+  var shift: int32 = (int32)(next_rand(state) % 9);
+  var r: int32 = 0;
+  while (r < 9) {
+    var c: int32 = 0;
+    while (c < 9) {
+      var sr: int32 = band[r / 3] * 3 + r % 3;
+      var sc: int32 = stack[c / 3] * 3 + c % 3;
+      var v: int32 = (sr * 3 + sr / 3 + sc + shift) % 9 + 1;
+      grid[r * 9 + c] = v;
+      c += 1;
+    }
+    r += 1;
+  }
+}
+
+fn make_puzzle(b: Board*, grid: int32*, state: uint32*) {
+  board_clear(b);
+  var hole: int32[81];
+  var i: int32 = 0;
+  while (i < CELLS) {
+    hole[i] = 0;
+    i += 1;
+  }
+  var removed: int32 = 0;
+  var guard: int32 = 0;
+  while (removed < REMOVE && guard < 4000) {
+    var p: int32 = (int32)(next_rand(state) % (uint32)CELLS);
+    if (hole[p] == 0) {
+      hole[p] = 1;
+      removed += 1;
+    }
+    guard += 1;
+  }
+  i = 0;
+  while (i < CELLS) {
+    if (hole[i] == 0) {
+      place(b, i, grid[i]);
+    }
+    i += 1;
+  }
+}
+
+fn round_trip(b: Board*, grid: int32*) -> uint64 {
+  var state: uint32 = 2463534242;
+  var h: uint64 = 14695981039346656037;
+  var solved_count: int32 = 0;
+  var total_nodes: int64 = 0;
+  var p: int32 = 0;
+  while (p < PUZZLES) {
+    build_solved(grid, &state);
+    make_puzzle(b, grid, &state);
+    var ok: int32 = solve(b);
+    solved_count += ok;
+    total_nodes += b->nodes;
+    var i: int32 = 0;
+    while (i < CELLS) {
+      h = h ^ (uint64)b->cell[i];
+      h = h * 1099511628211;
+      i += 1;
+    }
+    h = h * 31 + (uint64)b->nodes;
+    p += 1;
+  }
+  h = h * 1000003 + (uint64)solved_count;
+  h = h * 31 + (uint64)total_nodes;
+  return h;
+}
+
+fn main() -> int32 {
+  var cell: int32* = malloc((int64)CELLS * 4);
+  var rowmask: int32* = malloc(36);
+  var colmask: int32* = malloc(36);
+  var boxmask: int32* = malloc(36);
+  var grid: int32* = malloc((int64)CELLS * 4);
+  if (cell == 0 || rowmask == 0 || colmask == 0 || boxmask == 0 || grid == 0) {
+    println("malloc failed");
+    return 1;
+  }
+  var b: Board;
+  b.cell = cell;
+  b.rowmask = rowmask;
+  b.colmask = colmask;
+  b.boxmask = boxmask;
+  b.nodes = 0;
+
+  println("Sudoku: {PUZZLES} puzzles, {REMOVE} holes each, MRV backtracking");
+
+  var check: uint64 = round_trip(&b, grid);
+  println("Checksum = {check}");
+
+  println("Benchmark: {PASSES} passes");
+
+  var t0: int64 = bench_time_us();
+  var bench_hash: uint64 = 0;
+  var pass: int32 = 0;
+  while (pass < PASSES) {
+    bench_hash = bench_hash * 1000003 + round_trip(&b, grid);
+    pass += 1;
+  }
+  var elapsed_us: int64 = bench_time_us() - t0;
+
+  println("Bench hash = {bench_hash}");
+  print("Time: ");
+  print("{elapsed_us}");
+  println(" us");
+
+  var per_pass: int64 = elapsed_us / PASSES;
+  print("Per pass: ~");
+  print("{per_pass}");
+  println(" us");
+
+  free(cell);
+  free(rowmask);
+  free(colmask);
+  free(boxmask);
+  free(grid);
+  return 0;
+}
