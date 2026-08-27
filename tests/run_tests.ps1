@@ -1474,6 +1474,10 @@ $cases = @(
   # An `enum` in a `comptime for` body: cloning a declaration kind the clone had
   # no case for left the node with no payload.
   @{ Name = "comptime_for_enum_declaration"; Path = "tests/test_comptime_for_enum_declaration.mettle"; ShouldSucceed = $true },
+  # A narrow integer read out of memory comes back as its declared type reads.
+  # int8/int16 loads widened with movzx whatever the element said, so a[0] set
+  # to -1 read back as 255 and the answer moved with the optimization level.
+  @{ Name = "narrow_signed_loads"; Path = "tests/test_narrow_signed_loads.mettle"; ShouldSucceed = $true },
   @{ Name = "integer_literal_wide"; Path = "tests/test_integer_literal_wide.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_mixed_locals"; Path = "tests/test_stack_mixed_locals.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_large_struct"; Path = "tests/test_stack_large_struct.mettle"; ShouldSucceed = $true },
@@ -2431,7 +2435,7 @@ $cases = @(
      OutputMustMatch = @("test string_literals_have_bytes \.\.\. ok",
                          "test aggregates_and_globals \.\.\. ok",
                          "test param_addresses_and_tokens \.\.\. ok",
-                         "test byte_loads_zero_extend \.\.\. ok",
+                         "test narrow_loads_follow_their_type \.\.\. ok",
                          "test loop_locals_do_not_exhaust \.\.\. ok",
                          "left: 1, right: 2")
      OutputMustNotMatch = @("unsupported", "leaked") },
@@ -7479,34 +7483,35 @@ foreach ($variant in @("release", "debug", "debug_fallback")) {
   }
 }
 
-# Byte-map lane widening: int8 arrays vectorized by the general byte map must
-# zero-extend into their int32 lanes (the movzx convention every scalar
-# backend follows). Release picked vpmovsxbd off the load's signedness flag
-# and a clamp over bytes >= 128 diverged from debug.
+# Byte-map lane widening: an int8 array vectorized by the general byte map must
+# sign-extend into its int32 lanes, the way the element type reads and the way
+# the scalar backends load it. The fixture clamps bytes that are negative as
+# int8 and checks the kernel against an unvectorizable reference beside it, so
+# a lane that widens the other way shows up as a checksum split.
 foreach ($variant in @("release", "debug")) {
   $total++
   try {
     if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
-    $exePath = Join-Path $tmpDir "test_byte_vloop_zero_extend_$variant.exe"
+    $exePath = Join-Path $tmpDir "test_byte_vloop_sign_extend_$variant.exe"
     $buildArgs = @("--build", "--emit-obj", "--linker", "internal")
     if ($variant -eq "release") { $buildArgs += "--release" }
-    $buildArgs += @("tests/test_byte_vloop_zero_extend.mettle", "-o", $exePath)
+    $buildArgs += @("tests/test_byte_vloop_sign_extend.mettle", "-o", $exePath)
 
     $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
-      throw "byte-vloop-zero-extend build ($variant) failed: $buildOut"
+      throw "byte-vloop-sign-extend build ($variant) failed: $buildOut"
     }
 
     & $exePath 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 1) {
-      throw "byte-vloop-zero-extend ($variant) miscompiled (exit $LASTEXITCODE)"
+    if ($LASTEXITCODE -ne 0) {
+      throw "byte-vloop-sign-extend ($variant) miscompiled (exit $LASTEXITCODE)"
     }
 
-    Write-CaseResult -Name "byte_vloop_zero_extend_$variant" -Passed $true
+    Write-CaseResult -Name "byte_vloop_sign_extend_$variant" -Passed $true
   }
   catch {
     $failed++
-    Write-CaseResult -Name "byte_vloop_zero_extend_$variant" -Passed $false -Reason $_.Exception.Message
+    Write-CaseResult -Name "byte_vloop_sign_extend_$variant" -Passed $false -Reason $_.Exception.Message
   }
 }
 

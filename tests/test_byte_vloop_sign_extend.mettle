@@ -1,0 +1,83 @@
+// Byte lanes widen the way the element type reads. An int8 array vectorized by
+// the general byte map must sign-extend into its int32 lanes, matching what the
+// scalar backends now do, so a clamp over bytes that are negative as int8 sees
+// the same values in debug, in release, and through the reference loop beside
+// it. The lane widening was pinned to zero-extension while the scalar load was:
+// `a[i] = 150` read back as 150 rather than -106, and the two disagreed.
+import "std/mem";
+
+fn dim(a: int8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = (int32)a[i];
+    if (v > 100) {
+      v = v - 100;
+    }
+    a[i] = (int8)v;
+    i = i + 1;
+  }
+}
+
+// The same clamp, written so no vectorizer recognizes it: the reference the
+// kernel above has to agree with.
+@noinline fn dim_reference(a: int8*, n: int64) -> int64 {
+  var acc: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int64 = (int64)a[i];
+    if (v > 100) {
+      v = v - 100;
+    }
+    acc = acc + v;
+    i = i + 1;
+  }
+  return acc;
+}
+
+fn fill(a: int8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    a[i] = (int8)(150 + i % 100);
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  var n: int64 = 256;
+
+  // A byte stored as 150 is -106 read back through an int8*, and every path
+  // has to say so before the checksums below mean anything.
+  var one: int8* = malloc(n);
+  one[0] = (int8)150;
+  if ((int64)(int32)one[0] != 0 - 106) {
+    free(one);
+    return 2;
+  }
+  if (one[0] >= (int8)0) {
+    free(one);
+    return 3;
+  }
+  free(one);
+
+  var a: int8* = malloc(n);
+  fill(a, n);
+  var want: int64 = dim_reference(a, n);
+
+  var b: int8* = malloc(n);
+  fill(b, n);
+  dim(b, n);
+  var got: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    got = got + (int64)(int32)b[i];
+    i = i + 1;
+  }
+
+  free(a);
+  free(b);
+
+  if (got != want) {
+    return 1;
+  }
+  return 0;
+}

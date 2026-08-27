@@ -74,17 +74,26 @@ fn apply(f: fn(int64) -> int64, v: int64) -> int64 {
   assert_eq(apply(&add1, 9), 10);
 }
 
-@test fn byte_loads_zero_extend() {
+@test fn narrow_loads_follow_their_type() {
   var b: int8* = malloc(4);
   b[0] = (int8)(0 - 56);
-  assert_eq((int64)(int32)b[0], 200);
+  assert_eq((int64)(int32)b[0], 0 - 56);
+  assert(b[0] < (int8)0);
   var h: int16* = malloc(8);
   h[0] = (int16)65000;
-  assert_eq((int64)(int32)h[0], 65000);
+  assert_eq((int64)(int32)h[0], 0 - 536);
+  var ub: uint8* = malloc(4);
+  ub[0] = (uint8)200;
+  assert_eq((int64)(int32)ub[0], 200);
+  var uh: uint16* = malloc(8);
+  uh[0] = (uint16)65000;
+  assert_eq((int64)(int32)uh[0], 65000);
   var local: int8 = (int8)(0 - 56);
   assert(local < 0);
   free(b);
   free(h);
+  free(ub);
+  free(uh);
 }
 
 @test fn loop_locals_do_not_exhaust() {

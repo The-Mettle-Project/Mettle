@@ -142,12 +142,11 @@ static int ir_decode_byte_indexed_load(IRFunction *function, size_t before,
                                       base_out)) {
     return 0;
   }
-  /* A byte load's lane value is the zero-extended byte regardless of the
-   * element's declared signedness: every scalar backend loads bytes with
-   * movzx (int8 -56 in memory reads back as 200). Honoring is_unsigned here
-   * made the kernel pick vpmovsxbd for int8 arrays, and a release-only
-   * clamp `if ((int32)a[i] > 100)` saw -106 where debug saw 150. */
-  *unsigned_out = 1;
+  /* The lane widens the way the scalar load does, which is the way the element
+   * type reads: a signed byte sign-extends, an unsigned one zero-extends. This
+   * was pinned to zero-extension while the scalar backends widened every byte
+   * with movzx, so an int8 -56 read back as 200 and the kernel had to match. */
+  *unsigned_out = load->is_unsigned ? 1 : 0;
   return 1;
 }
 

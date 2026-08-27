@@ -1,0 +1,80 @@
+// A narrow integer read out of memory comes back as its declared type reads.
+// int8 and int16 loads used to widen with movzx whatever the element type said,
+// so `a[0] = (int8)-1` read back as 255: `(int64)a[0]` was 255, `a[0] < a[1]`
+// compared 255 against 1, and the answer depended on the optimization level,
+// because SROA promoting an array to scalar locals swapped the memory
+// convention for the local one on the way past.
+
+import "std/mem";
+
+@noinline fn read8(p: int8*) -> int64 { return (int64)p[0]; }
+@noinline fn read16(p: int16*) -> int64 { return (int64)p[0]; }
+@noinline fn readu8(p: uint8*) -> int64 { return (int64)p[0]; }
+@noinline fn readu16(p: uint16*) -> int64 { return (int64)p[0]; }
+
+@noinline fn imin(p: int16*, n: int64) -> int64 {
+    var m: int16 = p[0];
+    var i: int64 = 1;
+    while (i < n) {
+        if (p[i] < m) {
+            m = p[i];
+        }
+        i = i + 1;
+    }
+    return (int64)m;
+}
+
+fn main() -> int32 {
+    // Signed elements sign-extend, through a local array and through a pointer.
+    var a8: int8[2];
+    a8[0] = (int8)-1;
+    a8[1] = (int8)1;
+    if ((int64)a8[0] != -1) { return 1; }
+    if (read8(&a8[0]) != -1) { return 2; }
+    if (!(a8[0] < a8[1])) { return 3; }
+    if (!(a8[0] < (int8)0)) { return 4; }
+
+    var a16: int16[2];
+    a16[0] = (int16)-1;
+    a16[1] = (int16)1;
+    if ((int64)a16[0] != -1) { return 5; }
+    if (read16(&a16[0]) != -1) { return 6; }
+    if (!(a16[0] < a16[1])) { return 7; }
+
+    // Unsigned elements still zero-extend.
+    var u8: uint8[2];
+    u8[0] = (uint8)255;
+    u8[1] = (uint8)1;
+    if ((int64)u8[0] != 255) { return 8; }
+    if (readu8(&u8[0]) != 255) { return 9; }
+    if (u8[0] < u8[1]) { return 10; }
+
+    var u16: uint16[2];
+    u16[0] = (uint16)65535;
+    u16[1] = (uint16)1;
+    if ((int64)u16[0] != 65535) { return 11; }
+    if (readu16(&u16[0]) != 65535) { return 12; }
+    if (u16[0] < u16[1]) { return 13; }
+
+    // The extremes, and a loop-carried narrow local compared against memory.
+    var e8: int8[3];
+    e8[0] = (int8)-128;
+    e8[1] = (int8)127;
+    e8[2] = (int8)0;
+    if ((int64)e8[0] != -128) { return 14; }
+    if ((int64)e8[1] != 127) { return 15; }
+
+    var w: int16[8];
+    w[0] = (int16)-16384; w[1] = (int16)-32768; w[2] = (int16)32767; w[3] = (int16)0;
+    w[4] = (int16)1;      w[5] = (int16)-1;     w[6] = (int16)16384; w[7] = (int16)-32768;
+    if (imin(&w[0], 8) != -32768) { return 16; }
+
+    // Heap memory reads the same way as a stack array.
+    var h: int8* = malloc(4);
+    h[0] = (int8)-56;
+    var heap: int64 = (int64)h[0];
+    free(h);
+    if (heap != -56) { return 17; }
+
+    return 0;
+}

@@ -2763,7 +2763,7 @@ int code_generator_binary_load_needs_sign_extend(
   const CgSym *symbol = NULL;
   (void)context;
 
-  if (load_size != 4 || !destination) {
+  if ((load_size != 1 && load_size != 2 && load_size != 4) || !destination) {
     return 0;
   }
 
@@ -2856,6 +2856,26 @@ int code_generator_binary_emit_load(CodeGenerator *generator,
    * Skip when dest is int32. A load tagged is_unsigned (uint8/16/32 pointee, set
    * at lowering) must stay zero-extended -- without this its high bits get sign-
    * extended and 64-bit ops (compare/divide/(int64) widening) read garbage. */
+  /* Same for a 1- or 2-byte load: the movzx above widens it, and a signed
+   * pointee has to come back as its own value before any 64-bit compare or
+   * widening reads it. A load of an unsigned pointee is tagged and stays
+   * zero-extended. */
+  if ((size == 1 || size == 2) && !instruction->is_float &&
+      !instruction->is_unsigned &&
+      code_generator_binary_load_needs_sign_extend(generator, context,
+                                                   &instruction->dest, size) &&
+      !(size == 1 ? binary_emit_movsx_reg_reg8(&context->code, value_register,
+                                               value_register)
+                  : binary_emit_movsx_reg_reg16(&context->code, value_register,
+                                                value_register))) {
+    if (!generator->has_error) {
+      code_generator_set_error(generator,
+                               "Out of memory while emitting IR load in "
+                               "function '%s'",
+                               context->function_name);
+    }
+    return 0;
+  }
   if (size == 4 && !instruction->is_float && !instruction->is_unsigned &&
       code_generator_binary_load_needs_sign_extend(generator, context,
                                                    &instruction->dest, size) &&

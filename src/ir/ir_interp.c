@@ -4410,12 +4410,18 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         }
       } else {
         long long v = (long long)raw;
-        /* Byte and half loads zero-extend regardless of signedness: the
-         * backends load them with movzx (int8 -56 in memory reads back as
-         * 200). Only 32-bit loads honor the signedness flag, where the
-         * widening cast's movsxd/mov choice is observable. */
-        if (size == 4 && !insn->is_unsigned) {
-          v = (long long)(int)(unsigned int)raw;
+        /* Every integer load narrower than a word comes back as its element
+         * type reads: signed sign-extends, unsigned zero-extends. Byte and
+         * half loads were pinned to zero-extension while the backends widened
+         * them with movzx whatever the type said. */
+        if (!insn->is_unsigned) {
+          if (size == 1) {
+            v = (long long)(signed char)raw;
+          } else if (size == 2) {
+            v = (long long)(short)raw;
+          } else if (size == 4) {
+            v = (long long)(int)(unsigned int)raw;
+          }
         }
         value = ii_int_value(v);
       }
