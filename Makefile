@@ -1,4 +1,5 @@
 CC = gcc
+PYTHON ?= python3
 # EXTRA_CFLAGS lets release builds stamp the version, e.g.
 #   make EXTRA_CFLAGS='-DMETTLE_VERSION_RAW=v0.13.0'
 # (bare token, stringified in main.c - avoids fragile quote escaping)
@@ -89,7 +90,7 @@ NM ?= nm
 LIBMTLC = $(BINDIR)/libmtlc.a
 TARGET = $(BINDIR)/mettle
 
-.PHONY: all clean test check install install-libmtlc dist-libmtlc bundle-stdlib bundle-runtime libmtlc
+.PHONY: all clean test check complexity install install-libmtlc dist-libmtlc bundle-stdlib bundle-runtime libmtlc
 
 all: $(TARGET) bundle-stdlib bundle-runtime
 libmtlc: $(LIBMTLC)
@@ -219,6 +220,11 @@ check: $(TARGET) bundle-stdlib bundle-runtime
 		echo "  install PowerShell Core: https://aka.ms/powershell"; \
 		exit 1; }
 	pwsh -NoProfile -File tests/run_tests.ps1 -CompilerPath $(TARGET)
+
+complexity:
+	$(PYTHON) tools/ci/complexity_audit.py --self-test
+	$(PYTHON) tools/ci/complexity_audit.py
+	$(PYTHON) tools/ci/complexity_audit.py --check
 
 # Install the full reference toolchain (the mettle driver + stdlib + runtime).
 install: $(TARGET) bundle-stdlib bundle-runtime

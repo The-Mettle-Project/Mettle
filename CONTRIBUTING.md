@@ -121,6 +121,31 @@ introduced a divergence. A silent miscompile that escapes review is the failure
 this gate exists to catch. The nightly workflow runs the heavy sweep, so run a
 local pass on anything that reaches the generated code.
 
+### Complexity budget
+
+Every function under `src/` and `include/` carries a cyclomatic complexity
+number: one, plus a count of the branch points in its body. The ceiling is 40.
+
+```bash
+make complexity                                 # audit, then gate
+python3 tools/ci/complexity_audit.py            # the audit on its own
+python3 tools/ci/complexity_audit.py --check    # what CI gates on
+```
+
+`tools/ci/complexity-budget.json` pins every function already past the ceiling
+at the number it carries today. Those are free to shrink and will fail the gate
+if they grow. A new function past the ceiling fails it too. Split the function.
+Where the debt is deliberate, record it with `--update-budget` and say why in
+the pull request.
+
+The audit prints a second column, `mcc`, which counts a `switch` once instead
+of once per `case`. A dispatch table over every opcode scores badly in `cc` and
+still reads cleanly on the page. Where `cc` and `mcc` sit close together, the
+branching is real.
+
+A breach that reaches `main` opens a GitHub issue carrying the full report, and
+that issue closes itself once `main` is back under budget.
+
 ## Making changes
 
 ### Optimizer and code generation
@@ -169,8 +194,8 @@ Build clean under GCC and Clang on your platform, run `tests\run_tests.ps1` on
 Windows, and run the differential fuzzer for anything touching generated code.
 
 CI runs Windows GCC with the full suite and the fuzz gate, Windows Clang for
-compilation, Linux GCC and Clang over the ELF backend, and Linux ASan and
-UBSan. All of them need to be green.
+compilation, Linux GCC and Clang over the ELF backend, Linux ASan and UBSan,
+and the complexity budget. All of them need to be green.
 
 Describe the change, the platforms you tested, and for optimizer or code
 generation work, how you established correctness: the fuzzer, `--verify`,

@@ -67,6 +67,47 @@ jobs:
           }
           if ($failed) { exit 1 }
 
+  complexity:
+    name: Complexity budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the scanner against its own cases
+        run: python3 tools/ci/complexity_audit.py --self-test
+
+      - name: Audit the tree
+        run: python3 tools/ci/complexity_audit.py --json "$RUNNER_TEMP/complexity.json"
+
+      - name: Gate on the budget
+        id: gate
+        continue-on-error: true
+        run: python3 tools/ci/complexity_audit.py --check
+
+      - name: Upload the measurements
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: complexity-audit
+          path: ${{ runner.temp }}/complexity.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Track a breach of the default branch as an issue
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 tools/ci/complexity_audit.py --sync-issue
+
+      - name: Fail when the budget is breached
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
   build-and-test:
     name: Build & test (windows gcc)
     runs-on: windows-latest
