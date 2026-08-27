@@ -40,6 +40,47 @@ static int enc_err(MirFunction *fn, const char *msg) {
 /* rbp-relative offset of a spilled vreg (mem = [rbp - offset]). */
 static int spill_off(const MirVreg *v) { return v->spill_offset; }
 
+/* Spill-home forwarding.
+ *
+ * A spilled value that is written and then immediately read back costs two
+ * memory operations to move a value that is already sitting in the register
+ * that just wrote it. The allocator produces long runs of this whenever a
+ * chain of instructions shares one coalesced slot: the counter update in a
+ * pressured loop stores, reloads, stores and reloads the same word.
+ *
+ * The only thing that makes forwarding unsound is something happening between
+ * the store and the load, and the code buffer answers that exactly: if its
+ * size has not moved, no instruction was emitted in between, so the register
+ * still holds what the slot holds. A label emits no bytes and would slip
+ * through that test, so control flow clears the record explicitly.
+ *
+ * An address-taken home is never forwarded: a pointer can write those bytes
+ * without going through this path at all. */
+typedef struct {
+  int valid;
+  int disp;
+  BinaryGpRegister reg;
+  size_t code_size;
+} MirHomeForward;
+
+static MirHomeForward g_home_fwd;
+
+static void home_fwd_clear(void) { g_home_fwd.valid = 0; }
+
+static void home_fwd_record(const BinaryCodeBuffer *code, int disp,
+                            BinaryGpRegister reg) {
+  g_home_fwd.valid = 1;
+  g_home_fwd.disp = disp;
+  g_home_fwd.reg = reg;
+  g_home_fwd.code_size = code->size;
+}
+
+static int home_fwd_has(const BinaryCodeBuffer *code, int disp,
+                        BinaryGpRegister reg) {
+  return g_home_fwd.valid && g_home_fwd.disp == disp &&
+         g_home_fwd.reg == reg && g_home_fwd.code_size == code->size;
+}
+
 /* Frame base register for stack slots: RSP when the frame pointer is omitted
  * (rbp is then free for allocation), otherwise RBP. */
 static BinaryGpRegister frame_base(const MirFunction *fn) {
@@ -63,6 +104,9 @@ static int gp_home_load(MirFunction *fn, const MirVreg *v,
   BinaryCodeBuffer *code = &fn->context->code;
   BinaryGpRegister base = frame_base(fn);
   int disp = frame_disp(fn, -spill_off(v));
+  if (!v->address_taken && home_fwd_has(code, disp, dst)) {
+    return 1;
+  }
   if (v->address_taken) {
     switch (v->home_width) {
     case 4:
@@ -344,8 +388,21 @@ static int store_from(MirFunction *fn, const MirOperand *dst,
       }
       return 1;
     }
-    return binary_emit_mov_mem_reg(code, frame_base(fn),
-                                   frame_disp(fn, -spill_off(v)), src_phys);
+    {
+      int disp = frame_disp(fn, -spill_off(v));
+      if (!v->address_taken && home_fwd_has(code, disp, src_phys)) {
+        /* The slot already holds this register's value and nothing has run
+         * since it was put there. */
+        return 1;
+      }
+      if (!binary_emit_mov_mem_reg(code, frame_base(fn), disp, src_phys)) {
+        return 0;
+      }
+      if (!v->address_taken) {
+        home_fwd_record(code, disp, src_phys);
+      }
+      return 1;
+    }
   }
   case MIR_OPK_PHYS:
     if ((BinaryGpRegister)dst->phys != src_phys) {
@@ -2454,6 +2511,7 @@ int mir_encode(MirFunction *fn) {
   size_t fused_mask_test = (size_t)-1;
   size_t prev_cmpbr = (size_t)-1;
 
+  home_fwd_clear();
   if (!mir_layout_frame(fn) || !mir_emit_prologue(fn)) {
     return 0;
   }
@@ -2503,6 +2561,14 @@ int mir_encode(MirFunction *fn) {
     const MirInst *in = &fn->insns[i];
     int ok = 1;
     size_t annot_off = ctx->code.size;
+    /* A label emits no bytes, so the code-size invariant cannot see that
+     * control can arrive here from a branch with a different register state.
+     * Anything that transfers control ends a forwarding window. */
+    if (in->op == MIR_LABEL || in->op == MIR_JMP || in->op == MIR_JCC ||
+        in->op == MIR_CMPBR || in->op == MIR_FCMPBR || in->op == MIR_CALL ||
+        in->op == MIR_RET) {
+      home_fwd_clear();
+    }
     if (in->op == MIR_LABEL && align_label && align_label[i]) {
       if (align_label[i] == 2) {
         ctx->wants_wide_loop_alignment = 1;
