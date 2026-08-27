@@ -104,6 +104,33 @@ run_one() {
     return
   fi
 
+  # Not a program: a kernel module, a declarations sidecar, a library of parts
+  # something else imports. Nothing to link and nothing to run.
+  if ! grep -qE '^[[:space:]]*(export[[:space:]]+)?fn[[:space:]]+main[[:space:]]*\(' "$source"; then
+    printf 'SKIP\t%s\tnot a program (no main)\n' "$source" > "$report"
+    return
+  fi
+
+  # A program that needs a companion object on the link line: a CUDA or PTX
+  # module, a hand-written kernel, a shared library this target cannot link.
+  # Listed one by one on purpose. Anything NOT here that fails to build is a
+  # regression and is reported as one, which is the point: a stale example used
+  # to look exactly like a deliberate skip, and guessing-game sat broken behind
+  # that until someone noticed by hand.
+  case "$source" in
+    */gpu_inference/decode_host.mettle|\
+    */gpu_minimal/scale_host.mettle|\
+    */gpu_vadd/vadd_host.mettle|\
+    */llm/qwen3/engine.mettle|\
+    */llm/qwen3/test_cuda.mettle|\
+    */llm/qwen3/gpu/*.mettle|\
+    */raylib/*.mettle)
+      printf 'SKIP\t%s\tneeds a companion object on the link line\n' \
+        "$source" > "$report"
+      return
+      ;;
+  esac
+
   local reference="" reference_rc="" reference_tag=""
   local spec tag mode exe build raw got rc
   local began
@@ -121,11 +148,11 @@ run_one() {
       why=$(printf '%s' "$build" |
             grep -m1 -E '^(error|warning\[|Code generation|Mettle internal)' |
             cut -c1-110)
-      if [ -z "$reference_tag" ]; then
-        printf 'SKIP\t%s\t%s\n' "$source" "$why" > "$report"
-      else
-        printf 'BUILD\t%s\t%s\t%s\n' "$source" "$tag" "$why" > "$report"
-      fi
+      # Failing in the FIRST mode used to report as a skip, which is how an
+      # example that stopped compiling stayed invisible. Everything reaching
+      # here is expected to build, so it is a failure whichever mode broke.
+      printf 'BUILD\t%s\t%s\t%s\n' \
+        "$source" "${reference_tag:-$tag}" "$why" > "$report"
       return
     fi
 

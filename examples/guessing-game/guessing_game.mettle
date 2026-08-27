@@ -31,11 +31,19 @@ fn read_char_win() -> int32 {
 
 // Read a line from stdin into buf (max 31 chars + null), return length
 // Consumes trailing \n after \r so Windows CRLF doesn't leave empty line in buffer
+// Returns the length read, or -1 at end of input. An empty line and a closed
+// stdin both used to answer 0, so a caller treating 0 as bad input looped on
+// EOF forever: piped into the game with nothing left to read, it printed the
+// invalid-input line a couple of million times a second.
 fn read_line_win(buf: cstring, max_len: int32) -> int32 {
   var i: int32 = 0;
   while (i < max_len) {
     var c: int32 = read_char_win();
     if (c == 10 || c == 13 || c < 0) {
+      if (c < 0 && i == 0) {
+        buf[0] = 0;
+        return 0 - 1;
+      }
       if (c == 13) {
         var next: int32 = read_char_win();
         if (next != 10 && next >= 0) {
@@ -85,6 +93,10 @@ fn main() -> int32 {
 
     var buf: uint8[32];
     var len: int32 = read_line_win(&buf[0], 31);
+    if (len < 0) {
+      // stdin is closed: there is nobody left to guess.
+      return 0;
+    }
     if (len == 0) {
       println(invalid);
       continue;
