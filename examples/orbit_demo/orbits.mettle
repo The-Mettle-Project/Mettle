@@ -25,6 +25,7 @@ import "std/io";
 import "std/mem";
 import "std/process";
 import "std/win32";
+import "std/math";   // sqrt/sin/cos: the owned ones, no libc on the link line
 import "std/bench";   // bench_time_us(): QueryPerformanceCounter high-res clock
 
 // --- Tunables ----------------------------------------------------------------
@@ -51,12 +52,8 @@ var DAMPING: float64     = 0.9995;
 var WELL_ATTRACT: float64 = 9500.0;
 var WELL_REPEL: float64   = -7500.0;
 var CENTER_MASS: float64  = 16000.0;
-var TAU: float64          = 6.28318530718;
 
 // --- C runtime + GDI bindings the stdlib doesn't already expose --------------
-extern fn c_sqrt(x: float64) -> float64 = "sqrt";
-extern fn c_sin(x: float64) -> float64  = "sin";
-extern fn c_cos(x: float64) -> float64  = "cos";
 extern fn c_sprintf(buf: cstring, fmt: cstring, a: int64, b: int64, c: int64, d: int64) -> int32 = "sprintf";
 
 extern fn Gdi_CreateCompatibleDC(hdc: int64) -> int64 = "CreateCompatibleDC";
@@ -229,13 +226,13 @@ fn reset_particles() {
   var i: int32 = 0;
   while (i < NUM_PARTICLES) {
     var pp: Particle* = &particles[i];
-    var ang: float64 = randf() * TAU;
+    var ang: float64 = randf() * TAU();
     var rad: float64 = 70.0 + randf() * ((float64)view_h * 0.42);
-    pp->x = cx + c_cos(ang) * rad;
-    pp->y = cy + c_sin(ang) * rad;
-    var v: float64 = c_sqrt(CENTER_MASS / rad) * 0.92;
-    pp->vx = 0.0 - c_sin(ang) * v;
-    pp->vy = c_cos(ang) * v;
+    pp->x = cx + cos(ang) * rad;
+    pp->y = cy + sin(ang) * rad;
+    var v: float64 = sqrt(CENTER_MASS / rad) * 0.92;
+    pp->vx = 0.0 - sin(ang) * v;
+    pp->vy = cos(ang) * v;
     set_trail(pp);
     i = i + 1;
   }
@@ -250,7 +247,7 @@ fn add_well(x: float64, y: float64, strength: float64) {
 }
 
 fn speed_index(pp: Particle*) -> int32 {
-  var sp: float64 = c_sqrt(pp->vx * pp->vx + pp->vy * pp->vy);
+  var sp: float64 = sqrt(pp->vx * pp->vx + pp->vy * pp->vy);
   var t: float64 = sp / SPEED_CAP;
   if (t > 1.0) { t = 1.0; }
   var idx: int32 = 6 + (int32)(t * (float64)(PAL - 1 - 6));
@@ -274,7 +271,7 @@ fn update_physics() {
       var dx: float64 = wells[w].x - pp->x;
       var dy: float64 = wells[w].y - pp->y;
       var denom: float64 = dx * dx + dy * dy + G_SOFTEN;
-      var inv: float64 = wells[w].strength / (denom * c_sqrt(denom));
+      var inv: float64 = wells[w].strength / (denom * sqrt(denom));
       ax = ax + inv * dx;
       ay = ay + inv * dy;
       w = w + 1;
@@ -283,7 +280,7 @@ fn update_physics() {
     pp->vx = (pp->vx + ax) * DAMPING;
     pp->vy = (pp->vy + ay) * DAMPING;
 
-    var sp: float64 = c_sqrt(pp->vx * pp->vx + pp->vy * pp->vy);
+    var sp: float64 = sqrt(pp->vx * pp->vx + pp->vy * pp->vy);
     if (sp > SPEED_CAP) {
       var s: float64 = SPEED_CAP / sp;
       pp->vx = pp->vx * s;

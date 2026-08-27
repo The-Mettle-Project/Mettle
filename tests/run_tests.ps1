@@ -4356,6 +4356,47 @@ catch {
 }
 
 
+# Examples nothing else builds. tools/examples-differential.sh skips anything
+# that reads stdin or opens a window, and it reports an example that fails to
+# build in the FIRST mode as a skip rather than a failure, so one of these
+# going stale looks exactly like one being interactive. guessing-game did go
+# stale: std/io gained a read_line, the example's own read_line collided with
+# it, and nothing noticed. Compile-only, because none of them can run
+# unattended.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $interactive = @(
+    "examples/guessing-game/guessing_game.mettle",
+    "examples/hello_ui/hello_ui.mettle",
+    "examples/orbit_demo/orbits.mettle",
+    "examples/testing/ui_test.mettle",
+    "examples/ui_demo/ui_demo.mettle"
+  )
+  $present = @($interactive | Where-Object { Test-Path $_ })
+  if ($present.Count -eq 0) {
+    throw "no interactive examples found to compile"
+  }
+
+  $builds = @()
+  foreach ($src in $present) {
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($src)
+    $builds += @{ File = $script:CompilerFullPath
+                  Args = @("--build", "--release", $src, "-o", (Join-Path $tmpDir "interactive_$stem.exe")) }
+  }
+  $buildResults = Invoke-InParallel -Commands $builds
+  for ($i = 0; $i -lt $present.Count; $i++) {
+    if ($buildResults[$i].ExitCode -ne 0) {
+      throw "$($present[$i]) no longer builds:`n$($buildResults[$i].Output)"
+    }
+  }
+  Write-CaseResult -Name "interactive_examples_compile" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "interactive_examples_compile" -Passed $false -Reason $_.Exception.Message
+}
+
 # --safe must not change what a correct program computes and must not reject
 # one. Real programs are what tests that: the fixtures above are written to
 # exercise a mechanism, while these were written to sort and encode and

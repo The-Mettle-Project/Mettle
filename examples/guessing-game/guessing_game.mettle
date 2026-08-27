@@ -1,7 +1,7 @@
 // Mettle Number Guessing Game
 //
 // The computer picks a random number 1-100. You guess until you get it right.
-// Demonstrates: std/io, std/conv, std/process, control flow, loops, extern.
+// Demonstrates: std/io, std/conv, std/process, std/bench, control flow, loops, extern.
 //
 // Build: build.bat
 // Run: guessing_game.exe
@@ -11,8 +11,8 @@
 import "std/io";
 import "std/conv";
 import "std/process";
+import "std/bench";   // bench_time_us(): the seed, with no CRT clock on the link line
 
-extern fn time(t: cstring) -> int64 = "time";
 extern fn GetStdHandle(which: int32) -> int64 = "GetStdHandle";
 extern fn ReadFile(h: int64, buf: cstring, len: int32, read: cstring, overlapped: cstring) -> int32 = "ReadFile";
 
@@ -31,7 +31,7 @@ fn read_char_win() -> int32 {
 
 // Read a line from stdin into buf (max 31 chars + null), return length
 // Consumes trailing \n after \r so Windows CRLF doesn't leave empty line in buffer
-fn read_line(buf: cstring, max_len: int32) -> int32 {
+fn read_line_win(buf: cstring, max_len: int32) -> int32 {
   var i: int32 = 0;
   while (i < max_len) {
     var c: int32 = read_char_win();
@@ -73,7 +73,7 @@ fn main() -> int32 {
   var guesses_label: string = "Guesses: ";
   var newline: string = "\n";
 
-  srand((int32)time(0));
+  srand((int32)bench_time_us());
   var target: int32 = rand_range_1_100();
   var guesses: int32 = 0;
 
@@ -84,7 +84,7 @@ fn main() -> int32 {
     print(prompt);
 
     var buf: uint8[32];
-    var len: int32 = read_line(&buf[0], 31);
+    var len: int32 = read_line_win(&buf[0], 31);
     if (len == 0) {
       println(invalid);
       continue;
