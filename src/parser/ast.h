@@ -58,7 +58,9 @@ typedef enum {
   AST_AGGREGATE_LITERAL,
   /* `comptime for f in typeof(T).fields { ... }`. Replaced by its expansions
    * during const eval, so no pass after the expander ever sees one. */
-  AST_COMPTIME_FOR
+  AST_COMPTIME_FOR,
+  /* Not a node kind: the number of them, so a table can be indexed by one. */
+  AST_NODE_TYPE_COUNT
 } ASTNodeType;
 
 /* SourceLocation moved to ../source_location.h so the backend IR can share it

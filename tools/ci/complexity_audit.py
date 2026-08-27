@@ -516,12 +516,16 @@ def issue_title(verdict):
         return "Complexity alarm: {} function{} past cc {}".format(
             alarming, "" if alarming == 1 else "s", verdict["alarm"])
     breaches = len(verdict["introduced"]) + len(verdict["regressed"])
-    if not breaches:
+    if breaches:
+        return "Complexity budget breached by {} function{}".format(
+            breaches, "" if breaches == 1 else "s")
+    unbalanced = len(verdict["unbalanced"])
+    if unbalanced:
         return "Complexity gate could not measure {} file{}".format(
-            len(verdict["unbalanced"]),
-            "" if len(verdict["unbalanced"]) == 1 else "s")
-    return "Complexity budget breached by {} function{}".format(
-        breaches, "" if breaches == 1 else "s")
+            unbalanced, "" if unbalanced == 1 else "s")
+    # Nothing to report. A clean tree closes the issue rather than titling one,
+    # and only --dry-run ever renders this.
+    return "Complexity budget holds"
 
 
 def issue_body(verdict, functions, files):
@@ -544,11 +548,17 @@ def issue_body(verdict, functions, files):
             "The complexity gate on the default branch found new debt "
             "against a ceiling of **{}** branches per function.".format(
                 ceiling))
-    else:
+    elif verdict["unbalanced"]:
         parts.append(
             "The complexity gate lost brace balance while reading the tree, "
             "so the functions in the files listed below went unmeasured and "
             "the numbers here are incomplete.")
+    else:
+        parts.append(
+            "The complexity gate on the default branch is under budget: "
+            "nothing was introduced over the ceiling of **{}** and nothing "
+            "recorded grew. A clean tree closes the issue rather than filing "
+            "this, so only `--dry-run` renders it.".format(ceiling))
 
     if repository and sha:
         parts.append("Measured on [`{}`]({}/{}/commit/{}) over `{}`.".format(

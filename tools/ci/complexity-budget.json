@@ -233,7 +233,6 @@
     "src/main.c::mettle_link_object_file": 180,
     "src/main.c::report_ptx_occupancy": 46,
     "src/main.c::write_kernel_declarations": 50,
-    "src/parser/ast.c::ast_clone_node": 192,
     "src/parser/ast.c::ast_destroy_node": 102,
     "src/parser/ast_dump.c::dump_node_data": 59,
     "src/parser/ast_print.c::print_expression": 46,
