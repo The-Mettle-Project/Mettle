@@ -4245,6 +4245,14 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
       options->emit_ptx || options->emit_spirv;
   int opt_ok = ir_optimize_program(ir_program, &ir_optimize_options);
   free(global_consts);
+  /* --safe describes a stack local at function entry, which outlives the block
+   * the declaration sits in. The optimizer is free to fold that block away, so
+   * retire the notes it left addressing locals that are no longer declared. */
+  if (opt_ok && options->safe && !options->emit_ptx && !options->emit_spirv &&
+      !ir_safety_retire_dangling_notes(ir_program)) {
+    mettle_compiler_ice_report("Failed to retire --safe stack notes", NULL);
+    return 0;
+  }
   if (!opt_ok) {
     /* A violated `@simd!` contract is a user error already printed with a
      * source location; don't bury it under a generic internal-error report. */

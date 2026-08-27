@@ -4187,6 +4187,38 @@ catch {
   Write-CaseResult -Name "safe_mode_stack" -Passed $false -Reason $_.Exception.Message
 }
 
+# --safe describes a stack local to the runtime at function entry, which is
+# outside the block that declares it. A tagged-enum constructor declares its
+# local where the value is built, so one built under a folded-away condition
+# left the description addressing a local that was no longer there, and the
+# backend refused the symbol. Every optimization level, because only the
+# optimized ones fold the branch.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $deadCtorSrc = "tests/test_safe_dead_ctor_local.mettle"
+  foreach ($flags in @(@(), @("--release"), @("--safe"), @("--safe", "--release"), @("--safe", "-O"))) {
+    $label = if ($flags.Count -eq 0) { "(none)" } else { $flags -join " " }
+    $exe = Join-Path $tmpDir ("safe_dead_ctor_{0}.exe" -f ($flags -join "_").Replace("-", ""))
+    $out = & $CompilerPath --build @flags $deadCtorSrc -o $exe 2>&1 | Out-String
+    if ($out -match "internal compiler error") {
+      throw "a constructor in a folded-away branch crashed the compiler at [$label]:`n$out"
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "build of $deadCtorSrc failed at [$label]:`n$out"
+    }
+    & $exe *> $null
+    if ($LASTEXITCODE -ne 0) {
+      throw "$deadCtorSrc returned $LASTEXITCODE at [$label], expected 0"
+    }
+  }
+  Write-CaseResult -Name "safe_dead_ctor_local" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_dead_ctor_local" -Passed $false -Reason $_.Exception.Message
+}
+
 # One check covering a whole loop's range is only honest when the loop really
 # does walk that range. The body may branch, so long as it rejoins and the
 # access sits ahead of the branch; a loop that can break out, or an access the

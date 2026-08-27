@@ -1,0 +1,50 @@
+// --safe registers each escaping stack local with the runtime at function
+// entry, so the note outlives the block that declares it. A tagged-enum
+// constructor declares its local where the value is built, so building one
+// under a condition the optimizer folds away left the note taking the address
+// of a local that no longer existed, and the backend refused the symbol.
+//
+// The live paths still have to work, so the folded branch sits beside real
+// ones that build the same enum.
+
+enum Opt {
+    Yes(int64),
+    No,
+}
+
+fn classify(n: int64) -> int64 {
+    var s: Opt;
+    if (1 == 2) {
+        s = No;
+    }
+    if (n > 0) {
+        s = Yes(n * 2);
+    } else {
+        s = No;
+    }
+    match (s) {
+        case Yes(v): { return v; }
+        default: { return -1; }
+    }
+}
+
+fn unreachable_payload(n: int64) -> int64 {
+    var s: Opt;
+    if (n != n) {
+        s = Yes(n);
+    }
+    return n + 1;
+}
+
+fn main() -> int32 {
+    if (classify(20) != 40) {
+        return 1;
+    }
+    if (classify(0) != -1) {
+        return 2;
+    }
+    if (unreachable_payload(5) != 6) {
+        return 3;
+    }
+    return 0;
+}

@@ -46,4 +46,10 @@ int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats);
  * failure. */
 int ir_safety_register_allocations(IRProgram *program);
 
+/* Drop the stack notes whose local the optimizer removed. Runs after
+ * optimization: a note is emitted at function entry for a local declared
+ * anywhere in the body, so folding away the block that declared it leaves the
+ * note addressing a slot that is no longer there. */
+int ir_safety_retire_dangling_notes(IRProgram *program);
+
 #endif /* IR_SAFETY_H */

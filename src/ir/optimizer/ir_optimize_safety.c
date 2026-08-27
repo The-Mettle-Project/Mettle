@@ -3524,6 +3524,89 @@ static int safety_describe_globals(IRProgram *program, IRFunction *entry) {
   return 1;
 }
 
+/* A stack local is described at function entry, so the note outlives the block
+ * the declaration sits in. When the optimizer folds that block away - a
+ * constructor built under `if (1 == 2)`, say - the declaration goes and the
+ * note is left taking the address of a local that no longer exists, which the
+ * backend refuses. Nothing can reach an undeclared slot, so the note has
+ * nothing left to describe: retire it and the address it took.
+ *
+ * Only stack notes. A global has no declaration in any function by
+ * construction, and its note is exactly as good as it ever was. */
+static int safety_retire_stack_notes(const IRProgram *program,
+                                     IRFunction *function) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *call = &function->instructions[i];
+    if (call->op != IR_OP_CALL || !call->text || call->argument_count < 1 ||
+        !call->arguments) {
+      continue;
+    }
+    if (strcmp(call->text, "mettle_safety_register") != 0 &&
+        strcmp(call->text, "mettle_safety_unregister") != 0) {
+      continue;
+    }
+    const IROperand *argument = &call->arguments[0];
+    if (argument->kind != IR_OPERAND_TEMP || !argument->name) {
+      continue;
+    }
+
+    /* The address is taken immediately before the call it feeds. */
+    IRInstruction *take = NULL;
+    for (size_t back = i; back-- > 0;) {
+      IRInstruction *candidate = &function->instructions[back];
+      if (candidate->op == IR_OP_NOP) {
+        continue;
+      }
+      if (candidate->op == IR_OP_ADDRESS_OF &&
+          candidate->dest.kind == IR_OPERAND_TEMP && candidate->dest.name &&
+          strcmp(candidate->dest.name, argument->name) == 0) {
+        take = candidate;
+      }
+      break;
+    }
+    if (!take || take->lhs.kind != IR_OPERAND_SYMBOL || !take->lhs.name) {
+      continue;
+    }
+    if (ir_program_lookup_symbol(program, take->lhs.name)) {
+      continue;
+    }
+
+    int declared = 0;
+    for (size_t d = 0; d < function->instruction_count; d++) {
+      const IRInstruction *candidate = &function->instructions[d];
+      if (candidate->op == IR_OP_DECLARE_LOCAL &&
+          candidate->dest.kind == IR_OPERAND_SYMBOL && candidate->dest.name &&
+          strcmp(candidate->dest.name, take->lhs.name) == 0) {
+        declared = 1;
+        break;
+      }
+    }
+    if (declared) {
+      continue;
+    }
+    if (safety_trace_enabled()) {
+      fprintf(stderr, "safety: retiring note for %s in %s\n", take->lhs.name,
+              function->name ? function->name : "?");
+    }
+    ir_instruction_make_nop(take);
+    ir_instruction_make_nop(call);
+  }
+  return 1;
+}
+
+int ir_safety_retire_dangling_notes(IRProgram *program) {
+  if (!program) {
+    return 1;
+  }
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *function = program->functions[i];
+    if (function && !safety_retire_stack_notes(program, function)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int ir_safety_register_allocations(IRProgram *program) {
   if (!program) {
     return 1;
