@@ -755,8 +755,16 @@ static int irv_setup_machine(IRInterpMachine *machine, IRFunction *shape,
       }
       unsigned int seed = 0x2545F491u ^ (unsigned int)(p * 7919u) ^
                           (unsigned int)(run * 104729u);
+      /* Most runs keep every field small, so a field used as a length or an
+       * index stays inside the buffers beside it and the run stays usable. The
+       * last two spend that and set the high bits instead: a narrow signed
+       * field only reads differently from an unsigned one once bit 7 or bit 15
+       * is set, and while every run stayed under 24 no seeded input could tell
+       * sign extension from zero extension. */
+      int wide = run >= IRV_INPUT_RUNS - 2;
       for (long long b = 0; b < bytes; b++) {
-        init[b] = (unsigned char)(irv_lcg_next(&seed) % 24);
+        init[b] = wide ? (unsigned char)(irv_lcg_next(&seed) >> 13)
+                       : (unsigned char)(irv_lcg_next(&seed) % 24);
       }
       unsigned long long addr = ir_interp_add_buffer(machine, init, bytes);
       free(init);
