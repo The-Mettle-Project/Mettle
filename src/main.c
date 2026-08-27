@@ -12,6 +12,7 @@
 #include "codegen/gpu_detect.h"
 #include "codegen/ptx_emitter.h"
 #include "codegen/spirv_emitter.h"
+#include "linker/elf_image.h"
 #include "linker/pe_emitter.h"
 #include "string_intern.h"
 #include "compiler/compiler_context.h"
@@ -966,6 +967,77 @@ static int mettle_elf_keep_symbols(const CompilerOptions *options) {
           compiler_options_use_profile_runtime(options));
 }
 
+static int mettle_elf_external_linker_requested(const CompilerOptions *options) {
+  if (!options) {
+    return 0;
+  }
+  return options->linker_mode == LINKER_MODE_GCC ||
+         options->linker_mode == LINKER_MODE_MSVC;
+}
+
+static int mettle_link_elf_native(const char *startup_object,
+                                  const char *object_filename,
+                                  const char *executable_filename,
+                                  const char *freestanding_object,
+                                  const char *const *extra_objects,
+                                  size_t extra_object_count,
+                                  int strip_symbols) {
+  const char *object_paths[32];
+  unsigned char runtime_defaults[32];
+  LinkResolutionOptions resolution_options = {"_start", 16u, 0, NULL};
+  ElfImageOptions emission_options = {0x400000u, 0x1000u, 0};
+  LinkResolution *resolution = NULL;
+  char *error_message = NULL;
+  size_t count = 0u;
+  size_t i = 0u;
+  int result = 1;
+
+  if (!startup_object || !object_filename || !executable_filename ||
+      !freestanding_object ||
+      extra_object_count > sizeof(object_paths) / sizeof(object_paths[0]) - 3u) {
+    return 1;
+  }
+
+  object_paths[count] = startup_object;
+  runtime_defaults[count++] = 1u;
+  object_paths[count] = freestanding_object;
+  runtime_defaults[count++] = 1u;
+  for (i = 0u; i < extra_object_count; i++) {
+    if (!extra_objects[i]) {
+      continue;
+    }
+    object_paths[count] = extra_objects[i];
+    runtime_defaults[count++] = 1u;
+  }
+  object_paths[count] = object_filename;
+  runtime_defaults[count++] = 0u;
+
+  resolution_options.object_is_runtime_default = runtime_defaults;
+  emission_options.strip_symbols = strip_symbols;
+
+  if (!link_resolution_build(object_paths, count, &resolution_options,
+                             &resolution, &error_message)) {
+    fprintf(stderr, "Error: Native ELF link failed: %s\n",
+            error_message ? error_message : "symbol resolution failed");
+    free(error_message);
+    return 1;
+  }
+
+  if (!elf_image_emit_executable(resolution, executable_filename,
+                                 &emission_options, &error_message)) {
+    fprintf(stderr, "Error: Native ELF link failed: %s\n",
+            error_message ? error_message : "image emission failed");
+    free(error_message);
+    link_resolution_destroy(resolution);
+    return 1;
+  }
+
+  free(error_message);
+  link_resolution_destroy(resolution);
+  result = 0;
+  return result;
+}
+
 /* Link a static ELF image from Mettle owned startup and runtime objects. */
 static int mettle_link_elf_direct(const char *startup_object,
                                   const char *object_filename,
@@ -1140,8 +1212,17 @@ static int mettle_link_elf_executable(const char *object_filename,
     extra_objects[extra_object_count++] = profile_object;
   }
 
-  /* Use ld directly when no caller link arguments need driver parsing. */
   if (!(options && options->link_argument_count > 0) &&
+      !mettle_elf_external_linker_requested(options) &&
+      mettle_link_elf_native(startup_object, object_filename,
+                             executable_filename, freestanding_object,
+                             (const char *const *)extra_objects,
+                             extra_object_count,
+                             !mettle_elf_keep_symbols(options)) == 0) {
+    result = 0;
+  }
+
+  if (result != 0 && !(options && options->link_argument_count > 0) &&
       mettle_link_elf_direct(startup_object, object_filename,
                              executable_filename, freestanding_object,
                              (const char *const *)extra_objects,

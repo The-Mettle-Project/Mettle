@@ -43,6 +43,8 @@ static size_t link_section_index_from_kind(LinkSectionKind kind) {
     return 4u;
   case LINK_SECTION_KIND_XDATA:
     return 5u;
+  case LINK_SECTION_KIND_TLS:
+    return 6u;
   case LINK_SECTION_KIND_UNKNOWN:
   default:
     return LINKED_SECTION_INDEX_NONE;
@@ -343,8 +345,18 @@ typedef struct {
   size_t section_index;
 } GcWorkItem;
 
+static int link_section_is_granular(const char *name) {
+  if (!name) {
+    return 0;
+  }
+  if (strchr(name, '$')) {
+    return 1;
+  }
+  return name[0] == '.' && strchr(name + 1, '.') != NULL;
+}
+
 static int link_section_is_gc_eligible(const LinkSection *section) {
-  if (!section->name || !strchr(section->name, '$')) {
+  if (!link_section_is_granular(section->name)) {
     return 0;
   }
   switch (section->kind) {
@@ -684,7 +696,8 @@ static int link_resolution_merge_sections(LinkResolution *resolution,
         return 0;
       }
 
-      if (section->kind != LINK_SECTION_KIND_BSS) {
+      if (section->kind != LINK_SECTION_KIND_BSS &&
+          section->size_of_raw_data != 0u) {
         if (!link_section_reserve_data(merged, start + section->size_of_raw_data,
                                        error_message_out)) {
           return 0;

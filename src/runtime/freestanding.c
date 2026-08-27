@@ -1346,6 +1346,7 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #define MT_SYS_RT_SIGACTION 13
 #define MT_SYS_GETCWD 79
 #define MT_SYS_MKDIR 83
+#define MT_SYS_CHMOD 90
 #define MT_SYS_NEWFSTATAT 262
 #define MT_SYS_GETDENTS64 217
 #define MT_SYS_READLINKAT 267
@@ -1390,6 +1391,7 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #define MT_SYS_GETCWD 17
 #define MT_SYS_DUP3 24
 #define MT_SYS_MKDIRAT 34
+#define MT_SYS_FCHMODAT 53
 #define MT_SYS_FACCESSAT 48
 #define MT_SYS_PIPE2 59
 #define MT_SYS_READLINKAT 78
@@ -1758,6 +1760,16 @@ int mkdir(const char *path, unsigned int mode) {
       mt_syscall6(MT_SYS_MKDIR, (mt_i64)path, mode, 0, 0, 0, 0));
 #else
   return (int)mt_sys_result(mt_syscall6(MT_SYS_MKDIRAT, MT_AT_FDCWD,
+                                        (mt_i64)path, mode, 0, 0, 0));
+#endif
+}
+
+int chmod(const char *path, unsigned int mode) {
+#if defined(__x86_64__)
+  return (int)mt_sys_result(
+      mt_syscall6(MT_SYS_CHMOD, (mt_i64)path, mode, 0, 0, 0, 0));
+#else
+  return (int)mt_sys_result(mt_syscall6(MT_SYS_FCHMODAT, MT_AT_FDCWD,
                                         (mt_i64)path, mode, 0, 0, 0));
 #endif
 }
