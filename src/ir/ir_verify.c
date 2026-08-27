@@ -885,11 +885,25 @@ static int irv_compare_observations(IRInterpMachine *before,
     }
   }
 
-  /* Input buffers exist in both machines by construction. */
+  /* Input buffers exist in both machines by construction. A run that hands one
+   * back to the OS (munmap, VirtualFree) releases the bytes with it, so a
+   * released buffer reads as absent: two runs that both released it agree, and
+   * only one of them doing so is the divergence. */
   for (size_t i = 0; i < input_buffer_count; i++) {
     long long size_a = 0, size_b = 0;
     const unsigned char *a = ir_interp_buffer_data(before, i, &size_a);
     const unsigned char *b = ir_interp_buffer_data(after, i, &size_b);
+    int freed_a = ir_interp_buffer_freed(before, i);
+    int freed_b = ir_interp_buffer_freed(after, i);
+    if (freed_a != freed_b) {
+      snprintf(why, why_capacity,
+               "input buffer %zu was released on %s side only", i,
+               freed_a ? "the pre-pass" : "the post-pass");
+      return 0;
+    }
+    if (freed_a) {
+      continue;
+    }
     if (!a || !b || size_a != size_b) {
       snprintf(why, why_capacity, "input buffer %zu shape changed", i);
       return 0;

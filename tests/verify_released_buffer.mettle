@@ -1,0 +1,20 @@
+import "std/osmem";
+
+fn touch_and_release(p: cstring, n: int64) -> int64 {
+    if (p == 0) {
+        return 0;
+    }
+    var sum: int64 = 0;
+    var i: int64 = 0;
+    while (i < n) {
+        sum = sum + (int64)p[i];
+        i = i + 1;
+    }
+    os_mem_unmap(p, n);
+    return sum;
+}
+
+fn main() -> int32 {
+    var p: cstring = os_mem_map(4096);
+    return (int32)(touch_and_release(p, 16) & 255);
+}

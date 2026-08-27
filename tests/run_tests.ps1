@@ -2389,6 +2389,13 @@ $cases = @(
   @{ Name = "verify_fuel_asymmetry"; Path = "tests/verify_fuel_asymmetry.mettle"; ShouldSucceed = $true
      Args = @("--verify")
      OutputMustNotMatch = @("MISCOMPILE", "removed a trap") },
+  # Handing a buffer back to the OS releases its bytes, so both runs read it as
+  # absent. That is agreement, not a shape change: os_mem_unmap once lost seven
+  # correct passes in every test that mapped a page.
+  @{ Name = "verify_released_buffer"; Path = "tests/verify_released_buffer.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     OutputMustMatch = @("translation validation: OK")
+     OutputMustNotMatch = @("MISCOMPILE") },
   @{ Name = "verify_sabotage_caught"; Path = "tests/verify_clean.mettle"; ShouldSucceed = $true
      Args = @("--verify")
      Env = @{ METTLE_VERIFY_BREAK = "constant_and_branch_simplify:dot" }
