@@ -114,7 +114,7 @@
     "src/ir/ir_comptime.c::ir_comptime_run_tests": 43,
     "src/ir/ir_comptime.c::ir_comptime_trace": 70,
     "src/ir/ir_interp.c::ii_binary": 60,
-    "src/ir/ir_interp.c::ii_exec_function": 306,
+    "src/ir/ir_interp.c::ii_exec_function": 115,
     "src/ir/ir_interp.c::ii_exec_simd": 430,
     "src/ir/ir_interp.c::ii_extern_call": 336,
     "src/ir/ir_lower_address.c::ir_lower_lvalue_address": 103,
