@@ -210,7 +210,6 @@ static uint64_t render(uint8_t *solid, int32_t *out_hits) {
 }
 
 static uint64_t round_trip(uint8_t *solid, int32_t *out_hits) {
-  build_world(solid, 2463534242ULL);
   int32_t hits = 0;
   uint64_t r = render(solid, &hits);
   uint64_t h = 1469598103934665603ULL;
@@ -228,6 +227,8 @@ int main(void) {
     }
 
     printf("Voxel trace: %d^3 grid, %dx%d rays, DDA with one bounce\n", DIM, WIDTH, HEIGHT);
+
+    build_world(solid, 2463534242ULL);
 
     int32_t hits = 0;
     uint64_t check = round_trip(solid, &hits);

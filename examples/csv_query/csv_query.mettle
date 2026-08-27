@@ -9,7 +9,7 @@ const PRODUCTS: int32 = 256;
 const MAP_SLOTS: int32 = 16384;
 const MAP_MASK: int32 = 16383;
 const TOP_K: int32 = 24;
-const PASSES: int32 = 5;
+const PASSES: int32 = 12;
 
 struct Group {
   key: uint64;
@@ -252,8 +252,7 @@ fn sort_groups(groups: Group*, lo: int32, hi: int32) {
   sort_groups(groups, i, hi);
 }
 
-fn round_trip(text: uint8*, slots: int32*, groups: Group*, out_groups: int32*) -> uint64 {
-  var len: int32 = generate_csv(text, 2463534242);
+fn round_trip(text: uint8*, len: int32, slots: int32*, groups: Group*, out_groups: int32*) -> uint64 {
   var used: int32 = ingest(text, len, slots, groups);
   sort_groups(groups, 0, used - 1);
 
@@ -291,8 +290,10 @@ fn main() -> int32 {
 
   println("CSV query: {ROWS} rows, {REGIONS} regions x {PRODUCTS} products, group-by then sort");
 
+  var text_len: int32 = generate_csv(text, 2463534242);
+
   var used: int32 = 0;
-  var check: uint64 = round_trip(text, slots, groups, &used);
+  var check: uint64 = round_trip(text, text_len, slots, groups, &used);
   println("  groups = {used}, top value = {groups[0].value}");
   println("Checksum = {check}");
 
@@ -303,7 +304,7 @@ fn main() -> int32 {
   var pass: int32 = 0;
   while (pass < PASSES) {
     var g2: int32 = 0;
-    bench_hash = bench_hash * 1000003 + round_trip(text, slots, groups, &g2);
+    bench_hash = bench_hash * 1000003 + round_trip(text, text_len, slots, groups, &g2);
     pass += 1;
   }
   var elapsed_us: int64 = bench_time_us() - t0;

@@ -207,7 +207,6 @@ fn render(solid: uint8*, out_hits: int32*) -> uint64 {
 }
 
 fn round_trip(solid: uint8*, out_hits: int32*) -> uint64 {
-  build_world(solid, 2463534242);
   var hits: int32 = 0;
   var r: uint64 = render(solid, &hits);
   var h: uint64 = 1469598103934665603;
@@ -225,6 +224,8 @@ fn main() -> int32 {
   }
 
   println("Voxel trace: {DIM}^3 grid, {WIDTH}x{HEIGHT} rays, DDA with one bounce");
+
+  build_world(solid, 2463534242);
 
   var hits: int32 = 0;
   var check: uint64 = round_trip(solid, &hits);

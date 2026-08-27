@@ -2,6 +2,7 @@ param(
     [string]$Compiler = "bin\mettle.exe",
     [string[]]$Benchmark = @(),
     [int[]]$Suite = @(),
+    [int[]]$Set = @(),
     [int]$Runs = 9,
     [int]$AffinityMask = 0x10,
     [string]$CC = "clang",
@@ -26,6 +27,9 @@ $want = @($want | Where-Object { $_ })
 if ($want.Count -gt 0) { $all = @($all | Where-Object { $want -contains $_.name }) }
 if ($Suite.Count -gt 0) {
     $all = @($all | Where-Object { $s = if ($null -ne $_.suite) { [int]$_.suite } else { 1 }; $Suite -contains $s })
+}
+if ($Set.Count -gt 0) {
+    $all = @($all | Where-Object { $t = if ($null -ne $_.set) { [int]$_.set } else { 1 }; $Set -contains $t })
 }
 if ($all.Count -eq 0) { throw "no benchmarks selected" }
 

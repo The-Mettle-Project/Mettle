@@ -8,7 +8,7 @@ const MAX_LINES: int32 = 320;
 const LINE_CAP: int32 = 64;
 const DP_STRIDE: int32 = 321;
 const MAX_OPS: int32 = 640;
-const PASSES: int32 = 3;
+const PASSES: int32 = 5;
 
 struct Doc {
   text: uint8*;
@@ -262,16 +262,41 @@ fn apply_patch(a: Doc*, b: Doc*, p: Patch*) -> int32 {
   return mismatch;
 }
 
-fn round_trip(a: Doc*, b: Doc*, dp: int32*, p: Patch*, out_lcs: int32*,
-              out_bad: int32*) -> uint64 {
+fn generate_pairs(a: Doc*, b: Doc*, ahash: int32*, bhash: int32*,
+                  acnt: int32*, bcnt: int32*) {
   var state: uint32 = 2463534242;
+  var doc: int32 = 0;
+  while (doc < DOCS) {
+    build_doc(a, &state, LINES_A);
+    derive_doc(b, a, &state);
+    var i: int32 = 0;
+    while (i < a->count) {
+      ahash[doc * MAX_LINES + i] = a->hash[i];
+      i += 1;
+    }
+    i = 0;
+    while (i < b->count) {
+      bhash[doc * MAX_LINES + i] = b->hash[i];
+      i += 1;
+    }
+    acnt[doc] = a->count;
+    bcnt[doc] = b->count;
+    doc += 1;
+  }
+}
+
+fn round_trip(a: Doc*, b: Doc*, dp: int32*, p: Patch*, ahash: int32*,
+              bhash: int32*, acnt: int32*, bcnt: int32*, out_lcs: int32*,
+              out_bad: int32*) -> uint64 {
   var h: uint64 = 1469598103934665603;
   var total_lcs: int32 = 0;
   var bad: int32 = 0;
   var doc: int32 = 0;
   while (doc < DOCS) {
-    build_doc(a, &state, LINES_A);
-    derive_doc(b, a, &state);
+    a->hash = ahash + doc * MAX_LINES;
+    a->count = acnt[doc];
+    b->hash = bhash + doc * MAX_LINES;
+    b->count = bcnt[doc];
     var lcs: int32 = lcs_fill(dp, a, b);
     total_lcs += lcs;
     var same: int32 = 0;
@@ -309,7 +334,12 @@ fn main() -> int32 {
   p.arg = malloc((int64)MAX_OPS * 4);
   p.count = 0;
   var dp: int32* = malloc((int64)DP_STRIDE * DP_STRIDE * 4);
-  if (a.text == 0 || b.text == 0 || dp == 0 || p.kind == 0) {
+  var ahash: int32* = malloc((int64)DOCS * MAX_LINES * 4);
+  var bhash: int32* = malloc((int64)DOCS * MAX_LINES * 4);
+  var acnt: int32* = malloc((int64)DOCS * 4);
+  var bcnt: int32* = malloc((int64)DOCS * 4);
+  if (a.text == 0 || b.text == 0 || dp == 0 || p.kind == 0 || ahash == 0 ||
+      bhash == 0 || acnt == 0 || bcnt == 0) {
     println("malloc failed");
     return 1;
   }
@@ -318,7 +348,10 @@ fn main() -> int32 {
 
   var lcs: int32 = 0;
   var bad: int32 = 0;
-  var check: uint64 = round_trip(&a, &b, dp, &p, &lcs, &bad);
+  generate_pairs(&a, &b, ahash, bhash, acnt, bcnt);
+
+  var check: uint64 = round_trip(&a, &b, dp, &p, ahash, bhash, acnt, bcnt,
+                                 &lcs, &bad);
   println("  total LCS = {lcs}, derived lines = {b.count}, patch ops = {p.count}");
   println("  patch mismatches = {bad}");
   println("Checksum = {check}");
@@ -331,7 +364,8 @@ fn main() -> int32 {
   while (pass < PASSES) {
     var l2: int32 = 0;
     var b2: int32 = 0;
-    bench_hash = bench_hash * 1000003 + round_trip(&a, &b, dp, &p, &l2, &b2);
+    bench_hash = bench_hash * 1000003 +
+                 round_trip(&a, &b, dp, &p, ahash, bhash, acnt, bcnt, &l2, &b2);
     pass += 1;
   }
   var elapsed_us: int64 = bench_time_us() - t0;
@@ -351,5 +385,9 @@ fn main() -> int32 {
   free(dp);
   free(p.kind);
   free(p.arg);
+  free(ahash);
+  free(bhash);
+  free(acnt);
+  free(bcnt);
   return 0;
 }

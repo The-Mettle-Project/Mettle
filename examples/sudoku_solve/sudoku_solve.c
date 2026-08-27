@@ -157,8 +157,7 @@ static void build_solved(int32_t *grid, uint32_t *state) {
   }
 }
 
-static void make_puzzle(Board *b, int32_t *grid, uint32_t *state) {
-  board_clear(b);
+static void make_puzzle(int32_t *dst, int32_t *grid, uint32_t *state) {
   int32_t hole[81];
   int32_t i = 0;
   while (i < CELLS) {
@@ -178,21 +177,42 @@ static void make_puzzle(Board *b, int32_t *grid, uint32_t *state) {
   i = 0;
   while (i < CELLS) {
     if (hole[i] == 0) {
-      place(b, i, grid[i]);
+      dst[i] = grid[i];
+    } else {
+      dst[i] = 0;
     }
     i += 1;
   }
 }
 
-static uint64_t round_trip(Board *b, int32_t *grid) {
+static void generate_puzzles(int32_t *puzzles, int32_t *grid) {
   uint32_t state = 2463534242ULL;
+  int32_t p = 0;
+  while (p < PUZZLES) {
+    build_solved(grid, &state);
+    make_puzzle(puzzles + p * CELLS, grid, &state);
+    p += 1;
+  }
+}
+
+static void load_puzzle(Board *b, int32_t *src) {
+  board_clear(b);
+  int32_t i = 0;
+  while (i < CELLS) {
+    if (src[i] != 0) {
+      place(b, i, src[i]);
+    }
+    i += 1;
+  }
+}
+
+static uint64_t round_trip(Board *b, int32_t *puzzles) {
   uint64_t h = 14695981039346656037ULL;
   int32_t solved_count = 0;
   int64_t total_nodes = 0;
   int32_t p = 0;
   while (p < PUZZLES) {
-    build_solved(grid, &state);
-    make_puzzle(b, grid, &state);
+    load_puzzle(b, puzzles + p * CELLS);
     int32_t ok = solve(b);
     solved_count += ok;
     total_nodes = total_nodes + b->nodes;
@@ -216,7 +236,9 @@ int main(void) {
     int32_t *colmask = (int32_t *)malloc(36);
     int32_t *boxmask = (int32_t *)malloc(36);
     int32_t *grid = (int32_t *)malloc((size_t)CELLS * 4);
-    if (cell == NULL || rowmask == NULL || colmask == NULL || boxmask == NULL || grid == NULL) {
+    int32_t *puzzles = (int32_t *)malloc((size_t)PUZZLES * CELLS * 4);
+    if (cell == NULL || rowmask == NULL || colmask == NULL || boxmask == NULL ||
+        grid == NULL || puzzles == NULL) {
         printf("malloc failed\n");
         return 1;
     }
@@ -229,7 +251,9 @@ int main(void) {
 
     printf("Sudoku: %d puzzles, %d holes each, MRV backtracking\n", PUZZLES, REMOVE);
 
-    uint64_t check = round_trip(&b, grid);
+    generate_puzzles(puzzles, grid);
+
+    uint64_t check = round_trip(&b, puzzles);
     printf("Checksum = %" PRIu64 "\n", check);
 
     printf("Benchmark: %d passes\n", PASSES);
@@ -238,7 +262,7 @@ int main(void) {
     uint64_t bench_hash = 0;
     int32_t pass = 0;
     while (pass < PASSES) {
-        bench_hash = bench_hash * 1000003 + round_trip(&b, grid);
+        bench_hash = bench_hash * 1000003 + round_trip(&b, puzzles);
         pass += 1;
     }
     uint64_t elapsed_us = bench_time_us() - t0;
@@ -254,5 +278,6 @@ int main(void) {
     free(colmask);
     free(boxmask);
     free(grid);
+    free(puzzles);
     return 0;
 }

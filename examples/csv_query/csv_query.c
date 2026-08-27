@@ -13,7 +13,7 @@
 #define MAP_SLOTS 16384
 #define MAP_MASK 16383
 #define TOP_K 24
-#define PASSES 5
+#define PASSES 12
 
 typedef struct {
     uint64_t key;
@@ -256,8 +256,7 @@ static void sort_groups(Group *groups, int32_t lo, int32_t hi) {
   sort_groups(groups, i, hi);
 }
 
-static uint64_t round_trip(uint8_t *text, int32_t *slots, Group *groups, int32_t *out_groups) {
-  int32_t len = generate_csv(text, 2463534242ULL);
+static uint64_t round_trip(uint8_t *text, int32_t len, int32_t *slots, Group *groups, int32_t *out_groups) {
   int32_t used = ingest(text, len, slots, groups);
   sort_groups(groups, 0, used - 1);
 
@@ -296,8 +295,10 @@ int main(void) {
     printf("CSV query: %d rows, %d regions x %d products, group-by then sort\n",
            ROWS, REGIONS, PRODUCTS);
 
+    int32_t text_len = generate_csv(text, 2463534242ULL);
+
     int32_t used = 0;
-    uint64_t check = round_trip(text, slots, groups, &used);
+    uint64_t check = round_trip(text, text_len, slots, groups, &used);
     printf("  groups = %d, top value = %" PRId64 "\n", used, groups[0].value);
     printf("Checksum = %" PRIu64 "\n", check);
 
@@ -308,7 +309,7 @@ int main(void) {
     int32_t pass = 0;
     while (pass < PASSES) {
         int32_t g2 = 0;
-        bench_hash = bench_hash * 1000003 + round_trip(text, slots, groups, &g2);
+        bench_hash = bench_hash * 1000003 + round_trip(text, text_len, slots, groups, &g2);
         pass += 1;
     }
     uint64_t elapsed_us = bench_time_us() - t0;

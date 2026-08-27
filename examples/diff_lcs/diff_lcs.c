@@ -12,7 +12,7 @@
 #define LINE_CAP 64
 #define DP_STRIDE 321
 #define MAX_OPS 640
-#define PASSES 3
+#define PASSES 5
 
 typedef struct {
     uint8_t *text;
@@ -265,15 +265,38 @@ static int32_t apply_patch(Doc *a, Doc *b, Patch *p) {
   return mismatch;
 }
 
-static uint64_t round_trip(Doc *a, Doc *b, int32_t *dp, Patch *p, int32_t *out_lcs, int32_t *out_bad) {
+static void generate_pairs(Doc *a, Doc *b, int32_t *ahash, int32_t *bhash, int32_t *acnt, int32_t *bcnt) {
   uint32_t state = 2463534242ULL;
+  int32_t doc = 0;
+  while (doc < DOCS) {
+    build_doc(a, &state, LINES_A);
+    derive_doc(b, a, &state);
+    int32_t i = 0;
+    while (i < a->count) {
+      ahash[doc * MAX_LINES + i] = a->hash[i];
+      i += 1;
+    }
+    i = 0;
+    while (i < b->count) {
+      bhash[doc * MAX_LINES + i] = b->hash[i];
+      i += 1;
+    }
+    acnt[doc] = a->count;
+    bcnt[doc] = b->count;
+    doc += 1;
+  }
+}
+
+static uint64_t round_trip(Doc *a, Doc *b, int32_t *dp, Patch *p, int32_t *ahash, int32_t *bhash, int32_t *acnt, int32_t *bcnt, int32_t *out_lcs, int32_t *out_bad) {
   uint64_t h = 1469598103934665603ULL;
   int32_t total_lcs = 0;
   int32_t bad = 0;
   int32_t doc = 0;
   while (doc < DOCS) {
-    build_doc(a, &state, LINES_A);
-    derive_doc(b, a, &state);
+    a->hash = ahash + doc * MAX_LINES;
+    a->count = acnt[doc];
+    b->hash = bhash + doc * MAX_LINES;
+    b->count = bcnt[doc];
     int32_t lcs = lcs_fill(dp, a, b);
     total_lcs += lcs;
     int32_t same = 0;
@@ -311,7 +334,12 @@ int main(void) {
     p.arg = (int32_t *)malloc((size_t)MAX_OPS * 4);
     p.count = 0;
     int32_t *dp = (int32_t *)malloc((size_t)DP_STRIDE * DP_STRIDE * 4);
-    if (a.text == NULL || b.text == NULL || dp == NULL || p.kind == NULL) {
+    int32_t *ahash = (int32_t *)malloc((size_t)DOCS * MAX_LINES * 4);
+    int32_t *bhash = (int32_t *)malloc((size_t)DOCS * MAX_LINES * 4);
+    int32_t *acnt = (int32_t *)malloc((size_t)DOCS * 4);
+    int32_t *bcnt = (int32_t *)malloc((size_t)DOCS * 4);
+    if (a.text == NULL || b.text == NULL || dp == NULL || p.kind == NULL ||
+        ahash == NULL || bhash == NULL || acnt == NULL || bcnt == NULL) {
         printf("malloc failed\n");
         return 1;
     }
@@ -321,7 +349,10 @@ int main(void) {
 
     int32_t lcs = 0;
     int32_t bad = 0;
-    uint64_t check = round_trip(&a, &b, dp, &p, &lcs, &bad);
+    generate_pairs(&a, &b, ahash, bhash, acnt, bcnt);
+
+    uint64_t check = round_trip(&a, &b, dp, &p, ahash, bhash, acnt, bcnt,
+                                &lcs, &bad);
     printf("  total LCS = %d, derived lines = %d, patch ops = %d\n", lcs, b.count, p.count);
     printf("  patch mismatches = %d\n", bad);
     printf("Checksum = %" PRIu64 "\n", check);
@@ -334,7 +365,8 @@ int main(void) {
     while (pass < PASSES) {
         int32_t l2 = 0;
         int32_t b2 = 0;
-        bench_hash = bench_hash * 1000003 + round_trip(&a, &b, dp, &p, &l2, &b2);
+        bench_hash = bench_hash * 1000003 +
+                     round_trip(&a, &b, dp, &p, ahash, bhash, acnt, bcnt, &l2, &b2);
         pass += 1;
     }
     uint64_t elapsed_us = bench_time_us() - t0;
@@ -350,5 +382,9 @@ int main(void) {
     free(dp);
     free(p.kind);
     free(p.arg);
+    free(ahash);
+    free(bhash);
+    free(acnt);
+    free(bcnt);
     return 0;
 }

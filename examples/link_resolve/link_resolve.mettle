@@ -13,7 +13,7 @@ const SLOTS: int32 = 131072;
 const SLOT_MASK: int32 = 131071;
 const IMAGE_SIZE: int32 = 1048576;
 const SECTIONS: int32 = 4;
-const PASSES: int32 = 3;
+const PASSES: int32 = 5;
 
 struct Sym {
   name_off: int32;
@@ -309,7 +309,6 @@ fn resolve_and_relocate(l: Linker*) -> int32 {
 }
 
 fn round_trip(l: Linker*, out_applied: int32*) -> uint64 {
-  generate_stream(l, 2463534242);
   var units: int32 = parse_stream(l);
   intern_defs(l);
   var applied: int32 = resolve_and_relocate(l);
@@ -349,6 +348,8 @@ fn main() -> int32 {
   }
 
   println("Link resolve: {UNITS} units, {DEFS_PER} defs and {REFS_PER} refs each");
+
+  generate_stream(&l, 2463534242);
 
   var applied: int32 = 0;
   var check: uint64 = round_trip(&l, &applied);

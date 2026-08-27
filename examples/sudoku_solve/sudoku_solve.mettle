@@ -153,8 +153,7 @@ fn build_solved(grid: int32*, state: uint32*) {
   }
 }
 
-fn make_puzzle(b: Board*, grid: int32*, state: uint32*) {
-  board_clear(b);
+fn make_puzzle(dst: int32*, grid: int32*, state: uint32*) {
   var hole: int32[81];
   var i: int32 = 0;
   while (i < CELLS) {
@@ -174,21 +173,42 @@ fn make_puzzle(b: Board*, grid: int32*, state: uint32*) {
   i = 0;
   while (i < CELLS) {
     if (hole[i] == 0) {
-      place(b, i, grid[i]);
+      dst[i] = grid[i];
+    } else {
+      dst[i] = 0;
     }
     i += 1;
   }
 }
 
-fn round_trip(b: Board*, grid: int32*) -> uint64 {
+fn generate_puzzles(puzzles: int32*, grid: int32*) {
   var state: uint32 = 2463534242;
+  var p: int32 = 0;
+  while (p < PUZZLES) {
+    build_solved(grid, &state);
+    make_puzzle(puzzles + p * CELLS, grid, &state);
+    p += 1;
+  }
+}
+
+fn load_puzzle(b: Board*, src: int32*) {
+  board_clear(b);
+  var i: int32 = 0;
+  while (i < CELLS) {
+    if (src[i] != 0) {
+      place(b, i, src[i]);
+    }
+    i += 1;
+  }
+}
+
+fn round_trip(b: Board*, puzzles: int32*) -> uint64 {
   var h: uint64 = 14695981039346656037;
   var solved_count: int32 = 0;
   var total_nodes: int64 = 0;
   var p: int32 = 0;
   while (p < PUZZLES) {
-    build_solved(grid, &state);
-    make_puzzle(b, grid, &state);
+    load_puzzle(b, puzzles + p * CELLS);
     var ok: int32 = solve(b);
     solved_count += ok;
     total_nodes = total_nodes + b->nodes;
@@ -212,7 +232,9 @@ fn main() -> int32 {
   var colmask: int32* = malloc(36);
   var boxmask: int32* = malloc(36);
   var grid: int32* = malloc((int64)CELLS * 4);
-  if (cell == 0 || rowmask == 0 || colmask == 0 || boxmask == 0 || grid == 0) {
+  var puzzles: int32* = malloc((int64)PUZZLES * CELLS * 4);
+  if (cell == 0 || rowmask == 0 || colmask == 0 || boxmask == 0 || grid == 0 ||
+      puzzles == 0) {
     println("malloc failed");
     return 1;
   }
@@ -225,7 +247,9 @@ fn main() -> int32 {
 
   println("Sudoku: {PUZZLES} puzzles, {REMOVE} holes each, MRV backtracking");
 
-  var check: uint64 = round_trip(&b, grid);
+  generate_puzzles(puzzles, grid);
+
+  var check: uint64 = round_trip(&b, puzzles);
   println("Checksum = {check}");
 
   println("Benchmark: {PASSES} passes");
@@ -234,7 +258,7 @@ fn main() -> int32 {
   var bench_hash: uint64 = 0;
   var pass: int32 = 0;
   while (pass < PASSES) {
-    bench_hash = bench_hash * 1000003 + round_trip(&b, grid);
+    bench_hash = bench_hash * 1000003 + round_trip(&b, puzzles);
     pass += 1;
   }
   var elapsed_us: int64 = bench_time_us() - t0;
@@ -254,5 +278,6 @@ fn main() -> int32 {
   free(colmask);
   free(boxmask);
   free(grid);
+  free(puzzles);
   return 0;
 }

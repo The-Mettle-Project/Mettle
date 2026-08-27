@@ -17,7 +17,7 @@
 #define SLOT_MASK 131071
 #define IMAGE_SIZE 1048576
 #define SECTIONS 4
-#define PASSES 3
+#define PASSES 5
 
 typedef struct {
     int32_t name_off;
@@ -313,7 +313,6 @@ static int32_t resolve_and_relocate(Linker *l) {
 }
 
 static uint64_t round_trip(Linker *l, int32_t *out_applied) {
-  generate_stream(l, 2463534242ULL);
   int32_t units = parse_stream(l);
   intern_defs(l);
   int32_t applied = resolve_and_relocate(l);
@@ -353,6 +352,8 @@ int main(void) {
     }
 
     printf("Link resolve: %d units, %d defs and %d refs each\n", UNITS, DEFS_PER, REFS_PER);
+
+    generate_stream(&l, 2463534242ULL);
 
     int32_t applied = 0;
     uint64_t check = round_trip(&l, &applied);

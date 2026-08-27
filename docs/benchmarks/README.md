@@ -99,12 +99,12 @@ are honest kernels, both are now in Suite 2, and neither is a Suite 3 program.
 |------|----------|------------------|
 | `btree_index` | 50000 inserts with node splits, a full lookup pass, a half-miss pass, an in-order walk × 3 | 256-byte nodes, in-node shifting, recursive descent |
 | `bytecode_vm` | Assemble a register program, then run collatz over [2,9000) through a switch dispatch loop × 3 | Interpreter dispatch and a memory register file |
-| `sudoku_solve` | 120 generated puzzles, 61 holes each, bitmask propagation with MRV backtracking × 3 | Deep recursion, early exit, branches that never predict |
+| `sudoku_solve` | Solve 120 generated puzzles, 61 holes each, bitmask propagation with MRV backtracking × 3 | Deep recursion, early exit, branches that never predict |
 | `voxel_trace` | 64^3 grid, 200×150 rays, float64 DDA traversal with one reflection bounce × 3 | float64 without `sqrt`, axis-aligned normals |
 | `mark_sweep` | Build a 160000-object graph, mark from roots through a worklist, sweep, compact and remap, mutate, 3 cycles × 2 | Pointer chasing in a data-dependent order, forwarding remap |
-| `diff_lcs` | 90 document pairs of 240 lines, line hashing, LCS dynamic programming, backtrack to an edit script, replay and verify × 3 | A DP table with a serial row recurrence, then a replay pass |
-| `link_resolve` | Parse 1200 object records, intern 48000 symbols, resolve cross-unit references, apply relocations to a 1 MB image × 3 | Byte-stream parsing, string interning, probe chains |
-| `csv_query` | Generate 60000 rows, parse, hash group-by into 4096 groups, quicksort by value × 5 | Integer parsing, open addressing, a comparison sort on records |
+| `diff_lcs` | 90 document pairs of 240 lines, LCS dynamic programming, backtrack to an edit script, replay and verify × 5 | A DP table with a serial row recurrence, then a replay pass |
+| `link_resolve` | Parse 1200 object records, intern 48000 symbols, resolve cross-unit references, apply relocations to a 1 MB image × 5 | Byte-stream parsing, string interning, probe chains |
+| `csv_query` | Parse 60000 generated rows, hash group-by into 4096 groups, quicksort by value × 12 | Integer parsing, open addressing, a comparison sort on records |
 
 `voxel_trace` is written without `sqrt` on purpose. Mettle's `std/math` `sqrt`
 is a Newton-Raphson iteration and C's is the hardware instruction, so the two
@@ -119,7 +119,15 @@ built so that recognizing one loop buys almost nothing, while everything an
 application actually spends time on is on the clock.
 
 1. Three phases at least. Each program generates its input, transforms it,
-   and checks the result, so no single loop owns the measurement.
+   and checks the result, so no single loop owns the measurement. Generation
+   runs once, before the timed loop; the loop times the transform and the
+   check. Set 2 originally regenerated its input inside every pass, and the
+   phase timings showed why that is wrong: 40% to 60% of `link_resolve` and
+   `csv_query` was spent formatting integers into a byte buffer, so the
+   number those two reported was mostly a measure of `sprintf`-shaped code
+   rather than of linking or querying. Generation is still on the program's
+   critical path and still covered by the checksum, and it is no longer
+   counted against the workload the benchmark is named for.
 2. The two sources are mirrors. Same functions in the same order, same
    control flow, same types. Neither side is unrolled, annotated, or hand tuned;
    no `@simd`, no `@inline`, no pointer tricks on one side only.
