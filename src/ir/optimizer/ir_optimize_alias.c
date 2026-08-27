@@ -340,9 +340,149 @@ static int alias_name_is_fresh_allocator(const char *name) {
 
 /* How many times this function writes `name` as a destination. A pointer
  * assigned once can be looked through; one reassigned in a loop cannot. */
+/* Writers of every function, indexed by name.
+ *
+ * Asking who wrote a name by scanning the function is the shape this
+ * repository has been retiring everywhere else, and the alias walk asks it for
+ * every call-site argument on every propagation round. The IR does not move
+ * while the facts are being built, so the answers are collected once per
+ * function and read back from a table. Up to four writers are remembered; a
+ * name written more often is not one the walk can settle anyway. */
+#define ALIAS_DEF_MAX_WRITERS 4
+
+typedef struct {
+  const char *key; /* borrowed operand name, NULL when free */
+  int kind;
+  int count; /* > ALIAS_DEF_MAX_WRITERS means "more than it remembers" */
+  int at[ALIAS_DEF_MAX_WRITERS];
+} AliasDefSlot;
+
+static AliasDefSlot **g_alias_def_tables;
+static size_t *g_alias_def_masks;
+static size_t g_alias_def_table_count;
+
+static size_t alias_defs_probe(const char *name, int kind, size_t mask) {
+  unsigned long long h = 1469598103934665603ULL ^ (unsigned long long)kind;
+  for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+    h ^= (unsigned long long)*p;
+    h *= 1099511628211ULL;
+  }
+  return (size_t)h & mask;
+}
+
+static void alias_defs_destroy(void) {
+  for (size_t i = 0; i < g_alias_def_table_count; i++) {
+    free(g_alias_def_tables[i]);
+  }
+  free(g_alias_def_tables);
+  free(g_alias_def_masks);
+  g_alias_def_tables = NULL;
+  g_alias_def_masks = NULL;
+  g_alias_def_table_count = 0;
+}
+
+/* The slot arrays are sized here; a function's own table is filled the first
+ * time something asks about it. Most of a program's functions are never asked,
+ * and indexing them all made a small compile pay for a large one. */
+static void alias_defs_build_all(IRAliasFacts *facts) {
+  IRProgram *program = facts->program;
+  alias_defs_destroy();
+  g_alias_def_tables = calloc(program->function_count,
+                              sizeof(*g_alias_def_tables));
+  g_alias_def_masks = calloc(program->function_count,
+                             sizeof(*g_alias_def_masks));
+  if (!g_alias_def_tables || !g_alias_def_masks) {
+    alias_defs_destroy();
+    return;
+  }
+  g_alias_def_table_count = program->function_count;
+}
+
+static AliasDefSlot *alias_defs_table_for(const IRFunction *function,
+                                          size_t slot_index) {
+  size_t want = 16;
+  AliasDefSlot *table;
+  if (g_alias_def_tables[slot_index]) {
+    return g_alias_def_tables[slot_index];
+  }
+  while (want < function->instruction_count * 2) {
+    want *= 2;
+  }
+  table = calloc(want, sizeof(AliasDefSlot));
+  if (!table) {
+    return NULL;
+  }
+  g_alias_def_tables[slot_index] = table;
+  g_alias_def_masks[slot_index] = want - 1;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    size_t mask = want - 1;
+    size_t at;
+    if (ins->op == IR_OP_DECLARE_LOCAL || !ins->dest.name ||
+        (ins->dest.kind != IR_OPERAND_TEMP &&
+         ins->dest.kind != IR_OPERAND_SYMBOL)) {
+      continue;
+    }
+    at = alias_defs_probe(ins->dest.name, (int)ins->dest.kind, mask);
+    while (table[at].key &&
+           !(table[at].kind == (int)ins->dest.kind &&
+             strcmp(table[at].key, ins->dest.name) == 0)) {
+      at = (at + 1) & mask;
+    }
+    if (!table[at].key) {
+      table[at].key = ins->dest.name;
+      table[at].kind = (int)ins->dest.kind;
+    }
+    if (table[at].count < ALIAS_DEF_MAX_WRITERS) {
+      table[at].at[table[at].count] = (int)i;
+    }
+    table[at].count++;
+  }
+  return table;
+}
+
+static const AliasDefSlot *alias_defs_find(const IRFunction *function,
+                                           IROperandKind kind,
+                                           const char *name) {
+  size_t slot_index;
+  AliasDefSlot *table;
+  size_t mask;
+  size_t at;
+  if (!g_alias_def_tables || !function || !name) {
+    return NULL;
+  }
+  slot_index = alias_function_slot(&g_alias, function);
+  if (slot_index == (size_t)-1 || slot_index >= g_alias_def_table_count) {
+    return NULL;
+  }
+  table = alias_defs_table_for(function, slot_index);
+  if (!table) {
+    return NULL;
+  }
+  mask = g_alias_def_masks[slot_index];
+  at = alias_defs_probe(name, (int)kind, mask);
+  while (table[at].key) {
+    if (table[at].kind == (int)kind && strcmp(table[at].key, name) == 0) {
+      return &table[at];
+    }
+    at = (at + 1) & mask;
+  }
+  return NULL;
+}
+
 static int alias_symbol_def_count(const IRFunction *function,
                                   const char *name) {
   int count = 0;
+  {
+    const AliasDefSlot *slot =
+        alias_defs_find(function, IR_OPERAND_SYMBOL, name);
+    if (slot) {
+      return slot->count;
+    }
+    if (g_alias_def_tables) {
+      return 0; /* indexed, and this name writes nothing */
+    }
+  }
   for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_DECLARE_LOCAL) {
@@ -360,6 +500,15 @@ static const IRInstruction *alias_unique_def(const IRFunction *function,
                                              IROperandKind kind,
                                              const char *name) {
   const IRInstruction *found = NULL;
+  {
+    const AliasDefSlot *slot = alias_defs_find(function, kind, name);
+    if (slot) {
+      return slot->count == 1 ? &function->instructions[slot->at[0]] : NULL;
+    }
+    if (g_alias_def_tables) {
+      return NULL; /* indexed, and this name writes nothing */
+    }
+  }
   for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_DECLARE_LOCAL) {
@@ -609,6 +758,7 @@ void ir_alias_facts_reset(void) {
   }
   free(g_alias.root_names);
   memset(&g_alias, 0, sizeof(g_alias));
+  alias_defs_destroy();
 }
 
 /* ========================================================================== */
@@ -984,6 +1134,7 @@ void ir_alias_facts_build(IRProgram *program) {
     return;
   }
   alias_slot_index_build(&g_alias);
+  alias_defs_build_all(&g_alias);
   alias_poison_escaping_functions(&g_alias);
   if (!alias_seed_parameters(&g_alias)) {
     ir_alias_facts_reset();
