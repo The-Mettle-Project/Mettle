@@ -30,6 +30,12 @@ export fn SOCK_DGRAM() -> int32  { return 2; }
 export fn IPPROTO_TCP() -> int32 { return 6; }
 export fn IPPROTO_UDP() -> int32 { return 17; }
 export fn SOL_SOCKET() -> int32 { return 1; }       // Linux value
+
+// Report a broken connection as a return value rather than as a signal.
+// The default disposition of SIGPIPE terminates the process, so without
+// this a send on a socket with no reader kills the program before the
+// caller can read the error it was promised.
+export fn MSG_NOSIGNAL() -> int32 { return 16384; }
 export fn SO_REUSEADDR() -> int32 { return 2; }     // Linux value
 export fn SD_RECEIVE() -> int32 { return 0; }
 export fn SD_SEND() -> int32 { return 1; }
@@ -175,7 +181,7 @@ export fn set_reuseaddr(sock: int64, enabled: int32) -> int32 {
 export fn send_all(sock: int64, buf: cstring, len: int32) -> Result<int32, int32> {
   var total: int32 = 0;
   while (total < len) {
-    var sent: int32 = send(sock, &buf[total], len - total, 0);
+    var sent: int32 = send(sock, &buf[total], len - total, MSG_NOSIGNAL());
     if (sent <= 0) { return Err(net_last_error()); }
     total = total + sent;
   }
