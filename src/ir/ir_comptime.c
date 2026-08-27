@@ -423,7 +423,7 @@ int ir_comptime_trace(IRProgram *program, ErrorReporter *reporter,
   if (!machine) {
     return 1;
   }
-  IRInterpValue call_args[16];
+  IRInterpValue call_args[16] = {{0}};
   char arg_display[16][48];
   size_t cli_index = 0;
   if (fn->parameter_count > 16) {
@@ -632,6 +632,15 @@ int ir_comptime_trace(IRProgram *program, ErrorReporter *reporter,
   case IR_INTERP_OK: {
     char value[48];
     ict_format_value(&result, value, sizeof(value));
+    if (result.undefined || ir_interp_branched_on_undefined(machine)) {
+      printf("%sno answer%s: the result depends on something this run could"
+             " not know -- memory nothing had written, or a call with no"
+             " model above. It computed %s; a real run would compute"
+             " something else\n",
+             bold, reset, value);
+      ir_interp_destroy(machine);
+      return 0;
+    }
     printf("%sreturns %s%s\n", bold, value, reset);
     ir_interp_destroy(machine);
     return 0;

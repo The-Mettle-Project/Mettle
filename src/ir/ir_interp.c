@@ -41,6 +41,11 @@ typedef struct {
    * the aggregate assignment that consumes it copies it out. */
   int escaped_local;
   size_t alloc_line; /* NEW/malloc source line; 0 for harness inputs */
+  /* One byte per data byte: nonzero once something has written it. Buffers
+     start known (zeroed or seeded); the sites that stamp the uninitialized
+     pattern clear it here too, so a read can tell an undefined byte from a
+     byte that genuinely holds 0xA5. */
+  unsigned char *init_map;
 } IIBuffer;
 
 /* A materialized string literal: the characters (NUL-terminated) and the
@@ -144,7 +149,9 @@ struct IRInterpMachine {
   const IRFunction *value_hook_fn;
 
   int held_mutex_count;
-  int read_undefined;
+  int last_read_undefined;
+  int last_socket_error;
+  int branched_on_undefined;
   unsigned long long next_thread_handle;
 
   unsigned long long swap_slots[256];
@@ -258,6 +265,7 @@ void ir_interp_destroy(IRInterpMachine *machine) {
   }
   for (size_t i = 0; i < machine->buffer_count; i++) {
     free(machine->buffers[i].data);
+    free(machine->buffers[i].init_map);
   }
   free(machine->buffers);
   free(machine->free_slots);
@@ -366,10 +374,21 @@ static int ii_free_slot_push(IRInterpMachine *machine, size_t index) {
 static void ii_reclaim_buffer(IRInterpMachine *machine, size_t index) {
   IIBuffer *buf = &machine->buffers[index];
   free(buf->data);
+  free(buf->init_map);
   buf->data = NULL;
+  buf->init_map = NULL;
   buf->freed = 1;
   buf->escaped_local = 0;
   ii_free_slot_push(machine, index);
+}
+
+static void ii_mark_bytes(IIBuffer *buf, long long offset, long long length,
+                          unsigned char known) {
+  if (!buf || !buf->init_map || offset < 0 || length <= 0 ||
+      offset + length > buf->size) {
+    return;
+  }
+  memset(buf->init_map + offset, known, (size_t)length);
 }
 
 static unsigned long long ii_add_buffer_ex(IRInterpMachine *machine,
@@ -404,7 +423,17 @@ static unsigned long long ii_add_buffer_ex(IRInterpMachine *machine,
   buf->escaped_local = 0;
   buf->alloc_line = 0;
   buf->base = II_ADDR_BASE + (unsigned long long)index * II_ADDR_STRIDE;
+  buf->init_map = NULL;
   buf->data = (unsigned char *)malloc(size > 0 ? (size_t)size : 1);
+  if (buf->data) {
+    buf->init_map = (unsigned char *)malloc(size > 0 ? (size_t)size : 1);
+    if (!buf->init_map) {
+      free(buf->data);
+      buf->data = NULL;
+    } else {
+      memset(buf->init_map, 1, size > 0 ? (size_t)size : 1);
+    }
+  }
   if (!buf->data) {
     if (index != machine->buffer_count) {
       buf->freed = 1;
@@ -640,13 +669,26 @@ static int ii_mem_read(IRInterpMachine *machine, unsigned long long addr,
   }
   unsigned long long value = 0;
   memcpy(&value, buf->data + offset, (size_t)size);
-  for (int b = 0; b < size; b++) {
-    if (buf->data[offset + b] != II_POISON_BYTE) {
-      *out = value;
-      return 1;
+  /* Every byte unwritten, not merely some: a struct copy legitimately reads
+     the padding between fields, and an enum reads a payload its tag says is
+     absent. Those carry real data alongside. A read where nothing at all was
+     written carries none, and its value is whatever the allocator or the
+     stack left there. */
+  /* Both signals, not either: the map says nothing wrote these bytes and the
+     bytes still carry the pattern. The map alone would accuse every write
+     path that reaches memory without going through here; the bytes alone
+     would accuse any program that legitimately stores 0xA5. */
+  machine->last_read_undefined = 0;
+  if (buf->init_map) {
+    int undefined = 1;
+    for (int b = 0; b < size && undefined; b++) {
+      undefined = buf->init_map[offset + b] == 0 &&
+                  buf->data[offset + b] == II_POISON_BYTE;
+    }
+    if (undefined) {
+      machine->last_read_undefined = 1;
     }
   }
-  machine->read_undefined = 1;
   *out = value;
   return 1;
 }
@@ -660,6 +702,7 @@ static int ii_mem_write(IRInterpMachine *machine, unsigned long long addr,
     return 0;
   }
   memcpy(buf->data + offset, &value, (size_t)size);
+  ii_mark_bytes(buf, offset, size, 1);
   return 1;
 }
 
@@ -854,6 +897,7 @@ static IRInterpValue ii_int_value(long long v) {
   value.i = v;
   value.f = 0;
   value.is_float = 0;
+  value.undefined = 0;
   return value;
 }
 
@@ -862,6 +906,7 @@ static IRInterpValue ii_float_value(double v) {
   value.i = 0;
   value.f = v;
   value.is_float = 1;
+  value.undefined = 0;
   return value;
 }
 
@@ -875,6 +920,7 @@ static IRInterpValue ii_poison_value(void) {
   value.i = (long long)0xA5A5A5A5A5A5A5A5ULL;
   value.f = 0;
   value.is_float = 0;
+  value.undefined = 1;
   return value;
 }
 
@@ -894,23 +940,10 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
                             IRInterpValue *result);
 
 /* Read a variable, honoring slot-backed locals. */
-static int ii_value_is_poison(const IRInterpValue *value) {
-  unsigned long long bits;
-  if (value->is_float) {
-    return 0;
-  }
-  bits = (unsigned long long)value->i;
-  return bits == 0xA5A5A5A5A5A5A5A5ULL || bits == 0xA5A5A5A5ULL ||
-         (long long)bits == (long long)(int)0xA5A5A5A5;
-}
-
 static int ii_var_read(IRInterpMachine *machine, IIVar *var,
                        IRInterpValue *out) {
   if (!var->slotted) {
     *out = var->value;
-    if (ii_value_is_poison(out)) {
-      machine->read_undefined = 1;
-    }
     return 1;
   }
   unsigned long long raw = 0;
@@ -1313,10 +1346,6 @@ static int ii_fetch(IRInterpMachine *machine, IIFrame *frame,
     if (!operand->name) {
       *out = ii_int_value(0);
       return 1;
-    }
-    if (operand->kind == IR_OPERAND_TEMP &&
-        !ii_env_find(&frame->env, operand->name)) {
-      machine->read_undefined = 1;
     }
     IIVar *var = ii_resolve(machine, frame, operand);
     if (!var) {
@@ -1814,6 +1843,11 @@ static int ii_copy_aggregate_args(IRInterpMachine *machine, IIFrame *frame,
       return 0;
     }
     memcpy(dbuf->data + dst_off, sbuf->data + src_off, (size_t)size);
+    if (dbuf->init_map && sbuf->init_map) {
+      memcpy(dbuf->init_map + dst_off, sbuf->init_map + src_off, (size_t)size);
+    } else {
+      ii_mark_bytes(dbuf, dst_off, size, 1);
+    }
     args[i] = ii_int_value((long long)copy);
   }
   return 1;
@@ -1861,7 +1895,8 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
       long long offset = 0;
       IIBuffer *buf = ii_addr_to_buffer(machine, addr, 0, &offset);
       if (buf) {
-        memset(buf->data, 0xA5, (size_t)buf->size);
+        memset(buf->data, II_POISON_BYTE, (size_t)buf->size);
+        ii_mark_bytes(buf, 0, buf->size, 0);
       }
     }
     *result = ii_int_value((long long)addr);
@@ -1991,6 +2026,48 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
   if (strcmp(name, "mettle_swap_discard") == 0) {
     machine->swap_pending_count = 0;
     *result = ii_int_value(0);
+    return 1;
+  }
+
+  /* A machine with sockets and no peers, which is what the compile host is
+     from the program's point of view. Creating and closing one succeeds;
+     anything needing a peer fails and reports why. No operating system is
+     involved: the handle is a counter and the failure is the only answer a
+     socket that was never connected can give. */
+  if (strcmp(name, "socket") == 0 || strcmp(name, "WSASocketA") == 0) {
+    machine->next_thread_handle++;
+    *result = ii_int_value((long long)(machine->next_thread_handle + 2));
+    return 1;
+  }
+
+  if (strcmp(name, "closesocket") == 0 || strcmp(name, "shutdown") == 0 ||
+      strcmp(name, "close") == 0 ||
+      strcmp(name, "bind") == 0 || strcmp(name, "listen") == 0 ||
+      strcmp(name, "setsockopt") == 0 || strcmp(name, "WSAStartup") == 0 ||
+      strcmp(name, "WSACleanup") == 0) {
+    *result = ii_int_value(0);
+    return 1;
+  }
+
+  if (strcmp(name, "posix_get_errno") == 0 ||
+      strcmp(name, "WSAGetLastError") == 0) {
+    *result = ii_int_value(machine->last_socket_error);
+    return 1;
+  }
+
+  if (arg_count >= 2 && (strcmp(name, "send") == 0 ||
+                         strcmp(name, "sendto") == 0)) {
+    machine->last_socket_error = 107; /* ENOTCONN */
+    *result = ii_int_value(-1);
+    return 1;
+  }
+
+  if (arg_count >= 2 && (strcmp(name, "recv") == 0 ||
+                         strcmp(name, "recvfrom") == 0 ||
+                         strcmp(name, "accept") == 0 ||
+                         strcmp(name, "connect") == 0)) {
+    machine->last_socket_error = 107; /* ENOTCONN */
+    *result = ii_int_value(-1);
     return 1;
   }
 
@@ -2611,9 +2688,14 @@ static int ii_extern_call(IRInterpMachine *machine, const char *name,
     }
   }
 
-  /* Unknown extern: pure model (returns 0), but the call is traced so a pass
-   * that deletes or reorders it still diverges. */
+  /* Unknown extern: the call is traced so a pass that deletes or reorders it
+   * still diverges, and the answer is marked undefined. Zero is a value the
+   * program will branch on -- `dir_exists` answering 0 sends it down the
+   * directory-is-missing arm and every step after that is fiction. Marking it
+   * lets whoever consumes the run say it does not know, rather than report a
+   * number computed from a guess. */
   ii_trace_extern(machine, name, args, arg_count);
+  result->undefined = 1;
   return machine->status == IR_INTERP_OK ? 0 : -1;
 }
 
@@ -3996,6 +4078,9 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         goto done;
       }
       long long v = cond.is_float ? (cond.f != 0.0) : cond.i;
+      if (cond.undefined) {
+        machine->branched_on_undefined = 1;
+      }
       if (v == 0) {
         const IILabel *label = insn->text ? ii_find_label(&frame, insn->text) : NULL;
         if (!label) {
@@ -4020,6 +4105,9 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         equal = ii_as_float(&a) == ii_as_float(&b);
       } else {
         equal = a.i == b.i;
+      }
+      if (a.undefined || b.undefined) {
+        machine->branched_on_undefined = 1;
       }
       if (equal) {
         const IILabel *label = insn->text ? ii_find_label(&frame, insn->text) : NULL;
@@ -4073,6 +4161,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
               ii_addr_to_buffer(machine, var->string_record, 16, &offset);
           if (buf) {
             memset(buf->data + offset, 0, 16);
+            ii_mark_bytes(buf, offset, 16, 1);
             var->value = ii_int_value((long long)var->string_record);
             pc++;
             break;
@@ -4124,6 +4213,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
               machine, (unsigned long long)var->value.i, agg_size, &offset);
           if (buf) {
             memset(buf->data + offset, II_POISON_BYTE, (size_t)agg_size);
+            ii_mark_bytes(buf, offset, agg_size, 0);
             pc++;
             break;
           }
@@ -4140,6 +4230,8 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         }
         memset(machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE].data,
                II_POISON_BYTE, (size_t)agg_size);
+        ii_mark_bytes(&machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE],
+                      0, agg_size, 0);
         var->value = ii_int_value((long long)addr);
         var->slotted = 0;
         var->agg_size = agg_size;
@@ -4178,6 +4270,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
                                             (unsigned long long)var->value.i,
                                             count * elem_size, &offset);
           if (buf) {
+            ii_mark_bytes(buf, offset, count * elem_size, 0);
             memset(buf->data + offset, II_POISON_BYTE,
                    (size_t)(count * elem_size));
             addr = (unsigned long long)var->value.i;
@@ -4198,6 +4291,9 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
            * zeroed, matching HEAP_ZERO_MEMORY in codegen). */
           memset(machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE].data,
                  II_POISON_BYTE, (size_t)(count * elem_size));
+          ii_mark_bytes(
+              &machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE], 0,
+              count * elem_size, 0);
           var->has_local_storage = 1;
         }
         var->value = ii_int_value((long long)addr);
@@ -4323,6 +4419,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         }
         value = ii_int_value(v);
       }
+      value.undefined = machine->last_read_undefined;
       if (!ii_store_dest(machine, &frame, &insn->dest, &value)) {
         goto done;
       }
@@ -4392,8 +4489,11 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       IRInterpValue a, b, out;
       if (!ii_fetch(machine, &frame, &insn->lhs, &a) ||
           !ii_fetch(machine, &frame, &insn->rhs, &b) ||
-          !ii_binary(machine, insn, &a, &b, &out) ||
-          !ii_store_dest(machine, &frame, &insn->dest, &out)) {
+          !ii_binary(machine, insn, &a, &b, &out)) {
+        goto done;
+      }
+      out.undefined = a.undefined || b.undefined;
+      if (!ii_store_dest(machine, &frame, &insn->dest, &out)) {
         goto done;
       }
       pc++;
@@ -4423,6 +4523,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         ii_fail(machine, IR_INTERP_UNSUPPORTED, "unary op");
         goto done;
       }
+      out.undefined = a.undefined;
       if (!ii_store_dest(machine, &frame, &insn->dest, &out)) {
         goto done;
       }
@@ -4452,8 +4553,11 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
     case IR_OP_CAST: {
       IRInterpValue a, out;
       if (!ii_fetch(machine, &frame, &insn->lhs, &a) ||
-          !ii_cast(machine, insn, &a, &out) ||
-          !ii_store_dest(machine, &frame, &insn->dest, &out)) {
+          !ii_cast(machine, insn, &a, &out)) {
+        goto done;
+      }
+      out.undefined = a.undefined;
+      if (!ii_store_dest(machine, &frame, &insn->dest, &out)) {
         goto done;
       }
       pc++;
@@ -4811,8 +4915,8 @@ const unsigned char *ir_interp_buffer_data(const IRInterpMachine *machine,
   return machine->buffers[index].data;
 }
 
-int ir_interp_read_undefined(const IRInterpMachine *machine) {
-  return machine ? machine->read_undefined : 0;
+int ir_interp_branched_on_undefined(const IRInterpMachine *machine) {
+  return machine ? machine->branched_on_undefined : 0;
 }
 
 size_t ir_interp_extern_trace_count(const IRInterpMachine *machine) {

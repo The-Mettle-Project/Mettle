@@ -41,6 +41,10 @@ typedef struct {
   long long i;
   double f;
   int is_float;
+  /* The value came from memory nothing had written, or was computed from one
+     that did. A real run reads whatever the allocator or the stack left
+     there, so nothing may be concluded from it. */
+  int undefined;
 } IRInterpValue;
 
 /* Bytes captured per pointer argument at extern-call time. */
@@ -89,7 +93,10 @@ IRInterpStatus ir_interp_run(IRInterpMachine *machine, IRFunction *function,
 size_t ir_interp_buffer_count(const IRInterpMachine *machine);
 const unsigned char *ir_interp_buffer_data(const IRInterpMachine *machine,
                                            size_t index, long long *size);
-int ir_interp_read_undefined(const IRInterpMachine *machine);
+/* The run chose a path from a value it could not know -- uninitialized memory,
+   or a call with no model. Everything after that branch is one arbitrary
+   execution out of several, so no answer may be reported from it. */
+int ir_interp_branched_on_undefined(const IRInterpMachine *machine);
 
 size_t ir_interp_extern_trace_count(const IRInterpMachine *machine);
 const IRInterpExternCall *ir_interp_extern_trace(const IRInterpMachine *machine,

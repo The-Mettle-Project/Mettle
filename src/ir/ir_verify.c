@@ -1279,8 +1279,8 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
     }
     ir_interp_set_override(machine_before, function->name, &before_fn);
 
-    IRInterpValue args_before[IRV_MAX_PARAMS];
-    IRInterpValue args_after[IRV_MAX_PARAMS];
+    IRInterpValue args_before[IRV_MAX_PARAMS] = {{0}};
+    IRInterpValue args_after[IRV_MAX_PARAMS] = {{0}};
     /* Runs past the fixed table carry a harvested boundary value; the buffer
      * shape stays on the table's cycle so lengths remain in range. */
     const long long *boundary =
@@ -1375,8 +1375,7 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
       continue;
     }
 
-    if (ir_interp_read_undefined(machine_before) ||
-        ir_interp_read_undefined(machine_after)) {
+    if (ret_before.undefined || ret_after.undefined) {
       snprintf(last_unusable, sizeof(last_unusable),
                "read something nothing had written");
       ir_interp_destroy(machine_before);
