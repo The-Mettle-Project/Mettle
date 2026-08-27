@@ -1040,6 +1040,14 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
    * the budget exists to bound code size, not to leave per-iteration call
    * overhead in hot loops). What stays refused: cold one-shot call sites,
    * which cost nothing measurable as real calls. */
+  /* Measured once, for the caller as this pass found it, and deliberately not
+   * charged as the caller grows. Recomputing it after every inline is what the
+   * paragraph above reads like it should do, and it is worse: cutting a pass
+   * off part way leaves a caller half converted, with some of a routine
+   * inlined and the rest still calls, which allocates worse than either doing
+   * all of it or none of it. Charging the growth cost 2.4% across Suite 3
+   * Set 2, every benchmark slower. Growth is bounded between rounds instead,
+   * where the caller is whole again. */
   int caller_over_budget = ir_function_non_nop_instruction_count(function) >
                            ir_opt_inline_caller_budget(function);
   /* Built for every caller, not just over-budget ones: the callee size budget
