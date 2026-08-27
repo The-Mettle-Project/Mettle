@@ -836,6 +836,7 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
 
     for (size_t s = header + 1; s < latch; s++) {
       long long k = 0;
+      long long bias = 0;
       size_t idx_pos = 0;
       size_t consumers[IR_ROW_MAX_CONSUMERS];
       size_t consumer_count = 0;
@@ -910,6 +911,32 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
           idx = shl;
           idx_pos = s;
         }
+        /* A neighbour reads `m[r + i - 1]`, and the constant lands between
+         * the index add and the shift. It belongs to the fixed half, because
+         * (r + i - c) << k is ((r - c) + i) << k, so it is carried across and
+         * folded into the row pointer rather than refusing the shape. */
+        if (idx && idx->op == IR_OP_BINARY && !idx->is_float && idx->text &&
+            (strcmp(idx->text, "+") == 0 || strcmp(idx->text, "-") == 0) &&
+            idx->rhs.kind == IR_OPERAND_INT &&
+            idx->lhs.kind == IR_OPERAND_TEMP && idx->lhs.name) {
+          const IRInstruction *inner = NULL;
+          for (size_t j = idx_pos; j-- > header + 1;) {
+            const IRInstruction *cand = &function->instructions[j];
+            if (ir_instruction_writes_destination(cand) &&
+                cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
+                strcmp(cand->dest.name, idx->lhs.name) == 0) {
+              inner = cand;
+              if (inner->op == IR_OP_BINARY && !inner->is_float &&
+                  inner->text && strcmp(inner->text, "+") == 0) {
+                bias = strcmp(idx->text, "-") == 0 ? -idx->rhs.int_value
+                                                   : idx->rhs.int_value;
+                idx = inner;
+                idx_pos = j;
+              }
+              break;
+            }
+          }
+        }
         if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||
             strcmp(idx->text, "+") != 0) {
           continue;
@@ -928,7 +955,8 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
             !var_side->name) {
           continue;
         }
-        if (inv_side->kind == IR_OPERAND_INT && inv_side->int_value == 0) {
+        if (inv_side->kind == IR_OPERAND_INT &&
+            inv_side->int_value + bias == 0) {
           continue;
         }
         /* The moving half must still hold the index add's value at the
@@ -997,6 +1025,7 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
       char ptr_types[IR_ROW_MAX_CONSUMERS][64];
       char row_names[IR_ROW_MAX_CONSUMERS][48];
       char off_name[48];
+      char bias_name[48];
       int need_off_temp = k != 0 && inv.kind != IR_OPERAND_INT;
       for (size_t c = 0; c < consumer_count && !bad; c++) {
         const IRInstruction *addr = &function->instructions[consumers[c]];
@@ -1016,6 +1045,7 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
       }
 
       snprintf(off_name, sizeof(off_name), "__rowoff_%d", g_row_counter);
+      snprintf(bias_name, sizeof(bias_name), "__rowbias_%d", g_row_counter);
       for (size_t c = 0; c < consumer_count; c++) {
         snprintf(row_names[c], sizeof(row_names[c]), "__rowp_%d_%zu",
                  g_row_counter, c);
@@ -1086,6 +1116,28 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
           inserted++;
         }
       }
+      /* The fixed half plus the constant carried out of the index, when the
+       * fixed half is a name and so cannot be folded at compile time. */
+      if (!failed && bias != 0 && inv.kind != IR_OPERAND_INT) {
+        IRInstruction adj = {0};
+        adj.op = IR_OP_BINARY;
+        adj.text = mettle_strdup("+");
+        adj.dest = ir_operand_temp(bias_name);
+        adj.lhs = ir_operand_copy(&inv);
+        adj.rhs = ir_operand_int(bias);
+        if (!adj.text || !adj.dest.name ||
+            !ir_function_insert_instruction(function, at, &adj)) {
+          failed = 1;
+        }
+        ir_instruction_destroy_storage(&adj);
+        if (!failed) {
+          at++;
+          inserted++;
+          ir_operand_destroy(&inv);
+          inv = ir_operand_temp(bias_name);
+          bias = 0; /* now carried by the name */
+        }
+      }
       if (!failed && need_off_temp) {
         IRInstruction off = {0};
         off.op = IR_OP_BINARY;
@@ -1109,10 +1161,12 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
         add.text = mettle_strdup("+");
         add.dest = ir_operand_symbol(row_names[c]);
         add.lhs = ir_operand_symbol(base_names[c]);
-        add.rhs = need_off_temp
-                      ? ir_operand_temp(off_name)
-                      : (k == 0 ? ir_operand_copy(&inv)
-                                : ir_operand_int(inv.int_value << k));
+        add.rhs =
+            need_off_temp
+                ? ir_operand_temp(off_name)
+                : (inv.kind == IR_OPERAND_INT
+                       ? ir_operand_int((inv.int_value + bias) << k)
+                       : ir_operand_copy(&inv));
         if (!add.text || !add.dest.name || !add.lhs.name ||
             !ir_function_insert_instruction(function, at, &add)) {
           failed = 1;
