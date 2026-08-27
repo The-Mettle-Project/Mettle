@@ -4357,12 +4357,15 @@ catch {
 
 
 # Examples nothing else builds. tools/examples-differential.sh skips anything
-# that reads stdin or opens a window, and it reports an example that fails to
-# build in the FIRST mode as a skip rather than a failure, so one of these
-# going stale looks exactly like one being interactive. guessing-game did go
-# stale: std/io gained a read_line, the example's own read_line collided with
-# it, and nothing noticed. Compile-only, because none of them can run
-# unattended.
+# that reads stdin or opens a window, so one of these going stale looked
+# exactly like one being interactive. guessing-game did go stale: std/io
+# gained a read_line, the example's own read_line collided with it, and
+# nothing noticed. Compile-only, because none of them can run unattended.
+#
+# Windows-only: four of them import std/ui and the fifth reads the console
+# through GetStdHandle and ReadFile, so there is nothing here a Linux link
+# line can resolve.
+if (-not $script:OnWindows) { Skip-WindowsOnly "interactive_examples_compile" "Windows-only: std/ui and the Win32 console API" } else {
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
@@ -4395,6 +4398,7 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "interactive_examples_compile" -Passed $false -Reason $_.Exception.Message
+}
 }
 
 # --safe must not change what a correct program computes and must not reject
