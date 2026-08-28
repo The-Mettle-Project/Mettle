@@ -1,0 +1,202 @@
+import "std/io";
+import "std/mem";
+
+const AAC_OK = 0;
+const AAC_ERR_CONFIG = 1;
+const AAC_ERR_BITSTREAM = 2;
+const AAC_ERR_UNSUPPORTED = 3;
+
+const AAC_OBJECT_MAIN = 1;
+const AAC_OBJECT_LC = 2;
+const AAC_OBJECT_SSR = 3;
+const AAC_OBJECT_LTP = 4;
+const AAC_OBJECT_SBR = 5;
+const AAC_OBJECT_PS = 29;
+
+const AAC_ELEMENT_SCE = 0;
+const AAC_ELEMENT_CPE = 1;
+const AAC_ELEMENT_CCE = 2;
+const AAC_ELEMENT_LFE = 3;
+const AAC_ELEMENT_DSE = 4;
+const AAC_ELEMENT_PCE = 5;
+const AAC_ELEMENT_FIL = 6;
+const AAC_ELEMENT_END = 7;
+
+struct AacBits {
+  data: uint8*;
+  size: int64;
+  position: int64;
+  overrun: int32;
+}
+
+struct AacConfig {
+  object_type: int32;
+  sample_rate_index: int32;
+  sample_rate: int32;
+  channels: int32;
+  frame_length: int32;
+  sbr_present: int32;
+  extension_sample_rate: int32;
+}
+
+fn aac_bits_start(r: AacBits*, data: uint8*, size: int64) {
+  r->data = data;
+  r->size = size;
+  r->position = 0;
+  r->overrun = 0;
+}
+
+fn aac_read_bit(r: AacBits*) -> int32 {
+  var index: int64 = r->position >> 3;
+  if (index >= r->size) {
+    r->overrun = 1;
+    r->position = r->position + 1;
+    return 0;
+  }
+  var shift: int32 = 7 - (int32)(r->position & (int64)7);
+  r->position = r->position + 1;
+  return ((int32)r->data[index] >> shift) & 1;
+}
+
+fn aac_read_bits(r: AacBits*, count: int32) -> int32 {
+  var value: int32 = 0;
+  for i in 0..count {
+    value = (value << 1) | aac_read_bit(r);
+  }
+  return value;
+}
+
+fn aac_bits_left(r: AacBits*) -> int64 {
+  return r->size * (int64)8 - r->position;
+}
+
+fn aac_sample_rate_for_index(index: int32) -> int32 {
+  var table: int32[13] = [96000, 88200, 64000, 48000, 44100, 32000,
+                          24000, 22050, 16000, 12000, 11025, 8000, 7350];
+  if (index < 0 || index > 12) { return 0; }
+  return table[index];
+}
+
+fn aac_read_object_type(r: AacBits*) -> int32 {
+  var value: int32 = aac_read_bits(r, 5);
+  if (value == 31) { return 32 + aac_read_bits(r, 6); }
+  return value;
+}
+
+fn aac_read_sample_rate(r: AacBits*, out_index: int32*) -> int32 {
+  var index: int32 = aac_read_bits(r, 4);
+  *out_index = index;
+  if (index == 15) { return aac_read_bits(r, 24); }
+  return aac_sample_rate_for_index(index);
+}
+
+fn aac_parse_specific_config(config: AacConfig*, data: uint8*, size: int64) -> int32 {
+  if (data == 0 || size < 2) { return AAC_ERR_CONFIG; }
+
+  var r: AacBits;
+  aac_bits_start(&r, data, size);
+
+  config->sbr_present = 0;
+  config->extension_sample_rate = 0;
+
+  config->object_type = aac_read_object_type(&r);
+  config->sample_rate = aac_read_sample_rate(&r, &config->sample_rate_index);
+  config->channels = aac_read_bits(&r, 4);
+
+  if (config->object_type == AAC_OBJECT_SBR || config->object_type == AAC_OBJECT_PS) {
+    config->sbr_present = 1;
+    var extension_index: int32 = 0;
+    config->extension_sample_rate = aac_read_sample_rate(&r, &extension_index);
+    config->object_type = aac_read_object_type(&r);
+  }
+
+  if (config->object_type != AAC_OBJECT_LC) { return AAC_ERR_UNSUPPORTED; }
+
+  var frame_length_flag: int32 = aac_read_bit(&r);
+  config->frame_length = 1024;
+  if (frame_length_flag != 0) { config->frame_length = 960; }
+
+  if (aac_read_bit(&r) != 0) { aac_read_bits(&r, 14); }
+  var extension_flag: int32 = aac_read_bit(&r);
+  if (extension_flag != 0) { return AAC_ERR_UNSUPPORTED; }
+
+  if (config->sample_rate <= 0) { return AAC_ERR_CONFIG; }
+  if (config->channels < 1 || config->channels > 2) { return AAC_ERR_UNSUPPORTED; }
+  if (r.overrun != 0) { return AAC_ERR_CONFIG; }
+  return AAC_OK;
+}
+
+fn aac_descriptor_length(data: uint8*, size: int32, at: int32, out_next: int32*) -> int32 {
+  var length: int32 = 0;
+  var cursor: int32 = at;
+  for i in 0..4 {
+    if (cursor >= size) {
+      *out_next = cursor;
+      return -1;
+    }
+    var byte: int32 = (int32)data[cursor];
+    cursor = cursor + 1;
+    length = (length << 7) | (byte & 127);
+    if ((byte & 128) == 0) { break; }
+  }
+  *out_next = cursor;
+  return length;
+}
+
+fn aac_find_specific_config(esds: uint8*, size: int32, out_offset: int32*,
+                            out_size: int32*) -> int32 {
+  if (esds == 0 || size < 6) { return AAC_ERR_CONFIG; }
+
+  var at: int32 = 4;
+  if ((int32)esds[at] != 3) { return AAC_ERR_CONFIG; }
+  at = at + 1;
+
+  var next: int32 = 0;
+  if (aac_descriptor_length(esds, size, at, &next) < 0) { return AAC_ERR_CONFIG; }
+  at = next;
+  if (at + 3 > size) { return AAC_ERR_CONFIG; }
+
+  at = at + 2;
+  var flags: int32 = (int32)esds[at];
+  at = at + 1;
+  if ((flags & 128) != 0) { at = at + 2; }
+  if ((flags & 64) != 0) {
+    if (at >= size) { return AAC_ERR_CONFIG; }
+    at = at + 1 + (int32)esds[at];
+  }
+  if ((flags & 32) != 0) { at = at + 2; }
+
+  if (at >= size || (int32)esds[at] != 4) { return AAC_ERR_CONFIG; }
+  at = at + 1;
+  if (aac_descriptor_length(esds, size, at, &next) < 0) { return AAC_ERR_CONFIG; }
+  at = next + 13;
+
+  if (at >= size || (int32)esds[at] != 5) { return AAC_ERR_CONFIG; }
+  at = at + 1;
+  var length: int32 = aac_descriptor_length(esds, size, at, &next);
+  if (length < 0) { return AAC_ERR_CONFIG; }
+  at = next;
+  if (at + length > size) { length = size - at; }
+  if (length <= 0) { return AAC_ERR_CONFIG; }
+
+  *out_offset = at;
+  *out_size = length;
+  return AAC_OK;
+}
+
+fn aac_read_config(config: AacConfig*, esds: uint8*, size: int32) -> int32 {
+  var offset: int32 = 0;
+  var length: int32 = 0;
+  var status: int32 = aac_find_specific_config(esds, size, &offset, &length);
+  if (status != AAC_OK) { return status; }
+  return aac_parse_specific_config(config, &esds[offset], (int64)length);
+}
+
+fn aac_object_name(object_type: int32) -> cstring {
+  if (object_type == AAC_OBJECT_MAIN) { return "AAC Main"; }
+  if (object_type == AAC_OBJECT_LC) { return "AAC LC"; }
+  if (object_type == AAC_OBJECT_SSR) { return "AAC SSR"; }
+  if (object_type == AAC_OBJECT_LTP) { return "AAC LTP"; }
+  if (object_type == AAC_OBJECT_SBR) { return "AAC SBR"; }
+  return "unknown";
+}

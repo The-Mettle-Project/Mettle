@@ -49,6 +49,9 @@ struct MediaSource {
 
   codec_config: uint8*;
   codec_config_size: int32;
+  audio_config: uint8*;
+  audio_config_size: int32;
+  audio_frame_count: int32;
 }
 
 fn source_path_is_iso(path: cstring) -> int32 {
@@ -98,6 +101,22 @@ fn source_build_iso_audio(s: MediaSource*) -> int32 {
 
   if (mp4_format_is_aac(file->tracks[track].format) != 0) {
     s->audio_codec = SOURCE_AUDIO_AAC;
+    s->audio_config = file->tracks[track].codec_config;
+    s->audio_config_size = file->tracks[track].codec_config_size;
+
+    var frames: int32 = file->tracks[track].sample_count;
+    if (frames <= 0) { return 1; }
+    if (source_reserve_audio(s, frames) == 0) { return 0; }
+    var largest: int32 = 0;
+    for i in 0..frames {
+      s->audio_offsets[i] = file->tracks[track].offsets[i];
+      s->audio_sizes[i] = file->tracks[track].sizes[i];
+      s->audio_starts[i] = (int64)i * (int64)1024;
+      if (file->tracks[track].sizes[i] > largest) { largest = file->tracks[track].sizes[i]; }
+    }
+    s->audio_frame_count = frames;
+    s->audio_chunk_count = frames;
+    s->max_audio_size = largest;
     return 1;
   }
   if (mp4_format_is_pcm(file->tracks[track].format) == 0) {
