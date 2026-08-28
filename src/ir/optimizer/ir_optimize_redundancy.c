@@ -2836,3 +2836,534 @@ int ir_unify_param_copy_spelling_pass(IRFunction *function, int *changed) {
   ir_temp_value_map_destroy(&addr_taken);
   return 1;
 }
+
+#define BP_MAX_LEAVES 4
+#define BP_MAX_TERMS 4
+#define BP_MAX_PATTERN 32
+#define BP_MAX_DEPTH 8
+
+typedef struct {
+  const char *terms[BP_MAX_TERMS];
+  IROperandKind kinds[BP_MAX_TERMS];
+  int count;
+  long long konst;
+  int ok;
+} BPAddr;
+
+typedef struct {
+  const IRInstruction *load;
+  size_t load_at;
+  int shift;
+} BPLeaf;
+
+typedef struct {
+  BPLeaf leaves[BP_MAX_LEAVES];
+  int leaf_count;
+  size_t pattern[BP_MAX_PATTERN];
+  int pattern_count;
+  int ok;
+} BPMatch;
+
+static void bp_add_term(BPAddr *out, IROperandKind kind, const char *name) {
+  if (!name || out->count >= BP_MAX_TERMS) {
+    out->ok = 0;
+    return;
+  }
+  out->terms[out->count] = name;
+  out->kinds[out->count] = kind;
+  out->count++;
+}
+
+static void bp_collect(const IRFunction *function, const REDefs *defs,
+                       const IROperand *operand, BPAddr *out, int depth) {
+  if (!out->ok) {
+    return;
+  }
+  if (!operand || depth > BP_MAX_DEPTH) {
+    out->ok = 0;
+    return;
+  }
+  if (operand->kind == IR_OPERAND_INT) {
+    out->konst += operand->int_value;
+    return;
+  }
+  if ((operand->kind != IR_OPERAND_TEMP &&
+       operand->kind != IR_OPERAND_SYMBOL) ||
+      !operand->name) {
+    out->ok = 0;
+    return;
+  }
+  if (operand->kind == IR_OPERAND_SYMBOL &&
+      re_symbol_is_aliasable(defs, operand->name)) {
+    bp_add_term(out, operand->kind, operand->name);
+    return;
+  }
+  {
+    const IRInstruction *def =
+        re_unique_def(function, defs, operand->kind, operand->name);
+    if (def && def->op == IR_OP_ASSIGN &&
+        (def->lhs.kind == IR_OPERAND_TEMP ||
+         def->lhs.kind == IR_OPERAND_SYMBOL ||
+         def->lhs.kind == IR_OPERAND_INT)) {
+      bp_collect(function, defs, &def->lhs, out, depth + 1);
+      return;
+    }
+    if (def && def->op == IR_OP_BINARY && !def->is_float && def->text &&
+        strcmp(def->text, "+") == 0) {
+      bp_collect(function, defs, &def->lhs, out, depth + 1);
+      bp_collect(function, defs, &def->rhs, out, depth + 1);
+      return;
+    }
+  }
+  bp_add_term(out, operand->kind, operand->name);
+}
+
+static int bp_same_terms(const BPAddr *a, const BPAddr *b) {
+  int used[BP_MAX_TERMS];
+  if (a->count != b->count) {
+    return 0;
+  }
+  for (int i = 0; i < BP_MAX_TERMS; i++) {
+    used[i] = 0;
+  }
+  for (int i = 0; i < a->count; i++) {
+    int found = 0;
+    for (int j = 0; j < b->count && !found; j++) {
+      if (!used[j] && a->kinds[i] == b->kinds[j] &&
+          strcmp(a->terms[i], b->terms[j]) == 0) {
+        used[j] = 1;
+        found = 1;
+      }
+    }
+    if (!found) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int bp_note(BPMatch *m, size_t index) {
+  for (int i = 0; i < m->pattern_count; i++) {
+    if (m->pattern[i] == index) {
+      m->ok = 0;
+      return 0;
+    }
+  }
+  if (m->pattern_count >= BP_MAX_PATTERN) {
+    m->ok = 0;
+    return 0;
+  }
+  m->pattern[m->pattern_count++] = index;
+  return 1;
+}
+
+static long long bp_index_of(const REDefs *defs, IROperandKind kind,
+                             const char *name) {
+  char key[RE_NAME_MAX];
+  if (!re_name_key(key, sizeof(key), kind, name)) {
+    return 0;
+  }
+  return re_map_get(&defs->def_at, key);
+}
+
+static const IRInstruction *bp_trace_byte_load(const IRFunction *function,
+                                               const REDefs *defs,
+                                               const IROperand *operand,
+                                               BPMatch *m, size_t *load_at,
+                                               int depth) {
+  if (!operand || depth > BP_MAX_DEPTH ||
+      (operand->kind != IR_OPERAND_TEMP &&
+       operand->kind != IR_OPERAND_SYMBOL) ||
+      !operand->name) {
+    return NULL;
+  }
+  if (operand->kind == IR_OPERAND_SYMBOL &&
+      re_symbol_is_aliasable(defs, operand->name)) {
+    return NULL;
+  }
+  {
+    long long at = bp_index_of(defs, operand->kind, operand->name);
+    const IRInstruction *def =
+        re_unique_def(function, defs, operand->kind, operand->name);
+    if (!def || at <= 0) {
+      return NULL;
+    }
+    if (def->op == IR_OP_LOAD) {
+      if (def->is_float || !def->is_unsigned ||
+          def->rhs.kind != IR_OPERAND_INT || def->rhs.int_value != 1) {
+        return NULL;
+      }
+      if (!bp_note(m, (size_t)(at - 1))) {
+        return NULL;
+      }
+      *load_at = (size_t)(at - 1);
+      return def;
+    }
+    if (def->op == IR_OP_ASSIGN ||
+        (def->op == IR_OP_CAST && !def->is_float &&
+         subword_target_is_wider(def->text, 1))) {
+      if (!bp_note(m, (size_t)(at - 1))) {
+        return NULL;
+      }
+      return bp_trace_byte_load(function, defs, &def->lhs, m, load_at,
+                                depth + 1);
+    }
+  }
+  return NULL;
+}
+
+static void bp_expand(const IRFunction *function, const REDefs *defs,
+                      const IROperand *operand, BPMatch *m, int depth) {
+  if (!m->ok) {
+    return;
+  }
+  if (depth > BP_MAX_DEPTH) {
+    m->ok = 0;
+    return;
+  }
+  if ((operand->kind == IR_OPERAND_TEMP ||
+       operand->kind == IR_OPERAND_SYMBOL) &&
+      operand->name &&
+      !(operand->kind == IR_OPERAND_SYMBOL &&
+        re_symbol_is_aliasable(defs, operand->name))) {
+    long long at = bp_index_of(defs, operand->kind, operand->name);
+    const IRInstruction *def =
+        re_unique_def(function, defs, operand->kind, operand->name);
+    if (def && at > 0 && def->op == IR_OP_BINARY && !def->is_float &&
+        def->text && strcmp(def->text, "|") == 0) {
+      if (!bp_note(m, (size_t)(at - 1))) {
+        return;
+      }
+      bp_expand(function, defs, &def->lhs, m, depth + 1);
+      bp_expand(function, defs, &def->rhs, m, depth + 1);
+      return;
+    }
+    if (def && at > 0 && def->op == IR_OP_BINARY && !def->is_float &&
+        def->text && strcmp(def->text, "<<") == 0 &&
+        def->rhs.kind == IR_OPERAND_INT) {
+      long long amount = def->rhs.int_value;
+      if (amount <= 0 || amount % 8 != 0 || amount / 8 >= BP_MAX_LEAVES ||
+          m->leaf_count >= BP_MAX_LEAVES) {
+        m->ok = 0;
+        return;
+      }
+      if (!bp_note(m, (size_t)(at - 1))) {
+        return;
+      }
+      {
+        size_t load_at = 0;
+        const IRInstruction *load =
+            bp_trace_byte_load(function, defs, &def->lhs, m, &load_at, 0);
+        if (!load) {
+          m->ok = 0;
+          return;
+        }
+        m->leaves[m->leaf_count].load = load;
+        m->leaves[m->leaf_count].load_at = load_at;
+        m->leaves[m->leaf_count].shift = (int)(amount / 8);
+        m->leaf_count++;
+      }
+      return;
+    }
+  }
+  if (m->leaf_count >= BP_MAX_LEAVES) {
+    m->ok = 0;
+    return;
+  }
+  {
+    size_t load_at = 0;
+    const IRInstruction *load =
+        bp_trace_byte_load(function, defs, operand, m, &load_at, 0);
+    if (!load) {
+      m->ok = 0;
+      return;
+    }
+    m->leaves[m->leaf_count].load = load;
+    m->leaves[m->leaf_count].load_at = load_at;
+    m->leaves[m->leaf_count].shift = 0;
+    m->leaf_count++;
+  }
+}
+
+static void bp_trace(const char *why, size_t at, int detail) {
+  if (getenv("METTLE_BP_TRACE")) {
+    fprintf(stderr, "[bp] %zu bail=%s detail=%d\n", at, why, detail);
+  }
+}
+
+static int bp_in_pattern(const BPMatch *m, size_t index) {
+  for (int i = 0; i < m->pattern_count; i++) {
+    if (m->pattern[i] == index) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static long long bp_occurrences(const IRFunction *function, const char *name,
+                                IROperandKind kind, const BPMatch *m,
+                                int inside) {
+  long long total = 0;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP) {
+      continue;
+    }
+    if (bp_in_pattern(m, i) != inside || ins->op == IR_OP_DECLARE_LOCAL) {
+      continue;
+    }
+    if (ins->dest.kind == kind && ins->dest.name &&
+        strcmp(ins->dest.name, name) == 0) {
+      total++;
+    }
+    if (ins->lhs.kind == kind && ins->lhs.name &&
+        strcmp(ins->lhs.name, name) == 0) {
+      total++;
+    }
+    if (ins->rhs.kind == kind && ins->rhs.name &&
+        strcmp(ins->rhs.name, name) == 0) {
+      total++;
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      if (ins->arguments[a].kind == kind && ins->arguments[a].name &&
+          strcmp(ins->arguments[a].name, name) == 0) {
+        total++;
+      }
+    }
+  }
+  return total;
+}
+
+static int bp_writes_name(const IRInstruction *ins, const char *name,
+                          IROperandKind kind) {
+  if (!ir_instruction_writes_destination(ins)) {
+    return 0;
+  }
+  return ins->dest.kind == kind && ins->dest.name &&
+         strcmp(ins->dest.name, name) == 0;
+}
+
+static int bp_span_is_clean(const IRFunction *function, size_t from, size_t to,
+                            const BPAddr *addr) {
+  for (size_t i = from; i <= to && i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    switch (ins->op) {
+    case IR_OP_NOP:
+      continue;
+    case IR_OP_STORE:
+    case IR_OP_CALL:
+    case IR_OP_CALL_INDIRECT:
+    case IR_OP_LABEL:
+    case IR_OP_JUMP:
+    case IR_OP_BRANCH_ZERO:
+    case IR_OP_BRANCH_EQ:
+    case IR_OP_RETURN:
+      return 0;
+    default:
+      break;
+    }
+    if (ir_instruction_has_side_effect(ins)) {
+      return 0;
+    }
+    for (int t = 0; t < addr->count; t++) {
+      if (bp_writes_name(ins, addr->terms[t], addr->kinds[t])) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static int bp_build_consumed(const IRFunction *function, REMap *consumed) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    const IROperand *sides[2];
+    if (ins->op != IR_OP_BINARY || ins->is_float || !ins->text ||
+        (strcmp(ins->text, "|") != 0 && strcmp(ins->text, "<<") != 0)) {
+      continue;
+    }
+    sides[0] = &ins->lhs;
+    sides[1] = &ins->rhs;
+    for (int s = 0; s < 2; s++) {
+      char key[RE_NAME_MAX];
+      if ((sides[s]->kind != IR_OPERAND_TEMP &&
+           sides[s]->kind != IR_OPERAND_SYMBOL) ||
+          !re_name_key(key, sizeof(key), sides[s]->kind, sides[s]->name)) {
+        continue;
+      }
+      if (!re_map_set(consumed, key, 1)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static int bp_try_at(IRFunction *function, const REDefs *defs,
+                     const REMap *consumed, size_t at, int *changed) {
+  IRInstruction *terminal = &function->instructions[at];
+  BPMatch m = {0};
+  BPAddr base = {0};
+  int width;
+  size_t lowest_at = 0;
+  size_t first = at;
+  size_t last = at;
+  const IRInstruction *lowest = NULL;
+  char key[RE_NAME_MAX];
+
+  if (terminal->op != IR_OP_BINARY || terminal->is_float || !terminal->text ||
+      strcmp(terminal->text, "|") != 0 ||
+      terminal->dest.kind != IR_OPERAND_TEMP || !terminal->dest.name) {
+    return 0;
+  }
+  if (!re_name_key(key, sizeof(key), terminal->dest.kind, terminal->dest.name) ||
+      re_map_get(consumed, key) != 0) {
+    return 0;
+  }
+
+  m.ok = 1;
+  bp_expand(function, defs, &terminal->lhs, &m, 0);
+  bp_expand(function, defs, &terminal->rhs, &m, 0);
+  if (!m.ok) {
+    bp_trace("expand", at, m.leaf_count);
+    return 0;
+  }
+  width = m.leaf_count;
+  if (width != 2 && width != 4) {
+    bp_trace("width", at, width);
+    return 0;
+  }
+  for (int k = 0; k < width; k++) {
+    int seen = 0;
+    for (int j = 0; j < width; j++) {
+      if (m.leaves[j].shift == k) {
+        seen++;
+      }
+    }
+    if (seen != 1) {
+      bp_trace("shifts", at, k);
+      return 0;
+    }
+  }
+
+  base.ok = 1;
+  for (int j = 0; j < width; j++) {
+    BPAddr here = {0};
+    here.ok = 1;
+    bp_collect(function, defs, &m.leaves[j].load->lhs, &here, 0);
+    if (!here.ok) {
+      return 0;
+    }
+    if (m.leaves[j].shift == 0) {
+      base = here;
+      lowest = m.leaves[j].load;
+      lowest_at = m.leaves[j].load_at;
+    }
+  }
+  if (!lowest) {
+    return 0;
+  }
+  for (int j = 0; j < width; j++) {
+    BPAddr here = {0};
+    here.ok = 1;
+    bp_collect(function, defs, &m.leaves[j].load->lhs, &here, 0);
+    if (!here.ok || !bp_same_terms(&base, &here) ||
+        here.konst != base.konst + m.leaves[j].shift) {
+      bp_trace("addr", at, j);
+      return 0;
+    }
+    if (m.leaves[j].load->alias_class != lowest->alias_class) {
+      return 0;
+    }
+  }
+
+  if (!bp_note(&m, at)) {
+    return 0;
+  }
+  for (int i = 0; i < m.pattern_count; i++) {
+    if (m.pattern[i] < first) {
+      first = m.pattern[i];
+    }
+    if (m.pattern[i] > last) {
+      last = m.pattern[i];
+    }
+  }
+  if (last != at || !bp_span_is_clean(function, first, last, &base)) {
+    bp_trace("span", at, (int)first);
+    return 0;
+  }
+
+  for (int i = 0; i < m.pattern_count; i++) {
+    const IRInstruction *ins = &function->instructions[m.pattern[i]];
+    if (m.pattern[i] == at) {
+      continue;
+    }
+    if (!ir_instruction_writes_destination(ins) ||
+        (ins->dest.kind != IR_OPERAND_TEMP &&
+         ins->dest.kind != IR_OPERAND_SYMBOL) ||
+        !ins->dest.name) {
+      return 0;
+    }
+    if (bp_occurrences(function, ins->dest.name, ins->dest.kind, &m, 0) != 0) {
+      bp_trace("outside-use", at, (int)m.pattern[i]);
+      return 0;
+    }
+  }
+
+  {
+    IROperand address = ir_operand_copy(&lowest->lhs);
+    IROperand dest = ir_operand_copy(&terminal->dest);
+    int keep_float_bits = 0;
+    ir_instruction_destroy_storage(terminal);
+    memset(terminal, 0, sizeof(*terminal));
+    terminal->op = IR_OP_LOAD;
+    terminal->dest = dest;
+    terminal->lhs = address;
+    terminal->rhs = ir_operand_int(width);
+    terminal->is_unsigned = 1;
+    terminal->float_bits = keep_float_bits;
+    terminal->alias_class = IR_ALIAS_CLASS_NONE;
+    terminal->location = function->instructions[lowest_at].location;
+  }
+  for (int i = 0; i < m.pattern_count; i++) {
+    if (m.pattern[i] == at) {
+      continue;
+    }
+    ir_instruction_destroy_storage(&function->instructions[m.pattern[i]]);
+    memset(&function->instructions[m.pattern[i]], 0,
+           sizeof(function->instructions[m.pattern[i]]));
+    function->instructions[m.pattern[i]].op = IR_OP_NOP;
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+int ir_widen_byte_pack_pass(IRFunction *function, int *changed) {
+  REDefs defs = {0};
+  REMap consumed = {0};
+  IRTempValueMap addr_taken;
+
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  if (!ir_temp_value_map_init(&addr_taken)) {
+    return 1;
+  }
+  defs.function = function;
+  defs.addr_taken = &addr_taken;
+  if (ir_addr_taken_set_build(function, &addr_taken) &&
+      re_collect_defs(function, &defs) &&
+      bp_build_consumed(function, &consumed)) {
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      bp_try_at(function, &defs, &consumed, i, changed);
+    }
+  }
+
+  re_map_destroy(&consumed);
+  re_map_destroy(&defs.defs);
+  re_map_destroy(&defs.def_at);
+  ir_temp_value_map_destroy(&addr_taken);
+  return 1;
+}

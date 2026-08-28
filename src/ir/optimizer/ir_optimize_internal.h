@@ -512,6 +512,7 @@ int ir_fold_range_test_pass(IRFunction *function, int *changed);
 int ir_float_divide_by_power_of_two_pass(IRFunction *function, int *changed);
 /* `(int32)buf[i]` on an unsigned narrow element: the load already put the
  * whole value in the register. */
+int ir_widen_byte_pack_pass(IRFunction *function, int *changed);
 int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed);
 /* Move a load no store in its loop can change into the preheader. */
 int ir_hoist_invariant_loads_pass(IRFunction *function, int *changed);

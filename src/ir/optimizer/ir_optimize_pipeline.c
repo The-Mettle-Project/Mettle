@@ -166,6 +166,8 @@ static const IROptNamedPass g_ir_lowering_cleanup[] = {
      {IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
     {"widen_subword_cast", ir_widen_subword_load_cast_pass,
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
+    {"widen_byte_pack", ir_widen_byte_pack_pass,
+     {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
     {"ascii_casefold_range", ir_ascii_casefold_range_pass,
      {IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
     /* After the casefold pass, which claims the two-range letter test and
