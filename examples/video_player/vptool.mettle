@@ -8,6 +8,7 @@ import "h264";
 import "h264_decode";
 import "h264_frame";
 import "aac";
+import "aac_decode";
 
 extern fn Win_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
 extern fn Win_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
@@ -528,6 +529,49 @@ fn command_h264dump(path: cstring, frame_limit: int32, output: cstring, skip_fil
   return 0;
 }
 
+fn command_aacparse(path: cstring, frame_limit: int32) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) { return 1; }
+  defer source_close(file);
+  if (file->audio_codec != SOURCE_AUDIO_AAC) { println("not AAC"); return 1; }
+
+  var config: AacConfig;
+  if (aac_read_config(&config, file->audio_config, file->audio_config_size) != AAC_OK) {
+    println("config parse failed");
+    return 1;
+  }
+  var decoder: AacDecoder* = aac_decoder_new(&config);
+  if (decoder == 0) { return 1; }
+  defer aac_decoder_free(decoder);
+
+  var buffer: uint8* = malloc((int64)file->max_audio_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  var limit: int32 = frame_limit;
+  if (limit > file->audio_frame_count) { limit = file->audio_frame_count; }
+  var good: int32 = 0;
+  var failures: int32 = 0;
+  var shown: int32 = 0;
+  for i in 0..limit {
+    var size: int32 = source_read_audio(file, i, buffer, (int64)file->max_audio_size);
+    if (size <= 0) { println("frame {i}: unreadable"); return 1; }
+    var result: int32 = aac_decode_frame(decoder, buffer, (int64)size);
+    if (result == AAC_OK) {
+      good = good + 1;
+    } else {
+      failures = failures + 1;
+      if (shown < 6) {
+        println("frame {i}: status {result} ({size} bytes) win {decoder->channels[0].window_sequence} max_sfb {decoder->channels[0].max_sfb} groups {decoder->channels[0].num_groups} stage {decoder->fail_stage} at_bit {decoder->fail_bits} of {size * 8}");
+        shown = shown + 1;
+      }
+    }
+  }
+  println("parsed {good} of {limit} frames, {failures} failures");
+  return 0;
+}
+
 fn command_aacinfo(path: cstring, frame_limit: int32) -> int32 {
   var status: int32 = 0;
   var file: MediaSource* = source_open(path, &status);
@@ -940,6 +984,11 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   }
   if (cstring_equals(command, "h264rgb") != 0 && argc >= 5) {
     return command_h264rgb(argv[2], parse_int(argv[3]), argv[4]);
+  }
+  if (cstring_equals(command, "aacparse") != 0 && argc >= 3) {
+    var parse_limit: int32 = 1000000;
+    if (argc >= 4) { parse_limit = parse_int(argv[3]); }
+    return command_aacparse(argv[2], parse_limit);
   }
   if (cstring_equals(command, "aacinfo") != 0 && argc >= 3) {
     var aac_limit: int32 = 4;
