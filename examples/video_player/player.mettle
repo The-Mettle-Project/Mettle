@@ -7,6 +7,8 @@ import "audio";
 import "h264";
 import "h264_decode";
 import "h264_frame";
+import "aac";
+import "aac_decode";
 
 const SEEK_STEP_US = 5000000;
 const SEEK_LONG_US = 30000000;
@@ -935,7 +937,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   if (g_audio->ready != 0) {
     println(", audio {g_file->audio_channels} ch {g_file->audio_sample_rate} Hz");
   } else if (g_file->audio_codec == SOURCE_AUDIO_AAC) {
-    println(", AAC audio not decoded yet");
+    println(", AAC audio unavailable");
   } else if (source_has_audio(g_file) != 0) {
     println(", audio device unavailable");
   } else {

@@ -95,6 +95,12 @@ struct AacDecoder {
   error: int32;
 }
 
+var g_aac_use_tns: int32 = 1;
+var g_aac_frame_pns: int32 = 0;
+var g_aac_frame_pulse: int32 = 0;
+var g_aac_book_use: int64[16];
+var g_aac_window_use: int64[4];
+
 const AAC_PI = 3.14159265358979323846;
 
 fn aac_fabs(x: float64) -> float64 {
@@ -484,6 +490,7 @@ fn aac_read_pulse_data(r: AacBits*, c: AacChannel*) -> int32 {
   }
   if (c->pulse_start_sfb > c->num_swb) { return AAC_ERR_BITSTREAM; }
   c->pulse_present = 1;
+  g_aac_frame_pulse = g_aac_frame_pulse + 1;
   return AAC_OK;
 }
 
@@ -747,9 +754,6 @@ fn aac_decode_frame(d: AacDecoder*, data: uint8*, size: int64) -> int32 {
   return AAC_OK;
 }
 
-var g_aac_use_tns: int32 = 1;
-var g_aac_book_use: int64[16];
-var g_aac_window_use: int64[4];
 
 fn aac_dequantize(d: AacDecoder*, c: AacChannel*) {
   var group_start: int32 = 0;
@@ -758,6 +762,7 @@ fn aac_dequantize(d: AacDecoder*, c: AacChannel*) {
     for sfb in 0..c->max_sfb {
       var book: int32 = c->sfb_codebook[g * AAC_MAX_SFB + sfb];
       g_aac_book_use[book] = g_aac_book_use[book] + (int64)1;
+      if (book == AAC_HCB_NOISE) { g_aac_frame_pns = g_aac_frame_pns + 1; }
       if (book == AAC_HCB_ZERO || book == AAC_HCB_NOISE ||
           book == AAC_HCB_INTENSITY || book == AAC_HCB_INTENSITY2) {
         continue;
@@ -853,7 +858,7 @@ fn aac_apply_tns(d: AacDecoder*, c: AacChannel*) {
       var work: float64[21];
       lpc[0] = 1.0;
       for m in 1..(order + 1) {
-        var coefficient: float64 = c->tns_coefficient[slot * 20 + m - 1];
+        var coefficient: float64 = 0.0 - c->tns_coefficient[slot * 20 + m - 1];
         for i in 1..m { work[i] = lpc[i] + coefficient * lpc[m - i]; }
         for i in 1..m { lpc[i] = work[i]; }
         lpc[m] = coefficient;
@@ -961,6 +966,8 @@ fn aac_filterbank(d: AacDecoder*, c: AacChannel*, output: float64*) {
 }
 
 fn aac_reconstruct(d: AacDecoder*, output: float64*) {
+  g_aac_frame_pns = 0;
+  g_aac_frame_pulse = 0;
   for ch in 0..d->frame_channels {
     aac_dequantize(d, &d->channels[ch]);
   }
@@ -968,6 +975,15 @@ fn aac_reconstruct(d: AacDecoder*, output: float64*) {
   for ch in 0..d->frame_channels {
     if (g_aac_use_tns != 0) { aac_apply_tns(d, &d->channels[ch]); }
     aac_filterbank(d, &d->channels[ch], &output[ch * 1024]);
+  }
+}
+
+fn aac_decoder_reset(d: AacDecoder*) {
+  for ch in 0..2 {
+    for i in 0..AAC_SPECTRUM { d->channels[ch].overlap[i] = 0.0; }
+    for i in 0..AAC_SPECTRUM { d->channels[ch].spectrum[i] = 0.0; }
+    d->channels[ch].previous_window_shape = 0;
+    d->channels[ch].window_sequence = AAC_WINDOW_LONG;
   }
 }
 

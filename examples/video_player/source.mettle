@@ -339,6 +339,10 @@ fn source_sync_sample_at_or_before(s: MediaSource*, sample: int32) -> int32 {
 }
 
 fn source_has_audio(s: MediaSource*) -> int32 {
+  if (s->audio_codec == SOURCE_AUDIO_AAC) {
+    if (s->audio_frame_count <= 0) { return 0; }
+    return 1;
+  }
   if (s->audio_codec != SOURCE_AUDIO_PCM) { return 0; }
   if (s->audio_chunk_count <= 0) { return 0; }
   return 1;

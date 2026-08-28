@@ -588,11 +588,12 @@ fn command_aacwav(path: cstring, frame_limit: int32, output: cstring) -> int32 {
       }
     }
     if (g_aac_trace != 0) {
+      var _unused: int32 = 0;
       var tns0: int32 = 0;
       for w in 0..8 { tns0 = tns0 + decoder->channels[0].tns_filters[w]; }
       var tns1: int32 = 0;
       for w in 0..8 { tns1 = tns1 + decoder->channels[1].tns_filters[w]; }
-      println("f {i} win {decoder->channels[0].window_sequence} tns {tns0}/{tns1} ms {decoder->ms_mask}");
+      println("f {i} win {decoder->channels[0].window_sequence} tns {tns0}/{tns1} ord {decoder->channels[0].tns_order[0]} dir {decoder->channels[0].tns_direction[0]} len {decoder->channels[0].tns_length[0]} pns {g_aac_frame_pns} pulse {g_aac_frame_pulse}");
     }
     fwrite(&samples[0], 1, (int64)at, fp);
     written = written + 1;
@@ -1063,7 +1064,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   }
   if (cstring_equals(command, "aacwav") != 0 && argc >= 5) {
     if (argc >= 6) { g_pcm_scale = 1.0 / (float64)parse_int(argv[5]); }
-    if (argc >= 7) { g_aac_use_tns = 0; g_aac_trace = 1; }
+    if (argc >= 7) { g_aac_use_tns = 0; }
     return command_aacwav(argv[2], parse_int(argv[3]), argv[4]);
   }
   if (cstring_equals(command, "aacparse") != 0 && argc >= 3) {

@@ -1,5 +1,7 @@
 import "std/mem";
 import "source";
+import "aac";
+import "aac_decode";
 
 const AUDIO_BUFFER_COUNT = 12;
 const AUDIO_WHDR_DONE = 1;
@@ -59,6 +61,13 @@ struct AudioPlayer {
   buffers: uint8*;
   in_flight: int32*;
 
+  codec: int32;
+  aac: AacDecoder*;
+  aac_pcm: float64*;
+  aac_channels: int32;
+  aac_frame_samples: int32;
+  aac_scratch: uint8*;
+
   next_chunk: int32;
   base_microseconds: int64;
   wrap_microseconds: int64;
@@ -78,6 +87,27 @@ fn audio_open(file: MediaSource*) -> AudioPlayer* {
   var sample_rate: int32 = file->audio_sample_rate;
   var bits: int32 = file->audio_bits;
   var align: int32 = file->audio_block_align;
+
+  player->codec = file->audio_codec;
+  if (player->codec == SOURCE_AUDIO_AAC) {
+    var config: AacConfig;
+    if (aac_read_config(&config, file->audio_config, file->audio_config_size) != AAC_OK) {
+      return player;
+    }
+    player->aac = aac_decoder_new(&config);
+    if (player->aac == 0) { return player; }
+    player->aac_pcm = malloc(2048 * 8);
+    if (player->aac_pcm == 0) { return player; }
+    player->aac_scratch = malloc((int64)file->max_audio_size);
+    if (player->aac_scratch == 0) { return player; }
+    channels = config.channels;
+    sample_rate = config.sample_rate;
+    bits = 16;
+    align = channels * 2;
+    player->aac_channels = channels;
+    player->aac_frame_samples = config.frame_length;
+  }
+
   if (align <= 0) { align = channels * (bits / 8); }
   if (channels <= 0 || sample_rate <= 0 || align <= 0) { return player; }
 
@@ -96,6 +126,9 @@ fn audio_open(file: MediaSource*) -> AudioPlayer* {
   }
 
   var capacity: int32 = file->max_audio_size;
+  if (player->codec == SOURCE_AUDIO_AAC) {
+    capacity = player->aac_frame_samples * align;
+  }
   if (capacity < 4096) { capacity = 4096; }
 
   player->headers = malloc((int64)AUDIO_BUFFER_COUNT * sizeof(WaveHeader));
@@ -117,6 +150,32 @@ fn audio_open(file: MediaSource*) -> AudioPlayer* {
   return player;
 }
 
+fn audio_decode_aac_frame(player: AudioPlayer*, file: MediaSource*, frame: int32,
+                          target: uint8*, scratch: uint8*) -> int32 {
+  if (frame < 0 || frame >= file->audio_frame_count) { return 0; }
+  var size: int32 = source_read_audio(file, frame, scratch, (int64)file->max_audio_size);
+  if (size <= 0) { return 0; }
+  if (aac_decode_pcm(player->aac, scratch, (int64)size, player->aac_pcm) != AAC_OK) { return 0; }
+
+  var channels: int32 = player->aac_channels;
+  var samples: int32 = player->aac_frame_samples;
+  var at: int32 = 0;
+  for n in 0..samples {
+    for ch in 0..channels {
+      var value: float64 = player->aac_pcm[ch * 1024 + n];
+      var rounded: float64 = value + 0.5;
+      if (value < 0.0) { rounded = value - 0.5; }
+      var scaled: int32 = (int32)rounded;
+      if (scaled > 32767) { scaled = 32767; }
+      if (scaled < -32768) { scaled = 0 - 32768; }
+      target[at] = (uint8)(scaled & 255);
+      target[at + 1] = (uint8)((scaled >> 8) & 255);
+      at = at + 2;
+    }
+  }
+  return at;
+}
+
 fn audio_close(player: AudioPlayer*) {
   if (player == 0) { return; }
   if (player->ready != 0) {
@@ -124,6 +183,9 @@ fn audio_close(player: AudioPlayer*) {
     audio_release_headers(player);
     waveOutClose(player->device);
   }
+  if (player->aac != 0) { aac_decoder_free(player->aac); }
+  if (player->aac_pcm != 0) { free(player->aac_pcm); }
+  if (player->aac_scratch != 0) { free(player->aac_scratch); }
   if (player->headers != 0) { free(player->headers); }
   if (player->buffers != 0) { free(player->buffers); }
   if (player->in_flight != 0) { free(player->in_flight); }
@@ -204,6 +266,29 @@ fn audio_seek(player: AudioPlayer*, file: MediaSource*, microseconds: int64) {
   player->last_position = (uint32)0;
   player->finished = 0;
 
+  if (player->codec == SOURCE_AUDIO_AAC) {
+    var samples: int64 = microseconds * (int64)file->audio_sample_rate / (int64)1000000;
+    var frame: int32 = (int32)(samples / (int64)player->aac_frame_samples);
+    if (frame < 0) { frame = 0; }
+    aac_decoder_reset(player->aac);
+    if (frame > 0) {
+      var priming: uint8* = malloc((int64)file->max_audio_size);
+      if (priming != 0) {
+        var throwaway: uint8* = malloc((int64)player->buffer_capacity);
+        if (throwaway != 0) {
+          audio_decode_aac_frame(player, file, frame - 1, throwaway, priming);
+          free(throwaway);
+        }
+        free(priming);
+      }
+    }
+    player->next_chunk = frame;
+    player->base_microseconds = (int64)frame * (int64)player->aac_frame_samples *
+                                (int64)1000000 / (int64)file->audio_sample_rate;
+    if (player->paused == 0) { waveOutRestart(player->device); }
+    return;
+  }
+
   var byte_position: int64 = microseconds * (int64)player->bytes_per_second / (int64)1000000;
   if (byte_position < 0) { byte_position = 0; }
   var chunk: int32 = source_audio_chunk_at_byte(file, byte_position);
@@ -223,12 +308,19 @@ fn audio_pump(player: AudioPlayer*, file: MediaSource*) {
       waveOutUnprepareHeader(player->device, header, (uint32)sizeof(WaveHeader));
       player->in_flight[i] = 0;
     }
-    if (player->next_chunk >= file->audio_chunk_count) {
+    var total: int32 = file->audio_chunk_count;
+    if (player->codec == SOURCE_AUDIO_AAC) { total = file->audio_frame_count; }
+    if (player->next_chunk >= total) {
       player->finished = 1;
       return;
     }
     var target: uint8* = &player->buffers[(int64)i * (int64)player->buffer_capacity];
-    var size: int32 = source_read_audio(file, player->next_chunk, target, (int64)player->buffer_capacity);
+    var size: int32 = 0;
+    if (player->codec == SOURCE_AUDIO_AAC) {
+      size = audio_decode_aac_frame(player, file, player->next_chunk, target, player->aac_scratch);
+    } else {
+      size = source_read_audio(file, player->next_chunk, target, (int64)player->buffer_capacity);
+    }
     player->next_chunk = player->next_chunk + 1;
     if (size <= 0) { continue; }
 
