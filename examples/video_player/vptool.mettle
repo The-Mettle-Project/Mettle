@@ -4,6 +4,7 @@ import "jpeg";
 import "source";
 import "audio";
 import "mp4";
+import "h264";
 
 extern fn Win_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
 extern fn Win_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
@@ -330,6 +331,83 @@ fn command_mp4samples(path: cstring, track: int32, count: int32) -> int32 {
   return 0;
 }
 
+fn command_h264info(path: cstring, sample_limit: int32, print_limit: int32) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) {
+    println("cannot open file, status {status}");
+    return 1;
+  }
+  defer source_close(file);
+
+  if (file->video_codec != SOURCE_VIDEO_H264) {
+    println("video track is not H.264");
+    return 1;
+  }
+
+  var decoder: H264Decoder* = h264_decoder_new();
+  if (decoder == 0) { return 1; }
+  defer h264_decoder_free(decoder);
+
+  var config_status: int32 = h264_read_config(decoder, file->codec_config, file->codec_config_size);
+  if (config_status != H264_OK) {
+    println("avcC parse failed with status {config_status}");
+    return 1;
+  }
+
+  var sps: H264Sps* = &decoder->sps[decoder->active_sps];
+  var pps: H264Pps* = &decoder->pps[decoder->active_pps];
+  print("profile       ");
+  print(h264_profile_name(sps->profile_idc));
+  println(" ({sps->profile_idc}) level {sps->level_idc / 10}.{sps->level_idc % 10}");
+  println("size          {sps->width}x{sps->height} from {sps->pic_width_in_mbs}x{sps->pic_height_in_map_units} macroblocks");
+  println("crop          l{sps->crop_left} r{sps->crop_right} t{sps->crop_top} b{sps->crop_bottom}");
+  println("chroma        format {sps->chroma_format_idc}, {sps->bit_depth_luma} bit luma, {sps->bit_depth_chroma} bit chroma");
+  println("frame num     {sps->log2_max_frame_num} bits, poc type {sps->pic_order_cnt_type}, poc lsb {sps->log2_max_pic_order_cnt_lsb} bits");
+  println("ref frames    {sps->max_num_ref_frames}, frame_mbs_only {sps->frame_mbs_only}, direct8x8 {sps->direct_8x8_inference}");
+  println("entropy       {pps->entropy_coding_mode} (0 CAVLC, 1 CABAC)");
+  println("pps           init qp {pps->pic_init_qp}, chroma offset {pps->chroma_qp_index_offset}, deblock control {pps->deblocking_filter_control_present}");
+  println("              weighted pred {pps->weighted_pred}, bipred idc {pps->weighted_bipred_idc}, transform8x8 {pps->transform_8x8_mode}");
+  println("nal length    {decoder->nal_length_size} bytes");
+
+  var buffer: uint8* = malloc((int64)file->max_video_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  var counts: int32[8];
+  for i in 0..8 { counts[i] = 0; }
+  var limit: int32 = sample_limit;
+  if (limit > file->video_frame_count) { limit = file->video_frame_count; }
+  var failures: int32 = 0;
+
+  for i in 0..limit {
+    var size: int32 = source_read_video(file, i, buffer, (int64)file->max_video_size);
+    if (size <= 0) { failures = failures + 1; continue; }
+    var nal_total: int32 = h264_nal_count(decoder, buffer, (int64)size);
+    for n in 0..nal_total {
+      var nal_size: int64 = 0;
+      var nal: uint8* = h264_nal_at(decoder, buffer, (int64)size, n, &nal_size);
+      if (nal == 0) { continue; }
+      var kind: int32 = h264_nal_type(nal);
+      if (kind == H264_NAL_SLICE || kind == H264_NAL_IDR) {
+        var header: H264SliceHeader;
+        if (h264_parse_slice_header(decoder, nal, nal_size, &header) != H264_OK) {
+          failures = failures + 1;
+          continue;
+        }
+        counts[header.slice_type] = counts[header.slice_type] + 1;
+        if (i < print_limit) {
+          print("sample {i} nal {n}: ");
+          print(h264_slice_type_name(header.slice_type));
+          println(" frame_num {header.frame_num} poc_lsb {header.pic_order_cnt_lsb} qp {header.qp} idr {header.is_idr} first_mb {header.first_mb_in_slice}");
+        }
+      }
+    }
+  }
+  println("slices        I {counts[H264_SLICE_I]}  P {counts[H264_SLICE_P]}  B {counts[H264_SLICE_B]}  failures {failures}");
+  return 0;
+}
+
 fn parse_int(text: cstring) -> int32 {
   var value: int32 = 0;
   var i: int64 = 0;
@@ -347,6 +425,7 @@ fn print_usage() {
   println("  vptool bench <input>");
   println("  vptool jpeg  <input.jpg> <output.ppm>");
   println("  vptool audio <input> [seconds]");
+  println("  vptool h264info <input.mp4> [samples]");
   println("  vptool mp4info <input.mp4>");
   println("  vptool mp4samples <input.mp4> <track> <count>");
 }
@@ -368,6 +447,13 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   }
   if (cstring_equals(command, "bench") != 0) {
     return command_bench(argv[2]);
+  }
+  if (cstring_equals(command, "h264info") != 0) {
+    var limit: int32 = 200;
+    if (argc >= 4) { limit = parse_int(argv[3]); }
+    var shown: int32 = 8;
+    if (argc >= 5) { shown = parse_int(argv[4]); }
+    return command_h264info(argv[2], limit, shown);
   }
   if (cstring_equals(command, "mp4info") != 0) {
     return command_mp4info(argv[2]);

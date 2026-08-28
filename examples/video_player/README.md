@@ -69,6 +69,7 @@ seconds. It stays up while paused.
 | [`mp4.mettle`](mp4.mettle) | ISO base media parsing, sample tables and fragments |
 | [`jpeg.mettle`](jpeg.mettle) | baseline JPEG decoder, from markers to BGRA pixels |
 | [`audio.mettle`](audio.mettle) | waveOut ring buffer and the audio clock |
+| [`h264.mettle`](h264.mettle) | H.264 bitstream: NAL units, SPS, PPS, slice headers |
 | [`vptool.mettle`](vptool.mettle) | command line tool used to test the other modules |
 
 ### The containers
@@ -123,6 +124,7 @@ vptool.exe jpeg  photo.jpg out.ppm     # decode a still
 vptool.exe audio clip.mov 5            # audio clock against the wall clock
 vptool.exe mp4info clip.mp4            # tracks, formats, sample counts
 vptool.exe mp4samples clip.mp4 0 100   # offset, size, dts, pts, sync per sample
+vptool.exe h264info clip.mp4 400       # H.264 parameter sets and slice headers
 ```
 
 What was measured:
@@ -136,8 +138,13 @@ What was measured:
   and keyframe flag identical.
 - Frames decoded under `--build`, `--release` and `-s --release`, with every
   pixel hashed: the same in all three.
-- 1390 truncated and byte-corrupted files through the decoder and both
-  demuxers under `--safe`: no crash, no read outside a buffer, no hang.
+- The H.264 slice headers read out of the reference clip compared against
+  `ffprobe -show_frames`: 400 of 400 slice types identical, which also confirms
+  the parameter sets, since a wrong field length would misalign every header
+  after it.
+- 1918 truncated and byte-corrupted files through the decoder, both demuxers
+  and the H.264 header parser under `--safe`: no crash, no read outside a
+  buffer, no hang.
 - Playback rate measured by screenshotting the window and matching against an
   ffmpeg frame index: 153 frames in 6.364 s at 24 fps on the audio clock,
   84 in 3.351 s at 25 fps on the wall clock.
@@ -148,7 +155,9 @@ What was measured:
 
 - Windows only. The window, the blit, and the audio device are Win32.
 - H.264 and AAC are not decoded yet. A file carrying them opens, reports what
-  it holds, and says what to convert.
+  it holds, and says what to convert. The H.264 work has started: parameter
+  sets and slice headers read correctly, and what remains is the CABAC engine,
+  prediction, the transform, and the deblocking filter.
 - Progressive JPEG is rejected. Motion JPEG does not use it.
 - Decoding runs on the UI thread. It is fast enough for 720p and 1080p on one
   core, and a 4K file would want a decode thread.

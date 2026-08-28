@@ -1,0 +1,701 @@
+import "std/mem";
+
+const H264_OK = 0;
+const H264_ERR_CONFIG = 1;
+const H264_ERR_UNSUPPORTED = 2;
+const H264_ERR_BITSTREAM = 3;
+const H264_ERR_NO_MEMORY = 4;
+
+const H264_NAL_SLICE = 1;
+const H264_NAL_SLICE_A = 2;
+const H264_NAL_IDR = 5;
+const H264_NAL_SEI = 6;
+const H264_NAL_SPS = 7;
+const H264_NAL_PPS = 8;
+const H264_NAL_AUD = 9;
+
+const H264_SLICE_P = 0;
+const H264_SLICE_B = 1;
+const H264_SLICE_I = 2;
+const H264_SLICE_SP = 3;
+const H264_SLICE_SI = 4;
+
+const H264_MAX_PARAMETER_SETS = 32;
+
+struct H264Bits {
+  data: uint8*;
+  size: int64;
+  position: int64;
+  overrun: int32;
+}
+
+struct H264Sps {
+  valid: int32;
+  profile_idc: int32;
+  constraint_flags: int32;
+  level_idc: int32;
+  id: int32;
+
+  chroma_format_idc: int32;
+  separate_colour_plane: int32;
+  bit_depth_luma: int32;
+  bit_depth_chroma: int32;
+  transform_bypass: int32;
+  scaling_matrix_present: int32;
+
+  log2_max_frame_num: int32;
+  pic_order_cnt_type: int32;
+  log2_max_pic_order_cnt_lsb: int32;
+  delta_pic_order_always_zero: int32;
+  offset_for_non_ref_pic: int32;
+  offset_for_top_to_bottom_field: int32;
+  poc_cycle_length: int32;
+
+  max_num_ref_frames: int32;
+  gaps_in_frame_num_allowed: int32;
+  pic_width_in_mbs: int32;
+  pic_height_in_map_units: int32;
+  frame_mbs_only: int32;
+  mb_adaptive_frame_field: int32;
+  direct_8x8_inference: int32;
+
+  crop_left: int32;
+  crop_right: int32;
+  crop_top: int32;
+  crop_bottom: int32;
+
+  width: int32;
+  height: int32;
+}
+
+struct H264Pps {
+  valid: int32;
+  id: int32;
+  sps_id: int32;
+  entropy_coding_mode: int32;
+  bottom_field_pic_order_present: int32;
+  num_slice_groups: int32;
+  num_ref_idx_l0_default: int32;
+  num_ref_idx_l1_default: int32;
+  weighted_pred: int32;
+  weighted_bipred_idc: int32;
+  pic_init_qp: int32;
+  pic_init_qs: int32;
+  chroma_qp_index_offset: int32;
+  second_chroma_qp_index_offset: int32;
+  deblocking_filter_control_present: int32;
+  constrained_intra_pred: int32;
+  redundant_pic_cnt_present: int32;
+  transform_8x8_mode: int32;
+}
+
+struct H264SliceHeader {
+  first_mb_in_slice: int32;
+  slice_type: int32;
+  slice_type_raw: int32;
+  pps_id: int32;
+  frame_num: int32;
+  field_pic: int32;
+  bottom_field: int32;
+  idr_pic_id: int32;
+  pic_order_cnt_lsb: int32;
+  delta_pic_order_cnt_bottom: int32;
+  delta_pic_order_cnt_0: int32;
+  delta_pic_order_cnt_1: int32;
+  redundant_pic_cnt: int32;
+  direct_spatial_mv_pred: int32;
+  num_ref_idx_l0_active: int32;
+  num_ref_idx_l1_active: int32;
+  cabac_init_idc: int32;
+  slice_qp_delta: int32;
+  qp: int32;
+  disable_deblocking_filter_idc: int32;
+  slice_alpha_c0_offset: int32;
+  slice_beta_offset: int32;
+  nal_ref_idc: int32;
+  nal_unit_type: int32;
+  is_idr: int32;
+}
+
+struct H264Decoder {
+  nal_length_size: int32;
+  config_profile: int32;
+  config_level: int32;
+
+  sps: H264Sps[32];
+  pps: H264Pps[32];
+  active_sps: int32;
+  active_pps: int32;
+
+  rbsp: uint8*;
+  rbsp_capacity: int64;
+
+  error: int32;
+}
+
+fn h264_bits_init(r: H264Bits*, data: uint8*, size: int64) {
+  r->data = data;
+  r->size = size;
+  r->position = 0;
+  r->overrun = 0;
+}
+
+fn h264_read_bit(r: H264Bits*) -> int32 {
+  var byte_index: int64 = r->position >> 3;
+  if (byte_index >= r->size) {
+    r->overrun = 1;
+    return 0;
+  }
+  var shift: int32 = 7 - (int32)(r->position & (int64)7);
+  r->position = r->position + 1;
+  return ((int32)r->data[byte_index] >> shift) & 1;
+}
+
+fn h264_read_bits(r: H264Bits*, count: int32) -> int32 {
+  var value: int32 = 0;
+  for i in 0..count {
+    value = (value << 1) | h264_read_bit(r);
+  }
+  return value;
+}
+
+fn h264_read_ue(r: H264Bits*) -> int32 {
+  var zeros: int32 = 0;
+  while (h264_read_bit(r) == 0 && r->overrun == 0 && zeros < 32) {
+    zeros = zeros + 1;
+  }
+  if (zeros >= 32 || r->overrun != 0) { return 0; }
+  if (zeros == 0) { return 0; }
+  return (1 << zeros) - 1 + h264_read_bits(r, zeros);
+}
+
+fn h264_read_se(r: H264Bits*) -> int32 {
+  var value: int32 = h264_read_ue(r);
+  if ((value & 1) != 0) {
+    return (value + 1) / 2;
+  }
+  return 0 - value / 2;
+}
+
+fn h264_more_rbsp_data(r: H264Bits*) -> int32 {
+  if (r->overrun != 0) { return 0; }
+  var total_bits: int64 = r->size * (int64)8;
+  if (r->position >= total_bits) { return 0; }
+  var last: int64 = total_bits - 1;
+  while (last > r->position) {
+    var byte_index: int64 = last >> 3;
+    var shift: int32 = 7 - (int32)(last & (int64)7);
+    if ((((int32)r->data[byte_index] >> shift) & 1) != 0) { break; }
+    last = last - 1;
+  }
+  if (last <= r->position) { return 0; }
+  return 1;
+}
+
+fn h264_decoder_new() -> H264Decoder* {
+  var d: H264Decoder* = malloc(sizeof(H264Decoder));
+  if (d == 0) { return 0; }
+  memset(d, 0, sizeof(H264Decoder));
+  d->nal_length_size = 4;
+  d->active_sps = -1;
+  d->active_pps = -1;
+  return d;
+}
+
+fn h264_decoder_free(d: H264Decoder*) {
+  if (d == 0) { return; }
+  if (d->rbsp != 0) { free(d->rbsp); }
+  free(d);
+}
+
+fn h264_reserve_rbsp(d: H264Decoder*, needed: int64) -> int32 {
+  if (needed <= d->rbsp_capacity) { return 1; }
+  var capacity: int64 = d->rbsp_capacity * 2;
+  if (capacity < needed) { capacity = needed; }
+  if (capacity < 4096) { capacity = 4096; }
+  var buffer: uint8* = realloc(d->rbsp, capacity);
+  if (buffer == 0) { return 0; }
+  d->rbsp = buffer;
+  d->rbsp_capacity = capacity;
+  return 1;
+}
+
+fn h264_extract_rbsp(d: H264Decoder*, source: uint8*, size: int64) -> int64 {
+  if (h264_reserve_rbsp(d, size) == 0) { return -1; }
+  var written: int64 = 0;
+  var zeros: int32 = 0;
+  var i: int64 = 0;
+  while (i < size) {
+    var byte_value: uint8 = source[i];
+    if (zeros >= 2 && byte_value == (uint8)3) {
+      zeros = 0;
+      i = i + 1;
+      continue;
+    }
+    if (byte_value == (uint8)0) { zeros = zeros + 1; } else { zeros = 0; }
+    d->rbsp[written] = byte_value;
+    written = written + 1;
+    i = i + 1;
+  }
+  return written;
+}
+
+fn h264_skip_scaling_list(r: H264Bits*, count: int32) {
+  var last_scale: int32 = 8;
+  var next_scale: int32 = 8;
+  for i in 0..count {
+    if (next_scale != 0) {
+      var delta: int32 = h264_read_se(r);
+      next_scale = (last_scale + delta + 256) % 256;
+    }
+    if (next_scale != 0) { last_scale = next_scale; }
+  }
+}
+
+fn h264_skip_scaling_matrix(r: H264Bits*, list_count: int32) {
+  for i in 0..list_count {
+    if (h264_read_bit(r) != 0) {
+      if (i < 6) {
+        h264_skip_scaling_list(r, 16);
+      } else {
+        h264_skip_scaling_list(r, 64);
+      }
+    }
+  }
+}
+
+fn h264_parse_sps(d: H264Decoder*, data: uint8*, size: int64) -> int32 {
+  var length: int64 = h264_extract_rbsp(d, data, size);
+  if (length < 4) { return H264_ERR_BITSTREAM; }
+
+  var r: H264Bits;
+  h264_bits_init(&r, d->rbsp, length);
+  h264_read_bits(&r, 8);
+
+  var profile_idc: int32 = h264_read_bits(&r, 8);
+  var constraint_flags: int32 = h264_read_bits(&r, 8);
+  var level_idc: int32 = h264_read_bits(&r, 8);
+  var id: int32 = h264_read_ue(&r);
+  if (id < 0 || id >= H264_MAX_PARAMETER_SETS) { return H264_ERR_BITSTREAM; }
+
+  var s: H264Sps* = &d->sps[id];
+  memset(s, 0, sizeof(H264Sps));
+  s->profile_idc = profile_idc;
+  s->constraint_flags = constraint_flags;
+  s->level_idc = level_idc;
+  s->id = id;
+  s->chroma_format_idc = 1;
+  s->bit_depth_luma = 8;
+  s->bit_depth_chroma = 8;
+
+  if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 ||
+      profile_idc == 244 || profile_idc == 44 || profile_idc == 83 ||
+      profile_idc == 86 || profile_idc == 118 || profile_idc == 128 ||
+      profile_idc == 138 || profile_idc == 139 || profile_idc == 134) {
+    s->chroma_format_idc = h264_read_ue(&r);
+    if (s->chroma_format_idc == 3) {
+      s->separate_colour_plane = h264_read_bit(&r);
+    }
+    s->bit_depth_luma = 8 + h264_read_ue(&r);
+    s->bit_depth_chroma = 8 + h264_read_ue(&r);
+    s->transform_bypass = h264_read_bit(&r);
+    s->scaling_matrix_present = h264_read_bit(&r);
+    if (s->scaling_matrix_present != 0) {
+      var list_count: int32 = 8;
+      if (s->chroma_format_idc == 3) { list_count = 12; }
+      h264_skip_scaling_matrix(&r, list_count);
+    }
+  }
+
+  s->log2_max_frame_num = 4 + h264_read_ue(&r);
+  s->pic_order_cnt_type = h264_read_ue(&r);
+  if (s->pic_order_cnt_type == 0) {
+    s->log2_max_pic_order_cnt_lsb = 4 + h264_read_ue(&r);
+  } else if (s->pic_order_cnt_type == 1) {
+    s->delta_pic_order_always_zero = h264_read_bit(&r);
+    s->offset_for_non_ref_pic = h264_read_se(&r);
+    s->offset_for_top_to_bottom_field = h264_read_se(&r);
+    s->poc_cycle_length = h264_read_ue(&r);
+    for i in 0..s->poc_cycle_length {
+      h264_read_se(&r);
+    }
+  }
+
+  s->max_num_ref_frames = h264_read_ue(&r);
+  s->gaps_in_frame_num_allowed = h264_read_bit(&r);
+  s->pic_width_in_mbs = h264_read_ue(&r) + 1;
+  s->pic_height_in_map_units = h264_read_ue(&r) + 1;
+  s->frame_mbs_only = h264_read_bit(&r);
+  if (s->frame_mbs_only == 0) {
+    s->mb_adaptive_frame_field = h264_read_bit(&r);
+  }
+  s->direct_8x8_inference = h264_read_bit(&r);
+
+  if (h264_read_bit(&r) != 0) {
+    s->crop_left = h264_read_ue(&r);
+    s->crop_right = h264_read_ue(&r);
+    s->crop_top = h264_read_ue(&r);
+    s->crop_bottom = h264_read_ue(&r);
+  }
+
+  if (r.overrun != 0) { return H264_ERR_BITSTREAM; }
+
+  var width_unit: int32 = 1;
+  var height_unit: int32 = 1;
+  if (s->chroma_format_idc == 1) { width_unit = 2; height_unit = 2; }
+  if (s->chroma_format_idc == 2) { width_unit = 2; height_unit = 1; }
+  if (s->frame_mbs_only == 0) { height_unit = height_unit * 2; }
+
+  s->width = s->pic_width_in_mbs * 16 - (s->crop_left + s->crop_right) * width_unit;
+  var map_height: int32 = s->pic_height_in_map_units;
+  if (s->frame_mbs_only == 0) { map_height = map_height * 2; }
+  s->height = map_height * 16 - (s->crop_top + s->crop_bottom) * height_unit;
+
+  s->valid = 1;
+  if (d->active_sps < 0) { d->active_sps = id; }
+  return H264_OK;
+}
+
+fn h264_parse_pps(d: H264Decoder*, data: uint8*, size: int64) -> int32 {
+  var length: int64 = h264_extract_rbsp(d, data, size);
+  if (length < 2) { return H264_ERR_BITSTREAM; }
+
+  var r: H264Bits;
+  h264_bits_init(&r, d->rbsp, length);
+  h264_read_bits(&r, 8);
+
+  var id: int32 = h264_read_ue(&r);
+  if (id < 0 || id >= H264_MAX_PARAMETER_SETS) { return H264_ERR_BITSTREAM; }
+
+  var p: H264Pps* = &d->pps[id];
+  memset(p, 0, sizeof(H264Pps));
+  p->id = id;
+  p->sps_id = h264_read_ue(&r);
+  p->entropy_coding_mode = h264_read_bit(&r);
+  p->bottom_field_pic_order_present = h264_read_bit(&r);
+  p->num_slice_groups = h264_read_ue(&r) + 1;
+  if (p->num_slice_groups > 1) { return H264_ERR_UNSUPPORTED; }
+  p->num_ref_idx_l0_default = h264_read_ue(&r) + 1;
+  p->num_ref_idx_l1_default = h264_read_ue(&r) + 1;
+  p->weighted_pred = h264_read_bit(&r);
+  p->weighted_bipred_idc = h264_read_bits(&r, 2);
+  p->pic_init_qp = 26 + h264_read_se(&r);
+  p->pic_init_qs = 26 + h264_read_se(&r);
+  p->chroma_qp_index_offset = h264_read_se(&r);
+  p->second_chroma_qp_index_offset = p->chroma_qp_index_offset;
+  p->deblocking_filter_control_present = h264_read_bit(&r);
+  p->constrained_intra_pred = h264_read_bit(&r);
+  p->redundant_pic_cnt_present = h264_read_bit(&r);
+
+  if (h264_more_rbsp_data(&r) != 0) {
+    p->transform_8x8_mode = h264_read_bit(&r);
+    if (h264_read_bit(&r) != 0) {
+      var sps_index: int32 = p->sps_id;
+      var list_count: int32 = 6;
+      if (sps_index >= 0 && sps_index < H264_MAX_PARAMETER_SETS) {
+        if (p->transform_8x8_mode != 0) {
+          if (d->sps[sps_index].chroma_format_idc == 3) {
+            list_count = 12;
+          } else {
+            list_count = 8;
+          }
+        }
+      }
+      h264_skip_scaling_matrix(&r, list_count);
+    }
+    p->second_chroma_qp_index_offset = h264_read_se(&r);
+  }
+
+  if (r.overrun != 0) { return H264_ERR_BITSTREAM; }
+  p->valid = 1;
+  if (d->active_pps < 0) { d->active_pps = id; }
+  return H264_OK;
+}
+
+fn h264_skip_ref_pic_list_modification(r: H264Bits*, slice_type: int32) {
+  if (slice_type != H264_SLICE_I && slice_type != H264_SLICE_SI) {
+    if (h264_read_bit(r) != 0) {
+      var operation: int32 = h264_read_ue(r);
+      var guard: int32 = 0;
+      while (operation != 3 && guard < 64 && r->overrun == 0) {
+        h264_read_ue(r);
+        operation = h264_read_ue(r);
+        guard = guard + 1;
+      }
+    }
+  }
+  if (slice_type == H264_SLICE_B) {
+    if (h264_read_bit(r) != 0) {
+      var operation: int32 = h264_read_ue(r);
+      var guard: int32 = 0;
+      while (operation != 3 && guard < 64 && r->overrun == 0) {
+        h264_read_ue(r);
+        operation = h264_read_ue(r);
+        guard = guard + 1;
+      }
+    }
+  }
+}
+
+fn h264_skip_pred_weight_table(r: H264Bits*, header: H264SliceHeader*, chroma_format: int32) {
+  h264_read_ue(r);
+  if (chroma_format != 0) { h264_read_ue(r); }
+  for i in 0..header->num_ref_idx_l0_active {
+    if (h264_read_bit(r) != 0) {
+      h264_read_se(r);
+      h264_read_se(r);
+    }
+    if (chroma_format != 0) {
+      if (h264_read_bit(r) != 0) {
+        for c in 0..2 {
+          h264_read_se(r);
+          h264_read_se(r);
+        }
+      }
+    }
+  }
+  if (header->slice_type == H264_SLICE_B) {
+    for i in 0..header->num_ref_idx_l1_active {
+      if (h264_read_bit(r) != 0) {
+        h264_read_se(r);
+        h264_read_se(r);
+      }
+      if (chroma_format != 0) {
+        if (h264_read_bit(r) != 0) {
+          for c in 0..2 {
+            h264_read_se(r);
+            h264_read_se(r);
+          }
+        }
+      }
+    }
+  }
+}
+
+fn h264_skip_dec_ref_pic_marking(r: H264Bits*, is_idr: int32) {
+  if (is_idr != 0) {
+    h264_read_bit(r);
+    h264_read_bit(r);
+    return;
+  }
+  if (h264_read_bit(r) == 0) { return; }
+  var operation: int32 = h264_read_ue(r);
+  var guard: int32 = 0;
+  while (operation != 0 && guard < 64 && r->overrun == 0) {
+    if (operation == 1 || operation == 3) { h264_read_ue(r); }
+    if (operation == 2) { h264_read_ue(r); }
+    if (operation == 3 || operation == 6) { h264_read_ue(r); }
+    if (operation == 4) { h264_read_ue(r); }
+    operation = h264_read_ue(r);
+    guard = guard + 1;
+  }
+}
+
+fn h264_parse_slice_header(d: H264Decoder*, data: uint8*, size: int64, header: H264SliceHeader*) -> int32 {
+  if (size < 2) { return H264_ERR_BITSTREAM; }
+  var first_byte: int32 = (int32)data[0];
+  memset(header, 0, sizeof(H264SliceHeader));
+  header->nal_ref_idc = (first_byte >> 5) & 3;
+  header->nal_unit_type = first_byte & 31;
+  if (header->nal_unit_type == H264_NAL_IDR) { header->is_idr = 1; }
+
+  var length: int64 = h264_extract_rbsp(d, data, size);
+  if (length < 2) { return H264_ERR_BITSTREAM; }
+
+  var r: H264Bits;
+  h264_bits_init(&r, d->rbsp, length);
+  h264_read_bits(&r, 8);
+
+  header->first_mb_in_slice = h264_read_ue(&r);
+  header->slice_type_raw = h264_read_ue(&r);
+  header->slice_type = header->slice_type_raw % 5;
+  header->pps_id = h264_read_ue(&r);
+  if (header->pps_id < 0 || header->pps_id >= H264_MAX_PARAMETER_SETS) { return H264_ERR_BITSTREAM; }
+
+  var p: H264Pps* = &d->pps[header->pps_id];
+  if (p->valid == 0) { return H264_ERR_CONFIG; }
+  if (p->sps_id < 0 || p->sps_id >= H264_MAX_PARAMETER_SETS) { return H264_ERR_BITSTREAM; }
+  var s: H264Sps* = &d->sps[p->sps_id];
+  if (s->valid == 0) { return H264_ERR_CONFIG; }
+
+  d->active_pps = header->pps_id;
+  d->active_sps = p->sps_id;
+
+  if (s->separate_colour_plane != 0) { h264_read_bits(&r, 2); }
+  header->frame_num = h264_read_bits(&r, s->log2_max_frame_num);
+
+  if (s->frame_mbs_only == 0) {
+    header->field_pic = h264_read_bit(&r);
+    if (header->field_pic != 0) {
+      header->bottom_field = h264_read_bit(&r);
+    }
+  }
+  if (header->is_idr != 0) {
+    header->idr_pic_id = h264_read_ue(&r);
+  }
+
+  if (s->pic_order_cnt_type == 0) {
+    header->pic_order_cnt_lsb = h264_read_bits(&r, s->log2_max_pic_order_cnt_lsb);
+    if (p->bottom_field_pic_order_present != 0 && header->field_pic == 0) {
+      header->delta_pic_order_cnt_bottom = h264_read_se(&r);
+    }
+  } else if (s->pic_order_cnt_type == 1 && s->delta_pic_order_always_zero == 0) {
+    header->delta_pic_order_cnt_0 = h264_read_se(&r);
+    if (p->bottom_field_pic_order_present != 0 && header->field_pic == 0) {
+      header->delta_pic_order_cnt_1 = h264_read_se(&r);
+    }
+  }
+
+  if (p->redundant_pic_cnt_present != 0) {
+    header->redundant_pic_cnt = h264_read_ue(&r);
+  }
+
+  header->num_ref_idx_l0_active = p->num_ref_idx_l0_default;
+  header->num_ref_idx_l1_active = p->num_ref_idx_l1_default;
+
+  if (header->slice_type == H264_SLICE_B) {
+    header->direct_spatial_mv_pred = h264_read_bit(&r);
+  }
+  if (header->slice_type == H264_SLICE_P || header->slice_type == H264_SLICE_SP ||
+      header->slice_type == H264_SLICE_B) {
+    if (h264_read_bit(&r) != 0) {
+      header->num_ref_idx_l0_active = h264_read_ue(&r) + 1;
+      if (header->slice_type == H264_SLICE_B) {
+        header->num_ref_idx_l1_active = h264_read_ue(&r) + 1;
+      }
+    }
+  }
+
+  h264_skip_ref_pic_list_modification(&r, header->slice_type);
+
+  var weighted: int32 = 0;
+  if (p->weighted_pred != 0) {
+    if (header->slice_type == H264_SLICE_P || header->slice_type == H264_SLICE_SP) {
+      weighted = 1;
+    }
+  }
+  if (p->weighted_bipred_idc == 1 && header->slice_type == H264_SLICE_B) { weighted = 1; }
+  if (weighted != 0) {
+    h264_skip_pred_weight_table(&r, header, s->chroma_format_idc);
+  }
+
+  if (header->nal_ref_idc != 0) {
+    h264_skip_dec_ref_pic_marking(&r, header->is_idr);
+  }
+
+  if (p->entropy_coding_mode != 0 && header->slice_type != H264_SLICE_I &&
+      header->slice_type != H264_SLICE_SI) {
+    header->cabac_init_idc = h264_read_ue(&r);
+  }
+
+  header->slice_qp_delta = h264_read_se(&r);
+  header->qp = p->pic_init_qp + header->slice_qp_delta;
+
+  if (header->slice_type == H264_SLICE_SP || header->slice_type == H264_SLICE_SI) {
+    if (header->slice_type == H264_SLICE_SP) { h264_read_bit(&r); }
+    h264_read_se(&r);
+  }
+
+  if (p->deblocking_filter_control_present != 0) {
+    header->disable_deblocking_filter_idc = h264_read_ue(&r);
+    if (header->disable_deblocking_filter_idc != 1) {
+      header->slice_alpha_c0_offset = h264_read_se(&r) * 2;
+      header->slice_beta_offset = h264_read_se(&r) * 2;
+    }
+  }
+
+  if (r.overrun != 0) { return H264_ERR_BITSTREAM; }
+  return H264_OK;
+}
+
+fn h264_read_config(d: H264Decoder*, config: uint8*, size: int32) -> int32 {
+  if (config == 0 || size < 7) { return H264_ERR_CONFIG; }
+  d->config_profile = (int32)config[1];
+  d->config_level = (int32)config[3];
+  d->nal_length_size = ((int32)config[4] & 3) + 1;
+
+  var count: int32 = (int32)config[5] & 31;
+  var at: int32 = 6;
+  for i in 0..count {
+    if (at + 2 > size) { return H264_ERR_CONFIG; }
+    var length: int32 = ((int32)config[at] << 8) | (int32)config[at + 1];
+    at = at + 2;
+    if (at + length > size) { return H264_ERR_CONFIG; }
+    var status: int32 = h264_parse_sps(d, &config[at], (int64)length);
+    if (status != H264_OK) { return status; }
+    at = at + length;
+  }
+
+  if (at >= size) { return H264_ERR_CONFIG; }
+  var pps_count: int32 = (int32)config[at];
+  at = at + 1;
+  for i in 0..pps_count {
+    if (at + 2 > size) { return H264_ERR_CONFIG; }
+    var length: int32 = ((int32)config[at] << 8) | (int32)config[at + 1];
+    at = at + 2;
+    if (at + length > size) { return H264_ERR_CONFIG; }
+    var status: int32 = h264_parse_pps(d, &config[at], (int64)length);
+    if (status != H264_OK) { return status; }
+    at = at + length;
+  }
+  return H264_OK;
+}
+
+fn h264_nal_count(d: H264Decoder*, sample: uint8*, size: int64) -> int32 {
+  var at: int64 = 0;
+  var count: int32 = 0;
+  while (at + (int64)d->nal_length_size <= size) {
+    var length: int64 = 0;
+    for i in 0..d->nal_length_size {
+      length = (length << 8) | (int64)sample[at + (int64)i];
+    }
+    at = at + (int64)d->nal_length_size;
+    if (length <= 0 || at + length > size) { break; }
+    count = count + 1;
+    at = at + length;
+  }
+  return count;
+}
+
+fn h264_nal_at(d: H264Decoder*, sample: uint8*, size: int64, index: int32, out_size: int64*) -> uint8* {
+  var at: int64 = 0;
+  var seen: int32 = 0;
+  while (at + (int64)d->nal_length_size <= size) {
+    var length: int64 = 0;
+    for i in 0..d->nal_length_size {
+      length = (length << 8) | (int64)sample[at + (int64)i];
+    }
+    at = at + (int64)d->nal_length_size;
+    if (length <= 0 || at + length > size) { return 0; }
+    if (seen == index) {
+      *out_size = length;
+      return &sample[at];
+    }
+    seen = seen + 1;
+    at = at + length;
+  }
+  return 0;
+}
+
+fn h264_nal_type(nal: uint8*) -> int32 {
+  return (int32)nal[0] & 31;
+}
+
+fn h264_slice_type_name(slice_type: int32) -> string {
+  if (slice_type == H264_SLICE_P) { return "P"; }
+  if (slice_type == H264_SLICE_B) { return "B"; }
+  if (slice_type == H264_SLICE_I) { return "I"; }
+  if (slice_type == H264_SLICE_SP) { return "SP"; }
+  return "SI";
+}
+
+fn h264_profile_name(profile_idc: int32) -> string {
+  if (profile_idc == 66) { return "Baseline"; }
+  if (profile_idc == 77) { return "Main"; }
+  if (profile_idc == 88) { return "Extended"; }
+  if (profile_idc == 100) { return "High"; }
+  if (profile_idc == 110) { return "High 10"; }
+  if (profile_idc == 122) { return "High 4:2:2"; }
+  if (profile_idc == 244) { return "High 4:4:4"; }
+  return "unknown";
+}
