@@ -5593,18 +5593,28 @@ try {
 set -u
 exe="$1"; work="$2"
 fifo="$work/dbg.fifo"
-rm -f "$fifo"; mkfifo "$fifo"
-( timeout 12 cat "$fifo" > "$work/announced.txt" ) &
+out="$work/announced.txt"
+rm -f "$fifo"; : > "$out"; mkfifo "$fifo"
+( timeout 25 cat "$fifo" > "$out" ) &
 drain=$!
-sleep 0.3
 exec 8> "$fifo"
 METTLE_DBG_PIPE="$fifo" "$exe" > "$work/prog.txt" 2>&1 &
 prog=$!
-sleep 2
+await() {
+  i=0
+  while [ $i -lt 400 ]; do
+    if grep -q "$1" "$out" 2>/dev/null; then return 0; fi
+    sleep 0.05
+    i=$((i+1))
+  done
+  return 1
+}
+await hello
 printf 'continue\n' >&8
-sleep 1
+await debug_demo
 printf 'detach\n' >&8
-sleep 1
+i=0
+while kill -0 $prog 2>/dev/null && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done
 kill -9 $prog 2>/dev/null
 exec 8>&-
 wait $drain 2>/dev/null

@@ -1278,12 +1278,18 @@ static char *mt_environment_overrides[64];
 static mt_size mt_environment_override_count;
 static char *mt_read_environment_value(const char *name, mt_size name_length);
 static int mt_initialize_initial_tls(mt_i64 argc, char **argv);
+#if defined(MTLC_HOST_PREFIX_H)
+static void mt_raise_stack_limit(void);
+#endif
 
 void mettle_rt_startup(mt_i64 argc, char **argv) {
   if (!mt_initialize_initial_tls(argc, argv)) {
     _exit(127);
   }
   mt_environment = argv + argc + 1;
+#if defined(MTLC_HOST_PREFIX_H)
+  mt_raise_stack_limit();
+#endif
 }
 
 char *getenv(const char *name) {
@@ -1327,6 +1333,7 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #define MT_SYS_LSEEK 8
 #define MT_SYS_IOCTL 16
 #define MT_SYS_MMAP 9
+#define MT_SYS_PRLIMIT64 302
 #define MT_SYS_MPROTECT 10
 #define MT_SYS_MUNMAP 11
 #define MT_SYS_SCHED_YIELD 24
@@ -1411,6 +1418,7 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #define MT_SYS_SHUTDOWN 210
 #define MT_SYS_MUNMAP 215
 #define MT_SYS_MMAP 222
+#define MT_SYS_PRLIMIT64 261
 #define MT_SYS_MPROTECT 226
 #define MT_SYS_CLONE 220
 #define MT_SYS_GETTID 178
@@ -1432,6 +1440,36 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #define MT_PROT_WRITE 2
 #define MT_MAP_PRIVATE 2
 #define MT_MAP_ANONYMOUS 0x20
+
+#if defined(MTLC_HOST_PREFIX_H)
+#define MT_RLIMIT_STACK 3
+#define MT_HOST_STACK_BYTES ((mt_u64)64 * 1024 * 1024)
+
+typedef struct {
+  mt_u64 cur;
+  mt_u64 max;
+} MtRlimit64;
+
+static void mt_raise_stack_limit(void) {
+  MtRlimit64 current;
+  MtRlimit64 next;
+  mt_u64 want = MT_HOST_STACK_BYTES;
+
+  if (mt_syscall6(MT_SYS_PRLIMIT64, 0, MT_RLIMIT_STACK, 0, (mt_i64)&current, 0,
+                  0) < 0) {
+    return;
+  }
+  if (current.max != (mt_u64)-1 && want > current.max) {
+    want = current.max;
+  }
+  if (want <= current.cur) {
+    return;
+  }
+  next.cur = want;
+  next.max = current.max;
+  mt_syscall6(MT_SYS_PRLIMIT64, 0, MT_RLIMIT_STACK, (mt_i64)&next, 0, 0, 0);
+}
+#endif
 
 static mt_i64 mt_sys_result(mt_i64 result) {
   if ((mt_u64)result >= (mt_u64)-4095) {
