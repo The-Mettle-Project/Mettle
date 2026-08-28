@@ -86,6 +86,8 @@ struct AacDecoder {
   cos_long: float64*;
   cos_short: float64*;
   transform: float64[2048];
+  active_index: int32[1024];
+  active_value: float64[1024];
   scratch: float64[2048];
 
   frame_channels: int32;
@@ -898,16 +900,49 @@ fn aac_imdct(d: AacDecoder*, input: float64*, output: float64*, size: int32) {
   var table: float64* = d->cos_long;
   if (size == 256) { table = d->cos_short; }
 
+  var count: int32 = 0;
+  for k in 0..half {
+    if (input[k] != 0.0) {
+      d->active_index[count] = k;
+      d->active_value[count] = input[k];
+      count = count + 1;
+    }
+  }
+
+  var scale: float64 = 2.0 / (float64)size;
+  if (count == 0) {
+    for n in 0..size { output[n] = 0.0; }
+    return;
+  }
+
   var quarter: int32 = size / 2;
-  for n in 0..size {
+  var eighth: int32 = size / 4;
+
+  for n in 0..eighth {
     var total: float64 = 0.0;
     var step: int32 = (2 * n + 1 + quarter) & mask;
-    var phase: int32 = step;
-    for k in 0..half {
-      total = total + input[k] * table[phase];
-      phase = (phase + 2 * step) & mask;
+    var twice: int32 = (2 * step) & mask;
+    for j in 0..count {
+      var phase: int32 = (step + d->active_index[j] * twice) & mask;
+      total = total + d->active_value[j] * table[phase];
     }
-    output[n] = total * (2.0 / (float64)size);
+    var value: float64 = total * scale;
+    output[n] = value;
+    output[quarter - 1 - n] = 0.0 - value;
+  }
+
+  for n in 0..eighth {
+    var index: int32 = quarter + n;
+    var total: float64 = 0.0;
+    var step: int32 = (2 * index + 1 + quarter) & mask;
+    var twice: int32 = (2 * step) & mask;
+    for j in 0..count {
+      var phase: int32 = (step + d->active_index[j] * twice) & mask;
+      total = total + d->active_value[j] * table[phase];
+    }
+    var value: float64 = total * scale;
+    output[index] = value;
+    output[size - 1 - n] = value;
   }
 }
 
