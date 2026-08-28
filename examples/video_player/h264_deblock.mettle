@@ -11,11 +11,21 @@ fn h264_boundary_strength(v: H264Video*, current: int32, neighbour: int32,
                           mb_edge: int32) -> int32 {
   var a: H264Macroblock* = &v->macroblocks[current];
   var b: H264Macroblock* = &v->macroblocks[neighbour];
-  if (mb_edge != 0) { return 4; }
-  if (a->kind == H264_MB_I_NXN || a->kind == H264_MB_I_16X16) { return 3; }
-  if (b->kind == H264_MB_I_NXN || b->kind == H264_MB_I_16X16) { return 3; }
+  if (mb_edge != 0 && (a->is_intra != 0 || b->is_intra != 0)) { return 4; }
+  if (a->is_intra != 0 || b->is_intra != 0) { return 3; }
   if (a->luma_nonzero[current_block] != (uint8)0) { return 2; }
   if (b->luma_nonzero[neighbour_block] != (uint8)0) { return 2; }
+
+  var block_a: int32 = (current_block >> 3) * 2 + ((current_block & 3) >> 1);
+  var block_b: int32 = (neighbour_block >> 3) * 2 + ((neighbour_block & 3) >> 1);
+  if (a->ref_picture[block_a] != b->ref_picture[block_b]) { return 1; }
+
+  var difference_x: int32 = a->mv_x[current_block] - b->mv_x[neighbour_block];
+  if (difference_x < 0) { difference_x = 0 - difference_x; }
+  if (difference_x >= 4) { return 1; }
+  var difference_y: int32 = a->mv_y[current_block] - b->mv_y[neighbour_block];
+  if (difference_y < 0) { difference_y = 0 - difference_y; }
+  if (difference_y >= 4) { return 1; }
   return 0;
 }
 
@@ -257,7 +267,7 @@ fn h264_deblock_horizontal_chroma(v: H264Video*, mb_x: int32, mb_y: int32, edge:
 }
 
 fn h264_deblock_picture(v: H264Video*) {
-  if (v->disable_deblocking == 1) { return; }
+  if (v->disable_deblocking == 1 || v->skip_deblocking != 0) { return; }
 
   for mb_y in 0..v->mb_height {
     for mb_x in 0..v->mb_width {

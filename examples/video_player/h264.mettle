@@ -117,6 +117,18 @@ struct H264SliceHeader {
   is_idr: int32;
   data_bit_offset: int64;
   rbsp_size: int64;
+
+  modification_count: int32;
+  modification_op: int32[34];
+  modification_value: int32[34];
+
+  has_weights: int32;
+  luma_log2_denom: int32;
+  chroma_log2_denom: int32;
+  luma_weight: int32[32];
+  luma_offset: int32[32];
+  chroma_weight: int32[64];
+  chroma_offset: int32[64];
 }
 
 struct H264Decoder {
@@ -414,23 +426,27 @@ fn h264_parse_pps(d: H264Decoder*, data: uint8*, size: int64) -> int32 {
   return H264_OK;
 }
 
-fn h264_skip_ref_pic_list_modification(r: H264Bits*, slice_type: int32) {
-  if (slice_type != H264_SLICE_I && slice_type != H264_SLICE_SI) {
+fn h264_read_ref_pic_list_modification(r: H264Bits*, header: H264SliceHeader*) {
+  header->modification_count = 0;
+  if (header->slice_type != H264_SLICE_I && header->slice_type != H264_SLICE_SI) {
     if (h264_read_bit(r) != 0) {
       var operation: int32 = h264_read_ue(r);
       var guard: int32 = 0;
-      while (operation != 3 && guard < 64 && r->overrun == 0) {
-        h264_read_ue(r);
+      while (operation != 3 && guard < 32 && r->overrun == 0) {
+        var value: int32 = h264_read_ue(r);
+        header->modification_op[header->modification_count] = operation;
+        header->modification_value[header->modification_count] = value;
+        header->modification_count = header->modification_count + 1;
         operation = h264_read_ue(r);
         guard = guard + 1;
       }
     }
   }
-  if (slice_type == H264_SLICE_B) {
+  if (header->slice_type == H264_SLICE_B) {
     if (h264_read_bit(r) != 0) {
       var operation: int32 = h264_read_ue(r);
       var guard: int32 = 0;
-      while (operation != 3 && guard < 64 && r->overrun == 0) {
+      while (operation != 3 && guard < 32 && r->overrun == 0) {
         h264_read_ue(r);
         operation = h264_read_ue(r);
         guard = guard + 1;
@@ -439,19 +455,40 @@ fn h264_skip_ref_pic_list_modification(r: H264Bits*, slice_type: int32) {
   }
 }
 
-fn h264_skip_pred_weight_table(r: H264Bits*, header: H264SliceHeader*, chroma_format: int32) {
-  h264_read_ue(r);
-  if (chroma_format != 0) { h264_read_ue(r); }
+fn h264_read_pred_weight_table(r: H264Bits*, header: H264SliceHeader*, chroma_format: int32) {
+  header->has_weights = 1;
+  header->luma_log2_denom = h264_read_ue(r);
+  if (chroma_format != 0) { header->chroma_log2_denom = h264_read_ue(r); }
+
+  var default_luma: int32 = 1 << header->luma_log2_denom;
+  var default_chroma: int32 = 1 << header->chroma_log2_denom;
+  for i in 0..32 {
+    header->luma_weight[i] = default_luma;
+    header->luma_offset[i] = 0;
+    header->chroma_weight[i * 2] = default_chroma;
+    header->chroma_weight[i * 2 + 1] = default_chroma;
+    header->chroma_offset[i * 2] = 0;
+    header->chroma_offset[i * 2 + 1] = 0;
+  }
+
   for i in 0..header->num_ref_idx_l0_active {
     if (h264_read_bit(r) != 0) {
-      h264_read_se(r);
-      h264_read_se(r);
+      var weight: int32 = h264_read_se(r);
+      var offset: int32 = h264_read_se(r);
+      if (i < 32) {
+        header->luma_weight[i] = weight;
+        header->luma_offset[i] = offset;
+      }
     }
     if (chroma_format != 0) {
       if (h264_read_bit(r) != 0) {
         for c in 0..2 {
-          h264_read_se(r);
-          h264_read_se(r);
+          var weight: int32 = h264_read_se(r);
+          var offset: int32 = h264_read_se(r);
+          if (i < 32) {
+            header->chroma_weight[i * 2 + c] = weight;
+            header->chroma_offset[i * 2 + c] = offset;
+          }
         }
       }
     }
@@ -568,7 +605,7 @@ fn h264_parse_slice_header(d: H264Decoder*, data: uint8*, size: int64, header: H
     }
   }
 
-  h264_skip_ref_pic_list_modification(&r, header->slice_type);
+  h264_read_ref_pic_list_modification(&r, header);
 
   var weighted: int32 = 0;
   if (p->weighted_pred != 0) {
@@ -578,7 +615,7 @@ fn h264_parse_slice_header(d: H264Decoder*, data: uint8*, size: int64, header: H
   }
   if (p->weighted_bipred_idc == 1 && header->slice_type == H264_SLICE_B) { weighted = 1; }
   if (weighted != 0) {
-    h264_skip_pred_weight_table(&r, header, s->chroma_format_idc);
+    h264_read_pred_weight_table(&r, header, s->chroma_format_idc);
   }
 
   if (header->nal_ref_idc != 0) {

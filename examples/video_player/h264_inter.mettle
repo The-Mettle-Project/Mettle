@@ -1,0 +1,296 @@
+import "h264";
+import "h264_decode";
+
+fn h264_reference_sample(plane: uint8*, stride: int32, width: int32, height: int32,
+                         x: int32, y: int32) -> int32 {
+  var cx: int32 = x;
+  var cy: int32 = y;
+  if (cx < 0) { cx = 0; }
+  if (cx > width - 1) { cx = width - 1; }
+  if (cy < 0) { cy = 0; }
+  if (cy > height - 1) { cy = height - 1; }
+  return (int32)plane[(int64)cy * (int64)stride + (int64)cx];
+}
+
+fn h264_six_tap(a: int32, b: int32, c: int32, d: int32, e: int32, f: int32) -> int32 {
+  return a - 5 * b + 20 * c + 20 * d - 5 * e + f;
+}
+
+fn h264_horizontal_partial(plane: uint8*, stride: int32, width: int32, height: int32,
+                           x: int32, y: int32) -> int32 {
+  return h264_six_tap(h264_reference_sample(plane, stride, width, height, x - 2, y),
+                      h264_reference_sample(plane, stride, width, height, x - 1, y),
+                      h264_reference_sample(plane, stride, width, height, x, y),
+                      h264_reference_sample(plane, stride, width, height, x + 1, y),
+                      h264_reference_sample(plane, stride, width, height, x + 2, y),
+                      h264_reference_sample(plane, stride, width, height, x + 3, y));
+}
+
+fn h264_vertical_partial(plane: uint8*, stride: int32, width: int32, height: int32,
+                         x: int32, y: int32) -> int32 {
+  return h264_six_tap(h264_reference_sample(plane, stride, width, height, x, y - 2),
+                      h264_reference_sample(plane, stride, width, height, x, y - 1),
+                      h264_reference_sample(plane, stride, width, height, x, y),
+                      h264_reference_sample(plane, stride, width, height, x, y + 1),
+                      h264_reference_sample(plane, stride, width, height, x, y + 2),
+                      h264_reference_sample(plane, stride, width, height, x, y + 3));
+}
+
+fn h264_luma_interpolate(plane: uint8*, stride: int32, width: int32, height: int32,
+                         x: int32, y: int32, x_frac: int32, y_frac: int32) -> int32 {
+  if (x_frac == 0 && y_frac == 0) {
+    return h264_reference_sample(plane, stride, width, height, x, y);
+  }
+
+  var half_h: int32 = 0;
+  var half_v: int32 = 0;
+  var half_center: int32 = 0;
+  var half_v_right: int32 = 0;
+  var half_h_below: int32 = 0;
+
+  if (y_frac == 0) {
+    half_h = h264_clip_horizontal(plane, stride, width, height, x, y);
+    if (x_frac == 2) { return half_h; }
+    var integer: int32 = h264_reference_sample(plane, stride, width, height, x, y);
+    if (x_frac == 1) { return (integer + half_h + 1) >> 1; }
+    var right: int32 = h264_reference_sample(plane, stride, width, height, x + 1, y);
+    return (right + half_h + 1) >> 1;
+  }
+
+  if (x_frac == 0) {
+    half_v = h264_clip_vertical(plane, stride, width, height, x, y);
+    if (y_frac == 2) { return half_v; }
+    var integer: int32 = h264_reference_sample(plane, stride, width, height, x, y);
+    if (y_frac == 1) { return (integer + half_v + 1) >> 1; }
+    var below: int32 = h264_reference_sample(plane, stride, width, height, x, y + 1);
+    return (below + half_v + 1) >> 1;
+  }
+
+  half_h = h264_clip_horizontal(plane, stride, width, height, x, y);
+  half_v = h264_clip_vertical(plane, stride, width, height, x, y);
+
+  if (x_frac == 2 && y_frac == 2) {
+    return h264_center_sample(plane, stride, width, height, x, y);
+  }
+
+  if (y_frac == 2) {
+    half_center = h264_center_sample(plane, stride, width, height, x, y);
+    if (x_frac == 1) { return (half_v + half_center + 1) >> 1; }
+    half_v_right = h264_clip_vertical(plane, stride, width, height, x + 1, y);
+    return (half_center + half_v_right + 1) >> 1;
+  }
+
+  if (x_frac == 2) {
+    half_center = h264_center_sample(plane, stride, width, height, x, y);
+    if (y_frac == 1) { return (half_h + half_center + 1) >> 1; }
+    half_h_below = h264_clip_horizontal(plane, stride, width, height, x, y + 1);
+    return (half_center + half_h_below + 1) >> 1;
+  }
+
+  if (y_frac == 1) {
+    if (x_frac == 1) { return (half_h + half_v + 1) >> 1; }
+    half_v_right = h264_clip_vertical(plane, stride, width, height, x + 1, y);
+    return (half_h + half_v_right + 1) >> 1;
+  }
+
+  half_h_below = h264_clip_horizontal(plane, stride, width, height, x, y + 1);
+  if (x_frac == 1) { return (half_v + half_h_below + 1) >> 1; }
+  half_v_right = h264_clip_vertical(plane, stride, width, height, x + 1, y);
+  return (half_v_right + half_h_below + 1) >> 1;
+}
+
+fn h264_clip_horizontal(plane: uint8*, stride: int32, width: int32, height: int32,
+                        x: int32, y: int32) -> int32 {
+  var value: int32 = (h264_horizontal_partial(plane, stride, width, height, x, y) + 16) >> 5;
+  return (int32)h264_clip_sample(value);
+}
+
+fn h264_clip_vertical(plane: uint8*, stride: int32, width: int32, height: int32,
+                      x: int32, y: int32) -> int32 {
+  var value: int32 = (h264_vertical_partial(plane, stride, width, height, x, y) + 16) >> 5;
+  return (int32)h264_clip_sample(value);
+}
+
+fn h264_center_sample(plane: uint8*, stride: int32, width: int32, height: int32,
+                      x: int32, y: int32) -> int32 {
+  var total: int32 = h264_six_tap(
+    h264_horizontal_partial(plane, stride, width, height, x, y - 2),
+    h264_horizontal_partial(plane, stride, width, height, x, y - 1),
+    h264_horizontal_partial(plane, stride, width, height, x, y),
+    h264_horizontal_partial(plane, stride, width, height, x, y + 1),
+    h264_horizontal_partial(plane, stride, width, height, x, y + 2),
+    h264_horizontal_partial(plane, stride, width, height, x, y + 3));
+  return (int32)h264_clip_sample((total + 512) >> 10);
+}
+
+fn h264_motion_compensate_luma(v: H264Video*, reference: H264Picture*, target: int32*,
+                               block_x: int32, block_y: int32, block_w: int32, block_h: int32,
+                               mv_x: int32, mv_y: int32) {
+  var width: int32 = v->mb_width * 16;
+  var height: int32 = v->mb_height * 16;
+  var base_x: int32 = block_x + (mv_x >> 2);
+  var base_y: int32 = block_y + (mv_y >> 2);
+  var x_frac: int32 = mv_x & 3;
+  var y_frac: int32 = mv_y & 3;
+
+  for row in 0..block_h {
+    for column in 0..block_w {
+      target[row * block_w + column] =
+        h264_luma_interpolate(reference->luma, v->luma_stride, width, height,
+                              base_x + column, base_y + row, x_frac, y_frac);
+    }
+  }
+}
+
+fn h264_motion_compensate_chroma(v: H264Video*, plane: uint8*, target: int32*,
+                                 block_x: int32, block_y: int32, block_w: int32, block_h: int32,
+                                 mv_x: int32, mv_y: int32) {
+  var width: int32 = v->mb_width * 8;
+  var height: int32 = v->mb_height * 8;
+  var base_x: int32 = block_x + (mv_x >> 3);
+  var base_y: int32 = block_y + (mv_y >> 3);
+  var x_frac: int32 = mv_x & 7;
+  var y_frac: int32 = mv_y & 7;
+
+  for row in 0..block_h {
+    for column in 0..block_w {
+      var a: int32 = h264_reference_sample(plane, v->chroma_stride, width, height, base_x + column, base_y + row);
+      var b: int32 = h264_reference_sample(plane, v->chroma_stride, width, height, base_x + column + 1, base_y + row);
+      var c: int32 = h264_reference_sample(plane, v->chroma_stride, width, height, base_x + column, base_y + row + 1);
+      var d: int32 = h264_reference_sample(plane, v->chroma_stride, width, height, base_x + column + 1, base_y + row + 1);
+      target[row * block_w + column] =
+        ((8 - x_frac) * (8 - y_frac) * a + x_frac * (8 - y_frac) * b +
+         (8 - x_frac) * y_frac * c + x_frac * y_frac * d + 32) >> 6;
+    }
+  }
+}
+
+fn h264_block_available(v: H264Video*, block_x: int32, block_y: int32) -> int32 {
+  if (block_x < 0 || block_y < 0) { return 0; }
+  if (block_x >= v->mb_width * 4) { return 0; }
+  if (block_y >= v->mb_height * 4) { return 0; }
+  var mb: int32 = (block_y >> 2) * v->mb_width + (block_x >> 2);
+  if (mb == v->mb_index) {
+    var inside: int32 = (block_y & 3) * 4 + (block_x & 3);
+    return v->block_filled[inside];
+  }
+  if (mb > v->mb_index) { return 0; }
+  if (v->macroblocks[mb].coded == 0) { return 0; }
+  return 1;
+}
+
+fn h264_neighbour_motion(v: H264Video*, list: int32, block_x: int32, block_y: int32,
+                         out_ref: int32*, out_mv_x: int32*, out_mv_y: int32*) -> int32 {
+  *out_ref = -1;
+  *out_mv_x = 0;
+  *out_mv_y = 0;
+  if (h264_block_available(v, block_x, block_y) == 0) { return 0; }
+
+  var mb: int32 = (block_y >> 2) * v->mb_width + (block_x >> 2);
+  var inside: int32 = (block_y & 3) * 4 + (block_x & 3);
+  var info: H264Macroblock* = &v->macroblocks[mb];
+  if (info->is_intra != 0) { return 1; }
+
+  var slot: int32 = list * 16 + inside;
+  *out_ref = info->ref_index[list * 4 + ((inside >> 3) * 2 + ((inside & 3) >> 1))];
+  *out_mv_x = info->mv_x[slot];
+  *out_mv_y = info->mv_y[slot];
+  return 1;
+}
+
+fn h264_predict_motion_vector(v: H264Video*, list: int32, part_x: int32, part_y: int32,
+                              part_w: int32, part_h: int32, reference: int32,
+                              out_mv_x: int32*, out_mv_y: int32*) {
+  var origin_x: int32 = v->mb_x * 4 + part_x;
+  var origin_y: int32 = v->mb_y * 4 + part_y;
+
+  var ref_a: int32 = 0;
+  var mv_ax: int32 = 0;
+  var mv_ay: int32 = 0;
+  var has_a: int32 = h264_neighbour_motion(v, list, origin_x - 1, origin_y, &ref_a, &mv_ax, &mv_ay);
+
+  var ref_b: int32 = 0;
+  var mv_bx: int32 = 0;
+  var mv_by: int32 = 0;
+  var has_b: int32 = h264_neighbour_motion(v, list, origin_x, origin_y - 1, &ref_b, &mv_bx, &mv_by);
+
+  var ref_c: int32 = 0;
+  var mv_cx: int32 = 0;
+  var mv_cy: int32 = 0;
+  var has_c: int32 = h264_neighbour_motion(v, list, origin_x + part_w, origin_y - 1, &ref_c, &mv_cx, &mv_cy);
+  if (has_c == 0) {
+    has_c = h264_neighbour_motion(v, list, origin_x - 1, origin_y - 1, &ref_c, &mv_cx, &mv_cy);
+  }
+
+  if (has_b == 0 && has_c == 0 && has_a != 0) {
+    *out_mv_x = mv_ax;
+    *out_mv_y = mv_ay;
+    return;
+  }
+
+  if (part_w == 4 && part_h == 2) {
+    if (part_y == 0) {
+      if (ref_b == reference) { *out_mv_x = mv_bx; *out_mv_y = mv_by; return; }
+    } else {
+      if (ref_a == reference) { *out_mv_x = mv_ax; *out_mv_y = mv_ay; return; }
+    }
+  } else if (part_w == 2 && part_h == 4) {
+    if (part_x == 0) {
+      if (ref_a == reference) { *out_mv_x = mv_ax; *out_mv_y = mv_ay; return; }
+    } else {
+      if (ref_c == reference) { *out_mv_x = mv_cx; *out_mv_y = mv_cy; return; }
+    }
+  }
+
+  var matches: int32 = 0;
+  var only_x: int32 = 0;
+  var only_y: int32 = 0;
+  if (ref_a == reference) { matches = matches + 1; only_x = mv_ax; only_y = mv_ay; }
+  if (ref_b == reference) { matches = matches + 1; only_x = mv_bx; only_y = mv_by; }
+  if (ref_c == reference) { matches = matches + 1; only_x = mv_cx; only_y = mv_cy; }
+  if (matches == 1) {
+    *out_mv_x = only_x;
+    *out_mv_y = only_y;
+    return;
+  }
+
+  *out_mv_x = h264_median(mv_ax, mv_bx, mv_cx);
+  *out_mv_y = h264_median(mv_ay, mv_by, mv_cy);
+}
+
+fn h264_median(a: int32, b: int32, c: int32) -> int32 {
+  var low: int32 = a;
+  if (b < low) { low = b; }
+  if (c < low) { low = c; }
+  var high: int32 = a;
+  if (b > high) { high = b; }
+  if (c > high) { high = c; }
+  return a + b + c - low - high;
+}
+
+fn h264_store_partition_motion(v: H264Video*, mb: H264Macroblock*, list: int32,
+                               part_x: int32, part_y: int32, part_w: int32, part_h: int32,
+                               reference: int32, mv_x: int32, mv_y: int32,
+                               mvd_x: int32, mvd_y: int32) {
+  for row in 0..part_h {
+    for column in 0..part_w {
+      var inside: int32 = (part_y + row) * 4 + part_x + column;
+      mb->mv_x[list * 16 + inside] = mv_x;
+      mb->mv_y[list * 16 + inside] = mv_y;
+      mb->mvd_x[list * 16 + inside] = mvd_x;
+      mb->mvd_y[list * 16 + inside] = mvd_y;
+      v->block_filled[inside] = 1;
+    }
+  }
+  var picture: int32 = -1;
+  if (reference >= 0 && reference < v->ref_count0) { picture = v->ref_list0[reference]; }
+  for row in 0..((part_h + 1) / 2) {
+    for column in 0..((part_w + 1) / 2) {
+      var block8: int32 = ((part_y / 2) + row) * 2 + (part_x / 2) + column;
+      if (block8 >= 0 && block8 < 4) {
+        mb->ref_index[list * 4 + block8] = reference;
+        mb->ref_picture[list * 4 + block8] = picture;
+      }
+    }
+  }
+}

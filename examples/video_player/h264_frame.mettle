@@ -3,6 +3,8 @@ import "h264";
 import "h264_decode";
 import "h264_predict";
 import "h264_deblock";
+import "h264_inter";
+import "h264_pslice";
 
 fn h264_store_prediction(v: H264Video*, x: int32, y: int32, prediction: int32*) {
   for row in 0..4 {
@@ -22,6 +24,13 @@ fn h264_store_prediction_with_residual(v: H264Video*, x: int32, y: int32,
         h264_clip_sample(prediction[row * 4 + column] + residual[row * 4 + column]);
     }
   }
+}
+
+fn h264_clear_residual(v: H264Video*) {
+  for i in 0..256 { v->luma_ac[i] = 0; }
+  for i in 0..16 { v->luma_dc[i] = 0; }
+  for i in 0..128 { v->chroma_ac[i] = 0; }
+  for i in 0..8 { v->chroma_dc[i] = 0; }
 }
 
 fn h264_reconstruct_intra_nxn(v: H264Video*, mb: H264Macroblock*) {
@@ -93,31 +102,58 @@ fn h264_reconstruct_chroma(v: H264Video*, mb: H264Macroblock*, pps: H264Pps*) {
   }
 }
 
-fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*) -> int32 {
+fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*) -> int32 {
   var mb: H264Macroblock* = &v->macroblocks[v->mb_index];
   memset(mb, 0, sizeof(H264Macroblock));
   mb->coded = 1;
+  for i in 0..16 { v->block_filled[i] = 0; }
+  for i in 0..16 { v->ref_filled[i] = 0; }
+  for i in 0..8 { mb->ref_index[i] = -1; }
+  for i in 0..8 { mb->ref_picture[i] = -1; }
+
+  if (v->slice_type != H264_SLICE_I) {
+    if (h264_decode_skip_flag(v) != 0) {
+      mb->skipped = 1;
+      mb->kind = H264_MB_P_SKIP;
+      mb->qp = v->qp;
+      v->qp_delta_nonzero = 0;
+      h264_skip_motion(v, mb);
+      h264_clear_residual(v);
+      h264_reconstruct_inter(v, mb, pps);
+      return H264_OK;
+    }
+  }
 
   var cbp_luma: int32 = 0;
   var cbp_chroma: int32 = 0;
   var mode16: int32 = 0;
-  var kind: int32 = h264_decode_mb_type_intra(v, &cbp_luma, &cbp_chroma, &mode16);
-  mb->kind = kind;
-
-  if (kind == H264_MB_I_PCM) {
-    return H264_ERR_UNSUPPORTED;
-  }
-
-  if (kind == H264_MB_I_NXN) {
-    h264_decode_intra4x4_modes(v, mb);
+  var kind: int32 = 0;
+  if (v->slice_type == H264_SLICE_I) {
+    kind = h264_decode_mb_type_intra(v, &cbp_luma, &cbp_chroma, &mode16);
   } else {
-    mb->intra16x16_mode = mode16;
-    mb->cbp_luma = cbp_luma;
-    mb->cbp_chroma = cbp_chroma;
+    kind = h264_decode_mb_type_p(v, &cbp_luma, &cbp_chroma, &mode16);
   }
-  mb->chroma_mode = h264_decode_chroma_mode(v);
+  mb->kind = kind;
+  if (kind == H264_MB_I_PCM) { return H264_ERR_UNSUPPORTED; }
 
-  if (kind == H264_MB_I_NXN) {
+  var intra: int32 = 0;
+  if (kind == H264_MB_I_NXN || kind == H264_MB_I_16X16) { intra = 1; }
+  mb->is_intra = intra;
+
+  if (intra != 0) {
+    if (kind == H264_MB_I_NXN) {
+      h264_decode_intra4x4_modes(v, mb);
+    } else {
+      mb->intra16x16_mode = mode16;
+      mb->cbp_luma = cbp_luma;
+      mb->cbp_chroma = cbp_chroma;
+    }
+    mb->chroma_mode = h264_decode_chroma_mode(v);
+  } else {
+    h264_decode_p_motion(v, mb, header->num_ref_idx_l0_active);
+  }
+
+  if (kind != H264_MB_I_16X16) {
     var luma: int32 = 0;
     var chroma: int32 = 0;
     h264_decode_cbp(v, &luma, &chroma);
@@ -139,19 +175,217 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*) -> int32 {
   if (has_residual != 0) {
     h264_decode_residual(v, mb);
   } else {
-    for i in 0..256 { v->luma_ac[i] = 0; }
-    for i in 0..16 { v->luma_dc[i] = 0; }
-    for i in 0..128 { v->chroma_ac[i] = 0; }
-    for i in 0..8 { v->chroma_dc[i] = 0; }
+    h264_clear_residual(v);
   }
 
-  if (kind == H264_MB_I_NXN) {
-    h264_reconstruct_intra_nxn(v, mb);
+  if (intra != 0) {
+    if (kind == H264_MB_I_NXN) {
+      h264_reconstruct_intra_nxn(v, mb);
+    } else {
+      h264_reconstruct_intra_16x16(v, mb);
+    }
+    h264_reconstruct_chroma(v, mb, pps);
   } else {
-    h264_reconstruct_intra_16x16(v, mb);
+    h264_reconstruct_inter(v, mb, pps);
   }
-  h264_reconstruct_chroma(v, mb, pps);
   return H264_OK;
+}
+
+fn h264_compute_picture_order(v: H264Video*, sps: H264Sps*, header: H264SliceHeader*) {
+  if (sps->pic_order_cnt_type == 0) {
+    var previous_msb: int32 = v->previous_poc_msb;
+    var previous_lsb: int32 = v->previous_poc_lsb;
+    if (header->is_idr != 0) {
+      previous_msb = 0;
+      previous_lsb = 0;
+    }
+    var maximum: int32 = v->max_poc_lsb;
+    var lsb: int32 = header->pic_order_cnt_lsb;
+    var msb: int32 = previous_msb;
+    if (lsb < previous_lsb && previous_lsb - lsb >= maximum / 2) {
+      msb = previous_msb + maximum;
+    } else if (lsb > previous_lsb && lsb - previous_lsb > maximum / 2) {
+      msb = previous_msb - maximum;
+    }
+    v->poc = msb + lsb;
+    if (header->nal_ref_idc != 0) {
+      v->previous_poc_msb = msb;
+      v->previous_poc_lsb = lsb;
+    }
+    return;
+  }
+
+  var offset: int32 = v->previous_frame_num_offset;
+  if (header->is_idr != 0) {
+    offset = 0;
+  } else if (v->previous_frame_num > header->frame_num) {
+    offset = v->previous_frame_num_offset + v->max_frame_num;
+  }
+  v->previous_frame_num_offset = offset;
+  v->poc = 2 * (offset + header->frame_num);
+  if (header->nal_ref_idc == 0) { v->poc = v->poc - 1; }
+}
+
+fn h264_clear_references(v: H264Video*) {
+  for i in 0..H264_MAX_PICTURES {
+    v->pictures[i].is_reference = 0;
+    v->pictures[i].used = 0;
+  }
+}
+
+fn h264_build_reference_lists(v: H264Video*, header: H264SliceHeader*) {
+  v->ref_count0 = 0;
+  v->ref_count1 = 0;
+  if (v->slice_type == H264_SLICE_I) { return; }
+
+  for i in 0..H264_MAX_PICTURES {
+    if (i == v->current_picture) { continue; }
+    if (v->pictures[i].used == 0 || v->pictures[i].is_reference == 0) { continue; }
+    var wrap: int32 = v->pictures[i].frame_num;
+    if (wrap > header->frame_num) { wrap = wrap - v->max_frame_num; }
+    v->pictures[i].frame_num_wrap = wrap;
+    v->ref_list0[v->ref_count0] = i;
+    v->ref_count0 = v->ref_count0 + 1;
+  }
+
+  for i in 1..v->ref_count0 {
+    var value: int32 = v->ref_list0[i];
+    var key: int32 = v->pictures[value].frame_num_wrap;
+    var j: int32 = i;
+    while (j > 0 && v->pictures[v->ref_list0[j - 1]].frame_num_wrap < key) {
+      v->ref_list0[j] = v->ref_list0[j - 1];
+      j = j - 1;
+    }
+    v->ref_list0[j] = value;
+  }
+
+  if (v->ref_count0 == 0) { return; }
+
+  var size: int32 = header->num_ref_idx_l0_active;
+  if (size > 31) { size = 31; }
+  if (size < 1) { size = 1; }
+  for i in v->ref_count0..size {
+    v->ref_list0[i] = v->ref_list0[v->ref_count0 - 1];
+  }
+
+  var predicted: int32 = header->frame_num;
+  var index: int32 = 0;
+  for operation in 0..header->modification_count {
+    var kind: int32 = header->modification_op[operation];
+    if (kind != 0 && kind != 1) { continue; }
+    var difference: int32 = header->modification_value[operation] + 1;
+    var no_wrap: int32 = predicted - difference;
+    if (kind == 1) { no_wrap = predicted + difference; }
+    if (no_wrap < 0) { no_wrap = no_wrap + v->max_frame_num; }
+    if (no_wrap >= v->max_frame_num) { no_wrap = no_wrap - v->max_frame_num; }
+    predicted = no_wrap;
+
+    var wanted: int32 = no_wrap;
+    if (wanted > header->frame_num) { wanted = wanted - v->max_frame_num; }
+
+    var found: int32 = -1;
+    for i in 0..H264_MAX_PICTURES {
+      if (i == v->current_picture) { continue; }
+      if (v->pictures[i].used == 0 || v->pictures[i].is_reference == 0) { continue; }
+      if (v->pictures[i].frame_num_wrap == wanted) {
+        found = i;
+      }
+    }
+    if (found < 0) { continue; }
+
+    var slot: int32 = size;
+    while (slot > index) {
+      v->ref_list0[slot] = v->ref_list0[slot - 1];
+      slot = slot - 1;
+    }
+    v->ref_list0[index] = found;
+    index = index + 1;
+
+    var next: int32 = index;
+    for scan in index..(size + 1) {
+      if (v->ref_list0[scan] != found) {
+        v->ref_list0[next] = v->ref_list0[scan];
+        next = next + 1;
+      }
+    }
+  }
+
+  if (header->modification_count > 0) {
+    v->ref_count0 = size;
+  } else if (v->ref_count0 > size) {
+    v->ref_count0 = size;
+  }
+}
+
+fn h264_begin_picture(v: H264Video*, sps: H264Sps*, pps: H264Pps*, header: H264SliceHeader*) -> int32 {
+  var status: int32 = h264_prepare_picture(v, sps);
+  if (status != H264_OK) { return status; }
+
+  v->max_frame_num = 1 << sps->log2_max_frame_num;
+  v->max_poc_lsb = 1 << sps->log2_max_pic_order_cnt_lsb;
+
+  if (header->is_idr != 0) { h264_clear_references(v); }
+
+  h264_compute_picture_order(v, sps, header);
+
+  var index: int32 = h264_pick_free_picture(v);
+  status = h264_picture_allocate(v, index);
+  if (status != H264_OK) { return status; }
+
+  v->current_picture = index;
+  v->pictures[index].used = 1;
+  v->pictures[index].is_reference = 0;
+  v->pictures[index].poc = v->poc;
+  v->pictures[index].frame_num = header->frame_num;
+  v->luma = v->pictures[index].luma;
+  v->cb = v->pictures[index].cb;
+  v->cr = v->pictures[index].cr;
+
+  for i in 0..v->mb_count {
+    v->macroblocks[i].coded = 0;
+  }
+
+  h264_build_reference_lists(v, header);
+  return H264_OK;
+}
+
+fn h264_end_picture(v: H264Video*, sps: H264Sps*, header: H264SliceHeader*) {
+  h264_deblock_picture(v);
+  v->previous_frame_num = header->frame_num;
+
+  if (header->nal_ref_idc == 0) { return; }
+
+  var picture: H264Picture* = &v->pictures[v->current_picture];
+  picture->is_reference = 1;
+  picture->frame_num = header->frame_num;
+
+  var limit: int32 = sps->max_num_ref_frames;
+  if (limit < 1) { limit = 1; }
+
+  var count: int32 = 0;
+  for i in 0..H264_MAX_PICTURES {
+    if (v->pictures[i].used != 0 && v->pictures[i].is_reference != 0) { count = count + 1; }
+  }
+  while (count > limit) {
+    var oldest: int32 = -1;
+    for i in 0..H264_MAX_PICTURES {
+      if (i == v->current_picture) { continue; }
+      if (v->pictures[i].used == 0 || v->pictures[i].is_reference == 0) { continue; }
+      var wrap: int32 = v->pictures[i].frame_num;
+      if (wrap > header->frame_num) { wrap = wrap - v->max_frame_num; }
+      if (oldest < 0) {
+        oldest = i;
+      } else {
+        var best: int32 = v->pictures[oldest].frame_num;
+        if (best > header->frame_num) { best = best - v->max_frame_num; }
+        if (wrap < best) { oldest = i; }
+      }
+    }
+    if (oldest < 0) { break; }
+    v->pictures[oldest].is_reference = 0;
+    v->pictures[oldest].used = 0;
+    count = count - 1;
+  }
 }
 
 fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
@@ -160,16 +394,27 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
   var sps: H264Sps* = &parser->sps[parser->active_sps];
 
   if (pps->entropy_coding_mode == 0) { return H264_ERR_UNSUPPORTED; }
-  if (header->slice_type != H264_SLICE_I) { return H264_ERR_UNSUPPORTED; }
   if (sps->chroma_format_idc != 1) { return H264_ERR_UNSUPPORTED; }
   if (pps->transform_8x8_mode != 0) { return H264_ERR_UNSUPPORTED; }
+  if (header->slice_type == H264_SLICE_B) { return H264_ERR_UNSUPPORTED; }
+  if (header->slice_type == H264_SLICE_SP || header->slice_type == H264_SLICE_SI) {
+    return H264_ERR_UNSUPPORTED;
+  }
 
-  var status: int32 = h264_prepare_picture(v, sps);
-  if (status != H264_OK) { return status; }
+  v->slice_type = header->slice_type;
+  v->weighted_bipred = pps->weighted_bipred_idc;
+
+  if (header->first_mb_in_slice == 0) {
+    var status: int32 = h264_begin_picture(v, sps, pps, header);
+    if (status != H264_OK) { return status; }
+  }
 
   var start_bit: int64 = (header->data_bit_offset + (int64)7) & ~(int64)7;
   h264_cabac_start(v, parser->rbsp, header->rbsp_size, start_bit);
-  h264_cabac_init_contexts(v, header->qp, 0);
+
+  var model: int32 = 0;
+  if (header->slice_type != H264_SLICE_I) { model = header->cabac_init_idc + 1; }
+  h264_cabac_init_contexts(v, header->qp, model);
 
   v->qp = header->qp;
   v->qp_delta_nonzero = 0;
@@ -179,19 +424,33 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
   v->chroma_offset[0] = pps->chroma_qp_index_offset;
   v->chroma_offset[1] = pps->second_chroma_qp_index_offset;
 
+  v->use_weights = 0;
+  if (header->has_weights != 0 && header->slice_type != H264_SLICE_I) {
+    v->use_weights = 1;
+    v->luma_log2_denom = header->luma_log2_denom;
+    v->chroma_log2_denom = header->chroma_log2_denom;
+    for i in 0..32 {
+      v->weight_luma[i] = header->luma_weight[i];
+      v->weight_luma_offset[i] = header->luma_offset[i];
+      v->weight_chroma[i * 2] = header->chroma_weight[i * 2];
+      v->weight_chroma[i * 2 + 1] = header->chroma_weight[i * 2 + 1];
+      v->weight_chroma_offset[i * 2] = header->chroma_offset[i * 2];
+      v->weight_chroma_offset[i * 2 + 1] = header->chroma_offset[i * 2 + 1];
+    }
+  }
+
   var address: int32 = header->first_mb_in_slice;
   while (address < v->mb_count) {
     v->mb_index = address;
     v->mb_x = address % v->mb_width;
     v->mb_y = address / v->mb_width;
 
-    var mb_status: int32 = h264_decode_macroblock(v, pps);
+    var mb_status: int32 = h264_decode_macroblock(v, pps, header);
     if (mb_status != H264_OK) { return mb_status; }
 
     if (h264_decode_terminate(v) != 0) { break; }
     address = address + 1;
   }
-  h264_deblock_picture(v);
   return H264_OK;
 }
 
@@ -199,6 +458,7 @@ fn h264_decode_sample(v: H264Video*, sample: uint8*, size: int64) -> int32 {
   var parser: H264Decoder* = v->parser;
   var count: int32 = h264_nal_count(parser, sample, size);
   var decoded: int32 = 0;
+  var last: H264SliceHeader;
 
   for i in 0..count {
     var nal_size: int64 = 0;
@@ -216,10 +476,12 @@ fn h264_decode_sample(v: H264Video*, sample: uint8*, size: int64) -> int32 {
       if (status != H264_OK) { return status; }
       status = h264_decode_slice(v, &header);
       if (status != H264_OK) { return status; }
+      last = header;
       decoded = decoded + 1;
     }
   }
   if (decoded == 0) { return H264_ERR_BITSTREAM; }
+  h264_end_picture(v, &parser->sps[parser->active_sps], &last);
   return H264_OK;
 }
 

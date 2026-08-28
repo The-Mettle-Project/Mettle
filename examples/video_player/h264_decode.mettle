@@ -5,6 +5,16 @@ import "h264_tables";
 const H264_MB_I_NXN = 0;
 const H264_MB_I_16X16 = 1;
 const H264_MB_I_PCM = 2;
+const H264_MB_P_16X16 = 3;
+const H264_MB_P_16X8 = 4;
+const H264_MB_P_8X16 = 5;
+const H264_MB_P_8X8 = 6;
+const H264_MB_P_SKIP = 7;
+const H264_MB_B_DIRECT = 8;
+const H264_MB_B_INTER = 9;
+const H264_MB_B_SKIP = 10;
+
+const H264_MAX_PICTURES = 20;
 
 const H264_CAT_LUMA_DC = 0;
 const H264_CAT_LUMA_AC = 1;
@@ -24,6 +34,15 @@ const H264_CTX_SIGNIFICANT = 105;
 const H264_CTX_LAST_SIGNIFICANT = 166;
 const H264_CTX_ABS_LEVEL = 227;
 const H264_CTX_TERMINATE = 276;
+const H264_CTX_SKIP_P = 11;
+const H264_CTX_MB_TYPE_P = 14;
+const H264_CTX_SUB_TYPE_P = 21;
+const H264_CTX_SKIP_B = 24;
+const H264_CTX_MB_TYPE_B = 27;
+const H264_CTX_SUB_TYPE_B = 36;
+const H264_CTX_MVD_X = 40;
+const H264_CTX_MVD_Y = 47;
+const H264_CTX_REF_IDX = 54;
 
 struct H264Cabac {
   data: uint8*;
@@ -35,9 +54,22 @@ struct H264Cabac {
   mps: int32[460];
 }
 
+struct H264Picture {
+  luma: uint8*;
+  cb: uint8*;
+  cr: uint8*;
+  capacity: int64;
+  poc: int32;
+  frame_num: int32;
+  frame_num_wrap: int32;
+  is_reference: int32;
+  used: int32;
+}
+
 struct H264Macroblock {
   coded: int32;
   kind: int32;
+  is_intra: int32;
   intra16x16_mode: int32;
   chroma_mode: int32;
   cbp_luma: int32;
@@ -48,6 +80,13 @@ struct H264Macroblock {
   chroma_nonzero: uint8[8];
   luma_dc_nonzero: uint8;
   chroma_dc_nonzero: uint8[2];
+  mv_x: int32[32];
+  mv_y: int32[32];
+  mvd_x: int32[32];
+  mvd_y: int32[32];
+  ref_index: int32[8];
+  ref_picture: int32[8];
+  skipped: int32;
 }
 
 struct H264Video {
@@ -66,7 +105,32 @@ struct H264Video {
   luma: uint8*;
   cb: uint8*;
   cr: uint8*;
-  plane_capacity: int64;
+
+  pictures: H264Picture[20];
+  current_picture: int32;
+  ref_list0: int32[32];
+  ref_list1: int32[32];
+  ref_count0: int32;
+  ref_count1: int32;
+
+  poc: int32;
+  previous_poc_msb: int32;
+  previous_poc_lsb: int32;
+  previous_frame_num: int32;
+  previous_frame_num_offset: int32;
+  max_frame_num: int32;
+  max_poc_lsb: int32;
+
+  slice_type: int32;
+  direct_spatial: int32;
+  weighted_bipred: int32;
+  use_weights: int32;
+  luma_log2_denom: int32;
+  chroma_log2_denom: int32;
+  weight_luma: int32[32];
+  weight_luma_offset: int32[32];
+  weight_chroma: int32[64];
+  weight_chroma_offset: int32[64];
 
   macroblocks: H264Macroblock*;
   macroblock_capacity: int32;
@@ -82,6 +146,7 @@ struct H264Video {
   deblock_tc: int32*;
 
   disable_deblocking: int32;
+  skip_deblocking: int32;
   alpha_offset: int32;
   beta_offset: int32;
   chroma_offset: int32[2];
@@ -101,6 +166,8 @@ struct H264Video {
 
   qp: int32;
   qp_delta_nonzero: int32;
+  block_filled: int32[16];
+  ref_filled: int32[16];
   mb_x: int32;
   mb_y: int32;
   mb_index: int32;
@@ -179,9 +246,11 @@ fn h264_video_free(v: H264Video*) {
   if (v->deblock_alpha != 0) { free(v->deblock_alpha); }
   if (v->deblock_beta != 0) { free(v->deblock_beta); }
   if (v->deblock_tc != 0) { free(v->deblock_tc); }
-  if (v->luma != 0) { free(v->luma); }
-  if (v->cb != 0) { free(v->cb); }
-  if (v->cr != 0) { free(v->cr); }
+  for i in 0..H264_MAX_PICTURES {
+    if (v->pictures[i].luma != 0) { free(v->pictures[i].luma); }
+    if (v->pictures[i].cb != 0) { free(v->pictures[i].cb); }
+    if (v->pictures[i].cr != 0) { free(v->pictures[i].cr); }
+  }
   if (v->macroblocks != 0) { free(v->macroblocks); }
   if (v->pixels != 0) { free(v->pixels); }
   free(v);
@@ -205,22 +274,6 @@ fn h264_prepare_picture(v: H264Video*, sps: H264Sps*) -> int32 {
 
   v->luma_stride = v->mb_width * 16;
   v->chroma_stride = v->mb_width * 8;
-  var luma_size: int64 = (int64)v->luma_stride * (int64)(v->mb_height * 16);
-  var chroma_size: int64 = (int64)v->chroma_stride * (int64)(v->mb_height * 8);
-
-  if (luma_size > v->plane_capacity) {
-    if (v->luma != 0) { free(v->luma); }
-    if (v->cb != 0) { free(v->cb); }
-    if (v->cr != 0) { free(v->cr); }
-    v->luma = malloc(luma_size);
-    v->cb = malloc(chroma_size);
-    v->cr = malloc(chroma_size);
-    if (v->luma == 0 || v->cb == 0 || v->cr == 0) {
-      v->plane_capacity = 0;
-      return H264_ERR_NO_MEMORY;
-    }
-    v->plane_capacity = luma_size;
-  }
 
   if (v->mb_count > v->macroblock_capacity) {
     if (v->macroblocks != 0) { free(v->macroblocks); }
@@ -243,6 +296,37 @@ fn h264_prepare_picture(v: H264Video*, sps: H264Sps*) -> int32 {
     v->pixel_capacity = pixel_size;
   }
   return H264_OK;
+}
+
+fn h264_picture_allocate(v: H264Video*, index: int32) -> int32 {
+  var luma_size: int64 = (int64)v->luma_stride * (int64)(v->mb_height * 16);
+  var chroma_size: int64 = (int64)v->chroma_stride * (int64)(v->mb_height * 8);
+  var picture: H264Picture* = &v->pictures[index];
+  if (luma_size <= picture->capacity) { return H264_OK; }
+  if (picture->luma != 0) { free(picture->luma); }
+  if (picture->cb != 0) { free(picture->cb); }
+  if (picture->cr != 0) { free(picture->cr); }
+  picture->luma = malloc(luma_size);
+  picture->cb = malloc(chroma_size);
+  picture->cr = malloc(chroma_size);
+  if (picture->luma == 0 || picture->cb == 0 || picture->cr == 0) {
+    picture->capacity = 0;
+    return H264_ERR_NO_MEMORY;
+  }
+  picture->capacity = luma_size;
+  return H264_OK;
+}
+
+fn h264_pick_free_picture(v: H264Video*) -> int32 {
+  for i in 0..H264_MAX_PICTURES {
+    if (v->pictures[i].used == 0) { return i; }
+  }
+  var oldest: int32 = 0;
+  for i in 0..H264_MAX_PICTURES {
+    if (v->pictures[i].is_reference == 0) { return i; }
+    if (v->pictures[i].frame_num_wrap < v->pictures[oldest].frame_num_wrap) { oldest = i; }
+  }
+  return oldest;
 }
 
 fn h264_cabac_read_bit(c: H264Cabac*) -> int32 {
@@ -502,29 +586,31 @@ fn h264_coded_block_context(v: H264Video*, mb: H264Macroblock*, category: int32,
                             index: int32, component: int32) -> int32 {
   var left_flag: int32 = 0;
   var above_flag: int32 = 0;
+  var missing: int32 = 0;
+  if (mb->is_intra != 0) { missing = 1; }
   var left: int32 = h264_left_index(v);
   var above: int32 = h264_above_index(v);
 
   if (category == H264_CAT_LUMA_DC) {
-    if (left < 0) { left_flag = 1; } else { left_flag = (int32)v->macroblocks[left].luma_dc_nonzero; }
-    if (above < 0) { above_flag = 1; } else { above_flag = (int32)v->macroblocks[above].luma_dc_nonzero; }
+    if (left < 0) { left_flag = missing; } else { left_flag = (int32)v->macroblocks[left].luma_dc_nonzero; }
+    if (above < 0) { above_flag = missing; } else { above_flag = (int32)v->macroblocks[above].luma_dc_nonzero; }
   } else if (category == H264_CAT_CHROMA_DC) {
-    if (left < 0) { left_flag = 1; } else { left_flag = (int32)v->macroblocks[left].chroma_dc_nonzero[component]; }
-    if (above < 0) { above_flag = 1; } else { above_flag = (int32)v->macroblocks[above].chroma_dc_nonzero[component]; }
+    if (left < 0) { left_flag = missing; } else { left_flag = (int32)v->macroblocks[left].chroma_dc_nonzero[component]; }
+    if (above < 0) { above_flag = missing; } else { above_flag = (int32)v->macroblocks[above].chroma_dc_nonzero[component]; }
   } else if (category == H264_CAT_CHROMA_AC) {
     var bx: int32 = index & 1;
     var by: int32 = index >> 1;
     if (bx > 0) {
       left_flag = (int32)mb->chroma_nonzero[component * 4 + by * 2 + bx - 1];
     } else if (left < 0) {
-      left_flag = 1;
+      left_flag = missing;
     } else {
       left_flag = (int32)v->macroblocks[left].chroma_nonzero[component * 4 + by * 2 + 1];
     }
     if (by > 0) {
       above_flag = (int32)mb->chroma_nonzero[component * 4 + (by - 1) * 2 + bx];
     } else if (above < 0) {
-      above_flag = 1;
+      above_flag = missing;
     } else {
       above_flag = (int32)v->macroblocks[above].chroma_nonzero[component * 4 + 2 + bx];
     }
@@ -535,14 +621,14 @@ fn h264_coded_block_context(v: H264Video*, mb: H264Macroblock*, category: int32,
     if (bx > 0) {
       left_flag = (int32)mb->luma_nonzero[by * 4 + bx - 1];
     } else if (left < 0) {
-      left_flag = 1;
+      left_flag = missing;
     } else {
       left_flag = (int32)v->macroblocks[left].luma_nonzero[by * 4 + 3];
     }
     if (by > 0) {
       above_flag = (int32)mb->luma_nonzero[(by - 1) * 4 + bx];
     } else if (above < 0) {
-      above_flag = 1;
+      above_flag = missing;
     } else {
       above_flag = (int32)v->macroblocks[above].luma_nonzero[3 * 4 + bx];
     }
