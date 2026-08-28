@@ -18,6 +18,11 @@ native executable. See [`calc/README.md`](calc/README.md) and
 [`raylib/`](raylib/) binds raylib 5.5 with nothing but `extern fn` declarations
 and draws a rotating, lit sphere at ~8,600 fps. See [`raylib/README.md`](raylib/README.md).
 
+[`video_player/`](video_player/) plays Motion JPEG video with PCM audio from an
+AVI file. The container parser, the baseline JPEG decoder, the inverse DCT, the
+chroma upsampler, and the playback clock are all Mettle; Win32 supplies the
+window, the blit, and the wave device. See [`video_player/README.md`](video_player/README.md).
+
 ## Benchmark examples
 
 Each directory below contains `*.mettle`, `*.c`, `*.rs`, and `build.bat`. They are wired into [`docs/benchmarks/harness.json`](../docs/benchmarks/harness.json) and run via [`tools/benchmark/run-benchmarks.ps1`](../tools/benchmark/run-benchmarks.ps1). Every benchmark entry carries a `suite` number; benchmarks without one default to Suite 1.

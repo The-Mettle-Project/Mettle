@@ -1,0 +1,82 @@
+import "std/io";
+import "std/mem";
+
+extern fn _fseeki64(fp: cstring, offset: int64, origin: int32) -> int32 = "_fseeki64";
+extern fn _ftelli64(fp: cstring) -> int64 = "_ftelli64";
+extern fn remove(path: cstring) -> int32 = "remove";
+
+fn expected_byte(index: int32) -> int32 {
+  return (index * 3 + 7) & 255;
+}
+
+fn write_sample(path: cstring) -> int32 {
+  var fp: cstring = fopen(path, "wb");
+  if (fp == 0) { return 0; }
+  var bytes: uint8[64];
+  for i in 0..64 {
+    bytes[i] = (uint8)expected_byte(i);
+  }
+  fwrite(&bytes[0], 1, 64, fp);
+  fclose(fp);
+  return 1;
+}
+
+fn check_run(fp: cstring, at: int32, buffer: uint8*) -> int32 {
+  if (fread(buffer, 1, 4, fp) != 4) { return 0; }
+  for i in 0..4 {
+    if ((int32)buffer[i] != expected_byte(at + i)) { return 0; }
+  }
+  return 1;
+}
+
+fn main() -> int32 {
+  var path: cstring = "test_file_seek64_tmp.bin";
+  if (write_sample(path) == 0) {
+    println("cannot write sample");
+    return 1;
+  }
+
+  var fp: cstring = fopen(path, "rb");
+  if (fp == 0) {
+    println("cannot open sample");
+    return 1;
+  }
+
+  var buffer: uint8[16];
+  var failures: int32 = 0;
+
+  if (check_run(fp, 0, &buffer[0]) == 0) {
+    println("first read wrong");
+    failures = failures + 1;
+  }
+
+  if (_fseeki64(fp, 8, 0) != 0 || check_run(fp, 8, &buffer[0]) == 0) {
+    println("seek from start after a buffered read landed wrong");
+    failures = failures + 1;
+  }
+
+  if (_ftelli64(fp) != (int64)12) {
+    println("tell after a buffered read reported {_ftelli64(fp)}, wanted 12");
+    failures = failures + 1;
+  }
+
+  if (_fseeki64(fp, 8, 1) != 0 || check_run(fp, 20, &buffer[0]) == 0) {
+    println("seek from current position landed wrong");
+    failures = failures + 1;
+  }
+
+  if (_fseeki64(fp, -8, 2) != 0 || check_run(fp, 56, &buffer[0]) == 0) {
+    println("seek from end landed wrong");
+    failures = failures + 1;
+  }
+
+  fclose(fp);
+  remove(path);
+
+  if (failures != 0) {
+    println("{failures} seek checks failed");
+    return 1;
+  }
+  println("64-bit seeks agree with the stream buffer");
+  return 0;
+}

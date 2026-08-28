@@ -3166,15 +3166,24 @@ long ftell(void *stream) {
  * mt_i64); these are the entry points that let a program reach it, under the
  * names the platform uses for them. */
 int _fseeki64(void *stream, mt_i64 offset, int origin) {
+  MtFile *file = (MtFile *)stream;
   if (!stream || origin < 0 || origin > 2) {
     mt_errno_value = 22;
     return -1;
   }
-  return mt_file_seek((MtFile *)stream, offset, origin) < 0 ? -1 : 0;
+  if (origin == 1) {
+    offset -= (mt_i64)mt_stream_pending(file);
+  }
+  mt_stream_discard(file);
+  return mt_file_seek(file, offset, origin) < 0 ? -1 : 0;
 }
 
 mt_i64 _ftelli64(void *stream) {
-  return stream ? mt_file_seek((MtFile *)stream, 0, 1) : -1;
+  mt_i64 position = stream ? mt_file_seek((MtFile *)stream, 0, 1) : -1;
+  if (position >= 0) {
+    position -= (mt_i64)mt_stream_pending((MtFile *)stream);
+  }
+  return position;
 }
 
 void rewind(void *stream) {

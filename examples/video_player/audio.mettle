@@ -1,0 +1,251 @@
+import "std/mem";
+import "avi";
+
+const AUDIO_BUFFER_COUNT = 12;
+const AUDIO_WHDR_DONE = 1;
+const AUDIO_WHDR_PREPARED = 2;
+const AUDIO_TIME_BYTES = 4;
+
+struct WaveFormatEx {
+  format_tag: uint16;
+  channels: uint16;
+  samples_per_second: uint32;
+  average_bytes_per_second: uint32;
+  block_align: uint16;
+  bits_per_sample: uint16;
+  extra_size: uint16;
+}
+
+struct WaveHeader {
+  data: cstring;
+  buffer_length: uint32;
+  bytes_recorded: uint32;
+  user: int64;
+  flags: uint32;
+  loops: uint32;
+  next: int64;
+  reserved: int64;
+}
+
+struct MultimediaTime {
+  kind: uint32;
+  value: uint32;
+  padding: uint32;
+}
+
+extern fn waveOutOpen(device: int64*, device_id: uint32, format: WaveFormatEx*, callback: int64, instance: int64, flags: uint32) -> uint32 = "waveOutOpen";
+extern fn waveOutClose(device: int64) -> uint32 = "waveOutClose";
+extern fn waveOutPrepareHeader(device: int64, header: WaveHeader*, size: uint32) -> uint32 = "waveOutPrepareHeader";
+extern fn waveOutUnprepareHeader(device: int64, header: WaveHeader*, size: uint32) -> uint32 = "waveOutUnprepareHeader";
+extern fn waveOutWrite(device: int64, header: WaveHeader*, size: uint32) -> uint32 = "waveOutWrite";
+extern fn waveOutReset(device: int64) -> uint32 = "waveOutReset";
+extern fn waveOutPause(device: int64) -> uint32 = "waveOutPause";
+extern fn waveOutRestart(device: int64) -> uint32 = "waveOutRestart";
+extern fn waveOutSetVolume(device: int64, volume: uint32) -> uint32 = "waveOutSetVolume";
+extern fn waveOutGetPosition(device: int64, time: MultimediaTime*, size: uint32) -> uint32 = "waveOutGetPosition";
+
+struct AudioPlayer {
+  device: int64;
+  ready: int32;
+  paused: int32;
+  volume: int32;
+  muted: int32;
+
+  bytes_per_second: int32;
+  block_align: int32;
+  buffer_capacity: int32;
+
+  headers: WaveHeader*;
+  buffers: uint8*;
+  in_flight: int32*;
+
+  next_chunk: int32;
+  base_microseconds: int64;
+  wrap_microseconds: int64;
+  last_position: uint32;
+  finished: int32;
+}
+
+fn audio_open(file: AviFile*) -> AudioPlayer* {
+  var player: AudioPlayer* = malloc(sizeof(AudioPlayer));
+  if (player == 0) { return 0; }
+  memset(player, 0, sizeof(AudioPlayer));
+  player->volume = 70;
+
+  if (avi_has_audio(file) == 0) { return player; }
+
+  var stream: int32 = file->audio_stream;
+  var channels: int32 = file->streams[stream].channels;
+  var sample_rate: int32 = file->streams[stream].sample_rate;
+  var bits: int32 = file->streams[stream].bits_per_sample;
+  var align: int32 = file->streams[stream].block_align;
+  if (align <= 0) { align = channels * (bits / 8); }
+  if (channels <= 0 || sample_rate <= 0 || align <= 0) { return player; }
+
+  var format: WaveFormatEx;
+  format.format_tag = (uint16)1;
+  format.channels = (uint16)channels;
+  format.samples_per_second = (uint32)sample_rate;
+  format.average_bytes_per_second = (uint32)(sample_rate * align);
+  format.block_align = (uint16)align;
+  format.bits_per_sample = (uint16)bits;
+  format.extra_size = (uint16)0;
+
+  var device: int64 = 0;
+  if (waveOutOpen(&device, (uint32)0xFFFFFFFF, &format, 0, 0, (uint32)0) != (uint32)0) {
+    return player;
+  }
+
+  var capacity: int32 = file->audio_max_size;
+  if (capacity < 4096) { capacity = 4096; }
+
+  player->headers = malloc((int64)AUDIO_BUFFER_COUNT * sizeof(WaveHeader));
+  player->buffers = malloc((int64)AUDIO_BUFFER_COUNT * (int64)capacity);
+  player->in_flight = malloc((int64)AUDIO_BUFFER_COUNT * 4);
+  if (player->headers == 0 || player->buffers == 0 || player->in_flight == 0) {
+    waveOutClose(device);
+    return player;
+  }
+  memset(player->headers, 0, (int64)AUDIO_BUFFER_COUNT * sizeof(WaveHeader));
+  memset(player->in_flight, 0, (int64)AUDIO_BUFFER_COUNT * 4);
+
+  player->device = device;
+  player->ready = 1;
+  player->bytes_per_second = sample_rate * align;
+  player->block_align = align;
+  player->buffer_capacity = capacity;
+  audio_apply_volume(player);
+  return player;
+}
+
+fn audio_close(player: AudioPlayer*) {
+  if (player == 0) { return; }
+  if (player->ready != 0) {
+    waveOutReset(player->device);
+    audio_release_headers(player);
+    waveOutClose(player->device);
+  }
+  if (player->headers != 0) { free(player->headers); }
+  if (player->buffers != 0) { free(player->buffers); }
+  if (player->in_flight != 0) { free(player->in_flight); }
+  free(player);
+}
+
+fn audio_release_headers(player: AudioPlayer*) {
+  for i in 0..AUDIO_BUFFER_COUNT {
+    if (player->in_flight[i] != 0) {
+      waveOutUnprepareHeader(player->device, &player->headers[i], (uint32)sizeof(WaveHeader));
+      player->in_flight[i] = 0;
+    }
+  }
+}
+
+fn audio_apply_volume(player: AudioPlayer*) {
+  if (player->ready == 0) { return; }
+  var level: int32 = player->volume;
+  if (player->muted != 0) { level = 0; }
+  if (level < 0) { level = 0; }
+  if (level > 100) { level = 100; }
+  var scaled: uint32 = (uint32)(level * 65535 / 100);
+  waveOutSetVolume(player->device, scaled | (scaled << 16));
+}
+
+fn audio_set_volume(player: AudioPlayer*, level: int32) {
+  player->volume = level;
+  if (player->volume < 0) { player->volume = 0; }
+  if (player->volume > 100) { player->volume = 100; }
+  audio_apply_volume(player);
+}
+
+fn audio_toggle_mute(player: AudioPlayer*) {
+  if (player->muted != 0) { player->muted = 0; } else { player->muted = 1; }
+  audio_apply_volume(player);
+}
+
+fn audio_pause(player: AudioPlayer*) {
+  if (player->ready == 0 || player->paused != 0) { return; }
+  waveOutPause(player->device);
+  player->paused = 1;
+}
+
+fn audio_resume(player: AudioPlayer*) {
+  if (player->ready == 0 || player->paused == 0) { return; }
+  waveOutRestart(player->device);
+  player->paused = 0;
+}
+
+fn audio_played_bytes(player: AudioPlayer*) -> int64 {
+  var time: MultimediaTime;
+  time.kind = (uint32)AUDIO_TIME_BYTES;
+  time.value = (uint32)0;
+  time.padding = (uint32)0;
+  if (waveOutGetPosition(player->device, &time, (uint32)sizeof(MultimediaTime)) != (uint32)0) {
+    return 0;
+  }
+  if (time.kind != (uint32)AUDIO_TIME_BYTES) { return 0; }
+  var position: uint32 = time.value;
+  if (position < player->last_position) {
+    player->wrap_microseconds = player->wrap_microseconds + (int64)4294967296;
+  }
+  player->last_position = position;
+  return player->wrap_microseconds + (int64)position;
+}
+
+fn audio_position_microseconds(player: AudioPlayer*) -> int64 {
+  if (player->ready == 0 || player->bytes_per_second <= 0) { return 0; }
+  var played: int64 = audio_played_bytes(player);
+  return player->base_microseconds + played * (int64)1000000 / (int64)player->bytes_per_second;
+}
+
+fn audio_seek(player: AudioPlayer*, file: AviFile*, microseconds: int64) {
+  if (player->ready == 0) { return; }
+  waveOutReset(player->device);
+  audio_release_headers(player);
+  player->wrap_microseconds = 0;
+  player->last_position = (uint32)0;
+  player->finished = 0;
+
+  var byte_position: int64 = microseconds * (int64)player->bytes_per_second / (int64)1000000;
+  if (byte_position < 0) { byte_position = 0; }
+  var chunk: int32 = avi_audio_chunk_at_byte(file, byte_position);
+  player->next_chunk = chunk;
+  player->base_microseconds = file->audio_starts[chunk] * (int64)1000000 / (int64)player->bytes_per_second;
+  if (player->paused == 0) {
+    waveOutRestart(player->device);
+  }
+}
+
+fn audio_pump(player: AudioPlayer*, file: AviFile*) {
+  if (player->ready == 0) { return; }
+  for i in 0..AUDIO_BUFFER_COUNT {
+    var header: WaveHeader* = &player->headers[i];
+    if (player->in_flight[i] != 0) {
+      if ((header->flags & (uint32)AUDIO_WHDR_DONE) == (uint32)0) { continue; }
+      waveOutUnprepareHeader(player->device, header, (uint32)sizeof(WaveHeader));
+      player->in_flight[i] = 0;
+    }
+    if (player->next_chunk >= file->audio_count) {
+      player->finished = 1;
+      return;
+    }
+    var target: uint8* = &player->buffers[(int64)i * (int64)player->buffer_capacity];
+    var size: int32 = avi_read_audio_chunk(file, player->next_chunk, target, (int64)player->buffer_capacity);
+    player->next_chunk = player->next_chunk + 1;
+    if (size <= 0) { continue; }
+
+    header->data = target;
+    header->buffer_length = (uint32)size;
+    header->bytes_recorded = (uint32)0;
+    header->user = 0;
+    header->flags = (uint32)0;
+    header->loops = (uint32)0;
+    header->next = 0;
+    header->reserved = 0;
+    if (waveOutPrepareHeader(player->device, header, (uint32)sizeof(WaveHeader)) != (uint32)0) { return; }
+    if (waveOutWrite(player->device, header, (uint32)sizeof(WaveHeader)) != (uint32)0) {
+      waveOutUnprepareHeader(player->device, header, (uint32)sizeof(WaveHeader));
+      return;
+    }
+    player->in_flight[i] = 1;
+  }
+}

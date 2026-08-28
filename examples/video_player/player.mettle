@@ -1,0 +1,751 @@
+import "std/ui";
+import "std/io";
+import "std/mem";
+import "jpeg";
+import "avi";
+import "audio";
+
+const SEEK_STEP_US = 5000000;
+const SEEK_LONG_US = 30000000;
+const OSD_HOLD_US = 2500000;
+const OSD_BAND_HEIGHT = 62;
+const GWL_STYLE = -16;
+const SWP_FRAMECHANGED = 0x0020;
+const SWP_NOOWNERZORDER = 0x0200;
+const MONITOR_DEFAULTTONEAREST = 2;
+
+struct BitmapInfoHeader {
+  size: uint32;
+  width: int32;
+  height: int32;
+  planes: uint16;
+  bit_count: uint16;
+  compression: uint32;
+  size_image: uint32;
+  x_pels_per_meter: int32;
+  y_pels_per_meter: int32;
+  clr_used: uint32;
+  clr_important: uint32;
+}
+
+struct MonitorInfo {
+  size: uint32;
+  monitor: UiRect;
+  work: UiRect;
+  flags: uint32;
+}
+
+extern fn Gdi_StretchDIBits(hdc: int64, xdst: int32, ydst: int32, wdst: int32, hdst: int32,
+                            xsrc: int32, ysrc: int32, wsrc: int32, hsrc: int32,
+                            bits: rawptr, info: rawptr, usage: uint32, rop: uint32) -> int32 = "StretchDIBits";
+extern fn Gdi_SetStretchBltMode(hdc: int64, mode: int32) -> int32 = "SetStretchBltMode";
+extern fn Win_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn Win_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn Win_AdjustWindowRect(rect: UiRect*, style: uint32, menu: int32) -> int32 = "AdjustWindowRect";
+extern fn Win_MonitorFromWindow(hwnd: int64, flags: uint32) -> int64 = "MonitorFromWindow";
+extern fn Win_GetMonitorInfoA(monitor: int64, info: MonitorInfo*) -> int32 = "GetMonitorInfoA";
+extern fn Win_ShowCursor(show: int32) -> int32 = "ShowCursor";
+extern fn Win_SetCapture(hwnd: int64) -> int64 = "SetCapture";
+extern fn Win_ReleaseCapture() -> int32 = "ReleaseCapture";
+
+var g_window: int64 = 0;
+var g_running: int32 = 1;
+var g_file: AviFile* = 0;
+var g_decoder: JpegDecoder* = 0;
+var g_audio: AudioPlayer* = 0;
+var g_frame_buffer: uint8* = 0;
+var g_frame_capacity: int64 = 0;
+var g_has_picture: int32 = 0;
+
+var g_playing: int32 = 1;
+var g_position_us: int64 = 0;
+var g_clock_base_us: int64 = 0;
+var g_clock_start_us: int64 = 0;
+var g_duration_us: int64 = 0;
+var g_displayed_frame: int32 = -1;
+var g_qpc_frequency: int64 = 1;
+
+var g_osd_until_us: int64 = 0;
+var g_osd_font: int64 = 0;
+var g_cursor_hidden: int32 = 0;
+var g_scrubbing: int32 = 0;
+var g_mouse_x: int32 = 0;
+var g_mouse_y: int32 = 0;
+
+var g_fullscreen: int32 = 0;
+var g_saved_style: int64 = 0;
+var g_saved_left: int32 = 0;
+var g_saved_top: int32 = 0;
+var g_saved_width: int32 = 0;
+var g_saved_height: int32 = 0;
+
+var g_dest_left: int32 = -1;
+var g_dest_top: int32 = -1;
+var g_dest_width: int32 = -1;
+var g_dest_height: int32 = -1;
+
+var g_decode_us: int64 = 0;
+var g_decode_samples: int64 = 0;
+var g_decode_total_us: int64 = 0;
+var g_dropped: int64 = 0;
+
+fn now_microseconds() -> int64 {
+  var counter: int64 = 0;
+  Win_QueryPerformanceCounter(&counter);
+  var seconds: int64 = counter / g_qpc_frequency;
+  var remainder: int64 = counter % g_qpc_frequency;
+  return seconds * (int64)1000000 + remainder * (int64)1000000 / g_qpc_frequency;
+}
+
+fn append_byte(buffer: uint8*, index: int32, value: int32) -> int32 {
+  buffer[index] = (uint8)value;
+  return index + 1;
+}
+
+fn append_number(buffer: uint8*, index: int32, value: int64, min_digits: int32) -> int32 {
+  var digits: uint8[24];
+  var count: int32 = 0;
+  var left: int64 = value;
+  if (left < 0) { left = 0; }
+  while (left > 0) {
+    digits[count] = (uint8)(48 + (int32)(left % (int64)10));
+    left = left / (int64)10;
+    count = count + 1;
+  }
+  while (count < min_digits) {
+    digits[count] = (uint8)48;
+    count = count + 1;
+  }
+  if (count == 0) {
+    digits[0] = (uint8)48;
+    count = 1;
+  }
+  var out: int32 = index;
+  for i in 0..count {
+    buffer[out] = digits[count - 1 - i];
+    out = out + 1;
+  }
+  return out;
+}
+
+fn append_text(buffer: uint8*, index: int32, text: cstring) -> int32 {
+  var out: int32 = index;
+  var i: int64 = 0;
+  while (text[i] != (uint8)0) {
+    buffer[out] = text[i];
+    out = out + 1;
+    i = i + 1;
+  }
+  return out;
+}
+
+fn append_clock(buffer: uint8*, index: int32, microseconds: int64) -> int32 {
+  var total_seconds: int64 = microseconds / (int64)1000000;
+  if (total_seconds < 0) { total_seconds = 0; }
+  var hours: int64 = total_seconds / (int64)3600;
+  var minutes: int64 = (total_seconds / (int64)60) % (int64)60;
+  var seconds: int64 = total_seconds % (int64)60;
+  var out: int32 = index;
+  if (hours > 0) {
+    out = append_number(buffer, out, hours, 1);
+    out = append_byte(buffer, out, 58);
+    out = append_number(buffer, out, minutes, 2);
+  } else {
+    out = append_number(buffer, out, minutes, 1);
+  }
+  out = append_byte(buffer, out, 58);
+  out = append_number(buffer, out, seconds, 2);
+  return out;
+}
+
+fn frame_at_position(microseconds: int64) -> int32 {
+  var period: int64 = (int64)g_file->microsec_per_frame;
+  if (period <= 0) { period = 33333; }
+  var index: int64 = microseconds / period;
+  if (index < 0) { index = 0; }
+  if (index >= (int64)g_file->video_count) { index = (int64)g_file->video_count - 1; }
+  return (int32)index;
+}
+
+fn decode_frame(index: int32) -> int32 {
+  var size: int32 = avi_read_video_frame(g_file, index, g_frame_buffer, g_frame_capacity);
+  if (size < 0) { return 0; }
+  if (size == 0) { return 1; }
+  var started: int64 = now_microseconds();
+  var status: int32 = jpeg_decode(g_decoder, g_frame_buffer, (int64)size);
+  if (status != JPEG_OK) { return 0; }
+  g_decode_us = now_microseconds() - started;
+  g_decode_total_us = g_decode_total_us + g_decode_us;
+  g_decode_samples = g_decode_samples + 1;
+  g_has_picture = 1;
+  return 1;
+}
+
+fn compute_destination(client: UiRect*) {
+  var client_width: int32 = client->right - client->left;
+  var client_height: int32 = client->bottom - client->top;
+  if (client_width <= 0 || client_height <= 0) { return; }
+  var source_width: int32 = g_file->width;
+  var source_height: int32 = g_file->height;
+  if (g_decoder->width > 0) { source_width = g_decoder->width; }
+  if (g_decoder->height > 0) { source_height = g_decoder->height; }
+  if (source_width <= 0 || source_height <= 0) { return; }
+
+  var width: int32 = client_width;
+  var height: int32 = (int32)((int64)client_width * (int64)source_height / (int64)source_width);
+  if (height > client_height) {
+    height = client_height;
+    width = (int32)((int64)client_height * (int64)source_width / (int64)source_height);
+  }
+  g_dest_left = (client_width - width) / 2;
+  g_dest_top = (client_height - height) / 2;
+  g_dest_width = width;
+  g_dest_height = height;
+}
+
+fn paint_letterbox(hdc: int64, client: UiRect*) {
+  var black: uint32 = ui_rgb((uint32)0, (uint32)0, (uint32)0);
+  if (g_dest_top > 0) {
+    ui_fill_rect_color(hdc, 0, 0, client->right, g_dest_top, black);
+  }
+  var bottom: int32 = g_dest_top + g_dest_height;
+  if (bottom < client->bottom) {
+    ui_fill_rect_color(hdc, 0, bottom, client->right, client->bottom, black);
+  }
+  if (g_dest_left > 0) {
+    ui_fill_rect_color(hdc, 0, g_dest_top, g_dest_left, bottom, black);
+  }
+  var right: int32 = g_dest_left + g_dest_width;
+  if (right < client->right) {
+    ui_fill_rect_color(hdc, right, g_dest_top, client->right, bottom, black);
+  }
+}
+
+fn paint_picture(hdc: int64) {
+  if (g_has_picture == 0) { return; }
+  var info: BitmapInfoHeader;
+  info.size = (uint32)40;
+  info.width = g_decoder->width;
+  info.height = 0 - g_decoder->height;
+  info.planes = (uint16)1;
+  info.bit_count = (uint16)32;
+  info.compression = (uint32)0;
+  info.size_image = (uint32)0;
+  info.x_pels_per_meter = 0;
+  info.y_pels_per_meter = 0;
+  info.clr_used = (uint32)0;
+  info.clr_important = (uint32)0;
+  Gdi_SetStretchBltMode(hdc, 3);
+  Gdi_StretchDIBits(hdc, g_dest_left, g_dest_top, g_dest_width, g_dest_height,
+                    0, 0, g_decoder->width, g_decoder->height,
+                    g_decoder->pixels, &info, (uint32)0, (uint32)0x00CC0020);
+}
+
+fn seek_bar_track(client: UiRect*, left: int32*, right: int32*, top: int32*) {
+  *left = 20;
+  *right = client->right - 20;
+  *top = client->bottom - 26;
+}
+
+fn paint_osd(hdc: int64, client: UiRect*) {
+  var band_top: int32 = client->bottom - OSD_BAND_HEIGHT;
+  if (band_top < 0) { band_top = 0; }
+  ui_fill_rect_color(hdc, 0, band_top, client->right, client->bottom, ui_rgb((uint32)16, (uint32)16, (uint32)18));
+
+  var track_left: int32 = 0;
+  var track_right: int32 = 0;
+  var track_top: int32 = 0;
+  seek_bar_track(client, &track_left, &track_right, &track_top);
+  var track_width: int32 = track_right - track_left;
+  if (track_width < 8) { return; }
+
+  ui_fill_rect_color(hdc, track_left, track_top, track_right, track_top + 5, ui_rgb((uint32)62, (uint32)62, (uint32)68));
+  var filled: int32 = 0;
+  if (g_duration_us > 0) {
+    filled = (int32)((int64)track_width * g_position_us / g_duration_us);
+  }
+  if (filled < 0) { filled = 0; }
+  if (filled > track_width) { filled = track_width; }
+  ui_fill_rect_color(hdc, track_left, track_top, track_left + filled, track_top + 5, ui_rgb((uint32)240, (uint32)240, (uint32)245));
+
+  var text: uint8[192];
+  var length: int32 = 0;
+  if (g_playing == 0) {
+    length = append_text(&text[0], length, "paused  ");
+  }
+  length = append_clock(&text[0], length, g_position_us);
+  length = append_text(&text[0], length, " / ");
+  length = append_clock(&text[0], length, g_duration_us);
+  text[length] = (uint8)0;
+
+  var font_saved: int64 = 0;
+  if (g_osd_font != 0) { font_saved = ui_select_object(hdc, g_osd_font); }
+  ui_set_text_transparent(hdc);
+  ui_draw_text_transparent(hdc, track_left, band_top + 12, (cstring)&text[0], ui_rgb((uint32)235, (uint32)235, (uint32)240));
+
+  var right_text: uint8[192];
+  var right_length: int32 = 0;
+  right_length = append_text(&right_text[0], right_length, "frame ");
+  right_length = append_number(&right_text[0], right_length, (int64)g_displayed_frame + (int64)1, 1);
+  right_length = append_byte(&right_text[0], right_length, 47);
+  right_length = append_number(&right_text[0], right_length, (int64)g_file->video_count, 1);
+  if (g_decode_samples > 0) {
+    var tenths: int64 = g_decode_total_us / g_decode_samples / (int64)100;
+    right_length = append_text(&right_text[0], right_length, "   decode ");
+    right_length = append_number(&right_text[0], right_length, tenths / (int64)10, 1);
+    right_length = append_byte(&right_text[0], right_length, 46);
+    right_length = append_number(&right_text[0], right_length, tenths % (int64)10, 1);
+    right_length = append_text(&right_text[0], right_length, " ms");
+  }
+  if (g_audio->ready != 0) {
+    right_length = append_text(&right_text[0], right_length, "   vol ");
+    if (g_audio->muted != 0) {
+      right_length = append_text(&right_text[0], right_length, "muted");
+    } else {
+      right_length = append_number(&right_text[0], right_length, (int64)g_audio->volume, 1);
+    }
+  }
+  right_text[right_length] = (uint8)0;
+  ui_draw_text_transparent(hdc, track_left + 220, band_top + 12, (cstring)&right_text[0], ui_rgb((uint32)150, (uint32)150, (uint32)160));
+
+  if (font_saved != 0) { ui_select_object(hdc, font_saved); }
+}
+
+fn osd_visible() -> int32 {
+  if (g_playing == 0) { return 1; }
+  if (now_microseconds() < g_osd_until_us) { return 1; }
+  return 0;
+}
+
+fn paint_window(hdc: int64) {
+  var client: UiRect = ui_window_client_rect(g_window);
+  compute_destination(&client);
+  paint_letterbox(hdc, &client);
+  paint_picture(hdc);
+  if (osd_visible() != 0) {
+    paint_osd(hdc, &client);
+  }
+}
+
+fn present() {
+  var hdc: int64 = Ui_GetDC(g_window);
+  if (hdc == 0) { return; }
+  paint_window(hdc);
+  Ui_ReleaseDC(g_window, hdc);
+}
+
+fn show_frame(index: int32) {
+  if (index == g_displayed_frame) { return; }
+  if (decode_frame(index) == 0) {
+    g_displayed_frame = index;
+    return;
+  }
+  if (index > g_displayed_frame + 1) {
+    g_dropped = g_dropped + (int64)(index - g_displayed_frame - 1);
+  }
+  g_displayed_frame = index;
+  present();
+}
+
+fn wake_osd() {
+  g_osd_until_us = now_microseconds() + (int64)OSD_HOLD_US;
+  if (g_cursor_hidden != 0) {
+    Win_ShowCursor(1);
+    g_cursor_hidden = 0;
+  }
+}
+
+fn set_playing(playing: int32) {
+  if (playing == g_playing) { return; }
+  if (playing != 0 && g_position_us >= g_duration_us) {
+    g_playing = 1;
+    seek_to(0);
+    audio_resume(g_audio);
+    return;
+  }
+  g_playing = playing;
+  if (playing != 0) {
+    g_clock_base_us = g_position_us;
+    g_clock_start_us = now_microseconds();
+    audio_resume(g_audio);
+  } else {
+    audio_pause(g_audio);
+  }
+  present();
+}
+
+fn seek_to(microseconds: int64) {
+  var target: int64 = microseconds;
+  if (target < 0) { target = 0; }
+  if (target > g_duration_us) { target = g_duration_us; }
+  g_position_us = target;
+  g_clock_base_us = target;
+  g_clock_start_us = now_microseconds();
+  audio_seek(g_audio, g_file, target);
+  var index: int32 = frame_at_position(target);
+  var scan: int32 = index;
+  while (scan > 0 && g_file->video_sizes[scan] == 0) {
+    scan = scan - 1;
+  }
+  if (scan != g_displayed_frame) {
+    decode_frame(scan);
+  }
+  g_displayed_frame = index;
+  present();
+}
+
+fn step_frames(delta: int32) {
+  var period: int64 = (int64)g_file->microsec_per_frame;
+  var index: int32 = frame_at_position(g_position_us) + delta;
+  if (index < 0) { index = 0; }
+  if (index >= g_file->video_count) { index = g_file->video_count - 1; }
+  set_playing(0);
+  seek_to((int64)index * period);
+}
+
+fn update_playback() {
+  var use_audio: int32 = 0;
+  if (g_audio->ready != 0 && g_audio->finished == 0 && g_playing != 0) { use_audio = 1; }
+
+  if (use_audio != 0) {
+    var audio_position: int64 = audio_position_microseconds(g_audio);
+    if (audio_position < 0) { audio_position = 0; }
+    g_position_us = audio_position;
+    g_clock_base_us = audio_position;
+    g_clock_start_us = now_microseconds();
+  } else if (g_playing != 0) {
+    g_position_us = g_clock_base_us + (now_microseconds() - g_clock_start_us);
+  }
+
+  if (g_position_us >= g_duration_us) {
+    g_position_us = g_duration_us;
+    if (g_playing != 0) {
+      set_playing(0);
+      wake_osd();
+    }
+  }
+
+  show_frame(frame_at_position(g_position_us));
+
+  if (g_playing != 0 && osd_visible() == 0 && g_fullscreen != 0 && g_cursor_hidden == 0) {
+    Win_ShowCursor(0);
+    g_cursor_hidden = 1;
+  }
+}
+
+fn seek_from_mouse(x: int32) {
+  var client: UiRect = ui_window_client_rect(g_window);
+  var track_left: int32 = 0;
+  var track_right: int32 = 0;
+  var track_top: int32 = 0;
+  seek_bar_track(&client, &track_left, &track_right, &track_top);
+  var track_width: int32 = track_right - track_left;
+  if (track_width <= 0) { return; }
+  var offset: int32 = x - track_left;
+  if (offset < 0) { offset = 0; }
+  if (offset > track_width) { offset = track_width; }
+  seek_to(g_duration_us * (int64)offset / (int64)track_width);
+}
+
+fn point_in_osd(y: int32) -> int32 {
+  var client: UiRect = ui_window_client_rect(g_window);
+  if (y >= client.bottom - OSD_BAND_HEIGHT) { return 1; }
+  return 0;
+}
+
+fn toggle_fullscreen() {
+  if (g_fullscreen == 0) {
+    var window: UiRect = ui_window_rect(g_window);
+    g_saved_left = window.left;
+    g_saved_top = window.top;
+    g_saved_width = window.right - window.left;
+    g_saved_height = window.bottom - window.top;
+    g_saved_style = Ui_GetWindowLongPtrA(g_window, GWL_STYLE);
+
+    var monitor: int64 = Win_MonitorFromWindow(g_window, (uint32)MONITOR_DEFAULTTONEAREST);
+    var info: MonitorInfo;
+    info.size = (uint32)sizeof(MonitorInfo);
+    if (Win_GetMonitorInfoA(monitor, &info) == 0) { return; }
+
+    Ui_SetWindowLongPtrA(g_window, GWL_STYLE, g_saved_style & ~(int64)UI_WS_OVERLAPPEDWINDOW());
+    Ui_SetWindowPos(g_window, 0, info.monitor.left, info.monitor.top,
+                    info.monitor.right - info.monitor.left,
+                    info.monitor.bottom - info.monitor.top,
+                    (uint32)(SWP_FRAMECHANGED | SWP_NOOWNERZORDER));
+    g_fullscreen = 1;
+  } else {
+    Ui_SetWindowLongPtrA(g_window, GWL_STYLE, g_saved_style);
+    Ui_SetWindowPos(g_window, 0, g_saved_left, g_saved_top, g_saved_width, g_saved_height,
+                    (uint32)(SWP_FRAMECHANGED | SWP_NOOWNERZORDER));
+    g_fullscreen = 0;
+    if (g_cursor_hidden != 0) {
+      Win_ShowCursor(1);
+      g_cursor_hidden = 0;
+    }
+  }
+  g_dest_width = -1;
+  wake_osd();
+  present();
+}
+
+fn handle_key(key: int64) {
+  wake_osd();
+  if (key == 32 || key == 75) {
+    if (g_playing != 0) { set_playing(0); } else { set_playing(1); }
+    return;
+  }
+  if (key == 39) { seek_to(g_position_us + (int64)SEEK_STEP_US); return; }
+  if (key == 37) { seek_to(g_position_us - (int64)SEEK_STEP_US); return; }
+  if (key == 76) { seek_to(g_position_us + (int64)SEEK_LONG_US); return; }
+  if (key == 74) { seek_to(g_position_us - (int64)SEEK_LONG_US); return; }
+  if (key == 38) { audio_set_volume(g_audio, g_audio->volume + 5); present(); return; }
+  if (key == 40) { audio_set_volume(g_audio, g_audio->volume - 5); present(); return; }
+  if (key == 77) { audio_toggle_mute(g_audio); present(); return; }
+  if (key == 36) { seek_to(0); return; }
+  if (key == 35) { seek_to(g_duration_us); return; }
+  if (key == 190) { step_frames(1); return; }
+  if (key == 188) { step_frames(-1); return; }
+  if (key == 70 || key == 122) { toggle_fullscreen(); return; }
+  if (key == 27) {
+    if (g_fullscreen != 0) { toggle_fullscreen(); return; }
+    g_running = 0;
+    ui_window_close(g_window);
+    return;
+  }
+  if (key == 81) {
+    g_running = 0;
+    ui_window_close(g_window);
+    return;
+  }
+}
+
+fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  if (msg == UI_WM_ERASEBKGND()) { return 1; }
+
+  if (msg == UI_WM_PAINT()) {
+    var paint: UiPaintStruct;
+    var hdc: int64 = ui_begin_paint(hwnd, &paint);
+    g_dest_width = -1;
+    paint_window(hdc);
+    ui_end_paint(hwnd, &paint);
+    return 0;
+  }
+
+  if (msg == UI_WM_SIZE()) {
+    g_dest_width = -1;
+    present();
+    return 0;
+  }
+
+  if (msg == UI_WM_KEYDOWN()) {
+    handle_key(wparam);
+    return 0;
+  }
+
+  if (msg == UI_WM_MOUSEMOVE()) {
+    g_mouse_x = ui_mouse_x(lparam);
+    g_mouse_y = ui_mouse_y(lparam);
+    wake_osd();
+    if (g_scrubbing != 0) {
+      seek_from_mouse(g_mouse_x);
+    } else if (g_playing == 0) {
+      present();
+    }
+    return 0;
+  }
+
+  if (msg == UI_WM_LBUTTONDOWN()) {
+    var x: int32 = ui_mouse_x(lparam);
+    var y: int32 = ui_mouse_y(lparam);
+    wake_osd();
+    if (point_in_osd(y) != 0) {
+      g_scrubbing = 1;
+      Win_SetCapture(hwnd);
+      seek_from_mouse(x);
+    }
+    return 0;
+  }
+
+  if (msg == UI_WM_LBUTTONUP()) {
+    if (g_scrubbing != 0) {
+      g_scrubbing = 0;
+      Win_ReleaseCapture();
+    }
+    return 0;
+  }
+
+  if (msg == UI_WM_LBUTTONDBLCLK()) {
+    toggle_fullscreen();
+    return 0;
+  }
+
+  if (msg == UI_WM_MOUSEWHEEL()) {
+    var delta: int32 = (int32)((wparam >> 16) & 0xFFFF);
+    if (delta >= 32768) { delta = delta - 65536; }
+    audio_set_volume(g_audio, g_audio->volume + delta / 120 * 5);
+    wake_osd();
+    present();
+    return 0;
+  }
+
+  if (msg == UI_WM_DESTROY()) {
+    g_running = 0;
+    ui_quit(0);
+    return 0;
+  }
+
+  return ui_def_window_proc(hwnd, msg, wparam, lparam);
+}
+
+fn initial_window_size(video_width: int32, video_height: int32, out_width: int32*, out_height: int32*) {
+  var screen_width: int32 = win32_get_system_metrics(SM_CXSCREEN());
+  var screen_height: int32 = win32_get_system_metrics(SM_CYSCREEN());
+  var limit_width: int32 = screen_width * 8 / 10;
+  var limit_height: int32 = screen_height * 8 / 10;
+  var width: int32 = video_width;
+  var height: int32 = video_height;
+  if (width > limit_width) {
+    height = height * limit_width / width;
+    width = limit_width;
+  }
+  if (height > limit_height) {
+    width = width * limit_height / height;
+    height = limit_height;
+  }
+  if (width < 320) { width = 320; }
+  if (height < 240) { height = 240; }
+
+  var rect: UiRect = ui_make_rect(0, 0, width, height);
+  Win_AdjustWindowRect(&rect, UI_WS_OVERLAPPEDWINDOW(), 0);
+  *out_width = rect.right - rect.left;
+  *out_height = rect.bottom - rect.top;
+}
+
+fn file_name_of(path: cstring) -> cstring {
+  var last: int64 = -1;
+  var i: int64 = 0;
+  while (path[i] != (uint8)0) {
+    if (path[i] == (uint8)47 || path[i] == (uint8)92) { last = i; }
+    i = i + 1;
+  }
+  return &path[last + 1];
+}
+
+fn print_controls() {
+  println("controls:");
+  println("  space or K     play and pause");
+  println("  left / right   seek 5 seconds");
+  println("  J / L          seek 30 seconds");
+  println("  , / .          step one frame");
+  println("  home / end     start and end");
+  println("  up / down      volume, mouse wheel does the same");
+  println("  M              mute");
+  println("  F or F11       fullscreen, double click does the same");
+  println("  click the bar  seek, drag to scrub");
+  println("  esc or Q       quit");
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 2) {
+    println("usage: player <file.avi>");
+    println("");
+    println("Plays Motion JPEG video with PCM audio from an AVI container.");
+    println("Convert any source with ffmpeg:");
+    println("  ffmpeg -i input.mp4 -c:v mjpeg -q:v 5 -pix_fmt yuvj420p -c:a pcm_s16le clip.avi");
+    println("");
+    print_controls();
+    return 0;
+  }
+
+  Win_QueryPerformanceFrequency(&g_qpc_frequency);
+  if (g_qpc_frequency <= 0) { g_qpc_frequency = 1; }
+
+  var status: int32 = 0;
+  g_file = avi_open(argv[1], &status);
+  if (g_file == 0) {
+    print("cannot open ");
+    println_cstr(argv[1]);
+    if (status == AVI_ERR_OPEN) { println("no such file"); }
+    if (status == AVI_ERR_NOT_RIFF) { println("not an AVI file"); }
+    if (status == AVI_ERR_NO_VIDEO) { println("no video stream found"); }
+    return 1;
+  }
+  defer avi_close(g_file);
+
+  if (avi_is_mjpeg(g_file) == 0) {
+    println("warning: video stream is not tagged Motion JPEG, trying anyway");
+  }
+
+  g_decoder = jpeg_decoder_new();
+  if (g_decoder == 0) { return 1; }
+  defer jpeg_decoder_free(g_decoder);
+
+  g_frame_capacity = (int64)g_file->video_max_size;
+  g_frame_buffer = malloc(g_frame_capacity);
+  if (g_frame_buffer == 0) { return 1; }
+  defer free(g_frame_buffer);
+
+  g_audio = audio_open(g_file);
+  if (g_audio == 0) { return 1; }
+  defer audio_close(g_audio);
+
+  g_duration_us = avi_duration_microseconds(g_file);
+
+  print("video {g_file->width}x{g_file->height}, {g_file->video_count} frames, {(int64)1000000 / (int64)g_file->microsec_per_frame} fps");
+  if (g_audio->ready != 0) {
+    println(", audio {g_file->streams[g_file->audio_stream].channels} ch {g_file->streams[g_file->audio_stream].sample_rate} Hz");
+  } else if (avi_has_audio(g_file) != 0) {
+    println(", audio device unavailable");
+  } else {
+    println(", no audio");
+  }
+
+  var window_width: int32 = 0;
+  var window_height: int32 = 0;
+  initial_window_size(g_file->width, g_file->height, &window_width, &window_height);
+
+  var title: uint8[512];
+  var title_length: int32 = append_text(&title[0], 0, file_name_of(argv[1]));
+  title[title_length] = (uint8)0;
+
+  g_window = ui_window_create_centered((cstring)&title[0], window_width, window_height, &window_proc);
+  if (g_window == 0) {
+    println("cannot create window");
+    return 1;
+  }
+  g_osd_font = ui_create_font(17, "Segoe UI", UI_FW_NORMAL());
+  ui_window_show(g_window);
+  wake_osd();
+
+  decode_frame(0);
+  g_displayed_frame = 0;
+  present();
+
+  g_clock_base_us = 0;
+  g_clock_start_us = now_microseconds();
+  audio_seek(g_audio, g_file, 0);
+
+  var message: UiMsg;
+  while (g_running != 0) {
+    while (Ui_PeekMessageA(&message, 0, 0, 0, UI_PM_REMOVE()) != 0) {
+      if (message.message == UI_WM_QUIT()) {
+        g_running = 0;
+        break;
+      }
+      Ui_TranslateMessage(&message);
+      Ui_DispatchMessageA(&message);
+    }
+    if (g_running == 0) { break; }
+
+    if (g_playing != 0) {
+      audio_pump(g_audio, g_file);
+    }
+    update_playback();
+    win32_sleep_ms((uint32)2);
+  }
+
+  if (g_cursor_hidden != 0) { Win_ShowCursor(1); }
+  if (g_osd_font != 0) { ui_delete_object(g_osd_font); }
+  println("played to {g_position_us / 1000000} s, {g_dropped} frames skipped");
+  return 0;
+}

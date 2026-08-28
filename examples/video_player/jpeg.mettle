@@ -1,0 +1,880 @@
+import "std/mem";
+
+const JPEG_OK = 0;
+const JPEG_ERR_NOT_JPEG = 1;
+const JPEG_ERR_UNSUPPORTED = 2;
+const JPEG_ERR_TRUNCATED = 3;
+const JPEG_ERR_BAD_DATA = 4;
+const JPEG_ERR_NO_MEMORY = 5;
+
+const JPEG_CONST_BITS = 13;
+const JPEG_PASS1_BITS = 2;
+
+const FIX_0_298631336 = 2446;
+const FIX_0_390180644 = 3196;
+const FIX_0_541196100 = 4433;
+const FIX_0_765366865 = 6270;
+const FIX_0_899976223 = 7373;
+const FIX_1_175875602 = 9633;
+const FIX_1_501321110 = 12299;
+const FIX_1_847759065 = 15137;
+const FIX_1_961570560 = 16069;
+const FIX_2_053119869 = 16819;
+const FIX_2_562915447 = 20995;
+const FIX_3_072711026 = 25172;
+
+struct JpegComponent {
+  id: int32;
+  h: int32;
+  v: int32;
+  quant_index: int32;
+  dc_table: int32;
+  ac_table: int32;
+  dc_pred: int32;
+  plane: uint8*;
+  stride: int32;
+  plane_height: int32;
+  plane_capacity: int64;
+}
+
+struct JpegDecoder {
+  data: uint8*;
+  size: int64;
+  pos: int64;
+
+  bit_buffer: uint64;
+  bit_count: int32;
+  marker_hit: int32;
+
+  width: int32;
+  height: int32;
+  component_count: int32;
+  h_max: int32;
+  v_max: int32;
+  mcu_cols: int32;
+  mcu_rows: int32;
+  restart_interval: int32;
+
+  components: JpegComponent[4];
+
+  zigzag: int32[64];
+  quant: int32[256];
+  block: int32[64];
+  workspace: int32[64];
+
+  huff_maxcode: int32[144];
+  huff_mincode: int32[136];
+  huff_valptr: int32[136];
+  huff_vals: uint8[2048];
+  huff_defined: int32[8];
+
+  pixels: uint32*;
+  pixel_capacity: int64;
+  upsample: uint8*;
+  upsample_capacity: int64;
+
+  error: int32;
+}
+
+fn jpeg_decoder_new() -> JpegDecoder* {
+  var d: JpegDecoder* = malloc(sizeof(JpegDecoder));
+  if (d == 0) { return 0; }
+  memset(d, 0, sizeof(JpegDecoder));
+  var order: int32[64] = [
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63
+  ];
+  for i in 0..64 {
+    d->zigzag[i] = order[i];
+  }
+  return d;
+}
+
+fn jpeg_decoder_free(d: JpegDecoder*) {
+  if (d == 0) { return; }
+  for i in 0..4 {
+    if (d->components[i].plane != 0) {
+      free(d->components[i].plane);
+      d->components[i].plane = 0;
+    }
+  }
+  if (d->pixels != 0) { free(d->pixels); }
+  if (d->upsample != 0) { free(d->upsample); }
+  free(d);
+}
+
+fn jpeg_read_u16(d: JpegDecoder*, at: int64) -> int32 {
+  if (at + 1 >= d->size) { return -1; }
+  return ((int32)d->data[at] << 8) | (int32)d->data[at + 1];
+}
+
+fn jpeg_next_marker(d: JpegDecoder*) -> int32 {
+  while (d->pos < d->size) {
+    if (d->data[d->pos] != (uint8)0xFF) {
+      d->pos = d->pos + 1;
+      continue;
+    }
+    var probe: int64 = d->pos + 1;
+    while (probe < d->size && d->data[probe] == (uint8)0xFF) {
+      probe = probe + 1;
+    }
+    if (probe >= d->size) { return -1; }
+    var marker: int32 = (int32)d->data[probe];
+    d->pos = probe + 1;
+    if (marker != 0) { return marker; }
+  }
+  return -1;
+}
+
+fn jpeg_fill_bits(d: JpegDecoder*) {
+  while (d->bit_count <= 24) {
+    var byte_value: int32 = 0;
+    if (d->marker_hit == 0 && d->pos < d->size) {
+      byte_value = (int32)d->data[d->pos];
+      d->pos = d->pos + 1;
+      if (byte_value == 0xFF) {
+        var next: int32 = 0xD9;
+        if (d->pos < d->size) { next = (int32)d->data[d->pos]; }
+        if (next == 0) {
+          d->pos = d->pos + 1;
+        } else {
+          d->pos = d->pos - 1;
+          d->marker_hit = 1;
+          byte_value = 0;
+        }
+      }
+    }
+    d->bit_buffer = (d->bit_buffer << (uint64)8) | (uint64)byte_value;
+    d->bit_count = d->bit_count + 8;
+  }
+}
+
+fn jpeg_get_bits(d: JpegDecoder*, count: int32) -> int32 {
+  if (count <= 0) { return 0; }
+  if (d->bit_count < count) { jpeg_fill_bits(d); }
+  var remaining: int32 = d->bit_count - count;
+  var mask: uint64 = ((uint64)1 << (uint64)count) - (uint64)1;
+  var value: int32 = (int32)((d->bit_buffer >> (uint64)remaining) & mask);
+  d->bit_count = remaining;
+  return value;
+}
+
+fn jpeg_reset_bits(d: JpegDecoder*) {
+  d->bit_buffer = (uint64)0;
+  d->bit_count = 0;
+  d->marker_hit = 0;
+}
+
+fn jpeg_decode_huffman(d: JpegDecoder*, table: int32) -> int32 {
+  var max_base: int32 = table * 18;
+  var base: int32 = table * 17;
+  var code: int32 = jpeg_get_bits(d, 1);
+  var length: int32 = 1;
+  while (length <= 16 && code > d->huff_maxcode[max_base + length]) {
+    code = (code << 1) | jpeg_get_bits(d, 1);
+    length = length + 1;
+  }
+  if (length > 16) {
+    d->error = JPEG_ERR_BAD_DATA;
+    return 0;
+  }
+  var index: int32 = d->huff_valptr[base + length] + code - d->huff_mincode[base + length];
+  if (index < 0 || index > 255) {
+    d->error = JPEG_ERR_BAD_DATA;
+    return 0;
+  }
+  return (int32)d->huff_vals[table * 256 + index];
+}
+
+fn jpeg_extend(value: int32, magnitude: int32) -> int32 {
+  if (magnitude == 0) { return 0; }
+  if (value < (1 << (magnitude - 1))) {
+    return value - (1 << magnitude) + 1;
+  }
+  return value;
+}
+
+fn jpeg_build_huffman(d: JpegDecoder*, table: int32, counts: int32*) {
+  var sizes: int32[257];
+  var codes: int32[257];
+  var total: int32 = 0;
+  for length in 1..17 {
+    for i in 0..counts[length] {
+      sizes[total] = length;
+      total = total + 1;
+    }
+  }
+  sizes[total] = 0;
+
+  var code: int32 = 0;
+  var size: int32 = sizes[0];
+  var p: int32 = 0;
+  while (p < total) {
+    while (p < total && sizes[p] == size) {
+      codes[p] = code;
+      code = code + 1;
+      p = p + 1;
+    }
+    code = code << 1;
+    size = size + 1;
+  }
+
+  var max_base: int32 = table * 18;
+  var base: int32 = table * 17;
+  p = 0;
+  for length in 1..17 {
+    if (counts[length] > 0) {
+      d->huff_valptr[base + length] = p;
+      d->huff_mincode[base + length] = codes[p];
+      p = p + counts[length];
+      d->huff_maxcode[max_base + length] = codes[p - 1];
+    } else {
+      d->huff_maxcode[max_base + length] = -1;
+    }
+  }
+  d->huff_maxcode[max_base + 17] = 0x000FFFFF;
+  d->huff_defined[table] = 1;
+}
+
+fn jpeg_install_default_table(d: JpegDecoder*, table: int32, counts: int32*, values: int32*, count: int32) {
+  for i in 0..count {
+    d->huff_vals[table * 256 + i] = (uint8)values[i];
+  }
+  jpeg_build_huffman(d, table, counts);
+}
+
+fn jpeg_install_default_huffman(d: JpegDecoder*) {
+  var dc_luma_counts: int32[17] = [0, 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+  var dc_chroma_counts: int32[17] = [0, 0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+  var dc_values: int32[12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+  var ac_luma_counts: int32[17] = [0, 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125];
+  var ac_luma_values: int32[162] = [
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+    0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+    0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+    0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA
+  ];
+
+  var ac_chroma_counts: int32[17] = [0, 0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 119];
+  var ac_chroma_values: int32[162] = [
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33, 0x52, 0xF0,
+    0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34, 0xE1, 0x25, 0xF1, 0x17, 0x18, 0x19, 0x1A, 0x26,
+    0x27, 0x28, 0x29, 0x2A, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5,
+    0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3,
+    0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA,
+    0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA
+  ];
+
+  if (d->huff_defined[0] == 0) {
+    jpeg_install_default_table(d, 0, &dc_luma_counts[0], &dc_values[0], 12);
+  }
+  if (d->huff_defined[1] == 0) {
+    jpeg_install_default_table(d, 1, &dc_chroma_counts[0], &dc_values[0], 12);
+  }
+  if (d->huff_defined[4] == 0) {
+    jpeg_install_default_table(d, 4, &ac_luma_counts[0], &ac_luma_values[0], 162);
+  }
+  if (d->huff_defined[5] == 0) {
+    jpeg_install_default_table(d, 5, &ac_chroma_counts[0], &ac_chroma_values[0], 162);
+  }
+}
+
+fn jpeg_parse_dht(d: JpegDecoder*, at: int64, end: int64) -> int32 {
+  var p: int64 = at;
+  while (p < end) {
+    if (p + 17 > end) { return JPEG_ERR_BAD_DATA; }
+    var spec: int32 = (int32)d->data[p];
+    p = p + 1;
+    var table_class: int32 = spec >> 4;
+    var table_id: int32 = spec & 15;
+    if (table_class > 1 || table_id > 3) { return JPEG_ERR_BAD_DATA; }
+
+    var counts: int32[17];
+    counts[0] = 0;
+    var total: int32 = 0;
+    for length in 1..17 {
+      counts[length] = (int32)d->data[p + (int64)(length - 1)];
+      total = total + counts[length];
+    }
+    p = p + 16;
+    if (total > 256 || p + (int64)total > end) { return JPEG_ERR_BAD_DATA; }
+
+    var table: int32 = table_class * 4 + table_id;
+    for i in 0..total {
+      d->huff_vals[table * 256 + i] = d->data[p + (int64)i];
+    }
+    p = p + (int64)total;
+    jpeg_build_huffman(d, table, &counts[0]);
+  }
+  return JPEG_OK;
+}
+
+fn jpeg_parse_dqt(d: JpegDecoder*, at: int64, end: int64) -> int32 {
+  var p: int64 = at;
+  while (p < end) {
+    var spec: int32 = (int32)d->data[p];
+    p = p + 1;
+    var precision: int32 = spec >> 4;
+    var table_id: int32 = spec & 15;
+    if (table_id > 3) { return JPEG_ERR_BAD_DATA; }
+    var need: int64 = (int64)64;
+    if (precision != 0) { need = (int64)128; }
+    if (p + need > end) { return JPEG_ERR_BAD_DATA; }
+    for i in 0..64 {
+      var value: int32 = 0;
+      if (precision == 0) {
+        value = (int32)d->data[p + (int64)i];
+      } else {
+        value = ((int32)d->data[p + (int64)(i * 2)] << 8) | (int32)d->data[p + (int64)(i * 2 + 1)];
+      }
+      d->quant[table_id * 64 + d->zigzag[i]] = value;
+    }
+    p = p + need;
+  }
+  return JPEG_OK;
+}
+
+fn jpeg_parse_sof(d: JpegDecoder*, at: int64, end: int64) -> int32 {
+  if (at + 6 > end) { return JPEG_ERR_BAD_DATA; }
+  var precision: int32 = (int32)d->data[at];
+  if (precision != 8) { return JPEG_ERR_UNSUPPORTED; }
+  d->height = jpeg_read_u16(d, at + 1);
+  d->width = jpeg_read_u16(d, at + 3);
+  d->component_count = (int32)d->data[at + 5];
+  if (d->width <= 0 || d->height <= 0) { return JPEG_ERR_BAD_DATA; }
+  if (d->component_count != 1 && d->component_count != 3) { return JPEG_ERR_UNSUPPORTED; }
+  if (at + 6 + (int64)(d->component_count * 3) > end) { return JPEG_ERR_BAD_DATA; }
+
+  d->h_max = 1;
+  d->v_max = 1;
+  for i in 0..d->component_count {
+    var base: int64 = at + 6 + (int64)(i * 3);
+    d->components[i].id = (int32)d->data[base];
+    var sampling: int32 = (int32)d->data[base + 1];
+    d->components[i].h = sampling >> 4;
+    d->components[i].v = sampling & 15;
+    d->components[i].quant_index = (int32)d->data[base + 2];
+    if (d->components[i].h < 1 || d->components[i].h > 4) { return JPEG_ERR_BAD_DATA; }
+    if (d->components[i].v < 1 || d->components[i].v > 4) { return JPEG_ERR_BAD_DATA; }
+    if (d->components[i].quant_index > 3) { return JPEG_ERR_BAD_DATA; }
+    if (d->components[i].h > d->h_max) { d->h_max = d->components[i].h; }
+    if (d->components[i].v > d->v_max) { d->v_max = d->components[i].v; }
+  }
+
+  d->mcu_cols = (d->width + d->h_max * 8 - 1) / (d->h_max * 8);
+  d->mcu_rows = (d->height + d->v_max * 8 - 1) / (d->v_max * 8);
+  return JPEG_OK;
+}
+
+fn jpeg_allocate_planes(d: JpegDecoder*) -> int32 {
+  for i in 0..d->component_count {
+    var stride: int32 = d->mcu_cols * d->components[i].h * 8;
+    var rows: int32 = d->mcu_rows * d->components[i].v * 8;
+    var need: int64 = (int64)stride * (int64)rows;
+    if (need > d->components[i].plane_capacity) {
+      if (d->components[i].plane != 0) { free(d->components[i].plane); }
+      d->components[i].plane = malloc(need);
+      if (d->components[i].plane == 0) {
+        d->components[i].plane_capacity = 0;
+        return JPEG_ERR_NO_MEMORY;
+      }
+      d->components[i].plane_capacity = need;
+    }
+    d->components[i].stride = stride;
+    d->components[i].plane_height = rows;
+  }
+
+  var pixels_need: int64 = (int64)d->width * (int64)d->height * 4;
+  if (pixels_need > d->pixel_capacity) {
+    if (d->pixels != 0) { free(d->pixels); }
+    d->pixels = malloc(pixels_need);
+    if (d->pixels == 0) {
+      d->pixel_capacity = 0;
+      return JPEG_ERR_NO_MEMORY;
+    }
+    d->pixel_capacity = pixels_need;
+  }
+
+  var upsample_need: int64 = (int64)d->width * 3;
+  if (upsample_need > d->upsample_capacity) {
+    if (d->upsample != 0) { free(d->upsample); }
+    d->upsample = malloc(upsample_need);
+    if (d->upsample == 0) {
+      d->upsample_capacity = 0;
+      return JPEG_ERR_NO_MEMORY;
+    }
+    d->upsample_capacity = upsample_need;
+  }
+  return JPEG_OK;
+}
+
+fn jpeg_idct_block(d: JpegDecoder*, quant_base: int32, out: uint8*, out_offset: int64, stride: int32) {
+  var coefficients: int32* = &d->block[0];
+  var quant: int32* = &d->quant[quant_base];
+  var workspace: int32* = &d->workspace[0];
+
+  for column in 0..8 {
+    var in1: int32 = coefficients[column + 8];
+    var in2: int32 = coefficients[column + 16];
+    var in3: int32 = coefficients[column + 24];
+    var in4: int32 = coefficients[column + 32];
+    var in5: int32 = coefficients[column + 40];
+    var in6: int32 = coefficients[column + 48];
+    var in7: int32 = coefficients[column + 56];
+
+    if (in1 == 0 && in2 == 0 && in3 == 0 && in4 == 0 && in5 == 0 && in6 == 0 && in7 == 0) {
+      var flat: int32 = (coefficients[column] * quant[column]) << JPEG_PASS1_BITS;
+      for row in 0..8 {
+        workspace[column + row * 8] = flat;
+      }
+      continue;
+    }
+
+    var z2: int32 = in2 * quant[column + 16];
+    var z3: int32 = in6 * quant[column + 48];
+    var z1: int32 = (z2 + z3) * FIX_0_541196100;
+    var tmp2: int32 = z1 + z3 * (0 - FIX_1_847759065);
+    var tmp3: int32 = z1 + z2 * FIX_0_765366865;
+
+    z2 = coefficients[column] * quant[column];
+    z3 = in4 * quant[column + 32];
+    var tmp0: int32 = (z2 + z3) << JPEG_CONST_BITS;
+    var tmp1: int32 = (z2 - z3) << JPEG_CONST_BITS;
+
+    var tmp10: int32 = tmp0 + tmp3;
+    var tmp13: int32 = tmp0 - tmp3;
+    var tmp11: int32 = tmp1 + tmp2;
+    var tmp12: int32 = tmp1 - tmp2;
+
+    tmp0 = in7 * quant[column + 56];
+    tmp1 = in5 * quant[column + 40];
+    tmp2 = in3 * quant[column + 24];
+    tmp3 = in1 * quant[column + 8];
+
+    z1 = tmp0 + tmp3;
+    z2 = tmp1 + tmp2;
+    z3 = tmp0 + tmp2;
+    var z4: int32 = tmp1 + tmp3;
+    var z5: int32 = (z3 + z4) * FIX_1_175875602;
+
+    tmp0 = tmp0 * FIX_0_298631336;
+    tmp1 = tmp1 * FIX_2_053119869;
+    tmp2 = tmp2 * FIX_3_072711026;
+    tmp3 = tmp3 * FIX_1_501321110;
+    z1 = z1 * (0 - FIX_0_899976223);
+    z2 = z2 * (0 - FIX_2_562915447);
+    z3 = z3 * (0 - FIX_1_961570560);
+    z4 = z4 * (0 - FIX_0_390180644);
+
+    z3 = z3 + z5;
+    z4 = z4 + z5;
+
+    tmp0 = tmp0 + z1 + z3;
+    tmp1 = tmp1 + z2 + z4;
+    tmp2 = tmp2 + z2 + z3;
+    tmp3 = tmp3 + z1 + z4;
+
+    var round1: int32 = 1 << (JPEG_CONST_BITS - JPEG_PASS1_BITS - 1);
+    var shift1: int32 = JPEG_CONST_BITS - JPEG_PASS1_BITS;
+    workspace[column] = (tmp10 + tmp3 + round1) >> shift1;
+    workspace[column + 56] = (tmp10 - tmp3 + round1) >> shift1;
+    workspace[column + 8] = (tmp11 + tmp2 + round1) >> shift1;
+    workspace[column + 48] = (tmp11 - tmp2 + round1) >> shift1;
+    workspace[column + 16] = (tmp12 + tmp1 + round1) >> shift1;
+    workspace[column + 40] = (tmp12 - tmp1 + round1) >> shift1;
+    workspace[column + 24] = (tmp13 + tmp0 + round1) >> shift1;
+    workspace[column + 32] = (tmp13 - tmp0 + round1) >> shift1;
+  }
+
+  var round2: int32 = 1 << (JPEG_CONST_BITS + JPEG_PASS1_BITS + 2);
+  var shift2: int32 = JPEG_CONST_BITS + JPEG_PASS1_BITS + 3;
+
+  for row in 0..8 {
+    var base: int32 = row * 8;
+    var target: int64 = out_offset + (int64)row * (int64)stride;
+
+    var z2: int32 = workspace[base + 2];
+    var z3: int32 = workspace[base + 6];
+    var z1: int32 = (z2 + z3) * FIX_0_541196100;
+    var tmp2: int32 = z1 + z3 * (0 - FIX_1_847759065);
+    var tmp3: int32 = z1 + z2 * FIX_0_765366865;
+
+    var tmp0: int32 = (workspace[base] + workspace[base + 4]) << JPEG_CONST_BITS;
+    var tmp1: int32 = (workspace[base] - workspace[base + 4]) << JPEG_CONST_BITS;
+
+    var tmp10: int32 = tmp0 + tmp3;
+    var tmp13: int32 = tmp0 - tmp3;
+    var tmp11: int32 = tmp1 + tmp2;
+    var tmp12: int32 = tmp1 - tmp2;
+
+    tmp0 = workspace[base + 7];
+    tmp1 = workspace[base + 5];
+    tmp2 = workspace[base + 3];
+    tmp3 = workspace[base + 1];
+
+    z1 = tmp0 + tmp3;
+    z2 = tmp1 + tmp2;
+    z3 = tmp0 + tmp2;
+    var z4: int32 = tmp1 + tmp3;
+    var z5: int32 = (z3 + z4) * FIX_1_175875602;
+
+    tmp0 = tmp0 * FIX_0_298631336;
+    tmp1 = tmp1 * FIX_2_053119869;
+    tmp2 = tmp2 * FIX_3_072711026;
+    tmp3 = tmp3 * FIX_1_501321110;
+    z1 = z1 * (0 - FIX_0_899976223);
+    z2 = z2 * (0 - FIX_2_562915447);
+    z3 = z3 * (0 - FIX_1_961570560);
+    z4 = z4 * (0 - FIX_0_390180644);
+
+    z3 = z3 + z5;
+    z4 = z4 + z5;
+
+    tmp0 = tmp0 + z1 + z3;
+    tmp1 = tmp1 + z2 + z4;
+    tmp2 = tmp2 + z2 + z3;
+    tmp3 = tmp3 + z1 + z4;
+
+    out[target] = jpeg_clamp_sample(((tmp10 + tmp3 + round2) >> shift2) + 128);
+    out[target + 7] = jpeg_clamp_sample(((tmp10 - tmp3 + round2) >> shift2) + 128);
+    out[target + 1] = jpeg_clamp_sample(((tmp11 + tmp2 + round2) >> shift2) + 128);
+    out[target + 6] = jpeg_clamp_sample(((tmp11 - tmp2 + round2) >> shift2) + 128);
+    out[target + 2] = jpeg_clamp_sample(((tmp12 + tmp1 + round2) >> shift2) + 128);
+    out[target + 5] = jpeg_clamp_sample(((tmp12 - tmp1 + round2) >> shift2) + 128);
+    out[target + 3] = jpeg_clamp_sample(((tmp13 + tmp0 + round2) >> shift2) + 128);
+    out[target + 4] = jpeg_clamp_sample(((tmp13 - tmp0 + round2) >> shift2) + 128);
+  }
+}
+
+fn jpeg_clamp_sample(value: int32) -> uint8 {
+  if (value < 0) { return (uint8)0; }
+  if (value > 255) { return (uint8)255; }
+  return (uint8)value;
+}
+
+fn jpeg_decode_block(d: JpegDecoder*, component: int32) {
+  for i in 0..64 {
+    d->block[i] = 0;
+  }
+  var symbol: int32 = jpeg_decode_huffman(d, d->components[component].dc_table);
+  if (d->error != JPEG_OK) { return; }
+  var diff: int32 = 0;
+  if (symbol != 0) {
+    if (symbol > 15) { d->error = JPEG_ERR_BAD_DATA; return; }
+    diff = jpeg_extend(jpeg_get_bits(d, symbol), symbol);
+  }
+  d->components[component].dc_pred = d->components[component].dc_pred + diff;
+  d->block[0] = d->components[component].dc_pred;
+
+  var ac_table: int32 = 4 + d->components[component].ac_table;
+  var k: int32 = 1;
+  while (k < 64) {
+    var run_size: int32 = jpeg_decode_huffman(d, ac_table);
+    if (d->error != JPEG_OK) { return; }
+    var magnitude: int32 = run_size & 15;
+    var run: int32 = run_size >> 4;
+    if (magnitude == 0) {
+      if (run != 15) { return; }
+      k = k + 16;
+      continue;
+    }
+    k = k + run;
+    if (k > 63) { return; }
+    d->block[d->zigzag[k]] = jpeg_extend(jpeg_get_bits(d, magnitude), magnitude);
+    k = k + 1;
+  }
+}
+
+fn jpeg_at_restart_marker(d: JpegDecoder*) -> int32 {
+  var p: int64 = d->pos;
+  while (p + 1 < d->size && d->data[p] == (uint8)0xFF && d->data[p + 1] == (uint8)0xFF) {
+    p = p + 1;
+  }
+  if (p + 1 >= d->size) { return 0; }
+  if (d->data[p] != (uint8)0xFF) { return 0; }
+  var marker: int32 = (int32)d->data[p + 1];
+  if (marker >= 0xD0 && marker <= 0xD7) {
+    d->pos = p + 2;
+    return 1;
+  }
+  return 0;
+}
+
+fn jpeg_decode_scan(d: JpegDecoder*) -> int32 {
+  jpeg_reset_bits(d);
+  for i in 0..d->component_count {
+    d->components[i].dc_pred = 0;
+  }
+
+  var mcu_count: int32 = d->mcu_cols * d->mcu_rows;
+  var since_restart: int32 = 0;
+
+  for mcu in 0..mcu_count {
+    var mcu_x: int32 = mcu % d->mcu_cols;
+    var mcu_y: int32 = mcu / d->mcu_cols;
+
+    if (d->restart_interval > 0 && since_restart == d->restart_interval) {
+      jpeg_reset_bits(d);
+      if (jpeg_at_restart_marker(d) == 0) { return JPEG_ERR_BAD_DATA; }
+      for i in 0..d->component_count {
+        d->components[i].dc_pred = 0;
+      }
+      since_restart = 0;
+    }
+    since_restart = since_restart + 1;
+
+    for c in 0..d->component_count {
+      var horizontal: int32 = d->components[c].h;
+      var vertical: int32 = d->components[c].v;
+      var stride: int32 = d->components[c].stride;
+      var plane: uint8* = d->components[c].plane;
+      var quant_base: int32 = d->components[c].quant_index * 64;
+      for by in 0..vertical {
+        for bx in 0..horizontal {
+          var px: int32 = (mcu_x * horizontal + bx) * 8;
+          var py: int32 = (mcu_y * vertical + by) * 8;
+          jpeg_decode_block(d, c);
+          if (d->error != JPEG_OK) { return d->error; }
+          jpeg_idct_block(d, quant_base, plane, (int64)py * (int64)stride + (int64)px, stride);
+        }
+      }
+    }
+  }
+  return JPEG_OK;
+}
+
+fn jpeg_component_columns(d: JpegDecoder*, component: int32) -> int32 {
+  return (d->width * d->components[component].h + d->h_max - 1) / d->h_max;
+}
+
+fn jpeg_component_rows(d: JpegDecoder*, component: int32) -> int32 {
+  return (d->height * d->components[component].v + d->v_max - 1) / d->v_max;
+}
+
+fn jpeg_upsample_row(d: JpegDecoder*, component: int32, out: uint8*, y: int32) {
+  var stride: int32 = d->components[component].stride;
+  var plane: uint8* = d->components[component].plane;
+  var ratio_h: int32 = d->h_max / d->components[component].h;
+  var ratio_v: int32 = d->v_max / d->components[component].v;
+  var width: int32 = d->width;
+
+  if (ratio_h * d->components[component].h != d->h_max
+      || ratio_v * d->components[component].v != d->v_max
+      || ratio_h > 2 || ratio_v > 2) {
+    var scale_h: int32 = d->components[component].h;
+    var scale_v: int32 = d->components[component].v;
+    var source_row: int64 = (int64)(y * scale_v / d->v_max) * (int64)stride;
+    for x in 0..width {
+      out[x] = plane[source_row + (int64)(x * scale_h / d->h_max)];
+    }
+    return;
+  }
+
+  var columns: int32 = jpeg_component_columns(d, component);
+  var rows: int32 = jpeg_component_rows(d, component);
+  var shift_h: int32 = ratio_h - 1;
+  var shift_v: int32 = ratio_v - 1;
+
+  var center_y: int32 = y >> shift_v;
+  if (center_y >= rows) { center_y = rows - 1; }
+  var other_y: int32 = center_y;
+  if (ratio_v == 2) {
+    if ((y & 1) == 0) { other_y = center_y - 1; } else { other_y = center_y + 1; }
+    if (other_y < 0) { other_y = 0; }
+    if (other_y >= rows) { other_y = rows - 1; }
+  }
+
+  var center_row: int64 = (int64)center_y * (int64)stride;
+  var other_row: int64 = (int64)other_y * (int64)stride;
+
+  if (ratio_h == 1 && ratio_v == 1) {
+    for x in 0..width {
+      out[x] = plane[center_row + (int64)x];
+    }
+    return;
+  }
+
+  for x in 0..width {
+    var center_x: int32 = x >> shift_h;
+    if (center_x >= columns) { center_x = columns - 1; }
+    var other_x: int32 = center_x;
+    if (ratio_h == 2) {
+      if ((x & 1) == 0) { other_x = center_x - 1; } else { other_x = center_x + 1; }
+      if (other_x < 0) { other_x = 0; }
+      if (other_x >= columns) { other_x = columns - 1; }
+    }
+    var near: int32 = (int32)plane[center_row + (int64)center_x];
+    var side: int32 = (int32)plane[center_row + (int64)other_x];
+    var below: int32 = (int32)plane[other_row + (int64)center_x];
+    var diagonal: int32 = (int32)plane[other_row + (int64)other_x];
+    out[x] = (uint8)((9 * near + 3 * side + 3 * below + diagonal + 8) >> 4);
+  }
+}
+
+fn jpeg_color_convert(d: JpegDecoder*) {
+  var width: int32 = d->width;
+  var height: int32 = d->height;
+  var out: uint32* = d->pixels;
+
+  if (d->component_count == 1) {
+    var stride: int32 = d->components[0].stride;
+    var plane: uint8* = d->components[0].plane;
+    for y in 0..height {
+      var row: int64 = (int64)y * (int64)stride;
+      var target: int64 = (int64)y * (int64)width;
+      for x in 0..width {
+        var luma: uint32 = (uint32)plane[row + (int64)x];
+        out[target + (int64)x] = (luma << 16) | (luma << 8) | luma;
+      }
+    }
+    return;
+  }
+
+  var luma_row: uint8* = &d->upsample[0];
+  var blue_row: uint8* = &d->upsample[width];
+  var red_row: uint8* = &d->upsample[width * 2];
+  var luma_direct: int32 = 0;
+  if (d->components[0].h == d->h_max && d->components[0].v == d->v_max) { luma_direct = 1; }
+  var luma_plane: uint8* = d->components[0].plane;
+  var luma_stride: int32 = d->components[0].stride;
+
+  for y in 0..height {
+    var luma_source: uint8* = luma_row;
+    if (luma_direct != 0) {
+      luma_source = &luma_plane[(int64)y * (int64)luma_stride];
+    } else {
+      jpeg_upsample_row(d, 0, luma_row, y);
+    }
+    jpeg_upsample_row(d, 1, blue_row, y);
+    jpeg_upsample_row(d, 2, red_row, y);
+
+    var target: int64 = (int64)y * (int64)width;
+    for x in 0..width {
+      var luma: int32 = (int32)luma_source[x];
+      var blue_diff: int32 = (int32)blue_row[x] - 128;
+      var red_diff: int32 = (int32)red_row[x] - 128;
+
+      var red: int32 = luma + ((91881 * red_diff + 32768) >> 16);
+      var green: int32 = luma - ((22554 * blue_diff + 46802 * red_diff + 32768) >> 16);
+      var blue: int32 = luma + ((116130 * blue_diff + 32768) >> 16);
+
+      if (red < 0) { red = 0; }
+      if (red > 255) { red = 255; }
+      if (green < 0) { green = 0; }
+      if (green > 255) { green = 255; }
+      if (blue < 0) { blue = 0; }
+      if (blue > 255) { blue = 255; }
+
+      out[target + (int64)x] = ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
+    }
+  }
+}
+
+fn jpeg_decode(d: JpegDecoder*, data: uint8*, size: int64) -> int32 {
+  d->data = data;
+  d->size = size;
+  d->pos = 0;
+  d->error = JPEG_OK;
+  d->restart_interval = 0;
+  d->component_count = 0;
+  d->width = 0;
+  d->height = 0;
+  for i in 0..8 {
+    d->huff_defined[i] = 0;
+  }
+
+  if (size < 4) { return JPEG_ERR_NOT_JPEG; }
+  var marker: int32 = jpeg_next_marker(d);
+  if (marker != 0xD8) { return JPEG_ERR_NOT_JPEG; }
+
+  var have_frame: int32 = 0;
+  while (1 == 1) {
+    marker = jpeg_next_marker(d);
+    if (marker < 0) { return JPEG_ERR_TRUNCATED; }
+    if (marker == 0xD9) { return JPEG_ERR_BAD_DATA; }
+    if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) { continue; }
+
+    var length: int32 = jpeg_read_u16(d, d->pos);
+    if (length < 2) { return JPEG_ERR_BAD_DATA; }
+    var body: int64 = d->pos + 2;
+    var end: int64 = d->pos + (int64)length;
+    if (end > d->size) { return JPEG_ERR_TRUNCATED; }
+
+    if (marker == 0xC0 || marker == 0xC1) {
+      var status: int32 = jpeg_parse_sof(d, body, end);
+      if (status != JPEG_OK) { return status; }
+      have_frame = 1;
+    } else if (marker == 0xC2) {
+      return JPEG_ERR_UNSUPPORTED;
+    } else if (marker == 0xC3 || marker == 0xC5 || marker == 0xC6 || marker == 0xC7) {
+      return JPEG_ERR_UNSUPPORTED;
+    } else if (marker == 0xC9 || marker == 0xCA || marker == 0xCB) {
+      return JPEG_ERR_UNSUPPORTED;
+    } else if (marker == 0xCD || marker == 0xCE || marker == 0xCF) {
+      return JPEG_ERR_UNSUPPORTED;
+    } else if (marker == 0xC4) {
+      var status: int32 = jpeg_parse_dht(d, body, end);
+      if (status != JPEG_OK) { return status; }
+    } else if (marker == 0xDB) {
+      var status: int32 = jpeg_parse_dqt(d, body, end);
+      if (status != JPEG_OK) { return status; }
+    } else if (marker == 0xDD) {
+      if (body + 2 > end) { return JPEG_ERR_BAD_DATA; }
+      d->restart_interval = jpeg_read_u16(d, body);
+    } else if (marker == 0xDA) {
+      if (have_frame == 0) { return JPEG_ERR_BAD_DATA; }
+      var scan_count: int32 = (int32)d->data[body];
+      if (scan_count != d->component_count) { return JPEG_ERR_UNSUPPORTED; }
+      for i in 0..scan_count {
+        var component_id: int32 = (int32)d->data[body + 1 + (int64)(i * 2)];
+        var tables: int32 = (int32)d->data[body + 2 + (int64)(i * 2)];
+        var found: int32 = 0;
+        for c in 0..d->component_count {
+          if (d->components[c].id == component_id) {
+            d->components[c].dc_table = tables >> 4;
+            d->components[c].ac_table = tables & 15;
+            if (d->components[c].dc_table > 3 || d->components[c].ac_table > 3) {
+              return JPEG_ERR_BAD_DATA;
+            }
+            found = 1;
+          }
+        }
+        if (found == 0) { return JPEG_ERR_BAD_DATA; }
+      }
+      var spectral_start: int32 = (int32)d->data[body + 1 + (int64)(scan_count * 2)];
+      var spectral_end: int32 = (int32)d->data[body + 2 + (int64)(scan_count * 2)];
+      if (spectral_start != 0 || spectral_end != 63) { return JPEG_ERR_UNSUPPORTED; }
+
+      jpeg_install_default_huffman(d);
+      var status: int32 = jpeg_allocate_planes(d);
+      if (status != JPEG_OK) { return status; }
+      d->pos = end;
+      status = jpeg_decode_scan(d);
+      if (status != JPEG_OK) { return status; }
+      jpeg_color_convert(d);
+      return JPEG_OK;
+    }
+
+    d->pos = end;
+  }
+  return JPEG_ERR_BAD_DATA;
+}

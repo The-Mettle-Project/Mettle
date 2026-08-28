@@ -1,0 +1,312 @@
+import "std/io";
+import "std/mem";
+import "jpeg";
+import "avi";
+import "audio";
+
+extern fn Win_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn Win_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn Win_Sleep(milliseconds: uint32) = "Sleep";
+
+fn cstring_equals(a: cstring, b: cstring) -> int32 {
+  var i: int64 = 0;
+  while (a[i] != (uint8)0 && b[i] != (uint8)0) {
+    if (a[i] != b[i]) { return 0; }
+    i = i + 1;
+  }
+  if (a[i] != b[i]) { return 0; }
+  return 1;
+}
+
+fn read_whole_file(path: cstring, out_size: int64*) -> uint8* {
+  var fp: cstring = fopen(path, "rb");
+  if (fp == 0) { return 0; }
+  defer fclose(fp);
+  if (_fseeki64(fp, 0, 2) != 0) { return 0; }
+  var size: int64 = _ftelli64(fp);
+  if (size <= 0) { return 0; }
+  if (_fseeki64(fp, 0, 0) != 0) { return 0; }
+  var buffer: uint8* = malloc(size);
+  if (buffer == 0) { return 0; }
+  var got: int64 = fread(buffer, 1, size, fp);
+  if (got != size) {
+    free(buffer);
+    return 0;
+  }
+  *out_size = size;
+  return buffer;
+}
+
+fn write_ppm(path: cstring, pixels: uint32*, width: int32, height: int32) -> int32 {
+  var fp: cstring = fopen(path, "wb");
+  if (fp == 0) { return 0; }
+  defer fclose(fp);
+  var header: uint8* = malloc(64);
+  if (header == 0) { return 0; }
+  defer free(header);
+  var n: int32 = 0;
+  header[n] = (uint8)80; n = n + 1;
+  header[n] = (uint8)54; n = n + 1;
+  header[n] = (uint8)10; n = n + 1;
+  n = n + write_decimal(&header[n], width);
+  header[n] = (uint8)32; n = n + 1;
+  n = n + write_decimal(&header[n], height);
+  header[n] = (uint8)10; n = n + 1;
+  header[n] = (uint8)50; n = n + 1;
+  header[n] = (uint8)53; n = n + 1;
+  header[n] = (uint8)53; n = n + 1;
+  header[n] = (uint8)10; n = n + 1;
+  fwrite(header, 1, (int64)n, fp);
+
+  var count: int64 = (int64)width * (int64)height;
+  var rgb: uint8* = malloc(count * 3);
+  if (rgb == 0) { return 0; }
+  defer free(rgb);
+  for i in 0..count {
+    var value: uint32 = pixels[i];
+    rgb[i * 3] = (uint8)((value >> 16) & (uint32)255);
+    rgb[i * 3 + 1] = (uint8)((value >> 8) & (uint32)255);
+    rgb[i * 3 + 2] = (uint8)(value & (uint32)255);
+  }
+  fwrite(rgb, 1, count * 3, fp);
+  return 1;
+}
+
+fn write_decimal(out: uint8*, value: int32) -> int32 {
+  if (value == 0) {
+    out[0] = (uint8)48;
+    return 1;
+  }
+  var digits: uint8[12];
+  var count: int32 = 0;
+  var left: int32 = value;
+  while (left > 0) {
+    digits[count] = (uint8)(48 + left % 10);
+    left = left / 10;
+    count = count + 1;
+  }
+  for i in 0..count {
+    out[i] = digits[count - 1 - i];
+  }
+  return count;
+}
+
+fn command_jpeg(input: cstring, output: cstring) -> int32 {
+  var size: int64 = 0;
+  var data: uint8* = read_whole_file(input, &size);
+  if (data == 0) {
+    println("cannot read input");
+    return 1;
+  }
+  defer free(data);
+
+  var decoder: JpegDecoder* = jpeg_decoder_new();
+  if (decoder == 0) {
+    println("out of memory");
+    return 1;
+  }
+  defer jpeg_decoder_free(decoder);
+
+  var status: int32 = jpeg_decode(decoder, data, size);
+  if (status != JPEG_OK) {
+    println("decode failed with status {status}");
+    return 1;
+  }
+  println("{decoder->width}x{decoder->height} components={decoder->component_count} sampling={decoder->components[0].h}x{decoder->components[0].v}");
+  if (write_ppm(output, decoder->pixels, decoder->width, decoder->height) == 0) {
+    println("cannot write output");
+    return 1;
+  }
+  return 0;
+}
+
+fn command_info(path: cstring) -> int32 {
+  var status: int32 = 0;
+  var file: AviFile* = avi_open(path, &status);
+  if (file == 0) {
+    println("cannot open avi, status {status}");
+    return 1;
+  }
+  defer avi_close(file);
+
+  var microseconds: int64 = avi_duration_microseconds(file);
+  println("size          {file->width}x{file->height}");
+  println("video frames  {file->video_count}");
+  println("frame period  {file->microsec_per_frame} us");
+  println("duration      {microseconds / 1000000}.{(microseconds / 1000) % 1000} s");
+  println("largest frame {file->video_max_size} bytes");
+  println("mjpeg         {avi_is_mjpeg(file)}");
+  if (avi_has_audio(file) != 0) {
+    var stream: int32 = file->audio_stream;
+    println("audio         {file->streams[stream].channels} ch, {file->streams[stream].sample_rate} Hz, {file->streams[stream].bits_per_sample} bit, {file->audio_count} chunks, {file->audio_total_bytes} bytes");
+  } else {
+    println("audio         none");
+  }
+  return 0;
+}
+
+fn command_frame(path: cstring, frame_index: int32, output: cstring) -> int32 {
+  var status: int32 = 0;
+  var file: AviFile* = avi_open(path, &status);
+  if (file == 0) {
+    println("cannot open avi, status {status}");
+    return 1;
+  }
+  defer avi_close(file);
+
+  var buffer: uint8* = malloc((int64)file->video_max_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  var size: int32 = avi_read_video_frame(file, frame_index, buffer, (int64)file->video_max_size);
+  if (size <= 0) {
+    println("cannot read frame {frame_index}");
+    return 1;
+  }
+
+  var decoder: JpegDecoder* = jpeg_decoder_new();
+  if (decoder == 0) { return 1; }
+  defer jpeg_decoder_free(decoder);
+
+  var decode_status: int32 = jpeg_decode(decoder, buffer, (int64)size);
+  if (decode_status != JPEG_OK) {
+    println("decode failed with status {decode_status}");
+    return 1;
+  }
+  println("frame {frame_index}: {size} bytes, {decoder->width}x{decoder->height}");
+  if (write_ppm(output, decoder->pixels, decoder->width, decoder->height) == 0) {
+    println("cannot write output");
+    return 1;
+  }
+  return 0;
+}
+
+fn command_bench(path: cstring) -> int32 {
+  var status: int32 = 0;
+  var file: AviFile* = avi_open(path, &status);
+  if (file == 0) {
+    println("cannot open avi, status {status}");
+    return 1;
+  }
+  defer avi_close(file);
+
+  var buffer: uint8* = malloc((int64)file->video_max_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  var decoder: JpegDecoder* = jpeg_decoder_new();
+  if (decoder == 0) { return 1; }
+  defer jpeg_decoder_free(decoder);
+
+  var decoded: int32 = 0;
+  var failed: int32 = 0;
+  var checksum: int64 = 0;
+  for i in 0..file->video_count {
+    var size: int32 = avi_read_video_frame(file, i, buffer, (int64)file->video_max_size);
+    if (size <= 0) {
+      failed = failed + 1;
+      if (failed <= 5) { println("frame {i}: read failed, chunk size {file->video_sizes[i]}"); }
+      continue;
+    }
+    var frame_status: int32 = jpeg_decode(decoder, buffer, (int64)size);
+    if (frame_status != JPEG_OK) {
+      failed = failed + 1;
+      if (failed <= 5) { println("frame {i}: decode status {frame_status}, {size} bytes"); }
+      continue;
+    }
+    decoded = decoded + 1;
+    var count: int64 = (int64)decoder->width * (int64)decoder->height;
+    var pixels: uint32* = decoder->pixels;
+    var hash: int64 = checksum;
+    for p in 0..count {
+      hash = hash * (int64)31 + (int64)pixels[p];
+    }
+    checksum = hash;
+  }
+  println("decoded {decoded} frames, {failed} failures, checksum {checksum}");
+  return 0;
+}
+
+fn command_audio(path: cstring, seconds: int32) -> int32 {
+  var status: int32 = 0;
+  var file: AviFile* = avi_open(path, &status);
+  if (file == 0) {
+    println("cannot open avi, status {status}");
+    return 1;
+  }
+  defer avi_close(file);
+
+  var player: AudioPlayer* = audio_open(file);
+  if (player == 0) { return 1; }
+  defer audio_close(player);
+
+  if (player->ready == 0) {
+    println("audio device did not open");
+    return 1;
+  }
+  audio_seek(player, file, 0);
+
+  var frequency: int64 = 1;
+  Win_QueryPerformanceFrequency(&frequency);
+  var counter: int64 = 0;
+  Win_QueryPerformanceCounter(&counter);
+  var start: int64 = counter;
+
+  var elapsed_us: int64 = 0;
+  var limit_us: int64 = (int64)seconds * (int64)1000000;
+  while (elapsed_us < limit_us) {
+    audio_pump(player, file);
+    Win_Sleep((uint32)200);
+    Win_QueryPerformanceCounter(&counter);
+    elapsed_us = (counter - start) * (int64)1000000 / frequency;
+    var audio_us: int64 = audio_position_microseconds(player);
+    println("wall {elapsed_us / 1000} ms   audio {audio_us / 1000} ms   drift {(audio_us - elapsed_us) / 1000} ms");
+  }
+  return 0;
+}
+
+fn parse_int(text: cstring) -> int32 {
+  var value: int32 = 0;
+  var i: int64 = 0;
+  while (text[i] >= (uint8)48 && text[i] <= (uint8)57) {
+    value = value * 10 + (int32)(text[i] - (uint8)48);
+    i = i + 1;
+  }
+  return value;
+}
+
+fn print_usage() {
+  println("usage:");
+  println("  vptool info  <input.avi>");
+  println("  vptool frame <input.avi> <index> <output.ppm>");
+  println("  vptool bench <input.avi>");
+  println("  vptool jpeg  <input.jpg> <output.ppm>");
+  println("  vptool audio <input.avi> [seconds]");
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 3) {
+    print_usage();
+    return 0;
+  }
+  var command: cstring = argv[1];
+  if (cstring_equals(command, "jpeg") != 0 && argc >= 4) {
+    return command_jpeg(argv[2], argv[3]);
+  }
+  if (cstring_equals(command, "info") != 0) {
+    return command_info(argv[2]);
+  }
+  if (cstring_equals(command, "frame") != 0 && argc >= 5) {
+    return command_frame(argv[2], parse_int(argv[3]), argv[4]);
+  }
+  if (cstring_equals(command, "bench") != 0) {
+    return command_bench(argv[2]);
+  }
+  if (cstring_equals(command, "audio") != 0) {
+    var seconds: int32 = 5;
+    if (argc >= 4) { seconds = parse_int(argv[3]); }
+    return command_audio(argv[2], seconds);
+  }
+  print_usage();
+  return 0;
+}

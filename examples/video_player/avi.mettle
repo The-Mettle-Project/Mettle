@@ -1,0 +1,474 @@
+import "std/mem";
+import "std/io";
+
+const AVI_OK = 0;
+const AVI_ERR_OPEN = 1;
+const AVI_ERR_NOT_RIFF = 2;
+const AVI_ERR_NO_VIDEO = 3;
+const AVI_ERR_NO_MEMORY = 4;
+const AVI_ERR_READ = 5;
+
+const AVI_FOURCC_RIFF = 0x46464952;
+const AVI_FOURCC_AVI = 0x20495641;
+const AVI_FOURCC_LIST = 0x5453494C;
+const AVI_FOURCC_HDRL = 0x6C726468;
+const AVI_FOURCC_MOVI = 0x69766F6D;
+const AVI_FOURCC_STRL = 0x6C727473;
+const AVI_FOURCC_STRH = 0x68727473;
+const AVI_FOURCC_STRF = 0x66727473;
+const AVI_FOURCC_AVIH = 0x68697661;
+const AVI_FOURCC_REC = 0x20636572;
+const AVI_FOURCC_VIDS = 0x73646976;
+const AVI_FOURCC_AUDS = 0x73647561;
+
+const AVI_STREAM_NONE = 0;
+const AVI_STREAM_VIDEO = 1;
+const AVI_STREAM_AUDIO = 2;
+
+const AVI_MAX_STREAMS = 8;
+
+extern fn _fseeki64(fp: cstring, offset: int64, origin: int32) -> int32 = "_fseeki64";
+extern fn _ftelli64(fp: cstring) -> int64 = "_ftelli64";
+
+struct AviStream {
+  kind: int32;
+  handler: uint32;
+  scale: int32;
+  rate: int32;
+  length: int32;
+  sample_size: int32;
+  compression: uint32;
+  width: int32;
+  height: int32;
+  format_tag: int32;
+  channels: int32;
+  sample_rate: int32;
+  bits_per_sample: int32;
+  block_align: int32;
+}
+
+struct AviFile {
+  fp: cstring;
+  file_size: int64;
+  scratch: uint8*;
+
+  stream_count: int32;
+  streams: AviStream[8];
+  video_stream: int32;
+  audio_stream: int32;
+
+  microsec_per_frame: int32;
+  header_total_frames: int32;
+  width: int32;
+  height: int32;
+
+  video_offsets: int64*;
+  video_sizes: int32*;
+  video_count: int32;
+  video_capacity: int32;
+  video_max_size: int32;
+
+  audio_offsets: int64*;
+  audio_sizes: int32*;
+  audio_starts: int64*;
+  audio_count: int32;
+  audio_capacity: int32;
+  audio_total_bytes: int64;
+  audio_max_size: int32;
+}
+
+fn avi_read_u32_at(a: AviFile*, offset: int64) -> uint32 {
+  if (_fseeki64(a->fp, offset, 0) != 0) { return (uint32)0; }
+  var bytes: uint8* = a->scratch;
+  if (fread(bytes, 1, 4, a->fp) != 4) { return (uint32)0; }
+  return (uint32)bytes[0] | ((uint32)bytes[1] << 8) | ((uint32)bytes[2] << 16) | ((uint32)bytes[3] << 24);
+}
+
+fn avi_read_block(a: AviFile*, offset: int64, into: uint8*, count: int64) -> int32 {
+  if (_fseeki64(a->fp, offset, 0) != 0) { return 0; }
+  if (fread(into, 1, count, a->fp) != count) { return 0; }
+  return 1;
+}
+
+fn avi_u32_from(bytes: uint8*, at: int32) -> uint32 {
+  return (uint32)bytes[at] | ((uint32)bytes[at + 1] << 8) | ((uint32)bytes[at + 2] << 16) | ((uint32)bytes[at + 3] << 24);
+}
+
+fn avi_u16_from(bytes: uint8*, at: int32) -> int32 {
+  return (int32)bytes[at] | ((int32)bytes[at + 1] << 8);
+}
+
+fn avi_grow_video(a: AviFile*) -> int32 {
+  var capacity: int32 = a->video_capacity * 2;
+  if (capacity < 1024) { capacity = 1024; }
+  var offsets: int64* = realloc(a->video_offsets, (int64)capacity * 8);
+  if (offsets == 0) { return 0; }
+  a->video_offsets = offsets;
+  var sizes: int32* = realloc(a->video_sizes, (int64)capacity * 4);
+  if (sizes == 0) { return 0; }
+  a->video_sizes = sizes;
+  a->video_capacity = capacity;
+  return 1;
+}
+
+fn avi_grow_audio(a: AviFile*) -> int32 {
+  var capacity: int32 = a->audio_capacity * 2;
+  if (capacity < 1024) { capacity = 1024; }
+  var offsets: int64* = realloc(a->audio_offsets, (int64)capacity * 8);
+  if (offsets == 0) { return 0; }
+  a->audio_offsets = offsets;
+  var sizes: int32* = realloc(a->audio_sizes, (int64)capacity * 4);
+  if (sizes == 0) { return 0; }
+  a->audio_sizes = sizes;
+  var starts: int64* = realloc(a->audio_starts, (int64)capacity * 8);
+  if (starts == 0) { return 0; }
+  a->audio_starts = starts;
+  a->audio_capacity = capacity;
+  return 1;
+}
+
+fn avi_add_video_chunk(a: AviFile*, offset: int64, size: int32) -> int32 {
+  if (a->video_count == a->video_capacity) {
+    if (avi_grow_video(a) == 0) { return 0; }
+  }
+  a->video_offsets[a->video_count] = offset;
+  a->video_sizes[a->video_count] = size;
+  a->video_count = a->video_count + 1;
+  if (size > a->video_max_size) { a->video_max_size = size; }
+  return 1;
+}
+
+fn avi_add_audio_chunk(a: AviFile*, offset: int64, size: int32) -> int32 {
+  if (a->audio_count == a->audio_capacity) {
+    if (avi_grow_audio(a) == 0) { return 0; }
+  }
+  a->audio_offsets[a->audio_count] = offset;
+  a->audio_sizes[a->audio_count] = size;
+  a->audio_starts[a->audio_count] = a->audio_total_bytes;
+  a->audio_total_bytes = a->audio_total_bytes + (int64)size;
+  a->audio_count = a->audio_count + 1;
+  if (size > a->audio_max_size) { a->audio_max_size = size; }
+  return 1;
+}
+
+fn avi_parse_strh(a: AviFile*, stream: int32, offset: int64, size: int32) {
+  if (size < 48) { return; }
+  var header: uint8* = a->scratch;
+  if (avi_read_block(a, offset, header, 48) == 0) { return; }
+  var kind: uint32 = avi_u32_from(header, 0);
+  if (kind == (uint32)AVI_FOURCC_VIDS) {
+    a->streams[stream].kind = AVI_STREAM_VIDEO;
+  } else if (kind == (uint32)AVI_FOURCC_AUDS) {
+    a->streams[stream].kind = AVI_STREAM_AUDIO;
+  } else {
+    a->streams[stream].kind = AVI_STREAM_NONE;
+  }
+  a->streams[stream].handler = avi_u32_from(header, 4);
+  a->streams[stream].scale = (int32)avi_u32_from(header, 20);
+  a->streams[stream].rate = (int32)avi_u32_from(header, 24);
+  a->streams[stream].length = (int32)avi_u32_from(header, 32);
+  a->streams[stream].sample_size = (int32)avi_u32_from(header, 44);
+}
+
+fn avi_parse_strf(a: AviFile*, stream: int32, offset: int64, size: int32) {
+  var format: uint8* = a->scratch;
+  if (a->streams[stream].kind == AVI_STREAM_VIDEO) {
+    if (size < 40) { return; }
+    if (avi_read_block(a, offset, format, 40) == 0) { return; }
+    a->streams[stream].width = (int32)avi_u32_from(format, 4);
+    a->streams[stream].height = (int32)avi_u32_from(format, 8);
+    a->streams[stream].compression = avi_u32_from(format, 16);
+    if (a->streams[stream].height < 0) {
+      a->streams[stream].height = 0 - a->streams[stream].height;
+    }
+    return;
+  }
+  if (a->streams[stream].kind == AVI_STREAM_AUDIO) {
+    if (size < 16) { return; }
+    if (avi_read_block(a, offset, format, 16) == 0) { return; }
+    a->streams[stream].format_tag = avi_u16_from(format, 0);
+    a->streams[stream].channels = avi_u16_from(format, 2);
+    a->streams[stream].sample_rate = (int32)avi_u32_from(format, 4);
+    a->streams[stream].block_align = avi_u16_from(format, 12);
+    a->streams[stream].bits_per_sample = avi_u16_from(format, 14);
+  }
+}
+
+fn avi_parse_strl(a: AviFile*, stream: int32, start: int64, end: int64) {
+  var position: int64 = start;
+  while (position + 8 <= end) {
+    var id: uint32 = avi_read_u32_at(a, position);
+    var size: int32 = (int32)avi_read_u32_at(a, position + 4);
+    if (size < 0) { return; }
+    var body: int64 = position + 8;
+    if (id == (uint32)AVI_FOURCC_STRH) {
+      avi_parse_strh(a, stream, body, size);
+    } else if (id == (uint32)AVI_FOURCC_STRF) {
+      avi_parse_strf(a, stream, body, size);
+    }
+    position = body + (int64)size;
+    if ((size & 1) != 0) { position = position + 1; }
+  }
+}
+
+fn avi_parse_hdrl(a: AviFile*, start: int64, end: int64) {
+  var position: int64 = start;
+  while (position + 8 <= end) {
+    var id: uint32 = avi_read_u32_at(a, position);
+    var size: int32 = (int32)avi_read_u32_at(a, position + 4);
+    if (size < 0) { return; }
+    var body: int64 = position + 8;
+    if (id == (uint32)AVI_FOURCC_AVIH) {
+      var header: uint8* = a->scratch;
+      if (size >= 40 && avi_read_block(a, body, header, 40) != 0) {
+        a->microsec_per_frame = (int32)avi_u32_from(header, 0);
+        a->header_total_frames = (int32)avi_u32_from(header, 16);
+        a->width = (int32)avi_u32_from(header, 32);
+        a->height = (int32)avi_u32_from(header, 36);
+      }
+    } else if (id == (uint32)AVI_FOURCC_LIST) {
+      var list_type: uint32 = avi_read_u32_at(a, body);
+      if (list_type == (uint32)AVI_FOURCC_STRL && a->stream_count < AVI_MAX_STREAMS) {
+        avi_parse_strl(a, a->stream_count, body + 4, body + (int64)size);
+        a->stream_count = a->stream_count + 1;
+      }
+    }
+    position = body + (int64)size;
+    if ((size & 1) != 0) { position = position + 1; }
+  }
+}
+
+fn avi_chunk_stream_number(id: uint32) -> int32 {
+  var first: int32 = (int32)(id & (uint32)0xFF);
+  var second: int32 = (int32)((id >> 8) & (uint32)0xFF);
+  if (first < 48 || first > 57 || second < 48 || second > 57) { return -1; }
+  return (first - 48) * 10 + (second - 48);
+}
+
+fn avi_chunk_is_video(id: uint32) -> int32 {
+  var third: int32 = (int32)((id >> 16) & (uint32)0xFF);
+  var fourth: int32 = (int32)((id >> 24) & (uint32)0xFF);
+  if (third == 100 && (fourth == 99 || fourth == 98)) { return 1; }
+  return 0;
+}
+
+fn avi_chunk_is_audio(id: uint32) -> int32 {
+  var third: int32 = (int32)((id >> 16) & (uint32)0xFF);
+  var fourth: int32 = (int32)((id >> 24) & (uint32)0xFF);
+  if (third == 119 && fourth == 98) { return 1; }
+  return 0;
+}
+
+fn avi_index_movi(a: AviFile*, start: int64, end: int64) -> int32 {
+  var position: int64 = start;
+  while (position + 8 <= end) {
+    var id: uint32 = avi_read_u32_at(a, position);
+    var size: int32 = (int32)avi_read_u32_at(a, position + 4);
+    if (size < 0) { return AVI_ERR_READ; }
+    var body: int64 = position + 8;
+
+    if (id == (uint32)AVI_FOURCC_LIST) {
+      var list_type: uint32 = avi_read_u32_at(a, body);
+      if (list_type == (uint32)AVI_FOURCC_REC) {
+        var status: int32 = avi_index_movi(a, body + 4, body + (int64)size);
+        if (status != AVI_OK) { return status; }
+      }
+      position = body + (int64)size;
+      if ((size & 1) != 0) { position = position + 1; }
+      continue;
+    }
+
+    var stream: int32 = avi_chunk_stream_number(id);
+    if (stream >= 0 && body + (int64)size <= a->file_size) {
+      if (stream == a->video_stream && avi_chunk_is_video(id) != 0) {
+        if (avi_add_video_chunk(a, body, size) == 0) { return AVI_ERR_NO_MEMORY; }
+      } else if (stream == a->audio_stream && avi_chunk_is_audio(id) != 0) {
+        if (avi_add_audio_chunk(a, body, size) == 0) { return AVI_ERR_NO_MEMORY; }
+      }
+    }
+
+    position = body + (int64)size;
+    if ((size & 1) != 0) { position = position + 1; }
+  }
+  return AVI_OK;
+}
+
+fn avi_open(path: cstring, status: int32*) -> AviFile* {
+  var a: AviFile* = malloc(sizeof(AviFile));
+  if (a == 0) {
+    *status = AVI_ERR_NO_MEMORY;
+    return 0;
+  }
+  memset(a, 0, sizeof(AviFile));
+  a->video_stream = -1;
+  a->audio_stream = -1;
+
+  a->scratch = malloc(256);
+  if (a->scratch == 0) {
+    free(a);
+    *status = AVI_ERR_NO_MEMORY;
+    return 0;
+  }
+
+  a->fp = fopen(path, "rb");
+  if (a->fp == 0) {
+    free(a->scratch);
+    free(a);
+    *status = AVI_ERR_OPEN;
+    return 0;
+  }
+
+  _fseeki64(a->fp, 0, 2);
+  a->file_size = _ftelli64(a->fp);
+
+  if (avi_read_u32_at(a, 0) != (uint32)AVI_FOURCC_RIFF || avi_read_u32_at(a, 8) != (uint32)AVI_FOURCC_AVI) {
+    avi_close(a);
+    *status = AVI_ERR_NOT_RIFF;
+    return 0;
+  }
+
+  var position: int64 = 12;
+  var movi_start: int64 = 0;
+  var movi_end: int64 = 0;
+  while (position + 8 <= a->file_size) {
+    var id: uint32 = avi_read_u32_at(a, position);
+    var size: int32 = (int32)avi_read_u32_at(a, position + 4);
+    if (size < 0) { break; }
+    var body: int64 = position + 8;
+    if (id == (uint32)AVI_FOURCC_LIST) {
+      var list_type: uint32 = avi_read_u32_at(a, body);
+      if (list_type == (uint32)AVI_FOURCC_HDRL) {
+        avi_parse_hdrl(a, body + 4, body + (int64)size);
+      } else if (list_type == (uint32)AVI_FOURCC_MOVI) {
+        movi_start = body + 4;
+        movi_end = body + (int64)size;
+        if (movi_end > a->file_size) { movi_end = a->file_size; }
+      }
+    }
+    position = body + (int64)size;
+    if ((size & 1) != 0) { position = position + 1; }
+  }
+
+  for i in 0..a->stream_count {
+    if (a->streams[i].kind == AVI_STREAM_VIDEO && a->video_stream < 0) {
+      a->video_stream = i;
+    }
+    if (a->streams[i].kind == AVI_STREAM_AUDIO && a->audio_stream < 0) {
+      if (a->streams[i].format_tag == 1) {
+        a->audio_stream = i;
+      }
+    }
+  }
+
+  if (a->video_stream < 0 || movi_end <= movi_start) {
+    avi_close(a);
+    *status = AVI_ERR_NO_VIDEO;
+    return 0;
+  }
+
+  var index_status: int32 = avi_index_movi(a, movi_start, movi_end);
+  if (index_status != AVI_OK) {
+    avi_close(a);
+    *status = index_status;
+    return 0;
+  }
+
+  if (a->width <= 0) { a->width = a->streams[a->video_stream].width; }
+  if (a->height <= 0) { a->height = a->streams[a->video_stream].height; }
+  if (a->microsec_per_frame <= 0) {
+    var rate: int32 = a->streams[a->video_stream].rate;
+    var scale: int32 = a->streams[a->video_stream].scale;
+    if (rate > 0 && scale > 0) {
+      a->microsec_per_frame = (int32)((int64)1000000 * (int64)scale / (int64)rate);
+    } else {
+      a->microsec_per_frame = 33333;
+    }
+  }
+
+  if (a->video_count == 0) {
+    avi_close(a);
+    *status = AVI_ERR_NO_VIDEO;
+    return 0;
+  }
+
+  *status = AVI_OK;
+  return a;
+}
+
+fn avi_close(a: AviFile*) {
+  if (a == 0) { return; }
+  if (a->fp != 0) { fclose(a->fp); }
+  if (a->scratch != 0) { free(a->scratch); }
+  if (a->video_offsets != 0) { free(a->video_offsets); }
+  if (a->video_sizes != 0) { free(a->video_sizes); }
+  if (a->audio_offsets != 0) { free(a->audio_offsets); }
+  if (a->audio_sizes != 0) { free(a->audio_sizes); }
+  if (a->audio_starts != 0) { free(a->audio_starts); }
+  free(a);
+}
+
+fn avi_read_video_frame(a: AviFile*, index: int32, into: uint8*, capacity: int64) -> int32 {
+  if (index < 0 || index >= a->video_count) { return -1; }
+  var size: int32 = a->video_sizes[index];
+  if ((int64)size > capacity) { return -1; }
+  if (avi_read_block(a, a->video_offsets[index], into, (int64)size) == 0) { return -1; }
+  return size;
+}
+
+fn avi_read_audio_chunk(a: AviFile*, index: int32, into: uint8*, capacity: int64) -> int32 {
+  if (index < 0 || index >= a->audio_count) { return -1; }
+  var size: int32 = a->audio_sizes[index];
+  if ((int64)size > capacity) { return -1; }
+  if (avi_read_block(a, a->audio_offsets[index], into, (int64)size) == 0) { return -1; }
+  return size;
+}
+
+fn avi_has_audio(a: AviFile*) -> int32 {
+  if (a->audio_stream < 0) { return 0; }
+  if (a->audio_count == 0) { return 0; }
+  return 1;
+}
+
+fn avi_audio_bytes_per_second(a: AviFile*) -> int32 {
+  if (avi_has_audio(a) == 0) { return 0; }
+  var stream: int32 = a->audio_stream;
+  var align: int32 = a->streams[stream].block_align;
+  if (align <= 0) {
+    align = a->streams[stream].channels * (a->streams[stream].bits_per_sample / 8);
+  }
+  return a->streams[stream].sample_rate * align;
+}
+
+fn avi_audio_chunk_at_byte(a: AviFile*, byte_position: int64) -> int32 {
+  if (a->audio_count == 0) { return 0; }
+  var low: int32 = 0;
+  var high: int32 = a->audio_count - 1;
+  while (low < high) {
+    var middle: int32 = (low + high + 1) / 2;
+    if (a->audio_starts[middle] <= byte_position) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return low;
+}
+
+fn avi_duration_microseconds(a: AviFile*) -> int64 {
+  return (int64)a->video_count * (int64)a->microsec_per_frame;
+}
+
+fn avi_is_mjpeg(a: AviFile*) -> int32 {
+  var compression: uint32 = a->streams[a->video_stream].compression;
+  var handler: uint32 = a->streams[a->video_stream].handler;
+  if (avi_fourcc_is_mjpeg(compression) != 0) { return 1; }
+  if (avi_fourcc_is_mjpeg(handler) != 0) { return 1; }
+  return 0;
+}
+
+fn avi_fourcc_is_mjpeg(code: uint32) -> int32 {
+  var upper: uint32 = code & (uint32)0xDFDFDFDF;
+  if (upper == (uint32)0x47504A4D) { return 1; }
+  if (upper == (uint32)0x4745504A) { return 1; }
+  return 0;
+}
