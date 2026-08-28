@@ -1,13 +1,13 @@
 # Video player
 
 A desktop video player written in Mettle. It reads AVI, MP4 and MOV files,
-decodes Motion JPEG video and PCM audio, keeps the picture locked to the sound
-card's own clock, and draws to a window through GDI.
+decodes H.264 and Motion JPEG video with AAC and PCM audio, keeps the picture
+locked to the sound card's own clock, and draws to a window through GDI.
 
 Everything below the operating system is Mettle: the container parsers, the
-baseline JPEG decoder, the inverse DCT, the chroma upsampler, the colour
-conversion, and the playback clock. The only outside calls are Win32 ones for
-the window, the blit, and the wave device.
+H.264 decoder, the AAC decoder, the baseline JPEG decoder, the transforms, the
+colour conversion, and the playback clock. The only outside calls are Win32
+ones for the window, the blit, and the wave device.
 
 ## Building
 
@@ -28,18 +28,22 @@ examples\video_player\player.exe clip.mov
 ```
 
 Containers: AVI, MP4 and MOV, including fragmented MP4 where the samples live
-in `moof` boxes rather than in a sample table. Video: Motion JPEG, at any
-chroma sampling, plus greyscale. Audio: PCM.
+in `moof` boxes rather than in a sample table. Video: H.264 Main profile with
+CABAC, and Motion JPEG at any chroma sampling plus greyscale. Audio: AAC LC,
+and PCM.
 
-H.264 and AAC are not decoded yet, so a typical MP4 from a camera or a
-download needs one conversion first:
+An ordinary MP4 from a camera or a download plays directly.
 
-```bash
-ffmpeg -i input.mp4 -c:v mjpeg -q:v 5 -pix_fmt yuvj420p -c:a pcm_s16le -ar 44100 -ac 2 clip.avi
+## Setting it as the default player
+
+```powershell
+examples\video_player\install-player.ps1
 ```
 
-`-q:v` runs from 2 (large files, near transparent) to 31 (small, blocky). 5 is
-a good default.
+That registers the player for `.mp4`, `.mov`, `.m4v` and `.avi` under HKCU, with
+no administrator rights. Windows does not let a program make itself the
+default, so pick it once from Open with, or from Settings, Apps, Default apps.
+`install-player.ps1 -Unregister` removes every key it wrote.
 
 ## Controls
 
@@ -70,6 +74,16 @@ seconds. It stays up while paused.
 | [`jpeg.mettle`](jpeg.mettle) | baseline JPEG decoder, from markers to BGRA pixels |
 | [`audio.mettle`](audio.mettle) | waveOut ring buffer and the audio clock |
 | [`h264.mettle`](h264.mettle) | H.264 bitstream: NAL units, SPS, PPS, slice headers |
+| [`h264_decode.mettle`](h264_decode.mettle) | CABAC engine, macroblock layer, residuals, transforms |
+| [`h264_predict.mettle`](h264_predict.mettle) | intra prediction, 4x4 and 16x16 and chroma |
+| [`h264_inter.mettle`](h264_inter.mettle) | motion compensation, six tap luma, bilinear chroma |
+| [`h264_pslice.mettle`](h264_pslice.mettle) | P slice syntax, weighting, inter reconstruction |
+| [`h264_bslice.mettle`](h264_bslice.mettle) | B slice syntax, spatial and temporal direct modes |
+| [`h264_deblock.mettle`](h264_deblock.mettle) | deblocking filter, boundary strength and edges |
+| [`h264_frame.mettle`](h264_frame.mettle) | picture order, reference lists, DPB, frame assembly |
+| [`aac.mettle`](aac.mettle) | AudioSpecificConfig and the bit reader |
+| [`aac_decode.mettle`](aac_decode.mettle) | AAC LC: Huffman, scalefactors, TNS, IMDCT, windows |
+| [`aac_tables.mettle`](aac_tables.mettle) | generated Huffman codebooks and scalefactor bands |
 | [`vptool.mettle`](vptool.mettle) | command line tool used to test the other modules |
 
 ### The containers
