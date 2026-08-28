@@ -575,6 +575,24 @@ fn h264_end_picture(v: H264Video*, sps: H264Sps*, header: H264SliceHeader*) {
   }
 }
 
+fn h264_unsupported_reason(parser: H264Decoder*) -> cstring {
+  var sps: H264Sps* = &parser->sps[parser->active_sps];
+  var pps: H264Pps* = &parser->pps[parser->active_pps];
+  if (pps->entropy_coding_mode == 0) {
+    return "CAVLC entropy coding, this decoder reads CABAC only";
+  }
+  if (sps->chroma_format_idc != 1) {
+    return "a chroma format other than 4:2:0";
+  }
+  if (pps->transform_8x8_mode != 0) {
+    return "the 8x8 transform of H.264 High profile";
+  }
+  if (sps->scaling_matrix_present != 0) {
+    return "custom scaling matrices";
+  }
+  return 0;
+}
+
 fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
   var parser: H264Decoder* = v->parser;
   var pps: H264Pps* = &parser->pps[parser->active_pps];
