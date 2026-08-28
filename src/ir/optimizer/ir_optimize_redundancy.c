@@ -1980,6 +1980,54 @@ static int re_access_reaches(const IRFunction *function, const REDefs *defs,
  * stales the def-index map the address resolver walks, so the caller rebuilds
  * and rescans after each success. Returns 1 when a load moved. */
 
+static size_t re_straight_line_end(const IRFunction *function, size_t from,
+                                   size_t limit, size_t fallback) {
+  for (size_t i = from; i <= limit && i < function->instruction_count; i++) {
+    IROpcode op = function->instructions[i].op;
+    if (op == IR_OP_BRANCH_ZERO || op == IR_OP_BRANCH_EQ ||
+        op == IR_OP_JUMP || op == IR_OP_LABEL || op == IR_OP_RETURN) {
+      return i;
+    }
+  }
+  return fallback;
+}
+
+static int re_hoist_base_is_dereferenceable(
+    const IRFunction *function, const REDefs *defs, const REAddr *addr,
+    long long reach, size_t header, size_t at, size_t prefix_end,
+    size_t body_prefix_end, size_t entry_end, int runs_at_least_once) {
+  if (at < prefix_end) {
+    return 1;
+  }
+  for (size_t k = header + 1; k < prefix_end; k++) {
+    if (re_access_reaches(function, defs, &function->instructions[k], addr,
+                          reach)) {
+      return 1;
+    }
+  }
+  for (size_t k = header; k-- > 0;) {
+    const IRInstruction *back = &function->instructions[k];
+    if (back->op == IR_OP_LABEL || back->op == IR_OP_JUMP ||
+        back->op == IR_OP_RETURN || back->op == IR_OP_BRANCH_ZERO ||
+        back->op == IR_OP_BRANCH_EQ) {
+      break;
+    }
+    if (re_access_reaches(function, defs, back, addr, reach)) {
+      return 1;
+    }
+  }
+  if (!addr->is_address_of &&
+      ir_function_symbol_is_parameter(function, addr->name)) {
+    for (size_t k = 0; k < entry_end; k++) {
+      if (re_access_reaches(function, defs, &function->instructions[k], addr,
+                            reach)) {
+        return 1;
+      }
+    }
+  }
+  return at < body_prefix_end && runs_at_least_once;
+}
+
 static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
                                  const IRTempValueMap *addr_taken,
                                  int *changed) {
@@ -2030,31 +2078,13 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
 
     /* The header's straight-line prefix runs on every entry to the loop; a
      * base it dereferences is a base a hoisted load may touch. */
-    size_t prefix_end = latch;
-    for (size_t i = header + 1; i <= latch; i++) {
-      IROpcode op = function->instructions[i].op;
-      if (op == IR_OP_BRANCH_ZERO || op == IR_OP_BRANCH_EQ ||
-          op == IR_OP_JUMP || op == IR_OP_LABEL || op == IR_OP_RETURN) {
-        prefix_end = i;
-        break;
-      }
-    }
+    size_t prefix_end = re_straight_line_end(function, header + 1, latch, latch);
 
     /* How far into the body control gets without taking a branch, past the
      * loop's own guard: a load before that runs on every iteration that runs
      * at all. */
-    size_t body_prefix_end = latch;
-    {
-      size_t k = prefix_end + 1;
-      for (; k < latch; k++) {
-        IROpcode op = function->instructions[k].op;
-        if (op == IR_OP_BRANCH_ZERO || op == IR_OP_BRANCH_EQ ||
-            op == IR_OP_JUMP || op == IR_OP_LABEL || op == IR_OP_RETURN) {
-          break;
-        }
-      }
-      body_prefix_end = k;
-    }
+    size_t body_prefix_end =
+        re_straight_line_end(function, prefix_end + 1, latch, latch);
     int runs_at_least_once =
         re_loop_runs_at_least_once(function, &defs, header, latch);
 
@@ -2083,47 +2113,10 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
         continue;
       }
 
-      /* Dereferenceability: the prefix already touches this base, or this
-       * load IS in the prefix. */
-      long long reach = addr.offset + load->rhs.int_value;
-      int safe = i < prefix_end;
-      for (size_t k = header + 1; k < prefix_end && !safe; k++) {
-        safe = re_access_reaches(function, &defs, &function->instructions[k],
-                                 &addr, reach);
-      }
-      for (size_t k = header; k-- > 0 && !safe;) {
-        const IRInstruction *back = &function->instructions[k];
-        if (back->op == IR_OP_LABEL || back->op == IR_OP_JUMP ||
-            back->op == IR_OP_RETURN || back->op == IR_OP_BRANCH_ZERO ||
-            back->op == IR_OP_BRANCH_EQ) {
-          break;
-        }
-        safe = re_access_reaches(function, &defs, back, &addr, reach);
-      }
-      /* The walk above stops at the first label behind the header, so a base
-       * the function dereferenced earlier stops counting the moment anything
-       * branches in between. The entry block runs before every loop in the
-       * function whatever the control flow does, so an access there says the
-       * base is dereferenceable here too. `lcs_fill` reads `b->count` on the
-       * way in and then re-reads `b->hash` on every step of its inner loop
-       * for want of exactly this.
-       *
-       * Only asked about a parameter: what the entry block dereferences is
-       * what was handed in, and asking for every candidate that got this far
-       * cost more than the answer was worth. */
-      if (!safe && !addr.is_address_of &&
-          ir_function_symbol_is_parameter(function, addr.name)) {
-        for (size_t k = 0; k < entry_end && !safe; k++) {
-          safe = re_access_reaches(function, &defs, &function->instructions[k],
-                                   &addr, reach);
-        }
-      }
-      /* Or the loop is entered unconditionally and this load runs on the way
-       * through, so it was going to happen regardless of where it sits. */
-      if (!safe && i < body_prefix_end && runs_at_least_once) {
-        safe = 1;
-      }
-      if (!safe) {
+      if (!re_hoist_base_is_dereferenceable(
+              function, &defs, &addr, addr.offset + load->rhs.int_value,
+              header, i, prefix_end, body_prefix_end, entry_end,
+              runs_at_least_once)) {
         continue;
       }
 
@@ -2275,6 +2268,200 @@ static int re_label_index_of(const IRFunction *function, const char *label,
 
 /* One promotion per scan, same discipline as the load hoister: insertions
  * stale the def-index map. Returns 1 when something moved. */
+typedef struct {
+  size_t loads[RE_PROMOTE_MAX_SITES];
+  size_t stores[RE_PROMOTE_MAX_SITES];
+  size_t load_count;
+  size_t store_count;
+  REExit exits[RE_PROMOTE_MAX_EXITS];
+  size_t exit_count;
+  int header_exit;
+  int viable;
+  int strong;
+  int is_float;
+  int float_bits;
+  int is_unsigned;
+  MtlcType *value_type;
+  unsigned char promoted_class;
+} REPromoteSites;
+
+#define RE_ACCESS_ELSEWHERE 0
+#define RE_ACCESS_PARTIAL 1
+#define RE_ACCESS_EXACT 2
+
+static int re_promote_classify_access(const IRFunction *function,
+                                      const REDefs *defs,
+                                      const IRInstruction *ins,
+                                      const char *region_base,
+                                      const REAddr *region, long long size,
+                                      unsigned seed_class, int known_float) {
+  REAddr a = {0};
+  const IROperand *ao = ins->op == IR_OP_LOAD ? &ins->lhs : &ins->dest;
+  char abase[RE_NAME_MAX + 1];
+  int resolvable;
+  long long asize;
+
+  re_resolve_addr(function, defs, ao, &a, 0);
+  resolvable = a.valid && a.name &&
+               snprintf(abase, sizeof(abase), "%c%s",
+                        a.is_address_of ? '&' : 's',
+                        a.name) < (int)sizeof(abase);
+  asize = ins->rhs.kind == IR_OPERAND_INT ? ins->rhs.int_value : RE_MEM_WHOLE;
+  {
+    REMemRegion probe = {resolvable ? abase : NULL, a.offset, asize,
+                         ins->alias_class};
+    if (!re_kill_hits(function, &probe, region_base, region->offset, size,
+                      seed_class)) {
+      return RE_ACCESS_ELSEWHERE;
+    }
+  }
+  if (!resolvable || strcmp(abase, region_base) != 0 ||
+      a.offset != region->offset || asize != size ||
+      ins->is_float != known_float) {
+    return RE_ACCESS_PARTIAL;
+  }
+  return RE_ACCESS_EXACT;
+}
+
+static void re_promote_collect_sites(const IRFunction *function,
+                                     const REDefs *defs_in,
+                                     const IRTempValueMap *addr_taken,
+                                     size_t header, size_t latch,
+                                     const char *region_base,
+                                     const REAddr *region_in, long long size,
+                                     const IRInstruction *seed,
+                                     REPromoteSites *out) {
+  const REDefs defs = *defs_in;
+  const REAddr region = *region_in;
+  size_t *loads = out->loads;
+  size_t *stores = out->stores;
+  size_t load_count = 0;
+  size_t store_count = 0;
+  REExit *exits = out->exits;
+  size_t exit_count = 0;
+  int header_exit = -1;
+  int viable = 1;
+  int strong = 1;
+  int is_float = 0;
+  int float_bits = 0;
+  int is_unsigned = 0;
+  MtlcType *value_type = NULL;
+  unsigned char promoted_class = IR_ALIAS_CLASS_NONE;
+
+  for (size_t i = header + 1; i < latch && viable; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP) {
+      continue;
+    }
+    if (ins->op == IR_OP_LOAD || ins->op == IR_OP_STORE) {
+      int known_float = (load_count || store_count) ? is_float : ins->is_float;
+      int verdict = re_promote_classify_access(function, &defs, ins,
+                                               region_base, &region, size,
+                                               seed->alias_class, known_float);
+      if (verdict == RE_ACCESS_ELSEWHERE) {
+        continue;
+      }
+      if (verdict == RE_ACCESS_PARTIAL) {
+        if (ins->op == IR_OP_LOAD) {
+          strong = 0;
+          continue;
+        }
+        viable = 0;
+        break;
+      }
+      if (ins->op == IR_OP_LOAD) {
+        if (ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name ||
+            load_count >= RE_PROMOTE_MAX_SITES) {
+          strong = 0;
+          continue;
+        }
+        loads[load_count++] = i;
+      } else {
+        if (store_count >= RE_PROMOTE_MAX_SITES) {
+          viable = 0;
+          break;
+        }
+        stores[store_count++] = i;
+      }
+      is_float = ins->is_float;
+      float_bits = ins->float_bits;
+      if (ins->op == IR_OP_LOAD) {
+        is_unsigned = ins->is_unsigned;
+        if (ins->value_type) {
+          value_type = ins->value_type;
+        }
+      }
+      if (ins->alias_class != IR_ALIAS_CLASS_NONE) {
+        promoted_class = ins->alias_class;
+      }
+      continue;
+    }
+    {
+      char wbase[RE_NAME_MAX + 1];
+      long long woff, wsize;
+      unsigned wtype = IR_ALIAS_CLASS_NONE;
+      if (re_instruction_write_region(function, &defs, addr_taken, ins,
+                                      wbase, sizeof(wbase), &woff, &wsize,
+                                      &wtype)) {
+        REMemRegion probe = {wbase[0] ? wbase : NULL, woff, wsize,
+                             (unsigned char)wtype};
+        if (re_kill_hits(function, &probe, region_base, region.offset, size,
+                         seed->alias_class)) {
+          viable = 0;
+          break;
+        }
+      }
+    }
+    if (ins->op == IR_OP_CALL || ins->op == IR_OP_CALL_INDIRECT) {
+      viable = 0;
+      break;
+    }
+    /* exits */
+    if (ins->op == IR_OP_RETURN) {
+      if (exit_count >= RE_PROMOTE_MAX_EXITS) {
+        viable = 0;
+        break;
+      }
+      exits[exit_count].at = i;
+      exits[exit_count].is_return = 1;
+      exit_count++;
+    } else if ((ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+                ins->op == IR_OP_BRANCH_EQ) &&
+               ins->text) {
+      size_t target = 0;
+      if (!re_label_index_of(function, ins->text, &target)) {
+        viable = 0;
+        break;
+      }
+      if (target <= header || target > latch) {
+        if (exit_count >= RE_PROMOTE_MAX_EXITS) {
+          viable = 0;
+          break;
+        }
+        exits[exit_count].at = i;
+        exits[exit_count].is_return = 0;
+        if ((size_t)i <= header) {
+          viable = 0;
+          break;
+        }
+        exit_count++;
+      }
+    }
+  }
+
+  out->load_count = load_count;
+  out->store_count = store_count;
+  out->exit_count = exit_count;
+  out->header_exit = header_exit;
+  out->viable = viable;
+  out->strong = strong;
+  out->is_float = is_float;
+  out->float_bits = float_bits;
+  out->is_unsigned = is_unsigned;
+  out->value_type = value_type;
+  out->promoted_class = promoted_class;
+}
+
 static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
                               const IRTempValueMap *addr_taken, int *changed) {
   const REDefs defs = *defs_in;
@@ -2334,136 +2521,24 @@ static int re_try_promote_one(IRFunction *function, const REDefs *defs_in,
        * a way that reaches it, and the loop takes no calls at all (a call
        * could read the region through an escaped pointer AND would clobber
        * the promoted local's freshness for it). */
-      size_t loads[RE_PROMOTE_MAX_SITES];
-      size_t stores[RE_PROMOTE_MAX_SITES];
-      size_t load_count = 0;
-      size_t store_count = 0;
-      REExit exits[RE_PROMOTE_MAX_EXITS];
-      size_t exit_count = 0;
-      int header_exit = -1;
-      int viable = 1;
-      int strong = 1;
-      int is_float = 0;
-      int float_bits = 0;
-      int is_unsigned = 0;
-      MtlcType *value_type = NULL;
-      unsigned char promoted_class = IR_ALIAS_CLASS_NONE;
+      REPromoteSites sites;
+      re_promote_collect_sites(function, &defs, addr_taken, header, latch,
+                               region_base, &region, size, seed, &sites);
+      size_t *loads = sites.loads;
+      size_t *stores = sites.stores;
+      size_t load_count = sites.load_count;
+      size_t store_count = sites.store_count;
+      REExit *exits = sites.exits;
+      size_t exit_count = sites.exit_count;
+      int header_exit = sites.header_exit;
+      int viable = sites.viable;
+      int strong = sites.strong;
+      int is_float = sites.is_float;
+      int float_bits = sites.float_bits;
+      int is_unsigned = sites.is_unsigned;
+      MtlcType *value_type = sites.value_type;
+      unsigned char promoted_class = sites.promoted_class;
 
-      for (size_t i = header + 1; i < latch && viable; i++) {
-        const IRInstruction *ins = &function->instructions[i];
-        if (ins->op == IR_OP_NOP) {
-          continue;
-        }
-        if (ins->op == IR_OP_LOAD || ins->op == IR_OP_STORE) {
-          REAddr a = {0};
-          const IROperand *ao =
-              ins->op == IR_OP_LOAD ? &ins->lhs : &ins->dest;
-          re_resolve_addr(function, &defs, ao, &a, 0);
-          char abase[RE_NAME_MAX + 1];
-          int resolvable =
-              a.valid && a.name &&
-              snprintf(abase, sizeof(abase), "%c%s",
-                       a.is_address_of ? '&' : 's',
-                       a.name) < (int)sizeof(abase);
-          long long asize =
-              ins->rhs.kind == IR_OPERAND_INT ? ins->rhs.int_value : RE_MEM_WHOLE;
-          REMemRegion probe = {resolvable ? abase : NULL, a.offset, asize,
-                               ins->alias_class};
-          if (!re_kill_hits(function, &probe, region_base, region.offset, size,
-                            seed->alias_class)) {
-            continue; /* provably elsewhere */
-          }
-          /* it may touch the region: it must BE the region, exactly */
-          if (!resolvable || strcmp(abase, region_base) != 0 ||
-              a.offset != region.offset || asize != size ||
-              ins->is_float != (load_count || store_count ? is_float
-                                                          : ins->is_float)) {
-            if (ins->op == IR_OP_LOAD) {
-              strong = 0;
-              continue;
-            }
-            viable = 0;
-            break;
-          }
-          if (ins->op == IR_OP_LOAD) {
-            if (ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name ||
-                load_count >= RE_PROMOTE_MAX_SITES) {
-              strong = 0;
-              continue;
-            }
-            loads[load_count++] = i;
-          } else {
-            if (store_count >= RE_PROMOTE_MAX_SITES) {
-              viable = 0;
-              break;
-            }
-            stores[store_count++] = i;
-          }
-          is_float = ins->is_float;
-          float_bits = ins->float_bits;
-          if (ins->op == IR_OP_LOAD) {
-            is_unsigned = ins->is_unsigned;
-            if (ins->value_type) {
-              value_type = ins->value_type;
-            }
-          }
-          if (ins->alias_class != IR_ALIAS_CLASS_NONE) {
-            promoted_class = ins->alias_class;
-          }
-          continue;
-        }
-        {
-          char wbase[RE_NAME_MAX + 1];
-          long long woff, wsize;
-          unsigned wtype = IR_ALIAS_CLASS_NONE;
-          if (re_instruction_write_region(function, &defs, addr_taken, ins,
-                                          wbase, sizeof(wbase), &woff, &wsize,
-                                          &wtype)) {
-            REMemRegion probe = {wbase[0] ? wbase : NULL, woff, wsize,
-                                 (unsigned char)wtype};
-            if (re_kill_hits(function, &probe, region_base, region.offset, size,
-                             seed->alias_class)) {
-              viable = 0;
-              break;
-            }
-          }
-        }
-        if (ins->op == IR_OP_CALL || ins->op == IR_OP_CALL_INDIRECT) {
-          viable = 0;
-          break;
-        }
-        /* exits */
-        if (ins->op == IR_OP_RETURN) {
-          if (exit_count >= RE_PROMOTE_MAX_EXITS) {
-            viable = 0;
-            break;
-          }
-          exits[exit_count].at = i;
-          exits[exit_count].is_return = 1;
-          exit_count++;
-        } else if ((ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
-                    ins->op == IR_OP_BRANCH_EQ) &&
-                   ins->text) {
-          size_t target = 0;
-          if (!re_label_index_of(function, ins->text, &target)) {
-            viable = 0;
-            break;
-          }
-          if (target <= header || target > latch) {
-            if (exit_count >= RE_PROMOTE_MAX_EXITS) {
-              viable = 0;
-              break;
-            }
-            exits[exit_count].at = i;
-            exits[exit_count].is_return = 0;
-            if ((size_t)i <= header) {
-              viable = 0;
-              break;
-            }
-            exit_count++;
-          }
-        }
-      }
       if (getenv("METTLE_PROM_TRACE")) {
         fprintf(stderr, "[prom]   viable=%d strong=%d loads=%zu stores=%zu exits=%zu float=%d\n",
                 viable, strong, load_count, store_count, exit_count, is_float);
@@ -3198,25 +3273,141 @@ static int bp_build_consumed(const IRFunction *function, REMap *consumed) {
   return 1;
 }
 
-static int bp_try_at(IRFunction *function, const REDefs *defs,
-                     const REMap *consumed, size_t at, int *changed) {
-  IRInstruction *terminal = &function->instructions[at];
-  BPMatch m = {0};
-  BPAddr base = {0};
-  int width;
-  size_t lowest_at = 0;
-  size_t first = at;
-  size_t last = at;
-  const IRInstruction *lowest = NULL;
-  char key[RE_NAME_MAX];
+static int bp_shifts_cover(const BPMatch *m, int width) {
+  for (int k = 0; k < width; k++) {
+    int seen = 0;
+    for (int j = 0; j < width; j++) {
+      if (m->leaves[j].shift == k) {
+        seen++;
+      }
+    }
+    if (seen != 1) {
+      return 0;
+    }
+  }
+  return 1;
+}
 
+static const IRInstruction *bp_pack_lowest(const IRFunction *function,
+                                           const REDefs *defs,
+                                           const BPMatch *m, int width,
+                                           BPAddr *base, size_t *lowest_at) {
+  for (int j = 0; j < width; j++) {
+    if (m->leaves[j].shift != 0) {
+      continue;
+    }
+    base->count = 0;
+    base->konst = 0;
+    base->ok = 1;
+    bp_collect(function, defs, &m->leaves[j].load->lhs, base, 0);
+    if (!base->ok) {
+      return NULL;
+    }
+    *lowest_at = m->leaves[j].load_at;
+    return m->leaves[j].load;
+  }
+  return NULL;
+}
+
+static int bp_pack_addresses_agree(const IRFunction *function,
+                                   const REDefs *defs, const BPMatch *m,
+                                   int width, const BPAddr *base,
+                                   const IRInstruction *lowest, size_t at) {
+  for (int j = 0; j < width; j++) {
+    BPAddr here = {0};
+    here.ok = 1;
+    bp_collect(function, defs, &m->leaves[j].load->lhs, &here, 0);
+    if (!here.ok || !bp_same_terms(base, &here) ||
+        here.konst != base->konst + m->leaves[j].shift) {
+      bp_trace("addr", at, j);
+      return 0;
+    }
+    if (m->leaves[j].load->alias_class != lowest->alias_class) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void bp_span_bounds(const BPMatch *m, size_t at, size_t *first,
+                           size_t *last) {
+  *first = at;
+  *last = at;
+  for (int i = 0; i < m->pattern_count; i++) {
+    if (m->pattern[i] < *first) {
+      *first = m->pattern[i];
+    }
+    if (m->pattern[i] > *last) {
+      *last = m->pattern[i];
+    }
+  }
+}
+
+static int bp_group_is_retirable(const IRFunction *function, const BPMatch *m,
+                                 size_t at, const char *why) {
+  for (int i = 0; i < m->pattern_count; i++) {
+    const IRInstruction *ins = &function->instructions[m->pattern[i]];
+    if (m->pattern[i] == at || ins->op == IR_OP_STORE) {
+      continue;
+    }
+    if (!ir_instruction_writes_destination(ins) ||
+        (ins->dest.kind != IR_OPERAND_TEMP &&
+         ins->dest.kind != IR_OPERAND_SYMBOL) ||
+        !ins->dest.name) {
+      return 0;
+    }
+    if (bp_occurrences(function, ins->dest.name, ins->dest.kind, m, 0) != 0) {
+      bp_trace(why, at, (int)m->pattern[i]);
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void bp_retire(IRFunction *function, const BPMatch *m, size_t at,
+                      int *changed) {
+  for (int i = 0; i < m->pattern_count; i++) {
+    if (m->pattern[i] == at) {
+      continue;
+    }
+    ir_instruction_destroy_storage(&function->instructions[m->pattern[i]]);
+    memset(&function->instructions[m->pattern[i]], 0,
+           sizeof(function->instructions[m->pattern[i]]));
+    function->instructions[m->pattern[i]].op = IR_OP_NOP;
+  }
+  if (changed) {
+    *changed = 1;
+  }
+}
+
+static int bp_pack_anchor_is_root(const IRFunction *function,
+                                  const REMap *consumed, size_t at) {
+  const IRInstruction *terminal = &function->instructions[at];
+  char key[RE_NAME_MAX];
   if (terminal->op != IR_OP_BINARY || terminal->is_float || !terminal->text ||
       strcmp(terminal->text, "|") != 0 ||
       terminal->dest.kind != IR_OPERAND_TEMP || !terminal->dest.name) {
     return 0;
   }
-  if (!re_name_key(key, sizeof(key), terminal->dest.kind, terminal->dest.name) ||
-      re_map_get(consumed, key) != 0) {
+  if (!re_name_key(key, sizeof(key), terminal->dest.kind,
+                   terminal->dest.name)) {
+    return 0;
+  }
+  return re_map_get(consumed, key) == 0;
+}
+
+static int bp_try_at(IRFunction *function, const REDefs *defs,
+                     const REMap *consumed, size_t at, int *changed) {
+  IRInstruction *terminal = &function->instructions[at];
+  BPMatch m = {0};
+  BPAddr base = {0};
+  const IRInstruction *lowest;
+  size_t lowest_at = 0;
+  size_t first;
+  size_t last;
+  int width;
+
+  if (!bp_pack_anchor_is_root(function, consumed, at)) {
     return 0;
   }
 
@@ -3232,87 +3423,33 @@ static int bp_try_at(IRFunction *function, const REDefs *defs,
     bp_trace("width", at, width);
     return 0;
   }
-  for (int k = 0; k < width; k++) {
-    int seen = 0;
-    for (int j = 0; j < width; j++) {
-      if (m.leaves[j].shift == k) {
-        seen++;
-      }
-    }
-    if (seen != 1) {
-      bp_trace("shifts", at, k);
-      return 0;
-    }
-  }
-
-  base.ok = 1;
-  for (int j = 0; j < width; j++) {
-    BPAddr here = {0};
-    here.ok = 1;
-    bp_collect(function, defs, &m.leaves[j].load->lhs, &here, 0);
-    if (!here.ok) {
-      return 0;
-    }
-    if (m.leaves[j].shift == 0) {
-      base = here;
-      lowest = m.leaves[j].load;
-      lowest_at = m.leaves[j].load_at;
-    }
-  }
-  if (!lowest) {
+  if (!bp_shifts_cover(&m, width)) {
+    bp_trace("shifts", at, width);
     return 0;
   }
-  for (int j = 0; j < width; j++) {
-    BPAddr here = {0};
-    here.ok = 1;
-    bp_collect(function, defs, &m.leaves[j].load->lhs, &here, 0);
-    if (!here.ok || !bp_same_terms(&base, &here) ||
-        here.konst != base.konst + m.leaves[j].shift) {
-      bp_trace("addr", at, j);
-      return 0;
-    }
-    if (m.leaves[j].load->alias_class != lowest->alias_class) {
-      return 0;
-    }
+
+  lowest = bp_pack_lowest(function, defs, &m, width, &base, &lowest_at);
+  if (!lowest ||
+      !bp_pack_addresses_agree(function, defs, &m, width, &base, lowest, at)) {
+    return 0;
   }
 
   if (!bp_note(&m, at)) {
     return 0;
   }
-  for (int i = 0; i < m.pattern_count; i++) {
-    if (m.pattern[i] < first) {
-      first = m.pattern[i];
-    }
-    if (m.pattern[i] > last) {
-      last = m.pattern[i];
-    }
-  }
+  bp_span_bounds(&m, at, &first, &last);
   if (last != at || !bp_span_is_clean(function, first, last, &base)) {
     bp_trace("span", at, (int)first);
     return 0;
   }
-
-  for (int i = 0; i < m.pattern_count; i++) {
-    const IRInstruction *ins = &function->instructions[m.pattern[i]];
-    if (m.pattern[i] == at) {
-      continue;
-    }
-    if (!ir_instruction_writes_destination(ins) ||
-        (ins->dest.kind != IR_OPERAND_TEMP &&
-         ins->dest.kind != IR_OPERAND_SYMBOL) ||
-        !ins->dest.name) {
-      return 0;
-    }
-    if (bp_occurrences(function, ins->dest.name, ins->dest.kind, &m, 0) != 0) {
-      bp_trace("outside-use", at, (int)m.pattern[i]);
-      return 0;
-    }
+  if (!bp_group_is_retirable(function, &m, at, "outside-use")) {
+    return 0;
   }
 
   {
     IROperand address = ir_operand_copy(&lowest->lhs);
     IROperand dest = ir_operand_copy(&terminal->dest);
-    int keep_float_bits = 0;
+    SourceLocation where = function->instructions[lowest_at].location;
     ir_instruction_destroy_storage(terminal);
     memset(terminal, 0, sizeof(*terminal));
     terminal->op = IR_OP_LOAD;
@@ -3320,22 +3457,10 @@ static int bp_try_at(IRFunction *function, const REDefs *defs,
     terminal->lhs = address;
     terminal->rhs = ir_operand_int(width);
     terminal->is_unsigned = 1;
-    terminal->float_bits = keep_float_bits;
     terminal->alias_class = IR_ALIAS_CLASS_NONE;
-    terminal->location = function->instructions[lowest_at].location;
+    terminal->location = where;
   }
-  for (int i = 0; i < m.pattern_count; i++) {
-    if (m.pattern[i] == at) {
-      continue;
-    }
-    ir_instruction_destroy_storage(&function->instructions[m.pattern[i]]);
-    memset(&function->instructions[m.pattern[i]], 0,
-           sizeof(function->instructions[m.pattern[i]]));
-    function->instructions[m.pattern[i]].op = IR_OP_NOP;
-  }
-  if (changed) {
-    *changed = 1;
-  }
+  bp_retire(function, &m, at, changed);
   return 1;
 }
 
@@ -3444,35 +3569,12 @@ static int bp_store_span_is_clean(const IRFunction *function, size_t from,
   return 1;
 }
 
-static int bp_try_store_at(IRFunction *function, const REDefs *defs, size_t at,
-                           int *changed) {
-  IRInstruction *anchor = &function->instructions[at];
-  BPMatch m = {0};
-  BPAddr base = {0};
-  const IROperand *root = NULL;
-  size_t members[BP_MAX_LEAVES];
+static int bp_store_gather(IRFunction *function, const REDefs *defs,
+                           size_t at, const BPAddr *base,
+                           const IROperand *root, BPMatch *m,
+                           size_t *members) {
+  const IRInstruction *anchor = &function->instructions[at];
   int width = 1;
-  int shift = 0;
-
-  if (anchor->op != IR_OP_STORE || anchor->is_float ||
-      anchor->rhs.kind != IR_OPERAND_INT || anchor->rhs.int_value != 1) {
-    return 0;
-  }
-  m.ok = 1;
-  if (!bp_note(&m, at) ||
-      !bp_trace_stored_byte(function, defs, &anchor->lhs, &m, &root, &shift,
-                            0) ||
-      shift != 0 || !root) {
-    bp_trace("st-anchor", at, shift);
-    return 0;
-  }
-  base.ok = 1;
-  bp_collect(function, defs, &anchor->dest, &base, 0);
-  if (!base.ok) {
-    bp_trace("st-addr", at, 0);
-    return 0;
-  }
-  members[0] = at;
 
   for (size_t i = at + 1;
        i < function->instruction_count && width < BP_MAX_LEAVES; i++) {
@@ -3494,10 +3596,10 @@ static int bp_try_store_at(IRFunction *function, const REDefs *defs, size_t at,
       continue;
     }
     if (ins->is_float || ins->rhs.kind != IR_OPERAND_INT ||
-        ins->rhs.int_value != 1) {
+        ins->rhs.int_value != 1 || ins->alias_class != anchor->alias_class) {
       break;
     }
-    probe = m;
+    probe = *m;
     if (!bp_trace_stored_byte(function, defs, &ins->lhs, &probe, &here_root,
                               &here_shift, 0) ||
         !here_root || !bp_same_operand(root, here_root) ||
@@ -3506,21 +3608,51 @@ static int bp_try_store_at(IRFunction *function, const REDefs *defs, size_t at,
     }
     here.ok = 1;
     bp_collect(function, defs, &ins->dest, &here, 0);
-    if (!here.ok || !bp_same_terms(&base, &here) ||
-        here.konst != base.konst + width) {
+    if (!here.ok || !bp_same_terms(base, &here) ||
+        here.konst != base->konst + width) {
       break;
     }
-    if (ins->alias_class != anchor->alias_class) {
-      break;
-    }
-    m = probe;
-    if (!bp_note(&m, i)) {
+    *m = probe;
+    if (!bp_note(m, i)) {
       return 0;
     }
     members[width] = i;
     width++;
   }
+  return width;
+}
 
+static int bp_try_store_at(IRFunction *function, const REDefs *defs, size_t at,
+                           int *changed) {
+  IRInstruction *anchor = &function->instructions[at];
+  BPMatch m = {0};
+  BPAddr base = {0};
+  const IROperand *root = NULL;
+  size_t members[BP_MAX_LEAVES];
+  int shift = 0;
+  int width;
+
+  if (anchor->op != IR_OP_STORE || anchor->is_float ||
+      anchor->rhs.kind != IR_OPERAND_INT || anchor->rhs.int_value != 1) {
+    return 0;
+  }
+  m.ok = 1;
+  if (!bp_note(&m, at) ||
+      !bp_trace_stored_byte(function, defs, &anchor->lhs, &m, &root, &shift,
+                            0) ||
+      shift != 0 || !root) {
+    bp_trace("st-anchor", at, shift);
+    return 0;
+  }
+  base.ok = 1;
+  bp_collect(function, defs, &anchor->dest, &base, 0);
+  if (!base.ok) {
+    bp_trace("st-addr", at, 0);
+    return 0;
+  }
+  members[0] = at;
+
+  width = bp_store_gather(function, defs, at, &base, root, &m, members);
   if (width != 2 && width != 4) {
     bp_trace("st-width", at, width);
     return 0;
@@ -3530,21 +3662,8 @@ static int bp_try_store_at(IRFunction *function, const REDefs *defs, size_t at,
     bp_trace("st-span", at, width);
     return 0;
   }
-  for (int i = 0; i < m.pattern_count; i++) {
-    const IRInstruction *ins = &function->instructions[m.pattern[i]];
-    if (ins->op == IR_OP_STORE) {
-      continue;
-    }
-    if (!ir_instruction_writes_destination(ins) ||
-        (ins->dest.kind != IR_OPERAND_TEMP &&
-         ins->dest.kind != IR_OPERAND_SYMBOL) ||
-        !ins->dest.name) {
-      return 0;
-    }
-    if (bp_occurrences(function, ins->dest.name, ins->dest.kind, &m, 0) != 0) {
-      bp_trace("st-outside-use", at, (int)m.pattern[i]);
-      return 0;
-    }
+  if (!bp_group_is_retirable(function, &m, at, "st-outside-use")) {
+    return 0;
   }
 
   {
@@ -3560,18 +3679,7 @@ static int bp_try_store_at(IRFunction *function, const REDefs *defs, size_t at,
     anchor->alias_class = IR_ALIAS_CLASS_NONE;
     anchor->location = where;
   }
-  for (int i = 0; i < m.pattern_count; i++) {
-    if (m.pattern[i] == at) {
-      continue;
-    }
-    ir_instruction_destroy_storage(&function->instructions[m.pattern[i]]);
-    memset(&function->instructions[m.pattern[i]], 0,
-           sizeof(function->instructions[m.pattern[i]]));
-    function->instructions[m.pattern[i]].op = IR_OP_NOP;
-  }
-  if (changed) {
-    *changed = 1;
-  }
+  bp_retire(function, &m, at, changed);
   return 1;
 }
 

@@ -1090,6 +1090,61 @@ static int mettle_link_elf_direct(const char *startup_object,
  * only as a linker driver with startup files, default libraries, and compiler
  * support libraries disabled. The finished ELF must pass the dependency gate.
  * Used on ELF hosts. Returns 0 on success. */
+static void elf_select_runtime_helpers(const char *runtime_directory,
+                                       const char *object_filename,
+                                       int stack_trace, int profile_runtime,
+                                       int needs_safety,
+                                       char **crash_handler_object,
+                                       char **profile_object) {
+  if (stack_trace || profile_runtime || needs_safety ||
+      object_needs_crash_handler(object_filename)) {
+    *crash_handler_object = join_paths(runtime_directory, "crash_handler.o");
+  }
+  if (profile_runtime) {
+    *profile_object = join_paths(runtime_directory, "profile.o");
+  }
+}
+
+static int elf_collect_on_demand_objects(const char *runtime_directory,
+                                         const char *object_filename,
+                                         char **extra_objects,
+                                         size_t *extra_object_count,
+                                         size_t *on_demand_object_count) {
+  static const struct {
+    const char *file;
+    int (*needed)(const char *);
+  } on_demand[] = {
+      {"string.o", object_needs_string_runtime},
+      {"swap.o", object_needs_swap_runtime},
+      {"safety.o", object_needs_safety_runtime},
+      {"debug.o", object_needs_debug_runtime},
+      {"atomics.o", object_needs_atomics},
+  };
+  size_t i = 0u;
+
+  for (i = 0u; i < sizeof(on_demand) / sizeof(on_demand[0]); i++) {
+    char *candidate = NULL;
+    if (!on_demand[i].needed(object_filename)) {
+      continue;
+    }
+    candidate = join_paths(runtime_directory, on_demand[i].file);
+    if (!candidate) {
+      continue;
+    }
+    if (access(candidate, F_OK) != 0) {
+      fprintf(stderr,
+              "Error: Program references the %s runtime but '%s' is not in "
+              "'%s'\n",
+              on_demand[i].file, on_demand[i].file, runtime_directory);
+      free(candidate);
+      return 0;
+    }
+    extra_objects[(*extra_object_count)++] = candidate;
+    *on_demand_object_count = *extra_object_count;
+  }
+  return 1;
+}
+
 static int mettle_link_elf_executable(const char *object_filename,
                                       const char *executable_filename,
                                       const CompilerOptions *options,
@@ -1124,47 +1179,14 @@ static int mettle_link_elf_executable(const char *object_filename,
      * only when the program leaves one of its symbols undefined. Naming none
      * of them is what makes a bare compute program cost nothing. */
     needs_safety = object_needs_safety_runtime(object_filename);
-    if (stack_trace || profile_runtime || needs_safety ||
-        object_needs_crash_handler(object_filename)) {
-      crash_handler_object = join_paths(runtime_directory, "crash_handler.o");
-    }
-    if (profile_runtime) {
-      profile_object = join_paths(runtime_directory, "profile.o");
-    }
+    elf_select_runtime_helpers(runtime_directory, object_filename, stack_trace,
+                               profile_runtime, needs_safety,
+                               &crash_handler_object, &profile_object);
 
-    {
-      static const struct {
-        const char *file;
-        int (*needed)(const char *);
-      } on_demand[] = {
-          {"string.o", object_needs_string_runtime},
-          {"swap.o", object_needs_swap_runtime},
-          {"safety.o", object_needs_safety_runtime},
-          {"debug.o", object_needs_debug_runtime},
-          {"atomics.o", object_needs_atomics},
-      };
-      size_t i = 0u;
-
-      for (i = 0u; i < sizeof(on_demand) / sizeof(on_demand[0]); i++) {
-        char *candidate = NULL;
-        if (!on_demand[i].needed(object_filename)) {
-          continue;
-        }
-        candidate = join_paths(runtime_directory, on_demand[i].file);
-        if (!candidate) {
-          continue;
-        }
-        if (access(candidate, F_OK) != 0) {
-          fprintf(stderr,
-                  "Error: Program references the %s runtime but '%s' is not in "
-                  "'%s'\n",
-                  on_demand[i].file, on_demand[i].file, runtime_directory);
-          free(candidate);
-          goto cleanup;
-        }
-        extra_objects[extra_object_count++] = candidate;
-        on_demand_object_count = extra_object_count;
-      }
+    if (!elf_collect_on_demand_objects(runtime_directory, object_filename,
+                                      extra_objects, &extra_object_count,
+                                      &on_demand_object_count)) {
+      goto cleanup;
     }
   }
 

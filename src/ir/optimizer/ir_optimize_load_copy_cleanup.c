@@ -815,6 +815,174 @@ int ir_hoist_invariant_arith_pass(IRFunction *function, int *changed) {
  * EVERY reader of the shifted index must be a `base + %sh` add this rewrite
  * also retargets. One consumer left behind would compute an address missing
  * the hoisted term. */
+typedef struct {
+  long long k;
+  long long bias;
+  size_t idx_pos;
+  char sh_name[128];
+  IROperand inv;
+  IROperand var;
+} IRRowShape;
+
+static int ir_row_index_is_read_in_loop(const IRFunction *function, size_t s,
+                                        size_t latch, const char *sh_name) {
+  for (size_t j = s + 1; j < latch; j++) {
+    const IRInstruction *use = &function->instructions[j];
+    if (use->op == IR_OP_BINARY && !use->is_float && use->text &&
+        strcmp(use->text, "+") == 0 &&
+        use->lhs.kind == IR_OPERAND_SYMBOL && use->lhs.name &&
+        ir_operand_is_temp_named(&use->rhs, sh_name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static const IRInstruction *ir_row_nearest_def(const IRFunction *function,
+                                               size_t from, size_t header,
+                                               const char *name, size_t *at) {
+  for (size_t j = from; j-- > header + 1;) {
+    const IRInstruction *cand = &function->instructions[j];
+    if (ir_instruction_writes_destination(cand) &&
+        cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
+        strcmp(cand->dest.name, name) == 0) {
+      *at = j;
+      return cand;
+    }
+  }
+  return NULL;
+}
+
+static int ir_row_still_holds(const IRFunction *function, size_t from,
+                              size_t to, const IROperand *value) {
+  for (size_t j = from; j < to; j++) {
+    const IRInstruction *mid = &function->instructions[j];
+    if (ir_instruction_writes_destination(mid) &&
+        mid->dest.kind == value->kind && mid->dest.name &&
+        strcmp(mid->dest.name, value->name) == 0) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static const IRInstruction *ir_row_carry_bias(const IRFunction *function,
+                                              size_t header,
+                                              const IRInstruction *idx,
+                                              IRRowShape *out) {
+  size_t inner_at = 0;
+  const IRInstruction *inner;
+  /* A neighbour reads `m[r + i - 1]`, and the constant lands between
+   * the index add and the shift. It belongs to the fixed half, because
+   * (r + i - c) << k is ((r - c) + i) << k, so it is carried across and
+   * folded into the row pointer rather than refusing the shape. */
+  if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||
+      (strcmp(idx->text, "+") != 0 && strcmp(idx->text, "-") != 0) ||
+      idx->rhs.kind != IR_OPERAND_INT || idx->lhs.kind != IR_OPERAND_TEMP ||
+      !idx->lhs.name) {
+    return idx;
+  }
+  inner = ir_row_nearest_def(function, out->idx_pos, header, idx->lhs.name,
+                             &inner_at);
+  if (!inner || inner->op != IR_OP_BINARY || inner->is_float || !inner->text ||
+      strcmp(inner->text, "+") != 0) {
+    return idx;
+  }
+  out->bias =
+      strcmp(idx->text, "-") == 0 ? -idx->rhs.int_value : idx->rhs.int_value;
+  out->idx_pos = inner_at;
+  return inner;
+}
+
+static int ir_row_pick_sides(const IRFunction *function, size_t header,
+                             size_t latch, size_t s, const IRInstruction *idx,
+                             IRRowShape *out) {
+  const IROperand *inv_side;
+  const IROperand *var_side;
+  int lhs_inv =
+      ir_row_operand_invariant(function, header + 1, latch, &idx->lhs);
+  int rhs_inv =
+      ir_row_operand_invariant(function, header + 1, latch, &idx->rhs);
+  if (lhs_inv == rhs_inv) {
+    return 0; /* both fixed is plain LICM; both moving has no hoist. */
+  }
+  inv_side = lhs_inv ? &idx->lhs : &idx->rhs;
+  var_side = lhs_inv ? &idx->rhs : &idx->lhs;
+  if ((var_side->kind != IR_OPERAND_SYMBOL &&
+       var_side->kind != IR_OPERAND_TEMP) ||
+      !var_side->name) {
+    return 0;
+  }
+  if (inv_side->kind == IR_OPERAND_INT &&
+      inv_side->int_value + out->bias == 0) {
+    return 0;
+  }
+  /* The moving half must still hold the index add's value at the
+   * shift: nothing may redefine it in between. At scale 1 they are the
+   * same instruction, so there is no in between. */
+  if (!ir_row_still_holds(function, out->idx_pos + 1, s, var_side)) {
+    return 0;
+  }
+  out->inv = ir_operand_copy(inv_side);
+  out->var = ir_operand_copy(var_side);
+  return 1;
+}
+
+static int ir_row_match_shape(const IRFunction *function, size_t header,
+                              size_t latch, size_t s, IRRowShape *out) {
+  const IRInstruction *shl = &function->instructions[s];
+  const IRInstruction *idx = NULL;
+  /* A byte array scales by one, so the shift the pattern keys on is not
+   * emitted at all and `m[r + i]` reaches the consumer as the index add
+   * itself. Every string scan in the language has that shape, so the
+   * scale-1 form is matched here with the index add standing in for the
+   * shift and the same gates applied to it. */
+  int scaled = shl->op == IR_OP_BINARY && !shl->is_float && shl->text &&
+               strcmp(shl->text, "<<") == 0 &&
+               shl->rhs.kind == IR_OPERAND_INT && shl->rhs.int_value >= 1 &&
+               shl->rhs.int_value <= 3 && shl->lhs.kind == IR_OPERAND_TEMP &&
+               shl->lhs.name && shl->dest.kind == IR_OPERAND_TEMP &&
+               shl->dest.name;
+  int unscaled = !scaled && shl->op == IR_OP_BINARY && !shl->is_float &&
+                 shl->text && strcmp(shl->text, "+") == 0 &&
+                 shl->dest.kind == IR_OPERAND_TEMP && shl->dest.name;
+
+  if (!scaled && !unscaled) {
+    return 0;
+  }
+  if (snprintf(out->sh_name, sizeof(out->sh_name), "%s", shl->dest.name) >=
+      (int)sizeof(out->sh_name)) {
+    return 0;
+  }
+  out->k = scaled ? shl->rhs.int_value : 0;
+
+  /* Cheap rejection first. Everything below this point walks the loop
+   * (the invariance tests) and then the whole function (the reader
+   * scan), and admitting the scale-1 form means every `+` in every loop
+   * is a candidate. Unless some instruction in this loop already reads
+   * the index as `base + %sh`, there is nothing to rewrite and those
+   * walks would only prove it. The loop body is the smaller thing to
+   * search, so search it first. */
+  if (!ir_row_index_is_read_in_loop(function, s, latch, out->sh_name)) {
+    return 0;
+  }
+
+  /* The shifted value must be `invariant + counter`, defined in-loop. */
+  if (scaled) {
+    idx = ir_row_nearest_def(function, s, header, shl->lhs.name,
+                             &out->idx_pos);
+  } else {
+    idx = shl;
+    out->idx_pos = s;
+  }
+  idx = ir_row_carry_bias(function, header, idx, out);
+  if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||
+      strcmp(idx->text, "+") != 0) {
+    return 0;
+  }
+  return ir_row_pick_sides(function, header, latch, s, idx, out);
+}
+
 int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
   static int g_row_counter;
   if (!function) {
@@ -846,137 +1014,16 @@ int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
       int bad = 0;
 
       {
-        const IRInstruction *shl = &function->instructions[s];
-        /* A byte array scales by one, so the shift the pattern keys on is not
-         * emitted at all and `m[r + i]` reaches the consumer as the index add
-         * itself. Every string scan in the language has that shape, so the
-         * scale-1 form is matched here with the index add standing in for the
-         * shift and the same gates applied to it. */
-        int scaled =
-            shl->op == IR_OP_BINARY && !shl->is_float && shl->text &&
-            strcmp(shl->text, "<<") == 0 && shl->rhs.kind == IR_OPERAND_INT &&
-            shl->rhs.int_value >= 1 && shl->rhs.int_value <= 3 &&
-            shl->lhs.kind == IR_OPERAND_TEMP && shl->lhs.name &&
-            shl->dest.kind == IR_OPERAND_TEMP && shl->dest.name;
-        int unscaled = !scaled && shl->op == IR_OP_BINARY && !shl->is_float &&
-                       shl->text && strcmp(shl->text, "+") == 0 &&
-                       shl->dest.kind == IR_OPERAND_TEMP && shl->dest.name;
-        if (!scaled && !unscaled) {
+        IRRowShape shape = {0};
+        if (!ir_row_match_shape(function, header, latch, s, &shape)) {
           continue;
         }
-        if (snprintf(sh_name, sizeof(sh_name), "%s", shl->dest.name) >=
-            (int)sizeof(sh_name)) {
-          continue;
-        }
-        k = scaled ? shl->rhs.int_value : 0;
-
-        /* Cheap rejection first. Everything below this point walks the loop
-         * (the invariance tests) and then the whole function (the reader
-         * scan), and admitting the scale-1 form means every `+` in every loop
-         * is a candidate. Unless some instruction in this loop already reads
-         * the index as `base + %sh`, there is nothing to rewrite and those
-         * walks would only prove it. The loop body is the smaller thing to
-         * search, so search it first. */
-        {
-          int reachable = 0;
-          for (size_t j = s + 1; j < latch; j++) {
-            const IRInstruction *use = &function->instructions[j];
-            if (use->op == IR_OP_BINARY && !use->is_float && use->text &&
-                strcmp(use->text, "+") == 0 &&
-                use->lhs.kind == IR_OPERAND_SYMBOL && use->lhs.name &&
-                ir_operand_is_temp_named(&use->rhs, sh_name)) {
-              reachable = 1;
-              break;
-            }
-          }
-          if (!reachable) {
-            continue;
-          }
-        }
-
-        /* The shifted value must be `invariant + counter`, defined in-loop. */
-        const IRInstruction *idx = NULL;
-        if (scaled) {
-          for (size_t j = s; j-- > header + 1;) {
-            const IRInstruction *cand = &function->instructions[j];
-            if (ir_instruction_writes_destination(cand) &&
-                cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
-                strcmp(cand->dest.name, shl->lhs.name) == 0) {
-              idx = cand;
-              idx_pos = j;
-              break;
-            }
-          }
-        } else {
-          idx = shl;
-          idx_pos = s;
-        }
-        /* A neighbour reads `m[r + i - 1]`, and the constant lands between
-         * the index add and the shift. It belongs to the fixed half, because
-         * (r + i - c) << k is ((r - c) + i) << k, so it is carried across and
-         * folded into the row pointer rather than refusing the shape. */
-        if (idx && idx->op == IR_OP_BINARY && !idx->is_float && idx->text &&
-            (strcmp(idx->text, "+") == 0 || strcmp(idx->text, "-") == 0) &&
-            idx->rhs.kind == IR_OPERAND_INT &&
-            idx->lhs.kind == IR_OPERAND_TEMP && idx->lhs.name) {
-          const IRInstruction *inner = NULL;
-          for (size_t j = idx_pos; j-- > header + 1;) {
-            const IRInstruction *cand = &function->instructions[j];
-            if (ir_instruction_writes_destination(cand) &&
-                cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
-                strcmp(cand->dest.name, idx->lhs.name) == 0) {
-              inner = cand;
-              if (inner->op == IR_OP_BINARY && !inner->is_float &&
-                  inner->text && strcmp(inner->text, "+") == 0) {
-                bias = strcmp(idx->text, "-") == 0 ? -idx->rhs.int_value
-                                                   : idx->rhs.int_value;
-                idx = inner;
-                idx_pos = j;
-              }
-              break;
-            }
-          }
-        }
-        if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||
-            strcmp(idx->text, "+") != 0) {
-          continue;
-        }
-        int lhs_inv =
-            ir_row_operand_invariant(function, header + 1, latch, &idx->lhs);
-        int rhs_inv =
-            ir_row_operand_invariant(function, header + 1, latch, &idx->rhs);
-        if (lhs_inv == rhs_inv) {
-          continue; /* both fixed is plain LICM; both moving has no hoist. */
-        }
-        const IROperand *inv_side = lhs_inv ? &idx->lhs : &idx->rhs;
-        const IROperand *var_side = lhs_inv ? &idx->rhs : &idx->lhs;
-        if ((var_side->kind != IR_OPERAND_SYMBOL &&
-             var_side->kind != IR_OPERAND_TEMP) ||
-            !var_side->name) {
-          continue;
-        }
-        if (inv_side->kind == IR_OPERAND_INT &&
-            inv_side->int_value + bias == 0) {
-          continue;
-        }
-        /* The moving half must still hold the index add's value at the
-         * shift: nothing may redefine it in between. At scale 1 they are the
-         * same instruction, so there is no in between. */
-        int redefined = 0;
-        for (size_t j = idx_pos + 1; j < s; j++) {
-          const IRInstruction *mid = &function->instructions[j];
-          if (ir_instruction_writes_destination(mid) &&
-              mid->dest.kind == var_side->kind && mid->dest.name &&
-              strcmp(mid->dest.name, var_side->name) == 0) {
-            redefined = 1;
-            break;
-          }
-        }
-        if (redefined) {
-          continue;
-        }
-        inv = ir_operand_copy(inv_side);
-        var = ir_operand_copy(var_side);
+        k = shape.k;
+        bias = shape.bias;
+        idx_pos = shape.idx_pos;
+        memcpy(sh_name, shape.sh_name, sizeof(sh_name));
+        inv = shape.inv;
+        var = shape.var;
       }
 
       /* Every reader of the shifted index, in or out of the loop, must be a

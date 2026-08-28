@@ -67,6 +67,16 @@ static MirHomeForward g_home_fwd;
 
 static void home_fwd_clear(void) { g_home_fwd.valid = 0; }
 
+/* A label emits no bytes, so the code-size invariant cannot see that control
+ * can arrive here from a branch with a different register state. Anything that
+ * transfers control ends a forwarding window. */
+static void home_fwd_note_boundary(MirOpcode op) {
+  if (op == MIR_LABEL || op == MIR_JMP || op == MIR_JCC || op == MIR_CMPBR ||
+      op == MIR_FCMPBR || op == MIR_CALL || op == MIR_RET) {
+    g_home_fwd.valid = 0;
+  }
+}
+
 static void home_fwd_record(const BinaryCodeBuffer *code, int disp,
                             BinaryGpRegister reg) {
   g_home_fwd.valid = 1;
@@ -2561,14 +2571,7 @@ int mir_encode(MirFunction *fn) {
     const MirInst *in = &fn->insns[i];
     int ok = 1;
     size_t annot_off = ctx->code.size;
-    /* A label emits no bytes, so the code-size invariant cannot see that
-     * control can arrive here from a branch with a different register state.
-     * Anything that transfers control ends a forwarding window. */
-    if (in->op == MIR_LABEL || in->op == MIR_JMP || in->op == MIR_JCC ||
-        in->op == MIR_CMPBR || in->op == MIR_FCMPBR || in->op == MIR_CALL ||
-        in->op == MIR_RET) {
-      home_fwd_clear();
-    }
+    home_fwd_note_boundary(in->op);
     if (in->op == MIR_LABEL && align_label && align_label[i]) {
       if (align_label[i] == 2) {
         ctx->wants_wide_loop_alignment = 1;
