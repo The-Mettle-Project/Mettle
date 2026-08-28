@@ -2,6 +2,7 @@ import "std/io";
 import "std/mem";
 import "aac";
 import "aac_tables";
+import "std/math";
 
 const AAC_MAX_WINDOWS = 8;
 const AAC_MAX_SFB = 51;
@@ -73,11 +74,79 @@ struct AacDecoder {
   ms_mask: int32;
   ms_used: int32[408];
 
+  window_long_sine: float64*;
+  window_long_kbd: float64*;
+  window_short_sine: float64*;
+  window_short_kbd: float64*;
+  cos_long: float64*;
+  cos_short: float64*;
+  transform: float64[2048];
+  scratch: float64[2048];
+
   frame_channels: int32;
   fail_stage: int32;
   fail_bits: int64;
   samples: float64[2048];
   error: int32;
+}
+
+fn aac_bessel_i0(x: float64) -> float64 {
+  var sum: float64 = 1.0;
+  var term: float64 = 1.0;
+  for i in 1..32 {
+    var k: float64 = (float64)i;
+    term = term * (x / (2.0 * k)) * (x / (2.0 * k));
+    sum = sum + term;
+  }
+  return sum;
+}
+
+fn aac_build_kbd(window: float64*, count: int32, alpha: float64) {
+  var half: int32 = count / 2;
+  var scratch: float64[1025];
+  var total: float64 = 0.0;
+  var denominator: float64 = aac_bessel_i0(3.14159265358979323846 * alpha);
+  for i in 0..(half + 1) {
+    var ratio: float64 = (float64)(2 * i) / (float64)count - 1.0;
+    var inner: float64 = 1.0 - ratio * ratio;
+    if (inner < 0.0) { inner = 0.0; }
+    scratch[i] = aac_bessel_i0(3.14159265358979323846 * alpha * sqrt(inner)) / denominator;
+  }
+  for i in 0..(half + 1) { total = total + scratch[i]; }
+  var running: float64 = 0.0;
+  for i in 0..half {
+    running = running + scratch[i];
+    window[i] = sqrt(running / total);
+  }
+}
+
+fn aac_build_windows(d: AacDecoder*) {
+  var pi: float64 = 3.14159265358979323846;
+
+  for i in 0..1024 {
+    d->window_long_sine[i] = sin(pi / 2048.0 * ((float64)i + 0.5));
+  }
+  for i in 0..128 {
+    d->window_short_sine[i] = sin(pi / 256.0 * ((float64)i + 0.5));
+  }
+  aac_build_kbd(d->window_long_kbd, 2048, 4.0);
+  aac_build_kbd(d->window_short_kbd, 256, 6.0);
+
+  for i in 0..8192 {
+    d->cos_long[i] = cos(2.0 * pi * (float64)i / 8192.0);
+  }
+  for i in 0..1024 {
+    d->cos_short[i] = cos(2.0 * pi * (float64)i / 1024.0);
+  }
+}
+
+fn aac_window_half(d: AacDecoder*, shape: int32, long_window: int32) -> float64* {
+  if (long_window != 0) {
+    if (shape != 0) { return d->window_long_kbd; }
+    return d->window_long_sine;
+  }
+  if (shape != 0) { return d->window_short_kbd; }
+  return d->window_short_sine;
 }
 
 fn aac_decoder_new(config: AacConfig*) -> AacDecoder* {
@@ -112,6 +181,20 @@ fn aac_decoder_new(config: AacConfig*) -> AacDecoder* {
   aac_fill_swb_short_count(&d->swb_short_count[0]);
   aac_fill_tns_coefficients(d->tns_coefficients);
 
+  d->window_long_sine = malloc(2048 * 8);
+  d->window_long_kbd = malloc(2048 * 8);
+  d->window_short_sine = malloc(256 * 8);
+  d->window_short_kbd = malloc(256 * 8);
+  d->cos_long = malloc(8192 * 8);
+  d->cos_short = malloc(1024 * 8);
+  if (d->window_long_sine == 0 || d->window_long_kbd == 0 ||
+      d->window_short_sine == 0 || d->window_short_kbd == 0 ||
+      d->cos_long == 0 || d->cos_short == 0) {
+    aac_decoder_free(d);
+    return 0;
+  }
+  aac_build_windows(d);
+
   for book in 0..AAC_BOOK_COUNT {
     var base: int32 = book * 24;
     for i in 0..24 {
@@ -141,6 +224,12 @@ fn aac_decoder_free(d: AacDecoder*) {
   if (d->swb_long != 0) { free(d->swb_long); }
   if (d->swb_short != 0) { free(d->swb_short); }
   if (d->tns_coefficients != 0) { free(d->tns_coefficients); }
+  if (d->window_long_sine != 0) { free(d->window_long_sine); }
+  if (d->window_long_kbd != 0) { free(d->window_long_kbd); }
+  if (d->window_short_sine != 0) { free(d->window_short_sine); }
+  if (d->window_short_kbd != 0) { free(d->window_short_kbd); }
+  if (d->cos_long != 0) { free(d->cos_long); }
+  if (d->cos_short != 0) { free(d->cos_short); }
   free(d);
 }
 
@@ -551,5 +640,227 @@ fn aac_decode_frame(d: AacDecoder*, data: uint8*, size: int64) -> int32 {
     d->fail_bits = r.position;
     return AAC_ERR_BITSTREAM;
   }
+  return AAC_OK;
+}
+
+var g_aac_use_tns: int32 = 1;
+
+fn aac_dequantize(d: AacDecoder*, c: AacChannel*) {
+  var group_start: int32 = 0;
+  for g in 0..c->num_groups {
+    var span: int32 = c->group_length[g];
+    for sfb in 0..c->max_sfb {
+      var book: int32 = c->sfb_codebook[g * AAC_MAX_SFB + sfb];
+      if (book == AAC_HCB_ZERO || book == AAC_HCB_NOISE ||
+          book == AAC_HCB_INTENSITY || book == AAC_HCB_INTENSITY2) {
+        continue;
+      }
+      var scale: int32 = c->scale_factor[g * AAC_MAX_SFB + sfb];
+      var gain: float64 = pow(2.0, 0.25 * (float64)(scale - 100));
+      var low: int32 = c->swb_offset[sfb];
+      var high: int32 = c->swb_offset[sfb + 1];
+      for w in 0..span {
+        var base: int32 = (group_start + w) * 128;
+        if (c->window_sequence != AAC_WINDOW_SHORT) { base = 0; }
+        for k in low..high {
+          var value: float64 = c->spectrum[base + k];
+          if (value == 0.0) { continue; }
+          var magnitude: float64 = fabs(value);
+          var scaled: float64 = pow(magnitude, 4.0 / 3.0) * gain;
+          if (value < 0.0) { scaled = 0.0 - scaled; }
+          c->spectrum[base + k] = scaled;
+        }
+      }
+    }
+    group_start = group_start + span;
+  }
+}
+
+fn aac_apply_ms(d: AacDecoder*) {
+  if (d->ms_mask == 0 || d->frame_channels < 2) { return; }
+  var left: AacChannel* = &d->channels[0];
+  var right: AacChannel* = &d->channels[1];
+
+  var group_start: int32 = 0;
+  for g in 0..left->num_groups {
+    var span: int32 = left->group_length[g];
+    for sfb in 0..left->max_sfb {
+      if (d->ms_used[g * AAC_MAX_SFB + sfb] == 0) { continue; }
+      var book: int32 = right->sfb_codebook[g * AAC_MAX_SFB + sfb];
+      if (book == AAC_HCB_INTENSITY || book == AAC_HCB_INTENSITY2) { continue; }
+      var low: int32 = left->swb_offset[sfb];
+      var high: int32 = left->swb_offset[sfb + 1];
+      for w in 0..span {
+        var base: int32 = (group_start + w) * 128;
+        if (left->window_sequence != AAC_WINDOW_SHORT) { base = 0; }
+        for k in low..high {
+          var a: float64 = left->spectrum[base + k];
+          var b: float64 = right->spectrum[base + k];
+          left->spectrum[base + k] = a + b;
+          right->spectrum[base + k] = a - b;
+        }
+      }
+    }
+    group_start = group_start + span;
+  }
+}
+
+fn aac_tns_band_limit(c: AacChannel*, window: int32, filter: int32, out_start: int32*,
+                      out_end: int32*) {
+  var slot: int32 = window * 3 + filter;
+  var top: int32 = c->num_swb;
+  for f in 0..filter { top = top - c->tns_length[window * 3 + f]; }
+  var bottom: int32 = top - c->tns_length[slot];
+  if (bottom < 0) { bottom = 0; }
+  if (top > c->max_sfb) { top = c->max_sfb; }
+  if (bottom > top) { bottom = top; }
+  *out_start = c->swb_offset[bottom];
+  *out_end = c->swb_offset[top];
+}
+
+fn aac_apply_tns(d: AacDecoder*, c: AacChannel*) {
+  if (c->tns_present == 0) { return; }
+  var size: int32 = 1024;
+  if (c->window_sequence == AAC_WINDOW_SHORT) { size = 128; }
+
+  for w in 0..c->num_windows {
+    var filters: int32 = c->tns_filters[w];
+    for f in 0..filters {
+      var slot: int32 = w * 3 + f;
+      var order: int32 = c->tns_order[slot];
+      if (order == 0) { continue; }
+
+      var start: int32 = 0;
+      var end: int32 = 0;
+      aac_tns_band_limit(c, w, f, &start, &end);
+      if (end > size) { end = size; }
+      var span: int32 = end - start;
+      if (span <= 0) { continue; }
+
+      var lpc: float64[21];
+      var work: float64[21];
+      lpc[0] = 1.0;
+      for m in 1..(order + 1) {
+        var coefficient: float64 = c->tns_coefficient[slot * 20 + m - 1];
+        for i in 1..m { work[i] = lpc[i] + coefficient * lpc[m - i]; }
+        for i in 1..m { lpc[i] = work[i]; }
+        lpc[m] = coefficient;
+      }
+
+      var base: int32 = w * 128;
+      if (c->window_sequence != AAC_WINDOW_SHORT) { base = 0; }
+
+      if (c->tns_direction[slot] != 0) {
+        var index: int32 = end - 1;
+        for i in 0..span {
+          var sum: float64 = c->spectrum[base + index];
+          for m in 1..(order + 1) {
+            if (i - m >= 0) { sum = sum - lpc[m] * c->spectrum[base + index + m]; }
+          }
+          c->spectrum[base + index] = sum;
+          index = index - 1;
+        }
+      } else {
+        var index: int32 = start;
+        for i in 0..span {
+          var sum: float64 = c->spectrum[base + index];
+          for m in 1..(order + 1) {
+            if (i - m >= 0) { sum = sum - lpc[m] * c->spectrum[base + index - m]; }
+          }
+          c->spectrum[base + index] = sum;
+          index = index + 1;
+        }
+      }
+    }
+  }
+}
+
+fn aac_imdct(d: AacDecoder*, input: float64*, output: float64*, size: int32) {
+  var half: int32 = size / 2;
+  var mask: int32 = size * 4 - 1;
+  var table: float64* = d->cos_long;
+  if (size == 256) { table = d->cos_short; }
+
+  var quarter: int32 = size / 2;
+  for n in 0..size {
+    var total: float64 = 0.0;
+    var step: int32 = (2 * n + 1 + quarter) & mask;
+    var phase: int32 = step;
+    for k in 0..half {
+      total = total + input[k] * table[phase];
+      phase = (phase + 2 * step) & mask;
+    }
+    output[n] = total * (2.0 / (float64)size);
+  }
+}
+
+fn aac_filterbank(d: AacDecoder*, c: AacChannel*, output: float64*) {
+  var previous: float64* = aac_window_half(d, c->previous_window_shape, 1);
+  var current: float64* = aac_window_half(d, c->window_shape, 1);
+  var previous_short: float64* = aac_window_half(d, c->previous_window_shape, 0);
+  var current_short: float64* = aac_window_half(d, c->window_shape, 0);
+
+  var transform: float64* = &d->transform[0];
+
+  if (c->window_sequence == AAC_WINDOW_SHORT) {
+    var accumulated: float64[2048];
+    for i in 0..2048 { accumulated[i] = 0.0; }
+    for w in 0..8 {
+      aac_imdct(d, &c->spectrum[w * 128], transform, 256);
+      var offset: int32 = 448 + w * 128;
+      var left: float64* = previous_short;
+      if (w > 0) { left = current_short; }
+      for i in 0..128 {
+        accumulated[offset + i] = accumulated[offset + i] + transform[i] * left[i];
+      }
+      for i in 0..128 {
+        accumulated[offset + 128 + i] =
+          accumulated[offset + 128 + i] + transform[128 + i] * current_short[127 - i];
+      }
+    }
+    for i in 0..1024 { output[i] = c->overlap[i] + accumulated[i]; }
+    for i in 0..1024 { c->overlap[i] = accumulated[1024 + i]; }
+  } else {
+    aac_imdct(d, &c->spectrum[0], transform, 2048);
+    var left: float64[1024];
+    var right: float64[1024];
+
+    if (c->window_sequence == AAC_WINDOW_STOP) {
+      for i in 0..448 { left[i] = 0.0; }
+      for i in 0..128 { left[448 + i] = previous_short[i]; }
+      for i in 0..448 { left[576 + i] = 1.0; }
+    } else {
+      for i in 0..1024 { left[i] = previous[i]; }
+    }
+
+    if (c->window_sequence == AAC_WINDOW_START) {
+      for i in 0..448 { right[i] = 1.0; }
+      for i in 0..128 { right[448 + i] = current_short[127 - i]; }
+      for i in 0..448 { right[576 + i] = 0.0; }
+    } else {
+      for i in 0..1024 { right[i] = current[1023 - i]; }
+    }
+
+    for i in 0..1024 { output[i] = c->overlap[i] + transform[i] * left[i]; }
+    for i in 0..1024 { c->overlap[i] = transform[1024 + i] * right[i]; }
+  }
+  c->previous_window_shape = c->window_shape;
+}
+
+fn aac_reconstruct(d: AacDecoder*, output: float64*) {
+  for ch in 0..d->frame_channels {
+    aac_dequantize(d, &d->channels[ch]);
+  }
+  aac_apply_ms(d);
+  for ch in 0..d->frame_channels {
+    if (g_aac_use_tns != 0) { aac_apply_tns(d, &d->channels[ch]); }
+    aac_filterbank(d, &d->channels[ch], &output[ch * 1024]);
+  }
+}
+
+fn aac_decode_pcm(d: AacDecoder*, data: uint8*, size: int64, output: float64*) -> int32 {
+  var status: int32 = aac_decode_frame(d, data, size);
+  if (status != AAC_OK) { return status; }
+  aac_reconstruct(d, output);
   return AAC_OK;
 }

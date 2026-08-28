@@ -1,5 +1,6 @@
 import "std/ui";
 import "std/io";
+import "std/math";
 import "std/mem";
 import "jpeg";
 import "source";

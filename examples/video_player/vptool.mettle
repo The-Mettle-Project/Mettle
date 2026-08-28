@@ -1,4 +1,5 @@
 import "std/io";
+import "std/math";
 import "std/mem";
 import "jpeg";
 import "source";
@@ -529,6 +530,68 @@ fn command_h264dump(path: cstring, frame_limit: int32, output: cstring, skip_fil
   return 0;
 }
 
+var g_pcm_scale: float64 = 1.0;
+
+fn command_aacwav(path: cstring, frame_limit: int32, output: cstring) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) { return 1; }
+  defer source_close(file);
+  if (file->audio_codec != SOURCE_AUDIO_AAC) { println("not AAC"); return 1; }
+
+  var config: AacConfig;
+  if (aac_read_config(&config, file->audio_config, file->audio_config_size) != AAC_OK) {
+    println("config parse failed");
+    return 1;
+  }
+  var decoder: AacDecoder* = aac_decoder_new(&config);
+  if (decoder == 0) { return 1; }
+  defer aac_decoder_free(decoder);
+
+  var buffer: uint8* = malloc((int64)file->max_audio_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  var limit: int32 = frame_limit;
+  if (limit > file->audio_frame_count) { limit = file->audio_frame_count; }
+
+  var fp: cstring = fopen(output, "wb");
+  if (fp == 0) { println("cannot open output"); return 1; }
+  defer fclose(fp);
+
+  var pcm: float64* = malloc(2048 * 8);
+  if (pcm == 0) { return 1; }
+  defer free(pcm);
+
+  var written: int32 = 0;
+  for i in 0..limit {
+    var size: int32 = source_read_audio(file, i, buffer, (int64)file->max_audio_size);
+    if (size <= 0) { break; }
+    if (aac_decode_pcm(decoder, buffer, (int64)size, pcm) != AAC_OK) {
+      println("frame {i}: decode failed");
+      return 1;
+    }
+    var channels: int32 = decoder->frame_channels;
+    var samples: uint8[4096];
+    var at: int32 = 0;
+    for n in 0..1024 {
+      for ch in 0..channels {
+        var value: float64 = pcm[ch * 1024 + n] * g_pcm_scale;
+        var scaled: int32 = (int32)(value * 32768.0);
+        if (scaled > 32767) { scaled = 32767; }
+        if (scaled < -32768) { scaled = -32768; }
+        samples[at] = (uint8)(scaled & 255);
+        samples[at + 1] = (uint8)((scaled >> 8) & 255);
+        at = at + 2;
+      }
+    }
+    fwrite(&samples[0], 1, (int64)at, fp);
+    written = written + 1;
+  }
+  println("wrote {written} frames of raw 16 bit PCM");
+  return 0;
+}
+
 fn command_aacparse(path: cstring, frame_limit: int32) -> int32 {
   var status: int32 = 0;
   var file: MediaSource* = source_open(path, &status);
@@ -984,6 +1047,11 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   }
   if (cstring_equals(command, "h264rgb") != 0 && argc >= 5) {
     return command_h264rgb(argv[2], parse_int(argv[3]), argv[4]);
+  }
+  if (cstring_equals(command, "aacwav") != 0 && argc >= 5) {
+    if (argc >= 6) { g_pcm_scale = 1.0 / (float64)parse_int(argv[5]); }
+    if (argc >= 7) { g_aac_use_tns = 0; }
+    return command_aacwav(argv[2], parse_int(argv[3]), argv[4]);
   }
   if (cstring_equals(command, "aacparse") != 0 && argc >= 3) {
     var parse_limit: int32 = 1000000;
