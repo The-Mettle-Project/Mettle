@@ -1,0 +1,282 @@
+import "h264_decode";
+
+fn h264_clip3(value: int32, low: int32, high: int32) -> int32 {
+  if (value < low) { return low; }
+  if (value > high) { return high; }
+  return value;
+}
+
+fn h264_boundary_strength(v: H264Video*, current: int32, neighbour: int32,
+                          current_block: int32, neighbour_block: int32,
+                          mb_edge: int32) -> int32 {
+  var a: H264Macroblock* = &v->macroblocks[current];
+  var b: H264Macroblock* = &v->macroblocks[neighbour];
+  if (mb_edge != 0) { return 4; }
+  if (a->kind == H264_MB_I_NXN || a->kind == H264_MB_I_16X16) { return 3; }
+  if (b->kind == H264_MB_I_NXN || b->kind == H264_MB_I_16X16) { return 3; }
+  if (a->luma_nonzero[current_block] != (uint8)0) { return 2; }
+  if (b->luma_nonzero[neighbour_block] != (uint8)0) { return 2; }
+  return 0;
+}
+
+fn h264_filter_luma_line(v: H264Video*, plane: uint8*, base: int64, step: int64,
+                         strength: int32, alpha: int32, beta: int32, tc0: int32) {
+  var p0: int32 = (int32)plane[base - step];
+  var p1: int32 = (int32)plane[base - step * (int64)2];
+  var p2: int32 = (int32)plane[base - step * (int64)3];
+  var p3: int32 = (int32)plane[base - step * (int64)4];
+  var q0: int32 = (int32)plane[base];
+  var q1: int32 = (int32)plane[base + step];
+  var q2: int32 = (int32)plane[base + step * (int64)2];
+  var q3: int32 = (int32)plane[base + step * (int64)3];
+
+  var difference: int32 = p0 - q0;
+  if (difference < 0) { difference = 0 - difference; }
+  if (difference >= alpha) { return; }
+  var edge_p: int32 = p1 - p0;
+  if (edge_p < 0) { edge_p = 0 - edge_p; }
+  if (edge_p >= beta) { return; }
+  var edge_q: int32 = q1 - q0;
+  if (edge_q < 0) { edge_q = 0 - edge_q; }
+  if (edge_q >= beta) { return; }
+
+  var ap: int32 = p2 - p0;
+  if (ap < 0) { ap = 0 - ap; }
+  var aq: int32 = q2 - q0;
+  if (aq < 0) { aq = 0 - aq; }
+
+  if (strength < 4) {
+    var tc: int32 = tc0;
+    if (ap < beta) { tc = tc + 1; }
+    if (aq < beta) { tc = tc + 1; }
+    var delta: int32 = h264_clip3((((q0 - p0) * 4) + (p1 - q1) + 4) >> 3, 0 - tc, tc);
+    plane[base - step] = h264_clip_sample(p0 + delta);
+    plane[base] = h264_clip_sample(q0 - delta);
+    if (ap < beta) {
+      plane[base - step * (int64)2] =
+        (uint8)(p1 + h264_clip3((p2 + ((p0 + q0 + 1) >> 1) - (p1 * 2)) >> 1, 0 - tc0, tc0));
+    }
+    if (aq < beta) {
+      plane[base + step] =
+        (uint8)(q1 + h264_clip3((q2 + ((p0 + q0 + 1) >> 1) - (q1 * 2)) >> 1, 0 - tc0, tc0));
+    }
+    return;
+  }
+
+  var narrow: int32 = (alpha >> 2) + 2;
+  if (ap < beta && difference < narrow) {
+    plane[base - step] = (uint8)((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+    plane[base - step * (int64)2] = (uint8)((p2 + p1 + p0 + q0 + 2) >> 2);
+    plane[base - step * (int64)3] = (uint8)((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+  } else {
+    plane[base - step] = (uint8)((2 * p1 + p0 + q1 + 2) >> 2);
+  }
+  if (aq < beta && difference < narrow) {
+    plane[base] = (uint8)((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) >> 3);
+    plane[base + step] = (uint8)((q2 + q1 + q0 + p0 + 2) >> 2);
+    plane[base + step * (int64)2] = (uint8)((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
+  } else {
+    plane[base] = (uint8)((2 * q1 + q0 + p1 + 2) >> 2);
+  }
+}
+
+fn h264_filter_chroma_line(v: H264Video*, plane: uint8*, base: int64, step: int64,
+                           strength: int32, alpha: int32, beta: int32, tc0: int32) {
+  var p0: int32 = (int32)plane[base - step];
+  var p1: int32 = (int32)plane[base - step * (int64)2];
+  var q0: int32 = (int32)plane[base];
+  var q1: int32 = (int32)plane[base + step];
+
+  var difference: int32 = p0 - q0;
+  if (difference < 0) { difference = 0 - difference; }
+  if (difference >= alpha) { return; }
+  var edge_p: int32 = p1 - p0;
+  if (edge_p < 0) { edge_p = 0 - edge_p; }
+  if (edge_p >= beta) { return; }
+  var edge_q: int32 = q1 - q0;
+  if (edge_q < 0) { edge_q = 0 - edge_q; }
+  if (edge_q >= beta) { return; }
+
+  if (strength < 4) {
+    var tc: int32 = tc0 + 1;
+    var delta: int32 = h264_clip3((((q0 - p0) * 4) + (p1 - q1) + 4) >> 3, 0 - tc, tc);
+    plane[base - step] = h264_clip_sample(p0 + delta);
+    plane[base] = h264_clip_sample(q0 - delta);
+    return;
+  }
+  plane[base - step] = (uint8)((2 * p1 + p0 + q1 + 2) >> 2);
+  plane[base] = (uint8)((2 * q1 + q0 + p1 + 2) >> 2);
+}
+
+fn h264_edge_thresholds(v: H264Video*, qp_a: int32, qp_b: int32,
+                        out_alpha: int32*, out_beta: int32*, out_tc: int32*, strength: int32) {
+  var average: int32 = (qp_a + qp_b + 1) >> 1;
+  var index_a: int32 = h264_clip3(average + v->alpha_offset, 0, 51);
+  var index_b: int32 = h264_clip3(average + v->beta_offset, 0, 51);
+  *out_alpha = v->deblock_alpha[index_a];
+  *out_beta = v->deblock_beta[index_b];
+  if (strength > 0 && strength < 4) {
+    *out_tc = v->deblock_tc[index_a * 3 + strength - 1];
+  } else {
+    *out_tc = 0;
+  }
+}
+
+fn h264_deblock_vertical_luma(v: H264Video*, mb_x: int32, mb_y: int32, edge: int32) {
+  var current: int32 = mb_y * v->mb_width + mb_x;
+  var mb_edge: int32 = 0;
+  var neighbour: int32 = current;
+  if (edge == 0) {
+    mb_edge = 1;
+    neighbour = current - 1;
+  }
+  var x: int32 = mb_x * 16 + edge * 4;
+
+  for row in 0..16 {
+    var y: int32 = mb_y * 16 + row;
+    var current_block: int32 = (row >> 2) * 4 + edge;
+    var neighbour_block: int32 = current_block - 1;
+    if (edge == 0) { neighbour_block = (row >> 2) * 4 + 3; }
+
+    var strength: int32 = h264_boundary_strength(v, current, neighbour, current_block, neighbour_block, mb_edge);
+    if (strength == 0) { continue; }
+
+    var alpha: int32 = 0;
+    var beta: int32 = 0;
+    var tc: int32 = 0;
+    h264_edge_thresholds(v, v->macroblocks[current].qp, v->macroblocks[neighbour].qp,
+                         &alpha, &beta, &tc, strength);
+    if (alpha == 0) { continue; }
+    h264_filter_luma_line(v, v->luma, (int64)y * (int64)v->luma_stride + (int64)x, 1,
+                          strength, alpha, beta, tc);
+  }
+}
+
+fn h264_deblock_horizontal_luma(v: H264Video*, mb_x: int32, mb_y: int32, edge: int32) {
+  var current: int32 = mb_y * v->mb_width + mb_x;
+  var mb_edge: int32 = 0;
+  var neighbour: int32 = current;
+  if (edge == 0) {
+    mb_edge = 1;
+    neighbour = current - v->mb_width;
+  }
+  var y: int32 = mb_y * 16 + edge * 4;
+
+  for column in 0..16 {
+    var x: int32 = mb_x * 16 + column;
+    var current_block: int32 = edge * 4 + (column >> 2);
+    var neighbour_block: int32 = current_block - 4;
+    if (edge == 0) { neighbour_block = 3 * 4 + (column >> 2); }
+
+    var strength: int32 = h264_boundary_strength(v, current, neighbour, current_block, neighbour_block, mb_edge);
+    if (strength == 0) { continue; }
+
+    var alpha: int32 = 0;
+    var beta: int32 = 0;
+    var tc: int32 = 0;
+    h264_edge_thresholds(v, v->macroblocks[current].qp, v->macroblocks[neighbour].qp,
+                         &alpha, &beta, &tc, strength);
+    if (alpha == 0) { continue; }
+    h264_filter_luma_line(v, v->luma, (int64)y * (int64)v->luma_stride + (int64)x,
+                          (int64)v->luma_stride, strength, alpha, beta, tc);
+  }
+}
+
+fn h264_deblock_vertical_chroma(v: H264Video*, mb_x: int32, mb_y: int32, edge: int32) {
+  var current: int32 = mb_y * v->mb_width + mb_x;
+  var mb_edge: int32 = 0;
+  var neighbour: int32 = current;
+  var luma_edge: int32 = edge * 2;
+  if (edge == 0) {
+    mb_edge = 1;
+    neighbour = current - 1;
+  }
+  var x: int32 = mb_x * 8 + edge * 4;
+
+  for row in 0..8 {
+    var y: int32 = mb_y * 8 + row;
+    var luma_row: int32 = row * 2;
+    var current_block: int32 = (luma_row >> 2) * 4 + luma_edge;
+    var neighbour_block: int32 = current_block - 1;
+    if (edge == 0) { neighbour_block = (luma_row >> 2) * 4 + 3; }
+
+    var strength: int32 = h264_boundary_strength(v, current, neighbour, current_block, neighbour_block, mb_edge);
+    if (strength == 0) { continue; }
+
+    for component in 0..2 {
+      var plane: uint8* = v->cb;
+      if (component == 1) { plane = v->cr; }
+      var qp_a: int32 = h264_chroma_qp(v, v->macroblocks[current].qp, v->chroma_offset[component]);
+      var qp_b: int32 = h264_chroma_qp(v, v->macroblocks[neighbour].qp, v->chroma_offset[component]);
+      var alpha: int32 = 0;
+      var beta: int32 = 0;
+      var tc: int32 = 0;
+      h264_edge_thresholds(v, qp_a, qp_b, &alpha, &beta, &tc, strength);
+      if (alpha == 0) { continue; }
+      h264_filter_chroma_line(v, plane, (int64)y * (int64)v->chroma_stride + (int64)x, 1,
+                              strength, alpha, beta, tc);
+    }
+  }
+}
+
+fn h264_deblock_horizontal_chroma(v: H264Video*, mb_x: int32, mb_y: int32, edge: int32) {
+  var current: int32 = mb_y * v->mb_width + mb_x;
+  var mb_edge: int32 = 0;
+  var neighbour: int32 = current;
+  var luma_edge: int32 = edge * 2;
+  if (edge == 0) {
+    mb_edge = 1;
+    neighbour = current - v->mb_width;
+  }
+  var y: int32 = mb_y * 8 + edge * 4;
+
+  for column in 0..8 {
+    var x: int32 = mb_x * 8 + column;
+    var luma_column: int32 = column * 2;
+    var current_block: int32 = luma_edge * 4 + (luma_column >> 2);
+    var neighbour_block: int32 = current_block - 4;
+    if (edge == 0) { neighbour_block = 3 * 4 + (luma_column >> 2); }
+
+    var strength: int32 = h264_boundary_strength(v, current, neighbour, current_block, neighbour_block, mb_edge);
+    if (strength == 0) { continue; }
+
+    for component in 0..2 {
+      var plane: uint8* = v->cb;
+      if (component == 1) { plane = v->cr; }
+      var qp_a: int32 = h264_chroma_qp(v, v->macroblocks[current].qp, v->chroma_offset[component]);
+      var qp_b: int32 = h264_chroma_qp(v, v->macroblocks[neighbour].qp, v->chroma_offset[component]);
+      var alpha: int32 = 0;
+      var beta: int32 = 0;
+      var tc: int32 = 0;
+      h264_edge_thresholds(v, qp_a, qp_b, &alpha, &beta, &tc, strength);
+      if (alpha == 0) { continue; }
+      h264_filter_chroma_line(v, plane, (int64)y * (int64)v->chroma_stride + (int64)x,
+                              (int64)v->chroma_stride, strength, alpha, beta, tc);
+    }
+  }
+}
+
+fn h264_deblock_picture(v: H264Video*) {
+  if (v->disable_deblocking == 1) { return; }
+
+  for mb_y in 0..v->mb_height {
+    for mb_x in 0..v->mb_width {
+      for edge in 0..4 {
+        if (edge == 0 && mb_x == 0) { continue; }
+        h264_deblock_vertical_luma(v, mb_x, mb_y, edge);
+      }
+      for edge in 0..2 {
+        if (edge == 0 && mb_x == 0) { continue; }
+        h264_deblock_vertical_chroma(v, mb_x, mb_y, edge);
+      }
+      for edge in 0..4 {
+        if (edge == 0 && mb_y == 0) { continue; }
+        h264_deblock_horizontal_luma(v, mb_x, mb_y, edge);
+      }
+      for edge in 0..2 {
+        if (edge == 0 && mb_y == 0) { continue; }
+        h264_deblock_horizontal_chroma(v, mb_x, mb_y, edge);
+      }
+    }
+  }
+}

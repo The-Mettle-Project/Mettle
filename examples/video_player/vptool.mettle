@@ -5,6 +5,8 @@ import "source";
 import "audio";
 import "mp4";
 import "h264";
+import "h264_decode";
+import "h264_frame";
 
 extern fn Win_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
 extern fn Win_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
@@ -408,6 +410,73 @@ fn command_h264info(path: cstring, sample_limit: int32, print_limit: int32) -> i
   return 0;
 }
 
+fn command_h264dump(path: cstring, frame_limit: int32, output: cstring) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) {
+    println("cannot open file, status {status}");
+    return 1;
+  }
+  defer source_close(file);
+
+  if (file->video_codec != SOURCE_VIDEO_H264) {
+    println("video track is not H.264");
+    return 1;
+  }
+
+  var parser: H264Decoder* = h264_decoder_new();
+  if (parser == 0) { return 1; }
+  defer h264_decoder_free(parser);
+  if (h264_read_config(parser, file->codec_config, file->codec_config_size) != H264_OK) {
+    println("avcC parse failed");
+    return 1;
+  }
+
+  var video: H264Video* = h264_video_new(parser);
+  if (video == 0) { return 1; }
+  defer h264_video_free(video);
+
+  var buffer: uint8* = malloc((int64)file->max_video_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  var fp: cstring = fopen(output, "wb");
+  if (fp == 0) {
+    println("cannot open output");
+    return 1;
+  }
+  defer fclose(fp);
+
+  var limit: int32 = frame_limit;
+  if (limit > file->video_frame_count) { limit = file->video_frame_count; }
+  var written: int32 = 0;
+
+  for i in 0..limit {
+    var size: int32 = source_read_video(file, i, buffer, (int64)file->max_video_size);
+    if (size <= 0) {
+      println("frame {i}: unreadable");
+      return 1;
+    }
+    var decode_status: int32 = h264_decode_sample(video, buffer, (int64)size);
+    if (decode_status != H264_OK) {
+      println("frame {i}: decode status {decode_status}");
+      return 1;
+    }
+    for y in 0..video->height {
+      fwrite(&video->luma[(int64)(y + video->crop_top) * (int64)video->luma_stride + (int64)video->crop_left], 1, (int64)video->width, fp);
+    }
+    for y in 0..(video->height / 2) {
+      fwrite(&video->cb[(int64)(y + video->crop_top / 2) * (int64)video->chroma_stride + (int64)(video->crop_left / 2)], 1, (int64)(video->width / 2), fp);
+    }
+    for y in 0..(video->height / 2) {
+      fwrite(&video->cr[(int64)(y + video->crop_top / 2) * (int64)video->chroma_stride + (int64)(video->crop_left / 2)], 1, (int64)(video->width / 2), fp);
+    }
+    written = written + 1;
+  }
+  println("decoded {written} frames, {video->width}x{video->height}");
+  return 0;
+}
+
 fn parse_int(text: cstring) -> int32 {
   var value: int32 = 0;
   var i: int64 = 0;
@@ -426,6 +495,7 @@ fn print_usage() {
   println("  vptool jpeg  <input.jpg> <output.ppm>");
   println("  vptool audio <input> [seconds]");
   println("  vptool h264info <input.mp4> [samples]");
+  println("  vptool h264dump <input.mp4> <frames> <out.yuv>");
   println("  vptool mp4info <input.mp4>");
   println("  vptool mp4samples <input.mp4> <track> <count>");
 }
@@ -447,6 +517,9 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   }
   if (cstring_equals(command, "bench") != 0) {
     return command_bench(argv[2]);
+  }
+  if (cstring_equals(command, "h264dump") != 0 && argc >= 5) {
+    return command_h264dump(argv[2], parse_int(argv[3]), argv[4]);
   }
   if (cstring_equals(command, "h264info") != 0) {
     var limit: int32 = 200;

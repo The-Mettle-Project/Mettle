@@ -115,6 +115,8 @@ struct H264SliceHeader {
   nal_ref_idc: int32;
   nal_unit_type: int32;
   is_idr: int32;
+  data_bit_offset: int64;
+  rbsp_size: int64;
 }
 
 struct H264Decoder {
@@ -605,6 +607,8 @@ fn h264_parse_slice_header(d: H264Decoder*, data: uint8*, size: int64, header: H
   }
 
   if (r.overrun != 0) { return H264_ERR_BITSTREAM; }
+  header->data_bit_offset = r.position;
+  header->rbsp_size = length;
   return H264_OK;
 }
 

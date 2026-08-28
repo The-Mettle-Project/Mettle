@@ -1,0 +1,254 @@
+import "std/mem";
+import "h264";
+import "h264_decode";
+import "h264_predict";
+import "h264_deblock";
+
+fn h264_store_prediction(v: H264Video*, x: int32, y: int32, prediction: int32*) {
+  for row in 0..4 {
+    var base: int64 = (int64)(y + row) * (int64)v->luma_stride + (int64)x;
+    for column in 0..4 {
+      v->luma[base + (int64)column] = h264_clip_sample(prediction[row * 4 + column]);
+    }
+  }
+}
+
+fn h264_store_prediction_with_residual(v: H264Video*, x: int32, y: int32,
+                                       prediction: int32*, residual: int32*) {
+  for row in 0..4 {
+    var base: int64 = (int64)(y + row) * (int64)v->luma_stride + (int64)x;
+    for column in 0..4 {
+      v->luma[base + (int64)column] =
+        h264_clip_sample(prediction[row * 4 + column] + residual[row * 4 + column]);
+    }
+  }
+}
+
+fn h264_reconstruct_intra_nxn(v: H264Video*, mb: H264Macroblock*) {
+  var prediction: int32[16];
+  var scaled: int32[16];
+  var residual: int32[16];
+
+  for blk in 0..16 {
+    var raster: int32 = v->blk_raster[blk];
+    var x: int32 = v->mb_x * 16 + (raster & 3) * 4;
+    var y: int32 = v->mb_y * 16 + (raster >> 2) * 4;
+    h264_predict_intra4x4(v, blk, (int32)mb->intra4x4_modes[raster], &prediction[0]);
+
+    if (mb->luma_nonzero[raster] != (uint8)0) {
+      h264_scale_block(v, &v->luma_ac[blk * 16], &scaled[0], mb->qp, 0);
+      h264_inverse_transform_4x4(v, &scaled[0], &residual[0]);
+      h264_store_prediction_with_residual(v, x, y, &prediction[0], &residual[0]);
+    } else {
+      h264_store_prediction(v, x, y, &prediction[0]);
+    }
+  }
+}
+
+fn h264_reconstruct_intra_16x16(v: H264Video*, mb: H264Macroblock*) {
+  h264_predict_intra16x16(v, mb->intra16x16_mode);
+
+  var dc: int32[16];
+  h264_luma_dc_transform(v, mb->qp, &dc[0]);
+
+  var scaled: int32[16];
+  var residual: int32[16];
+  for blk in 0..16 {
+    var raster: int32 = v->blk_raster[blk];
+    var x: int32 = v->mb_x * 16 + (raster & 3) * 4;
+    var y: int32 = v->mb_y * 16 + (raster >> 2) * 4;
+    h264_scale_ac_block(v, &v->luma_ac[blk * 16], &scaled[0], mb->qp);
+    scaled[0] = dc[raster];
+    h264_inverse_transform_4x4(v, &scaled[0], &residual[0]);
+    h264_add_residual(v->luma, v->luma_stride, x, y, &residual[0]);
+  }
+}
+
+fn h264_reconstruct_chroma(v: H264Video*, mb: H264Macroblock*, pps: H264Pps*) {
+  h264_predict_chroma(v, v->cb, mb->chroma_mode);
+  h264_predict_chroma(v, v->cr, mb->chroma_mode);
+  if (mb->cbp_chroma == 0) { return; }
+
+  var scaled: int32[16];
+  var residual: int32[16];
+  var dc: int32[4];
+
+  for component in 0..2 {
+    var offset: int32 = pps->chroma_qp_index_offset;
+    if (component == 1) { offset = pps->second_chroma_qp_index_offset; }
+    var qp: int32 = h264_chroma_qp(v, mb->qp, offset);
+    h264_chroma_dc_transform(v, component, qp, &dc[0]);
+
+    var plane: uint8* = v->cb;
+    if (component == 1) { plane = v->cr; }
+
+    for blk in 0..4 {
+      var x: int32 = v->mb_x * 8 + (blk & 1) * 4;
+      var y: int32 = v->mb_y * 8 + (blk >> 1) * 4;
+      h264_scale_ac_block(v, &v->chroma_ac[(component * 4 + blk) * 16], &scaled[0], qp);
+      scaled[0] = dc[blk];
+      h264_inverse_transform_4x4(v, &scaled[0], &residual[0]);
+      h264_add_residual(plane, v->chroma_stride, x, y, &residual[0]);
+    }
+  }
+}
+
+fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*) -> int32 {
+  var mb: H264Macroblock* = &v->macroblocks[v->mb_index];
+  memset(mb, 0, sizeof(H264Macroblock));
+  mb->coded = 1;
+
+  var cbp_luma: int32 = 0;
+  var cbp_chroma: int32 = 0;
+  var mode16: int32 = 0;
+  var kind: int32 = h264_decode_mb_type_intra(v, &cbp_luma, &cbp_chroma, &mode16);
+  mb->kind = kind;
+
+  if (kind == H264_MB_I_PCM) {
+    return H264_ERR_UNSUPPORTED;
+  }
+
+  if (kind == H264_MB_I_NXN) {
+    h264_decode_intra4x4_modes(v, mb);
+  } else {
+    mb->intra16x16_mode = mode16;
+    mb->cbp_luma = cbp_luma;
+    mb->cbp_chroma = cbp_chroma;
+  }
+  mb->chroma_mode = h264_decode_chroma_mode(v);
+
+  if (kind == H264_MB_I_NXN) {
+    var luma: int32 = 0;
+    var chroma: int32 = 0;
+    h264_decode_cbp(v, &luma, &chroma);
+    mb->cbp_luma = luma;
+    mb->cbp_chroma = chroma;
+  }
+
+  var has_residual: int32 = 0;
+  if (mb->cbp_luma != 0 || mb->cbp_chroma != 0 || kind == H264_MB_I_16X16) { has_residual = 1; }
+
+  if (has_residual != 0) {
+    var delta: int32 = h264_decode_qp_delta(v);
+    v->qp = (v->qp + delta + 52) % 52;
+  } else {
+    v->qp_delta_nonzero = 0;
+  }
+  mb->qp = v->qp;
+
+  if (has_residual != 0) {
+    h264_decode_residual(v, mb);
+  } else {
+    for i in 0..256 { v->luma_ac[i] = 0; }
+    for i in 0..16 { v->luma_dc[i] = 0; }
+    for i in 0..128 { v->chroma_ac[i] = 0; }
+    for i in 0..8 { v->chroma_dc[i] = 0; }
+  }
+
+  if (kind == H264_MB_I_NXN) {
+    h264_reconstruct_intra_nxn(v, mb);
+  } else {
+    h264_reconstruct_intra_16x16(v, mb);
+  }
+  h264_reconstruct_chroma(v, mb, pps);
+  return H264_OK;
+}
+
+fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
+  var parser: H264Decoder* = v->parser;
+  var pps: H264Pps* = &parser->pps[parser->active_pps];
+  var sps: H264Sps* = &parser->sps[parser->active_sps];
+
+  if (pps->entropy_coding_mode == 0) { return H264_ERR_UNSUPPORTED; }
+  if (header->slice_type != H264_SLICE_I) { return H264_ERR_UNSUPPORTED; }
+  if (sps->chroma_format_idc != 1) { return H264_ERR_UNSUPPORTED; }
+  if (pps->transform_8x8_mode != 0) { return H264_ERR_UNSUPPORTED; }
+
+  var status: int32 = h264_prepare_picture(v, sps);
+  if (status != H264_OK) { return status; }
+
+  var start_bit: int64 = (header->data_bit_offset + (int64)7) & ~(int64)7;
+  h264_cabac_start(v, parser->rbsp, header->rbsp_size, start_bit);
+  h264_cabac_init_contexts(v, header->qp, 0);
+
+  v->qp = header->qp;
+  v->qp_delta_nonzero = 0;
+  v->disable_deblocking = header->disable_deblocking_filter_idc;
+  v->alpha_offset = header->slice_alpha_c0_offset;
+  v->beta_offset = header->slice_beta_offset;
+  v->chroma_offset[0] = pps->chroma_qp_index_offset;
+  v->chroma_offset[1] = pps->second_chroma_qp_index_offset;
+
+  var address: int32 = header->first_mb_in_slice;
+  while (address < v->mb_count) {
+    v->mb_index = address;
+    v->mb_x = address % v->mb_width;
+    v->mb_y = address / v->mb_width;
+
+    var mb_status: int32 = h264_decode_macroblock(v, pps);
+    if (mb_status != H264_OK) { return mb_status; }
+
+    if (h264_decode_terminate(v) != 0) { break; }
+    address = address + 1;
+  }
+  h264_deblock_picture(v);
+  return H264_OK;
+}
+
+fn h264_decode_sample(v: H264Video*, sample: uint8*, size: int64) -> int32 {
+  var parser: H264Decoder* = v->parser;
+  var count: int32 = h264_nal_count(parser, sample, size);
+  var decoded: int32 = 0;
+
+  for i in 0..count {
+    var nal_size: int64 = 0;
+    var nal: uint8* = h264_nal_at(parser, sample, size, i, &nal_size);
+    if (nal == 0) { continue; }
+    var kind: int32 = h264_nal_type(nal);
+
+    if (kind == H264_NAL_SPS) {
+      h264_parse_sps(parser, nal, nal_size);
+    } else if (kind == H264_NAL_PPS) {
+      h264_parse_pps(parser, nal, nal_size);
+    } else if (kind == H264_NAL_SLICE || kind == H264_NAL_IDR) {
+      var header: H264SliceHeader;
+      var status: int32 = h264_parse_slice_header(parser, nal, nal_size, &header);
+      if (status != H264_OK) { return status; }
+      status = h264_decode_slice(v, &header);
+      if (status != H264_OK) { return status; }
+      decoded = decoded + 1;
+    }
+  }
+  if (decoded == 0) { return H264_ERR_BITSTREAM; }
+  return H264_OK;
+}
+
+fn h264_write_pixels(v: H264Video*) {
+  var out: uint32* = v->pixels;
+  for y in 0..v->height {
+    var source_y: int32 = y + v->crop_top;
+    var luma_row: int64 = (int64)source_y * (int64)v->luma_stride;
+    var chroma_row: int64 = (int64)(source_y >> 1) * (int64)v->chroma_stride;
+    var target: int64 = (int64)y * (int64)v->width;
+    for x in 0..v->width {
+      var source_x: int32 = x + v->crop_left;
+      var luma: int32 = (int32)v->luma[luma_row + (int64)source_x] - 16;
+      var blue_diff: int32 = (int32)v->cb[chroma_row + (int64)(source_x >> 1)] - 128;
+      var red_diff: int32 = (int32)v->cr[chroma_row + (int64)(source_x >> 1)] - 128;
+      var base: int32 = 76309 * luma;
+
+      var red: int32 = (base + 104597 * red_diff + 32768) >> 16;
+      var green: int32 = (base - 25675 * blue_diff - 53279 * red_diff + 32768) >> 16;
+      var blue: int32 = (base + 132201 * blue_diff + 32768) >> 16;
+
+      if (red < 0) { red = 0; }
+      if (red > 255) { red = 255; }
+      if (green < 0) { green = 0; }
+      if (green > 255) { green = 255; }
+      if (blue < 0) { blue = 0; }
+      if (blue > 255) { blue = 255; }
+
+      out[target + (int64)x] = ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
+    }
+  }
+}
