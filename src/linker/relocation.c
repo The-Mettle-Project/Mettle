@@ -91,6 +91,35 @@ static int relocation_resolve_target(const LinkResolution *resolution,
   return 1;
 }
 
+static int relocation_relax_gotpcrelx(LinkedSection *merged,
+                                      size_t patch_offset,
+                                      const char *symbol_name,
+                                      char **error_message_out) {
+  unsigned char *opcode;
+  unsigned char *modrm;
+
+  if (patch_offset < 2u) {
+    mettle_set_error(error_message_out,
+                     "GOTPCRELX relocation for symbol '%s' has no room for the "
+                     "instruction it belongs to",
+                     symbol_name ? symbol_name : "<unknown>");
+    return 0;
+  }
+  opcode = merged->data + patch_offset - 2u;
+  modrm = merged->data + patch_offset - 1u;
+  if (*opcode != 0x8Bu || (*modrm & 0xC7u) != 0x05u) {
+    mettle_set_error(error_message_out,
+                     "GOTPCRELX relocation for symbol '%s' is not the "
+                     "RIP-relative load this linker can relax (opcode %02x, "
+                     "modrm %02x)",
+                     symbol_name ? symbol_name : "<unknown>",
+                     (unsigned)*opcode, (unsigned)*modrm);
+    return 0;
+  }
+  *opcode = 0x8Du;
+  return 1;
+}
+
 static int link_apply_section_relocations(
     LinkResolution *resolution, const LinkedInputObject *input,
     const LinkSection *source_section, size_t section_index,
@@ -127,7 +156,7 @@ static int link_apply_section_relocations(
     case LINK_RELOC_IMAGE_REL32:
     case LINK_RELOC_SECREL32:
     case LINK_RELOC_TPOFF32:
-    case LINK_RELOC_GOTPCREL32:
+    case LINK_RELOC_GOTPCRELX32:
       width = 4u;
       break;
     default:
@@ -154,9 +183,14 @@ static int link_apply_section_relocations(
       addend = (int64_t)(int32_t)linker_read_u32(merged->data + patch_offset);
     }
 
+    if (relocation->kind == LINK_RELOC_GOTPCRELX32 &&
+        !relocation_relax_gotpcrelx(merged, patch_offset, target.name,
+                                    error_message_out)) {
+      return 0;
+    }
     switch (relocation->kind) {
     case LINK_RELOC_PC32:
-    case LINK_RELOC_GOTPCREL32:
+    case LINK_RELOC_GOTPCRELX32:
       value = (int64_t)target.virtual_address + addend -
               (int64_t)patch_address;
       if (!relocation->addend_is_explicit) {

@@ -135,9 +135,10 @@ static LinkRelocKind elf_reloc_kind(uint32_t type) {
         case R_X86_64_TPOFF32:
             return LINK_RELOC_TPOFF32;
         case R_X86_64_GOTPCREL:
+            return LINK_RELOC_GOTPCREL32;
         case R_X86_64_GOTPCRELX:
         case R_X86_64_REX_GOTPCRELX:
-            return LINK_RELOC_GOTPCREL32;
+            return LINK_RELOC_GOTPCRELX32;
         default:
             return LINK_RELOC_NONE;
     }

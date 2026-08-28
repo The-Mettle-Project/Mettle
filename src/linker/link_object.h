@@ -29,6 +29,7 @@ typedef enum {
   LINK_RELOC_SECREL32,
   LINK_RELOC_TPOFF32,
   LINK_RELOC_GOTPCREL32,
+  LINK_RELOC_GOTPCRELX32,
 } LinkRelocKind;
 
 typedef struct {

@@ -147,6 +147,7 @@ const char *link_reloc_kind_name(LinkRelocKind kind) {
         case LINK_RELOC_SECREL32: return "SECREL32";
         case LINK_RELOC_TPOFF32: return "TPOFF32";
         case LINK_RELOC_GOTPCREL32: return "GOTPCREL32";
+        case LINK_RELOC_GOTPCRELX32: return "GOTPCRELX32";
         case LINK_RELOC_NONE: default: return "NONE";
     }
 }
