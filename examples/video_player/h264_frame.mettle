@@ -34,6 +34,39 @@ fn h264_clear_residual(v: H264Video*) {
   for i in 0..8 { v->chroma_dc[i] = 0; }
 }
 
+fn h264_reconstruct_intra_8x8(v: H264Video*, mb: H264Macroblock*) {
+  var prediction: int32[64];
+  var scaled: int32[64];
+  var residual: int32[64];
+
+  for blk in 0..4 {
+    var x: int32 = v->mb_x * 16 + (blk & 1) * 8;
+    var y: int32 = v->mb_y * 16 + (blk >> 1) * 8;
+    var bx: int32 = (blk & 1) * 2;
+    var by: int32 = (blk >> 1) * 2;
+    h264_predict_intra8x8(v, blk, (int32)mb->intra4x4_modes[by * 4 + bx], &prediction[0]);
+
+    if ((mb->cbp_luma & (1 << blk)) != 0) {
+      h264_scale_block_8x8(v, &v->luma_8x8[blk * 64], &scaled[0], mb->qp);
+      h264_inverse_transform_8x8(v, &scaled[0], &residual[0]);
+      for row in 0..8 {
+        var base: int64 = (int64)(y + row) * (int64)v->luma_stride + (int64)x;
+        for column in 0..8 {
+          v->luma[base + (int64)column] =
+            h264_clip_sample(prediction[row * 8 + column] + residual[row * 8 + column]);
+        }
+      }
+    } else {
+      for row in 0..8 {
+        var base: int64 = (int64)(y + row) * (int64)v->luma_stride + (int64)x;
+        for column in 0..8 {
+          v->luma[base + (int64)column] = h264_clip_sample(prediction[row * 8 + column]);
+        }
+      }
+    }
+  }
+}
+
 fn h264_reconstruct_intra_nxn(v: H264Video*, mb: H264Macroblock*) {
   var prediction: int32[16];
   var scaled: int32[16];
@@ -152,7 +185,14 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
 
   if (intra != 0) {
     if (kind == H264_MB_I_NXN) {
-      h264_decode_intra4x4_modes(v, mb);
+      if (pps->transform_8x8_mode != 0) {
+        mb->transform_8x8 = h264_decode_transform_8x8_flag(v);
+      }
+      if (mb->transform_8x8 != 0) {
+        h264_decode_intra8x8_modes(v, mb);
+      } else {
+        h264_decode_intra4x4_modes(v, mb);
+      }
     } else {
       mb->intra16x16_mode = mode16;
       mb->cbp_luma = cbp_luma;
@@ -172,6 +212,15 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
     h264_decode_cbp(v, &luma, &chroma);
     mb->cbp_luma = luma;
     mb->cbp_chroma = chroma;
+
+    if (pps->transform_8x8_mode != 0 && intra == 0 && mb->cbp_luma != 0 &&
+        mb->sub_8x8_small == 0) {
+      var allowed: int32 = 1;
+      if (kind == H264_MB_B_DIRECT && v->direct_8x8_inference == 0) { allowed = 0; }
+      if (allowed != 0) {
+        mb->transform_8x8 = h264_decode_transform_8x8_flag(v);
+      }
+    }
   }
 
   var has_residual: int32 = 0;
@@ -193,7 +242,11 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
 
   if (intra != 0) {
     if (kind == H264_MB_I_NXN) {
-      h264_reconstruct_intra_nxn(v, mb);
+      if (mb->transform_8x8 != 0) {
+        h264_reconstruct_intra_8x8(v, mb);
+      } else {
+        h264_reconstruct_intra_nxn(v, mb);
+      }
     } else {
       h264_reconstruct_intra_16x16(v, mb);
     }
@@ -584,9 +637,6 @@ fn h264_unsupported_reason(parser: H264Decoder*) -> cstring {
   if (sps->chroma_format_idc != 1) {
     return "a chroma format other than 4:2:0";
   }
-  if (pps->transform_8x8_mode != 0) {
-    return "the 8x8 transform of H.264 High profile";
-  }
   if (sps->scaling_matrix_present != 0) {
     return "custom scaling matrices";
   }
@@ -600,7 +650,6 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
 
   if (pps->entropy_coding_mode == 0) { return H264_ERR_UNSUPPORTED; }
   if (sps->chroma_format_idc != 1) { return H264_ERR_UNSUPPORTED; }
-  if (pps->transform_8x8_mode != 0) { return H264_ERR_UNSUPPORTED; }
   if (header->slice_type == H264_SLICE_SP || header->slice_type == H264_SLICE_SI) {
     return H264_ERR_UNSUPPORTED;
   }
@@ -667,7 +716,7 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
     var mb_status: int32 = h264_decode_macroblock(v, pps, header);
     if (g_trace_mb != 0) {
       var mb: H264Macroblock* = &v->macroblocks[address];
-      println("mb {address} kind {mb->kind} skip {mb->skipped} intra {mb->is_intra} cbp {mb->cbp_luma}/{mb->cbp_chroma} qp {mb->qp} mv0 {mb->mv_x[0]},{mb->mv_y[0]} r {mb->ref_index[0]}/{mb->ref_index[4]}");
+      println("mb {address} kind {mb->kind} t8 {mb->transform_8x8} cbp {mb->cbp_luma} m {mb->intra4x4_modes[0]} {mb->intra4x4_modes[2]} {mb->intra4x4_modes[8]} {mb->intra4x4_modes[10]}");
       fflush(0);
     }
     if (mb_status != H264_OK) { return mb_status; }

@@ -362,6 +362,12 @@ fn h264_decode_b_motion(v: H264Video*, mb: H264Macroblock*, value: int32,
     var sub_types: int32[4];
     for block in 0..4 {
       sub_types[block] = h264_decode_sub_type_b(v);
+      var kind: int32 = sub_types[block];
+      if (kind == 0) {
+        if (v->direct_8x8_inference == 0) { mb->sub_8x8_small = 1; }
+      } else if (h264_b_sub_width(kind) < 2 || h264_b_sub_height(kind) < 2) {
+        mb->sub_8x8_small = 1;
+      }
     }
 
     for block in 0..4 {

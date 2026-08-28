@@ -228,6 +228,7 @@ fn h264_decode_p_motion(v: H264Video*, mb: H264Macroblock*, count: int32) {
   var sub_types: int32[4];
   for block in 0..4 {
     sub_types[block] = h264_decode_sub_type_p(v);
+    if (sub_types[block] != 0) { mb->sub_8x8_small = 1; }
   }
   var references: int32[4];
   for block in 0..4 {
@@ -605,6 +606,31 @@ fn h264_reconstruct_inter(v: H264Video*, mb: H264Macroblock*, pps: H264Pps*) {
 
   if (h264_predict_inter(v, mb) == 0) { return; }
 
+  if (mb->transform_8x8 != 0) {
+    var scaled8: int32[64];
+    var residual8: int32[64];
+    for blk in 0..4 {
+      var x: int32 = v->mb_x * 16 + (blk & 1) * 8;
+      var y: int32 = v->mb_y * 16 + (blk >> 1) * 8;
+      var source_x: int32 = (blk & 1) * 8;
+      var source_y: int32 = (blk >> 1) * 8;
+      var coded8: int32 = 0;
+      if ((mb->cbp_luma & (1 << blk)) != 0) {
+        h264_scale_block_8x8(v, &v->luma_8x8[blk * 64], &scaled8[0], mb->qp);
+        h264_inverse_transform_8x8(v, &scaled8[0], &residual8[0]);
+        coded8 = 1;
+      }
+      for row in 0..8 {
+        var base: int64 = (int64)(y + row) * (int64)v->luma_stride + (int64)x;
+        var source: int32 = (source_y + row) * 16 + source_x;
+        for column in 0..8 {
+          var value: int32 = (int32)g_pred_luma[source + column];
+          if (coded8 != 0) { value = value + residual8[row * 8 + column]; }
+          v->luma[base + (int64)column] = h264_clip_sample(value);
+        }
+      }
+    }
+  } else {
   for raster in 0..16 {
     var bx: int32 = raster & 3;
     var by: int32 = raster >> 2;
@@ -632,6 +658,7 @@ fn h264_reconstruct_inter(v: H264Video*, mb: H264Macroblock*, pps: H264Pps*) {
         }
       }
     }
+  }
   }
 
   for row in 0..8 {

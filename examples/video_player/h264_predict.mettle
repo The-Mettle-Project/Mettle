@@ -380,3 +380,273 @@ fn h264_predict_chroma(v: H264Video*, plane: uint8*, mode: int32) {
     }
   }
 }
+
+fn h264_intra8x8_available(v: H264Video*, blk: int32, side: int32) -> int32 {
+  var bx: int32 = (blk & 1) * 2;
+  var by: int32 = (blk >> 1) * 2;
+
+  if (side == 0) {
+    if (bx > 0) { return 1; }
+    if (v->mb_x > 0) { return 1; }
+    return 0;
+  }
+  if (side == 1) {
+    if (by > 0) { return 1; }
+    if (v->mb_y > 0) { return 1; }
+    return 0;
+  }
+  if (side == 2) {
+    if (bx > 0 && by > 0) { return 1; }
+    if (bx > 0) { return h264_intra8x8_available(v, blk, 1); }
+    if (by > 0) { return h264_intra8x8_available(v, blk, 0); }
+    if (v->mb_x > 0 && v->mb_y > 0) { return 1; }
+    return 0;
+  }
+
+  if (blk == 0) {
+    if (v->mb_y > 0) { return 1; }
+    return 0;
+  }
+  if (blk == 1) {
+    if (v->mb_y > 0 && v->mb_x < v->mb_width - 1) { return 1; }
+    return 0;
+  }
+  if (blk == 2) { return 1; }
+  return 0;
+}
+
+fn h264_intra8x8_reference(v: H264Video*, blk: int32, top: int32*, left: int32*,
+                           out_corner: int32*, out_top_ok: int32*, out_left_ok: int32*,
+                           out_corner_ok: int32*) {
+  var bx: int32 = (blk & 1) * 8;
+  var by: int32 = (blk >> 1) * 8;
+  var x: int32 = v->mb_x * 16 + bx;
+  var y: int32 = v->mb_y * 16 + by;
+
+  var left_ok: int32 = h264_intra8x8_available(v, blk, 0);
+  var top_ok: int32 = h264_intra8x8_available(v, blk, 1);
+  var corner_ok: int32 = h264_intra8x8_available(v, blk, 2);
+  var right_ok: int32 = h264_intra8x8_available(v, blk, 3);
+
+  var raw_top: int32[16];
+  var raw_left: int32[8];
+  var corner: int32 = 0;
+  for i in 0..16 { raw_top[i] = 0; }
+  for i in 0..8 { raw_left[i] = 0; }
+
+  if (top_ok != 0) {
+    for i in 0..8 { raw_top[i] = h264_luma_sample(v, x + i, y - 1); }
+    if (right_ok != 0) {
+      for i in 8..16 { raw_top[i] = h264_luma_sample(v, x + i, y - 1); }
+    } else {
+      for i in 8..16 { raw_top[i] = raw_top[7]; }
+    }
+  }
+  if (left_ok != 0) {
+    for i in 0..8 { raw_left[i] = h264_luma_sample(v, x - 1, y + i); }
+  }
+  if (corner_ok != 0) { corner = h264_luma_sample(v, x - 1, y - 1); }
+
+  if (top_ok != 0) {
+    if (corner_ok != 0) {
+      top[0] = (corner + 2 * raw_top[0] + raw_top[1] + 2) >> 2;
+    } else {
+      top[0] = (3 * raw_top[0] + raw_top[1] + 2) >> 2;
+    }
+    for i in 1..15 {
+      top[i] = (raw_top[i - 1] + 2 * raw_top[i] + raw_top[i + 1] + 2) >> 2;
+    }
+    top[15] = (raw_top[14] + 3 * raw_top[15] + 2) >> 2;
+  }
+
+  if (left_ok != 0) {
+    if (corner_ok != 0) {
+      left[0] = (corner + 2 * raw_left[0] + raw_left[1] + 2) >> 2;
+    } else {
+      left[0] = (3 * raw_left[0] + raw_left[1] + 2) >> 2;
+    }
+    for i in 1..7 {
+      left[i] = (raw_left[i - 1] + 2 * raw_left[i] + raw_left[i + 1] + 2) >> 2;
+    }
+    left[7] = (raw_left[6] + 3 * raw_left[7] + 2) >> 2;
+  }
+
+  var filtered_corner: int32 = corner;
+  if (corner_ok != 0) {
+    if (top_ok != 0 && left_ok != 0) {
+      filtered_corner = (raw_top[0] + 2 * corner + raw_left[0] + 2) >> 2;
+    } else if (top_ok != 0) {
+      filtered_corner = (3 * corner + raw_top[0] + 2) >> 2;
+    } else if (left_ok != 0) {
+      filtered_corner = (3 * corner + raw_left[0] + 2) >> 2;
+    }
+  }
+
+  *out_corner = filtered_corner;
+  *out_top_ok = top_ok;
+  *out_left_ok = left_ok;
+  *out_corner_ok = corner_ok;
+}
+
+fn h264_predict_intra8x8(v: H264Video*, blk: int32, mode: int32, prediction: int32*) {
+  var top: int32[16];
+  var left: int32[8];
+  for i in 0..16 { top[i] = 0; }
+  for i in 0..8 { left[i] = 0; }
+  var corner: int32 = 0;
+  var top_ok: int32 = 0;
+  var left_ok: int32 = 0;
+  var corner_ok: int32 = 0;
+  h264_intra8x8_reference(v, blk, &top[0], &left[0], &corner, &top_ok, &left_ok, &corner_ok);
+
+  if (mode == 0) {
+    for row in 0..8 {
+      for column in 0..8 { prediction[row * 8 + column] = top[column]; }
+    }
+    return;
+  }
+  if (mode == 1) {
+    for row in 0..8 {
+      for column in 0..8 { prediction[row * 8 + column] = left[row]; }
+    }
+    return;
+  }
+  if (mode == 2) {
+    var total: int32 = 0;
+    var count: int32 = 0;
+    if (top_ok != 0) {
+      for i in 0..8 { total = total + top[i]; }
+      count = count + 8;
+    }
+    if (left_ok != 0) {
+      for i in 0..8 { total = total + left[i]; }
+      count = count + 8;
+    }
+    var value: int32 = 128;
+    if (count == 16) { value = (total + 8) >> 4; }
+    else if (count == 8) { value = (total + 4) >> 3; }
+    for i in 0..64 { prediction[i] = value; }
+    return;
+  }
+  if (mode == 3) {
+    for row in 0..8 {
+      for column in 0..8 {
+        var z: int32 = column + row;
+        if (z == 14) {
+          prediction[row * 8 + column] = (top[14] + 3 * top[15] + 2) >> 2;
+        } else {
+          prediction[row * 8 + column] = (top[z] + 2 * top[z + 1] + top[z + 2] + 2) >> 2;
+        }
+      }
+    }
+    return;
+  }
+  if (mode == 4) {
+    for row in 0..8 {
+      for column in 0..8 {
+        if (column > row) {
+          var z: int32 = column - row - 2;
+          if (z < 0) {
+            prediction[row * 8 + column] = (corner + 2 * top[0] + top[1] + 2) >> 2;
+          } else {
+            prediction[row * 8 + column] = (top[z] + 2 * top[z + 1] + top[z + 2] + 2) >> 2;
+          }
+        } else if (column < row) {
+          var z: int32 = row - column - 2;
+          if (z < 0) {
+            prediction[row * 8 + column] = (corner + 2 * left[0] + left[1] + 2) >> 2;
+          } else {
+            prediction[row * 8 + column] = (left[z] + 2 * left[z + 1] + left[z + 2] + 2) >> 2;
+          }
+        } else {
+          prediction[row * 8 + column] = (top[0] + 2 * corner + left[0] + 2) >> 2;
+        }
+      }
+    }
+    return;
+  }
+  if (mode == 5) {
+    for row in 0..8 {
+      for column in 0..8 {
+        var z: int32 = 2 * column - row;
+        if (z >= 0) {
+          if ((z & 1) == 0) {
+            var i: int32 = column - (row >> 1);
+            if (i == 0) { prediction[row * 8 + column] = (corner + top[0] + 1) >> 1; }
+            else { prediction[row * 8 + column] = (top[i - 1] + top[i] + 1) >> 1; }
+          } else {
+            var i: int32 = column - (row >> 1);
+            if (i == 0) { prediction[row * 8 + column] = (left[0] + 2 * corner + top[0] + 2) >> 2; }
+            else if (i == 1) { prediction[row * 8 + column] = (corner + 2 * top[0] + top[1] + 2) >> 2; }
+            else { prediction[row * 8 + column] = (top[i - 2] + 2 * top[i - 1] + top[i] + 2) >> 2; }
+          }
+        } else if (z == -1) {
+          prediction[row * 8 + column] = (left[0] + 2 * corner + top[0] + 2) >> 2;
+        } else {
+          var i: int32 = row - 2 * column - 1;
+          if (i <= 1) { prediction[row * 8 + column] = (left[1] + 2 * left[0] + corner + 2) >> 2; }
+          else { prediction[row * 8 + column] = (left[i] + 2 * left[i - 1] + left[i - 2] + 2) >> 2; }
+        }
+      }
+    }
+    return;
+  }
+  if (mode == 6) {
+    for row in 0..8 {
+      for column in 0..8 {
+        var z: int32 = 2 * row - column;
+        if (z >= 0) {
+          if ((z & 1) == 0) {
+            var i: int32 = row - (column >> 1);
+            if (i == 0) { prediction[row * 8 + column] = (corner + left[0] + 1) >> 1; }
+            else { prediction[row * 8 + column] = (left[i - 1] + left[i] + 1) >> 1; }
+          } else {
+            var i: int32 = row - (column >> 1);
+            if (i == 0) { prediction[row * 8 + column] = (top[0] + 2 * corner + left[0] + 2) >> 2; }
+            else if (i == 1) { prediction[row * 8 + column] = (corner + 2 * left[0] + left[1] + 2) >> 2; }
+            else { prediction[row * 8 + column] = (left[i - 2] + 2 * left[i - 1] + left[i] + 2) >> 2; }
+          }
+        } else if (z == -1) {
+          prediction[row * 8 + column] = (top[0] + 2 * corner + left[0] + 2) >> 2;
+        } else {
+          var i: int32 = column - 2 * row - 1;
+          if (i <= 1) { prediction[row * 8 + column] = (top[1] + 2 * top[0] + corner + 2) >> 2; }
+          else { prediction[row * 8 + column] = (top[i] + 2 * top[i - 1] + top[i - 2] + 2) >> 2; }
+        }
+      }
+    }
+    return;
+  }
+  if (mode == 7) {
+    for row in 0..8 {
+      for column in 0..8 {
+        var i: int32 = column + (row >> 1);
+        if ((row & 1) == 0) {
+          prediction[row * 8 + column] = (top[i] + top[i + 1] + 1) >> 1;
+        } else {
+          prediction[row * 8 + column] = (top[i] + 2 * top[i + 1] + top[i + 2] + 2) >> 2;
+        }
+      }
+    }
+    return;
+  }
+
+  for row in 0..8 {
+    for column in 0..8 {
+      var z: int32 = column + 2 * row;
+      if (z < 13) {
+        if ((z & 1) == 0) {
+          var i: int32 = row + (column >> 1);
+          prediction[row * 8 + column] = (left[i] + left[i + 1] + 1) >> 1;
+        } else {
+          var i: int32 = row + (column >> 1);
+          prediction[row * 8 + column] = (left[i] + 2 * left[i + 1] + left[i + 2] + 2) >> 2;
+        }
+      } else if (z == 13) {
+        prediction[row * 8 + column] = (left[6] + 3 * left[7] + 2) >> 2;
+      } else {
+        prediction[row * 8 + column] = left[7];
+      }
+    }
+  }
+}

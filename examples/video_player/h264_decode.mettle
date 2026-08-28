@@ -21,6 +21,7 @@ const H264_CAT_LUMA_AC = 1;
 const H264_CAT_LUMA_4X4 = 2;
 const H264_CAT_CHROMA_DC = 3;
 const H264_CAT_CHROMA_AC = 4;
+const H264_CAT_LUMA_8X8 = 5;
 
 const H264_CTX_MB_TYPE_I = 3;
 const H264_CTX_QP_DELTA = 60;
@@ -43,6 +44,10 @@ const H264_CTX_SUB_TYPE_B = 36;
 const H264_CTX_MVD_X = 40;
 const H264_CTX_MVD_Y = 47;
 const H264_CTX_REF_IDX = 54;
+const H264_CTX_TRANSFORM_8X8 = 399;
+const H264_CTX_SIGNIFICANT_8X8 = 402;
+const H264_CTX_LAST_8X8 = 417;
+const H264_CTX_LEVEL_8X8 = 426;
 
 struct H264Cabac {
   data: uint8*;
@@ -92,6 +97,8 @@ struct H264Macroblock {
   ref_index: int32[8];
   ref_picture: int32[8];
   skipped: int32;
+  transform_8x8: int32;
+  sub_8x8_small: int32;
   direct8x8: uint8[4];
 }
 
@@ -165,6 +172,10 @@ struct H264Video {
   chroma_offset: int32[2];
 
   zigzag: int32[16];
+  zigzag8: int32[64];
+  significant8: int32[64];
+  last8: int32[64];
+  normalise8: int32[384];
   blk_raster: int32[16];
   raster_blk: int32[16];
   normalise: int32[96];
@@ -172,6 +183,7 @@ struct H264Video {
 
   luma_dc: int32[16];
   luma_ac: int32[256];
+  luma_8x8: int32[256];
   chroma_dc: int32[8];
   chroma_ac: int32[128];
   block: int32[16];
@@ -239,6 +251,58 @@ fn h264_video_new(parser: H264Decoder*) -> H264Video* {
       if ((row & 1) == 0 && (column & 1) == 0) { group = 0; }
       else if ((row & 1) == 1 && (column & 1) == 1) { group = 1; }
       v->normalise[m * 16 + i] = adjust[m * 3 + group] * 16;
+    }
+  }
+
+  var scan8: int32[64] = [
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63
+  ];
+  for i in 0..64 { v->zigzag8[i] = scan8[i]; }
+
+  var sig8: int32[64] = [
+     0,  1,  2,  3,  4,  5,  5,  4,
+     4,  3,  3,  4,  4,  4,  5,  5,
+     4,  4,  4,  4,  3,  3,  6,  7,
+     7,  7,  8,  9, 10,  9,  8,  7,
+     7,  6, 11, 12, 13, 11,  6,  7,
+     8,  9, 14, 10,  9,  8,  6, 11,
+    12, 13, 11,  6,  9, 14, 10,  9,
+    11, 12, 13, 11, 14, 10, 12, 14
+  ];
+  for i in 0..64 { v->significant8[i] = sig8[i]; }
+
+  var last8: int32[64] = [
+    0, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 6, 6, 6, 6,
+    7, 7, 7, 7, 8, 8, 8, 8
+  ];
+  for i in 0..64 { v->last8[i] = last8[i]; }
+
+  var base8: int32[36] = [
+    20, 18, 32, 19, 25, 24,
+    22, 19, 35, 21, 28, 26,
+    26, 23, 42, 24, 33, 31,
+    28, 25, 45, 26, 35, 33,
+    32, 28, 51, 30, 40, 38,
+    36, 32, 58, 34, 46, 43
+  ];
+  var pick8: int32[16] = [0, 3, 4, 3, 3, 1, 5, 1, 4, 5, 2, 5, 3, 1, 5, 1];
+  for m in 0..6 {
+    for i in 0..64 {
+      var slot: int32 = ((i >> 1) & 12) | (i & 3);
+      v->normalise8[m * 64 + i] = base8[m * 6 + pick8[slot]] * 16;
     }
   }
 
@@ -508,6 +572,33 @@ fn h264_neighbour_intra4x4_mode(v: H264Video*, mb: H264Macroblock*, raster: int3
   return (int32)v->macroblocks[above].intra4x4_modes[3 * 4 + bx];
 }
 
+fn h264_decode_intra8x8_modes(v: H264Video*, mb: H264Macroblock*) {
+  for blk in 0..4 {
+    var bx: int32 = (blk & 1) * 2;
+    var by: int32 = (blk >> 1) * 2;
+    var raster: int32 = by * 4 + bx;
+    var left_mode: int32 = h264_neighbour_intra4x4_mode(v, mb, raster, 0);
+    var above_mode: int32 = h264_neighbour_intra4x4_mode(v, mb, raster, 1);
+    var predicted: int32 = 2;
+    if (left_mode >= 0 && above_mode >= 0) {
+      predicted = left_mode;
+      if (above_mode < predicted) { predicted = above_mode; }
+    }
+    var mode: int32 = predicted;
+    if (h264_decode_bin(v, H264_CTX_PREV_INTRA) == 0) {
+      var remainder: int32 = h264_decode_bin(v, H264_CTX_REM_INTRA);
+      remainder = remainder | (h264_decode_bin(v, H264_CTX_REM_INTRA) << 1);
+      remainder = remainder | (h264_decode_bin(v, H264_CTX_REM_INTRA) << 2);
+      if (remainder < predicted) { mode = remainder; } else { mode = remainder + 1; }
+    }
+    for row in 0..2 {
+      for column in 0..2 {
+        mb->intra4x4_modes[(by + row) * 4 + bx + column] = (uint8)mode;
+      }
+    }
+  }
+}
+
 fn h264_decode_intra4x4_modes(v: H264Video*, mb: H264Macroblock*) {
   for blk in 0..16 {
     var raster: int32 = v->blk_raster[blk];
@@ -596,6 +687,15 @@ fn h264_decode_cbp(v: H264Video*, out_luma: int32*, out_chroma: int32*) {
   }
   *out_luma = luma;
   *out_chroma = chroma;
+}
+
+fn h264_decode_transform_8x8_flag(v: H264Video*) -> int32 {
+  var increment: int32 = 0;
+  var left: int32 = h264_left_index(v);
+  var above: int32 = h264_above_index(v);
+  if (left >= 0 && v->macroblocks[left].transform_8x8 != 0) { increment = increment + 1; }
+  if (above >= 0 && v->macroblocks[above].transform_8x8 != 0) { increment = increment + 1; }
+  return h264_decode_bin(v, H264_CTX_TRANSFORM_8X8 + increment);
 }
 
 fn h264_decode_qp_delta(v: H264Video*) -> int32 {
@@ -702,29 +802,39 @@ fn h264_decode_residual_block(v: H264Video*, mb: H264Macroblock*, coefficients: 
     coefficients[i] = 0;
   }
 
-  var coded_context: int32 = H264_CTX_CODED_BLOCK + h264_category_coded_offset(category) +
-                             h264_coded_block_context(v, mb, category, index, component);
-  if (h264_decode_bin(v, coded_context) == 0) {
-    return 0;
+  if (category != H264_CAT_LUMA_8X8) {
+    var coded_context: int32 = H264_CTX_CODED_BLOCK + h264_category_coded_offset(category) +
+                               h264_coded_block_context(v, mb, category, index, component);
+    if (h264_decode_bin(v, coded_context) == 0) {
+      return 0;
+    }
   }
 
-  var significant: int32[16];
-  for i in 0..16 { significant[i] = 0; }
+  var significant: int32[64];
+  for i in 0..64 { significant[i] = 0; }
 
   var significant_base: int32 = H264_CTX_SIGNIFICANT + h264_category_significant_offset(category);
   var last_base: int32 = H264_CTX_LAST_SIGNIFICANT + h264_category_significant_offset(category);
+  if (category == H264_CAT_LUMA_8X8) {
+    significant_base = H264_CTX_SIGNIFICANT_8X8;
+    last_base = H264_CTX_LAST_8X8;
+  }
 
   var count: int32 = end_index + 1;
   var i: int32 = start_index;
   while (i < count - 1) {
     var position: int32 = i;
+    var last_position: int32 = i;
     if (category == H264_CAT_CHROMA_DC) {
-      position = i;
       if (position > 2) { position = 2; }
+      last_position = position;
+    } else if (category == H264_CAT_LUMA_8X8) {
+      position = v->significant8[i];
+      last_position = v->last8[i];
     }
     if (h264_decode_bin(v, significant_base + position) != 0) {
       significant[i] = 1;
-      if (h264_decode_bin(v, last_base + position) != 0) {
+      if (h264_decode_bin(v, last_base + last_position) != 0) {
         count = i + 1;
       }
     }
@@ -733,6 +843,7 @@ fn h264_decode_residual_block(v: H264Video*, mb: H264Macroblock*, coefficients: 
   significant[count - 1] = 1;
 
   var level_base: int32 = H264_CTX_ABS_LEVEL + h264_category_level_offset(category);
+  if (category == H264_CAT_LUMA_8X8) { level_base = H264_CTX_LEVEL_8X8; }
   var equal_one: int32 = 0;
   var greater_one: int32 = 0;
 
@@ -803,6 +914,7 @@ fn h264_decode_residual(v: H264Video*, mb: H264Macroblock*) {
   mb->chroma_dc_nonzero[1] = (uint8)0;
   for i in 0..16 { v->luma_dc[i] = 0; }
   for i in 0..256 { v->luma_ac[i] = 0; }
+  for i in 0..256 { v->luma_8x8[i] = 0; }
   for i in 0..8 { v->chroma_dc[i] = 0; }
   for i in 0..128 { v->chroma_ac[i] = 0; }
 
@@ -812,20 +924,37 @@ fn h264_decode_residual(v: H264Video*, mb: H264Macroblock*) {
     }
   }
 
-  for group in 0..4 {
-    for sub in 0..4 {
-      var blk: int32 = group * 4 + sub;
-      var raster: int32 = v->blk_raster[blk];
+  if (mb->transform_8x8 != 0) {
+    for group in 0..4 {
       if ((mb->cbp_luma & (1 << group)) == 0) { continue; }
-      var coded: int32 = 0;
-      if (intra16 != 0) {
-        coded = h264_decode_residual_block(v, mb, &v->luma_ac[blk * 16], 0, 14, 15,
-                                           H264_CAT_LUMA_AC, blk, 0);
-      } else {
-        coded = h264_decode_residual_block(v, mb, &v->luma_ac[blk * 16], 0, 15, 16,
-                                           H264_CAT_LUMA_4X4, blk, 0);
+      var coded: int32 = h264_decode_residual_block(v, mb, &v->luma_8x8[group * 64], 0, 63, 64,
+                                                    H264_CAT_LUMA_8X8, group, 0);
+      if (coded != 0) {
+        var bx: int32 = (group & 1) * 2;
+        var by: int32 = (group >> 1) * 2;
+        for row in 0..2 {
+          for column in 0..2 {
+            mb->luma_nonzero[(by + row) * 4 + bx + column] = (uint8)1;
+          }
+        }
       }
-      if (coded != 0) { mb->luma_nonzero[raster] = (uint8)1; }
+    }
+  } else {
+    for group in 0..4 {
+      for sub in 0..4 {
+        var blk: int32 = group * 4 + sub;
+        var raster: int32 = v->blk_raster[blk];
+        if ((mb->cbp_luma & (1 << group)) == 0) { continue; }
+        var coded: int32 = 0;
+        if (intra16 != 0) {
+          coded = h264_decode_residual_block(v, mb, &v->luma_ac[blk * 16], 0, 14, 15,
+                                             H264_CAT_LUMA_AC, blk, 0);
+        } else {
+          coded = h264_decode_residual_block(v, mb, &v->luma_ac[blk * 16], 0, 15, 16,
+                                             H264_CAT_LUMA_4X4, blk, 0);
+        }
+        if (coded != 0) { mb->luma_nonzero[raster] = (uint8)1; }
+      }
     }
   }
 
@@ -888,6 +1017,67 @@ fn h264_scale_block(v: H264Video*, coefficients: int32*, block: int32*, qp: int3
     } else {
       block[position] = (level * scale + (1 << (3 - shift))) >> (4 - shift);
     }
+  }
+}
+
+fn h264_scale_block_8x8(v: H264Video*, coefficients: int32*, block: int32*, qp: int32) {
+  for i in 0..64 { block[i] = 0; }
+  var shift: int32 = qp / 6;
+  var remainder: int32 = qp % 6;
+  for i in 0..64 {
+    var position: int32 = v->zigzag8[i];
+    var level: int32 = coefficients[i];
+    if (level == 0) { continue; }
+    var scale: int32 = v->normalise8[remainder * 64 + position];
+    if (shift >= 6) {
+      block[position] = (level * scale) << (shift - 6);
+    } else {
+      var round: int32 = 1 << (5 - shift);
+      block[position] = (level * scale + round) >> (6 - shift);
+    }
+  }
+}
+
+fn h264_transform_8x8_line(a: int32*) {
+  var e0: int32 = a[0] + a[4];
+  var e1: int32 = 0 - a[3] + a[5] - a[7] - (a[7] >> 1);
+  var e2: int32 = a[0] - a[4];
+  var e3: int32 = a[1] + a[7] - a[3] - (a[3] >> 1);
+  var e4: int32 = (a[2] >> 1) - a[6];
+  var e5: int32 = 0 - a[1] + a[7] + a[5] + (a[5] >> 1);
+  var e6: int32 = a[2] + (a[6] >> 1);
+  var e7: int32 = a[3] + a[5] + a[1] + (a[1] >> 1);
+
+  var f0: int32 = e0 + e6;
+  var f1: int32 = e1 + (e7 >> 2);
+  var f2: int32 = e2 + e4;
+  var f3: int32 = e3 + (e5 >> 2);
+  var f4: int32 = e2 - e4;
+  var f5: int32 = (e3 >> 2) - e5;
+  var f6: int32 = e0 - e6;
+  var f7: int32 = e7 - (e1 >> 2);
+
+  a[0] = f0 + f7;
+  a[1] = f2 + f5;
+  a[2] = f4 + f3;
+  a[3] = f6 + f1;
+  a[4] = f6 - f1;
+  a[5] = f4 - f3;
+  a[6] = f2 - f5;
+  a[7] = f0 - f7;
+}
+
+fn h264_inverse_transform_8x8(v: H264Video*, block: int32*, residual: int32*) {
+  var line: int32[8];
+  for row in 0..8 {
+    for i in 0..8 { line[i] = block[row * 8 + i]; }
+    h264_transform_8x8_line(&line[0]);
+    for i in 0..8 { block[row * 8 + i] = line[i]; }
+  }
+  for column in 0..8 {
+    for i in 0..8 { line[i] = block[i * 8 + column]; }
+    h264_transform_8x8_line(&line[0]);
+    for i in 0..8 { residual[i * 8 + column] = (line[i] + 32) >> 6; }
   }
 }
 
