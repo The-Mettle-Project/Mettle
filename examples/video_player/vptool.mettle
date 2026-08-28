@@ -1,5 +1,4 @@
 import "std/io";
-import "std/math";
 import "std/mem";
 import "jpeg";
 import "source";
@@ -531,6 +530,7 @@ fn command_h264dump(path: cstring, frame_limit: int32, output: cstring, skip_fil
 }
 
 var g_pcm_scale: float64 = 1.0;
+var g_aac_trace: int32 = 0;
 
 fn command_aacwav(path: cstring, frame_limit: int32, output: cstring) -> int32 {
   var status: int32 = 0;
@@ -577,7 +577,9 @@ fn command_aacwav(path: cstring, frame_limit: int32, output: cstring) -> int32 {
     for n in 0..1024 {
       for ch in 0..channels {
         var value: float64 = pcm[ch * 1024 + n] * g_pcm_scale;
-        var scaled: int32 = (int32)(value * 32768.0);
+        var rounded: float64 = value + 0.5;
+        if (value < 0.0) { rounded = value - 0.5; }
+        var scaled: int32 = (int32)rounded;
         if (scaled > 32767) { scaled = 32767; }
         if (scaled < -32768) { scaled = -32768; }
         samples[at] = (uint8)(scaled & 255);
@@ -585,10 +587,21 @@ fn command_aacwav(path: cstring, frame_limit: int32, output: cstring) -> int32 {
         at = at + 2;
       }
     }
+    if (g_aac_trace != 0) {
+      var tns0: int32 = 0;
+      for w in 0..8 { tns0 = tns0 + decoder->channels[0].tns_filters[w]; }
+      var tns1: int32 = 0;
+      for w in 0..8 { tns1 = tns1 + decoder->channels[1].tns_filters[w]; }
+      println("f {i} win {decoder->channels[0].window_sequence} tns {tns0}/{tns1} ms {decoder->ms_mask}");
+    }
     fwrite(&samples[0], 1, (int64)at, fp);
     written = written + 1;
   }
   println("wrote {written} frames of raw 16 bit PCM");
+  print("codebook use:");
+  for i in 0..16 { print(" {i}:{g_aac_book_use[i]}"); }
+  println("");
+  println("windows: long {g_aac_window_use[0]} start {g_aac_window_use[1]} short {g_aac_window_use[2]} stop {g_aac_window_use[3]}");
   return 0;
 }
 
@@ -1050,7 +1063,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   }
   if (cstring_equals(command, "aacwav") != 0 && argc >= 5) {
     if (argc >= 6) { g_pcm_scale = 1.0 / (float64)parse_int(argv[5]); }
-    if (argc >= 7) { g_aac_use_tns = 0; }
+    if (argc >= 7) { g_aac_use_tns = 0; g_aac_trace = 1; }
     return command_aacwav(argv[2], parse_int(argv[3]), argv[4]);
   }
   if (cstring_equals(command, "aacparse") != 0 && argc >= 3) {

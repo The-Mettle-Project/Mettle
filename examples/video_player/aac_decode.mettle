@@ -2,7 +2,6 @@ import "std/io";
 import "std/mem";
 import "aac";
 import "aac_tables";
-import "std/math";
 
 const AAC_MAX_WINDOWS = 8;
 const AAC_MAX_SFB = 51;
@@ -35,6 +34,12 @@ struct AacChannel {
 
   sfb_codebook: int32[408];
   scale_factor: int32[408];
+
+  pulse_present: int32;
+  pulse_count: int32;
+  pulse_start_sfb: int32;
+  pulse_offset: int32[4];
+  pulse_amplitude: int32[4];
 
   tns_present: int32;
   tns_filters: int32[8];
@@ -90,6 +95,85 @@ struct AacDecoder {
   error: int32;
 }
 
+const AAC_PI = 3.14159265358979323846;
+
+fn aac_fabs(x: float64) -> float64 {
+  if (x < 0.0) { return 0.0 - x; }
+  return x;
+}
+
+fn aac_sqrt(x: float64) -> float64 {
+  if (x <= 0.0) { return 0.0; }
+  var value: float64 = x;
+  if (value > 1.0) { value = x / 2.0; }
+  for i in 0..40 { value = 0.5 * (value + x / value); }
+  return value;
+}
+
+fn aac_cbrt(x: float64) -> float64 {
+  if (x <= 0.0) { return 0.0; }
+  var value: float64 = x;
+  var scale: float64 = 1.0;
+  while (value >= 8.0) { value = value / 8.0; scale = scale * 2.0; }
+  while (value < 1.0) { value = value * 8.0; scale = scale / 2.0; }
+  var y: float64 = 1.5;
+  for i in 0..24 { y = (2.0 * y + value / (y * y)) / 3.0; }
+  return y * scale;
+}
+
+fn aac_sin_core(x: float64) -> float64 {
+  var x2: float64 = x * x;
+  var term: float64 = 1.0 / 362880.0;
+  term = 0.0 - 1.0 / 5040.0 + x2 * term;
+  term = 1.0 / 120.0 + x2 * term;
+  term = 0.0 - 1.0 / 6.0 + x2 * term;
+  term = 1.0 + x2 * term;
+  return x * term;
+}
+
+fn aac_cos_core(x: float64) -> float64 {
+  var x2: float64 = x * x;
+  var term: float64 = 1.0 / 40320.0;
+  term = 0.0 - 1.0 / 720.0 + x2 * term;
+  term = 1.0 / 24.0 + x2 * term;
+  term = 0.0 - 0.5 + x2 * term;
+  return 1.0 + x2 * term;
+}
+
+fn aac_cos(angle: float64) -> float64 {
+  var turns: float64 = angle / (2.0 * AAC_PI);
+  var whole: float64 = (float64)((int64)turns);
+  if (turns < 0.0) { whole = whole - 1.0; }
+  var reduced: float64 = angle - whole * 2.0 * AAC_PI;
+
+  var quadrant: int32 = (int32)(reduced / (AAC_PI / 2.0));
+  if (quadrant > 3) { quadrant = 3; }
+  var offset: float64 = reduced - (float64)quadrant * (AAC_PI / 2.0);
+
+  if (quadrant == 0) { return aac_cos_core(offset); }
+  if (quadrant == 1) { return 0.0 - aac_sin_core(offset); }
+  if (quadrant == 2) { return 0.0 - aac_cos_core(offset); }
+  return aac_sin_core(offset);
+}
+
+fn aac_sin(angle: float64) -> float64 {
+  return aac_cos(angle - AAC_PI / 2.0);
+}
+
+fn aac_scale_gain(scale: int32) -> float64 {
+  var exponent: int32 = scale - 100;
+  var whole: int32 = exponent >> 2;
+  var remainder: int32 = exponent - whole * 4;
+  var quarters: float64[4] = [1.0, 1.18920711500272107, 1.41421356237309515, 1.68179283050742909];
+  var value: float64 = quarters[remainder];
+  if (whole >= 0) {
+    for i in 0..whole { value = value * 2.0; }
+  } else {
+    for i in 0..(0 - whole) { value = value / 2.0; }
+  }
+  return value;
+}
+
 fn aac_bessel_i0(x: float64) -> float64 {
   var sum: float64 = 1.0;
   var term: float64 = 1.0;
@@ -105,38 +189,38 @@ fn aac_build_kbd(window: float64*, count: int32, alpha: float64) {
   var half: int32 = count / 2;
   var scratch: float64[1025];
   var total: float64 = 0.0;
-  var denominator: float64 = aac_bessel_i0(3.14159265358979323846 * alpha);
+  var denominator: float64 = aac_bessel_i0(AAC_PI * alpha);
   for i in 0..(half + 1) {
-    var ratio: float64 = (float64)(2 * i) / (float64)count - 1.0;
+    var ratio: float64 = (float64)(2 * i) / (float64)half - 1.0;
     var inner: float64 = 1.0 - ratio * ratio;
     if (inner < 0.0) { inner = 0.0; }
-    scratch[i] = aac_bessel_i0(3.14159265358979323846 * alpha * sqrt(inner)) / denominator;
+    scratch[i] = aac_bessel_i0(AAC_PI * alpha * aac_sqrt(inner)) / denominator;
   }
   for i in 0..(half + 1) { total = total + scratch[i]; }
   var running: float64 = 0.0;
   for i in 0..half {
     running = running + scratch[i];
-    window[i] = sqrt(running / total);
+    window[i] = aac_sqrt(running / total);
   }
 }
 
 fn aac_build_windows(d: AacDecoder*) {
-  var pi: float64 = 3.14159265358979323846;
+  var pi: float64 = AAC_PI;
 
   for i in 0..1024 {
-    d->window_long_sine[i] = sin(pi / 2048.0 * ((float64)i + 0.5));
+    d->window_long_sine[i] = aac_sin(pi / 2048.0 * ((float64)i + 0.5));
   }
   for i in 0..128 {
-    d->window_short_sine[i] = sin(pi / 256.0 * ((float64)i + 0.5));
+    d->window_short_sine[i] = aac_sin(pi / 256.0 * ((float64)i + 0.5));
   }
   aac_build_kbd(d->window_long_kbd, 2048, 4.0);
   aac_build_kbd(d->window_short_kbd, 256, 6.0);
 
   for i in 0..8192 {
-    d->cos_long[i] = cos(2.0 * pi * (float64)i / 8192.0);
+    d->cos_long[i] = aac_cos(2.0 * pi * (float64)i / 8192.0);
   }
   for i in 0..1024 {
-    d->cos_short[i] = cos(2.0 * pi * (float64)i / 1024.0);
+    d->cos_short[i] = aac_cos(2.0 * pi * (float64)i / 1024.0);
   }
 }
 
@@ -392,12 +476,30 @@ fn aac_read_scale_factors(d: AacDecoder*, r: AacBits*, c: AacChannel*) -> int32 
 
 fn aac_read_pulse_data(r: AacBits*, c: AacChannel*) -> int32 {
   var count: int32 = aac_read_bits(r, 2);
-  aac_read_bits(r, 6);
+  c->pulse_count = count + 1;
+  c->pulse_start_sfb = aac_read_bits(r, 6);
   for i in 0..(count + 1) {
-    aac_read_bits(r, 5);
-    aac_read_bits(r, 4);
+    c->pulse_offset[i] = aac_read_bits(r, 5);
+    c->pulse_amplitude[i] = aac_read_bits(r, 4);
   }
+  if (c->pulse_start_sfb > c->num_swb) { return AAC_ERR_BITSTREAM; }
+  c->pulse_present = 1;
   return AAC_OK;
+}
+
+fn aac_apply_pulses(c: AacChannel*) {
+  if (c->pulse_present == 0) { return; }
+  if (c->window_sequence == AAC_WINDOW_SHORT) { return; }
+  var k: int32 = c->swb_offset[c->pulse_start_sfb];
+  for i in 0..c->pulse_count {
+    k = k + c->pulse_offset[i];
+    if (k < 0 || k >= AAC_SPECTRUM) { return; }
+    if (c->spectrum[k] > 0.0) {
+      c->spectrum[k] = c->spectrum[k] + (float64)c->pulse_amplitude[i];
+    } else {
+      c->spectrum[k] = c->spectrum[k] - (float64)c->pulse_amplitude[i];
+    }
+  }
 }
 
 fn aac_read_tns_data(d: AacDecoder*, r: AacBits*, c: AacChannel*) -> int32 {
@@ -498,6 +600,7 @@ fn aac_read_channel_stream(d: AacDecoder*, r: AacBits*, c: AacChannel*,
                            common_window: int32) -> int32 {
   c->global_gain = aac_read_bits(r, 8);
   c->tns_present = 0;
+  c->pulse_present = 0;
   for i in 0..AAC_MAX_WINDOWS { c->tns_filters[i] = 0; }
 
   if (common_window == 0) {
@@ -529,6 +632,7 @@ fn aac_read_channel_stream(d: AacDecoder*, r: AacBits*, c: AacChannel*,
   d->fail_stage = 7;
   status = aac_read_spectral_data(d, r, c);
   if (status != AAC_OK) { d->fail_bits = r->position; }
+  aac_apply_pulses(c);
   return status;
 }
 
@@ -644,6 +748,8 @@ fn aac_decode_frame(d: AacDecoder*, data: uint8*, size: int64) -> int32 {
 }
 
 var g_aac_use_tns: int32 = 1;
+var g_aac_book_use: int64[16];
+var g_aac_window_use: int64[4];
 
 fn aac_dequantize(d: AacDecoder*, c: AacChannel*) {
   var group_start: int32 = 0;
@@ -651,12 +757,13 @@ fn aac_dequantize(d: AacDecoder*, c: AacChannel*) {
     var span: int32 = c->group_length[g];
     for sfb in 0..c->max_sfb {
       var book: int32 = c->sfb_codebook[g * AAC_MAX_SFB + sfb];
+      g_aac_book_use[book] = g_aac_book_use[book] + (int64)1;
       if (book == AAC_HCB_ZERO || book == AAC_HCB_NOISE ||
           book == AAC_HCB_INTENSITY || book == AAC_HCB_INTENSITY2) {
         continue;
       }
       var scale: int32 = c->scale_factor[g * AAC_MAX_SFB + sfb];
-      var gain: float64 = pow(2.0, 0.25 * (float64)(scale - 100));
+      var gain: float64 = aac_scale_gain(scale);
       var low: int32 = c->swb_offset[sfb];
       var high: int32 = c->swb_offset[sfb + 1];
       for w in 0..span {
@@ -665,8 +772,8 @@ fn aac_dequantize(d: AacDecoder*, c: AacChannel*) {
         for k in low..high {
           var value: float64 = c->spectrum[base + k];
           if (value == 0.0) { continue; }
-          var magnitude: float64 = fabs(value);
-          var scaled: float64 = pow(magnitude, 4.0 / 3.0) * gain;
+          var magnitude: float64 = aac_fabs(value);
+          var scaled: float64 = magnitude * aac_cbrt(magnitude) * gain;
           if (value < 0.0) { scaled = 0.0 - scaled; }
           c->spectrum[base + k] = scaled;
         }
@@ -712,7 +819,9 @@ fn aac_tns_band_limit(c: AacChannel*, window: int32, filter: int32, out_start: i
   for f in 0..filter { top = top - c->tns_length[window * 3 + f]; }
   var bottom: int32 = top - c->tns_length[slot];
   if (bottom < 0) { bottom = 0; }
+  if (top < 0) { top = 0; }
   if (top > c->max_sfb) { top = c->max_sfb; }
+  if (bottom > c->max_sfb) { bottom = c->max_sfb; }
   if (bottom > top) { bottom = top; }
   *out_start = c->swb_offset[bottom];
   *out_end = c->swb_offset[top];
@@ -729,6 +838,9 @@ fn aac_apply_tns(d: AacDecoder*, c: AacChannel*) {
       var slot: int32 = w * 3 + f;
       var order: int32 = c->tns_order[slot];
       if (order == 0) { continue; }
+      var limit: int32 = 12;
+      if (c->window_sequence == AAC_WINDOW_SHORT) { limit = 7; }
+      if (order > limit) { order = limit; }
 
       var start: int32 = 0;
       var end: int32 = 0;
@@ -844,6 +956,7 @@ fn aac_filterbank(d: AacDecoder*, c: AacChannel*, output: float64*) {
     for i in 0..1024 { output[i] = c->overlap[i] + transform[i] * left[i]; }
     for i in 0..1024 { c->overlap[i] = transform[1024 + i] * right[i]; }
   }
+  g_aac_window_use[c->window_sequence] = g_aac_window_use[c->window_sequence] + (int64)1;
   c->previous_window_shape = c->window_shape;
 }
 
