@@ -48,6 +48,7 @@ extern fn Gdi_StretchDIBits(hdc: int64, xdst: int32, ydst: int32, wdst: int32, h
 extern fn Gdi_SetStretchBltMode(hdc: int64, mode: int32) -> int32 = "SetStretchBltMode";
 extern fn Win_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
 extern fn Win_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn Win_AttachConsole(process: uint32) -> int32 = "AttachConsole";
 extern fn Win_AdjustWindowRect(rect: UiRect*, style: uint32, menu: int32) -> int32 = "AdjustWindowRect";
 extern fn Win_MonitorFromWindow(hwnd: int64, flags: uint32) -> int64 = "MonitorFromWindow";
 extern fn Win_GetMonitorInfoA(monitor: int64, info: MonitorInfo*) -> int32 = "GetMonitorInfoA";
@@ -860,31 +861,40 @@ fn widen_text(input: cstring, output: uint16*, capacity: int32) -> int32 {
   return written;
 }
 
-fn print_controls() {
-  println("controls:");
-  println("  space or K     play and pause");
-  println("  left / right   seek 5 seconds");
-  println("  J / L          seek 30 seconds");
-  println("  , / .          step one frame");
-  println("  home / end     start and end");
-  println("  up / down      volume, mouse wheel does the same");
-  println("  M              mute");
-  println("  F or F11       fullscreen, double click does the same");
-  println("  click the bar  seek, drag to scrub");
-  println("  esc or Q       quit");
+fn report(message: string) {
+  var text: cstring = cstr(message, malloc);
+  if (text == 0) { return; }
+  Ui_MessageBoxA(0, text, "Player", (uint32)48);
+  free(text);
+}
+
+fn report_cstr(prefix: string, tail: cstring) {
+  var length: int64 = 0;
+  while (tail[length] != 0) { length = length + 1; }
+  var total: int64 = (int64)prefix.length + length + 1;
+  var text: cstring = malloc(total);
+  if (text == 0) { report(prefix); return; }
+  var source: cstring = prefix.chars;
+  var i: int64 = 0;
+  while (i < (int64)prefix.length) { text[i] = source[i]; i = i + 1; }
+  var j: int64 = 0;
+  while (j < length) { text[i + j] = tail[j]; j = j + 1; }
+  text[i + length] = 0;
+  Ui_MessageBoxA(0, text, "Player", (uint32)48);
+  free(text);
+}
+
+fn print_usage() {
+  report("Open a video file with this player, or pass one on the command line.\n\nIt plays H.264 and Motion JPEG video with AAC or PCM audio, from AVI, MP4 and MOV.\n\ncontrols\n  space or K     play and pause\n  left / right   seek 5 seconds\n  J / L          seek 30 seconds\n  , / .          step one frame\n  home / end     start and end\n  up / down      volume, mouse wheel does the same\n  M              mute\n  F or F11       fullscreen, double click does the same\n  click the bar  seek, drag to scrub\n  esc or Q       quit");
 }
 
 fn main(argc: int32, argv: cstring*) -> int32 {
   if (argc < 2) {
-    println("usage: player <file>");
-    println("");
-    println("Plays Motion JPEG video with PCM audio from AVI, MP4 and MOV.");
-    println("Convert any source with ffmpeg:");
-    println("  ffmpeg -i input.mp4 -c:v mjpeg -q:v 5 -pix_fmt yuvj420p -c:a pcm_s16le clip.avi");
-    println("");
-    print_controls();
+    print_usage();
     return 0;
   }
+
+  Win_AttachConsole((uint32)4294967295);
 
   Win_QueryPerformanceFrequency(&g_qpc_frequency);
   if (g_qpc_frequency <= 0) { g_qpc_frequency = 1; }
@@ -892,17 +902,16 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   var status: int32 = 0;
   g_file = source_open(argv[1], &status);
   if (g_file == 0) {
-    print("cannot open ");
-    println_cstr(argv[1]);
-    if (status == SOURCE_ERR_OPEN) { println("no such file"); }
-    if (status == SOURCE_ERR_FORMAT) { println("not an AVI, MP4 or MOV file"); }
-    if (status == SOURCE_ERR_NO_VIDEO) { println("no video track found"); }
+    if (status == SOURCE_ERR_OPEN) { report_cstr("No such file: ", argv[1]); }
+    else if (status == SOURCE_ERR_FORMAT) { report_cstr("Not an AVI, MP4 or MOV file: ", argv[1]); }
+    else if (status == SOURCE_ERR_NO_VIDEO) { report_cstr("No video track in ", argv[1]); }
+    else { report_cstr("Cannot open ", argv[1]); }
     return 1;
   }
   defer source_close(g_file);
 
   if (g_file->video_codec == SOURCE_VIDEO_UNKNOWN) {
-    println("this file carries video this player cannot decode");
+    report("This file carries video this player cannot decode.");
     return 1;
   }
 
@@ -914,15 +923,12 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     g_parser = h264_decoder_new();
     if (g_parser == 0) { return 1; }
     if (h264_read_config(g_parser, g_file->codec_config, g_file->codec_config_size) != H264_OK) {
-      println("cannot read the H.264 parameter sets");
+      report("The H.264 parameter sets in this file cannot be read.");
       return 1;
     }
     var missing: cstring = h264_unsupported_reason(g_parser);
     if (missing != 0) {
-      print("this file needs ");
-      print_cstr(missing);
-      println("");
-      println("the picture would be blank, so nothing is played");
+      report_cstr("This file needs ", missing);
       return 1;
     }
     g_video = h264_video_new(g_parser);
@@ -965,7 +971,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   g_window = ui_window_create_centered_unicode(&wide_title[0], window_width, window_height,
                                                &window_proc);
   if (g_window == 0) {
-    println("cannot create window");
+    report("The player could not create its window.");
     return 1;
   }
   Win_SetWindowTextW(g_window, &wide_title[0]);

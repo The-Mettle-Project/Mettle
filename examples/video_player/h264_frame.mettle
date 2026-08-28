@@ -724,6 +724,11 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
     if (h264_decode_terminate(v) != 0) { break; }
     address = address + 1;
   }
+  if (g_trace_mb != 0) {
+    var c: H264Cabac* = &v->cabac;
+    println("slice end at mb {address} of {v->mb_count}, cabac byte {c->bit_position / 8} of {c->size}");
+    fflush(0);
+  }
   return H264_OK;
 }
 

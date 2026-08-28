@@ -1841,6 +1841,9 @@ static int mettle_link_internal(const char **object_paths,
     goto cleanup;
   }
 
+  if (options && options->windows_subsystem) {
+    emission_options.subsystem = 2u;
+  }
   emission_options.import_library_paths =
       (const char **)import_library_paths.items;
   emission_options.import_library_count = import_library_paths.count;
@@ -1942,7 +1945,7 @@ static int mettle_link_object_with_gcc(const char *object_filename,
                                         size_t runtime_object_count,
                                         const CompilerOptions *options) {
   size_t link_argument_count = options ? options->link_argument_count : 0u;
-  size_t capacity = 11u + runtime_object_count + link_argument_count;
+  size_t capacity = 12u + runtime_object_count + link_argument_count;
   const char **arguments = calloc(capacity, sizeof(*arguments));
   size_t count = 0u;
   int result;
@@ -1957,6 +1960,9 @@ static int mettle_link_object_with_gcc(const char *object_filename,
   arguments[count++] = "-nodefaultlibs";
   arguments[count++] = "-Wl,--disable-runtime-pseudo-reloc";
   arguments[count++] = "-Wl,-e,mettle_start,--gc-sections";
+  if (options && options->windows_subsystem) {
+    arguments[count++] = "-Wl,--subsystem,windows";
+  }
   arguments[count++] = object_filename;
   for (size_t i = 0; i < runtime_object_count; i++) {
     if (runtime_objects[i] && runtime_objects[i][0]) {
@@ -2012,8 +2018,11 @@ static int mettle_link_object_with_link(const char *object_filename,
   size_t offset = 0;
   if (!append_argument_text(
           link_command, link_len, &offset,
-          "link.exe /nologo /nodefaultlib /entry:mettle_start "
-          "/subsystem:console /out:") ||
+          (options && options->windows_subsystem)
+              ? "link.exe /nologo /nodefaultlib /entry:mettle_start "
+                "/subsystem:windows /out:"
+              : "link.exe /nologo /nodefaultlib /entry:mettle_start "
+                "/subsystem:console /out:") ||
       !append_quoted_argument(link_command, link_len, &offset,
                               executable_filename) ||
       !append_argument_text(link_command, link_len, &offset, " ") ||
@@ -3400,6 +3409,21 @@ int main(int argc, char *argv[]) {
       }
     } else if (strcmp(argv[i], "--linker") == 0) {
       fprintf(stderr, "Error: Missing linker mode after '--linker'\n");
+      return 1;
+    } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
+      const char *name = argv[++i];
+      if (strcmp(name, "windows") == 0 || strcmp(name, "gui") == 0) {
+        options.windows_subsystem = 1;
+      } else if (strcmp(name, "console") == 0) {
+        options.windows_subsystem = 0;
+      } else {
+        fprintf(stderr,
+                "Error: Unknown subsystem '%s' (expected console or windows)\n",
+                name);
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--subsystem") == 0) {
+      fprintf(stderr, "Error: Missing subsystem after '--subsystem'\n");
       return 1;
     } else if (strcmp(argv[i], "--link-arg") == 0 && i + 1 < argc) {
       if (!add_link_argument(&options, argv[++i])) {
@@ -5452,6 +5476,8 @@ void print_usage(const char *program_name) {
   printf("  --linker <mode>     Linker backend: auto, internal, gcc, or msvc "
          "(default: internal with --build, otherwise %s)\n",
          linker_mode_name(LINKER_MODE_AUTO));
+  printf("  --subsystem <kind>  Windows subsystem: console or windows. A windows "
+         "image gets no console window\n");
   printf("  --link-arg <arg>    Pass an extra linker argument (repeatable; "
          "use with --build)\n");
   printf("  --tracy             Link std/tracy with the Tracy profiler "

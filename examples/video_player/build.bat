@@ -20,7 +20,7 @@ if not exist bin\mettle.exe (
 )
 
 echo Building examples\video_player\player.exe ...
-bin\mettle.exe --build --release --linker internal examples\video_player\player.mettle -o examples\video_player\player.exe
+bin\mettle.exe --build --release --linker internal --subsystem windows examples\video_player\player.mettle -o examples\video_player\player.exe
 if errorlevel 1 (
   echo ERROR: player build failed.
   exit /b 1

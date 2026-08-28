@@ -313,7 +313,7 @@ fn h264_video_new(parser: H264Decoder*) -> H264Video* {
   return v;
 }
 
-fn h264_video_free(v: H264Video*) {
+@inline fn h264_video_free(v: H264Video*) {
   if (v == 0) { return; }
   if (v->context_slope != 0) { free(v->context_slope); }
   if (v->context_offset != 0) { free(v->context_offset); }
@@ -471,7 +471,7 @@ fn h264_cabac_init_contexts(v: H264Video*, slice_qp: int32, model: int32) {
   }
 }
 
-fn h264_decode_bin(v: H264Video*, context: int32) -> int32 {
+@inline fn h264_decode_bin(v: H264Video*, context: int32) -> int32 {
   var c: H264Cabac* = &v->cabac;
   var state: int32 = c->state[context];
   var lps: int32 = v->range_lps[state * 4 + ((c->range >> 6) & 3)];
@@ -795,7 +795,7 @@ fn h264_category_level_offset(category: int32) -> int32 {
   return 39;
 }
 
-fn h264_decode_residual_block(v: H264Video*, mb: H264Macroblock*, coefficients: int32*,
+@inline fn h264_decode_residual_block(v: H264Video*, mb: H264Macroblock*, coefficients: int32*,
                               start_index: int32, end_index: int32, max_coefficients: int32,
                               category: int32, index: int32, component: int32) -> int32 {
   for i in 0..max_coefficients {

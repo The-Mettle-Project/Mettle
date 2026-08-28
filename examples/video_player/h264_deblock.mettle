@@ -342,8 +342,10 @@ fn h264_deblock_picture(v: H264Video*) {
 
   for mb_y in 0..v->mb_height {
     for mb_x in 0..v->mb_width {
+      var eight: int32 = v->macroblocks[mb_y * v->mb_width + mb_x].transform_8x8;
       for edge in 0..4 {
         if (edge == 0 && mb_x == 0) { continue; }
+        if (eight != 0 && (edge & 1) != 0) { continue; }
         h264_deblock_vertical_luma(v, mb_x, mb_y, edge);
       }
       for edge in 0..2 {
@@ -352,6 +354,7 @@ fn h264_deblock_picture(v: H264Video*) {
       }
       for edge in 0..4 {
         if (edge == 0 && mb_y == 0) { continue; }
+        if (eight != 0 && (edge & 1) != 0) { continue; }
         h264_deblock_horizontal_luma(v, mb_x, mb_y, edge);
       }
       for edge in 0..2 {

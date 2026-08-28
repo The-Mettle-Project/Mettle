@@ -136,6 +136,9 @@ typedef struct {
    * only sound when `main` is the single entry point, e.g. dead-function
    * elimination. */
   int building_executable;
+  /* --subsystem=windows: mark the PE as a GUI image so Windows does not create
+   * a console window for it. Ignored on non-PE targets. */
+  int windows_subsystem;
   LinkerMode linker_mode;
 } CompilerOptions;
 
