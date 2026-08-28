@@ -7,6 +7,7 @@ import "mp4";
 import "h264";
 import "h264_decode";
 import "h264_frame";
+import "h264_gpu";
 import "aac";
 import "aac_decode";
 
@@ -869,7 +870,7 @@ fn command_h264stats(path: cstring, frame_limit: int32) -> int32 {
   return 0;
 }
 
-fn command_h264bench(path: cstring, frame_limit: int32) -> int32 {
+fn command_h264gpucheck(path: cstring, frame_limit: int32) -> int32 {
   var status: int32 = 0;
   var file: MediaSource* = source_open(path, &status);
   if (file == 0) { return 1; }
@@ -883,6 +884,119 @@ fn command_h264bench(path: cstring, frame_limit: int32) -> int32 {
   var video: H264Video* = h264_video_new(parser);
   if (video == 0) { return 1; }
   defer h264_video_free(video);
+
+  if (h264_gpu_probe() == 0) {
+    print("no GPU colour path: ");
+    println_cstr(h264_gpu_status());
+    return 1;
+  }
+  print("checking against ");
+  println_cstr(h264_gpu_device());
+
+  var buffer: uint8* = malloc((int64)file->max_video_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  var limit: int32 = frame_limit;
+  if (limit > file->video_frame_count) { limit = file->video_frame_count; }
+
+  var host: uint32* = 0;
+  var device: uint32* = 0;
+  var count: int64 = 0;
+  var mismatches: int64 = 0;
+  var worst: int32 = 0;
+  var frames: int32 = 0;
+  var gpu_us: int64 = 0;
+  var cpu_us: int64 = 0;
+
+  for i in 0..limit {
+    var size: int32 = source_read_video_by_sample(file, i, buffer, (int64)file->max_video_size);
+    if (size <= 0) { return 1; }
+    if (h264_decode_sample(video, buffer, (int64)size) != H264_OK) { return 1; }
+    if (host == 0) {
+      count = (int64)video->width * (int64)video->height;
+      host = malloc(count * 4);
+      device = malloc(count * 4);
+      if (host == 0 || device == 0) { return 1; }
+    }
+    var t0: int64 = now_microseconds();
+    h264_gpu_set_enabled(0);
+    h264_write_pixels_to(video, host);
+    var t1: int64 = now_microseconds();
+    h264_gpu_set_enabled(1);
+    if (h264_gpu_convert(video, device) == 0) {
+      println("frame {i}: the GPU path refused");
+      return 1;
+    }
+    var t2: int64 = now_microseconds();
+    cpu_us = cpu_us + (t1 - t0);
+    gpu_us = gpu_us + (t2 - t1);
+    frames = frames + 1;
+
+    for p in 0..count {
+      if (host[p] != device[p]) {
+        mismatches = mismatches + (int64)1;
+        var a: int32 = (int32)(host[p] & (uint32)255) - (int32)(device[p] & (uint32)255);
+        if (a < 0) { a = 0 - a; }
+        if (a > worst) { worst = a; }
+        var b: int32 = (int32)((host[p] >> (uint32)8) & (uint32)255) -
+                       (int32)((device[p] >> (uint32)8) & (uint32)255);
+        if (b < 0) { b = 0 - b; }
+        if (b > worst) { worst = b; }
+        var c: int32 = (int32)((host[p] >> (uint32)16) & (uint32)255) -
+                       (int32)((device[p] >> (uint32)16) & (uint32)255);
+        if (c < 0) { c = 0 - c; }
+        if (c > worst) { worst = c; }
+      }
+    }
+  }
+  println("{frames} frames, {count} pixels each");
+  println("pixels that differ: {mismatches}, largest channel difference {worst}");
+  println("cpu {cpu_us / (int64)frames} us per frame, gpu {gpu_us / (int64)frames} us per frame");
+
+  var pageable_us: int64 = 0;
+  for i in 0..frames {
+    var t0: int64 = now_microseconds();
+    h264_gpu_convert(video, device);
+    pageable_us = pageable_us + (now_microseconds() - t0);
+  }
+  var locked: uint32* = (uint32*)h264_gpu_host_alloc(count * 4);
+  var locked_us: int64 = 0;
+  if (locked != 0) {
+    for i in 0..frames {
+      var t0: int64 = now_microseconds();
+      h264_gpu_convert(video, locked);
+      locked_us = locked_us + (now_microseconds() - t0);
+    }
+    for p in 0..count {
+      if (locked[p] != device[p]) { println("pinned path differs at {p}"); return 1; }
+    }
+    h264_gpu_host_free((uint8*)locked);
+  }
+  println("into ordinary memory {pageable_us / (int64)frames} us, into locked memory {locked_us / (int64)frames} us");
+  if (host != 0) { free(host); }
+  if (device != 0) { free(device); }
+  if (mismatches != (int64)0) { return 1; }
+  println("the GPU colour path is exact");
+  return 0;
+}
+
+fn command_h264bench(path: cstring, frame_limit: int32, skip_filter: int32) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) { return 1; }
+  defer source_close(file);
+
+  var parser: H264Decoder* = h264_decoder_new();
+  if (parser == 0) { return 1; }
+  defer h264_decoder_free(parser);
+  if (h264_read_config(parser, file->codec_config, file->codec_config_size) != H264_OK) { return 1; }
+
+  var video: H264Video* = h264_video_new(parser);
+  if (video == 0) { return 1; }
+  defer h264_video_free(video);
+  video->skip_deblocking = skip_filter & 1;
+  if ((skip_filter & 2) != 0) { h264_gpu_set_enabled(0); }
 
   var buffer: uint8* = malloc((int64)file->max_video_size);
   if (buffer == 0) { return 1; }
@@ -899,6 +1013,9 @@ fn command_h264bench(path: cstring, frame_limit: int32) -> int32 {
   var worst_index: int32 = 0;
   var late_us: int64 = 0;
   var late_count: int32 = 0;
+  var checksum: int64 = 0;
+  var surface: uint32* = 0;
+  defer h264_gpu_host_free((uint8*)surface);
   for i in 0..limit {
     var t0: int64 = now_microseconds();
     var size: int32 = source_read_video_by_sample(file, i, buffer, (int64)file->max_video_size);
@@ -909,7 +1026,11 @@ fn command_h264bench(path: cstring, frame_limit: int32) -> int32 {
       return 1;
     }
     var t2: int64 = now_microseconds();
-    h264_write_pixels(video);
+    if (surface == 0) {
+      surface = (uint32*)h264_gpu_host_alloc((int64)video->width * (int64)video->height * 4);
+      if (surface == 0) { return 1; }
+    }
+    h264_write_pixels_deferred(video, surface);
     var t3: int64 = now_microseconds();
     read_us = read_us + (t1 - t0);
     decode_us = decode_us + (t2 - t1);
@@ -923,10 +1044,33 @@ fn command_h264bench(path: cstring, frame_limit: int32) -> int32 {
       late_count = late_count + 1;
     }
     decoded = decoded + 1;
+    var hash: int64 = checksum;
+    for y in 0..video->height {
+      var row: int64 = (int64)(y + video->crop_top) * (int64)video->luma_stride + (int64)video->crop_left;
+      for x in 0..video->width {
+        hash = hash * (int64)131 + (int64)video->luma[row + (int64)x];
+      }
+    }
+    for y in 0..(video->height / 2) {
+      var crow: int64 = (int64)(y + video->crop_top / 2) * (int64)video->chroma_stride + (int64)(video->crop_left / 2);
+      for x in 0..(video->width / 2) {
+        hash = hash * (int64)131 + (int64)video->cb[crow + (int64)x];
+        hash = hash * (int64)131 + (int64)video->cr[crow + (int64)x];
+      }
+    }
+    checksum = hash;
   }
 
+  h264_gpu_wait();
   var total: int64 = read_us + decode_us + write_us;
   println("{decoded} frames {video->width}x{video->height}");
+  if (h264_gpu_active() != 0) {
+    print("colour on     ");
+    println_cstr(h264_gpu_device());
+  } else {
+    print("colour on     the CPU: ");
+    println_cstr(h264_gpu_status());
+  }
   println("read   {read_us} us");
   println("decode {decode_us} us");
   println("write  {write_us} us");
@@ -934,6 +1078,8 @@ fn command_h264bench(path: cstring, frame_limit: int32) -> int32 {
   var per: int64 = total / (int64)decoded;
   println("per frame {per} us");
   println("worst frame {worst_index}: {worst} us");
+  println("checksum {checksum}");
+
   if (late_count > 0) {
     var late_per: int64 = late_us / (int64)late_count;
     println("second half per frame {late_per} us");
@@ -1037,6 +1183,7 @@ fn print_usage() {
   println("  vptool audio <input> [seconds]");
   println("  vptool h264info <input.mp4> [samples]");
   println("  vptool h264dump <input.mp4> <frames> <out.yuv>");
+  println("  vptool h264gpucheck <input.mp4> [frames]");
   println("  vptool mp4info <input.mp4>");
   println("  vptool mp4samples <input.mp4> <track> <count>");
 }
@@ -1056,10 +1203,17 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   if (cstring_equals(command, "frame") != 0 && argc >= 5) {
     return command_frame(argv[2], parse_int(argv[3]), argv[4]);
   }
+  if (cstring_equals(command, "h264gpucheck") != 0 && argc >= 3) {
+    var check_limit: int32 = 40;
+    if (argc >= 4) { check_limit = parse_int(argv[3]); }
+    return command_h264gpucheck(argv[2], check_limit);
+  }
   if (cstring_equals(command, "h264bench") != 0 && argc >= 3) {
     var bench_limit: int32 = 1000000;
     if (argc >= 4) { bench_limit = parse_int(argv[3]); }
-    return command_h264bench(argv[2], bench_limit);
+    var bench_skip: int32 = 0;
+    if (argc >= 5) { bench_skip = parse_int(argv[4]); }
+    return command_h264bench(argv[2], bench_limit, bench_skip);
   }
   if (cstring_equals(command, "bench") != 0) {
     return command_bench(argv[2]);

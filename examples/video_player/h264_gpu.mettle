@@ -1,0 +1,370 @@
+import "std/mem";
+import "h264_decode";
+
+extern fn H264Gpu_LoadLibraryA(name: cstring) -> int64 = "LoadLibraryA";
+extern fn H264Gpu_GetProcAddress(module: int64, name: cstring) -> int64 = "GetProcAddress";
+extern fn H264Gpu_GetModuleFileNameA(module: int64, out: uint8*, size: uint32) -> uint32 = "GetModuleFileNameA";
+extern fn H264Gpu_fopen(path: uint8*, mode: cstring) -> int64 = "fopen";
+extern fn H264Gpu_fread(buffer: uint8*, size: int64, count: int64, stream: int64) -> int64 = "fread";
+extern fn H264Gpu_fseek(stream: int64, offset: int64, origin: int32) -> int32 = "_fseeki64";
+extern fn H264Gpu_ftell(stream: int64) -> int64 = "_ftelli64";
+extern fn H264Gpu_fclose(stream: int64) -> int32 = "fclose";
+
+const H264_GPU_UNTRIED = 0;
+const H264_GPU_READY = 1;
+const H264_GPU_ABSENT = 2;
+
+var g_gpu_state: int32 = H264_GPU_UNTRIED;
+var g_gpu_off: int32 = 0;
+var g_gpu_reason: int32 = 0;
+var g_gpu_name: uint8[256];
+
+var cu_init_at: fn(uint32) -> int32 = 0;
+var cu_device_at: fn(int32*, int32) -> int32 = 0;
+var cu_device_name_at: fn(uint8*, int32, int32) -> int32 = 0;
+var cu_context_at: fn(int64*, uint32, int32) -> int32 = 0;
+var cu_module_at: fn(int64*, uint8*) -> int32 = 0;
+var cu_function_at: fn(int64*, int64, cstring) -> int32 = 0;
+var cu_alloc_at: fn(int64*, int64) -> int32 = 0;
+var cu_release_at: fn(int64) -> int32 = 0;
+var cu_upload_at: fn(int64, uint8*, int64) -> int32 = 0;
+var cu_download_at: fn(uint8*, int64, int64) -> int32 = 0;
+var cu_host_alloc_at: fn(int64*, int64, uint32) -> int32 = 0;
+var cu_host_free_at: fn(int64) -> int32 = 0;
+var cu_launch_at: fn(int64, uint32, uint32, uint32, uint32, uint32, uint32,
+                     uint32, int64, int64*, int64*) -> int32 = 0;
+var cu_stream_new_at: fn(int64*, uint32) -> int32 = 0;
+var cu_stream_wait_at: fn(int64) -> int32 = 0;
+var cu_upload_async_at: fn(int64, uint8*, int64, int64) -> int32 = 0;
+var cu_download_async_at: fn(uint8*, int64, int64, int64) -> int32 = 0;
+
+var g_gpu_kernel: int64 = 0;
+var g_gpu_stream: int64 = 0;
+var g_gpu_pending: int32 = 0;
+var g_gpu_luma: int64 = 0;
+var g_gpu_cb: int64 = 0;
+var g_gpu_cr: int64 = 0;
+var g_gpu_out: int64 = 0;
+var g_gpu_plane_bytes: int64 = 0;
+var g_gpu_chroma_bytes: int64 = 0;
+var g_gpu_out_bytes: int64 = 0;
+
+fn h264_gpu_module_path(out: uint8*, size: int32) -> int32 {
+  var length: int32 = (int32)H264Gpu_GetModuleFileNameA(0, out, (uint32)size);
+  if (length <= 0 || length >= size) { return 0; }
+  var cut: int32 = 0;
+  for i in 0..length {
+    if (out[i] == (uint8)92 || out[i] == (uint8)47) { cut = i + 1; }
+  }
+  var name: cstring = "video_kernels.ptx";
+  var i: int32 = 0;
+  while (name[i] != (uint8)0) {
+    if (cut + i >= size - 1) { return 0; }
+    out[cut + i] = name[i];
+    i = i + 1;
+  }
+  out[cut + i] = (uint8)0;
+  return 1;
+}
+
+fn h264_gpu_read_module() -> uint8* {
+  var path: uint8[1024];
+  if (h264_gpu_module_path(&path[0], 1024) == 0) { return 0; }
+  var file: int64 = H264Gpu_fopen(&path[0], "rb");
+  if (file == 0) { return 0; }
+  H264Gpu_fseek(file, 0, 2);
+  var size: int64 = H264Gpu_ftell(file);
+  H264Gpu_fseek(file, 0, 0);
+  if (size <= 0) {
+    H264Gpu_fclose(file);
+    return 0;
+  }
+  var image: uint8* = malloc(size + (int64)1);
+  if (image == 0) {
+    H264Gpu_fclose(file);
+    return 0;
+  }
+  var read: int64 = H264Gpu_fread(image, 1, size, file);
+  H264Gpu_fclose(file);
+  if (read != size) {
+    free(image);
+    return 0;
+  }
+  image[size] = (uint8)0;
+  return image;
+}
+
+fn h264_gpu_bind(library: int64) -> int32 {
+  var address: int64 = H264Gpu_GetProcAddress(library, "cuInit");
+  if (address == 0) { return 0; }
+  cu_init_at = (fn(uint32) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuDeviceGet");
+  if (address == 0) { return 0; }
+  cu_device_at = (fn(int32*, int32) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuDeviceGetName");
+  if (address == 0) { return 0; }
+  cu_device_name_at = (fn(uint8*, int32, int32) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuCtxCreate_v2");
+  if (address == 0) { return 0; }
+  cu_context_at = (fn(int64*, uint32, int32) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuModuleLoadData");
+  if (address == 0) { return 0; }
+  cu_module_at = (fn(int64*, uint8*) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuModuleGetFunction");
+  if (address == 0) { return 0; }
+  cu_function_at = (fn(int64*, int64, cstring) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuMemAlloc_v2");
+  if (address == 0) { return 0; }
+  cu_alloc_at = (fn(int64*, int64) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuMemFree_v2");
+  if (address == 0) { return 0; }
+  cu_release_at = (fn(int64) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuMemcpyHtoD_v2");
+  if (address == 0) { return 0; }
+  cu_upload_at = (fn(int64, uint8*, int64) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuMemcpyDtoH_v2");
+  if (address == 0) { return 0; }
+  cu_download_at = (fn(uint8*, int64, int64) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuMemHostAlloc");
+  if (address == 0) { return 0; }
+  cu_host_alloc_at = (fn(int64*, int64, uint32) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuMemFreeHost");
+  if (address == 0) { return 0; }
+  cu_host_free_at = (fn(int64) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuLaunchKernel");
+  if (address == 0) { return 0; }
+  cu_launch_at = (fn(int64, uint32, uint32, uint32, uint32, uint32, uint32,
+                     uint32, int64, int64*, int64*) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuStreamCreate");
+  if (address == 0) { return 0; }
+  cu_stream_new_at = (fn(int64*, uint32) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuStreamSynchronize");
+  if (address == 0) { return 0; }
+  cu_stream_wait_at = (fn(int64) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuMemcpyHtoDAsync_v2");
+  if (address == 0) { return 0; }
+  cu_upload_async_at = (fn(int64, uint8*, int64, int64) -> int32)address;
+
+  address = H264Gpu_GetProcAddress(library, "cuMemcpyDtoHAsync_v2");
+  if (address == 0) { return 0; }
+  cu_download_async_at = (fn(uint8*, int64, int64, int64) -> int32)address;
+  return 1;
+}
+
+fn h264_gpu_start() {
+  g_gpu_state = H264_GPU_ABSENT;
+
+  var library: int64 = H264Gpu_LoadLibraryA("nvcuda.dll");
+  if (library == 0) {
+    g_gpu_reason = 1;
+    return;
+  }
+  if (h264_gpu_bind(library) == 0) {
+    g_gpu_reason = 2;
+    return;
+  }
+  if (cu_init_at((uint32)0) != 0) {
+    g_gpu_reason = 3;
+    return;
+  }
+  var device: int32 = 0;
+  if (cu_device_at(&device, 0) != 0) {
+    g_gpu_reason = 4;
+    return;
+  }
+  var context: int64 = 0;
+  if (cu_context_at(&context, (uint32)0, device) != 0) {
+    g_gpu_reason = 5;
+    return;
+  }
+  cu_device_name_at(&g_gpu_name[0], 255, device);
+
+  var image: uint8* = h264_gpu_read_module();
+  if (image == 0) {
+    g_gpu_reason = 6;
+    return;
+  }
+  var module: int64 = 0;
+  var status: int32 = cu_module_at(&module, image);
+  free(image);
+  if (status != 0) {
+    g_gpu_reason = 7;
+    return;
+  }
+  if (cu_function_at(&g_gpu_kernel, module, "yuv420_to_bgra") != 0) {
+    g_gpu_reason = 8;
+    return;
+  }
+  if (cu_stream_new_at(&g_gpu_stream, (uint32)1) != 0) {
+    g_gpu_stream = 0;
+  }
+  g_gpu_reason = 9;
+  g_gpu_state = H264_GPU_READY;
+}
+
+fn h264_gpu_buffers(v: H264Video*) -> int32 {
+  var plane: int64 = (int64)v->luma_stride * (int64)(v->mb_height * 16);
+  var chroma: int64 = (int64)v->chroma_stride * (int64)(v->mb_height * 8);
+  var pixels: int64 = (int64)v->width * (int64)v->height * (int64)4;
+
+  if (g_gpu_plane_bytes != plane) {
+    if (g_gpu_luma != 0) { cu_release_at(g_gpu_luma); g_gpu_luma = 0; }
+    if (cu_alloc_at(&g_gpu_luma, plane) != 0) { g_gpu_plane_bytes = 0; return 0; }
+    g_gpu_plane_bytes = plane;
+  }
+  if (g_gpu_chroma_bytes != chroma) {
+    if (g_gpu_cb != 0) { cu_release_at(g_gpu_cb); g_gpu_cb = 0; }
+    if (g_gpu_cr != 0) { cu_release_at(g_gpu_cr); g_gpu_cr = 0; }
+    if (cu_alloc_at(&g_gpu_cb, chroma) != 0) { g_gpu_chroma_bytes = 0; return 0; }
+    if (cu_alloc_at(&g_gpu_cr, chroma) != 0) { g_gpu_chroma_bytes = 0; return 0; }
+    g_gpu_chroma_bytes = chroma;
+  }
+  if (g_gpu_out_bytes != pixels) {
+    if (g_gpu_out != 0) { cu_release_at(g_gpu_out); g_gpu_out = 0; }
+    if (cu_alloc_at(&g_gpu_out, pixels) != 0) { g_gpu_out_bytes = 0; return 0; }
+    g_gpu_out_bytes = pixels;
+  }
+  return 1;
+}
+
+fn h264_gpu_wait() {
+  if (g_gpu_pending == 0) { return; }
+  cu_stream_wait_at(g_gpu_stream);
+  g_gpu_pending = 0;
+}
+
+fn h264_gpu_convert_async(v: H264Video*, out: uint32*) -> int32 {
+  if (g_gpu_off != 0) { return 0; }
+  if (g_gpu_state == H264_GPU_UNTRIED) { h264_gpu_start(); }
+  if (g_gpu_state != H264_GPU_READY) { return 0; }
+  if (v->luma == 0 || v->cb == 0 || v->cr == 0) { return 0; }
+  if (h264_gpu_buffers(v) == 0) { return 0; }
+
+  h264_gpu_wait();
+
+  if (cu_upload_async_at(g_gpu_luma, v->luma, g_gpu_plane_bytes, g_gpu_stream) != 0) { return 0; }
+  if (cu_upload_async_at(g_gpu_cb, v->cb, g_gpu_chroma_bytes, g_gpu_stream) != 0) { return 0; }
+  if (cu_upload_async_at(g_gpu_cr, v->cr, g_gpu_chroma_bytes, g_gpu_stream) != 0) { return 0; }
+
+  var luma_pointer: int64 = g_gpu_luma;
+  var cb_pointer: int64 = g_gpu_cb;
+  var cr_pointer: int64 = g_gpu_cr;
+  var out_pointer: int64 = g_gpu_out;
+  var width: int32 = v->width;
+  var height: int32 = v->height;
+  var luma_stride: int32 = v->luma_stride;
+  var chroma_stride: int32 = v->chroma_stride;
+  var crop_left: int32 = v->crop_left;
+  var crop_top: int32 = v->crop_top;
+  var pairs: int32 = (width + 1) / 2;
+
+  var arguments: int64[11];
+  arguments[0] = (int64)&luma_pointer;
+  arguments[1] = (int64)&cb_pointer;
+  arguments[2] = (int64)&cr_pointer;
+  arguments[3] = (int64)&out_pointer;
+  arguments[4] = (int64)&width;
+  arguments[5] = (int64)&height;
+  arguments[6] = (int64)&luma_stride;
+  arguments[7] = (int64)&chroma_stride;
+  arguments[8] = (int64)&crop_left;
+  arguments[9] = (int64)&crop_top;
+  arguments[10] = (int64)&pairs;
+
+  var block: int32 = 128;
+  var grid_x: int32 = (pairs + block - 1) / block;
+  if (cu_launch_at(g_gpu_kernel, (uint32)grid_x, (uint32)height, (uint32)1,
+                   (uint32)block, (uint32)1, (uint32)1, (uint32)0, g_gpu_stream,
+                   &arguments[0], 0) != 0) {
+    return 0;
+  }
+
+  if (cu_download_async_at((uint8*)out, g_gpu_out, g_gpu_out_bytes, g_gpu_stream) != 0) {
+    return 0;
+  }
+  g_gpu_pending = 1;
+  return 1;
+}
+
+fn h264_gpu_convert(v: H264Video*, out: uint32*) -> int32 {
+  if (h264_gpu_convert_async(v, out) == 0) { return 0; }
+  h264_gpu_wait();
+  return 1;
+}
+
+@inline fn h264_gpu_active() -> int32 {
+  if (g_gpu_off != 0) { return 0; }
+  if (g_gpu_state == H264_GPU_READY) { return 1; }
+  return 0;
+}
+
+fn h264_gpu_status() -> cstring {
+  if (g_gpu_reason == 1) { return "no NVIDIA driver on this machine"; }
+  if (g_gpu_reason == 2) { return "the driver is missing an entry point this needs"; }
+  if (g_gpu_reason == 3) { return "the driver would not initialise"; }
+  if (g_gpu_reason == 4) { return "no usable device"; }
+  if (g_gpu_reason == 5) { return "no device context"; }
+  if (g_gpu_reason == 6) { return "video_kernels.ptx is not beside the executable"; }
+  if (g_gpu_reason == 7) { return "the driver rejected video_kernels.ptx"; }
+  if (g_gpu_reason == 8) { return "the module has no yuv420_to_bgra entry point"; }
+  if (g_gpu_reason == 9) { return "ready"; }
+  return "not tried yet";
+}
+
+@inline fn h264_gpu_device() -> cstring { return (cstring)&g_gpu_name[0]; }
+
+@inline fn h264_gpu_set_enabled(enabled: int32) {
+  if (enabled != 0) { g_gpu_off = 0; } else { g_gpu_off = 1; }
+}
+
+fn h264_gpu_probe() -> int32 {
+  if (g_gpu_state == H264_GPU_UNTRIED) { h264_gpu_start(); }
+  return h264_gpu_active();
+}
+
+var g_gpu_locked: int64[8];
+
+fn h264_gpu_host_alloc(bytes: int64) -> uint8* {
+  if (h264_gpu_probe() != 0) {
+    var slot: int32 = -1;
+    for i in 0..8 {
+      if (g_gpu_locked[i] == 0 && slot < 0) { slot = i; }
+    }
+    if (slot >= 0) {
+      var pinned: int64 = 0;
+      if (cu_host_alloc_at(&pinned, bytes, (uint32)0) == 0 && pinned != 0) {
+        g_gpu_locked[slot] = pinned;
+        return (uint8*)pinned;
+      }
+    }
+  }
+  return malloc(bytes);
+}
+
+fn h264_gpu_host_free(block: uint8*) {
+  if (block == 0) { return; }
+  for i in 0..8 {
+    if (g_gpu_locked[i] == (int64)block) {
+      cu_host_free_at(g_gpu_locked[i]);
+      g_gpu_locked[i] = 0;
+      return;
+    }
+  }
+  free(block);
+}
+

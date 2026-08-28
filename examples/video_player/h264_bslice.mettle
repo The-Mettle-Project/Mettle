@@ -137,29 +137,21 @@ fn h264_minimum_positive(a: int32, b: int32) -> int32 {
   return b;
 }
 
-fn h264_neighbour_reference(v: H264Video*, list: int32, block_x: int32, block_y: int32) -> int32 {
-  var reference: int32 = 0;
-  var mv_x: int32 = 0;
-  var mv_y: int32 = 0;
-  if (h264_neighbour_motion(v, list, block_x, block_y, &reference, &mv_x, &mv_y) == 0) {
-    return -1;
-  }
-  return reference;
-}
-
 fn h264_direct_spatial(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_y: int32,
                        part_w: int32, part_h: int32) {
   var origin_x: int32 = v->mb_x * 4;
   var origin_y: int32 = v->mb_y * 4;
 
   var reference: int32[2];
+  var near: int32[24];
   for list in 0..2 {
-    var a: int32 = h264_neighbour_reference(v, list, origin_x - 1, origin_y);
-    var b: int32 = h264_neighbour_reference(v, list, origin_x, origin_y - 1);
-    var c: int32 = h264_neighbour_reference(v, list, origin_x + 4, origin_y - 1);
-    if (h264_block_available(v, origin_x + 4, origin_y - 1) == 0) {
-      c = h264_neighbour_reference(v, list, origin_x - 1, origin_y - 1);
-    }
+    h264_gather_neighbours(v, list, origin_x, origin_y, 4, &near[list * 12]);
+    var a: int32 = -1;
+    if (near[list * 12] != 0) { a = near[list * 12 + 1]; }
+    var b: int32 = -1;
+    if (near[list * 12 + 4] != 0) { b = near[list * 12 + 5]; }
+    var c: int32 = -1;
+    if (near[list * 12 + 8] != 0) { c = near[list * 12 + 9]; }
     reference[list] = h264_minimum_positive(a, h264_minimum_positive(b, c));
   }
 
@@ -176,32 +168,53 @@ fn h264_direct_spatial(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_y
     predicted_x[list] = 0;
     predicted_y[list] = 0;
     if (reference[list] >= 0 && zero_prediction == 0) {
-      h264_predict_motion_vector(v, list, 0, 0, 4, 4, reference[list],
-                                 &predicted_x[list], &predicted_y[list]);
+      h264_predict_from_neighbours(&near[list * 12], 0, 0, 4, 4, reference[list],
+                                   &predicted_x[list], &predicted_y[list]);
     }
   }
 
   var colocated: int32 = -1;
   if (v->ref_count1 > 0) { colocated = v->ref_list1[0]; }
 
+  var zero_flags: int32[16];
+  for i in 0..16 { zero_flags[i] = 0; }
+  if (colocated >= 0 && v->pictures[colocated].col_capacity > 0) {
+    var picture: H264Picture* = &v->pictures[colocated];
+    var col_ref: int32* = picture->col_ref;
+    var col_x: int32* = picture->col_mv_x;
+    var col_y: int32* = picture->col_mv_y;
+    var origin: int32 = v->mb_index * 16;
+    if (v->direct_8x8_inference != 0) {
+      var eight_flags: int32[4];
+      for eight in 0..4 {
+        var index: int32 = origin + (eight >> 1) * 12 + (eight & 1) * 3;
+        var flag: int32 = 0;
+        if (col_ref[index] == 0) {
+          var mv_x: int32 = col_x[index];
+          var mv_y: int32 = col_y[index];
+          if (mv_x >= -1 && mv_x <= 1 && mv_y >= -1 && mv_y <= 1) { flag = 1; }
+        }
+        eight_flags[eight] = flag;
+      }
+      for i in 0..16 {
+        zero_flags[i] = eight_flags[((i >> 2) >> 1) * 2 + ((i & 3) >> 1)];
+      }
+    } else {
+      for i in 0..16 {
+        var index: int32 = origin + i;
+        if (col_ref[index] == 0) {
+          var mv_x: int32 = col_x[index];
+          var mv_y: int32 = col_y[index];
+          if (mv_x >= -1 && mv_x <= 1 && mv_y >= -1 && mv_y <= 1) { zero_flags[i] = 1; }
+        }
+      }
+    }
+  }
+
   for row in 0..part_h {
     for column in 0..part_w {
       var inside: int32 = (part_y + row) * 4 + part_x + column;
-      var zero_flag: int32 = 0;
-      if (colocated >= 0 && v->pictures[colocated].col_capacity > 0) {
-        var lookup: int32 = inside;
-        if (v->direct_8x8_inference != 0) {
-          var eight: int32 = ((inside >> 2) >> 1) * 2 + ((inside & 3) >> 1);
-          lookup = (eight >> 1) * 12 + (eight & 1) * 3;
-        }
-        var index: int32 = v->mb_index * 16 + lookup;
-        var col_reference: int32 = v->pictures[colocated].col_ref[index];
-        if (col_reference == 0) {
-          var mv_x: int32 = v->pictures[colocated].col_mv_x[index];
-          var mv_y: int32 = v->pictures[colocated].col_mv_y[index];
-          if (mv_x >= -1 && mv_x <= 1 && mv_y >= -1 && mv_y <= 1) { zero_flag = 1; }
-        }
-      }
+      var zero_flag: int32 = zero_flags[inside];
 
       for list in 0..2 {
         var mv_x: int32 = predicted_x[list];
@@ -213,10 +226,8 @@ fn h264_direct_spatial(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_y
           mv_x = 0;
           mv_y = 0;
         }
-        mb->mv_x[list * 16 + inside] = mv_x;
-        mb->mv_y[list * 16 + inside] = mv_y;
-        mb->mvd_x[list * 16 + inside] = 0;
-        mb->mvd_y[list * 16 + inside] = 0;
+        mb->mv_x[list * 16 + inside] = (int16)mv_x;
+        mb->mv_y[list * 16 + inside] = (int16)mv_y;
       }
       v->block_filled[inside] = 1;
       v->ref_filled[inside] = 1;
@@ -311,14 +322,10 @@ fn h264_direct_temporal(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_
     for row in 0..2 {
       for column in 0..2 {
         var inside: int32 = (base_y + row) * 4 + base_x + column;
-        mb->mv_x[inside] = mv_x0;
-        mb->mv_y[inside] = mv_y0;
-        mb->mv_x[16 + inside] = mv_x1;
-        mb->mv_y[16 + inside] = mv_y1;
-        mb->mvd_x[inside] = 0;
-        mb->mvd_y[inside] = 0;
-        mb->mvd_x[16 + inside] = 0;
-        mb->mvd_y[16 + inside] = 0;
+        mb->mv_x[inside] = (int16)mv_x0;
+        mb->mv_y[inside] = (int16)mv_y0;
+        mb->mv_x[16 + inside] = (int16)mv_x1;
+        mb->mv_y[16 + inside] = (int16)mv_y1;
         v->block_filled[inside] = 1;
         v->ref_filled[inside] = 1;
       }

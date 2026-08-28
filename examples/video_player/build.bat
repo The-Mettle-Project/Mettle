@@ -19,6 +19,12 @@ if not exist bin\mettle.exe (
   )
 )
 
+echo Building examples\video_player\video_kernels.ptx ...
+bin\mettle.exe -O --emit-ptx examples\video_player\video_kernels.mettle -o examples\video_player\video_kernels.ptx --emit-kernel-decls=examples\video_player\video_kernel_decls.mettle
+if errorlevel 1 (
+  echo NOTE: no GPU module built; the player converts colour on the CPU.
+)
+
 echo Building examples\video_player\player.exe ...
 bin\mettle.exe --build --release --linker internal --subsystem windows examples\video_player\player.mettle -o examples\video_player\player.exe
 if errorlevel 1 (
@@ -35,6 +41,11 @@ if errorlevel 1 (
 
 echo.
 echo Built examples\video_player\player.exe and examples\video_player\vptool.exe
+echo.
+echo The player converts colour on the GPU when video_kernels.ptx sits beside
+echo player.exe and an NVIDIA driver is present, and on the CPU otherwise.
+echo Check which one it picked with:
+echo   examples\video_player\vptool.exe h264gpucheck clip.mp4
 echo.
 echo Make a playable file from any source video:
 echo   ffmpeg -i input.mp4 -c:v mjpeg -q:v 5 -pix_fmt yuvj420p -c:a pcm_s16le -ar 44100 -ac 2 clip.avi

@@ -16,6 +16,13 @@ const H264_MB_B_SKIP = 10;
 
 const H264_MAX_PICTURES = 20;
 
+var g_clip_rgb: uint8[1024];
+var g_luma_base: int32[256];
+var g_cabac_lps: uint8[256];
+var g_cabac_next_mps: uint8[128];
+var g_cabac_next_lps: uint8[128];
+var g_cabac_renorm: uint8[512];
+
 const H264_CAT_LUMA_DC = 0;
 const H264_CAT_LUMA_AC = 1;
 const H264_CAT_LUMA_4X4 = 2;
@@ -52,11 +59,12 @@ const H264_CTX_LEVEL_8X8 = 426;
 struct H264Cabac {
   data: uint8*;
   size: int64;
-  bit_position: int64;
+  byte_position: int64;
+  cache: uint64;
+  cache_bits: int32;
   range: int32;
   offset: int32;
-  state: int32[460];
-  mps: int32[460];
+  state: uint8[460];
 }
 
 struct H264Picture {
@@ -90,16 +98,18 @@ struct H264Macroblock {
   chroma_nonzero: uint8[8];
   luma_dc_nonzero: uint8;
   chroma_dc_nonzero: uint8[2];
-  mv_x: int32[32];
-  mv_y: int32[32];
-  mvd_x: int32[32];
-  mvd_y: int32[32];
+  mv_x: int16[32];
+  mv_y: int16[32];
+  mvd_x: int16[32];
+  mvd_y: int16[32];
   ref_index: int32[8];
   ref_picture: int32[8];
   skipped: int32;
   transform_8x8: int32;
   sub_8x8_small: int32;
   direct8x8: uint8[4];
+  uniform: uint8;
+  nonzero_any: uint8;
 }
 
 struct H264Video {
@@ -200,6 +210,12 @@ struct H264Video {
   pixels: uint32*;
   pixel_capacity: int64;
   error: int32;
+
+  pred_luma: uint8*;
+  pred_luma_stride: int32;
+  pred_cb: uint8*;
+  pred_cr: uint8*;
+  pred_chroma_stride: int32;
 }
 
 fn h264_video_new(parser: H264Decoder*) -> H264Video* {
@@ -224,6 +240,8 @@ fn h264_video_new(parser: H264Decoder*) -> H264Video* {
   }
   h264_fill_context_init(v->context_slope, v->context_offset);
   h264_fill_range_tables(v->range_lps, v->next_lps, v->next_mps);
+  h264_build_cabac_tables(v);
+  h264_build_colour_tables();
   h264_fill_deblock_tables(v->deblock_alpha, v->deblock_beta, v->deblock_tc);
 
   var scan: int32[16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
@@ -428,27 +446,72 @@ fn h264_pick_free_picture(v: H264Video*) -> int32 {
   return oldest;
 }
 
-fn h264_cabac_read_bit(c: H264Cabac*) -> int32 {
-  var index: int64 = c->bit_position >> 3;
-  if (index >= c->size) {
-    c->bit_position = c->bit_position + 1;
-    return 0;
+fn h264_cabac_refill(c: H264Cabac*) {
+  while (c->cache_bits <= 24) {
+    var byte: int64 = 0;
+    if (c->byte_position < c->size) { byte = (int64)c->data[c->byte_position]; }
+    c->byte_position = c->byte_position + 1;
+    c->cache = c->cache | ((uint64)byte << (uint64)(56 - c->cache_bits));
+    c->cache_bits = c->cache_bits + 8;
   }
-  var shift: int32 = 7 - (int32)(c->bit_position & (int64)7);
-  c->bit_position = c->bit_position + 1;
-  return ((int32)c->data[index] >> shift) & 1;
+}
+
+@inline fn h264_cabac_bits(c: H264Cabac*, count: int32) -> int32 {
+  if (c->cache_bits < count) { h264_cabac_refill(c); }
+  var value: int32 = (int32)(c->cache >> (uint64)(64 - count));
+  c->cache = c->cache << (uint64)count;
+  c->cache_bits = c->cache_bits - count;
+  return value;
+}
+
+fn h264_build_colour_tables() {
+  for i in 0..1024 {
+    var value: int32 = i - 320;
+    if (value < 0) { value = 0; }
+    if (value > 255) { value = 255; }
+    g_clip_rgb[i] = (uint8)value;
+  }
+  for i in 0..256 {
+    g_luma_base[i] = 76309 * (i - 16);
+  }
+}
+
+fn h264_build_cabac_tables(v: H264Video*) {
+  for i in 0..256 { g_cabac_lps[i] = (uint8)v->range_lps[i]; }
+  for state in 0..64 {
+    for flag in 0..2 {
+      var packed: int32 = state * 2 + flag;
+      g_cabac_next_mps[packed] = (uint8)(v->next_mps[state] * 2 + flag);
+      if (state == 0) {
+        g_cabac_next_lps[packed] = (uint8)(v->next_lps[state] * 2 + 1 - flag);
+      } else {
+        g_cabac_next_lps[packed] = (uint8)(v->next_lps[state] * 2 + flag);
+      }
+    }
+  }
+  g_cabac_renorm[0] = (uint8)0;
+  for value in 1..512 {
+    var shift: int32 = 0;
+    var scaled: int32 = value;
+    while (scaled < 256) {
+      scaled = scaled << 1;
+      shift = shift + 1;
+    }
+    g_cabac_renorm[value] = (uint8)shift;
+  }
 }
 
 fn h264_cabac_start(v: H264Video*, data: uint8*, size: int64, start_bit: int64) {
   var c: H264Cabac* = &v->cabac;
   c->data = data;
   c->size = size;
-  c->bit_position = start_bit;
+  c->byte_position = start_bit >> 3;
+  c->cache = (uint64)0;
+  c->cache_bits = 0;
+  var skew: int32 = (int32)(start_bit & (int64)7);
+  if (skew != 0) { h264_cabac_bits(c, skew); }
   c->range = 510;
-  c->offset = 0;
-  for i in 0..9 {
-    c->offset = (c->offset << 1) | h264_cabac_read_bit(c);
-  }
+  c->offset = h264_cabac_bits(c, 9);
 }
 
 fn h264_cabac_init_contexts(v: H264Video*, slice_qp: int32, model: int32) {
@@ -462,55 +525,61 @@ fn h264_cabac_init_contexts(v: H264Video*, slice_qp: int32, model: int32) {
     if (pre < 1) { pre = 1; }
     if (pre > 126) { pre = 126; }
     if (pre <= 63) {
-      v->cabac.state[i] = 63 - pre;
-      v->cabac.mps[i] = 0;
+      v->cabac.state[i] = (uint8)((63 - pre) * 2);
     } else {
-      v->cabac.state[i] = pre - 64;
-      v->cabac.mps[i] = 1;
+      v->cabac.state[i] = (uint8)((pre - 64) * 2 + 1);
     }
   }
 }
 
 @inline fn h264_decode_bin(v: H264Video*, context: int32) -> int32 {
   var c: H264Cabac* = &v->cabac;
-  var state: int32 = c->state[context];
-  var lps: int32 = v->range_lps[state * 4 + ((c->range >> 6) & 3)];
-  c->range = c->range - lps;
+  var state: int32 = (int32)c->state[context];
+  var range: int32 = c->range;
+  var offset: int32 = c->offset;
+  var lps: int32 = (int32)g_cabac_lps[(state >> 1) * 4 + ((range >> 6) & 3)];
+  range = range - lps;
   var bin: int32 = 0;
-  if (c->offset >= c->range) {
-    bin = 1 - c->mps[context];
-    c->offset = c->offset - c->range;
-    c->range = lps;
-    if (state == 0) { c->mps[context] = 1 - c->mps[context]; }
-    c->state[context] = v->next_lps[state];
+  if (offset >= range) {
+    bin = (state & 1) ^ 1;
+    offset = offset - range;
+    range = lps;
+    c->state[context] = g_cabac_next_lps[state];
   } else {
-    bin = c->mps[context];
-    c->state[context] = v->next_mps[state];
+    bin = state & 1;
+    c->state[context] = g_cabac_next_mps[state];
   }
-  while (c->range < 256) {
-    c->range = c->range << 1;
-    c->offset = (c->offset << 1) | h264_cabac_read_bit(c);
+  var shift: int32 = (int32)g_cabac_renorm[range];
+  if (shift != 0) {
+    range = range << shift;
+    offset = (offset << shift) | h264_cabac_bits(c, shift);
   }
+  c->range = range;
+  c->offset = offset;
   return bin;
 }
 
-fn h264_decode_bypass(v: H264Video*) -> int32 {
+@inline fn h264_decode_bypass(v: H264Video*) -> int32 {
   var c: H264Cabac* = &v->cabac;
-  c->offset = (c->offset << 1) | h264_cabac_read_bit(c);
-  if (c->offset >= c->range) {
-    c->offset = c->offset - c->range;
+  var offset: int32 = (c->offset << 1) | h264_cabac_bits(c, 1);
+  var range: int32 = c->range;
+  if (offset >= range) {
+    c->offset = offset - range;
     return 1;
   }
+  c->offset = offset;
   return 0;
 }
 
 fn h264_decode_terminate(v: H264Video*) -> int32 {
   var c: H264Cabac* = &v->cabac;
-  c->range = c->range - 2;
-  if (c->offset >= c->range) { return 1; }
-  while (c->range < 256) {
-    c->range = c->range << 1;
-    c->offset = (c->offset << 1) | h264_cabac_read_bit(c);
+  var range: int32 = c->range - 2;
+  c->range = range;
+  if (c->offset >= range) { return 1; }
+  var shift: int32 = (int32)g_cabac_renorm[range];
+  if (shift != 0) {
+    c->range = range << shift;
+    c->offset = (c->offset << shift) | h264_cabac_bits(c, shift);
   }
   return 0;
 }
@@ -798,10 +867,6 @@ fn h264_category_level_offset(category: int32) -> int32 {
 @inline fn h264_decode_residual_block(v: H264Video*, mb: H264Macroblock*, coefficients: int32*,
                               start_index: int32, end_index: int32, max_coefficients: int32,
                               category: int32, index: int32, component: int32) -> int32 {
-  for i in 0..max_coefficients {
-    coefficients[i] = 0;
-  }
-
   if (category != H264_CAT_LUMA_8X8) {
     var coded_context: int32 = H264_CTX_CODED_BLOCK + h264_category_coded_offset(category) +
                                h264_coded_block_context(v, mb, category, index, component);
@@ -810,8 +875,11 @@ fn h264_category_level_offset(category: int32) -> int32 {
     }
   }
 
-  var significant: int32[64];
-  for i in 0..64 { significant[i] = 0; }
+  for i in 0..max_coefficients {
+    coefficients[i] = 0;
+  }
+
+  var significant: int64 = 0;
 
   var significant_base: int32 = H264_CTX_SIGNIFICANT + h264_category_significant_offset(category);
   var last_base: int32 = H264_CTX_LAST_SIGNIFICANT + h264_category_significant_offset(category);
@@ -833,14 +901,14 @@ fn h264_category_level_offset(category: int32) -> int32 {
       last_position = v->last8[i];
     }
     if (h264_decode_bin(v, significant_base + position) != 0) {
-      significant[i] = 1;
+      significant = significant | ((int64)1 << i);
       if (h264_decode_bin(v, last_base + last_position) != 0) {
         count = i + 1;
       }
     }
     i = i + 1;
   }
-  significant[count - 1] = 1;
+  significant = significant | ((int64)1 << (count - 1));
 
   var level_base: int32 = H264_CTX_ABS_LEVEL + h264_category_level_offset(category);
   if (category == H264_CAT_LUMA_8X8) { level_base = H264_CTX_LEVEL_8X8; }
@@ -849,7 +917,7 @@ fn h264_category_level_offset(category: int32) -> int32 {
 
   var scan: int32 = count - 1;
   while (scan >= start_index) {
-    if (significant[scan] == 0) {
+    if (((significant >> scan) & (int64)1) == (int64)0) {
       scan = scan - 1;
       continue;
     }
@@ -912,11 +980,8 @@ fn h264_decode_residual(v: H264Video*, mb: H264Macroblock*) {
   mb->luma_dc_nonzero = (uint8)0;
   mb->chroma_dc_nonzero[0] = (uint8)0;
   mb->chroma_dc_nonzero[1] = (uint8)0;
-  for i in 0..16 { v->luma_dc[i] = 0; }
-  for i in 0..256 { v->luma_ac[i] = 0; }
-  for i in 0..256 { v->luma_8x8[i] = 0; }
-  for i in 0..8 { v->chroma_dc[i] = 0; }
-  for i in 0..128 { v->chroma_ac[i] = 0; }
+  if (intra16 != 0) { for i in 0..16 { v->luma_dc[i] = 0; } }
+  if (mb->cbp_chroma != 0) { for i in 0..8 { v->chroma_dc[i] = 0; } }
 
   if (intra16 != 0) {
     if (h264_decode_residual_block(v, mb, &v->luma_dc[0], 0, 15, 16, H264_CAT_LUMA_DC, 0, 0) != 0) {
@@ -932,6 +997,7 @@ fn h264_decode_residual(v: H264Video*, mb: H264Macroblock*) {
       if (coded != 0) {
         var bx: int32 = (group & 1) * 2;
         var by: int32 = (group >> 1) * 2;
+        mb->nonzero_any = (uint8)1;
         for row in 0..2 {
           for column in 0..2 {
             mb->luma_nonzero[(by + row) * 4 + bx + column] = (uint8)1;
@@ -953,7 +1019,10 @@ fn h264_decode_residual(v: H264Video*, mb: H264Macroblock*) {
           coded = h264_decode_residual_block(v, mb, &v->luma_ac[blk * 16], 0, 15, 16,
                                              H264_CAT_LUMA_4X4, blk, 0);
         }
-        if (coded != 0) { mb->luma_nonzero[raster] = (uint8)1; }
+        if (coded != 0) {
+          mb->luma_nonzero[raster] = (uint8)1;
+          mb->nonzero_any = (uint8)1;
+        }
       }
     }
   }

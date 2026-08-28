@@ -1,0 +1,44 @@
+@inline fn gpu_clamp_byte(value: int32) -> int32 {
+  if (value < 0) { return 0; }
+  if (value > 255) { return 255; }
+  return value;
+}
+
+@inline fn gpu_pack_bgra(base: int32, red_bias: int32, green_bias: int32,
+                         blue_bias: int32) -> uint32 {
+  var red: int32 = gpu_clamp_byte((base + red_bias) >> 16);
+  var green: int32 = gpu_clamp_byte((base + green_bias) >> 16);
+  var blue: int32 = gpu_clamp_byte((base + blue_bias) >> 16);
+  return ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
+}
+
+kernel(block = 128) yuv420_to_bgra(luma: uint8*, cb: uint8*, cr: uint8*, out: uint32*,
+                                   width: int32, height: int32,
+                                   luma_stride: int32, chroma_stride: int32,
+                                   crop_left: int32, crop_top: int32, pairs: int32) {
+  var pair: int32 = block.x * block_dim.x + thread.x;
+  var row: int32 = block.y;
+  if (pair >= pairs) { return; }
+  if (row >= height) { return; }
+
+  var source_row: int32 = row + crop_top;
+  var luma_row: int32 = source_row * luma_stride + crop_left;
+  var chroma_row: int32 = (source_row >> 1) * chroma_stride + (crop_left >> 1);
+
+  var blue_diff: int32 = (int32)cb[chroma_row + pair] - 128;
+  var red_diff: int32 = (int32)cr[chroma_row + pair] - 128;
+  var red_bias: int32 = 104597 * red_diff + 32768;
+  var green_bias: int32 = 32768 - 25675 * blue_diff - 53279 * red_diff;
+  var blue_bias: int32 = 132201 * blue_diff + 32768;
+
+  var column: int32 = pair * 2;
+  var target: int32 = row * width + column;
+
+  var base: int32 = 76309 * ((int32)luma[luma_row + column] - 16);
+  out[target] = gpu_pack_bgra(base, red_bias, green_bias, blue_bias);
+
+  if (column + 1 < width) {
+    base = 76309 * ((int32)luma[luma_row + column + 1] - 16);
+    out[target + 1] = gpu_pack_bgra(base, red_bias, green_bias, blue_bias);
+  }
+}

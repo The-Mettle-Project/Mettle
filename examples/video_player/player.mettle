@@ -7,13 +7,38 @@ import "audio";
 import "h264";
 import "h264_decode";
 import "h264_frame";
+import "h264_gpu";
 import "aac";
 import "aac_decode";
+import "paint";
 
 const SEEK_STEP_US = 5000000;
 const SEEK_LONG_US = 30000000;
-const OSD_HOLD_US = 2500000;
-const OSD_BAND_HEIGHT = 62;
+const OSD_HOLD_US = 2600000;
+const OSD_BAND_HEIGHT = 108;
+const OSD_MARGIN = 22;
+const OSD_SCRIM_HEIGHT = 176;
+const OSD_TITLE_HEIGHT = 96;
+const BUTTON_RADIUS = 19;
+const BUTTON_STEP = 44;
+const VOLUME_TRACK = 68;
+const FLASH_HOLD_US = 620000;
+const WM_MOUSELEAVE = 0x02A3;
+const HOVER_NONE = 0;
+const HOVER_BAR = 1;
+const HOVER_PLAY = 2;
+const HOVER_BACK = 3;
+const HOVER_FORWARD = 4;
+const HOVER_VOLUME = 5;
+const HOVER_VOLUME_TRACK = 6;
+const HOVER_FULLSCREEN = 7;
+const FLASH_NONE = 0;
+const FLASH_PLAY = 1;
+const FLASH_PAUSE = 2;
+const FLASH_FORWARD = 3;
+const FLASH_BACK = 4;
+const FLASH_VOLUME = 5;
+const FLASH_MUTED = 6;
 const GWL_STYLE = -16;
 const SWP_FRAMECHANGED = 0x0020;
 const SWP_NOOWNERZORDER = 0x0200;
@@ -33,6 +58,13 @@ struct BitmapInfoHeader {
   y_pels_per_meter: int32;
   clr_used: uint32;
   clr_important: uint32;
+}
+
+struct TrackMouse {
+  size: uint32;
+  flags: uint32;
+  target: int64;
+  hover_time: uint32;
 }
 
 struct MonitorInfo {
@@ -62,6 +94,13 @@ extern fn Gdi_CreateCompatibleBitmap(hdc: int64, width: int32, height: int32) ->
 extern fn Gdi_DeleteDC(hdc: int64) -> int32 = "DeleteDC";
 extern fn Gdi_BitBlt(destination: int64, x: int32, y: int32, width: int32, height: int32,
                      source: int64, source_x: int32, source_y: int32, rop: uint32) -> int32 = "BitBlt";
+extern fn Gdi_CreateDIBSection(hdc: int64, info: rawptr, usage: uint32, bits: rawptr*,
+                               section: int64, offset: uint32) -> int64 = "CreateDIBSection";
+extern fn Gdi_GdiFlush() -> int32 = "GdiFlush";
+extern fn Gdi_TextOutW(hdc: int64, x: int32, y: int32, text: uint16*, length: int32) -> int32 = "TextOutW";
+extern fn Gdi_TextExtentA(hdc: int64, text: cstring, length: int32, size: UiSize*) -> int32 = "GetTextExtentPoint32A";
+extern fn Gdi_TextExtentW(hdc: int64, text: uint16*, length: int32, size: UiSize*) -> int32 = "GetTextExtentPoint32W";
+extern fn Win_TrackMouseEvent(track: TrackMouse*) -> int32 = "TrackMouseEvent";
 
 var g_window: int64 = 0;
 var g_running: int32 = 1;
@@ -96,6 +135,35 @@ var g_qpc_frequency: int64 = 1;
 
 var g_osd_until_us: int64 = 0;
 var g_osd_font: int64 = 0;
+var g_title_font: int64 = 0;
+var g_back_pixels: uint32* = 0;
+var g_title_wide: uint16[512];
+var g_title_length: int32 = 0;
+
+var g_osd_alpha: int32 = 0;
+var g_bar_grow: int32 = 0;
+var g_volume_grow: int32 = 0;
+var g_hover: int32 = 0;
+var g_hover_alpha: int32[8];
+var g_pressed: int32 = 0;
+var g_pointer_inside: int32 = 0;
+var g_animation_us: int64 = 0;
+var g_last_present_us: int64 = 0;
+var g_flash_kind: int32 = 0;
+var g_flash_start_us: int64 = 0;
+
+var g_bar_left: int32 = 0;
+var g_bar_right: int32 = 0;
+var g_bar_y: int32 = 0;
+var g_row_y: int32 = 0;
+var g_play_x: int32 = 0;
+var g_back_x: int32 = 0;
+var g_forward_x: int32 = 0;
+var g_volume_x: int32 = 0;
+var g_volume_left: int32 = 0;
+var g_volume_right: int32 = 0;
+var g_time_x: int32 = 0;
+var g_fullscreen_x: int32 = 0;
 var g_cursor_hidden: int32 = 0;
 var g_scrubbing: int32 = 0;
 var g_mouse_x: int32 = 0;
@@ -228,8 +296,8 @@ fn ring_prepare() -> int32 {
   var count: int64 = (int64)g_video->width * (int64)g_video->height;
   if (count <= 0) { return 0; }
   if (g_ring != 0 && g_ring_frame == count) { return 1; }
-  if (g_ring != 0) { free(g_ring); }
-  g_ring = malloc(count * 4 * (int64)FRAME_RING);
+  if (g_ring != 0) { h264_gpu_host_free((uint8*)g_ring); }
+  g_ring = (uint32*)h264_gpu_host_alloc(count * 4 * (int64)FRAME_RING);
   if (g_ring == 0) {
     g_ring_frame = 0;
     return 0;
@@ -242,7 +310,7 @@ fn ring_prepare() -> int32 {
 fn ring_store(display: int32) {
   if (ring_prepare() == 0) { return; }
   var slot: int32 = ring_slot(display);
-  h264_write_pixels_to(g_video, &g_ring[(int64)slot * g_ring_frame]);
+  h264_write_pixels_deferred(g_video, &g_ring[(int64)slot * g_ring_frame]);
   g_ring_display[slot] = display;
 }
 
@@ -282,6 +350,7 @@ fn decode_ahead() {
 fn ring_show(display: int32) -> int32 {
   var slot: int32 = ring_slot(display);
   if (g_ring == 0 || g_ring_display[slot] != display) { return 0; }
+  h264_gpu_wait();
   g_pixels = &g_ring[(int64)slot * g_ring_frame];
   g_picture_width = g_video->width;
   g_picture_height = g_video->height;
@@ -389,90 +458,455 @@ fn paint_picture(hdc: int64) {
                     g_pixels, &info, (uint32)0, (uint32)0x00CC0020);
 }
 
-fn seek_bar_track(client: UiRect*, left: int32*, right: int32*, top: int32*) {
-  *left = 20;
-  *right = client->right - 20;
-  *top = client->bottom - 26;
+fn compute_layout(client: UiRect*) {
+  var width: int32 = client->right - client->left;
+  var height: int32 = client->bottom - client->top;
+  g_bar_left = OSD_MARGIN;
+  g_bar_right = width - OSD_MARGIN;
+  g_bar_y = height - 74;
+  g_row_y = height - 34;
+  g_play_x = OSD_MARGIN + 20;
+  g_back_x = g_play_x + BUTTON_STEP;
+  g_forward_x = g_back_x + BUTTON_STEP;
+  g_volume_x = g_forward_x + BUTTON_STEP;
+  if (width < 540) {
+    g_back_x = 0 - 1000;
+    g_forward_x = 0 - 1000;
+    g_volume_x = g_play_x + BUTTON_STEP;
+  }
+  g_volume_left = g_volume_x + 20;
+  g_volume_right = g_volume_left + VOLUME_TRACK * g_volume_grow / 255;
+  g_time_x = g_volume_right + 14;
+  g_fullscreen_x = width - OSD_MARGIN - 20;
 }
 
-fn paint_osd(hdc: int64, client: UiRect*) {
-  var band_top: int32 = client->bottom - OSD_BAND_HEIGHT;
-  if (band_top < 0) { band_top = 0; }
-  ui_fill_rect_color(hdc, 0, band_top, client->right, client->bottom, ui_rgb((uint32)16, (uint32)16, (uint32)18));
+fn near_button(x: int32, center: int32) -> int32 {
+  var offset: int32 = x - center;
+  if (offset < 0) { offset = 0 - offset; }
+  if (offset <= BUTTON_RADIUS + 3) { return 1; }
+  return 0;
+}
 
-  var track_left: int32 = 0;
-  var track_right: int32 = 0;
-  var track_top: int32 = 0;
-  seek_bar_track(client, &track_left, &track_right, &track_top);
-  var track_width: int32 = track_right - track_left;
-  if (track_width < 8) { return; }
-
-  ui_fill_rect_color(hdc, track_left, track_top, track_right, track_top + 5, ui_rgb((uint32)62, (uint32)62, (uint32)68));
-  var filled: int32 = 0;
-  if (g_duration_us > 0) {
-    filled = (int32)((int64)track_width * g_position_us / g_duration_us);
+fn hover_at(x: int32, y: int32) -> int32 {
+  if (g_file == 0) { return HOVER_NONE; }
+  var client: UiRect = ui_window_client_rect(g_window);
+  compute_layout(&client);
+  if (y >= g_bar_y - 13 && y <= g_bar_y + 13 &&
+      x >= g_bar_left - 10 && x <= g_bar_right + 10) {
+    return HOVER_BAR;
   }
-  if (filled < 0) { filled = 0; }
-  if (filled > track_width) { filled = track_width; }
-  ui_fill_rect_color(hdc, track_left, track_top, track_left + filled, track_top + 5, ui_rgb((uint32)240, (uint32)240, (uint32)245));
-
-  var text: uint8[192];
-  var length: int32 = 0;
-  if (g_playing == 0) {
-    length = append_text(&text[0], length, "paused  ");
-  }
-  length = append_clock(&text[0], length, g_position_us);
-  length = append_text(&text[0], length, " / ");
-  length = append_clock(&text[0], length, g_duration_us);
-  text[length] = (uint8)0;
-
-  var font_saved: int64 = 0;
-  if (g_osd_font != 0) { font_saved = ui_select_object(hdc, g_osd_font); }
-  ui_set_text_transparent(hdc);
-  ui_draw_text_transparent(hdc, track_left, band_top + 12, (cstring)&text[0], ui_rgb((uint32)235, (uint32)235, (uint32)240));
-
-  var right_text: uint8[192];
-  var right_length: int32 = 0;
-  right_length = append_text(&right_text[0], right_length, "frame ");
-  right_length = append_number(&right_text[0], right_length, (int64)g_displayed_frame + (int64)1, 1);
-  right_length = append_byte(&right_text[0], right_length, 47);
-  right_length = append_number(&right_text[0], right_length, (int64)g_file->video_frame_count, 1);
-  if (g_decode_samples > 0) {
-    var tenths: int64 = g_decode_total_us / g_decode_samples / (int64)100;
-    right_length = append_text(&right_text[0], right_length, "   decode ");
-    right_length = append_number(&right_text[0], right_length, tenths / (int64)10, 1);
-    right_length = append_byte(&right_text[0], right_length, 46);
-    right_length = append_number(&right_text[0], right_length, tenths % (int64)10, 1);
-    right_length = append_text(&right_text[0], right_length, " ms");
-  }
-  if (g_audio->ready != 0) {
-    right_length = append_text(&right_text[0], right_length, "   vol ");
-    if (g_audio->muted != 0) {
-      right_length = append_text(&right_text[0], right_length, "muted");
-    } else {
-      right_length = append_number(&right_text[0], right_length, (int64)g_audio->volume, 1);
+  if (y >= g_row_y - 20 && y <= g_row_y + 20) {
+    if (near_button(x, g_play_x) != 0) { return HOVER_PLAY; }
+    if (near_button(x, g_back_x) != 0) { return HOVER_BACK; }
+    if (near_button(x, g_forward_x) != 0) { return HOVER_FORWARD; }
+    if (near_button(x, g_fullscreen_x) != 0) { return HOVER_FULLSCREEN; }
+    if (g_volume_grow > 100 && x >= g_volume_left - 6 && x <= g_volume_right + 10) {
+      return HOVER_VOLUME_TRACK;
     }
+    if (near_button(x, g_volume_x) != 0) { return HOVER_VOLUME; }
   }
-  right_text[right_length] = (uint8)0;
-  ui_draw_text_transparent(hdc, track_left + 220, band_top + 12, (cstring)&right_text[0], ui_rgb((uint32)150, (uint32)150, (uint32)160));
-
-  if (font_saved != 0) { ui_select_object(hdc, font_saved); }
+  return HOVER_NONE;
 }
 
-fn osd_visible() -> int32 {
+fn osd_wanted() -> int32 {
   if (g_playing == 0) { return 1; }
+  if (g_pressed != HOVER_NONE) { return 1; }
+  if (g_pointer_inside != 0 && g_hover != HOVER_NONE) { return 1; }
   if (now_microseconds() < g_osd_until_us) { return 1; }
   return 0;
 }
 
-fn paint_window(hdc: int64) {
+fn osd_visible() -> int32 {
+  if (g_osd_alpha > 0) { return 1; }
+  return 0;
+}
+
+fn approach(current: int32, target: int32, elapsed_us: int64, duration_us: int64) -> int32 {
+  if (current == target) { return current; }
+  var step: int32 = (int32)((int64)255 * elapsed_us / duration_us);
+  if (step < 2) { step = 2; }
+  var value: int32 = current;
+  if (value < target) {
+    value = value + step;
+    if (value > target) { value = target; }
+  } else {
+    value = value - step;
+    if (value < target) { value = target; }
+  }
+  return value;
+}
+
+fn flash_show(kind: int32) {
+  g_flash_kind = kind;
+  g_flash_start_us = now_microseconds();
+}
+
+fn flash_alpha() -> int32 {
+  if (g_flash_kind == FLASH_NONE) { return 0; }
+  var elapsed: int64 = now_microseconds() - g_flash_start_us;
+  if (elapsed < 0) { return 0; }
+  if (elapsed >= (int64)FLASH_HOLD_US) { return 0; }
+  var remaining: float64 = 1.0 - (float64)elapsed / (float64)FLASH_HOLD_US;
+  return (int32)(255.0 * remaining * remaining);
+}
+
+fn animation_step() -> int32 {
+  var now: int64 = now_microseconds();
+  var elapsed: int64 = now - g_animation_us;
+  if (elapsed < 0) { elapsed = 0; }
+  if (elapsed > (int64)120000) { elapsed = (int64)120000; }
+  g_animation_us = now;
+
+  var before_osd: int32 = g_osd_alpha;
+  var before_bar: int32 = g_bar_grow;
+  var before_volume: int32 = g_volume_grow;
+  var before_flash: int32 = flash_alpha();
+
+  var osd_target: int32 = 0;
+  if (osd_wanted() != 0) { osd_target = 255; }
+  var fade: int64 = 260000;
+  if (osd_target == 255) { fade = 130000; }
+  g_osd_alpha = approach(g_osd_alpha, osd_target, elapsed, fade);
+
+  var bar_target: int32 = 0;
+  if (g_hover == HOVER_BAR || g_pressed == HOVER_BAR) { bar_target = 255; }
+  if (g_osd_alpha == 0) { bar_target = 0; }
+  g_bar_grow = approach(g_bar_grow, bar_target, elapsed, 130000);
+
+  var volume_target: int32 = 0;
+  if (g_hover == HOVER_VOLUME || g_hover == HOVER_VOLUME_TRACK) { volume_target = 255; }
+  if (g_pressed == HOVER_VOLUME_TRACK) { volume_target = 255; }
+  if (g_osd_alpha == 0) { volume_target = 0; }
+  g_volume_grow = approach(g_volume_grow, volume_target, elapsed, 150000);
+
+  var changed: int32 = 0;
+  for control in 0..8 {
+    var target: int32 = 0;
+    if (g_hover == control && control != HOVER_NONE) { target = 255; }
+    var before: int32 = g_hover_alpha[control];
+    g_hover_alpha[control] = approach(before, target, elapsed, 110000);
+    if (g_hover_alpha[control] != before) { changed = 1; }
+  }
+
+  if (g_osd_alpha != before_osd) { changed = 1; }
+  if (g_bar_grow != before_bar) { changed = 1; }
+  if (g_volume_grow != before_volume) { changed = 1; }
+  if (flash_alpha() != before_flash) { changed = 1; }
+  if (g_flash_kind != FLASH_NONE && flash_alpha() == 0) { g_flash_kind = FLASH_NONE; }
+  return changed;
+}
+
+fn icon_play(canvas: Canvas*, x: float64, y: float64, scale: float64, color: uint32, alpha: int32) {
+  paint_triangle(canvas, x - 6.0 * scale, y - 8.5 * scale,
+                 x - 6.0 * scale, y + 8.5 * scale,
+                 x + 9.0 * scale, y, color, alpha);
+}
+
+fn icon_pause(canvas: Canvas*, x: float64, y: float64, scale: float64, color: uint32, alpha: int32) {
+  paint_round_rect(canvas, x - 6.8 * scale, y - 8.5 * scale, x - 2.2 * scale, y + 8.5 * scale,
+                   1.6 * scale, color, alpha);
+  paint_round_rect(canvas, x + 2.2 * scale, y - 8.5 * scale, x + 6.8 * scale, y + 8.5 * scale,
+                   1.6 * scale, color, alpha);
+}
+
+fn icon_rewind(canvas: Canvas*, x: float64, y: float64, scale: float64, color: uint32, alpha: int32) {
+  paint_triangle(canvas, x - 9.0 * scale, y, x - 1.0 * scale, y - 7.5 * scale,
+                 x - 1.0 * scale, y + 7.5 * scale, color, alpha);
+  paint_triangle(canvas, x - 1.0 * scale, y, x + 7.0 * scale, y - 7.5 * scale,
+                 x + 7.0 * scale, y + 7.5 * scale, color, alpha);
+}
+
+fn icon_forward(canvas: Canvas*, x: float64, y: float64, scale: float64, color: uint32, alpha: int32) {
+  paint_triangle(canvas, x + 9.0 * scale, y, x + 1.0 * scale, y - 7.5 * scale,
+                 x + 1.0 * scale, y + 7.5 * scale, color, alpha);
+  paint_triangle(canvas, x + 1.0 * scale, y, x - 7.0 * scale, y - 7.5 * scale,
+                 x - 7.0 * scale, y + 7.5 * scale, color, alpha);
+}
+
+fn icon_volume(canvas: Canvas*, x: float64, y: float64, scale: float64, level: int32,
+               muted: int32, color: uint32, alpha: int32) {
+  paint_round_rect(canvas, x - 9.0 * scale, y - 3.2 * scale, x - 4.6 * scale, y + 3.2 * scale,
+                   1.0 * scale, color, alpha);
+  paint_triangle(canvas, x - 5.0 * scale, y, x - 0.5 * scale, y - 8.0 * scale,
+                 x - 0.5 * scale, y + 8.0 * scale, color, alpha);
+  if (muted != 0) {
+    paint_capsule(canvas, x + 3.0 * scale, y - 4.6 * scale, x + 9.4 * scale, y + 1.8 * scale,
+                  2.0 * scale, color, alpha);
+    paint_capsule(canvas, x + 9.4 * scale, y - 4.6 * scale, x + 3.0 * scale, y + 1.8 * scale,
+                  2.0 * scale, color, alpha);
+    return;
+  }
+  if (level > 0) {
+    paint_arc(canvas, x - 0.5 * scale, y, 4.4 * scale, 6.0 * scale, 1.0, color, alpha);
+  }
+  if (level >= 50) {
+    paint_arc(canvas, x - 0.5 * scale, y, 7.6 * scale, 9.2 * scale, 1.0, color, alpha);
+  }
+}
+
+fn icon_fullscreen(canvas: Canvas*, x: float64, y: float64, scale: float64, exiting: int32,
+                   color: uint32, alpha: int32) {
+  var outer: float64 = 8.6 * scale;
+  var inner: float64 = 2.6 * scale;
+  var thickness: float64 = 2.1 * scale;
+  if (exiting != 0) {
+    paint_capsule(canvas, x - inner, y - inner, x - outer, y - inner, thickness, color, alpha);
+    paint_capsule(canvas, x - inner, y - inner, x - inner, y - outer, thickness, color, alpha);
+    paint_capsule(canvas, x + inner, y - inner, x + outer, y - inner, thickness, color, alpha);
+    paint_capsule(canvas, x + inner, y - inner, x + inner, y - outer, thickness, color, alpha);
+    paint_capsule(canvas, x - inner, y + inner, x - outer, y + inner, thickness, color, alpha);
+    paint_capsule(canvas, x - inner, y + inner, x - inner, y + outer, thickness, color, alpha);
+    paint_capsule(canvas, x + inner, y + inner, x + outer, y + inner, thickness, color, alpha);
+    paint_capsule(canvas, x + inner, y + inner, x + inner, y + outer, thickness, color, alpha);
+    return;
+  }
+  paint_capsule(canvas, x - outer, y - outer, x - inner, y - outer, thickness, color, alpha);
+  paint_capsule(canvas, x - outer, y - outer, x - outer, y - inner, thickness, color, alpha);
+  paint_capsule(canvas, x + outer, y - outer, x + inner, y - outer, thickness, color, alpha);
+  paint_capsule(canvas, x + outer, y - outer, x + outer, y - inner, thickness, color, alpha);
+  paint_capsule(canvas, x - outer, y + outer, x - inner, y + outer, thickness, color, alpha);
+  paint_capsule(canvas, x - outer, y + outer, x - outer, y + inner, thickness, color, alpha);
+  paint_capsule(canvas, x + outer, y + outer, x + inner, y + outer, thickness, color, alpha);
+  paint_capsule(canvas, x + outer, y + outer, x + outer, y + inner, thickness, color, alpha);
+}
+
+fn button_backdrop(canvas: Canvas*, x: int32, y: int32, control: int32, alpha: int32) {
+  var lift: int32 = g_hover_alpha[control];
+  if (lift <= 0) { return; }
+  paint_circle(canvas, (float64)x, (float64)y, (float64)BUTTON_RADIUS,
+               paint_rgb(255, 255, 255), 30 * lift / 255 * alpha / 255);
+}
+
+fn bar_position_at(x: int32) -> int64 {
+  var span: int32 = g_bar_right - g_bar_left;
+  if (span <= 0) { return 0; }
+  var offset: int32 = x - g_bar_left;
+  if (offset < 0) { offset = 0; }
+  if (offset > span) { offset = span; }
+  return g_duration_us * (int64)offset / (int64)span;
+}
+
+fn paint_progress(canvas: Canvas*, alpha: int32) {
+  var thickness: float64 = 4.0 + 3.0 * (float64)g_bar_grow / 255.0;
+  var half: float64 = thickness * 0.5;
+  var center: float64 = (float64)g_bar_y;
+  var left: float64 = (float64)g_bar_left;
+  var right: float64 = (float64)g_bar_right;
+  if (right <= left) { return; }
+
+  paint_round_rect(canvas, left, center - half, right, center + half, half,
+                   paint_rgb(255, 255, 255), 58 * alpha / 255);
+
+  var played: float64 = 0.0;
+  if (g_duration_us > 0) {
+    played = (right - left) * (float64)g_position_us / (float64)g_duration_us;
+  }
+  if (played < 0.0) { played = 0.0; }
+  if (played > right - left) { played = right - left; }
+  if (played > 0.5) {
+    paint_round_rect(canvas, left, center - half, left + played, center + half, half,
+                     paint_rgb(255, 255, 255), alpha);
+  }
+
+  var handle: float64 = 7.5 * (float64)g_bar_grow / 255.0;
+  if (g_pressed == HOVER_BAR) { handle = 8.5; }
+  if (handle > 0.4) {
+    paint_circle(canvas, left + played, center, handle + 1.6, paint_rgb(0, 0, 0),
+                 70 * alpha / 255);
+    paint_circle(canvas, left + played, center, handle, paint_rgb(255, 255, 255), alpha);
+  }
+}
+
+fn paint_volume(canvas: Canvas*, alpha: int32) {
+  if (g_volume_grow <= 4) { return; }
+  if (g_audio == 0 || g_audio->ready == 0) { return; }
+  var left: float64 = (float64)g_volume_left;
+  var right: float64 = (float64)g_volume_right;
+  if (right - left < 4.0) { return; }
+  var center: float64 = (float64)g_row_y;
+  var faded: int32 = alpha * g_volume_grow / 255;
+
+  paint_round_rect(canvas, left, center - 1.6, right, center + 1.6, 1.6,
+                   paint_rgb(255, 255, 255), 70 * faded / 255);
+  var level: int32 = g_audio->volume;
+  if (g_audio->muted != 0) { level = 0; }
+  var filled: float64 = (right - left) * (float64)level / 100.0;
+  if (filled > 0.5) {
+    paint_round_rect(canvas, left, center - 1.6, left + filled, center + 1.6, 1.6,
+                     paint_rgb(255, 255, 255), faded);
+  }
+  paint_circle(canvas, left + filled, center, 5.0, paint_rgb(255, 255, 255), faded);
+}
+
+fn paint_flash(canvas: Canvas*, client: UiRect*) {
+  var alpha: int32 = flash_alpha();
+  if (alpha <= 0) { return; }
+  var center_x: float64 = (float64)(client->right - client->left) * 0.5;
+  var center_y: float64 = (float64)(client->bottom - client->top) * 0.5;
+  var grow: float64 = 1.0 + 0.35 * (1.0 - (float64)alpha / 255.0);
+  var half: float64 = 38.0 * grow;
+  paint_round_rect(canvas, center_x - half, center_y - half, center_x + half, center_y + half,
+                   half * 0.42, paint_rgb(0, 0, 0), 120 * alpha / 255);
+
+  var white: uint32 = paint_rgb(255, 255, 255);
+  var scale: float64 = 1.5 * grow;
+  if (g_flash_kind == FLASH_PLAY) { icon_play(canvas, center_x, center_y, scale, white, alpha); }
+  if (g_flash_kind == FLASH_PAUSE) { icon_pause(canvas, center_x, center_y, scale, white, alpha); }
+  if (g_flash_kind == FLASH_FORWARD) { icon_forward(canvas, center_x, center_y, scale, white, alpha); }
+  if (g_flash_kind == FLASH_BACK) { icon_rewind(canvas, center_x, center_y, scale, white, alpha); }
+  if (g_flash_kind == FLASH_VOLUME || g_flash_kind == FLASH_MUTED) {
+    var level: int32 = 0;
+    var muted: int32 = 1;
+    if (g_audio != 0) {
+      level = g_audio->volume;
+      muted = g_audio->muted;
+    }
+    icon_volume(canvas, center_x, center_y - 8.0 * grow, scale, level, muted, white, alpha);
+    var track_half: float64 = 26.0 * grow;
+    var track_y: float64 = center_y + 22.0 * grow;
+    paint_round_rect(canvas, center_x - track_half, track_y - 2.0, center_x + track_half,
+                     track_y + 2.0, 2.0, white, 90 * alpha / 255);
+    var shown: int32 = level;
+    if (muted != 0) { shown = 0; }
+    var filled: float64 = track_half * 2.0 * (float64)shown / 100.0;
+    if (filled > 1.0) {
+      paint_round_rect(canvas, center_x - track_half, track_y - 2.0,
+                       center_x - track_half + filled, track_y + 2.0, 2.0, white, alpha);
+    }
+  }
+}
+
+fn paint_overlay(canvas: Canvas*, client: UiRect*) {
+  if (canvas->pixels == 0) { return; }
+  var alpha: int32 = g_osd_alpha;
+  if (alpha <= 0) {
+    paint_flash(canvas, client);
+    return;
+  }
+  var width: int32 = client->right - client->left;
+  var height: int32 = client->bottom - client->top;
+  var black: uint32 = paint_rgb(0, 0, 0);
+  var white: uint32 = paint_rgb(255, 255, 255);
+
+  paint_gradient(canvas, 0, height - OSD_SCRIM_HEIGHT, width, height, black,
+                 0, 205 * alpha / 255, 2);
+  if (g_fullscreen != 0) {
+    paint_gradient(canvas, 0, 0, width, OSD_TITLE_HEIGHT, black, 175 * alpha / 255, 0, 2);
+  }
+
+  paint_progress(canvas, alpha);
+
+  var icon: int32 = 240 * alpha / 255;
+  button_backdrop(canvas, g_play_x, g_row_y, HOVER_PLAY, alpha);
+  if (g_playing != 0) {
+    icon_pause(canvas, (float64)g_play_x, (float64)g_row_y, 1.0, white, icon);
+  } else {
+    icon_play(canvas, (float64)g_play_x, (float64)g_row_y, 1.0, white, icon);
+  }
+
+  if (g_back_x > 0) {
+    button_backdrop(canvas, g_back_x, g_row_y, HOVER_BACK, alpha);
+    icon_rewind(canvas, (float64)g_back_x, (float64)g_row_y, 1.0, white, icon);
+    button_backdrop(canvas, g_forward_x, g_row_y, HOVER_FORWARD, alpha);
+    icon_forward(canvas, (float64)g_forward_x, (float64)g_row_y, 1.0, white, icon);
+  }
+
+  if (g_audio != 0 && g_audio->ready != 0) {
+    button_backdrop(canvas, g_volume_x, g_row_y, HOVER_VOLUME, alpha);
+    icon_volume(canvas, (float64)g_volume_x, (float64)g_row_y, 1.0, g_audio->volume,
+                g_audio->muted, white, icon);
+    paint_volume(canvas, alpha);
+  }
+
+  button_backdrop(canvas, g_fullscreen_x, g_row_y, HOVER_FULLSCREEN, alpha);
+  icon_fullscreen(canvas, (float64)g_fullscreen_x, (float64)g_row_y, 1.0, g_fullscreen,
+                  white, icon);
+
+  paint_flash(canvas, client);
+}
+
+fn text_width(hdc: int64, text: cstring, length: int32) -> int32 {
+  var size: UiSize;
+  size.width = 0;
+  size.height = 0;
+  Gdi_TextExtentA(hdc, text, length, &size);
+  return size.width;
+}
+
+fn fade_grey(level: int32, alpha: int32) -> uint32 {
+  var value: uint32 = (uint32)(level * alpha / 255);
+  return ui_rgb(value, value, value);
+}
+
+fn paint_tooltip(canvas: Canvas*, hdc: int64, client: UiRect*, alpha: int32) {
+  if (alpha <= 0) { return; }
+  var text: uint8[64];
+  var length: int32 = append_clock(&text[0], 0, bar_position_at(g_mouse_x));
+  text[length] = (uint8)0;
+  var measured: int32 = text_width(hdc, (cstring)&text[0], length);
+  var half: int32 = measured / 2 + 11;
+  var center: int32 = g_mouse_x;
+  var limit: int32 = client->right - client->left;
+  if (center - half < 6) { center = half + 6; }
+  if (center + half > limit - 6) { center = limit - 6 - half; }
+  var bottom: int32 = g_bar_y - 18;
+  paint_round_rect(canvas, (float64)(center - half), (float64)(bottom - 26),
+                   (float64)(center + half), (float64)bottom, 6.0,
+                   paint_rgb(0, 0, 0), 205 * alpha / 255);
+  var saved: int64 = 0;
+  if (g_osd_font != 0) { saved = ui_select_object(hdc, g_osd_font); }
+  ui_set_text_transparent(hdc);
+  ui_draw_text_transparent(hdc, center - measured / 2, bottom - 22, (cstring)&text[0],
+                           fade_grey(240, alpha));
+  if (saved != 0) { ui_select_object(hdc, saved); }
+}
+
+fn paint_overlay_text(canvas: Canvas*, hdc: int64, client: UiRect*) {
+  var alpha: int32 = g_osd_alpha;
+  if (alpha <= 0) { return; }
+  var saved: int64 = 0;
+  if (g_osd_font != 0) { saved = ui_select_object(hdc, g_osd_font); }
+  ui_set_text_transparent(hdc);
+
+  var current: uint8[64];
+  var current_length: int32 = append_clock(&current[0], 0, g_position_us);
+  current[current_length] = (uint8)0;
+  var total: uint8[80];
+  var total_length: int32 = append_text(&total[0], 0, " / ");
+  total_length = append_clock(&total[0], total_length, g_duration_us);
+  total[total_length] = (uint8)0;
+
+  var baseline: int32 = g_row_y - 10;
+  ui_draw_text_transparent(hdc, g_time_x, baseline, (cstring)&current[0], fade_grey(245, alpha));
+  var advance: int32 = text_width(hdc, (cstring)&current[0], current_length);
+  ui_draw_text_transparent(hdc, g_time_x + advance, baseline, (cstring)&total[0],
+                           fade_grey(155, alpha));
+
+  if (g_fullscreen != 0 && g_title_length > 0) {
+    var title_saved: int64 = 0;
+    if (g_title_font != 0) { title_saved = ui_select_object(hdc, g_title_font); }
+    ui_set_text_color(hdc, fade_grey(245, alpha));
+    Gdi_TextOutW(hdc, OSD_MARGIN + 4, 26, &g_title_wide[0], g_title_length);
+    if (title_saved != 0) { ui_select_object(hdc, title_saved); }
+  }
+
+  if (saved != 0) { ui_select_object(hdc, saved); }
+
+  var tooltip: int32 = 0;
+  if (g_hover == HOVER_BAR) { tooltip = alpha; }
+  if (g_pressed == HOVER_BAR) { tooltip = alpha; }
+  if (tooltip > 0) { paint_tooltip(canvas, hdc, client, tooltip); }
+}
+
+fn paint_window(hdc: int64, canvas: Canvas*) {
   var client: UiRect = ui_window_client_rect(g_window);
   compute_destination(&client);
   paint_letterbox(hdc, &client);
   paint_picture(hdc);
-  if (osd_visible() != 0) {
-    paint_osd(hdc, &client);
-  }
+  compute_layout(&client);
+  Gdi_GdiFlush();
+  paint_overlay(canvas, &client);
+  paint_overlay_text(canvas, hdc, &client);
 }
 
 fn back_buffer_release() {
@@ -486,6 +920,7 @@ fn back_buffer_release() {
     ui_delete_object(g_back_bitmap);
     g_back_bitmap = 0;
   }
+  g_back_pixels = 0;
   g_back_width = 0;
   g_back_height = 0;
 }
@@ -496,12 +931,27 @@ fn back_buffer_ready(hdc: int64, width: int32, height: int32) -> int32 {
   back_buffer_release();
   g_back_dc = Gdi_CreateCompatibleDC(hdc);
   if (g_back_dc == 0) { return 0; }
-  g_back_bitmap = Gdi_CreateCompatibleBitmap(hdc, width, height);
-  if (g_back_bitmap == 0) {
+  var info: BitmapInfoHeader;
+  info.size = (uint32)40;
+  info.width = width;
+  info.height = 0 - height;
+  info.planes = (uint16)1;
+  info.bit_count = (uint16)32;
+  info.compression = (uint32)0;
+  info.size_image = (uint32)0;
+  info.x_pels_per_meter = 0;
+  info.y_pels_per_meter = 0;
+  info.clr_used = (uint32)0;
+  info.clr_important = (uint32)0;
+  var bits: rawptr = 0;
+  g_back_bitmap = Gdi_CreateDIBSection(g_back_dc, &info, (uint32)0, &bits, 0, (uint32)0);
+  if (g_back_bitmap == 0 || bits == 0) {
     Gdi_DeleteDC(g_back_dc);
     g_back_dc = 0;
+    g_back_bitmap = 0;
     return 0;
   }
+  g_back_pixels = (uint32*)bits;
   g_back_previous = ui_select_object(g_back_dc, g_back_bitmap);
   g_back_width = width;
   g_back_height = height;
@@ -512,11 +962,16 @@ fn paint_buffered(hdc: int64) {
   var client: UiRect = ui_window_client_rect(g_window);
   var width: int32 = client.right - client.left;
   var height: int32 = client.bottom - client.top;
+  var canvas: Canvas;
+  canvas.pixels = 0;
+  canvas.width = width;
+  canvas.height = height;
   if (back_buffer_ready(hdc, width, height) == 0) {
-    paint_window(hdc);
+    paint_window(hdc, &canvas);
     return;
   }
-  paint_window(g_back_dc);
+  canvas.pixels = g_back_pixels;
+  paint_window(g_back_dc, &canvas);
   Gdi_BitBlt(hdc, 0, 0, width, height, g_back_dc, 0, 0, (uint32)0x00CC0020);
 }
 
@@ -560,6 +1015,7 @@ fn set_playing(playing: int32) {
     return;
   }
   g_playing = playing;
+  if (playing != 0) { flash_show(FLASH_PLAY); } else { flash_show(FLASH_PAUSE); }
   if (playing != 0) {
     g_clock_base_us = g_position_us;
     g_clock_start_us = now_microseconds();
@@ -585,6 +1041,11 @@ fn seek_to(microseconds: int64) {
   g_displayed_frame = index;
   g_present_count = g_present_count + (int64)1;
   present();
+}
+
+fn nudge_position(delta: int64) {
+  if (delta >= 0) { flash_show(FLASH_FORWARD); } else { flash_show(FLASH_BACK); }
+  seek_to(g_position_us + delta);
 }
 
 fn step_frames(delta: int32) {
@@ -619,30 +1080,25 @@ fn update_playback() {
 
   show_frame(frame_at_position(g_position_us));
 
-  if (g_playing != 0 && osd_visible() == 0 && g_fullscreen != 0 && g_cursor_hidden == 0) {
+  if (g_playing != 0 && g_osd_alpha == 0 && g_pointer_inside != 0 && g_cursor_hidden == 0) {
     Win_ShowCursor(0);
     g_cursor_hidden = 1;
   }
 }
 
 fn seek_from_mouse(x: int32) {
-  var client: UiRect = ui_window_client_rect(g_window);
-  var track_left: int32 = 0;
-  var track_right: int32 = 0;
-  var track_top: int32 = 0;
-  seek_bar_track(&client, &track_left, &track_right, &track_top);
-  var track_width: int32 = track_right - track_left;
-  if (track_width <= 0) { return; }
-  var offset: int32 = x - track_left;
-  if (offset < 0) { offset = 0; }
-  if (offset > track_width) { offset = track_width; }
-  seek_to(g_duration_us * (int64)offset / (int64)track_width);
+  seek_to(bar_position_at(x));
 }
 
-fn point_in_osd(y: int32) -> int32 {
-  var client: UiRect = ui_window_client_rect(g_window);
-  if (y >= client.bottom - OSD_BAND_HEIGHT) { return 1; }
-  return 0;
+fn volume_from_mouse(x: int32) {
+  if (g_audio == 0) { return; }
+  var span: int32 = g_volume_right - g_volume_left;
+  if (span <= 0) { return; }
+  var offset: int32 = x - g_volume_left;
+  if (offset < 0) { offset = 0; }
+  if (offset > span) { offset = span; }
+  if (g_audio->muted != 0) { audio_toggle_mute(g_audio); }
+  audio_set_volume(g_audio, offset * 100 / span);
 }
 
 fn toggle_fullscreen() {
@@ -686,13 +1142,29 @@ fn handle_key(key: int64) {
     if (g_playing != 0) { set_playing(0); } else { set_playing(1); }
     return;
   }
-  if (key == 39) { seek_to(g_position_us + (int64)SEEK_STEP_US); return; }
-  if (key == 37) { seek_to(g_position_us - (int64)SEEK_STEP_US); return; }
-  if (key == 76) { seek_to(g_position_us + (int64)SEEK_LONG_US); return; }
-  if (key == 74) { seek_to(g_position_us - (int64)SEEK_LONG_US); return; }
-  if (key == 38) { audio_set_volume(g_audio, g_audio->volume + 5); present(); return; }
-  if (key == 40) { audio_set_volume(g_audio, g_audio->volume - 5); present(); return; }
-  if (key == 77) { audio_toggle_mute(g_audio); present(); return; }
+  if (key == 39) { nudge_position((int64)SEEK_STEP_US); return; }
+  if (key == 37) { nudge_position(0 - (int64)SEEK_STEP_US); return; }
+  if (key == 76) { nudge_position((int64)SEEK_LONG_US); return; }
+  if (key == 74) { nudge_position(0 - (int64)SEEK_LONG_US); return; }
+  if (key == 38) {
+    if (g_audio->muted != 0) { audio_toggle_mute(g_audio); }
+    audio_set_volume(g_audio, g_audio->volume + 5);
+    flash_show(FLASH_VOLUME);
+    present();
+    return;
+  }
+  if (key == 40) {
+    audio_set_volume(g_audio, g_audio->volume - 5);
+    flash_show(FLASH_VOLUME);
+    present();
+    return;
+  }
+  if (key == 77) {
+    audio_toggle_mute(g_audio);
+    flash_show(FLASH_MUTED);
+    present();
+    return;
+  }
   if (key == 36) { seek_to(0); return; }
   if (key == 35) { seek_to(g_duration_us); return; }
   if (key == 190) { step_frames(1); return; }
@@ -735,38 +1207,91 @@ fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 
   }
 
   if (msg == UI_WM_MOUSEMOVE()) {
+    var moved: int32 = 0;
+    if (ui_mouse_x(lparam) != g_mouse_x || ui_mouse_y(lparam) != g_mouse_y) { moved = 1; }
     g_mouse_x = ui_mouse_x(lparam);
     g_mouse_y = ui_mouse_y(lparam);
-    wake_osd();
-    if (g_scrubbing != 0) {
-      seek_from_mouse(g_mouse_x);
-    } else if (g_playing == 0) {
-      present();
+    if (g_pointer_inside == 0) {
+      var track: TrackMouse;
+      track.size = (uint32)sizeof(TrackMouse);
+      track.flags = (uint32)2;
+      track.target = hwnd;
+      track.hover_time = (uint32)0;
+      Win_TrackMouseEvent(&track);
+      g_pointer_inside = 1;
     }
+    if (moved != 0) { wake_osd(); }
+    if (g_pressed == HOVER_BAR) {
+      seek_from_mouse(g_mouse_x);
+    } else if (g_pressed == HOVER_VOLUME_TRACK) {
+      volume_from_mouse(g_mouse_x);
+      present();
+    } else {
+      g_hover = hover_at(g_mouse_x, g_mouse_y);
+    }
+    return 0;
+  }
+
+  if (msg == WM_MOUSELEAVE) {
+    g_pointer_inside = 0;
+    g_hover = HOVER_NONE;
     return 0;
   }
 
   if (msg == UI_WM_LBUTTONDOWN()) {
     var x: int32 = ui_mouse_x(lparam);
     var y: int32 = ui_mouse_y(lparam);
+    g_mouse_x = x;
+    g_mouse_y = y;
     wake_osd();
-    if (point_in_osd(y) != 0) {
+    var target: int32 = hover_at(x, y);
+    g_hover = target;
+    if (target == HOVER_BAR || target == HOVER_VOLUME_TRACK) {
+      g_pressed = target;
       g_scrubbing = 1;
       Win_SetCapture(hwnd);
-      seek_from_mouse(x);
+      if (target == HOVER_BAR) { seek_from_mouse(x); } else { volume_from_mouse(x); }
+      present();
+      return 0;
     }
+    if (target != HOVER_NONE) {
+      g_pressed = target;
+      return 0;
+    }
+    if (g_osd_alpha > 200 && y > g_bar_y - 24) { return 0; }
+    if (g_playing != 0) { set_playing(0); } else { set_playing(1); }
     return 0;
   }
 
   if (msg == UI_WM_LBUTTONUP()) {
+    var x: int32 = ui_mouse_x(lparam);
+    var y: int32 = ui_mouse_y(lparam);
     if (g_scrubbing != 0) {
       g_scrubbing = 0;
       Win_ReleaseCapture();
     }
+    var released: int32 = g_pressed;
+    g_pressed = HOVER_NONE;
+    if (released != HOVER_NONE && released == hover_at(x, y)) {
+      if (released == HOVER_PLAY) {
+        if (g_playing != 0) { set_playing(0); } else { set_playing(1); }
+      }
+      if (released == HOVER_BACK) { nudge_position(0 - (int64)SEEK_STEP_US); }
+      if (released == HOVER_FORWARD) { nudge_position((int64)SEEK_STEP_US); }
+      if (released == HOVER_VOLUME) {
+        audio_toggle_mute(g_audio);
+        flash_show(FLASH_MUTED);
+        present();
+      }
+      if (released == HOVER_FULLSCREEN) { toggle_fullscreen(); }
+    }
+    g_hover = hover_at(x, y);
     return 0;
   }
 
   if (msg == UI_WM_LBUTTONDBLCLK()) {
+    var y: int32 = ui_mouse_y(lparam);
+    if (g_osd_alpha > 200 && y > g_bar_y - 24) { return 0; }
     toggle_fullscreen();
     return 0;
   }
@@ -774,7 +1299,9 @@ fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 
   if (msg == UI_WM_MOUSEWHEEL()) {
     var delta: int32 = (int32)((wparam >> 16) & 0xFFFF);
     if (delta >= 32768) { delta = delta - 65536; }
+    if (g_audio->muted != 0 && delta > 0) { audio_toggle_mute(g_audio); }
     audio_set_volume(g_audio, g_audio->volume + delta / 120 * 5);
+    flash_show(FLASH_VOLUME);
     wake_osd();
     present();
     return 0;
@@ -827,7 +1354,7 @@ fn release_decoders() {
   back_buffer_release();
   if (g_video != 0) { h264_video_free(g_video); g_video = 0; }
   if (g_parser != 0) { h264_decoder_free(g_parser); g_parser = 0; }
-  if (g_ring != 0) { free(g_ring); g_ring = 0; }
+  if (g_ring != 0) { h264_gpu_host_free((uint8*)g_ring); g_ring = 0; }
 }
 
 fn widen_text(input: cstring, output: uint16*, capacity: int32) -> int32 {
@@ -975,7 +1502,10 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     return 1;
   }
   Win_SetWindowTextW(g_window, &wide_title[0]);
-  g_osd_font = ui_create_font(17, "Segoe UI", UI_FW_NORMAL());
+  g_title_length = widen_text(file_name_of(argv[1]), &g_title_wide[0], 512);
+  g_osd_font = ui_create_font(15, "Segoe UI", 600);
+  g_title_font = ui_create_font(19, "Segoe UI", UI_FW_NORMAL());
+  g_animation_us = now_microseconds();
   ui_window_show(g_window);
   wake_osd();
 
@@ -1010,6 +1540,13 @@ fn main(argc: int32, argv: cstring*) -> int32 {
         if (slack > (int64)24000) { decode_ahead(); }
       }
     }
+    if (animation_step() != 0) {
+      var since: int64 = now_microseconds() - g_last_present_us;
+      if (since >= (int64)14000) {
+        g_last_present_us = now_microseconds();
+        present();
+      }
+    }
     if (g_playing != 0 && now_microseconds() >= g_report_at_us) {
       var shown: int32 = g_displayed_frame - g_last_report_frame;
       println("t {g_position_us} shown {shown} present {g_present_count} dropped {g_dropped} miss {g_ring_miss} reset {g_resets} decoded {g_samples_decoded} worst {g_worst_decode_us}");
@@ -1021,6 +1558,8 @@ fn main(argc: int32, argv: cstring*) -> int32 {
 
   if (g_cursor_hidden != 0) { Win_ShowCursor(1); }
   if (g_osd_font != 0) { ui_delete_object(g_osd_font); }
+  if (g_title_font != 0) { ui_delete_object(g_title_font); }
+  back_buffer_release();
   println("played to {g_position_us / 1000000} s, {g_dropped} frames skipped");
   if (g_decode_failures > 0) {
     println("{g_decode_failures} frames failed to decode");

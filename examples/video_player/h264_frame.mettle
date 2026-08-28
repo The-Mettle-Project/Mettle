@@ -6,6 +6,7 @@ import "h264_deblock";
 import "h264_inter";
 import "h264_pslice";
 import "h264_bslice";
+import "h264_gpu";
 
 fn h264_store_prediction(v: H264Video*, x: int32, y: int32, prediction: int32*) {
   for row in 0..4 {
@@ -25,13 +26,6 @@ fn h264_store_prediction_with_residual(v: H264Video*, x: int32, y: int32,
         h264_clip_sample(prediction[row * 4 + column] + residual[row * 4 + column]);
     }
   }
-}
-
-fn h264_clear_residual(v: H264Video*) {
-  for i in 0..256 { v->luma_ac[i] = 0; }
-  for i in 0..16 { v->luma_dc[i] = 0; }
-  for i in 0..128 { v->chroma_ac[i] = 0; }
-  for i in 0..8 { v->chroma_dc[i] = 0; }
 }
 
 fn h264_reconstruct_intra_8x8(v: H264Video*, mb: H264Macroblock*) {
@@ -100,7 +94,12 @@ fn h264_reconstruct_intra_16x16(v: H264Video*, mb: H264Macroblock*) {
     var raster: int32 = v->blk_raster[blk];
     var x: int32 = v->mb_x * 16 + (raster & 3) * 4;
     var y: int32 = v->mb_y * 16 + (raster >> 2) * 4;
-    h264_scale_ac_block(v, &v->luma_ac[blk * 16], &scaled[0], mb->qp);
+    if (mb->luma_nonzero[raster] != (uint8)0) {
+      h264_scale_ac_block(v, &v->luma_ac[blk * 16], &scaled[0], mb->qp);
+    } else {
+      if (dc[raster] == 0) { continue; }
+      for i in 0..16 { scaled[i] = 0; }
+    }
     scaled[0] = dc[raster];
     h264_inverse_transform_4x4(v, &scaled[0], &residual[0]);
     h264_add_residual(v->luma, v->luma_stride, x, y, &residual[0]);
@@ -128,7 +127,12 @@ fn h264_reconstruct_chroma(v: H264Video*, mb: H264Macroblock*, pps: H264Pps*) {
     for blk in 0..4 {
       var x: int32 = v->mb_x * 8 + (blk & 1) * 4;
       var y: int32 = v->mb_y * 8 + (blk >> 1) * 4;
-      h264_scale_ac_block(v, &v->chroma_ac[(component * 4 + blk) * 16], &scaled[0], qp);
+      if (mb->chroma_nonzero[component * 4 + blk] != (uint8)0) {
+        h264_scale_ac_block(v, &v->chroma_ac[(component * 4 + blk) * 16], &scaled[0], qp);
+      } else {
+        if (dc[blk] == 0) { continue; }
+        for i in 0..16 { scaled[i] = 0; }
+      }
       scaled[0] = dc[blk];
       h264_inverse_transform_4x4(v, &scaled[0], &residual[0]);
       h264_add_residual(plane, v->chroma_stride, x, y, &residual[0]);
@@ -157,7 +161,6 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
         mb->kind = H264_MB_P_SKIP;
         h264_skip_motion(v, mb);
       }
-      h264_clear_residual(v);
       h264_reconstruct_inter(v, mb, pps);
       return H264_OK;
     }
@@ -236,8 +239,6 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
 
   if (has_residual != 0) {
     h264_decode_residual(v, mb);
-  } else {
-    h264_clear_residual(v);
   }
 
   if (intra != 0) {
@@ -510,13 +511,13 @@ fn h264_store_colocated_motion(v: H264Video*) {
       if (mb->ref_index[block8] >= 0) {
         picture->col_ref[index] = mb->ref_index[block8];
         picture->col_picture[index] = mb->ref_picture[block8];
-        picture->col_mv_x[index] = mb->mv_x[blk];
-        picture->col_mv_y[index] = mb->mv_y[blk];
+        picture->col_mv_x[index] = (int32)mb->mv_x[blk];
+        picture->col_mv_y[index] = (int32)mb->mv_y[blk];
       } else {
         picture->col_ref[index] = mb->ref_index[4 + block8];
         picture->col_picture[index] = mb->ref_picture[4 + block8];
-        picture->col_mv_x[index] = mb->mv_x[16 + blk];
-        picture->col_mv_y[index] = mb->mv_y[16 + blk];
+        picture->col_mv_x[index] = (int32)mb->mv_x[16 + blk];
+        picture->col_mv_y[index] = (int32)mb->mv_y[16 + blk];
       }
     }
   }
@@ -708,10 +709,12 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
   }
 
   var address: int32 = header->first_mb_in_slice;
+  var cursor_x: int32 = address % v->mb_width;
+  var cursor_y: int32 = address / v->mb_width;
   while (address < v->mb_count) {
     v->mb_index = address;
-    v->mb_x = address % v->mb_width;
-    v->mb_y = address / v->mb_width;
+    v->mb_x = cursor_x;
+    v->mb_y = cursor_y;
 
     var mb_status: int32 = h264_decode_macroblock(v, pps, header);
     if (g_trace_mb != 0) {
@@ -723,10 +726,15 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
 
     if (h264_decode_terminate(v) != 0) { break; }
     address = address + 1;
+    cursor_x = cursor_x + 1;
+    if (cursor_x == v->mb_width) {
+      cursor_x = 0;
+      cursor_y = cursor_y + 1;
+    }
   }
   if (g_trace_mb != 0) {
     var c: H264Cabac* = &v->cabac;
-    println("slice end at mb {address} of {v->mb_count}, cabac byte {c->bit_position / 8} of {c->size}");
+    println("slice end at mb {address} of {v->mb_count}, cabac byte {c->byte_position} of {c->size}");
     fflush(0);
   }
   return H264_OK;
@@ -778,61 +786,61 @@ fn h264_video_reset(v: H264Video*) {
 }
 
 fn h264_write_pixels_to(v: H264Video*, out: uint32*) {
+  if (h264_gpu_convert(v, out) != 0) { return; }
+  h264_write_pixels_cpu(v, out);
+}
+
+fn h264_write_pixels_deferred(v: H264Video*, out: uint32*) {
+  if (h264_gpu_convert_async(v, out) != 0) { return; }
+  h264_write_pixels_cpu(v, out);
+}
+
+fn h264_write_pixels_cpu(v: H264Video*, out: uint32*) {
   var pairs: int32 = v->width / 2;
+  var luma: uint8* = v->luma;
+  var cb: uint8* = v->cb;
+  var cr: uint8* = v->cr;
+  var luma_stride: int32 = v->luma_stride;
+  var chroma_stride: int32 = v->chroma_stride;
+  var width: int32 = v->width;
+
   for y in 0..v->height {
     var source_y: int32 = y + v->crop_top;
-    var luma_row: int64 = (int64)source_y * (int64)v->luma_stride + (int64)v->crop_left;
-    var chroma_row: int64 = (int64)(source_y >> 1) * (int64)v->chroma_stride +
+    var luma_row: int64 = (int64)source_y * (int64)luma_stride + (int64)v->crop_left;
+    var chroma_row: int64 = (int64)(source_y >> 1) * (int64)chroma_stride +
                             (int64)(v->crop_left >> 1);
-    var target: int64 = (int64)y * (int64)v->width;
+    var target: int64 = (int64)y * (int64)width;
 
     for i in 0..pairs {
-      var blue_diff: int32 = (int32)v->cb[chroma_row + (int64)i] - 128;
-      var red_diff: int32 = (int32)v->cr[chroma_row + (int64)i] - 128;
-      var red_bias: int32 = 104597 * red_diff + 32768;
-      var green_bias: int32 = 32768 - 25675 * blue_diff - 53279 * red_diff;
-      var blue_bias: int32 = 132201 * blue_diff + 32768;
+      var blue_diff: int32 = (int32)cb[chroma_row + (int64)i] - 128;
+      var red_diff: int32 = (int32)cr[chroma_row + (int64)i] - 128;
+      var red_bias: int32 = 104597 * red_diff + 32768 + 20971520;
+      var green_bias: int32 = 32768 - 25675 * blue_diff - 53279 * red_diff + 20971520;
+      var blue_bias: int32 = 132201 * blue_diff + 32768 + 20971520;
 
-      var luma: int32 = (int32)v->luma[luma_row + (int64)(i * 2)] - 16;
-      var base: int32 = 76309 * luma;
-      var red: int32 = (base + red_bias) >> 16;
-      var green: int32 = (base + green_bias) >> 16;
-      var blue: int32 = (base + blue_bias) >> 16;
-      if (red < 0) { red = 0; }
-      if (red > 255) { red = 255; }
-      if (green < 0) { green = 0; }
-      if (green > 255) { green = 255; }
-      if (blue < 0) { blue = 0; }
-      if (blue > 255) { blue = 255; }
-      out[target + (int64)(i * 2)] = ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
+      var left: int64 = luma_row + (int64)(i * 2);
+      var base: int32 = g_luma_base[(int32)luma[left]];
+      var red: int32 = (int32)g_clip_rgb[(base + red_bias) >> 16];
+      var green: int32 = (int32)g_clip_rgb[(base + green_bias) >> 16];
+      var blue: int32 = (int32)g_clip_rgb[(base + blue_bias) >> 16];
+      out[target + (int64)(i * 2)] =
+        ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
 
-      luma = (int32)v->luma[luma_row + (int64)(i * 2 + 1)] - 16;
-      base = 76309 * luma;
-      red = (base + red_bias) >> 16;
-      green = (base + green_bias) >> 16;
-      blue = (base + blue_bias) >> 16;
-      if (red < 0) { red = 0; }
-      if (red > 255) { red = 255; }
-      if (green < 0) { green = 0; }
-      if (green > 255) { green = 255; }
-      if (blue < 0) { blue = 0; }
-      if (blue > 255) { blue = 255; }
-      out[target + (int64)(i * 2 + 1)] = ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
+      base = g_luma_base[(int32)luma[left + (int64)1]];
+      red = (int32)g_clip_rgb[(base + red_bias) >> 16];
+      green = (int32)g_clip_rgb[(base + green_bias) >> 16];
+      blue = (int32)g_clip_rgb[(base + blue_bias) >> 16];
+      out[target + (int64)(i * 2 + 1)] =
+        ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
     }
-    for x in (pairs * 2)..v->width {
-      var luma: int32 = (int32)v->luma[luma_row + (int64)x] - 16;
-      var blue_diff: int32 = (int32)v->cb[chroma_row + (int64)(x >> 1)] - 128;
-      var red_diff: int32 = (int32)v->cr[chroma_row + (int64)(x >> 1)] - 128;
-      var base: int32 = 76309 * luma;
-      var red: int32 = (base + 104597 * red_diff + 32768) >> 16;
-      var green: int32 = (base - 25675 * blue_diff - 53279 * red_diff + 32768) >> 16;
-      var blue: int32 = (base + 132201 * blue_diff + 32768) >> 16;
-      if (red < 0) { red = 0; }
-      if (red > 255) { red = 255; }
-      if (green < 0) { green = 0; }
-      if (green > 255) { green = 255; }
-      if (blue < 0) { blue = 0; }
-      if (blue > 255) { blue = 255; }
+    for x in (pairs * 2)..width {
+      var blue_diff: int32 = (int32)cb[chroma_row + (int64)(x >> 1)] - 128;
+      var red_diff: int32 = (int32)cr[chroma_row + (int64)(x >> 1)] - 128;
+      var base: int32 = g_luma_base[(int32)luma[luma_row + (int64)x]] + 20971520;
+      var red: int32 = (int32)g_clip_rgb[(base + 104597 * red_diff + 32768) >> 16];
+      var green: int32 =
+        (int32)g_clip_rgb[(base - 25675 * blue_diff - 53279 * red_diff + 32768) >> 16];
+      var blue: int32 = (int32)g_clip_rgb[(base + 132201 * blue_diff + 32768) >> 16];
       out[target + (int64)x] = ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
     }
   }
