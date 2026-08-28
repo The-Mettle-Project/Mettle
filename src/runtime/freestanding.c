@@ -14,6 +14,7 @@
 #endif
 
 typedef unsigned char mt_u8;
+typedef unsigned short mt_u16;
 typedef unsigned int mt_u32;
 typedef int mt_i32;
 typedef unsigned long long mt_u64;
@@ -389,15 +390,22 @@ MT_DLLIMPORT int WriteFile(void *file, const void *buffer, mt_u32 count,
 MT_DLLIMPORT void *CreateFileA(const char *path, mt_u32 access, mt_u32 sharing,
                                void *security, mt_u32 creation,
                                mt_u32 attributes, void *template_file);
+MT_DLLIMPORT void *CreateFileW(const mt_u16 *path, mt_u32 access, mt_u32 sharing,
+                               void *security, mt_u32 creation,
+                               mt_u32 attributes, void *template_file);
 MT_DLLIMPORT int CloseHandle(void *handle);
 MT_DLLIMPORT int SetFilePointerEx(void *file, mt_i64 distance,
                                   mt_i64 *new_position, mt_u32 method);
 MT_DLLIMPORT int DeleteFileA(const char *path);
+MT_DLLIMPORT int DeleteFileW(const mt_u16 *path);
 MT_DLLIMPORT int GetConsoleMode(void *handle, mt_u32 *mode);
 #define MT_CP_UTF8 65001u
 MT_DLLIMPORT int SetConsoleOutputCP(mt_u32 code_page);
 MT_DLLIMPORT mt_u32 GetConsoleOutputCP(void);
 MT_DLLIMPORT char *GetCommandLineA(void);
+MT_DLLIMPORT mt_u16 *GetCommandLineW(void);
+
+static mt_u16 *mt_widen_path(const char *path);
 MT_DLLIMPORT mt_u32 GetEnvironmentVariableA(const char *name, char *buffer,
                                              mt_u32 size);
 MT_DLLIMPORT int SetEnvironmentVariableA(const char *name, const char *value);
@@ -601,7 +609,15 @@ char *mettle_realpath(const char *path, char *resolved) {
   return realpath(path, resolved);
 }
 
-int unlink(const char *path) { return DeleteFileA(path) ? 0 : -1; }
+int unlink(const char *path) {
+  mt_u16 *wide_path = mt_widen_path(path);
+  if (!wide_path) {
+    return -1;
+  }
+  int ok = DeleteFileW(wide_path);
+  free(wide_path);
+  return ok ? 0 : -1;
+}
 
 int gettimeofday(void *time_value, void *timezone_value) {
   MtFileTime file_time;
@@ -958,6 +974,110 @@ void *__acrt_iob_func(int index) {
   return &mt_stdout_file;
 }
 
+static mt_size mt_utf8_to_utf16(const char *input, mt_u16 *output,
+                                mt_size capacity) {
+  mt_size written = 0;
+  mt_size i = 0;
+  while (input[i]) {
+    mt_u32 code = (mt_u8)input[i++];
+    mt_size extra = 0;
+    if (code >= 0xF0u) {
+      code &= 0x07u;
+      extra = 3;
+    } else if (code >= 0xE0u) {
+      code &= 0x0Fu;
+      extra = 2;
+    } else if (code >= 0xC0u) {
+      code &= 0x1Fu;
+      extra = 1;
+    } else if (code >= 0x80u) {
+      code = 0xFFFDu;
+    }
+    while (extra > 0) {
+      mt_u8 next = (mt_u8)input[i];
+      if ((next & 0xC0u) != 0x80u) {
+        code = 0xFFFDu;
+        break;
+      }
+      code = (code << 6) | (mt_u32)(next & 0x3Fu);
+      i++;
+      extra--;
+    }
+    if (code > 0x10FFFFu || (code >= 0xD800u && code <= 0xDFFFu)) {
+      code = 0xFFFDu;
+    }
+    if (code >= 0x10000u) {
+      if (output && written + 2 <= capacity) {
+        output[written] = (mt_u16)(0xD800u + ((code - 0x10000u) >> 10));
+        output[written + 1] = (mt_u16)(0xDC00u + ((code - 0x10000u) & 0x3FFu));
+      }
+      written += 2;
+    } else {
+      if (output && written < capacity) {
+        output[written] = (mt_u16)code;
+      }
+      written += 1;
+    }
+  }
+  if (output && written < capacity) {
+    output[written] = 0;
+  }
+  return written;
+}
+
+static mt_size mt_utf16_to_utf8(const mt_u16 *input, mt_size length,
+                                char *output) {
+  mt_size written = 0;
+  mt_size i = 0;
+  while (i < length) {
+    mt_u32 code = input[i++];
+    if (code >= 0xD800u && code <= 0xDBFFu && i < length &&
+        input[i] >= 0xDC00u && input[i] <= 0xDFFFu) {
+      code = 0x10000u + ((code - 0xD800u) << 10) + (mt_u32)(input[i] - 0xDC00u);
+      i++;
+    }
+    if (code < 0x80u) {
+      if (output) {
+        output[written] = (char)code;
+      }
+      written += 1;
+    } else if (code < 0x800u) {
+      if (output) {
+        output[written] = (char)(0xC0u | (code >> 6));
+        output[written + 1] = (char)(0x80u | (code & 0x3Fu));
+      }
+      written += 2;
+    } else if (code < 0x10000u) {
+      if (output) {
+        output[written] = (char)(0xE0u | (code >> 12));
+        output[written + 1] = (char)(0x80u | ((code >> 6) & 0x3Fu));
+        output[written + 2] = (char)(0x80u | (code & 0x3Fu));
+      }
+      written += 3;
+    } else {
+      if (output) {
+        output[written] = (char)(0xF0u | (code >> 18));
+        output[written + 1] = (char)(0x80u | ((code >> 12) & 0x3Fu));
+        output[written + 2] = (char)(0x80u | ((code >> 6) & 0x3Fu));
+        output[written + 3] = (char)(0x80u | (code & 0x3Fu));
+      }
+      written += 4;
+    }
+  }
+  return written;
+}
+
+static mt_u16 *mt_widen_path(const char *path) {
+  mt_size units = mt_utf8_to_utf16(path, MT_NULL, 0);
+  mt_u16 *wide = (mt_u16 *)malloc((units + 1) * sizeof(mt_u16));
+  if (!wide) {
+    return MT_NULL;
+  }
+  mt_utf8_to_utf16(path, wide, units + 1);
+  wide[units] = 0;
+  return wide;
+}
+
 void *fopen(const char *path, const char *mode) {
   mt_u32 access = MT_GENERIC_READ;
   mt_u32 creation = MT_OPEN_EXISTING;
@@ -978,8 +1098,13 @@ void *fopen(const char *path, const char *mode) {
       access = MT_GENERIC_READ | MT_GENERIC_WRITE;
     }
   }
-  void *handle = CreateFileA(path, access, MT_FILE_SHARE_READ, MT_NULL,
+  mt_u16 *wide_path = mt_widen_path(path);
+  if (!wide_path) {
+    return MT_NULL;
+  }
+  void *handle = CreateFileW(wide_path, access, MT_FILE_SHARE_READ, MT_NULL,
                              creation, MT_FILE_ATTRIBUTE_NORMAL, MT_NULL);
+  free(wide_path);
   if (handle == MT_INVALID_HANDLE) {
     return MT_NULL;
   }
@@ -1016,31 +1141,33 @@ int fclose(void *stream) {
   return result;
 }
 
-static int mt_is_space(char c) {
-  return c == ' ' || c == '\t';
-}
-
 int mettle_rt_getmainargs(int *argc_out, char ***argv_out) {
-  char *command = GetCommandLineA();
-  mt_size length = strlen(command);
-  char **argv = (char **)malloc((length + 2) * sizeof(char *));
-  char *text = (char *)malloc(length + 1);
+  mt_u16 *command = GetCommandLineW();
+  mt_size length = 0;
+  while (command[length]) {
+    length++;
+  }
+
+  mt_u16 *text = (mt_u16 *)malloc((length + 1) * sizeof(mt_u16));
+  mt_size *starts = (mt_size *)malloc((length + 2) * sizeof(mt_size));
   int argc = 0;
   mt_size source = 0;
   mt_size target = 0;
-  if (!argc_out || !argv_out || !argv || !text) {
-    free(argv);
+  if (!argc_out || !argv_out || !text || !starts) {
     free(text);
+    free(starts);
     return 0;
   }
+
   while (source < length) {
-    while (source < length && mt_is_space(command[source])) {
+    while (source < length &&
+           (command[source] == ' ' || command[source] == '\t')) {
       source++;
     }
     if (source == length) {
       break;
     }
-    argv[argc++] = text + target;
+    starts[argc++] = target;
     int quoted = 0;
     while (source < length) {
       mt_size slash_count = 0;
@@ -1055,8 +1182,7 @@ int mettle_rt_getmainargs(int *argc_out, char ***argv_out) {
         if (slash_count & 1u) {
           text[target++] = '"';
           source++;
-        } else if (quoted && source + 1 < length &&
-                   command[source + 1] == '"') {
+        } else if (quoted && source + 1 < length && command[source + 1] == '"') {
           text[target++] = '"';
           source += 2;
         } else {
@@ -1068,14 +1194,48 @@ int mettle_rt_getmainargs(int *argc_out, char ***argv_out) {
       while (slash_count--) {
         text[target++] = '\\';
       }
-      if (source == length || (!quoted && mt_is_space(command[source]))) {
+      if (source == length ||
+          (!quoted && (command[source] == ' ' || command[source] == '\t'))) {
         break;
       }
       text[target++] = command[source++];
     }
     text[target++] = 0;
   }
+
+  mt_size utf8_bytes = 0;
+  for (int i = 0; i < argc; i++) {
+    mt_size units = 0;
+    while (text[starts[i] + units]) {
+      units++;
+    }
+    utf8_bytes += mt_utf16_to_utf8(text + starts[i], units, MT_NULL) + 1;
+  }
+
+  char **argv = (char **)malloc(((mt_size)argc + 1) * sizeof(char *));
+  char *bytes = (char *)malloc(utf8_bytes + 1);
+  if (!argv || !bytes) {
+    free(argv);
+    free(bytes);
+    free(text);
+    free(starts);
+    return 0;
+  }
+
+  mt_size written = 0;
+  for (int i = 0; i < argc; i++) {
+    mt_size units = 0;
+    while (text[starts[i] + units]) {
+      units++;
+    }
+    argv[i] = bytes + written;
+    written += mt_utf16_to_utf8(text + starts[i], units, bytes + written);
+    bytes[written++] = 0;
+  }
   argv[argc] = MT_NULL;
+
+  free(text);
+  free(starts);
   *argc_out = argc;
   *argv_out = argv;
   return 1;
@@ -3239,7 +3399,7 @@ int ioctl(int descriptor, unsigned long request, ...) {
 
 int remove(const char *path) {
 #if defined(_WIN32)
-  return DeleteFileA(path) ? 0 : -1;
+  return unlink(path);
 #else
   return (int)mt_sys_result(mt_syscall6(MT_SYS_UNLINKAT, MT_AT_FDCWD,
                                         (mt_i64)path, 0, 0, 0, 0));

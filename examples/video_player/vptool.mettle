@@ -1,8 +1,9 @@
 import "std/io";
 import "std/mem";
 import "jpeg";
-import "avi";
+import "source";
 import "audio";
+import "mp4";
 
 extern fn Win_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
 extern fn Win_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
@@ -122,23 +123,26 @@ fn command_jpeg(input: cstring, output: cstring) -> int32 {
 
 fn command_info(path: cstring) -> int32 {
   var status: int32 = 0;
-  var file: AviFile* = avi_open(path, &status);
+  var file: MediaSource* = source_open(path, &status);
   if (file == 0) {
-    println("cannot open avi, status {status}");
+    println("cannot open file, status {status}");
     return 1;
   }
-  defer avi_close(file);
+  defer source_close(file);
 
-  var microseconds: int64 = avi_duration_microseconds(file);
+  var microseconds: int64 = file->duration_us;
+  print("container     ");
+  println(source_container_name(file));
+  print("video codec   ");
+  println(source_video_codec_name(file));
   println("size          {file->width}x{file->height}");
-  println("video frames  {file->video_count}");
-  println("frame period  {file->microsec_per_frame} us");
+  println("video frames  {file->video_frame_count}");
   println("duration      {microseconds / 1000000}.{(microseconds / 1000) % 1000} s");
-  println("largest frame {file->video_max_size} bytes");
-  println("mjpeg         {avi_is_mjpeg(file)}");
-  if (avi_has_audio(file) != 0) {
-    var stream: int32 = file->audio_stream;
-    println("audio         {file->streams[stream].channels} ch, {file->streams[stream].sample_rate} Hz, {file->streams[stream].bits_per_sample} bit, {file->audio_count} chunks, {file->audio_total_bytes} bytes");
+  println("largest frame {file->max_video_size} bytes");
+  if (source_has_audio(file) != 0) {
+    println("audio         {file->audio_channels} ch, {file->audio_sample_rate} Hz, {file->audio_bits} bit, {file->audio_chunk_count} chunks, {file->audio_total_bytes} bytes");
+  } else if (file->audio_codec == SOURCE_AUDIO_AAC) {
+    println("audio         AAC, {file->audio_channels} ch, {file->audio_sample_rate} Hz, not decoded yet");
   } else {
     println("audio         none");
   }
@@ -147,18 +151,18 @@ fn command_info(path: cstring) -> int32 {
 
 fn command_frame(path: cstring, frame_index: int32, output: cstring) -> int32 {
   var status: int32 = 0;
-  var file: AviFile* = avi_open(path, &status);
+  var file: MediaSource* = source_open(path, &status);
   if (file == 0) {
-    println("cannot open avi, status {status}");
+    println("cannot open file, status {status}");
     return 1;
   }
-  defer avi_close(file);
+  defer source_close(file);
 
-  var buffer: uint8* = malloc((int64)file->video_max_size);
+  var buffer: uint8* = malloc((int64)file->max_video_size);
   if (buffer == 0) { return 1; }
   defer free(buffer);
 
-  var size: int32 = avi_read_video_frame(file, frame_index, buffer, (int64)file->video_max_size);
+  var size: int32 = source_read_video(file, frame_index, buffer, (int64)file->max_video_size);
   if (size <= 0) {
     println("cannot read frame {frame_index}");
     return 1;
@@ -183,14 +187,14 @@ fn command_frame(path: cstring, frame_index: int32, output: cstring) -> int32 {
 
 fn command_bench(path: cstring) -> int32 {
   var status: int32 = 0;
-  var file: AviFile* = avi_open(path, &status);
+  var file: MediaSource* = source_open(path, &status);
   if (file == 0) {
-    println("cannot open avi, status {status}");
+    println("cannot open file, status {status}");
     return 1;
   }
-  defer avi_close(file);
+  defer source_close(file);
 
-  var buffer: uint8* = malloc((int64)file->video_max_size);
+  var buffer: uint8* = malloc((int64)file->max_video_size);
   if (buffer == 0) { return 1; }
   defer free(buffer);
 
@@ -201,11 +205,11 @@ fn command_bench(path: cstring) -> int32 {
   var decoded: int32 = 0;
   var failed: int32 = 0;
   var checksum: int64 = 0;
-  for i in 0..file->video_count {
-    var size: int32 = avi_read_video_frame(file, i, buffer, (int64)file->video_max_size);
+  for i in 0..file->video_frame_count {
+    var size: int32 = source_read_video(file, i, buffer, (int64)file->max_video_size);
     if (size <= 0) {
       failed = failed + 1;
-      if (failed <= 5) { println("frame {i}: read failed, chunk size {file->video_sizes[i]}"); }
+      if (failed <= 5) { println("frame {i}: empty or unreadable"); }
       continue;
     }
     var frame_status: int32 = jpeg_decode(decoder, buffer, (int64)size);
@@ -229,12 +233,12 @@ fn command_bench(path: cstring) -> int32 {
 
 fn command_audio(path: cstring, seconds: int32) -> int32 {
   var status: int32 = 0;
-  var file: AviFile* = avi_open(path, &status);
+  var file: MediaSource* = source_open(path, &status);
   if (file == 0) {
-    println("cannot open avi, status {status}");
+    println("cannot open file, status {status}");
     return 1;
   }
-  defer avi_close(file);
+  defer source_close(file);
 
   var player: AudioPlayer* = audio_open(file);
   if (player == 0) { return 1; }
@@ -265,6 +269,67 @@ fn command_audio(path: cstring, seconds: int32) -> int32 {
   return 0;
 }
 
+fn print_fourcc(code: uint32) {
+  var text: uint8[8];
+  text[0] = (uint8)((code >> 24) & (uint32)255);
+  text[1] = (uint8)((code >> 16) & (uint32)255);
+  text[2] = (uint8)((code >> 8) & (uint32)255);
+  text[3] = (uint8)(code & (uint32)255);
+  text[4] = (uint8)0;
+  for i in 0..4 {
+    if (text[i] < (uint8)32 || text[i] > (uint8)126) { text[i] = (uint8)46; }
+  }
+  print_cstr((cstring)&text[0]);
+}
+
+fn command_mp4info(path: cstring) -> int32 {
+  var status: int32 = 0;
+  var file: Mp4File* = mp4_open(path, &status);
+  if (file == 0) {
+    println("cannot open mp4, status {status}");
+    return 1;
+  }
+  defer mp4_close(file);
+
+  var duration: int64 = mp4_duration_microseconds(file);
+  println("tracks        {file->track_count}");
+  println("duration      {duration / 1000000}.{(duration / 1000) % 1000} s");
+  for i in 0..file->track_count {
+    print("track {i}      ");
+    print_fourcc(file->tracks[i].format);
+    print(" kind={file->tracks[i].kind} timescale={file->tracks[i].timescale} samples={file->tracks[i].sample_count}");
+    println(" sync={file->tracks[i].sync_count} largest={file->tracks[i].max_size} config={file->tracks[i].codec_config_size}");
+    if (file->tracks[i].kind == MP4_TRACK_VIDEO) {
+      println("              {file->tracks[i].width}x{file->tracks[i].height}");
+    }
+    if (file->tracks[i].kind == MP4_TRACK_AUDIO) {
+      println("              {file->tracks[i].channels} ch, {file->tracks[i].sample_rate} Hz, {file->tracks[i].bits_per_sample} bit");
+    }
+  }
+  return 0;
+}
+
+fn command_mp4samples(path: cstring, track: int32, count: int32) -> int32 {
+  var status: int32 = 0;
+  var file: Mp4File* = mp4_open(path, &status);
+  if (file == 0) {
+    println("cannot open mp4, status {status}");
+    return 1;
+  }
+  defer mp4_close(file);
+
+  if (track < 0 || track >= file->track_count) {
+    println("no such track");
+    return 1;
+  }
+  var limit: int32 = count;
+  if (limit > file->tracks[track].sample_count) { limit = file->tracks[track].sample_count; }
+  for i in 0..limit {
+    println("{i} {file->tracks[track].offsets[i]} {file->tracks[track].sizes[i]} {file->tracks[track].decode_times[i]} {file->tracks[track].presentation_times[i]} {file->tracks[track].sync_flags[i]}");
+  }
+  return 0;
+}
+
 fn parse_int(text: cstring) -> int32 {
   var value: int32 = 0;
   var i: int64 = 0;
@@ -277,11 +342,13 @@ fn parse_int(text: cstring) -> int32 {
 
 fn print_usage() {
   println("usage:");
-  println("  vptool info  <input.avi>");
-  println("  vptool frame <input.avi> <index> <output.ppm>");
-  println("  vptool bench <input.avi>");
+  println("  vptool info  <input>");
+  println("  vptool frame <input> <index> <output.ppm>");
+  println("  vptool bench <input>");
   println("  vptool jpeg  <input.jpg> <output.ppm>");
-  println("  vptool audio <input.avi> [seconds]");
+  println("  vptool audio <input> [seconds]");
+  println("  vptool mp4info <input.mp4>");
+  println("  vptool mp4samples <input.mp4> <track> <count>");
 }
 
 fn main(argc: int32, argv: cstring*) -> int32 {
@@ -301,6 +368,12 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   }
   if (cstring_equals(command, "bench") != 0) {
     return command_bench(argv[2]);
+  }
+  if (cstring_equals(command, "mp4info") != 0) {
+    return command_mp4info(argv[2]);
+  }
+  if (cstring_equals(command, "mp4samples") != 0 && argc >= 5) {
+    return command_mp4samples(argv[2], parse_int(argv[3]), parse_int(argv[4]));
   }
   if (cstring_equals(command, "audio") != 0) {
     var seconds: int32 = 5;

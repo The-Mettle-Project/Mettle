@@ -1,5 +1,5 @@
 import "std/mem";
-import "avi";
+import "source";
 
 const AUDIO_BUFFER_COUNT = 12;
 const AUDIO_WHDR_DONE = 1;
@@ -66,19 +66,18 @@ struct AudioPlayer {
   finished: int32;
 }
 
-fn audio_open(file: AviFile*) -> AudioPlayer* {
+fn audio_open(file: MediaSource*) -> AudioPlayer* {
   var player: AudioPlayer* = malloc(sizeof(AudioPlayer));
   if (player == 0) { return 0; }
   memset(player, 0, sizeof(AudioPlayer));
   player->volume = 70;
 
-  if (avi_has_audio(file) == 0) { return player; }
+  if (source_has_audio(file) == 0) { return player; }
 
-  var stream: int32 = file->audio_stream;
-  var channels: int32 = file->streams[stream].channels;
-  var sample_rate: int32 = file->streams[stream].sample_rate;
-  var bits: int32 = file->streams[stream].bits_per_sample;
-  var align: int32 = file->streams[stream].block_align;
+  var channels: int32 = file->audio_channels;
+  var sample_rate: int32 = file->audio_sample_rate;
+  var bits: int32 = file->audio_bits;
+  var align: int32 = file->audio_block_align;
   if (align <= 0) { align = channels * (bits / 8); }
   if (channels <= 0 || sample_rate <= 0 || align <= 0) { return player; }
 
@@ -96,7 +95,7 @@ fn audio_open(file: AviFile*) -> AudioPlayer* {
     return player;
   }
 
-  var capacity: int32 = file->audio_max_size;
+  var capacity: int32 = file->max_audio_size;
   if (capacity < 4096) { capacity = 4096; }
 
   player->headers = malloc((int64)AUDIO_BUFFER_COUNT * sizeof(WaveHeader));
@@ -197,7 +196,7 @@ fn audio_position_microseconds(player: AudioPlayer*) -> int64 {
   return player->base_microseconds + played * (int64)1000000 / (int64)player->bytes_per_second;
 }
 
-fn audio_seek(player: AudioPlayer*, file: AviFile*, microseconds: int64) {
+fn audio_seek(player: AudioPlayer*, file: MediaSource*, microseconds: int64) {
   if (player->ready == 0) { return; }
   waveOutReset(player->device);
   audio_release_headers(player);
@@ -207,15 +206,15 @@ fn audio_seek(player: AudioPlayer*, file: AviFile*, microseconds: int64) {
 
   var byte_position: int64 = microseconds * (int64)player->bytes_per_second / (int64)1000000;
   if (byte_position < 0) { byte_position = 0; }
-  var chunk: int32 = avi_audio_chunk_at_byte(file, byte_position);
+  var chunk: int32 = source_audio_chunk_at_byte(file, byte_position);
   player->next_chunk = chunk;
-  player->base_microseconds = file->audio_starts[chunk] * (int64)1000000 / (int64)player->bytes_per_second;
+  player->base_microseconds = source_audio_chunk_start(file, chunk) * (int64)1000000 / (int64)player->bytes_per_second;
   if (player->paused == 0) {
     waveOutRestart(player->device);
   }
 }
 
-fn audio_pump(player: AudioPlayer*, file: AviFile*) {
+fn audio_pump(player: AudioPlayer*, file: MediaSource*) {
   if (player->ready == 0) { return; }
   for i in 0..AUDIO_BUFFER_COUNT {
     var header: WaveHeader* = &player->headers[i];
@@ -224,12 +223,12 @@ fn audio_pump(player: AudioPlayer*, file: AviFile*) {
       waveOutUnprepareHeader(player->device, header, (uint32)sizeof(WaveHeader));
       player->in_flight[i] = 0;
     }
-    if (player->next_chunk >= file->audio_count) {
+    if (player->next_chunk >= file->audio_chunk_count) {
       player->finished = 1;
       return;
     }
     var target: uint8* = &player->buffers[(int64)i * (int64)player->buffer_capacity];
-    var size: int32 = avi_read_audio_chunk(file, player->next_chunk, target, (int64)player->buffer_capacity);
+    var size: int32 = source_read_audio(file, player->next_chunk, target, (int64)player->buffer_capacity);
     player->next_chunk = player->next_chunk + 1;
     if (size <= 0) { continue; }
 

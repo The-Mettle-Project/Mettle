@@ -1,0 +1,352 @@
+import "std/mem";
+import "std/io";
+import "avi";
+import "mp4";
+
+const SOURCE_OK = 0;
+const SOURCE_ERR_OPEN = 1;
+const SOURCE_ERR_FORMAT = 2;
+const SOURCE_ERR_NO_VIDEO = 3;
+const SOURCE_ERR_NO_MEMORY = 4;
+
+const SOURCE_CONTAINER_AVI = 1;
+const SOURCE_CONTAINER_ISO = 2;
+
+const SOURCE_VIDEO_UNKNOWN = 0;
+const SOURCE_VIDEO_MJPEG = 1;
+const SOURCE_VIDEO_H264 = 2;
+
+const SOURCE_AUDIO_NONE = 0;
+const SOURCE_AUDIO_PCM = 1;
+const SOURCE_AUDIO_AAC = 2;
+
+const SOURCE_AUDIO_TARGET_BYTES = 8192;
+
+struct MediaSource {
+  container: int32;
+  avi: AviFile*;
+  mp4: Mp4File*;
+
+  width: int32;
+  height: int32;
+  video_codec: int32;
+  video_frame_count: int32;
+  max_video_size: int32;
+  duration_us: int64;
+
+  audio_codec: int32;
+  audio_channels: int32;
+  audio_sample_rate: int32;
+  audio_bits: int32;
+  audio_block_align: int32;
+
+  audio_offsets: int64*;
+  audio_sizes: int32*;
+  audio_starts: int64*;
+  audio_chunk_count: int32;
+  audio_total_bytes: int64;
+  max_audio_size: int32;
+
+  codec_config: uint8*;
+  codec_config_size: int32;
+}
+
+fn source_path_is_iso(path: cstring) -> int32 {
+  var length: int64 = 0;
+  while (path[length] != (uint8)0) { length = length + 1; }
+  if (length < 4) { return 0; }
+  var dot: int64 = length - 4;
+  if (path[dot] != (uint8)46) { return 0; }
+  var a: int32 = source_lower((int32)path[dot + 1]);
+  var b: int32 = source_lower((int32)path[dot + 2]);
+  var c: int32 = source_lower((int32)path[dot + 3]);
+  if (a == 109 && b == 112 && c == 52) { return 1; }
+  if (a == 109 && b == 111 && c == 118) { return 1; }
+  if (a == 109 && b == 52 && c == 97) { return 1; }
+  if (a == 109 && b == 52 && c == 118) { return 1; }
+  return 0;
+}
+
+fn source_lower(character: int32) -> int32 {
+  if (character >= 65 && character <= 90) { return character + 32; }
+  return character;
+}
+
+fn source_reserve_audio(s: MediaSource*, needed: int32) -> int32 {
+  var offsets: int64* = realloc(s->audio_offsets, (int64)needed * 8);
+  if (offsets == 0) { return 0; }
+  s->audio_offsets = offsets;
+  var sizes: int32* = realloc(s->audio_sizes, (int64)needed * 4);
+  if (sizes == 0) { return 0; }
+  s->audio_sizes = sizes;
+  var starts: int64* = realloc(s->audio_starts, (int64)needed * 8);
+  if (starts == 0) { return 0; }
+  s->audio_starts = starts;
+  return 1;
+}
+
+fn source_build_iso_audio(s: MediaSource*) -> int32 {
+  var file: Mp4File* = s->mp4;
+  var track: int32 = file->audio_track;
+  if (track < 0) { return 1; }
+
+  s->audio_channels = file->tracks[track].channels;
+  s->audio_sample_rate = file->tracks[track].sample_rate;
+  s->audio_bits = file->tracks[track].bits_per_sample;
+  if (s->audio_bits <= 0) { s->audio_bits = 16; }
+  s->audio_block_align = s->audio_channels * (s->audio_bits / 8);
+
+  if (mp4_format_is_aac(file->tracks[track].format) != 0) {
+    s->audio_codec = SOURCE_AUDIO_AAC;
+    return 1;
+  }
+  if (mp4_format_is_pcm(file->tracks[track].format) == 0) {
+    return 1;
+  }
+  s->audio_codec = SOURCE_AUDIO_PCM;
+
+  var count: int32 = file->tracks[track].sample_count;
+  if (count <= 0) { return 1; }
+  if (source_reserve_audio(s, count) == 0) { return 0; }
+
+  var chunk: int32 = -1;
+  for i in 0..count {
+    var offset: int64 = file->tracks[track].offsets[i];
+    var size: int32 = file->tracks[track].sizes[i];
+    if (size <= 0) { continue; }
+    var merged: int32 = 0;
+    if (chunk >= 0) {
+      if (s->audio_offsets[chunk] + (int64)s->audio_sizes[chunk] == offset &&
+          s->audio_sizes[chunk] + size <= SOURCE_AUDIO_TARGET_BYTES) {
+        s->audio_sizes[chunk] = s->audio_sizes[chunk] + size;
+        merged = 1;
+      }
+    }
+    if (merged == 0) {
+      chunk = chunk + 1;
+      s->audio_offsets[chunk] = offset;
+      s->audio_sizes[chunk] = size;
+    }
+  }
+  s->audio_chunk_count = chunk + 1;
+
+  var running: int64 = 0;
+  for i in 0..s->audio_chunk_count {
+    s->audio_starts[i] = running;
+    running = running + (int64)s->audio_sizes[i];
+    if (s->audio_sizes[i] > s->max_audio_size) { s->max_audio_size = s->audio_sizes[i]; }
+  }
+  s->audio_total_bytes = running;
+  return 1;
+}
+
+fn source_first_sample_is_jpeg(s: MediaSource*) -> int32 {
+  var track: int32 = s->mp4->video_track;
+  if (s->mp4->tracks[track].sample_count <= 0) { return 0; }
+  var probe: uint8[4];
+  if (mp4_read_block(s->mp4, s->mp4->tracks[track].offsets[0], &probe[0], 3) == 0) { return 0; }
+  if (probe[0] == (uint8)0xFF && probe[1] == (uint8)0xD8 && probe[2] == (uint8)0xFF) { return 1; }
+  return 0;
+}
+
+fn source_open_iso(s: MediaSource*, path: cstring, status: int32*) -> int32 {
+  var open_status: int32 = 0;
+  s->mp4 = mp4_open(path, &open_status);
+  if (s->mp4 == 0) {
+    if (open_status == MP4_ERR_OPEN) { *status = SOURCE_ERR_OPEN; }
+    else if (open_status == MP4_ERR_NO_TRACK) { *status = SOURCE_ERR_NO_VIDEO; }
+    else { *status = SOURCE_ERR_FORMAT; }
+    return 0;
+  }
+  s->container = SOURCE_CONTAINER_ISO;
+
+  var track: int32 = s->mp4->video_track;
+  s->width = s->mp4->tracks[track].width;
+  s->height = s->mp4->tracks[track].height;
+  s->video_frame_count = s->mp4->tracks[track].sample_count;
+  s->max_video_size = s->mp4->tracks[track].max_size;
+  s->duration_us = mp4_duration_microseconds(s->mp4);
+  s->codec_config = s->mp4->tracks[track].codec_config;
+  s->codec_config_size = s->mp4->tracks[track].codec_config_size;
+
+  if (mp4_format_is_mjpeg(s->mp4->tracks[track].format) != 0) {
+    s->video_codec = SOURCE_VIDEO_MJPEG;
+  } else if (mp4_format_is_avc(s->mp4->tracks[track].format) != 0) {
+    s->video_codec = SOURCE_VIDEO_H264;
+  } else if (source_first_sample_is_jpeg(s) != 0) {
+    s->video_codec = SOURCE_VIDEO_MJPEG;
+  }
+
+  if (source_build_iso_audio(s) == 0) {
+    *status = SOURCE_ERR_NO_MEMORY;
+    return 0;
+  }
+  *status = SOURCE_OK;
+  return 1;
+}
+
+fn source_open_avi(s: MediaSource*, path: cstring, status: int32*) -> int32 {
+  var open_status: int32 = 0;
+  s->avi = avi_open(path, &open_status);
+  if (s->avi == 0) {
+    if (open_status == AVI_ERR_OPEN) { *status = SOURCE_ERR_OPEN; }
+    else if (open_status == AVI_ERR_NO_VIDEO) { *status = SOURCE_ERR_NO_VIDEO; }
+    else { *status = SOURCE_ERR_FORMAT; }
+    return 0;
+  }
+  s->container = SOURCE_CONTAINER_AVI;
+  s->width = s->avi->width;
+  s->height = s->avi->height;
+  s->video_frame_count = s->avi->video_count;
+  s->max_video_size = s->avi->video_max_size;
+  s->duration_us = avi_duration_microseconds(s->avi);
+  s->video_codec = SOURCE_VIDEO_MJPEG;
+
+  if (avi_has_audio(s->avi) != 0) {
+    var stream: int32 = s->avi->audio_stream;
+    s->audio_codec = SOURCE_AUDIO_PCM;
+    s->audio_channels = s->avi->streams[stream].channels;
+    s->audio_sample_rate = s->avi->streams[stream].sample_rate;
+    s->audio_bits = s->avi->streams[stream].bits_per_sample;
+    s->audio_block_align = s->avi->streams[stream].block_align;
+    if (s->audio_block_align <= 0) {
+      s->audio_block_align = s->audio_channels * (s->audio_bits / 8);
+    }
+    s->audio_chunk_count = s->avi->audio_count;
+    s->audio_total_bytes = s->avi->audio_total_bytes;
+    s->max_audio_size = s->avi->audio_max_size;
+  }
+  *status = SOURCE_OK;
+  return 1;
+}
+
+fn source_open(path: cstring, status: int32*) -> MediaSource* {
+  var s: MediaSource* = malloc(sizeof(MediaSource));
+  if (s == 0) {
+    *status = SOURCE_ERR_NO_MEMORY;
+    return 0;
+  }
+  memset(s, 0, sizeof(MediaSource));
+
+  var opened: int32 = 0;
+  if (source_path_is_iso(path) != 0) {
+    opened = source_open_iso(s, path, status);
+    if (opened == 0 && *status == SOURCE_ERR_FORMAT) {
+      opened = source_open_avi(s, path, status);
+    }
+  } else {
+    opened = source_open_avi(s, path, status);
+    if (opened == 0 && *status == SOURCE_ERR_FORMAT) {
+      opened = source_open_iso(s, path, status);
+    }
+  }
+  if (opened == 0) {
+    source_close(s);
+    return 0;
+  }
+  return s;
+}
+
+fn source_close(s: MediaSource*) {
+  if (s == 0) { return; }
+  if (s->avi != 0) { avi_close(s->avi); }
+  if (s->mp4 != 0) { mp4_close(s->mp4); }
+  if (s->audio_offsets != 0) { free(s->audio_offsets); }
+  if (s->audio_sizes != 0) { free(s->audio_sizes); }
+  if (s->audio_starts != 0) { free(s->audio_starts); }
+  free(s);
+}
+
+fn source_sample_for_display(s: MediaSource*, display_index: int32) -> int32 {
+  if (s->container == SOURCE_CONTAINER_AVI) { return display_index; }
+  var track: int32 = s->mp4->video_track;
+  if (display_index < 0 || display_index >= s->mp4->tracks[track].sample_count) { return -1; }
+  return s->mp4->tracks[track].display_order[display_index];
+}
+
+fn source_video_time_us(s: MediaSource*, display_index: int32) -> int64 {
+  if (s->container == SOURCE_CONTAINER_AVI) {
+    return (int64)display_index * (int64)s->avi->microsec_per_frame;
+  }
+  var track: int32 = s->mp4->video_track;
+  return mp4_sample_presentation_microseconds(s->mp4, track, source_sample_for_display(s, display_index));
+}
+
+fn source_video_index_at_time(s: MediaSource*, microseconds: int64) -> int32 {
+  if (s->container == SOURCE_CONTAINER_AVI) {
+    var period: int64 = (int64)s->avi->microsec_per_frame;
+    if (period <= 0) { period = 33333; }
+    var index: int64 = microseconds / period;
+    if (index < 0) { index = 0; }
+    if (index >= (int64)s->video_frame_count) { index = (int64)s->video_frame_count - 1; }
+    return (int32)index;
+  }
+  return mp4_display_index_at_time(s->mp4, s->mp4->video_track, microseconds);
+}
+
+fn source_read_video(s: MediaSource*, display_index: int32, into: uint8*, capacity: int64) -> int32 {
+  if (s->container == SOURCE_CONTAINER_AVI) {
+    return avi_read_video_frame(s->avi, display_index, into, capacity);
+  }
+  var sample: int32 = source_sample_for_display(s, display_index);
+  return mp4_read_sample(s->mp4, s->mp4->video_track, sample, into, capacity);
+}
+
+fn source_has_audio(s: MediaSource*) -> int32 {
+  if (s->audio_codec != SOURCE_AUDIO_PCM) { return 0; }
+  if (s->audio_chunk_count <= 0) { return 0; }
+  return 1;
+}
+
+fn source_read_audio(s: MediaSource*, index: int32, into: uint8*, capacity: int64) -> int32 {
+  if (s->container == SOURCE_CONTAINER_AVI) {
+    return avi_read_audio_chunk(s->avi, index, into, capacity);
+  }
+  if (index < 0 || index >= s->audio_chunk_count) { return -1; }
+  var size: int32 = s->audio_sizes[index];
+  if ((int64)size > capacity) { return -1; }
+  if (mp4_read_block(s->mp4, s->audio_offsets[index], into, (int64)size) == 0) { return -1; }
+  return size;
+}
+
+fn source_audio_chunk_start(s: MediaSource*, index: int32) -> int64 {
+  if (s->container == SOURCE_CONTAINER_AVI) {
+    if (index < 0 || index >= s->avi->audio_count) { return 0; }
+    return s->avi->audio_starts[index];
+  }
+  if (index < 0 || index >= s->audio_chunk_count) { return 0; }
+  return s->audio_starts[index];
+}
+
+fn source_audio_bytes_per_second(s: MediaSource*) -> int32 {
+  var align: int32 = s->audio_block_align;
+  if (align <= 0) { align = s->audio_channels * (s->audio_bits / 8); }
+  return s->audio_sample_rate * align;
+}
+
+fn source_audio_chunk_at_byte(s: MediaSource*, byte_position: int64) -> int32 {
+  var count: int32 = s->audio_chunk_count;
+  if (count <= 0) { return 0; }
+  var low: int32 = 0;
+  var high: int32 = count - 1;
+  while (low < high) {
+    var middle: int32 = (low + high + 1) / 2;
+    if (source_audio_chunk_start(s, middle) <= byte_position) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return low;
+}
+
+fn source_video_codec_name(s: MediaSource*) -> string {
+  if (s->video_codec == SOURCE_VIDEO_MJPEG) { return "Motion JPEG"; }
+  if (s->video_codec == SOURCE_VIDEO_H264) { return "H.264"; }
+  return "unknown";
+}
+
+fn source_container_name(s: MediaSource*) -> string {
+  if (s->container == SOURCE_CONTAINER_AVI) { return "AVI"; }
+  return "ISO base media";
+}

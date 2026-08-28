@@ -2,7 +2,7 @@ import "std/ui";
 import "std/io";
 import "std/mem";
 import "jpeg";
-import "avi";
+import "source";
 import "audio";
 
 const SEEK_STEP_US = 5000000;
@@ -50,7 +50,7 @@ extern fn Win_ReleaseCapture() -> int32 = "ReleaseCapture";
 
 var g_window: int64 = 0;
 var g_running: int32 = 1;
-var g_file: AviFile* = 0;
+var g_file: MediaSource* = 0;
 var g_decoder: JpegDecoder* = 0;
 var g_audio: AudioPlayer* = 0;
 var g_frame_buffer: uint8* = 0;
@@ -159,16 +159,11 @@ fn append_clock(buffer: uint8*, index: int32, microseconds: int64) -> int32 {
 }
 
 fn frame_at_position(microseconds: int64) -> int32 {
-  var period: int64 = (int64)g_file->microsec_per_frame;
-  if (period <= 0) { period = 33333; }
-  var index: int64 = microseconds / period;
-  if (index < 0) { index = 0; }
-  if (index >= (int64)g_file->video_count) { index = (int64)g_file->video_count - 1; }
-  return (int32)index;
+  return source_video_index_at_time(g_file, microseconds);
 }
 
 fn decode_frame(index: int32) -> int32 {
-  var size: int32 = avi_read_video_frame(g_file, index, g_frame_buffer, g_frame_capacity);
+  var size: int32 = source_read_video(g_file, index, g_frame_buffer, g_frame_capacity);
   if (size < 0) { return 0; }
   if (size == 0) { return 1; }
   var started: int64 = now_microseconds();
@@ -288,7 +283,7 @@ fn paint_osd(hdc: int64, client: UiRect*) {
   right_length = append_text(&right_text[0], right_length, "frame ");
   right_length = append_number(&right_text[0], right_length, (int64)g_displayed_frame + (int64)1, 1);
   right_length = append_byte(&right_text[0], right_length, 47);
-  right_length = append_number(&right_text[0], right_length, (int64)g_file->video_count, 1);
+  right_length = append_number(&right_text[0], right_length, (int64)g_file->video_frame_count, 1);
   if (g_decode_samples > 0) {
     var tenths: int64 = g_decode_total_us / g_decode_samples / (int64)100;
     right_length = append_text(&right_text[0], right_length, "   decode ");
@@ -383,24 +378,19 @@ fn seek_to(microseconds: int64) {
   g_clock_start_us = now_microseconds();
   audio_seek(g_audio, g_file, target);
   var index: int32 = frame_at_position(target);
-  var scan: int32 = index;
-  while (scan > 0 && g_file->video_sizes[scan] == 0) {
-    scan = scan - 1;
-  }
-  if (scan != g_displayed_frame) {
-    decode_frame(scan);
+  if (index != g_displayed_frame) {
+    decode_frame(index);
   }
   g_displayed_frame = index;
   present();
 }
 
 fn step_frames(delta: int32) {
-  var period: int64 = (int64)g_file->microsec_per_frame;
   var index: int32 = frame_at_position(g_position_us) + delta;
   if (index < 0) { index = 0; }
-  if (index >= g_file->video_count) { index = g_file->video_count - 1; }
+  if (index >= g_file->video_frame_count) { index = g_file->video_frame_count - 1; }
   set_playing(0);
-  seek_to((int64)index * period);
+  seek_to(source_video_time_us(g_file, index));
 }
 
 fn update_playback() {
@@ -647,9 +637,9 @@ fn print_controls() {
 
 fn main(argc: int32, argv: cstring*) -> int32 {
   if (argc < 2) {
-    println("usage: player <file.avi>");
+    println("usage: player <file>");
     println("");
-    println("Plays Motion JPEG video with PCM audio from an AVI container.");
+    println("Plays Motion JPEG video with PCM audio from AVI, MP4 and MOV.");
     println("Convert any source with ffmpeg:");
     println("  ffmpeg -i input.mp4 -c:v mjpeg -q:v 5 -pix_fmt yuvj420p -c:a pcm_s16le clip.avi");
     println("");
@@ -661,26 +651,31 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   if (g_qpc_frequency <= 0) { g_qpc_frequency = 1; }
 
   var status: int32 = 0;
-  g_file = avi_open(argv[1], &status);
+  g_file = source_open(argv[1], &status);
   if (g_file == 0) {
     print("cannot open ");
     println_cstr(argv[1]);
-    if (status == AVI_ERR_OPEN) { println("no such file"); }
-    if (status == AVI_ERR_NOT_RIFF) { println("not an AVI file"); }
-    if (status == AVI_ERR_NO_VIDEO) { println("no video stream found"); }
+    if (status == SOURCE_ERR_OPEN) { println("no such file"); }
+    if (status == SOURCE_ERR_FORMAT) { println("not an AVI, MP4 or MOV file"); }
+    if (status == SOURCE_ERR_NO_VIDEO) { println("no video track found"); }
     return 1;
   }
-  defer avi_close(g_file);
+  defer source_close(g_file);
 
-  if (avi_is_mjpeg(g_file) == 0) {
-    println("warning: video stream is not tagged Motion JPEG, trying anyway");
+  if (g_file->video_codec != SOURCE_VIDEO_MJPEG) {
+    print("this file carries ");
+    print(source_video_codec_name(g_file));
+    println(" video, which this player cannot decode yet");
+    println("convert it once with ffmpeg:");
+    println("  ffmpeg -i input -c:v mjpeg -q:v 5 -pix_fmt yuvj420p -c:a pcm_s16le -ar 44100 -ac 2 clip.avi");
+    return 1;
   }
 
   g_decoder = jpeg_decoder_new();
   if (g_decoder == 0) { return 1; }
   defer jpeg_decoder_free(g_decoder);
 
-  g_frame_capacity = (int64)g_file->video_max_size;
+  g_frame_capacity = (int64)g_file->max_video_size;
   g_frame_buffer = malloc(g_frame_capacity);
   if (g_frame_buffer == 0) { return 1; }
   defer free(g_frame_buffer);
@@ -689,12 +684,17 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   if (g_audio == 0) { return 1; }
   defer audio_close(g_audio);
 
-  g_duration_us = avi_duration_microseconds(g_file);
+  g_duration_us = g_file->duration_us;
 
-  print("video {g_file->width}x{g_file->height}, {g_file->video_count} frames, {(int64)1000000 / (int64)g_file->microsec_per_frame} fps");
+  print(source_container_name(g_file));
+  print(", ");
+  print(source_video_codec_name(g_file));
+  print(" {g_file->width}x{g_file->height}, {g_file->video_frame_count} frames");
   if (g_audio->ready != 0) {
-    println(", audio {g_file->streams[g_file->audio_stream].channels} ch {g_file->streams[g_file->audio_stream].sample_rate} Hz");
-  } else if (avi_has_audio(g_file) != 0) {
+    println(", audio {g_file->audio_channels} ch {g_file->audio_sample_rate} Hz");
+  } else if (g_file->audio_codec == SOURCE_AUDIO_AAC) {
+    println(", AAC audio not decoded yet");
+  } else if (source_has_audio(g_file) != 0) {
     println(", audio device unavailable");
   } else {
     println(", no audio");

@@ -1,0 +1,1130 @@
+import "std/mem";
+import "std/io";
+
+const MP4_OK = 0;
+const MP4_ERR_OPEN = 1;
+const MP4_ERR_NOT_ISO = 2;
+const MP4_ERR_NO_TRACK = 3;
+const MP4_ERR_NO_MEMORY = 4;
+const MP4_ERR_READ = 5;
+
+const MP4_TRACK_NONE = 0;
+const MP4_TRACK_VIDEO = 1;
+const MP4_TRACK_AUDIO = 2;
+
+const MP4_MAX_TRACKS = 8;
+
+const MP4_BOX_FTYP = 0x66747970;
+const MP4_BOX_MOOV = 0x6D6F6F76;
+const MP4_BOX_MVHD = 0x6D766864;
+const MP4_BOX_TRAK = 0x7472616B;
+const MP4_BOX_TKHD = 0x746B6864;
+const MP4_BOX_EDTS = 0x65647473;
+const MP4_BOX_ELST = 0x656C7374;
+const MP4_BOX_MDIA = 0x6D646961;
+const MP4_BOX_MDHD = 0x6D646864;
+const MP4_BOX_HDLR = 0x68646C72;
+const MP4_BOX_MINF = 0x6D696E66;
+const MP4_BOX_STBL = 0x7374626C;
+const MP4_BOX_STSD = 0x73747364;
+const MP4_BOX_STTS = 0x73747473;
+const MP4_BOX_CTTS = 0x63747473;
+const MP4_BOX_STSC = 0x73747363;
+const MP4_BOX_STSZ = 0x7374737A;
+const MP4_BOX_STCO = 0x7374636F;
+const MP4_BOX_CO64 = 0x636F3634;
+const MP4_BOX_STSS = 0x73747373;
+const MP4_BOX_AVCC = 0x61766343;
+const MP4_BOX_ESDS = 0x65736473;
+const MP4_BOX_WAVE = 0x77617665;
+
+const MP4_BOX_MVEX = 0x6D766578;
+const MP4_BOX_TREX = 0x74726578;
+const MP4_BOX_MOOF = 0x6D6F6F66;
+const MP4_BOX_TRAF = 0x74726166;
+const MP4_BOX_TFHD = 0x74666864;
+const MP4_BOX_TFDT = 0x74666474;
+const MP4_BOX_TRUN = 0x7472756E;
+
+const MP4_HANDLER_VIDE = 0x76696465;
+const MP4_HANDLER_SOUN = 0x736F756E;
+
+const MP4_TFHD_BASE_OFFSET = 0x000001;
+const MP4_TFHD_DESCRIPTION_INDEX = 0x000002;
+const MP4_TFHD_DEFAULT_DURATION = 0x000008;
+const MP4_TFHD_DEFAULT_SIZE = 0x000010;
+const MP4_TFHD_DEFAULT_FLAGS = 0x000020;
+
+const MP4_TRUN_DATA_OFFSET = 0x000001;
+const MP4_TRUN_FIRST_FLAGS = 0x000004;
+const MP4_TRUN_SAMPLE_DURATION = 0x000100;
+const MP4_TRUN_SAMPLE_SIZE = 0x000200;
+const MP4_TRUN_SAMPLE_FLAGS = 0x000400;
+const MP4_TRUN_SAMPLE_COMPOSITION = 0x000800;
+
+const MP4_SAMPLE_NOT_SYNC = 0x00010000;
+
+extern fn _fseeki64(fp: cstring, offset: int64, origin: int32) -> int32 = "_fseeki64";
+extern fn _ftelli64(fp: cstring) -> int64 = "_ftelli64";
+
+struct Mp4Tables {
+  stsd_offset: int64;
+  stsd_size: int32;
+  stts_offset: int64;
+  stts_size: int32;
+  ctts_offset: int64;
+  ctts_size: int32;
+  stsc_offset: int64;
+  stsc_size: int32;
+  stsz_offset: int64;
+  stsz_size: int32;
+  stco_offset: int64;
+  stco_size: int32;
+  co64_offset: int64;
+  co64_size: int32;
+  stss_offset: int64;
+  stss_size: int32;
+}
+
+struct Mp4Track {
+  kind: int32;
+  track_id: int32;
+  timescale: int32;
+  duration: int64;
+  format: uint32;
+
+  width: int32;
+  height: int32;
+  channels: int32;
+  sample_rate: int32;
+  bits_per_sample: int32;
+
+  sample_count: int32;
+  sample_capacity: int32;
+  offsets: int64*;
+  sizes: int32*;
+  decode_times: int64*;
+  presentation_times: int64*;
+  display_order: int32*;
+  sync_flags: uint8*;
+  max_size: int32;
+  sync_count: int32;
+
+  codec_config: uint8*;
+  codec_config_size: int32;
+
+  presentation_shift: int64;
+  presentation_shift_known: int32;
+
+  trex_duration: int32;
+  trex_size: int32;
+  trex_flags: uint32;
+  fragment_time: int64;
+
+  tables: Mp4Tables;
+}
+
+struct Mp4File {
+  fp: cstring;
+  file_size: int64;
+  scratch: uint8*;
+
+  timescale: int32;
+  duration: int64;
+
+  track_count: int32;
+  tracks: Mp4Track[8];
+  video_track: int32;
+  audio_track: int32;
+
+  fragment_offsets: int64*;
+  fragment_count: int32;
+  fragment_capacity: int32;
+}
+
+fn mp4_read_block(f: Mp4File*, offset: int64, into: uint8*, count: int64) -> int32 {
+  if (count <= 0) { return 1; }
+  if (offset < 0 || offset + count > f->file_size) { return 0; }
+  if (_fseeki64(f->fp, offset, 0) != 0) { return 0; }
+  if (fread(into, 1, count, f->fp) != count) { return 0; }
+  return 1;
+}
+
+fn mp4_be_u16(bytes: uint8*, at: int32) -> int32 {
+  return ((int32)bytes[at] << 8) | (int32)bytes[at + 1];
+}
+
+fn mp4_be_u32(bytes: uint8*, at: int32) -> uint32 {
+  return ((uint32)bytes[at] << 24) | ((uint32)bytes[at + 1] << 16) |
+         ((uint32)bytes[at + 2] << 8) | (uint32)bytes[at + 3];
+}
+
+fn mp4_be_u64(bytes: uint8*, at: int32) -> int64 {
+  return ((int64)mp4_be_u32(bytes, at) << 32) | (int64)mp4_be_u32(bytes, at + 4);
+}
+
+fn mp4_read_u32_at(f: Mp4File*, offset: int64) -> uint32 {
+  if (mp4_read_block(f, offset, f->scratch, 4) == 0) { return (uint32)0; }
+  return mp4_be_u32(f->scratch, 0);
+}
+
+fn mp4_box_payload(f: Mp4File*, offset: int64, size: int32) -> uint8* {
+  if (size <= 0) { return 0; }
+  var buffer: uint8* = malloc((int64)size);
+  if (buffer == 0) { return 0; }
+  if (mp4_read_block(f, offset, buffer, (int64)size) == 0) {
+    free(buffer);
+    return 0;
+  }
+  return buffer;
+}
+
+fn mp4_track_reserve(track: Mp4Track*, needed: int32) -> int32 {
+  if (needed <= track->sample_capacity) { return 1; }
+  var capacity: int32 = track->sample_capacity * 2;
+  if (capacity < needed) { capacity = needed; }
+  if (capacity < 512) { capacity = 512; }
+
+  var offsets: int64* = realloc(track->offsets, (int64)capacity * 8);
+  if (offsets == 0) { return 0; }
+  track->offsets = offsets;
+  var sizes: int32* = realloc(track->sizes, (int64)capacity * 4);
+  if (sizes == 0) { return 0; }
+  track->sizes = sizes;
+  var decode: int64* = realloc(track->decode_times, (int64)capacity * 8);
+  if (decode == 0) { return 0; }
+  track->decode_times = decode;
+  var presentation: int64* = realloc(track->presentation_times, (int64)capacity * 8);
+  if (presentation == 0) { return 0; }
+  track->presentation_times = presentation;
+  var order: int32* = realloc(track->display_order, (int64)capacity * 4);
+  if (order == 0) { return 0; }
+  track->display_order = order;
+  var sync: uint8* = realloc(track->sync_flags, (int64)capacity);
+  if (sync == 0) { return 0; }
+  track->sync_flags = sync;
+
+  track->sample_capacity = capacity;
+  return 1;
+}
+
+fn mp4_append_sample(track: Mp4Track*, offset: int64, size: int32,
+                     decode_time: int64, presentation_time: int64, sync: int32) -> int32 {
+  if (mp4_track_reserve(track, track->sample_count + 1) == 0) { return 0; }
+  var index: int32 = track->sample_count;
+  track->offsets[index] = offset;
+  track->sizes[index] = size;
+  track->decode_times[index] = decode_time;
+  track->presentation_times[index] = presentation_time;
+  if (sync != 0) {
+    track->sync_flags[index] = (uint8)1;
+    track->sync_count = track->sync_count + 1;
+  } else {
+    track->sync_flags[index] = (uint8)0;
+  }
+  if (size > track->max_size) { track->max_size = size; }
+  track->sample_count = index + 1;
+  return 1;
+}
+
+fn mp4_scan_codec_config(f: Mp4File*, track: int32, body: uint8*, start: int32, end: int32) {
+  var at: int32 = start;
+  while (at + 8 <= end) {
+    var size: int32 = (int32)mp4_be_u32(body, at);
+    var kind: uint32 = mp4_be_u32(body, at + 4);
+    if (size < 8 || at + size > end) { return; }
+    if (kind == (uint32)MP4_BOX_AVCC || kind == (uint32)MP4_BOX_ESDS) {
+      var payload_size: int32 = size - 8;
+      if (payload_size > 0 && f->tracks[track].codec_config == 0) {
+        var payload: uint8* = malloc((int64)payload_size);
+        if (payload != 0) {
+          for i in 0..payload_size {
+            payload[i] = body[at + 8 + i];
+          }
+          f->tracks[track].codec_config = payload;
+          f->tracks[track].codec_config_size = payload_size;
+        }
+      }
+      return;
+    }
+    if (kind == (uint32)MP4_BOX_WAVE) {
+      mp4_scan_codec_config(f, track, body, at + 8, at + size);
+      if (f->tracks[track].codec_config != 0) { return; }
+    }
+    at = at + size;
+  }
+}
+
+fn mp4_parse_stsd(f: Mp4File*, track: int32) {
+  var location: Mp4Tables* = &f->tracks[track].tables;
+  if (location->stsd_size < 16) { return; }
+  var body: uint8* = mp4_box_payload(f, location->stsd_offset, location->stsd_size);
+  if (body == 0) { return; }
+  defer free(body);
+
+  var entry_count: uint32 = mp4_be_u32(body, 4);
+  if (entry_count == (uint32)0) { return; }
+
+  var entry_size: int32 = (int32)mp4_be_u32(body, 8);
+  if (entry_size < 16 || entry_size > location->stsd_size - 8) { return; }
+  f->tracks[track].format = mp4_be_u32(body, 12);
+
+  var extra_at: int32 = 0;
+  if (f->tracks[track].kind == MP4_TRACK_VIDEO) {
+    if (entry_size < 86) { return; }
+    f->tracks[track].width = mp4_be_u16(body, 8 + 32);
+    f->tracks[track].height = mp4_be_u16(body, 8 + 34);
+    extra_at = 8 + 86;
+  } else if (f->tracks[track].kind == MP4_TRACK_AUDIO) {
+    if (entry_size < 36) { return; }
+    var version: int32 = mp4_be_u16(body, 8 + 16);
+    f->tracks[track].channels = mp4_be_u16(body, 8 + 24);
+    f->tracks[track].bits_per_sample = mp4_be_u16(body, 8 + 26);
+    f->tracks[track].sample_rate = mp4_be_u16(body, 8 + 32);
+    extra_at = 8 + 36;
+    if (version == 1) { extra_at = extra_at + 16; }
+    if (version == 2) { extra_at = extra_at + 36; }
+  } else {
+    return;
+  }
+
+  var limit: int32 = 8 + entry_size;
+  if (limit > location->stsd_size) { limit = location->stsd_size; }
+  mp4_scan_codec_config(f, track, body, extra_at, limit);
+}
+
+fn mp4_sample_count_from_tables(f: Mp4File*, track: int32) -> int32 {
+  var location: Mp4Tables* = &f->tracks[track].tables;
+  if (location->stsz_size >= 12) {
+    var header: uint8* = f->scratch;
+    if (mp4_read_block(f, location->stsz_offset, header, 12) == 0) { return 0; }
+    return (int32)mp4_be_u32(header, 8);
+  }
+  return 0;
+}
+
+fn mp4_fill_sizes(f: Mp4File*, track: int32) -> int32 {
+  var location: Mp4Tables* = &f->tracks[track].tables;
+  var count: int32 = f->tracks[track].sample_count;
+  var body: uint8* = mp4_box_payload(f, location->stsz_offset, location->stsz_size);
+  if (body == 0) { return 0; }
+  defer free(body);
+
+  var uniform: int32 = (int32)mp4_be_u32(body, 4);
+  if (uniform != 0) {
+    for i in 0..count {
+      f->tracks[track].sizes[i] = uniform;
+    }
+    f->tracks[track].max_size = uniform;
+    return 1;
+  }
+  if (12 + count * 4 > location->stsz_size) { return 0; }
+  var largest: int32 = 0;
+  for i in 0..count {
+    var size: int32 = (int32)mp4_be_u32(body, 12 + i * 4);
+    f->tracks[track].sizes[i] = size;
+    if (size > largest) { largest = size; }
+  }
+  f->tracks[track].max_size = largest;
+  return 1;
+}
+
+fn mp4_fill_times(f: Mp4File*, track: int32) -> int32 {
+  var location: Mp4Tables* = &f->tracks[track].tables;
+  var count: int32 = f->tracks[track].sample_count;
+  var body: uint8* = mp4_box_payload(f, location->stts_offset, location->stts_size);
+  if (body == 0) { return 0; }
+  defer free(body);
+
+  var runs: int32 = (int32)mp4_be_u32(body, 4);
+  if (8 + runs * 8 > location->stts_size) { return 0; }
+
+  var sample: int32 = 0;
+  var stamp: int64 = 0;
+  for run in 0..runs {
+    var run_count: int32 = (int32)mp4_be_u32(body, 8 + run * 8);
+    var delta: int32 = (int32)mp4_be_u32(body, 12 + run * 8);
+    for i in 0..run_count {
+      if (sample >= count) { break; }
+      f->tracks[track].decode_times[sample] = stamp;
+      stamp = stamp + (int64)delta;
+      sample = sample + 1;
+    }
+  }
+  while (sample < count) {
+    f->tracks[track].decode_times[sample] = stamp;
+    sample = sample + 1;
+  }
+  return 1;
+}
+
+fn mp4_fill_presentation(f: Mp4File*, track: int32) -> int32 {
+  var location: Mp4Tables* = &f->tracks[track].tables;
+  var count: int32 = f->tracks[track].sample_count;
+
+  for i in 0..count {
+    f->tracks[track].presentation_times[i] = f->tracks[track].decode_times[i];
+  }
+  if (location->ctts_size < 8) { return 1; }
+
+  var body: uint8* = mp4_box_payload(f, location->ctts_offset, location->ctts_size);
+  if (body == 0) { return 1; }
+  defer free(body);
+
+  var runs: int32 = (int32)mp4_be_u32(body, 4);
+  if (8 + runs * 8 > location->ctts_size) { return 1; }
+
+  var sample: int32 = 0;
+  for run in 0..runs {
+    var run_count: int32 = (int32)mp4_be_u32(body, 8 + run * 8);
+    var offset: int32 = (int32)mp4_be_u32(body, 12 + run * 8);
+    for i in 0..run_count {
+      if (sample >= count) { break; }
+      f->tracks[track].presentation_times[sample] = f->tracks[track].decode_times[sample] + (int64)offset;
+      sample = sample + 1;
+    }
+  }
+  return 1;
+}
+
+fn mp4_fill_offsets(f: Mp4File*, track: int32) -> int32 {
+  var location: Mp4Tables* = &f->tracks[track].tables;
+  var count: int32 = f->tracks[track].sample_count;
+
+  var chunk_offsets_are_64: int32 = 0;
+  var chunk_box_offset: int64 = location->stco_offset;
+  var chunk_box_size: int32 = location->stco_size;
+  if (chunk_box_size < 8) {
+    chunk_offsets_are_64 = 1;
+    chunk_box_offset = location->co64_offset;
+    chunk_box_size = location->co64_size;
+  }
+  if (chunk_box_size < 8 || location->stsc_size < 8) { return 0; }
+
+  var chunks: uint8* = mp4_box_payload(f, chunk_box_offset, chunk_box_size);
+  if (chunks == 0) { return 0; }
+  defer free(chunks);
+  var runs: uint8* = mp4_box_payload(f, location->stsc_offset, location->stsc_size);
+  if (runs == 0) { return 0; }
+  defer free(runs);
+
+  var chunk_count: int32 = (int32)mp4_be_u32(chunks, 4);
+  var run_count: int32 = (int32)mp4_be_u32(runs, 4);
+  if (8 + run_count * 12 > location->stsc_size) { return 0; }
+
+  var sample: int32 = 0;
+  var run: int32 = 0;
+  for chunk in 0..chunk_count {
+    while (run + 1 < run_count && (int32)mp4_be_u32(runs, 8 + (run + 1) * 12) <= chunk + 1) {
+      run = run + 1;
+    }
+    var per_chunk: int32 = (int32)mp4_be_u32(runs, 12 + run * 12);
+    var position: int64 = 0;
+    if (chunk_offsets_are_64 != 0) {
+      if (8 + chunk * 8 + 8 > chunk_box_size) { return 0; }
+      position = mp4_be_u64(chunks, 8 + chunk * 8);
+    } else {
+      if (8 + chunk * 4 + 4 > chunk_box_size) { return 0; }
+      position = (int64)mp4_be_u32(chunks, 8 + chunk * 4);
+    }
+    for i in 0..per_chunk {
+      if (sample >= count) { return 1; }
+      f->tracks[track].offsets[sample] = position;
+      position = position + (int64)f->tracks[track].sizes[sample];
+      sample = sample + 1;
+    }
+  }
+  return 1;
+}
+
+fn mp4_fill_sync(f: Mp4File*, track: int32) -> int32 {
+  var location: Mp4Tables* = &f->tracks[track].tables;
+  var count: int32 = f->tracks[track].sample_count;
+
+  if (location->stss_size < 8) {
+    for i in 0..count {
+      f->tracks[track].sync_flags[i] = (uint8)1;
+    }
+    f->tracks[track].sync_count = count;
+    return 1;
+  }
+
+  for i in 0..count {
+    f->tracks[track].sync_flags[i] = (uint8)0;
+  }
+  var body: uint8* = mp4_box_payload(f, location->stss_offset, location->stss_size);
+  if (body == 0) { return 0; }
+  defer free(body);
+
+  var entries: int32 = (int32)mp4_be_u32(body, 4);
+  if (8 + entries * 4 > location->stss_size) { return 0; }
+  var marked: int32 = 0;
+  for i in 0..entries {
+    var index: int32 = (int32)mp4_be_u32(body, 8 + i * 4) - 1;
+    if (index >= 0 && index < count) {
+      f->tracks[track].sync_flags[index] = (uint8)1;
+      marked = marked + 1;
+    }
+  }
+  f->tracks[track].sync_count = marked;
+  return 1;
+}
+
+fn mp4_build_from_tables(f: Mp4File*, track: int32) -> int32 {
+  var count: int32 = mp4_sample_count_from_tables(f, track);
+  if (count <= 0) { return 1; }
+  if (mp4_track_reserve(&f->tracks[track], count) == 0) { return 0; }
+  f->tracks[track].sample_count = count;
+
+  if (mp4_fill_sizes(f, track) == 0) { return 0; }
+  if (mp4_fill_times(f, track) == 0) { return 0; }
+  if (mp4_fill_presentation(f, track) == 0) { return 0; }
+  if (mp4_fill_offsets(f, track) == 0) { return 0; }
+  if (mp4_fill_sync(f, track) == 0) { return 0; }
+  return 1;
+}
+
+fn mp4_track_by_id(f: Mp4File*, track_id: int32) -> int32 {
+  for i in 0..f->track_count {
+    if (f->tracks[i].track_id == track_id) { return i; }
+  }
+  return -1;
+}
+
+fn mp4_parse_trun(f: Mp4File*, track: int32, body: uint8*, at: int32, end: int32,
+                  base_offset: int64, default_duration: int32, default_size: int32,
+                  default_flags: uint32) -> int32 {
+  if (at + 8 > end) { return 0; }
+  var flags: uint32 = mp4_be_u32(body, at) & (uint32)0x00FFFFFF;
+  var sample_count: int32 = (int32)mp4_be_u32(body, at + 4);
+  var cursor: int32 = at + 8;
+
+  var data_offset: int64 = 0;
+  if ((flags & (uint32)MP4_TRUN_DATA_OFFSET) != (uint32)0) {
+    if (cursor + 4 > end) { return 0; }
+    data_offset = (int64)(int32)mp4_be_u32(body, cursor);
+    cursor = cursor + 4;
+  }
+  var first_flags: uint32 = default_flags;
+  var have_first: int32 = 0;
+  if ((flags & (uint32)MP4_TRUN_FIRST_FLAGS) != (uint32)0) {
+    if (cursor + 4 > end) { return 0; }
+    first_flags = mp4_be_u32(body, cursor);
+    have_first = 1;
+    cursor = cursor + 4;
+  }
+
+  var position: int64 = base_offset + data_offset;
+  for i in 0..sample_count {
+    var duration: int32 = default_duration;
+    var size: int32 = default_size;
+    var sample_flags: uint32 = default_flags;
+    var composition: int32 = 0;
+
+    if ((flags & (uint32)MP4_TRUN_SAMPLE_DURATION) != (uint32)0) {
+      if (cursor + 4 > end) { return 0; }
+      duration = (int32)mp4_be_u32(body, cursor);
+      cursor = cursor + 4;
+    }
+    if ((flags & (uint32)MP4_TRUN_SAMPLE_SIZE) != (uint32)0) {
+      if (cursor + 4 > end) { return 0; }
+      size = (int32)mp4_be_u32(body, cursor);
+      cursor = cursor + 4;
+    }
+    if ((flags & (uint32)MP4_TRUN_SAMPLE_FLAGS) != (uint32)0) {
+      if (cursor + 4 > end) { return 0; }
+      sample_flags = mp4_be_u32(body, cursor);
+      cursor = cursor + 4;
+    }
+    if ((flags & (uint32)MP4_TRUN_SAMPLE_COMPOSITION) != (uint32)0) {
+      if (cursor + 4 > end) { return 0; }
+      composition = (int32)mp4_be_u32(body, cursor);
+      cursor = cursor + 4;
+    }
+    if (i == 0 && have_first != 0) { sample_flags = first_flags; }
+
+    var sync: int32 = 1;
+    if ((sample_flags & (uint32)MP4_SAMPLE_NOT_SYNC) != (uint32)0) { sync = 0; }
+
+    var decode_time: int64 = f->tracks[track].fragment_time;
+    if (mp4_append_sample(&f->tracks[track], position, size, decode_time,
+                          decode_time + (int64)composition, sync) == 0) {
+      return 0;
+    }
+    position = position + (int64)size;
+    f->tracks[track].fragment_time = decode_time + (int64)duration;
+  }
+  return 1;
+}
+
+fn mp4_parse_traf(f: Mp4File*, body: uint8*, at: int32, end: int32, moof_offset: int64) {
+  var track: int32 = -1;
+  var base_offset: int64 = moof_offset;
+  var default_duration: int32 = 0;
+  var default_size: int32 = 0;
+  var default_flags: uint32 = (uint32)0;
+
+  var cursor: int32 = at;
+  while (cursor + 8 <= end) {
+    var size: int32 = (int32)mp4_be_u32(body, cursor);
+    var kind: uint32 = mp4_be_u32(body, cursor + 4);
+    if (size < 8 || cursor + size > end) { return; }
+    var payload: int32 = cursor + 8;
+
+    if (kind == (uint32)MP4_BOX_TFHD) {
+      if (payload + 8 > end) { return; }
+      var flags: uint32 = mp4_be_u32(body, payload) & (uint32)0x00FFFFFF;
+      var track_id: int32 = (int32)mp4_be_u32(body, payload + 4);
+      track = mp4_track_by_id(f, track_id);
+      if (track < 0) { return; }
+      default_duration = f->tracks[track].trex_duration;
+      default_size = f->tracks[track].trex_size;
+      default_flags = f->tracks[track].trex_flags;
+
+      var field: int32 = payload + 8;
+      if ((flags & (uint32)MP4_TFHD_BASE_OFFSET) != (uint32)0) {
+        if (field + 8 > end) { return; }
+        base_offset = mp4_be_u64(body, field);
+        field = field + 8;
+      }
+      if ((flags & (uint32)MP4_TFHD_DESCRIPTION_INDEX) != (uint32)0) {
+        field = field + 4;
+      }
+      if ((flags & (uint32)MP4_TFHD_DEFAULT_DURATION) != (uint32)0) {
+        if (field + 4 > end) { return; }
+        default_duration = (int32)mp4_be_u32(body, field);
+        field = field + 4;
+      }
+      if ((flags & (uint32)MP4_TFHD_DEFAULT_SIZE) != (uint32)0) {
+        if (field + 4 > end) { return; }
+        default_size = (int32)mp4_be_u32(body, field);
+        field = field + 4;
+      }
+      if ((flags & (uint32)MP4_TFHD_DEFAULT_FLAGS) != (uint32)0) {
+        if (field + 4 > end) { return; }
+        default_flags = mp4_be_u32(body, field);
+        field = field + 4;
+      }
+    } else if (kind == (uint32)MP4_BOX_TFDT) {
+      if (track >= 0 && payload + 8 <= end) {
+        var version: int32 = (int32)body[payload];
+        if (version == 1) {
+          if (payload + 12 <= end) {
+            f->tracks[track].fragment_time = mp4_be_u64(body, payload + 4);
+          }
+        } else {
+          f->tracks[track].fragment_time = (int64)mp4_be_u32(body, payload + 4);
+        }
+      }
+    } else if (kind == (uint32)MP4_BOX_TRUN) {
+      if (track >= 0) {
+        mp4_parse_trun(f, track, body, payload, cursor + size, base_offset,
+                       default_duration, default_size, default_flags);
+      }
+    }
+    cursor = cursor + size;
+  }
+}
+
+fn mp4_parse_moof(f: Mp4File*, offset: int64) -> int32 {
+  var header: uint8* = f->scratch;
+  if (mp4_read_block(f, offset, header, 8) == 0) { return 0; }
+  var size: int32 = (int32)mp4_be_u32(header, 0);
+  if (size < 8) { return 0; }
+
+  var body: uint8* = mp4_box_payload(f, offset, size);
+  if (body == 0) { return 0; }
+  defer free(body);
+
+  var cursor: int32 = 8;
+  while (cursor + 8 <= size) {
+    var child_size: int32 = (int32)mp4_be_u32(body, cursor);
+    var kind: uint32 = mp4_be_u32(body, cursor + 4);
+    if (child_size < 8 || cursor + child_size > size) { return 1; }
+    if (kind == (uint32)MP4_BOX_TRAF) {
+      mp4_parse_traf(f, body, cursor + 8, cursor + child_size, offset);
+    }
+    cursor = cursor + child_size;
+  }
+  return 1;
+}
+
+fn mp4_remember_fragment(f: Mp4File*, offset: int64) -> int32 {
+  if (f->fragment_count == f->fragment_capacity) {
+    var capacity: int32 = f->fragment_capacity * 2;
+    if (capacity < 256) { capacity = 256; }
+    var offsets: int64* = realloc(f->fragment_offsets, (int64)capacity * 8);
+    if (offsets == 0) { return 0; }
+    f->fragment_offsets = offsets;
+    f->fragment_capacity = capacity;
+  }
+  f->fragment_offsets[f->fragment_count] = offset;
+  f->fragment_count = f->fragment_count + 1;
+  return 1;
+}
+
+fn mp4_parse_stbl(f: Mp4File*, track: int32, start: int64, end: int64) {
+  var position: int64 = start;
+  while (position + 8 <= end) {
+    var size: int64 = (int64)mp4_read_u32_at(f, position);
+    var kind: uint32 = mp4_read_u32_at(f, position + 4);
+    if (size < 8 || position + size > end) { return; }
+    var body: int64 = position + 8;
+    var body_size: int32 = (int32)(size - 8);
+
+    if (kind == (uint32)MP4_BOX_STSD) {
+      f->tracks[track].tables.stsd_offset = body;
+      f->tracks[track].tables.stsd_size = body_size;
+    } else if (kind == (uint32)MP4_BOX_STTS) {
+      f->tracks[track].tables.stts_offset = body;
+      f->tracks[track].tables.stts_size = body_size;
+    } else if (kind == (uint32)MP4_BOX_CTTS) {
+      f->tracks[track].tables.ctts_offset = body;
+      f->tracks[track].tables.ctts_size = body_size;
+    } else if (kind == (uint32)MP4_BOX_STSC) {
+      f->tracks[track].tables.stsc_offset = body;
+      f->tracks[track].tables.stsc_size = body_size;
+    } else if (kind == (uint32)MP4_BOX_STSZ) {
+      f->tracks[track].tables.stsz_offset = body;
+      f->tracks[track].tables.stsz_size = body_size;
+    } else if (kind == (uint32)MP4_BOX_STCO) {
+      f->tracks[track].tables.stco_offset = body;
+      f->tracks[track].tables.stco_size = body_size;
+    } else if (kind == (uint32)MP4_BOX_CO64) {
+      f->tracks[track].tables.co64_offset = body;
+      f->tracks[track].tables.co64_size = body_size;
+    } else if (kind == (uint32)MP4_BOX_STSS) {
+      f->tracks[track].tables.stss_offset = body;
+      f->tracks[track].tables.stss_size = body_size;
+    }
+    position = position + size;
+  }
+}
+
+fn mp4_parse_minf(f: Mp4File*, track: int32, start: int64, end: int64) {
+  var position: int64 = start;
+  while (position + 8 <= end) {
+    var size: int64 = (int64)mp4_read_u32_at(f, position);
+    var kind: uint32 = mp4_read_u32_at(f, position + 4);
+    if (size < 8 || position + size > end) { return; }
+    if (kind == (uint32)MP4_BOX_STBL) {
+      mp4_parse_stbl(f, track, position + 8, position + size);
+    }
+    position = position + size;
+  }
+}
+
+fn mp4_parse_mdia(f: Mp4File*, track: int32, start: int64, end: int64) {
+  var position: int64 = start;
+  while (position + 8 <= end) {
+    var size: int64 = (int64)mp4_read_u32_at(f, position);
+    var kind: uint32 = mp4_read_u32_at(f, position + 4);
+    if (size < 8 || position + size > end) { return; }
+    var body: int64 = position + 8;
+
+    if (kind == (uint32)MP4_BOX_MDHD) {
+      var header: uint8* = f->scratch;
+      if (mp4_read_block(f, body, header, 32) != 0) {
+        var version: int32 = (int32)header[0];
+        if (version == 1) {
+          f->tracks[track].timescale = (int32)mp4_be_u32(header, 20);
+          f->tracks[track].duration = mp4_be_u64(header, 24);
+        } else {
+          f->tracks[track].timescale = (int32)mp4_be_u32(header, 12);
+          f->tracks[track].duration = (int64)mp4_be_u32(header, 16);
+        }
+      }
+    } else if (kind == (uint32)MP4_BOX_HDLR) {
+      var header: uint8* = f->scratch;
+      if (mp4_read_block(f, body, header, 12) != 0) {
+        var handler: uint32 = mp4_be_u32(header, 8);
+        if (handler == (uint32)MP4_HANDLER_VIDE) {
+          f->tracks[track].kind = MP4_TRACK_VIDEO;
+        } else if (handler == (uint32)MP4_HANDLER_SOUN) {
+          f->tracks[track].kind = MP4_TRACK_AUDIO;
+        }
+      }
+    } else if (kind == (uint32)MP4_BOX_MINF) {
+      mp4_parse_minf(f, track, body, position + size);
+    }
+    position = position + size;
+  }
+}
+
+fn mp4_parse_edts(f: Mp4File*, track: int32, start: int64, end: int64) {
+  var position: int64 = start;
+  while (position + 8 <= end) {
+    var size: int64 = (int64)mp4_read_u32_at(f, position);
+    var kind: uint32 = mp4_read_u32_at(f, position + 4);
+    if (size < 8 || position + size > end) { return; }
+    if (kind == (uint32)MP4_BOX_ELST && size >= (int64)28) {
+      var body: uint8* = f->scratch;
+      if (mp4_read_block(f, position + 8, body, 28) != 0) {
+        var version: int32 = (int32)body[0];
+        var entries: int32 = (int32)mp4_be_u32(body, 4);
+        if (entries >= 1) {
+          var media_time: int64 = 0;
+          if (version == 1) {
+            media_time = mp4_be_u64(body, 16);
+          } else {
+            media_time = (int64)(int32)mp4_be_u32(body, 12);
+          }
+          if (media_time >= 0) {
+            f->tracks[track].presentation_shift = media_time;
+            f->tracks[track].presentation_shift_known = 1;
+          }
+        }
+      }
+    }
+    position = position + size;
+  }
+}
+
+fn mp4_parse_trak(f: Mp4File*, track: int32, start: int64, end: int64) {
+  var position: int64 = start;
+  while (position + 8 <= end) {
+    var size: int64 = (int64)mp4_read_u32_at(f, position);
+    var kind: uint32 = mp4_read_u32_at(f, position + 4);
+    if (size < 8 || position + size > end) { return; }
+    var body: int64 = position + 8;
+
+    if (kind == (uint32)MP4_BOX_TKHD) {
+      var header: uint8* = f->scratch;
+      if (mp4_read_block(f, body, header, 84) != 0) {
+        var version: int32 = (int32)header[0];
+        if (version == 1) {
+          f->tracks[track].track_id = (int32)mp4_be_u32(header, 20);
+        } else {
+          f->tracks[track].track_id = (int32)mp4_be_u32(header, 12);
+        }
+      }
+    } else if (kind == (uint32)MP4_BOX_EDTS) {
+      mp4_parse_edts(f, track, body, position + size);
+    } else if (kind == (uint32)MP4_BOX_MDIA) {
+      mp4_parse_mdia(f, track, body, position + size);
+    }
+    position = position + size;
+  }
+}
+
+fn mp4_parse_mvex(f: Mp4File*, start: int64, end: int64) {
+  var position: int64 = start;
+  while (position + 8 <= end) {
+    var size: int64 = (int64)mp4_read_u32_at(f, position);
+    var kind: uint32 = mp4_read_u32_at(f, position + 4);
+    if (size < 8 || position + size > end) { return; }
+    if (kind == (uint32)MP4_BOX_TREX && size >= (int64)32) {
+      var body: uint8* = f->scratch;
+      if (mp4_read_block(f, position + 8, body, 24) != 0) {
+        var track_id: int32 = (int32)mp4_be_u32(body, 4);
+        var track: int32 = mp4_track_by_id(f, track_id);
+        if (track >= 0) {
+          f->tracks[track].trex_duration = (int32)mp4_be_u32(body, 12);
+          f->tracks[track].trex_size = (int32)mp4_be_u32(body, 16);
+          f->tracks[track].trex_flags = mp4_be_u32(body, 20);
+        }
+      }
+    }
+    position = position + size;
+  }
+}
+
+fn mp4_parse_moov(f: Mp4File*, start: int64, end: int64) {
+  var position: int64 = start;
+  var mvex_start: int64 = 0;
+  var mvex_end: int64 = 0;
+
+  while (position + 8 <= end) {
+    var size: int64 = (int64)mp4_read_u32_at(f, position);
+    var kind: uint32 = mp4_read_u32_at(f, position + 4);
+    if (size < 8 || position + size > end) { break; }
+    var body: int64 = position + 8;
+
+    if (kind == (uint32)MP4_BOX_MVHD) {
+      var header: uint8* = f->scratch;
+      if (mp4_read_block(f, body, header, 32) != 0) {
+        var version: int32 = (int32)header[0];
+        if (version == 1) {
+          f->timescale = (int32)mp4_be_u32(header, 20);
+          f->duration = mp4_be_u64(header, 24);
+        } else {
+          f->timescale = (int32)mp4_be_u32(header, 12);
+          f->duration = (int64)mp4_be_u32(header, 16);
+        }
+      }
+    } else if (kind == (uint32)MP4_BOX_TRAK) {
+      if (f->track_count < MP4_MAX_TRACKS) {
+        mp4_parse_trak(f, f->track_count, body, position + size);
+        f->track_count = f->track_count + 1;
+      }
+    } else if (kind == (uint32)MP4_BOX_MVEX) {
+      mvex_start = body;
+      mvex_end = position + size;
+    }
+    position = position + size;
+  }
+
+  if (mvex_end > mvex_start) {
+    mp4_parse_mvex(f, mvex_start, mvex_end);
+  }
+}
+
+fn mp4_apply_presentation_shift(f: Mp4File*, track: int32) {
+  var count: int32 = f->tracks[track].sample_count;
+  if (count <= 0) { return; }
+  if (f->tracks[track].presentation_shift_known == 0) { return; }
+  var shift: int64 = f->tracks[track].presentation_shift;
+  if (shift == 0) { return; }
+  for i in 0..count {
+    f->tracks[track].presentation_times[i] = f->tracks[track].presentation_times[i] - shift;
+  }
+}
+
+fn mp4_fill_display_order(f: Mp4File*, track: int32) {
+  var count: int32 = f->tracks[track].sample_count;
+  if (count <= 0) { return; }
+  var order: int32* = f->tracks[track].display_order;
+  var times: int64* = f->tracks[track].presentation_times;
+  for i in 0..count {
+    order[i] = i;
+  }
+  var gap: int32 = 1;
+  while (gap < count / 3) {
+    gap = gap * 3 + 1;
+  }
+  while (gap >= 1) {
+    for i in gap..count {
+      var value: int32 = order[i];
+      var key: int64 = times[value];
+      var j: int32 = i;
+      while (j >= gap && times[order[j - gap]] > key) {
+        order[j] = order[j - gap];
+        j = j - gap;
+      }
+      order[j] = value;
+    }
+    gap = gap / 3;
+  }
+}
+
+fn mp4_finalize_track(f: Mp4File*, track: int32) {
+  mp4_parse_stsd(f, track);
+  mp4_apply_presentation_shift(f, track);
+  mp4_fill_display_order(f, track);
+  if (f->tracks[track].timescale <= 0) { f->tracks[track].timescale = 1000; }
+}
+
+fn mp4_release_track(track: Mp4Track*) {
+  if (track->offsets != 0) { free(track->offsets); track->offsets = 0; }
+  if (track->sizes != 0) { free(track->sizes); track->sizes = 0; }
+  if (track->decode_times != 0) { free(track->decode_times); track->decode_times = 0; }
+  if (track->presentation_times != 0) { free(track->presentation_times); track->presentation_times = 0; }
+  if (track->display_order != 0) { free(track->display_order); track->display_order = 0; }
+  if (track->sync_flags != 0) { free(track->sync_flags); track->sync_flags = 0; }
+  if (track->codec_config != 0) { free(track->codec_config); track->codec_config = 0; }
+}
+
+fn mp4_close(f: Mp4File*) {
+  if (f == 0) { return; }
+  for i in 0..MP4_MAX_TRACKS {
+    mp4_release_track(&f->tracks[i]);
+  }
+  if (f->fragment_offsets != 0) { free(f->fragment_offsets); }
+  if (f->fp != 0) { fclose(f->fp); }
+  if (f->scratch != 0) { free(f->scratch); }
+  free(f);
+}
+
+fn mp4_open(path: cstring, status: int32*) -> Mp4File* {
+  var f: Mp4File* = malloc(sizeof(Mp4File));
+  if (f == 0) {
+    *status = MP4_ERR_NO_MEMORY;
+    return 0;
+  }
+  memset(f, 0, sizeof(Mp4File));
+  f->video_track = -1;
+  f->audio_track = -1;
+  f->timescale = 1000;
+
+  f->scratch = malloc(256);
+  if (f->scratch == 0) {
+    free(f);
+    *status = MP4_ERR_NO_MEMORY;
+    return 0;
+  }
+
+  f->fp = fopen(path, "rb");
+  if (f->fp == 0) {
+    free(f->scratch);
+    free(f);
+    *status = MP4_ERR_OPEN;
+    return 0;
+  }
+  _fseeki64(f->fp, 0, 2);
+  f->file_size = _ftelli64(f->fp);
+
+  var position: int64 = 0;
+  var saw_iso_header: int32 = 0;
+  var moov_start: int64 = 0;
+  var moov_end: int64 = 0;
+
+  while (position + 8 <= f->file_size) {
+    var size: int64 = (int64)mp4_read_u32_at(f, position);
+    var kind: uint32 = mp4_read_u32_at(f, position + 4);
+    var body: int64 = position + 8;
+    if (size == (int64)1) {
+      if (mp4_read_block(f, position + 8, f->scratch, 8) == 0) { break; }
+      size = mp4_be_u64(f->scratch, 0);
+      body = position + 16;
+    } else if (size == (int64)0) {
+      size = f->file_size - position;
+    }
+    if (size < 8 || position + size > f->file_size) { break; }
+
+    if (kind == (uint32)MP4_BOX_FTYP || kind == (uint32)MP4_BOX_MOOV) { saw_iso_header = 1; }
+    if (kind == (uint32)MP4_BOX_MOOV) {
+      moov_start = body;
+      moov_end = position + size;
+    } else if (kind == (uint32)MP4_BOX_MOOF) {
+      if (mp4_remember_fragment(f, position) == 0) {
+        mp4_close(f);
+        *status = MP4_ERR_NO_MEMORY;
+        return 0;
+      }
+    }
+    position = position + size;
+  }
+
+  if (saw_iso_header == 0 || moov_end <= moov_start) {
+    mp4_close(f);
+    *status = MP4_ERR_NOT_ISO;
+    return 0;
+  }
+
+  mp4_parse_moov(f, moov_start, moov_end);
+
+  for i in 0..f->track_count {
+    if (mp4_build_from_tables(f, i) == 0) {
+      mp4_close(f);
+      *status = MP4_ERR_READ;
+      return 0;
+    }
+  }
+
+  for i in 0..f->fragment_count {
+    if (mp4_parse_moof(f, f->fragment_offsets[i]) == 0) {
+      mp4_close(f);
+      *status = MP4_ERR_READ;
+      return 0;
+    }
+  }
+
+  for i in 0..f->track_count {
+    mp4_finalize_track(f, i);
+  }
+
+  for i in 0..f->track_count {
+    if (f->tracks[i].kind == MP4_TRACK_VIDEO && f->video_track < 0 && f->tracks[i].sample_count > 0) {
+      f->video_track = i;
+    }
+    if (f->tracks[i].kind == MP4_TRACK_AUDIO && f->audio_track < 0 && f->tracks[i].sample_count > 0) {
+      f->audio_track = i;
+    }
+  }
+  if (f->video_track < 0) {
+    mp4_close(f);
+    *status = MP4_ERR_NO_TRACK;
+    return 0;
+  }
+
+  *status = MP4_OK;
+  return f;
+}
+
+fn mp4_read_sample(f: Mp4File*, track: int32, index: int32, into: uint8*, capacity: int64) -> int32 {
+  if (track < 0 || track >= f->track_count) { return -1; }
+  if (index < 0 || index >= f->tracks[track].sample_count) { return -1; }
+  var size: int32 = f->tracks[track].sizes[index];
+  if ((int64)size > capacity) { return -1; }
+  if (mp4_read_block(f, f->tracks[track].offsets[index], into, (int64)size) == 0) { return -1; }
+  return size;
+}
+
+fn mp4_track_time_microseconds(f: Mp4File*, track: int32, ticks: int64) -> int64 {
+  var timescale: int64 = (int64)f->tracks[track].timescale;
+  if (timescale <= 0) { return 0; }
+  return ticks * (int64)1000000 / timescale;
+}
+
+fn mp4_sample_presentation_microseconds(f: Mp4File*, track: int32, index: int32) -> int64 {
+  if (index < 0 || index >= f->tracks[track].sample_count) { return 0; }
+  return mp4_track_time_microseconds(f, track, f->tracks[track].presentation_times[index]);
+}
+
+fn mp4_duration_microseconds(f: Mp4File*) -> int64 {
+  var track: int32 = f->video_track;
+  if (track < 0) { return 0; }
+  var count: int32 = f->tracks[track].sample_count;
+  var from_samples: int64 = 0;
+  if (count > 0) {
+    from_samples = mp4_sample_presentation_microseconds(f, track, f->tracks[track].display_order[count - 1]);
+  }
+  if (f->tracks[track].duration > 0) {
+    var from_header: int64 = mp4_track_time_microseconds(f, track, f->tracks[track].duration);
+    if (from_header > from_samples) { return from_header; }
+  }
+  return from_samples;
+}
+
+fn mp4_display_index_at_time(f: Mp4File*, track: int32, microseconds: int64) -> int32 {
+  var count: int32 = f->tracks[track].sample_count;
+  if (count <= 0) { return 0; }
+  var low: int32 = 0;
+  var high: int32 = count - 1;
+  while (low < high) {
+    var middle: int32 = (low + high + 1) / 2;
+    var sample: int32 = f->tracks[track].display_order[middle];
+    if (mp4_sample_presentation_microseconds(f, track, sample) <= microseconds) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return low;
+}
+
+fn mp4_sync_sample_at_or_before(f: Mp4File*, track: int32, index: int32) -> int32 {
+  var scan: int32 = index;
+  if (scan >= f->tracks[track].sample_count) { scan = f->tracks[track].sample_count - 1; }
+  while (scan > 0 && f->tracks[track].sync_flags[scan] == (uint8)0) {
+    scan = scan - 1;
+  }
+  return scan;
+}
+
+fn mp4_format_is_mjpeg(format: uint32) -> int32 {
+  if (format == (uint32)0x6A706567) { return 1; }
+  if (format == (uint32)0x6D6A7061) { return 1; }
+  if (format == (uint32)0x6D6A7062) { return 1; }
+  if (format == (uint32)0x41564A32) { return 1; }
+  return 0;
+}
+
+fn mp4_format_is_avc(format: uint32) -> int32 {
+  if (format == (uint32)0x61766331) { return 1; }
+  if (format == (uint32)0x61766333) { return 1; }
+  return 0;
+}
+
+fn mp4_format_is_pcm(format: uint32) -> int32 {
+  if (format == (uint32)0x74776F73) { return 1; }
+  if (format == (uint32)0x736F7774) { return 1; }
+  if (format == (uint32)0x6C70636D) { return 1; }
+  if (format == (uint32)0x72617720) { return 1; }
+  return 0;
+}
+
+fn mp4_format_is_aac(format: uint32) -> int32 {
+  if (format == (uint32)0x6D703461) { return 1; }
+  return 0;
+}
