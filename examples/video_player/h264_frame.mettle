@@ -5,6 +5,7 @@ import "h264_predict";
 import "h264_deblock";
 import "h264_inter";
 import "h264_pslice";
+import "h264_bslice";
 
 fn h264_store_prediction(v: H264Video*, x: int32, y: int32, prediction: int32*) {
   for row in 0..4 {
@@ -114,10 +115,15 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
   if (v->slice_type != H264_SLICE_I) {
     if (h264_decode_skip_flag(v) != 0) {
       mb->skipped = 1;
-      mb->kind = H264_MB_P_SKIP;
       mb->qp = v->qp;
       v->qp_delta_nonzero = 0;
-      h264_skip_motion(v, mb);
+      if (v->slice_type == H264_SLICE_B) {
+        mb->kind = H264_MB_B_SKIP;
+        h264_direct_prediction(v, mb, 0, 0, 4, 4);
+      } else {
+        mb->kind = H264_MB_P_SKIP;
+        h264_skip_motion(v, mb);
+      }
       h264_clear_residual(v);
       h264_reconstruct_inter(v, mb, pps);
       return H264_OK;
@@ -128,12 +134,16 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
   var cbp_chroma: int32 = 0;
   var mode16: int32 = 0;
   var kind: int32 = 0;
+  var b_value: int32 = 0;
   if (v->slice_type == H264_SLICE_I) {
     kind = h264_decode_mb_type_intra(v, &cbp_luma, &cbp_chroma, &mode16);
+  } else if (v->slice_type == H264_SLICE_B) {
+    kind = h264_decode_mb_type_b(v, &cbp_luma, &cbp_chroma, &mode16, &b_value);
   } else {
     kind = h264_decode_mb_type_p(v, &cbp_luma, &cbp_chroma, &mode16);
   }
   mb->kind = kind;
+  if (g_trace_mb != 0) { println("  type mb {v->mb_index} kind {kind} mode16 {mode16} b {b_value} cbp {cbp_luma}/{cbp_chroma}"); fflush(0); }
   if (kind == H264_MB_I_PCM) { return H264_ERR_UNSUPPORTED; }
 
   var intra: int32 = 0;
@@ -149,6 +159,9 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
       mb->cbp_chroma = cbp_chroma;
     }
     mb->chroma_mode = h264_decode_chroma_mode(v);
+  } else if (v->slice_type == H264_SLICE_B) {
+    h264_decode_b_motion(v, mb, b_value, header->num_ref_idx_l0_active,
+                         header->num_ref_idx_l1_active);
   } else {
     h264_decode_p_motion(v, mb, header->num_ref_idx_l0_active);
   }
@@ -233,47 +246,51 @@ fn h264_clear_references(v: H264Video*) {
   }
 }
 
-fn h264_build_reference_lists(v: H264Video*, header: H264SliceHeader*) {
-  v->ref_count0 = 0;
-  v->ref_count1 = 0;
-  if (v->slice_type == H264_SLICE_I) { return; }
-
-  for i in 0..H264_MAX_PICTURES {
-    if (i == v->current_picture) { continue; }
-    if (v->pictures[i].used == 0 || v->pictures[i].is_reference == 0) { continue; }
-    var wrap: int32 = v->pictures[i].frame_num;
-    if (wrap > header->frame_num) { wrap = wrap - v->max_frame_num; }
-    v->pictures[i].frame_num_wrap = wrap;
-    v->ref_list0[v->ref_count0] = i;
-    v->ref_count0 = v->ref_count0 + 1;
-  }
-
-  for i in 1..v->ref_count0 {
-    var value: int32 = v->ref_list0[i];
+fn h264_sort_by_frame_number(v: H264Video*, list: int32*, count: int32) {
+  for i in 1..count {
+    var value: int32 = list[i];
     var key: int32 = v->pictures[value].frame_num_wrap;
     var j: int32 = i;
-    while (j > 0 && v->pictures[v->ref_list0[j - 1]].frame_num_wrap < key) {
-      v->ref_list0[j] = v->ref_list0[j - 1];
+    while (j > 0 && v->pictures[list[j - 1]].frame_num_wrap < key) {
+      list[j] = list[j - 1];
       j = j - 1;
     }
-    v->ref_list0[j] = value;
+    list[j] = value;
   }
+}
 
-  if (v->ref_count0 == 0) { return; }
+fn h264_sort_by_order_count(v: H264Video*, list: int32*, count: int32, ascending: int32) {
+  for i in 1..count {
+    var value: int32 = list[i];
+    var key: int32 = v->pictures[value].poc;
+    var j: int32 = i;
+    while (j > 0) {
+      var previous: int32 = v->pictures[list[j - 1]].poc;
+      var swap: int32 = 0;
+      if (ascending != 0 && previous > key) { swap = 1; }
+      if (ascending == 0 && previous < key) { swap = 1; }
+      if (swap == 0) { break; }
+      list[j] = list[j - 1];
+      j = j - 1;
+    }
+    list[j] = value;
+  }
+}
 
-  var size: int32 = header->num_ref_idx_l0_active;
-  if (size > 31) { size = 31; }
-  if (size < 1) { size = 1; }
-  for i in v->ref_count0..size {
-    v->ref_list0[i] = v->ref_list0[v->ref_count0 - 1];
+fn h264_apply_list_modification(v: H264Video*, header: H264SliceHeader*, list: int32*,
+                                count: int32*, size: int32, operations: int32,
+                                kinds: int32*, values: int32*) {
+  if (*count == 0) { return; }
+  for i in *count..size {
+    list[i] = list[*count - 1];
   }
 
   var predicted: int32 = header->frame_num;
   var index: int32 = 0;
-  for operation in 0..header->modification_count {
-    var kind: int32 = header->modification_op[operation];
+  for operation in 0..operations {
+    var kind: int32 = kinds[operation];
     if (kind != 0 && kind != 1) { continue; }
-    var difference: int32 = header->modification_value[operation] + 1;
+    var difference: int32 = values[operation] + 1;
     var no_wrap: int32 = predicted - difference;
     if (kind == 1) { no_wrap = predicted + difference; }
     if (no_wrap < 0) { no_wrap = no_wrap + v->max_frame_num; }
@@ -287,33 +304,168 @@ fn h264_build_reference_lists(v: H264Video*, header: H264SliceHeader*) {
     for i in 0..H264_MAX_PICTURES {
       if (i == v->current_picture) { continue; }
       if (v->pictures[i].used == 0 || v->pictures[i].is_reference == 0) { continue; }
-      if (v->pictures[i].frame_num_wrap == wanted) {
-        found = i;
-      }
+      if (v->pictures[i].frame_num_wrap == wanted) { found = i; }
     }
     if (found < 0) { continue; }
 
     var slot: int32 = size;
     while (slot > index) {
-      v->ref_list0[slot] = v->ref_list0[slot - 1];
+      list[slot] = list[slot - 1];
       slot = slot - 1;
     }
-    v->ref_list0[index] = found;
+    list[index] = found;
     index = index + 1;
 
     var next: int32 = index;
     for scan in index..(size + 1) {
-      if (v->ref_list0[scan] != found) {
-        v->ref_list0[next] = v->ref_list0[scan];
+      if (list[scan] != found) {
+        list[next] = list[scan];
         next = next + 1;
       }
     }
   }
 
-  if (header->modification_count > 0) {
-    v->ref_count0 = size;
-  } else if (v->ref_count0 > size) {
-    v->ref_count0 = size;
+  if (operations > 0) {
+    *count = size;
+  } else if (*count > size) {
+    *count = size;
+  }
+}
+
+fn h264_build_reference_lists(v: H264Video*, header: H264SliceHeader*) {
+  v->ref_count0 = 0;
+  v->ref_count1 = 0;
+  if (v->slice_type == H264_SLICE_I) { return; }
+
+  var available: int32[32];
+  var count: int32 = 0;
+  for i in 0..H264_MAX_PICTURES {
+    if (i == v->current_picture) { continue; }
+    if (v->pictures[i].used == 0 || v->pictures[i].is_reference == 0) { continue; }
+    var wrap: int32 = v->pictures[i].frame_num;
+    if (wrap > header->frame_num) { wrap = wrap - v->max_frame_num; }
+    v->pictures[i].frame_num_wrap = wrap;
+    if (count < 32) {
+      available[count] = i;
+      count = count + 1;
+    }
+  }
+  if (count == 0) { return; }
+
+  if (v->slice_type != H264_SLICE_B) {
+    for i in 0..count { v->ref_list0[i] = available[i]; }
+    v->ref_count0 = count;
+    h264_sort_by_frame_number(v, &v->ref_list0[0], v->ref_count0);
+
+    var size: int32 = header->num_ref_idx_l0_active;
+    if (size > 31) { size = 31; }
+    if (size < 1) { size = 1; }
+    h264_apply_list_modification(v, header, &v->ref_list0[0], &v->ref_count0, size,
+                                 header->modification_count, &header->modification_op[0],
+                                 &header->modification_value[0]);
+    return;
+  }
+
+  var before: int32[32];
+  var after: int32[32];
+  var before_count: int32 = 0;
+  var after_count: int32 = 0;
+  for i in 0..count {
+    if (v->pictures[available[i]].poc < v->poc) {
+      before[before_count] = available[i];
+      before_count = before_count + 1;
+    } else {
+      after[after_count] = available[i];
+      after_count = after_count + 1;
+    }
+  }
+  h264_sort_by_order_count(v, &before[0], before_count, 0);
+  h264_sort_by_order_count(v, &after[0], after_count, 1);
+
+  for i in 0..before_count { v->ref_list0[i] = before[i]; }
+  for i in 0..after_count { v->ref_list0[before_count + i] = after[i]; }
+  v->ref_count0 = before_count + after_count;
+
+  for i in 0..after_count { v->ref_list1[i] = after[i]; }
+  for i in 0..before_count { v->ref_list1[after_count + i] = before[i]; }
+  v->ref_count1 = after_count + before_count;
+
+  if (v->ref_count1 > 1) {
+    var identical: int32 = 1;
+    for i in 0..v->ref_count1 {
+      if (v->ref_list0[i] != v->ref_list1[i]) { identical = 0; }
+    }
+    if (identical != 0) {
+      var swap: int32 = v->ref_list1[0];
+      v->ref_list1[0] = v->ref_list1[1];
+      v->ref_list1[1] = swap;
+    }
+  }
+
+  var size0: int32 = header->num_ref_idx_l0_active;
+  if (size0 > 31) { size0 = 31; }
+  if (size0 < 1) { size0 = 1; }
+  h264_apply_list_modification(v, header, &v->ref_list0[0], &v->ref_count0, size0,
+                               header->modification_count, &header->modification_op[0],
+                               &header->modification_value[0]);
+
+  var size1: int32 = header->num_ref_idx_l1_active;
+  if (size1 > 31) { size1 = 31; }
+  if (size1 < 1) { size1 = 1; }
+  h264_apply_list_modification(v, header, &v->ref_list1[0], &v->ref_count1, size1,
+                               header->modification_count_l1, &header->modification_op_l1[0],
+                               &header->modification_value_l1[0]);
+}
+
+fn h264_compute_implicit_weights(v: H264Video*) {
+  for i in 0..v->ref_count0 {
+    for j in 0..v->ref_count1 {
+      var poc0: int32 = v->pictures[v->ref_list0[i]].poc;
+      var poc1: int32 = v->pictures[v->ref_list1[j]].poc;
+      var weight: int32 = 32;
+      var td: int32 = h264_clip3(poc1 - poc0, -128, 127);
+      if (td != 0) {
+        var tb: int32 = h264_clip3(v->poc - poc0, -128, 127);
+        var half: int32 = td;
+        if (half < 0) { half = 0 - half; }
+        half = half / 2;
+        var tx: int32 = (16384 + half) / td;
+        var scale: int32 = h264_clip3((tb * tx + 32) >> 6, -1024, 1023);
+        var candidate: int32 = scale >> 2;
+        if (candidate >= -64 && candidate <= 128) { weight = candidate; }
+      }
+      v->implicit_w1[i * 32 + j] = weight;
+    }
+  }
+}
+
+fn h264_store_colocated_motion(v: H264Video*) {
+  var picture: H264Picture* = &v->pictures[v->current_picture];
+  if (picture->col_capacity < v->mb_count * 16) { return; }
+  for m in 0..v->mb_count {
+    var mb: H264Macroblock* = &v->macroblocks[m];
+    for blk in 0..16 {
+      var index: int32 = m * 16 + blk;
+      if (mb->is_intra != 0 || mb->coded == 0) {
+        picture->col_ref[index] = -1;
+        picture->col_picture[index] = -1;
+        picture->col_mv_x[index] = 0;
+        picture->col_mv_y[index] = 0;
+        continue;
+      }
+      var block8: int32 = ((blk >> 2) >> 1) * 2 + ((blk & 3) >> 1);
+      if (mb->ref_index[block8] >= 0) {
+        picture->col_ref[index] = mb->ref_index[block8];
+        picture->col_picture[index] = mb->ref_picture[block8];
+        picture->col_mv_x[index] = mb->mv_x[blk];
+        picture->col_mv_y[index] = mb->mv_y[blk];
+      } else {
+        picture->col_ref[index] = mb->ref_index[4 + block8];
+        picture->col_picture[index] = mb->ref_picture[4 + block8];
+        picture->col_mv_x[index] = mb->mv_x[16 + blk];
+        picture->col_mv_y[index] = mb->mv_y[16 + blk];
+      }
+    }
   }
 }
 
@@ -327,6 +479,13 @@ fn h264_begin_picture(v: H264Video*, sps: H264Sps*, pps: H264Pps*, header: H264S
   if (header->is_idr != 0) { h264_clear_references(v); }
 
   h264_compute_picture_order(v, sps, header);
+
+  for i in 0..H264_MAX_PICTURES {
+    if (i == v->current_picture) { continue; }
+    if (v->pictures[i].used != 0 && v->pictures[i].is_reference == 0) {
+      v->pictures[i].used = 0;
+    }
+  }
 
   var index: int32 = h264_pick_free_picture(v);
   status = h264_picture_allocate(v, index);
@@ -349,11 +508,39 @@ fn h264_begin_picture(v: H264Video*, sps: H264Sps*, pps: H264Pps*, header: H264S
   return H264_OK;
 }
 
+fn h264_mark_short_term_unused(v: H264Video*, pic_num: int32, current_frame_num: int32) {
+  for i in 0..H264_MAX_PICTURES {
+    if (i == v->current_picture) { continue; }
+    if (v->pictures[i].used == 0 || v->pictures[i].is_reference == 0) { continue; }
+    var wrap: int32 = v->pictures[i].frame_num;
+    if (wrap > current_frame_num) { wrap = wrap - v->max_frame_num; }
+    if (wrap == pic_num) {
+      v->pictures[i].is_reference = 0;
+      return;
+    }
+  }
+}
+
+fn h264_apply_marking(v: H264Video*, header: H264SliceHeader*) {
+  for i in 0..header->marking_count {
+    var operation: int32 = header->marking_op[i];
+    if (operation == 1) {
+      h264_mark_short_term_unused(v, header->frame_num - (header->marking_arg[i] + 1),
+                                  header->frame_num);
+    } else if (operation == 5) {
+      h264_clear_references(v);
+    }
+  }
+}
+
 fn h264_end_picture(v: H264Video*, sps: H264Sps*, header: H264SliceHeader*) {
+  h264_store_colocated_motion(v);
   h264_deblock_picture(v);
   v->previous_frame_num = header->frame_num;
 
   if (header->nal_ref_idc == 0) { return; }
+
+  if (header->has_marking != 0) { h264_apply_marking(v, header); }
 
   var picture: H264Picture* = &v->pictures[v->current_picture];
   picture->is_reference = 1;
@@ -396,14 +583,17 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
   if (pps->entropy_coding_mode == 0) { return H264_ERR_UNSUPPORTED; }
   if (sps->chroma_format_idc != 1) { return H264_ERR_UNSUPPORTED; }
   if (pps->transform_8x8_mode != 0) { return H264_ERR_UNSUPPORTED; }
-  if (header->slice_type == H264_SLICE_B) { return H264_ERR_UNSUPPORTED; }
   if (header->slice_type == H264_SLICE_SP || header->slice_type == H264_SLICE_SI) {
     return H264_ERR_UNSUPPORTED;
   }
 
+
   v->slice_type = header->slice_type;
   v->weighted_bipred = pps->weighted_bipred_idc;
+  v->direct_spatial = header->direct_spatial_mv_pred;
+  v->direct_8x8_inference = sps->direct_8x8_inference;
 
+  if (g_trace_mb != 0) { println("slice type {header->slice_type} frame_num {header->frame_num} poc {v->poc} direct_spatial {header->direct_spatial_mv_pred} l0_active {header->num_ref_idx_l0_active} l1_active {header->num_ref_idx_l1_active} built {v->ref_count0}/{v->ref_count1} mods {header->modification_count}/{header->modification_count_l1}"); fflush(0); }
   if (header->first_mb_in_slice == 0) {
     var status: int32 = h264_begin_picture(v, sps, pps, header);
     if (status != H264_OK) { return status; }
@@ -425,6 +615,11 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
   v->chroma_offset[1] = pps->second_chroma_qp_index_offset;
 
   v->use_weights = 0;
+  v->implicit_weights = 0;
+  if (pps->weighted_bipred_idc == 2 && header->slice_type == H264_SLICE_B) {
+    v->implicit_weights = 1;
+    h264_compute_implicit_weights(v);
+  }
   if (header->has_weights != 0 && header->slice_type != H264_SLICE_I) {
     v->use_weights = 1;
     v->luma_log2_denom = header->luma_log2_denom;
@@ -436,6 +631,12 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
       v->weight_chroma[i * 2 + 1] = header->chroma_weight[i * 2 + 1];
       v->weight_chroma_offset[i * 2] = header->chroma_offset[i * 2];
       v->weight_chroma_offset[i * 2 + 1] = header->chroma_offset[i * 2 + 1];
+      v->weight_luma_l1[i] = header->luma_weight_l1[i];
+      v->weight_luma_offset_l1[i] = header->luma_offset_l1[i];
+      v->weight_chroma_l1[i * 2] = header->chroma_weight_l1[i * 2];
+      v->weight_chroma_l1[i * 2 + 1] = header->chroma_weight_l1[i * 2 + 1];
+      v->weight_chroma_offset_l1[i * 2] = header->chroma_offset_l1[i * 2];
+      v->weight_chroma_offset_l1[i * 2 + 1] = header->chroma_offset_l1[i * 2 + 1];
     }
   }
 
@@ -446,6 +647,11 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
     v->mb_y = address / v->mb_width;
 
     var mb_status: int32 = h264_decode_macroblock(v, pps, header);
+    if (g_trace_mb != 0) {
+      var mb: H264Macroblock* = &v->macroblocks[address];
+      println("mb {address} kind {mb->kind} skip {mb->skipped} intra {mb->is_intra} cbp {mb->cbp_luma}/{mb->cbp_chroma} qp {mb->qp} mv0 {mb->mv_x[0]},{mb->mv_y[0]} r {mb->ref_index[0]}/{mb->ref_index[4]}");
+      fflush(0);
+    }
     if (mb_status != H264_OK) { return mb_status; }
 
     if (h264_decode_terminate(v) != 0) { break; }
@@ -485,32 +691,81 @@ fn h264_decode_sample(v: H264Video*, sample: uint8*, size: int64) -> int32 {
   return H264_OK;
 }
 
-fn h264_write_pixels(v: H264Video*) {
-  var out: uint32* = v->pixels;
+fn h264_video_reset(v: H264Video*) {
+  for i in 0..H264_MAX_PICTURES {
+    v->pictures[i].used = 0;
+    v->pictures[i].is_reference = 0;
+  }
+  v->current_picture = 0;
+  v->ref_count0 = 0;
+  v->ref_count1 = 0;
+  v->previous_poc_msb = 0;
+  v->previous_poc_lsb = 0;
+  v->previous_frame_num = 0;
+  v->previous_frame_num_offset = 0;
+}
+
+fn h264_write_pixels_to(v: H264Video*, out: uint32*) {
+  var pairs: int32 = v->width / 2;
   for y in 0..v->height {
     var source_y: int32 = y + v->crop_top;
-    var luma_row: int64 = (int64)source_y * (int64)v->luma_stride;
-    var chroma_row: int64 = (int64)(source_y >> 1) * (int64)v->chroma_stride;
+    var luma_row: int64 = (int64)source_y * (int64)v->luma_stride + (int64)v->crop_left;
+    var chroma_row: int64 = (int64)(source_y >> 1) * (int64)v->chroma_stride +
+                            (int64)(v->crop_left >> 1);
     var target: int64 = (int64)y * (int64)v->width;
-    for x in 0..v->width {
-      var source_x: int32 = x + v->crop_left;
-      var luma: int32 = (int32)v->luma[luma_row + (int64)source_x] - 16;
-      var blue_diff: int32 = (int32)v->cb[chroma_row + (int64)(source_x >> 1)] - 128;
-      var red_diff: int32 = (int32)v->cr[chroma_row + (int64)(source_x >> 1)] - 128;
+
+    for i in 0..pairs {
+      var blue_diff: int32 = (int32)v->cb[chroma_row + (int64)i] - 128;
+      var red_diff: int32 = (int32)v->cr[chroma_row + (int64)i] - 128;
+      var red_bias: int32 = 104597 * red_diff + 32768;
+      var green_bias: int32 = 32768 - 25675 * blue_diff - 53279 * red_diff;
+      var blue_bias: int32 = 132201 * blue_diff + 32768;
+
+      var luma: int32 = (int32)v->luma[luma_row + (int64)(i * 2)] - 16;
       var base: int32 = 76309 * luma;
-
-      var red: int32 = (base + 104597 * red_diff + 32768) >> 16;
-      var green: int32 = (base - 25675 * blue_diff - 53279 * red_diff + 32768) >> 16;
-      var blue: int32 = (base + 132201 * blue_diff + 32768) >> 16;
-
+      var red: int32 = (base + red_bias) >> 16;
+      var green: int32 = (base + green_bias) >> 16;
+      var blue: int32 = (base + blue_bias) >> 16;
       if (red < 0) { red = 0; }
       if (red > 255) { red = 255; }
       if (green < 0) { green = 0; }
       if (green > 255) { green = 255; }
       if (blue < 0) { blue = 0; }
       if (blue > 255) { blue = 255; }
+      out[target + (int64)(i * 2)] = ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
 
+      luma = (int32)v->luma[luma_row + (int64)(i * 2 + 1)] - 16;
+      base = 76309 * luma;
+      red = (base + red_bias) >> 16;
+      green = (base + green_bias) >> 16;
+      blue = (base + blue_bias) >> 16;
+      if (red < 0) { red = 0; }
+      if (red > 255) { red = 255; }
+      if (green < 0) { green = 0; }
+      if (green > 255) { green = 255; }
+      if (blue < 0) { blue = 0; }
+      if (blue > 255) { blue = 255; }
+      out[target + (int64)(i * 2 + 1)] = ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
+    }
+    for x in (pairs * 2)..v->width {
+      var luma: int32 = (int32)v->luma[luma_row + (int64)x] - 16;
+      var blue_diff: int32 = (int32)v->cb[chroma_row + (int64)(x >> 1)] - 128;
+      var red_diff: int32 = (int32)v->cr[chroma_row + (int64)(x >> 1)] - 128;
+      var base: int32 = 76309 * luma;
+      var red: int32 = (base + 104597 * red_diff + 32768) >> 16;
+      var green: int32 = (base - 25675 * blue_diff - 53279 * red_diff + 32768) >> 16;
+      var blue: int32 = (base + 132201 * blue_diff + 32768) >> 16;
+      if (red < 0) { red = 0; }
+      if (red > 255) { red = 255; }
+      if (green < 0) { green = 0; }
+      if (green > 255) { green = 255; }
+      if (blue < 0) { blue = 0; }
+      if (blue > 255) { blue = 255; }
       out[target + (int64)x] = ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
     }
   }
+}
+
+fn h264_write_pixels(v: H264Video*) {
+  h264_write_pixels_to(v, v->pixels);
 }

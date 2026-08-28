@@ -12,6 +12,17 @@ extern fn Win_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerforma
 extern fn Win_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
 extern fn Win_Sleep(milliseconds: uint32) = "Sleep";
 
+var g_qpc_frequency: int64 = 1;
+
+fn now_microseconds() -> int64 {
+  if (g_qpc_frequency <= 1) { Win_QueryPerformanceFrequency(&g_qpc_frequency); }
+  var counter: int64 = 0;
+  Win_QueryPerformanceCounter(&counter);
+  var seconds: int64 = counter / g_qpc_frequency;
+  var remainder: int64 = counter % g_qpc_frequency;
+  return seconds * (int64)1000000 + remainder * (int64)1000000 / g_qpc_frequency;
+}
+
 fn cstring_equals(a: cstring, b: cstring) -> int32 {
   var i: int64 = 0;
   while (a[i] != (uint8)0 && b[i] != (uint8)0) {
@@ -401,7 +412,7 @@ fn command_h264info(path: cstring, sample_limit: int32, print_limit: int32) -> i
         if (i < print_limit) {
           print("sample {i} nal {n}: ");
           print(h264_slice_type_name(header.slice_type));
-          println(" frame_num {header.frame_num} poc_lsb {header.pic_order_cnt_lsb} qp {header.qp} idr {header.is_idr} first_mb {header.first_mb_in_slice}");
+          println(" frame_num {header.frame_num} poc_lsb {header.pic_order_cnt_lsb} qp {header.qp} idr {header.is_idr} direct_spatial {header.direct_spatial_mv_pred} l0 {header.num_ref_idx_l0_active} l1 {header.num_ref_idx_l1_active} mods {header.modification_count}/{header.modification_count_l1}");
         }
       }
     }
@@ -452,29 +463,155 @@ fn command_h264dump(path: cstring, frame_limit: int32, output: cstring, skip_fil
   if (limit > file->video_frame_count) { limit = file->video_frame_count; }
   var written: int32 = 0;
 
+  var frame_bytes: int64 = 0;
+  var store: uint8* = 0;
+  var have: uint8* = 0;
+
   for i in 0..limit {
-    var size: int32 = source_read_video(file, i, buffer, (int64)file->max_video_size);
+    var size: int32 = source_read_video_by_sample(file, i, buffer, (int64)file->max_video_size);
     if (size <= 0) {
-      println("frame {i}: unreadable");
+      println("sample {i}: unreadable");
       return 1;
     }
     var decode_status: int32 = h264_decode_sample(video, buffer, (int64)size);
     if (decode_status != H264_OK) {
-      println("frame {i}: decode status {decode_status}");
+      println("sample {i}: decode status {decode_status}");
       return 1;
     }
+    if (store == 0) {
+      frame_bytes = (int64)video->width * (int64)video->height * 3 / 2;
+      store = malloc(frame_bytes * (int64)limit);
+      have = malloc((int64)limit);
+      if (store == 0 || have == 0) { return 1; }
+      memset(have, 0, (int64)limit);
+    }
+    var position: int32 = source_display_position(file, i);
+    if (position < 0 || position >= limit) { continue; }
+    var target: int64 = (int64)position * frame_bytes;
+    var offset: int64 = 0;
     for y in 0..video->height {
-      fwrite(&video->luma[(int64)(y + video->crop_top) * (int64)video->luma_stride + (int64)video->crop_left], 1, (int64)video->width, fp);
+      var row: int64 = (int64)(y + video->crop_top) * (int64)video->luma_stride + (int64)video->crop_left;
+      for x in 0..video->width {
+        store[target + offset] = video->luma[row + (int64)x];
+        offset = offset + 1;
+      }
     }
     for y in 0..(video->height / 2) {
-      fwrite(&video->cb[(int64)(y + video->crop_top / 2) * (int64)video->chroma_stride + (int64)(video->crop_left / 2)], 1, (int64)(video->width / 2), fp);
+      var row: int64 = (int64)(y + video->crop_top / 2) * (int64)video->chroma_stride + (int64)(video->crop_left / 2);
+      for x in 0..(video->width / 2) {
+        store[target + offset] = video->cb[row + (int64)x];
+        offset = offset + 1;
+      }
     }
     for y in 0..(video->height / 2) {
-      fwrite(&video->cr[(int64)(y + video->crop_top / 2) * (int64)video->chroma_stride + (int64)(video->crop_left / 2)], 1, (int64)(video->width / 2), fp);
+      var row: int64 = (int64)(y + video->crop_top / 2) * (int64)video->chroma_stride + (int64)(video->crop_left / 2);
+      for x in 0..(video->width / 2) {
+        store[target + offset] = video->cr[row + (int64)x];
+        offset = offset + 1;
+      }
     }
+    have[position] = (uint8)1;
     written = written + 1;
   }
+
+  if (store != 0) {
+    for i in 0..limit {
+      if (have[i] == (uint8)0) { continue; }
+      fwrite(&store[(int64)i * frame_bytes], 1, frame_bytes, fp);
+    }
+    free(store);
+    free(have);
+  }
+
   println("decoded {written} frames, {video->width}x{video->height}");
+  return 0;
+}
+
+fn command_syncmap(path: cstring) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) { return 1; }
+  defer source_close(file);
+  var count: int32 = 0;
+  var previous: int32 = -1;
+  var worst: int32 = 0;
+  for i in 0..file->video_frame_count {
+    if (source_is_sync_sample(file, i) == 0) { continue; }
+    if (count < 12) { print(" {i}"); }
+    if (previous >= 0 && i - previous > worst) { worst = i - previous; }
+    previous = i;
+    count = count + 1;
+  }
+  println("");
+  println("sync samples {count} of {file->video_frame_count}, largest gap {worst}");
+  return 0;
+}
+
+fn command_h264hdr(path: cstring, sample_index: int32) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) { return 1; }
+  defer source_close(file);
+  var parser: H264Decoder* = h264_decoder_new();
+  if (parser == 0) { return 1; }
+  defer h264_decoder_free(parser);
+  if (h264_read_config(parser, file->codec_config, file->codec_config_size) != H264_OK) { return 1; }
+  var buffer: uint8* = malloc((int64)file->max_video_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+  var size: int32 = source_read_video_by_sample(file, sample_index, buffer, (int64)file->max_video_size);
+  if (size <= 0) { return 1; }
+  var count: int32 = h264_nal_count(parser, buffer, (int64)size);
+  println("sample {sample_index}: {size} bytes, {count} nals");
+  for n in 0..count {
+    var nal_size: int64 = 0;
+    var nal: uint8* = h264_nal_at(parser, buffer, (int64)size, n, &nal_size);
+    if (nal == 0) { continue; }
+    var kind: int32 = h264_nal_type(nal);
+    print("nal {n} type {kind} size {nal_size} bytes:");
+    var limit: int64 = 24;
+    if (nal_size < limit) { limit = nal_size; }
+    for i in 0..limit {
+      var byte: int32 = (int32)nal[i];
+      print(" {byte}");
+    }
+    println("");
+    if (kind == H264_NAL_SLICE || kind == H264_NAL_IDR) {
+      var header: H264SliceHeader;
+      if (h264_parse_slice_header(parser, nal, nal_size, &header) == H264_OK) {
+        println("  type {header.slice_type} frame_num {header.frame_num} poc_lsb {header.pic_order_cnt_lsb} qp {header.qp} bit_offset {header.data_bit_offset} ref_idc {header.nal_ref_idc}");
+      }
+    }
+  }
+  return 0;
+}
+
+fn command_h264trace(path: cstring, sample_index: int32) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) { return 1; }
+  defer source_close(file);
+  var parser: H264Decoder* = h264_decoder_new();
+  if (parser == 0) { return 1; }
+  defer h264_decoder_free(parser);
+  if (h264_read_config(parser, file->codec_config, file->codec_config_size) != H264_OK) { return 1; }
+  var video: H264Video* = h264_video_new(parser);
+  if (video == 0) { return 1; }
+  defer h264_video_free(video);
+  var buffer: uint8* = malloc((int64)file->max_video_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+  for i in 0..(sample_index + 1) {
+    var size: int32 = source_read_video_by_sample(file, i, buffer, (int64)file->max_video_size);
+    if (size <= 0) { return 1; }
+    if (i == sample_index) { g_trace_mb = 1; }
+    if (h264_decode_sample(video, buffer, (int64)size) != H264_OK) {
+      println("sample {i}: decode failed");
+      return 1;
+    }
+    var display: int32 = source_display_position(file, i);
+    if (i + 8 >= sample_index) { println("sample {i} -> display {display} poc {video->poc}"); }
+  }
   return 0;
 }
 
@@ -500,7 +637,7 @@ fn command_h264stats(path: cstring, frame_limit: int32) -> int32 {
   var limit: int32 = frame_limit;
   if (limit > file->video_frame_count) { limit = file->video_frame_count; }
   for i in 0..limit {
-    var size: int32 = source_read_video(file, i, buffer, (int64)file->max_video_size);
+    var size: int32 = source_read_video_by_sample(file, i, buffer, (int64)file->max_video_size);
     if (size <= 0) { return 1; }
     if (h264_decode_sample(video, buffer, (int64)size) != H264_OK) {
       println("frame {i}: decode failed");
@@ -527,11 +664,87 @@ fn command_h264stats(path: cstring, frame_limit: int32) -> int32 {
         if (video->macroblocks[m].ref_index[b] > 1) { used_ref2 = used_ref2 + 1; }
       }
     }
-    print("frame {i}: refs {video->ref_count0} poc {video->poc} skip {skip} intra {intra} p16 {p16} p8 {p8} other {other} ref1 {used_ref1} ref2 {used_ref2} list");
+    print("sample {i}: poc {video->poc} skip {skip} intra {intra} L0");
     for r in 0..video->ref_count0 {
       print(" [{video->pictures[video->ref_list0[r]].frame_num}/{video->pictures[video->ref_list0[r]].poc}]");
     }
+    print(" L1");
+    for r in 0..video->ref_count1 {
+      print(" [{video->pictures[video->ref_list1[r]].frame_num}/{video->pictures[video->ref_list1[r]].poc}]");
+    }
     println("");
+  }
+  return 0;
+}
+
+fn command_h264bench(path: cstring, frame_limit: int32) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) { return 1; }
+  defer source_close(file);
+
+  var parser: H264Decoder* = h264_decoder_new();
+  if (parser == 0) { return 1; }
+  defer h264_decoder_free(parser);
+  if (h264_read_config(parser, file->codec_config, file->codec_config_size) != H264_OK) { return 1; }
+
+  var video: H264Video* = h264_video_new(parser);
+  if (video == 0) { return 1; }
+  defer h264_video_free(video);
+
+  var buffer: uint8* = malloc((int64)file->max_video_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  var limit: int32 = frame_limit;
+  if (limit > file->video_frame_count) { limit = file->video_frame_count; }
+
+  var read_us: int64 = 0;
+  var decode_us: int64 = 0;
+  var write_us: int64 = 0;
+  var decoded: int32 = 0;
+  var worst: int64 = 0;
+  var worst_index: int32 = 0;
+  var late_us: int64 = 0;
+  var late_count: int32 = 0;
+  for i in 0..limit {
+    var t0: int64 = now_microseconds();
+    var size: int32 = source_read_video_by_sample(file, i, buffer, (int64)file->max_video_size);
+    if (size <= 0) { return 1; }
+    var t1: int64 = now_microseconds();
+    if (h264_decode_sample(video, buffer, (int64)size) != H264_OK) {
+      println("sample {i}: decode failed");
+      return 1;
+    }
+    var t2: int64 = now_microseconds();
+    h264_write_pixels(video);
+    var t3: int64 = now_microseconds();
+    read_us = read_us + (t1 - t0);
+    decode_us = decode_us + (t2 - t1);
+    write_us = write_us + (t3 - t2);
+    if (t2 - t1 > worst) {
+      worst = t2 - t1;
+      worst_index = i;
+    }
+    if (i >= limit / 2) {
+      late_us = late_us + (t2 - t1);
+      late_count = late_count + 1;
+    }
+    decoded = decoded + 1;
+  }
+
+  var total: int64 = read_us + decode_us + write_us;
+  println("{decoded} frames {video->width}x{video->height}");
+  println("read   {read_us} us");
+  println("decode {decode_us} us");
+  println("write  {write_us} us");
+  println("total  {total} us");
+  var per: int64 = total / (int64)decoded;
+  println("per frame {per} us");
+  println("worst frame {worst_index}: {worst} us");
+  if (late_count > 0) {
+    var late_per: int64 = late_us / (int64)late_count;
+    println("second half per frame {late_per} us");
   }
   return 0;
 }
@@ -553,7 +766,7 @@ fn command_h264mb(path: cstring, frame_index: int32, mb_index: int32) -> int32 {
   defer free(buffer);
 
   for i in 0..(frame_index + 1) {
-    var size: int32 = source_read_video(file, i, buffer, (int64)file->max_video_size);
+    var size: int32 = source_read_video_by_sample(file, i, buffer, (int64)file->max_video_size);
     if (size <= 0) { return 1; }
     if (h264_decode_sample(video, buffer, (int64)size) != H264_OK) { return 1; }
   }
@@ -562,14 +775,54 @@ fn command_h264mb(path: cstring, frame_index: int32, mb_index: int32) -> int32 {
   print("  nonzero");
   for i in 0..16 { print(" {mb->luma_nonzero[i]}"); }
   println("");
-  print("  refidx");
+  print("  L0 refidx");
   for i in 0..4 { print(" {mb->ref_index[i]}"); }
-  print("  refpic");
+  print(" refpic");
   for i in 0..4 { print(" {mb->ref_picture[i]}"); }
+  println("");
+  print("  L1 refidx");
+  for i in 0..4 { print(" {mb->ref_index[4 + i]}"); }
+  print(" refpic");
+  for i in 0..4 { print(" {mb->ref_picture[4 + i]}"); }
+  println("");
+  print("  mv1");
+  for i in 0..16 { print(" {mb->mv_x[16 + i]},{mb->mv_y[16 + i]}"); }
   println("");
   print("  mv");
   for i in 0..16 { print(" {mb->mv_x[i]},{mb->mv_y[i]}"); }
   println("");
+  return 0;
+}
+
+fn command_h264rgb(path: cstring, count: int32, output: cstring) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) { return 1; }
+  defer source_close(file);
+  var parser: H264Decoder* = h264_decoder_new();
+  if (parser == 0) { return 1; }
+  defer h264_decoder_free(parser);
+  if (h264_read_config(parser, file->codec_config, file->codec_config_size) != H264_OK) { return 1; }
+  var video: H264Video* = h264_video_new(parser);
+  if (video == 0) { return 1; }
+  defer h264_video_free(video);
+  var buffer: uint8* = malloc((int64)file->max_video_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  for i in 0..count {
+    var size: int32 = source_read_video_by_sample(file, i, buffer, (int64)file->max_video_size);
+    if (size <= 0) { return 1; }
+    if (h264_decode_sample(video, buffer, (int64)size) != H264_OK) {
+      println("sample {i} failed");
+      return 1;
+    }
+  }
+  println("size {video->width}x{video->height} stride {video->luma_stride}/{video->chroma_stride} crop {video->crop_left},{video->crop_top}");
+  println("luma {video->luma[0]} {video->luma[1000]} {video->luma[100000]} cb {video->cb[0]} {video->cb[1000]} cr {video->cr[0]}");
+  h264_write_pixels(video);
+  println("pixels {video->pixels[0]} {video->pixels[1000]} {video->pixels[100000]}");
+  if (write_ppm(output, video->pixels, video->width, video->height) == 0) { return 1; }
   return 0;
 }
 
@@ -611,11 +864,28 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   if (cstring_equals(command, "frame") != 0 && argc >= 5) {
     return command_frame(argv[2], parse_int(argv[3]), argv[4]);
   }
+  if (cstring_equals(command, "h264bench") != 0 && argc >= 3) {
+    var bench_limit: int32 = 1000000;
+    if (argc >= 4) { bench_limit = parse_int(argv[3]); }
+    return command_h264bench(argv[2], bench_limit);
+  }
   if (cstring_equals(command, "bench") != 0) {
     return command_bench(argv[2]);
   }
   if (cstring_equals(command, "h264mb") != 0 && argc >= 5) {
     return command_h264mb(argv[2], parse_int(argv[3]), parse_int(argv[4]));
+  }
+  if (cstring_equals(command, "h264rgb") != 0 && argc >= 5) {
+    return command_h264rgb(argv[2], parse_int(argv[3]), argv[4]);
+  }
+  if (cstring_equals(command, "syncmap") != 0 && argc >= 3) {
+    return command_syncmap(argv[2]);
+  }
+  if (cstring_equals(command, "h264hdr") != 0 && argc >= 4) {
+    return command_h264hdr(argv[2], parse_int(argv[3]));
+  }
+  if (cstring_equals(command, "h264trace") != 0 && argc >= 4) {
+    return command_h264trace(argv[2], parse_int(argv[3]));
   }
   if (cstring_equals(command, "h264stats") != 0) {
     var limit: int32 = 10;

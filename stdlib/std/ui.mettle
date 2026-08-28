@@ -284,6 +284,9 @@ export extern fn Ui_GetModuleHandleA(name: cstring) -> int64 = "GetModuleHandleA
 export extern fn Ui_LoadCursorA(instance: int64, name: cstring) -> int64 = "LoadCursorA";
 export extern fn Ui_LoadIconA(instance: int64, name: cstring) -> int64 = "LoadIconA";
 export extern fn Ui_RegisterClassExA(wnd_class: UiWndClassEx*) -> uint16 = "RegisterClassExA";
+export extern fn Ui_RegisterClassExW(wnd_class: UiWndClassEx*) -> uint16 = "RegisterClassExW";
+export extern fn Ui_CreateWindowExW(ex_style: uint32, class_name: uint16*, window_name: uint16*, style: uint32, x: int32, y: int32, width: int32, height: int32, parent: int64, menu: int64, instance: int64, param: cstring) -> int64 = "CreateWindowExW";
+export extern fn Ui_UnregisterClassW(class_name: uint16*, instance: int64) -> int32 = "UnregisterClassW";
 export extern fn Ui_UnregisterClassA(class_name: cstring, instance: int64) -> int32 = "UnregisterClassA";
 export extern fn Ui_CreateWindowExA(ex_style: uint32, class_name: cstring, window_name: cstring, style: uint32, x: int32, y: int32, width: int32, height: int32, parent: int64, menu: int64, instance: int64, param: cstring) -> int64 = "CreateWindowExA";
 export extern fn Ui_DestroyWindow(hwnd: int64) -> int32 = "DestroyWindow";
@@ -347,6 +350,8 @@ export extern fn Ui_GetWindowLongPtrA(hwnd: int64, index: int32) -> int64 = "Get
 // Module state.
 var UI_CLASS_NAME: string = "MettleUiWindow";
 var ui_class_registered: int32 = 0;
+var ui_unicode_class_registered: int32 = 0;
+var ui_unicode_class_name: uint16[32];
 var ui_app_instance: int64 = 0;
 
 // General helpers.
@@ -594,6 +599,73 @@ export fn ui_init() -> int32 {
 
   ui_class_registered = 1;
   return 1;
+}
+
+fn ui_widen_ascii(text: cstring, out: uint16*, capacity: int32) {
+  var i: int32 = 0;
+  while (text[i] != (uint8)0 && i + 1 < capacity) {
+    out[i] = (uint16)(int32)text[i];
+    i = i + 1;
+  }
+  out[i] = (uint16)0;
+}
+
+export fn ui_init_unicode() -> int32 {
+  if (ui_unicode_class_registered != 0) { return 1; }
+
+  if (ui_app_instance == NULL_HANDLE()) {
+    ui_app_instance = Ui_GetModuleHandleA(0);
+    if (ui_app_instance == NULL_HANDLE()) { return 0; }
+  }
+
+  ui_widen_ascii("MettleUiWindowW", &ui_unicode_class_name[0], 32);
+
+  var wnd_class: UiWndClassEx;
+  wnd_class.cb_size = 80;
+  wnd_class.style = UI_CS_HREDRAW() | UI_CS_VREDRAW() | UI_CS_DBLCLKS();
+  wnd_class.wnd_proc = &ui_trampoline_window_proc;
+  wnd_class.cls_extra = 0;
+  wnd_class.wnd_extra = 0;
+  wnd_class.instance = ui_app_instance;
+  wnd_class.icon = 0;
+  wnd_class.cursor = Ui_LoadCursorA(0, (cstring)(int64)UI_IDC_ARROW());
+  wnd_class.background = (int64)(UI_COLOR_WINDOW() + 1);
+  wnd_class.menu_name = 0;
+  wnd_class.class_name = (cstring)&ui_unicode_class_name[0];
+  wnd_class.icon_sm = 0;
+
+  if (Ui_RegisterClassExW(&wnd_class) == 0) { return 0; }
+
+  ui_unicode_class_registered = 1;
+  return 1;
+}
+
+export fn ui_window_create_unicode(title: uint16*, x: int32, y: int32, width: int32, height: int32,
+                                   proc: fn(int64, uint32, int64, int64) -> int64) -> int64 {
+  if (ui_init_unicode() == 0) { return 0; }
+  var proc_addr: int64 = (int64)proc;
+  return Ui_CreateWindowExW(
+    UI_WS_EX_APPWINDOW(),
+    &ui_unicode_class_name[0],
+    title,
+    UI_WS_OVERLAPPEDWINDOW() | UI_WS_CLIPCHILDREN(),
+    x,
+    y,
+    width,
+    height,
+    0,
+    0,
+    ui_app_instance,
+    (cstring)proc_addr
+  );
+}
+
+export fn ui_window_create_centered_unicode(title: uint16*, width: int32, height: int32,
+                                            proc: fn(int64, uint32, int64, int64) -> int64) -> int64 {
+  var screen_w: int32 = win32_get_system_metrics(SM_CXSCREEN());
+  var screen_h: int32 = win32_get_system_metrics(SM_CYSCREEN());
+  return ui_window_create_unicode(title, (screen_w - width) / 2, (screen_h - height) / 2,
+                                  width, height, proc);
 }
 
 export fn ui_shutdown() {

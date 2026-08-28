@@ -121,6 +121,15 @@ struct H264SliceHeader {
   modification_count: int32;
   modification_op: int32[34];
   modification_value: int32[34];
+  modification_count_l1: int32;
+  has_marking: int32;
+  long_term_reference: int32;
+  marking_count: int32;
+  marking_op: int32[16];
+  marking_arg: int32[16];
+  marking_arg2: int32[16];
+  modification_op_l1: int32[34];
+  modification_value_l1: int32[34];
 
   has_weights: int32;
   luma_log2_denom: int32;
@@ -129,6 +138,10 @@ struct H264SliceHeader {
   luma_offset: int32[32];
   chroma_weight: int32[64];
   chroma_offset: int32[64];
+  luma_weight_l1: int32[32];
+  luma_offset_l1: int32[32];
+  chroma_weight_l1: int32[64];
+  chroma_offset_l1: int32[64];
 }
 
 struct H264Decoder {
@@ -442,12 +455,16 @@ fn h264_read_ref_pic_list_modification(r: H264Bits*, header: H264SliceHeader*) {
       }
     }
   }
+  header->modification_count_l1 = 0;
   if (header->slice_type == H264_SLICE_B) {
     if (h264_read_bit(r) != 0) {
       var operation: int32 = h264_read_ue(r);
       var guard: int32 = 0;
       while (operation != 3 && guard < 32 && r->overrun == 0) {
-        h264_read_ue(r);
+        var value: int32 = h264_read_ue(r);
+        header->modification_op_l1[header->modification_count_l1] = operation;
+        header->modification_value_l1[header->modification_count_l1] = value;
+        header->modification_count_l1 = header->modification_count_l1 + 1;
         operation = h264_read_ue(r);
         guard = guard + 1;
       }
@@ -494,16 +511,32 @@ fn h264_read_pred_weight_table(r: H264Bits*, header: H264SliceHeader*, chroma_fo
     }
   }
   if (header->slice_type == H264_SLICE_B) {
+    for i in 0..32 {
+      header->luma_weight_l1[i] = default_luma;
+      header->luma_offset_l1[i] = 0;
+      header->chroma_weight_l1[i * 2] = default_chroma;
+      header->chroma_weight_l1[i * 2 + 1] = default_chroma;
+      header->chroma_offset_l1[i * 2] = 0;
+      header->chroma_offset_l1[i * 2 + 1] = 0;
+    }
     for i in 0..header->num_ref_idx_l1_active {
       if (h264_read_bit(r) != 0) {
-        h264_read_se(r);
-        h264_read_se(r);
+        var weight: int32 = h264_read_se(r);
+        var offset: int32 = h264_read_se(r);
+        if (i < 32) {
+          header->luma_weight_l1[i] = weight;
+          header->luma_offset_l1[i] = offset;
+        }
       }
       if (chroma_format != 0) {
         if (h264_read_bit(r) != 0) {
           for c in 0..2 {
-            h264_read_se(r);
-            h264_read_se(r);
+            var weight: int32 = h264_read_se(r);
+            var offset: int32 = h264_read_se(r);
+            if (i < 32) {
+              header->chroma_weight_l1[i * 2 + c] = weight;
+              header->chroma_offset_l1[i * 2 + c] = offset;
+            }
           }
         }
       }
@@ -511,20 +544,34 @@ fn h264_read_pred_weight_table(r: H264Bits*, header: H264SliceHeader*, chroma_fo
   }
 }
 
-fn h264_skip_dec_ref_pic_marking(r: H264Bits*, is_idr: int32) {
-  if (is_idr != 0) {
+fn h264_read_dec_ref_pic_marking(r: H264Bits*, header: H264SliceHeader*) {
+  header->has_marking = 0;
+  header->long_term_reference = 0;
+  header->marking_count = 0;
+
+  if (header->is_idr != 0) {
     h264_read_bit(r);
-    h264_read_bit(r);
+    header->long_term_reference = h264_read_bit(r);
     return;
   }
   if (h264_read_bit(r) == 0) { return; }
+  header->has_marking = 1;
+
   var operation: int32 = h264_read_ue(r);
   var guard: int32 = 0;
   while (operation != 0 && guard < 64 && r->overrun == 0) {
-    if (operation == 1 || operation == 3) { h264_read_ue(r); }
-    if (operation == 2) { h264_read_ue(r); }
-    if (operation == 3 || operation == 6) { h264_read_ue(r); }
-    if (operation == 4) { h264_read_ue(r); }
+    var first: int32 = 0;
+    var second: int32 = 0;
+    if (operation == 1 || operation == 3) { first = h264_read_ue(r); }
+    if (operation == 2) { first = h264_read_ue(r); }
+    if (operation == 3 || operation == 6) { second = h264_read_ue(r); }
+    if (operation == 4) { first = h264_read_ue(r); }
+    if (header->marking_count < 16) {
+      header->marking_op[header->marking_count] = operation;
+      header->marking_arg[header->marking_count] = first;
+      header->marking_arg2[header->marking_count] = second;
+      header->marking_count = header->marking_count + 1;
+    }
     operation = h264_read_ue(r);
     guard = guard + 1;
   }
@@ -619,7 +666,7 @@ fn h264_parse_slice_header(d: H264Decoder*, data: uint8*, size: int64, header: H
   }
 
   if (header->nal_ref_idc != 0) {
-    h264_skip_dec_ref_pic_marking(&r, header->is_idr);
+    h264_read_dec_ref_pic_marking(&r, header);
   }
 
   if (p->entropy_coding_mode != 0 && header->slice_type != H264_SLICE_I &&

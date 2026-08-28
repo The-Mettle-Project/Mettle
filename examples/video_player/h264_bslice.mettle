@@ -1,0 +1,496 @@
+import "std/mem";
+import "h264";
+import "h264_decode";
+import "h264_inter";
+import "h264_pslice";
+
+const H264_PRED_L0 = 0;
+const H264_PRED_L1 = 1;
+const H264_PRED_BI = 2;
+
+fn h264_is_direct(kind: int32) -> int32 {
+  if (kind == H264_MB_B_DIRECT) { return 1; }
+  if (kind == H264_MB_B_SKIP) { return 1; }
+  return 0;
+}
+
+fn h264_decode_mb_type_b(v: H264Video*, out_cbp_luma: int32*, out_cbp_chroma: int32*,
+                         out_mode: int32*, out_value: int32*) -> int32 {
+  var increment: int32 = 0;
+  var left: int32 = h264_left_index(v);
+  var above: int32 = h264_above_index(v);
+  if (left >= 0 && h264_is_direct(v->macroblocks[left].kind) == 0) { increment = increment + 1; }
+  if (above >= 0 && h264_is_direct(v->macroblocks[above].kind) == 0) { increment = increment + 1; }
+
+  if (h264_decode_bin(v, H264_CTX_MB_TYPE_B + increment) == 0) {
+    *out_value = 0;
+    return H264_MB_B_DIRECT;
+  }
+  if (h264_decode_bin(v, H264_CTX_MB_TYPE_B + 3) == 0) {
+    *out_value = 1 + h264_decode_bin(v, H264_CTX_MB_TYPE_B + 5);
+    return H264_MB_B_INTER;
+  }
+
+  var value: int32 = h264_decode_bin(v, H264_CTX_MB_TYPE_B + 4) << 3;
+  value = value | (h264_decode_bin(v, H264_CTX_MB_TYPE_B + 5) << 2);
+  value = value | (h264_decode_bin(v, H264_CTX_MB_TYPE_B + 5) << 1);
+  value = value | h264_decode_bin(v, H264_CTX_MB_TYPE_B + 5);
+
+  if (value < 8) {
+    *out_value = value + 3;
+    return H264_MB_B_INTER;
+  }
+  if (value == 13) {
+    return h264_decode_intra_suffix(v, 32, out_cbp_luma, out_cbp_chroma, out_mode);
+  }
+  if (value == 14) {
+    *out_value = 11;
+    return H264_MB_B_INTER;
+  }
+  if (value == 15) {
+    *out_value = 22;
+    return H264_MB_B_INTER;
+  }
+
+  value = (value << 1) | h264_decode_bin(v, H264_CTX_MB_TYPE_B + 5);
+  *out_value = value - 4;
+  return H264_MB_B_INTER;
+}
+
+fn h264_decode_sub_type_b(v: H264Video*) -> int32 {
+  if (h264_decode_bin(v, H264_CTX_SUB_TYPE_B) == 0) { return 0; }
+  if (h264_decode_bin(v, H264_CTX_SUB_TYPE_B + 1) == 0) {
+    return 1 + h264_decode_bin(v, H264_CTX_SUB_TYPE_B + 3);
+  }
+  var value: int32 = 3;
+  if (h264_decode_bin(v, H264_CTX_SUB_TYPE_B + 2) != 0) {
+    if (h264_decode_bin(v, H264_CTX_SUB_TYPE_B + 3) != 0) {
+      return 11 + h264_decode_bin(v, H264_CTX_SUB_TYPE_B + 3);
+    }
+    value = value + 4;
+  }
+  value = value + 2 * h264_decode_bin(v, H264_CTX_SUB_TYPE_B + 3);
+  value = value + h264_decode_bin(v, H264_CTX_SUB_TYPE_B + 3);
+  return value;
+}
+
+fn h264_b_partition_prediction(value: int32, part: int32) -> int32 {
+  if (value == 1) { return H264_PRED_L0; }
+  if (value == 2) { return H264_PRED_L1; }
+  if (value == 3) { return H264_PRED_BI; }
+  var pair: int32 = (value - 4) / 2;
+  if (pair == 0) { return H264_PRED_L0; }
+  if (pair == 1) { return H264_PRED_L1; }
+  if (pair == 2) {
+    if (part == 0) { return H264_PRED_L0; }
+    return H264_PRED_L1;
+  }
+  if (pair == 3) {
+    if (part == 0) { return H264_PRED_L1; }
+    return H264_PRED_L0;
+  }
+  if (pair == 4) {
+    if (part == 0) { return H264_PRED_L0; }
+    return H264_PRED_BI;
+  }
+  if (pair == 5) {
+    if (part == 0) { return H264_PRED_L1; }
+    return H264_PRED_BI;
+  }
+  if (pair == 6) {
+    if (part == 0) { return H264_PRED_BI; }
+    return H264_PRED_L0;
+  }
+  if (pair == 7) {
+    if (part == 0) { return H264_PRED_BI; }
+    return H264_PRED_L1;
+  }
+  return H264_PRED_BI;
+}
+
+fn h264_b_sub_prediction(kind: int32) -> int32 {
+  if (kind == 1 || kind == 4 || kind == 5 || kind == 10) { return H264_PRED_L0; }
+  if (kind == 2 || kind == 6 || kind == 7 || kind == 11) { return H264_PRED_L1; }
+  return H264_PRED_BI;
+}
+
+fn h264_b_sub_width(kind: int32) -> int32 {
+  if (kind == 0 || kind == 1 || kind == 2 || kind == 3) { return 2; }
+  if (kind == 4 || kind == 6 || kind == 8) { return 2; }
+  if (kind == 5 || kind == 7 || kind == 9) { return 1; }
+  return 1;
+}
+
+fn h264_b_sub_height(kind: int32) -> int32 {
+  if (kind == 0 || kind == 1 || kind == 2 || kind == 3) { return 2; }
+  if (kind == 4 || kind == 6 || kind == 8) { return 1; }
+  if (kind == 5 || kind == 7 || kind == 9) { return 2; }
+  return 1;
+}
+
+fn h264_minimum_positive(a: int32, b: int32) -> int32 {
+  if (a >= 0 && b >= 0) {
+    if (a < b) { return a; }
+    return b;
+  }
+  if (a > b) { return a; }
+  return b;
+}
+
+fn h264_neighbour_reference(v: H264Video*, list: int32, block_x: int32, block_y: int32) -> int32 {
+  var reference: int32 = 0;
+  var mv_x: int32 = 0;
+  var mv_y: int32 = 0;
+  if (h264_neighbour_motion(v, list, block_x, block_y, &reference, &mv_x, &mv_y) == 0) {
+    return -1;
+  }
+  return reference;
+}
+
+fn h264_direct_spatial(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_y: int32,
+                       part_w: int32, part_h: int32) {
+  var origin_x: int32 = v->mb_x * 4;
+  var origin_y: int32 = v->mb_y * 4;
+
+  var reference: int32[2];
+  for list in 0..2 {
+    var a: int32 = h264_neighbour_reference(v, list, origin_x - 1, origin_y);
+    var b: int32 = h264_neighbour_reference(v, list, origin_x, origin_y - 1);
+    var c: int32 = h264_neighbour_reference(v, list, origin_x + 4, origin_y - 1);
+    if (h264_block_available(v, origin_x + 4, origin_y - 1) == 0) {
+      c = h264_neighbour_reference(v, list, origin_x - 1, origin_y - 1);
+    }
+    reference[list] = h264_minimum_positive(a, h264_minimum_positive(b, c));
+  }
+
+  var zero_prediction: int32 = 0;
+  if (reference[0] < 0 && reference[1] < 0) {
+    reference[0] = 0;
+    reference[1] = 0;
+    zero_prediction = 1;
+  }
+
+  var predicted_x: int32[2];
+  var predicted_y: int32[2];
+  for list in 0..2 {
+    predicted_x[list] = 0;
+    predicted_y[list] = 0;
+    if (reference[list] >= 0 && zero_prediction == 0) {
+      h264_predict_motion_vector(v, list, 0, 0, 4, 4, reference[list],
+                                 &predicted_x[list], &predicted_y[list]);
+    }
+  }
+
+  var colocated: int32 = -1;
+  if (v->ref_count1 > 0) { colocated = v->ref_list1[0]; }
+
+  for row in 0..part_h {
+    for column in 0..part_w {
+      var inside: int32 = (part_y + row) * 4 + part_x + column;
+      var zero_flag: int32 = 0;
+      if (colocated >= 0 && v->pictures[colocated].col_capacity > 0) {
+        var lookup: int32 = inside;
+        if (v->direct_8x8_inference != 0) {
+          var eight: int32 = ((inside >> 2) >> 1) * 2 + ((inside & 3) >> 1);
+          lookup = (eight >> 1) * 12 + (eight & 1) * 3;
+        }
+        var index: int32 = v->mb_index * 16 + lookup;
+        var col_reference: int32 = v->pictures[colocated].col_ref[index];
+        if (col_reference == 0) {
+          var mv_x: int32 = v->pictures[colocated].col_mv_x[index];
+          var mv_y: int32 = v->pictures[colocated].col_mv_y[index];
+          if (mv_x >= -1 && mv_x <= 1 && mv_y >= -1 && mv_y <= 1) { zero_flag = 1; }
+        }
+      }
+
+      for list in 0..2 {
+        var mv_x: int32 = predicted_x[list];
+        var mv_y: int32 = predicted_y[list];
+        if (reference[list] < 0) {
+          mv_x = 0;
+          mv_y = 0;
+        } else if (reference[list] == 0 && zero_flag != 0) {
+          mv_x = 0;
+          mv_y = 0;
+        }
+        mb->mv_x[list * 16 + inside] = mv_x;
+        mb->mv_y[list * 16 + inside] = mv_y;
+        mb->mvd_x[list * 16 + inside] = 0;
+        mb->mvd_y[list * 16 + inside] = 0;
+      }
+      v->block_filled[inside] = 1;
+      v->ref_filled[inside] = 1;
+    }
+  }
+
+  for row in 0..((part_h + 1) / 2) {
+    for column in 0..((part_w + 1) / 2) {
+      var block8: int32 = ((part_y / 2) + row) * 2 + (part_x / 2) + column;
+      if (block8 < 0 || block8 > 3) { continue; }
+      for list in 0..2 {
+        mb->ref_index[list * 4 + block8] = reference[list];
+        if (reference[list] >= 0) {
+          if (list == 0 && reference[list] < v->ref_count0) {
+            mb->ref_picture[block8] = v->ref_list0[reference[list]];
+          }
+          if (list == 1 && reference[list] < v->ref_count1) {
+            mb->ref_picture[4 + block8] = v->ref_list1[reference[list]];
+          }
+        } else {
+          mb->ref_picture[list * 4 + block8] = -1;
+        }
+      }
+    }
+  }
+}
+
+fn h264_map_colocated_to_list0(v: H264Video*, picture: int32) -> int32 {
+  if (picture < 0) { return 0; }
+  for i in 0..v->ref_count0 {
+    if (v->ref_list0[i] == picture) { return i; }
+  }
+  return 0;
+}
+
+fn h264_direct_temporal(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_y: int32,
+                        part_w: int32, part_h: int32) {
+  var colocated: int32 = -1;
+  if (v->ref_count1 > 0) { colocated = v->ref_list1[0]; }
+  if (colocated < 0 || v->pictures[colocated].col_capacity <= 0) {
+    h264_direct_spatial(v, mb, part_x, part_y, part_w, part_h);
+    return;
+  }
+
+  var poc1: int32 = v->pictures[colocated].poc;
+
+  var first_eight: int32 = (part_y / 2) * 2 + (part_x / 2);
+  var eight_count: int32 = (part_w / 2) * (part_h / 2);
+
+  for step in 0..eight_count {
+    var eight: int32 = first_eight;
+    if (eight_count == 4) { eight = step; }
+    var base_x: int32 = (eight & 1) * 2;
+    var base_y: int32 = (eight >> 1) * 2;
+
+    var source: int32 = (eight >> 1) * 12 + (eight & 1) * 3;
+    if (v->direct_8x8_inference == 0) { source = base_y * 4 + base_x; }
+    var index: int32 = v->mb_index * 16 + source;
+
+    var col_picture: int32 = v->pictures[colocated].col_picture[index];
+    var col_mv_x: int32 = v->pictures[colocated].col_mv_x[index];
+    var col_mv_y: int32 = v->pictures[colocated].col_mv_y[index];
+    if (v->pictures[colocated].col_ref[index] < 0) {
+      col_picture = -1;
+      col_mv_x = 0;
+      col_mv_y = 0;
+    }
+
+    var reference: int32 = h264_map_colocated_to_list0(v, col_picture);
+    var mv_x0: int32 = col_mv_x;
+    var mv_y0: int32 = col_mv_y;
+    var mv_x1: int32 = 0;
+    var mv_y1: int32 = 0;
+
+    if (reference < v->ref_count0) {
+      var poc0: int32 = v->pictures[v->ref_list0[reference]].poc;
+      var td: int32 = h264_clip3(poc1 - poc0, -128, 127);
+      if (td != 0) {
+        var tb: int32 = h264_clip3(v->poc - poc0, -128, 127);
+        var half: int32 = td;
+        if (half < 0) { half = 0 - half; }
+        half = half / 2;
+        var tx: int32 = (16384 + half) / td;
+        var scale: int32 = h264_clip3((tb * tx + 32) >> 6, -1024, 1023);
+        mv_x0 = (scale * col_mv_x + 128) >> 8;
+        mv_y0 = (scale * col_mv_y + 128) >> 8;
+        mv_x1 = mv_x0 - col_mv_x;
+        mv_y1 = mv_y0 - col_mv_y;
+      }
+    }
+
+    for row in 0..2 {
+      for column in 0..2 {
+        var inside: int32 = (base_y + row) * 4 + base_x + column;
+        mb->mv_x[inside] = mv_x0;
+        mb->mv_y[inside] = mv_y0;
+        mb->mv_x[16 + inside] = mv_x1;
+        mb->mv_y[16 + inside] = mv_y1;
+        mb->mvd_x[inside] = 0;
+        mb->mvd_y[inside] = 0;
+        mb->mvd_x[16 + inside] = 0;
+        mb->mvd_y[16 + inside] = 0;
+        v->block_filled[inside] = 1;
+        v->ref_filled[inside] = 1;
+      }
+    }
+    mb->ref_index[eight] = reference;
+    mb->ref_index[4 + eight] = 0;
+    if (reference < v->ref_count0) {
+      mb->ref_picture[eight] = v->ref_list0[reference];
+    } else {
+      mb->ref_picture[eight] = -1;
+    }
+    mb->ref_picture[4 + eight] = colocated;
+  }
+}
+
+fn h264_direct_prediction(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_y: int32,
+                          part_w: int32, part_h: int32) {
+  for row in 0..((part_h + 1) / 2) {
+    for column in 0..((part_w + 1) / 2) {
+      var block8: int32 = ((part_y / 2) + row) * 2 + (part_x / 2) + column;
+      if (block8 >= 0 && block8 < 4) { mb->direct8x8[block8] = (uint8)1; }
+    }
+  }
+  if (v->direct_spatial != 0) {
+    h264_direct_spatial(v, mb, part_x, part_y, part_w, part_h);
+    return;
+  }
+  h264_direct_temporal(v, mb, part_x, part_y, part_w, part_h);
+}
+
+fn h264_partition_uses_list(mode: int32, list: int32) -> int32 {
+  if (mode == H264_PRED_BI) { return 1; }
+  if (list == 0 && mode == H264_PRED_L0) { return 1; }
+  if (list == 1 && mode == H264_PRED_L1) { return 1; }
+  return 0;
+}
+
+fn h264_decode_b_motion(v: H264Video*, mb: H264Macroblock*, value: int32,
+                        count0: int32, count1: int32) {
+  if (value == 22) {
+    var sub_types: int32[4];
+    for block in 0..4 {
+      sub_types[block] = h264_decode_sub_type_b(v);
+    }
+
+    for block in 0..4 {
+      if (sub_types[block] != 0) { continue; }
+      h264_direct_prediction(v, mb, (block & 1) * 2, (block >> 1) * 2, 2, 2);
+    }
+
+    var references: int32[8];
+    for i in 0..8 { references[i] = -1; }
+    for list in 0..2 {
+      for block in 0..4 {
+        var kind: int32 = sub_types[block];
+        if (kind == 0) { continue; }
+        if (h264_partition_uses_list(h264_b_sub_prediction(kind), list) == 0) { continue; }
+        var count: int32 = count0;
+        if (list == 1) { count = count1; }
+        references[list * 4 + block] =
+          h264_decode_reference_index(v, list, (block & 1) * 2, (block >> 1) * 2, count);
+        h264_store_partition_reference(v, mb, list, (block & 1) * 2, (block >> 1) * 2, 2, 2,
+                                       references[list * 4 + block]);
+      }
+    }
+    for list in 0..2 {
+      for block in 0..4 {
+        if (sub_types[block] == 0) { continue; }
+        if (references[list * 4 + block] >= 0) { continue; }
+        h264_store_partition_reference(v, mb, list, (block & 1) * 2, (block >> 1) * 2, 2, 2, -1);
+      }
+    }
+
+    for list in 0..2 {
+      for block in 0..4 {
+        var kind: int32 = sub_types[block];
+        if (kind == 0) { continue; }
+        var base_x: int32 = (block & 1) * 2;
+        var base_y: int32 = (block >> 1) * 2;
+        var reference: int32 = references[list * 4 + block];
+        if (reference < 0) {
+          h264_store_partition_motion(v, mb, list, base_x, base_y, 2, 2, -1, 0, 0, 0, 0);
+          continue;
+        }
+        var width: int32 = h264_b_sub_width(kind);
+        var height: int32 = h264_b_sub_height(kind);
+        for row in 0..(2 / height) {
+          for column in 0..(2 / width) {
+            h264_decode_partition_motion(v, mb, list, base_x + column * width,
+                                         base_y + row * height, width, height, reference);
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  if (value == 0) {
+    h264_direct_prediction(v, mb, 0, 0, 4, 4);
+    return;
+  }
+
+  var origin_x: int32[2];
+  var origin_y: int32[2];
+  var width: int32[2];
+  var height: int32[2];
+  var modes: int32[2];
+  var parts: int32 = 1;
+
+  if (value <= 3) {
+    origin_x[0] = 0;
+    origin_y[0] = 0;
+    width[0] = 4;
+    height[0] = 4;
+    modes[0] = h264_b_partition_prediction(value, 0);
+  } else {
+    parts = 2;
+    modes[0] = h264_b_partition_prediction(value, 0);
+    modes[1] = h264_b_partition_prediction(value, 1);
+    if ((value % 2) == 0) {
+      origin_x[0] = 0;
+      origin_y[0] = 0;
+      width[0] = 4;
+      height[0] = 2;
+      origin_x[1] = 0;
+      origin_y[1] = 2;
+      width[1] = 4;
+      height[1] = 2;
+    } else {
+      origin_x[0] = 0;
+      origin_y[0] = 0;
+      width[0] = 2;
+      height[0] = 4;
+      origin_x[1] = 2;
+      origin_y[1] = 0;
+      width[1] = 2;
+      height[1] = 4;
+    }
+  }
+
+  var references: int32[4];
+  for i in 0..4 { references[i] = -1; }
+
+  for list in 0..2 {
+    for part in 0..parts {
+      if (h264_partition_uses_list(modes[part], list) == 0) { continue; }
+      var count: int32 = count0;
+      if (list == 1) { count = count1; }
+      references[list * 2 + part] =
+        h264_decode_reference_index(v, list, origin_x[part], origin_y[part], count);
+      h264_store_partition_reference(v, mb, list, origin_x[part], origin_y[part],
+                                     width[part], height[part], references[list * 2 + part]);
+    }
+  }
+  for list in 0..2 {
+    for part in 0..parts {
+      if (references[list * 2 + part] >= 0) { continue; }
+      h264_store_partition_reference(v, mb, list, origin_x[part], origin_y[part],
+                                     width[part], height[part], -1);
+    }
+  }
+
+  for list in 0..2 {
+    for part in 0..parts {
+      var reference: int32 = references[list * 2 + part];
+      if (reference < 0) {
+        h264_store_partition_motion(v, mb, list, origin_x[part], origin_y[part],
+                                    width[part], height[part], -1, 0, 0, 0, 0);
+        continue;
+      }
+      h264_decode_partition_motion(v, mb, list, origin_x[part], origin_y[part],
+                                   width[part], height[part], reference);
+    }
+  }
+}

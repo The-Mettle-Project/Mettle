@@ -59,6 +59,11 @@ struct H264Picture {
   cb: uint8*;
   cr: uint8*;
   capacity: int64;
+  col_mv_x: int32*;
+  col_mv_y: int32*;
+  col_ref: int32*;
+  col_picture: int32*;
+  col_capacity: int32;
   poc: int32;
   frame_num: int32;
   frame_num_wrap: int32;
@@ -87,6 +92,7 @@ struct H264Macroblock {
   ref_index: int32[8];
   ref_picture: int32[8];
   skipped: int32;
+  direct8x8: uint8[4];
 }
 
 struct H264Video {
@@ -123,14 +129,21 @@ struct H264Video {
 
   slice_type: int32;
   direct_spatial: int32;
+  direct_8x8_inference: int32;
   weighted_bipred: int32;
   use_weights: int32;
+  implicit_weights: int32;
   luma_log2_denom: int32;
   chroma_log2_denom: int32;
   weight_luma: int32[32];
   weight_luma_offset: int32[32];
   weight_chroma: int32[64];
   weight_chroma_offset: int32[64];
+  weight_luma_l1: int32[32];
+  weight_luma_offset_l1: int32[32];
+  weight_chroma_l1: int32[64];
+  weight_chroma_offset_l1: int32[64];
+  implicit_w1: int32[1024];
 
   macroblocks: H264Macroblock*;
   macroblock_capacity: int32;
@@ -250,6 +263,10 @@ fn h264_video_free(v: H264Video*) {
     if (v->pictures[i].luma != 0) { free(v->pictures[i].luma); }
     if (v->pictures[i].cb != 0) { free(v->pictures[i].cb); }
     if (v->pictures[i].cr != 0) { free(v->pictures[i].cr); }
+    if (v->pictures[i].col_mv_x != 0) { free(v->pictures[i].col_mv_x); }
+    if (v->pictures[i].col_mv_y != 0) { free(v->pictures[i].col_mv_y); }
+    if (v->pictures[i].col_ref != 0) { free(v->pictures[i].col_ref); }
+    if (v->pictures[i].col_picture != 0) { free(v->pictures[i].col_picture); }
   }
   if (v->macroblocks != 0) { free(v->macroblocks); }
   if (v->pixels != 0) { free(v->pixels); }
@@ -314,6 +331,24 @@ fn h264_picture_allocate(v: H264Video*, index: int32) -> int32 {
     return H264_ERR_NO_MEMORY;
   }
   picture->capacity = luma_size;
+
+  var blocks: int32 = v->mb_count * 16;
+  if (blocks > picture->col_capacity) {
+    if (picture->col_mv_x != 0) { free(picture->col_mv_x); }
+    if (picture->col_mv_y != 0) { free(picture->col_mv_y); }
+    if (picture->col_ref != 0) { free(picture->col_ref); }
+    if (picture->col_picture != 0) { free(picture->col_picture); }
+    picture->col_mv_x = malloc((int64)blocks * 4);
+    picture->col_mv_y = malloc((int64)blocks * 4);
+    picture->col_ref = malloc((int64)blocks * 4);
+    picture->col_picture = malloc((int64)blocks * 4);
+    if (picture->col_mv_x == 0 || picture->col_mv_y == 0 || picture->col_ref == 0 ||
+        picture->col_picture == 0) {
+      picture->col_capacity = 0;
+      return H264_ERR_NO_MEMORY;
+    }
+    picture->col_capacity = blocks;
+  }
   return H264_OK;
 }
 
@@ -930,6 +965,8 @@ fn h264_chroma_dc_transform(v: H264Video*, component: int32, qp: int32, output: 
   output[2] = ((d2 * scale) << shift) >> 5;
   output[3] = ((d3 * scale) << shift) >> 5;
 }
+
+var g_trace_mb: int32 = 0;
 
 fn h264_clip_sample(value: int32) -> uint8 {
   if (value < 0) { return (uint8)0; }

@@ -253,13 +253,21 @@ static int ir_ptr_binding_find(IRPtrBaseBinding *bindings, size_t count,
   return -1;
 }
 
+/* 1 on success, -1 when the fixed binding table is full (the loop simply has
+ * more distinct bases or address temps than the transform can carry: decline
+ * it), 0 only for an allocation failure. Running out of slots is a routine
+ * property of the input, and reporting it as a pass failure turned a loop the
+ * transform merely could not hold into a compiler crash. */
 static int ir_ptr_binding_add(IRPtrBaseBinding *bindings, size_t *count,
                               size_t header_index, const char *base,
                               const char *addr_temp) {
   int idx = 0;
-  if (!bindings || !count || !base || !addr_temp ||
-      *count >= IR_PTR_BIND_MAX) {
+  if (!bindings || !count || !base || !addr_temp) {
     return 0;
+  }
+  if (*count >= IR_PTR_BIND_MAX &&
+      ir_ptr_binding_find(bindings, *count, base) < 0) {
+    return -1;
   }
   idx = ir_ptr_binding_find(bindings, *count, base);
   if (idx < 0) {
@@ -279,7 +287,7 @@ static int ir_ptr_binding_add(IRPtrBaseBinding *bindings, size_t *count,
     return 1;
   }
   if (bindings[idx].addr_temp_count >= 8) {
-    return 0;
+    return -1;
   }
   for (size_t t = 0; t < bindings[idx].addr_temp_count; t++) {
     if (bindings[idx].addr_temps[t] &&
@@ -598,10 +606,11 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
         has_unconvertible_iv_access = 1;
         continue;
       }
-      if (!ir_ptr_binding_add(bindings, &binding_count, header_index, base,
-                              ins->lhs.name)) {
+      int added = ir_ptr_binding_add(bindings, &binding_count, header_index,
+                                     base, ins->lhs.name);
+      if (added <= 0) {
         ir_ptr_bindings_destroy(bindings, binding_count);
-        return 0;
+        return added == 0 ? 0 : 1;
       }
     }
     if (ins->op == IR_OP_STORE && ins->dest.kind == IR_OPERAND_TEMP &&
@@ -615,10 +624,11 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
         has_unconvertible_iv_access = 1;
         continue;
       }
-      if (!ir_ptr_binding_add(bindings, &binding_count, header_index, base,
-                              ins->dest.name)) {
+      int added = ir_ptr_binding_add(bindings, &binding_count, header_index,
+                                     base, ins->dest.name);
+      if (added <= 0) {
         ir_ptr_bindings_destroy(bindings, binding_count);
-        return 0;
+        return added == 0 ? 0 : 1;
       }
     }
   }

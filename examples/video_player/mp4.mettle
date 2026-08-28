@@ -106,6 +106,7 @@ struct Mp4Track {
   decode_times: int64*;
   presentation_times: int64*;
   display_order: int32*;
+  display_position: int32*;
   sync_flags: uint8*;
   max_size: int32;
   sync_count: int32;
@@ -200,6 +201,9 @@ fn mp4_track_reserve(track: Mp4Track*, needed: int32) -> int32 {
   var order: int32* = realloc(track->display_order, (int64)capacity * 4);
   if (order == 0) { return 0; }
   track->display_order = order;
+  var position: int32* = realloc(track->display_position, (int64)capacity * 4);
+  if (position == 0) { return 0; }
+  track->display_position = position;
   var sync: uint8* = realloc(track->sync_flags, (int64)capacity);
   if (sync == 0) { return 0; }
   track->sync_flags = sync;
@@ -905,6 +909,9 @@ fn mp4_fill_display_order(f: Mp4File*, track: int32) {
     }
     gap = gap / 3;
   }
+  for i in 0..count {
+    f->tracks[track].display_position[order[i]] = i;
+  }
 }
 
 fn mp4_finalize_track(f: Mp4File*, track: int32) {
@@ -920,6 +927,7 @@ fn mp4_release_track(track: Mp4Track*) {
   if (track->decode_times != 0) { free(track->decode_times); track->decode_times = 0; }
   if (track->presentation_times != 0) { free(track->presentation_times); track->presentation_times = 0; }
   if (track->display_order != 0) { free(track->display_order); track->display_order = 0; }
+  if (track->display_position != 0) { free(track->display_position); track->display_position = 0; }
   if (track->sync_flags != 0) { free(track->sync_flags); track->sync_flags = 0; }
   if (track->codec_config != 0) { free(track->codec_config); track->codec_config = 0; }
 }

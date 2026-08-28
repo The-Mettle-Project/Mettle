@@ -292,6 +292,33 @@ fn source_read_video(s: MediaSource*, display_index: int32, into: uint8*, capaci
   return mp4_read_sample(s->mp4, s->mp4->video_track, sample, into, capacity);
 }
 
+fn source_read_video_by_sample(s: MediaSource*, sample: int32, into: uint8*, capacity: int64) -> int32 {
+  if (s->container == SOURCE_CONTAINER_AVI) {
+    return avi_read_video_frame(s->avi, sample, into, capacity);
+  }
+  return mp4_read_sample(s->mp4, s->mp4->video_track, sample, into, capacity);
+}
+
+fn source_display_position(s: MediaSource*, sample: int32) -> int32 {
+  if (s->container == SOURCE_CONTAINER_AVI) { return sample; }
+  var track: int32 = s->mp4->video_track;
+  if (sample < 0 || sample >= s->mp4->tracks[track].sample_count) { return 0; }
+  return s->mp4->tracks[track].display_position[sample];
+}
+
+fn source_is_sync_sample(s: MediaSource*, sample: int32) -> int32 {
+  if (s->container == SOURCE_CONTAINER_AVI) { return 1; }
+  var track: int32 = s->mp4->video_track;
+  if (sample < 0 || sample >= s->mp4->tracks[track].sample_count) { return 1; }
+  if (s->mp4->tracks[track].sync_flags[sample] != (uint8)0) { return 1; }
+  return 0;
+}
+
+fn source_sync_sample_at_or_before(s: MediaSource*, sample: int32) -> int32 {
+  if (s->container == SOURCE_CONTAINER_AVI) { return sample; }
+  return mp4_sync_sample_at_or_before(s->mp4, s->mp4->video_track, sample);
+}
+
 fn source_has_audio(s: MediaSource*) -> int32 {
   if (s->audio_codec != SOURCE_AUDIO_PCM) { return 0; }
   if (s->audio_chunk_count <= 0) { return 0; }
