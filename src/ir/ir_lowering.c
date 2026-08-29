@@ -260,14 +260,35 @@ void ir_set_error(IRLoweringContext *context, const char *format, ...) {
   va_end(args);
 }
 
+/* Lowering names a temp for most expressions it walks, and snprintf's format
+ * interpreter is a poor way to spell one integer. Writes the digits backwards
+ * into the tail of `buffer` and returns where the text starts. */
+static char *ir_write_id(char *buffer, size_t size, int id) {
+  char *at = buffer + size - 1;
+
+  *at = '\0';
+  if (id == 0) {
+    *--at = '0';
+    return at;
+  }
+  while (id > 0) {
+    *--at = (char)('0' + id % 10);
+    id /= 10;
+  }
+  return at;
+}
+
 char *ir_new_temp_name(IRLoweringContext *context) {
   char buffer[64];
   // The '.' prefix keeps temp names out of the user-identifier namespace.
   // Several backend tables (the MIR name->vreg map, float-bits marking) key on
   // the bare name, so a temp named "t2" would alias a user local named "t2" and
   // share its storage - a silent miscompile.
-  snprintf(buffer, sizeof(buffer), ".t%d", context->next_temp_id++);
-  return mettle_strdup(buffer);
+  char *digits = ir_write_id(buffer, sizeof(buffer), context->next_temp_id++);
+
+  *--digits = 't';
+  *--digits = '.';
+  return mettle_strdup(digits);
 }
 
 char *ir_new_label_name(IRLoweringContext *context, const char *prefix) {
@@ -364,18 +385,17 @@ int ir_emit_unroll_marker(IRLoweringContext *context, IRFunction *function,
 
 int ir_make_temp_operand(IRLoweringContext *context,
                                 IROperand *out_temp) {
+  char buffer[32];
+  char *temp_name;
+
   if (!context || !out_temp) {
     return 0;
   }
 
-  char *temp_name = ir_new_temp_name(context);
-  if (!temp_name) {
-    ir_set_error(context, "Out of memory while allocating IR temp");
-    return 0;
-  }
-
+  temp_name = ir_write_id(buffer, sizeof(buffer), context->next_temp_id++);
+  *--temp_name = 't';
+  *--temp_name = '.';
   *out_temp = ir_operand_temp(temp_name);
-  free(temp_name);
   if (out_temp->kind != IR_OPERAND_TEMP || !out_temp->name) {
     ir_set_error(context, "Failed to create IR temp operand");
     return 0;
