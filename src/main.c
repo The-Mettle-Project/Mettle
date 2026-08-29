@@ -5183,6 +5183,14 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
+  /* Retiring an instruction leaves a NOP behind, and after a release pipeline
+   * close to half the body is holes. The optimizer keeps them because several
+   * passes rewrite into the slack they provide; nothing downstream needs it,
+   * and codegen walks every function several times. */
+  for (size_t i = 0; i < ir_program->function_count; i++) {
+    ir_function_drop_dead_nops(ir_program->functions[i]);
+  }
+
   if (options->profile_runtime_ops) {
     if (!ir_profile_instrument_operation_counters(ir_program)) {
       fprintf(stderr,

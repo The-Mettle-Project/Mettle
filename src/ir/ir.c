@@ -5332,6 +5332,42 @@ static int ir_declaration_names(const IRInstruction *instruction,
          strcmp(instruction->dest.name, symbol_name) == 0;
 }
 
+/* Dead instructions are retired by turning them into NOPs, so a function that
+ * has been through the pipeline is close to half empty and every later pass
+ * still walks the holes. Drop the ones that carry nothing: a NOP with text is a
+ * marker (`@@simd:`, `@@unroll:`) a later pass reads, and one with an origin
+ * token still names a source line for debug info. Positions move, so the caller
+ * owns invalidating anything that recorded one. */
+size_t ir_function_drop_dead_nops(IRFunction *function) {
+  size_t write = 0;
+  size_t dropped;
+
+  if (!function || !function->instructions) {
+    return 0;
+  }
+
+  for (size_t read = 0; read < function->instruction_count; read++) {
+    IRInstruction *instruction = &function->instructions[read];
+
+    if (instruction->op == IR_OP_NOP && !instruction->text &&
+        !instruction->ast_ref) {
+      ir_instruction_destroy(instruction);
+      continue;
+    }
+    if (write != read) {
+      function->instructions[write] = *instruction;
+    }
+    write++;
+  }
+
+  dropped = function->instruction_count - write;
+  function->instruction_count = write;
+  if (dropped > 0) {
+    function->cfg_valid = 0;
+  }
+  return dropped;
+}
+
 const IRInstruction *ir_function_find_declaration(const IRFunction *function,
                                                   const char *symbol_name,
                                                   int symbols_only) {

@@ -936,6 +936,7 @@ void ir_gpu_call_graph_destroy(IRGpuCallGraph *graph);
  * internal one. Run it once before optimization to keep the pipeline off bodies
  * that will not ship, and again after inlining so fully-inlined helpers are
  * swept too. Returns 1 on success (including no-op), 0 on allocation failure. */
+size_t ir_function_drop_dead_nops(IRFunction *function);
 const IRInstruction *ir_function_find_declaration(const IRFunction *function,
                                                  const char *symbol_name,
                                                  int symbols_only);
