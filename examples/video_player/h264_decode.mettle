@@ -1226,6 +1226,7 @@ fn h264_chroma_dc_transform(v: H264Video*, component: int32, qp: int32, output: 
 }
 
 var g_trace_mb: int32 = 0;
+var g_skip_reconstruct: int32 = 0;
 
 fn h264_clip_sample(value: int32) -> uint8 {
   if (value < 0) { return (uint8)0; }

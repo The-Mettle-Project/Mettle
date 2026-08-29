@@ -120,41 +120,66 @@ allocates nothing that frame 1 did not already allocate.
 
 ### Speed
 
-720p decode was taken from 9.3 ms a frame to 6.2 ms, and the whole path from
-compressed bytes to BGRA pixels from 11.2 ms a frame to 6.8 ms, measured over
+720p decode was taken from 9.3 ms a frame to 4.8 ms, and the whole path from
+compressed bytes to BGRA pixels from 11.0 ms a frame to 5.3 ms, measured over
 300 frames of a 1280x720 file. Every step was checked by hashing all three
-decoded planes against the decoder as it stood before: the output is identical,
-not merely close.
+decoded planes against the decoder as it stood before, on four different files:
+the output is identical, not merely close.
 
-What was worth doing, in the order the measurements pointed at:
+Measuring was most of the work, and twice it said something other than what the
+code looked like it was doing. A per-macroblock timer put 45 per cent of decode
+in a branch that did nothing. A call-count profiler put 60 per cent in a blend
+whose real cost was a tenth of that, because disabling inlining had turned a
+one-line clamp into a million function calls a frame. What held up was
+switching a whole stage off in an ordinary optimized build and taking the
+difference, and timing one loop on its own.
 
-- **Deblocking** was 30 per cent of decode and is now 7. Boundary strength is
-  computed once per macroblock edge instead of once per four-sample segment,
-  and the chroma pass reuses the luma answer rather than deriving it again.
-  Alpha, beta and the three clipping limits are read once per edge instead of
-  once per segment. A macroblock that is inter-coded, carries no coefficients
-  and has one motion vector for the whole of it cannot have a nonzero strength
-  on any interior edge, so all three interior edges are skipped outright.
+What that pointed at, in the order it mattered:
+
+- **Prediction was two thirds of decode**, and most of it was bulk byte
+  movement done a byte at a time. Copying a reference block, averaging two
+  predictions, and the quarter-sample chroma filter now work through 64-bit
+  words: eight pixels per operation, no SIMD instruction set required. The
+  rounded average of two byte planes is
+  `(a | b) - (((a ^ b) & 0xFEFEFEFEFEFEFEFE) >> 1)`, which is exact, not an
+  approximation. On its own that is 4.6x on the blend and 5.8x on the copy.
+- **Weighted prediction** ran every pixel through an `int32` buffer: motion
+  compensation wrote bytes, a pass widened them, a pass weighted them, and a
+  pass narrowed them back. It is one pass now, and the weight itself is a
+  256-entry table built when the weight changes rather than a multiply and two
+  compares per pixel. This stream uses weighted prediction on nearly every
+  macroblock, which is why it was worth finding.
+- **Deblocking** was 30 per cent of decode and is now 11. Boundary strength is
+  derived once per macroblock edge instead of once per four-sample segment, the
+  chroma pass reuses the luma answer, and an inter macroblock with no
+  coefficients and one motion vector cannot have a nonzero strength on any
+  interior edge, so those edges are skipped without being examined.
 - **Motion compensation** worked in `int32` through a padded copy of the
-  reference block, then chose between the sixteen half-sample cases inside the
-  pixel loop. It now reads the reference plane in place, works in bytes, and
+  reference block and chose between the sixteen half-sample cases inside the
+  pixel loop. It reads the reference plane in place now, works in bytes, and
   picks the case once per block. When the macroblock has no residual the
-  prediction is written straight into the picture instead of into a staging
-  buffer that was copied out afterwards.
+  prediction is written straight into the picture.
 - **The residual path** cleared 664 integers per macroblock whether or not a
-  block was coded, and each block cleared its own coefficients again on top of
-  that. Only coded blocks are cleared now, and the reconstruction side skips
-  a block whose coefficients are all zero rather than transforming zeros.
+  block was coded, and each block cleared its own coefficients again. Only
+  coded blocks are cleared now.
 - **The macroblock record** shrank from 680 bytes to 424 by holding motion
   vectors and differences as `int16`. Three thousand six hundred of them are
-  written and read back per frame, so this is a cache change more than an
-  arithmetic one.
-- **The CABAC engine** reads through a 64-bit cache instead of a bit at a time,
-  keeps the context state and its most probable bit packed in one byte, and
-  renormalises with a table lookup instead of a loop. On this file it was worth
-  little, because the stream is 99 per cent skipped macroblocks and spends only
-  about seven thousand bins a frame; on a high-bitrate stream it is the part
-  that matters.
+  written and read back per frame.
+- **Temporal direct mode** did a division and a reference-list search per 8x8
+  block. Both depend only on the slice, so both are a table now.
+- **CABAC** reads through a 64-bit cache instead of a bit at a time, keeps the
+  context state and its most probable bit in one byte, and renormalises with a
+  table lookup. On this file that was worth almost nothing, because the stream
+  spends about seven thousand bins a frame; on a high-bitrate stream it is the
+  part that matters.
+
+What is left is the part that needs real vector instructions. Prediction now
+runs at about 1.4 cycles per pixel operation, which is close to what scalar
+code can do; ffmpeg decodes the same file in 1.15 ms a frame using hand-written
+AVX2. The compiler's own auto-vectorizer does fire on these loops when they are
+written as flat loops over row pointers, but its byte kernel carries about 90 ns
+of setup, so on a 16-pixel row it loses to the scalar code it replaces. The
+64-bit word arithmetic above is what was available in the meantime.
 
 ### Colour on the GPU
 
@@ -177,7 +202,7 @@ roughly doubles the speed of reading the finished picture back. The conversion
 is issued asynchronously and waited on only when the player reaches for that
 frame, so it overlaps the decode of the frames after it.
 
-Measured over 300 frames at 1280x720: 1.86 ms a frame on the CPU, 0.76 ms on an
+Measured over 300 frames at 1280x720: 1.63 ms a frame on the CPU, 0.52 ms on an
 RTX 5060 Ti, and the two outputs agree on every one of the 921,600 pixels in
 every frame. `vptool h264gpucheck` is that comparison.
 
@@ -230,11 +255,14 @@ What was measured:
 - Playback rate measured by screenshotting the window and matching against an
   ffmpeg frame index: 153 frames in 6.364 s at 24 fps on the audio clock,
   84 in 3.351 s at 25 fps on the wall clock.
-- 1280x720 decode costs 6.2 ms a frame in a release build, and 6.8 ms including
-  colour conversion, so a 24 fps file uses about a sixth of one core.
+- 1280x720 decode costs 4.8 ms a frame in a release build, and 5.3 ms including
+  colour conversion on the GPU, so a 24 fps file uses about an eighth of one
+  core.
 - The optimized decoder against the one before it, over 300 frames with all
-  three planes hashed: identical output, 1.51x faster. The same check on a
-  second H.264 file and on the Motion JPEG path: identical.
+  three planes hashed: identical output, 1.92x faster on decode and 2.09x over
+  the whole path. The same check on a second H.264 file, on three re-encoded
+  clips at 320x180, 640x360 and 1280x720, and on the Motion JPEG path:
+  identical in every case.
 - The GPU colour path against the CPU one, 40 frames of 921,600 pixels: no
   pixel differs.
 

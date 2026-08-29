@@ -211,6 +211,14 @@ fn h264_direct_spatial(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_y
     }
   }
 
+  if (part_w == 4 && part_h == 4) {
+    var steady: int32 = 1;
+    for i in 1..16 {
+      if (zero_flags[i] != zero_flags[0]) { steady = 0; }
+    }
+    if (steady != 0) { mb->uniform = (uint8)1; }
+  }
+
   for row in 0..part_h {
     for column in 0..part_w {
       var inside: int32 = (part_y + row) * 4 + part_x + column;
@@ -263,6 +271,36 @@ fn h264_map_colocated_to_list0(v: H264Video*, picture: int32) -> int32 {
   return 0;
 }
 
+var g_direct_reference: int32[H264_MAX_PICTURES];
+var g_direct_scale: int32[H264_MAX_PICTURES];
+var g_direct_ready: int32 = 0;
+
+fn h264_reset_direct_scales() {
+  g_direct_ready = 0;
+}
+
+fn h264_build_direct_scales(v: H264Video*, colocated: int32) {
+  var poc1: int32 = v->pictures[colocated].poc;
+  for picture in 0..H264_MAX_PICTURES {
+    var reference: int32 = h264_map_colocated_to_list0(v, picture);
+    g_direct_reference[picture] = reference;
+    g_direct_scale[picture] = 0;
+    if (reference < v->ref_count0) {
+      var poc0: int32 = v->pictures[v->ref_list0[reference]].poc;
+      var td: int32 = h264_clip3(poc1 - poc0, -128, 127);
+      if (td != 0) {
+        var tb: int32 = h264_clip3(v->poc - poc0, -128, 127);
+        var half: int32 = td;
+        if (half < 0) { half = 0 - half; }
+        half = half / 2;
+        var tx: int32 = (16384 + half) / td;
+        g_direct_scale[picture] = h264_clip3((tb * tx + 32) >> 6, -1024, 1023);
+      }
+    }
+  }
+  g_direct_ready = 1;
+}
+
 fn h264_direct_temporal(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_y: int32,
                         part_w: int32, part_h: int32) {
   var colocated: int32 = -1;
@@ -272,7 +310,7 @@ fn h264_direct_temporal(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_
     return;
   }
 
-  var poc1: int32 = v->pictures[colocated].poc;
+  if (g_direct_ready == 0) { h264_build_direct_scales(v, colocated); }
 
   var first_eight: int32 = (part_y / 2) * 2 + (part_x / 2);
   var eight_count: int32 = (part_w / 2) * (part_h / 2);
@@ -296,27 +334,22 @@ fn h264_direct_temporal(v: H264Video*, mb: H264Macroblock*, part_x: int32, part_
       col_mv_y = 0;
     }
 
-    var reference: int32 = h264_map_colocated_to_list0(v, col_picture);
+    var slot: int32 = col_picture;
+    if (slot < 0) { slot = 0; }
+    var reference: int32 = 0;
+    if (col_picture >= 0) { reference = g_direct_reference[slot]; }
     var mv_x0: int32 = col_mv_x;
     var mv_y0: int32 = col_mv_y;
     var mv_x1: int32 = 0;
     var mv_y1: int32 = 0;
 
-    if (reference < v->ref_count0) {
-      var poc0: int32 = v->pictures[v->ref_list0[reference]].poc;
-      var td: int32 = h264_clip3(poc1 - poc0, -128, 127);
-      if (td != 0) {
-        var tb: int32 = h264_clip3(v->poc - poc0, -128, 127);
-        var half: int32 = td;
-        if (half < 0) { half = 0 - half; }
-        half = half / 2;
-        var tx: int32 = (16384 + half) / td;
-        var scale: int32 = h264_clip3((tb * tx + 32) >> 6, -1024, 1023);
-        mv_x0 = (scale * col_mv_x + 128) >> 8;
-        mv_y0 = (scale * col_mv_y + 128) >> 8;
-        mv_x1 = mv_x0 - col_mv_x;
-        mv_y1 = mv_y0 - col_mv_y;
-      }
+    var scale: int32 = 0;
+    if (col_picture >= 0) { scale = g_direct_scale[slot]; }
+    if (scale != 0) {
+      mv_x0 = (scale * col_mv_x + 128) >> 8;
+      mv_y0 = (scale * col_mv_y + 128) >> 8;
+      mv_x1 = mv_x0 - col_mv_x;
+      mv_y1 = mv_y0 - col_mv_y;
     }
 
     for row in 0..2 {

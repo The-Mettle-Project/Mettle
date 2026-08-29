@@ -32,6 +32,99 @@ fn h264_copy_plane_u8(plane: uint8*, stride: int32, width: int32, height: int32,
   }
 }
 
+@inline fn h264_quarter_row_u8(a: uint8*, b: uint8*, c: uint8*, d: uint8*,
+                               out: uint8*, w: int32) {
+  if ((w & 7) == 0) {
+    var lanes: int32 = w >> 3;
+    var mask: uint64 = (uint64)71777214294589695;
+    var sa: uint64* = (uint64*)a;
+    var sb: uint64* = (uint64*)b;
+    var sc: uint64* = (uint64*)c;
+    var sd: uint64* = (uint64*)d;
+    var target: uint64* = (uint64*)out;
+    for i in 0..lanes {
+      var x: uint64 = sa[i];
+      var y: uint64 = sb[i];
+      var z: uint64 = sc[i];
+      var q: uint64 = sd[i];
+      var low: uint64 = (x & mask) + (y & mask) + (z & mask) + (q & mask) + (uint64)562958543486978;
+      var high: uint64 = ((x >> (uint64)8) & mask) + ((y >> (uint64)8) & mask) +
+                         ((z >> (uint64)8) & mask) + ((q >> (uint64)8) & mask) +
+                         (uint64)562958543486978;
+      target[i] = ((low >> (uint64)2) & mask) | (((high >> (uint64)2) & mask) << (uint64)8);
+    }
+    return;
+  }
+  for i in 0..w {
+    out[i] = (uint8)(((int32)a[i] + (int32)b[i] + (int32)c[i] + (int32)d[i] + 2) >> 2);
+  }
+}
+
+@inline fn h264_average_row_u8(a: uint8*, b: uint8*, out: uint8*, w: int32) {
+  if (w == 16) {
+    var left: uint64* = (uint64*)a;
+    var right: uint64* = (uint64*)b;
+    var target: uint64* = (uint64*)out;
+    var x: uint64 = left[0];
+    var y: uint64 = right[0];
+    target[0] = (x | y) - (((x ^ y) & (uint64)18374403900871474942) >> (uint64)1);
+    x = left[1];
+    y = right[1];
+    target[1] = (x | y) - (((x ^ y) & (uint64)18374403900871474942) >> (uint64)1);
+    return;
+  }
+  if (w == 8) {
+    var left: uint64* = (uint64*)a;
+    var right: uint64* = (uint64*)b;
+    var target: uint64* = (uint64*)out;
+    var x: uint64 = left[0];
+    var y: uint64 = right[0];
+    target[0] = (x | y) - (((x ^ y) & (uint64)18374403900871474942) >> (uint64)1);
+    return;
+  }
+  if (w == 4) {
+    var left: uint32* = (uint32*)a;
+    var right: uint32* = (uint32*)b;
+    var target: uint32* = (uint32*)out;
+    var x: uint32 = left[0];
+    var y: uint32 = right[0];
+    target[0] = (x | y) - (((x ^ y) & (uint32)4278124286) >> (uint32)1);
+    return;
+  }
+  for i in 0..w {
+    out[i] = (uint8)(((int32)a[i] + (int32)b[i] + 1) >> 1);
+  }
+}
+
+@inline fn h264_copy_row(dst: uint8*, src: uint8*, w: int32) {
+  if (w == 16) {
+    var wide_dst: uint64* = (uint64*)dst;
+    var wide_src: uint64* = (uint64*)src;
+    wide_dst[0] = wide_src[0];
+    wide_dst[1] = wide_src[1];
+    return;
+  }
+  if (w == 8) {
+    var wide_dst: uint64* = (uint64*)dst;
+    var wide_src: uint64* = (uint64*)src;
+    wide_dst[0] = wide_src[0];
+    return;
+  }
+  if (w == 4) {
+    var word_dst: uint32* = (uint32*)dst;
+    var word_src: uint32* = (uint32*)src;
+    word_dst[0] = word_src[0];
+    return;
+  }
+  if (w == 2) {
+    var half_dst: uint16* = (uint16*)dst;
+    var half_src: uint16* = (uint16*)src;
+    half_dst[0] = half_src[0];
+    return;
+  }
+  for i in 0..w { dst[i] = src[i]; }
+}
+
 fn h264_mc_luma_u8(v: H264Video*, reference: uint8*, dst: uint8*, dst_stride: int32,
                    block_x: int32, block_y: int32, w: int32, h: int32,
                    mv_x: int32, mv_y: int32) {
@@ -58,22 +151,8 @@ fn h264_mc_luma_u8(v: H264Video*, reference: uint8*, dst: uint8*, dst_stride: in
   }
 
   if (x_frac == 0 && y_frac == 0) {
-    if (w == 16) {
-      for row in 0..h {
-        memcpy(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], (int64)16);
-      }
-    } else if (w == 8) {
-      for row in 0..h {
-        memcpy(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], (int64)8);
-      }
-    } else if (w == 4) {
-      for row in 0..h {
-        memcpy(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], (int64)4);
-      }
-    } else {
-      for row in 0..h {
-        memcpy(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], (int64)w);
-      }
+    for row in 0..h {
+      h264_copy_row(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], w);
     }
     return;
   }
@@ -240,22 +319,62 @@ fn h264_mc_chroma_u8(v: H264Video*, plane: uint8*, dst: uint8*, dst_stride: int3
   }
 
   if (x_frac == 0 && y_frac == 0) {
-    if (w == 8) {
+    for row in 0..h {
+      h264_copy_row(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], w);
+    }
+    return;
+  }
+
+  var step: int64 = (int64)src_stride;
+
+  if (y_frac == 0) {
+    if (x_frac == 4) {
       for row in 0..h {
-        memcpy(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], (int64)8);
+        var line: int64 = origin + (int64)row * step;
+        h264_average_row_u8(&src[line], &src[line + (int64)1], &dst[row * dst_stride], w);
       }
-    } else if (w == 4) {
+      return;
+    }
+    var left: int32 = 8 - x_frac;
+    for row in 0..h {
+      var line: int64 = origin + (int64)row * step;
+      var out: int32 = row * dst_stride;
+      for column in 0..w {
+        var c: int64 = (int64)column;
+        dst[out + column] =
+          (uint8)((left * (int32)src[line + c] + x_frac * (int32)src[line + c + (int64)1] + 4) >> 3);
+      }
+    }
+    return;
+  }
+
+  if (x_frac == 0) {
+    if (y_frac == 4) {
       for row in 0..h {
-        memcpy(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], (int64)4);
+        var line: int64 = origin + (int64)row * step;
+        h264_average_row_u8(&src[line], &src[line + step], &dst[row * dst_stride], w);
       }
-    } else if (w == 2) {
-      for row in 0..h {
-        memcpy(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], (int64)2);
+      return;
+    }
+    var above: int32 = 8 - y_frac;
+    for row in 0..h {
+      var line: int64 = origin + (int64)row * step;
+      var out: int32 = row * dst_stride;
+      for column in 0..w {
+        var c: int64 = (int64)column;
+        dst[out + column] =
+          (uint8)((above * (int32)src[line + c] + y_frac * (int32)src[line + step + c] + 4) >> 3);
       }
-    } else {
-      for row in 0..h {
-        memcpy(&dst[row * dst_stride], &src[origin + (int64)(row * src_stride)], (int64)w);
-      }
+    }
+    return;
+  }
+
+  if (x_frac == 4 && y_frac == 4) {
+    for row in 0..h {
+      var top: int64 = origin + (int64)row * step;
+      var bottom: int64 = top + step;
+      h264_quarter_row_u8(&src[top], &src[top + (int64)1], &src[bottom],
+                          &src[bottom + (int64)1], &dst[row * dst_stride], w);
     }
     return;
   }
@@ -264,7 +383,6 @@ fn h264_mc_chroma_u8(v: H264Video*, plane: uint8*, dst: uint8*, dst_stride: int3
   var w01: int32 = x_frac * (8 - y_frac);
   var w10: int32 = (8 - x_frac) * y_frac;
   var w11: int32 = x_frac * y_frac;
-  var step: int64 = (int64)src_stride;
   for row in 0..h {
     var top: int64 = origin + (int64)row * step;
     var bottom: int64 = top + step;

@@ -144,10 +144,10 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
   var mb: H264Macroblock* = &v->macroblocks[v->mb_index];
   memset(mb, 0, sizeof(H264Macroblock));
   mb->coded = 1;
-  for i in 0..16 { v->block_filled[i] = 0; }
-  for i in 0..16 { v->ref_filled[i] = 0; }
-  for i in 0..8 { mb->ref_index[i] = -1; }
-  for i in 0..8 { mb->ref_picture[i] = -1; }
+  memset(&v->block_filled[0], 0, (int64)64);
+  memset(&v->ref_filled[0], 0, (int64)64);
+  memset(&mb->ref_index[0], 255, (int64)32);
+  memset(&mb->ref_picture[0], 255, (int64)32);
 
   if (v->slice_type != H264_SLICE_I) {
     if (h264_decode_skip_flag(v) != 0) {
@@ -161,7 +161,7 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
         mb->kind = H264_MB_P_SKIP;
         h264_skip_motion(v, mb);
       }
-      h264_reconstruct_inter(v, mb, pps);
+      if (g_skip_reconstruct == 0) { h264_reconstruct_inter(v, mb, pps); }
       return H264_OK;
     }
   }
@@ -186,6 +186,7 @@ fn h264_decode_macroblock(v: H264Video*, pps: H264Pps*, header: H264SliceHeader*
   if (kind == H264_MB_I_NXN || kind == H264_MB_I_16X16) { intra = 1; }
   mb->is_intra = intra;
 
+  if (g_skip_reconstruct != 0) { return H264_OK; }
   if (intra != 0) {
     if (kind == H264_MB_I_NXN) {
       if (pps->transform_8x8_mode != 0) {
@@ -669,6 +670,8 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
 
   var start_bit: int64 = (header->data_bit_offset + (int64)7) & ~(int64)7;
   h264_cabac_start(v, parser->rbsp, header->rbsp_size, start_bit);
+
+  h264_reset_direct_scales();
 
   var model: int32 = 0;
   if (header->slice_type != H264_SLICE_I) { model = header->cabac_init_idc + 1; }

@@ -280,69 +280,72 @@ fn h264_skip_motion(v: H264Video*, mb: H264Macroblock*) {
     h264_predict_motion_vector(v, 0, 0, 0, 4, 4, 0, &mv_x, &mv_y);
   }
   h264_store_partition_motion(v, mb, 0, 0, 0, 4, 4, 0, mv_x, mv_y, 0, 0);
+  mb->uniform = (uint8)1;
 }
 
-fn h264_apply_weight(block: int32*, count: int32, weight: int32, offset: int32, denominator: int32) {
-  for i in 0..count {
-    var value: int32 = 0;
-    if (denominator >= 1) {
-      value = ((block[i] * weight + (1 << (denominator - 1))) >> denominator) + offset;
-    } else {
-      value = block[i] * weight + offset;
+@inline fn h264_pack_byte(value: int32) -> uint8 {
+  if (value < 0) { return (uint8)0; }
+  if (value > 255) { return (uint8)255; }
+  return (uint8)value;
+}
+
+var g_weight_table: uint8[768];
+var g_weight_key: int32[3];
+
+fn h264_weight_u8(src: uint8*, src_stride: int32, dst: uint8*, dst_stride: int32,
+                  w: int32, h: int32, weight: int32, offset: int32, denominator: int32,
+                  slot: int32) {
+  var key: int32 = (weight + 512) | ((offset + 512) << 11) | (denominator << 22);
+  var base: int32 = slot * 256;
+  if (g_weight_key[slot] != key) {
+    var round: int32 = 0;
+    if (denominator >= 1) { round = 1 << (denominator - 1); }
+    for i in 0..256 {
+      g_weight_table[base + i] = h264_pack_byte(((i * weight + round) >> denominator) + offset);
     }
-    if (value < 0) { value = 0; }
-    if (value > 255) { value = 255; }
-    block[i] = value;
+    g_weight_key[slot] = key;
+  }
+  for row in 0..h {
+    var source: int32 = row * src_stride;
+    var target: int32 = row * dst_stride;
+    for column in 0..w {
+      dst[target + column] = g_weight_table[base + (int32)src[source + column]];
+    }
   }
 }
 
-fn h264_combine_predictions(v: H264Video*, first: int32*, second: int32*, count: int32,
-                            reference0: int32, reference1: int32, chroma: int32, component: int32) {
-  if (v->implicit_weights != 0) {
-    var w1: int32 = v->implicit_w1[reference0 * 32 + reference1];
-    var w0: int32 = 64 - w1;
-    for i in 0..count {
-      var value: int32 = (first[i] * w0 + second[i] * w1 + 32) >> 6;
-      if (value < 0) { value = 0; }
-      if (value > 255) { value = 255; }
-      first[i] = value;
+var g_pair_left: int32[256];
+var g_pair_right: int32[256];
+var g_pair_key: int32 = 0;
+
+fn h264_weight_pair_u8(a: uint8*, b: uint8*, dst: uint8*, dst_stride: int32,
+                       w: int32, h: int32, weight0: int32, weight1: int32,
+                       offset0: int32, offset1: int32, denominator: int32) {
+  var round: int32 = 1 << denominator;
+  var shift: int32 = denominator + 1;
+  var offset: int32 = (offset0 + offset1 + 1) >> 1;
+  var key: int32 = (weight0 + 512) | ((weight1 + 512) << 11) | (denominator << 22);
+  if (g_pair_key != key) {
+    for i in 0..256 {
+      g_pair_left[i] = i * weight0;
+      g_pair_right[i] = i * weight1;
     }
-    return;
+    g_pair_key = key;
   }
-  if (v->use_weights != 0) {
-    var denominator: int32 = v->luma_log2_denom;
-    var w0: int32 = v->weight_luma[reference0];
-    var w1: int32 = v->weight_luma_l1[reference1];
-    var o0: int32 = v->weight_luma_offset[reference0];
-    var o1: int32 = v->weight_luma_offset_l1[reference1];
-    if (chroma != 0) {
-      denominator = v->chroma_log2_denom;
-      w0 = v->weight_chroma[reference0 * 2 + component];
-      w1 = v->weight_chroma_l1[reference1 * 2 + component];
-      o0 = v->weight_chroma_offset[reference0 * 2 + component];
-      o1 = v->weight_chroma_offset_l1[reference1 * 2 + component];
+  for row in 0..h {
+    var source: int32 = row * w;
+    var target: int32 = row * dst_stride;
+    for column in 0..w {
+      var value: int32 = (g_pair_left[(int32)a[source + column]] +
+                          g_pair_right[(int32)b[source + column]] + round) >> shift;
+      dst[target + column] = h264_pack_byte(value + offset);
     }
-    for i in 0..count {
-      var value: int32 = ((first[i] * w0 + second[i] * w1 + (1 << denominator)) >> (denominator + 1)) +
-                         ((o0 + o1 + 1) >> 1);
-      if (value < 0) { value = 0; }
-      if (value > 255) { value = 255; }
-      first[i] = value;
-    }
-    return;
-  }
-  for i in 0..count {
-    first[i] = (first[i] + second[i] + 1) >> 1;
   }
 }
 
 var g_pred_luma: uint8[256];
 var g_pred_cb: uint8[64];
 var g_pred_cr: uint8[64];
-var g_mc0_luma: int32[256];
-var g_mc1_luma: int32[256];
-var g_mc0_chroma: int32[64];
-var g_mc1_chroma: int32[64];
 var g_ref0_luma: uint8[256];
 var g_ref1_luma: uint8[256];
 var g_ref0_chroma: uint8[64];
@@ -352,12 +355,13 @@ fn h264_blend_u8(a: uint8*, b: uint8*, out: uint8*, w: int32, h: int32, out_stri
                  weight0: int32, weight1: int32, implicit: int32) {
   if (implicit == 0) {
     for row in 0..h {
-      var store: int32 = row * out_stride;
-      var source: int32 = row * w;
-      for column in 0..w {
-        out[store + column] =
-          (uint8)(((int32)a[source + column] + (int32)b[source + column] + 1) >> 1);
-      }
+      h264_average_row_u8(&a[row * w], &b[row * w], &out[row * out_stride], w);
+    }
+    return;
+  }
+  if (weight1 == 32) {
+    for row in 0..h {
+      h264_average_row_u8(&a[row * w], &b[row * w], &out[row * out_stride], w);
     }
     return;
   }
@@ -365,11 +369,9 @@ fn h264_blend_u8(a: uint8*, b: uint8*, out: uint8*, w: int32, h: int32, out_stri
     var store: int32 = row * out_stride;
     var source: int32 = row * w;
     for column in 0..w {
-      var value: int32 = ((int32)a[source + column] * weight0 +
-                          (int32)b[source + column] * weight1 + 32) >> 6;
-      if (value < 0) { value = 0; }
-      if (value > 255) { value = 255; }
-      out[store + column] = (uint8)value;
+      var base: int32 = (int32)a[source + column];
+      out[store + column] =
+        h264_pack_byte(base + ((((int32)b[source + column] - base) * weight1 + 32) >> 6));
     }
   }
 }
@@ -442,8 +444,6 @@ fn h264_predict_region(v: H264Video*, mb: H264Macroblock*, bx: int32, by: int32,
   var chroma_stride_out: int32 = v->pred_chroma_stride;
   var chroma_shift: int64 = (int64)(by * 2) * (int64)chroma_stride_out + (int64)(bx * 2);
 
-  var block0: int32* = &g_mc0_luma[0];
-  var block1: int32* = &g_mc1_luma[0];
   var mv0x: int32 = (int32)mb->mv_x[raster];
   var mv0y: int32 = (int32)mb->mv_y[raster];
   var mv1x: int32 = (int32)mb->mv_x[16 + raster];
@@ -467,49 +467,44 @@ fn h264_predict_region(v: H264Video*, mb: H264Macroblock*, bx: int32, by: int32,
     implicit_w1 = v->implicit_w1[reference0 * 32 + reference1];
   }
 
-  if (plain != 0 && use1 == 0) {
-    h264_mc_luma_u8(v, picture0->luma, luma_out, luma_stride_out, x, y, w, h, mv0x, mv0y);
-  } else if (plain != 0 && use0 == 0) {
-    h264_mc_luma_u8(v, picture1->luma, luma_out, luma_stride_out, x, y, w, h, mv1x, mv1y);
-  } else if (plain != 0) {
+  if (use0 != 0 && use1 != 0) {
     h264_mc_luma_u8(v, picture0->luma, &g_ref0_luma[0], w, x, y, w, h, mv0x, mv0y);
     h264_mc_luma_u8(v, picture1->luma, &g_ref1_luma[0], w, x, y, w, h, mv1x, mv1y);
-    h264_blend_u8(&g_ref0_luma[0], &g_ref1_luma[0], luma_out, w, h, luma_stride_out,
-                  64 - implicit_w1, implicit_w1, v->implicit_weights);
-  } else {
-    var count: int32 = w * h;
-    if (use0 != 0) {
-      h264_mc_luma_u8(v, picture0->luma, &g_ref0_luma[0], w, x, y, w, h, mv0x, mv0y);
-      for i in 0..count { block0[i] = (int32)g_ref0_luma[i]; }
-    }
-    if (use1 != 0) {
-      h264_mc_luma_u8(v, picture1->luma, &g_ref1_luma[0], w, x, y, w, h, mv1x, mv1y);
-      for i in 0..count { block1[i] = (int32)g_ref1_luma[i]; }
-    }
-
-    if (use0 != 0 && use1 != 0) {
-      h264_combine_predictions(v, block0, block1, count, reference0, reference1, 0, 0);
-    } else if (use0 != 0) {
-      h264_apply_weight(block0, count, v->weight_luma[reference0],
-                        v->weight_luma_offset[reference0], v->luma_log2_denom);
+    if (plain != 0) {
+      h264_blend_u8(&g_ref0_luma[0], &g_ref1_luma[0], luma_out, w, h, luma_stride_out,
+                    64 - implicit_w1, implicit_w1, v->implicit_weights);
     } else {
-      h264_apply_weight(block1, count, v->weight_luma_l1[reference1],
-                        v->weight_luma_offset_l1[reference1], v->luma_log2_denom);
-      for i in 0..count { block0[i] = block1[i]; }
+      h264_weight_pair_u8(&g_ref0_luma[0], &g_ref1_luma[0], luma_out, luma_stride_out, w, h,
+                          v->weight_luma[reference0], v->weight_luma_l1[reference1],
+                          v->weight_luma_offset[reference0],
+                          v->weight_luma_offset_l1[reference1], v->luma_log2_denom);
     }
-
-    for row in 0..h {
-      var store: int32 = row * luma_stride_out;
-      var source: int32 = row * w;
-      for column in 0..w {
-        luma_out[store + column] = (uint8)block0[source + column];
-      }
+  } else {
+    var source_plane: uint8* = picture0->luma;
+    var single_x: int32 = mv0x;
+    var single_y: int32 = mv0y;
+    var single_weight: int32 = 0;
+    var single_offset: int32 = 0;
+    if (use0 == 0) {
+      source_plane = picture1->luma;
+      single_x = mv1x;
+      single_y = mv1y;
+      single_weight = v->weight_luma_l1[reference1];
+      single_offset = v->weight_luma_offset_l1[reference1];
+    } else {
+      single_weight = v->weight_luma[reference0];
+      single_offset = v->weight_luma_offset[reference0];
+    }
+    if (plain != 0) {
+      h264_mc_luma_u8(v, source_plane, luma_out, luma_stride_out, x, y, w, h,
+                      single_x, single_y);
+    } else {
+      h264_mc_luma_u8(v, source_plane, &g_ref0_luma[0], w, x, y, w, h, single_x, single_y);
+      h264_weight_u8(&g_ref0_luma[0], w, luma_out, luma_stride_out, w, h,
+                     single_weight, single_offset, v->luma_log2_denom, 0);
     }
   }
 
-  var chroma0: int32* = &g_mc0_chroma[0];
-  var chroma1: int32* = &g_mc1_chroma[0];
-  var chroma_count: int32 = cw * ch;
   var chroma_offset: int32 = (by * 2) * 8 + bx * 2;
   var chroma_full0: int32 = 0;
   if ((mv0x & 7) == 0 && (mv0y & 7) == 0) { chroma_full0 = 1; }
@@ -530,54 +525,55 @@ fn h264_predict_region(v: H264Video*, mb: H264Macroblock*, bx: int32, by: int32,
     }
     var store: uint8* = &v->pred_cb[chroma_shift];
     if (component == 1) { store = &v->pred_cr[chroma_shift]; }
-    if (plain != 0 && use1 == 0) {
-      h264_mc_chroma_u8(v, source0, store, chroma_stride_out, cx, cy, cw, ch, mv0x, mv0y);
+    if (use0 != 0 && use1 != 0) {
+      h264_mc_chroma_u8(v, source0, &g_ref0_chroma[0], cw, cx, cy, cw, ch, mv0x, mv0y);
+      h264_mc_chroma_u8(v, source1, &g_ref1_chroma[0], cw, cx, cy, cw, ch, mv1x, mv1y);
+      if (plain != 0) {
+        h264_blend_u8(&g_ref0_chroma[0], &g_ref1_chroma[0], store, cw, ch, chroma_stride_out,
+                      64 - implicit_w1, implicit_w1, v->implicit_weights);
+      } else {
+        h264_weight_pair_u8(&g_ref0_chroma[0], &g_ref1_chroma[0], store, chroma_stride_out,
+                            cw, ch,
+                            v->weight_chroma[reference0 * 2 + component],
+                            v->weight_chroma_l1[reference1 * 2 + component],
+                            v->weight_chroma_offset[reference0 * 2 + component],
+                            v->weight_chroma_offset_l1[reference1 * 2 + component],
+                            v->chroma_log2_denom);
+      }
       continue;
     }
-    if (plain != 0 && use0 == 0) {
-      h264_mc_chroma_u8(v, source1, store, chroma_stride_out, cx, cy, cw, ch, mv1x, mv1y);
-      continue;
+    var chroma_plane: uint8* = source0;
+    var chroma_x: int32 = mv0x;
+    var chroma_y: int32 = mv0y;
+    var chroma_weight: int32 = 0;
+    var chroma_offset_value: int32 = 0;
+    if (use0 == 0) {
+      chroma_plane = source1;
+      chroma_x = mv1x;
+      chroma_y = mv1y;
+      chroma_weight = v->weight_chroma_l1[reference1 * 2 + component];
+      chroma_offset_value = v->weight_chroma_offset_l1[reference1 * 2 + component];
+    } else {
+      chroma_weight = v->weight_chroma[reference0 * 2 + component];
+      chroma_offset_value = v->weight_chroma_offset[reference0 * 2 + component];
     }
     if (plain != 0) {
-      h264_mc_chroma_u8(v, source0, &g_ref0_chroma[0], cw, cx, cy, cw, ch, mv0x, mv0y);
-      h264_mc_chroma_u8(v, source1, &g_ref1_chroma[0], cw, cx, cy, cw, ch, mv1x, mv1y);
-      h264_blend_u8(&g_ref0_chroma[0], &g_ref1_chroma[0], store, cw, ch, chroma_stride_out,
-                    64 - implicit_w1, implicit_w1, v->implicit_weights);
-      continue;
-    }
-    if (use0 != 0) {
-      h264_mc_chroma_u8(v, source0, &g_ref0_chroma[0], cw, cx, cy, cw, ch, mv0x, mv0y);
-      for i in 0..chroma_count { chroma0[i] = (int32)g_ref0_chroma[i]; }
-    }
-    if (use1 != 0) {
-      h264_mc_chroma_u8(v, source1, &g_ref1_chroma[0], cw, cx, cy, cw, ch, mv1x, mv1y);
-      for i in 0..chroma_count { chroma1[i] = (int32)g_ref1_chroma[i]; }
-    }
-    if (use0 != 0 && use1 != 0) {
-      h264_combine_predictions(v, chroma0, chroma1, chroma_count, reference0, reference1,
-                               1, component);
-    } else if (use0 != 0) {
-      h264_apply_weight(chroma0, chroma_count, v->weight_chroma[reference0 * 2 + component],
-                        v->weight_chroma_offset[reference0 * 2 + component],
-                        v->chroma_log2_denom);
+      h264_mc_chroma_u8(v, chroma_plane, store, chroma_stride_out, cx, cy, cw, ch,
+                        chroma_x, chroma_y);
     } else {
-      h264_apply_weight(chroma1, chroma_count, v->weight_chroma_l1[reference1 * 2 + component],
-                        v->weight_chroma_offset_l1[reference1 * 2 + component],
-                        v->chroma_log2_denom);
-      for i in 0..chroma_count { chroma0[i] = chroma1[i]; }
-    }
-    for row in 0..ch {
-      var target: int32 = row * chroma_stride_out;
-      var source: int32 = row * cw;
-      for column in 0..cw {
-        store[target + column] = (uint8)chroma0[source + column];
-      }
+      h264_mc_chroma_u8(v, chroma_plane, &g_ref0_chroma[0], cw, cx, cy, cw, ch,
+                        chroma_x, chroma_y);
+      h264_weight_u8(&g_ref0_chroma[0], cw, store, chroma_stride_out, cw, ch,
+                     chroma_weight, chroma_offset_value, v->chroma_log2_denom, component + 1);
     }
   }
   return 1;
 }
 
 fn h264_predict_inter(v: H264Video*, mb: H264Macroblock*) -> int32 {
+  if (mb->uniform != (uint8)0) {
+    return h264_predict_region(v, mb, 0, 0, 4, 4);
+  }
   if (h264_uniform_region(mb, 0, 0, 4, 4) != 0) {
     mb->uniform = (uint8)1;
     return h264_predict_region(v, mb, 0, 0, 4, 4);
@@ -700,8 +696,8 @@ fn h264_reconstruct_inter(v: H264Video*, mb: H264Macroblock*, pps: H264Pps*) {
   if (direct_chroma != 0) { return; }
   for row in 0..8 {
     var base: int64 = chroma_origin + (int64)(row * v->chroma_stride);
-    memcpy(&v->cb[base], &g_pred_cb[row * 8], (int64)8);
-    memcpy(&v->cr[base], &g_pred_cr[row * 8], (int64)8);
+    h264_copy_row(&v->cb[base], &g_pred_cb[row * 8], 8);
+    h264_copy_row(&v->cr[base], &g_pred_cr[row * 8], 8);
   }
   var dc: int32[4];
   for component in 0..2 {
