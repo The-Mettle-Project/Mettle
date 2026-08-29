@@ -76,11 +76,34 @@ void *stdin = &mt_stdin_file;
 void *stdout = &mt_stdout_file;
 void *stderr = &mt_stderr_file;
 
+#define MT_WORD_ONES 0x0101010101010101ull
+#define MT_WORD_HIGH 0x8080808080808080ull
+#define MT_WORD_ALIGN(p) ((mt_u64)(mt_size)(const void *)(p) & 7u)
+
+static mt_u64 mt_word_zero_mask(mt_u64 word) {
+  return (word - MT_WORD_ONES) & ~word & MT_WORD_HIGH;
+}
+
 void *memset(void *destination, int value, mt_size count) {
   mt_u8 *out = (mt_u8 *)destination;
   mt_u8 byte = (mt_u8)value;
-  for (mt_size i = 0; i < count; i++) {
-    out[i] = byte;
+  mt_u64 pattern = (mt_u64)byte * MT_WORD_ONES;
+
+  while (count >= 32) {
+    __builtin_memcpy(out, &pattern, 8);
+    __builtin_memcpy(out + 8, &pattern, 8);
+    __builtin_memcpy(out + 16, &pattern, 8);
+    __builtin_memcpy(out + 24, &pattern, 8);
+    out += 32;
+    count -= 32;
+  }
+  while (count >= 8) {
+    __builtin_memcpy(out, &pattern, 8);
+    out += 8;
+    count -= 8;
+  }
+  while (count--) {
+    *out++ = byte;
   }
   return destination;
 }
@@ -88,8 +111,31 @@ void *memset(void *destination, int value, mt_size count) {
 void *memcpy(void *destination, const void *source, mt_size count) {
   mt_u8 *out = (mt_u8 *)destination;
   const mt_u8 *in = (const mt_u8 *)source;
-  for (mt_size i = 0; i < count; i++) {
-    out[i] = in[i];
+
+  while (count >= 32) {
+    mt_u64 a, b, c, d;
+    __builtin_memcpy(&a, in, 8);
+    __builtin_memcpy(&b, in + 8, 8);
+    __builtin_memcpy(&c, in + 16, 8);
+    __builtin_memcpy(&d, in + 24, 8);
+    __builtin_memcpy(out, &a, 8);
+    __builtin_memcpy(out + 8, &b, 8);
+    __builtin_memcpy(out + 16, &c, 8);
+    __builtin_memcpy(out + 24, &d, 8);
+    out += 32;
+    in += 32;
+    count -= 32;
+  }
+  while (count >= 8) {
+    mt_u64 a;
+    __builtin_memcpy(&a, in, 8);
+    __builtin_memcpy(out, &a, 8);
+    out += 8;
+    in += 8;
+    count -= 8;
+  }
+  while (count--) {
+    *out++ = *in++;
   }
   return destination;
 }
@@ -103,19 +149,39 @@ void *memmove(void *destination, const void *source, mt_size count) {
   if (out < in || out >= in + count) {
     return memcpy(destination, source, count);
   }
-  for (mt_size i = count; i != 0; i--) {
-    out[i - 1] = in[i - 1];
+  while (count >= 8) {
+    mt_u64 a;
+    count -= 8;
+    __builtin_memcpy(&a, in + count, 8);
+    __builtin_memcpy(out + count, &a, 8);
+  }
+  while (count != 0) {
+    count--;
+    out[count] = in[count];
   }
   return destination;
 }
 
 void *memchr(const void *memory, int character, mt_size count) {
   const mt_u8 *bytes = (const mt_u8 *)memory;
-  mt_u8 wanted = (mt_u8)character;
-  for (mt_size i = 0; i < count; i++) {
-    if (bytes[i] == wanted) {
-      return (void *)(bytes + i);
+  mt_u64 pattern = (mt_u64)(mt_u8)character * MT_WORD_ONES;
+
+  while (count >= 8) {
+    mt_u64 word;
+    mt_u64 hit;
+    __builtin_memcpy(&word, bytes, 8);
+    hit = mt_word_zero_mask(word ^ pattern);
+    if (hit) {
+      return (void *)(bytes + (__builtin_ctzll(hit) >> 3));
     }
+    bytes += 8;
+    count -= 8;
+  }
+  while (count--) {
+    if (*bytes == (mt_u8)character) {
+      return (void *)bytes;
+    }
+    bytes++;
   }
   return MT_NULL;
 }
@@ -123,10 +189,25 @@ void *memchr(const void *memory, int character, mt_size count) {
 int memcmp(const void *left, const void *right, mt_size count) {
   const mt_u8 *a = (const mt_u8 *)left;
   const mt_u8 *b = (const mt_u8 *)right;
-  for (mt_size i = 0; i < count; i++) {
-    if (a[i] != b[i]) {
-      return (int)a[i] - (int)b[i];
+
+  while (count >= 8) {
+    mt_u64 x, y;
+    __builtin_memcpy(&x, a, 8);
+    __builtin_memcpy(&y, b, 8);
+    if (x != y) {
+      mt_u64 lane = (mt_u64)(__builtin_ctzll(x ^ y) & ~7u);
+      return (int)((x >> lane) & 0xffu) - (int)((y >> lane) & 0xffu);
     }
+    a += 8;
+    b += 8;
+    count -= 8;
+  }
+  while (count--) {
+    if (*a != *b) {
+      return (int)*a - (int)*b;
+    }
+    a++;
+    b++;
   }
   return 0;
 }
@@ -161,22 +242,58 @@ int memcmp(const void *left, const void *right, mt_size count) {
 #endif
 
 mt_size strlen(const char *text) {
-  mt_size length = 0;
+  const char *cursor = text;
+
   if (!text) {
     return 0;
   }
-  while (text[length]) {
-    length++;
+  while (MT_WORD_ALIGN(cursor) != 0) {
+    if (!*cursor) {
+      return (mt_size)(cursor - text);
+    }
+    cursor++;
   }
-  return length;
+  for (;;) {
+    mt_u64 word;
+    mt_u64 zero;
+    __builtin_memcpy(&word, cursor, 8);
+    zero = mt_word_zero_mask(word);
+    if (zero) {
+      return (mt_size)(cursor - text) + (mt_size)(__builtin_ctzll(zero) >> 3);
+    }
+    cursor += 8;
+  }
 }
 
 int strcmp(const char *left, const char *right) {
-  mt_size i = 0;
-  while (left[i] && left[i] == right[i]) {
-    i++;
+  if (MT_WORD_ALIGN(left) == MT_WORD_ALIGN(right)) {
+    while (MT_WORD_ALIGN(left) != 0) {
+      mt_u8 a = (mt_u8)*left;
+      mt_u8 b = (mt_u8)*right;
+      if (a != b || a == 0) {
+        return (int)a - (int)b;
+      }
+      left++;
+      right++;
+    }
+    for (;;) {
+      mt_u64 x, y;
+      __builtin_memcpy(&x, left, 8);
+      __builtin_memcpy(&y, right, 8);
+      if (x != y || mt_word_zero_mask(x)) {
+        break;
+      }
+      left += 8;
+      right += 8;
+    }
   }
-  return (int)(mt_u8)left[i] - (int)(mt_u8)right[i];
+  {
+    mt_size i = 0;
+    while (left[i] && left[i] == right[i]) {
+      i++;
+    }
+    return (int)(mt_u8)left[i] - (int)(mt_u8)right[i];
+  }
 }
 
 int strncmp(const char *left, const char *right, mt_size count) {
@@ -192,13 +309,30 @@ int strncmp(const char *left, const char *right, mt_size count) {
 
 char *strchr(const char *text, int character) {
   char wanted = (char)character;
-  for (;;) {
+  mt_u64 pattern = (mt_u64)(mt_u8)wanted * MT_WORD_ONES;
+
+  while (MT_WORD_ALIGN(text) != 0) {
     if (*text == wanted) {
       return (char *)text;
     }
     if (!*text++) {
       return MT_NULL;
     }
+  }
+  for (;;) {
+    mt_u64 word;
+    mt_u64 zero;
+    mt_u64 hit;
+    __builtin_memcpy(&word, text, 8);
+    zero = mt_word_zero_mask(word);
+    hit = mt_word_zero_mask(word ^ pattern);
+    if (hit | zero) {
+      if (hit && (!zero || __builtin_ctzll(hit) <= __builtin_ctzll(zero))) {
+        return (char *)text + (__builtin_ctzll(hit) >> 3);
+      }
+      return MT_NULL;
+    }
+    text += 8;
   }
 }
 
@@ -255,19 +389,23 @@ int strcasecmp(const char *left, const char *right) {
 }
 
 char *strstr(const char *text, const char *part) {
-  if (!*part) {
+  char first = part[0];
+  mt_size rest;
+
+  if (!first) {
     return (char *)text;
   }
-  for (; *text; text++) {
-    mt_size i = 0;
-    while (part[i] && text[i] == part[i]) {
-      i++;
+  rest = strlen(part + 1);
+  for (;;) {
+    text = strchr(text, first);
+    if (!text) {
+      return MT_NULL;
     }
-    if (!part[i]) {
+    if (strncmp(text + 1, part + 1, rest) == 0) {
       return (char *)text;
     }
+    text++;
   }
-  return MT_NULL;
 }
 
 static char *mt_strtok_next = MT_NULL;

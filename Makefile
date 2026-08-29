@@ -68,7 +68,7 @@ LINKER_SOURCES = $(wildcard $(SRCDIR)/linker/*.c)
 DIAG_SOURCES = $(SRCDIR)/error/error_reporter.c $(SRCDIR)/error/diag_style.c
 ERROR_SOURCES = $(SRCDIR)/error/error_explain.c
 DEBUG_SOURCES = $(SRCDIR)/debug/debug_info.c
-COMPILER_SOURCES = $(SRCDIR)/compiler/compiler_context.c $(SRCDIR)/compiler/compiler_crash.c
+COMPILER_SOURCES = $(SRCDIR)/compiler/compiler_context.c $(SRCDIR)/compiler/compiler_crash.c $(SRCDIR)/compiler/compiler_self_profile.c
 COMMON_SOURCES = $(SRCDIR)/common.c
 MAIN_SOURCES = $(SRCDIR)/main.c $(SRCDIR)/tracy_build.c
 

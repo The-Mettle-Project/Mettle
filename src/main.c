@@ -17,6 +17,7 @@
 #include "string_intern.h"
 #include "compiler/compiler_context.h"
 #include "compiler/compiler_crash.h"
+#include "compiler/compiler_self_profile.h"
 #include "runtime/owned.h"
 #include "runtime/verify_owned.h"
 #include "tracy_build.h"
@@ -3245,6 +3246,7 @@ static int report_gpu_info(const char *default_target, int isa_major,
 int main(int argc, char *argv[]) {
   CompilerOptions options = {0};
   mettle_compiler_crash_install(argc, argv);
+  mettle_compiler_self_profile_start();
   char *auto_stdlib_directory = NULL;
   char *auto_runtime_directory = NULL;
   char *build_output_filename = NULL;
@@ -3958,6 +3960,7 @@ int main(int argc, char *argv[]) {
   if (getenv("METTLE_FULL_CLEANUP")) {
     string_intern_clear();
   }
+  mettle_compiler_self_profile_report();
   return result;
 }
 

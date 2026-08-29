@@ -2926,7 +2926,8 @@ int ir_eliminate_unreachable_straightline_pass(IRFunction *function,
 int ir_operand_is_symbol_named(const IROperand *operand,
                                       const char *name) {
   return operand && operand->kind == IR_OPERAND_SYMBOL && operand->name &&
-         name && strcmp(operand->name, name) == 0;
+         name && operand->name[0] == name[0] &&
+         strcmp(operand->name, name) == 0;
 }
 
 static int ir_try_fuse_rotate_add_at(IRFunction *function, size_t index,
@@ -3157,7 +3158,8 @@ int ir_instruction_has_side_effect(const IRInstruction *instruction) {
 int ir_operand_is_temp_named(const IROperand *operand,
                                     const char *name) {
   return operand && operand->kind == IR_OPERAND_TEMP && operand->name &&
-         name && strcmp(operand->name, name) == 0;
+         name && operand->name[0] == name[0] &&
+         strcmp(operand->name, name) == 0;
 }
 
 int ir_operand_is_int_value(const IROperand *operand,

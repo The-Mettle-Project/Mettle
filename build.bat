@@ -235,6 +235,7 @@ if not defined BACKEND_ONLY call :cc src\error\error_explain.c obj\error\error_e
 
 call :cc src\compiler\compiler_context.c obj\compiler\compiler_context.o
 call :cc src\compiler\compiler_crash.c obj\compiler\compiler_crash.o
+call :cc src\compiler\compiler_self_profile.c obj\compiler\compiler_self_profile.o
 
 call :cc src\mtlc_api.c obj\mtlc_api.o
 call :cc src\mtlc_build.c obj\mtlc_build.o
