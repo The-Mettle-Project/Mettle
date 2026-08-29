@@ -528,6 +528,17 @@ static int ir_scheduled_pass_is_enabled(const IROptScheduledPass *pass,
          (features & pass->gate.any) != 0;
 }
 
+/* Cached: getenv takes a lock and walks the whole environment on Windows, and
+ * this is asked once per function. */
+static int ir_time_functions_enabled(void) {
+  static int cached = -1;
+
+  if (cached < 0) {
+    cached = getenv("METTLE_TIME_FUNCTIONS") != NULL;
+  }
+  return cached;
+}
+
 static int ir_run_fixpoint_stage(IRFunction *function,
                                  const IROptFixpointStage *stage) {
   if (!stage || !stage->passes || stage->max_iterations <= 0) {
@@ -564,7 +575,7 @@ static int ir_run_fixpoint_stage(IRFunction *function,
     used = iteration + 2;
   }
 
-  if (getenv("METTLE_TIME_FUNCTIONS") && function->instruction_count > 800) {
+  if (ir_time_functions_enabled() && function->instruction_count > 800) {
     fprintf(stderr, "   fixpoint %s: %d iterations over %zu instructions\n",
             function->name ? function->name : "?", used,
             function->instruction_count);
@@ -665,7 +676,7 @@ static void ir_set_current_function_context(IRFunction *function) {
 
 static int ir_run_program_stage_for_each_function(
     IRProgram *program, int (*run)(IRFunction *function)) {
-  int report = getenv("METTLE_TIME_FUNCTIONS") != NULL;
+  int report = ir_time_functions_enabled();
   double slowest = 0.0;
   double total = 0.0;
   const char *slowest_name = NULL;
