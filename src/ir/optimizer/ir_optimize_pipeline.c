@@ -685,6 +685,8 @@ static int ir_run_program_stage_for_each_function(
   int report = ir_time_functions_enabled();
   double slowest = 0.0;
   double total = 0.0;
+  double tiny_ms = 0.0;
+  size_t tiny_count = 0;
   const char *slowest_name = NULL;
 
   for (size_t i = 0; i < program->function_count; i++) {
@@ -697,6 +699,10 @@ static int ir_run_program_stage_for_each_function(
     if (report) {
       double took = mettle_now_ms() - began;
       total += took;
+      if (function->instruction_count < 64) {
+        tiny_ms += took;
+        tiny_count++;
+      }
       if (took > slowest) {
         slowest = took;
         slowest_name = function->name;
@@ -705,9 +711,10 @@ static int ir_run_program_stage_for_each_function(
   }
   if (report) {
     fprintf(stderr,
-            "-- stage over %zu functions: %.1f ms total, slowest %.1f ms (%s) --\n",
+            "-- stage over %zu functions: %.1f ms total, slowest %.1f ms (%s); "
+            "%zu under 64 instructions cost %.1f ms --\n",
             program->function_count, total, slowest,
-            slowest_name ? slowest_name : "?");
+            slowest_name ? slowest_name : "?", tiny_count, tiny_ms);
   }
   return 1;
 }

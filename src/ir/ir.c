@@ -5344,6 +5344,149 @@ static int ir_declaration_names(const IRInstruction *instruction,
          strcmp(instruction->dest.name, symbol_name) == 0;
 }
 
+/* One scan of a body indexes every declaration in it, which is what the
+ * per-name hint below cannot do: its first lookup for each name still had to
+ * walk the function, and on a body that has absorbed a thousand inlined calls
+ * that was most of the compile. The index is only ever trusted through
+ * ir_declaration_names against the live instruction, so a body that moved
+ * under it costs a miss and never a wrong answer. */
+#define IR_DECLARATION_MAP_SLOTS 4
+#define IR_DECLARATION_MAP_MIN_BODY 64
+
+typedef struct {
+  unsigned any;    /* index + 1 of the first declaration of this name */
+  unsigned symbol; /* index + 1 of the first with a SYMBOL destination */
+} IRDeclarationBucket;
+
+static struct {
+  const IRFunction *function;
+  const IRInstruction *instructions;
+  size_t instruction_count;
+  IRDeclarationBucket *buckets;
+  size_t bucket_count;
+} g_ir_declaration_maps[IR_DECLARATION_MAP_SLOTS];
+static size_t g_ir_declaration_map_next;
+
+static size_t ir_declaration_name_hash(const char *name) {
+  size_t hash = METTLE_FNV1A_OFFSET_BASIS;
+
+  for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+    hash ^= (size_t)*p;
+    hash *= METTLE_FNV1A_PRIME;
+  }
+  hash ^= hash >> 31;
+  return hash * 0xff51afd7ed558ccdull;
+}
+
+static size_t ir_declaration_map_build(const IRFunction *function) {
+  size_t slot = g_ir_declaration_map_next % IR_DECLARATION_MAP_SLOTS;
+  size_t declarations = 0;
+  size_t want = 64;
+
+  g_ir_declaration_map_next++;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_DECLARE_LOCAL) {
+      declarations++;
+    }
+  }
+  while (want < (declarations + 1) * 4) {
+    want *= 2;
+  }
+  if (g_ir_declaration_maps[slot].bucket_count < want) {
+    IRDeclarationBucket *grown =
+        realloc(g_ir_declaration_maps[slot].buckets,
+                want * sizeof(IRDeclarationBucket));
+
+    if (!grown) {
+      return IR_DECLARATION_MAP_SLOTS;
+    }
+    g_ir_declaration_maps[slot].buckets = grown;
+    g_ir_declaration_maps[slot].bucket_count = want;
+  }
+  want = g_ir_declaration_maps[slot].bucket_count;
+  memset(g_ir_declaration_maps[slot].buckets, 0,
+         want * sizeof(IRDeclarationBucket));
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    size_t bucket;
+
+    if (instruction->op != IR_OP_DECLARE_LOCAL || !instruction->dest.name) {
+      continue;
+    }
+    bucket = ir_declaration_name_hash(instruction->dest.name) & (want - 1);
+    while (g_ir_declaration_maps[slot].buckets[bucket].any) {
+      const IRInstruction *held =
+          &function->instructions
+               [g_ir_declaration_maps[slot].buckets[bucket].any - 1];
+
+      if (held->dest.name &&
+          strcmp(held->dest.name, instruction->dest.name) == 0) {
+        break;
+      }
+      bucket = (bucket + 1) & (want - 1);
+    }
+    if (!g_ir_declaration_maps[slot].buckets[bucket].any) {
+      g_ir_declaration_maps[slot].buckets[bucket].any = (unsigned)(i + 1);
+    }
+    if (!g_ir_declaration_maps[slot].buckets[bucket].symbol &&
+        instruction->dest.kind == IR_OPERAND_SYMBOL) {
+      g_ir_declaration_maps[slot].buckets[bucket].symbol = (unsigned)(i + 1);
+    }
+  }
+
+  g_ir_declaration_maps[slot].function = function;
+  g_ir_declaration_maps[slot].instructions = function->instructions;
+  g_ir_declaration_maps[slot].instruction_count = function->instruction_count;
+  return slot;
+}
+
+static size_t ir_declaration_map_slot(const IRFunction *function) {
+  for (size_t i = 0; i < IR_DECLARATION_MAP_SLOTS; i++) {
+    if (g_ir_declaration_maps[i].function == function &&
+        g_ir_declaration_maps[i].instructions == function->instructions &&
+        g_ir_declaration_maps[i].instruction_count ==
+            function->instruction_count) {
+      return i;
+    }
+  }
+  return ir_declaration_map_build(function);
+}
+
+static const IRInstruction *ir_declaration_map_find(const IRFunction *function,
+                                                    const char *symbol_name,
+                                                    int symbols_only) {
+  size_t slot = ir_declaration_map_slot(function);
+  size_t mask;
+  size_t bucket;
+
+  if (slot >= IR_DECLARATION_MAP_SLOTS ||
+      !g_ir_declaration_maps[slot].buckets) {
+    return NULL;
+  }
+  mask = g_ir_declaration_maps[slot].bucket_count - 1;
+  bucket = ir_declaration_name_hash(symbol_name) & mask;
+  while (g_ir_declaration_maps[slot].buckets[bucket].any) {
+    unsigned found = symbols_only
+                         ? g_ir_declaration_maps[slot].buckets[bucket].symbol
+                         : g_ir_declaration_maps[slot].buckets[bucket].any;
+    const IRInstruction *held =
+        &function->instructions
+             [g_ir_declaration_maps[slot].buckets[bucket].any - 1];
+
+    if (held->dest.name && strcmp(held->dest.name, symbol_name) == 0) {
+      if (!found || found > function->instruction_count) {
+        return NULL;
+      }
+      held = &function->instructions[found - 1];
+      return ir_declaration_names(held, symbol_name, symbols_only) ? held
+                                                                   : NULL;
+    }
+    bucket = (bucket + 1) & mask;
+  }
+  return NULL;
+}
+
 /* Dead instructions are retired by turning them into NOPs, so a function that
  * has been through the pipeline is close to half empty and every later pass
  * still walks the holes. Drop the ones that carry nothing: a NOP with text is a
@@ -5396,6 +5539,18 @@ const IRInstruction *ir_function_find_declaration(const IRFunction *function,
         &function->instructions[g_ir_declaration_hints[slot].index];
     if (ir_declaration_names(hinted, symbol_name, symbols_only)) {
       return hinted;
+    }
+  }
+
+  if (function->instruction_count >= IR_DECLARATION_MAP_MIN_BODY) {
+    const IRInstruction *found =
+        ir_declaration_map_find(function, symbol_name, symbols_only);
+
+    if (found) {
+      g_ir_declaration_hints[slot].function = function;
+      g_ir_declaration_hints[slot].index =
+          (size_t)(found - function->instructions);
+      return found;
     }
   }
 
