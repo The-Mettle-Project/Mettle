@@ -133,11 +133,11 @@ static void string_intern_maybe_grow(void) {
       StringInternEntry *next = entry->next;
 
       size_t cb =
-          string_intern_hash_bytes(entry->value, entry->length) % new_count;
+          string_intern_hash_bytes(entry->value, entry->length) & (new_count - 1);
       entry->next = new_content[cb];
       new_content[cb] = entry;
 
-      size_t pb = string_intern_hash_ptr(entry->value) % new_count;
+      size_t pb = string_intern_hash_ptr(entry->value) & (new_count - 1);
       entry->ptr_next = new_ptr[pb];
       new_ptr[pb] = entry;
 
@@ -162,7 +162,7 @@ const char *string_intern_n(const char *value, size_t length) {
   }
 
   size_t hash = string_intern_hash_bytes(value, length);
-  size_t bucket = hash % g_string_intern_bucket_count;
+  size_t bucket = hash & (g_string_intern_bucket_count - 1);
   StringInternEntry *entry = g_string_intern_buckets[bucket];
   while (entry) {
     if (entry->length == length && memcmp(entry->value, value, length) == 0) {
@@ -190,7 +190,7 @@ const char *string_intern_n(const char *value, size_t length) {
   g_string_intern_buckets[bucket] = entry;
 
   size_t ptr_bucket =
-      string_intern_hash_ptr(copy) % g_string_intern_bucket_count;
+      string_intern_hash_ptr(copy) & (g_string_intern_bucket_count - 1);
   entry->ptr_next = g_string_intern_ptr_buckets[ptr_bucket];
   g_string_intern_ptr_buckets[ptr_bucket] = entry;
 
@@ -213,7 +213,7 @@ int string_is_interned(const char *value) {
   }
 
   size_t ptr_bucket =
-      string_intern_hash_ptr(value) % g_string_intern_bucket_count;
+      string_intern_hash_ptr(value) & (g_string_intern_bucket_count - 1);
   StringInternEntry *entry = g_string_intern_ptr_buckets[ptr_bucket];
   while (entry) {
     if (entry->value == value) {
