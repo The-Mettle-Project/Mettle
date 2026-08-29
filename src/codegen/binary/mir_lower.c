@@ -600,6 +600,7 @@ static MtlcType *mir_local_or_param_type(CodeGenerator *g,
   }
   for (size_t i = 0; i < ir_function->parameter_count; i++) {
     if (ir_function->parameter_names && ir_function->parameter_names[i] &&
+        ir_function->parameter_names[i][0] == name[0] &&
         strcmp(ir_function->parameter_names[i], name) == 0) {
       if (is_param_out) {
         *is_param_out = 1;
@@ -610,11 +611,12 @@ static MtlcType *mir_local_or_param_type(CodeGenerator *g,
           0);
     }
   }
-  for (size_t i = 0; i < ir_function->instruction_count; i++) {
-    const IRInstruction *in = &ir_function->instructions[i];
-    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name &&
-        strcmp(in->dest.name, name) == 0 && in->text) {
-      return code_generator_binary_get_resolved_type(g, in->text, 0);
+  {
+    const IRInstruction *declaration =
+        ir_function_find_declaration(ir_function, name, 0);
+
+    if (declaration) {
+      return code_generator_binary_get_resolved_type(g, declaration->text, 0);
     }
   }
   return NULL;

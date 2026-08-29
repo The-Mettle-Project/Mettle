@@ -93,7 +93,7 @@ static long long *re_map_slot(REMap *map, const char *key, int create) {
       map->count++;
       return &map->values[slot];
     }
-    if (strcmp(map->keys[slot], key) == 0) {
+    if (map->keys[slot][0] == key[0] && strcmp(map->keys[slot], key) == 0) {
       return &map->values[slot];
     }
     slot = (slot + 1) & mask;

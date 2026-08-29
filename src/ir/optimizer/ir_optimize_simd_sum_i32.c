@@ -6,19 +6,10 @@
 
 const char *ir_function_local_declared_type(const IRFunction *function,
                                                    const char *symbol_name) {
-  if (!function || !symbol_name) {
-    return NULL;
-  }
+  const IRInstruction *declaration =
+      ir_function_find_declaration(function, symbol_name, 1);
 
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_DECLARE_LOCAL &&
-        ir_operand_is_symbol_named(&ins->dest, symbol_name) && ins->text) {
-      return ins->text;
-    }
-  }
-
-  return NULL;
+  return declaration ? declaration->text : NULL;
 }
 
 int ir_function_symbol_is_parameter(const IRFunction *function,

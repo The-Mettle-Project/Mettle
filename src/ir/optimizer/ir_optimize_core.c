@@ -73,7 +73,8 @@ static int ir_name_map_find(const IRNameMap *map, const char *from) {
     size_t b = mettle_fnv1a_hash(from) & (map->bucket_count - 1);
     while (map->buckets[b]) {
       size_t i = map->buckets[b] - 1;
-      if (map->items[i].from && strcmp(map->items[i].from, from) == 0) {
+      if (map->items[i].from && map->items[i].from[0] == from[0] &&
+          strcmp(map->items[i].from, from) == 0) {
         return (int)i;
       }
       b = (b + 1) & (map->bucket_count - 1);
@@ -82,7 +83,8 @@ static int ir_name_map_find(const IRNameMap *map, const char *from) {
   }
 
   for (size_t i = 0; i < map->count; i++) {
-    if (map->items[i].from && strcmp(map->items[i].from, from) == 0) {
+    if (map->items[i].from && map->items[i].from[0] == from[0] &&
+        strcmp(map->items[i].from, from) == 0) {
       return (int)i;
     }
   }
@@ -771,7 +773,8 @@ static int ir_temp_value_map_find(const IRTempValueMap *map, const char *name) {
   if (!map->ix) {
     /* Allocation failed: stay correct via the linear scan. */
     for (size_t i = 0; i < map->count; i++) {
-      if (map->items[i].name && strcmp(map->items[i].name, name) == 0) {
+      if (map->items[i].name && map->items[i].name[0] == name[0] &&
+          strcmp(map->items[i].name, name) == 0) {
         return (int)i;
       }
     }
@@ -784,6 +787,7 @@ static int ir_temp_value_map_find(const IRTempValueMap *map, const char *name) {
     if (map->ix[b] != IR_TVM_TOMB) {
       size_t slot = (size_t)map->ix[b] - 1;
       if (slot < map->count && map->items[slot].name &&
+          map->items[slot].name[0] == name[0] &&
           strcmp(map->items[slot].name, name) == 0) {
         return (int)slot;
       }
@@ -2168,7 +2172,8 @@ static int ir_temp_use_map_find(const IRTempUseMap *map, const char *name) {
   size_t h = mettle_fnv1a_hash(name) & mask;
   while (map->hash[h] != 0) {
     size_t idx = map->hash[h] - 1;
-    if (map->items[idx].name && strcmp(map->items[idx].name, name) == 0) {
+    if (map->items[idx].name && map->items[idx].name[0] == name[0] &&
+        strcmp(map->items[idx].name, name) == 0) {
       return (int)idx;
     }
     h = (h + 1) & mask;

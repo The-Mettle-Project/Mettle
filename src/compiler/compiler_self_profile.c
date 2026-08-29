@@ -12,7 +12,8 @@
 #include <dbghelp.h>
 #include <stdint.h>
 
-#define MTLC_SELF_PROFILE_CAPACITY (1u << 21)
+#define MTLC_SELF_PROFILE_CAPACITY (1u << 18)
+#define MTLC_SELF_PROFILE_STACK_WORDS 10
 #define MTLC_SELF_PROFILE_SYM_NAME 512
 #define MTLC_SELF_PROFILE_REPORT_ROWS 45
 
@@ -22,7 +23,7 @@ typedef struct {
 } MtlcSelfProfileEntry;
 
 static unsigned long long *g_self_profile_addresses;
-static unsigned long long *g_self_profile_callers;
+static unsigned long long *g_self_profile_stacks;
 static volatile long g_self_profile_used;
 static volatile long g_self_profile_stop;
 static HANDLE g_self_profile_thread;
@@ -65,14 +66,19 @@ static DWORD WINAPI mettle_self_profile_sampler(LPVOID unused) {
 
     slot = InterlockedIncrement(&g_self_profile_used) - 1;
     if (slot < (long)MTLC_SELF_PROFILE_CAPACITY - 1) {
-      unsigned long long caller = 0;
       SIZE_T read = 0;
 
-      ReadProcessMemory(GetCurrentProcess(),
-                        (LPCVOID)(ULONG_PTR)(context.Rbp + 8), &caller,
-                        sizeof(caller), &read);
       g_self_profile_addresses[slot] = (unsigned long long)context.Rip;
-      g_self_profile_callers[slot] = read == sizeof(caller) ? caller : 0;
+      if (!ReadProcessMemory(
+              GetCurrentProcess(), (LPCVOID)(ULONG_PTR)context.Rsp,
+              &g_self_profile_stacks[(size_t)slot *
+                                     MTLC_SELF_PROFILE_STACK_WORDS],
+              MTLC_SELF_PROFILE_STACK_WORDS * sizeof(unsigned long long),
+              &read)) {
+        memset(&g_self_profile_stacks[(size_t)slot *
+                                      MTLC_SELF_PROFILE_STACK_WORDS],
+               0, MTLC_SELF_PROFILE_STACK_WORDS * sizeof(unsigned long long));
+      }
     } else {
       g_self_profile_missed++;
     }
@@ -99,10 +105,12 @@ void mettle_compiler_self_profile_start(void) {
   g_self_profile_addresses = (unsigned long long *)VirtualAlloc(
       NULL, (SIZE_T)MTLC_SELF_PROFILE_CAPACITY * sizeof(unsigned long long),
       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-  g_self_profile_callers = (unsigned long long *)VirtualAlloc(
-      NULL, (SIZE_T)MTLC_SELF_PROFILE_CAPACITY * sizeof(unsigned long long),
+  g_self_profile_stacks = (unsigned long long *)VirtualAlloc(
+      NULL,
+      (SIZE_T)MTLC_SELF_PROFILE_CAPACITY * MTLC_SELF_PROFILE_STACK_WORDS *
+          sizeof(unsigned long long),
       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-  if (!g_self_profile_addresses || !g_self_profile_callers) {
+  if (!g_self_profile_addresses || !g_self_profile_stacks) {
     return;
   }
   if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
@@ -170,8 +178,13 @@ static void mettle_self_profile_dump(long taken) {
   }
   fprintf(out, "module %llx\n", base);
   for (long i = 0; i < taken; i++) {
-    fprintf(out, "%llx %llx\n", g_self_profile_addresses[i],
-            g_self_profile_callers[i]);
+    fprintf(out, "%llx", g_self_profile_addresses[i]);
+    for (int w = 0; w < MTLC_SELF_PROFILE_STACK_WORDS; w++) {
+      fprintf(out, " %llx",
+              g_self_profile_stacks[(size_t)i * MTLC_SELF_PROFILE_STACK_WORDS +
+                                    w]);
+    }
+    fprintf(out, "\n");
   }
   fclose(out);
 }

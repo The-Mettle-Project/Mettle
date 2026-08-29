@@ -102,7 +102,7 @@ int code_generator_binary_compare_true_cmov(const char *op,
 int code_generator_binary_operand_uses_temp(const IROperand *operand,
                                                    const char *name) {
   return operand && operand->kind == IR_OPERAND_TEMP && operand->name && name &&
-         strcmp(operand->name, name) == 0;
+         operand->name[0] == name[0] && strcmp(operand->name, name) == 0;
 }
 
 int code_generator_binary_instruction_temp_use_count(

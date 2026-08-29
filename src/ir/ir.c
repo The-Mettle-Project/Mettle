@@ -774,18 +774,6 @@ void ir_operand_destroy(IROperand *operand) {
   case IR_OPERAND_SYMBOL:
   case IR_OPERAND_STRING:
   case IR_OPERAND_LABEL:
-    /* Recognizer passes routinely cache an operand's name and keep using it
-     * while they build a replacement. If one is still held when the operand
-     * dies, poisoning turns a silent read of recycled heap into a name that
-     * cannot be mistaken for anything else. Without this the same defect
-     * surfaces as whatever small allocation happens to land in the freed slot
-     * -- a single character, a stray operator -- which reproduces perhaps one
-     * run in four and reads like a backend bug.
-     *
-     * Opt-in (-DMTLC_POISON_FREED_OPERANDS) so the default build provably pays
-     * nothing for it. Turn it on when a nondeterministic "Unknown IR temp"
-     * appears: it makes that whole class of defect reproduce every run, with a
-     * name no legitimate operand could have. */
 #ifdef MTLC_POISON_FREED_OPERANDS
     if (operand->name && !string_is_interned(operand->name)) {
       memset(operand->name, 0xA5, strlen(operand->name));
@@ -5316,6 +5304,65 @@ int ir_init_image_is_all_zero(const IRModuleSymbol *symbol) {
     }
   }
   return 1;
+}
+
+#define IR_DECLARATION_HINT_SLOTS 8192u
+
+static struct {
+  const IRFunction *function;
+  const char *symbol_name;
+  size_t index;
+} g_ir_declaration_hints[IR_DECLARATION_HINT_SLOTS];
+
+static size_t ir_declaration_hint_slot(const IRFunction *function,
+                                       const char *symbol_name,
+                                       int symbols_only) {
+  size_t mixed = (size_t)(const void *)function * 0x9e3779b97f4a7c15ull;
+  mixed ^= (size_t)(const void *)symbol_name * 0xff51afd7ed558ccdull;
+  mixed ^= (size_t)symbols_only * 0xd6e8feb86659fd93ull;
+  return (mixed >> 17) & (IR_DECLARATION_HINT_SLOTS - 1u);
+}
+
+static int ir_declaration_names(const IRInstruction *instruction,
+                                const char *symbol_name, int symbols_only) {
+  return instruction->op == IR_OP_DECLARE_LOCAL && instruction->text &&
+         instruction->dest.name &&
+         (!symbols_only || instruction->dest.kind == IR_OPERAND_SYMBOL) &&
+         instruction->dest.name[0] == symbol_name[0] &&
+         strcmp(instruction->dest.name, symbol_name) == 0;
+}
+
+const IRInstruction *ir_function_find_declaration(const IRFunction *function,
+                                                  const char *symbol_name,
+                                                  int symbols_only) {
+  size_t slot;
+
+  if (!function || !symbol_name) {
+    return NULL;
+  }
+
+  slot = ir_declaration_hint_slot(function, symbol_name, symbols_only);
+  if (g_ir_declaration_hints[slot].function == function &&
+      g_ir_declaration_hints[slot].symbol_name == symbol_name &&
+      g_ir_declaration_hints[slot].index < function->instruction_count) {
+    const IRInstruction *hinted =
+        &function->instructions[g_ir_declaration_hints[slot].index];
+    if (ir_declaration_names(hinted, symbol_name, symbols_only)) {
+      return hinted;
+    }
+  }
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (ir_declaration_names(instruction, symbol_name, symbols_only)) {
+      g_ir_declaration_hints[slot].function = function;
+      g_ir_declaration_hints[slot].symbol_name = symbol_name;
+      g_ir_declaration_hints[slot].index = i;
+      return instruction;
+    }
+  }
+
+  return NULL;
 }
 
 int ir_program_eliminate_dead_functions(IRProgram *program, int keep_exports) {

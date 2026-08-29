@@ -1858,7 +1858,7 @@ int ir_float_divide_by_power_of_two_pass(IRFunction *function, int *changed) {
     if (!product) {
       return 0;
     }
-    free(instruction->text);
+    mettle_free_string(instruction->text);
     instruction->text = product;
     instruction->rhs.float_value = reciprocal;
     if (changed) {

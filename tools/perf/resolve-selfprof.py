@@ -67,8 +67,14 @@ for line in open(samples):
         foreign += 1
         continue
     flat[here] += 1
-    if callers_of and here == callers_of and len(line) > 1:
-        callers[name_of(int(line[1], 16), module) or "<unknown>"] += 1
+    if callers_of and here == callers_of:
+        for word in line[1:]:
+            found = name_of(int(word, 16), module)
+            if found and found != here:
+                callers[found] += 1
+                break
+        else:
+            callers["<unknown>"] += 1
 
 print(f"{total} samples ({foreign} outside the compiler image)")
 for name, count in flat.most_common(rows):

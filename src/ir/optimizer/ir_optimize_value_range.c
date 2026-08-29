@@ -326,8 +326,9 @@ static int vr_find_block_writer(const IRFunction *fn, size_t at,
     if (in->op == IR_OP_LABEL) {
       return 0;
     }
-    if (ir_instruction_writes_destination(in) && in->dest.kind == kind &&
-        in->dest.name && name && strcmp(in->dest.name, name) == 0) {
+    if (in->dest.kind == kind && in->dest.name && name &&
+        in->dest.name[0] == name[0] && strcmp(in->dest.name, name) == 0 &&
+        ir_instruction_writes_destination(in)) {
       *out_index = i;
       return 1;
     }
