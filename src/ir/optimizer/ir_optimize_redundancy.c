@@ -1586,12 +1586,6 @@ static int sel_match_at(const IRFunction *function, size_t branch,
     }
   }
 
-  /* Room for the compare, the two instructions that build the selected
-   * constant, and the arm itself, all inside the slots the arms occupied. */
-  if (else_label - branch < then_arm.count + 3) {
-    return 0;
-  }
-
   out->branch = branch;
   out->else_label = else_label;
   out->end_label = end_label;
@@ -1603,8 +1597,44 @@ static int sel_match_at(const IRFunction *function, size_t branch,
   return 1;
 }
 
-static void sel_apply(IRFunction *function, const REDefs *defs,
-                      const SelMatch *m, int *changed) {
+/* The rewrite is written into the slots the diamond already occupies. When the
+ * arms are tight there is no room for the three instructions that build the
+ * selected constant, so open it here: the spare slots the matcher used to
+ * insist on are only present when some earlier pass happened to retire
+ * something nearby, which is not a property of the shape being matched.
+ *
+ * Every index the caller holds moves, `defs` included, so the caller is told
+ * to stop and let the pass run again against a rebuilt one. */
+static int sel_open_room(IRFunction *function, SelMatch *m, size_t body_count) {
+  size_t needed = body_count + 3;
+  size_t have = m->else_label - m->branch;
+  size_t extra;
+  IRInstruction nop = {0};
+
+  if (have >= needed) {
+    return 0;
+  }
+  extra = needed - have;
+  nop.op = IR_OP_NOP;
+  nop.location = function->instructions[m->branch].location;
+  for (size_t i = 0; i < extra; i++) {
+    if (!ir_function_insert_instruction(function, m->branch, &nop)) {
+      return -1;
+    }
+  }
+  m->else_label += extra;
+  m->end_label += extra;
+  for (size_t k = 0; k < m->then_arm.count; k++) {
+    m->then_arm.index[k] += extra;
+  }
+  for (size_t k = 0; k < m->else_arm.count; k++) {
+    m->else_arm.index[k] += extra;
+  }
+  return 1;
+}
+
+static int sel_apply(IRFunction *function, const REDefs *defs, SelMatch *m,
+                     int *changed) {
   static int counter;
   IRInstruction body[SEL_MAX_ARM];
   IRInstruction *br = &function->instructions[m->branch];
@@ -1613,6 +1643,7 @@ static void sel_apply(IRFunction *function, const REDefs *defs,
   int cond_is_boolean = sel_condition_is_boolean(function, defs, &br->lhs);
   long long delta = m->then_const - m->else_const;
   size_t body_count = m->then_arm.count;
+  int opened;
   size_t at;
   char sel_name[48];
   char scaled_name[48];
@@ -1622,6 +1653,13 @@ static void sel_apply(IRFunction *function, const REDefs *defs,
   snprintf(scaled_name, sizeof(scaled_name), "__fselm_%d", counter);
   snprintf(offset_name, sizeof(offset_name), "__fselk_%d", counter);
   counter++;
+
+  /* Everything read out of `defs` above used the positions as they are now. */
+  opened = sel_open_room(function, m, body_count);
+  if (opened < 0) {
+    ir_operand_destroy(&cond);
+    return -1;
+  }
 
   /* Move the arm out before its slots are reused. */
   for (size_t k = 0; k < body_count; k++) {
@@ -1680,6 +1718,7 @@ static void sel_apply(IRFunction *function, const REDefs *defs,
   if (changed) {
     *changed = 1;
   }
+  return opened;
 }
 
 int ir_select_adjacent_field_pass(IRFunction *function, int *changed) {
@@ -1702,7 +1741,12 @@ int ir_select_adjacent_field_pass(IRFunction *function, int *changed) {
         continue;
       }
       if (sel_match_at(function, i, &match)) {
-        sel_apply(function, &defs, &match, changed);
+        if (sel_apply(function, &defs, &match, changed) != 0) {
+          /* Positions moved under `defs`; every later match here would read
+           * the wrong definition. Stop, and the driver offers the pass the
+           * body again with a rebuilt one. */
+          break;
+        }
         i = match.end_label;
       }
     }

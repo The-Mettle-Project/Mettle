@@ -1462,14 +1462,54 @@ static int ir_accum_condition_is_nonzero_load(const IRFunction *function,
 
 /* The NOP nearest the branch, searching back to the loop header. Returns 0
  * when the region holds none. */
+/* A retired slot inside the loop body to put the comparison back into, at or
+ * after the point `cond` is computed: the rewrite makes the multiply read the
+ * comparison's result, so a slot ahead of the load that defines `cond` would
+ * compare whatever the previous iteration left there. */
+static size_t ir_accum_condition_defined_at(const IRFunction *function,
+                                            size_t header, size_t before,
+                                            const char *cond) {
+  for (size_t i = before; i > header; i--) {
+    const IRInstruction *ins = &function->instructions[i - 1];
+
+    if (ir_instruction_writes_destination(ins) &&
+        ir_operand_is_temp_named(&ins->dest, cond)) {
+      return i - 1;
+    }
+  }
+  return header;
+}
+
 static size_t ir_accum_free_nop_slot(const IRFunction *function, size_t header,
-                                     size_t before) {
-  for (size_t i = before; i > header + 1; i--) {
+                                     size_t before, const char *cond) {
+  size_t defined_at =
+      ir_accum_condition_defined_at(function, header, before, cond);
+
+  for (size_t i = before; i > defined_at + 1; i--) {
     if (function->instructions[i - 1].op == IR_OP_NOP) {
       return i - 1;
     }
   }
   return 0;
+}
+
+/* No retired slot to put the comparison back into, so make one. The loop's own
+ * indices move with it, which is why the caller hands them over to be
+ * adjusted. */
+static size_t ir_accum_open_nop_slot(IRFunction *function, size_t header,
+                                     size_t *before, size_t *latch,
+                                     const char *cond) {
+  size_t at = ir_accum_condition_defined_at(function, header, *before, cond) + 1;
+  IRInstruction nop = {0};
+
+  nop.op = IR_OP_NOP;
+  nop.location = function->instructions[*before].location;
+  if (!ir_function_insert_instruction(function, at, &nop)) {
+    return 0;
+  }
+  (*before)++;
+  (*latch)++;
+  return at;
 }
 
 /* Structural equality of two operands, and of the chains that compute two
@@ -1586,6 +1626,12 @@ static int ir_accum_label_is_reached(const IRFunction *function,
  * The rewrite lands in the slots the branch and its jump occupied, so nothing
  * moves and no instruction is inserted. */
 int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
+  /* The two temporaries below used to be named after the instruction index
+   * they were written at. A name is only unique while positions hold still,
+   * and any pass that inserts or retires ahead of this one moves them, so two
+   * unrelated values could end up sharing a name and then a home. */
+  static unsigned minted;
+
   if (!function) {
     return 0;
   }
@@ -1621,9 +1667,15 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
         if (!ir_accum_condition_is_nonzero_load(function, i, cond)) {
           continue;
         }
-        rematerialize_at = ir_accum_free_nop_slot(function, header, i);
+        rematerialize_at = ir_accum_free_nop_slot(function, header, i, cond);
         if (!rematerialize_at) {
-          continue;
+          rematerialize_at =
+              ir_accum_open_nop_slot(function, header, &i, &latch, cond);
+          if (!rematerialize_at) {
+            continue;
+          }
+          br = &function->instructions[i];
+          cond = br->lhs.name;
         }
       }
       /* The arm writes one symbol, the accumulator. Everything else in it must
@@ -1720,7 +1772,7 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
          * multiply by that instead of by the raw loaded value. */
         if (rematerialize_at) {
           IRInstruction cmp = {0};
-          snprintf(boolean, sizeof(boolean), ".ifne%zu", rematerialize_at);
+          snprintf(boolean, sizeof(boolean), ".ifne%u", minted++);
           cmp.op = IR_OP_BINARY;
           cmp.location = function->instructions[i].location;
           cmp.text = mettle_strdup("!=");
@@ -1754,7 +1806,7 @@ int ir_if_convert_accumulate_pass(IRFunction *function, int *changed) {
           char product[64];
           IRInstruction mul = {0};
           IRInstruction sum = {0};
-          snprintf(product, sizeof(product), ".ifacc%zu", add_index);
+          snprintf(product, sizeof(product), ".ifacc%u", minted++);
           mul.op = IR_OP_BINARY;
           mul.location = add->location;
           mul.text = mettle_strdup("*");

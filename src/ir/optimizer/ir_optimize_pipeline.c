@@ -556,6 +556,12 @@ static int ir_run_fixpoint_stage(IRFunction *function,
     int changed = 0;
     IROptFunctionFeatures features;
 
+    /* Retiring an instruction leaves a NOP behind, and by the third iteration
+     * of a big body most of it is holes that every pass below still walks.
+     * Positions move, so every pass has to be offered the body again. */
+    if (ir_function_drop_dead_nops(function) > 0) {
+      version++;
+    }
     mettle_compiler_ctx_set_fixpoint_iteration(iteration + 1);
     ir_collect_function_features(function, &features);
     unsigned feature_flags = ir_opt_feature_flags(&features);

@@ -1696,8 +1696,7 @@ static int ir_or_chain_to_bitset_once(IRFunction *function, int *changed,
         continue;
       }
     }
-    if (key_count < IR_BITSET_MIN_KEYS ||
-        branch - i + 1 < IR_BITSET_SLOTS) {
+    if (key_count < IR_BITSET_MIN_KEYS) {
       continue;
     }
     for (size_t k = 0; k < key_count; k++) {
@@ -1707,11 +1706,31 @@ static int ir_or_chain_to_bitset_once(IRFunction *function, int *changed,
       }
     }
     {
+      /* Both are read out of the array before anything is inserted into it:
+       * the chain is rewritten in place, and when it is shorter than the
+       * replacement the room has to be opened first. The old alternative was
+       * to decline, which made the fold depend on how many neighbouring
+       * instructions some earlier pass happened to retire. */
       IROperand value = ir_operand_copy(&first->lhs);
       char *miss = mettle_strdup(function->instructions[branch].text);
-      int ok = value.name && miss &&
-               ir_bitset_emit(function, i, branch, &value, mask, max_key, miss,
-                              changed);
+      size_t have = branch - i + 1;
+      int ok = value.name && miss != NULL;
+
+      if (ok && have < IR_BITSET_SLOTS) {
+        size_t extra = IR_BITSET_SLOTS - have;
+        IRInstruction nop = {0};
+
+        nop.op = IR_OP_NOP;
+        nop.location = function->instructions[i].location;
+        for (size_t k = 0; k < extra && ok; k++) {
+          ok = ir_function_insert_instruction(function, i, &nop);
+        }
+        if (ok) {
+          branch += extra;
+        }
+      }
+      ok = ok && ir_bitset_emit(function, i, branch, &value, mask, max_key,
+                                miss, changed);
       ir_operand_destroy(&value);
       mettle_free_string(miss);
       ir_temp_use_map_destroy(&uses);
