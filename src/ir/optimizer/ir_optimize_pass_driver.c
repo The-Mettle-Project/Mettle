@@ -1,5 +1,6 @@
 #include "ir_optimize_internal.h"
 #include "../ir_verify.h"
+#include "../../common.h"
 
 #include <time.h>
 
@@ -40,13 +41,8 @@ static struct {
 } g_ir_named_ms[IR_PASS_TIME_NAMED_MAX];
 static size_t g_ir_named_count = 0;
 
-/* Raw clock() ticks, not a converted figure: clock()'s units do not reliably
- * match CLOCKS_PER_SEC across the toolchains this builds with (the owned
- * freestanding runtime returns microseconds while mingw reports 1000), and a
- * number in the wrong units is worse than none. The same policy the safety
- * resolver already follows. Runs are comparable, which is what this is for. */
 static double ir_pass_now_ticks(void) {
-  return (double)clock();
+  return mettle_now_ms();
 }
 
 static void ir_pass_time_add_named(const char *name, double ms) {
@@ -83,7 +79,7 @@ void ir_pass_time_report(void) {
   if (!ir_pass_time_enabled()) {
     return;
   }
-  fprintf(stderr, "-- IR pass times (cumulative clock() ticks) --\n");
+  fprintf(stderr, "-- IR pass times (cumulative ms) --\n");
   for (int dumped = 0; dumped < 40; dumped++) {
     double best = 0.5; /* drop sub-tick noise */
     int best_fix = -1;

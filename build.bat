@@ -83,7 +83,8 @@ REM handler unwinds x64 frames through .pdata/.xdata, so dropping them blinds
 REM the ICE backtrace, and gcc 15.2 segfaults in the -gcodeview emitter when
 REM -fno-asynchronous-unwind-tables removes them. .pdata is inert data: it
 REM pulls in no unwinder, so the owned-runtime audit below is unaffected.
-set CFLAGS=-Wall -Wextra -std=c99 -g -O2 -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer -ffreestanding -fno-builtin -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -include src/runtime/host_redirect.h
+if not defined METTLE_HOST_OPT set "METTLE_HOST_OPT=-O2"
+set CFLAGS=-Wall -Wextra -std=c99 -g %METTLE_HOST_OPT% -D_GNU_SOURCE -Isrc -Iinclude -fno-omit-frame-pointer -ffreestanding -fno-builtin -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -include src/runtime/host_redirect.h
 set RUNTIME_CFLAGS=-std=c99 -O2 -D_GNU_SOURCE -Isrc -ffreestanding -fno-builtin -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -mno-stack-arg-probe -ffunction-sections -fdata-sections -fno-jump-tables
 REM This build is mingw-ABI throughout: GNU ld, ar/nm, --entry, and the
 REM __imp_-only archive audit. A stock LLVM install defaults to

@@ -49,4 +49,6 @@ void mettle_set_error(char **dest, const char *fmt, ...);
 void mettle_free_string(char *str);
 void mettle_free_string_array(char **values, size_t count);
 
+double mettle_now_ms(void);
+
 #endif

@@ -36,6 +36,7 @@ char *mtlc_host_strtok(char *, const char *);
 char *mtlc_host_strdup(const char *);
 char *mtlc_host_strerror(int);
 
+void mtlc_host_alloc_report(void);
 void *mtlc_host_malloc(size_t);
 void *mtlc_host_calloc(size_t, size_t);
 void *mtlc_host_realloc(void *, size_t);

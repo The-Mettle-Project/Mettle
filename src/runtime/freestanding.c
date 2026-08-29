@@ -32,6 +32,11 @@ int isspace(int character);
 int tolower(int character);
 void *malloc(mt_size size);
 void free(void *memory);
+struct MtFile;
+static int mt_stream_flush(struct MtFile *file);
+static void mt_open_write_track(struct MtFile *file);
+static void mt_open_write_forget(struct MtFile *file);
+static void mt_flush_open_streams(void);
 
 /* read_buffer is allocated on the first buffered read and only for a file
  * opened read-only, which is what lets fgets stop asking the kernel for one
@@ -43,17 +48,22 @@ typedef struct MtFile {
   unsigned char *read_buffer;
   int read_fill;
   int read_pos;
+  unsigned char *write_buffer;
+  int write_fill;
+  struct MtFile *next_open;
 } MtFile;
 
 #define MT_FILE_READ 1u
 #define MT_FILE_WRITE 2u
 #define MT_FILE_BUFFERED 4u
+#define MT_FILE_WRITE_BUFFERED 8u
 #define MT_FILE_STANDARD 0x80000000u
 #define MT_FILE_BUFFER_BYTES 8192
+#define MT_FILE_WRITE_BUFFER_BYTES 65536
 
-static MtFile mt_stdin_file = {0, MT_FILE_STANDARD | MT_FILE_READ, 0, 0, 0, 0};
-static MtFile mt_stdout_file = {1, MT_FILE_STANDARD | MT_FILE_WRITE, 0, 0, 0, 0};
-static MtFile mt_stderr_file = {2, MT_FILE_STANDARD | MT_FILE_WRITE, 0, 0, 0, 0};
+static MtFile mt_stdin_file = {0, MT_FILE_STANDARD | MT_FILE_READ, 0, 0, 0, 0, 0, 0, 0};
+static MtFile mt_stdout_file = {1, MT_FILE_STANDARD | MT_FILE_WRITE, 0, 0, 0, 0, 0, 0, 0};
+static MtFile mt_stderr_file = {2, MT_FILE_STANDARD | MT_FILE_WRITE, 0, 0, 0, 0, 0, 0, 0};
 #if defined(_WIN32)
 static int mt_errno_value;
 #else
@@ -313,6 +323,9 @@ static int mt_is_markdown_name(const char *name) {
 #define MT_DLLIMPORT __declspec(dllimport)
 #define MT_INVALID_HANDLE ((void *)(mt_i64)-1)
 #define MT_HEAP_ZERO_MEMORY 0x00000008u
+#define MT_MEM_COMMIT 0x00001000u
+#define MT_MEM_RESERVE 0x00002000u
+#define MT_PAGE_READWRITE 0x00000004u
 #define MT_STD_INPUT_HANDLE ((mt_u32)-10)
 #define MT_STD_OUTPUT_HANDLE ((mt_u32)-11)
 #define MT_STD_ERROR_HANDLE ((mt_u32)-12)
@@ -377,6 +390,8 @@ typedef struct MtFindData {
   char alternate_name[14];
 } MtFindData;
 
+MT_DLLIMPORT void *VirtualAlloc(void *address, mt_size size, mt_u32 type,
+                               mt_u32 protect);
 MT_DLLIMPORT void *GetProcessHeap(void);
 MT_DLLIMPORT void *HeapAlloc(void *heap, mt_u32 flags, mt_size bytes);
 MT_DLLIMPORT void *HeapReAlloc(void *heap, mt_u32 flags, void *memory,
@@ -783,13 +798,164 @@ static void *mt_windows_std_handle(MtFile *file) {
   return GetStdHandle(which);
 }
 
+#define MT_WIN_SUBCHUNK 65536u
+#define MT_WIN_COMMIT_GRANULE (1024u * 1024u)
+#define MT_WIN_ARENA_BYTES (1024u * 1024u * 1024u)
+#define MT_WIN_SUBCHUNK_COUNT (MT_WIN_ARENA_BYTES / MT_WIN_SUBCHUNK)
+#define MT_WIN_CLASS_COUNT 11
+#define MT_WIN_LARGE_MIN 16384u
+#define MT_WIN_CLASS_BYTES(c) ((mt_size)16 << (c))
+
+static unsigned char mt_win_subchunk_class[MT_WIN_SUBCHUNK_COUNT];
+static char *mt_win_arena_base;
+static char *mt_win_arena_end;
+static char *mt_win_subchunk_next;
+static char *mt_win_committed_end;
+static void *mt_win_free_list[MT_WIN_CLASS_COUNT];
+static char *mt_win_bump[MT_WIN_CLASS_COUNT];
+static mt_size mt_win_bump_left[MT_WIN_CLASS_COUNT];
+static volatile int mt_win_heap_lock;
+static int mt_win_arena_unavailable;
+
+static int mt_win_class_of(mt_size size) {
+  if (size <= 16) {
+    return 0;
+  }
+  return 60 - __builtin_clzll((mt_u64)size - 1);
+}
+
+__attribute__((noinline)) static void mt_win_heap_lock_contended(void) {
+  while (__atomic_exchange_n(&mt_win_heap_lock, 1, __ATOMIC_ACQUIRE)) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+  }
+}
+
+static void mt_win_heap_acquire(void) {
+  if (__atomic_exchange_n(&mt_win_heap_lock, 1, __ATOMIC_ACQUIRE)) {
+    mt_win_heap_lock_contended();
+  }
+}
+
+static void mt_win_heap_release(void) {
+  __atomic_store_n(&mt_win_heap_lock, 0, __ATOMIC_RELEASE);
+}
+
+__attribute__((noinline)) static char *mt_win_take_subchunk(mt_size count) {
+  mt_size span = count * MT_WIN_SUBCHUNK;
+  char *chunk;
+
+  if (!mt_win_arena_base) {
+    char *base;
+
+    if (mt_win_arena_unavailable) {
+      return MT_NULL;
+    }
+    base = (char *)VirtualAlloc(MT_NULL, MT_WIN_ARENA_BYTES, MT_MEM_RESERVE,
+                                MT_PAGE_READWRITE);
+    if (!base) {
+      mt_win_arena_unavailable = 1;
+      return MT_NULL;
+    }
+    mt_win_arena_base = base;
+    mt_win_arena_end = base + MT_WIN_ARENA_BYTES;
+    mt_win_subchunk_next = base;
+    mt_win_committed_end = base;
+  }
+
+  while (mt_win_subchunk_next + span > mt_win_committed_end) {
+    mt_size want = span > MT_WIN_COMMIT_GRANULE ? span : MT_WIN_COMMIT_GRANULE;
+
+    if (mt_win_committed_end + want > mt_win_arena_end) {
+      want = (mt_size)(mt_win_arena_end - mt_win_committed_end);
+    }
+    if (want < span ||
+        !VirtualAlloc(mt_win_committed_end, want, MT_MEM_COMMIT,
+                      MT_PAGE_READWRITE)) {
+      return MT_NULL;
+    }
+    mt_win_committed_end += want;
+  }
+
+  chunk = mt_win_subchunk_next;
+  mt_win_subchunk_next += span;
+  return chunk;
+}
+
+static void *mt_win_carve(int class_index) {
+  mt_size block = MT_WIN_CLASS_BYTES(class_index);
+  char *result;
+
+  if (mt_win_bump_left[class_index] < block) {
+    mt_size count = (block * 16 + MT_WIN_SUBCHUNK - 1) / MT_WIN_SUBCHUNK;
+    mt_size index;
+    char *chunk;
+
+    if (count == 0) {
+      count = 1;
+    }
+    chunk = mt_win_take_subchunk(count);
+    if (!chunk) {
+      return MT_NULL;
+    }
+    index = (mt_size)(chunk - mt_win_arena_base) / MT_WIN_SUBCHUNK;
+    for (mt_size i = 0; i < count; i++) {
+      mt_win_subchunk_class[index + i] = (unsigned char)class_index;
+    }
+    mt_win_bump[class_index] = chunk;
+    mt_win_bump_left[class_index] = count * MT_WIN_SUBCHUNK;
+  }
+
+  result = mt_win_bump[class_index];
+  mt_win_bump[class_index] = result + block;
+  mt_win_bump_left[class_index] -= block;
+  return result;
+}
+
+static int mt_win_owns(const void *memory) {
+  return (const char *)memory >= mt_win_arena_base &&
+         (const char *)memory < mt_win_arena_end;
+}
+
+static int mt_win_class_at(const void *memory) {
+  return (int)mt_win_subchunk_class[(mt_size)((const char *)memory -
+                                              mt_win_arena_base) /
+                                    MT_WIN_SUBCHUNK];
+}
+
 void *malloc(mt_size size) {
+  void *memory;
+  int class_index;
+
   if (size == 0) {
     size = 1;
   }
-  void *memory = HeapAlloc(GetProcessHeap(), 0, size);
+  if (size > MT_WIN_LARGE_MIN) {
+    memory = HeapAlloc(GetProcessHeap(), 0, size);
+    if (memory) {
+      mt_allocation_count++;
+    }
+    return memory;
+  }
+
+  class_index = mt_win_class_of(size);
+  mt_win_heap_acquire();
+  memory = mt_win_free_list[class_index];
   if (memory) {
-    __atomic_add_fetch(&mt_allocation_count, 1, __ATOMIC_RELAXED);
+    mt_win_free_list[class_index] = *(void **)memory;
+  } else {
+    memory = mt_win_carve(class_index);
+  }
+  if (memory) {
+    mt_allocation_count++;
+  }
+  mt_win_heap_release();
+  if (!memory) {
+    memory = HeapAlloc(GetProcessHeap(), 0, size);
+    if (memory) {
+      mt_allocation_count++;
+    }
   }
   return memory;
 }
@@ -802,18 +968,37 @@ void *calloc(mt_size count, mt_size size) {
   if (total == 0) {
     total = 1;
   }
-  void *memory = HeapAlloc(GetProcessHeap(), MT_HEAP_ZERO_MEMORY, total);
+  if (total > MT_WIN_LARGE_MIN) {
+    void *memory = HeapAlloc(GetProcessHeap(), MT_HEAP_ZERO_MEMORY, total);
+    if (memory) {
+      mt_allocation_count++;
+    }
+    return memory;
+  }
+
+  void *memory = malloc(total);
   if (memory) {
-    __atomic_add_fetch(&mt_allocation_count, 1, __ATOMIC_RELAXED);
+    memset(memory, 0, total);
   }
   return memory;
 }
 
 void free(void *memory) {
-  if (memory) {
-    __atomic_add_fetch(&mt_free_count, 1, __ATOMIC_RELAXED);
-    HeapFree(GetProcessHeap(), 0, memory);
+  if (!memory) {
+    return;
   }
+  if (mt_win_owns(memory)) {
+    int class_index = mt_win_class_at(memory);
+
+    mt_win_heap_acquire();
+    *(void **)memory = mt_win_free_list[class_index];
+    mt_win_free_list[class_index] = memory;
+    mt_free_count++;
+    mt_win_heap_release();
+    return;
+  }
+  mt_free_count++;
+  HeapFree(GetProcessHeap(), 0, memory);
 }
 
 void *realloc(void *memory, mt_size size) {
@@ -823,6 +1008,21 @@ void *realloc(void *memory, mt_size size) {
   if (size == 0) {
     free(memory);
     return MT_NULL;
+  }
+  if (mt_win_owns(memory)) {
+    mt_size held = MT_WIN_CLASS_BYTES(mt_win_class_at(memory));
+    void *replacement;
+
+    if (size <= held) {
+      return memory;
+    }
+    replacement = malloc(size);
+    if (!replacement) {
+      return MT_NULL;
+    }
+    memcpy(replacement, memory, held);
+    free(memory);
+    return replacement;
   }
   return HeapReAlloc(GetProcessHeap(), 0, memory, size);
 }
@@ -1119,10 +1319,19 @@ void *fopen(const char *path, const char *mode) {
   if (file->flags == MT_FILE_READ) {
     file->flags |= MT_FILE_BUFFERED;
   }
+  if (file->flags & MT_FILE_WRITE) {
+    file->flags |= MT_FILE_WRITE_BUFFERED;
+  }
   file->child_pid = 0;
   file->read_buffer = MT_NULL;
   file->read_fill = 0;
   file->read_pos = 0;
+  file->write_buffer = MT_NULL;
+  file->write_fill = 0;
+  file->next_open = MT_NULL;
+  if (file->flags & MT_FILE_WRITE_BUFFERED) {
+    mt_open_write_track(file);
+  }
   if (append) {
     SetFilePointerEx(handle, 0, MT_NULL, MT_FILE_END);
   }
@@ -1135,8 +1344,17 @@ int fclose(void *stream) {
       file == &mt_stderr_file) {
     return file ? 0 : -1;
   }
+  mt_open_write_forget(file);
+  if (mt_stream_flush(file) != 0) {
+    CloseHandle((void *)(mt_i64)file->handle);
+    free(file->read_buffer);
+    free(file->write_buffer);
+    free(file);
+    return -1;
+  }
   int result = CloseHandle((void *)(mt_i64)file->handle) ? 0 : -1;
   free(file->read_buffer);
+  free(file->write_buffer);
   free(file);
   return result;
 }
@@ -1241,7 +1459,10 @@ int mettle_rt_getmainargs(int *argc_out, char ***argv_out) {
   return 1;
 }
 
-MT_NORETURN void exit(int status) { ExitProcess((mt_u32)status); }
+MT_NORETURN void exit(int status) {
+  mt_flush_open_streams();
+  ExitProcess((mt_u32)status);
+}
 MT_NORETURN void _exit(int status) { ExitProcess((mt_u32)status); }
 
 static mt_size mt_windows_quoted_size(const char *text) {
@@ -1411,6 +1632,9 @@ void *popen(const char *command, const char *mode) {
   file->read_buffer = MT_NULL;
   file->read_fill = 0;
   file->read_pos = 0;
+  file->write_buffer = MT_NULL;
+  file->write_fill = 0;
+  file->next_open = MT_NULL;
   return file;
 }
 
@@ -2326,7 +2550,7 @@ void *malloc(mt_size size) {
   }
   base[0] = tag;
   base[1] = size;
-  __atomic_add_fetch(&mt_allocation_count, 1, __ATOMIC_RELAXED);
+  mt_allocation_count++;
   return base + 2;
 }
 
@@ -2349,7 +2573,7 @@ void free(void *memory) {
     return;
   }
   mt_u64 *base = (mt_u64 *)memory - 2;
-  __atomic_add_fetch(&mt_free_count, 1, __ATOMIC_RELAXED);
+  mt_free_count++;
   if (base[0] > MT_HEAP_CLASS_COUNT) {
     munmap(base, base[0]);
     return;
@@ -2426,11 +2650,19 @@ void *fopen(const char *path, const char *mode) {
     return MT_NULL;
   }
   file->handle = fd;
-  file->flags = flags == MT_O_RDONLY ? (MT_FILE_READ | MT_FILE_BUFFERED) : 0u;
+  file->flags = flags == MT_O_RDONLY
+                    ? (MT_FILE_READ | MT_FILE_BUFFERED)
+                    : (MT_FILE_READ | MT_FILE_WRITE | MT_FILE_WRITE_BUFFERED);
   file->child_pid = 0;
   file->read_buffer = MT_NULL;
   file->read_fill = 0;
   file->read_pos = 0;
+  file->write_buffer = MT_NULL;
+  file->write_fill = 0;
+  file->next_open = MT_NULL;
+  if (file->flags & MT_FILE_WRITE_BUFFERED) {
+    mt_open_write_track(file);
+  }
   return file;
 }
 
@@ -2440,10 +2672,13 @@ int fclose(void *stream) {
       file == &mt_stderr_file) {
     return file ? 0 : -1;
   }
+  mt_open_write_forget(file);
+  int flushed = mt_stream_flush(file);
   int result = close((int)file->handle);
   free(file->read_buffer);
+  free(file->write_buffer);
   free(file);
-  return result;
+  return flushed != 0 ? -1 : result;
 }
 
 int posix_get_errno(void) { return mt_errno_value; }
@@ -2989,6 +3224,7 @@ int posix_atomic_add_i32(volatile int *target, int value) {
 }
 
 MT_NORETURN void exit(int status) {
+  mt_flush_open_streams();
   mt_syscall6(MT_SYS_EXIT, status, 0, 0, 0, 0, 0);
   for (;;) {
   }
@@ -3104,6 +3340,9 @@ void *popen(const char *command, const char *mode) {
   file->read_buffer = MT_NULL;
   file->read_fill = 0;
   file->read_pos = 0;
+  file->write_buffer = MT_NULL;
+  file->write_fill = 0;
+  file->next_open = MT_NULL;
   return file;
 }
 
@@ -3153,6 +3392,9 @@ static mt_ssize mt_stream_read(MtFile *file, void *buffer, mt_size bytes) {
   unsigned char *out = (unsigned char *)buffer;
   mt_size done = 0;
 
+  if (file->write_fill > 0) {
+    mt_stream_flush(file);
+  }
   if (!(file->flags & MT_FILE_BUFFERED)) {
     return mt_file_read(file, buffer, bytes);
   }
@@ -3201,6 +3443,110 @@ static mt_ssize mt_stream_read(MtFile *file, void *buffer, mt_size bytes) {
   return (mt_ssize)done;
 }
 
+static MtFile *mt_open_write_files;
+static volatile int mt_open_write_lock;
+
+static void mt_open_write_track(struct MtFile *file) {
+  MtFile *stream = (MtFile *)file;
+
+  while (__atomic_exchange_n(&mt_open_write_lock, 1, __ATOMIC_ACQUIRE)) {
+  }
+  stream->next_open = mt_open_write_files;
+  mt_open_write_files = stream;
+  __atomic_store_n(&mt_open_write_lock, 0, __ATOMIC_RELEASE);
+}
+
+static void mt_open_write_forget(struct MtFile *file) {
+  MtFile *stream = (MtFile *)file;
+  MtFile **link;
+
+  while (__atomic_exchange_n(&mt_open_write_lock, 1, __ATOMIC_ACQUIRE)) {
+  }
+  link = &mt_open_write_files;
+  while (*link) {
+    if (*link == stream) {
+      *link = stream->next_open;
+      break;
+    }
+    link = &(*link)->next_open;
+  }
+  stream->next_open = MT_NULL;
+  __atomic_store_n(&mt_open_write_lock, 0, __ATOMIC_RELEASE);
+}
+
+static int mt_stream_flush(struct MtFile *file) {
+  MtFile *stream = (MtFile *)file;
+  mt_size pending;
+
+  if (!stream || stream->write_fill <= 0) {
+    return 0;
+  }
+  pending = (mt_size)stream->write_fill;
+  stream->write_fill = 0;
+  return mt_file_write(stream, stream->write_buffer, pending) ==
+                 (mt_ssize)pending
+             ? 0
+             : -1;
+}
+
+static mt_ssize mt_stream_write(MtFile *file, const void *buffer,
+                                mt_size bytes) {
+  const unsigned char *in = (const unsigned char *)buffer;
+  mt_size done = 0;
+
+  if (!(file->flags & MT_FILE_WRITE_BUFFERED)) {
+    return mt_file_write(file, buffer, bytes);
+  }
+
+  while (done < bytes) {
+    mt_size room;
+    mt_size wanted = bytes - done;
+
+    if (!file->write_buffer) {
+      file->write_buffer = (unsigned char *)malloc(MT_FILE_WRITE_BUFFER_BYTES);
+      if (!file->write_buffer) {
+        mt_ssize direct = mt_file_write(file, in + done, wanted);
+        file->flags &= ~MT_FILE_WRITE_BUFFERED;
+        return direct > 0 ? (mt_ssize)done + direct : (mt_ssize)done;
+      }
+    }
+
+    room = (mt_size)(MT_FILE_WRITE_BUFFER_BYTES - file->write_fill);
+    if (room == 0) {
+      if (mt_stream_flush(file) != 0) {
+        break;
+      }
+      room = MT_FILE_WRITE_BUFFER_BYTES;
+    }
+    if (wanted >= room && file->write_fill == 0) {
+      mt_ssize written = mt_file_write(file, in + done, wanted);
+      if (written <= 0) {
+        break;
+      }
+      done += (mt_size)written;
+      continue;
+    }
+    if (wanted > room) {
+      wanted = room;
+    }
+    memcpy(file->write_buffer + file->write_fill, in + done, wanted);
+    file->write_fill += (int)wanted;
+    done += wanted;
+  }
+
+  return (mt_ssize)done;
+}
+
+static void mt_flush_open_streams(void) {
+  MtFile *stream = mt_open_write_files;
+
+  while (stream) {
+    MtFile *next = stream->next_open;
+    mt_stream_flush(stream);
+    stream = next;
+  }
+}
+
 /* Bytes read ahead of what the caller has consumed. Seek and tell have to
  * account for them: the kernel's offset is that far past the stream's. */
 static mt_size mt_stream_pending(const MtFile *file) {
@@ -3229,7 +3575,7 @@ mt_size fwrite(const void *buffer, mt_size size, mt_size count, void *stream) {
     return 0;
   }
   mt_size bytes = size * count;
-  mt_ssize result = mt_file_write((MtFile *)stream, buffer, bytes);
+  mt_ssize result = mt_stream_write((MtFile *)stream, buffer, bytes);
   if (result <= 0 || size == 0) {
     return 0;
   }
@@ -3238,7 +3584,7 @@ mt_size fwrite(const void *buffer, mt_size size, mt_size count, void *stream) {
 
 int fputs(const char *text, void *stream) {
   mt_size length = strlen(text);
-  mt_ssize result = mt_file_write((MtFile *)stream, text, length);
+  mt_ssize result = mt_stream_write((MtFile *)stream, text, length);
   return result == (mt_ssize)length ? 0 : -1;
 }
 
@@ -3246,12 +3592,12 @@ int puts(const char *text) {
   if (fputs(text, stdout) < 0) {
     return -1;
   }
-  return mt_file_write((MtFile *)stdout, "\n", 1) == 1 ? 0 : -1;
+  return mt_stream_write((MtFile *)stdout, "\n", 1) == 1 ? 0 : -1;
 }
 
 int putchar(int character) {
   mt_u8 byte = (mt_u8)character;
-  return mt_file_write((MtFile *)stdout, &byte, 1) == 1 ? character : -1;
+  return mt_stream_write((MtFile *)stdout, &byte, 1) == 1 ? character : -1;
 }
 
 int getchar(void) {
@@ -3283,8 +3629,11 @@ char *fgets(char *buffer, int size, void *stream) {
 }
 
 int fflush(void *stream) {
-  (void)stream;
-  return 0;
+  if (!stream) {
+    mt_flush_open_streams();
+    return 0;
+  }
+  return mt_stream_flush((MtFile *)stream);
 }
 
 int ferror(void *stream) {
@@ -3294,7 +3643,7 @@ int ferror(void *stream) {
 
 int fputc(int character, void *stream) {
   mt_u8 byte = (mt_u8)character;
-  return mt_file_write((MtFile *)stream, &byte, 1) == 1 ? character : -1;
+  return mt_stream_write((MtFile *)stream, &byte, 1) == 1 ? character : -1;
 }
 
 int fseek(void *stream, long offset, int origin) {
@@ -3305,6 +3654,7 @@ int fseek(void *stream, long offset, int origin) {
   }
   /* A seek from the current position has to start from where the caller
    * thinks it is, not from where the read-ahead left the descriptor. */
+  mt_stream_flush(file);
   if (origin == 1) {
     offset -= (long)mt_stream_pending(file);
   }
@@ -3313,7 +3663,9 @@ int fseek(void *stream, long offset, int origin) {
 }
 
 long ftell(void *stream) {
-  mt_i64 position = stream ? mt_file_seek((MtFile *)stream, 0, 1) : -1;
+  mt_i64 position;
+  mt_stream_flush((MtFile *)stream);
+  position = stream ? mt_file_seek((MtFile *)stream, 0, 1) : -1;
   if (position >= 0) {
     position -= (mt_i64)mt_stream_pending((MtFile *)stream);
   }
@@ -3331,6 +3683,7 @@ int _fseeki64(void *stream, mt_i64 offset, int origin) {
     mt_errno_value = 22;
     return -1;
   }
+  mt_stream_flush(file);
   if (origin == 1) {
     offset -= (mt_i64)mt_stream_pending(file);
   }
@@ -3339,7 +3692,9 @@ int _fseeki64(void *stream, mt_i64 offset, int origin) {
 }
 
 mt_i64 _ftelli64(void *stream) {
-  mt_i64 position = stream ? mt_file_seek((MtFile *)stream, 0, 1) : -1;
+  mt_i64 position;
+  mt_stream_flush((MtFile *)stream);
+  position = stream ? mt_file_seek((MtFile *)stream, 0, 1) : -1;
   if (position >= 0) {
     position -= (mt_i64)mt_stream_pending((MtFile *)stream);
   }
@@ -3348,6 +3703,7 @@ mt_i64 _ftelli64(void *stream) {
 
 void rewind(void *stream) {
   if (stream) {
+    mt_stream_flush((MtFile *)stream);
     (void)mt_file_seek((MtFile *)stream, 0, 0);
   }
 }

@@ -96,24 +96,7 @@ typedef struct {
 } CompilerProfile;
 
 static double compiler_profile_now_ms(void) {
-#if defined(_WIN32) && !defined(__MINGW32__)
-  static MettleQpcTicks frequency = 0;
-  MettleQpcTicks counter = 0;
-
-  if (frequency == 0) {
-    QueryPerformanceFrequency(&frequency);
-  }
-  if (frequency == 0) {
-    return 0.0;
-  }
-  QueryPerformanceCounter(&counter);
-  return (double)counter * 1000.0 / (double)frequency;
-#else
-  struct timeval tv;
-
-  gettimeofday(&tv, NULL);
-  return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
-#endif
+  return mettle_now_ms();
 }
 
 static void compiler_profile_init(CompilerProfile *profile, int enabled) {
@@ -165,6 +148,9 @@ static void compiler_profile_print_compile(const CompilerProfile *profile,
             mettle_compiler_phase_name((MettleCompilerPhase)i), ms, percent);
   }
   fprintf(stderr, "  %-20s %9.3f ms  %6.2f%%\n", "total", total_ms, 100.0);
+  if (getenv("METTLE_ALLOC_REPORT")) {
+    mettle_alloc_report();
+  }
 }
 
 static void compiler_set_phase(MettleCompilerPhase phase) {
