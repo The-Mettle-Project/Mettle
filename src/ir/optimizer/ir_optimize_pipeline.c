@@ -535,6 +535,7 @@ static int ir_run_fixpoint_stage(IRFunction *function,
   }
 
   unsigned long long version = 1;
+  int used = 1;
   unsigned long long clean_version[IR_OPT_PASS_COUNT];
   for (int i = 0; i < IR_OPT_PASS_COUNT; i++) {
     clean_version[i] = 0;
@@ -560,8 +561,14 @@ static int ir_run_fixpoint_stage(IRFunction *function,
     if (!changed) {
       break;
     }
+    used = iteration + 2;
   }
 
+  if (getenv("METTLE_TIME_FUNCTIONS") && function->instruction_count > 800) {
+    fprintf(stderr, "   fixpoint %s: %d iterations over %zu instructions\n",
+            function->name ? function->name : "?", used,
+            function->instruction_count);
+  }
   mettle_compiler_ctx_set_fixpoint_iteration(0);
   return 1;
 }
@@ -658,12 +665,32 @@ static void ir_set_current_function_context(IRFunction *function) {
 
 static int ir_run_program_stage_for_each_function(
     IRProgram *program, int (*run)(IRFunction *function)) {
+  int report = getenv("METTLE_TIME_FUNCTIONS") != NULL;
+  double slowest = 0.0;
+  double total = 0.0;
+  const char *slowest_name = NULL;
+
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
+    double began = report ? mettle_now_ms() : 0.0;
     ir_set_current_function_context(function);
     if (!run(function)) {
       return 0;
     }
+    if (report) {
+      double took = mettle_now_ms() - began;
+      total += took;
+      if (took > slowest) {
+        slowest = took;
+        slowest_name = function->name;
+      }
+    }
+  }
+  if (report) {
+    fprintf(stderr,
+            "-- stage over %zu functions: %.1f ms total, slowest %.1f ms (%s) --\n",
+            program->function_count, total, slowest,
+            slowest_name ? slowest_name : "?");
   }
   return 1;
 }

@@ -5310,16 +5310,28 @@ int ir_init_image_is_all_zero(const IRModuleSymbol *symbol) {
 
 static struct {
   const IRFunction *function;
-  const char *symbol_name;
   size_t index;
 } g_ir_declaration_hints[IR_DECLARATION_HINT_SLOTS];
 
+/* Keyed on what the name says, not where it is stored: an operand's name is
+ * its own copy, so the same symbol arrives through a different pointer at
+ * almost every call and a pointer key never hits. */
 static size_t ir_declaration_hint_slot(const IRFunction *function,
                                        const char *symbol_name,
                                        int symbols_only) {
-  size_t mixed = (size_t)(const void *)function * 0x9e3779b97f4a7c15ull;
-  mixed ^= (size_t)(const void *)symbol_name * 0xff51afd7ed558ccdull;
+  size_t length = strlen(symbol_name);
+  size_t edge = length < 4 ? length : 4;
+  unsigned head = 0;
+  unsigned tail = 0;
+  size_t mixed;
+
+  memcpy(&head, symbol_name, edge);
+  memcpy(&tail, symbol_name + length - edge, edge);
+  mixed = (size_t)(const void *)function * 0x9e3779b97f4a7c15ull;
+  mixed ^= ((size_t)head + ((size_t)tail << 16) + length) *
+           0xff51afd7ed558ccdull;
   mixed ^= (size_t)symbols_only * 0xd6e8feb86659fd93ull;
+  mixed ^= mixed >> 31;
   return (mixed >> 17) & (IR_DECLARATION_HINT_SLOTS - 1u);
 }
 
@@ -5379,7 +5391,6 @@ const IRInstruction *ir_function_find_declaration(const IRFunction *function,
 
   slot = ir_declaration_hint_slot(function, symbol_name, symbols_only);
   if (g_ir_declaration_hints[slot].function == function &&
-      g_ir_declaration_hints[slot].symbol_name == symbol_name &&
       g_ir_declaration_hints[slot].index < function->instruction_count) {
     const IRInstruction *hinted =
         &function->instructions[g_ir_declaration_hints[slot].index];
@@ -5392,7 +5403,6 @@ const IRInstruction *ir_function_find_declaration(const IRFunction *function,
     const IRInstruction *instruction = &function->instructions[i];
     if (ir_declaration_names(instruction, symbol_name, symbols_only)) {
       g_ir_declaration_hints[slot].function = function;
-      g_ir_declaration_hints[slot].symbol_name = symbol_name;
       g_ir_declaration_hints[slot].index = i;
       return instruction;
     }

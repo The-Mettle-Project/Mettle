@@ -30,6 +30,15 @@ static int ir_pass_time_enabled(void) {
   return cached;
 }
 
+static int ir_pass_time_covers(const IRFunction *function) {
+  const char *only = getenv("METTLE_TIME_ONE_FUNCTION");
+
+  if (!only || !only[0]) {
+    return 1;
+  }
+  return function && function->name && strcmp(function->name, only) == 0;
+}
+
 static double g_ir_pass_ms[IR_OPT_PASS_COUNT];
 static unsigned long long g_ir_pass_runs[IR_OPT_PASS_COUNT];
 /* Named-sequence passes (vectorizers etc.) keyed by name, small fixed table. */
@@ -455,7 +464,7 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
     ir_trace_pass_event(pass_name, "failed", version, -1);
     return 0;
   }
-  if (ir_pass_time_enabled()) {
+  if (ir_pass_time_enabled() && ir_pass_time_covers(function)) {
     g_ir_pass_ms[pass_id] += ir_pass_now_ticks() - t0;
     g_ir_pass_runs[pass_id]++;
   }
