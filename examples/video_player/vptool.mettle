@@ -870,6 +870,88 @@ fn command_h264stats(path: cstring, frame_limit: int32) -> int32 {
   return 0;
 }
 
+fn command_h264seek(path: cstring, seeks: int32, drop: int32) -> int32 {
+  var status: int32 = 0;
+  var file: MediaSource* = source_open(path, &status);
+  if (file == 0) { return 1; }
+  defer source_close(file);
+
+  var parser: H264Decoder* = h264_decoder_new();
+  if (parser == 0) { return 1; }
+  defer h264_decoder_free(parser);
+  if (h264_read_config(parser, file->codec_config, file->codec_config_size) != H264_OK) { return 1; }
+
+  var video: H264Video* = h264_video_new(parser);
+  if (video == 0) { return 1; }
+  defer h264_video_free(video);
+
+  var buffer: uint8* = malloc((int64)file->max_video_size);
+  if (buffer == 0) { return 1; }
+  defer free(buffer);
+
+  var surface: uint32* = (uint32*)h264_gpu_host_alloc((int64)file->video_frame_count);
+  var frames: int32 = file->video_frame_count;
+  var total_us: int64 = 0;
+  var worst_us: int64 = 0;
+  var decoded_total: int64 = 0;
+  var skipped_total: int64 = 0;
+  var done: int32 = 0;
+
+  var step: int32 = frames / (seeks + 1);
+  if (step < 1) { step = 1; }
+
+  for round in 0..seeks {
+    var target: int32 = step * (round + 1);
+    if (target >= frames) { target = frames - 1; }
+    var sample: int32 = source_sample_for_display(file, target);
+    if (sample < 0) { continue; }
+
+    var began: int64 = now_microseconds();
+    var next: int32 = source_sync_sample_at_or_before(file, sample);
+    h264_video_reset(video);
+
+    var guard: int32 = 0;
+    var arrived: int32 = 0;
+    while (next < frames && guard < 4096) {
+      var size: int32 = source_read_video_by_sample(file, next, buffer, (int64)file->max_video_size);
+      if (size <= 0) { break; }
+      var display: int32 = source_display_position(file, next);
+      if (drop != 0 && display < target &&
+          h264_sample_is_droppable(video, buffer, (int64)size) != 0) {
+        skipped_total = skipped_total + (int64)1;
+        next = next + 1;
+        guard = guard + 1;
+        continue;
+      }
+      if (h264_decode_sample(video, buffer, (int64)size) != H264_OK) { break; }
+      decoded_total = decoded_total + (int64)1;
+      if (display == target) {
+        arrived = 1;
+        next = next + 1;
+        guard = guard + 1;
+        break;
+      }
+      next = next + 1;
+      guard = guard + 1;
+    }
+    var elapsed: int64 = now_microseconds() - began;
+    if (arrived != 0) {
+      total_us = total_us + elapsed;
+      if (elapsed > worst_us) { worst_us = elapsed; }
+      done = done + 1;
+    }
+  }
+  if (surface != 0) { h264_gpu_host_free((uint8*)surface); }
+
+  if (done <= 0) {
+    println("no seek landed");
+    return 1;
+  }
+  println("{done} seeks, {total_us / (int64)done} us each on average, worst {worst_us} us");
+  println("samples decoded {decoded_total / (int64)done} per seek, skipped {skipped_total / (int64)done}");
+  return 0;
+}
+
 fn command_h264gpucheck(path: cstring, frame_limit: int32) -> int32 {
   var status: int32 = 0;
   var file: MediaSource* = source_open(path, &status);
@@ -1184,6 +1266,7 @@ fn print_usage() {
   println("  vptool h264info <input.mp4> [samples]");
   println("  vptool h264dump <input.mp4> <frames> <out.yuv>");
   println("  vptool h264gpucheck <input.mp4> [frames]");
+  println("  vptool h264seek <input.mp4> [seeks] [skip-disposable]");
   println("  vptool mp4info <input.mp4>");
   println("  vptool mp4samples <input.mp4> <track> <count>");
 }
@@ -1202,6 +1285,13 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   }
   if (cstring_equals(command, "frame") != 0 && argc >= 5) {
     return command_frame(argv[2], parse_int(argv[3]), argv[4]);
+  }
+  if (cstring_equals(command, "h264seek") != 0 && argc >= 3) {
+    var seek_count: int32 = 20;
+    if (argc >= 4) { seek_count = parse_int(argv[3]); }
+    var seek_drop: int32 = 1;
+    if (argc >= 5) { seek_drop = parse_int(argv[4]); }
+    return command_h264seek(argv[2], seek_count, seek_drop);
   }
   if (cstring_equals(command, "h264gpucheck") != 0 && argc >= 3) {
     var check_limit: int32 = 40;

@@ -173,6 +173,10 @@ What that pointed at, in the order it mattered:
   spends about seven thousand bins a frame; on a high-bitrate stream it is the
   part that matters.
 
+Decoding stays linear in macroblocks as the picture grows: 0.58 microseconds
+per macroblock at 1280x720, 0.51 at 1920x1080, and 0.51 at 3840x2160. A 4K
+frame costs 16.4 ms and a 1080p frame 4.1 ms, decode only.
+
 What is left is the part that needs real vector instructions. Prediction now
 runs at about 1.4 cycles per pixel operation, which is close to what scalar
 code can do; ffmpeg decodes the same file in 1.15 ms a frame using hand-written
@@ -180,6 +184,25 @@ AVX2. The compiler's own auto-vectorizer does fire on these loops when they are
 written as flat loops over row pointers, but its byte kernel carries about 90 ns
 of setup, so on a 16-pixel row it loses to the scalar code it replaces. The
 64-bit word arithmetic above is what was available in the meantime.
+
+### Seeking
+
+A seek has to decode from the last keyframe forward, which in this file is up
+to 158 frames. Two things made that cheaper than it looks. Frames whose
+`nal_ref_idc` is zero are never referenced by anything, so when one lands
+before the frame being seeked to it is skipped without being decoded at all;
+in this file that is 45 per cent of the frames in a group. And the frames
+passed over on the way are no longer converted to BGRA, only the one being
+seeked to and the few after it that the ring will want.
+
+Measured over 20 seeks spread across the file: 332 ms each on average and
+1121 ms at worst before, 198 ms and 531 ms after. `vptool h264seek` is that
+measurement, and its second argument turns the skipping off so the two can be
+compared.
+
+Skipping is only done when the stream numbers its pictures with
+`pic_order_cnt_type` 0, where the order count of a non-reference picture feeds
+nothing that comes after it. Under the other two types it decodes everything.
 
 ### Colour on the GPU
 
@@ -263,6 +286,9 @@ What was measured:
   the whole path. The same check on a second H.264 file, on three re-encoded
   clips at 320x180, 640x360 and 1280x720, and on the Motion JPEG path:
   identical in every case.
+- Decode against ffmpeg on one thread, same files: 1.9 ms a frame against
+  0.95 at 720p, 4.2 against 1.5 at 1080p, 16.4 against 5.2 at 4K. The gap is
+  hand-written AVX2.
 - The GPU colour path against the CPU one, 40 frames of 921,600 pixels: no
   pixel differs.
 

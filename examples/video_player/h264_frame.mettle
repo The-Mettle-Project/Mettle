@@ -589,11 +589,11 @@ fn h264_apply_marking(v: H264Video*, header: H264SliceHeader*) {
 }
 
 fn h264_end_picture(v: H264Video*, sps: H264Sps*, header: H264SliceHeader*) {
-  h264_store_colocated_motion(v);
   h264_deblock_picture(v);
   v->previous_frame_num = header->frame_num;
 
   if (header->nal_ref_idc == 0) { return; }
+  h264_store_colocated_motion(v);
 
   if (header->has_marking != 0) { h264_apply_marking(v, header); }
 
@@ -741,6 +741,25 @@ fn h264_decode_slice(v: H264Video*, header: H264SliceHeader*) -> int32 {
     fflush(0);
   }
   return H264_OK;
+}
+
+fn h264_sample_is_droppable(v: H264Video*, sample: uint8*, size: int64) -> int32 {
+  var parser: H264Decoder* = v->parser;
+  if (parser->sps[parser->active_sps].pic_order_cnt_type != 0) { return 0; }
+  var count: int32 = h264_nal_count(parser, sample, size);
+  for i in 0..count {
+    var nal_size: int64 = 0;
+    var nal: uint8* = h264_nal_at(parser, sample, size, i, &nal_size);
+    if (nal == 0) { continue; }
+    var kind: int32 = h264_nal_type(nal);
+    if (kind == H264_NAL_SPS || kind == H264_NAL_PPS || kind == H264_NAL_IDR) { return 0; }
+    if (kind == H264_NAL_SLICE) {
+      var reference_idc: int32 = (((int32)nal[0]) >> 5) & 3;
+      if (reference_idc == 0) { return 1; }
+      return 0;
+    }
+  }
+  return 0;
 }
 
 fn h264_decode_sample(v: H264Video*, sample: uint8*, size: int64) -> int32 {

@@ -188,6 +188,7 @@ var g_dropped: int64 = 0;
 var g_decode_failures: int64 = 0;
 var g_resets: int64 = 0;
 var g_samples_decoded: int64 = 0;
+var g_samples_skipped: int64 = 0;
 var g_ring_miss: int64 = 0;
 var g_worst_decode_us: int64 = 0;
 var g_worst_batch: int64 = 0;
@@ -378,11 +379,23 @@ fn decode_frame_h264(index: int32) -> int32 {
   while (next < g_file->video_frame_count && guard < 4096) {
     var size: int32 = source_read_video_by_sample(g_file, next, g_frame_buffer, g_frame_capacity);
     if (size <= 0) { return 0; }
+    var display: int32 = source_display_position(g_file, next);
+
+    if (display < index && h264_sample_is_droppable(g_video, g_frame_buffer, (int64)size) != 0) {
+      g_last_sample = next;
+      next = next + 1;
+      guard = guard + 1;
+      g_samples_skipped = g_samples_skipped + (int64)1;
+      continue;
+    }
+
     if (h264_decode_sample(g_video, g_frame_buffer, (int64)size) != H264_OK) {
       g_last_sample = next;
       return 0;
     }
-    ring_store(source_display_position(g_file, next));
+    if (display >= index && display < index + FRAME_RING) {
+      ring_store(display);
+    }
     g_last_sample = next;
     next = next + 1;
     guard = guard + 1;
