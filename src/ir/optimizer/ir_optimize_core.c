@@ -716,10 +716,10 @@ static unsigned int ir_tvm_hash(const char *s) {
   return h;
 }
 
-static void ir_tvm_index_insert(IRTempValueMap *map, const char *name,
-                                size_t slot) {
+static void ir_tvm_index_insert_with(IRTempValueMap *map, unsigned int hash,
+                                     size_t slot) {
   size_t mask = map->ix_capacity - 1;
-  size_t b = ir_tvm_hash(name) & mask;
+  size_t b = hash & mask;
   while (map->ix[b] != 0 && map->ix[b] != IR_TVM_TOMB) {
     b = (b + 1) & mask;
   }
@@ -727,6 +727,11 @@ static void ir_tvm_index_insert(IRTempValueMap *map, const char *name,
     map->ix_tombstones--;
   }
   map->ix[b] = (unsigned int)(slot + 1);
+}
+
+static void ir_tvm_index_insert(IRTempValueMap *map, const char *name,
+                                size_t slot) {
+  ir_tvm_index_insert_with(map, ir_tvm_hash(name), slot);
 }
 
 int ir_temp_value_map_reindex(IRTempValueMap *map) {
@@ -764,7 +769,8 @@ static void ir_tvm_index_ensure(IRTempValueMap *map) {
   }
 }
 
-static int ir_temp_value_map_find(const IRTempValueMap *map, const char *name) {
+static int ir_temp_value_map_find_with(const IRTempValueMap *map,
+                                       const char *name, unsigned int hash) {
   if (!map || !name || map->count == 0) {
     return -1;
   }
@@ -782,7 +788,7 @@ static int ir_temp_value_map_find(const IRTempValueMap *map, const char *name) {
   }
 
   size_t mask = map->ix_capacity - 1;
-  size_t b = ir_tvm_hash(name) & mask;
+  size_t b = hash & mask;
   while (map->ix[b] != 0) {
     if (map->ix[b] != IR_TVM_TOMB) {
       size_t slot = (size_t)map->ix[b] - 1;
@@ -795,6 +801,10 @@ static int ir_temp_value_map_find(const IRTempValueMap *map, const char *name) {
     b = (b + 1) & mask;
   }
   return -1;
+}
+
+static int ir_temp_value_map_find(const IRTempValueMap *map, const char *name) {
+  return name ? ir_temp_value_map_find_with(map, name, ir_tvm_hash(name)) : -1;
 }
 
 /* Tombstone the bucket that points at `slot` for `name`. */
@@ -914,7 +924,8 @@ int ir_temp_value_map_set(IRTempValueMap *map, const char *name,
     return 0;
   }
 
-  int existing = ir_temp_value_map_find(map, name);
+  unsigned int hash = ir_tvm_hash(name);
+  int existing = ir_temp_value_map_find_with(map, name, hash);
   if (existing >= 0) {
     IROperand cloned = ir_operand_none();
     if (!ir_operand_clone(value, &cloned)) {
@@ -952,7 +963,7 @@ int ir_temp_value_map_set(IRTempValueMap *map, const char *name,
   map->count++;
   ir_tvm_vsym_note_value(map, &map->items[map->count - 1].value, 1);
   if (map->ix && (map->count + map->ix_tombstones) * 2 < map->ix_capacity) {
-    ir_tvm_index_insert(map, name_copy, map->count - 1);
+    ir_tvm_index_insert_with(map, hash, map->count - 1);
   } else {
     ir_temp_value_map_reindex(map);
   }
@@ -2129,14 +2140,22 @@ int ir_temp_use_map_init(IRTempUseMap *map) {
   return 1;
 }
 
-/* Insert items[index] into the hash table (hash table must have room). */
-static void ir_temp_use_map_hash_put(IRTempUseMap *map, size_t index) {
+/* Insert items[index] into the hash table (hash table must have room). The
+ * caller passes the key's hash when it already had to compute one to look the
+ * key up and miss, which is every insert that comes through add. */
+static void ir_temp_use_map_hash_put_with(IRTempUseMap *map, size_t index,
+                                          size_t hash) {
   size_t mask = map->hash_count - 1;
-  size_t h = mettle_fnv1a_hash(map->items[index].name) & mask;
+  size_t h = hash & mask;
   while (map->hash[h] != 0) {
     h = (h + 1) & mask;
   }
   map->hash[h] = index + 1; /* store index+1; 0 == empty */
+}
+
+static void ir_temp_use_map_hash_put(IRTempUseMap *map, size_t index) {
+  ir_temp_use_map_hash_put_with(map, index,
+                                mettle_fnv1a_hash(map->items[index].name));
 }
 
 /* Grow/allocate the hash table so it can hold map->count entries at <0.5 load,
@@ -2163,13 +2182,14 @@ static int ir_temp_use_map_hash_reserve(IRTempUseMap *map, size_t needed) {
   return 1;
 }
 
-static int ir_temp_use_map_find(const IRTempUseMap *map, const char *name) {
+static int ir_temp_use_map_find_with(const IRTempUseMap *map, const char *name,
+                                     size_t hash) {
   if (!map || !name || !map->hash) {
     return -1;
   }
 
   size_t mask = map->hash_count - 1;
-  size_t h = mettle_fnv1a_hash(name) & mask;
+  size_t h = hash & mask;
   while (map->hash[h] != 0) {
     size_t idx = map->hash[h] - 1;
     if (map->items[idx].name && map->items[idx].name[0] == name[0] &&
@@ -2181,12 +2201,21 @@ static int ir_temp_use_map_find(const IRTempUseMap *map, const char *name) {
   return -1;
 }
 
+static int ir_temp_use_map_find(const IRTempUseMap *map, const char *name) {
+  return name ? ir_temp_use_map_find_with(map, name, mettle_fnv1a_hash(name))
+              : -1;
+}
+
 static int ir_temp_use_map_add(IRTempUseMap *map, const char *name) {
+  size_t hash;
+  int existing;
+
   if (!map || !name) {
     return 0;
   }
 
-  int existing = ir_temp_use_map_find(map, name);
+  hash = mettle_fnv1a_hash(name);
+  existing = ir_temp_use_map_find_with(map, name, hash);
   if (existing >= 0) {
     map->items[existing].use_count++;
     return 1;
@@ -2215,7 +2244,7 @@ static int ir_temp_use_map_add(IRTempUseMap *map, const char *name) {
 
   map->items[map->count].name = name_copy;
   map->items[map->count].use_count = 1;
-  ir_temp_use_map_hash_put(map, map->count);
+  ir_temp_use_map_hash_put_with(map, map->count, hash);
   map->count++;
   return 1;
 }
