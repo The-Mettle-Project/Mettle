@@ -268,15 +268,49 @@ static void emit_store_sized(Arm64Emit *e, Arm64Reg source,
   }
 }
 
+/* The base type name inside a declared type text: "int32[4]" and "int32*" both
+ * name int32. Every predicate below reads this rather than searching the text,
+ * because a monomorphized name carries its type argument: "Pair__float64"
+ * contains "float64" and "Some__uint32" contains "uint32", and matching on the
+ * substring classified a whole record as the scalar inside its name. */
+static const char *type_text_base(const char *t, char *buffer, size_t size) {
+  size_t n = 0;
+  if (!t || size == 0) {
+    if (size > 0) buffer[0] = '\0';
+    return buffer;
+  }
+  while (t[n] && t[n] != '*' && t[n] != '[' && t[n] != ' ' && n + 1 < size) {
+    n++;
+  }
+  memcpy(buffer, t, n);
+  buffer[n] = '\0';
+  return buffer;
+}
+
+static int type_text_base_is(const char *t, const char *name) {
+  char base[64];
+  return strcmp(type_text_base(t, base, sizeof(base)), name) == 0;
+}
+
 /* Byte size of an array element by its type name. */
 static int type_elem_size(const char *t) {
+  char base[64];
   if (!t) return 8;
   if (strchr(t, '*')) return 8; /* pointer */
-  if (strstr(t, "64")) return 8;
-  if (strstr(t, "32")) return 4;
-  if (strstr(t, "16")) return 2;
-  if (strstr(t, "8")) return 1;
-  if (strcmp(t, "bool") == 0) return 1;
+  type_text_base(t, base, sizeof(base));
+  if (strcmp(base, "int64") == 0 || strcmp(base, "uint64") == 0 ||
+      strcmp(base, "float64") == 0) {
+    return 8;
+  }
+  if (strcmp(base, "int32") == 0 || strcmp(base, "uint32") == 0 ||
+      strcmp(base, "float32") == 0) {
+    return 4;
+  }
+  if (strcmp(base, "int16") == 0 || strcmp(base, "uint16") == 0) return 2;
+  if (strcmp(base, "int8") == 0 || strcmp(base, "uint8") == 0 ||
+      strcmp(base, "bool") == 0 || strcmp(base, "char") == 0) {
+    return 1;
+  }
   return 8;
 }
 
@@ -285,8 +319,13 @@ static int type_elem_size(const char *t) {
  * IR names such a local where it means the local's ADDRESS. */
 static int type_is_aggregate(const MtlcType *t) {
   if (!t) return 0;
+  /* A tagged enum is a record too: a tag word and a payload beside it, wider
+   * than a register. Leaving it out here made a value of one travel as its
+   * first eight bytes, so a callee read the right tag and a zeroed payload,
+   * and a constructor's return arrived empty. The x86 predicate has always
+   * counted it. */
   return t->kind == MTLC_TYPE_STRUCT || t->kind == MTLC_TYPE_ARRAY ||
-         t->kind == MTLC_TYPE_STRING;
+         t->kind == MTLC_TYPE_TAGGED_ENUM || t->kind == MTLC_TYPE_STRING;
 }
 
 /* Frame bytes a DECLARE_LOCAL needs from its type text (e.g. "int64[4]"). */
@@ -383,8 +422,13 @@ static int slot_find(const SlotMap *s, const char *name) {
  * type -- passes it in a GP register. The two then disagree about where the
  * argument is. */
 static int type_text_is_float_scalar(const char *t) {
-  return t && strstr(t, "float") != NULL && strchr(t, '*') == NULL &&
-         strchr(t, '[') == NULL;
+  if (!t || strchr(t, '*') != NULL || strchr(t, '[') != NULL) return 0;
+  return type_text_base_is(t, "float32") || type_text_base_is(t, "float64");
+}
+
+/* 32 or 64 for a scalar float type text; 64 when it does not name one. */
+static int type_text_float_bits(const char *t) {
+  return type_text_base_is(t, "float32") ? 32 : 64;
 }
 
 /* IEEE-754 bit pattern of a FLOAT operand at `bits` (32 or 64). A literal's
@@ -705,14 +749,14 @@ static void build_float_set(const IRFunction *fn, const IRProgram *prog,
     if (fn->parameter_types &&
         type_text_is_float_scalar(fn->parameter_types[i])) {
       set_add_bits(fs, fn->parameter_names[i],
-                   strstr(fn->parameter_types[i], "32") ? 32 : 64);
+                   type_text_float_bits(fn->parameter_types[i]));
     }
   }
   for (size_t i = 0; i < fn->instruction_count; i++) {
     const IRInstruction *in = &fn->instructions[i];
     if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name &&
         type_text_is_float_scalar(in->text)) {
-      set_add_bits(fs, in->dest.name, strstr(in->text, "32") ? 32 : 64);
+      set_add_bits(fs, in->dest.name, type_text_float_bits(in->text));
     }
   }
   for (int pass = 0; pass < 4; pass++) {
@@ -795,7 +839,10 @@ static int type_is_unsigned(const MtlcType *t) {
  * DECLARE_LOCAL types reach the backend as text, not as an MtlcType. "uint" also
  * covers "uint8[16]"; a '*' anywhere makes it a pointer. */
 static int type_text_is_unsigned(const char *t) {
-  return t && (strstr(t, "uint") != NULL || strchr(t, '*') != NULL);
+  if (!t) return 0;
+  if (strchr(t, '*') != NULL) return 1;
+  return type_text_base_is(t, "uint8") || type_text_base_is(t, "uint16") ||
+         type_text_base_is(t, "uint32") || type_text_base_is(t, "uint64");
 }
 
 /* Populate `us` with every value name in `fn` that holds an unsigned integer or
@@ -1905,7 +1952,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
       if (location.kind == ARM64_ARG_IN_VEC_REGISTER) {
         const char *type =
             fn->parameter_types ? fn->parameter_types[i] : NULL;
-        int is_double = !type || !strstr(type, "32");
+        int is_double = type_text_float_bits(type) == 64;
         emit_slot_str_fp(e, is_double, (int)location.reg, off);
       } else if (location.kind == ARM64_ARG_IN_GP_REGISTER) {
         emit_slot_str(e, location.reg, off);
@@ -1936,7 +1983,7 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
         int is_scalar_float =
             t ? mtlc_type_is_float(t) : type_text_is_float_scalar(in->text);
         int fbits = t ? (t->kind == MTLC_TYPE_FLOAT32 ? 32 : 64)
-                      : (in->text && strstr(in->text, "32") ? 32 : 64);
+                      : type_text_float_bits(in->text);
         set_rebind(&fs, name, is_scalar_float, is_scalar_float ? fbits : 0);
         set_rebind(&us, name,
                    type_text_is_unsigned(in->text) || type_is_unsigned(t), 0);
