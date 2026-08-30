@@ -46,6 +46,10 @@ const char *mtlc_target_triple_list(void);
 
 int mtlc_target_is_object_capable(const MtlcTarget *target);
 
+MtlcTargetOs mtlc_target_host_os(void);
+
+const char *mtlc_target_os_name(MtlcTargetOs os);
+
 #ifdef __cplusplus
 }
 #endif

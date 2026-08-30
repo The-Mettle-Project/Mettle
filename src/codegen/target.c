@@ -123,6 +123,29 @@ const char *mtlc_target_triple_list(void) {
          "aarch64-none, i386-none, i686-none, i8086-none";
 }
 
+MtlcTargetOs mtlc_target_host_os(void) {
+  switch (binary_target_format_host_default()) {
+  case BINARY_TARGET_FORMAT_ELF_X64:
+  case BINARY_TARGET_FORMAT_ELF_ARM64:
+    return MTLC_TARGET_OS_LINUX;
+  case BINARY_TARGET_FORMAT_COFF_WIN64:
+  default:
+    return MTLC_TARGET_OS_WINDOWS;
+  }
+}
+
+const char *mtlc_target_os_name(MtlcTargetOs os) {
+  switch (os) {
+  case MTLC_TARGET_OS_LINUX:
+    return "Linux";
+  case MTLC_TARGET_OS_WINDOWS:
+    return "Windows";
+  case MTLC_TARGET_OS_NONE:
+  default:
+    return "freestanding";
+  }
+}
+
 int mtlc_target_is_object_capable(const MtlcTarget *target) {
   if (!target) {
     return 0;

@@ -86,12 +86,13 @@ int code_generator_binary_check_interrupt_signature(CodeGenerator *generator,
   if (!generator || !ir_function) {
     return 0;
   }
-  if (mtlc_target()->code_bits != 64) {
+  if (mtlc_target()->code_bits == 16 && ir_function->parameter_count >= 2) {
     generator->has_user_error = 1;
     code_generator_set_error(
         generator,
-        "'%s' is `@interrupt`, which the compiler emits for 64-bit targets "
-        "only; write a `@naked` handler for 16-bit or 32-bit code",
+        "'%s' is `@interrupt` and takes an error code, which real mode never "
+        "pushes; a 16-bit handler takes no parameters or the frame pointer "
+        "alone",
         ir_function->name);
     return 0;
   }
@@ -110,7 +111,7 @@ int code_generator_binary_check_interrupt_signature(CodeGenerator *generator,
     code_generator_set_error(
         generator,
         "'%s' is `@interrupt`: an interrupt handler returns nothing, because "
-        "`iretq` has nowhere to hand a value back to",
+        "the interrupt return has nowhere to hand a value back to",
         ir_function->name);
     return 0;
   }

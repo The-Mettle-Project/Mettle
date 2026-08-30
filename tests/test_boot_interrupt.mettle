@@ -1,0 +1,65 @@
+@naked fn _start() {
+    asm {
+        bits 16
+        cli
+        xor ax, ax
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov sp, 0x7c00
+        sti
+        call main
+        cli
+    halt:
+        hlt
+        jmp halt
+    }
+}
+
+var ticks: int16 = 0
+
+fn putchar(c: int16) -> int16 {
+    asm {
+        mov ax, {c}
+        mov ah, 0x0e
+        mov bx, 7
+        int 0x10
+    }
+    return c
+}
+
+@interrupt fn timer_tick() {
+    ticks = (int16)(ticks + 1)
+}
+
+fn fire() -> int16 {
+    var preserved: int16 = 0
+    asm {
+        mov ax, timer_tick
+        mov word ptr [0x100], ax
+        mov word ptr [0x102], 0
+        mov si, 0x1234
+        mov di, 0x4321
+        int 0x40
+        int 0x40
+        int 0x40
+        mov ax, 0
+        cmp si, 0x1234
+        jne settled
+        cmp di, 0x4321
+        jne settled
+        mov ax, 1
+    settled:
+        mov {preserved}, ax
+    }
+    return preserved
+}
+
+fn main() -> int16 {
+    var preserved: int16 = fire()
+    putchar((int16)(48 + ticks))
+    putchar((int16)(48 + preserved))
+    putchar(13)
+    putchar(10)
+    return 0
+}

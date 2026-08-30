@@ -19,6 +19,8 @@ typedef struct {
   int zero;
   int sign;
   int overflow;
+  int direction;
+  int interrupts;
   int halted;
   int fault;
   const char *fault_reason;
@@ -275,16 +277,47 @@ static uint16_t shift(Cpu *cpu, int op, uint16_t value, int count, int width) {
   return (uint16_t)result;
 }
 
-static void bios_interrupt(Cpu *cpu, uint8_t vector) {
-  if (vector != 0x10) {
-    fault(cpu, "unexpected BIOS interrupt");
+static uint16_t pack_flags(const Cpu *cpu) {
+  return (uint16_t)((cpu->carry ? 0x0001u : 0u) |
+                    (cpu->zero ? 0x0040u : 0u) |
+                    (cpu->sign ? 0x0080u : 0u) |
+                    (cpu->direction ? 0x0400u : 0u) |
+                    (cpu->interrupts ? 0x0200u : 0u) |
+                    (cpu->overflow ? 0x0800u : 0u) | 0x0002u);
+}
+
+static void unpack_flags(Cpu *cpu, uint16_t value) {
+  cpu->carry = (value & 0x0001u) != 0;
+  cpu->zero = (value & 0x0040u) != 0;
+  cpu->sign = (value & 0x0080u) != 0;
+  cpu->direction = (value & 0x0400u) != 0;
+  cpu->interrupts = (value & 0x0200u) != 0;
+  cpu->overflow = (value & 0x0800u) != 0;
+}
+
+static void software_interrupt(Cpu *cpu, uint8_t vector) {
+  uint16_t offset;
+  uint16_t segment;
+  if (vector == 0x10) {
+    if (get_reg8(cpu, 4) == 0x0E) {
+      emit_output((char)get_reg8(cpu, 0));
+      return;
+    }
+    fault(cpu, "unsupported int 0x10 function");
     return;
   }
-  if (get_reg8(cpu, 4) == 0x0E) {
-    emit_output((char)get_reg8(cpu, 0));
+  offset = read16((uint32_t)vector * 4u);
+  segment = read16((uint32_t)vector * 4u + 2u);
+  if (offset == 0 && segment == 0) {
+    fault(cpu, "interrupt vector is empty");
     return;
   }
-  fault(cpu, "unsupported int 0x10 function");
+  push16(cpu, pack_flags(cpu));
+  push16(cpu, cpu->seg[SEG_CS]);
+  push16(cpu, cpu->ip);
+  cpu->interrupts = 0;
+  cpu->seg[SEG_CS] = segment;
+  cpu->ip = offset;
 }
 
 static void step(Cpu *cpu) {
@@ -522,7 +555,45 @@ static void step(Cpu *cpu) {
     cpu->reg[REG_BP] = pop16(cpu);
     return;
   case 0xCD:
-    bios_interrupt(cpu, fetch8(cpu));
+    software_interrupt(cpu, fetch8(cpu));
+    return;
+  case 0xCF:
+    cpu->ip = pop16(cpu);
+    cpu->seg[SEG_CS] = pop16(cpu);
+    unpack_flags(cpu, pop16(cpu));
+    return;
+  case 0x9C:
+    push16(cpu, pack_flags(cpu));
+    return;
+  case 0x9D:
+    unpack_flags(cpu, pop16(cpu));
+    return;
+  case 0x06:
+    push16(cpu, cpu->seg[SEG_ES]);
+    return;
+  case 0x07:
+    cpu->seg[SEG_ES] = pop16(cpu);
+    return;
+  case 0x0E:
+    push16(cpu, cpu->seg[SEG_CS]);
+    return;
+  case 0x16:
+    push16(cpu, cpu->seg[SEG_SS]);
+    return;
+  case 0x17:
+    cpu->seg[SEG_SS] = pop16(cpu);
+    return;
+  case 0x1E:
+    push16(cpu, cpu->seg[SEG_DS]);
+    return;
+  case 0x1F:
+    cpu->seg[SEG_DS] = pop16(cpu);
+    return;
+  case 0xFC:
+    cpu->direction = 0;
+    return;
+  case 0xFD:
+    cpu->direction = 1;
     return;
   case 0xC0:
   case 0xC1:
@@ -579,9 +650,10 @@ static void step(Cpu *cpu) {
   case 0xF8: cpu->carry = 0; return;
   case 0xF9: cpu->carry = 1; return;
   case 0xFA:
+    cpu->interrupts = 0;
+    return;
   case 0xFB:
-  case 0xFC:
-  case 0xFD:
+    cpu->interrupts = 1;
     return;
   case 0xF6:
   case 0xF7: {

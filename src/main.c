@@ -3831,6 +3831,41 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  if (build_executable && mtlc_target()->explicit_triple) {
+    const MtlcTarget *target = mtlc_target();
+    if (target->freestanding) {
+      fprintf(stderr,
+              "Error: --build links against the host runtime, which the %s "
+              "target has none of; emit the image with --emit-flat, or the "
+              "object with --emit-obj and link it yourself\n",
+              target->triple);
+      free((void *)options.import_directories);
+      free((void *)options.link_arguments);
+      return 1;
+    }
+    if (target->os != mtlc_target_host_os()) {
+      fprintf(stderr,
+              "Error: --build for %s has to run that machine's linker against "
+              "that machine's runtime, and neither is here; emit the object "
+              "with --emit-obj and link it on a %s host\n",
+              target->triple, mtlc_target_os_name(target->os));
+      free((void *)options.import_directories);
+      free((void *)options.link_arguments);
+      return 1;
+    }
+  }
+
+  if (options.safe && mtlc_target()->freestanding) {
+    fprintf(stderr,
+            "Error: --safe on the %s target has no runtime to report a "
+            "violation to; its checks call into the shadow map the runtime "
+            "owns, and a freestanding image links no library\n",
+            mtlc_target()->triple);
+    free((void *)options.import_directories);
+    free((void *)options.link_arguments);
+    return 1;
+  }
+
   /* No --gpu-arch given: target the GPU that is actually in this machine when
    * one is visible. Detection failure (no driver, headless build host) keeps
    * the GB10 default so cross-compiles for DGX Spark are unchanged. */

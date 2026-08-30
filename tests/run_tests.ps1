@@ -13871,10 +13871,6 @@ else {
   }
 }
 
-# 16-bit gate, second image: the narrow code generator has to place values that
-# do not live in a register. This one computes through a struct, an array
-# indexed by a range-`for` counter, a pointer, and a global, and prints one
-# digit per answer, so a frame it laid out wrong shows up as a wrong digit.
 if (-not $calcGcc) {
   Write-Host "[SKIP] boot_sector_data_runs (gcc not found)"
 }
@@ -13909,6 +13905,107 @@ else {
     $failed++
     Write-CaseResult -Name "boot_sector_data_runs" -Passed $false -Reason $_.Exception.Message
   }
+}
+
+if (-not $calcGcc) {
+  Write-Host "[SKIP] boot_interrupt_runs (gcc not found)"
+}
+else {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $isrImage = Join-Path $tmpDir "boot_interrupt.bin"
+    if (Test-Path $isrImage) { Remove-Item -Path $isrImage -Force }
+    $isrArgs = @("tests/test_boot_interrupt.mettle", "--target", "i8086-none",
+                 "--image-base", "0x8000", "--emit-flat", $isrImage)
+    $isrOut = & $CompilerPath @isrArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $isrImage)) {
+      throw "compiling the 16-bit interrupt image failed: $isrOut"
+    }
+    $emulatorExe = Join-Path $tmpDir "x86_16_emulator_test.exe"
+    if (-not (Test-Path $emulatorExe)) {
+      $emulatorArgs = @("-Wall", "-Wextra", "-std=c99",
+                        "tests/x86_16_emulator_test.c", "-o", $emulatorExe)
+      $buildOut = & $calcGcc.Source @emulatorArgs 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "building the real-mode emulator failed: $buildOut"
+      }
+    }
+    $runOut = & $emulatorExe $isrImage '31\r\n' '0x8000' 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "the 16-bit interrupt handler did not run as expected: $runOut"
+    }
+    Write-CaseResult -Name "boot_interrupt_runs" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "boot_interrupt_runs" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $crossSource = "tests/test_cross_target.mettle"
+  $hostTriple = if ($IsLinux) { "x86_64-linux" } else { "x86_64-windows" }
+  $foreignTriple = if ($IsLinux) { "x86_64-windows" } else { "x86_64-linux" }
+  function Get-CrossObject([string[]]$extraArgs, [string]$name) {
+    $path = Join-Path $tmpDir $name
+    if (Test-Path $path) { Remove-Item -Path $path -Force }
+    $emitArgs = @($crossSource, "--emit-obj", "-o", $path) + $extraArgs
+    $out = & $CompilerPath @emitArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $path)) {
+      throw "compiling $crossSource $($extraArgs -join ' ') failed: $out"
+    }
+    return [System.IO.File]::ReadAllBytes($path)
+  }
+
+  $plain = Get-CrossObject @() "cross_plain.o"
+  $named = Get-CrossObject @("--target", $hostTriple) "cross_named.o"
+  if ($plain.Length -ne $named.Length) {
+    throw "--target $hostTriple changed the object size ($($plain.Length) vs $($named.Length))"
+  }
+  for ($i = 0; $i -lt $plain.Length; $i++) {
+    if ($plain[$i] -ne $named[$i]) {
+      throw "--target $hostTriple changed byte $i of the object"
+    }
+  }
+
+  $elf = Get-CrossObject @("--target", "x86_64-linux") "cross_elf.o"
+  if ($elf[0] -ne 0x7F -or $elf[1] -ne 0x45 -or $elf[2] -ne 0x4C -or $elf[3] -ne 0x46) {
+    throw "x86_64-linux did not produce an ELF object"
+  }
+  if ($elf[18] -ne 0x3E -or $elf[19] -ne 0x00) {
+    throw "the x86_64-linux object does not name the x86-64 machine"
+  }
+
+  $arm = Get-CrossObject @("--target", "aarch64-linux") "cross_arm.o"
+  if ($arm[0] -ne 0x7F -or $arm[1] -ne 0x45) {
+    throw "aarch64-linux did not produce an ELF object"
+  }
+  if ($arm[18] -ne 0xB7 -or $arm[19] -ne 0x00) {
+    throw "the aarch64-linux object does not name the AArch64 machine"
+  }
+
+  $coff = Get-CrossObject @("--target", "x86_64-windows") "cross_coff.o"
+  if ($coff[0] -ne 0x64 -or $coff[1] -ne 0x86) {
+    throw "the x86_64-windows object does not name the x86-64 COFF machine"
+  }
+
+  $crossBuildOut = Join-Path $tmpDir "cross_build_out"
+  $crossBuild = & $CompilerPath $crossSource "--target" $foreignTriple "--build" "-o" $crossBuildOut 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) {
+    throw "--build for $foreignTriple was accepted on this host"
+  }
+  if ($crossBuild -notmatch "emit the object") {
+    throw "the cross --build refusal did not say what to do instead: $crossBuild"
+  }
+
+  Write-CaseResult -Name "cross_target_objects" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "cross_target_objects" -Passed $false -Reason $_.Exception.Message
 }
 
 # 32-bit gate: the i386 target must reach the narrow code generator. Emitting

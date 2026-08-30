@@ -480,6 +480,93 @@ static int x86_narrow_type_is_addressed_region(const MtlcType *type) {
   return type && (type->kind == MTLC_TYPE_ARRAY || type->kind == MTLC_TYPE_STRUCT);
 }
 
+static const char *const X86_NARROW_ISR_SAVED_16[] = {
+    "ax", "bx", "cx", "dx", "si", "di", "ds", "es"};
+
+static const char *const X86_NARROW_ISR_SAVED_32[] = {
+    "eax", "ebx", "ecx", "edx", "esi", "edi", "ds", "es"};
+
+#define X86_NARROW_ISR_SAVED_COUNT 8
+
+static const char *x86_narrow_isr_saved(const X86NarrowEmitter *emitter,
+                                        int index) {
+  return emitter->bits == 32 ? X86_NARROW_ISR_SAVED_32[index]
+                             : X86_NARROW_ISR_SAVED_16[index];
+}
+
+static int x86_narrow_isr_frame_offset(const X86NarrowEmitter *emitter) {
+  int offset = (X86_NARROW_ISR_SAVED_COUNT + 1) * emitter->word;
+  if (emitter->function->parameter_count >= 2) {
+    offset += emitter->word;
+  }
+  return offset;
+}
+
+static int x86_narrow_interrupt_entry(X86NarrowEmitter *emitter) {
+  int i;
+  if (!x86_narrow_emit(emitter, "cld\n")) {
+    return 0;
+  }
+  for (i = 0; i < X86_NARROW_ISR_SAVED_COUNT; i++) {
+    if (!x86_narrow_emit(emitter, "push %s\n",
+                         x86_narrow_isr_saved(emitter, i))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int x86_narrow_interrupt_parameters(X86NarrowEmitter *emitter) {
+  size_t count = emitter->function->parameter_count;
+  int slot = 0;
+  if (count == 0) {
+    return 1;
+  }
+  if (!x86_narrow_slots_find(&emitter->slots,
+                             emitter->function->parameter_names[0], &slot)) {
+    return 1;
+  }
+  if (!x86_narrow_emit(emitter, "lea %s, [%s + %d]\nmov [%s - %d], %s\n",
+                       emitter->accumulator, emitter->frame,
+                       x86_narrow_isr_frame_offset(emitter), emitter->frame,
+                       -slot, emitter->accumulator)) {
+    return 0;
+  }
+  if (count < 2 ||
+      !x86_narrow_slots_find(&emitter->slots,
+                             emitter->function->parameter_names[1], &slot)) {
+    return 1;
+  }
+  return x86_narrow_emit(
+      emitter, "mov %s, [%s + %d]\nmov [%s - %d], %s\n", emitter->accumulator,
+      emitter->frame, (X86_NARROW_ISR_SAVED_COUNT + 1) * emitter->word,
+      emitter->frame, -slot, emitter->accumulator);
+}
+
+static int x86_narrow_epilogue(X86NarrowEmitter *emitter) {
+  int i;
+  if (!x86_narrow_emit(emitter, "mov %s, %s\npop %s\n", emitter->stack,
+                       emitter->frame, emitter->frame)) {
+    return 0;
+  }
+  if (!emitter->function->is_interrupt) {
+    return x86_narrow_emit(emitter, "ret\n");
+  }
+  for (i = X86_NARROW_ISR_SAVED_COUNT; i > 0; i--) {
+    if (!x86_narrow_emit(emitter, "pop %s\n",
+                         x86_narrow_isr_saved(emitter, i - 1))) {
+      return 0;
+    }
+  }
+  if (emitter->function->parameter_count >= 2 &&
+      !x86_narrow_emit(emitter, "add %s, %d\n", emitter->stack,
+                       emitter->word)) {
+    return 0;
+  }
+  return x86_narrow_emit(emitter, "%s\n",
+                         emitter->bits == 32 ? "iretd" : "iret");
+}
+
 static int x86_narrow_fill(X86NarrowEmitter *emitter, long long width) {
   long long words = width / emitter->word;
   long long bytes = width % emitter->word;
@@ -759,8 +846,7 @@ static int x86_narrow_instruction(X86NarrowEmitter *emitter,
                               &instruction->lhs)) {
       return 0;
     }
-    return x86_narrow_emit(emitter, "mov %s, %s\npop %s\nret\n", emitter->stack,
-                           emitter->frame, emitter->frame);
+    return x86_narrow_epilogue(emitter);
 
   case IR_OP_INLINE_ASM:
     if (!instruction->text) {
@@ -801,6 +887,14 @@ static int x86_narrow_plan_frame(X86NarrowEmitter *emitter) {
 
   for (i = 0; i < function->parameter_count; i++) {
     if (!function->parameter_names || !function->parameter_names[i]) {
+      continue;
+    }
+    if (function->is_interrupt) {
+      used += emitter->word;
+      if (!x86_narrow_slots_add(&emitter->slots, function->parameter_names[i],
+                                -used, emitter->word)) {
+        return 0;
+      }
       continue;
     }
     if (!x86_narrow_slots_add(&emitter->slots, function->parameter_names[i],
@@ -949,6 +1043,14 @@ int code_generator_emit_binary_function_x86_16(
     goto cleanup;
   }
 
+  if (ir_function->is_interrupt &&
+      !code_generator_binary_check_interrupt_signature(generator,
+                                                       ir_function)) {
+    goto cleanup;
+  }
+  if (ir_function->is_interrupt && !x86_narrow_interrupt_entry(&emitter)) {
+    goto cleanup;
+  }
   if (!x86_narrow_emit(&emitter, "push %s\nmov %s, %s\n", emitter.frame,
                        emitter.frame, emitter.stack)) {
     goto cleanup;
@@ -958,6 +1060,10 @@ int code_generator_emit_binary_function_x86_16(
                        emitter.frame_size)) {
     goto cleanup;
   }
+  if (ir_function->is_interrupt &&
+      !x86_narrow_interrupt_parameters(&emitter)) {
+    goto cleanup;
+  }
 
   for (i = 0; i < ir_function->instruction_count; i++) {
     if (!x86_narrow_instruction(&emitter, &ir_function->instructions[i])) {
@@ -965,8 +1071,7 @@ int code_generator_emit_binary_function_x86_16(
     }
   }
 
-  if (!x86_narrow_emit(&emitter, "mov %s, %s\npop %s\nret\n", emitter.stack,
-                       emitter.frame, emitter.frame)) {
+  if (!x86_narrow_epilogue(&emitter)) {
     goto cleanup;
   }
 

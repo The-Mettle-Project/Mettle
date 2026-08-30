@@ -1,0 +1,11 @@
+fn triple(value: int64) -> int64 {
+    return value * 3
+}
+
+fn main() -> int64 {
+    var total: int64 = 0
+    for i in 0..5 {
+        total = total + triple(i)
+    }
+    return total
+}

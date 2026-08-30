@@ -45,6 +45,7 @@
 
 #include "type_checker_internal.h"
 #include "../ir/ir_explain_memory.h"
+#include "codegen/target.h"
 
 #define MEM_MAX_LOCALS 256
 #define MEM_MAX_PARAMS 32
@@ -582,6 +583,11 @@ static void mem_check_null_deref(MemCtx *ctx, ASTNode *pointer_expr,
   }
   MemLocal *local = mem_expr_as_local(ctx, pointer_expr);
   if (!local || !local->is_pointer) {
+    return;
+  }
+  if (mtlc_target()->freestanding) {
+    local->is_null = 0;
+    local->is_wild = 0;
     return;
   }
   if (local->is_null) {
