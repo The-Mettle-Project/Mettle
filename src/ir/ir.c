@@ -2156,21 +2156,15 @@ static void ir_format_operand(const IROperand *operand, char *buffer,
   }
 }
 
-static int ir_format_instruction_line(const IRInstruction *instruction,
-                                      char *buffer, size_t buffer_size) {
-  char dest[IR_OPERAND_FMT_BUFSIZE];
-  char lhs[IR_OPERAND_FMT_BUFSIZE];
-  char rhs[IR_OPERAND_FMT_BUFSIZE];
+static int ir_format_control_line(const IRInstruction *instruction,
+                             const char *dest, const char *lhs,
+                             const char *rhs, char *buffer,
+                             size_t buffer_size, int *handled) {
   int written = 0;
-
-  if (!instruction || !buffer || buffer_size == 0) {
-    return 0;
-  }
-
-  ir_format_operand(&instruction->dest, dest, sizeof(dest));
-  ir_format_operand(&instruction->lhs, lhs, sizeof(lhs));
-  ir_format_operand(&instruction->rhs, rhs, sizeof(rhs));
-
+  (void)dest;
+  (void)lhs;
+  (void)rhs;
+  *handled = 1;
   switch (instruction->op) {
   case IR_OP_LABEL:
     written = snprintf(buffer, buffer_size, "%s %s", ir_opcode_name(instruction->op),
@@ -2195,6 +2189,183 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        ir_opcode_name(instruction->op), dest,
                        instruction->text ? instruction->text : "<unknown>");
     break;
+  default:
+    *handled = 0;
+    break;
+  }
+  return written;
+}
+
+static int ir_format_value_line(const IRInstruction *instruction,
+                             const char *dest, const char *lhs,
+                             const char *rhs, char *buffer,
+                             size_t buffer_size, int *handled) {
+  int written = 0;
+  (void)dest;
+  (void)lhs;
+  (void)rhs;
+  *handled = 1;
+  switch (instruction->op) {
+  case IR_OP_ASSIGN:
+    written = snprintf(buffer, buffer_size, "%s <- %s", dest, lhs);
+    break;
+  case IR_OP_ADDRESS_OF:
+    written = snprintf(buffer, buffer_size, "%s <- &%s", dest, lhs);
+    break;
+  case IR_OP_LOAD:
+    written = snprintf(buffer, buffer_size, "%s <- *%s [%s]%s", dest, lhs, rhs,
+                       instruction->is_volatile ? " volatile" : "");
+    break;
+  case IR_OP_STORE:
+    written = snprintf(buffer, buffer_size, "*%s <- %s [%s]%s", dest, lhs, rhs,
+                       instruction->is_volatile ? " volatile" : "");
+    break;
+  case IR_OP_BINARY:
+    written = snprintf(buffer, buffer_size, "%s = %s %s%s %s", dest, lhs,
+                       instruction->text ? instruction->text : "?",
+                       instruction->is_float ? " (float)" : "", rhs);
+    break;
+  case IR_OP_ROTATE_ADD:
+    written = snprintf(buffer, buffer_size, "%s = rotate_add(%s, %s)", dest, lhs,
+                       rhs);
+    break;
+  case IR_OP_UNARY:
+    written = snprintf(buffer, buffer_size, "%s = %s%s%s", dest,
+                       instruction->text ? instruction->text : "?", lhs,
+                       instruction->is_float ? " (float)" : "");
+    break;
+  case IR_OP_NEW:
+    written = snprintf(buffer, buffer_size, "%s = %s [%s]", dest,
+                       instruction->text ? instruction->text : "<type>", rhs);
+    break;
+  case IR_OP_RETURN:
+    written = snprintf(buffer, buffer_size, "return %s", lhs);
+    break;
+  case IR_OP_INLINE_ASM:
+    written = snprintf(buffer, buffer_size, "inline_asm \"%s\"",
+                       instruction->text ? instruction->text : "");
+    break;
+  case IR_OP_CAST:
+    written = snprintf(buffer, buffer_size, "%s = (%s)%s%s", dest,
+                       instruction->text ? instruction->text : "<type>", lhs,
+                       instruction->is_float ? " (float)" : "");
+    break;
+  case IR_OP_COUNT_WORD_STARTS:
+    written = snprintf(buffer, buffer_size, "%s = count_word_starts(buf=%s, len=%s)",
+                       dest, lhs, rhs);
+    break;
+  case IR_OP_SELECT: {
+    char else_val[128];
+    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                      : NULL,
+                      else_val, sizeof(else_val));
+    if (instruction->text && instruction->argument_count > 1) {
+      char cmp_rhs[128];
+      ir_format_operand(&instruction->arguments[1], cmp_rhs, sizeof(cmp_rhs));
+      written = snprintf(buffer, buffer_size, "%s = select(%s %s %s, %s, %s)",
+                         dest, lhs, instruction->text, cmp_rhs, rhs, else_val);
+    } else {
+      written = snprintf(buffer, buffer_size, "%s = select(%s, %s, %s)", dest,
+                         lhs, rhs, else_val);
+    }
+    break;
+  }
+  default:
+    *handled = 0;
+    break;
+  }
+  return written;
+}
+
+static int ir_format_call_line(const IRInstruction *instruction,
+                             const char *dest, const char *lhs,
+                             const char *rhs, char *buffer,
+                             size_t buffer_size, int *handled) {
+  int written = 0;
+  (void)dest;
+  (void)lhs;
+  (void)rhs;
+  *handled = 1;
+  switch (instruction->op) {
+  case IR_OP_CALL:
+  case IR_OP_CALL_INDIRECT: {
+    size_t offset = 0;
+    offset += (size_t)snprintf(buffer + offset, buffer_size - offset, "%s = %s(",
+                               dest, instruction->text ? instruction->text
+                                                       : "<callee>");
+    for (size_t arg_i = 0; arg_i < instruction->argument_count; arg_i++) {
+      char arg_buffer[128];
+      ir_format_operand(&instruction->arguments[arg_i], arg_buffer,
+                        sizeof(arg_buffer));
+      offset +=
+          (size_t)snprintf(buffer + offset, buffer_size - offset, "%s%s",
+                           arg_i == 0 ? "" : ", ", arg_buffer);
+      if (offset >= buffer_size) {
+        break;
+      }
+    }
+    if (ir_intrinsic_is_atomic(instruction->intrinsic)) {
+      if (ir_intrinsic_is_compare_exchange(instruction->intrinsic)) {
+        written = (int)snprintf(
+            buffer + offset, buffer_size - offset,
+            ") [%s success=%s failure=%s %s]",
+            ir_address_space_name(instruction->address_space),
+            ir_memory_order_name(instruction->memory_order),
+            ir_memory_order_name(instruction->failure_memory_order),
+            ir_memory_scope_name(instruction->memory_scope));
+      } else {
+        written = (int)snprintf(
+            buffer + offset, buffer_size - offset, ") [%s %s %s]",
+            ir_address_space_name(instruction->address_space),
+            ir_memory_order_name(instruction->memory_order),
+            ir_memory_scope_name(instruction->memory_scope));
+      }
+    } else {
+      written = (int)snprintf(buffer + offset, buffer_size - offset, ")");
+    }
+    if (written >= 0) {
+      written += (int)offset;
+    }
+    break;
+  }
+  case IR_OP_GPU_LAUNCH: {
+    size_t offset = 0;
+    offset += (size_t)snprintf(buffer + offset, buffer_size - offset,
+                               "gpu_launch %s [", lhs);
+    for (size_t arg_i = 0; arg_i < instruction->argument_count; arg_i++) {
+      char arg_buffer[128];
+      ir_format_operand(&instruction->arguments[arg_i], arg_buffer,
+                        sizeof(arg_buffer));
+      offset += (size_t)snprintf(buffer + offset, buffer_size - offset,
+                                "%s%s", arg_i == 0 ? "" : ", ",
+                                arg_buffer);
+      if (offset >= buffer_size) {
+        break;
+      }
+    }
+    written = (int)snprintf(buffer + offset, buffer_size - offset, "]");
+    if (written >= 0) {
+      written += (int)offset;
+    }
+    break;
+  }
+  default:
+    *handled = 0;
+    break;
+  }
+  return written;
+}
+
+static int ir_format_gpu_line(const IRInstruction *instruction,
+                             const char *dest, const char *lhs,
+                             const char *rhs, char *buffer,
+                             size_t buffer_size, int *handled) {
+  int written = 0;
+  (void)dest;
+  (void)lhs;
+  (void)rhs;
+  *handled = 1;
+  switch (instruction->op) {
   case IR_OP_ADDRESS_SPACE_ALLOC:
     if (instruction->rhs.kind == IR_OPERAND_INT &&
         instruction->rhs.int_value == 0) {
@@ -2375,132 +2546,23 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        (unsigned)IR_TENSOR_MMA(instruction).n,
                        (unsigned)IR_TENSOR_MMA(instruction).k);
     break;
-  case IR_OP_ASSIGN:
-    written = snprintf(buffer, buffer_size, "%s <- %s", dest, lhs);
-    break;
-  case IR_OP_ADDRESS_OF:
-    written = snprintf(buffer, buffer_size, "%s <- &%s", dest, lhs);
-    break;
-  case IR_OP_LOAD:
-    written = snprintf(buffer, buffer_size, "%s <- *%s [%s]%s", dest, lhs, rhs,
-                       instruction->is_volatile ? " volatile" : "");
-    break;
-  case IR_OP_STORE:
-    written = snprintf(buffer, buffer_size, "*%s <- %s [%s]%s", dest, lhs, rhs,
-                       instruction->is_volatile ? " volatile" : "");
-    break;
-  case IR_OP_BINARY:
-    written = snprintf(buffer, buffer_size, "%s = %s %s%s %s", dest, lhs,
-                       instruction->text ? instruction->text : "?",
-                       instruction->is_float ? " (float)" : "", rhs);
-    break;
-  case IR_OP_ROTATE_ADD:
-    written = snprintf(buffer, buffer_size, "%s = rotate_add(%s, %s)", dest, lhs,
-                       rhs);
-    break;
-  case IR_OP_UNARY:
-    written = snprintf(buffer, buffer_size, "%s = %s%s%s", dest,
-                       instruction->text ? instruction->text : "?", lhs,
-                       instruction->is_float ? " (float)" : "");
-    break;
-  case IR_OP_CALL:
-  case IR_OP_CALL_INDIRECT: {
-    size_t offset = 0;
-    offset += (size_t)snprintf(buffer + offset, buffer_size - offset, "%s = %s(",
-                               dest, instruction->text ? instruction->text
-                                                       : "<callee>");
-    for (size_t arg_i = 0; arg_i < instruction->argument_count; arg_i++) {
-      char arg_buffer[128];
-      ir_format_operand(&instruction->arguments[arg_i], arg_buffer,
-                        sizeof(arg_buffer));
-      offset +=
-          (size_t)snprintf(buffer + offset, buffer_size - offset, "%s%s",
-                           arg_i == 0 ? "" : ", ", arg_buffer);
-      if (offset >= buffer_size) {
-        break;
-      }
-    }
-    if (ir_intrinsic_is_atomic(instruction->intrinsic)) {
-      if (ir_intrinsic_is_compare_exchange(instruction->intrinsic)) {
-        written = (int)snprintf(
-            buffer + offset, buffer_size - offset,
-            ") [%s success=%s failure=%s %s]",
-            ir_address_space_name(instruction->address_space),
-            ir_memory_order_name(instruction->memory_order),
-            ir_memory_order_name(instruction->failure_memory_order),
-            ir_memory_scope_name(instruction->memory_scope));
-      } else {
-        written = (int)snprintf(
-            buffer + offset, buffer_size - offset, ") [%s %s %s]",
-            ir_address_space_name(instruction->address_space),
-            ir_memory_order_name(instruction->memory_order),
-            ir_memory_scope_name(instruction->memory_scope));
-      }
-    } else {
-      written = (int)snprintf(buffer + offset, buffer_size - offset, ")");
-    }
-    if (written >= 0) {
-      written += (int)offset;
-    }
+  default:
+    *handled = 0;
     break;
   }
-  case IR_OP_GPU_LAUNCH: {
-    size_t offset = 0;
-    offset += (size_t)snprintf(buffer + offset, buffer_size - offset,
-                               "gpu_launch %s [", lhs);
-    for (size_t arg_i = 0; arg_i < instruction->argument_count; arg_i++) {
-      char arg_buffer[128];
-      ir_format_operand(&instruction->arguments[arg_i], arg_buffer,
-                        sizeof(arg_buffer));
-      offset += (size_t)snprintf(buffer + offset, buffer_size - offset,
-                                "%s%s", arg_i == 0 ? "" : ", ",
-                                arg_buffer);
-      if (offset >= buffer_size) {
-        break;
-      }
-    }
-    written = (int)snprintf(buffer + offset, buffer_size - offset, "]");
-    if (written >= 0) {
-      written += (int)offset;
-    }
-    break;
-  }
-  case IR_OP_NEW:
-    written = snprintf(buffer, buffer_size, "%s = %s [%s]", dest,
-                       instruction->text ? instruction->text : "<type>", rhs);
-    break;
-  case IR_OP_RETURN:
-    written = snprintf(buffer, buffer_size, "return %s", lhs);
-    break;
-  case IR_OP_INLINE_ASM:
-    written = snprintf(buffer, buffer_size, "inline_asm \"%s\"",
-                       instruction->text ? instruction->text : "");
-    break;
-  case IR_OP_CAST:
-    written = snprintf(buffer, buffer_size, "%s = (%s)%s%s", dest,
-                       instruction->text ? instruction->text : "<type>", lhs,
-                       instruction->is_float ? " (float)" : "");
-    break;
-  case IR_OP_COUNT_WORD_STARTS:
-    written = snprintf(buffer, buffer_size, "%s = count_word_starts(buf=%s, len=%s)",
-                       dest, lhs, rhs);
-    break;
-  case IR_OP_SELECT: {
-    char else_val[128];
-    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
-                                                      : NULL,
-                      else_val, sizeof(else_val));
-    if (instruction->text && instruction->argument_count > 1) {
-      char cmp_rhs[128];
-      ir_format_operand(&instruction->arguments[1], cmp_rhs, sizeof(cmp_rhs));
-      written = snprintf(buffer, buffer_size, "%s = select(%s %s %s, %s, %s)",
-                         dest, lhs, instruction->text, cmp_rhs, rhs, else_val);
-    } else {
-      written = snprintf(buffer, buffer_size, "%s = select(%s, %s, %s)", dest,
-                         lhs, rhs, else_val);
-    }
-    break;
-  }
+  return written;
+}
+
+static int ir_format_simd_int_line(const IRInstruction *instruction,
+                             const char *dest, const char *lhs,
+                             const char *rhs, char *buffer,
+                             size_t buffer_size, int *handled) {
+  int written = 0;
+  (void)dest;
+  (void)lhs;
+  (void)rhs;
+  *handled = 1;
+  switch (instruction->op) {
   case IR_OP_MEMCPY_INLINE:
     written = snprintf(buffer, buffer_size, "%s = memcpy_inline %s, %s", dest,
                        lhs, rhs);
@@ -2650,6 +2712,23 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        maxv);
     break;
   }
+  default:
+    *handled = 0;
+    break;
+  }
+  return written;
+}
+
+static int ir_format_simd_float_line(const IRInstruction *instruction,
+                             const char *dest, const char *lhs,
+                             const char *rhs, char *buffer,
+                             size_t buffer_size, int *handled) {
+  int written = 0;
+  (void)dest;
+  (void)lhs;
+  (void)rhs;
+  *handled = 1;
+  switch (instruction->op) {
   case IR_OP_SIMD_SUM_F64:
   case IR_OP_SIMD_SUM_F32:
     written = snprintf(buffer, buffer_size, "%s += %s(base=%s, len=%s)", dest,
@@ -2751,10 +2830,54 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
                        src_scale, dst_scale, bias);
     break;
   }
-  case IR_OP_NOP:
   default:
-    written = snprintf(buffer, buffer_size, "%s", ir_opcode_name(instruction->op));
+    *handled = 0;
     break;
+  }
+  return written;
+}
+
+static int ir_format_instruction_line(const IRInstruction *instruction,
+                                      char *buffer, size_t buffer_size) {
+  char dest[IR_OPERAND_FMT_BUFSIZE];
+  char lhs[IR_OPERAND_FMT_BUFSIZE];
+  char rhs[IR_OPERAND_FMT_BUFSIZE];
+  int handled = 0;
+  int written;
+
+  if (!instruction || !buffer || buffer_size == 0) {
+    return 0;
+  }
+
+  ir_format_operand(&instruction->dest, dest, sizeof(dest));
+  ir_format_operand(&instruction->lhs, lhs, sizeof(lhs));
+  ir_format_operand(&instruction->rhs, rhs, sizeof(rhs));
+
+  written = ir_format_control_line(instruction, dest, lhs, rhs, buffer,
+                                   buffer_size, &handled);
+  if (!handled) {
+    written = ir_format_value_line(instruction, dest, lhs, rhs, buffer,
+                                   buffer_size, &handled);
+  }
+  if (!handled) {
+    written = ir_format_call_line(instruction, dest, lhs, rhs, buffer,
+                                  buffer_size, &handled);
+  }
+  if (!handled) {
+    written = ir_format_gpu_line(instruction, dest, lhs, rhs, buffer,
+                                 buffer_size, &handled);
+  }
+  if (!handled) {
+    written = ir_format_simd_int_line(instruction, dest, lhs, rhs, buffer,
+                                     buffer_size, &handled);
+  }
+  if (!handled) {
+    written = ir_format_simd_float_line(instruction, dest, lhs, rhs, buffer,
+                                        buffer_size, &handled);
+  }
+  if (!handled) {
+    written =
+        snprintf(buffer, buffer_size, "%s", ir_opcode_name(instruction->op));
   }
 
   if (instruction->is_volatile && instruction->op != IR_OP_LOAD &&

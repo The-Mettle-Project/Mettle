@@ -4763,6 +4763,204 @@ static void compile_dump_ast(ASTNode *program, const char *output_filename) {
   free(ast_output);
 }
 
+/* `mettle test` / `mettle trace`: execute in the compile-time interpreter and
+ * stop - no optimization (unless requested), no codegen, no linking. */
+static int compile_run_comptime(IRProgram *ir_program, ASTNode *program,
+                                const CompilerOptions *options,
+                                ErrorReporter *error_reporter,
+                                const char *input_filename,
+                                const char *source) {
+  if (options->optimize && !compile_optimize_ir(ir_program, program, options)) {
+    return 1;
+  }
+  if (options->test_mode) {
+    return ir_comptime_run_tests(ir_program, error_reporter, input_filename,
+                                 options->test_filter);
+  }
+  return ir_comptime_trace(ir_program, error_reporter, input_filename, source,
+                           options->trace_function, options->trace_args,
+                           options->trace_arg_count);
+}
+
+static int compile_optimize_device_ir(IRProgram *ir_program, ASTNode *program,
+                                      const CompilerOptions *options,
+                                      CompilerProfile *profile) {
+  double phase_start;
+  int opt_ok;
+  if (!options->optimize) {
+    return 1;
+  }
+  compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);
+  phase_start = compiler_profile_begin(profile);
+  opt_ok = compile_optimize_ir(ir_program, program, options);
+  compiler_profile_add(profile, PROFILE_PHASE_IR_OPTIMIZATION, phase_start);
+  return opt_ok;
+}
+
+static int compile_write_kernel_declarations(ASTNode *program,
+                                             const CompilerOptions *options,
+                                             const char *input_filename,
+                                             const char *output_filename) {
+  char decls_path[1024];
+  if (!options->emit_kernel_decls) {
+    return 1;
+  }
+  if (options->emit_kernel_decls[0]) {
+    snprintf(decls_path, sizeof(decls_path), "%s", options->emit_kernel_decls);
+  } else {
+    snprintf(decls_path, sizeof(decls_path), "%s.mettle", output_filename);
+  }
+  return write_kernel_declarations(program, decls_path, input_filename);
+}
+
+/* --emit-ptx: lower every declared kernel to a PTX `.visible .entry` and write
+ * the PTX text to the output file. No object or link is produced -- the CUDA
+ * driver JIT-compiles this text at runtime. */
+static int compile_emit_ptx(IRProgram *ir_program, ASTNode *program,
+                            CodeGenerator *code_generator,
+                            const CompilerOptions *options,
+                            const char *input_filename,
+                            const char *output_filename,
+                            CompilerProfile *profile) {
+  FILE *ptx_out;
+  char *ptx_err = NULL;
+  PtxEmitOptions ptx_options = {options->ptx_target, options->ptx_isa_major,
+                                options->ptx_isa_minor,
+                                options->ptx_tensor_tuple_budget,
+                                options->gpu_checks};
+  int ok;
+
+  if (!compile_optimize_device_ir(ir_program, program, options, profile)) {
+    return 1;
+  }
+  if (options->dump_ir) {
+    compile_dump_device_ir(ir_program, output_filename);
+  }
+  ptx_out = fopen(output_filename, "w");
+  if (!ptx_out) {
+    fprintf(stderr, "Error: could not open PTX output '%s'\n", output_filename);
+    return 1;
+  }
+  ok = ptx_emit_program(ir_program, code_generator, ptx_out, &ptx_options,
+                        &ptx_err);
+  fclose(ptx_out);
+  if (!ok) {
+    fprintf(stderr, "Error: PTX emission failed: %s\n",
+            ptx_err ? ptx_err : "unknown");
+    free(ptx_err);
+    return 1;
+  }
+  if (options->explain && options->optimize) {
+    ir_explain_target_flush("PTX");
+  }
+  printf("Generated PTX: %s\n", output_filename);
+  if (!compile_write_kernel_declarations(program, options, input_filename,
+                                         output_filename)) {
+    return 1;
+  }
+  if (options->report_occupancy) {
+    int sm_count = options->report_sms;
+    int sm_count_is_local = 0;
+    if (sm_count <= 0) {
+      sm_count = detect_gpu_sm_count();
+      sm_count_is_local = sm_count > 0;
+    }
+    report_ptx_occupancy(ir_program, output_filename, options->ptx_target,
+                         sm_count, sm_count_is_local);
+  }
+  return 0;
+}
+
+/* --emit-spirv: lower every declared kernel to a SPIR-V `Kernel` entry point
+ * and write the binary module. Offload-only: no host object or link. An OpenCL
+ * runtime JITs the module at load time. */
+static int compile_emit_spirv(IRProgram *ir_program, ASTNode *program,
+                              CodeGenerator *code_generator,
+                              const CompilerOptions *options,
+                              const char *output_filename,
+                              CompilerProfile *profile) {
+  FILE *spv_out;
+  char *spv_err = NULL;
+  int ok;
+
+  if (!compile_optimize_device_ir(ir_program, program, options, profile)) {
+    return 1;
+  }
+  if (options->dump_ir) {
+    compile_dump_device_ir(ir_program, output_filename);
+  }
+  spv_out = fopen(output_filename, "wb");
+  if (!spv_out) {
+    fprintf(stderr, "Error: could not open SPIR-V output '%s'\n",
+            output_filename);
+    return 1;
+  }
+  ok = spirv_emit_program(ir_program, code_generator, spv_out, &spv_err);
+  fclose(spv_out);
+  if (!ok) {
+    fprintf(stderr, "Error: SPIR-V emission failed: %s\n",
+            spv_err ? spv_err : "unknown");
+    free(spv_err);
+    return 1;
+  }
+  if (options->explain && options->optimize) {
+    ir_explain_target_flush("SPIR-V");
+  }
+  printf("Generated SPIR-V: %s\n", output_filename);
+  return 0;
+}
+
+/* --emit-arm64: lower the scalar subset of every function directly to a
+ * self-contained AArch64 ELF executable (from-scratch backend, no external
+ * assembler and no linker). A `_start` calls main() and exits with its return
+ * value; module globals and the freestanding allocator live in a second,
+ * writable segment. No x86 object.
+ *
+ * -O/--release runs the target-neutral half of the optimizer: scalar and
+ * control-flow transforms that keep the shared IR instruction set. The x86
+ * SIMD idiom recognizers stay off -- they form ops this backend has no
+ * encoding for -- so what reaches the lowering is the same shape it already
+ * consumes, just less of it. */
+static int compile_emit_arm64(IRProgram *ir_program, ASTNode *program,
+                              const CompilerOptions *options,
+                              const char *output_filename) {
+  Arm64Emit ae;
+  unsigned char *arm64_data = NULL;
+  size_t arm64_data_len = 0;
+  int ok;
+
+  if (options->optimize && !compile_optimize_ir(ir_program, program, options)) {
+    return 1;
+  }
+  arm64_emit_init(&ae);
+  ok = arm64_ir_encode_program(&ae, ir_program, "main", &arm64_data,
+                               &arm64_data_len) &&
+       arm64_emit_finalize(&ae);
+  if (ok) {
+    ok = arm64_write_elf(output_filename, ae.code.data, ae.code.len,
+                         arm64_data, arm64_data_len);
+    if (!ok) {
+      fprintf(stderr,
+              "Error: could not write AArch64 ELF '%s' (I/O failure, or the "
+              "program's %zu bytes of code reach the fixed address of the "
+              "writable segment; use the object path for a program this "
+              "large)\n",
+              output_filename, ae.code.len);
+    }
+  } else {
+    fprintf(stderr, "Error: AArch64 lowering failed: %s\n",
+            arm64_error_reason(&ae));
+  }
+  free(arm64_data);
+  arm64_emit_free(&ae);
+  if (!ok) {
+    return 1;
+  }
+  printf("Generated AArch64 ELF: %s\n", output_filename);
+  return 0;
+}
+
+
 int compile_file(const char *input_filename, const char *output_filename,
                  CompilerOptions *options) {
   CompilerProfile profile;
@@ -5176,143 +5374,21 @@ int compile_file(const char *input_filename, const char *output_filename,
     ir_pgo_print_summary();
   }
 
-  /* `mettle test` / `mettle trace`: execute in the compile-time interpreter
-   * and stop - no optimization (unless requested), no codegen, no linking. */
   if (options->test_mode || options->trace_function) {
-    if (options->optimize) {
-      int opt_ok = compile_optimize_ir(ir_program, program, options);
-      if (!opt_ok) {
-        result = 1;
-        goto cleanup;
-      }
-    }
-    if (options->test_mode) {
-      result = ir_comptime_run_tests(ir_program, error_reporter,
-                                     input_filename, options->test_filter);
-    } else {
-      result = ir_comptime_trace(ir_program, error_reporter, input_filename,
-                                 source, options->trace_function,
-                                 options->trace_args,
-                                 options->trace_arg_count);
-    }
+    result = compile_run_comptime(ir_program, program, options, error_reporter,
+                                  input_filename, source);
     goto cleanup;
   }
 
-  /* --emit-ptx: lower every declared kernel to a PTX `.visible .entry` and
-   * write the PTX text to the output file. Under -O, run only the shared
-   * target-neutral scalar/CFG pipeline over kernel-reachable device code; the
-   * x86-specific optimizer is never allowed to shape GPU IR. No object or link
-   * is produced -- the CUDA driver JIT-compiles this text at runtime. */
   if (options->emit_ptx) {
-    if (options->optimize) {
-      compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);
-      phase_start = compiler_profile_begin(&profile);
-      int opt_ok = compile_optimize_ir(ir_program, program, options);
-      compiler_profile_add(&profile, PROFILE_PHASE_IR_OPTIMIZATION,
-                           phase_start);
-      if (!opt_ok) {
-        result = 1;
-        goto cleanup;
-      }
-    }
-    if (options->dump_ir) {
-      compile_dump_device_ir(ir_program, output_filename);
-    }
-    FILE *ptx_out = fopen(output_filename, "w");
-    if (!ptx_out) {
-      fprintf(stderr, "Error: could not open PTX output '%s'\n",
-              output_filename);
-      result = 1;
-      goto cleanup;
-    }
-    char *ptx_err = NULL;
-    PtxEmitOptions ptx_options = {options->ptx_target,
-                                   options->ptx_isa_major,
-                                   options->ptx_isa_minor,
-                                   options->ptx_tensor_tuple_budget,
-                                   options->gpu_checks};
-    int ok = ptx_emit_program(ir_program, code_generator, ptx_out,
-                              &ptx_options, &ptx_err);
-    fclose(ptx_out);
-    if (!ok) {
-      fprintf(stderr, "Error: PTX emission failed: %s\n",
-              ptx_err ? ptx_err : "unknown");
-      free(ptx_err);
-      result = 1;
-      goto cleanup;
-    }
-    if (options->explain && options->optimize) {
-      ir_explain_target_flush("PTX");
-    }
-    printf("Generated PTX: %s\n", output_filename);
-    if (options->emit_kernel_decls) {
-      char decls_path[1024];
-      if (options->emit_kernel_decls[0]) {
-        snprintf(decls_path, sizeof(decls_path), "%s",
-                 options->emit_kernel_decls);
-      } else {
-        snprintf(decls_path, sizeof(decls_path), "%s.mettle", output_filename);
-      }
-      if (!write_kernel_declarations(program, decls_path, input_filename)) {
-        result = 1;
-        goto cleanup;
-      }
-    }
-    if (options->report_occupancy) {
-      int sm_count = options->report_sms;
-      int sm_count_is_local = 0;
-      if (sm_count <= 0) {
-        sm_count = detect_gpu_sm_count();
-        sm_count_is_local = sm_count > 0;
-      }
-      report_ptx_occupancy(ir_program, output_filename, options->ptx_target,
-                           sm_count, sm_count_is_local);
-    }
-    result = 0;
+    result = compile_emit_ptx(ir_program, program, code_generator, options,
+                              input_filename, output_filename, &profile);
     goto cleanup;
   }
 
-  /* --emit-spirv: lower every declared kernel to a SPIR-V `Kernel` entry point
-   * and write the binary module. -O has the same target-neutral,
-   * kernel-reachable policy as PTX. This remains offload-only: no host object
-   * or link. An OpenCL runtime JITs the module at load time. */
   if (options->emit_spirv) {
-    if (options->optimize) {
-      compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);
-      phase_start = compiler_profile_begin(&profile);
-      int opt_ok = compile_optimize_ir(ir_program, program, options);
-      compiler_profile_add(&profile, PROFILE_PHASE_IR_OPTIMIZATION,
-                           phase_start);
-      if (!opt_ok) {
-        result = 1;
-        goto cleanup;
-      }
-    }
-    if (options->dump_ir) {
-      compile_dump_device_ir(ir_program, output_filename);
-    }
-    FILE *spv_out = fopen(output_filename, "wb");
-    if (!spv_out) {
-      fprintf(stderr, "Error: could not open SPIR-V output '%s'\n",
-              output_filename);
-      result = 1;
-      goto cleanup;
-    }
-    char *spv_err = NULL;
-    int ok = spirv_emit_program(ir_program, code_generator, spv_out, &spv_err);
-    fclose(spv_out);
-    if (!ok) {
-      fprintf(stderr, "Error: SPIR-V emission failed: %s\n",
-              spv_err ? spv_err : "unknown");
-      free(spv_err);
-      result = 1;
-      goto cleanup;
-    }
-    if (options->explain && options->optimize) {
-      ir_explain_target_flush("SPIR-V");
-    }
-    printf("Generated SPIR-V: %s\n", output_filename);
-    result = 0;
+    result = compile_emit_spirv(ir_program, program, code_generator, options,
+                                output_filename, &profile);
     goto cleanup;
   }
 
@@ -5325,52 +5401,8 @@ int compile_file(const char *input_filename, const char *output_filename,
     goto cleanup;
   }
 
-  /* --emit-arm64: lower the scalar subset of every function directly to a
-   * self-contained AArch64 ELF executable (from-scratch backend, no external
-   * assembler and no linker). A `_start` calls main() and exits with its return
-   * value; module globals and the freestanding allocator live in a second,
-   * writable segment. No x86 object.
-   *
-   * -O/--release runs the target-neutral half of the optimizer: scalar and
-   * control-flow transforms that keep the shared IR instruction set. The x86
-   * SIMD idiom recognizers stay off -- they form ops this backend has no
-   * encoding for -- so what reaches the lowering is the same shape it already
-   * consumes, just less of it. */
   if (options->emit_arm64) {
-    if (options->optimize && !compile_optimize_ir(ir_program, program, options)) {
-      result = 1;
-      goto cleanup;
-    }
-    Arm64Emit ae;
-    unsigned char *arm64_data = NULL;
-    size_t arm64_data_len = 0;
-    arm64_emit_init(&ae);
-    int ok = arm64_ir_encode_program(&ae, ir_program, "main", &arm64_data,
-                                     &arm64_data_len) &&
-             arm64_emit_finalize(&ae);
-    if (ok) {
-      ok = arm64_write_elf(output_filename, ae.code.data, ae.code.len,
-                           arm64_data, arm64_data_len);
-      if (!ok) {
-        fprintf(stderr,
-                "Error: could not write AArch64 ELF '%s' (I/O failure, or the "
-                "program's %zu bytes of code reach the fixed address of the "
-                "writable segment; use the object path for a program this "
-                "large)\n",
-                output_filename, ae.code.len);
-      }
-    } else {
-      fprintf(stderr, "Error: AArch64 lowering failed: %s\n",
-              arm64_error_reason(&ae));
-    }
-    free(arm64_data);
-    arm64_emit_free(&ae);
-    if (!ok) {
-      result = 1;
-      goto cleanup;
-    }
-    printf("Generated AArch64 ELF: %s\n", output_filename);
-    result = 0;
+    result = compile_emit_arm64(ir_program, program, options, output_filename);
     goto cleanup;
   }
 
