@@ -14074,6 +14074,55 @@ catch {
   Write-CaseResult -Name "freestanding_kernel_image" -Passed $false -Reason $_.Exception.Message
 }
 
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $baseSource = "tests/test_cross_target.mettle"
+  $baseAligned = if ($IsLinux) { "0x800000" } else { "0x180000000" }
+  $baseValue = if ($IsLinux) { [uint64]8388608 } else { [uint64]6442450944 }
+  $baseMisaligned = if ($IsLinux) { "0x800123" } else { "0x180000123" }
+  $baseExe = Join-Path $tmpDir "image_base_test"
+  if (-not $IsLinux) { $baseExe = "$baseExe.exe" }
+  if (Test-Path $baseExe) { Remove-Item -Path $baseExe -Force }
+  $baseOut = & $CompilerPath $baseSource "--build" "--image-base" $baseAligned "-o" $baseExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $baseExe)) {
+    throw "building at image base $baseAligned failed: $baseOut"
+  }
+  & $baseExe | Out-Null
+  if ($LASTEXITCODE -ne 30) {
+    throw "the executable built at $baseAligned returned $LASTEXITCODE, expected 30"
+  }
+  $baseBytes = [System.IO.File]::ReadAllBytes($baseExe)
+  if ($baseBytes[0] -eq 0x4D -and $baseBytes[1] -eq 0x5A) {
+    $peOffset = [System.BitConverter]::ToInt32($baseBytes, 0x3C)
+    $recorded = [System.BitConverter]::ToUInt64($baseBytes, $peOffset + 48)
+    if ($recorded -ne $baseValue) {
+      throw "the PE header records image base 0x$($recorded.ToString('x')), not $baseAligned"
+    }
+  }
+  else {
+    $entry = [System.BitConverter]::ToUInt64($baseBytes, 0x18)
+    if ($entry -lt $baseValue -or $entry -ge ($baseValue + [uint64]1048576)) {
+      throw "the ELF entry point 0x$($entry.ToString('x')) is not inside the image at $baseAligned"
+    }
+  }
+
+  $badExe = Join-Path $tmpDir "image_base_bad"
+  if (Test-Path $badExe) { Remove-Item -Path $badExe -Force }
+  $badOut = & $CompilerPath $baseSource "--build" "--image-base" $baseMisaligned "-o" $badExe 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0 -or (Test-Path $badExe)) {
+    throw "a misaligned image base produced an executable anyway: $badOut"
+  }
+  if ($badOut -notmatch "not aligned to") {
+    throw "the misaligned image base was not reported: $badOut"
+  }
+  Write-CaseResult -Name "image_base_is_honored" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "image_base_is_honored" -Passed $false -Reason $_.Exception.Message
+}
+
 # 32-bit gate: the i386 target must reach the narrow code generator. Emitting
 # 64-bit code into a 32-bit image is the failure that looks like success, so
 # this asserts the shape of what came out rather than only that it came out.

@@ -33,6 +33,52 @@ static void check(int bits, const char *text, const char *expected_hex) {
 }
 
 
+static void check_narrow_frame_shapes(void) {
+  check(16, "push bp", "55");
+  check(16, "mov bp, sp", "89e5");
+  check(16, "sub sp, 12", "83ec0c");
+  check(16, "mov ax, word ptr [bp - 2]", "8b46fe");
+  check(16, "mov word ptr [bp - 2], ax", "8946fe");
+  check(16, "mov bx, word ptr [bp + 4]", "8b5e04");
+  check(16, "lea ax, [bp - 4]", "8d46fc");
+  check(16, "mov [bx], ax", "8907");
+  check(16, "mov [bx + 4], ax", "894704");
+  check(16, "movzx ax, byte ptr [bx]", "0fb607");
+  check(16, "cwd", "99");
+  check(16, "idiv bx", "f7fb");
+  check(16, "mul bx", "f7e3");
+  check(16, "mov cx, 4", "b90400");
+  check(16, "dec cx", "49");
+  check(16, "iret", "cf");
+  check(16, "push ds", "1e");
+  check(16, "pop es", "07");
+  check(16, "mov sp, bp", "89ec");
+  check(16, "pop bp", "5d");
+
+  check(32, "push ebp", "55");
+  check(32, "mov ebp, esp", "89e5");
+  check(32, "sub esp, 12", "83ec0c");
+  check(32, "mov eax, dword ptr [ebp - 4]", "8b45fc");
+  check(32, "mov dword ptr [ebp - 4], eax", "8945fc");
+  check(32, "mov ebx, dword ptr [ebp + 8]", "8b5d08");
+  check(32, "lea eax, [ebp - 8]", "8d45f8");
+  check(32, "mov [ebx], eax", "8903");
+  check(32, "mov [ebx + 4], eax", "894304");
+  check(32, "movzx eax, byte ptr [ebx]", "0fb603");
+  check(32, "movsx eax, word ptr [ebx]", "0fbf03");
+  check(32, "cdq", "99");
+  check(32, "idiv ebx", "f7fb");
+  check(32, "mul ebx", "f7e3");
+  check(32, "mov ecx, 4", "b904000000");
+  check(32, "dec ecx", "49");
+  check(32, "iretd", "cf");
+  check(32, "push ds", "1e");
+  check(32, "pop es", "07");
+  check(32, "mov esp, ebp", "89ec");
+  check(32, "pop ebp", "5d");
+  check(32, "add ebx, 4", "83c304");
+}
+
 static void check_systems_extensions(void) {
   check(64, "bswap eax", "0fc8");
   check(64, "bswap rax", "480fc8");
@@ -130,6 +176,7 @@ static void check_documented_instructions(void) {
 }
 
 int main(void) {
+  check_narrow_frame_shapes();
   check_systems_extensions();
   check(64, "nop", "90");
   check(64, "ret", "c3");

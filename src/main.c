@@ -3855,6 +3855,36 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  if (mtlc_target()->image_base_set && !options.flat_output) {
+    if (!build_executable) {
+      fprintf(stderr,
+              "Error: --image-base says where a linked image loads, and this "
+              "compile produces a relocatable object; add --build, or "
+              "--emit-flat <file> for a raw image\n");
+      free((void *)options.import_directories);
+      free((void *)options.link_arguments);
+      return 1;
+    }
+    {
+      uint64_t base = mtlc_target()->image_base;
+      uint64_t alignment =
+          mtlc_target()->format == BINARY_TARGET_FORMAT_COFF_WIN64 ? 0x10000u
+                                                                   : 0x1000u;
+      if (base % alignment) {
+        fprintf(stderr,
+                "Error: --image-base 0x%llx is not aligned to 0x%llx, which is "
+                "the boundary a %s image loads on\n",
+                (unsigned long long)base, (unsigned long long)alignment,
+                mtlc_target()->format == BINARY_TARGET_FORMAT_COFF_WIN64
+                    ? "PE"
+                    : "ELF");
+        free((void *)options.import_directories);
+        free((void *)options.link_arguments);
+        return 1;
+      }
+    }
+  }
+
   if (options.safe && mtlc_target()->freestanding) {
     fprintf(stderr,
             "Error: --safe on the %s target has no runtime to report a "
