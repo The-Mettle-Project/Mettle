@@ -25,6 +25,41 @@ static int ir_popcount_body_is_v_shift_step(const IRInstruction *instruction,
   return 0;
 }
 
+/* Does this type name hold at most eight bits? */
+static int ir_type_name_is_byte(const char *name) {
+  return name && (strcmp(name, "uint8") == 0 || strcmp(name, "int8") == 0 ||
+                  strcmp(name, "bool") == 0 || strcmp(name, "char") == 0);
+}
+
+/* Is `symbol` declared, as a local or as a parameter, at byte width?
+ *
+ * Eight unrolled steps is the whole loop only when the value cannot carry more
+ * than eight significant bits. Nothing checked that, so a uint64 popcount loop
+ * folded to its low byte's answer and popcount(0xFFFFFFFFFFFFFFFF) came back
+ * as 8. */
+static int ir_symbol_is_byte_wide(const IRFunction *function,
+                                  const char *symbol) {
+  if (!function || !symbol) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->parameter_count; i++) {
+    if (function->parameter_names && function->parameter_names[i] &&
+        strcmp(function->parameter_names[i], symbol) == 0) {
+      return function->parameter_types &&
+             ir_type_name_is_byte(function->parameter_types[i]);
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_DECLARE_LOCAL &&
+        instruction->dest.kind == IR_OPERAND_SYMBOL && instruction->dest.name &&
+        strcmp(instruction->dest.name, symbol) == 0) {
+      return ir_type_name_is_byte(instruction->text);
+    }
+  }
+  return 0;
+}
+
 static int ir_popcount_body_matches(const IRFunction *function, size_t body_start,
                                     size_t body_end, const char *v_symbol,
                                     const char **count_symbol_out,
@@ -290,6 +325,14 @@ static int ir_try_fold_popcount_byte_loop_at(IRFunction *function,
   if (!ir_popcount_body_matches(function, branch_index + 1, jump_index,
                                 v_symbol, &count_symbol, &use_int32_cast,
                                 &use_uint8_cast)) {
+    return 1;
+  }
+
+  /* The unroll below runs eight steps and stops, so the value has to be one
+   * that eight shifts exhaust. Only the declaration says that: a body cast
+   * back to uint8 narrows what the shift produced, and the value the loop
+   * STARTS from can still be wider than a byte. */
+  if (!ir_symbol_is_byte_wide(function, v_symbol)) {
     return 1;
   }
 

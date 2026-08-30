@@ -1,0 +1,65 @@
+// The popcount fold unrolls eight shift-and-test steps and stops, which is the
+// whole loop only for a value eight shifts exhaust. Nothing checked the width,
+// so the same fold fired on a uint64 loop and answered its low byte's count:
+// popcount(0xFFFFFFFFFFFFFFFF) came back as 8 under --release and 64 without.
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+fn count_u8(b: uint8) -> int32 {
+  var count: int32 = 0;
+  var v: uint8 = b;
+  while (v != 0) {
+    count = count + (int32)(v & 1);
+    v = (uint8)(v / 2);
+  }
+  return count;
+}
+
+fn count_u32(b: uint32) -> int32 {
+  var count: int32 = 0;
+  var v: uint32 = b;
+  while (v != 0) {
+    count = count + (int32)(v & 1);
+    v = v >> 1;
+  }
+  return count;
+}
+
+fn count_u64(b: uint64) -> int32 {
+  var count: int32 = 0;
+  var v: uint64 = b;
+  while (v != 0) {
+    count = count + (int32)(v & 1);
+    v = v >> 1;
+  }
+  return count;
+}
+
+fn count_i64(b: int64) -> int32 {
+  var count: int32 = 0;
+  var v: int64 = b;
+  while (v != 0) {
+    count = count + (int32)(v & 1);
+    v = v >> 1;
+  }
+  return count;
+}
+
+fn main() -> int32 {
+  if (count_u8((uint8)opaque(255)) != 8) { return 1; }
+  if (count_u8((uint8)opaque(1)) != 1) { return 2; }
+  if (count_u8((uint8)opaque(0)) != 0) { return 3; }
+  if (count_u8((uint8)opaque(170)) != 4) { return 4; }
+
+  if (count_u32((uint32)opaque(4294967295)) != 32) { return 5; }
+  if (count_u32((uint32)opaque(65535)) != 16) { return 6; }
+  if (count_u32((uint32)opaque(256)) != 1) { return 7; }
+
+  if (count_u64((uint64)opaque(0 - 1)) != 64) { return 8; }
+  if (count_u64((uint64)opaque(4294967296)) != 1) { return 9; }
+  if (count_u64((uint64)opaque(255)) != 8) { return 10; }
+
+  if (count_i64(opaque(255)) != 8) { return 11; }
+  if (count_i64(opaque(1099511627776)) != 1) { return 12; }
+
+  return 0;
+}

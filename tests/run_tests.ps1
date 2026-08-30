@@ -13482,6 +13482,8 @@ $runFixtures = @(
      What = "a codegen check failed" },
   @{ Name = "decl_order"; Path = "tests/codegen/decl_order.mettle"
      What = "a type declared below the one that names it was not registered in time" },
+  @{ Name = "popcount_widths"; Path = "tests/codegen/popcount_widths.mettle"
+     What = "the eight-step popcount fold fired on a value wider than a byte" },
   @{ Name = "int_edges"; Path = "tests/codegen/int_edges.mettle"
      What = "a codegen check failed" },
   @{ Name = "funcptr"; Path = "tests/codegen/funcptr.mettle"
