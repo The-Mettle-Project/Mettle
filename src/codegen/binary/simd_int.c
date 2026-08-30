@@ -1532,26 +1532,38 @@ int code_generator_binary_emit_simd_dot_i32(
                                                       BINARY_GP_RAX);
 }
 
-/* IR_OP_SIMD_DOT_I8: int8 x int8 -> int32 dot product (the inner loop of
- * quantized GEMM/GEMV). dest = int32 sum symbol, lhs/rhs = the two int8 array
- * bases, arguments[0] = element count n. Two int32 accumulators (ymm2/ymm3)
- * consume 32 int8 per iteration: vpmovsxbw sign-extends 16 bytes to 16 int16,
+/* IR_OP_SIMD_DOT_I8: byte x byte -> int32 dot product (the inner loop of
+ * quantized GEMM/GEMV). dest = int32 sum symbol, lhs/rhs = the two byte array
+ * bases, arguments[0] = element count n, is_unsigned = whether the source's
+ * loads widen zero-extended. Two int32 accumulators (ymm2/ymm3) consume 32
+ * bytes per iteration: vpmovsxbw or vpmovzxbw widens 16 bytes to 16 int16,
  * vpmaddwd folds adjacent pairs into 8 int32 partial dots, vpaddd accumulates.
  * The lanes are reduced to one signed int32 in-vector (wrapping at 32 bits like
  * the scalar `int32` accumulator does), then a scalar byte tail handles n % 32.
  * The whole reduction is summed in RAX and stored truncated to the int32 dest,
- * which preserves the source's int32 wraparound (sum mod 2^32). */
+ * which preserves the source's int32 wraparound (sum mod 2^32).
+ *
+ * The widening used to be zero-extending whatever the element type said, so
+ * every negative int8 in a dot product came back as its unsigned reading: a
+ * kernel over -1 and 3 answered 765 per element instead of -3. */
 int code_generator_binary_emit_simd_dot_i8(CodeGenerator *generator,
                                            BinaryFunctionContext *context,
                                            const IRInstruction *instruction) {
   BinaryCodeBuffer *b = NULL;
   size_t loop_top = 0, after_main = 0, tail_top = 0, j_done = 0;
+  int (*widen)(BinaryCodeBuffer *, int, int, int) = NULL;
+  int (*tail_load)(BinaryCodeBuffer *, BinaryGpRegister, BinaryGpRegister,
+                   int) = NULL;
 
   if (!generator || !context || !instruction ||
       instruction->argument_count != 1 || !instruction->arguments) {
     code_generator_set_error(generator, "Malformed simd_dot_i8");
     return 0;
   }
+  widen = instruction->is_unsigned ? wcs_avx_vpmovzxbw_ymm_mem
+                                   : wcs_avx_vpmovsxbw_ymm_mem;
+  tail_load = instruction->is_unsigned ? binary_emit_movzx_reg_mem8
+                                       : binary_emit_movsx_reg_mem8;
   b = &context->code;
 
   /* a->RCX, b->RDX, n->R8; end pointer R11 = RCX + n (int8 = 1 byte). */
@@ -1576,11 +1588,11 @@ int code_generator_binary_emit_simd_dot_i8(CodeGenerator *generator,
       !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R9, BINARY_GP_RCX) ||
       !wcs_cmp_reg_imm32(b, BINARY_GP_R9, 32) ||
       !wcs_jcc(b, 0x82 /* jb */, &after_main) ||
-      !wcs_avx_vpmovzxbw_ymm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_avx_vpmovzxbw_ymm_mem(b, 1, BINARY_GP_RDX, 0) ||
+      !widen(b, 0, BINARY_GP_RCX, 0) ||
+      !widen(b, 1, BINARY_GP_RDX, 0) ||
       !wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) || !wcs_avx_vpaddd_ymm(b, 2, 2, 0) ||
-      !wcs_avx_vpmovzxbw_ymm_mem(b, 0, BINARY_GP_RCX, 16) ||
-      !wcs_avx_vpmovzxbw_ymm_mem(b, 1, BINARY_GP_RDX, 16) ||
+      !widen(b, 0, BINARY_GP_RCX, 16) ||
+      !widen(b, 1, BINARY_GP_RDX, 16) ||
       !wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) || !wcs_avx_vpaddd_ymm(b, 3, 3, 0) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
@@ -1603,13 +1615,13 @@ int code_generator_binary_emit_simd_dot_i8(CodeGenerator *generator,
     return 0;
   }
 
-  /* Scalar byte tail: while (cur < end), zero-extend a[i]*b[i] into RAX (int8 is
-   * byte-unsigned in Mettle, matching the vpmovzxbw widening above). */
+  /* Scalar byte tail: while (cur < end), widen a[i]*b[i] into RAX the same way
+   * the vector body did. */
   tail_top = b->size;
   if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11) ||
       !wcs_jcc(b, 0x83 /* jae */, &j_done) ||
-      !binary_emit_movzx_reg_mem8(b, BINARY_GP_R10, BINARY_GP_RCX, 0) ||
-      !binary_emit_movzx_reg_mem8(b, BINARY_GP_R9, BINARY_GP_RDX, 0) ||
+      !tail_load(b, BINARY_GP_R10, BINARY_GP_RCX, 0) ||
+      !tail_load(b, BINARY_GP_R9, BINARY_GP_RDX, 0) ||
       !binary_emit_imul_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
       !wcs_add_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R10) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 1) ||

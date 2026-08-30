@@ -3113,9 +3113,10 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
   }
 
   case IR_OP_SIMD_DOT_I8: {
-    /* int8 x int8 -> int32 dot: bytes widen zero-extended (the language's
-     * int8 load convention, and the kernel's vpmovzxbw), accumulated with
-     * int32 wraparound into the dest sum. */
+    /* byte x byte -> int32 dot: each byte widens the way the source's loads
+     * did, which insn->is_unsigned records, accumulated with int32 wraparound
+     * into the dest sum. Widening every byte zero-extended read a negative
+     * int8 as its unsigned value. */
     unsigned long long a, b;
     long long n;
     IRInterpValue acc;
@@ -3133,7 +3134,13 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
           !ii_mem_read(machine, b + (unsigned long long)i, 1, &y)) {
         return 0;
       }
-      sum += (unsigned int)(unsigned char)x * (unsigned int)(unsigned char)y;
+      {
+        int xw = insn->is_unsigned ? (int)(unsigned char)x
+                                   : (int)(signed char)(unsigned char)x;
+        int yw = insn->is_unsigned ? (int)(unsigned char)y
+                                   : (int)(signed char)(unsigned char)y;
+        sum += (unsigned int)(xw * yw);
+      }
     }
     machine->fuel -= n;
     IRInterpValue out =

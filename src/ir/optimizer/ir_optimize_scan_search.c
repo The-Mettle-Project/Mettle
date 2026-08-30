@@ -1203,8 +1203,13 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
         ins->op == IR_OP_ASSIGN) {
       continue;
     }
+    /* Require FOUR-BYTE loads: the kernel reads and strides int32 elements, so
+     * a loop over byte arrays with an int64 accumulator matched here and was
+     * replayed four bytes at a time over the wrong memory. The byte dot is a
+     * separate recognizer, keyed on width 1. */
     if (ins->op == IR_OP_LOAD && ins->lhs.kind == IR_OPERAND_TEMP &&
-        ins->lhs.name) {
+        ins->lhs.name && ins->rhs.kind == IR_OPERAND_INT &&
+        ins->rhs.int_value == 4) {
       const char *base = NULL;
       if (ir_resolve_indexed_address_temp(function, i, iv_symbol, NULL,
                                           ins->lhs.name, &base, NULL, NULL)) {
@@ -1290,6 +1295,10 @@ static int ir_try_vectorize_dot_i8_at(IRFunction *function, size_t header_index,
   IRInstruction fused = {0};
   IROperand len = {0};
   int has_mul_add = 0;
+  /* Whether the byte loads widen zero-extended. A uint8 array and an int8 array
+   * reach here in the same shape, and the two dot products differ: the kernel
+   * has to be told which widening the source asked for. */
+  int a_unsigned = 0, b_unsigned = 0;
 
   if (!function || header_index + 4 >= function->instruction_count) {
     return 1;
@@ -1385,8 +1394,10 @@ static int ir_try_vectorize_dot_i8_at(IRFunction *function, size_t header_index,
                                           ins->lhs.name, &base, NULL, NULL)) {
         if (!a_symbol) {
           a_symbol = base;
+          a_unsigned = ins->is_unsigned;
         } else if (!b_symbol && strcmp(base, a_symbol) != 0) {
           b_symbol = base;
+          b_unsigned = ins->is_unsigned;
         }
       }
     }
@@ -1419,7 +1430,15 @@ static int ir_try_vectorize_dot_i8_at(IRFunction *function, size_t header_index,
     return 1;
   }
 
+  /* Both sides have to widen the same way; a mixed int8/uint8 dot is not a
+   * shape this kernel has. */
+  if (a_unsigned != b_unsigned) {
+    ir_operand_destroy(&len);
+    return 1;
+  }
+
   fused.op = IR_OP_SIMD_DOT_I8;
+  fused.is_unsigned = a_unsigned;
   fused.location = header->location;
   fused.dest = ir_operand_symbol(sum_symbol);
   fused.lhs = ir_operand_symbol(a_symbol);
