@@ -51,7 +51,8 @@ DETERMINISM RULES (why a divergence is always a real miscompile):
     2^width is defined semantics, so it is still deterministic
   - a narrow RETURN TYPE wraps its value to that width by definition (it is
     what the return register carries), so the narrow-return helpers in
-    stmt_narrow_call let their arithmetic overflow on purpose. That is the
+    stmt_narrow_call and stmt_narrow_inline let their arithmetic overflow on
+    purpose. That is the
     shape an inlined body used to lose: with no call boundary the temp kept
     all 64 bits and the comparison behind it read the unwrapped number
   - struct fields and arrays are always fully written before any read
@@ -190,6 +191,7 @@ class Gen:
             (6,  self.stmt_guarded_accum),
             (5,  self.stmt_fnptr),
             (8,  self.stmt_narrow_call),
+            (8,  self.stmt_narrow_inline),
         ]
         total = sum(w for w, _ in kinds)
         roll = self.rng.uniform(0, total)
@@ -551,6 +553,47 @@ class Gen:
             else:  # divide by a runtime variable, forced nonzero
                 self.emit(f"{u} = {u} / (uint32)(({z} & 15) | 1);")
         self.emit(f"{acc} = ({acc} + (int64){u} + (int64){z}) & {MASK};")
+
+    def stmt_narrow_inline(self):
+        """Narrow arithmetic read WITHOUT a store in between: a temp is 64 bits
+        wide whatever the expression's type is, and only a store into a narrow
+        location used to cut the value back down. Everything here reads the
+        result the way a store does not -- a comparison, a widening, a divide,
+        an interpolation -- so an unwrapped value shows up as a different exit
+        code. The operands are pushed to the edge of the type on purpose."""
+        acc = self.ensure_acc()
+        ty = self.rng.choice(["int32", "uint32", "int16", "uint16",
+                              "int8", "uint8"])
+        lo, hi = {"int32": (-2147483648, 2147483647),
+                  "uint32": (0, 4294967295),
+                  "int16": (-32768, 32767),
+                  "uint16": (0, 65535),
+                  "int8": (-128, 127),
+                  "uint8": (0, 255)}[ty]
+        near = self.rng.choice([hi, hi - 1, hi // 2 + 1, lo, lo + 1])
+        a = self.fresh("qa")
+        b = self.fresh("qb")
+        self.emit(f"var {a}: {ty} = ({ty}){near};")
+        self.emit(f"var {b}: {ty} = ({ty})(({self.atom(1)} & 7) + 1);")
+        op = self.rng.choice(["+", "-", "*", "<<"])
+        if op == "<<":
+            expr = f"({a} << ({ty})(({self.atom(1)} & 3) + 1))"
+        else:
+            expr = f"({a} {op} {b})"
+        # A comparison: the branch the unwrapped value took the wrong way.
+        self.emit(f"if ({expr} > ({ty})0) {{ "
+                  f"{acc} = ({acc} + 11) & {MASK}; }}")
+        # A widening: (int64) of an expression, never of a stored value.
+        self.emit(f"{acc} = ({acc} + (int64)({expr})) & {MASK};")
+        # A divide reads the wrapped numerator.
+        self.emit(f"{acc} = ({acc} + (int64)(({expr}) / ({ty})3)) & {MASK};")
+        # And the unary forms, which leave the width their own two ways.
+        self.emit(f"{acc} = ({acc} + (int64)(~{a})) & {MASK};")
+        self.emit(f"{acc} = ({acc} + (int64)(-{b})) & {MASK};")
+        # A shift count at or past the width masks to the width, as an int64
+        # shift does.
+        self.emit(f"{acc} = ({acc} + (int64)({a} >> "
+                  f"({ty})(({self.atom(1)} & 1) * 8 + 16))) & {MASK};")
 
     # ---- wrapping uint32 accumulator statement ------------------------------
     def stmt_u32wrap(self):
@@ -1063,6 +1106,7 @@ class Gen:
         self.emit("var acc: int64 = 1;")
         self.live_vars = ["acc"]
         self.stmt_narrow_call()
+        self.stmt_narrow_inline()
         # ~8% jumbo mains: enough statements to trip the MIR size bail so
         # the fallback backend sees every shape too
         if self.rng.random() < 0.08:

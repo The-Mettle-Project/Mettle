@@ -1,0 +1,30 @@
+// KNOWN BUG, not yet fixed: an unsigned divide whose dividend is a nested
+// expression is emitted as IDIV by the baseline emitter, so it answers the
+// signed quotient. `(a >> 59) / b` on uint64 gives -15 where the answer is 0.
+// The MIR backend is right; the fallback one is not, and -s forces it.
+//
+// The IR carries is_unsigned on the binary, set at lowering from the operand
+// types. Both operands come back untyped here: a local identifier is not in
+// the symbol table that stage can see, and a nested binary has no home to read
+// a type off. The dividend is a temp, so the backend cannot recover it either,
+// and the one path that works is the one where the dividend is a named local.
+import "std/io";
+
+@noinline fn u64(v: uint64) -> uint64 { return v; }
+
+fn main() -> int32 {
+  var a: uint64 = u64(18446744073709551615);
+  var b: uint64 = u64(18446744073709551614);
+
+  // The dividend through a local: right in every mode.
+  var shifted: uint64 = a >> (uint64)59;
+  if (shifted / b != (uint64)0) { return 1; }
+  if (shifted % b != (uint64)31) { return 2; }
+
+  // The same value as an expression: wrong under -s.
+  if ((a >> (uint64)59) / b != (uint64)0) { return 3; }
+  if ((a >> (uint64)59) % b != (uint64)31) { return 4; }
+
+  println("ok");
+  return 0;
+}

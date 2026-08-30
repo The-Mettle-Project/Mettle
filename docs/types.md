@@ -64,6 +64,13 @@ Mixing widths in one expression is allowed, and the narrower side widens.
 Storing a `float64` into a `float32` converts on its own, so the cast rule
 below covers the integer types only.
 
+Each operation rounds once, at the width it is written in. A summation is the
+one place where an optimized build can answer differently from an unoptimized
+one: the vectorizers add a float reduction lane by lane and combine the lanes
+at the end, which is the same additions in a different order, and floating
+point addition is not associative. `METTLE_NO_SIMD=1` turns that off when a
+run has to match `-O0` exactly.
+
 ## bool
 
 `bool` is one byte and holds `true` or `false`. Comparison and the logical
