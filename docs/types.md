@@ -170,6 +170,10 @@ var vga: volatile uint16* = (volatile uint16*)0xB8000;
 vga[0] = 0x0F41;
 ```
 
+A global may be `volatile` too, which is the flag an interrupt handler
+writes and the main line reads. The qualifier travels with the symbol there,
+so a function that names one keeps every value in memory.
+
 [Bare metal](bare-metal.md) covers what the compiler guarantees and what it
 costs.
 

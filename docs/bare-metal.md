@@ -64,18 +64,24 @@ registers its calling convention names, and restore the stack it moves.
 Intel syntax, one instruction per line, `;`, `#`, `//` and `/* */` comments.
 
 - The full integer instruction set a systems program reaches for: the ALU
-  group, `mov`/`movzx`/`movsx`/`movsxd`/`movabs`, `lea`, `test`, `xchg`, the
-  shift and rotate group, `imul` in all three forms, `div`/`idiv`, `push`/`pop`,
-  `inc`/`dec`, `not`/`neg`, `setcc`, `cmovcc`, `bt`/`bts`/`btr`/`btc`,
-  `bsf`/`bsr`/`popcnt`/`lzcnt`/`tzcnt`, `xadd`, `cmpxchg`, and the string
-  instructions with `rep`/`repe`/`repne`.
+  group, `mov`/`movzx`/`movsx`/`movsxd`/`movabs`/`movbe`, `lea`, `test`,
+  `xchg`, the shift and rotate group including `shld`/`shrd`, `imul` in all
+  three forms, `div`/`idiv`, `push`/`pop`, `inc`/`dec`, `not`/`neg`, `bswap`,
+  `setcc`, `cmovcc`, `bt`/`bts`/`btr`/`btc`,
+  `bsf`/`bsr`/`popcnt`/`lzcnt`/`tzcnt`, `xadd`, `cmpxchg`,
+  `cmpxchg8b`/`cmpxchg16b`, and the string instructions with
+  `rep`/`repe`/`repne`.
 - Control transfer: `jmp`, `call`, `ret`, `retf`, `jcc`, `loop`, `jrcxz`, far
   `jmp`/`call` in the `selector:offset` form.
 - System instructions: `cli`, `sti`, `hlt`, `cld`, `std`, `int`, `iret`,
   `iretd`, `iretq`, `in`, `out`, `lgdt`, `lidt`, `sgdt`, `sidt`, `lldt`, `ltr`,
-  `lmsw`, `smsw`, `invlpg`, `cpuid`, `rdmsr`, `wrmsr`, `rdtsc`, `swapgs`,
-  `xgetbv`, `syscall`, `sysret`, `sysenter`, `sysexit`, `wbinvd`, `clts`, and
-  `mov` to and from the control and debug registers.
+  `lmsw`, `smsw`, `invlpg`, `cpuid`, `rdmsr`, `wrmsr`, `rdtsc`, `rdtscp`,
+  `swapgs`, `xgetbv`, `xsetbv`, `syscall`, `sysret`, `sysenter`, `sysexit`,
+  `wbinvd`, `invd`, `clts`, `lar`, `lsl`, `verr`, `verw`, `arpl`, and `mov` to
+  and from the control and debug registers.
+- Machine state and the cache: `fxsave`, `fxrstor`, `xsave`, `xrstor`,
+  `clflush`, `prefetchnta`, `prefetcht0`, `prefetcht1`, `prefetcht2`,
+  `mfence`, `lfence`, `sfence`, `pause`, and `endbr64`/`endbr32`.
 - SSE and SSE2 moves and arithmetic, `movd`/`movq`, and the conversions.
 - Prefixes: `lock`, `rep`, segment overrides written `fs:[...]`.
 - Directives: `db`, `dw`, `dd`, `dq` (constants, symbols, and strings), `resb`
@@ -103,6 +109,19 @@ rather than the register allocator, and nothing is promoted to a register
 across it. That is the price of letting the block clobber registers freely and
 of `{x}` resolving to a stack home that actually exists.
 
+### No runtime under a freestanding target
+
+A debug build normally checks a pointer before dereferencing it and calls into
+the runtime to report a null one. A freestanding target has no runtime to
+report to, and no operating system to have left address zero unmapped: there,
+zero is the interrupt vector table and the low 64K is whatever the firmware
+put in it. So a `*-none` target emits those checks the way `--release` does,
+which is to say not at all, and the diagnostics that warn about a constant low
+address stay quiet.
+
+`--safe` is refused on a freestanding target for the same reason: its checks
+consult a shadow map the runtime owns, and a flat image links no library.
+
 ## `volatile`
 
 `volatile T` says that reading or writing a `T` is observable in itself. Such
@@ -118,6 +137,11 @@ fn wait_for_ready(status: volatile uint32*) {
 The qualifier binds to the value being accessed, so `volatile uint16*` is a
 pointer to volatile `uint16` -- the shape memory-mapped hardware has. Write it
 anywhere a type goes: on a parameter, a local, a global, or a struct field.
+
+A `volatile` global is the flag an interrupt handler writes and the main line
+reads. Its accesses are not loads through a pointer, so the qualifier travels
+with the symbol: every instruction that names such a global is marked, no pass
+may drop or move one, and the function holding it keeps every value in memory.
 
 ```mettle
 var vga: volatile uint16* = (volatile uint16*)0xB8000
@@ -184,9 +208,14 @@ The parameters say what the vector pushes:
 | one pointer | the pointer receives the interrupt frame |
 | a pointer and an integer | the vector pushes an error code, which the entry reads and pops before `iretq` |
 
-An `@interrupt` function returns nothing -- `iretq` has nowhere to hand a value
-back to -- and is emitted for 64-bit targets. Write a `@naked` handler for
-16-bit or 32-bit code.
+An `@interrupt` function returns nothing: the interrupt return has nowhere to
+hand a value back to.
+
+The 16- and 32-bit targets take `@interrupt` too. There the entry saves the
+general and segment registers one at a time, so the sequence is one an 8086
+accepts, and the exit returns through `iret` at the mode's own width. Real
+mode pushes no error code, so a 16-bit handler takes no parameters or the
+frame pointer alone, and asking for the error code is a compile error.
 
 ## Cross-compilation
 
@@ -213,6 +242,14 @@ A trailing vendor or environment is accepted and ignored, so
 
 The 16- and 32-bit targets have no object format that carries their
 relocations, so they produce a flat image and nothing else.
+
+`--target` produces an object for the named machine. It does not link one:
+`--build` runs this machine's linker against this machine's runtime, and
+neither belongs to the machine you named, so `--build` with a foreign or
+freestanding target is a compile error saying so. Cross-compiling means
+emitting the object here and linking it there. Naming this machine's own
+triple changes nothing at all: the object is byte-identical to the one that
+comes out with no `--target` at all, which is what the test suite checks.
 
 ## A chosen link address
 
@@ -268,17 +305,28 @@ fn main() -> int16 {
 
 Real mode is 16 bits wide, and the code generator says so:
 
-- Values are `int8`, `uint8`, `int16`, `uint16`, and near pointers. There is no
-  `int32`, no `int64`, and no floating point.
+- A value computed in a register is `int8`, `uint8`, `int16`, `uint16`, or a
+  near pointer. There is no `int32`, no `int64`, and no floating point, and a
+  declaration that asks for one is a compile error naming it.
+- A struct or an array is a region of the frame rather than a value in a
+  register, so both work: the frame sizes each local by its declared type, and
+  the code reaches into it by address the way the 64-bit backend does.
+- A range-`for` counter takes the target's word, so `for i in 0..n` walks an
+  array without a cast.
 - Arguments are pushed right to left and the caller cleans up; the result comes
   back in `AX`. Locals and parameters live in a `bp`-relative frame.
 - Arithmetic, comparison, control flow, calls, loads and stores, address-of,
-  and `asm` blocks with `{}` bindings all work. Anything else is a compile
-  error naming the construct.
+  `@interrupt` handlers, and `asm` blocks with `{}` bindings all work. Anything
+  else is a compile error naming the construct.
 
-The test suite compiles a boot sector out of Mettle and then *runs* it in a
-real-mode emulator, checking what it printed through the BIOS. Bytes that look
-right are not evidence that real-mode code runs.
+The test suite compiles three images out of Mettle and then *runs* each in a
+real-mode emulator, checking what it printed through the BIOS. One prints
+letters from a counted loop; one computes through a struct, an array indexed by
+a range-`for` counter, a pointer and a global, and prints a digit per answer;
+one installs an `@interrupt` handler in the vector table, raises `int 0x40`
+three times, and checks both the count the handler kept and that the
+interrupted code got its registers back. Bytes that look right are not evidence
+that real-mode code runs.
 
 ## A complete boot sector
 

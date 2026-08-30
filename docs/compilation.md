@@ -53,6 +53,11 @@ trailing vendor or environment is accepted and ignored, so
 `x86_64-unknown-linux-gnu` selects `x86_64-linux`. The 16- and 32-bit targets
 emit a flat image only.
 
+`--target` emits an object for the named machine; it does not link one.
+`--build` runs this machine's linker against this machine's runtime, so it is
+refused for a foreign or freestanding target, with a message saying which
+machine has to do the linking.
+
 [Bare metal](bare-metal.md) covers cross-compilation, flat images, and 16-bit
 code generation.
 

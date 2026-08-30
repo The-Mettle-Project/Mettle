@@ -221,7 +221,7 @@ A decorator sits before a declaration and asks the compiler for something.
 | `@unroll(n)` | Unroll this loop n times |
 | `@test` | A compile-time test, run by `mettle test` |
 | `@naked` | No prologue, no frame, no epilogue; the body is `asm` only |
-| `@interrupt` | Entered by the CPU; the compiler emits the save/restore and `iretq` |
+| `@interrupt` | Entered by the CPU; the compiler emits the save/restore and the interrupt return |
 
 ```mettle
 @inline fn hot(x: int32) -> int32 { return x * 3; }

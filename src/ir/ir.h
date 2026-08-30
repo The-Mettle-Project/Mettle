@@ -755,6 +755,12 @@ typedef struct {
    * folded initializer as the symbol's only value; without it a global's
    * initializer says what the value STARTS as, not what it is. */
   int is_immutable;
+  /* The source declared this global `volatile`. Reading or writing it is
+   * observable in itself, so no pass may drop, merge or move one of its
+   * accesses and no backend may keep its value in a register. A global's
+   * access is a plain symbol operand rather than a load, so the mark travels
+   * through the symbol. */
+  int is_volatile;
   /* Function signature (IR_MODSYM_FUNCTION), for call ABI classification. */
   MtlcType *return_type;    /* borrowed */
   MtlcType **param_types;   /* owned array of borrowed ptrs, or NULL */

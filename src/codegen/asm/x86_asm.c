@@ -1834,6 +1834,8 @@ static const AsmSimpleInstruction ASM_SIMPLE[] = {
     {"sfence", {0x0F, 0xAE, 0xF8}, 3},
     {"pause", {0xF3, 0x90}, 2},
     {"emms", {0x0F, 0x77}, 2},
+    {"endbr64", {0xF3, 0x0F, 0x1E, 0xFA}, 4},
+    {"endbr32", {0xF3, 0x0F, 0x1E, 0xFB}, 4},
 };
 
 typedef struct {
@@ -2775,6 +2777,170 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
     return asm_emit_instruction(state, line, opcode, 2, operands[0].reg, 0, 0,
                                 &operands[1], operands[0].reg_bytes,
                                 mnemonic[4] == 's' ? 0xF3 : 0xF2, 0);
+  }
+
+  if (strcmp(mnemonic, "bswap") == 0) {
+    int rex = 0;
+    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_REG ||
+        operands[0].reg_class != X86_ASM_REG_GP ||
+        (operands[0].reg_bytes != 4 && operands[0].reg_bytes != 8)) {
+      asm_fail(state, line, "`bswap` takes a 32- or 64-bit register");
+      return 0;
+    }
+    if (operands[0].reg_bytes == 8) {
+      rex |= 0x48;
+    }
+    if (operands[0].reg >= 8) {
+      rex |= 0x41;
+    }
+    if (rex && state->bits != 64) {
+      asm_fail(state, line, "`bswap` of that register needs 64-bit code");
+      return 0;
+    }
+    if (rex && !asm_byte(state, (unsigned char)rex)) {
+      return 0;
+    }
+    if (!asm_byte(state, 0x0F)) {
+      return 0;
+    }
+    return asm_byte(state, (unsigned char)(0xC8 + (operands[0].reg & 7)));
+  }
+
+  if (strcmp(mnemonic, "shld") == 0 || strcmp(mnemonic, "shrd") == 0) {
+    int is_left = mnemonic[2] == 'l';
+    if (count != 3 || operands[1].kind != X86_ASM_OPERAND_REG) {
+      asm_fail(state, line,
+               "`%s` takes an operand, a register and a count", mnemonic);
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    if (operands[2].kind == X86_ASM_OPERAND_IMM) {
+      opcode[1] = (unsigned char)(is_left ? 0xA4 : 0xAC);
+      if (!asm_emit_instruction(state, line, opcode, 2, operands[1].reg, 1,
+                                operands[1].high_byte, &operands[0],
+                                operands[1].reg_bytes, 0, 0)) {
+        return 0;
+      }
+      return asm_emit_immediate(state, line, &operands[2], 1);
+    }
+    if (operands[2].kind != X86_ASM_OPERAND_REG || operands[2].reg != 1 ||
+        operands[2].reg_bytes != 1) {
+      asm_fail(state, line, "`%s` counts by an immediate or by cl", mnemonic);
+      return 0;
+    }
+    opcode[1] = (unsigned char)(is_left ? 0xA5 : 0xAD);
+    return asm_emit_instruction(state, line, opcode, 2, operands[1].reg, 1,
+                                operands[1].high_byte, &operands[0],
+                                operands[1].reg_bytes, 0, 0);
+  }
+
+  if (strcmp(mnemonic, "fxsave") == 0 || strcmp(mnemonic, "fxrstor") == 0 ||
+      strcmp(mnemonic, "xsave") == 0 || strcmp(mnemonic, "xrstor") == 0 ||
+      strcmp(mnemonic, "clflush") == 0) {
+    int digit = strcmp(mnemonic, "fxsave") == 0    ? 0
+                : strcmp(mnemonic, "fxrstor") == 0 ? 1
+                : strcmp(mnemonic, "xsave") == 0   ? 4
+                : strcmp(mnemonic, "xrstor") == 0  ? 5
+                                                   : 7;
+    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_MEM) {
+      asm_fail(state, line, "`%s` takes a memory operand", mnemonic);
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    opcode[1] = 0xAE;
+    return asm_emit_instruction(state, line, opcode, 2, digit, 0, 0,
+                                &operands[0], 0, 0, 0);
+  }
+
+  if (strncmp(mnemonic, "prefetch", 8) == 0) {
+    const char *hint = mnemonic + 8;
+    int digit = strcmp(hint, "nta") == 0  ? 0
+                : strcmp(hint, "t0") == 0 ? 1
+                : strcmp(hint, "t1") == 0 ? 2
+                : strcmp(hint, "t2") == 0 ? 3
+                                          : -1;
+    if (digit < 0) {
+      asm_fail(state, line, "unknown instruction `%s`", mnemonic);
+      return 0;
+    }
+    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_MEM) {
+      asm_fail(state, line, "`%s` takes a memory operand", mnemonic);
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    opcode[1] = 0x18;
+    return asm_emit_instruction(state, line, opcode, 2, digit, 0, 0,
+                                &operands[0], 0, 0, 0);
+  }
+
+  if (strcmp(mnemonic, "cmpxchg16b") == 0 ||
+      strcmp(mnemonic, "cmpxchg8b") == 0) {
+    int wide = strcmp(mnemonic, "cmpxchg16b") == 0;
+    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_MEM) {
+      asm_fail(state, line, "`%s` takes a memory operand", mnemonic);
+      return 0;
+    }
+    if (wide && state->bits != 64) {
+      asm_fail(state, line, "`cmpxchg16b` needs 64-bit code");
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    opcode[1] = 0xC7;
+    return asm_emit_instruction(state, line, opcode, 2, 1, 0, 0, &operands[0],
+                                0, 0, wide);
+  }
+
+  if (strcmp(mnemonic, "arpl") == 0) {
+    if (count != 2 || operands[1].kind != X86_ASM_OPERAND_REG ||
+        operands[1].reg_bytes != 2) {
+      asm_fail(state, line, "`arpl` takes an operand and a 16-bit register");
+      return 0;
+    }
+    if (state->bits == 64) {
+      asm_fail(state, line, "`arpl` is invalid in 64-bit code");
+      return 0;
+    }
+    opcode[0] = 0x63;
+    return asm_emit_instruction(state, line, opcode, 1, operands[1].reg, 1,
+                                operands[1].high_byte, &operands[0], 2, 0, 0);
+  }
+
+  if (strcmp(mnemonic, "lar") == 0 || strcmp(mnemonic, "lsl") == 0) {
+    if (count != 2 || operands[0].kind != X86_ASM_OPERAND_REG) {
+      asm_fail(state, line, "`%s` takes a register and an operand", mnemonic);
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    opcode[1] = (unsigned char)(strcmp(mnemonic, "lar") == 0 ? 0x02 : 0x03);
+    return asm_emit_instruction(state, line, opcode, 2, operands[0].reg, 0, 0,
+                                &operands[1], operands[0].reg_bytes, 0, 0);
+  }
+
+  if (strcmp(mnemonic, "movbe") == 0) {
+    int to_register;
+    if (count != 2) {
+      asm_fail(state, line, "`movbe` takes two operands");
+      return 0;
+    }
+    to_register = operands[0].kind == X86_ASM_OPERAND_REG;
+    if (to_register == (operands[1].kind == X86_ASM_OPERAND_REG)) {
+      asm_fail(state, line, "`movbe` moves between a register and memory");
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    opcode[1] = 0x38;
+    opcode[2] = (unsigned char)(to_register ? 0xF0 : 0xF1);
+    return asm_emit_instruction(
+        state, line, opcode, 3, to_register ? operands[0].reg : operands[1].reg,
+        0, 0, to_register ? &operands[1] : &operands[0],
+        to_register ? operands[0].reg_bytes : operands[1].reg_bytes, 0, 0);
+  }
+
+  if (strcmp(mnemonic, "nop") == 0 && count == 1) {
+    opcode[0] = 0x0F;
+    opcode[1] = 0x1F;
+    return asm_emit_instruction(state, line, opcode, 2, 0, 0, 0, &operands[0],
+                                0, 0, 0);
   }
 
   for (i = 0; i < sizeof(ASM_SIMPLE) / sizeof(ASM_SIMPLE[0]); i++) {

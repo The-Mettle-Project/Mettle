@@ -14008,6 +14008,39 @@ catch {
   Write-CaseResult -Name "cross_target_objects" -Passed $false -Reason $_.Exception.Message
 }
 
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $volSource = "tests/test_volatile_global.mettle"
+  $volObject = Join-Path $tmpDir "volatile_global.o"
+  $volIr = "$volObject.ir"
+  foreach ($mode in @(@(), @("--release"))) {
+    if (Test-Path $volIr) { Remove-Item -Path $volIr -Force }
+    $volArgs = @($volSource, "--emit-obj", "-o", $volObject, "--dump-ir") + $mode
+    $volOut = & $CompilerPath @volArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $volIr)) {
+      throw "compiling $volSource $($mode -join ' ') failed: $volOut"
+    }
+    $ir = Get-Content $volIr -Raw
+    $readyBody = [regex]::Match($ir, '(?s)function wait_ready \{.*?\n\}')
+    $plainBody = [regex]::Match($ir, '(?s)function wait_plain \{.*?\n\}')
+    if (-not $readyBody.Success -or -not $plainBody.Success) {
+      throw "the IR dump has no wait_ready/wait_plain body $($mode -join ' ')"
+    }
+    if ($readyBody.Value -notmatch '@ready.*volatile') {
+      throw "the volatile global's access is not marked volatile $($mode -join ' '): $($readyBody.Value)"
+    }
+    if ($plainBody.Value -match 'volatile') {
+      throw "a plain global's access was marked volatile $($mode -join ' '): $($plainBody.Value)"
+    }
+  }
+  Write-CaseResult -Name "volatile_global_survives" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "volatile_global_survives" -Passed $false -Reason $_.Exception.Message
+}
+
 # 32-bit gate: the i386 target must reach the narrow code generator. Emitting
 # 64-bit code into a 32-bit image is the failure that looks like success, so
 # this asserts the shape of what came out rather than only that it came out.

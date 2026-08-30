@@ -146,17 +146,25 @@ rule. `--profile-runtime` is the built-in alternative.
 
 ## Narrow targets
 
-The 16- and 32-bit targets compute in one register's worth of value. A local,
-parameter, or return type wider than a word -- `int32` in 16-bit code, `int64`
-or a float in either -- is a compile error naming the declaration. Structs and
-strings do not travel through them at all. Pointers are near.
+The 16- and 32-bit targets compute in one register's worth of value. A value
+wider than a word -- `int32` in 16-bit code, `int64` or a float in either -- is
+a compile error naming the declaration. A struct or an array is a frame region
+reached by address, so both work; strings do not travel through these targets
+at all. Pointers are near.
 
 Neither target has an object format that carries its relocations, so
 `--emit-flat` is their only product; asking for an object or an executable is
 an error rather than a file whose code is the wrong width for its header.
 
-`@interrupt` is emitted for 64-bit targets. A 16- or 32-bit handler is written
-`@naked`, which is where `bits 16` and `bits 32` are allowed.
+Real mode pushes no error code, so a 16-bit `@interrupt` handler takes no
+parameters or the interrupt frame alone. `bits 16` and `bits 32` are allowed
+inside a `@naked` function, which is the only place the compiler contributes no
+bytes of its own.
+
+A freestanding target has no runtime, so it emits no runtime checks and refuses
+`--safe`. `--build` needs a linker and a runtime belonging to the machine being
+built for, so it is refused for a foreign or freestanding target.
+Cross-compiling means emitting the object here and linking it there.
 
 ## Compiler
 

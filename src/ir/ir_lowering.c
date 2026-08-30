@@ -32,6 +32,46 @@ static IRProgram *ir_lowering_fail(IRProgram *ir_program,
   return NULL;
 }
 
+static int ir_symbol_is_volatile_global(const IRProgram *program,
+                                        const IROperand *operand) {
+  const IRModuleSymbol *symbol;
+  if (!operand || operand->kind != IR_OPERAND_SYMBOL || !operand->name) {
+    return 0;
+  }
+  symbol = ir_program_lookup_symbol(program, operand->name);
+  return symbol && symbol->kind == IR_MODSYM_VARIABLE && symbol->is_volatile;
+}
+
+static void ir_mark_volatile_global_accesses(IRProgram *program) {
+  size_t f;
+  if (!program) {
+    return;
+  }
+  for (f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    size_t i;
+    if (!function) {
+      continue;
+    }
+    for (i = 0; i < function->instruction_count; i++) {
+      IRInstruction *instruction = &function->instructions[i];
+      size_t a;
+      int touches = ir_symbol_is_volatile_global(program, &instruction->dest) ||
+                    ir_symbol_is_volatile_global(program, &instruction->lhs) ||
+                    ir_symbol_is_volatile_global(program, &instruction->rhs);
+      for (a = 0; !touches && a < instruction->argument_count; a++) {
+        touches = ir_symbol_is_volatile_global(program,
+                                               &instruction->arguments[a]);
+      }
+      if (!touches) {
+        continue;
+      }
+      instruction->is_volatile = 1;
+      function->has_volatile_access = 1;
+    }
+  }
+}
+
 IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
                             SymbolTable *symbol_table, char **error_message,
                             int emit_runtime_checks, int emit_safety_checks) {
@@ -112,6 +152,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   /* Bake the backend-owned type registry + module symbol table so the code
    * generators no longer consult the frontend TypeChecker/SymbolTable/AST. */
   mtlc_lower_populate_module(ir_program, program, type_checker, symbol_table);
+  ir_mark_volatile_global_accesses(ir_program);
 
   return ir_program;
 }

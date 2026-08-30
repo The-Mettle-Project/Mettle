@@ -2757,6 +2757,13 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
     break;
   }
 
+  if (instruction->is_volatile && instruction->op != IR_OP_LOAD &&
+      instruction->op != IR_OP_STORE && written > 0 &&
+      (size_t)written + 10 < buffer_size) {
+    written += snprintf(buffer + written, buffer_size - (size_t)written,
+                        " volatile");
+  }
+
   return written > 0 && (size_t)written < buffer_size;
 }
 

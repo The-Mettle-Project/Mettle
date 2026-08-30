@@ -33,6 +33,38 @@ static void check(int bits, const char *text, const char *expected_hex) {
 }
 
 
+static void check_systems_extensions(void) {
+  check(64, "bswap eax", "0fc8");
+  check(64, "bswap rax", "480fc8");
+  check(64, "bswap r8", "490fc8");
+  check(32, "bswap ecx", "0fc9");
+  check(64, "shld rax, rbx, 4", "480fa4d804");
+  check(64, "shrd rax, rbx, 4", "480facd804");
+  check(64, "shld rax, rbx, cl", "480fa5d8");
+  check(64, "shrd rax, rbx, cl", "480fadd8");
+  check(32, "shld eax, ebx, 1", "0fa4d801");
+  check(64, "fxsave [rax]", "0fae00");
+  check(64, "fxrstor [rax]", "0fae08");
+  check(64, "xsave [rax]", "0fae20");
+  check(64, "xrstor [rax]", "0fae28");
+  check(64, "clflush [rax]", "0fae38");
+  check(64, "prefetchnta [rax]", "0f1800");
+  check(64, "prefetcht0 [rax]", "0f1808");
+  check(64, "prefetcht1 [rax]", "0f1810");
+  check(64, "prefetcht2 [rax]", "0f1818");
+  check(64, "cmpxchg16b [rax]", "480fc708");
+  check(32, "cmpxchg8b [eax]", "0fc708");
+  check(32, "arpl ax, bx", "6663d8");
+  check(64, "lar eax, ebx", "0f02c3");
+  check(64, "lsl eax, ebx", "0f03c3");
+  check(64, "movbe eax, [rbx]", "0f38f003");
+  check(64, "movbe [rbx], eax", "0f38f103");
+  check(64, "nop dword ptr [rax]", "0f1f00");
+  check(64, "endbr64", "f30f1efa");
+  check(32, "endbr32", "f30f1efb");
+
+}
+
 static void accepts(int bits, const char *text) {
   X86AsmConfig config;
   X86AsmResult result;
@@ -76,11 +108,17 @@ static void check_documented_instructions(void) {
     "align 16", "db 1, 2, 3", "dw 1", "dd 1", "dq 1", "resb 4",
     "a: jrcxz a", "a: loope a", "a: loopne a", "jmp qword ptr [rax]",
     "call qword ptr [rax]", "mov rax, fs:[0x30]", "lea rax, [rip + 8]",
+    "bswap eax", "bswap rax", "shld rax, rbx, 4", "shrd rax, rbx, cl",
+    "movbe eax, [rbx]", "cmpxchg16b [rax]", "fxsave [rax]", "fxrstor [rax]",
+    "xsave [rax]", "xrstor [rax]", "clflush [rax]", "prefetchnta [rax]",
+    "prefetcht0 [rax]", "prefetcht1 [rax]", "prefetcht2 [rax]",
+    "lar eax, ebx", "lsl eax, ebx", "endbr64",
   };
   const char *sixteen[] = {
     "jmp 0x08:0x7c00", "call 0x08:0x1234", "iret", "pusha", "popa",
     "mov al, [bx + si + 4]", "mov ax, [bp + di]", "times 4 db 0x90",
     "bits 32", "bits 16", "in al, dx", "cbw", "cwd",
+    "arpl ax, bx", "endbr32", "cmpxchg8b [bx]",
   };
   size_t i;
   for (i = 0; i < sizeof(sixty_four) / sizeof(sixty_four[0]); i++) {
@@ -92,6 +130,7 @@ static void check_documented_instructions(void) {
 }
 
 int main(void) {
+  check_systems_extensions();
   check(64, "nop", "90");
   check(64, "ret", "c3");
   check(64, "mov rax, rbx", "4889d8");

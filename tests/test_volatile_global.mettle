@@ -1,0 +1,28 @@
+var ready: volatile int32 = 0
+var plain: int32 = 0
+
+fn wait_ready() -> int32 {
+    var spins: int32 = 0
+    while (ready == 0) {
+        spins = spins + 1
+        if (spins > 4) {
+            return spins
+        }
+    }
+    return spins
+}
+
+fn wait_plain() -> int32 {
+    var spins: int32 = 0
+    while (plain == 0) {
+        spins = spins + 1
+        if (spins > 4) {
+            return spins
+        }
+    }
+    return spins
+}
+
+fn main() -> int64 {
+    return (int64)(wait_ready() + wait_plain())
+}

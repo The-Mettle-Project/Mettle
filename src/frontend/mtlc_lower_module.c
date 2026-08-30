@@ -597,6 +597,7 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
           vtype = type_checker_get_type_by_name(tc, vd->type_name);
         }
         entry.type = mtlc_type_from_frontend(vtype);
+        entry.is_volatile = vtype && vtype->is_volatile ? 1 : 0;
         if (!vd->is_extern && vd->initializer &&
             vd->initializer->type == AST_AGGREGATE_LITERAL) {
           /* An aggregate literal was already folded to its laid-out bytes when
