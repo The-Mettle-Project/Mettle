@@ -1,5 +1,34 @@
 // Type checker: struct / enum / declaration processing.
 #include "type_checker_internal.h"
+#include "codegen/target.h"
+
+static Type *type_checker_narrow_to_target_word(TypeChecker *checker,
+                                               Type *type) {
+  int bits = mtlc_target()->code_bits;
+  size_t word;
+  if (!checker || !type || bits >= 64) {
+    return NULL;
+  }
+  word = (size_t)(bits / 8);
+  if (type->size <= word) {
+    return NULL;
+  }
+  switch (type->kind) {
+  case TYPE_INT16:
+  case TYPE_INT32:
+  case TYPE_INT64:
+    return type_checker_get_type_by_name(checker,
+                                         bits == 16 ? "int16" : "int32");
+  case TYPE_UINT16:
+  case TYPE_UINT32:
+  case TYPE_UINT64:
+    return type_checker_get_type_by_name(checker,
+                                         bits == 16 ? "uint16" : "uint32");
+  default:
+    return NULL;
+  }
+}
+
 
 /* The kernel ABI is intentionally explicit: a parameter is a POD scalar, a
  * pointer, or a record built from those. Rejecting strings, closures, and
@@ -1049,6 +1078,22 @@ int type_checker_process_declaration(TypeChecker *checker,
         // at each use, so its type is exactly its literal value's type). Take
         // the initializer type.
         var_type = init_type;
+        if (var_decl->structural_type) {
+          Type *narrowed = type_checker_narrow_to_target_word(checker, var_type);
+          if (narrowed && narrowed->name) {
+            char *narrowed_name = strdup(narrowed->name);
+            if (!narrowed_name) {
+              type_checker_set_error_at_location(
+                  checker, declaration->location,
+                  "Out of memory narrowing '%s' to the target's word",
+                  var_decl->name);
+              return 0;
+            }
+            free(var_decl->type_name);
+            var_decl->type_name = narrowed_name;
+            var_type = narrowed;
+          }
+        }
       } else {
         // Mettle requires an explicit type on every user `var` and local
         // `const` binding; nothing is inferred from an arbitrary initializer.

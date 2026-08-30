@@ -33,9 +33,6 @@ static void check(int bits, const char *text, const char *expected_hex) {
 }
 
 
-/* Acceptance, not encoding: every instruction the documentation names must be
- * one the assembler takes. A doc that promises an instruction the assembler
- * rejects is a lie the compiler can check. */
 static void accepts(int bits, const char *text) {
   X86AsmConfig config;
   X86AsmResult result;

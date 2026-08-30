@@ -13871,6 +13871,46 @@ else {
   }
 }
 
+# 16-bit gate, second image: the narrow code generator has to place values that
+# do not live in a register. This one computes through a struct, an array
+# indexed by a range-`for` counter, a pointer, and a global, and prints one
+# digit per answer, so a frame it laid out wrong shows up as a wrong digit.
+if (-not $calcGcc) {
+  Write-Host "[SKIP] boot_sector_data_runs (gcc not found)"
+}
+else {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $dataImage = Join-Path $tmpDir "boot_sector_data.bin"
+    if (Test-Path $dataImage) { Remove-Item -Path $dataImage -Force }
+    $dataArgs = @("tests/test_boot_sector_data.mettle", "--target", "i8086-none",
+                  "--image-base", "0x8000", "--emit-flat", $dataImage)
+    $dataOut = & $CompilerPath @dataArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dataImage)) {
+      throw "compiling the 16-bit data image failed: $dataOut"
+    }
+    $emulatorExe = Join-Path $tmpDir "x86_16_emulator_test.exe"
+    if (-not (Test-Path $emulatorExe)) {
+      $emulatorArgs = @("-Wall", "-Wextra", "-std=c99",
+                        "tests/x86_16_emulator_test.c", "-o", $emulatorExe)
+      $buildOut = & $calcGcc.Source @emulatorArgs 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "building the real-mode emulator failed: $buildOut"
+      }
+    }
+    $runOut = & $emulatorExe $dataImage '7896\r\n' '0x8000' 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "the 16-bit data image did not run as expected: $runOut"
+    }
+    Write-CaseResult -Name "boot_sector_data_runs" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "boot_sector_data_runs" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # 32-bit gate: the i386 target must reach the narrow code generator. Emitting
 # 64-bit code into a 32-bit image is the failure that looks like success, so
 # this asserts the shape of what came out rather than only that it came out.

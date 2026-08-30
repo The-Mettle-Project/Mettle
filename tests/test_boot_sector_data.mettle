@@ -1,0 +1,76 @@
+@naked fn _start() {
+    asm {
+        bits 16
+        cli
+        xor ax, ax
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov sp, 0x7c00
+        sti
+        call main
+        cli
+    halt:
+        hlt
+        jmp halt
+    }
+}
+
+struct Point {
+    x: int16;
+    y: int16;
+}
+
+var accumulator: int16 = 0
+
+fn putchar(c: int16) -> int16 {
+    asm {
+        mov ax, {c}
+        mov ah, 0x0e
+        mov bx, 7
+        int 0x10
+    }
+    return c
+}
+
+fn point_sum() -> int16 {
+    var p: Point
+    p.x = 3
+    p.y = 4
+    return (int16)(p.x + p.y)
+}
+
+fn array_sum() -> int16 {
+    var buf: int16[4]
+    var total: int16 = 0
+    buf[0] = 1
+    buf[1] = 2
+    buf[2] = 3
+    buf[3] = 2
+    for i in 0..4 {
+        total = (int16)(total + buf[i])
+    }
+    return total
+}
+
+fn through_pointer() -> int16 {
+    var value: int16 = 4
+    var slot: int16* = &value
+    *slot = (int16)(*slot + 5)
+    return value
+}
+
+fn global_bump() -> int16 {
+    accumulator = (int16)(accumulator + 6)
+    return accumulator
+}
+
+fn main() -> int16 {
+    putchar((int16)(48 + point_sum()))
+    putchar((int16)(48 + array_sum()))
+    putchar((int16)(48 + through_pointer()))
+    putchar((int16)(48 + global_bump()))
+    putchar(13)
+    putchar(10)
+    return 0
+}

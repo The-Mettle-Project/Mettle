@@ -52,8 +52,6 @@ typedef struct {
   long long addend;
   size_t next_instruction_offset;
   int line;
-  /* Position of this branch among the block's relaxable branches, or -1. A
-   * later pass uses it to decide the branch can take its short form. */
   int branch_ordinal;
 } AsmPatch;
 
@@ -76,10 +74,6 @@ typedef struct {
   int segment_override;
   int lock_prefix;
   int rep_prefix;
-  /* Branch relaxation: one entry per relaxable branch, in emission order.
-   * Set when the previous pass proved the branch reaches its target in one
-   * signed byte. Shrinking a branch can only bring targets closer, so a hint
-   * proved against the long form stays true, and the loop converges. */
   unsigned char *short_hints;
   size_t short_hint_count;
   int branch_ordinal;
@@ -1210,9 +1204,6 @@ static int asm_emit_instruction(AsmState *state, int line,
     int displacement_bytes = 0;
     long long displacement = rm->disp;
 
-    /* `[symbol]` with nothing to add it to. In 64-bit code the only reference
-     * that survives being loaded anywhere is a rip-relative one, and that is
-     * what every assembler means by it. */
     if (rm->rip_relative ||
         (state->bits == 64 && rm->symbol && !rm->has_base && !rm->has_index)) {
       if (state->bits != 64) {
@@ -2208,8 +2199,6 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
       asm_fail(state, line, "`%s` needs 64-bit code", mnemonic);
       return 0;
     }
-    /* push and pop of the flags default to the mode's own width, so the
-     * operand-size prefix is what asks for the other one. */
     if ((operand_bits == 16 && state->bits != 16) ||
         (operand_bits == 32 && state->bits == 16)) {
       if (!asm_byte(state, 0x66)) {

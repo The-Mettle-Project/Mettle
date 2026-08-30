@@ -585,6 +585,33 @@ int type_checker_check_for_statement(TypeChecker *checker,
     }
   }
 
+  if (for_stmt->increment && for_stmt->increment->type == AST_ASSIGNMENT &&
+      for_stmt->initializer &&
+      for_stmt->initializer->type == AST_VAR_DECLARATION &&
+      ((VarDeclaration *)for_stmt->initializer->data)->structural_type) {
+    VarDeclaration *counter_decl =
+        (VarDeclaration *)for_stmt->initializer->data;
+    Assignment *step = (Assignment *)for_stmt->increment->data;
+    Symbol *counter = symbol_table_lookup(checker->symbol_table,
+                                          counter_decl->name);
+    if (counter && counter->type && step->value &&
+        type_checker_is_integer_type(counter->type)) {
+      Type *step_type = type_checker_infer_type(checker, step->value);
+      if (step_type && type_checker_is_integer_type(step_type) &&
+          step_type->size > counter->type->size) {
+        ASTNode *narrowed = ast_create_cast_expression(
+            counter->type->name, step->value, for_stmt->increment->location);
+        if (!narrowed) {
+          free(post_init_snapshot);
+          type_checker_init_tracker_exit_scope(checker);
+          symbol_table_exit_scope(checker->symbol_table);
+          return 0;
+        }
+        step->value = narrowed;
+      }
+    }
+  }
+
   if (for_stmt->increment) {
     /* An assignment carries a target, and only the statement checker looks at
      * one: as an expression it answers with the type of the value and never

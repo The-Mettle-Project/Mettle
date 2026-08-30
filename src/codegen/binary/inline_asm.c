@@ -285,8 +285,6 @@ int code_generator_binary_assemble_text(CodeGenerator *generator,
       x86_asm_result_destroy(&result);
       return 0;
     }
-    /* A name this program defines is not external, and declaring it so leaves
-     * an undefined symbol beside the definition. */
     if (!fixup->block_local &&
         !code_generator_find_ir_function_binary(generator, symbol) &&
         !code_generator_binary_declare_external_symbol(generator, symbol)) {

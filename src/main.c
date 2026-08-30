@@ -4922,7 +4922,10 @@ int compile_file(const char *input_filename, const char *output_filename,
    * like the x86 backend's, so debug semantics match across targets. (The
    * exclusion dated from bring-up, when the trap calls could not lower.) */
   int emit_runtime_checks =
-      (options->release || options->emit_ptx || options->emit_spirv) ? 0 : 1;
+      (options->release || options->emit_ptx || options->emit_spirv ||
+       mtlc_target()->freestanding)
+          ? 0
+          : 1;
   /* The device backends have their own bounds story (--gpu-checks) and their
    * pointers are not host addresses the shadow map could describe. */
   int emit_safety_checks =

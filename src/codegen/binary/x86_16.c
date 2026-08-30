@@ -11,6 +11,7 @@
 typedef struct {
   char **names;
   int *offsets;
+  int *sizes;
   size_t count;
   size_t capacity;
 } X86NarrowSlots;
@@ -20,13 +21,12 @@ typedef struct {
   IRFunction *function;
   BinaryFunctionContext *context;
   X86NarrowSlots slots;
-  /* Real mode and 32-bit protected mode differ in the width of a word and the
-   * spelling of the registers, and in nothing else this emitter cares about. */
   int bits;
   int word;
   const char *accumulator;
   const char *base;
   const char *data;
+  const char *counter;
   const char *frame;
   const char *stack;
   const char *word_keyword;
@@ -40,7 +40,7 @@ typedef struct {
 } X86NarrowEmitter;
 
 static int x86_narrow_slots_add(X86NarrowSlots *slots, const char *name,
-                                int offset) {
+                                int offset, int size) {
   size_t i;
   for (i = 0; i < slots->count; i++) {
     if (strcmp(slots->names[i], name) == 0) {
@@ -51,6 +51,7 @@ static int x86_narrow_slots_add(X86NarrowSlots *slots, const char *name,
     size_t capacity = slots->capacity ? slots->capacity * 2 : 16;
     char **names = (char **)realloc(slots->names, capacity * sizeof(char *));
     int *offsets = NULL;
+    int *sizes = NULL;
     if (!names) {
       return 0;
     }
@@ -60,6 +61,11 @@ static int x86_narrow_slots_add(X86NarrowSlots *slots, const char *name,
       return 0;
     }
     slots->offsets = offsets;
+    sizes = (int *)realloc(slots->sizes, capacity * sizeof(int));
+    if (!sizes) {
+      return 0;
+    }
+    slots->sizes = sizes;
     slots->capacity = capacity;
   }
   slots->names[slots->count] = mettle_strdup(name);
@@ -67,6 +73,7 @@ static int x86_narrow_slots_add(X86NarrowSlots *slots, const char *name,
     return 0;
   }
   slots->offsets[slots->count] = offset;
+  slots->sizes[slots->count] = size;
   slots->count++;
   return 1;
 }
@@ -86,6 +93,19 @@ static int x86_narrow_slots_find(const X86NarrowSlots *slots, const char *name,
   return 0;
 }
 
+static int x86_narrow_slot_size(const X86NarrowSlots *slots, const char *name) {
+  size_t i;
+  if (!name) {
+    return 0;
+  }
+  for (i = 0; i < slots->count; i++) {
+    if (strcmp(slots->names[i], name) == 0) {
+      return slots->sizes[i];
+    }
+  }
+  return 0;
+}
+
 static void x86_narrow_slots_destroy(X86NarrowSlots *slots) {
   size_t i;
   for (i = 0; i < slots->count; i++) {
@@ -93,6 +113,7 @@ static void x86_narrow_slots_destroy(X86NarrowSlots *slots) {
   }
   free(slots->names);
   free(slots->offsets);
+  free(slots->sizes);
   memset(slots, 0, sizeof(*slots));
 }
 
@@ -171,6 +192,10 @@ static int x86_narrow_operand_text(X86NarrowEmitter *emitter,
       return 0;
     }
     if (x86_narrow_slots_find(&emitter->slots, operand->name, &offset)) {
+      if (x86_narrow_slot_size(&emitter->slots, operand->name) >
+          emitter->word) {
+        return 0;
+      }
       snprintf(buffer, size, "%s ptr [%s %c %d]", emitter->word_keyword,
                emitter->frame, offset < 0 ? '-' : '+',
                offset < 0 ? -offset : offset);
@@ -392,10 +417,6 @@ static int x86_narrow_binary(X86NarrowEmitter *emitter,
   return 0;
 }
 
-/* `{name}` inside an asm block names a Mettle local, parameter or global. The
- * 64-bit path resolves one through the emitter's frame tables; here the frame
- * is this file's own, so the binding is spelled out before the assembler ever
- * sees it. */
 static int x86_narrow_inline_asm(X86NarrowEmitter *emitter, const char *text) {
   size_t i = 0;
   while (text[i]) {
@@ -440,10 +461,6 @@ static int x86_narrow_inline_asm(X86NarrowEmitter *emitter, const char *text) {
   return x86_narrow_emit(emitter, "\n");
 }
 
-/* A value this emitter cannot hold in one register has no home here: the frame
- * gives every local one word, so a wider type would be silently truncated on
- * the first assignment. A pointer is near, and so is a word wide whatever the
- * frontend's 64-bit descriptor says. */
 static int x86_narrow_type_fits(const X86NarrowEmitter *emitter,
                                 const MtlcType *type) {
   if (!type) {
@@ -459,6 +476,43 @@ static int x86_narrow_type_fits(const X86NarrowEmitter *emitter,
   return type->size <= (size_t)emitter->word;
 }
 
+static int x86_narrow_type_is_addressed_region(const MtlcType *type) {
+  return type && (type->kind == MTLC_TYPE_ARRAY || type->kind == MTLC_TYPE_STRUCT);
+}
+
+static int x86_narrow_fill(X86NarrowEmitter *emitter, long long width) {
+  long long words = width / emitter->word;
+  long long bytes = width % emitter->word;
+  long long i;
+
+  if (words > 16) {
+    int label = emitter->label_serial++;
+    if (!x86_narrow_emit(emitter,
+                         "mov %s, %lld\n.fill_%d:\nmov [%s], %s\n"
+                         "add %s, %d\ndec %s\njnz .fill_%d\n",
+                         emitter->counter, words, label, emitter->base,
+                         emitter->accumulator, emitter->base, emitter->word,
+                         emitter->counter, label)) {
+      return 0;
+    }
+    words = 0;
+    bytes = width % emitter->word;
+  }
+  for (i = 0; i < words; i++) {
+    if (!x86_narrow_emit(emitter, "mov [%s + %lld], %s\n", emitter->base,
+                         i * emitter->word, emitter->accumulator)) {
+      return 0;
+    }
+  }
+  for (i = 0; i < bytes; i++) {
+    if (!x86_narrow_emit(emitter, "mov [%s + %lld], al\n", emitter->base,
+                         words * emitter->word + i)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int x86_narrow_instruction(X86NarrowEmitter *emitter,
                                   const IRInstruction *instruction) {
   switch (instruction->op) {
@@ -466,7 +520,8 @@ static int x86_narrow_instruction(X86NarrowEmitter *emitter,
     return 1;
 
   case IR_OP_DECLARE_LOCAL:
-    if (!x86_narrow_type_fits(emitter, instruction->value_type)) {
+    if (!x86_narrow_type_is_addressed_region(instruction->value_type) &&
+        !x86_narrow_type_fits(emitter, instruction->value_type)) {
       x86_narrow_fail(emitter,
                       "'%s' declares '%s' as `%s`, which does not fit in the "
                       "%d bits this target computes in",
@@ -649,6 +704,9 @@ static int x86_narrow_instruction(X86NarrowEmitter *emitter,
     if (width == 4 && emitter->word == 4) {
       return x86_narrow_emit(emitter, "mov [%s], eax\n", emitter->base);
     }
+    if (width > emitter->word) {
+      return x86_narrow_fill(emitter, width);
+    }
     x86_narrow_fail(emitter,
                     "'%s' stores %lld bytes, which %d-bit code generation "
                     "cannot hold in a register",
@@ -720,10 +778,25 @@ static int x86_narrow_instruction(X86NarrowEmitter *emitter,
   }
 }
 
+static int x86_narrow_slot_bytes(const X86NarrowEmitter *emitter,
+                                 const MtlcType *type) {
+  int size = emitter->word;
+  if (type && type->kind != MTLC_TYPE_POINTER &&
+      type->kind != MTLC_TYPE_FUNCTION_POINTER &&
+      type->size > (size_t)emitter->word) {
+    size = (int)type->size;
+  }
+  while (size % emitter->word) {
+    size++;
+  }
+  return size;
+}
+
 static int x86_narrow_plan_frame(X86NarrowEmitter *emitter) {
   IRFunction *function = emitter->function;
   size_t i;
-  int next_local = -emitter->word;
+  int used = 0;
+  int next_local = 0;
   int next_parameter = 2 * emitter->word;
 
   for (i = 0; i < function->parameter_count; i++) {
@@ -731,12 +804,32 @@ static int x86_narrow_plan_frame(X86NarrowEmitter *emitter) {
       continue;
     }
     if (!x86_narrow_slots_add(&emitter->slots, function->parameter_names[i],
-                              next_parameter)) {
+                              next_parameter, emitter->word)) {
       return 0;
     }
     next_parameter += emitter->word;
   }
 
+  for (i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    int size;
+    if (instruction->op != IR_OP_DECLARE_LOCAL || !instruction->dest.name) {
+      continue;
+    }
+    if (x86_narrow_slots_find(&emitter->slots, instruction->dest.name,
+                              &next_local) ||
+        x86_narrow_symbol_is_global(emitter, instruction->dest.name)) {
+      continue;
+    }
+    size = x86_narrow_slot_bytes(emitter, instruction->value_type);
+    used += size;
+    if (!x86_narrow_slots_add(&emitter->slots, instruction->dest.name, -used,
+                              size)) {
+      return 0;
+    }
+  }
+
+  next_local = 0;
   for (i = 0; i < function->instruction_count; i++) {
     const IRInstruction *instruction = &function->instructions[i];
     const IROperand *operands[3];
@@ -757,10 +850,11 @@ static int x86_narrow_plan_frame(X86NarrowEmitter *emitter) {
           x86_narrow_symbol_is_global(emitter, operand->name)) {
         continue;
       }
-      if (!x86_narrow_slots_add(&emitter->slots, operand->name, next_local)) {
+      used += emitter->word;
+      if (!x86_narrow_slots_add(&emitter->slots, operand->name, -used,
+                                emitter->word)) {
         return 0;
       }
-      next_local -= emitter->word;
     }
     for (argument = 0; argument < instruction->argument_count; argument++) {
       const IROperand *operand = &instruction->arguments[argument];
@@ -774,14 +868,16 @@ static int x86_narrow_plan_frame(X86NarrowEmitter *emitter) {
           x86_narrow_symbol_is_global(emitter, operand->name)) {
         continue;
       }
-      if (!x86_narrow_slots_add(&emitter->slots, operand->name, next_local)) {
+      used += emitter->word;
+      if (!x86_narrow_slots_add(&emitter->slots, operand->name, -used,
+                                emitter->word)) {
         return 0;
       }
-      next_local -= emitter->word;
     }
   }
 
-  emitter->frame_size = -(next_local + emitter->word);
+  (void)next_local;
+  emitter->frame_size = used;
   while (emitter->frame_size % emitter->word) {
     emitter->frame_size++;
   }
@@ -808,6 +904,7 @@ int code_generator_emit_binary_function_x86_16(
   emitter.accumulator = emitter.bits == 32 ? "eax" : "ax";
   emitter.base = emitter.bits == 32 ? "ebx" : "bx";
   emitter.data = emitter.bits == 32 ? "edx" : "dx";
+  emitter.counter = emitter.bits == 32 ? "ecx" : "cx";
   emitter.frame = emitter.bits == 32 ? "ebp" : "bp";
   emitter.stack = emitter.bits == 32 ? "esp" : "sp";
   emitter.word_keyword = emitter.bits == 32 ? "dword" : "word";

@@ -692,8 +692,6 @@ static void step(Cpu *cpu) {
   }
 }
 
-/* The expected text arrives on a command line, where a carriage return cannot
- * be written literally, so `\\r` and `\\n` stand for themselves. */
 static const char *unescape(const char *text, char *buffer, size_t size) {
   size_t out = 0;
   size_t i = 0;
@@ -716,6 +714,8 @@ static const char *unescape(const char *text, char *buffer, size_t size) {
   return buffer;
 }
 
+static unsigned load_address = LOAD_ADDRESS;
+
 int main(int argc, char **argv) {
   Cpu cpu;
   char expected_storage[OUTPUT_MAX];
@@ -725,29 +725,40 @@ int main(int argc, char **argv) {
   const char *expected;
 
   if (argc < 3) {
-    fprintf(stderr, "usage: %s <image.bin> <expected-output>\n", argv[0]);
+    fprintf(stderr, "usage: %s <image.bin> <expected-output> [load-address]\n",
+            argv[0]);
     return 2;
   }
   expected = unescape(argv[2], expected_storage, sizeof(expected_storage));
+  if (argc > 3) {
+    load_address = (unsigned)strtoul(argv[3], NULL, 0);
+    if (load_address >= MEMORY_BYTES) {
+      fprintf(stderr, "load address %s is outside the emulated memory\n",
+              argv[3]);
+      return 2;
+    }
+  }
 
   file = fopen(argv[1], "rb");
   if (!file) {
     fprintf(stderr, "could not open %s\n", argv[1]);
     return 2;
   }
-  size = fread(memory + LOAD_ADDRESS, 1, MEMORY_BYTES - LOAD_ADDRESS, file);
+  size = fread(memory + load_address, 1, MEMORY_BYTES - load_address, file);
   fclose(file);
   if (size < 2) {
     fprintf(stderr, "%s is too small to be an image\n", argv[1]);
     return 2;
   }
-  if (memory[LOAD_ADDRESS + 510] != 0x55 || memory[LOAD_ADDRESS + 511] != 0xAA) {
+  if (size == 512 &&
+      (memory[load_address + 510] != 0x55 ||
+       memory[load_address + 511] != 0xAA)) {
     fprintf(stderr, "%s has no boot signature\n", argv[1]);
     return 1;
   }
 
   memset(&cpu, 0, sizeof(cpu));
-  cpu.ip = LOAD_ADDRESS;
+  cpu.ip = (uint16_t)load_address;
   cpu.reg[REG_SP] = 0x7C00;
 
   while (!cpu.halted && !cpu.fault && steps++ < STEP_LIMIT) {
