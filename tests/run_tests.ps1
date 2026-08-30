@@ -13488,6 +13488,8 @@ $runFixtures = @(
      What = "a byte dot product widened its elements the wrong way, or the int32 dot claimed a byte loop" },
   @{ Name = "induction_value_shift"; Path = "tests/codegen/induction_value_shift.mettle"
      What = "pointer induction deleted an iv-fed shift that the stored value still read" },
+  @{ Name = "unsigned_fused_load"; Path = "tests/codegen/unsigned_fused_load.mettle"
+     What = "a fused scaled-address load sign-extended a uint32 the plain load leaves zero-extended" },
   @{ Name = "int_edges"; Path = "tests/codegen/int_edges.mettle"
      What = "a codegen check failed" },
   @{ Name = "funcptr"; Path = "tests/codegen/funcptr.mettle"

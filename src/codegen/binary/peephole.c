@@ -2199,7 +2199,13 @@ int code_generator_binary_try_emit_scaled_address_load(
                                                     BINARY_GP_RAX)) {
     return 0;
   }
-  if (size == 4 && !load->is_float &&
+  /* A load tagged is_unsigned reads a uint8/16/32 pointee and must stay
+   * zero-extended; its two sibling fused forms above already say so. Without
+   * it this one sign-extended every uint32 with its high bit set, so
+   * `(uint64)s->p[i + j]` answered 18446744071562067989 for 2147483669 -- and
+   * only for an index the address fold claimed, which is why a bignum's carry
+   * chain went wrong and a single-index read of the same array did not. */
+  if (size == 4 && !load->is_float && !load->is_unsigned &&
       code_generator_binary_load_needs_sign_extend(generator, context,
                                                    &load->dest, size) &&
       !binary_emit_movsxd_rax_eax(&context->code)) {
