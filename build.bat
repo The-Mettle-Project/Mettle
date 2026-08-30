@@ -112,8 +112,14 @@ REM the archive audit below sees a screenful of undefined g_* symbols.
 if defined METTLE_NO_CODEVIEW (
     set "LDFLAGS=-ldbghelp"
 ) else (
+REM -fno-reorder-blocks-and-partition rides along because the CodeView line
+REM table measures every line label from .text, while -O2's block partitioning
+REM moves cold blocks into .text.unlikely, where that subtraction has no answer
+REM and gas reports "can't resolve .text - .Lcvline<n>". Whether a function
+REM splits depends on its size, so any statement added to a large one could
+REM break the default Windows build in a file nobody touched.
     if /I "%CC%"=="gcc" (
-        set "CFLAGS=%CFLAGS% -gcodeview"
+        set "CFLAGS=%CFLAGS% -gcodeview -fno-reorder-blocks-and-partition"
         set "LDFLAGS=-ldbghelp -Wl,--pdb,bin\mettle.pdb"
     ) else (
         set "LDFLAGS=-ldbghelp"

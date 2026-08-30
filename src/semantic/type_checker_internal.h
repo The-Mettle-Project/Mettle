@@ -230,6 +230,8 @@ int type_checker_desugar_struct_method_call(TypeChecker *checker,
 Type *type_checker_default_integer_literal_type(TypeChecker *checker,
                                                      NumberLiteral *literal);
 
+int type_checker_is_int64_min_magnitude(const ASTNode *operand);
+
 Type *type_checker_infer_type_internal(TypeChecker *checker,
                                               ASTNode *expression);
 

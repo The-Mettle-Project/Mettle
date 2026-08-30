@@ -2233,6 +2233,10 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                                           "numeric type", operand_type->name);
         return NULL;
       }
+      if (unop->operator[0] == '-' &&
+          type_checker_is_int64_min_magnitude(unop->operand)) {
+        return checker->builtin_int64;
+      }
       return operand_type;
     }
 

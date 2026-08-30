@@ -1592,3 +1592,21 @@ Type *type_checker_field_value(TypeChecker *checker, Type *owner,
   (void)field_index;
   return checker->builtin_field;
 }
+
+/* True for the decimal literal `9223372036854775808`, the magnitude of int64's
+ * minimum. A literal is never negative in source, so that number alone is past
+ * LLONG_MAX and types uint64; negating it was then refused against a range the
+ * diagnostic itself printed as containing the answer, which made int64's
+ * minimum the one value nobody could write. Under a unary minus the number is
+ * an int64 and the minus belongs to it. */
+int type_checker_is_int64_min_magnitude(const ASTNode *operand) {
+  const NumberLiteral *literal;
+  if (!operand || operand->type != AST_NUMBER_LITERAL) {
+    return 0;
+  }
+  literal = (const NumberLiteral *)operand->data;
+  return literal && !literal->is_float && !literal->is_char &&
+         literal->int_radix == 10 &&
+         (unsigned long long)literal->int_value ==
+             (unsigned long long)INT64_MAX + 1ull;
+}
