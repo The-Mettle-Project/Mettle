@@ -147,6 +147,17 @@ int ir_fold_readonly_globals_pass(IRProgram *program,
           cand->disqualified = 1;
         }
       }
+      /* An asm block that binds a candidate reaches it by address and may
+       * store through it; the block is one opaque instruction and no other
+       * instruction records the write. */
+      if (ins->op == IR_OP_INLINE_ASM && ins->text) {
+        for (size_t c = 0; c < table.count; c++) {
+          if (table.items[c].shadow_gen != gen &&
+              ir_inline_asm_binds_symbol(ins->text, table.items[c].name)) {
+            table.items[c].disqualified = 1;
+          }
+        }
+      }
     }
   }
 

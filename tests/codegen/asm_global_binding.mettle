@@ -1,0 +1,53 @@
+// An asm block reaching a global: `{name}` names a Mettle local, parameter, or
+// global, so the assembler must resolve a module symbol to its address, and the
+// compiler must accept that the block may store through it.
+//
+// Two things were wrong. The operand kept a borrowed pointer to the symbol name
+// while the assembler owns that field and frees it, which corrupted the heap and
+// killed the compiler with no diagnostic. And the readonly-globals fold proves a
+// global is never written by looking for a store instruction, which an asm block
+// never is: a global written only from assembly answered its initializer forever.
+import "std/io";
+
+var VIA_ASM: int64 = 7;
+var VIA_ASM_NARROW: int32 = 3;
+
+// Never touched by assembly, so it still folds. That is the behaviour being
+// kept rather than lost.
+var NEVER_WRITTEN: int64 = 41;
+
+@noinline fn read_it() -> int64 { return VIA_ASM; }
+@noinline fn read_narrow() -> int32 { return VIA_ASM_NARROW; }
+@noinline fn read_settled() -> int64 { return NEVER_WRITTEN; }
+
+@noinline fn write_asm() -> void {
+  asm {
+    mov rax, 77
+    mov {VIA_ASM}, rax
+    mov eax, 88
+    mov {VIA_ASM_NARROW}, eax
+  }
+}
+
+// Reading a global back out of assembly resolves the same symbol.
+@noinline fn read_asm() -> int64 {
+  var out: int64 = 0
+  asm {
+    mov rax, {VIA_ASM}
+    add rax, 1
+    mov {out}, rax
+  }
+  return out
+}
+
+fn main() -> int32 {
+  if (read_it() != 7) { return 1; }
+  if (read_narrow() != 3) { return 2; }
+  write_asm();
+  if (read_it() != 77) { return 3; }
+  if (read_narrow() != 88) { return 4; }
+  if (read_asm() != 78) { return 5; }
+  if (read_settled() != 41) { return 6; }
+  println("ok");
+  return 0;
+}

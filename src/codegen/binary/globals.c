@@ -815,6 +815,20 @@ static int binary_written_set_build(BinaryWrittenSet *set,
           return 0;
         }
       }
+      /* An asm block is opaque, so every global it binds counts as written. */
+      if (instruction->op == IR_OP_INLINE_ASM && instruction->text) {
+        for (size_t sym_i = 0; sym_i < ir_program->module_symbol_count;
+             sym_i++) {
+          const IRModuleSymbol *sym = &ir_program->module_symbols[sym_i];
+          if (sym->kind != IR_MODSYM_VARIABLE || !sym->name) {
+            continue;
+          }
+          if (ir_inline_asm_binds_symbol(instruction->text, sym->name) &&
+              !binary_written_set_add(set, sym->name)) {
+            return 0;
+          }
+        }
+      }
     }
   }
   return 1;
@@ -850,6 +864,10 @@ int code_generator_binary_global_is_written(IRProgram *ir_program,
       if (instruction->op == IR_OP_STORE &&
           instruction->dest.kind == IR_OPERAND_SYMBOL &&
           instruction->dest.name && strcmp(instruction->dest.name, name) == 0) {
+        return 1;
+      }
+      if (instruction->op == IR_OP_INLINE_ASM &&
+          ir_inline_asm_binds_symbol(instruction->text, name)) {
         return 1;
       }
     }

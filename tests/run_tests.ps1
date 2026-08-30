@@ -419,6 +419,19 @@ $cases = @(
     SkipRunDiff   = $true
   },
   @{
+    Name          = "asm_global_binding"
+    Path          = "tests/codegen/asm_global_binding.mettle"
+    ShouldSucceed = $true
+    Expected      = "ok"
+  },
+  @{
+    Name          = "asm_global_binding_release"
+    Path          = "tests/codegen/asm_global_binding.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--emit-obj")
+    Expected      = "ok"
+  },
+  @{
     Name          = "naked_interrupt"
     Path          = "tests/test_naked_interrupt.mettle"
     ShouldSucceed = $true

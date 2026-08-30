@@ -776,6 +776,12 @@ typedef struct {
   void *codegen_view;
 } IRModuleSymbol;
 
+/* Does this inline-assembly text bind `{name}`? An asm block reaches a global
+ * through such a binding and may store to it, and nothing else in the IR
+ * records that: the block is one opaque instruction carrying its own text. Any
+ * analysis asking "is this global ever written" has to read it. */
+int ir_inline_asm_binds_symbol(const char *assembly_text, const char *name);
+
 typedef struct {
   IRFunction **functions;
   size_t function_count;

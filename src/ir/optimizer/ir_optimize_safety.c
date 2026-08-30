@@ -2790,6 +2790,12 @@ static int safety_global_is_settled(const IRProgram *program,
           strcmp(in->dest.name, name) == 0) {
         return 0;
       }
+      /* An asm block is opaque: a global it binds may be stored to inside it,
+       * and no instruction records that. */
+      if (in->op == IR_OP_INLINE_ASM &&
+          ir_inline_asm_binds_symbol(in->text, name)) {
+        return 0;
+      }
     }
   }
   return 1;
@@ -2829,6 +2835,11 @@ static void safety_const_globals_build(const IRProgram *program) {
     if (symbol->kind != IR_MODSYM_VARIABLE || symbol->is_extern ||
         !symbol->has_initializer || symbol->init_is_float ||
         symbol->init_string || symbol->init_bytes || !symbol->name) {
+      continue;
+    }
+    /* Exported: something outside this compilation can write it, so scanning
+     * this program says nothing about its value. */
+    if (symbol->is_exported) {
       continue;
     }
     if (!safety_global_is_settled(program, symbol->name)) {

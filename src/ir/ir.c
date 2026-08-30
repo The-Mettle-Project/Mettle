@@ -5764,3 +5764,30 @@ int ir_program_dump(IRProgram *program, FILE *output) {
 
   return 1;
 }
+
+int ir_inline_asm_binds_symbol(const char *assembly_text, const char *name) {
+  size_t name_length;
+  const char *at;
+
+  if (!assembly_text || !name || !*name) {
+    return 0;
+  }
+  name_length = strlen(name);
+  for (at = strchr(assembly_text, '{'); at; at = strchr(at + 1, '{')) {
+    const char *cursor = at + 1;
+    while (*cursor == ' ' || *cursor == '	') {
+      cursor++;
+    }
+    if (strncmp(cursor, name, name_length) != 0) {
+      continue;
+    }
+    cursor += name_length;
+    while (*cursor == ' ' || *cursor == '	') {
+      cursor++;
+    }
+    if (*cursor == '}') {
+      return 1;
+    }
+  }
+  return 0;
+}

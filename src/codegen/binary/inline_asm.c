@@ -116,7 +116,16 @@ static int binary_asm_resolve_binding(void *binding_context, const char *name,
     out->rip_relative = 1;
     out->address_bytes = 8;
     out->mem_bytes = binary_asm_type_bytes(symbol->type);
-    out->symbol = (char *)link_name;
+    /* The assembler OWNS an operand's symbol and frees it with the operand;
+     * every name it parses itself arrives here through strdup. Handing it the
+     * link name directly gave it a pointer the symbol table still owns, and
+     * freeing that corrupted the compiler's heap: `asm { mov {G}, rax }` on a
+     * global died with no diagnostic at all. */
+    out->symbol = mettle_strdup(link_name);
+    if (!out->symbol) {
+      snprintf(error, error_size, "out of memory naming global `%s`", name);
+      return 0;
+    }
     return 1;
   }
 

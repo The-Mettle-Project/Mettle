@@ -148,11 +148,24 @@ typedef struct { unsigned char opaque[64]; } CONDITION_VARIABLE;
 
 static int dbg_posix_write(HANDLE fd, const void *buffer, DWORD count,
                            DWORD *written, void *unused) {
-  long n;
+  const char *at = (const char *)buffer;
+  unsigned long remaining = (unsigned long)count;
+  int retries = 0;
   (void)unused;
-  n = write(fd, buffer, (unsigned long)count);
-  if (written) *written = n > 0 ? (DWORD)n : 0;
-  return n >= 0;
+  while (remaining > 0) {
+    long n = write(fd, at, remaining);
+    if (n > 0) {
+      at += n;
+      remaining -= (unsigned long)n;
+      retries = 0;
+      continue;
+    }
+    if (n == 0 || ++retries > 64) {
+      break;
+    }
+  }
+  if (written) *written = (DWORD)(count - remaining);
+  return remaining == 0;
 }
 
 static int dbg_posix_read(HANDLE fd, void *buffer, DWORD count, DWORD *got,
@@ -478,12 +491,15 @@ static uint32_t g_cmd_head = 0, g_cmd_tail = 0;
 /* --- pipe I/O ----------------------------------------------------------------- */
 
 static void dbg_send(const char *line) {
+  char framed[DBG_LINE_MAX + 1];
   DWORD written = 0;
   size_t len;
   if (g_pipe == INVALID_HANDLE_VALUE || !line) return;
   len = strlen(line);
-  WriteFile(g_pipe, line, (DWORD)len, &written, NULL);
-  WriteFile(g_pipe, "\n", 1, &written, NULL);
+  if (len > DBG_LINE_MAX) len = DBG_LINE_MAX;
+  memcpy(framed, line, len);
+  framed[len] = '\n';
+  WriteFile(g_pipe, framed, (DWORD)(len + 1), &written, NULL);
 }
 
 static void dbg_sendf(const char *format, ...) {
