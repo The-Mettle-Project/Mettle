@@ -226,24 +226,16 @@ static int asm_is_ident_char(int c) {
   return isalnum(c) || c == '_' || c == '.' || c == '$' || c == '@';
 }
 
-static AsmToken asm_scan_token(AsmLexer *lexer) {
-  AsmToken token;
+static void asm_skip_trivia(AsmLexer *lexer) {
   const char *source = lexer->source;
-  memset(&token, 0, sizeof(token));
-
   for (;;) {
     char c = source[lexer->position];
     if (c == ' ' || c == '\t' || c == '\r') {
       lexer->position++;
       continue;
     }
-    if (c == ';' || c == '#') {
-      while (source[lexer->position] && source[lexer->position] != '\n') {
-        lexer->position++;
-      }
-      continue;
-    }
-    if (c == '/' && source[lexer->position + 1] == '/') {
+    if (c == ';' || c == '#' ||
+        (c == '/' && source[lexer->position + 1] == '/')) {
       while (source[lexer->position] && source[lexer->position] != '\n') {
         lexer->position++;
       }
@@ -264,153 +256,186 @@ static AsmToken asm_scan_token(AsmLexer *lexer) {
       }
       continue;
     }
-    break;
+    return;
   }
+}
 
+static void asm_scan_binding(AsmLexer *lexer, AsmToken *token) {
+  const char *source = lexer->source;
+  size_t length = 0;
+  lexer->position++;
+  while (source[lexer->position] && source[lexer->position] != '}' &&
+         source[lexer->position] != '\n') {
+    if (length + 1 < sizeof(token->text)) {
+      token->text[length++] = source[lexer->position];
+    }
+    lexer->position++;
+  }
+  token->text[length] = '\0';
+  if (source[lexer->position] != '}') {
+    asm_lexer_fail(lexer, token->line, "unterminated `{` operand binding");
+    token->type = AT_END;
+    return;
+  }
+  lexer->position++;
+  while (length > 0 && isspace((unsigned char)token->text[length - 1])) {
+    token->text[--length] = '\0';
+  }
+  token->type = AT_BINDING;
+}
+
+static char asm_scan_escape(AsmLexer *lexer) {
+  char escaped = lexer->source[lexer->position + 1];
+  lexer->position += 2;
+  switch (escaped) {
+  case 'n': return '\n';
+  case 't': return '\t';
+  case 'r': return '\r';
+  case '0': return '\0';
+  case 'e': return 27;
+  default: return escaped;
+  }
+}
+
+static void asm_scan_string(AsmLexer *lexer, AsmToken *token) {
+  const char *source = lexer->source;
+  char quote = source[lexer->position];
+  size_t length = 0;
+  size_t i;
+  lexer->position++;
+  while (source[lexer->position] && source[lexer->position] != quote) {
+    char c = source[lexer->position];
+    if (c == '\\' && source[lexer->position + 1]) {
+      c = asm_scan_escape(lexer);
+    } else {
+      if (c == '\n') {
+        lexer->line++;
+      }
+      lexer->position++;
+    }
+    if (length + 1 < sizeof(token->text)) {
+      token->text[length++] = c;
+    }
+  }
+  if (source[lexer->position] != quote) {
+    asm_lexer_fail(lexer, token->line, "unterminated string in asm block");
+    token->type = AT_END;
+    return;
+  }
+  lexer->position++;
+  token->text[length] = '\0';
+  token->length = length;
+  if (length >= 1 && length <= 8) {
+    token->number = 0;
+    for (i = 0; i < length; i++) {
+      token->number |= ((long long)(unsigned char)token->text[i]) << (8 * i);
+    }
+  }
+  token->type = AT_STRING;
+}
+
+static int asm_scan_number_base(AsmLexer *lexer) {
+  const char *source = lexer->source;
+  char marker;
+  if (source[lexer->position] != '0') {
+    return 10;
+  }
+  marker = source[lexer->position + 1];
+  if (marker == 'x' || marker == 'X') {
+    lexer->position += 2;
+    return 16;
+  }
+  if (marker == 'b' || marker == 'B') {
+    lexer->position += 2;
+    return 2;
+  }
+  if (marker == 'o' || marker == 'O') {
+    lexer->position += 2;
+    return 8;
+  }
+  return 10;
+}
+
+static void asm_scan_number(AsmLexer *lexer, AsmToken *token) {
+  const char *source = lexer->source;
+  char buffer[128];
+  size_t length = 0;
+  int base = asm_scan_number_base(lexer);
+  char *end = NULL;
+  unsigned long long value;
+  while (isalnum((unsigned char)source[lexer->position]) ||
+         source[lexer->position] == '_') {
+    if (source[lexer->position] != '_' && length + 1 < sizeof(buffer)) {
+      buffer[length++] = source[lexer->position];
+    }
+    lexer->position++;
+  }
+  buffer[length] = '\0';
+  value = strtoull(buffer, &end, base);
+  if (!end || *end != '\0') {
+    asm_lexer_fail(lexer, token->line, "malformed number in asm block");
+    token->type = AT_END;
+    return;
+  }
+  token->number = (long long)value;
+  token->type = AT_NUMBER;
+  snprintf(token->text, sizeof(token->text), "%s", buffer);
+}
+
+static void asm_scan_identifier(AsmLexer *lexer, AsmToken *token) {
+  const char *source = lexer->source;
+  size_t length = 0;
+  while (asm_is_ident_char((unsigned char)source[lexer->position])) {
+    if (length + 1 < sizeof(token->text)) {
+      token->text[length++] = source[lexer->position];
+    }
+    lexer->position++;
+  }
+  token->text[length] = '\0';
+  token->length = length;
+  token->type = AT_IDENT;
+}
+
+static AsmToken asm_scan_token(AsmLexer *lexer) {
+  AsmToken token;
+  const char *source = lexer->source;
+  char c;
+  memset(&token, 0, sizeof(token));
+
+  asm_skip_trivia(lexer);
   token.line = lexer->line;
+  c = source[lexer->position];
 
-  if (source[lexer->position] == '\0') {
+  if (c == '\0') {
     token.type = AT_END;
     return token;
   }
-
-  if (source[lexer->position] == '\n') {
+  if (c == '\n') {
     lexer->position++;
     lexer->line++;
     token.type = AT_NEWLINE;
     return token;
   }
-
-  if (source[lexer->position] == '{') {
-    size_t length = 0;
-    lexer->position++;
-    while (source[lexer->position] && source[lexer->position] != '}' &&
-           source[lexer->position] != '\n') {
-      if (length + 1 < sizeof(token.text)) {
-        token.text[length++] = source[lexer->position];
-      }
-      lexer->position++;
-    }
-    token.text[length] = '\0';
-    if (source[lexer->position] != '}') {
-      asm_lexer_fail(lexer, token.line, "unterminated `{` operand binding");
-      token.type = AT_END;
-      return token;
-    }
-    lexer->position++;
-    while (length > 0 && isspace((unsigned char)token.text[length - 1])) {
-      token.text[--length] = '\0';
-    }
-    token.type = AT_BINDING;
+  if (c == '{') {
+    asm_scan_binding(lexer, &token);
     return token;
   }
-
-  if (source[lexer->position] == '\'' || source[lexer->position] == '"') {
-    char quote = source[lexer->position];
-    size_t length = 0;
-    lexer->position++;
-    while (source[lexer->position] && source[lexer->position] != quote) {
-      char c = source[lexer->position];
-      if (c == '\\' && source[lexer->position + 1]) {
-        char escaped = source[lexer->position + 1];
-        lexer->position += 2;
-        switch (escaped) {
-        case 'n': c = '\n'; break;
-        case 't': c = '\t'; break;
-        case 'r': c = '\r'; break;
-        case '0': c = '\0'; break;
-        case 'e': c = 27; break;
-        default: c = escaped; break;
-        }
-      } else {
-        if (c == '\n') {
-          lexer->line++;
-        }
-        lexer->position++;
-      }
-      if (length + 1 < sizeof(token.text)) {
-        token.text[length++] = c;
-      }
-    }
-    if (source[lexer->position] != quote) {
-      asm_lexer_fail(lexer, token.line, "unterminated string in asm block");
-      token.type = AT_END;
-      return token;
-    }
-    lexer->position++;
-    token.text[length] = '\0';
-    token.length = length;
-    if (length >= 1 && length <= 8) {
-      size_t i;
-      token.number = 0;
-      for (i = 0; i < length; i++) {
-        token.number |= ((long long)(unsigned char)token.text[i]) << (8 * i);
-      }
-    }
-    token.type = AT_STRING;
+  if (c == '\'' || c == '"') {
+    asm_scan_string(lexer, &token);
     return token;
   }
-
-  if (isdigit((unsigned char)source[lexer->position])) {
-    char buffer[128];
-    size_t length = 0;
-    int base = 10;
-    if (source[lexer->position] == '0' &&
-        (source[lexer->position + 1] == 'x' ||
-         source[lexer->position + 1] == 'X')) {
-      base = 16;
-      lexer->position += 2;
-    } else if (source[lexer->position] == '0' &&
-               (source[lexer->position + 1] == 'b' ||
-                source[lexer->position + 1] == 'B')) {
-      base = 2;
-      lexer->position += 2;
-    } else if (source[lexer->position] == '0' &&
-               (source[lexer->position + 1] == 'o' ||
-                source[lexer->position + 1] == 'O')) {
-      base = 8;
-      lexer->position += 2;
-    }
-    while (isalnum((unsigned char)source[lexer->position]) ||
-           source[lexer->position] == '_') {
-      if (source[lexer->position] != '_' && length + 1 < sizeof(buffer)) {
-        buffer[length++] = source[lexer->position];
-      }
-      lexer->position++;
-    }
-    buffer[length] = '\0';
-    {
-      char *end = NULL;
-      unsigned long long value = strtoull(buffer, &end, base);
-      if (!end || *end != '\0') {
-        asm_lexer_fail(lexer, token.line, "malformed number in asm block");
-        token.type = AT_END;
-        return token;
-      }
-      token.number = (long long)value;
-    }
-    token.type = AT_NUMBER;
-    snprintf(token.text, sizeof(token.text), "%s", buffer);
+  if (isdigit((unsigned char)c)) {
+    asm_scan_number(lexer, &token);
     return token;
   }
-
-  if (asm_is_ident_start((unsigned char)source[lexer->position])) {
-    size_t length = 0;
-    while (asm_is_ident_char((unsigned char)source[lexer->position])) {
-      if (length + 1 < sizeof(token.text)) {
-        token.text[length++] = source[lexer->position];
-      }
-      lexer->position++;
-    }
-    token.text[length] = '\0';
-    token.length = length;
-    token.type = AT_IDENT;
+  if (asm_is_ident_start((unsigned char)c)) {
+    asm_scan_identifier(lexer, &token);
     return token;
   }
 
   token.type = AT_PUNCT;
-  token.punct = source[lexer->position];
-  token.text[0] = source[lexer->position];
+  token.punct = c;
+  token.text[0] = c;
   token.text[1] = '\0';
   lexer->position++;
   return token;
@@ -752,207 +777,249 @@ static int asm_parse_memory(AsmState *state, X86AsmOperand *operand,
   return 1;
 }
 
-static int asm_parse_operand(AsmState *state, X86AsmOperand *operand) {
+static int asm_parse_operand(AsmState *state, X86AsmOperand *operand);
+
+static int asm_parse_operand_prefixes(AsmState *state, X86AsmOperand *operand) {
   AsmLexer *lexer = state->lexer;
   int size_bytes = 0;
-  int segment = 0;
-
-  memset(operand, 0, sizeof(*operand));
-  operand->scale = 1;
-
   for (;;) {
-    if (lexer->current.type != AT_IDENT) {
-      break;
-    }
-    {
-      char name[192];
-      int keyword_size;
-      snprintf(name, sizeof(name), "%s", lexer->current.text);
-      asm_lowercase(name);
-      keyword_size = asm_size_keyword(name);
-      if (keyword_size) {
-        const AsmToken *next = asm_peek(lexer);
-        int next_is_ptr = next->type == AT_IDENT;
-        char peeked[192];
-        if (next_is_ptr) {
-          snprintf(peeked, sizeof(peeked), "%s", next->text);
-          asm_lowercase(peeked);
-          next_is_ptr = strcmp(peeked, "ptr") == 0;
-        }
-        if (next_is_ptr) {
-          size_bytes = keyword_size;
-          asm_advance(lexer);
-          asm_advance(lexer);
-          continue;
-        }
-        if (next->type == AT_PUNCT && next->punct == '[') {
-          size_bytes = keyword_size;
-          asm_advance(lexer);
-          continue;
-        }
-      }
-      if (strcmp(name, "short") == 0 || strcmp(name, "near") == 0) {
-        operand->explicit_short = strcmp(name, "short") == 0;
-        asm_advance(lexer);
-        continue;
-      }
-      if (strcmp(name, "ptr") == 0 || strcmp(name, "offset") == 0) {
-        asm_advance(lexer);
-        continue;
-      }
-    }
-    break;
-  }
-
-  if (lexer->current.type == AT_IDENT) {
     char name[192];
-    int reg_class = 0;
-    int number = 0;
-    int bytes = 0;
-    int high = 0;
+    int keyword_size;
+    if (lexer->current.type != AT_IDENT) {
+      return size_bytes;
+    }
     snprintf(name, sizeof(name), "%s", lexer->current.text);
     asm_lowercase(name);
-    if (x86_asm_lookup_register(name, &reg_class, &number, &bytes, &high)) {
+    keyword_size = asm_size_keyword(name);
+    if (keyword_size) {
       const AsmToken *next = asm_peek(lexer);
-      if (reg_class == X86_ASM_REG_SEG && next->type == AT_PUNCT &&
-          next->punct == ':') {
-        segment = number;
-        asm_advance(lexer);
-        asm_advance(lexer);
-        if (!(lexer->current.type == AT_PUNCT && lexer->current.punct == '[')) {
-          asm_fail(state, lexer->current.line,
-                   "expected `[` after a segment override");
-          return 0;
-        }
-        return asm_parse_memory(state, operand, size_bytes, segment + 1);
+      int next_is_ptr = next->type == AT_IDENT;
+      char peeked[192];
+      if (next_is_ptr) {
+        snprintf(peeked, sizeof(peeked), "%s", next->text);
+        asm_lowercase(peeked);
+        next_is_ptr = strcmp(peeked, "ptr") == 0;
       }
-      operand->kind = X86_ASM_OPERAND_REG;
-      operand->reg_class = reg_class;
-      operand->reg = number;
-      operand->reg_bytes = bytes;
-      operand->high_byte = high;
+      if (next_is_ptr) {
+        size_bytes = keyword_size;
+        asm_advance(lexer);
+        asm_advance(lexer);
+        continue;
+      }
+      if (next->type == AT_PUNCT && next->punct == '[') {
+        size_bytes = keyword_size;
+        asm_advance(lexer);
+        continue;
+      }
+    }
+    if (strcmp(name, "short") == 0 || strcmp(name, "near") == 0) {
+      operand->explicit_short = strcmp(name, "short") == 0;
       asm_advance(lexer);
-      return 1;
+      continue;
     }
+    if (strcmp(name, "ptr") == 0 || strcmp(name, "offset") == 0) {
+      asm_advance(lexer);
+      continue;
+    }
+    return size_bytes;
   }
+}
 
-  if (lexer->current.type == AT_PUNCT && lexer->current.punct == '[') {
-    return asm_parse_memory(state, operand, size_bytes, segment);
+static int asm_parse_register_operand(AsmState *state, X86AsmOperand *operand,
+                                      int size_bytes, int *handled) {
+  AsmLexer *lexer = state->lexer;
+  char name[192];
+  int reg_class = 0;
+  int number = 0;
+  int bytes = 0;
+  int high = 0;
+  const AsmToken *next;
+
+  *handled = 0;
+  snprintf(name, sizeof(name), "%s", lexer->current.text);
+  asm_lowercase(name);
+  if (!x86_asm_lookup_register(name, &reg_class, &number, &bytes, &high)) {
+    return 0;
   }
-
-  if (lexer->current.type == AT_BINDING) {
-    char error[192];
-    X86AsmOperand bound;
-    memset(&bound, 0, sizeof(bound));
-    if (!state->config->resolve_binding) {
+  *handled = 1;
+  next = asm_peek(lexer);
+  if (reg_class == X86_ASM_REG_SEG && next->type == AT_PUNCT &&
+      next->punct == ':') {
+    asm_advance(lexer);
+    asm_advance(lexer);
+    if (!(lexer->current.type == AT_PUNCT && lexer->current.punct == '[')) {
       asm_fail(state, lexer->current.line,
-               "`{%s}` operand bindings are not available in this context",
-               lexer->current.text);
+               "expected `[` after a segment override");
       return 0;
     }
-    error[0] = '\0';
-    if (!state->config->resolve_binding(state->config->binding_context,
-                                        lexer->current.text, &bound, error,
-                                        sizeof(error))) {
-      asm_fail(state, lexer->current.line, "%s",
-               error[0] ? error : "unknown operand binding");
-      return 0;
+    return asm_parse_memory(state, operand, size_bytes, number + 1);
+  }
+  operand->kind = X86_ASM_OPERAND_REG;
+  operand->reg_class = reg_class;
+  operand->reg = number;
+  operand->reg_bytes = bytes;
+  operand->high_byte = high;
+  asm_advance(lexer);
+  return 1;
+}
+
+static int asm_parse_binding_operand(AsmState *state, X86AsmOperand *operand,
+                                     int size_bytes) {
+  AsmLexer *lexer = state->lexer;
+  char error[192];
+  X86AsmOperand bound;
+  memset(&bound, 0, sizeof(bound));
+  if (!state->config->resolve_binding) {
+    asm_fail(state, lexer->current.line,
+             "`{%s}` operand bindings are not available in this context",
+             lexer->current.text);
+    return 0;
+  }
+  error[0] = '\0';
+  if (!state->config->resolve_binding(state->config->binding_context,
+                                      lexer->current.text, &bound, error,
+                                      sizeof(error))) {
+    asm_fail(state, lexer->current.line, "%s",
+             error[0] ? error : "unknown operand binding");
+    return 0;
+  }
+  if (size_bytes && bound.kind == X86_ASM_OPERAND_MEM) {
+    bound.mem_bytes = size_bytes;
+  }
+  *operand = bound;
+  asm_advance(lexer);
+  return 1;
+}
+
+static void asm_parse_immediate_sign(AsmLexer *lexer, int *sign) {
+  for (;;) {
+    if (lexer->current.type == AT_PUNCT && lexer->current.punct == '-') {
+      *sign = -*sign;
+      asm_advance(lexer);
+      continue;
     }
-    if (size_bytes && bound.kind == X86_ASM_OPERAND_MEM) {
-      bound.mem_bytes = size_bytes;
+    if (lexer->current.type == AT_PUNCT && lexer->current.punct == '+') {
+      asm_advance(lexer);
+      continue;
     }
-    *operand = bound;
+    return;
+  }
+}
+
+static int asm_parse_immediate_symbol(AsmState *state, X86AsmOperand *operand,
+                                      int sign) {
+  AsmLexer *lexer = state->lexer;
+  if (strcmp(lexer->current.text, "$") == 0) {
+    operand->imm += sign * (long long)(state->config->origin + state->size);
     asm_advance(lexer);
     return 1;
   }
-
-  {
-    int sign = 1;
-    int have_value = 0;
-    operand->kind = X86_ASM_OPERAND_IMM;
-    for (;;) {
-      if (lexer->current.type == AT_PUNCT && lexer->current.punct == '-') {
-        sign = -sign;
-        asm_advance(lexer);
-        continue;
-      }
-      if (lexer->current.type == AT_PUNCT && lexer->current.punct == '+') {
-        asm_advance(lexer);
-        continue;
-      }
-      break;
-    }
-    for (;;) {
-      if (lexer->current.type == AT_NUMBER ||
-          lexer->current.type == AT_STRING) {
-        if (lexer->current.type == AT_STRING && lexer->current.length > 8) {
-          asm_fail(state, lexer->current.line,
-                   "a string longer than 8 bytes is not a constant");
-          return 0;
-        }
-        operand->imm += sign * lexer->current.number;
-        have_value = 1;
-        asm_advance(lexer);
-      } else if (lexer->current.type == AT_IDENT) {
-        if (strcmp(lexer->current.text, "$") == 0) {
-          operand->imm +=
-              sign * (long long)(state->config->origin + state->size);
-          have_value = 1;
-          asm_advance(lexer);
-        } else if (strcmp(lexer->current.text, "$$") == 0) {
-          operand->imm += sign * (long long)state->config->origin;
-          have_value = 1;
-          asm_advance(lexer);
-        } else {
-          if (operand->symbol) {
-            asm_fail(state, lexer->current.line,
-                     "an operand takes at most one symbol");
-            return 0;
-          }
-          operand->symbol = strdup(lexer->current.text);
-          if (!operand->symbol) {
-            asm_fail(state, lexer->current.line, "out of memory");
-            return 0;
-          }
-          operand->symbol_is_label =
-              asm_is_declared_label(state, operand->symbol);
-          have_value = 1;
-          asm_advance(lexer);
-        }
-      } else {
-        break;
-      }
-      if (lexer->current.type == AT_PUNCT &&
-          (lexer->current.punct == '+' || lexer->current.punct == '-')) {
-        sign = lexer->current.punct == '-' ? -1 : 1;
-        asm_advance(lexer);
-        continue;
-      }
-      break;
-    }
-    if (!have_value) {
-      asm_fail(state, lexer->current.line, "expected an operand");
-      return 0;
-    }
-    if (lexer->current.type == AT_PUNCT && lexer->current.punct == ':') {
-      X86AsmOperand offset_operand;
-      if (operand->symbol) {
-        asm_fail(state, lexer->current.line,
-                 "a far pointer's selector must be a constant");
-        return 0;
-      }
-      asm_advance(lexer);
-      if (!asm_parse_operand(state, &offset_operand)) {
-        return 0;
-      }
-      operand->far_segment = operand->imm;
-      operand->imm = offset_operand.imm;
-      operand->symbol = offset_operand.symbol;
-      operand->symbol_is_label = offset_operand.symbol_is_label;
-      operand->kind = X86_ASM_OPERAND_FAR;
-    }
+  if (strcmp(lexer->current.text, "$$") == 0) {
+    operand->imm += sign * (long long)state->config->origin;
+    asm_advance(lexer);
     return 1;
   }
+  if (operand->symbol) {
+    asm_fail(state, lexer->current.line, "an operand takes at most one symbol");
+    return 0;
+  }
+  operand->symbol = strdup(lexer->current.text);
+  if (!operand->symbol) {
+    asm_fail(state, lexer->current.line, "out of memory");
+    return 0;
+  }
+  operand->symbol_is_label = asm_is_declared_label(state, operand->symbol);
+  asm_advance(lexer);
+  return 1;
+}
+
+static int asm_parse_far_offset(AsmState *state, X86AsmOperand *operand) {
+  AsmLexer *lexer = state->lexer;
+  X86AsmOperand offset_operand;
+  if (operand->symbol) {
+    asm_fail(state, lexer->current.line,
+             "a far pointer's selector must be a constant");
+    return 0;
+  }
+  asm_advance(lexer);
+  if (!asm_parse_operand(state, &offset_operand)) {
+    return 0;
+  }
+  operand->far_segment = operand->imm;
+  operand->imm = offset_operand.imm;
+  operand->symbol = offset_operand.symbol;
+  operand->symbol_is_label = offset_operand.symbol_is_label;
+  operand->kind = X86_ASM_OPERAND_FAR;
+  return 1;
+}
+
+static int asm_parse_immediate_operand(AsmState *state,
+                                       X86AsmOperand *operand) {
+  AsmLexer *lexer = state->lexer;
+  int sign = 1;
+  int have_value = 0;
+
+  operand->kind = X86_ASM_OPERAND_IMM;
+  asm_parse_immediate_sign(lexer, &sign);
+  for (;;) {
+    if (lexer->current.type == AT_NUMBER ||
+        lexer->current.type == AT_STRING) {
+      if (lexer->current.type == AT_STRING && lexer->current.length > 8) {
+        asm_fail(state, lexer->current.line,
+                 "a string longer than 8 bytes is not a constant");
+        return 0;
+      }
+      operand->imm += sign * lexer->current.number;
+      asm_advance(lexer);
+    } else if (lexer->current.type == AT_IDENT) {
+      if (!asm_parse_immediate_symbol(state, operand, sign)) {
+        return 0;
+      }
+    } else {
+      break;
+    }
+    have_value = 1;
+    if (lexer->current.type == AT_PUNCT &&
+        (lexer->current.punct == '+' || lexer->current.punct == '-')) {
+      sign = lexer->current.punct == '-' ? -1 : 1;
+      asm_advance(lexer);
+      continue;
+    }
+    break;
+  }
+  if (!have_value) {
+    asm_fail(state, lexer->current.line, "expected an operand");
+    return 0;
+  }
+  if (lexer->current.type == AT_PUNCT && lexer->current.punct == ':') {
+    return asm_parse_far_offset(state, operand);
+  }
+  return 1;
+}
+
+static int asm_parse_operand(AsmState *state, X86AsmOperand *operand) {
+  AsmLexer *lexer = state->lexer;
+  int size_bytes;
+
+  memset(operand, 0, sizeof(*operand));
+  operand->scale = 1;
+  size_bytes = asm_parse_operand_prefixes(state, operand);
+
+  if (lexer->current.type == AT_IDENT) {
+    int handled = 0;
+    int parsed = asm_parse_register_operand(state, operand, size_bytes,
+                                            &handled);
+    if (handled) {
+      return parsed;
+    }
+  }
+  if (lexer->current.type == AT_PUNCT && lexer->current.punct == '[') {
+    return asm_parse_memory(state, operand, size_bytes, 0);
+  }
+  if (lexer->current.type == AT_BINDING) {
+    return asm_parse_binding_operand(state, operand, size_bytes);
+  }
+  return asm_parse_immediate_operand(state, operand);
 }
 
 static int asm_address_bytes(const AsmState *state,
@@ -974,38 +1041,64 @@ static int asm_fits_signed(long long value, int bytes) {
   return value >= low && value <= high;
 }
 
-static int asm_emit_instruction(AsmState *state, int line,
-                                const unsigned char *opcode, int opcode_length,
-                                int reg_field, int reg_field_is_gp,
-                                int reg_high_byte, const X86AsmOperand *rm,
-                                int operand_bytes, int mandatory_prefix,
-                                int force_rex_w) {
+typedef struct {
+  int base;
+  int index;
+  int field;
+} AsmModRm16;
+
+static const AsmModRm16 ASM_MODRM16_PAIR[] = {
+    {3, 6, 0}, {3, 7, 1}, {5, 6, 2}, {5, 7, 3},
+    {6, 3, 0}, {7, 3, 1}, {6, 5, 2}, {7, 5, 3}};
+
+static const AsmModRm16 ASM_MODRM16_SINGLE[] = {
+    {6, 0, 4}, {7, 0, 5}, {5, 0, 6}, {3, 0, 7}};
+
+static int asm_rex_flags(const X86AsmOperand *rm, int reg_field,
+                         int reg_field_is_gp, int reg_high_byte,
+                         int operand_bytes, int force_rex_w, int *needs_rex,
+                         int *forbids_rex) {
   int rex = 0;
-  int needs_rex = 0;
-  int forbids_rex = 0;
-  int address_bytes = state->bits / 8;
-  int i;
-
-  if (rm && rm->kind == X86_ASM_OPERAND_MEM) {
-    address_bytes = asm_address_bytes(state, rm);
-  }
-
+  *needs_rex = 0;
+  *forbids_rex = 0;
   if (reg_high_byte) {
-    forbids_rex = 1;
+    *forbids_rex = 1;
   }
   if (reg_field_is_gp && operand_bytes == 1 && !reg_high_byte &&
       reg_field >= 4 && reg_field <= 7) {
-    needs_rex = 1;
+    *needs_rex = 1;
   }
   if (rm && rm->kind == X86_ASM_OPERAND_REG) {
     if (rm->high_byte) {
-      forbids_rex = 1;
+      *forbids_rex = 1;
     } else if (rm->reg_class == X86_ASM_REG_GP && rm->reg_bytes == 1 &&
                rm->reg >= 4 && rm->reg <= 7) {
-      needs_rex = 1;
+      *needs_rex = 1;
     }
   }
+  if (operand_bytes == 8 || force_rex_w) {
+    rex |= 0x08;
+  }
+  if (reg_field >= 8) {
+    rex |= 0x04;
+  }
+  if (rm && rm->kind == X86_ASM_OPERAND_REG && rm->reg >= 8) {
+    rex |= 0x01;
+  }
+  if (rm && rm->kind == X86_ASM_OPERAND_MEM) {
+    if (rm->has_base && rm->base >= 8) {
+      rex |= 0x01;
+    }
+    if (rm->has_index && rm->index >= 8) {
+      rex |= 0x02;
+    }
+  }
+  return rex;
+}
 
+static int asm_emit_prefixes(AsmState *state, int line,
+                             const X86AsmOperand *rm, int address_bytes,
+                             int operand_bytes, int mandatory_prefix) {
   if (state->lock_prefix && !asm_byte(state, 0xF0)) {
     return 0;
   }
@@ -1044,37 +1137,218 @@ static int asm_emit_instruction(AsmState *state, int line,
       asm_fail(state, line, "64-bit operands are not available in 16-bit code");
       return 0;
     }
+    return 1;
+  }
+  if (operand_bytes == 2 && mandatory_prefix != 0x66 &&
+      !asm_byte(state, 0x66)) {
+    return 0;
+  }
+  if (operand_bytes == 8 && state->bits != 64) {
+    asm_fail(state, line, "64-bit operands are not available in 32-bit code");
+    return 0;
+  }
+  return 1;
+}
+
+static int asm_emit_displacement(AsmState *state, int line,
+                                 const X86AsmOperand *rm, long long
+                                 displacement, int bytes, int pc_relative) {
+  if (rm->symbol) {
+    if (!asm_patch(state, rm->symbol, state->size, bytes, pc_relative,
+                   displacement, line)) {
+      return 0;
+    }
+    return asm_value(state, 0, bytes);
+  }
+  return asm_value(state, displacement, bytes);
+}
+
+static int asm_modrm16_field(const X86AsmOperand *rm) {
+  size_t i;
+  if (rm->has_base && rm->has_index) {
+    for (i = 0; i < sizeof(ASM_MODRM16_PAIR) / sizeof(ASM_MODRM16_PAIR[0]);
+         i++) {
+      if (rm->base == ASM_MODRM16_PAIR[i].base &&
+          rm->index == ASM_MODRM16_PAIR[i].index) {
+        return ASM_MODRM16_PAIR[i].field;
+      }
+    }
+    return -1;
+  }
+  for (i = 0; i < sizeof(ASM_MODRM16_SINGLE) / sizeof(ASM_MODRM16_SINGLE[0]);
+       i++) {
+    if ((rm->has_base ? rm->base : rm->index) ==
+        ASM_MODRM16_SINGLE[i].base) {
+      return ASM_MODRM16_SINGLE[i].field;
+    }
+  }
+  return -1;
+}
+
+static int asm_emit_modrm16(AsmState *state, int line, int reg_field,
+                            const X86AsmOperand *rm) {
+  int rm_field;
+  int mod;
+  long long displacement = rm->disp;
+  if (rm->rip_relative) {
+    asm_fail(state, line, "rip-relative addressing needs 64-bit code");
+    return 0;
+  }
+  if (!rm->has_base && !rm->has_index) {
+    if (!asm_byte(state, ((reg_field & 7) << 3) | 6)) {
+      return 0;
+    }
+    return asm_emit_displacement(state, line, rm, displacement, 2, 0);
+  }
+  if (rm->has_base && rm->has_index && rm->scale != 1) {
+    asm_fail(state, line, "16-bit addressing has no scaled index");
+    return 0;
+  }
+  rm_field = asm_modrm16_field(rm);
+  if (rm_field < 0) {
+    asm_fail(state, line, "that base/index combination has no 16-bit encoding");
+    return 0;
+  }
+  if (rm->symbol) {
+    mod = 2;
+  } else if (displacement == 0 && rm_field != 6) {
+    mod = 0;
+  } else if (asm_fits_signed(displacement, 1)) {
+    mod = 1;
   } else {
-    if (operand_bytes == 2 && mandatory_prefix != 0x66 &&
-        !asm_byte(state, 0x66)) {
+    mod = 2;
+  }
+  if (!asm_byte(state,
+                (unsigned)((mod << 6) | ((reg_field & 7) << 3) | rm_field))) {
+    return 0;
+  }
+  if (mod == 1) {
+    return asm_value(state, displacement, 1);
+  }
+  if (mod == 2) {
+    return asm_emit_displacement(state, line, rm, displacement, 2, 0);
+  }
+  return 1;
+}
+
+static int asm_emit_sib(AsmState *state, int line, const X86AsmOperand *rm) {
+  int scale_bits;
+  int index_field = rm->has_index ? (rm->index & 7) : 4;
+  int base_field = rm->has_base ? (rm->base & 7) : 5;
+  switch (rm->scale) {
+  case 1: scale_bits = 0; break;
+  case 2: scale_bits = 1; break;
+  case 4: scale_bits = 2; break;
+  case 8: scale_bits = 3; break;
+  default:
+    asm_fail(state, line, "an index scale must be 1, 2, 4 or 8");
+    return 0;
+  }
+  return asm_byte(state, (unsigned)((scale_bits << 6) | (index_field << 3) |
+                                    base_field));
+}
+
+static int asm_emit_modrm32(AsmState *state, int line, int reg_field,
+                            const X86AsmOperand *rm) {
+  int mod;
+  int rm_field;
+  int need_sib = 0;
+  int displacement_bytes = 0;
+  long long displacement = rm->disp;
+
+  if (rm->rip_relative ||
+      (state->bits == 64 && rm->symbol && !rm->has_base && !rm->has_index)) {
+    if (state->bits != 64) {
+      asm_fail(state, line, "rip-relative addressing needs 64-bit code");
       return 0;
     }
-    if (operand_bytes == 8 && state->bits != 64) {
-      asm_fail(state, line, "64-bit operands are not available in 32-bit code");
+    if (!asm_byte(state, (unsigned)(((reg_field & 7) << 3) | 5))) {
       return 0;
     }
+    return asm_emit_displacement(state, line, rm, displacement, 4, 1);
   }
 
-  if (operand_bytes == 8 || force_rex_w) {
-    rex |= 0x08;
-  }
-  if (reg_field >= 8) {
-    rex |= 0x04;
-  }
-  if (rm) {
-    if (rm->kind == X86_ASM_OPERAND_REG) {
-      if (rm->reg >= 8) {
-        rex |= 0x01;
+  if (!rm->has_base && !rm->has_index) {
+    if (state->bits == 64) {
+      if (!asm_byte(state, (unsigned)(((reg_field & 7) << 3) | 4))) {
+        return 0;
       }
-    } else if (rm->kind == X86_ASM_OPERAND_MEM) {
-      if (rm->has_base && rm->base >= 8) {
-        rex |= 0x01;
+      if (!asm_byte(state, 0x25)) {
+        return 0;
       }
-      if (rm->has_index && rm->index >= 8) {
-        rex |= 0x02;
-      }
+    } else if (!asm_byte(state, (unsigned)(((reg_field & 7) << 3) | 5))) {
+      return 0;
     }
+    return asm_emit_displacement(state, line, rm, displacement, 4, 0);
   }
+
+  if (rm->has_index || (rm->has_base && (rm->base & 7) == 4)) {
+    need_sib = 1;
+  }
+  if (rm->has_index && (rm->index & 7) == 4 && rm->scale == 1 &&
+      !rm->has_base) {
+    asm_fail(state, line, "rsp cannot be a scaled index");
+    return 0;
+  }
+
+  if (!rm->has_base) {
+    mod = 0;
+    displacement_bytes = 4;
+  } else if (rm->symbol) {
+    mod = 2;
+    displacement_bytes = 4;
+  } else if (displacement == 0 && (rm->base & 7) != 5) {
+    mod = 0;
+    displacement_bytes = 0;
+  } else if (asm_fits_signed(displacement, 1)) {
+    mod = 1;
+    displacement_bytes = 1;
+  } else {
+    mod = 2;
+    displacement_bytes = 4;
+  }
+
+  rm_field = need_sib ? 4 : (rm->base & 7);
+  if (!asm_byte(state,
+                (unsigned)((mod << 6) | ((reg_field & 7) << 3) | rm_field))) {
+    return 0;
+  }
+  if (need_sib && !asm_emit_sib(state, line, rm)) {
+    return 0;
+  }
+  if (displacement_bytes == 1) {
+    return asm_value(state, displacement, 1);
+  }
+  if (displacement_bytes == 4) {
+    return asm_emit_displacement(state, line, rm, displacement, 4, 0);
+  }
+  return 1;
+}
+
+static int asm_emit_instruction(AsmState *state, int line,
+                                const unsigned char *opcode, int opcode_length,
+                                int reg_field, int reg_field_is_gp,
+                                int reg_high_byte, const X86AsmOperand *rm,
+                                int operand_bytes, int mandatory_prefix,
+                                int force_rex_w) {
+  int rex;
+  int needs_rex;
+  int forbids_rex;
+  int address_bytes = state->bits / 8;
+  int i;
+
+  if (rm && rm->kind == X86_ASM_OPERAND_MEM) {
+    address_bytes = asm_address_bytes(state, rm);
+  }
+
+  rex = asm_rex_flags(rm, reg_field, reg_field_is_gp, reg_high_byte,
+                      operand_bytes, force_rex_w, &needs_rex, &forbids_rex);
+
+  if (!asm_emit_prefixes(state, line, rm, address_bytes, operand_bytes,
+                         mandatory_prefix)) {
+    return 0;
+  }
+
   if (rex || needs_rex) {
     if (state->bits != 64) {
       asm_fail(state, line,
@@ -1102,214 +1376,13 @@ static int asm_emit_instruction(AsmState *state, int line,
   if (!rm) {
     return 1;
   }
-
   if (rm->kind == X86_ASM_OPERAND_REG) {
     return asm_byte(state, 0xC0 | ((reg_field & 7) << 3) | (rm->reg & 7));
   }
-
   if (address_bytes == 2) {
-    int rm_field = -1;
-    int mod = 0;
-    long long displacement = rm->disp;
-    if (rm->rip_relative) {
-      asm_fail(state, line, "rip-relative addressing needs 64-bit code");
-      return 0;
-    }
-    if (rm->has_base && rm->has_index) {
-      if (rm->scale != 1) {
-        asm_fail(state, line, "16-bit addressing has no scaled index");
-        return 0;
-      }
-      if (rm->base == 3 && rm->index == 6) {
-        rm_field = 0;
-      } else if (rm->base == 3 && rm->index == 7) {
-        rm_field = 1;
-      } else if (rm->base == 5 && rm->index == 6) {
-        rm_field = 2;
-      } else if (rm->base == 5 && rm->index == 7) {
-        rm_field = 3;
-      } else if (rm->base == 6 && rm->index == 3) {
-        rm_field = 0;
-      } else if (rm->base == 7 && rm->index == 3) {
-        rm_field = 1;
-      } else if (rm->base == 6 && rm->index == 5) {
-        rm_field = 2;
-      } else if (rm->base == 7 && rm->index == 5) {
-        rm_field = 3;
-      }
-    } else if (rm->has_base || rm->has_index) {
-      int reg = rm->has_base ? rm->base : rm->index;
-      if (reg == 6) {
-        rm_field = 4;
-      } else if (reg == 7) {
-        rm_field = 5;
-      } else if (reg == 5) {
-        rm_field = 6;
-      } else if (reg == 3) {
-        rm_field = 7;
-      }
-    } else {
-      rm_field = 6;
-      mod = 0;
-      if (!asm_byte(state, ((reg_field & 7) << 3) | 6)) {
-        return 0;
-      }
-      if (rm->symbol) {
-        if (!asm_patch(state, rm->symbol, state->size, 2, 0, displacement,
-                       line)) {
-          return 0;
-        }
-        return asm_value(state, 0, 2);
-      }
-      return asm_value(state, displacement, 2);
-    }
-    if (rm_field < 0) {
-      asm_fail(state, line,
-               "that base/index combination has no 16-bit encoding");
-      return 0;
-    }
-    if (rm->symbol) {
-      mod = 2;
-    } else if (displacement == 0 && rm_field != 6) {
-      mod = 0;
-    } else if (asm_fits_signed(displacement, 1)) {
-      mod = 1;
-    } else {
-      mod = 2;
-    }
-    if (!asm_byte(state, (unsigned)((mod << 6) | ((reg_field & 7) << 3) |
-                                    rm_field))) {
-      return 0;
-    }
-    if (mod == 1) {
-      return asm_value(state, displacement, 1);
-    }
-    if (mod == 2) {
-      if (rm->symbol) {
-        if (!asm_patch(state, rm->symbol, state->size, 2, 0, displacement,
-                       line)) {
-          return 0;
-        }
-        return asm_value(state, 0, 2);
-      }
-      return asm_value(state, displacement, 2);
-    }
-    return 1;
+    return asm_emit_modrm16(state, line, reg_field, rm);
   }
-
-  {
-    int mod;
-    int rm_field;
-    int need_sib = 0;
-    int displacement_bytes = 0;
-    long long displacement = rm->disp;
-
-    if (rm->rip_relative ||
-        (state->bits == 64 && rm->symbol && !rm->has_base && !rm->has_index)) {
-      if (state->bits != 64) {
-        asm_fail(state, line, "rip-relative addressing needs 64-bit code");
-        return 0;
-      }
-      if (!asm_byte(state, (unsigned)(((reg_field & 7) << 3) | 5))) {
-        return 0;
-      }
-      if (rm->symbol) {
-        if (!asm_patch(state, rm->symbol, state->size, 4, 1, displacement,
-                       line)) {
-          return 0;
-        }
-        return asm_value(state, 0, 4);
-      }
-      return asm_value(state, displacement, 4);
-    }
-
-    if (!rm->has_base && !rm->has_index) {
-      if (state->bits == 64) {
-        if (!asm_byte(state, (unsigned)(((reg_field & 7) << 3) | 4))) {
-          return 0;
-        }
-        if (!asm_byte(state, 0x25)) {
-          return 0;
-        }
-      } else {
-        if (!asm_byte(state, (unsigned)(((reg_field & 7) << 3) | 5))) {
-          return 0;
-        }
-      }
-      if (rm->symbol) {
-        if (!asm_patch(state, rm->symbol, state->size, 4, 0, displacement,
-                       line)) {
-          return 0;
-        }
-        return asm_value(state, 0, 4);
-      }
-      return asm_value(state, displacement, 4);
-    }
-
-    if (rm->has_index || (rm->has_base && (rm->base & 7) == 4)) {
-      need_sib = 1;
-    }
-    if (rm->has_index && (rm->index & 7) == 4 && rm->scale == 1 &&
-        !rm->has_base) {
-      asm_fail(state, line, "rsp cannot be a scaled index");
-      return 0;
-    }
-
-    if (!rm->has_base) {
-      mod = 0;
-      displacement_bytes = 4;
-    } else if (rm->symbol) {
-      mod = 2;
-      displacement_bytes = 4;
-    } else if (displacement == 0 && (rm->base & 7) != 5) {
-      mod = 0;
-      displacement_bytes = 0;
-    } else if (asm_fits_signed(displacement, 1)) {
-      mod = 1;
-      displacement_bytes = 1;
-    } else {
-      mod = 2;
-      displacement_bytes = 4;
-    }
-
-    rm_field = need_sib ? 4 : (rm->base & 7);
-    if (!asm_byte(state,
-                  (unsigned)((mod << 6) | ((reg_field & 7) << 3) | rm_field))) {
-      return 0;
-    }
-    if (need_sib) {
-      int scale_bits = 0;
-      int index_field = rm->has_index ? (rm->index & 7) : 4;
-      int base_field = rm->has_base ? (rm->base & 7) : 5;
-      switch (rm->scale) {
-      case 1: scale_bits = 0; break;
-      case 2: scale_bits = 1; break;
-      case 4: scale_bits = 2; break;
-      case 8: scale_bits = 3; break;
-      default:
-        asm_fail(state, line, "an index scale must be 1, 2, 4 or 8");
-        return 0;
-      }
-      if (!asm_byte(state, (unsigned)((scale_bits << 6) | (index_field << 3) |
-                                      base_field))) {
-        return 0;
-      }
-    }
-    if (displacement_bytes == 1) {
-      return asm_value(state, displacement, 1);
-    }
-    if (displacement_bytes == 4) {
-      if (rm->symbol) {
-        if (!asm_patch(state, rm->symbol, state->size, 4, 0, displacement,
-                       line)) {
-          return 0;
-        }
-        return asm_value(state, 0, 4);
-      }
-      return asm_value(state, displacement, 4);
-    }
-    return 1;
-  }
+  return asm_emit_modrm32(state, line, reg_field, rm);
 }
 
 static int asm_emit_immediate(AsmState *state, int line,
@@ -1985,14 +2058,178 @@ static int asm_far_branch(AsmState *state, int line, int is_call,
   return asm_value(state, operands[0].far_segment, 2);
 }
 
-static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
-                               X86AsmOperand *operands, int count) {
+
+typedef struct {
+  const char *name;
+  int digit;
+} AsmDigitInstruction;
+
+static const AsmDigitInstruction ASM_GROUP3[] = {
+    {"not", 2}, {"neg", 3}, {"mul", 4}, {"div", 6}, {"idiv", 7}};
+
+static const AsmDigitInstruction ASM_BIT_TEST[] = {
+    {"bt", 4}, {"bts", 5}, {"btr", 6}, {"btc", 7}};
+
+static const AsmDigitInstruction ASM_DESCRIPTOR[] = {
+    {"sgdt", 0}, {"sidt", 1}, {"lgdt", 2},   {"lidt", 3},
+    {"smsw", 4}, {"lmsw", 6}, {"invlpg", 7}};
+
+static const AsmDigitInstruction ASM_SEGMENT_REGISTER[] = {
+    {"sldt", 0}, {"str", 1},  {"lldt", 2},
+    {"ltr", 3},  {"verr", 4}, {"verw", 5}};
+
+static const AsmDigitInstruction ASM_SAVE_STATE[] = {
+    {"fxsave", 0}, {"fxrstor", 1}, {"xsave", 4}, {"xrstor", 5}, {"clflush", 7}};
+
+static const AsmDigitInstruction ASM_PREFETCH_HINT[] = {
+    {"nta", 0}, {"t0", 1}, {"t1", 2}, {"t2", 3}};
+
+typedef struct {
+  const char *name;
+  unsigned char opcode;
+  int width;
+} AsmWidthInstruction;
+
+static const AsmWidthInstruction ASM_WIDTH[] = {
+    {"cbw", 0x98, 16},  {"cwde", 0x98, 32},  {"cdqe", 0x98, 64},
+    {"cwd", 0x99, 16},  {"cdq", 0x99, 32},   {"cqo", 0x99, 64},
+    {"iret", 0xCF, 16}, {"iretw", 0xCF, 16}, {"iretd", 0xCF, 32},
+    {"iretq", 0xCF, 64}};
+
+typedef struct {
+  const char *name;
+  unsigned char opcode;
+} AsmCounterBranch;
+
+static const AsmCounterBranch ASM_COUNTER_BRANCH[] = {
+    {"loop", 0xE2},   {"loope", 0xE1}, {"loopz", 0xE1},  {"loopne", 0xE0},
+    {"loopnz", 0xE0}, {"jcxz", 0xE3},  {"jecxz", 0xE3},  {"jrcxz", 0xE3}};
+
+typedef struct {
+  const char *name;
+  unsigned char opcode;
+  unsigned char prefix;
+} AsmBitScan;
+
+static const AsmBitScan ASM_BIT_SCAN[] = {
+    {"bsf", 0xBC, 0},      {"bsr", 0xBD, 0}, {"popcnt", 0xB8, 0xF3},
+    {"lzcnt", 0xBD, 0xF3}, {"tzcnt", 0xBC, 0xF3}};
+
+typedef struct {
+  const char *name;
+  unsigned char byte_opcode;
+  unsigned char wide_opcode;
+  int width;
+  int bare_only;
+} AsmStringInstruction;
+
+static const AsmStringInstruction ASM_STRING[] = {
+    {"movsb", 0xA4, 0xA5, 1, 0}, {"movsw", 0xA4, 0xA5, 2, 0},
+    {"movsd", 0xA4, 0xA5, 4, 1}, {"movsq", 0xA4, 0xA5, 8, 0},
+    {"stosb", 0xAA, 0xAB, 1, 0}, {"stosw", 0xAA, 0xAB, 2, 0},
+    {"stosd", 0xAA, 0xAB, 4, 0}, {"stosq", 0xAA, 0xAB, 8, 0},
+    {"lodsb", 0xAC, 0xAD, 1, 0}, {"lodsw", 0xAC, 0xAD, 2, 0},
+    {"lodsd", 0xAC, 0xAD, 4, 0}, {"lodsq", 0xAC, 0xAD, 8, 0},
+    {"scasb", 0xAE, 0xAF, 1, 0}, {"scasw", 0xAE, 0xAF, 2, 0},
+    {"scasd", 0xAE, 0xAF, 4, 0}, {"scasq", 0xAE, 0xAF, 8, 0},
+    {"cmpsb", 0xA6, 0xA7, 1, 0}, {"cmpsw", 0xA6, 0xA7, 2, 0},
+    {"cmpsd", 0xA6, 0xA7, 4, 1}, {"cmpsq", 0xA6, 0xA7, 8, 0},
+    {"insb", 0x6C, 0x6D, 1, 0},  {"insw", 0x6C, 0x6D, 2, 0},
+    {"insd", 0x6C, 0x6D, 4, 0},  {"outsb", 0x6E, 0x6F, 1, 0},
+    {"outsw", 0x6E, 0x6F, 2, 0}, {"outsd", 0x6E, 0x6F, 4, 0}};
+
+static int asm_encode_width_op(AsmState *state, int line, const char *mnemonic,
+                               unsigned char opcode, int width) {
+  if (width == 64) {
+    if (state->bits != 64) {
+      asm_fail(state, line, "`%s` needs 64-bit code", mnemonic);
+      return 0;
+    }
+    if (!asm_byte(state, 0x48)) {
+      return 0;
+    }
+    return asm_byte(state, opcode);
+  }
+  if ((width == 16) != (state->bits == 16) && !asm_byte(state, 0x66)) {
+    return 0;
+  }
+  return asm_byte(state, opcode);
+}
+
+static int asm_encode_one_operand_digit(AsmState *state, int line,
+                                        const char *mnemonic, int digit,
+                                        unsigned char second, int operand_bytes,
+                                        X86AsmOperand *operands, int count) {
+  unsigned char opcode[2];
+  if (count != 1) {
+    asm_fail(state, line, "`%s` takes one operand", mnemonic);
+    return 0;
+  }
+  opcode[0] = 0x0F;
+  opcode[1] = second;
+  return asm_emit_instruction(state, line, opcode, 2, digit, 0, 0, &operands[0],
+                              operand_bytes, 0, 0);
+}
+
+static int asm_encode_port(AsmState *state, int line, int is_in,
+                           const char *mnemonic, X86AsmOperand *operands,
+                           int count) {
+  const X86AsmOperand *port = is_in ? &operands[1] : &operands[0];
+  const X86AsmOperand *accumulator = is_in ? &operands[0] : &operands[1];
+  if (count != 2 || accumulator->kind != X86_ASM_OPERAND_REG ||
+      accumulator->reg != 0) {
+    asm_fail(state, line, "`%s` uses al, ax or eax", mnemonic);
+    return 0;
+  }
+  if (accumulator->reg_bytes == 2 && state->bits != 16 &&
+      !asm_byte(state, 0x66)) {
+    return 0;
+  }
+  if (accumulator->reg_bytes == 4 && state->bits == 16 &&
+      !asm_byte(state, 0x66)) {
+    return 0;
+  }
+  if (port->kind == X86_ASM_OPERAND_REG) {
+    if (port->reg != 2 || port->reg_bytes != 2) {
+      asm_fail(state, line, "a variable port must be `dx`");
+      return 0;
+    }
+    return asm_byte(state, (unsigned)((is_in ? 0xEC : 0xEE) +
+                                      (accumulator->reg_bytes == 1 ? 0 : 1)));
+  }
+  if (!asm_byte(state, (unsigned)((is_in ? 0xE4 : 0xE6) +
+                                  (accumulator->reg_bytes == 1 ? 0 : 1)))) {
+    return 0;
+  }
+  return asm_emit_immediate(state, line, port, 1);
+}
+
+static int asm_encode_memory_digit(AsmState *state, int line,
+                                   const char *mnemonic, int digit,
+                                   unsigned char second,
+                                   X86AsmOperand *operands, int count) {
+  unsigned char opcode[2];
+  if (count != 1 || operands[0].kind != X86_ASM_OPERAND_MEM) {
+    asm_fail(state, line, "`%s` takes a memory operand", mnemonic);
+    return 0;
+  }
+  opcode[0] = 0x0F;
+  opcode[1] = second;
+  return asm_emit_instruction(state, line, opcode, 2, digit, 0, 0, &operands[0],
+                              0, 0, 0);
+}
+
+static int asm_encode_arithmetic(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
   static const char *ALU_NAMES[8] = {"add", "or",  "adc", "sbb",
                                      "and", "sub", "xor", "cmp"};
   static const char *SHIFT_NAMES[8] = {"rol", "ror", "rcl", "rcr",
                                        "shl", "shr", NULL,  "sar"};
   unsigned char opcode[4];
   size_t i;
+  *handled = 1;
 
   for (i = 0; i < 8; i++) {
     if (strcmp(mnemonic, ALU_NAMES[i]) == 0) {
@@ -2007,6 +2244,71 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
   if (strcmp(mnemonic, "sal") == 0) {
     return asm_shift(state, line, 4, operands, count);
   }
+
+  for (i = 0; i < sizeof(ASM_GROUP3) / sizeof(ASM_GROUP3[0]); i++) {
+    if (strcmp(mnemonic, ASM_GROUP3[i].name) == 0) {
+      return asm_group3(state, line, ASM_GROUP3[i].digit, operands, count);
+    }
+  }
+
+  if (strcmp(mnemonic, "imul") == 0) {
+    if (count == 1) {
+      return asm_group3(state, line, 5, operands, count);
+    }
+    if (count == 2) {
+      if (operands[0].kind != X86_ASM_OPERAND_REG) {
+        asm_fail(state, line, "`imul` needs a register destination");
+        return 0;
+      }
+      opcode[0] = 0x0F;
+      opcode[1] = 0xAF;
+      return asm_emit_instruction(state, line, opcode, 2, operands[0].reg, 0, 0,
+                                  &operands[1], operands[0].reg_bytes, 0, 0);
+    }
+    if (count == 3) {
+      if (operands[0].kind != X86_ASM_OPERAND_REG ||
+          operands[2].kind != X86_ASM_OPERAND_IMM) {
+        asm_fail(state, line,
+                 "three-operand `imul` takes a register, an operand and a "
+                 "constant");
+        return 0;
+      }
+      if (!operands[2].symbol && asm_fits_signed(operands[2].imm, 1)) {
+        opcode[0] = 0x6B;
+        if (!asm_emit_instruction(state, line, opcode, 1, operands[0].reg, 0, 0,
+                                  &operands[1], operands[0].reg_bytes, 0, 0)) {
+          return 0;
+        }
+        return asm_emit_immediate(state, line, &operands[2], 1);
+      }
+      opcode[0] = 0x69;
+      if (!asm_emit_instruction(state, line, opcode, 1, operands[0].reg, 0, 0,
+                                &operands[1], operands[0].reg_bytes, 0, 0)) {
+        return 0;
+      }
+      return asm_emit_immediate(state, line, &operands[2],
+                                asm_immediate_bytes(operands[0].reg_bytes));
+    }
+    asm_fail(state, line, "`imul` takes one, two or three operands");
+    return 0;
+  }
+
+  if (strcmp(mnemonic, "inc") == 0) {
+    return asm_increment(state, line, 0, operands, count);
+  }
+  if (strcmp(mnemonic, "dec") == 0) {
+    return asm_increment(state, line, 1, operands, count);
+  }
+  *handled = 0;
+  return 0;
+}
+
+static int asm_encode_move(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  unsigned char opcode[4];
+  *handled = 1;
 
   if (strcmp(mnemonic, "mov") == 0) {
     return asm_mov(state, line, operands, count);
@@ -2035,6 +2337,72 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
     return asm_emit_instruction(state, line, opcode, 1, operands[0].reg, 0, 0,
                                 &operands[1], operands[0].reg_bytes, 0, 0);
   }
+
+  if (strcmp(mnemonic, "movzx") == 0 || strcmp(mnemonic, "movsx") == 0) {
+    int source_bytes;
+    if (count != 2 || operands[0].kind != X86_ASM_OPERAND_REG) {
+      asm_fail(state, line, "`%s` takes a register destination", mnemonic);
+      return 0;
+    }
+    if (operands[1].kind == X86_ASM_OPERAND_REG) {
+      source_bytes = operands[1].reg_bytes;
+    } else if (operands[1].mem_bytes) {
+      source_bytes = operands[1].mem_bytes;
+    } else {
+      asm_fail(state, line,
+               "`%s` needs `byte` or `word` before the memory operand",
+               mnemonic);
+      return 0;
+    }
+    if (source_bytes != 1 && source_bytes != 2) {
+      asm_fail(state, line, "`%s` widens from a byte or a word", mnemonic);
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    opcode[1] = (unsigned char)((mnemonic[3] == 'z' ? 0xB6 : 0xBE) +
+                                (source_bytes == 2 ? 1 : 0));
+    return asm_emit_instruction(state, line, opcode, 2, operands[0].reg, 0, 0,
+                                &operands[1], operands[0].reg_bytes, 0, 0);
+  }
+  if (strcmp(mnemonic, "movsxd") == 0) {
+    if (count != 2 || operands[0].kind != X86_ASM_OPERAND_REG) {
+      asm_fail(state, line, "`movsxd` takes a register destination");
+      return 0;
+    }
+    opcode[0] = 0x63;
+    return asm_emit_instruction(state, line, opcode, 1, operands[0].reg, 0, 0,
+                                &operands[1], operands[0].reg_bytes, 0, 0);
+  }
+
+  if (strcmp(mnemonic, "movbe") == 0) {
+    int to_register;
+    if (count != 2) {
+      asm_fail(state, line, "`movbe` takes two operands");
+      return 0;
+    }
+    to_register = operands[0].kind == X86_ASM_OPERAND_REG;
+    if (to_register == (operands[1].kind == X86_ASM_OPERAND_REG)) {
+      asm_fail(state, line, "`movbe` moves between a register and memory");
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    opcode[1] = 0x38;
+    opcode[2] = (unsigned char)(to_register ? 0xF0 : 0xF1);
+    return asm_emit_instruction(
+        state, line, opcode, 3, to_register ? operands[0].reg : operands[1].reg,
+        0, 0, to_register ? &operands[1] : &operands[0],
+        to_register ? operands[0].reg_bytes : operands[1].reg_bytes, 0, 0);
+  }
+  *handled = 0;
+  return 0;
+}
+
+static int asm_encode_test_exchange(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  unsigned char opcode[4];
+  *handled = 1;
 
   if (strcmp(mnemonic, "test") == 0) {
     int operand_bytes;
@@ -2112,70 +2480,16 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
     asm_fail(state, line, "`xchg` needs a register operand");
     return 0;
   }
+  *handled = 0;
+  return 0;
+}
 
-  if (strcmp(mnemonic, "not") == 0) {
-    return asm_group3(state, line, 2, operands, count);
-  }
-  if (strcmp(mnemonic, "neg") == 0) {
-    return asm_group3(state, line, 3, operands, count);
-  }
-  if (strcmp(mnemonic, "mul") == 0) {
-    return asm_group3(state, line, 4, operands, count);
-  }
-  if (strcmp(mnemonic, "div") == 0) {
-    return asm_group3(state, line, 6, operands, count);
-  }
-  if (strcmp(mnemonic, "idiv") == 0) {
-    return asm_group3(state, line, 7, operands, count);
-  }
-  if (strcmp(mnemonic, "imul") == 0) {
-    if (count == 1) {
-      return asm_group3(state, line, 5, operands, count);
-    }
-    if (count == 2) {
-      if (operands[0].kind != X86_ASM_OPERAND_REG) {
-        asm_fail(state, line, "`imul` needs a register destination");
-        return 0;
-      }
-      opcode[0] = 0x0F;
-      opcode[1] = 0xAF;
-      return asm_emit_instruction(state, line, opcode, 2, operands[0].reg, 0, 0,
-                                  &operands[1], operands[0].reg_bytes, 0, 0);
-    }
-    if (count == 3) {
-      if (operands[0].kind != X86_ASM_OPERAND_REG ||
-          operands[2].kind != X86_ASM_OPERAND_IMM) {
-        asm_fail(state, line,
-                 "three-operand `imul` takes a register, an operand and a "
-                 "constant");
-        return 0;
-      }
-      if (!operands[2].symbol && asm_fits_signed(operands[2].imm, 1)) {
-        opcode[0] = 0x6B;
-        if (!asm_emit_instruction(state, line, opcode, 1, operands[0].reg, 0, 0,
-                                  &operands[1], operands[0].reg_bytes, 0, 0)) {
-          return 0;
-        }
-        return asm_emit_immediate(state, line, &operands[2], 1);
-      }
-      opcode[0] = 0x69;
-      if (!asm_emit_instruction(state, line, opcode, 1, operands[0].reg, 0, 0,
-                                &operands[1], operands[0].reg_bytes, 0, 0)) {
-        return 0;
-      }
-      return asm_emit_immediate(state, line, &operands[2],
-                                asm_immediate_bytes(operands[0].reg_bytes));
-    }
-    asm_fail(state, line, "`imul` takes one, two or three operands");
-    return 0;
-  }
+static int asm_encode_stack(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  *handled = 1;
 
-  if (strcmp(mnemonic, "inc") == 0) {
-    return asm_increment(state, line, 0, operands, count);
-  }
-  if (strcmp(mnemonic, "dec") == 0) {
-    return asm_increment(state, line, 1, operands, count);
-  }
   if (strcmp(mnemonic, "push") == 0) {
     return asm_push_pop(state, line, 1, operands, count);
   }
@@ -2224,49 +2538,35 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
     return asm_byte(state, 0x61);
   }
 
-  if (strcmp(mnemonic, "cbw") == 0) {
-    if (state->bits != 16 && !asm_byte(state, 0x66)) {
+  if (strcmp(mnemonic, "enter") == 0) {
+    if (count != 2) {
+      asm_fail(state, line, "`enter` takes a frame size and a nesting level");
       return 0;
     }
-    return asm_byte(state, 0x98);
+    if (!asm_byte(state, 0xC8)) {
+      return 0;
+    }
+    if (!asm_emit_immediate(state, line, &operands[0], 2)) {
+      return 0;
+    }
+    return asm_emit_immediate(state, line, &operands[1], 1);
   }
-  if (strcmp(mnemonic, "cwde") == 0) {
-    if (state->bits == 16 && !asm_byte(state, 0x66)) {
-      return 0;
+  *handled = 0;
+  return 0;
+}
+
+static int asm_encode_width(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  size_t i;
+  *handled = 1;
+
+  for (i = 0; i < sizeof(ASM_WIDTH) / sizeof(ASM_WIDTH[0]); i++) {
+    if (strcmp(mnemonic, ASM_WIDTH[i].name) == 0) {
+      return asm_encode_width_op(state, line, mnemonic, ASM_WIDTH[i].opcode,
+                                 ASM_WIDTH[i].width);
     }
-    return asm_byte(state, 0x98);
-  }
-  if (strcmp(mnemonic, "cdqe") == 0) {
-    if (state->bits != 64) {
-      asm_fail(state, line, "`cdqe` needs 64-bit code");
-      return 0;
-    }
-    if (!asm_byte(state, 0x48)) {
-      return 0;
-    }
-    return asm_byte(state, 0x98);
-  }
-  if (strcmp(mnemonic, "cwd") == 0) {
-    if (state->bits != 16 && !asm_byte(state, 0x66)) {
-      return 0;
-    }
-    return asm_byte(state, 0x99);
-  }
-  if (strcmp(mnemonic, "cdq") == 0) {
-    if (state->bits == 16 && !asm_byte(state, 0x66)) {
-      return 0;
-    }
-    return asm_byte(state, 0x99);
-  }
-  if (strcmp(mnemonic, "cqo") == 0) {
-    if (state->bits != 64) {
-      asm_fail(state, line, "`cqo` needs 64-bit code");
-      return 0;
-    }
-    if (!asm_byte(state, 0x48)) {
-      return 0;
-    }
-    return asm_byte(state, 0x99);
   }
 
   if (strcmp(mnemonic, "ret") == 0 || strcmp(mnemonic, "retn") == 0) {
@@ -2287,28 +2587,6 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
     }
     return asm_emit_immediate(state, line, &operands[0], 2);
   }
-  if (strcmp(mnemonic, "iret") == 0 || strcmp(mnemonic, "iretw") == 0) {
-    if (state->bits != 16 && !asm_byte(state, 0x66)) {
-      return 0;
-    }
-    return asm_byte(state, 0xCF);
-  }
-  if (strcmp(mnemonic, "iretd") == 0) {
-    if (state->bits == 16 && !asm_byte(state, 0x66)) {
-      return 0;
-    }
-    return asm_byte(state, 0xCF);
-  }
-  if (strcmp(mnemonic, "iretq") == 0) {
-    if (state->bits != 64) {
-      asm_fail(state, line, "`iretq` needs 64-bit code");
-      return 0;
-    }
-    if (!asm_byte(state, 0x48)) {
-      return 0;
-    }
-    return asm_byte(state, 0xCF);
-  }
 
   if (strcmp(mnemonic, "int") == 0) {
     if (count != 1 || operands[0].kind != X86_ASM_OPERAND_IMM) {
@@ -2323,6 +2601,17 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
     }
     return asm_emit_immediate(state, line, &operands[0], 1);
   }
+  *handled = 0;
+  return 0;
+}
+
+static int asm_encode_branch(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  unsigned char opcode[4];
+  size_t i;
+  *handled = 1;
 
   if (strcmp(mnemonic, "jmp") == 0) {
     if (count == 1 && operands[0].kind == X86_ASM_OPERAND_FAR) {
@@ -2350,18 +2639,13 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
     opcode[0] = 0xE8;
     return asm_branch(state, line, -1, opcode, 1, operands, count);
   }
-  if (strcmp(mnemonic, "loop") == 0) {
-    return asm_branch(state, line, 0xE2, NULL, 0, operands, count);
-  }
-  if (strcmp(mnemonic, "loope") == 0 || strcmp(mnemonic, "loopz") == 0) {
-    return asm_branch(state, line, 0xE1, NULL, 0, operands, count);
-  }
-  if (strcmp(mnemonic, "loopne") == 0 || strcmp(mnemonic, "loopnz") == 0) {
-    return asm_branch(state, line, 0xE0, NULL, 0, operands, count);
-  }
-  if (strcmp(mnemonic, "jcxz") == 0 || strcmp(mnemonic, "jecxz") == 0 ||
-      strcmp(mnemonic, "jrcxz") == 0) {
-    return asm_branch(state, line, 0xE3, NULL, 0, operands, count);
+
+  for (i = 0; i < sizeof(ASM_COUNTER_BRANCH) / sizeof(ASM_COUNTER_BRANCH[0]);
+       i++) {
+    if (strcmp(mnemonic, ASM_COUNTER_BRANCH[i].name) == 0) {
+      return asm_branch(state, line, ASM_COUNTER_BRANCH[i].opcode, NULL, 0,
+                        operands, count);
+    }
   }
 
   if (mnemonic[0] == 'j') {
@@ -2399,78 +2683,40 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
                                   &operands[1], operands[0].reg_bytes, 0, 0);
     }
   }
+  *handled = 0;
+  return 0;
+}
 
-  if (strcmp(mnemonic, "movzx") == 0 || strcmp(mnemonic, "movsx") == 0) {
-    int source_bytes;
-    if (count != 2 || operands[0].kind != X86_ASM_OPERAND_REG) {
-      asm_fail(state, line, "`%s` takes a register destination", mnemonic);
-      return 0;
-    }
-    if (operands[1].kind == X86_ASM_OPERAND_REG) {
-      source_bytes = operands[1].reg_bytes;
-    } else if (operands[1].mem_bytes) {
-      source_bytes = operands[1].mem_bytes;
-    } else {
-      asm_fail(state, line,
-               "`%s` needs `byte` or `word` before the memory operand",
-               mnemonic);
-      return 0;
-    }
-    if (source_bytes != 1 && source_bytes != 2) {
-      asm_fail(state, line, "`%s` widens from a byte or a word", mnemonic);
-      return 0;
-    }
-    opcode[0] = 0x0F;
-    opcode[1] = (unsigned char)((mnemonic[3] == 'z' ? 0xB6 : 0xBE) +
-                                (source_bytes == 2 ? 1 : 0));
-    return asm_emit_instruction(state, line, opcode, 2, operands[0].reg, 0, 0,
-                                &operands[1], operands[0].reg_bytes, 0, 0);
-  }
-  if (strcmp(mnemonic, "movsxd") == 0) {
-    if (count != 2 || operands[0].kind != X86_ASM_OPERAND_REG) {
-      asm_fail(state, line, "`movsxd` takes a register destination");
-      return 0;
-    }
-    opcode[0] = 0x63;
-    return asm_emit_instruction(state, line, opcode, 1, operands[0].reg, 0, 0,
-                                &operands[1], operands[0].reg_bytes, 0, 0);
-  }
+static int asm_encode_bit(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  unsigned char opcode[4];
+  size_t i;
+  *handled = 1;
 
-  if (strcmp(mnemonic, "bsf") == 0 || strcmp(mnemonic, "bsr") == 0 ||
-      strcmp(mnemonic, "popcnt") == 0 || strcmp(mnemonic, "lzcnt") == 0 ||
-      strcmp(mnemonic, "tzcnt") == 0) {
-    int prefix = 0;
+  for (i = 0; i < sizeof(ASM_BIT_SCAN) / sizeof(ASM_BIT_SCAN[0]); i++) {
+    if (strcmp(mnemonic, ASM_BIT_SCAN[i].name) != 0) {
+      continue;
+    }
     if (count != 2 || operands[0].kind != X86_ASM_OPERAND_REG) {
       asm_fail(state, line, "`%s` takes a register and an operand", mnemonic);
       return 0;
     }
     opcode[0] = 0x0F;
-    if (strcmp(mnemonic, "bsf") == 0) {
-      opcode[1] = 0xBC;
-    } else if (strcmp(mnemonic, "bsr") == 0) {
-      opcode[1] = 0xBD;
-    } else if (strcmp(mnemonic, "popcnt") == 0) {
-      opcode[1] = 0xB8;
-      prefix = 0xF3;
-    } else if (strcmp(mnemonic, "lzcnt") == 0) {
-      opcode[1] = 0xBD;
-      prefix = 0xF3;
-    } else {
-      opcode[1] = 0xBC;
-      prefix = 0xF3;
-    }
+    opcode[1] = ASM_BIT_SCAN[i].opcode;
     return asm_emit_instruction(state, line, opcode, 2, operands[0].reg, 0, 0,
-                                &operands[1], operands[0].reg_bytes, prefix, 0);
+                                &operands[1], operands[0].reg_bytes,
+                                ASM_BIT_SCAN[i].prefix, 0);
   }
 
-  if (strcmp(mnemonic, "bt") == 0 || strcmp(mnemonic, "bts") == 0 ||
-      strcmp(mnemonic, "btr") == 0 || strcmp(mnemonic, "btc") == 0) {
-    int digit = strcmp(mnemonic, "bt") == 0
-                    ? 4
-                    : (strcmp(mnemonic, "bts") == 0
-                           ? 5
-                           : (strcmp(mnemonic, "btr") == 0 ? 6 : 7));
+  for (i = 0; i < sizeof(ASM_BIT_TEST) / sizeof(ASM_BIT_TEST[0]); i++) {
+    int digit;
     int operand_bytes;
+    if (strcmp(mnemonic, ASM_BIT_TEST[i].name) != 0) {
+      continue;
+    }
+    digit = ASM_BIT_TEST[i].digit;
     if (count != 2) {
       asm_fail(state, line, "`%s` takes two operands", mnemonic);
       return 0;
@@ -2493,6 +2739,71 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
                                 &operands[0], operand_bytes, 0, 0);
   }
 
+  if (strcmp(mnemonic, "bswap") == 0) {
+    int rex = 0;
+    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_REG ||
+        operands[0].reg_class != X86_ASM_REG_GP ||
+        (operands[0].reg_bytes != 4 && operands[0].reg_bytes != 8)) {
+      asm_fail(state, line, "`bswap` takes a 32- or 64-bit register");
+      return 0;
+    }
+    if (operands[0].reg_bytes == 8) {
+      rex |= 0x48;
+    }
+    if (operands[0].reg >= 8) {
+      rex |= 0x41;
+    }
+    if (rex && state->bits != 64) {
+      asm_fail(state, line, "`bswap` of that register needs 64-bit code");
+      return 0;
+    }
+    if (rex && !asm_byte(state, (unsigned char)rex)) {
+      return 0;
+    }
+    if (!asm_byte(state, 0x0F)) {
+      return 0;
+    }
+    return asm_byte(state, (unsigned char)(0xC8 + (operands[0].reg & 7)));
+  }
+
+  if (strcmp(mnemonic, "shld") == 0 || strcmp(mnemonic, "shrd") == 0) {
+    int is_left = mnemonic[2] == 'l';
+    if (count != 3 || operands[1].kind != X86_ASM_OPERAND_REG) {
+      asm_fail(state, line,
+               "`%s` takes an operand, a register and a count", mnemonic);
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    if (operands[2].kind == X86_ASM_OPERAND_IMM) {
+      opcode[1] = (unsigned char)(is_left ? 0xA4 : 0xAC);
+      if (!asm_emit_instruction(state, line, opcode, 2, operands[1].reg, 1,
+                                operands[1].high_byte, &operands[0],
+                                operands[1].reg_bytes, 0, 0)) {
+        return 0;
+      }
+      return asm_emit_immediate(state, line, &operands[2], 1);
+    }
+    if (operands[2].kind != X86_ASM_OPERAND_REG || operands[2].reg != 1 ||
+        operands[2].reg_bytes != 1) {
+      asm_fail(state, line, "`%s` counts by an immediate or by cl", mnemonic);
+      return 0;
+    }
+    opcode[1] = (unsigned char)(is_left ? 0xA5 : 0xAD);
+    return asm_emit_instruction(state, line, opcode, 2, operands[1].reg, 1,
+                                operands[1].high_byte, &operands[0],
+                                operands[1].reg_bytes, 0, 0);
+  }
+  *handled = 0;
+  return 0;
+}
+
+static int asm_encode_atomic(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  unsigned char opcode[4];
+  *handled = 1;
+
   if (strcmp(mnemonic, "xadd") == 0 || strcmp(mnemonic, "cmpxchg") == 0) {
     int operand_bytes;
     if (count != 2 || operands[1].kind != X86_ASM_OPERAND_REG) {
@@ -2514,187 +2825,140 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
                                 operand_bytes, 0, 0);
   }
 
+  if (strcmp(mnemonic, "cmpxchg16b") == 0 ||
+      strcmp(mnemonic, "cmpxchg8b") == 0) {
+    int wide = strcmp(mnemonic, "cmpxchg16b") == 0;
+    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_MEM) {
+      asm_fail(state, line, "`%s` takes a memory operand", mnemonic);
+      return 0;
+    }
+    if (wide && state->bits != 64) {
+      asm_fail(state, line, "`cmpxchg16b` needs 64-bit code");
+      return 0;
+    }
+    opcode[0] = 0x0F;
+    opcode[1] = 0xC7;
+    return asm_emit_instruction(state, line, opcode, 2, 1, 0, 0, &operands[0],
+                                0, 0, wide);
+  }
+  *handled = 0;
+  return 0;
+}
+
+static int asm_encode_system(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  unsigned char opcode[4];
+  size_t i;
+  *handled = 1;
+
   if (strcmp(mnemonic, "in") == 0 || strcmp(mnemonic, "out") == 0) {
-    int is_in = strcmp(mnemonic, "in") == 0;
-    const X86AsmOperand *port = is_in ? &operands[1] : &operands[0];
-    const X86AsmOperand *accumulator = is_in ? &operands[0] : &operands[1];
-    if (count != 2 || accumulator->kind != X86_ASM_OPERAND_REG ||
-        accumulator->reg != 0) {
-      asm_fail(state, line, "`%s` uses al, ax or eax", mnemonic);
-      return 0;
+    return asm_encode_port(state, line, strcmp(mnemonic, "in") == 0, mnemonic,
+                           operands, count);
+  }
+
+  for (i = 0; i < sizeof(ASM_DESCRIPTOR) / sizeof(ASM_DESCRIPTOR[0]); i++) {
+    if (strcmp(mnemonic, ASM_DESCRIPTOR[i].name) == 0) {
+      return asm_encode_one_operand_digit(state, line, mnemonic,
+                                          ASM_DESCRIPTOR[i].digit, 0x01, 0,
+                                          operands, count);
     }
-    if (accumulator->reg_bytes == 2 && state->bits != 16 &&
-        !asm_byte(state, 0x66)) {
-      return 0;
+  }
+
+  for (i = 0;
+       i < sizeof(ASM_SEGMENT_REGISTER) / sizeof(ASM_SEGMENT_REGISTER[0]);
+       i++) {
+    if (strcmp(mnemonic, ASM_SEGMENT_REGISTER[i].name) == 0) {
+      return asm_encode_one_operand_digit(state, line, mnemonic,
+                                          ASM_SEGMENT_REGISTER[i].digit, 0x00,
+                                          2, operands, count);
     }
-    if (accumulator->reg_bytes == 4 && state->bits == 16 &&
-        !asm_byte(state, 0x66)) {
-      return 0;
+  }
+
+  for (i = 0; i < sizeof(ASM_SAVE_STATE) / sizeof(ASM_SAVE_STATE[0]); i++) {
+    if (strcmp(mnemonic, ASM_SAVE_STATE[i].name) == 0) {
+      return asm_encode_memory_digit(state, line, mnemonic,
+                                     ASM_SAVE_STATE[i].digit, 0xAE, operands,
+                                     count);
     }
-    if (port->kind == X86_ASM_OPERAND_REG) {
-      if (port->reg != 2 || port->reg_bytes != 2) {
-        asm_fail(state, line, "a variable port must be `dx`");
-        return 0;
+  }
+
+  if (strncmp(mnemonic, "prefetch", 8) == 0) {
+    const char *hint = mnemonic + 8;
+    for (i = 0; i < sizeof(ASM_PREFETCH_HINT) / sizeof(ASM_PREFETCH_HINT[0]);
+         i++) {
+      if (strcmp(hint, ASM_PREFETCH_HINT[i].name) == 0) {
+        return asm_encode_memory_digit(state, line, mnemonic,
+                                       ASM_PREFETCH_HINT[i].digit, 0x18,
+                                       operands, count);
       }
-      return asm_byte(state, (unsigned)((is_in ? 0xEC : 0xEE) +
-                                        (accumulator->reg_bytes == 1 ? 0 : 1)));
     }
-    if (!asm_byte(state, (unsigned)((is_in ? 0xE4 : 0xE6) +
-                                    (accumulator->reg_bytes == 1 ? 0 : 1)))) {
-      return 0;
-    }
-    return asm_emit_immediate(state, line, port, 1);
+    asm_fail(state, line, "unknown instruction `%s`", mnemonic);
+    return 0;
   }
 
-  if (strcmp(mnemonic, "lgdt") == 0 || strcmp(mnemonic, "lidt") == 0 ||
-      strcmp(mnemonic, "sgdt") == 0 || strcmp(mnemonic, "sidt") == 0 ||
-      strcmp(mnemonic, "lmsw") == 0 || strcmp(mnemonic, "smsw") == 0 ||
-      strcmp(mnemonic, "invlpg") == 0) {
-    int digit = 0;
-    if (count != 1) {
-      asm_fail(state, line, "`%s` takes one operand", mnemonic);
+  if (strcmp(mnemonic, "arpl") == 0) {
+    if (count != 2 || operands[1].kind != X86_ASM_OPERAND_REG ||
+        operands[1].reg_bytes != 2) {
+      asm_fail(state, line, "`arpl` takes an operand and a 16-bit register");
       return 0;
     }
-    if (strcmp(mnemonic, "sgdt") == 0) {
-      digit = 0;
-    } else if (strcmp(mnemonic, "sidt") == 0) {
-      digit = 1;
-    } else if (strcmp(mnemonic, "lgdt") == 0) {
-      digit = 2;
-    } else if (strcmp(mnemonic, "lidt") == 0) {
-      digit = 3;
-    } else if (strcmp(mnemonic, "smsw") == 0) {
-      digit = 4;
-    } else if (strcmp(mnemonic, "lmsw") == 0) {
-      digit = 6;
-    } else {
-      digit = 7;
+    if (state->bits == 64) {
+      asm_fail(state, line, "`arpl` is invalid in 64-bit code");
+      return 0;
+    }
+    opcode[0] = 0x63;
+    return asm_emit_instruction(state, line, opcode, 1, operands[1].reg, 1,
+                                operands[1].high_byte, &operands[0], 2, 0, 0);
+  }
+
+  if (strcmp(mnemonic, "lar") == 0 || strcmp(mnemonic, "lsl") == 0) {
+    if (count != 2 || operands[0].kind != X86_ASM_OPERAND_REG) {
+      asm_fail(state, line, "`%s` takes a register and an operand", mnemonic);
+      return 0;
     }
     opcode[0] = 0x0F;
-    opcode[1] = 0x01;
-    return asm_emit_instruction(state, line, opcode, 2, digit, 0, 0,
-                                &operands[0], 0, 0, 0);
+    opcode[1] = (unsigned char)(strcmp(mnemonic, "lar") == 0 ? 0x02 : 0x03);
+    return asm_emit_instruction(state, line, opcode, 2, operands[0].reg, 0, 0,
+                                &operands[1], operands[0].reg_bytes, 0, 0);
+  }
+  *handled = 0;
+  return 0;
+}
+
+static int asm_encode_string(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  size_t i;
+  *handled = 1;
+
+  (void)operands;
+
+  for (i = 0; i < sizeof(ASM_STRING) / sizeof(ASM_STRING[0]); i++) {
+    if (strcmp(mnemonic, ASM_STRING[i].name) != 0) {
+      continue;
+    }
+    if (ASM_STRING[i].bare_only && count != 0) {
+      break;
+    }
+    return asm_string_operation(state, line, mnemonic,
+                                ASM_STRING[i].byte_opcode,
+                                ASM_STRING[i].wide_opcode, ASM_STRING[i].width);
   }
 
-  if (strcmp(mnemonic, "lldt") == 0 || strcmp(mnemonic, "sldt") == 0 ||
-      strcmp(mnemonic, "ltr") == 0 || strcmp(mnemonic, "str") == 0 ||
-      strcmp(mnemonic, "verr") == 0 || strcmp(mnemonic, "verw") == 0) {
-    int digit = 0;
-    if (count != 1) {
-      asm_fail(state, line, "`%s` takes one operand", mnemonic);
-      return 0;
-    }
-    if (strcmp(mnemonic, "sldt") == 0) {
-      digit = 0;
-    } else if (strcmp(mnemonic, "str") == 0) {
-      digit = 1;
-    } else if (strcmp(mnemonic, "lldt") == 0) {
-      digit = 2;
-    } else if (strcmp(mnemonic, "ltr") == 0) {
-      digit = 3;
-    } else if (strcmp(mnemonic, "verr") == 0) {
-      digit = 4;
-    } else {
-      digit = 5;
-    }
-    opcode[0] = 0x0F;
-    opcode[1] = 0x00;
-    return asm_emit_instruction(state, line, opcode, 2, digit, 0, 0,
-                                &operands[0], 2, 0, 0);
-  }
+  *handled = 0;
+  return 0;
+}
 
-  if (strcmp(mnemonic, "enter") == 0) {
-    if (count != 2) {
-      asm_fail(state, line, "`enter` takes a frame size and a nesting level");
-      return 0;
-    }
-    if (!asm_byte(state, 0xC8)) {
-      return 0;
-    }
-    if (!asm_emit_immediate(state, line, &operands[0], 2)) {
-      return 0;
-    }
-    return asm_emit_immediate(state, line, &operands[1], 1);
-  }
-
-  if (strcmp(mnemonic, "movsb") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xA4, 0xA5, 1);
-  }
-  if (strcmp(mnemonic, "movsw") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xA4, 0xA5, 2);
-  }
-  if (strcmp(mnemonic, "movsd") == 0 && count == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xA4, 0xA5, 4);
-  }
-  if (strcmp(mnemonic, "movsq") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xA4, 0xA5, 8);
-  }
-  if (strcmp(mnemonic, "stosb") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAA, 0xAB, 1);
-  }
-  if (strcmp(mnemonic, "stosw") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAA, 0xAB, 2);
-  }
-  if (strcmp(mnemonic, "stosd") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAA, 0xAB, 4);
-  }
-  if (strcmp(mnemonic, "stosq") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAA, 0xAB, 8);
-  }
-  if (strcmp(mnemonic, "lodsb") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAC, 0xAD, 1);
-  }
-  if (strcmp(mnemonic, "lodsw") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAC, 0xAD, 2);
-  }
-  if (strcmp(mnemonic, "lodsd") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAC, 0xAD, 4);
-  }
-  if (strcmp(mnemonic, "lodsq") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAC, 0xAD, 8);
-  }
-  if (strcmp(mnemonic, "scasb") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAE, 0xAF, 1);
-  }
-  if (strcmp(mnemonic, "scasw") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAE, 0xAF, 2);
-  }
-  if (strcmp(mnemonic, "scasd") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAE, 0xAF, 4);
-  }
-  if (strcmp(mnemonic, "scasq") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xAE, 0xAF, 8);
-  }
-  if (strcmp(mnemonic, "cmpsb") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xA6, 0xA7, 1);
-  }
-  if (strcmp(mnemonic, "cmpsw") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xA6, 0xA7, 2);
-  }
-  if (strcmp(mnemonic, "cmpsd") == 0 && count == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xA6, 0xA7, 4);
-  }
-  if (strcmp(mnemonic, "cmpsq") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0xA6, 0xA7, 8);
-  }
-  if (strcmp(mnemonic, "insb") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0x6C, 0x6D, 1);
-  }
-  if (strcmp(mnemonic, "insw") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0x6C, 0x6D, 2);
-  }
-  if (strcmp(mnemonic, "insd") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0x6C, 0x6D, 4);
-  }
-  if (strcmp(mnemonic, "outsb") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0x6E, 0x6F, 1);
-  }
-  if (strcmp(mnemonic, "outsw") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0x6E, 0x6F, 2);
-  }
-  if (strcmp(mnemonic, "outsd") == 0) {
-    return asm_string_operation(state, line, mnemonic, 0x6E, 0x6F, 4);
-  }
+static int asm_encode_sse(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  unsigned char opcode[4];
+  size_t i;
+  *handled = 1;
 
   if (strcmp(mnemonic, "movd") == 0 || strcmp(mnemonic, "movq") == 0) {
     int wide = strcmp(mnemonic, "movq") == 0;
@@ -2778,163 +3042,17 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
                                 &operands[1], operands[0].reg_bytes,
                                 mnemonic[4] == 's' ? 0xF3 : 0xF2, 0);
   }
+  *handled = 0;
+  return 0;
+}
 
-  if (strcmp(mnemonic, "bswap") == 0) {
-    int rex = 0;
-    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_REG ||
-        operands[0].reg_class != X86_ASM_REG_GP ||
-        (operands[0].reg_bytes != 4 && operands[0].reg_bytes != 8)) {
-      asm_fail(state, line, "`bswap` takes a 32- or 64-bit register");
-      return 0;
-    }
-    if (operands[0].reg_bytes == 8) {
-      rex |= 0x48;
-    }
-    if (operands[0].reg >= 8) {
-      rex |= 0x41;
-    }
-    if (rex && state->bits != 64) {
-      asm_fail(state, line, "`bswap` of that register needs 64-bit code");
-      return 0;
-    }
-    if (rex && !asm_byte(state, (unsigned char)rex)) {
-      return 0;
-    }
-    if (!asm_byte(state, 0x0F)) {
-      return 0;
-    }
-    return asm_byte(state, (unsigned char)(0xC8 + (operands[0].reg & 7)));
-  }
-
-  if (strcmp(mnemonic, "shld") == 0 || strcmp(mnemonic, "shrd") == 0) {
-    int is_left = mnemonic[2] == 'l';
-    if (count != 3 || operands[1].kind != X86_ASM_OPERAND_REG) {
-      asm_fail(state, line,
-               "`%s` takes an operand, a register and a count", mnemonic);
-      return 0;
-    }
-    opcode[0] = 0x0F;
-    if (operands[2].kind == X86_ASM_OPERAND_IMM) {
-      opcode[1] = (unsigned char)(is_left ? 0xA4 : 0xAC);
-      if (!asm_emit_instruction(state, line, opcode, 2, operands[1].reg, 1,
-                                operands[1].high_byte, &operands[0],
-                                operands[1].reg_bytes, 0, 0)) {
-        return 0;
-      }
-      return asm_emit_immediate(state, line, &operands[2], 1);
-    }
-    if (operands[2].kind != X86_ASM_OPERAND_REG || operands[2].reg != 1 ||
-        operands[2].reg_bytes != 1) {
-      asm_fail(state, line, "`%s` counts by an immediate or by cl", mnemonic);
-      return 0;
-    }
-    opcode[1] = (unsigned char)(is_left ? 0xA5 : 0xAD);
-    return asm_emit_instruction(state, line, opcode, 2, operands[1].reg, 1,
-                                operands[1].high_byte, &operands[0],
-                                operands[1].reg_bytes, 0, 0);
-  }
-
-  if (strcmp(mnemonic, "fxsave") == 0 || strcmp(mnemonic, "fxrstor") == 0 ||
-      strcmp(mnemonic, "xsave") == 0 || strcmp(mnemonic, "xrstor") == 0 ||
-      strcmp(mnemonic, "clflush") == 0) {
-    int digit = strcmp(mnemonic, "fxsave") == 0    ? 0
-                : strcmp(mnemonic, "fxrstor") == 0 ? 1
-                : strcmp(mnemonic, "xsave") == 0   ? 4
-                : strcmp(mnemonic, "xrstor") == 0  ? 5
-                                                   : 7;
-    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_MEM) {
-      asm_fail(state, line, "`%s` takes a memory operand", mnemonic);
-      return 0;
-    }
-    opcode[0] = 0x0F;
-    opcode[1] = 0xAE;
-    return asm_emit_instruction(state, line, opcode, 2, digit, 0, 0,
-                                &operands[0], 0, 0, 0);
-  }
-
-  if (strncmp(mnemonic, "prefetch", 8) == 0) {
-    const char *hint = mnemonic + 8;
-    int digit = strcmp(hint, "nta") == 0  ? 0
-                : strcmp(hint, "t0") == 0 ? 1
-                : strcmp(hint, "t1") == 0 ? 2
-                : strcmp(hint, "t2") == 0 ? 3
-                                          : -1;
-    if (digit < 0) {
-      asm_fail(state, line, "unknown instruction `%s`", mnemonic);
-      return 0;
-    }
-    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_MEM) {
-      asm_fail(state, line, "`%s` takes a memory operand", mnemonic);
-      return 0;
-    }
-    opcode[0] = 0x0F;
-    opcode[1] = 0x18;
-    return asm_emit_instruction(state, line, opcode, 2, digit, 0, 0,
-                                &operands[0], 0, 0, 0);
-  }
-
-  if (strcmp(mnemonic, "cmpxchg16b") == 0 ||
-      strcmp(mnemonic, "cmpxchg8b") == 0) {
-    int wide = strcmp(mnemonic, "cmpxchg16b") == 0;
-    if (count != 1 || operands[0].kind != X86_ASM_OPERAND_MEM) {
-      asm_fail(state, line, "`%s` takes a memory operand", mnemonic);
-      return 0;
-    }
-    if (wide && state->bits != 64) {
-      asm_fail(state, line, "`cmpxchg16b` needs 64-bit code");
-      return 0;
-    }
-    opcode[0] = 0x0F;
-    opcode[1] = 0xC7;
-    return asm_emit_instruction(state, line, opcode, 2, 1, 0, 0, &operands[0],
-                                0, 0, wide);
-  }
-
-  if (strcmp(mnemonic, "arpl") == 0) {
-    if (count != 2 || operands[1].kind != X86_ASM_OPERAND_REG ||
-        operands[1].reg_bytes != 2) {
-      asm_fail(state, line, "`arpl` takes an operand and a 16-bit register");
-      return 0;
-    }
-    if (state->bits == 64) {
-      asm_fail(state, line, "`arpl` is invalid in 64-bit code");
-      return 0;
-    }
-    opcode[0] = 0x63;
-    return asm_emit_instruction(state, line, opcode, 1, operands[1].reg, 1,
-                                operands[1].high_byte, &operands[0], 2, 0, 0);
-  }
-
-  if (strcmp(mnemonic, "lar") == 0 || strcmp(mnemonic, "lsl") == 0) {
-    if (count != 2 || operands[0].kind != X86_ASM_OPERAND_REG) {
-      asm_fail(state, line, "`%s` takes a register and an operand", mnemonic);
-      return 0;
-    }
-    opcode[0] = 0x0F;
-    opcode[1] = (unsigned char)(strcmp(mnemonic, "lar") == 0 ? 0x02 : 0x03);
-    return asm_emit_instruction(state, line, opcode, 2, operands[0].reg, 0, 0,
-                                &operands[1], operands[0].reg_bytes, 0, 0);
-  }
-
-  if (strcmp(mnemonic, "movbe") == 0) {
-    int to_register;
-    if (count != 2) {
-      asm_fail(state, line, "`movbe` takes two operands");
-      return 0;
-    }
-    to_register = operands[0].kind == X86_ASM_OPERAND_REG;
-    if (to_register == (operands[1].kind == X86_ASM_OPERAND_REG)) {
-      asm_fail(state, line, "`movbe` moves between a register and memory");
-      return 0;
-    }
-    opcode[0] = 0x0F;
-    opcode[1] = 0x38;
-    opcode[2] = (unsigned char)(to_register ? 0xF0 : 0xF1);
-    return asm_emit_instruction(
-        state, line, opcode, 3, to_register ? operands[0].reg : operands[1].reg,
-        0, 0, to_register ? &operands[1] : &operands[0],
-        to_register ? operands[0].reg_bytes : operands[1].reg_bytes, 0, 0);
-  }
+static int asm_encode_simple(AsmState *state, int line,
+                         const char *mnemonic,
+                         X86AsmOperand *operands, int count,
+                         int *handled) {
+  unsigned char opcode[4];
+  size_t i;
+  *handled = 1;
 
   if (strcmp(mnemonic, "nop") == 0 && count == 1) {
     opcode[0] = 0x0F;
@@ -2958,65 +3076,58 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
       return 1;
     }
   }
+  *handled = 0;
+  return 0;
+}
 
+static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
+                               X86AsmOperand *operands, int count) {
+  static int (*const GROUPS[])(AsmState *, int, const char *, X86AsmOperand *,
+                               int, int *) = {
+      asm_encode_arithmetic, asm_encode_move,   asm_encode_test_exchange,
+      asm_encode_stack,      asm_encode_width,  asm_encode_branch,
+      asm_encode_bit,        asm_encode_atomic, asm_encode_system,
+      asm_encode_string,     asm_encode_sse,    asm_encode_simple};
+  size_t i;
+
+  for (i = 0; i < sizeof(GROUPS) / sizeof(GROUPS[0]); i++) {
+    int handled = 0;
+    int encoded = GROUPS[i](state, line, mnemonic, operands, count, &handled);
+    if (handled) {
+      return encoded;
+    }
+  }
   asm_fail(state, line, "unknown instruction `%s`", mnemonic);
   return 0;
 }
 
-static int asm_statement(AsmState *state) {
+static int asm_statement(AsmState *state);
+
+static int asm_consume_labels(AsmState *state, int line) {
   AsmLexer *lexer = state->lexer;
-  X86AsmOperand operands[X86_ASM_MAX_OPERANDS];
-  int operand_count = 0;
-  int line = lexer->current.line;
-  char mnemonic[192];
-  size_t patch_mark;
-  int i;
-  int result;
-
-  state->lock_prefix = 0;
-  state->rep_prefix = 0;
-
-  while (lexer->current.type == AT_NEWLINE) {
-    asm_advance(lexer);
-  }
-  if (lexer->current.type == AT_END) {
-    return 1;
-  }
-
-  line = lexer->current.line;
-
   while (lexer->current.type == AT_IDENT) {
     const AsmToken *next = asm_peek(lexer);
-    if (next->type == AT_PUNCT && next->punct == ':') {
-      if (!asm_add_label(state, lexer->current.text, state->size)) {
-        asm_fail(state, line, "out of memory");
-        return 0;
-      }
-      asm_advance(lexer);
-      asm_advance(lexer);
-      while (lexer->current.type == AT_NEWLINE) {
-        asm_advance(lexer);
-      }
-      continue;
+    if (!(next->type == AT_PUNCT && next->punct == ':')) {
+      return 1;
     }
-    break;
-  }
-
-  if (lexer->current.type == AT_END) {
-    return 1;
-  }
-  if (lexer->current.type == AT_NEWLINE) {
+    if (!asm_add_label(state, lexer->current.text, state->size)) {
+      asm_fail(state, line, "out of memory");
+      return 0;
+    }
     asm_advance(lexer);
-    return 1;
+    asm_advance(lexer);
+    while (lexer->current.type == AT_NEWLINE) {
+      asm_advance(lexer);
+    }
   }
-  if (lexer->current.type != AT_IDENT) {
-    asm_fail(state, line, "expected an instruction, found `%s`",
-             lexer->current.text);
-    return 0;
-  }
+  return 1;
+}
 
+static void asm_read_repeat_prefixes(AsmState *state, char *mnemonic,
+                                     size_t size) {
+  AsmLexer *lexer = state->lexer;
   for (;;) {
-    snprintf(mnemonic, sizeof(mnemonic), "%s", lexer->current.text);
+    snprintf(mnemonic, size, "%s", lexer->current.text);
     asm_lowercase(mnemonic);
     if (strcmp(mnemonic, "lock") == 0) {
       state->lock_prefix = 1;
@@ -3025,7 +3136,7 @@ static int asm_statement(AsmState *state) {
     }
     if (strcmp(mnemonic, "rep") == 0 || strcmp(mnemonic, "repe") == 0 ||
         strcmp(mnemonic, "repz") == 0) {
-      state->rep_prefix = strcmp(mnemonic, "rep") == 0 ? 0xF3 : 0xF3;
+      state->rep_prefix = 0xF3;
       asm_advance(lexer);
       continue;
     }
@@ -3034,141 +3145,138 @@ static int asm_statement(AsmState *state) {
       asm_advance(lexer);
       continue;
     }
-    break;
+    return;
   }
+}
 
-  if (strcmp(mnemonic, "bits") == 0 || strcmp(mnemonic, "use16") == 0 ||
-      strcmp(mnemonic, "use32") == 0 || strcmp(mnemonic, "use64") == 0) {
-    int requested = 0;
-    if (!state->config->allow_bits_directive) {
-      asm_fail(state, line,
-               "`bits` is only allowed in a `@naked` function's asm block");
-      return 0;
-    }
-    if (strcmp(mnemonic, "bits") == 0) {
-      asm_advance(lexer);
-      if (lexer->current.type != AT_NUMBER) {
-        asm_fail(state, line, "`bits` takes 16, 32 or 64");
-        return 0;
-      }
-      requested = (int)lexer->current.number;
-      asm_advance(lexer);
-    } else {
-      requested = atoi(mnemonic + 3);
-      asm_advance(lexer);
-    }
-    if (requested != 16 && requested != 32 && requested != 64) {
+static int asm_directive_bits(AsmState *state, int line,
+                              const char *mnemonic) {
+  AsmLexer *lexer = state->lexer;
+  int requested = 0;
+  if (!state->config->allow_bits_directive) {
+    asm_fail(state, line,
+             "`bits` is only allowed in a `@naked` function's asm block");
+    return 0;
+  }
+  if (strcmp(mnemonic, "bits") == 0) {
+    asm_advance(lexer);
+    if (lexer->current.type != AT_NUMBER) {
       asm_fail(state, line, "`bits` takes 16, 32 or 64");
       return 0;
     }
-    state->bits = requested;
-    return 1;
-  }
-
-  if (strcmp(mnemonic, "db") == 0 || strcmp(mnemonic, "dw") == 0 ||
-      strcmp(mnemonic, "dd") == 0 || strcmp(mnemonic, "dq") == 0) {
-    int width = mnemonic[1] == 'b' ? 1 : (mnemonic[1] == 'w' ? 2
-                                          : (mnemonic[1] == 'd' ? 4 : 8));
+    requested = (int)lexer->current.number;
     asm_advance(lexer);
-    return asm_directive_data(state, line, width);
-  }
-
-  if (strcmp(mnemonic, "resb") == 0 || strcmp(mnemonic, "resw") == 0 ||
-      strcmp(mnemonic, "resd") == 0 || strcmp(mnemonic, "resq") == 0) {
-    int width = mnemonic[3] == 'b' ? 1 : (mnemonic[3] == 'w' ? 2
-                                          : (mnemonic[3] == 'd' ? 4 : 8));
-    X86AsmOperand operand;
-    long long total;
+  } else {
+    requested = atoi(mnemonic + 3);
     asm_advance(lexer);
-    if (!asm_parse_operand(state, &operand)) {
-      return 0;
-    }
-    if (operand.kind != X86_ASM_OPERAND_IMM || operand.symbol) {
-      asm_operand_release(&operand);
-      asm_fail(state, line, "a reservation takes a constant count");
-      return 0;
-    }
-    total = operand.imm * width;
+  }
+  if (requested != 16 && requested != 32 && requested != 64) {
+    asm_fail(state, line, "`bits` takes 16, 32 or 64");
+    return 0;
+  }
+  state->bits = requested;
+  return 1;
+}
+
+static int asm_directive_reserve(AsmState *state, int line, int width) {
+  X86AsmOperand operand;
+  long long total;
+  if (!asm_parse_operand(state, &operand)) {
+    return 0;
+  }
+  if (operand.kind != X86_ASM_OPERAND_IMM || operand.symbol) {
     asm_operand_release(&operand);
-    while (total-- > 0) {
-      if (!asm_byte(state, 0)) {
-        return 0;
-      }
-    }
-    return 1;
+    asm_fail(state, line, "a reservation takes a constant count");
+    return 0;
   }
-
-  if (strcmp(mnemonic, "align") == 0) {
-    X86AsmOperand operand;
-    long long boundary;
-    asm_advance(lexer);
-    if (!asm_parse_operand(state, &operand)) {
+  total = operand.imm * width;
+  asm_operand_release(&operand);
+  while (total-- > 0) {
+    if (!asm_byte(state, 0)) {
       return 0;
     }
-    boundary = operand.imm;
+  }
+  return 1;
+}
+
+static int asm_directive_align(AsmState *state, int line) {
+  X86AsmOperand operand;
+  long long boundary;
+  if (!asm_parse_operand(state, &operand)) {
+    return 0;
+  }
+  boundary = operand.imm;
+  asm_operand_release(&operand);
+  if (boundary <= 0 || (boundary & (boundary - 1)) != 0) {
+    asm_fail(state, line, "`align` takes a power of two");
+    return 0;
+  }
+  while ((long long)((state->config->origin + state->size) %
+                     (size_t)boundary)) {
+    if (!asm_byte(state, 0x90)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int asm_directive_times(AsmState *state, int line) {
+  AsmLexer *lexer = state->lexer;
+  X86AsmOperand operand;
+  long long repetitions;
+  size_t saved_position;
+  int saved_line;
+  AsmToken saved_current;
+  AsmToken saved_lookahead;
+  int saved_has_lookahead;
+  if (!asm_parse_operand(state, &operand)) {
+    return 0;
+  }
+  if (operand.kind != X86_ASM_OPERAND_IMM || operand.symbol) {
     asm_operand_release(&operand);
-    if (boundary <= 0 || (boundary & (boundary - 1)) != 0) {
-      asm_fail(state, line, "`align` takes a power of two");
-      return 0;
-    }
-    while ((long long)((state->config->origin + state->size) % (size_t)boundary)) {
-      if (!asm_byte(state, 0x90)) {
-        return 0;
-      }
+    asm_fail(state, line, "`times` takes a constant count");
+    return 0;
+  }
+  repetitions = operand.imm;
+  asm_operand_release(&operand);
+  if (repetitions < 0) {
+    asm_fail(state, line, "`times` count is negative");
+    return 0;
+  }
+  saved_position = lexer->position;
+  saved_line = lexer->line;
+  saved_current = lexer->current;
+  saved_lookahead = lexer->lookahead;
+  saved_has_lookahead = lexer->has_lookahead;
+  if (repetitions == 0) {
+    while (lexer->current.type != AT_NEWLINE &&
+           lexer->current.type != AT_END) {
+      asm_advance(lexer);
     }
     return 1;
   }
-
-  if (strcmp(mnemonic, "times") == 0) {
-    X86AsmOperand operand;
-    long long repetitions;
-    size_t saved_position;
-    int saved_line;
-    AsmToken saved_current;
-    AsmToken saved_lookahead;
-    int saved_has_lookahead;
-    asm_advance(lexer);
-    if (!asm_parse_operand(state, &operand)) {
+  while (repetitions-- > 0) {
+    lexer->position = saved_position;
+    lexer->line = saved_line;
+    lexer->current = saved_current;
+    lexer->lookahead = saved_lookahead;
+    lexer->has_lookahead = saved_has_lookahead;
+    if (!asm_statement(state)) {
       return 0;
     }
-    if (operand.kind != X86_ASM_OPERAND_IMM || operand.symbol) {
-      asm_operand_release(&operand);
-      asm_fail(state, line, "`times` takes a constant count");
-      return 0;
-    }
-    repetitions = operand.imm;
-    asm_operand_release(&operand);
-    if (repetitions < 0) {
-      asm_fail(state, line, "`times` count is negative");
-      return 0;
-    }
-    saved_position = lexer->position;
-    saved_line = lexer->line;
-    saved_current = lexer->current;
-    saved_lookahead = lexer->lookahead;
-    saved_has_lookahead = lexer->has_lookahead;
-    if (repetitions == 0) {
-      while (lexer->current.type != AT_NEWLINE &&
-             lexer->current.type != AT_END) {
-        asm_advance(lexer);
-      }
-      return 1;
-    }
-    while (repetitions-- > 0) {
-      lexer->position = saved_position;
-      lexer->line = saved_line;
-      lexer->current = saved_current;
-      lexer->lookahead = saved_lookahead;
-      lexer->has_lookahead = saved_has_lookahead;
-      if (!asm_statement(state)) {
-        return 0;
-      }
-    }
-    return 1;
   }
+  return 1;
+}
 
-  asm_advance(lexer);
-  patch_mark = state->patch_count;
+static int asm_statement_instruction(AsmState *state, int line,
+                                     const char *mnemonic) {
+  X86AsmOperand operands[X86_ASM_MAX_OPERANDS];
+  int operand_count = 0;
+  size_t patch_mark = state->patch_count;
+  size_t patch;
+  int result;
+  int i;
+
   memset(operands, 0, sizeof(operands));
   if (!asm_parse_operand_list(state, operands, &operand_count)) {
     for (i = 0; i < X86_ASM_MAX_OPERANDS; i++) {
@@ -3184,13 +3292,82 @@ static int asm_statement(AsmState *state) {
   if (!result) {
     return 0;
   }
-  {
-    size_t p;
-    for (p = patch_mark; p < state->patch_count; p++) {
-      state->patches[p].next_instruction_offset = state->size;
-    }
+  for (patch = patch_mark; patch < state->patch_count; patch++) {
+    state->patches[patch].next_instruction_offset = state->size;
   }
   return 1;
+}
+
+static int asm_statement_body(AsmState *state, int line,
+                              const char *mnemonic) {
+  AsmLexer *lexer = state->lexer;
+
+  if (strcmp(mnemonic, "bits") == 0 || strcmp(mnemonic, "use16") == 0 ||
+      strcmp(mnemonic, "use32") == 0 || strcmp(mnemonic, "use64") == 0) {
+    return asm_directive_bits(state, line, mnemonic);
+  }
+  if (strcmp(mnemonic, "db") == 0 || strcmp(mnemonic, "dw") == 0 ||
+      strcmp(mnemonic, "dd") == 0 || strcmp(mnemonic, "dq") == 0) {
+    int width = mnemonic[1] == 'b' ? 1 : (mnemonic[1] == 'w' ? 2
+                                          : (mnemonic[1] == 'd' ? 4 : 8));
+    asm_advance(lexer);
+    return asm_directive_data(state, line, width);
+  }
+  if (strcmp(mnemonic, "resb") == 0 || strcmp(mnemonic, "resw") == 0 ||
+      strcmp(mnemonic, "resd") == 0 || strcmp(mnemonic, "resq") == 0) {
+    int width = mnemonic[3] == 'b' ? 1 : (mnemonic[3] == 'w' ? 2
+                                          : (mnemonic[3] == 'd' ? 4 : 8));
+    asm_advance(lexer);
+    return asm_directive_reserve(state, line, width);
+  }
+  if (strcmp(mnemonic, "align") == 0) {
+    asm_advance(lexer);
+    return asm_directive_align(state, line);
+  }
+  if (strcmp(mnemonic, "times") == 0) {
+    asm_advance(lexer);
+    return asm_directive_times(state, line);
+  }
+
+  asm_advance(lexer);
+  return asm_statement_instruction(state, line, mnemonic);
+}
+
+static int asm_statement(AsmState *state) {
+  AsmLexer *lexer = state->lexer;
+  char mnemonic[192];
+  int line;
+
+  state->lock_prefix = 0;
+  state->rep_prefix = 0;
+
+  while (lexer->current.type == AT_NEWLINE) {
+    asm_advance(lexer);
+  }
+  if (lexer->current.type == AT_END) {
+    return 1;
+  }
+
+  line = lexer->current.line;
+  if (!asm_consume_labels(state, line)) {
+    return 0;
+  }
+
+  if (lexer->current.type == AT_END) {
+    return 1;
+  }
+  if (lexer->current.type == AT_NEWLINE) {
+    asm_advance(lexer);
+    return 1;
+  }
+  if (lexer->current.type != AT_IDENT) {
+    asm_fail(state, line, "expected an instruction, found `%s`",
+             lexer->current.text);
+    return 0;
+  }
+
+  asm_read_repeat_prefixes(state, mnemonic, sizeof(mnemonic));
+  return asm_statement_body(state, line, mnemonic);
 }
 
 static int asm_prescan_labels(AsmState *state, const char *text) {
