@@ -1827,11 +1827,10 @@ static Symbol *type_checker_retarget_constructor(TypeChecker *checker,
   return ctor;
 }
 
-Type *type_checker_infer_type_internal(TypeChecker *checker,
-                                              ASTNode *expression) {
-  if (!checker || !expression)
-    return NULL;
-
+static Type *type_checker_infer_literal(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
   switch (expression->type) {
   case AST_NUMBER_LITERAL: {
     NumberLiteral *literal = (NumberLiteral *)expression->data;
@@ -1861,6 +1860,18 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     return type_checker_check_aggregate_literal(checker, expression, target);
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
+
+static Type *type_checker_infer_identifier(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_IDENTIFIER: {
     Identifier *id = (Identifier *)expression->data;
     Symbol *symbol = type_checker_resolve_identifier(checker, id);
@@ -1934,82 +1945,18 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     return symbol->type;
   }
 
-  case AST_BINARY_EXPRESSION: {
-    BinaryExpression *binop = (BinaryExpression *)expression->data;
-    return type_checker_check_binary_expression(checker, binop,
-                                                expression->location);
+  default:
+    *handled = 0;
+    break;
   }
+  return NULL;
+}
 
-  case AST_CLOSURE_ADAPT_EXPRESSION: {
-    /* The closure-adapt pass wrapped a thin function value (`&func`, or a
-     * non-capturing lambda) that flowed into an `Fn(...)` boundary. The wrapper
-     * calls a generated adapter constructor at IR-lowering time; here it simply
-     * types as the closure signature it was synthesized for. */
-    ClosureAdapt *adapt = (ClosureAdapt *)expression->data;
-    if (!adapt || !adapt->ctor_name || !adapt->inner) {
-      type_checker_set_error_at_location(
-          checker, expression->location,
-          "Internal: closure adapter was not synthesized");
-      return NULL;
-    }
-    if (!type_checker_infer_type(checker, adapt->inner)) {
-      return NULL;
-    }
-    Type **ptypes = NULL;
-    if (adapt->param_count > 0) {
-      ptypes = malloc(adapt->param_count * sizeof(Type *));
-      if (!ptypes) {
-        return NULL;
-      }
-      for (size_t i = 0; i < adapt->param_count; i++) {
-        ptypes[i] =
-            type_checker_get_type_by_name(checker, adapt->param_types[i]);
-        if (!ptypes[i]) {
-          type_checker_set_error_at_location(
-              checker, expression->location,
-              "Unknown adapter parameter type '%s'", adapt->param_types[i]);
-          free(ptypes);
-          return NULL;
-        }
-      }
-    }
-    Type *adapt_return_type =
-        adapt->return_type
-            ? type_checker_get_type_by_name(checker, adapt->return_type)
-            : checker->builtin_void;
-    if (!adapt_return_type) {
-      adapt_return_type = checker->builtin_void;
-    }
-    Type *closure_type = type_create_function_pointer(
-        ptypes, adapt->param_count, adapt_return_type);
-    free(ptypes);
-    if (!closure_type) {
-      type_checker_set_error_at_location(checker, expression->location,
-                                         "Failed to create adapted closure type");
-      return NULL;
-    }
-    char adapt_sig[1024];
-    {
-      size_t off = 0;
-      int wrote = snprintf(adapt_sig, sizeof(adapt_sig), "Fn(");
-      if (wrote > 0)
-        off += (size_t)wrote;
-      for (size_t i = 0; i < adapt->param_count && off < sizeof(adapt_sig);
-           i++) {
-        wrote = snprintf(adapt_sig + off, sizeof(adapt_sig) - off, "%s%s",
-                         i ? "," : "", adapt->param_types[i]);
-        if (wrote > 0)
-          off += (size_t)wrote;
-      }
-      if (off < sizeof(adapt_sig))
-        snprintf(adapt_sig + off, sizeof(adapt_sig) - off, ")->%s",
-                 adapt->return_type ? adapt->return_type : "void");
-    }
-    closure_type->name = (char *)string_intern(adapt_sig);
-    closure_type->closure_env = type_checker_closure_env_sentinel();
-    return closure_type;
-  }
-
+static Type *type_checker_infer_lambda(TypeChecker *checker,
+                                       ASTNode *expression,
+                                       int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_LAMBDA_EXPRESSION: {
     /* Closure conversion lifted the lambda body and recorded the symbol its
      * value derives from. A non-capturing lambda is the address of its lifted
@@ -2109,7 +2056,107 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     fp_type->name = (char *)string_intern(sig);
     return fp_type;
   }
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
 
+static Type *type_checker_infer_closure(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
+  case AST_BINARY_EXPRESSION: {
+    BinaryExpression *binop = (BinaryExpression *)expression->data;
+    return type_checker_check_binary_expression(checker, binop,
+                                                expression->location);
+  }
+
+  case AST_CLOSURE_ADAPT_EXPRESSION: {
+    /* The closure-adapt pass wrapped a thin function value (`&func`, or a
+     * non-capturing lambda) that flowed into an `Fn(...)` boundary. The wrapper
+     * calls a generated adapter constructor at IR-lowering time; here it simply
+     * types as the closure signature it was synthesized for. */
+    ClosureAdapt *adapt = (ClosureAdapt *)expression->data;
+    if (!adapt || !adapt->ctor_name || !adapt->inner) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Internal: closure adapter was not synthesized");
+      return NULL;
+    }
+    if (!type_checker_infer_type(checker, adapt->inner)) {
+      return NULL;
+    }
+    Type **ptypes = NULL;
+    if (adapt->param_count > 0) {
+      ptypes = malloc(adapt->param_count * sizeof(Type *));
+      if (!ptypes) {
+        return NULL;
+      }
+      for (size_t i = 0; i < adapt->param_count; i++) {
+        ptypes[i] =
+            type_checker_get_type_by_name(checker, adapt->param_types[i]);
+        if (!ptypes[i]) {
+          type_checker_set_error_at_location(
+              checker, expression->location,
+              "Unknown adapter parameter type '%s'", adapt->param_types[i]);
+          free(ptypes);
+          return NULL;
+        }
+      }
+    }
+    Type *adapt_return_type =
+        adapt->return_type
+            ? type_checker_get_type_by_name(checker, adapt->return_type)
+            : checker->builtin_void;
+    if (!adapt_return_type) {
+      adapt_return_type = checker->builtin_void;
+    }
+    Type *closure_type = type_create_function_pointer(
+        ptypes, adapt->param_count, adapt_return_type);
+    free(ptypes);
+    if (!closure_type) {
+      type_checker_set_error_at_location(checker, expression->location,
+                                         "Failed to create adapted closure type");
+      return NULL;
+    }
+    char adapt_sig[1024];
+    {
+      size_t off = 0;
+      int wrote = snprintf(adapt_sig, sizeof(adapt_sig), "Fn(");
+      if (wrote > 0)
+        off += (size_t)wrote;
+      for (size_t i = 0; i < adapt->param_count && off < sizeof(adapt_sig);
+           i++) {
+        wrote = snprintf(adapt_sig + off, sizeof(adapt_sig) - off, "%s%s",
+                         i ? "," : "", adapt->param_types[i]);
+        if (wrote > 0)
+          off += (size_t)wrote;
+      }
+      if (off < sizeof(adapt_sig))
+        snprintf(adapt_sig + off, sizeof(adapt_sig) - off, ")->%s",
+                 adapt->return_type ? adapt->return_type : "void");
+    }
+    closure_type->name = (char *)string_intern(adapt_sig);
+    closure_type->closure_env = type_checker_closure_env_sentinel();
+    return closure_type;
+  }
+
+
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
+
+static Type *type_checker_infer_unary(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_UNARY_EXPRESSION: {
     UnaryExpression *unop = (UnaryExpression *)expression->data;
     if (!unop || !unop->operator || !unop->operand) {
@@ -2270,107 +2317,397 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     return NULL;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
+
+static Type *type_checker_infer_named_builtin(TypeChecker *checker,
+                                              ASTNode *expression,
+                                              CallExpression *call,
+                                              int *handled) {
+  *handled = 1;
+  if (strcmp(call->function_name, "sizeof") == 0) {
+    Type *sized_type =
+        type_checker_resolve_sizeof_argument(checker, call,
+                                             expression->location);
+    return sized_type ? checker->builtin_int64 : NULL;
+  }
+
+  if (strcmp(call->function_name, "offsetof") == 0) {
+    long long offset = 0;
+    if (!type_checker_eval_offsetof(checker, call, expression->location,
+                                    &offset)) {
+      return NULL;
+    }
+    return checker->builtin_int64;
+  }
+
+  if (strcmp(call->function_name, "typeof") == 0) {
+    Type *referred = type_checker_resolve_typeof_argument(
+        checker, call, expression->location);
+    if (!referred) {
+      return NULL;
+    }
+    return type_checker_type_value(checker, referred, expression);
+  }
+
+  if (strcmp(call->function_name, "layoutof") == 0) {
+    long long digest = 0;
+    if (!type_checker_eval_layoutof(checker, call, expression->location,
+                                    &digest)) {
+      return NULL;
+    }
+    return checker->builtin_int64;
+  }
+
+  if (strcmp(call->function_name, "fieldof") == 0) {
+    ComptimeValue field = comptime_none();
+    if (!type_checker_eval_fieldof(checker, call, expression->location,
+                                   &field)) {
+      return NULL;
+    }
+    Type *owner = type_checker_type_from_index(
+        checker, field.as.field_ref.type_index);
+    return type_checker_field_value(checker, owner,
+                                    field.as.field_ref.field_index,
+                                    expression);
+  }
+
+  if (strcmp(call->function_name, "static_assert") == 0) {
+    return type_checker_validate_static_assert(checker, call,
+                                               expression->location)
+               ? checker->builtin_void
+               : NULL;
+  }
+
+  /* String interpolation conversion, synthesized by the parser for each
+   * "{expr}" part. It types as string for every value the runtime can
+   * render; IR lowering picks the mettle_string_from_* helper. */
+  if (strcmp(call->function_name, "__mtl_interp") == 0) {
+    if (call->argument_count != 1 || !call->arguments ||
+        !call->arguments[0]) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "String interpolation takes exactly one value");
+      return NULL;
+    }
+    Type *value_type =
+        type_checker_infer_type(checker, call->arguments[0]);
+    if (!value_type) {
+      return NULL;
+    }
+    switch (value_type->kind) {
+    case TYPE_INT8:
+    case TYPE_INT16:
+    case TYPE_INT32:
+    case TYPE_INT64:
+    case TYPE_UINT8:
+    case TYPE_UINT16:
+    case TYPE_UINT32:
+    case TYPE_UINT64:
+    case TYPE_BOOL:
+    case TYPE_CHAR:
+    case TYPE_FLOAT32:
+    case TYPE_FLOAT64:
+    case TYPE_STRING:
+      return checker->builtin_string;
+    default:
+      type_checker_set_error_at_location(
+          checker, call->arguments[0]->location,
+          "Cannot interpolate a value of type '%s' into a string; "
+          "interpolation takes integers, characters, booleans, floats, "
+          "and strings",
+          value_type->name ? value_type->name : "?");
+      return NULL;
+    }
+  }
+
+  *handled = 0;
+  return NULL;
+}
+
+static Type *type_checker_infer_fn_pointer_call(TypeChecker *checker,
+                                                ASTNode *expression,
+                                                CallExpression *call,
+                                                Symbol *func_symbol,
+                                                int *handled) {
+  *handled = 1;
+/* Variable with function pointer type can be called like a function */
+if ((func_symbol->kind == SYMBOL_VARIABLE ||
+     func_symbol->kind == SYMBOL_PARAMETER) &&
+    func_symbol->type &&
+    func_symbol->type->kind == TYPE_FUNCTION_POINTER) {
+  call->is_indirect_call = 1;
+  Type *fp_type = func_symbol->type;
+  call->callee_closure_env = fp_type->closure_env;
+  if (call->argument_count != fp_type->fn_param_count) {
+    char error_msg[512];
+    snprintf(error_msg, sizeof(error_msg),
+             "Function pointer expects %llu arguments, got %llu",
+             (unsigned long long)fp_type->fn_param_count,
+             (unsigned long long)call->argument_count);
+    type_checker_set_error_at_location(checker, expression->location,
+                                       error_msg);
+    return NULL;
+  }
+  for (size_t i = 0; i < call->argument_count; i++) {
+    Type *arg_type = type_checker_infer_type(checker, call->arguments[i]);
+    if (!arg_type)
+      return NULL;
+    if (type_checker_reject_comptime_escape(
+            checker, call->arguments[i]->location, arg_type)) {
+      return NULL;
+    }
+    Type *param_type = fp_type->fn_param_types[i];
+    int is_null =
+        (param_type && param_type->kind == TYPE_POINTER &&
+         type_checker_is_null_pointer_constant(call->arguments[i]));
+    if (!is_null &&
+        !type_checker_is_assignable_from(checker, param_type, arg_type,
+                                         call->arguments[i])) {
+      type_checker_report_assign_mismatch(checker, call->arguments[i],
+                                          call->arguments[i]->location,
+                                          param_type, arg_type);
+      return NULL;
+    }
+  }
+  return fp_type->fn_return_type;
+}
+  *handled = 0;
+  return NULL;
+}
+
+static int type_checker_check_call_arguments(TypeChecker *checker,
+                                             ASTNode *expression,
+                                             CallExpression *call,
+                                             Symbol *func_symbol) {
+// Check argument count
+if (call->argument_count != func_symbol->data.function.parameter_count) {
+  char error_msg[512];
+  snprintf(error_msg, sizeof(error_msg),
+           "Function '%s' expects %llu arguments, got %llu",
+           call->function_name,
+           (unsigned long long)func_symbol->data.function.parameter_count,
+           (unsigned long long)call->argument_count);
+  checker->has_error = 1;
+  free(checker->error_message);
+  checker->error_message = strdup(error_msg);
+  if (checker->error_reporter) {
+    SourceSpan span = source_span_from_location(
+        expression->location, strlen(call->function_name));
+    /* The call node's location points at '('; walk back onto the name. */
+    if (span.column > strlen(call->function_name))
+      span.column -= strlen(call->function_name);
+    span = error_reporter_span_snap_to_token(checker->error_reporter, span,
+                                             call->function_name);
+    error_reporter_add_error_with_span(checker->error_reporter,
+                                       ERROR_SEMANTIC, span, error_msg);
+    char label[128];
+    snprintf(label, sizeof(label), "expected %llu argument%s, got %llu",
+             (unsigned long long)func_symbol->data.function.parameter_count,
+             func_symbol->data.function.parameter_count == 1 ? "" : "s",
+             (unsigned long long)call->argument_count);
+    error_reporter_set_last_label(checker->error_reporter, label);
+    type_checker_note_declared_here(checker, func_symbol, "function");
+  }
+  return 0;
+}
+
+// Check each argument type
+for (size_t i = 0; i < call->argument_count; i++) {
+  Type *arg_type = type_checker_infer_type(checker, call->arguments[i]);
+  if (!arg_type) {
+    // Error already set by type inference
+    return 0;
+  }
+  if (type_checker_reject_comptime_escape(
+          checker, call->arguments[i]->location, arg_type)) {
+    return 0;
+  }
+
+  Type *param_type = func_symbol->data.function.parameter_types[i];
+  int is_null_pointer_arg =
+      (param_type && param_type->kind == TYPE_POINTER &&
+       type_checker_is_null_pointer_constant(call->arguments[i]));
+  if (!is_null_pointer_arg &&
+       !type_checker_is_assignable_from(checker, param_type, arg_type,
+                                        call->arguments[i])) {
+    type_checker_report_assign_mismatch(checker, call->arguments[i],
+                                        call->arguments[i]->location,
+                                        param_type, arg_type);
+    if (func_symbol->data.function.parameter_names &&
+        func_symbol->data.function.parameter_names[i] &&
+        checker->error_reporter) {
+      char label[192];
+      snprintf(label, sizeof(label),
+               "parameter '%s' expects '%s', this argument is '%s'",
+               func_symbol->data.function.parameter_names[i],
+               param_type->name, arg_type->name);
+      error_reporter_set_last_label(checker->error_reporter, label);
+    }
+    type_checker_note_declared_here(checker, func_symbol, "function");
+    return 0;
+  }
+
+}
+
+type_checker_warn_recv_buffer_bounds(checker, call);
+type_checker_warn_memcpy_buffer_bounds(checker, call);
+  return 1;
+}
+
+static Type *type_checker_infer_user_call(TypeChecker *checker,
+                                          ASTNode *expression,
+                                          CallExpression *call,
+                                          Type *call_target) {
+  // Method calls on threading types:
+  // Thread.join(), Mutex.new(), mutex.lock(), guard (unlock via drop),
+  // Atomic.new(), atomic.load/store/fetch_add/fetch_sub/cas(),
+  // channel(), tx.send(), rx.recv()
+  if (call && call->object) {
+    if (!type_checker_desugar_struct_method_call(checker, expression, call)) {
+      return NULL;
+    }
+    /* The desugar may have rewritten a closure/fn-pointer field call
+     * (`obj.field(args)`) into a function-pointer call; re-dispatch on the new
+     * node kind, since the CallExpression `call` is no longer valid. */
+    if (expression->type != AST_FUNCTION_CALL) {
+      return type_checker_infer_type_internal(checker, expression);
+    }
+  }
+
+  Symbol *func_symbol =
+      symbol_table_lookup(checker->symbol_table, call->function_name);
+  if (!func_symbol) {
+    type_checker_report_undefined_symbol(
+        checker, expression->location,
+        call->written_name ? call->written_name : call->function_name,
+        "function");
+    return NULL;
+  }
+
+  {
+    int pointer_handled = 0;
+    Type *through_pointer = type_checker_infer_fn_pointer_call(
+        checker, expression, call, func_symbol, &pointer_handled);
+    if (pointer_handled) {
+      return through_pointer;
+    }
+  }
+
+  if (func_symbol->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR) {
+    func_symbol = type_checker_retarget_constructor(
+        checker, func_symbol, call_target, call->function_name,
+        &call->function_name);
+    Type *enum_type = func_symbol->data.constructor.enum_type;
+    Type *payload_type = func_symbol->data.constructor.payload_type;
+    size_t expected_args = payload_type ? 1 : 0;
+
+    if (call->argument_count != expected_args) {
+      char error_msg[512];
+      snprintf(error_msg, sizeof(error_msg),
+               "Constructor '%s' expects %llu arguments, got %llu",
+               call->function_name, (unsigned long long)expected_args,
+               (unsigned long long)call->argument_count);
+      type_checker_set_error_at_location(checker, expression->location,
+                                         error_msg);
+      return NULL;
+    }
+
+    if (payload_type && call->argument_count == 1) {
+      Type *saved_target = checker->aggregate_target_type;
+      checker->aggregate_target_type = payload_type;
+      Type *arg_type = type_checker_infer_type(checker, call->arguments[0]);
+      checker->aggregate_target_type = saved_target;
+      if (!arg_type) {
+        return NULL;
+      }
+      if (!type_checker_is_assignable_from(checker, payload_type, arg_type,
+                                           call->arguments[0])) {
+        type_checker_report_assign_mismatch(checker, call->arguments[0],
+                                            call->arguments[0]->location,
+                                            payload_type, arg_type);
+        return NULL;
+      }
+    }
+
+    return enum_type;
+  }
+
+  if (func_symbol->kind != SYMBOL_FUNCTION) {
+    const char *symbol_type =
+        (func_symbol->kind == SYMBOL_VARIABLE ||
+         func_symbol->kind == SYMBOL_PARAMETER) ? "variable"
+        : (func_symbol->kind == SYMBOL_STRUCT) ? "struct"
+                                               : "symbol";
+    char error_msg[512];
+    snprintf(error_msg, sizeof(error_msg), "'%s' is a %s, not a function",
+             call->function_name, symbol_type);
+    type_checker_set_error_at_location(checker, expression->location,
+                                       error_msg);
+    return NULL;
+  }
+
+  // assert/assert_eq are `mettle test` builtins: they exist only in the
+  // compile-time interpreter, so reject them outside @test functions
+  // (where they would survive into codegen and fail at link).
+  if (func_symbol->is_builtin &&
+      (strcmp(call->function_name, "assert") == 0 ||
+       strcmp(call->function_name, "assert_eq") == 0)) {
+    FunctionDeclaration *current_fn =
+        checker->current_function_decl && checker->current_function_decl->data
+            ? (FunctionDeclaration *)checker->current_function_decl->data
+            : NULL;
+    if (!current_fn || !current_fn->is_test) {
+      char error_msg[256];
+      snprintf(error_msg, sizeof(error_msg),
+               "'%s' is a compile-time test builtin and can only be called "
+               "inside a @test function",
+               call->function_name);
+      checker->has_error = 1;
+      free(checker->error_message);
+      checker->error_message = strdup(error_msg);
+      if (checker->error_reporter) {
+        SourceSpan span = source_span_from_location(
+            expression->location, strlen(call->function_name));
+        span = error_reporter_span_snap_to_token(checker->error_reporter,
+                                                 span, call->function_name);
+        error_reporter_add_error_with_span_and_suggestion(
+            checker->error_reporter, ERROR_SEMANTIC, span, error_msg,
+            "mark the enclosing function @test and run it with `mettle "
+            "test`, or use an if + return instead");
+      }
+      return NULL;
+    }
+  }
+
+  if (!type_checker_check_call_arguments(checker, expression, call,
+                                        func_symbol)) {
+    return NULL;
+  }
+
+  return func_symbol->data.function.return_type;
+}
+
+static Type *type_checker_infer_call(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_FUNCTION_CALL: {
     Type *call_target = checker->aggregate_target_type;
     checker->aggregate_target_type = NULL;
     CallExpression *call = (CallExpression *)expression->data;
     if (call && call->function_name) {
-      if (strcmp(call->function_name, "sizeof") == 0) {
-        Type *sized_type =
-            type_checker_resolve_sizeof_argument(checker, call,
-                                                 expression->location);
-        return sized_type ? checker->builtin_int64 : NULL;
+      int builtin_handled = 0;
+      Type *builtin = type_checker_infer_named_builtin(
+          checker, expression, call, &builtin_handled);
+      if (builtin_handled) {
+        return builtin;
       }
-
-      if (strcmp(call->function_name, "offsetof") == 0) {
-        long long offset = 0;
-        if (!type_checker_eval_offsetof(checker, call, expression->location,
-                                        &offset)) {
-          return NULL;
-        }
-        return checker->builtin_int64;
-      }
-
-      if (strcmp(call->function_name, "typeof") == 0) {
-        Type *referred = type_checker_resolve_typeof_argument(
-            checker, call, expression->location);
-        if (!referred) {
-          return NULL;
-        }
-        return type_checker_type_value(checker, referred, expression);
-      }
-
-      if (strcmp(call->function_name, "layoutof") == 0) {
-        long long digest = 0;
-        if (!type_checker_eval_layoutof(checker, call, expression->location,
-                                        &digest)) {
-          return NULL;
-        }
-        return checker->builtin_int64;
-      }
-
-      if (strcmp(call->function_name, "fieldof") == 0) {
-        ComptimeValue field = comptime_none();
-        if (!type_checker_eval_fieldof(checker, call, expression->location,
-                                       &field)) {
-          return NULL;
-        }
-        Type *owner = type_checker_type_from_index(
-            checker, field.as.field_ref.type_index);
-        return type_checker_field_value(checker, owner,
-                                        field.as.field_ref.field_index,
-                                        expression);
-      }
-
-      if (strcmp(call->function_name, "static_assert") == 0) {
-        return type_checker_validate_static_assert(checker, call,
-                                                   expression->location)
-                   ? checker->builtin_void
-                   : NULL;
-      }
-
-      /* String interpolation conversion, synthesized by the parser for each
-       * "{expr}" part. It types as string for every value the runtime can
-       * render; IR lowering picks the mettle_string_from_* helper. */
-      if (strcmp(call->function_name, "__mtl_interp") == 0) {
-        if (call->argument_count != 1 || !call->arguments ||
-            !call->arguments[0]) {
-          type_checker_set_error_at_location(
-              checker, expression->location,
-              "String interpolation takes exactly one value");
-          return NULL;
-        }
-        Type *value_type =
-            type_checker_infer_type(checker, call->arguments[0]);
-        if (!value_type) {
-          return NULL;
-        }
-        switch (value_type->kind) {
-        case TYPE_INT8:
-        case TYPE_INT16:
-        case TYPE_INT32:
-        case TYPE_INT64:
-        case TYPE_UINT8:
-        case TYPE_UINT16:
-        case TYPE_UINT32:
-        case TYPE_UINT64:
-        case TYPE_BOOL:
-        case TYPE_CHAR:
-        case TYPE_FLOAT32:
-        case TYPE_FLOAT64:
-        case TYPE_STRING:
-          return checker->builtin_string;
-        default:
-          type_checker_set_error_at_location(
-              checker, call->arguments[0]->location,
-              "Cannot interpolate a value of type '%s' into a string; "
-              "interpolation takes integers, characters, booleans, floats, "
-              "and strings",
-              value_type->name ? value_type->name : "?");
-          return NULL;
-        }
-      }
-
     }
 
     {
@@ -2456,236 +2793,22 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
       }
     }
 
-    // Method calls on threading types:
-    // Thread.join(), Mutex.new(), mutex.lock(), guard (unlock via drop),
-    // Atomic.new(), atomic.load/store/fetch_add/fetch_sub/cas(),
-    // channel(), tx.send(), rx.recv()
-    if (call && call->object) {
-      if (!type_checker_desugar_struct_method_call(checker, expression, call)) {
-        return NULL;
-      }
-      /* The desugar may have rewritten a closure/fn-pointer field call
-       * (`obj.field(args)`) into a function-pointer call; re-dispatch on the new
-       * node kind, since the CallExpression `call` is no longer valid. */
-      if (expression->type != AST_FUNCTION_CALL) {
-        return type_checker_infer_type_internal(checker, expression);
-      }
-    }
-
-    Symbol *func_symbol =
-        symbol_table_lookup(checker->symbol_table, call->function_name);
-    if (!func_symbol) {
-      type_checker_report_undefined_symbol(
-          checker, expression->location,
-          call->written_name ? call->written_name : call->function_name,
-          "function");
-      return NULL;
-    }
-
-    /* Variable with function pointer type can be called like a function */
-    if ((func_symbol->kind == SYMBOL_VARIABLE ||
-         func_symbol->kind == SYMBOL_PARAMETER) &&
-        func_symbol->type &&
-        func_symbol->type->kind == TYPE_FUNCTION_POINTER) {
-      call->is_indirect_call = 1;
-      Type *fp_type = func_symbol->type;
-      call->callee_closure_env = fp_type->closure_env;
-      if (call->argument_count != fp_type->fn_param_count) {
-        char error_msg[512];
-        snprintf(error_msg, sizeof(error_msg),
-                 "Function pointer expects %llu arguments, got %llu",
-                 (unsigned long long)fp_type->fn_param_count,
-                 (unsigned long long)call->argument_count);
-        type_checker_set_error_at_location(checker, expression->location,
-                                           error_msg);
-        return NULL;
-      }
-      for (size_t i = 0; i < call->argument_count; i++) {
-        Type *arg_type = type_checker_infer_type(checker, call->arguments[i]);
-        if (!arg_type)
-          return NULL;
-        if (type_checker_reject_comptime_escape(
-                checker, call->arguments[i]->location, arg_type)) {
-          return NULL;
-        }
-        Type *param_type = fp_type->fn_param_types[i];
-        int is_null =
-            (param_type && param_type->kind == TYPE_POINTER &&
-             type_checker_is_null_pointer_constant(call->arguments[i]));
-        if (!is_null &&
-            !type_checker_is_assignable_from(checker, param_type, arg_type,
-                                             call->arguments[i])) {
-          type_checker_report_assign_mismatch(checker, call->arguments[i],
-                                              call->arguments[i]->location,
-                                              param_type, arg_type);
-          return NULL;
-        }
-      }
-      return fp_type->fn_return_type;
-    }
-
-    if (func_symbol->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR) {
-      func_symbol = type_checker_retarget_constructor(
-          checker, func_symbol, call_target, call->function_name,
-          &call->function_name);
-      Type *enum_type = func_symbol->data.constructor.enum_type;
-      Type *payload_type = func_symbol->data.constructor.payload_type;
-      size_t expected_args = payload_type ? 1 : 0;
-
-      if (call->argument_count != expected_args) {
-        char error_msg[512];
-        snprintf(error_msg, sizeof(error_msg),
-                 "Constructor '%s' expects %llu arguments, got %llu",
-                 call->function_name, (unsigned long long)expected_args,
-                 (unsigned long long)call->argument_count);
-        type_checker_set_error_at_location(checker, expression->location,
-                                           error_msg);
-        return NULL;
-      }
-
-      if (payload_type && call->argument_count == 1) {
-        Type *saved_target = checker->aggregate_target_type;
-        checker->aggregate_target_type = payload_type;
-        Type *arg_type = type_checker_infer_type(checker, call->arguments[0]);
-        checker->aggregate_target_type = saved_target;
-        if (!arg_type) {
-          return NULL;
-        }
-        if (!type_checker_is_assignable_from(checker, payload_type, arg_type,
-                                             call->arguments[0])) {
-          type_checker_report_assign_mismatch(checker, call->arguments[0],
-                                              call->arguments[0]->location,
-                                              payload_type, arg_type);
-          return NULL;
-        }
-      }
-
-      return enum_type;
-    }
-
-    if (func_symbol->kind != SYMBOL_FUNCTION) {
-      const char *symbol_type =
-          (func_symbol->kind == SYMBOL_VARIABLE ||
-           func_symbol->kind == SYMBOL_PARAMETER) ? "variable"
-          : (func_symbol->kind == SYMBOL_STRUCT) ? "struct"
-                                                 : "symbol";
-      char error_msg[512];
-      snprintf(error_msg, sizeof(error_msg), "'%s' is a %s, not a function",
-               call->function_name, symbol_type);
-      type_checker_set_error_at_location(checker, expression->location,
-                                         error_msg);
-      return NULL;
-    }
-
-    // assert/assert_eq are `mettle test` builtins: they exist only in the
-    // compile-time interpreter, so reject them outside @test functions
-    // (where they would survive into codegen and fail at link).
-    if (func_symbol->is_builtin &&
-        (strcmp(call->function_name, "assert") == 0 ||
-         strcmp(call->function_name, "assert_eq") == 0)) {
-      FunctionDeclaration *current_fn =
-          checker->current_function_decl && checker->current_function_decl->data
-              ? (FunctionDeclaration *)checker->current_function_decl->data
-              : NULL;
-      if (!current_fn || !current_fn->is_test) {
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg),
-                 "'%s' is a compile-time test builtin and can only be called "
-                 "inside a @test function",
-                 call->function_name);
-        checker->has_error = 1;
-        free(checker->error_message);
-        checker->error_message = strdup(error_msg);
-        if (checker->error_reporter) {
-          SourceSpan span = source_span_from_location(
-              expression->location, strlen(call->function_name));
-          span = error_reporter_span_snap_to_token(checker->error_reporter,
-                                                   span, call->function_name);
-          error_reporter_add_error_with_span_and_suggestion(
-              checker->error_reporter, ERROR_SEMANTIC, span, error_msg,
-              "mark the enclosing function @test and run it with `mettle "
-              "test`, or use an if + return instead");
-        }
-        return NULL;
-      }
-    }
-
-    // Check argument count
-    if (call->argument_count != func_symbol->data.function.parameter_count) {
-      char error_msg[512];
-      snprintf(error_msg, sizeof(error_msg),
-               "Function '%s' expects %llu arguments, got %llu",
-               call->function_name,
-               (unsigned long long)func_symbol->data.function.parameter_count,
-               (unsigned long long)call->argument_count);
-      checker->has_error = 1;
-      free(checker->error_message);
-      checker->error_message = strdup(error_msg);
-      if (checker->error_reporter) {
-        SourceSpan span = source_span_from_location(
-            expression->location, strlen(call->function_name));
-        /* The call node's location points at '('; walk back onto the name. */
-        if (span.column > strlen(call->function_name))
-          span.column -= strlen(call->function_name);
-        span = error_reporter_span_snap_to_token(checker->error_reporter, span,
-                                                 call->function_name);
-        error_reporter_add_error_with_span(checker->error_reporter,
-                                           ERROR_SEMANTIC, span, error_msg);
-        char label[128];
-        snprintf(label, sizeof(label), "expected %llu argument%s, got %llu",
-                 (unsigned long long)func_symbol->data.function.parameter_count,
-                 func_symbol->data.function.parameter_count == 1 ? "" : "s",
-                 (unsigned long long)call->argument_count);
-        error_reporter_set_last_label(checker->error_reporter, label);
-        type_checker_note_declared_here(checker, func_symbol, "function");
-      }
-      return NULL;
-    }
-
-    // Check each argument type
-    for (size_t i = 0; i < call->argument_count; i++) {
-      Type *arg_type = type_checker_infer_type(checker, call->arguments[i]);
-      if (!arg_type) {
-        // Error already set by type inference
-        return NULL;
-      }
-      if (type_checker_reject_comptime_escape(
-              checker, call->arguments[i]->location, arg_type)) {
-        return NULL;
-      }
-
-      Type *param_type = func_symbol->data.function.parameter_types[i];
-      int is_null_pointer_arg =
-          (param_type && param_type->kind == TYPE_POINTER &&
-           type_checker_is_null_pointer_constant(call->arguments[i]));
-      if (!is_null_pointer_arg &&
-           !type_checker_is_assignable_from(checker, param_type, arg_type,
-                                            call->arguments[i])) {
-        type_checker_report_assign_mismatch(checker, call->arguments[i],
-                                            call->arguments[i]->location,
-                                            param_type, arg_type);
-        if (func_symbol->data.function.parameter_names &&
-            func_symbol->data.function.parameter_names[i] &&
-            checker->error_reporter) {
-          char label[192];
-          snprintf(label, sizeof(label),
-                   "parameter '%s' expects '%s', this argument is '%s'",
-                   func_symbol->data.function.parameter_names[i],
-                   param_type->name, arg_type->name);
-          error_reporter_set_last_label(checker->error_reporter, label);
-        }
-        type_checker_note_declared_here(checker, func_symbol, "function");
-        return NULL;
-      }
-
-    }
-
-    type_checker_warn_recv_buffer_bounds(checker, call);
-    type_checker_warn_memcpy_buffer_bounds(checker, call);
-
-    return func_symbol->data.function.return_type;
+    return type_checker_infer_user_call(checker, expression, call,
+                                       call_target);
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
+
+static Type *type_checker_infer_indirect_call(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_FUNC_PTR_CALL: {
     FuncPtrCall *fp_call = (FuncPtrCall *)expression->data;
     if (!fp_call || !fp_call->function) {
@@ -2766,64 +2889,150 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     return func_type->fn_return_type;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
+
+static Type *type_checker_infer_enum_member(TypeChecker *checker,
+                                            ASTNode *expression,
+                                            MemberAccess *member,
+                                            int *handled) {
+  *handled = 1;
+  /* Qualified enum access: `EnumName.Variant`.
+   *  - Plain enum:  yields the variant's integer value, typed as the enum.
+   *  - Tagged enum, nullary variant: yields a tagged-enum value.
+   *  - Tagged enum, payloadful variant: only valid as the callee of a
+   *    CallExpression (handled by the call type-checker, which sees the
+   *    member-access and looks up the constructor symbol). Here we still
+   *    return the enum type so downstream code keeps making progress; the
+   *    constructor arity is enforced at call-check time.
+   * The object must be an identifier naming an ENUM symbol. */
+  if (member->object && member->object->type == AST_IDENTIFIER) {
+    Identifier *obj_id = (Identifier *)member->object->data;
+    if (obj_id && obj_id->name) {
+      Symbol *enum_sym = type_checker_resolve_identifier(checker, obj_id);
+      if (enum_sym && enum_sym->kind == SYMBOL_ENUM && enum_sym->type) {
+        Type *enum_ty = enum_sym->type;
+        if (enum_ty->kind == TYPE_ENUM) {
+          /* The type table records every plain enum's members, so resolve
+           * against that first. A user enum also publishes its variants as
+           * bare globals and is found either way; `Kind` deliberately
+           * publishes none, and is only reachable through here. */
+          for (size_t i = 0; i < enum_ty->enum_member_count; i++) {
+            if (enum_ty->enum_member_names[i] &&
+                strcmp(enum_ty->enum_member_names[i], member->member) == 0) {
+              return enum_ty;
+            }
+          }
+          /* Fall back to the bare global for enums declared before the
+           * member table was populated. */
+          Symbol *variant_sym =
+              symbol_table_lookup(checker->symbol_table, member->member);
+          if (variant_sym && variant_sym->kind == SYMBOL_CONSTANT &&
+              variant_sym->type == enum_ty) {
+            return enum_ty;
+          }
+          type_checker_set_error_at_location(
+              checker, expression->location,
+              "Enum '%s' has no variant '%s'", obj_id->name, member->member);
+          return NULL;
+        }
+        if (enum_ty->kind == TYPE_TAGGED_ENUM) {
+          for (size_t i = 0; i < enum_ty->tagged_variant_count; i++) {
+            if (enum_ty->tagged_variant_names &&
+                enum_ty->tagged_variant_names[i] &&
+                strcmp(enum_ty->tagged_variant_names[i], member->member) ==
+                    0) {
+              return enum_ty;
+            }
+          }
+          type_checker_set_error_at_location(
+              checker, expression->location,
+              "Tagged enum '%s' has no variant '%s'", obj_id->name,
+              member->member);
+          return NULL;
+        }
+      }
+    }
+  }
+  *handled = 0;
+  return NULL;
+}
+
+static Type *type_checker_infer_type_query(TypeChecker *checker,
+                                           ASTNode *expression,
+                                           MemberAccess *member,
+                                           Type *object_type,
+                                           int *handled) {
+  *handled = 1;
+  if (object_type && object_type->kind == TYPE_TYPE) {
+    ComptimeValue owner = comptime_none();
+    if (!type_checker_eval_comptime(checker, member->object, &owner) ||
+        owner.kind != COMPTIME_TYPE_REF) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "field access on 'Type' requires a compile-time type value");
+      return NULL;
+    }
+    Type *referred =
+        type_checker_type_from_index(checker, owner.as.type_ref.type_index);
+    if (!referred) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "field access on 'Type' refers to an unknown type");
+      return NULL;
+    }
+    /* A declared field wins over a query of the same name: reflection must
+     * never shadow what the program itself wrote. */
+    int field_index = type_get_field_index(referred, member->member);
+    if (field_index >= 0) {
+      return type_checker_field_value(checker, referred,
+                                      (uint32_t)field_index, expression);
+    }
+    if (!type_checker_type_member_exists(member->member)) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "type '%s' has no field or query '%s'; a Type answers 'kind', "
+          "'name', 'size', 'align', 'fields', 'pointee', 'element', "
+          "and 'len'",
+          referred->name ? referred->name : "<anonymous>", member->member);
+      return NULL;
+    }
+    ComptimeValue queried = comptime_none();
+    if (!type_checker_eval_type_member(checker, owner, member->member,
+                                       &queried)) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "type '%s' cannot answer '.%s'",
+          referred->name ? referred->name : "<anonymous>", member->member);
+      return NULL;
+    }
+    if (strcmp(member->member, "kind") == 0) {
+      return type_checker_kind_result(checker, queried, expression);
+    }
+    return type_checker_comptime_result(checker, queried, expression);
+  }
+  *handled = 0;
+  return NULL;
+}
+
+static Type *type_checker_infer_member(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_MEMBER_ACCESS: {
     MemberAccess *member = (MemberAccess *)expression->data;
 
-    /* Qualified enum access: `EnumName.Variant`.
-     *  - Plain enum:  yields the variant's integer value, typed as the enum.
-     *  - Tagged enum, nullary variant: yields a tagged-enum value.
-     *  - Tagged enum, payloadful variant: only valid as the callee of a
-     *    CallExpression (handled by the call type-checker, which sees the
-     *    member-access and looks up the constructor symbol). Here we still
-     *    return the enum type so downstream code keeps making progress; the
-     *    constructor arity is enforced at call-check time.
-     * The object must be an identifier naming an ENUM symbol. */
-    if (member->object && member->object->type == AST_IDENTIFIER) {
-      Identifier *obj_id = (Identifier *)member->object->data;
-      if (obj_id && obj_id->name) {
-        Symbol *enum_sym = type_checker_resolve_identifier(checker, obj_id);
-        if (enum_sym && enum_sym->kind == SYMBOL_ENUM && enum_sym->type) {
-          Type *enum_ty = enum_sym->type;
-          if (enum_ty->kind == TYPE_ENUM) {
-            /* The type table records every plain enum's members, so resolve
-             * against that first. A user enum also publishes its variants as
-             * bare globals and is found either way; `Kind` deliberately
-             * publishes none, and is only reachable through here. */
-            for (size_t i = 0; i < enum_ty->enum_member_count; i++) {
-              if (enum_ty->enum_member_names[i] &&
-                  strcmp(enum_ty->enum_member_names[i], member->member) == 0) {
-                return enum_ty;
-              }
-            }
-            /* Fall back to the bare global for enums declared before the
-             * member table was populated. */
-            Symbol *variant_sym =
-                symbol_table_lookup(checker->symbol_table, member->member);
-            if (variant_sym && variant_sym->kind == SYMBOL_CONSTANT &&
-                variant_sym->type == enum_ty) {
-              return enum_ty;
-            }
-            type_checker_set_error_at_location(
-                checker, expression->location,
-                "Enum '%s' has no variant '%s'", obj_id->name, member->member);
-            return NULL;
-          }
-          if (enum_ty->kind == TYPE_TAGGED_ENUM) {
-            for (size_t i = 0; i < enum_ty->tagged_variant_count; i++) {
-              if (enum_ty->tagged_variant_names &&
-                  enum_ty->tagged_variant_names[i] &&
-                  strcmp(enum_ty->tagged_variant_names[i], member->member) ==
-                      0) {
-                return enum_ty;
-              }
-            }
-            type_checker_set_error_at_location(
-                checker, expression->location,
-                "Tagged enum '%s' has no variant '%s'", obj_id->name,
-                member->member);
-            return NULL;
-          }
-        }
+    {
+      int enum_handled = 0;
+      Type *variant = type_checker_infer_enum_member(checker, expression,
+                                                     member, &enum_handled);
+      if (enum_handled) {
+        return variant;
       }
     }
 
@@ -2834,52 +3043,13 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
         object_type->base_type) {
       object_type = object_type->base_type;
     }
-    if (object_type && object_type->kind == TYPE_TYPE) {
-      ComptimeValue owner = comptime_none();
-      if (!type_checker_eval_comptime(checker, member->object, &owner) ||
-          owner.kind != COMPTIME_TYPE_REF) {
-        type_checker_set_error_at_location(
-            checker, expression->location,
-            "field access on 'Type' requires a compile-time type value");
-        return NULL;
+    {
+      int query_handled = 0;
+      Type *queried = type_checker_infer_type_query(
+          checker, expression, member, object_type, &query_handled);
+      if (query_handled) {
+        return queried;
       }
-      Type *referred =
-          type_checker_type_from_index(checker, owner.as.type_ref.type_index);
-      if (!referred) {
-        type_checker_set_error_at_location(
-            checker, expression->location,
-            "field access on 'Type' refers to an unknown type");
-        return NULL;
-      }
-      /* A declared field wins over a query of the same name: reflection must
-       * never shadow what the program itself wrote. */
-      int field_index = type_get_field_index(referred, member->member);
-      if (field_index >= 0) {
-        return type_checker_field_value(checker, referred,
-                                        (uint32_t)field_index, expression);
-      }
-      if (!type_checker_type_member_exists(member->member)) {
-        type_checker_set_error_at_location(
-            checker, expression->location,
-            "type '%s' has no field or query '%s'; a Type answers 'kind', "
-            "'name', 'size', 'align', 'fields', 'pointee', 'element', "
-            "and 'len'",
-            referred->name ? referred->name : "<anonymous>", member->member);
-        return NULL;
-      }
-      ComptimeValue queried = comptime_none();
-      if (!type_checker_eval_type_member(checker, owner, member->member,
-                                         &queried)) {
-        type_checker_set_error_at_location(
-            checker, expression->location,
-            "type '%s' cannot answer '.%s'",
-            referred->name ? referred->name : "<anonymous>", member->member);
-        return NULL;
-      }
-      if (strcmp(member->member, "kind") == 0) {
-        return type_checker_kind_result(checker, queried, expression);
-      }
-      return type_checker_comptime_result(checker, queried, expression);
     }
     if (object_type && object_type->kind == TYPE_SEQUENCE) {
       ComptimeValue answered = comptime_none();
@@ -2945,6 +3115,18 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     return NULL;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
+
+static Type *type_checker_infer_index(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_INDEX_EXPRESSION: {
     ArrayIndexExpression *idx = (ArrayIndexExpression *)expression->data;
     if (!idx || !idx->array || !idx->index) {
@@ -3037,6 +3219,18 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     return NULL;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
+
+static Type *type_checker_infer_allocation(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_ASSIGNMENT: {
     Assignment *assignment = (Assignment *)expression->data;
     if (assignment && assignment->value) {
@@ -3086,6 +3280,18 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     return pointer_type;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
+
+static Type *type_checker_infer_cast(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_CAST_EXPRESSION: {
     CastExpression *cast_expr = (CastExpression *)expression->data;
     if (!cast_expr || !cast_expr->type_name || !cast_expr->operand) {
@@ -3131,6 +3337,18 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
     return target_type;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return NULL;
+}
+
+static Type *type_checker_infer_match(TypeChecker *checker,
+                                  ASTNode *expression,
+                                  int *handled) {
+  *handled = 1;
+  switch (expression->type) {
   case AST_MATCH_STATEMENT: {
     MatchStatement *m = (MatchStatement *)expression->data;
     if (!m || !m->is_expression) {
@@ -3144,8 +3362,41 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
   }
 
   default:
-    return NULL;
+    *handled = 0;
+    break;
   }
+  return NULL;
+}
+
+Type *type_checker_infer_type_internal(TypeChecker *checker,
+                                       ASTNode *expression) {
+  static Type *(*const INFERRERS[])(TypeChecker *, ASTNode *, int *) = {
+      type_checker_infer_literal,
+      type_checker_infer_identifier,
+      type_checker_infer_closure,
+      type_checker_infer_lambda,
+      type_checker_infer_unary,
+      type_checker_infer_call,
+      type_checker_infer_indirect_call,
+      type_checker_infer_member,
+      type_checker_infer_index,
+      type_checker_infer_allocation,
+      type_checker_infer_cast,
+      type_checker_infer_match};
+  size_t inferrer;
+
+  if (!checker || !expression)
+    return NULL;
+
+  for (inferrer = 0; inferrer < sizeof(INFERRERS) / sizeof(INFERRERS[0]);
+       inferrer++) {
+    int handled = 0;
+    Type *inferred = INFERRERS[inferrer](checker, expression, &handled);
+    if (handled) {
+      return inferred;
+    }
+  }
+  return NULL;
 }
 
 int type_checker_check_expression(TypeChecker *checker, ASTNode *expression) {

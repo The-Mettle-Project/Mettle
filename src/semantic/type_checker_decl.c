@@ -840,12 +840,10 @@ int type_checker_process_enum_declaration(TypeChecker *checker,
   return 1;
 }
 
-int type_checker_process_declaration(TypeChecker *checker,
-                                     ASTNode *declaration) {
-  if (!checker || !declaration) {
-    return 0;
-  }
-
+static int type_checker_process_deferred(TypeChecker *checker,
+                                   ASTNode *declaration,
+                                   int *handled) {
+  *handled = 1;
   switch (declaration->type) {
   case AST_DEFER_STATEMENT:
     type_checker_set_error_at_location(checker, declaration->location,
@@ -876,6 +874,585 @@ int type_checker_process_declaration(TypeChecker *checker,
     return 0;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int type_checker_check_address_space(TypeChecker *checker,
+                                            ASTNode *declaration,
+                                            VarDeclaration *var_decl,
+                                            Scope *current_scope,
+                                            Type **var_type_io) {
+  Type *var_type = *var_type_io;
+  if (var_decl->address_space != AST_ADDRESS_SPACE_DEFAULT) {
+    FunctionDeclaration *owner =
+        checker->current_function_decl &&
+                checker->current_function_decl->type == AST_FUNCTION_DECLARATION
+            ? (FunctionDeclaration *)checker->current_function_decl->data
+            : NULL;
+    if (!owner || !owner->is_kernel || !current_scope ||
+        current_scope->type == SCOPE_GLOBAL) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "%s storage is only legal inside a GPU kernel",
+          var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP ? "workgroup"
+                                                                 : "private");
+      return 0;
+    }
+    if (var_decl->is_const || var_decl->is_extern || var_decl->is_exported) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "GPU address-space storage must be a local 'var' binding");
+      return 0;
+    }
+    if (var_decl->initializer) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "%s storage cannot have a declaration initializer; initialize "
+          "elements explicitly",
+          var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP ? "workgroup"
+                                                                 : "private");
+      return 0;
+    }
+    int is_static_storage =
+        var_type && var_type->kind == TYPE_ARRAY && var_type->base_type &&
+        var_type->array_size > 0 && var_type->array_size <= UINT32_MAX;
+    int is_dynamic_workgroup_view =
+        var_type && var_type->kind == TYPE_POINTER && var_type->base_type &&
+        var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP;
+    if (!is_static_storage && !is_dynamic_workgroup_view) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "GPU address-space storage requires a statically sized array type "
+          "with at most %u elements, or a pointer type for a dynamic "
+          "workgroup view",
+          UINT32_MAX);
+      return 0;
+    }
+    Type *element_type = var_type->base_type;
+    switch (element_type->kind) {
+    case TYPE_INT8:
+    case TYPE_INT16:
+    case TYPE_INT32:
+    case TYPE_INT64:
+    case TYPE_UINT8:
+    case TYPE_UINT16:
+    case TYPE_UINT32:
+    case TYPE_UINT64:
+    case TYPE_BOOL:
+    case TYPE_FLOAT32:
+    case TYPE_FLOAT64:
+      break;
+    default:
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "GPU address-space binding '%s' must have a scalar numeric element "
+          "type",
+          var_decl->name);
+      return 0;
+    }
+  }
+  *var_type_io = var_type;
+  return 1;
+}
+
+static int type_checker_check_variable_initializer(
+    TypeChecker *checker, ASTNode *declaration,
+    VarDeclaration *var_decl, Scope *current_scope, Type **var_type_io,
+    int *poisoned_io) {
+  Type *var_type = *var_type_io;
+  // If there's an initializer, validate it. When validation fails but the
+  // declared type is known, the variable is still registered with that type
+  // ("poisoned") so later uses don't cascade into bogus undefined-variable
+  // errors; the declaration itself still fails.
+  int poisoned = *poisoned_io;
+  if (var_decl->initializer) {
+    size_t reports_before =
+        checker->error_reporter ? checker->error_reporter->count : 0;
+    /* An aggregate literal has no type of its own, so hand it the declared
+     * type. Without one there is nothing to check it against, and the
+     * literal reports that itself. */
+    checker->aggregate_target_type =
+        var_decl->initializer->type == AST_AGGREGATE_LITERAL ||
+                var_decl->initializer->type == AST_FUNCTION_CALL ||
+                var_decl->initializer->type == AST_IDENTIFIER
+            ? var_type
+            : NULL;
+    Type *init_type = type_checker_infer_type(checker, var_decl->initializer);
+    checker->aggregate_target_type = NULL;
+    if (!init_type) {
+      int already_reported =
+          checker->error_reporter
+              ? checker->error_reporter->count > reports_before
+              : checker->has_error;
+      if (!already_reported) {
+        type_checker_set_error_at_location(
+            checker, var_decl->initializer->location,
+            "Cannot infer type of initializer for variable '%s'",
+            var_decl->name);
+      }
+      checker->has_error = 1;
+      if (!var_type)
+        return 0;
+      poisoned = 1;
+    }
+    if (!poisoned && var_type) {
+      /* A capturing closure carries a heap environment and cannot be stored in
+       * a plain function-pointer type; it needs a closure type `Fn(...)`. */
+      if (init_type && init_type->kind == TYPE_FUNCTION_POINTER &&
+          init_type->closure_env &&
+          !(var_type->kind == TYPE_FUNCTION_POINTER && var_type->closure_env)) {
+        type_checker_set_error_at_location(
+            checker, var_decl->initializer->location,
+            "a capturing closure cannot be stored in a plain function-pointer "
+            "type '%s'; declare '%s' with a closure type 'Fn(...)' instead",
+            var_type->name, var_decl->name);
+        poisoned = 1;
+      }
+      // Type specified: validate assignment compatibility
+      else if (type_is_comptime_only(init_type) &&
+               !type_is_comptime_only(var_type)) {
+        type_checker_reject_comptime_escape(
+            checker, var_decl->initializer->location, init_type);
+        poisoned = 1;
+      } else if (!(type_checker_type_accepts_null_pointer(var_type) &&
+            type_checker_is_null_pointer_constant(var_decl->initializer)) &&
+          !type_checker_is_assignable_from(checker, var_type, init_type,
+                                           var_decl->initializer)) {
+        type_checker_report_assign_mismatch(
+            checker, var_decl->initializer,
+            var_decl->initializer->location, var_type, init_type);
+        poisoned = 1;
+      }
+    } else if (poisoned) {
+      /* Initializer failed but declared type is known: register anyway. */
+    } else if (var_decl->structural_type ||
+               (var_decl->is_const &&
+                (!current_scope || current_scope->type == SCOPE_GLOBAL))) {
+      // Exempt: a compiler-synthesized binding whose type is structural (e.g.
+      // a range-`for` counter), or a global `const` (integer-only and folded
+      // at each use, so its type is exactly its literal value's type). Take
+      // the initializer type.
+      var_type = init_type;
+      if (var_decl->structural_type) {
+        Type *narrowed = type_checker_narrow_to_target_word(checker, var_type);
+        if (narrowed && narrowed->name) {
+          char *narrowed_name = strdup(narrowed->name);
+          if (!narrowed_name) {
+            type_checker_set_error_at_location(
+                checker, declaration->location,
+                "Out of memory narrowing '%s' to the target's word",
+                var_decl->name);
+            return 0;
+          }
+          free(var_decl->type_name);
+          var_decl->type_name = narrowed_name;
+          var_type = narrowed;
+        }
+      }
+    } else {
+      // Mettle requires an explicit type on every user `var` and local
+      // `const` binding; nothing is inferred from an arbitrary initializer.
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "%s '%s' requires an explicit type: write '%s %s: <type> = ...' "
+          "(Mettle does not infer binding types)",
+          var_decl->is_const ? "constant" : "variable", var_decl->name,
+          var_decl->is_const ? "const" : "var", var_decl->name);
+      return 0;
+    }
+  } else if (!var_type) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Variable '%s' must have either a type annotation or an initializer",
+        var_decl->name);
+    return 0;
+  }
+  *var_type_io = var_type;
+  *poisoned_io = poisoned;
+  return 1;
+}
+
+static int type_checker_declare_comptime_const(
+    TypeChecker *checker, ASTNode *declaration,
+    VarDeclaration *var_decl, Type *var_type, int poisoned,
+    int *handled) {
+  *handled = 1;
+  if (var_type && type_contains_comptime_only(var_type)) {
+    if (!var_decl->is_const || !type_is_comptime_only(var_type)) {
+      type_checker_reject_no_runtime_repr(checker, declaration->location,
+                                          var_type);
+      return 0;
+    }
+    if (!var_decl->initializer) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Constant '%s' must have an initializer", var_decl->name);
+      return 0;
+    }
+    if (poisoned) {
+      return 0;
+    }
+    ComptimeValue folded = comptime_none();
+    if (!type_checker_eval_comptime(checker, var_decl->initializer,
+                                    &folded) ||
+        (var_type->kind == TYPE_TYPE && folded.kind != COMPTIME_TYPE_REF) ||
+        (var_type->kind == TYPE_FIELD &&
+         folded.kind != COMPTIME_FIELD_REF)) {
+      type_checker_set_error_at_location(
+          checker, var_decl->initializer->location,
+          "Constant '%s' initializer must be a compile-time %s value",
+          var_decl->name, var_type->name);
+      return 0;
+    }
+    if (symbol_table_lookup_current_scope(checker->symbol_table,
+                                          var_decl->name)) {
+      type_checker_report_duplicate_declaration(
+          checker, declaration->location, var_decl->name);
+      return 0;
+    }
+    Symbol *const_symbol =
+        symbol_create(var_decl->name, SYMBOL_CONSTANT, var_type);
+    if (!const_symbol) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Failed to create symbol for constant '%s'", var_decl->name);
+      return 0;
+    }
+    const_symbol->comptime_value = folded;
+    const_symbol->is_initialized = 1;
+    const_symbol->is_immutable = 1;
+    const_symbol->decl_line = declaration->location.line;
+    const_symbol->decl_column = declaration->location.column;
+    const_symbol->decl_file = declaration->location.filename;
+    if (!symbol_table_declare(checker->symbol_table, const_symbol)) {
+      type_checker_report_duplicate_declaration(
+          checker, declaration->location, var_decl->name);
+      symbol_destroy(const_symbol);
+      return 0;
+    }
+    return 1;
+  }
+  *handled = 0;
+  return 1;
+}
+
+static int type_checker_check_global_initializer(
+    TypeChecker *checker, ASTNode *declaration,
+    VarDeclaration *var_decl, Type *var_type, Scope *current_scope,
+    int *poisoned_io) {
+  int poisoned = *poisoned_io;
+  /* A global's storage is laid out in the object file, so its value has to be
+   * known at compile time. For an aggregate that means an aggregate literal
+   * and nothing else -- a call or any other run-time expression has no image
+   * to lay out, and there is no module initializer to run one in. Caught here
+   * rather than in codegen so the report carries a source location. */
+  if (!poisoned && var_decl->initializer && !var_decl->is_extern && var_type &&
+      (var_type->kind == TYPE_STRUCT || var_type->kind == TYPE_ARRAY) &&
+      var_decl->initializer->type != AST_AGGREGATE_LITERAL &&
+      (!current_scope || current_scope->type == SCOPE_GLOBAL)) {
+    type_checker_set_error_at_location(
+        checker, var_decl->initializer->location,
+        "a global of aggregate type must be initialized with an aggregate "
+        "literal (%s), whose value is known at compile time; '%s' has type "
+        "'%s'",
+        var_type->kind == TYPE_STRUCT ? "'{ field: value, ... }'"
+                                      : "'[ value, ... ]'",
+        var_decl->name, var_type->name ? var_type->name : "?");
+    /* Register the binding anyway so later uses do not pile on with
+     * "undefined variable"; the declaration itself has already failed. */
+    checker->has_error = 1;
+    poisoned = 1;
+  }
+
+  /* The same rule for a scalar global. Its initializer is folded to bytes in
+   * the object file, so it has to be one of the shapes the module lowering
+   * can fold (see eval_numeric in mtlc_lower_module.c): a numeric constant
+   * expression, `sizeof(T)`, `&name`, or a string literal. Anything else -- a
+   * call, `new`, an index or member access, string concatenation -- is a
+   * run-time value with nothing to lay out. Rejected here so the report
+   * carries a source location instead of failing as an internal compiler
+   * error in codegen. */
+  if (!poisoned && var_decl->initializer && !var_decl->is_extern && var_type &&
+      var_type->kind != TYPE_STRUCT && var_type->kind != TYPE_ARRAY &&
+      (!current_scope || current_scope->type == SCOPE_GLOBAL) &&
+      /* An integer `const` gets the more specific diagnostic from its own
+       * fold below; everything else lands here. */
+       !(var_decl->is_const && type_checker_is_numeric_type(var_type)) &&
+      !layoutable_global_initializer(checker, var_type, var_decl->initializer,
+                                    1)) {
+    type_checker_set_error_at_location(
+        checker, var_decl->initializer->location,
+        "a global's initializer must be known at compile time; '%s' is "
+        "initialized with a value that is only available at run time. Move "
+        "the initialization into a function, or make the initializer a "
+        "constant expression",
+        var_decl->name);
+    checker->has_error = 1;
+    poisoned = 1;
+  }
+  *poisoned_io = poisoned;
+  return 1;
+}
+
+static int type_checker_fold_const_value(
+    TypeChecker *checker, ASTNode *declaration,
+    VarDeclaration *var_decl, Type *var_type, Scope *current_scope,
+    int *has_folded_value_io, int poisoned, int *folded_is_float_io,
+    long long *folded_integer_value_io, double *folded_float_value_io) {
+  int folded_is_float = *folded_is_float_io;
+  long long folded_integer_value = *folded_integer_value_io;
+  double folded_float_value = *folded_float_value_io;
+// A `const` declaration binds an immutable value and must be initialized.
+// Numeric consts must fold at compile time. Integer globals use the
+// storage free symbol form. Other numeric consts keep normal storage when
+// the backend needs an address, but carry the folded value for later const
+// expressions.
+if (var_decl->is_const) {
+  if (!var_decl->initializer) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Constant '%s' must have an initializer", var_decl->name);
+    return 0;
+  }
+  if (!poisoned && type_checker_is_numeric_type(var_type)) {
+    long long const_value = 0;
+    double float_value = 0.0;
+    int is_float = type_checker_is_floating_type(var_type);
+    int evaluated = is_float
+                        ? type_checker_eval_float_constant_with_checker(
+                              checker, var_decl->initializer, &float_value)
+                        : type_checker_eval_integer_constant_with_checker(
+                              checker, var_decl->initializer, &const_value);
+    if (!evaluated) {
+      type_checker_set_error_at_location(
+          checker, var_decl->initializer->location,
+          is_float
+              ? "Constant '%s' initializer must be a compile-time "
+                "constant expression"
+              : "Constant '%s' initializer must be a compile-time integer "
+                "constant expression",
+          var_decl->name);
+      return 0;
+    }
+    *has_folded_value_io = 1;
+    folded_is_float = is_float;
+    folded_integer_value = const_value;
+    folded_float_value = float_value;
+    if (current_scope && current_scope->type == SCOPE_GLOBAL && !is_float) {
+      if (symbol_table_lookup_current_scope(checker->symbol_table,
+                                            var_decl->name)) {
+        type_checker_report_duplicate_declaration(
+            checker, declaration->location, var_decl->name);
+        return 0;
+      }
+      Symbol *const_symbol =
+          symbol_create(var_decl->name, SYMBOL_CONSTANT, var_type);
+      if (!const_symbol) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Failed to create symbol for constant '%s'", var_decl->name);
+        return 0;
+      }
+      const_symbol->data.constant.value = const_value;
+      const_symbol->has_constant_value = 1;
+      const_symbol->constant_integer_value = const_value;
+      const_symbol->is_initialized = 1;
+      if (!symbol_table_declare(checker->symbol_table, const_symbol)) {
+        type_checker_report_duplicate_declaration(
+            checker, declaration->location, var_decl->name);
+        symbol_destroy(const_symbol);
+        return 0;
+      }
+      return 2;
+    }
+    // Local numeric consts and global float consts use normal storage.
+  }
+  // Non numeric consts use normal storage and the immutable flag below.
+}
+  *folded_is_float_io = folded_is_float;
+  *folded_integer_value_io = folded_integer_value;
+  *folded_float_value_io = folded_float_value;
+  return 1;
+}
+
+static int type_checker_track_local_initialization(
+    TypeChecker *checker, ASTNode *declaration,
+    VarDeclaration *var_decl, Symbol *var_symbol, Type *var_type) {
+if (checker->current_function && !var_decl->is_extern) {
+  Scope *declare_scope =
+      symbol_table_get_current_scope(checker->symbol_table);
+  if (declare_scope && declare_scope->type != SCOPE_GLOBAL) {
+    int track_definite_init =
+        !var_symbol->is_address_space_binding &&
+        !(var_type &&
+          (var_type->kind == TYPE_ARRAY || var_type->kind == TYPE_STRUCT ||
+           var_type->kind == TYPE_STRING));
+    if (track_definite_init) {
+      if (!type_checker_init_tracker_declare(
+              checker, var_decl->name, var_decl->initializer != NULL)) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Out of memory while tracking initialization state for '%s'",
+            var_decl->name);
+        return 0;
+      }
+    }
+
+    if (var_type && var_type->kind == TYPE_POINTER) {
+      long long known_extent = type_checker_extract_known_buffer_extent(
+          checker, var_decl->initializer);
+      long long known_alignment =
+          type_checker_extract_known_pointer_alignment(
+              checker, var_decl->initializer);
+      if (!type_checker_buffer_extent_declare(checker, var_decl->name,
+                                              known_extent,
+                                              known_alignment)) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Out of memory while tracking buffer extent for '%s'",
+            var_decl->name);
+        return 0;
+      }
+    }
+  }
+  }
+  return 1;
+}
+
+static int type_checker_declare_variable(
+    TypeChecker *checker, ASTNode *declaration,
+    VarDeclaration *var_decl, Type *var_type, Scope *current_scope,
+    int *poisoned_io) {
+  int poisoned = *poisoned_io;
+  int has_folded_value = 0;
+  int folded_is_float = 0;
+  long long folded_integer_value = 0;
+  double folded_float_value = 0.0;
+
+  {
+    int folded = type_checker_fold_const_value(
+        checker, declaration, var_decl, var_type, current_scope,
+        &has_folded_value, poisoned, &folded_is_float,
+        &folded_integer_value, &folded_float_value);
+    if (folded != 1) {
+      return folded == 2 ? 1 : 0;
+    }
+  }
+
+  // Check for duplicate declaration in current scope.
+  Symbol *existing = symbol_table_lookup_current_scope(checker->symbol_table,
+                                                       var_decl->name);
+  if (existing) {
+    if (existing->kind != SYMBOL_VARIABLE) {
+      type_checker_report_duplicate_declaration_prev(
+          checker, declaration->location, var_decl->name, existing);
+      return 0;
+    }
+    if (existing->is_extern != var_decl->is_extern) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Variable '%s' redeclared with conflicting extern/non-extern "
+          "linkage",
+          var_decl->name);
+      return 0;
+    }
+    if (!var_decl->is_extern) {
+      type_checker_report_duplicate_declaration_prev(
+          checker, declaration->location, var_decl->name, existing);
+      return 0;
+    }
+    if (!type_checker_types_equal(existing->type, var_type)) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Extern variable '%s' redeclared with conflicting type",
+          var_decl->name);
+      return 0;
+    }
+    if (!type_checker_link_name_matches_symbol(existing, var_decl->name,
+                                               var_decl->is_extern,
+                                               var_decl->link_name)) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Extern variable '%s' redeclared with conflicting link name",
+          var_decl->name);
+      return 0;
+    }
+    return 1;
+  }
+
+  // Create and declare the symbol
+  Symbol *var_symbol =
+      symbol_create(var_decl->name, SYMBOL_VARIABLE, var_type);
+  if (var_symbol) {
+    var_symbol->decl_line = declaration->location.line;
+    var_symbol->decl_column = declaration->location.column;
+    var_symbol->decl_file = declaration->location.filename;
+  }
+  if (!var_symbol) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Failed to create symbol for variable '%s'", var_decl->name);
+    return 0;
+  }
+
+  var_symbol->is_extern = var_decl->is_extern;
+  var_symbol->is_immutable = var_decl->is_const;
+  if (has_folded_value) {
+    var_symbol->has_constant_value = 1;
+    var_symbol->constant_is_float = folded_is_float;
+    var_symbol->constant_integer_value = folded_integer_value;
+    var_symbol->constant_float_value = folded_float_value;
+  }
+  var_symbol->is_address_space_binding =
+      var_decl->address_space != AST_ADDRESS_SPACE_DEFAULT;
+  var_symbol->address_space =
+      var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP
+          ? MTLC_ADDRESS_SPACE_WORKGROUP
+      : var_decl->address_space == AST_ADDRESS_SPACE_PRIVATE
+          ? MTLC_ADDRESS_SPACE_PRIVATE
+          : MTLC_ADDRESS_SPACE_DEFAULT;
+  if (var_decl->is_extern) {
+    const char *effective_link_name = type_checker_decl_link_name(
+        var_decl->name, var_decl->is_extern, var_decl->link_name);
+    var_symbol->link_name =
+        effective_link_name ? strdup(effective_link_name) : NULL;
+    if (!var_symbol->link_name) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Failed to allocate link name for extern variable '%s'",
+          var_decl->name);
+      symbol_destroy(var_symbol);
+      return 0;
+    }
+  }
+
+  if (!symbol_table_declare(checker->symbol_table, var_symbol)) {
+    type_checker_report_duplicate_declaration_prev(
+        checker, declaration->location, var_decl->name,
+        symbol_table_lookup_current_scope(checker->symbol_table,
+                                          var_decl->name));
+    symbol_destroy(var_symbol);
+    return 0;
+  }
+
+  if (!type_checker_track_local_initialization(checker, declaration,
+                                               var_decl, var_symbol,
+                                               var_type)) {
+    return 0;
+  }
+  *poisoned_io = poisoned;
+  return 1;
+}
+
+static int type_checker_process_variable(TypeChecker *checker,
+                                   ASTNode *declaration,
+                                   int *handled) {
+  *handled = 1;
+  switch (declaration->type) {
   case AST_VAR_DECLARATION: {
     VarDeclaration *var_decl = (VarDeclaration *)declaration->data;
     if (!var_decl || !var_decl->name) {
@@ -936,500 +1513,396 @@ int type_checker_process_declaration(TypeChecker *checker,
       }
     }
 
-    if (var_decl->address_space != AST_ADDRESS_SPACE_DEFAULT) {
-      FunctionDeclaration *owner =
-          checker->current_function_decl &&
-                  checker->current_function_decl->type == AST_FUNCTION_DECLARATION
-              ? (FunctionDeclaration *)checker->current_function_decl->data
-              : NULL;
-      if (!owner || !owner->is_kernel || !current_scope ||
-          current_scope->type == SCOPE_GLOBAL) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "%s storage is only legal inside a GPU kernel",
-            var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP ? "workgroup"
-                                                                   : "private");
-        return 0;
-      }
-      if (var_decl->is_const || var_decl->is_extern || var_decl->is_exported) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "GPU address-space storage must be a local 'var' binding");
-        return 0;
-      }
-      if (var_decl->initializer) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "%s storage cannot have a declaration initializer; initialize "
-            "elements explicitly",
-            var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP ? "workgroup"
-                                                                   : "private");
-        return 0;
-      }
-      int is_static_storage =
-          var_type && var_type->kind == TYPE_ARRAY && var_type->base_type &&
-          var_type->array_size > 0 && var_type->array_size <= UINT32_MAX;
-      int is_dynamic_workgroup_view =
-          var_type && var_type->kind == TYPE_POINTER && var_type->base_type &&
-          var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP;
-      if (!is_static_storage && !is_dynamic_workgroup_view) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "GPU address-space storage requires a statically sized array type "
-            "with at most %u elements, or a pointer type for a dynamic "
-            "workgroup view",
-            UINT32_MAX);
-        return 0;
-      }
-      Type *element_type = var_type->base_type;
-      switch (element_type->kind) {
-      case TYPE_INT8:
-      case TYPE_INT16:
-      case TYPE_INT32:
-      case TYPE_INT64:
-      case TYPE_UINT8:
-      case TYPE_UINT16:
-      case TYPE_UINT32:
-      case TYPE_UINT64:
-      case TYPE_BOOL:
-      case TYPE_FLOAT32:
-      case TYPE_FLOAT64:
-        break;
-      default:
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "GPU address-space binding '%s' must have a scalar numeric element "
-            "type",
-            var_decl->name);
-        return 0;
-      }
-    }
-
-    // If there's an initializer, validate it. When validation fails but the
-    // declared type is known, the variable is still registered with that type
-    // ("poisoned") so later uses don't cascade into bogus undefined-variable
-    // errors; the declaration itself still fails.
     int poisoned = 0;
-    if (var_decl->initializer) {
-      size_t reports_before =
-          checker->error_reporter ? checker->error_reporter->count : 0;
-      /* An aggregate literal has no type of its own, so hand it the declared
-       * type. Without one there is nothing to check it against, and the
-       * literal reports that itself. */
-      checker->aggregate_target_type =
-          var_decl->initializer->type == AST_AGGREGATE_LITERAL ||
-                  var_decl->initializer->type == AST_FUNCTION_CALL ||
-                  var_decl->initializer->type == AST_IDENTIFIER
-              ? var_type
-              : NULL;
-      Type *init_type = type_checker_infer_type(checker, var_decl->initializer);
-      checker->aggregate_target_type = NULL;
-      if (!init_type) {
-        int already_reported =
-            checker->error_reporter
-                ? checker->error_reporter->count > reports_before
-                : checker->has_error;
-        if (!already_reported) {
-          type_checker_set_error_at_location(
-              checker, var_decl->initializer->location,
-              "Cannot infer type of initializer for variable '%s'",
-              var_decl->name);
-        }
-        checker->has_error = 1;
-        if (!var_type)
-          return 0;
-        poisoned = 1;
-      }
-      if (!poisoned && var_type) {
-        /* A capturing closure carries a heap environment and cannot be stored in
-         * a plain function-pointer type; it needs a closure type `Fn(...)`. */
-        if (init_type && init_type->kind == TYPE_FUNCTION_POINTER &&
-            init_type->closure_env &&
-            !(var_type->kind == TYPE_FUNCTION_POINTER && var_type->closure_env)) {
-          type_checker_set_error_at_location(
-              checker, var_decl->initializer->location,
-              "a capturing closure cannot be stored in a plain function-pointer "
-              "type '%s'; declare '%s' with a closure type 'Fn(...)' instead",
-              var_type->name, var_decl->name);
-          poisoned = 1;
-        }
-        // Type specified: validate assignment compatibility
-        else if (type_is_comptime_only(init_type) &&
-                 !type_is_comptime_only(var_type)) {
-          type_checker_reject_comptime_escape(
-              checker, var_decl->initializer->location, init_type);
-          poisoned = 1;
-        } else if (!(type_checker_type_accepts_null_pointer(var_type) &&
-              type_checker_is_null_pointer_constant(var_decl->initializer)) &&
-            !type_checker_is_assignable_from(checker, var_type, init_type,
-                                             var_decl->initializer)) {
-          type_checker_report_assign_mismatch(
-              checker, var_decl->initializer,
-              var_decl->initializer->location, var_type, init_type);
-          poisoned = 1;
-        }
-      } else if (poisoned) {
-        /* Initializer failed but declared type is known: register anyway. */
-      } else if (var_decl->structural_type ||
-                 (var_decl->is_const &&
-                  (!current_scope || current_scope->type == SCOPE_GLOBAL))) {
-        // Exempt: a compiler-synthesized binding whose type is structural (e.g.
-        // a range-`for` counter), or a global `const` (integer-only and folded
-        // at each use, so its type is exactly its literal value's type). Take
-        // the initializer type.
-        var_type = init_type;
-        if (var_decl->structural_type) {
-          Type *narrowed = type_checker_narrow_to_target_word(checker, var_type);
-          if (narrowed && narrowed->name) {
-            char *narrowed_name = strdup(narrowed->name);
-            if (!narrowed_name) {
-              type_checker_set_error_at_location(
-                  checker, declaration->location,
-                  "Out of memory narrowing '%s' to the target's word",
-                  var_decl->name);
-              return 0;
-            }
-            free(var_decl->type_name);
-            var_decl->type_name = narrowed_name;
-            var_type = narrowed;
-          }
-        }
-      } else {
-        // Mettle requires an explicit type on every user `var` and local
-        // `const` binding; nothing is inferred from an arbitrary initializer.
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "%s '%s' requires an explicit type: write '%s %s: <type> = ...' "
-            "(Mettle does not infer binding types)",
-            var_decl->is_const ? "constant" : "variable", var_decl->name,
-            var_decl->is_const ? "const" : "var", var_decl->name);
-        return 0;
-      }
-    } else if (!var_type) {
-      type_checker_set_error_at_location(
-          checker, declaration->location,
-          "Variable '%s' must have either a type annotation or an initializer",
-          var_decl->name);
+    if (!type_checker_check_address_space(checker, declaration, var_decl,
+                                         current_scope, &var_type) ||
+        !type_checker_check_variable_initializer(checker, declaration,
+                                                 var_decl, current_scope,
+                                                 &var_type, &poisoned)) {
       return 0;
     }
-
-    if (var_type && type_contains_comptime_only(var_type)) {
-      if (!var_decl->is_const || !type_is_comptime_only(var_type)) {
-        type_checker_reject_no_runtime_repr(checker, declaration->location,
-                                            var_type);
-        return 0;
+    {
+      int const_handled = 0;
+      int declared = type_checker_declare_comptime_const(
+          checker, declaration, var_decl, var_type, poisoned,
+          &const_handled);
+      if (const_handled) {
+        return declared;
       }
-      if (!var_decl->initializer) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Constant '%s' must have an initializer", var_decl->name);
-        return 0;
-      }
-      if (poisoned) {
-        return 0;
-      }
-      ComptimeValue folded = comptime_none();
-      if (!type_checker_eval_comptime(checker, var_decl->initializer,
-                                      &folded) ||
-          (var_type->kind == TYPE_TYPE && folded.kind != COMPTIME_TYPE_REF) ||
-          (var_type->kind == TYPE_FIELD &&
-           folded.kind != COMPTIME_FIELD_REF)) {
-        type_checker_set_error_at_location(
-            checker, var_decl->initializer->location,
-            "Constant '%s' initializer must be a compile-time %s value",
-            var_decl->name, var_type->name);
-        return 0;
-      }
-      if (symbol_table_lookup_current_scope(checker->symbol_table,
-                                            var_decl->name)) {
-        type_checker_report_duplicate_declaration(
-            checker, declaration->location, var_decl->name);
-        return 0;
-      }
-      Symbol *const_symbol =
-          symbol_create(var_decl->name, SYMBOL_CONSTANT, var_type);
-      if (!const_symbol) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Failed to create symbol for constant '%s'", var_decl->name);
-        return 0;
-      }
-      const_symbol->comptime_value = folded;
-      const_symbol->is_initialized = 1;
-      const_symbol->is_immutable = 1;
-      const_symbol->decl_line = declaration->location.line;
-      const_symbol->decl_column = declaration->location.column;
-      const_symbol->decl_file = declaration->location.filename;
-      if (!symbol_table_declare(checker->symbol_table, const_symbol)) {
-        type_checker_report_duplicate_declaration(
-            checker, declaration->location, var_decl->name);
-        symbol_destroy(const_symbol);
-        return 0;
-      }
-      return 1;
     }
-
-    /* A global's storage is laid out in the object file, so its value has to be
-     * known at compile time. For an aggregate that means an aggregate literal
-     * and nothing else -- a call or any other run-time expression has no image
-     * to lay out, and there is no module initializer to run one in. Caught here
-     * rather than in codegen so the report carries a source location. */
-    if (!poisoned && var_decl->initializer && !var_decl->is_extern && var_type &&
-        (var_type->kind == TYPE_STRUCT || var_type->kind == TYPE_ARRAY) &&
-        var_decl->initializer->type != AST_AGGREGATE_LITERAL &&
-        (!current_scope || current_scope->type == SCOPE_GLOBAL)) {
-      type_checker_set_error_at_location(
-          checker, var_decl->initializer->location,
-          "a global of aggregate type must be initialized with an aggregate "
-          "literal (%s), whose value is known at compile time; '%s' has type "
-          "'%s'",
-          var_type->kind == TYPE_STRUCT ? "'{ field: value, ... }'"
-                                        : "'[ value, ... ]'",
-          var_decl->name, var_type->name ? var_type->name : "?");
-      /* Register the binding anyway so later uses do not pile on with
-       * "undefined variable"; the declaration itself has already failed. */
-      checker->has_error = 1;
-      poisoned = 1;
-    }
-
-    /* The same rule for a scalar global. Its initializer is folded to bytes in
-     * the object file, so it has to be one of the shapes the module lowering
-     * can fold (see eval_numeric in mtlc_lower_module.c): a numeric constant
-     * expression, `sizeof(T)`, `&name`, or a string literal. Anything else -- a
-     * call, `new`, an index or member access, string concatenation -- is a
-     * run-time value with nothing to lay out. Rejected here so the report
-     * carries a source location instead of failing as an internal compiler
-     * error in codegen. */
-    if (!poisoned && var_decl->initializer && !var_decl->is_extern && var_type &&
-        var_type->kind != TYPE_STRUCT && var_type->kind != TYPE_ARRAY &&
-        (!current_scope || current_scope->type == SCOPE_GLOBAL) &&
-        /* An integer `const` gets the more specific diagnostic from its own
-         * fold below; everything else lands here. */
-         !(var_decl->is_const && type_checker_is_numeric_type(var_type)) &&
-        !layoutable_global_initializer(checker, var_type, var_decl->initializer,
-                                      1)) {
-      type_checker_set_error_at_location(
-          checker, var_decl->initializer->location,
-          "a global's initializer must be known at compile time; '%s' is "
-          "initialized with a value that is only available at run time. Move "
-          "the initialization into a function, or make the initializer a "
-          "constant expression",
-          var_decl->name);
-      checker->has_error = 1;
-      poisoned = 1;
-    }
-
-    int has_folded_value = 0;
-    int folded_is_float = 0;
-    long long folded_integer_value = 0;
-    double folded_float_value = 0.0;
-
-    // A `const` declaration binds an immutable value and must be initialized.
-    // Numeric consts must fold at compile time. Integer globals use the
-    // storage free symbol form. Other numeric consts keep normal storage when
-    // the backend needs an address, but carry the folded value for later const
-    // expressions.
-    if (var_decl->is_const) {
-      if (!var_decl->initializer) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Constant '%s' must have an initializer", var_decl->name);
-        return 0;
-      }
-      if (!poisoned && type_checker_is_numeric_type(var_type)) {
-        long long const_value = 0;
-        double float_value = 0.0;
-        int is_float = type_checker_is_floating_type(var_type);
-        int evaluated = is_float
-                            ? type_checker_eval_float_constant_with_checker(
-                                  checker, var_decl->initializer, &float_value)
-                            : type_checker_eval_integer_constant_with_checker(
-                                  checker, var_decl->initializer, &const_value);
-        if (!evaluated) {
-          type_checker_set_error_at_location(
-              checker, var_decl->initializer->location,
-              is_float
-                  ? "Constant '%s' initializer must be a compile-time "
-                    "constant expression"
-                  : "Constant '%s' initializer must be a compile-time integer "
-                    "constant expression",
-              var_decl->name);
-          return 0;
-        }
-        has_folded_value = 1;
-        folded_is_float = is_float;
-        folded_integer_value = const_value;
-        folded_float_value = float_value;
-        if (current_scope && current_scope->type == SCOPE_GLOBAL && !is_float) {
-          if (symbol_table_lookup_current_scope(checker->symbol_table,
-                                                var_decl->name)) {
-            type_checker_report_duplicate_declaration(
-                checker, declaration->location, var_decl->name);
-            return 0;
-          }
-          Symbol *const_symbol =
-              symbol_create(var_decl->name, SYMBOL_CONSTANT, var_type);
-          if (!const_symbol) {
-            type_checker_set_error_at_location(
-                checker, declaration->location,
-                "Failed to create symbol for constant '%s'", var_decl->name);
-            return 0;
-          }
-          const_symbol->data.constant.value = const_value;
-          const_symbol->has_constant_value = 1;
-          const_symbol->constant_integer_value = const_value;
-          const_symbol->is_initialized = 1;
-          if (!symbol_table_declare(checker->symbol_table, const_symbol)) {
-            type_checker_report_duplicate_declaration(
-                checker, declaration->location, var_decl->name);
-            symbol_destroy(const_symbol);
-            return 0;
-          }
-          return 1;
-        }
-        // Local numeric consts and global float consts use normal storage.
-      }
-      // Non numeric consts use normal storage and the immutable flag below.
-    }
-
-    // Check for duplicate declaration in current scope.
-    Symbol *existing = symbol_table_lookup_current_scope(checker->symbol_table,
-                                                         var_decl->name);
-    if (existing) {
-      if (existing->kind != SYMBOL_VARIABLE) {
-        type_checker_report_duplicate_declaration_prev(
-            checker, declaration->location, var_decl->name, existing);
-        return 0;
-      }
-      if (existing->is_extern != var_decl->is_extern) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Variable '%s' redeclared with conflicting extern/non-extern "
-            "linkage",
-            var_decl->name);
-        return 0;
-      }
-      if (!var_decl->is_extern) {
-        type_checker_report_duplicate_declaration_prev(
-            checker, declaration->location, var_decl->name, existing);
-        return 0;
-      }
-      if (!type_checker_types_equal(existing->type, var_type)) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Extern variable '%s' redeclared with conflicting type",
-            var_decl->name);
-        return 0;
-      }
-      if (!type_checker_link_name_matches_symbol(existing, var_decl->name,
-                                                 var_decl->is_extern,
-                                                 var_decl->link_name)) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Extern variable '%s' redeclared with conflicting link name",
-            var_decl->name);
-        return 0;
-      }
-      return 1;
-    }
-
-    // Create and declare the symbol
-    Symbol *var_symbol =
-        symbol_create(var_decl->name, SYMBOL_VARIABLE, var_type);
-    if (var_symbol) {
-      var_symbol->decl_line = declaration->location.line;
-      var_symbol->decl_column = declaration->location.column;
-      var_symbol->decl_file = declaration->location.filename;
-    }
-    if (!var_symbol) {
-      type_checker_set_error_at_location(
-          checker, declaration->location,
-          "Failed to create symbol for variable '%s'", var_decl->name);
+    if (!type_checker_check_global_initializer(checker, declaration, var_decl,
+                                               var_type, current_scope,
+                                               &poisoned) ||
+        !type_checker_declare_variable(checker, declaration, var_decl, var_type,
+                                       current_scope, &poisoned)) {
       return 0;
     }
-
-    var_symbol->is_extern = var_decl->is_extern;
-    var_symbol->is_immutable = var_decl->is_const;
-    if (has_folded_value) {
-      var_symbol->has_constant_value = 1;
-      var_symbol->constant_is_float = folded_is_float;
-      var_symbol->constant_integer_value = folded_integer_value;
-      var_symbol->constant_float_value = folded_float_value;
-    }
-    var_symbol->is_address_space_binding =
-        var_decl->address_space != AST_ADDRESS_SPACE_DEFAULT;
-    var_symbol->address_space =
-        var_decl->address_space == AST_ADDRESS_SPACE_WORKGROUP
-            ? MTLC_ADDRESS_SPACE_WORKGROUP
-        : var_decl->address_space == AST_ADDRESS_SPACE_PRIVATE
-            ? MTLC_ADDRESS_SPACE_PRIVATE
-            : MTLC_ADDRESS_SPACE_DEFAULT;
-    if (var_decl->is_extern) {
-      const char *effective_link_name = type_checker_decl_link_name(
-          var_decl->name, var_decl->is_extern, var_decl->link_name);
-      var_symbol->link_name =
-          effective_link_name ? strdup(effective_link_name) : NULL;
-      if (!var_symbol->link_name) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Failed to allocate link name for extern variable '%s'",
-            var_decl->name);
-        symbol_destroy(var_symbol);
-        return 0;
-      }
-    }
-
-    if (!symbol_table_declare(checker->symbol_table, var_symbol)) {
-      type_checker_report_duplicate_declaration_prev(
-          checker, declaration->location, var_decl->name,
-          symbol_table_lookup_current_scope(checker->symbol_table,
-                                            var_decl->name));
-      symbol_destroy(var_symbol);
-      return 0;
-    }
-
-    if (checker->current_function && !var_decl->is_extern) {
-      Scope *declare_scope =
-          symbol_table_get_current_scope(checker->symbol_table);
-      if (declare_scope && declare_scope->type != SCOPE_GLOBAL) {
-        int track_definite_init =
-            !var_symbol->is_address_space_binding &&
-            !(var_type &&
-              (var_type->kind == TYPE_ARRAY || var_type->kind == TYPE_STRUCT ||
-               var_type->kind == TYPE_STRING));
-        if (track_definite_init) {
-          if (!type_checker_init_tracker_declare(
-                  checker, var_decl->name, var_decl->initializer != NULL)) {
-            type_checker_set_error_at_location(
-                checker, declaration->location,
-                "Out of memory while tracking initialization state for '%s'",
-                var_decl->name);
-            return 0;
-          }
-        }
-
-        if (var_type && var_type->kind == TYPE_POINTER) {
-          long long known_extent = type_checker_extract_known_buffer_extent(
-              checker, var_decl->initializer);
-          long long known_alignment =
-              type_checker_extract_known_pointer_alignment(
-                  checker, var_decl->initializer);
-          if (!type_checker_buffer_extent_declare(checker, var_decl->name,
-                                                  known_extent,
-                                                  known_alignment)) {
-            type_checker_set_error_at_location(
-                checker, declaration->location,
-                "Out of memory while tracking buffer extent for '%s'",
-                var_decl->name);
-            return 0;
-          }
-        }
-      }
-    }
-
     return poisoned ? 0 : 1;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static Symbol *type_checker_build_function_symbol(
+    TypeChecker *checker, ASTNode *declaration,
+    FunctionDeclaration *func_decl, Type *return_type) {
+  // Resolve parameter types and check for duplicate parameter names
+  Type **param_types = NULL;
+  if (func_decl->parameter_count > 0) {
+    param_types = malloc(func_decl->parameter_count * sizeof(Type *));
+    if (!param_types) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Memory allocation failed for function parameters");
+      return 0;
+    }
+
+    // Check for duplicate parameter names
+    for (size_t i = 0; i < func_decl->parameter_count; i++) {
+      for (size_t j = i + 1; j < func_decl->parameter_count; j++) {
+        if (strcmp(func_decl->parameter_names[i],
+                   func_decl->parameter_names[j]) == 0) {
+          type_checker_report_duplicate_declaration(
+              checker, declaration->location, func_decl->parameter_names[i]);
+          free(param_types);
+          return 0;
+        }
+      }
+    }
+
+    for (size_t i = 0; i < func_decl->parameter_count; i++) {
+      param_types[i] = type_checker_get_type_by_name(
+          checker, func_decl->parameter_types[i]);
+      if (!param_types[i]) {
+        type_checker_report_undefined_symbol(checker, declaration->location,
+                                             func_decl->parameter_types[i],
+                                             "type");
+        free(param_types);
+        return 0;
+      }
+      if (type_checker_reject_no_runtime_repr(checker, declaration->location,
+                                              param_types[i])) {
+        free(param_types);
+        return 0;
+      }
+      if (func_decl->is_kernel &&
+          !gpu_kernel_parameter_type(param_types[i])) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "GPU kernel '%s' parameter '%s' has unsupported ABI type '%s'; "
+            "use a scalar, a pointer, or a record built from those",
+            func_decl->name, func_decl->parameter_names[i],
+            param_types[i]->name ? param_types[i]->name : "unknown");
+        free(param_types);
+        return 0;
+      }
+    }
+  }
+
+  // Copy parameter names so function symbols own their metadata.
+  char **param_names_copy = NULL;
+  if (func_decl->parameter_count > 0) {
+    param_names_copy = malloc(func_decl->parameter_count * sizeof(char *));
+    if (!param_names_copy) {
+      if (param_types)
+        free(param_types);
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Memory allocation failed for function parameter names");
+      return 0;
+    }
+    for (size_t i = 0; i < func_decl->parameter_count; i++) {
+      param_names_copy[i] = strdup(func_decl->parameter_names[i]);
+      if (!param_names_copy[i]) {
+        for (size_t j = 0; j < i; j++) {
+          free(param_names_copy[j]);
+        }
+        free(param_names_copy);
+        if (param_types)
+          free(param_types);
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Memory allocation failed for parameter name copy");
+        return 0;
+      }
+    }
+  }
+
+  // Create function symbol
+  Symbol *func_symbol =
+      symbol_create(func_decl->name, SYMBOL_FUNCTION, return_type);
+  if (!func_symbol) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Memory allocation failed for function symbol");
+    if (param_names_copy) {
+      for (size_t i = 0; i < func_decl->parameter_count; i++) {
+        free(param_names_copy[i]);
+      }
+      free(param_names_copy);
+    }
+    if (param_types)
+      free(param_types);
+    return 0;
+  }
+
+  // Set function-specific data
+  func_symbol->data.function.parameter_count = func_decl->parameter_count;
+  func_symbol->data.function.parameter_names = param_names_copy;
+  func_symbol->data.function.parameter_types = param_types;
+  func_symbol->data.function.return_type = return_type;
+  func_symbol->is_kernel = func_decl->is_kernel;
+  func_symbol->kernel_block[0] = func_decl->kernel_block[0];
+  func_symbol->kernel_block[1] = func_decl->kernel_block[1];
+  func_symbol->kernel_block[2] = func_decl->kernel_block[2];
+  func_symbol->kernel_threads_per_item = func_decl->kernel_threads_per_item;
+  func_symbol->is_extern = func_decl->is_extern;
+  if (func_decl->is_extern) {
+    const char *effective_link_name = type_checker_decl_link_name(
+        func_decl->name, func_decl->is_extern, func_decl->link_name);
+    func_symbol->link_name =
+        effective_link_name ? strdup(effective_link_name) : NULL;
+    if (!func_symbol->link_name) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Failed to allocate link name for extern function '%s'",
+          func_decl->name);
+      symbol_destroy(func_symbol);
+      return 0;
+    }
+  }
+  return func_symbol;
+}
+
+static int type_checker_check_function_body(
+    TypeChecker *checker, ASTNode *declaration,
+    FunctionDeclaration *func_decl, Symbol *func_symbol,
+    Type *return_type) {
+  // Add parameters to the new scope
+  Type **active_param_types =
+      checker->current_function->data.function.parameter_types;
+  if (func_decl->parameter_count > 0) {
+    for (size_t i = 0; i < func_decl->parameter_count; i++) {
+      Symbol *param_symbol =
+          symbol_create(func_decl->parameter_names[i], SYMBOL_PARAMETER,
+                        active_param_types ? active_param_types[i] : NULL);
+      if (!param_symbol) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Failed to create parameter symbol");
+        symbol_table_exit_scope(checker->symbol_table);
+        return 0;
+      }
+      if (func_decl->is_kernel && active_param_types &&
+          active_param_types[i] &&
+          active_param_types[i]->kind == TYPE_POINTER) {
+        param_symbol->address_space = MTLC_ADDRESS_SPACE_GLOBAL;
+      }
+      param_symbol->decl_line = declaration->location.line;
+      param_symbol->decl_column = declaration->location.column;
+      param_symbol->decl_file = declaration->location.filename;
+      if (!symbol_table_declare(checker->symbol_table, param_symbol)) {
+        type_checker_report_duplicate_declaration(
+            checker, declaration->location, func_decl->parameter_names[i]);
+        symbol_destroy(param_symbol);
+        type_checker_init_tracker_reset(checker);
+        symbol_table_exit_scope(checker->symbol_table);
+        return 0;
+      }
+      if (!type_checker_init_tracker_declare(
+              checker, func_decl->parameter_names[i], 1)) {
+        type_checker_set_error_at_location(
+            checker, declaration->location,
+            "Out of memory while tracking parameter initialization");
+        type_checker_init_tracker_reset(checker);
+        symbol_table_exit_scope(checker->symbol_table);
+        return 0;
+      }
+      Type *param_type = active_param_types ? active_param_types[i] : NULL;
+      if (param_type && param_type->kind == TYPE_POINTER) {
+        if (!type_checker_buffer_extent_declare(
+                checker, func_decl->parameter_names[i], -1, -1)) {
+          type_checker_set_error_at_location(
+              checker, declaration->location,
+              "Out of memory while tracking pointer parameter extent");
+          type_checker_init_tracker_reset(checker);
+          symbol_table_exit_scope(checker->symbol_table);
+          return 0;
+        }
+      }
+    }
+  }
+
+  // Process the function body
+  if (func_decl->body &&
+      !type_checker_check_statement(checker, func_decl->body)) {
+    // Error already reported
+    type_checker_init_tracker_reset(checker);
+    symbol_table_exit_scope(checker->symbol_table);
+    return 0;
+  }
+
+  // Memory diagnostics (use-after-free, dangling stack addresses,
+  // constant out-of-bounds accesses, leaks). The scope is still live, so
+  // `const` locals resolve for constant-index evaluation.
+  if (func_decl->body &&
+      !type_checker_check_function_memory(checker, declaration)) {
+    type_checker_init_tracker_reset(checker);
+    symbol_table_exit_scope(checker->symbol_table);
+    return 0;
+  }
+
+  // A function with a non-void return type must contain at least one
+  // return statement. This is a simple body-walk (a missing return on
+  // some paths is not yet diagnosed); a function with no return at all
+  // would otherwise compile and return garbage from RAX/XMM0. `main` is
+  // exempt: the entry point falls through to an implicit `return 0`.
+  /* A `@naked` function has no frame and no compiled epilogue: its asm block
+   * loads the return register and returns itself, so there is no `return`
+   * statement to find and no garbage to warn about. */
+  if (func_decl->body && return_type &&
+      return_type->kind != TYPE_VOID && !func_decl->is_naked &&
+      strcmp(func_decl->name, "main") != 0 &&
+      !type_checker_ast_contains_node_type(func_decl->body,
+                                           AST_RETURN_STATEMENT)) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Function '%s' has non-void return type '%s' but contains no return "
+        "statement",
+        func_decl->name, return_type->name);
+    type_checker_init_tracker_reset(checker);
+    symbol_table_exit_scope(checker->symbol_table);
+    return 0;
+  }
+  return 1;
+}
+
+static Type *type_checker_function_return_type(
+    TypeChecker *checker, ASTNode *declaration,
+    FunctionDeclaration *func_decl) {
+  // Resolve return type
+  Type *return_type = NULL;
+  if (func_decl->return_type_count > 0 &&
+      !type_checker_ensure_multi_return_type(checker, func_decl,
+                                             declaration->location)) {
+    /* Only speak in generalities when nothing more specific was said: the
+     * builder names the offending return value when it can. */
+    if (!checker->has_error) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Could not build the multiple return type for function '%s'",
+          func_decl->name);
+    }
+    return 0;
+  }
+  if (func_decl->return_type) {
+    return_type =
+        type_checker_get_type_by_name(checker, func_decl->return_type);
+    if (!return_type) {
+      type_checker_report_undefined_symbol(checker, declaration->location,
+                                           func_decl->return_type, "type");
+      return 0;
+    }
+    if (type_checker_reject_no_runtime_repr(checker, declaration->location,
+                                            return_type)) {
+      return 0;
+    }
+  } else {
+    return_type = checker->builtin_void;
+  }
+  if (func_decl->is_kernel && return_type->kind != TYPE_VOID) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "GPU kernel '%s' must return void (remove '-> %s')", func_decl->name,
+        return_type->name ? return_type->name : "non-void");
+    return 0;
+  }
+  return return_type;
+}
+
+static int type_checker_bind_function_symbol(
+    TypeChecker *checker, ASTNode *declaration,
+    FunctionDeclaration *func_decl, Symbol *func_symbol,
+    int *is_resolving_forward, Symbol **existing_before_out,
+    int *handled) {
+  *handled = 1;
+  Symbol *existing_before = symbol_table_lookup_current_scope(
+      checker->symbol_table, func_decl->name);
+  *is_resolving_forward =
+      (existing_before && existing_before->kind == SYMBOL_FUNCTION &&
+       existing_before->is_forward_declaration);
+
+  if (existing_before && existing_before->kind != SYMBOL_FUNCTION) {
+    type_checker_report_duplicate_declaration(checker, declaration->location,
+                                              func_decl->name);
+    symbol_destroy(func_symbol);
+    return 0;
+  }
+
+  if (existing_before && existing_before->kind == SYMBOL_FUNCTION) {
+    if (existing_before->is_extern != func_decl->is_extern) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Function '%s' redeclared with conflicting extern/non-extern "
+          "linkage",
+          func_decl->name);
+      symbol_destroy(func_symbol);
+      return 0;
+    }
+    if ((existing_before->is_extern || func_decl->is_extern) &&
+        !type_checker_link_name_matches_symbol(
+            existing_before, func_decl->name, func_decl->is_extern,
+            func_decl->link_name)) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Function '%s' redeclared with conflicting link name",
+          func_decl->name);
+      symbol_destroy(func_symbol);
+      return 0;
+    }
+  }
+
+  // Forward declaration: no body
+  if (!func_decl->body) {
+    func_symbol->is_initialized = 0;
+    if (!symbol_table_declare_forward(checker->symbol_table, func_symbol)) {
+      type_checker_set_error_at_location(
+          checker, declaration->location,
+          "Invalid or conflicting forward declaration for function '%s'",
+          func_decl->name);
+      symbol_destroy(func_symbol);
+      return 0;
+    }
+    if (*is_resolving_forward) {
+      symbol_destroy(func_symbol);
+    }
+    return 1;
+  }
+
+  func_symbol->is_initialized = 1;
+  if (!symbol_table_resolve_forward_declaration(checker->symbol_table,
+                                                func_symbol)) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Function definition for '%s' does not match existing declaration",
+        func_decl->name);
+    symbol_destroy(func_symbol);
+    return 0;
+  }
+  *existing_before_out = existing_before;
+  *handled = 0;
+  return 1;
+}
+
+static int type_checker_process_function(TypeChecker *checker,
+                                   ASTNode *declaration,
+                                   int *handled) {
+  *handled = 1;
+  switch (declaration->type) {
   case AST_FUNCTION_DECLARATION: {
     FunctionDeclaration *func_decl = (FunctionDeclaration *)declaration->data;
     if (!func_decl || !func_decl->name) {
@@ -1480,232 +1953,28 @@ int type_checker_process_declaration(TypeChecker *checker,
       return 0;
     }
 
-    // Resolve return type
-    Type *return_type = NULL;
-    if (func_decl->return_type_count > 0 &&
-        !type_checker_ensure_multi_return_type(checker, func_decl,
-                                               declaration->location)) {
-      /* Only speak in generalities when nothing more specific was said: the
-       * builder names the offending return value when it can. */
-      if (!checker->has_error) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Could not build the multiple return type for function '%s'",
-            func_decl->name);
-      }
-      return 0;
-    }
-    if (func_decl->return_type) {
-      return_type =
-          type_checker_get_type_by_name(checker, func_decl->return_type);
-      if (!return_type) {
-        type_checker_report_undefined_symbol(checker, declaration->location,
-                                             func_decl->return_type, "type");
-        return 0;
-      }
-      if (type_checker_reject_no_runtime_repr(checker, declaration->location,
-                                              return_type)) {
-        return 0;
-      }
-    } else {
-      return_type = checker->builtin_void;
-    }
-    if (func_decl->is_kernel && return_type->kind != TYPE_VOID) {
-      type_checker_set_error_at_location(
-          checker, declaration->location,
-          "GPU kernel '%s' must return void (remove '-> %s')", func_decl->name,
-          return_type->name ? return_type->name : "non-void");
+    Type *return_type =
+        type_checker_function_return_type(checker, declaration, func_decl);
+    if (!return_type) {
       return 0;
     }
 
-    // Resolve parameter types and check for duplicate parameter names
-    Type **param_types = NULL;
-    if (func_decl->parameter_count > 0) {
-      param_types = malloc(func_decl->parameter_count * sizeof(Type *));
-      if (!param_types) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Memory allocation failed for function parameters");
-        return 0;
-      }
-
-      // Check for duplicate parameter names
-      for (size_t i = 0; i < func_decl->parameter_count; i++) {
-        for (size_t j = i + 1; j < func_decl->parameter_count; j++) {
-          if (strcmp(func_decl->parameter_names[i],
-                     func_decl->parameter_names[j]) == 0) {
-            type_checker_report_duplicate_declaration(
-                checker, declaration->location, func_decl->parameter_names[i]);
-            free(param_types);
-            return 0;
-          }
-        }
-      }
-
-      for (size_t i = 0; i < func_decl->parameter_count; i++) {
-        param_types[i] = type_checker_get_type_by_name(
-            checker, func_decl->parameter_types[i]);
-        if (!param_types[i]) {
-          type_checker_report_undefined_symbol(checker, declaration->location,
-                                               func_decl->parameter_types[i],
-                                               "type");
-          free(param_types);
-          return 0;
-        }
-        if (type_checker_reject_no_runtime_repr(checker, declaration->location,
-                                                param_types[i])) {
-          free(param_types);
-          return 0;
-        }
-        if (func_decl->is_kernel &&
-            !gpu_kernel_parameter_type(param_types[i])) {
-          type_checker_set_error_at_location(
-              checker, declaration->location,
-              "GPU kernel '%s' parameter '%s' has unsupported ABI type '%s'; "
-              "use a scalar, a pointer, or a record built from those",
-              func_decl->name, func_decl->parameter_names[i],
-              param_types[i]->name ? param_types[i]->name : "unknown");
-          free(param_types);
-          return 0;
-        }
-      }
-    }
-
-    // Copy parameter names so function symbols own their metadata.
-    char **param_names_copy = NULL;
-    if (func_decl->parameter_count > 0) {
-      param_names_copy = malloc(func_decl->parameter_count * sizeof(char *));
-      if (!param_names_copy) {
-        if (param_types)
-          free(param_types);
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Memory allocation failed for function parameter names");
-        return 0;
-      }
-      for (size_t i = 0; i < func_decl->parameter_count; i++) {
-        param_names_copy[i] = strdup(func_decl->parameter_names[i]);
-        if (!param_names_copy[i]) {
-          for (size_t j = 0; j < i; j++) {
-            free(param_names_copy[j]);
-          }
-          free(param_names_copy);
-          if (param_types)
-            free(param_types);
-          type_checker_set_error_at_location(
-              checker, declaration->location,
-              "Memory allocation failed for parameter name copy");
-          return 0;
-        }
-      }
-    }
-
-    // Create function symbol
-    Symbol *func_symbol =
-        symbol_create(func_decl->name, SYMBOL_FUNCTION, return_type);
+    Symbol *func_symbol = type_checker_build_function_symbol(
+        checker, declaration, func_decl, return_type);
     if (!func_symbol) {
-      type_checker_set_error_at_location(
-          checker, declaration->location,
-          "Memory allocation failed for function symbol");
-      if (param_names_copy) {
-        for (size_t i = 0; i < func_decl->parameter_count; i++) {
-          free(param_names_copy[i]);
-        }
-        free(param_names_copy);
-      }
-      if (param_types)
-        free(param_types);
       return 0;
     }
 
-    // Set function-specific data
-    func_symbol->data.function.parameter_count = func_decl->parameter_count;
-    func_symbol->data.function.parameter_names = param_names_copy;
-    func_symbol->data.function.parameter_types = param_types;
-    func_symbol->data.function.return_type = return_type;
-    func_symbol->is_kernel = func_decl->is_kernel;
-    func_symbol->kernel_block[0] = func_decl->kernel_block[0];
-    func_symbol->kernel_block[1] = func_decl->kernel_block[1];
-    func_symbol->kernel_block[2] = func_decl->kernel_block[2];
-    func_symbol->kernel_threads_per_item = func_decl->kernel_threads_per_item;
-    func_symbol->is_extern = func_decl->is_extern;
-    if (func_decl->is_extern) {
-      const char *effective_link_name = type_checker_decl_link_name(
-          func_decl->name, func_decl->is_extern, func_decl->link_name);
-      func_symbol->link_name =
-          effective_link_name ? strdup(effective_link_name) : NULL;
-      if (!func_symbol->link_name) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Failed to allocate link name for extern function '%s'",
-            func_decl->name);
-        symbol_destroy(func_symbol);
-        return 0;
+    int is_resolving_forward = 0;
+    Symbol *existing_before = NULL;
+    {
+      int bound = 0;
+      int result = type_checker_bind_function_symbol(
+          checker, declaration, func_decl, func_symbol,
+          &is_resolving_forward, &existing_before, &bound);
+      if (bound) {
+        return result;
       }
-    }
-
-    Symbol *existing_before = symbol_table_lookup_current_scope(
-        checker->symbol_table, func_decl->name);
-    int is_resolving_forward =
-        (existing_before && existing_before->kind == SYMBOL_FUNCTION &&
-         existing_before->is_forward_declaration);
-
-    if (existing_before && existing_before->kind != SYMBOL_FUNCTION) {
-      type_checker_report_duplicate_declaration(checker, declaration->location,
-                                                func_decl->name);
-      symbol_destroy(func_symbol);
-      return 0;
-    }
-
-    if (existing_before && existing_before->kind == SYMBOL_FUNCTION) {
-      if (existing_before->is_extern != func_decl->is_extern) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Function '%s' redeclared with conflicting extern/non-extern "
-            "linkage",
-            func_decl->name);
-        symbol_destroy(func_symbol);
-        return 0;
-      }
-      if ((existing_before->is_extern || func_decl->is_extern) &&
-          !type_checker_link_name_matches_symbol(
-              existing_before, func_decl->name, func_decl->is_extern,
-              func_decl->link_name)) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Function '%s' redeclared with conflicting link name",
-            func_decl->name);
-        symbol_destroy(func_symbol);
-        return 0;
-      }
-    }
-
-    // Forward declaration: no body
-    if (!func_decl->body) {
-      func_symbol->is_initialized = 0;
-      if (!symbol_table_declare_forward(checker->symbol_table, func_symbol)) {
-        type_checker_set_error_at_location(
-            checker, declaration->location,
-            "Invalid or conflicting forward declaration for function '%s'",
-            func_decl->name);
-        symbol_destroy(func_symbol);
-        return 0;
-      }
-      if (is_resolving_forward) {
-        symbol_destroy(func_symbol);
-      }
-      return 1;
-    }
-
-    func_symbol->is_initialized = 1;
-    if (!symbol_table_resolve_forward_declaration(checker->symbol_table,
-                                                  func_symbol)) {
-      type_checker_set_error_at_location(
-          checker, declaration->location,
-          "Function definition for '%s' does not match existing declaration",
-          func_decl->name);
-      symbol_destroy(func_symbol);
-      return 0;
     }
 
     if (is_resolving_forward) {
@@ -1733,100 +2002,8 @@ int type_checker_process_declaration(TypeChecker *checker,
       return 0;
     }
 
-    // Add parameters to the new scope
-    Type **active_param_types =
-        checker->current_function->data.function.parameter_types;
-    if (func_decl->parameter_count > 0) {
-      for (size_t i = 0; i < func_decl->parameter_count; i++) {
-        Symbol *param_symbol =
-            symbol_create(func_decl->parameter_names[i], SYMBOL_PARAMETER,
-                          active_param_types ? active_param_types[i] : NULL);
-        if (!param_symbol) {
-          type_checker_set_error_at_location(
-              checker, declaration->location,
-              "Failed to create parameter symbol");
-          symbol_table_exit_scope(checker->symbol_table);
-          return 0;
-        }
-        if (func_decl->is_kernel && active_param_types &&
-            active_param_types[i] &&
-            active_param_types[i]->kind == TYPE_POINTER) {
-          param_symbol->address_space = MTLC_ADDRESS_SPACE_GLOBAL;
-        }
-        param_symbol->decl_line = declaration->location.line;
-        param_symbol->decl_column = declaration->location.column;
-        param_symbol->decl_file = declaration->location.filename;
-        if (!symbol_table_declare(checker->symbol_table, param_symbol)) {
-          type_checker_report_duplicate_declaration(
-              checker, declaration->location, func_decl->parameter_names[i]);
-          symbol_destroy(param_symbol);
-          type_checker_init_tracker_reset(checker);
-          symbol_table_exit_scope(checker->symbol_table);
-          return 0;
-        }
-        if (!type_checker_init_tracker_declare(
-                checker, func_decl->parameter_names[i], 1)) {
-          type_checker_set_error_at_location(
-              checker, declaration->location,
-              "Out of memory while tracking parameter initialization");
-          type_checker_init_tracker_reset(checker);
-          symbol_table_exit_scope(checker->symbol_table);
-          return 0;
-        }
-        Type *param_type = active_param_types ? active_param_types[i] : NULL;
-        if (param_type && param_type->kind == TYPE_POINTER) {
-          if (!type_checker_buffer_extent_declare(
-                  checker, func_decl->parameter_names[i], -1, -1)) {
-            type_checker_set_error_at_location(
-                checker, declaration->location,
-                "Out of memory while tracking pointer parameter extent");
-            type_checker_init_tracker_reset(checker);
-            symbol_table_exit_scope(checker->symbol_table);
-            return 0;
-          }
-        }
-      }
-    }
-
-    // Process the function body
-    if (func_decl->body &&
-        !type_checker_check_statement(checker, func_decl->body)) {
-      // Error already reported
-      type_checker_init_tracker_reset(checker);
-      symbol_table_exit_scope(checker->symbol_table);
-      return 0;
-    }
-
-    // Memory diagnostics (use-after-free, dangling stack addresses,
-    // constant out-of-bounds accesses, leaks). The scope is still live, so
-    // `const` locals resolve for constant-index evaluation.
-    if (func_decl->body &&
-        !type_checker_check_function_memory(checker, declaration)) {
-      type_checker_init_tracker_reset(checker);
-      symbol_table_exit_scope(checker->symbol_table);
-      return 0;
-    }
-
-    // A function with a non-void return type must contain at least one
-    // return statement. This is a simple body-walk (a missing return on
-    // some paths is not yet diagnosed); a function with no return at all
-    // would otherwise compile and return garbage from RAX/XMM0. `main` is
-    // exempt: the entry point falls through to an implicit `return 0`.
-    /* A `@naked` function has no frame and no compiled epilogue: its asm block
-     * loads the return register and returns itself, so there is no `return`
-     * statement to find and no garbage to warn about. */
-    if (func_decl->body && return_type &&
-        return_type->kind != TYPE_VOID && !func_decl->is_naked &&
-        strcmp(func_decl->name, "main") != 0 &&
-        !type_checker_ast_contains_node_type(func_decl->body,
-                                             AST_RETURN_STATEMENT)) {
-      type_checker_set_error_at_location(
-          checker, declaration->location,
-          "Function '%s' has non-void return type '%s' but contains no return "
-          "statement",
-          func_decl->name, return_type->name);
-      type_checker_init_tracker_reset(checker);
-      symbol_table_exit_scope(checker->symbol_table);
+    if (!type_checker_check_function_body(checker, declaration, func_decl,
+                                         func_symbol, return_type)) {
       return 0;
     }
 
@@ -1843,6 +2020,18 @@ int type_checker_process_declaration(TypeChecker *checker,
     return 1;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int type_checker_process_member(TypeChecker *checker,
+                                   ASTNode *declaration,
+                                   int *handled) {
+  *handled = 1;
+  switch (declaration->type) {
   case AST_METHOD_DECLARATION:
     // Method declarations are handled within struct processing
     // This case shouldn't normally be reached during standalone processing
@@ -1852,6 +2041,280 @@ int type_checker_process_declaration(TypeChecker *checker,
     // Top-level inline assembly is permitted.
     return 1;
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int type_checker_check_multi_assignment(
+    TypeChecker *checker, ASTNode *declaration,
+    Assignment *assignment, int *handled) {
+  *handled = 1;
+  if (assignment->target_count > 0) {
+    Type *value_type = type_checker_infer_type(checker, assignment->value);
+    if (!value_type || value_type->kind != TYPE_STRUCT ||
+        value_type->field_count != assignment->target_count) {
+      type_checker_set_error_at_location(
+          checker, assignment->value->location,
+          "Multiple assignment needs a matching multiple return value");
+      return 0;
+    }
+
+    for (size_t i = 0; i < assignment->target_count; i++) {
+      ASTNode *target = assignment->targets[i];
+      if (!target || target->type != AST_IDENTIFIER) {
+        type_checker_set_error_at_location(
+            checker, target ? target->location : declaration->location,
+            "Multiple return assignment targets must be identifiers");
+        return 0;
+      }
+      Identifier *identifier = (Identifier *)target->data;
+      Symbol *symbol = identifier && identifier->name
+                           ? type_checker_resolve_identifier(checker,
+                                                             identifier)
+                           : NULL;
+      if (!symbol || (symbol->kind != SYMBOL_VARIABLE &&
+                      symbol->kind != SYMBOL_PARAMETER)) {
+        type_checker_report_undefined_symbol(
+            checker, target->location,
+            identifier && identifier->name ? identifier->name : "<invalid>",
+            "variable");
+        return 0;
+      }
+      if (symbol->is_immutable) {
+        type_checker_set_error_at_location(
+            checker, target->location, "'%s' is a constant and cannot be assigned to",
+            identifier->name);
+        return 0;
+      }
+      Type *field_type = value_type->field_types[i];
+      if (!type_checker_is_assignable(checker, symbol->type, field_type)) {
+        type_checker_report_assign_mismatch(checker, NULL, target->location,
+                                            symbol->type, field_type);
+        return 0;
+      }
+      if (checker->current_function && symbol->scope &&
+          symbol->scope->type != SCOPE_GLOBAL) {
+        type_checker_init_tracker_set_initialized(checker, identifier->name);
+      }
+    }
+    return 1;
+  }
+  *handled = 0;
+  return 1;
+}
+
+static int type_checker_check_member_assignment(
+    TypeChecker *checker, Assignment *assignment,
+    MemberAccess *member) {
+  if (!member || !member->object || !member->member) {
+    type_checker_set_error_at_location(checker,
+                                       assignment->target->location,
+                                       "Invalid field assignment target");
+    return 0;
+  }
+
+  Type *object_type = type_checker_infer_type(checker, member->object);
+  if (!object_type) {
+    return 0;
+  }
+  /* Assigning through a pointer-to-struct auto-dereferences (like `->`). */
+  if (object_type->kind == TYPE_POINTER && object_type->base_type) {
+    object_type = object_type->base_type;
+  }
+
+  if (object_type->kind != TYPE_STRUCT &&
+      object_type->kind != TYPE_STRING) {
+    char error_msg[512];
+    snprintf(error_msg, sizeof(error_msg),
+             "Cannot assign field '%s' on non-struct/string type '%s'",
+             member->member, object_type->name);
+    type_checker_set_error_at_location(
+        checker, assignment->target->location, error_msg);
+    return 0;
+  }
+
+  Type *field_type = type_get_field_type(object_type, member->member);
+  if (!field_type) {
+    char error_msg[512];
+    snprintf(error_msg, sizeof(error_msg),
+             "Field '%s' not found in type '%s'", member->member,
+             object_type->name);
+    type_checker_set_error_at_location(
+        checker, assignment->target->location, error_msg);
+    return 0;
+  }
+
+  checker->aggregate_target_type = field_type;
+  Type *value_type = type_checker_infer_type(checker, assignment->value);
+  checker->aggregate_target_type = NULL;
+  if (!value_type) {
+    if (!checker->has_error) {
+      type_checker_set_error_at_location(
+          checker, assignment->value->location,
+          "Cannot infer type of assignment value");
+    }
+    return 0;
+  }
+
+  if (!(type_checker_type_accepts_null_pointer(field_type) &&
+        type_checker_is_null_pointer_constant(assignment->value)) &&
+      !type_checker_is_assignable_from(checker, field_type, value_type,
+                                       assignment->value)) {
+    type_checker_report_assign_mismatch(checker, assignment->value,
+                                        assignment->value->location,
+                                        field_type, value_type);
+    return 0;
+  }
+
+  return 1;
+}
+
+static int type_checker_check_target_assignment(
+    TypeChecker *checker, ASTNode *declaration,
+    Assignment *assignment, int *handled) {
+  *handled = 1;
+  // Complex assignment target: obj.field = value or arr[i] = value
+  if (assignment->target) {
+    if (assignment->target->type == AST_MEMBER_ACCESS) {
+      MemberAccess *member = (MemberAccess *)assignment->target->data;
+      return type_checker_check_member_assignment(checker, assignment,
+                                                  member);
+    } else if (assignment->target->type == AST_INDEX_EXPRESSION) {
+      ArrayIndexExpression *target_index =
+          (ArrayIndexExpression *)assignment->target->data;
+      if (!target_index || !target_index->array || !target_index->index) {
+        type_checker_set_error_at_location(checker,
+                                           assignment->target->location,
+                                           "Invalid array assignment target");
+        return 0;
+      }
+
+      Type *target_array_type =
+          type_checker_infer_type(checker, target_index->array);
+      if (!target_array_type) {
+        return 0;
+      }
+      /* `s[i]` reads a character; it is not a place to put one. A string
+       * is a borrowed view, and the bytes it points at are as likely to be
+       * a literal in read-only memory as a buffer the program owns. Reach
+       * the bytes through `s.chars` when they are genuinely writable. */
+      if (target_array_type->kind == TYPE_STRING) {
+        type_checker_set_error_at_location(
+            checker, assignment->target->location,
+            "Cannot assign through a string index: a string is a borrowed "
+            "view and its bytes may be read-only");
+        if (checker->error_reporter) {
+          error_reporter_set_last_label(
+              checker->error_reporter,
+              "write through 's.chars' when the bytes are yours to change");
+        }
+        return 0;
+      }
+      if (target_array_type->kind == TYPE_ARRAY) {
+        long long constant_index = 0;
+        if (type_checker_eval_integer_constant(target_index->index,
+                                               &constant_index)) {
+          if (constant_index < 0 ||
+              (unsigned long long)constant_index >=
+                  (unsigned long long)target_array_type->array_size) {
+            type_checker_set_error_at_location(
+                checker, target_index->index->location,
+                "Array index %lld is out of bounds for '%s' (size %zu)",
+                constant_index,
+                target_array_type->name ? target_array_type->name : "array",
+                target_array_type->array_size);
+            return 0;
+          }
+        }
+      }
+
+      Type *element_type =
+          type_checker_infer_type(checker, assignment->target);
+      if (!element_type) {
+        return 0;
+      }
+
+      checker->aggregate_target_type = element_type;
+      Type *value_type = type_checker_infer_type(checker, assignment->value);
+      checker->aggregate_target_type = NULL;
+      if (!value_type) {
+        if (!checker->has_error) {
+          type_checker_set_error_at_location(
+              checker, assignment->value->location,
+              "Cannot infer type of assignment value");
+        }
+        return 0;
+      }
+
+      if (!(type_checker_type_accepts_null_pointer(element_type) &&
+            type_checker_is_null_pointer_constant(assignment->value)) &&
+          !type_checker_is_assignable_from(checker, element_type, value_type,
+                                           assignment->value)) {
+        type_checker_report_assign_mismatch(checker, assignment->value,
+                                            assignment->value->location,
+                                            element_type, value_type);
+        return 0;
+      }
+
+      return 1;
+    } else if (assignment->target->type == AST_UNARY_EXPRESSION) {
+      UnaryExpression *target_unary =
+          (UnaryExpression *)assignment->target->data;
+      if (!target_unary || !target_unary->operator ||
+          strcmp(target_unary->operator, "*") != 0) {
+        type_checker_set_error_at_location(checker,
+                                           assignment->target->location,
+                                           "Invalid assignment target");
+        return 0;
+      }
+
+      Type *target_type =
+          type_checker_infer_type(checker, assignment->target);
+      if (!target_type) {
+        return 0;
+      }
+
+      checker->aggregate_target_type = target_type;
+      Type *value_type = type_checker_infer_type(checker, assignment->value);
+      checker->aggregate_target_type = NULL;
+      if (!value_type) {
+        if (!checker->has_error) {
+          type_checker_set_error_at_location(
+              checker, assignment->value->location,
+              "Cannot infer type of assignment value");
+        }
+        return 0;
+      }
+
+      if (!(type_checker_type_accepts_null_pointer(target_type) &&
+            type_checker_is_null_pointer_constant(assignment->value)) &&
+          !type_checker_is_assignable_from(checker, target_type, value_type,
+                                           assignment->value)) {
+        type_checker_report_assign_mismatch(checker, assignment->value,
+                                            assignment->value->location,
+                                            target_type, value_type);
+        return 0;
+      }
+
+      return 1;
+    }
+
+    type_checker_set_error_at_location(checker, assignment->target->location,
+                                       "Invalid assignment target");
+    return 0;
+  }
+  *handled = 0;
+  return 1;
+}
+
+static int type_checker_process_assignment(TypeChecker *checker,
+                                   ASTNode *declaration,
+                                   int *handled) {
+  *handled = 1;
+  switch (declaration->type) {
   case AST_ASSIGNMENT: {
     Assignment *assignment = (Assignment *)declaration->data;
     if (!assignment || !assignment->value) {
@@ -1860,245 +2323,22 @@ int type_checker_process_declaration(TypeChecker *checker,
       return 0;
     }
 
-    if (assignment->target_count > 0) {
-      Type *value_type = type_checker_infer_type(checker, assignment->value);
-      if (!value_type || value_type->kind != TYPE_STRUCT ||
-          value_type->field_count != assignment->target_count) {
-        type_checker_set_error_at_location(
-            checker, assignment->value->location,
-            "Multiple assignment needs a matching multiple return value");
-        return 0;
+    {
+      int multi_handled = 0;
+      int checked = type_checker_check_multi_assignment(
+          checker, declaration, assignment, &multi_handled);
+      if (multi_handled) {
+        return checked;
       }
-
-      for (size_t i = 0; i < assignment->target_count; i++) {
-        ASTNode *target = assignment->targets[i];
-        if (!target || target->type != AST_IDENTIFIER) {
-          type_checker_set_error_at_location(
-              checker, target ? target->location : declaration->location,
-              "Multiple return assignment targets must be identifiers");
-          return 0;
-        }
-        Identifier *identifier = (Identifier *)target->data;
-        Symbol *symbol = identifier && identifier->name
-                             ? type_checker_resolve_identifier(checker,
-                                                               identifier)
-                             : NULL;
-        if (!symbol || (symbol->kind != SYMBOL_VARIABLE &&
-                        symbol->kind != SYMBOL_PARAMETER)) {
-          type_checker_report_undefined_symbol(
-              checker, target->location,
-              identifier && identifier->name ? identifier->name : "<invalid>",
-              "variable");
-          return 0;
-        }
-        if (symbol->is_immutable) {
-          type_checker_set_error_at_location(
-              checker, target->location, "'%s' is a constant and cannot be assigned to",
-              identifier->name);
-          return 0;
-        }
-        Type *field_type = value_type->field_types[i];
-        if (!type_checker_is_assignable(checker, symbol->type, field_type)) {
-          type_checker_report_assign_mismatch(checker, NULL, target->location,
-                                              symbol->type, field_type);
-          return 0;
-        }
-        if (checker->current_function && symbol->scope &&
-            symbol->scope->type != SCOPE_GLOBAL) {
-          type_checker_init_tracker_set_initialized(checker, identifier->name);
-        }
-      }
-      return 1;
     }
 
-    // Complex assignment target: obj.field = value or arr[i] = value
-    if (assignment->target) {
-      if (assignment->target->type == AST_MEMBER_ACCESS) {
-        MemberAccess *member = (MemberAccess *)assignment->target->data;
-        if (!member || !member->object || !member->member) {
-          type_checker_set_error_at_location(checker,
-                                             assignment->target->location,
-                                             "Invalid field assignment target");
-          return 0;
-        }
-
-        Type *object_type = type_checker_infer_type(checker, member->object);
-        if (!object_type) {
-          return 0;
-        }
-        /* Assigning through a pointer-to-struct auto-dereferences (like `->`). */
-        if (object_type->kind == TYPE_POINTER && object_type->base_type) {
-          object_type = object_type->base_type;
-        }
-
-        if (object_type->kind != TYPE_STRUCT &&
-            object_type->kind != TYPE_STRING) {
-          char error_msg[512];
-          snprintf(error_msg, sizeof(error_msg),
-                   "Cannot assign field '%s' on non-struct/string type '%s'",
-                   member->member, object_type->name);
-          type_checker_set_error_at_location(
-              checker, assignment->target->location, error_msg);
-          return 0;
-        }
-
-        Type *field_type = type_get_field_type(object_type, member->member);
-        if (!field_type) {
-          char error_msg[512];
-          snprintf(error_msg, sizeof(error_msg),
-                   "Field '%s' not found in type '%s'", member->member,
-                   object_type->name);
-          type_checker_set_error_at_location(
-              checker, assignment->target->location, error_msg);
-          return 0;
-        }
-
-        checker->aggregate_target_type = field_type;
-        Type *value_type = type_checker_infer_type(checker, assignment->value);
-        checker->aggregate_target_type = NULL;
-        if (!value_type) {
-          if (!checker->has_error) {
-            type_checker_set_error_at_location(
-                checker, assignment->value->location,
-                "Cannot infer type of assignment value");
-          }
-          return 0;
-        }
-
-        if (!(type_checker_type_accepts_null_pointer(field_type) &&
-              type_checker_is_null_pointer_constant(assignment->value)) &&
-            !type_checker_is_assignable_from(checker, field_type, value_type,
-                                             assignment->value)) {
-          type_checker_report_assign_mismatch(checker, assignment->value,
-                                              assignment->value->location,
-                                              field_type, value_type);
-          return 0;
-        }
-
-        return 1;
-      } else if (assignment->target->type == AST_INDEX_EXPRESSION) {
-        ArrayIndexExpression *target_index =
-            (ArrayIndexExpression *)assignment->target->data;
-        if (!target_index || !target_index->array || !target_index->index) {
-          type_checker_set_error_at_location(checker,
-                                             assignment->target->location,
-                                             "Invalid array assignment target");
-          return 0;
-        }
-
-        Type *target_array_type =
-            type_checker_infer_type(checker, target_index->array);
-        if (!target_array_type) {
-          return 0;
-        }
-        /* `s[i]` reads a character; it is not a place to put one. A string
-         * is a borrowed view, and the bytes it points at are as likely to be
-         * a literal in read-only memory as a buffer the program owns. Reach
-         * the bytes through `s.chars` when they are genuinely writable. */
-        if (target_array_type->kind == TYPE_STRING) {
-          type_checker_set_error_at_location(
-              checker, assignment->target->location,
-              "Cannot assign through a string index: a string is a borrowed "
-              "view and its bytes may be read-only");
-          if (checker->error_reporter) {
-            error_reporter_set_last_label(
-                checker->error_reporter,
-                "write through 's.chars' when the bytes are yours to change");
-          }
-          return 0;
-        }
-        if (target_array_type->kind == TYPE_ARRAY) {
-          long long constant_index = 0;
-          if (type_checker_eval_integer_constant(target_index->index,
-                                                 &constant_index)) {
-            if (constant_index < 0 ||
-                (unsigned long long)constant_index >=
-                    (unsigned long long)target_array_type->array_size) {
-              type_checker_set_error_at_location(
-                  checker, target_index->index->location,
-                  "Array index %lld is out of bounds for '%s' (size %zu)",
-                  constant_index,
-                  target_array_type->name ? target_array_type->name : "array",
-                  target_array_type->array_size);
-              return 0;
-            }
-          }
-        }
-
-        Type *element_type =
-            type_checker_infer_type(checker, assignment->target);
-        if (!element_type) {
-          return 0;
-        }
-
-        checker->aggregate_target_type = element_type;
-        Type *value_type = type_checker_infer_type(checker, assignment->value);
-        checker->aggregate_target_type = NULL;
-        if (!value_type) {
-          if (!checker->has_error) {
-            type_checker_set_error_at_location(
-                checker, assignment->value->location,
-                "Cannot infer type of assignment value");
-          }
-          return 0;
-        }
-
-        if (!(type_checker_type_accepts_null_pointer(element_type) &&
-              type_checker_is_null_pointer_constant(assignment->value)) &&
-            !type_checker_is_assignable_from(checker, element_type, value_type,
-                                             assignment->value)) {
-          type_checker_report_assign_mismatch(checker, assignment->value,
-                                              assignment->value->location,
-                                              element_type, value_type);
-          return 0;
-        }
-
-        return 1;
-      } else if (assignment->target->type == AST_UNARY_EXPRESSION) {
-        UnaryExpression *target_unary =
-            (UnaryExpression *)assignment->target->data;
-        if (!target_unary || !target_unary->operator ||
-            strcmp(target_unary->operator, "*") != 0) {
-          type_checker_set_error_at_location(checker,
-                                             assignment->target->location,
-                                             "Invalid assignment target");
-          return 0;
-        }
-
-        Type *target_type =
-            type_checker_infer_type(checker, assignment->target);
-        if (!target_type) {
-          return 0;
-        }
-
-        checker->aggregate_target_type = target_type;
-        Type *value_type = type_checker_infer_type(checker, assignment->value);
-        checker->aggregate_target_type = NULL;
-        if (!value_type) {
-          if (!checker->has_error) {
-            type_checker_set_error_at_location(
-                checker, assignment->value->location,
-                "Cannot infer type of assignment value");
-          }
-          return 0;
-        }
-
-        if (!(type_checker_type_accepts_null_pointer(target_type) &&
-              type_checker_is_null_pointer_constant(assignment->value)) &&
-            !type_checker_is_assignable_from(checker, target_type, value_type,
-                                             assignment->value)) {
-          type_checker_report_assign_mismatch(checker, assignment->value,
-                                              assignment->value->location,
-                                              target_type, value_type);
-          return 0;
-        }
-
-        return 1;
+    {
+      int target_handled = 0;
+      int checked = type_checker_check_target_assignment(
+          checker, declaration, assignment, &target_handled);
+      if (target_handled) {
+        return checked;
       }
-
-      type_checker_set_error_at_location(checker, assignment->target->location,
-                                         "Invalid assignment target");
-      return 0;
     }
 
     // Simple variable assignment: name = value
@@ -2201,7 +2441,15 @@ int type_checker_process_declaration(TypeChecker *checker,
     return 1;
   }
 
-  default: {
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int type_checker_reject_file_scope(TypeChecker *checker,
+                                          ASTNode *declaration) {
     /* An expression or statement reached file scope, where only declarations
        live. Name what it is so the reader can see which line to move. */
     const char *shape = "statement";
@@ -2244,6 +2492,29 @@ int type_checker_process_declaration(TypeChecker *checker,
       error_reporter_set_last_label(checker->error_reporter,
                                     "this needs a function to run in");
     return 0;
+}
+
+int type_checker_process_declaration(TypeChecker *checker,
+                                     ASTNode *declaration) {
+  static int (*const PROCESSORS[])(TypeChecker *, ASTNode *, int *) = {
+      type_checker_process_deferred,
+      type_checker_process_variable,
+      type_checker_process_function,
+      type_checker_process_member,
+      type_checker_process_assignment};
+  size_t processor;
+
+  if (!checker || !declaration) {
+    return 0;
   }
+
+  for (processor = 0; processor < sizeof(PROCESSORS) / sizeof(PROCESSORS[0]);
+       processor++) {
+    int handled = 0;
+    int checked = PROCESSORS[processor](checker, declaration, &handled);
+    if (handled) {
+      return checked;
+    }
   }
+  return type_checker_reject_file_scope(checker, declaration);
 }
