@@ -3639,7 +3639,15 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
         !ii_fetch_int(machine, frame, &insn->arguments[4], &first)) {
       return 0;
     }
-    long long hit = n;
+    /* The kernel only moves the counter forward to where the scalar loop would
+     * have arrived, so with nothing to scan it must leave the counter where it
+     * started. Answering `n` unconditionally was right for the not-found case
+     * and wrong for an empty range: a negative length made this model hand back
+     * that negative number, the scalar loop then exited on the first test with
+     * it, and validation read a kernel that agrees with the source as a
+     * divergence. It quarantined simd_find on every counted search under
+     * --verify. */
+    long long hit = n > first ? n : first;
     for (long long i = first; i < n; i++) {
       long long av, bv;
       if (elem_kind == 0) {

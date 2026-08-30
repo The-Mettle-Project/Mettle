@@ -2435,6 +2435,14 @@ $cases = @(
      Args = @("--verify")
      OutputMustMatch = @("translation validation: OK")
      OutputMustNotMatch = @("MISCOMPILE") },
+  # The find kernel only moves the loop counter forward to where the scalar loop
+  # would have arrived, so an empty range has to leave it alone. The model
+  # answered the length unconditionally, and a negative one made it hand back
+  # that negative number: simd_find was quarantined on every counted search.
+  @{ Name = "verify_find_empty_range"; Path = "tests/verify_find_empty_range.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     OutputMustMatch = @("translation validation: OK")
+     OutputMustNotMatch = @("MISCOMPILE") },
   # Running the interpreter out of step fuel is not a fate the program chose.
   # The fuel report names only the function, so a message-text guard never saw
   # it: simd_fill turning a 262144-iteration zero loop into a bulk fill spends
