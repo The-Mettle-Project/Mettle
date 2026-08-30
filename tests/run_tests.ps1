@@ -13547,6 +13547,9 @@ $runFixtures = @(
      What = "a struct method body behaved wrong" },
   @{ Name = "unsigned_fold"; Path = "tests/codegen/unsigned_fold.mettle"
      What = "an unsigned operation folded with signed semantics" },
+  @{ Name = "unsigned_divide_temp_dividend"
+     Path = "tests/codegen/unsigned_divide_temp_dividend.mettle"
+     What = "a fused integer chain divided or shifted an unsigned value as signed" },
   @{ Name = "uint64_literals"; Path = "tests/codegen/uint64_literals.mettle"
      What = "a uint64 decimal literal was wrong" },
   @{ Name = "value_range"; Path = "tests/codegen/value_range.mettle"

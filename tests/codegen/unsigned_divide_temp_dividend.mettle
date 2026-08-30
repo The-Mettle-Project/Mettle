@@ -1,29 +1,56 @@
-// KNOWN BUG, not yet fixed: an unsigned divide whose dividend is a nested
-// expression is emitted as IDIV by the baseline emitter, so it answers the
-// signed quotient. `(a >> 59) / b` on uint64 gives -15 where the answer is 0.
-// The MIR backend is right; the fallback one is not, and -s forces it.
+// The baseline emitter fuses a producer/consumer pair of integer binaries into
+// one RAX chain, and the consumer's left operand is then the producer's result
+// sitting in RAX. For a divide, a remainder or a right shift, whether that
+// value is signed decides DIV vs IDIV and SHR vs SAR. The fusion asked the
+// producer's baked value_type, which a plain numeric binary does not carry at
+// all, so every fused pair answered "signed" and `(a >> 59) / b` on uint64 gave
+// the signed quotient. The shift cases below answered right anyway, and are
+// here because they read the same variable one call away.
 //
-// The IR carries is_unsigned on the binary, set at lowering from the operand
-// types. Both operands come back untyped here: a local identifier is not in
-// the symbol table that stage can see, and a nested binary has no home to read
-// a type off. The dividend is a temp, so the backend cannot recover it either,
-// and the one path that works is the one where the dividend is a named local.
+// Nothing before this reached that path with an unsigned value, because the
+// same expression through a named local is a symbol whose declared type the
+// backend can read. The suite runs every fixture at -s --release and -s -O,
+// which force the fallback emitter, and that is where this one bites.
 import "std/io";
 
 @noinline fn u64(v: uint64) -> uint64 { return v; }
+@noinline fn u32(v: uint32) -> uint32 { return v; }
+@noinline fn u16(v: uint16) -> uint16 { return v; }
+@noinline fn i64(v: int64) -> int64 { return v; }
 
 fn main() -> int32 {
   var a: uint64 = u64(18446744073709551615);
   var b: uint64 = u64(18446744073709551614);
 
-  // The dividend through a local: right in every mode.
+  // The dividend through a named local, which always worked.
   var shifted: uint64 = a >> (uint64)59;
   if (shifted / b != (uint64)0) { return 1; }
   if (shifted % b != (uint64)31) { return 2; }
 
-  // The same value as an expression: wrong under -s.
+  // The same value as an expression, which is what fuses.
   if ((a >> (uint64)59) / b != (uint64)0) { return 3; }
   if ((a >> (uint64)59) % b != (uint64)31) { return 4; }
+  if ((a - (uint64)2) / b != (uint64)0) { return 5; }
+  if ((a & b) / b != (uint64)1) { return 6; }
+
+  // A right shift on a fused chain: SAR would drag the sign bit down.
+  var half: uint64 = u64(9223372036854775808);
+  if ((half + (uint64)0) >> (uint64)60 != (uint64)8) { return 7; }
+  if ((half | (uint64)1) >> (uint64)60 != (uint64)8) { return 8; }
+  if ((half * (uint64)1) >> (uint64)63 != (uint64)1) { return 9; }
+
+  // The narrower unsigned types take the same path.
+  var w: uint32 = u32(4294967295);
+  var wd: uint32 = u32(4294967294);
+  if ((w >> (uint32)27) / wd != (uint32)0) { return 10; }
+  if ((w >> (uint32)27) % wd != (uint32)31) { return 11; }
+  var h: uint16 = u16(65535);
+  if ((h >> (uint16)11) / u16(65534) != (uint16)0) { return 12; }
+
+  // Signed arithmetic on the same shapes keeps answering as signed.
+  var s: int64 = i64(-64);
+  if ((s + (int64)0) / i64(8) != (int64)(0 - 8)) { return 13; }
+  if ((s + (int64)0) >> (int64)3 != (int64)(0 - 8)) { return 14; }
 
   println("ok");
   return 0;

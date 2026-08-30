@@ -2535,8 +2535,15 @@ int code_generator_binary_try_emit_binary_expression_chain(
    * producer expression, decides DIV vs IDIV / SHR vs SAR. (div/mod/>> are
    * non-commutative, so the commutative branch above never lands here with one
    * of them.) */
-  /* Producer's result type baked onto the IR at lowering. */
+  /* A result type is baked onto the IR for only some shapes, and a plain
+   * numeric binary is not one of them: it carries no value_type at all, so
+   * asking for one answered "signed" for every fused pair and `(a >> 59) / b`
+   * on uint64 divided with IDIV. The producer's dest is a temp, which is why
+   * the operand-type fallback the sibling emitters use cannot rescue it here.
+   * is_unsigned is the same question already answered at lowering, off the
+   * operand types the promotion rules make the result type follow. */
   int consumer_lhs_unsigned =
+      producer->is_unsigned ||
       binary_type_is_unsigned_integer(producer->value_type);
 
   if (!code_generator_binary_emit_integer_binary_to_rax(generator, context,

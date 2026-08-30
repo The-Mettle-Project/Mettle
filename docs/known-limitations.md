@@ -193,25 +193,6 @@ happened.
 Unreachable-code analysis is block-local and conservative. Some dead paths in
 complex control flow are not diagnosed.
 
-## An unsigned divide whose dividend is an expression
-
-`(a >> 59) / b` on `uint64` answers the signed quotient under `-s`, which
-forces the fallback emitter. The same value through a named local is right
-everywhere:
-
-```mettle
-var shifted: uint64 = a >> (uint64)59;
-var right: uint64 = shifted / b;            // 0
-var wrong: uint64 = (a >> (uint64)59) / b;  // the signed quotient, under -s
-```
-
-Whether a divide is unsigned is recorded on the IR instruction at lowering and
-read off the operand types. Both operands come back untyped for this shape, and
-the dividend reaches the backend as a temp carrying no declared type to recover
-it from. The register-allocating backend gets it right, so an ordinary build is
-unaffected; `-s`, and any function that falls back for another reason, is not.
-`tests/codegen/unsigned_divide_temp_dividend.mettle` reproduces it.
-
 ## See also
 
 - [Memory safety](memory-safety.md)
