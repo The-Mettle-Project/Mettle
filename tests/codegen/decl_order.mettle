@@ -1,8 +1,10 @@
 // A function can call one declared below it, and a type gets the same
-// courtesy. Registration used to walk the file top to bottom, so an enum whose
-// payload named a struct written later was "payload of unknown type", and a
-// struct field naming a later struct was "Unknown type in struct field". Order
-// here is deliberately the reverse of the dependency order throughout.
+// courtesy, and so does a global. Registration used to walk the file top to
+// bottom, so an enum whose payload named a struct written later was "payload of
+// unknown type", a struct field naming a later struct was "Unknown type in
+// struct field", and a function reading a global written later was "Undefined
+// variable". Order here is deliberately the reverse of the dependency order
+// throughout.
 import "std/io";
 
 enum Shape { Wide(Span), Deep(Nest), Nothing }
@@ -20,6 +22,24 @@ struct Leaf { v: int64; }
 struct Ring { next: Ring*; v: int64; }
 
 struct Holder { shape: Shape; tag: Leaf; }
+
+// Every one of these reads a global declared below it.
+@noinline fn read_scalar() -> int64 { return LATER_SCALAR; }
+@noinline fn read_array(i: int64) -> int64 { return LATER_ARRAY[i]; }
+@noinline fn read_record() -> int64 { return LATER_RECORD.z + (int64)LATER_RECORD.tag; }
+@noinline fn read_string() -> int64 { return (int64)LATER_STRING.length; }
+@noinline fn bump() -> int64 { LATER_MUTABLE = LATER_MUTABLE + 1; return LATER_MUTABLE; }
+
+var LATER_SCALAR: int64 = 42;
+var LATER_ARRAY: int64[4] = [10, 20, 30, 40];
+var LATER_RECORD: Later2;
+var LATER_STRING: string = "twelve chars";
+var LATER_MUTABLE: int64;
+const LATER_CONST: int64 = 7;
+
+struct Later2 { z: int64; tag: int32; }
+
+@noinline fn read_const() -> int64 { return LATER_CONST; }
 
 @noinline fn opaque(v: int64) -> int64 { return v; }
 
@@ -58,6 +78,15 @@ fn main() -> int32 {
   held.shape = Wide(span);
   held.tag.v = opaque(7);
   if (score(held.shape) != 34 || held.tag.v != 7) { return 6; }
+
+  if (read_scalar() != 42) { return 7; }
+  if (read_array(opaque(2)) != 30) { return 8; }
+  LATER_RECORD.z = opaque(5);
+  LATER_RECORD.tag = (int32)opaque(6);
+  if (read_record() != 11) { return 9; }
+  if (read_string() != 12) { return 10; }
+  if (bump() != 1 || bump() != 2 || LATER_MUTABLE != 2) { return 11; }
+  if (read_const() != 7) { return 12; }
 
   return 0;
 }

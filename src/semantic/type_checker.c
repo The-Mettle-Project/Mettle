@@ -521,12 +521,24 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
     }
   }
 
-  // Pass 3: Process all declarations (type-check function bodies, etc.)
-  for (size_t i = 0; i < prog->declaration_count; i++) {
-    ASTNode *decl = prog->declarations[i];
-    if (decl && decl->type != AST_STRUCT_DECLARATION &&
-        decl->type != AST_ENUM_DECLARATION) {
+  /* Pass 3: process the remaining declarations, globals before function
+   * bodies. A function may call one declared below it, and a type may name one
+   * declared below it; a global was the odd one out, so a function reading a
+   * global written later in the file was "Undefined variable". Taking the
+   * globals first is what puts them on the same footing. Their initializers are
+   * compile-time constants, and any function or type they name is already
+   * registered by the passes above. */
+  for (int functions_now = 0; functions_now <= 1; functions_now++) {
+    for (size_t i = 0; i < prog->declaration_count; i++) {
+      ASTNode *decl = prog->declarations[i];
       ComptimeDeclScope expansion;
+      if (!decl || decl->type == AST_STRUCT_DECLARATION ||
+          decl->type == AST_ENUM_DECLARATION) {
+        continue;
+      }
+      if ((decl->type == AST_FUNCTION_DECLARATION) != functions_now) {
+        continue;
+      }
       type_checker_enter_expansion_decl(checker, decl, &expansion);
       if (!type_checker_process_declaration(checker, decl)) {
         ok = 0;
