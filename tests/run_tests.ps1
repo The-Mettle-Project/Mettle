@@ -13532,9 +13532,18 @@ foreach ($fixture in $runFixtures) {
   # combination disables the MIR backend, so it is the only thing exercising
   # the fallback emitter on this corpus -- which is where a promoted global
   # counter lost every write to it.
+  #
+  # opt and trace_opt are plain -O, which differs from --release in one way
+  # that matters: it KEEPS the runtime checks. Their branches split loop bodies
+  # and change what every pass sees. Until these two modes were added, nothing
+  # in the suite compiled at -O at all, and three miscompiles lived only there:
+  # pointer induction deleting a shift the stored value still read, a fused
+  # scaled-address load sign-extending a uint32, and a bignum losing carries.
   foreach ($mode in @(@{ Name = "debug"; Args = @() },
                       @{ Name = "release"; Args = @("--release") },
-                      @{ Name = "trace_release"; Args = @("-s", "--release") })) {
+                      @{ Name = "trace_release"; Args = @("-s", "--release") },
+                      @{ Name = "opt"; Args = @("-O") },
+                      @{ Name = "trace_opt"; Args = @("-s", "-O") })) {
     $caseName = "$($fixture.Name)_$($mode.Name)"
     try {
       $total++
