@@ -2122,19 +2122,8 @@ static int mir_gate_inline_kernel(const IRFunction *ir_function,
   return mir_trace_bail(ir_function, buf);
 }
 
-int mir_function_is_eligible(CodeGenerator *generator,
-                             IRFunction *ir_function) {
-  if (!generator || !ir_function) {
-    return 0;
-  }
-  g_mir_gate_fn_size = 0;
-  if (ir_explain_enabled()) {
-    for (size_t i = 0; i < ir_function->instruction_count; i++) {
-      if (ir_function->instructions[i].op != IR_OP_NOP) {
-        g_mir_gate_fn_size++;
-      }
-    }
-  }
+static int mir_gate_function_shape(CodeGenerator *generator,
+                                   const IRFunction *ir_function) {
   /* Kill switch for bisecting MIR vs legacy regressions. */
   {
     const char *off = mir_env_mir();
@@ -2205,6 +2194,11 @@ int mir_function_is_eligible(CodeGenerator *generator,
       }
     }
   }
+  return 1;
+}
+
+static int mir_gate_signature(CodeGenerator *generator,
+                              const IRFunction *ir_function) {
   /* Signature: <=4 GP params, GP-or-void return, no indirect return. */
   if (ir_function->parameter_count > MIR_MAX_PARAMS) {
     return mir_trace_bail(ir_function, "sig:params>max");
@@ -2260,7 +2254,132 @@ int mir_function_is_eligible(CodeGenerator *generator,
       !mir_type_is_indirect_aggregate(generator, ir_function->return_type_name)) {
     return mir_trace_bail(ir_function, "sig:return_nonscalar");
   }
+  return 1;
+}
 
+static void mir_scan_global_write(CodeGenerator *generator,
+                                  const IRFunction *ir_function,
+                                  const IRInstruction *in,
+                                  MirNameMap *defined, int *globals_ok,
+                                  int *has_global_write, int *gw_overflow,
+                                  const char **gw_names,
+                                  size_t *gw_count) {
+  /* An undefined SYMBOL written here is a global STORE. */
+  if (in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name) {
+    int found = 0;
+    for (size_t j = 0; j < defined->count; j++) {
+      if (strcmp(defined->items[j].name, in->dest.name) == 0) {
+        found = 1;
+        break;
+      }
+    }
+    /* STORE's dest is an ADDRESS operand: `*@g <- v` stores through a global
+     * aggregate's memory (never cached, so it is not a cache write). */
+    int agg_addr_dest =
+        !found && in->op == IR_OP_STORE &&
+        mir_name_is_global_aggregate(generator, ir_function, in->dest.name);
+    if (!found && !agg_addr_dest &&
+        !mir_name_is_global_scalar(generator, in->dest.name)) {
+      *globals_ok = 0;
+      return;
+    }
+    if (!found && !agg_addr_dest) {
+      *has_global_write = 1;
+      int seen = 0;
+      for (size_t j = 0; j < (*gw_count); j++) {
+        if (strcmp(gw_names[j], in->dest.name) == 0) {
+          seen = 1;
+          break;
+        }
+      }
+      if (!seen) {
+        if ((*gw_count) < 64) {
+          gw_names[(*gw_count)++] = in->dest.name;
+        } else {
+          *gw_overflow = 1;
+        }
+      }
+    }
+  }
+}
+
+static void mir_scan_global_operands(CodeGenerator *generator,
+                                     const IRFunction *ir_function,
+                                     MirNameMap *defined, int *globals_ok,
+                                     int *has_global_write, int *has_call,
+                                     int *gw_overflow) {
+  const char *gw_names[64];
+  size_t gw_count = 0;
+  for (size_t i = 0; i < ir_function->instruction_count && *globals_ok; i++) {
+    const IRInstruction *in = &ir_function->instructions[i];
+    if (in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) {
+      *has_call = 1;
+    }
+    mir_scan_global_write(generator, ir_function, in, defined, globals_ok,
+                          has_global_write, gw_overflow, gw_names,
+                          &gw_count);
+    /* An undefined SYMBOL read must be a global scalar. */
+    const IROperand *reads[2] = {&in->lhs, &in->rhs};
+    for (int k = 0; k < 2; k++) {
+      if (in->op == IR_OP_ADDRESS_OF && reads[k] == &in->lhs) {
+        continue; /* &symbol names an address target, not a by-value read. */
+      }
+      if (reads[k]->kind == IR_OPERAND_SYMBOL && reads[k]->name) {
+        int found = 0;
+        for (size_t j = 0; j < defined->count; j++) {
+          if (strcmp(defined->items[j].name, reads[k]->name) == 0) {
+            found = 1;
+            break;
+          }
+        }
+        if (!found && !mir_name_is_global_scalar(generator, reads[k]->name)) {
+          /* A global AGGREGATE name is usable in the positions where the
+           * lowering materializes its RIP-relative address instead of a
+           * cached value: a LOAD/PREFETCH address (`*@g [w]`), or the source
+           * of a whole-struct ASSIGN into a LEA-able home. */
+          int agg_ok =
+              mir_name_is_global_aggregate(generator, ir_function,
+                                           reads[k]->name) &&
+              (((in->op == IR_OP_LOAD || in->op == IR_OP_PREFETCH) &&
+                reads[k] == &in->lhs) ||
+               (in->op == IR_OP_ASSIGN && reads[k] == &in->lhs &&
+                mir_operand_struct_home_size(generator, ir_function,
+                                             &in->dest) > 0));
+          if (!agg_ok) {
+            *globals_ok = 0;
+            break;
+          }
+        }
+      }
+    }
+    /* Undefined SYMBOL call arguments are global reads too (e.g. f(g)). They
+     * must be scalar globals so the entry-load pass can cache them, or global
+     * aggregates a CALL copies from by address (mir_call_is_supported vets the
+     * parameter match; CALL_INDIRECT rejects aggregate args in its own gate). */
+    for (size_t a = 0; a < in->argument_count && *globals_ok; a++) {
+      const IROperand *arg = &in->arguments[a];
+      if (arg->kind != IR_OPERAND_SYMBOL || !arg->name) {
+        continue;
+      }
+      int found = 0;
+      for (size_t j = 0; j < defined->count; j++) {
+        if (strcmp(defined->items[j].name, arg->name) == 0) {
+          found = 1;
+          break;
+        }
+      }
+      if (!found && !mir_name_is_global_scalar(generator, arg->name) &&
+          !((in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) &&
+            mir_name_is_global_aggregate(generator, ir_function, arg->name))) {
+        *globals_ok = 0;
+        break;
+      }
+    }
+  }
+}
+
+static int mir_gate_globals(CodeGenerator *generator,
+                            IRFunction *ir_function) {
   /* Collect the names that are defined inside the function: parameters and
    * declared locals. Any SYMBOL operand naming something outside this set is a
    * global (or otherwise externally-defined) value. Those become vregs that no
@@ -2271,8 +2390,6 @@ int mir_function_is_eligible(CodeGenerator *generator,
   int globals_ok = 1;
   int has_global_write = 0;
   int has_call = 0;
-  const char *gw_names[64];
-  size_t gw_count = 0;
   int gw_overflow = 0;
   for (size_t i = 0; i < ir_function->parameter_count; i++) {
     if (ir_function->parameter_names[i]) {
@@ -2300,106 +2417,8 @@ int mir_function_is_eligible(CodeGenerator *generator,
    * it). Calls are fine: the lowering flushes written globals before each call
    * and reloads cached globals after, keeping memory authoritative across the
    * call boundary. */
-  for (size_t i = 0; i < ir_function->instruction_count && globals_ok; i++) {
-    const IRInstruction *in = &ir_function->instructions[i];
-    if (in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) {
-      has_call = 1;
-    }
-    /* An undefined SYMBOL written here is a global STORE. */
-    if (in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name) {
-      int found = 0;
-      for (size_t j = 0; j < defined.count; j++) {
-        if (strcmp(defined.items[j].name, in->dest.name) == 0) {
-          found = 1;
-          break;
-        }
-      }
-      /* STORE's dest is an ADDRESS operand: `*@g <- v` stores through a global
-       * aggregate's memory (never cached, so it is not a cache write). */
-      int agg_addr_dest =
-          !found && in->op == IR_OP_STORE &&
-          mir_name_is_global_aggregate(generator, ir_function, in->dest.name);
-      if (!found && !agg_addr_dest &&
-          !mir_name_is_global_scalar(generator, in->dest.name)) {
-        globals_ok = 0;
-        break;
-      }
-      if (!found && !agg_addr_dest) {
-        has_global_write = 1;
-        int seen = 0;
-        for (size_t j = 0; j < gw_count; j++) {
-          if (strcmp(gw_names[j], in->dest.name) == 0) {
-            seen = 1;
-            break;
-          }
-        }
-        if (!seen) {
-          if (gw_count < 64) {
-            gw_names[gw_count++] = in->dest.name;
-          } else {
-            gw_overflow = 1;
-          }
-        }
-      }
-    }
-    /* An undefined SYMBOL read must be a global scalar. */
-    const IROperand *reads[2] = {&in->lhs, &in->rhs};
-    for (int k = 0; k < 2; k++) {
-      if (in->op == IR_OP_ADDRESS_OF && reads[k] == &in->lhs) {
-        continue; /* &symbol names an address target, not a by-value read. */
-      }
-      if (reads[k]->kind == IR_OPERAND_SYMBOL && reads[k]->name) {
-        int found = 0;
-        for (size_t j = 0; j < defined.count; j++) {
-          if (strcmp(defined.items[j].name, reads[k]->name) == 0) {
-            found = 1;
-            break;
-          }
-        }
-        if (!found && !mir_name_is_global_scalar(generator, reads[k]->name)) {
-          /* A global AGGREGATE name is usable in the positions where the
-           * lowering materializes its RIP-relative address instead of a
-           * cached value: a LOAD/PREFETCH address (`*@g [w]`), or the source
-           * of a whole-struct ASSIGN into a LEA-able home. */
-          int agg_ok =
-              mir_name_is_global_aggregate(generator, ir_function,
-                                           reads[k]->name) &&
-              (((in->op == IR_OP_LOAD || in->op == IR_OP_PREFETCH) &&
-                reads[k] == &in->lhs) ||
-               (in->op == IR_OP_ASSIGN && reads[k] == &in->lhs &&
-                mir_operand_struct_home_size(generator, ir_function,
-                                             &in->dest) > 0));
-          if (!agg_ok) {
-            globals_ok = 0;
-            break;
-          }
-        }
-      }
-    }
-    /* Undefined SYMBOL call arguments are global reads too (e.g. f(g)). They
-     * must be scalar globals so the entry-load pass can cache them, or global
-     * aggregates a CALL copies from by address (mir_call_is_supported vets the
-     * parameter match; CALL_INDIRECT rejects aggregate args in its own gate). */
-    for (size_t a = 0; a < in->argument_count && globals_ok; a++) {
-      const IROperand *arg = &in->arguments[a];
-      if (arg->kind != IR_OPERAND_SYMBOL || !arg->name) {
-        continue;
-      }
-      int found = 0;
-      for (size_t j = 0; j < defined.count; j++) {
-        if (strcmp(defined.items[j].name, arg->name) == 0) {
-          found = 1;
-          break;
-        }
-      }
-      if (!found && !mir_name_is_global_scalar(generator, arg->name) &&
-          !((in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) &&
-            mir_name_is_global_aggregate(generator, ir_function, arg->name))) {
-        globals_ok = 0;
-        break;
-      }
-    }
-  }
+  mir_scan_global_operands(generator, ir_function, &defined, &globals_ok,
+                           &has_global_write, &has_call, &gw_overflow);
   mir_name_map_destroy(&defined);
   mir_function_destroy(&scratch_fn);
   if (!globals_ok) {
@@ -2415,83 +2434,122 @@ int mir_function_is_eligible(CodeGenerator *generator,
   if (has_global_write && has_call && gw_overflow) {
     return mir_trace_bail(ir_function, "global_write_with_call");
   }
+  return 1;
+}
+
+static int mir_gate_indirect_operands(CodeGenerator *generator,
+                                      const IRFunction *ir_function,
+                                      const IRInstruction *in) {
+  const IROperand *whole[3] = {&in->dest, &in->lhs, &in->rhs};
+  for (int k = 0; k < 3; k++) {
+    const IROperand *o = whole[k];
+    if (o->kind != IR_OPERAND_SYMBOL || !o->name ||
+        !mir_name_is_indirect_aggregate(generator, ir_function, o->name)) {
+      continue;
+    }
+    int allowed =
+        (in->op == IR_OP_DECLARE_LOCAL && o == &in->dest) ||
+        (in->op == IR_OP_ADDRESS_OF && o == &in->lhs) ||
+        /* RETURN copies from any supported indirect source: a local or
+         * temp home, a by-ref param's pointee, or a global aggregate. */
+        (in->op == IR_OP_RETURN && o == &in->lhs &&
+         mir_indirect_source_is_supported(generator, ir_function,
+                                          &in->lhs)) ||
+        /* `@local = f()` for a struct-returning callee: the call writes the
+         * struct directly into the dest local's home via the hidden return
+         * pointer (mir_call_is_supported validates the callee returns
+         * INDIRECT). */
+        (in->op == IR_OP_CALL && o == &in->dest &&
+         mir_name_is_indirect_struct_local(generator, ir_function, o->name)) ||
+        /* Whole-struct ASSIGN into a LEA-able struct home (rep-movsb): the
+         * source may be another home, a by-ref param (copy through its
+         * pointer), or a string literal (copy from its .rdata record). */
+        (in->op == IR_OP_ASSIGN && (o == &in->dest || o == &in->lhs) &&
+         mir_operand_struct_home_size(generator, ir_function, &in->dest) >
+             0 &&
+         mir_indirect_source_is_supported(generator, ir_function,
+                                          &in->lhs)) ||
+        /* An 8-byte string VALUE is a record pointer: storing a string
+         * local stores its home's address, storing a by-ref param stores
+         * the pointer it holds (both mirror emit_operand_load). */
+        (in->op == IR_OP_STORE && o == &in->lhs &&
+         in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 8 &&
+         (mir_name_is_string_local(generator, ir_function, o->name) ||
+          mir_name_is_indirect_param(generator, ir_function, o->name))) ||
+        /* `@s <- *addr [8]` with a string dest: the loaded pointer is
+         * deref-copied into the local's home (a by-ref param dest just
+         * takes the pointer as its new value). */
+        (in->op == IR_OP_LOAD && o == &in->dest &&
+         in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 8 &&
+         (mir_name_is_string_local(generator, ir_function, o->name) ||
+          mir_name_is_indirect_param(generator, ir_function, o->name))) ||
+        /* `*@s [w]` / `*@s <- v [w]`: the name used as a memory ADDRESS.
+         * A string local's address is its home (mir_address_operand leas
+         * it); a by-ref param's value already is the address. */
+        (((in->op == IR_OP_LOAD && o == &in->lhs) ||
+          (in->op == IR_OP_STORE && o == &in->dest)) &&
+         (mir_name_is_string_local(generator, ir_function, o->name) ||
+          mir_name_is_indirect_param(generator, ir_function, o->name)));
+    if (!allowed) {
+      return mir_trace_bail(ir_function, "indirect_agg_byname");
+    }
+  }
+  return 1;
+}
+
+static int mir_gate_indirect_aggregate(CodeGenerator *generator,
+                                       const IRFunction *ir_function,
+                                       const IRInstruction *in) {
+  /* Whole-struct by-name guard: an INDIRECT aggregate (struct local or
+   * by-reference param) may only be DECLARED or have its ADDRESS taken; MIR
+   * reaches its fields exclusively through &@sym + offset memory ops. Any
+   * other by-name appearance (assign/return/call-arg/store value) would copy
+   * just the low 8 bytes, so defer such a function to the fallback. */
+  {
+    if (!mir_gate_indirect_operands(generator, ir_function, in)) {
+      return 0;
+    }
+    for (size_t a = 0; a < in->argument_count; a++) {
+      if (in->arguments[a].kind == IR_OPERAND_SYMBOL &&
+          in->arguments[a].name &&
+          mir_name_is_indirect_aggregate(generator, ir_function,
+                                         in->arguments[a].name) &&
+          /* A struct passed by value is allowed when Link 4 can source the
+           * outgoing copy: a struct LOCAL's home, or a by-ref param's
+           * pointer (mir_call_is_supported validates the callee param). */
+          !(in->op == IR_OP_CALL &&
+            mir_indirect_source_is_supported(generator, ir_function,
+                                             &in->arguments[a]))) {
+        return mir_trace_bail(ir_function, "indirect_agg_byname");
+      }
+    }
+  }
+  return 1;
+}
+
+int mir_function_is_eligible(CodeGenerator *generator,
+                             IRFunction *ir_function) {
+  if (!generator || !ir_function) {
+    return 0;
+  }
+  g_mir_gate_fn_size = 0;
+  if (ir_explain_enabled()) {
+    for (size_t i = 0; i < ir_function->instruction_count; i++) {
+      if (ir_function->instructions[i].op != IR_OP_NOP) {
+        g_mir_gate_fn_size++;
+      }
+    }
+  }
+  if (!mir_gate_function_shape(generator, ir_function) ||
+      !mir_gate_signature(generator, ir_function) ||
+      !mir_gate_globals(generator, ir_function)) {
+    return 0;
+  }
 
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     const IRInstruction *in = &ir_function->instructions[i];
-    /* Whole-struct by-name guard: an INDIRECT aggregate (struct local or
-     * by-reference param) may only be DECLARED or have its ADDRESS taken; MIR
-     * reaches its fields exclusively through &@sym + offset memory ops. Any
-     * other by-name appearance (assign/return/call-arg/store value) would copy
-     * just the low 8 bytes, so defer such a function to the fallback. */
-    {
-      const IROperand *whole[3] = {&in->dest, &in->lhs, &in->rhs};
-      for (int k = 0; k < 3; k++) {
-        const IROperand *o = whole[k];
-        if (o->kind != IR_OPERAND_SYMBOL || !o->name ||
-            !mir_name_is_indirect_aggregate(generator, ir_function, o->name)) {
-          continue;
-        }
-        int allowed =
-            (in->op == IR_OP_DECLARE_LOCAL && o == &in->dest) ||
-            (in->op == IR_OP_ADDRESS_OF && o == &in->lhs) ||
-            /* RETURN copies from any supported indirect source: a local or
-             * temp home, a by-ref param's pointee, or a global aggregate. */
-            (in->op == IR_OP_RETURN && o == &in->lhs &&
-             mir_indirect_source_is_supported(generator, ir_function,
-                                              &in->lhs)) ||
-            /* `@local = f()` for a struct-returning callee: the call writes the
-             * struct directly into the dest local's home via the hidden return
-             * pointer (mir_call_is_supported validates the callee returns
-             * INDIRECT). */
-            (in->op == IR_OP_CALL && o == &in->dest &&
-             mir_name_is_indirect_struct_local(generator, ir_function, o->name)) ||
-            /* Whole-struct ASSIGN into a LEA-able struct home (rep-movsb): the
-             * source may be another home, a by-ref param (copy through its
-             * pointer), or a string literal (copy from its .rdata record). */
-            (in->op == IR_OP_ASSIGN && (o == &in->dest || o == &in->lhs) &&
-             mir_operand_struct_home_size(generator, ir_function, &in->dest) >
-                 0 &&
-             mir_indirect_source_is_supported(generator, ir_function,
-                                              &in->lhs)) ||
-            /* An 8-byte string VALUE is a record pointer: storing a string
-             * local stores its home's address, storing a by-ref param stores
-             * the pointer it holds (both mirror emit_operand_load). */
-            (in->op == IR_OP_STORE && o == &in->lhs &&
-             in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 8 &&
-             (mir_name_is_string_local(generator, ir_function, o->name) ||
-              mir_name_is_indirect_param(generator, ir_function, o->name))) ||
-            /* `@s <- *addr [8]` with a string dest: the loaded pointer is
-             * deref-copied into the local's home (a by-ref param dest just
-             * takes the pointer as its new value). */
-            (in->op == IR_OP_LOAD && o == &in->dest &&
-             in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 8 &&
-             (mir_name_is_string_local(generator, ir_function, o->name) ||
-              mir_name_is_indirect_param(generator, ir_function, o->name))) ||
-            /* `*@s [w]` / `*@s <- v [w]`: the name used as a memory ADDRESS.
-             * A string local's address is its home (mir_address_operand leas
-             * it); a by-ref param's value already is the address. */
-            (((in->op == IR_OP_LOAD && o == &in->lhs) ||
-              (in->op == IR_OP_STORE && o == &in->dest)) &&
-             (mir_name_is_string_local(generator, ir_function, o->name) ||
-              mir_name_is_indirect_param(generator, ir_function, o->name)));
-        if (!allowed) {
-          return mir_trace_bail(ir_function, "indirect_agg_byname");
-        }
-      }
-      for (size_t a = 0; a < in->argument_count; a++) {
-        if (in->arguments[a].kind == IR_OPERAND_SYMBOL &&
-            in->arguments[a].name &&
-            mir_name_is_indirect_aggregate(generator, ir_function,
-                                           in->arguments[a].name) &&
-            /* A struct passed by value is allowed when Link 4 can source the
-             * outgoing copy: a struct LOCAL's home, or a by-ref param's
-             * pointer (mir_call_is_supported validates the callee param). */
-            !(in->op == IR_OP_CALL &&
-              mir_indirect_source_is_supported(generator, ir_function,
-                                               &in->arguments[a]))) {
-          return mir_trace_bail(ir_function, "indirect_agg_byname");
-        }
-      }
+    if (!mir_gate_indirect_aggregate(generator, ir_function, in)) {
+      return 0;
     }
     {
       static int (*const GATES[])(CodeGenerator *, const IRFunction *,
