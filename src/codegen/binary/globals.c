@@ -878,6 +878,14 @@ int code_generator_binary_collect_global_constants(CodeGenerator *generator) {
         !sym->has_initializer || sym->init_string) {
       continue; /* extern, no initializer, or a string initializer */
     }
+    /* An exported global is reachable from outside this compilation, so a scan
+     * of this program's writes proves nothing about its value. Folding its
+     * initializer into the reads made `export var SHARED: int64 = 7;` answer 7
+     * forever: a C caller that stored 99 saw its own store and Mettle's reader
+     * still returned the constant. */
+    if (sym->is_exported) {
+      continue;
+    }
 
     const MtlcType *type = sym->type;
     if (!type || !code_generator_binary_resolved_type_is_supported(type, 0) ||

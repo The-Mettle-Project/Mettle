@@ -1,0 +1,27 @@
+// What `export` means for a variable: something outside this compilation can
+// read AND write it. The backend folded a global's initializer into every read
+// once nothing in THIS program wrote it, which is sound for a private global
+// and wrong for an exported one. `export var SHARED: int64 = 7;` answered 7
+// forever: a C caller that stored 99 saw its own store, and the reader here
+// still returned the constant.
+//
+// The C driver beside this file does the storing. Everything here reads.
+
+export var SHARED: int64 = 7;
+export var SHARED_COUNT: int32 = 3;
+export var SHARED_FLOAT: float64 = 1.5;
+
+// A private global with no writer still folds, which is the behaviour being
+// kept rather than lost.
+var PRIVATE: int64 = 41;
+
+export fn get_shared() -> int64 { return SHARED; }
+export fn get_count() -> int32 { return SHARED_COUNT; }
+export fn get_float() -> float64 { return SHARED_FLOAT; }
+export fn get_private() -> int64 { return PRIVATE; }
+export fn add_shared(v: int64) -> int64 { return SHARED + v; }
+
+export fn bump_shared() -> int64 {
+  SHARED = SHARED + 1;
+  return SHARED;
+}

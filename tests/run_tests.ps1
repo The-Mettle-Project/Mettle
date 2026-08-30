@@ -13850,6 +13850,48 @@ else {
     }
   }
 }
+
+# What `export` means for a variable: something outside this compilation can
+# read AND write it. The backend folded a global's initializer into every read
+# once nothing in THIS program wrote it -- sound for a private global, wrong for
+# an exported one, and nothing here had ever linked a Mettle object against a C
+# caller to notice. The driver stores and asks Mettle what it sees.
+if (-not $calcGcc) {
+  Write-Host "[SKIP] c_interop_exported_global (gcc not found)"
+}
+else {
+  foreach ($mode in @(@{ Name = "debug"; Args = @() },
+                      @{ Name = "release"; Args = @("--release") })) {
+    $total++
+    $caseName = "c_interop_exported_global_$($mode.Name)"
+    try {
+      if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+      $obj = Join-Path $tmpDir "$caseName.obj"
+      $exe = Join-Path $tmpDir "$caseName.exe"
+      $emitArgs = @("--emit-obj") + $mode.Args +
+                  @("tests/export_shared_global.mettle", "-o", $obj)
+      $emitOut = & $CompilerPath @emitArgs 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $obj)) {
+        throw "emitting the object failed: $emitOut"
+      }
+      $linkOut = & $calcGcc.Source @("tests/export_shared_global_driver.c",
+                                     $obj, "-o", $exe) 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) {
+        throw "linking the C driver failed: $linkOut"
+      }
+      $runOut = (& $exe 2>&1 | Out-String).Trim()
+      if ($LASTEXITCODE -ne 0 -or $runOut -ne "ok") {
+        throw "the C driver reported: $runOut"
+      }
+      Write-CaseResult -Name $caseName -Passed $true
+    }
+    catch {
+      if ($_.Exception.Message -eq $script:ShardSkip) { $total--; continue }
+      $failed++
+      Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
+    }
+  }
+}
 if (-not $calcGcc) {
   Write-Host "[SKIP] calc_frontend (gcc not found)"
 }

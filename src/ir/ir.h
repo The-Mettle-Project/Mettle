@@ -755,6 +755,11 @@ typedef struct {
    * folded initializer as the symbol's only value; without it a global's
    * initializer says what the value STARTS as, not what it is. */
   int is_immutable;
+  /* The source declared this global `export`. Something outside this
+   * compilation can write it, so scanning THIS program for writes proves
+   * nothing about its value and its initializer may not be folded into the
+   * reads. */
+  int is_exported;
   /* The source declared this global `volatile`. Reading or writing it is
    * observable in itself, so no pass may drop, merge or move one of its
    * accesses and no backend may keep its value in a register. A global's

@@ -592,6 +592,7 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
       } else {
         entry.kind = IR_MODSYM_VARIABLE;
         entry.is_immutable = s ? s->is_immutable : 0;
+        entry.is_exported = vd->is_exported;
         Type *vtype = s ? s->type : NULL;
         if (!vtype && vd->type_name) {
           vtype = type_checker_get_type_by_name(tc, vd->type_name);
