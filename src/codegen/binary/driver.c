@@ -203,10 +203,12 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     goto mir_shared_append;
   }
 
-  /* Real mode has no 64-bit frame, no rip-relative addressing and no register
-   * convention the rest of this backend assumes, so a 16-bit target gets its
-   * own emitter rather than a flag threaded through this one. */
-  if (mtlc_target()->arch == MTLC_TARGET_ARCH_X86_16) {
+  /* Real mode and 32-bit protected mode have no 64-bit frame, no rip-relative
+   * addressing and none of the register conventions the rest of this backend
+   * assumes, so they get their own emitter rather than a flag threaded through
+   * this one. */
+  if (mtlc_target()->arch == MTLC_TARGET_ARCH_X86_16 ||
+      mtlc_target()->arch == MTLC_TARGET_ARCH_X86_32) {
     if (!code_generator_emit_binary_function_x86_16(generator, ir_function,
                                                     &context)) {
       binary_function_context_destroy(&context);

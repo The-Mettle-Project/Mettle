@@ -144,6 +144,20 @@ rule. `--profile-runtime` is the built-in alternative.
 
 `--musl` is rejected, because linking musl would break the owned-runtime rule.
 
+## Narrow targets
+
+The 16- and 32-bit targets compute in one register's worth of value. A local,
+parameter, or return type wider than a word -- `int32` in 16-bit code, `int64`
+or a float in either -- is a compile error naming the declaration. Structs and
+strings do not travel through them at all. Pointers are near.
+
+Neither target has an object format that carries its relocations, so
+`--emit-flat` is their only product; asking for an object or an executable is
+an error rather than a file whose code is the wrong width for its header.
+
+`@interrupt` is emitted for 64-bit targets. A 16- or 32-bit handler is written
+`@naked`, which is where `bits 16` and `bits 32` are allowed.
+
 ## Compiler
 
 An expression may nest 4096 levels deep, and blocks may nest 4096 deep. Past

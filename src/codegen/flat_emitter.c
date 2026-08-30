@@ -192,9 +192,13 @@ int binary_emitter_write_flat(BinaryEmitter *emitter, const char *path,
 
     symbol = flat_find_symbol(emitter, relocation->symbol_name);
     if (!symbol) {
+      const BinarySection *from =
+          binary_emitter_get_section_const(emitter, relocation->section_index);
       flat_fail(error, error_size,
-                "flat image references '%s', which nothing in this program "
-                "defines",
+                "%s references '%s', which nothing in this program defines. A "
+                "flat image links no library, so every name it uses has to be "
+                "defined in it",
+                from && from->name ? from->name : "the image",
                 relocation->symbol_name ? relocation->symbol_name : "<null>");
       goto cleanup;
     }

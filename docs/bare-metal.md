@@ -40,8 +40,10 @@ fn count_set_bits(value: uint64) -> int64 {
 ### Operand bindings
 
 `{name}` names a Mettle local, parameter, or global, and expands to where that
-variable lives. A local or parameter expands to its stack home, a global to a
-rip-relative reference. Write it wherever an operand goes:
+variable lives. A local or parameter expands to its stack home; a global
+expands to a rip-relative reference in 64-bit code and an absolute one in
+16- and 32-bit code, where there is no such addressing. Write it wherever an
+operand goes:
 
 ```mettle
 mov rax, {a}        // read a
@@ -215,9 +217,14 @@ relocations, so they produce a flat image and nothing else.
 ## A chosen link address
 
 `--image-base <addr>` sets where the linked image is loaded, replacing the
-format's default. `--emit-flat <file>` writes a raw image with no container at
-all: sections laid out from the image base, every relocation resolved against
-the final addresses, and the bytes written out.
+format's default. It applies to all three products: a PE's `ImageBase`, an ELF
+executable's load address, and where a flat image's first byte lands. A PE
+loads on a 64K boundary and an ELF on a page, and a base that does not sit on
+one is a compile error rather than an image nothing can load.
+
+`--emit-flat <file>` writes a raw image with no container at all: sections laid
+out from the image base, every relocation resolved against the final addresses,
+and the bytes written out.
 
 ```bash
 mettle boot.mettle --target i8086-none --image-base 0x7c00 --emit-flat boot.bin
@@ -226,6 +233,12 @@ mettle boot.mettle --target i8086-none --image-base 0x7c00 --emit-flat boot.bin
 The entry point is a function named `_start`, or `main` when there is none, and
 it is placed at offset zero. At image base `0x7c00` the compiler recognizes a
 boot sector: the image is padded to 512 bytes and signed `0x55AA`.
+
+A flat image links no library, so every name it uses has to be defined in it.
+A program that reaches the runtime -- a null-pointer check's trap, string
+formatting, the allocator -- names symbols nothing in the image provides, and
+the compiler says which section referenced what. Define them yourself, or keep
+the image to code that does not need them.
 
 ## 16-bit code generation
 

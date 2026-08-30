@@ -1,6 +1,13 @@
 import "std/io";
 import "std/mem";
 
+struct Device {
+    status: volatile uint32;
+    data: volatile uint32;
+}
+
+var tick: volatile int32 = 0;
+
 fn poll_four_times(port: volatile uint32*) -> uint32 {
     var total: uint32 = 0
     var i: int32 = 0
@@ -26,17 +33,33 @@ fn write_twice(port: volatile uint16*) {
     *port = 2
 }
 
+fn touch(device: Device*) -> uint32 {
+    device->status = 5
+    device->data = device->status + 2
+    return device->data
+}
+
+fn bump() -> int32 {
+    tick = tick + 1
+    tick = tick + 1
+    return tick
+}
+
 fn main() -> int32 {
-    var cell: rawptr = alloc_zeroed(8)
+    var cell: rawptr = alloc_zeroed(16)
     var word: volatile uint32* = (volatile uint32*)cell
     var byte: volatile uint8* = (volatile uint8*)cell
     var half: volatile uint16* = (volatile uint16*)cell
+    var device: Device* = (Device*)cell
 
     *word = 7
     print("polled = {poll_four_times(word)}")
     print("drained = {drain(byte, 3)}")
     write_twice(half)
     print("last = {*half}")
+    print("device = {touch(device)}")
+    print("tick = {bump()}")
+    print("tick = {bump()}")
 
     free(cell)
     return 0

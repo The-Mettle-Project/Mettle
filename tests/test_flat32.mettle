@@ -1,0 +1,18 @@
+@naked fn _start() {
+    asm {
+        bits 32
+        mov esp, 0x90000
+        call accumulate
+        hlt
+    }
+}
+
+fn accumulate() -> int32 {
+    var total: int32 = 0
+    var i: int32 = 0
+    while (i < 10) {
+        total = total + i * 3
+        i = i + 1
+    }
+    return total
+}

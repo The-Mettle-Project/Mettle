@@ -981,6 +981,20 @@ static int mettle_link_elf_native(const char *startup_object,
   size_t i = 0u;
   int result = 1;
 
+  /* --image-base: a freestanding image is placed where its loader puts it, not
+   * where a hosted operating system would. An ELF segment is mapped by page, so
+   * a base that is not page-aligned cannot be loaded at all. */
+  if (mtlc_target()->image_base_set) {
+    if (mtlc_target()->image_base % 0x1000u) {
+      fprintf(stderr,
+              "Error: --image-base 0x%llx is not page-aligned; an ELF image "
+              "must load on a 0x1000 boundary\n",
+              (unsigned long long)mtlc_target()->image_base);
+      return 1;
+    }
+    emission_options.image_base = mtlc_target()->image_base;
+  }
+
   if (!startup_object || !object_filename || !executable_filename ||
       !freestanding_object ||
       extra_object_count > sizeof(object_paths) / sizeof(object_paths[0]) - 3u) {
@@ -1832,6 +1846,17 @@ static int mettle_link_internal(const char **object_paths,
 
   if (options && options->windows_subsystem) {
     emission_options.subsystem = 2u;
+  }
+  /* A PE is relocated in 64K granules, so its ImageBase must sit on one. */
+  if (mtlc_target()->image_base_set) {
+    if (mtlc_target()->image_base % 0x10000u) {
+      fprintf(stderr,
+              "Error: --image-base 0x%llx is not 64K-aligned; a PE image must "
+              "load on a 0x10000 boundary\n",
+              (unsigned long long)mtlc_target()->image_base);
+      goto cleanup;
+    }
+    emission_options.image_base = mtlc_target()->image_base;
   }
   emission_options.import_library_paths =
       (const char **)import_library_paths.items;
@@ -3778,6 +3803,29 @@ int main(int argc, char *argv[]) {
   if (!options.input_filename) {
     fprintf(stderr, "Error: No input file specified.\n");
     print_usage(argv[0]);
+    free((void *)options.import_directories);
+    free((void *)options.link_arguments);
+    return 1;
+  }
+
+  /* A flat image IS the linked product: there is nothing left for a linker to
+   * do to it, and no container for a linker to put it in. */
+  if (options.flat_output && build_executable) {
+    fprintf(stderr,
+            "Error: --emit-flat writes the linked image itself; drop --build\n");
+    free((void *)options.import_directories);
+    free((void *)options.link_arguments);
+    return 1;
+  }
+
+  /* No object format here carries 16- or 32-bit relocations, so a narrow
+   * target has exactly one product. Saying so beats emitting an object whose
+   * code is the wrong width for the header on it. */
+  if (!mtlc_target_is_object_capable(mtlc_target()) && !options.flat_output) {
+    fprintf(stderr,
+            "Error: the %s target emits a flat image only; add --emit-flat "
+            "<file> (and --image-base <addr>)\n",
+            mtlc_target()->triple);
     free((void *)options.import_directories);
     free((void *)options.link_arguments);
     return 1;

@@ -10238,14 +10238,40 @@ catch {
   Write-CaseResult -Name "runtime_null_trace" -Passed $false -Reason $_.Exception.Message
 }
 
+# A hardware access violation becomes a Mettle stack trace through structured
+# exception handling, which the owned Linux runtime has no counterpart for:
+# there a wild store is a SIGSEGV the process dies on. The checked null
+# dereference above is what covers both.
+if (-not $script:OnWindows) {
+  Skip-WindowsOnly "runtime_access_violation_trace" "Windows-only: a hardware fault becomes a trace through SEH"
+} else {
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
-  Write-CaseResult -Name "runtime_access_violation_trace" -Passed $true -Reason "skipped: inline assembly is not supported by the binary backend"
+  $avExe = Join-Path $tmpDir "test_runtime_access_violation_trace.exe"
+  $avBuild = & $CompilerPath --build -s tests/test_runtime_access_violation_trace.mettle -o $avExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "access-violation trace build failed: $avBuild"
+  }
+  $avOut = & $avExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 1) {
+    throw "access-violation trace exited with $LASTEXITCODE (expected 1)"
+  }
+  if ($avOut -notmatch "access violation" -and $avOut -notmatch "Segmentation") {
+    throw "access-violation trace output does not name the fault: $avOut"
+  }
+  if ($avOut -notmatch "Stack trace:") {
+    throw "access-violation trace output missing stack trace header"
+  }
+  if ($avOut -notmatch "leaf_crash") {
+    throw "access-violation trace output missing frame names"
+  }
+  Write-CaseResult -Name "runtime_access_violation_trace" -Passed $true
 }
 catch {
   $failed++
   Write-CaseResult -Name "runtime_access_violation_trace" -Passed $false -Reason $_.Exception.Message
+}
 }
 
 # Recognizer-rot gate. Compiles a corpus of kernels whose loops the
@@ -13843,6 +13869,41 @@ else {
     $failed++
     Write-CaseResult -Name "boot_sector_runs" -Passed $false -Reason $_.Exception.Message
   }
+}
+
+# 32-bit gate: the i386 target must reach the narrow code generator. Emitting
+# 64-bit code into a 32-bit image is the failure that looks like success, so
+# this asserts the shape of what came out rather than only that it came out.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $flatImage = Join-Path $tmpDir "flat32.bin"
+  if (Test-Path $flatImage) { Remove-Item -Path $flatImage -Force }
+  $flatArgs = @("tests/test_flat32.mettle", "--target", "i386-none",
+                "--image-base", "0x100000", "--emit-flat", $flatImage)
+  $flatOut = & $CompilerPath @flatArgs 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $flatImage)) {
+    throw "compiling the 32-bit image failed: $flatOut"
+  }
+  $bytes = [System.IO.File]::ReadAllBytes($flatImage)
+  $hex = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+  # `mov esp, 0x90000` as the first instruction of the naked entry.
+  if ($hex.Substring(0, 10) -ne "bc00000900") {
+    throw "the 32-bit entry does not begin with `mov esp, 0x90000`: $($hex.Substring(0, 16))"
+  }
+  # A 32-bit frame: push ebp / mov ebp, esp / sub esp, imm8.
+  if ($hex -notmatch "5589e583ec") {
+    throw "no 32-bit frame in the image"
+  }
+  # REX.W mov rsp, rbp is what a 64-bit epilogue looks like; there must be none.
+  if ($hex -match "4889e55d") {
+    throw "the image holds 64-bit code"
+  }
+  Write-CaseResult -Name "flat32_is_32_bit" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "flat32_is_32_bit" -Passed $false -Reason $_.Exception.Message
 }
 
 # Optimizer unit gate: loop-carried float symbols must not become temps before

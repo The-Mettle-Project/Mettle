@@ -1210,7 +1210,11 @@ static int asm_emit_instruction(AsmState *state, int line,
     int displacement_bytes = 0;
     long long displacement = rm->disp;
 
-    if (rm->rip_relative) {
+    /* `[symbol]` with nothing to add it to. In 64-bit code the only reference
+     * that survives being loaded anywhere is a rip-relative one, and that is
+     * what every assembler means by it. */
+    if (rm->rip_relative ||
+        (state->bits == 64 && rm->symbol && !rm->has_base && !rm->has_index)) {
       if (state->bits != 64) {
         asm_fail(state, line, "rip-relative addressing needs 64-bit code");
         return 0;
@@ -2185,13 +2189,34 @@ static int asm_encode_mnemonic(AsmState *state, int line, const char *mnemonic,
   if (strcmp(mnemonic, "pop") == 0) {
     return asm_push_pop(state, line, 0, operands, count);
   }
-  if (strcmp(mnemonic, "pushf") == 0 || strcmp(mnemonic, "pushfd") == 0 ||
-      strcmp(mnemonic, "pushfq") == 0) {
-    return asm_byte(state, 0x9C);
-  }
-  if (strcmp(mnemonic, "popf") == 0 || strcmp(mnemonic, "popfd") == 0 ||
-      strcmp(mnemonic, "popfq") == 0) {
-    return asm_byte(state, 0x9D);
+  if (strncmp(mnemonic, "pushf", 5) == 0 || strncmp(mnemonic, "popf", 4) == 0) {
+    int is_push = mnemonic[1] == 'u';
+    const char *suffix = mnemonic + (is_push ? 5 : 4);
+    int operand_bits = suffix[0] == 'd'   ? 32
+                       : suffix[0] == 'q' ? 64
+                       : suffix[0] == '\0' ? 16
+                                           : 0;
+    if (!operand_bits) {
+      asm_fail(state, line, "unknown instruction `%s`", mnemonic);
+      return 0;
+    }
+    if (operand_bits == 32 && state->bits == 64) {
+      asm_fail(state, line, "`%s` is invalid in 64-bit code", mnemonic);
+      return 0;
+    }
+    if (operand_bits == 64 && state->bits != 64) {
+      asm_fail(state, line, "`%s` needs 64-bit code", mnemonic);
+      return 0;
+    }
+    /* push and pop of the flags default to the mode's own width, so the
+     * operand-size prefix is what asks for the other one. */
+    if ((operand_bits == 16 && state->bits != 16) ||
+        (operand_bits == 32 && state->bits == 16)) {
+      if (!asm_byte(state, 0x66)) {
+        return 0;
+      }
+    }
+    return asm_byte(state, is_push ? 0x9C : 0x9D);
   }
   if (strcmp(mnemonic, "pusha") == 0 || strcmp(mnemonic, "pushad") == 0) {
     if (state->bits == 64) {
