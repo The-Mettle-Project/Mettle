@@ -1824,6 +1824,861 @@ static int emit_call_arguments(Arm64Emit *e, SlotMap *slots,
  * `prog`/`retf` drive the float ABI (which callees return floats); `object` and
  * `data` select where globals live, and exactly one of them is set. All may be
  * NULL for the single-function path. */
+typedef struct {
+  Arm64Emit *e;
+  const IRFunction *fn;
+  LblMap *fns;
+  const IRProgram *prog;
+  const int *retf;
+  Arm64ObjectContext *object;
+  SlotMap *slots;
+  LblMap *labels;
+  StrSet *fs;
+  StrSet *us;
+  AggMap *ag;
+  NarrowMap *nm;
+  StrSet *wide_params;
+  int frame;
+  int sret_size;
+} Arm64Scope;
+
+static int encode_control_instruction(const Arm64Scope *scope,
+                                 const IRInstruction *in) {
+  Arm64Emit *e = scope->e;
+  const IRFunction *fn = scope->fn;
+  LblMap *fns = scope->fns;
+  const IRProgram *prog = scope->prog;
+  const int *retf = scope->retf;
+  Arm64ObjectContext *object = scope->object;
+  SlotMap *slots = scope->slots;
+  LblMap *labels = scope->labels;
+  StrSet *fs = scope->fs;
+  StrSet *us = scope->us;
+  AggMap *ag = scope->ag;
+  NarrowMap *nm = scope->nm;
+  StrSet *wide_params = scope->wide_params;
+  int frame = scope->frame;
+  int sret_size = scope->sret_size;
+  (void)fn;
+  (void)retf;
+
+  (void)e;
+  (void)fn;
+  (void)fns;
+  (void)prog;
+  (void)retf;
+  (void)object;
+  (void)slots;
+  (void)labels;
+  (void)fs;
+  (void)us;
+  (void)ag;
+  (void)nm;
+  (void)wide_params;
+  (void)frame;
+  (void)sret_size;
+  switch (in->op) {
+  case IR_OP_NOP:
+    break;
+  case IR_OP_DECLARE_LOCAL: {
+    /* The IR reuses local names across block scopes with different types
+     * (`ref` can be float64 in one block and uint32 in the next). The maps
+     * were seeded with each name's FIRST declaration; from here on, this
+     * declaration is the truth for this name. */
+    const char *name = in->dest.name;
+    if (name) {
+      const MtlcType *t = declared_type(prog, in);
+      int is_scalar_float =
+          t ? mtlc_type_is_float(t) : type_text_is_float_scalar(in->text);
+      int fbits = t ? (t->kind == MTLC_TYPE_FLOAT32 ? 32 : 64)
+                    : type_text_float_bits(in->text);
+      set_rebind(fs, name, is_scalar_float, is_scalar_float ? fbits : 0);
+      set_rebind(us, name,
+                 type_text_is_unsigned(in->text) || type_is_unsigned(t), 0);
+      narrow_remove(nm, name);
+      if (t && !mtlc_type_is_float(t) && !type_is_aggregate(t)) {
+        size_t size = mtlc_type_size(t);
+        if (size == 1 || size == 2 || size == 4) {
+          narrow_add(nm, name, (int)size, module_type_signed(t));
+        }
+      }
+      agg_remove(ag, name);
+      if (type_is_aggregate(t)) {
+        agg_add(ag, name, declare_local_size(prog, in));
+      }
+    }
+    break;
+  }
+  case IR_OP_LABEL:
+    arm64_bind_label(e, label_for(e, labels, in->text));
+    break;
+  case IR_OP_JUMP:
+    arm64_emit_b(e, label_for(e, labels, in->text));
+    break;
+  case IR_OP_BRANCH_ZERO:
+    arm64_emit_cbz(e, 1, load_into(e, slots, &in->lhs, R_LHS),
+                   label_for(e, labels, in->text));
+    break;
+  case IR_OP_BRANCH_EQ: {
+    Arm64Reg a = load_into(e, slots, &in->lhs, R_LHS);
+    Arm64Reg b = load_into(e, slots, &in->rhs, R_RHS);
+    arm64_emit_word(e, arm64_cmp_reg(1, a, b));
+    arm64_emit_bcond(e, ARM64_EQ, label_for(e, labels, in->text));
+    break;
+  }
+  default:
+    return 0;
+  }
+  return 1;
+}
+
+static int encode_assign_instruction(const Arm64Scope *scope,
+                                 const IRInstruction *in) {
+  Arm64Emit *e = scope->e;
+  const IRFunction *fn = scope->fn;
+  LblMap *fns = scope->fns;
+  const IRProgram *prog = scope->prog;
+  const int *retf = scope->retf;
+  Arm64ObjectContext *object = scope->object;
+  SlotMap *slots = scope->slots;
+  LblMap *labels = scope->labels;
+  StrSet *fs = scope->fs;
+  StrSet *us = scope->us;
+  AggMap *ag = scope->ag;
+  NarrowMap *nm = scope->nm;
+  StrSet *wide_params = scope->wide_params;
+  int frame = scope->frame;
+  int sret_size = scope->sret_size;
+  (void)fn;
+  (void)retf;
+
+  (void)e;
+  (void)fn;
+  (void)fns;
+  (void)prog;
+  (void)retf;
+  (void)object;
+  (void)slots;
+  (void)labels;
+  (void)fs;
+  (void)us;
+  (void)ag;
+  (void)nm;
+  (void)wide_params;
+  (void)frame;
+  (void)sret_size;
+  switch (in->op) {
+  case IR_OP_ASSIGN: {
+    /* An assignment whose destination is a WIDE aggregate local is a
+     * whole-object copy: the local IS the object. The source's record
+     * address comes from wherever it lives -- another aggregate local, an
+     * aggregate global, a string literal's record, or (for a temp) a
+     * pointer value such as an sret result. Everything else, including a
+     * packed <=8-byte struct, is a one-word move. */
+    int bytes = in->dest.kind == IR_OPERAND_SYMBOL
+                    ? agg_size_of(ag, in->dest.name)
+                    : 0;
+    int source = in->lhs.kind == IR_OPERAND_SYMBOL
+                     ? agg_size_of(ag, in->lhs.name)
+                     : 0;
+    if (bytes > 8) {
+      if (source > 0) {
+        emit_lea_local(e, R_LHS, slot_off(slots, in->lhs.name));
+      } else {
+        /* STRING literals load as a record address; a temp holds one. */
+        load_into(e, slots, &in->lhs, R_LHS);
+      }
+      emit_lea_local(e, R_RHS, slot_off(slots, in->dest.name));
+      emit_fixed_copy(e, R_RHS, R_LHS,
+                      source > 0 && source < bytes ? source : bytes);
+      break;
+    }
+    if (bytes > 0 && source > 0) {
+      emit_lea_local(e, R_LHS, slot_off(slots, in->lhs.name));
+      emit_lea_local(e, R_RHS, slot_off(slots, in->dest.name));
+      emit_fixed_copy(e, R_RHS, R_LHS, bytes < source ? bytes : source);
+      break;
+    }
+    if (in->lhs.kind == IR_OPERAND_FLOAT ||
+        operand_is_float(fs, &in->lhs)) {
+      /* A float assignment stores at the DESTINATION's width. The source may
+       * have been computed at the other one (a global float32 updated with a
+       * literal runs in double), and the low half of a double is not a
+       * float. */
+      int dst_bits = 0;
+      const IRModuleSymbol *dst_global =
+          in->dest.kind == IR_OPERAND_SYMBOL &&
+                  slot_find(slots, in->dest.name) < 0
+              ? module_variable(slots, in->dest.name)
+              : NULL;
+      if (dst_global && mtlc_type_is_float(dst_global->type)) {
+        dst_bits = dst_global->type->kind == MTLC_TYPE_FLOAT32 ? 32 : 64;
+      } else if (in->dest.kind == IR_OPERAND_SYMBOL ||
+                 in->dest.kind == IR_OPERAND_TEMP) {
+        dst_bits = set_bits(fs, in->dest.name);
+      }
+      if (dst_bits) {
+        int d = dst_bits != 32;
+        load_float_operand(e, slots, fs, &in->lhs, d, 0, R_LHS);
+        arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+        store_dest(e, slots, &in->dest, R_RES);
+        break;
+      }
+    }
+    store_dest(e, slots, &in->dest, load_into(e, slots, &in->lhs, R_LHS));
+    break;
+  }
+  default:
+    return 0;
+  }
+  return 1;
+}
+
+static int encode_cast_instruction(const Arm64Scope *scope,
+                                 const IRInstruction *in) {
+  Arm64Emit *e = scope->e;
+  const IRFunction *fn = scope->fn;
+  LblMap *fns = scope->fns;
+  const IRProgram *prog = scope->prog;
+  const int *retf = scope->retf;
+  Arm64ObjectContext *object = scope->object;
+  SlotMap *slots = scope->slots;
+  LblMap *labels = scope->labels;
+  StrSet *fs = scope->fs;
+  StrSet *us = scope->us;
+  AggMap *ag = scope->ag;
+  NarrowMap *nm = scope->nm;
+  StrSet *wide_params = scope->wide_params;
+  int frame = scope->frame;
+  int sret_size = scope->sret_size;
+  (void)fn;
+  (void)retf;
+
+  (void)e;
+  (void)fn;
+  (void)fns;
+  (void)prog;
+  (void)retf;
+  (void)object;
+  (void)slots;
+  (void)labels;
+  (void)fs;
+  (void)us;
+  (void)ag;
+  (void)nm;
+  (void)wide_params;
+  (void)frame;
+  (void)sret_size;
+  switch (in->op) {
+  case IR_OP_CAST: {
+    int srcf = in->is_float;
+    int dstf = in->dest.float_bits != 0;
+    if (srcf && !dstf) { /* float -> int (truncating) */
+      int d = operand_float_bits(fs, &in->lhs) != 32;
+      arm64_emit_word(e, arm64_fmov_gp(d, 0, load_into(e, slots, &in->lhs,
+                                                       R_LHS)));
+      arm64_emit_word(e, arm64_fcvtzs(d, R_RES, 0));
+      store_dest(e, slots, &in->dest, R_RES);
+    } else if (!srcf && dstf) { /* int -> float */
+      int d = in->dest.float_bits != 32;
+      arm64_emit_word(e, arm64_scvtf(d, 0, load_into(e, slots, &in->lhs,
+                                                     R_LHS)));
+      arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+      store_dest(e, slots, &in->dest, R_RES);
+    } else if (srcf && dstf) { /* float -> float */
+      int sd = operand_float_bits(fs, &in->lhs) != 32;
+      int dd = in->dest.float_bits != 32;
+      arm64_emit_word(e, arm64_fmov_gp(sd, 0, load_into(e, slots, &in->lhs,
+                                                        R_LHS)));
+      if (sd != dd) {
+        arm64_emit_word(e, arm64_fcvt(dd, 1, 0));
+        arm64_emit_word(e, arm64_fmov_to_gp(dd, R_RES, 1));
+      } else {
+        arm64_emit_word(e, arm64_fmov_to_gp(sd, R_RES, 0));
+      }
+      store_dest(e, slots, &in->dest, R_RES);
+    } else {
+      /* int -> int: re-express the value as the TARGET integer type. A bit
+       * copy was wrong for every narrowing cast used as a value rather than
+       * stored into a typed local: `(int8)511` answered 511, because only
+       * the store to a declared-narrow slot ever truncated. The value in the
+       * register is already canonical for its own type, so extending its low
+       * `tw` bytes by the target's signedness is the whole conversion. */
+      Arm64Reg src = load_into(e, slots, &in->lhs, R_LHS);
+      const MtlcType *tt =
+          prog && in->text && !strchr(in->text, '[') && !strchr(in->text, '*')
+              ? ir_program_lookup_type(prog, in->text)
+              : NULL;
+      int tw = tt ? (int)mtlc_type_size(tt) : type_elem_size(in->text);
+      int tu = tt ? type_is_unsigned(tt) : type_text_is_unsigned(in->text);
+      if (tt && type_is_aggregate(tt)) {
+        tw = 8;
+      }
+      if (in->text && strchr(in->text, '*')) {
+        tw = 8;
+      }
+      if (tw == 1 || tw == 2 || tw == 4) {
+        arm64_emit_word(
+            e, tw == 1 ? (tu ? arm64_uxtb(R_RES, src) : arm64_sxtb(R_RES, src))
+               : tw == 2
+                   ? (tu ? arm64_uxth(R_RES, src) : arm64_sxth(R_RES, src))
+                   : (tu ? arm64_mov_reg(0, R_RES, src)
+                         : arm64_sxtw(R_RES, src)));
+        store_dest(e, slots, &in->dest, R_RES);
+      } else {
+        store_dest(e, slots, &in->dest, src);
+      }
+    }
+    break;
+  }
+  default:
+    return 0;
+  }
+  return 1;
+}
+
+static int encode_memory_instruction(const Arm64Scope *scope,
+                                 const IRInstruction *in) {
+  Arm64Emit *e = scope->e;
+  const IRFunction *fn = scope->fn;
+  LblMap *fns = scope->fns;
+  const IRProgram *prog = scope->prog;
+  const int *retf = scope->retf;
+  Arm64ObjectContext *object = scope->object;
+  SlotMap *slots = scope->slots;
+  LblMap *labels = scope->labels;
+  StrSet *fs = scope->fs;
+  StrSet *us = scope->us;
+  AggMap *ag = scope->ag;
+  NarrowMap *nm = scope->nm;
+  StrSet *wide_params = scope->wide_params;
+  int frame = scope->frame;
+  int sret_size = scope->sret_size;
+  (void)fn;
+  (void)retf;
+
+  (void)e;
+  (void)fn;
+  (void)fns;
+  (void)prog;
+  (void)retf;
+  (void)object;
+  (void)slots;
+  (void)labels;
+  (void)fs;
+  (void)us;
+  (void)ag;
+  (void)nm;
+  (void)wide_params;
+  (void)frame;
+  (void)sret_size;
+  switch (in->op) {
+  case IR_OP_ADDRESS_OF: {
+    const IRModuleSymbol *global =
+        slot_find(slots, in->lhs.name) < 0
+            ? module_variable(slots, in->lhs.name)
+            : NULL;
+    if (global) {
+      emit_global_address(e, slots, R_RES, global);
+    } else if (slot_find(slots, in->lhs.name) < 0 &&
+               prog_fn_index(prog, in->lhs.name) >= 0) {
+      emit_function_address(e, slots, R_RES, in->lhs.name);
+    } else if (set_has(wide_params, in->lhs.name)) {
+      emit_slot_ldr(e, R_RES, slot_off(slots, in->lhs.name));
+    } else {
+      emit_lea_local(e, R_RES, slot_off(slots, in->lhs.name));
+    }
+    store_dest(e, slots, &in->dest, R_RES);
+    break;
+  }
+  case IR_OP_LOAD: {
+    int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
+    Arm64Reg addr = address_operand(e, slots, ag, &in->lhs, R_LHS);
+    if (size > 8) {
+      /* A wide load produces an aggregate VALUE, which travels as its
+       * address. Into an aggregate local: copy the bytes. Into a temp: the
+       * loaded address IS the value. */
+      int dest_agg = in->dest.kind == IR_OPERAND_SYMBOL
+                         ? agg_size_of(ag, in->dest.name)
+                         : 0;
+      if (dest_agg > 8) {
+        emit_lea_local(e, R_RHS, slot_off(slots, in->dest.name));
+        emit_fixed_copy(e, R_RHS, addr, size < dest_agg ? size : dest_agg);
+      } else {
+        store_dest(e, slots, &in->dest, addr);
+      }
+      break;
+    }
+    emit_load_sized(e, R_RES, addr, size,
+                    !in->is_unsigned && !in->is_float);
+    store_dest(e, slots, &in->dest, R_RES);
+    break;
+  }
+  case IR_OP_STORE: {
+    int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
+    Arm64Reg addr = address_operand(e, slots, ag, &in->dest, R_LHS);
+    if (size > 8) {
+      /* Wide store: copy the source record's bytes through the pointer. */
+      Arm64Reg src;
+      if (in->lhs.kind == IR_OPERAND_SYMBOL &&
+          agg_size_of(ag, in->lhs.name) > 0) {
+        emit_lea_local(e, R_RHS, slot_off(slots, in->lhs.name));
+        src = R_RHS;
+      } else {
+        src = load_into(e, slots, &in->lhs, R_RHS); /* record address */
+      }
+      emit_fixed_copy(e, addr, src, size);
+      break;
+    }
+    if ((size == 4 || size == 8) && operand_is_float(fs, &in->lhs)) {
+      /* A float store's size names the STORAGE width; convert the value to
+       * it first, or a double's low half (or a single's bits zero-padded)
+       * lands in memory. */
+      int d = size == 8;
+      load_float_operand(e, slots, fs, &in->lhs, d, 0, R_RHS);
+      arm64_emit_word(e, arm64_fmov_to_gp(d, R_RHS, 0));
+      emit_store_sized(e, R_RHS, addr, size);
+      break;
+    }
+    Arm64Reg val = load_into(e, slots, &in->lhs, R_RHS);
+    emit_store_sized(e, val, addr, size);
+    break;
+  }
+  default:
+    return 0;
+  }
+  return 1;
+}
+
+static int encode_arithmetic_instruction(const Arm64Scope *scope,
+                                 const IRInstruction *in) {
+  Arm64Emit *e = scope->e;
+  const IRFunction *fn = scope->fn;
+  LblMap *fns = scope->fns;
+  const IRProgram *prog = scope->prog;
+  const int *retf = scope->retf;
+  Arm64ObjectContext *object = scope->object;
+  SlotMap *slots = scope->slots;
+  LblMap *labels = scope->labels;
+  StrSet *fs = scope->fs;
+  StrSet *us = scope->us;
+  AggMap *ag = scope->ag;
+  NarrowMap *nm = scope->nm;
+  StrSet *wide_params = scope->wide_params;
+  int frame = scope->frame;
+  int sret_size = scope->sret_size;
+  (void)fn;
+  (void)retf;
+
+  (void)e;
+  (void)fn;
+  (void)fns;
+  (void)prog;
+  (void)retf;
+  (void)object;
+  (void)slots;
+  (void)labels;
+  (void)fs;
+  (void)us;
+  (void)ag;
+  (void)nm;
+  (void)wide_params;
+  (void)frame;
+  (void)sret_size;
+  switch (in->op) {
+  case IR_OP_BINARY:
+    if (binary_is_string_concat(in)) {
+      /* result = a + b over { chars, length } records. One block holds the
+       * new record and its characters (record first, chars at +16); bump
+       * memory is fresh-zero, so the NUL after the copied bytes is free. */
+      if (!object && !fns) {
+        arm64_fail(e, "string concatenation in '%s' needs the runtime "
+                      "kernel, which this path does not provide",
+                   fn->name);
+        break;
+      }
+      int off_a = slot_off(slots, CONCAT_A_SLOT);
+      int off_b = slot_off(slots, CONCAT_B_SLOT);
+      int off_dst = slot_off(slots, CONCAT_DST_SLOT);
+      /* Record addresses of both operands, parked across the calls. */
+      if (in->lhs.kind == IR_OPERAND_SYMBOL &&
+          agg_size_of(ag, in->lhs.name) > 0) {
+        emit_lea_local(e, R_LHS, slot_off(slots, in->lhs.name));
+      } else {
+        load_into(e, slots, &in->lhs, R_LHS);
+      }
+      emit_slot_str(e, R_LHS, off_a);
+      if (in->rhs.kind == IR_OPERAND_SYMBOL &&
+          agg_size_of(ag, in->rhs.name) > 0) {
+        emit_lea_local(e, R_LHS, slot_off(slots, in->rhs.name));
+      } else {
+        load_into(e, slots, &in->rhs, R_LHS);
+      }
+      emit_slot_str(e, R_LHS, off_b);
+      /* malloc(16 + len(a) + len(b) + 1) */
+      emit_slot_ldr(e, R_LHS, off_a);
+      arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
+      emit_slot_ldr(e, R_RHS, off_b);
+      arm64_emit_word(e, arm64_ldr_imm(1, R_RHS, R_RHS, 8));
+      arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, R_LHS, R_RHS));
+      arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 17, 0));
+      emit_runtime_call(e, object, prog, fns, STUB_MALLOC);
+      emit_slot_str(e, ARM64_X0, off_dst);
+      /* record: chars = block+16; length = len(a) + len(b) */
+      arm64_emit_word(e, arm64_add_imm(1, R_LHS, ARM64_X0, 16, 0));
+      arm64_emit_word(e, arm64_str_imm(1, R_LHS, ARM64_X0, 0));
+      emit_slot_ldr(e, R_LHS, off_a);
+      arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
+      emit_slot_ldr(e, R_RHS, off_b);
+      arm64_emit_word(e, arm64_ldr_imm(1, R_RHS, R_RHS, 8));
+      arm64_emit_word(e, arm64_add_reg(1, R_LHS, R_LHS, R_RHS));
+      arm64_emit_word(e, arm64_str_imm(1, R_LHS, ARM64_X0, 8));
+      /* memcpy(block+16, a.chars, a.len) */
+      emit_slot_ldr(e, ARM64_X0, off_dst);
+      arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
+      emit_slot_ldr(e, R_LHS, off_a);
+      arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X1, R_LHS, 0));
+      arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
+      emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
+      /* memcpy(block+16+a.len, b.chars, b.len) */
+      emit_slot_ldr(e, ARM64_X0, off_dst);
+      arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
+      emit_slot_ldr(e, R_LHS, off_a);
+      arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
+      arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, ARM64_X0, R_LHS));
+      emit_slot_ldr(e, R_LHS, off_b);
+      arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X1, R_LHS, 0));
+      arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
+      emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
+      /* Terminate. The freestanding allocator hands back fresh-zero memory,
+       * so this is redundant there, but the general allocator need not. */
+      emit_slot_ldr(e, ARM64_X0, off_dst);
+      arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, ARM64_X0, 8));
+      arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
+      arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, ARM64_X0, R_LHS));
+      arm64_emit_word(e, arm64_strb_imm(ARM64_XZR, ARM64_X0, 0));
+      /* The block's start IS the result record. */
+      emit_slot_ldr(e, R_RES, off_dst);
+      if (in->dest.kind == IR_OPERAND_SYMBOL &&
+          agg_size_of(ag, in->dest.name) > 8) {
+        emit_lea_local(e, R_RHS, slot_off(slots, in->dest.name));
+        emit_fixed_copy(e, R_RHS, R_RES, 16);
+      } else {
+        store_dest(e, slots, &in->dest, R_RES);
+      }
+      break;
+    }
+    lower_binary(e, slots, fs, us, in);
+    break;
+  case IR_OP_UNARY:
+    lower_unary(e, slots, fs, in);
+    break;
+  default:
+    return 0;
+  }
+  return 1;
+}
+
+static int encode_call_instruction(const Arm64Scope *scope,
+                                 const IRInstruction *in) {
+  Arm64Emit *e = scope->e;
+  const IRFunction *fn = scope->fn;
+  LblMap *fns = scope->fns;
+  const IRProgram *prog = scope->prog;
+  const int *retf = scope->retf;
+  Arm64ObjectContext *object = scope->object;
+  SlotMap *slots = scope->slots;
+  LblMap *labels = scope->labels;
+  StrSet *fs = scope->fs;
+  StrSet *us = scope->us;
+  AggMap *ag = scope->ag;
+  NarrowMap *nm = scope->nm;
+  StrSet *wide_params = scope->wide_params;
+  int frame = scope->frame;
+  int sret_size = scope->sret_size;
+  (void)fn;
+  (void)retf;
+
+  (void)e;
+  (void)fn;
+  (void)fns;
+  (void)prog;
+  (void)retf;
+  (void)object;
+  (void)slots;
+  (void)labels;
+  (void)fs;
+  (void)us;
+  (void)ag;
+  (void)nm;
+  (void)wide_params;
+  (void)frame;
+  (void)sret_size;
+  switch (in->op) {
+  case IR_OP_CALL: {
+    if (!fns || !in->text) {
+      arm64_fail(e, in->text
+                        ? "'%s' calls '%s', but this path lowers one function"
+                          " in isolation"
+                        : "'%s' contains a call with no callee name%s",
+                 fn->name, in->text ? in->text : "");
+      break;
+    }
+    /* cstr("literal"): embed the bytes in the loaded segment (branched over),
+     * and materialize their virtual address into dest -- no actual call. */
+    if (strcmp(in->text, "cstr") == 0 && in->argument_count >= 1 &&
+        in->arguments[0].kind == IR_OPERAND_STRING &&
+        in->arguments[0].name) {
+      const char *str = in->arguments[0].name;
+      if (object) {
+        char symbol[64];
+        size_t offset = 0;
+        snprintf(symbol, sizeof(symbol), ".Lmtlc.str.%u",
+                 object->string_id++);
+        if (!binary_emitter_append_bytes(object->emitter,
+                                         object->rodata_section, str,
+                                         strlen(str) + 1, &offset) ||
+            !binary_emitter_define_symbol(
+                object->emitter, symbol, BINARY_SYMBOL_LOCAL,
+                object->rodata_section, offset, strlen(str) + 1)) {
+          arm64_fail(e, "could not place a cstr literal in .rodata");
+          break;
+        }
+        emit_symbol_address(e, object, R_RES, symbol);
+      } else {
+        int past = arm64_new_label(e);
+        arm64_emit_b(e, past);
+        size_t soff = arm64_here(e);
+        arm64_emit_bytes(e, str, strlen(str) + 1);
+        arm64_bind_label(e, past);
+        emit_imm(e, R_RES, (uint64_t)ELF_BASE + ELF_HDRS + soff);
+      }
+      if (in->dest.kind == IR_OPERAND_TEMP ||
+          in->dest.kind == IR_OPERAND_SYMBOL) {
+        store_dest(e, slots, &in->dest, R_RES);
+      }
+      break;
+    }
+    /* Runtime traps in a relocatable object lower to owned puts and exit.
+     * The compact self contained image exits through its local syscall. */
+    if (strcmp(in->text, "mettle_crash_trap_ex") == 0 ||
+        strcmp(in->text, "mettle_crash_trap") == 0) {
+      size_t msg_index =
+          strcmp(in->text, "mettle_crash_trap_ex") == 0 ? 1u : 0u;
+      /* x0 = the message as a CSTRING. A literal goes via the chars-address
+       * emitter, not load_into, whose STRING case yields a record address. */
+      if (in->argument_count > msg_index &&
+          in->arguments[msg_index].kind == IR_OPERAND_STRING) {
+        emit_string_literal_address(e, object,
+                                    in->arguments[msg_index].name, ARM64_X0);
+      } else if (in->argument_count > msg_index) {
+        load_into(e, slots, &in->arguments[msg_index], ARM64_X0);
+      } else {
+        emit_string_literal_address(e, object, "Fatal error", ARM64_X0);
+      }
+      if (object) {
+        if (!emit_external_call(e, object, prog, "puts")) break;
+        emit_imm(e, ARM64_X0, 1);
+        if (!emit_external_call(e, object, prog, "exit")) break;
+      } else {
+        /* Match the x86 observable: the message on stdout, then exit(1).
+         * The puts stub is emitted whenever a trap is reachable. */
+        arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[STUB_PUTS].name));
+        emit_imm(e, ARM64_X0, 1);
+        arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_EXIT, 0));
+        arm64_emit_word(e, ARM64_SVC0);
+      }
+      break;
+    }
+    if (!emit_call_arguments(e, slots, prog, fs, in)) break;
+
+    int callee_sret = fn_aggregate_return_size(prog, in->text);
+    if (callee_sret) {
+      emit_lea_local(e, ARM64_X8, slot_off(slots, SRET_BUFFER_SLOT));
+    }
+    int stub = object ? -1 : runtime_stub_index(in->text);
+    if (prog_fn_index(prog, in->text) >= 0) {
+      arm64_emit_bl(e, label_for(e, fns, in->text));
+    } else if (object) {
+      if (!emit_external_call(e, object, prog, in->text)) {
+        break;
+      }
+    } else if (stub >= 0) {
+      /* Resolved to a stub this backend writes itself. Branch to the
+       * canonical name so aliases (mettle_heap_zeroed) share one body. */
+      arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[stub].name));
+    } else {
+      arm64_fail(e,
+                 "'%s' calls '%s', which is neither in this program, a "
+                 "runtime stub, nor an external symbol (the self-contained "
+                 "ELF has no linker)",
+                 fn->name, in->text);
+      break;
+    }
+    if (in->dest.kind == IR_OPERAND_TEMP ||
+        in->dest.kind == IR_OPERAND_SYMBOL) {
+      int dest_agg = in->dest.kind == IR_OPERAND_SYMBOL
+                         ? agg_size_of(ag, in->dest.name)
+                         : 0;
+      int resf = call_returns_float(prog, in, retf) ||
+                 set_has(fs, in->dest.name);
+      if (callee_sret && dest_agg > 8) {
+        /* Copy the returned record straight from the sret buffer. */
+        emit_lea_local(e, R_RHS, slot_off(slots, in->dest.name));
+        arm64_emit_mov(e, 1, R_LHS, ARM64_X0);
+        emit_fixed_copy(e, R_RHS, R_LHS,
+                        callee_sret < dest_agg ? callee_sret : dest_agg);
+      } else if (resf) { /* float result arrives in d0/s0 */
+        int d = call_return_float_bits(prog, in) != 32;
+        arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+        store_dest(e, slots, &in->dest, R_RES);
+      } else {
+        store_dest(e, slots, &in->dest, ARM64_X0);
+      }
+    }
+    break;
+  }
+  default:
+    return 0;
+  }
+  return 1;
+}
+
+static int encode_runtime_instruction(const Arm64Scope *scope,
+                                 const IRInstruction *in) {
+  Arm64Emit *e = scope->e;
+  const IRFunction *fn = scope->fn;
+  LblMap *fns = scope->fns;
+  const IRProgram *prog = scope->prog;
+  const int *retf = scope->retf;
+  Arm64ObjectContext *object = scope->object;
+  SlotMap *slots = scope->slots;
+  LblMap *labels = scope->labels;
+  StrSet *fs = scope->fs;
+  StrSet *us = scope->us;
+  AggMap *ag = scope->ag;
+  NarrowMap *nm = scope->nm;
+  StrSet *wide_params = scope->wide_params;
+  int frame = scope->frame;
+  int sret_size = scope->sret_size;
+  (void)fn;
+  (void)retf;
+
+  (void)e;
+  (void)fn;
+  (void)fns;
+  (void)prog;
+  (void)retf;
+  (void)object;
+  (void)slots;
+  (void)labels;
+  (void)fs;
+  (void)us;
+  (void)ag;
+  (void)nm;
+  (void)wide_params;
+  (void)frame;
+  (void)sret_size;
+  switch (in->op) {
+  case IR_OP_CALL_INDIRECT: {
+    /* Call through a function pointer in `lhs`. Arguments go first: loading a
+     * global operand borrows x16, so the callee address must land there only
+     * once every argument is already in place. x16 is the AAPCS64 IP0 scratch,
+     * which is exactly what an indirect branch target may use. */
+    if (!emit_call_arguments(e, slots, prog, fs, in)) break;
+    load_into(e, slots, &in->lhs, ARM64_X16);
+    arm64_emit_word(e, arm64_blr(ARM64_X16));
+    if (in->dest.kind == IR_OPERAND_TEMP ||
+        in->dest.kind == IR_OPERAND_SYMBOL) {
+      if (call_returns_float(prog, in, retf) || set_has(fs, in->dest.name)) {
+        int d = call_return_float_bits(prog, in) != 32;
+        arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+        store_dest(e, slots, &in->dest, R_RES);
+      } else {
+        store_dest(e, slots, &in->dest, ARM64_X0);
+      }
+    }
+    break;
+  }
+  case IR_OP_NEW: {
+    /* Heap allocation of `rhs` bytes, zeroed. The object path calls owned
+     * calloc(1, size); the self contained path branches to the bump
+     * allocator, whose memory is already zero. */
+    Arm64Reg size_reg = object ? ARM64_X1 : ARM64_X0;
+    if (in->rhs.kind == IR_OPERAND_NONE ||
+        (in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value <= 0)) {
+      emit_imm(e, size_reg, 8);
+    } else if (in->rhs.kind == IR_OPERAND_INT) {
+      emit_imm(e, size_reg, (uint64_t)in->rhs.int_value);
+    } else {
+      load_into(e, slots, &in->rhs, size_reg);
+    }
+    if (object) {
+      emit_imm(e, ARM64_X0, 1);
+      if (!emit_external_call(e, object, prog, "calloc")) break;
+    } else if (fns) {
+      arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[STUB_MALLOC].name));
+    } else {
+      arm64_fail(e, "'%s' allocates, but this path lowers one function in "
+                    "isolation", fn->name);
+      break;
+    }
+    if (in->dest.kind == IR_OPERAND_TEMP ||
+        in->dest.kind == IR_OPERAND_SYMBOL) {
+      store_dest(e, slots, &in->dest, ARM64_X0);
+    }
+    break;
+  }
+  case IR_OP_RETURN:
+    if (sret_size && in->lhs.kind != IR_OPERAND_NONE) {
+      /* Copy the returned record into the caller's buffer and hand the
+       * buffer back in x0. */
+      if (in->lhs.kind == IR_OPERAND_SYMBOL &&
+          agg_size_of(ag, in->lhs.name) > 0) {
+        emit_lea_local(e, R_LHS, slot_off(slots, in->lhs.name));
+      } else {
+        load_into(e, slots, &in->lhs, R_LHS); /* record address */
+      }
+      emit_slot_ldr(e, R_RHS, slot_off(slots, SRET_SAVE_SLOT));
+      emit_fixed_copy(e, R_RHS, R_LHS, sret_size);
+      arm64_emit_mov(e, 1, ARM64_X0, R_RHS);
+      arm64_emit_epilogue(e, frame, NULL, 0);
+      break;
+    }
+    if (in->lhs.kind != IR_OPERAND_NONE) {
+      if (operand_is_float(fs, &in->lhs)) { /* float result goes in d0/s0 */
+        const IRModuleSymbol *current = module_function(prog, fn->name);
+        int d = current && current->return_type
+                    ? current->return_type->kind != MTLC_TYPE_FLOAT32
+                    : operand_float_bits(fs, &in->lhs) != 32;
+        load_float_operand(e, slots, fs, &in->lhs, d, 0, R_LHS);
+      } else {
+        arm64_emit_mov(e, 1, ARM64_X0, load_into(e, slots, &in->lhs, R_LHS));
+      }
+    }
+    arm64_emit_epilogue(e, frame, NULL, 0);
+    break;
+  default:
+    return 0;
+  }
+  return 1;
+}
+
+static void encode_instruction(const Arm64Scope *scope,
+                               const IRInstruction *in) {
+  if (encode_control_instruction(scope, in) ||
+      encode_assign_instruction(scope, in) ||
+      encode_cast_instruction(scope, in) ||
+      encode_memory_instruction(scope, in) ||
+      encode_arithmetic_instruction(scope, in) ||
+      encode_call_instruction(scope, in) ||
+      encode_runtime_instruction(scope, in)) {
+    return;
+  }
+  arm64_fail(scope->e, "'%s' uses %s, which has no AArch64 lowering",
+             scope->fn->name, ir_opcode_name(in->op));
+}
+
 static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
                            const IRProgram *prog, const int *retf,
                            Arm64ObjectContext *object, Arm64Data *data) {
@@ -1968,541 +2823,25 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
     if (e->error) goto done;
   }
 
-  for (size_t i = 0; i < fn->instruction_count && !e->error; i++) {
-    const IRInstruction *in = &fn->instructions[i];
-    switch (in->op) {
-    case IR_OP_NOP:
-      break;
-    case IR_OP_DECLARE_LOCAL: {
-      /* The IR reuses local names across block scopes with different types
-       * (`ref` can be float64 in one block and uint32 in the next). The maps
-       * were seeded with each name's FIRST declaration; from here on, this
-       * declaration is the truth for this name. */
-      const char *name = in->dest.name;
-      if (name) {
-        const MtlcType *t = declared_type(prog, in);
-        int is_scalar_float =
-            t ? mtlc_type_is_float(t) : type_text_is_float_scalar(in->text);
-        int fbits = t ? (t->kind == MTLC_TYPE_FLOAT32 ? 32 : 64)
-                      : type_text_float_bits(in->text);
-        set_rebind(&fs, name, is_scalar_float, is_scalar_float ? fbits : 0);
-        set_rebind(&us, name,
-                   type_text_is_unsigned(in->text) || type_is_unsigned(t), 0);
-        narrow_remove(&nm, name);
-        if (t && !mtlc_type_is_float(t) && !type_is_aggregate(t)) {
-          size_t size = mtlc_type_size(t);
-          if (size == 1 || size == 2 || size == 4) {
-            narrow_add(&nm, name, (int)size, module_type_signed(t));
-          }
-        }
-        agg_remove(&ag, name);
-        if (type_is_aggregate(t)) {
-          agg_add(&ag, name, declare_local_size(prog, in));
-        }
-      }
-      break;
-    }
-    case IR_OP_LABEL:
-      arm64_bind_label(e, label_for(e, &labels, in->text));
-      break;
-    case IR_OP_JUMP:
-      arm64_emit_b(e, label_for(e, &labels, in->text));
-      break;
-    case IR_OP_BRANCH_ZERO:
-      arm64_emit_cbz(e, 1, load_into(e, &slots, &in->lhs, R_LHS),
-                     label_for(e, &labels, in->text));
-      break;
-    case IR_OP_BRANCH_EQ: {
-      Arm64Reg a = load_into(e, &slots, &in->lhs, R_LHS);
-      Arm64Reg b = load_into(e, &slots, &in->rhs, R_RHS);
-      arm64_emit_word(e, arm64_cmp_reg(1, a, b));
-      arm64_emit_bcond(e, ARM64_EQ, label_for(e, &labels, in->text));
-      break;
-    }
-    case IR_OP_ASSIGN: {
-      /* An assignment whose destination is a WIDE aggregate local is a
-       * whole-object copy: the local IS the object. The source's record
-       * address comes from wherever it lives -- another aggregate local, an
-       * aggregate global, a string literal's record, or (for a temp) a
-       * pointer value such as an sret result. Everything else, including a
-       * packed <=8-byte struct, is a one-word move. */
-      int bytes = in->dest.kind == IR_OPERAND_SYMBOL
-                      ? agg_size_of(&ag, in->dest.name)
-                      : 0;
-      int source = in->lhs.kind == IR_OPERAND_SYMBOL
-                       ? agg_size_of(&ag, in->lhs.name)
-                       : 0;
-      if (bytes > 8) {
-        if (source > 0) {
-          emit_lea_local(e, R_LHS, slot_off(&slots, in->lhs.name));
-        } else {
-          /* STRING literals load as a record address; a temp holds one. */
-          load_into(e, &slots, &in->lhs, R_LHS);
-        }
-        emit_lea_local(e, R_RHS, slot_off(&slots, in->dest.name));
-        emit_fixed_copy(e, R_RHS, R_LHS,
-                        source > 0 && source < bytes ? source : bytes);
-        break;
-      }
-      if (bytes > 0 && source > 0) {
-        emit_lea_local(e, R_LHS, slot_off(&slots, in->lhs.name));
-        emit_lea_local(e, R_RHS, slot_off(&slots, in->dest.name));
-        emit_fixed_copy(e, R_RHS, R_LHS, bytes < source ? bytes : source);
-        break;
-      }
-      if (in->lhs.kind == IR_OPERAND_FLOAT ||
-          operand_is_float(&fs, &in->lhs)) {
-        /* A float assignment stores at the DESTINATION's width. The source may
-         * have been computed at the other one (a global float32 updated with a
-         * literal runs in double), and the low half of a double is not a
-         * float. */
-        int dst_bits = 0;
-        const IRModuleSymbol *dst_global =
-            in->dest.kind == IR_OPERAND_SYMBOL &&
-                    slot_find(&slots, in->dest.name) < 0
-                ? module_variable(&slots, in->dest.name)
-                : NULL;
-        if (dst_global && mtlc_type_is_float(dst_global->type)) {
-          dst_bits = dst_global->type->kind == MTLC_TYPE_FLOAT32 ? 32 : 64;
-        } else if (in->dest.kind == IR_OPERAND_SYMBOL ||
-                   in->dest.kind == IR_OPERAND_TEMP) {
-          dst_bits = set_bits(&fs, in->dest.name);
-        }
-        if (dst_bits) {
-          int d = dst_bits != 32;
-          load_float_operand(e, &slots, &fs, &in->lhs, d, 0, R_LHS);
-          arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
-          store_dest(e, &slots, &in->dest, R_RES);
-          break;
-        }
-      }
-      store_dest(e, &slots, &in->dest, load_into(e, &slots, &in->lhs, R_LHS));
-      break;
-    }
-    case IR_OP_CAST: {
-      int srcf = in->is_float;
-      int dstf = in->dest.float_bits != 0;
-      if (srcf && !dstf) { /* float -> int (truncating) */
-        int d = operand_float_bits(&fs, &in->lhs) != 32;
-        arm64_emit_word(e, arm64_fmov_gp(d, 0, load_into(e, &slots, &in->lhs,
-                                                         R_LHS)));
-        arm64_emit_word(e, arm64_fcvtzs(d, R_RES, 0));
-        store_dest(e, &slots, &in->dest, R_RES);
-      } else if (!srcf && dstf) { /* int -> float */
-        int d = in->dest.float_bits != 32;
-        arm64_emit_word(e, arm64_scvtf(d, 0, load_into(e, &slots, &in->lhs,
-                                                       R_LHS)));
-        arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
-        store_dest(e, &slots, &in->dest, R_RES);
-      } else if (srcf && dstf) { /* float -> float */
-        int sd = operand_float_bits(&fs, &in->lhs) != 32;
-        int dd = in->dest.float_bits != 32;
-        arm64_emit_word(e, arm64_fmov_gp(sd, 0, load_into(e, &slots, &in->lhs,
-                                                          R_LHS)));
-        if (sd != dd) {
-          arm64_emit_word(e, arm64_fcvt(dd, 1, 0));
-          arm64_emit_word(e, arm64_fmov_to_gp(dd, R_RES, 1));
-        } else {
-          arm64_emit_word(e, arm64_fmov_to_gp(sd, R_RES, 0));
-        }
-        store_dest(e, &slots, &in->dest, R_RES);
-      } else {
-        /* int -> int: re-express the value as the TARGET integer type. A bit
-         * copy was wrong for every narrowing cast used as a value rather than
-         * stored into a typed local: `(int8)511` answered 511, because only
-         * the store to a declared-narrow slot ever truncated. The value in the
-         * register is already canonical for its own type, so extending its low
-         * `tw` bytes by the target's signedness is the whole conversion. */
-        Arm64Reg src = load_into(e, &slots, &in->lhs, R_LHS);
-        const MtlcType *tt =
-            prog && in->text && !strchr(in->text, '[') && !strchr(in->text, '*')
-                ? ir_program_lookup_type(prog, in->text)
-                : NULL;
-        int tw = tt ? (int)mtlc_type_size(tt) : type_elem_size(in->text);
-        int tu = tt ? type_is_unsigned(tt) : type_text_is_unsigned(in->text);
-        if (tt && type_is_aggregate(tt)) {
-          tw = 8;
-        }
-        if (in->text && strchr(in->text, '*')) {
-          tw = 8;
-        }
-        if (tw == 1 || tw == 2 || tw == 4) {
-          arm64_emit_word(
-              e, tw == 1 ? (tu ? arm64_uxtb(R_RES, src) : arm64_sxtb(R_RES, src))
-                 : tw == 2
-                     ? (tu ? arm64_uxth(R_RES, src) : arm64_sxth(R_RES, src))
-                     : (tu ? arm64_mov_reg(0, R_RES, src)
-                           : arm64_sxtw(R_RES, src)));
-          store_dest(e, &slots, &in->dest, R_RES);
-        } else {
-          store_dest(e, &slots, &in->dest, src);
-        }
-      }
-      break;
-    }
-    case IR_OP_ADDRESS_OF: {
-      const IRModuleSymbol *global =
-          slot_find(&slots, in->lhs.name) < 0
-              ? module_variable(&slots, in->lhs.name)
-              : NULL;
-      if (global) {
-        emit_global_address(e, &slots, R_RES, global);
-      } else if (slot_find(&slots, in->lhs.name) < 0 &&
-                 prog_fn_index(prog, in->lhs.name) >= 0) {
-        emit_function_address(e, &slots, R_RES, in->lhs.name);
-      } else if (set_has(&wide_params, in->lhs.name)) {
-        emit_slot_ldr(e, R_RES, slot_off(&slots, in->lhs.name));
-      } else {
-        emit_lea_local(e, R_RES, slot_off(&slots, in->lhs.name));
-      }
-      store_dest(e, &slots, &in->dest, R_RES);
-      break;
-    }
-    case IR_OP_LOAD: {
-      int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
-      Arm64Reg addr = address_operand(e, &slots, &ag, &in->lhs, R_LHS);
-      if (size > 8) {
-        /* A wide load produces an aggregate VALUE, which travels as its
-         * address. Into an aggregate local: copy the bytes. Into a temp: the
-         * loaded address IS the value. */
-        int dest_agg = in->dest.kind == IR_OPERAND_SYMBOL
-                           ? agg_size_of(&ag, in->dest.name)
-                           : 0;
-        if (dest_agg > 8) {
-          emit_lea_local(e, R_RHS, slot_off(&slots, in->dest.name));
-          emit_fixed_copy(e, R_RHS, addr, size < dest_agg ? size : dest_agg);
-        } else {
-          store_dest(e, &slots, &in->dest, addr);
-        }
-        break;
-      }
-      emit_load_sized(e, R_RES, addr, size,
-                      !in->is_unsigned && !in->is_float);
-      store_dest(e, &slots, &in->dest, R_RES);
-      break;
-    }
-    case IR_OP_STORE: {
-      int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
-      Arm64Reg addr = address_operand(e, &slots, &ag, &in->dest, R_LHS);
-      if (size > 8) {
-        /* Wide store: copy the source record's bytes through the pointer. */
-        Arm64Reg src;
-        if (in->lhs.kind == IR_OPERAND_SYMBOL &&
-            agg_size_of(&ag, in->lhs.name) > 0) {
-          emit_lea_local(e, R_RHS, slot_off(&slots, in->lhs.name));
-          src = R_RHS;
-        } else {
-          src = load_into(e, &slots, &in->lhs, R_RHS); /* record address */
-        }
-        emit_fixed_copy(e, addr, src, size);
-        break;
-      }
-      if ((size == 4 || size == 8) && operand_is_float(&fs, &in->lhs)) {
-        /* A float store's size names the STORAGE width; convert the value to
-         * it first, or a double's low half (or a single's bits zero-padded)
-         * lands in memory. */
-        int d = size == 8;
-        load_float_operand(e, &slots, &fs, &in->lhs, d, 0, R_RHS);
-        arm64_emit_word(e, arm64_fmov_to_gp(d, R_RHS, 0));
-        emit_store_sized(e, R_RHS, addr, size);
-        break;
-      }
-      Arm64Reg val = load_into(e, &slots, &in->lhs, R_RHS);
-      emit_store_sized(e, val, addr, size);
-      break;
-    }
-    case IR_OP_BINARY:
-      if (binary_is_string_concat(in)) {
-        /* result = a + b over { chars, length } records. One block holds the
-         * new record and its characters (record first, chars at +16); bump
-         * memory is fresh-zero, so the NUL after the copied bytes is free. */
-        if (!object && !fns) {
-          arm64_fail(e, "string concatenation in '%s' needs the runtime "
-                        "kernel, which this path does not provide",
-                     fn->name);
-          break;
-        }
-        int off_a = slot_off(&slots, CONCAT_A_SLOT);
-        int off_b = slot_off(&slots, CONCAT_B_SLOT);
-        int off_dst = slot_off(&slots, CONCAT_DST_SLOT);
-        /* Record addresses of both operands, parked across the calls. */
-        if (in->lhs.kind == IR_OPERAND_SYMBOL &&
-            agg_size_of(&ag, in->lhs.name) > 0) {
-          emit_lea_local(e, R_LHS, slot_off(&slots, in->lhs.name));
-        } else {
-          load_into(e, &slots, &in->lhs, R_LHS);
-        }
-        emit_slot_str(e, R_LHS, off_a);
-        if (in->rhs.kind == IR_OPERAND_SYMBOL &&
-            agg_size_of(&ag, in->rhs.name) > 0) {
-          emit_lea_local(e, R_LHS, slot_off(&slots, in->rhs.name));
-        } else {
-          load_into(e, &slots, &in->rhs, R_LHS);
-        }
-        emit_slot_str(e, R_LHS, off_b);
-        /* malloc(16 + len(a) + len(b) + 1) */
-        emit_slot_ldr(e, R_LHS, off_a);
-        arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
-        emit_slot_ldr(e, R_RHS, off_b);
-        arm64_emit_word(e, arm64_ldr_imm(1, R_RHS, R_RHS, 8));
-        arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, R_LHS, R_RHS));
-        arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 17, 0));
-        emit_runtime_call(e, object, prog, fns, STUB_MALLOC);
-        emit_slot_str(e, ARM64_X0, off_dst);
-        /* record: chars = block+16; length = len(a) + len(b) */
-        arm64_emit_word(e, arm64_add_imm(1, R_LHS, ARM64_X0, 16, 0));
-        arm64_emit_word(e, arm64_str_imm(1, R_LHS, ARM64_X0, 0));
-        emit_slot_ldr(e, R_LHS, off_a);
-        arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
-        emit_slot_ldr(e, R_RHS, off_b);
-        arm64_emit_word(e, arm64_ldr_imm(1, R_RHS, R_RHS, 8));
-        arm64_emit_word(e, arm64_add_reg(1, R_LHS, R_LHS, R_RHS));
-        arm64_emit_word(e, arm64_str_imm(1, R_LHS, ARM64_X0, 8));
-        /* memcpy(block+16, a.chars, a.len) */
-        emit_slot_ldr(e, ARM64_X0, off_dst);
-        arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
-        emit_slot_ldr(e, R_LHS, off_a);
-        arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X1, R_LHS, 0));
-        arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
-        emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
-        /* memcpy(block+16+a.len, b.chars, b.len) */
-        emit_slot_ldr(e, ARM64_X0, off_dst);
-        arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
-        emit_slot_ldr(e, R_LHS, off_a);
-        arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
-        arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, ARM64_X0, R_LHS));
-        emit_slot_ldr(e, R_LHS, off_b);
-        arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X1, R_LHS, 0));
-        arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
-        emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
-        /* Terminate. The freestanding allocator hands back fresh-zero memory,
-         * so this is redundant there, but the general allocator need not. */
-        emit_slot_ldr(e, ARM64_X0, off_dst);
-        arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, ARM64_X0, 8));
-        arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
-        arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, ARM64_X0, R_LHS));
-        arm64_emit_word(e, arm64_strb_imm(ARM64_XZR, ARM64_X0, 0));
-        /* The block's start IS the result record. */
-        emit_slot_ldr(e, R_RES, off_dst);
-        if (in->dest.kind == IR_OPERAND_SYMBOL &&
-            agg_size_of(&ag, in->dest.name) > 8) {
-          emit_lea_local(e, R_RHS, slot_off(&slots, in->dest.name));
-          emit_fixed_copy(e, R_RHS, R_RES, 16);
-        } else {
-          store_dest(e, &slots, &in->dest, R_RES);
-        }
-        break;
-      }
-      lower_binary(e, &slots, &fs, &us, in);
-      break;
-    case IR_OP_UNARY:
-      lower_unary(e, &slots, &fs, in);
-      break;
-    case IR_OP_CALL: {
-      if (!fns || !in->text) {
-        arm64_fail(e, in->text
-                          ? "'%s' calls '%s', but this path lowers one function"
-                            " in isolation"
-                          : "'%s' contains a call with no callee name%s",
-                   fn->name, in->text ? in->text : "");
-        break;
-      }
-      /* cstr("literal"): embed the bytes in the loaded segment (branched over),
-       * and materialize their virtual address into dest -- no actual call. */
-      if (strcmp(in->text, "cstr") == 0 && in->argument_count >= 1 &&
-          in->arguments[0].kind == IR_OPERAND_STRING &&
-          in->arguments[0].name) {
-        const char *str = in->arguments[0].name;
-        if (object) {
-          char symbol[64];
-          size_t offset = 0;
-          snprintf(symbol, sizeof(symbol), ".Lmtlc.str.%u",
-                   object->string_id++);
-          if (!binary_emitter_append_bytes(object->emitter,
-                                           object->rodata_section, str,
-                                           strlen(str) + 1, &offset) ||
-              !binary_emitter_define_symbol(
-                  object->emitter, symbol, BINARY_SYMBOL_LOCAL,
-                  object->rodata_section, offset, strlen(str) + 1)) {
-            arm64_fail(e, "could not place a cstr literal in .rodata");
-            break;
-          }
-          emit_symbol_address(e, object, R_RES, symbol);
-        } else {
-          int past = arm64_new_label(e);
-          arm64_emit_b(e, past);
-          size_t soff = arm64_here(e);
-          arm64_emit_bytes(e, str, strlen(str) + 1);
-          arm64_bind_label(e, past);
-          emit_imm(e, R_RES, (uint64_t)ELF_BASE + ELF_HDRS + soff);
-        }
-        if (in->dest.kind == IR_OPERAND_TEMP ||
-            in->dest.kind == IR_OPERAND_SYMBOL) {
-          store_dest(e, &slots, &in->dest, R_RES);
-        }
-        break;
-      }
-      /* Runtime traps in a relocatable object lower to owned puts and exit.
-       * The compact self contained image exits through its local syscall. */
-      if (strcmp(in->text, "mettle_crash_trap_ex") == 0 ||
-          strcmp(in->text, "mettle_crash_trap") == 0) {
-        size_t msg_index =
-            strcmp(in->text, "mettle_crash_trap_ex") == 0 ? 1u : 0u;
-        /* x0 = the message as a CSTRING. A literal goes via the chars-address
-         * emitter, not load_into, whose STRING case yields a record address. */
-        if (in->argument_count > msg_index &&
-            in->arguments[msg_index].kind == IR_OPERAND_STRING) {
-          emit_string_literal_address(e, object,
-                                      in->arguments[msg_index].name, ARM64_X0);
-        } else if (in->argument_count > msg_index) {
-          load_into(e, &slots, &in->arguments[msg_index], ARM64_X0);
-        } else {
-          emit_string_literal_address(e, object, "Fatal error", ARM64_X0);
-        }
-        if (object) {
-          if (!emit_external_call(e, object, prog, "puts")) break;
-          emit_imm(e, ARM64_X0, 1);
-          if (!emit_external_call(e, object, prog, "exit")) break;
-        } else {
-          /* Match the x86 observable: the message on stdout, then exit(1).
-           * The puts stub is emitted whenever a trap is reachable. */
-          arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[STUB_PUTS].name));
-          emit_imm(e, ARM64_X0, 1);
-          arm64_emit_word(e, arm64_movz(1, ARM64_X8, SYS_EXIT, 0));
-          arm64_emit_word(e, ARM64_SVC0);
-        }
-        break;
-      }
-      if (!emit_call_arguments(e, &slots, prog, &fs, in)) break;
-
-      int callee_sret = fn_aggregate_return_size(prog, in->text);
-      if (callee_sret) {
-        emit_lea_local(e, ARM64_X8, slot_off(&slots, SRET_BUFFER_SLOT));
-      }
-      int stub = object ? -1 : runtime_stub_index(in->text);
-      if (prog_fn_index(prog, in->text) >= 0) {
-        arm64_emit_bl(e, label_for(e, fns, in->text));
-      } else if (object) {
-        if (!emit_external_call(e, object, prog, in->text)) {
-          break;
-        }
-      } else if (stub >= 0) {
-        /* Resolved to a stub this backend writes itself. Branch to the
-         * canonical name so aliases (mettle_heap_zeroed) share one body. */
-        arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[stub].name));
-      } else {
-        arm64_fail(e,
-                   "'%s' calls '%s', which is neither in this program, a "
-                   "runtime stub, nor an external symbol (the self-contained "
-                   "ELF has no linker)",
-                   fn->name, in->text);
-        break;
-      }
-      if (in->dest.kind == IR_OPERAND_TEMP ||
-          in->dest.kind == IR_OPERAND_SYMBOL) {
-        int dest_agg = in->dest.kind == IR_OPERAND_SYMBOL
-                           ? agg_size_of(&ag, in->dest.name)
-                           : 0;
-        int resf = call_returns_float(prog, in, retf) ||
-                   set_has(&fs, in->dest.name);
-        if (callee_sret && dest_agg > 8) {
-          /* Copy the returned record straight from the sret buffer. */
-          emit_lea_local(e, R_RHS, slot_off(&slots, in->dest.name));
-          arm64_emit_mov(e, 1, R_LHS, ARM64_X0);
-          emit_fixed_copy(e, R_RHS, R_LHS,
-                          callee_sret < dest_agg ? callee_sret : dest_agg);
-        } else if (resf) { /* float result arrives in d0/s0 */
-          int d = call_return_float_bits(prog, in) != 32;
-          arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
-          store_dest(e, &slots, &in->dest, R_RES);
-        } else {
-          store_dest(e, &slots, &in->dest, ARM64_X0);
-        }
-      }
-      break;
-    }
-    case IR_OP_CALL_INDIRECT: {
-      /* Call through a function pointer in `lhs`. Arguments go first: loading a
-       * global operand borrows x16, so the callee address must land there only
-       * once every argument is already in place. x16 is the AAPCS64 IP0 scratch,
-       * which is exactly what an indirect branch target may use. */
-      if (!emit_call_arguments(e, &slots, prog, &fs, in)) break;
-      load_into(e, &slots, &in->lhs, ARM64_X16);
-      arm64_emit_word(e, arm64_blr(ARM64_X16));
-      if (in->dest.kind == IR_OPERAND_TEMP ||
-          in->dest.kind == IR_OPERAND_SYMBOL) {
-        if (call_returns_float(prog, in, retf) || set_has(&fs, in->dest.name)) {
-          int d = call_return_float_bits(prog, in) != 32;
-          arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
-          store_dest(e, &slots, &in->dest, R_RES);
-        } else {
-          store_dest(e, &slots, &in->dest, ARM64_X0);
-        }
-      }
-      break;
-    }
-    case IR_OP_NEW: {
-      /* Heap allocation of `rhs` bytes, zeroed. The object path calls owned
-       * calloc(1, size); the self contained path branches to the bump
-       * allocator, whose memory is already zero. */
-      Arm64Reg size_reg = object ? ARM64_X1 : ARM64_X0;
-      if (in->rhs.kind == IR_OPERAND_NONE ||
-          (in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value <= 0)) {
-        emit_imm(e, size_reg, 8);
-      } else if (in->rhs.kind == IR_OPERAND_INT) {
-        emit_imm(e, size_reg, (uint64_t)in->rhs.int_value);
-      } else {
-        load_into(e, &slots, &in->rhs, size_reg);
-      }
-      if (object) {
-        emit_imm(e, ARM64_X0, 1);
-        if (!emit_external_call(e, object, prog, "calloc")) break;
-      } else if (fns) {
-        arm64_emit_bl(e, label_for(e, fns, RUNTIME_STUBS[STUB_MALLOC].name));
-      } else {
-        arm64_fail(e, "'%s' allocates, but this path lowers one function in "
-                      "isolation", fn->name);
-        break;
-      }
-      if (in->dest.kind == IR_OPERAND_TEMP ||
-          in->dest.kind == IR_OPERAND_SYMBOL) {
-        store_dest(e, &slots, &in->dest, ARM64_X0);
-      }
-      break;
-    }
-    case IR_OP_RETURN:
-      if (sret_size && in->lhs.kind != IR_OPERAND_NONE) {
-        /* Copy the returned record into the caller's buffer and hand the
-         * buffer back in x0. */
-        if (in->lhs.kind == IR_OPERAND_SYMBOL &&
-            agg_size_of(&ag, in->lhs.name) > 0) {
-          emit_lea_local(e, R_LHS, slot_off(&slots, in->lhs.name));
-        } else {
-          load_into(e, &slots, &in->lhs, R_LHS); /* record address */
-        }
-        emit_slot_ldr(e, R_RHS, slot_off(&slots, SRET_SAVE_SLOT));
-        emit_fixed_copy(e, R_RHS, R_LHS, sret_size);
-        arm64_emit_mov(e, 1, ARM64_X0, R_RHS);
-        arm64_emit_epilogue(e, frame, NULL, 0);
-        break;
-      }
-      if (in->lhs.kind != IR_OPERAND_NONE) {
-        if (operand_is_float(&fs, &in->lhs)) { /* float result goes in d0/s0 */
-          const IRModuleSymbol *current = module_function(prog, fn->name);
-          int d = current && current->return_type
-                      ? current->return_type->kind != MTLC_TYPE_FLOAT32
-                      : operand_float_bits(&fs, &in->lhs) != 32;
-          load_float_operand(e, &slots, &fs, &in->lhs, d, 0, R_LHS);
-        } else {
-          arm64_emit_mov(e, 1, ARM64_X0, load_into(e, &slots, &in->lhs, R_LHS));
-        }
-      }
-      arm64_emit_epilogue(e, frame, NULL, 0);
-      break;
-    default:
-      arm64_fail(e, "'%s' uses %s, which has no AArch64 lowering", fn->name,
-                 ir_opcode_name(in->op));
-      break;
+  {
+    Arm64Scope scope;
+    scope.e = e;
+    scope.fn = fn;
+    scope.fns = fns;
+    scope.prog = prog;
+    scope.retf = retf;
+    scope.object = object;
+    scope.slots = &slots;
+    scope.labels = &labels;
+    scope.fs = &fs;
+    scope.us = &us;
+    scope.ag = &ag;
+    scope.nm = &nm;
+    scope.wide_params = &wide_params;
+    scope.frame = frame;
+    scope.sret_size = sret_size;
+    for (size_t i = 0; i < fn->instruction_count && !e->error; i++) {
+      encode_instruction(&scope, &fn->instructions[i]);
     }
   }
 
