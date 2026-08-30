@@ -1603,13 +1603,135 @@ static int ir_bitset_emit(IRFunction *function, size_t at, size_t last,
  * instruction stream and invalidates the use map built above it, so a
  * function holding several chains -- which is what inlining a predicate
  * like `skip_ws` into every caller produces -- needs one call per chain. */
+static int ir_bitset_match_chain(const IRFunction *function,
+                                 const IRTempUseMap *uses, size_t index,
+                                 long long *keys, size_t *key_count,
+                                 size_t *branch_out) {
+  const IRInstruction *first = &function->instructions[index];
+  const IRInstruction *cmp;
+  const IRInstruction *br;
+  const IRInstruction *lab;
+  size_t scan;
+  size_t tail;
+  size_t branch;
+  size_t label;
+
+  *key_count = 0;
+  if (first->op != IR_OP_BRANCH_EQ || first->is_float || !first->text ||
+      first->rhs.kind != IR_OPERAND_INT ||
+      (first->lhs.kind != IR_OPERAND_TEMP &&
+       first->lhs.kind != IR_OPERAND_SYMBOL) ||
+      !first->lhs.name) {
+    return 0;
+  }
+
+  scan = index;
+  while (scan < function->instruction_count) {
+    const IRInstruction *ins = &function->instructions[scan];
+    if (ins->op == IR_OP_NOP) {
+      scan++;
+      continue;
+    }
+    if (ins->op != IR_OP_BRANCH_EQ || ins->is_float || !ins->text ||
+        strcmp(ins->text, first->text) != 0 ||
+        ins->rhs.kind != IR_OPERAND_INT ||
+        !ir_bitset_same_operand(&ins->lhs, &first->lhs) ||
+        !ir_bitset_key_ok(keys, *key_count, ins->rhs.int_value)) {
+      break;
+    }
+    keys[(*key_count)++] = ins->rhs.int_value;
+    scan++;
+  }
+  if (*key_count == 0 || !ir_find_next_non_nop(function, scan, &tail)) {
+    return 0;
+  }
+
+  cmp = &function->instructions[tail];
+  if (cmp->op != IR_OP_BINARY || cmp->is_float || !cmp->text ||
+      strcmp(cmp->text, "==") != 0 || cmp->rhs.kind != IR_OPERAND_INT ||
+      cmp->dest.kind != IR_OPERAND_TEMP || !cmp->dest.name ||
+      !ir_bitset_same_operand(&cmp->lhs, &first->lhs) ||
+      !ir_bitset_key_ok(keys, *key_count, cmp->rhs.int_value) ||
+      ir_temp_use_map_get(uses, cmp->dest.name) != 1) {
+    return 0;
+  }
+  keys[(*key_count)++] = cmp->rhs.int_value;
+
+  if (!ir_find_next_non_nop(function, tail + 1, &branch)) {
+    return 0;
+  }
+  br = &function->instructions[branch];
+  if (br->op != IR_OP_BRANCH_ZERO || br->lhs.kind != IR_OPERAND_TEMP ||
+      !br->lhs.name || !br->text ||
+      strcmp(br->lhs.name, cmp->dest.name) != 0) {
+    return 0;
+  }
+
+  if (!ir_find_next_non_nop(function, branch + 1, &label)) {
+    return 0;
+  }
+  lab = &function->instructions[label];
+  if (lab->op != IR_OP_LABEL || !lab->text ||
+      strcmp(lab->text, first->text) != 0) {
+    return 0;
+  }
+  if (*key_count < IR_BITSET_MIN_KEYS) {
+    return 0;
+  }
+  *branch_out = branch;
+  return 1;
+}
+
+static int ir_bitset_rewrite_chain(IRFunction *function, size_t index,
+                                   size_t branch, const long long *keys,
+                                   size_t key_count, int *changed) {
+  /* Both are read out of the array before anything is inserted into it: the
+   * chain is rewritten in place, and when it is shorter than the replacement
+   * the room has to be opened first. The old alternative was to decline, which
+   * made the fold depend on how many neighbouring instructions some earlier
+   * pass happened to retire. */
+  IROperand value = ir_operand_copy(&function->instructions[index].lhs);
+  char *miss = mettle_strdup(function->instructions[branch].text);
+  size_t have = branch - index + 1;
+  long long mask = 0;
+  long long max_key = 0;
+  int ok = value.name && miss != NULL;
+
+  for (size_t k = 0; k < key_count; k++) {
+    mask |= 1LL << keys[k];
+    if (keys[k] > max_key) {
+      max_key = keys[k];
+    }
+  }
+
+  if (ok && have < IR_BITSET_SLOTS) {
+    size_t extra = IR_BITSET_SLOTS - have;
+    IRInstruction nop = {0};
+
+    nop.op = IR_OP_NOP;
+    nop.location = function->instructions[index].location;
+    for (size_t k = 0; k < extra && ok; k++) {
+      ok = ir_function_insert_instruction(function, index, &nop);
+    }
+    if (ok) {
+      branch += extra;
+    }
+  }
+  ok = ok && ir_bitset_emit(function, index, branch, &value, mask, max_key,
+                            miss, changed);
+  ir_operand_destroy(&value);
+  mettle_free_string(miss);
+  return ok;
+}
+
 static int ir_or_chain_to_bitset_once(IRFunction *function, int *changed,
                                       int *folded) {
+  IRTempUseMap uses;
+
   *folded = 0;
   if (!function) {
     return 1;
   }
-  IRTempUseMap uses;
   if (!ir_temp_use_map_init(&uses)) {
     return 1;
   }
@@ -1621,122 +1743,17 @@ static int ir_or_chain_to_bitset_once(IRFunction *function, int *changed,
   }
 
   for (size_t i = 0; i < function->instruction_count; i++) {
-    const IRInstruction *first = &function->instructions[i];
     long long keys[IR_BITSET_MAX_KEY + 2];
     size_t key_count = 0;
-    size_t scan;
-    size_t tail;
-    size_t branch;
-    size_t label;
-    long long mask = 0;
-    long long max_key = 0;
-    if (first->op != IR_OP_BRANCH_EQ || first->is_float || !first->text ||
-        first->rhs.kind != IR_OPERAND_INT ||
-        (first->lhs.kind != IR_OPERAND_TEMP &&
-         first->lhs.kind != IR_OPERAND_SYMBOL) ||
-        !first->lhs.name) {
+    size_t branch = 0;
+    if (!ir_bitset_match_chain(function, &uses, i, keys, &key_count,
+                               &branch)) {
       continue;
     }
-
-    scan = i;
-    while (scan < function->instruction_count) {
-      const IRInstruction *ins = &function->instructions[scan];
-      if (ins->op == IR_OP_NOP) {
-        scan++;
-        continue;
-      }
-      if (ins->op != IR_OP_BRANCH_EQ || ins->is_float || !ins->text ||
-          strcmp(ins->text, first->text) != 0 ||
-          ins->rhs.kind != IR_OPERAND_INT ||
-          !ir_bitset_same_operand(&ins->lhs, &first->lhs) ||
-          !ir_bitset_key_ok(keys, key_count, ins->rhs.int_value)) {
-        break;
-      }
-      keys[key_count++] = ins->rhs.int_value;
-      scan++;
-    }
-    if (key_count == 0) {
-      continue;
-    }
-
-    if (!ir_find_next_non_nop(function, scan, &tail)) {
-      continue;
-    }
-    {
-      const IRInstruction *cmp = &function->instructions[tail];
-      if (cmp->op != IR_OP_BINARY || cmp->is_float || !cmp->text ||
-          strcmp(cmp->text, "==") != 0 || cmp->rhs.kind != IR_OPERAND_INT ||
-          cmp->dest.kind != IR_OPERAND_TEMP || !cmp->dest.name ||
-          !ir_bitset_same_operand(&cmp->lhs, &first->lhs) ||
-          !ir_bitset_key_ok(keys, key_count, cmp->rhs.int_value) ||
-          ir_temp_use_map_get(&uses, cmp->dest.name) != 1) {
-        continue;
-      }
-      keys[key_count++] = cmp->rhs.int_value;
-    }
-    if (!ir_find_next_non_nop(function, tail + 1, &branch)) {
-      continue;
-    }
-    {
-      const IRInstruction *br = &function->instructions[branch];
-      const IRInstruction *cmp = &function->instructions[tail];
-      if (br->op != IR_OP_BRANCH_ZERO || br->lhs.kind != IR_OPERAND_TEMP ||
-          !br->lhs.name || !br->text ||
-          strcmp(br->lhs.name, cmp->dest.name) != 0) {
-        continue;
-      }
-    }
-    if (!ir_find_next_non_nop(function, branch + 1, &label)) {
-      continue;
-    }
-    {
-      const IRInstruction *lab = &function->instructions[label];
-      if (lab->op != IR_OP_LABEL || !lab->text ||
-          strcmp(lab->text, first->text) != 0) {
-        continue;
-      }
-    }
-    if (key_count < IR_BITSET_MIN_KEYS) {
-      continue;
-    }
-    for (size_t k = 0; k < key_count; k++) {
-      mask |= 1LL << keys[k];
-      if (keys[k] > max_key) {
-        max_key = keys[k];
-      }
-    }
-    {
-      /* Both are read out of the array before anything is inserted into it:
-       * the chain is rewritten in place, and when it is shorter than the
-       * replacement the room has to be opened first. The old alternative was
-       * to decline, which made the fold depend on how many neighbouring
-       * instructions some earlier pass happened to retire. */
-      IROperand value = ir_operand_copy(&first->lhs);
-      char *miss = mettle_strdup(function->instructions[branch].text);
-      size_t have = branch - i + 1;
-      int ok = value.name && miss != NULL;
-
-      if (ok && have < IR_BITSET_SLOTS) {
-        size_t extra = IR_BITSET_SLOTS - have;
-        IRInstruction nop = {0};
-
-        nop.op = IR_OP_NOP;
-        nop.location = function->instructions[i].location;
-        for (size_t k = 0; k < extra && ok; k++) {
-          ok = ir_function_insert_instruction(function, i, &nop);
-        }
-        if (ok) {
-          branch += extra;
-        }
-      }
-      ok = ok && ir_bitset_emit(function, i, branch, &value, mask, max_key,
-                                miss, changed);
-      ir_operand_destroy(&value);
-      mettle_free_string(miss);
-      ir_temp_use_map_destroy(&uses);
-      *folded = ok;
-      return 1;
-    }
+    *folded =
+        ir_bitset_rewrite_chain(function, i, branch, keys, key_count, changed);
+    ir_temp_use_map_destroy(&uses);
+    return 1;
   }
   ir_temp_use_map_destroy(&uses);
   return 1;

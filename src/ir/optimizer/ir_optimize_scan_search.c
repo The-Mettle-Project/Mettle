@@ -1099,39 +1099,43 @@ int ir_prefix_sum_i32_pass(IRFunction *function, int *changed) {
 }
 
 
-static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index,
-                                       int *changed) {
+typedef struct {
+  IRInstruction *header;
+  size_t branch_index;
+  size_t jump_index;
+  const char *iv_symbol;
+  IROperand len;
+} IRCountedLoop;
+
+static int ir_match_counted_loop(IRFunction *function, size_t header_index,
+                                 IRCountedLoop *loop) {
+  IRInstruction *header;
+  IRInstruction *compare;
+  IRInstruction *branch;
+  const char *loop_label;
   size_t compare_index = 0;
   size_t branch_index = 0;
   size_t jump_index = (size_t)-1;
-  size_t increment_index = 0;
-  const char *iv_symbol = NULL;
-  const char *sum_symbol = NULL;
-  const char *a_symbol = NULL;
-  const char *b_symbol = NULL;
-  const char *sum_type = NULL;
-  const char *loop_label = NULL;
-  IRInstruction fused = {0};
-  IROperand len = {0};
-  int has_mul_add = 0;
+  size_t increment_index;
 
+  memset(loop, 0, sizeof(*loop));
   if (!function || header_index + 4 >= function->instruction_count) {
-    return 1;
+    return -1;
   }
 
-  IRInstruction *header = &function->instructions[header_index];
+  header = &function->instructions[header_index];
   if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
-    return 1;
+    return -1;
   }
   loop_label = header->text;
 
   if (!ir_find_next_non_nop(function, header_index + 1, &compare_index) ||
       !ir_find_next_non_nop(function, compare_index + 1, &branch_index)) {
-    return 1;
+    return -1;
   }
 
-  IRInstruction *compare = &function->instructions[compare_index];
-  IRInstruction *branch = &function->instructions[branch_index];
+  compare = &function->instructions[compare_index];
+  branch = &function->instructions[branch_index];
   if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
       strcmp(compare->text, "<") != 0 ||
       compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
@@ -1140,12 +1144,7 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
       branch->op != IR_OP_BRANCH_ZERO ||
       !ir_operand_is_temp_named(&branch->lhs, compare->dest.name) ||
       !branch->text) {
-    return 1;
-  }
-
-  iv_symbol = compare->lhs.name;
-  if (!ir_operand_clone(&compare->rhs, &len)) {
-    return 0;
+    return -1;
   }
 
   for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
@@ -1164,17 +1163,12 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
   if (jump_index == (size_t)-1 ||
       !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
                                jump_index)) {
-    ir_operand_destroy(&len);
-    return 1;
+    return -1;
   }
-  if (!ir_fused_loop_exit_is_adjacent(function, jump_index, branch->text)) {
-    ir_operand_destroy(&len);
-    return 1; /* threaded exit: fusing would delete the exit edge */
-  }
-
-  if (ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
-    ir_operand_destroy(&len);
-    return 1;
+  /* A threaded exit would lose its edge when the loop is fused away. */
+  if (!ir_fused_loop_exit_is_adjacent(function, jump_index, branch->text) ||
+      ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
+    return -1;
   }
 
   increment_index = jump_index;
@@ -1185,44 +1179,75 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
     }
   }
   if (!ir_try_parse_direct_unit_increment(
-          &function->instructions[increment_index], iv_symbol)) {
-    ir_operand_destroy(&len);
-    return 1;
+          &function->instructions[increment_index], compare->lhs.name)) {
+    return -1;
   }
-  /* The kernel replays a[0..len)*b[0..len): the loop must start at iv == 0,
-   * and the iv must be dead after the loop (the fused op drops it). */
-  if (!ir_iv_zero_at_header(function, header_index, iv_symbol) ||
-      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
-    ir_operand_destroy(&len);
-    return 1;
+  if (!ir_iv_zero_at_header(function, header_index, compare->lhs.name) ||
+      ir_symbol_live_after_loop(function, jump_index + 1, compare->lhs.name)) {
+    return -1;
   }
 
-  for (size_t i = branch_index + 1; i < jump_index; i++) {
+  if (!ir_operand_clone(&compare->rhs, &loop->len)) {
+    return 0;
+  }
+  loop->header = header;
+  loop->branch_index = branch_index;
+  loop->jump_index = jump_index;
+  loop->iv_symbol = compare->lhs.name;
+  return 1;
+}
+
+static int ir_fuse_counted_loop(IRFunction *function, size_t header_index,
+                                IRCountedLoop *loop, IRInstruction *fused,
+                                int *changed) {
+  fused->location = loop->header->location;
+  fused->arguments = calloc(1, sizeof(IROperand));
+  if (!fused->arguments) {
+    ir_operand_destroy(&loop->len);
+    ir_instruction_destroy_storage(fused);
+    return 0;
+  }
+  fused->argument_count = 1;
+  fused->arguments[0] = loop->len;
+
+  ir_instruction_destroy_storage(loop->header);
+  *loop->header = *fused;
+  for (size_t i = header_index + 1; i <= loop->jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+static int ir_dot_scan_body(const IRFunction *function,
+                            const IRCountedLoop *loop, long long width,
+                            int skip_casts, const char **a_symbol,
+                            const char **b_symbol, int *a_unsigned,
+                            int *b_unsigned, const char **sum_symbol) {
+  int has_mul_add = 0;
+  for (size_t i = loop->branch_index + 1; i < loop->jump_index; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL ||
-        ins->op == IR_OP_ASSIGN) {
+        ins->op == IR_OP_ASSIGN ||
+        (skip_casts && ins->op == IR_OP_CAST)) {
       continue;
     }
-    /* Require FOUR-BYTE loads: the kernel reads and strides int32 elements, so
-     * a loop over byte arrays with an int64 accumulator matched here and was
-     * replayed four bytes at a time over the wrong memory. The byte dot is a
-     * separate recognizer, keyed on width 1. */
     if (ins->op == IR_OP_LOAD && ins->lhs.kind == IR_OPERAND_TEMP &&
         ins->lhs.name && ins->rhs.kind == IR_OPERAND_INT &&
-        ins->rhs.int_value == 4) {
+        ins->rhs.int_value == width) {
       const char *base = NULL;
-      if (ir_resolve_indexed_address_temp(function, i, iv_symbol, NULL,
+      if (ir_resolve_indexed_address_temp(function, i, loop->iv_symbol, NULL,
                                           ins->lhs.name, &base, NULL, NULL)) {
-        if (!a_symbol) {
-          a_symbol = base;
-        } else if (!b_symbol && strcmp(base, a_symbol) != 0) {
-          b_symbol = base;
+        if (!*a_symbol) {
+          *a_symbol = base;
+          *a_unsigned = ins->is_unsigned;
+        } else if (!*b_symbol && strcmp(base, *a_symbol) != 0) {
+          *b_symbol = base;
+          *b_unsigned = ins->is_unsigned;
         }
       }
-    }
-    if (ins->op == IR_OP_BINARY && ins->text && strcmp(ins->text, "*") == 0 &&
-        !ins->is_float) {
-      has_mul_add = 1;
     }
     if (ins->op == IR_OP_BINARY && ins->text && strcmp(ins->text, "+") == 0 &&
         !ins->is_float && ins->dest.kind == IR_OPERAND_SYMBOL &&
@@ -1233,50 +1258,57 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
       if (mul && mul->op == IR_OP_BINARY && mul->text &&
           strcmp(mul->text, "*") == 0 && !mul->is_float) {
         has_mul_add = 1;
-        sum_symbol = ins->dest.name;
+        *sum_symbol = ins->dest.name;
       }
     }
   }
+  return has_mul_add;
+}
 
-  if (!has_mul_add || !sum_symbol || !a_symbol || !b_symbol) {
-    ir_operand_destroy(&len);
-    return 1;
+static int ir_dot_bases_are_arrays(const IRFunction *function,
+                                   const char *sum_symbol,
+                                   const char *sum_wanted,
+                                   const char *a_symbol,
+                                   const char *b_symbol) {
+  const char *sum_type = ir_function_local_declared_type(function, sum_symbol);
+  return sum_type && strcmp(sum_type, sum_wanted) == 0 &&
+         ir_symbol_is_sum_array_base(function, a_symbol) &&
+         ir_symbol_is_sum_array_base(function, b_symbol);
+}
+
+static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index,
+                                       int *changed) {
+  IRCountedLoop loop;
+  IRInstruction fused = {0};
+  const char *sum_symbol = NULL;
+  const char *a_symbol = NULL;
+  const char *b_symbol = NULL;
+  int a_unsigned = 0;
+  int b_unsigned = 0;
+  int matched = ir_match_counted_loop(function, header_index, &loop);
+
+  if (matched <= 0) {
+    return matched == 0 ? 0 : 1;
   }
 
-  sum_type = ir_function_local_declared_type(function, sum_symbol);
-  if (!sum_type || strcmp(sum_type, "int64") != 0) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
-  if (!ir_symbol_is_sum_array_base(function, a_symbol) ||
-      !ir_symbol_is_sum_array_base(function, b_symbol)) {
-    ir_operand_destroy(&len);
+  /* Require FOUR-BYTE loads: the kernel reads and strides int32 elements, so a
+   * loop over byte arrays with an int64 accumulator matched here and was
+   * replayed four bytes at a time over the wrong memory. The byte dot is a
+   * separate recognizer, keyed on width 1. */
+  if (!ir_dot_scan_body(function, &loop, 4, 0, &a_symbol, &b_symbol,
+                        &a_unsigned, &b_unsigned, &sum_symbol) ||
+      !sum_symbol || !a_symbol || !b_symbol ||
+      !ir_dot_bases_are_arrays(function, sum_symbol, "int64", a_symbol,
+                               b_symbol)) {
+    ir_operand_destroy(&loop.len);
     return 1;
   }
 
   fused.op = IR_OP_SIMD_DOT_I32;
-  fused.location = header->location;
   fused.dest = ir_operand_symbol(sum_symbol);
   fused.lhs = ir_operand_symbol(a_symbol);
   fused.rhs = ir_operand_symbol(b_symbol);
-  fused.arguments = calloc(1, sizeof(IROperand));
-  if (!fused.arguments) {
-    ir_operand_destroy(&len);
-    ir_instruction_destroy_storage(&fused);
-    return 0;
-  }
-  fused.argument_count = 1;
-  fused.arguments[0] = len;
-
-  ir_instruction_destroy_storage(header);
-  *header = fused;
-  for (size_t i = header_index + 1; i <= jump_index; i++) {
-    ir_instruction_make_nop(&function->instructions[i]);
-  }
-  if (changed) {
-    *changed = 1;
-  }
-  return 1;
+  return ir_fuse_counted_loop(function, header_index, &loop, &fused, changed);
 }
 
 /* int8 x int8 -> int32 dot product: the quantized-GEMM inner loop
@@ -1287,180 +1319,40 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
  * (byte loads feeding a multiply-accumulate reduction), not by name. */
 static int ir_try_vectorize_dot_i8_at(IRFunction *function, size_t header_index,
                                       int *changed) {
-  size_t compare_index = 0, branch_index = 0, jump_index = (size_t)-1;
-  size_t increment_index = 0;
-  const char *iv_symbol = NULL, *sum_symbol = NULL;
-  const char *a_symbol = NULL, *b_symbol = NULL, *sum_type = NULL;
-  const char *loop_label = NULL;
+  IRCountedLoop loop;
   IRInstruction fused = {0};
-  IROperand len = {0};
-  int has_mul_add = 0;
+  const char *sum_symbol = NULL;
+  const char *a_symbol = NULL;
+  const char *b_symbol = NULL;
   /* Whether the byte loads widen zero-extended. A uint8 array and an int8 array
    * reach here in the same shape, and the two dot products differ: the kernel
-   * has to be told which widening the source asked for. */
-  int a_unsigned = 0, b_unsigned = 0;
+   * has to be told which widening the source asked for. Both sides have to
+   * widen the same way; a mixed int8/uint8 dot is not a shape this kernel
+   * has. */
+  int a_unsigned = 0;
+  int b_unsigned = 0;
+  int matched = ir_match_counted_loop(function, header_index, &loop);
 
-  if (!function || header_index + 4 >= function->instruction_count) {
-    return 1;
-  }
-  IRInstruction *header = &function->instructions[header_index];
-  if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
-    return 1;
-  }
-  loop_label = header->text;
-
-  if (!ir_find_next_non_nop(function, header_index + 1, &compare_index) ||
-      !ir_find_next_non_nop(function, compare_index + 1, &branch_index)) {
-    return 1;
-  }
-  IRInstruction *compare = &function->instructions[compare_index];
-  IRInstruction *branch = &function->instructions[branch_index];
-  if (compare->op != IR_OP_BINARY || compare->is_float || !compare->text ||
-      strcmp(compare->text, "<") != 0 ||
-      compare->dest.kind != IR_OPERAND_TEMP || !compare->dest.name ||
-      compare->lhs.kind != IR_OPERAND_SYMBOL || !compare->lhs.name ||
-      compare->rhs.kind != IR_OPERAND_SYMBOL || !compare->rhs.name ||
-      branch->op != IR_OP_BRANCH_ZERO ||
-      !ir_operand_is_temp_named(&branch->lhs, compare->dest.name) ||
-      !branch->text) {
-    return 1;
-  }
-  iv_symbol = compare->lhs.name;
-  if (!ir_operand_clone(&compare->rhs, &len)) {
-    return 0;
+  if (matched <= 0) {
+    return matched == 0 ? 0 : 1;
   }
 
-  for (size_t i = branch_index + 1; i < function->instruction_count; i++) {
-    if (function->instructions[i].op == IR_OP_JUMP &&
-        function->instructions[i].text &&
-        strcmp(function->instructions[i].text, loop_label) == 0) {
-      jump_index = i;
-      break;
-    }
-    if (function->instructions[i].op == IR_OP_LABEL &&
-        function->instructions[i].text &&
-        strcmp(function->instructions[i].text, branch->text) == 0) {
-      break;
-    }
-  }
-  if (jump_index == (size_t)-1 ||
-      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
-                               jump_index)) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
-  if (!ir_fused_loop_exit_is_adjacent(function, jump_index, branch->text)) {
-    ir_operand_destroy(&len);
-    return 1; /* threaded exit: fusing would delete the exit edge */
-  }
-  if (ir_loop_body_is_unclaimable(function, branch_index + 1, jump_index)) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
-
-  increment_index = jump_index;
-  while (increment_index > branch_index + 1) {
-    increment_index--;
-    if (function->instructions[increment_index].op != IR_OP_NOP) {
-      break;
-    }
-  }
-  if (!ir_try_parse_direct_unit_increment(
-          &function->instructions[increment_index], iv_symbol)) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
-  /* The kernel replays a[0..len)*b[0..len): the loop must start at iv == 0,
-   * and the iv must be dead after the loop (the fused op drops it). */
-  if (!ir_iv_zero_at_header(function, header_index, iv_symbol) ||
-      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
-
-  for (size_t i = branch_index + 1; i < jump_index; i++) {
-    const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL ||
-        ins->op == IR_OP_ASSIGN || ins->op == IR_OP_CAST) {
-      continue;
-    }
-    /* Require BYTE loads (width 1): this is what distinguishes an int8 dot from
-     * the int32 dot (width 4). */
-    if (ins->op == IR_OP_LOAD && ins->lhs.kind == IR_OPERAND_TEMP &&
-        ins->lhs.name && ins->rhs.kind == IR_OPERAND_INT &&
-        ins->rhs.int_value == 1) {
-      const char *base = NULL;
-      if (ir_resolve_indexed_address_temp(function, i, iv_symbol, NULL,
-                                          ins->lhs.name, &base, NULL, NULL)) {
-        if (!a_symbol) {
-          a_symbol = base;
-          a_unsigned = ins->is_unsigned;
-        } else if (!b_symbol && strcmp(base, a_symbol) != 0) {
-          b_symbol = base;
-          b_unsigned = ins->is_unsigned;
-        }
-      }
-    }
-    if (ins->op == IR_OP_BINARY && ins->text && strcmp(ins->text, "+") == 0 &&
-        !ins->is_float && ins->dest.kind == IR_OPERAND_SYMBOL &&
-        ins->dest.name && ins->lhs.kind == IR_OPERAND_SYMBOL &&
-        ir_operand_is_symbol_named(&ins->lhs, ins->dest.name)) {
-      const IRInstruction *mul =
-          ir_find_temp_producer_before(function, i, ins->rhs.name);
-      if (mul && mul->op == IR_OP_BINARY && mul->text &&
-          strcmp(mul->text, "*") == 0 && !mul->is_float) {
-        has_mul_add = 1;
-        sum_symbol = ins->dest.name;
-      }
-    }
-  }
-
-  if (!has_mul_add || !sum_symbol || !a_symbol || !b_symbol) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
-  sum_type = ir_function_local_declared_type(function, sum_symbol);
-  if (!sum_type || strcmp(sum_type, "int32") != 0) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
-  if (!ir_symbol_is_sum_array_base(function, a_symbol) ||
-      !ir_symbol_is_sum_array_base(function, b_symbol)) {
-    ir_operand_destroy(&len);
-    return 1;
-  }
-
-  /* Both sides have to widen the same way; a mixed int8/uint8 dot is not a
-   * shape this kernel has. */
-  if (a_unsigned != b_unsigned) {
-    ir_operand_destroy(&len);
+  if (!ir_dot_scan_body(function, &loop, 1, 1, &a_symbol, &b_symbol,
+                        &a_unsigned, &b_unsigned, &sum_symbol) ||
+      !sum_symbol || !a_symbol || !b_symbol ||
+      !ir_dot_bases_are_arrays(function, sum_symbol, "int32", a_symbol,
+                               b_symbol) ||
+      a_unsigned != b_unsigned) {
+    ir_operand_destroy(&loop.len);
     return 1;
   }
 
   fused.op = IR_OP_SIMD_DOT_I8;
   fused.is_unsigned = a_unsigned;
-  fused.location = header->location;
   fused.dest = ir_operand_symbol(sum_symbol);
   fused.lhs = ir_operand_symbol(a_symbol);
   fused.rhs = ir_operand_symbol(b_symbol);
-  fused.arguments = calloc(1, sizeof(IROperand));
-  if (!fused.arguments) {
-    ir_operand_destroy(&len);
-    ir_instruction_destroy_storage(&fused);
-    return 0;
-  }
-  fused.argument_count = 1;
-  fused.arguments[0] = len;
-
-  ir_instruction_destroy_storage(header);
-  *header = fused;
-  for (size_t i = header_index + 1; i <= jump_index; i++) {
-    ir_instruction_make_nop(&function->instructions[i]);
-  }
-  if (changed) {
-    *changed = 1;
-  }
-  return 1;
+  return ir_fuse_counted_loop(function, header_index, &loop, &fused, changed);
 }
 
 static int ir_memcmp_byte_loop_is_indexed_load(const IRFunction *function,

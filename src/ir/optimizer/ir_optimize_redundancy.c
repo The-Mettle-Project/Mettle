@@ -2077,16 +2077,10 @@ static int re_hoist_base_is_dereferenceable(
   return at < body_prefix_end && runs_at_least_once;
 }
 
-static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
-                                 const IRTempValueMap *addr_taken,
-                                 int *changed) {
-  const REDefs defs = *defs_in;
-  static int counter;
-  /* Where the entry block ends. It runs before every loop in the function, so
-   * a base it dereferences is dereferenceable at any header; found once here
-   * rather than per candidate. */
+/* Where the entry block ends. It runs before every loop in the function, so a
+ * base it dereferences is dereferenceable at any header. */
+static size_t re_entry_block_end(const IRFunction *function) {
   size_t entry_end = 0;
-
   while (entry_end < function->instruction_count) {
     IROpcode op = function->instructions[entry_end].op;
     if (op == IR_OP_LABEL || op == IR_OP_JUMP || op == IR_OP_RETURN ||
@@ -2095,30 +2089,158 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
     }
     entry_end++;
   }
+  return entry_end;
+}
+
+/* Control has to fall into the header for a preheader to exist. */
+static int re_header_has_preheader(const IRFunction *function, size_t header) {
+  const IRInstruction *prev;
+  size_t p;
+  if (header == 0) {
+    return 1;
+  }
+  p = header - 1;
+  prev = &function->instructions[p];
+  while (p > 0 && prev->op == IR_OP_NOP) {
+    prev = &function->instructions[--p];
+  }
+  return prev->op != IR_OP_JUMP && prev->op != IR_OP_RETURN &&
+         prev->op != IR_OP_BRANCH_ZERO && prev->op != IR_OP_BRANCH_EQ;
+}
+
+static int re_load_is_hoistable(const IRFunction *function, const REDefs *defs,
+                                REKillLog *writes, size_t header, size_t index,
+                                size_t prefix_end, size_t body_prefix_end,
+                                size_t entry_end, int runs_at_least_once,
+                                REAddr *addr) {
+  IRInstruction *load = &function->instructions[index];
+  char membuf[RE_NAME_MAX + 1];
+
+  if (load->op != IR_OP_LOAD || load->is_volatile ||
+      load->dest.kind != IR_OPERAND_TEMP || !load->dest.name ||
+      load->rhs.kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  re_resolve_addr(function, defs, &load->lhs, addr, 0);
+  if (!addr->valid || !addr->name || !addr->portable || addr->offset < 0 ||
+      addr->offset >= 4096 ||
+      (addr->kind == IR_OPERAND_TEMP && !addr->is_address_of)) {
+    return 0;
+  }
+  if (re_def_count(defs, IR_OPERAND_TEMP, load->dest.name) != 1) {
+    return 0;
+  }
+  if (snprintf(membuf, sizeof(membuf), "%c%s", addr->is_address_of ? '&' : 's',
+               addr->name) >= (int)sizeof(membuf) ||
+      !re_region_survives_log(function, writes, membuf, addr->offset,
+                              load->rhs.int_value, load->alias_class)) {
+    return 0;
+  }
+  return re_hoist_base_is_dereferenceable(
+      function, defs, addr, addr->offset + load->rhs.int_value, header, index,
+      prefix_end, body_prefix_end, entry_end, runs_at_least_once);
+}
+
+/* Preheader: %addr = base + off ; dest <- *%addr. The original load and its
+ * in-loop address chain go to the cleanups behind this pass. */
+static int re_emit_hoist(IRFunction *function, size_t header, size_t index,
+                         const REAddr *addr, const char *addr_name,
+                         int *changed) {
+  IRInstruction *load = &function->instructions[index];
+  IRInstruction lead = {0};
+  IRInstruction body = {0};
+  size_t inserted = 0;
+  int failed = 0;
+
+  if (addr->is_address_of) {
+    lead.op = IR_OP_ADDRESS_OF;
+    lead.dest = ir_operand_temp(addr_name);
+    lead.lhs = ir_operand_symbol(addr->name);
+  } else {
+    lead.op = IR_OP_BINARY;
+    lead.text = mettle_strdup("+");
+    lead.dest = ir_operand_temp(addr_name);
+    lead.lhs = ir_operand_symbol(addr->name);
+    lead.rhs = ir_operand_int(0);
+  }
+  lead.location = load->location;
+  if (!ir_function_insert_instruction(function, header, &lead)) {
+    failed = 1;
+  }
+  ir_instruction_destroy_storage(&lead);
+  if (!failed) {
+    IRInstruction *moved;
+    inserted++;
+    moved = &function->instructions[index + inserted];
+    body.op = IR_OP_LOAD;
+    body.location = moved->location;
+    body.dest = ir_operand_temp(moved->dest.name);
+    body.lhs = ir_operand_temp(addr_name);
+    body.rhs = ir_operand_int(moved->rhs.int_value);
+    body.is_float = moved->is_float;
+    body.float_bits = moved->float_bits;
+    body.is_unsigned = moved->is_unsigned;
+    body.value_type = moved->value_type;
+    body.alias_class = moved->alias_class;
+    if (addr->offset != 0) {
+      /* fold the offset into the lead add */
+      IRInstruction *lead_in = &function->instructions[header];
+      if (lead_in->op == IR_OP_BINARY) {
+        lead_in->rhs.int_value = addr->offset;
+      } else {
+        /* address-of base: append the offset with a second add */
+        IRInstruction add = {0};
+        add.op = IR_OP_BINARY;
+        add.text = mettle_strdup("+");
+        add.dest = ir_operand_temp(addr_name);
+        add.lhs = ir_operand_temp(addr_name);
+        add.rhs = ir_operand_int(addr->offset);
+        add.location = body.location;
+        if (!ir_function_insert_instruction(function, header + 1, &add)) {
+          failed = 1;
+        }
+        ir_instruction_destroy_storage(&add);
+        if (!failed) {
+          inserted++;
+        }
+      }
+    }
+  }
+  if (!failed &&
+      ir_function_insert_instruction(function, header + inserted, &body)) {
+    inserted++;
+    ir_instruction_make_nop(&function->instructions[index + inserted]);
+    if (changed) {
+      *changed = 1;
+    }
+  }
+  ir_instruction_destroy_storage(&body);
+  return failed ? 0 : 1;
+}
+
+static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
+                                 const IRTempValueMap *addr_taken,
+                                 int *changed) {
+  const REDefs defs = *defs_in;
+  static int counter;
+  size_t entry_end = re_entry_block_end(function);
 
   for (size_t header = 0; header < function->instruction_count; header++) {
     const IRInstruction *label = &function->instructions[header];
+    REKillLog writes = {0};
+    size_t latch;
+    size_t prefix_end;
+    size_t body_prefix_end;
+    int runs_at_least_once;
+
     if (label->op != IR_OP_LABEL || !re_label_is_loop_header(label->text)) {
       continue;
     }
-    size_t latch = re_loop_latch(function, header);
-    if (!latch) {
+    latch = re_loop_latch(function, header);
+    if (!latch || !re_header_has_preheader(function, header)) {
       continue;
     }
-    /* Control has to fall into the header for a preheader to exist. */
-    if (header > 0) {
-      const IRInstruction *prev = &function->instructions[header - 1];
-      size_t p = header - 1;
-      while (p > 0 && prev->op == IR_OP_NOP) {
-        prev = &function->instructions[--p];
-      }
-      if (prev->op == IR_OP_JUMP || prev->op == IR_OP_RETURN ||
-          prev->op == IR_OP_BRANCH_ZERO || prev->op == IR_OP_BRANCH_EQ) {
-        continue;
-      }
-    }
 
-    REKillLog writes = {0};
     if (!re_collect_loop_writes(function, &defs, addr_taken, header + 1, latch,
                                 &writes)) {
       re_kills_destroy(&writes);
@@ -2127,122 +2249,29 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
 
     /* The header's straight-line prefix runs on every entry to the loop; a
      * base it dereferences is a base a hoisted load may touch. */
-    size_t prefix_end = re_straight_line_end(function, header + 1, latch, latch);
+    prefix_end = re_straight_line_end(function, header + 1, latch, latch);
 
     /* How far into the body control gets without taking a branch, past the
      * loop's own guard: a load before that runs on every iteration that runs
      * at all. */
-    size_t body_prefix_end =
-        re_straight_line_end(function, prefix_end + 1, latch, latch);
-    int runs_at_least_once =
+    body_prefix_end = re_straight_line_end(function, prefix_end + 1, latch,
+                                           latch);
+    runs_at_least_once =
         re_loop_runs_at_least_once(function, &defs, header, latch);
 
     for (size_t i = header + 1; i < latch; i++) {
-      IRInstruction *load = &function->instructions[i];
       REAddr addr = {0};
-      char membuf[RE_NAME_MAX + 1];
-      if (load->op != IR_OP_LOAD || load->is_volatile ||
-          load->dest.kind != IR_OPERAND_TEMP || !load->dest.name ||
-          load->rhs.kind != IR_OPERAND_INT) {
-        continue;
-      }
-      re_resolve_addr(function, &defs, &load->lhs, &addr, 0);
-      if (!addr.valid || !addr.name || !addr.portable || addr.offset < 0 ||
-          addr.offset >= 4096 ||
-          (addr.kind == IR_OPERAND_TEMP && !addr.is_address_of)) {
-        continue;
-      }
-      if (re_def_count(&defs, IR_OPERAND_TEMP, load->dest.name) != 1) {
-        continue;
-      }
-      if (snprintf(membuf, sizeof(membuf), "%c%s",
-                   addr.is_address_of ? '&' : 's',
-                   addr.name) >= (int)sizeof(membuf) ||
-          !re_region_survives_log(function, &writes, membuf, addr.offset,
-                                  load->rhs.int_value, load->alias_class)) {
-        continue;
-      }
-
-      if (!re_hoist_base_is_dereferenceable(
-              function, &defs, &addr, addr.offset + load->rhs.int_value,
-              header, i, prefix_end, body_prefix_end, entry_end,
-              runs_at_least_once)) {
-        continue;
-      }
-
-      /* Preheader: %addr = base + off ; dest <- *%addr. The original load and
-       * its in-loop address chain go to the cleanups behind this pass. */
       char addr_name[48];
+      int hoisted;
+      if (!re_load_is_hoistable(function, &defs, &writes, header, i,
+                                prefix_end, body_prefix_end, entry_end,
+                                runs_at_least_once, &addr)) {
+        continue;
+      }
       snprintf(addr_name, sizeof(addr_name), "__licm_%d", counter++);
-      IRInstruction lead = {0};
-      IRInstruction body = {0};
-      size_t inserted = 0;
-      int failed = 0;
-
-      if (addr.is_address_of) {
-        lead.op = IR_OP_ADDRESS_OF;
-        lead.dest = ir_operand_temp(addr_name);
-        lead.lhs = ir_operand_symbol(addr.name);
-      } else {
-        lead.op = IR_OP_BINARY;
-        lead.text = mettle_strdup("+");
-        lead.dest = ir_operand_temp(addr_name);
-        lead.lhs = ir_operand_symbol(addr.name);
-        lead.rhs = ir_operand_int(0);
-      }
-      lead.location = load->location;
-      if (!ir_function_insert_instruction(function, header, &lead)) {
-        failed = 1;
-      }
-      ir_instruction_destroy_storage(&lead);
-      if (!failed) {
-        inserted++;
-        IRInstruction *moved = &function->instructions[i + inserted];
-        body.op = IR_OP_LOAD;
-        body.location = moved->location;
-        body.dest = ir_operand_temp(moved->dest.name);
-        body.lhs = ir_operand_temp(addr_name);
-        body.rhs = ir_operand_int(moved->rhs.int_value);
-        body.is_float = moved->is_float;
-        body.float_bits = moved->float_bits;
-        body.is_unsigned = moved->is_unsigned;
-        body.value_type = moved->value_type;
-        body.alias_class = moved->alias_class;
-        if (addr.offset != 0) {
-          /* fold the offset into the lead add */
-          IRInstruction *lead_in = &function->instructions[header];
-          if (lead_in->op == IR_OP_BINARY) {
-            lead_in->rhs.int_value = addr.offset;
-          } else {
-            /* address-of base: append the offset with a second add */
-            IRInstruction add = {0};
-            add.op = IR_OP_BINARY;
-            add.text = mettle_strdup("+");
-            add.dest = ir_operand_temp(addr_name);
-            add.lhs = ir_operand_temp(addr_name);
-            add.rhs = ir_operand_int(addr.offset);
-            add.location = body.location;
-            if (!ir_function_insert_instruction(function, header + 1, &add)) {
-              failed = 1;
-            }
-            ir_instruction_destroy_storage(&add);
-            if (!failed) {
-              inserted++;
-            }
-          }
-        }
-      }
-      if (!failed &&
-          ir_function_insert_instruction(function, header + inserted, &body)) {
-        inserted++;
-        ir_instruction_make_nop(&function->instructions[i + inserted]);
-        if (changed) {
-          *changed = 1;
-        }
-      }
-      ir_instruction_destroy_storage(&body);
+      hoisted = re_emit_hoist(function, header, i, &addr, addr_name, changed);
       re_kills_destroy(&writes);
-      return failed ? 0 : 1;
+      return hoisted;
     }
     re_kills_destroy(&writes);
   }
