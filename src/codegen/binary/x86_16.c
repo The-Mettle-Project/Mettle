@@ -721,6 +721,255 @@ static int x86_narrow_fill(X86NarrowEmitter *emitter, long long width) {
   return 1;
 }
 
+static int x86_narrow_branch_eq(X86NarrowEmitter *emitter,
+                         const IRInstruction *instruction) {
+  char text[160];
+  if (!x86_narrow_load_into(emitter, emitter->accumulator,
+                            &instruction->lhs)) {
+    return 0;
+  }
+  if (!x86_narrow_operand_text(emitter, &instruction->rhs, text,
+                               sizeof(text))) {
+    x86_narrow_fail(emitter, "'%s' cannot compare that operand in %d-bit code",
+                    emitter->function->name, emitter->bits);
+    return 0;
+  }
+  if (instruction->rhs.kind == IR_OPERAND_INT) {
+    return x86_narrow_emit(emitter, "cmp %s, %s\nje %s\n",
+                           emitter->accumulator, text, instruction->text);
+  }
+  return x86_narrow_emit(emitter, "mov %s, %s\ncmp %s, %s\nje %s\n",
+                         emitter->base, text, emitter->accumulator,
+                         emitter->base, instruction->text);
+}
+
+static int x86_narrow_cast(X86NarrowEmitter *emitter,
+                         const IRInstruction *instruction) {
+  /* A narrow local lives in a whole-word slot here, so the store never
+   * truncates and the cast is the only place the width is applied. Treating
+   * it as an assignment left `(uint8)321` answering 321 and `(int8)200`
+   * answering 200. Truncate in the accumulator, then extend by the target's
+   * signedness so the word slot holds the value the type says it does. */
+  const MtlcType *target =
+      instruction->text ? code_generator_named_type(emitter->generator,
+                                                    instruction->text)
+                        : NULL;
+  int size = target ? code_generator_binary_resolved_type_scalar_size(
+                          (MtlcType *)target)
+                    : emitter->word;
+  int is_signed =
+      target ? code_generator_binary_resolved_type_is_signed_integer(
+                   (MtlcType *)target)
+             : 1;
+  if (!x86_narrow_load_into(emitter, emitter->accumulator,
+                            &instruction->lhs)) {
+    return 0;
+  }
+  if (size == 1 && emitter->word == 2) {
+    if (!x86_narrow_emit(emitter, is_signed ? "cbw\n"
+                                            : "and ax, 255\n")) {
+      return 0;
+    }
+  } else if (size == 1 && emitter->word == 4) {
+    if (!x86_narrow_emit(emitter, "%s eax, al\n",
+                         is_signed ? "movsx" : "movzx")) {
+      return 0;
+    }
+  } else if (size == 2 && emitter->word == 4) {
+    if (!x86_narrow_emit(emitter, "%s eax, ax\n",
+                         is_signed ? "movsx" : "movzx")) {
+      return 0;
+    }
+  }
+  return x86_narrow_store_from(emitter, &instruction->dest,
+                               emitter->accumulator);
+}
+
+static int x86_narrow_unary(X86NarrowEmitter *emitter,
+                         const IRInstruction *instruction) {
+  const char *op = instruction->text ? instruction->text : "";
+  if (!x86_narrow_load_into(emitter, emitter->accumulator,
+                            &instruction->lhs)) {
+    return 0;
+  }
+  if (strcmp(op, "-") == 0) {
+    if (!x86_narrow_emit(emitter, "neg %s\n", emitter->accumulator)) {
+      return 0;
+    }
+  } else if (strcmp(op, "~") == 0) {
+    if (!x86_narrow_emit(emitter, "not %s\n", emitter->accumulator)) {
+      return 0;
+    }
+  } else if (strcmp(op, "!") == 0) {
+    int label = emitter->label_serial++;
+    if (!x86_narrow_emit(emitter,
+                         "test %s, %s\njz .not_true_%d\nmov %s, 0\n"
+                         "jmp short .not_end_%d\n.not_true_%d:\nmov %s, 1\n"
+                         ".not_end_%d:\n",
+                         emitter->accumulator, emitter->accumulator, label,
+                         emitter->accumulator, label, label,
+                         emitter->accumulator, label)) {
+      return 0;
+    }
+  } else if (strcmp(op, "+") != 0) {
+    x86_narrow_fail(emitter,
+                    "'%s' uses the unary operator `%s`, which %d-bit code "
+                    "generation does not support",
+                    emitter->function->name, op, emitter->bits);
+    return 0;
+  }
+  return x86_narrow_store_from(emitter, &instruction->dest,
+                               emitter->accumulator);
+}
+
+static int x86_narrow_address_of(X86NarrowEmitter *emitter,
+                         const IRInstruction *instruction) {
+  int offset = 0;
+  if (instruction->lhs.name &&
+      x86_narrow_slots_find(&emitter->slots, instruction->lhs.name,
+                            &offset)) {
+    if (!x86_narrow_emit(emitter, "lea %s, [%s %c %d]\n",
+                         emitter->accumulator, emitter->frame,
+                         offset < 0 ? '-' : '+',
+                         offset < 0 ? -offset : offset)) {
+      return 0;
+    }
+  } else if (instruction->lhs.name &&
+             x86_narrow_symbol_is_global(emitter, instruction->lhs.name)) {
+    const char *link_name = code_generator_get_link_symbol_name(
+        emitter->generator, instruction->lhs.name);
+    if (!x86_narrow_emit(emitter, "mov %s, %s\n", emitter->accumulator,
+                         link_name && link_name[0] ? link_name
+                                                   : instruction->lhs.name)) {
+      return 0;
+    }
+  } else {
+    x86_narrow_fail(emitter,
+                    "'%s' takes the address of '%s', which %d-bit code "
+                    "generation cannot place",
+                    emitter->function->name,
+                    instruction->lhs.name ? instruction->lhs.name : "<value>",
+                    emitter->bits);
+    return 0;
+  }
+  return x86_narrow_store_from(emitter, &instruction->dest,
+                               emitter->accumulator);
+}
+
+static int x86_narrow_load(X86NarrowEmitter *emitter,
+                         const IRInstruction *instruction) {
+  long long width = instruction->rhs.kind == IR_OPERAND_INT
+                        ? instruction->rhs.int_value
+                        : emitter->word;
+  if (!x86_narrow_load_into(emitter, emitter->base, &instruction->lhs)) {
+    return 0;
+  }
+  if (width == 1 && emitter->word == 2) {
+    /* movzx and movsx are 386 instructions. A 16-bit image that used them
+     * ran on nothing the target names: the project's own real-mode emulator
+     * reports an unimplemented opcode, and so would an 8086. */
+    if (!x86_narrow_emit(emitter,
+                         instruction->is_unsigned
+                             ? "xor ax, ax\nmov al, byte ptr [%s]\n"
+                             : "mov al, byte ptr [%s]\ncbw\n",
+                         emitter->base)) {
+      return 0;
+    }
+  } else if (width == 1 || (width == 2 && emitter->word == 4)) {
+    if (!x86_narrow_emit(emitter, "%s %s, %s ptr [%s]\n",
+                         instruction->is_unsigned ? "movzx" : "movsx",
+                         emitter->accumulator, width == 1 ? "byte" : "word",
+                         emitter->base)) {
+      return 0;
+    }
+  } else if (width == emitter->word) {
+    if (!x86_narrow_emit(emitter, "mov %s, [%s]\n", emitter->accumulator,
+                         emitter->base)) {
+      return 0;
+    }
+  } else {
+    x86_narrow_fail(emitter,
+                    "'%s' loads %lld bytes, which %d-bit code generation "
+                    "cannot hold in a register",
+                    emitter->function->name, width, emitter->bits);
+    return 0;
+  }
+  return x86_narrow_store_from(emitter, &instruction->dest,
+                               emitter->accumulator);
+}
+
+static int x86_narrow_store(X86NarrowEmitter *emitter,
+                         const IRInstruction *instruction) {
+  long long width = instruction->rhs.kind == IR_OPERAND_INT
+                        ? instruction->rhs.int_value
+                        : emitter->word;
+  if (!x86_narrow_load_into(emitter, emitter->accumulator,
+                            &instruction->lhs)) {
+    return 0;
+  }
+  if (!x86_narrow_load_into(emitter, emitter->base, &instruction->dest)) {
+    return 0;
+  }
+  if (width == 1) {
+    return x86_narrow_emit(emitter, "mov [%s], al\n", emitter->base);
+  }
+  if (width == 2) {
+    return x86_narrow_emit(emitter, "mov [%s], ax\n", emitter->base);
+  }
+  if (width == 4 && emitter->word == 4) {
+    return x86_narrow_emit(emitter, "mov [%s], eax\n", emitter->base);
+  }
+  if (width > emitter->word) {
+    return x86_narrow_fill(emitter, width);
+  }
+  x86_narrow_fail(emitter,
+                  "'%s' stores %lld bytes, which %d-bit code generation "
+                  "cannot hold in a register",
+                  emitter->function->name, width, emitter->bits);
+  return 0;
+  return 0;
+}
+
+static int x86_narrow_call(X86NarrowEmitter *emitter,
+                         const IRInstruction *instruction) {
+  size_t i;
+  if (!instruction->text) {
+    x86_narrow_fail(emitter, "'%s' has a call with no callee",
+                    emitter->function->name);
+    return 0;
+  }
+  for (i = instruction->argument_count; i > 0; i--) {
+    char text[160];
+    const IROperand *argument = &instruction->arguments[i - 1];
+    if (!x86_narrow_operand_text(emitter, argument, text, sizeof(text))) {
+      x86_narrow_fail(emitter,
+                      "'%s' passes an argument %d-bit code generation cannot "
+                      "place",
+                      emitter->function->name, emitter->bits);
+      return 0;
+    }
+    if (argument->kind == IR_OPERAND_INT) {
+      if (!x86_narrow_emit(emitter, "mov %s, %s\npush %s\n",
+                           emitter->accumulator, text,
+                           emitter->accumulator)) {
+        return 0;
+      }
+    } else if (!x86_narrow_emit(emitter, "push %s\n", text)) {
+      return 0;
+    }
+  }
+  if (!x86_narrow_emit(emitter, "call %s\n", instruction->text)) {
+    return 0;
+  }
+  if (instruction->argument_count &&
+      !x86_narrow_emit(emitter, "add %s, %zu\n", emitter->stack,
+                       instruction->argument_count * (size_t)emitter->word)) {
+    return 0;
+  }
+  return x86_narrow_store_from(emitter, &instruction->dest,
+                               emitter->accumulator);
+}
+
 static int x86_narrow_instruction(X86NarrowEmitter *emitter,
                                   const IRInstruction *instruction) {
   switch (instruction->op) {
@@ -760,26 +1009,8 @@ static int x86_narrow_instruction(X86NarrowEmitter *emitter,
                            emitter->accumulator, emitter->accumulator,
                            instruction->text);
 
-  case IR_OP_BRANCH_EQ: {
-    char text[160];
-    if (!x86_narrow_load_into(emitter, emitter->accumulator,
-                              &instruction->lhs)) {
-      return 0;
-    }
-    if (!x86_narrow_operand_text(emitter, &instruction->rhs, text,
-                                 sizeof(text))) {
-      x86_narrow_fail(emitter, "'%s' cannot compare that operand in %d-bit code",
-                      emitter->function->name, emitter->bits);
-      return 0;
-    }
-    if (instruction->rhs.kind == IR_OPERAND_INT) {
-      return x86_narrow_emit(emitter, "cmp %s, %s\nje %s\n",
-                             emitter->accumulator, text, instruction->text);
-    }
-    return x86_narrow_emit(emitter, "mov %s, %s\ncmp %s, %s\nje %s\n",
-                           emitter->base, text, emitter->accumulator,
-                           emitter->base, instruction->text);
-  }
+  case IR_OP_BRANCH_EQ:
+    return x86_narrow_branch_eq(emitter, instruction);
 
   case IR_OP_ASSIGN:
     if (!x86_narrow_load_into(emitter, emitter->accumulator,
@@ -789,228 +1020,26 @@ static int x86_narrow_instruction(X86NarrowEmitter *emitter,
     return x86_narrow_store_from(emitter, &instruction->dest,
                                  emitter->accumulator);
 
-  case IR_OP_CAST: {
-    /* A narrow local lives in a whole-word slot here, so the store never
-     * truncates and the cast is the only place the width is applied. Treating
-     * it as an assignment left `(uint8)321` answering 321 and `(int8)200`
-     * answering 200. Truncate in the accumulator, then extend by the target's
-     * signedness so the word slot holds the value the type says it does. */
-    const MtlcType *target =
-        instruction->text ? code_generator_named_type(emitter->generator,
-                                                      instruction->text)
-                          : NULL;
-    int size = target ? code_generator_binary_resolved_type_scalar_size(
-                            (MtlcType *)target)
-                      : emitter->word;
-    int is_signed =
-        target ? code_generator_binary_resolved_type_is_signed_integer(
-                     (MtlcType *)target)
-               : 1;
-    if (!x86_narrow_load_into(emitter, emitter->accumulator,
-                              &instruction->lhs)) {
-      return 0;
-    }
-    if (size == 1 && emitter->word == 2) {
-      if (!x86_narrow_emit(emitter, is_signed ? "cbw\n"
-                                              : "and ax, 255\n")) {
-        return 0;
-      }
-    } else if (size == 1 && emitter->word == 4) {
-      if (!x86_narrow_emit(emitter, "%s eax, al\n",
-                           is_signed ? "movsx" : "movzx")) {
-        return 0;
-      }
-    } else if (size == 2 && emitter->word == 4) {
-      if (!x86_narrow_emit(emitter, "%s eax, ax\n",
-                           is_signed ? "movsx" : "movzx")) {
-        return 0;
-      }
-    }
-    return x86_narrow_store_from(emitter, &instruction->dest,
-                                 emitter->accumulator);
-  }
+  case IR_OP_CAST:
+    return x86_narrow_cast(emitter, instruction);
 
   case IR_OP_BINARY:
     return x86_narrow_binary(emitter, instruction);
 
-  case IR_OP_UNARY: {
-    const char *op = instruction->text ? instruction->text : "";
-    if (!x86_narrow_load_into(emitter, emitter->accumulator,
-                              &instruction->lhs)) {
-      return 0;
-    }
-    if (strcmp(op, "-") == 0) {
-      if (!x86_narrow_emit(emitter, "neg %s\n", emitter->accumulator)) {
-        return 0;
-      }
-    } else if (strcmp(op, "~") == 0) {
-      if (!x86_narrow_emit(emitter, "not %s\n", emitter->accumulator)) {
-        return 0;
-      }
-    } else if (strcmp(op, "!") == 0) {
-      int label = emitter->label_serial++;
-      if (!x86_narrow_emit(emitter,
-                           "test %s, %s\njz .not_true_%d\nmov %s, 0\n"
-                           "jmp short .not_end_%d\n.not_true_%d:\nmov %s, 1\n"
-                           ".not_end_%d:\n",
-                           emitter->accumulator, emitter->accumulator, label,
-                           emitter->accumulator, label, label,
-                           emitter->accumulator, label)) {
-        return 0;
-      }
-    } else if (strcmp(op, "+") != 0) {
-      x86_narrow_fail(emitter,
-                      "'%s' uses the unary operator `%s`, which %d-bit code "
-                      "generation does not support",
-                      emitter->function->name, op, emitter->bits);
-      return 0;
-    }
-    return x86_narrow_store_from(emitter, &instruction->dest,
-                                 emitter->accumulator);
-  }
+  case IR_OP_UNARY:
+    return x86_narrow_unary(emitter, instruction);
 
-  case IR_OP_ADDRESS_OF: {
-    int offset = 0;
-    if (instruction->lhs.name &&
-        x86_narrow_slots_find(&emitter->slots, instruction->lhs.name,
-                              &offset)) {
-      if (!x86_narrow_emit(emitter, "lea %s, [%s %c %d]\n",
-                           emitter->accumulator, emitter->frame,
-                           offset < 0 ? '-' : '+',
-                           offset < 0 ? -offset : offset)) {
-        return 0;
-      }
-    } else if (instruction->lhs.name &&
-               x86_narrow_symbol_is_global(emitter, instruction->lhs.name)) {
-      const char *link_name = code_generator_get_link_symbol_name(
-          emitter->generator, instruction->lhs.name);
-      if (!x86_narrow_emit(emitter, "mov %s, %s\n", emitter->accumulator,
-                           link_name && link_name[0] ? link_name
-                                                     : instruction->lhs.name)) {
-        return 0;
-      }
-    } else {
-      x86_narrow_fail(emitter,
-                      "'%s' takes the address of '%s', which %d-bit code "
-                      "generation cannot place",
-                      emitter->function->name,
-                      instruction->lhs.name ? instruction->lhs.name : "<value>",
-                      emitter->bits);
-      return 0;
-    }
-    return x86_narrow_store_from(emitter, &instruction->dest,
-                                 emitter->accumulator);
-  }
+  case IR_OP_ADDRESS_OF:
+    return x86_narrow_address_of(emitter, instruction);
 
-  case IR_OP_LOAD: {
-    long long width = instruction->rhs.kind == IR_OPERAND_INT
-                          ? instruction->rhs.int_value
-                          : emitter->word;
-    if (!x86_narrow_load_into(emitter, emitter->base, &instruction->lhs)) {
-      return 0;
-    }
-    if (width == 1 && emitter->word == 2) {
-      /* movzx and movsx are 386 instructions. A 16-bit image that used them
-       * ran on nothing the target names: the project's own real-mode emulator
-       * reports an unimplemented opcode, and so would an 8086. */
-      if (!x86_narrow_emit(emitter,
-                           instruction->is_unsigned
-                               ? "xor ax, ax\nmov al, byte ptr [%s]\n"
-                               : "mov al, byte ptr [%s]\ncbw\n",
-                           emitter->base)) {
-        return 0;
-      }
-    } else if (width == 1 || (width == 2 && emitter->word == 4)) {
-      if (!x86_narrow_emit(emitter, "%s %s, %s ptr [%s]\n",
-                           instruction->is_unsigned ? "movzx" : "movsx",
-                           emitter->accumulator, width == 1 ? "byte" : "word",
-                           emitter->base)) {
-        return 0;
-      }
-    } else if (width == emitter->word) {
-      if (!x86_narrow_emit(emitter, "mov %s, [%s]\n", emitter->accumulator,
-                           emitter->base)) {
-        return 0;
-      }
-    } else {
-      x86_narrow_fail(emitter,
-                      "'%s' loads %lld bytes, which %d-bit code generation "
-                      "cannot hold in a register",
-                      emitter->function->name, width, emitter->bits);
-      return 0;
-    }
-    return x86_narrow_store_from(emitter, &instruction->dest,
-                                 emitter->accumulator);
-  }
+  case IR_OP_LOAD:
+    return x86_narrow_load(emitter, instruction);
 
-  case IR_OP_STORE: {
-    long long width = instruction->rhs.kind == IR_OPERAND_INT
-                          ? instruction->rhs.int_value
-                          : emitter->word;
-    if (!x86_narrow_load_into(emitter, emitter->accumulator,
-                              &instruction->lhs)) {
-      return 0;
-    }
-    if (!x86_narrow_load_into(emitter, emitter->base, &instruction->dest)) {
-      return 0;
-    }
-    if (width == 1) {
-      return x86_narrow_emit(emitter, "mov [%s], al\n", emitter->base);
-    }
-    if (width == 2) {
-      return x86_narrow_emit(emitter, "mov [%s], ax\n", emitter->base);
-    }
-    if (width == 4 && emitter->word == 4) {
-      return x86_narrow_emit(emitter, "mov [%s], eax\n", emitter->base);
-    }
-    if (width > emitter->word) {
-      return x86_narrow_fill(emitter, width);
-    }
-    x86_narrow_fail(emitter,
-                    "'%s' stores %lld bytes, which %d-bit code generation "
-                    "cannot hold in a register",
-                    emitter->function->name, width, emitter->bits);
-    return 0;
-  }
+  case IR_OP_STORE:
+    return x86_narrow_store(emitter, instruction);
 
-  case IR_OP_CALL: {
-    size_t i;
-    if (!instruction->text) {
-      x86_narrow_fail(emitter, "'%s' has a call with no callee",
-                      emitter->function->name);
-      return 0;
-    }
-    for (i = instruction->argument_count; i > 0; i--) {
-      char text[160];
-      const IROperand *argument = &instruction->arguments[i - 1];
-      if (!x86_narrow_operand_text(emitter, argument, text, sizeof(text))) {
-        x86_narrow_fail(emitter,
-                        "'%s' passes an argument %d-bit code generation cannot "
-                        "place",
-                        emitter->function->name, emitter->bits);
-        return 0;
-      }
-      if (argument->kind == IR_OPERAND_INT) {
-        if (!x86_narrow_emit(emitter, "mov %s, %s\npush %s\n",
-                             emitter->accumulator, text,
-                             emitter->accumulator)) {
-          return 0;
-        }
-      } else if (!x86_narrow_emit(emitter, "push %s\n", text)) {
-        return 0;
-      }
-    }
-    if (!x86_narrow_emit(emitter, "call %s\n", instruction->text)) {
-      return 0;
-    }
-    if (instruction->argument_count &&
-        !x86_narrow_emit(emitter, "add %s, %zu\n", emitter->stack,
-                         instruction->argument_count * (size_t)emitter->word)) {
-      return 0;
-    }
-    return x86_narrow_store_from(emitter, &instruction->dest,
-                                 emitter->accumulator);
-  }
+  case IR_OP_CALL:
+    return x86_narrow_call(emitter, instruction);
 
   case IR_OP_RETURN:
     if (instruction->lhs.kind != IR_OPERAND_NONE &&

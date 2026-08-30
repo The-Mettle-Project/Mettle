@@ -2262,10 +2262,127 @@ static int ir_narrowing_sink_is_narrower(const IRFunction *function,
  * an operation whose own result is cut to it, and the same bits are discarded
  * either way. Retiring them here, before any recognizer runs, is what keeps an
  * int32 accumulator loop looking like one. */
+static void ir_narrowing_count_names(IRFunction *function,
+                                     IRNarrowingFacts *facts) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    ir_narrowing_count_operand(&facts->uses, &in->lhs);
+    ir_narrowing_count_operand(&facts->uses, &in->rhs);
+    for (size_t a = 0; a < in->argument_count; a++) {
+      ir_narrowing_count_operand(&facts->uses, &in->arguments[a]);
+    }
+    if (in->dest.kind != IR_OPERAND_TEMP || !in->dest.name) {
+      continue;
+    }
+    if (ir_instruction_writes_destination(in)) {
+      ir_name_index_add(&facts->defs, in->dest.name, 1);
+      ir_name_index_insert(&facts->def_at, in->dest.name, i);
+    } else {
+      ir_name_index_add(&facts->uses, in->dest.name, 1);
+    }
+  }
+}
+
+/* Which results are cut back down right after they are produced. */
+static void ir_narrowing_mark_producers(IRFunction *function,
+                                        IRNarrowingFacts *facts) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *cast = &function->instructions[i];
+    size_t width;
+    size_t producer = 0;
+    if (cast->op != IR_OP_CAST || cast->is_float ||
+        cast->lhs.kind != IR_OPERAND_TEMP || !cast->lhs.name) {
+      continue;
+    }
+    width = ir_narrowing_width(cast->text);
+    if (width == 0 || !ir_narrowing_single_def(facts, cast->lhs.name) ||
+        !ir_narrowing_single_use(facts, cast->lhs.name) ||
+        !ir_narrowing_from_arithmetic(function, facts, cast->lhs.name)) {
+      continue;
+    }
+    if (ir_name_index_find(&facts->def_at, cast->lhs.name, &producer)) {
+      facts->narrowed_to[producer] = width;
+    }
+  }
+}
+
+static void ir_narrowing_choose_retirements(IRFunction *function,
+                                            IRNarrowingFacts *facts,
+                                            unsigned char *retire,
+                                            size_t *retire_use) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *cast = &function->instructions[i];
+    size_t width;
+    if (cast->op != IR_OP_CAST || cast->is_float ||
+        cast->dest.kind != IR_OPERAND_TEMP || !cast->dest.name ||
+        cast->lhs.kind != IR_OPERAND_TEMP || !cast->lhs.name) {
+      continue;
+    }
+    width = ir_narrowing_width(cast->text);
+    if (width == 0 || !ir_narrowing_single_use(facts, cast->dest.name) ||
+        !ir_narrowing_single_def(facts, cast->dest.name) ||
+        !ir_narrowing_single_def(facts, cast->lhs.name) ||
+        !ir_narrowing_from_arithmetic(function, facts, cast->lhs.name)) {
+      continue;
+    }
+    for (size_t u = i + 1; u < function->instruction_count; u++) {
+      const IRInstruction *use = &function->instructions[u];
+      int in_lhs = ir_operand_is_temp_named(&use->lhs, cast->dest.name);
+      int in_rhs = ir_operand_is_temp_named(&use->rhs, cast->dest.name);
+      if (!in_lhs && !in_rhs) {
+        continue;
+      }
+      if (in_lhs && in_rhs) {
+        break;
+      }
+      if (ir_narrowing_sink_is_narrower(function, facts, u, in_lhs ? 1 : 2,
+                                        width)) {
+        retire[i] = in_lhs ? 1 : 2;
+        retire_use[i] = u;
+      }
+      break;
+    }
+  }
+}
+
+static int ir_narrowing_apply_retirements(IRFunction *function,
+                                          const unsigned char *retire,
+                                          const size_t *retire_use,
+                                          int *changed) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *cast;
+    IRInstruction *use;
+    IROperand *target;
+    char *source;
+    if (!retire[i]) {
+      continue;
+    }
+    cast = &function->instructions[i];
+    use = &function->instructions[retire_use[i]];
+    target = retire[i] == 1 ? &use->lhs : &use->rhs;
+    source = mettle_strdup(cast->lhs.name);
+    if (!source) {
+      return 0;
+    }
+    ir_operand_destroy(target);
+    *target = ir_operand_temp(source);
+    free(source);
+    if (!target->name) {
+      return 0;
+    }
+    ir_instruction_make_nop(cast);
+    if (changed) {
+      *changed = 1;
+    }
+  }
+  return 1;
+}
+
 int ir_drop_dead_narrowing_pass(IRFunction *function, int *changed) {
   IRNarrowingFacts facts;
   unsigned char *retire = NULL;
   size_t *retire_use = NULL;
+  int applied;
   if (!function || function->instruction_count == 0) {
     return 1;
   }
@@ -2283,43 +2400,8 @@ int ir_drop_dead_narrowing_pass(IRFunction *function, int *changed) {
     return 0;
   }
 
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    const IRInstruction *in = &function->instructions[i];
-    ir_narrowing_count_operand(&facts.uses, &in->lhs);
-    ir_narrowing_count_operand(&facts.uses, &in->rhs);
-    for (size_t a = 0; a < in->argument_count; a++) {
-      ir_narrowing_count_operand(&facts.uses, &in->arguments[a]);
-    }
-    if (in->dest.kind != IR_OPERAND_TEMP || !in->dest.name) {
-      continue;
-    }
-    if (ir_instruction_writes_destination(in)) {
-      ir_name_index_add(&facts.defs, in->dest.name, 1);
-      ir_name_index_insert(&facts.def_at, in->dest.name, i);
-    } else {
-      ir_name_index_add(&facts.uses, in->dest.name, 1);
-    }
-  }
-
-  /* Which results are cut back down right after they are produced. */
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    const IRInstruction *cast = &function->instructions[i];
-    size_t width;
-    size_t producer = 0;
-    if (cast->op != IR_OP_CAST || cast->is_float ||
-        cast->lhs.kind != IR_OPERAND_TEMP || !cast->lhs.name) {
-      continue;
-    }
-    width = ir_narrowing_width(cast->text);
-    if (width == 0 || !ir_narrowing_single_def(&facts, cast->lhs.name) ||
-        !ir_narrowing_single_use(&facts, cast->lhs.name) ||
-        !ir_narrowing_from_arithmetic(function, &facts, cast->lhs.name)) {
-      continue;
-    }
-    if (ir_name_index_find(&facts.def_at, cast->lhs.name, &producer)) {
-      facts.narrowed_to[producer] = width;
-    }
-  }
+  ir_narrowing_count_names(function, &facts);
+  ir_narrowing_mark_producers(function, &facts);
 
   retire = (unsigned char *)calloc(function->instruction_count, 1);
   retire_use = (size_t *)calloc(function->instruction_count, sizeof(size_t));
@@ -2331,72 +2413,12 @@ int ir_drop_dead_narrowing_pass(IRFunction *function, int *changed) {
   }
   /* Decide first, rewrite after: the name indexes borrow the operand names
    * they were built from, and retiring one cast frees a few of them. */
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    const IRInstruction *cast = &function->instructions[i];
-    size_t width;
-    if (cast->op != IR_OP_CAST || cast->is_float ||
-        cast->dest.kind != IR_OPERAND_TEMP || !cast->dest.name ||
-        cast->lhs.kind != IR_OPERAND_TEMP || !cast->lhs.name) {
-      continue;
-    }
-    width = ir_narrowing_width(cast->text);
-    if (width == 0 || !ir_narrowing_single_use(&facts, cast->dest.name) ||
-        !ir_narrowing_single_def(&facts, cast->dest.name) ||
-        !ir_narrowing_single_def(&facts, cast->lhs.name) ||
-        !ir_narrowing_from_arithmetic(function, &facts, cast->lhs.name)) {
-      continue;
-    }
-    for (size_t u = i + 1; u < function->instruction_count; u++) {
-      const IRInstruction *use = &function->instructions[u];
-      int in_lhs = ir_operand_is_temp_named(&use->lhs, cast->dest.name);
-      int in_rhs = ir_operand_is_temp_named(&use->rhs, cast->dest.name);
-      if (!in_lhs && !in_rhs) {
-        continue;
-      }
-      if (in_lhs && in_rhs) {
-        break;
-      }
-      if (ir_narrowing_sink_is_narrower(function, &facts, u, in_lhs ? 1 : 2,
-                                        width)) {
-        retire[i] = in_lhs ? 1 : 2;
-        retire_use[i] = u;
-      }
-      break;
-    }
-  }
+  ir_narrowing_choose_retirements(function, &facts, retire, retire_use);
   ir_narrowing_facts_destroy(&facts);
 
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    IRInstruction *cast;
-    IRInstruction *use;
-    IROperand *target;
-    char *source;
-    if (!retire[i]) {
-      continue;
-    }
-    cast = &function->instructions[i];
-    use = &function->instructions[retire_use[i]];
-    target = retire[i] == 1 ? &use->lhs : &use->rhs;
-    source = mettle_strdup(cast->lhs.name);
-    if (!source) {
-      free(retire);
-      free(retire_use);
-      return 0;
-    }
-    ir_operand_destroy(target);
-    *target = ir_operand_temp(source);
-    free(source);
-    if (!target->name) {
-      free(retire);
-      free(retire_use);
-      return 0;
-    }
-    ir_instruction_make_nop(cast);
-    if (changed) {
-      *changed = 1;
-    }
-  }
+  applied = ir_narrowing_apply_retirements(function, retire, retire_use,
+                                           changed);
   free(retire);
   free(retire_use);
-  return 1;
+  return applied;
 }
