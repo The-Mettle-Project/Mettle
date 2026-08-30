@@ -58,6 +58,19 @@ fn main() -> int32 {
   if (uw * (uint32)2 != (uint32)1705032704) { return 18; }
   if (uw << (uint32)1 != (uint32)1705032704) { return 19; }
 
+  // The unary forms leave the width the same two ways: complementing an
+  // unsigned narrow value sets bits the type does not have, and negating the
+  // most negative signed one does not fit back into it.
+  var minb: int8 = opq8(-128);
+  if (-minb != -128) { return 24; }
+  if (~opqu8(1) != (uint8)254) { return 25; }
+  if (~opqu16(1) != (uint16)65534) { return 26; }
+  if (~opqu32(1) != (uint32)4294967294) { return 27; }
+  if (~opq8(1) != (int8)-2) { return 28; }
+  var minh: int16 = opq16(-32768);
+  if (-minh != -32768) { return 29; }
+  if (-min32 != min32) { return 30; }
+
   // Storing already truncated, and still does.
   var stored: int32 = big + big;
   if (stored != -294967296) { return 20; }

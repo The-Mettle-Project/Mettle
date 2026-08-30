@@ -1,5 +1,6 @@
 // AST->IR lowering: type / float-width / string-coercion utilities.
 #include "ir_lowering_internal.h"
+#include <limits.h>
 
 int ir_type_is_cstring(Type *type) {
   return type && type->kind == TYPE_POINTER && type->name &&
@@ -401,14 +402,57 @@ int ir_type_is_unsigned_integer(Type *type) {
 /* The type name a narrow integer result has to be brought back to, or NULL
  * when the value is already canonical. Only these operators can leave a
  * 64-bit register holding something outside the declared width: the rest
- * either cannot overflow it (`/`, `%`, `>>`, the bitwise operators, the
- * comparisons) or do not produce an integer at all. */
+ * either cannot leave it (`/`, `%`, `>>`, `&`, `|`, `^`, the comparisons) or
+ * do not produce an integer at all. The unary forms of `~` and `-` are here
+ * for the same reason: complementing a uint8 in a 64-bit register sets 56 bits
+ * the type does not have, and negating int8 -128 gives 128, which is not an
+ * int8 either. */
+/* Does this unary applied to this constant land back inside `type_name`? Then
+ * the value is already what the type says and no truncation is emitted, which
+ * leaves a negative literal reading as the constant it is. */
+int ir_unary_constant_fits(const char *type_name, const char *op,
+                           long long value) {
+  long long folded;
+  if (!type_name || !op) {
+    return 0;
+  }
+  if (strcmp(op, "-") == 0) {
+    if (value == LLONG_MIN) {
+      return 0;
+    }
+    folded = -value;
+  } else if (strcmp(op, "~") == 0) {
+    folded = ~value;
+  } else {
+    return 0;
+  }
+  if (strcmp(type_name, "int8") == 0) {
+    return folded >= -128 && folded <= 127;
+  }
+  if (strcmp(type_name, "int16") == 0) {
+    return folded >= -32768 && folded <= 32767;
+  }
+  if (strcmp(type_name, "int32") == 0) {
+    return folded >= -2147483648LL && folded <= 2147483647LL;
+  }
+  if (strcmp(type_name, "uint8") == 0) {
+    return folded >= 0 && folded <= 255;
+  }
+  if (strcmp(type_name, "uint16") == 0) {
+    return folded >= 0 && folded <= 65535;
+  }
+  if (strcmp(type_name, "uint32") == 0) {
+    return folded >= 0 && folded <= 4294967295LL;
+  }
+  return 0;
+}
+
 const char *ir_narrow_integer_result_type(Type *type, const char *op) {
   if (!type || !op) {
     return NULL;
   }
   if (strcmp(op, "+") != 0 && strcmp(op, "-") != 0 && strcmp(op, "*") != 0 &&
-      strcmp(op, "<<") != 0) {
+      strcmp(op, "<<") != 0 && strcmp(op, "~") != 0) {
     return NULL;
   }
   switch (type->kind) {

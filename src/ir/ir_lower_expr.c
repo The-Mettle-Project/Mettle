@@ -2019,6 +2019,46 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     }
 
     ir_operand_destroy(&operand);
+
+    /* Same rule as a binary: the temp is 64 bits and the arithmetic ran at
+     * that width, so a narrow result comes back to its declared width here.
+     * `~x` on a uint8 set 56 bits the type does not have. A constant operand
+     * is folded and range-checked instead, because `-90` is every negative
+     * literal in the language and a cast around one hides the constant from
+     * every recognizer that reads it. */
+    {
+      const char *narrow = ir_narrow_integer_result_type(
+          instruction.is_float ? NULL
+                               : ir_infer_expression_type(context, expression),
+          unary->operator);
+      if (narrow && instruction.lhs.kind == IR_OPERAND_INT &&
+          ir_unary_constant_fits(narrow, unary->operator,
+                                 instruction.lhs.int_value)) {
+        narrow = NULL;
+      }
+      if (narrow) {
+        IROperand wrapped = ir_operand_none();
+        if (!ir_make_temp_operand(context, &wrapped)) {
+          ir_operand_destroy(&destination);
+          return 0;
+        }
+        IRInstruction truncate = {0};
+        truncate.op = IR_OP_CAST;
+        truncate.location = expression->location;
+        truncate.dest = wrapped;
+        truncate.lhs = destination;
+        truncate.text = (char *)narrow;
+        if (!ir_emit(context, function, &truncate)) {
+          ir_operand_destroy(&wrapped);
+          ir_operand_destroy(&destination);
+          return 0;
+        }
+        ir_operand_destroy(&destination);
+        *out_value = wrapped;
+        return 1;
+      }
+    }
+
     *out_value = destination;
     return 1;
   }

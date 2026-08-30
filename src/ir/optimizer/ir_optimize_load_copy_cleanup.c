@@ -2225,7 +2225,7 @@ static int ir_narrowing_from_arithmetic(const IRFunction *function,
     return 0;
   }
   def = &function->instructions[at];
-  return def->op == IR_OP_BINARY && !def->is_float;
+  return (def->op == IR_OP_BINARY || def->op == IR_OP_UNARY) && !def->is_float;
 }
 
 static int ir_narrowing_single_use(const IRNarrowingFacts *facts,

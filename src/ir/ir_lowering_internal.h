@@ -416,6 +416,8 @@ int ir_type_array_element_stride(Type *element_type);
 
 int ir_type_is_unsigned_integer(Type *type);
 const char *ir_narrow_integer_result_type(Type *type, const char *op);
+int ir_unary_constant_fits(const char *type_name, const char *op,
+                           long long value);
 int ir_type_is_pointer(Type *type);
 
 int ir_emit_binary_instruction(IRLoweringContext *context,
