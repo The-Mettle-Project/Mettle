@@ -1009,39 +1009,274 @@ static size_t binary_symbol_score_of(const BinarySymbolScores *map,
   return score;
 }
 
+static const BinaryGpRegister BINARY_PROMOTION_REGISTERS[] = {
+    BINARY_GP_R12, BINARY_GP_R13, BINARY_GP_R14, BINARY_GP_R15,
+    BINARY_GP_RBX, BINARY_GP_RSI, BINARY_GP_RDI};
+
+typedef struct {
+  const char *name;
+  size_t score;
+  int is_global;
+} BinaryPromotionPick;
+
+static int binary_symbol_is_claimable(BinaryFunctionContext *context,
+                                      const char *name) {
+  return name && !code_generator_binary_symbol_already_promoted(context, name) &&
+         !binary_symbol_alias_table_get(&context->symbol_aliases, name) &&
+         binary_named_slot_table_get_offset(&context->address_taken_symbols,
+                                            name) < 0;
+}
+
+static const CgSym *binary_global_symbol(CodeGenerator *generator,
+                                         const char *name) {
+  const CgSym *symbol = generator->ir_program
+                            ? code_generator_lookup_symbol(generator, name)
+                            : NULL;
+  if (!symbol || symbol->kind != CG_SYM_VARIABLE || !symbol->scope ||
+      symbol->scope->type != CG_SCOPE_GLOBAL) {
+    return NULL;
+  }
+  return symbol;
+}
+
+static int binary_global_is_promotable(CodeGenerator *generator,
+                                       BinaryFunctionContext *context,
+                                       const char *name) {
+  const CgSym *symbol = binary_global_symbol(generator, name);
+  return symbol && !symbol->is_extern &&
+         binary_named_slot_table_get_offset(&context->local_slots, name) < 0 &&
+         binary_named_slot_table_get_offset(&context->parameter_slots, name) <
+             0 &&
+         code_generator_binary_type_is_gp_promotable(symbol->type);
+}
+
+static int binary_insn_is_pointer_step(const IRInstruction *insn) {
+  return insn->op == IR_OP_BINARY && insn->text &&
+         strcmp(insn->text, "+") == 0 && !insn->is_float &&
+         insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name &&
+         insn->lhs.kind == IR_OPERAND_SYMBOL && insn->lhs.name &&
+         strcmp(insn->dest.name, insn->lhs.name) == 0 &&
+         insn->rhs.kind == IR_OPERAND_INT &&
+         (insn->rhs.int_value == 4 || insn->rhs.int_value == -4 ||
+          insn->rhs.int_value == 1 || insn->rhs.int_value == -1);
+}
+
+static int binary_promote_pointer_steps(CodeGenerator *generator,
+                                        BinaryFunctionContext *context,
+                                        IRFunction *ir_function,
+                                        size_t max_promoted,
+                                        size_t *promoted_count) {
+  for (size_t insn_i = 0;
+       insn_i < ir_function->instruction_count &&
+       *promoted_count < max_promoted;
+       insn_i++) {
+    const IRInstruction *insn = &ir_function->instructions[insn_i];
+    const IROperand *operands[3];
+    int is_pointer_step = binary_insn_is_pointer_step(insn);
+
+    if (insn->op != IR_OP_ROTATE_ADD && !is_pointer_step) {
+      continue;
+    }
+
+    operands[0] = &insn->dest;
+    operands[1] = &insn->lhs;
+    operands[2] = &insn->rhs;
+    for (size_t op_i = 0; op_i < 3 && *promoted_count < max_promoted; op_i++) {
+      const char *name = operands[op_i]->name;
+      MtlcType *type = NULL;
+      if (operands[op_i]->kind != IR_OPERAND_SYMBOL ||
+          !binary_symbol_is_claimable(context, name)) {
+        continue;
+      }
+      if (is_pointer_step && op_i == 2) {
+        continue;
+      }
+      /* Globals belong to the scoring loop below, which records them in
+       * register_global_symbols as well. This path records only
+       * register_symbols, and the prologue's load and the epilogue's store
+       * both key off the other table -- so a global promoted here lived in a
+       * register that was never filled from memory and never written back.
+       * `n = n + 1` on a global int32 matches the pointer-step shape exactly,
+       * so every write to such a counter was dropped. */
+      if (binary_global_symbol(generator, name)) {
+        continue;
+      }
+      type = code_generator_binary_get_resolved_type(
+          generator, is_pointer_step ? "int32*" : "int64", 0);
+      if (!code_generator_binary_type_is_gp_promotable(type) &&
+          !(is_pointer_step && strstr(name, "__ptr_") != NULL)) {
+        continue;
+      }
+      if (!binary_named_slot_table_add(
+              &context->register_symbols, name,
+              (int)BINARY_PROMOTION_REGISTERS[*promoted_count]) ||
+          !code_generator_binary_context_add_saved_register(
+              context, BINARY_PROMOTION_REGISTERS[*promoted_count])) {
+        return 0;
+      }
+      (*promoted_count)++;
+    }
+  }
+  return 1;
+}
+
+static void binary_offer(BinaryPromotionPick *best, const char *name,
+                         size_t score, int is_global) {
+  if (score > best->score) {
+    best->score = score;
+    best->name = name;
+    best->is_global = is_global;
+  }
+}
+
+static void binary_score_parameters(CodeGenerator *generator,
+                                    BinaryFunctionContext *context,
+                                    IRFunction *ir_function,
+                                    const BinarySymbolScores *scores,
+                                    BinaryPromotionPick *best) {
+  for (size_t i = 0; i < ir_function->parameter_count; i++) {
+    const char *name = ir_function->parameter_names[i];
+    MtlcType *type;
+    if (!binary_symbol_is_claimable(context, name)) {
+      continue;
+    }
+    type = code_generator_binary_get_resolved_type(
+        generator,
+        ir_function->parameter_types ? ir_function->parameter_types[i] : NULL,
+        0);
+    if (!code_generator_binary_type_is_gp_promotable(type)) {
+      continue;
+    }
+    binary_offer(best, name, binary_symbol_score_of(scores, name), 0);
+  }
+}
+
+static void binary_score_locals(CodeGenerator *generator,
+                                BinaryFunctionContext *context,
+                                IRFunction *ir_function,
+                                const BinarySymbolScores *scores,
+                                BinaryPromotionPick *best) {
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    const IRInstruction *instruction = &ir_function->instructions[i];
+    const char *name;
+    MtlcType *type;
+    if (!instruction || instruction->op != IR_OP_DECLARE_LOCAL ||
+        instruction->dest.kind != IR_OPERAND_SYMBOL ||
+        !instruction->dest.name) {
+      continue;
+    }
+    name = instruction->dest.name;
+    if (!binary_symbol_is_claimable(context, name)) {
+      continue;
+    }
+    type = code_generator_binary_get_resolved_type(
+        generator,
+        instruction->text && instruction->text[0] != '\0' ? instruction->text
+                                                          : "int64",
+        0);
+    if (!code_generator_binary_type_is_gp_promotable(type)) {
+      continue;
+    }
+    binary_offer(best, name, binary_symbol_score_of(scores, name), 0);
+  }
+}
+
+static void binary_score_one_global(CodeGenerator *generator,
+                                    BinaryFunctionContext *context,
+                                    const IROperand *operand,
+                                    const BinarySymbolScores *scores,
+                                    BinaryPromotionPick *best) {
+  const char *name = operand->name;
+  if (operand->kind != IR_OPERAND_SYMBOL ||
+      !binary_symbol_is_claimable(context, name) ||
+      !binary_global_is_promotable(generator, context, name)) {
+    return;
+  }
+  binary_offer(best, name, binary_symbol_score_of(scores, name), 1);
+}
+
+static void binary_score_globals(CodeGenerator *generator,
+                                 BinaryFunctionContext *context,
+                                 IRFunction *ir_function,
+                                 const BinarySymbolScores *scores,
+                                 BinaryPromotionPick *best) {
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    const IRInstruction *instruction = &ir_function->instructions[i];
+    if (!instruction) {
+      continue;
+    }
+    binary_score_one_global(generator, context, &instruction->dest, scores,
+                            best);
+    binary_score_one_global(generator, context, &instruction->lhs, scores,
+                            best);
+    binary_score_one_global(generator, context, &instruction->rhs, scores,
+                            best);
+    for (size_t arg_i = 0; arg_i < instruction->argument_count; arg_i++) {
+      binary_score_one_global(generator, context,
+                              &instruction->arguments[arg_i], scores, best);
+    }
+  }
+}
+
+static int binary_claim_register(CodeGenerator *generator,
+                                 BinaryFunctionContext *context,
+                                 IRFunction *ir_function,
+                                 const BinaryPromotionPick *best,
+                                 BinaryGpRegister reg) {
+  if (best->is_global &&
+      !binary_named_slot_table_add(&context->register_global_symbols,
+                                   best->name, (int)reg)) {
+    code_generator_set_error(
+        generator, "Out of memory while promoting global '%s' in '%s'",
+        best->name, ir_function->name);
+    return 0;
+  }
+  if (!binary_named_slot_table_add(&context->register_symbols, best->name,
+                                   (int)reg) ||
+      !code_generator_binary_context_add_saved_register(context, reg)) {
+    code_generator_set_error(
+        generator,
+        "Failed to promote hot symbol '%s' in direct object function '%s'",
+        best->name, ir_function->name);
+    return 0;
+  }
+  return 1;
+}
+
 int code_generator_binary_promote_hot_symbols(
     CodeGenerator *generator, BinaryFunctionContext *context,
     IRFunction *ir_function) {
-  static const BinaryGpRegister promotion_registers[] = {
-      BINARY_GP_R12, BINARY_GP_R13, BINARY_GP_R14, BINARY_GP_R15,
-      BINARY_GP_RBX, BINARY_GP_RSI, BINARY_GP_RDI};
+  MtlcType *return_type;
+  size_t max_promoted;
+  size_t promoted_count = 0;
+  size_t *loop_weights;
+  int function_has_no_calls;
+  BinarySymbolScores symbol_scores;
 
   if (!generator || !context || !ir_function) {
     return 0;
   }
 
   /* An asm block clobbers registers the compiler never told it about, so
-   * nothing may live in one across it. Every value keeps its stack home,
-   * which is also the home an `{x}` operand binding resolves to. */
+   * nothing may live in one across it. Every value keeps its stack home, which
+   * is also the home an `{x}` operand binding resolves to. */
   if (ir_function_has_inline_asm(ir_function) ||
       ir_function->has_volatile_access) {
     return 1;
   }
 
-  MtlcType *return_type = code_generator_binary_get_resolved_type(
+  return_type = code_generator_binary_get_resolved_type(
       generator, ir_function->return_type_name, 1);
-  size_t max_promoted =
-      sizeof(promotion_registers) / sizeof(promotion_registers[0]);
+  max_promoted = sizeof(BINARY_PROMOTION_REGISTERS) /
+                 sizeof(BINARY_PROMOTION_REGISTERS[0]);
   if (!code_generator_binary_function_can_promote_rsi_rdi(
           generator, ir_function, return_type) &&
       max_promoted >= 2) {
     max_promoted -= 2;
   }
-  size_t promoted_count = 0;
-  int function_has_no_calls =
+  function_has_no_calls =
       !code_generator_binary_function_has_calls(ir_function);
-  size_t *loop_weights =
-      code_generator_binary_build_loop_weights(ir_function);
+  loop_weights = code_generator_binary_build_loop_weights(ir_function);
   if (!loop_weights) {
     code_generator_set_error(
         generator,
@@ -1050,7 +1285,6 @@ int code_generator_binary_promote_hot_symbols(
         ir_function->name);
     return 0;
   }
-  BinarySymbolScores symbol_scores;
   if (!binary_symbol_scores_build(context, ir_function, loop_weights,
                                   &symbol_scores)) {
     binary_symbol_scores_destroy(&symbol_scores);
@@ -1062,259 +1296,34 @@ int code_generator_binary_promote_hot_symbols(
     return 0;
   }
 
-  if (function_has_no_calls) {
-    for (size_t insn_i = 0;
-         insn_i < ir_function->instruction_count && promoted_count < max_promoted;
-         insn_i++) {
-      const IRInstruction *insn = &ir_function->instructions[insn_i];
-      const IROperand *operands[3];
-      size_t op_i = 0;
-      int is_pointer_step = 0;
-
-      if (insn->op == IR_OP_BINARY && insn->text &&
-          strcmp(insn->text, "+") == 0 && !insn->is_float &&
-          insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name &&
-          insn->lhs.kind == IR_OPERAND_SYMBOL && insn->lhs.name &&
-          strcmp(insn->dest.name, insn->lhs.name) == 0 &&
-          insn->rhs.kind == IR_OPERAND_INT &&
-          (insn->rhs.int_value == 4 || insn->rhs.int_value == -4 ||
-           insn->rhs.int_value == 1 || insn->rhs.int_value == -1)) {
-        is_pointer_step = 1;
-      }
-
-      if (insn->op != IR_OP_ROTATE_ADD && !is_pointer_step) {
-        continue;
-      }
-
-      operands[0] = &insn->dest;
-      operands[1] = &insn->lhs;
-      operands[2] = &insn->rhs;
-      for (op_i = 0; op_i < 3 && promoted_count < max_promoted; op_i++) {
-        const char *name = operands[op_i]->name;
-        MtlcType *type = NULL;
-        if (operands[op_i]->kind != IR_OPERAND_SYMBOL || !name ||
-            binary_symbol_alias_table_get(&context->symbol_aliases, name) ||
-            code_generator_binary_symbol_already_promoted(context, name) ||
-            binary_named_slot_table_get_offset(&context->address_taken_symbols,
-                                               name) >= 0) {
-          continue;
-        }
-
-        if (is_pointer_step && op_i == 2) {
-          continue;
-        }
-
-        /* Globals belong to the promotion loop below, which records them in
-         * register_global_symbols as well. This path records only
-         * register_symbols, and the prologue's load and the epilogue's store
-         * both key off the other table -- so a global promoted here lived in a
-         * register that was never filled from memory and never written back.
-         * `n = n + 1` on a global int32 matches the pointer-step shape
-         * exactly, so every write to such a counter was dropped. */
-        {
-          const CgSym *global_symbol =
-              generator->ir_program
-                  ? code_generator_lookup_symbol(generator, name)
-                  : NULL;
-          if (global_symbol && global_symbol->kind == CG_SYM_VARIABLE &&
-              global_symbol->scope &&
-              global_symbol->scope->type == CG_SCOPE_GLOBAL) {
-            continue;
-          }
-        }
-
-        type = code_generator_binary_get_resolved_type(
-            generator,
-            is_pointer_step ? "int32*" : "int64",
-            0);
-        if (!code_generator_binary_type_is_gp_promotable(type) &&
-            !(is_pointer_step && strstr(name, "__ptr_") != NULL)) {
-          continue;
-        }
-
-        if (!binary_named_slot_table_add(
-                &context->register_symbols, name,
-                (int)promotion_registers[promoted_count]) ||
-            !code_generator_binary_context_add_saved_register(
-                context, promotion_registers[promoted_count])) {
-          binary_symbol_scores_destroy(&symbol_scores);
-          free(loop_weights);
-          return 0;
-        }
-        promoted_count++;
-      }
-    }
+  if (function_has_no_calls &&
+      !binary_promote_pointer_steps(generator, context, ir_function,
+                                    max_promoted, &promoted_count)) {
+    binary_symbol_scores_destroy(&symbol_scores);
+    free(loop_weights);
+    return 0;
   }
 
-  for (size_t reg_index = promoted_count;
-       reg_index < max_promoted;
+  for (size_t reg_index = promoted_count; reg_index < max_promoted;
        reg_index++) {
-    const char *best_name = NULL;
-    size_t best_score = 0;
-    int best_is_global = 0;
+    BinaryPromotionPick best = {0};
 
-    for (size_t i = 0; i < ir_function->parameter_count; i++) {
-      const char *name = ir_function->parameter_names[i];
-      MtlcType *type = NULL;
-      if (!name || code_generator_binary_symbol_already_promoted(context, name) ||
-          binary_symbol_alias_table_get(&context->symbol_aliases, name) ||
-          binary_named_slot_table_get_offset(&context->address_taken_symbols,
-                                             name) >= 0) {
-        continue;
-      }
-
-      type = code_generator_binary_get_resolved_type(
-          generator,
-          ir_function->parameter_types ? ir_function->parameter_types[i]
-                                         : NULL,
-          0);
-      if (!code_generator_binary_type_is_gp_promotable(type)) {
-        continue;
-      }
-
-      size_t score = binary_symbol_score_of(&symbol_scores, name);
-      if (score > best_score) {
-        best_score = score;
-        best_name = name;
-        best_is_global = 0;
-      }
+    binary_score_parameters(generator, context, ir_function, &symbol_scores,
+                            &best);
+    if (!best.name || best.score < 2) {
+      binary_score_locals(generator, context, ir_function, &symbol_scores,
+                          &best);
     }
-
-    if (!best_name || best_score < 2) {
-      for (size_t i = 0; i < ir_function->instruction_count; i++) {
-        const IRInstruction *instruction = &ir_function->instructions[i];
-        const char *name = NULL;
-        MtlcType *type = NULL;
-        if (!instruction || instruction->op != IR_OP_DECLARE_LOCAL ||
-            instruction->dest.kind != IR_OPERAND_SYMBOL ||
-            !instruction->dest.name) {
-          continue;
-        }
-
-        name = instruction->dest.name;
-        if (code_generator_binary_symbol_already_promoted(context, name) ||
-            binary_symbol_alias_table_get(&context->symbol_aliases, name) ||
-            binary_named_slot_table_get_offset(&context->address_taken_symbols,
-                                               name) >= 0) {
-          continue;
-        }
-
-        type = code_generator_binary_get_resolved_type(
-            generator,
-            instruction->text && instruction->text[0] != '\0' ? instruction->text
-                                                              : "int64",
-            0);
-        if (!code_generator_binary_type_is_gp_promotable(type)) {
-          continue;
-        }
-
-        size_t score = binary_symbol_score_of(&symbol_scores, name);
-        if (score > best_score) {
-          best_score = score;
-          best_name = name;
-          best_is_global = 0;
-        }
-      }
-    }
-
     if (function_has_no_calls) {
-      for (size_t i = 0; i < ir_function->instruction_count; i++) {
-        const IRInstruction *instruction = &ir_function->instructions[i];
-        const IROperand *operands[3];
-        if (!instruction) {
-          continue;
-        }
-        operands[0] = &instruction->dest;
-        operands[1] = &instruction->lhs;
-        operands[2] = &instruction->rhs;
-        for (size_t op_i = 0; op_i < 3; op_i++) {
-          const char *name = operands[op_i]->name;
-          const CgSym *symbol = NULL;
-          size_t score = 0;
-          if (operands[op_i]->kind != IR_OPERAND_SYMBOL || !name ||
-              code_generator_binary_symbol_already_promoted(context, name) ||
-              binary_symbol_alias_table_get(&context->symbol_aliases, name) ||
-              binary_named_slot_table_get_offset(&context->address_taken_symbols,
-                                                 name) >= 0) {
-            continue;
-          }
-          symbol = generator->ir_program
-                       ? code_generator_lookup_symbol(generator, name)
-                       : NULL;
-          if (!symbol || symbol->kind != CG_SYM_VARIABLE || !symbol->scope ||
-              symbol->scope->type != CG_SCOPE_GLOBAL || symbol->is_extern ||
-              binary_named_slot_table_get_offset(&context->local_slots, name) >=
-                  0 ||
-              binary_named_slot_table_get_offset(&context->parameter_slots,
-                                                 name) >= 0 ||
-              !code_generator_binary_type_is_gp_promotable(symbol->type)) {
-            continue;
-          }
-          score = binary_symbol_score_of(&symbol_scores, name);
-          if (score > best_score) {
-            best_score = score;
-            best_name = name;
-            best_is_global = 1;
-          }
-        }
-        for (size_t arg_i = 0; arg_i < instruction->argument_count; arg_i++) {
-          const IROperand *operand = &instruction->arguments[arg_i];
-          const char *name = operand->name;
-          const CgSym *symbol = NULL;
-          size_t score = 0;
-          if (operand->kind != IR_OPERAND_SYMBOL || !name ||
-              code_generator_binary_symbol_already_promoted(context, name) ||
-              binary_symbol_alias_table_get(&context->symbol_aliases, name) ||
-              binary_named_slot_table_get_offset(&context->address_taken_symbols,
-                                                 name) >= 0) {
-            continue;
-          }
-          symbol = generator->ir_program
-                       ? code_generator_lookup_symbol(generator, name)
-                       : NULL;
-          if (!symbol || symbol->kind != CG_SYM_VARIABLE || !symbol->scope ||
-              symbol->scope->type != CG_SCOPE_GLOBAL || symbol->is_extern ||
-              binary_named_slot_table_get_offset(&context->local_slots, name) >=
-                  0 ||
-              binary_named_slot_table_get_offset(&context->parameter_slots,
-                                                 name) >= 0 ||
-              !code_generator_binary_type_is_gp_promotable(symbol->type)) {
-            continue;
-          }
-          score = binary_symbol_score_of(&symbol_scores, name);
-          if (score > best_score) {
-            best_score = score;
-            best_name = name;
-            best_is_global = 1;
-          }
-        }
-      }
+      binary_score_globals(generator, context, ir_function, &symbol_scores,
+                           &best);
     }
 
-    if (!best_name || best_score < 2) {
+    if (!best.name || best.score < 2) {
       break;
     }
-
-    if (best_is_global &&
-        !binary_named_slot_table_add(&context->register_global_symbols,
-                                     best_name,
-                                     (int)promotion_registers[reg_index])) {
-      code_generator_set_error(
-          generator, "Out of memory while promoting global '%s' in '%s'",
-          best_name, ir_function->name);
-      binary_symbol_scores_destroy(&symbol_scores);
-      free(loop_weights);
-      return 0;
-    }
-
-    if (!binary_named_slot_table_add(&context->register_symbols, best_name,
-                                     (int)promotion_registers[reg_index]) ||
-        !code_generator_binary_context_add_saved_register(
-            context, promotion_registers[reg_index])) {
-      code_generator_set_error(
-          generator,
-          "Failed to promote hot symbol '%s' in direct object function '%s'",
-          best_name, ir_function->name);
+    if (!binary_claim_register(generator, context, ir_function, &best,
+                               BINARY_PROMOTION_REGISTERS[reg_index])) {
       binary_symbol_scores_destroy(&symbol_scores);
       free(loop_weights);
       return 0;

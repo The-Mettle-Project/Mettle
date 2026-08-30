@@ -127,6 +127,198 @@ static int code_generator_binary_jump_is_fallthrough(
          target < next_emitting[index];
 }
 
+typedef int (*BinaryPeepholeEmitter)(CodeGenerator *, BinaryFunctionContext *,
+                                     const IRFunction *, size_t, size_t *);
+
+static const BinaryPeepholeEmitter BINARY_PEEPHOLES[] = {
+    code_generator_binary_try_emit_binary_compare_branch_chain,
+    code_generator_binary_try_emit_compare_assign_diamond,
+    code_generator_binary_try_emit_offset_scaled_address_load,
+    code_generator_binary_try_emit_offset_scaled_address_store,
+    code_generator_binary_try_emit_address_add_load,
+    code_generator_binary_try_emit_address_add_store,
+    code_generator_binary_try_emit_scaled_address_load,
+    code_generator_binary_try_emit_scaled_address_store,
+    code_generator_binary_try_emit_binary_cast_chain,
+    code_generator_binary_try_emit_float_cast_binary_chain,
+    code_generator_binary_try_emit_float_binary_expression_chain,
+    code_generator_binary_try_emit_binary_expression_chain,
+    code_generator_binary_try_emit_compare_branch_zero,
+};
+
+/* Loop-top alignment, matching what the MIR backend does for the functions it
+ * takes: an IR label that some LATER branch jumps back to is a loop header, so
+ * pad it onto a boundary. Without this a loop's speed depends on where its
+ * function happened to land -- an unrelated change upstream that shifts the
+ * function by a few bytes moves a hot loop across an instruction-fetch window
+ * and swings it by tens of percent.
+ *
+ * The pad sits before the label, so the back-edge jumps past it and only a
+ * fall-through into the loop decodes it, once. */
+static char *binary_scan_loop_alignment(const IRFunction *ir_function,
+                                        const BinaryLabelIndex *labels) {
+  char *align_label = NULL;
+  if (ir_function->instruction_count == 0) {
+    return NULL;
+  }
+  align_label = (char *)calloc(ir_function->instruction_count, 1);
+  if (!align_label) {
+    return NULL;
+  }
+  for (size_t b = 0; b < ir_function->instruction_count; b++) {
+    const IRInstruction *br = &ir_function->instructions[b];
+    size_t d;
+    if (br->op != IR_OP_JUMP && br->op != IR_OP_BRANCH_ZERO &&
+        br->op != IR_OP_BRANCH_EQ) {
+      continue;
+    }
+    if (!br->text || !br->text[0]) {
+      continue;
+    }
+    /* Scanning the prefix for the target label costs the whole function for
+     * every forward branch, which a body built out of if/else is made of. */
+    d = binary_label_index_find(labels, br->text);
+    if (d != (size_t)-1 && d < b) {
+      /* 1 = align, 2 = align wider: the body from here to this back-edge is
+       * big enough that the extra padding costs nothing next to it. The
+       * FURTHEST back-edge decides, so a nested loop sharing a header is
+       * measured at its full extent. */
+      align_label[d] =
+          (b - d >= BINARY_LOOP_BIG_IR_INSTRUCTIONS || align_label[d] == 2) ? 2
+                                                                            : 1;
+    }
+  }
+  return align_label;
+}
+
+static int binary_emit_aligned_label(CodeGenerator *generator,
+                                     BinaryFunctionContext *context,
+                                     char wanted) {
+  if (wanted == 2) {
+    context->wants_wide_loop_alignment = 1;
+  }
+  if (!binary_emit_align_code(
+          &context->code,
+          wanted == 2 ? BINARY_LOOP_ALIGN_BIG : BINARY_LOOP_ALIGN,
+          wanted == 2 ? BINARY_LOOP_ALIGN_BIG_MAX_PAD
+                      : BINARY_LOOP_ALIGN_MAX_PAD)) {
+    code_generator_set_error(generator,
+                             "Out of memory while aligning a loop header");
+    return 0;
+  }
+  return 1;
+}
+
+static int binary_emit_location_marker(CodeGenerator *generator,
+                                       BinaryFunctionContext *context,
+                                       const IRInstruction *instruction) {
+  if (!generator->debug_info || !generator->generate_stack_trace_support ||
+      instruction->location.line <= 0) {
+    return 1;
+  }
+  return code_generator_binary_emit_runtime_location_marker(
+      generator, context, instruction->location.line,
+      instruction->location.column,
+      code_generator_runtime_filename(generator,
+                                      instruction->location.filename));
+}
+
+static int binary_emit_function_body(CodeGenerator *generator,
+                                     BinaryFunctionContext *context,
+                                     const IRFunction *ir_function,
+                                     const BinaryLabelIndex *labels,
+                                     const size_t *next_emitting,
+                                     const char *align_label, int annot,
+                                     size_t annot_base) {
+  size_t annot_prev_off = context->code.size;
+  int annot_prev_idx = -1;
+
+  for (size_t i = 0; i < ir_function->instruction_count;) {
+    size_t consumed = 0;
+    size_t peephole;
+    int taken = 0;
+
+    /* A jump to the code that immediately follows it is the fall-through it
+     * would have taken anyway. The lowering emits one wherever a structured
+     * statement ends by branching to its own exit label -- if/else arms, loop
+     * bodies, short-circuits -- and each costs five bytes of instruction fetch
+     * for nothing. Only zero-byte instructions may sit in between; anything
+     * that emits code means the jump really is a jump. */
+    if (ir_function->instructions[i].op == IR_OP_JUMP &&
+        code_generator_binary_jump_is_fallthrough(ir_function, i, labels,
+                                                  next_emitting)) {
+      i++;
+      continue;
+    }
+    if (align_label && align_label[i] &&
+        !binary_emit_aligned_label(generator, context, align_label[i])) {
+      if (annot) mir_annotate_end_function();
+      return 0;
+    }
+    /* Lazily record the previous instruction's span now that it is fully
+     * emitted; this is robust to the cascade's many `continue` paths because
+     * every one returns here. */
+    if (annot && annot_prev_idx >= 0 && context->code.size > annot_prev_off) {
+      mir_annotate_record_ir(ir_function, annot_prev_idx,
+                             annot_prev_off - annot_base,
+                             context->code.size - annot_prev_off,
+                             context->code.data + annot_prev_off);
+    }
+    annot_prev_off = context->code.size;
+    annot_prev_idx = (int)i;
+    /* Labels emit no bytes, so the lazy span recorder never sees them; record
+     * a zero-byte marker so loop recovery can resolve backward-branch
+     * targets. */
+    if (annot && ir_function->instructions[i].op == IR_OP_LABEL) {
+      mir_annotate_record_ir_label(ir_function->instructions[i].text,
+                                   context->code.size - annot_base);
+    }
+
+    if (code_generator_binary_try_skip_scaled_address_shift(ir_function, i,
+                                                            &consumed)) {
+      i += consumed;
+      continue;
+    }
+    for (peephole = 0;
+         peephole < sizeof(BINARY_PEEPHOLES) / sizeof(BINARY_PEEPHOLES[0]);
+         peephole++) {
+      if (BINARY_PEEPHOLES[peephole](generator, context, ir_function, i,
+                                     &consumed)) {
+        taken = 1;
+        break;
+      }
+    }
+    if (taken) {
+      i += consumed;
+      continue;
+    }
+
+    if (!binary_emit_location_marker(generator, context,
+                                     &ir_function->instructions[i])) {
+      return 0;
+    }
+    if (!code_generator_binary_emit_instruction(
+            generator, context, &ir_function->instructions[i])) {
+      if (annot) mir_annotate_end_function();
+      return 0;
+    }
+    i++;
+  }
+
+  /* Record the last instruction's span (no further loop top runs). */
+  if (annot && annot_prev_idx >= 0 && context->code.size > annot_prev_off) {
+    mir_annotate_record_ir(ir_function, annot_prev_idx,
+                           annot_prev_off - annot_base,
+                           context->code.size - annot_prev_off,
+                           context->code.data + annot_prev_off);
+  }
+  if (annot) {
+    mir_annotate_end_function();
+  }
+  return 1;
+}
+
+
 int code_generator_emit_binary_function(CodeGenerator *generator,
                                                IRFunction *ir_function) {
   BinaryEmitter *emitter = NULL;
@@ -293,209 +485,20 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
     return 0;
   }
   char *align_label = NULL;
-  if (ir_function->instruction_count > 0) {
-    align_label = (char *)calloc(ir_function->instruction_count, 1);
-  }
-  if (align_label) {
-    for (size_t b = 0; b < ir_function->instruction_count; b++) {
-      const IRInstruction *br = &ir_function->instructions[b];
-      size_t d;
-      if (br->op != IR_OP_JUMP && br->op != IR_OP_BRANCH_ZERO &&
-          br->op != IR_OP_BRANCH_EQ) {
-        continue;
-      }
-      if (!br->text || !br->text[0]) {
-        continue;
-      }
-      /* Scanning the prefix for the target label costs the whole function for
-       * every forward branch, which a body built out of if/else is made of. */
-      d = binary_label_index_find(&labels, br->text);
-      if (d != (size_t)-1 && d < b) {
-        /* 1 = align, 2 = align wider: the body from here to this back-edge is
-         * big enough that the extra padding costs nothing next to it. The
-         * FURTHEST back-edge decides, so a nested loop sharing a header is
-         * measured at its full extent. */
-        align_label[d] = (b - d >= BINARY_LOOP_BIG_IR_INSTRUCTIONS ||
-                          align_label[d] == 2)
-                             ? 2
-                             : 1;
-      }
-    }
-  }
+  align_label = binary_scan_loop_alignment(ir_function, &labels);
 
   cg_time_end("baseline align scan", cg_t);
   cg_t = cg_time_begin();
-  size_t annot_prev_off = context.code.size;
-  int annot_prev_idx = -1;
-  for (size_t i = 0; i < ir_function->instruction_count;) {
-    /* A jump to the code that immediately follows it is the fall-through it
-     * would have taken anyway. The lowering emits one wherever a structured
-     * statement ends by branching to its own exit label -- if/else arms, loop
-     * bodies, short-circuits -- and each costs five bytes of instruction fetch
-     * for nothing. Only zero-byte instructions may sit in between; anything
-     * that emits code means the jump really is a jump. */
-    if (ir_function->instructions[i].op == IR_OP_JUMP &&
-        code_generator_binary_jump_is_fallthrough(ir_function, i, &labels,
-                                                  next_emitting)) {
-      i++;
-      continue;
-    }
-    if (align_label && align_label[i] == 2) {
-      context.wants_wide_loop_alignment = 1;
-    }
-    if (align_label && align_label[i] &&
-        !binary_emit_align_code(&context.code,
-                                align_label[i] == 2 ? BINARY_LOOP_ALIGN_BIG
-                                                    : BINARY_LOOP_ALIGN,
-                                align_label[i] == 2
-                                    ? BINARY_LOOP_ALIGN_BIG_MAX_PAD
-                                    : BINARY_LOOP_ALIGN_MAX_PAD)) {
-      code_generator_set_error(generator,
-                               "Out of memory while aligning a loop header");
-      free(align_label);
-      if (annot) mir_annotate_end_function();
-      binary_function_context_destroy(&context);
-      return 0;
-    }
-    /* Lazily record the previous instruction's span now that it is fully
-     * emitted; this is robust to the cascade's many `continue` paths because
-     * every one returns here. */
-    if (annot && annot_prev_idx >= 0 && context.code.size > annot_prev_off) {
-      mir_annotate_record_ir(ir_function, annot_prev_idx,
-                             annot_prev_off - annot_base,
-                             context.code.size - annot_prev_off,
-                             context.code.data + annot_prev_off);
-    }
-    annot_prev_off = context.code.size;
-    annot_prev_idx = (int)i;
-    /* Labels emit no bytes, so the lazy span recorder never sees them; record a
-     * zero-byte marker so loop recovery can resolve backward-branch targets. */
-    if (annot && ir_function->instructions[i].op == IR_OP_LABEL) {
-      mir_annotate_record_ir_label(ir_function->instructions[i].text,
-                                   context.code.size - annot_base);
-    }
-    size_t consumed = 0;
-    if (code_generator_binary_try_skip_scaled_address_shift(ir_function, i,
-                                                            &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_binary_compare_branch_chain(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_compare_assign_diamond(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_offset_scaled_address_load(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_offset_scaled_address_store(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_address_add_load(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_address_add_store(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_scaled_address_load(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_scaled_address_store(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_binary_cast_chain(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_float_cast_binary_chain(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_float_binary_expression_chain(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_binary_expression_chain(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    if (code_generator_binary_try_emit_compare_branch_zero(
-            generator, &context, ir_function, i, &consumed)) {
-      i += consumed;
-      continue;
-    }
-
-    {
-      const IRInstruction *instruction = &ir_function->instructions[i];
-      if (generator->debug_info && generator->generate_stack_trace_support &&
-          instruction->location.line > 0) {
-        if (!code_generator_binary_emit_runtime_location_marker(
-                generator, &context, instruction->location.line,
-                instruction->location.column,
-                code_generator_runtime_filename(
-                    generator, instruction->location.filename))) {
-          free(align_label);
-          binary_function_context_destroy(&context);
-          return 0;
-        }
-      }
-    }
-
-    if (!code_generator_binary_emit_instruction(
-            generator, &context, &ir_function->instructions[i])) {
-      free(align_label);
-      if (annot) mir_annotate_end_function();
-      binary_function_context_destroy(&context);
-      return 0;
-    }
-    i++;
+  if (!binary_emit_function_body(generator, &context, ir_function, &labels,
+                                 next_emitting, align_label, annot,
+                                 annot_base)) {
+    free(align_label);
+    binary_function_context_destroy(&context);
+    return 0;
   }
   free(align_label);
   align_label = NULL;
-  /* Record the last instruction's span (no further loop top runs). */
-  if (annot && annot_prev_idx >= 0 && context.code.size > annot_prev_off) {
-    mir_annotate_record_ir(ir_function, annot_prev_idx,
-                           annot_prev_off - annot_base,
-                           context.code.size - annot_prev_off,
-                           context.code.data + annot_prev_off);
-  }
-  if (annot) {
-    mir_annotate_end_function();
-  }
+
 
   return_offset = context.code.size;
   if (context.runtime_end_label &&
