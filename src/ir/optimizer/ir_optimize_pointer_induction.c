@@ -481,167 +481,102 @@ static int ir_ptr_iv_chain_dies_in_drops(const IRFunction *function,
   return 1;
 }
 
-static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index,
-                                       int *changed) {
-  IRWhileLoopBounds bounds = {0};
-  const char *iv_symbol = NULL;
-  size_t compare_index = 0;
-  size_t branch_index = 0;
-  size_t body_start = 0;
-  size_t body_end = 0;
-  size_t jump_index = 0;
-  size_t increment_index = 0;
-  IRPtrBaseBinding bindings[IR_PTR_BIND_MAX] = {0};
-  size_t binding_count = 0;
-  char *end_ptr = NULL;
-  IRInstructionVector vector = {0};
-  const IRInstruction *compare = NULL;
-  const char *bound_symbol = NULL;
-  long long iv_start = 0;
-
-  if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
-    return 1;
-  }
-
-  compare_index = bounds.compare_index;
-  branch_index = bounds.branch_index;
-  body_start = branch_index + 1;
-  body_end = bounds.jump_index;
-  jump_index = bounds.jump_index;
-
-  compare = &function->instructions[compare_index];
-  iv_symbol = compare->lhs.name;
-  if (!iv_symbol || compare->rhs.kind != IR_OPERAND_SYMBOL ||
-      !compare->rhs.name ||
-      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
-                               bounds.jump_index)) {
-    return 1;
-  }
-  bound_symbol = compare->rhs.name;
-
-  if (!ir_ptr_induction_iv_start_value(function, header_index, iv_symbol,
-                                       &iv_start) ||
-      iv_start != 0) {
-    return 1;
-  }
-
-  increment_index = jump_index;
-  while (increment_index > body_start) {
-    increment_index--;
-    if (function->instructions[increment_index].op != IR_OP_NOP) {
-      break;
-    }
-  }
-  if (!ir_try_parse_direct_unit_increment(
-          &function->instructions[increment_index], iv_symbol)) {
-    return 1;
-  }
-
-  if (ir_loop_body_is_unclaimable(function, body_start, body_end)) {
-    return 1;
-  }
-
-  /* Leave PURE reductions (a self-accumulate `acc = acc OP <loaded>`, acc != iv,
-   * and NO array store) alone: the SIMD sum/dot recognizers handle them far
-   * better but need the loop in INDEXED form, and walking the load pointer here
-   * would hide that shape. A loop that ALSO stores to an array is a real map
-   * (sum_i32 etc. won't claim it anyway), so pointer-induction must still run.
-   * Safe -- this only declines an optimization, never changes results. */
-  {
-    int loop_has_reduction = 0;
-    int loop_has_store = 0;
-    for (size_t i = body_start; i < body_end; i++) {
-      const IRInstruction *ins = &function->instructions[i];
-      if (ins->op == IR_OP_STORE) {
-        loop_has_store = 1;
-      }
-      if (ins->op == IR_OP_BINARY && ins->text &&
-          (strcmp(ins->text, "+") == 0 || strcmp(ins->text, "-") == 0) &&
-          ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
-          (!iv_symbol || strcmp(ins->dest.name, iv_symbol) != 0) &&
-          (ir_operand_is_symbol_named(&ins->lhs, ins->dest.name) ||
-           ir_operand_is_symbol_named(&ins->rhs, ins->dest.name))) {
-        loop_has_reduction = 1;
-      }
-    }
-    if (loop_has_reduction && !loop_has_store) {
-      return 1;
-    }
-  }
-
-  /* Likewise leave unit-stride int32 MAPS that the general int vectorizer
-   * claims (it needs the indexed `iv << 2` form; walking the pointers here
-   * would hide the shape and leave the loop scalar). Probed with the real
-   * matcher so this decline tracks the vectorizer's gates exactly; loops it
-   * refuses (division, casts to narrow ints, over-budget DAGs, ...) still
-   * get the pointer walk. */
-  if (ir_auto_vectorize_int_claimable(function, header_index)) {
-    return 1;
-  }
-
-  /* Same for early-exit search loops the find skip-ahead claims: it needs the
-   * indexed `a + (iv << 2)` / `a + iv` form to recognize the predicate. */
-  if (ir_auto_vectorize_find_claimable(function, header_index)) {
-    return 1;
-  }
-
-  /* Set when an iv-indexed access cannot be converted to a pointer-walk (its
-   * base is not an i32 ptr param , e.g. a local pointer like (int32*)&G[off]).
-   * Such an access keeps the induction variable (and its `iv << 2` byte-offset
-   * shift) live, but the transform unconditionally drops the iv increment and
-   * shift. Half-converting would leave the surviving access referencing a
-   * deleted index temp, so we must bail out entirely instead. */
-  int has_unconvertible_iv_access = 0;
-
+/* Leave PURE reductions (a self-accumulate `acc = acc OP <loaded>`, acc != iv,
+ * and NO array store) alone: the SIMD sum/dot recognizers handle them far
+ * better but need the loop in INDEXED form, and walking the load pointer here
+ * would hide that shape. A loop that ALSO stores to an array is a real map
+ * (sum_i32 etc. won't claim it anyway), so pointer-induction must still run.
+ * Safe -- this only declines an optimization, never changes results. */
+static int ir_ptr_loop_is_pure_reduction(const IRFunction *function,
+                                         size_t body_start, size_t body_end,
+                                         const char *iv_symbol) {
+  int loop_has_reduction = 0;
+  int loop_has_store = 0;
   for (size_t i = body_start; i < body_end; i++) {
     const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_LOAD && ins->lhs.kind == IR_OPERAND_TEMP &&
-        ins->lhs.name) {
-      const char *base = NULL;
-      if (!ir_resolve_indexed_address_temp(function, i, iv_symbol, bound_symbol,
-                                           ins->lhs.name, &base, NULL, NULL)) {
-        continue;
-      }
-      if (!ir_symbol_is_i32_ptr_param(function, base)) {
-        has_unconvertible_iv_access = 1;
-        continue;
-      }
-      int added = ir_ptr_binding_add(bindings, &binding_count, header_index,
-                                     base, ins->lhs.name);
-      if (added <= 0) {
-        ir_ptr_bindings_destroy(bindings, binding_count);
-        return added == 0 ? 0 : 1;
-      }
+    if (ins->op == IR_OP_STORE) {
+      loop_has_store = 1;
     }
-    if (ins->op == IR_OP_STORE && ins->dest.kind == IR_OPERAND_TEMP &&
-        ins->dest.name) {
-      const char *base = NULL;
-      if (!ir_resolve_indexed_address_temp(function, i, iv_symbol, bound_symbol,
-                                           ins->dest.name, &base, NULL, NULL)) {
-        continue;
-      }
-      if (!ir_symbol_is_i32_ptr_param(function, base)) {
-        has_unconvertible_iv_access = 1;
-        continue;
-      }
-      int added = ir_ptr_binding_add(bindings, &binding_count, header_index,
-                                     base, ins->dest.name);
-      if (added <= 0) {
-        ir_ptr_bindings_destroy(bindings, binding_count);
-        return added == 0 ? 0 : 1;
-      }
+    if (ins->op == IR_OP_BINARY && ins->text &&
+        (strcmp(ins->text, "+") == 0 || strcmp(ins->text, "-") == 0) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        (!iv_symbol || strcmp(ins->dest.name, iv_symbol) != 0) &&
+        (ir_operand_is_symbol_named(&ins->lhs, ins->dest.name) ||
+         ir_operand_is_symbol_named(&ins->rhs, ins->dest.name))) {
+      loop_has_reduction = 1;
     }
   }
-  /* The counter is deleted along with its increment, so nothing may read it
-   * except computation that dies into the dropped address temps. When
-   * something else DOES read it -- a reversed index chain, a stored counter
-   * value -- the loop still converts, but in keep-the-counter mode: the
-   * increment and iv-fed shifts stay, and only the bound address producers
-   * are dropped. Previously such loops either froze the counter (a stored
-   * `i * 2` went stale: the gather test's silent miscompile) or bailed. */
-  int keep_iv = has_unconvertible_iv_access;
-  for (size_t i = body_start; i < body_end && !keep_iv; i++) {
+  return loop_has_reduction && !loop_has_store;
+}
+
+static int ir_ptr_collect_one_access(const IRFunction *function, size_t index,
+                                     const char *iv_symbol,
+                                     const char *bound_symbol,
+                                     const IROperand *address,
+                                     size_t header_index,
+                                     IRPtrBaseBinding *bindings,
+                                     size_t *binding_count,
+                                     int *has_unconvertible_iv_access) {
+  const char *base = NULL;
+  if (address->kind != IR_OPERAND_TEMP || !address->name) {
+    return 1;
+  }
+  if (!ir_resolve_indexed_address_temp(function, index, iv_symbol, bound_symbol,
+                                       address->name, &base, NULL, NULL)) {
+    return 1;
+  }
+  if (!ir_symbol_is_i32_ptr_param(function, base)) {
+    *has_unconvertible_iv_access = 1;
+    return 1;
+  }
+  return ir_ptr_binding_add(bindings, binding_count, header_index, base,
+                            address->name);
+}
+
+static int ir_ptr_collect_bindings(const IRFunction *function,
+                                   size_t header_index, size_t body_start,
+                                   size_t body_end, const char *iv_symbol,
+                                   const char *bound_symbol,
+                                   IRPtrBaseBinding *bindings,
+                                   size_t *binding_count,
+                                   int *has_unconvertible_iv_access) {
+  for (size_t i = body_start; i < body_end; i++) {
     const IRInstruction *ins = &function->instructions[i];
+    const IROperand *address = NULL;
+    int added;
+    if (ins->op == IR_OP_LOAD) {
+      address = &ins->lhs;
+    } else if (ins->op == IR_OP_STORE) {
+      address = &ins->dest;
+    } else {
+      continue;
+    }
+    added = ir_ptr_collect_one_access(function, i, iv_symbol, bound_symbol,
+                                      address, header_index, bindings,
+                                      binding_count,
+                                      has_unconvertible_iv_access);
+    if (added <= 0) {
+      return added == 0 ? 0 : -1;
+    }
+  }
+  return 1;
+}
+
+/* The counter is deleted along with its increment, so nothing may read it
+ * except computation that dies into the dropped address temps. When something
+ * else DOES read it -- a reversed index chain, a stored counter value -- the
+ * loop still converts, but in keep-the-counter mode: the increment and iv-fed
+ * shifts stay, and only the bound address producers are dropped. Previously
+ * such loops either froze the counter (a stored `i * 2` went stale: the gather
+ * test's silent miscompile) or bailed. */
+static int ir_ptr_must_keep_counter(const IRFunction *function,
+                                    size_t body_start, size_t body_end,
+                                    const IRPtrBaseBinding *bindings,
+                                    size_t binding_count,
+                                    const char *iv_symbol) {
+  for (size_t i = body_start; i < body_end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    int reads_iv;
     if (ins->op == IR_OP_NOP) {
       continue;
     }
@@ -664,41 +599,41 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
         ir_operand_is_int_value(&ins->rhs, 1)) {
       continue;
     }
-    int reads_iv = ir_operand_is_symbol_named(&ins->lhs, iv_symbol) ||
-                   ir_operand_is_symbol_named(&ins->rhs, iv_symbol) ||
-                   (ins->op == IR_OP_STORE &&
-                    ir_operand_is_symbol_named(&ins->dest, iv_symbol));
+    reads_iv = ir_operand_is_symbol_named(&ins->lhs, iv_symbol) ||
+               ir_operand_is_symbol_named(&ins->rhs, iv_symbol) ||
+               (ins->op == IR_OP_STORE &&
+                ir_operand_is_symbol_named(&ins->dest, iv_symbol));
     for (size_t a = 0; !reads_iv && a < ins->argument_count; a++) {
       reads_iv = ir_operand_is_symbol_named(&ins->arguments[a], iv_symbol);
     }
     if (reads_iv &&
-        !ir_ptr_iv_chain_dies_in_drops(function, body_start, body_end,
-                                       bindings, binding_count, iv_symbol,
-                                       ins, 0)) {
-      keep_iv = 1;
+        !ir_ptr_iv_chain_dies_in_drops(function, body_start, body_end, bindings,
+                                       binding_count, iv_symbol, ins, 0)) {
+      return 1;
     }
   }
+  return 0;
+}
 
-
-
-  if (binding_count == 0) {
-    return 1;
-  }
-
-  end_ptr = ir_ptr_induction_make_name(bindings[0].base, header_index, "end");
-  if (!end_ptr) {
-    ir_ptr_bindings_destroy(bindings, binding_count);
-    return 0;
-  }
+static int ir_ptr_emit_prologue(IRFunction *function,
+                                size_t header_index,
+                                const IRPtrBaseBinding *bindings,
+                                size_t binding_count, const char *bound_symbol,
+                                const char *end_ptr,
+                                IRInstructionVector *vector) {
+  IRInstruction end_decl = {0};
+  IRInstruction end_init = {0};
+  IRInstruction end_scale = {0};
+  IRInstruction end_add = {0};
+  char end_scale_temp[64];
+  const char *end_type;
+  int ok;
 
   for (size_t i = 0; i < header_index; i++) {
     IRInstruction cloned = {0};
     if (!ir_clone_instruction_plain(&function->instructions[i], &cloned) ||
-        !ir_instruction_vector_append_move(&vector, &cloned)) {
+        !ir_instruction_vector_append_move(vector, &cloned)) {
       ir_instruction_destroy_storage(&cloned);
-      ir_instruction_vector_destroy(&vector);
-      ir_ptr_bindings_destroy(bindings, binding_count);
-      free(end_ptr);
       return 0;
     }
   }
@@ -717,112 +652,98 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
     init.op = IR_OP_ASSIGN;
     init.dest = ir_operand_symbol(bindings[b].ptr_p);
     init.lhs = ir_operand_symbol(bindings[b].base);
-    if (!decl.dest.name || !decl.text || !init.dest.name || !init.lhs.name ||
-        !ir_instruction_vector_append_move(&vector, &decl) ||
-        !ir_instruction_vector_append_move(&vector, &init)) {
-      ir_instruction_destroy_storage(&decl);
-      ir_instruction_destroy_storage(&init);
-      ir_instruction_vector_destroy(&vector);
-      ir_ptr_bindings_destroy(bindings, binding_count);
-      free(end_ptr);
-      return 0;
-    }
+    ok = decl.dest.name && decl.text && init.dest.name && init.lhs.name &&
+         ir_instruction_vector_append_move(vector, &decl) &&
+         ir_instruction_vector_append_move(vector, &init);
     ir_instruction_destroy_storage(&decl);
     ir_instruction_destroy_storage(&init);
-  }
-
-  {
-    IRInstruction end_decl = {0};
-    IRInstruction end_init = {0};
-    IRInstruction end_scale = {0};
-    IRInstruction end_add = {0};
-    char end_scale_temp[64];
-    const char *ptr_type =
-        ir_function_local_declared_type(function, bindings[0].base);
-    snprintf(end_scale_temp, sizeof(end_scale_temp), "__ptr_t%zu_end",
-             header_index);
-    end_decl.op = IR_OP_DECLARE_LOCAL;
-    end_decl.dest = ir_operand_symbol(end_ptr);
-    end_decl.text = mettle_strdup(ptr_type ? ptr_type : "int32*");
-    end_init.op = IR_OP_ASSIGN;
-    end_init.dest = ir_operand_symbol(end_ptr);
-    end_init.lhs = ir_operand_symbol(bindings[0].base);
-    end_scale.op = IR_OP_BINARY;
-    end_scale.text = mettle_strdup("<<");
-    end_scale.dest = ir_operand_temp(end_scale_temp);
-    end_scale.lhs = ir_operand_symbol(bound_symbol);
-    end_scale.rhs = ir_operand_int(2);
-    end_add.op = IR_OP_BINARY;
-    end_add.text = mettle_strdup("+");
-    end_add.dest = ir_operand_symbol(end_ptr);
-    end_add.lhs = ir_operand_symbol(end_ptr);
-    end_add.rhs = ir_operand_temp(end_scale_temp);
-    if (!end_decl.text || !end_scale.text || !end_add.text ||
-        !ir_instruction_vector_append_move(&vector, &end_decl) ||
-        !ir_instruction_vector_append_move(&vector, &end_init) ||
-        !ir_instruction_vector_append_move(&vector, &end_scale) ||
-        !ir_instruction_vector_append_move(&vector, &end_add)) {
-      ir_instruction_destroy_storage(&end_decl);
-      ir_instruction_destroy_storage(&end_init);
-      ir_instruction_destroy_storage(&end_scale);
-      ir_instruction_destroy_storage(&end_add);
-      ir_instruction_vector_destroy(&vector);
-      ir_ptr_bindings_destroy(bindings, binding_count);
-      free(end_ptr);
+    if (!ok) {
       return 0;
     }
-    ir_instruction_destroy_storage(&end_decl);
-    ir_instruction_destroy_storage(&end_init);
-    ir_instruction_destroy_storage(&end_scale);
-    ir_instruction_destroy_storage(&end_add);
   }
 
+  end_type = ir_function_local_declared_type(function, bindings[0].base);
+  snprintf(end_scale_temp, sizeof(end_scale_temp), "__ptr_t%zu_end",
+           header_index);
+  end_decl.op = IR_OP_DECLARE_LOCAL;
+  end_decl.dest = ir_operand_symbol(end_ptr);
+  end_decl.text = mettle_strdup(end_type ? end_type : "int32*");
+  end_init.op = IR_OP_ASSIGN;
+  end_init.dest = ir_operand_symbol(end_ptr);
+  end_init.lhs = ir_operand_symbol(bindings[0].base);
+  end_scale.op = IR_OP_BINARY;
+  end_scale.text = mettle_strdup("<<");
+  end_scale.dest = ir_operand_temp(end_scale_temp);
+  end_scale.lhs = ir_operand_symbol(bound_symbol);
+  end_scale.rhs = ir_operand_int(2);
+  end_add.op = IR_OP_BINARY;
+  end_add.text = mettle_strdup("+");
+  end_add.dest = ir_operand_symbol(end_ptr);
+  end_add.lhs = ir_operand_symbol(end_ptr);
+  end_add.rhs = ir_operand_temp(end_scale_temp);
+  ok = end_decl.text && end_scale.text && end_add.text &&
+       ir_instruction_vector_append_move(vector, &end_decl) &&
+       ir_instruction_vector_append_move(vector, &end_init) &&
+       ir_instruction_vector_append_move(vector, &end_scale) &&
+       ir_instruction_vector_append_move(vector, &end_add);
+  ir_instruction_destroy_storage(&end_decl);
+  ir_instruction_destroy_storage(&end_init);
+  ir_instruction_destroy_storage(&end_scale);
+  ir_instruction_destroy_storage(&end_add);
+  return ok;
+}
+
+static int ir_ptr_emit_step(IRFunction *function, size_t index,
+                            const IRPtrBaseBinding *bindings,
+                            size_t binding_count,
+                            IRInstructionVector *vector) {
+  for (size_t b = 0; b < binding_count; b++) {
+    IRInstruction step = {0};
+    int ok;
+    step.op = IR_OP_BINARY;
+    step.location = function->instructions[index].location;
+    step.text = mettle_strdup("+");
+    step.dest = ir_operand_symbol(bindings[b].ptr_p);
+    step.lhs = ir_operand_symbol(bindings[b].ptr_p);
+    step.rhs = ir_operand_int(4);
+    ok = step.text && ir_instruction_vector_append_move(vector, &step);
+    ir_instruction_destroy_storage(&step);
+    if (!ok) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ir_ptr_emit_loop(IRFunction *function, size_t header_index,
+                            size_t increment_index, size_t jump_index,
+                            size_t body_start, size_t body_end,
+                            const IRPtrBaseBinding *bindings,
+                            size_t binding_count, const char *iv_symbol,
+                            const char *end_ptr, int keep_iv,
+                            IRInstructionVector *vector) {
   for (size_t i = header_index; i < function->instruction_count; i++) {
     IRInstruction rewritten = {0};
     if (!ir_clone_instruction_plain(&function->instructions[i], &rewritten)) {
-      ir_instruction_vector_destroy(&vector);
-      ir_ptr_bindings_destroy(bindings, binding_count);
-      free(end_ptr);
       return 0;
     }
 
     if (i == increment_index) {
-      for (size_t b = 0; b < binding_count; b++) {
-        IRInstruction step = {0};
-        step.op = IR_OP_BINARY;
-        step.location = function->instructions[i].location;
-        step.text = mettle_strdup("+");
-        step.dest = ir_operand_symbol(bindings[b].ptr_p);
-        step.lhs = ir_operand_symbol(bindings[b].ptr_p);
-        step.rhs = ir_operand_int(4);
-        if (!step.text || !ir_instruction_vector_append_move(&vector, &step)) {
-          ir_instruction_destroy_storage(&step);
-          ir_instruction_vector_destroy(&vector);
-          ir_ptr_bindings_destroy(bindings, binding_count);
-          free(end_ptr);
-          return 0;
-        }
-        ir_instruction_destroy_storage(&step);
-      }
-      if (!ir_instruction_vector_append_move(&vector, &rewritten)) {
+      if (!ir_ptr_emit_step(function, i, bindings, binding_count, vector) ||
+          !ir_instruction_vector_append_move(vector, &rewritten)) {
         ir_instruction_destroy_storage(&rewritten);
-        ir_instruction_vector_destroy(&vector);
-        ir_ptr_bindings_destroy(bindings, binding_count);
-        free(end_ptr);
         return 0;
       }
       continue;
     }
 
-  /* Rewrites are only valid inside this loop; the iv and addr temps may be
-   * reused by later loops that keep their indexed form. */
-  if (i <= jump_index &&
-      !ir_ptr_induction_rewrite_instruction(
-            &rewritten, bindings, binding_count, iv_symbol, end_ptr)) {
+    /* Rewrites are only valid inside this loop; the iv and addr temps may be
+     * reused by later loops that keep their indexed form. */
+    if (i <= jump_index &&
+        !ir_ptr_induction_rewrite_instruction(&rewritten, bindings,
+                                              binding_count, iv_symbol,
+                                              end_ptr)) {
       ir_instruction_destroy_storage(&rewritten);
-      ir_instruction_vector_destroy(&vector);
-      ir_ptr_bindings_destroy(bindings, binding_count);
-      free(end_ptr);
       return 0;
     }
 
@@ -834,16 +755,121 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
       continue;
     }
 
-    if (!ir_instruction_vector_append_move(&vector, &rewritten)) {
+    if (!ir_instruction_vector_append_move(vector, &rewritten)) {
       ir_instruction_destroy_storage(&rewritten);
-      ir_instruction_vector_destroy(&vector);
-      ir_ptr_bindings_destroy(bindings, binding_count);
-      free(end_ptr);
       return 0;
     }
   }
+  return 1;
+}
 
-  if (!ir_function_replace_instructions(function, &vector)) {
+static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index,
+                                       int *changed) {
+  IRWhileLoopBounds bounds = {0};
+  const char *iv_symbol = NULL;
+  size_t body_start = 0;
+  size_t body_end = 0;
+  size_t increment_index = 0;
+  IRPtrBaseBinding bindings[IR_PTR_BIND_MAX] = {0};
+  size_t binding_count = 0;
+  char *end_ptr = NULL;
+  IRInstructionVector vector = {0};
+  const IRInstruction *compare = NULL;
+  const char *bound_symbol = NULL;
+  long long iv_start = 0;
+  int has_unconvertible_iv_access = 0;
+  int collected;
+  int keep_iv;
+
+  if (!function || !ir_find_while_loop_bounds(function, header_index, &bounds)) {
+    return 1;
+  }
+
+  body_start = bounds.branch_index + 1;
+  body_end = bounds.jump_index;
+
+  compare = &function->instructions[bounds.compare_index];
+  iv_symbol = compare->lhs.name;
+  if (!iv_symbol || compare->rhs.kind != IR_OPERAND_SYMBOL ||
+      !compare->rhs.name ||
+      !ir_symbol_is_loop_bound(function, compare->rhs.name, header_index,
+                               bounds.jump_index)) {
+    return 1;
+  }
+  bound_symbol = compare->rhs.name;
+
+  if (!ir_ptr_induction_iv_start_value(function, header_index, iv_symbol,
+                                       &iv_start) ||
+      iv_start != 0) {
+    return 1;
+  }
+
+  increment_index = bounds.jump_index;
+  while (increment_index > body_start) {
+    increment_index--;
+    if (function->instructions[increment_index].op != IR_OP_NOP) {
+      break;
+    }
+  }
+  if (!ir_try_parse_direct_unit_increment(
+          &function->instructions[increment_index], iv_symbol)) {
+    return 1;
+  }
+
+  if (ir_loop_body_is_unclaimable(function, body_start, body_end)) {
+    return 1;
+  }
+
+  if (ir_ptr_loop_is_pure_reduction(function, body_start, body_end,
+                                    iv_symbol)) {
+    return 1;
+  }
+
+  /* Likewise leave unit-stride int32 MAPS that the general int vectorizer
+   * claims (it needs the indexed `iv << 2` form; walking the pointers here
+   * would hide the shape and leave the loop scalar). Probed with the real
+   * matcher so this decline tracks the vectorizer's gates exactly; loops it
+   * refuses (division, casts to narrow ints, over-budget DAGs, ...) still
+   * get the pointer walk. */
+  if (ir_auto_vectorize_int_claimable(function, header_index)) {
+    return 1;
+  }
+
+  /* Same for early-exit search loops the find skip-ahead claims: it needs the
+   * indexed `a + (iv << 2)` / `a + iv` form to recognize the predicate. */
+  if (ir_auto_vectorize_find_claimable(function, header_index)) {
+    return 1;
+  }
+
+  collected = ir_ptr_collect_bindings(function, header_index, body_start,
+                                      body_end, iv_symbol, bound_symbol,
+                                      bindings, &binding_count,
+                                      &has_unconvertible_iv_access);
+  if (collected <= 0) {
+    ir_ptr_bindings_destroy(bindings, binding_count);
+    return collected == 0 ? 0 : 1;
+  }
+
+  keep_iv = has_unconvertible_iv_access ||
+            ir_ptr_must_keep_counter(function, body_start, body_end, bindings,
+                                     binding_count, iv_symbol);
+
+  if (binding_count == 0) {
+    return 1;
+  }
+
+  end_ptr = ir_ptr_induction_make_name(bindings[0].base, header_index, "end");
+  if (!end_ptr) {
+    ir_ptr_bindings_destroy(bindings, binding_count);
+    return 0;
+  }
+
+  if (!ir_ptr_emit_prologue(function, header_index, bindings, binding_count,
+                            bound_symbol, end_ptr, &vector) ||
+      !ir_ptr_emit_loop(function, header_index, increment_index,
+                        bounds.jump_index, body_start, body_end, bindings,
+                        binding_count, iv_symbol, end_ptr, keep_iv, &vector) ||
+      !ir_function_replace_instructions(function, &vector)) {
     ir_instruction_vector_destroy(&vector);
     ir_ptr_bindings_destroy(bindings, binding_count);
     free(end_ptr);

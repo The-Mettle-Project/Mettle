@@ -3284,6 +3284,536 @@ static int report_gpu_info(const char *default_target, int isa_major,
   return 0;
 }
 
+typedef struct {
+  int build_executable;
+  int linker_mode_explicit;
+  int output_filename_explicit;
+  int ptx_version_explicit;
+  int gpu_arch_explicit;
+  char detected_ptx_target[16];
+} DriverFlags;
+
+typedef enum {
+  DRIVER_FLAG_UNMATCHED = 0,
+  DRIVER_FLAG_TAKEN,
+  DRIVER_FLAG_FAILED
+} DriverFlagResult;
+
+static DriverFlagResult parse_flag_output(CompilerOptions *options,
+                                     DriverFlags *flags,
+                                     int argc, char *argv[],
+                                     int *index) {
+  int i = *index;
+  (void)argc;
+  (void)flags;
+  if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+    options->input_filename = argv[++i];
+  } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+    options->output_filename = argv[++i];
+    flags->output_filename_explicit = 1;
+  } else if (strcmp(argv[i], "-I") == 0) {
+    if (i + 1 >= argc) {
+      fprintf(stderr, "Error: Missing import directory after '-I'\n");
+      return DRIVER_FLAG_FAILED;
+    }
+    if (!add_import_directory(options, argv[++i])) {
+      fprintf(stderr, "Error: Failed to add import directory\n");
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strncmp(argv[i], "-I", 2) == 0 && argv[i][2] != '\0') {
+    if (!add_import_directory(options, argv[i] + 2)) {
+      fprintf(stderr, "Error: Failed to add import directory\n");
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--stdlib") == 0 && i + 1 < argc) {
+    options->stdlib_directory = argv[++i];
+  } else if (strcmp(argv[i], "--build") == 0) {
+    flags->build_executable = 1;
+  } else if (strcmp(argv[i], "--emit-asm") == 0) {
+    fprintf(stderr,
+            "Error: --emit-asm has been removed; Mettle only emits native "
+            "objects now.\n");
+    return DRIVER_FLAG_FAILED;
+  } else if (strcmp(argv[i], "--emit-obj") == 0) {
+    options->emit_object = 1;
+  } else if (strcmp(argv[i], "--linker") == 0 && i + 1 < argc) {
+    flags->linker_mode_explicit = 1;
+    if (!parse_linker_mode(argv[++i], &options->linker_mode)) {
+      fprintf(stderr,
+              "Error: Unknown linker mode '%s' (expected auto, internal, gcc, or msvc)\n",
+              argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--linker") == 0) {
+    fprintf(stderr, "Error: Missing linker mode after '--linker'\n");
+    return DRIVER_FLAG_FAILED;
+  } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
+    const char *name = argv[++i];
+    if (strcmp(name, "windows") == 0 || strcmp(name, "gui") == 0) {
+      options->windows_subsystem = 1;
+    } else if (strcmp(name, "console") == 0) {
+      options->windows_subsystem = 0;
+    } else {
+      fprintf(stderr,
+              "Error: Unknown subsystem '%s' (expected console or windows)\n",
+              name);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--subsystem") == 0) {
+    fprintf(stderr, "Error: Missing subsystem after '--subsystem'\n");
+    return DRIVER_FLAG_FAILED;
+  } else if (strcmp(argv[i], "--link-arg") == 0 && i + 1 < argc) {
+    if (!add_link_argument(options, argv[++i])) {
+      fprintf(stderr, "Error: Failed to add linker argument\n");
+      return DRIVER_FLAG_FAILED;
+    }
+  } else {
+    return DRIVER_FLAG_UNMATCHED;
+  }
+  *index = i;
+  return DRIVER_FLAG_TAKEN;
+}
+
+static DriverFlagResult parse_flag_diagnostics(CompilerOptions *options,
+                                     DriverFlags *flags,
+                                     int argc, char *argv[],
+                                     int *index) {
+  int i = *index;
+  (void)argc;
+  (void)flags;
+  if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+    options->debug_mode = 1;
+    options->generate_debug_symbols = 1;
+    options->generate_line_mapping = 1;
+    options->generate_stack_trace_support = 1;
+  } else if (strcmp(argv[i], "--dump-ast") == 0) {
+    options->dump_ast = 1;
+  } else if (strcmp(argv[i], "--dump-ir") == 0) {
+    options->dump_ir = 1;
+  } else if (strcmp(argv[i], "--ml-opt") == 0) {
+    options->ml_opt = 1;
+    options->optimize = 1;
+  } else if (strcmp(argv[i], "--ml-opt-speculative") == 0) {
+    /* Unlocks the model's unproven actions (dead-code DELETE). They exist
+     * only on the validator's word, so this implies --ml-opt; ml_gnn reads
+     * the env to emit the speculative dispositions. */
+    options->ml_opt = 1;
+    options->optimize = 1;
+    putenv("METTLE_ML_SPECULATIVE=1");
+  } else if (strncmp(argv[i], "--error-format=", 15) == 0) {
+    const char *fmt = argv[i] + 15;
+    if (strcmp(fmt, "json") == 0) {
+      error_reporter_set_format_json(1);
+    } else if (strcmp(fmt, "human") == 0) {
+      error_reporter_set_format_json(0);
+    } else {
+      fprintf(stderr,
+              "Error: Unknown error format '%s' (expected human or json)\n",
+              fmt);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strncmp(argv[i], "--filter=", 9) == 0) {
+    options->test_filter = argv[i] + 9;
+  } else if (strcmp(argv[i], "--pgo") == 0) {
+    options->pgo = 1;
+    options->optimize = 1;
+  } else if (strcmp(argv[i], "--verify") == 0) {
+    ir_verify_set_enabled(1);
+    options->optimize = 1;
+  } else if (strcmp(argv[i], "--simd-report") == 0) {
+    options->simd_report = 1;
+  } else if (strcmp(argv[i], "--explain") == 0) {
+    options->explain = 1;
+  } else if (strncmp(argv[i], "--explain=", 10) == 0) {
+    /* A whole program's report runs to hundreds of lines. The selector cuts
+     * the prose down to the slice asked for; the JSON sidecar stays whole. */
+    options->explain = 1;
+    options->explain_filter = argv[i] + 10;
+  } else if (strcmp(argv[i], "--explain-all") == 0) {
+    /* Whole-program report: no focus-file filter, so imported modules'
+     * loops and calls are analyzed too (stdlib included). */
+    options->explain = 1;
+    options->explain_all = 1;
+  } else if (strcmp(argv[i], "--explain-json") == 0) {
+    /* Machine-readable sidecar (<output-stem>.explain.json) alongside the
+     * prose report; implies --explain. */
+    options->explain = 1;
+    options->explain_json = 1;
+  } else if (strcmp(argv[i], "--annotate-asm") == 0) {
+    /* Codegen provenance listing + <stem>.annot.json sidecar. Needs the
+     * optimizer's decisions (and remarks) to be interesting, so it implies
+     * -O and collects --explain remarks (retained past optimization for the
+     * codegen join). The default syntax is both Intel and AT&T (toggle). */
+    options->annotate_asm = 1;
+    /* Reflect the codegen users actually ship: --release enables every
+     * vectorizer/idiom, so the annotation matches release output (otherwise a
+     * loop shown "not vectorized" at -O would mislead). */
+    options->optimize = 1;
+    options->release = 1;
+    options->explain = 1;
+    options->asm_syntax = 2; /* both */
+  } else if (strncmp(argv[i], "--annotate-lines=", 17) == 0) {
+    /* Focused codegen report for a source line range (LLM-facing): asm + cost
+     * + covering loops + live registers + decisions for just those lines.
+     * Accepts "A" (single line) or "A-B". Implies --annotate-asm. */
+    const char *v = argv[i] + 17;
+    int a = 0, b = 0;
+    if (sscanf(v, "%d-%d", &a, &b) == 2) {
+      /* range */
+    } else if (sscanf(v, "%d", &a) == 1) {
+      b = a;
+    } else {
+      fprintf(stderr, "Error: --annotate-lines expects A or A-B (got '%s')\n", v);
+      return DRIVER_FLAG_FAILED;
+    }
+    if (a <= 0 || b < a) {
+      fprintf(stderr, "Error: --annotate-lines range invalid: %s\n", v);
+      return DRIVER_FLAG_FAILED;
+    }
+    options->annotate_q_lo = a;
+    options->annotate_q_hi = b;
+    options->annotate_asm = 1;
+    options->optimize = 1;
+    options->release = 1;
+    options->explain = 1;
+    if (!options->asm_syntax) options->asm_syntax = 0; /* intel-only is terser */
+  } else if (strncmp(argv[i], "--annotate-fn=", 14) == 0) {
+    options->annotate_q_fn = argv[i] + 14;
+    options->annotate_asm = 1;
+    options->optimize = 1;
+    options->release = 1;
+    options->explain = 1;
+  } else if (strcmp(argv[i], "--annotate-hot") == 0 ||
+             strncmp(argv[i], "--annotate-hot=", 15) == 0) {
+    /* Top-N hotspots across the program (LLM-facing "where is the time"). */
+    int n = 8;
+    if (argv[i][14] == '=') n = atoi(argv[i] + 15);
+    if (n <= 0) n = 8;
+    options->annotate_hot = n;
+    options->annotate_asm = 1;
+    options->optimize = 1;
+    options->release = 1;
+    options->explain = 1;
+  } else if (strncmp(argv[i], "--asm-syntax=", 13) == 0) {
+    const char *v = argv[i] + 13;
+    if (strcmp(v, "intel") == 0) {
+      options->asm_syntax = 0;
+    } else if (strcmp(v, "att") == 0) {
+      options->asm_syntax = 1;
+    } else if (strcmp(v, "both") == 0) {
+      options->asm_syntax = 2;
+    } else {
+      fprintf(stderr,
+              "Error: --asm-syntax must be intel, att, or both (got '%s')\n",
+              v);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else {
+    return DRIVER_FLAG_UNMATCHED;
+  }
+  *index = i;
+  return DRIVER_FLAG_TAKEN;
+}
+
+static DriverFlagResult parse_flag_gpu(CompilerOptions *options,
+                                     DriverFlags *flags,
+                                     int argc, char *argv[],
+                                     int *index) {
+  int i = *index;
+  (void)argc;
+  (void)flags;
+  if (strcmp(argv[i], "--emit-ptx") == 0) {
+    options->emit_ptx = 1;
+  } else if (strncmp(argv[i], "--emit-kernel-decls", 19) == 0) {
+    /* Bare, the declarations land next to the PTX as <output>.mettle. */
+    options->emit_kernel_decls =
+        argv[i][19] == '=' ? argv[i] + 20 : "";
+    if (argv[i][19] != '\0' && argv[i][19] != '=') {
+      fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strncmp(argv[i], "--gpu-arch=", 11) == 0) {
+    const char *arch = argv[i] + 11;
+    flags->gpu_arch_explicit = 1;
+    if (strcmp(arch, "gb10") == 0) {
+      /* GB10's compatible sm_121 profile excludes its architecture-specific
+       * FP4/block-scaled MMA forms. The named performance target must retain
+       * the `a` suffix; callers needing compatible PTX can request sm_121. */
+      options->ptx_target = "sm_121a";
+      if (!flags->ptx_version_explicit) {
+        options->ptx_isa_major = 8;
+        options->ptx_isa_minor = 8;
+      }
+    } else if (strcmp(arch, "native") == 0) {
+      /* The default already prefers the local GPU. Asking for it by name
+       * says the build is meant for this machine, so a missing driver is an
+       * error here rather than a silent fall back to the GB10 default. */
+      if (!gpu_detect_ptx_target(0, flags->detected_ptx_target,
+                                 sizeof(flags->detected_ptx_target))) {
+        fprintf(stderr,
+                "Error: --gpu-arch=native found no local NVIDIA device (%s); "
+                "name a target with --gpu-arch=sm_NN to cross-compile\n",
+                gpu_detect_local()->source);
+        return DRIVER_FLAG_FAILED;
+      }
+      options->ptx_target = flags->detected_ptx_target;
+    } else if (strcmp(arch, "portable") == 0) {
+      /* Virtual Turing ISA is the oldest forward-compatible baseline still
+       * supported for offline assembly by current CUDA 13 toolchains. */
+      options->ptx_target = "compute_75";
+      if (!flags->ptx_version_explicit) {
+        options->ptx_isa_major = 6;
+        options->ptx_isa_minor = 4;
+      }
+    } else if (strncmp(arch, "sm_", 3) == 0 ||
+               strncmp(arch, "compute_", 8) == 0) {
+      options->ptx_target = arch;
+    } else {
+      fprintf(stderr,
+              "Error: --gpu-arch expects gb10, portable, sm_NN, or "
+              "compute_NN (got '%s')\n",
+              arch);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strncmp(argv[i], "--ptx-version=", 14) == 0) {
+    const char *version = argv[i] + 14;
+    int major = 0, minor = 0;
+    char trailing = '\0';
+    if (sscanf(version, "%d.%d%c", &major, &minor, &trailing) != 2 ||
+        major < 1 || major > 99 || minor < 0 || minor > 9) {
+      fprintf(stderr,
+              "Error: --ptx-version expects MAJOR.MINOR (got '%s')\n",
+              version);
+      return DRIVER_FLAG_FAILED;
+    }
+    options->ptx_isa_major = major;
+    options->ptx_isa_minor = minor;
+    flags->ptx_version_explicit = 1;
+  } else if (strncmp(argv[i], "--gpu-tensor-tuple-budget=", 26) == 0) {
+    const char *value = argv[i] + 26;
+    int budget = 0;
+    char trailing = '\0';
+    if (sscanf(value, "%d%c", &budget, &trailing) != 1 || budget < 0 ||
+        budget > 4096) {
+      fprintf(stderr,
+              "Error: --gpu-tensor-tuple-budget expects 0..4096 (got '%s')\n",
+              value);
+      return DRIVER_FLAG_FAILED;
+    }
+    options->ptx_tensor_tuple_budget = budget;
+  } else if (strcmp(argv[i], "--report-occupancy") == 0) {
+    options->report_occupancy = 1;
+  } else if (strcmp(argv[i], "--gpu-checks") == 0) {
+    options->gpu_checks = 1;
+  } else if (strcmp(argv[i], "--report-launches") == 0) {
+    options->report_launches = 1;
+  } else if (strcmp(argv[i], "--old") == 0 && i + 1 < argc) {
+    options->swap_old_name = argv[++i];
+  } else if (strcmp(argv[i], "--new") == 0 && i + 1 < argc) {
+    options->swap_new_name = argv[++i];
+  } else if (strcmp(argv[i], "--report-expansion") == 0) {
+    options->report_expansion = 1;
+  } else if (strncmp(argv[i], "--expansion-budget=", 19) == 0) {
+    long long budget = atoll(argv[i] + 19);
+    if (budget < 0) {
+      fprintf(stderr, "--expansion-budget must not be negative\n");
+      return DRIVER_FLAG_FAILED;
+    }
+    /* 0 is a real budget (expand nothing), so remember that one was asked
+       for rather than inferring it from the number. */
+    options->expansion_budget = (size_t)budget;
+    options->expansion_budget_set = 1;
+  } else if (strncmp(argv[i], "--sms=", 6) == 0) {
+    int sms = atoi(argv[i] + 6);
+    if (sms < 1 || sms > 1024) {
+      fprintf(stderr, "Error: --sms expects an SM count from 1 to 1024 "
+                      "(got '%s')\n",
+              argv[i] + 6);
+      return DRIVER_FLAG_FAILED;
+    }
+    options->report_sms = sms;
+  } else if (strcmp(argv[i], "--emit-spirv") == 0) {
+    options->emit_spirv = 1;
+  } else {
+    return DRIVER_FLAG_UNMATCHED;
+  }
+  *index = i;
+  return DRIVER_FLAG_TAKEN;
+}
+
+static DriverFlagResult parse_flag_codegen(CompilerOptions *options,
+                                     DriverFlags *flags,
+                                     int argc, char *argv[],
+                                     int *index) {
+  int i = *index;
+  (void)argc;
+  (void)flags;
+  if (strcmp(argv[i], "--emit-arm64") == 0) {
+    options->emit_arm64 = 1;
+  } else if (strcmp(argv[i], "--emit-arm64-obj") == 0) {
+    options->emit_arm64_obj = 1;
+  } else if (strcmp(argv[i], "-g") == 0 ||
+             strcmp(argv[i], "--debug-symbols") == 0) {
+    options->generate_debug_symbols = 1;
+  } else if (strcmp(argv[i], "-l") == 0 ||
+             strcmp(argv[i], "--line-mapping") == 0) {
+    options->generate_line_mapping = 1;
+  } else if (strcmp(argv[i], "-s") == 0 ||
+             strcmp(argv[i], "--stack-trace") == 0) {
+    options->generate_stack_trace_support = 1;
+  } else if (strcmp(argv[i], "--debug-format") == 0 && i + 1 < argc) {
+    options->debug_format = argv[++i];
+  } else if (strcmp(argv[i], "-O") == 0 ||
+             strcmp(argv[i], "--optimize") == 0) {
+    options->optimize = 1;
+  } else if (strcmp(argv[i], "-r") == 0 ||
+             strcmp(argv[i], "--release") == 0) {
+    options->release = 1;
+    options->optimize = 1;
+  } else if (strcmp(argv[i], "--strip-comments") == 0) {
+    fprintf(stderr,
+            "Error: --strip-comments has been removed; Mettle no longer "
+            "emits text assembly.\n");
+    return DRIVER_FLAG_FAILED;
+  } else if (strcmp(argv[i], "--prelude") == 0) {
+    options->prelude = 1;
+  } else if (strcmp(argv[i], "--profile") == 0) {
+    options->profile = 1;
+  } else if (strcmp(argv[i], "--profile-runtime") == 0) {
+    options->profile_runtime = 1;
+  } else if (strcmp(argv[i], "--profile-runtime-ops") == 0) {
+    options->profile_runtime_ops = 1;
+  } else if (strcmp(argv[i], "--profile-blocks") == 0) {
+    options->profile_blocks = 1;
+    options->profile_runtime = 1;
+  } else if (strcmp(argv[i], "--debug-hooks") == 0) {
+    options->debug_hooks = 1;
+  } else if (strcmp(argv[i], "--safe") == 0) {
+    options->safe = 1;
+  } else if (strcmp(argv[i], "--native-heap") == 0) {
+    options->native_heap = 1;
+  } else if (strcmp(argv[i], "--static") == 0) {
+    options->static_link = 1;
+  } else if (strcmp(argv[i], "--musl") == 0) {
+    options->musl_link = 1;
+    options->static_link = 1;
+  } else if (strcmp(argv[i], "--tracy") == 0) {
+    options->tracy = 1;
+  } else if (strcmp(argv[i], "--tracy-dir") == 0 && i + 1 < argc) {
+    options->tracy_directory = argv[++i];
+  } else if (strcmp(argv[i], "--tracy-dir") == 0) {
+    fprintf(stderr, "Error: Missing path after '--tracy-dir'\n");
+    return DRIVER_FLAG_FAILED;
+  } else {
+    return DRIVER_FLAG_UNMATCHED;
+  }
+  *index = i;
+  return DRIVER_FLAG_TAKEN;
+}
+
+static DriverFlagResult parse_flag_target(CompilerOptions *options,
+                                     DriverFlags *flags,
+                                     int argc, char *argv[],
+                                     int *index) {
+  int i = *index;
+  (void)argc;
+  (void)flags;
+  if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+    char target_error[256];
+    options->target_triple = argv[++i];
+    if (!mtlc_target_select(options->target_triple, target_error,
+                            sizeof(target_error))) {
+      fprintf(stderr, "Error: %s\n", target_error);
+      return DRIVER_FLAG_FAILED;
+    }
+    if (mtlc_target()->arch == MTLC_TARGET_ARCH_AARCH64) {
+      options->emit_arm64_obj = 1;
+    }
+  } else if (strcmp(argv[i], "--target") == 0) {
+    fprintf(stderr, "Error: Missing triple after '--target'; known targets "
+                    "are %s\n",
+            mtlc_target_triple_list());
+    return DRIVER_FLAG_FAILED;
+  } else if (strncmp(argv[i], "--target=", 9) == 0) {
+    char target_error[256];
+    options->target_triple = argv[i] + 9;
+    if (!mtlc_target_select(options->target_triple, target_error,
+                            sizeof(target_error))) {
+      fprintf(stderr, "Error: %s\n", target_error);
+      return DRIVER_FLAG_FAILED;
+    }
+    if (mtlc_target()->arch == MTLC_TARGET_ARCH_AARCH64) {
+      options->emit_arm64_obj = 1;
+    }
+  } else if (strcmp(argv[i], "--image-base") == 0 && i + 1 < argc) {
+    char *end = NULL;
+    unsigned long long base = strtoull(argv[++i], &end, 0);
+    if (!end || *end != '\0') {
+      fprintf(stderr, "Error: '--image-base' takes an address, e.g. 0x7c00\n");
+      return DRIVER_FLAG_FAILED;
+    }
+    options->image_base = base;
+    options->image_base_set = 1;
+    mtlc_target_set_image_base(base);
+  } else if (strcmp(argv[i], "--image-base") == 0) {
+    fprintf(stderr, "Error: Missing address after '--image-base'\n");
+    return DRIVER_FLAG_FAILED;
+  } else if (strcmp(argv[i], "--emit-flat") == 0 && i + 1 < argc) {
+    options->flat_output = argv[++i];
+    options->emit_object = 1;
+  } else if (strcmp(argv[i], "--emit-flat") == 0) {
+    fprintf(stderr, "Error: Missing output path after '--emit-flat'\n");
+    return DRIVER_FLAG_FAILED;
+  } else if (strcmp(argv[i], "--debug-compiler") == 0) {
+    options->debug_compiler = 1;
+  } else {
+    return DRIVER_FLAG_UNMATCHED;
+  }
+  *index = i;
+  return DRIVER_FLAG_TAKEN;
+}
+
+typedef DriverFlagResult (*DriverFlagParser)(CompilerOptions *, DriverFlags *,
+                                             int, char **, int *);
+
+static const DriverFlagParser DRIVER_FLAG_PARSERS[] = {
+    parse_flag_output, parse_flag_diagnostics, parse_flag_gpu,
+    parse_flag_codegen, parse_flag_target};
+
+static int parse_arguments(CompilerOptions *options, DriverFlags *flags,
+                           int argc, char *argv[]) {
+  for (int i = 1; i < argc; i++) {
+    DriverFlagResult taken = DRIVER_FLAG_UNMATCHED;
+    size_t group;
+    for (group = 0;
+         group < sizeof(DRIVER_FLAG_PARSERS) / sizeof(DRIVER_FLAG_PARSERS[0]);
+         group++) {
+      taken = DRIVER_FLAG_PARSERS[group](options, flags, argc, argv, &i);
+      if (taken != DRIVER_FLAG_UNMATCHED) {
+        break;
+      }
+    }
+    if (taken == DRIVER_FLAG_FAILED) {
+      return 1;
+    }
+    if (taken == DRIVER_FLAG_TAKEN) {
+      continue;
+    }
+    if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+      print_usage(argv[0]);
+      return 0;
+    }
+    if (!options->input_filename) {
+      options->input_filename = argv[i];
+      continue;
+    }
+    fprintf(stderr, "Error: Unknown or misplaced argument '%s'\n", argv[i]);
+    print_usage(argv[0]);
+    return 1;
+  }
+  return -1;
+}
+
 int main(int argc, char *argv[]) {
   CompilerOptions options = {0};
   mettle_compiler_crash_install(argc, argv);
@@ -3292,12 +3822,7 @@ int main(int argc, char *argv[]) {
   char *auto_runtime_directory = NULL;
   char *build_output_filename = NULL;
   char *object_output_filename = NULL;
-  int build_executable = 0;
-  int linker_mode_explicit = 0;
-  int output_filename_explicit = 0;
-  int ptx_version_explicit = 0;
-  int gpu_arch_explicit = 0;
-  char detected_ptx_target[16];
+  DriverFlags flags = {0};
   options.emit_object = 1;
   options.output_filename = default_object_output_filename();
   options.debug_format = "dwarf";
@@ -3396,421 +3921,10 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // Parse command line arguments
-  for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
-      options.input_filename = argv[++i];
-    } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-      options.output_filename = argv[++i];
-      output_filename_explicit = 1;
-    } else if (strcmp(argv[i], "-I") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Error: Missing import directory after '-I'\n");
-        return 1;
-      }
-      if (!add_import_directory(&options, argv[++i])) {
-        fprintf(stderr, "Error: Failed to add import directory\n");
-        return 1;
-      }
-    } else if (strncmp(argv[i], "-I", 2) == 0 && argv[i][2] != '\0') {
-      if (!add_import_directory(&options, argv[i] + 2)) {
-        fprintf(stderr, "Error: Failed to add import directory\n");
-        return 1;
-      }
-    } else if (strcmp(argv[i], "--stdlib") == 0 && i + 1 < argc) {
-      options.stdlib_directory = argv[++i];
-    } else if (strcmp(argv[i], "--build") == 0) {
-      build_executable = 1;
-    } else if (strcmp(argv[i], "--emit-asm") == 0) {
-      fprintf(stderr,
-              "Error: --emit-asm has been removed; Mettle only emits native "
-              "objects now.\n");
-      return 1;
-    } else if (strcmp(argv[i], "--emit-obj") == 0) {
-      options.emit_object = 1;
-    } else if (strcmp(argv[i], "--linker") == 0 && i + 1 < argc) {
-      linker_mode_explicit = 1;
-      if (!parse_linker_mode(argv[++i], &options.linker_mode)) {
-        fprintf(stderr,
-                "Error: Unknown linker mode '%s' (expected auto, internal, gcc, or msvc)\n",
-                argv[i]);
-        return 1;
-      }
-    } else if (strcmp(argv[i], "--linker") == 0) {
-      fprintf(stderr, "Error: Missing linker mode after '--linker'\n");
-      return 1;
-    } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
-      const char *name = argv[++i];
-      if (strcmp(name, "windows") == 0 || strcmp(name, "gui") == 0) {
-        options.windows_subsystem = 1;
-      } else if (strcmp(name, "console") == 0) {
-        options.windows_subsystem = 0;
-      } else {
-        fprintf(stderr,
-                "Error: Unknown subsystem '%s' (expected console or windows)\n",
-                name);
-        return 1;
-      }
-    } else if (strcmp(argv[i], "--subsystem") == 0) {
-      fprintf(stderr, "Error: Missing subsystem after '--subsystem'\n");
-      return 1;
-    } else if (strcmp(argv[i], "--link-arg") == 0 && i + 1 < argc) {
-      if (!add_link_argument(&options, argv[++i])) {
-        fprintf(stderr, "Error: Failed to add linker argument\n");
-        return 1;
-      }
-    } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
-      options.debug_mode = 1;
-      options.generate_debug_symbols = 1;
-      options.generate_line_mapping = 1;
-      options.generate_stack_trace_support = 1;
-    } else if (strcmp(argv[i], "--dump-ast") == 0) {
-      options.dump_ast = 1;
-    } else if (strcmp(argv[i], "--dump-ir") == 0) {
-      options.dump_ir = 1;
-    } else if (strcmp(argv[i], "--ml-opt") == 0) {
-      options.ml_opt = 1;
-      options.optimize = 1;
-    } else if (strcmp(argv[i], "--ml-opt-speculative") == 0) {
-      /* Unlocks the model's unproven actions (dead-code DELETE). They exist
-       * only on the validator's word, so this implies --ml-opt; ml_gnn reads
-       * the env to emit the speculative dispositions. */
-      options.ml_opt = 1;
-      options.optimize = 1;
-      putenv("METTLE_ML_SPECULATIVE=1");
-    } else if (strncmp(argv[i], "--error-format=", 15) == 0) {
-      const char *fmt = argv[i] + 15;
-      if (strcmp(fmt, "json") == 0) {
-        error_reporter_set_format_json(1);
-      } else if (strcmp(fmt, "human") == 0) {
-        error_reporter_set_format_json(0);
-      } else {
-        fprintf(stderr,
-                "Error: Unknown error format '%s' (expected human or json)\n",
-                fmt);
-        return 1;
-      }
-    } else if (strncmp(argv[i], "--filter=", 9) == 0) {
-      options.test_filter = argv[i] + 9;
-    } else if (strcmp(argv[i], "--pgo") == 0) {
-      options.pgo = 1;
-      options.optimize = 1;
-    } else if (strcmp(argv[i], "--verify") == 0) {
-      ir_verify_set_enabled(1);
-      options.optimize = 1;
-    } else if (strcmp(argv[i], "--simd-report") == 0) {
-      options.simd_report = 1;
-    } else if (strcmp(argv[i], "--explain") == 0) {
-      options.explain = 1;
-    } else if (strncmp(argv[i], "--explain=", 10) == 0) {
-      /* A whole program's report runs to hundreds of lines. The selector cuts
-       * the prose down to the slice asked for; the JSON sidecar stays whole. */
-      options.explain = 1;
-      options.explain_filter = argv[i] + 10;
-    } else if (strcmp(argv[i], "--explain-all") == 0) {
-      /* Whole-program report: no focus-file filter, so imported modules'
-       * loops and calls are analyzed too (stdlib included). */
-      options.explain = 1;
-      options.explain_all = 1;
-    } else if (strcmp(argv[i], "--explain-json") == 0) {
-      /* Machine-readable sidecar (<output-stem>.explain.json) alongside the
-       * prose report; implies --explain. */
-      options.explain = 1;
-      options.explain_json = 1;
-    } else if (strcmp(argv[i], "--annotate-asm") == 0) {
-      /* Codegen provenance listing + <stem>.annot.json sidecar. Needs the
-       * optimizer's decisions (and remarks) to be interesting, so it implies
-       * -O and collects --explain remarks (retained past optimization for the
-       * codegen join). The default syntax is both Intel and AT&T (toggle). */
-      options.annotate_asm = 1;
-      /* Reflect the codegen users actually ship: --release enables every
-       * vectorizer/idiom, so the annotation matches release output (otherwise a
-       * loop shown "not vectorized" at -O would mislead). */
-      options.optimize = 1;
-      options.release = 1;
-      options.explain = 1;
-      options.asm_syntax = 2; /* both */
-    } else if (strncmp(argv[i], "--annotate-lines=", 17) == 0) {
-      /* Focused codegen report for a source line range (LLM-facing): asm + cost
-       * + covering loops + live registers + decisions for just those lines.
-       * Accepts "A" (single line) or "A-B". Implies --annotate-asm. */
-      const char *v = argv[i] + 17;
-      int a = 0, b = 0;
-      if (sscanf(v, "%d-%d", &a, &b) == 2) {
-        /* range */
-      } else if (sscanf(v, "%d", &a) == 1) {
-        b = a;
-      } else {
-        fprintf(stderr, "Error: --annotate-lines expects A or A-B (got '%s')\n", v);
-        return 1;
-      }
-      if (a <= 0 || b < a) {
-        fprintf(stderr, "Error: --annotate-lines range invalid: %s\n", v);
-        return 1;
-      }
-      options.annotate_q_lo = a;
-      options.annotate_q_hi = b;
-      options.annotate_asm = 1;
-      options.optimize = 1;
-      options.release = 1;
-      options.explain = 1;
-      if (!options.asm_syntax) options.asm_syntax = 0; /* intel-only is terser */
-    } else if (strncmp(argv[i], "--annotate-fn=", 14) == 0) {
-      options.annotate_q_fn = argv[i] + 14;
-      options.annotate_asm = 1;
-      options.optimize = 1;
-      options.release = 1;
-      options.explain = 1;
-    } else if (strcmp(argv[i], "--annotate-hot") == 0 ||
-               strncmp(argv[i], "--annotate-hot=", 15) == 0) {
-      /* Top-N hotspots across the program (LLM-facing "where is the time"). */
-      int n = 8;
-      if (argv[i][14] == '=') n = atoi(argv[i] + 15);
-      if (n <= 0) n = 8;
-      options.annotate_hot = n;
-      options.annotate_asm = 1;
-      options.optimize = 1;
-      options.release = 1;
-      options.explain = 1;
-    } else if (strncmp(argv[i], "--asm-syntax=", 13) == 0) {
-      const char *v = argv[i] + 13;
-      if (strcmp(v, "intel") == 0) {
-        options.asm_syntax = 0;
-      } else if (strcmp(v, "att") == 0) {
-        options.asm_syntax = 1;
-      } else if (strcmp(v, "both") == 0) {
-        options.asm_syntax = 2;
-      } else {
-        fprintf(stderr,
-                "Error: --asm-syntax must be intel, att, or both (got '%s')\n",
-                v);
-        return 1;
-      }
-    } else if (strcmp(argv[i], "--emit-ptx") == 0) {
-      options.emit_ptx = 1;
-    } else if (strncmp(argv[i], "--emit-kernel-decls", 19) == 0) {
-      /* Bare, the declarations land next to the PTX as <output>.mettle. */
-      options.emit_kernel_decls =
-          argv[i][19] == '=' ? argv[i] + 20 : "";
-      if (argv[i][19] != '\0' && argv[i][19] != '=') {
-        fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
-        return 1;
-      }
-    } else if (strncmp(argv[i], "--gpu-arch=", 11) == 0) {
-      const char *arch = argv[i] + 11;
-      gpu_arch_explicit = 1;
-      if (strcmp(arch, "gb10") == 0) {
-        /* GB10's compatible sm_121 profile excludes its architecture-specific
-         * FP4/block-scaled MMA forms. The named performance target must retain
-         * the `a` suffix; callers needing compatible PTX can request sm_121. */
-        options.ptx_target = "sm_121a";
-        if (!ptx_version_explicit) {
-          options.ptx_isa_major = 8;
-          options.ptx_isa_minor = 8;
-        }
-      } else if (strcmp(arch, "native") == 0) {
-        /* The default already prefers the local GPU. Asking for it by name
-         * says the build is meant for this machine, so a missing driver is an
-         * error here rather than a silent fall back to the GB10 default. */
-        if (!gpu_detect_ptx_target(0, detected_ptx_target,
-                                   sizeof(detected_ptx_target))) {
-          fprintf(stderr,
-                  "Error: --gpu-arch=native found no local NVIDIA device (%s); "
-                  "name a target with --gpu-arch=sm_NN to cross-compile\n",
-                  gpu_detect_local()->source);
-          return 1;
-        }
-        options.ptx_target = detected_ptx_target;
-      } else if (strcmp(arch, "portable") == 0) {
-        /* Virtual Turing ISA is the oldest forward-compatible baseline still
-         * supported for offline assembly by current CUDA 13 toolchains. */
-        options.ptx_target = "compute_75";
-        if (!ptx_version_explicit) {
-          options.ptx_isa_major = 6;
-          options.ptx_isa_minor = 4;
-        }
-      } else if (strncmp(arch, "sm_", 3) == 0 ||
-                 strncmp(arch, "compute_", 8) == 0) {
-        options.ptx_target = arch;
-      } else {
-        fprintf(stderr,
-                "Error: --gpu-arch expects gb10, portable, sm_NN, or "
-                "compute_NN (got '%s')\n",
-                arch);
-        return 1;
-      }
-    } else if (strncmp(argv[i], "--ptx-version=", 14) == 0) {
-      const char *version = argv[i] + 14;
-      int major = 0, minor = 0;
-      char trailing = '\0';
-      if (sscanf(version, "%d.%d%c", &major, &minor, &trailing) != 2 ||
-          major < 1 || major > 99 || minor < 0 || minor > 9) {
-        fprintf(stderr,
-                "Error: --ptx-version expects MAJOR.MINOR (got '%s')\n",
-                version);
-        return 1;
-      }
-      options.ptx_isa_major = major;
-      options.ptx_isa_minor = minor;
-      ptx_version_explicit = 1;
-    } else if (strncmp(argv[i], "--gpu-tensor-tuple-budget=", 26) == 0) {
-      const char *value = argv[i] + 26;
-      int budget = 0;
-      char trailing = '\0';
-      if (sscanf(value, "%d%c", &budget, &trailing) != 1 || budget < 0 ||
-          budget > 4096) {
-        fprintf(stderr,
-                "Error: --gpu-tensor-tuple-budget expects 0..4096 (got '%s')\n",
-                value);
-        return 1;
-      }
-      options.ptx_tensor_tuple_budget = budget;
-    } else if (strcmp(argv[i], "--report-occupancy") == 0) {
-      options.report_occupancy = 1;
-    } else if (strcmp(argv[i], "--gpu-checks") == 0) {
-      options.gpu_checks = 1;
-    } else if (strcmp(argv[i], "--report-launches") == 0) {
-      options.report_launches = 1;
-    } else if (strcmp(argv[i], "--old") == 0 && i + 1 < argc) {
-      options.swap_old_name = argv[++i];
-    } else if (strcmp(argv[i], "--new") == 0 && i + 1 < argc) {
-      options.swap_new_name = argv[++i];
-    } else if (strcmp(argv[i], "--report-expansion") == 0) {
-      options.report_expansion = 1;
-    } else if (strncmp(argv[i], "--expansion-budget=", 19) == 0) {
-      long long budget = atoll(argv[i] + 19);
-      if (budget < 0) {
-        fprintf(stderr, "--expansion-budget must not be negative\n");
-        return 1;
-      }
-      /* 0 is a real budget (expand nothing), so remember that one was asked
-         for rather than inferring it from the number. */
-      options.expansion_budget = (size_t)budget;
-      options.expansion_budget_set = 1;
-    } else if (strncmp(argv[i], "--sms=", 6) == 0) {
-      int sms = atoi(argv[i] + 6);
-      if (sms < 1 || sms > 1024) {
-        fprintf(stderr, "Error: --sms expects an SM count from 1 to 1024 "
-                        "(got '%s')\n",
-                argv[i] + 6);
-        return 1;
-      }
-      options.report_sms = sms;
-    } else if (strcmp(argv[i], "--emit-spirv") == 0) {
-      options.emit_spirv = 1;
-    } else if (strcmp(argv[i], "--emit-arm64") == 0) {
-      options.emit_arm64 = 1;
-    } else if (strcmp(argv[i], "--emit-arm64-obj") == 0) {
-      options.emit_arm64_obj = 1;
-    } else if (strcmp(argv[i], "-g") == 0 ||
-               strcmp(argv[i], "--debug-symbols") == 0) {
-      options.generate_debug_symbols = 1;
-    } else if (strcmp(argv[i], "-l") == 0 ||
-               strcmp(argv[i], "--line-mapping") == 0) {
-      options.generate_line_mapping = 1;
-    } else if (strcmp(argv[i], "-s") == 0 ||
-               strcmp(argv[i], "--stack-trace") == 0) {
-      options.generate_stack_trace_support = 1;
-    } else if (strcmp(argv[i], "--debug-format") == 0 && i + 1 < argc) {
-      options.debug_format = argv[++i];
-    } else if (strcmp(argv[i], "-O") == 0 ||
-               strcmp(argv[i], "--optimize") == 0) {
-      options.optimize = 1;
-    } else if (strcmp(argv[i], "-r") == 0 ||
-               strcmp(argv[i], "--release") == 0) {
-      options.release = 1;
-      options.optimize = 1;
-    } else if (strcmp(argv[i], "--strip-comments") == 0) {
-      fprintf(stderr,
-              "Error: --strip-comments has been removed; Mettle no longer "
-              "emits text assembly.\n");
-      return 1;
-    } else if (strcmp(argv[i], "--prelude") == 0) {
-      options.prelude = 1;
-    } else if (strcmp(argv[i], "--profile") == 0) {
-      options.profile = 1;
-    } else if (strcmp(argv[i], "--profile-runtime") == 0) {
-      options.profile_runtime = 1;
-    } else if (strcmp(argv[i], "--profile-runtime-ops") == 0) {
-      options.profile_runtime_ops = 1;
-    } else if (strcmp(argv[i], "--profile-blocks") == 0) {
-      options.profile_blocks = 1;
-      options.profile_runtime = 1;
-    } else if (strcmp(argv[i], "--debug-hooks") == 0) {
-      options.debug_hooks = 1;
-    } else if (strcmp(argv[i], "--safe") == 0) {
-      options.safe = 1;
-    } else if (strcmp(argv[i], "--native-heap") == 0) {
-      options.native_heap = 1;
-    } else if (strcmp(argv[i], "--static") == 0) {
-      options.static_link = 1;
-    } else if (strcmp(argv[i], "--musl") == 0) {
-      options.musl_link = 1;
-      options.static_link = 1;
-    } else if (strcmp(argv[i], "--tracy") == 0) {
-      options.tracy = 1;
-    } else if (strcmp(argv[i], "--tracy-dir") == 0 && i + 1 < argc) {
-      options.tracy_directory = argv[++i];
-    } else if (strcmp(argv[i], "--tracy-dir") == 0) {
-      fprintf(stderr, "Error: Missing path after '--tracy-dir'\n");
-      return 1;
-    } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
-      char target_error[256];
-      options.target_triple = argv[++i];
-      if (!mtlc_target_select(options.target_triple, target_error,
-                              sizeof(target_error))) {
-        fprintf(stderr, "Error: %s\n", target_error);
-        return 1;
-      }
-      if (mtlc_target()->arch == MTLC_TARGET_ARCH_AARCH64) {
-        options.emit_arm64_obj = 1;
-      }
-    } else if (strcmp(argv[i], "--target") == 0) {
-      fprintf(stderr, "Error: Missing triple after '--target'; known targets "
-                      "are %s\n",
-              mtlc_target_triple_list());
-      return 1;
-    } else if (strncmp(argv[i], "--target=", 9) == 0) {
-      char target_error[256];
-      options.target_triple = argv[i] + 9;
-      if (!mtlc_target_select(options.target_triple, target_error,
-                              sizeof(target_error))) {
-        fprintf(stderr, "Error: %s\n", target_error);
-        return 1;
-      }
-      if (mtlc_target()->arch == MTLC_TARGET_ARCH_AARCH64) {
-        options.emit_arm64_obj = 1;
-      }
-    } else if (strcmp(argv[i], "--image-base") == 0 && i + 1 < argc) {
-      char *end = NULL;
-      unsigned long long base = strtoull(argv[++i], &end, 0);
-      if (!end || *end != '\0') {
-        fprintf(stderr, "Error: '--image-base' takes an address, e.g. 0x7c00\n");
-        return 1;
-      }
-      options.image_base = base;
-      options.image_base_set = 1;
-      mtlc_target_set_image_base(base);
-    } else if (strcmp(argv[i], "--image-base") == 0) {
-      fprintf(stderr, "Error: Missing address after '--image-base'\n");
-      return 1;
-    } else if (strcmp(argv[i], "--emit-flat") == 0 && i + 1 < argc) {
-      options.flat_output = argv[++i];
-      options.emit_object = 1;
-    } else if (strcmp(argv[i], "--emit-flat") == 0) {
-      fprintf(stderr, "Error: Missing output path after '--emit-flat'\n");
-      return 1;
-    } else if (strcmp(argv[i], "--debug-compiler") == 0) {
-      options.debug_compiler = 1;
-    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-      print_usage(argv[0]);
-      return 0;
-    } else if (!options.input_filename) {
-      options.input_filename = argv[i];
-    } else {
-      fprintf(stderr, "Error: Unknown or misplaced argument '%s'\n", argv[i]);
-      print_usage(argv[0]);
-      return 1;
+  {
+    int early = parse_arguments(&options, &flags, argc, argv);
+    if (early >= 0) {
+      return early;
     }
   }
 
@@ -3824,7 +3938,7 @@ int main(int argc, char *argv[]) {
 
   /* A flat image IS the linked product: there is nothing left for a linker to
    * do to it, and no container for a linker to put it in. */
-  if (options.flat_output && build_executable) {
+  if (options.flat_output && flags.build_executable) {
     fprintf(stderr,
             "Error: --emit-flat writes the linked image itself; drop --build\n");
     free((void *)options.import_directories);
@@ -3845,7 +3959,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  if (build_executable && mtlc_target()->explicit_triple) {
+  if (flags.build_executable && mtlc_target()->explicit_triple) {
     const MtlcTarget *target = mtlc_target();
     if (target->freestanding) {
       fprintf(stderr,
@@ -3870,7 +3984,7 @@ int main(int argc, char *argv[]) {
   }
 
   if (mtlc_target()->image_base_set && !options.flat_output) {
-    if (!build_executable) {
+    if (!flags.build_executable) {
       fprintf(stderr,
               "Error: --image-base says where a linked image loads, and this "
               "compile produces a relocatable object; add --build, or "
@@ -3913,16 +4027,16 @@ int main(int argc, char *argv[]) {
   /* No --gpu-arch given: target the GPU that is actually in this machine when
    * one is visible. Detection failure (no driver, headless build host) keeps
    * the GB10 default so cross-compiles for DGX Spark are unchanged. */
-  if (options.emit_ptx && !gpu_arch_explicit &&
-      detect_host_gpu_ptx_target(detected_ptx_target,
-                                 sizeof(detected_ptx_target))) {
-    options.ptx_target = detected_ptx_target;
+  if (options.emit_ptx && !flags.gpu_arch_explicit &&
+      detect_host_gpu_ptx_target(flags.detected_ptx_target,
+                                 sizeof(flags.detected_ptx_target))) {
+    options.ptx_target = flags.detected_ptx_target;
   }
 
   /* A `.version` above what the local driver understands fails inside
    * cuModuleLoadData at run time, where the only evidence is a status code.
    * When the target came from this machine, take the ISA from it too. */
-  if (options.emit_ptx && !ptx_version_explicit) {
+  if (options.emit_ptx && !flags.ptx_version_explicit) {
     int driver_major = 0, driver_minor = 0;
     if (gpu_detect_ptx_isa(&driver_major, &driver_minor) &&
         (driver_major < options.ptx_isa_major ||
@@ -3933,7 +4047,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  if (options.tracy && !build_executable) {
+  if (options.tracy && !flags.build_executable) {
     fprintf(stderr, "Error: --tracy requires --build\n");
     free((void *)options.import_directories);
     free((void *)options.link_arguments);
@@ -3951,7 +4065,7 @@ int main(int argc, char *argv[]) {
   }
 
 #if !defined(__aarch64__) && !defined(_M_ARM64)
-  if (options.emit_arm64_obj && build_executable) {
+  if (options.emit_arm64_obj && flags.build_executable) {
     fprintf(stderr,
             "Error: --emit-arm64-obj cannot be combined with --build on an "
             "x86-64 host: the object is AArch64 and this host's linker cannot "
@@ -3963,9 +4077,9 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
-  if (build_executable) {
+  if (flags.build_executable) {
     options.emit_object = 1;
-    if (!linker_mode_explicit) {
+    if (!flags.linker_mode_explicit) {
       options.linker_mode = LINKER_MODE_INTERNAL;
     }
   }
@@ -3990,7 +4104,7 @@ int main(int argc, char *argv[]) {
   int elf_build = host_format == BINARY_TARGET_FORMAT_ELF_X64 ||
                   host_format == BINARY_TARGET_FORMAT_ELF_ARM64;
 
-  if (build_executable) {
+  if (flags.build_executable) {
     if (options.musl_link) {
       fprintf(stderr,
               "Error: --musl is not available in owned runtime mode because "
@@ -4038,7 +4152,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 #endif
-    if (output_filename_explicit) {
+    if (flags.output_filename_explicit) {
       build_output_filename = strdup(options.output_filename);
     } else {
       build_output_filename = default_executable_filename(options.input_filename);
@@ -4072,13 +4186,13 @@ int main(int argc, char *argv[]) {
     options.output_filename = object_output_filename;
   }
 
-  options.building_executable = build_executable;
+  options.building_executable = flags.build_executable;
 
   double command_profile_start =
       options.profile ? compiler_profile_now_ms() : 0.0;
   int result =
       compile_file(options.input_filename, options.output_filename, &options);
-  if (result == 0 && build_executable) {
+  if (result == 0 && flags.build_executable) {
     double build_profile_start =
         options.profile ? compiler_profile_now_ms() : 0.0;
 #ifndef _WIN32
