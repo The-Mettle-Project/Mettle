@@ -45,10 +45,18 @@ tr -d '\r' < "$dir/manifest.txt" | while IFS=' ' read -r name expect; do
     exit 1
   fi
   # Copy into the Linux fs: executing an ELF straight off /mnt can be flaky.
-  cp "$elf" /tmp/m_arm64.elf
-  chmod +x /tmp/m_arm64.elf
-  "$qemu" /tmp/m_arm64.elf
+  # The destination is PID-unique and the copy is checked: a fixed name left
+  # behind by another user made `cp` fail and every fixture then ran whatever
+  # binary was already there, which reported PASS for programs never executed.
+  stage="/tmp/m_arm64.$$.elf"
+  if ! cp -f "$elf" "$stage"; then
+    echo "  STAGE-FAIL $name (cannot write $stage)"
+    exit 1
+  fi
+  chmod +x "$stage"
+  "$qemu" "$stage"
   got=$?
+  rm -f "$stage"
   if [ "$got" -eq "$expect" ]; then
     echo "  PASS $name -> $got"
   else

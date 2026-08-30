@@ -2058,8 +2058,37 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
           arm64_emit_word(e, arm64_fmov_to_gp(sd, R_RES, 0));
         }
         store_dest(e, &slots, &in->dest, R_RES);
-      } else { /* int -> int: bit copy */
-        store_dest(e, &slots, &in->dest, load_into(e, &slots, &in->lhs, R_LHS));
+      } else {
+        /* int -> int: re-express the value as the TARGET integer type. A bit
+         * copy was wrong for every narrowing cast used as a value rather than
+         * stored into a typed local: `(int8)511` answered 511, because only
+         * the store to a declared-narrow slot ever truncated. The value in the
+         * register is already canonical for its own type, so extending its low
+         * `tw` bytes by the target's signedness is the whole conversion. */
+        Arm64Reg src = load_into(e, &slots, &in->lhs, R_LHS);
+        const MtlcType *tt =
+            prog && in->text && !strchr(in->text, '[') && !strchr(in->text, '*')
+                ? ir_program_lookup_type(prog, in->text)
+                : NULL;
+        int tw = tt ? (int)mtlc_type_size(tt) : type_elem_size(in->text);
+        int tu = tt ? type_is_unsigned(tt) : type_text_is_unsigned(in->text);
+        if (tt && type_is_aggregate(tt)) {
+          tw = 8;
+        }
+        if (in->text && strchr(in->text, '*')) {
+          tw = 8;
+        }
+        if (tw == 1 || tw == 2 || tw == 4) {
+          arm64_emit_word(
+              e, tw == 1 ? (tu ? arm64_uxtb(R_RES, src) : arm64_sxtb(R_RES, src))
+                 : tw == 2
+                     ? (tu ? arm64_uxth(R_RES, src) : arm64_sxth(R_RES, src))
+                     : (tu ? arm64_mov_reg(0, R_RES, src)
+                           : arm64_sxtw(R_RES, src)));
+          store_dest(e, &slots, &in->dest, R_RES);
+        } else {
+          store_dest(e, &slots, &in->dest, src);
+        }
       }
       break;
     }

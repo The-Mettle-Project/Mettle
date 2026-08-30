@@ -1,0 +1,24 @@
+// An integer cast used as a VALUE has to convert. The AArch64 encoder emitted a
+// bit copy for int->int and leaned on the store to a declared-narrow local to do
+// the truncating, so every cast that never reached such a store kept all 64
+// bits: `(int32)0x100000001` answered 4294967297 and `(int8)511` answered 511.
+// 1 + 2 + 4 + 8 + 16 + 32 = 63
+@noinline fn opaque(v: int64) -> int64 { return v; }
+fn main() -> int64 {
+  var r: int64 = 0;
+
+  var wide: int64 = opaque(4294967297);
+  if ((int32)wide == 1) { r = r + 1; }
+
+  var big: int64 = opaque(511);
+  if ((int8)big == 0 - 1) { r = r + 2; }
+  if ((uint8)big == 255) { r = r + 4; }
+
+  var neg: int16 = (int16)opaque(0 - 1);
+  if ((uint32)neg == 4294967295) { r = r + 8; }
+  if ((int32)neg == 0 - 1) { r = r + 16; }
+
+  if ((uint16)opaque(70000) == 4464) { r = r + 32; }
+
+  return r;
+}

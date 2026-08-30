@@ -33,9 +33,17 @@ for elf in "$dir"/*.elf; do
   name=$(basename "$elf" .elf)
   exp="$dir/$name.out"
   [ -f "$exp" ] || continue
-  cp "$elf" /tmp/m_io.elf
-  chmod +x /tmp/m_io.elf
-  got=$("$qemu" /tmp/m_io.elf 2>/dev/null)
+  # PID-unique and checked: a fixed staging name another user already owns made
+  # `cp` fail, and the run then compared the stale binary's output instead.
+  stage="/tmp/m_io.$$.elf"
+  if ! cp -f "$elf" "$stage"; then
+    echo "  STAGE-FAIL $name (cannot write $stage)"
+    fail=1
+    continue
+  fi
+  chmod +x "$stage"
+  got=$("$qemu" "$stage" 2>/dev/null)
+  rm -f "$stage"
   want=$(cat "$exp")
   if [ "$got" = "$want" ]; then
     echo "  PASS $name"

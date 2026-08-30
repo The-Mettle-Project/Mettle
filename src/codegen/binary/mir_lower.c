@@ -3901,6 +3901,23 @@ static int mir_lower_instruction(MirFunction *fn, CodeGenerator *g,
        * source there left `(uint32)x >> 1` shifting a sign-extended value, and
        * a right shift is exactly where the high half stops being invisible. */
       int extend_signed = (dw == sw) ? dsigned : ssigned;
+      /* A signed narrow source widened into an unsigned destination narrower
+       * than 64 bits needs both halves of the story: the source's sign is what
+       * gives the bits their value, and the destination's width is where that
+       * value has to live zero-extended. Extending by the source alone left
+       * `(uint32)int16_minus_one` reading 0xFFFFFFFFFFFFFFFF instead of
+       * 4294967295. */
+      if (extend_signed && !dsigned && dw < 8 && dw > sw) {
+        MirVregId widened = mir_new_vreg(fn, MIR_RC_GP, 8);
+        if (widened == MIR_VREG_NONE ||
+            !mir_emit1(fn, MIR_MOVSX, mir_op_vreg(widened), a, mir_op_none(),
+                       sw, 0, 0)) {
+          fn->has_error = 1;
+          return 0;
+        }
+        return mir_emit1(fn, MIR_MOVZX, dst, mir_op_vreg(widened),
+                         mir_op_none(), dw, 1, 0);
+      }
       return mir_emit1(fn, extend_signed ? MIR_MOVSX : MIR_MOVZX, dst, a,
                        mir_op_none(), sw, !extend_signed, 0);
     }
