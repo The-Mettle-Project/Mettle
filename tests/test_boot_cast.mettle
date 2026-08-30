@@ -1,8 +1,17 @@
-// A narrow local lives in a whole-word slot on the 16- and 32-bit targets, so
-// the store never truncates and the cast is the only place a width is applied.
-// The cast was emitted as a plain move: `(uint8)321` answered 321, `(int8)200`
-// answered 200, and nothing on these targets ever wrapped. Each check prints Y
-// when the conversion happened and N when it did not.
+// Narrow values on the 16-bit target, all three ways they used to go wrong.
+//
+// A narrow local lives in a whole-word slot, so the store never truncates and
+// the cast is the only place a width is applied. The cast was emitted as a
+// plain move, and nothing here ever wrapped: (uint8)321 answered 321.
+//
+// A global holds exactly its declared size, so a uint8 one is a single byte
+// with the next global right after it. Every access spelled it `word ptr`,
+// which read and wrote that neighbour.
+//
+// A byte read through a pointer used movzx/movsx, which are 386 instructions.
+// A 16-bit image that used them ran on nothing the target names.
+//
+// Each check prints Y when the value came back right and N when it did not.
 @naked fn _start() {
     asm {
         bits 16
@@ -21,6 +30,12 @@
     }
 }
 
+struct Bytes { a: uint8; b: int8; n: int16; }
+
+var BYTE_A: uint8 = 1
+var BYTE_B: uint8 = 2
+var SIGNED_G: int8 = 0
+
 fn putchar(c: int16) -> int16 {
     asm {
         mov ax, {c}
@@ -31,11 +46,6 @@ fn putchar(c: int16) -> int16 {
     return c
 }
 
-// A global holds exactly its declared size, so a byte global has the next one
-// right after it and a whole-word access there reads and writes its neighbour.
-var BYTE_A: uint8 = 1
-var BYTE_B: uint8 = 2
-
 @noinline fn opaque(v: int16) -> int16 { return v }
 
 fn check(ok: int16) -> int16 {
@@ -44,11 +54,38 @@ fn check(ok: int16) -> int16 {
 }
 
 fn main() -> int16 {
+    // The cast converts, wherever its value is used.
     check((uint8)opaque(321) == 65)
     check((int8)opaque(200) == 0 - 56)
+    check((uint8)opaque(0 - 1) == 255)
+    var wrapped: uint8 = (uint8)opaque(300)
+    check(wrapped == 44)
+    var narrow: int8 = (int8)opaque(200)
+    check(narrow == 0 - 56)
+
+    // A byte global is a byte, and its neighbour keeps its own value.
     BYTE_A = (uint8)opaque(200)
     check(BYTE_B == 2)
     check(BYTE_A == 200)
+    SIGNED_G = (int8)opaque(0 - 5)
+    check(SIGNED_G == 0 - 5)
+    check(BYTE_A == 200)
+
+    // A byte read through a pointer, unsigned and signed.
+    var record: Bytes
+    record.a = (uint8)opaque(200)
+    record.b = (int8)opaque(0 - 3)
+    record.n = opaque(1000)
+    check(record.a == 200)
+    check(record.b == 0 - 3)
+    check(record.n == 1000)
+
+    var buffer: uint8[4]
+    buffer[0] = (uint8)opaque(250)
+    buffer[3] = (uint8)opaque(7)
+    check(buffer[0] == 250)
+    check(buffer[3] == 7)
+
     putchar(13)
     putchar(10)
     return 0

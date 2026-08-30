@@ -909,7 +909,18 @@ static int x86_narrow_instruction(X86NarrowEmitter *emitter,
     if (!x86_narrow_load_into(emitter, emitter->base, &instruction->lhs)) {
       return 0;
     }
-    if (width == 1 || (width == 2 && emitter->word == 4)) {
+    if (width == 1 && emitter->word == 2) {
+      /* movzx and movsx are 386 instructions. A 16-bit image that used them
+       * ran on nothing the target names: the project's own real-mode emulator
+       * reports an unimplemented opcode, and so would an 8086. */
+      if (!x86_narrow_emit(emitter,
+                           instruction->is_unsigned
+                               ? "xor ax, ax\nmov al, byte ptr [%s]\n"
+                               : "mov al, byte ptr [%s]\ncbw\n",
+                           emitter->base)) {
+        return 0;
+      }
+    } else if (width == 1 || (width == 2 && emitter->word == 4)) {
       if (!x86_narrow_emit(emitter, "%s %s, %s ptr [%s]\n",
                            instruction->is_unsigned ? "movzx" : "movsx",
                            emitter->accumulator, width == 1 ? "byte" : "word",

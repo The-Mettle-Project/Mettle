@@ -13887,7 +13887,7 @@ else {
     $castImage = Join-Path $tmpDir "boot_cast.bin"
     if (Test-Path $castImage) { Remove-Item -Path $castImage -Force }
     $castArgs = @("tests/test_boot_cast.mettle", "--target", "i8086-none",
-                  "--image-base", "0x7c00", "--emit-flat", $castImage)
+                  "--image-base", "0x8000", "--emit-flat", $castImage)
     $castOut = & $CompilerPath @castArgs 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $castImage)) {
       throw "compiling the cast boot image failed: $castOut"
@@ -13901,7 +13901,7 @@ else {
         throw "building the real-mode emulator failed: $buildOut"
       }
     }
-    $runOut = & $emulatorExe $castImage 'YYYY\r\n' 2>&1 | Out-String
+    $runOut = & $emulatorExe $castImage 'YYYYYYYYYYYYYY\r\n' '0x8000' 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
       throw "a narrowing cast did not convert: $runOut"
     }
