@@ -60,12 +60,18 @@ the shift count, so this does not produce the zero the code reads as
 `bool` and stop as soon as the answer is known, so the right side is not
 evaluated when the left settles it.
 
-`!` negates. Store the result in a `bool` when you want to print it:
+`!` negates, and produces a `bool` like the rest of them:
 
 ```mettle
-var ok: bool = !(a > 3);
-println("{ok}");
+println("{!(a > 3)}");
 ```
+
+```text
+false
+```
+
+A `bool` converts to the integer types with no cast, so `var n: int32 = !flag;`
+still gives 1 or 0.
 
 ## Assignment
 

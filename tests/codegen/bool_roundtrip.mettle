@@ -19,5 +19,23 @@ fn main() -> int32 {
   if ((int32)true != 1) { return 10; }
   var f: Flags = { on: true, off: false };
   if (both(f) != 2) { return 11; }
+  // A logical operator answers a question, and an answer is a bool. `!` used
+  // to hand back an int32, so `{flag}` printed `true` while `{!flag}` printed
+  // `0`. It still converts to an integer with no cast.
+  var t: bool = true;
+  if ("{!t}" != "false") { return 12; }
+  if ("{!!t}" != "true") { return 13; }
+  if ("{!(1 < 2)}" != "false") { return 14; }
+  if ("{!is_pos(5)}" != "false") { return 15; }
+  var n: int32 = !t;
+  if (n != 0) { return 16; }
+  var m: int64 = !g_false;
+  if (m != 1) { return 17; }
+  if (take(!g_false) != 1) { return 18; }
+  var p: int32* = 0;
+  if ("{!p}" != "true") { return 19; }
+  var counted: int32 = 0;
+  for i in 0..4 { counted = counted + (!is_pos(i - 2)); }
+  if (counted != 3) { return 20; }
   return 0;
 }

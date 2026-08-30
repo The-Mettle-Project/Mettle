@@ -2257,8 +2257,11 @@ Type *type_checker_infer_type_internal(TypeChecker *checker,
                                           operand_type->name);
         return NULL;
       }
-      // Logical NOT always produces an int32 (0 or 1)
-      return checker->builtin_int32;
+      /* A logical operator answers a question, and the type of an answer is
+       * `bool`. `<` and `&&` already said so; `!` handed back an int32, so
+       * `{flag}` printed `true` while `{!flag}` printed `0` and the docs had
+       * to teach a detour through a named bool to print one. */
+      return checker->builtin_bool;
     }
 
     type_checker_set_error_at_location(checker, expression->location,
