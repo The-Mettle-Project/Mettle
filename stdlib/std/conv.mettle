@@ -260,16 +260,30 @@ export fn str_to_i64(s: string) -> Result<int64, string> {
   }
   if (i >= n) { return Err("sign with no digits"); }
 
-  var value: int64 = 0;
+  // The magnitude is accumulated unsigned and checked before each step, so a
+  // number past the type answers Err rather than a wrapped Ok. A Result return
+  // exists to report exactly this, and "99999999999999999999999" used to come
+  // back as Ok(200376420520689663).
+  var limit: uint64 = 9223372036854775807;
+  if (negative == 1) { limit = 9223372036854775808; }
+
+  var value: uint64 = 0;
   while (i < n) {
     var c: char = s[i];
     if (!is_digit(c)) { return Err("not a decimal digit"); }
-    value = value * 10 + (int64)char_to_digit(c);
+    var digit: uint64 = (uint64)char_to_digit(c);
+    if (value > (limit - digit) / 10) {
+      return Err("out of range for int64");
+    }
+    value = value * 10 + digit;
     i = i + 1;
   }
 
-  if (negative == 1) { return Ok(0 - value); }
-  return Ok(value);
+  if (negative == 1) {
+    if (value == 9223372036854775808) { return Ok(-9223372036854775808); }
+    return Ok(0 - (int64)value);
+  }
+  return Ok((int64)value);
 }
 
 // The parsed value, or `fallback` when the view does not hold a number. For

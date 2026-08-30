@@ -89,6 +89,32 @@ fn main() -> int32 {
         case Err(why): { if (why != "empty") { return 46; } }
     }
 
+    // A number past the type is an error, not a wrapped Ok. The accumulator
+    // used to overflow in silence: "99999999999999999999999" came back as
+    // Ok(200376420520689663), which is what a Result return exists to prevent.
+    match (str_to_i64("99999999999999999999999")) {
+        case Ok(v): { return 47; }
+        case Err(why): { if (why != "out of range for int64") { return 48; } }
+    }
+    match (str_to_i64("9223372036854775808")) {
+        case Ok(v): { return 49; }
+        case Err(why): { if (why != "out of range for int64") { return 50; } }
+    }
+    match (str_to_i64("-9223372036854775809")) {
+        case Ok(v): { return 51; }
+        case Err(why): { if (why != "out of range for int64") { return 52; } }
+    }
+    // Both ends of the range still parse, including the minimum whose
+    // magnitude is one past the maximum.
+    if (str_to_i64_or("9223372036854775807", 0) != 9223372036854775807) {
+        return 53;
+    }
+    if (str_to_i64_or("-9223372036854775808", 0) != -9223372036854775808) {
+        return 54;
+    }
+    if (str_to_i64_or("007", 0 - 1) != 7) { return 55; }
+    if (str_to_i64_or("-0", 0 - 1) != 0) { return 56; }
+
     // Parsing a field sliced straight out of a larger buffer.
     var record: string = "id=907;";
     match (str_split_once(record, "=")) {

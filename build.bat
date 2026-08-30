@@ -285,6 +285,13 @@ if defined BACKEND_ONLY (
 if not defined RELINK (
     echo Everything up to date.
     if defined BACKEND_ONLY goto backend_only_done
+    REM The bundled standard library is a copy of stdlib\, and editing a .mettle
+    REM file there compiles nothing, so nothing relinks and the copy went stale:
+    REM the next build compiled against the library as it was before the edit.
+    REM Refreshing it here costs one directory copy.
+    echo Refreshing bundled standard library in bin\stdlib...
+    if exist bin\stdlib rmdir /S /Q bin\stdlib
+    xcopy stdlib bin\stdlib\ /E /I /Y >nul
     goto run_tests
 )
 
