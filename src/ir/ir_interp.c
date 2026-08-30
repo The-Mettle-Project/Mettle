@@ -2753,8 +2753,9 @@ static double ii_outer_lane_uniform(const IRInstruction *insn, size_t prog,
 
 /* ---------------- SIMD kernel ops (documented scalar semantics) ---------- */
 
-static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
-                        const IRInstruction *insn) {
+static int ii_exec_memory(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
   switch (insn->op) {
   case IR_OP_PREFETCH:
     /* Advisory cache hint: no architectural effect, nothing to interpret. */
@@ -2810,6 +2811,17 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     return ii_store_dest(machine, frame, &insn->dest, &out);
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_slp_mac(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_SLP_MAC_I32:
   case IR_OP_SIMD_SLP_MAC_I8: {
     /* K parallel int32 MAC reductions sharing a broadcast scalar:
@@ -2864,6 +2876,17 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     return 1;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_int_reduce(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_SUM_I32:
   case IR_OP_SIMD_SUM_U8: {
     unsigned long long base;
@@ -2931,6 +2954,111 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     return 1;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_fill_indexed(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, long long elem_size,
+                      unsigned long long fill_bits) {
+  unsigned long long base;
+  long long bound, start = 0, offset = 0;
+  if (!ii_fetch_addr(machine, frame, &insn->lhs, &base) ||
+      !ii_fetch_int(machine, frame, &insn->rhs, &bound)) {
+    return 0;
+  }
+  if (insn->argument_count > 3 &&
+      !ii_fetch_int(machine, frame, &insn->arguments[3], &start)) {
+    return 0;
+  }
+  if (insn->argument_count > 4 &&
+      !ii_fetch_int(machine, frame, &insn->arguments[4], &offset)) {
+    return 0;
+  }
+  for (long long i = start; i < bound; i++) {
+    int idx32 = (int)(offset + i); /* 32-bit index math, like the loop */
+    unsigned long long addr =
+        base + (unsigned long long)((long long)idx32 * elem_size);
+    if (!ii_mem_write(machine, addr, (int)elem_size, fill_bits)) {
+      return 0;
+    }
+  }
+  machine->fuel -= bound > start ? bound - start : 0;
+  if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
+    long long final_value = bound > start ? bound : start;
+    int wide = insn->argument_count > 5 &&
+               insn->arguments[5].kind == IR_OPERAND_INT &&
+               insn->arguments[5].int_value == 64;
+    IRInterpValue out;
+    if (!wide) {
+      final_value = (long long)(int)final_value;
+    }
+    out = ii_int_value(final_value);
+    if (!ii_store_dest(machine, frame, &insn->dest, &out)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ii_fill_range(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, long long elem_size,
+                      unsigned long long fill_bits) {
+  unsigned long long begin, end;
+  if (!ii_fetch_addr(machine, frame, &insn->lhs, &begin) ||
+      !ii_fetch_addr(machine, frame, &insn->rhs, &end)) {
+    return 0;
+  }
+  long long steps = 0;
+  for (unsigned long long p = begin; p < end; p += (unsigned long long)elem_size) {
+    if (!ii_mem_write(machine, p, (int)elem_size, fill_bits)) {
+      return 0;
+    }
+    steps++;
+  }
+  machine->fuel -= steps;
+  return 1;
+}
+
+static int ii_fill_offset(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, long long elem_size,
+                      unsigned long long fill_bits) {
+  unsigned long long base;
+  long long bound, start = 0;
+  if (!ii_fetch_addr(machine, frame, &insn->lhs, &base) ||
+      !ii_fetch_int(machine, frame, &insn->rhs, &bound)) {
+    return 0;
+  }
+  if (insn->argument_count > 3 &&
+      !ii_fetch_int(machine, frame, &insn->arguments[3], &start)) {
+    return 0;
+  }
+  long long steps = 0;
+  long long off = start;
+  for (; off < bound; off += elem_size) {
+    if (!ii_mem_write(machine, base + (unsigned long long)off,
+                      (int)elem_size, fill_bits)) {
+      return 0;
+    }
+    steps++;
+  }
+  machine->fuel -= steps;
+  if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
+    IRInterpValue out = ii_int_value(off);
+    if (!ii_store_dest(machine, frame, &insn->dest, &out)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ii_exec_fill(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_FILL: {
     if (insn->argument_count < 3) {
       ii_fail(machine, IR_INTERP_UNSUPPORTED, "simd_fill arity");
@@ -2964,94 +3092,29 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
       }
     }
     if (mode == 0) {
-      unsigned long long base;
-      long long bound, start = 0, offset = 0;
-      if (!ii_fetch_addr(machine, frame, &insn->lhs, &base) ||
-          !ii_fetch_int(machine, frame, &insn->rhs, &bound)) {
-        return 0;
-      }
-      if (insn->argument_count > 3 &&
-          !ii_fetch_int(machine, frame, &insn->arguments[3], &start)) {
-        return 0;
-      }
-      if (insn->argument_count > 4 &&
-          !ii_fetch_int(machine, frame, &insn->arguments[4], &offset)) {
-        return 0;
-      }
-      for (long long i = start; i < bound; i++) {
-        int idx32 = (int)(offset + i); /* 32-bit index math, like the loop */
-        unsigned long long addr =
-            base + (unsigned long long)((long long)idx32 * elem_size);
-        if (!ii_mem_write(machine, addr, (int)elem_size, fill_bits)) {
-          return 0;
-        }
-      }
-      machine->fuel -= bound > start ? bound - start : 0;
-      if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
-        long long final_value = bound > start ? bound : start;
-        int wide = insn->argument_count > 5 &&
-                   insn->arguments[5].kind == IR_OPERAND_INT &&
-                   insn->arguments[5].int_value == 64;
-        IRInterpValue out;
-        if (!wide) {
-          final_value = (long long)(int)final_value;
-        }
-        out = ii_int_value(final_value);
-        if (!ii_store_dest(machine, frame, &insn->dest, &out)) {
-          return 0;
-        }
-      }
-      return 1;
+      return ii_fill_indexed(machine, frame, insn, elem_size, fill_bits);
     }
     if (mode == 1) {
-      unsigned long long begin, end;
-      if (!ii_fetch_addr(machine, frame, &insn->lhs, &begin) ||
-          !ii_fetch_addr(machine, frame, &insn->rhs, &end)) {
-        return 0;
-      }
-      long long steps = 0;
-      for (unsigned long long p = begin; p < end; p += (unsigned long long)elem_size) {
-        if (!ii_mem_write(machine, p, (int)elem_size, fill_bits)) {
-          return 0;
-        }
-        steps++;
-      }
-      machine->fuel -= steps;
-      return 1;
+      return ii_fill_range(machine, frame, insn, elem_size, fill_bits);
     }
     if (mode == 2) {
-      unsigned long long base;
-      long long bound, start = 0;
-      if (!ii_fetch_addr(machine, frame, &insn->lhs, &base) ||
-          !ii_fetch_int(machine, frame, &insn->rhs, &bound)) {
-        return 0;
-      }
-      if (insn->argument_count > 3 &&
-          !ii_fetch_int(machine, frame, &insn->arguments[3], &start)) {
-        return 0;
-      }
-      long long steps = 0;
-      long long off = start;
-      for (; off < bound; off += elem_size) {
-        if (!ii_mem_write(machine, base + (unsigned long long)off,
-                          (int)elem_size, fill_bits)) {
-          return 0;
-        }
-        steps++;
-      }
-      machine->fuel -= steps;
-      if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name) {
-        IRInterpValue out = ii_int_value(off);
-        if (!ii_store_dest(machine, frame, &insn->dest, &out)) {
-          return 0;
-        }
-      }
-      return 1;
+      return ii_fill_offset(machine, frame, insn, elem_size, fill_bits);
     }
     ii_fail(machine, IR_INTERP_UNSUPPORTED, "simd_fill mode");
     return 0;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_sort(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_INSERTION_SORT_I32: {
     unsigned long long base;
     long long n;
@@ -3087,6 +3150,17 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     return 1;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_int_dot(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_DOT_I32: {
     unsigned long long a, b;
     long long n;
@@ -3180,6 +3254,17 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     return ii_store_dest(machine, frame, &insn->dest, &out);
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_int_map(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_SCALE_I32:
   case IR_OP_SIMD_CLAMP_I32:
   case IR_OP_SIMD_REVERSE_COPY_I32: {
@@ -3228,6 +3313,17 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     return ii_store_dest(machine, frame, &insn->dest, &out);
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_int_search(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_LOWER_BOUND_I32: {
     unsigned long long base;
     long long n, key, lo0;
@@ -3285,6 +3381,17 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
            ii_store_dest(machine, frame, &insn->arguments[0], &out_max);
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_float_reduce(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_SUM_F64:
   case IR_OP_SIMD_SUM_F32: {
     unsigned long long base;
@@ -3395,6 +3502,17 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     return 1;
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_float_map(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_EXP_F32:
   case IR_OP_SIMD_SILU_F32: {
     unsigned long long out_base, g_base = 0, u_base = 0;
@@ -3488,6 +3606,17 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     return ii_store_dest(machine, frame, &insn->dest, &out);
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_outer_lane(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_OUTER_LANE_F64: {
     enum { OL_ADD = 0, OL_SUB = 1, OL_MUL = 2, OL_DIV = 3 };
     if (insn->argument_count < 8) {
@@ -3583,6 +3712,114 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     }
   }
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+static int ii_exec_find(IRInterpMachine *machine, IIFrame *frame,
+                        const IRInstruction *insn) {
+  if (insn->argument_count < 4) {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "simd_find arity");
+    return 0;
+  }
+  long long n;
+  unsigned long long a_base;
+  if (!ii_fetch_int(machine, frame, &insn->lhs, &n) ||
+      !ii_fetch_addr(machine, frame, &insn->rhs, &a_base)) {
+    return 0;
+  }
+  long long pred = insn->arguments[0].int_value;
+  long long elem_kind = insn->arguments[1].int_value;
+  long long rhs_kind = insn->arguments[2].int_value;
+  long long first = 0;
+  long long rhs_scalar = 0;
+  unsigned long long b_base = 0;
+  if (rhs_kind == 2) {
+    if (!ii_fetch_addr(machine, frame, &insn->arguments[3], &b_base)) {
+      return 0;
+    }
+  } else if (!ii_fetch_int(machine, frame, &insn->arguments[3], &rhs_scalar)) {
+    return 0;
+  }
+  if (insn->argument_count > 4 &&
+      !ii_fetch_int(machine, frame, &insn->arguments[4], &first)) {
+    return 0;
+  }
+  /* The kernel only moves the counter forward to where the scalar loop would
+   * have arrived, so with nothing to scan it must leave the counter where it
+   * started. Answering `n` unconditionally was right for the not-found case
+   * and wrong for an empty range: a negative length made this model hand back
+   * that negative number, the scalar loop then exited on the first test with
+   * it, and validation read a kernel that agrees with the source as a
+   * divergence. It quarantined simd_find on every counted search under
+   * --verify. */
+  long long hit = n > first ? n : first;
+  for (long long i = first; i < n; i++) {
+    long long av, bv;
+    if (elem_kind == 0) {
+      int v;
+      if (!ii_read_i32(machine, a_base + (unsigned long long)i * 4, &v)) {
+        return 0;
+      }
+      av = v;
+    } else {
+      unsigned long long v;
+      if (!ii_mem_read(machine, a_base + (unsigned long long)i, 1, &v)) {
+        return 0;
+      }
+      av = (long long)v;
+    }
+    if (rhs_kind == 2) {
+      if (elem_kind == 0) {
+        int v;
+        if (!ii_read_i32(machine, b_base + (unsigned long long)i * 4, &v)) {
+          return 0;
+        }
+        bv = v;
+      } else {
+        unsigned long long v;
+        if (!ii_mem_read(machine, b_base + (unsigned long long)i, 1, &v)) {
+          return 0;
+        }
+        bv = (long long)v;
+      }
+    } else {
+      bv = rhs_scalar;
+    }
+    int match;
+    switch (pred) {
+    case 0: match = av == bv; break;
+    case 1: match = av != bv; break;
+    case 2: match = av < bv; break;
+    case 3: match = av > bv; break;
+    case 4: match = av <= bv; break;
+    case 5: match = av >= bv; break;
+    case 6:
+      match = !((av >= 'a' && av <= 'z') ||
+                (av >= 'A' && av <= 'Z') ||
+                (av >= '0' && av <= '9') || av == '_');
+      break;
+    default:
+      ii_fail(machine, IR_INTERP_UNSUPPORTED, "simd_find predicate");
+      return 0;
+    }
+    if (match) {
+      hit = i;
+      break;
+    }
+  }
+  machine->fuel -= n > first ? n - first : 0;
+  IRInterpValue out = ii_int_value(hit);
+  return ii_store_dest(machine, frame, &insn->dest, &out);
+}
+
+static int ii_exec_random(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_LCG_U32: {
     if (insn->argument_count < 3) {
       ii_fail(machine, IR_INTERP_UNSUPPORTED, "lcg arity");
@@ -3611,102 +3848,251 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
            ii_store_dest(machine, frame, &insn->rhs, &out_state);
   }
 
-  case IR_OP_SIMD_FIND: {
-    if (insn->argument_count < 4) {
-      ii_fail(machine, IR_INTERP_UNSUPPORTED, "simd_find arity");
-      return 0;
-    }
-    long long n;
-    unsigned long long a_base;
-    if (!ii_fetch_int(machine, frame, &insn->lhs, &n) ||
-        !ii_fetch_addr(machine, frame, &insn->rhs, &a_base)) {
-      return 0;
-    }
-    long long pred = insn->arguments[0].int_value;
-    long long elem_kind = insn->arguments[1].int_value;
-    long long rhs_kind = insn->arguments[2].int_value;
-    long long first = 0;
-    long long rhs_scalar = 0;
-    unsigned long long b_base = 0;
-    if (rhs_kind == 2) {
-      if (!ii_fetch_addr(machine, frame, &insn->arguments[3], &b_base)) {
-        return 0;
-      }
-    } else if (!ii_fetch_int(machine, frame, &insn->arguments[3], &rhs_scalar)) {
-      return 0;
-    }
-    if (insn->argument_count > 4 &&
-        !ii_fetch_int(machine, frame, &insn->arguments[4], &first)) {
-      return 0;
-    }
-    /* The kernel only moves the counter forward to where the scalar loop would
-     * have arrived, so with nothing to scan it must leave the counter where it
-     * started. Answering `n` unconditionally was right for the not-found case
-     * and wrong for an empty range: a negative length made this model hand back
-     * that negative number, the scalar loop then exited on the first test with
-     * it, and validation read a kernel that agrees with the source as a
-     * divergence. It quarantined simd_find on every counted search under
-     * --verify. */
-    long long hit = n > first ? n : first;
-    for (long long i = first; i < n; i++) {
-      long long av, bv;
-      if (elem_kind == 0) {
-        int v;
-        if (!ii_read_i32(machine, a_base + (unsigned long long)i * 4, &v)) {
-          return 0;
-        }
-        av = v;
-      } else {
-        unsigned long long v;
-        if (!ii_mem_read(machine, a_base + (unsigned long long)i, 1, &v)) {
-          return 0;
-        }
-        av = (long long)v;
-      }
-      if (rhs_kind == 2) {
-        if (elem_kind == 0) {
-          int v;
-          if (!ii_read_i32(machine, b_base + (unsigned long long)i * 4, &v)) {
-            return 0;
-          }
-          bv = v;
-        } else {
-          unsigned long long v;
-          if (!ii_mem_read(machine, b_base + (unsigned long long)i, 1, &v)) {
-            return 0;
-          }
-          bv = (long long)v;
-        }
-      } else {
-        bv = rhs_scalar;
-      }
-      int match;
-      switch (pred) {
-      case 0: match = av == bv; break;
-      case 1: match = av != bv; break;
-      case 2: match = av < bv; break;
-      case 3: match = av > bv; break;
-      case 4: match = av <= bv; break;
-      case 5: match = av >= bv; break;
-      case 6:
-        match = !((av >= 'a' && av <= 'z') ||
-                  (av >= 'A' && av <= 'Z') ||
-                  (av >= '0' && av <= '9') || av == '_');
-        break;
-      default:
-        ii_fail(machine, IR_INTERP_UNSUPPORTED, "simd_find predicate");
-        return 0;
-      }
-      if (match) {
-        hit = i;
-        break;
-      }
-    }
-    machine->fuel -= n > first ? n - first : 0;
-    IRInterpValue out = ii_int_value(hit);
-    return ii_store_dest(machine, frame, &insn->dest, &out);
-  }
+  case IR_OP_SIMD_FIND:
+    return ii_exec_find(machine, frame, insn);
 
+  default:
+    *handled = 0;
+    break;
+  }
+  return 0;
+}
+
+typedef struct {
+  IRInterpMachine *machine;
+  const unsigned long long *arrays;
+  const double *scalars_f;
+  const long long *scalars_i;
+  const double *consts_f;
+  const long long *consts_i;
+  double *vals_f;
+  long long *vals_i;
+  long long n_arrays;
+  long long n_scalars;
+  long long n_consts;
+  long long n_nodes;
+  long long elem_size;
+  int elem8;
+  int elem8_unsigned;
+} IIVloopEnv;
+
+static int ii_vloop_node_i32(const IIVloopEnv *env, long long tag,
+                             long long op0, long long op1, long long i,
+                             long long *out) {
+  long long v = 0;
+  switch (tag) {
+  case 0: { /* LOAD */
+    int e;
+    unsigned long long at;
+    if (op0 < 0 || op0 >= env->n_arrays) {
+      ii_fail(env->machine, IR_INTERP_UNSUPPORTED, "vloop load idx");
+      return 0;
+    }
+    at = env->arrays[op0] +
+         (unsigned long long)i * (unsigned long long)env->elem_size;
+    if (env->elem8) {
+      if (!ii_read_byte_as_i32(env->machine, at, env->elem8_unsigned, &e))
+        return 0;
+    } else if (!ii_read_i32(env->machine, at, &e)) {
+      return 0;
+    }
+    v = e;
+    break;
+  }
+  case 1: v = i; break;
+  case 2: v = op0 >= 0 && op0 < env->n_consts ? env->consts_i[op0] : 0; break;
+  case 3: v = (long long)(int)((unsigned int)(int)env->vals_i[op0] + (unsigned int)(int)env->vals_i[op1]); break;
+  case 4: v = (long long)(int)((unsigned int)(int)env->vals_i[op0] - (unsigned int)(int)env->vals_i[op1]); break;
+  case 5: v = (long long)(int)((unsigned int)(int)env->vals_i[op0] * (unsigned int)(int)env->vals_i[op1]); break;
+  case 7: v = op0 >= 0 && op0 < env->n_scalars ? env->scalars_i[op0] : 0; break;
+  case 8: v = (long long)(int)((int)env->vals_i[op0] & (int)env->vals_i[op1]); break;
+  case 9: v = (long long)(int)((int)env->vals_i[op0] | (int)env->vals_i[op1]); break;
+  case 10: v = (long long)(int)((int)env->vals_i[op0] ^ (int)env->vals_i[op1]); break;
+  case 11: v = (long long)(int)((unsigned int)(int)env->vals_i[op0] << (op1 & 31)); break;
+  case 12: v = (long long)(int)((int)env->vals_i[op0] >> (op1 & 31)); break;
+  case 13: v = (long long)(int)((unsigned int)(int)env->vals_i[op0] >> (op1 & 31)); break;
+  default:
+    ii_fail(env->machine, IR_INTERP_UNSUPPORTED, "vloop int node tag");
+    return 0;
+  }
+  *out = v;
+  return 1;
+}
+
+static int ii_vloop_node_f32(const IIVloopEnv *env, long long tag,
+                             long long op0, long long op1, long long i,
+                             double *out) {
+  float v = 0;
+  switch (tag) {
+  case 0: {
+    float e;
+    if (op0 < 0 || op0 >= env->n_arrays) {
+      ii_fail(env->machine, IR_INTERP_UNSUPPORTED, "vloop load idx");
+      return 0;
+    }
+    if (!ii_read_f32(env->machine,
+                     env->arrays[op0] + (unsigned long long)i * 4, &e))
+      return 0;
+    v = e;
+    break;
+  }
+  case 1: v = (float)i; break;
+  case 2: v = op0 >= 0 && op0 < env->n_consts ? (float)env->consts_f[op0] : 0; break;
+  case 3: v = (float)env->vals_f[op0] + (float)env->vals_f[op1]; break;
+  case 4: v = (float)env->vals_f[op0] - (float)env->vals_f[op1]; break;
+  case 5: v = (float)env->vals_f[op0] * (float)env->vals_f[op1]; break;
+  case 6: v = (float)env->vals_f[op0] / (float)env->vals_f[op1]; break;
+  case 7: v = op0 >= 0 && op0 < env->n_scalars ? (float)env->scalars_f[op0] : 0; break;
+  default:
+    ii_fail(env->machine, IR_INTERP_UNSUPPORTED, "vloop f32 node tag");
+    return 0;
+  }
+  *out = (double)v;
+  return 1;
+}
+
+static int ii_vloop_node_f64(const IIVloopEnv *env, long long tag,
+                             long long op0, long long op1, long long i,
+                             double *out) {
+  double v = 0;
+  switch (tag) {
+  case 0: {
+    if (op0 < 0 || op0 >= env->n_arrays) {
+      ii_fail(env->machine, IR_INTERP_UNSUPPORTED, "vloop load idx");
+      return 0;
+    }
+    if (!ii_read_f64(env->machine,
+                     env->arrays[op0] + (unsigned long long)i * 8, &v))
+      return 0;
+    break;
+  }
+  case 1: v = (double)i; break;
+  case 2: v = op0 >= 0 && op0 < env->n_consts ? env->consts_f[op0] : 0; break;
+  case 3: v = env->vals_f[op0] + env->vals_f[op1]; break;
+  case 4: v = env->vals_f[op0] - env->vals_f[op1]; break;
+  case 5: v = env->vals_f[op0] * env->vals_f[op1]; break;
+  case 6: v = env->vals_f[op0] / env->vals_f[op1]; break;
+  case 7: v = op0 >= 0 && op0 < env->n_scalars ? env->scalars_f[op0] : 0; break;
+  default:
+    ii_fail(env->machine, IR_INTERP_UNSUPPORTED, "vloop f64 node tag");
+    return 0;
+  }
+  *out = v;
+  return 1;
+}
+
+static int ii_vloop_eval(const IIVloopEnv *env, const IRInstruction *insn,
+                         size_t nodes_at, long long i, int is_int, int is_f32) {
+  for (long long node = 0; node < env->n_nodes; node++) {
+    long long tag = insn->arguments[nodes_at + (size_t)node * 3].int_value;
+    long long op0 = insn->arguments[nodes_at + (size_t)node * 3 + 1].int_value;
+    long long op1 = insn->arguments[nodes_at + (size_t)node * 3 + 2].int_value;
+    if (is_int) {
+      if (!ii_vloop_node_i32(env, tag, op0, op1, i, &env->vals_i[node])) {
+        return 0;
+      }
+    } else if (is_f32) {
+      if (!ii_vloop_node_f32(env, tag, op0, op1, i, &env->vals_f[node])) {
+        return 0;
+      }
+    } else if (!ii_vloop_node_f64(env, tag, op0, op1, i, &env->vals_f[node])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ii_vloop_reduce(const IIVloopEnv *env, long long reduce_op,
+                           long long root, long long i, int is_int, int is_f32,
+                           unsigned long long dest_base, long long *acc_i,
+                           double *acc_f) {
+  if (reduce_op == 1) {
+    if (is_int) {
+      *acc_i = (long long)(int)((unsigned int)(int)*acc_i +
+                                (unsigned int)(int)env->vals_i[root]);
+    } else if (is_f32) {
+      *acc_f = (double)(float)((float)*acc_f + (float)env->vals_f[root]);
+    } else {
+      *acc_f += env->vals_f[root];
+    }
+    return 1;
+  }
+  if (reduce_op == 2 || reduce_op == 3) {
+    /* `if (v > acc) { acc = v; }`: the element only wins an ordered compare,
+     * so a NaN leaves the accumulator alone -- the same rule the kernel gets
+     * from MAXPS/MINPS returning src2 when unordered. */
+    if (is_int) {
+      long long v = (long long)(int)env->vals_i[root];
+      long long a = (long long)(int)*acc_i;
+      if (reduce_op == 2 ? v > a : v < a) {
+        *acc_i = v;
+      }
+    } else {
+      double v = is_f32 ? (double)(float)env->vals_f[root] : env->vals_f[root];
+      if (reduce_op == 2 ? v > *acc_f : v < *acc_f) {
+        *acc_f = v;
+      }
+    }
+    return 1;
+  }
+  {
+    unsigned long long addr =
+        dest_base + (unsigned long long)i * (unsigned long long)env->elem_size;
+    if (env->elem8) {
+      return ii_write_byte(env->machine, addr, (int)env->vals_i[root]);
+    }
+    if (is_int) {
+      return ii_write_i32(env->machine, addr, (int)env->vals_i[root]);
+    }
+    if (is_f32) {
+      return ii_write_f32(env->machine, addr, (float)env->vals_f[root]);
+    }
+    return ii_write_f64(env->machine, addr, env->vals_f[root]);
+  }
+}
+
+
+static int ii_vloop_read_operands(IRInterpMachine *machine, IIFrame *frame,
+                                  const IRInstruction *insn, long long n_arrays,
+                                  long long n_scalars, long long n_consts,
+                                  long long n_nodes,
+                                  unsigned long long *arrays, double *scalars_f,
+                                  long long *scalars_i, double *consts_f,
+                                  long long *consts_i, size_t *nodes_at) {
+  size_t at = 7;
+  if (n_arrays > 32 || n_scalars > 16 || n_consts > 32) {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop widths");
+    return 0;
+  }
+  for (long long k = 0; k < n_arrays; k++) {
+    if (!ii_fetch_addr(machine, frame, &insn->arguments[at++], &arrays[k])) {
+      return 0;
+    }
+  }
+  for (long long k = 0; k < n_scalars; k++) {
+    IRInterpValue v;
+    if (!ii_fetch(machine, frame, &insn->arguments[at++], &v)) {
+      return 0;
+    }
+    scalars_f[k] = ii_as_float(&v);
+    scalars_i[k] = ii_as_int(&v);
+  }
+  *nodes_at = at;
+  at += (size_t)(n_nodes * 3);
+  for (long long k = 0; k < n_consts; k++) {
+    const IROperand *c = &insn->arguments[at++];
+    consts_f[k] =
+        c->kind == IR_OPERAND_FLOAT ? c->float_value : (double)c->int_value;
+    consts_i[k] =
+        c->kind == IR_OPERAND_FLOAT ? (long long)c->float_value : c->int_value;
+  }
+  return 1;
+}
+
+static int ii_exec_vloop(IRInterpMachine *machine, IIFrame *frame,
+                      const IRInstruction *insn, int *handled) {
+  *handled = 1;
+  switch (insn->op) {
   case IR_OP_SIMD_VLOOP_F64:
   case IR_OP_SIMD_VLOOP_I32: {
     /* Replay the serialized straight-line DAG per element (see ir.h). */
@@ -3739,32 +4125,11 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     long long scalars_i[16];
     double consts_f[32];
     long long consts_i[32];
-    if (n_arrays > 32 || n_scalars > 16 || n_consts > 32) {
-      ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop widths");
+    size_t nodes_at = 0;
+    if (!ii_vloop_read_operands(machine, frame, insn, n_arrays, n_scalars,
+                                n_consts, n_nodes, arrays, scalars_f, scalars_i,
+                                consts_f, consts_i, &nodes_at)) {
       return 0;
-    }
-    size_t at = 7;
-    for (long long k = 0; k < n_arrays; k++) {
-      if (!ii_fetch_addr(machine, frame, &insn->arguments[at++], &arrays[k])) {
-        return 0;
-      }
-    }
-    for (long long k = 0; k < n_scalars; k++) {
-      IRInterpValue v;
-      if (!ii_fetch(machine, frame, &insn->arguments[at++], &v)) {
-        return 0;
-      }
-      scalars_f[k] = ii_as_float(&v);
-      scalars_i[k] = ii_as_int(&v);
-    }
-    size_t nodes_at = at;
-    at += (size_t)(n_nodes * 3);
-    for (long long k = 0; k < n_consts; k++) {
-      const IROperand *c = &insn->arguments[at++];
-      consts_f[k] = c->kind == IR_OPERAND_FLOAT ? c->float_value
-                                                : (double)c->int_value;
-      consts_i[k] = c->kind == IR_OPERAND_FLOAT ? (long long)c->float_value
-                                                : c->int_value;
     }
 
     long long trip;
@@ -3792,124 +4157,26 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
     double vals_f[64];
     long long vals_i[64];
     for (long long i = 0; i < trip; i++) {
-      for (long long node = 0; node < n_nodes; node++) {
-        long long tag = insn->arguments[nodes_at + (size_t)node * 3].int_value;
-        long long op0 = insn->arguments[nodes_at + (size_t)node * 3 + 1].int_value;
-        long long op1 = insn->arguments[nodes_at + (size_t)node * 3 + 2].int_value;
-        if (is_int) {
-          long long v = 0;
-          switch (tag) {
-          case 0: { /* LOAD */
-            if (op0 < 0 || op0 >= n_arrays) { ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop load idx"); return 0; }
-            int e;
-            unsigned long long at =
-                arrays[op0] + (unsigned long long)i * (unsigned long long)elem_size;
-            if (elem8) {
-              if (!ii_read_byte_as_i32(machine, at, elem8_unsigned, &e)) return 0;
-            } else if (!ii_read_i32(machine, at, &e)) {
-              return 0;
-            }
-            v = e;
-            break;
-          }
-          case 1: v = i; break;
-          case 2: v = op0 >= 0 && op0 < n_consts ? consts_i[op0] : 0; break;
-          case 3: v = (long long)(int)((unsigned int)(int)vals_i[op0] + (unsigned int)(int)vals_i[op1]); break;
-          case 4: v = (long long)(int)((unsigned int)(int)vals_i[op0] - (unsigned int)(int)vals_i[op1]); break;
-          case 5: v = (long long)(int)((unsigned int)(int)vals_i[op0] * (unsigned int)(int)vals_i[op1]); break;
-          case 7: v = op0 >= 0 && op0 < n_scalars ? scalars_i[op0] : 0; break;
-          case 8: v = (long long)(int)((int)vals_i[op0] & (int)vals_i[op1]); break;
-          case 9: v = (long long)(int)((int)vals_i[op0] | (int)vals_i[op1]); break;
-          case 10: v = (long long)(int)((int)vals_i[op0] ^ (int)vals_i[op1]); break;
-          case 11: v = (long long)(int)((unsigned int)(int)vals_i[op0] << (op1 & 31)); break;
-          case 12: v = (long long)(int)((int)vals_i[op0] >> (op1 & 31)); break;
-          case 13: v = (long long)(int)((unsigned int)(int)vals_i[op0] >> (op1 & 31)); break;
-          default:
-            ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop int node tag");
-            return 0;
-          }
-          vals_i[node] = v;
-        } else if (is_f32) {
-          float v = 0;
-          switch (tag) {
-          case 0: {
-            if (op0 < 0 || op0 >= n_arrays) { ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop load idx"); return 0; }
-            float e;
-            if (!ii_read_f32(machine, arrays[op0] + (unsigned long long)i * 4, &e)) return 0;
-            v = e;
-            break;
-          }
-          case 1: v = (float)i; break;
-          case 2: v = op0 >= 0 && op0 < n_consts ? (float)consts_f[op0] : 0; break;
-          case 3: v = (float)vals_f[op0] + (float)vals_f[op1]; break;
-          case 4: v = (float)vals_f[op0] - (float)vals_f[op1]; break;
-          case 5: v = (float)vals_f[op0] * (float)vals_f[op1]; break;
-          case 6: v = (float)vals_f[op0] / (float)vals_f[op1]; break;
-          case 7: v = op0 >= 0 && op0 < n_scalars ? (float)scalars_f[op0] : 0; break;
-          default:
-            ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop f32 node tag");
-            return 0;
-          }
-          vals_f[node] = (double)v;
-        } else {
-          double v = 0;
-          switch (tag) {
-          case 0: {
-            if (op0 < 0 || op0 >= n_arrays) { ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop load idx"); return 0; }
-            if (!ii_read_f64(machine, arrays[op0] + (unsigned long long)i * 8, &v)) return 0;
-            break;
-          }
-          case 1: v = (double)i; break;
-          case 2: v = op0 >= 0 && op0 < n_consts ? consts_f[op0] : 0; break;
-          case 3: v = vals_f[op0] + vals_f[op1]; break;
-          case 4: v = vals_f[op0] - vals_f[op1]; break;
-          case 5: v = vals_f[op0] * vals_f[op1]; break;
-          case 6: v = vals_f[op0] / vals_f[op1]; break;
-          case 7: v = op0 >= 0 && op0 < n_scalars ? scalars_f[op0] : 0; break;
-          default:
-            ii_fail(machine, IR_INTERP_UNSUPPORTED, "vloop f64 node tag");
-            return 0;
-          }
-          vals_f[node] = v;
-        }
-      }
-      if (reduce_op == 1) {
-        if (is_int) {
-          acc_i = (long long)(int)((unsigned int)(int)acc_i +
-                                   (unsigned int)(int)vals_i[root]);
-        } else if (is_f32) {
-          acc_f = (double)(float)((float)acc_f + (float)vals_f[root]);
-        } else {
-          acc_f += vals_f[root];
-        }
-      } else if (reduce_op == 2 || reduce_op == 3) {
-        /* `if (v > acc) { acc = v; }`: the element only wins an ordered
-         * compare, so a NaN leaves the accumulator alone -- the same rule the
-         * kernel gets from MAXPS/MINPS returning src2 when unordered. */
-        if (is_int) {
-          long long v = (long long)(int)vals_i[root];
-          long long a = (long long)(int)acc_i;
-          if (reduce_op == 2 ? v > a : v < a) {
-            acc_i = v;
-          }
-        } else {
-          double v = is_f32 ? (double)(float)vals_f[root] : vals_f[root];
-          if (reduce_op == 2 ? v > acc_f : v < acc_f) {
-            acc_f = v;
-          }
-        }
-      } else {
-        unsigned long long addr =
-            dest_base + (unsigned long long)i * (unsigned long long)elem_size;
-        if (elem8) {
-          if (!ii_write_byte(machine, addr, (int)vals_i[root])) return 0;
-        } else if (is_int) {
-          if (!ii_write_i32(machine, addr, (int)vals_i[root])) return 0;
-        } else if (is_f32) {
-          if (!ii_write_f32(machine, addr, (float)vals_f[root])) return 0;
-        } else {
-          if (!ii_write_f64(machine, addr, vals_f[root])) return 0;
-        }
+      IIVloopEnv env;
+      env.machine = machine;
+      env.arrays = arrays;
+      env.scalars_f = scalars_f;
+      env.scalars_i = scalars_i;
+      env.consts_f = consts_f;
+      env.consts_i = consts_i;
+      env.vals_f = vals_f;
+      env.vals_i = vals_i;
+      env.n_arrays = n_arrays;
+      env.n_scalars = n_scalars;
+      env.n_consts = n_consts;
+      env.n_nodes = n_nodes;
+      env.elem_size = elem_size;
+      env.elem8 = elem8;
+      env.elem8_unsigned = elem8_unsigned;
+      if (!ii_vloop_eval(&env, insn, nodes_at, i, is_int, is_f32) ||
+          !ii_vloop_reduce(&env, reduce_op, root, i, is_int, is_f32, dest_base,
+                           &acc_i, &acc_f)) {
+        return 0;
       }
       machine->fuel -= n_nodes;
       if (machine->fuel < 0) {
@@ -3925,9 +4192,32 @@ static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
   }
 
   default:
-    ii_fail(machine, IR_INTERP_UNSUPPORTED, ir_opcode_name(insn->op));
-    return 0;
+    *handled = 0;
+    break;
   }
+  return 0;
+}
+
+static int ii_exec_simd(IRInterpMachine *machine, IIFrame *frame,
+                        const IRInstruction *insn) {
+  static int (*const KERNELS[])(IRInterpMachine *, IIFrame *,
+                                const IRInstruction *, int *) = {
+      ii_exec_memory,       ii_exec_slp_mac,    ii_exec_int_reduce,
+      ii_exec_fill,         ii_exec_sort,       ii_exec_int_dot,
+      ii_exec_int_map,      ii_exec_int_search, ii_exec_float_reduce,
+      ii_exec_float_map,    ii_exec_outer_lane, ii_exec_random,
+      ii_exec_vloop};
+  size_t kernel;
+
+  for (kernel = 0; kernel < sizeof(KERNELS) / sizeof(KERNELS[0]); kernel++) {
+    int handled = 0;
+    int executed = KERNELS[kernel](machine, frame, insn, &handled);
+    if (handled) {
+      return executed;
+    }
+  }
+  ii_fail(machine, IR_INTERP_UNSUPPORTED, ir_opcode_name(insn->op));
+  return 0;
 }
 
 /* ---------------- main execution loop ---------------- */
