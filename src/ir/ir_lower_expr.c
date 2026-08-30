@@ -1750,6 +1750,47 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       return 0;
     }
 
+    /* A shift on a narrow type runs in a 64-bit register, where the hardware
+     * masks the count to 6 bits instead of the width the type has. int64
+     * shifts read that way already and M0115 says so, so the count is brought
+     * down to this type's own width: `x >> 32` on an int32 answered 0 while
+     * the same shift on an int64 answered x. A constant count folds here and
+     * leaves the shape every address recognizer reads. */
+    {
+      int shift_bits = ir_narrow_integer_shift_bits(
+          ir_infer_expression_type(context, expression));
+      if (shift_bits &&
+          (strcmp(binary->operator, "<<") == 0 ||
+           strcmp(binary->operator, ">>") == 0)) {
+        long long mask = shift_bits - 1;
+        if (right.kind == IR_OPERAND_INT) {
+          right.int_value &= mask;
+        } else {
+          IROperand masked = ir_operand_none();
+          IRInstruction bound = {0};
+          if (!ir_make_temp_operand(context, &masked)) {
+            ir_operand_destroy(&left);
+            ir_operand_destroy(&right);
+            return 0;
+          }
+          bound.op = IR_OP_BINARY;
+          bound.location = expression->location;
+          bound.dest = masked;
+          bound.lhs = right;
+          bound.rhs = ir_operand_int(mask);
+          bound.text = (char *)"&";
+          if (!ir_emit(context, function, &bound)) {
+            ir_operand_destroy(&masked);
+            ir_operand_destroy(&left);
+            ir_operand_destroy(&right);
+            return 0;
+          }
+          ir_operand_destroy(&right);
+          right = masked;
+        }
+      }
+    }
+
     IROperand destination = ir_operand_none();
     if (!ir_make_temp_operand(context, &destination)) {
       ir_operand_destroy(&left);

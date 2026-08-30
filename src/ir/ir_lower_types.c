@@ -407,6 +407,31 @@ int ir_type_is_unsigned_integer(Type *type) {
  * for the same reason: complementing a uint8 in a 64-bit register sets 56 bits
  * the type does not have, and negating int8 -128 gives 128, which is not an
  * int8 either. */
+/* Bit width of a narrow integer type, or 0 for anything else. A shift on one
+ * of these runs in a 64-bit register, where the hardware masks the count to 6
+ * bits and not to the type's own width. int64 shifts already read that way,
+ * and the M0115 warning describes it, so a narrow shift masks its count to the
+ * width the type actually has. Without it `x >> 32` on an int32 answered 0
+ * while the same shift on an int64 answered x. */
+int ir_narrow_integer_shift_bits(Type *type) {
+  if (!type) {
+    return 0;
+  }
+  switch (type->kind) {
+  case TYPE_INT8:
+  case TYPE_UINT8:
+    return 8;
+  case TYPE_INT16:
+  case TYPE_UINT16:
+    return 16;
+  case TYPE_INT32:
+  case TYPE_UINT32:
+    return 32;
+  default:
+    return 0;
+  }
+}
+
 /* Does this unary applied to this constant land back inside `type_name`? Then
  * the value is already what the type says and no truncation is emitted, which
  * leaves a negative literal reading as the constant it is. */
