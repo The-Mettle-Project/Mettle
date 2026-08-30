@@ -13840,7 +13840,10 @@ else {
 # path passed only -lkernel32, so every std/ui and std/net program linked one
 # way and failed the other on its first Win32 entry point. Linking is the whole
 # check: this one opens a window if it runs.
-if (-not $calcGcc) {
+if (-not $script:OnWindows) {
+  Write-Host "[SKIP] external_linker_win32_libraries (Win32 import libraries)"
+}
+elseif (-not $calcGcc) {
   Write-Host "[SKIP] external_linker_win32_libraries (gcc not found)"
 }
 else {
