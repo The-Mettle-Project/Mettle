@@ -1,4 +1,5 @@
 #include "codegen/binary/internal.h"
+#include "codegen/target.h"
 #include "codegen/binary/mir.h"
 #include "codegen/binary/mir_annotate.h"
 #include "ir/ir_pgo.h"
@@ -192,6 +193,29 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
                                         ir_function->location.filename));
   }
 
+  if (ir_function->is_naked) {
+    if (!code_generator_emit_binary_naked_function(generator, ir_function,
+                                                   &context)) {
+      binary_function_context_destroy(&context);
+      return 0;
+    }
+    return_offset = context.code.size;
+    goto mir_shared_append;
+  }
+
+  /* Real mode has no 64-bit frame, no rip-relative addressing and no register
+   * convention the rest of this backend assumes, so a 16-bit target gets its
+   * own emitter rather than a flag threaded through this one. */
+  if (mtlc_target()->arch == MTLC_TARGET_ARCH_X86_16) {
+    if (!code_generator_emit_binary_function_x86_16(generator, ir_function,
+                                                    &context)) {
+      binary_function_context_destroy(&context);
+      return 0;
+    }
+    return_offset = context.code.size;
+    goto mir_shared_append;
+  }
+
   /* Route fully-supported leaf integer functions through the MIR + linear-scan
    * register allocator The MIR path fills context.code
    * with a complete prologue..epilogue and resolves its own label fixups; all
@@ -219,6 +243,14 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
         ir_function->name, ir_function,
         ir_function->location.filename, ir_function->location.line);
     mir_annotate_note_backend("baseline (fallback)", NULL);
+  }
+
+  if (ir_function->is_interrupt &&
+      !code_generator_binary_emit_interrupt_entry(generator, ir_function,
+                                                  &context)) {
+    if (annot) mir_annotate_end_function();
+    binary_function_context_destroy(&context);
+    return 0;
   }
 
   if (!code_generator_binary_emit_prologue(generator, &context)) {
@@ -500,9 +532,16 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
                                  BINARY_GP_RAX)) ||
       !binary_emit_mov_reg_reg(&context.code, BINARY_GP_RSP, BINARY_GP_RBP) ||
       !binary_emit_pop_reg(&context.code, BINARY_GP_RBP) ||
-      !binary_emit_ret(&context.code)) {
+      (!ir_function->is_interrupt && !binary_emit_ret(&context.code))) {
     code_generator_set_error(generator,
                              "Out of memory while emitting function epilogue");
+    binary_function_context_destroy(&context);
+    return 0;
+  }
+
+  if (ir_function->is_interrupt &&
+      !code_generator_binary_emit_interrupt_exit(generator, ir_function,
+                                                 &context)) {
     binary_function_context_destroy(&context);
     return 0;
   }
@@ -612,6 +651,21 @@ mir_shared_append:
                                  : "Failed to emit function machine code");
     binary_function_context_destroy(&context);
     return 0;
+  }
+
+  for (size_t i = 0; i < context.asm_relocations.count; i++) {
+    BinaryAsmRelocation *relocation = &context.asm_relocations.items[i];
+    if (!binary_emitter_add_relocation(
+            emitter, text_section, function_offset + relocation->offset,
+            (BinaryRelocationKind)relocation->kind, relocation->symbol_name,
+            relocation->addend)) {
+      code_generator_set_error(generator, "%s",
+                               binary_emitter_get_error(emitter)
+                                   ? binary_emitter_get_error(emitter)
+                                   : "Failed to record an asm relocation");
+      binary_function_context_destroy(&context);
+      return 0;
+    }
   }
 
   for (size_t i = 0; i < context.call_relocations.count; i++) {

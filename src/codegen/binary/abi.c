@@ -1020,6 +1020,14 @@ int code_generator_binary_promote_hot_symbols(
     return 0;
   }
 
+  /* An asm block clobbers registers the compiler never told it about, so
+   * nothing may live in one across it. Every value keeps its stack home,
+   * which is also the home an `{x}` operand binding resolves to. */
+  if (ir_function_has_inline_asm(ir_function) ||
+      ir_function->has_volatile_access) {
+    return 1;
+  }
+
   MtlcType *return_type = code_generator_binary_get_resolved_type(
       generator, ir_function->return_type_name, 1);
   size_t max_promoted =

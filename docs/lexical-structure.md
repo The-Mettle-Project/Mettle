@@ -61,12 +61,15 @@ The built-in type names are also reserved: `int8`, `int16`, `int32`, `int64`,
 `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`.
 
 Some names are recognized by position and stay usable elsewhere: `bool`,
-`char`, `cstring`, `rawptr`, `comptime`, `in`, `sizeof`, `typeof`, `Fn`,
-`Type`, `Field`. Writing one where a type belongs gets you that type. Writing
-one as a variable name works.
+`char`, `cstring`, `rawptr`, `comptime`, `volatile`, `in`, `sizeof`, `typeof`,
+`Fn`, `Type`, `Field`. Writing one where a type belongs gets you that type.
+Writing one as a variable name works.
 
-Inside an `asm` block the x86-64 mnemonics and register names are recognized
-too, and they match without regard to case. They mean nothing outside a block.
+An `asm` block is not lexed as Mettle at all. Everything between its braces is
+handed to the compiler's own x86 assembler, which has its own comment styles
+(`;`, `#`, `//`, `/* */`) and its own names for instructions and registers.
+Only `{name}` reaches back into Mettle, to name a variable. See
+[Bare metal](bare-metal.md).
 
 ## Integer literals
 

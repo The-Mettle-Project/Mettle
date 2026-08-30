@@ -139,6 +139,18 @@ typedef struct {
   /* --subsystem=windows: mark the PE as a GUI image so Windows does not create
    * a console window for it. Ignored on non-PE targets. */
   int windows_subsystem;
+  /* --target <triple>: the machine the output runs on, which may not be this
+   * one. Selects the object format, the calling convention and the width the
+   * code generators and the inline assembler emit for. */
+  const char *target_triple;
+  /* --image-base <addr>: where the linked image is loaded, replacing the
+   * format's default. A freestanding image is placed where its loader puts
+   * it, not where a hosted operating system would. */
+  unsigned long long image_base;
+  int image_base_set;
+  /* --emit-flat <file>: a raw image with no object or executable container,
+   * laid out at --image-base. This is what a boot sector or a ROM is. */
+  const char *flat_output;
   LinkerMode linker_mode;
 } CompilerOptions;
 

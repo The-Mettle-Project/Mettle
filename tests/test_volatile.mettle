@@ -1,0 +1,43 @@
+import "std/io";
+import "std/mem";
+
+fn poll_four_times(port: volatile uint32*) -> uint32 {
+    var total: uint32 = 0
+    var i: int32 = 0
+    while (i < 4) {
+        total = total + *port
+        i = i + 1
+    }
+    return total
+}
+
+fn drain(port: volatile uint8*, count: int32) -> int32 {
+    var total: int32 = 0
+    var i: int32 = 0
+    while (i < count) {
+        total = total + (int32)(*port)
+        i = i + 1
+    }
+    return total
+}
+
+fn write_twice(port: volatile uint16*) {
+    *port = 1
+    *port = 2
+}
+
+fn main() -> int32 {
+    var cell: rawptr = alloc_zeroed(8)
+    var word: volatile uint32* = (volatile uint32*)cell
+    var byte: volatile uint8* = (volatile uint8*)cell
+    var half: volatile uint16* = (volatile uint16*)cell
+
+    *word = 7
+    print("polled = {poll_four_times(word)}")
+    print("drained = {drain(byte, 3)}")
+    write_twice(half)
+    print("last = {*half}")
+
+    free(cell)
+    return 0
+}

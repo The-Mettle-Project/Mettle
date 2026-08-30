@@ -35,6 +35,7 @@ int type_checker_ensure_multi_return_type(TypeChecker *checker,
                                           SourceLocation location);
 
 Type *type_checker_pointer_to(TypeChecker *checker, Type *base);
+Type *type_checker_volatile_of(TypeChecker *checker, Type *base);
 Type *type_checker_parse_pointer_type(TypeChecker *checker,
                                              const char *name);
 

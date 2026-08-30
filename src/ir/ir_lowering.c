@@ -145,11 +145,15 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   function->is_inline = function_data->is_inline;
   function->is_inline_contract = function_data->is_inline_contract;
   function->is_swappable = function_data->is_swappable;
+  function->is_naked = function_data->is_naked;
+  function->is_interrupt = function_data->is_interrupt;
   function->is_exported = function_data->is_exported;
   /* The swap redirects a call, so the call must still exist at run time. This
    * is the cost the decorator buys, and it is why swappability is opt-in. */
-  function->is_noinline =
-      function_data->is_noinline || function_data->is_swappable;
+  function->is_noinline = function_data->is_noinline ||
+                          function_data->is_swappable ||
+                          function_data->is_naked ||
+                          function_data->is_interrupt;
   function->is_pure = function_data->is_pure;
   function->is_noalloc = function_data->is_noalloc;
   function->is_test = function_data->is_test;
@@ -206,10 +210,13 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
     return NULL;
   }
 
-  // Ensure fall-off path runs defers too by emitting a return if none exists.
-  if (function->instruction_count == 0 ||
-      function->instructions[function->instruction_count - 1].op !=
-          IR_OP_RETURN) {
+  /* A `@naked` body ends where its asm block ends: there is no frame, so
+   * there is nothing for a fall-off return or a defer to unwind, and the
+   * scaffolding would emit compiled code into a function that has none. */
+  if (!function_data->is_naked &&
+      (function->instruction_count == 0 ||
+       function->instructions[function->instruction_count - 1].op !=
+           IR_OP_RETURN)) {
     IROperand implicit_value = ir_operand_none();
     if (!ir_emit_return_with_defers(context, function, &defers, &implicit_value,
                                     declaration->location)) {

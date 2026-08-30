@@ -1457,6 +1457,19 @@ int mir_function_is_eligible(CodeGenerator *generator,
       }
     }
   }
+  /* An `asm` block is written against named stack homes and clobbers whatever
+   * registers it likes. The allocated frame has neither, so the whole function
+   * goes to the baseline emitter, which keeps every value in its own slot. */
+  if (ir_function->is_naked || ir_function->is_interrupt ||
+      ir_function_has_inline_asm(ir_function)) {
+    return mir_trace_bail(ir_function, "inline_asm");
+  }
+  /* A volatile access must reach memory exactly as often as the source says.
+   * The allocated frame keeps values in registers and fuses accesses, so a
+   * function holding one is emitted by the baseline, which does neither. */
+  if (ir_function->has_volatile_access) {
+    return mir_trace_bail(ir_function, "volatile_access");
+  }
   /* Stage 2 targets plain --release codegen only: no debug line markers,
    * stack-trace ranges, or profiling instrumentation. */
   if (generator->generate_debug_info || generator->generate_stack_trace_support ||

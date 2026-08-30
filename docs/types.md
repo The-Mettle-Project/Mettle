@@ -160,6 +160,19 @@ been decided. `cstring` is a pointer to nul-terminated bytes, and it exists for
 the C boundary. [C interoperability](c-interop.md) covers converting between
 `cstring` and `string`.
 
+`volatile T` says that reading or writing a `T` is observable in itself: no
+access to one is removed, merged, hoisted, or served from a register. The
+qualifier binds to the value accessed, so `volatile uint16*` points at volatile
+`uint16` -- the shape memory-mapped hardware has.
+
+```mettle
+var vga: volatile uint16* = (volatile uint16*)0xB8000;
+vga[0] = 0x0F41;
+```
+
+[Bare metal](bare-metal.md) covers what the compiler guarantees and what it
+costs.
+
 ## Arrays
 
 `T[N]` is N elements laid out end to end. The size is part of the type, and it

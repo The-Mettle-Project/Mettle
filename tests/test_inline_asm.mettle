@@ -1,0 +1,75 @@
+import "std/io";
+
+fn add_via_asm(a: int64, b: int64) -> int64 {
+    var result: int64 = 0
+    asm {
+        mov rax, {a}
+        add rax, {b}
+        mov {result}, rax
+    }
+    return result
+}
+
+fn count_set_bits(value: uint64) -> int64 {
+    var total: int64 = 0
+    asm {
+        mov rcx, {value}
+        xor rax, rax
+    next:
+        test rcx, rcx
+        je done
+        mov rdx, rcx
+        and rdx, 1
+        add rax, rdx
+        shr rcx, 1
+        jmp next
+    done:
+        mov {total}, rax
+    }
+    return total
+}
+
+fn saturating_add(a: int32, b: int32) -> int32 {
+    var result: int32 = 0
+    asm {
+        mov eax, {a}
+        add eax, {b}
+        jno keep
+        mov eax, 0x7fffffff
+    keep:
+        mov {result}, eax
+    }
+    return result
+}
+
+fn byte_swap(value: uint32) -> uint32 {
+    var result: uint32 = 0
+    asm {
+        mov eax, {value}
+        mov ecx, eax
+        shr ecx, 24
+        mov edx, eax
+        shl edx, 24
+        or ecx, edx
+        mov edx, eax
+        and edx, 0x0000ff00
+        shl edx, 8
+        or ecx, edx
+        mov edx, eax
+        and edx, 0x00ff0000
+        shr edx, 8
+        or ecx, edx
+        mov {result}, ecx
+    }
+    return result
+}
+
+fn main() -> int32 {
+    print("sum = {add_via_asm(20, 22)}")
+    print("bits255 = {count_set_bits(255)}")
+    print("bits1024 = {count_set_bits(1024)}")
+    print("sat = {saturating_add(2147483647, 1)}")
+    print("plain = {saturating_add(20, 22)}")
+    print("swap = {byte_swap(0x11223344)}")
+    return 0
+}

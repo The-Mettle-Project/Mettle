@@ -35,6 +35,11 @@ typedef enum {
   BINARY_RELOCATION_REL32 = 0,
   BINARY_RELOCATION_ADDR64,
   BINARY_RELOCATION_ADDR32NB,
+  /* Real-mode 16-bit references. No object format here carries them, so they
+   * are resolved when the flat image is laid out and rejected everywhere
+   * else. */
+  BINARY_RELOCATION_REL16,
+  BINARY_RELOCATION_ADDR16,
   BINARY_RELOCATION_SECTION_REL32,
   /* AArch64 ELF instruction relocations. These stay target-specific rather
    * than overloading REL32: their relocated fields and addend rules are

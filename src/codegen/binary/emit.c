@@ -19,9 +19,57 @@ static int binary_emit_mov_reg_from_saved_string_source(
   return binary_emit_mov_reg_reg(code, destination, source);
 }
 
+/* Allocate through the runtime's own allocator.
+ *
+ * This used to inline HeapAlloc against the Win32 process heap while every
+ * other path -- the MIR backend, SysV, and every allocation the standard
+ * library makes -- went through the runtime's allocator. A buffer taken from
+ * one and released to the other is a crash, and which one a program got
+ * depended on whether its function happened to be eligible for the register
+ * allocator. There is one allocator, and both backends now call it. */
+
+#define BINARY_HEAP_ZERO_MEMORY 8u
 static int binary_emit_windows_heap_alloc(
     CodeGenerator *generator, BinaryFunctionContext *context,
-    BinaryGpRegister size_register, uint32_t flags);
+    BinaryGpRegister size_register, uint32_t flags) {
+  const BinaryAbi *abi = code_generator_binary_active_abi();
+  BinaryGpRegister arg0 = abi->int_param_registers[0];
+  BinaryGpRegister arg1 = abi->int_param_registers[1];
+  int zeroed = (flags & BINARY_HEAP_ZERO_MEMORY) != 0u;
+  const char *symbol = zeroed ? "calloc" : "malloc";
+  size_t displacement_offset = 0;
+
+  if (!code_generator_binary_declare_external_symbol(generator, symbol)) {
+    return 0;
+  }
+
+  /* calloc(1, size): the size moves to arg1 before arg0 is overwritten, so a
+   * size already living in arg0 survives. */
+  if (zeroed) {
+    if (!binary_emit_mov_reg_reg(&context->code, arg1, size_register) ||
+        !binary_emit_mov_reg_imm64(&context->code, arg0, 1)) {
+      return 0;
+    }
+  } else if (!binary_emit_mov_reg_reg(&context->code, arg0, size_register)) {
+    return 0;
+  }
+
+  if (abi->shadow_space_size &&
+      !binary_emit_sub_rsp_imm32(&context->code, abi->shadow_space_size)) {
+    return 0;
+  }
+  if (!binary_emit_call_placeholder(&context->code, &displacement_offset) ||
+      !binary_call_relocation_table_add(&context->call_relocations, symbol,
+                                        displacement_offset)) {
+    return 0;
+  }
+  if (abi->shadow_space_size &&
+      !binary_emit_add_rsp_imm32(&context->code, abi->shadow_space_size)) {
+    return 0;
+  }
+  return 1;
+}
+
 static int binary_emit_windows_zeroed_heap_alloc(
     CodeGenerator *generator, BinaryFunctionContext *context,
     BinaryGpRegister size_register);
@@ -1748,55 +1796,35 @@ static int code_generator_binary_emit_memcmp_call_inline(
                                                       BINARY_GP_RAX);
 }
 
+/* Release through the runtime's own allocator; see the note on
+ * binary_emit_windows_heap_alloc for why this is not HeapFree. */
 static int binary_emit_windows_heap_free_value(
     CodeGenerator *generator, BinaryFunctionContext *context,
     BinaryGpRegister ptr_register) {
-  size_t get_heap_displacement_offset = 0;
-  size_t heap_free_displacement_offset = 0;
+  const BinaryAbi *abi = code_generator_binary_active_abi();
+  size_t displacement_offset = 0;
 
-  if (code_generator_binary_active_abi()->counts_classes_separately) {
-    const BinaryAbi *abi = code_generator_binary_active_abi();
-    size_t displacement_offset = 0;
-
-    if (!code_generator_binary_declare_external_symbol(generator, "free")) {
-      return 0;
-    }
-    return binary_emit_mov_reg_reg(&context->code, abi->int_param_registers[0],
-                                   ptr_register) &&
-           binary_emit_call_placeholder(&context->code, &displacement_offset) &&
-           binary_call_relocation_table_add(&context->call_relocations, "free",
-                                            displacement_offset);
-  }
-
-  if (!code_generator_binary_declare_external_symbol(generator,
-                                                     "GetProcessHeap") ||
-      !code_generator_binary_declare_external_symbol(generator, "HeapFree")) {
+  if (!code_generator_binary_declare_external_symbol(generator, "free")) {
     return 0;
   }
-
-  return binary_emit_push_reg(&context->code, ptr_register) &&
-         binary_emit_sub_rsp_imm32(&context->code,
-                                   BINARY_WIN64_SHADOW_SPACE_SIZE + 8) &&
-         binary_emit_call_placeholder(&context->code,
-                                      &get_heap_displacement_offset) &&
-         binary_call_relocation_table_add(&context->call_relocations,
-                                          "GetProcessHeap",
-                                          get_heap_displacement_offset) &&
-         binary_emit_add_rsp_imm32(&context->code,
-                                   BINARY_WIN64_SHADOW_SPACE_SIZE + 8) &&
-         binary_emit_pop_reg(&context->code, BINARY_GP_R8) &&
-         binary_emit_mov_reg_reg(&context->code, BINARY_GP_RCX,
-                                 BINARY_GP_RAX) &&
-         binary_emit_mov_reg_imm64(&context->code, BINARY_GP_RDX, 0) &&
-         binary_emit_sub_rsp_imm32(&context->code,
-                                   BINARY_WIN64_SHADOW_SPACE_SIZE) &&
-         binary_emit_call_placeholder(&context->code,
-                                      &heap_free_displacement_offset) &&
-         binary_call_relocation_table_add(&context->call_relocations,
-                                          "HeapFree",
-                                          heap_free_displacement_offset) &&
-         binary_emit_add_rsp_imm32(&context->code,
-                                   BINARY_WIN64_SHADOW_SPACE_SIZE);
+  if (!binary_emit_mov_reg_reg(&context->code, abi->int_param_registers[0],
+                               ptr_register)) {
+    return 0;
+  }
+  if (abi->shadow_space_size &&
+      !binary_emit_sub_rsp_imm32(&context->code, abi->shadow_space_size)) {
+    return 0;
+  }
+  if (!binary_emit_call_placeholder(&context->code, &displacement_offset) ||
+      !binary_call_relocation_table_add(&context->call_relocations, "free",
+                                        displacement_offset)) {
+    return 0;
+  }
+  if (abi->shadow_space_size &&
+      !binary_emit_add_rsp_imm32(&context->code, abi->shadow_space_size)) {
+    return 0;
+  }
+  return 1;
 }
 
 static int code_generator_binary_emit_malloc_call_inline(
@@ -3027,86 +3055,6 @@ int code_generator_binary_emit_store(CodeGenerator *generator,
 }
 
 /* MT_HEAP_ZERO_MEMORY, the flag the Win32 heap takes for zeroed storage. */
-#define BINARY_HEAP_ZERO_MEMORY 8u
-
-/* Allocate through the owned runtime's malloc/calloc. The Win32 heap pair
- * below has no counterpart outside Windows, and freestanding.c already
- * exports these two names on every target. */
-static int binary_emit_sysv_heap_alloc(CodeGenerator *generator,
-                                       BinaryFunctionContext *context,
-                                       BinaryGpRegister size_register,
-                                       uint32_t flags) {
-  const BinaryAbi *abi = code_generator_binary_active_abi();
-  BinaryGpRegister arg0 = abi->int_param_registers[0];
-  BinaryGpRegister arg1 = abi->int_param_registers[1];
-  int zeroed = (flags & BINARY_HEAP_ZERO_MEMORY) != 0u;
-  const char *symbol = zeroed ? "calloc" : "malloc";
-  size_t displacement_offset = 0;
-
-  if (!code_generator_binary_declare_external_symbol(generator, symbol)) {
-    return 0;
-  }
-
-  /* calloc(1, size): the size moves to arg1 before arg0 is overwritten, so a
-   * size already living in arg0 survives. */
-  if (zeroed) {
-    if (!binary_emit_mov_reg_reg(&context->code, arg1, size_register) ||
-        !binary_emit_mov_reg_imm64(&context->code, arg0, 1)) {
-      return 0;
-    }
-  } else if (!binary_emit_mov_reg_reg(&context->code, arg0, size_register)) {
-    return 0;
-  }
-
-  return binary_emit_call_placeholder(&context->code, &displacement_offset) &&
-         binary_call_relocation_table_add(&context->call_relocations, symbol,
-                                          displacement_offset);
-}
-
-static int binary_emit_windows_heap_alloc(
-    CodeGenerator *generator, BinaryFunctionContext *context,
-    BinaryGpRegister size_register, uint32_t flags) {
-  size_t get_heap_displacement_offset = 0;
-  size_t heap_alloc_displacement_offset = 0;
-
-  if (code_generator_binary_active_abi()->counts_classes_separately) {
-    return binary_emit_sysv_heap_alloc(generator, context, size_register,
-                                       flags);
-  }
-
-  if (!code_generator_binary_declare_external_symbol(generator,
-                                                     "GetProcessHeap") ||
-      !code_generator_binary_declare_external_symbol(generator, "HeapAlloc")) {
-    return 0;
-  }
-
-  if (!binary_emit_push_reg(&context->code, size_register) ||
-      !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8) ||
-      !binary_emit_call_placeholder(&context->code,
-                                    &get_heap_displacement_offset) ||
-      !binary_call_relocation_table_add(&context->call_relocations,
-                                        "GetProcessHeap",
-                                        get_heap_displacement_offset) ||
-      !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE + 8) ||
-      !binary_emit_pop_reg(&context->code, BINARY_GP_R8) ||
-      !binary_emit_mov_reg_reg(&context->code, BINARY_GP_RCX, BINARY_GP_RAX) ||
-      !binary_emit_mov_reg_imm64(&context->code, BINARY_GP_RDX, flags) ||
-      !binary_emit_sub_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE) ||
-      !binary_emit_call_placeholder(&context->code,
-                                    &heap_alloc_displacement_offset) ||
-      !binary_call_relocation_table_add(&context->call_relocations,
-                                        "HeapAlloc",
-                                        heap_alloc_displacement_offset) ||
-      !binary_emit_add_rsp_imm32(&context->code,
-                                 BINARY_WIN64_SHADOW_SPACE_SIZE)) {
-    return 0;
-  }
-
-  return 1;
-}
 
 static int binary_emit_windows_zeroed_heap_alloc(
     CodeGenerator *generator, BinaryFunctionContext *context,
@@ -6327,13 +6275,8 @@ int code_generator_binary_emit_instruction(
                                                           instruction);
 
   case IR_OP_INLINE_ASM:
-    generator->has_user_error = 1;
-    code_generator_set_error(
-        generator,
-        "inline assembly is not supported by the code generator; function "
-        "'%s' contains an `asm` block",
-        context->function_name);
-    return 0;
+    return code_generator_binary_emit_inline_asm(generator, context,
+                                                 instruction);
 
   default: {
     const char *gpu_construct = ir_gpu_only_construct_name(instruction->op);

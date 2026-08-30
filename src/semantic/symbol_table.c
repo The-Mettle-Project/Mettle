@@ -424,6 +424,7 @@ Type *type_create(TypeKind kind, const char *name) {
 
   type->kind = kind;
   type->name = name ? (char *)string_intern(name) : NULL;
+  type->is_volatile = 0;
   type->size = 0;
   type->alignment = 0;
   type->base_type = NULL;

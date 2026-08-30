@@ -1,0 +1,38 @@
+import "std/io";
+
+var interrupt_ticks: int64 = 0;
+
+@naked fn triple(x: int64) -> int64 {
+    asm {
+        mov rax, rcx
+        add rax, rax
+        add rax, rcx
+        ret
+    }
+}
+
+@naked fn cpu_vendor_ebx() -> uint32 {
+    asm {
+        push rbx
+        xor eax, eax
+        cpuid
+        mov eax, ebx
+        pop rbx
+        ret
+    }
+}
+
+@interrupt fn timer_isr() {
+    interrupt_ticks = interrupt_ticks + 1
+}
+
+@interrupt fn page_fault(frame: int64*, error_code: uint64) {
+    interrupt_ticks = (int64)error_code
+}
+
+fn main() -> int32 {
+    print("triple = {triple(14)}")
+    print("vendor_is_genuine = {cpu_vendor_ebx() == 1970169159}")
+    print("ticks = {interrupt_ticks}")
+    return 0
+}

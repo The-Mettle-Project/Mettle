@@ -973,6 +973,9 @@ IRFunction *ir_function_create(const char *name) {
   function->is_noalloc = 0;
   function->is_test = 0;
   function->is_swappable = 0;
+  function->is_naked = 0;
+  function->is_interrupt = 0;
+  function->has_volatile_access = 0;
   function->is_kernel = 0;
   return function;
 }
@@ -1082,6 +1085,9 @@ int ir_function_append_instruction(IRFunction *function,
 
   IRInstruction *slot = &function->instructions[function->instruction_count];
   *slot = *instruction;
+  if (instruction->is_volatile) {
+    function->has_volatile_access = 1;
+  }
 
   /* The shallow copy above aliased the source's tensor block; take our own
    * before anything can free either instruction. */
@@ -2376,10 +2382,12 @@ static int ir_format_instruction_line(const IRInstruction *instruction,
     written = snprintf(buffer, buffer_size, "%s <- &%s", dest, lhs);
     break;
   case IR_OP_LOAD:
-    written = snprintf(buffer, buffer_size, "%s <- *%s [%s]", dest, lhs, rhs);
+    written = snprintf(buffer, buffer_size, "%s <- *%s [%s]%s", dest, lhs, rhs,
+                       instruction->is_volatile ? " volatile" : "");
     break;
   case IR_OP_STORE:
-    written = snprintf(buffer, buffer_size, "*%s <- %s [%s]", dest, lhs, rhs);
+    written = snprintf(buffer, buffer_size, "*%s <- %s [%s]%s", dest, lhs, rhs,
+                       instruction->is_volatile ? " volatile" : "");
     break;
   case IR_OP_BINARY:
     written = snprintf(buffer, buffer_size, "%s = %s %s%s %s", dest, lhs,

@@ -45,6 +45,10 @@ typedef enum {
 typedef struct Type {
   TypeKind kind;
   char *name;
+  /* `volatile T`: reading or writing a value of this type is observable in
+   * itself. No access may be removed, merged with another, reordered against
+   * another volatile access, or served from a register. */
+  int is_volatile;
   size_t size;
   size_t alignment;
   struct Type *base_type; // For pointers and arrays

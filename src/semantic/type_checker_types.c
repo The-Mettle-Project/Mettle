@@ -235,6 +235,67 @@ Type *type_checker_pointer_to(TypeChecker *checker, Type *base) {
   return type_checker_canon_type(checker, pointer_type);
 }
 
+Type *type_checker_volatile_of(TypeChecker *checker, Type *base) {
+  if (!checker || !base) {
+    return NULL;
+  }
+  if (base->is_volatile) {
+    return base;
+  }
+  {
+    const char *base_name = base->name ? base->name : "value";
+    size_t length = strlen(base_name) + 10;
+    char *qualified_name = malloc(length);
+    Type *qualified = NULL;
+    size_t i;
+    if (!qualified_name) {
+      return NULL;
+    }
+    snprintf(qualified_name, length, "volatile %s", base_name);
+    for (i = 0; i < checker->type_table_count; i++) {
+      Type *existing = checker->type_table[i];
+      if (existing && existing->is_volatile && existing->name &&
+          strcmp(existing->name, qualified_name) == 0) {
+        free(qualified_name);
+        return existing;
+      }
+    }
+    qualified = type_create(base->kind, qualified_name);
+    free(qualified_name);
+    if (!qualified) {
+      return NULL;
+    }
+    qualified->is_volatile = 1;
+    qualified->base_type = base->base_type;
+    qualified->array_size = base->array_size;
+    qualified->fn_param_types = base->fn_param_types;
+    qualified->fn_param_count = base->fn_param_count;
+    qualified->fn_return_type = base->fn_return_type;
+    qualified->closure_env = base->closure_env;
+    qualified->field_names = base->field_names;
+    qualified->field_types = base->field_types;
+    qualified->field_offsets = base->field_offsets;
+    qualified->field_bit_offsets = base->field_bit_offsets;
+    qualified->field_bit_widths = base->field_bit_widths;
+    qualified->field_count = base->field_count;
+    qualified->tagged_variant_names = base->tagged_variant_names;
+    qualified->tagged_variant_tags = base->tagged_variant_tags;
+    qualified->tagged_variant_payloads = base->tagged_variant_payloads;
+    qualified->tagged_variant_count = base->tagged_variant_count;
+    qualified->enum_member_names = base->enum_member_names;
+    qualified->enum_member_values = base->enum_member_values;
+    qualified->enum_member_count = base->enum_member_count;
+    qualified->tagged_data_offset = base->tagged_data_offset;
+    qualified->tagged_data_size = base->tagged_data_size;
+    qualified->size = base->size;
+    qualified->alignment = base->alignment;
+    if (type_checker_intern_type(checker, qualified) == UINT32_MAX) {
+      return base;
+    }
+    return qualified;
+  }
+}
+
 Type *type_checker_parse_pointer_type(TypeChecker *checker,
                                              const char *name) {
   if (!checker || !name) {
@@ -788,6 +849,17 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
     if (pointer_type) {
       return pointer_type;
     }
+  }
+
+  /* `volatile T`. The qualifier binds to the value being accessed, so
+   * `volatile uint16*` is a pointer to volatile uint16: the pointer branch
+   * above strips the `*` first and lands back here on the element. */
+  if (strncmp(name, "volatile ", 9) == 0) {
+    Type *base = type_checker_get_type_by_name(checker, name + 9);
+    if (base) {
+      return type_checker_volatile_of(checker, base);
+    }
+    return NULL;
   }
 
   // Check for user-defined types in symbol table

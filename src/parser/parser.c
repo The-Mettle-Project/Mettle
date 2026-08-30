@@ -689,6 +689,8 @@ typedef struct {
   int is_noalloc;         // `@noalloc`
   int is_test;            // `@test`: compile-time unit test (mettle test)
   int is_swappable;       // `@swappable`: may be replaced at a `quiesce` point
+  int is_naked;
+  int is_interrupt;
   int simd_mode; // SimdAttr from `@simd` / `@simd!` (SIMD_ATTR_NONE if absent)
   int unroll_factor; // `@unroll(n)` on a loop; 0 if absent
 } ParsedDecorators;
@@ -706,6 +708,8 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->is_noalloc = 0;
   out->is_test = 0;
   out->is_swappable = 0;
+  out->is_naked = 0;
+  out->is_interrupt = 0;
   out->simd_mode = SIMD_ATTR_NONE;
   out->unroll_factor = 0;
 
@@ -764,6 +768,20 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
       }
       out->is_swappable = 1;
       parser_advance(parser);
+    } else if (strcmp(name, "naked") == 0) {
+      if (out->is_naked) {
+        parser_set_error(parser, "Duplicate '@naked' decorator");
+        return 0;
+      }
+      out->is_naked = 1;
+      parser_advance(parser);
+    } else if (strcmp(name, "interrupt") == 0) {
+      if (out->is_interrupt) {
+        parser_set_error(parser, "Duplicate '@interrupt' decorator");
+        return 0;
+      }
+      out->is_interrupt = 1;
+      parser_advance(parser);
     } else if (strcmp(name, "simd") == 0) {
       if (out->simd_mode != SIMD_ATTR_NONE) {
         parser_set_error(parser, "Duplicate '@simd' decorator");
@@ -804,8 +822,8 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
     } else {
       parser_set_error(parser,
                        "Unknown decorator after '@' (expected 'inline', "
-                       "'noinline', 'pure', 'noalloc', 'test', 'simd', or "
-                       "'unroll')");
+                       "'noinline', 'pure', 'noalloc', 'test', 'naked', "
+                       "'interrupt', 'simd', or 'unroll')");
       return 0;
     }
   }
@@ -880,7 +898,23 @@ ASTNode *parser_parse_declaration(Parser *parser) {
     fd->is_noalloc = decos.is_noalloc;
     fd->is_test = decos.is_test;
     fd->is_swappable = decos.is_swappable;
+    fd->is_naked = decos.is_naked;
+    fd->is_interrupt = decos.is_interrupt;
     fd->simd_mode = decos.simd_mode;
+    if (fd->is_naked && fd->is_interrupt) {
+      parser_set_error(parser,
+                       "'@naked' and '@interrupt' are mutually exclusive: an "
+                       "interrupt handler needs the entry stub '@naked' "
+                       "removes");
+      ast_destroy_node(decl);
+      return NULL;
+    }
+    if ((fd->is_naked || fd->is_interrupt) && fd->is_inline) {
+      parser_set_error(parser,
+                       "'@naked' and '@interrupt' functions cannot be inlined");
+      ast_destroy_node(decl);
+      return NULL;
+    }
     return decl;
   }
 
@@ -2211,6 +2245,36 @@ static char *parser_parse_type_annotation(Parser *parser) {
     return NULL;
 
   char *type_name = NULL;
+
+  /* `volatile T`: every access to a T is observable in itself, so none may be
+   * removed, merged, reordered against another volatile access, or served from
+   * a register. Spelled as a prefix qualifier and carried in the type text. */
+  if (parser_is_identifier_like(parser->current_token.type) &&
+      parser->current_token.value &&
+      strcmp(parser->current_token.value, "volatile") == 0 &&
+      parser->peek_token.type != TOKEN_COLON &&
+      parser->peek_token.type != TOKEN_COMMA &&
+      parser->peek_token.type != TOKEN_RPAREN) {
+    parser_advance(parser);
+    {
+      char *inner = parser_parse_type_annotation(parser);
+      char *qualified = NULL;
+      if (!inner) {
+        return NULL;
+      }
+      if (strncmp(inner, "volatile ", 9) == 0) {
+        return inner;
+      }
+      qualified = malloc(strlen(inner) + 10);
+      if (!qualified) {
+        free(inner);
+        return NULL;
+      }
+      sprintf(qualified, "volatile %s", inner);
+      free(inner);
+      return qualified;
+    }
+  }
 
   /* Function pointer type: fn(param_types) -> return_type (thin), or
    * Fn(param_types) -> return_type (a stateful closure type). */
@@ -5688,78 +5752,111 @@ ASTNode *parser_parse_inline_asm(Parser *parser) {
     return NULL;
 
   SourceLocation location = parser_current_location(parser);
-  // Expect 'asm' keyword
   if (!parser_expect(parser, TOKEN_ASM)) {
     return NULL;
   }
 
-  // Expect '{'
-  if (!parser_expect(parser, TOKEN_LBRACE)) {
+  if (!parser_match(parser, TOKEN_LBRACE)) {
+    parser_set_error(parser, "expected '{' to open an asm block");
     return NULL;
   }
 
-  // Collect all tokens until we hit the closing '}'
-  // We need to preserve the exact assembly code as a string
-  char *assembly_code = malloc(1024); // Start with 1KB buffer
-  size_t buffer_size = 1024;
-  size_t code_length = 0;
+  const char *source = parser->lexer->source;
+  if (!source || !parser->current_token.lexeme.data) {
+    parser_set_error(parser, "asm block source text is unavailable");
+    return NULL;
+  }
 
+  size_t open_offset = (size_t)(parser->current_token.lexeme.data - source);
+  size_t scan = open_offset + 1;
+  size_t start_line = parser->current_token.line;
+  int depth = 1;
+  size_t line = start_line;
+
+  while (source[scan] && depth > 0) {
+    char c = source[scan];
+    if (c == '\n') {
+      line++;
+      scan++;
+      continue;
+    }
+    if (c == ';' || (c == '/' && source[scan + 1] == '/')) {
+      while (source[scan] && source[scan] != '\n') {
+        scan++;
+      }
+      continue;
+    }
+    if (c == '/' && source[scan + 1] == '*') {
+      scan += 2;
+      while (source[scan] && !(source[scan] == '*' && source[scan + 1] == '/')) {
+        if (source[scan] == '\n') {
+          line++;
+        }
+        scan++;
+      }
+      if (source[scan]) {
+        scan += 2;
+      }
+      continue;
+    }
+    if (c == '\'' || c == '"') {
+      char quote = c;
+      scan++;
+      while (source[scan] && source[scan] != quote) {
+        if (source[scan] == '\\' && source[scan + 1]) {
+          scan++;
+        } else if (source[scan] == '\n') {
+          line++;
+        }
+        scan++;
+      }
+      if (source[scan]) {
+        scan++;
+      }
+      continue;
+    }
+    if (c == '{') {
+      depth++;
+    } else if (c == '}') {
+      depth--;
+      if (depth == 0) {
+        break;
+      }
+    }
+    scan++;
+  }
+
+  if (depth != 0) {
+    parser_set_error(parser, "unterminated asm block: expected '}'");
+    return NULL;
+  }
+
+  size_t body_length = scan - (open_offset + 1);
+  char *assembly_code = (char *)malloc(body_length + 1);
   if (!assembly_code) {
     parser_set_error(parser, "Memory allocation failed");
     return NULL;
   }
+  memcpy(assembly_code, source + open_offset + 1, body_length);
+  assembly_code[body_length] = '\0';
 
-  assembly_code[0] = '\0';
+  token_destroy(&parser->current_token);
+  token_destroy(&parser->peek_token);
+  memset(&parser->current_token, 0, sizeof(parser->current_token));
+  memset(&parser->peek_token, 0, sizeof(parser->peek_token));
 
-  size_t last_token_line = 0;
+  parser->lexer->position = scan + 1;
+  parser->lexer->line = line;
+  parser->lexer->column = 1;
+  parser->lexer->continuation_depth = 0;
+  parser->lexer->last_significant = TOKEN_RBRACE;
+  parser->current_token = lexer_next_token(parser->lexer);
+  parser->peek_token = lexer_next_token(parser->lexer);
+  parser->previous_token_type = TOKEN_RBRACE;
+  snprintf(parser->previous_token_text, sizeof(parser->previous_token_text),
+           "}");
 
-  while (parser->current_token.type != TOKEN_RBRACE &&
-         parser->current_token.type != TOKEN_EOF && !parser->has_error) {
-
-    // Add the token value to our assembly code string
-    if (parser->current_token.value) {
-      size_t token_len = strlen(parser->current_token.value);
-
-      // Check if we need to expand the buffer
-      if (code_length + token_len + 2 >=
-          buffer_size) { // +2 for separator and null terminator
-        buffer_size *= 2;
-        assembly_code = realloc(assembly_code, buffer_size);
-        if (!assembly_code) {
-          parser_set_error(parser, "Memory allocation failed");
-          return NULL;
-        }
-      }
-
-      // Add a separator before the token if we already have content
-      if (code_length > 0) {
-        if (last_token_line != 0 &&
-            parser->current_token.line > last_token_line) {
-          assembly_code[code_length] = '\n';
-        } else {
-          assembly_code[code_length] = ' ';
-        }
-        code_length++;
-      }
-
-      // Copy the token value
-      strcpy(assembly_code + code_length, parser->current_token.value);
-      code_length += token_len;
-    }
-
-    last_token_line = parser->current_token.line;
-    parser_advance(parser);
-  }
-
-  // Expect '}'
-  if (!parser_expect(parser, TOKEN_RBRACE)) {
-    free(assembly_code);
-    return NULL;
-  }
-
-  // Create inline assembly node
   ASTNode *inline_asm = ast_create_inline_asm(assembly_code, location);
-
   free(assembly_code);
   return inline_asm;
 }

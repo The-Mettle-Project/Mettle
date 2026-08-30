@@ -171,6 +171,23 @@ typedef struct {
   size_t capacity;
 } BinaryCallRelocationTable;
 
+/* A symbol reference an inline `asm` block left behind. Unlike a call
+ * relocation these carry their own kind and addend, because an asm block can
+ * name a symbol as a rip-relative operand, an absolute 8-byte pointer, or the
+ * target of a branch, and each needs a different fixup. */
+typedef struct {
+  char *symbol_name;
+  size_t offset;
+  int kind;
+  int32_t addend;
+} BinaryAsmRelocation;
+
+typedef struct {
+  BinaryAsmRelocation *items;
+  size_t count;
+  size_t capacity;
+} BinaryAsmRelocationTable;
+
 typedef struct {
   size_t *items;
   size_t count;
@@ -263,6 +280,7 @@ typedef struct {
   BinaryLabelTable labels;
   BinaryLabelFixupTable label_fixups;
   BinaryCallRelocationTable call_relocations;
+  BinaryAsmRelocationTable asm_relocations;
   BinaryOffsetTable return_fixups;
   /* Up to 8 callee-saved GP regs: RBX, RSI, RDI, R12..R15, and RBP (the last
    * only when the frame pointer is omitted and rbp joins the allocatable pool). */
@@ -846,6 +864,16 @@ int code_generator_binary_function_temp_use_count( const IRFunction *function, c
 int code_generator_binary_get_access_size(CodeGenerator *generator, BinaryFunctionContext *context, const IROperand *size_operand);
 int code_generator_binary_get_local_offset(BinaryFunctionContext *context, const char *name);
 int code_generator_binary_get_parameter_offset( BinaryFunctionContext *context, const char *name);
+int binary_asm_relocation_table_add(BinaryAsmRelocationTable *table, const char *symbol_name, size_t offset, int kind, int32_t addend);
+void binary_asm_relocation_table_destroy(BinaryAsmRelocationTable *table);
+int code_generator_binary_assemble_text(CodeGenerator *generator, BinaryFunctionContext *context, const char *text, int bits, int allow_bits_directive, const SourceLocation *location, int *final_bits_out);
+int code_generator_binary_emit_inline_asm(CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int ir_function_has_inline_asm(const IRFunction *function);
+int code_generator_emit_binary_naked_function(CodeGenerator *generator, IRFunction *ir_function, BinaryFunctionContext *context);
+int code_generator_binary_check_interrupt_signature(CodeGenerator *generator, IRFunction *ir_function);
+int code_generator_binary_emit_interrupt_entry(CodeGenerator *generator, IRFunction *ir_function, BinaryFunctionContext *context);
+int code_generator_binary_emit_interrupt_exit(CodeGenerator *generator, IRFunction *ir_function, BinaryFunctionContext *context);
+int code_generator_emit_binary_function_x86_16(CodeGenerator *generator, IRFunction *ir_function, BinaryFunctionContext *context);
 int code_generator_binary_get_symbol_offset(BinaryFunctionContext *context, const char *name);
 int code_generator_binary_get_temp_offset(BinaryFunctionContext *context, const char *name);
 int code_generator_binary_global_is_written(IRProgram *ir_program, const char *name);

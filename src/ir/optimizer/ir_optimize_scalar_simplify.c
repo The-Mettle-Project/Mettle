@@ -3121,6 +3121,12 @@ int ir_instruction_has_side_effect(const IRInstruction *instruction) {
     return 0;
   }
 
+  /* A volatile access is observable in itself, so it counts as an effect even
+   * when it is a load whose value nothing reads. */
+  if (instruction->is_volatile) {
+    return 1;
+  }
+
   switch (instruction->op) {
   case IR_OP_BARRIER:
   case IR_OP_ASYNC_COPY:

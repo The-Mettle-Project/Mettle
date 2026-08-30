@@ -35,9 +35,26 @@ the backend one program, so you never compile imported files separately.
 | `--emit-arm64-obj` | An AArch64 relocatable object. The default on an ARM host. |
 | `--emit-ptx` | Declared kernels as NVIDIA PTX. |
 | `--emit-spirv` | Declared kernels as OpenCL SPIR-V. |
+| `--emit-flat <file>` | A raw image with no container, laid out at `--image-base`. |
 
 [Linker and build pipelines](linker-build-pipelines.md) covers which linker
 runs for each combination. [GPU offload](gpu.md) covers the device targets.
+
+## Which machine
+
+| Option | Effect |
+|--------|--------|
+| `--target <triple>` | Compile for another machine. |
+| `--image-base <addr>` | Where the linked image loads, replacing the format's default. |
+
+The triples are `x86_64-windows`, `x86_64-linux`, `x86_64-none`,
+`aarch64-linux`, `aarch64-none`, `i386-none`, `i686-none`, and `i8086-none`. A
+trailing vendor or environment is accepted and ignored, so
+`x86_64-unknown-linux-gnu` selects `x86_64-linux`. The 16- and 32-bit targets
+emit a flat image only.
+
+[Bare metal](bare-metal.md) covers cross-compilation, flat images, and 16-bit
+code generation.
 
 ## Optimization
 

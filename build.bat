@@ -146,6 +146,7 @@ if not exist obj\ir mkdir obj\ir
 if not exist obj\ir\optimizer mkdir obj\ir\optimizer
 if not exist obj\codegen mkdir obj\codegen
 if not exist obj\codegen\binary mkdir obj\codegen\binary
+if not exist obj\codegen\asm mkdir obj\codegen\asm
 if not exist obj\linker mkdir obj\linker
 if not exist obj\debug mkdir obj\debug
 if not exist obj\error mkdir obj\error
@@ -197,7 +198,8 @@ call :cc src\semantic\monomorphize.c obj\semantic\monomorphize.o
 for %%f in (src\ir\*.c) do call :cc "%%f" "obj\ir\%%~nf.o"
 for %%f in (src\ir\optimizer\*.c) do call :cc "%%f" "obj\ir\optimizer\%%~nf.o"
 
-for %%f in (src\codegen\binary_emitter.c src\codegen\code_generator.c src\codegen\elf_emitter.c src\codegen\gpu_detect.c src\codegen\ptx_emitter.c src\codegen\spirv_emitter.c) do call :cc "%%f" "obj\codegen\%%~nf.o"
+for %%f in (src\codegen\binary_emitter.c src\codegen\code_generator.c src\codegen\elf_emitter.c src\codegen\gpu_detect.c src\codegen\ptx_emitter.c src\codegen\spirv_emitter.c src\codegen\target.c src\codegen\flat_emitter.c) do call :cc "%%f" "obj\codegen\%%~nf.o"
+for %%f in (src\codegen\asm\*.c) do call :cc "%%f" "obj\codegen\asm\%%~nf.o"
 for %%f in (src\codegen\binary\*.c) do call :cc "%%f" "obj\codegen\binary\%%~nf.o"
 for %%f in (src\linker\*.c) do call :cc "%%f" "obj\linker\%%~nf.o"
 
@@ -314,7 +316,8 @@ for %%o in (obj\ir\optimizer\*.o) do call set "AROBJS=%%AROBJS%% %%o"
 %AR% rcs bin\mtlc.lib %AROBJS%
 if errorlevel 1 exit /b 1
 
-set "AROBJS=obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\gpu_detect.o obj\codegen\ptx_emitter.o obj\codegen\spirv_emitter.o"
+set "AROBJS=obj\codegen\binary_emitter.o obj\codegen\code_generator.o obj\codegen\elf_emitter.o obj\codegen\gpu_detect.o obj\codegen\ptx_emitter.o obj\codegen\spirv_emitter.o obj\codegen\target.o obj\codegen\flat_emitter.o"
+for %%o in (obj\codegen\asm\*.o) do call set "AROBJS=%%AROBJS%% %%o"
 for %%o in (obj\codegen\binary\*.o) do call set "AROBJS=%%AROBJS%% %%o"
 %AR% rcs bin\mtlc.lib %AROBJS%
 if errorlevel 1 exit /b 1

@@ -12,6 +12,8 @@
 #include "codegen/gpu_detect.h"
 #include "codegen/ptx_emitter.h"
 #include "codegen/spirv_emitter.h"
+#include "codegen/target.h"
+#include "codegen/flat_emitter.h"
 #include "linker/elf_image.h"
 #include "linker/pe_emitter.h"
 #include "string_intern.h"
@@ -591,7 +593,7 @@ static char *replace_extension(const char *path, const char *extension) {
  * format: a native AArch64 Linux build reports ELF_ARM64, and a test written
  * against ELF_X64 alone quietly hands it the Windows answer. */
 static int host_target_is_elf(void) {
-  BinaryTargetFormat format = binary_target_format_host_default();
+  BinaryTargetFormat format = mtlc_target()->format;
   return format == BINARY_TARGET_FORMAT_ELF_X64 ||
          format == BINARY_TARGET_FORMAT_ELF_ARM64;
 }
@@ -3713,6 +3715,52 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "--tracy-dir") == 0) {
       fprintf(stderr, "Error: Missing path after '--tracy-dir'\n");
       return 1;
+    } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+      char target_error[256];
+      options.target_triple = argv[++i];
+      if (!mtlc_target_select(options.target_triple, target_error,
+                              sizeof(target_error))) {
+        fprintf(stderr, "Error: %s\n", target_error);
+        return 1;
+      }
+      if (mtlc_target()->arch == MTLC_TARGET_ARCH_AARCH64) {
+        options.emit_arm64_obj = 1;
+      }
+    } else if (strcmp(argv[i], "--target") == 0) {
+      fprintf(stderr, "Error: Missing triple after '--target'; known targets "
+                      "are %s\n",
+              mtlc_target_triple_list());
+      return 1;
+    } else if (strncmp(argv[i], "--target=", 9) == 0) {
+      char target_error[256];
+      options.target_triple = argv[i] + 9;
+      if (!mtlc_target_select(options.target_triple, target_error,
+                              sizeof(target_error))) {
+        fprintf(stderr, "Error: %s\n", target_error);
+        return 1;
+      }
+      if (mtlc_target()->arch == MTLC_TARGET_ARCH_AARCH64) {
+        options.emit_arm64_obj = 1;
+      }
+    } else if (strcmp(argv[i], "--image-base") == 0 && i + 1 < argc) {
+      char *end = NULL;
+      unsigned long long base = strtoull(argv[++i], &end, 0);
+      if (!end || *end != '\0') {
+        fprintf(stderr, "Error: '--image-base' takes an address, e.g. 0x7c00\n");
+        return 1;
+      }
+      options.image_base = base;
+      options.image_base_set = 1;
+      mtlc_target_set_image_base(base);
+    } else if (strcmp(argv[i], "--image-base") == 0) {
+      fprintf(stderr, "Error: Missing address after '--image-base'\n");
+      return 1;
+    } else if (strcmp(argv[i], "--emit-flat") == 0 && i + 1 < argc) {
+      options.flat_output = argv[++i];
+      options.emit_object = 1;
+    } else if (strcmp(argv[i], "--emit-flat") == 0) {
+      fprintf(stderr, "Error: Missing output path after '--emit-flat'\n");
+      return 1;
     } else if (strcmp(argv[i], "--debug-compiler") == 0) {
       options.debug_compiler = 1;
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -3811,7 +3859,7 @@ int main(int argc, char *argv[]) {
   /* The native ELF backend supports --build on Linux via an ld-based link of
    * the emitted ELF object plus a self-contained _start. On Linux --build
    * always uses the direct-object backend (no asm/NASM path). */
-  BinaryTargetFormat host_format = binary_target_format_host_default();
+  BinaryTargetFormat host_format = mtlc_target()->format;
   int elf_build = host_format == BINARY_TARGET_FORMAT_ELF_X64 ||
                   host_format == BINARY_TARGET_FORMAT_ELF_ARM64;
 
@@ -5282,6 +5330,45 @@ int compile_file(const char *input_filename, const char *output_filename,
       result = 1;
       goto cleanup;
     }
+  } else if (options->flat_output) {
+    BinaryEmitter *binary_emitter =
+        code_generator_get_binary_emitter(code_generator);
+    const char *flat_entry_symbol = "main";
+    for (size_t fi = 0; fi < ir_program->function_count; fi++) {
+      if (ir_program->functions[fi] && ir_program->functions[fi]->name &&
+          strcmp(ir_program->functions[fi]->name, "_start") == 0) {
+        flat_entry_symbol = "_start";
+        break;
+      }
+    }
+    char flat_error[512] = {0};
+    const unsigned char boot_signature[2] = {0x55, 0xAA};
+    const unsigned char *trailer = NULL;
+    size_t pad_to = 0;
+    size_t trailer_size = 0;
+    /* A flat image loaded at 0x7C00 is a boot sector by definition: the
+     * firmware reads exactly 512 bytes and refuses them without the signature
+     * in the last two, so the compiler writes both rather than making every
+     * caller remember. */
+    if (mtlc_target()->image_base == 0x7C00ull) {
+      pad_to = 512;
+      trailer = boot_signature;
+      trailer_size = sizeof(boot_signature);
+    }
+    if (!binary_emitter_write_flat(binary_emitter, options->flat_output,
+                                   mtlc_target()->image_base,
+                                   flat_entry_symbol, pad_to, 0x00, trailer,
+                                   trailer_size, flat_error,
+                                   sizeof(flat_error))) {
+      compiler_profile_add(&profile, PROFILE_PHASE_WRITE_OUTPUT, phase_start);
+      fprintf(stderr, "Error: Could not create flat image '%s': %s\n",
+              options->flat_output,
+              flat_error[0] ? flat_error : "Unknown error");
+      result = 1;
+      goto cleanup;
+    }
+    fprintf(stderr, "Wrote flat image '%s' at 0x%llx\n", options->flat_output,
+            (unsigned long long)mtlc_target()->image_base);
   } else {
     BinaryEmitter *binary_emitter =
         code_generator_get_binary_emitter(code_generator);
@@ -5431,6 +5518,18 @@ void print_usage(const char *program_name) {
   printf("  --build             Compile and link to an executable (COFF/PE on "
          "Windows, ELF on Linux)\n");
   printf("  --emit-obj          Emit a native object directly (default)\n");
+  printf("  --target <triple>   Compile for another machine: x86_64-windows,\n"
+         "                      x86_64-linux, x86_64-none, aarch64-linux,\n"
+         "                      aarch64-none, i386-none, i686-none,\n"
+         "                      i8086-none. The 16- and 32-bit targets emit a\n"
+         "                      flat image only (--emit-flat)\n");
+  printf("  --image-base <addr> Load address of the linked image, replacing "
+         "the\n"
+         "                      format's default (e.g. 0x7c00 for a boot "
+         "sector)\n");
+  printf("  --emit-flat <file>  Write a raw image with no object or executable\n"
+         "                      container, laid out at --image-base. At 0x7c00\n"
+         "                      it is padded to 512 bytes and signed 0x55AA\n");
   printf("  --emit-arm64        Emit a self-contained AArch64 Linux "
          "executable\n");
   printf("  --emit-arm64-obj    Emit an AArch64 relocatable object (link it "

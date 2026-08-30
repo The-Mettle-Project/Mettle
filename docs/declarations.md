@@ -220,6 +220,8 @@ A decorator sits before a declaration and asks the compiler for something.
 | `@simd` | Report whether this loop vectorized |
 | `@unroll(n)` | Unroll this loop n times |
 | `@test` | A compile-time test, run by `mettle test` |
+| `@naked` | No prologue, no frame, no epilogue; the body is `asm` only |
+| `@interrupt` | Entered by the CPU; the compiler emits the save/restore and `iretq` |
 
 ```mettle
 @inline fn hot(x: int32) -> int32 { return x * 3; }
@@ -235,6 +237,9 @@ defeated it. Vectorization contracts are only checked when optimization is on:
 note: 1 `@simd` loop present but not verified; vectorization contracts are
 only checked with -O/--release
 ```
+
+`@naked` and `@interrupt` are for code the operating system is not running.
+[Bare metal](bare-metal.md) covers both, along with inline assembly.
 
 [Compilation](compilation.md) covers the flags, and
 [`--explain`](compilation.md) reports what each decision came to.

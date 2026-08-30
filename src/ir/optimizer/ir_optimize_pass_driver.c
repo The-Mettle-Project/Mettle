@@ -243,9 +243,40 @@ static int ir_no_simd_enabled(void) {
   return v;
 }
 
+/* A signature over the function's volatile accesses: how many there are, in
+ * what order, and at what width. A pass that drops one, invents one, or swaps
+ * two of them has broken the one guarantee `volatile` makes, and the program
+ * would be silently wrong. Comparing the signature across a pass turns that
+ * into a compiler error naming the pass. Only functions that hold a volatile
+ * access pay for this. */
+static unsigned long long ir_volatile_signature(const IRFunction *function) {
+  unsigned long long signature = 1469598103934665603ULL;
+  size_t i;
+  if (!function) {
+    return signature;
+  }
+  for (i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    unsigned long long token;
+    if (!instruction->is_volatile) {
+      continue;
+    }
+    token = (unsigned long long)instruction->op * 131ULL +
+            (unsigned long long)instruction->alias_class * 17ULL +
+            (instruction->rhs.kind == IR_OPERAND_INT
+                 ? (unsigned long long)instruction->rhs.int_value
+                 : 0ULL);
+    signature = (signature ^ token) * 1099511628211ULL;
+  }
+  return signature;
+}
+
 static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
                              const char *failure_message, int *changed_out) {
   int changed = 0;
+  int audit_volatile = function && function->has_volatile_access;
+  unsigned long long volatile_before =
+      audit_volatile ? ir_volatile_signature(function) : 0;
 
   if (changed_out) {
     *changed_out = 0;
@@ -279,6 +310,16 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
   }
   ir_pass_time_end(pass->name, t0);
   ir_explain_pass_end(function, pass->name, changed);
+
+  if (audit_volatile && ir_volatile_signature(function) != volatile_before) {
+    char message[256];
+    snprintf(message, sizeof(message),
+             "optimization pass '%s' changed the volatile accesses in '%s'; a "
+             "volatile load or store may not be removed, duplicated or "
+             "reordered against another",
+             pass->name, function->name ? function->name : "<unnamed>");
+    mettle_compiler_ice(message);
+  }
 
   if (verify_snapshot) {
     ir_verify_maybe_sabotage(function, pass->name, &changed);

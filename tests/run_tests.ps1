@@ -406,6 +406,48 @@ $cases = @(
     )
   },
   @{ Name = "only_struct"; Path = "tests/only_struct.mettle"; ShouldSucceed = $true },
+  @{
+    Name          = "inline_asm"
+    Path          = "tests/test_inline_asm.mettle"
+    ShouldSucceed = $true
+  },
+  @{
+    Name          = "inline_asm_release"
+    Path          = "tests/test_inline_asm.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--emit-obj")
+    SkipRunDiff   = $true
+  },
+  @{
+    Name          = "naked_interrupt"
+    Path          = "tests/test_naked_interrupt.mettle"
+    ShouldSucceed = $true
+  },
+  @{
+    Name          = "volatile_accesses"
+    Path          = "tests/test_volatile.mettle"
+    ShouldSucceed = $true
+  },
+  @{
+    Name           = "volatile_survives_release"
+    Path           = "tests/test_volatile.mettle"
+    ShouldSucceed  = $true
+    Args           = @("--release", "--emit-obj", "--dump-ir")
+    IrMustMatch    = @("volatile")
+    SkipRunDiff    = $true
+  },
+  @{
+    Name          = "asm_block_diagnoses_bad_mnemonic"
+    Path          = "tests/err_asm_unknown_instruction.mettle"
+    ShouldSucceed = $false
+    Pattern       = "unknown instruction"
+  },
+  @{
+    Name          = "naked_body_must_be_asm"
+    Path          = "tests/err_naked_has_statements.mettle"
+    ShouldSucceed = $false
+    Pattern       = "may hold only .asm. blocks"
+  },
   @{ Name = "array_index"; Path = "tests/test_array_index.mettle"; ShouldSucceed = $true },
   @{ Name = "control_flow"; Path = "tests/test_control_flow.mettle"; ShouldSucceed = $true },
   @{ Name = "nested_switch_loop"; Path = "tests/test_nested_switch_loop.mettle"; ShouldSucceed = $true },
@@ -5596,7 +5638,7 @@ exe="$1"; work="$2"
 fifo="$work/dbg.fifo"
 out="$work/announced.txt"
 rm -f "$fifo"; : > "$out"; mkfifo "$fifo"
-( timeout 25 cat "$fifo" > "$out" ) &
+( timeout 40 cat "$fifo" > "$out" ) &
 drain=$!
 exec 8> "$fifo"
 METTLE_DBG_PIPE="$fifo" "$exe" > "$work/prog.txt" 2>&1 &
@@ -5610,12 +5652,15 @@ await() {
   done
   return 1
 }
-await hello
+settle() {
+  i=0
+  while kill -0 $prog 2>/dev/null && [ $i -lt "$1" ]; do sleep 0.05; i=$((i+1)); done
+}
+await tablesdone
 printf 'continue\n' >&8
-await debug_demo
+settle 40
 printf 'detach\n' >&8
-i=0
-while kill -0 $prog 2>/dev/null && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+settle 100
 kill -9 $prog 2>/dev/null
 exec 8>&-
 wait $drain 2>/dev/null
@@ -13719,6 +13764,84 @@ else {
   catch {
     $failed++
     Write-CaseResult -Name "calc_frontend" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# x86 assembler gate: every encoding the inline assembler produces, in all three
+# operand widths, checked against hand-verified bytes. An assembler that quietly
+# encodes the wrong instruction is the one failure an `asm` block cannot survive.
+if (-not $calcGcc) {
+  Write-Host "[SKIP] x86_asm_encodings (gcc not found)"
+}
+elseif (-not (Test-Path $script:BackendArchive)) {
+  Write-Host "[SKIP] x86_asm_encodings ($script:BackendArchive not present)"
+}
+else {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $asmTestExe = Join-Path $tmpDir "x86_asm_encode_test.exe"
+    $asmTestArgs = @("-Wall", "-Wextra", "-std=c99", "-Isrc", "-Iinclude",
+                     "tests/x86_asm_encode_test.c",
+                     $script:BackendArchive,
+                     "-o", $asmTestExe) + $script:HostSymbolizerLibs
+    $buildOut = & $calcGcc.Source @asmTestArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "building x86_asm_encode_test failed: $buildOut"
+    }
+    $runOut = & $asmTestExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "x86_asm_encode_test failed: $runOut"
+    }
+    Write-CaseResult -Name "x86_asm_encodings" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "x86_asm_encodings" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# 16-bit gate: compile a boot sector out of Mettle, then EXECUTE it in a
+# real-mode emulator and check what it printed through the BIOS. Bytes that
+# merely look right are not evidence that real-mode code runs.
+if (-not $calcGcc) {
+  Write-Host "[SKIP] boot_sector_runs (gcc not found)"
+}
+else {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $bootImage = Join-Path $tmpDir "boot_sector.bin"
+    if (Test-Path $bootImage) { Remove-Item -Path $bootImage -Force }
+    $bootArgs = @("tests/test_boot_sector.mettle", "--target", "i8086-none",
+                  "--image-base", "0x7c00", "--emit-flat", $bootImage)
+    $bootOut = & $CompilerPath @bootArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $bootImage)) {
+      throw "compiling the boot sector failed: $bootOut"
+    }
+    $imageBytes = [System.IO.File]::ReadAllBytes($bootImage)
+    if ($imageBytes.Length -ne 512) {
+      throw "boot image is $($imageBytes.Length) bytes, expected 512"
+    }
+    if ($imageBytes[510] -ne 0x55 -or $imageBytes[511] -ne 0xAA) {
+      throw "boot image has no 0x55AA signature"
+    }
+    $emulatorExe = Join-Path $tmpDir "x86_16_emulator_test.exe"
+    $emulatorArgs = @("-Wall", "-Wextra", "-std=c99",
+                      "tests/x86_16_emulator_test.c", "-o", $emulatorExe)
+    $buildOut = & $calcGcc.Source @emulatorArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "building the real-mode emulator failed: $buildOut"
+    }
+    $runOut = & $emulatorExe $bootImage 'ABCDE\r\n' 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "the boot sector did not run as expected: $runOut"
+    }
+    Write-CaseResult -Name "boot_sector_runs" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "boot_sector_runs" -Passed $false -Reason $_.Exception.Message
   }
 }
 

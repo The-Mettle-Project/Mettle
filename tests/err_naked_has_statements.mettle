@@ -1,0 +1,11 @@
+@naked fn broken() {
+    var x: int32 = 1
+    asm {
+        ret
+    }
+}
+
+fn main() -> int32 {
+    broken()
+    return 0
+}

@@ -38,6 +38,8 @@ frontend can drive instead. The documentation is organized the same way.
 - [Linker and build pipelines](linker-build-pipelines.md): which linker runs
   when.
 - [Runtime model](runtime-model.md): what an emitted program assumes of the OS.
+- [Bare metal](bare-metal.md): inline assembly, `volatile`, `@naked` and
+  `@interrupt`, cross-compilation, a chosen link address, and 16-bit code.
 - [C interoperability](c-interop.md): calling out, being called, the struct
   ABI.
 

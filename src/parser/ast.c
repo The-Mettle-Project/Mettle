@@ -151,6 +151,8 @@ static ASTNode *ast_clone_method_declaration(ASTNode *clone, const ASTNode *node
   dst->is_noalloc = src->is_noalloc;
   dst->is_test = src->is_test;
   dst->is_swappable = src->is_swappable;
+  dst->is_naked = src->is_naked;
+  dst->is_interrupt = src->is_interrupt;
   dst->simd_mode = src->simd_mode;
   dst->captured_count = src->captured_count;
   dst->captured_names =
@@ -1719,6 +1721,8 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->is_noalloc = 0;
   func_decl->is_test = 0;
   func_decl->is_swappable = 0;
+  func_decl->is_naked = 0;
+  func_decl->is_interrupt = 0;
   func_decl->simd_mode = SIMD_ATTR_NONE;
   func_decl->captured_names = NULL;
   func_decl->captured_types = NULL;

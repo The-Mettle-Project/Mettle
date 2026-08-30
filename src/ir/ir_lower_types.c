@@ -244,6 +244,9 @@ void ir_access_apply_alias_class(IRInstruction *access, Type *accessed_type) {
   if (!access || !accessed_type) {
     return;
   }
+  if (accessed_type->is_volatile) {
+    access->is_volatile = 1;
+  }
   switch (accessed_type->kind) {
   case TYPE_POINTER:
   case TYPE_FUNCTION_POINTER:

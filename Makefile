@@ -60,6 +60,9 @@ CODEGEN_SOURCES = \
 	$(SRCDIR)/codegen/gpu_detect.c \
 	$(SRCDIR)/codegen/ptx_emitter.c \
 	$(SRCDIR)/codegen/spirv_emitter.c \
+	$(SRCDIR)/codegen/target.c \
+	$(SRCDIR)/codegen/flat_emitter.c \
+	$(wildcard $(SRCDIR)/codegen/asm/*.c) \
 	$(wildcard $(SRCDIR)/codegen/binary/*.c)
 LINKER_SOURCES = $(wildcard $(SRCDIR)/linker/*.c)
 # error_reporter.c is frontend-NEUTRAL (renders against raw source text +

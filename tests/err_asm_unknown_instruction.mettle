@@ -1,0 +1,6 @@
+fn main() -> int32 {
+    asm {
+        frobnicate rax, rbx
+    }
+    return 0
+}

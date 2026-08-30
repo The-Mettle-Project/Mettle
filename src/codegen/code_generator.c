@@ -4,6 +4,7 @@
  * frontend AST/TypeChecker/SymbolTable. */
 #include "code_generator_internal.h"
 #include "compiler/compiler_context.h"
+#include "codegen/target.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -33,7 +34,7 @@ CodeGenerator *code_generator_create(void) {
   generator->profile_function_count = 0;
   generator->profile_function_capacity = 0;
   generator->binary_emitter =
-      binary_emitter_create(binary_target_format_host_default());
+      binary_emitter_create(mtlc_target()->format);
 
   if (!generator->binary_emitter) {
     free(generator);

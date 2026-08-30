@@ -501,6 +501,10 @@ typedef struct {
    * bits clean, so the 64-bit ops the fallback emits (compare, divide, (int64)
    * widening) see the true value instead of a sign-extended one. */
   int is_unsigned;
+  /* Set on a LOAD or STORE whose pointee type is `volatile`. The access is
+   * observable in itself: it is never removed, never merged with another
+   * access, never hoisted out of a loop and never served from a register. */
+  int is_volatile;
   /* This instruction allocates heap memory at runtime even though its opcode
    * doesn't say so (today: string '+' concatenation, which codegen lowers to a
    * heap-allocating kernel). Set by ir_lowering, consumed by the `@noalloc`
@@ -638,6 +642,17 @@ typedef struct {
    * to redirect and no boundary to name. Opting in is what buys that, so a
    * function without the decorator pays nothing. */
   int is_swappable;
+  /* `@naked`: emitted with no prologue, no epilogue and no frame. The body is
+   * inline assembly only. */
+  int is_naked;
+  /* `@interrupt`: reached by the CPU on an interrupt or exception. The entry
+   * saves every general-purpose register, calls the body, restores them and
+   * returns with iret. */
+  int is_interrupt;
+  /* Set the moment a volatile load or store is appended, and never cleared.
+   * The optimizer driver uses it to decide whether a function is worth
+   * auditing for dropped, duplicated or reordered volatile accesses. */
+  int has_volatile_access;
   int is_kernel;          // GPU entry point; ordinary functions are not entries
   /* `export fn`: visible outside this compilation. Two things follow. Its
    * object symbol stays global where an internal function's is local, and it

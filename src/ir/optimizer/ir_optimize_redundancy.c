@@ -939,6 +939,11 @@ static int re_instruction_write_region(const IRFunction *function,
 
 static int re_load_key(const REWalk *walk, const IRInstruction *ins,
                        char *key, size_t size, REAddr *addr) {
+  /* No two volatile reads of the same address are the same read, so a volatile
+   * load never gets a key and is never served from a cached value. */
+  if (ins->is_volatile) {
+    return 0;
+  }
   if (ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name ||
       ins->rhs.kind != IR_OPERAND_INT) {
     return 0;
@@ -2136,8 +2141,9 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
       IRInstruction *load = &function->instructions[i];
       REAddr addr = {0};
       char membuf[RE_NAME_MAX + 1];
-      if (load->op != IR_OP_LOAD || load->dest.kind != IR_OPERAND_TEMP ||
-          !load->dest.name || load->rhs.kind != IR_OPERAND_INT) {
+      if (load->op != IR_OP_LOAD || load->is_volatile ||
+          load->dest.kind != IR_OPERAND_TEMP || !load->dest.name ||
+          load->rhs.kind != IR_OPERAND_INT) {
         continue;
       }
       re_resolve_addr(function, &defs, &load->lhs, &addr, 0);

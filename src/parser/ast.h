@@ -154,6 +154,8 @@ typedef struct {
   // swap possible, so a function without it pays nothing and can be proven
   // to have paid nothing.
   int is_swappable;
+  int is_naked;
+  int is_interrupt;
   int simd_mode;          // SimdAttr applied as the default to every body loop
   // Closure conversion metadata (set on AST_LAMBDA_EXPRESSION nodes only). A
   // capturing lambda records the variables it captures by value, their types,

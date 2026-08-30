@@ -1,0 +1,43 @@
+@naked fn _start() {
+    asm {
+        bits 16
+        cli
+        xor ax, ax
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov sp, 0x7c00
+        sti
+        call main
+        cli
+    halt:
+        hlt
+        jmp halt
+    }
+}
+
+fn putchar(c: int16) -> int16 {
+    asm {
+        mov ax, {c}
+        mov ah, 0x0e
+        mov bx, 7
+        int 0x10
+    }
+    return c
+}
+
+fn print_letters(count: int16) -> int16 {
+    var i: int16 = 0
+    while (i < count) {
+        putchar((int16)(65 + i))
+        i = (int16)(i + 1)
+    }
+    return i
+}
+
+fn main() -> int16 {
+    print_letters(5)
+    putchar(13)
+    putchar(10)
+    return 0
+}
