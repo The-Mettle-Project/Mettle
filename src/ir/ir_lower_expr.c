@@ -1248,6 +1248,984 @@ static int ir_try_load_aggregate_by_value(IRLoweringContext *context,
   return 1;
 }
 
+  /* `==` / `!=` on strings compare contents. The generic binary path would
+   * compare the 16-byte record as a scalar, which answered no for two views
+   * of the same bytes and compiled without a word, so `if (input == "quit")`
+   * was a branch that never ran. Contents also match `+`, which already
+   * concatenates bytes rather than pointers. */
+static int ir_lower_string_compare(IRLoweringContext *context,
+                       IRFunction *function, ASTNode *expression,
+                       BinaryExpression *binary,
+                       IROperand *out_value, int *handled) {
+  *handled = 1;
+  if (strcmp(binary->operator, "==") == 0 ||
+      strcmp(binary->operator, "!=") == 0) {
+    Type *left_type =
+        type_checker_infer_type(context->type_checker, binary->left);
+    Type *right_type =
+        type_checker_infer_type(context->type_checker, binary->right);
+    if (left_type && right_type && left_type->kind == TYPE_STRING &&
+        right_type->kind == TYPE_STRING) {
+      IROperand left = ir_operand_none();
+      IROperand right = ir_operand_none();
+      IROperand equal = ir_operand_none();
+      if (!ir_lower_expression(context, function, binary->left, &left)) {
+        return 0;
+      }
+      if (!ir_lower_expression(context, function, binary->right, &right)) {
+        ir_operand_destroy(&left);
+        return 0;
+      }
+      if (!ir_make_temp_operand(context, &equal)) {
+        ir_operand_destroy(&right);
+        ir_operand_destroy(&left);
+        return 0;
+      }
+
+      IROperand call_args[2];
+      call_args[0] = left;
+      call_args[1] = right;
+      IRInstruction call = {0};
+      call.op = IR_OP_CALL;
+      call.location = expression->location;
+      call.dest = equal;
+      call.text = "mettle_string_eq";
+      call.arguments = call_args;
+      call.argument_count = 2;
+      int call_ok = ir_emit(context, function, &call);
+      ir_operand_destroy(&right);
+      ir_operand_destroy(&left);
+      if (!call_ok) {
+        ir_operand_destroy(&equal);
+        return 0;
+      }
+
+      if (strcmp(binary->operator, "==") == 0) {
+        *out_value = equal;
+        return 1;
+      }
+
+      /* `!=` is the same answer inverted, and inverting it here keeps the
+       * runtime surface to one function. */
+      IROperand negated = ir_operand_none();
+      if (!ir_make_temp_operand(context, &negated)) {
+        ir_operand_destroy(&equal);
+        return 0;
+      }
+      IRInstruction invert = {0};
+      invert.op = IR_OP_BINARY;
+      invert.location = expression->location;
+      invert.dest = negated;
+      invert.lhs = equal;
+      invert.rhs = ir_operand_int(0);
+      invert.text = "==";
+      int invert_ok = ir_emit(context, function, &invert);
+      ir_operand_destroy(&equal);
+      if (!invert_ok) {
+        ir_operand_destroy(&negated);
+        return 0;
+      }
+      *out_value = negated;
+      return 1;
+    }
+  }
+  *handled = 0;
+  return 1;
+}
+
+  // Keep string concatenation in AST form for codegen. The current IR binary
+  // fallback models '+' as integer arithmetic, which is invalid for string
+  // records.
+static int ir_lower_string_concat(IRLoweringContext *context,
+                       IRFunction *function, ASTNode *expression,
+                       BinaryExpression *binary,
+                       IROperand *out_value, int *handled) {
+  *handled = 1;
+  if (strcmp(binary->operator, "+") == 0) {
+    Type *expr_type = ir_infer_expression_type(context, expression);
+    if (expr_type && expr_type->kind == TYPE_STRING) {
+      IROperand destination = ir_operand_none();
+      IROperand left = ir_operand_none();
+      IROperand right = ir_operand_none();
+      if (!ir_make_temp_operand(context, &destination)) {
+        return 0;
+      }
+      if (!ir_lower_expression(context, function, binary->left, &left)) {
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      if (!ir_lower_expression(context, function, binary->right, &right)) {
+        ir_operand_destroy(&left);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+
+      IRInstruction instruction = {0};
+      instruction.op = IR_OP_BINARY;
+      instruction.location = expression->location;
+      instruction.dest = destination;
+      instruction.lhs = left;
+      instruction.rhs = right;
+      instruction.text = binary->operator;
+      instruction.ast_ref = expression;
+      /* Bake the result type onto the IR so codegen reads it instead of
+       * re-inferring from the AST (replaces code_generator_infer_expression_type;
+       * mirrors its primary path). */
+      instruction.value_type = mtlc_type_from_frontend(
+          type_checker_infer_type(context->type_checker, expression));
+      /* String '+' becomes a heap-allocating concat kernel in codegen; mark
+       * it so the `@noalloc` contract checker can see the allocation. */
+      instruction.allocates = 1;
+      ir_declare_string_concat_helper(context);
+      if (!ir_emit(context, function, &instruction)) {
+        ir_operand_destroy(&right);
+        ir_operand_destroy(&left);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+
+      ir_operand_destroy(&right);
+      ir_operand_destroy(&left);
+      *out_value = destination;
+      return 1;
+    }
+  }
+  *handled = 0;
+  return 1;
+}
+
+static int ir_lower_short_circuit(IRLoweringContext *context,
+                       IRFunction *function, ASTNode *expression,
+                       BinaryExpression *binary,
+                       IROperand *out_value, int *handled) {
+  *handled = 1;
+  if (strcmp(binary->operator, "&&") == 0 ||
+      strcmp(binary->operator, "||") == 0) {
+    int is_and = strcmp(binary->operator, "&&") == 0;
+    IROperand destination = ir_operand_none();
+    IROperand left = ir_operand_none();
+    IROperand right = ir_operand_none();
+    char *rhs_label = NULL;
+    char *true_label = NULL;
+    char *false_label = NULL;
+    char *end_label = NULL;
+
+    if (!ir_make_temp_operand(context, &destination)) {
+      return 0;
+    }
+    if (!ir_lower_expression(context, function, binary->left, &left)) {
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    rhs_label = ir_new_label_name(context, "sc_rhs");
+    true_label = ir_new_label_name(context, "sc_true");
+    false_label = ir_new_label_name(context, "sc_false");
+    end_label = ir_new_label_name(context, "sc_end");
+    if (!rhs_label || !true_label || !false_label || !end_label) {
+      ir_set_error(context,
+                   "Out of memory while creating short-circuit labels");
+      free(rhs_label);
+      free(true_label);
+      free(false_label);
+      free(end_label);
+      ir_operand_destroy(&left);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    IRInstruction instruction = {0};
+    instruction.location = expression->location;
+
+    instruction.op = IR_OP_BRANCH_ZERO;
+    instruction.lhs = left;
+    instruction.text = is_and ? false_label : rhs_label;
+    if (!ir_emit(context, function, &instruction)) {
+      free(rhs_label);
+      free(true_label);
+      free(false_label);
+      free(end_label);
+      ir_operand_destroy(&left);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    if (is_and) {
+      instruction = (IRInstruction){0};
+      instruction.op = IR_OP_LABEL;
+      instruction.location = expression->location;
+      instruction.text = rhs_label;
+      if (!ir_emit(context, function, &instruction) ||
+          !ir_lower_expression(context, function, binary->right, &right)) {
+        free(rhs_label);
+        free(true_label);
+        free(false_label);
+        free(end_label);
+        ir_operand_destroy(&left);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+
+      instruction = (IRInstruction){0};
+      instruction.op = IR_OP_BRANCH_ZERO;
+      instruction.location = expression->location;
+      instruction.lhs = right;
+      instruction.text = false_label;
+      if (!ir_emit(context, function, &instruction)) {
+        free(rhs_label);
+        free(true_label);
+        free(false_label);
+        free(end_label);
+        ir_operand_destroy(&right);
+        ir_operand_destroy(&left);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+    } else {
+      instruction = (IRInstruction){0};
+      instruction.op = IR_OP_JUMP;
+      instruction.location = expression->location;
+      instruction.text = true_label;
+      if (!ir_emit(context, function, &instruction)) {
+        free(rhs_label);
+        free(true_label);
+        free(false_label);
+        free(end_label);
+        ir_operand_destroy(&left);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+
+      instruction = (IRInstruction){0};
+      instruction.op = IR_OP_LABEL;
+      instruction.location = expression->location;
+      instruction.text = rhs_label;
+      if (!ir_emit(context, function, &instruction) ||
+          !ir_lower_expression(context, function, binary->right, &right)) {
+        free(rhs_label);
+        free(true_label);
+        free(false_label);
+        free(end_label);
+        ir_operand_destroy(&left);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+
+      instruction = (IRInstruction){0};
+      instruction.op = IR_OP_BRANCH_ZERO;
+      instruction.location = expression->location;
+      instruction.lhs = right;
+      instruction.text = false_label;
+      if (!ir_emit(context, function, &instruction)) {
+        free(rhs_label);
+        free(true_label);
+        free(false_label);
+        free(end_label);
+        ir_operand_destroy(&right);
+        ir_operand_destroy(&left);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+    }
+
+    instruction = (IRInstruction){0};
+    instruction.op = IR_OP_LABEL;
+    instruction.location = expression->location;
+    instruction.text = true_label;
+    if (!ir_emit(context, function, &instruction)) {
+      free(rhs_label);
+      free(true_label);
+      free(false_label);
+      free(end_label);
+      ir_operand_destroy(&right);
+      ir_operand_destroy(&left);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    instruction = (IRInstruction){0};
+    instruction.op = IR_OP_ASSIGN;
+    instruction.location = expression->location;
+    instruction.dest = destination;
+    instruction.lhs = ir_operand_int(1);
+    if (!ir_emit(context, function, &instruction)) {
+      free(rhs_label);
+      free(true_label);
+      free(false_label);
+      free(end_label);
+      ir_operand_destroy(&right);
+      ir_operand_destroy(&left);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    instruction = (IRInstruction){0};
+    instruction.op = IR_OP_JUMP;
+    instruction.location = expression->location;
+    instruction.text = end_label;
+    if (!ir_emit(context, function, &instruction)) {
+      free(rhs_label);
+      free(true_label);
+      free(false_label);
+      free(end_label);
+      ir_operand_destroy(&right);
+      ir_operand_destroy(&left);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    instruction = (IRInstruction){0};
+    instruction.op = IR_OP_LABEL;
+    instruction.location = expression->location;
+    instruction.text = false_label;
+    if (!ir_emit(context, function, &instruction)) {
+      free(rhs_label);
+      free(true_label);
+      free(false_label);
+      free(end_label);
+      ir_operand_destroy(&right);
+      ir_operand_destroy(&left);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    instruction = (IRInstruction){0};
+    instruction.op = IR_OP_ASSIGN;
+    instruction.location = expression->location;
+    instruction.dest = destination;
+    instruction.lhs = ir_operand_int(0);
+    if (!ir_emit(context, function, &instruction)) {
+      free(rhs_label);
+      free(true_label);
+      free(false_label);
+      free(end_label);
+      ir_operand_destroy(&right);
+      ir_operand_destroy(&left);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    instruction = (IRInstruction){0};
+    instruction.op = IR_OP_LABEL;
+    instruction.location = expression->location;
+    instruction.text = end_label;
+    if (!ir_emit(context, function, &instruction)) {
+      free(rhs_label);
+      free(true_label);
+      free(false_label);
+      free(end_label);
+      ir_operand_destroy(&right);
+      ir_operand_destroy(&left);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+
+    free(rhs_label);
+    free(true_label);
+    free(false_label);
+    free(end_label);
+    ir_operand_destroy(&right);
+    ir_operand_destroy(&left);
+    *out_value = destination;
+    return 1;
+  }
+  *handled = 0;
+  return 1;
+}
+
+static int ir_lower_binary_expression(IRLoweringContext *context,
+                       IRFunction *function, ASTNode *expression,
+                       IROperand *out_value) {
+  BinaryExpression *binary = (BinaryExpression *)expression->data;
+  if (!binary || !binary->left || !binary->right || !binary->operator) {
+    ir_set_error(context, "Malformed binary expression");
+    return 0;
+  }
+
+  {
+    int handled = 0;
+    int lowered = ir_lower_string_compare(context, function, expression, binary,
+                                          out_value, &handled);
+    if (handled) {
+      return lowered;
+    }
+    lowered = ir_lower_string_concat(context, function, expression, binary,
+                                     out_value, &handled);
+    if (handled) {
+      return lowered;
+    }
+    lowered = ir_lower_short_circuit(context, function, expression, binary,
+                                     out_value, &handled);
+    if (handled) {
+      return lowered;
+    }
+  }
+
+  if (ir_try_lower_pointer_arithmetic(context, function, binary,
+                                      expression->location, out_value)) {
+    return 1;
+  }
+
+  IROperand left = ir_operand_none();
+  IROperand right = ir_operand_none();
+  if (!ir_lower_expression(context, function, binary->left, &left) ||
+      !ir_lower_expression(context, function, binary->right, &right)) {
+    ir_operand_destroy(&left);
+    ir_operand_destroy(&right);
+    return 0;
+  }
+
+  /* A shift on a narrow type runs in a 64-bit register, where the hardware
+   * masks the count to 6 bits instead of the width the type has. int64
+   * shifts read that way already and M0115 says so, so the count is brought
+   * down to this type's own width: `x >> 32` on an int32 answered 0 while
+   * the same shift on an int64 answered x. A constant count folds here and
+   * leaves the shape every address recognizer reads. */
+  {
+    int shift_bits = ir_narrow_integer_shift_bits(
+        ir_infer_expression_type(context, expression));
+    if (shift_bits &&
+        (strcmp(binary->operator, "<<") == 0 ||
+         strcmp(binary->operator, ">>") == 0)) {
+      long long mask = shift_bits - 1;
+      if (right.kind == IR_OPERAND_INT) {
+        right.int_value &= mask;
+      } else {
+        IROperand masked = ir_operand_none();
+        IRInstruction bound = {0};
+        if (!ir_make_temp_operand(context, &masked)) {
+          ir_operand_destroy(&left);
+          ir_operand_destroy(&right);
+          return 0;
+        }
+        bound.op = IR_OP_BINARY;
+        bound.location = expression->location;
+        bound.dest = masked;
+        bound.lhs = right;
+        bound.rhs = ir_operand_int(mask);
+        bound.text = (char *)"&";
+        if (!ir_emit(context, function, &bound)) {
+          ir_operand_destroy(&masked);
+          ir_operand_destroy(&left);
+          ir_operand_destroy(&right);
+          return 0;
+        }
+        ir_operand_destroy(&right);
+        right = masked;
+      }
+    }
+  }
+
+  IROperand destination = ir_operand_none();
+  if (!ir_make_temp_operand(context, &destination)) {
+    ir_operand_destroy(&left);
+    ir_operand_destroy(&right);
+    return 0;
+  }
+
+  IRInstruction instruction = {0};
+  instruction.op = IR_OP_BINARY;
+  instruction.location = expression->location;
+  instruction.dest = destination;
+  instruction.lhs = left;
+  instruction.rhs = right;
+  instruction.text = binary->operator;
+  /* Record that this operation is unsigned so the optimizer's constant
+   * folder, which evaluates in signed long long, declines to fold a divide,
+   * remainder, right shift, or ordering that signed arithmetic would get
+   * wrong. Nothing else set this for a binary, so `var c: uint64 = 1e19; c /
+   * 2` folded with a signed divide under -O and produced a negative result
+   * while the unoptimized build divided correctly. Either operand being
+   * unsigned makes the operation unsigned, matching the usual arithmetic
+   * conversions the type checker already applied. */
+  instruction.is_unsigned =
+      ir_type_is_unsigned_integer(
+          ir_infer_expression_type(context, binary->left)) ||
+      ir_type_is_unsigned_integer(
+          ir_infer_expression_type(context, binary->right));
+  int operation_float_bits = ir_binary_expression_operation_float_bits(
+      context, expression, binary);
+  instruction.is_float = operation_float_bits != 0;
+  if (instruction.is_float) {
+    instruction.float_bits = operation_float_bits;
+    if (!ir_binary_operator_is_comparison(binary->operator)) {
+      instruction.dest.float_bits = instruction.float_bits;
+      destination.float_bits = instruction.float_bits;
+    }
+  }
+
+  if (!ir_emit(context, function, &instruction)) {
+    ir_operand_destroy(&destination);
+    ir_operand_destroy(&left);
+    ir_operand_destroy(&right);
+    return 0;
+  }
+
+  ir_operand_destroy(&left);
+  ir_operand_destroy(&right);
+
+  /* A temp is 64 bits wide whatever the expression's type is, and the
+   * arithmetic that produced it ran at that width. `int32 + int32` overflows
+   * at 32 bits by the language's own rule, so the value has to come back to
+   * its declared width here: storing it into a narrow location truncated it,
+   * and nothing else did, so `big + big > 0` answered yes for two values
+   * whose int32 sum is negative. */
+  {
+    const char *narrow = ir_narrow_integer_result_type(
+        instruction.is_float ? NULL : ir_infer_expression_type(context,
+                                                               expression),
+        binary->operator);
+    if (narrow) {
+      IROperand wrapped = ir_operand_none();
+      if (!ir_make_temp_operand(context, &wrapped)) {
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      IRInstruction truncate = {0};
+      truncate.op = IR_OP_CAST;
+      truncate.location = expression->location;
+      truncate.dest = wrapped;
+      truncate.lhs = destination;
+      truncate.text = (char *)narrow;
+      if (!ir_emit(context, function, &truncate)) {
+        ir_operand_destroy(&wrapped);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      ir_operand_destroy(&destination);
+      *out_value = wrapped;
+      return 1;
+    }
+  }
+
+  *out_value = destination;
+  return 1;
+}
+
+static int ir_lower_unary_expression(IRLoweringContext *context,
+                       IRFunction *function, ASTNode *expression,
+                       IROperand *out_value) {
+  UnaryExpression *unary = (UnaryExpression *)expression->data;
+  if (!unary || !unary->operator || !unary->operand) {
+    ir_set_error(context, "Malformed unary expression");
+    return 0;
+  }
+
+
+  if (strcmp(unary->operator, "&") == 0) {
+    Type *target_type = NULL;
+    if (!ir_lower_lvalue_address(context, function, unary->operand, out_value,
+                                 &target_type)) {
+      return 0;
+    }
+    return 1;
+  }
+
+  if (strcmp(unary->operator, "*") == 0) {
+    IROperand address = ir_operand_none();
+    Type *target_type = NULL;
+    if (!ir_lower_lvalue_address(context, function, expression, &address,
+                                 &target_type)) {
+      return 0;
+    }
+    if (!target_type) {
+      ir_operand_destroy(&address);
+      ir_set_error(context, "Cannot dereference unknown type");
+      return 0;
+    }
+
+    {
+      int handled = ir_try_load_aggregate_by_value(
+          context, function, &address, target_type, expression->location,
+          out_value);
+      if (handled >= 0) {
+        return handled;
+      }
+    }
+
+    IROperand destination = ir_operand_none();
+    if (!ir_make_temp_operand(context, &destination)) {
+      ir_operand_destroy(&address);
+      return 0;
+    }
+
+    IRInstruction load = {0};
+    load.op = IR_OP_LOAD;
+    load.location = expression->location;
+    load.dest = destination;
+    load.lhs = address;
+    load.rhs = ir_operand_int(ir_type_storage_size(target_type));
+    ir_load_apply_float_type(&load, target_type);
+    ir_load_apply_unsigned(&load, target_type);
+    ir_access_apply_alias_class(&load, target_type);
+    if (!ir_emit(context, function, &load)) {
+      ir_operand_destroy(&destination);
+      ir_operand_destroy(&address);
+      return 0;
+    }
+    destination.float_bits = load.dest.float_bits;
+
+    ir_operand_destroy(&address);
+    *out_value = destination;
+    return 1;
+  }
+
+  IROperand operand = ir_operand_none();
+  if (!ir_lower_expression(context, function, unary->operand, &operand)) {
+    return 0;
+  }
+
+  IROperand destination = ir_operand_none();
+  if (!ir_make_temp_operand(context, &destination)) {
+    ir_operand_destroy(&operand);
+    return 0;
+  }
+
+  IRInstruction instruction = {0};
+  instruction.op = IR_OP_UNARY;
+  instruction.location = expression->location;
+  instruction.dest = destination;
+  instruction.lhs = operand;
+  instruction.text = unary->operator;
+  instruction.is_float = ir_expression_is_floating(context, expression);
+  if (instruction.is_float) {
+    instruction.float_bits = ir_expression_float_bits(context, expression);
+    if (instruction.float_bits == 0) {
+      instruction.float_bits = 64;
+    }
+    instruction.dest.float_bits = instruction.float_bits;
+    destination.float_bits = instruction.float_bits;
+  }
+
+  if (!ir_emit(context, function, &instruction)) {
+    ir_operand_destroy(&destination);
+    ir_operand_destroy(&operand);
+    return 0;
+  }
+
+  ir_operand_destroy(&operand);
+
+  /* Same rule as a binary: the temp is 64 bits and the arithmetic ran at
+   * that width, so a narrow result comes back to its declared width here.
+   * `~x` on a uint8 set 56 bits the type does not have. A constant operand
+   * is folded and range-checked instead, because `-90` is every negative
+   * literal in the language and a cast around one hides the constant from
+   * every recognizer that reads it. */
+  {
+    const char *narrow = ir_narrow_integer_result_type(
+        instruction.is_float ? NULL
+                             : ir_infer_expression_type(context, expression),
+        unary->operator);
+    if (narrow && instruction.lhs.kind == IR_OPERAND_INT &&
+        ir_unary_constant_fits(narrow, unary->operator,
+                               instruction.lhs.int_value)) {
+      narrow = NULL;
+    }
+    if (narrow) {
+      IROperand wrapped = ir_operand_none();
+      if (!ir_make_temp_operand(context, &wrapped)) {
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      IRInstruction truncate = {0};
+      truncate.op = IR_OP_CAST;
+      truncate.location = expression->location;
+      truncate.dest = wrapped;
+      truncate.lhs = destination;
+      truncate.text = (char *)narrow;
+      if (!ir_emit(context, function, &truncate)) {
+        ir_operand_destroy(&wrapped);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      ir_operand_destroy(&destination);
+      *out_value = wrapped;
+      return 1;
+    }
+  }
+
+  *out_value = destination;
+  return 1;
+}
+
+/* Closure value: func_ptr is the environment pointer. Load the code
+ * pointer from field 0 and pass the environment as a hidden leading
+ * argument. */
+static int ir_lower_closure_call(IRLoweringContext *context,
+                                 IRFunction *function,
+                                 ASTNode *expression,
+                                 FuncPtrCall *fp_call,
+                                 IROperand *arguments,
+                                 IROperand func_ptr,
+                                 IROperand destination,
+                                 IROperand indirect_return_address,
+                                 IROperand *out_value) {
+  size_t lead = 1;
+  size_t at = 0;
+  IROperand code = ir_operand_none();
+  if (indirect_return_address.kind != IR_OPERAND_NONE) {
+    lead = 2;
+  }
+  if (!ir_make_temp_operand(context, &code)) {
+    for (size_t i = 0; i < fp_call->argument_count; i++)
+      ir_operand_destroy(&arguments[i]);
+    free(arguments);
+    ir_operand_destroy(&func_ptr);
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+  IRInstruction load = {0};
+  load.op = IR_OP_LOAD;
+  load.location = expression->location;
+  load.dest = code;
+  load.lhs = func_ptr;
+  load.rhs = ir_operand_int(8);
+  int load_ok = ir_emit(context, function, &load);
+  if (!load_ok) {
+    for (size_t i = 0; i < fp_call->argument_count; i++)
+      ir_operand_destroy(&arguments[i]);
+    free(arguments);
+    ir_operand_destroy(&func_ptr);
+    ir_operand_destroy(&code);
+    ir_operand_destroy(&indirect_return_address);
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+  IROperand *cargs =
+      calloc(fp_call->argument_count + lead, sizeof(IROperand));
+  if (!cargs) {
+    for (size_t i = 0; i < fp_call->argument_count; i++)
+      ir_operand_destroy(&arguments[i]);
+    free(arguments);
+    ir_operand_destroy(&func_ptr);
+    ir_operand_destroy(&code);
+    ir_operand_destroy(&indirect_return_address);
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+  if (lead == 2) {
+    cargs[at++] = indirect_return_address;
+    indirect_return_address = ir_operand_none();
+  }
+  cargs[at++] = func_ptr;
+  for (size_t i = 0; i < fp_call->argument_count; i++)
+    cargs[at + i] = arguments[i];
+  free(arguments);
+  IRInstruction cinstr = {0};
+  cinstr.op = IR_OP_CALL_INDIRECT;
+  cinstr.location = expression->location;
+  cinstr.dest = destination;
+  cinstr.lhs = code;
+  cinstr.value_type =
+      expression->resolved_type
+          ? mtlc_type_from_frontend(expression->resolved_type)
+          : NULL;
+  cinstr.arguments = cargs;
+  cinstr.argument_count = fp_call->argument_count + lead;
+  cinstr.argument_types = ir_indirect_slot_types(
+      fp_call->arguments, fp_call->argument_count, lead);
+  int ok = ir_emit(context, function, &cinstr);
+  free(cinstr.argument_types);
+  for (size_t i = 0; i < fp_call->argument_count + lead; i++)
+    ir_operand_destroy(&cargs[i]);
+  free(cargs);
+  ir_operand_destroy(&code);
+  if (!ok) {
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+  *out_value = destination;
+  return 1;
+}
+
+static int ir_lower_func_ptr_call(IRLoweringContext *context,
+                       IRFunction *function, ASTNode *expression,
+                       IROperand *out_value) {
+  FuncPtrCall *fp_call = (FuncPtrCall *)expression->data;
+  if (!fp_call || !fp_call->function) {
+    ir_set_error(context, "Invalid function pointer call");
+    return 0;
+  }
+
+  IROperand destination = ir_operand_none();
+  if (!ir_make_temp_operand(context, &destination)) {
+    return 0;
+  }
+
+  IROperand func_ptr = ir_operand_none();
+  if (!ir_lower_expression(context, function, fp_call->function, &func_ptr)) {
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+
+  IROperand *arguments = NULL;
+  if (fp_call->argument_count > 0) {
+    arguments = calloc(fp_call->argument_count, sizeof(IROperand));
+    if (!arguments) {
+      ir_operand_destroy(&func_ptr);
+      ir_operand_destroy(&destination);
+      ir_set_error(
+          context,
+          "Out of memory while lowering function pointer call arguments");
+      return 0;
+    }
+  }
+
+  for (size_t i = 0; i < fp_call->argument_count; i++) {
+    if (!ir_lower_expression(context, function, fp_call->arguments[i],
+                             &arguments[i])) {
+      for (size_t j = 0; j < i; j++) {
+        ir_operand_destroy(&arguments[j]);
+      }
+      free(arguments);
+      ir_operand_destroy(&func_ptr);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+  }
+
+  Type *func_type = ir_infer_expression_type(context, fp_call->function);
+  if (func_type && func_type->kind == TYPE_FUNCTION_POINTER &&
+      func_type->fn_param_types) {
+    for (size_t i = 0; i < fp_call->argument_count &&
+                       i < func_type->fn_param_count;
+         i++) {
+      if (ir_should_decay_array_to_address(func_type->fn_param_types[i],
+                                           fp_call->arguments[i]) &&
+          !ir_decay_array_operand_to_address(
+              context, function, &arguments[i],
+              fp_call->arguments[i]->location)) {
+        for (size_t j = 0; j < fp_call->argument_count; j++) {
+          ir_operand_destroy(&arguments[j]);
+        }
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      if (ir_should_coerce_string_to_cstring(
+              context, func_type->fn_param_types[i], fp_call->arguments[i]) &&
+          !ir_coerce_string_operand_to_cstring(
+              context, function, &arguments[i],
+              fp_call->arguments[i]->location)) {
+        for (size_t j = 0; j < fp_call->argument_count; j++) {
+          ir_operand_destroy(&arguments[j]);
+        }
+        free(arguments);
+        ir_operand_destroy(&func_ptr);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < fp_call->argument_count; i++) {
+    Type *argument_type =
+        fp_call->arguments[i] ? fp_call->arguments[i]->resolved_type : NULL;
+    if (!ir_indirect_arg_passes_by_address(argument_type)) {
+      continue;
+    }
+    if (!ir_pass_aggregate_argument_by_address(
+            context, function, &arguments[i], argument_type,
+            fp_call->arguments[i]->location)) {
+      for (size_t j = 0; j < fp_call->argument_count; j++) {
+        ir_operand_destroy(&arguments[j]);
+      }
+      free(arguments);
+      ir_operand_destroy(&func_ptr);
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+  }
+
+  IROperand indirect_return_address = ir_operand_none();
+  if (ir_indirect_return_passes_by_pointer(expression->resolved_type) &&
+      !ir_make_indirect_return_slot(context, function,
+                                    expression->resolved_type,
+                                    expression->location,
+                                    &indirect_return_address)) {
+    for (size_t i = 0; i < fp_call->argument_count; i++) {
+      ir_operand_destroy(&arguments[i]);
+    }
+    free(arguments);
+    ir_operand_destroy(&func_ptr);
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+
+  if (func_type && func_type->kind == TYPE_FUNCTION_POINTER &&
+      func_type->closure_env) {
+    return ir_lower_closure_call(context, function, expression, fp_call,
+                                 arguments, func_ptr, destination,
+                                 indirect_return_address, out_value);
+  }
+
+  IROperand *emitted_arguments = arguments;
+  size_t emitted_argument_count = fp_call->argument_count;
+  IROperand *prefixed_arguments = NULL;
+  if (indirect_return_address.kind != IR_OPERAND_NONE) {
+    prefixed_arguments =
+        calloc(fp_call->argument_count + 1, sizeof(IROperand));
+    if (!prefixed_arguments) {
+      for (size_t i = 0; i < fp_call->argument_count; i++) {
+        ir_operand_destroy(&arguments[i]);
+      }
+      free(arguments);
+      ir_operand_destroy(&func_ptr);
+      ir_operand_destroy(&indirect_return_address);
+      ir_operand_destroy(&destination);
+      ir_set_error(context, "Out of memory while lowering an indirect call");
+      return 0;
+    }
+    prefixed_arguments[0] = indirect_return_address;
+    indirect_return_address = ir_operand_none();
+    for (size_t i = 0; i < fp_call->argument_count; i++)
+      prefixed_arguments[i + 1] = arguments[i];
+    emitted_arguments = prefixed_arguments;
+    emitted_argument_count = fp_call->argument_count + 1;
+  }
+
+  IRInstruction instruction = {0};
+  instruction.op = IR_OP_CALL_INDIRECT;
+  instruction.location = expression->location;
+  instruction.dest = destination;
+  // For indirect calls, we use lhs to hold the function pointer operand
+  instruction.lhs = func_ptr;
+  instruction.value_type =
+      expression->resolved_type
+          ? mtlc_type_from_frontend(expression->resolved_type)
+          : NULL;
+  instruction.arguments = emitted_arguments;
+  instruction.argument_count = emitted_argument_count;
+  instruction.argument_types = ir_indirect_slot_types(
+      fp_call->arguments, fp_call->argument_count,
+      emitted_argument_count - fp_call->argument_count);
+
+  if (!ir_emit(context, function, &instruction)) {
+    free(instruction.argument_types);
+    for (size_t i = 0; i < emitted_argument_count; i++) {
+      ir_operand_destroy(&emitted_arguments[i]);
+    }
+    free(prefixed_arguments);
+    free(arguments);
+    ir_operand_destroy(&func_ptr);
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+  free(instruction.argument_types);
+  instruction.argument_types = NULL;
+
+  for (size_t i = 0; i < emitted_argument_count; i++) {
+    ir_operand_destroy(&emitted_arguments[i]);
+  }
+  free(prefixed_arguments);
+  free(arguments);
+  ir_operand_destroy(&func_ptr);
+
+  *out_value = destination;
+  return 1;
+}
+
 int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
                                ASTNode *expression, IROperand *out_value) {
   if (!context || !function || !expression || !out_value) {
@@ -1368,514 +2346,9 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     return 1;
   }
 
-  case AST_BINARY_EXPRESSION: {
-    BinaryExpression *binary = (BinaryExpression *)expression->data;
-    if (!binary || !binary->left || !binary->right || !binary->operator) {
-      ir_set_error(context, "Malformed binary expression");
-      return 0;
-    }
-
-    /* `==` / `!=` on strings compare contents. The generic binary path would
-     * compare the 16-byte record as a scalar, which answered no for two views
-     * of the same bytes and compiled without a word, so `if (input == "quit")`
-     * was a branch that never ran. Contents also match `+`, which already
-     * concatenates bytes rather than pointers. */
-    if (strcmp(binary->operator, "==") == 0 ||
-        strcmp(binary->operator, "!=") == 0) {
-      Type *left_type =
-          type_checker_infer_type(context->type_checker, binary->left);
-      Type *right_type =
-          type_checker_infer_type(context->type_checker, binary->right);
-      if (left_type && right_type && left_type->kind == TYPE_STRING &&
-          right_type->kind == TYPE_STRING) {
-        IROperand left = ir_operand_none();
-        IROperand right = ir_operand_none();
-        IROperand equal = ir_operand_none();
-        if (!ir_lower_expression(context, function, binary->left, &left)) {
-          return 0;
-        }
-        if (!ir_lower_expression(context, function, binary->right, &right)) {
-          ir_operand_destroy(&left);
-          return 0;
-        }
-        if (!ir_make_temp_operand(context, &equal)) {
-          ir_operand_destroy(&right);
-          ir_operand_destroy(&left);
-          return 0;
-        }
-
-        IROperand call_args[2];
-        call_args[0] = left;
-        call_args[1] = right;
-        IRInstruction call = {0};
-        call.op = IR_OP_CALL;
-        call.location = expression->location;
-        call.dest = equal;
-        call.text = "mettle_string_eq";
-        call.arguments = call_args;
-        call.argument_count = 2;
-        int call_ok = ir_emit(context, function, &call);
-        ir_operand_destroy(&right);
-        ir_operand_destroy(&left);
-        if (!call_ok) {
-          ir_operand_destroy(&equal);
-          return 0;
-        }
-
-        if (strcmp(binary->operator, "==") == 0) {
-          *out_value = equal;
-          return 1;
-        }
-
-        /* `!=` is the same answer inverted, and inverting it here keeps the
-         * runtime surface to one function. */
-        IROperand negated = ir_operand_none();
-        if (!ir_make_temp_operand(context, &negated)) {
-          ir_operand_destroy(&equal);
-          return 0;
-        }
-        IRInstruction invert = {0};
-        invert.op = IR_OP_BINARY;
-        invert.location = expression->location;
-        invert.dest = negated;
-        invert.lhs = equal;
-        invert.rhs = ir_operand_int(0);
-        invert.text = "==";
-        int invert_ok = ir_emit(context, function, &invert);
-        ir_operand_destroy(&equal);
-        if (!invert_ok) {
-          ir_operand_destroy(&negated);
-          return 0;
-        }
-        *out_value = negated;
-        return 1;
-      }
-    }
-
-    // Keep string concatenation in AST form for codegen. The current IR binary
-    // fallback models '+' as integer arithmetic, which is invalid for string
-    // records.
-    if (strcmp(binary->operator, "+") == 0) {
-      Type *expr_type = ir_infer_expression_type(context, expression);
-      if (expr_type && expr_type->kind == TYPE_STRING) {
-        IROperand destination = ir_operand_none();
-        IROperand left = ir_operand_none();
-        IROperand right = ir_operand_none();
-        if (!ir_make_temp_operand(context, &destination)) {
-          return 0;
-        }
-        if (!ir_lower_expression(context, function, binary->left, &left)) {
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-        if (!ir_lower_expression(context, function, binary->right, &right)) {
-          ir_operand_destroy(&left);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-
-        IRInstruction instruction = {0};
-        instruction.op = IR_OP_BINARY;
-        instruction.location = expression->location;
-        instruction.dest = destination;
-        instruction.lhs = left;
-        instruction.rhs = right;
-        instruction.text = binary->operator;
-        instruction.ast_ref = expression;
-        /* Bake the result type onto the IR so codegen reads it instead of
-         * re-inferring from the AST (replaces code_generator_infer_expression_type;
-         * mirrors its primary path). */
-        instruction.value_type = mtlc_type_from_frontend(
-            type_checker_infer_type(context->type_checker, expression));
-        /* String '+' becomes a heap-allocating concat kernel in codegen; mark
-         * it so the `@noalloc` contract checker can see the allocation. */
-        instruction.allocates = 1;
-        ir_declare_string_concat_helper(context);
-        if (!ir_emit(context, function, &instruction)) {
-          ir_operand_destroy(&right);
-          ir_operand_destroy(&left);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-
-        ir_operand_destroy(&right);
-        ir_operand_destroy(&left);
-        *out_value = destination;
-        return 1;
-      }
-    }
-
-    if (strcmp(binary->operator, "&&") == 0 ||
-        strcmp(binary->operator, "||") == 0) {
-      int is_and = strcmp(binary->operator, "&&") == 0;
-      IROperand destination = ir_operand_none();
-      IROperand left = ir_operand_none();
-      IROperand right = ir_operand_none();
-      char *rhs_label = NULL;
-      char *true_label = NULL;
-      char *false_label = NULL;
-      char *end_label = NULL;
-
-      if (!ir_make_temp_operand(context, &destination)) {
-        return 0;
-      }
-      if (!ir_lower_expression(context, function, binary->left, &left)) {
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-
-      rhs_label = ir_new_label_name(context, "sc_rhs");
-      true_label = ir_new_label_name(context, "sc_true");
-      false_label = ir_new_label_name(context, "sc_false");
-      end_label = ir_new_label_name(context, "sc_end");
-      if (!rhs_label || !true_label || !false_label || !end_label) {
-        ir_set_error(context,
-                     "Out of memory while creating short-circuit labels");
-        free(rhs_label);
-        free(true_label);
-        free(false_label);
-        free(end_label);
-        ir_operand_destroy(&left);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-
-      IRInstruction instruction = {0};
-      instruction.location = expression->location;
-
-      instruction.op = IR_OP_BRANCH_ZERO;
-      instruction.lhs = left;
-      instruction.text = is_and ? false_label : rhs_label;
-      if (!ir_emit(context, function, &instruction)) {
-        free(rhs_label);
-        free(true_label);
-        free(false_label);
-        free(end_label);
-        ir_operand_destroy(&left);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-
-      if (is_and) {
-        instruction = (IRInstruction){0};
-        instruction.op = IR_OP_LABEL;
-        instruction.location = expression->location;
-        instruction.text = rhs_label;
-        if (!ir_emit(context, function, &instruction) ||
-            !ir_lower_expression(context, function, binary->right, &right)) {
-          free(rhs_label);
-          free(true_label);
-          free(false_label);
-          free(end_label);
-          ir_operand_destroy(&left);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-
-        instruction = (IRInstruction){0};
-        instruction.op = IR_OP_BRANCH_ZERO;
-        instruction.location = expression->location;
-        instruction.lhs = right;
-        instruction.text = false_label;
-        if (!ir_emit(context, function, &instruction)) {
-          free(rhs_label);
-          free(true_label);
-          free(false_label);
-          free(end_label);
-          ir_operand_destroy(&right);
-          ir_operand_destroy(&left);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-      } else {
-        instruction = (IRInstruction){0};
-        instruction.op = IR_OP_JUMP;
-        instruction.location = expression->location;
-        instruction.text = true_label;
-        if (!ir_emit(context, function, &instruction)) {
-          free(rhs_label);
-          free(true_label);
-          free(false_label);
-          free(end_label);
-          ir_operand_destroy(&left);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-
-        instruction = (IRInstruction){0};
-        instruction.op = IR_OP_LABEL;
-        instruction.location = expression->location;
-        instruction.text = rhs_label;
-        if (!ir_emit(context, function, &instruction) ||
-            !ir_lower_expression(context, function, binary->right, &right)) {
-          free(rhs_label);
-          free(true_label);
-          free(false_label);
-          free(end_label);
-          ir_operand_destroy(&left);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-
-        instruction = (IRInstruction){0};
-        instruction.op = IR_OP_BRANCH_ZERO;
-        instruction.location = expression->location;
-        instruction.lhs = right;
-        instruction.text = false_label;
-        if (!ir_emit(context, function, &instruction)) {
-          free(rhs_label);
-          free(true_label);
-          free(false_label);
-          free(end_label);
-          ir_operand_destroy(&right);
-          ir_operand_destroy(&left);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-      }
-
-      instruction = (IRInstruction){0};
-      instruction.op = IR_OP_LABEL;
-      instruction.location = expression->location;
-      instruction.text = true_label;
-      if (!ir_emit(context, function, &instruction)) {
-        free(rhs_label);
-        free(true_label);
-        free(false_label);
-        free(end_label);
-        ir_operand_destroy(&right);
-        ir_operand_destroy(&left);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-
-      instruction = (IRInstruction){0};
-      instruction.op = IR_OP_ASSIGN;
-      instruction.location = expression->location;
-      instruction.dest = destination;
-      instruction.lhs = ir_operand_int(1);
-      if (!ir_emit(context, function, &instruction)) {
-        free(rhs_label);
-        free(true_label);
-        free(false_label);
-        free(end_label);
-        ir_operand_destroy(&right);
-        ir_operand_destroy(&left);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-
-      instruction = (IRInstruction){0};
-      instruction.op = IR_OP_JUMP;
-      instruction.location = expression->location;
-      instruction.text = end_label;
-      if (!ir_emit(context, function, &instruction)) {
-        free(rhs_label);
-        free(true_label);
-        free(false_label);
-        free(end_label);
-        ir_operand_destroy(&right);
-        ir_operand_destroy(&left);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-
-      instruction = (IRInstruction){0};
-      instruction.op = IR_OP_LABEL;
-      instruction.location = expression->location;
-      instruction.text = false_label;
-      if (!ir_emit(context, function, &instruction)) {
-        free(rhs_label);
-        free(true_label);
-        free(false_label);
-        free(end_label);
-        ir_operand_destroy(&right);
-        ir_operand_destroy(&left);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-
-      instruction = (IRInstruction){0};
-      instruction.op = IR_OP_ASSIGN;
-      instruction.location = expression->location;
-      instruction.dest = destination;
-      instruction.lhs = ir_operand_int(0);
-      if (!ir_emit(context, function, &instruction)) {
-        free(rhs_label);
-        free(true_label);
-        free(false_label);
-        free(end_label);
-        ir_operand_destroy(&right);
-        ir_operand_destroy(&left);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-
-      instruction = (IRInstruction){0};
-      instruction.op = IR_OP_LABEL;
-      instruction.location = expression->location;
-      instruction.text = end_label;
-      if (!ir_emit(context, function, &instruction)) {
-        free(rhs_label);
-        free(true_label);
-        free(false_label);
-        free(end_label);
-        ir_operand_destroy(&right);
-        ir_operand_destroy(&left);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-
-      free(rhs_label);
-      free(true_label);
-      free(false_label);
-      free(end_label);
-      ir_operand_destroy(&right);
-      ir_operand_destroy(&left);
-      *out_value = destination;
-      return 1;
-    }
-
-    if (ir_try_lower_pointer_arithmetic(context, function, binary,
-                                        expression->location, out_value)) {
-      return 1;
-    }
-
-    IROperand left = ir_operand_none();
-    IROperand right = ir_operand_none();
-    if (!ir_lower_expression(context, function, binary->left, &left) ||
-        !ir_lower_expression(context, function, binary->right, &right)) {
-      ir_operand_destroy(&left);
-      ir_operand_destroy(&right);
-      return 0;
-    }
-
-    /* A shift on a narrow type runs in a 64-bit register, where the hardware
-     * masks the count to 6 bits instead of the width the type has. int64
-     * shifts read that way already and M0115 says so, so the count is brought
-     * down to this type's own width: `x >> 32` on an int32 answered 0 while
-     * the same shift on an int64 answered x. A constant count folds here and
-     * leaves the shape every address recognizer reads. */
-    {
-      int shift_bits = ir_narrow_integer_shift_bits(
-          ir_infer_expression_type(context, expression));
-      if (shift_bits &&
-          (strcmp(binary->operator, "<<") == 0 ||
-           strcmp(binary->operator, ">>") == 0)) {
-        long long mask = shift_bits - 1;
-        if (right.kind == IR_OPERAND_INT) {
-          right.int_value &= mask;
-        } else {
-          IROperand masked = ir_operand_none();
-          IRInstruction bound = {0};
-          if (!ir_make_temp_operand(context, &masked)) {
-            ir_operand_destroy(&left);
-            ir_operand_destroy(&right);
-            return 0;
-          }
-          bound.op = IR_OP_BINARY;
-          bound.location = expression->location;
-          bound.dest = masked;
-          bound.lhs = right;
-          bound.rhs = ir_operand_int(mask);
-          bound.text = (char *)"&";
-          if (!ir_emit(context, function, &bound)) {
-            ir_operand_destroy(&masked);
-            ir_operand_destroy(&left);
-            ir_operand_destroy(&right);
-            return 0;
-          }
-          ir_operand_destroy(&right);
-          right = masked;
-        }
-      }
-    }
-
-    IROperand destination = ir_operand_none();
-    if (!ir_make_temp_operand(context, &destination)) {
-      ir_operand_destroy(&left);
-      ir_operand_destroy(&right);
-      return 0;
-    }
-
-    IRInstruction instruction = {0};
-    instruction.op = IR_OP_BINARY;
-    instruction.location = expression->location;
-    instruction.dest = destination;
-    instruction.lhs = left;
-    instruction.rhs = right;
-    instruction.text = binary->operator;
-    /* Record that this operation is unsigned so the optimizer's constant
-     * folder, which evaluates in signed long long, declines to fold a divide,
-     * remainder, right shift, or ordering that signed arithmetic would get
-     * wrong. Nothing else set this for a binary, so `var c: uint64 = 1e19; c /
-     * 2` folded with a signed divide under -O and produced a negative result
-     * while the unoptimized build divided correctly. Either operand being
-     * unsigned makes the operation unsigned, matching the usual arithmetic
-     * conversions the type checker already applied. */
-    instruction.is_unsigned =
-        ir_type_is_unsigned_integer(
-            ir_infer_expression_type(context, binary->left)) ||
-        ir_type_is_unsigned_integer(
-            ir_infer_expression_type(context, binary->right));
-    int operation_float_bits = ir_binary_expression_operation_float_bits(
-        context, expression, binary);
-    instruction.is_float = operation_float_bits != 0;
-    if (instruction.is_float) {
-      instruction.float_bits = operation_float_bits;
-      if (!ir_binary_operator_is_comparison(binary->operator)) {
-        instruction.dest.float_bits = instruction.float_bits;
-        destination.float_bits = instruction.float_bits;
-      }
-    }
-
-    if (!ir_emit(context, function, &instruction)) {
-      ir_operand_destroy(&destination);
-      ir_operand_destroy(&left);
-      ir_operand_destroy(&right);
-      return 0;
-    }
-
-    ir_operand_destroy(&left);
-    ir_operand_destroy(&right);
-
-    /* A temp is 64 bits wide whatever the expression's type is, and the
-     * arithmetic that produced it ran at that width. `int32 + int32` overflows
-     * at 32 bits by the language's own rule, so the value has to come back to
-     * its declared width here: storing it into a narrow location truncated it,
-     * and nothing else did, so `big + big > 0` answered yes for two values
-     * whose int32 sum is negative. */
-    {
-      const char *narrow = ir_narrow_integer_result_type(
-          instruction.is_float ? NULL : ir_infer_expression_type(context,
-                                                                 expression),
-          binary->operator);
-      if (narrow) {
-        IROperand wrapped = ir_operand_none();
-        if (!ir_make_temp_operand(context, &wrapped)) {
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-        IRInstruction truncate = {0};
-        truncate.op = IR_OP_CAST;
-        truncate.location = expression->location;
-        truncate.dest = wrapped;
-        truncate.lhs = destination;
-        truncate.text = (char *)narrow;
-        if (!ir_emit(context, function, &truncate)) {
-          ir_operand_destroy(&wrapped);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-        ir_operand_destroy(&destination);
-        *out_value = wrapped;
-        return 1;
-      }
-    }
-
-    *out_value = destination;
-    return 1;
-  }
+  case AST_BINARY_EXPRESSION:
+    return ir_lower_binary_expression(context, function, expression,
+                                      out_value);
 
   case AST_CLOSURE_ADAPT_EXPRESSION: {
     /* A thin value (`&func` or a non-capturing lambda) wrapped by the
@@ -1960,149 +2433,9 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
                                      expression->location, out_value);
   }
 
-  case AST_UNARY_EXPRESSION: {
-    UnaryExpression *unary = (UnaryExpression *)expression->data;
-    if (!unary || !unary->operator || !unary->operand) {
-      ir_set_error(context, "Malformed unary expression");
-      return 0;
-    }
-
-
-    if (strcmp(unary->operator, "&") == 0) {
-      Type *target_type = NULL;
-      if (!ir_lower_lvalue_address(context, function, unary->operand, out_value,
-                                   &target_type)) {
-        return 0;
-      }
-      return 1;
-    }
-
-    if (strcmp(unary->operator, "*") == 0) {
-      IROperand address = ir_operand_none();
-      Type *target_type = NULL;
-      if (!ir_lower_lvalue_address(context, function, expression, &address,
-                                   &target_type)) {
-        return 0;
-      }
-      if (!target_type) {
-        ir_operand_destroy(&address);
-        ir_set_error(context, "Cannot dereference unknown type");
-        return 0;
-      }
-
-      {
-        int handled = ir_try_load_aggregate_by_value(
-            context, function, &address, target_type, expression->location,
-            out_value);
-        if (handled >= 0) {
-          return handled;
-        }
-      }
-
-      IROperand destination = ir_operand_none();
-      if (!ir_make_temp_operand(context, &destination)) {
-        ir_operand_destroy(&address);
-        return 0;
-      }
-
-      IRInstruction load = {0};
-      load.op = IR_OP_LOAD;
-      load.location = expression->location;
-      load.dest = destination;
-      load.lhs = address;
-      load.rhs = ir_operand_int(ir_type_storage_size(target_type));
-      ir_load_apply_float_type(&load, target_type);
-      ir_load_apply_unsigned(&load, target_type);
-      ir_access_apply_alias_class(&load, target_type);
-      if (!ir_emit(context, function, &load)) {
-        ir_operand_destroy(&destination);
-        ir_operand_destroy(&address);
-        return 0;
-      }
-      destination.float_bits = load.dest.float_bits;
-
-      ir_operand_destroy(&address);
-      *out_value = destination;
-      return 1;
-    }
-
-    IROperand operand = ir_operand_none();
-    if (!ir_lower_expression(context, function, unary->operand, &operand)) {
-      return 0;
-    }
-
-    IROperand destination = ir_operand_none();
-    if (!ir_make_temp_operand(context, &destination)) {
-      ir_operand_destroy(&operand);
-      return 0;
-    }
-
-    IRInstruction instruction = {0};
-    instruction.op = IR_OP_UNARY;
-    instruction.location = expression->location;
-    instruction.dest = destination;
-    instruction.lhs = operand;
-    instruction.text = unary->operator;
-    instruction.is_float = ir_expression_is_floating(context, expression);
-    if (instruction.is_float) {
-      instruction.float_bits = ir_expression_float_bits(context, expression);
-      if (instruction.float_bits == 0) {
-        instruction.float_bits = 64;
-      }
-      instruction.dest.float_bits = instruction.float_bits;
-      destination.float_bits = instruction.float_bits;
-    }
-
-    if (!ir_emit(context, function, &instruction)) {
-      ir_operand_destroy(&destination);
-      ir_operand_destroy(&operand);
-      return 0;
-    }
-
-    ir_operand_destroy(&operand);
-
-    /* Same rule as a binary: the temp is 64 bits and the arithmetic ran at
-     * that width, so a narrow result comes back to its declared width here.
-     * `~x` on a uint8 set 56 bits the type does not have. A constant operand
-     * is folded and range-checked instead, because `-90` is every negative
-     * literal in the language and a cast around one hides the constant from
-     * every recognizer that reads it. */
-    {
-      const char *narrow = ir_narrow_integer_result_type(
-          instruction.is_float ? NULL
-                               : ir_infer_expression_type(context, expression),
-          unary->operator);
-      if (narrow && instruction.lhs.kind == IR_OPERAND_INT &&
-          ir_unary_constant_fits(narrow, unary->operator,
-                                 instruction.lhs.int_value)) {
-        narrow = NULL;
-      }
-      if (narrow) {
-        IROperand wrapped = ir_operand_none();
-        if (!ir_make_temp_operand(context, &wrapped)) {
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-        IRInstruction truncate = {0};
-        truncate.op = IR_OP_CAST;
-        truncate.location = expression->location;
-        truncate.dest = wrapped;
-        truncate.lhs = destination;
-        truncate.text = (char *)narrow;
-        if (!ir_emit(context, function, &truncate)) {
-          ir_operand_destroy(&wrapped);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-        ir_operand_destroy(&destination);
-        *out_value = wrapped;
-        return 1;
-      }
-    }
-
-    *out_value = destination;
-    return 1;
-  }
+  case AST_UNARY_EXPRESSION:
+    return ir_lower_unary_expression(context, function, expression,
+                                     out_value);
 
   case AST_MEMBER_ACCESS: {
     MemberAccess *m = (MemberAccess *)expression->data;
@@ -2298,267 +2631,9 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
   case AST_FUNCTION_CALL:
     return ir_lower_call_expression(context, function, expression, out_value);
 
-  case AST_FUNC_PTR_CALL: {
-    FuncPtrCall *fp_call = (FuncPtrCall *)expression->data;
-    if (!fp_call || !fp_call->function) {
-      ir_set_error(context, "Invalid function pointer call");
-      return 0;
-    }
-
-    IROperand destination = ir_operand_none();
-    if (!ir_make_temp_operand(context, &destination)) {
-      return 0;
-    }
-
-    IROperand func_ptr = ir_operand_none();
-    if (!ir_lower_expression(context, function, fp_call->function, &func_ptr)) {
-      ir_operand_destroy(&destination);
-      return 0;
-    }
-
-    IROperand *arguments = NULL;
-    if (fp_call->argument_count > 0) {
-      arguments = calloc(fp_call->argument_count, sizeof(IROperand));
-      if (!arguments) {
-        ir_operand_destroy(&func_ptr);
-        ir_operand_destroy(&destination);
-        ir_set_error(
-            context,
-            "Out of memory while lowering function pointer call arguments");
-        return 0;
-      }
-    }
-
-    for (size_t i = 0; i < fp_call->argument_count; i++) {
-      if (!ir_lower_expression(context, function, fp_call->arguments[i],
-                               &arguments[i])) {
-        for (size_t j = 0; j < i; j++) {
-          ir_operand_destroy(&arguments[j]);
-        }
-        free(arguments);
-        ir_operand_destroy(&func_ptr);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-    }
-
-    Type *func_type = ir_infer_expression_type(context, fp_call->function);
-    if (func_type && func_type->kind == TYPE_FUNCTION_POINTER &&
-        func_type->fn_param_types) {
-      for (size_t i = 0; i < fp_call->argument_count &&
-                         i < func_type->fn_param_count;
-           i++) {
-        if (ir_should_decay_array_to_address(func_type->fn_param_types[i],
-                                             fp_call->arguments[i]) &&
-            !ir_decay_array_operand_to_address(
-                context, function, &arguments[i],
-                fp_call->arguments[i]->location)) {
-          for (size_t j = 0; j < fp_call->argument_count; j++) {
-            ir_operand_destroy(&arguments[j]);
-          }
-          free(arguments);
-          ir_operand_destroy(&func_ptr);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-        if (ir_should_coerce_string_to_cstring(
-                context, func_type->fn_param_types[i], fp_call->arguments[i]) &&
-            !ir_coerce_string_operand_to_cstring(
-                context, function, &arguments[i],
-                fp_call->arguments[i]->location)) {
-          for (size_t j = 0; j < fp_call->argument_count; j++) {
-            ir_operand_destroy(&arguments[j]);
-          }
-          free(arguments);
-          ir_operand_destroy(&func_ptr);
-          ir_operand_destroy(&destination);
-          return 0;
-        }
-      }
-    }
-
-    for (size_t i = 0; i < fp_call->argument_count; i++) {
-      Type *argument_type =
-          fp_call->arguments[i] ? fp_call->arguments[i]->resolved_type : NULL;
-      if (!ir_indirect_arg_passes_by_address(argument_type)) {
-        continue;
-      }
-      if (!ir_pass_aggregate_argument_by_address(
-              context, function, &arguments[i], argument_type,
-              fp_call->arguments[i]->location)) {
-        for (size_t j = 0; j < fp_call->argument_count; j++) {
-          ir_operand_destroy(&arguments[j]);
-        }
-        free(arguments);
-        ir_operand_destroy(&func_ptr);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-    }
-
-    IROperand indirect_return_address = ir_operand_none();
-    if (ir_indirect_return_passes_by_pointer(expression->resolved_type) &&
-        !ir_make_indirect_return_slot(context, function,
-                                      expression->resolved_type,
-                                      expression->location,
-                                      &indirect_return_address)) {
-      for (size_t i = 0; i < fp_call->argument_count; i++) {
-        ir_operand_destroy(&arguments[i]);
-      }
-      free(arguments);
-      ir_operand_destroy(&func_ptr);
-      ir_operand_destroy(&destination);
-      return 0;
-    }
-
-    if (func_type && func_type->kind == TYPE_FUNCTION_POINTER &&
-        func_type->closure_env) {
-      /* Closure value: func_ptr is the environment pointer. Load the code
-       * pointer from field 0 and pass the environment as a hidden leading
-       * argument. */
-      size_t lead = 1;
-      size_t at = 0;
-      IROperand code = ir_operand_none();
-      if (indirect_return_address.kind != IR_OPERAND_NONE) {
-        lead = 2;
-      }
-      if (!ir_make_temp_operand(context, &code)) {
-        for (size_t i = 0; i < fp_call->argument_count; i++)
-          ir_operand_destroy(&arguments[i]);
-        free(arguments);
-        ir_operand_destroy(&func_ptr);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-      IRInstruction load = {0};
-      load.op = IR_OP_LOAD;
-      load.location = expression->location;
-      load.dest = code;
-      load.lhs = func_ptr;
-      load.rhs = ir_operand_int(8);
-      int load_ok = ir_emit(context, function, &load);
-      if (!load_ok) {
-        for (size_t i = 0; i < fp_call->argument_count; i++)
-          ir_operand_destroy(&arguments[i]);
-        free(arguments);
-        ir_operand_destroy(&func_ptr);
-        ir_operand_destroy(&code);
-        ir_operand_destroy(&indirect_return_address);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-      IROperand *cargs =
-          calloc(fp_call->argument_count + lead, sizeof(IROperand));
-      if (!cargs) {
-        for (size_t i = 0; i < fp_call->argument_count; i++)
-          ir_operand_destroy(&arguments[i]);
-        free(arguments);
-        ir_operand_destroy(&func_ptr);
-        ir_operand_destroy(&code);
-        ir_operand_destroy(&indirect_return_address);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-      if (lead == 2) {
-        cargs[at++] = indirect_return_address;
-        indirect_return_address = ir_operand_none();
-      }
-      cargs[at++] = func_ptr;
-      for (size_t i = 0; i < fp_call->argument_count; i++)
-        cargs[at + i] = arguments[i];
-      free(arguments);
-      IRInstruction cinstr = {0};
-      cinstr.op = IR_OP_CALL_INDIRECT;
-      cinstr.location = expression->location;
-      cinstr.dest = destination;
-      cinstr.lhs = code;
-      cinstr.value_type =
-          expression->resolved_type
-              ? mtlc_type_from_frontend(expression->resolved_type)
-              : NULL;
-      cinstr.arguments = cargs;
-      cinstr.argument_count = fp_call->argument_count + lead;
-      cinstr.argument_types = ir_indirect_slot_types(
-          fp_call->arguments, fp_call->argument_count, lead);
-      int ok = ir_emit(context, function, &cinstr);
-      free(cinstr.argument_types);
-      for (size_t i = 0; i < fp_call->argument_count + lead; i++)
-        ir_operand_destroy(&cargs[i]);
-      free(cargs);
-      ir_operand_destroy(&code);
-      if (!ok) {
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-      *out_value = destination;
-      return 1;
-    }
-
-    IROperand *emitted_arguments = arguments;
-    size_t emitted_argument_count = fp_call->argument_count;
-    IROperand *prefixed_arguments = NULL;
-    if (indirect_return_address.kind != IR_OPERAND_NONE) {
-      prefixed_arguments =
-          calloc(fp_call->argument_count + 1, sizeof(IROperand));
-      if (!prefixed_arguments) {
-        for (size_t i = 0; i < fp_call->argument_count; i++) {
-          ir_operand_destroy(&arguments[i]);
-        }
-        free(arguments);
-        ir_operand_destroy(&func_ptr);
-        ir_operand_destroy(&indirect_return_address);
-        ir_operand_destroy(&destination);
-        ir_set_error(context, "Out of memory while lowering an indirect call");
-        return 0;
-      }
-      prefixed_arguments[0] = indirect_return_address;
-      indirect_return_address = ir_operand_none();
-      for (size_t i = 0; i < fp_call->argument_count; i++)
-        prefixed_arguments[i + 1] = arguments[i];
-      emitted_arguments = prefixed_arguments;
-      emitted_argument_count = fp_call->argument_count + 1;
-    }
-
-    IRInstruction instruction = {0};
-    instruction.op = IR_OP_CALL_INDIRECT;
-    instruction.location = expression->location;
-    instruction.dest = destination;
-    // For indirect calls, we use lhs to hold the function pointer operand
-    instruction.lhs = func_ptr;
-    instruction.value_type =
-        expression->resolved_type
-            ? mtlc_type_from_frontend(expression->resolved_type)
-            : NULL;
-    instruction.arguments = emitted_arguments;
-    instruction.argument_count = emitted_argument_count;
-    instruction.argument_types = ir_indirect_slot_types(
-        fp_call->arguments, fp_call->argument_count,
-        emitted_argument_count - fp_call->argument_count);
-
-    if (!ir_emit(context, function, &instruction)) {
-      free(instruction.argument_types);
-      for (size_t i = 0; i < emitted_argument_count; i++) {
-        ir_operand_destroy(&emitted_arguments[i]);
-      }
-      free(prefixed_arguments);
-      free(arguments);
-      ir_operand_destroy(&func_ptr);
-      ir_operand_destroy(&destination);
-      return 0;
-    }
-    free(instruction.argument_types);
-    instruction.argument_types = NULL;
-
-    for (size_t i = 0; i < emitted_argument_count; i++) {
-      ir_operand_destroy(&emitted_arguments[i]);
-    }
-    free(prefixed_arguments);
-    free(arguments);
-    ir_operand_destroy(&func_ptr);
-
-    *out_value = destination;
-    return 1;
-  }
+  case AST_FUNC_PTR_CALL:
+    return ir_lower_func_ptr_call(context, function, expression,
+                                  out_value);
 
   case AST_MATCH_STATEMENT:
     return ir_lower_match_expression(context, function, expression,
