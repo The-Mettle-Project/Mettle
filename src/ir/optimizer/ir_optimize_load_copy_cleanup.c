@@ -838,6 +838,8 @@ static int ir_row_index_is_read_in_loop(const IRFunction *function, size_t s,
   return 0;
 }
 
+static size_t ir_narrowing_width(const char *type_name);
+
 static const IRInstruction *ir_row_nearest_def(const IRFunction *function,
                                                size_t from, size_t header,
                                                const char *name, size_t *at) {
@@ -851,6 +853,22 @@ static const IRInstruction *ir_row_nearest_def(const IRFunction *function,
     }
   }
   return NULL;
+}
+
+/* An int32 index expression is cut back to int32 before it is scaled, because
+ * that is where the language says the arithmetic wraps. The row pointer this
+ * pass forms is the same address for every index the array actually holds, so
+ * the shape is read through the truncation the way it was before one was
+ * emitted. An index that wraps is out of bounds either way. */
+static const IRInstruction *ir_row_see_through_narrowing(
+    const IRFunction *function, size_t header, const IRInstruction *idx,
+    size_t *at) {
+  while (idx && idx->op == IR_OP_CAST && !idx->is_float && idx->text &&
+         idx->lhs.kind == IR_OPERAND_TEMP && idx->lhs.name &&
+         ir_narrowing_width(idx->text) != 0) {
+    idx = ir_row_nearest_def(function, *at, header, idx->lhs.name, at);
+  }
+  return idx;
 }
 
 static int ir_row_still_holds(const IRFunction *function, size_t from,
@@ -975,7 +993,9 @@ static int ir_row_match_shape(const IRFunction *function, size_t header,
     idx = shl;
     out->idx_pos = s;
   }
+  idx = ir_row_see_through_narrowing(function, header, idx, &out->idx_pos);
   idx = ir_row_carry_bias(function, header, idx, out);
+  idx = ir_row_see_through_narrowing(function, header, idx, &out->idx_pos);
   if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||
       strcmp(idx->text, "+") != 0) {
     return 0;
@@ -2123,5 +2143,260 @@ int ir_eliminate_load_symbol_copy_pass(IRFunction *function,
     ir_name_index_destroy(&mentions);
   }
 
+  return 1;
+}
+
+/* ---- redundant narrowing ---------------------------------------------- */
+
+/* Width in bytes of a narrow integer type name, or 0 for anything else. */
+static size_t ir_narrowing_width(const char *type_name) {
+  if (!type_name) {
+    return 0;
+  }
+  if (strcmp(type_name, "int8") == 0 || strcmp(type_name, "uint8") == 0) {
+    return 1;
+  }
+  if (strcmp(type_name, "int16") == 0 || strcmp(type_name, "uint16") == 0) {
+    return 2;
+  }
+  if (strcmp(type_name, "int32") == 0 || strcmp(type_name, "uint32") == 0) {
+    return 4;
+  }
+  return 0;
+}
+
+/* Does the low half of this operation's result depend only on the low half of
+ * the operand in this slot? Then a truncation feeding that slot is dead when
+ * the result is cut at least as far. A shift's right operand is a count rather
+ * than a value, so it is excluded. */
+static int ir_narrowing_op_keeps_low_bits(const IRInstruction *in, int slot) {
+  if (in->op != IR_OP_BINARY || in->is_float || !in->text) {
+    return 0;
+  }
+  if (strcmp(in->text, "+") == 0 || strcmp(in->text, "-") == 0 ||
+      strcmp(in->text, "*") == 0) {
+    return 1;
+  }
+  return slot == 1 && strcmp(in->text, "<<") == 0;
+}
+
+static void ir_narrowing_count_operand(IRNameIndex *uses,
+                                       const IROperand *operand) {
+  if (operand->kind == IR_OPERAND_TEMP && operand->name) {
+    ir_name_index_add(uses, operand->name, 1);
+  }
+}
+
+typedef struct {
+  IRNameIndex uses;
+  IRNameIndex defs;
+  IRNameIndex def_at;
+  size_t *narrowed_to;
+} IRNarrowingFacts;
+
+static void ir_narrowing_facts_destroy(IRNarrowingFacts *facts) {
+  ir_name_index_destroy(&facts->uses);
+  ir_name_index_destroy(&facts->defs);
+  ir_name_index_destroy(&facts->def_at);
+  free(facts->narrowed_to);
+  facts->narrowed_to = NULL;
+}
+
+/* A temp is not an SSA value here: lowering merges the arms of an expression
+ * by assigning the same one from several blocks. Forwarding past a cast is
+ * only the same program when the cast is the temp's one definition. */
+static int ir_narrowing_single_def(const IRNarrowingFacts *facts,
+                                   const char *name) {
+  size_t count = 0;
+  return ir_name_index_find(&facts->defs, name, &count) && count == 1;
+}
+
+/* Is this temp the result of integer arithmetic? Only those are what lowering
+ * cut back to a declared width, and only those are safe to forward past: a
+ * cast off a byte load is a WIDENING, and dropping it loses the sign extension
+ * the element type asks for. */
+static int ir_narrowing_from_arithmetic(const IRFunction *function,
+                                        const IRNarrowingFacts *facts,
+                                        const char *name) {
+  size_t at = 0;
+  const IRInstruction *def;
+  if (!ir_name_index_find(&facts->def_at, name, &at) ||
+      at >= function->instruction_count) {
+    return 0;
+  }
+  def = &function->instructions[at];
+  return def->op == IR_OP_BINARY && !def->is_float;
+}
+
+static int ir_narrowing_single_use(const IRNarrowingFacts *facts,
+                                   const char *name) {
+  size_t count = 0;
+  return ir_name_index_find(&facts->uses, name, &count) && count == 1;
+}
+
+/* Everything above `width` bytes is discarded on the way into this use, so a
+ * truncation to that width feeding it is dead. */
+static int ir_narrowing_sink_is_narrower(const IRFunction *function,
+                                         const IRNarrowingFacts *facts,
+                                         size_t use_at, int slot,
+                                         size_t width) {
+  const IRInstruction *use = &function->instructions[use_at];
+  size_t sink = 0;
+  if (slot == 1 && use->op == IR_OP_CAST) {
+    sink = ir_narrowing_width(use->text);
+  } else if (slot == 1 && use->op == IR_OP_ASSIGN &&
+             use->dest.kind == IR_OPERAND_SYMBOL && use->dest.name &&
+             !use->is_float) {
+    sink = ir_narrowing_width(
+        ir_function_local_declared_type(function, use->dest.name));
+  } else if (ir_narrowing_op_keeps_low_bits(use, slot)) {
+    sink = facts->narrowed_to[use_at];
+  }
+  return sink != 0 && sink <= width;
+}
+
+/* Lowering brings every narrow arithmetic result back to its declared width,
+ * because a 64-bit temp holding an `int32 + int32` has to wrap where the
+ * language says it wraps. Most of those truncations are dead the moment they
+ * are emitted: the value goes straight into a location of that width, or into
+ * an operation whose own result is cut to it, and the same bits are discarded
+ * either way. Retiring them here, before any recognizer runs, is what keeps an
+ * int32 accumulator loop looking like one. */
+int ir_drop_dead_narrowing_pass(IRFunction *function, int *changed) {
+  IRNarrowingFacts facts;
+  unsigned char *retire = NULL;
+  size_t *retire_use = NULL;
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  memset(&facts, 0, sizeof(facts));
+  if (!ir_name_index_init(&facts.uses, function->instruction_count * 2) ||
+      !ir_name_index_init(&facts.defs, function->instruction_count * 2) ||
+      !ir_name_index_init(&facts.def_at, function->instruction_count * 2)) {
+    ir_narrowing_facts_destroy(&facts);
+    return 0;
+  }
+  facts.narrowed_to =
+      (size_t *)calloc(function->instruction_count, sizeof(size_t));
+  if (!facts.narrowed_to) {
+    ir_narrowing_facts_destroy(&facts);
+    return 0;
+  }
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    ir_narrowing_count_operand(&facts.uses, &in->lhs);
+    ir_narrowing_count_operand(&facts.uses, &in->rhs);
+    for (size_t a = 0; a < in->argument_count; a++) {
+      ir_narrowing_count_operand(&facts.uses, &in->arguments[a]);
+    }
+    if (in->dest.kind != IR_OPERAND_TEMP || !in->dest.name) {
+      continue;
+    }
+    if (ir_instruction_writes_destination(in)) {
+      ir_name_index_add(&facts.defs, in->dest.name, 1);
+      ir_name_index_insert(&facts.def_at, in->dest.name, i);
+    } else {
+      ir_name_index_add(&facts.uses, in->dest.name, 1);
+    }
+  }
+
+  /* Which results are cut back down right after they are produced. */
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *cast = &function->instructions[i];
+    size_t width;
+    size_t producer = 0;
+    if (cast->op != IR_OP_CAST || cast->is_float ||
+        cast->lhs.kind != IR_OPERAND_TEMP || !cast->lhs.name) {
+      continue;
+    }
+    width = ir_narrowing_width(cast->text);
+    if (width == 0 || !ir_narrowing_single_def(&facts, cast->lhs.name) ||
+        !ir_narrowing_single_use(&facts, cast->lhs.name) ||
+        !ir_narrowing_from_arithmetic(function, &facts, cast->lhs.name)) {
+      continue;
+    }
+    if (ir_name_index_find(&facts.def_at, cast->lhs.name, &producer)) {
+      facts.narrowed_to[producer] = width;
+    }
+  }
+
+  retire = (unsigned char *)calloc(function->instruction_count, 1);
+  retire_use = (size_t *)calloc(function->instruction_count, sizeof(size_t));
+  if (!retire || !retire_use) {
+    free(retire);
+    free(retire_use);
+    ir_narrowing_facts_destroy(&facts);
+    return 0;
+  }
+  /* Decide first, rewrite after: the name indexes borrow the operand names
+   * they were built from, and retiring one cast frees a few of them. */
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *cast = &function->instructions[i];
+    size_t width;
+    if (cast->op != IR_OP_CAST || cast->is_float ||
+        cast->dest.kind != IR_OPERAND_TEMP || !cast->dest.name ||
+        cast->lhs.kind != IR_OPERAND_TEMP || !cast->lhs.name) {
+      continue;
+    }
+    width = ir_narrowing_width(cast->text);
+    if (width == 0 || !ir_narrowing_single_use(&facts, cast->dest.name) ||
+        !ir_narrowing_single_def(&facts, cast->dest.name) ||
+        !ir_narrowing_single_def(&facts, cast->lhs.name) ||
+        !ir_narrowing_from_arithmetic(function, &facts, cast->lhs.name)) {
+      continue;
+    }
+    for (size_t u = i + 1; u < function->instruction_count; u++) {
+      const IRInstruction *use = &function->instructions[u];
+      int in_lhs = ir_operand_is_temp_named(&use->lhs, cast->dest.name);
+      int in_rhs = ir_operand_is_temp_named(&use->rhs, cast->dest.name);
+      if (!in_lhs && !in_rhs) {
+        continue;
+      }
+      if (in_lhs && in_rhs) {
+        break;
+      }
+      if (ir_narrowing_sink_is_narrower(function, &facts, u, in_lhs ? 1 : 2,
+                                        width)) {
+        retire[i] = in_lhs ? 1 : 2;
+        retire_use[i] = u;
+      }
+      break;
+    }
+  }
+  ir_narrowing_facts_destroy(&facts);
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *cast;
+    IRInstruction *use;
+    IROperand *target;
+    char *source;
+    if (!retire[i]) {
+      continue;
+    }
+    cast = &function->instructions[i];
+    use = &function->instructions[retire_use[i]];
+    target = retire[i] == 1 ? &use->lhs : &use->rhs;
+    source = mettle_strdup(cast->lhs.name);
+    if (!source) {
+      free(retire);
+      free(retire_use);
+      return 0;
+    }
+    ir_operand_destroy(target);
+    *target = ir_operand_temp(source);
+    free(source);
+    if (!target->name) {
+      free(retire);
+      free(retire_use);
+      return 0;
+    }
+    ir_instruction_make_nop(cast);
+    if (changed) {
+      *changed = 1;
+    }
+  }
+  free(retire);
+  free(retire_use);
   return 1;
 }

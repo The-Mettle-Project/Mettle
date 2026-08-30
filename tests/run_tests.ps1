@@ -13407,6 +13407,8 @@ $runFixtures = @(
      What = "a bool crossed a call boundary wrong" },
   @{ Name = "odd_size_aggregates"; Path = "tests/codegen/odd_size_aggregates.mettle"
      What = "a 3/5/6/7-byte aggregate copied wrong" },
+  @{ Name = "narrow_arithmetic_wraps"; Path = "tests/codegen/narrow_arithmetic_wraps.mettle"
+     What = "narrow integer arithmetic kept more than its declared width" },
   @{ Name = "utf8"; Path = "tests/codegen/utf8.mettle"
      What = "a UTF-8 decode, encode, count or offset answered wrong, or malformed bytes were decoded as text instead of refused" },
   @{ Name = "characters"; Path = "tests/codegen/characters.mettle"

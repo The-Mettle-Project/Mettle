@@ -366,6 +366,7 @@ typedef struct {
 
 #define IR_OPT_PASS_LIST(X)                                                   \
   X(REDUCTION_UNROLL, "reduction_unroll")                                    \
+  X(DROP_DEAD_NARROWING, "drop_dead_narrowing")                               \
   X(COPY_AND_CONSTANT_PROPAGATION, "copy_and_constant_propagation")           \
   X(FUSE_TENSOR_MMA_CHAINS, "fuse_tensor_mma_chains")                        \
   X(PROMOTE_GPU_ASYNC_STAGING, "promote_gpu_async_staging")                  \
@@ -492,6 +493,7 @@ int ir_eliminate_unreachable_blocks_pass(IRFunction *function,
 int ir_eliminate_unreachable_straightline_pass(IRFunction *function,
                                                        int *changed);
 int ir_hoist_body_locals_pass(IRFunction *function, int *changed);
+int ir_drop_dead_narrowing_pass(IRFunction *function, int *changed);
 int ir_hoist_global_bases_pass(IRFunction *function, int *changed);
 /* `m[r + i]` with invariant `r`: hoist `r`'s scaled term into a row pointer
  * ahead of the loop so the in-loop index is the counter alone. */

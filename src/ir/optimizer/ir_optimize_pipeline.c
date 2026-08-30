@@ -57,6 +57,8 @@ typedef struct {
   {IR_OPT_LABEL_JUMP, IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_BRANCH_EQ}
 
 static const IROptNamedPass g_ir_pre_inline_canonical[] = {
+    {"drop_dead_narrowing", ir_drop_dead_narrowing_pass,
+     {IR_OPT_REQUIRE_NONE, IR_OPT_REQUIRE_NONE}},
     {"hoist_global_bases", ir_hoist_global_bases_pass, IR_GATE_LOOP},
     {"hoist_row_pointers", ir_hoist_row_pointers_pass, IR_GATE_LOOP},
     {"if_convert_accumulate", ir_if_convert_accumulate_pass,
@@ -85,6 +87,8 @@ static const IROptNamedPass g_ir_pre_inline_recognizers[] = {
  * inlining plants a fresh declaration per parameter of every call it folded
  * into a body. */
 static const IROptNamedPass g_ir_loop_canonical_passes[] = {
+    {"drop_dead_narrowing", ir_drop_dead_narrowing_pass,
+     {IR_OPT_REQUIRE_NONE, IR_OPT_REQUIRE_NONE}},
     {"unify_param_copy_spelling", ir_unify_param_copy_spelling_pass,
      IR_GATE_LOOP},
     {"hoist_body_locals", ir_hoist_body_locals_pass, IR_GATE_LOOP},
@@ -302,6 +306,7 @@ static const IROptFixpointStage g_ir_fixpoint_stage = {
  * intentionally target-neutral: no vector opcodes, rotate fusion, host memory
  * intrinsics, prefetch, or target-specific cost model. */
 static const IROptScheduledPass g_ir_portable_fixpoint_passes[] = {
+    IR_OPT_PASS_ALWAYS(DROP_DEAD_NARROWING, ir_drop_dead_narrowing_pass),
     IR_OPT_PASS_WHEN_ALL(UNROLL_ANNOTATED_LOOPS,
                          ir_unroll_annotated_loops_pass,
                          IR_OPT_LABEL_JUMP),

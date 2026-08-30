@@ -1797,6 +1797,41 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
 
     ir_operand_destroy(&left);
     ir_operand_destroy(&right);
+
+    /* A temp is 64 bits wide whatever the expression's type is, and the
+     * arithmetic that produced it ran at that width. `int32 + int32` overflows
+     * at 32 bits by the language's own rule, so the value has to come back to
+     * its declared width here: storing it into a narrow location truncated it,
+     * and nothing else did, so `big + big > 0` answered yes for two values
+     * whose int32 sum is negative. */
+    {
+      const char *narrow = ir_narrow_integer_result_type(
+          instruction.is_float ? NULL : ir_infer_expression_type(context,
+                                                                 expression),
+          binary->operator);
+      if (narrow) {
+        IROperand wrapped = ir_operand_none();
+        if (!ir_make_temp_operand(context, &wrapped)) {
+          ir_operand_destroy(&destination);
+          return 0;
+        }
+        IRInstruction truncate = {0};
+        truncate.op = IR_OP_CAST;
+        truncate.location = expression->location;
+        truncate.dest = wrapped;
+        truncate.lhs = destination;
+        truncate.text = (char *)narrow;
+        if (!ir_emit(context, function, &truncate)) {
+          ir_operand_destroy(&wrapped);
+          ir_operand_destroy(&destination);
+          return 0;
+        }
+        ir_operand_destroy(&destination);
+        *out_value = wrapped;
+        return 1;
+      }
+    }
+
     *out_value = destination;
     return 1;
   }

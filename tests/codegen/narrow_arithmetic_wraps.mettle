@@ -1,0 +1,86 @@
+// "Signed overflow wraps two's complement and unsigned wraps modulo 2^n" is
+// the rule for the type the arithmetic is written in, and a temp is 64 bits
+// wide whatever that type is. The result was only ever cut back to its declared
+// width by a store into a narrow location, so an int32 sum that overflowed kept
+// all 64 bits everywhere else: `big + big > 0` answered yes for two values
+// whose int32 sum is negative, `(int64)(big + big)` widened a value that had
+// never wrapped, and interpolation printed 4000000000 for an int32.
+//
+// Only +, -, * and << can leave the declared width. Everything checked here is
+// the wrapped answer, in expression position where nothing else truncates.
+import "std/io";
+
+@noinline fn opq8(v: int8) -> int8 { return v; }
+@noinline fn opq16(v: int16) -> int16 { return v; }
+@noinline fn opq32(v: int32) -> int32 { return v; }
+@noinline fn opqu8(v: uint8) -> uint8 { return v; }
+@noinline fn opqu16(v: uint16) -> uint16 { return v; }
+@noinline fn opqu32(v: uint32) -> uint32 { return v; }
+@noinline fn sink(v: int64) -> int64 { return v; }
+
+fn main() -> int32 {
+  var big: int32 = opq32(2000000000);
+  var min32: int32 = opq32(-2147483648);
+
+  // The branch the old code took the wrong way.
+  if (big + big > 0) { return 1; }
+  if (big + big != -294967296) { return 2; }
+  if (big * (int32)3 != 1705032704) { return 3; }
+  if ((int32)0 - min32 != min32) { return 4; }
+  if (big - (0 - big) != -294967296) { return 5; }
+  if (opq32(1) << opq32(31) != min32) { return 6; }
+
+  // Widening sees the wrapped value, not the arithmetic that produced it.
+  var widened: int64 = big + big;
+  if (widened != -294967296) { return 7; }
+  if (sink((int64)(big + big)) != -294967296) { return 8; }
+
+  // A division reads the wrapped numerator.
+  if ((big + big) / opq32(2) != -147483648) { return 9; }
+
+  var b: int8 = opq8(100);
+  if (b + b != -56) { return 10; }
+  if (b * (int8)3 != 44) { return 11; }
+
+  var h: int16 = opq16(30000);
+  if (h + h != -5536) { return 12; }
+  if (h * (int16)3 != 24464) { return 13; }
+
+  var ub: uint8 = opqu8(200);
+  if (ub + ub != (uint8)144) { return 14; }
+  if (ub * (uint8)3 != (uint8)88) { return 15; }
+
+  var uh: uint16 = opqu16(60000);
+  if (uh + uh != (uint16)54464) { return 16; }
+
+  var uw: uint32 = opqu32(3000000000);
+  if (uw + uw != (uint32)1705032704) { return 17; }
+  if (uw * (uint32)2 != (uint32)1705032704) { return 18; }
+  if (uw << (uint32)1 != (uint32)1705032704) { return 19; }
+
+  // Storing already truncated, and still does.
+  var stored: int32 = big + big;
+  if (stored != -294967296) { return 20; }
+  var acc: int32 = big;
+  acc = acc + big;
+  if (acc != -294967296) { return 21; }
+
+  // Interpolation reads the value the same way a comparison does.
+  var text: string = "{big + big}";
+  if (text != "-294967296") { return 22; }
+
+  // An accumulator that stays in range answers exactly as before: this is the
+  // shape every int32 reduction loop has, and it must not have changed.
+  var arr: int32[64];
+  for i in 0..64 {
+    arr[i] = (int32)i * 3;
+  }
+  var total: int32 = 0;
+  for i in 0..64 {
+    total = total + arr[i];
+  }
+  if (total != 6048) { return 23; }
+
+  println("ok");
+  return 0;
+}

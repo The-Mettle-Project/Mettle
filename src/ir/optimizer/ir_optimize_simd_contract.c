@@ -2117,15 +2117,28 @@ static int ir_simd_mutate_dot_row_pointer(IRFunction *clone, size_t begin,
           shl->dest.kind == IR_OPERAND_TEMP && shl->dest.name)) {
       continue;
     }
-    /* The shifted index must be `invariant + iv` (either order). */
+    /* The shifted index must be `invariant + iv` (either order), read through
+     * the truncation an int32 index carries: the arithmetic wraps at its
+     * declared width before it is scaled. */
     IRInstruction *idx = NULL;
-    for (size_t j = i; j-- > begin;) {
-      IRInstruction *cand = &clone->instructions[j];
-      if (ir_instruction_writes_destination(cand) &&
-          cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
-          strcmp(cand->dest.name, shl->lhs.name) == 0) {
-        idx = cand;
-        break;
+    {
+      const char *want = shl->lhs.name;
+      for (;;) {
+        idx = NULL;
+        for (size_t j = i; j-- > begin;) {
+          IRInstruction *cand = &clone->instructions[j];
+          if (ir_instruction_writes_destination(cand) &&
+              cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
+              strcmp(cand->dest.name, want) == 0) {
+            idx = cand;
+            break;
+          }
+        }
+        if (!idx || idx->op != IR_OP_CAST || idx->is_float ||
+            idx->lhs.kind != IR_OPERAND_TEMP || !idx->lhs.name) {
+          break;
+        }
+        want = idx->lhs.name;
       }
     }
     if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||

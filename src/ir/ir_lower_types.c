@@ -398,6 +398,37 @@ int ir_type_is_unsigned_integer(Type *type) {
   }
 }
 
+/* The type name a narrow integer result has to be brought back to, or NULL
+ * when the value is already canonical. Only these operators can leave a
+ * 64-bit register holding something outside the declared width: the rest
+ * either cannot overflow it (`/`, `%`, `>>`, the bitwise operators, the
+ * comparisons) or do not produce an integer at all. */
+const char *ir_narrow_integer_result_type(Type *type, const char *op) {
+  if (!type || !op) {
+    return NULL;
+  }
+  if (strcmp(op, "+") != 0 && strcmp(op, "-") != 0 && strcmp(op, "*") != 0 &&
+      strcmp(op, "<<") != 0) {
+    return NULL;
+  }
+  switch (type->kind) {
+  case TYPE_INT8:
+    return "int8";
+  case TYPE_INT16:
+    return "int16";
+  case TYPE_INT32:
+    return "int32";
+  case TYPE_UINT8:
+    return "uint8";
+  case TYPE_UINT16:
+    return "uint16";
+  case TYPE_UINT32:
+    return "uint32";
+  default:
+    return NULL;
+  }
+}
+
 int ir_type_is_pointer(Type *type) {
   return type && type->kind == TYPE_POINTER && type->base_type;
 }
