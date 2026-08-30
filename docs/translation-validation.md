@@ -77,7 +77,7 @@ translation validation: OK - 12 pass applications validated on 6 input sets each
 
 ## What it cannot see
 
-Validation compares observable behavior on generated inputs. Two limits follow
+Validation compares observable behavior on generated inputs. Three limits follow
 from that.
 
 Inputs are generated, so a bug that needs one specific value may go unseen. The
@@ -85,6 +85,12 @@ input sets are small and structured rather than exhaustive.
 
 Behavior reached only through an `extern` pointer's bytes is invisible, because
 the interpreter does not know what is behind that pointer.
+
+The comparison is exact, so a kernel that approximates on purpose reads as a
+divergence. `simd_exp_f32` and `simd_silu_f32` evaluate a polynomial where the
+scalar loop called `expf`, and validation quarantines them for the functions
+they touch. The build stays correct; it loses those two kernels while `--verify`
+is on.
 
 ## Cost
 

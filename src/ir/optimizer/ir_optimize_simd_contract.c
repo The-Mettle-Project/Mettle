@@ -231,7 +231,13 @@ static int ir_label_is_runtime_check(const char *label) {
   if (!label) {
     return 0;
   }
+  /* `nullhoist` is the skip label null_check_licm leaves when it lifts a
+   * check out of the loop. Leaving it off this list made the diagnosis count
+   * the compiler's own branch as the programmer's, so a straight-line
+   * `@simd! for i in 0..n { a[i] = a[i] * 3 + 1; }` was told its body
+   * "branches on data (an `if` or `&&`/`||` per iteration)". */
   return strstr(label, "trap_null") != NULL || strstr(label, "nonnull") != NULL ||
+         strstr(label, "nullhoist") != NULL ||
          strstr(label, "trap_bounds") != NULL || strstr(label, "in_bounds") != NULL;
 }
 
@@ -625,8 +631,29 @@ static const char *ir_region_find_serial_recurrence(const IRFunction *function,
  * counted loop has exactly one exit test (branch) and one back-edge (jump);
  * extras mean the body carries its own control flow (a nested loop or an `if`),
  * which the recognizers don't handle. */
+/* Does this region carry a compiler-inserted null or bounds check? Those are
+ * absent under --release, so their presence is the difference between a build
+ * that vectorizes and one that does not. */
+static int ir_region_has_runtime_check(const IRFunction *function, size_t begin,
+                                       size_t end) {
+  for (size_t i = begin + 1; i < end && i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if ((ins->op == IR_OP_CALL || ins->op == IR_OP_CALL_INDIRECT) &&
+        ins->text && strstr(ins->text, "crash_trap") != NULL) {
+      return 1;
+    }
+    if ((ins->op == IR_OP_BRANCH_ZERO || ins->op == IR_OP_BRANCH_EQ ||
+         ins->op == IR_OP_JUMP || ins->op == IR_OP_LABEL) &&
+        ir_label_is_runtime_check(ins->text)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
                                        size_t end) {
+  static char reason_buffer[512];
   int has_call = 0, has_new = 0, has_asm = 0;
   int branch_count = 0, jump_count = 0;
   int has_i16 = 0, has_i64 = 0; /* unsupported memory element widths */
@@ -692,26 +719,38 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
       break;
     }
   }
+  /* A kernel replaces the loop wholesale, so it has nowhere to put a
+   * per-element trap. When this build keeps the runtime checks, that is the
+   * difference between it and a build that would vectorize, and it belongs in
+   * the message whatever else the loop is doing: the reader's next move is
+   * --release, not rewriting a loop that is already fine. */
+  const char *keeps_checks =
+      ir_region_has_runtime_check(function, begin, end)
+          ? "; this build also keeps the runtime checks inside the loop, which "
+            "no kernel can carry (--release drops them)"
+          : "";
+#define IR_SIMD_BAIL(text)                                                       do {                                                                             if (!*keeps_checks) {                                                            return (text);                                                               }                                                                              snprintf(reason_buffer, sizeof(reason_buffer), "%s%s", (text),                          keeps_checks);                                                        return reason_buffer;                                                        } while (0)
+
   if (has_call) {
-    return "the loop body contains a function call (only call-free or "
-           "fully-inlined loops vectorize)";
+    IR_SIMD_BAIL("the loop body contains a function call (only call-free or "
+                 "fully-inlined loops vectorize)");
   }
   if (has_new) {
-    return "the loop body allocates memory (new)";
+    IR_SIMD_BAIL("the loop body allocates memory (new)");
   }
   if (has_asm) {
-    return "the loop body contains inline assembly";
+    IR_SIMD_BAIL("the loop body contains inline assembly");
   }
   if (ir_region_inner_loop_line(function, begin, end)) {
     /* Check the nest BEFORE the branch count: an inner loop's own exit test
      * and back-edge are extra branches, and calling those a data-dependent
      * branch sends the reader looking for an `if` that is not there. */
-    return "the loop body contains a nested loop (possibly from an inlined "
-           "call); only the innermost loop of a nest vectorizes";
+    IR_SIMD_BAIL("the loop body contains a nested loop (possibly from an "
+                 "inlined call); only the innermost loop of a nest vectorizes");
   }
   if (branch_count > 1 || jump_count > 1) {
-    return "the loop body branches on data (an `if` or `&&`/`||` per "
-           "iteration); only straight-line loop bodies vectorize";
+    IR_SIMD_BAIL("the loop body branches on data (an `if` or `&&`/`||` per "
+                 "iteration); only straight-line loop bodies vectorize");
   }
   if (has_i16) {
     return "the loop accesses 16-bit integers, which have no vectorizer "
@@ -736,11 +775,21 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
              "not";
     }
   }
+  /* Nothing about the loop itself disqualifies it, but this build keeps the
+   * runtime checks, and a kernel replaces the loop wholesale so it has nowhere
+   * to put a per-element trap. Saying so names the difference between this
+   * build and one that would vectorize, which "no kernel claimed this shape"
+   * does not. */
   /* Honest fallback: we've ruled out the disqualifiers we can detect, so the
    * truthful statement is that no kernel claimed this shape -- NOT an assertion
-   * of a specific cause we haven't verified. */
-  return "no vectorizer recognized this loop's shape (e.g. a non-unit stride, "
-         "a loop-carried dependence, or a reduction/operation no kernel covers)";
+   * of a specific cause we haven't verified. The checks are appended, never
+   * substituted: a non-unit stride does not vectorize under --release either,
+   * and naming the checks first would send the reader after a flag that
+   * changes nothing. */
+  IR_SIMD_BAIL("no vectorizer recognized this loop's shape (e.g. a non-unit "
+               "stride, a loop-carried dependence, or a reduction/operation "
+               "no kernel covers)");
+#undef IR_SIMD_BAIL
 }
 
 /* Stable names for the IRSimdBailId schema (internal header). Used by future

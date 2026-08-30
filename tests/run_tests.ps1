@@ -13486,6 +13486,8 @@ $runFixtures = @(
      What = "the eight-step popcount fold fired on a value wider than a byte" },
   @{ Name = "dot_i8_signs"; Path = "tests/codegen/dot_i8_signs.mettle"
      What = "a byte dot product widened its elements the wrong way, or the int32 dot claimed a byte loop" },
+  @{ Name = "induction_value_shift"; Path = "tests/codegen/induction_value_shift.mettle"
+     What = "pointer induction deleted an iv-fed shift that the stored value still read" },
   @{ Name = "int_edges"; Path = "tests/codegen/int_edges.mettle"
      What = "a codegen check failed" },
   @{ Name = "funcptr"; Path = "tests/codegen/funcptr.mettle"

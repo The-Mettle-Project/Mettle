@@ -642,9 +642,26 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   int keep_iv = has_unconvertible_iv_access;
   for (size_t i = body_start; i < body_end && !keep_iv; i++) {
     const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_NOP ||
-        ir_ptr_induction_should_drop_body_insn(ins, bindings, binding_count,
-                                               iv_symbol, 0)) {
+    if (ins->op == IR_OP_NOP) {
+      continue;
+    }
+    /* Only two kinds of instruction are droppable without asking who reads
+     * them: a bound address producer, which the rewrite replaces, and the
+     * counter's own increment, which goes with the counter.
+     *
+     * `iv << k` is NOT one of them. Asking should_drop_body_insn here counted
+     * every iv-fed shift as address scaling and skipped it before the chain
+     * analysis below could see it, so `for i in 0..n { arr[i] = i * 4 + 1; }`
+     * -- where one shift feeds the address and an identical one feeds the
+     * stored value -- lost the value's shift and wrote the same number into
+     * every element. */
+    if (ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name &&
+        ir_ptr_lookup_addr_temp(bindings, binding_count, ins->dest.name)) {
+      continue;
+    }
+    if (ins->op == IR_OP_BINARY && ins->text && strcmp(ins->text, "+") == 0 &&
+        ir_operand_is_symbol_named(&ins->dest, iv_symbol) &&
+        ir_operand_is_int_value(&ins->rhs, 1)) {
       continue;
     }
     int reads_iv = ir_operand_is_symbol_named(&ins->lhs, iv_symbol) ||
