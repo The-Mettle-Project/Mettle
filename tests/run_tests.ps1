@@ -14041,6 +14041,39 @@ catch {
   Write-CaseResult -Name "volatile_global_survives" -Passed $false -Reason $_.Exception.Message
 }
 
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $kernelImage = Join-Path $tmpDir "freestanding_kernel.bin"
+  if (Test-Path $kernelImage) { Remove-Item -Path $kernelImage -Force }
+  $kernelArgs = @("tests/test_freestanding_kernel.mettle", "--target", "x86_64-none",
+                  "--image-base", "0x100000", "--emit-flat", $kernelImage)
+  $kernelOut = & $CompilerPath @kernelArgs 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $kernelImage)) {
+    throw "compiling the freestanding kernel failed: $kernelOut"
+  }
+  $kernelBytes = [System.IO.File]::ReadAllBytes($kernelImage)
+  $kernelHex = ($kernelBytes | ForEach-Object { $_.ToString("x2") }) -join ""
+  if (-not $kernelHex.StartsWith("488d25")) {
+    throw "the image does not start with the naked entry's lea: $($kernelHex.Substring(0, 24))"
+  }
+  $iretCount = ([regex]::Matches($kernelHex, "48cf")).Count
+  if ($iretCount -ne 2) {
+    throw "expected two interrupt returns in the image, found $iretCount"
+  }
+  if (([regex]::Matches($kernelHex, "4883c40848cf")).Count -ne 1) {
+    throw "the handler that takes an error code does not pop it before returning"
+  }
+  if ($kernelBytes.Length -le 4096) {
+    throw "the image is $($kernelBytes.Length) bytes, too small to carry its zero-filled stack"
+  }
+  Write-CaseResult -Name "freestanding_kernel_image" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "freestanding_kernel_image" -Passed $false -Reason $_.Exception.Message
+}
+
 # 32-bit gate: the i386 target must reach the narrow code generator. Emitting
 # 64-bit code into a 32-bit image is the failure that looks like success, so
 # this asserts the shape of what came out rather than only that it came out.

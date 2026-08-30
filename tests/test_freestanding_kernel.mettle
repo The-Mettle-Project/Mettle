@@ -1,0 +1,52 @@
+struct InterruptFrame {
+    rip: uint64;
+    cs: uint64;
+    flags: uint64;
+}
+
+var ticks: volatile uint64 = 0
+var table: uint64[8]
+var stack: uint64[512]
+
+@naked fn _start() {
+    asm {
+        lea rsp, [rip + stack]
+        add rsp, 4096
+        call kernel_main
+    park:
+        hlt
+        jmp park
+    }
+}
+
+@interrupt fn on_timer(frame: InterruptFrame*) {
+    ticks = ticks + 1
+}
+
+@interrupt fn on_fault(frame: InterruptFrame*, error_code: uint64) {
+    ticks = ticks + error_code
+}
+
+fn port_out(port: uint16, value: uint8) {
+    asm {
+        mov dx, {port}
+        mov al, {value}
+        out dx, al
+    }
+}
+
+fn fill(count: uint64) -> uint64 {
+    var total: uint64 = 0
+    var i: uint64 = 0
+    while (i < count) {
+        table[i] = i * 2
+        total = total + table[i]
+        i = i + 1
+    }
+    return total
+}
+
+fn kernel_main() -> uint64 {
+    port_out(0x80, 0x2A)
+    return fill(8) + ticks
+}

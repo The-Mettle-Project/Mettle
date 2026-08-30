@@ -23,8 +23,7 @@ static void flat_fail(char *error, size_t error_size, const char *format, ...) {
 }
 
 static int flat_section_is_loadable(const BinarySection *section) {
-  return section && section->kind != BINARY_SECTION_BSS &&
-         section->kind != BINARY_SECTION_DEBUG && section->size > 0;
+  return section && section->kind != BINARY_SECTION_DEBUG && section->size > 0;
 }
 
 static int flat_section_rank(const BinarySection *section) {
@@ -39,6 +38,8 @@ static int flat_section_rank(const BinarySection *section) {
     return 3;
   case BINARY_SECTION_FINI_ARRAY:
     return 4;
+  case BINARY_SECTION_BSS:
+    return 6;
   default:
     return 5;
   }
@@ -115,7 +116,7 @@ int binary_emitter_write_flat(BinaryEmitter *emitter, const char *path,
     }
   }
 
-  for (int rank = 0; rank <= 5; rank++) {
+  for (int rank = 0; rank <= 6; rank++) {
     for (i = 0; i < emitter->section_count; i++) {
       const BinarySection *section =
           binary_emitter_get_section_const(emitter, i);
@@ -166,6 +167,10 @@ int binary_emitter_write_flat(BinaryEmitter *emitter, const char *path,
     const BinarySection *section = binary_emitter_get_section_const(
         emitter, placements[i].section_index);
     placements[i].address = image_base + placements[i].file_offset;
+    if (section->kind == BINARY_SECTION_BSS || !section->data) {
+      memset(image + placements[i].file_offset, 0, section->size);
+      continue;
+    }
     memcpy(image + placements[i].file_offset, section->data, section->size);
   }
 

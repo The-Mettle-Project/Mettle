@@ -272,10 +272,16 @@ it is placed at offset zero. At image base `0x7c00` the compiler recognizes a
 boot sector: the image is padded to 512 bytes and signed `0x55AA`.
 
 A flat image links no library, so every name it uses has to be defined in it.
-A program that reaches the runtime -- a null-pointer check's trap, string
-formatting, the allocator -- names symbols nothing in the image provides, and
-the compiler says which section referenced what. Define them yourself, or keep
-the image to code that does not need them.
+A program that reaches the runtime -- string formatting, the allocator --
+names symbols nothing in the image provides, and the compiler says which
+section referenced what. Define them yourself, or keep the image to code that
+does not need them. A freestanding target emits no null-pointer check, so an
+ordinary dereference costs the image nothing.
+
+Zero-initialized data is laid out last and written into the image as zeros.
+There is no loader to reserve it and no header to ask one to, so a stack or a
+table declared without an initializer takes up its own size in the file. That
+is why a boot sector keeps them small: the 512-byte limit counts them.
 
 ## 16-bit code generation
 
