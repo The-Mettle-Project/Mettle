@@ -519,13 +519,174 @@ static int program_has_function_body(const IRProgram *program,
   return 0;
 }
 
+static void populate_function_symbol(IRProgram *program,
+                                    const FnBodySet *body_set, SymbolTable *st,
+                                    FunctionDeclaration *fd) {
+  Symbol *s = symbol_table_lookup(st, fd->name);
+  IRModuleSymbol entry = {0};
+  MtlcType **params;
+  size_t pc = 0;
+
+  entry.name = fd->name;
+  entry.kind = IR_MODSYM_FUNCTION;
+  entry.is_extern = fd->is_extern;
+  entry.is_kernel = fd->is_kernel;
+  /* Whether the MODULE defines this function, not whether this particular
+   * declaration carries the body: a forward declaration and its later
+   * definition each add a symbol entry, and lookups find the first. Asking
+   * fd->body made the forward declaration's entry claim there was no body, so
+   * a backend that skips body-less symbols skipped the definition. */
+  entry.has_body = program_has_function_body(program, body_set, fd->name);
+  entry.link_name = s ? s->link_name : NULL;
+  entry.type = s ? mtlc_type_from_frontend(s->type) : NULL;
+  if (s && s->kind == SYMBOL_FUNCTION) {
+    entry.return_type = mtlc_type_from_frontend(s->data.function.return_type);
+  }
+  params = build_param_types(s, &pc);
+  entry.param_types = params;
+  entry.param_count = pc;
+  ir_program_add_symbol(program, &entry); /* copies param_types */
+  free(params);
+}
+
+/* An aggregate literal was already folded to its laid-out bytes when the type
+ * checker validated it against the declared type, so the image just moves
+ * across. Codegen blits it and emits the relocations; nothing re-walks the
+ * AST. */
+static IRInitReloc *populate_aggregate_initializer(IRModuleSymbol *entry,
+                                                   ASTNode *initializer) {
+  AggregateLiteral *literal = (AggregateLiteral *)initializer->data;
+  IRInitReloc *relocs;
+
+  if (!literal || !literal->image) {
+    entry->has_unfoldable_initializer = 1;
+    return NULL;
+  }
+  entry->init_bytes = literal->image;
+  entry->init_bytes_size = literal->image_size;
+  if (literal->reloc_count == 0) {
+    return NULL;
+  }
+  relocs = calloc(literal->reloc_count, sizeof(IRInitReloc));
+  if (!relocs) {
+    return NULL;
+  }
+  for (size_t r = 0; r < literal->reloc_count; r++) {
+    relocs[r].offset = literal->relocs[r].offset;
+    relocs[r].symbol = literal->relocs[r].symbol;
+    relocs[r].string = literal->relocs[r].string;
+    relocs[r].string_wants_record = literal->relocs[r].string_wants_record;
+  }
+  entry->init_relocs = relocs;
+  entry->init_reloc_count = literal->reloc_count;
+  return relocs;
+}
+
+static void populate_scalar_initializer(IRProgram *program, TypeChecker *tc,
+                                        SymbolTable *st, IRModuleSymbol *entry,
+                                        ASTNode *initializer) {
+  NumConst c = {0};
+  const char *addressed;
+
+  if (entry->type && entry->type->kind == MTLC_TYPE_STRING) {
+    if (initializer->type == AST_STRING_LITERAL) {
+      StringLiteral *lit = (StringLiteral *)initializer->data;
+      entry->has_initializer = 1;
+      entry->init_string = lit && lit->value ? lit->value : "";
+    } else {
+      entry->has_unfoldable_initializer = 1;
+    }
+    return;
+  }
+
+  addressed = lower_module_address_of_symbol_name(initializer);
+  if (eval_numeric(program, tc, st, initializer, &c)) {
+    entry->has_initializer = 1;
+    entry->init_is_float = c.is_float;
+    if (c.is_float) {
+      double d = c.float_value;
+      memcpy(&entry->init_bits, &d, sizeof(d));
+    } else {
+      entry->init_bits = c.int_value;
+    }
+  } else if (addressed) {
+    /* `&other_symbol`: the address is a link-time value, so record the name
+     * and let the backend emit a relocation. */
+    entry->init_symbol_ref = (char *)addressed;
+  } else {
+    entry->has_unfoldable_initializer = 1;
+  }
+}
+
+static void populate_variable_symbol(IRProgram *program, TypeChecker *tc,
+                                     SymbolTable *st, VarDeclaration *vd) {
+  Symbol *s = symbol_table_lookup(st, vd->name);
+  IRModuleSymbol entry = {0};
+  IRInitReloc *aggregate_relocs = NULL;
+
+  entry.name = vd->name;
+  entry.is_extern = vd->is_extern;
+  entry.link_name = s ? s->link_name : NULL;
+  if (s && s->kind == SYMBOL_CONSTANT) {
+    /* Type/Field reflection consts have no runtime representation and must not
+     * become module symbols. */
+    if (type_is_comptime_only(s->type)) {
+      return;
+    }
+    entry.kind = IR_MODSYM_CONSTANT;
+    entry.const_value = s->data.constant.value;
+    entry.type = mtlc_type_from_frontend(s->type);
+  } else {
+    Type *vtype = s ? s->type : NULL;
+    entry.kind = IR_MODSYM_VARIABLE;
+    entry.is_immutable = s ? s->is_immutable : 0;
+    entry.is_exported = vd->is_exported;
+    if (!vtype && vd->type_name) {
+      vtype = type_checker_get_type_by_name(tc, vd->type_name);
+    }
+    entry.type = mtlc_type_from_frontend(vtype);
+    entry.is_volatile = vtype && vtype->is_volatile ? 1 : 0;
+    if (!vd->is_extern && vd->initializer) {
+      if (vd->initializer->type == AST_AGGREGATE_LITERAL) {
+        aggregate_relocs =
+            populate_aggregate_initializer(&entry, vd->initializer);
+      } else {
+        populate_scalar_initializer(program, tc, st, &entry, vd->initializer);
+      }
+    }
+  }
+  ir_program_add_symbol(program, &entry); /* deep-copies the image */
+  free(aggregate_relocs);
+}
+
+/* Register user-defined named types so codegen can resolve them. */
+static void populate_named_type_symbol(IRProgram *program, TypeChecker *tc,
+                                       SymbolTable *st, ASTNode *decl) {
+  Symbol *s = NULL;
+  if (decl->type == AST_STRUCT_DECLARATION) {
+    StructDeclaration *sd = (StructDeclaration *)decl->data;
+    if (sd && sd->name) {
+      s = symbol_table_lookup(st, sd->name);
+    }
+  } else {
+    EnumDeclaration *ed = (EnumDeclaration *)decl->data;
+    if (ed && ed->name) {
+      s = symbol_table_lookup(st, ed->name);
+    }
+  }
+  if (s && s->name && s->type) {
+    register_named_type(program, tc, s->name);
+  }
+}
+
 static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
                                     TypeChecker *tc, SymbolTable *st) {
   Program *pdata = (Program *)ast_program->data;
+  FnBodySet body_set;
+
   if (!pdata) {
     return;
   }
-  FnBodySet body_set;
   fn_body_set_build(&body_set, program);
   for (size_t i = 0; i < pdata->declaration_count; i++) {
     ASTNode *decl = pdata->declarations[i];
@@ -534,150 +695,22 @@ static void populate_module_symbols(IRProgram *program, ASTNode *ast_program,
     }
     if (decl->type == AST_FUNCTION_DECLARATION) {
       FunctionDeclaration *fd = (FunctionDeclaration *)decl->data;
-      if (!fd || !fd->name) {
-        continue;
-      }
       /* `extern kernel` names a device entry point, not a host symbol. It
        * exists so `dispatch` can check its arguments; the handle is resolved
        * from the loaded GPU module at run time. Emitting a module symbol for
        * it would make the host linker look for a definition that is, by
        * construction, on the other side of the PTX boundary. */
-      if (fd->is_extern && fd->is_kernel) {
-        continue;
+      if (fd && fd->name && !(fd->is_extern && fd->is_kernel)) {
+        populate_function_symbol(program, &body_set, st, fd);
       }
-      Symbol *s = symbol_table_lookup(st, fd->name);
-      IRModuleSymbol entry = {0};
-      entry.name = fd->name;
-      entry.kind = IR_MODSYM_FUNCTION;
-      entry.is_extern = fd->is_extern;
-      entry.is_kernel = fd->is_kernel;
-      /* Whether the MODULE defines this function, not whether this particular
-       * declaration carries the body: a forward declaration and its later
-       * definition each add a symbol entry, and lookups find the first. Asking
-       * fd->body made the forward declaration's entry claim there was no body,
-       * so a backend that skips body-less symbols skipped the definition. */
-      entry.has_body = program_has_function_body(program, &body_set, fd->name);
-      entry.link_name = s ? s->link_name : NULL;
-      entry.type = s ? mtlc_type_from_frontend(s->type) : NULL;
-      if (s && s->kind == SYMBOL_FUNCTION) {
-        entry.return_type =
-            mtlc_type_from_frontend(s->data.function.return_type);
-      }
-      size_t pc = 0;
-      MtlcType **params = build_param_types(s, &pc);
-      entry.param_types = params;
-      entry.param_count = pc;
-      ir_program_add_symbol(program, &entry); /* copies param_types */
-      free(params);
     } else if (decl->type == AST_VAR_DECLARATION) {
       VarDeclaration *vd = (VarDeclaration *)decl->data;
-      if (!vd || !vd->name) {
-        continue;
+      if (vd && vd->name) {
+        populate_variable_symbol(program, tc, st, vd);
       }
-      Symbol *s = symbol_table_lookup(st, vd->name);
-      IRModuleSymbol entry = {0};
-      IRInitReloc *aggregate_relocs = NULL;
-      entry.name = vd->name;
-      entry.is_extern = vd->is_extern;
-      entry.link_name = s ? s->link_name : NULL;
-      if (s && s->kind == SYMBOL_CONSTANT) {
-        /* Type/Field reflection consts have no runtime representation and
-         * must not become module symbols. */
-        if (type_is_comptime_only(s->type)) {
-          continue;
-        }
-        entry.kind = IR_MODSYM_CONSTANT;
-        entry.const_value = s->data.constant.value;
-        entry.type = mtlc_type_from_frontend(s->type);
-      } else {
-        entry.kind = IR_MODSYM_VARIABLE;
-        entry.is_immutable = s ? s->is_immutable : 0;
-        entry.is_exported = vd->is_exported;
-        Type *vtype = s ? s->type : NULL;
-        if (!vtype && vd->type_name) {
-          vtype = type_checker_get_type_by_name(tc, vd->type_name);
-        }
-        entry.type = mtlc_type_from_frontend(vtype);
-        entry.is_volatile = vtype && vtype->is_volatile ? 1 : 0;
-        if (!vd->is_extern && vd->initializer &&
-            vd->initializer->type == AST_AGGREGATE_LITERAL) {
-          /* An aggregate literal was already folded to its laid-out bytes when
-           * the type checker validated it against the declared type, so the
-           * image just moves across. Codegen blits it and emits the
-           * relocations; nothing re-walks the AST. */
-          AggregateLiteral *literal = (AggregateLiteral *)vd->initializer->data;
-          if (literal && literal->image) {
-            entry.init_bytes = literal->image;
-            entry.init_bytes_size = literal->image_size;
-            if (literal->reloc_count > 0) {
-              aggregate_relocs =
-                  calloc(literal->reloc_count, sizeof(IRInitReloc));
-              if (aggregate_relocs) {
-                for (size_t r = 0; r < literal->reloc_count; r++) {
-                  aggregate_relocs[r].offset = literal->relocs[r].offset;
-                  aggregate_relocs[r].symbol = literal->relocs[r].symbol;
-                  aggregate_relocs[r].string = literal->relocs[r].string;
-                  aggregate_relocs[r].string_wants_record =
-                      literal->relocs[r].string_wants_record;
-                }
-                entry.init_relocs = aggregate_relocs;
-                entry.init_reloc_count = literal->reloc_count;
-              }
-            }
-          } else {
-            entry.has_unfoldable_initializer = 1;
-          }
-        } else if (!vd->is_extern && vd->initializer) {
-          if (entry.type && entry.type->kind == MTLC_TYPE_STRING) {
-            if (vd->initializer->type == AST_STRING_LITERAL) {
-              StringLiteral *lit = (StringLiteral *)vd->initializer->data;
-              entry.has_initializer = 1;
-              entry.init_string = lit && lit->value ? lit->value : "";
-            } else {
-              entry.has_unfoldable_initializer = 1;
-            }
-          } else {
-            NumConst c = {0};
-            const char *addressed = lower_module_address_of_symbol_name(vd->initializer);
-            if (eval_numeric(program, tc, st, vd->initializer, &c)) {
-              entry.has_initializer = 1;
-              entry.init_is_float = c.is_float;
-              if (c.is_float) {
-                double d = c.float_value;
-                memcpy(&entry.init_bits, &d, sizeof(d));
-              } else {
-                entry.init_bits = c.int_value;
-              }
-            } else if (addressed) {
-              /* `&other_symbol`: the address is a link-time value, so record the
-               * name and let the backend emit a relocation. */
-              entry.init_symbol_ref = (char *)addressed;
-            } else {
-              entry.has_unfoldable_initializer = 1;
-            }
-          }
-        }
-      }
-      ir_program_add_symbol(program, &entry); /* deep-copies the image */
-      free(aggregate_relocs);
     } else if (decl->type == AST_STRUCT_DECLARATION ||
                decl->type == AST_ENUM_DECLARATION) {
-      /* Register user-defined named types so codegen can resolve them. */
-      Symbol *s = NULL;
-      if (decl->type == AST_STRUCT_DECLARATION) {
-        StructDeclaration *sd = (StructDeclaration *)decl->data;
-        if (sd && sd->name) {
-          s = symbol_table_lookup(st, sd->name);
-        }
-      } else {
-        EnumDeclaration *ed = (EnumDeclaration *)decl->data;
-        if (ed && ed->name) {
-          s = symbol_table_lookup(st, ed->name);
-        }
-      }
-      if (s && s->name && s->type) {
-        register_named_type(program, tc, s->name);
-      }
+      populate_named_type_symbol(program, tc, st, decl);
     }
   }
   fn_body_set_free(&body_set);

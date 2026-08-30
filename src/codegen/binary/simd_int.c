@@ -1546,14 +1546,65 @@ int code_generator_binary_emit_simd_dot_i32(
  * The widening used to be zero-extending whatever the element type said, so
  * every negative int8 in a dot product came back as its unsigned reading: a
  * kernel over -1 and 3 answered 765 per element instead of -3. */
+typedef int (*BinaryByteWiden)(BinaryCodeBuffer *, int, int, int);
+typedef int (*BinaryByteLoad)(BinaryCodeBuffer *, BinaryGpRegister,
+                              BinaryGpRegister, int);
+
+/* Main loop: while (end - cur) >= 32, two 16-wide MAC chains. */
+static int binary_emit_dot_i8_body(BinaryCodeBuffer *b, BinaryByteWiden widen) {
+  size_t loop_top = b->size;
+  size_t after_main = 0;
+  size_t j_back = 0;
+  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R11) ||
+      !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R9, BINARY_GP_RCX) ||
+      !wcs_cmp_reg_imm32(b, BINARY_GP_R9, 32) ||
+      !wcs_jcc(b, 0x82 /* jb */, &after_main) ||
+      !widen(b, 0, BINARY_GP_RCX, 0) || !widen(b, 1, BINARY_GP_RDX, 0) ||
+      !wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) || !wcs_avx_vpaddd_ymm(b, 2, 2, 0) ||
+      !widen(b, 0, BINARY_GP_RCX, 16) || !widen(b, 1, BINARY_GP_RDX, 16) ||
+      !wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) || !wcs_avx_vpaddd_ymm(b, 3, 3, 0) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32) ||
+      !wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
+    return 0;
+  }
+  /* Reduce ymm2+ymm3 to a single signed int32 in RAX. */
+  return wcs_patch_here(b, after_main) && wcs_avx_vpaddd_ymm(b, 2, 2, 3) &&
+         wcs_avx_vextracti128(b, 3, 2, 1) && wcs_avx_vzeroupper(b) &&
+         wcs_paddd(b, 2, 3) && wcs_pshufd(b, 3, 2, 0xEE) &&
+         wcs_paddd(b, 2, 3) && wcs_pshufd(b, 3, 2, 0x55) &&
+         wcs_paddd(b, 2, 3) &&
+         binary_emit_movd_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM2) &&
+         binary_emit_movsxd_rax_eax(b);
+}
+
+/* Scalar byte tail: while (cur < end), widen a[i]*b[i] into RAX the same way
+ * the vector body did. */
+static int binary_emit_dot_i8_tail(BinaryCodeBuffer *b,
+                                   BinaryByteLoad tail_load) {
+  size_t tail_top = b->size;
+  size_t j_done = 0;
+  size_t j_back = 0;
+  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11) ||
+      !wcs_jcc(b, 0x83 /* jae */, &j_done) ||
+      !tail_load(b, BINARY_GP_R10, BINARY_GP_RCX, 0) ||
+      !tail_load(b, BINARY_GP_R9, BINARY_GP_RDX, 0) ||
+      !binary_emit_imul_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
+      !wcs_add_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R10) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 1) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 1) ||
+      !wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, tail_top)) {
+    return 0;
+  }
+  return wcs_patch_here(b, j_done);
+}
+
 int code_generator_binary_emit_simd_dot_i8(CodeGenerator *generator,
                                            BinaryFunctionContext *context,
                                            const IRInstruction *instruction) {
   BinaryCodeBuffer *b = NULL;
-  size_t loop_top = 0, after_main = 0, tail_top = 0, j_done = 0;
-  int (*widen)(BinaryCodeBuffer *, int, int, int) = NULL;
-  int (*tail_load)(BinaryCodeBuffer *, BinaryGpRegister, BinaryGpRegister,
-                   int) = NULL;
+  BinaryByteWiden widen = NULL;
+  BinaryByteLoad tail_load = NULL;
 
   if (!generator || !context || !instruction ||
       instruction->argument_count != 1 || !instruction->arguments) {
@@ -1582,60 +1633,8 @@ int code_generator_binary_emit_simd_dot_i8(CodeGenerator *generator,
     return 0;
   }
 
-  /* Main loop: while (end - cur) >= 32, two 16-wide MAC chains. */
-  loop_top = b->size;
-  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R11) ||
-      !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R9, BINARY_GP_RCX) ||
-      !wcs_cmp_reg_imm32(b, BINARY_GP_R9, 32) ||
-      !wcs_jcc(b, 0x82 /* jb */, &after_main) ||
-      !widen(b, 0, BINARY_GP_RCX, 0) ||
-      !widen(b, 1, BINARY_GP_RDX, 0) ||
-      !wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) || !wcs_avx_vpaddd_ymm(b, 2, 2, 0) ||
-      !widen(b, 0, BINARY_GP_RCX, 16) ||
-      !widen(b, 1, BINARY_GP_RDX, 16) ||
-      !wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) || !wcs_avx_vpaddd_ymm(b, 3, 3, 0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
-    return 0;
-  }
-  {
-    size_t j_back = 0;
-    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
-      return 0;
-    }
-  }
-
-  /* Reduce ymm2+ymm3 to a single signed int32 in RAX. */
-  if (!wcs_patch_here(b, after_main) || !wcs_avx_vpaddd_ymm(b, 2, 2, 3) ||
-      !wcs_avx_vextracti128(b, 3, 2, 1) || !wcs_avx_vzeroupper(b) ||
-      !wcs_paddd(b, 2, 3) || !wcs_pshufd(b, 3, 2, 0xEE) || !wcs_paddd(b, 2, 3) ||
-      !wcs_pshufd(b, 3, 2, 0x55) || !wcs_paddd(b, 2, 3) ||
-      !binary_emit_movd_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM2) ||
-      !binary_emit_movsxd_rax_eax(b)) {
-    return 0;
-  }
-
-  /* Scalar byte tail: while (cur < end), widen a[i]*b[i] into RAX the same way
-   * the vector body did. */
-  tail_top = b->size;
-  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11) ||
-      !wcs_jcc(b, 0x83 /* jae */, &j_done) ||
-      !tail_load(b, BINARY_GP_R10, BINARY_GP_RCX, 0) ||
-      !tail_load(b, BINARY_GP_R9, BINARY_GP_RDX, 0) ||
-      !binary_emit_imul_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
-      !wcs_add_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R10) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 1) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 1)) {
-    return 0;
-  }
-  {
-    size_t j_back = 0;
-    if (!wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, tail_top)) {
-      return 0;
-    }
-  }
-
-  if (!wcs_patch_here(b, j_done)) {
+  if (!binary_emit_dot_i8_body(b, widen) ||
+      !binary_emit_dot_i8_tail(b, tail_load)) {
     return 0;
   }
   return code_generator_binary_emit_destination_store(generator, context,

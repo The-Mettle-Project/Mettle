@@ -2081,15 +2081,12 @@ static int ir_simd_temp_is_region_invariant(const IRFunction *function,
  * only the declared type; the clone never executes). The invariance of the
  * hoisted half IS checked (conservatively) -- otherwise the simulation could
  * prove a fix the user cannot actually write. */
-static int ir_simd_mutate_dot_row_pointer(IRFunction *clone, size_t begin,
-                                          size_t end) {
-  const char *iv = NULL;
+/* The loop's induction variable: lhs of the header's `iv < bound` compare. */
+static const char *ir_simd_region_induction_variable(const IRFunction *clone,
+                                                     size_t begin,
+                                                     size_t end) {
   int past_header = 0;
-  int rewrites = 0;
-  int variant_index_seen = 0;
-
-  /* The loop's induction variable: lhs of the header's `iv < bound` compare. */
-  for (size_t i = begin + 1; i < end && !iv; i++) {
+  for (size_t i = begin + 1; i < end; i++) {
     const IRInstruction *ins = &clone->instructions[i];
     if (ins->op == IR_OP_LABEL) {
       if (ins->text && (strstr(ins->text, "ir_while_") != NULL ||
@@ -2098,102 +2095,131 @@ static int ir_simd_mutate_dot_row_pointer(IRFunction *clone, size_t begin,
       }
       continue;
     }
-    if (past_header && ins->op == IR_OP_BINARY && !ins->is_float &&
-        ins->text && strcmp(ins->text, "<") == 0 &&
-        ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name) {
-      iv = ins->lhs.name;
+    if (past_header && ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
+        strcmp(ins->text, "<") == 0 && ins->lhs.kind == IR_OPERAND_SYMBOL &&
+        ins->lhs.name) {
+      return ins->lhs.name;
     }
   }
+  return NULL;
+}
+
+static IRInstruction *ir_simd_index_producer(IRFunction *clone, size_t begin,
+                                             size_t at, const char *want) {
+  IRInstruction *idx = NULL;
+  for (;;) {
+    idx = NULL;
+    for (size_t j = at; j-- > begin;) {
+      IRInstruction *cand = &clone->instructions[j];
+      if (ir_instruction_writes_destination(cand) &&
+          cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
+          strcmp(cand->dest.name, want) == 0) {
+        idx = cand;
+        break;
+      }
+    }
+    if (!idx || idx->op != IR_OP_CAST || idx->is_float ||
+        idx->lhs.kind != IR_OPERAND_TEMP || !idx->lhs.name) {
+      return idx;
+    }
+    want = idx->lhs.name;
+  }
+}
+
+static const IROperand *ir_simd_row_invariant_half(IRFunction *clone,
+                                                   size_t begin, size_t end,
+                                                   size_t at,
+                                                   const IRInstruction *idx,
+                                                   const char *iv,
+                                                   int *variant_index_seen) {
+  const IROperand *other = NULL;
+  if (idx->lhs.kind == IR_OPERAND_SYMBOL && idx->lhs.name &&
+      strcmp(idx->lhs.name, iv) == 0) {
+    other = &idx->rhs;
+  } else if (idx->rhs.kind == IR_OPERAND_SYMBOL && idx->rhs.name &&
+             strcmp(idx->rhs.name, iv) == 0) {
+    other = &idx->lhs;
+  } else {
+    return NULL;
+  }
+  if (other->kind == IR_OPERAND_SYMBOL) {
+    if (!ir_simd_symbol_is_region_invariant(clone, begin, end, other->name,
+                                            iv)) {
+      *variant_index_seen = 1;
+      return NULL;
+    }
+  } else if (other->kind == IR_OPERAND_TEMP) {
+    if (!other->name ||
+        !ir_simd_temp_is_region_invariant(clone, begin, end, at, other->name,
+                                          iv, 0)) {
+      *variant_index_seen = 1;
+      return NULL;
+    }
+  } else if (other->kind != IR_OPERAND_INT) {
+    return NULL;
+  }
+  return other;
+}
+
+/* The address add consuming the shifted index: `addr = base + %shifted`. */
+static IRInstruction *ir_simd_address_add(IRFunction *clone, size_t at,
+                                          size_t end, const char *shifted) {
+  for (size_t k = at + 1; k < end; k++) {
+    IRInstruction *cand = &clone->instructions[k];
+    if (cand->op == IR_OP_BINARY && !cand->is_float && cand->text &&
+        strcmp(cand->text, "+") == 0 && cand->lhs.kind == IR_OPERAND_SYMBOL &&
+        cand->lhs.name && cand->rhs.kind == IR_OPERAND_TEMP && cand->rhs.name &&
+        strcmp(cand->rhs.name, shifted) == 0) {
+      return cand;
+    }
+  }
+  return NULL;
+}
+
+static int ir_simd_is_index_scale(const IRInstruction *shl) {
+  return shl->op == IR_OP_BINARY && !shl->is_float && shl->text &&
+         strcmp(shl->text, "<<") == 0 && shl->rhs.kind == IR_OPERAND_INT &&
+         (shl->rhs.int_value == 2 || shl->rhs.int_value == 3) &&
+         shl->lhs.kind == IR_OPERAND_TEMP && shl->lhs.name &&
+         shl->dest.kind == IR_OPERAND_TEMP && shl->dest.name;
+}
+
+static int ir_simd_mutate_dot_row_pointer(IRFunction *clone, size_t begin,
+                                          size_t end) {
+  const char *iv = ir_simd_region_induction_variable(clone, begin, end);
+  int rewrites = 0;
+  int variant_index_seen = 0;
+
   if (!iv) {
     return 0;
   }
 
   for (size_t i = begin + 1; i < end; i++) {
     IRInstruction *shl = &clone->instructions[i];
-    if (!(shl->op == IR_OP_BINARY && !shl->is_float && shl->text &&
-          strcmp(shl->text, "<<") == 0 && shl->rhs.kind == IR_OPERAND_INT &&
-          (shl->rhs.int_value == 2 || shl->rhs.int_value == 3) &&
-          shl->lhs.kind == IR_OPERAND_TEMP && shl->lhs.name &&
-          shl->dest.kind == IR_OPERAND_TEMP && shl->dest.name)) {
+    IRInstruction *idx;
+    IRInstruction *addr;
+    const char *elem_type;
+    char row_name[32];
+
+    if (!ir_simd_is_index_scale(shl)) {
       continue;
     }
-    /* The shifted index must be `invariant + iv` (either order), read through
-     * the truncation an int32 index carries: the arithmetic wraps at its
-     * declared width before it is scaled. */
-    IRInstruction *idx = NULL;
-    {
-      const char *want = shl->lhs.name;
-      for (;;) {
-        idx = NULL;
-        for (size_t j = i; j-- > begin;) {
-          IRInstruction *cand = &clone->instructions[j];
-          if (ir_instruction_writes_destination(cand) &&
-              cand->dest.kind == IR_OPERAND_TEMP && cand->dest.name &&
-              strcmp(cand->dest.name, want) == 0) {
-            idx = cand;
-            break;
-          }
-        }
-        if (!idx || idx->op != IR_OP_CAST || idx->is_float ||
-            idx->lhs.kind != IR_OPERAND_TEMP || !idx->lhs.name) {
-          break;
-        }
-        want = idx->lhs.name;
-      }
-    }
+    idx = ir_simd_index_producer(clone, begin, i, shl->lhs.name);
     if (!idx || idx->op != IR_OP_BINARY || idx->is_float || !idx->text ||
         strcmp(idx->text, "+") != 0) {
       continue;
     }
-    const IROperand *other = NULL;
-    if (idx->lhs.kind == IR_OPERAND_SYMBOL && idx->lhs.name &&
-        strcmp(idx->lhs.name, iv) == 0) {
-      other = &idx->rhs;
-    } else if (idx->rhs.kind == IR_OPERAND_SYMBOL && idx->rhs.name &&
-               strcmp(idx->rhs.name, iv) == 0) {
-      other = &idx->lhs;
-    } else {
+    if (!ir_simd_row_invariant_half(clone, begin, end, i, idx, iv,
+                                    &variant_index_seen)) {
       continue;
     }
-    /* The hoisted half must be loop-invariant across this region, or the
-     * verified claim would endorse a rewrite the user cannot make. */
-    if (other->kind == IR_OPERAND_SYMBOL) {
-      if (!ir_simd_symbol_is_region_invariant(clone, begin, end, other->name,
-                                              iv)) {
-        variant_index_seen = 1;
-        continue;
-      }
-    } else if (other->kind == IR_OPERAND_TEMP) {
-      if (!other->name ||
-          !ir_simd_temp_is_region_invariant(clone, begin, end, i, other->name,
-                                            iv, 0)) {
-        variant_index_seen = 1;
-        continue;
-      }
-    } else if (other->kind != IR_OPERAND_INT) {
-      continue;
-    }
-    /* The address add consuming the shifted index: `addr = base + %shifted`. */
-    IRInstruction *addr = NULL;
-    for (size_t k = i + 1; k < end; k++) {
-      IRInstruction *cand = &clone->instructions[k];
-      if (cand->op == IR_OP_BINARY && !cand->is_float && cand->text &&
-          strcmp(cand->text, "+") == 0 &&
-          cand->lhs.kind == IR_OPERAND_SYMBOL && cand->lhs.name &&
-          cand->rhs.kind == IR_OPERAND_TEMP && cand->rhs.name &&
-          strcmp(cand->rhs.name, shl->dest.name) == 0) {
-        addr = cand;
-        break;
-      }
-    }
+    addr = ir_simd_address_add(clone, i, end, shl->dest.name);
     if (!addr) {
       continue;
     }
 
-    char row_name[32];
     snprintf(row_name, sizeof(row_name), "__hypo_row%d", rewrites);
-    const char *elem_type =
-        (shl->rhs.int_value == 3) ? "float64*" : "float32*";
+    elem_type = (shl->rhs.int_value == 3) ? "float64*" : "float32*";
 
     ir_operand_destroy(&shl->lhs);
     shl->lhs = ir_operand_symbol(iv);
