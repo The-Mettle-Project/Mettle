@@ -13873,6 +13873,46 @@ else {
   }
 }
 
+# A narrow local lives in a whole-word slot on the 16- and 32-bit targets, so the
+# store never truncates and the cast is the only place a width is applied. The
+# cast used to be emitted as a plain move, and nothing on these targets wrapped:
+# (uint8)321 answered 321. Each check prints Y for a conversion that happened.
+if (-not $calcGcc) {
+  Write-Host "[SKIP] boot_cast_narrows (gcc not found)"
+}
+else {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $castImage = Join-Path $tmpDir "boot_cast.bin"
+    if (Test-Path $castImage) { Remove-Item -Path $castImage -Force }
+    $castArgs = @("tests/test_boot_cast.mettle", "--target", "i8086-none",
+                  "--image-base", "0x7c00", "--emit-flat", $castImage)
+    $castOut = & $CompilerPath @castArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $castImage)) {
+      throw "compiling the cast boot image failed: $castOut"
+    }
+    $emulatorExe = Join-Path $tmpDir "x86_16_emulator_test.exe"
+    if (-not (Test-Path $emulatorExe)) {
+      $emulatorArgs = @("-Wall", "-Wextra", "-std=c99",
+                        "tests/x86_16_emulator_test.c", "-o", $emulatorExe)
+      $buildOut = & $calcGcc.Source @emulatorArgs 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "building the real-mode emulator failed: $buildOut"
+      }
+    }
+    $runOut = & $emulatorExe $castImage 'YYYY\r\n' 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "a narrowing cast did not convert: $runOut"
+    }
+    Write-CaseResult -Name "boot_cast_narrows" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "boot_cast_narrows" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 if (-not $calcGcc) {
   Write-Host "[SKIP] boot_sector_data_runs (gcc not found)"
 }

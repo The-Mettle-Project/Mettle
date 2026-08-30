@@ -1,0 +1,55 @@
+// A narrow local lives in a whole-word slot on the 16- and 32-bit targets, so
+// the store never truncates and the cast is the only place a width is applied.
+// The cast was emitted as a plain move: `(uint8)321` answered 321, `(int8)200`
+// answered 200, and nothing on these targets ever wrapped. Each check prints Y
+// when the conversion happened and N when it did not.
+@naked fn _start() {
+    asm {
+        bits 16
+        cli
+        xor ax, ax
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov sp, 0x7c00
+        sti
+        call main
+        cli
+    halt:
+        hlt
+        jmp halt
+    }
+}
+
+fn putchar(c: int16) -> int16 {
+    asm {
+        mov ax, {c}
+        mov ah, 0x0e
+        mov bx, 7
+        int 0x10
+    }
+    return c
+}
+
+// A global holds exactly its declared size, so a byte global has the next one
+// right after it and a whole-word access there reads and writes its neighbour.
+var BYTE_A: uint8 = 1
+var BYTE_B: uint8 = 2
+
+@noinline fn opaque(v: int16) -> int16 { return v }
+
+fn check(ok: int16) -> int16 {
+    if (ok != 0) { putchar(89) } else { putchar(78) }
+    return ok
+}
+
+fn main() -> int16 {
+    check((uint8)opaque(321) == 65)
+    check((int8)opaque(200) == 0 - 56)
+    BYTE_A = (uint8)opaque(200)
+    check(BYTE_B == 2)
+    check(BYTE_A == 200)
+    putchar(13)
+    putchar(10)
+    return 0
+}

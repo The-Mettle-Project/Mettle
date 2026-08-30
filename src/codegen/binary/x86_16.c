@@ -169,13 +169,38 @@ static int x86_narrow_emit(X86NarrowEmitter *emitter, const char *format, ...) {
   }
 }
 
-static int x86_narrow_symbol_is_global(X86NarrowEmitter *emitter,
-                                       const char *name) {
+static const CgSym *x86_narrow_global_symbol(X86NarrowEmitter *emitter,
+                                             const char *name) {
   const CgSym *symbol =
       emitter->generator && emitter->generator->ir_program
           ? code_generator_lookup_symbol(emitter->generator, name)
           : NULL;
-  return symbol && symbol->scope && symbol->scope->type == CG_SCOPE_GLOBAL;
+  return symbol && symbol->scope && symbol->scope->type == CG_SCOPE_GLOBAL
+             ? symbol
+             : NULL;
+}
+
+static int x86_narrow_symbol_is_global(X86NarrowEmitter *emitter,
+                                       const char *name) {
+  return x86_narrow_global_symbol(emitter, name) != NULL;
+}
+
+/* Bytes a global scalar occupies in the image, or 0 when it is not a global or
+ * not a scalar smaller than a word. A global holds exactly its declared size,
+ * so a `uint8` one is a single byte with the next global right after it, and a
+ * whole-word access there reads and writes its neighbour. */
+static int x86_narrow_sub_word_global_size(X86NarrowEmitter *emitter,
+                                           const char *name) {
+  const CgSym *symbol = x86_narrow_global_symbol(emitter, name);
+  const MtlcType *type = symbol ? symbol->type : NULL;
+  if (!type || type->kind == MTLC_TYPE_POINTER ||
+      type->kind == MTLC_TYPE_FUNCTION_POINTER) {
+    return 0;
+  }
+  if (type->size == 0 || type->size >= (size_t)emitter->word) {
+    return 0;
+  }
+  return (int)type->size;
 }
 
 static int x86_narrow_operand_text(X86NarrowEmitter *emitter,
@@ -204,6 +229,13 @@ static int x86_narrow_operand_text(X86NarrowEmitter *emitter,
     if (x86_narrow_symbol_is_global(emitter, operand->name)) {
       const char *link_name =
           code_generator_get_link_symbol_name(emitter->generator, operand->name);
+      /* A sub-word global cannot be spelled as a whole-word memory operand:
+       * the access has to carry its own size, which only the load and store
+       * paths below can arrange. Refusing here turns what was a neighbour-
+       * clobbering word access into a diagnostic. */
+      if (x86_narrow_sub_word_global_size(emitter, operand->name)) {
+        return 0;
+      }
       snprintf(buffer, size, "%s ptr [%s]", emitter->word_keyword,
                link_name && link_name[0] ? link_name : operand->name);
       return 1;
@@ -217,9 +249,91 @@ static int x86_narrow_operand_text(X86NarrowEmitter *emitter,
   }
 }
 
+/* The 8- and 16-bit names of a general register: "ax" gives "al" and "ax",
+ * "eax" gives "al" and "ax". */
+static void x86_narrow_sub_registers(const X86NarrowEmitter *emitter,
+                                     const char *reg, char *byte_name,
+                                     char *word_name, size_t size) {
+  const char *base = emitter->word == 4 ? reg + 1 : reg;
+  snprintf(word_name, size, "%s", base);
+  snprintf(byte_name, size, "%cl", base[0]);
+}
+
+static const char *x86_narrow_global_link_name(X86NarrowEmitter *emitter,
+                                               const char *name) {
+  const char *link =
+      code_generator_get_link_symbol_name(emitter->generator, name);
+  return link && link[0] ? link : name;
+}
+
+static int x86_narrow_global_is_signed(X86NarrowEmitter *emitter,
+                                       const char *name) {
+  const CgSym *symbol = x86_narrow_global_symbol(emitter, name);
+  return symbol && symbol->type
+             ? code_generator_binary_resolved_type_is_signed_integer(
+                   (MtlcType *)symbol->type)
+             : 1;
+}
+
+/* Read a global narrower than a word into `reg`, widened to the whole register
+ * by its own signedness. The 8086 has no movzx/movsx, so the 16-bit path
+ * widens by hand; the 32-bit path uses the 386 instructions. */
+static int x86_narrow_load_sub_word_global(X86NarrowEmitter *emitter,
+                                           const char *reg, const char *name,
+                                           int bytes) {
+  const char *symbol = x86_narrow_global_link_name(emitter, name);
+  int is_signed = x86_narrow_global_is_signed(emitter, name);
+  char byte_name[8];
+  char word_name[8];
+
+  x86_narrow_sub_registers(emitter, reg, byte_name, word_name,
+                           sizeof(byte_name));
+  if (emitter->word == 4) {
+    return x86_narrow_emit(emitter, "%s %s, %s ptr [%s]\n",
+                           is_signed ? "movsx" : "movzx", reg,
+                           bytes == 1 ? "byte" : "word", symbol);
+  }
+  if (!is_signed) {
+    return x86_narrow_emit(emitter, "xor %s, %s\nmov %s, byte ptr [%s]\n", reg,
+                           reg, byte_name, symbol);
+  }
+  /* cbw is the only 8086 sign extension and it widens AL into AX alone, so a
+   * load into any other register borrows AX and gives it back. */
+  if (strcmp(reg, emitter->accumulator) == 0) {
+    return x86_narrow_emit(emitter, "mov al, byte ptr [%s]\ncbw\n", symbol);
+  }
+  return x86_narrow_emit(emitter,
+                         "push ax\nmov al, byte ptr [%s]\ncbw\nmov %s, ax\n"
+                         "pop ax\n",
+                         symbol, reg);
+}
+
+static int x86_narrow_store_sub_word_global(X86NarrowEmitter *emitter,
+                                            const char *reg, const char *name,
+                                            int bytes) {
+  const char *symbol = x86_narrow_global_link_name(emitter, name);
+  char byte_name[8];
+  char word_name[8];
+
+  x86_narrow_sub_registers(emitter, reg, byte_name, word_name,
+                           sizeof(byte_name));
+  return x86_narrow_emit(emitter, "mov %s ptr [%s], %s\n",
+                         bytes == 1 ? "byte" : "word", symbol,
+                         bytes == 1 ? byte_name : word_name);
+}
+
 static int x86_narrow_load_into(X86NarrowEmitter *emitter, const char *reg,
                                 const IROperand *operand) {
   char text[160];
+  if ((operand->kind == IR_OPERAND_SYMBOL ||
+       operand->kind == IR_OPERAND_TEMP) &&
+      operand->name) {
+    int bytes = x86_narrow_sub_word_global_size(emitter, operand->name);
+    if (bytes) {
+      return x86_narrow_load_sub_word_global(emitter, reg, operand->name,
+                                             bytes);
+    }
+  }
   if (!x86_narrow_operand_text(emitter, operand, text, sizeof(text))) {
     x86_narrow_fail(emitter,
                     "'%s' targets %d-bit code, which cannot read operand '%s'",
@@ -235,6 +349,13 @@ static int x86_narrow_store_from(X86NarrowEmitter *emitter,
   char text[160];
   if (dest->kind == IR_OPERAND_NONE) {
     return 1;
+  }
+  if ((dest->kind == IR_OPERAND_SYMBOL || dest->kind == IR_OPERAND_TEMP) &&
+      dest->name) {
+    int bytes = x86_narrow_sub_word_global_size(emitter, dest->name);
+    if (bytes) {
+      return x86_narrow_store_sub_word_global(emitter, reg, dest->name, bytes);
+    }
   }
   if (!x86_narrow_operand_text(emitter, dest, text, sizeof(text))) {
     x86_narrow_fail(emitter,
@@ -661,13 +782,53 @@ static int x86_narrow_instruction(X86NarrowEmitter *emitter,
   }
 
   case IR_OP_ASSIGN:
-  case IR_OP_CAST:
     if (!x86_narrow_load_into(emitter, emitter->accumulator,
                               &instruction->lhs)) {
       return 0;
     }
     return x86_narrow_store_from(emitter, &instruction->dest,
                                  emitter->accumulator);
+
+  case IR_OP_CAST: {
+    /* A narrow local lives in a whole-word slot here, so the store never
+     * truncates and the cast is the only place the width is applied. Treating
+     * it as an assignment left `(uint8)321` answering 321 and `(int8)200`
+     * answering 200. Truncate in the accumulator, then extend by the target's
+     * signedness so the word slot holds the value the type says it does. */
+    const MtlcType *target =
+        instruction->text ? code_generator_named_type(emitter->generator,
+                                                      instruction->text)
+                          : NULL;
+    int size = target ? code_generator_binary_resolved_type_scalar_size(
+                            (MtlcType *)target)
+                      : emitter->word;
+    int is_signed =
+        target ? code_generator_binary_resolved_type_is_signed_integer(
+                     (MtlcType *)target)
+               : 1;
+    if (!x86_narrow_load_into(emitter, emitter->accumulator,
+                              &instruction->lhs)) {
+      return 0;
+    }
+    if (size == 1 && emitter->word == 2) {
+      if (!x86_narrow_emit(emitter, is_signed ? "cbw\n"
+                                              : "and ax, 255\n")) {
+        return 0;
+      }
+    } else if (size == 1 && emitter->word == 4) {
+      if (!x86_narrow_emit(emitter, "%s eax, al\n",
+                           is_signed ? "movsx" : "movzx")) {
+        return 0;
+      }
+    } else if (size == 2 && emitter->word == 4) {
+      if (!x86_narrow_emit(emitter, "%s eax, ax\n",
+                           is_signed ? "movsx" : "movzx")) {
+        return 0;
+      }
+    }
+    return x86_narrow_store_from(emitter, &instruction->dest,
+                                 emitter->accumulator);
+  }
 
   case IR_OP_BINARY:
     return x86_narrow_binary(emitter, instruction);
