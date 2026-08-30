@@ -44,7 +44,6 @@
     "src/codegen/binary/mir_lower.c::mir_elide_guarded_sext": 118,
     "src/codegen/binary/mir_lower.c::mir_emit_const_divmod": 61,
     "src/codegen/binary/mir_lower.c::mir_fold_address_offsets": 54,
-    "src/codegen/binary/mir_lower.c::mir_function_is_eligible": 155,
     "src/codegen/binary/mir_lower.c::mir_sink_cold_exits": 52,
     "src/codegen/binary/mir_regalloc.c::mir_color_graph": 151,
     "src/codegen/binary/mir_regalloc.c::mir_live_cfg_build": 94,
