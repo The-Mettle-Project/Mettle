@@ -13498,6 +13498,8 @@ $runFixtures = @(
      What = "pointer induction deleted an iv-fed shift that the stored value still read" },
   @{ Name = "unsigned_fused_load"; Path = "tests/codegen/unsigned_fused_load.mettle"
      What = "a fused scaled-address load sign-extended a uint32 the plain load leaves zero-extended" },
+  @{ Name = "uninitialized_globals"; Path = "tests/codegen/uninitialized_globals.mettle"
+     What = "a global with no initializer got no space, or overlapped the one beside it" },
   @{ Name = "int_edges"; Path = "tests/codegen/int_edges.mettle"
      What = "a codegen check failed" },
   @{ Name = "funcptr"; Path = "tests/codegen/funcptr.mettle"
@@ -13779,6 +13781,75 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
 # frontend in the loop, proving libmtlc is frontend-agnostic. Skipped if gcc is
 # unavailable (it links the example against the static library).
 $calcGcc = Get-Command gcc -ErrorAction SilentlyContinue
+
+# The external linker, which nothing else in the suite exercises. Everything
+# builds through the internal PE linker, so an object that only GNU ld reads
+# wrong went unseen: .bss was written with SizeOfRawData zero, ld reserved
+# nothing for it, and the first write to an uninitialized global faulted. The
+# internal linker sizes .bss from the section symbol's auxiliary record and
+# never noticed.
+if (-not $calcGcc) {
+  Write-Host "[SKIP] external_linker_uninitialized_globals (gcc not found)"
+}
+else {
+  foreach ($mode in @(@{ Name = "debug"; Args = @() },
+                      @{ Name = "release"; Args = @("--release") })) {
+    $total++
+    $caseName = "external_linker_uninitialized_globals_$($mode.Name)"
+    try {
+      if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+      $exe = Join-Path $tmpDir "$caseName.exe"
+      if (Test-Path $exe) { Remove-Item -Path $exe -Force }
+      $buildArgs = @("--build", "--emit-obj", "--linker", "gcc") + $mode.Args +
+                   @("tests/codegen/uninitialized_globals.mettle", "-o", $exe)
+      $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) {
+        throw "linking with gcc failed: $buildOut"
+      }
+      $runOut = & $exe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "the gcc-linked program returned $LASTEXITCODE (check $runOut)"
+      }
+      Write-CaseResult -Name $caseName -Passed $true
+    }
+    catch {
+      if ($_.Exception.Message -eq $script:ShardSkip) { $total--; continue }
+      $failed++
+      Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
+    }
+  }
+}
+
+# The library set the external linker is given. The internal linker resolves
+# imports against kernel32, user32, gdi32, advapi32, ws2_32 and winmm; the gcc
+# path passed only -lkernel32, so every std/ui and std/net program linked one
+# way and failed the other on its first Win32 entry point. Linking is the whole
+# check: this one opens a window if it runs.
+if (-not $calcGcc) {
+  Write-Host "[SKIP] external_linker_win32_libraries (gcc not found)"
+}
+else {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exe = Join-Path $tmpDir "external_linker_win32_libraries.exe"
+    if (Test-Path $exe) { Remove-Item -Path $exe -Force }
+    $buildOut = & $CompilerPath @("--build", "--emit-obj", "--linker", "gcc",
+                                  "examples/hello_ui/hello_ui.mettle",
+                                  "-o", $exe) 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) {
+      throw "linking a std/ui program with gcc failed: $buildOut"
+    }
+    Write-CaseResult -Name "external_linker_win32_libraries" -Passed $true
+  }
+  catch {
+    if ($_.Exception.Message -eq $script:ShardSkip) { $total-- }
+    else {
+      $failed++
+      Write-CaseResult -Name "external_linker_win32_libraries" -Passed $false -Reason $_.Exception.Message
+    }
+  }
+}
 if (-not $calcGcc) {
   Write-Host "[SKIP] calc_frontend (gcc not found)"
 }

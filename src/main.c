@@ -1959,7 +1959,11 @@ static int mettle_link_object_with_gcc(const char *object_filename,
                                         size_t runtime_object_count,
                                         const CompilerOptions *options) {
   size_t link_argument_count = options ? options->link_argument_count : 0u;
-  size_t capacity = 12u + runtime_object_count + link_argument_count;
+  /* The fixed arguments are: gcc, three -no* flags, two -Wl flags, an optional
+   * subsystem flag, the object, -o, the executable, six libraries, and the NULL
+   * terminator. Eighteen, and the old bound of twelve was already one short
+   * whenever the subsystem flag was present and nothing followed it. */
+  size_t capacity = 24u + runtime_object_count + link_argument_count;
   const char **arguments = calloc(capacity, sizeof(*arguments));
   size_t count = 0u;
   int result;
@@ -1985,7 +1989,17 @@ static int mettle_link_object_with_gcc(const char *object_filename,
   }
   arguments[count++] = "-o";
   arguments[count++] = executable_filename;
+  /* The same system libraries the internal linker resolves imports against
+   * (collect_internal_link_imports) and the Tracy link step already passes.
+   * Only -lkernel32 was here, so a program using std/ui or std/net linked with
+   * --linker internal and failed with --linker gcc on every Win32 entry point
+   * it named. --gc-sections drops what a program does not reach. */
   arguments[count++] = "-lkernel32";
+  arguments[count++] = "-luser32";
+  arguments[count++] = "-lgdi32";
+  arguments[count++] = "-ladvapi32";
+  arguments[count++] = "-lws2_32";
+  arguments[count++] = "-lwinmm";
   if (options) {
     for (size_t i = 0; i < options->link_argument_count; i++) {
       if (options->link_arguments[i] && options->link_arguments[i][0]) {

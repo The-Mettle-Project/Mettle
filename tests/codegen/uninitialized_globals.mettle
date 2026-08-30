@@ -1,0 +1,72 @@
+// A global with no initializer lives in .bss, whose bytes are not in the object
+// file. COFF still states how much space it needs in SizeOfRawData; it is
+// PointerToRawData that is zero. The emitter wrote zero for the size, so the
+// section header said the region was empty while symbols sat inside it. The
+// internal linker sizes .bss from the section symbol's auxiliary record and was
+// unaffected; GNU ld reads the header, reserved nothing, and the first write to
+// an uninitialized global faulted.
+//
+// Sizes here straddle the section alignment so an under-reserved .bss overlaps
+// something: A ends where B begins, and a short reservation puts them on top of
+// each other rather than off the end of the image.
+import "std/io";
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+var A: int64[64];
+var B: int64[64];
+var SMALL: uint8[3];
+var SCALAR: int64;
+var INITIALIZED: int64 = 12345;
+var ZEROED: int64 = 0;
+
+struct Rec { a: int64; b: int32; c: uint8; }
+var RECORD: Rec;
+var RECORDS: Rec[8];
+
+fn main() -> int32 {
+  for i in 0..64 {
+    A[i] = (int64)(i + 1);
+    B[i] = (int64)(i + 1000);
+  }
+  var sa: int64 = 0;
+  var sb: int64 = 0;
+  for i in 0..64 {
+    sa = sa + A[i];
+    sb = sb + B[i];
+  }
+  if (sa != 2080) { return 1; }
+  if (sb != 66016) { return 2; }
+  if (A[0] != 1 || A[63] != 64) { return 3; }
+  if (B[0] != 1000 || B[63] != 1063) { return 4; }
+
+  SMALL[0] = (uint8)opaque(7);
+  SMALL[2] = (uint8)opaque(9);
+  if (SMALL[0] != 7 || SMALL[1] != 0 || SMALL[2] != 9) { return 5; }
+
+  SCALAR = opaque(99);
+  if (SCALAR != 99) { return 6; }
+
+  // The neighbours keep their own values: an under-reserved .bss shows up as
+  // one global writing over the next.
+  if (INITIALIZED != 12345) { return 7; }
+  if (ZEROED != 0) { return 8; }
+
+  RECORD.a = opaque(5);
+  RECORD.b = (int32)opaque(6);
+  RECORD.c = (uint8)opaque(7);
+  for i in 0..8 {
+    RECORDS[i].a = (int64)(i * 10);
+    RECORDS[i].b = (int32)i;
+    RECORDS[i].c = (uint8)(i + 1);
+  }
+  if (RECORD.a != 5 || RECORD.b != 6 || RECORD.c != 7) { return 9; }
+  if (RECORDS[0].a != 0 || RECORDS[7].a != 70) { return 10; }
+  if (RECORDS[7].b != 7 || RECORDS[7].c != 8) { return 11; }
+
+  // Everything still holds after the later writes.
+  if (A[63] != 64 || B[0] != 1000) { return 12; }
+  if (INITIALIZED != 12345) { return 13; }
+
+  return 0;
+}

@@ -840,8 +840,14 @@ static int binary_emitter_write_coff_object_file(BinaryEmitter *emitter,
                                            section_name_offsets[i]) ||
         !binary_emitter_write_u32(file, 0) ||
         !binary_emitter_write_u32(file, 0) ||
-        !binary_emitter_write_u32(
-            file, section->kind == BINARY_SECTION_BSS ? 0u : (uint32_t)section->size) ||
+        /* SizeOfRawData carries the section's size even for uninitialized
+         * data; it is PointerToRawData that is zero, which is what says the
+         * bytes are not in the file. Writing zero here left a .bss section
+         * whose symbols sat inside a region the header said was empty: GNU ld
+         * reserved nothing for it and the first write to an uninitialized
+         * global faulted. The internal linker sizes .bss from the section
+         * symbol's auxiliary record, so only external linkers saw it. */
+        !binary_emitter_write_u32(file, (uint32_t)section->size) ||
         !binary_emitter_write_u32(file, section_raw_offsets[i]) ||
         !binary_emitter_write_u32(file, section_reloc_offsets[i]) ||
         !binary_emitter_write_u32(file, 0) ||

@@ -302,7 +302,11 @@ static int coff_reader_parse_sections(CoffObject *object,
     section->number_of_line_numbers = linker_read_u16(header + 34);
     section->characteristics = linker_read_u32(header + 36);
 
-    if (section->size_of_raw_data > 0u) {
+    /* PointerToRawData zero means the bytes are not in the file at all --
+     * uninitialized data, whose SizeOfRawData still states how much space it
+     * needs. Copying from file offset 0 would hand back the COFF header as the
+     * section's contents. */
+    if (section->size_of_raw_data > 0u && section->pointer_to_raw_data != 0u) {
       if (!coff_reader_range_ok(file_size, section->pointer_to_raw_data,
                                 section->size_of_raw_data)) {
         mettle_set_error(error_message_out,
