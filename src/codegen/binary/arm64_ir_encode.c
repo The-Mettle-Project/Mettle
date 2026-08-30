@@ -113,7 +113,7 @@ typedef enum {
   STUB_MALLOC, STUB_CALLOC, STUB_FREE, STUB_PUTS, STUB_PUTCHAR, STUB_WRITE,
   STUB_STRLEN, STUB_MEMCPY, STUB_MEMMOVE, STUB_MEMSET, STUB_EXIT, STUB_ABORT,
   STUB_STR_FROM_INT, STUB_STR_FROM_UINT, STUB_STR_FROM_BOOL,
-  STUB_STR_FROM_CHAR,
+  STUB_STR_FROM_CHAR, STUB_STR_EQ,
   STUB_COUNT
 } Arm64StubId;
 
@@ -127,6 +127,7 @@ static const struct {
     {"mettle_string_from_int", 1},  {"mettle_string_from_uint", 1},
     {"mettle_string_from_bool", 1},
     {"mettle_string_from_char", 1},
+    {"mettle_string_eq", 0},
 };
 
 /* Index of the runtime stub named `name`, or -1. `mettle_heap_zeroed` is the
@@ -2858,6 +2859,39 @@ static void emit_string_from_char(Arm64Emit *e, int malloc_label) {
 }
 
 /* x0 = mettle_string_from_bool(x0): "true" or "false" as a heap record. */
+/* x0 = mettle_string_eq(x0 = &a, x1 = &b). A string value travels as the
+ * address of its { chars, length } record, so both arguments are pointers to
+ * one. Answers 1 when the lengths match and every byte does. */
+static void emit_string_eq(Arm64Emit *e) {
+  int l_loop = arm64_new_label(e);
+  int l_equal = arm64_new_label(e);
+  int l_differ = arm64_new_label(e);
+
+  arm64_emit_prologue(e, 0, NULL, 0);
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X9, ARM64_X0, 8));
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X10, ARM64_X1, 8));
+  arm64_emit_word(e, arm64_cmp_reg(1, ARM64_X9, ARM64_X10));
+  arm64_emit_bcond(e, ARM64_NE, l_differ);
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X11, ARM64_X0, 0));
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X12, ARM64_X1, 0));
+  arm64_bind_label(e, l_loop);
+  arm64_emit_cbz(e, 1, ARM64_X9, l_equal);
+  arm64_emit_word(e, arm64_ldrb_imm(ARM64_X13, ARM64_X11, 0));
+  arm64_emit_word(e, arm64_ldrb_imm(ARM64_X14, ARM64_X12, 0));
+  arm64_emit_word(e, arm64_cmp_reg(0, ARM64_X13, ARM64_X14));
+  arm64_emit_bcond(e, ARM64_NE, l_differ);
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X11, ARM64_X11, 1, 0));
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X12, ARM64_X12, 1, 0));
+  arm64_emit_word(e, arm64_sub_imm(1, ARM64_X9, ARM64_X9, 1, 0));
+  arm64_emit_b(e, l_loop);
+  arm64_bind_label(e, l_equal);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X0, 1, 0));
+  arm64_emit_epilogue(e, 0, NULL, 0);
+  arm64_bind_label(e, l_differ);
+  arm64_emit_word(e, arm64_movz(1, ARM64_X0, 0, 0));
+  arm64_emit_epilogue(e, 0, NULL, 0);
+}
+
 static void emit_string_from_bool(Arm64Emit *e, int malloc_label) {
   int l_true = arm64_new_label(e);
   int l_store = arm64_new_label(e);
@@ -2916,6 +2950,7 @@ static void emit_runtime_stub(Arm64Emit *e, int id, int malloc_label) {
   case STUB_STR_FROM_UINT: emit_string_from_value(e, malloc_label, 0); break;
   case STUB_STR_FROM_BOOL: emit_string_from_bool(e, malloc_label); break;
   case STUB_STR_FROM_CHAR: emit_string_from_char(e, malloc_label); break;
+  case STUB_STR_EQ: emit_string_eq(e); break;
   default: arm64_fail(e, "internal: no runtime stub %d", id); break;
   }
 }

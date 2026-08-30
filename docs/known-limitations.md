@@ -18,6 +18,14 @@ entries in a struct, which is the usual shape for a dispatch table.
 A generic call names its type arguments: `id<int64>(7)`. Nothing is inferred
 from the argument.
 
+An array is one-dimensional. `int64[3][4]` does not parse; index a flat
+`int64[12]` yourself.
+
+A type may name one declared later in the file, but two types cannot point at
+each other: `struct A { b: B*; }` above `struct B { a: A*; }` reports `Unknown
+type 'B*'`. A type pointing at itself works. Put both ends behind one type, or
+reach the second through `rawptr`.
+
 ## Aggregate literals
 
 Elements must be compile-time constants: literals, other constants, `sizeof`,

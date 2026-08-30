@@ -13480,6 +13480,8 @@ $runFixtures = @(
      What = "a codegen check failed" },
   @{ Name = "casts"; Path = "tests/codegen/casts.mettle"
      What = "a codegen check failed" },
+  @{ Name = "decl_order"; Path = "tests/codegen/decl_order.mettle"
+     What = "a type declared below the one that names it was not registered in time" },
   @{ Name = "int_edges"; Path = "tests/codegen/int_edges.mettle"
      What = "a codegen check failed" },
   @{ Name = "funcptr"; Path = "tests/codegen/funcptr.mettle"

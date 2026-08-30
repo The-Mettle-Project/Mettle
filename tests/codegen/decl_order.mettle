@@ -1,0 +1,63 @@
+// A function can call one declared below it, and a type gets the same
+// courtesy. Registration used to walk the file top to bottom, so an enum whose
+// payload named a struct written later was "payload of unknown type", and a
+// struct field naming a later struct was "Unknown type in struct field". Order
+// here is deliberately the reverse of the dependency order throughout.
+import "std/io";
+
+enum Shape { Wide(Span), Deep(Nest), Nothing }
+
+struct Nest { inner: Leaf; n: int64; }
+
+fn use_later(v: Later) -> int64 { return v.z; }
+
+struct Span { lo: int64; hi: int64; }
+
+struct Later { z: int64; }
+
+struct Leaf { v: int64; }
+
+struct Ring { next: Ring*; v: int64; }
+
+struct Holder { shape: Shape; tag: Leaf; }
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+@noinline fn score(s: Shape) -> int64 {
+  match (s) {
+    case Wide(w): { return w.lo * 10 + w.hi; }
+    case Deep(d): { return d.inner.v + d.n; }
+    case Nothing: { return 0 - 1; }
+  }
+  return 0 - 2;
+}
+
+fn main() -> int32 {
+  var span: Span;
+  span.lo = opaque(3);
+  span.hi = opaque(4);
+  if (score(Wide(span)) != 34) { return 1; }
+
+  var nest: Nest;
+  nest.inner.v = opaque(5);
+  nest.n = opaque(6);
+  if (score(Deep(nest)) != 11) { return 2; }
+
+  if (score(Nothing()) != 0 - 1) { return 3; }
+
+  var later: Later;
+  later.z = opaque(8);
+  if (use_later(later) != 8) { return 4; }
+
+  var ring: Ring;
+  ring.v = opaque(9);
+  ring.next = &ring;
+  if (ring.next->v != 9) { return 5; }
+
+  var held: Holder;
+  held.shape = Wide(span);
+  held.tag.v = opaque(7);
+  if (score(held.shape) != 34 || held.tag.v != 7) { return 6; }
+
+  return 0;
+}

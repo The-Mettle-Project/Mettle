@@ -295,24 +295,169 @@ int type_checker_register_function_signature(TypeChecker *checker,
   return 1;
 }
 
+/* The name a declaration introduces, or NULL when it introduces none. */
+static const char *type_decl_name(const ASTNode *decl) {
+  if (!decl) {
+    return NULL;
+  }
+  if (decl->type == AST_STRUCT_DECLARATION) {
+    const StructDeclaration *s = (const StructDeclaration *)decl->data;
+    return s ? s->name : NULL;
+  }
+  if (decl->type == AST_ENUM_DECLARATION) {
+    const EnumDeclaration *en = (const EnumDeclaration *)decl->data;
+    return en ? en->name : NULL;
+  }
+  return NULL;
+}
+
+/* Does this type text name `what` as a whole identifier? `Span`, `Span*`,
+ * `Span[4]` and `Cell<Span>` all do; `Spanner` does not. */
+static int type_text_names(const char *text, const char *what) {
+  size_t length;
+  const char *at;
+
+  if (!text || !what || !*what) {
+    return 0;
+  }
+  length = strlen(what);
+  for (at = strstr(text, what); at; at = strstr(at + 1, what)) {
+    int left_ok = at == text || (!isalnum((unsigned char)at[-1]) &&
+                                 at[-1] != '_');
+    char right = at[length];
+    int right_ok = !isalnum((unsigned char)right) && right != '_';
+    if (left_ok && right_ok) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Does `decl` refer to `name` in a field type or a variant payload? */
+static int type_decl_refers_to(const ASTNode *decl, const char *name) {
+  size_t i;
+  if (!decl || !name) {
+    return 0;
+  }
+  if (decl->type == AST_STRUCT_DECLARATION) {
+    const StructDeclaration *s = (const StructDeclaration *)decl->data;
+    if (!s) {
+      return 0;
+    }
+    for (i = 0; i < s->field_count; i++) {
+      if (type_text_names(s->field_types ? s->field_types[i] : NULL, name)) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (decl->type == AST_ENUM_DECLARATION) {
+    const EnumDeclaration *en = (const EnumDeclaration *)decl->data;
+    if (!en) {
+      return 0;
+    }
+    for (i = 0; i < en->variant_count; i++) {
+      if (type_text_names(en->variants[i].payload_type, name)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 /* Struct and enum registration, over either the declarations the programmer
  * wrote or the ones expansion generated. Two sweeps rather than one because
  * expansion sits between them: a directive reflects on a type, so the written
  * types have to exist before it runs, and the types it generates only exist
- * after. */
+ * after.
+ *
+ * Within a sweep the order is by dependency, not by where the declarations sit
+ * in the file. A function can call one declared below it, and a type gets the
+ * same courtesy: `enum Shape { Wide(Span) }` above `struct Span` used to be
+ * "payload of unknown type 'Span'". A declaration waits while any type it names
+ * is still pending; when a round settles nothing, the rest are processed in
+ * source order so a genuine cycle or a genuinely unknown name reports itself. */
 static int type_checker_register_types(TypeChecker *checker, Program *prog,
                                        int generated_only) {
   int ok = 1;
-  for (size_t i = 0; i < prog->declaration_count; i++) {
+  char *pending = calloc(prog->declaration_count, 1);
+  size_t remaining = 0;
+  size_t i, j;
+
+  for (i = 0; i < prog->declaration_count; i++) {
     ASTNode *decl = prog->declarations[i];
+    ComptimeDeclScope expansion;
     if (!decl || (decl->type != AST_STRUCT_DECLARATION &&
                   decl->type != AST_ENUM_DECLARATION)) {
       continue;
     }
-    ComptimeDeclScope expansion;
     type_checker_enter_expansion_decl(checker, decl, &expansion);
-    int is_generated = expansion.bindings_pushed > 0;
-    if (is_generated == generated_only) {
+    if ((expansion.bindings_pushed > 0) == generated_only) {
+      if (pending) {
+        pending[i] = 1;
+        remaining++;
+      }
+    }
+    type_checker_leave_expansion_decl(checker, &expansion);
+  }
+
+  while (pending && remaining > 0) {
+    size_t settled = 0;
+    for (i = 0; i < prog->declaration_count; i++) {
+      ASTNode *decl;
+      ComptimeDeclScope expansion;
+      const char *self;
+      int waiting = 0;
+      if (!pending[i]) {
+        continue;
+      }
+      decl = prog->declarations[i];
+      self = type_decl_name(decl);
+      for (j = 0; j < prog->declaration_count && !waiting; j++) {
+        const char *other;
+        if (j == i || !pending[j]) {
+          continue;
+        }
+        other = type_decl_name(prog->declarations[j]);
+        /* A name declared twice is a duplicate, reported when it is processed;
+         * waiting on the other one here would just stall the round. */
+        if (other && (!self || strcmp(other, self) != 0) &&
+            type_decl_refers_to(decl, other)) {
+          waiting = 1;
+        }
+      }
+      if (waiting) {
+        continue;
+      }
+      pending[i] = 0;
+      remaining--;
+      settled++;
+      type_checker_enter_expansion_decl(checker, decl, &expansion);
+      if (decl->type == AST_STRUCT_DECLARATION
+              ? !type_checker_process_struct_declaration(checker, decl)
+              : !type_checker_process_enum_declaration(checker, decl)) {
+        ok = 0;
+      }
+      type_checker_leave_expansion_decl(checker, &expansion);
+    }
+    if (settled == 0) {
+      break;
+    }
+  }
+
+  for (i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl;
+    ComptimeDeclScope expansion;
+    if (pending && !pending[i]) {
+      continue;
+    }
+    decl = prog->declarations[i];
+    if (!decl || (decl->type != AST_STRUCT_DECLARATION &&
+                  decl->type != AST_ENUM_DECLARATION)) {
+      continue;
+    }
+    type_checker_enter_expansion_decl(checker, decl, &expansion);
+    if ((expansion.bindings_pushed > 0) == generated_only) {
       if (decl->type == AST_STRUCT_DECLARATION
               ? !type_checker_process_struct_declaration(checker, decl)
               : !type_checker_process_enum_declaration(checker, decl)) {
@@ -321,6 +466,8 @@ static int type_checker_register_types(TypeChecker *checker, Program *prog,
     }
     type_checker_leave_expansion_decl(checker, &expansion);
   }
+
+  free(pending);
   return ok;
 }
 
