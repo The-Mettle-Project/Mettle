@@ -1421,6 +1421,707 @@ int mir_rewrite_string_concat_calls(IRFunction *ir_function) {
 
 /* Pure-ish scan: returns 1 if every instruction is in the supported set and the
  * signature is GP-only. Uses generator for type queries; no MIR built yet. */
+static int mir_gate_control(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_NOP:
+  case IR_OP_LABEL:
+  case IR_OP_JUMP:
+    break;
+  case IR_OP_DECLARE_LOCAL:
+    /* A DIRECT small-aggregate local is allowed: field access lowers to
+     * &local + offset + LOAD/STORE (all supported), and when its address is
+     * taken it becomes memory-resident with an 8-byte home covering it. An
+     * INDIRECT struct local is also allowed: it gets a multi-slot home sized
+     * to the whole struct (home_bytes), and the same &local + offset + memory
+     * machinery reaches every field. Whole-struct by-name uses of it are
+     * rejected by the guard below, so only field access ever touches it. */
+    if (in->text && !mir_type_is_mir_value(generator, in->text) &&
+        !mir_type_is_indirect_aggregate(generator, in->text)) {
+      return mir_trace_bail(ir_function, "declare_local:nonscalar");
+    }
+    break;
+  case IR_OP_BRANCH_ZERO:
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
+      return 0;
+    }
+    /* branch_zero on a float value (e.g. errdefer on a float return) needs a
+     * float-zero compare; float branches are deferred -> fall back. */
+    if (in->lhs.kind == IR_OPERAND_TEMP &&
+        mir_temp_is_float(generator, ir_function, in->lhs.name, 0)) {
+      return 0;
+    }
+    break;
+  case IR_OP_BRANCH_EQ: {
+    /* if (lhs == rhs) goto label: integer equality (switch/match dispatch).
+     * Both operands must be register-resident or an int literal; float
+     * equality would need ucomis, so defer it. */
+    const IROperand *eq[2] = {&in->lhs, &in->rhs};
+    for (int k = 0; k < 2; k++) {
+      if (eq[k]->kind != IR_OPERAND_TEMP && eq[k]->kind != IR_OPERAND_SYMBOL &&
+          eq[k]->kind != IR_OPERAND_INT) {
+        return mir_trace_bail(ir_function, "branch_eq:operand_kind");
+      }
+      if (eq[k]->kind == IR_OPERAND_TEMP &&
+          mir_temp_is_float(generator, ir_function, eq[k]->name, 0)) {
+        return mir_trace_bail(ir_function, "branch_eq:float");
+      }
+    }
+    if (in->is_float) {
+      return mir_trace_bail(ir_function, "branch_eq:float");
+    }
+    break;
+  }
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_arith(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_BINARY: {
+    MirOpcode tmp;
+    if (!in->text) {
+      return 0;
+    }
+    /* String '+' is the concat kernel; only the fallback emitter has it. */
+    if (in->value_type && in->value_type->kind == MTLC_TYPE_STRING) {
+      return mir_trace_bail(ir_function, "binary:string");
+    }
+    if (in->is_float) {
+      /* Float arithmetic, or an ordered float comparison (<,<=,>,>=). */
+      int sw;
+      unsigned char fcc;
+      if (!mir_float_arith_opcode(in->text, &tmp) &&
+          !mir_float_cmp_info(in->text, 0, &sw, &fcc)) {
+        return 0;
+      }
+    } else if (!mir_arith_opcode(in->text, &tmp) &&
+               !mir_is_comparison(in->text) &&
+               strcmp(in->text, "/") != 0 && strcmp(in->text, "%") != 0) {
+      return mir_trace_bail(ir_function, "binary:other");
+    }
+    if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+      return 0;
+    }
+    for (int k = 0; k < 2; k++) {
+      const IROperand *o = k == 0 ? &in->lhs : &in->rhs;
+      if (o->kind != IR_OPERAND_TEMP && o->kind != IR_OPERAND_SYMBOL &&
+          o->kind != IR_OPERAND_INT && o->kind != IR_OPERAND_FLOAT) {
+        return 0;
+      }
+    }
+    break;
+  }
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_convert(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_CAST:
+    /* Any scalar numeric cast: int<->int, int<->float, float<->float. The
+     * direction is resolved from operand types during lowering, which is
+     * exhaustive for these, so it cannot fail mid-function. */
+    if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+      return 0;
+    }
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
+        in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
+      return 0;
+    }
+    break;
+  case IR_OP_UNARY:
+    /* Integer unary `-`, `~`, `+`, `!`; float unary `-` (negate as 0-x) and
+     * `+` (copy). Float `~`/`!` are not valid and popcnt is deferred. */
+    if (!in->text) {
+      return mir_trace_bail(ir_function, "unary:float_or_unsupported");
+    }
+    if (in->is_float) {
+      if (strcmp(in->text, "-") != 0 && strcmp(in->text, "+") != 0) {
+        return mir_trace_bail(ir_function, "unary:float_or_unsupported");
+      }
+    } else if (strcmp(in->text, "-") != 0 && strcmp(in->text, "~") != 0 &&
+               strcmp(in->text, "+") != 0 && strcmp(in->text, "!") != 0 &&
+               strcmp(in->text, "popcnt") != 0) {
+      return mir_trace_bail(ir_function, "unary:float_or_unsupported");
+    }
+    if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+      return 0;
+    }
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
+        in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
+      return 0;
+    }
+    break;
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_value(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_ASSIGN:
+    if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+      return 0;
+    }
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
+        in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
+      /* `@s <- "lit"`: a string literal into a string local/temp is a
+       * 16-byte copy from the literal's .rdata record (MIR_LEA_STRLIT). */
+      if (in->lhs.kind == IR_OPERAND_STRING &&
+          mir_operand_struct_home_size(generator, ir_function, &in->dest) >
+              0) {
+        break;
+      }
+      return 0;
+    }
+    break;
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_memory(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_LOAD:
+    /* `%t <- *"literal" [8]` reads the data-pointer field of a string
+     * literal's fat struct: the value IS the address of a NUL-terminated
+     * .rdata cstring, so it lowers to MIR_LEA_CSTR (the same materialization
+     * used for string-literal call arguments). Any other width/shape on a
+     * STRING operand is deferred. */
+    if (in->lhs.kind == IR_OPERAND_STRING) {
+      if (in->is_float || in->rhs.kind != IR_OPERAND_INT ||
+          in->rhs.int_value != 8) {
+        return mir_trace_bail(ir_function, "load:string_shape");
+      }
+      if (in->dest.kind != IR_OPERAND_TEMP &&
+          in->dest.kind != IR_OPERAND_SYMBOL) {
+        return mir_trace_bail(ir_function, "load:dest");
+      }
+      break;
+    }
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
+      return mir_trace_bail(ir_function, "load:address_kind");
+    }
+    if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+      return mir_trace_bail(ir_function, "load:dest");
+    }
+    break;
+  case IR_OP_STORE:
+    if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+      return 0; /* address */
+    }
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
+        in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
+      return 0; /* value */
+    }
+    break;
+  case IR_OP_PREFETCH:
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
+      return mir_trace_bail(ir_function, "prefetch:addr");
+    }
+    break;
+  case IR_OP_ROTATE_ADD:
+    /* next = a + b; a = b; b = next. Writes lhs and rhs too, which the
+     * written-global tracking only covers for dest, so a and b must be
+     * locals/params. */
+    if (in->dest.kind != IR_OPERAND_SYMBOL ||
+        in->lhs.kind != IR_OPERAND_SYMBOL ||
+        in->rhs.kind != IR_OPERAND_SYMBOL || in->is_float ||
+        !mir_local_or_param_type(generator, ir_function, in->lhs.name,
+                                 NULL) ||
+        !mir_local_or_param_type(generator, ir_function, in->rhs.name,
+                                 NULL)) {
+      return 0;
+    }
+    break;
+  case IR_OP_NEW:
+    /* Zeroed heap allocation: size is a compile-time INT, absent (defaults
+     * to 8), or a runtime GP value; the result pointer lands in a
+     * TEMP/SYMBOL. Win64 lowers to the inline GetProcessHeap+HeapAlloc
+     * sequence (MIR_HEAP_NEW), SysV to a plain calloc call. */
+    if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+      return mir_trace_bail(ir_function, "new:dest");
+    }
+    if (in->rhs.kind != IR_OPERAND_NONE && in->rhs.kind != IR_OPERAND_INT &&
+        in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL) {
+      return mir_trace_bail(ir_function, "new:size");
+    }
+    break;
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_select(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_SELECT: {
+    /* dest = (cond != 0) ? then : else. Each of cond/then/else may be a
+     * temp/symbol/int; the dest is a temp/symbol. */
+    const IROperand *sops[3] = {&in->lhs, &in->rhs,
+                                in->argument_count > 0 ? &in->arguments[0]
+                                                       : NULL};
+    if (!sops[2]) {
+      return mir_trace_bail(ir_function, "select:no_else");
+    }
+    for (int s = 0; s < 3; s++) {
+      if (sops[s]->kind != IR_OPERAND_TEMP &&
+          sops[s]->kind != IR_OPERAND_SYMBOL &&
+          sops[s]->kind != IR_OPERAND_INT) {
+        return mir_trace_bail(ir_function, "select:operand_kind");
+      }
+    }
+    if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+      return mir_trace_bail(ir_function, "select:dest_kind");
+    }
+    break;
+  }
+  case IR_OP_RETURN:
+    if (in->lhs.kind != IR_OPERAND_NONE && in->lhs.kind != IR_OPERAND_TEMP &&
+        in->lhs.kind != IR_OPERAND_SYMBOL && in->lhs.kind != IR_OPERAND_INT) {
+      return 0;
+    }
+    /* An INDIRECT-returning function returns anything the indirect-copy
+     * machinery can source: a struct LOCAL or TEMP home (a call result
+     * lands in the temp's home via the hidden pointer), a by-ref param's
+     * pointee, a global aggregate, or a string literal. */
+    if (mir_type_is_indirect_aggregate(generator,
+                                       ir_function->return_type_name) &&
+        !mir_indirect_source_is_supported(generator, ir_function, &in->lhs)) {
+      return mir_trace_bail(ir_function, "return:indirect_nonlocal");
+    }
+    break;
+  case IR_OP_CALL:
+    if (!mir_call_is_supported(generator, ir_function, in)) {
+      return mir_trace_bail(ir_function, "call_unsupported");
+    }
+    break;
+  case IR_OP_CALL_INDIRECT:
+    if (!mir_call_indirect_is_supported(generator, ir_function, in)) {
+      return mir_trace_bail(ir_function, "call_indirect_unsupported");
+    }
+    break;
+  case IR_OP_ADDRESS_OF:
+    /* &local/&param (made memory-resident via forced spill) or &global (kept
+     * cached but coherent via flush/reload around pointer memory ops).
+     * Functions/strings have their own address forms and are deferred. */
+    if (mir_addressof_kind(generator, ir_function, in) ==
+        MIR_ADDROF_UNSUPPORTED) {
+      return mir_trace_bail(ir_function, "addressof:unsupported");
+    }
+    if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+      return mir_trace_bail(ir_function, "addressof:dest");
+    }
+    break;
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_mac(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_SIMD_SLP_MAC_I8:
+  case IR_OP_SIMD_SLP_MAC_I32: {
+    /* SLP MAC kernel run INLINE inside the MIR function (so the surrounding
+     * outer loops keep register-allocated codegen). The lowering marshals the
+     * three base pointers + count + byte stride into RCX/RDX/R8/R9/RAX, so the
+     * only compile-time-constant requirement is the lane count K (it selects
+     * the xmm-vs-ymm kernel width); the bases, offsets, count, and stride may
+     * each be a runtime temp/symbol resolved via mir_value_operand. The I8
+     * variant (int8 a/b, int32 c) uses the same shape with different element
+     * scaling, handled in lowering. */
+    if (in->argument_count < 6 || !in->arguments ||
+        in->arguments[0].kind != IR_OPERAND_INT ||
+        (in->arguments[0].int_value != 4 &&
+         in->arguments[0].int_value != 8)) {
+      return mir_trace_bail(ir_function, "slp_mac:nonconst_K");
+    }
+    const IROperand *bases[3] = {&in->dest, &in->lhs, &in->rhs};
+    for (int k = 0; k < 3; k++) {
+      if (bases[k]->kind != IR_OPERAND_TEMP &&
+          bases[k]->kind != IR_OPERAND_SYMBOL) {
+        return mir_trace_bail(ir_function, "slp_mac:base_kind");
+      }
+    }
+    /* count, a_off, b_off, b_stride, out_off */
+    const int run_args[5] = {1, 2, 3, 4, 5};
+    for (int k = 0; k < 5; k++) {
+      const IROperand *o = &in->arguments[run_args[k]];
+      if (o->kind != IR_OPERAND_TEMP && o->kind != IR_OPERAND_SYMBOL &&
+          o->kind != IR_OPERAND_INT) {
+        return mir_trace_bail(ir_function, "slp_mac:arg_kind");
+      }
+    }
+    break;
+  }
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_fill_counter(const IRFunction *ir_function,
+                                 const IRInstruction *in,
+                                 long long fill_mode) {
+  /* Mode 0 must start the induction variable at 0 (a nonzero start adjusts
+   * both the base and the count; deferred). A nonzero/runtime OFFSET (the
+   * invariant part of `base[offset + i]`) is supported by folding
+   * `base + offset*size` in MIR before the kernel, but only for an int64
+   * (wide) index so the pointer math is plain 64-bit -- an int32 offset would
+   * need the fallback's sign-extension to match exactly. */
+  if (fill_mode == 0) {
+    int start_zero = (in->arguments[3].kind == IR_OPERAND_INT &&
+                      in->arguments[3].int_value == 0);
+    int offset_zero = (in->arguments[4].kind == IR_OPERAND_INT &&
+                       in->arguments[4].int_value == 0);
+    int wide = in->argument_count > 5 &&
+               in->arguments[5].kind == IR_OPERAND_INT &&
+               in->arguments[5].int_value == 64;
+    /* A nonzero start folds into the base and the count; a nonzero offset
+     * folds into the base. An int32 start subtracts at 32 bits and
+     * sign-extends (matching the fallback's movsxd); combining a narrow
+     * start with a runtime offset still defers. */
+    if (!start_zero) {
+      if (!wide && !offset_zero) {
+        return mir_trace_bail(ir_function, "simd_fill:start");
+      }
+      if (in->arguments[3].kind != IR_OPERAND_TEMP &&
+          in->arguments[3].kind != IR_OPERAND_SYMBOL &&
+          in->arguments[3].kind != IR_OPERAND_INT) {
+        return mir_trace_bail(ir_function, "simd_fill:start");
+      }
+    }
+    if (!offset_zero) {
+      if (!wide) {
+        return mir_trace_bail(ir_function, "simd_fill:offset_width");
+      }
+      if (in->arguments[4].kind != IR_OPERAND_TEMP &&
+          in->arguments[4].kind != IR_OPERAND_SYMBOL &&
+          in->arguments[4].kind != IR_OPERAND_INT) {
+        return mir_trace_bail(ir_function, "simd_fill:offset_kind");
+      }
+    }
+  }
+  return 1;
+}
+
+static int mir_gate_fill_value(CodeGenerator *generator,
+                               const IRFunction *ir_function,
+                               const IRInstruction *in) {
+  /* The fill value: a compile-time INT, or a runtime invariant GP value
+   * (mem_fill's splatted word). A float-valued symbol would resolve to an
+   * XMM vreg the RAX marshalling cannot take, so it stays deferred. */
+  if (in->arguments[2].kind != IR_OPERAND_INT) {
+    if ((in->arguments[2].kind != IR_OPERAND_TEMP &&
+         in->arguments[2].kind != IR_OPERAND_SYMBOL) ||
+        mir_arg_float_bits(generator, ir_function, &in->arguments[2]) != 0 ||
+        (in->arguments[2].kind == IR_OPERAND_TEMP &&
+         mir_temp_is_float(generator, ir_function, in->arguments[2].name,
+                           0))) {
+      return mir_trace_bail(ir_function, "simd_fill:value");
+    }
+  }
+  return 1;
+}
+
+static int mir_gate_fill(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_SIMD_FILL: {
+    /* Inline fill passthrough: element-counted (mode 0), begin->end byte
+     * walk (mode 1), and byte-offset walk (mode 2, the mem_zero/mem_fill
+     * word loop), with a compile-time or runtime-invariant GP value. What
+     * still defers: float-valued fills, mode-1 pointer-iv write-backs, and
+     * mode-0 nonzero starts. */
+    if (in->argument_count < 5 ||
+        in->arguments[0].kind != IR_OPERAND_INT ||
+        (in->arguments[0].int_value != 1 && in->arguments[0].int_value != 2 &&
+         in->arguments[0].int_value != 4 &&
+         in->arguments[0].int_value != 8) ||
+        in->arguments[1].kind != IR_OPERAND_INT) {
+      return mir_trace_bail(ir_function, "simd_fill:shape");
+    }
+    /* Mode 0 (element-counted), mode 1 (begin->end byte walk), and mode 2
+     * (byte-offset walk: the lowering folds base+start and bound-start in
+     * 64-bit MIR, and writes the live iv back as start + bytes walked). */
+    long long fill_mode = in->arguments[1].int_value;
+    if (fill_mode != 0 && fill_mode != 1 && fill_mode != 2) {
+      return mir_trace_bail(ir_function, "simd_fill:mode");
+    }
+    if (fill_mode == 2 && in->arguments[3].kind != IR_OPERAND_TEMP &&
+        in->arguments[3].kind != IR_OPERAND_SYMBOL &&
+        in->arguments[3].kind != IR_OPERAND_INT) {
+      return mir_trace_bail(ir_function, "simd_fill:start");
+    }
+    if (!mir_gate_fill_counter(ir_function, in, fill_mode)) {
+      return 0;
+    }
+    /* A live induction variable (dest = the iv symbol) needs a final
+     * write-back, folded in MIR after the kernel: mode 0 (start 0) leaves
+     * iv = max(count, 0); mode 2 leaves iv = start + bytes walked. Either
+     * needs the iv to be a LOCAL/PARAM (resolvable to a vreg); mode 1's
+     * pointer iv and a global iv stay in the fallback. */
+    if (in->dest.kind == IR_OPERAND_SYMBOL) {
+      if ((fill_mode != 0 && fill_mode != 2) ||
+          !mir_local_or_param_type(generator, ir_function, in->dest.name,
+                                   NULL)) {
+        return mir_trace_bail(ir_function, "simd_fill:writeback");
+      }
+    }
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
+      return mir_trace_bail(ir_function, "simd_fill:base");
+    }
+    if (in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL &&
+        in->rhs.kind != IR_OPERAND_INT) {
+      return mir_trace_bail(ir_function, "simd_fill:count");
+    }
+    if (!mir_gate_fill_value(generator, ir_function, in)) {
+      return 0;
+    }
+    break;
+  }
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_affine(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_SIMD_AFFINE_MAP_F64:
+  case IR_OP_SIMD_AFFINE_MAP_F32: {
+    /* Inline float affine-map passthrough (`dst[i]=a*src[i]+b*dst[i]+c`, the
+     * float-copy/saxpy class). src (lhs) and dst (rhs) must be LEA-able
+     * pointers (TEMP/SYMBOL), the count GP-resolvable, and the a/b/c
+     * coefficients compile-time FLOAT immediates (so the kernel can bake their
+     * broadcasts); a runtime coefficient stays in the fallback. F32 and F64
+     * share this validation; the lowering below picks the width. */
+    if (in->argument_count < 4 || !in->arguments) {
+      return mir_trace_bail(ir_function, "affine_map:shape");
+    }
+    if ((in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) ||
+        (in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL)) {
+      return mir_trace_bail(ir_function, "affine_map:ptr");
+    }
+    if (in->arguments[0].kind != IR_OPERAND_TEMP &&
+        in->arguments[0].kind != IR_OPERAND_SYMBOL &&
+        in->arguments[0].kind != IR_OPERAND_INT) {
+      return mir_trace_bail(ir_function, "affine_map:count");
+    }
+    for (int k = 1; k <= 3; k++) {
+      if (in->arguments[k].kind == IR_OPERAND_FLOAT) continue;
+      /* F64 additionally accepts a RUNTIME `a` scale (arguments[1]) -- the
+       * saxpy `y=a*x+y` shape where a varies per pass; it is marshalled into
+       * an xmm and broadcast at runtime. b and c (args 2,3) must stay
+       * compile-time so their broadcasts are baked. F32 stays const-only. */
+      if (in->op == IR_OP_SIMD_AFFINE_MAP_F64 && k == 1 &&
+          (in->arguments[k].kind == IR_OPERAND_TEMP ||
+           in->arguments[k].kind == IR_OPERAND_SYMBOL)) {
+        continue;
+      }
+      return mir_trace_bail(ir_function, "affine_map:coeff");
+    }
+    break;
+  }
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_vloop(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_SIMD_VLOOP_I32:
+  case IR_OP_SIMD_VLOOP_F64: {
+    /* Inline general-vectorized-loop passthrough. Maps marshal <=3 distinct
+     * base pointers + count through RCX/RDX/R8/R9; reductions go through
+     * the generic kernel bridge (staged frame slots), which also carries
+     * their accumulator and any invariant scalars. */
+    const char *vnames[4];
+    const IROperand *vsrcs[4];
+    const int vi32 = (in->op == IR_OP_SIMD_VLOOP_I32);
+    int vn = 0;
+    if (in->argument_count < 7 || !in->arguments) {
+      return mir_trace_bail(ir_function, "vloop:shape");
+    }
+    if (vi32 ? (in->float_bits != 32 && in->float_bits != 8)
+             : (in->float_bits != 64 && in->float_bits != 32)) {
+      return mir_trace_bail(ir_function, "vloop:width");
+    }
+    /* Reductions, scalar-reading DAGs, and 4-base maps run through the
+     * generic kernel bridge (staged slots); plain maps with <=3 bases take
+     * the marshalled fast path. */
+    {
+      const int vreduce = in->arguments[0].int_value != 0;
+      int bridge = vreduce || in->arguments[5].int_value != 0;
+      if (!vreduce) {
+        if (code_generator_vloop_collect_dist(in, 0, vnames, vsrcs, &vn) <
+            0) {
+          return mir_trace_bail(ir_function, "vloop:bases");
+        }
+        if (vn > 3) {
+          bridge = 1;
+        }
+      }
+      if (bridge) {
+        int slots = mir_kernel_slot_estimate(in);
+        if (slots < 0 || slots > MIR_KERNEL_MAX_SLOTS) {
+          return mir_trace_bail(ir_function,
+                                vreduce ? "vloop:reduce" : "vloop:scalars");
+        }
+        break;
+      }
+    }
+    for (int vk = 0; vk < vn; vk++) {
+      if (!vsrcs[vk] || (vsrcs[vk]->kind != IR_OPERAND_TEMP &&
+                         vsrcs[vk]->kind != IR_OPERAND_SYMBOL)) {
+        return mir_trace_bail(ir_function, "vloop:ptr");
+      }
+    }
+    if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
+        in->lhs.kind != IR_OPERAND_INT) {
+      return mir_trace_bail(ir_function, "vloop:count");
+    }
+    break;
+  }
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+static int mir_gate_silu(CodeGenerator *generator,
+                       const IRFunction *ir_function,
+                       const IRInstruction *in, size_t i,
+                       int *handled) {
+  (void)generator;
+  (void)i;
+  *handled = 1;
+  switch (in->op) {
+  case IR_OP_SIMD_SILU_F32: {
+    /* Inline SiLU/SwiGLU passthrough. g (lhs) must be a LEA-able pointer, the
+     * count GP-resolvable, and (SwiGLU) u (rhs) a pointer too; plain SiLU
+     * leaves rhs NONE/"" (no multiply). */
+    if (in->argument_count < 1 || !in->arguments ||
+        (in->lhs.kind != IR_OPERAND_TEMP &&
+         in->lhs.kind != IR_OPERAND_SYMBOL)) {
+      return mir_trace_bail(ir_function, "silu:g");
+    }
+    if (in->arguments[0].kind != IR_OPERAND_TEMP &&
+        in->arguments[0].kind != IR_OPERAND_SYMBOL &&
+        in->arguments[0].kind != IR_OPERAND_INT) {
+      return mir_trace_bail(ir_function, "silu:count");
+    }
+    if (in->rhs.kind != IR_OPERAND_NONE && in->rhs.kind != IR_OPERAND_STRING &&
+        in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL) {
+      return mir_trace_bail(ir_function, "silu:u");
+    }
+    break;
+  }
+  default:
+    *handled = 0;
+    break;
+  }
+  return 1;
+}
+
+
+static int mir_gate_inline_kernel(const IRFunction *ir_function,
+                                  const IRInstruction *in) {
+  /* A kernel in the inline-kernel table runs in place (MIR_IR_KERNEL): it
+   * needs no per-opcode gate, only room to stage its by-name operands. */
+  if (mir_ir_kernel_for_op(in->op)) {
+    int slots = mir_kernel_slot_estimate(in);
+    if (slots < 0) {
+      return mir_trace_bail(ir_function, "kernel:operand_kind");
+    }
+    if (slots > MIR_KERNEL_MAX_SLOTS) {
+      return mir_trace_bail(ir_function, "kernel:slots");
+    }
+    return 1;
+  }
+  /* NEW, ROTATE_ADD, the tensor ops: not yet. */
+  char buf[40];
+  snprintf(buf, sizeof(buf), "op:%d", (int)in->op);
+  return mir_trace_bail(ir_function, buf);
+}
+
 int mir_function_is_eligible(CodeGenerator *generator,
                              IRFunction *ir_function) {
   if (!generator || !ir_function) {
@@ -1792,522 +2493,28 @@ int mir_function_is_eligible(CodeGenerator *generator,
         }
       }
     }
-    switch (in->op) {
-    case IR_OP_NOP:
-    case IR_OP_LABEL:
-    case IR_OP_JUMP:
-      break;
-    case IR_OP_DECLARE_LOCAL:
-      /* A DIRECT small-aggregate local is allowed: field access lowers to
-       * &local + offset + LOAD/STORE (all supported), and when its address is
-       * taken it becomes memory-resident with an 8-byte home covering it. An
-       * INDIRECT struct local is also allowed: it gets a multi-slot home sized
-       * to the whole struct (home_bytes), and the same &local + offset + memory
-       * machinery reaches every field. Whole-struct by-name uses of it are
-       * rejected by the guard below, so only field access ever touches it. */
-      if (in->text && !mir_type_is_mir_value(generator, in->text) &&
-          !mir_type_is_indirect_aggregate(generator, in->text)) {
-        return mir_trace_bail(ir_function, "declare_local:nonscalar");
-      }
-      break;
-    case IR_OP_BRANCH_ZERO:
-      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
-        return 0;
-      }
-      /* branch_zero on a float value (e.g. errdefer on a float return) needs a
-       * float-zero compare; float branches are deferred -> fall back. */
-      if (in->lhs.kind == IR_OPERAND_TEMP &&
-          mir_temp_is_float(generator, ir_function, in->lhs.name, 0)) {
-        return 0;
-      }
-      break;
-    case IR_OP_BRANCH_EQ: {
-      /* if (lhs == rhs) goto label: integer equality (switch/match dispatch).
-       * Both operands must be register-resident or an int literal; float
-       * equality would need ucomis, so defer it. */
-      const IROperand *eq[2] = {&in->lhs, &in->rhs};
-      for (int k = 0; k < 2; k++) {
-        if (eq[k]->kind != IR_OPERAND_TEMP && eq[k]->kind != IR_OPERAND_SYMBOL &&
-            eq[k]->kind != IR_OPERAND_INT) {
-          return mir_trace_bail(ir_function, "branch_eq:operand_kind");
-        }
-        if (eq[k]->kind == IR_OPERAND_TEMP &&
-            mir_temp_is_float(generator, ir_function, eq[k]->name, 0)) {
-          return mir_trace_bail(ir_function, "branch_eq:float");
-        }
-      }
-      if (in->is_float) {
-        return mir_trace_bail(ir_function, "branch_eq:float");
-      }
-      break;
-    }
-    case IR_OP_ASSIGN:
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return 0;
-      }
-      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
-          in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
-        /* `@s <- "lit"`: a string literal into a string local/temp is a
-         * 16-byte copy from the literal's .rdata record (MIR_LEA_STRLIT). */
-        if (in->lhs.kind == IR_OPERAND_STRING &&
-            mir_operand_struct_home_size(generator, ir_function, &in->dest) >
-                0) {
-          break;
-        }
-        return 0;
-      }
-      break;
-    case IR_OP_BINARY: {
-      MirOpcode tmp;
-      if (!in->text) {
-        return 0;
-      }
-      /* String '+' is the concat kernel; only the fallback emitter has it. */
-      if (in->value_type && in->value_type->kind == MTLC_TYPE_STRING) {
-        return mir_trace_bail(ir_function, "binary:string");
-      }
-      if (in->is_float) {
-        /* Float arithmetic, or an ordered float comparison (<,<=,>,>=). */
-        int sw;
-        unsigned char fcc;
-        if (!mir_float_arith_opcode(in->text, &tmp) &&
-            !mir_float_cmp_info(in->text, 0, &sw, &fcc)) {
+    {
+      static int (*const GATES[])(CodeGenerator *, const IRFunction *,
+                                  const IRInstruction *, size_t, int *) = {
+          mir_gate_control, mir_gate_value,  mir_gate_arith,
+          mir_gate_convert, mir_gate_memory, mir_gate_select,
+          mir_gate_mac,     mir_gate_fill,   mir_gate_affine,
+          mir_gate_vloop,   mir_gate_silu};
+      size_t gate;
+      int claimed = 0;
+      for (gate = 0; gate < sizeof(GATES) / sizeof(GATES[0]); gate++) {
+        int handled = 0;
+        if (!GATES[gate](generator, ir_function, in, i, &handled)) {
           return 0;
         }
-      } else if (!mir_arith_opcode(in->text, &tmp) &&
-                 !mir_is_comparison(in->text) &&
-                 strcmp(in->text, "/") != 0 && strcmp(in->text, "%") != 0) {
-        return mir_trace_bail(ir_function, "binary:other");
-      }
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return 0;
-      }
-      for (int k = 0; k < 2; k++) {
-        const IROperand *o = k == 0 ? &in->lhs : &in->rhs;
-        if (o->kind != IR_OPERAND_TEMP && o->kind != IR_OPERAND_SYMBOL &&
-            o->kind != IR_OPERAND_INT && o->kind != IR_OPERAND_FLOAT) {
-          return 0;
-        }
-      }
-      break;
-    }
-    case IR_OP_CAST:
-      /* Any scalar numeric cast: int<->int, int<->float, float<->float. The
-       * direction is resolved from operand types during lowering, which is
-       * exhaustive for these, so it cannot fail mid-function. */
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return 0;
-      }
-      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
-          in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
-        return 0;
-      }
-      break;
-    case IR_OP_UNARY:
-      /* Integer unary `-`, `~`, `+`, `!`; float unary `-` (negate as 0-x) and
-       * `+` (copy). Float `~`/`!` are not valid and popcnt is deferred. */
-      if (!in->text) {
-        return mir_trace_bail(ir_function, "unary:float_or_unsupported");
-      }
-      if (in->is_float) {
-        if (strcmp(in->text, "-") != 0 && strcmp(in->text, "+") != 0) {
-          return mir_trace_bail(ir_function, "unary:float_or_unsupported");
-        }
-      } else if (strcmp(in->text, "-") != 0 && strcmp(in->text, "~") != 0 &&
-                 strcmp(in->text, "+") != 0 && strcmp(in->text, "!") != 0 &&
-                 strcmp(in->text, "popcnt") != 0) {
-        return mir_trace_bail(ir_function, "unary:float_or_unsupported");
-      }
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return 0;
-      }
-      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
-          in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
-        return 0;
-      }
-      break;
-    case IR_OP_LOAD:
-      /* `%t <- *"literal" [8]` reads the data-pointer field of a string
-       * literal's fat struct: the value IS the address of a NUL-terminated
-       * .rdata cstring, so it lowers to MIR_LEA_CSTR (the same materialization
-       * used for string-literal call arguments). Any other width/shape on a
-       * STRING operand is deferred. */
-      if (in->lhs.kind == IR_OPERAND_STRING) {
-        if (in->is_float || in->rhs.kind != IR_OPERAND_INT ||
-            in->rhs.int_value != 8) {
-          return mir_trace_bail(ir_function, "load:string_shape");
-        }
-        if (in->dest.kind != IR_OPERAND_TEMP &&
-            in->dest.kind != IR_OPERAND_SYMBOL) {
-          return mir_trace_bail(ir_function, "load:dest");
-        }
-        break;
-      }
-      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
-        return mir_trace_bail(ir_function, "load:address_kind");
-      }
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return mir_trace_bail(ir_function, "load:dest");
-      }
-      break;
-    case IR_OP_STORE:
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return 0; /* address */
-      }
-      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
-          in->lhs.kind != IR_OPERAND_INT && in->lhs.kind != IR_OPERAND_FLOAT) {
-        return 0; /* value */
-      }
-      break;
-    case IR_OP_PREFETCH:
-      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
-        return mir_trace_bail(ir_function, "prefetch:addr");
-      }
-      break;
-    case IR_OP_ROTATE_ADD:
-      /* next = a + b; a = b; b = next. Writes lhs and rhs too, which the
-       * written-global tracking only covers for dest, so a and b must be
-       * locals/params. */
-      if (in->dest.kind != IR_OPERAND_SYMBOL ||
-          in->lhs.kind != IR_OPERAND_SYMBOL ||
-          in->rhs.kind != IR_OPERAND_SYMBOL || in->is_float ||
-          !mir_local_or_param_type(generator, ir_function, in->lhs.name,
-                                   NULL) ||
-          !mir_local_or_param_type(generator, ir_function, in->rhs.name,
-                                   NULL)) {
-        return 0;
-      }
-      break;
-    case IR_OP_NEW:
-      /* Zeroed heap allocation: size is a compile-time INT, absent (defaults
-       * to 8), or a runtime GP value; the result pointer lands in a
-       * TEMP/SYMBOL. Win64 lowers to the inline GetProcessHeap+HeapAlloc
-       * sequence (MIR_HEAP_NEW), SysV to a plain calloc call. */
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return mir_trace_bail(ir_function, "new:dest");
-      }
-      if (in->rhs.kind != IR_OPERAND_NONE && in->rhs.kind != IR_OPERAND_INT &&
-          in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL) {
-        return mir_trace_bail(ir_function, "new:size");
-      }
-      break;
-    case IR_OP_SELECT: {
-      /* dest = (cond != 0) ? then : else. Each of cond/then/else may be a
-       * temp/symbol/int; the dest is a temp/symbol. */
-      const IROperand *sops[3] = {&in->lhs, &in->rhs,
-                                  in->argument_count > 0 ? &in->arguments[0]
-                                                         : NULL};
-      if (!sops[2]) {
-        return mir_trace_bail(ir_function, "select:no_else");
-      }
-      for (int s = 0; s < 3; s++) {
-        if (sops[s]->kind != IR_OPERAND_TEMP &&
-            sops[s]->kind != IR_OPERAND_SYMBOL &&
-            sops[s]->kind != IR_OPERAND_INT) {
-          return mir_trace_bail(ir_function, "select:operand_kind");
-        }
-      }
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return mir_trace_bail(ir_function, "select:dest_kind");
-      }
-      break;
-    }
-    case IR_OP_RETURN:
-      if (in->lhs.kind != IR_OPERAND_NONE && in->lhs.kind != IR_OPERAND_TEMP &&
-          in->lhs.kind != IR_OPERAND_SYMBOL && in->lhs.kind != IR_OPERAND_INT) {
-        return 0;
-      }
-      /* An INDIRECT-returning function returns anything the indirect-copy
-       * machinery can source: a struct LOCAL or TEMP home (a call result
-       * lands in the temp's home via the hidden pointer), a by-ref param's
-       * pointee, a global aggregate, or a string literal. */
-      if (mir_type_is_indirect_aggregate(generator,
-                                         ir_function->return_type_name) &&
-          !mir_indirect_source_is_supported(generator, ir_function, &in->lhs)) {
-        return mir_trace_bail(ir_function, "return:indirect_nonlocal");
-      }
-      break;
-    case IR_OP_CALL:
-      if (!mir_call_is_supported(generator, ir_function, in)) {
-        return mir_trace_bail(ir_function, "call_unsupported");
-      }
-      break;
-    case IR_OP_CALL_INDIRECT:
-      if (!mir_call_indirect_is_supported(generator, ir_function, in)) {
-        return mir_trace_bail(ir_function, "call_indirect_unsupported");
-      }
-      break;
-    case IR_OP_ADDRESS_OF:
-      /* &local/&param (made memory-resident via forced spill) or &global (kept
-       * cached but coherent via flush/reload around pointer memory ops).
-       * Functions/strings have their own address forms and are deferred. */
-      if (mir_addressof_kind(generator, ir_function, in) ==
-          MIR_ADDROF_UNSUPPORTED) {
-        return mir_trace_bail(ir_function, "addressof:unsupported");
-      }
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
-        return mir_trace_bail(ir_function, "addressof:dest");
-      }
-      break;
-    case IR_OP_SIMD_SLP_MAC_I8:
-    case IR_OP_SIMD_SLP_MAC_I32: {
-      /* SLP MAC kernel run INLINE inside the MIR function (so the surrounding
-       * outer loops keep register-allocated codegen). The lowering marshals the
-       * three base pointers + count + byte stride into RCX/RDX/R8/R9/RAX, so the
-       * only compile-time-constant requirement is the lane count K (it selects
-       * the xmm-vs-ymm kernel width); the bases, offsets, count, and stride may
-       * each be a runtime temp/symbol resolved via mir_value_operand. The I8
-       * variant (int8 a/b, int32 c) uses the same shape with different element
-       * scaling, handled in lowering. */
-      if (in->argument_count < 6 || !in->arguments ||
-          in->arguments[0].kind != IR_OPERAND_INT ||
-          (in->arguments[0].int_value != 4 &&
-           in->arguments[0].int_value != 8)) {
-        return mir_trace_bail(ir_function, "slp_mac:nonconst_K");
-      }
-      const IROperand *bases[3] = {&in->dest, &in->lhs, &in->rhs};
-      for (int k = 0; k < 3; k++) {
-        if (bases[k]->kind != IR_OPERAND_TEMP &&
-            bases[k]->kind != IR_OPERAND_SYMBOL) {
-          return mir_trace_bail(ir_function, "slp_mac:base_kind");
-        }
-      }
-      /* count, a_off, b_off, b_stride, out_off */
-      const int run_args[5] = {1, 2, 3, 4, 5};
-      for (int k = 0; k < 5; k++) {
-        const IROperand *o = &in->arguments[run_args[k]];
-        if (o->kind != IR_OPERAND_TEMP && o->kind != IR_OPERAND_SYMBOL &&
-            o->kind != IR_OPERAND_INT) {
-          return mir_trace_bail(ir_function, "slp_mac:arg_kind");
-        }
-      }
-      break;
-    }
-    case IR_OP_SIMD_FILL: {
-      /* Inline fill passthrough: element-counted (mode 0), begin->end byte
-       * walk (mode 1), and byte-offset walk (mode 2, the mem_zero/mem_fill
-       * word loop), with a compile-time or runtime-invariant GP value. What
-       * still defers: float-valued fills, mode-1 pointer-iv write-backs, and
-       * mode-0 nonzero starts. */
-      if (in->argument_count < 5 ||
-          in->arguments[0].kind != IR_OPERAND_INT ||
-          (in->arguments[0].int_value != 1 && in->arguments[0].int_value != 2 &&
-           in->arguments[0].int_value != 4 &&
-           in->arguments[0].int_value != 8) ||
-          in->arguments[1].kind != IR_OPERAND_INT) {
-        return mir_trace_bail(ir_function, "simd_fill:shape");
-      }
-      /* Mode 0 (element-counted), mode 1 (begin->end byte walk), and mode 2
-       * (byte-offset walk: the lowering folds base+start and bound-start in
-       * 64-bit MIR, and writes the live iv back as start + bytes walked). */
-      long long fill_mode = in->arguments[1].int_value;
-      if (fill_mode != 0 && fill_mode != 1 && fill_mode != 2) {
-        return mir_trace_bail(ir_function, "simd_fill:mode");
-      }
-      if (fill_mode == 2 && in->arguments[3].kind != IR_OPERAND_TEMP &&
-          in->arguments[3].kind != IR_OPERAND_SYMBOL &&
-          in->arguments[3].kind != IR_OPERAND_INT) {
-        return mir_trace_bail(ir_function, "simd_fill:start");
-      }
-      /* Mode 0 must start the induction variable at 0 (a nonzero start adjusts
-       * both the base and the count; deferred). A nonzero/runtime OFFSET (the
-       * invariant part of `base[offset + i]`) is supported by folding
-       * `base + offset*size` in MIR before the kernel, but only for an int64
-       * (wide) index so the pointer math is plain 64-bit -- an int32 offset would
-       * need the fallback's sign-extension to match exactly. */
-      if (fill_mode == 0) {
-        int start_zero = (in->arguments[3].kind == IR_OPERAND_INT &&
-                          in->arguments[3].int_value == 0);
-        int offset_zero = (in->arguments[4].kind == IR_OPERAND_INT &&
-                           in->arguments[4].int_value == 0);
-        int wide = in->argument_count > 5 &&
-                   in->arguments[5].kind == IR_OPERAND_INT &&
-                   in->arguments[5].int_value == 64;
-        /* A nonzero start folds into the base and the count; a nonzero offset
-         * folds into the base. An int32 start subtracts at 32 bits and
-         * sign-extends (matching the fallback's movsxd); combining a narrow
-         * start with a runtime offset still defers. */
-        if (!start_zero) {
-          if (!wide && !offset_zero) {
-            return mir_trace_bail(ir_function, "simd_fill:start");
-          }
-          if (in->arguments[3].kind != IR_OPERAND_TEMP &&
-              in->arguments[3].kind != IR_OPERAND_SYMBOL &&
-              in->arguments[3].kind != IR_OPERAND_INT) {
-            return mir_trace_bail(ir_function, "simd_fill:start");
-          }
-        }
-        if (!offset_zero) {
-          if (!wide) {
-            return mir_trace_bail(ir_function, "simd_fill:offset_width");
-          }
-          if (in->arguments[4].kind != IR_OPERAND_TEMP &&
-              in->arguments[4].kind != IR_OPERAND_SYMBOL &&
-              in->arguments[4].kind != IR_OPERAND_INT) {
-            return mir_trace_bail(ir_function, "simd_fill:offset_kind");
-          }
-        }
-      }
-      /* A live induction variable (dest = the iv symbol) needs a final
-       * write-back, folded in MIR after the kernel: mode 0 (start 0) leaves
-       * iv = max(count, 0); mode 2 leaves iv = start + bytes walked. Either
-       * needs the iv to be a LOCAL/PARAM (resolvable to a vreg); mode 1's
-       * pointer iv and a global iv stay in the fallback. */
-      if (in->dest.kind == IR_OPERAND_SYMBOL) {
-        if ((fill_mode != 0 && fill_mode != 2) ||
-            !mir_local_or_param_type(generator, ir_function, in->dest.name,
-                                     NULL)) {
-          return mir_trace_bail(ir_function, "simd_fill:writeback");
-        }
-      }
-      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) {
-        return mir_trace_bail(ir_function, "simd_fill:base");
-      }
-      if (in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL &&
-          in->rhs.kind != IR_OPERAND_INT) {
-        return mir_trace_bail(ir_function, "simd_fill:count");
-      }
-      /* The fill value: a compile-time INT, or a runtime invariant GP value
-       * (mem_fill's splatted word). A float-valued symbol would resolve to an
-       * XMM vreg the RAX marshalling cannot take, so it stays deferred. */
-      if (in->arguments[2].kind != IR_OPERAND_INT) {
-        if ((in->arguments[2].kind != IR_OPERAND_TEMP &&
-             in->arguments[2].kind != IR_OPERAND_SYMBOL) ||
-            mir_arg_float_bits(generator, ir_function, &in->arguments[2]) != 0 ||
-            (in->arguments[2].kind == IR_OPERAND_TEMP &&
-             mir_temp_is_float(generator, ir_function, in->arguments[2].name,
-                               0))) {
-          return mir_trace_bail(ir_function, "simd_fill:value");
-        }
-      }
-      break;
-    }
-    case IR_OP_SIMD_AFFINE_MAP_F64:
-    case IR_OP_SIMD_AFFINE_MAP_F32: {
-      /* Inline float affine-map passthrough (`dst[i]=a*src[i]+b*dst[i]+c`, the
-       * float-copy/saxpy class). src (lhs) and dst (rhs) must be LEA-able
-       * pointers (TEMP/SYMBOL), the count GP-resolvable, and the a/b/c
-       * coefficients compile-time FLOAT immediates (so the kernel can bake their
-       * broadcasts); a runtime coefficient stays in the fallback. F32 and F64
-       * share this validation; the lowering below picks the width. */
-      if (in->argument_count < 4 || !in->arguments) {
-        return mir_trace_bail(ir_function, "affine_map:shape");
-      }
-      if ((in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL) ||
-          (in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL)) {
-        return mir_trace_bail(ir_function, "affine_map:ptr");
-      }
-      if (in->arguments[0].kind != IR_OPERAND_TEMP &&
-          in->arguments[0].kind != IR_OPERAND_SYMBOL &&
-          in->arguments[0].kind != IR_OPERAND_INT) {
-        return mir_trace_bail(ir_function, "affine_map:count");
-      }
-      for (int k = 1; k <= 3; k++) {
-        if (in->arguments[k].kind == IR_OPERAND_FLOAT) continue;
-        /* F64 additionally accepts a RUNTIME `a` scale (arguments[1]) -- the
-         * saxpy `y=a*x+y` shape where a varies per pass; it is marshalled into
-         * an xmm and broadcast at runtime. b and c (args 2,3) must stay
-         * compile-time so their broadcasts are baked. F32 stays const-only. */
-        if (in->op == IR_OP_SIMD_AFFINE_MAP_F64 && k == 1 &&
-            (in->arguments[k].kind == IR_OPERAND_TEMP ||
-             in->arguments[k].kind == IR_OPERAND_SYMBOL)) {
-          continue;
-        }
-        return mir_trace_bail(ir_function, "affine_map:coeff");
-      }
-      break;
-    }
-    case IR_OP_SIMD_VLOOP_I32:
-    case IR_OP_SIMD_VLOOP_F64: {
-      /* Inline general-vectorized-loop passthrough. Maps marshal <=3 distinct
-       * base pointers + count through RCX/RDX/R8/R9; reductions go through
-       * the generic kernel bridge (staged frame slots), which also carries
-       * their accumulator and any invariant scalars. */
-      const char *vnames[4];
-      const IROperand *vsrcs[4];
-      const int vi32 = (in->op == IR_OP_SIMD_VLOOP_I32);
-      int vn = 0;
-      if (in->argument_count < 7 || !in->arguments) {
-        return mir_trace_bail(ir_function, "vloop:shape");
-      }
-      if (vi32 ? (in->float_bits != 32 && in->float_bits != 8)
-               : (in->float_bits != 64 && in->float_bits != 32)) {
-        return mir_trace_bail(ir_function, "vloop:width");
-      }
-      /* Reductions, scalar-reading DAGs, and 4-base maps run through the
-       * generic kernel bridge (staged slots); plain maps with <=3 bases take
-       * the marshalled fast path. */
-      {
-        const int vreduce = in->arguments[0].int_value != 0;
-        int bridge = vreduce || in->arguments[5].int_value != 0;
-        if (!vreduce) {
-          if (code_generator_vloop_collect_dist(in, 0, vnames, vsrcs, &vn) <
-              0) {
-            return mir_trace_bail(ir_function, "vloop:bases");
-          }
-          if (vn > 3) {
-            bridge = 1;
-          }
-        }
-        if (bridge) {
-          int slots = mir_kernel_slot_estimate(in);
-          if (slots < 0 || slots > MIR_KERNEL_MAX_SLOTS) {
-            return mir_trace_bail(ir_function,
-                                  vreduce ? "vloop:reduce" : "vloop:scalars");
-          }
+        if (handled) {
+          claimed = 1;
           break;
         }
       }
-      for (int vk = 0; vk < vn; vk++) {
-        if (!vsrcs[vk] || (vsrcs[vk]->kind != IR_OPERAND_TEMP &&
-                           vsrcs[vk]->kind != IR_OPERAND_SYMBOL)) {
-          return mir_trace_bail(ir_function, "vloop:ptr");
-        }
+      if (!claimed && !mir_gate_inline_kernel(ir_function, in)) {
+        return 0;
       }
-      if (in->lhs.kind != IR_OPERAND_TEMP && in->lhs.kind != IR_OPERAND_SYMBOL &&
-          in->lhs.kind != IR_OPERAND_INT) {
-        return mir_trace_bail(ir_function, "vloop:count");
-      }
-      break;
-    }
-    case IR_OP_SIMD_SILU_F32: {
-      /* Inline SiLU/SwiGLU passthrough. g (lhs) must be a LEA-able pointer, the
-       * count GP-resolvable, and (SwiGLU) u (rhs) a pointer too; plain SiLU
-       * leaves rhs NONE/"" (no multiply). */
-      if (in->argument_count < 1 || !in->arguments ||
-          (in->lhs.kind != IR_OPERAND_TEMP &&
-           in->lhs.kind != IR_OPERAND_SYMBOL)) {
-        return mir_trace_bail(ir_function, "silu:g");
-      }
-      if (in->arguments[0].kind != IR_OPERAND_TEMP &&
-          in->arguments[0].kind != IR_OPERAND_SYMBOL &&
-          in->arguments[0].kind != IR_OPERAND_INT) {
-        return mir_trace_bail(ir_function, "silu:count");
-      }
-      if (in->rhs.kind != IR_OPERAND_NONE && in->rhs.kind != IR_OPERAND_STRING &&
-          in->rhs.kind != IR_OPERAND_TEMP && in->rhs.kind != IR_OPERAND_SYMBOL) {
-        return mir_trace_bail(ir_function, "silu:u");
-      }
-      break;
-    }
-    default: {
-      /* A kernel in the inline-kernel table runs in place (MIR_IR_KERNEL): it
-       * needs no per-opcode gate, only room to stage its by-name operands. */
-      if (mir_ir_kernel_for_op(in->op)) {
-        int slots = mir_kernel_slot_estimate(in);
-        if (slots < 0) {
-          return mir_trace_bail(ir_function, "kernel:operand_kind");
-        }
-        if (slots > MIR_KERNEL_MAX_SLOTS) {
-          return mir_trace_bail(ir_function, "kernel:slots");
-        }
-        break;
-      }
-      /* NEW, ROTATE_ADD, the tensor ops: not yet. */
-      char buf[40];
-      snprintf(buf, sizeof(buf), "op:%d", (int)in->op);
-      return mir_trace_bail(ir_function, buf);
-    }
     }
   }
   if (mir_env_trace()) {
