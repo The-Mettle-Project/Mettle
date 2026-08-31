@@ -312,6 +312,7 @@ export extern fn Ui_PeekMessageA(msg: UiMsg*, hwnd: int64, filter_min: uint32, f
 export extern fn Ui_TranslateMessage(msg: UiMsg*) -> int32 = "TranslateMessage";
 export extern fn Ui_DispatchMessageA(msg: UiMsg*) -> int64 = "DispatchMessageA";
 export extern fn Ui_SendMessageA(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 = "SendMessageA";
+export extern fn Ui_PostMessageA(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int32 = "PostMessageA";
 export extern fn Ui_SetTimer(hwnd: int64, timer_id: uint32, elapsed_ms: uint32, proc: cstring) -> uint32 = "SetTimer";
 export extern fn Ui_KillTimer(hwnd: int64, timer_id: uint32) -> int32 = "KillTimer";
 export extern fn Ui_MessageBoxA(owner: int64, text: cstring, caption: cstring, kind: uint32) -> int32 = "MessageBoxA";
@@ -682,7 +683,7 @@ export fn ui_def_window_proc_auto(hwnd: int64, msg: uint32, wparam: int64, lpara
   if (Ui_IsWindowUnicode(hwnd) != 0) {
     return Ui_DefWindowProcW(hwnd, msg, wparam, lparam);
   }
-  return ui_def_window_proc_auto(hwnd, msg, wparam, lparam);
+  return Ui_DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 fn ui_trampoline_window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
@@ -840,6 +841,17 @@ export fn ui_run_message_loop() -> int32 {
     Ui_DispatchMessageA(&msg);
   }
   return (int32)msg.wparam;
+}
+
+// Hand a window a message. `ui_send_message` dispatches it now and answers with
+// what the window procedure returned; `ui_post_message` queues it for the pump
+// and answers whether it was queued.
+export fn ui_send_message(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  return Ui_SendMessageA(hwnd, msg, wparam, lparam);
+}
+
+export fn ui_post_message(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int32 {
+  return Ui_PostMessageA(hwnd, msg, wparam, lparam);
 }
 
 export fn ui_pump_messages() -> int32 {

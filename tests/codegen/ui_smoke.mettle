@@ -1,0 +1,250 @@
+/* std/ui end to end, without a person at the keyboard.
+ *
+ * `ui_def_window_proc_auto` fell through to itself on the ANSI branch, so the
+ * first message a window handled itself -- WM_PAINT, on the first repaint --
+ * recursed until the stack ran out. Every std/ui program died the same way, and
+ * the exit code (0xC00000FD) was all there was to go on.
+ *
+ * The window here is created hidden and driven by messages this program posts
+ * to it, so the fixture needs no display and no input. It still walks the real
+ * paths: class registration, the trampoline that dispatches to a Mettle window
+ * procedure, painting into a device context, a child control answering
+ * WM_COMMAND, a timer, and the pump. */
+
+import "std/ui";
+
+var seen_create: int32 = 0;
+var seen_paint: int32 = 0;
+var seen_size: int32 = 0;
+var seen_command: int32 = 0;
+var seen_timer: int32 = 0;
+var seen_key: int32 = 0;
+var paint_width: int32 = 0;
+var last_mouse_x: int32 = 0;
+var last_mouse_y: int32 = 0;
+
+fn on_paint(hwnd: int64) {
+  var ps: UiPaintStruct;
+  var hdc: int64 = ui_begin_paint(hwnd, &ps);
+  var theme: UiTheme = ui_default_theme();
+  var width: int32 = ui_client_width(hwnd);
+  var height: int32 = ui_client_height(hwnd);
+  paint_width = width;
+
+  ui_fill_rect_color(hdc, 0, 0, width, height, theme.background);
+  ui_fill_rect_color(hdc, 0, 0, width, 40, theme.accent);
+  var frame: UiRect = ui_make_rect(4, 4, width - 4, height - 4);
+  ui_frame_rect_color(hdc, &frame, theme.border);
+  ui_draw_line(hdc, 0, 40, width, 40, theme.border, 1);
+  var outline: UiRect = ui_rect_xywh(8, 48, 112, 32);
+  ui_draw_rect_outline(hdc, &outline, theme.border, 1);
+  var oval: UiRect = ui_rect_xywh(130, 48, 70, 32);
+  ui_draw_ellipse_outline(hdc, &oval, theme.accent, 1);
+  ui_draw_text_color(hdc, 12, 12, "smoke", theme.accent_text, theme.accent);
+  ui_draw_text_transparent(hdc, 12, 52, "transparent", theme.text);
+
+  var box: UiRect = ui_rect_xywh(8, 90, 200, 24);
+  ui_draw_text_rect_color(hdc, &box, "in a rect", theme.muted_text, UI_DT_CENTER() | UI_DT_SINGLELINE());
+
+  ui_end_paint(hwnd, &ps);
+  seen_paint = seen_paint + 1;
+}
+
+fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  if (msg == UI_WM_CREATE()) {
+    seen_create = seen_create + 1;
+    return 0;
+  }
+  if (msg == UI_WM_PAINT()) {
+    on_paint(hwnd);
+    return 0;
+  }
+  if (msg == UI_WM_SIZE()) {
+    seen_size = ui_size_width(lparam);
+    return 0;
+  }
+  if (msg == UI_WM_COMMAND()) {
+    if (ui_command_id(wparam) == 4242) {
+      seen_command = seen_command + 1;
+    }
+    return 0;
+  }
+  if (msg == UI_WM_TIMER()) {
+    seen_timer = seen_timer + 1;
+    ui_quit(0);
+    return 0;
+  }
+  if (msg == UI_WM_KEYDOWN()) {
+    seen_key = (int32)wparam;
+    return 0;
+  }
+  if (msg == UI_WM_MOUSEMOVE()) {
+    last_mouse_x = ui_mouse_x(lparam);
+    last_mouse_y = ui_mouse_y(lparam);
+    return 0;
+  }
+  if (msg == UI_WM_DESTROY()) {
+    ui_quit(0);
+    return 0;
+  }
+  return ui_def_window_proc(hwnd, msg, wparam, lparam);
+}
+
+/* The pure helpers: no window, no device context, just arithmetic that every
+ * layout in a std/ui program leans on. */
+fn check_helpers() -> int32 {
+  var c: uint32 = ui_rgb(10, 20, 30);
+  if (ui_color_r(c) != 10) { return 1; }
+  if (ui_color_g(c) != 20) { return 2; }
+  if (ui_color_b(c) != 30) { return 3; }
+
+  if (ui_lo_word(0x00040003) != 3) { return 4; }
+  if (ui_hi_word(0x00040003) != 4) { return 5; }
+
+  var r: UiRect = ui_rect_xywh(10, 20, 100, 50);
+  if (ui_rect_width(r) != 100) { return 6; }
+  if (ui_rect_height(r) != 50) { return 7; }
+  if (ui_rect_is_empty(r) != 0) { return 8; }
+  if (ui_rect_contains(r, 10, 20) != 1) { return 9; }
+  if (ui_rect_contains(r, 110, 20) != 0) { return 10; }
+
+  var inset: UiRect = ui_rect_inset(r, ui_make_insets(5));
+  if (ui_rect_width(inset) != 90) { return 11; }
+  if (ui_rect_height(inset) != 40) { return 12; }
+
+  var moved: UiRect = ui_rect_offset(r, 5, 7);
+  if (moved.left != 15) { return 13; }
+  if (moved.top != 27) { return 14; }
+
+  if (ui_clamp_i32(200, 0, 100) != 100) { return 15; }
+  if (ui_clamp_i32(0 - 5, 0, 100) != 0) { return 16; }
+  if (ui_scale(100, 192) != 200) { return 17; }
+  if (ui_cstring_len("hello") != 5) { return 18; }
+
+  if (ui_size_width(0x00500080) != 128) { return 19; }
+  if (ui_size_height(0x00500080) != 80) { return 20; }
+  if (ui_mouse_x(0x0000FFFF) != 0 - 1) { return 21; }
+  if (ui_mouse_y(0xFFFF0000) != 0 - 1) { return 22; }
+
+  var p: UiPoint = ui_make_point(3, 4);
+  if (p.x != 3) { return 23; }
+  if (p.y != 4) { return 24; }
+
+  var sz: UiSize = ui_make_size(6, 7);
+  if (sz.width != 6) { return 25; }
+  if (sz.height != 7) { return 26; }
+
+  var theme: UiTheme = ui_default_theme();
+  if (ui_color_r(theme.accent_text) != 255) { return 27; }
+
+  return 0;
+}
+
+fn main() -> int32 {
+  var helpers: int32 = check_helpers();
+  if (helpers != 0) { return helpers; }
+
+  if (ui_init() == 0) { return 40; }
+  if (ui_init() == 0) { return 41; }
+
+  var hwnd: int64 = ui_window_create("mettle ui smoke", 0, 0, 480, 240, &window_proc);
+  if (hwnd == 0) { return 42; }
+  if (seen_create != 1) { return 43; }
+
+  /* Hidden the whole way: SW_HIDE keeps the window off the screen while it
+   * still receives everything posted to it. */
+  ui_window_hide(hwnd);
+
+  if (ui_client_width(hwnd) <= 0) { return 44; }
+  if (ui_client_height(hwnd) <= 0) { return 45; }
+
+  var rect: UiRect = ui_window_client_rect(hwnd);
+  if (ui_rect_width(rect) != ui_client_width(hwnd)) { return 46; }
+
+  var button: int64 = ui_button_create(hwnd, 8, 120, 90, 26, "press", 4242);
+  if (button == 0) { return 47; }
+  ui_control_set_text(button, "pressed");
+  if (ui_control_text_length(button) != 7) { return 48; }
+
+  var check: int64 = ui_checkbox_create(hwnd, 8, 152, 90, 22, "toggle", 4243);
+  if (check == 0) { return 49; }
+  ui_checkbox_set_checked(check, 1);
+  if (ui_checkbox_is_checked(check) != 1) { return 50; }
+  ui_checkbox_set_checked(check, 0);
+  if (ui_checkbox_is_checked(check) != 0) { return 51; }
+
+  var list: int64 = ui_listbox_create(hwnd, 120, 120, 140, 60, 4244);
+  if (list == 0) { return 52; }
+  ui_listbox_add(list, "one");
+  ui_listbox_add(list, "two");
+  ui_listbox_select(list, 1);
+  if (ui_listbox_selected(list) != 1) { return 53; }
+  ui_listbox_clear(list);
+  if (ui_listbox_selected(list) != UI_LB_ERR()) { return 54; }
+
+  var combo: int64 = ui_combobox_create(hwnd, 270, 120, 140, 120, 4245);
+  if (combo == 0) { return 55; }
+  ui_combobox_add(combo, "alpha");
+  ui_combobox_select(combo, 0);
+  if (ui_combobox_selected(combo) != 0) { return 56; }
+
+  /* WM_PAINT is the message that used to take the stack out. Sent rather than
+   * posted because a hidden window is never asked to repaint by the system;
+   * the route through the trampoline into window_proc is the same one. */
+  ui_window_invalidate(hwnd);
+  ui_send_message(hwnd, UI_WM_PAINT(), 0, 0);
+  if (seen_paint < 1) { return 57; }
+  if (paint_width != ui_client_width(hwnd)) { return 58; }
+
+  ui_post_message(hwnd, UI_WM_SIZE(), 0, 0x00500080);
+  ui_post_message(hwnd, UI_WM_COMMAND(), 4242, button);
+  ui_post_message(hwnd, UI_WM_KEYDOWN(), 65, 0);
+  ui_post_message(hwnd, UI_WM_MOUSEMOVE(), 0, 0x00190032);
+  ui_pump_messages();
+  if (seen_size != 128) { return 59; }
+  if (seen_command != 1) { return 60; }
+  if (seen_key != 65) { return 61; }
+  if (last_mouse_x != 50) { return 62; }
+  if (last_mouse_y != 25) { return 63; }
+
+  /* A message std/ui does not handle reaches DefWindowProc. That call is the
+   * one that recursed; reaching it and coming back is the whole point. Both
+   * the direct call and the route the system takes, which is a message the
+   * window procedure above does not name. */
+  var answered: int64 = ui_def_window_proc(hwnd, UI_WM_GETTEXTLENGTH(), 0, 0);
+  if (answered < 0) { return 64; }
+  ui_send_message(hwnd, UI_WM_SETFOCUS(), 0, 0);
+  ui_send_message(hwnd, UI_WM_ERASEBKGND(), 0, 0);
+  ui_send_message(hwnd, UI_WM_SHOWWINDOW(), 0, 0);
+
+  /* The blocking loop, the one every std/ui program ends on. The timer fires,
+   * its handler posts WM_QUIT, and the loop returns that exit code. */
+  ui_timer_start(hwnd, 1, 10);
+  var loop_code: int32 = ui_run_message_loop();
+  ui_timer_stop(hwnd, 1);
+  if (seen_timer == 0) { return 65; }
+  if (loop_code != 0) { return 66; }
+
+  var font: int64 = ui_create_font(16, "Segoe UI", 400);
+  if (font == 0) { return 67; }
+  ui_control_set_font(button, font);
+  ui_delete_object(font);
+
+  ui_control_hide(button);
+  ui_control_show(button);
+  ui_control_enable(button, 0);
+  ui_control_enable(button, 1);
+  ui_control_move(button, 8, 190, 90, 26);
+
+  ui_window_set_title(hwnd, "renamed");
+  ui_window_move(hwnd, 10, 10, 400, 200, 1);
+  var dirty: UiRect = ui_rect_xywh(0, 0, 40, 40);
+  ui_window_invalidate_rect(hwnd, &dirty);
+  ui_pump_messages();
+
+  ui_set_user_data(hwnd, 0);
+  ui_window_close(hwnd);
+  ui_pump_messages();
+  ui_shutdown();
+  return 0;
+}

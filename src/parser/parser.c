@@ -614,6 +614,43 @@ int parser_is_binary_operator(TokenType type) {
   }
 }
 
+/* An operator that may open a continuation line, so
+ *
+ *   var wx: float64 = x + a(i)
+ *                       + b(i);
+ *
+ * reads as one expression. It is the mirror of the trailing form, which works
+ * because the loop below skips newlines after consuming an operator.
+ *
+ * Every operator here is one no statement can begin with, so nothing that used
+ * to parse as two statements now parses as one. `*` is the exception and is
+ * deliberately absent: `*p = 5;` is a statement, so a line opening with `*`
+ * is genuinely ambiguous. Multiplication splits on the trailing form. */
+static int parser_operator_opens_continuation_line(TokenType type) {
+  switch (type) {
+  case TOKEN_PLUS:
+  case TOKEN_MINUS:
+  case TOKEN_DIVIDE:
+  case TOKEN_PERCENT:
+  case TOKEN_EQUALS_EQUALS:
+  case TOKEN_NOT_EQUALS:
+  case TOKEN_LESS_THAN:
+  case TOKEN_LESS_EQUALS:
+  case TOKEN_GREATER_THAN:
+  case TOKEN_GREATER_EQUALS:
+  case TOKEN_AND_AND:
+  case TOKEN_OR_OR:
+  case TOKEN_AMPERSAND:
+  case TOKEN_PIPE:
+  case TOKEN_CARET:
+  case TOKEN_LSHIFT:
+  case TOKEN_RSHIFT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 int parser_is_unary_operator(TokenType type) {
   switch (type) {
   case TOKEN_MINUS:
@@ -960,7 +997,8 @@ static ASTNode *parser_parse_exported_declaration(Parser *parser) {
     if (decl && decl->data) {
       ((TraitDeclaration *)decl->data)->is_exported = 1;
     }
-  } else if (parser->current_token.type == TOKEN_VAR) {
+  } else if (parser->current_token.type == TOKEN_VAR ||
+             parser->current_token.type == TOKEN_CONST) {
     decl = parser_parse_var_declaration(parser);
     if (decl && decl->data) {
       ((VarDeclaration *)decl->data)->is_exported = 1;
@@ -996,8 +1034,8 @@ static ASTNode *parser_parse_exported_declaration(Parser *parser) {
                      "'@inline export fn', not 'export @inline ...')");
     return NULL;
   } else {
-    parser_set_error(parser, "Expected 'fn', 'var', 'struct', 'enum', "
-                             "'trait', or 'extern' after 'export'");
+    parser_set_error(parser, "Expected 'fn', 'var', 'const', 'struct', "
+                             "'enum', 'trait', or 'extern' after 'export'");
     return NULL;
   }
   return decl;
@@ -3899,6 +3937,18 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
     return NULL;
 
   while (1) {
+    /* A line opening with `.` or `->` continues this one, so a chain can be
+     * written down the page. Neither can begin a statement, so nothing that
+     * used to parse as two statements now parses as one. */
+    while (parser->current_token.type == TOKEN_NEWLINE &&
+           parser->peek_token.type == TOKEN_NEWLINE) {
+      parser_advance(parser);
+    }
+    if (parser->current_token.type == TOKEN_NEWLINE &&
+        (parser->peek_token.type == TOKEN_DOT ||
+         parser->peek_token.type == TOKEN_ARROW)) {
+      parser_advance(parser);
+    }
     SourceLocation location = parser_current_location(parser);
 
     if (expr->type == AST_IDENTIFIER &&
@@ -4291,7 +4341,22 @@ ASTNode *parser_parse_binary_expression(Parser *parser, int min_precedence) {
    * count is restored on the way out so a sibling expression starts level. */
   int enclosing_depth = parser->expression_depth;
 
-  while (parser_is_binary_operator(parser->current_token.type)) {
+  for (;;) {
+    /* Blank lines inside a split expression: stepping over one leaves another
+     * newline current, so a statement that does end here still sees one. */
+    while (parser->current_token.type == TOKEN_NEWLINE &&
+           parser->peek_token.type == TOKEN_NEWLINE) {
+      parser_advance(parser);
+    }
+    if (parser->current_token.type == TOKEN_NEWLINE &&
+        parser_operator_opens_continuation_line(parser->peek_token.type) &&
+        parser_get_operator_precedence(parser->peek_token.type) >=
+            min_precedence) {
+      parser_advance(parser); // the operator opens the next line
+    }
+    if (!parser_is_binary_operator(parser->current_token.type)) {
+      break;
+    }
     SourceLocation location = parser_current_location(parser);
     int precedence = parser_get_operator_precedence(parser->current_token.type);
     if (precedence < min_precedence)

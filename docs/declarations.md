@@ -51,9 +51,21 @@ const MAX = 100;
 const NAME: string = "mettle";
 ```
 
-A global `const` holding an integer literal may leave its type off, and it
-takes the literal's type. Everything else, including every local `const`,
-names its type.
+A global `const` holding a numeric or string literal may leave its type off,
+and it takes the literal's type. Everything else, including every local
+`const`, names its type. A float is a constant like any other:
+
+```mettle
+const DS_PI = 3.14159265358979;
+const HALF: float32 = 0.5;
+```
+
+`export const` puts a constant on the module's public surface, where an
+importer can use it wherever a constant goes -- an array size included:
+
+```mettle
+export const MAX_CARGO = 24;
+```
 
 A `const` may hold an aggregate, which is how you write a table:
 

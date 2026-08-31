@@ -22,6 +22,7 @@ CodeGenerator *code_generator_create(void) {
   generator->current_function_name = NULL;
   generator->generate_debug_info = 0;
   generator->generate_stack_trace_support = 0;
+  generator->generate_crash_report = 0;
   generator->eliminate_unreachable_functions = 0;
   generator->has_error = 0;
   generator->has_user_error = 0;
@@ -166,6 +167,12 @@ void code_generator_set_stack_trace_support(CodeGenerator *generator,
                                             int enable) {
   if (generator) {
     generator->generate_stack_trace_support = enable ? 1 : 0;
+  }
+}
+
+void code_generator_set_crash_report(CodeGenerator *generator, int enable) {
+  if (generator) {
+    generator->generate_crash_report = enable ? 1 : 0;
   }
 }
 

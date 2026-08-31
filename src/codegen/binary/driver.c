@@ -366,7 +366,8 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
   generator->last_runtime_location_line = 0;
   generator->last_runtime_location_column = 0;
 
-  if (generator->debug_info && generator->generate_stack_trace_support) {
+  if (generator->debug_info && (generator->generate_stack_trace_support ||
+                               generator->generate_crash_report)) {
     context.runtime_end_label =
         code_generator_generate_label(generator, "mettledbg_func_end");
     if (!context.runtime_end_label) {
@@ -796,17 +797,20 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator) {
     return 0;
   }
 
-  if (generator->generate_stack_trace_support &&
+  if ((generator->generate_stack_trace_support ||
+       generator->generate_crash_report) &&
       !code_generator_binary_emit_runtime_debug_tables(generator)) {
     return 0;
   }
 
-  if (generator->generate_stack_trace_support &&
+  if ((generator->generate_stack_trace_support ||
+       generator->generate_crash_report) &&
       !code_generator_binary_emit_crash_startup(generator)) {
     return 0;
   }
 
-  if ((generator->generate_stack_trace_support || generator->profile_runtime) &&
+  if ((generator->generate_stack_trace_support ||
+       generator->generate_crash_report || generator->profile_runtime) &&
       !code_generator_binary_emit_elf_runtime_hooks(generator)) {
     return 0;
   }

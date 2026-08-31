@@ -66,5 +66,51 @@ fn main() -> int32 {
   var quoted: string = "say \"{name}\"";
   if (quoted != "say \"pea\"") { return 12; }
 
+  /* The operator opening the line, the mirror of the trailing form above. */
+  var lead: int64 = 1
+      + 2
+      - 3
+      + opaque(10)
+      / 2;
+  if (lead != 5) { return 13; }
+
+  var chained: bool = lead > 1
+      && lead < 100
+      || false;
+  if (!chained) { return 14; }
+
+  var bits: int64 = 1
+      | 2
+      | 4
+      & 6
+      ^ 1;
+  if (bits != 7) { return 15; }
+
+  /* Blank lines inside a split expression, and a chain written down the page
+   * through both member operators. */
+  var spread: int64 = 10
+
+      + 5;
+  if (spread != 15) { return 16; }
+
+  var cell: Cell<int64>
+  cell.v = 41;
+  var pcell: Cell<int64>* = &cell;
+  var read: int64 = cell
+      .v
+      + pcell
+      ->v;
+  if (read != 82) { return 17; }
+
+  /* A line opening with `*` is a dereference-assignment statement, not a
+   * continuation of the one above it. That is why `*` splits on the trailing
+   * form and is the one operator the leading form leaves alone. */
+  var target: int32 = 0;
+  var into: int32* = &target;
+  var untouched: int32 = opaque(6)
+  *into = 5;
+  if (untouched != 6) { return 18; }
+  if (target != 5) { return 19; }
+
   return 0;
 }

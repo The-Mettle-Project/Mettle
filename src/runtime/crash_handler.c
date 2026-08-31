@@ -510,6 +510,20 @@ static void mettle_crash_print_frame(size_t index, uintptr_t program_counter) {
   }
 }
 
+/* Function records alone place a fault in a function, at the line that
+ * function is declared on. Per-statement lines are a separate, larger table
+ * that only -s / -d ask for, so say where the exact line is. */
+static void mettle_crash_write_precision_hint(void) {
+  if (g_runtime_debug_location_count > 0 ||
+      g_runtime_debug_function_count == 0) {
+    return;
+  }
+  mettle_crash_write_stderr(
+      "Lines above are where each function is declared; rebuild with -s for "
+      "the exact statement.");
+  mettle_crash_write_newline();
+}
+
 static void mettle_crash_print_trace_from_frame(uintptr_t program_counter,
                                                 uintptr_t frame_pointer) {
   mettle_crash_write_stderr("Stack trace:");
@@ -537,6 +551,7 @@ static void mettle_crash_print_trace_from_frame(uintptr_t program_counter,
     mettle_crash_print_frame(index, return_address - 1u);
     current_frame = next_frame;
   }
+  mettle_crash_write_precision_hint();
 }
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -634,6 +649,12 @@ mettle_crash_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
                                         location_info->filename,
                                         location_info->line,
                                         location_info->column);
+    } else if (function_info && function_info->filename &&
+               function_info->line > 0) {
+      mettle_crash_write_location_arrow(function_info->function_name,
+                                        function_info->filename,
+                                        function_info->line,
+                                        function_info->column);
     }
   }
 

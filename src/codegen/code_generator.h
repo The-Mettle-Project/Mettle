@@ -16,6 +16,12 @@ typedef struct {
   char *current_function_name;
   int generate_debug_info;
   int generate_stack_trace_support;
+  /* Function-granularity crash reporting: one debug record per function, the
+   * installed handler, and no per-instruction location markers -- so unlike
+   * generate_stack_trace_support it does not push a function to the baseline
+   * emitter. On by default; a fault names its function instead of being
+   * silent. */
+  int generate_crash_report;
   int eliminate_unreachable_functions;
   /* The whole program is in this object, so a function nothing outside names
    * can take local linkage. A separately compiled object keeps every symbol
@@ -45,6 +51,7 @@ void code_generator_destroy(CodeGenerator *generator);
 void code_generator_set_ir_program(CodeGenerator *generator,
                                    IRProgram *ir_program);
 int code_generator_generate_program(CodeGenerator *generator);
+void code_generator_set_crash_report(CodeGenerator *generator, int enable);
 void code_generator_set_stack_trace_support(CodeGenerator *generator,
                                             int enable);
 void code_generator_set_debug_sidecar_emission(CodeGenerator *generator,

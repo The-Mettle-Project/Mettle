@@ -93,6 +93,21 @@ static int compiler_options_use_profile_runtime(const CompilerOptions *options) 
          (options->profile_runtime || options->profile_runtime_ops);
 }
 
+/* Does this build install the crash handler at startup? Either the programmer
+ * asked for full stack traces, or the default function-granularity report is
+ * in effect -- which needs this driver to be the one producing the executable,
+ * since it is the link built here that carries crash_handler.o. */
+static int compiler_options_install_crash_handler(const CompilerOptions *options) {
+  if (!options) {
+    return 0;
+  }
+  if (options->generate_stack_trace_support) {
+    return 1;
+  }
+  return options->generate_crash_report && options->building_executable &&
+         !options->flat_output && !mtlc_target()->freestanding;
+}
+
 typedef struct {
   int enabled;
   double phases_ms[PROFILE_PHASE_COUNT];
@@ -1166,7 +1181,7 @@ static int mettle_link_elf_executable(const char *object_filename,
   int result = 1;
   int profile_runtime =
       options && compiler_options_use_profile_runtime(options) ? 1 : 0;
-  int stack_trace = options && options->generate_stack_trace_support ? 1 : 0;
+  int stack_trace = compiler_options_install_crash_handler(options);
   int needs_safety = 0;
 
   memset(extra_objects, 0, sizeof(extra_objects));
@@ -2413,7 +2428,7 @@ static int mettle_link_object_file(const char *object_filename,
               "falling back to external linkers\n");
     } else if (write_internal_startup_object(
                    startup_object, profile_runtime,
-                   options && options->generate_stack_trace_support ? 1 : 0,
+                   compiler_options_install_crash_handler(options),
                    options && options->main_wants_argc_argv ? 1 : 0) != 0) {
       if (linker_mode == LINKER_MODE_INTERNAL || (!has_gcc && !has_link)) {
         fprintf(stderr,
@@ -2604,7 +2619,7 @@ static int mettle_link_object_file(const char *object_filename,
     if (!external_startup_object ||
         write_internal_startup_object(
             external_startup_object, profile_runtime,
-            options && options->generate_stack_trace_support ? 1 : 0,
+            compiler_options_install_crash_handler(options),
             options && options->main_wants_argc_argv ? 1 : 0) != 0) {
       fprintf(stderr, "Error: Failed to generate external-linker startup object\n");
       goto cleanup;
@@ -3661,6 +3676,8 @@ static DriverFlagResult parse_flag_codegen(CompilerOptions *options,
   } else if (strcmp(argv[i], "-s") == 0 ||
              strcmp(argv[i], "--stack-trace") == 0) {
     options->generate_stack_trace_support = 1;
+  } else if (strcmp(argv[i], "--no-crash-report") == 0) {
+    options->generate_crash_report = 0;
   } else if (strcmp(argv[i], "--debug-format") == 0 && i + 1 < argc) {
     options->debug_format = argv[++i];
   } else if (strcmp(argv[i], "-O") == 0 ||
@@ -3824,6 +3841,7 @@ int main(int argc, char *argv[]) {
   char *object_output_filename = NULL;
   DriverFlags flags = {0};
   options.emit_object = 1;
+  options.generate_crash_report = 1;
   options.output_filename = default_object_output_filename();
   options.debug_format = "dwarf";
   options.ptx_target = "sm_121a";
@@ -5070,7 +5088,9 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
 
   if (options->debug_mode || options->generate_debug_symbols ||
-      options->generate_line_mapping || options->generate_stack_trace_support) {
+      options->generate_line_mapping ||
+      options->generate_stack_trace_support ||
+      (options->generate_crash_report && options->building_executable)) {
     debug_info = debug_info_create(input_filename, output_filename);
     if (!debug_info) {
       compiler_profile_add(&profile, PROFILE_PHASE_INIT, phase_start);
@@ -5122,6 +5142,17 @@ int compile_file(const char *input_filename, const char *output_filename,
   }
   code_generator_set_stack_trace_support(
       code_generator, options->generate_stack_trace_support ? 1 : 0);
+  /* Crash reporting is on by default, but only where this driver produces the
+   * executable and there is a runtime to report through: it adds references to
+   * mettle_crash_*, and only the link this driver builds is guaranteed to
+   * carry crash_handler.o. A bare object handed to someone else's linker, and
+   * a freestanding image with no runtime at all, stay as they were. */
+  code_generator_set_crash_report(
+      code_generator,
+      (options->generate_crash_report && options->building_executable &&
+       !options->flat_output && !mtlc_target()->freestanding)
+          ? 1
+          : 0);
   code_generator_set_eliminate_unreachable_functions(
       code_generator, options->release ? 1 : 0);
   code_generator_set_profile_runtime(code_generator,
@@ -5902,7 +5933,14 @@ void print_usage(const char *program_name) {
          "                      Implies --ml-opt.\n");
   printf("  -g, --debug-symbols Generate debug symbols\n");
   printf("  -l, --line-mapping  Generate source line mapping\n");
-  printf("  -s, --stack-trace   Embed runtime crash traceback support\n");
+  printf("  -s, --stack-trace   Report a crash at the exact statement. Records\n"
+         "                      a location per instruction, which the\n"
+         "                      register-allocating backend cannot carry, so\n"
+         "                      the affected functions use the baseline emitter\n");
+  printf("  --no-crash-report   Drop the default crash report from a linked\n"
+         "                      executable. By default a fault names itself,\n"
+         "                      its address and the function it happened in,\n"
+         "                      for about 8 KB and no change to codegen\n");
   printf("  --debug-format <fmt> Debug format: dwarf, stabs, or map (default: "
          "dwarf)\n");
   printf("  -O, --optimize      Enable optimizations\n");

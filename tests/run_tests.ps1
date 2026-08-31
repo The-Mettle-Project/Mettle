@@ -3579,7 +3579,11 @@ try {
   $components = @(
     @{ Name = "safety";        Flag = "--safe";            Marker = "memory access outside its allocation"
        OnProbe = "tests/runtime_excision_safety_probe.mettle" },
-    @{ Name = "crash_handler"; Flag = "-s";                Marker = "Fatal error: null pointer dereference" },
+    # The crash report is on by default, so this one is checked the other way
+    # round: absent when --no-crash-report asks for it to go, present when
+    # nothing does. A fault that says nothing is worse than 8 KB.
+    @{ Name = "crash_handler"; Flag = "";  OffFlag = "--no-crash-report"
+       Marker = "Fatal error: null pointer dereference" },
     @{ Name = "profile";       Flag = "--profile-runtime"; Marker = "total_us    avg_ns" },
     @{ Name = "debug_hooks";   Flag = "--debug-hooks";     Marker = "not a variable in this frame" }
   )
@@ -3600,20 +3604,30 @@ try {
 
     $onProbe = if ($c.ContainsKey("OnProbe") -and $c.OnProbe) { $c.OnProbe } else { $probe }
 
+    # A component is either opt-in (Flag asks for it, nothing gets it out) or
+    # opt-out (OffFlag removes it, nothing keeps it). Both are checked in both
+    # directions, since absence alone would pass if the marker never appeared.
+    $offArgs = @()
+    if ($c.ContainsKey("OffFlag") -and $c.OffFlag) { $offArgs += $c.OffFlag }
+    $onArgs = @()
+    if ($c.Flag) { $onArgs += $c.Flag }
+    $offAsked = if ($offArgs.Count -gt 0) { $offArgs -join ' ' } else { "no flag" }
+    $onAsked = if ($onArgs.Count -gt 0) { $onArgs -join ' ' } else { "no flag" }
+
     # The absence half uses whichever source the presence half will use, so a
     # marker missing from the first build is missing because the flag was
     # absent rather than because the program differed.
-    $out = & $CompilerPath --build $onProbe -o $offExe 2>&1 | Out-String
+    $out = & $CompilerPath @offArgs --build $onProbe -o $offExe 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "baseline build failed: $out" }
     if (Test-BinaryContains $offExe $c.Marker) {
       throw ("$($c.Name) was linked into a binary that did not ask for it: " +
-             "found '$($c.Marker)' without $($c.Flag)")
+             "found '$($c.Marker)' with $offAsked")
     }
 
-    $out = & $CompilerPath $c.Flag --build $onProbe -o $onExe 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "$($c.Name) build with $($c.Flag) failed: $out" }
+    $out = & $CompilerPath @onArgs --build $onProbe -o $onExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "$($c.Name) build with $onAsked failed: $out" }
     if (-not (Test-BinaryContains $onExe $c.Marker)) {
-      throw ("$($c.Name) marker '$($c.Marker)' is absent even with $($c.Flag); " +
+      throw ("$($c.Name) marker '$($c.Marker)' is absent even with $onAsked; " +
              "the absence check above proves nothing until this passes")
     }
   }
@@ -4462,6 +4476,41 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "interactive_examples_compile" -Passed $false -Reason $_.Exception.Message
+}
+}
+
+# Compiling those examples proves nothing about whether they work. std/ui had a
+# window procedure that fell through to itself instead of to DefWindowProcA, so
+# the first message a window handled recursed until the stack ran out -- every
+# std/ui program died on its first repaint, and all of them compiled clean.
+#
+# ui_smoke drives a real hidden window: class registration, the trampoline into
+# a Mettle window procedure, painting, child controls, a timer, both message
+# pumps, and the DefWindowProc fall-through. It needs no display and no input.
+if (-not $script:OnWindows) { Skip-WindowsOnly "ui_smoke" "Windows-only: std/ui is Win32" } else {
+foreach ($uiMode in @(@{ Name = "debug"; Args = @() },
+                      @{ Name = "release"; Args = @("--release") },
+                      @{ Name = "trace_release"; Args = @("-s", "--release") })) {
+  $uiCase = "ui_smoke_$($uiMode.Name)"
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $uiExe = Join-Path $tmpDir "$uiCase.exe"
+    $uiOut = & $CompilerPath --build @($uiMode.Args) `
+      "tests/codegen/ui_smoke.mettle" -o $uiExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "compile failed: $uiOut" }
+    & $uiExe | Out-Null
+    $uiExit = $LASTEXITCODE
+    if ($uiExit -eq -1073741571) {
+      throw "std/ui overflowed the stack (a window procedure recursed into itself)"
+    }
+    if ($uiExit -ne 0) { throw "std/ui check #$uiExit failed" }
+    Write-CaseResult -Name $uiCase -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $uiCase -Passed $false -Reason $_.Exception.Message
+  }
 }
 }
 

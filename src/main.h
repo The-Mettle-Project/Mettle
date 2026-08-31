@@ -110,6 +110,13 @@ typedef struct {
   int generate_debug_symbols;
   int generate_line_mapping;
   int generate_stack_trace_support;
+  /* On by default: a program that faults names the fault, the address, and the
+   * function it happened in, rather than dying silently. It costs a table of
+   * one record per function and the installed handler, and it leaves the
+   * register-allocating backend alone -- unlike -s / -d, which additionally
+   * record a location per instruction and so must use the baseline emitter.
+   * --no-crash-report turns it off. */
+  int generate_crash_report;
   const char *debug_format; // "dwarf", "stabs", or "map"
   const char **import_directories;
   size_t import_directory_count;

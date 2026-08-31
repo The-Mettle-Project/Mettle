@@ -75,6 +75,7 @@ It may appear anywhere a string literal may. The value has `.chars` and
 ```mettle
 export fn twice(x: int32) -> int32 { return x * 2; }
 export var answer: int32 = 42;
+export const MAX_CARGO = 24;
 export struct Point { x: int32; y: int32; }
 export enum Dir { Up = 1, Down = 2 }
 export extern fn puts(msg: cstring) -> int32 = "puts";

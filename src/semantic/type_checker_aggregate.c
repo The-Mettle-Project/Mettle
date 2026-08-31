@@ -109,6 +109,23 @@ static int aggregate_fold_number(TypeChecker *checker, ASTNode *expression,
       out->float_value = (double)out->int_value;
       return 1;
     }
+    /* A named const carries its folded value on its symbol, float included.
+     * Asking the integer folder first would refuse `const HALF = 0.5` as "not
+     * a compile-time constant", which it plainly is. */
+    Symbol *symbol =
+        symbol_table_lookup(checker->symbol_table, identifier->name);
+    if (symbol && symbol->has_constant_value &&
+        (symbol->kind == SYMBOL_CONSTANT || symbol->is_immutable)) {
+      out->is_float = symbol->constant_is_float;
+      out->float_value = symbol->constant_is_float
+                             ? symbol->constant_float_value
+                             : (double)symbol->constant_integer_value;
+      out->int_value = symbol->constant_is_float
+                           ? (long long)symbol->constant_float_value
+                           : symbol->constant_integer_value;
+      symbol->is_used = 1;
+      return 1;
+    }
     long long value = 0;
     if (!type_checker_eval_integer_constant_with_checker(checker, expression,
                                                          &value)) {
@@ -188,7 +205,40 @@ static int aggregate_fold_number(TypeChecker *checker, ASTNode *expression,
     long long value = 0;
     if (!type_checker_eval_integer_constant_with_checker(checker, expression,
                                                          &value)) {
-      return 0;
+      /* Both sides already folded to integers above, so the operands are
+       * constant whether or not the shared integer folder can see them --
+       * a named const resolved from its symbol is the case it cannot. */
+      long long l = left.int_value;
+      long long r = right.int_value;
+      if (strcmp(op, "+") == 0) {
+        value = l + r;
+      } else if (strcmp(op, "-") == 0) {
+        value = l - r;
+      } else if (strcmp(op, "*") == 0) {
+        value = l * r;
+      } else if (strcmp(op, "/") == 0) {
+        if (r == 0) {
+          return 0;
+        }
+        value = l / r;
+      } else if (strcmp(op, "%") == 0) {
+        if (r == 0) {
+          return 0;
+        }
+        value = l % r;
+      } else if (strcmp(op, "<<") == 0 && r >= 0 && r < 64) {
+        value = (long long)((unsigned long long)l << r);
+      } else if (strcmp(op, ">>") == 0 && r >= 0 && r < 64) {
+        value = l >> r;
+      } else if (strcmp(op, "&") == 0) {
+        value = l & r;
+      } else if (strcmp(op, "|") == 0) {
+        value = l | r;
+      } else if (strcmp(op, "^") == 0) {
+        value = l ^ r;
+      } else {
+        return 0;
+      }
     }
     out->is_float = 0;
     out->int_value = value;

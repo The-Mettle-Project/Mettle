@@ -195,7 +195,8 @@ int code_generator_binary_emit_runtime_debug_tables(CodeGenerator *generator) {
   char **trap_file_symbols = NULL;
 
   if (!generator || !generator->debug_info ||
-      !generator->generate_stack_trace_support) {
+      (!generator->generate_stack_trace_support &&
+       !generator->generate_crash_report)) {
     return 1;
   }
 
@@ -874,7 +875,8 @@ int code_generator_binary_emit_elf_runtime_hooks(CodeGenerator *generator) {
     return 1;
   }
 
-  if (generator->generate_stack_trace_support &&
+  if ((generator->generate_stack_trace_support ||
+       generator->generate_crash_report) &&
       !code_generator_binary_emit_elf_pointer_array_entry(
           generator, ".init_array", BINARY_SECTION_INIT_ARRAY,
           "mettle_crash_startup")) {
@@ -909,7 +911,8 @@ int code_generator_binary_emit_crash_startup(CodeGenerator *generator) {
   BinaryCallRelocationTable call_relocations = {0};
   int target_is_elf = 0;
 
-  if (!generator || !generator->generate_stack_trace_support) {
+  if (!generator || (!generator->generate_stack_trace_support &&
+                     !generator->generate_crash_report)) {
     return 1;
   }
 
