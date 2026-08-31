@@ -25,13 +25,20 @@ compiled to a flat image with `--target x86_64-none`.
   backspace, and arrow keys walking the command history.
 - **Files.** `build.ps1` packs everything in `files/` into an archive that
   rides along on the disk. `ls` and `cat` read it out of memory.
-- **Graphics.** The second stage walks the VESA mode list for the widest
-  32-bit-colour mode up to 1024x768 with a linear framebuffer, and copies the
-  BIOS 8x16 font out of the video ROM on the way past. The kernel composes into
-  a back buffer at 4 MB and copies out the rectangles that changed.
-- **Desktop.** A wallpaper, launcher icons, draggable windows with title bars
-  and close boxes, a taskbar with a window list and a clock, and a mouse
-  pointer drawn over the top with save-under.
+- **GPU.** The kernel finds the VMware SVGA II device on the PCI bus, claims
+  it, negotiates the protocol version, sets the mode itself, and drives it
+  through its command FIFO: damage rectangles go to the device rather than a
+  whole screen, and the pointer is a hardware alpha cursor the device composites
+  on its own. Device-side fills and copies are there behind their capability
+  bits. Everything falls back to the firmware framebuffer when the device is
+  absent.
+- **Graphics.** The second stage walks the VESA mode list for a fallback linear
+  framebuffer and copies the BIOS 8x16 font out of the video ROM on the way
+  past. The kernel composes into a back buffer and presents what changed.
+- **Desktop.** A painted wallpaper with two radial glows and a vignette, a
+  frosted dock blurred out of the wallpaper itself, draggable windows with soft
+  shadows, antialiased rounded corners and gradient title bars, hover states,
+  and an antialiased pointer.
 - **Pointer.** A PS/2 mouse on IRQ12, three-byte packets, movement and the left
   button.
 - **Output.** Everything the kernel prints goes to the terminal window, to the
@@ -46,7 +53,10 @@ nothing reaches into another module's globals.
 | Module | Owns |
 | --- | --- |
 | `layout` | Where things sit in physical memory. Every fixed address in the system is here. |
-| `video` | The framebuffer: the back buffer, fills, rectangles, and presenting what changed. |
+| `pci` | Configuration space, and finding a device by its identity. |
+| `svga` | The VMware SVGA II driver: registers, command FIFO, hardware cursor. |
+| `video` | Drawing: fills, gradients, alpha, rounded shapes, discs, blits, presenting. |
+| `cursor` | The pointer, sampled into an alpha sprite, uploaded to the device or drawn by hand. |
 | `font` | The BIOS 8x16 glyphs, drawn as pixels. |
 | `theme` | Every colour the desktop uses. |
 | `mouse` | The PS/2 pointer. |

@@ -1,0 +1,109 @@
+import "layout"
+import "video"
+import "svga"
+
+export const CURSOR_WIDTH: uint64 = 20
+export const CURSOR_HEIGHT: uint64 = 28
+export const CURSOR_HOT_X: uint64 = 1
+export const CURSOR_HOT_Y: uint64 = 1
+
+const POINTS: uint64 = 7
+const SAMPLES: uint64 = 3
+const UNIT: int64 = 6
+
+var shape_x: int64[7] = [2, 2, 13, 19, 26, 20, 32]
+var shape_y: int64[7] = [2, 44, 33, 52, 49, 31, 31]
+var pixels: uint32[560]
+var hardware: uint64 = 0
+
+fn inside(sample_x: int64, sample_y: int64) -> bool {
+    var crossings: uint64 = 0
+    for i: uint64 in 0..POINTS {
+        var j: uint64 = (i + 1) % POINTS
+        var ax: int64 = shape_x[i] * 3
+        var ay: int64 = shape_y[i] * 3
+        var bx: int64 = shape_x[j] * 3
+        var by: int64 = shape_y[j] * 3
+        if ((ay > sample_y) != (by > sample_y)) {
+            var span: int64 = by - ay
+            if (span != 0) {
+                var cut: int64 = ax + (sample_y - ay) * (bx - ax) / span
+                if (cut > sample_x) {
+                    crossings++
+                }
+            }
+        }
+    }
+    return crossings % 2 == 1
+}
+
+fn coverage(pixel_x: uint64, pixel_y: uint64, grow: bool) -> uint64 {
+    var hits: uint64 = 0
+    for sample_y: uint64 in 0..SAMPLES {
+        for sample_x: uint64 in 0..SAMPLES {
+            var fx: int64 = (int64)(pixel_x * 6 + sample_x * 2 + 1)
+            var fy: int64 = (int64)(pixel_y * 6 + sample_y * 2 + 1)
+            var found: bool = inside(fx, fy)
+            if (grow && !found) {
+                found = inside(fx - UNIT, fy) || inside(fx + UNIT, fy) ||
+                        inside(fx, fy - UNIT) || inside(fx, fy + UNIT)
+            }
+            if (found) {
+                hits++
+            }
+        }
+    }
+    return hits * 255 / 9
+}
+
+export fn cursor_build() {
+    for row: uint64 in 0..CURSOR_HEIGHT {
+        for column: uint64 in 0..CURSOR_WIDTH {
+            var body: uint64 = coverage(column, row, false)
+            var edge: uint64 = coverage(column, row, true)
+            var value: uint32 = 0
+            if (edge != 0) {
+                var tone: uint64 = body * 255 / edge
+                if (tone > 255) {
+                    tone = 255
+                }
+                value = (uint32)((edge << 24) | video_mix(0x101418, 0xffffff, tone))
+            }
+            pixels[row * CURSOR_WIDTH + column] = value
+        }
+    }
+}
+
+export fn cursor_upload() -> bool {
+    if (!video_accelerated() || !svga_can_cursor()) {
+        return false
+    }
+    var premultiplied: uint32* = (uint32*)SPRITE_BASE
+    for i: uint64 in 0..(CURSOR_WIDTH * CURSOR_HEIGHT) {
+        var value: uint32 = pixels[i]
+        var alpha: uint64 = (uint64)(value >> 24)
+        var red: uint64 = (uint64)((value >> 16) & 255) * alpha / 255
+        var green: uint64 = (uint64)((value >> 8) & 255) * alpha / 255
+        var blue: uint64 = (uint64)(value & 255) * alpha / 255
+        premultiplied[i] = (uint32)((alpha << 24) | (red << 16) | (green << 8) |
+                                    blue)
+    }
+    svga_define_cursor(CURSOR_WIDTH, CURSOR_HEIGHT, CURSOR_HOT_X, CURSOR_HOT_Y,
+                       premultiplied)
+    hardware = 1
+    return true
+}
+
+export fn cursor_on_gpu() -> bool {
+    return hardware != 0
+}
+
+export fn cursor_move(x: uint64, y: uint64) {
+    if (hardware != 0) {
+        svga_move_cursor(x, y)
+    }
+}
+
+export fn cursor_draw(x: uint64, y: uint64) {
+    video_blit_alpha((uint64)&pixels[0], x, y, CURSOR_WIDTH, CURSOR_HEIGHT)
+}

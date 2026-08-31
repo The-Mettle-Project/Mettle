@@ -1,50 +1,58 @@
-export const SKY_TOP: uint32 = 0x0b1020
-export const SKY_BOTTOM: uint32 = 0x24406e
+export const SKY_TOP: uint32 = 0x070b16
+export const SKY_BOTTOM: uint32 = 0x1a2b4e
+export const GLOW_TEAL: uint32 = 0x1c6f6a
+export const GLOW_VIOLET: uint32 = 0x4b2f74
 
-export const BAR: uint32 = 0x0e1118
-export const BAR_EDGE: uint32 = 0x2b3346
-export const BAR_TEXT: uint32 = 0xaab4c4
+export const ACCENT: uint32 = 0x35d6b0
+export const ACCENT_DEEP: uint32 = 0x1c8f78
+export const VIOLET: uint32 = 0x8b6cf0
 
-export const WINDOW_BODY: uint32 = 0x171a21
-export const WINDOW_EDGE: uint32 = 0x2f3644
-export const WINDOW_TEXT: uint32 = 0xd6dbe4
-export const WINDOW_FAINT: uint32 = 0x8a93a3
+export const WINDOW_BODY: uint32 = 0x141821
+export const WINDOW_EDGE: uint32 = 0x39415a
+export const WINDOW_TEXT: uint32 = 0xe8edf6
+export const WINDOW_FAINT: uint32 = 0x93a0b8
 
-export const TITLE_ACTIVE: uint32 = 0x2a6ab0
-export const TITLE_IDLE: uint32 = 0x272c36
-export const TITLE_TEXT: uint32 = 0xffffff
-export const TITLE_IDLE_TEXT: uint32 = 0x9aa3b2
+export const TITLE_TOP: uint32 = 0x28324c
+export const TITLE_BOTTOM: uint32 = 0x1a2133
+export const TITLE_TOP_IDLE: uint32 = 0x1c2231
+export const TITLE_BOTTOM_IDLE: uint32 = 0x161b28
+export const TITLE_TEXT: uint32 = 0xf2f6ff
+export const TITLE_TEXT_IDLE: uint32 = 0x8d97ab
 
-export const CLOSE_BOX: uint32 = 0xc05252
-export const ACCENT: uint32 = 0x54c9a4
-export const SHADOW: uint32 = 0x070a12
+export const CLOSE_DOT: uint32 = 0xff5f57
+export const CLOSE_DOT_IDLE: uint32 = 0x4a4f5e
+
+export const DOCK_TINT: uint32 = 0x080c18
+export const DOCK_EDGE: uint32 = 0x4a5878
+export const DOCK_TEXT: uint32 = 0xc3cddf
+export const DOCK_ACTIVE: uint32 = 0x2b3550
+
+export const SHADOW: uint32 = 0x000000
+export const HIGHLIGHT: uint32 = 0xffffff
+
+export const TERMINAL_BACK: uint32 = 0x0a0d14
+export const TERMINAL_TEXT: uint32 = 0xd3dcea
 
 export const ICON_FACE: uint32 = 0x1d2534
 export const ICON_EDGE: uint32 = 0x3d4b64
 export const ICON_TEXT: uint32 = 0xdde3ee
 
-export const TERMINAL_BACK: uint32 = 0x0b0d12
-export const TERMINAL_TEXT: uint32 = 0xc9d2e0
-
-export const CURSOR_FILL: uint32 = 0xffffff
-export const CURSOR_EDGE: uint32 = 0x000000
-
 export fn theme_text_color(attribute: uint8) -> uint32 {
     var index: uint64 = (uint64)attribute & 15
-    if (index == 0) { return 0x30363f }
-    if (index == 1) { return 0x3b6fd6 }
-    if (index == 2) { return 0x4fbf7a }
-    if (index == 3) { return 0x3fb6bf }
-    if (index == 4) { return 0xd0564f }
-    if (index == 5) { return 0xb05cd0 }
-    if (index == 6) { return 0xc09a4a }
-    if (index == 7) { return 0xc9d2e0 }
-    if (index == 8) { return 0x5a6270 }
-    if (index == 9) { return 0x6f9bff }
-    if (index == 10) { return 0x77e2a1 }
-    if (index == 11) { return 0x74dbe6 }
-    if (index == 12) { return 0xff8078 }
-    if (index == 13) { return 0xdb8cff }
-    if (index == 14) { return 0xf0cc70 }
+    if (index == 0) { return 0x353b47 }
+    if (index == 1) { return 0x4f7fe0 }
+    if (index == 2) { return 0x54c98a }
+    if (index == 3) { return 0x45c4cf }
+    if (index == 4) { return 0xdc6259 }
+    if (index == 5) { return 0xb96ee0 }
+    if (index == 6) { return 0xd0a95a }
+    if (index == 7) { return 0xd3dcea }
+    if (index == 8) { return 0x66708a }
+    if (index == 9) { return 0x7fa8ff }
+    if (index == 10) { return 0x6fe8b4 }
+    if (index == 11) { return 0x7ee6f0 }
+    if (index == 12) { return 0xff8b82 }
+    if (index == 13) { return 0xd8a0ff }
+    if (index == 14) { return 0xf5d67c }
     return 0xffffff
 }

@@ -1,31 +1,77 @@
 import "layout"
+import "svga"
 
 const INFO_WIDTH: uint64 = BOOT_INFO_BASE + 2
 const INFO_HEIGHT: uint64 = BOOT_INFO_BASE + 4
 const INFO_PITCH: uint64 = BOOT_INFO_BASE + 6
-const INFO_DEPTH: uint64 = BOOT_INFO_BASE + 8
 const INFO_FRAMEBUFFER: uint64 = BOOT_INFO_BASE + 12
+
+const SAMPLES: uint64 = 3
+const SAMPLE_STEPS: uint64 = 9
 
 var width: uint64 = 0
 var height: uint64 = 0
 var pitch: uint64 = 0
 var framebuffer: uint64 = 0
 var back: uint64 = 0
+var accelerated: uint64 = 0
 
-export fn video_init() -> bool {
-    var words: uint16* = (uint16*)INFO_WIDTH
-    var frame: uint32* = (uint32*)INFO_FRAMEBUFFER
-    width = (uint64)words[0]
-    height = (uint64)words[1]
-    pitch = (uint64)words[2]
-    framebuffer = (uint64)frame[0]
-    back = BACK_BUFFER_BASE
-    if (width == 0 || height == 0 || framebuffer == 0) {
-        width = 0
-        height = 0
+fn adopt(new_width: uint64, new_height: uint64, new_pitch: uint64,
+         new_framebuffer: uint64) -> bool {
+    if (new_width == 0 || new_height == 0 || new_framebuffer == 0) {
         return false
     }
+    if (new_width > SCREEN_LIMIT_WIDTH || new_height > SCREEN_LIMIT_HEIGHT) {
+        return false
+    }
+    width = new_width
+    height = new_height
+    pitch = new_pitch
+    framebuffer = new_framebuffer
+    back = BACK_BUFFER_BASE
     return true
+}
+
+fn try_gpu() -> bool {
+    if (!svga_probe()) {
+        return false
+    }
+    var wanted_width: uint64 = SCREEN_LIMIT_WIDTH
+    var wanted_height: uint64 = SCREEN_LIMIT_HEIGHT
+    if (svga_max_width() < wanted_width || svga_max_height() < wanted_height) {
+        wanted_width = 1024
+        wanted_height = 768
+    }
+    if (svga_max_width() < wanted_width || svga_max_height() < wanted_height) {
+        wanted_width = 800
+        wanted_height = 600
+    }
+    if (!svga_set_mode(wanted_width, wanted_height)) {
+        return false
+    }
+    if (!adopt(wanted_width, wanted_height, svga_pitch(), svga_framebuffer())) {
+        return false
+    }
+    accelerated = 1
+    return true
+}
+
+fn try_firmware() -> bool {
+    var words: uint16* = (uint16*)INFO_WIDTH
+    var frame: uint32* = (uint32*)INFO_FRAMEBUFFER
+    return adopt((uint64)words[0], (uint64)words[1], (uint64)words[2],
+                 (uint64)frame[0])
+}
+
+export fn video_init() -> bool {
+    if (try_gpu()) {
+        return true
+    }
+    return try_firmware()
+}
+
+export fn video_accelerated() -> bool {
+    return accelerated != 0
 }
 
 export fn video_ready() -> bool {
@@ -40,8 +86,20 @@ export fn video_height() -> uint64 {
     return height
 }
 
+export fn video_back_buffer() -> uint64 {
+    return back
+}
+
 fn row_address(y: uint64) -> uint64 {
     return back + y * width * 4
+}
+
+export fn video_read(x: uint64, y: uint64) -> uint32 {
+    if (x >= width || y >= height) {
+        return 0
+    }
+    var row: uint32* = (uint32*)row_address(y)
+    return row[x]
 }
 
 export fn video_pixel(x: uint64, y: uint64, color: uint32) {
@@ -50,6 +108,31 @@ export fn video_pixel(x: uint64, y: uint64, color: uint32) {
     }
     var row: uint32* = (uint32*)row_address(y)
     row[x] = color
+}
+
+export fn video_mix(under: uint32, over: uint32, alpha: uint64) -> uint32 {
+    if (alpha >= 255) {
+        return over
+    }
+    if (alpha == 0) {
+        return under
+    }
+    var rest: uint64 = 255 - alpha
+    var red: uint64 = ((uint64)((over >> 16) & 255) * alpha +
+                       (uint64)((under >> 16) & 255) * rest + 128) >> 8
+    var green: uint64 = ((uint64)((over >> 8) & 255) * alpha +
+                         (uint64)((under >> 8) & 255) * rest + 128) >> 8
+    var blue: uint64 = ((uint64)(over & 255) * alpha +
+                        (uint64)(under & 255) * rest + 128) >> 8
+    return (uint32)((red << 16) | (green << 8) | blue)
+}
+
+export fn video_blend_pixel(x: uint64, y: uint64, color: uint32, alpha: uint64) {
+    if (x >= width || y >= height || alpha == 0) {
+        return
+    }
+    var row: uint32* = (uint32*)row_address(y)
+    row[x] = video_mix(row[x], color, alpha)
 }
 
 fn fill_span(start: uint64, count: uint64, color: uint32) {
@@ -65,20 +148,56 @@ fn fill_span(start: uint64, count: uint64, color: uint32) {
     }
 }
 
+fn clip_right(x: uint64, w: uint64) -> uint64 {
+    var right: uint64 = x + w
+    if (right > width) {
+        return width
+    }
+    return right
+}
+
+fn clip_bottom(y: uint64, h: uint64) -> uint64 {
+    var bottom: uint64 = y + h
+    if (bottom > height) {
+        return height
+    }
+    return bottom
+}
+
 export fn video_fill(x: uint64, y: uint64, w: uint64, h: uint64, color: uint32) {
     if (x >= width || y >= height) {
         return
     }
-    var right: uint64 = x + w
-    var bottom: uint64 = y + h
-    if (right > width) {
-        right = width
-    }
-    if (bottom > height) {
-        bottom = height
-    }
+    var right: uint64 = clip_right(x, w)
+    var bottom: uint64 = clip_bottom(y, h)
     for row: uint64 in y..bottom {
         fill_span(row_address(row) + x * 4, right - x, color)
+    }
+}
+
+export fn video_blend_fill(x: uint64, y: uint64, w: uint64, h: uint64,
+                           color: uint32, alpha: uint64) {
+    if (x >= width || y >= height) {
+        return
+    }
+    var right: uint64 = clip_right(x, w)
+    var bottom: uint64 = clip_bottom(y, h)
+    for row: uint64 in y..bottom {
+        var line: uint32* = (uint32*)row_address(row)
+        for column: uint64 in x..right {
+            line[column] = video_mix(line[column], color, alpha)
+        }
+    }
+}
+
+export fn video_gradient(x: uint64, y: uint64, w: uint64, h: uint64,
+                         top: uint32, bottom: uint32) {
+    if (h == 0) {
+        return
+    }
+    for row: uint64 in 0..h {
+        var mix: uint64 = row * 255 / h
+        video_fill(x, y + row, w, 1, video_mix(top, bottom, mix))
     }
 }
 
@@ -89,17 +208,188 @@ export fn video_frame(x: uint64, y: uint64, w: uint64, h: uint64, color: uint32)
     video_fill(x + w - 1, y, 1, h, color)
 }
 
-fn copy_span(source: uint64, target: uint64, count: uint64) {
-    var pairs: uint64 = count / 2
-    var from: uint64* = (uint64*)source
-    var to: uint64* = (uint64*)target
-    for i: uint64 in 0..pairs {
-        to[i] = from[i]
+fn corner_coverage(pixel_x: uint64, pixel_y: uint64, radius: uint64) -> uint64 {
+    var inside: uint64 = 0
+    var centre: uint64 = radius * SAMPLES * 2
+    var limit: uint64 = centre * centre
+    for sample_y: uint64 in 0..SAMPLES {
+        for sample_x: uint64 in 0..SAMPLES {
+            var fx: uint64 = pixel_x * SAMPLES * 2 + sample_x * 2 + 1
+            var fy: uint64 = pixel_y * SAMPLES * 2 + sample_y * 2 + 1
+            if (fx <= centre && fy <= centre) {
+                var dx: uint64 = centre - fx
+                var dy: uint64 = centre - fy
+                if (dx * dx + dy * dy <= limit) {
+                    inside++
+                }
+            } else {
+                inside++
+            }
+        }
     }
-    if (count % 2 != 0) {
-        var from_tail: uint32* = (uint32*)(source + pairs * 8)
-        var to_tail: uint32* = (uint32*)(target + pairs * 8)
-        to_tail[0] = from_tail[0]
+    return inside * 255 / SAMPLE_STEPS
+}
+
+export fn video_isqrt(value: uint64) -> uint64 {
+    var root: uint64 = 0
+    while ((root + 1) * (root + 1) <= value) {
+        root++
+    }
+    return root
+}
+
+export fn video_arc_inset(row: uint64, radius: uint64) -> uint64 {
+    if (row >= radius) {
+        return 0
+    }
+    var offset: uint64 = radius - row
+    return radius - video_isqrt(radius * radius - offset * offset)
+}
+
+fn round_corners(x: uint64, y: uint64, w: uint64, h: uint64, radius: uint64,
+                 color: uint32, alpha: uint64) {
+    for row: uint64 in 0..radius {
+        for column: uint64 in 0..radius {
+            var edge: uint64 = corner_coverage(column, row, radius) * alpha / 255
+            video_blend_pixel(x + column, y + row, color, edge)
+            video_blend_pixel(x + w - 1 - column, y + row, color, edge)
+            video_blend_pixel(x + column, y + h - 1 - row, color, edge)
+            video_blend_pixel(x + w - 1 - column, y + h - 1 - row, color, edge)
+        }
+    }
+}
+
+export fn video_rounded_fill(x: uint64, y: uint64, w: uint64, h: uint64,
+                             radius: uint64, color: uint32) {
+    video_fill(x + radius, y, w - radius * 2, h, color)
+    video_fill(x, y + radius, radius, h - radius * 2, color)
+    video_fill(x + w - radius, y + radius, radius, h - radius * 2, color)
+    round_corners(x, y, w, h, radius, color, 255)
+}
+
+export fn video_rounded_gradient(x: uint64, y: uint64, w: uint64, h: uint64,
+                                 radius: uint64, top: uint32, bottom: uint32,
+                                 round_bottom: bool) {
+    for row: uint64 in 0..h {
+        var shade: uint32 = video_mix(top, bottom, row * 255 / h)
+        var inset: uint64 = video_arc_inset(row, radius)
+        if (round_bottom && row + radius >= h) {
+            inset = video_arc_inset(h - 1 - row, radius)
+        }
+        video_fill(x + inset, y + row, w - inset * 2, 1, shade)
+    }
+    for row: uint64 in 0..radius {
+        for column: uint64 in 0..radius {
+            var edge: uint64 = corner_coverage(column, row, radius)
+            video_blend_pixel(x + column, y + row, top, edge)
+            video_blend_pixel(x + w - 1 - column, y + row, top, edge)
+        }
+    }
+}
+
+export fn video_rounded_outline(x: uint64, y: uint64, w: uint64, h: uint64,
+                                radius: uint64, color: uint32, alpha: uint64) {
+    video_blend_fill(x + radius, y, w - radius * 2, 1, color, alpha)
+    video_blend_fill(x + radius, y + h - 1, w - radius * 2, 1, color, alpha)
+    video_blend_fill(x, y + radius, 1, h - radius * 2, color, alpha)
+    video_blend_fill(x + w - 1, y + radius, 1, h - radius * 2, color, alpha)
+    for step: uint64 in 0..radius {
+        var offset: uint64 = radius - step
+        var reach: uint64 = radius * radius - offset * offset
+        var span: uint64 = 0
+        while (span * span < reach) {
+            span++
+        }
+        var inset: uint64 = radius - span
+        video_blend_pixel(x + inset, y + offset - 1, color, alpha)
+        video_blend_pixel(x + w - 1 - inset, y + offset - 1, color, alpha)
+        video_blend_pixel(x + inset, y + h - offset, color, alpha)
+        video_blend_pixel(x + w - 1 - inset, y + h - offset, color, alpha)
+    }
+}
+
+export fn video_shadow(x: uint64, y: uint64, w: uint64, h: uint64,
+                       radius: uint64, spread: uint64, color: uint32,
+                       strength: uint64) {
+    for ring: uint64 in 0..spread {
+        var grow: uint64 = spread - ring
+        var alpha: uint64 = strength * (ring + 1) / spread / 3
+        video_rounded_outline(x - grow, y - grow + 2, w + grow * 2, h + grow * 2,
+                              radius + grow, color, alpha)
+    }
+}
+
+export fn video_disc(centre_x: uint64, centre_y: uint64, radius: uint64,
+                     color: uint32) {
+    var limit: uint64 = radius * SAMPLES * 2
+    for row: uint64 in 0..(radius * 2) {
+        for column: uint64 in 0..(radius * 2) {
+            var hits: uint64 = 0
+            for sample_y: uint64 in 0..SAMPLES {
+                for sample_x: uint64 in 0..SAMPLES {
+                    var fx: int64 = (int64)(column * SAMPLES * 2 + sample_x * 2 + 1) -
+                                    (int64)limit
+                    var fy: int64 = (int64)(row * SAMPLES * 2 + sample_y * 2 + 1) -
+                                    (int64)limit
+                    if (fx * fx + fy * fy <= (int64)(limit * limit)) {
+                        hits++
+                    }
+                }
+            }
+            if (hits != 0) {
+                video_blend_pixel(centre_x - radius + column,
+                                  centre_y - radius + row, color,
+                                  hits * 255 / SAMPLE_STEPS)
+            }
+        }
+    }
+}
+
+export fn video_blit(source: uint64, source_pitch: uint64, from_x: uint64,
+                     from_y: uint64, x: uint64, y: uint64, w: uint64, h: uint64) {
+    var right: uint64 = clip_right(x, w)
+    var bottom: uint64 = clip_bottom(y, h)
+    if (x >= width || y >= height) {
+        return
+    }
+    var count: uint64 = right - x
+    for row: uint64 in y..bottom {
+        var from: uint64* = (uint64*)(source + (from_y + row - y) * source_pitch +
+                                      from_x * 4)
+        var to: uint64* = (uint64*)(row_address(row) + x * 4)
+        for i: uint64 in 0..(count / 2) {
+            to[i] = from[i]
+        }
+        if (count % 2 != 0) {
+            var from_tail: uint32* = (uint32*)(source +
+                                               (from_y + row - y) * source_pitch +
+                                               (from_x + count - 1) * 4)
+            var to_tail: uint32* = (uint32*)(row_address(row) + (x + count - 1) * 4)
+            to_tail[0] = from_tail[0]
+        }
+    }
+}
+
+export fn video_blit_alpha(source: uint64, x: uint64, y: uint64, w: uint64,
+                           h: uint64) {
+    var pixels: uint32* = (uint32*)source
+    for row: uint64 in 0..h {
+        for column: uint64 in 0..w {
+            var value: uint32 = pixels[row * w + column]
+            var alpha: uint64 = (uint64)(value >> 24)
+            if (alpha != 0) {
+                video_blend_pixel(x + column, y + row, value & 0xffffff, alpha)
+            }
+        }
+    }
+}
+
+export fn video_capture(into: uint64, x: uint64, y: uint64, w: uint64, h: uint64) {
+    var pixels: uint32* = (uint32*)into
+    for row: uint64 in 0..h {
+        for column: uint64 in 0..w {
+            pixels[row * w + column] = video_read(x + column, y + row)
+        }
     }
 }
 
@@ -107,36 +397,27 @@ export fn video_present(x: uint64, y: uint64, w: uint64, h: uint64) {
     if (width == 0 || x >= width || y >= height) {
         return
     }
-    var right: uint64 = x + w
-    var bottom: uint64 = y + h
-    if (right > width) {
-        right = width
-    }
-    if (bottom > height) {
-        bottom = height
-    }
+    var right: uint64 = clip_right(x, w)
+    var bottom: uint64 = clip_bottom(y, h)
+    var count: uint64 = right - x
     for row: uint64 in y..bottom {
-        copy_span(row_address(row) + x * 4,
-                  framebuffer + row * pitch + x * 4, right - x)
+        var from: uint64* = (uint64*)(row_address(row) + x * 4)
+        var to: uint64* = (uint64*)(framebuffer + row * pitch + x * 4)
+        for i: uint64 in 0..(count / 2) {
+            to[i] = from[i]
+        }
+        if (count % 2 != 0) {
+            var from_tail: uint32* = (uint32*)(row_address(row) + (right - 1) * 4)
+            var to_tail: uint32* = (uint32*)(framebuffer + row * pitch +
+                                             (right - 1) * 4)
+            to_tail[0] = from_tail[0]
+        }
+    }
+    if (accelerated != 0) {
+        svga_update(x, y, right - x, bottom - y)
     }
 }
 
 export fn video_present_all() {
     video_present(0, 0, width, height)
-}
-
-export fn video_save(x: uint64, y: uint64, w: uint64, h: uint64, into: uint64) {
-    for row: uint64 in 0..h {
-        if (y + row < height) {
-            copy_span(row_address(y + row) + x * 4, into + row * w * 4, w)
-        }
-    }
-}
-
-export fn video_restore(x: uint64, y: uint64, w: uint64, h: uint64, from: uint64) {
-    for row: uint64 in 0..h {
-        if (y + row < height) {
-            copy_span(from + row * w * 4, row_address(y + row) + x * 4, w)
-        }
-    }
 }

@@ -18,6 +18,24 @@ export fn port_in(port: uint16) -> uint8 {
     return value
 }
 
+export fn port_out32(port: uint16, value: uint32) {
+    asm {
+        mov dx, {port}
+        mov eax, {value}
+        out dx, eax
+    }
+}
+
+export fn port_in32(port: uint16) -> uint32 {
+    var value: uint32 = 0
+    asm {
+        mov dx, {port}
+        in eax, dx
+        mov {value}, eax
+    }
+    return value
+}
+
 export fn port_settle() {
     port_out(SETTLE_PORT, 0)
 }

@@ -37,7 +37,8 @@ if (-not $known) {
   & $manage storagectl $Name --name "Floppy" --add floppy
 }
 
-& $manage modifyvm $Name --memory $Memory --vram 16 --acpi on --ioapic off
+& $manage modifyvm $Name --memory $Memory --vram 64 --acpi on --ioapic off
+& $manage modifyvm $Name --graphicscontroller vmsvga --accelerate3d off
 & $manage modifyvm $Name --boot1 floppy --boot2 none --boot3 none --boot4 none
 & $manage modifyvm $Name --nic1 none --usb off
 & $manage modifyvm $Name --uart1 0x3f8 4 --uartmode1 file $SerialLog

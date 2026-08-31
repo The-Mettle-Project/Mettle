@@ -20,6 +20,9 @@ import "kernel/terminal"
 import "kernel/window"
 import "kernel/apps"
 import "kernel/desktop"
+import "kernel/pci"
+import "kernel/svga"
+import "kernel/cursor"
 
 @naked fn _start() {
     asm {
@@ -77,6 +80,11 @@ fn desktop_mode() {
     console_write(" by ")
     console_write_decimal(video_height())
     console_write_line(" in 32 bit colour")
+    if (video_accelerated()) {
+        console_write("the svga device is driving the screen, capabilities ")
+        console_write_hex((uint64)svga_capabilities(), 8)
+        console_write_line("")
+    }
     console_add_sink(&terminal_put, &terminal_tint, &terminal_clear)
     terminal_clear()
     desktop_init()

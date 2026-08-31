@@ -2,6 +2,7 @@ export const WINDOW_SLOTS: uint64 = 8
 export const TITLE_HEIGHT: uint64 = 22
 export const BORDER: uint64 = 1
 export const CLOSE_SIZE: uint64 = 12
+export const CONTENT_INSET: uint64 = 8
 
 const NAME_BYTES: uint64 = 24
 
@@ -59,19 +60,19 @@ export fn window_title(id: uint64) -> cstring {
 }
 
 export fn window_content_x(id: uint64) -> uint64 {
-    return (uint64)(windows[id].x + (int64)BORDER)
+    return (uint64)(windows[id].x + (int64)CONTENT_INSET)
 }
 
 export fn window_content_y(id: uint64) -> uint64 {
-    return (uint64)(windows[id].y + (int64)(BORDER + TITLE_HEIGHT))
+    return (uint64)(windows[id].y + (int64)(TITLE_HEIGHT + 2))
 }
 
 export fn window_content_width(id: uint64) -> uint64 {
-    return windows[id].w - BORDER * 2
+    return windows[id].w - CONTENT_INSET * 2
 }
 
 export fn window_content_height(id: uint64) -> uint64 {
-    return windows[id].h - TITLE_HEIGHT - BORDER * 2
+    return windows[id].h - TITLE_HEIGHT - CONTENT_INSET - 2
 }
 
 export fn window_draw_content(id: uint64) {

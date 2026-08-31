@@ -44,9 +44,9 @@ fn terminal_key(id: uint64, ch: uint8) {
 }
 
 export fn app_terminal_open() -> uint64 {
-    return window_open(KIND_TERMINAL, 40, 60,
-                       terminal_pixel_width() + BORDER * 2,
-                       terminal_pixel_height() + TITLE_HEIGHT + BORDER * 2,
+    return window_open(KIND_TERMINAL, 60, 70,
+                       terminal_pixel_width() + CONTENT_INSET * 2,
+                       terminal_pixel_height() + TITLE_HEIGHT + CONTENT_INSET + 2,
                        "terminal", &terminal_draw_window, &terminal_key,
                        &files_ignore_click)
 }

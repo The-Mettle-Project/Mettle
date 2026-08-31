@@ -1,16 +1,20 @@
 the desktop, from the bottom up:
 
-  the second stage asks the vesa bios for the widest 32 bit colour mode it
-  offers up to 1024 by 768, and copies the 8x16 font out of the video rom
-  before the mode changes
+  the kernel looks for a vmware svga device on the pci bus. when it is there,
+  the kernel sets the mode itself, writes commands into the device fifo, and
+  hands the pointer to the hardware cursor. when it is not, the framebuffer the
+  bios handed over at boot is used instead and the pointer is drawn by hand
 
-  the kernel composes into a back buffer at four megabytes and copies out
-  only the rectangles that changed, so the pointer costs two small copies a
-  frame rather than a whole screen
+  the wallpaper is painted once into its own buffer: a vertical gradient, two
+  radial glows, a vignette, and a little ordered dither so the gradient does
+  not band. every frame starts as a copy of it
 
-  windows are records with three function pointers: draw, key, click. the
-  desktop owns the chrome and the event loop, the app owns the inside
+  the dock is a strip of that wallpaper, box blurred, tinted, and rounded,
+  baked once at startup. the icons and labels are drawn over it each frame
 
-  the terminal window is a text grid the console writes into. the shell runs
-  in its own task and blocks on the window's key queue, so dragging a window
-  keeps working while a command runs
+  windows carry a soft shadow built from rings of rounded outlines, a gradient
+  title bar with an accent line under the focused one, and corners that are
+  antialiased by sampling the circle nine times per pixel
+
+  the pointer is a polygon, sampled nine times per pixel for the fill and again
+  for a grown outline, so it has a dark edge and a soft one

@@ -23,6 +23,52 @@ export fn font_draw_char(x: uint64, y: uint64, ch: uint8, color: uint32) {
     }
 }
 
+export fn font_draw_char_blend(x: uint64, y: uint64, ch: uint8, color: uint32,
+                               alpha: uint64) {
+    var rows: uint8* = glyph_rows(ch)
+    for row: uint64 in 0..GLYPH_HEIGHT {
+        var bits: uint8 = rows[row]
+        if (bits != 0) {
+            for column: uint64 in 0..GLYPH_WIDTH {
+                if ((bits >> (7 - column)) & 1) {
+                    video_blend_pixel(x + column, y + row, color, alpha)
+                }
+            }
+        }
+    }
+}
+
+export fn font_draw_text_soft(x: uint64, y: uint64, text: cstring, color: uint32,
+                              shade: uint64) -> uint64 {
+    var i: uint64 = 0
+    while (text[i] != 0) {
+        font_draw_char_blend(x + i * GLYPH_WIDTH + 1, y + 1, text[i], 0x000000,
+                             shade)
+        i++
+    }
+    return font_draw_text(x, y, text, color)
+}
+
+export fn font_draw_text_large(x: uint64, y: uint64, text: cstring,
+                               color: uint32) -> uint64 {
+    var i: uint64 = 0
+    while (text[i] != 0) {
+        var rows: uint8* = glyph_rows(text[i])
+        for row: uint64 in 0..GLYPH_HEIGHT {
+            var bits: uint8 = rows[row]
+            for column: uint64 in 0..GLYPH_WIDTH {
+                if ((bits >> (7 - column)) & 1) {
+                    var px: uint64 = x + i * GLYPH_WIDTH * 2 + column * 2
+                    var py: uint64 = y + row * 2
+                    video_fill(px, py, 2, 2, color)
+                }
+            }
+        }
+        i++
+    }
+    return i * GLYPH_WIDTH * 2
+}
+
 export fn font_draw_char_on(x: uint64, y: uint64, ch: uint8, color: uint32,
                             background: uint32) {
     video_fill(x, y, GLYPH_WIDTH, GLYPH_HEIGHT, background)

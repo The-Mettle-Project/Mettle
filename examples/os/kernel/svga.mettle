@@ -1,0 +1,269 @@
+import "port"
+import "pci"
+
+const VENDOR: uint32 = 0x15ad
+const DEVICE: uint32 = 0x0405
+
+const INDEX_OFFSET: uint16 = 0
+const VALUE_OFFSET: uint16 = 1
+
+const REG_ID: uint32 = 0
+const REG_ENABLE: uint32 = 1
+const REG_WIDTH: uint32 = 2
+const REG_HEIGHT: uint32 = 3
+const REG_MAX_WIDTH: uint32 = 4
+const REG_MAX_HEIGHT: uint32 = 5
+const REG_BITS_PER_PIXEL: uint32 = 7
+const REG_BYTES_PER_LINE: uint32 = 12
+const REG_FB_START: uint32 = 13
+const REG_VRAM_SIZE: uint32 = 15
+const REG_FB_SIZE: uint32 = 16
+const REG_CAPABILITIES: uint32 = 17
+const REG_FIFO_START: uint32 = 18
+const REG_FIFO_SIZE: uint32 = 19
+const REG_CONFIG_DONE: uint32 = 20
+const REG_SYNC: uint32 = 21
+const REG_BUSY: uint32 = 22
+const REG_CURSOR_ID: uint32 = 24
+const REG_CURSOR_X: uint32 = 25
+const REG_CURSOR_Y: uint32 = 26
+const REG_CURSOR_ON: uint32 = 27
+
+const ID_2: uint32 = 0x90000002
+const ID_1: uint32 = 0x90000001
+
+const CAP_RECT_COPY: uint32 = 0x00000002
+const CAP_RECT_FILL: uint32 = 0x00000010
+const CAP_CURSOR: uint32 = 0x00000020
+const CAP_ALPHA_CURSOR: uint32 = 0x00000200
+
+const CMD_UPDATE: uint32 = 1
+const CMD_RECT_FILL: uint32 = 2
+const CMD_RECT_COPY: uint32 = 3
+const CMD_DEFINE_ALPHA_CURSOR: uint32 = 22
+
+const FIFO_MIN: uint64 = 0
+const FIFO_MAX: uint64 = 1
+const FIFO_NEXT: uint64 = 2
+const FIFO_STOP: uint64 = 3
+const FIFO_HEADER_BYTES: uint32 = 16
+
+const CURSOR_SHOW: uint32 = 1
+const SPIN_LIMIT: uint64 = 1000000
+
+var io_base: uint16 = 0
+var fifo: uint64 = 0
+var fifo_bytes: uint32 = 0
+var framebuffer: uint64 = 0
+var pitch: uint64 = 0
+var capabilities: uint32 = 0
+var max_width: uint64 = 0
+var max_height: uint64 = 0
+var ready: uint64 = 0
+var impatient: uint64 = 0
+
+fn write_register(index: uint32, value: uint32) {
+    port_out32(io_base + INDEX_OFFSET, index)
+    port_out32(io_base + VALUE_OFFSET, value)
+}
+
+fn read_register(index: uint32) -> uint32 {
+    port_out32(io_base + INDEX_OFFSET, index)
+    return port_in32(io_base + VALUE_OFFSET)
+}
+
+fn fifo_word(index: uint64) -> uint32 {
+    var words: uint32* = (uint32*)fifo
+    return words[index]
+}
+
+fn set_fifo_word(index: uint64, value: uint32) {
+    var words: uint32* = (uint32*)fifo
+    words[index] = value
+}
+
+export fn svga_sync() {
+    write_register(REG_SYNC, 1)
+    if (impatient != 0) {
+        return
+    }
+    var spins: uint64 = 0
+    while (read_register(REG_BUSY) != 0 && spins < SPIN_LIMIT) {
+        spins++
+    }
+    if (spins >= SPIN_LIMIT) {
+        impatient = 1
+    }
+}
+
+export fn svga_waited_out() -> bool {
+    return impatient != 0
+}
+
+export fn svga_capabilities() -> uint32 {
+    return capabilities
+}
+
+fn push(value: uint32) {
+    var next: uint32 = fifo_word(FIFO_NEXT)
+    var stop: uint32 = fifo_word(FIFO_STOP)
+    var top: uint32 = fifo_word(FIFO_MAX)
+    var bottom: uint32 = fifo_word(FIFO_MIN)
+    var following: uint32 = next + 4
+    if (following >= top) {
+        following = bottom
+    }
+    if (following == stop) {
+        svga_sync()
+    }
+    set_fifo_word((uint64)next / 4, value)
+    set_fifo_word(FIFO_NEXT, following)
+}
+
+export fn svga_ready() -> bool {
+    return ready != 0
+}
+
+export fn svga_framebuffer() -> uint64 {
+    return framebuffer
+}
+
+export fn svga_pitch() -> uint64 {
+    return pitch
+}
+
+export fn svga_max_width() -> uint64 {
+    return max_width
+}
+
+export fn svga_max_height() -> uint64 {
+    return max_height
+}
+
+export fn svga_can_fill() -> bool {
+    return (capabilities & CAP_RECT_FILL) != 0
+}
+
+export fn svga_can_copy() -> bool {
+    return (capabilities & CAP_RECT_COPY) != 0
+}
+
+export fn svga_can_cursor() -> bool {
+    return (capabilities & CAP_ALPHA_CURSOR) != 0
+}
+
+export fn svga_probe() -> bool {
+    var location: uint64 = pci_find(VENDOR, DEVICE)
+    if (location == PCI_NONE) {
+        return false
+    }
+    pci_claim(location)
+    io_base = (uint16)pci_bar(location, 0)
+    if (io_base == 0) {
+        return false
+    }
+
+    write_register(REG_ID, ID_2)
+    if (read_register(REG_ID) != ID_2) {
+        write_register(REG_ID, ID_1)
+        if (read_register(REG_ID) != ID_1) {
+            return false
+        }
+    }
+
+    fifo = (uint64)read_register(REG_FIFO_START)
+    fifo_bytes = read_register(REG_FIFO_SIZE)
+    capabilities = read_register(REG_CAPABILITIES)
+    max_width = (uint64)read_register(REG_MAX_WIDTH)
+    max_height = (uint64)read_register(REG_MAX_HEIGHT)
+    if (fifo == 0 || fifo_bytes < 1024 || max_width == 0) {
+        return false
+    }
+    return true
+}
+
+export fn svga_set_mode(width: uint64, height: uint64) -> bool {
+    write_register(REG_WIDTH, (uint32)width)
+    write_register(REG_HEIGHT, (uint32)height)
+    write_register(REG_BITS_PER_PIXEL, 32)
+    write_register(REG_ENABLE, 1)
+
+    framebuffer = (uint64)read_register(REG_FB_START)
+    pitch = (uint64)read_register(REG_BYTES_PER_LINE)
+    if (framebuffer == 0 || pitch < width * 4) {
+        write_register(REG_ENABLE, 0)
+        return false
+    }
+
+    set_fifo_word(FIFO_MIN, FIFO_HEADER_BYTES)
+    set_fifo_word(FIFO_MAX, fifo_bytes)
+    set_fifo_word(FIFO_NEXT, FIFO_HEADER_BYTES)
+    set_fifo_word(FIFO_STOP, FIFO_HEADER_BYTES)
+    write_register(REG_CONFIG_DONE, 1)
+    ready = 1
+    return true
+}
+
+export fn svga_update(x: uint64, y: uint64, w: uint64, h: uint64) {
+    push(CMD_UPDATE)
+    push((uint32)x)
+    push((uint32)y)
+    push((uint32)w)
+    push((uint32)h)
+    svga_sync()
+}
+
+export fn svga_fill(x: uint64, y: uint64, w: uint64, h: uint64, color: uint32) -> bool {
+    if (!svga_can_fill()) {
+        return false
+    }
+    push(CMD_RECT_FILL)
+    push(color)
+    push((uint32)x)
+    push((uint32)y)
+    push((uint32)w)
+    push((uint32)h)
+    svga_sync()
+    return true
+}
+
+export fn svga_copy(from_x: uint64, from_y: uint64, to_x: uint64, to_y: uint64,
+                    w: uint64, h: uint64) -> bool {
+    if (!svga_can_copy()) {
+        return false
+    }
+    push(CMD_RECT_COPY)
+    push((uint32)from_x)
+    push((uint32)from_y)
+    push((uint32)to_x)
+    push((uint32)to_y)
+    push((uint32)w)
+    push((uint32)h)
+    svga_sync()
+    return true
+}
+
+export fn svga_define_cursor(width: uint64, height: uint64, hot_x: uint64,
+                             hot_y: uint64, pixels: uint32*) {
+    if (!svga_can_cursor()) {
+        return
+    }
+    push(CMD_DEFINE_ALPHA_CURSOR)
+    push(1)
+    push((uint32)hot_x)
+    push((uint32)hot_y)
+    push((uint32)width)
+    push((uint32)height)
+    for i: uint64 in 0..(width * height) {
+        push(pixels[i])
+    }
+    svga_sync()
+    write_register(REG_CURSOR_ID, 1)
+}
+
+export fn svga_move_cursor(x: uint64, y: uint64) {
+    write_register(REG_CURSOR_ID, 1)
+    write_register(REG_CURSOR_X, (uint32)x)
+    write_register(REG_CURSOR_Y, (uint32)y)
+    write_register(REG_CURSOR_ON, CURSOR_SHOW)
+}

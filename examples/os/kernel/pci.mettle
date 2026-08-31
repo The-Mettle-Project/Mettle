@@ -1,0 +1,58 @@
+import "port"
+
+export const PCI_NONE: uint64 = 0xffffffff
+
+const ADDRESS_PORT: uint16 = 0xcf8
+const DATA_PORT: uint16 = 0xcfc
+const ENABLE_BIT: uint32 = 0x80000000
+const COMMAND_OFFSET: uint32 = 0x04
+const BAR_OFFSET: uint32 = 0x10
+const COMMAND_IO: uint32 = 0x01
+const COMMAND_MEMORY: uint32 = 0x02
+const COMMAND_BUS_MASTER: uint32 = 0x04
+const BAR_IS_IO: uint32 = 0x01
+const BAR_IO_MASK: uint32 = 0xfffffffc
+const BAR_MEMORY_MASK: uint32 = 0xfffffff0
+
+fn address_of(location: uint64, offset: uint32) -> uint32 {
+    return ENABLE_BIT | (uint32)(location << 8) | (offset & 0xfc)
+}
+
+export fn pci_read(location: uint64, offset: uint32) -> uint32 {
+    port_out32(ADDRESS_PORT, address_of(location, offset))
+    return port_in32(DATA_PORT)
+}
+
+export fn pci_write(location: uint64, offset: uint32, value: uint32) {
+    port_out32(ADDRESS_PORT, address_of(location, offset))
+    port_out32(DATA_PORT, value)
+}
+
+export fn pci_find(vendor: uint32, device: uint32) -> uint64 {
+    var wanted: uint32 = (device << 16) | vendor
+    for bus: uint64 in 0..2 {
+        for slot: uint64 in 0..32 {
+            for function: uint64 in 0..8 {
+                var location: uint64 = (bus << 8) | (slot << 3) | function
+                if (pci_read(location, 0) == wanted) {
+                    return location
+                }
+            }
+        }
+    }
+    return PCI_NONE
+}
+
+export fn pci_bar(location: uint64, index: uint32) -> uint64 {
+    var value: uint32 = pci_read(location, BAR_OFFSET + index * 4)
+    if ((value & BAR_IS_IO) != 0) {
+        return (uint64)(value & BAR_IO_MASK)
+    }
+    return (uint64)(value & BAR_MEMORY_MASK)
+}
+
+export fn pci_claim(location: uint64) {
+    var command: uint32 = pci_read(location, COMMAND_OFFSET)
+    pci_write(location, COMMAND_OFFSET,
+              command | COMMAND_IO | COMMAND_MEMORY | COMMAND_BUS_MASTER)
+}
