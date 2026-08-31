@@ -84,8 +84,9 @@ The built-in type names are also reserved: `int8`, `int16`, `int32`, `int64`,
 
 Some names are recognized by position and stay usable elsewhere: `bool`,
 `char`, `cstring`, `rawptr`, `comptime`, `volatile`, `in`, `sizeof`, `typeof`,
-`Fn`, `Type`, `Field`. Writing one where a type belongs gets you that type.
-Writing one as a variable name works.
+`Fn`, `Type`, `Field`, `quiesce`, `fallthrough`. Writing one where a type
+belongs gets you that type. Writing one as a variable name works. `quiesce;`
+and `fallthrough;` are statements only when a semicolon follows the name.
 
 An `asm` block is not lexed as Mettle at all. Everything between its braces is
 handed to the compiler's own x86 assembler, which has its own comment styles

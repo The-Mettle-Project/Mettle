@@ -21,6 +21,10 @@ typedef struct {
   char *break_label;
   char *continue_label;
   char *user_label; // optional source-level label for labeled break/continue
+  /* Where `fallthrough;` goes: the next case's label, while that case's body
+     is being lowered. Borrowed from the switch's label array, and NULL
+     everywhere else, including in the last case. */
+  const char *fallthrough_label;
   /* The defer chain in effect where this loop or switch was entered. A
      `break` or `continue` targeting this frame leaves every scope between the
      jump and here, so those scopes' deferred statements run before it. */
@@ -331,6 +335,14 @@ int ir_push_control_frame(IRLoweringContext *context,
 void ir_pop_control_frame(IRLoweringContext *context);
 
 const char *ir_current_break_label(IRLoweringContext *context);
+
+/* The innermost switch case that has a case after it, or NULL. `fallthrough`
+   jumps to its label, and its defer chain says which scopes to leave first. */
+const IRControlFrame *ir_current_fallthrough_frame(IRLoweringContext *context);
+
+/* Point the innermost control frame at the case a `fallthrough` would enter.
+   The switch sets it before each case body and clears it after the last. */
+void ir_set_fallthrough_label(IRLoweringContext *context, const char *label);
 
 const char *ir_current_continue_label(IRLoweringContext *context);
 

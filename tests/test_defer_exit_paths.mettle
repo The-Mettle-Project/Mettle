@@ -74,6 +74,7 @@ fn switch_case(v: int32) -> int32 {
     case 1: {
       defer println("s-case1");
       println("s-body1");
+      fallthrough;
     }
     case 2: {
       defer println("s-case2");

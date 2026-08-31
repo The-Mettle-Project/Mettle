@@ -222,6 +222,49 @@ int type_checker_ensure_multi_return_type(TypeChecker *checker,
   return 1;
 }
 
+/* A slice of `element`: the fat pointer `{ data, length }` that carries its own
+ * extent. It is spelled `T[]`, it is what a `T[N]` becomes when it is handed to
+ * something that does not know N, and it is what `new T[n]` produces. The two
+ * fields are ordinary ones, so `.length` and `.data` read the way any struct's
+ * fields read, and the value copies and passes the way a 16-byte struct does. */
+Type *type_checker_slice_of(TypeChecker *checker, Type *element) {
+  const char *element_name = NULL;
+  size_t name_length = 0;
+  char *name = NULL;
+  Type *slice = NULL;
+  Type *data = NULL;
+
+  if (!checker || !element) {
+    return NULL;
+  }
+  element_name = element->name ? element->name : "?";
+  name_length = strlen(element_name) + 3;
+  name = malloc(name_length);
+  if (!name) {
+    return NULL;
+  }
+  snprintf(name, name_length, "%s[]", element_name);
+
+  slice = type_create(TYPE_SLICE, name);
+  free(name);
+  if (!slice) {
+    return NULL;
+  }
+  data = type_checker_pointer_to(checker, element);
+  if (!data || !type_alloc_fields(slice, 2)) {
+    type_destroy(slice);
+    return NULL;
+  }
+  slice->base_type = element;
+  slice->size = 16;
+  slice->alignment = 8;
+  type_set_field(slice, 0, "data", data, 0);
+  type_set_field(slice, 1, "length", checker->builtin_int64, 0);
+  slice->field_offsets[0] = 0;
+  slice->field_offsets[1] = 8;
+  return type_checker_canon_type(checker, slice);
+}
+
 /* Pointer to an arbitrary type, built from the type rather than from its
  * spelling. Address-of used to mangle "<name>*" and look the result up, which
  * works while the name is a plain identifier and fails the moment it is not:
@@ -761,6 +804,11 @@ void type_checker_init_builtin_types(TypeChecker *checker) {
     checker->builtin_field->size = 0;
     checker->builtin_field->alignment = 0;
   }
+  checker->builtin_row = type_create(TYPE_FIELD, "Row");
+  if (checker->builtin_row) {
+    checker->builtin_row->size = 0;
+    checker->builtin_row->alignment = 0;
+  }
   checker->builtin_sequence = type_create(TYPE_SEQUENCE, "Sequence");
   if (checker->builtin_sequence) {
     checker->builtin_sequence->size = 0;
@@ -850,6 +898,24 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
   if (strcmp(name, "Kind") == 0) {
     type_checker_register_kind_enum(checker);
     return checker->builtin_kind;
+  }
+
+  /* `T[]`: a slice, which is `T*` and a length in one value. The brackets are
+   * empty because the length is not part of the type. */
+  {
+    size_t length = strlen(name);
+    if (length > 2 && name[length - 2] == '[' && name[length - 1] == ']') {
+      char *element_name = malloc(length - 1);
+      Type *element = NULL;
+      if (!element_name) {
+        return NULL;
+      }
+      memcpy(element_name, name, length - 2);
+      element_name[length - 2] = '\0';
+      element = type_checker_get_type_by_name(checker, element_name);
+      free(element_name);
+      return element ? type_checker_slice_of(checker, element) : NULL;
+    }
   }
 
   /* A parenthesised type. Bare, it is the type inside; suffixed, the array and

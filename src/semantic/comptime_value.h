@@ -24,7 +24,8 @@ typedef enum {
   COMPTIME_TYPE_REF,
   COMPTIME_FIELD_REF,
   COMPTIME_STRING,
-  COMPTIME_SEQUENCE
+  COMPTIME_SEQUENCE,
+  COMPTIME_ROW
 } ComptimeValueKind;
 
 typedef struct {
@@ -49,6 +50,16 @@ typedef struct {
   uint32_t count;
 } ComptimeSequence;
 
+/* One row of a constant table. `literal` is the row's aggregate literal, held
+ * as void so this header stays independent of the AST; `type_index` names the
+ * struct whose field names the columns answer to. Borrowed, like every other
+ * pointer a ComptimeValue carries: the program owns the table. */
+typedef struct {
+  const void *literal;
+  uint32_t type_index;
+  uint32_t index;
+} ComptimeRow;
+
 typedef struct ComptimeValue {
   ComptimeValueKind kind;
   union {
@@ -58,6 +69,7 @@ typedef struct ComptimeValue {
     FieldRef field_ref;
     ComptimeString string;
     ComptimeSequence sequence;
+    ComptimeRow row;
   } as;
 } ComptimeValue;
 
@@ -71,6 +83,9 @@ ComptimeValue comptime_string(const char *value);
 /* `items` must point into storage that outlives the value; see the arena on
  * TypeChecker. */
 ComptimeValue comptime_sequence(const ComptimeValue *items, uint32_t count);
+/* `literal` must outlive the value; it is a node of the program's own AST. */
+ComptimeValue comptime_row(const void *literal, uint32_t type_index,
+                           uint32_t index);
 
 int comptime_is_none(ComptimeValue value);
 int comptime_is_reflection(ComptimeValue value);

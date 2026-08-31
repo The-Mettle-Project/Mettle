@@ -83,13 +83,14 @@ enum Color { Red = 1, Green = 2, Blue = 3 }
 ```mettle
 var c: Color = Color.Green;
 switch ((int32)c) {
-  case 1: { println("red"); break; }
-  case 2: { println("green"); break; }
+  case 1: { println("red"); }
+  case 2: { println("green"); }
   default: { println("other"); }
 }
 ```
 
-Cases fall through without `break`.
+A case ends where the next one begins. An empty case body continues into the
+next case, and `fallthrough;` makes a case with a body do the same.
 
 ## Tagged enums and match
 

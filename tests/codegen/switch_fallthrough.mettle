@@ -1,0 +1,87 @@
+// A case used to run into the next one unless it ended with `break`, which
+// made the common case the one you had to write something for. A case now ends
+// where the next one begins, `fallthrough;` asks for the other behaviour, and
+// an empty case body is how several values share one.
+
+fn classify(n: int32) -> int32 {
+  var out: int32 = 0;
+  switch (n) {
+    case 1: { out = 1; }
+    case 2: { out = 2; }
+    case 3:
+    case 4: { out = 34; }
+    case 5: { out = 5; fallthrough; }
+    case 6: { out = out + 60; }
+    case 7: {
+      out = 7;
+      if (n == 7) { fallthrough; }
+      out = 700;
+    }
+    case 8: { out = out + 80; }
+    default: { out = 99; }
+  }
+  return out;
+}
+
+fn unbraced(n: int32) -> int32 {
+  var out: int32 = 0;
+  switch (n) {
+    case 0:
+      out = 10;
+      break;
+    case 1:
+      out = 11;
+    case 2:
+      out = out + 12;
+    default:
+      out = out + 99;
+  }
+  return out;
+}
+
+fn with_defer(n: int32) -> int32 {
+  var log: int32 = 0;
+  switch (n) {
+    case 1: {
+      log = 1;
+      fallthrough;
+    }
+    case 2: { log = log + 20; }
+    default: { log = 99; }
+  }
+  return log;
+}
+
+fn ranged(n: int32) -> int32 {
+  switch (n) {
+    case 0..3: { return 1; }
+    case 4..6: { return 2; }
+    default: { return 3; }
+  }
+}
+
+fn main() -> int32 {
+  if (classify(0) != 99) { return 1; }
+  if (classify(1) != 1) { return 2; }
+  if (classify(2) != 2) { return 3; }
+  if (classify(3) != 34) { return 4; }
+  if (classify(4) != 34) { return 5; }
+  if (classify(5) != 65) { return 6; }
+  if (classify(6) != 60) { return 7; }
+  if (classify(7) != 87) { return 8; }
+  if (classify(8) != 80) { return 9; }
+  if (classify(9) != 99) { return 10; }
+
+  if (unbraced(0) != 10) { return 11; }
+  if (unbraced(1) != 11) { return 12; }
+  if (unbraced(2) != 12) { return 13; }
+  if (unbraced(3) != 99) { return 14; }
+
+  if (with_defer(1) != 21) { return 15; }
+  if (with_defer(2) != 20) { return 16; }
+
+  if (ranged(2) != 1) { return 17; }
+  if (ranged(5) != 2) { return 18; }
+  if (ranged(9) != 3) { return 19; }
+  return 0;
+}

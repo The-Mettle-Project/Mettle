@@ -52,6 +52,10 @@ typedef struct {
    * Field is the type of a FieldRef. Neither has a runtime representation. */
   Type *builtin_type;
   Type *builtin_field;
+  /* The type of a `comptime for` binding over a constant table. It is a
+     compile-time type like Field, so the escape checks that keep reflection
+     out of runtime code cover a row without knowing about tables. */
+  Type *builtin_row;
   Type *builtin_sequence;
 
   /* Interned types, indexed by TypeRef.type_index / FieldRef.type_index. */
@@ -108,6 +112,14 @@ typedef struct {
    * initializes - so the caller that knows that type parks it here for the one
    * inference call that may see the literal. Consumed (cleared) on read. */
   Type *aggregate_target_type;
+  /* Set alongside it when the literal lands somewhere no code runs: a `const`,
+     or a module-scope `var`. An element that is not a constant is then an
+     error rather than a store. Consumed (cleared) with the target type. */
+  int aggregate_requires_constant;
+  /* The module being checked. Module-scope expansion runs before any `const`
+     has a symbol, so a `comptime for` over a table finds the declaration here
+     and reads the rows straight out of what the program wrote. */
+  struct ASTNode *module_program;
   /* Struct types registered as empty placeholders so a cycle of pointers can
      resolve. A cycle has no order that puts every name before its use, so the
      names are all declared first and the fields filled in afterwards. Each
@@ -327,6 +339,13 @@ int type_checker_eval_type_member(TypeChecker *checker,
                                   ComptimeValue type_value, const char *member,
                                   ComptimeValue *out_value);
 int type_checker_field_member_exists(const char *member);
+
+/* One column of a `comptime for` table row, and whether that column exists.
+   A row's members are its struct's fields, plus `.index`. */
+int type_checker_eval_row_member(TypeChecker *checker, ComptimeValue row,
+                                 const char *member, ComptimeValue *out_value);
+int type_checker_row_member_exists(TypeChecker *checker, ComptimeValue row,
+                                   const char *member);
 int type_checker_eval_field_member(TypeChecker *checker, ComptimeValue field,
                                    const char *member,
                                    ComptimeValue *out_value);

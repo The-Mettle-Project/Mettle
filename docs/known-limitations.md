@@ -8,9 +8,6 @@ entry is something a reader would otherwise hit and have to work out.
 A tagged-enum variant carries at most one payload. `Circle(float64)` works;
 `Pair(int32, int32)` does not parse. Wrap two values in a struct.
 
-`switch` cases fall through into the next case. End each one with `break`
-unless you mean the fall-through.
-
 An array is one-dimensional. `int64[3][4]` does not parse; index a flat
 `int64[12]` yourself.
 
@@ -26,15 +23,24 @@ size. Hold one of them by pointer: 'B*'
 
 ## Aggregate literals
 
-Elements must be compile-time constants: literals, other constants, `sizeof`,
-arithmetic over those, `&function`, `&global`, `0`, string literals, and nested
-literals. A call in an element is rejected:
+A literal initializing a local may hold anything an assignment to that field
+could hold, computed values included. What is known while compiling is laid out
+in the object file and copied in; what is not becomes a store into that image
+at the element's own offset, so the two mix freely inside one literal.
+
+A `const` and a module-scope `var` are laid out before any code runs, so their
+elements have to be constants: literals, other constants, `sizeof`, arithmetic
+over those, `&function`, `&global`, `0`, string literals, and nested literals.
+An element that is not reports where it sits:
 
 ```text
-error[E0003]: aggregate literal elements must be compile-time constants
+error[E0003]: a constant and a module-scope variable are laid out before the
+program runs, so every element has to be known while compiling, and this one is
+not. Make it a constant, or build the value in a function
 ```
 
-There is no run-time aggregate literal.
+A literal also needs a target type, which it takes from the `var`, `const`, or
+assignment it initializes. It cannot stand alone as a call argument.
 
 A closure cannot appear in one, because its environment is built at run time.
 Writing a lambda where a `Fn` field is expected inside a literal reports a
@@ -45,15 +51,17 @@ elements, unknown field names, and repeated field names are errors.
 
 ## Compile-time expansion
 
-`typeof(T).fields` is the only compile-time sequence. `comptime for` iterates a
-struct's fields and nothing else:
+`comptime for` iterates two sequences: `typeof(T).fields`, and `TABLE.rows` for
+a `const` holding an array literal. Anything else is refused by name:
 
 ```text
-error[E0003]: 'comptime for' iterates a compile-time sequence; the only one is
-'<type>.fields'
+error[E0003]: 'comptime for' cannot iterate '.each'; the compile-time sequences
+are '.fields' and '.rows'
 ```
 
-There is no way to declare a table of data and generate from it.
+A row of a struct answers to its own columns and to `.index`; a row of a plain
+value is that value. Every column has to be a compile-time constant, which a
+`const` guarantees.
 
 Compile-time strings compare and nothing else. `==` and `!=` fold, which is
 enough to check that two declarations agree by name. There is no

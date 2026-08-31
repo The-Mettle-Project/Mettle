@@ -1,0 +1,33 @@
+// `&name` in an aggregate literal used to become a link-time relocation, which
+// needs a name the object file defines. A local lives on the stack, so folding
+// one produced an image referring to a name that does not exist, and the
+// linker said "Relocation refers to an undefined symbol" with no source line.
+// A local's address is not known until the frame exists, so it is taken where
+// the literal is written, like any other element that is not a constant.
+
+struct Node {
+  value: int32;
+  next: Node*;
+}
+
+fn walk(from: Node*) -> int32 {
+  var total: int32 = 0;
+  var at: Node* = from;
+  var guard: int32 = 0;
+  while (at != 0 && guard < 8) {
+    total = total + at->value;
+    at = at->next;
+    guard = guard + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var first: Node = { value: 1, next: 0 };
+  var second: Node = { value: 2, next: &first };
+  var third: Node = { value: 4, next: &second };
+  if (second.next->value != 1) { return 1; }
+  if (third.next->next->value != 1) { return 2; }
+  if (walk(&third) != 7) { return 3; }
+  return 0;
+}

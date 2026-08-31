@@ -1,0 +1,60 @@
+// `comptime for` used to iterate one sequence, `<type>.fields`, so a program
+// could reflect on the types it had written and could not generate from data it
+// wrote down. A `const` array is a table, and `.rows` iterates it: a row of a
+// struct answers to its own columns, and a row of a plain value is that value.
+
+struct Op { name: string; code: int32; cost: float64; }
+
+const OPS: Op[3] = [
+  { name: "add", code: 1, cost: 0.5 },
+  { name: "mul", code: 2, cost: 2.5 },
+  { name: "nop", code: 0, cost: 0.0 }
+];
+
+const WIDTHS: int32[4] = [ 1, 2, 4, 8 ];
+const LABELS: string[2] = [ "alpha", "beta" ];
+
+comptime for op in OPS.rows {
+  fn ident("code_of_", op.name)() -> int32 { return op.code; }
+  fn ident("cost_of_", op.name)() -> float64 { return op.cost; }
+  const ident("SLOT_", op.name) = op.index;
+  struct ident("Rec_", op.name) { code: int32; used: int32; }
+}
+
+fn total_width() -> int32 {
+  var total: int32 = 0;
+  comptime for w in WIDTHS.rows {
+    total = total + w;
+  }
+  return total;
+}
+
+fn label_bytes() -> int32 {
+  var total: int32 = 0;
+  comptime for label in LABELS.rows {
+    total = total + (int32)label.length;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  if (code_of_add() != 1) { return 1; }
+  if (code_of_mul() != 2) { return 2; }
+  if (code_of_nop() != 0) { return 3; }
+
+  if (cost_of_add() != 0.5) { return 4; }
+  if (cost_of_mul() != 2.5) { return 5; }
+
+  if (SLOT_add != 0) { return 6; }
+  if (SLOT_mul != 1) { return 7; }
+  if (SLOT_nop != 2) { return 8; }
+
+  var r: Rec_add;
+  r.code = code_of_add();
+  r.used = 1;
+  if (r.code != 1 || r.used != 1) { return 9; }
+
+  if (total_width() != 15) { return 10; }
+  if (label_bytes() != 9) { return 11; }
+  return 0;
+}

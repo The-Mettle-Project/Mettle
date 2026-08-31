@@ -51,12 +51,23 @@ ComptimeValue comptime_sequence(const ComptimeValue *items, uint32_t count) {
   return value;
 }
 
+ComptimeValue comptime_row(const void *literal, uint32_t type_index,
+                           uint32_t index) {
+  ComptimeValue value;
+  value.kind = COMPTIME_ROW;
+  value.as.row.literal = literal;
+  value.as.row.type_index = type_index;
+  value.as.row.index = index;
+  return value;
+}
+
 int comptime_is_none(ComptimeValue value) {
   return value.kind == COMPTIME_NONE;
 }
 
 int comptime_is_reflection(ComptimeValue value) {
-  return value.kind == COMPTIME_TYPE_REF || value.kind == COMPTIME_FIELD_REF;
+  return value.kind == COMPTIME_TYPE_REF || value.kind == COMPTIME_FIELD_REF ||
+         value.kind == COMPTIME_ROW;
 }
 
 const char *comptime_kind_name(ComptimeValueKind kind) {
@@ -75,6 +86,8 @@ const char *comptime_kind_name(ComptimeValueKind kind) {
     return "string";
   case COMPTIME_SEQUENCE:
     return "sequence";
+  case COMPTIME_ROW:
+    return "table row";
   }
   return "unknown";
 }

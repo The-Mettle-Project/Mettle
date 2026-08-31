@@ -59,6 +59,9 @@ typedef enum {
   /* `comptime for f in typeof(T).fields { ... }`. Replaced by its expansions
    * during const eval, so no pass after the expander ever sees one. */
   AST_COMPTIME_FOR,
+  /* `fallthrough;` inside a switch case: continue into the next case's body.
+     A case ends at the next one without it. */
+  AST_FALLTHROUGH_STATEMENT,
   /* Not a node kind: the number of them, so a table can be indexed by one. */
   AST_NODE_TYPE_COUNT
 } ASTNodeType;
@@ -434,6 +437,17 @@ typedef struct {
   int string_wants_record;
 } AggregateReloc;
 
+/* One element of an aggregate literal that is not a compile-time constant. The
+ * image holds zero at its offset and lowering stores the value there after
+ * copying the image in, so a literal may mix the two freely: what is known
+ * while compiling stays in the image, and what is not is computed at the point
+ * the literal is written. */
+typedef struct {
+  size_t offset;            // byte offset into the image
+  ASTNode *element;         // borrowed; the node is a child of the literal
+  struct Type *element_type; // what to store, and how wide
+} AggregateRuntimeStore;
+
 /* An aggregate literal: `[a, b, c]` or `[value; count]` for an array, and
  * `{ field: value, ... }` for a struct. The literal has no type of its own -
  * it takes the type of whatever it initializes, which is always spelled out in
@@ -457,6 +471,9 @@ typedef struct {
   size_t image_size;
   AggregateReloc *relocs;
   size_t reloc_count;
+  /* The elements that are not constants, in the order they were written. */
+  AggregateRuntimeStore *runtime_stores;
+  size_t runtime_store_count;
 } AggregateLiteral;
 
 typedef struct {
@@ -635,6 +652,8 @@ ASTNode *ast_create_comptime_for(const char *binding_name, ASTNode *sequence,
 int ast_fold_member_access_to_int(ASTNode *node, long long value);
 /* Same, for a query that folded to a string (`.name`). */
 int ast_fold_member_access_to_string(ASTNode *node, const char *value);
+/* Same, for a float column of a compile-time table. */
+int ast_fold_member_access_to_float(ASTNode *node, double value);
 /* Replace an `ident(...)` call node with the identifier it composed. */
 int ast_fold_call_to_identifier(ASTNode *node, const char *name);
 ASTNode *ast_create_case_clause(ASTNode *value, ASTNode *body, int is_default,
@@ -643,6 +662,7 @@ ASTNode *ast_create_switch_statement(ASTNode *expression, ASTNode **cases,
                                      size_t case_count,
                                      SourceLocation location);
 ASTNode *ast_create_quiesce_statement(SourceLocation location);
+ASTNode *ast_create_fallthrough_statement(SourceLocation location);
 ASTNode *ast_create_break_statement(SourceLocation location);
 ASTNode *ast_create_continue_statement(SourceLocation location);
 ASTNode *ast_create_labeled_break_statement(const char *label,

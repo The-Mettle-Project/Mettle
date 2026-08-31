@@ -676,12 +676,13 @@ $cases = @(
     Args          = @("-O")
   },
   @{
-    # Aggregate literals are compile-time constants: a call in an element has
-    # no bytes to lay out, and there is no module initializer to run it in.
+    # A `const` is laid out before any code runs: a call in one of its elements
+    # has no bytes to lay out, and there is no module initializer to run it in.
+    # A local's literal takes the same call as a store.
     Name          = "err_aggregate_literal_runtime"
     Path          = "tests/err_aggregate_literal_runtime.mettle"
     ShouldSucceed = $false
-    Pattern       = 'aggregate literal elements must be compile-time constants'
+    Pattern       = 'laid out before the program runs'
   },
   @{
     # A global aggregate needs a literal. This used to reach the backend and
@@ -1368,7 +1369,7 @@ $cases = @(
                          'expanded from comptime-for iteration 2 \(field .b.\)')
      OutputMustNotMatch = @("internal compiler error") },
   @{ Name = "err_comptime_for_bad_sequence"; Path = "tests/err_comptime_for_bad_sequence.mettle"; ShouldSucceed = $false
-     Pattern = "the only compile-time sequence is"
+     Pattern = "the compile-time sequences are"
      OutputMustNotMatch = @("internal compiler error") },
   @{ Name = "err_comptime_for_escape"; Path = "tests/err_comptime_for_escape.mettle"; ShouldSucceed = $false
      Pattern = "cannot escape into runtime code"
@@ -1392,9 +1393,6 @@ $cases = @(
   # A global is laid out at compile time and there is no module initializer, so a
   # run-time initializer must be a diagnostic with a source location - it used to
   # reach the direct-object backend and abort as an internal compiler error.
-  @{ Name = "err_aggregate_address_of_local"; Path = "tests/err_aggregate_address_of_local.mettle"; ShouldSucceed = $false
-     Pattern = "is a local, so its address is only known at run time"
-     OutputMustNotMatch = @("Relocation refers to an undefined symbol") },
   @{ Name = "err_global_init_call"; Path = "tests/err_global_init_call.mettle"; ShouldSucceed = $false
      Pattern = "a global's initializer must be known at compile time"
      OutputMustNotMatch = @("internal compiler error") },
@@ -2278,6 +2276,12 @@ $cases = @(
   @{ Name = "err_struct_value_cycle"; Path = "tests/err_struct_value_cycle.mettle"; ShouldSucceed = $false; Pattern = "each store a value of the other" },
   @{ Name = "err_generic_infer_unknown"; Path = "tests/err_generic_infer_unknown.mettle"; ShouldSucceed = $false; Pattern = "Nothing in this call says what" },
   @{ Name = "err_generic_infer_conflict"; Path = "tests/err_generic_infer_conflict.mettle"; ShouldSucceed = $false; Pattern = "asks for a different type parameter" },
+  @{ Name = "err_const_aggregate_runtime"; Path = "tests/err_const_aggregate_runtime.mettle"; ShouldSucceed = $false; Pattern = "laid out before the program runs" },
+  @{ Name = "err_global_aggregate_runtime"; Path = "tests/err_global_aggregate_runtime.mettle"; ShouldSucceed = $false; Pattern = "laid out before the program runs" },
+  @{ Name = "err_fallthrough_last_case"; Path = "tests/err_fallthrough_last_case.mettle"; ShouldSucceed = $false; Pattern = "has no case to fall into" },
+  @{ Name = "err_fallthrough_outside_switch"; Path = "tests/err_fallthrough_outside_switch.mettle"; ShouldSucceed = $false; Pattern = "only be used inside a switch case" },
+  @{ Name = "err_comptime_table_not_const"; Path = "tests/err_comptime_table_not_const.mettle"; ShouldSucceed = $false; Pattern = "is not a constant table" },
+  @{ Name = "err_comptime_table_column"; Path = "tests/err_comptime_table_column.mettle"; ShouldSucceed = $false; Pattern = "rows have no column" },
   @{ Name = "err_function_arg_count"; Path = "tests/err_function_arg_count.mettle"; ShouldSucceed = $false; Pattern = "expects .* arguments, got" },
   @{ Name = "err_function_arg_type"; Path = "tests/err_function_arg_type.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
   @{ Name = "err_gpu_kernel_return"; Path = "tests/err_gpu_kernel_return.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_result' must return void" },
@@ -13668,6 +13672,14 @@ $runFixtures = @(
      What = "an array of function pointers dispatched wrong" },
   @{ Name = "generic_inference"; Path = "tests/codegen/generic_inference.mettle"
      What = "an inferred type argument picked the wrong instantiation" },
+  @{ Name = "runtime_aggregate_literal"; Path = "tests/codegen/runtime_aggregate_literal.mettle"
+     What = "an aggregate literal built from computed values came out wrong" },
+  @{ Name = "aggregate_address_of_local"; Path = "tests/codegen/aggregate_address_of_local.mettle"
+     What = "the address of a local in an aggregate literal came out wrong" },
+  @{ Name = "switch_fallthrough"; Path = "tests/codegen/switch_fallthrough.mettle"
+     What = "a switch case ran into the next one, or a fallthrough did not" },
+  @{ Name = "comptime_table"; Path = "tests/codegen/comptime_table.mettle"
+     What = "a declaration generated from a constant table came out wrong" },
   @{ Name = "struct_methods"; Path = "tests/codegen/struct_methods.mettle"
      What = "a struct method body behaved wrong" },
   @{ Name = "unsigned_fold"; Path = "tests/codegen/unsigned_fold.mettle"

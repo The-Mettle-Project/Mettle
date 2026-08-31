@@ -1778,6 +1778,19 @@ ASTNode *parser_parse_statement(Parser *parser) {
     return ast_create_quiesce_statement(location);
   }
 
+  /* Contextual `fallthrough;`: continue into the next case of a switch. A case
+   * ends where the next one begins, so this is what asks for the other
+   * behaviour, and it is contextual for the same reason `quiesce` is. */
+  if (parser_is_identifier_like(parser->current_token.type) &&
+      parser->current_token.value &&
+      strcmp(parser->current_token.value, "fallthrough") == 0 &&
+      parser->peek_token.type == TOKEN_SEMICOLON) {
+    SourceLocation location = parser_current_location(parser);
+    parser_advance(parser);
+    parser_advance(parser);
+    return ast_create_fallthrough_statement(location);
+  }
+
   // Vectorization attribute on a loop: `@simd` / `@simd!`.
   //   @simd  for i in 0..n { ... }   -> best-effort hint (warn if not vectorized)
   //   @simd! for i in 0..n { ... }   -> hard contract (compile error otherwise)
@@ -2571,6 +2584,21 @@ static char *parser_parse_array_suffix(Parser *parser, char *type_name) {
     return type_name;
   }
   parser_advance(parser); /* consume '[' */
+
+  /* `T[]`: a slice, whose length is not part of the type. Empty brackets are
+     what says so, and the suffix keeps stacking after it. */
+  if (parser->current_token.type == TOKEN_RBRACKET) {
+    size_t slice_len = strlen(type_name) + 3;
+    char *slice_type = malloc(slice_len);
+    parser_advance(parser);
+    if (!slice_type) {
+      free(type_name);
+      return NULL;
+    }
+    snprintf(slice_type, slice_len, "%s[]", type_name);
+    free(type_name);
+    return parser_parse_array_suffix(parser, slice_type);
+  }
 
   if (parser->current_token.type != TOKEN_NUMBER &&
       parser->current_token.type != TOKEN_IDENTIFIER) {

@@ -654,6 +654,25 @@ int type_checker_check_for_statement(TypeChecker *checker,
   return 1;
 }
 
+/* The first `fallthrough` this case body would reach, or NULL. A nested switch
+ * owns its own cases, so the walk stops at one. */
+static const ASTNode *type_checker_find_fallthrough(const ASTNode *node) {
+  size_t i;
+  if (!node || node->type == AST_SWITCH_STATEMENT) {
+    return NULL;
+  }
+  if (node->type == AST_FALLTHROUGH_STATEMENT) {
+    return node;
+  }
+  for (i = 0; i < node->child_count; i++) {
+    const ASTNode *found = type_checker_find_fallthrough(node->children[i]);
+    if (found) {
+      return found;
+    }
+  }
+  return NULL;
+}
+
 int type_checker_check_switch_statement(TypeChecker *checker,
                                                ASTNode *statement) {
   SwitchStatement *switch_stmt = (SwitchStatement *)statement->data;
@@ -904,6 +923,18 @@ int type_checker_check_switch_statement(TypeChecker *checker,
       free(init_snapshot);
       free(case_values);
       return 0;
+    }
+    if (i + 1 == switch_stmt->case_count) {
+      const ASTNode *stray = type_checker_find_fallthrough(case_clause->body);
+      if (stray) {
+        type_checker_set_error_at_location(
+            checker, stray->location,
+            "'fallthrough' in the last case has no case to fall into");
+        checker->switch_depth--;
+        free(init_snapshot);
+        free(case_values);
+        return 0;
+      }
     }
     type_checker_init_tracker_restore(checker, init_snapshot,
                                       init_snapshot_count);
@@ -1273,6 +1304,15 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
    * to check about the point itself; what a swap is allowed to change is
    * checked against `layoutof` where the swap is proposed. */
   case AST_QUIESCE_STATEMENT:
+    return 1;
+
+  case AST_FALLTHROUGH_STATEMENT:
+    if (checker->switch_depth <= 0) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "'fallthrough' can only be used inside a switch case");
+      return 0;
+    }
     return 1;
 
   case AST_BREAK_STATEMENT: {

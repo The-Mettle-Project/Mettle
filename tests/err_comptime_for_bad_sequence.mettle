@@ -1,5 +1,5 @@
-// `.fields` is the only compile-time sequence, and the message says so rather
-// than reporting that something unspecified went wrong.
+// `.fields` and `.rows` are the compile-time sequences, and the message names
+// them rather than reporting that something unspecified went wrong.
 
 struct Point {
   x: int32;

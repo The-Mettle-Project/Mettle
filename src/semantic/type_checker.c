@@ -64,6 +64,8 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   checker->tracked_scope_depth = 0;
   checker->tracked_buffer_extents = NULL;
   checker->aggregate_target_type = NULL;
+  checker->aggregate_requires_constant = 0;
+  checker->module_program = NULL;
   checker->struct_placeholders = NULL;
   checker->struct_placeholder_count = 0;
   checker->struct_placeholder_capacity = 0;
@@ -85,6 +87,7 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   checker->builtin_void = NULL;
   checker->builtin_type = NULL;
   checker->builtin_field = NULL;
+  checker->builtin_row = NULL;
   checker->builtin_sequence = NULL;
   checker->type_table = NULL;
   checker->type_table_count = 0;
@@ -168,6 +171,7 @@ void type_checker_destroy(TypeChecker *checker) {
     type_destroy(checker->builtin_void);
     type_destroy(checker->builtin_type);
     type_destroy(checker->builtin_field);
+    type_destroy(checker->builtin_row);
     type_destroy(checker->builtin_sequence);
     free(checker->type_table);
     free(checker->struct_placeholders);
@@ -604,6 +608,7 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
   Program *prog = (Program *)program->data;
   if (!prog)
     return 0;
+  checker->module_program = program;
 
   // Pass 1: Register struct and enum types. On failure keep going so every
   // bad declaration is reported in one compile, not one per rebuild.

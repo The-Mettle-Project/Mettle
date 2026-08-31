@@ -1,0 +1,77 @@
+// An aggregate literal used to be a compile-time constant and nothing else, so
+// a struct built from a computed value had to be declared zeroed and filled a
+// field at a time. What is known while compiling still becomes an image in the
+// object file; what is not becomes a store into that image, at the offset the
+// element occupies, so a literal may mix the two freely.
+
+struct Point { x: int32; y: int32; }
+struct Line { a: Point; b: Point; label: string; }
+struct Sizes { small: int8; medium: int32; wide: int64; ratio: float64; }
+
+@noinline fn triple(n: int32) -> int32 { return n * 3; }
+@noinline fn name_of(n: int32) -> string { if (n == 1) { return "one"; } return "many"; }
+
+fn make(a: int32, b: int32) -> Point {
+  var p: Point = { x: a, y: b };
+  return p;
+}
+
+fn main() -> int32 {
+  var k: int32 = 4;
+
+  var p: Point = { x: triple(2), y: k };
+  if (p.x != 6 || p.y != 4) { return 1; }
+
+  var all_constant: Point = { x: 1, y: 2 };
+  if (all_constant.x != 1 || all_constant.y != 2) { return 2; }
+
+  var partly: Point = { x: 9, y: k };
+  if (partly.x != 9 || partly.y != 4) { return 3; }
+
+  var nested: Line = { a: { x: k, y: 1 }, b: { x: 2, y: triple(1) },
+                       label: name_of(k) };
+  if (nested.a.x != 4 || nested.a.y != 1) { return 4; }
+  if (nested.b.x != 2 || nested.b.y != 3) { return 5; }
+  if ((int32)nested.label.length != 4) { return 6; }
+
+  var elements: int32[4] = [ k, triple(1), 7, k + 1 ];
+  if (elements[0] != 4 || elements[1] != 3) { return 7; }
+  if (elements[2] != 7 || elements[3] != 5) { return 8; }
+
+  var repeated: int32[3] = [ k; 3 ];
+  if (repeated[0] != 4 || repeated[2] != 4) { return 9; }
+
+  var assigned: Point;
+  assigned = { x: k * 2, y: 9 };
+  if (assigned.x != 8 || assigned.y != 9) { return 10; }
+
+  // An omitted field is zero even when a sibling is computed.
+  var partial: Line = { a: { x: k, y: 0 } };
+  if (partial.b.x != 0 || partial.b.y != 0) { return 11; }
+  if (partial.a.x != 4) { return 12; }
+
+  // Every width stores at its own size, and a float element keeps its bits.
+  var widths: Sizes = { small: (int8)k, medium: triple(3), wide: (int64)k * 100,
+                        ratio: (float64)k / 2.0 };
+  if (widths.small != 4) { return 13; }
+  if (widths.medium != 9) { return 14; }
+  if (widths.wide != 400) { return 15; }
+  if (widths.ratio != 2.0) { return 16; }
+
+  // The address of a local is not known until the frame exists.
+  var here: Point = { x: 1, y: 1 };
+  var pointers: Point*[2] = [ &here, &p ];
+  if (pointers[0]->x != 1 || pointers[1]->x != 6) { return 17; }
+
+  var returned: Point = make(triple(5), 2);
+  if (returned.x != 15 || returned.y != 2) { return 18; }
+
+  // A literal inside a loop is rebuilt on every iteration.
+  var total: int32 = 0;
+  for i in 0..4 {
+    var each: Point = { x: i, y: i * 2 };
+    total = total + each.x + each.y;
+  }
+  if (total != 18) { return 19; }
+  return 0;
+}

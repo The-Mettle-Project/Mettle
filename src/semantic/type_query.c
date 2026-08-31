@@ -421,6 +421,81 @@ int type_checker_eval_field_member(TypeChecker *checker, ComptimeValue field,
   return 0;
 }
 
+/* A column of one table row. The row is an aggregate literal and the columns
+ * are its struct's fields, so a name resolves the same way a field access
+ * would, and the answer is whatever constant the table wrote there. */
+int type_checker_eval_row_member(TypeChecker *checker, ComptimeValue row,
+                                 const char *member,
+                                 ComptimeValue *out_value) {
+  const AggregateLiteral *literal = NULL;
+  Type *row_type = NULL;
+  size_t i;
+
+  if (!checker || !member || !out_value || row.kind != COMPTIME_ROW) {
+    return 0;
+  }
+  literal = (const AggregateLiteral *)row.as.row.literal;
+  row_type = type_checker_type_from_index(checker, row.as.row.type_index);
+  if (!literal || !row_type) {
+    return 0;
+  }
+  if (strcmp(member, "index") == 0) {
+    *out_value = comptime_int((long long)row.as.row.index);
+    return 1;
+  }
+  for (i = 0; i < literal->element_count; i++) {
+    const char *written =
+        literal->field_names ? literal->field_names[i] : NULL;
+    if (!written || strcmp(written, member) != 0) {
+      continue;
+    }
+    return type_checker_eval_comptime(checker, literal->elements[i],
+                                      out_value);
+  }
+  /* A column the row left out keeps the zero the layout gives it, which is
+     what the value would be at run time. */
+  for (i = 0; i < row_type->field_count; i++) {
+    if (row_type->field_names[i] &&
+        strcmp(row_type->field_names[i], member) == 0) {
+      Type *column = row_type->field_types[i];
+      if (column && (column->kind == TYPE_FLOAT32 ||
+                     column->kind == TYPE_FLOAT64)) {
+        *out_value = comptime_float(0.0);
+      } else if (column && column->kind == TYPE_STRING) {
+        *out_value = comptime_string(string_intern(""));
+      } else {
+        *out_value = comptime_int(0);
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Does this table row have a column by that name? */
+int type_checker_row_member_exists(TypeChecker *checker, ComptimeValue row,
+                                   const char *member) {
+  Type *row_type = NULL;
+  size_t i;
+  if (!checker || !member || row.kind != COMPTIME_ROW) {
+    return 0;
+  }
+  if (strcmp(member, "index") == 0) {
+    return 1;
+  }
+  row_type = type_checker_type_from_index(checker, row.as.row.type_index);
+  if (!row_type) {
+    return 0;
+  }
+  for (i = 0; i < row_type->field_count; i++) {
+    if (row_type->field_names[i] &&
+        strcmp(row_type->field_names[i], member) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* `.len` and `[i]` on a sequence. Sequences answer only these two, which is
  * what makes them observable without being a container the program can hold. */
 int type_checker_eval_sequence_member(TypeChecker *checker,
@@ -466,6 +541,14 @@ Type *type_checker_comptime_result(TypeChecker *checker, ComptimeValue value,
       return NULL;
     }
     return checker->builtin_string;
+  case COMPTIME_FLOAT:
+    if (!ast_fold_member_access_to_float(expression, value.as.float_value)) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Out of memory folding a compile-time float");
+      return NULL;
+    }
+    return checker->builtin_float64;
   case COMPTIME_TYPE_REF:
     return checker->builtin_type;
   case COMPTIME_FIELD_REF:

@@ -120,6 +120,70 @@ static char *ir_intern_aggregate_literal(IRLoweringContext *context,
   return name;
 }
 
+/* The elements the literal could not fold, stored into the image once it is in
+ * place. The checker gave each one an absolute byte offset into the target, so
+ * a nested literal needs no walking here: its runtime elements are already in
+ * this list, at the offsets they occupy in the whole value. */
+static int ir_emit_aggregate_runtime_stores(IRLoweringContext *context,
+                                            IRFunction *function,
+                                            const IROperand *dest_address,
+                                            ASTNode *literal_node,
+                                            SourceLocation location) {
+  AggregateLiteral *literal =
+      literal_node && literal_node->type == AST_AGGREGATE_LITERAL
+          ? (AggregateLiteral *)literal_node->data
+          : NULL;
+  size_t i;
+
+  if (!literal || literal->runtime_store_count == 0) {
+    return 1;
+  }
+
+  for (i = 0; i < literal->runtime_store_count; i++) {
+    AggregateRuntimeStore *entry = &literal->runtime_stores[i];
+    Type *element_type = (Type *)entry->element_type;
+    IROperand value = ir_operand_none();
+    IROperand slot = ir_operand_none();
+    IRInstruction store = {0};
+
+    if (!element_type ||
+        !ir_lower_expression(context, function, entry->element, &value)) {
+      ir_operand_destroy(&value);
+      return 0;
+    }
+    if (!ir_emit_address_with_offset(context, function, dest_address,
+                                     entry->offset, location, &slot)) {
+      ir_operand_destroy(&value);
+      return 0;
+    }
+    if (ir_try_emit_aggregate_address_memcpy(context, function, &slot, &value,
+                                             element_type, location)) {
+      ir_operand_destroy(&value);
+      ir_operand_destroy(&slot);
+      continue;
+    }
+    store.op = IR_OP_STORE;
+    store.location = location;
+    store.dest = slot;
+    store.lhs = value;
+    store.rhs = ir_operand_int(ir_type_storage_size(element_type));
+    ir_access_apply_alias_class(&store, element_type);
+    if (element_type->kind == TYPE_FLOAT32 ||
+        element_type->kind == TYPE_FLOAT64) {
+      ir_assign_apply_float_bits(&store, &store.lhs,
+                                 ir_type_float_bits(element_type));
+    }
+    if (!ir_emit(context, function, &store)) {
+      ir_operand_destroy(&value);
+      ir_operand_destroy(&slot);
+      return 0;
+    }
+    ir_operand_destroy(&value);
+    ir_operand_destroy(&slot);
+  }
+  return 1;
+}
+
 int ir_emit_aggregate_literal_copy(IRLoweringContext *context,
                                    IRFunction *function,
                                    const IROperand *dest_address,
@@ -189,7 +253,11 @@ int ir_emit_aggregate_literal_copy(IRLoweringContext *context,
   int ok = ir_emit(context, function, &store);
   ir_operand_destroy(&store.dest);
   ir_operand_destroy(&value);
-  return ok;
+  if (!ok) {
+    return 0;
+  }
+  return ir_emit_aggregate_runtime_stores(context, function, dest_address,
+                                          literal_node, location);
 }
 
 /* Above this many bytes the zero-fill is one string operation rather than a

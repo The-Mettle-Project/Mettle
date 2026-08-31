@@ -1856,8 +1856,11 @@ static Type *type_checker_infer_literal(TypeChecker *checker,
      * type parked it on the checker just before this call. Consume it so a
      * nested inference cannot pick up a stale target. */
     Type *target = checker->aggregate_target_type;
+    int requires_constant = checker->aggregate_requires_constant;
     checker->aggregate_target_type = NULL;
-    return type_checker_check_aggregate_literal(checker, expression, target);
+    checker->aggregate_requires_constant = 0;
+    return type_checker_check_aggregate_literal(checker, expression, target,
+                                                requires_constant);
   }
 
   default:
@@ -1900,6 +1903,21 @@ static Type *type_checker_infer_identifier(TypeChecker *checker,
         return NULL;
       }
       return type_checker_type_value(checker, symbol->type, expression);
+    }
+    /* A `comptime for` binding over a table of plain values is that value.
+       The binding leaves scope with its expansion, so the value is baked into
+       the node here, where it is still known. */
+    if (symbol->is_comptime_binding &&
+        (symbol->comptime_value.kind == COMPTIME_INT ||
+         symbol->comptime_value.kind == COMPTIME_FLOAT ||
+         symbol->comptime_value.kind == COMPTIME_STRING)) {
+      Type *declared = symbol->type;
+      Type *folded = type_checker_comptime_result(
+          checker, symbol->comptime_value, expression);
+      if (!folded) {
+        return NULL;
+      }
+      return declared ? declared : folded;
     }
     /* A bare function name is the function, so it types as a pointer to it --
      * which is what makes `run(mix)` work and what makes `i < wm_count` (the
@@ -3057,6 +3075,35 @@ static Type *type_checker_infer_member(TypeChecker *checker,
         type_checker_set_error_at_location(
             checker, expression->location,
             "a compile-time sequence answers only '.len'; '%s' is not a query",
+            member->member);
+        return NULL;
+      }
+      return type_checker_comptime_result(checker, answered, expression);
+    }
+    if (object_type && object_type == checker->builtin_row) {
+      /* A table row answers to its own columns, so what exists depends on the
+         table rather than on a fixed set of queries. */
+      ComptimeValue row = comptime_none();
+      ComptimeValue answered = comptime_none();
+      if (!type_checker_eval_comptime(checker, member->object, &row) ||
+          row.kind != COMPTIME_ROW) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "'.%s' needs a compile-time table row on its left",
+            member->member);
+        return NULL;
+      }
+      if (!type_checker_row_member_exists(checker, row, member->member)) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "this table's rows have no column '%s'", member->member);
+        return NULL;
+      }
+      if (!type_checker_eval_row_member(checker, row, member->member,
+                                        &answered)) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "column '%s' of this row is not a compile-time constant",
             member->member);
         return NULL;
       }

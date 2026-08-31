@@ -627,11 +627,16 @@ static ASTNode *ast_clone_aggregate_literal(ASTNode *clone, const ASTNode *node)
     ast_add_child(clone, dst->repeat_count);
   }
   /* The folded image is re-derived when the clone is checked; a clone made
-   * before checking (monomorphization) has nothing to copy anyway. */
+   * before checking (monomorphization) has nothing to copy anyway. The runtime
+   * elements go with it: they name nodes in the tree that was cloned from, so
+   * carrying them over would point the clone's stores at another tree's
+   * expressions. */
   dst->image = NULL;
   dst->image_size = 0;
   dst->relocs = NULL;
   dst->reloc_count = 0;
+  dst->runtime_stores = NULL;
+  dst->runtime_store_count = 0;
   clone->data = dst;
   return clone;
 }
@@ -1432,6 +1437,7 @@ void ast_destroy_node(ASTNode *node) {
       }
       free(literal->relocs);
       free(literal->image);
+      free(literal->runtime_stores);
       free(literal);
     }
     break;
@@ -2406,6 +2412,8 @@ ASTNode *ast_create_aggregate_literal(int is_struct, ASTNode **elements,
   literal->image_size = 0;
   literal->relocs = NULL;
   literal->reloc_count = 0;
+  literal->runtime_stores = NULL;
+  literal->runtime_store_count = 0;
   node->data = literal;
 
   for (size_t i = 0; i < element_count; i++) {
@@ -2587,7 +2595,8 @@ ASTNode *ast_create_for_statement(ASTNode *initializer, ASTNode *condition,
  * the value out again. The node pointer is kept because parents hold it. */
 int ast_fold_member_access_to_int(ASTNode *node, long long value) {
   if (!node || (node->type != AST_MEMBER_ACCESS &&
-                node->type != AST_INDEX_EXPRESSION)) {
+                node->type != AST_INDEX_EXPRESSION &&
+                node->type != AST_IDENTIFIER)) {
     return 0;
   }
   NumberLiteral *literal = malloc(sizeof(NumberLiteral));
@@ -2600,6 +2609,46 @@ int ast_fold_member_access_to_int(ASTNode *node, long long value) {
   literal->int_radix = 10;
 
   for (size_t i = 0; i < node->child_count; i++) {
+    ast_destroy_node(node->children[i]);
+  }
+  free(node->children);
+  node->children = NULL;
+  node->child_count = 0;
+
+  if (node->type == AST_MEMBER_ACCESS) {
+    MemberAccess *member_access = (MemberAccess *)node->data;
+    if (member_access) {
+      ast_free_string(member_access->member);
+      free(member_access);
+    }
+  } else {
+    free(node->data);
+  }
+  node->type = AST_NUMBER_LITERAL;
+  node->data = literal;
+  return 1;
+}
+
+/* Same shape as the integer fold, for a float a compile-time query answered
+ * with. */
+int ast_fold_member_access_to_float(ASTNode *node, double value) {
+  NumberLiteral *literal = NULL;
+  size_t i;
+  if (!node || (node->type != AST_MEMBER_ACCESS &&
+                node->type != AST_INDEX_EXPRESSION &&
+                node->type != AST_IDENTIFIER)) {
+    return 0;
+  }
+  literal = malloc(sizeof(NumberLiteral));
+  if (!literal) {
+    return 0;
+  }
+  literal->float_value = value;
+  literal->is_float = 1;
+  literal->is_char = 0;
+  literal->int_radix = 10;
+
+  for (i = 0; i < node->child_count; i++) {
     ast_destroy_node(node->children[i]);
   }
   free(node->children);
@@ -2669,7 +2718,8 @@ int ast_fold_call_to_identifier(ASTNode *node, const char *name) {
  * the caller, so the literal borrows it and the node owns nothing new. */
 int ast_fold_member_access_to_string(ASTNode *node, const char *value) {
   if (!node || !value || (node->type != AST_MEMBER_ACCESS &&
-                          node->type != AST_INDEX_EXPRESSION)) {
+                          node->type != AST_INDEX_EXPRESSION &&
+                          node->type != AST_IDENTIFIER)) {
     return 0;
   }
   StringLiteral *literal = malloc(sizeof(StringLiteral));
@@ -2797,6 +2847,10 @@ ASTNode *ast_create_switch_statement(ASTNode *expression, ASTNode **cases,
 
 ASTNode *ast_create_quiesce_statement(SourceLocation location) {
   return ast_create_node(AST_QUIESCE_STATEMENT, location);
+}
+
+ASTNode *ast_create_fallthrough_statement(SourceLocation location) {
+  return ast_create_node(AST_FALLTHROUGH_STATEMENT, location);
 }
 
 ASTNode *ast_create_break_statement(SourceLocation location) {

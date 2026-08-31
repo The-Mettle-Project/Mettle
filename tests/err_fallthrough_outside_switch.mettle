@@ -1,0 +1,7 @@
+fn main() -> int32 {
+  var n: int32 = 1;
+  if (n == 1) {
+    fallthrough;
+  }
+  return n;
+}

@@ -35,6 +35,11 @@ int type_checker_ensure_multi_return_type(TypeChecker *checker,
                                           SourceLocation location);
 
 Type *type_checker_pointer_to(TypeChecker *checker, Type *base);
+
+/* The slice type `T[]`: a pointer to T and a length, in one value. It is what
+   a `T[N]` becomes at a boundary that does not know N, and what `new T[n]`
+   produces. Canonical per element type. */
+Type *type_checker_slice_of(TypeChecker *checker, Type *element);
 Type *type_checker_volatile_of(TypeChecker *checker, Type *base);
 Type *type_checker_parse_pointer_type(TypeChecker *checker,
                                              const char *name);
@@ -288,8 +293,12 @@ int type_checker_check_switch_statement(TypeChecker *checker,
 
 /* Check and fold an aggregate literal against the type it initializes
  * (type_checker_aggregate.c). On success the literal's folded byte image and
- * relocations are attached to the node and `target` is returned. */
+ * relocations are attached to the node and `target` is returned. Elements that
+ * are not compile-time constants are recorded as runtime stores for lowering
+ * to emit after the image; `requires_constant` refuses those, for a `const` or
+ * a module-scope `var`, where no code runs to perform them. */
 Type *type_checker_check_aggregate_literal(TypeChecker *checker,
-                                           ASTNode *expression, Type *target);
+                                           ASTNode *expression, Type *target,
+                                           int requires_constant);
 
 #endif // TYPE_CHECKER_INTERNAL_H

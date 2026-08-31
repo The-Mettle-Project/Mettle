@@ -1,0 +1,11 @@
+struct Op { name: string; code: int32; }
+
+const OPS: Op[1] = [ { name: "add", code: 1 } ];
+
+comptime for op in OPS.rows {
+  fn ident("code_of_", op.name)() -> int32 { return op.weight; }
+}
+
+fn main() -> int32 {
+  return code_of_add();
+}

@@ -19,6 +19,9 @@ typedef struct {
   AggregateReloc *relocs;
   size_t reloc_count;
   size_t reloc_capacity;
+  AggregateRuntimeStore *runtime_stores;
+  size_t runtime_store_count;
+  size_t runtime_store_capacity;
 } AggregateImage;
 
 static void aggregate_image_free(AggregateImage *out) {
@@ -28,11 +31,38 @@ static void aggregate_image_free(AggregateImage *out) {
   }
   free(out->relocs);
   free(out->image);
+  free(out->runtime_stores);
   out->image = NULL;
   out->relocs = NULL;
   out->image_size = 0;
   out->reloc_count = 0;
   out->reloc_capacity = 0;
+  out->runtime_stores = NULL;
+  out->runtime_store_count = 0;
+  out->runtime_store_capacity = 0;
+}
+
+/* Record an element to be stored after the image is copied in. The image keeps
+ * its zero at this offset, so a value that is only known at run time costs one
+ * store and nothing else. */
+static int aggregate_image_add_runtime_store(AggregateImage *out, size_t offset,
+                                             ASTNode *element, Type *type) {
+  if (out->runtime_store_count == out->runtime_store_capacity) {
+    size_t next =
+        out->runtime_store_capacity ? out->runtime_store_capacity * 2 : 4;
+    AggregateRuntimeStore *grown =
+        realloc(out->runtime_stores, next * sizeof(*grown));
+    if (!grown) {
+      return 0;
+    }
+    out->runtime_stores = grown;
+    out->runtime_store_capacity = next;
+  }
+  out->runtime_stores[out->runtime_store_count].offset = offset;
+  out->runtime_stores[out->runtime_store_count].element = element;
+  out->runtime_stores[out->runtime_store_count].element_type = type;
+  out->runtime_store_count++;
+  return 1;
 }
 
 /* Takes ownership of `symbol`/`string` on success; frees them on failure so a
@@ -329,10 +359,7 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
 
   if (type->kind == TYPE_STRING || type_checker_is_cstring_type(type)) {
     if (element->type != AST_STRING_LITERAL) {
-      type_checker_set_error_at_location(
-          checker, element->location,
-          "a string element of an aggregate literal must be a string literal");
-      return 0;
+      return aggregate_image_add_runtime_store(out, offset, element, type);
     }
     StringLiteral *literal = (StringLiteral *)element->data;
     const char *value = literal && literal->value ? literal->value : "";
@@ -370,12 +397,10 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
        * name has an address that is known at link time. */
       if (symbol && symbol->kind != SYMBOL_FUNCTION && symbol->scope &&
           symbol->scope->type != SCOPE_GLOBAL) {
-        type_checker_set_error_at_location(
-            checker, element->location,
-            "'&%s' cannot appear in an aggregate literal: '%s' is a local, so "
-            "its address is only known at run time",
-            referenced, referenced);
-        return 0;
+        /* A local's address is not known until the frame exists, so it is
+           taken where the literal is written rather than folded. */
+        symbol->is_used = 1;
+        return aggregate_image_add_runtime_store(out, offset, element, type);
       }
       char *copy = strdup(referenced);
       if (!copy) {
@@ -392,18 +417,12 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
     if (type_checker_is_null_pointer_constant(element)) {
       return 1; // already zero
     }
-    type_checker_set_error_at_location(
-        checker, element->location,
-        "a pointer element of an aggregate literal must be '&name' or 0");
-    return 0;
+    return aggregate_image_add_runtime_store(out, offset, element, type);
   }
 
   AggregateNumber value = {0};
   if (!aggregate_fold_number(checker, element, &value)) {
-    type_checker_set_error_at_location(
-        checker, element->location,
-        "aggregate literal elements must be compile-time constants");
-    return 0;
+    return aggregate_image_add_runtime_store(out, offset, element, type);
   }
 
   if (type->kind == TYPE_FLOAT32) {
@@ -631,7 +650,8 @@ static int aggregate_fold_element(TypeChecker *checker, ASTNode *element,
 }
 
 Type *type_checker_check_aggregate_literal(TypeChecker *checker,
-                                           ASTNode *expression, Type *target) {
+                                           ASTNode *expression, Type *target,
+                                           int requires_constant) {
   if (!checker || !expression || expression->type != AST_AGGREGATE_LITERAL) {
     return NULL;
   }
@@ -692,10 +712,27 @@ Type *type_checker_check_aggregate_literal(TypeChecker *checker,
     free(literal->relocs[i].string);
   }
   free(literal->relocs);
+  if (requires_constant && out.runtime_store_count > 0) {
+    /* Nowhere for a store to go: a `const` and a module-scope `var` are laid
+       out in the object file, before any code of the program runs. */
+    type_checker_set_error_at_location(
+        checker, out.runtime_stores[0].element->location,
+        "a constant and a module-scope variable are laid out before the "
+        "program runs, so every element has to be known while compiling, and "
+        "this one is not. Make it a constant, or build the value in a "
+        "function");
+    aggregate_image_free(&out);
+    checker->has_error = 1;
+    return NULL;
+  }
+
+  free(literal->runtime_stores);
   literal->image = out.image;
   literal->image_size = out.image_size;
   literal->relocs = out.relocs;
   literal->reloc_count = out.reloc_count;
+  literal->runtime_stores = out.runtime_stores;
+  literal->runtime_store_count = out.runtime_store_count;
 
   expression->resolved_type = target;
   return target;

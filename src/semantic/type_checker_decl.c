@@ -1055,8 +1055,15 @@ static int type_checker_check_variable_initializer(
                 var_decl->initializer->type == AST_IDENTIFIER
             ? var_type
             : NULL;
+    /* A `const` and a module-scope `var` are laid out in the object file, so
+       an element of theirs has to be known while compiling. A local is
+       initialized by code, which can compute one. */
+    checker->aggregate_requires_constant =
+        var_decl->is_const ||
+        (current_scope && current_scope->type == SCOPE_GLOBAL);
     Type *init_type = type_checker_infer_type(checker, var_decl->initializer);
     checker->aggregate_target_type = NULL;
+    checker->aggregate_requires_constant = 0;
     if (!init_type) {
       int already_reported =
           checker->error_reporter
@@ -1475,6 +1482,12 @@ static int type_checker_declare_variable(
 
   var_symbol->is_extern = var_decl->is_extern;
   var_symbol->is_immutable = var_decl->is_const;
+  /* A `const` written as an aggregate literal is a table a `comptime for` can
+     read the rows of, so the literal is kept where the name can reach it. */
+  if (var_decl->is_const && var_decl->initializer &&
+      var_decl->initializer->type == AST_AGGREGATE_LITERAL) {
+    var_symbol->constant_initializer = var_decl->initializer;
+  }
   if (has_folded_value) {
     var_symbol->has_constant_value = 1;
     var_symbol->constant_is_float = folded_is_float;

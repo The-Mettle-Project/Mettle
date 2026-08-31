@@ -87,6 +87,47 @@ done:
   return ok;
 }
 
+/* The statements of a block, or nothing when the node is not one. A case body
+ * is a block; an empty one is how several case values share a body. */
+static const ASTNode *ir_block_last_statement(const ASTNode *body,
+                                              size_t *out_count) {
+  const Program *block = NULL;
+  if (out_count) {
+    *out_count = 0;
+  }
+  if (!body || body->type != AST_PROGRAM) {
+    return body;
+  }
+  block = (const Program *)body->data;
+  if (!block || block->declaration_count == 0) {
+    return NULL;
+  }
+  if (out_count) {
+    *out_count = block->declaration_count;
+  }
+  return block->declarations[block->declaration_count - 1];
+}
+
+/* Does this case body already leave the switch by itself? The jump to the end
+ * is emitted after every other one, and emitting it after a `return` would
+ * leave a branch nothing can reach. */
+static int ir_case_body_transfers_control(const ASTNode *body) {
+  const ASTNode *last = body;
+  size_t count = 0;
+  /* A braced body is one statement holding the real ones, so the last
+     statement of the case is the last statement of the innermost block. */
+  while (last && last->type == AST_PROGRAM) {
+    last = ir_block_last_statement(last, &count);
+  }
+  if (!last) {
+    return 0;
+  }
+  return last->type == AST_RETURN_STATEMENT ||
+         last->type == AST_BREAK_STATEMENT ||
+         last->type == AST_CONTINUE_STATEMENT ||
+         last->type == AST_FALLTHROUGH_STATEMENT;
+}
+
 int ir_lower_switch_statement(IRLoweringContext *context,
                                      IRFunction *function, ASTNode *statement,
                                      IRDeferScope *defers) {
@@ -255,6 +296,11 @@ int ir_lower_switch_statement(IRLoweringContext *context,
       return 0;
     }
 
+    /* Where a `fallthrough` written in this case goes. The last case has
+       nowhere to go, which the checker has already reported. */
+    ir_set_fallthrough_label(
+        context, i + 1 < switch_data->case_count ? case_labels[i + 1] : NULL);
+
     // The case body is a scope of its own. Passing the live defer chain lets
     // a `defer` written inside a case run when that case ends, whether it
     // falls through to the next label or breaks out.
@@ -270,8 +316,28 @@ int ir_lower_switch_statement(IRLoweringContext *context,
       return 0;
     }
 
-    // Fallthrough to next case label unless body jumped/broke.
+    /* A case ends where the next one begins. An empty body is the exception,
+       and the only way several case values share one: with no statements of
+       its own there is nothing for the case to do but continue into the next.
+       `fallthrough;` is what asks for that from a case that does have a body. */
+    {
+      size_t statement_count = 0;
+      ir_block_last_statement(clause->body, &statement_count);
+      if (statement_count > 0 && !ir_case_body_transfers_control(clause->body) &&
+          !ir_emit_jump_instruction(context, function, end_label,
+                                    case_node->location)) {
+        ir_pop_control_frame(context);
+        for (size_t j = 0; j < switch_data->case_count; j++) {
+          free(case_labels[j]);
+        }
+        free(case_labels);
+        ir_operand_destroy(&switch_value);
+        free(end_label);
+        return 0;
+      }
+    }
   }
+  ir_set_fallthrough_label(context, NULL);
 
   ir_pop_control_frame(context);
 

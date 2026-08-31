@@ -24,6 +24,9 @@
 typedef struct {
   const char *binding_name;
   ComptimeValue binding_value;
+  /* What the binding reads as: the row's own type for a table of values, and
+     NULL when the value's kind is enough to say (a field, a row). */
+  Type *binding_type;
   const char *note;
   SourceSpan origin;
 } ComptimeFrame;
@@ -38,6 +41,7 @@ typedef struct {
   SourceSpan origin;
   const char *binding_name;
   ComptimeValue binding_value;
+  Type *binding_type;
   ComptimeFrame *inherited;
   size_t inherited_count;
 } ComptimeExpansion;
@@ -51,7 +55,7 @@ struct ComptimeBindingSlot {
 };
 
 static int binding_push(TypeChecker *checker, const char *name,
-                        ComptimeValue value, SourceSpan origin,
+                        ComptimeValue value, Type *declared, SourceSpan origin,
                         const char *note);
 static void binding_pop(TypeChecker *checker);
 static int resolve_composed_names(TypeChecker *checker, ASTNode *node);
@@ -262,26 +266,151 @@ int type_checker_check_expansion_budget(TypeChecker *checker, size_t budget) {
   return 0;
 }
 
-/* Resolve the `comptime for` sequence to the type whose fields it names. The
- * only sequence that exists today is `<type>.fields`; anything else is refused
- * by name, so the message names what is available rather than what failed. */
-static Type *resolve_field_sequence(TypeChecker *checker, ASTNode *sequence) {
+/* What a `comptime for` iterates. Two sequences exist: the fields of a type,
+ * which reflect on what the program declared, and the rows of a constant
+ * table, which are what the program wrote down. Each hands one binding value
+ * to each iteration, and says how to name that iteration in a diagnostic. */
+typedef struct {
+  int is_table;
+  Type *owner;       /* the type whose fields are iterated, or the row type */
+  uint32_t owner_index;
+  const char *label; /* what the cost ledger and messages call the sequence */
+  size_t count;
+  AggregateLiteral *table; /* table only: the literal holding the rows */
+} ComptimeSource;
+
+/* The module-scope `const NAME = [ ... ]` declaration, found in the program
+ * rather than in the symbol table: module-scope expansion runs before any
+ * `const` has been declared, and a table has to be readable there. */
+static ASTNode *module_const_initializer(TypeChecker *checker,
+                                         const char *name, Type **out_type) {
+  Program *module = NULL;
+  size_t i;
+  if (!checker || !checker->module_program || !name) {
+    return NULL;
+  }
+  module = (Program *)checker->module_program->data;
+  if (!module) {
+    return NULL;
+  }
+  for (i = 0; i < module->declaration_count; i++) {
+    ASTNode *declaration = module->declarations[i];
+    VarDeclaration *var = NULL;
+    if (!declaration || declaration->type != AST_VAR_DECLARATION) {
+      continue;
+    }
+    var = (VarDeclaration *)declaration->data;
+    if (!var || !var->is_const || !var->name || strcmp(var->name, name) != 0) {
+      continue;
+    }
+    if (!var->initializer ||
+        var->initializer->type != AST_AGGREGATE_LITERAL || !var->type_name) {
+      return NULL;
+    }
+    *out_type = type_checker_get_type_by_name(checker, var->type_name);
+    return *out_type ? var->initializer : NULL;
+  }
+  return NULL;
+}
+
+/* `NAME.rows`, where NAME is a constant table: an array of constants. Returns
+ * 0 when the expression is not that shape, having reported nothing, so the
+ * caller can try the other sequence; -1 when it is that shape and wrong. */
+static int resolve_table_sequence(TypeChecker *checker, ASTNode *sequence,
+                                  ComptimeSource *out) {
+  MemberAccess *member =
+      sequence && sequence->type == AST_MEMBER_ACCESS
+          ? (MemberAccess *)sequence->data
+          : NULL;
+  Identifier *named = NULL;
+  Symbol *symbol = NULL;
+  AggregateLiteral *literal = NULL;
+  ASTNode *initializer = NULL;
+  Type *table_type = NULL;
+
+  if (!member || !member->member || strcmp(member->member, "rows") != 0) {
+    return 0;
+  }
+  if (!member->object || member->object->type != AST_IDENTIFIER) {
+    type_checker_set_error_at_location(
+        checker,
+        member->object ? member->object->location : sequence->location,
+        "'.rows' needs a constant table on its left, named where it was "
+        "declared");
+    return -1;
+  }
+  named = (Identifier *)member->object->data;
+  symbol = named ? type_checker_resolve_identifier(checker, named) : NULL;
+  if (symbol && symbol->constant_initializer &&
+      symbol->constant_initializer->type == AST_AGGREGATE_LITERAL &&
+      symbol->type) {
+    table_type = symbol->type;
+    initializer = symbol->constant_initializer;
+  } else {
+    initializer = module_const_initializer(checker, named ? named->name : NULL,
+                                           &table_type);
+  }
+  if (!initializer || !table_type) {
+    type_checker_set_error_at_location(
+        checker, member->object->location,
+        "'%s' is not a constant table; a table is a 'const' holding an array "
+        "literal",
+        named && named->name ? named->name : "<unknown>");
+    return -1;
+  }
+  if (table_type->kind != TYPE_ARRAY || !table_type->base_type) {
+    type_checker_set_error_at_location(
+        checker, member->object->location,
+        "'%s' is a constant, and a table has to be an array of them",
+        named->name ? named->name : "<unknown>");
+    return -1;
+  }
+  literal = (AggregateLiteral *)initializer->data;
+  if (!literal || literal->is_struct) {
+    type_checker_set_error_at_location(
+        checker, member->object->location,
+        "'%s' is not written as an array literal",
+        named->name ? named->name : "<unknown>");
+    return -1;
+  }
+
+  out->is_table = 1;
+  out->owner = table_type->base_type;
+  out->owner_index = type_checker_intern_type(checker, out->owner);
+  out->label = named->name;
+  out->table = literal;
+  /* The rows are the ones written. A short literal leaves the rest of the
+     array zeroed, and a zero row is not something to generate from. */
+  out->count = literal->element_count;
+  return 1;
+}
+
+/* Resolve the `comptime for` sequence: `<type>.fields`, or `TABLE.rows`. */
+static int resolve_sequence(TypeChecker *checker, ASTNode *sequence,
+                            ComptimeSource *out) {
+  int table = 0;
+  memset(out, 0, sizeof(*out));
   if (!sequence || sequence->type != AST_MEMBER_ACCESS) {
     type_checker_set_error_at_location(
         checker, sequence ? sequence->location : (SourceLocation){0, 0, NULL},
-        "'comptime for' iterates a compile-time sequence; the only one is "
-        "'<type>.fields'");
-    return NULL;
+        "'comptime for' iterates a compile-time sequence: '<type>.fields', or "
+        "'<table>.rows' for a constant table");
+    return 0;
+  }
+
+  table = resolve_table_sequence(checker, sequence, out);
+  if (table != 0) {
+    return table > 0;
   }
 
   MemberAccess *member = (MemberAccess *)sequence->data;
   if (!member || !member->member || strcmp(member->member, "fields") != 0) {
     type_checker_set_error_at_location(
         checker, sequence->location,
-        "'comptime for' cannot iterate '.%s'; the only compile-time "
-        "sequence is '.fields'",
+        "'comptime for' cannot iterate '.%s'; the compile-time sequences are "
+        "'.fields' and '.rows'",
         member && member->member ? member->member : "<unknown>");
-    return NULL;
+    return 0;
   }
 
   ComptimeValue owner = comptime_none();
@@ -291,7 +420,7 @@ static Type *resolve_field_sequence(TypeChecker *checker, ASTNode *sequence) {
         checker, member->object->location,
         "'.fields' needs a compile-time type on its left, for example "
         "'typeof(T).fields'");
-    return NULL;
+    return 0;
   }
 
   Type *referred =
@@ -300,25 +429,72 @@ static Type *resolve_field_sequence(TypeChecker *checker, ASTNode *sequence) {
     type_checker_set_error_at_location(
         checker, member->object->location,
         "'.fields' refers to a type that is not in the type table");
-    return NULL;
+    return 0;
   }
   if (referred->kind != TYPE_STRUCT && referred->kind != TYPE_STRING) {
     type_checker_set_error_at_location(
         checker, member->object->location,
         "type '%s' has no fields to iterate",
         referred->name ? referred->name : "<anonymous>");
-    return NULL;
+    return 0;
   }
-  return referred;
+  out->is_table = 0;
+  out->owner = referred;
+  out->owner_index = type_checker_intern_type(checker, referred);
+  out->label = referred->name;
+  out->count = type_field_count(referred);
+  return 1;
 }
 
 /* What a diagnostic raised inside this iteration says about where it came from.
  * Written once: `mettle expand` prints it as a comment and the reporter prints
  * it as a note, and the two have to agree. */
-static void iteration_note(char *out, size_t capacity, const TypeField *field,
-                           size_t field_index) {
+static void iteration_note(char *out, size_t capacity,
+                           const ComptimeSource *source, const TypeField *field,
+                           size_t index) {
+  if (source && source->is_table) {
+    snprintf(out, capacity, "expanded from comptime-for iteration %zu (row %zu of `%s`)",
+             index + 1, index + 1, source->label ? source->label : "<table>");
+    return;
+  }
   snprintf(out, capacity, "expanded from comptime-for iteration %zu (field `%s`)",
-           field_index + 1, field->name ? field->name : "<anonymous>");
+           index + 1, field && field->name ? field->name : "<anonymous>");
+}
+
+/* The value the binding takes for one iteration. A field iteration hands out a
+ * reference to the field; a table iteration hands out the row itself, whose
+ * columns are read straight from the literal the program wrote. */
+/* The type a table of plain values binds its element as: the element type the
+ * table declared, so a table of `int32` binds an `int32`. A table of rows and
+ * a type's fields both say what they are through the value's kind. */
+static Type *binding_declared_type(const ComptimeSource *source) {
+  if (!source || !source->is_table || !source->owner) {
+    return NULL;
+  }
+  return source->owner->kind == TYPE_STRUCT ? NULL : source->owner;
+}
+
+static ComptimeValue iteration_value(TypeChecker *checker,
+                                     const ComptimeSource *source,
+                                     size_t index) {
+  if (source->is_table) {
+    ASTNode *row = source->table && index < source->table->element_count
+                       ? source->table->elements[index]
+                       : NULL;
+    if (row && row->type == AST_AGGREGATE_LITERAL) {
+      return comptime_row(row->data, source->owner_index, (uint32_t)index);
+    }
+    /* A table of plain values has no columns to name, so the binding is the
+       value itself: `comptime for name in NAMES.rows` binds the string. */
+    {
+      ComptimeValue scalar = comptime_none();
+      if (row && type_checker_eval_comptime(checker, row, &scalar)) {
+        return scalar;
+      }
+    }
+    return comptime_row(NULL, source->owner_index, (uint32_t)index);
+  }
+  return comptime_field_ref(source->owner_index, (uint32_t)index);
 }
 
 /* Record a cloned expansion against the binding it runs under and the note that
@@ -327,10 +503,11 @@ static void iteration_note(char *out, size_t capacity, const TypeField *field,
  * exactly what the clone inherits. */
 static int register_expansion(TypeChecker *checker,
                               ComptimeForStatement *directive, ASTNode *clone,
-                              const TypeField *field, uint32_t owner_index,
-                              size_t field_index, size_t inherit_count) {
+                              const ComptimeSource *source,
+                              const TypeField *field, size_t field_index,
+                              size_t inherit_count) {
   char note[256];
-  iteration_note(note, sizeof(note), field, field_index);
+  iteration_note(note, sizeof(note), source, field, field_index);
 
   ComptimeExpansion entry;
   entry.block = clone;
@@ -338,7 +515,8 @@ static int register_expansion(TypeChecker *checker,
   entry.origin = source_span_from_location(directive->keyword_location,
                                            strlen("comptime"));
   entry.binding_name = string_intern(directive->binding_name);
-  entry.binding_value = comptime_field_ref(owner_index, (uint32_t)field_index);
+  entry.binding_value = iteration_value(checker, source, field_index);
+  entry.binding_type = binding_declared_type(source);
   entry.inherited = NULL;
   entry.inherited_count = 0;
 
@@ -372,10 +550,13 @@ static int read_field(TypeChecker *checker, ComptimeForStatement *directive,
 /* Build one iteration: a clone of the body registered with the binding it runs
  * under and the note that attributes it back to the `comptime for`. */
 static ASTNode *expand_iteration(TypeChecker *checker,
-                                 ComptimeForStatement *directive, Type *owner,
-                                 uint32_t owner_index, size_t field_index) {
+                                 ComptimeForStatement *directive,
+                                 const ComptimeSource *source,
+                                 size_t field_index) {
   TypeField field;
-  if (!read_field(checker, directive, owner, field_index, &field)) {
+  memset(&field, 0, sizeof(field));
+  if (!source->is_table &&
+      !read_field(checker, directive, source->owner, field_index, &field)) {
     return NULL;
   }
 
@@ -395,10 +576,10 @@ static ASTNode *expand_iteration(TypeChecker *checker,
                                                 strlen("comptime"));
   size_t inherit_count = checker->comptime_binding_count;
   char note[256];
-  iteration_note(note, sizeof(note), &field, field_index);
+  iteration_note(note, sizeof(note), source, &field, field_index);
   if (!binding_push(checker, string_intern(directive->binding_name),
-                    comptime_field_ref(owner_index, (uint32_t)field_index),
-                    origin, note)) {
+                    iteration_value(checker, source, field_index),
+                    binding_declared_type(source), origin, note)) {
     type_checker_set_error_at_location(
         checker, directive->keyword_location,
         "Out of memory binding '%s' for iteration %zu", directive->binding_name,
@@ -410,7 +591,7 @@ static ASTNode *expand_iteration(TypeChecker *checker,
   binding_pop(checker);
 
   if (!resolved ||
-      !register_expansion(checker, directive, clone, &field, owner_index,
+      !register_expansion(checker, directive, clone, source, &field,
                           field_index, inherit_count)) {
     ast_destroy_node(clone);
     return NULL;
@@ -449,11 +630,13 @@ static const char *declaration_name(const ASTNode *node) {
  * Appends to `out`; the caller owns everything appended either way. */
 static int expand_declaration_iteration(TypeChecker *checker,
                                         ComptimeForStatement *directive,
-                                        Type *owner, uint32_t owner_index,
+                                        const ComptimeSource *source,
                                         size_t field_index, ASTNode **out,
                                         size_t *out_count) {
   TypeField field;
-  if (!read_field(checker, directive, owner, field_index, &field)) {
+  memset(&field, 0, sizeof(field));
+  if (!source->is_table &&
+      !read_field(checker, directive, source->owner, field_index, &field)) {
     return 0;
   }
 
@@ -464,10 +647,10 @@ static int expand_declaration_iteration(TypeChecker *checker,
                                                 strlen("comptime"));
   size_t inherit_count = checker->comptime_binding_count;
   char note[256];
-  iteration_note(note, sizeof(note), &field, field_index);
+  iteration_note(note, sizeof(note), source, &field, field_index);
   if (!binding_push(checker, string_intern(directive->binding_name),
-                    comptime_field_ref(owner_index, (uint32_t)field_index),
-                    origin, note)) {
+                    iteration_value(checker, source, field_index),
+                    binding_declared_type(source), origin, note)) {
     type_checker_set_error_at_location(
         checker, directive->keyword_location,
         "Out of memory binding '%s' for iteration %zu",
@@ -487,7 +670,7 @@ static int expand_declaration_iteration(TypeChecker *checker,
       break;
     }
     if (!resolve_composed_names(checker, clone) ||
-        !register_expansion(checker, directive, clone, &field, owner_index,
+        !register_expansion(checker, directive, clone, source, &field,
                             field_index, inherit_count)) {
       ast_destroy_node(clone);
       ok = 0;
@@ -530,13 +713,44 @@ static int check_generated_names(TypeChecker *checker,
 /* The binding symbol, built the same way the statement-scope path builds it so
  * a generated declaration sees exactly what a generated block would. */
 static Symbol *binding_symbol(TypeChecker *checker, const char *name,
-                              ComptimeValue value, SourceSpan origin) {
-  Symbol *symbol =
-      symbol_create((char *)name, SYMBOL_CONSTANT, checker->builtin_field);
+                              ComptimeValue value, Type *declared,
+                              SourceSpan origin) {
+  Type *binding_type = declared ? declared : checker->builtin_field;
+  Symbol *symbol = NULL;
+  /* A row answers to its columns, and a plain value is that value: a table of
+     strings binds a string, which reads as one wherever it is written. */
+  if (value.kind == COMPTIME_ROW) {
+    binding_type = checker->builtin_row;
+  } else if (!declared) {
+    switch (value.kind) {
+    case COMPTIME_STRING:
+      binding_type = checker->builtin_string;
+      break;
+    case COMPTIME_INT:
+      binding_type = checker->builtin_int64;
+      break;
+    case COMPTIME_FLOAT:
+      binding_type = checker->builtin_float64;
+      break;
+    default:
+      break;
+    }
+  }
+  symbol = symbol_create((char *)name, SYMBOL_CONSTANT, binding_type);
   if (!symbol) {
     return NULL;
   }
   symbol->comptime_value = value;
+  symbol->is_comptime_binding = 1;
+  if (value.kind == COMPTIME_INT) {
+    symbol->has_constant_value = 1;
+    symbol->constant_integer_value = value.as.int_value;
+    symbol->data.constant.value = value.as.int_value;
+  } else if (value.kind == COMPTIME_FLOAT) {
+    symbol->has_constant_value = 1;
+    symbol->constant_is_float = 1;
+    symbol->constant_float_value = value.as.float_value;
+  }
   symbol->is_initialized = 1;
   symbol->is_immutable = 1;
   symbol->decl_line = origin.line;
@@ -546,7 +760,7 @@ static Symbol *binding_symbol(TypeChecker *checker, const char *name,
 }
 
 static int binding_push(TypeChecker *checker, const char *name,
-                        ComptimeValue value, SourceSpan origin,
+                        ComptimeValue value, Type *declared, SourceSpan origin,
                         const char *note) {
   if (checker->comptime_binding_count == checker->comptime_binding_capacity) {
     size_t next = checker->comptime_binding_capacity
@@ -561,7 +775,7 @@ static int binding_push(TypeChecker *checker, const char *name,
     checker->comptime_bindings = grown;
     checker->comptime_binding_capacity = next;
   }
-  Symbol *symbol = binding_symbol(checker, name, value, origin);
+  Symbol *symbol = binding_symbol(checker, name, value, declared, origin);
   if (!symbol) {
     return 0;
   }
@@ -617,6 +831,7 @@ static int capture_inherited(TypeChecker *checker, ComptimeExpansion *entry,
     entry->inherited[i].binding_name = slot->symbol ? slot->symbol->name : NULL;
     entry->inherited[i].binding_value =
         slot->symbol ? slot->symbol->comptime_value : comptime_none();
+    entry->inherited[i].binding_type = slot->symbol ? slot->symbol->type : NULL;
     entry->inherited[i].note = slot->note;
     entry->inherited[i].origin = slot->origin;
   }
@@ -624,9 +839,11 @@ static int capture_inherited(TypeChecker *checker, ComptimeExpansion *entry,
 }
 
 static void push_frame(TypeChecker *checker, const char *binding_name,
-                       ComptimeValue binding_value, SourceSpan origin,
-                       const char *note, ComptimeDeclScope *scope) {
-  if (binding_push(checker, binding_name, binding_value, origin, note)) {
+                       ComptimeValue binding_value, Type *binding_type,
+                       SourceSpan origin, const char *note,
+                       ComptimeDeclScope *scope) {
+  if (binding_push(checker, binding_name, binding_value, binding_type, origin,
+                   note)) {
     scope->bindings_pushed++;
   }
   if (note && checker->error_reporter &&
@@ -652,11 +869,12 @@ void type_checker_enter_expansion_decl(TypeChecker *checker,
    * an inner binding shadows an outer one of the same name. */
   for (size_t i = 0; i < entry->inherited_count; i++) {
     push_frame(checker, entry->inherited[i].binding_name,
-               entry->inherited[i].binding_value, entry->inherited[i].origin,
+               entry->inherited[i].binding_value,
+               entry->inherited[i].binding_type, entry->inherited[i].origin,
                entry->inherited[i].note, scope);
   }
-  push_frame(checker, entry->binding_name, entry->binding_value, entry->origin,
-             entry->note, scope);
+  push_frame(checker, entry->binding_name, entry->binding_value,
+             entry->binding_type, entry->origin, entry->note, scope);
 }
 
 void type_checker_leave_expansion_decl(TypeChecker *checker,
@@ -899,8 +1117,9 @@ int type_checker_declare_expansion_binding(TypeChecker *checker,
     return 1;
   }
 
-  Symbol *symbol = binding_symbol(checker, entry->binding_name,
-                                  entry->binding_value, entry->origin);
+  Symbol *symbol =
+      binding_symbol(checker, entry->binding_name, entry->binding_value,
+                     entry->binding_type, entry->origin);
   if (!symbol) {
     type_checker_set_error_at_location(
         checker, block->location,
@@ -976,10 +1195,9 @@ static int expand_one_round(TypeChecker *checker, ASTNode *block,
       type_checker_enter_expansion_decl(checker, child, &outer);
 
       ComptimeForStatement *directive = (ComptimeForStatement *)child->data;
-      Type *owner =
-          directive ? resolve_field_sequence(checker, directive->sequence)
-                    : NULL;
-      if (!owner) {
+      ComptimeSource source;
+      if (!directive ||
+          !resolve_sequence(checker, directive->sequence, &source)) {
         ok = 0;
         type_checker_leave_expansion_decl(checker, &outer);
         break;
@@ -992,9 +1210,9 @@ static int expand_one_round(TypeChecker *checker, ASTNode *block,
         break;
       }
 
-      uint32_t owner_index = type_checker_intern_type(checker, owner);
-      /* Zero fields expands to nothing, which is an answer, not an error. */
-      size_t iterations = type_field_count(owner);
+      /* Zero fields, or zero rows, expands to nothing. That is an answer,
+         not an error. */
+      size_t iterations = source.count;
       Program *body = (Program *)directive->body->data;
       size_t per_iteration =
           module_scope ? (body ? body->declaration_count : 0) : 1;
@@ -1013,11 +1231,10 @@ static int expand_one_round(TypeChecker *checker, ASTNode *block,
         size_t produced = 0;
         for (size_t f = 0; f < iterations && ok; f++) {
           if (module_scope) {
-            ok = expand_declaration_iteration(checker, directive, owner,
-                                              owner_index, f, owned, &produced);
+            ok = expand_declaration_iteration(checker, directive, &source, f,
+                                              owned, &produced);
           } else {
-            owned[produced] =
-                expand_iteration(checker, directive, owner, owner_index, f);
+            owned[produced] = expand_iteration(checker, directive, &source, f);
             ok = owned[produced] != NULL;
             produced += ok ? 1 : 0;
           }
@@ -1034,10 +1251,10 @@ static int expand_one_round(TypeChecker *checker, ASTNode *block,
         incoming = produced;
         batch = owned;
         expansion_record_cost(checker->expansions, directive->keyword_location,
-                              owner->name, iterations, generated);
+                              source.label, iterations, generated);
       } else {
         expansion_record_cost(checker->expansions, directive->keyword_location,
-                              owner->name, iterations, 0);
+                              source.label, iterations, 0);
       }
     }
     type_checker_leave_expansion_decl(checker, &outer);

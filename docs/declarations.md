@@ -108,6 +108,19 @@ var b: Point;
 b.x = 3;
 ```
 
+An element may be anything the field could be assigned, so a value computed
+where the literal is written needs no separate statement:
+
+```mettle
+fn make(width: int32, height: int32) -> Point {
+  var p: Point = { x: width * 2, y: height + offset() };
+  return p;
+}
+```
+
+A `const` and a module-scope `var` are the exception: both are laid out before
+any code runs, so every element of theirs has to be known while compiling.
+
 ## Methods
 
 A method is a plain function whose name is the type, an underscore, and the
@@ -381,6 +394,19 @@ comptime for f in typeof(Pair).fields {
 ```
 
 That declares `OFFSET_a`, `OFFSET_b`, `end_of_a`, and `end_of_b`.
+
+A `const` array is a table, and `.rows` generates from it. The columns are read
+by name, so the declaration and what it is built from sit next to each other:
+
+```mettle
+struct Op { name: string; code: int32; }
+
+const OPS: Op[2] = [ { name: "add", code: 1 }, { name: "mul", code: 2 } ];
+
+comptime for op in OPS.rows {
+  fn ident("code_of_", op.name)() -> int32 { return op.code; }
+}
+```
 
 A body whose declaration name does not come from the binding generates the
 same name every iteration, and the compiler rejects it rather than dropping

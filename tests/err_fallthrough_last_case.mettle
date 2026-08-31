@@ -1,0 +1,9 @@
+fn main() -> int32 {
+  var n: int32 = 1;
+  var out: int32 = 0;
+  switch (n) {
+    case 1: { out = 1; }
+    default: { out = 2; fallthrough; }
+  }
+  return out;
+}

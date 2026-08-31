@@ -879,6 +879,10 @@ int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
       return type_checker_eval_sequence_member(checker, owner, member->member,
                                                out_value);
     }
+    if (owner.kind == COMPTIME_ROW) {
+      return type_checker_eval_row_member(checker, owner, member->member,
+                                          out_value);
+    }
     if (owner.kind != COMPTIME_TYPE_REF) {
       return 0;
     }
@@ -1518,6 +1522,10 @@ int type_checker_statement_guarantees_termination(ASTNode *statement) {
    * through to the next statement, so everything after it is reachable. */
   case AST_QUIESCE_STATEMENT:
     return 0;
+  /* `fallthrough;` leaves this case for the next one, so what follows it in
+   * the same case is unreachable, exactly as after a `break`. */
+  case AST_FALLTHROUGH_STATEMENT:
+    return 1;
   case AST_IF_STATEMENT: {
     IfStatement *if_stmt = (IfStatement *)statement->data;
     if (!if_stmt || !if_stmt->then_branch || !if_stmt->else_branch) {

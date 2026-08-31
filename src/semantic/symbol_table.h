@@ -128,6 +128,8 @@ typedef enum {
   SYMBOL_TAGGED_ENUM_CONSTRUCTOR
 } SymbolKind;
 
+struct ASTNode;
+
 typedef struct Symbol {
   char *name;
   SymbolKind kind;
@@ -165,6 +167,13 @@ typedef struct Symbol {
   /* Folded compile-time value, including TypeRef / FieldRef. Numeric consts
    * also keep the fields above so existing integer/float folders stay simple. */
   ComptimeValue comptime_value;
+  /* The aggregate literal a `const` table was written as, borrowed from the
+   * program. `comptime for` reads the rows out of it; nothing else does. */
+  struct ASTNode *constant_initializer;
+  /* This symbol is a `comptime for` binding, which exists only while the body
+   * it binds is being checked. A scalar one is baked into the nodes that read
+   * it, because there is nothing left to read afterwards. */
+  int is_comptime_binding;
   union {
     struct {
       int register_id;

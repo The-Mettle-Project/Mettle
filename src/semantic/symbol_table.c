@@ -659,6 +659,8 @@ Symbol *symbol_create(const char *name, SymbolKind kind, Type *type) {
   symbol->decl_column = 0;
   symbol->decl_file = NULL;
   symbol->is_used = 0;
+  symbol->constant_initializer = NULL;
+  symbol->is_comptime_binding = 0;
 
   // Initialize union data based on symbol kind
   switch (kind) {

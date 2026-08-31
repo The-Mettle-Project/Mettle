@@ -1554,6 +1554,24 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     return ir_lower_match_statement(context, function, statement, defers);
   }
 
+  case AST_FALLTHROUGH_STATEMENT: {
+    const IRControlFrame *frame = ir_current_fallthrough_frame(context);
+    if (!frame || !frame->fallthrough_label) {
+      ir_set_error(context, "'fallthrough' outside a switch case with a case "
+                            "after it");
+      return 0;
+    }
+    /* The case ends here, so its scopes' deferred statements run before the
+       next case begins, the same as on the path that leaves the switch. */
+    if (!ir_emit_defers_until_scope(context, function, defers,
+                                    frame->defers)) {
+      return 0;
+    }
+    return ir_emit_jump_instruction(context, function,
+                                    frame->fallthrough_label,
+                                    statement->location);
+  }
+
   case AST_BREAK_STATEMENT: {
     LoopControlStatement *ctrl = (LoopControlStatement *)statement->data;
     const char *user_label = ctrl ? ctrl->target_label : NULL;
@@ -1667,7 +1685,9 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       return ok;
     }
 
-    ir_set_error(context, "Unsupported statement type in pure IR lowering");
+    ir_set_error(context,
+                 "Unsupported statement type %d in pure IR lowering",
+                 (int)statement->type);
     return 0;
   }
   }

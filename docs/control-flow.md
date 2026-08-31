@@ -93,22 +93,45 @@ outer: for i in 0..3 {
 
 ## switch
 
-`switch` branches on an integer. Each `case` takes a constant and a braced
-body, and `default` catches the rest.
+`switch` branches on an integer. Each `case` takes a constant and a body, and
+`default` catches the rest.
 
-Control falls through from one case into the next. End a case with `break` to
-leave the switch:
+A case ends where the next one begins:
 
 ```mettle
 switch (code) {
-  case 1: { println("one"); break; }
-  case 2: { println("two"); break; }
+  case 1: { println("one"); }
+  case 2: { println("two"); }
   default: { println("other"); }
 }
 ```
 
-With `code` set to 1 that prints `one`. Dropping the `break` statements makes
-it print `one`, `two`, and `other`.
+With `code` set to 1 that prints `one` and nothing else.
+
+A case with no body of its own continues into the next one, which is how
+several values share a body:
+
+```mettle
+switch (code) {
+  case 1:
+  case 2: { println("one or two"); }
+  default: { println("other"); }
+}
+```
+
+`fallthrough;` asks a case that does have a body to continue into the next one
+as well. It may sit anywhere in the case, including inside an `if`, and the
+case it names is the one written next, whatever the value that case tests:
+
+```mettle
+switch (code) {
+  case 1: { println("one"); fallthrough; }
+  case 2: { println("also two"); }
+  default: { println("other"); }
+}
+```
+
+The last case has nothing after it, so `fallthrough` there is an error.
 
 A plain enum is 8 bytes and does not decay to an integer, so cast it first:
 
@@ -118,8 +141,8 @@ enum Color { Red = 1, Green = 2, Blue = 3 }
 
 ```mettle
 switch ((int32)c) {
-  case 1: { println("red"); break; }
-  case 2: { println("green"); break; }
+  case 1: { println("red"); }
+  case 2: { println("green"); }
   default: { println("other"); }
 }
 ```
@@ -221,9 +244,27 @@ At file scope it generates declarations, and each generated name must come
 from the binding. [Declarations](declarations.md) covers `ident(...)` and the
 rules that go with it.
 
-A compile-time binding cannot become a run-time value. Assigning `f` itself to
-an `int64` is an error, because generated code gets the trust hand-written
-code gets.
+There are two sequences. `typeof(T).fields` reflects on a type the program
+declared. `TABLE.rows` reads a `const` holding an array literal, which is how a
+program generates from data it wrote down:
+
+```mettle
+struct Op { name: string; code: int32; }
+
+const OPS: Op[2] = [ { name: "add", code: 1 }, { name: "mul", code: 2 } ];
+
+comptime for op in OPS.rows {
+  println("{op.name} is {op.code}");
+}
+```
+
+A row of a struct answers to its own columns, and to `.index`. A row of a plain
+value is that value, so a `const int32[4]` binds an `int32` each time round.
+
+A compile-time binding of a type's field cannot become a run-time value.
+Assigning `f` itself to an `int64` is an error, because generated code gets the
+trust hand-written code gets. A table's columns are ordinary constants, so they
+go wherever a constant of their type goes.
 
 ## asm
 

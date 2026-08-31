@@ -445,6 +445,7 @@ int ir_push_labeled_control_frame(IRLoweringContext *context,
   frame->continue_label =
       continue_label ? mettle_strdup(continue_label) : NULL;
   frame->user_label = user_label ? mettle_strdup(user_label) : NULL;
+  frame->fallthrough_label = NULL;
   frame->defers = defers;
   if ((break_label && !frame->break_label) ||
       (continue_label && !frame->continue_label) ||
@@ -490,6 +491,27 @@ const char *ir_current_break_label(IRLoweringContext *context) {
     return NULL;
   }
   return context->control_stack[context->control_count - 1].break_label;
+}
+
+const IRControlFrame *ir_current_fallthrough_frame(IRLoweringContext *context) {
+  size_t i;
+  if (!context) {
+    return NULL;
+  }
+  for (i = context->control_count; i > 0; i--) {
+    const IRControlFrame *frame = &context->control_stack[i - 1];
+    if (frame->fallthrough_label) {
+      return frame;
+    }
+  }
+  return NULL;
+}
+
+void ir_set_fallthrough_label(IRLoweringContext *context, const char *label) {
+  if (!context || context->control_count == 0) {
+    return;
+  }
+  context->control_stack[context->control_count - 1].fallthrough_label = label;
 }
 
 const char *ir_current_continue_label(IRLoweringContext *context) {
