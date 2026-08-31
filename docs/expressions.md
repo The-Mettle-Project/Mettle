@@ -104,6 +104,33 @@ compiler says which conversion it wanted:
 error[M0119]: Narrowing conversion from 'int64' to 'int8' needs a cast
 ```
 
+One spelling covers three different jobs, so it is worth knowing which one you
+are asking for. Between numeric types it converts the value, losing precision
+where the destination is narrower. Between pointer types, and between a pointer
+and an integer, it reinterprets the address and changes nothing. And from a
+float to an integer it rounds -- **toward zero**, always.
+
+That last one is the rule worth keeping in mind, because toward zero is the
+wrong direction on the negative side of an axis: `(int32)(-2.7)` is `-2`, so a
+grid lookup written with a cast reads one cell off there. `std/math` names the
+mode instead of leaving it implied:
+
+```mettle
+floor_i32(-2.7)   // -3, toward negative infinity
+ceil_i32(-2.7)    // -2, toward positive infinity
+trunc_i32(-2.7)   // -2, toward zero: what the cast does
+round_i32(-2.7)   // -3, nearest, halfway away from zero
+```
+
+Each has an `_i64` sibling, and each is `@inline`, so it costs a call site
+nothing over writing the same arithmetic by hand.
+
+A pointer cast to an integer and straight back to a pointer is reported as
+M0120. Both halves are legitimate alone -- an operating-system handle becomes a
+pointer, a pointer becomes an integer to be printed or aligned -- but the round
+trip drops the provenance the borrow checker and `--verify` follow, in exchange
+for nothing.
+
 ## Member access and indexing
 
 `a.b` reads a field of a struct value. `p->b` reads a field through a pointer.

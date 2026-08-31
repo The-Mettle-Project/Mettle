@@ -1,0 +1,49 @@
+/* `u++`, `u += 1` and `u = u + 1` are three spellings of one thing, so they
+ * must answer alike. They used to agree by all three being refused: the
+ * literal defaulted to int32, so the arithmetic typed as int32 and the store
+ * back into a uint8 was a narrowing.
+ *
+ * They agree now by all three being accepted. The literal has no width of its
+ * own, so it is read at the destination's, and the arithmetic is the uint8
+ * arithmetic the reader of `u++` already had in mind -- including the wrap at
+ * the top of the range, which is what the cast produced anyway.
+ *
+ * A genuinely wider value still narrows loudly; err_narrow_wide_value.mettle
+ * holds that half. */
+
+@noinline fn opaque(x: uint8) -> uint8 { return x; }
+
+@noinline fn three_spellings_agree() -> int32 {
+  var a: uint8 = opaque(254);
+  var b: uint8 = opaque(254);
+  var c: uint8 = opaque(254);
+  var i: int32 = 0;
+  while (i < 3) {
+    a++;
+    b += 1;
+    c = c + 1;
+    i = i + 1;
+  }
+  if (a != 1) { return 1; }
+  if (b != 1) { return 2; }
+  if (c != 1) { return 3; }
+  return 0;
+}
+
+@noinline fn decrement_agrees() -> int32 {
+  var a: int8 = 0 - 128;
+  var b: int8 = 0 - 128;
+  a--;
+  b -= 1;
+  if (a != 127) { return 1; }
+  if (b != 127) { return 2; }
+  return 0;
+}
+
+fn main() -> int32 {
+  var r: int32 = three_spellings_agree();
+  if (r != 0) { return r; }
+  r = decrement_agrees();
+  if (r != 0) { return 10 + r; }
+  return 0;
+}

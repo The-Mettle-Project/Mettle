@@ -145,6 +145,10 @@ long long
 type_checker_extract_known_pointer_alignment(TypeChecker *checker,
                                              ASTNode *expression);
 
+void type_checker_warn_pointer_integer_round_trip(TypeChecker *checker,
+                                                 ASTNode *expression,
+                                                 CastExpression *cast_expr,
+                                                 Type *target_type);
 void type_checker_warn_potential_misaligned_cast(TypeChecker *checker,
                                                         ASTNode *expression,
                                                         CastExpression *cast_expr,

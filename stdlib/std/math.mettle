@@ -241,6 +241,66 @@ export fn fract(x: float64) -> float64 {
   return x - floor(x);
 }
 
+// ---------------------------------------------------------------------------
+// Float to integer, with the rounding named.
+//
+// A cast picks one rounding mode and does not say so: `(int32)x` truncates
+// toward zero, which is the wrong direction on the negative side of an axis
+// and is why a grid lookup written with a cast walks one cell off there. These
+// name the mode instead, so the reader of a hot loop can see which one is
+// meant without deriving it.
+//
+// They are also the whole conversion, not a rounding followed by a cast:
+// `(int32)floor(x)` computes a float64 nobody wants on the way to an integer.
+// Every one of these is @inline, so at a call site the body folds into the
+// caller and the float never leaves a register.
+// ---------------------------------------------------------------------------
+
+@inline export fn floor_i64(x: float64) -> int64 {
+  var t: int64 = (int64)x;
+  if ((float64)t > x) { return t - 1; }
+  return t;
+}
+
+@inline export fn floor_i32(x: float64) -> int32 {
+  var t: int32 = (int32)x;
+  if ((float64)t > x) { return t - 1; }
+  return t;
+}
+
+@inline export fn ceil_i64(x: float64) -> int64 {
+  var t: int64 = (int64)x;
+  if ((float64)t < x) { return t + 1; }
+  return t;
+}
+
+@inline export fn ceil_i32(x: float64) -> int32 {
+  var t: int32 = (int32)x;
+  if ((float64)t < x) { return t + 1; }
+  return t;
+}
+
+// Toward zero: what the cast already does, named so a hot loop says which
+// rounding it meant rather than leaving the reader to recall the rule.
+@inline export fn trunc_i64(x: float64) -> int64 {
+  return (int64)x;
+}
+
+@inline export fn trunc_i32(x: float64) -> int32 {
+  return (int32)x;
+}
+
+// Halfway cases go away from zero, matching round() above.
+@inline export fn round_i64(x: float64) -> int64 {
+  if (x >= 0.0) { return (int64)(x + 0.5); }
+  return (int64)(x - 0.5);
+}
+
+@inline export fn round_i32(x: float64) -> int32 {
+  if (x >= 0.0) { return (int32)(x + 0.5); }
+  return (int32)(x - 0.5);
+}
+
 // Exact remainder, by repeated subtraction of scaled divisors. Each subtraction
 // happens between values within a factor of two, so it is exact.
 export fn fmod(x: float64, y: float64) -> float64 {

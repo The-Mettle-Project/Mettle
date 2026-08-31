@@ -1,0 +1,135 @@
+/* What a conversion says, and what it should not have to say twice.
+ *
+ * Four separate frictions, all about the same syntax:
+ *
+ *  - `(int64)"main"` was refused while passing "main" to a cstring parameter
+ *    and casting there was fine, so a one-line identity wrapper defeated the
+ *    rule. A cast must never be more restrictive than the conversion it
+ *    spells out.
+ *
+ *  - `(T*)((int64)p)` is the same address with its provenance dropped.
+ *    Reported as M0120 and seen through by lowering, so the analyses keep
+ *    following the value.
+ *
+ *  - A cast picks a rounding mode and does not say which. `floor_i32` and its
+ *    siblings name it, so a hot loop does not carry a hand-rolled floor.
+ *
+ *  - `var n: int8 = s - 1;` where s is an int8 asked for a cast, because the
+ *    literal defaulted to int32. The literal has no width of its own; read at
+ *    the destination's, the arithmetic is int8 arithmetic already.
+ */
+
+import "std/math";
+
+extern fn strlen(s: cstring) -> int64;
+
+/* The wrapper that used to be the only way to say this. Both spellings must
+ * mean the same thing now. */
+@noinline fn through_a_parameter(s: cstring) -> int64 { return (int64)s; }
+
+@noinline fn string_casts() -> int32 {
+  var literal_addr: int64 = (int64)"main";
+  if (literal_addr == 0) { return 1; }
+  if (through_a_parameter("main") == 0) { return 2; }
+
+  var as_cstring: cstring = (cstring)"main";
+  if (strlen(as_cstring) != 4) { return 3; }
+
+  var s: string = "hello";
+  if (strlen((cstring)s) != 5) { return 4; }
+  if ((int64)s == 0) { return 5; }
+
+  /* The implicit coercion the cast now agrees with. */
+  var implicit: cstring = "hello";
+  if (strlen(implicit) != 5) { return 6; }
+  return 0;
+}
+
+@noinline fn pointer_round_trip() -> int32 {
+  var buf: float32[4];
+  buf[0] = 1.5;
+  buf[1] = 2.5;
+
+  /* M0120: reported, and lowered as the pointer it always was. */
+  var laundered: float32* = (float32*)((int64)(&(buf[0])));
+  var direct: float32* = &(buf[0]);
+  if (laundered[0] != 1.5) { return 1; }
+  if (laundered[1] != direct[1]) { return 2; }
+
+  /* Each half alone still means something and stays quiet. */
+  var address: int64 = (int64)direct;
+  if (address == 0) { return 3; }
+  var rebuilt: float32* = (float32*)address;
+  if (rebuilt[0] != 1.5) { return 4; }
+  return 0;
+}
+
+@noinline fn opaque(x: float64) -> float64 { return x; }
+
+@noinline fn named_rounding() -> int32 {
+  if (floor_i32(opaque(2.7)) != 2) { return 1; }
+  if (floor_i32(opaque(0.0 - 2.7)) != 0 - 3) { return 2; }
+  if (ceil_i32(opaque(2.7)) != 3) { return 3; }
+  if (ceil_i32(opaque(0.0 - 2.7)) != 0 - 2) { return 4; }
+  if (trunc_i32(opaque(2.7)) != 2) { return 5; }
+  if (trunc_i32(opaque(0.0 - 2.7)) != 0 - 2) { return 6; }
+  if (round_i32(opaque(2.5)) != 3) { return 7; }
+  if (round_i32(opaque(0.0 - 2.5)) != 0 - 3) { return 8; }
+  if (round_i32(opaque(0.0 - 0.5)) != 0 - 1) { return 9; }
+
+  if (floor_i64(opaque(0.0 - 3.25)) != 0 - 4) { return 10; }
+  if (ceil_i64(opaque(3.25)) != 4) { return 11; }
+  if (trunc_i64(opaque(0.0 - 3.25)) != 0 - 3) { return 12; }
+  if (round_i64(opaque(3.5)) != 4) { return 13; }
+
+  /* Integral and zero go through unchanged in every mode. */
+  if (floor_i32(opaque(3.0)) != 3) { return 14; }
+  if (ceil_i32(opaque(0.0 - 3.0)) != 0 - 3) { return 15; }
+  if (round_i32(opaque(0.0)) != 0) { return 16; }
+  return 0;
+}
+
+@noinline fn takes_u8(x: uint8) -> uint8 { return x; }
+
+@noinline fn literal_takes_the_destination_width() -> int32 {
+  var s: int8 = 0 - 3;
+  var n: int8 = s - 1;
+  if (n != 0 - 4) { return 1; }
+
+  var b: uint8 = 7;
+  if (takes_u8(b + 1) != 8) { return 2; }
+
+  var m: uint8 = b | 128;
+  if (m != 135) { return 3; }
+
+  var shifted: uint8 = b << 2;
+  if (shifted != 28) { return 4; }
+
+  var masked: uint8 = (b + 1) & 6;
+  if (masked != 0) { return 5; }
+
+  var negated: int8 = 0 - s;
+  if (negated != 3) { return 6; }
+
+  /* The wrap is the destination's own, the same value the cast produced. */
+  var top: uint8 = 255;
+  var wrapped: uint8 = top + 1;
+  if (wrapped != 0) { return 7; }
+
+  var low: int8 = 0 - 128;
+  var under: int8 = low - 1;
+  if (under != 127) { return 8; }
+  return 0;
+}
+
+fn main() -> int32 {
+  var r: int32 = string_casts();
+  if (r != 0) { return r; }
+  r = pointer_round_trip();
+  if (r != 0) { return 10 + r; }
+  r = named_rounding();
+  if (r != 0) { return 20 + r; }
+  r = literal_takes_the_destination_width();
+  if (r != 0) { return 50 + r; }
+  return 0;
+}

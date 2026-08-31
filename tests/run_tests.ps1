@@ -1264,6 +1264,17 @@ $cases = @(
   @{ Name = "err_const_no_init"; Path = "tests/err_const_no_init.mettle"; ShouldSucceed = $false; Pattern = "Constant declaration requires an initializer" },
   @{ Name = "err_const_assign"; Path = "tests/err_const_assign.mettle"; ShouldSucceed = $false; Pattern = "is a constant and cannot be assigned to" },
   @{ Name = "err_const_nonconst"; Path = "tests/err_const_nonconst.mettle"; ShouldSucceed = $false; Pattern = "compile-time integer constant expression" },
+  @{ Name = "err_narrow_wide_value"; Path = "tests/err_narrow_wide_value.mettle"; ShouldSucceed = $false
+     OutputMustMatch = @(
+       "Narrowing conversion from 'int64' to 'int8' needs a cast",
+       "Narrowing conversion from 'int32' to 'int8' needs a cast",
+       "Narrowing conversion from 'int8' to 'uint8' needs a cast"
+     ) },
+  @{ Name = "pointer_round_trip_warns"; Path = "tests/pointer_round_trip_warns.mettle"; ShouldSucceed = $true
+     OutputMustMatch = @(
+       'warning\[M0120\]: This pointer is cast to an integer and straight back to a pointer'
+     )
+     OutputMustNotMatch = @("error") },
   @{ Name = "comptime_type_ref"; Path = "tests/test_comptime_type_ref.mettle"; ShouldSucceed = $true },
   @{ Name = "comptime_field_ref"; Path = "tests/test_comptime_field_ref.mettle"; ShouldSucceed = $true },
   @{ Name = "type_table_layout"; Path = "tests/test_type_table_layout.mettle"; ShouldSucceed = $true },
@@ -2551,7 +2562,6 @@ $cases = @(
   @{ Name = "err_syntax_lexical_no_cascade"; Path = "tests/err_syntax_lexical_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
   @{ Name = "err_increment_expression"; Path = "tests/err_increment_expression.mettle"; ShouldSucceed = $false; Pattern = "are statements, not expressions" },
   @{ Name = "err_increment_expression_once"; Path = "tests/err_increment_expression.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
-  @{ Name = "err_increment_narrow"; Path = "tests/err_increment_narrow.mettle"; ShouldSucceed = $false; Pattern = "Narrowing conversion from 'int32' to 'uint8'" },
   # A `<` comparison whose right side makes the speculative type-argument parse
   # fail must backtrack without leaving the abandoned parse's diagnostic behind.
   @{ Name = "generic_call_lt_ambiguity"; Path = "tests/generic_call_lt_ambiguity.mettle"; ShouldSucceed = $true
@@ -13512,6 +13522,10 @@ $runFixtures = @(
      What = "a shadowing var shared the slot of the one it shadows" },
   @{ Name = "local_shadows_global"; Path = "tests/codegen/local_shadows_global.mettle"
      What = "a local took the type of a global or function that shares its name" },
+  @{ Name = "conversion_surface"; Path = "tests/codegen/conversion_surface.mettle"
+     What = "a cast, a named rounding, or a literal read at its destination's width answered wrong" },
+  @{ Name = "increment_narrow_agrees"; Path = "tests/codegen/increment_narrow_agrees.mettle"
+     What = "`u++`, `u += 1` and `u = u + 1` stopped agreeing on a sub-word target" },
   @{ Name = "unsigned_through_temp"; Path = "tests/codegen/unsigned_through_temp.mettle"
      What = "an unsigned shift, divide or remainder through a temp went signed" },
   @{ Name = "if_convert_accumulate"; Path = "tests/codegen/if_convert_accumulate.mettle"

@@ -138,6 +138,10 @@ Sign and range: `fabs`, `copysign`, `fsign`, `fmin`, `fmax`, `fclamp`,
 
 Rounding: `trunc`, `floor`, `ceil`, `round`, `fract`, `fmod`.
 
+Float to integer with the mode named, rather than the one a cast picks:
+`floor_i32`, `ceil_i32`, `trunc_i32`, `round_i32`, and their `_i64` siblings.
+All are `@inline`.
+
 Powers and roots: `sqrt`, `rsqrt`, `hypot`, `cbrt`, `pow`, `ldexp`, `frexp`.
 
 Exponential and logarithm: `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`,

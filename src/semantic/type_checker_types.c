@@ -1063,6 +1063,18 @@ int type_checker_is_cast_valid(Type *from, Type *to) {
     return 1;
   }
 
+  /* A `string` reaches a pointer or an integer as its characters, which is
+   * exactly what the implicit coercion at a `cstring` binding already does. A
+   * cast must never be more restrictive than the conversion it spells out:
+   * while it was, `(int64)"main"` was refused although "main" passed to a
+   * cstring parameter and cast there was fine, so a one-line identity wrapper
+   * defeated the rule. A restriction a wrapper defeats is in the wrong place. */
+  if (from->kind == TYPE_STRING &&
+      (to->kind == TYPE_POINTER || to->kind == TYPE_FUNCTION_POINTER ||
+       type_checker_is_integer_type(to))) {
+    return 1;
+  }
+
   // Pointer <-> pointer
   if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER)
     return 1;
@@ -1181,6 +1193,97 @@ int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
   return type_checker_is_implicitly_convertible(src_type, dest_type);
 }
 
+/* Operators whose low N bits are decided by the operands' low N bits alone, so
+ * computing them in a wider type and truncating gives what the narrow type
+ * would have given. `/` and `%` are not here: they read the whole value. `>>`
+ * is not here either: it feeds high bits downward. */
+static int type_checker_op_keeps_low_bits(const char *op) {
+  if (!op) {
+    return 0;
+  }
+  return strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
+         strcmp(op, "*") == 0 || strcmp(op, "&") == 0 ||
+         strcmp(op, "|") == 0 || strcmp(op, "^") == 0 ||
+         strcmp(op, "<<") == 0;
+}
+
+/* Is this expression already an expression OF the destination type, spelled
+ * with a literal that a narrower type cannot hold on its own?
+ *
+ * `var n: int8 = s - 1;` where s is an int8 is that shape. The literal 1 has no
+ * type of its own until something gives it one, so the subtraction typed as
+ * int32 and the store was reported as a narrowing -- a cast that said nothing
+ * the destination had not already said. Reading the literal at the destination
+ * type instead, the arithmetic is int8 arithmetic and the result is the same
+ * value the cast produced.
+ *
+ * Every leaf must fit the destination and every operator must be one whose
+ * result's low bits come only from its operands' low bits, so nothing is lost
+ * that the destination would have kept. Anything reaching a genuinely wider
+ * value -- an int64 variable, a call result, a divide -- still narrows loudly. */
+static int type_checker_expression_is_destination_width(TypeChecker *checker,
+                                                        Type *dest_type,
+                                                        ASTNode *expression,
+                                                        int depth) {
+  if (!checker || !dest_type || !expression || depth > 32) {
+    return 0;
+  }
+
+  switch (expression->type) {
+  case AST_NUMBER_LITERAL: {
+    NumberLiteral *literal = (NumberLiteral *)expression->data;
+    long long value = 0;
+    if (!literal || literal->is_float) {
+      return 0;
+    }
+    if (!type_checker_eval_integer_constant_with_checker(checker, expression,
+                                                         &value)) {
+      return 0;
+    }
+    return type_checker_constant_fits_type(dest_type, expression->resolved_type,
+                                           value);
+  }
+
+  case AST_BINARY_EXPRESSION: {
+    BinaryExpression *binary = (BinaryExpression *)expression->data;
+    if (!binary || !type_checker_op_keeps_low_bits(binary->operator)) {
+      return 0;
+    }
+    return type_checker_expression_is_destination_width(checker, dest_type,
+                                                        binary->left,
+                                                        depth + 1) &&
+           type_checker_expression_is_destination_width(checker, dest_type,
+                                                        binary->right,
+                                                        depth + 1);
+  }
+
+  case AST_UNARY_EXPRESSION: {
+    UnaryExpression *unary = (UnaryExpression *)expression->data;
+    if (!unary || !unary->operator|| !unary->operand) {
+      return 0;
+    }
+    if (strcmp(unary->operator, "-") != 0 && strcmp(unary->operator, "+") != 0 &&
+        strcmp(unary->operator, "~") != 0) {
+      return 0;
+    }
+    return type_checker_expression_is_destination_width(checker, dest_type,
+                                                        unary->operand,
+                                                        depth + 1);
+  }
+
+  default:
+    break;
+  }
+
+  /* Any other leaf: a variable, a field, a call. It counts only when its own
+   * type already reaches the destination without losing anything. */
+  return expression->resolved_type &&
+         type_checker_is_integer_type(expression->resolved_type) &&
+         expression->resolved_type->kind != TYPE_ENUM &&
+         type_checker_int_conversion_is_value_preserving(
+             expression->resolved_type, dest_type);
+}
+
 int type_checker_is_assignable_from(TypeChecker *checker, Type *dest_type,
                                     Type *src_type, ASTNode *src_expr) {
   long long folded = 0;
@@ -1199,7 +1302,8 @@ int type_checker_is_assignable_from(TypeChecker *checker, Type *dest_type,
   }
   if (!type_checker_eval_integer_constant_with_checker(checker, src_expr,
                                                        &folded)) {
-    return 0;
+    return type_checker_expression_is_destination_width(checker, dest_type,
+                                                        src_expr, 0);
   }
   return type_checker_constant_fits_type(dest_type, src_type, folded);
 }

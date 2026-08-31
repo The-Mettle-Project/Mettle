@@ -3333,6 +3333,8 @@ static Type *type_checker_infer_cast(TypeChecker *checker,
 
     type_checker_warn_potential_misaligned_cast(checker, expression, cast_expr,
                                                 target_type);
+    type_checker_warn_pointer_integer_round_trip(checker, expression, cast_expr,
+                                                 target_type);
 
     return target_type;
   }

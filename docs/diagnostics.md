@@ -110,6 +110,7 @@ Memory and range diagnostics:
 | M0117 | Loop index runs past the end of the array |
 | M0118 | Integer out of range for its destination |
 | M0119 | Narrowing conversion needs a cast |
+| M0120 | Pointer cast to an integer and back to a pointer |
 
 [Memory safety](memory-safety.md) and [Borrow checker](borrow-checker.md)
 cover the M codes in context.

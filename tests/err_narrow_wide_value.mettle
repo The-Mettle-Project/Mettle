@@ -1,0 +1,15 @@
+// Reading a literal at its destination's width does not make every narrowing
+// silent. A genuinely wider value, a divide, and a shift each still ask for
+// the cast that says the truncation is meant.
+fn wide() -> int64 { return 5; }
+
+fn main() -> int32 {
+  var w: int64 = 300;
+  var s: int8 = 5;
+  var from_wide: int8 = w - 1;
+  var from_call: int8 = wide();
+  var from_divide: int8 = s / 2 + 1;
+  var from_shift: uint8 = s >> 1;
+  return (int32)from_wide + (int32)from_call + (int32)from_divide +
+         (int32)from_shift;
+}

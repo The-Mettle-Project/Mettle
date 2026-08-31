@@ -2577,8 +2577,45 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       return 0;
     }
 
+    Type *cast_target = ir_resolve_named_type(context, cast_expr->type_name);
+    int target_is_pointer =
+        cast_target && (cast_target->kind == TYPE_POINTER ||
+                        cast_target->kind == TYPE_FUNCTION_POINTER);
+    ASTNode *cast_operand = cast_expr->operand;
+
+    /* `(T*)((int64)p)` where p is already a pointer: the integer carries the
+     * same address with its provenance dropped. Lower the pointer instead, so
+     * the alias analysis, the borrow checker and --verify keep following the
+     * value the source laundered. The type checker reports M0120 on the same
+     * shape, so the spelling gets cleaned up as well. */
+    if (target_is_pointer && cast_operand->type == AST_CAST_EXPRESSION &&
+        cast_operand->data) {
+      CastExpression *inner = (CastExpression *)cast_operand->data;
+      Type *mid = inner->type_name
+                      ? ir_resolve_named_type(context, inner->type_name)
+                      : NULL;
+      Type *source = inner->operand ? inner->operand->resolved_type : NULL;
+      if (mid && source && inner->operand &&
+          type_checker_is_integer_type(mid) &&
+          (source->kind == TYPE_POINTER ||
+           source->kind == TYPE_FUNCTION_POINTER)) {
+        cast_operand = inner->operand;
+      }
+    }
+
     IROperand operand = ir_operand_none();
-    if (!ir_lower_expression(context, function, cast_expr->operand, &operand)) {
+    if (!ir_lower_expression(context, function, cast_operand, &operand)) {
+      return 0;
+    }
+
+    /* Casting a `string` to a pointer or an integer means its characters, the
+     * same conversion a `cstring` binding gets implicitly. The record itself
+     * is not the address. */
+    if (cast_target && ir_expression_is_string(context, cast_operand) &&
+        (target_is_pointer || type_checker_is_integer_type(cast_target)) &&
+        !ir_coerce_string_operand_to_cstring(context, function, &operand,
+                                             expression->location)) {
+      ir_operand_destroy(&operand);
       return 0;
     }
 
@@ -2594,14 +2631,12 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     instruction.dest = destination;
     instruction.lhs = operand;
     instruction.text = (char *)ir_backend_type_name(cast_expr->type_name);
-    instruction.is_float =
-        ir_expression_is_floating(context, cast_expr->operand);
+    instruction.is_float = ir_expression_is_floating(context, cast_operand);
     if (instruction.is_float) {
       /* float_bits on a CAST records the SOURCE operand width so the backend
        * can pick cvttss2si/cvtss2sd (f32) vs cvttsd2si (f64). The TARGET
        * width is resolved separately from instruction->text. */
-      instruction.float_bits =
-          ir_expression_float_bits(context, cast_expr->operand);
+      instruction.float_bits = ir_expression_float_bits(context, cast_operand);
       if (instruction.float_bits == 0) {
         instruction.float_bits = 64;
       }

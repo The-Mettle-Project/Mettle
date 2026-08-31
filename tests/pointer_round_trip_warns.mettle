@@ -1,0 +1,13 @@
+// M0120: a pointer cast to an integer and straight back. Both halves alone are
+// legitimate and must stay quiet; only the round trip is reported.
+fn main() -> int32 {
+  var buf: int32[4];
+  buf[0] = 7;
+  var laundered: int32* = (int32*)((int64)(&(buf[0])));
+  var direct: int32* = &(buf[0]);
+  var address: int64 = (int64)direct;
+  var rebuilt: int32* = (int32*)address;
+  if (laundered[0] != rebuilt[0]) { return 1; }
+  if (address == 0) { return 2; }
+  return 0;
+}

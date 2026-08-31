@@ -1,9 +1,0 @@
-// `u++` is `u = u + 1`, and that arithmetic promotes to int32, so a sub-word
-// target narrows on the way back. The increment spelling must be held to the
-// same rule as `+=` and the assignment it stands for, rather than quietly
-// wrapping where the other two ask for a cast.
-fn main() -> int32 {
-  var u: uint8 = 254;
-  u++;
-  return (int32)u;
-}

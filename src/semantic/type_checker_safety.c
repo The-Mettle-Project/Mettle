@@ -1328,6 +1328,78 @@ void type_checker_warn_potential_misaligned_cast(TypeChecker *checker,
   }
 }
 
+/* `(T*)((int64)p)`, where p is already a pointer. The integer in the middle
+ * carries nothing the pointer did not: it is the same address, spelled through
+ * a type that says less. What it costs is real -- the borrow checker and the
+ * translation validator both have to give up on a value whose provenance was
+ * laundered through an integer, and every such cast is a hole in what they can
+ * prove about the program around it.
+ *
+ * Reported, and then seen through: lowering keeps the pointer, so the analyses
+ * are not blinded while the source is cleaned up. Going the other way, an
+ * integer that really is an address (a handle from the operating system, a
+ * device pointer) still casts to a pointer, and a pointer still casts to an
+ * integer to be printed or hashed. Only the round trip is noise. */
+static ASTNode *type_checker_pointer_laundered_through_integer(
+    TypeChecker *checker, ASTNode *operand) {
+  CastExpression *inner = NULL;
+  Type *inner_target = NULL;
+  Type *inner_source = NULL;
+
+  if (!operand || operand->type != AST_CAST_EXPRESSION || !operand->data) {
+    return NULL;
+  }
+  inner = (CastExpression *)operand->data;
+  if (!inner->type_name || !inner->operand) {
+    return NULL;
+  }
+  inner_target = type_checker_get_type_by_name(checker, inner->type_name);
+  if (!inner_target || !type_checker_is_integer_type(inner_target)) {
+    return NULL;
+  }
+  inner_source = inner->operand->resolved_type;
+  if (!inner_source) {
+    inner_source = type_checker_infer_type(checker, inner->operand);
+  }
+  if (!inner_source || (inner_source->kind != TYPE_POINTER &&
+                        inner_source->kind != TYPE_FUNCTION_POINTER)) {
+    return NULL;
+  }
+  return inner->operand;
+}
+
+void type_checker_warn_pointer_integer_round_trip(TypeChecker *checker,
+                                                  ASTNode *expression,
+                                                  CastExpression *cast_expr,
+                                                  Type *target_type) {
+  ASTNode *pointer = NULL;
+  char message[512];
+  char help[512];
+
+  if (!checker || !checker->error_reporter || !expression || !cast_expr ||
+      !target_type || (target_type->kind != TYPE_POINTER &&
+                       target_type->kind != TYPE_FUNCTION_POINTER)) {
+    return;
+  }
+  pointer = type_checker_pointer_laundered_through_integer(checker,
+                                                           cast_expr->operand);
+  if (!pointer) {
+    return;
+  }
+
+  snprintf(message, sizeof(message),
+           "This pointer is cast to an integer and straight back to a pointer");
+  snprintf(help, sizeof(help),
+           "write the pointer cast on its own: (%s)<pointer>. The integer in "
+           "between is the same address with its provenance dropped, which the "
+           "borrow checker and --verify cannot follow through",
+           target_type->name ? target_type->name : "T*");
+  error_reporter_add_warning_with_suggestion(
+      checker->error_reporter, ERROR_SEMANTIC, expression->location, message,
+      help);
+  error_reporter_set_last_code(checker->error_reporter, "M0120");
+}
+
 void type_checker_warn_recv_buffer_bounds(TypeChecker *checker,
                                                  CallExpression *call) {
   if (!checker || !checker->error_reporter || !call || !call->function_name) {

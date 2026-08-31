@@ -258,6 +258,27 @@ static const ErrorCodeDoc DOCS[] = {
      "Two destinations sit outside the rule because they are not range\n"
      "conversions: `bool` is a truth coercion, and an enum names a set.\n"
      "Floating-point conversions are unchanged and still silent.\n"},
+    {"M0120", "Pointer cast to an integer and back to a pointer",
+     "A pointer is cast to an integer and straight back to a pointer. The\n"
+     "integer in the middle holds the same address the pointer already held,\n"
+     "so nothing about the value changes. What changes is what the compiler\n"
+     "can say about it: an integer has no provenance, so the borrow checker,\n"
+     "the alias analysis and --verify all have to give up on where that\n"
+     "address came from.\n"
+     "\n"
+     "Example:\n"
+     "    var p: float32* = (float32*)((int64)(&(buf[0])));  // M0120\n"
+     "    var q: float32* = &(buf[0]);                       // the same value\n"
+     "\n"
+     "Lowering sees through the round trip, so the analyses are not blinded\n"
+     "while the spelling is cleaned up. The value is not wrong; the detour\n"
+     "is.\n"
+     "\n"
+     "Neither half is reported on its own, because each is sometimes the only\n"
+     "way to say a thing. An integer that really is an address -- a handle\n"
+     "from the operating system, a device pointer -- becomes a pointer by\n"
+     "cast. A pointer becomes an integer to be printed, hashed or aligned.\n"
+     "Only the round trip carries no information.\n"},
 };
 
 /* ---- optimizer decision codes ----------------------------------------------
