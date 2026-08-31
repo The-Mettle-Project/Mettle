@@ -119,9 +119,37 @@ form.
 | `-d`, `--debug` | Debug output and symbols. |
 | `-g`, `--debug-symbols` | Debug symbols. |
 | `-l`, `--line-mapping` | Source line mapping. |
-| `-s`, `--stack-trace` | Embed crash traceback support. |
+| `-s`, `--stack-trace` | Report a crash at the exact statement. |
+| `--no-crash-report` | Drop the default crash report. |
 | `--debug-format <fmt>` | `dwarf`, `stabs`, or `map`. Default `dwarf`. |
 | `--debug-hooks` | Instrument for the interactive debugger. Needs `-O0`. |
+
+### When a program faults
+
+A linked executable reports a fault by default. It names the exception, the
+address, and the function it happened in, with that function's file and line,
+then walks the stack:
+
+```text
+Unhandled runtime exception 0xC0000005 (access violation)
+Attempted to read inaccessible memory at 0x00000000DEADB000
+  --> ds_vk.mettle:406:1 in submit_frame
+Stack trace:
+  #0 submit_frame at ds_vk.mettle:406:1 (0x0000000140001ECA)
+  #1 main at ds.mettle:812:1 (0x0000000140001F2A)
+Lines above are where each function is declared; rebuild with -s for the exact statement.
+```
+
+That costs one debug record per function plus the handler, about 8 KB, and
+nothing in code quality: the register-allocating backend is unaffected.
+`--no-crash-report` removes it. A bare object (`--emit-obj` with no `--build`)
+and a freestanding image never carry it, because neither links through a
+runtime this compiler controls.
+
+`-s` records a location per instruction as well, so the report names the exact
+statement rather than the function's declaration. That table cannot be carried
+by the register-allocating backend, so the functions in a `-s` build are
+emitted by the baseline one and run slower.
 
 ## Profiling
 

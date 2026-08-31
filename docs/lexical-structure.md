@@ -19,7 +19,29 @@ var b: int32 = 2
 
 An expression may span lines. The compiler keeps reading while the statement is
 plainly unfinished, so a long call or a long arithmetic chain can be broken
-across lines without a continuation marker.
+across lines without a continuation marker. The break may go either side of the
+operator:
+
+```mettle
+var trailing: float64 = x +
+    a(i) +
+    b(i);
+
+var leading: float64 = x
+    + a(i)
+    + b(i);
+```
+
+A chain of member accesses reads the same way down the page, through `.` or
+`->`. Blank lines inside a split expression are allowed.
+
+`*` is the one operator that only splits on the trailing form, because a line
+opening with it is a dereference-assignment statement:
+
+```mettle
+var n: int32 = compute()
+*p = 5;                     // two statements, not one expression
+```
 
 ## Comments
 

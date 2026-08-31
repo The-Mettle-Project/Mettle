@@ -57,7 +57,25 @@ fn sqrt2(x: float64) -> float64 { return x + 1.0; }
   return wide + (int64)u + (int64)narrow + (int64)acc;
 }
 
+/* Parameters own their names against globals too, and a shadow that opens in a
+ * nested block closes with it. */
+@noinline fn parameters_own_their_names(fl: int64, f32g: float32,
+                                        wide: int32) -> int64 {
+  return fl + (int64)f32g + (int64)wide;
+}
+
+@noinline fn nested_block_shadow() -> int64 {
+  var wide: int64 = 10;
+  {
+    var wide: float32 = 2.5;
+    if (wide != 2.5) { return 0 - 1; }
+  }
+  return wide;
+}
+
 fn main() -> int32 {
+  if (parameters_own_their_names(3, 4.0, 5) != 12) { return 6; }
+  if (nested_block_shadow() != 10) { return 7; }
   if (integer_named_like_a_float_function() != 1235) { return 1; }
   if (locals_win_over_globals() != 5294967490) { return 2; }
   if (float_local_over_integer_global() != 0.75) { return 3; }
