@@ -57,6 +57,9 @@
         mov dword [di], 0x32454256
         mov ax, 0x4f00
         int 0x10
+        xor bx, bx
+        mov ds, bx
+        mov es, bx
         cmp ax, 0x004f
         jne video_done
         mov ax, [0x100e]
@@ -79,6 +82,9 @@
         mov ax, 0x4f01
         mov di, 0x1200
         int 0x10
+        xor bx, bx
+        mov ds, bx
+        mov es, bx
         cmp ax, 0x004f
         jne mode_next
 
@@ -115,6 +121,9 @@
         or bx, 0x4000
         mov ax, 0x4f02
         int 0x10
+        xor bx, bx
+        mov ds, bx
+        mov es, bx
         cmp ax, 0x004f
         je video_done
         mov word [0x0502], 0
@@ -126,29 +135,32 @@
         or al, 2
         out 0x92, al
 
-        mov edi, 0x10000
+        xor ax, ax
+        mov es, ax
+        mov ds, ax
+        mov di, 0x1000
         xor eax, eax
         mov ecx, 6144
         rep stosd
 
-        mov edi, 0x10000
-        mov dword [edi], 0x11003
-        mov edi, 0x11000
-        mov dword [edi], 0x12003
-        mov dword [edi + 8], 0x13003
-        mov dword [edi + 16], 0x14003
-        mov dword [edi + 24], 0x15003
+        mov di, 0x1000
+        mov dword [di], 0x2003
+        mov di, 0x2000
+        mov dword [di], 0x3003
+        mov dword [di + 8], 0x4003
+        mov dword [di + 16], 0x5003
+        mov dword [di + 24], 0x6003
 
-        mov edi, 0x12000
+        mov di, 0x3000
         mov eax, 0x83
         mov ecx, 2048
     map_page:
-        mov [edi], eax
+        mov [di], eax
         add eax, 0x200000
-        add edi, 8
+        add di, 8
         loop map_page
 
-        mov edi, 0x10000
+        mov edi, 0x1000
         mov cr3, edi
         lgdt [gdt_pointer]
         mov eax, cr4
