@@ -1,0 +1,12 @@
+the path from power on to the shell:
+
+  the bios reads sector zero to 0x7c00 and jumps into it
+  the sector asks the bios for the memory map and leaves it at 0x5000
+  it reads 128 kilobytes from the floppy to 0x20000
+  it opens the a20 line so addresses above one megabyte work
+  it builds page tables that identity map the first gigabyte
+  it turns on pae, long mode, and paging, then jumps to 64 bit code
+  it jumps to 0x20000, where the kernel starts
+
+the kernel is linked at 0x20000 and the archive of files sits at 0x30000.
+the stack starts at 0x90000.

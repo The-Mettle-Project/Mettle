@@ -13,6 +13,28 @@ struct MemoryRegion {
     attributes: uint32;
 }
 
+struct Task {
+    stack_pointer: uint64;
+    stack_base: uint64;
+    state: uint64;
+    slices: uint64;
+    stop: uint64;
+    value: uint64;
+    name: uint8[16];
+}
+
+struct FileEntry {
+    name: uint8[32];
+    offset: uint64;
+    length: uint64;
+}
+
+struct BlockHeader {
+    size: uint64;
+    used: uint64;
+    next: uint64;
+}
+
 var idt: uint64[512]
 var idt_descriptor: uint8[16]
 
@@ -20,14 +42,31 @@ var ticks: volatile uint64 = 0
 var cursor_row: uint64 = 0
 var cursor_column: uint64 = 0
 var attribute: uint8 = 7
+var serial_ready: uint64 = 0
 
 var key_buffer: uint8[128]
 var key_head: volatile uint64 = 0
 var key_tail: volatile uint64 = 0
 var shift_held: volatile uint64 = 0
+var extended_code: volatile uint64 = 0
+
 var line_buffer: uint8[128]
 var command_buffer: uint8[32]
 var vendor_buffer: uint8[16]
+var history: uint8[1024]
+var history_count: uint64 = 0
+
+var free_page_list: uint64 = 0
+var free_page_count: uint64 = 0
+var total_page_count: uint64 = 0
+
+var heap_head: uint64 = 0
+var heap_bytes: uint64 = 0
+var heap_used: uint64 = 0
+
+var tasks: Task[8]
+var current_task: uint64 = 0
+var scheduler_ready: volatile uint64 = 0
 
 @naked fn _start() {
     asm {
@@ -81,6 +120,28 @@ fn wait_for_interrupt() {
     }
 }
 
+fn serial_init() {
+    outb(0x3f9, 0)
+    outb(0x3fb, 0x80)
+    outb(0x3f8, 1)
+    outb(0x3f9, 0)
+    outb(0x3fb, 3)
+    outb(0x3fa, 0xc7)
+    outb(0x3fc, 0x0b)
+    serial_ready = 1
+}
+
+fn serial_put(ch: uint8) {
+    if (serial_ready == 0) {
+        return
+    }
+    var guard: uint64 = 0
+    while ((inb(0x3fd) & 32) == 0 && guard < 200000) {
+        guard = guard + 1
+    }
+    outb(0x3f8, ch)
+}
+
 fn vga_write_cell(index: uint64, ch: uint8, color: uint8) {
     var screen: uint16* = (uint16*)0xb8000
     screen[index] = (uint16)ch | ((uint16)color << 8)
@@ -109,26 +170,28 @@ fn clear_screen() {
 }
 
 fn scroll_screen() {
-    for i: uint64 in 0..1920 {
+    for i: uint64 in 0..1760 {
         var screen: uint16* = (uint16*)0xb8000
         screen[i] = vga_read_cell(i + 80)
     }
-    for i: uint64 in 1920..2000 {
+    for i: uint64 in 1760..1840 {
         vga_write_cell(i, 32, attribute)
     }
-    cursor_row = 24
+    cursor_row = 22
 }
 
 fn new_line() {
     cursor_column = 0
     cursor_row = cursor_row + 1
-    if (cursor_row > 24) {
+    if (cursor_row > 22) {
         scroll_screen()
     }
 }
 
 fn put_char(ch: uint8) {
     if (ch == 10) {
+        serial_put(13)
+        serial_put(10)
         new_line()
         return
     }
@@ -141,6 +204,7 @@ fn put_char(ch: uint8) {
             cursor_column = cursor_column - 1
             vga_write_cell(cursor_row * 80 + cursor_column, 32, attribute)
         }
+        serial_put(8)
         return
     }
     if (ch == 9) {
@@ -149,6 +213,7 @@ fn put_char(ch: uint8) {
         }
         return
     }
+    serial_put(ch)
     vga_write_cell(cursor_row * 80 + cursor_column, ch, attribute)
     cursor_column = cursor_column + 1
     if (cursor_column > 79) {
@@ -205,6 +270,205 @@ fn write_hex(value: uint64, width: uint64) {
     }
 }
 
+fn draw_text(row: uint64, column: uint64, text: cstring, color: uint8) {
+    var i: uint64 = 0
+    while (text[i] != 0 && column + i < 80) {
+        vga_write_cell(row * 80 + column + i, text[i], color)
+        i = i + 1
+    }
+}
+
+fn draw_number(row: uint64, column: uint64, value: uint64, color: uint8) -> uint64 {
+    var digits: uint8[24]
+    var count: uint64 = 0
+    var remaining: uint64 = value
+    if (remaining == 0) {
+        digits[0] = 48
+        count = 1
+    }
+    while (remaining > 0) {
+        digits[count] = (uint8)(48 + remaining % 10)
+        remaining = remaining / 10
+        count = count + 1
+    }
+    var written: uint64 = 0
+    while (count > 0) {
+        count = count - 1
+        vga_write_cell(row * 80 + column + written, digits[count], color)
+        written = written + 1
+    }
+    return written
+}
+
+fn draw_two_digits(row: uint64, column: uint64, value: uint64, color: uint8) {
+    vga_write_cell(row * 80 + column, (uint8)(48 + (value / 10) % 10), color)
+    vga_write_cell(row * 80 + column + 1, (uint8)(48 + value % 10), color)
+}
+
+fn page_free(address: uint64) {
+    var slot: uint64* = (uint64*)address
+    slot[0] = free_page_list
+    free_page_list = address
+    free_page_count = free_page_count + 1
+}
+
+fn page_alloc() -> uint64 {
+    if (free_page_list == 0) {
+        return 0
+    }
+    var address: uint64 = free_page_list
+    var slot: uint64* = (uint64*)address
+    free_page_list = slot[0]
+    free_page_count = free_page_count - 1
+    return address
+}
+
+fn memory_init() {
+    var count_slot: uint16* = (uint16*)0x5000
+    var count: uint64 = (uint64)count_slot[0]
+    var regions: MemoryRegion* = (MemoryRegion*)0x5010
+    for i: uint64 in 0..count {
+        if (regions[i].kind == 1) {
+            var start: uint64 = regions[i].base
+            var end: uint64 = regions[i].base + regions[i].length
+            if (start < 0x200000) {
+                start = 0x200000
+            }
+            if (end > 0x40000000) {
+                end = 0x40000000
+            }
+            start = (start + 4095) / 4096 * 4096
+            end = end / 4096 * 4096
+            while (start + 4096 <= end) {
+                page_free(start)
+                total_page_count = total_page_count + 1
+                start = start + 4096
+            }
+        }
+    }
+}
+
+fn heap_grow(need: uint64) -> uint64 {
+    var pages: uint64 = (need + 24 + 4095) / 4096
+    var first: uint64 = 0
+    var previous: uint64 = 0
+    for i: uint64 in 0..pages {
+        var page: uint64 = page_alloc()
+        if (page == 0) {
+            return first
+        }
+        var header: BlockHeader* = (BlockHeader*)page
+        header->size = 4096 - 24
+        header->used = 0
+        header->next = 0
+        if (previous != 0) {
+            var last: BlockHeader* = (BlockHeader*)previous
+            last->next = page
+        }
+        if (first == 0) {
+            first = page
+        }
+        previous = page
+        heap_bytes = heap_bytes + 4096
+    }
+    if (heap_head == 0) {
+        heap_head = first
+    } else {
+        var walk: uint64 = heap_head
+        while (1 == 1) {
+            var block: BlockHeader* = (BlockHeader*)walk
+            if (block->next == 0) {
+                block->next = first
+                break
+            }
+            walk = block->next
+        }
+    }
+    return first
+}
+
+fn kmalloc(size: uint64) -> uint64 {
+    var need: uint64 = (size + 15) / 16 * 16
+    if (need == 0) {
+        need = 16
+    }
+    if (need > 4096 - 24) {
+        return 0
+    }
+    var walk: uint64 = heap_head
+    while (walk != 0) {
+        var block: BlockHeader* = (BlockHeader*)walk
+        if (block->used == 0 && block->size >= need) {
+            if (block->size >= need + 48) {
+                var rest: uint64 = walk + 24 + need
+                var tail: BlockHeader* = (BlockHeader*)rest
+                tail->size = block->size - need - 24
+                tail->used = 0
+                tail->next = block->next
+                block->size = need
+                block->next = rest
+            }
+            block->used = 1
+            heap_used = heap_used + block->size
+            return walk + 24
+        }
+        walk = block->next
+    }
+    if (heap_grow(need) == 0) {
+        return 0
+    }
+    return kmalloc(size)
+}
+
+fn kfree(pointer: uint64) {
+    if (pointer == 0) {
+        return
+    }
+    var block: BlockHeader* = (BlockHeader*)(pointer - 24)
+    if (block->used == 0) {
+        return
+    }
+    block->used = 0
+    if (heap_used >= block->size) {
+        heap_used = heap_used - block->size
+    }
+    var walk: uint64 = heap_head
+    while (walk != 0) {
+        var current: BlockHeader* = (BlockHeader*)walk
+        if (current->used == 0 && current->next != 0) {
+            var next: BlockHeader* = (BlockHeader*)current->next
+            if (next->used == 0 && walk + 24 + current->size == current->next) {
+                current->size = current->size + 24 + next->size
+                current->next = next->next
+                continue
+            }
+        }
+        walk = current->next
+    }
+}
+
+fn cmos_read(index: uint8) -> uint64 {
+    outb(0x70, index)
+    return (uint64)inb(0x71)
+}
+
+fn from_bcd(value: uint64) -> uint64 {
+    return (value & 15) + (value >> 4) * 10
+}
+
+fn rtc_read(field: uint8) -> uint64 {
+    var guard: uint64 = 0
+    while ((cmos_read(0x0a) & 0x80) != 0 && guard < 100000) {
+        guard = guard + 1
+    }
+    var raw: uint64 = cmos_read(field)
+    var status: uint64 = cmos_read(0x0b)
+    if ((status & 4) == 0) {
+        return from_bcd(raw)
+    }
+    return raw
+}
+
 fn idt_set(vector: uint64, handler: uint64) {
     idt[vector * 2] = (handler & 0xffff) | ((uint64)8 << 16) |
                       ((uint64)0x8e00 << 32) |
@@ -222,25 +486,242 @@ fn load_idt() {
     }
 }
 
-@interrupt fn on_timer() {
+fn reap_tasks() {
+    for i: uint64 in 0..8 {
+        if (tasks[i].state == 3 && i != current_task) {
+            if (tasks[i].stack_base != 0) {
+                page_free(tasks[i].stack_base)
+            }
+            tasks[i].stack_base = 0
+            tasks[i].state = 0
+        }
+    }
+}
+
+fn schedule(saved: uint64) -> uint64 {
+    tasks[current_task].stack_pointer = saved
+    if (tasks[current_task].state == 2) {
+        tasks[current_task].state = 1
+    }
+    var next: uint64 = current_task
+    var checked: uint64 = 0
+    var found: uint64 = 0
+    while (checked < 8) {
+        next = (next + 1) % 8
+        checked = checked + 1
+        if (tasks[next].state == 1) {
+            found = 1
+            break
+        }
+    }
+    if (found == 0) {
+        next = current_task
+    }
+    current_task = next
+    tasks[next].state = 2
+    tasks[next].slices = tasks[next].slices + 1
+    reap_tasks()
+    return tasks[next].stack_pointer
+}
+
+fn timer_tick(saved: uint64) -> uint64 {
     ticks = ticks + 1
     outb(0x20, 0x20)
+    if (scheduler_ready == 0) {
+        return saved
+    }
+    return schedule(saved)
+}
+
+@naked fn timer_entry() {
+    asm {
+        push rax
+        push rcx
+        push rdx
+        push rbx
+        push rbp
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
+        mov rdi, rsp
+        call timer_tick
+        mov rsp, rax
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rbp
+        pop rbx
+        pop rdx
+        pop rcx
+        pop rax
+        iretq
+    }
+}
+
+fn task_name_set(slot: uint64, text: cstring) {
+    var i: uint64 = 0
+    while (text[i] != 0 && i < 15) {
+        tasks[slot].name[i] = text[i]
+        i = i + 1
+    }
+    tasks[slot].name[i] = 0
+}
+
+fn task_create(entry: uint64, name: cstring, argument: uint64) -> uint64 {
+    disable_interrupts()
+    var slot: uint64 = 8
+    for i: uint64 in 0..8 {
+        if (tasks[i].state == 0 && slot == 8) {
+            slot = i
+        }
+    }
+    if (slot == 8) {
+        enable_interrupts()
+        return 0
+    }
+    var stack: uint64 = page_alloc()
+    if (stack == 0) {
+        enable_interrupts()
+        return 0
+    }
+    var top: uint64 = stack + 4096
+    var frame: uint64* = (uint64*)(top - 160)
+    for i: uint64 in 0..20 {
+        frame[i] = 0
+    }
+    frame[8] = argument
+    frame[15] = entry
+    frame[16] = 8
+    frame[17] = 0x202
+    frame[18] = top
+    frame[19] = 16
+    tasks[slot].stack_pointer = top - 160
+    tasks[slot].stack_base = stack
+    tasks[slot].slices = 0
+    tasks[slot].stop = 0
+    tasks[slot].value = 0
+    task_name_set(slot, name)
+    tasks[slot].state = 1
+    enable_interrupts()
+    return slot
+}
+
+fn task_exit() {
+    disable_interrupts()
+    tasks[current_task].state = 3
+    enable_interrupts()
+    while (1 == 1) {
+        asm {
+            hlt
+        }
+    }
+}
+
+fn task_sleep(count: uint64) {
+    var target: uint64 = ticks + count
+    while (ticks < target) {
+        asm {
+            hlt
+        }
+    }
+}
+
+fn status_task(argument: uint64) {
+    while (tasks[current_task].stop == 0) {
+        var color: uint8 = 0x1f
+        for i: uint64 in 0..80 {
+            vga_write_cell(1840 + i, 32, color)
+        }
+        draw_text(23, 1, "mettle os", color)
+        draw_text(23, 13, "time", color)
+        draw_two_digits(23, 18, rtc_read(4), color)
+        vga_write_cell(23 * 80 + 20, 58, color)
+        draw_two_digits(23, 21, rtc_read(2), color)
+        vga_write_cell(23 * 80 + 23, 58, color)
+        draw_two_digits(23, 24, rtc_read(0), color)
+        draw_text(23, 29, "up", color)
+        var used: uint64 = draw_number(23, 32, ticks / 100, color)
+        draw_text(23, 32 + used, "s", color)
+        draw_text(23, 40, "free", color)
+        used = draw_number(23, 45, free_page_count * 4096 / 1048576, color)
+        draw_text(23, 45 + used, "mb", color)
+        draw_text(23, 55, "heap", color)
+        used = draw_number(23, 60, heap_used, color)
+        draw_text(23, 60 + used, "b", color)
+        draw_text(23, 68, "tasks", color)
+        var live: uint64 = 0
+        for i: uint64 in 0..8 {
+            if (tasks[i].state != 0) {
+                live = live + 1
+            }
+        }
+        draw_number(23, 74, live, color)
+        task_sleep(25)
+    }
+    task_exit()
+}
+
+fn counter_task(argument: uint64) {
+    var slot: uint64 = current_task
+    var column: uint64 = (slot % 8) * 10
+    while (tasks[slot].stop == 0) {
+        tasks[slot].value = tasks[slot].value + 1
+        for i: uint64 in 0..8 {
+            vga_write_cell(24 * 80 + column + i, 32, 0x0e)
+        }
+        vga_write_cell(24 * 80 + column, 116, 0x0e)
+        var used: uint64 = draw_number(24, column + 1, slot, 0x0e)
+        vga_write_cell(24 * 80 + column + 1 + used, 58, 0x0e)
+        draw_number(24, column + 2 + used, tasks[slot].value, 0x0e)
+        task_sleep(10)
+    }
+    for i: uint64 in 0..10 {
+        vga_write_cell(24 * 80 + column + i, 32, 7)
+    }
+    task_exit()
 }
 
 @interrupt fn on_keyboard() {
     var code: uint8 = inb(0x60)
-    if (code == 0x2a || code == 0x36) {
+    if (code == 0xe0) {
+        extended_code = 1
+        outb(0x20, 0x20)
+        return
+    }
+    var ch: uint8 = 0
+    if (extended_code != 0) {
+        extended_code = 0
+        if (code == 0x48) {
+            ch = 17
+        } else if (code == 0x50) {
+            ch = 18
+        }
+    } else if (code == 0x2a || code == 0x36) {
         shift_held = 1
     } else if (code == 0xaa || code == 0xb6) {
         shift_held = 0
     } else if (code < 0x80) {
-        var ch: uint8 = key_translate(code)
-        if (ch != 0) {
-            var next: uint64 = (key_head + 1) & 127
-            if (next != key_tail) {
-                key_buffer[key_head] = ch
-                key_head = next
-            }
+        ch = key_translate(code)
+    }
+    if (ch != 0) {
+        var next: uint64 = (key_head + 1) & 127
+        if (next != key_tail) {
+            key_buffer[key_head] = ch
+            key_head = next
         }
     }
     outb(0x20, 0x20)
@@ -297,7 +778,7 @@ fn interrupts_init() {
     for vector: uint64 in 32..48 {
         idt_set(vector, (uint64)&on_spurious)
     }
-    idt_set(32, (uint64)&on_timer)
+    idt_set(32, (uint64)&timer_entry)
     idt_set(33, (uint64)&on_keyboard)
     load_idt()
 }
@@ -328,6 +809,16 @@ fn timer_init() {
     outb(0x43, 0x36)
     outb(0x40, (uint8)(divisor & 255))
     outb(0x40, (uint8)((divisor >> 8) & 255))
+}
+
+fn beep(length: uint64) {
+    var divisor: uint64 = 1193182 / 880
+    outb(0x43, 0xb6)
+    outb(0x42, (uint8)(divisor & 255))
+    outb(0x42, (uint8)((divisor >> 8) & 255))
+    outb(0x61, inb(0x61) | 3)
+    task_sleep(length)
+    outb(0x61, inb(0x61) & 0xfc)
 }
 
 fn shifted_letter(ch: uint8) -> uint8 {
@@ -417,17 +908,60 @@ fn key_read() -> uint8 {
     return 0
 }
 
+fn history_store(length: uint64) {
+    if (length == 0) {
+        return
+    }
+    var slot: uint64 = history_count % 8
+    for i: uint64 in 0..128 {
+        if (i < length) {
+            history[slot * 128 + i] = line_buffer[i]
+        } else {
+            history[slot * 128 + i] = 0
+        }
+    }
+    history_count = history_count + 1
+}
+
+fn history_recall(back: uint64, current_length: uint64) -> uint64 {
+    var slot: uint64 = (history_count - back) % 8
+    var i: uint64 = 0
+    while (i < current_length) {
+        put_char(8)
+        i = i + 1
+    }
+    var length: uint64 = 0
+    while (history[slot * 128 + length] != 0 && length < 126) {
+        line_buffer[length] = history[slot * 128 + length]
+        put_char(line_buffer[length])
+        length = length + 1
+    }
+    return length
+}
+
 fn read_line() -> uint64 {
     var length: uint64 = 0
+    var back: uint64 = 0
     while (1 == 1) {
         update_cursor()
         var ch: uint8 = key_read()
         if (ch == 10) {
             put_char(10)
             line_buffer[length] = 0
+            history_store(length)
             return length
         }
-        if (ch == 8) {
+        if (ch == 17) {
+            if (back < history_count && back < 8) {
+                back = back + 1
+                length = history_recall(back, length)
+            }
+        } else if (ch == 18) {
+            if (back > 1) {
+                back = back - 1
+                length = history_recall(back, length)
+            }
+        } else if (ch == 8) {
             if (length > 0) {
                 length = length - 1
                 put_char(8)
@@ -468,17 +1002,114 @@ fn split_command(input: cstring) -> uint64 {
     return i
 }
 
+fn parse_number(text: cstring) -> uint64 {
+    var i: uint64 = 0
+    var value: uint64 = 0
+    var base: uint64 = 10
+    if (text[0] == 48 && (text[1] == 120 || text[1] == 88)) {
+        base = 16
+        i = 2
+    }
+    while (text[i] != 0) {
+        var digit: uint64 = 16
+        if (text[i] >= 48 && text[i] <= 57) {
+            digit = (uint64)text[i] - 48
+        } else if (text[i] >= 97 && text[i] <= 102) {
+            digit = (uint64)text[i] - 87
+        } else if (text[i] >= 65 && text[i] <= 70) {
+            digit = (uint64)text[i] - 55
+        }
+        if (digit >= base) {
+            return value
+        }
+        value = value * base + digit
+        i = i + 1
+    }
+    return value
+}
+
+fn archive_count() -> uint64 {
+    var magic: cstring = (cstring)0x30000
+    if (magic[0] != 77 || magic[1] != 69 || magic[2] != 84 || magic[3] != 84) {
+        return 0
+    }
+    var header: uint32* = (uint32*)0x30008
+    return (uint64)header[0]
+}
+
+fn archive_entry(index: uint64) -> FileEntry* {
+    var entries: FileEntry* = (FileEntry*)0x30010
+    return &entries[index]
+}
+
+fn archive_find(name: cstring) -> FileEntry* {
+    var count: uint64 = archive_count()
+    for i: uint64 in 0..count {
+        var entry: FileEntry* = archive_entry(i)
+        if (text_equals((cstring)&entry->name[0], name) != 0) {
+            return entry
+        }
+    }
+    return (FileEntry*)0
+}
+
+fn command_ls() {
+    var count: uint64 = archive_count()
+    if (count == 0) {
+        write_line("no archive was loaded with the kernel")
+        return
+    }
+    write_line("size      name")
+    for i: uint64 in 0..count {
+        var entry: FileEntry* = archive_entry(i)
+        write_decimal(entry->length)
+        write("        ")
+        write_line((cstring)&entry->name[0])
+    }
+}
+
+fn command_cat(name: cstring) {
+    if (name[0] == 0) {
+        write_line("cat wants a file name, ls lists them")
+        return
+    }
+    var entry: FileEntry* = archive_find(name)
+    if (entry == (FileEntry*)0) {
+        write("no such file ")
+        write_line(name)
+        return
+    }
+    var data: uint8* = (uint8*)(0x30000 + entry->offset)
+    for i: uint64 in 0..entry->length {
+        var ch: uint8 = data[i]
+        if (ch == 10 || (ch >= 32 && ch < 127)) {
+            put_char(ch)
+        }
+    }
+    put_char(10)
+}
+
 fn command_help() {
     write_line("commands")
-    write_line("  help      this list")
-    write_line("  clear     wipe the screen")
-    write_line("  echo      print the rest of the line")
-    write_line("  mem       the memory map the firmware reported")
-    write_line("  uptime    seconds since the timer started")
-    write_line("  cpu       what the processor calls itself")
-    write_line("  banner    draw the greeting again")
-    write_line("  reboot    ask the keyboard controller to reset")
-    write_line("  halt      stop the processor")
+    write_line("  help            this list")
+    write_line("  clear           wipe the screen")
+    write_line("  echo <text>     print the rest of the line")
+    write_line("  mem             memory map, free pages, heap")
+    write_line("  alloc           exercise the heap and report")
+    write_line("  uptime          seconds and ticks since boot")
+    write_line("  date            the clock the firmware keeps")
+    write_line("  cpu             what the processor calls itself")
+    write_line("  ls              files carried in the boot image")
+    write_line("  cat <file>      print one of them")
+    write_line("  ps              the task table")
+    write_line("  spawn           start a counting task")
+    write_line("  kill <id>       ask a task to stop")
+    write_line("  hexdump <addr>  128 bytes of memory")
+    write_line("  beep            a note on the speaker")
+    write_line("  banner          draw the greeting again")
+    write_line("  reboot          pulse the keyboard controller reset")
+    write_line("  halt            stop the processor")
+    write_line("arrow up and down walk the command history")
 }
 
 fn region_kind_name(kind: uint32) -> cstring {
@@ -507,22 +1138,72 @@ fn command_mem() {
     var usable: uint64 = 0
     if (count == 0) {
         write_line("the firmware reported no memory map")
-        return
+    } else {
+        write_line("base                 length               kind")
+        for i: uint64 in 0..count {
+            write_hex(regions[i].base, 16)
+            write("   ")
+            write_hex(regions[i].length, 16)
+            write("   ")
+            write_line(region_kind_name(regions[i].kind))
+            if (regions[i].kind == 1) {
+                usable = usable + regions[i].length
+            }
+        }
+        write("firmware calls ")
+        write_decimal(usable / 1048576)
+        write_line(" mb usable")
     }
-    write_line("base                 length               kind")
-    for i: uint64 in 0..count {
-        write_hex(regions[i].base, 16)
-        write("   ")
-        write_hex(regions[i].length, 16)
-        write("   ")
-        write_line(region_kind_name(regions[i].kind))
-        if (regions[i].kind == 1) {
-            usable = usable + regions[i].length
+    write("pages ")
+    write_decimal(free_page_count)
+    write(" free of ")
+    write_decimal(total_page_count)
+    write(", ")
+    write_decimal(free_page_count * 4096 / 1024)
+    write_line(" kb available")
+    write("heap ")
+    write_decimal(heap_used)
+    write(" bytes handed out of ")
+    write_decimal(heap_bytes)
+    write_line(" bytes claimed")
+}
+
+fn command_alloc() {
+    var blocks: uint64[8]
+    var sizes: uint64[8] = [16, 64, 200, 1000, 32, 512, 24, 700]
+    var failures: uint64 = 0
+    for i: uint64 in 0..8 {
+        blocks[i] = kmalloc(sizes[i])
+        if (blocks[i] == 0) {
+            failures = failures + 1
+        } else {
+            var bytes: uint8* = (uint8*)blocks[i]
+            for j: uint64 in 0..sizes[i] {
+                bytes[j] = (uint8)(i + 1)
+            }
         }
     }
-    write("usable ")
-    write_decimal(usable / 1048576)
-    write_line(" mb")
+    for i: uint64 in 0..8 {
+        if (blocks[i] != 0) {
+            var bytes: uint8* = (uint8*)blocks[i]
+            for j: uint64 in 0..sizes[i] {
+                if (bytes[j] != (uint8)(i + 1)) {
+                    failures = failures + 1
+                }
+            }
+        }
+    }
+    write("eight blocks written and read back, ")
+    write_decimal(failures)
+    write_line(" failures")
+    for i: uint64 in 0..8 {
+        kfree(blocks[i])
+    }
+    write("heap now holds ")
+    write_decimal(heap_used)
+    write(" bytes over ")
+    write_decimal(heap_bytes)
+    write_line(" claimed")
 }
 
 fn command_uptime() {
@@ -534,6 +1215,21 @@ fn command_uptime() {
     write("s over ")
     write_decimal(ticks)
     write_line(" timer ticks")
+}
+
+fn command_date() {
+    write_decimal(2000 + rtc_read(9))
+    put_char(45)
+    write_decimal(rtc_read(8))
+    put_char(45)
+    write_decimal(rtc_read(7))
+    put_char(32)
+    write_decimal(rtc_read(4))
+    put_char(58)
+    write_decimal(rtc_read(2))
+    put_char(58)
+    write_decimal(rtc_read(0))
+    write_line(" by the cmos clock")
 }
 
 fn cpu_vendor(out: uint8*) {
@@ -556,8 +1252,93 @@ fn command_cpu() {
     cpu_vendor(&vendor_buffer[0])
     write("vendor ")
     write_line((cstring)&vendor_buffer[0])
-    write("long mode is on, paging identity maps the first gigabyte")
-    put_char(10)
+    write_line("long mode, one gigabyte identity mapped with two megabyte pages")
+}
+
+fn task_state_name(state: uint64) -> cstring {
+    if (state == 1) {
+        return "ready"
+    }
+    if (state == 2) {
+        return "running"
+    }
+    if (state == 3) {
+        return "leaving"
+    }
+    return "free"
+}
+
+fn command_ps() {
+    write_line("id  state    slices     stack   name")
+    for i: uint64 in 0..8 {
+        if (tasks[i].state != 0) {
+            write_decimal(i)
+            write("   ")
+            write(task_state_name(tasks[i].state))
+            write("  ")
+            write_decimal(tasks[i].slices)
+            write("   ")
+            write_hex(tasks[i].stack_base, 8)
+            write("  ")
+            write_line((cstring)&tasks[i].name[0])
+        }
+    }
+}
+
+fn command_spawn() {
+    var slot: uint64 = task_create((uint64)&counter_task, "counter", 0)
+    if (slot == 0) {
+        write_line("no free task slot or no free page")
+        return
+    }
+    write("task ")
+    write_decimal(slot)
+    write_line(" is counting on the bottom line")
+}
+
+fn command_kill(argument: cstring) {
+    var slot: uint64 = parse_number(argument)
+    if (slot == 0 || slot >= 8) {
+        write_line("kill wants a task id from ps, and the shell cannot be killed")
+        return
+    }
+    if (tasks[slot].state == 0) {
+        write_line("no task there")
+        return
+    }
+    tasks[slot].stop = 1
+    write("asked task ")
+    write_decimal(slot)
+    write_line(" to stop")
+}
+
+fn command_hexdump(argument: cstring) {
+    var address: uint64 = parse_number(argument)
+    if (address == 0) {
+        address = 0x20000
+    }
+    var bytes: uint8* = (uint8*)address
+    for row: uint64 in 0..8 {
+        write_hex(address + row * 16, 16)
+        write("  ")
+        for column: uint64 in 0..16 {
+            var value: uint64 = (uint64)bytes[row * 16 + column]
+            var alphabet: cstring = "0123456789abcdef"
+            put_char(alphabet[(value >> 4) & 15])
+            put_char(alphabet[value & 15])
+            put_char(32)
+        }
+        write(" ")
+        for column: uint64 in 0..16 {
+            var ch: uint8 = bytes[row * 16 + column]
+            if (ch >= 32 && ch < 127) {
+                put_char(ch)
+            } else {
+                put_char(46)
+            }
+        }
+        put_char(10)
+    }
 }
 
 fn command_reboot() {
@@ -578,6 +1359,15 @@ fn banner() {
     write_colored("a kernel compiled straight to a flat image by the mettle compiler", 0x0b)
     put_char(10)
     write_line("type help for the command list")
+    put_char(10)
+}
+
+fn show_motd() {
+    var entry: FileEntry* = archive_find("motd.txt")
+    if (entry == (FileEntry*)0) {
+        return
+    }
+    command_cat("motd.txt")
     put_char(10)
 }
 
@@ -605,12 +1395,48 @@ fn shell_execute(input: cstring) {
         command_mem()
         return
     }
+    if (text_equals(command, "alloc") != 0) {
+        command_alloc()
+        return
+    }
     if (text_equals(command, "uptime") != 0) {
         command_uptime()
         return
     }
+    if (text_equals(command, "date") != 0) {
+        command_date()
+        return
+    }
     if (text_equals(command, "cpu") != 0) {
         command_cpu()
+        return
+    }
+    if (text_equals(command, "ls") != 0) {
+        command_ls()
+        return
+    }
+    if (text_equals(command, "cat") != 0) {
+        command_cat(rest)
+        return
+    }
+    if (text_equals(command, "ps") != 0) {
+        command_ps()
+        return
+    }
+    if (text_equals(command, "spawn") != 0) {
+        command_spawn()
+        return
+    }
+    if (text_equals(command, "kill") != 0) {
+        command_kill(rest)
+        return
+    }
+    if (text_equals(command, "hexdump") != 0) {
+        command_hexdump(rest)
+        return
+    }
+    if (text_equals(command, "beep") != 0) {
+        beep(20)
         return
     }
     if (text_equals(command, "banner") != 0) {
@@ -631,12 +1457,26 @@ fn shell_execute(input: cstring) {
 
 fn kernel_main() -> uint64 {
     attribute = 7
+    serial_init()
     clear_screen()
     banner()
+    memory_init()
     pic_init()
     interrupts_init()
     timer_init()
+
+    for i: uint64 in 0..8 {
+        tasks[i].state = 0
+    }
+    tasks[0].state = 2
+    tasks[0].stack_base = 0x90000
+    task_name_set(0, "shell")
+    current_task = 0
+    scheduler_ready = 1
     enable_interrupts()
+
+    task_create((uint64)&status_task, "status", 0)
+    show_motd()
 
     while (1 == 1) {
         write_colored("mettle> ", 0x0a)

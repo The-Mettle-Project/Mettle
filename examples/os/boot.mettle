@@ -34,7 +34,7 @@
     map_done:
         mov [0x5000], si
 
-        mov cx, 128
+        mov cx, 256
         mov si, 1
         mov bp, 0x2000
     load_next:

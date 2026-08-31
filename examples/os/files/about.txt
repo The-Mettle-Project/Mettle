@@ -1,0 +1,11 @@
+mettle os is a kernel written in mettle and compiled to a flat image.
+
+there is no c library under it, no loader, and no external assembler. the boot
+sector is an asm block the mettle compiler assembles itself. everything above
+it is ordinary mettle: structs, arrays, pointers, and functions.
+
+what runs here:
+  a page allocator built from the memory map the firmware reported
+  a heap that splits and merges blocks on top of those pages
+  a preemptive round robin scheduler driven by the timer interrupt
+  a vga console, a ps2 keyboard, a cmos clock, a serial line

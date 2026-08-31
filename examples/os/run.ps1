@@ -1,6 +1,8 @@
 param(
   [string]$Name = "MettleOS",
   [string]$Image = (Join-Path $PSScriptRoot "mettleos.img"),
+  [string]$SerialLog = (Join-Path $PSScriptRoot "serial.log"),
+  [int]$Memory = 128,
   [switch]$Headless,
   [switch]$Recreate
 )
@@ -21,7 +23,7 @@ if (-not (Test-Path $Image)) {
 }
 
 $existing = & $manage list vms
-$known = $existing -match "^`"$Name`""
+$known = [bool]($existing -match "^`"$Name`"")
 
 if ($known -and $Recreate) {
   & $manage controlvm $Name poweroff 2>$null | Out-Null
@@ -32,13 +34,16 @@ if ($known -and $Recreate) {
 
 if (-not $known) {
   & $manage createvm --name $Name --ostype Other_64 --register
-  & $manage modifyvm $Name --memory 64 --vram 16 --acpi on --ioapic off
-  & $manage modifyvm $Name --boot1 floppy --boot2 none --boot3 none --boot4 none
-  & $manage modifyvm $Name --nic1 none --usb off
   & $manage storagectl $Name --name "Floppy" --add floppy
 }
 
+& $manage modifyvm $Name --memory $Memory --vram 16 --acpi on --ioapic off
+& $manage modifyvm $Name --boot1 floppy --boot2 none --boot3 none --boot4 none
+& $manage modifyvm $Name --nic1 none --usb off
+& $manage modifyvm $Name --uart1 0x3f8 4 --uartmode1 file $SerialLog
 & $manage storageattach $Name --storagectl "Floppy" --port 0 --device 0 --type fdd --medium $Image
 
 $type = if ($Headless) { "headless" } else { "gui" }
 & $manage startvm $Name --type $type
+
+Write-Host "everything the kernel prints is mirrored to $SerialLog"
