@@ -3592,8 +3592,13 @@ try {
     # The crash report is on by default, so this one is checked the other way
     # round: absent when --no-crash-report asks for it to go, present when
     # nothing does. A fault that says nothing is worse than 8 KB.
+    #
+    # The marker is a string on the handler's always-reachable path. A trap
+    # message is not: the Linux runtime is built with -ffunction-sections and
+    # linked with --gc-sections, so the trap reporter is correctly collected
+    # out of a build whose null checks lower to puts+exit instead.
     @{ Name = "crash_handler"; Flag = "";  OffFlag = "--no-crash-report"
-       Marker = "Fatal error: null pointer dereference" },
+       Marker = "Stack trace:" },
     @{ Name = "profile";       Flag = "--profile-runtime"; Marker = "total_us    avg_ns" },
     @{ Name = "debug_hooks";   Flag = "--debug-hooks";     Marker = "not a variable in this frame" }
   )
@@ -13525,7 +13530,7 @@ $runFixtures = @(
   @{ Name = "conversion_surface"; Path = "tests/codegen/conversion_surface.mettle"
      What = "a cast, a named rounding, or a literal read at its destination's width answered wrong" },
   @{ Name = "increment_narrow_agrees"; Path = "tests/codegen/increment_narrow_agrees.mettle"
-     What = "`u++`, `u += 1` and `u = u + 1` stopped agreeing on a sub-word target" },
+     What = "the three increment spellings stopped agreeing on a sub-word target" },
   @{ Name = "unsigned_through_temp"; Path = "tests/codegen/unsigned_through_temp.mettle"
      What = "an unsigned shift, divide or remainder through a temp went signed" },
   @{ Name = "if_convert_accumulate"; Path = "tests/codegen/if_convert_accumulate.mettle"
