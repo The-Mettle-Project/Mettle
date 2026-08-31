@@ -1,0 +1,65 @@
+import "process"
+import "clock"
+
+var ticks_done: uint64[16]
+
+export fn jobs_progress(slot: uint64) -> uint64 {
+    return ticks_done[slot]
+}
+
+fn counter_body(argument: uint64) {
+    var slot: uint64 = process_current()
+    ticks_done[slot] = 0
+    while (!process_stop_wanted()) {
+        ticks_done[slot]++
+        process_sleep(CLOCK_HZ / 10)
+    }
+    process_exit(ticks_done[slot] % 256)
+}
+
+fn worker_body(argument: uint64) {
+    var slot: uint64 = process_current()
+    var deadline: uint64 = clock_ticks() + argument
+    ticks_done[slot] = 0
+    while (clock_ticks() < deadline && !process_stop_wanted()) {
+        ticks_done[slot]++
+    }
+    process_exit(7)
+}
+
+fn sleeper_body(argument: uint64) {
+    process_sleep(argument)
+    process_exit(0)
+}
+
+fn mailbox_body(argument: uint64) {
+    var slot: uint64 = process_current()
+    var total: uint64 = 0
+    ticks_done[slot] = 0
+    while (!process_stop_wanted()) {
+        var message: uint64 = process_receive()
+        if (message == 0) {
+            process_exit(total % 256)
+        }
+        total += message
+        ticks_done[slot] = total
+    }
+    process_exit(total % 256)
+}
+
+export fn jobs_mailbox() -> uint64 {
+    return process_spawn((uint64)&mailbox_body, "mailbox", PRIORITY_NORMAL, 0)
+}
+
+export fn jobs_counter(priority: uint64) -> uint64 {
+    return process_spawn((uint64)&counter_body, "counter", priority, 0)
+}
+
+export fn jobs_worker(milliseconds: uint64, priority: uint64) -> uint64 {
+    return process_spawn((uint64)&worker_body, "worker", priority, milliseconds)
+}
+
+export fn jobs_sleeper(milliseconds: uint64) -> uint64 {
+    return process_spawn((uint64)&sleeper_body, "sleeper", PRIORITY_LOW,
+                         milliseconds)
+}

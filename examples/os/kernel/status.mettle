@@ -1,16 +1,13 @@
 import "layout"
 import "vga"
 import "clock"
-import "task"
+import "process"
 import "page"
 import "heap"
 
 const STATUS_ROW: uint64 = 23
-const COUNTER_ROW: uint64 = 24
 const FIELD_GAP: uint64 = 3
 const STATUS_PERIOD: uint64 = CLOCK_HZ / 4
-const COUNTER_PERIOD: uint64 = CLOCK_HZ / 10
-const COUNTER_WIDTH: uint64 = 10
 
 fn label(column: uint64, text: cstring) -> uint64 {
     return column + vga_draw_text(STATUS_ROW, column, text, COLOR_STATUS) + 1
@@ -41,48 +38,19 @@ fn draw_status_bar() {
     at = field(at, "up", clock_seconds(), "s")
     at = field(at, "free", page_free_bytes() / BYTES_PER_MB, "mb")
     at = field(at, "heap", heap_used(), "b")
-    field(at, "tasks", task_live_count(), "")
+    field(at, "tasks", process_count(), "")
 }
 
-fn status_task() {
-    var slot: uint64 = task_current()
-    while (!task_should_stop(slot)) {
+fn status_task(argument: uint64) {
+    while (!process_stop_wanted()) {
         draw_status_bar()
-        clock_sleep(STATUS_PERIOD)
+        process_sleep(STATUS_PERIOD)
     }
-    task_exit()
-}
-
-fn draw_counter(slot: uint64, value: uint64) {
-    var column: uint64 = slot * COUNTER_WIDTH
-    for i: uint64 in 0..COUNTER_WIDTH {
-        vga_cell(vga_index(COUNTER_ROW, column + i), ' ', COLOR_COUNTER)
-    }
-    var at: uint64 = column
-    at += vga_draw_text(COUNTER_ROW, at, "t", COLOR_COUNTER)
-    at += vga_draw_number(COUNTER_ROW, at, slot, COLOR_COUNTER)
-    at += vga_draw_text(COUNTER_ROW, at, ":", COLOR_COUNTER)
-    vga_draw_number(COUNTER_ROW, at, value, COLOR_COUNTER)
-}
-
-fn counter_task() {
-    var slot: uint64 = task_current()
-    var value: uint64 = 0
-    while (!task_should_stop(slot)) {
-        value++
-        draw_counter(slot, value)
-        clock_sleep(COUNTER_PERIOD)
-    }
-    for i: uint64 in 0..COUNTER_WIDTH {
-        vga_cell(vga_index(COUNTER_ROW, slot * COUNTER_WIDTH + i), ' ', COLOR_TEXT)
-    }
-    task_exit()
+    process_exit(0)
 }
 
 export fn status_start() -> uint64 {
-    return task_create((uint64)&status_task, "status")
+    return process_spawn((uint64)&status_task, "status", PRIORITY_LOW, 0)
 }
 
-export fn counter_start() -> uint64 {
-    return task_create((uint64)&counter_task, "counter")
-}
+

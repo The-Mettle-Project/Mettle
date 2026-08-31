@@ -6,7 +6,7 @@ import "theme"
 import "window"
 import "terminal"
 import "archive"
-import "task"
+import "process"
 import "clock"
 import "page"
 import "heap"
@@ -141,23 +141,33 @@ export fn app_viewer_open(index: uint64) -> uint64 {
 fn tasks_draw(id: uint64) {
     video_fill(window_content_x(id), window_content_y(id),
                window_content_width(id), window_content_height(id), WINDOW_BODY)
-    label(id, 0, "id   state     slices    name", WINDOW_FAINT)
+    var left: uint64 = window_content_x(id) + PAD
+    label(id, 0, "pid  name        state     pri     cpu%", WINDOW_FAINT)
     var line: uint64 = 1
-    for slot: uint64 in 0..TASK_SLOTS {
-        if (task_in_use(slot)) {
-            var left: uint64 = window_content_x(id) + PAD
+    for slot: uint64 in 0..PROCESS_SLOTS {
+        if (process_live(slot)) {
             var top: uint64 = line_y(id, line)
-            font_draw_number(left, top, slot, ACCENT)
-            font_draw_text(left + 40, top, task_state_name(slot), WINDOW_TEXT)
-            font_draw_number(left + 130, top, task_slices(slot), WINDOW_FAINT)
-            font_draw_text(left + 210, top, task_name(slot), WINDOW_TEXT)
+            font_draw_number(left, top, process_pid(slot), ACCENT)
+            font_draw_text(left + 40, top, process_name(slot), WINDOW_TEXT)
+            font_draw_text(left + 136, top, process_state_name(slot), WINDOW_TEXT)
+            font_draw_text(left + 216, top, process_priority_name(slot),
+                           WINDOW_FAINT)
+            var at: uint64 = left + 280
+            at += font_draw_number(at, top, process_percent(slot), WINDOW_TEXT)
+            font_draw_text(at, top, "%", WINDOW_FAINT)
             line++
         }
     }
+    var footer: uint64 = line_y(id, line + 1)
+    var at: uint64 = left
+    at += font_draw_number(at, footer, process_count(), ACCENT)
+    at += font_draw_text(at, footer, " processes, ", WINDOW_FAINT)
+    at += font_draw_number(at, footer, process_switch_count(), ACCENT)
+    font_draw_text(at, footer, " switches", WINDOW_FAINT)
 }
 
 export fn app_tasks_open() -> uint64 {
-    return window_open_plain(KIND_TASKS, 300, 120, 380, 250, "tasks",
+    return window_open_plain(KIND_TASKS, 300, 110, 400, 330, "processes",
                              &tasks_draw)
 }
 

@@ -52,6 +52,22 @@ export fn cpu_disable_interrupts() {
     }
 }
 
+export fn cpu_interrupts_on() -> bool {
+    var flags: uint64 = 0
+    asm {
+        pushfq
+        pop rax
+        mov {flags}, rax
+    }
+    return (flags & 0x200) != 0
+}
+
+export fn cpu_restore_interrupts(was_on: bool) {
+    if (was_on) {
+        cpu_enable_interrupts()
+    }
+}
+
 export fn cpu_halt() {
     asm {
         hlt

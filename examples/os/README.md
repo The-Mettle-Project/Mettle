@@ -15,10 +15,13 @@ compiled to a flat image with `--target x86_64-none`.
 - **Memory.** The boot sector asks the firmware for the E820 map. The kernel
   turns every usable region above 2 MB into a free page list, and runs a heap
   on top of it that splits blocks on allocation and merges neighbours on free.
-- **Tasks.** A preemptive round robin scheduler, switched from the timer
-  interrupt. Each task gets a page of stack, an entry in the task table, and a
-  time slice. Tasks that finish are reaped and their stack goes back to the
-  page list.
+- **Processes.** A process has a pid, a parent, a priority, a state, its own
+  stack, the pages it claimed, and accounting for the ticks it has burned. The
+  scheduler runs on the timer: highest ready priority first, round robin inside
+  a level, with anything passed over for a quarter second promoted so nothing
+  starves, and an idle process when nothing is ready. Sleeping and blocking are
+  real, so a waiting process costs nothing. Exits leave a zombie holding an
+  exit code until a parent waits for it.
 - **Time.** A 100 Hz PIT timer, and the CMOS clock read through ports 0x70
   and 0x71.
 - **Input.** A PS/2 keyboard on IRQ1 filling a ring buffer, with shift,
@@ -78,7 +81,8 @@ nothing reaches into another module's globals.
 | `clock` | The timer, the CMOS clock, sleeping, and the speaker. |
 | `page` | The firmware memory map and the free page list built from it. |
 | `heap` | Splitting and merging blocks inside pages. |
-| `task` | The task table, the scheduler, and the context switch. |
+| `process` | The process table, states, priorities, scheduling, sleep, wait channels, exits. |
+| `jobs` | Demonstration processes: counters, processor burners, sleepers. |
 | `keyboard` | Scancodes to characters, and the ring buffer between them. |
 | `archive` | The files packed into the boot image. |
 | `shell` | The command registry, the line editor, and the history. |
@@ -195,8 +199,8 @@ title bar, minimise it to the taskbar, maximise it to fill the work area, close
 it with the red button. A taskbar button raises its window, or minimises it
 again if it is already in front. The terminal window runs the shell, and the
 keyboard goes to whichever window is in front. The files window lists what the
-boot image carried; click a file to read it. The tasks window is the
-scheduler's own table, redrawn as it changes.
+boot image carried; click a file to read it. The processes window is the
+scheduler's own table with live processor shares, redrawn every second.
 
 If the firmware offers no 32-bit linear framebuffer, the kernel says so on the
 serial line and falls back to the 80x25 text console with the same shell and
@@ -216,9 +220,13 @@ the same commands.
 | `cpu` | The processor's vendor string, read with `cpuid` |
 | `ls` | The files carried in the boot image |
 | `cat <file>` | Print one of them |
-| `ps` | The task table with state, slices, and stack |
-| `spawn` | Start a task that counts on the bottom line |
-| `kill <id>` | Ask a task to stop |
+| `ps` | Every process with state, priority, processor share, and parent |
+| `top` | The same, ordered by processor share |
+| `spawn <n>` | Start counter processes |
+| `work <ms>` | Start a process that burns the processor |
+| `wait <pid>` | Block until a process exits, then read its exit code |
+| `kill <pid>` | Ask a process to stop |
+| `nice <pid> <level>` | Move a process between high, normal and low |
 | `hexdump <addr>` | 128 bytes of memory, hex and text |
 | `beep` | A note on the speaker |
 | `banner` | Draw the greeting again |

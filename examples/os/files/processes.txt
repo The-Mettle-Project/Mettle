@@ -1,0 +1,46 @@
+processes, and what the kernel keeps for each one:
+
+  a pid that is never reused, the pid of its parent, a state, a priority, the
+  stack it owns, the pages it claimed, how many ticks it has burned, how many
+  times it has been switched to, when it started, and the code it exited with
+
+states: ready, running, sleeping until a deadline, blocked on a channel,
+zombie until its parent collects it, free
+
+the scheduler runs on the timer, a thousand times a second. it charges the
+running process a tick, wakes any sleeper whose deadline has passed, and when
+the running process has spent its quantum it picks again. it takes the highest
+priority process that is ready, round robin inside that level, except that
+anything ready and passed over for a quarter of a second is treated as top
+priority so nothing starves. when nothing is ready the idle process halts.
+
+sleeping is real sleeping. a process that sleeps or blocks is skipped by the
+scheduler until its deadline passes or someone wakes its channel, so it costs
+nothing while it waits. the shell blocks on the terminal key channel, and the
+keystroke that arrives wakes it.
+
+exiting is real too. a process that exits becomes a zombie holding its exit
+code, its stack is handed back on the next switch, and the pages it claimed are
+released. a parent reads the code with wait, and the idle process collects the
+zombies whose parent is already gone.
+
+processes talk to each other by mail. every process has a small mailbox, and a
+send wakes it if it was blocked waiting on one. a process that exits hands its
+children to pid one first, so nobody is left pointing at a parent that is gone.
+
+each stack carries a guard word at its lowest address. the scheduler checks it
+every time it switches away from a process, and a process that has run off the
+bottom of its own stack is stopped and reported rather than left to corrupt
+whatever it landed on.
+
+try it from the shell:
+
+  ps            every process, with its state, priority and processor share
+  top           the same, ordered by processor share
+  work 3000     a process that burns the processor for three seconds
+  wait 7        block until that pid exits, then read its code
+  spawn 3       three counters that wake ten times a second
+  nice 8 low    move one down a priority
+  kill 8        ask one to stop
+  mailbox       a process that blocks until mail arrives
+  send 9 5      post it a number, and zero to make it exit

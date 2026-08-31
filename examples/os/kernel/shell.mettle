@@ -2,8 +2,9 @@ import "console"
 import "vga"
 import "keyboard"
 import "text"
+import "process"
 
-const COMMAND_SLOTS: uint64 = 24
+const COMMAND_SLOTS: uint64 = 32
 const HISTORY_SLOTS: uint64 = 8
 const LINE_BYTES: uint64 = 128
 const LINE_LIMIT: uint64 = LINE_BYTES - 2
@@ -16,7 +17,7 @@ struct Command {
     handler: fn(cstring) -> void;
 }
 
-var commands: Command[24]
+var commands: Command[32]
 var count: uint64 = 0
 
 var line: uint8[128]
@@ -104,10 +105,14 @@ fn read_line(read_key: fn() -> uint8) -> uint64 {
                 length--
                 console_put(KEY_BACKSPACE)
             }
-        } else if (length < LINE_LIMIT) {
+        } else if (ch != 0 && length < LINE_LIMIT) {
             line[length] = ch
             length++
             console_put(ch)
+        }
+        if (process_stop_wanted()) {
+            line[length] = 0
+            return length
         }
     }
     return 0
@@ -143,9 +148,10 @@ export fn shell_dispatch(input: cstring) {
 }
 
 export fn shell_run(read_key: fn() -> uint8) {
-    while (true) {
+    while (!process_stop_wanted()) {
         console_write_colored("mettle> ", COLOR_PROMPT)
         read_line(read_key)
         shell_dispatch((cstring)&line[0])
     }
+    process_exit(0)
 }

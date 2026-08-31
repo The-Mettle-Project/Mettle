@@ -5,9 +5,10 @@ import "vga"
 import "page"
 import "heap"
 import "clock"
-import "task"
+import "process"
 import "archive"
 import "status"
+import "jobs"
 import "shell"
 import "text"
 
@@ -177,45 +178,203 @@ export fn cmd_cat(argument: cstring) {
     console_put('\n')
 }
 
-fn cmd_ps(argument: cstring) {
-    console_write_line("id  state    slices   stack       name")
-    for i: uint64 in 0..TASK_SLOTS {
-        if (task_in_use(i)) {
-            console_write_padded(i, 4)
-            console_pad(task_state_name(i), 9)
-            console_write_padded(task_slices(i), 9)
-            console_write_hex(task_stack_base(i), 8)
-            console_write("  ")
-            console_write_line(task_name(i))
-        }
-    }
+fn print_row(slot: uint64) {
+    console_write_padded(process_pid(slot), 5)
+    console_pad(process_name(slot), 12)
+    console_pad(process_state_name(slot), 10)
+    console_pad(process_priority_name(slot), 8)
+    console_write_padded(process_percent(slot), 5)
+    console_write_padded(process_cpu_ticks(slot), 8)
+    console_write_padded(process_slices(slot), 8)
+    console_write_decimal(process_parent(slot))
+    console_write_line("")
 }
 
-fn cmd_spawn(argument: cstring) {
-    var slot: uint64 = counter_start()
-    if (slot >= TASK_SLOTS) {
-        console_write_line("no free task slot or no free page")
-        return
+fn print_header() {
+    console_write_line("pid  name        state     pri     cpu%   cpu ms  switches parent")
+}
+
+fn print_totals() {
+    console_write_decimal(process_count())
+    console_write(" processes, ")
+    console_write_decimal(process_switch_count())
+    console_write_line(" context switches")
+}
+
+fn cmd_ps(argument: cstring) {
+    print_header()
+    for slot: uint64 in 0..PROCESS_SLOTS {
+        if (process_live(slot)) {
+            print_row(slot)
+        }
     }
-    console_write("task ")
-    console_write_decimal(slot)
-    console_write_line(" is counting on the bottom line")
+    print_totals()
+}
+
+fn cmd_top(argument: cstring) {
+    var seen: uint64[16]
+    for i: uint64 in 0..PROCESS_SLOTS {
+        seen[i] = 0
+    }
+    print_header()
+    for round: uint64 in 0..PROCESS_SLOTS {
+        var best: uint64 = PROCESS_SLOTS
+        for slot: uint64 in 0..PROCESS_SLOTS {
+            if (process_live(slot) && seen[slot] == 0) {
+                if (best == PROCESS_SLOTS ||
+                    process_percent(slot) > process_percent(best)) {
+                    best = slot
+                }
+            }
+        }
+        if (best == PROCESS_SLOTS) {
+            print_totals()
+            return
+        }
+        seen[best] = 1
+        print_row(best)
+    }
+    print_totals()
+}
+
+fn rest_after_word(argument: cstring) -> uint64 {
+    var i: uint64 = 0
+    while (argument[i] != 0 && argument[i] != ' ') {
+        i++
+    }
+    while (argument[i] == ' ') {
+        i++
+    }
+    return i
 }
 
 fn cmd_kill(argument: cstring) {
-    var slot: uint64 = text_parse_number(argument)
-    if (slot == 0 || slot >= TASK_SLOTS) {
-        console_write_line("kill wants a task id from ps, and the shell cannot be killed")
+    var pid: uint64 = text_parse_number(argument)
+    if (pid == 0) {
+        console_write_line("kill wants a pid from ps")
         return
     }
-    if (!task_in_use(slot)) {
-        console_write_line("no task there")
+    if (!process_kill(pid)) {
+        console_write_line("no such process, or it may not be killed")
         return
     }
-    task_request_stop(slot)
-    console_write("asked task ")
-    console_write_decimal(slot)
+    console_write("asked ")
+    console_write_decimal(pid)
     console_write_line(" to stop")
+}
+
+fn cmd_nice(argument: cstring) {
+    var pid: uint64 = text_parse_number(argument)
+    var rest: cstring = (cstring)&argument[rest_after_word(argument)]
+    var priority: uint64 = PRIORITY_COUNT
+    if (text_equals(rest, "high")) {
+        priority = PRIORITY_HIGH
+    } else if (text_equals(rest, "normal")) {
+        priority = PRIORITY_NORMAL
+    } else if (text_equals(rest, "low")) {
+        priority = PRIORITY_LOW
+    }
+    if (pid == 0 || priority == PRIORITY_COUNT) {
+        console_write_line("nice wants a pid and one of high, normal, low")
+        return
+    }
+    if (!process_set_priority(pid, priority)) {
+        console_write_line("no such process")
+        return
+    }
+    console_write("pid ")
+    console_write_decimal(pid)
+    console_write(" now runs at ")
+    console_write_line(rest)
+}
+
+fn cmd_spawn(argument: cstring) {
+    var count: uint64 = text_parse_number(argument)
+    if (count == 0) {
+        count = 1
+    }
+    for i: uint64 in 0..count {
+        var pid: uint64 = jobs_counter(PRIORITY_LOW)
+        if (pid == 0) {
+            console_write_line("no free process slot or no free page")
+            return
+        }
+        console_write("started counter as pid ")
+        console_write_decimal(pid)
+        console_write_line("")
+    }
+}
+
+fn cmd_work(argument: cstring) {
+    var span: uint64 = text_parse_number(argument)
+    if (span == 0) {
+        span = 500
+    }
+    var pid: uint64 = jobs_worker(span, PRIORITY_NORMAL)
+    if (pid == 0) {
+        console_write_line("no free process slot or no free page")
+        return
+    }
+    console_write("pid ")
+    console_write_decimal(pid)
+    console_write(" is burning cpu for ")
+    console_write_decimal(span)
+    console_write_line(" ms, watch it in top")
+}
+
+fn cmd_mailbox(argument: cstring) {
+    var pid: uint64 = jobs_mailbox()
+    if (pid == 0) {
+        console_write_line("no free process slot or no free page")
+        return
+    }
+    console_write("pid ")
+    console_write_decimal(pid)
+    console_write_line(" is blocked waiting for mail, send it a number")
+}
+
+fn cmd_send(argument: cstring) {
+    var pid: uint64 = text_parse_number(argument)
+    var rest: cstring = (cstring)&argument[rest_after_word(argument)]
+    var message: uint64 = text_parse_number(rest)
+    if (pid == 0) {
+        console_write_line("send wants a pid and a number, zero ends it")
+        return
+    }
+    if (!process_send(pid, message)) {
+        console_write_line("no such process, or its mailbox is full")
+        return
+    }
+    console_write("sent ")
+    console_write_decimal(message)
+    console_write(" to ")
+    console_write_decimal(pid)
+    console_write_line("")
+}
+
+fn cmd_wait(argument: cstring) {
+    var pid: uint64 = text_parse_number(argument)
+    if (pid == 0) {
+        console_write_line("wait wants a pid")
+        return
+    }
+    if (process_slot_of(pid) == NO_PROCESS) {
+        console_write_line("no such process")
+        return
+    }
+    if (pid == process_pid(process_current())) {
+        console_write_line("a process cannot wait for itself")
+        return
+    }
+    console_write("waiting for ")
+    console_write_decimal(pid)
+    console_write_line("")
+    var code: uint64 = process_wait(pid)
+    console_write("pid ")
+    console_write_decimal(pid)
+    console_write(" exited with ")
+    console_write_decimal(code)
+    console_write_line("")
 }
 
 fn dump_row(bytes: uint8*, offset: uint64) {
@@ -285,9 +444,15 @@ export fn commands_init() {
     shell_register("cpu", "what the processor calls itself", &cmd_cpu)
     shell_register("ls", "files carried in the boot image", &cmd_ls)
     shell_register("cat", "print one of them", &cmd_cat)
-    shell_register("ps", "the task table", &cmd_ps)
-    shell_register("spawn", "start a counting task", &cmd_spawn)
-    shell_register("kill", "ask a task to stop", &cmd_kill)
+    shell_register("ps", "the process table", &cmd_ps)
+    shell_register("top", "processes by processor share", &cmd_top)
+    shell_register("spawn", "start counter processes", &cmd_spawn)
+    shell_register("work", "burn processor for a while", &cmd_work)
+    shell_register("wait", "wait for a process and read its code", &cmd_wait)
+    shell_register("kill", "ask a process to stop", &cmd_kill)
+    shell_register("nice", "change a process priority", &cmd_nice)
+    shell_register("mailbox", "start a process that waits for mail", &cmd_mailbox)
+    shell_register("send", "send a number to a process", &cmd_send)
     shell_register("hexdump", "128 bytes of memory", &cmd_hexdump)
     shell_register("beep", "a note on the speaker", &cmd_beep)
     shell_register("banner", "draw the greeting again", &cmd_banner)

@@ -9,6 +9,7 @@ import "mouse"
 import "cursor"
 import "keyboard"
 import "clock"
+import "process"
 import "console"
 
 const TASKBAR_HEIGHT: uint64 = 30
@@ -583,11 +584,15 @@ export fn desktop_run() {
             if (open_clock < WINDOW_SLOTS && !window_hidden(open_clock)) {
                 mark_window(open_clock)
             }
+            var monitor: uint64 = window_of_kind(KIND_TASKS)
+            if (monitor < WINDOW_SLOTS && !window_hidden(monitor)) {
+                mark_window(monitor)
+            }
         }
         flush()
         if (!cursor_on_gpu()) {
             software_cursor_show()
         }
-        clock_sleep(1)
+        process_sleep(1)
     }
 }

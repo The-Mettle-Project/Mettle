@@ -7,7 +7,8 @@ import "kernel/interrupt"
 import "kernel/clock"
 import "kernel/page"
 import "kernel/heap"
-import "kernel/task"
+import "kernel/process"
+import "kernel/jobs"
 import "kernel/keyboard"
 import "kernel/archive"
 import "kernel/shell"
@@ -43,7 +44,7 @@ fn show_motd() {
     }
 }
 
-fn shell_task() {
+fn shell_task(argument: uint64) {
     console_write_line("")
     cmd_banner("")
     show_motd()
@@ -57,7 +58,7 @@ fn machine_init() {
     pic_init()
     interrupt_init()
     clock_init()
-    task_init()
+    process_init()
     keyboard_init()
     cpu_enable_interrupts()
     commands_init()
@@ -89,7 +90,7 @@ fn desktop_mode() {
     terminal_clear()
     desktop_init()
     app_terminal_open()
-    task_create((uint64)&shell_task, "shell")
+    process_spawn((uint64)&shell_task, "shell", PRIORITY_NORMAL, 0)
     desktop_run()
 }
 

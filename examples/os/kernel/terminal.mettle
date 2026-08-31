@@ -2,7 +2,7 @@ import "video"
 import "font"
 import "theme"
 import "port"
-import "task"
+import "process"
 
 export const TERMINAL_COLUMNS: uint64 = 80
 export const TERMINAL_ROWS: uint64 = 25
@@ -10,6 +10,7 @@ export const TERMINAL_ROWS: uint64 = 25
 const CELLS: uint64 = 2000
 const KEY_SLOTS: uint64 = 64
 const KEY_MASK: uint64 = 63
+const KEY_CHANNEL: uint64 = 0x7e21
 
 var glyphs: uint8[2000]
 var tints: uint8[2000]
@@ -18,7 +19,6 @@ var row: uint64 = 0
 var tint: uint8 = 7
 var dirty: volatile uint64 = 1
 
-var reader: uint64 = 8
 var keys: uint8[64]
 var head: volatile uint64 = 0
 var tail: volatile uint64 = 0
@@ -131,13 +131,15 @@ export fn terminal_push_key(ch: uint8) {
         keys[head] = ch
         head = next
     }
-    task_wake(reader)
+    process_wake_channel(KEY_CHANNEL)
 }
 
 export fn terminal_read_key() -> uint8 {
     while (head == tail) {
-        reader = task_current()
-        task_wait()
+        if (process_stop_wanted()) {
+            return 0
+        }
+        process_block(KEY_CHANNEL)
     }
     var ch: uint8 = keys[tail]
     tail = (tail + 1) & KEY_MASK

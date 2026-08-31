@@ -1,0 +1,730 @@
+import "port"
+import "layout"
+import "page"
+import "clock"
+import "interrupt"
+import "console"
+
+export const PROCESS_SLOTS: uint64 = 16
+export const PRIORITY_HIGH: uint64 = 0
+export const PRIORITY_NORMAL: uint64 = 1
+export const PRIORITY_LOW: uint64 = 2
+export const PRIORITY_IDLE: uint64 = 3
+export const PRIORITY_COUNT: uint64 = 4
+export const NO_PROCESS: uint64 = 16
+export const OWNED_PAGES: uint64 = 8
+export const MAIL_SLOTS: uint64 = 8
+
+const NAME_BYTES: uint64 = 16
+const FRAME_SLOTS: uint64 = 20
+const FRAME_BYTES: uint64 = FRAME_SLOTS * 8
+const FLAGS_INTERRUPTS_ON: uint64 = 0x202
+const STARVED_TICKS: uint64 = 250
+const STACK_PAGES: uint64 = 2
+const STACK_GUARD: uint64 = 0x5354414b4755
+const MAIL_CHANNEL: uint64 = 0x4d41494c00
+const EXIT_STACK_BROKEN: uint64 = 0xdead
+
+export enum ProcessState {
+    Free = 0,
+    Ready = 1,
+    Running = 2,
+    Sleeping = 3,
+    Blocked = 4,
+    Zombie = 5
+}
+
+struct SwitchFrame {
+    r15: uint64;
+    r14: uint64;
+    r13: uint64;
+    r12: uint64;
+    r11: uint64;
+    r10: uint64;
+    r9: uint64;
+    r8: uint64;
+    rdi: uint64;
+    rsi: uint64;
+    rbp: uint64;
+    rbx: uint64;
+    rdx: uint64;
+    rcx: uint64;
+    rax: uint64;
+    rip: uint64;
+    cs: uint64;
+    flags: uint64;
+    rsp: uint64;
+    ss: uint64;
+}
+
+struct Process {
+    pid: uint64;
+    parent: uint64;
+    stack_pointer: uint64;
+    stack_base: uint64;
+    stack_bytes: uint64;
+    state: ProcessState;
+    priority: uint64;
+    quantum: uint64;
+    slices: uint64;
+    cpu_ticks: uint64;
+    window_ticks: uint64;
+    percent: uint64;
+    started: uint64;
+    ready_since: uint64;
+    wake_at: uint64;
+    channel: uint64;
+    exit_code: uint64;
+    stop_wanted: uint64;
+    page_count: uint64;
+    mail_head: uint64;
+    mail_tail: uint64;
+    mail: uint64[8];
+    pages: uint64[8];
+    name: uint8[16];
+}
+
+var table: Process[16]
+var current: uint64 = 0
+var next_pid: uint64 = 1
+var idle_slot: uint64 = NO_PROCESS
+var switches: uint64 = 0
+var window_start: uint64 = 0
+var quantum_for: uint64[4] = [8, 12, 20, 2]
+var broken_stacks: uint64 = 0
+var broken_pid: uint64 = 0
+var reported_stacks: uint64 = 0
+
+fn now() -> uint64 {
+    return clock_ticks()
+}
+
+export fn process_current() -> uint64 {
+    return current
+}
+
+export fn process_pid(slot: uint64) -> uint64 {
+    return table[slot].pid
+}
+
+export fn process_slot_of(pid: uint64) -> uint64 {
+    for i: uint64 in 0..PROCESS_SLOTS {
+        if (table[i].state != ProcessState.Free && table[i].pid == pid) {
+            return i
+        }
+    }
+    return NO_PROCESS
+}
+
+export fn process_live(slot: uint64) -> bool {
+    return slot < PROCESS_SLOTS && table[slot].state != ProcessState.Free
+}
+
+export fn process_name(slot: uint64) -> cstring {
+    return (cstring)&table[slot].name[0]
+}
+
+export fn process_parent(slot: uint64) -> uint64 {
+    return table[slot].parent
+}
+
+export fn process_priority(slot: uint64) -> uint64 {
+    return table[slot].priority
+}
+
+export fn process_slices(slot: uint64) -> uint64 {
+    return table[slot].slices
+}
+
+export fn process_cpu_ticks(slot: uint64) -> uint64 {
+    return table[slot].cpu_ticks
+}
+
+export fn process_percent(slot: uint64) -> uint64 {
+    return table[slot].percent
+}
+
+export fn process_age(slot: uint64) -> uint64 {
+    return now() - table[slot].started
+}
+
+export fn process_stack_base(slot: uint64) -> uint64 {
+    return table[slot].stack_base
+}
+
+export fn process_stack_bytes(slot: uint64) -> uint64 {
+    return table[slot].stack_bytes
+}
+
+export fn process_exit_code(slot: uint64) -> uint64 {
+    return table[slot].exit_code
+}
+
+export fn process_switch_count() -> uint64 {
+    return switches
+}
+
+export fn process_state(slot: uint64) -> ProcessState {
+    return table[slot].state
+}
+
+export fn process_state_name(slot: uint64) -> cstring {
+    switch ((int32)table[slot].state) {
+        case 1: { return "ready" }
+        case 2: { return "running" }
+        case 3: { return "sleeping" }
+        case 4: { return "blocked" }
+        case 5: { return "zombie" }
+        default: { return "free" }
+    }
+}
+
+export fn process_priority_name(slot: uint64) -> cstring {
+    if (table[slot].priority == PRIORITY_HIGH) {
+        return "high"
+    }
+    if (table[slot].priority == PRIORITY_NORMAL) {
+        return "normal"
+    }
+    if (table[slot].priority == PRIORITY_LOW) {
+        return "low"
+    }
+    return "idle"
+}
+
+export fn process_count() -> uint64 {
+    var live: uint64 = 0
+    for i: uint64 in 0..PROCESS_SLOTS {
+        if (table[i].state != ProcessState.Free) {
+            live++
+        }
+    }
+    return live
+}
+
+fn set_name(slot: uint64, text: cstring) {
+    var i: uint64 = 0
+    while (text[i] != 0 && i + 1 < NAME_BYTES) {
+        table[slot].name[i] = text[i]
+        i++
+    }
+    table[slot].name[i] = 0
+}
+
+fn make_ready(slot: uint64) {
+    table[slot].state = ProcessState.Ready
+    table[slot].ready_since = now()
+}
+
+fn release_stack(slot: uint64) {
+    var page: uint64 = table[slot].stack_base
+    while (page != 0 && page < table[slot].stack_base + table[slot].stack_bytes) {
+        page_free(page)
+        page += PAGE_SIZE
+    }
+    table[slot].stack_base = 0
+    table[slot].stack_bytes = 0
+}
+
+fn release_pages(slot: uint64) {
+    for i: uint64 in 0..table[slot].page_count {
+        page_free(table[slot].pages[i])
+    }
+    table[slot].page_count = 0
+}
+
+export fn process_claim_page() -> uint64 {
+    if (table[current].page_count >= OWNED_PAGES) {
+        return 0
+    }
+    var page: uint64 = page_alloc()
+    if (page == 0) {
+        return 0
+    }
+    table[current].pages[table[current].page_count] = page
+    table[current].page_count++
+    return page
+}
+
+export fn process_owned_pages(slot: uint64) -> uint64 {
+    return table[slot].page_count
+}
+
+fn free_slot() -> uint64 {
+    for i: uint64 in 0..PROCESS_SLOTS {
+        if (table[i].state == ProcessState.Free) {
+            return i
+        }
+    }
+    return NO_PROCESS
+}
+
+fn claim_stack(slot: uint64) -> uint64 {
+    var first: uint64 = page_alloc()
+    if (first == 0) {
+        return 0
+    }
+    var second: uint64 = page_alloc()
+    if (second == 0) {
+        table[slot].stack_bytes = PAGE_SIZE
+        return first
+    }
+    if (second + PAGE_SIZE == first) {
+        table[slot].stack_bytes = PAGE_SIZE * STACK_PAGES
+        return second
+    }
+    if (first + PAGE_SIZE == second) {
+        table[slot].stack_bytes = PAGE_SIZE * STACK_PAGES
+        return first
+    }
+    page_free(second)
+    table[slot].stack_bytes = PAGE_SIZE
+    return first
+}
+
+fn build_frame(top: uint64, entry: uint64, argument: uint64) -> uint64 {
+    var address: uint64 = top - FRAME_BYTES
+    var slots: uint64* = (uint64*)address
+    for i: uint64 in 0..FRAME_SLOTS {
+        slots[i] = 0
+    }
+    var frame: SwitchFrame* = (SwitchFrame*)address
+    frame->rdi = argument
+    frame->rip = entry
+    frame->cs = GDT_CODE_SELECTOR
+    frame->flags = FLAGS_INTERRUPTS_ON
+    frame->rsp = top
+    frame->ss = GDT_DATA_SELECTOR
+    return address
+}
+
+export fn process_spawn(entry: uint64, name: cstring, priority: uint64,
+                        argument: uint64) -> uint64 {
+    var was_on: bool = cpu_interrupts_on()
+    cpu_disable_interrupts()
+    var slot: uint64 = free_slot()
+    if (slot == NO_PROCESS) {
+        cpu_restore_interrupts(was_on)
+        return 0
+    }
+    var stack: uint64 = claim_stack(slot)
+    if (stack == 0) {
+        cpu_restore_interrupts(was_on)
+        return 0
+    }
+    table[slot].pid = next_pid
+    next_pid++
+    table[slot].parent = table[current].pid
+    table[slot].stack_base = stack
+    table[slot].stack_pointer = build_frame(stack + table[slot].stack_bytes, entry,
+                                            argument)
+    table[slot].priority = priority
+    table[slot].quantum = quantum_for[priority]
+    table[slot].slices = 0
+    table[slot].cpu_ticks = 0
+    table[slot].window_ticks = 0
+    table[slot].percent = 0
+    table[slot].started = now()
+    table[slot].wake_at = 0
+    table[slot].channel = 0
+    table[slot].exit_code = 0
+    table[slot].stop_wanted = 0
+    table[slot].page_count = 0
+    table[slot].mail_head = 0
+    table[slot].mail_tail = 0
+    var guard: uint64* = (uint64*)stack
+    guard[0] = STACK_GUARD
+    set_name(slot, name)
+    make_ready(slot)
+    cpu_restore_interrupts(was_on)
+    return table[slot].pid
+}
+
+export fn process_set_priority(pid: uint64, priority: uint64) -> bool {
+    var slot: uint64 = process_slot_of(pid)
+    if (slot == NO_PROCESS || priority >= PRIORITY_COUNT) {
+        return false
+    }
+    table[slot].priority = priority
+    table[slot].quantum = quantum_for[priority]
+    return true
+}
+
+export fn process_stop_wanted() -> bool {
+    return table[current].stop_wanted != 0
+}
+
+export fn process_kill(pid: uint64) -> bool {
+    var slot: uint64 = process_slot_of(pid)
+    if (slot == NO_PROCESS || slot == idle_slot || table[slot].pid == 1) {
+        return false
+    }
+    table[slot].stop_wanted = 1
+    if (table[slot].state == ProcessState.Sleeping ||
+        table[slot].state == ProcessState.Blocked) {
+        make_ready(slot)
+    }
+    return true
+}
+
+export fn process_wake_channel(channel: uint64) {
+    for i: uint64 in 0..PROCESS_SLOTS {
+        if (table[i].state == ProcessState.Blocked && table[i].channel == channel) {
+            table[i].channel = 0
+            make_ready(i)
+        }
+    }
+}
+
+export fn process_yield() {
+    table[current].quantum = 0
+    cpu_halt()
+}
+
+export fn process_block(channel: uint64) {
+    if (table[current].stop_wanted != 0) {
+        return
+    }
+    var was_on: bool = cpu_interrupts_on()
+    cpu_disable_interrupts()
+    table[current].channel = channel
+    table[current].state = ProcessState.Blocked
+    cpu_restore_interrupts(was_on)
+    while (table[current].state == ProcessState.Blocked) {
+        cpu_halt()
+    }
+}
+
+export fn process_sleep(ticks: uint64) {
+    var was_on: bool = cpu_interrupts_on()
+    cpu_disable_interrupts()
+    table[current].wake_at = now() + ticks
+    table[current].state = ProcessState.Sleeping
+    cpu_restore_interrupts(was_on)
+    while (table[current].state == ProcessState.Sleeping) {
+        cpu_halt()
+    }
+}
+
+fn reparent_children(pid: uint64) {
+    for i: uint64 in 0..PROCESS_SLOTS {
+        if (table[i].state != ProcessState.Free && table[i].parent == pid) {
+            table[i].parent = 1
+        }
+    }
+}
+
+export fn process_exit(code: uint64) {
+    var was_on: bool = cpu_interrupts_on()
+    cpu_disable_interrupts()
+    table[current].exit_code = code
+    table[current].state = ProcessState.Zombie
+    release_pages(current)
+    reparent_children(table[current].pid)
+    process_wake_channel(table[current].pid)
+    process_wake_channel(table[current].parent)
+    cpu_restore_interrupts(was_on)
+    while (true) {
+        cpu_halt()
+    }
+}
+
+export fn process_wait(pid: uint64) -> uint64 {
+    var slot: uint64 = process_slot_of(pid)
+    if (slot == NO_PROCESS) {
+        return 0
+    }
+    while (table[slot].state != ProcessState.Zombie) {
+        if (table[slot].state == ProcessState.Free || table[slot].pid != pid) {
+            return 0
+        }
+        process_block(pid)
+    }
+    var code: uint64 = table[slot].exit_code
+    release_stack(slot)
+    table[slot].state = ProcessState.Free
+    return code
+}
+
+export fn process_wait_any() -> uint64 {
+    var mine: uint64 = table[current].pid
+    while (true) {
+        var children: uint64 = 0
+        for i: uint64 in 0..PROCESS_SLOTS {
+            if (table[i].state != ProcessState.Free && table[i].parent == mine) {
+                if (table[i].state == ProcessState.Zombie) {
+                    var pid: uint64 = table[i].pid
+                    release_stack(i)
+                    table[i].state = ProcessState.Free
+                    return pid
+                }
+                children++
+            }
+        }
+        if (children == 0 || process_stop_wanted()) {
+            return 0
+        }
+        process_block(mine)
+    }
+    return 0
+}
+
+export fn process_send(pid: uint64, message: uint64) -> bool {
+    var slot: uint64 = process_slot_of(pid)
+    if (slot == NO_PROCESS) {
+        return false
+    }
+    var following: uint64 = (table[slot].mail_head + 1) % MAIL_SLOTS
+    if (following == table[slot].mail_tail) {
+        return false
+    }
+    table[slot].mail[table[slot].mail_head] = message
+    table[slot].mail_head = following
+    process_wake_channel(MAIL_CHANNEL + pid)
+    return true
+}
+
+export fn process_mail_waiting(slot: uint64) -> uint64 {
+    return (table[slot].mail_head + MAIL_SLOTS - table[slot].mail_tail) %
+           MAIL_SLOTS
+}
+
+export fn process_receive() -> uint64 {
+    while (table[current].mail_head == table[current].mail_tail) {
+        if (process_stop_wanted()) {
+            return 0
+        }
+        process_block(MAIL_CHANNEL + table[current].pid)
+    }
+    var message: uint64 = table[current].mail[table[current].mail_tail]
+    table[current].mail_tail = (table[current].mail_tail + 1) % MAIL_SLOTS
+    return message
+}
+
+export fn process_broken_stacks() -> uint64 {
+    return broken_stacks
+}
+
+export fn process_reap(pid: uint64) -> bool {
+    var slot: uint64 = process_slot_of(pid)
+    if (slot == NO_PROCESS || table[slot].state != ProcessState.Zombie) {
+        return false
+    }
+    release_stack(slot)
+    table[slot].state = ProcessState.Free
+    return true
+}
+
+fn parent_alive(slot: uint64) -> bool {
+    return process_slot_of(table[slot].parent) != NO_PROCESS
+}
+
+export fn process_collect_orphans() {
+    for i: uint64 in 0..PROCESS_SLOTS {
+        if (table[i].state == ProcessState.Zombie && !parent_alive(i)) {
+            release_stack(i)
+            table[i].state = ProcessState.Free
+        }
+    }
+}
+
+fn wake_sleepers(moment: uint64) {
+    for i: uint64 in 0..PROCESS_SLOTS {
+        if (table[i].state == ProcessState.Sleeping && table[i].wake_at <= moment) {
+            make_ready(i)
+        }
+    }
+}
+
+fn close_window(moment: uint64) {
+    if (moment - window_start < CLOCK_HZ) {
+        return
+    }
+    window_start = moment
+    for i: uint64 in 0..PROCESS_SLOTS {
+        if (table[i].state != ProcessState.Free) {
+            table[i].percent = table[i].window_ticks * 100 / CLOCK_HZ
+            table[i].window_ticks = 0
+        }
+    }
+}
+
+fn rank(slot: uint64, moment: uint64) -> uint64 {
+    if (moment - table[slot].ready_since > STARVED_TICKS) {
+        return 0
+    }
+    return table[slot].priority + 1
+}
+
+fn pick(moment: uint64) -> uint64 {
+    var best: uint64 = PRIORITY_COUNT + 2
+    for step: uint64 in 1..(PROCESS_SLOTS + 1) {
+        var slot: uint64 = (current + step) % PROCESS_SLOTS
+        if (table[slot].state == ProcessState.Ready && slot != idle_slot) {
+            var value: uint64 = rank(slot, moment)
+            if (value < best) {
+                best = value
+            }
+        }
+    }
+    if (best <= PRIORITY_COUNT + 1) {
+        for step: uint64 in 1..(PROCESS_SLOTS + 1) {
+            var slot: uint64 = (current + step) % PROCESS_SLOTS
+            if (table[slot].state == ProcessState.Ready && slot != idle_slot &&
+                rank(slot, moment) == best) {
+                return slot
+            }
+        }
+    }
+    if (table[current].state == ProcessState.Running) {
+        return current
+    }
+    return idle_slot
+}
+
+fn guard_intact(slot: uint64) -> bool {
+    if (table[slot].stack_base == 0) {
+        return true
+    }
+    var guard: uint64* = (uint64*)table[slot].stack_base
+    return guard[0] == STACK_GUARD
+}
+
+fn schedule(saved: uint64) -> uint64 {
+    var moment: uint64 = now()
+    table[current].stack_pointer = saved
+
+    if (current != 0 && !guard_intact(current)) {
+        broken_stacks++
+        broken_pid = table[current].pid
+        table[current].exit_code = EXIT_STACK_BROKEN
+        table[current].state = ProcessState.Zombie
+    }
+
+    if (table[current].state == ProcessState.Zombie &&
+        table[current].stack_base != 0) {
+        release_stack(current)
+    }
+    if (table[current].state == ProcessState.Running) {
+        make_ready(current)
+    }
+
+    var chosen: uint64 = pick(moment)
+    if (chosen >= PROCESS_SLOTS) {
+        chosen = current
+    }
+    if (chosen != current) {
+        switches++
+        table[chosen].slices++
+    }
+    current = chosen
+    table[current].state = ProcessState.Running
+    table[current].quantum = quantum_for[table[current].priority]
+    return table[current].stack_pointer
+}
+
+export fn process_tick(saved: uint64) -> uint64 {
+    var moment: uint64 = now()
+    table[current].cpu_ticks++
+    table[current].window_ticks++
+    wake_sleepers(moment)
+    close_window(moment)
+
+    if (table[current].quantum > 0) {
+        table[current].quantum--
+    }
+    if (table[current].state == ProcessState.Running &&
+        table[current].quantum > 0) {
+        return saved
+    }
+    return schedule(saved)
+}
+
+export fn timer_tick(saved: uint64) -> uint64 {
+    clock_tick()
+    pic_end_of_interrupt(IRQ_TIMER)
+    return process_tick(saved)
+}
+
+@naked fn timer_entry() {
+    asm {
+        push rax
+        push rcx
+        push rdx
+        push rbx
+        push rbp
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
+        mov rdi, rsp
+        call timer_tick
+        mov rsp, rax
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rbp
+        pop rbx
+        pop rdx
+        pop rcx
+        pop rax
+        iretq
+    }
+}
+
+fn report_broken_stacks() {
+    if (broken_stacks == reported_stacks) {
+        return
+    }
+    reported_stacks = broken_stacks
+    console_write("process ")
+    console_write_decimal(broken_pid)
+    console_write_line(" ran off the bottom of its stack and was stopped")
+}
+
+fn idle_loop(argument: uint64) {
+    while (true) {
+        process_collect_orphans()
+        report_broken_stacks()
+        cpu_halt()
+    }
+}
+
+export fn process_init() {
+    for i: uint64 in 0..PROCESS_SLOTS {
+        table[i].state = ProcessState.Free
+        table[i].stop_wanted = 0
+        table[i].page_count = 0
+    }
+    current = 0
+    table[0].pid = next_pid
+    next_pid++
+    table[0].parent = 0
+    table[0].state = ProcessState.Running
+    table[0].priority = PRIORITY_HIGH
+    table[0].quantum = quantum_for[PRIORITY_HIGH]
+    table[0].stack_base = STACK_TOP
+    table[0].stack_bytes = 0
+    table[0].started = 0
+    set_name(0, "kernel")
+
+    var idle_pid: uint64 = process_spawn((uint64)&idle_loop, "idle", PRIORITY_IDLE,
+                                         0)
+    idle_slot = process_slot_of(idle_pid)
+
+    interrupt_install(VECTOR_TIMER, (uint64)&timer_entry)
+    pic_unmask(IRQ_TIMER)
+}
