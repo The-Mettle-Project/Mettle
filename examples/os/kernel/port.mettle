@@ -1,0 +1,69 @@
+const SETTLE_PORT: uint16 = 0x80
+
+export fn port_out(port: uint16, value: uint8) {
+    asm {
+        mov dx, {port}
+        mov al, {value}
+        out dx, al
+    }
+}
+
+export fn port_in(port: uint16) -> uint8 {
+    var value: uint8 = 0
+    asm {
+        mov dx, {port}
+        in al, dx
+        mov {value}, al
+    }
+    return value
+}
+
+export fn port_settle() {
+    port_out(SETTLE_PORT, 0)
+}
+
+export fn cpu_enable_interrupts() {
+    asm {
+        sti
+    }
+}
+
+export fn cpu_disable_interrupts() {
+    asm {
+        cli
+    }
+}
+
+export fn cpu_halt() {
+    asm {
+        hlt
+    }
+}
+
+export fn cpu_idle() {
+    asm {
+        sti
+        hlt
+    }
+}
+
+export fn cpu_stop() {
+    cpu_disable_interrupts()
+    while (true) {
+        cpu_halt()
+    }
+}
+
+export fn cpu_vendor(out: uint8*) {
+    asm {
+        push rbx
+        mov rdi, {out}
+        xor eax, eax
+        cpuid
+        mov [rdi], ebx
+        mov [rdi + 4], edx
+        mov [rdi + 8], ecx
+        pop rbx
+    }
+    out[12] = 0
+}

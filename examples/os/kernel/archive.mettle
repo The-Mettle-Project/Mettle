@@ -1,0 +1,61 @@
+import "layout"
+import "text"
+
+const NAME_BYTES: uint64 = 32
+const HEADER_BYTES: uint64 = 16
+
+struct FileEntry {
+    name: uint8[32];
+    offset: uint64;
+    length: uint64;
+}
+
+fn magic_matches() -> bool {
+    var expected: cstring = "METTLEFS"
+    var stored: cstring = (cstring)ARCHIVE_BASE
+    for i: uint64 in 0..8 {
+        if (stored[i] != expected[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+export fn archive_count() -> uint64 {
+    if (!magic_matches()) {
+        return 0
+    }
+    var count: uint32* = (uint32*)(ARCHIVE_BASE + 8)
+    return (uint64)count[0]
+}
+
+fn entry_at(index: uint64) -> FileEntry* {
+    var entries: FileEntry* = (FileEntry*)(ARCHIVE_BASE + HEADER_BYTES)
+    return &entries[index]
+}
+
+export fn archive_name(index: uint64) -> cstring {
+    return (cstring)&entry_at(index)->name[0]
+}
+
+export fn archive_length(index: uint64) -> uint64 {
+    return entry_at(index)->length
+}
+
+export fn archive_data(index: uint64) -> uint8* {
+    return (uint8*)(ARCHIVE_BASE + entry_at(index)->offset)
+}
+
+export fn archive_holds(index: uint64) -> bool {
+    return index < archive_count()
+}
+
+export fn archive_find(name: cstring) -> uint64 {
+    var count: uint64 = archive_count()
+    for i: uint64 in 0..count {
+        if (text_equals(archive_name(i), name)) {
+            return i
+        }
+    }
+    return count
+}

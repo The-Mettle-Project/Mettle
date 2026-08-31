@@ -1,0 +1,110 @@
+import "layout"
+
+const REGION_USABLE: uint32 = 1
+const MAP_COUNT_ADDRESS: uint64 = BOOT_INFO_BASE
+const MAP_ENTRY_ADDRESS: uint64 = BOOT_INFO_BASE + 16
+
+export struct MemoryRegion {
+    base: uint64;
+    length: uint64;
+    kind: uint32;
+    attributes: uint32;
+}
+
+var free_list: uint64 = 0
+var free_pages: uint64 = 0
+var total_pages: uint64 = 0
+
+export fn memory_map_count() -> uint64 {
+    var count: uint16* = (uint16*)MAP_COUNT_ADDRESS
+    return (uint64)count[0]
+}
+
+export fn memory_map_region(index: uint64) -> MemoryRegion* {
+    var regions: MemoryRegion* = (MemoryRegion*)MAP_ENTRY_ADDRESS
+    return &regions[index]
+}
+
+export fn memory_map_kind_name(kind: uint32) -> cstring {
+    if (kind == REGION_USABLE) {
+        return "usable"
+    }
+    if (kind == 2) {
+        return "reserved"
+    }
+    if (kind == 3) {
+        return "acpi reclaim"
+    }
+    if (kind == 4) {
+        return "acpi nvs"
+    }
+    if (kind == 5) {
+        return "bad"
+    }
+    return "unknown"
+}
+
+export fn page_free(address: uint64) {
+    var link: uint64* = (uint64*)address
+    link[0] = free_list
+    free_list = address
+    free_pages++
+}
+
+export fn page_alloc() -> uint64 {
+    if (free_list == 0) {
+        return 0
+    }
+    var address: uint64 = free_list
+    var link: uint64* = (uint64*)address
+    free_list = link[0]
+    free_pages--
+    return address
+}
+
+export fn page_free_count() -> uint64 {
+    return free_pages
+}
+
+export fn page_total_count() -> uint64 {
+    return total_pages
+}
+
+export fn page_free_bytes() -> uint64 {
+    return free_pages * PAGE_SIZE
+}
+
+fn round_up(value: uint64) -> uint64 {
+    return (value + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE
+}
+
+fn round_down(value: uint64) -> uint64 {
+    return value / PAGE_SIZE * PAGE_SIZE
+}
+
+fn adopt_region(region: MemoryRegion*) {
+    var start: uint64 = region->base
+    var end: uint64 = region->base + region->length
+    if (start < HEAP_FLOOR) {
+        start = HEAP_FLOOR
+    }
+    if (end > IDENTITY_LIMIT) {
+        end = IDENTITY_LIMIT
+    }
+    start = round_up(start)
+    end = round_down(end)
+    while (start + PAGE_SIZE <= end) {
+        page_free(start)
+        total_pages++
+        start += PAGE_SIZE
+    }
+}
+
+export fn page_init() {
+    for i: uint64 in 0..memory_map_count() {
+        var region: MemoryRegion* = memory_map_region(i)
+        if (region->kind == REGION_USABLE) {
+            adopt_region(region)
+        }
+    }
+}

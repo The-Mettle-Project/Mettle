@@ -1,0 +1,49 @@
+import "port"
+
+const COM1_DATA: uint16 = 0x3f8
+const COM1_INTERRUPT_ENABLE: uint16 = 0x3f9
+const COM1_FIFO_CONTROL: uint16 = 0x3fa
+const COM1_LINE_CONTROL: uint16 = 0x3fb
+const COM1_MODEM_CONTROL: uint16 = 0x3fc
+const COM1_LINE_STATUS: uint16 = 0x3fd
+
+const LINE_CONTROL_DIVISOR_LATCH: uint8 = 0x80
+const LINE_CONTROL_8N1: uint8 = 0x03
+const FIFO_ENABLE_AND_CLEAR: uint8 = 0xc7
+const MODEM_READY: uint8 = 0x0b
+const TRANSMITTER_EMPTY: uint8 = 0x20
+const DIVISOR_115200: uint8 = 1
+
+const SPIN_LIMIT: uint64 = 200000
+
+var ready: uint64 = 0
+
+export fn serial_init() {
+    port_out(COM1_INTERRUPT_ENABLE, 0)
+    port_out(COM1_LINE_CONTROL, LINE_CONTROL_DIVISOR_LATCH)
+    port_out(COM1_DATA, DIVISOR_115200)
+    port_out(COM1_INTERRUPT_ENABLE, 0)
+    port_out(COM1_LINE_CONTROL, LINE_CONTROL_8N1)
+    port_out(COM1_FIFO_CONTROL, FIFO_ENABLE_AND_CLEAR)
+    port_out(COM1_MODEM_CONTROL, MODEM_READY)
+    ready = 1
+}
+
+fn emit(ch: uint8) {
+    var spins: uint64 = 0
+    while ((port_in(COM1_LINE_STATUS) & TRANSMITTER_EMPTY) == 0 &&
+           spins < SPIN_LIMIT) {
+        spins++
+    }
+    port_out(COM1_DATA, ch)
+}
+
+export fn serial_put(ch: uint8) {
+    if (ready == 0) {
+        return
+    }
+    if (ch == '\n') {
+        emit('\r')
+    }
+    emit(ch)
+}

@@ -1,0 +1,45 @@
+export const FORMAT_BYTES: uint64 = 24
+
+export fn format_decimal(value: uint64, out: uint8*) -> uint64 {
+    var reversed: uint8[FORMAT_BYTES]
+    var count: uint64 = 0
+    var remaining: uint64 = value
+    if (remaining == 0) {
+        reversed[0] = '0'
+        count = 1
+    }
+    while (remaining > 0) {
+        reversed[count] = (uint8)('0' + remaining % 10)
+        remaining /= 10
+        count++
+    }
+    for i: uint64 in 0..count {
+        out[i] = reversed[count - 1 - i]
+    }
+    out[count] = 0
+    return count
+}
+
+export fn format_hex(value: uint64, digits: uint64, out: uint8*) -> uint64 {
+    var alphabet: cstring = "0123456789abcdef"
+    var written: uint64 = 0
+    var shift: uint64 = digits * 4
+    while (shift > 0) {
+        shift -= 4
+        out[written] = alphabet[(value >> shift) & 15]
+        written++
+    }
+    out[written] = 0
+    return written
+}
+
+export fn format_hex_byte(value: uint64, out: uint8*) -> uint64 {
+    return format_hex(value, 2, out)
+}
+
+export fn format_two_digits(value: uint64, out: uint8*) -> uint64 {
+    out[0] = (uint8)('0' + (value / 10) % 10)
+    out[1] = (uint8)('0' + value % 10)
+    out[2] = 0
+    return 2
+}

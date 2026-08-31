@@ -1,0 +1,143 @@
+import "port"
+import "layout"
+import "format"
+
+export const VGA_COLUMNS: uint64 = 80
+export const VGA_ROWS: uint64 = 25
+export const VGA_TEXT_ROWS: uint64 = 23
+
+export const COLOR_TEXT: uint8 = 0x07
+export const COLOR_PROMPT: uint8 = 0x0a
+export const COLOR_TITLE: uint8 = 0x2f
+export const COLOR_NOTE: uint8 = 0x0b
+export const COLOR_ALARM: uint8 = 0x4f
+export const COLOR_STATUS: uint8 = 0x1f
+export const COLOR_COUNTER: uint8 = 0x0e
+
+const INDEX_PORT: uint16 = 0x3d4
+const DATA_PORT: uint16 = 0x3d5
+const CURSOR_HIGH: uint8 = 14
+const CURSOR_LOW: uint8 = 15
+
+const TAB_WIDTH: uint64 = 4
+const BLANK: uint8 = ' '
+
+var color: uint8 = COLOR_TEXT
+var row: uint64 = 0
+var column: uint64 = 0
+
+export fn vga_index(row_index: uint64, column_index: uint64) -> uint64 {
+    return row_index * VGA_COLUMNS + column_index
+}
+
+export fn vga_cell(index: uint64, ch: uint8, cell_color: uint8) {
+    var screen: uint16* = (uint16*)VGA_TEXT_BASE
+    screen[index] = (uint16)ch | ((uint16)cell_color << 8)
+}
+
+export fn vga_read(index: uint64) -> uint16 {
+    var screen: uint16* = (uint16*)VGA_TEXT_BASE
+    return screen[index]
+}
+
+export fn vga_set_color(value: uint8) {
+    color = value
+}
+
+export fn vga_color() -> uint8 {
+    return color
+}
+
+export fn vga_sync_cursor() {
+    var position: uint64 = vga_index(row, column)
+    port_out(INDEX_PORT, CURSOR_HIGH)
+    port_out(DATA_PORT, (uint8)((position >> 8) & 255))
+    port_out(INDEX_PORT, CURSOR_LOW)
+    port_out(DATA_PORT, (uint8)(position & 255))
+}
+
+export fn vga_fill_row(row_index: uint64, cell_color: uint8) {
+    for i: uint64 in 0..VGA_COLUMNS {
+        vga_cell(vga_index(row_index, i), BLANK, cell_color)
+    }
+}
+
+export fn vga_clear() {
+    for i: uint64 in 0..VGA_ROWS {
+        vga_fill_row(i, color)
+    }
+    row = 0
+    column = 0
+    vga_sync_cursor()
+}
+
+fn scroll() {
+    var last: uint64 = VGA_TEXT_ROWS - 1
+    for i: uint64 in 0..vga_index(last, 0) {
+        var screen: uint16* = (uint16*)VGA_TEXT_BASE
+        screen[i] = vga_read(i + VGA_COLUMNS)
+    }
+    vga_fill_row(last, color)
+    row = last
+}
+
+fn break_line() {
+    column = 0
+    row++
+    if (row >= VGA_TEXT_ROWS) {
+        scroll()
+    }
+}
+
+export fn vga_put(ch: uint8) {
+    if (ch == '\n') {
+        break_line()
+        return
+    }
+    if (ch == '\r') {
+        column = 0
+        return
+    }
+    if (ch == '\t') {
+        for i: uint64 in 0..TAB_WIDTH {
+            vga_put(BLANK)
+        }
+        return
+    }
+    if (ch == 8) {
+        if (column > 0) {
+            column--
+            vga_cell(vga_index(row, column), BLANK, color)
+        }
+        return
+    }
+    vga_cell(vga_index(row, column), ch, color)
+    column++
+    if (column >= VGA_COLUMNS) {
+        break_line()
+    }
+}
+
+export fn vga_draw_text(row_index: uint64, column_index: uint64, text: cstring,
+                        cell_color: uint8) -> uint64 {
+    var i: uint64 = 0
+    while (text[i] != 0 && column_index + i < VGA_COLUMNS) {
+        vga_cell(vga_index(row_index, column_index + i), text[i], cell_color)
+        i++
+    }
+    return i
+}
+
+export fn vga_draw_number(row_index: uint64, column_index: uint64, value: uint64,
+                          cell_color: uint8) -> uint64 {
+    var text: uint8[FORMAT_BYTES]
+    format_decimal(value, &text[0])
+    return vga_draw_text(row_index, column_index, (cstring)&text[0], cell_color)
+}
+
+export fn vga_draw_two_digits(row_index: uint64, column_index: uint64,
+                              value: uint64, cell_color: uint8) -> uint64 {
+    var text: uint8[FORMAT_BYTES]
+    format_two_digits(value, &text[0])
+    return vga_draw_text(row_index, column_index, (cstring)&text[0], cell_color)
+}

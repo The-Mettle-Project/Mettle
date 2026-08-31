@@ -1,0 +1,261 @@
+import "port"
+import "layout"
+import "page"
+import "clock"
+import "interrupt"
+
+export const TASK_SLOTS: uint64 = 8
+
+const NAME_BYTES: uint64 = 16
+const FRAME_SLOTS: uint64 = 20
+const FRAME_BYTES: uint64 = FRAME_SLOTS * 8
+const FLAGS_INTERRUPTS_ON: uint64 = 0x202
+
+export enum TaskState {
+    Free = 0,
+    Ready = 1,
+    Running = 2,
+    Leaving = 3
+}
+
+struct SwitchFrame {
+    r15: uint64;
+    r14: uint64;
+    r13: uint64;
+    r12: uint64;
+    r11: uint64;
+    r10: uint64;
+    r9: uint64;
+    r8: uint64;
+    rdi: uint64;
+    rsi: uint64;
+    rbp: uint64;
+    rbx: uint64;
+    rdx: uint64;
+    rcx: uint64;
+    rax: uint64;
+    rip: uint64;
+    cs: uint64;
+    flags: uint64;
+    rsp: uint64;
+    ss: uint64;
+}
+
+struct Task {
+    stack_pointer: uint64;
+    stack_base: uint64;
+    state: TaskState;
+    slices: uint64;
+    stop: uint64;
+    name: uint8[16];
+}
+
+var tasks: Task[8]
+var current: uint64 = 0
+
+export fn task_current() -> uint64 {
+    return current
+}
+
+export fn task_state(slot: uint64) -> TaskState {
+    return tasks[slot].state
+}
+
+export fn task_in_use(slot: uint64) -> bool {
+    return tasks[slot].state != TaskState.Free
+}
+
+export fn task_slices(slot: uint64) -> uint64 {
+    return tasks[slot].slices
+}
+
+export fn task_stack_base(slot: uint64) -> uint64 {
+    return tasks[slot].stack_base
+}
+
+export fn task_name(slot: uint64) -> cstring {
+    return (cstring)&tasks[slot].name[0]
+}
+
+export fn task_state_name(slot: uint64) -> cstring {
+    switch ((int32)tasks[slot].state) {
+        case 1: { return "ready" }
+        case 2: { return "running" }
+        case 3: { return "leaving" }
+        default: { return "free" }
+    }
+}
+
+export fn task_request_stop(slot: uint64) {
+    tasks[slot].stop = 1
+}
+
+export fn task_should_stop(slot: uint64) -> bool {
+    return tasks[slot].stop != 0
+}
+
+export fn task_live_count() -> uint64 {
+    var live: uint64 = 0
+    for i: uint64 in 0..TASK_SLOTS {
+        if (task_in_use(i)) {
+            live++
+        }
+    }
+    return live
+}
+
+fn set_name(slot: uint64, text: cstring) {
+    var i: uint64 = 0
+    while (text[i] != 0 && i + 1 < NAME_BYTES) {
+        tasks[slot].name[i] = text[i]
+        i++
+    }
+    tasks[slot].name[i] = 0
+}
+
+fn reap_departed() {
+    for i: uint64 in 0..TASK_SLOTS {
+        if (tasks[i].state == TaskState.Leaving && i != current) {
+            if (tasks[i].stack_base != 0) {
+                page_free(tasks[i].stack_base)
+            }
+            tasks[i].stack_base = 0
+            tasks[i].state = TaskState.Free
+        }
+    }
+}
+
+fn next_ready(from: uint64) -> uint64 {
+    var slot: uint64 = from
+    for i: uint64 in 0..TASK_SLOTS {
+        slot = (slot + 1) % TASK_SLOTS
+        if (tasks[slot].state == TaskState.Ready) {
+            return slot
+        }
+    }
+    return from
+}
+
+fn schedule(saved: uint64) -> uint64 {
+    tasks[current].stack_pointer = saved
+    if (tasks[current].state == TaskState.Running) {
+        tasks[current].state = TaskState.Ready
+    }
+    current = next_ready(current)
+    tasks[current].state = TaskState.Running
+    tasks[current].slices++
+    reap_departed()
+    return tasks[current].stack_pointer
+}
+
+export fn timer_tick(saved: uint64) -> uint64 {
+    clock_tick()
+    pic_end_of_interrupt()
+    return schedule(saved)
+}
+
+@naked fn timer_entry() {
+    asm {
+        push rax
+        push rcx
+        push rdx
+        push rbx
+        push rbp
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
+        mov rdi, rsp
+        call timer_tick
+        mov rsp, rax
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rbp
+        pop rbx
+        pop rdx
+        pop rcx
+        pop rax
+        iretq
+    }
+}
+
+fn build_frame(top: uint64, entry: uint64) -> uint64 {
+    var address: uint64 = top - FRAME_BYTES
+    var slots: uint64* = (uint64*)address
+    for i: uint64 in 0..FRAME_SLOTS {
+        slots[i] = 0
+    }
+    var frame: SwitchFrame* = (SwitchFrame*)address
+    frame->rip = entry
+    frame->cs = GDT_CODE_SELECTOR
+    frame->flags = FLAGS_INTERRUPTS_ON
+    frame->rsp = top
+    frame->ss = GDT_DATA_SELECTOR
+    return address
+}
+
+fn free_slot() -> uint64 {
+    for i: uint64 in 0..TASK_SLOTS {
+        if (tasks[i].state == TaskState.Free) {
+            return i
+        }
+    }
+    return TASK_SLOTS
+}
+
+export fn task_create(entry: uint64, name: cstring) -> uint64 {
+    cpu_disable_interrupts()
+    var slot: uint64 = free_slot()
+    if (slot == TASK_SLOTS) {
+        cpu_enable_interrupts()
+        return TASK_SLOTS
+    }
+    var stack: uint64 = page_alloc()
+    if (stack == 0) {
+        cpu_enable_interrupts()
+        return TASK_SLOTS
+    }
+    tasks[slot].stack_base = stack
+    tasks[slot].stack_pointer = build_frame(stack + PAGE_SIZE, entry)
+    tasks[slot].slices = 0
+    tasks[slot].stop = 0
+    set_name(slot, name)
+    tasks[slot].state = TaskState.Ready
+    cpu_enable_interrupts()
+    return slot
+}
+
+export fn task_exit() {
+    cpu_disable_interrupts()
+    tasks[current].state = TaskState.Leaving
+    cpu_enable_interrupts()
+    while (true) {
+        cpu_halt()
+    }
+}
+
+export fn task_init() {
+    for i: uint64 in 0..TASK_SLOTS {
+        tasks[i].state = TaskState.Free
+        tasks[i].stop = 0
+    }
+    current = 0
+    tasks[0].state = TaskState.Running
+    tasks[0].stack_base = STACK_TOP
+    set_name(0, "shell")
+    interrupt_install(VECTOR_TIMER, (uint64)&timer_entry)
+}

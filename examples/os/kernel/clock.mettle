@@ -1,0 +1,114 @@
+import "port"
+
+export const CLOCK_HZ: uint64 = 100
+
+const PIT_FREQUENCY: uint64 = 1193182
+const PIT_CHANNEL0: uint16 = 0x40
+const PIT_CHANNEL2: uint16 = 0x42
+const PIT_COMMAND: uint16 = 0x43
+const PIT_CHANNEL0_SQUARE_WAVE: uint8 = 0x36
+const PIT_CHANNEL2_SQUARE_WAVE: uint8 = 0xb6
+
+const SPEAKER_PORT: uint16 = 0x61
+const SPEAKER_ON: uint8 = 0x03
+const SPEAKER_OFF: uint8 = 0xfc
+const SPEAKER_TONE_HZ: uint64 = 880
+
+const CMOS_INDEX: uint16 = 0x70
+const CMOS_DATA: uint16 = 0x71
+const RTC_SECONDS: uint8 = 0
+const RTC_MINUTES: uint8 = 2
+const RTC_HOURS: uint8 = 4
+const RTC_DAY: uint8 = 7
+const RTC_MONTH: uint8 = 8
+const RTC_YEAR: uint8 = 9
+const RTC_STATUS_A: uint8 = 0x0a
+const RTC_STATUS_B: uint8 = 0x0b
+const RTC_UPDATING: uint64 = 0x80
+const RTC_BINARY_MODE: uint64 = 0x04
+const RTC_CENTURY: uint64 = 2000
+const SPIN_LIMIT: uint64 = 100000
+
+var ticks: volatile uint64 = 0
+
+fn write_divisor(channel: uint16, divisor: uint64) {
+    port_out(channel, (uint8)(divisor & 255))
+    port_out(channel, (uint8)((divisor >> 8) & 255))
+}
+
+export fn clock_init() {
+    port_out(PIT_COMMAND, PIT_CHANNEL0_SQUARE_WAVE)
+    write_divisor(PIT_CHANNEL0, PIT_FREQUENCY / CLOCK_HZ)
+}
+
+export fn clock_tick() {
+    ticks++
+}
+
+export fn clock_ticks() -> uint64 {
+    return ticks
+}
+
+export fn clock_seconds() -> uint64 {
+    return ticks / CLOCK_HZ
+}
+
+export fn clock_sleep(count: uint64) {
+    var target: uint64 = ticks + count
+    while (ticks < target) {
+        cpu_halt()
+    }
+}
+
+fn cmos_read(index: uint8) -> uint64 {
+    port_out(CMOS_INDEX, index)
+    return (uint64)port_in(CMOS_DATA)
+}
+
+fn from_bcd(value: uint64) -> uint64 {
+    return (value & 15) + (value >> 4) * 10
+}
+
+fn rtc_read(field: uint8) -> uint64 {
+    var spins: uint64 = 0
+    while ((cmos_read(RTC_STATUS_A) & RTC_UPDATING) != 0 && spins < SPIN_LIMIT) {
+        spins++
+    }
+    var raw: uint64 = cmos_read(field)
+    if ((cmos_read(RTC_STATUS_B) & RTC_BINARY_MODE) == 0) {
+        return from_bcd(raw)
+    }
+    return raw
+}
+
+export fn clock_hour() -> uint64 {
+    return rtc_read(RTC_HOURS)
+}
+
+export fn clock_minute() -> uint64 {
+    return rtc_read(RTC_MINUTES)
+}
+
+export fn clock_second() -> uint64 {
+    return rtc_read(RTC_SECONDS)
+}
+
+export fn clock_day() -> uint64 {
+    return rtc_read(RTC_DAY)
+}
+
+export fn clock_month() -> uint64 {
+    return rtc_read(RTC_MONTH)
+}
+
+export fn clock_year() -> uint64 {
+    return RTC_CENTURY + rtc_read(RTC_YEAR)
+}
+
+export fn speaker_beep(length: uint64) {
+    port_out(PIT_COMMAND, PIT_CHANNEL2_SQUARE_WAVE)
+    write_divisor(PIT_CHANNEL2, PIT_FREQUENCY / SPEAKER_TONE_HZ)
+    port_out(SPEAKER_PORT, port_in(SPEAKER_PORT) | SPEAKER_ON)
+    clock_sleep(length)
+    port_out(SPEAKER_PORT, port_in(SPEAKER_PORT) & SPEAKER_OFF)
+}

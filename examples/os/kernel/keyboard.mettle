@@ -1,0 +1,148 @@
+import "port"
+import "interrupt"
+
+export const KEY_BACKSPACE: uint8 = 8
+export const KEY_TAB: uint8 = 9
+export const KEY_ENTER: uint8 = '\n'
+export const KEY_UP: uint8 = 17
+export const KEY_DOWN: uint8 = 18
+
+const DATA_PORT: uint16 = 0x60
+const BUFFER_BYTES: uint64 = 128
+const BUFFER_MASK: uint64 = 127
+
+const SCAN_EXTENDED: uint8 = 0xe0
+const SCAN_RELEASE: uint8 = 0x80
+const SCAN_LEFT_SHIFT: uint8 = 0x2a
+const SCAN_RIGHT_SHIFT: uint8 = 0x36
+const SCAN_LEFT_SHIFT_UP: uint8 = 0xaa
+const SCAN_RIGHT_SHIFT_UP: uint8 = 0xb6
+const SCAN_ARROW_UP: uint8 = 0x48
+const SCAN_ARROW_DOWN: uint8 = 0x50
+
+const DIGIT_ROW_FIRST: uint64 = 0x02
+const DIGIT_ROW_LAST: uint64 = 0x0d
+const UPPER_ROW_FIRST: uint64 = 0x10
+const UPPER_ROW_LAST: uint64 = 0x19
+const HOME_ROW_FIRST: uint64 = 0x1e
+const HOME_ROW_LAST: uint64 = 0x26
+const LOWER_ROW_FIRST: uint64 = 0x2c
+const LOWER_ROW_LAST: uint64 = 0x32
+
+var buffer: uint8[128]
+var head: volatile uint64 = 0
+var tail: volatile uint64 = 0
+var shift_held: volatile uint64 = 0
+var extended: volatile uint64 = 0
+
+fn either(plain: uint8, shifted: uint8) -> uint8 {
+    if (shift_held != 0) {
+        return shifted
+    }
+    return plain
+}
+
+fn letter(ch: uint8) -> uint8 {
+    return either(ch, (uint8)(ch - 32))
+}
+
+fn translate(code: uint8) -> uint8 {
+    var index: uint64 = (uint64)code
+    if (index >= DIGIT_ROW_FIRST && index <= DIGIT_ROW_LAST) {
+        var plain: cstring = "1234567890-="
+        var shifted: cstring = "!@#$%^&*()_+"
+        var offset: uint64 = index - DIGIT_ROW_FIRST
+        return either(plain[offset], shifted[offset])
+    }
+    if (index >= UPPER_ROW_FIRST && index <= UPPER_ROW_LAST) {
+        var row: cstring = "qwertyuiop"
+        return letter(row[index - UPPER_ROW_FIRST])
+    }
+    if (index >= HOME_ROW_FIRST && index <= HOME_ROW_LAST) {
+        var row: cstring = "asdfghjkl"
+        return letter(row[index - HOME_ROW_FIRST])
+    }
+    if (index >= LOWER_ROW_FIRST && index <= LOWER_ROW_LAST) {
+        var row: cstring = "zxcvbnm"
+        return letter(row[index - LOWER_ROW_FIRST])
+    }
+    switch ((int32)index) {
+        case 0x0e: { return KEY_BACKSPACE }
+        case 0x0f: { return KEY_TAB }
+        case 0x1a: { return either('[', '{') }
+        case 0x1b: { return either(']', '}') }
+        case 0x1c: { return KEY_ENTER }
+        case 0x27: { return either(';', ':') }
+        case 0x28: { return either('\'', '"') }
+        case 0x29: { return either('`', '~') }
+        case 0x2b: { return either('\\', '|') }
+        case 0x33: { return either(',', '<') }
+        case 0x34: { return either('.', '>') }
+        case 0x35: { return either('/', '?') }
+        case 0x39: { return ' ' }
+        default: { return 0 }
+    }
+}
+
+fn push(ch: uint8) {
+    var next: uint64 = (head + 1) & BUFFER_MASK
+    if (next != tail) {
+        buffer[head] = ch
+        head = next
+    }
+}
+
+fn decode(code: uint8) -> uint8 {
+    if (extended != 0) {
+        extended = 0
+        if (code == SCAN_ARROW_UP) {
+            return KEY_UP
+        }
+        if (code == SCAN_ARROW_DOWN) {
+            return KEY_DOWN
+        }
+        return 0
+    }
+    if (code == SCAN_LEFT_SHIFT || code == SCAN_RIGHT_SHIFT) {
+        shift_held = 1
+        return 0
+    }
+    if (code == SCAN_LEFT_SHIFT_UP || code == SCAN_RIGHT_SHIFT_UP) {
+        shift_held = 0
+        return 0
+    }
+    if (code >= SCAN_RELEASE) {
+        return 0
+    }
+    return translate(code)
+}
+
+@interrupt fn on_keyboard() {
+    var code: uint8 = port_in(DATA_PORT)
+    if (code == SCAN_EXTENDED) {
+        extended = 1
+    } else {
+        var ch: uint8 = decode(code)
+        if (ch != 0) {
+            push(ch)
+        }
+    }
+    pic_end_of_interrupt()
+}
+
+export fn keyboard_init() {
+    interrupt_install(VECTOR_KEYBOARD, (uint64)&on_keyboard)
+}
+
+export fn keyboard_ready() -> bool {
+    return head != tail
+}
+
+export fn keyboard_read() -> uint8 {
+    while (!keyboard_ready()) {
+        cpu_idle()
+    }
+    var ch: uint8 = buffer[tail]
+    tail = (tail + 1) & BUFFER_MASK
+    return ch
+}

@@ -1,0 +1,67 @@
+const DECIMAL_BASE: uint64 = 10
+const HEX_BASE: uint64 = 16
+
+export fn text_equals(a: cstring, b: cstring) -> bool {
+    var i: uint64 = 0
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i++
+    }
+    return a[i] == b[i]
+}
+
+export fn text_length(text: cstring) -> uint64 {
+    var i: uint64 = 0
+    while (text[i] != 0) {
+        i++
+    }
+    return i
+}
+
+export fn text_empty(text: cstring) -> bool {
+    return text[0] == 0
+}
+
+export fn text_copy(destination: uint8*, limit: uint64, source: cstring) -> uint64 {
+    var i: uint64 = 0
+    while (source[i] != 0 && i + 1 < limit) {
+        destination[i] = source[i]
+        i++
+    }
+    destination[i] = 0
+    return i
+}
+
+fn digit_value(ch: uint8) -> uint64 {
+    if (ch >= '0' && ch <= '9') {
+        return (uint64)(ch - '0')
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return (uint64)(ch - 'a') + 10
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return (uint64)(ch - 'A') + 10
+    }
+    return HEX_BASE
+}
+
+export fn text_parse_number(text: cstring) -> uint64 {
+    var i: uint64 = 0
+    var base: uint64 = DECIMAL_BASE
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = HEX_BASE
+        i = 2
+    }
+    var value: uint64 = 0
+    while (text[i] != 0) {
+        var digit: uint64 = digit_value(text[i])
+        if (digit >= base) {
+            return value
+        }
+        value = value * base + digit
+        i++
+    }
+    return value
+}

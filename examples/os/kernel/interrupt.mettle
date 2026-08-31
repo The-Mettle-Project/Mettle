@@ -1,0 +1,130 @@
+import "port"
+import "console"
+import "vga"
+
+export const VECTOR_COUNT: uint64 = 256
+export const VECTOR_TIMER: uint64 = 32
+export const VECTOR_KEYBOARD: uint64 = 33
+
+const KERNEL_CODE_SELECTOR: uint64 = 8
+const GATE_INTERRUPT: uint64 = 0x8e
+const CPU_VECTORS: uint64 = 32
+const IRQ_VECTORS: uint64 = 16
+
+const PIC_MASTER_COMMAND: uint16 = 0x20
+const PIC_MASTER_DATA: uint16 = 0x21
+const PIC_SLAVE_COMMAND: uint16 = 0xa0
+const PIC_SLAVE_DATA: uint16 = 0xa1
+const PIC_END_OF_INTERRUPT: uint8 = 0x20
+const PIC_INIT: uint8 = 0x11
+const PIC_MODE_8086: uint8 = 0x01
+const PIC_SLAVE_ON_IRQ2: uint8 = 0x04
+const PIC_SLAVE_IDENTITY: uint8 = 0x02
+const PIC_MASTER_OFFSET: uint8 = 0x20
+const PIC_SLAVE_OFFSET: uint8 = 0x28
+const MASK_ALL_BUT_TIMER_AND_KEYBOARD: uint8 = 0xfc
+const MASK_ALL: uint8 = 0xff
+
+struct InterruptFrame {
+    rip: uint64;
+    cs: uint64;
+    flags: uint64;
+    rsp: uint64;
+    ss: uint64;
+}
+
+export var idt_table: uint64[512]
+export var idt_descriptor: uint8[16]
+
+export fn interrupt_install(vector: uint64, handler: uint64) {
+    idt_table[vector * 2] = (handler & 0xffff) |
+                      (KERNEL_CODE_SELECTOR << 16) |
+                      (GATE_INTERRUPT << 40) |
+                      (((handler >> 16) & 0xffff) << 48)
+    idt_table[vector * 2 + 1] = handler >> 32
+}
+
+fn load_descriptor() {
+    var limit: uint16* = (uint16*)&idt_descriptor[0]
+    var base: uint64* = (uint64*)&idt_descriptor[2]
+    limit[0] = (uint16)(VECTOR_COUNT * 16 - 1)
+    base[0] = (uint64)&idt_table[0]
+    asm {
+        lidt {idt_descriptor}
+    }
+}
+
+fn report_fault(rip: uint64) {
+    console_color(COLOR_ALARM)
+    console_write_line("")
+    console_write_line(" cpu exception, the kernel stops here ")
+    console_write(" rip ")
+    console_write_hex(rip, 16)
+}
+
+@interrupt fn on_fault(frame: InterruptFrame*) {
+    report_fault(frame->rip)
+    console_write_line("")
+    cpu_stop()
+}
+
+@interrupt fn on_fault_with_code(frame: InterruptFrame*, error_code: uint64) {
+    report_fault(frame->rip)
+    console_write(" error ")
+    console_write_hex(error_code, 8)
+    console_write_line("")
+    cpu_stop()
+}
+
+@interrupt fn on_spurious() {
+    port_out(PIC_MASTER_COMMAND, PIC_END_OF_INTERRUPT)
+}
+
+export fn pic_end_of_interrupt() {
+    port_out(PIC_MASTER_COMMAND, PIC_END_OF_INTERRUPT)
+}
+
+export fn pic_init() {
+    port_out(PIC_MASTER_COMMAND, PIC_INIT)
+    port_settle()
+    port_out(PIC_SLAVE_COMMAND, PIC_INIT)
+    port_settle()
+    port_out(PIC_MASTER_DATA, PIC_MASTER_OFFSET)
+    port_settle()
+    port_out(PIC_SLAVE_DATA, PIC_SLAVE_OFFSET)
+    port_settle()
+    port_out(PIC_MASTER_DATA, PIC_SLAVE_ON_IRQ2)
+    port_settle()
+    port_out(PIC_SLAVE_DATA, PIC_SLAVE_IDENTITY)
+    port_settle()
+    port_out(PIC_MASTER_DATA, PIC_MODE_8086)
+    port_settle()
+    port_out(PIC_SLAVE_DATA, PIC_MODE_8086)
+    port_settle()
+    port_out(PIC_MASTER_DATA, MASK_ALL_BUT_TIMER_AND_KEYBOARD)
+    port_out(PIC_SLAVE_DATA, MASK_ALL)
+}
+
+fn install_fault_handlers() {
+    var plain: uint64 = (uint64)&on_fault
+    var with_code: uint64 = (uint64)&on_fault_with_code
+    for vector: uint64 in 0..CPU_VECTORS {
+        interrupt_install(vector, plain)
+    }
+    interrupt_install(8, with_code)
+    interrupt_install(10, with_code)
+    interrupt_install(11, with_code)
+    interrupt_install(12, with_code)
+    interrupt_install(13, with_code)
+    interrupt_install(14, with_code)
+    interrupt_install(17, with_code)
+}
+
+export fn interrupt_init() {
+    install_fault_handlers()
+    var spurious: uint64 = (uint64)&on_spurious
+    for vector: uint64 in CPU_VECTORS..(CPU_VECTORS + IRQ_VECTORS) {
+        interrupt_install(vector, spurious)
+    }
+    load_descriptor()
+}

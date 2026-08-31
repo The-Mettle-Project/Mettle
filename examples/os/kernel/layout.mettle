@@ -1,0 +1,16 @@
+export const PAGE_SIZE: uint64 = 4096
+
+export const BOOT_INFO_BASE: uint64 = 0x5000
+export const KERNEL_BASE: uint64 = 0x20000
+export const ARCHIVE_BASE: uint64 = 0x30000
+export const STACK_TOP: uint64 = 0x90000
+export const VGA_TEXT_BASE: uint64 = 0xb8000
+
+export const HEAP_FLOOR: uint64 = 0x200000
+export const IDENTITY_LIMIT: uint64 = 0x40000000
+
+export const GDT_CODE_SELECTOR: uint64 = 0x08
+export const GDT_DATA_SELECTOR: uint64 = 0x10
+
+export const BYTES_PER_KB: uint64 = 1024
+export const BYTES_PER_MB: uint64 = 1048576

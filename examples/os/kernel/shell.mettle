@@ -1,0 +1,152 @@
+import "console"
+import "vga"
+import "keyboard"
+import "text"
+
+const COMMAND_SLOTS: uint64 = 24
+const HISTORY_SLOTS: uint64 = 8
+const LINE_BYTES: uint64 = 128
+const LINE_LIMIT: uint64 = LINE_BYTES - 2
+const WORD_BYTES: uint64 = 32
+const HELP_COLUMN: uint64 = 16
+
+struct Command {
+    name: cstring;
+    help: cstring;
+    handler: fn(cstring) -> void;
+}
+
+var commands: Command[24]
+var count: uint64 = 0
+
+var line: uint8[128]
+var word: uint8[32]
+var history: uint8[1024]
+var history_count: uint64 = 0
+
+export fn shell_register(name: cstring, help: cstring,
+                         handler: fn(cstring) -> void) {
+    if (count >= COMMAND_SLOTS) {
+        return
+    }
+    commands[count].name = name
+    commands[count].help = help
+    commands[count].handler = handler
+    count++
+}
+
+export fn shell_help() {
+    console_write_line("commands")
+    for i: uint64 in 0..count {
+        console_write("  ")
+        console_pad(commands[i].name, HELP_COLUMN)
+        console_write_line(commands[i].help)
+    }
+    console_write_line("arrow up and down walk the command history")
+}
+
+fn history_slot(age: uint64) -> uint64 {
+    return ((history_count - age) % HISTORY_SLOTS) * LINE_BYTES
+}
+
+fn history_store(length: uint64) {
+    if (length == 0) {
+        return
+    }
+    var slot: uint64 = history_count % HISTORY_SLOTS * LINE_BYTES
+    for i: uint64 in 0..LINE_BYTES {
+        if (i < length) {
+            history[slot + i] = line[i]
+        } else {
+            history[slot + i] = 0
+        }
+    }
+    history_count++
+}
+
+fn history_recall(age: uint64, shown: uint64) -> uint64 {
+    var slot: uint64 = history_slot(age)
+    for i: uint64 in 0..shown {
+        console_put(KEY_BACKSPACE)
+    }
+    var length: uint64 = 0
+    while (history[slot + length] != 0 && length < LINE_LIMIT) {
+        line[length] = history[slot + length]
+        console_put(line[length])
+        length++
+    }
+    return length
+}
+
+fn read_line() -> uint64 {
+    var length: uint64 = 0
+    var age: uint64 = 0
+    while (true) {
+        console_sync_cursor()
+        var ch: uint8 = keyboard_read()
+        if (ch == KEY_ENTER) {
+            console_put('\n')
+            line[length] = 0
+            history_store(length)
+            return length
+        }
+        if (ch == KEY_UP) {
+            if (age < history_count && age < HISTORY_SLOTS) {
+                age++
+                length = history_recall(age, length)
+            }
+        } else if (ch == KEY_DOWN) {
+            if (age > 1) {
+                age--
+                length = history_recall(age, length)
+            }
+        } else if (ch == KEY_BACKSPACE) {
+            if (length > 0) {
+                length--
+                console_put(KEY_BACKSPACE)
+            }
+        } else if (length < LINE_LIMIT) {
+            line[length] = ch
+            length++
+            console_put(ch)
+        }
+    }
+    return 0
+}
+
+fn take_word(input: cstring) -> uint64 {
+    var i: uint64 = 0
+    while (input[i] != 0 && input[i] != ' ' && i + 1 < WORD_BYTES) {
+        word[i] = input[i]
+        i++
+    }
+    word[i] = 0
+    while (input[i] == ' ') {
+        i++
+    }
+    return i
+}
+
+export fn shell_dispatch(input: cstring) {
+    var rest: cstring = (cstring)&input[take_word(input)]
+    var name: cstring = (cstring)&word[0]
+    if (text_empty(name)) {
+        return
+    }
+    for i: uint64 in 0..count {
+        if (text_equals(commands[i].name, name)) {
+            commands[i].handler(rest)
+            return
+        }
+    }
+    console_write("unknown command ")
+    console_write_line(name)
+}
+
+export fn shell_run() {
+    while (true) {
+        console_write_colored("mettle> ", COLOR_PROMPT)
+        read_line()
+        shell_dispatch((cstring)&line[0])
+    }
+}

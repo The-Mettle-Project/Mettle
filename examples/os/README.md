@@ -28,14 +28,66 @@ compiled to a flat image with `--target x86_64-none`.
 - **Output.** An 80x25 VGA console with scrolling and a hardware cursor, a
   status bar drawn by a background task, and a copy of everything on COM1.
 
+## Modules
+
+`kernel.mettle` is the entry file and does nothing but wire the modules
+together in `kernel/`. Each one owns its state and hands out an interface;
+nothing reaches into another module's globals.
+
+| Module | Owns |
+| --- | --- |
+| `layout` | Where things sit in physical memory. Every fixed address in the system is here. |
+| `port` | `in`, `out`, and the instructions that stop or idle the processor. |
+| `text` | Comparing, measuring, copying, and parsing bytes. |
+| `format` | Turning numbers into digits. The console and the screen share it. |
+| `vga` | The screen: cells, colour, the cursor, scrolling, the text region. |
+| `serial` | COM1. |
+| `console` | Byte output. Writes to the screen and to every registered stream. |
+| `interrupt` | The IDT, the fault handlers, and the PIC. |
+| `clock` | The timer, the CMOS clock, sleeping, and the speaker. |
+| `page` | The firmware memory map and the free page list built from it. |
+| `heap` | Splitting and merging blocks inside pages. |
+| `task` | The task table, the scheduler, and the context switch. |
+| `keyboard` | Scancodes to characters, and the ring buffer between them. |
+| `archive` | The files packed into the boot image. |
+| `shell` | The command registry, the line editor, and the history. |
+| `status` | The status bar and the counter tasks that draw it. |
+| `commands` | Every built-in command, registered at startup. |
+
+The dependencies run one way. `port`, `text`, `format`, and `layout` depend on
+nothing. `vga` and `serial` sit on `port`; `console` sits on those; `interrupt`
+reports faults through `console`; `task` and `keyboard` install themselves into
+`interrupt`; `shell` and `commands` sit on top of everything.
+
+Three registries keep it that way, so a module adds itself rather than being
+named by the layer below:
+
+```mettle
+interrupt_install(VECTOR_KEYBOARD, (uint64)&on_keyboard)
+console_add_stream(&serial_put)
+shell_register("ps", "the task table", &cmd_ps)
+```
+
+## Adding to it
+
+- **A command.** Write `fn cmd_thing(argument: cstring)` in
+  `kernel/commands.mettle` and add one `shell_register` line. Nothing else
+  changes, and `help` picks it up on its own.
+- **An output device.** Write a `fn put(ch: uint8)` and call
+  `console_add_stream(&put)` once. Every line the kernel prints goes there too.
+- **An interrupt.** Write an `@interrupt fn`, then
+  `interrupt_install(vector, (uint64)&handler)` in your module's init.
+- **A file.** Drop it in `files/` and rebuild.
+
 ## Files
 
 | File | What it is |
 | --- | --- |
 | `boot.mettle` | The boot sector at 0x7c00. Memory map, 128 KB read off the floppy, A20, page tables, long mode. |
-| `kernel.mettle` | The kernel at 0x20000. |
+| `kernel.mettle` | The entry point and the boot order. |
+| `kernel/` | The modules above. |
 | `files/` | Text carried in the boot image and read back by `ls` and `cat`. |
-| `build.ps1` | Compiles both, packs the archive, writes `mettleos.img`. |
+| `build.ps1` | Compiles both images, packs the archive, writes `mettleos.img`. |
 | `run.ps1` | Creates the VirtualBox machine, attaches the image, starts it. |
 
 ## Build
@@ -144,6 +196,12 @@ functions, where the compiler writes the entry and the `iretq` itself, in both
 shapes, with and without an error code.
 
 ## Limits
+
+Two things constrain how the modules are written. An `asm` block inside an
+imported module can only name exported symbols, which is why `timer_tick` and
+the IDT descriptor carry `export`. And a module global that is read before it
+is written anywhere in the file cannot be assigned afterwards, so module state
+is written first and read later.
 
 There is no userspace, no privilege separation, and no disk driver: the kernel
 never talks to the floppy again after the boot sector reads it. The heap tops

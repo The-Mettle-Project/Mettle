@@ -1,0 +1,296 @@
+import "layout"
+import "port"
+import "console"
+import "vga"
+import "page"
+import "heap"
+import "clock"
+import "task"
+import "archive"
+import "status"
+import "shell"
+import "text"
+
+const VENDOR_BYTES: uint64 = 16
+const DUMP_ROWS: uint64 = 8
+const DUMP_COLUMNS: uint64 = 16
+const KEYBOARD_COMMAND_PORT: uint16 = 0x64
+const KEYBOARD_RESET_PULSE: uint8 = 0xfe
+const BEEP_TICKS: uint64 = 20
+const PRINTABLE_FIRST: uint8 = 32
+const PRINTABLE_LAST: uint8 = 126
+
+var vendor: uint8[16]
+
+fn cmd_help(argument: cstring) {
+    shell_help()
+}
+
+fn cmd_clear(argument: cstring) {
+    console_clear()
+}
+
+fn cmd_echo(argument: cstring) {
+    console_write_line(argument)
+}
+
+fn print_memory_map() -> uint64 {
+    var usable: uint64 = 0
+    console_write_line("base                 length               kind")
+    for i: uint64 in 0..memory_map_count() {
+        var region: MemoryRegion* = memory_map_region(i)
+        console_write_hex(region->base, 16)
+        console_write("   ")
+        console_write_hex(region->length, 16)
+        console_write("   ")
+        console_write_line(memory_map_kind_name(region->kind))
+        if (region->kind == 1) {
+            usable += region->length
+        }
+    }
+    return usable
+}
+
+fn cmd_mem(argument: cstring) {
+    if (memory_map_count() == 0) {
+        console_write_line("the firmware reported no memory map")
+    } else {
+        console_write("firmware calls ")
+        console_write_decimal(print_memory_map() / BYTES_PER_MB)
+        console_write_line(" mb usable")
+    }
+    console_write("pages ")
+    console_write_decimal(page_free_count())
+    console_write(" free of ")
+    console_write_decimal(page_total_count())
+    console_write(", ")
+    console_write_decimal(page_free_bytes() / BYTES_PER_KB)
+    console_write_line(" kb available")
+    console_write("heap ")
+    console_write_decimal(heap_used())
+    console_write(" bytes handed out of ")
+    console_write_decimal(heap_claimed())
+    console_write_line(" bytes claimed")
+}
+
+fn cmd_alloc(argument: cstring) {
+    var sizes: uint64[8] = [16, 64, 200, 1000, 32, 512, 24, 700]
+    var blocks: uint64[8]
+    var failures: uint64 = 0
+    for i: uint64 in 0..8 {
+        blocks[i] = heap_alloc(sizes[i])
+        if (blocks[i] == 0) {
+            failures++
+        } else {
+            var bytes: uint8* = (uint8*)blocks[i]
+            for j: uint64 in 0..sizes[i] {
+                bytes[j] = (uint8)(i + 1)
+            }
+        }
+    }
+    for i: uint64 in 0..8 {
+        if (blocks[i] != 0) {
+            var bytes: uint8* = (uint8*)blocks[i]
+            for j: uint64 in 0..sizes[i] {
+                if (bytes[j] != (uint8)(i + 1)) {
+                    failures++
+                }
+            }
+        }
+    }
+    console_write("eight blocks written and read back, ")
+    console_write_decimal(failures)
+    console_write_line(" failures")
+    for i: uint64 in 0..8 {
+        heap_free(blocks[i])
+    }
+    console_write("heap now holds ")
+    console_write_decimal(heap_used())
+    console_write(" bytes over ")
+    console_write_decimal(heap_claimed())
+    console_write_line(" claimed")
+}
+
+fn cmd_uptime(argument: cstring) {
+    var seconds: uint64 = clock_seconds()
+    console_write("up ")
+    console_write_decimal(seconds / 60)
+    console_write("m ")
+    console_write_decimal(seconds % 60)
+    console_write("s over ")
+    console_write_decimal(clock_ticks())
+    console_write_line(" timer ticks")
+}
+
+fn cmd_date(argument: cstring) {
+    console_write_decimal(clock_year())
+    console_put('-')
+    console_write_decimal(clock_month())
+    console_put('-')
+    console_write_decimal(clock_day())
+    console_put(' ')
+    console_write_decimal(clock_hour())
+    console_put(':')
+    console_write_decimal(clock_minute())
+    console_put(':')
+    console_write_decimal(clock_second())
+    console_write_line(" by the cmos clock")
+}
+
+fn cmd_cpu(argument: cstring) {
+    cpu_vendor(&vendor[0])
+    console_write("vendor ")
+    console_write_line((cstring)&vendor[0])
+    console_write_line("long mode, one gigabyte identity mapped with two megabyte pages")
+}
+
+fn cmd_ls(argument: cstring) {
+    if (archive_count() == 0) {
+        console_write_line("no archive was loaded with the kernel")
+        return
+    }
+    console_write_line("size      name")
+    for i: uint64 in 0..archive_count() {
+        console_write_padded(archive_length(i), 10)
+        console_write_line(archive_name(i))
+    }
+}
+
+export fn cmd_cat(argument: cstring) {
+    if (text_empty(argument)) {
+        console_write_line("cat wants a file name, ls lists them")
+        return
+    }
+    var index: uint64 = archive_find(argument)
+    if (!archive_holds(index)) {
+        console_write("no such file ")
+        console_write_line(argument)
+        return
+    }
+    var data: uint8* = archive_data(index)
+    for i: uint64 in 0..archive_length(index) {
+        var ch: uint8 = data[i]
+        if (ch == '\n' || (ch >= PRINTABLE_FIRST && ch <= PRINTABLE_LAST)) {
+            console_put(ch)
+        }
+    }
+    console_put('\n')
+}
+
+fn cmd_ps(argument: cstring) {
+    console_write_line("id  state    slices   stack       name")
+    for i: uint64 in 0..TASK_SLOTS {
+        if (task_in_use(i)) {
+            console_write_padded(i, 4)
+            console_pad(task_state_name(i), 9)
+            console_write_padded(task_slices(i), 9)
+            console_write_hex(task_stack_base(i), 8)
+            console_write("  ")
+            console_write_line(task_name(i))
+        }
+    }
+}
+
+fn cmd_spawn(argument: cstring) {
+    var slot: uint64 = counter_start()
+    if (slot >= TASK_SLOTS) {
+        console_write_line("no free task slot or no free page")
+        return
+    }
+    console_write("task ")
+    console_write_decimal(slot)
+    console_write_line(" is counting on the bottom line")
+}
+
+fn cmd_kill(argument: cstring) {
+    var slot: uint64 = text_parse_number(argument)
+    if (slot == 0 || slot >= TASK_SLOTS) {
+        console_write_line("kill wants a task id from ps, and the shell cannot be killed")
+        return
+    }
+    if (!task_in_use(slot)) {
+        console_write_line("no task there")
+        return
+    }
+    task_request_stop(slot)
+    console_write("asked task ")
+    console_write_decimal(slot)
+    console_write_line(" to stop")
+}
+
+fn dump_row(bytes: uint8*, offset: uint64) {
+    for i: uint64 in 0..DUMP_COLUMNS {
+        console_write_hex_byte((uint64)bytes[offset + i])
+        console_put(' ')
+    }
+    console_put(' ')
+    for i: uint64 in 0..DUMP_COLUMNS {
+        var ch: uint8 = bytes[offset + i]
+        if (ch >= PRINTABLE_FIRST && ch <= PRINTABLE_LAST) {
+            console_put(ch)
+        } else {
+            console_put('.')
+        }
+    }
+    console_put('\n')
+}
+
+fn cmd_hexdump(argument: cstring) {
+    var address: uint64 = text_parse_number(argument)
+    if (address == 0) {
+        address = KERNEL_BASE
+    }
+    var bytes: uint8* = (uint8*)address
+    for row: uint64 in 0..DUMP_ROWS {
+        console_write_hex(address + row * DUMP_COLUMNS, 16)
+        console_write("  ")
+        dump_row(bytes, row * DUMP_COLUMNS)
+    }
+}
+
+fn cmd_beep(argument: cstring) {
+    speaker_beep(BEEP_TICKS)
+}
+
+export fn cmd_banner(argument: cstring) {
+    console_write_colored("  mettle os  ", COLOR_TITLE)
+    console_put('\n')
+    console_write_colored("a kernel compiled straight to a flat image by the mettle compiler",
+                          COLOR_NOTE)
+    console_put('\n')
+    console_write_line("type help for the command list")
+    console_put('\n')
+}
+
+fn cmd_reboot(argument: cstring) {
+    console_write_line("resetting")
+    cpu_disable_interrupts()
+    port_out(KEYBOARD_COMMAND_PORT, KEYBOARD_RESET_PULSE)
+    cpu_stop()
+}
+
+fn cmd_halt(argument: cstring) {
+    console_write_line("halted, close the window when you are done")
+    cpu_stop()
+}
+
+export fn commands_init() {
+    shell_register("help", "this list", &cmd_help)
+    shell_register("clear", "wipe the screen", &cmd_clear)
+    shell_register("echo", "print the rest of the line", &cmd_echo)
+    shell_register("mem", "memory map, free pages, heap", &cmd_mem)
+    shell_register("alloc", "exercise the heap and report", &cmd_alloc)
+    shell_register("uptime", "seconds and ticks since boot", &cmd_uptime)
+    shell_register("date", "the clock the firmware keeps", &cmd_date)
+    shell_register("cpu", "what the processor calls itself", &cmd_cpu)
+    shell_register("ls", "files carried in the boot image", &cmd_ls)
+    shell_register("cat", "print one of them", &cmd_cat)
+    shell_register("ps", "the task table", &cmd_ps)
+    shell_register("spawn", "start a counting task", &cmd_spawn)
+    shell_register("kill", "ask a task to stop", &cmd_kill)
+    shell_register("hexdump", "128 bytes of memory", &cmd_hexdump)
+    shell_register("beep", "a note on the speaker", &cmd_beep)
+    shell_register("banner", "draw the greeting again", &cmd_banner)
+    shell_register("reboot", "pulse the keyboard controller reset", &cmd_reboot)
+    shell_register("halt", "stop the processor", &cmd_halt)
+}
