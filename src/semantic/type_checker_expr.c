@@ -2542,14 +2542,16 @@ static int type_checker_check_gathered_arguments(TypeChecker *checker,
     }
   }
 
-  /* One argument that is already the slice is the slice: `warn(parts)` inside
-     a variadic function passes what it was given rather than a slice of one. */
+  /* One argument that is already the whole run is the whole run: a slice of
+     the element type, or an array of it. That is how a variadic call forwards
+     what it was handed, in one piece. */
   if (call->argument_count == fixed + 1) {
     Type *only = type_checker_infer_type(checker, call->arguments[fixed]);
     if (!only) {
       return 0;
     }
-    if (only->kind == TYPE_SLICE && only->base_type &&
+    if ((only->kind == TYPE_SLICE || only->kind == TYPE_ARRAY) &&
+        only->base_type &&
         type_checker_types_equal(only->base_type, element)) {
       return 1;
     }
@@ -2569,6 +2571,91 @@ static int type_checker_check_gathered_arguments(TypeChecker *checker,
                                           element, argument);
       return 0;
     }
+  }
+
+  /* Gather them here, into the array literal the call would have had to write
+     out by hand. From this point nothing downstream can tell the two apart:
+     the argument is an array of the element type, and it becomes a slice the
+     way any array does. */
+  {
+    size_t gathered_count = call->argument_count - fixed;
+    ASTNode **elements = NULL;
+    ASTNode *gathered_literal = NULL;
+    ASTNode **new_arguments = NULL;
+
+    /* No arguments to gather is an empty slice: no data and no length, which
+       is exactly what the callee's loop reads. */
+    if (gathered_count == 0) {
+      ASTNode **empty_arguments = malloc((fixed + 1) * sizeof(ASTNode *));
+      ASTNode *empty = ast_create_aggregate_literal(1, NULL, NULL, 0, NULL,
+                                                    expression->location);
+      if (!empty_arguments || !empty) {
+        free(empty_arguments);
+        if (empty) {
+          ast_destroy_node(empty);
+        }
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "Out of memory gathering the arguments of '%s'",
+            call->function_name);
+        return 0;
+      }
+      ast_add_child(expression, empty);
+      for (i = 0; i < fixed; i++) {
+        empty_arguments[i] = call->arguments[i];
+      }
+      empty_arguments[fixed] = empty;
+      free(call->arguments);
+      call->arguments = empty_arguments;
+      call->argument_count = fixed + 1;
+      return type_checker_check_aggregate_literal(checker, empty, gathered,
+                                                  0) != NULL;
+    }
+
+    elements = malloc(gathered_count * sizeof(ASTNode *));
+    new_arguments = malloc((fixed + 1) * sizeof(ASTNode *));
+    if (!elements || !new_arguments) {
+      free(elements);
+      free(new_arguments);
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Out of memory gathering the arguments of '%s'",
+          call->function_name);
+      return 0;
+    }
+    for (i = 0; i < gathered_count; i++) {
+      elements[i] = call->arguments[fixed + i];
+    }
+    gathered_literal = ast_create_aggregate_literal(
+        0, elements, NULL, gathered_count, NULL,
+        call->arguments[fixed]->location);
+    if (!gathered_literal) {
+      free(elements);
+      free(new_arguments);
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "Out of memory gathering the arguments of '%s'",
+          call->function_name);
+      return 0;
+    }
+    /* The gathered expressions stay children of the call, which is what owns
+       them. The literal holds them only to fold and lower them. */
+    ast_release_children(gathered_literal);
+    ast_add_child(expression, gathered_literal);
+
+    for (i = 0; i < fixed; i++) {
+      new_arguments[i] = call->arguments[i];
+    }
+    new_arguments[fixed] = gathered_literal;
+    free(call->arguments);
+    call->arguments = new_arguments;
+    call->argument_count = fixed + 1;
+
+    if (!type_checker_check_aggregate_literal(checker, gathered_literal,
+                                              gathered, 0)) {
+      return 0;
+    }
+    (void)0;
   }
   return 1;
 }
@@ -2616,7 +2703,12 @@ if (call->argument_count != func_symbol->data.function.parameter_count) {
 
 // Check each argument type
 for (size_t i = 0; i < call->argument_count; i++) {
+  /* An aggregate literal takes the type of what it initializes, and at a call
+     that is the parameter. Park it the way a `var` does. */
+  checker->aggregate_target_type =
+      func_symbol->data.function.parameter_types[i];
   Type *arg_type = type_checker_infer_type(checker, call->arguments[i]);
+  checker->aggregate_target_type = NULL;
   if (!arg_type) {
     // Error already set by type inference
     return 0;

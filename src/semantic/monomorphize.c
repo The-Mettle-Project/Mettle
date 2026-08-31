@@ -50,9 +50,9 @@ typedef struct {
   size_t def_count;
   Instantiation *instances;
   size_t instance_count;
-  /* The module, so inference can read a called function's return type. Held
-     as the program rather than as its declaration array, which moves as
-     instantiations are appended. */
+  /* The module, so inference can read a called function's return type. It is
+     held as the program, whose declaration array moves as instantiations are
+     appended. */
   Program *module;
 } MonoContext;
 
@@ -2366,7 +2366,7 @@ static int mono_match_generic_args(const char *pattern, const char *actual,
 
 /* Bind what `pattern` says about `actual`. Returns 0 only on a contradiction
  * between two uses of the same type parameter, which is what makes a call
- * ambiguous rather than merely unreadable. */
+ * ambiguous. */
 static int mono_match_type_text(const char *pattern, const char *actual,
                                 char **params, size_t param_count,
                                 MonoTypeBinding *bindings) {

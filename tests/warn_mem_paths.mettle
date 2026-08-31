@@ -1,0 +1,117 @@
+// A branch used to be invisible to the memory analysis: every fact inside one
+// was demoted to "maybe", so nothing inside an `if`, a loop, a `switch` or a
+// `match` was ever reported. Within one execution of a block the statements do
+// run in order, so a bug inside one is a bug whenever that block runs.
+//
+// What the paths disagree about stays conservative: the state after a branch is
+// what every arm agreed on. The `clean_` functions below are the control, and
+// must produce no diagnostic at all.
+
+import "std/mem";
+
+fn use_after_free_in_branch(flag: int32) -> int32 {
+  var p: int32* = (int32*)malloc(16);
+  p[0] = 1;
+  if (flag > 0) {
+    free(p);
+    return p[0];
+  }
+  free(p);
+  return 0;
+}
+
+fn double_free_in_branch(flag: int32) -> int32 {
+  var d: int32* = (int32*)malloc(16);
+  if (flag > 0) {
+    free(d);
+    free(d);
+    return 1;
+  }
+  free(d);
+  return 0;
+}
+
+fn leak_in_branch(flag: int32) -> int32 {
+  if (flag > 0) {
+    var buffer: int32* = (int32*)malloc(16);
+    buffer[0] = 7;
+    return buffer[0];
+  }
+  return 0;
+}
+
+fn use_after_both_arms_free(flag: int32) -> int32 {
+  var both: int32* = (int32*)malloc(16);
+  if (flag > 0) {
+    free(both);
+  } else {
+    free(both);
+  }
+  return both[0];
+}
+
+fn leak_in_loop(count: int32) -> int32 {
+  var total: int32 = 0;
+  for i in 0..count {
+    var each: int32* = (int32*)malloc(16);
+    each[0] = (int32)i;
+    total = total + each[0];
+  }
+  return total;
+}
+
+// Controls. One arm freeing and another using is two paths, not a bug.
+fn clean_one_arm_frees(flag: int32) -> int32 {
+  var kept: int32* = (int32*)malloc(16);
+  kept[0] = 3;
+  if (flag > 0) {
+    free(kept);
+    return 1;
+  }
+  var value: int32 = kept[0];
+  free(kept);
+  return value;
+}
+
+fn clean_arm_owns_its_own(flag: int32) -> int32 {
+  if (flag > 0) {
+    var mine: int32* = (int32*)malloc(16);
+    mine[0] = 1;
+    var value: int32 = mine[0];
+    free(mine);
+    return value;
+  }
+  return 0;
+}
+
+fn clean_freed_in_loop(count: int32) -> int32 {
+  var total: int32 = 0;
+  for i in 0..count {
+    var step: int32* = (int32*)malloc(16);
+    step[0] = (int32)i;
+    total = total + step[0];
+    free(step);
+  }
+  return total;
+}
+
+fn clean_switch_arms(kind: int32) -> int32 {
+  var shared: int32* = (int32*)malloc(16);
+  shared[0] = 4;
+  var value: int32 = 0;
+  switch (kind) {
+    case 1: { value = shared[0]; }
+    case 2: { value = shared[0] + 1; }
+    default: { value = 0; }
+  }
+  free(shared);
+  return value;
+}
+
+fn main() -> int32 {
+  var total: int32 = use_after_free_in_branch(0) + double_free_in_branch(0);
+  total = total + leak_in_branch(0) + leak_in_loop(0);
+  total = total + clean_one_arm_frees(0) + clean_arm_owns_its_own(0);
+  total = total + clean_freed_in_loop(0) + clean_switch_arms(0);
+  return total + use_after_both_arms_free(0) * 0;
+}

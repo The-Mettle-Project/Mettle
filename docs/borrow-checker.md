@@ -75,6 +75,29 @@ pointer
 
 Finish with the derived pointers before freeing the base.
 
+## Paths
+
+A branch is not a blind spot. Each arm is followed with its own facts holding,
+because within one execution of a block the statements do run in order:
+
+```mettle
+if (flag > 0) {
+  free(p);
+  return p[0];
+}
+```
+
+```text
+warning[M0101]: Use of `p` after it was freed (freed at line 4); this is
+use-after-free
+```
+
+What the arms disagree about is where it goes quiet. After an `if`, a pointer
+counts as freed only when every arm freed it; freed on one path and read on
+another is two paths that disagree, and nothing is said. A loop body is one
+path and not entering the loop is another, so an allocation freed in the body
+is accounted for, and one the body never frees is a leak.
+
 ## Where it stays quiet
 
 The analysis proves things about code it can follow. It says nothing when it

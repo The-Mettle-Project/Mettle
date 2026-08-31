@@ -1736,13 +1736,244 @@ static void mem_scope_exit_check(MemCtx *ctx, int level) {
   }
 }
 
-static void mem_walk_branch(MemCtx *ctx, ASTNode *body) {
-  int level = ++ctx->scope_level;
-  ctx->depth++;
+/* ---- paths ------------------------------------------------------------------
+ *
+ * A fact used to be definite only on the function's straight-line spine, so
+ * everything a branch or a loop body did was demoted to "maybe" and went
+ * unreported. That left the code most programs are actually made of invisible.
+ *
+ * A path is walked with its facts definite, because within one execution of
+ * that block the statements do run in order: `if (c) { free(p); p[0] = 1; }`
+ * is a use-after-free whenever the branch is taken, and saying so proves
+ * something about every execution of it. What the paths disagree about stays
+ * conservative: the state after an `if` is the state both arms agreed on, and
+ * a loop merges its body against not running at all.
+ *
+ * Only the facts that drive a report are merged. The rest of a local -- its
+ * name, type, declaration site, scope -- is the same on every path. */
+
+typedef struct {
+  MemLocal *locals;
+  size_t count;
+} MemPath;
+
+static int mem_path_save(const MemCtx *ctx, MemPath *out) {
+  out->count = ctx->local_count;
+  out->locals = NULL;
+  if (out->count == 0) {
+    return 1;
+  }
+  out->locals = malloc(out->count * sizeof(MemLocal));
+  if (!out->locals) {
+    out->count = 0;
+    return 0;
+  }
+  memcpy(out->locals, ctx->locals, out->count * sizeof(MemLocal));
+  return 1;
+}
+
+static void mem_path_free(MemPath *path) {
+  free(path->locals);
+  path->locals = NULL;
+  path->count = 0;
+}
+
+static void mem_path_restore(MemCtx *ctx, const MemPath *path) {
+  if (path->count > 0 && path->locals) {
+    memcpy(ctx->locals, path->locals, path->count * sizeof(MemLocal));
+  }
+}
+
+/* What both paths agree on, written over `into`. */
+static void mem_local_join(MemLocal *into, const MemLocal *a,
+                           const MemLocal *b) {
+  /* An "ever" fact is a fact about the whole function, so it survives either
+     path having established it. */
+  into->ever_freed = a->ever_freed || b->ever_freed;
+  into->escaped = a->escaped || b->escaped;
+  into->reassigned = a->reassigned || b->reassigned;
+  into->out_of_scope = a->out_of_scope || b->out_of_scope;
+
+  if (a->freed == MEM_FREED_DEFINITE && b->freed == MEM_FREED_DEFINITE) {
+    into->freed = MEM_FREED_DEFINITE;
+    into->freed_loc = a->freed_loc;
+    into->freed_via = a->freed_via;
+    into->freed_alias = a->freed_alias;
+  } else if (a->freed != MEM_FREED_NO || b->freed != MEM_FREED_NO) {
+    const MemLocal *from = a->freed != MEM_FREED_NO ? a : b;
+    into->freed = MEM_FREED_MAYBE;
+    into->freed_loc = from->freed_loc;
+    into->freed_via = from->freed_via;
+    into->freed_alias = from->freed_alias;
+  } else {
+    into->freed = MEM_FREED_NO;
+    into->freed_via = NULL;
+    into->freed_alias = NULL;
+  }
+
+  if (a->holds_alloc && b->holds_alloc) {
+    into->holds_alloc = 1;
+    into->alloc_loc = a->alloc_loc;
+    into->alloc_via = a->alloc_via;
+  } else {
+    into->holds_alloc = 0;
+    into->alloc_via = NULL;
+  }
+
+  if (a->is_null && b->is_null) {
+    into->is_null = 1;
+    into->null_loc = a->null_loc;
+  } else {
+    into->is_null = 0;
+  }
+
+  if (a->is_wild && b->is_wild && a->wild_value == b->wild_value) {
+    into->is_wild = 1;
+    into->wild_value = a->wild_value;
+    into->wild_loc = a->wild_loc;
+  } else {
+    into->is_wild = 0;
+  }
+
+  if (a->borrow_dangling != BORROW_OK && b->borrow_dangling != BORROW_OK) {
+    into->borrow_dangling = a->borrow_dangling;
+    into->borrow_killed_loc = a->borrow_killed_loc;
+    into->borrow_killed_via = a->borrow_killed_via;
+  } else {
+    into->borrow_dangling = BORROW_OK;
+    into->borrow_killed_via = NULL;
+  }
+
+  if (a->has_const_value && b->has_const_value &&
+      a->const_value == b->const_value) {
+    into->has_const_value = 1;
+    into->const_value = a->const_value;
+  } else {
+    into->has_const_value = 0;
+  }
+
+  if (a->points_to_stack && b->points_to_stack &&
+      a->points_to_slot == b->points_to_slot &&
+      a->points_to_offset == b->points_to_offset) {
+    into->points_to_stack = a->points_to_stack;
+    into->points_to_slot = a->points_to_slot;
+    into->points_to_offset = a->points_to_offset;
+  } else {
+    into->points_to_stack = NULL;
+    into->points_to_slot = 0;
+    into->points_to_offset = -1;
+  }
+
+  if (a->borrows_heap && b->borrows_heap &&
+      strcmp(a->borrows_heap, b->borrows_heap) == 0) {
+    into->borrows_heap = a->borrows_heap;
+  } else {
+    into->borrows_heap = NULL;
+  }
+
+  into->alias_group = a->alias_group == b->alias_group ? a->alias_group : 0;
+}
+
+static void mem_path_join(MemCtx *ctx, const MemPath *a, const MemPath *b) {
+  size_t i;
+  size_t shared = a->count < b->count ? a->count : b->count;
+  for (i = 0; i < shared && i < ctx->local_count; i++) {
+    mem_local_join(&ctx->locals[i], &a->locals[i], &b->locals[i]);
+  }
+}
+
+/* One arm of a branch, or one iteration of a loop body: walked with its own
+ * facts definite, then handed back for the join. */
+static int mem_walk_path(MemCtx *ctx, ASTNode *body, const MemPath *entry,
+                         MemPath *out) {
+  int level;
+  mem_path_restore(ctx, entry);
+  level = ++ctx->scope_level;
   mem_walk_block(ctx, body);
-  ctx->depth--;
   mem_scope_exit_check(ctx, level);
   ctx->scope_level--;
+  return mem_path_save(ctx, out);
+}
+
+/* Walk each arm from the same entry state and keep what they all agree on.
+ * `arms` may hold NULL entries, which are arms the program did not write; the
+ * path where none of them ran is the entry state itself, and it is included
+ * unless `exhaustive` says one arm always runs. */
+static void mem_walk_arms(MemCtx *ctx, ASTNode **arms, size_t arm_count,
+                          int exhaustive) {
+  MemPath entry = {NULL, 0};
+  MemPath merged = {NULL, 0};
+  MemPath arm = {NULL, 0};
+  size_t i;
+  int have_merged = 0;
+
+  if (ctx->depth > 0 || !mem_path_save(ctx, &entry)) {
+    /* Already inside a path that is being joined, or out of memory: walk the
+       arms the way they were always walked, conservatively. */
+    for (i = 0; i < arm_count; i++) {
+      if (!arms[i]) {
+        continue;
+      }
+      {
+        int level = ++ctx->scope_level;
+        ctx->depth++;
+        mem_walk_block(ctx, arms[i]);
+        ctx->depth--;
+        mem_scope_exit_check(ctx, level);
+        ctx->scope_level--;
+      }
+    }
+    mem_path_free(&entry);
+    return;
+  }
+
+  for (i = 0; i < arm_count; i++) {
+    if (!arms[i]) {
+      continue;
+    }
+    if (!mem_walk_path(ctx, arms[i], &entry, &arm)) {
+      mem_path_free(&arm);
+      mem_path_free(&merged);
+      mem_path_free(&entry);
+      return;
+    }
+    if (!have_merged) {
+      merged = arm;
+      arm.locals = NULL;
+      arm.count = 0;
+      have_merged = 1;
+    } else {
+      mem_path_restore(ctx, &merged);
+      mem_path_join(ctx, &merged, &arm);
+      mem_path_free(&merged);
+      mem_path_free(&arm);
+      if (!mem_path_save(ctx, &merged)) {
+        mem_path_free(&entry);
+        return;
+      }
+    }
+  }
+
+  if (!have_merged) {
+    mem_path_restore(ctx, &entry);
+    mem_path_free(&entry);
+    return;
+  }
+
+  if (!exhaustive) {
+    mem_path_restore(ctx, &merged);
+    mem_path_join(ctx, &merged, &entry);
+  } else {
+    mem_path_restore(ctx, &merged);
+  }
+  mem_path_free(&merged);
+  mem_path_free(&entry);
+}
+
+static void mem_walk_branch(MemCtx *ctx, ASTNode *body) {
+  ASTNode *arms[1];
+  arms[0] = body;
+  mem_walk_arms(ctx, arms, 1, 0);
 }
 
 static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
@@ -1865,22 +2096,42 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
   }
   case AST_IF_STATEMENT: {
     IfStatement *if_stmt = (IfStatement *)statement->data;
+    ASTNode **arms = NULL;
+    size_t arm_count = 0;
+    size_t i;
     if (!if_stmt) {
       return;
     }
     ctx->in_condition++;
     mem_walk_expr(ctx, if_stmt->condition);
-    ctx->in_condition--;
-    mem_walk_branch(ctx, if_stmt->then_branch);
-    for (size_t i = 0; i < if_stmt->else_if_count; i++) {
-      ctx->in_condition++;
+    for (i = 0; i < if_stmt->else_if_count; i++) {
       mem_walk_expr(ctx, if_stmt->else_ifs[i].condition);
-      ctx->in_condition--;
-      mem_walk_branch(ctx, if_stmt->else_ifs[i].body);
+    }
+    ctx->in_condition--;
+
+    arm_count = 1 + if_stmt->else_if_count + (if_stmt->else_branch ? 1 : 0);
+    arms = malloc(arm_count * sizeof(ASTNode *));
+    if (!arms) {
+      mem_walk_branch(ctx, if_stmt->then_branch);
+      for (i = 0; i < if_stmt->else_if_count; i++) {
+        mem_walk_branch(ctx, if_stmt->else_ifs[i].body);
+      }
+      if (if_stmt->else_branch) {
+        mem_walk_branch(ctx, if_stmt->else_branch);
+      }
+      return;
+    }
+    arms[0] = if_stmt->then_branch;
+    for (i = 0; i < if_stmt->else_if_count; i++) {
+      arms[1 + i] = if_stmt->else_ifs[i].body;
     }
     if (if_stmt->else_branch) {
-      mem_walk_branch(ctx, if_stmt->else_branch);
+      arms[arm_count - 1] = if_stmt->else_branch;
     }
+    /* An `else` makes one arm certain to run; without one, not running any of
+       them is a path of its own. */
+    mem_walk_arms(ctx, arms, arm_count, if_stmt->else_branch != NULL);
+    free(arms);
     return;
   }
   case AST_WHILE_STATEMENT: {
@@ -1892,6 +2143,8 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     ctx->in_condition++;
     mem_walk_expr(ctx, while_stmt->condition);
     ctx->in_condition--;
+    /* The body is one path and not running it is another, so what survives the
+       loop is what holds either way. */
     mem_walk_branch(ctx, while_stmt->body);
     return;
   }
@@ -1908,15 +2161,13 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     ctx->in_condition++;
     mem_walk_expr(ctx, for_stmt->condition);
     ctx->in_condition--;
-    int for_level = ++ctx->scope_level;
-    ctx->depth++;
-    mem_walk_block(ctx, for_stmt->body);
+    mem_walk_branch(ctx, for_stmt->body);
     if (for_stmt->increment) {
+      int increment_depth = ctx->depth;
+      ctx->depth++;
       mem_walk_statement(ctx, for_stmt->increment);
+      ctx->depth = increment_depth;
     }
-    ctx->depth--;
-    mem_scope_exit_check(ctx, for_level);
-    ctx->scope_level--;
     return;
   }
   case AST_SWITCH_STATEMENT: {
@@ -1924,15 +2175,36 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     if (!switch_stmt) {
       return;
     }
+    ASTNode **arms = NULL;
+    size_t arm_count = 0;
+    int has_default = 0;
+    size_t i;
     mem_walk_expr(ctx, switch_stmt->expression);
-    for (size_t i = 0; i < switch_stmt->case_count; i++) {
+    if (switch_stmt->case_count > 0) {
+      arms = malloc(switch_stmt->case_count * sizeof(ASTNode *));
+    }
+    if (!arms) {
+      for (i = 0; i < switch_stmt->case_count; i++) {
+        CaseClause *clause = switch_stmt->cases[i]
+                                 ? (CaseClause *)switch_stmt->cases[i]->data
+                                 : NULL;
+        if (clause) {
+          mem_walk_branch(ctx, clause->body);
+        }
+      }
+      return;
+    }
+    for (i = 0; i < switch_stmt->case_count; i++) {
       CaseClause *clause = switch_stmt->cases[i]
                                ? (CaseClause *)switch_stmt->cases[i]->data
                                : NULL;
-      if (clause) {
-        mem_walk_branch(ctx, clause->body);
+      arms[arm_count++] = clause ? clause->body : NULL;
+      if (clause && clause->is_default) {
+        has_default = 1;
       }
     }
+    mem_walk_arms(ctx, arms, arm_count, has_default);
+    free(arms);
     return;
   }
   case AST_MATCH_STATEMENT: {
@@ -1940,10 +2212,24 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     if (!match) {
       return;
     }
+    ASTNode **arms = NULL;
+    size_t i;
     mem_walk_expr(ctx, match->expression);
-    for (size_t i = 0; i < match->arm_count; i++) {
-      mem_walk_branch(ctx, match->arms[i].body);
+    if (match->arm_count > 0) {
+      arms = malloc(match->arm_count * sizeof(ASTNode *));
     }
+    if (!arms) {
+      for (i = 0; i < match->arm_count; i++) {
+        mem_walk_branch(ctx, match->arms[i].body);
+      }
+      return;
+    }
+    for (i = 0; i < match->arm_count; i++) {
+      arms[i] = match->arms[i].body;
+    }
+    /* A match names every variant or ends with a default, so one arm runs. */
+    mem_walk_arms(ctx, arms, match->arm_count, 1);
+    free(arms);
     return;
   }
   case AST_DEFER_STATEMENT:

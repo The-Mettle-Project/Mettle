@@ -153,6 +153,7 @@ static ASTNode *ast_clone_method_declaration(ASTNode *clone, const ASTNode *node
   dst->is_swappable = src->is_swappable;
   dst->is_naked = src->is_naked;
   dst->is_interrupt = src->is_interrupt;
+  dst->is_variadic = src->is_variadic;
   dst->simd_mode = src->simd_mode;
   dst->captured_count = src->captured_count;
   dst->captured_names =
@@ -2529,6 +2530,18 @@ ASTNode *ast_create_new_expression(const char *type_name,
   node->data = new_expr;
 
   return node;
+}
+
+/* Drop a node's claim on its children without freeing them. The compiler uses
+ * it where a synthesized node borrows expressions another node already owns:
+ * a walk still reaches them through the owner, and only one destructor does. */
+void ast_release_children(ASTNode *node) {
+  if (!node) {
+    return;
+  }
+  free(node->children);
+  node->children = NULL;
+  node->child_count = 0;
 }
 
 ASTNode *ast_create_new_array_expression(const char *type_name, ASTNode *count,

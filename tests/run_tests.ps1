@@ -791,6 +791,32 @@ $cases = @(
     )
   },
   @{
+    # The memory analysis follows paths, not just the straight-line spine: a
+    # fact inside a branch, a loop, or a switch arm is definite for that path,
+    # and what survives the join is what every arm agreed on. The `clean_`
+    # controls must produce no diagnostic at all.
+    Name          = "warn_mem_paths"
+    Path          = "tests/warn_mem_paths.mettle"
+    ShouldSucceed = $true
+    OutputMustMatch = @(
+      'warning\[M0101\]: Use of `p` after it was freed',
+      'warning\[M0102\]: Double free of `d`',
+      'warning\[M0107\]: `buffer` is allocated here but never freed',
+      'warning\[M0107\]: `each` is allocated here but never freed',
+      'warning\[M0101\]: Use of `both` after it was freed'
+    )
+    OutputMustNotMatch = @(
+      'clean_one_arm_frees',
+      'clean_arm_owns_its_own',
+      'clean_freed_in_loop',
+      'clean_switch_arms',
+      '`kept`',
+      '`mine`',
+      '`step`',
+      '`shared`'
+    )
+  },
+  @{
     # Interprocedural ownership inference: summaries (frees param / returns
     # fresh / borrows / stores) are computed over the call graph, so these
     # diagnostics cross function boundaries. The clean control
@@ -2282,6 +2308,8 @@ $cases = @(
   @{ Name = "err_fallthrough_outside_switch"; Path = "tests/err_fallthrough_outside_switch.mettle"; ShouldSucceed = $false; Pattern = "only be used inside a switch case" },
   @{ Name = "err_comptime_table_not_const"; Path = "tests/err_comptime_table_not_const.mettle"; ShouldSucceed = $false; Pattern = "is not a constant table" },
   @{ Name = "err_comptime_table_column"; Path = "tests/err_comptime_table_column.mettle"; ShouldSucceed = $false; Pattern = "rows have no column" },
+  @{ Name = "err_variadic_not_last"; Path = "tests/err_variadic_not_last.mettle"; ShouldSucceed = $false; Pattern = "has to be the last parameter" },
+  @{ Name = "err_variadic_element_type"; Path = "tests/err_variadic_element_type.mettle"; ShouldSucceed = $false; Pattern = "expected 'int32', found 'string'" },
   @{ Name = "err_function_arg_count"; Path = "tests/err_function_arg_count.mettle"; ShouldSucceed = $false; Pattern = "expects .* arguments, got" },
   @{ Name = "err_function_arg_type"; Path = "tests/err_function_arg_type.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
   @{ Name = "err_gpu_kernel_return"; Path = "tests/err_gpu_kernel_return.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_result' must return void" },
@@ -13729,6 +13757,10 @@ $runFixtures = @(
      What = "a declaration generated from a constant table came out wrong" },
   @{ Name = "slices"; Path = "tests/codegen/slices.mettle"
      What = "a slice lost its extent or read the wrong element" },
+  @{ Name = "variadic"; Path = "tests/codegen/variadic.mettle"
+     What = "a gathered parameter did not receive what the call passed" },
+  @{ Name = "ownership_paths"; Path = "tests/codegen/ownership_paths.mettle"
+     What = "code the path analysis must stay quiet about behaved wrong" },
   @{ Name = "struct_methods"; Path = "tests/codegen/struct_methods.mettle"
      What = "a struct method body behaved wrong" },
   @{ Name = "unsigned_fold"; Path = "tests/codegen/unsigned_fold.mettle"

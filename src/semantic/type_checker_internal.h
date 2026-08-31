@@ -227,6 +227,10 @@ int type_checker_link_name_matches_symbol(const Symbol *symbol,
                                                  int decl_is_extern,
                                                  const char *decl_link_name);
 
+/* Record whether the last parameter was written `T[..]`, so a call gathers
+   what follows the fixed parameters into it. Idempotent. */
+void type_checker_note_gathered_parameter(FunctionDeclaration *declaration);
+
 int type_checker_register_function_signature(TypeChecker *checker,
                                                     ASTNode *declaration);
 

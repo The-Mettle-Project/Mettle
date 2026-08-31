@@ -1262,7 +1262,7 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
         return 0;
       }
       /* The one bounds check a pointer could never have: the length travels
-         with the value, so it is read here rather than assumed. */
+         with the value, so the check reads it from there. */
       if (base_is_slice &&
           !ir_emit_slice_bounds_check(context, function, expression->location,
                                       &slice_address, &index)) {

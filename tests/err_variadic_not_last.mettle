@@ -1,0 +1,7 @@
+fn broken(xs: int32[..], tail: int32) -> int32 {
+  return tail;
+}
+
+fn main() -> int32 {
+  return broken(1, 2);
+}

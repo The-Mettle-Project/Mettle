@@ -785,6 +785,41 @@ int ir_lower_call_expression(IRLoweringContext *context,
   }
 
   for (size_t i = 0; i < call->argument_count; i++) {
+    /* An aggregate literal has no value of its own to lower: it takes the type
+       of what it initializes, which here is the parameter. Give it a home and
+       pass that, so a struct or an array can be written at the call. */
+    if (call->arguments[i] &&
+        call->arguments[i]->type == AST_AGGREGATE_LITERAL &&
+        call->arguments[i]->resolved_type) {
+      Type *literal_type = call->arguments[i]->resolved_type;
+      char *home = ir_new_label_name(context, "arg_literal");
+      if (!home ||
+          !ir_emit_local_declaration(context, function, home,
+                                     literal_type->name,
+                                     call->arguments[i]->location) ||
+          !ir_emit_aggregate_literal_copy_to_symbol(
+              context, function, home, call->arguments[i], literal_type,
+              call->arguments[i]->location)) {
+        free(home);
+        for (size_t j = 0; j < i; j++) {
+          ir_operand_destroy(&arguments[j]);
+        }
+        free(arguments);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      arguments[i] = ir_operand_symbol(home);
+      free(home);
+      if (!arguments[i].name) {
+        for (size_t j = 0; j < i; j++) {
+          ir_operand_destroy(&arguments[j]);
+        }
+        free(arguments);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+      continue;
+    }
     if (!ir_lower_expression(context, function, call->arguments[i],
                              &arguments[i])) {
       for (size_t j = 0; j < i; j++) {

@@ -3730,8 +3730,8 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
       parser_set_error(parser, "Expected type name after 'new'");
       return NULL;
     }
-    /* The array suffix is left unparsed: `new T[n]` allocates n of them and
-       the count is an expression, not part of a type. */
+    /* The array suffix is left unparsed: `new T[n]` allocates n of them, and
+       the count is an expression the program computes. */
     char *type_name = parser_parse_type_annotation_ex(parser, 0);
     ASTNode *new_expr = NULL;
     if (!type_name) {
@@ -7701,7 +7701,7 @@ ASTNode *parser_parse_method_declaration(Parser *parser) {
   }
 
   // Create method declaration data (reuse FunctionDeclaration structure)
-  FunctionDeclaration *method_data = malloc(sizeof(FunctionDeclaration));
+  FunctionDeclaration *method_data = calloc(1, sizeof(FunctionDeclaration));
   if (!method_data) {
     // Clean up
     for (size_t i = 0; i < param_count; i++) {

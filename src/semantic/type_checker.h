@@ -114,7 +114,8 @@ typedef struct {
   Type *aggregate_target_type;
   /* Set alongside it when the literal lands somewhere no code runs: a `const`,
      or a module-scope `var`. An element that is not a constant is then an
-     error rather than a store. Consumed (cleared) with the target type. */
+     error, because there is nowhere for a store to go. Consumed (cleared)
+     with the target type. */
   int aggregate_requires_constant;
   /* The module being checked. Module-scope expansion runs before any `const`
      has a symbol, so a `comptime for` over a table finds the declaration here

@@ -44,7 +44,7 @@ hello world, n=7, twice=14, brace={
 Any expression fits in the braces. Every string literal is scanned, so there is
 one print function.
 
-## Arrays
+## Arrays and slices
 
 ```mettle
 var xs: int32[3] = [10, 20, 30];
@@ -52,6 +52,21 @@ var total: int32 = 0;
 for i in 0..3 {
   total = total + xs[i];
 }
+```
+
+`T[]` is a pointer and a length in one value. A `T[N]` converts to it, so a
+function is written once for any extent:
+
+```mettle
+fn sum(values: int32[]) -> int32 {
+  var total: int32 = 0;
+  for v in values { total = total + v; }
+  return total;
+}
+```
+
+```mettle
+var total: int32 = sum(xs);
 ```
 
 ## Structs and methods
@@ -193,6 +208,15 @@ fn main() -> int32 {
 
 `new T` allocates one zeroed `T`. A null result is `0`.
 
+`new T[n]` allocates `n` of them and answers a `T[]`, so the length travels
+with the pointer:
+
+```mettle
+var xs: int32[] = new int32[count];
+for i in 0..xs.length { xs[i] = (int32)i; }
+free(xs.data);
+```
+
 ## Strings
 
 ```mettle
@@ -321,11 +345,30 @@ fn add_one<T: Addable>(v: T) -> T { return v + 1; }
 ```
 
 ```mettle
-var n: int64 = id<int64>(7);
-var m: int32 = add_one<int32>(41);
+var n: int32 = id(7);
+var wide: int64 = id<int64>(7);
+var m: int32 = add_one(41);
 ```
 
-The call site names the type arguments.
+The call site may name the type arguments, and does not have to when the
+arguments already say what they are.
+
+## Gathered parameters
+
+```mettle
+fn sum(xs: int32[..]) -> int32 {
+  var total: int32 = 0;
+  for x in xs { total = total + x; }
+  return total;
+}
+```
+
+```mettle
+var a: int32 = sum(1, 2, 3);
+var b: int32 = sum();
+```
+
+The last parameter takes whatever follows the fixed ones, as a `T[]`.
 
 ## Compile-time tests
 

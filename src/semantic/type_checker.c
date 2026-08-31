@@ -195,6 +195,22 @@ void type_checker_destroy(TypeChecker *checker) {
   }
 }
 
+void type_checker_note_gathered_parameter(FunctionDeclaration *declaration) {
+  size_t last = 0;
+  const char *written = NULL;
+  size_t length = 0;
+  if (!declaration || declaration->parameter_count == 0) {
+    return;
+  }
+  last = declaration->parameter_count - 1;
+  written = declaration->parameter_types ? declaration->parameter_types[last]
+                                         : NULL;
+  length = written ? strlen(written) : 0;
+  if (length > 4 && strcmp(written + length - 4, "[..]") == 0) {
+    declaration->is_variadic = 1;
+  }
+}
+
 int type_checker_register_function_signature(TypeChecker *checker,
                                                     ASTNode *declaration) {
   if (!checker || !declaration ||
@@ -226,6 +242,10 @@ int type_checker_register_function_signature(TypeChecker *checker,
   } else {
     return_type = checker->builtin_void;
   }
+
+  /* A last parameter written `T[..]` gathers, and this is the signature a call
+     earlier in the file resolves against, so it has to know that here. */
+  type_checker_note_gathered_parameter(func_decl);
 
   Type **param_types = NULL;
   if (func_decl->parameter_count > 0) {

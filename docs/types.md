@@ -318,7 +318,7 @@ could never offer. The check is emitted in a normal build, dropped under
 `--release`, and kept under [`--safe`](memory-safety.md).
 
 A pointer and a length that came from somewhere else are joined by writing them
-down, which is the one place the extent is asserted rather than known:
+down, which is the one place the extent is asserted:
 
 ```mettle
 var view: int32[] = { data: borrowed, length: 3 };
@@ -376,7 +376,7 @@ var wide: int64 = id<int64>(7);
 
 An integer literal says `int32` and a fractional one says `float64`, so name
 the argument when a call needs a wider one. What no argument reaches is
-reported rather than guessed:
+reported:
 
 ```text
 error[E0003]: Nothing in this call says what 'T' is in 'make'. Name it at the

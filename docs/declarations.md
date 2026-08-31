@@ -121,6 +121,33 @@ fn make(width: int32, height: int32) -> Point {
 A `const` and a module-scope `var` are the exception: both are laid out before
 any code runs, so every element of theirs has to be known while compiling.
 
+## Gathered parameters
+
+A last parameter written `T[..]` takes whatever the call passes after the fixed
+ones. Inside the function it is an ordinary `T[]`:
+
+```mettle
+fn sum(xs: int32[..]) -> int32 {
+  var total: int32 = 0;
+  for x in xs { total = total + x; }
+  return total;
+}
+```
+
+`sum(1, 2, 3)` gathers three, `sum(5)` gathers one, and `sum()` gathers none
+and reads as an empty slice. Only the last parameter may gather, because
+anything after it would have nothing left to take.
+
+One argument that is already the whole run is passed through rather than
+wrapped: a `T[]` or a `T[N]` where the gather goes is what the callee receives.
+That is how one variadic call forwards to another:
+
+```mettle
+fn forward(xs: int32[..]) -> int32 {
+  return sum(xs);
+}
+```
+
 ## Methods
 
 A method is a plain function whose name is the type, an underscore, and the

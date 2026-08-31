@@ -399,8 +399,8 @@ typedef struct {
 typedef struct {
   char *type_name; // The target struct or type name
   /* `new T[n]`: how many elements to allocate. The value is a slice, `T[]`,
-   * so the count travels with the pointer rather than being remembered
-   * separately. NULL for `new T`, which allocates one and yields `T*`. */
+   * so the count travels with the pointer. NULL for `new T`, which allocates
+   * one and yields `T*`. */
   ASTNode *count;
 } NewExpression;
 
@@ -641,6 +641,10 @@ ASTNode *ast_create_method_call(ASTNode *object, const char *method_name,
                                 SourceLocation location);
 ASTNode *ast_create_new_expression(const char *type_name,
                                    SourceLocation location);
+/* Drop a node's claim on its children without freeing them, for a synthesized
+   node that borrows expressions another node owns. */
+void ast_release_children(ASTNode *node);
+
 /* `new T[count]`: a heap array whose length travels with it, as `T[]`. */
 ASTNode *ast_create_new_array_expression(const char *type_name, ASTNode *count,
                                          SourceLocation location);

@@ -1,0 +1,9 @@
+fn sum(xs: int32[..]) -> int32 {
+  var total: int32 = 0;
+  for x in xs { total = total + x; }
+  return total;
+}
+
+fn main() -> int32 {
+  return sum(1, "two", 3);
+}

@@ -11,26 +11,25 @@ A tagged-enum variant carries at most one payload. `Circle(float64)` works;
 An array is one-dimensional. `int64[3][4]` does not parse; index a flat
 `int64[12]` yourself.
 
-A `T[N]` has its length in its type, so `N` is a constant. `T[]` is the length
-carried in the value, which is what `new T[n]` produces and what a `T[N]`
-converts to at a boundary.
+A `T[N]` has its length in its type, so `N` has to be a constant. A length the
+program computes belongs to a [slice](types.md), `T[]`.
 
-Two types may point at each other. `struct A { b: B*; }` above
-`struct B { a: A*; }` compiles, as does a longer cycle and an enum whose
-payload points at a struct that stores the enum by value. What has no size is a
-cycle that stores values rather than pointers, and that is reported:
+Two types that store each other by value have no size, and that is reported:
 
 ```text
 error[E0003]: 'A' and 'B' each store a value of the other, so neither has a
 size. Hold one of them by pointer: 'B*'
 ```
 
+Pointing at each other is fine, in a cycle of any length.
+
 ## Aggregate literals
 
-A literal initializing a local may hold anything an assignment to that field
-could hold, computed values included. What is known while compiling is laid out
-in the object file and copied in; what is not becomes a store into that image
-at the element's own offset, so the two mix freely inside one literal.
+An element of a literal initializing a local may be any expression the field
+would accept in an assignment, computed values included. What is known while
+compiling is laid out in the object file and copied in; what is not becomes a
+store into that image at the element's own offset, so the two mix freely inside
+one literal.
 
 A `const` and a module-scope `var` are laid out before any code runs, so their
 elements have to be constants: literals, other constants, `sizeof`, arithmetic
@@ -43,8 +42,9 @@ program runs, so every element has to be known while compiling, and this one is
 not. Make it a constant, or build the value in a function
 ```
 
-A literal also needs a target type, which it takes from the `var`, `const`, or
-assignment it initializes. It cannot stand alone as a call argument.
+A literal needs a target type, which it takes from the `var`, `const`,
+assignment, or parameter it initializes. It cannot stand where no type says
+what it is.
 
 A closure cannot appear in one, because its environment is built at run time.
 Writing a lambda where a `Fn` field is expected inside a literal reports a
@@ -90,10 +90,14 @@ accepted at a declaration, an argument, a return, and an assignment.
 
 ## Borrow analysis
 
-Analysis is conservative and stays within one function. Borrows are tracked
-along a function's straight-line spine, so a borrow taken inside an `if`,
-`while`, or `for` body is not tracked, and a borrow handed across a call
-boundary is not followed.
+A borrow handed across a call boundary is not followed: the interior pointer
+`&buf[4]` passed to a function is not related back to `buf` inside it.
+
+Ownership itself is inferred per function and iterated over the call graph, so
+a free, a store, and a fresh allocation do cross calls. Within a function the
+analysis follows paths: a fact inside an `if`, a loop body, a `switch` arm or a
+`match` arm is definite for that path, and what survives the join is what every
+arm agreed on.
 
 There is no ownership syntax, so it never rejects a program. It points only at
 what it can prove. See [Borrow checker](borrow-checker.md).

@@ -398,7 +398,7 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
       if (symbol && symbol->kind != SYMBOL_FUNCTION && symbol->scope &&
           symbol->scope->type != SCOPE_GLOBAL) {
         /* A local's address is not known until the frame exists, so it is
-           taken where the literal is written rather than folded. */
+           taken where the literal is written. */
         symbol->is_used = 1;
         return aggregate_image_add_runtime_store(out, offset, element, type);
       }
@@ -618,6 +618,19 @@ static int aggregate_fold_element(TypeChecker *checker, ASTNode *element,
 
   if (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
       type->kind == TYPE_SLICE) {
+    /* An expression of the same type is a value to copy in, the way a
+       computed scalar is. Only something that is neither a literal nor a value
+       of this type has nothing to do here. */
+    Type *value_type = type_checker_infer_type(checker, element);
+    if (value_type &&
+        type_checker_is_assignable_from(checker, type, value_type, element)) {
+      return aggregate_image_add_runtime_store(out, offset, element, type);
+    }
+    if (value_type) {
+      type_checker_report_assign_mismatch(checker, element, element->location,
+                                          type, value_type);
+      return 0;
+    }
     type_checker_set_error_at_location(
         checker, element->location,
         "'%s' needs an aggregate literal here: write '%s'",
@@ -683,6 +696,41 @@ Type *type_checker_check_aggregate_literal(TypeChecker *checker,
         target->name ? target->name : "?");
     return NULL;
   }
+  /* `[a, b, c]` against a slice is the array of three, which then converts the
+     way any array does. The literal's own length is the only one there is. */
+  if (target->kind == TYPE_SLICE && !literal->is_struct && target->base_type) {
+    size_t written = literal->element_count;
+    char array_name[128];
+    Type *sized = NULL;
+    if (literal->repeat_count &&
+        !type_checker_eval_integer_constant_with_checker(
+            checker, literal->repeat_count, (long long *)&written)) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "the repeat count of an array literal must be a compile-time "
+          "integer constant");
+      return NULL;
+    }
+    if (written == 0) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "an empty literal gives '%s' no elements and no length to carry",
+          target->name ? target->name : "?");
+      return NULL;
+    }
+    snprintf(array_name, sizeof(array_name), "%s[%zu]",
+             target->base_type->name ? target->base_type->name : "?", written);
+    sized = type_checker_get_type_by_name(checker, array_name);
+    if (!sized) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "'%s' has no fixed form to build before it becomes a slice",
+          target->name ? target->name : "?");
+      return NULL;
+    }
+    target = sized;
+  }
+
   if (target->size == 0) {
     type_checker_set_error_at_location(
         checker, expression->location,

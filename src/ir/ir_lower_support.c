@@ -377,8 +377,8 @@ int ir_emit_bounds_check(IRLoweringContext *context,
 }
 
 /* The bounds check a pointer could never have. A slice carries its length
- * beside its data, so the extent is loaded from the value rather than taken on
- * trust, and a negative index fails the same check as an oversized one. */
+ * beside its data, so the extent is loaded from the value itself, and a
+ * negative index fails the same check as an oversized one. */
 int ir_emit_slice_bounds_check(IRLoweringContext *context, IRFunction *function,
                                SourceLocation location,
                                const IROperand *slice_address,

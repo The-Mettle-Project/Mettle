@@ -1,0 +1,77 @@
+// Correct code that the path-merged memory analysis must stay quiet about. A
+// fact holds after a branch only when every arm agreed on it, so a pointer
+// freed on one path and used on another is nothing to report, and one that is
+// allocated and freed inside the same arm is not a leak.
+
+import "std/mem";
+
+fn one_arm_frees(flag: int32) -> int32 {
+  var p: int32* = (int32*)malloc(16);
+  p[0] = 3;
+  if (flag > 0) {
+    free(p);
+    return 1;
+  }
+  var value: int32 = p[0];
+  free(p);
+  return value;
+}
+
+fn each_arm_owns_its_own(flag: int32) -> int32 {
+  if (flag > 0) {
+    var a: int32* = (int32*)malloc(16);
+    a[0] = 1;
+    var value: int32 = a[0];
+    free(a);
+    return value;
+  }
+  var b: int32* = (int32*)malloc(32);
+  b[0] = 2;
+  var other: int32 = b[0];
+  free(b);
+  return other;
+}
+
+fn freed_in_a_loop(count: int32) -> int32 {
+  var total: int32 = 0;
+  for i in 0..count {
+    var p: int32* = (int32*)malloc(16);
+    p[0] = (int32)i;
+    total = total + p[0];
+    free(p);
+  }
+  return total;
+}
+
+fn escapes_through_return(size: int64) -> int32* {
+  var p: int32* = (int32*)malloc(size);
+  p[0] = 9;
+  return p;
+}
+
+fn switch_arms(kind: int32) -> int32 {
+  var p: int32* = (int32*)malloc(16);
+  p[0] = 4;
+  var value: int32 = 0;
+  switch (kind) {
+    case 1: { value = p[0]; }
+    case 2: { value = p[0] + 1; }
+    default: { value = 0; }
+  }
+  free(p);
+  return value;
+}
+
+fn main() -> int32 {
+  if (one_arm_frees(1) != 1) { return 1; }
+  if (one_arm_frees(0) != 3) { return 2; }
+  if (each_arm_owns_its_own(1) != 1) { return 3; }
+  if (each_arm_owns_its_own(0) != 2) { return 4; }
+  if (freed_in_a_loop(4) != 6) { return 5; }
+  if (switch_arms(1) != 4) { return 6; }
+  if (switch_arms(9) != 0) { return 7; }
+  var owned: int32* = escapes_through_return(16);
+  if (owned[0] != 9) { return 8; }
+  free(owned);
+  return 0;
+}
