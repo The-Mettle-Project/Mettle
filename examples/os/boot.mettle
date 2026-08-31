@@ -1,0 +1,159 @@
+@naked fn _start() {
+    asm {
+        bits 16
+        cli
+        xor ax, ax
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov sp, 0x7c00
+        cld
+        mov [boot_drive], dl
+        sti
+
+        mov si, loading_text
+        call print
+
+        xor ebx, ebx
+        mov di, 0x5010
+        xor si, si
+    map_next:
+        mov eax, 0xe820
+        mov edx, 0x534d4150
+        mov ecx, 24
+        int 0x15
+        jc map_done
+        cmp eax, 0x534d4150
+        jne map_done
+        add di, 24
+        inc si
+        test ebx, ebx
+        jz map_done
+        cmp si, 40
+        jb map_next
+    map_done:
+        mov [0x5000], si
+
+        mov cx, 128
+        mov si, 1
+        mov bp, 0x2000
+    load_next:
+        call read_sector
+        inc si
+        add bp, 0x20
+        loop load_next
+
+        cli
+        in al, 0x92
+        or al, 2
+        out 0x92, al
+
+        mov edi, 0x1000
+        xor eax, eax
+        mov ecx, 4096
+        rep stosd
+
+        mov edi, 0x1000
+        mov dword [edi], 0x2003
+        mov edi, 0x2000
+        mov dword [edi], 0x3003
+        mov edi, 0x3000
+        mov eax, 0x83
+        mov ecx, 512
+    map_page:
+        mov [edi], eax
+        add eax, 0x200000
+        add edi, 8
+        loop map_page
+
+        mov edi, 0x1000
+        mov cr3, edi
+        lgdt [gdt_pointer]
+        mov eax, cr4
+        or eax, 0x20
+        mov cr4, eax
+        mov ecx, 0xc0000080
+        rdmsr
+        or eax, 0x100
+        wrmsr
+        mov eax, cr0
+        or eax, 0x80000001
+        mov cr0, eax
+        jmp 0x08:long_mode
+
+    read_sector:
+        push cx
+        push si
+        push bp
+        mov ax, si
+        xor dx, dx
+        mov di, 18
+        div di
+        mov cl, dl
+        inc cl
+        xor dx, dx
+        mov di, 2
+        div di
+        mov ch, al
+        mov dh, dl
+        mov dl, [boot_drive]
+        mov ax, bp
+        mov es, ax
+        xor bx, bx
+        mov ax, 0x0201
+        int 0x13
+        jc read_failed
+        pop bp
+        pop si
+        pop cx
+        ret
+    read_failed:
+        mov si, disk_text
+        call print
+    stopped:
+        hlt
+        jmp stopped
+
+    print:
+        push bx
+    print_byte:
+        lodsb
+        test al, al
+        jz print_done
+        mov ah, 0x0e
+        mov bx, 7
+        int 0x10
+        jmp print_byte
+    print_done:
+        pop bx
+        ret
+
+    boot_drive:
+        db 0
+    loading_text:
+        db "loading mettle os", 13, 10, 0
+    disk_text:
+        db "disk error", 13, 10, 0
+
+        align 8
+    gdt_start:
+        dq 0
+        dq 0x00af9a000000ffff
+        dq 0x00af92000000ffff
+    gdt_pointer:
+        dw 23
+        dd gdt_start
+
+        bits 64
+    long_mode:
+        mov ax, 0x10
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov fs, ax
+        mov gs, ax
+        mov rsp, 0x90000
+        mov rax, 0x20000
+        jmp rax
+    }
+}
