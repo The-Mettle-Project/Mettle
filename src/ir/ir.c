@@ -1,6 +1,7 @@
 #include "ir.h"
 #include "../common.h"
 #include "../string_intern.h"
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5431,6 +5432,57 @@ static void ir_dead_fn_mark(const IrFnNameTable *table, const char *name,
   }
 }
 
+static void ir_dead_fn_mark_assembly(const IrFnNameTable *table,
+                                     const char *assembly, unsigned char *live,
+                                     size_t *worklist,
+                                     size_t *worklist_count) {
+  size_t i = 0;
+
+  if (!assembly) {
+    return;
+  }
+
+  while (assembly[i] != '\0') {
+    if (assembly[i] == '"' || assembly[i] == '\'') {
+      char quote = assembly[i];
+      i++;
+      while (assembly[i] != '\0' && assembly[i] != quote) {
+        if (assembly[i] == '\\' && assembly[i + 1] != '\0') {
+          i++;
+        }
+        i++;
+      }
+      if (assembly[i] != '\0') {
+        i++;
+      }
+      continue;
+    }
+
+    if (isalpha((unsigned char)assembly[i]) || assembly[i] == '_') {
+      size_t start = i;
+      size_t length = 1;
+      char *token = NULL;
+
+      while (isalnum((unsigned char)assembly[start + length]) ||
+             assembly[start + length] == '_') {
+        length++;
+      }
+
+      token = (char *)malloc(length + 1);
+      if (token) {
+        memcpy(token, assembly + start, length);
+        token[length] = '\0';
+        ir_dead_fn_mark(table, token, live, worklist, worklist_count);
+        free(token);
+      }
+      i = start + length;
+      continue;
+    }
+
+    i++;
+  }
+}
+
 int ir_init_image_is_all_zero(const IRModuleSymbol *symbol) {
   if (!symbol || !symbol->init_bytes || symbol->init_bytes_size == 0 ||
       symbol->init_reloc_count > 0) {
@@ -5787,6 +5839,11 @@ int ir_program_eliminate_dead_functions(IRProgram *program, int keep_exports) {
     }
     for (size_t i = 0; i < fn->instruction_count; i++) {
       const IRInstruction *insn = &fn->instructions[i];
+      if (insn->op == IR_OP_INLINE_ASM) {
+        ir_dead_fn_mark_assembly(&table, insn->text, live, worklist,
+                                 &worklist_count);
+        continue;
+      }
       ir_dead_fn_mark(&table, insn->text, live, worklist, &worklist_count);
       if (insn->dest.kind == IR_OPERAND_SYMBOL) {
         ir_dead_fn_mark(&table, insn->dest.name, live, worklist,

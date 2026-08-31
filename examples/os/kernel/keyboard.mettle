@@ -32,11 +32,11 @@ const LOWER_ROW_LAST: uint64 = 0x32
 var buffer: uint8[128]
 var head: volatile uint64 = 0
 var tail: volatile uint64 = 0
-var shift_held: volatile uint64 = 0
-var extended: volatile uint64 = 0
+var shift_held: volatile bool = false
+var extended: volatile bool = false
 
 fn either(plain: uint8, shifted: uint8) -> uint8 {
-    if (shift_held != 0) {
+    if (shift_held) {
         return shifted
     }
     return plain
@@ -93,8 +93,8 @@ fn push(ch: uint8) {
 }
 
 fn decode(code: uint8) -> uint8 {
-    if (extended != 0) {
-        extended = 0
+    if (extended) {
+        extended = false
         if (code == SCAN_ARROW_UP) {
             return KEY_UP
         }
@@ -104,11 +104,11 @@ fn decode(code: uint8) -> uint8 {
         return 0
     }
     if (code == SCAN_LEFT_SHIFT || code == SCAN_RIGHT_SHIFT) {
-        shift_held = 1
+        shift_held = true
         return 0
     }
     if (code == SCAN_LEFT_SHIFT_UP || code == SCAN_RIGHT_SHIFT_UP) {
-        shift_held = 0
+        shift_held = false
         return 0
     }
     if (code >= SCAN_RELEASE) {
@@ -120,7 +120,7 @@ fn decode(code: uint8) -> uint8 {
 @interrupt fn on_keyboard() {
     var code: uint8 = port_in(DATA_PORT)
     if (code == SCAN_EXTENDED) {
-        extended = 1
+        extended = true
     } else {
         var ch: uint8 = decode(code)
         if (ch != 0) {

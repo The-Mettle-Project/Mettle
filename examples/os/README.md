@@ -197,12 +197,6 @@ shapes, with and without an error code.
 
 ## Limits
 
-Two things constrain how the modules are written. An `asm` block inside an
-imported module can only name exported symbols, which is why `timer_tick` and
-the IDT descriptor carry `export`. And a module global that is read before it
-is written anywhere in the file cannot be assigned afterwards, so module state
-is written first and read later.
-
 There is no userspace, no privilege separation, and no disk driver: the kernel
 never talks to the floppy again after the boot sector reads it. The heap tops
 out at one page per allocation. `hexdump` past the first gigabyte walks off

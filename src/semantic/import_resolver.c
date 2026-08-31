@@ -1068,6 +1068,94 @@ static char *rewrite_type_string(const char *type_name,
   return rewritten;
 }
 
+/* Inline assembly is a text blob to every other pass, but the names inside it
+ * are real references: `call helper` reaches a Mettle function and `{flag}`
+ * binds a global. An import renames a module's private declarations, so those
+ * names have to travel with them. Identifiers inside quoted runs are data
+ * (`db "text"`) and are left alone, and a name the enclosing scope declares is
+ * a local, which no import renames. */
+static char *rewrite_assembly_text(const char *assembly,
+                                   const NameRewrite *rewrites,
+                                   size_t rewrite_count,
+                                   const RewriteScope *scope) {
+  char *rewritten = NULL;
+  size_t length = 0;
+  size_t capacity = 0;
+  size_t i = 0;
+
+  if (!assembly) {
+    return NULL;
+  }
+
+  while (assembly[i] != '\0') {
+    if (assembly[i] == '"' || assembly[i] == '\'') {
+      char quote = assembly[i];
+      size_t start = i++;
+      while (assembly[i] != '\0' && assembly[i] != quote) {
+        if (assembly[i] == '\\' && assembly[i + 1] != '\0') {
+          i++;
+        }
+        i++;
+      }
+      if (assembly[i] != '\0') {
+        i++;
+      }
+      if (!append_text_fragment(&rewritten, &length, &capacity,
+                                assembly + start, i - start)) {
+        free(rewritten);
+        return NULL;
+      }
+      continue;
+    }
+
+    if (is_identifier_start_char(assembly[i])) {
+      size_t start = i;
+      size_t ident_len = 1;
+      const char *replacement = NULL;
+      char *token = NULL;
+
+      while (is_identifier_char(assembly[start + ident_len])) {
+        ident_len++;
+      }
+
+      token = duplicate_string_slice(assembly + start, ident_len);
+      if (!token) {
+        free(rewritten);
+        return NULL;
+      }
+      if (!scope_contains(scope, token)) {
+        replacement = find_name_rewrite_slice(rewrites, rewrite_count,
+                                              assembly + start, ident_len);
+      }
+      free(token);
+
+      if (!append_text_fragment(&rewritten, &length, &capacity,
+                                replacement ? replacement : assembly + start,
+                                replacement ? strlen(replacement)
+                                            : ident_len)) {
+        free(rewritten);
+        return NULL;
+      }
+
+      i = start + ident_len;
+      continue;
+    }
+
+    if (!append_text_fragment(&rewritten, &length, &capacity, &assembly[i],
+                              1)) {
+      free(rewritten);
+      return NULL;
+    }
+    i++;
+  }
+
+  if (!rewritten) {
+    rewritten = strdup(assembly);
+  }
+
+  return rewritten;
+}
+
 static int rewrite_type_string_in_place(char **slot, const NameRewrite *rewrites,
                                         size_t rewrite_count,
                                         const NamespaceBinding *bindings,
@@ -1815,6 +1903,27 @@ static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
                               bindings, binding_count, scope, 1);
   }
 
+  case AST_INLINE_ASM: {
+    InlineAsm *asm_block = (InlineAsm *)node->data;
+    char *rewritten = NULL;
+
+    if (!asm_block || !asm_block->assembly_code) {
+      return 1;
+    }
+
+    rewritten = rewrite_assembly_text(asm_block->assembly_code, rewrites,
+                                      rewrite_count, scope);
+    if (!rewritten) {
+      return 0;
+    }
+    if (!replace_interned_string(&asm_block->assembly_code, rewritten)) {
+      free(rewritten);
+      return 0;
+    }
+    free(rewritten);
+    return 1;
+  }
+
   default:
     return 1;
   }
@@ -1850,7 +1959,7 @@ static int preserve_extern_link_name(ASTNode *decl) {
     return 1;
   }
 
-  if (!decl_name || (*link_name && (*link_name)[0] != ' ')) {
+  if (!decl_name || (*link_name && (*link_name)[0] != '\0')) {
     return 1;
   }
 
@@ -2509,6 +2618,56 @@ static void collect_type_name_dependencies(const char *type_name,
   }
 }
 
+/* Every identifier an asm block names, minus the ones inside quoted runs. The
+ * closure cannot tell an instruction mnemonic from a symbol reference, and it
+ * does not need to: an extra name keeps a declaration that would otherwise be
+ * dropped, and keeping one costs nothing. */
+static void collect_assembly_identifiers(const char *assembly, char ***names,
+                                         size_t *count, size_t *capacity) {
+  size_t i = 0;
+
+  if (!assembly) {
+    return;
+  }
+
+  while (assembly[i] != '\0') {
+    if (assembly[i] == '"' || assembly[i] == '\'') {
+      char quote = assembly[i];
+      i++;
+      while (assembly[i] != '\0' && assembly[i] != quote) {
+        if (assembly[i] == '\\' && assembly[i + 1] != '\0') {
+          i++;
+        }
+        i++;
+      }
+      if (assembly[i] != '\0') {
+        i++;
+      }
+      continue;
+    }
+
+    if (is_identifier_start_char(assembly[i])) {
+      size_t start = i;
+      size_t ident_len = 1;
+      char *token = NULL;
+
+      while (is_identifier_char(assembly[start + ident_len])) {
+        ident_len++;
+      }
+
+      token = duplicate_string_slice(assembly + start, ident_len);
+      if (token) {
+        (void)path_set_add(names, count, capacity, token);
+        free(token);
+      }
+      i = start + ident_len;
+      continue;
+    }
+
+    i++;
+  }
+}
+
 static void collect_dependency_names(ASTNode *node, char ***names,
                                      size_t *count, size_t *capacity) {
   if (!node || !names || !count || !capacity) {
@@ -2666,6 +2825,12 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     if (!assign) {
       return;
     }
+    /* `name = value` keeps the target in variable_name rather than in a node,
+     * so a global that a module only ever writes is reachable through this
+     * string alone. */
+    if (assign->variable_name && assign->variable_name[0] != '\0') {
+      (void)path_set_add(names, count, capacity, assign->variable_name);
+    }
     if (assign->target) {
       collect_dependency_names(assign->target, names, count, capacity);
     }
@@ -2780,6 +2945,14 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     DeferStatement *defer = (DeferStatement *)node->data;
     if (defer) {
       collect_dependency_names(defer->statement, names, count, capacity);
+    }
+    return;
+  }
+  case AST_INLINE_ASM: {
+    InlineAsm *asm_block = (InlineAsm *)node->data;
+    if (asm_block && asm_block->assembly_code) {
+      collect_assembly_identifiers(asm_block->assembly_code, names, count,
+                                   capacity);
     }
     return;
   }

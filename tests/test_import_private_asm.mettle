@@ -1,0 +1,13 @@
+import "std/io";
+import "private_asm_module";
+
+fn main() -> int32 {
+  write_only(11);
+  store(58);
+  if (load_through_asm() != 58) { return 1; }
+  store(4);
+  if (load_through_asm() != 4) { return 2; }
+  if (call_through_asm() != 41) { return 3; }
+  println("ok");
+  return 0;
+}

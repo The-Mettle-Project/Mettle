@@ -1595,6 +1595,18 @@ $cases = @(
     ShouldSucceed = $true
     Args          = @("-I", "tests/lib")
   },
+  @{
+    Name          = "import_private_asm"
+    Path          = "tests/test_import_private_asm.mettle"
+    ShouldSucceed = $true
+    Args          = @("-I", "tests/lib")
+  },
+  @{
+    Name          = "import_private_asm_release"
+    Path          = "tests/test_import_private_asm.mettle"
+    ShouldSucceed = $true
+    Args          = @("-I", "tests/lib", "--release")
+  },
   @{ Name = "traits_generic_bound"; Path = "tests/test_traits_generic_bound.mettle"; ShouldSucceed = $true },
   @{ Name = "traits_multiple_where_bounds"; Path = "tests/test_traits_multiple_where_bounds.mettle"; ShouldSucceed = $true },
   @{ Name = "trait_methods_generic_dispatch"; Path = "tests/test_trait_methods_generic_dispatch.mettle"; ShouldSucceed = $true },
@@ -14170,6 +14182,40 @@ else {
     $failed++
     Write-CaseResult -Name "calc_frontend" -Passed $false -Reason $_.Exception.Message
   }
+}
+
+# Import gate: a module's private declarations are renamed so two modules may
+# share a name, and both the closure that decides what to carry and the rewrite
+# that renames it have to see every reference. A global the module only ever
+# assigns is reachable through the assignment alone, and a name inside an `asm`
+# block is a reference like any other. Compiling is most of the assertion here,
+# because each of these used to be an error; running it is the rest, since a
+# rewrite that renames the wrong token still compiles.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $privateAsmExe = Join-Path $tmpDir "import_private_asm.exe"
+  if (Test-Path $privateAsmExe) { Remove-Item -Path $privateAsmExe -Force }
+  $privateAsmArgs = @("--build", "tests/test_import_private_asm.mettle",
+                      "-I", "tests/lib", "-o", $privateAsmExe)
+  $privateAsmOut = & $CompilerPath @privateAsmArgs 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $privateAsmExe)) {
+    throw "building test_import_private_asm failed: $privateAsmOut"
+  }
+  $privateAsmRun = Invoke-ProgramCapture -Path $privateAsmExe
+  if ($privateAsmRun.Exit -ne 0) {
+    throw ("the program returned $($privateAsmRun.Exit): 1 is a global the " +
+           "module only writes, 2 is that global read back through asm, 3 is " +
+           "a function only asm names")
+  }
+  if ($privateAsmRun.Output.Trim() -ne "ok") {
+    throw "expected ok, got: $($privateAsmRun.Output)"
+  }
+  Write-CaseResult -Name "import_private_asm_runs" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "import_private_asm_runs" -Passed $false -Reason $_.Exception.Message
 }
 
 # x86 assembler gate: every encoding the inline assembler produces, in all three

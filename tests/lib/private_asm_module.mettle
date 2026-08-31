@@ -1,0 +1,35 @@
+var slot: uint64 = 0
+var only_written: uint64 = 0
+
+@naked fn secret_value() -> uint64 {
+    asm {
+        mov rax, 41
+        ret
+    }
+}
+
+export fn store(value: uint64) {
+    slot = value
+}
+
+export fn write_only(value: uint64) {
+    only_written = value
+}
+
+export fn load_through_asm() -> uint64 {
+    var out: uint64 = 0
+    asm {
+        mov rax, {slot}
+        mov {out}, rax
+    }
+    return out
+}
+
+export fn call_through_asm() -> uint64 {
+    var out: uint64 = 0
+    asm {
+        call secret_value
+        mov {out}, rax
+    }
+    return out
+}

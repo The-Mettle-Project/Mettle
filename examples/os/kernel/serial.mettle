@@ -16,7 +16,7 @@ const DIVISOR_115200: uint8 = 1
 
 const SPIN_LIMIT: uint64 = 200000
 
-var ready: uint64 = 0
+var ready: bool = false
 
 export fn serial_init() {
     port_out(COM1_INTERRUPT_ENABLE, 0)
@@ -26,7 +26,7 @@ export fn serial_init() {
     port_out(COM1_LINE_CONTROL, LINE_CONTROL_8N1)
     port_out(COM1_FIFO_CONTROL, FIFO_ENABLE_AND_CLEAR)
     port_out(COM1_MODEM_CONTROL, MODEM_READY)
-    ready = 1
+    ready = true
 }
 
 fn emit(ch: uint8) {
@@ -39,7 +39,7 @@ fn emit(ch: uint8) {
 }
 
 export fn serial_put(ch: uint8) {
-    if (ready == 0) {
+    if (!ready) {
         return
     }
     if (ch == '\n') {
