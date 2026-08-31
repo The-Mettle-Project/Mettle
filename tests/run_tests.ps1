@@ -10359,6 +10359,52 @@ catch {
 }
 }
 
+# A crash names the exact statement, identically on both platforms.
+#
+# A function whose whole body is one statement puts two location records on the
+# same address: the marker opening the function and the marker for the
+# statement, with no code emitted between them. The lookup takes the last record
+# at or before the program counter, and which of two equal-keyed records sorts
+# last is what a sort is free to decide. glibc and the Microsoft runtime decided
+# differently, so this reported the faulting statement on Windows and the
+# function's own declaration line on Linux. Asserting the exact line and column
+# on both is the only form of this test that would have caught it.
+#
+# The fixture's line numbers are load-bearing; its header says so.
+foreach ($crashMode in @(
+    @{ Name = "exact";     Args = @("-s")
+       Frames = @("one_statement_body at .*test_crash_exact_statement\.mettle:15:10",
+                  "caller at .*test_crash_exact_statement\.mettle:19:28",
+                  "main at .*test_crash_exact_statement\.mettle:24:16") },
+    @{ Name = "functions"; Args = @()
+       Frames = @("one_statement_body at .*test_crash_exact_statement\.mettle:14:11",
+                  "caller at .*test_crash_exact_statement\.mettle:18:11",
+                  "main at .*test_crash_exact_statement\.mettle:22:1") })) {
+  $crashCase = "crash_names_the_statement_$($crashMode.Name)"
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $crashExe = Join-Path $tmpDir "$crashCase.exe"
+    $crashBuild = & $CompilerPath --build @($crashMode.Args) `
+      tests/test_crash_exact_statement.mettle -o $crashExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "build failed: $crashBuild" }
+    $crashOut = & $crashExe 2>&1 | Out-String
+    if ($crashOut -notmatch "Stack trace:") {
+      throw "no stack trace: $crashOut"
+    }
+    foreach ($frame in $crashMode.Frames) {
+      if ($crashOut -notmatch $frame) {
+        throw "frame does not match '$frame': $crashOut"
+      }
+    }
+    Write-CaseResult -Name $crashCase -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $crashCase -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Recognizer-rot gate. Compiles a corpus of kernels whose loops the
 # vectorizers are supposed to claim and compares the outcome against a checked-
 # in baseline. A claim regressing from taken to untaken fails the build: that is

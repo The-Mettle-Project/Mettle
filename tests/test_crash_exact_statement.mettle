@@ -1,0 +1,25 @@
+// The line numbers in this file are the test. Adding or removing a line above
+// the marked statements changes what the harness expects, so keep edits below
+// the last one.
+//
+// A function whose whole body is one statement puts two location records on the
+// same address: the marker that opens the function, and the marker for the
+// statement, with nothing emitted between them. The lookup takes the last
+// record at or before the program counter, and which of two equal-keyed records
+// sorts last is exactly what a sort may decide for itself. glibc and the
+// Microsoft runtime decided differently, so this reported the faulting
+// statement on Windows and the function's own declaration line on Linux.
+//
+// LINE 15 is the wild store. LINE 19 is the call that reaches it.
+@noinline fn one_statement_body(p: int32*) -> int32 {
+  return *p;
+}
+
+@noinline fn caller(p: int32*) -> int32 {
+  return one_statement_body(p);
+}
+
+fn main() -> int32 {
+  var wild: int64 = 0x00000000DEADB000;
+  return caller((int32*)wild);
+}

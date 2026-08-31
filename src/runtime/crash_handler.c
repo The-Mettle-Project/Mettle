@@ -217,14 +217,38 @@ static int mettle_crash_address_is_readable(const void *address,
 #endif
 }
 
-static int mettle_crash_compare_location(const void *left, const void *right) {
-  uintptr_t addr_left = (uintptr_t)((const MettleCrashLocationInfo *)left)->address;
-  uintptr_t addr_right =
-      (uintptr_t)((const MettleCrashLocationInfo *)right)->address;
+/* Two location records may share an address: a marker that opens a function and
+ * the marker for its first statement land on the same byte when nothing is
+ * emitted between them. The lookup below takes the LAST record at or before the
+ * program counter, so which of the two answers depends on how the sort ordered
+ * them -- and ordering equal keys is exactly what a sort is free to do as it
+ * likes. glibc and the Microsoft runtime chose differently, so the same program
+ * reported the faulting statement on Windows and the function's own declaration
+ * on Linux.
+ *
+ * The order is total now: address, then the record's position in the emitted
+ * table. Records are emitted in program order, so a later one describes code
+ * that begins where an earlier one described none, and the later one is the
+ * answer. `g_runtime_sort_base` is the array being permuted; registration runs
+ * once, from startup, before anything else can be looking. */
+static const MettleCrashLocationInfo *g_runtime_sort_base = NULL;
+
+static int mettle_crash_compare_location_index(const void *left,
+                                               const void *right) {
+  size_t index_left = *(const size_t *)left;
+  size_t index_right = *(const size_t *)right;
+  uintptr_t addr_left = (uintptr_t)g_runtime_sort_base[index_left].address;
+  uintptr_t addr_right = (uintptr_t)g_runtime_sort_base[index_right].address;
   if (addr_left < addr_right) {
     return -1;
   }
   if (addr_left > addr_right) {
+    return 1;
+  }
+  if (index_left < index_right) {
+    return -1;
+  }
+  if (index_left > index_right) {
     return 1;
   }
   return 0;
@@ -243,16 +267,28 @@ static int mettle_crash_prepare_sorted_locations(
     return 1;
   }
 
+  size_t *order = (size_t *)malloc(location_count * sizeof(size_t));
+  if (!order) {
+    return 0;
+  }
   g_runtime_sorted_locations =
       (MettleCrashLocationInfo *)malloc(location_count *
                                       sizeof(MettleCrashLocationInfo));
   if (!g_runtime_sorted_locations) {
+    free(order);
     return 0;
   }
-  memcpy(g_runtime_sorted_locations, locations,
-         location_count * sizeof(MettleCrashLocationInfo));
-  qsort(g_runtime_sorted_locations, location_count,
-        sizeof(MettleCrashLocationInfo), mettle_crash_compare_location);
+  for (size_t i = 0; i < location_count; i++) {
+    order[i] = i;
+  }
+  g_runtime_sort_base = locations;
+  qsort(order, location_count, sizeof(size_t),
+        mettle_crash_compare_location_index);
+  g_runtime_sort_base = NULL;
+  for (size_t i = 0; i < location_count; i++) {
+    g_runtime_sorted_locations[i] = locations[order[i]];
+  }
+  free(order);
   g_runtime_sorted_location_count = location_count;
   return 1;
 }
