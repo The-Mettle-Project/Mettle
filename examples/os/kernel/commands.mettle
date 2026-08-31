@@ -16,7 +16,7 @@ const DUMP_ROWS: uint64 = 8
 const DUMP_COLUMNS: uint64 = 16
 const KEYBOARD_COMMAND_PORT: uint16 = 0x64
 const KEYBOARD_RESET_PULSE: uint8 = 0xfe
-const BEEP_TICKS: uint64 = 20
+const BEEP_TICKS: uint64 = CLOCK_HZ / 5
 const PRINTABLE_FIRST: uint8 = 32
 const PRINTABLE_LAST: uint8 = 126
 

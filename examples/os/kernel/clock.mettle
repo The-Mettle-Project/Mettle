@@ -1,6 +1,6 @@
 import "port"
 
-export const CLOCK_HZ: uint64 = 100
+export const CLOCK_HZ: uint64 = 1000
 
 const PIT_FREQUENCY: uint64 = 1193182
 const PIT_CHANNEL0: uint16 = 0x40

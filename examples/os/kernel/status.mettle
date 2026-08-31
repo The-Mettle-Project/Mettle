@@ -8,8 +8,8 @@ import "heap"
 const STATUS_ROW: uint64 = 23
 const COUNTER_ROW: uint64 = 24
 const FIELD_GAP: uint64 = 3
-const STATUS_PERIOD: uint64 = 25
-const COUNTER_PERIOD: uint64 = 10
+const STATUS_PERIOD: uint64 = CLOCK_HZ / 4
+const COUNTER_PERIOD: uint64 = CLOCK_HZ / 10
 const COUNTER_WIDTH: uint64 = 10
 
 fn label(column: uint64, text: cstring) -> uint64 {

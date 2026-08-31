@@ -2,6 +2,7 @@ import "video"
 import "font"
 import "theme"
 import "port"
+import "task"
 
 export const TERMINAL_COLUMNS: uint64 = 80
 export const TERMINAL_ROWS: uint64 = 25
@@ -17,6 +18,7 @@ var row: uint64 = 0
 var tint: uint8 = 7
 var dirty: volatile uint64 = 1
 
+var reader: uint64 = 8
 var keys: uint8[64]
 var head: volatile uint64 = 0
 var tail: volatile uint64 = 0
@@ -120,7 +122,7 @@ export fn terminal_draw(origin_x: uint64, origin_y: uint64) {
     }
     video_fill(origin_x + column * GLYPH_WIDTH,
                origin_y + row * GLYPH_HEIGHT + GLYPH_HEIGHT - 2,
-               GLYPH_WIDTH, 2, ACCENT)
+               GLYPH_WIDTH, 2, TERMINAL_TEXT)
 }
 
 export fn terminal_push_key(ch: uint8) {
@@ -129,11 +131,13 @@ export fn terminal_push_key(ch: uint8) {
         keys[head] = ch
         head = next
     }
+    task_wake(reader)
 }
 
 export fn terminal_read_key() -> uint8 {
     while (head == tail) {
-        cpu_idle()
+        reader = task_current()
+        task_wait()
     }
     var ch: uint8 = keys[tail]
     tail = (tail + 1) & KEY_MASK

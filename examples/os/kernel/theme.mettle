@@ -1,58 +1,85 @@
-export const SKY_TOP: uint32 = 0x070b16
-export const SKY_BOTTOM: uint32 = 0x1a2b4e
-export const GLOW_TEAL: uint32 = 0x1c6f6a
-export const GLOW_VIOLET: uint32 = 0x4b2f74
+export const DESKTOP: uint32 = 0x3a6ea5
 
-export const ACCENT: uint32 = 0x35d6b0
-export const ACCENT_DEEP: uint32 = 0x1c8f78
-export const VIOLET: uint32 = 0x8b6cf0
+export const FACE: uint32 = 0xece9d8
+export const FACE_LIGHT: uint32 = 0xffffff
+export const FACE_SHADOW: uint32 = 0xaca899
+export const FACE_DARK: uint32 = 0x716f64
+export const CLIENT: uint32 = 0xffffff
+export const TEXT: uint32 = 0x000000
+export const TEXT_FAINT: uint32 = 0x505050
+export const SELECT: uint32 = 0x316ac5
 
-export const WINDOW_BODY: uint32 = 0x141821
-export const WINDOW_EDGE: uint32 = 0x39415a
-export const WINDOW_TEXT: uint32 = 0xe8edf6
-export const WINDOW_FAINT: uint32 = 0x93a0b8
+export const FRAME_ACTIVE: uint32 = 0x0054e3
+export const FRAME_IDLE: uint32 = 0x99b4e0
+export const TITLE_TOP: uint32 = 0x0a4ad6
+export const TITLE_MID: uint32 = 0x3a93ff
+export const TITLE_BOTTOM: uint32 = 0x0f62e8
+export const TITLE_TOP_IDLE: uint32 = 0x7ba2e7
+export const TITLE_BOTTOM_IDLE: uint32 = 0xbdd3f7
+export const TITLE_TEXT: uint32 = 0xffffff
+export const TITLE_TEXT_IDLE: uint32 = 0xe4edfb
 
-export const TITLE_TOP: uint32 = 0x28324c
-export const TITLE_BOTTOM: uint32 = 0x1a2133
-export const TITLE_TOP_IDLE: uint32 = 0x1c2231
-export const TITLE_BOTTOM_IDLE: uint32 = 0x161b28
-export const TITLE_TEXT: uint32 = 0xf2f6ff
-export const TITLE_TEXT_IDLE: uint32 = 0x8d97ab
+export const BUTTON_TOP: uint32 = 0x5aa0f5
+export const BUTTON_BOTTOM: uint32 = 0x1f5fd0
+export const BUTTON_EDGE: uint32 = 0x183f8c
+export const CLOSE_TOP: uint32 = 0xf58a72
+export const CLOSE_BOTTOM: uint32 = 0xc4402a
+export const CLOSE_EDGE: uint32 = 0x8b2a18
 
-export const CLOSE_DOT: uint32 = 0xff5f57
-export const CLOSE_DOT_IDLE: uint32 = 0x4a4f5e
+export const TASKBAR_EDGE: uint32 = 0x0a2e9c
+export const TASKBAR_TOP: uint32 = 0x3d8bf2
+export const TASKBAR_BOTTOM: uint32 = 0x1e4fc0
+export const TASK_TOP: uint32 = 0x5b9df5
+export const TASK_BOTTOM: uint32 = 0x2f6fd8
+export const TASK_DOWN_TOP: uint32 = 0x1b47a8
+export const TASK_DOWN_BOTTOM: uint32 = 0x2a63c8
+export const TASK_TEXT: uint32 = 0xffffff
 
-export const DOCK_TINT: uint32 = 0x080c18
-export const DOCK_EDGE: uint32 = 0x4a5878
-export const DOCK_TEXT: uint32 = 0xc3cddf
-export const DOCK_ACTIVE: uint32 = 0x2b3550
+export const START_TOP: uint32 = 0x62b45c
+export const START_BOTTOM: uint32 = 0x246b21
+export const START_EDGE: uint32 = 0x17491a
+export const START_TEXT: uint32 = 0xffffff
 
-export const SHADOW: uint32 = 0x000000
-export const HIGHLIGHT: uint32 = 0xffffff
+export const TRAY_TOP: uint32 = 0x18b0e0
+export const TRAY_BOTTOM: uint32 = 0x0f86c8
+export const TRAY_EDGE: uint32 = 0x0a5f96
+export const TRAY_TEXT: uint32 = 0xffffff
 
-export const TERMINAL_BACK: uint32 = 0x0a0d14
-export const TERMINAL_TEXT: uint32 = 0xd3dcea
+export const MENU_FACE: uint32 = 0xffffff
+export const MENU_SIDE: uint32 = 0x1057c8
+export const MENU_EDGE: uint32 = 0x0b3d8c
+export const MENU_HOVER: uint32 = 0xd8e6fb
 
-export const ICON_FACE: uint32 = 0x1d2534
-export const ICON_EDGE: uint32 = 0x3d4b64
-export const ICON_TEXT: uint32 = 0xdde3ee
+export const ICON_FACE: uint32 = 0xd8e2f0
+export const ICON_EDGE: uint32 = 0x2a5f9e
+export const ICON_TEXT: uint32 = 0xffffff
+export const ICON_SHADOW: uint32 = 0x1c3a5c
+
+export const WINDOW_BODY: uint32 = 0xffffff
+export const WINDOW_EDGE: uint32 = 0xaca899
+export const WINDOW_TEXT: uint32 = 0x000000
+export const WINDOW_FAINT: uint32 = 0x555555
+export const ACCENT: uint32 = 0x0a246a
+
+export const TERMINAL_BACK: uint32 = 0x000000
+export const TERMINAL_TEXT: uint32 = 0xc0c0c0
 
 export fn theme_text_color(attribute: uint8) -> uint32 {
     var index: uint64 = (uint64)attribute & 15
-    if (index == 0) { return 0x353b47 }
-    if (index == 1) { return 0x4f7fe0 }
-    if (index == 2) { return 0x54c98a }
-    if (index == 3) { return 0x45c4cf }
-    if (index == 4) { return 0xdc6259 }
-    if (index == 5) { return 0xb96ee0 }
-    if (index == 6) { return 0xd0a95a }
-    if (index == 7) { return 0xd3dcea }
-    if (index == 8) { return 0x66708a }
-    if (index == 9) { return 0x7fa8ff }
-    if (index == 10) { return 0x6fe8b4 }
-    if (index == 11) { return 0x7ee6f0 }
-    if (index == 12) { return 0xff8b82 }
-    if (index == 13) { return 0xd8a0ff }
-    if (index == 14) { return 0xf5d67c }
+    if (index == 0) { return 0x000000 }
+    if (index == 1) { return 0x000080 }
+    if (index == 2) { return 0x008000 }
+    if (index == 3) { return 0x008080 }
+    if (index == 4) { return 0x800000 }
+    if (index == 5) { return 0x800080 }
+    if (index == 6) { return 0x808000 }
+    if (index == 7) { return 0xc0c0c0 }
+    if (index == 8) { return 0x808080 }
+    if (index == 9) { return 0x0000ff }
+    if (index == 10) { return 0x00ff00 }
+    if (index == 11) { return 0x00ffff }
+    if (index == 12) { return 0xff0000 }
+    if (index == 13) { return 0xff00ff }
+    if (index == 14) { return 0xffff00 }
     return 0xffffff
 }

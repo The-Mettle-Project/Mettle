@@ -15,7 +15,8 @@ export enum TaskState {
     Free = 0,
     Ready = 1,
     Running = 2,
-    Leaving = 3
+    Leaving = 3,
+    Waiting = 4
 }
 
 struct SwitchFrame {
@@ -83,6 +84,7 @@ export fn task_state_name(slot: uint64) -> cstring {
         case 1: { return "ready" }
         case 2: { return "running" }
         case 3: { return "leaving" }
+        case 4: { return "waiting" }
         default: { return "free" }
     }
 }
@@ -263,6 +265,21 @@ export fn task_create(entry: uint64, name: cstring) -> uint64 {
     tasks[slot].state = TaskState.Ready
     cpu_enable_interrupts()
     return slot
+}
+
+export fn task_wait() {
+    cpu_disable_interrupts()
+    tasks[current].state = TaskState.Waiting
+    cpu_enable_interrupts()
+    while (tasks[current].state == TaskState.Waiting) {
+        cpu_halt()
+    }
+}
+
+export fn task_wake(slot: uint64) {
+    if (slot < TASK_SLOTS && tasks[slot].state == TaskState.Waiting) {
+        tasks[slot].state = TaskState.Ready
+    }
 }
 
 export fn task_exit() {

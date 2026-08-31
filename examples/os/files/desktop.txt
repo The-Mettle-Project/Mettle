@@ -1,20 +1,20 @@
-the desktop, from the bottom up:
+the desktop is painted by damage, not by frames.
 
-  the kernel looks for a vmware svga device on the pci bus. when it is there,
-  the kernel sets the mode itself, writes commands into the device fifo, and
-  hands the pointer to the hardware cursor. when it is not, the framebuffer the
-  bios handed over at boot is used instead and the pointer is drawn by hand
+  nothing redraws unless something changed. moving a window marks the rectangle
+  it left and the one it arrived in, and only that union is repainted and sent
+  to the card. an idle machine repaints the clock corner once a second, about
+  two thousand pixels, and nothing else
 
-  the wallpaper is painted once into its own buffer: a vertical gradient, two
-  radial glows, a vignette, and a little ordered dither so the gradient does
-  not band. every frame starts as a copy of it
+  every drawing call is clipped to the damaged rectangle, so painting the whole
+  desktop inside a small clip costs almost nothing: the fills clip to zero
+  width and the glyphs return before they touch a pixel
 
-  the dock is a strip of that wallpaper, box blurred, tinted, and rounded,
-  baked once at startup. the icons and labels are drawn over it each frame
+  the timer runs at a thousand ticks a second, so the pointer and the keyboard
+  are read within a millisecond of moving
 
-  windows carry a soft shadow built from rings of rounded outlines, a gradient
-  title bar with an accent line under the focused one, and corners that are
-  antialiased by sampling the circle nine times per pixel
+  a task that is waiting for a key is marked waiting and the scheduler skips
+  it, so the shell costs nothing while it sits at the prompt and the desktop
+  gets the whole processor while you drag
 
-  the pointer is a polygon, sampled nine times per pixel for the fill and again
-  for a grown outline, so it has a dark edge and a soft one
+  when the svga device is there the pointer is a hardware cursor, so moving the
+  mouse redraws nothing at all

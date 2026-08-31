@@ -27,18 +27,21 @@ compiled to a flat image with `--target x86_64-none`.
   rides along on the disk. `ls` and `cat` read it out of memory.
 - **GPU.** The kernel finds the VMware SVGA II device on the PCI bus, claims
   it, negotiates the protocol version, sets the mode itself, and drives it
-  through its command FIFO: damage rectangles go to the device rather than a
-  whole screen, and the pointer is a hardware alpha cursor the device composites
-  on its own. Device-side fills and copies are there behind their capability
-  bits. Everything falls back to the firmware framebuffer when the device is
-  absent.
+  through its command FIFO. Damage rectangles go to the device rather than
+  whole screens, and the pointer is a hardware alpha cursor the device
+  composites on its own. Everything falls back to the firmware framebuffer when
+  the device is absent.
 - **Graphics.** The second stage walks the VESA mode list for a fallback linear
   framebuffer and copies the BIOS 8x16 font out of the video ROM on the way
-  past. The kernel composes into a back buffer and presents what changed.
-- **Desktop.** A painted wallpaper with two radial glows and a vignette, a
-  frosted dock blurred out of the wallpaper itself, draggable windows with soft
-  shadows, antialiased rounded corners and gradient title bars, hover states,
-  and an antialiased pointer.
+  past.
+- **Desktop.** Windows XP, drawn in flat gradients: blue title bars with
+  minimise, maximise and close, the green start button and a start menu, task
+  buttons, the clock in the tray, and desktop icons on the plain blue
+  background.
+- **Responsiveness.** Nothing repaints unless it changed. Every draw is clipped
+  to the damaged rectangle, the timer runs at 1 kHz so input is read within a
+  millisecond, and a task waiting for a key is skipped by the scheduler rather
+  than spinning.
 - **Pointer.** A PS/2 mouse on IRQ12, three-byte packets, movement and the left
   button.
 - **Output.** Everything the kernel prints goes to the terminal window, to the
@@ -57,6 +60,7 @@ nothing reaches into another module's globals.
 | `svga` | The VMware SVGA II driver: registers, command FIFO, hardware cursor. |
 | `video` | Drawing: fills, gradients, alpha, rounded shapes, discs, blits, presenting. |
 | `cursor` | The pointer, sampled into an alpha sprite, uploaded to the device or drawn by hand. |
+| `theme` | The Luna palette: window frames, taskbar, start button, tray. |
 | `font` | The BIOS 8x16 glyphs, drawn as pixels. |
 | `theme` | Every colour the desktop uses. |
 | `mouse` | The PS/2 pointer. |
@@ -186,11 +190,13 @@ VBoxManage startvm MettleOS
 
 ## The desktop
 
-Click an icon on the left to open a window. Drag a window by its title bar,
-raise it by clicking it or its taskbar button, close it with the red box. The
-terminal window runs the shell, and the keyboard goes to whichever window is in
-front. The files window lists what the boot image carried; click a file to read
-it. The tasks window is the scheduler's own table, redrawn as it changes.
+Click a desktop icon or the start button to open a window. Drag a window by its
+title bar, minimise it to the taskbar, maximise it to fill the work area, close
+it with the red button. A taskbar button raises its window, or minimises it
+again if it is already in front. The terminal window runs the shell, and the
+keyboard goes to whichever window is in front. The files window lists what the
+boot image carried; click a file to read it. The tasks window is the
+scheduler's own table, redrawn as it changes.
 
 If the firmware offers no 32-bit linear framebuffer, the kernel says so on the
 serial line and falls back to the 80x25 text console with the same shell and
