@@ -38,6 +38,12 @@ fn emit(ch: uint8) {
     port_out(COM1_DATA, ch)
 }
 
+export fn serial_ignore_tint(value: uint8) {
+}
+
+export fn serial_ignore_wipe() {
+}
+
 export fn serial_put(ch: uint8) {
     if (!ready) {
         return

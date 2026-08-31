@@ -1,0 +1,343 @@
+import "layout"
+import "video"
+import "font"
+import "theme"
+import "window"
+import "terminal"
+import "apps"
+import "mouse"
+import "keyboard"
+import "clock"
+import "page"
+import "port"
+
+const TASKBAR_HEIGHT: uint64 = 28
+const ICON_LEFT: uint64 = 18
+const ICON_TOP: uint64 = 24
+const ICON_WIDTH: uint64 = 96
+const ICON_HEIGHT: uint64 = 56
+const ICON_GAP: uint64 = 14
+const CURSOR_WIDTH: uint64 = 12
+const CURSOR_HEIGHT: uint64 = 19
+const LAUNCHER_SLOTS: uint64 = 5
+const BUTTON_WIDTH: uint64 = 132
+const REFRESH_TICKS: uint64 = 20
+
+struct Launcher {
+    label: cstring;
+    kind: uint64;
+    open: fn() -> uint64;
+}
+
+var launchers: Launcher[5]
+var launcher_count: uint64 = 0
+
+var arrow: uint32[19] = [0x000001, 0x000005, 0x000019, 0x000069, 0x0001a9,
+                         0x0006a9, 0x001aa9, 0x006aa9, 0x01aaa9, 0x06aaa9,
+                         0x1aaaa9, 0x555aa9, 0x001a69, 0x006919, 0x006905,
+                         0x01a401, 0x01a400, 0x015000, 0x000000]
+
+var cursor_pixels: uint32[228]
+var cursor_x: uint64 = 0
+var cursor_y: uint64 = 0
+var cursor_visible: uint64 = 0
+
+var stale: uint64 = 1
+var dragging: uint64 = WINDOW_SLOTS
+var drag_x: int64 = 0
+var drag_y: int64 = 0
+var was_down: uint64 = 0
+var last_refresh: uint64 = 0
+
+fn register(label: cstring, kind: uint64, open: fn() -> uint64) {
+    if (launcher_count >= LAUNCHER_SLOTS) {
+        return
+    }
+    launchers[launcher_count].label = label
+    launchers[launcher_count].kind = kind
+    launchers[launcher_count].open = open
+    launcher_count++
+}
+
+fn launch(index: uint64) {
+    var existing: uint64 = window_of_kind(launchers[index].kind)
+    if (existing < WINDOW_SLOTS) {
+        window_raise(existing)
+        return
+    }
+    launchers[index].open()
+}
+
+fn taskbar_top() -> uint64 {
+    return video_height() - TASKBAR_HEIGHT
+}
+
+fn draw_wallpaper() {
+    var rows: uint64 = taskbar_top()
+    for y: uint64 in 0..rows {
+        var mix: uint64 = y * 255 / rows
+        var red: uint64 = (((SKY_TOP >> 16) & 255) * (255 - mix) +
+                           ((SKY_BOTTOM >> 16) & 255) * mix) / 255
+        var green: uint64 = (((SKY_TOP >> 8) & 255) * (255 - mix) +
+                             ((SKY_BOTTOM >> 8) & 255) * mix) / 255
+        var blue: uint64 = ((SKY_TOP & 255) * (255 - mix) +
+                            (SKY_BOTTOM & 255) * mix) / 255
+        video_fill(0, y, video_width(), 1,
+                   (uint32)((red << 16) | (green << 8) | blue))
+    }
+}
+
+fn icon_top(index: uint64) -> uint64 {
+    return ICON_TOP + index * (ICON_HEIGHT + ICON_GAP)
+}
+
+fn draw_icons() {
+    for i: uint64 in 0..launcher_count {
+        var top: uint64 = icon_top(i)
+        video_fill(ICON_LEFT, top, ICON_WIDTH, ICON_HEIGHT, ICON_FACE)
+        video_frame(ICON_LEFT, top, ICON_WIDTH, ICON_HEIGHT, ICON_EDGE)
+        video_fill(ICON_LEFT + 34, top + 12, 28, 20, ACCENT)
+        video_fill(ICON_LEFT + 38, top + 16, 20, 12, ICON_FACE)
+        var width: uint64 = font_text_width(launchers[i].label)
+        font_draw_text(ICON_LEFT + (ICON_WIDTH - width) / 2, top + ICON_HEIGHT - 18,
+                       launchers[i].label, ICON_TEXT)
+    }
+}
+
+fn draw_window(id: uint64, active: bool) {
+    var left: uint64 = (uint64)window_x(id)
+    var top: uint64 = (uint64)window_y(id)
+    var w: uint64 = window_width(id)
+    var h: uint64 = window_height(id)
+
+    video_fill(left + 4, top + 4, w, h, SHADOW)
+    video_fill(left, top, w, h, WINDOW_BODY)
+    video_frame(left, top, w, h, WINDOW_EDGE)
+
+    var title_color: uint32 = TITLE_IDLE
+    var title_text: uint32 = TITLE_IDLE_TEXT
+    if (active) {
+        title_color = TITLE_ACTIVE
+        title_text = TITLE_TEXT
+    }
+    video_fill(left + BORDER, top + BORDER, w - BORDER * 2, TITLE_HEIGHT,
+               title_color)
+    font_draw_text(left + 8, top + 4, window_title(id), title_text)
+
+    video_fill(window_close_x(id), window_close_y(id), CLOSE_SIZE, CLOSE_SIZE,
+               CLOSE_BOX)
+    window_draw_content(id)
+}
+
+fn draw_taskbar() {
+    var top: uint64 = taskbar_top()
+    video_fill(0, top, video_width(), TASKBAR_HEIGHT, BAR)
+    video_fill(0, top, video_width(), 1, BAR_EDGE)
+
+    var at: uint64 = 10
+    for i: uint64 in 0..window_count() {
+        var id: uint64 = window_at_depth(i)
+        var active: bool = id == window_front()
+        var face: uint32 = TITLE_IDLE
+        if (active) {
+            face = TITLE_ACTIVE
+        }
+        video_fill(at, top + 5, BUTTON_WIDTH, TASKBAR_HEIGHT - 10, face)
+        font_draw_text(at + 8, top + 6, window_title(id), BAR_TEXT)
+        at += BUTTON_WIDTH + 8
+    }
+
+    var right: uint64 = video_width() - 210
+    right += font_draw_text(right, top + 6, "free ", BAR_TEXT)
+    right += font_draw_number(right, top + 6,
+                              page_free_bytes() / BYTES_PER_MB, ACCENT)
+    font_draw_text(right, top + 6, " mb", BAR_TEXT)
+
+    var clock_left: uint64 = video_width() - 76
+    clock_left += font_draw_two_digits(clock_left, top + 6, clock_hour(), BAR_TEXT)
+    clock_left += font_draw_text(clock_left, top + 6, ":", BAR_TEXT)
+    clock_left += font_draw_two_digits(clock_left, top + 6, clock_minute(), BAR_TEXT)
+    clock_left += font_draw_text(clock_left, top + 6, ":", BAR_TEXT)
+    font_draw_two_digits(clock_left, top + 6, clock_second(), BAR_TEXT)
+}
+
+fn compose() {
+    draw_wallpaper()
+    draw_icons()
+    var front: uint64 = window_front()
+    for i: uint64 in 0..window_count() {
+        var id: uint64 = window_at_depth(i)
+        draw_window(id, id == front)
+    }
+    draw_taskbar()
+}
+
+fn draw_cursor(x: uint64, y: uint64) {
+    for row: uint64 in 0..CURSOR_HEIGHT {
+        var bits: uint32 = arrow[row]
+        for column: uint64 in 0..CURSOR_WIDTH {
+            var code: uint32 = (bits >> (column * 2)) & 3
+            if (code == 1) {
+                video_pixel(x + column, y + row, CURSOR_EDGE)
+            } else if (code == 2) {
+                video_pixel(x + column, y + row, CURSOR_FILL)
+            }
+        }
+    }
+}
+
+fn cursor_show() {
+    cursor_x = mouse_x()
+    cursor_y = mouse_y()
+    if (cursor_x + CURSOR_WIDTH > video_width()) {
+        cursor_x = video_width() - CURSOR_WIDTH
+    }
+    if (cursor_y + CURSOR_HEIGHT > video_height()) {
+        cursor_y = video_height() - CURSOR_HEIGHT
+    }
+    video_save(cursor_x, cursor_y, CURSOR_WIDTH, CURSOR_HEIGHT,
+               (uint64)&cursor_pixels[0])
+    draw_cursor(cursor_x, cursor_y)
+    video_present(cursor_x, cursor_y, CURSOR_WIDTH, CURSOR_HEIGHT)
+    cursor_visible = 1
+}
+
+fn cursor_hide() {
+    if (cursor_visible == 0) {
+        return
+    }
+    video_restore(cursor_x, cursor_y, CURSOR_WIDTH, CURSOR_HEIGHT,
+                  (uint64)&cursor_pixels[0])
+    video_present(cursor_x, cursor_y, CURSOR_WIDTH, CURSOR_HEIGHT)
+    cursor_visible = 0
+}
+
+fn icon_under(x: uint64, y: uint64) -> uint64 {
+    for i: uint64 in 0..launcher_count {
+        var top: uint64 = icon_top(i)
+        if (x >= ICON_LEFT && x < ICON_LEFT + ICON_WIDTH && y >= top &&
+            y < top + ICON_HEIGHT) {
+            return i
+        }
+    }
+    return launcher_count
+}
+
+fn press_taskbar(x: uint64) {
+    var at: uint64 = 10
+    for i: uint64 in 0..window_count() {
+        if (x >= at && x < at + BUTTON_WIDTH) {
+            window_raise(window_at_depth(i))
+            return
+        }
+        at += BUTTON_WIDTH + 8
+    }
+}
+
+fn press(x: uint64, y: uint64) {
+    stale = 1
+    if (y >= taskbar_top()) {
+        press_taskbar(x)
+        return
+    }
+
+    var id: uint64 = window_under(x, y)
+    if (id < WINDOW_SLOTS) {
+        window_raise(id)
+        if (window_on_close(id, x, y)) {
+            window_close(id)
+            return
+        }
+        if (window_on_title(id, y)) {
+            dragging = id
+            drag_x = (int64)x
+            drag_y = (int64)y
+            return
+        }
+        var content_x: uint64 = window_content_x(id)
+        var content_y: uint64 = window_content_y(id)
+        if (x >= content_x && y >= content_y) {
+            window_send_click(id, x - content_x, y - content_y)
+        }
+        return
+    }
+
+    var icon: uint64 = icon_under(x, y)
+    if (icon < launcher_count) {
+        launch(icon)
+    }
+}
+
+fn poll_mouse() {
+    var moved: bool = mouse_take_motion()
+    var down: uint64 = 0
+    if (mouse_left_down()) {
+        down = 1
+    }
+    var x: uint64 = mouse_x()
+    var y: uint64 = mouse_y()
+
+    if (down != 0 && was_down == 0) {
+        press(x, y)
+    }
+    if (down == 0 && was_down != 0) {
+        dragging = WINDOW_SLOTS
+    }
+    was_down = down
+
+    if (moved && dragging < WINDOW_SLOTS) {
+        window_move(dragging, (int64)x - drag_x, (int64)y - drag_y)
+        drag_x = (int64)x
+        drag_y = (int64)y
+        stale = 1
+    }
+}
+
+fn poll_keys() {
+    while (keyboard_ready()) {
+        var ch: uint8 = keyboard_read()
+        var front: uint64 = window_front()
+        if (front < WINDOW_SLOTS) {
+            window_send_key(front, ch)
+        }
+    }
+}
+
+export fn desktop_dirty() {
+    stale = 1
+}
+
+export fn desktop_init() {
+    register("terminal", KIND_TERMINAL, &app_terminal_open)
+    register("files", KIND_FILES, &app_files_open)
+    register("tasks", KIND_TASKS, &app_tasks_open)
+    register("clock", KIND_CLOCK, &app_clock_open)
+    register("about", KIND_ABOUT, &app_about_open)
+    mouse_init(video_width(), video_height())
+}
+
+export fn desktop_run() {
+    compose()
+    video_present_all()
+    cursor_show()
+    while (true) {
+        cursor_hide()
+        poll_keys()
+        poll_mouse()
+        if (terminal_touched()) {
+            terminal_settle()
+            stale = 1
+        }
+        if (clock_ticks() - last_refresh >= REFRESH_TICKS) {
+            last_refresh = clock_ticks()
+            stale = 1
+        }
+        if (stale != 0) {
+            compose()
+            video_present_all()
+            stale = 0
+        }
+        cursor_show()
+        clock_sleep(1)
+    }
+}

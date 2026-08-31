@@ -1,0 +1,238 @@
+export const WINDOW_SLOTS: uint64 = 8
+export const TITLE_HEIGHT: uint64 = 22
+export const BORDER: uint64 = 1
+export const CLOSE_SIZE: uint64 = 12
+
+const NAME_BYTES: uint64 = 24
+
+struct Window {
+    x: int64;
+    y: int64;
+    w: uint64;
+    h: uint64;
+    kind: uint64;
+    used: uint64;
+    draw: fn(uint64) -> void;
+    key: fn(uint64, uint8) -> void;
+    click: fn(uint64, uint64, uint64) -> void;
+    title: uint8[24];
+}
+
+var windows: Window[8]
+var stack: uint64[8]
+var depth: uint64 = 0
+
+export fn window_count() -> uint64 {
+    return depth
+}
+
+export fn window_at_depth(index: uint64) -> uint64 {
+    return stack[index]
+}
+
+export fn window_live(id: uint64) -> bool {
+    return id < WINDOW_SLOTS && windows[id].used != 0
+}
+
+export fn window_kind(id: uint64) -> uint64 {
+    return windows[id].kind
+}
+
+export fn window_x(id: uint64) -> int64 {
+    return windows[id].x
+}
+
+export fn window_y(id: uint64) -> int64 {
+    return windows[id].y
+}
+
+export fn window_width(id: uint64) -> uint64 {
+    return windows[id].w
+}
+
+export fn window_height(id: uint64) -> uint64 {
+    return windows[id].h
+}
+
+export fn window_title(id: uint64) -> cstring {
+    return (cstring)&windows[id].title[0]
+}
+
+export fn window_content_x(id: uint64) -> uint64 {
+    return (uint64)(windows[id].x + (int64)BORDER)
+}
+
+export fn window_content_y(id: uint64) -> uint64 {
+    return (uint64)(windows[id].y + (int64)(BORDER + TITLE_HEIGHT))
+}
+
+export fn window_content_width(id: uint64) -> uint64 {
+    return windows[id].w - BORDER * 2
+}
+
+export fn window_content_height(id: uint64) -> uint64 {
+    return windows[id].h - TITLE_HEIGHT - BORDER * 2
+}
+
+export fn window_draw_content(id: uint64) {
+    windows[id].draw(id)
+}
+
+export fn window_send_key(id: uint64, ch: uint8) {
+    windows[id].key(id, ch)
+}
+
+export fn window_send_click(id: uint64, x: uint64, y: uint64) {
+    windows[id].click(id, x, y)
+}
+
+export fn window_move(id: uint64, step_x: int64, step_y: int64) {
+    windows[id].x = windows[id].x + step_x
+    windows[id].y = windows[id].y + step_y
+}
+
+export fn window_place(id: uint64, x: int64, y: int64) {
+    windows[id].x = x
+    windows[id].y = y
+}
+
+fn ignore_key(id: uint64, ch: uint8) {
+}
+
+fn ignore_click(id: uint64, x: uint64, y: uint64) {
+}
+
+fn set_title(id: uint64, text: cstring) {
+    var i: uint64 = 0
+    while (text[i] != 0 && i + 1 < NAME_BYTES) {
+        windows[id].title[i] = text[i]
+        i++
+    }
+    windows[id].title[i] = 0
+}
+
+export fn window_raise(id: uint64) {
+    var found: uint64 = depth
+    for i: uint64 in 0..depth {
+        if (stack[i] == id) {
+            found = i
+        }
+    }
+    if (found == depth) {
+        return
+    }
+    for i: uint64 in found..(depth - 1) {
+        stack[i] = stack[i + 1]
+    }
+    stack[depth - 1] = id
+}
+
+export fn window_front() -> uint64 {
+    if (depth == 0) {
+        return WINDOW_SLOTS
+    }
+    return stack[depth - 1]
+}
+
+export fn window_open(kind: uint64, x: int64, y: int64, w: uint64, h: uint64,
+                      title: cstring, draw: fn(uint64) -> void,
+                      key: fn(uint64, uint8) -> void,
+                      click: fn(uint64, uint64, uint64) -> void) -> uint64 {
+    var id: uint64 = WINDOW_SLOTS
+    for i: uint64 in 0..WINDOW_SLOTS {
+        if (windows[i].used == 0 && id == WINDOW_SLOTS) {
+            id = i
+        }
+    }
+    if (id == WINDOW_SLOTS) {
+        return WINDOW_SLOTS
+    }
+    windows[id].x = x
+    windows[id].y = y
+    windows[id].w = w
+    windows[id].h = h
+    windows[id].kind = kind
+    windows[id].draw = draw
+    windows[id].key = key
+    windows[id].click = click
+    windows[id].used = 1
+    set_title(id, title)
+    stack[depth] = id
+    depth++
+    return id
+}
+
+export fn window_open_plain(kind: uint64, x: int64, y: int64, w: uint64,
+                            h: uint64, title: cstring,
+                            draw: fn(uint64) -> void) -> uint64 {
+    return window_open(kind, x, y, w, h, title, draw, &ignore_key, &ignore_click)
+}
+
+export fn window_close(id: uint64) {
+    if (!window_live(id)) {
+        return
+    }
+    windows[id].used = 0
+    var found: uint64 = depth
+    for i: uint64 in 0..depth {
+        if (stack[i] == id) {
+            found = i
+        }
+    }
+    if (found == depth) {
+        return
+    }
+    for i: uint64 in found..(depth - 1) {
+        stack[i] = stack[i + 1]
+    }
+    depth--
+}
+
+export fn window_of_kind(kind: uint64) -> uint64 {
+    for i: uint64 in 0..WINDOW_SLOTS {
+        if (windows[i].used != 0 && windows[i].kind == kind) {
+            return i
+        }
+    }
+    return WINDOW_SLOTS
+}
+
+export fn window_holds(id: uint64, x: uint64, y: uint64) -> bool {
+    if (!window_live(id)) {
+        return false
+    }
+    var left: int64 = windows[id].x
+    var top: int64 = windows[id].y
+    return (int64)x >= left && (int64)x < left + (int64)windows[id].w &&
+           (int64)y >= top && (int64)y < top + (int64)windows[id].h
+}
+
+export fn window_under(x: uint64, y: uint64) -> uint64 {
+    var found: uint64 = WINDOW_SLOTS
+    for i: uint64 in 0..depth {
+        if (window_holds(stack[i], x, y)) {
+            found = stack[i]
+        }
+    }
+    return found
+}
+
+export fn window_on_title(id: uint64, y: uint64) -> bool {
+    return (int64)y < windows[id].y + (int64)(TITLE_HEIGHT + BORDER)
+}
+
+export fn window_on_close(id: uint64, x: uint64, y: uint64) -> bool {
+    var box_left: int64 = windows[id].x + (int64)windows[id].w -
+                          (int64)(CLOSE_SIZE + 6)
+    var box_top: int64 = windows[id].y + 5
+    return (int64)x >= box_left && (int64)x < box_left + (int64)CLOSE_SIZE &&
+           (int64)y >= box_top && (int64)y < box_top + (int64)CLOSE_SIZE
+}
+
+export fn window_close_x(id: uint64) -> uint64 {
+    return (uint64)(windows[id].x + (int64)windows[id].w - (int64)(CLOSE_SIZE + 6))
+}
+
+export fn window_close_y(id: uint64) -> uint64 {
+    return (uint64)(windows[id].y + 5)
+}

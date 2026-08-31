@@ -78,12 +78,11 @@ fn history_recall(age: uint64, shown: uint64) -> uint64 {
     return length
 }
 
-fn read_line() -> uint64 {
+fn read_line(read_key: fn() -> uint8) -> uint64 {
     var length: uint64 = 0
     var age: uint64 = 0
     while (true) {
-        console_sync_cursor()
-        var ch: uint8 = keyboard_read()
+        var ch: uint8 = read_key()
         if (ch == KEY_ENTER) {
             console_put('\n')
             line[length] = 0
@@ -143,10 +142,10 @@ export fn shell_dispatch(input: cstring) {
     console_write_line(name)
 }
 
-export fn shell_run() {
+export fn shell_run(read_key: fn() -> uint8) {
     while (true) {
         console_write_colored("mettle> ", COLOR_PROMPT)
-        read_line()
+        read_line(read_key)
         shell_dispatch((cstring)&line[0])
     }
 }

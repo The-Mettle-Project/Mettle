@@ -14,72 +14,25 @@
         mov si, loading_text
         call print
 
-        xor ebx, ebx
-        mov di, 0x5010
-        xor si, si
-    map_next:
-        mov eax, 0xe820
-        mov edx, 0x534d4150
-        mov ecx, 24
-        int 0x15
-        jc map_done
-        cmp eax, 0x534d4150
-        jne map_done
-        add di, 24
-        inc si
-        test ebx, ebx
-        jz map_done
-        cmp si, 40
-        jb map_next
-    map_done:
-        mov [0x5000], si
-
-        mov cx, 256
+        mov cx, 8
         mov si, 1
+        mov bp, 0x0800
+        call load_run
+
+        mov cx, 384
+        mov si, 9
         mov bp, 0x2000
-    load_next:
+        call load_run
+
+        mov dl, [boot_drive]
+        jmp 0x0000:0x8000
+
+    load_run:
         call read_sector
         inc si
         add bp, 0x20
-        loop load_next
-
-        cli
-        in al, 0x92
-        or al, 2
-        out 0x92, al
-
-        mov edi, 0x1000
-        xor eax, eax
-        mov ecx, 4096
-        rep stosd
-
-        mov edi, 0x1000
-        mov dword [edi], 0x2003
-        mov edi, 0x2000
-        mov dword [edi], 0x3003
-        mov edi, 0x3000
-        mov eax, 0x83
-        mov ecx, 512
-    map_page:
-        mov [edi], eax
-        add eax, 0x200000
-        add edi, 8
-        loop map_page
-
-        mov edi, 0x1000
-        mov cr3, edi
-        lgdt [gdt_pointer]
-        mov eax, cr4
-        or eax, 0x20
-        mov cr4, eax
-        mov ecx, 0xc0000080
-        rdmsr
-        or eax, 0x100
-        wrmsr
-        mov eax, cr0
-        or eax, 0x80000001
-        mov cr0, eax
-        jmp 0x08:long_mode
+        loop load_run
+        ret
 
     read_sector:
         push cx
@@ -134,26 +87,5 @@
         db "loading mettle os", 13, 10, 0
     disk_text:
         db "disk error", 13, 10, 0
-
-        align 8
-    gdt_start:
-        dq 0
-        dq 0x00af9a000000ffff
-        dq 0x00af92000000ffff
-    gdt_pointer:
-        dw 23
-        dd gdt_start
-
-        bits 64
-    long_mode:
-        mov ax, 0x10
-        mov ds, ax
-        mov es, ax
-        mov ss, ax
-        mov fs, ax
-        mov gs, ax
-        mov rsp, 0x90000
-        mov rax, 0x20000
-        jmp rax
     }
 }

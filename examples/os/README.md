@@ -1,10 +1,10 @@
 # Mettle OS
 
-A bootable operating system written in Mettle. The boot sector brings the
-machine from real mode into 64-bit long mode, loads the kernel and a small
-file archive, and hands control over. The kernel manages memory, schedules
-tasks, drives the screen, the keyboard, the clock and a serial line, and runs
-a shell.
+A bootable operating system written in Mettle, with a desktop. The boot sector
+loads a second stage, which asks the firmware for a linear framebuffer and
+brings the machine into 64-bit long mode. The kernel manages memory, schedules
+tasks, drives the screen, the mouse, the keyboard, the clock and a serial line,
+and runs a windowed desktop with a shell inside it.
 
 Nothing outside the Mettle compiler builds it. The 512-byte boot sector is an
 `asm` block the compiler assembles itself, and the kernel is ordinary Mettle
@@ -25,8 +25,17 @@ compiled to a flat image with `--target x86_64-none`.
   backspace, and arrow keys walking the command history.
 - **Files.** `build.ps1` packs everything in `files/` into an archive that
   rides along on the disk. `ls` and `cat` read it out of memory.
-- **Output.** An 80x25 VGA console with scrolling and a hardware cursor, a
-  status bar drawn by a background task, and a copy of everything on COM1.
+- **Graphics.** The second stage walks the VESA mode list for the widest
+  32-bit-colour mode up to 1024x768 with a linear framebuffer, and copies the
+  BIOS 8x16 font out of the video ROM on the way past. The kernel composes into
+  a back buffer at 4 MB and copies out the rectangles that changed.
+- **Desktop.** A wallpaper, launcher icons, draggable windows with title bars
+  and close boxes, a taskbar with a window list and a clock, and a mouse
+  pointer drawn over the top with save-under.
+- **Pointer.** A PS/2 mouse on IRQ12, three-byte packets, movement and the left
+  button.
+- **Output.** Everything the kernel prints goes to the terminal window, to the
+  80x25 text console when there is no framebuffer, and to COM1 either way.
 
 ## Modules
 
@@ -37,6 +46,14 @@ nothing reaches into another module's globals.
 | Module | Owns |
 | --- | --- |
 | `layout` | Where things sit in physical memory. Every fixed address in the system is here. |
+| `video` | The framebuffer: the back buffer, fills, rectangles, and presenting what changed. |
+| `font` | The BIOS 8x16 glyphs, drawn as pixels. |
+| `theme` | Every colour the desktop uses. |
+| `mouse` | The PS/2 pointer. |
+| `terminal` | A text grid that the console writes into and a window draws. |
+| `window` | Window records, z-order, hit testing. |
+| `desktop` | Wallpaper, icons, chrome, taskbar, cursor, and the event loop. |
+| `apps` | What each window draws: terminal, files, tasks, clock, about. |
 | `port` | `in`, `out`, and the instructions that stop or idle the processor. |
 | `text` | Comparing, measuring, copying, and parsing bytes. |
 | `format` | Turning numbers into digits. The console and the screen share it. |
@@ -70,6 +87,9 @@ shell_register("ps", "the task table", &cmd_ps)
 
 ## Adding to it
 
+- **An app.** Write `draw`, `key`, and `click` functions in
+  `kernel/apps.mettle`, open a window with them, and add one `register` line in
+  `kernel/desktop.mettle` to give it an icon.
 - **A command.** Write `fn cmd_thing(argument: cstring)` in
   `kernel/commands.mettle` and add one `shell_register` line. Nothing else
   changes, and `help` picks it up on its own.
@@ -83,7 +103,8 @@ shell_register("ps", "the task table", &cmd_ps)
 
 | File | What it is |
 | --- | --- |
-| `boot.mettle` | The boot sector at 0x7c00. Memory map, 128 KB read off the floppy, A20, page tables, long mode. |
+| `boot.mettle` | The boot sector at 0x7c00. Reads the second stage and 192 KB of kernel and files off the floppy. |
+| `stage2.mettle` | At 0x8000. Memory map, VESA mode, BIOS font, A20, page tables for the first four gigabytes, long mode. |
 | `kernel.mettle` | The entry point and the boot order. |
 | `kernel/` | The modules above. |
 | `files/` | Text carried in the boot image and read back by `ls` and `cat`. |
@@ -152,6 +173,18 @@ VBoxManage startvm MettleOS
    `examples/os/mettleos.img` to it. The file picker wants "Choose a disk
    file", and `.img` is one of the types it takes.
 5. Start.
+
+## The desktop
+
+Click an icon on the left to open a window. Drag a window by its title bar,
+raise it by clicking it or its taskbar button, close it with the red box. The
+terminal window runs the shell, and the keyboard goes to whichever window is in
+front. The files window lists what the boot image carried; click a file to read
+it. The tasks window is the scheduler's own table, redrawn as it changes.
+
+If the firmware offers no 32-bit linear framebuffer, the kernel says so on the
+serial line and falls back to the 80x25 text console with the same shell and
+the same commands.
 
 ## The shell
 

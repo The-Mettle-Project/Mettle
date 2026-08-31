@@ -5,6 +5,10 @@ import "vga"
 export const VECTOR_COUNT: uint64 = 256
 export const VECTOR_TIMER: uint64 = 32
 export const VECTOR_KEYBOARD: uint64 = 33
+export const VECTOR_MOUSE: uint64 = 44
+export const IRQ_TIMER: uint64 = 0
+export const IRQ_KEYBOARD: uint64 = 1
+export const IRQ_MOUSE: uint64 = 12
 
 const KERNEL_CODE_SELECTOR: uint64 = 8
 const GATE_INTERRUPT: uint64 = 0x8e
@@ -22,8 +26,9 @@ const PIC_SLAVE_ON_IRQ2: uint8 = 0x04
 const PIC_SLAVE_IDENTITY: uint8 = 0x02
 const PIC_MASTER_OFFSET: uint8 = 0x20
 const PIC_SLAVE_OFFSET: uint8 = 0x28
-const MASK_ALL_BUT_TIMER_AND_KEYBOARD: uint8 = 0xfc
 const MASK_ALL: uint8 = 0xff
+const CASCADE_IRQ: uint64 = 2
+const IRQS_PER_CHIP: uint64 = 8
 
 struct InterruptFrame {
     rip: uint64;
@@ -77,11 +82,25 @@ fn report_fault(rip: uint64) {
 }
 
 @interrupt fn on_spurious() {
+    port_out(PIC_SLAVE_COMMAND, PIC_END_OF_INTERRUPT)
     port_out(PIC_MASTER_COMMAND, PIC_END_OF_INTERRUPT)
 }
 
-export fn pic_end_of_interrupt() {
+export fn pic_end_of_interrupt(irq: uint64) {
+    if (irq >= IRQS_PER_CHIP) {
+        port_out(PIC_SLAVE_COMMAND, PIC_END_OF_INTERRUPT)
+    }
     port_out(PIC_MASTER_COMMAND, PIC_END_OF_INTERRUPT)
+}
+
+export fn pic_unmask(irq: uint64) {
+    if (irq >= IRQS_PER_CHIP) {
+        var line: uint64 = irq - IRQS_PER_CHIP
+        port_out(PIC_SLAVE_DATA, port_in(PIC_SLAVE_DATA) & (uint8)~((uint64)1 << line))
+        pic_unmask(CASCADE_IRQ)
+        return
+    }
+    port_out(PIC_MASTER_DATA, port_in(PIC_MASTER_DATA) & (uint8)~((uint64)1 << irq))
 }
 
 export fn pic_init() {
@@ -101,7 +120,7 @@ export fn pic_init() {
     port_settle()
     port_out(PIC_SLAVE_DATA, PIC_MODE_8086)
     port_settle()
-    port_out(PIC_MASTER_DATA, MASK_ALL_BUT_TIMER_AND_KEYBOARD)
+    port_out(PIC_MASTER_DATA, MASK_ALL)
     port_out(PIC_SLAVE_DATA, MASK_ALL)
 }
 

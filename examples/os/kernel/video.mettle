@@ -1,0 +1,142 @@
+import "layout"
+
+const INFO_WIDTH: uint64 = BOOT_INFO_BASE + 2
+const INFO_HEIGHT: uint64 = BOOT_INFO_BASE + 4
+const INFO_PITCH: uint64 = BOOT_INFO_BASE + 6
+const INFO_DEPTH: uint64 = BOOT_INFO_BASE + 8
+const INFO_FRAMEBUFFER: uint64 = BOOT_INFO_BASE + 12
+
+var width: uint64 = 0
+var height: uint64 = 0
+var pitch: uint64 = 0
+var framebuffer: uint64 = 0
+var back: uint64 = 0
+
+export fn video_init() -> bool {
+    var words: uint16* = (uint16*)INFO_WIDTH
+    var frame: uint32* = (uint32*)INFO_FRAMEBUFFER
+    width = (uint64)words[0]
+    height = (uint64)words[1]
+    pitch = (uint64)words[2]
+    framebuffer = (uint64)frame[0]
+    back = BACK_BUFFER_BASE
+    if (width == 0 || height == 0 || framebuffer == 0) {
+        width = 0
+        height = 0
+        return false
+    }
+    return true
+}
+
+export fn video_ready() -> bool {
+    return width != 0
+}
+
+export fn video_width() -> uint64 {
+    return width
+}
+
+export fn video_height() -> uint64 {
+    return height
+}
+
+fn row_address(y: uint64) -> uint64 {
+    return back + y * width * 4
+}
+
+export fn video_pixel(x: uint64, y: uint64, color: uint32) {
+    if (x >= width || y >= height) {
+        return
+    }
+    var row: uint32* = (uint32*)row_address(y)
+    row[x] = color
+}
+
+fn fill_span(start: uint64, count: uint64, color: uint32) {
+    var pair: uint64 = ((uint64)color << 32) | (uint64)color
+    var pairs: uint64 = count / 2
+    var wide: uint64* = (uint64*)start
+    for i: uint64 in 0..pairs {
+        wide[i] = pair
+    }
+    if (count % 2 != 0) {
+        var tail: uint32* = (uint32*)(start + pairs * 8)
+        tail[0] = color
+    }
+}
+
+export fn video_fill(x: uint64, y: uint64, w: uint64, h: uint64, color: uint32) {
+    if (x >= width || y >= height) {
+        return
+    }
+    var right: uint64 = x + w
+    var bottom: uint64 = y + h
+    if (right > width) {
+        right = width
+    }
+    if (bottom > height) {
+        bottom = height
+    }
+    for row: uint64 in y..bottom {
+        fill_span(row_address(row) + x * 4, right - x, color)
+    }
+}
+
+export fn video_frame(x: uint64, y: uint64, w: uint64, h: uint64, color: uint32) {
+    video_fill(x, y, w, 1, color)
+    video_fill(x, y + h - 1, w, 1, color)
+    video_fill(x, y, 1, h, color)
+    video_fill(x + w - 1, y, 1, h, color)
+}
+
+fn copy_span(source: uint64, target: uint64, count: uint64) {
+    var pairs: uint64 = count / 2
+    var from: uint64* = (uint64*)source
+    var to: uint64* = (uint64*)target
+    for i: uint64 in 0..pairs {
+        to[i] = from[i]
+    }
+    if (count % 2 != 0) {
+        var from_tail: uint32* = (uint32*)(source + pairs * 8)
+        var to_tail: uint32* = (uint32*)(target + pairs * 8)
+        to_tail[0] = from_tail[0]
+    }
+}
+
+export fn video_present(x: uint64, y: uint64, w: uint64, h: uint64) {
+    if (width == 0 || x >= width || y >= height) {
+        return
+    }
+    var right: uint64 = x + w
+    var bottom: uint64 = y + h
+    if (right > width) {
+        right = width
+    }
+    if (bottom > height) {
+        bottom = height
+    }
+    for row: uint64 in y..bottom {
+        copy_span(row_address(row) + x * 4,
+                  framebuffer + row * pitch + x * 4, right - x)
+    }
+}
+
+export fn video_present_all() {
+    video_present(0, 0, width, height)
+}
+
+export fn video_save(x: uint64, y: uint64, w: uint64, h: uint64, into: uint64) {
+    for row: uint64 in 0..h {
+        if (y + row < height) {
+            copy_span(row_address(y + row) + x * 4, into + row * w * 4, w)
+        }
+    }
+}
+
+export fn video_restore(x: uint64, y: uint64, w: uint64, h: uint64, from: uint64) {
+    for row: uint64 in 0..h {
+        if (y + row < height) {
+            copy_span(from + row * w * 4, row_address(y + row) + x * 4, w)
+        }
+    }
+}

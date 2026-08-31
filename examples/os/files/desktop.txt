@@ -1,0 +1,16 @@
+the desktop, from the bottom up:
+
+  the second stage asks the vesa bios for the widest 32 bit colour mode it
+  offers up to 1024 by 768, and copies the 8x16 font out of the video rom
+  before the mode changes
+
+  the kernel composes into a back buffer at four megabytes and copies out
+  only the rectangles that changed, so the pointer costs two small copies a
+  frame rather than a whole screen
+
+  windows are records with three function pointers: draw, key, click. the
+  desktop owns the chrome and the event loop, the app owns the inside
+
+  the terminal window is a text grid the console writes into. the shell runs
+  in its own task and blocks on the window's key queue, so dragging a window
+  keeps working while a command runs

@@ -44,6 +44,7 @@ struct SwitchFrame {
 struct Task {
     stack_pointer: uint64;
     stack_base: uint64;
+    stack_bytes: uint64;
     state: TaskState;
     slices: uint64;
     stop: bool;
@@ -116,8 +117,10 @@ fn set_name(slot: uint64, text: cstring) {
 fn reap_departed() {
     for i: uint64 in 0..TASK_SLOTS {
         if (tasks[i].state == TaskState.Leaving && i != current) {
-            if (tasks[i].stack_base != 0) {
-                page_free(tasks[i].stack_base)
+            var page: uint64 = tasks[i].stack_base
+            while (page != 0 && page < tasks[i].stack_base + tasks[i].stack_bytes) {
+                page_free(page)
+                page += PAGE_SIZE
             }
             tasks[i].stack_base = 0
             tasks[i].state = TaskState.Free
@@ -150,7 +153,7 @@ fn schedule(saved: uint64) -> uint64 {
 
 fn timer_tick(saved: uint64) -> uint64 {
     clock_tick()
-    pic_end_of_interrupt()
+    pic_end_of_interrupt(IRQ_TIMER)
     return schedule(saved)
 }
 
@@ -217,6 +220,29 @@ fn free_slot() -> uint64 {
     return TASK_SLOTS
 }
 
+fn claim_stack(slot: uint64) -> uint64 {
+    var first: uint64 = page_alloc()
+    if (first == 0) {
+        return 0
+    }
+    var second: uint64 = page_alloc()
+    if (second == 0) {
+        tasks[slot].stack_bytes = PAGE_SIZE
+        return first
+    }
+    if (second + PAGE_SIZE == first) {
+        tasks[slot].stack_bytes = PAGE_SIZE * 2
+        return second
+    }
+    if (first + PAGE_SIZE == second) {
+        tasks[slot].stack_bytes = PAGE_SIZE * 2
+        return first
+    }
+    page_free(second)
+    tasks[slot].stack_bytes = PAGE_SIZE
+    return first
+}
+
 export fn task_create(entry: uint64, name: cstring) -> uint64 {
     cpu_disable_interrupts()
     var slot: uint64 = free_slot()
@@ -224,13 +250,13 @@ export fn task_create(entry: uint64, name: cstring) -> uint64 {
         cpu_enable_interrupts()
         return TASK_SLOTS
     }
-    var stack: uint64 = page_alloc()
+    var stack: uint64 = claim_stack(slot)
     if (stack == 0) {
         cpu_enable_interrupts()
         return TASK_SLOTS
     }
     tasks[slot].stack_base = stack
-    tasks[slot].stack_pointer = build_frame(stack + PAGE_SIZE, entry)
+    tasks[slot].stack_pointer = build_frame(stack + tasks[slot].stack_bytes, entry)
     tasks[slot].slices = 0
     tasks[slot].stop = false
     set_name(slot, name)
@@ -256,6 +282,8 @@ export fn task_init() {
     current = 0
     tasks[0].state = TaskState.Running
     tasks[0].stack_base = STACK_TOP
+    tasks[0].stack_bytes = 0
     set_name(0, "shell")
     interrupt_install(VECTOR_TIMER, (uint64)&timer_entry)
+    pic_unmask(IRQ_TIMER)
 }

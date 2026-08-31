@@ -1,0 +1,60 @@
+import "layout"
+import "video"
+import "format"
+
+export const GLYPH_WIDTH: uint64 = 8
+export const GLYPH_HEIGHT: uint64 = 16
+
+fn glyph_rows(ch: uint8) -> uint8* {
+    return (uint8*)(FONT_BASE + (uint64)ch * GLYPH_HEIGHT)
+}
+
+export fn font_draw_char(x: uint64, y: uint64, ch: uint8, color: uint32) {
+    var rows: uint8* = glyph_rows(ch)
+    for row: uint64 in 0..GLYPH_HEIGHT {
+        var bits: uint8 = rows[row]
+        if (bits != 0) {
+            for column: uint64 in 0..GLYPH_WIDTH {
+                if ((bits >> (7 - column)) & 1) {
+                    video_pixel(x + column, y + row, color)
+                }
+            }
+        }
+    }
+}
+
+export fn font_draw_char_on(x: uint64, y: uint64, ch: uint8, color: uint32,
+                            background: uint32) {
+    video_fill(x, y, GLYPH_WIDTH, GLYPH_HEIGHT, background)
+    font_draw_char(x, y, ch, color)
+}
+
+export fn font_draw_text(x: uint64, y: uint64, text: cstring, color: uint32) -> uint64 {
+    var i: uint64 = 0
+    while (text[i] != 0) {
+        font_draw_char(x + i * GLYPH_WIDTH, y, text[i], color)
+        i++
+    }
+    return i * GLYPH_WIDTH
+}
+
+export fn font_draw_number(x: uint64, y: uint64, value: uint64, color: uint32) -> uint64 {
+    var text: uint8[FORMAT_BYTES]
+    format_decimal(value, &text[0])
+    return font_draw_text(x, y, (cstring)&text[0], color)
+}
+
+export fn font_draw_two_digits(x: uint64, y: uint64, value: uint64,
+                               color: uint32) -> uint64 {
+    var text: uint8[FORMAT_BYTES]
+    format_two_digits(value, &text[0])
+    return font_draw_text(x, y, (cstring)&text[0], color)
+}
+
+export fn font_text_width(text: cstring) -> uint64 {
+    var i: uint64 = 0
+    while (text[i] != 0) {
+        i++
+    }
+    return i * GLYPH_WIDTH
+}

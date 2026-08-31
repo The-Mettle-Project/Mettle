@@ -116,6 +116,7 @@ export fn vga_put(ch: uint8) {
     if (column >= VGA_COLUMNS) {
         break_line()
     }
+    vga_sync_cursor()
 }
 
 export fn vga_draw_text(row_index: uint64, column_index: uint64, text: cstring,

@@ -1,0 +1,196 @@
+@naked fn _start() {
+    asm {
+        bits 16
+        cli
+        xor ax, ax
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov sp, 0x7c00
+        cld
+        sti
+
+        mov word [0x0500], 0
+        mov word [0x0502], 0
+        mov word [0x0504], 0
+        mov word [0x0506], 0
+        mov word [0x0508], 0
+        mov dword [0x050c], 0
+
+        xor ebx, ebx
+        mov di, 0x0510
+        xor si, si
+    map_next:
+        mov eax, 0xe820
+        mov edx, 0x534d4150
+        mov ecx, 24
+        int 0x15
+        jc map_done
+        cmp eax, 0x534d4150
+        jne map_done
+        add di, 24
+        inc si
+        test ebx, ebx
+        jz map_done
+        cmp si, 40
+        jb map_next
+    map_done:
+        mov [0x0500], si
+
+        push es
+        mov ax, 0x1130
+        mov bh, 0x06
+        int 0x10
+        mov ax, es
+        mov ds, ax
+        mov si, bp
+        xor ax, ax
+        mov es, ax
+        mov di, 0x9000
+        mov cx, 4096
+        rep movsb
+        xor ax, ax
+        mov ds, ax
+        pop es
+
+        mov di, 0x1000
+        mov dword [di], 0x32454256
+        mov ax, 0x4f00
+        int 0x10
+        cmp ax, 0x004f
+        jne video_done
+        mov ax, [0x100e]
+        mov [mode_offset], ax
+        mov ax, [0x1010]
+        mov [mode_segment], ax
+
+    mode_next:
+        push ds
+        mov si, [mode_offset]
+        mov ax, [mode_segment]
+        mov ds, ax
+        mov cx, [si]
+        pop ds
+        add word [mode_offset], 2
+        cmp cx, 0xffff
+        je mode_chosen
+
+        mov [mode_number], cx
+        mov ax, 0x4f01
+        mov di, 0x1200
+        int 0x10
+        cmp ax, 0x004f
+        jne mode_next
+
+        mov ax, [0x1200]
+        and ax, 0x0091
+        cmp ax, 0x0091
+        jne mode_next
+        cmp byte [0x1219], 32
+        jne mode_next
+        mov ax, [0x1212]
+        cmp ax, 1024
+        ja mode_next
+        cmp ax, [0x0502]
+        jbe mode_next
+        mov bx, [0x1214]
+        cmp bx, 768
+        ja mode_next
+
+        mov [0x0502], ax
+        mov [0x0504], bx
+        mov ax, [0x1210]
+        mov [0x0506], ax
+        mov word [0x0508], 32
+        mov eax, [0x1228]
+        mov [0x050c], eax
+        mov cx, [mode_number]
+        mov [best_mode], cx
+        jmp mode_next
+
+    mode_chosen:
+        cmp word [0x0502], 0
+        je video_done
+        mov bx, [best_mode]
+        or bx, 0x4000
+        mov ax, 0x4f02
+        int 0x10
+        cmp ax, 0x004f
+        je video_done
+        mov word [0x0502], 0
+        mov word [0x0504], 0
+
+    video_done:
+        cli
+        in al, 0x92
+        or al, 2
+        out 0x92, al
+
+        mov edi, 0x10000
+        xor eax, eax
+        mov ecx, 6144
+        rep stosd
+
+        mov edi, 0x10000
+        mov dword [edi], 0x11003
+        mov edi, 0x11000
+        mov dword [edi], 0x12003
+        mov dword [edi + 8], 0x13003
+        mov dword [edi + 16], 0x14003
+        mov dword [edi + 24], 0x15003
+
+        mov edi, 0x12000
+        mov eax, 0x83
+        mov ecx, 2048
+    map_page:
+        mov [edi], eax
+        add eax, 0x200000
+        add edi, 8
+        loop map_page
+
+        mov edi, 0x10000
+        mov cr3, edi
+        lgdt [gdt_pointer]
+        mov eax, cr4
+        or eax, 0x20
+        mov cr4, eax
+        mov ecx, 0xc0000080
+        rdmsr
+        or eax, 0x100
+        wrmsr
+        mov eax, cr0
+        or eax, 0x80000001
+        mov cr0, eax
+        jmp 0x08:long_mode
+
+    mode_offset:
+        dw 0
+    mode_segment:
+        dw 0
+    mode_number:
+        dw 0
+    best_mode:
+        dw 0
+
+        align 8
+    gdt_start:
+        dq 0
+        dq 0x00af9a000000ffff
+        dq 0x00af92000000ffff
+    gdt_pointer:
+        dw 23
+        dd gdt_start
+
+        bits 64
+    long_mode:
+        mov ax, 0x10
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov fs, ax
+        mov gs, ax
+        mov rsp, 0x90000
+        mov rax, 0x20000
+        jmp rax
+    }
+}

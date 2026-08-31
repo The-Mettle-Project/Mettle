@@ -6,12 +6,20 @@ import "kernel/console"
 import "kernel/interrupt"
 import "kernel/clock"
 import "kernel/page"
+import "kernel/heap"
 import "kernel/task"
 import "kernel/keyboard"
 import "kernel/archive"
 import "kernel/shell"
 import "kernel/commands"
 import "kernel/status"
+import "kernel/video"
+import "kernel/font"
+import "kernel/theme"
+import "kernel/terminal"
+import "kernel/window"
+import "kernel/apps"
+import "kernel/desktop"
 
 @naked fn _start() {
     asm {
@@ -24,22 +32,6 @@ import "kernel/status"
     }
 }
 
-fn devices_init() {
-    serial_init()
-    console_add_stream(&serial_put)
-    console_color(COLOR_TEXT)
-    console_clear()
-}
-
-fn interrupts_init() {
-    pic_init()
-    interrupt_init()
-    clock_init()
-    task_init()
-    keyboard_init()
-    cpu_enable_interrupts()
-}
-
 fn show_motd() {
     var motd: cstring = "motd.txt"
     if (archive_holds(archive_find(motd))) {
@@ -48,14 +40,57 @@ fn show_motd() {
     }
 }
 
-fn kernel_main() -> uint64 {
-    devices_init()
+fn shell_task() {
+    console_write_line("")
     cmd_banner("")
+    show_motd()
+    shell_run(&terminal_read_key)
+}
+
+fn machine_init() {
+    serial_init()
+    console_add_sink(&serial_put, &serial_ignore_tint, &serial_ignore_wipe)
     page_init()
-    interrupts_init()
+    pic_init()
+    interrupt_init()
+    clock_init()
+    task_init()
+    keyboard_init()
+    cpu_enable_interrupts()
     commands_init()
+}
+
+fn text_mode() {
+    console_write_line("no linear framebuffer, using the text console")
+    console_add_sink(&vga_put, &vga_set_color, &vga_clear)
+    console_color(COLOR_TEXT)
+    console_clear()
+    cmd_banner("")
     status_start()
     show_motd()
-    shell_run()
+    shell_run(&keyboard_read)
+}
+
+fn desktop_mode() {
+    console_write("framebuffer ")
+    console_write_decimal(video_width())
+    console_write(" by ")
+    console_write_decimal(video_height())
+    console_write_line(" in 32 bit colour")
+    console_add_sink(&terminal_put, &terminal_tint, &terminal_clear)
+    terminal_clear()
+    desktop_init()
+    app_terminal_open()
+    task_create((uint64)&shell_task, "shell")
+    desktop_run()
+}
+
+fn kernel_main() -> uint64 {
+    machine_init()
+    if (video_init()) {
+        desktop_mode()
+    } else {
+        text_mode()
+    }
     return 0
 }

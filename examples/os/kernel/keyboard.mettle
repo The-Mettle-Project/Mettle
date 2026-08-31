@@ -127,11 +127,12 @@ fn decode(code: uint8) -> uint8 {
             push(ch)
         }
     }
-    pic_end_of_interrupt()
+    pic_end_of_interrupt(IRQ_KEYBOARD)
 }
 
 export fn keyboard_init() {
     interrupt_install(VECTOR_KEYBOARD, (uint64)&on_keyboard)
+    pic_unmask(IRQ_KEYBOARD)
 }
 
 export fn keyboard_ready() -> bool {

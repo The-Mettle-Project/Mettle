@@ -1,27 +1,44 @@
-import "vga"
 import "format"
 
-const STREAM_SLOTS: uint64 = 4
+const SINK_SLOTS: uint64 = 4
 
-struct Stream {
+struct Sink {
     emit: fn(uint8) -> void;
+    tint: fn(uint8) -> void;
+    wipe: fn() -> void;
 }
 
-var streams: Stream[4]
-var stream_count: uint64 = 0
+var sinks: Sink[4]
+var sink_count: uint64 = 0
+var color: uint8 = 7
 
-export fn console_add_stream(emit: fn(uint8) -> void) {
-    if (stream_count >= STREAM_SLOTS) {
+export fn console_add_sink(emit: fn(uint8) -> void, tint: fn(uint8) -> void,
+                           wipe: fn() -> void) {
+    if (sink_count >= SINK_SLOTS) {
         return
     }
-    streams[stream_count].emit = emit
-    stream_count++
+    sinks[sink_count].emit = emit
+    sinks[sink_count].tint = tint
+    sinks[sink_count].wipe = wipe
+    sink_count++
 }
 
 export fn console_put(ch: uint8) {
-    vga_put(ch)
-    for i: uint64 in 0..stream_count {
-        streams[i].emit(ch)
+    for i: uint64 in 0..sink_count {
+        sinks[i].emit(ch)
+    }
+}
+
+export fn console_color(value: uint8) {
+    color = value
+    for i: uint64 in 0..sink_count {
+        sinks[i].tint(value)
+    }
+}
+
+export fn console_clear() {
+    for i: uint64 in 0..sink_count {
+        sinks[i].wipe()
     }
 }
 
@@ -36,6 +53,13 @@ export fn console_write(text: cstring) {
 export fn console_write_line(text: cstring) {
     console_write(text)
     console_put('\n')
+}
+
+export fn console_write_colored(text: cstring, value: uint8) {
+    var previous: uint8 = color
+    console_color(value)
+    console_write(text)
+    console_color(previous)
 }
 
 export fn console_pad(text: cstring, width: uint64) {
@@ -73,23 +97,4 @@ export fn console_write_hex_byte(value: uint64) {
     var text: uint8[FORMAT_BYTES]
     format_hex_byte(value, &text[0])
     console_write((cstring)&text[0])
-}
-
-export fn console_color(value: uint8) {
-    vga_set_color(value)
-}
-
-export fn console_write_colored(text: cstring, value: uint8) {
-    var previous: uint8 = vga_color()
-    vga_set_color(value)
-    console_write(text)
-    vga_set_color(previous)
-}
-
-export fn console_clear() {
-    vga_clear()
-}
-
-export fn console_sync_cursor() {
-    vga_sync_cursor()
 }

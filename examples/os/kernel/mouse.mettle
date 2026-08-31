@@ -1,0 +1,157 @@
+import "port"
+import "interrupt"
+
+const DATA_PORT: uint16 = 0x60
+const STATUS_PORT: uint16 = 0x64
+const STATUS_OUTPUT_FULL: uint8 = 0x01
+const STATUS_INPUT_FULL: uint8 = 0x02
+
+const COMMAND_ENABLE_AUX: uint8 = 0xa8
+const COMMAND_READ_CONFIG: uint8 = 0x20
+const COMMAND_WRITE_CONFIG: uint8 = 0x60
+const COMMAND_TO_MOUSE: uint8 = 0xd4
+const CONFIG_AUX_INTERRUPT: uint8 = 0x02
+const CONFIG_AUX_CLOCK_OFF: uint8 = 0x20
+const MOUSE_SET_DEFAULTS: uint8 = 0xf6
+const MOUSE_ENABLE_REPORTING: uint8 = 0xf4
+
+const FLAG_LEFT: uint8 = 0x01
+const FLAG_RIGHT: uint8 = 0x02
+const FLAG_ALWAYS_SET: uint8 = 0x08
+const FLAG_X_NEGATIVE: uint8 = 0x10
+const FLAG_Y_NEGATIVE: uint8 = 0x20
+const FLAG_OVERFLOW: uint8 = 0xc0
+
+const SPIN_LIMIT: uint64 = 100000
+
+var pointer_x: int64 = 0
+var pointer_y: int64 = 0
+var limit_x: int64 = 0
+var limit_y: int64 = 0
+var buttons: volatile uint64 = 0
+var moved: volatile uint64 = 0
+var phase: volatile uint64 = 0
+var flags: uint8 = 0
+var delta_x: uint8 = 0
+var present: uint64 = 0
+
+fn wait_writable() {
+    var spins: uint64 = 0
+    while ((port_in(STATUS_PORT) & STATUS_INPUT_FULL) != 0 && spins < SPIN_LIMIT) {
+        spins++
+    }
+}
+
+fn wait_readable() {
+    var spins: uint64 = 0
+    while ((port_in(STATUS_PORT) & STATUS_OUTPUT_FULL) == 0 && spins < SPIN_LIMIT) {
+        spins++
+    }
+}
+
+fn command(value: uint8) {
+    wait_writable()
+    port_out(STATUS_PORT, COMMAND_TO_MOUSE)
+    wait_writable()
+    port_out(DATA_PORT, value)
+    wait_readable()
+    port_in(DATA_PORT)
+}
+
+fn clamp(value: int64, high: int64) -> int64 {
+    if (value < 0) {
+        return 0
+    }
+    if (value > high) {
+        return high
+    }
+    return value
+}
+
+fn apply(packet_flags: uint8, raw_x: uint8, raw_y: uint8) {
+    if ((packet_flags & FLAG_ALWAYS_SET) == 0 ||
+        (packet_flags & FLAG_OVERFLOW) != 0) {
+        return
+    }
+    var step_x: int64 = (int64)raw_x
+    var step_y: int64 = (int64)raw_y
+    if ((packet_flags & FLAG_X_NEGATIVE) != 0) {
+        step_x = step_x - 256
+    }
+    if ((packet_flags & FLAG_Y_NEGATIVE) != 0) {
+        step_y = step_y - 256
+    }
+    pointer_x = clamp(pointer_x + step_x, limit_x)
+    pointer_y = clamp(pointer_y - step_y, limit_y)
+    buttons = (uint64)(packet_flags & (FLAG_LEFT | FLAG_RIGHT))
+    moved = 1
+}
+
+@interrupt fn on_mouse() {
+    var value: uint8 = port_in(DATA_PORT)
+    if (phase == 0) {
+        flags = value
+        phase = 1
+    } else if (phase == 1) {
+        delta_x = value
+        phase = 2
+    } else {
+        phase = 0
+        apply(flags, delta_x, value)
+    }
+    pic_end_of_interrupt(IRQ_MOUSE)
+}
+
+export fn mouse_init(screen_width: uint64, screen_height: uint64) {
+    cpu_disable_interrupts()
+    limit_x = (int64)screen_width - 1
+    limit_y = (int64)screen_height - 1
+    pointer_x = (int64)(screen_width / 2)
+    pointer_y = (int64)(screen_height / 2)
+
+    wait_writable()
+    port_out(STATUS_PORT, COMMAND_ENABLE_AUX)
+
+    wait_writable()
+    port_out(STATUS_PORT, COMMAND_READ_CONFIG)
+    wait_readable()
+    var config: uint8 = port_in(DATA_PORT)
+    config = (config | CONFIG_AUX_INTERRUPT) & (uint8)~(uint64)CONFIG_AUX_CLOCK_OFF
+
+    wait_writable()
+    port_out(STATUS_PORT, COMMAND_WRITE_CONFIG)
+    wait_writable()
+    port_out(DATA_PORT, config)
+
+    command(MOUSE_SET_DEFAULTS)
+    command(MOUSE_ENABLE_REPORTING)
+
+    interrupt_install(VECTOR_MOUSE, (uint64)&on_mouse)
+    pic_unmask(IRQ_MOUSE)
+    present = 1
+    cpu_enable_interrupts()
+}
+
+export fn mouse_present() -> bool {
+    return present != 0
+}
+
+export fn mouse_x() -> uint64 {
+    return (uint64)pointer_x
+}
+
+export fn mouse_y() -> uint64 {
+    return (uint64)pointer_y
+}
+
+export fn mouse_left_down() -> bool {
+    return (buttons & (uint64)FLAG_LEFT) != 0
+}
+
+export fn mouse_take_motion() -> bool {
+    if (moved == 0) {
+        return false
+    }
+    moved = 0
+    return true
+}

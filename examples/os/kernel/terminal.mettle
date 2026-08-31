@@ -1,0 +1,141 @@
+import "video"
+import "font"
+import "theme"
+import "port"
+
+export const TERMINAL_COLUMNS: uint64 = 80
+export const TERMINAL_ROWS: uint64 = 25
+
+const CELLS: uint64 = 2000
+const KEY_SLOTS: uint64 = 64
+const KEY_MASK: uint64 = 63
+
+var glyphs: uint8[2000]
+var tints: uint8[2000]
+var column: uint64 = 0
+var row: uint64 = 0
+var tint: uint8 = 7
+var dirty: volatile uint64 = 1
+
+var keys: uint8[64]
+var head: volatile uint64 = 0
+var tail: volatile uint64 = 0
+
+export fn terminal_pixel_width() -> uint64 {
+    return TERMINAL_COLUMNS * GLYPH_WIDTH
+}
+
+export fn terminal_pixel_height() -> uint64 {
+    return TERMINAL_ROWS * GLYPH_HEIGHT
+}
+
+export fn terminal_touched() -> bool {
+    return dirty != 0
+}
+
+export fn terminal_settle() {
+    dirty = 0
+}
+
+fn clear_row(index: uint64) {
+    for i: uint64 in 0..TERMINAL_COLUMNS {
+        glyphs[index * TERMINAL_COLUMNS + i] = ' '
+        tints[index * TERMINAL_COLUMNS + i] = tint
+    }
+}
+
+export fn terminal_clear() {
+    for i: uint64 in 0..TERMINAL_ROWS {
+        clear_row(i)
+    }
+    column = 0
+    row = 0
+    dirty = 1
+}
+
+fn scroll() {
+    for i: uint64 in 0..(CELLS - TERMINAL_COLUMNS) {
+        glyphs[i] = glyphs[i + TERMINAL_COLUMNS]
+        tints[i] = tints[i + TERMINAL_COLUMNS]
+    }
+    clear_row(TERMINAL_ROWS - 1)
+    row = TERMINAL_ROWS - 1
+}
+
+fn break_line() {
+    column = 0
+    row++
+    if (row >= TERMINAL_ROWS) {
+        scroll()
+    }
+}
+
+export fn terminal_put(ch: uint8) {
+    dirty = 1
+    if (ch == '\n') {
+        break_line()
+        return
+    }
+    if (ch == '\r') {
+        column = 0
+        return
+    }
+    if (ch == 8) {
+        if (column > 0) {
+            column--
+            glyphs[row * TERMINAL_COLUMNS + column] = ' '
+        }
+        return
+    }
+    if (ch == '\t') {
+        for i: uint64 in 0..4 {
+            terminal_put(' ')
+        }
+        return
+    }
+    glyphs[row * TERMINAL_COLUMNS + column] = ch
+    tints[row * TERMINAL_COLUMNS + column] = tint
+    column++
+    if (column >= TERMINAL_COLUMNS) {
+        break_line()
+    }
+}
+
+export fn terminal_tint(value: uint8) {
+    tint = value
+}
+
+export fn terminal_draw(origin_x: uint64, origin_y: uint64) {
+    video_fill(origin_x, origin_y, terminal_pixel_width(), terminal_pixel_height(),
+               TERMINAL_BACK)
+    for line: uint64 in 0..TERMINAL_ROWS {
+        for cell: uint64 in 0..TERMINAL_COLUMNS {
+            var ch: uint8 = glyphs[line * TERMINAL_COLUMNS + cell]
+            if (ch != 0 && ch != ' ') {
+                font_draw_char(origin_x + cell * GLYPH_WIDTH,
+                               origin_y + line * GLYPH_HEIGHT, ch,
+                               theme_text_color(tints[line * TERMINAL_COLUMNS + cell]))
+            }
+        }
+    }
+    video_fill(origin_x + column * GLYPH_WIDTH,
+               origin_y + row * GLYPH_HEIGHT + GLYPH_HEIGHT - 2,
+               GLYPH_WIDTH, 2, ACCENT)
+}
+
+export fn terminal_push_key(ch: uint8) {
+    var next: uint64 = (head + 1) & KEY_MASK
+    if (next != tail) {
+        keys[head] = ch
+        head = next
+    }
+}
+
+export fn terminal_read_key() -> uint8 {
+    while (head == tail) {
+        cpu_idle()
+    }
+    var ch: uint8 = keys[tail]
+    tail = (tail + 1) & KEY_MASK
+    return ch
+}

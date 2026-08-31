@@ -1,0 +1,238 @@
+import "layout"
+import "port"
+import "video"
+import "font"
+import "theme"
+import "window"
+import "terminal"
+import "archive"
+import "task"
+import "clock"
+import "page"
+import "heap"
+
+export const KIND_TERMINAL: uint64 = 1
+export const KIND_FILES: uint64 = 2
+export const KIND_TASKS: uint64 = 3
+export const KIND_CLOCK: uint64 = 4
+export const KIND_ABOUT: uint64 = 5
+export const KIND_VIEWER: uint64 = 6
+
+const LINE_STEP: uint64 = 18
+const PAD: uint64 = 10
+const PRINTABLE_FIRST: uint8 = 32
+const PRINTABLE_LAST: uint8 = 126
+
+var viewer_file: uint64 = 0
+var vendor: uint8[16]
+
+fn line_y(id: uint64, index: uint64) -> uint64 {
+    return window_content_y(id) + PAD + index * LINE_STEP
+}
+
+fn label(id: uint64, index: uint64, text: cstring, color: uint32) -> uint64 {
+    return font_draw_text(window_content_x(id) + PAD, line_y(id, index), text,
+                          color)
+}
+
+fn terminal_draw_window(id: uint64) {
+    terminal_draw(window_content_x(id), window_content_y(id))
+}
+
+fn terminal_key(id: uint64, ch: uint8) {
+    terminal_push_key(ch)
+}
+
+export fn app_terminal_open() -> uint64 {
+    return window_open(KIND_TERMINAL, 40, 60,
+                       terminal_pixel_width() + BORDER * 2,
+                       terminal_pixel_height() + TITLE_HEIGHT + BORDER * 2,
+                       "terminal", &terminal_draw_window, &terminal_key,
+                       &files_ignore_click)
+}
+
+fn files_ignore_click(id: uint64, x: uint64, y: uint64) {
+}
+
+fn files_draw(id: uint64) {
+    video_fill(window_content_x(id), window_content_y(id),
+               window_content_width(id), window_content_height(id), WINDOW_BODY)
+    var count: uint64 = archive_count()
+    if (count == 0) {
+        label(id, 0, "no files travelled with the kernel", WINDOW_FAINT)
+        return
+    }
+    label(id, 0, "click a file to read it", WINDOW_FAINT)
+    for i: uint64 in 0..count {
+        var width: uint64 = label(id, i + 2, archive_name(i), WINDOW_TEXT)
+        font_draw_number(window_content_x(id) + PAD + 200, line_y(id, i + 2),
+                         archive_length(i), WINDOW_FAINT)
+        font_draw_text(window_content_x(id) + PAD + 260, line_y(id, i + 2),
+                       "bytes", WINDOW_FAINT)
+    }
+}
+
+fn files_click(id: uint64, x: uint64, y: uint64) {
+    if (y < PAD + LINE_STEP * 2) {
+        return
+    }
+    var index: uint64 = (y - PAD) / LINE_STEP
+    if (index < 2) {
+        return
+    }
+    index = index - 2
+    if (index < archive_count()) {
+        app_viewer_open(index)
+    }
+}
+
+export fn app_files_open() -> uint64 {
+    return window_open(KIND_FILES, 120, 140, 380, 240, "files", &files_draw,
+                       &viewer_ignore_key, &files_click)
+}
+
+fn viewer_ignore_key(id: uint64, ch: uint8) {
+}
+
+fn viewer_draw(id: uint64) {
+    video_fill(window_content_x(id), window_content_y(id),
+               window_content_width(id), window_content_height(id), WINDOW_BODY)
+    if (!archive_holds(viewer_file)) {
+        label(id, 0, "that file is gone", WINDOW_FAINT)
+        return
+    }
+    var data: uint8* = archive_data(viewer_file)
+    var length: uint64 = archive_length(viewer_file)
+    var columns: uint64 = (window_content_width(id) - PAD * 2) / GLYPH_WIDTH
+    var row: uint64 = 0
+    var column: uint64 = 0
+    var rows: uint64 = (window_content_height(id) - PAD * 2) / LINE_STEP
+    for i: uint64 in 0..length {
+        if (row >= rows) {
+            return
+        }
+        var ch: uint8 = data[i]
+        if (ch == '\n') {
+            row++
+            column = 0
+        } else if (ch >= PRINTABLE_FIRST && ch <= PRINTABLE_LAST) {
+            if (column >= columns) {
+                row++
+                column = 0
+            }
+            font_draw_char(window_content_x(id) + PAD + column * GLYPH_WIDTH,
+                           line_y(id, row), ch, WINDOW_TEXT)
+            column++
+        }
+    }
+}
+
+export fn app_viewer_open(index: uint64) -> uint64 {
+    viewer_file = index
+    var id: uint64 = window_of_kind(KIND_VIEWER)
+    if (id < WINDOW_SLOTS) {
+        window_raise(id)
+        return id
+    }
+    return window_open_plain(KIND_VIEWER, 220, 200, 520, 320,
+                             archive_name(index), &viewer_draw)
+}
+
+fn tasks_draw(id: uint64) {
+    video_fill(window_content_x(id), window_content_y(id),
+               window_content_width(id), window_content_height(id), WINDOW_BODY)
+    label(id, 0, "id   state     slices    name", WINDOW_FAINT)
+    var line: uint64 = 1
+    for slot: uint64 in 0..TASK_SLOTS {
+        if (task_in_use(slot)) {
+            var left: uint64 = window_content_x(id) + PAD
+            var top: uint64 = line_y(id, line)
+            font_draw_number(left, top, slot, ACCENT)
+            font_draw_text(left + 40, top, task_state_name(slot), WINDOW_TEXT)
+            font_draw_number(left + 130, top, task_slices(slot), WINDOW_FAINT)
+            font_draw_text(left + 210, top, task_name(slot), WINDOW_TEXT)
+            line++
+        }
+    }
+}
+
+export fn app_tasks_open() -> uint64 {
+    return window_open_plain(KIND_TASKS, 300, 120, 380, 250, "tasks",
+                             &tasks_draw)
+}
+
+fn clock_draw(id: uint64) {
+    video_fill(window_content_x(id), window_content_y(id),
+               window_content_width(id), window_content_height(id), WINDOW_BODY)
+    var left: uint64 = window_content_x(id) + 24
+    var top: uint64 = window_content_y(id) + 24
+    var at: uint64 = left
+    at += font_draw_two_digits(at, top, clock_hour(), ACCENT)
+    at += font_draw_text(at, top, ":", ACCENT)
+    at += font_draw_two_digits(at, top, clock_minute(), ACCENT)
+    at += font_draw_text(at, top, ":", ACCENT)
+    font_draw_two_digits(at, top, clock_second(), ACCENT)
+
+    at = left
+    at += font_draw_number(at, top + 28, clock_year(), WINDOW_TEXT)
+    at += font_draw_text(at, top + 28, "-", WINDOW_TEXT)
+    at += font_draw_two_digits(at, top + 28, clock_month(), WINDOW_TEXT)
+    at += font_draw_text(at, top + 28, "-", WINDOW_TEXT)
+    font_draw_two_digits(at, top + 28, clock_day(), WINDOW_TEXT)
+
+    at = left
+    at += font_draw_text(at, top + 56, "up ", WINDOW_FAINT)
+    at += font_draw_number(at, top + 56, clock_seconds(), WINDOW_FAINT)
+    font_draw_text(at, top + 56, " seconds", WINDOW_FAINT)
+}
+
+export fn app_clock_open() -> uint64 {
+    return window_open_plain(KIND_CLOCK, 420, 320, 260, 160, "clock",
+                             &clock_draw)
+}
+
+fn about_draw(id: uint64) {
+    video_fill(window_content_x(id), window_content_y(id),
+               window_content_width(id), window_content_height(id), WINDOW_BODY)
+    label(id, 0, "mettle os", ACCENT)
+    label(id, 1, "a kernel and a desktop written in mettle", WINDOW_FAINT)
+
+    var left: uint64 = window_content_x(id) + PAD
+    var at: uint64 = left
+    at += font_draw_text(at, line_y(id, 3), "screen ", WINDOW_FAINT)
+    at += font_draw_number(at, line_y(id, 3), video_width(), WINDOW_TEXT)
+    at += font_draw_text(at, line_y(id, 3), " by ", WINDOW_FAINT)
+    at += font_draw_number(at, line_y(id, 3), video_height(), WINDOW_TEXT)
+    font_draw_text(at, line_y(id, 3), " in 32 bit colour", WINDOW_FAINT)
+
+    at = left
+    at += font_draw_text(at, line_y(id, 4), "free ", WINDOW_FAINT)
+    at += font_draw_number(at, line_y(id, 4), page_free_bytes() / BYTES_PER_MB,
+                           WINDOW_TEXT)
+    at += font_draw_text(at, line_y(id, 4), " mb of ", WINDOW_FAINT)
+    at += font_draw_number(at, line_y(id, 4),
+                           page_total_count() * PAGE_SIZE / BYTES_PER_MB,
+                           WINDOW_TEXT)
+    font_draw_text(at, line_y(id, 4), " mb", WINDOW_FAINT)
+
+    at = left
+    at += font_draw_text(at, line_y(id, 5), "heap ", WINDOW_FAINT)
+    at += font_draw_number(at, line_y(id, 5), heap_used(), WINDOW_TEXT)
+    at += font_draw_text(at, line_y(id, 5), " bytes of ", WINDOW_FAINT)
+    at += font_draw_number(at, line_y(id, 5), heap_claimed(), WINDOW_TEXT)
+    font_draw_text(at, line_y(id, 5), " claimed", WINDOW_FAINT)
+
+    cpu_vendor(&vendor[0])
+    at = left
+    at += font_draw_text(at, line_y(id, 6), "cpu ", WINDOW_FAINT)
+    font_draw_text(at, line_y(id, 6), (cstring)&vendor[0], WINDOW_TEXT)
+
+    label(id, 8, "the boot sector is inline assembly the mettle", WINDOW_FAINT)
+    label(id, 9, "compiler assembles itself, and everything above", WINDOW_FAINT)
+    label(id, 10, "it is ordinary mettle in a flat image", WINDOW_FAINT)
+}
+
+export fn app_about_open() -> uint64 {
+    return window_open_plain(KIND_ABOUT, 200, 90, 420, 280, "about",
+                             &about_draw)
+}
