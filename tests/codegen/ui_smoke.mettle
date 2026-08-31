@@ -219,14 +219,17 @@ fn main() -> int32 {
 
   /* The blocking loop, the one every std/ui program ends on. The timer fires,
    * its handler posts WM_QUIT, and the loop returns that exit code. */
-  ui_timer_start(hwnd, 1, 10);
+  /* The blocking loop only ever returns because WM_QUIT arrives, and only the
+   * timer posts it, so refuse to enter it unless SetTimer actually armed. A
+   * failed check is a test result; a hang is not. */
+  if (ui_timer_start(hwnd, 1, 10) == 0) { return 65; }
   var loop_code: int32 = ui_run_message_loop();
   ui_timer_stop(hwnd, 1);
-  if (seen_timer == 0) { return 65; }
-  if (loop_code != 0) { return 66; }
+  if (seen_timer == 0) { return 66; }
+  if (loop_code != 0) { return 67; }
 
   var font: int64 = ui_create_font(16, "Segoe UI", 400);
-  if (font == 0) { return 67; }
+  if (font == 0) { return 68; }
   ui_control_set_font(button, font);
   ui_delete_object(font);
 
