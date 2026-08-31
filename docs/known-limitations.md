@@ -93,6 +93,11 @@ accepted at a declaration, an argument, a return, and an assignment.
 A borrow handed across a call boundary is not followed: the interior pointer
 `&buf[4]` passed to a function is not related back to `buf` inside it.
 
+A leak is reported for an allocation the function never frees. One the function
+frees on some paths and not on the path an early `return` takes is not reported,
+so a `defer free(p)` right after the allocation is still what makes the release
+cover every exit.
+
 Ownership itself is inferred per function and iterated over the call graph, so
 a free, a store, and a fresh allocation do cross calls. Within a function the
 analysis follows paths: a fact inside an `if`, a loop body, a `switch` arm or a

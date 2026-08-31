@@ -109,6 +109,9 @@ cannot:
   the analysis cannot relate back to the source.
 - Anything reached through a `rawptr` after the type is gone.
 - Two pointers it cannot prove alias.
+- An allocation released on some paths and not on the one an early `return`
+  takes. `defer free(p)` right after the allocation covers every exit, which is
+  what the language offers in place of a report.
 
 That silence is the design. A checker that guessed would produce the false
 positives people spend their days fighting, and there would be an annotation to
