@@ -1,0 +1,62 @@
+// A call names its type arguments when nothing else can say what they are.
+// When the arguments already say it, `id(7)` is the call `id<int32>(7)`, and
+// the binding comes from whatever the argument put where the type parameter
+// sits: the value itself, what a pointer points at, what an array holds.
+
+struct Point { x: int32; y: int32; }
+
+fn id<T>(x: T) -> T { return x; }
+fn first<T>(xs: T*, n: int32) -> T { return xs[0]; }
+fn swap_them<T>(a: T*, b: T*) {
+  var tmp: T = *a;
+  *a = *b;
+  *b = tmp;
+}
+fn second_of<T>(xs: T[4]) -> T { return xs[1]; }
+fn through<T>(x: T) -> T { return id(x); }
+
+trait Addable;
+impl Addable for int32;
+fn add_one<T: Addable>(v: T) -> T { return v + 1; }
+
+@noinline fn produce() -> int64 { return 9; }
+
+fn main() -> int32 {
+  if (id(7) != 7) { return 1; }
+  if (id("hi").length != 2) { return 2; }
+
+  var d: float64 = id(1.5);
+  if (d != 1.5) { return 3; }
+
+  var arr: int64[3];
+  arr[0] = 42;
+  if (first(&arr[0], 3) != 42) { return 4; }
+
+  var a: int32 = 1;
+  var b: int32 = 2;
+  swap_them(&a, &b);
+  if (a != 2 || b != 1) { return 5; }
+
+  var p: Point;
+  p.x = 11;
+  p.y = 12;
+  var q: Point = id(p);
+  if (q.x != 11 || q.y != 12) { return 6; }
+
+  var four: int32[4];
+  four[1] = 77;
+  if (second_of(four) != 77) { return 7; }
+
+  if (through(5) != 5) { return 8; }
+  if (add_one(1) != 2) { return 9; }
+
+  var got: int64 = id(produce());
+  if (got != 9) { return 10; }
+
+  var wide: int64 = id<int64>(7);
+  if (wide != 7) { return 11; }
+
+  var c: char = id('z');
+  if (c != 'z') { return 12; }
+  return 0;
+}

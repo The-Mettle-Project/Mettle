@@ -318,15 +318,31 @@ closure type on assignment and at a call.
 
 ## Generic types and functions
 
-A function may take type parameters, and the call site names them. Nothing is
-inferred here either:
+A function may take type parameters:
 
 ```mettle
 fn id<T>(x: T) -> T { return x; }
 ```
 
+The call site may name them, and does not have to when the arguments already
+say what they are. `id(7)` is the call `id<int32>(7)`: a parameter written with
+a type parameter is matched against the argument's type, and the binding is
+whatever the argument put where the type parameter sits, through pointers and
+array elements too.
+
 ```mettle
-var n: int64 = id<int64>(7);
+var n: int32 = id(7);
+var swapped: int32 = first(&values[0], 3);
+var wide: int64 = id<int64>(7);
+```
+
+An integer literal says `int32` and a fractional one says `float64`, so name
+the argument when a call needs a wider one. What no argument reaches is
+reported rather than guessed:
+
+```text
+error[E0003]: Nothing in this call says what 'T' is in 'make'. Name it at the
+call, as 'make<sometype>(...)'
 ```
 
 A bound restricts which types are allowed. Declare a trait, say which types

@@ -50,6 +50,10 @@ typedef struct {
   size_t def_count;
   Instantiation *instances;
   size_t instance_count;
+  /* The module, so inference can read a called function's return type. Held
+     as the program rather than as its declaration array, which moves as
+     instantiations are appended. */
+  Program *module;
 } MonoContext;
 
 static char *substitute_type_string(const char *type_str, char **param_names,
@@ -2219,6 +2223,525 @@ cleanup:
   return ok;
 }
 
+/* ---- Type-argument inference ---------------------------------------------
+ * A call names its type arguments when nothing else can say what they are.
+ * When the arguments already say it, `id(7)` is the same call as
+ * `id<int32>(7)`, and writing the second adds nothing. Inference runs here,
+ * before instantiation, because what it decides is which instantiation to
+ * make. It reads the type text the program wrote: a parameter spelled with a
+ * type parameter is matched against the argument's static type, and the
+ * parameter's binding is whatever the argument put where it sits.
+ *
+ * It binds only what it is sure of and contradicts nothing else, so a call it
+ * cannot read is reported as one to name the arguments on, never guessed at.
+ */
+
+typedef struct {
+  const char *name;
+  char *bound;
+} MonoTypeBinding;
+
+static char *mono_text_trim_dup(const char *text) {
+  size_t start = 0;
+  size_t end;
+  char *copy;
+
+  if (!text) {
+    return NULL;
+  }
+  end = strlen(text);
+  while (start < end && (text[start] == ' ' || text[start] == '\t')) {
+    start++;
+  }
+  while (end > start && (text[end - 1] == ' ' || text[end - 1] == '\t')) {
+    end--;
+  }
+  copy = malloc(end - start + 1);
+  if (!copy) {
+    return NULL;
+  }
+  memcpy(copy, text + start, end - start);
+  copy[end - start] = '\0';
+  return copy;
+}
+
+static int mono_type_param_index(char **params, size_t count,
+                                 const char *text) {
+  size_t i;
+  if (!params || !text) {
+    return -1;
+  }
+  for (i = 0; i < count; i++) {
+    if (params[i] && strcmp(params[i], text) == 0) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+/* The head of `Name<...>`, or NULL when the text is not a generic use. */
+static const char *mono_generic_args_start(const char *text) {
+  const char *open = text ? strchr(text, '<') : NULL;
+  if (!open || open == text) {
+    return NULL;
+  }
+  if (text[strlen(text) - 1] != '>') {
+    return NULL;
+  }
+  return open;
+}
+
+static int mono_match_type_text(const char *pattern, const char *actual,
+                                char **params, size_t param_count,
+                                MonoTypeBinding *bindings);
+
+/* Match `Name<A, B>` against `Name<X, Y>`, argument by argument. */
+static int mono_match_generic_args(const char *pattern, const char *actual,
+                                   char **params, size_t param_count,
+                                   MonoTypeBinding *bindings) {
+  const char *p_open = mono_generic_args_start(pattern);
+  const char *a_open = mono_generic_args_start(actual);
+  const char *p_scan;
+  const char *a_scan;
+  size_t p_head;
+  size_t a_head;
+
+  if (!p_open || !a_open) {
+    return 1;
+  }
+  p_head = (size_t)(p_open - pattern);
+  a_head = (size_t)(a_open - actual);
+  if (p_head != a_head || strncmp(pattern, actual, p_head) != 0) {
+    return 1;
+  }
+
+  p_scan = p_open + 1;
+  a_scan = a_open + 1;
+  while (*p_scan && *a_scan) {
+    const char *p_end = p_scan;
+    const char *a_end = a_scan;
+    int depth = 0;
+    char *p_arg;
+    char *a_arg;
+    int ok;
+    while (*p_end && (depth > 0 || (*p_end != ',' && *p_end != '>'))) {
+      if (*p_end == '<') {
+        depth++;
+      } else if (*p_end == '>') {
+        depth--;
+      }
+      p_end++;
+    }
+    depth = 0;
+    while (*a_end && (depth > 0 || (*a_end != ',' && *a_end != '>'))) {
+      if (*a_end == '<') {
+        depth++;
+      } else if (*a_end == '>') {
+        depth--;
+      }
+      a_end++;
+    }
+    p_arg = mono_text_trim_dup(p_scan);
+    a_arg = mono_text_trim_dup(a_scan);
+    if (p_arg && a_arg) {
+      p_arg[p_end - p_scan] = '\0';
+      a_arg[a_end - a_scan] = '\0';
+    }
+    ok = p_arg && a_arg
+             ? mono_match_type_text(p_arg, a_arg, params, param_count, bindings)
+             : 1;
+    free(p_arg);
+    free(a_arg);
+    if (!ok) {
+      return 0;
+    }
+    if (*p_end != ',' || *a_end != ',') {
+      break;
+    }
+    p_scan = p_end + 1;
+    a_scan = a_end + 1;
+  }
+  return 1;
+}
+
+/* Bind what `pattern` says about `actual`. Returns 0 only on a contradiction
+ * between two uses of the same type parameter, which is what makes a call
+ * ambiguous rather than merely unreadable. */
+static int mono_match_type_text(const char *pattern, const char *actual,
+                                char **params, size_t param_count,
+                                MonoTypeBinding *bindings) {
+  char *p = mono_text_trim_dup(pattern);
+  char *a = mono_text_trim_dup(actual);
+  int result = 1;
+  int index;
+
+  if (!p || !a || !*p || !*a) {
+    free(p);
+    free(a);
+    return 1;
+  }
+
+  index = mono_type_param_index(params, param_count, p);
+  if (index >= 0) {
+    if (bindings[index].bound) {
+      result = strcmp(bindings[index].bound, a) == 0;
+    } else {
+      bindings[index].bound = mettle_strdup(a);
+    }
+    free(p);
+    free(a);
+    return result;
+  }
+
+  {
+    size_t p_len = strlen(p);
+    size_t a_len = strlen(a);
+    if (p[p_len - 1] == '*' && a[a_len - 1] == '*') {
+      p[p_len - 1] = '\0';
+      a[a_len - 1] = '\0';
+      result = mono_match_type_text(p, a, params, param_count, bindings);
+      free(p);
+      free(a);
+      return result;
+    }
+    if (p[p_len - 1] == ']' && a[a_len - 1] == ']') {
+      char *p_open = strrchr(p, '[');
+      char *a_open = strrchr(a, '[');
+      if (p_open && a_open) {
+        *p_open = '\0';
+        *a_open = '\0';
+        result = mono_match_type_text(p, a, params, param_count, bindings);
+        free(p);
+        free(a);
+        return result;
+      }
+    }
+  }
+
+  result = mono_match_generic_args(p, a, params, param_count, bindings);
+  free(p);
+  free(a);
+  return result;
+}
+
+/* The type text of an expression, read off the program without checking it.
+ * NULL means "this expression does not say", which costs nothing: another
+ * argument may still say it, and if none does the call is reported. */
+static char *mono_static_type_of(MonoContext *ctx, ASTNode *expr,
+                                 MonoVarEnv *env) {
+  if (!expr) {
+    return NULL;
+  }
+  switch (expr->type) {
+  case AST_NUMBER_LITERAL: {
+    NumberLiteral *lit = (NumberLiteral *)expr->data;
+    if (!lit) {
+      return NULL;
+    }
+    if (lit->is_char) {
+      return mettle_strdup("char");
+    }
+    return mettle_strdup(lit->is_float ? "float64" : "int32");
+  }
+  case AST_STRING_LITERAL:
+    return mettle_strdup("string");
+  case AST_IDENTIFIER: {
+    Identifier *id = (Identifier *)expr->data;
+    const char *bound = id ? mono_env_lookup(env, id->name) : NULL;
+    return bound ? mettle_strdup(bound) : NULL;
+  }
+  case AST_CAST_EXPRESSION: {
+    CastExpression *cast = (CastExpression *)expr->data;
+    return cast && cast->type_name ? mettle_strdup(cast->type_name) : NULL;
+  }
+  case AST_NEW_EXPRESSION: {
+    NewExpression *ne = (NewExpression *)expr->data;
+    char *text;
+    size_t len;
+    if (!ne || !ne->type_name) {
+      return NULL;
+    }
+    len = strlen(ne->type_name) + 2;
+    text = malloc(len);
+    if (!text) {
+      return NULL;
+    }
+    snprintf(text, len, "%s*", ne->type_name);
+    return text;
+  }
+  case AST_UNARY_EXPRESSION: {
+    UnaryExpression *un = (UnaryExpression *)expr->data;
+    char *inner;
+    if (!un || !un->operator) {
+      return NULL;
+    }
+    inner = mono_static_type_of(ctx, un->operand, env);
+    if (strcmp(un->operator, "&") == 0) {
+      char *text;
+      size_t len;
+      if (!inner) {
+        return NULL;
+      }
+      len = strlen(inner) + 2;
+      text = malloc(len);
+      if (text) {
+        snprintf(text, len, "%s*", inner);
+      }
+      free(inner);
+      return text;
+    }
+    if (strcmp(un->operator, "*") == 0) {
+      size_t len = inner ? strlen(inner) : 0;
+      if (len > 0 && inner[len - 1] == '*') {
+        inner[len - 1] = '\0';
+        return inner;
+      }
+      free(inner);
+      return NULL;
+    }
+    return inner;
+  }
+  case AST_INDEX_EXPRESSION: {
+    ArrayIndexExpression *ix = (ArrayIndexExpression *)expr->data;
+    char *base = ix ? mono_static_type_of(ctx, ix->array, env) : NULL;
+    size_t len = base ? strlen(base) : 0;
+    if (!base || len == 0) {
+      free(base);
+      return NULL;
+    }
+    if (base[len - 1] == '*') {
+      base[len - 1] = '\0';
+      return base;
+    }
+    if (base[len - 1] == ']') {
+      char *open = strrchr(base, '[');
+      if (open) {
+        *open = '\0';
+        return base;
+      }
+    }
+    free(base);
+    return NULL;
+  }
+  case AST_BINARY_EXPRESSION: {
+    BinaryExpression *bin = (BinaryExpression *)expr->data;
+    char *left;
+    if (!bin || !bin->operator) {
+      return NULL;
+    }
+    if (strcmp(bin->operator, "==") == 0 || strcmp(bin->operator, "!=") == 0 ||
+        strcmp(bin->operator, "<") == 0 || strcmp(bin->operator, ">") == 0 ||
+        strcmp(bin->operator, "<=") == 0 || strcmp(bin->operator, ">=") == 0 ||
+        strcmp(bin->operator, "&&") == 0 || strcmp(bin->operator, "||") == 0) {
+      return NULL;
+    }
+    left = mono_static_type_of(ctx, bin->left, env);
+    if (left) {
+      return left;
+    }
+    return mono_static_type_of(ctx, bin->right, env);
+  }
+  case AST_FUNCTION_CALL: {
+    CallExpression *call = (CallExpression *)expr->data;
+    size_t i;
+    if (!call || !call->function_name || !ctx->module) {
+      return NULL;
+    }
+    for (i = 0; i < ctx->module->declaration_count; i++) {
+      ASTNode *decl = ctx->module->declarations[i];
+      FunctionDeclaration *fd;
+      if (!decl || decl->type != AST_FUNCTION_DECLARATION) {
+        continue;
+      }
+      fd = (FunctionDeclaration *)decl->data;
+      if (!fd || !fd->name || fd->type_param_count > 0 ||
+          strcmp(fd->name, call->function_name) != 0) {
+        continue;
+      }
+      return fd->return_type ? mettle_strdup(fd->return_type) : NULL;
+    }
+    return NULL;
+  }
+  default:
+    return NULL;
+  }
+}
+
+static int mono_infer_call_type_args(MonoContext *ctx, ASTNode *node,
+                                     MonoVarEnv *env) {
+  CallExpression *call = (CallExpression *)node->data;
+  GenericDef *def = NULL;
+  FunctionDeclaration *fd = NULL;
+  MonoTypeBinding *bindings = NULL;
+  size_t i;
+  int ok = 1;
+
+  if (!call || call->type_arg_count > 0 || !call->function_name) {
+    return 1;
+  }
+  def = find_generic_def(ctx, call->function_name);
+  if (!def || def->is_struct || def->type_param_count == 0 || !def->node) {
+    return 1;
+  }
+  fd = (FunctionDeclaration *)def->node->data;
+  if (!fd) {
+    return 1;
+  }
+
+  bindings = calloc(def->type_param_count, sizeof(MonoTypeBinding));
+  if (!bindings) {
+    return 1;
+  }
+  for (i = 0; i < def->type_param_count; i++) {
+    bindings[i].name = def->type_params[i];
+  }
+
+  for (i = 0; i < call->argument_count && i < fd->parameter_count; i++) {
+    char *actual = mono_static_type_of(ctx, call->arguments[i], env);
+    if (!actual) {
+      continue;
+    }
+    if (!mono_match_type_text(fd->parameter_types[i], actual, def->type_params,
+                              def->type_param_count, bindings)) {
+      char message[512];
+      snprintf(message, sizeof(message),
+               "Argument %zu of '%s' asks for a different type parameter "
+               "than an earlier argument did. Name the types at the call",
+               i + 1, call->function_name);
+      mono_report_error(ctx, node->location, message);
+      free(actual);
+      ok = 0;
+      goto done;
+    }
+    free(actual);
+  }
+
+  for (i = 0; i < def->type_param_count; i++) {
+    if (!bindings[i].bound) {
+      char message[512];
+      snprintf(message, sizeof(message),
+               "Nothing in this call says what '%s' is in '%s'. Name it at "
+               "the call, as '%s<sometype>(...)'",
+               bindings[i].name, call->function_name, call->function_name);
+      mono_report_error(ctx, node->location, message);
+      ok = 0;
+      goto done;
+    }
+  }
+
+  call->type_args = malloc(def->type_param_count * sizeof(char *));
+  if (!call->type_args) {
+    ok = 0;
+    goto done;
+  }
+  for (i = 0; i < def->type_param_count; i++) {
+    call->type_args[i] = bindings[i].bound;
+    bindings[i].bound = NULL;
+  }
+  call->type_arg_count = def->type_param_count;
+
+done:
+  for (i = 0; i < def->type_param_count; i++) {
+    mettle_free_string(bindings[i].bound);
+  }
+  free(bindings);
+  return ok;
+}
+
+static int mono_infer_type_args_in_node(MonoContext *ctx, ASTNode *node,
+                                        MonoVarEnv *env) {
+  size_t i;
+
+  if (!node) {
+    return 1;
+  }
+
+  if (node->type == AST_FUNCTION_CALL) {
+    CallExpression *call = (CallExpression *)node->data;
+    if (call) {
+      for (i = 0; i < call->argument_count; i++) {
+        if (!mono_infer_type_args_in_node(ctx, call->arguments[i], env)) {
+          return 0;
+        }
+      }
+      if (call->object &&
+          !mono_infer_type_args_in_node(ctx, call->object, env)) {
+        return 0;
+      }
+    }
+    if (!mono_infer_call_type_args(ctx, node, env)) {
+      return 0;
+    }
+    return 1;
+  }
+
+  if (node->type == AST_VAR_DECLARATION) {
+    VarDeclaration *decl = (VarDeclaration *)node->data;
+    if (decl && decl->initializer &&
+        !mono_infer_type_args_in_node(ctx, decl->initializer, env)) {
+      return 0;
+    }
+    if (decl && decl->name && decl->type_name &&
+        !mono_env_add(env, decl->name, decl->type_name)) {
+      return 0;
+    }
+    return 1;
+  }
+
+  for (i = 0; i < node->child_count; i++) {
+    if (!mono_infer_type_args_in_node(ctx, node->children[i], env)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int mono_infer_type_args_in_function(MonoContext *ctx,
+                                            ASTNode *function) {
+  FunctionDeclaration *fn = NULL;
+  MonoVarEnv env = {0};
+  int ok = 1;
+  size_t i;
+
+  if (!ctx || !function || function->type != AST_FUNCTION_DECLARATION) {
+    return 1;
+  }
+  fn = (FunctionDeclaration *)function->data;
+  if (!fn || !fn->body || fn->type_param_count > 0) {
+    return 1;
+  }
+
+  for (i = 0; i < fn->parameter_count && ok; i++) {
+    if (!mono_env_add(&env, fn->parameter_names[i], fn->parameter_types[i])) {
+      ok = 0;
+    }
+  }
+  if (ok) {
+    ok = mono_infer_type_args_in_node(ctx, fn->body, &env);
+  }
+  free(env.items);
+  return ok;
+}
+
+static int mono_infer_type_args(MonoContext *ctx, ASTNode *program) {
+  Program *prog = NULL;
+  size_t i;
+
+  if (!ctx || !program || program->type != AST_PROGRAM) {
+    return 1;
+  }
+  prog = (Program *)program->data;
+  if (!prog) {
+    return 1;
+  }
+  for (i = 0; i < prog->declaration_count; i++) {
+    if (!mono_infer_type_args_in_function(ctx, prog->declarations[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int mono_rewrite_trait_method_calls(MonoContext *ctx, ASTNode *program) {
   Program *prog = NULL;
 
@@ -2635,6 +3158,11 @@ static int mono_emit_instantiation(MonoContext *ctx, Program *prog,
    * what actually records the emission -- through the stale pointer it was
    * written to freed memory, and the instantiation stayed marked unemitted. */
   ctx->instances[index].emitted = 1;
+  if (mono_node->type == AST_FUNCTION_DECLARATION &&
+      !mono_infer_type_args_in_function(ctx, mono_node)) {
+    *success = 0;
+    return 0;
+  }
   collect_type_instantiations(mono_node, ctx);
   return 1;
 }
@@ -3969,6 +4497,15 @@ int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
   }
 
   if (ctx.def_count > 0) {
+    /* Step 1.5: fill in the type arguments a call did not name, from what its
+       arguments already say. It runs before collection because what it decides
+       is which instantiations there are to collect. */
+    ctx.module = prog;
+    if (!mono_infer_type_args(&ctx, program)) {
+      success = 0;
+      goto cleanup;
+    }
+
     // Step 2: Collect all instantiations from non-generic code
     collect_type_instantiations(program, &ctx);
 

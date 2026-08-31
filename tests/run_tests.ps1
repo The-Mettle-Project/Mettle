@@ -2276,6 +2276,8 @@ $cases = @(
   @{ Name = "member_through_ptr"; Path = "tests/err_codegen_member_expr.mettle"; ShouldSucceed = $true },
   @{ Name = "err_enum_payload_unknown"; Path = "tests/err_enum_payload_unknown.mettle"; ShouldSucceed = $false; Pattern = "carries a payload of unknown type" },
   @{ Name = "err_struct_value_cycle"; Path = "tests/err_struct_value_cycle.mettle"; ShouldSucceed = $false; Pattern = "each store a value of the other" },
+  @{ Name = "err_generic_infer_unknown"; Path = "tests/err_generic_infer_unknown.mettle"; ShouldSucceed = $false; Pattern = "Nothing in this call says what" },
+  @{ Name = "err_generic_infer_conflict"; Path = "tests/err_generic_infer_conflict.mettle"; ShouldSucceed = $false; Pattern = "asks for a different type parameter" },
   @{ Name = "err_function_arg_count"; Path = "tests/err_function_arg_count.mettle"; ShouldSucceed = $false; Pattern = "expects .* arguments, got" },
   @{ Name = "err_function_arg_type"; Path = "tests/err_function_arg_type.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
   @{ Name = "err_gpu_kernel_return"; Path = "tests/err_gpu_kernel_return.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_result' must return void" },
@@ -13664,6 +13666,8 @@ $runFixtures = @(
      What = "a cycle of types came out with the wrong layout" },
   @{ Name = "fn_pointer_arrays"; Path = "tests/codegen/fn_pointer_arrays.mettle"
      What = "an array of function pointers dispatched wrong" },
+  @{ Name = "generic_inference"; Path = "tests/codegen/generic_inference.mettle"
+     What = "an inferred type argument picked the wrong instantiation" },
   @{ Name = "struct_methods"; Path = "tests/codegen/struct_methods.mettle"
      What = "a struct method body behaved wrong" },
   @{ Name = "unsigned_fold"; Path = "tests/codegen/unsigned_fold.mettle"

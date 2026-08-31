@@ -1,0 +1,9 @@
+fn make<T>() -> T {
+  var v: T;
+  return v;
+}
+
+fn main() -> int32 {
+  var n: int32 = make();
+  return n;
+}

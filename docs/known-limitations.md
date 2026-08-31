@@ -11,9 +11,6 @@ A tagged-enum variant carries at most one payload. `Circle(float64)` works;
 `switch` cases fall through into the next case. End each one with `break`
 unless you mean the fall-through.
 
-A generic call names its type arguments: `id<int64>(7)`. Nothing is inferred
-from the argument.
-
 An array is one-dimensional. `int64[3][4]` does not parse; index a flat
 `int64[12]` yourself.
 
