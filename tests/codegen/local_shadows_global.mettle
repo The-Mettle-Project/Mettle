@@ -1,0 +1,67 @@
+/* A local owns its name outright. A global spelled the same way is a different
+ * object, and its type says nothing about the local's storage.
+ *
+ * The backend asked the module symbol table what type a named value operand
+ * had, without first asking whether the function declared a local by that name.
+ * A function symbol answered with its RETURN type, so `var fmod: int64` beside
+ * a float-returning `fmod` was recorded as a float slot: every store to it
+ * converted, and it read back as the bit pattern of a double. No diagnostic and
+ * no crash, just a wrong value. */
+
+var wide: int64 = 111;
+var fl: float64 = 2.5;
+var f32g: float32 = 1.5;
+var u: uint32 = 7;
+var narrow: int8 = 3;
+
+extern fn fmod(a: float64, b: float64) -> float64;
+
+fn sqrt2(x: float64) -> float64 { return x + 1.0; }
+
+@noinline fn opaque(x: int64) -> int64 { return x; }
+
+/* The shape that started this: an integer local named after a float-returning
+ * function. Every store converted, so it read back as the bits of a double. */
+@noinline fn integer_named_like_a_float_function() -> int64 {
+  var fmod: int64 = 1234;
+  fmod = fmod + 1;
+  return fmod;
+}
+
+@noinline fn locals_win_over_globals() -> int64 {
+  var wide: int32 = 0 - 3;
+  var fl: int32 = 0 - 9;
+  var f32g: int64 = 1000000007;
+  var u: int32 = 0 - 1;
+  var narrow: int64 = 4294967296;
+  var sqrt2: uint8 = 200;
+  return (int64)wide + (int64)fl + f32g + (int64)u + narrow + (int64)sqrt2;
+}
+
+/* A float local named after an integer global keeps float semantics too: the
+ * shadowing rule has to hold in both directions. */
+@noinline fn float_local_over_integer_global() -> float64 {
+  var wide: float64 = 0.5;
+  wide = wide + 0.25;
+  return wide;
+}
+
+@noinline fn parameter_shadows_global(fl: int64) -> int64 {
+  return opaque(fl) * 2;
+}
+
+/* The globals still answer with their own values and types where nothing
+ * shadows them. */
+@noinline fn globals_still_work() -> int64 {
+  var acc: float64 = fl + (float64)f32g + sqrt2(0.5);
+  return wide + (int64)u + (int64)narrow + (int64)acc;
+}
+
+fn main() -> int32 {
+  if (integer_named_like_a_float_function() != 1235) { return 1; }
+  if (locals_win_over_globals() != 5294967490) { return 2; }
+  if (float_local_over_integer_global() != 0.75) { return 3; }
+  if (parameter_shadows_global(21) != 42) { return 4; }
+  if (globals_still_work() != 126) { return 5; }
+  return 0;
+}

@@ -1021,9 +1021,9 @@ int code_generator_binary_operand_is_known_float64(
     return 1;
   }
 
-  if (operand->kind == IR_OPERAND_SYMBOL && operand->name && generator &&
-      generator->ir_program) {
-    symbol = code_generator_lookup_symbol(generator, operand->name);
+  if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
+    symbol =
+        code_generator_binary_value_symbol(generator, context, operand->name);
     return symbol && code_generator_binary_resolved_type_is_float64(symbol->type);
   }
 
@@ -1062,9 +1062,9 @@ int code_generator_binary_operand_float_bits(
     }
   }
 
-  if (operand->kind == IR_OPERAND_SYMBOL && operand->name && generator &&
-      generator->ir_program) {
-    symbol = code_generator_lookup_symbol(generator, operand->name);
+  if (operand->kind == IR_OPERAND_SYMBOL && operand->name) {
+    symbol =
+        code_generator_binary_value_symbol(generator, context, operand->name);
     if (symbol) {
       return code_generator_binary_resolved_type_float_bits(symbol->type);
     }
@@ -1434,10 +1434,8 @@ int code_generator_binary_emit_operand_load(
   case IR_OPERAND_SYMBOL: {
     const char *alias_target =
         binary_symbol_alias_table_get(&context->symbol_aliases, operand->name);
-    const CgSym *symbol = generator && generator->ir_program
-                         ? code_generator_lookup_symbol(generator,
-                                               operand->name)
-                         : NULL;
+    const CgSym *symbol =
+        code_generator_binary_value_symbol(generator, context, operand->name);
     MtlcType *load_type = symbol ? symbol->type
                              : code_generator_binary_get_operand_type_in_context(
                                    generator, context, operand);
@@ -2219,15 +2217,14 @@ int code_generator_binary_emit_destination_store(
   }
 
   case IR_OPERAND_SYMBOL: {
-    const CgSym *symbol = generator && generator->ir_program
-                         ? code_generator_lookup_symbol(generator,
-                                               destination->name)
-                         : NULL;
+    const CgSym *symbol = code_generator_binary_value_symbol(
+        generator, context, destination->name);
     /* The symbol table has popped function scope by codegen time, so the
      * lookup returns NULL for locals/params; fall back to the IR-derived type
      * (function signature + DECLARE_LOCAL). Without it a narrow local's store
      * defaults to 8 bytes, losing the type's truncation semantics (and
-     * over-writing a 4-byte stack slot). */
+     * over-writing a 4-byte stack slot). A local that shares its name with a
+     * global takes the same fallback -- the global is a different object. */
     MtlcType *dest_type = symbol && symbol->type
                           ? symbol->type
                           : code_generator_binary_get_operand_type_in_context(
@@ -2789,15 +2786,14 @@ int code_generator_binary_load_needs_sign_extend(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IROperand *destination, int load_size) {
   const CgSym *symbol = NULL;
-  (void)context;
 
   if ((load_size != 1 && load_size != 2 && load_size != 4) || !destination) {
     return 0;
   }
 
-  if (destination->kind == IR_OPERAND_SYMBOL && destination->name &&
-      generator->ir_program) {
-    symbol = code_generator_lookup_symbol(generator, destination->name);
+  if (destination->kind == IR_OPERAND_SYMBOL && destination->name) {
+    symbol = code_generator_binary_value_symbol(generator, context,
+                                                destination->name);
     if (symbol && symbol->type &&
         code_generator_binary_resolved_type_scalar_size(symbol->type) == 4) {
       return code_generator_binary_resolved_type_is_signed_integer(symbol->type);

@@ -81,6 +81,32 @@ int code_generator_binary_get_symbol_offset(BinaryFunctionContext *context,
   return code_generator_binary_get_local_offset(context, name);
 }
 
+/* The module symbol a value operand named `name` actually refers to, or NULL.
+ *
+ * Two names never reach a module symbol here. A local or parameter of the
+ * function being emitted owns its name outright, so a global spelled the same
+ * way is a different object whose type says nothing about this storage. And a
+ * function symbol carries its RETURN type in ->type, which is not the type of
+ * the name -- reading it as one made `var fmod: int64` (shadowing a
+ * float-returning `fmod`) a float slot, so every store to it converted and it
+ * read back as the bit pattern of a double. */
+const CgSym *code_generator_binary_value_symbol(CodeGenerator *generator,
+                                                BinaryFunctionContext *context,
+                                                const char *name) {
+  const CgSym *symbol = NULL;
+  if (!generator || !generator->ir_program || !name || name[0] == '\0') {
+    return NULL;
+  }
+  if (context && code_generator_binary_get_symbol_offset(context, name) > 0) {
+    return NULL;
+  }
+  symbol = code_generator_lookup_symbol(generator, name);
+  if (!symbol || symbol->kind == CG_SYM_FUNCTION) {
+    return NULL;
+  }
+  return symbol;
+}
+
 
 int code_generator_binary_resolved_type_is_stack_scalar(MtlcType *type) {
   if (!type) {
@@ -2080,8 +2106,22 @@ int code_generator_binary_prepare_function_context(
           !generator->ir_program) {
         continue;
       }
+      /* A local or parameter of this function owns the name outright: the
+       * global of the same name is a different object and its width says
+       * nothing about this storage. Without this, an `int64` local named like
+       * a float-returning function (`var fmod: int64`) was marked float and
+       * every store to it converted, so it read back as the bits of a double.
+       * A function name is never a float value either -- a function symbol
+       * carries its RETURN type in ->type, which is not the type of the name. */
+      if (binary_named_slot_table_get_offset(&context->local_slots, op->name) >=
+              0 ||
+          binary_named_slot_table_get_offset(&context->parameter_slots,
+                                             op->name) >= 0) {
+        continue;
+      }
       const CgSym *sym = code_generator_lookup_symbol(generator, op->name);
-      if (!sym || !sym->scope || sym->scope->type != CG_SCOPE_GLOBAL) {
+      if (!sym || !sym->scope || sym->scope->type != CG_SCOPE_GLOBAL ||
+          sym->kind == CG_SYM_FUNCTION) {
         continue;
       }
       int gfbits = code_generator_binary_resolved_type_float_bits(sym->type);

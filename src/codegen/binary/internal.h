@@ -875,6 +875,9 @@ int code_generator_binary_emit_interrupt_entry(CodeGenerator *generator, IRFunct
 int code_generator_binary_emit_interrupt_exit(CodeGenerator *generator, IRFunction *ir_function, BinaryFunctionContext *context);
 int code_generator_emit_binary_function_x86_16(CodeGenerator *generator, IRFunction *ir_function, BinaryFunctionContext *context);
 int code_generator_binary_get_symbol_offset(BinaryFunctionContext *context, const char *name);
+/* The module symbol a value operand of this name refers to, or NULL when a
+ * local/parameter of the function shadows it or the name is a function. */
+const CgSym *code_generator_binary_value_symbol(CodeGenerator *generator, BinaryFunctionContext *context, const char *name);
 int code_generator_binary_get_temp_offset(BinaryFunctionContext *context, const char *name);
 int code_generator_binary_global_is_written(IRProgram *ir_program, const char *name);
 int code_generator_binary_gp_register_is_win64_nonvolatile( BinaryGpRegister reg);

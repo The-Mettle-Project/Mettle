@@ -13461,6 +13461,8 @@ $runFixtures = @(
      What = "a register-promoted global counter lost its writes" },
   @{ Name = "scoped_shadowing"; Path = "tests/codegen/scoped_shadowing.mettle"
      What = "a shadowing var shared the slot of the one it shadows" },
+  @{ Name = "local_shadows_global"; Path = "tests/codegen/local_shadows_global.mettle"
+     What = "a local took the type of a global or function that shares its name" },
   @{ Name = "unsigned_through_temp"; Path = "tests/codegen/unsigned_through_temp.mettle"
      What = "an unsigned shift, divide or remainder through a temp went signed" },
   @{ Name = "if_convert_accumulate"; Path = "tests/codegen/if_convert_accumulate.mettle"
