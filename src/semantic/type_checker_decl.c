@@ -1661,6 +1661,27 @@ static Symbol *type_checker_build_function_symbol(
       }
     }
 
+    /* `T[..]` gathers whatever a call passes after the fixed parameters. Only
+       the last parameter can, because everything after it would have nothing
+       left to take. */
+    for (size_t i = 0; i < func_decl->parameter_count; i++) {
+      const char *written = func_decl->parameter_types[i];
+      size_t written_length = written ? strlen(written) : 0;
+      if (written_length > 4 &&
+          strcmp(written + written_length - 4, "[..]") == 0) {
+        if (i + 1 != func_decl->parameter_count) {
+          type_checker_set_error_at_location(
+              checker, declaration->location,
+              "'%s' gathers the rest of the call's arguments, so it has to be "
+              "the last parameter of '%s'",
+              func_decl->parameter_names[i], func_decl->name);
+          free(param_types);
+          return 0;
+        }
+        func_decl->is_variadic = 1;
+      }
+    }
+
     for (size_t i = 0; i < func_decl->parameter_count; i++) {
       param_types[i] = type_checker_get_type_by_name(
           checker, func_decl->parameter_types[i]);

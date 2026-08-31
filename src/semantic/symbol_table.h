@@ -190,6 +190,9 @@ typedef struct Symbol {
       Type **parameter_types;
       size_t parameter_count;
       Type *return_type;
+      /* The last parameter gathers: a call may pass any number of its element
+       * type there, or one slice of them. */
+      int is_variadic;
     } function;
     struct {
       long long value;

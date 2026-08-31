@@ -676,6 +676,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind, Type *type) {
     symbol->data.function.parameter_types = NULL;
     symbol->data.function.parameter_count = 0;
     symbol->data.function.return_type = NULL;
+    symbol->data.function.is_variadic = 0;
     break;
   case SYMBOL_STRUCT:
   case SYMBOL_ENUM:
@@ -903,7 +904,8 @@ Type *type_create_struct(const char *name, char **field_names,
 
 Type *type_get_field_type(Type *struct_type, const char *field_name) {
   if (!struct_type ||
-      (struct_type->kind != TYPE_STRUCT && struct_type->kind != TYPE_STRING) ||
+      (struct_type->kind != TYPE_STRUCT && struct_type->kind != TYPE_STRING &&
+       struct_type->kind != TYPE_SLICE) ||
       !field_name) {
     return NULL;
   }
@@ -919,7 +921,8 @@ Type *type_get_field_type(Type *struct_type, const char *field_name) {
 
 size_t type_get_field_offset(Type *struct_type, const char *field_name) {
   if (!struct_type ||
-      (struct_type->kind != TYPE_STRUCT && struct_type->kind != TYPE_STRING) ||
+      (struct_type->kind != TYPE_STRUCT && struct_type->kind != TYPE_STRING &&
+       struct_type->kind != TYPE_SLICE) ||
       !field_name) {
     return 0;
   }

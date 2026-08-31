@@ -2498,10 +2498,90 @@ if ((func_symbol->kind == SYMBOL_VARIABLE ||
   return NULL;
 }
 
+/* A call to a function whose last parameter gathers. The fixed parameters are
+ * checked the way any parameter is; everything after them has to be the
+ * element type, unless a single argument is already the slice, which is how
+ * one variadic call forwards to another. */
+static int type_checker_check_gathered_arguments(TypeChecker *checker,
+                                                 ASTNode *expression,
+                                                 CallExpression *call,
+                                                 Symbol *func_symbol) {
+  size_t fixed = func_symbol->data.function.parameter_count - 1;
+  Type *gathered = func_symbol->data.function.parameter_types[fixed];
+  Type *element = gathered ? gathered->base_type : NULL;
+  size_t i;
+
+  if (!element) {
+    return 0;
+  }
+  if (call->argument_count < fixed) {
+    char message[256];
+    snprintf(message, sizeof(message),
+             "Function '%s' expects at least %llu argument%s, got %llu",
+             call->function_name, (unsigned long long)fixed,
+             fixed == 1 ? "" : "s",
+             (unsigned long long)call->argument_count);
+    type_checker_set_error_at_location(checker, expression->location, message);
+    return 0;
+  }
+
+  for (i = 0; i < fixed; i++) {
+    Type *argument = type_checker_infer_type(checker, call->arguments[i]);
+    Type *parameter = func_symbol->data.function.parameter_types[i];
+    if (!argument) {
+      return 0;
+    }
+    if (!(parameter && type_checker_type_accepts_null_pointer(parameter) &&
+          type_checker_is_null_pointer_constant(call->arguments[i])) &&
+        !type_checker_is_assignable_from(checker, parameter, argument,
+                                         call->arguments[i])) {
+      type_checker_report_assign_mismatch(checker, call->arguments[i],
+                                          call->arguments[i]->location,
+                                          parameter, argument);
+      return 0;
+    }
+  }
+
+  /* One argument that is already the slice is the slice: `warn(parts)` inside
+     a variadic function passes what it was given rather than a slice of one. */
+  if (call->argument_count == fixed + 1) {
+    Type *only = type_checker_infer_type(checker, call->arguments[fixed]);
+    if (!only) {
+      return 0;
+    }
+    if (only->kind == TYPE_SLICE && only->base_type &&
+        type_checker_types_equal(only->base_type, element)) {
+      return 1;
+    }
+  }
+
+  for (i = fixed; i < call->argument_count; i++) {
+    Type *argument = type_checker_infer_type(checker, call->arguments[i]);
+    if (!argument) {
+      return 0;
+    }
+    if (!(type_checker_type_accepts_null_pointer(element) &&
+          type_checker_is_null_pointer_constant(call->arguments[i])) &&
+        !type_checker_is_assignable_from(checker, element, argument,
+                                         call->arguments[i])) {
+      type_checker_report_assign_mismatch(checker, call->arguments[i],
+                                          call->arguments[i]->location,
+                                          element, argument);
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int type_checker_check_call_arguments(TypeChecker *checker,
                                              ASTNode *expression,
                                              CallExpression *call,
                                              Symbol *func_symbol) {
+if (func_symbol->data.function.is_variadic &&
+    func_symbol->data.function.parameter_count > 0) {
+  return type_checker_check_gathered_arguments(checker, expression, call,
+                                               func_symbol);
+}
 // Check argument count
 if (call->argument_count != func_symbol->data.function.parameter_count) {
   char error_msg[512];
@@ -3134,7 +3214,8 @@ static Type *type_checker_infer_member(TypeChecker *checker,
                                           expression);
     }
     if (object_type && (object_type->kind == TYPE_STRUCT ||
-                        object_type->kind == TYPE_STRING)) {
+                        object_type->kind == TYPE_STRING ||
+                        object_type->kind == TYPE_SLICE)) {
       // Look up the field type in the struct
       Type *field_type = type_get_field_type(object_type, member->member);
       if (field_type) {
@@ -3218,6 +3299,18 @@ static Type *type_checker_infer_index(TypeChecker *checker,
       return NULL;
     }
 
+    /* `s[i]` on a slice reads through its data pointer. The extent travels
+       with the value, so this is the one indexing the compiler can check
+       against a length it actually has. */
+    if (array_type->kind == TYPE_SLICE) {
+      if (!array_type->base_type) {
+        type_checker_set_error_at_location(checker, expression->location,
+                                           "Indexed type has no element type");
+        return NULL;
+      }
+      return array_type->base_type;
+    }
+
     if (array_type->kind == TYPE_ARRAY || array_type->kind == TYPE_POINTER) {
       if (!array_type->base_type) {
         type_checker_set_error_at_location(checker, expression->location,
@@ -3292,6 +3385,39 @@ static Type *type_checker_infer_allocation(TypeChecker *checker,
       type_checker_set_error_at_location(checker, expression->location,
                                          "Invalid 'new' expression");
       return NULL;
+    }
+
+    /* `new T[n]` allocates n of them and answers a slice, so the length is
+       part of the value from the moment it exists. The element may be any
+       type with a size, which is what makes it the dynamically sized array
+       the language otherwise has no spelling for. */
+    if (new_expr->count) {
+      Type *element =
+          type_checker_get_type_by_name(checker, new_expr->type_name);
+      Type *count_type = type_checker_infer_type(checker, new_expr->count);
+      if (!element) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "Unknown type '%s' in 'new %s[...]'", new_expr->type_name,
+            new_expr->type_name);
+        return NULL;
+      }
+      if (element->size == 0) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "'%s' has no size, so 'new %s[...]' has nothing to allocate",
+            new_expr->type_name, new_expr->type_name);
+        return NULL;
+      }
+      if (!count_type) {
+        return NULL;
+      }
+      if (!type_checker_is_integer_type(count_type)) {
+        type_checker_report_type_mismatch(checker, new_expr->count->location,
+                                          "integer type", count_type->name);
+        return NULL;
+      }
+      return type_checker_slice_of(checker, element);
     }
 
     // Look up the type by name

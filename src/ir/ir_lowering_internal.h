@@ -150,6 +150,15 @@ int ir_coerce_string_operand_to_cstring(IRLoweringContext *context,
                                                IROperand *value,
                                                SourceLocation location);
 
+/* An array handed to a slice becomes `{ &a[0], N }` in a hidden local, so the
+   extent the type carried travels with the value. */
+int ir_should_build_slice_from_array(Type *target_type,
+                                     ASTNode *value_expression);
+int ir_build_slice_operand_from_array(IRLoweringContext *context,
+                                      IRFunction *function, IROperand *value,
+                                      Type *array_type, Type *slice_type,
+                                      SourceLocation location);
+
 int ir_should_decay_array_to_address(Type *target_type,
                                      ASTNode *value_expression);
 
@@ -305,6 +314,12 @@ int ir_emit_runtime_trap_ex(IRLoweringContext *context,
 
 int ir_emit_null_check(IRLoweringContext *context, IRFunction *function,
                               SourceLocation location, const IROperand *value);
+
+/* Bounds-check an index against the length a slice carries. */
+int ir_emit_slice_bounds_check(IRLoweringContext *context, IRFunction *function,
+                               SourceLocation location,
+                               const IROperand *slice_address,
+                               const IROperand *index);
 
 int ir_emit_bounds_check(IRLoweringContext *context,
                                 IRFunction *function, SourceLocation location,

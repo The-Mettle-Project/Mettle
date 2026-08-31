@@ -376,6 +376,134 @@ int ir_emit_bounds_check(IRLoweringContext *context,
   return 1;
 }
 
+/* The bounds check a pointer could never have. A slice carries its length
+ * beside its data, so the extent is loaded from the value rather than taken on
+ * trust, and a negative index fails the same check as an oversized one. */
+int ir_emit_slice_bounds_check(IRLoweringContext *context, IRFunction *function,
+                               SourceLocation location,
+                               const IROperand *slice_address,
+                               const IROperand *index) {
+  IROperand length = ir_operand_none();
+  IROperand length_slot = ir_operand_none();
+  IROperand in_bounds = ir_operand_none();
+  IROperand non_negative = ir_operand_none();
+  char *trap_label = NULL;
+  char *ok_label = NULL;
+  int ok = 0;
+
+  if (!context || !function || !slice_address || !index) {
+    return 0;
+  }
+  if (!context->emit_runtime_checks) {
+    return 1;
+  }
+
+  if (!ir_emit_address_with_offset(context, function, slice_address, 8,
+                                   location, &length_slot) ||
+      !ir_make_temp_operand(context, &length)) {
+    ir_operand_destroy(&length_slot);
+    return 0;
+  }
+  {
+    IRInstruction load = {0};
+    load.op = IR_OP_LOAD;
+    load.location = location;
+    load.dest = length;
+    load.lhs = length_slot;
+    load.rhs = ir_operand_int(8);
+    if (!ir_emit(context, function, &load)) {
+      ir_operand_destroy(&length_slot);
+      ir_operand_destroy(&length);
+      return 0;
+    }
+  }
+  ir_operand_destroy(&length_slot);
+
+  trap_label = ir_new_label_name(context, "trap_slice_bounds");
+  ok_label = ir_new_label_name(context, "in_slice_bounds");
+  if (!trap_label || !ok_label ||
+      !ir_make_temp_operand(context, &in_bounds) ||
+      !ir_make_temp_operand(context, &non_negative)) {
+    goto done;
+  }
+
+  {
+    IRInstruction compare = {0};
+    IRInstruction branch = {0};
+    compare.op = IR_OP_BINARY;
+    compare.location = location;
+    compare.dest = in_bounds;
+    compare.lhs = *index;
+    compare.rhs = length;
+    compare.text = "<";
+    if (!ir_emit(context, function, &compare)) {
+      goto done;
+    }
+    branch.op = IR_OP_BRANCH_ZERO;
+    branch.location = location;
+    branch.lhs = in_bounds;
+    branch.text = trap_label;
+    if (!ir_emit(context, function, &branch)) {
+      goto done;
+    }
+  }
+  {
+    IRInstruction compare = {0};
+    IRInstruction branch = {0};
+    compare.op = IR_OP_BINARY;
+    compare.location = location;
+    compare.dest = non_negative;
+    compare.lhs = *index;
+    compare.rhs = ir_operand_int(0);
+    compare.text = ">=";
+    if (!ir_emit(context, function, &compare)) {
+      goto done;
+    }
+    branch.op = IR_OP_BRANCH_ZERO;
+    branch.location = location;
+    branch.lhs = non_negative;
+    branch.text = trap_label;
+    if (!ir_emit(context, function, &branch)) {
+      goto done;
+    }
+  }
+  {
+    IRInstruction jump = {0};
+    IRInstruction trap = {0};
+    IRInstruction after = {0};
+    jump.op = IR_OP_JUMP;
+    jump.location = location;
+    jump.text = ok_label;
+    if (!ir_emit(context, function, &jump)) {
+      goto done;
+    }
+    trap.op = IR_OP_LABEL;
+    trap.location = location;
+    trap.text = trap_label;
+    if (!ir_emit(context, function, &trap) ||
+        !ir_emit_runtime_trap_ex(context, function, location, 2u,
+                                 "Fatal error: Slice index out of bounds",
+                                 index, &length)) {
+      goto done;
+    }
+    after.op = IR_OP_LABEL;
+    after.location = location;
+    after.text = ok_label;
+    if (!ir_emit(context, function, &after)) {
+      goto done;
+    }
+  }
+  ok = 1;
+
+done:
+  free(trap_label);
+  free(ok_label);
+  ir_operand_destroy(&in_bounds);
+  ir_operand_destroy(&non_negative);
+  ir_operand_destroy(&length);
+  return ok;
+}
+
 int ir_emit_safety_check(IRLoweringContext *context, IRFunction *function,
                          SourceLocation location, const IROperand *base,
                          const IROperand *offset, long long access_size,

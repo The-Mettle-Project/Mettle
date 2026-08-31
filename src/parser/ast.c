@@ -649,6 +649,10 @@ static ASTNode *ast_clone_new_expression(ASTNode *clone, const ASTNode *node) {
     return NULL;
   }
   dst->type_name = ast_intern_string(src->type_name);
+  dst->count = src->count ? ast_clone_node(src->count) : NULL;
+  if (dst->count) {
+    ast_add_child(clone, dst->count);
+  }
   clone->data = dst;
   return clone;
 }
@@ -1729,6 +1733,7 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->is_swappable = 0;
   func_decl->is_naked = 0;
   func_decl->is_interrupt = 0;
+  func_decl->is_variadic = 0;
   func_decl->simd_mode = SIMD_ATTR_NONE;
   func_decl->captured_names = NULL;
   func_decl->captured_types = NULL;
@@ -2520,8 +2525,23 @@ ASTNode *ast_create_new_expression(const char *type_name,
   }
 
   new_expr->type_name = ast_intern_string(type_name);
+  new_expr->count = NULL;
   node->data = new_expr;
 
+  return node;
+}
+
+ASTNode *ast_create_new_array_expression(const char *type_name, ASTNode *count,
+                                         SourceLocation location) {
+  ASTNode *node = ast_create_new_expression(type_name, location);
+  NewExpression *new_expr = node ? (NewExpression *)node->data : NULL;
+  if (!node) {
+    return NULL;
+  }
+  new_expr->count = count;
+  if (count) {
+    ast_add_child(node, count);
+  }
   return node;
 }
 

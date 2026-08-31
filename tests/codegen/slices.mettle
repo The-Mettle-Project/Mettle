@@ -1,0 +1,92 @@
+// A pointer carries no extent, so every buffer travelled as a pointer and a
+// separate length, and nothing could check one against the other. `T[]` is the
+// two in one value: a fixed array converts to it, `new T[n]` produces one, and
+// indexing one is checked against the length it carries.
+
+import "std/mem";
+
+struct Point { x: int32; y: int32; }
+
+fn total(xs: int32[]) -> int64 {
+  var sum: int64 = 0;
+  for x in xs { sum = sum + (int64)x; }
+  return sum;
+}
+
+fn fill(xs: int32[], value: int32) {
+  for i in 0..xs.length { xs[i] = value; }
+}
+
+fn first_or(xs: int32[], fallback: int32) -> int32 {
+  if (xs.length == 0) { return fallback; }
+  return xs[0];
+}
+
+fn widest(points: Point[]) -> int32 {
+  var best: int32 = 0;
+  for i in 0..points.length {
+    if (points[i].x > best) { best = points[i].x; }
+  }
+  return best;
+}
+
+fn head(xs: int32[]) -> int32[] { return xs; }
+
+fn main() -> int32 {
+  var a: int32[4];
+  a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;
+
+  var s: int32[] = a;
+  if (s.length != 4) { return 1; }
+  if (s[0] != 1 || s[3] != 4) { return 2; }
+  if (total(a) != 10) { return 3; }
+  if (total(s) != 10) { return 4; }
+
+  // Writing through a slice writes the array it views.
+  fill(s, 5);
+  if (a[0] != 5 || a[3] != 5) { return 5; }
+  if (total(s) != 20) { return 6; }
+
+  // A shorter array reaches the same function.
+  var two: int32[2];
+  two[0] = 7;
+  two[1] = 8;
+  if (total(two) != 15) { return 7; }
+  if (first_or(two, 0) != 7) { return 8; }
+
+  // The heap form: the length is known from the moment the value exists.
+  var n: int32 = 6;
+  var heap: int32[] = new int32[n];
+  if (heap.length != 6) { return 9; }
+  for i in 0..heap.length { heap[i] = (int32)i; }
+  if (total(heap) != 15) { return 10; }
+  if (heap[5] != 5) { return 11; }
+  free(heap.data);
+
+  // A struct element works the same way.
+  var points: Point[3];
+  points[0].x = 4;
+  points[1].x = 9;
+  points[2].x = 2;
+  if (widest(points) != 9) { return 12; }
+
+  // A slice passes through a function and comes back whole.
+  var back: int32[] = head(s);
+  if (back.length != 4 || back[1] != 5) { return 13; }
+
+  // The data pointer is what a C boundary takes.
+  var raw: int32* = s.data;
+  if (raw[2] != 5) { return 14; }
+
+  // A pointer and a length the program asserts: the one place an extent is
+  // taken on trust, and it is written down where it is taken.
+  var borrowed: int32* = (int32*)malloc(3 * 4);
+  borrowed[0] = 10;
+  borrowed[1] = 20;
+  borrowed[2] = 30;
+  var view: int32[] = { data: borrowed, length: 3 };
+  if (view.length != 3) { return 15; }
+  if (total(view) != 60) { return 16; }
+  free(borrowed);
+  return 0;
+}

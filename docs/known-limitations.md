@@ -11,6 +11,10 @@ A tagged-enum variant carries at most one payload. `Circle(float64)` works;
 An array is one-dimensional. `int64[3][4]` does not parse; index a flat
 `int64[12]` yourself.
 
+A `T[N]` has its length in its type, so `N` is a constant. `T[]` is the length
+carried in the value, which is what `new T[n]` produces and what a `T[N]`
+converts to at a boundary.
+
 Two types may point at each other. `struct A { b: B*; }` above
 `struct B { a: A*; }` compiles, as does a longer cycle and an enum whose
 payload points at a struct that stores the enum by value. What has no size is a
@@ -106,8 +110,10 @@ guarded at run time in normal builds, and those guards are dropped under
 `--release`.
 
 Pointer indexing is never bounds-checked, because the compiler does not know
-the pointee's extent. Pointers arriving from C or from inline assembly can be
-invalid in ways nothing can prove.
+the pointee's extent. A slice does carry one, so `T[]` indexing is checked
+against the length the value holds, under the same rule: guarded in normal
+builds, dropped under `--release`, kept under `--safe`. Pointers arriving from
+C or from inline assembly can be invalid in ways nothing can prove.
 
 ## Vectorization
 

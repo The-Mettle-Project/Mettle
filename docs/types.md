@@ -286,6 +286,44 @@ match (half(8)) {
 }
 ```
 
+## Slices
+
+`T[]` is a pointer to `T` and a length, in one value. It is what a buffer looks
+like when its extent travels with it:
+
+```mettle
+fn total(xs: int32[]) -> int64 {
+  var sum: int64 = 0;
+  for x in xs { sum = sum + (int64)x; }
+  return sum;
+}
+```
+
+A `T[N]` converts to `T[]` wherever one is expected -- a binding, an argument,
+a return -- and the length the type carried becomes the length the value
+carries. `.length` reads it and `.data` is the pointer, which is what a C
+boundary takes.
+
+`new T[n]` allocates `n` elements and answers a `T[]`, which is how a program
+writes an array whose size is not known while compiling:
+
+```mettle
+var xs: int32[] = new int32[count];
+for i in 0..xs.length { xs[i] = (int32)i; }
+free(xs.data);
+```
+
+Indexing a slice is checked against the length it carries, which a pointer
+could never offer. The check is emitted in a normal build, dropped under
+`--release`, and kept under [`--safe`](memory-safety.md).
+
+A pointer and a length that came from somewhere else are joined by writing them
+down, which is the one place the extent is asserted rather than known:
+
+```mettle
+var view: int32[] = { data: borrowed, length: 3 };
+```
+
 ## Function types
 
 `fn(A, B) -> R` is a plain function pointer. It holds a code address and

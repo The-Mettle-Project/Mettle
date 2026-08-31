@@ -4139,6 +4139,53 @@ catch {
   Write-CaseResult -Name "safe_mode_bounds" -Passed $false -Reason $_.Exception.Message
 }
 
+# A slice carries its length, so the index check compares against a number the
+# value really holds. The check is emitted in a normal build and dropped under
+# --release, the same rule a fixed array's check follows.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  foreach ($case in @("test_slice_bounds", "test_slice_bounds_negative")) {
+    $debugExe = Join-Path $tmpDir "$case.debug.exe"
+    & $CompilerPath --build "tests/$case.mettle" -o $debugExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "debug build of $case failed"
+    }
+    $debugOut = & $debugExe 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+      throw "$case ran to completion; the slice index should have trapped"
+    }
+    if ($debugOut -notmatch "Slice index out of bounds") {
+      throw "$case trapped without naming the slice index:`n$debugOut"
+    }
+
+    $releaseExe = Join-Path $tmpDir "$case.release.exe"
+    & $CompilerPath --build --release "tests/$case.mettle" -o $releaseExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "release build of $case failed"
+    }
+    $releaseOut = & $releaseExe 2>&1 | Out-String
+    if ($releaseOut -match "Slice index out of bounds") {
+      throw "$case trapped under --release, where the check is meant to be gone"
+    }
+
+    $safeExe = Join-Path $tmpDir "$case.safe.exe"
+    & $CompilerPath --build --safe --release "tests/$case.mettle" -o $safeExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "--safe build of $case failed"
+    }
+    & $safeExe 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+      throw "$case ran to completion under --safe; the access should have trapped"
+    }
+  }
+  Write-CaseResult -Name "slice_bounds" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "slice_bounds" -Passed $false -Reason $_.Exception.Message
+}
+
 
 # --safe on the heap, where the extent is not in the code and only the runtime
 # shadow map can answer. Run against both allocators: the libc one is C the
@@ -13680,6 +13727,8 @@ $runFixtures = @(
      What = "a switch case ran into the next one, or a fallthrough did not" },
   @{ Name = "comptime_table"; Path = "tests/codegen/comptime_table.mettle"
      What = "a declaration generated from a constant table came out wrong" },
+  @{ Name = "slices"; Path = "tests/codegen/slices.mettle"
+     What = "a slice lost its extent or read the wrong element" },
   @{ Name = "struct_methods"; Path = "tests/codegen/struct_methods.mettle"
      What = "a struct method body behaved wrong" },
   @{ Name = "unsigned_fold"; Path = "tests/codegen/unsigned_fold.mettle"

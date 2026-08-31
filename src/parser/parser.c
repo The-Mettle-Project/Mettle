@@ -2302,6 +2302,7 @@ static char **parser_parse_type_param_list(Parser *parser, char ***out_traits,
 }
 
 static char *parser_parse_type_annotation(Parser *parser);
+static char *parser_parse_type_annotation_ex(Parser *parser, int allow_array);
 
 /* `volatile T`: every access to a T is observable in itself, so none may be
  * removed, merged, reordered against another volatile access, or served from
@@ -2585,6 +2586,26 @@ static char *parser_parse_array_suffix(Parser *parser, char *type_name) {
   }
   parser_advance(parser); /* consume '[' */
 
+  /* `T[..]`: a gathered parameter. The brackets say array and the `..` says the
+     length comes from the call, which is what a variadic parameter is. Inside
+     the function it is an ordinary `T[]`. */
+  if (parser->current_token.type == TOKEN_DOT_DOT) {
+    size_t rest_len = strlen(type_name) + 5;
+    char *rest_type = malloc(rest_len);
+    parser_advance(parser);
+    if (!rest_type) {
+      free(type_name);
+      return NULL;
+    }
+    snprintf(rest_type, rest_len, "%s[..]", type_name);
+    free(type_name);
+    if (!parser_expect(parser, TOKEN_RBRACKET)) {
+      free(rest_type);
+      return NULL;
+    }
+    return rest_type;
+  }
+
   /* `T[]`: a slice, whose length is not part of the type. Empty brackets are
      what says so, and the suffix keeps stacking after it. */
   if (parser->current_token.type == TOKEN_RBRACKET) {
@@ -2635,7 +2656,7 @@ static char *parser_parse_array_suffix(Parser *parser, char *type_name) {
   return full_type;
 }
 
-static char *parser_parse_type_annotation(Parser *parser) {
+static char *parser_parse_type_annotation_ex(Parser *parser, int allow_array) {
   char *type_name = NULL;
   int is_closure_fn;
 
@@ -2678,7 +2699,7 @@ static char *parser_parse_type_annotation(Parser *parser) {
     if (!grouped) {
       return NULL;
     }
-    return parser_parse_array_suffix(parser, grouped);
+    return allow_array ? parser_parse_array_suffix(parser, grouped) : grouped;
   }
 
   is_closure_fn = parser_at_closure_type(parser);
@@ -2716,7 +2737,11 @@ static char *parser_parse_type_annotation(Parser *parser) {
   if (!type_name) {
     return NULL;
   }
-  return parser_parse_array_suffix(parser, type_name);
+  return allow_array ? parser_parse_array_suffix(parser, type_name) : type_name;
+}
+
+static char *parser_parse_type_annotation(Parser *parser) {
+  return parser_parse_type_annotation_ex(parser, 1);
 }
 
 static int parser_literal_radix_hint(const char *value) {
@@ -3705,12 +3730,33 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
       parser_set_error(parser, "Expected type name after 'new'");
       return NULL;
     }
-    char *type_name = parser_parse_type_annotation(parser);
+    /* The array suffix is left unparsed: `new T[n]` allocates n of them and
+       the count is an expression, not part of a type. */
+    char *type_name = parser_parse_type_annotation_ex(parser, 0);
+    ASTNode *new_expr = NULL;
     if (!type_name) {
       return NULL;
     }
 
-    ASTNode *new_expr = ast_create_new_expression(type_name, location);
+    if (parser->current_token.type == TOKEN_LBRACKET) {
+      ASTNode *count = NULL;
+      parser_advance(parser);
+      count = parser_parse_expression(parser);
+      if (!count) {
+        free(type_name);
+        return NULL;
+      }
+      if (!parser_expect(parser, TOKEN_RBRACKET)) {
+        ast_destroy_node(count);
+        free(type_name);
+        return NULL;
+      }
+      new_expr = ast_create_new_array_expression(type_name, count, location);
+      free(type_name);
+      return new_expr;
+    }
+
+    new_expr = ast_create_new_expression(type_name, location);
     free(type_name);
     return new_expr;
   }

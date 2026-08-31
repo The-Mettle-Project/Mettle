@@ -273,6 +273,7 @@ int type_checker_register_function_signature(TypeChecker *checker,
   func_symbol->data.function.parameter_names = param_names_copy;
   func_symbol->data.function.parameter_types = param_types;
   func_symbol->data.function.return_type = return_type;
+  func_symbol->data.function.is_variadic = func_decl->is_variadic;
   /* Kernel identity travels with the signature: this pre-registration is the
    * symbol a `dispatch` earlier in the file resolves against, so it has to
    * know the declaration was a `kernel` and what block shape it declared. */

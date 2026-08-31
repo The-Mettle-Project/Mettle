@@ -587,7 +587,8 @@ static int aggregate_fold_element(TypeChecker *checker, ASTNode *element,
                                          "Malformed aggregate literal");
       return 0;
     }
-    if (literal->is_struct && type->kind != TYPE_STRUCT) {
+    if (literal->is_struct && type->kind != TYPE_STRUCT &&
+        type->kind != TYPE_SLICE) {
       type_checker_set_error_at_location(
           checker, element->location,
           "'{ ... }' initializes a struct, but '%s' is not one",
@@ -615,12 +616,13 @@ static int aggregate_fold_element(TypeChecker *checker, ASTNode *element,
                                       out);
   }
 
-  if (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY) {
+  if (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
+      type->kind == TYPE_SLICE) {
     type_checker_set_error_at_location(
         checker, element->location,
         "'%s' needs an aggregate literal here: write '%s'",
         type->name ? type->name : "?",
-        type->kind == TYPE_STRUCT ? "{ field: value, ... }" : "[ value, ... ]");
+        type->kind == TYPE_ARRAY ? "[ value, ... ]" : "{ field: value, ... }");
     return 0;
   }
 
@@ -672,7 +674,8 @@ Type *type_checker_check_aggregate_literal(TypeChecker *checker,
     return NULL;
   }
 
-  if (target->kind != TYPE_STRUCT && target->kind != TYPE_ARRAY) {
+  if (target->kind != TYPE_STRUCT && target->kind != TYPE_ARRAY &&
+      target->kind != TYPE_SLICE) {
     type_checker_set_error_at_location(
         checker, expression->location,
         "'%s' is not a struct or array, so an aggregate literal cannot "

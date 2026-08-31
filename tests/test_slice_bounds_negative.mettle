@@ -1,0 +1,15 @@
+// The negative index a signed comparison against a length would let through.
+
+fn at(xs: int32[], i: int64) -> int32 {
+  return xs[i];
+}
+
+fn main() -> int32 {
+  var a: int32[3];
+  a[0] = 1;
+  var s: int32[] = a;
+  if (at(s, 0) != 1) {
+    return 90;
+  }
+  return at(s, -2);
+}

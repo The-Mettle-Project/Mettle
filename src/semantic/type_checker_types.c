@@ -901,9 +901,22 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
   }
 
   /* `T[]`: a slice, which is `T*` and a length in one value. The brackets are
-   * empty because the length is not part of the type. */
+   * empty because the length is not part of the type. `T[..]` is the same type
+   * written where a parameter gathers its arguments. */
   {
     size_t length = strlen(name);
+    if (length > 4 && strcmp(name + length - 4, "[..]") == 0) {
+      char *element_name = malloc(length - 3);
+      Type *element = NULL;
+      if (!element_name) {
+        return NULL;
+      }
+      memcpy(element_name, name, length - 4);
+      element_name[length - 4] = '\0';
+      element = type_checker_get_type_by_name(checker, element_name);
+      free(element_name);
+      return element ? type_checker_slice_of(checker, element) : NULL;
+    }
     if (length > 2 && name[length - 2] == '[' && name[length - 1] == ']') {
       char *element_name = malloc(length - 1);
       Type *element = NULL;
@@ -1266,6 +1279,15 @@ int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
   /* A Mettle string can flow to a cstring by exposing its chars pointer. */
   if (type_checker_is_cstring_type(dest_type) &&
       src_type->kind == TYPE_STRING) {
+    return 1;
+  }
+
+  /* A fixed array becomes a slice of the same element: the length the type
+     carried becomes the length the value carries. Nothing is lost, and it is
+     the conversion that lets a function be written once for any extent. */
+  if (dest_type->kind == TYPE_SLICE && src_type->kind == TYPE_ARRAY &&
+      dest_type->base_type && src_type->base_type &&
+      type_checker_types_equal(dest_type->base_type, src_type->base_type)) {
     return 1;
   }
 

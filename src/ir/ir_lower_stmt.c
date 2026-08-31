@@ -692,7 +692,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
      * no memset to lower the fill to. */
     if (!declaration->initializer && decl_type &&
         (decl_type->kind == TYPE_ARRAY || decl_type->kind == TYPE_STRUCT ||
-         decl_type->kind == TYPE_STRING) &&
+         decl_type->kind == TYPE_SLICE || decl_type->kind == TYPE_STRING) &&
         declaration->address_space == AST_ADDRESS_SPACE_DEFAULT &&
         !function->is_kernel) {
       /* The read-ahead is only valid when the tracked position really is this
@@ -729,6 +729,15 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
                                            declaration->initializer) &&
           !ir_decay_array_operand_to_address(
               context, function, &value, declaration->initializer->location)) {
+        ir_operand_destroy(&value);
+        return 0;
+      }
+      if (ir_should_build_slice_from_array(decl_type,
+                                           declaration->initializer) &&
+          !ir_build_slice_operand_from_array(
+              context, function, &value,
+              declaration->initializer->resolved_type, decl_type,
+              declaration->initializer->location)) {
         ir_operand_destroy(&value);
         return 0;
       }
@@ -838,6 +847,13 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       if (!decay_target && binding) {
         decay_target = ir_resolve_named_type(context, binding->type_text);
       }
+      if (ir_should_build_slice_from_array(decay_target, assignment->value) &&
+          !ir_build_slice_operand_from_array(
+              context, function, &value, assignment->value->resolved_type,
+              decay_target, assignment->value->location)) {
+        ir_operand_destroy(&value);
+        return 0;
+      }
       if (ir_should_decay_array_to_address(decay_target, assignment->value) &&
           !ir_decay_array_operand_to_address(context, function, &value,
                                              assignment->value->location)) {
@@ -920,6 +936,13 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       return 0;
     }
 
+    if (ir_should_build_slice_from_array(target_type, assignment->value) &&
+        !ir_build_slice_operand_from_array(
+            context, function, &value, assignment->value->resolved_type,
+            target_type, assignment->value->location)) {
+      ir_operand_destroy(&value);
+      return 0;
+    }
     if (ir_should_decay_array_to_address(target_type, assignment->value) &&
         !ir_decay_array_operand_to_address(context, function, &value,
                                            assignment->value->location)) {
@@ -1188,6 +1211,14 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       }
       Type *return_type =
           ir_resolve_named_type(context, context->current_return_type_name);
+      if (ir_should_build_slice_from_array(return_type, ret->value) &&
+          !ir_build_slice_operand_from_array(context, function, &value,
+                                             ret->value->resolved_type,
+                                             return_type,
+                                             ret->value->location)) {
+        ir_operand_destroy(&value);
+        return 0;
+      }
       if (ir_should_decay_array_to_address(return_type, ret->value) &&
           !ir_decay_array_operand_to_address(context, function, &value,
                                              ret->value->location)) {

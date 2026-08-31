@@ -55,6 +55,7 @@ static MtlcType **ir_indirect_slot_types(ASTNode **argument_nodes,
     if (!argument_type || argument_type->kind == TYPE_STRUCT ||
         argument_type->kind == TYPE_ARRAY ||
         argument_type->kind == TYPE_STRING ||
+        argument_type->kind == TYPE_SLICE ||
         argument_type->kind == TYPE_TAGGED_ENUM) {
       continue;
     }
@@ -65,14 +66,15 @@ static MtlcType **ir_indirect_slot_types(ASTNode **argument_nodes,
 
 static int ir_indirect_arg_passes_by_address(Type *type) {
   return type && type->name &&
-         (type->kind == TYPE_STRUCT || type->kind == TYPE_TAGGED_ENUM) &&
+         (type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE ||
+          type->kind == TYPE_TAGGED_ENUM) &&
          type->size > 8 && type->size <= (size_t)INT_MAX;
 }
 
 static int ir_indirect_return_passes_by_pointer(Type *type) {
   return type && type->name &&
          (type->kind == TYPE_STRUCT || type->kind == TYPE_STRING ||
-          type->kind == TYPE_TAGGED_ENUM) &&
+          type->kind == TYPE_SLICE || type->kind == TYPE_TAGGED_ENUM) &&
          type->size > 8 && type->size <= (size_t)INT_MAX;
 }
 
@@ -834,6 +836,20 @@ int ir_lower_call_expression(IRLoweringContext *context,
         }
         continue;
       }
+      if (ir_should_build_slice_from_array(ptype, call->arguments[i])) {
+        if (!ir_build_slice_operand_from_array(
+                context, function, &arguments[i],
+                call->arguments[i]->resolved_type, ptype,
+                call->arguments[i]->location)) {
+          for (size_t j = 0; j < call->argument_count; j++) {
+            ir_operand_destroy(&arguments[j]);
+          }
+          free(arguments);
+          ir_operand_destroy(&destination);
+          return 0;
+        }
+        continue;
+      }
       if (ir_should_coerce_string_to_cstring(context, ptype,
                                              call->arguments[i])) {
         if (!ir_coerce_string_operand_to_cstring(
@@ -1202,7 +1218,7 @@ static int ir_try_load_aggregate_by_value(IRLoweringContext *context,
 
   if (!value_type || !value_type->name ||
       (value_type->kind != TYPE_STRUCT && value_type->kind != TYPE_ARRAY &&
-       value_type->kind != TYPE_STRING &&
+       value_type->kind != TYPE_STRING && value_type->kind != TYPE_SLICE &&
        value_type->kind != TYPE_TAGGED_ENUM) ||
       value_type->size <= 8 || value_type->size > (size_t)INT_MAX) {
     return -1;
@@ -2521,6 +2537,130 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     if (!new_expression || !new_expression->type_name) {
       ir_set_error(context, "Invalid new expression");
       return 0;
+    }
+
+    /* `new T[n]`: n elements' worth of zeroed heap, and the count stored
+       beside the pointer, so what comes back is a slice and every read
+       through it can be checked against a length that is really there. */
+    if (new_expression->count) {
+      Type *slice_type = expression->resolved_type;
+      Type *element = slice_type ? slice_type->base_type : NULL;
+      IROperand count = ir_operand_none();
+      IROperand bytes = ir_operand_none();
+      IROperand pointer = ir_operand_none();
+      IROperand slice_address = ir_operand_none();
+      IROperand slot = ir_operand_none();
+      char *slice_name = NULL;
+      IRInstruction multiply = {0};
+      IRInstruction allocate = {0};
+      IRInstruction store = {0};
+
+      if (!slice_type || slice_type->kind != TYPE_SLICE || !element ||
+          element->size == 0) {
+        ir_set_error(context, "'new T[n]' reached lowering without a slice "
+                              "type");
+        return 0;
+      }
+      if (!ir_lower_expression(context, function, new_expression->count,
+                               &count) ||
+          !ir_make_temp_operand(context, &bytes) ||
+          !ir_make_temp_operand(context, &pointer)) {
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&bytes);
+        ir_operand_destroy(&pointer);
+        return 0;
+      }
+
+      multiply.op = IR_OP_BINARY;
+      multiply.location = expression->location;
+      multiply.dest = bytes;
+      multiply.lhs = count;
+      multiply.rhs = ir_operand_int((long long)element->size);
+      multiply.text = "*";
+      if (!ir_emit(context, function, &multiply)) {
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&bytes);
+        ir_operand_destroy(&pointer);
+        return 0;
+      }
+
+      allocate.op = IR_OP_NEW;
+      allocate.location = expression->location;
+      allocate.dest = pointer;
+      allocate.rhs = bytes;
+      allocate.text = (char *)ir_backend_type_name(new_expression->type_name);
+      if (!ir_emit(context, function, &allocate)) {
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&bytes);
+        ir_operand_destroy(&pointer);
+        return 0;
+      }
+
+      slice_name = ir_new_label_name(context, "slice");
+      if (!slice_name ||
+          !ir_emit_local_declaration(context, function, slice_name,
+                                     slice_type->name, expression->location) ||
+          !ir_emit_address_of_symbol(context, function, slice_name,
+                                     expression->location, &slice_address)) {
+        free(slice_name);
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&bytes);
+        ir_operand_destroy(&pointer);
+        ir_operand_destroy(&slice_address);
+        return 0;
+      }
+
+      store.op = IR_OP_STORE;
+      store.location = expression->location;
+      store.dest = ir_clone_operand_local(&slice_address);
+      store.lhs = pointer;
+      store.rhs = ir_operand_int(8);
+      if (!ir_emit(context, function, &store)) {
+        ir_operand_destroy(&store.dest);
+        free(slice_name);
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&bytes);
+        ir_operand_destroy(&pointer);
+        ir_operand_destroy(&slice_address);
+        return 0;
+      }
+      ir_operand_destroy(&store.dest);
+
+      if (!ir_emit_address_with_offset(context, function, &slice_address, 8,
+                                       expression->location, &slot)) {
+        free(slice_name);
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&bytes);
+        ir_operand_destroy(&pointer);
+        ir_operand_destroy(&slice_address);
+        return 0;
+      }
+      {
+        IRInstruction length = {0};
+        length.op = IR_OP_STORE;
+        length.location = expression->location;
+        length.dest = slot;
+        length.lhs = count;
+        length.rhs = ir_operand_int(8);
+        if (!ir_emit(context, function, &length)) {
+          ir_operand_destroy(&slot);
+          free(slice_name);
+          ir_operand_destroy(&count);
+          ir_operand_destroy(&bytes);
+          ir_operand_destroy(&pointer);
+          ir_operand_destroy(&slice_address);
+          return 0;
+        }
+      }
+      ir_operand_destroy(&slot);
+      ir_operand_destroy(&slice_address);
+      ir_operand_destroy(&count);
+      ir_operand_destroy(&bytes);
+      ir_operand_destroy(&pointer);
+
+      *out_value = ir_operand_symbol(slice_name);
+      free(slice_name);
+      return out_value->name != NULL;
     }
 
     Type *allocated_type = NULL;

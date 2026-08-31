@@ -474,6 +474,7 @@ int ir_try_emit_aggregate_symbol_memcpy(
    * back saw whatever the slot already held. */
   if (!dest_type ||
       (dest_type->kind != TYPE_STRUCT && dest_type->kind != TYPE_STRING &&
+       dest_type->kind != TYPE_SLICE &&
        dest_type->kind != TYPE_TAGGED_ENUM)) {
     return 0;
   }
@@ -616,6 +617,7 @@ int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
    * back saw whatever the slot already held. */
   if (!dest_type ||
       (dest_type->kind != TYPE_STRUCT && dest_type->kind != TYPE_STRING &&
+       dest_type->kind != TYPE_SLICE &&
        dest_type->kind != TYPE_TAGGED_ENUM)) {
     return 0;
   }
@@ -1097,7 +1099,8 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
       }
     }
     if (!object_type || (object_type->kind != TYPE_STRUCT &&
-                         object_type->kind != TYPE_STRING)) {
+                         object_type->kind != TYPE_STRING &&
+                         object_type->kind != TYPE_SLICE)) {
       ir_operand_destroy(&object_address);
       ir_set_error(context,
                    "Member access requires struct or string lvalue object");
@@ -1171,11 +1174,16 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
      * borrowed and may point into rodata, so this is a read: the type checker
      * rejects assignment through it before lowering sees the expression. */
     int base_is_string = array_type && array_type->kind == TYPE_STRING;
+    /* A slice holds its data pointer at offset 0 and its length at 8, so
+       indexing one reads the pointer first. The extent is right there beside
+       it, which is what the bounds check below uses. */
+    int base_is_slice = array_type && array_type->kind == TYPE_SLICE;
     Type *element_type = base_is_string
                              ? ir_resolve_named_type(context, "char")
                              : (array_type ? array_type->base_type : NULL);
     if (!array_type || !element_type ||
-        (!base_is_string && array_type->kind != TYPE_ARRAY &&
+        (!base_is_string && !base_is_slice &&
+         array_type->kind != TYPE_ARRAY &&
          array_type->kind != TYPE_POINTER)) {
       ir_set_error(context, "Index lvalue requires array or pointer type");
       return 0;
@@ -1191,11 +1199,27 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
     int is_address_space_allocation =
         ir_expression_is_address_space_allocation(function,
                                                   index_expression->array);
+    IROperand slice_address = ir_operand_none();
     if (base_is_string) {
       lowered_base = ir_lower_expression(context, function,
                                          index_expression->array, &base) &&
                      ir_coerce_string_operand_to_cstring(
                          context, function, &base, expression->location);
+    } else if (base_is_slice) {
+      lowered_base =
+          ir_lower_lvalue_address(context, function, index_expression->array,
+                                  &slice_address, NULL) &&
+          ir_make_temp_operand(context, &base);
+      if (lowered_base) {
+        IRInstruction load_data = {0};
+        load_data.op = IR_OP_LOAD;
+        load_data.location = expression->location;
+        load_data.dest = base;
+        load_data.lhs = ir_clone_operand_local(&slice_address);
+        load_data.rhs = ir_operand_int(8);
+        lowered_base = ir_emit(context, function, &load_data);
+        ir_operand_destroy(&load_data.lhs);
+      }
     } else if (array_type->kind == TYPE_ARRAY && is_address_space_allocation) {
       /* Workgroup/private arrays lower to pointer-valued storage bindings. */
       lowered_base =
@@ -1237,7 +1261,18 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
         ir_operand_destroy(&index);
         return 0;
       }
+      /* The one bounds check a pointer could never have: the length travels
+         with the value, so it is read here rather than assumed. */
+      if (base_is_slice &&
+          !ir_emit_slice_bounds_check(context, function, expression->location,
+                                      &slice_address, &index)) {
+        ir_operand_destroy(&base);
+        ir_operand_destroy(&index);
+        ir_operand_destroy(&slice_address);
+        return 0;
+      }
     }
+    ir_operand_destroy(&slice_address);
 
     IROperand scaled = ir_operand_none();
     if (!ir_make_temp_operand(context, &scaled)) {
@@ -1378,7 +1413,7 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
     Type *value_type = ir_infer_expression_type(context, expression);
     if (!value_type || !value_type->name ||
         (value_type->kind != TYPE_STRUCT && value_type->kind != TYPE_ARRAY &&
-         value_type->kind != TYPE_STRING)) {
+         value_type->kind != TYPE_SLICE && value_type->kind != TYPE_STRING)) {
       ir_set_error(context, "Expression is not assignable in IR lowering");
       return 0;
     }

@@ -159,6 +159,9 @@ typedef struct {
   int is_swappable;
   int is_naked;
   int is_interrupt;
+  /* The last parameter was written `T[..]`, so a call gathers whatever follows
+   * the fixed parameters into it. Inside the body it is an ordinary `T[]`. */
+  int is_variadic;
   int simd_mode;          // SimdAttr applied as the default to every body loop
   // Closure conversion metadata (set on AST_LAMBDA_EXPRESSION nodes only). A
   // capturing lambda records the variables it captures by value, their types,
@@ -395,6 +398,10 @@ typedef struct {
 
 typedef struct {
   char *type_name; // The target struct or type name
+  /* `new T[n]`: how many elements to allocate. The value is a slice, `T[]`,
+   * so the count travels with the pointer rather than being remembered
+   * separately. NULL for `new T`, which allocates one and yields `T*`. */
+  ASTNode *count;
 } NewExpression;
 
 typedef struct {
@@ -634,6 +641,9 @@ ASTNode *ast_create_method_call(ASTNode *object, const char *method_name,
                                 SourceLocation location);
 ASTNode *ast_create_new_expression(const char *type_name,
                                    SourceLocation location);
+/* `new T[count]`: a heap array whose length travels with it, as `T[]`. */
+ASTNode *ast_create_new_array_expression(const char *type_name, ASTNode *count,
+                                         SourceLocation location);
 ASTNode *ast_create_field_assignment(ASTNode *target, ASTNode *value,
                                      SourceLocation location);
 ASTNode *ast_create_cast_expression(const char *type_name, ASTNode *operand,

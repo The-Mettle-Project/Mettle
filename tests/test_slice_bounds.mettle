@@ -1,0 +1,19 @@
+// A slice carries its length, so an index past the end is caught by a check
+// against a number the value really holds. `--release` drops the check the way
+// it drops an array's; `--safe` keeps it.
+
+fn at(xs: int32[], i: int64) -> int32 {
+  return xs[i];
+}
+
+fn main() -> int32 {
+  var a: int32[3];
+  a[0] = 1;
+  a[1] = 2;
+  a[2] = 3;
+  var s: int32[] = a;
+  if (at(s, 0) != 1) {
+    return 90;
+  }
+  return at(s, 9);
+}

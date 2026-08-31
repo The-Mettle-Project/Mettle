@@ -44,6 +44,93 @@ int ir_should_decay_array_to_address(Type *target_type,
          value_expression->resolved_type->kind == TYPE_ARRAY;
 }
 
+/* An array flowing into a slice keeps its extent: the value becomes the pair
+ * `{ &a[0], N }`, which is the whole difference between a slice and a pointer.
+ * The length is the one the array's type carried, so nothing has to be trusted
+ * about it afterwards. */
+int ir_should_build_slice_from_array(Type *target_type,
+                                     ASTNode *value_expression) {
+  return target_type && target_type->kind == TYPE_SLICE &&
+         value_expression && value_expression->resolved_type &&
+         value_expression->resolved_type->kind == TYPE_ARRAY;
+}
+
+int ir_build_slice_operand_from_array(IRLoweringContext *context,
+                                      IRFunction *function, IROperand *value,
+                                      Type *array_type, Type *slice_type,
+                                      SourceLocation location) {
+  char *slice_name = NULL;
+  IROperand array_address = ir_operand_none();
+  IROperand slice_address = ir_operand_none();
+  IROperand slot = ir_operand_none();
+  IRInstruction store = {0};
+
+  if (!context || !function || !value || !array_type || !slice_type ||
+      value->kind != IR_OPERAND_SYMBOL || !value->name) {
+    return 0;
+  }
+
+  slice_name = ir_new_label_name(context, "slice");
+  if (!slice_name ||
+      !ir_emit_local_declaration(context, function, slice_name,
+                                 slice_type->name, location)) {
+    free(slice_name);
+    return 0;
+  }
+  if (!ir_emit_address_of_symbol(context, function, value->name, location,
+                                 &array_address) ||
+      !ir_emit_address_of_symbol(context, function, slice_name, location,
+                                 &slice_address)) {
+    ir_operand_destroy(&array_address);
+    ir_operand_destroy(&slice_address);
+    free(slice_name);
+    return 0;
+  }
+
+  store.op = IR_OP_STORE;
+  store.location = location;
+  store.dest = ir_clone_operand_local(&slice_address);
+  store.lhs = array_address;
+  store.rhs = ir_operand_int(8);
+  if (!ir_emit(context, function, &store)) {
+    ir_operand_destroy(&store.dest);
+    ir_operand_destroy(&array_address);
+    ir_operand_destroy(&slice_address);
+    free(slice_name);
+    return 0;
+  }
+  ir_operand_destroy(&store.dest);
+  ir_operand_destroy(&array_address);
+
+  if (!ir_emit_address_with_offset(context, function, &slice_address, 8,
+                                   location, &slot)) {
+    ir_operand_destroy(&slice_address);
+    free(slice_name);
+    return 0;
+  }
+  {
+    IRInstruction length = {0};
+    length.op = IR_OP_STORE;
+    length.location = location;
+    length.dest = slot;
+    length.lhs = ir_operand_int((long long)array_type->array_size);
+    length.rhs = ir_operand_int(8);
+    if (!ir_emit(context, function, &length)) {
+      ir_operand_destroy(&slot);
+      ir_operand_destroy(&slice_address);
+      free(slice_name);
+      return 0;
+    }
+  }
+  ir_operand_destroy(&slot);
+  ir_operand_destroy(&slice_address);
+
+  ir_operand_destroy(value);
+  *value = ir_operand_symbol(slice_name);
+  free(slice_name);
+  return value->name != NULL;
+}
+
 int ir_decay_array_operand_to_address(IRLoweringContext *context,
                                       IRFunction *function, IROperand *value,
                                       SourceLocation location) {
