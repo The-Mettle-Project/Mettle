@@ -1,0 +1,243 @@
+struct Canvas {
+  pixels: uint32*;
+  width: int32;
+  height: int32;
+}
+
+fn paint_clamp_int(value: int32, low: int32, high: int32) -> int32 {
+  if (value < low) { return low; }
+  if (value > high) { return high; }
+  return value;
+}
+
+fn paint_clamp_real(value: float64, low: float64, high: float64) -> float64 {
+  if (value < low) { return low; }
+  if (value > high) { return high; }
+  return value;
+}
+
+fn paint_rgb(red: int32, green: int32, blue: int32) -> uint32 {
+  return ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
+}
+
+@inline fn paint_blend(canvas: Canvas*, x: int32, y: int32, color: uint32, alpha: int32) {
+  if (alpha <= 0) { return; }
+  if (x < 0 || y < 0 || x >= canvas->width || y >= canvas->height) { return; }
+  var index: int64 = (int64)y * (int64)canvas->width + (int64)x;
+  if (alpha >= 255) {
+    canvas->pixels[index] = color;
+    return;
+  }
+  var destination: uint32 = canvas->pixels[index];
+  var inverse: int32 = 255 - alpha;
+  var red: int32 = ((int32)((destination >> 16) & (uint32)255) * inverse +
+                    (int32)((color >> 16) & (uint32)255) * alpha) / 255;
+  var green: int32 = ((int32)((destination >> 8) & (uint32)255) * inverse +
+                      (int32)((color >> 8) & (uint32)255) * alpha) / 255;
+  var blue: int32 = ((int32)(destination & (uint32)255) * inverse +
+                     (int32)(color & (uint32)255) * alpha) / 255;
+  canvas->pixels[index] = ((uint32)red << 16) | ((uint32)green << 8) | (uint32)blue;
+}
+
+fn paint_rect(canvas: Canvas*, x0: int32, y0: int32, x1: int32, y1: int32,
+              color: uint32, alpha: int32) {
+  if (alpha <= 0) { return; }
+  var left: int32 = paint_clamp_int(x0, 0, canvas->width);
+  var right: int32 = paint_clamp_int(x1, 0, canvas->width);
+  var top: int32 = paint_clamp_int(y0, 0, canvas->height);
+  var bottom: int32 = paint_clamp_int(y1, 0, canvas->height);
+  for y in top..bottom {
+    for x in left..right {
+      paint_blend(canvas, x, y, color, alpha);
+    }
+  }
+}
+
+fn paint_gradient(canvas: Canvas*, x0: int32, y0: int32, x1: int32, y1: int32,
+                  color: uint32, alpha_start: int32, alpha_end: int32, power: int32) {
+  var span: int32 = y1 - y0;
+  if (span <= 0) { return; }
+  var top: int32 = paint_clamp_int(y0, 0, canvas->height);
+  var bottom: int32 = paint_clamp_int(y1, 0, canvas->height);
+  for y in top..bottom {
+    var ratio: float64 = (float64)(y - y0) / (float64)span;
+    var shaped: float64 = ratio;
+    if (power == 2) { shaped = ratio * ratio; }
+    if (power == 3) { shaped = ratio * ratio * ratio; }
+    var alpha: int32 = alpha_start + (int32)((float64)(alpha_end - alpha_start) * shaped);
+    paint_rect(canvas, x0, y, x1, y + 1, color, alpha);
+  }
+}
+
+fn paint_round_rect(canvas: Canvas*, x0: float64, y0: float64, x1: float64, y1: float64,
+                    radius: float64, color: uint32, alpha: int32) {
+  if (alpha <= 0 || x1 <= x0 || y1 <= y0) { return; }
+  var limit: float64 = (x1 - x0) * 0.5;
+  var vertical_limit: float64 = (y1 - y0) * 0.5;
+  if (limit > vertical_limit) { limit = vertical_limit; }
+  var corner: float64 = radius;
+  if (corner > limit) { corner = limit; }
+  if (corner < 0.0) { corner = 0.0; }
+
+  var left: int32 = paint_clamp_int((int32)x0 - 1, 0, canvas->width);
+  var right: int32 = paint_clamp_int((int32)x1 + 2, 0, canvas->width);
+  var top: int32 = paint_clamp_int((int32)y0 - 1, 0, canvas->height);
+  var bottom: int32 = paint_clamp_int((int32)y1 + 2, 0, canvas->height);
+  var inner_left: float64 = x0 + corner;
+  var inner_right: float64 = x1 - corner;
+  var inner_top: float64 = y0 + corner;
+  var inner_bottom: float64 = y1 - corner;
+  var reach: float64 = corner * corner;
+
+  for y in top..bottom {
+    for x in left..right {
+      var hits: int32 = 0;
+      for sample_y in 0..4 {
+        var point_y: float64 = (float64)y + ((float64)sample_y + 0.5) * 0.25;
+        var near_y: float64 = paint_clamp_real(point_y, inner_top, inner_bottom);
+        var offset_y: float64 = point_y - near_y;
+        for sample_x in 0..4 {
+          var point_x: float64 = (float64)x + ((float64)sample_x + 0.5) * 0.25;
+          var near_x: float64 = paint_clamp_real(point_x, inner_left, inner_right);
+          var offset_x: float64 = point_x - near_x;
+          if (offset_x * offset_x + offset_y * offset_y <= reach) { hits = hits + 1; }
+        }
+      }
+      if (hits > 0) { paint_blend(canvas, x, y, color, alpha * hits / 16); }
+    }
+  }
+}
+
+fn paint_circle(canvas: Canvas*, center_x: float64, center_y: float64, radius: float64,
+                color: uint32, alpha: int32) {
+  paint_round_rect(canvas, center_x - radius, center_y - radius,
+                   center_x + radius, center_y + radius, radius, color, alpha);
+}
+
+fn paint_capsule(canvas: Canvas*, ax: float64, ay: float64, bx: float64, by: float64,
+                 thickness: float64, color: uint32, alpha: int32) {
+  if (alpha <= 0) { return; }
+  var half: float64 = thickness * 0.5;
+  var span_x: float64 = bx - ax;
+  var span_y: float64 = by - ay;
+  var length_squared: float64 = span_x * span_x + span_y * span_y;
+  if (length_squared <= 0.0) {
+    paint_circle(canvas, ax, ay, half, color, alpha);
+    return;
+  }
+  var low_x: float64 = ax;
+  var high_x: float64 = bx;
+  if (low_x > high_x) { low_x = bx; high_x = ax; }
+  var low_y: float64 = ay;
+  var high_y: float64 = by;
+  if (low_y > high_y) { low_y = by; high_y = ay; }
+
+  var left: int32 = paint_clamp_int((int32)(low_x - half) - 1, 0, canvas->width);
+  var right: int32 = paint_clamp_int((int32)(high_x + half) + 2, 0, canvas->width);
+  var top: int32 = paint_clamp_int((int32)(low_y - half) - 1, 0, canvas->height);
+  var bottom: int32 = paint_clamp_int((int32)(high_y + half) + 2, 0, canvas->height);
+  var reach: float64 = half * half;
+
+  for y in top..bottom {
+    for x in left..right {
+      var hits: int32 = 0;
+      for sample_y in 0..4 {
+        var point_y: float64 = (float64)y + ((float64)sample_y + 0.5) * 0.25;
+        for sample_x in 0..4 {
+          var point_x: float64 = (float64)x + ((float64)sample_x + 0.5) * 0.25;
+          var to_x: float64 = point_x - ax;
+          var to_y: float64 = point_y - ay;
+          var along: float64 = (to_x * span_x + to_y * span_y) / length_squared;
+          if (along < 0.0) { along = 0.0; }
+          if (along > 1.0) { along = 1.0; }
+          var gap_x: float64 = to_x - along * span_x;
+          var gap_y: float64 = to_y - along * span_y;
+          if (gap_x * gap_x + gap_y * gap_y <= reach) { hits = hits + 1; }
+        }
+      }
+      if (hits > 0) { paint_blend(canvas, x, y, color, alpha * hits / 16); }
+    }
+  }
+}
+
+fn paint_edge(px: float64, py: float64, ax: float64, ay: float64, bx: float64, by: float64) -> float64 {
+  return (px - bx) * (ay - by) - (ax - bx) * (py - by);
+}
+
+fn paint_triangle(canvas: Canvas*, ax: float64, ay: float64, bx: float64, by: float64,
+                  cx: float64, cy: float64, color: uint32, alpha: int32) {
+  if (alpha <= 0) { return; }
+  var low_x: float64 = ax;
+  if (bx < low_x) { low_x = bx; }
+  if (cx < low_x) { low_x = cx; }
+  var high_x: float64 = ax;
+  if (bx > high_x) { high_x = bx; }
+  if (cx > high_x) { high_x = cx; }
+  var low_y: float64 = ay;
+  if (by < low_y) { low_y = by; }
+  if (cy < low_y) { low_y = cy; }
+  var high_y: float64 = ay;
+  if (by > high_y) { high_y = by; }
+  if (cy > high_y) { high_y = cy; }
+
+  var left: int32 = paint_clamp_int((int32)low_x - 1, 0, canvas->width);
+  var right: int32 = paint_clamp_int((int32)high_x + 2, 0, canvas->width);
+  var top: int32 = paint_clamp_int((int32)low_y - 1, 0, canvas->height);
+  var bottom: int32 = paint_clamp_int((int32)high_y + 2, 0, canvas->height);
+
+  for y in top..bottom {
+    for x in left..right {
+      var hits: int32 = 0;
+      for sample_y in 0..4 {
+        var point_y: float64 = (float64)y + ((float64)sample_y + 0.5) * 0.25;
+        for sample_x in 0..4 {
+          var point_x: float64 = (float64)x + ((float64)sample_x + 0.5) * 0.25;
+          var first: float64 = paint_edge(point_x, point_y, ax, ay, bx, by);
+          var second: float64 = paint_edge(point_x, point_y, bx, by, cx, cy);
+          var third: float64 = paint_edge(point_x, point_y, cx, cy, ax, ay);
+          var negative: int32 = 0;
+          var positive: int32 = 0;
+          if (first < 0.0) { negative = 1; }
+          if (second < 0.0) { negative = 1; }
+          if (third < 0.0) { negative = 1; }
+          if (first > 0.0) { positive = 1; }
+          if (second > 0.0) { positive = 1; }
+          if (third > 0.0) { positive = 1; }
+          if (negative == 0 || positive == 0) { hits = hits + 1; }
+        }
+      }
+      if (hits > 0) { paint_blend(canvas, x, y, color, alpha * hits / 16); }
+    }
+  }
+}
+
+fn paint_arc(canvas: Canvas*, center_x: float64, center_y: float64, inner: float64,
+             outer: float64, spread: float64, color: uint32, alpha: int32) {
+  if (alpha <= 0) { return; }
+  var left: int32 = paint_clamp_int((int32)(center_x - outer) - 1, 0, canvas->width);
+  var right: int32 = paint_clamp_int((int32)(center_x + outer) + 2, 0, canvas->width);
+  var top: int32 = paint_clamp_int((int32)(center_y - outer) - 1, 0, canvas->height);
+  var bottom: int32 = paint_clamp_int((int32)(center_y + outer) + 2, 0, canvas->height);
+  var near: float64 = inner * inner;
+  var far: float64 = outer * outer;
+
+  for y in top..bottom {
+    for x in left..right {
+      var hits: int32 = 0;
+      for sample_y in 0..4 {
+        var point_y: float64 = (float64)y + ((float64)sample_y + 0.5) * 0.25;
+        var offset_y: float64 = point_y - center_y;
+        for sample_x in 0..4 {
+          var point_x: float64 = (float64)x + ((float64)sample_x + 0.5) * 0.25;
+          var offset_x: float64 = point_x - center_x;
+          if (offset_x <= 0.0) { continue; }
+          var distance: float64 = offset_x * offset_x + offset_y * offset_y;
+          if (distance < near || distance > far) { continue; }
+          if (offset_y * offset_y > offset_x * offset_x * spread) { continue; }
+          hits = hits + 1;
+        }
+      }
+      if (hits > 0) { paint_blend(canvas, x, y, color, alpha * hits / 16); }
+    }
+  }
+}

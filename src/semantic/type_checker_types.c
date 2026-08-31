@@ -18,10 +18,33 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
   if (!checker || !name)
     return NULL;
 
-  const char *lbracket = strchr(name, '[');
-  const char *rbracket = lbracket ? strchr(lbracket, ']') : NULL;
-  if (!lbracket || !rbracket || rbracket[1] != '\0') {
-    return NULL;
+  /* The suffix is the last bracket group, found from the end so a bracket
+   * inside the element type is not mistaken for it: the element of
+   * `(fn(int32[4]) -> int32)[2]` is the whole parenthesised function type. */
+  const char *lbracket = NULL;
+  const char *rbracket = NULL;
+  {
+    size_t length = strlen(name);
+    const char *scan;
+    int depth = 0;
+    if (length == 0 || name[length - 1] != ']') {
+      return NULL;
+    }
+    rbracket = name + length - 1;
+    for (scan = rbracket; scan >= name; scan--) {
+      if (*scan == ']') {
+        depth++;
+      } else if (*scan == '[') {
+        depth--;
+        if (depth == 0) {
+          lbracket = scan;
+          break;
+        }
+      }
+    }
+    if (!lbracket) {
+      return NULL;
+    }
   }
 
   size_t base_len = (size_t)(lbracket - name);
@@ -827,6 +850,38 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
   if (strcmp(name, "Kind") == 0) {
     type_checker_register_kind_enum(checker);
     return checker->builtin_kind;
+  }
+
+  /* A parenthesised type. Bare, it is the type inside; suffixed, the array and
+   * pointer branches below strip the suffix and land back here on the head. */
+  if (name[0] == '(') {
+    const char *scan;
+    const char *close = NULL;
+    int depth = 0;
+    for (scan = name; *scan; scan++) {
+      if (*scan == '(') {
+        depth++;
+      } else if (*scan == ')') {
+        depth--;
+        if (depth == 0) {
+          close = scan;
+          break;
+        }
+      }
+    }
+    if (close && close[1] == '\0') {
+      size_t inner_len = (size_t)(close - name) - 1;
+      char *inner = malloc(inner_len + 1);
+      Type *inner_type;
+      if (!inner) {
+        return NULL;
+      }
+      memcpy(inner, name + 1, inner_len);
+      inner[inner_len] = '\0';
+      inner_type = type_checker_get_type_by_name(checker, inner);
+      free(inner);
+      return inner_type;
+    }
   }
 
   // Check for function pointer types: fn(...)->R (thin) or Fn(...)->R (closure).

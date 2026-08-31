@@ -64,6 +64,9 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   checker->tracked_scope_depth = 0;
   checker->tracked_buffer_extents = NULL;
   checker->aggregate_target_type = NULL;
+  checker->struct_placeholders = NULL;
+  checker->struct_placeholder_count = 0;
+  checker->struct_placeholder_capacity = 0;
 
   // Initialize built-in type pointers to NULL
   checker->builtin_int8 = NULL;
@@ -167,6 +170,7 @@ void type_checker_destroy(TypeChecker *checker) {
     type_destroy(checker->builtin_field);
     type_destroy(checker->builtin_sequence);
     free(checker->type_table);
+    free(checker->struct_placeholders);
     type_checker_expansions_destroy(checker->expansions);
     free(checker->comptime_bindings);
     type_checker_sequences_destroy(checker->sequences);
@@ -333,6 +337,83 @@ static int type_text_names(const char *text, const char *what) {
   return 0;
 }
 
+/* Does this type text name `what` somewhere a stored value of `what` has to
+ * be there, rather than a pointer to one? `Span` and `Span[4]` do; `Span*` and
+ * `Span*[4]` do not. A pointer needs the name to exist and nothing more, which
+ * is what lets a cycle of pointers be registered at all. */
+static int type_text_names_by_value(const char *text, const char *what) {
+  size_t length;
+  const char *at;
+
+  if (!text || !what || !*what) {
+    return 0;
+  }
+  length = strlen(what);
+  for (at = strstr(text, what); at; at = strstr(at + 1, what)) {
+    const char *after;
+    int left_ok = at == text || (!isalnum((unsigned char)at[-1]) &&
+                                 at[-1] != '_');
+    char right = at[length];
+    int right_ok = !isalnum((unsigned char)right) && right != '_';
+    if (!left_ok || !right_ok) {
+      continue;
+    }
+    after = at + length;
+    for (;;) {
+      while (*after == ' ' || *after == '	') {
+        after++;
+      }
+      if (*after == '[') {
+        const char *close = strchr(after, ']');
+        if (!close) {
+          break;
+        }
+        after = close + 1;
+        continue;
+      }
+      break;
+    }
+    if (*after == '*') {
+      continue;
+    }
+    return 1;
+  }
+  return 0;
+}
+
+/* Does `decl` store a value of `name`, so that its own size depends on it? */
+static int type_decl_holds_by_value(const ASTNode *decl, const char *name) {
+  size_t i;
+  if (!decl || !name) {
+    return 0;
+  }
+  if (decl->type == AST_STRUCT_DECLARATION) {
+    const StructDeclaration *s = (const StructDeclaration *)decl->data;
+    if (!s) {
+      return 0;
+    }
+    for (i = 0; i < s->field_count; i++) {
+      if (type_text_names_by_value(s->field_types ? s->field_types[i] : NULL,
+                                   name)) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (decl->type == AST_ENUM_DECLARATION) {
+    const EnumDeclaration *en = (const EnumDeclaration *)decl->data;
+    if (!en) {
+      return 0;
+    }
+    for (i = 0; i < en->variant_count; i++) {
+      if (type_text_names_by_value(en->variants[i].payload_type, name)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 /* Does `decl` refer to `name` in a field type or a variant payload? */
 static int type_decl_refers_to(const ASTNode *decl, const char *name) {
   size_t i;
@@ -441,6 +522,50 @@ static int type_checker_register_types(TypeChecker *checker, Program *prog,
       type_checker_leave_expansion_decl(checker, &expansion);
     }
     if (settled == 0) {
+      /* Nothing moved, so what is left refers to itself in a circle. A circle
+       * of pointers is a shape a program is entitled to write, and it has no
+       * order that puts every name before its use, so the names are declared
+       * first and the fields filled in afterwards. A circle that stores values
+       * has no layout at all and is reported here, once, naming both ends. */
+      for (i = 0; i < prog->declaration_count; i++) {
+        const char *self;
+        if (!pending[i]) {
+          continue;
+        }
+        self = type_decl_name(prog->declarations[i]);
+        if (!self) {
+          continue;
+        }
+        for (j = 0; j < prog->declaration_count; j++) {
+          const char *other;
+          if (j == i || !pending[j]) {
+            continue;
+          }
+          other = type_decl_name(prog->declarations[j]);
+          if (!other || !type_decl_holds_by_value(prog->declarations[i],
+                                                  other) ||
+              !type_decl_holds_by_value(prog->declarations[j], self)) {
+            continue;
+          }
+          type_checker_set_error_at_location(
+              checker, prog->declarations[i]->location,
+              "'%s' and '%s' each store a value of the other, so neither has "
+              "a size. Hold one of them by pointer: '%s*'",
+              self, other, other);
+          ok = 0;
+          pending[i] = 0;
+          pending[j] = 0;
+          remaining -= 2;
+          break;
+        }
+      }
+      for (i = 0; i < prog->declaration_count; i++) {
+        if (pending[i] &&
+            prog->declarations[i]->type == AST_STRUCT_DECLARATION) {
+          type_checker_declare_struct_placeholder(checker,
+                                                  prog->declarations[i]);
+        }
+      }
       break;
     }
   }

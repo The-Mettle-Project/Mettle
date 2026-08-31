@@ -11,20 +11,21 @@ A tagged-enum variant carries at most one payload. `Circle(float64)` works;
 `switch` cases fall through into the next case. End each one with `break`
 unless you mean the fall-through.
 
-An array of function pointers cannot be spelled directly. In
-`fn(int32) -> int32[2]`, the `int32[2]` parses as the return type. Put the
-entries in a struct, which is the usual shape for a dispatch table.
-
 A generic call names its type arguments: `id<int64>(7)`. Nothing is inferred
 from the argument.
 
 An array is one-dimensional. `int64[3][4]` does not parse; index a flat
 `int64[12]` yourself.
 
-A type may name one declared later in the file, but two types cannot point at
-each other: `struct A { b: B*; }` above `struct B { a: A*; }` reports `Unknown
-type 'B*'`. A type pointing at itself works. Put both ends behind one type, or
-reach the second through `rawptr`.
+Two types may point at each other. `struct A { b: B*; }` above
+`struct B { a: A*; }` compiles, as does a longer cycle and an enum whose
+payload points at a struct that stores the enum by value. What has no size is a
+cycle that stores values rather than pointers, and that is reported:
+
+```text
+error[E0003]: 'A' and 'B' each store a value of the other, so neither has a
+size. Hold one of them by pointer: 'B*'
+```
 
 ## Aggregate literals
 

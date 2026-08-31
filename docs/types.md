@@ -295,6 +295,15 @@ captures nothing:
 var dbl: fn(int32) -> int32 = fn(x: int32) -> int32 { return x * 2; };
 ```
 
+A suffix binds to where it sits, so the `[2]` in `fn(int32) -> int32[2]` is
+part of the return type. Parentheses group what the suffix binds to, which is
+how a dispatch table is spelled:
+
+```mettle
+var table: (fn(int32) -> int32)[2];
+table[0] = &add_one;
+```
+
 `Fn(A, B) -> R` is a closure. It may capture locals from where it was written,
 and it carries an environment alongside the code address:
 

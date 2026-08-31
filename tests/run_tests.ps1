@@ -2275,6 +2275,7 @@ $cases = @(
   @{ Name = "err_null_deref_const"; Path = "tests/err_null_deref_const.mettle"; ShouldSucceed = $false; Pattern = "Null pointer dereference" },
   @{ Name = "member_through_ptr"; Path = "tests/err_codegen_member_expr.mettle"; ShouldSucceed = $true },
   @{ Name = "err_enum_payload_unknown"; Path = "tests/err_enum_payload_unknown.mettle"; ShouldSucceed = $false; Pattern = "carries a payload of unknown type" },
+  @{ Name = "err_struct_value_cycle"; Path = "tests/err_struct_value_cycle.mettle"; ShouldSucceed = $false; Pattern = "each store a value of the other" },
   @{ Name = "err_function_arg_count"; Path = "tests/err_function_arg_count.mettle"; ShouldSucceed = $false; Pattern = "expects .* arguments, got" },
   @{ Name = "err_function_arg_type"; Path = "tests/err_function_arg_type.mettle"; ShouldSucceed = $false; Pattern = "Type mismatch" },
   @{ Name = "err_gpu_kernel_return"; Path = "tests/err_gpu_kernel_return.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel 'invalid_result' must return void" },
@@ -13659,6 +13660,10 @@ $runFixtures = @(
      What = "a nested generic instantiation was wrong" },
   @{ Name = "keyword_field_names"; Path = "tests/codegen/keyword_field_names.mettle"
      What = "a mnemonic-named field read back wrong" },
+  @{ Name = "recursive_types"; Path = "tests/codegen/recursive_types.mettle"
+     What = "a cycle of types came out with the wrong layout" },
+  @{ Name = "fn_pointer_arrays"; Path = "tests/codegen/fn_pointer_arrays.mettle"
+     What = "an array of function pointers dispatched wrong" },
   @{ Name = "struct_methods"; Path = "tests/codegen/struct_methods.mettle"
      What = "a struct method body behaved wrong" },
   @{ Name = "unsigned_fold"; Path = "tests/codegen/unsigned_fold.mettle"

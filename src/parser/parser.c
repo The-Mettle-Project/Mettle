@@ -2618,6 +2618,41 @@ static char *parser_parse_type_annotation(Parser *parser) {
     return parser_parse_volatile_type(parser);
   }
 
+  /* A parenthesised type groups what a suffix binds to. `fn(int32) -> int32[2]`
+   * reads the array as the return type, because that is where the suffix sits;
+   * `(fn(int32) -> int32)[2]` is the array of function pointers. The
+   * parentheses stay in the text so the resolver sees the same grouping. */
+  if (parser->current_token.type == TOKEN_LPAREN) {
+    char *inner;
+    char *grouped;
+    size_t grouped_len;
+    parser_advance(parser);
+    inner = parser_parse_type_annotation(parser);
+    if (!inner) {
+      parser_set_error(parser, "Expected a type after '(' in a type");
+      return NULL;
+    }
+    if (parser->current_token.type != TOKEN_RPAREN) {
+      parser_set_error(parser, "Expected ')' after a parenthesised type");
+      free(inner);
+      return NULL;
+    }
+    parser_advance(parser);
+    grouped_len = strlen(inner) + 3;
+    grouped = malloc(grouped_len);
+    if (!grouped) {
+      free(inner);
+      return NULL;
+    }
+    snprintf(grouped, grouped_len, "(%s)", inner);
+    free(inner);
+    grouped = parser_parse_pointer_suffix(parser, grouped);
+    if (!grouped) {
+      return NULL;
+    }
+    return parser_parse_array_suffix(parser, grouped);
+  }
+
   is_closure_fn = parser_at_closure_type(parser);
   if (parser->current_token.type == TOKEN_FN || is_closure_fn) {
     type_name = parser_parse_function_pointer_type(parser, is_closure_fn);

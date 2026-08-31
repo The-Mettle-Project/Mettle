@@ -1,9 +1,7 @@
 enum List {
   Nil,
-  Cons(Cell*)
+  Cons(Missing*)
 }
-
-struct Cell { head: int64; tail: List; }
 
 fn main() -> int32 {
   return 0;

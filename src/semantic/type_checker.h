@@ -108,6 +108,14 @@ typedef struct {
    * initializes - so the caller that knows that type parks it here for the one
    * inference call that may see the literal. Consumed (cleared) on read. */
   Type *aggregate_target_type;
+  /* Struct types registered as empty placeholders so a cycle of pointers can
+     resolve. A cycle has no order that puts every name before its use, so the
+     names are all declared first and the fields filled in afterwards. Each
+     entry is claimed by the declaration it stands for and dropped from the
+     list, so a real duplicate still reports itself. */
+  Type **struct_placeholders;
+  size_t struct_placeholder_count;
+  size_t struct_placeholder_capacity;
 } TypeChecker;
 
 // Function declarations
@@ -361,6 +369,14 @@ int type_checker_reject_no_runtime_repr(TypeChecker *checker,
 int type_checker_reject_comptime_escape(TypeChecker *checker,
                                         SourceLocation location,
                                         const Type *type);
+
+/* Register `struct_decl`'s name as an empty struct type, so a field spelled
+   as a pointer to it resolves before its own fields are known. The next call
+   to type_checker_process_struct_declaration for that name fills it in place.
+   Returns 0 only on allocation failure; a name already declared is left
+   alone, so the duplicate is reported where it always was. */
+int type_checker_declare_struct_placeholder(TypeChecker *checker,
+                                            ASTNode *struct_decl);
 
 // Struct type processing functions
 int type_checker_process_struct_declaration(TypeChecker *checker,

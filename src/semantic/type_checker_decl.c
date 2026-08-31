@@ -204,6 +204,73 @@ static int gpu_kernel_parameter_type(const Type *type) {
 
 // Struct type processing functions
 
+static int type_checker_claim_struct_placeholder(TypeChecker *checker,
+                                                 const Type *type) {
+  size_t i;
+  if (!checker || !type) {
+    return 0;
+  }
+  for (i = 0; i < checker->struct_placeholder_count; i++) {
+    if (checker->struct_placeholders[i] == type) {
+      checker->struct_placeholders[i] =
+          checker->struct_placeholders[checker->struct_placeholder_count - 1];
+      checker->struct_placeholder_count--;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int type_checker_declare_struct_placeholder(TypeChecker *checker,
+                                            ASTNode *struct_decl) {
+  StructDeclaration *decl;
+  Type *struct_type;
+  Symbol *struct_symbol;
+  Type **grown;
+
+  if (!checker || !struct_decl ||
+      struct_decl->type != AST_STRUCT_DECLARATION) {
+    return 0;
+  }
+  decl = (StructDeclaration *)struct_decl->data;
+  if (!decl || !decl->name || decl->type_param_count > 0) {
+    return 1;
+  }
+  if (symbol_table_lookup_current_scope(checker->symbol_table, decl->name)) {
+    return 1;
+  }
+
+  struct_type = type_create(TYPE_STRUCT, decl->name);
+  if (!struct_type) {
+    return 0;
+  }
+  struct_symbol = symbol_create(decl->name, SYMBOL_STRUCT, struct_type);
+  if (!struct_symbol) {
+    type_destroy(struct_type);
+    return 0;
+  }
+  if (!symbol_table_declare(checker->symbol_table, struct_symbol)) {
+    symbol_destroy(struct_symbol);
+    return 0;
+  }
+
+  if (checker->struct_placeholder_count ==
+      checker->struct_placeholder_capacity) {
+    size_t capacity = checker->struct_placeholder_capacity
+                          ? checker->struct_placeholder_capacity * 2
+                          : 8;
+    grown = realloc(checker->struct_placeholders, capacity * sizeof(Type *));
+    if (!grown) {
+      return 0;
+    }
+    checker->struct_placeholders = grown;
+    checker->struct_placeholder_capacity = capacity;
+  }
+  checker->struct_placeholders[checker->struct_placeholder_count++] =
+      struct_type;
+  return 1;
+}
+
 int type_checker_process_struct_declaration(TypeChecker *checker,
                                             ASTNode *struct_decl) {
   if (!checker || !struct_decl || struct_decl->type != AST_STRUCT_DECLARATION) {
@@ -224,10 +291,15 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
   // Check if struct already exists
   Symbol *existing =
       symbol_table_lookup_current_scope(checker->symbol_table, decl->name);
+  Type *placeholder = NULL;
   if (existing) {
-    type_checker_report_duplicate_declaration(checker, struct_decl->location,
-                                              decl->name);
-    return 0;
+    if (type_checker_claim_struct_placeholder(checker, existing->type)) {
+      placeholder = existing->type;
+    } else {
+      type_checker_report_duplicate_declaration(checker, struct_decl->location,
+                                                decl->name);
+      return 0;
+    }
   }
 
   /* Self-referential structs (e.g. `next: Foo*` inside `struct Foo`) need
@@ -236,20 +308,22 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
    * parser only requires the base Type pointer to exist, not for its fields
    * to be populated. We fill in the field information in place once the
    * field types have all resolved. */
-  Type *struct_type = type_create(TYPE_STRUCT, decl->name);
+  Type *struct_type = placeholder;
   if (!struct_type) {
-    return 0;
-  }
-
-  Symbol *struct_symbol = symbol_create(decl->name, SYMBOL_STRUCT, struct_type);
-  if (!struct_symbol) {
-    type_destroy(struct_type);
-    return 0;
-  }
-
-  if (!symbol_table_declare(checker->symbol_table, struct_symbol)) {
-    symbol_destroy(struct_symbol);
-    return 0;
+    Symbol *struct_symbol;
+    struct_type = type_create(TYPE_STRUCT, decl->name);
+    if (!struct_type) {
+      return 0;
+    }
+    struct_symbol = symbol_create(decl->name, SYMBOL_STRUCT, struct_type);
+    if (!struct_symbol) {
+      type_destroy(struct_type);
+      return 0;
+    }
+    if (!symbol_table_declare(checker->symbol_table, struct_symbol)) {
+      symbol_destroy(struct_symbol);
+      return 0;
+    }
   }
 
   // Resolve field types now that the placeholder is visible.

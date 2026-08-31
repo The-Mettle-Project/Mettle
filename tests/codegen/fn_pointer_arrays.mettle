@@ -1,0 +1,47 @@
+// `fn(int32) -> int32[2]` reads the array as the return type, because that is
+// where the suffix sits. Parentheses group what a suffix binds to, so
+// `(fn(int32) -> int32)[2]` is the array of function pointers, and a dispatch
+// table can be spelled directly.
+
+fn add_one(x: int32) -> int32 { return x + 1; }
+fn double_it(x: int32) -> int32 { return x * 2; }
+fn negate(x: int32) -> int32 { return 0 - x; }
+
+struct Handlers { table: (fn(int32) -> int32)[3]; count: int32; }
+
+const TABLE: (fn(int32) -> int32)[3] = [ &add_one, &double_it, &negate ];
+
+fn apply_all(fns: (fn(int32) -> int32)*, n: int32, seed: int32) -> int32 {
+  var total: int32 = 0;
+  for i in 0..n { total = total + fns[i](seed); }
+  return total;
+}
+
+fn main() -> int32 {
+  var local: (fn(int32) -> int32)[3];
+  local[0] = &add_one;
+  local[1] = &double_it;
+  local[2] = &negate;
+  if (local[0](10) != 11) { return 1; }
+  if (local[1](10) != 20) { return 2; }
+  if (local[2](10) != -10) { return 3; }
+
+  var total: int32 = 0;
+  for i in 0..3 { total = total + local[i](4); }
+  if (total != 9) { return 4; }
+
+  if (TABLE[0](7) != 8) { return 5; }
+  if (TABLE[2](7) != -7) { return 6; }
+
+  var h: Handlers;
+  h.count = 2;
+  h.table[0] = &double_it;
+  h.table[1] = &add_one;
+  if (h.table[0](6) + h.table[1](6) != 19) { return 7; }
+
+  if (apply_all(&local[0], 3, 5) != 11) { return 8; }
+
+  var ret_array: fn(int32) -> int32 = &add_one;
+  if (ret_array(1) != 2) { return 9; }
+  return 0;
+}

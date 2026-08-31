@@ -1,0 +1,64 @@
+// A cycle of types has no order that puts every name before its use, so the
+// names are registered before any field is resolved. Two structs pointing at
+// each other, a three-step cycle, and an enum whose payload points at a struct
+// that stores the enum by value all have to come out with the right layout.
+
+struct Node { next: Node*; value: int32; }
+
+struct Room { exit: Door*; id: int32; }
+struct Door { back: Room*; id: int32; }
+
+struct Alpha { b: Beta*; tag: int32; }
+struct Beta { c: Gamma*; tag: int32; }
+struct Gamma { a: Alpha*; tag: int32; }
+
+enum List { Nil, Cons(Cell*) }
+struct Cell { head: int64; tail: List; }
+
+fn main() -> int32 {
+  var a: Room;
+  var b: Door;
+  a.id = 3;
+  b.id = 4;
+  a.exit = &b;
+  b.back = &a;
+  if (a.exit->id != 4) { return 1; }
+  if (b.back->id != 3) { return 2; }
+  if (a.exit->back->id != 3) { return 3; }
+
+  var x: Alpha;
+  var y: Beta;
+  var z: Gamma;
+  x.tag = 1; y.tag = 2; z.tag = 3;
+  x.b = &y; y.c = &z; z.a = &x;
+  if (x.b->c->a->tag != 1) { return 4; }
+  if (x.b->tag + y.c->tag != 5) { return 5; }
+
+  var head: Node;
+  var tail: Node;
+  head.value = 10;
+  tail.value = 20;
+  head.next = &tail;
+  tail.next = &head;
+  if (head.next->value != 20) { return 6; }
+
+  var first: Cell;
+  var second: Cell;
+  first.head = 1;
+  second.head = 2;
+  second.tail = Nil;
+  first.tail = Cons(&second);
+  var total: int64 = 0;
+  var walk: List = Cons(&first);
+  var steps: int32 = 0;
+  while (steps < 8) {
+    steps = steps + 1;
+    match (walk) {
+      case Cons(c): { total = total + c->head; walk = c->tail; }
+      case Nil: { steps = 99; }
+    }
+  }
+  if (total != 3) { return 7; }
+  if (sizeof(Room) != 16) { return 8; }
+  return 0;
+}
