@@ -1655,6 +1655,12 @@ $cases = @(
   # int8/int16 loads widened with movzx whatever the element said, so a[0] set
   # to -1 read back as 255 and the answer moved with the optimization level.
   @{ Name = "narrow_signed_loads"; Path = "tests/test_narrow_signed_loads.mettle"; ShouldSucceed = $true },
+  # char is an unsigned byte, and a load of one must zero-extend. It was left
+  # out of ir_load_apply_unsigned, so a byte from 0x80 up sign-extended when
+  # the load fed an expression directly while assigning through a char local
+  # zero-extended: `s[1] == 195` was false and `var c: char = s[1]; c == 195`
+  # was true, for the same byte.
+  @{ Name = "char_load_unsigned"; Path = "tests/test_char_load_unsigned.mettle"; ShouldSucceed = $true },
   @{ Name = "integer_literal_wide"; Path = "tests/test_integer_literal_wide.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_mixed_locals"; Path = "tests/test_stack_mixed_locals.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_large_struct"; Path = "tests/test_stack_large_struct.mettle"; ShouldSucceed = $true },

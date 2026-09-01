@@ -1,0 +1,68 @@
+// `char` is an unsigned byte, and a load of one has to zero-extend.
+//
+// ir_load_apply_unsigned listed uint8/16/32/64 but not char, so a byte from
+// 0x80 up sign-extended -- but only when the load fed an expression directly.
+// Assigning through a declared `char` local went the other way:
+//
+//   var c: char = s[1];  c == 195        // true
+//   s[1] == 195                          // false
+//   (int32)s[1]                          // -61
+//
+// So every non-ASCII byte of a UTF-8 string read differently depending on
+// whether it was stored first, which is the shape a UTF-8 decoder is written
+// in. bool is in the same class and is checked here too.
+import "std/conv";
+
+fn main() -> int32 {
+  var u: string = "héllo";
+  if (u.length != 6) { return 1; }
+
+  // Inline, which is the path that was wrong.
+  if (u[1] != 195) { return 2; }
+  if (u[2] != 169) { return 3; }
+  if ((int32)u[1] != 195) { return 4; }
+  if ((int64)u[2] != 169) { return 5; }
+
+  // Through a local, which was already right; the two must agree.
+  var c1: char = u[1];
+  var c2: char = u[2];
+  if (c1 != 195 || c2 != 169) { return 6; }
+  if ((int32)c1 != (int32)u[1]) { return 7; }
+  if ((int32)c2 != (int32)u[2]) { return 8; }
+
+  // A whole-string byte sum, the shape a decoder uses.
+  var e: string = "日本";
+  if (e.length != 6) { return 9; }
+  var total: int32 = 0;
+  for ch in e { total = total + (int32)ch; }
+  if (total != 1104) { return 10; }
+
+  var indexed: int32 = 0;
+  for i in 0..6 { indexed = indexed + (int32)e[i]; }
+  if (indexed != 1104) { return 11; }
+  if (indexed != total) { return 12; }
+
+  // A char array element, and a char through a pointer.
+  var bytes: char[4];
+  bytes[0] = (char)200;
+  bytes[1] = (char)7;
+  if ((int32)bytes[0] != 200) { return 13; }
+  if (bytes[0] != 200) { return 14; }
+  var p: char* = &bytes[0];
+  if ((int32)p[0] != 200) { return 15; }
+  if (p[0] != 200) { return 16; }
+
+  // ASCII is unaffected either way.
+  if (u[0] != 'h') { return 17; }
+  if ((int32)u[0] != 104) { return 18; }
+  if (is_alpha(u[0]) != true) { return 19; }
+
+  // bool loads zero-extend, which is the same class.
+  var flags: bool[2];
+  flags[0] = true;
+  flags[1] = false;
+  if ((int32)flags[0] != 1) { return 20; }
+  if ((int32)flags[1] != 0) { return 21; }
+
+  return 0;
+}
