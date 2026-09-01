@@ -27,7 +27,7 @@ const PRINTABLE_LAST: uint8 = 126
 var vendor: uint8[16]
 
 fn cmd_help(argument: cstring) {
-    shell_help()
+    shell_help(argument)
 }
 
 fn cmd_clear(argument: cstring) {
@@ -590,7 +590,7 @@ fn cmd_halt(argument: cstring) {
 
 export fn commands_init() {
     fs_commands_init()
-    shell_register("help", "this list", &cmd_help)
+    shell_register("help", "the command list, or one command", &cmd_help)
     shell_register("clear", "wipe the screen", &cmd_clear)
     shell_register("echo", "print the rest of the line", &cmd_echo)
     shell_register("mem", "memory map, free pages, heap", &cmd_mem)
