@@ -19,9 +19,19 @@ int ir_operand_clone(const IROperand *source, IROperand *out) {
   out->float_bits = source->float_bits;
 
   switch (source->kind) {
+  case IR_OPERAND_STRING:
+    if (!source->name) {
+      return 0;
+    }
+    out->name =
+        ir_copy_literal_bytes(source->name, ir_operand_string_length(source));
+    if (!out->name) {
+      *out = ir_operand_none();
+      return 0;
+    }
+    break;
   case IR_OPERAND_TEMP:
   case IR_OPERAND_SYMBOL:
-  case IR_OPERAND_STRING:
   case IR_OPERAND_LABEL:
     if (!source->name) {
       return 0;
@@ -1352,9 +1362,16 @@ int ir_operand_equals(const IROperand *lhs, const IROperand *rhs) {
      * as the default 64 so legacy float64-only IR keeps matching. */
     return lhs->float_value == rhs->float_value &&
            ((lhs->float_bits == 32) == (rhs->float_bits == 32));
+  case IR_OPERAND_STRING: {
+    size_t lhs_length = ir_operand_string_length(lhs);
+    if (!lhs->name || !rhs->name) {
+      return 0;
+    }
+    return lhs_length == ir_operand_string_length(rhs) &&
+           memcmp(lhs->name, rhs->name, lhs_length) == 0;
+  }
   case IR_OPERAND_TEMP:
   case IR_OPERAND_SYMBOL:
-  case IR_OPERAND_STRING:
   case IR_OPERAND_LABEL:
     if (!lhs->name || !rhs->name) {
       return 0;
@@ -1518,9 +1535,14 @@ static size_t ir_expr_operand_hash(const IROperand *operand) {
   case IR_OPERAND_INT:
     h ^= (size_t)operand->int_value * 1099511628211u;
     break;
+  case IR_OPERAND_STRING:
+    if (operand->name) {
+      h ^= (size_t)mettle_fnv1a_hash(operand->name);
+      h ^= (size_t)ir_operand_string_length(operand) * 2654435761u;
+    }
+    break;
   case IR_OPERAND_TEMP:
   case IR_OPERAND_SYMBOL:
-  case IR_OPERAND_STRING:
   case IR_OPERAND_LABEL:
     if (operand->name) {
       h ^= (size_t)mettle_fnv1a_hash(operand->name);

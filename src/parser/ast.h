@@ -394,6 +394,11 @@ typedef struct {
 
 typedef struct {
   char *value;
+  /* Byte length, which is not strlen: `\0` is a legal escape, so a literal may
+   * carry an interior NUL. `value` still ends in a NUL so the passes that only
+   * want a name (an import path, a diagnostic) can keep reading it as a C
+   * string; the ones that build the {chars, length} record read this. */
+  size_t length;
 } StringLiteral;
 
 typedef struct {
@@ -440,6 +445,7 @@ typedef struct {
   size_t offset;  // byte offset into the image
   char *symbol;   // module symbol whose address goes here (`&f`, `&g`)
   char *string;   // string-literal bytes to emit and point at
+  size_t string_length;
   /* A `string` value is a pointer to a { chars, length } record, so the slot
    * points at a record the backend builds; a `cstring` points straight at the
    * characters. Only meaningful when `string` is set. */
@@ -622,7 +628,8 @@ ASTNode *ast_create_number_literal(long long int_value,
                                    SourceLocation location,
                                    unsigned char int_radix);
 ASTNode *ast_create_float_literal(double float_value, SourceLocation location);
-ASTNode *ast_create_string_literal(const char *value, SourceLocation location);
+ASTNode *ast_create_string_literal(const char *value, size_t length,
+                                  SourceLocation location);
 ASTNode *ast_create_binary_expression(ASTNode *left, const char *op,
                                       ASTNode *right, SourceLocation location);
 ASTNode *ast_create_unary_expression(const char *op, ASTNode *operand,

@@ -575,6 +575,7 @@ static IRInitReloc *populate_aggregate_initializer(IRModuleSymbol *entry,
     relocs[r].offset = literal->relocs[r].offset;
     relocs[r].symbol = literal->relocs[r].symbol;
     relocs[r].string = literal->relocs[r].string;
+    relocs[r].string_length = literal->relocs[r].string_length;
     relocs[r].string_wants_record = literal->relocs[r].string_wants_record;
   }
   entry->init_relocs = relocs;
@@ -593,6 +594,7 @@ static void populate_scalar_initializer(IRProgram *program, TypeChecker *tc,
       StringLiteral *lit = (StringLiteral *)initializer->data;
       entry->has_initializer = 1;
       entry->init_string = lit && lit->value ? lit->value : "";
+      entry->init_string_length = lit && lit->value ? lit->length : 0;
     } else {
       entry->has_unfoldable_initializer = 1;
     }

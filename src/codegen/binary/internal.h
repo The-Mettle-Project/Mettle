@@ -742,7 +742,7 @@ int code_generator_binary_emit_float_call_argument( CodeGenerator *generator, Bi
 int code_generator_binary_emit_float_operand_to_xmm( CodeGenerator *generator, BinaryFunctionContext *context, const IROperand *operand, BinaryXmmRegister target_register);
 int code_generator_binary_emit_float_operand_to_xmm_bits( CodeGenerator *generator, BinaryFunctionContext *context, const IROperand *operand, BinaryXmmRegister target_register, int want_bits);
 int code_generator_binary_emit_float_reg_convert( BinaryFunctionContext *context, BinaryGpRegister gp_register, int src_bits, int dst_bits);
-int code_generator_binary_emit_global_string_variable( CodeGenerator *generator, const char *link_name, const char *value);
+int code_generator_binary_emit_global_string_variable( CodeGenerator *generator, const char *link_name, const char *value, size_t value_length);
 int code_generator_binary_emit_global_symbol_load( CodeGenerator *generator, BinaryFunctionContext *context, const char *symbol_name, MtlcType *type, int declare_external, BinaryGpRegister target_register);
 int code_generator_binary_emit_global_symbol_store( CodeGenerator *generator, BinaryFunctionContext *context, const char *symbol_name, MtlcType *type, int declare_external, BinaryGpRegister source_register);
 int code_generator_binary_emit_indirect_source_address( CodeGenerator *generator, BinaryFunctionContext *context, const IROperand *operand, BinaryGpRegister target_register);
@@ -850,7 +850,7 @@ int code_generator_binary_emit_simd_find( CodeGenerator *generator, BinaryFuncti
 int code_generator_binary_emit_simd_outer_lane_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_store(CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_store_to_address( CodeGenerator *generator, BinaryFunctionContext *context, BinaryGpRegister address_register, int size, BinaryGpRegister source_register);
-int code_generator_binary_emit_string_literal_value_address( CodeGenerator *generator, BinaryFunctionContext *context, const char *value, BinaryGpRegister target_register);
+int code_generator_binary_emit_string_literal_value_address( CodeGenerator *generator, BinaryFunctionContext *context, const char *value, size_t value_length, BinaryGpRegister target_register);
 int code_generator_binary_emit_string_symbol_load( CodeGenerator *generator, BinaryFunctionContext *context, const char *symbol_name, const CgSym *symbol, BinaryGpRegister target_register);
 int code_generator_binary_emit_struct_destination_address( CodeGenerator *generator, BinaryFunctionContext *context, const char *name, BinaryGpRegister target_register);
 int code_generator_binary_emit_symbol_address( CodeGenerator *generator, BinaryFunctionContext *context, const char *symbol_name, int declare_external, BinaryGpRegister target_register);

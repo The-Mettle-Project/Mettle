@@ -3230,7 +3230,11 @@ static MirVregId mir_emit_indirect_source_addr(MirFunction *fn,
   }
   if (op->kind == IR_OPERAND_STRING) {
     const char *s = op->name ? op->name : "";
-    if (!mir_emit1(fn, MIR_LEA_STRLIT, mir_op_vreg(base), mir_op_symbol(s),
+    /* imm carries the literal's byte length, which strlen cannot recover once
+     * the bytes hold an interior NUL. */
+    MirOperand lit = mir_op_symbol(s);
+    lit.imm = (long long)ir_operand_string_length(op);
+    if (!mir_emit1(fn, MIR_LEA_STRLIT, mir_op_vreg(base), lit,
                    mir_op_none(), 8, 0, 0)) {
       return MIR_VREG_NONE;
     }

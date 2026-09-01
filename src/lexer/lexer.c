@@ -1324,7 +1324,15 @@ Token token_clone(const Token *token) {
 
   clone = *token;
   if (token->value && !token->is_interned) {
-    clone.value = strdup(token->value);
+    size_t bytes = strlen(token->value);
+    if (token->lexeme.data == token->value && token->lexeme.length > bytes) {
+      bytes = token->lexeme.length;
+    }
+    clone.value = malloc(bytes + 1);
+    if (clone.value) {
+      memcpy(clone.value, token->value, bytes);
+      clone.value[bytes] = '\0';
+    }
     if (!clone.value) {
       clone.type = TOKEN_ERROR;
       clone.is_interned = 0;

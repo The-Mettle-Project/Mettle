@@ -1009,9 +1009,11 @@ static void emit_function_address(Arm64Emit *e, SlotMap *s, Arm64Reg rd,
  * as a pointer. (cstr("lit") is different, and is folded at its call site to
  * the characters' address, which is what a `cstring` is.) */
 static void emit_string_value(Arm64Emit *e, SlotMap *s, Arm64Reg dest,
-                              const char *str) {
-  if (!str) str = "";
-  size_t length = strlen(str);
+                              const char *str, size_t length) {
+  if (!str) {
+    str = "";
+    length = 0;
+  }
   if (s->object) {
     Arm64ObjectContext *object = s->object;
     char chars_symbol[64], record_symbol[64];
@@ -1086,7 +1088,7 @@ static Arm64Reg load_into(Arm64Emit *e, SlotMap *s, const IROperand *op,
     emit_imm(e, dest, ieee_bits(op));
     return dest;
   case IR_OPERAND_STRING:
-    emit_string_value(e, s, dest, op->name);
+    emit_string_value(e, s, dest, op->name, ir_operand_string_length(op));
     return dest;
   case IR_OPERAND_TEMP:
   case IR_OPERAND_SYMBOL: {
@@ -3412,7 +3414,7 @@ static int build_data_image(Arm64Data *d, const IRProgram *prog, Arm64Emit *e) {
 
     if (s->type->kind == MTLC_TYPE_STRING) {
       if (!s->has_initializer || !s->init_string) continue;
-      size_t length = strlen(s->init_string);
+      size_t length = s->init_string_length;
       size_t chars = data_reserve(d, length + 1, 1);
       if (chars == (size_t)-1) {
         arm64_fail(e, "out of memory storing the text of global '%s'", s->name);
@@ -3446,7 +3448,7 @@ static int build_data_image(Arm64Data *d, const IRProgram *prog, Arm64Emit *e) {
           }
           address = (uint64_t)ELF_DATA_VADDR + (uint64_t)target;
         } else {
-          size_t length = reloc->string ? strlen(reloc->string) : 0;
+          size_t length = reloc->string ? reloc->string_length : 0;
           size_t chars = data_reserve(d, length + 1, 1);
           if (chars == (size_t)-1) {
             arm64_fail(e, "out of memory storing a string in global '%s'",
@@ -3804,7 +3806,7 @@ static int arm64_object_emit_aggregate(Arm64ObjectContext *object,
 
     if (!target) {
       size_t chars_offset = 0;
-      size_t length = reloc->string ? strlen(reloc->string) : 0;
+      size_t length = reloc->string ? reloc->string_length : 0;
       snprintf(chars_symbol, sizeof(chars_symbol), ".Lmtlc.gstr.%u",
                object->string_id++);
       if (!binary_emitter_append_bytes(emitter, object->rodata_section,
@@ -3892,7 +3894,7 @@ static int arm64_object_emit_global(Arm64ObjectContext *object,
     if (symbol->has_initializer && symbol->init_string) {
       char chars_symbol[64];
       size_t chars_offset = 0;
-      size_t length = strlen(symbol->init_string);
+      size_t length = symbol->init_string_length;
       snprintf(chars_symbol, sizeof(chars_symbol), ".Lmtlc.gstr.%u",
                object->string_id++);
       if (!binary_emitter_append_bytes(

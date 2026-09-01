@@ -322,7 +322,7 @@ static int code_generator_binary_emit_global_aggregate_image(
       size_t rdata_section = binary_emitter_get_or_create_section(
           emitter, ".rdata", BINARY_SECTION_RDATA, 0, 8);
       size_t chars_offset = 0;
-      size_t length = reloc->string ? strlen(reloc->string) : 0;
+      size_t length = reloc->string ? reloc->string_length : 0;
       unsigned char terminator = 0;
 
       chars_label = code_generator_generate_label(generator, "str_chars");
@@ -458,7 +458,8 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
       return 0;
     }
     return code_generator_binary_emit_global_string_variable(
-        generator, link_name, sym->has_initializer ? sym->init_string : NULL);
+        generator, link_name, sym->has_initializer ? sym->init_string : NULL,
+        sym->has_initializer ? sym->init_string_length : 0);
   }
 
   /* Aggregates: a global struct, array or tagged enum either carries a folded

@@ -1,0 +1,78 @@
+// A `\0` inside a string literal is a byte like any other.
+//
+// `string` is a {chars, length} record, and `\0` is a documented escape, so a
+// literal can hold an interior NUL. Every layer measured the literal with
+// strlen instead of carrying its length, so "a\0b" arrived as the one-byte
+// string "a": the AST copy, the IR operand, the .rdata record's length field
+// and the interpreter's literal table all stopped at the NUL. The interpreter
+// and codegen agreed with each other and both were short.
+//
+// The two-literals check matters as much as the length one: "a" and "a\0b"
+// compare equal as C strings, so a table keyed on strcmp hands back the wrong
+// record for the second.
+
+const G_CONST: string = "g\0h";
+var g_var: string = "i\0j";
+const G_TABLE: string[2] = ["k\0l", "mn"];
+
+fn count_nul(s: string) -> int32 {
+  var n: int32 = 0;
+  for c in s {
+    if ((int32)c == 0) { n = n + 1; }
+  }
+  return n;
+}
+
+fn main() -> int32 {
+  var s: string = "a\0b";
+  if (s.length != (uint64)3) { return 1; }
+  if (s[0] != 'a') { return 2; }
+  if ((int32)s[1] != 0) { return 3; }
+  if (s[2] != 'b') { return 4; }
+  if (count_nul(s) != 1) { return 5; }
+
+  // A prefix of the above, which a strcmp-keyed literal table would confuse
+  // with it.
+  var prefix: string = "a";
+  if (prefix.length != (uint64)1) { return 6; }
+  if (s.length != (uint64)3) { return 7; }
+
+  // A literal that is nothing but the NUL, and the empty string beside it.
+  var only: string = "\0";
+  if (only.length != (uint64)1) { return 8; }
+  var empty: string = "";
+  if (empty.length != (uint64)0) { return 9; }
+
+  // Interpolation splits the literal into parts; each part carries its own
+  // length rather than being re-measured.
+  var n: int32 = 7;
+  var interp: string = "x\0y{n}z";
+  if (interp.length != (uint64)5) { return 10; }
+  if (count_nul(interp) != 1) { return 11; }
+  if (interp[1] != (char)0) { return 12; }
+  if (interp[3] != '7') { return 13; }
+
+  // Concatenation copies by length, so both NULs survive.
+  var a: string = "p\0q";
+  var b: string = "r\0s";
+  var joined: string = a + b;
+  if (joined.length != (uint64)6) { return 14; }
+  if (count_nul(joined) != 2) { return 15; }
+  if (joined[4] != (char)0) { return 16; }
+  if (joined[5] != 's') { return 17; }
+
+  if (G_CONST.length != (uint64)3) { return 18; }
+  if (G_CONST[2] != 'h') { return 19; }
+  if (count_nul(G_CONST) != 1) { return 20; }
+
+  if (g_var.length != (uint64)3) { return 21; }
+  if (g_var[2] != 'j') { return 22; }
+
+  if (G_TABLE[0].length != (uint64)3) { return 23; }
+  if (G_TABLE[0][2] != 'l') { return 24; }
+  if (count_nul(G_TABLE[0]) != 1) { return 25; }
+  if (G_TABLE[1].length != (uint64)2) { return 26; }
+  if (G_TABLE[1][1] != 'n') { return 27; }
+
+  return 0;
+}

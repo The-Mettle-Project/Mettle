@@ -1691,6 +1691,7 @@ $cases = @(
   # was true, for the same byte.
   @{ Name = "char_load_unsigned"; Path = "tests/test_char_load_unsigned.mettle"; ShouldSucceed = $true },
   @{ Name = "divide_min_by_neg_one"; Path = "tests/test_divide_min_by_neg_one.mettle"; ShouldSucceed = $true },
+  @{ Name = "string_interior_nul"; Path = "tests/test_string_interior_nul.mettle"; ShouldSucceed = $true },
   @{ Name = "integer_literal_wide"; Path = "tests/test_integer_literal_wide.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_mixed_locals"; Path = "tests/test_stack_mixed_locals.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_large_struct"; Path = "tests/test_stack_large_struct.mettle"; ShouldSucceed = $true },

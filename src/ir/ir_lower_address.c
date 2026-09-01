@@ -98,6 +98,7 @@ static char *ir_intern_aggregate_literal(IRLoweringContext *context,
       relocs[i].offset = literal->relocs[i].offset;
       relocs[i].symbol = literal->relocs[i].symbol;
       relocs[i].string = literal->relocs[i].string;
+      relocs[i].string_length = literal->relocs[i].string_length;
       relocs[i].string_wants_record = literal->relocs[i].string_wants_record;
     }
   }
@@ -447,7 +448,8 @@ IROperand ir_clone_operand_local(const IROperand *operand) {
   case IR_OPERAND_FLOAT:
     return ir_operand_float(operand->float_value);
   case IR_OPERAND_STRING:
-    return ir_operand_string(operand->name);
+    return ir_operand_string_n(operand->name,
+                               ir_operand_string_length(operand));
   case IR_OPERAND_LABEL:
     return ir_operand_label(operand->name);
   case IR_OPERAND_NONE:

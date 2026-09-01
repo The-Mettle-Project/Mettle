@@ -46,6 +46,10 @@ typedef enum {
 typedef struct {
   IROperandKind kind;
   char *name;
+  /* For IR_OPERAND_STRING this is the operand's BYTE LENGTH, which is not
+   * strlen(name): `\\0` is a legal escape, so a literal may carry an
+   * interior NUL. `name` is still NUL-terminated, so an operand built by a pass
+   * that has only a C string leaves this zero and readers fall back to strlen. */
   long long int_value;
   double float_value;
   /* IEEE-754 width of a floating operand: 32 or 64. 0 means "not a float /
@@ -707,6 +711,7 @@ typedef struct {
   size_t offset;
   char *symbol; /* owned */
   char *string; /* owned */
+  size_t string_length;
   /* A `string` value is a pointer to a { chars, length } record, so the slot
    * points at a record the backend builds next to the characters; a `cstring`
    * points straight at the characters. Only read when `string` is set. */
@@ -731,6 +736,7 @@ typedef struct {
   int init_is_float;
   long long init_bits;      /* numeric initializer (float carries bit pattern) */
   char *init_string;        /* owned; string-literal initializer bytes, or NULL */
+  size_t init_string_length;
   /* Set when the initializer is the address of another module symbol
    * (`var p: int32* = &g_x;`, `var f: fn() -> int32 = &handler;`). The value is
    * not known until link time, so the backend reserves a pointer-sized slot and
@@ -843,6 +849,11 @@ IROperand ir_operand_float(double value);
  * value is normalized to 64. */
 IROperand ir_operand_float_sized(double value, int float_bits);
 IROperand ir_operand_string(const char *value);
+IROperand ir_operand_string_n(const char *value, size_t length);
+char *ir_copy_literal_bytes(const char *value, size_t length);
+/* The byte length an IR_OPERAND_STRING stands for, falling back to strlen for
+ * an operand whose producer did not measure one. */
+size_t ir_operand_string_length(const IROperand *operand);
 IROperand ir_operand_label(const char *name);
 IROperand ir_operand_copy(const IROperand *operand);
 void ir_operand_destroy(IROperand *operand);

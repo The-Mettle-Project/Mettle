@@ -1351,8 +1351,12 @@ static int sel_operand_matches(const IROperand *a, const IROperand *b,
     }
     return re_map_get(rename, key) == 1;
   }
+  case IR_OPERAND_STRING: {
+    size_t a_length = ir_operand_string_length(a);
+    return a->name && b->name && a_length == ir_operand_string_length(b) &&
+           memcmp(a->name, b->name, a_length) == 0;
+  }
   case IR_OPERAND_SYMBOL:
-  case IR_OPERAND_STRING:
   case IR_OPERAND_LABEL:
     return a->name && b->name && strcmp(a->name, b->name) == 0;
   case IR_OPERAND_INT:

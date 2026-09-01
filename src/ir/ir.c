@@ -721,11 +721,43 @@ IROperand ir_operand_float_sized(double value, int float_bits) {
   return operand;
 }
 
+char *ir_copy_literal_bytes(const char *value, size_t length) {
+  char *copy = NULL;
+  if (!value) {
+    return NULL;
+  }
+  copy = malloc(length + 1);
+  if (!copy) {
+    return NULL;
+  }
+  memcpy(copy, value, length);
+  copy[length] = '\0';
+  return copy;
+}
+
 IROperand ir_operand_string(const char *value) {
+  return ir_operand_string_n(value, value ? strlen(value) : 0);
+}
+
+/* `value` may hold interior NULs, so the copy is by length and the terminator
+ * is added on top: readers that only want a name keep working, and the ones
+ * that build a {chars, length} record get every byte. */
+IROperand ir_operand_string_n(const char *value, size_t length) {
   IROperand operand = ir_operand_none();
   operand.kind = IR_OPERAND_STRING;
-  operand.name = ir_intern_name(value);
+  operand.name = ir_copy_literal_bytes(value, length);
+  operand.int_value = (long long)length;
   return operand;
+}
+
+size_t ir_operand_string_length(const IROperand *operand) {
+  if (!operand || !operand->name) {
+    return 0;
+  }
+  if (operand->kind == IR_OPERAND_STRING && operand->int_value > 0) {
+    return (size_t)operand->int_value;
+  }
+  return strlen(operand->name);
 }
 
 IROperand ir_operand_label(const char *name) {
@@ -756,7 +788,8 @@ IROperand ir_operand_copy(const IROperand *operand) {
   case IR_OPERAND_FLOAT:
     return ir_operand_float_sized(operand->float_value, operand->float_bits);
   case IR_OPERAND_STRING:
-    return ir_operand_string(operand->name);
+    return ir_operand_string_n(operand->name,
+                               ir_operand_string_length(operand));
   case IR_OPERAND_LABEL:
     return ir_operand_label(operand->name);
   case IR_OPERAND_NONE:
@@ -1863,7 +1896,11 @@ IRModuleSymbol *ir_program_add_symbol(IRProgram *program,
   *dst = *proto; /* shallow copy scalars + borrowed MtlcType* */
   dst->name = mettle_strdup(proto->name);
   dst->link_name = proto->link_name ? mettle_strdup(proto->link_name) : NULL;
-  dst->init_string = proto->init_string ? mettle_strdup(proto->init_string) : NULL;
+  dst->init_string =
+      proto->init_string
+          ? ir_copy_literal_bytes(proto->init_string, proto->init_string_length)
+          : NULL;
+  dst->init_string_length = proto->init_string ? proto->init_string_length : 0;
   dst->init_symbol_ref =
       proto->init_symbol_ref ? mettle_strdup(proto->init_symbol_ref) : NULL;
   /* Deep-copy the aggregate initializer image so the symbol table owns it
@@ -1902,8 +1939,12 @@ IRModuleSymbol *ir_program_add_symbol(IRProgram *program,
                 : NULL;
         dst->init_relocs[r].string =
             proto->init_relocs[r].string
-                ? mettle_strdup(proto->init_relocs[r].string)
+                ? ir_copy_literal_bytes(proto->init_relocs[r].string,
+                                        proto->init_relocs[r].string_length)
                 : NULL;
+        dst->init_relocs[r].string_length =
+            proto->init_relocs[r].string ? proto->init_relocs[r].string_length
+                                         : 0;
         dst->init_relocs[r].string_wants_record =
             proto->init_relocs[r].string_wants_record;
       }

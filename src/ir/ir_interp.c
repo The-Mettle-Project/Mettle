@@ -53,6 +53,7 @@ typedef struct {
  * buffer, laid out the way the backend parks them in .rdata. */
 typedef struct {
   const char *text; /* not owned; lives as long as the IR */
+  size_t length;    /* bytes, which is not strlen once a literal holds a NUL */
   unsigned long long chars;
   unsigned long long record;
 } IILiteral;
@@ -483,20 +484,24 @@ static IIBuffer *ii_addr_to_buffer(IRInterpMachine *machine,
  * for a fat `string` parameter and the characters for a `cstring` one, exactly
  * as the backend chooses between them. Cached per literal so the same call in
  * a loop does not exhaust the buffer table. */
+/* `length` is the literal's byte count. It is passed rather than measured
+ * because `\\0` is a legal escape: the bytes can run past an interior NUL, and
+ * two literals that share a prefix up to one are different strings. */
 static int ii_string_literal(IRInterpMachine *machine, const char *text,
-                             unsigned long long *chars_out,
+                             size_t length, unsigned long long *chars_out,
                              unsigned long long *record_out) {
   if (!text) {
     text = "";
+    length = 0;
   }
   for (size_t i = 0; i < machine->literal_count; i++) {
-    if (strcmp(machine->literals[i].text, text) == 0) {
+    if (machine->literals[i].length == length &&
+        memcmp(machine->literals[i].text, text, length) == 0) {
       *chars_out = machine->literals[i].chars;
       *record_out = machine->literals[i].record;
       return 1;
     }
   }
-  size_t length = strlen(text);
   size_t record_offset = (length + 1 + 7u) & ~(size_t)7u;
   unsigned long long addr =
       ir_interp_add_buffer(machine, NULL, (long long)(record_offset + 16u));
@@ -523,6 +528,7 @@ static int ii_string_literal(IRInterpMachine *machine, const char *text,
     machine->literal_capacity = grown;
   }
   machine->literals[machine->literal_count].text = text;
+  machine->literals[machine->literal_count].length = length;
   machine->literals[machine->literal_count].chars = addr;
   machine->literals[machine->literal_count].record = addr + record_offset;
   machine->literal_count++;
@@ -1190,7 +1196,9 @@ static IIVar *ii_global_touch(IRInterpMachine *machine, const char *name) {
     /* String global: the home holds the record address. */
     if (sym->init_string) {
       unsigned long long chars = 0, record = 0;
-      if (ii_string_literal(machine, sym->init_string, &chars, &record)) {
+      if (ii_string_literal(machine, sym->init_string,
+                            sym->init_string ? sym->init_string_length : 0,
+                            &chars, &record)) {
         var->value = ii_int_value((long long)record);
       }
     }
@@ -1231,7 +1239,9 @@ static IIVar *ii_global_touch(IRInterpMachine *machine, const char *name) {
       var->value = ii_float_value(d);
     } else if (sym->init_string) {
       unsigned long long chars = 0, record = 0;
-      if (ii_string_literal(machine, sym->init_string, &chars, &record)) {
+      if (ii_string_literal(machine, sym->init_string,
+                            sym->init_string ? sym->init_string_length : 0,
+                            &chars, &record)) {
         var->value = ii_int_value((long long)chars);
       }
     } else {
@@ -1328,12 +1338,14 @@ static unsigned long long ii_global_storage(IRInterpMachine *machine,
     unsigned long long value = 0;
     if (reloc->string) {
       unsigned long long chars = 0, record = 0;
-      if (!ii_string_literal(machine, reloc->string, &chars, &record)) {
+      if (!ii_string_literal(machine, reloc->string,
+                             reloc->string ? reloc->string_length : 0, &chars,
+                             &record)) {
         return 0;
       }
       value = chars;
       if (reloc->string_wants_record) {
-        unsigned long long length = (unsigned long long)strlen(reloc->string);
+        unsigned long long length = (unsigned long long)reloc->string_length;
         long long len_off = 0;
         IIBuffer *len_buf = ii_addr_to_buffer(
             machine, addr + reloc->offset + 8, 8, &len_off);
@@ -1417,7 +1429,9 @@ static int ii_fetch(IRInterpMachine *machine, IIFrame *frame,
     /* A string literal used as a value IS the address of its fat record, the
      * same thing the backend's operand load produces. */
     unsigned long long chars = 0, record = 0;
-    if (!ii_string_literal(machine, operand->name, &chars, &record)) {
+    if (!ii_string_literal(machine, operand->name,
+                           ir_operand_string_length(operand), &chars,
+                           &record)) {
       return 0;
     }
     *out = ii_int_value((long long)record);
@@ -4379,7 +4393,9 @@ static int ii_op_call(IRInterpMachine *machine, IIFrame *frame,
     const IROperand *arg = &insn->arguments[i];
     if (arg->kind == IR_OPERAND_STRING) {
       unsigned long long chars = 0, record = 0;
-      if (!ii_string_literal(machine, arg->name, &chars, &record)) {
+      if (!ii_string_literal(machine, arg->name,
+                             ir_operand_string_length(arg), &chars,
+                             &record)) {
         return 0;
       }
       call_args[i] = ii_int_value(
@@ -4479,7 +4495,9 @@ static int ii_op_call_indirect(IRInterpMachine *machine, IIFrame *frame,
     const IROperand *arg = &insn->arguments[i];
     if (arg->kind == IR_OPERAND_STRING) {
       unsigned long long chars = 0, record = 0;
-      if (!ii_string_literal(machine, arg->name, &chars, &record)) {
+      if (!ii_string_literal(machine, arg->name,
+                             ir_operand_string_length(arg), &chars,
+                             &record)) {
         return 0;
       }
       call_args[i] = ii_int_value((long long)record);
@@ -4671,7 +4689,9 @@ static int ii_op_assign(IRInterpMachine *machine, IIFrame *frame,
     IIVar *dest = ii_env_find(&frame->env, insn->dest.name);
     if (dest && dest->is_cstring) {
       unsigned long long chars = 0, record = 0;
-      if (!ii_string_literal(machine, insn->lhs.name, &chars, &record)) {
+      if (!ii_string_literal(machine, insn->lhs.name,
+                             ir_operand_string_length(&insn->lhs), &chars,
+                             &record)) {
         return 0;
       }
       value = ii_int_value((long long)chars);

@@ -3529,8 +3529,8 @@ static ASTNode *parser_interp_parse_fragment(Parser *parser,
 
 static ASTNode *parser_parse_interpolated_string(Parser *parser,
                                                  const char *value,
+                                                 size_t length,
                                                  SourceLocation location) {
-  size_t length = strlen(value);
   char *literal = malloc(length + 1);
   size_t literal_length = 0;
   ASTNode *chain = NULL;
@@ -3586,7 +3586,8 @@ static ASTNode *parser_parse_interpolated_string(Parser *parser,
 
     if (literal_length > 0) {
       literal[literal_length] = '\0';
-      ASTNode *part = ast_create_string_literal(literal, location);
+      ASTNode *part = ast_create_string_literal(literal, literal_length,
+                                                location);
       if (!part)
         goto fail;
       chain = parser_interp_append(chain, part, location);
@@ -3623,12 +3624,14 @@ static ASTNode *parser_parse_interpolated_string(Parser *parser,
 
   literal[literal_length] = '\0';
   if (!has_expression_part) {
-    ASTNode *only = ast_create_string_literal(literal, location);
+    ASTNode *only = ast_create_string_literal(literal, literal_length,
+                                              location);
     free(literal);
     return only;
   }
   if (literal_length > 0) {
-    ASTNode *part = ast_create_string_literal(literal, location);
+    ASTNode *part = ast_create_string_literal(literal, literal_length,
+                                              location);
     if (!part)
       goto fail;
     chain = parser_interp_append(chain, part, location);
@@ -3709,13 +3712,17 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
   }
   case TOKEN_STRING: {
     ASTNode *result;
+    /* The lexeme length, not strlen: `\0` is a legal escape, so the literal's
+     * bytes can run past an interior NUL and both the brace search and the
+     * copy have to span all of them. */
+    size_t token_length = parser->current_token.lexeme.length;
     if (parser->current_token.value &&
-        strchr(parser->current_token.value, '{')) {
+        memchr(parser->current_token.value, '{', token_length)) {
       result = parser_parse_interpolated_string(
-          parser, parser->current_token.value, location);
+          parser, parser->current_token.value, token_length, location);
     } else {
-      result =
-          ast_create_string_literal(parser->current_token.value, location);
+      result = ast_create_string_literal(parser->current_token.value,
+                                         token_length, location);
     }
     parser_advance(parser);
     return result;

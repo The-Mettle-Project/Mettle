@@ -3321,7 +3321,8 @@ int mir_encode(MirFunction *fn) {
       int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
       BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
       if (!code_generator_binary_emit_string_literal_value_address(
-              fn->generator, ctx, s, target)) {
+              fn->generator, ctx, s,
+              in->a.imm > 0 ? (size_t)in->a.imm : strlen(s), target)) {
         ok = enc_err(fn, "out of memory emitting string-literal record address");
         break;
       }

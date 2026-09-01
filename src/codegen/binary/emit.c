@@ -192,7 +192,8 @@ cleanup:
 
 int code_generator_binary_emit_string_literal_value_address(
     CodeGenerator *generator, BinaryFunctionContext *context,
-    const char *value, BinaryGpRegister target_register) {
+    const char *value, size_t value_length,
+    BinaryGpRegister target_register) {
   BinaryEmitter *emitter = NULL;
   BinarySection *section = NULL;
   size_t rdata_section = 0;
@@ -250,7 +251,10 @@ int code_generator_binary_emit_string_literal_value_address(
     goto cleanup;
   }
 
-  length = strlen(value);
+  /* The caller's byte count, not strlen: `\\0` is a legal escape, so the
+   * literal's bytes can run past an interior NUL and the record's length field
+   * has to span all of them. */
+  length = value_length;
   string_length = (uint64_t)length;
   if (!binary_emitter_append_bytes(emitter, rdata_section, value, length,
                                    &chars_offset) ||
@@ -302,7 +306,8 @@ cleanup:
 }
 
 int code_generator_binary_emit_global_string_variable(
-    CodeGenerator *generator, const char *link_name, const char *value) {
+    CodeGenerator *generator, const char *link_name, const char *value,
+    size_t value_length) {
   BinaryEmitter *emitter = NULL;
   BinarySection *section = NULL;
   size_t data_section = 0;
@@ -353,7 +358,7 @@ int code_generator_binary_emit_global_string_variable(
       return 0;
     }
 
-    length = strlen(value);
+    length = value_length;
     string_length = (uint64_t)length;
     if (!binary_emitter_append_bytes(emitter, rdata_section, value, length,
                                      &chars_offset) ||
@@ -713,7 +718,7 @@ int code_generator_binary_emit_indirect_source_address(
   if (operand->kind == IR_OPERAND_STRING) {
     return code_generator_binary_emit_string_literal_value_address(
         generator, context, operand->name ? operand->name : "",
-        target_register);
+        ir_operand_string_length(operand), target_register);
   }
   code_generator_set_error(
       generator, "Indirect call argument must be a struct value (kind=%d)",
@@ -1417,7 +1422,7 @@ int code_generator_binary_emit_operand_load(
   case IR_OPERAND_STRING:
     return code_generator_binary_emit_string_literal_value_address(
         generator, context, operand->name ? operand->name : "",
-        target_register);
+        ir_operand_string_length(operand), target_register);
 
   case IR_OPERAND_TEMP: {
     int offset = code_generator_binary_get_temp_offset(context, operand->name);

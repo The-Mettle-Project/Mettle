@@ -7,6 +7,20 @@ static char *ast_copy_string(const char *value) {
   return value ? strdup(value) : NULL;
 }
 
+static char *ast_copy_bytes(const char *value, size_t length) {
+  char *copy = NULL;
+  if (!value) {
+    return NULL;
+  }
+  copy = malloc(length + 1);
+  if (!copy) {
+    return NULL;
+  }
+  memcpy(copy, value, length);
+  copy[length] = '\0';
+  return copy;
+}
+
 static char *ast_intern_string(const char *value) {
   return value ? (char *)string_intern(value) : NULL;
 }
@@ -524,7 +538,8 @@ static ASTNode *ast_clone_string_literal(ASTNode *clone, const ASTNode *node) {
     free(clone);
     return NULL;
   }
-  dst->value = ast_copy_string(src->value);
+  dst->value = ast_copy_bytes(src->value, src->length);
+  dst->length = src->length;
   clone->data = dst;
   return clone;
 }
@@ -2290,7 +2305,8 @@ ASTNode *ast_create_float_literal(double float_value, SourceLocation location) {
   return node;
 }
 
-ASTNode *ast_create_string_literal(const char *value, SourceLocation location) {
+ASTNode *ast_create_string_literal(const char *value, size_t length,
+                                   SourceLocation location) {
   ASTNode *node = ast_create_node(AST_STRING_LITERAL, location);
   if (!node)
     return NULL;
@@ -2301,7 +2317,8 @@ ASTNode *ast_create_string_literal(const char *value, SourceLocation location) {
     return NULL;
   }
 
-  string_literal->value = ast_copy_string(value);
+  string_literal->value = ast_copy_bytes(value, length);
+  string_literal->length = length;
   node->data = string_literal;
 
   return node;
@@ -2794,6 +2811,7 @@ int ast_fold_member_access_to_string(ASTNode *node, const char *value) {
     free(literal);
     return 0;
   }
+  literal->length = strlen(value);
 
   for (size_t i = 0; i < node->child_count; i++) {
     ast_destroy_node(node->children[i]);

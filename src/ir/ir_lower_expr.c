@@ -2462,7 +2462,7 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
       ir_set_error(context, "Malformed string literal");
       return 0;
     }
-    *out_value = ir_operand_string(literal->value);
+    *out_value = ir_operand_string_n(literal->value, literal->length);
     if (!out_value->name) {
       ir_set_error(context, "Out of memory while lowering string literal");
       return 0;

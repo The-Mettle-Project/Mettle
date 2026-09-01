@@ -69,6 +69,7 @@ static int aggregate_image_add_runtime_store(AggregateImage *out, size_t offset,
  * caller can hand over freshly duplicated strings unconditionally. */
 static int aggregate_image_add_reloc(AggregateImage *out, size_t offset,
                                      char *symbol, char *string,
+                                     size_t string_length,
                                      int string_wants_record) {
   if (out->reloc_count == out->reloc_capacity) {
     size_t next = out->reloc_capacity ? out->reloc_capacity * 2 : 4;
@@ -84,6 +85,7 @@ static int aggregate_image_add_reloc(AggregateImage *out, size_t offset,
   out->relocs[out->reloc_count].offset = offset;
   out->relocs[out->reloc_count].symbol = symbol;
   out->relocs[out->reloc_count].string = string;
+  out->relocs[out->reloc_count].string_length = string_length;
   out->relocs[out->reloc_count].string_wants_record = string_wants_record;
   out->reloc_count++;
   return 1;
@@ -370,7 +372,12 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
     }
     StringLiteral *literal = (StringLiteral *)element->data;
     const char *value = literal && literal->value ? literal->value : "";
-    char *copy = strdup(value);
+    size_t value_length = literal && literal->value ? literal->length : 0;
+    char *copy = malloc(value_length + 1);
+    if (copy) {
+      memcpy(copy, value, value_length);
+      copy[value_length] = '\0';
+    }
     if (!copy) {
       type_checker_set_error_at_location(checker, element->location,
                                          "Out of memory folding aggregate "
@@ -381,7 +388,7 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
      * record itself, so the backend builds the record and points the slot at
      * it. A `cstring` slot points straight at the characters. */
     (void)at;
-    return aggregate_image_add_reloc(out, offset, NULL, copy,
+    return aggregate_image_add_reloc(out, offset, NULL, copy, value_length,
                                      type->kind == TYPE_STRING);
   }
 
@@ -419,7 +426,7 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
       if (symbol) {
         symbol->is_used = 1;
       }
-      return aggregate_image_add_reloc(out, offset, copy, NULL, 0);
+      return aggregate_image_add_reloc(out, offset, copy, NULL, 0, 0);
     }
     if (type_checker_is_null_pointer_constant(element)) {
       return 1; // already zero
