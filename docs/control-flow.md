@@ -223,9 +223,31 @@ body 1
 end 1
 ```
 
-`errdefer` runs only on the error path, meaning a return of an `Err`. It pairs
-with `defer` for work that has to be undone when a step fails.
-[Declarations](declarations.md) shows both together.
+`errdefer` runs only on the error path. It pairs with `defer` for work that has
+to be undone when a step fails. [Declarations](declarations.md) shows both
+together.
+
+What counts as the error path depends on what the function returns:
+
+| Return type | Error path |
+|-------------|------------|
+| `Result<T, E>` | returning `Err` |
+| an integer or `bool` | returning nonzero, the status-code convention |
+| a pointer | returning null |
+| a float | never; `0.0` is an ordinary result |
+| `void`, a struct, an array | never |
+
+A pointer is the case worth reading twice, because the test is the other way
+round from the integer one:
+
+```mettle
+fn make(ok: int32) -> Buf* {
+  var p: Buf* = new Buf;
+  errdefer release(p);
+  if (ok == 0) { return (Buf*)0; }   // null: release(p) runs
+  return p;                          // non-null: it does not
+}
+```
 
 ## comptime for
 

@@ -2241,6 +2241,11 @@ $cases = @(
   @{ Name = "errdefer_top_level"; Path = "tests/test_errdefer_top_level.mettle"; ShouldSucceed = $false; Pattern = "Defer statement outside of a function|Errdefer statement outside of a function" },
   @{ Name = "defer_block_statement"; Path = "tests/test_defer_block_statement.mettle"; ShouldSucceed = $true },
   @{ Name = "errdefer_assignment_statement"; Path = "tests/test_errdefer_assignment_statement.mettle"; ShouldSucceed = $true },
+  # What counts as the error path per return type. The test used to be
+  # "nonzero", whatever the type, which had the pointer idiom backwards:
+  # a successful non-null return ran the cleanup and freed what the caller
+  # had just been handed, while returning null leaked.
+  @{ Name = "errdefer_return_kinds"; Path = "tests/test_errdefer_return_kinds.mettle"; ShouldSucceed = $true },
   @{
     Name            = "errdefer_implicit_fallthrough"
     Path            = "tests/test_errdefer_implicit_fallthrough.mettle"

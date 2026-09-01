@@ -314,13 +314,62 @@ static int ir_emit_errdefer_condition(IRLoweringContext *context,
   Type *value_type = ir_returned_symbol_type(context, function, value);
   IROperand address = ir_operand_none();
   IRInstruction load = {0};
+  /* Whether the value is a pointer or a float is decided from the FUNCTION's
+   * declared return type, not the returned operand's. The operand is often a
+   * temp -- a cast, an arithmetic result -- or a parameter, and neither
+   * carries a type resolvable here, so `return (Buf*)0` and `return n` fell
+   * through to "nonzero means error" in a function whose signature says
+   * exactly what it returns. The tagged-enum path below still keys off the
+   * operand, because it needs the symbol's address to load the discriminant. */
+  Type *declared = (function && function->return_type_name)
+                       ? ir_resolve_named_type(context,
+                                               function->return_type_name)
+                       : NULL;
 
   if (!value_type || value_type->kind != TYPE_TAGGED_ENUM) {
     /* Only a tagged enum carries a discriminant an errdefer can read. A struct
      * or an array has no scalar to test at all, and copying one here would ask
-     * every backend to load a whole record into a branch condition. */
-    int aggregate = value_type && (value_type->kind == TYPE_STRUCT ||
-                                   value_type->kind == TYPE_ARRAY);
+     * every backend to load a whole record into a branch condition.
+     *
+     * A float has no failure convention: 0.0 is an ordinary result, so
+     * `return 1.5` must not count as an error. */
+    Type *shape = declared ? declared : value_type;
+    int aggregate = shape && (shape->kind == TYPE_STRUCT ||
+                              shape->kind == TYPE_ARRAY ||
+                              shape->kind == TYPE_FLOAT32 ||
+                              shape->kind == TYPE_FLOAT64);
+    /* A pointer fails by being NULL, so the test is inverted from the integer
+     * status-code one. Reading a pointer the same way as an int had the
+     * documented idiom exactly backwards:
+     *
+     *   var p: Buf* = new Buf;
+     *   errdefer release(p);
+     *   ...
+     *   return p;            // non-null: the cleanup RAN, freeing the
+     *                        // buffer the caller just received
+     *
+     * and the failure path, returning null, skipped the cleanup and leaked. */
+    if (shape && value->kind != IR_OPERAND_NONE &&
+        (shape->kind == TYPE_POINTER ||
+         shape->kind == TYPE_FUNCTION_POINTER)) {
+      IRInstruction is_null = {0};
+      if (!ir_make_temp_operand(context, out_condition)) {
+        return 0;
+      }
+      is_null.op = IR_OP_BINARY;
+      is_null.location = location;
+      is_null.dest = *out_condition;
+      is_null.lhs = ir_operand_copy(value);
+      is_null.rhs = ir_operand_int(0);
+      is_null.text = "==";
+      if (!ir_emit(context, function, &is_null)) {
+        ir_operand_destroy(&is_null.lhs);
+        ir_operand_destroy(out_condition);
+        return 0;
+      }
+      ir_operand_destroy(&is_null.lhs);
+      return 1;
+    }
     *out_condition = (value->kind == IR_OPERAND_NONE || aggregate)
                          ? ir_operand_int(0)
                          : ir_operand_copy(value);
