@@ -1,0 +1,90 @@
+// A struct that fits in a register does not travel like a bigger one. The
+// backend keeps its BYTES in a register, and the lvalue path declines the
+// whole-struct memcpy below 8 bytes, so `arr[2] = make_small(2, -2)` lowers to
+// a word-sized store and `var c: Mid = arr[0]` to a word-sized load feeding an
+// aggregate assign. The compile-time interpreter modelled every aggregate as
+// an address, so it stored the low bytes of one and trapped reading the other.
+//
+// This runs the same checks twice: natively through main, and through the
+// compile-time interpreter via the @test below. Both have to agree.
+
+struct Small { a: int8; b: int8; }
+struct Mid { x: int32; y: int32; }
+struct Pair16 { lo: uint16; hi: uint16; }
+
+@noinline fn make_small(a: int8, b: int8) -> Small {
+  var s: Small;
+  s.a = a;
+  s.b = b;
+  return s;
+}
+
+@noinline fn take_small(s: Small) -> int32 {
+  return (int32)s.a * 100 + (int32)s.b;
+}
+
+@noinline fn make_mid(x: int32, y: int32) -> Mid {
+  var m: Mid;
+  m.x = x;
+  m.y = y;
+  return m;
+}
+
+@noinline fn take_mid(m: Mid) -> int32 { return m.x - m.y; }
+
+@noinline fn make_pair(lo: uint16, hi: uint16) -> Pair16 {
+  var p: Pair16;
+  p.lo = lo;
+  p.hi = hi;
+  return p;
+}
+
+fn checks() -> int32 {
+  // A returned register-sized struct stored straight into an array element.
+  var smalls: Small[3];
+  smalls[2] = make_small(2, -2);
+  if (smalls[2].a != 2) { return 1; }
+  if (smalls[2].b != -2) { return 2; }
+  if (take_small(smalls[2]) != 198) { return 3; }
+
+  // The same through a loop, which is how it usually appears.
+  for i in 0..3 { smalls[i] = make_small((int8)i, (int8)(0 - i)); }
+  if (take_small(smalls[0]) != 0) { return 4; }
+  if (take_small(smalls[1]) != 99) { return 5; }
+  if (take_small(smalls[2]) != 198) { return 6; }
+
+  // Copying an element OUT of a struct array, and passing one by value.
+  var mids: Mid[4];
+  for i in 0..4 { mids[i] = make_mid(i, i * i); }
+  var c0: Mid = mids[0];
+  if (c0.x != 0 || c0.y != 0) { return 7; }
+  var c3: Mid = mids[3];
+  if (c3.x != 3 || c3.y != 9) { return 8; }
+  if (take_mid(mids[3]) != -6) { return 9; }
+
+  // The copy is a copy: writing it must not reach the array.
+  c3.x = 99;
+  if (mids[3].x != 3) { return 10; }
+
+  // A uint16 pair exercises the two-byte-field shape at four bytes total.
+  var pairs: Pair16[2];
+  pairs[0] = make_pair((uint16)65535, (uint16)1);
+  pairs[1] = make_pair((uint16)7, (uint16)60000);
+  if (pairs[0].lo != (uint16)65535 || pairs[0].hi != (uint16)1) { return 11; }
+  if (pairs[1].lo != (uint16)7 || pairs[1].hi != (uint16)60000) { return 12; }
+
+  // A returned aggregate bound to a local, then stored on to an element.
+  var one: Small = make_small(-1, 3);
+  smalls[1] = one;
+  if (take_small(smalls[1]) != -97) { return 13; }
+  if (one.a != -1 || one.b != 3) { return 14; }
+
+  return 0;
+}
+
+fn main() -> int32 { return checks(); }
+
+@test fn test_register_aggregates_match_native() -> int64 {
+  assert_eq(checks(), 0);
+  return 0;
+}

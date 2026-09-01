@@ -4540,6 +4540,47 @@ static int ii_op_store(IRInterpMachine *machine, IIFrame *frame,
             source_buffer->data + source_offset, (size_t)size);
     return 1;
   }
+  /* An aggregate at or below 8 bytes is stored by a WORD-SIZED store, because
+   * the backend keeps its bytes in a register and the lvalue path declines the
+   * whole-struct memcpy at that size. The interpreter holds every aggregate as
+   * a buffer and hands out its ADDRESS, so both shapes wrote the low bytes of
+   * an address: `smalls[1] = one`, whose value operand is the aggregate symbol
+   * itself, and `smalls[2] = make_small(2, -2)`, whose value is the callee's
+   * buffer marked escaped_local. Only the interpreter's own bookkeeping can
+   * name either, so an ordinary pointer store is never taken for one. */
+  if (!value.is_float && !insn->is_float && value.i != 0) {
+    long long source_offset = 0;
+    IIBuffer *source_buffer = NULL;
+    int is_aggregate_source = 0;
+    if (insn->lhs.kind == IR_OPERAND_SYMBOL && insn->lhs.name) {
+      IIVar *var = ii_env_find(&frame->env, insn->lhs.name);
+      if (!var) {
+        var = ii_env_find(&machine->globals, insn->lhs.name);
+      }
+      is_aggregate_source = var && (long long)var->agg_size == size;
+    }
+    source_buffer = ii_addr_to_buffer(machine, (unsigned long long)value.i,
+                                      size, &source_offset);
+    if (source_buffer && (is_aggregate_source || source_buffer->escaped_local)) {
+      long long dest_offset = 0;
+      IIBuffer *dest_buffer =
+          ii_addr_to_buffer(machine, addr, size, &dest_offset);
+      if (!dest_buffer) {
+        ii_fail(machine, IR_INTERP_TRAP,
+                "block copy out of bounds / after free");
+        return 0;
+      }
+      memmove(dest_buffer->data + dest_offset,
+              source_buffer->data + source_offset, (size_t)size);
+      /* A consumed aggregate return has no other reader; a named local does. */
+      if (source_buffer->escaped_local && source_buffer != dest_buffer) {
+        ii_reclaim_buffer(machine,
+                          (size_t)((source_buffer->base - II_ADDR_BASE) /
+                                   II_ADDR_STRIDE));
+      }
+      return 1;
+    }
+  }
   unsigned long long raw;
   if (value.is_float || insn->is_float) {
     if (size == 4) {

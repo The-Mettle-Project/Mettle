@@ -1588,6 +1588,11 @@ $cases = @(
   # lives in, so a constant held in an address-taken local outlived a store
   # through that address and was reused as a stale read.
   @{ Name = "cse_value_through_alias"; Path = "tests/test_cse_value_through_alias.mettle"; ShouldSucceed = $true },
+  # A struct at or below 8 bytes moves by word-sized load/store, because the
+  # backend keeps it in a register. The compile-time interpreter modelled every
+  # aggregate as an address, so it stored the low bytes of one and trapped
+  # reading another. Runs the same checks natively and under `mettle test`.
+  @{ Name = "interp_register_aggregates"; Path = "tests/test_interp_register_aggregates.mettle"; ShouldSucceed = $true },
   @{ Name = "signed_arithmetic"; Path = "tests/test_signed_arithmetic.mettle"; ShouldSucceed = $true },
   @{
     Name          = "sign_extension"
