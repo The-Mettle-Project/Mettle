@@ -2441,6 +2441,7 @@ int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
                                             const IRInstruction *instruction) {
   BinaryCodeBuffer *b = NULL;
   size_t loop_top = 0, done_main = 0, small = 0, fin = 0, noclamp = 0;
+  size_t tail = 0;
   if (!generator || !context || !instruction ||
       instruction->argument_count < 1 || !instruction->arguments) {
     code_generator_set_error(generator, "Malformed simd_exp_f32");
@@ -2470,7 +2471,7 @@ int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
       !wcs_jcc(b, 0x82 /* jb */, &small)) {
     return 0;
   }
-  /* R9 = last8 = end - 32; 8-wide loop overlapping the final vector. */
+  /* R9 = last8 = end - 32; the 8-wide loop runs only over whole vectors. */
   if (!wcs_addsub_reg_imm8(b, BINARY_GP_R9, 1 /* sub */, 32)) {
     return 0;
   }
@@ -2481,8 +2482,20 @@ int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
       !wcs_jcc(b, 0x83 /* jae */, &done_main) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
       !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
-      !wcs_jcc(b, 0x86 /* jbe */, &noclamp) ||
-      !binary_emit_mov_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9)) {
+      !wcs_jcc(b, 0x86 /* jbe */, &noclamp)) {
+    return 0;
+  }
+  /* Past end-32 means a partial tail of 1..7. Clamping back to end-32 and
+   * running one more full vector would reprocess the overlap, and this kernel
+   * is in-place -- a[i] = exp(a[i]) -- so those elements came back as
+   * exp(exp(x)). R8 = (end - RCX) / 4 sends the remainder to the gather path
+   * the n < 8 case uses, which touches each element once. */
+  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_R10, 0 /* add */, 32) ||
+      !wcs_sub_reg_reg64(b, BINARY_GP_R10, BINARY_GP_RCX) ||
+      !binary_emit_shift_reg_imm8(b, 5 /* shr */, BINARY_GP_R10, 2) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_R8, BINARY_GP_R10) ||
+      !wcs_jcc(b, 0, &tail)) {
     return 0;
   }
   if (!wcs_patch_here(b, noclamp)) {
@@ -2501,7 +2514,7 @@ int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
   /* n < 8: copy n floats into the [rsp+0] scratch buffer (already reserved),
    * exp it 8-wide, copy the n results back. R9 saves the base; RCX/R10/R11/RAX
    * are scratch. */
-  if (!wcs_patch_here(b, small) ||
+  if (!wcs_patch_here(b, small) || !wcs_patch_here(b, tail) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_RCX) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_RSP) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R8)) {
