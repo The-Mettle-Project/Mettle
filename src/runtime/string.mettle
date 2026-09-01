@@ -57,7 +57,7 @@ export fn mettle_string_concat(a: string, b: string) -> string {
 }
 
 export fn mettle_string_from_uint(value: uint64) -> string {
-  var scratch: MettleStringScratch* = new MettleStringScratch;
+    var scratch: MettleStringScratch* = new MettleStringScratch;
     var pos: int64 = 32;
     var v: uint64 = value;
     if (v == 0) {
@@ -87,7 +87,7 @@ export fn mettle_string_from_int(value: int64) -> string {
 // the view, so it comes from the same heap scratch the digits use rather than
 // from a stack local the escape checker would reject.
 export fn mettle_string_from_char(value: int64) -> string {
-  var scratch: MettleStringScratch* = new MettleStringScratch;
+    var scratch: MettleStringScratch* = new MettleStringScratch;
     scratch->bytes[0] = (uint8)value;
     var s: string;
     s.chars = &scratch->bytes[0];
