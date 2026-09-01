@@ -1,5 +1,6 @@
 import "port"
 import "interrupt"
+import "process"
 
 export const KEY_BACKSPACE: uint8 = 8
 export const KEY_TAB: uint8 = 9
@@ -125,6 +126,7 @@ fn decode(code: uint8) -> uint8 {
         var ch: uint8 = decode(code)
         if (ch != 0) {
             push(ch)
+            process_wake_channel(CHANNEL_INPUT)
         }
     }
     pic_end_of_interrupt(IRQ_KEYBOARD)

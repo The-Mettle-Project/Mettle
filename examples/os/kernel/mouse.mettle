@@ -1,5 +1,6 @@
 import "port"
 import "interrupt"
+import "process"
 
 const DATA_PORT: uint16 = 0x60
 const STATUS_PORT: uint16 = 0x64
@@ -85,6 +86,7 @@ fn apply(packet_flags: uint8, raw_x: uint8, raw_y: uint8) {
     pointer_y = clamp(pointer_y - step_y, limit_y)
     buttons = (uint64)(packet_flags & (FLAG_LEFT | FLAG_RIGHT))
     moved = 1
+    process_wake_channel(CHANNEL_INPUT)
 }
 
 @interrupt fn on_mouse() {
@@ -146,6 +148,10 @@ export fn mouse_y() -> uint64 {
 
 export fn mouse_left_down() -> bool {
     return (buttons & (uint64)FLAG_LEFT) != 0
+}
+
+export fn mouse_pending() -> bool {
+    return moved != 0
 }
 
 export fn mouse_take_motion() -> bool {

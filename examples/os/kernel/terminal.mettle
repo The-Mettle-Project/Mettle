@@ -56,6 +56,7 @@ fn touch(line: uint64) {
     if (line + 1 > dirty_last) {
         dirty_last = line + 1
     }
+    process_wake_channel(CHANNEL_INPUT)
 }
 
 fn touch_all() {
@@ -138,6 +139,10 @@ export fn terminal_draw(origin_x: uint64, origin_y: uint64) {
     video_fill(origin_x, origin_y, terminal_pixel_width(), terminal_pixel_height(),
                TERMINAL_BACK)
     for line: uint64 in 0..TERMINAL_ROWS {
+        var row_y: uint64 = origin_y + line * GLYPH_HEIGHT
+        if (!video_visible(origin_x, row_y, terminal_pixel_width(), GLYPH_HEIGHT)) {
+            continue
+        }
         for cell: uint64 in 0..TERMINAL_COLUMNS {
             var ch: uint8 = glyphs[line * TERMINAL_COLUMNS + cell]
             if (ch != 0 && ch != ' ') {
@@ -162,13 +167,19 @@ export fn terminal_push_key(ch: uint8) {
 }
 
 export fn terminal_read_key() -> uint8 {
-    while (head == tail) {
+    while (true) {
+        cpu_disable_interrupts()
+        if (head != tail) {
+            var ch: uint8 = keys[tail]
+            tail = (tail + 1) & KEY_MASK
+            cpu_enable_interrupts()
+            return ch
+        }
         if (process_stop_wanted()) {
+            cpu_enable_interrupts()
             return 0
         }
         process_block(KEY_CHANNEL)
     }
-    var ch: uint8 = keys[tail]
-    tail = (tail + 1) & KEY_MASK
-    return ch
+    return 0
 }

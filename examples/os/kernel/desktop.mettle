@@ -11,6 +11,7 @@ import "keyboard"
 import "clock"
 import "process"
 import "console"
+import "port"
 
 const TASKBAR_HEIGHT: uint64 = 30
 const START_WIDTH: uint64 = 78
@@ -631,6 +632,11 @@ export fn desktop_run() {
         if (shift) {
             software_cursor_show()
         }
-        process_sleep(1)
+        cpu_disable_interrupts()
+        if (!keyboard_ready() && !mouse_pending() && !terminal_touched()) {
+            process_wait_event(CHANNEL_INPUT, CLOCK_HZ / 20)
+        } else {
+            cpu_enable_interrupts()
+        }
     }
 }

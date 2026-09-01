@@ -14,12 +14,13 @@ export const PRIORITY_COUNT: uint64 = 4
 export const NO_PROCESS: uint64 = 16
 export const OWNED_PAGES: uint64 = 8
 export const MAIL_SLOTS: uint64 = 8
+export const CHANNEL_INPUT: uint64 = 0xd35c7091
 
 const NAME_BYTES: uint64 = 16
 const FRAME_SLOTS: uint64 = 20
 const FRAME_BYTES: uint64 = FRAME_SLOTS * 8
 const FLAGS_INTERRUPTS_ON: uint64 = 0x202
-const STARVED_TICKS: uint64 = 250
+const STARVED_TICKS: uint64 = 4
 const STACK_PAGES: uint64 = 2
 const STACK_GUARD: uint64 = 0x5354414b4755
 const MAIL_CHANNEL: uint64 = 0x4d41494c00
@@ -383,13 +384,29 @@ export fn process_yield() {
 
 export fn process_block(channel: uint64) {
     if (table[current].stop_wanted != 0) {
+        cpu_enable_interrupts()
         return
     }
-    var was_on: bool = cpu_interrupts_on()
     cpu_disable_interrupts()
     table[current].channel = channel
+    table[current].wake_at = 0
     table[current].state = ProcessState.Blocked
-    cpu_restore_interrupts(was_on)
+    cpu_enable_interrupts()
+    while (table[current].state == ProcessState.Blocked) {
+        cpu_halt()
+    }
+}
+
+export fn process_wait_event(channel: uint64, ticks: uint64) {
+    if (table[current].stop_wanted != 0) {
+        cpu_enable_interrupts()
+        return
+    }
+    cpu_disable_interrupts()
+    table[current].channel = channel
+    table[current].wake_at = now() + ticks
+    table[current].state = ProcessState.Blocked
+    cpu_enable_interrupts()
     while (table[current].state == ProcessState.Blocked) {
         cpu_halt()
     }
@@ -434,8 +451,14 @@ export fn process_wait(pid: uint64) -> uint64 {
     if (slot == NO_PROCESS) {
         return 0
     }
-    while (table[slot].state != ProcessState.Zombie) {
+    while (true) {
+        cpu_disable_interrupts()
+        if (table[slot].state == ProcessState.Zombie) {
+            cpu_enable_interrupts()
+            break
+        }
         if (table[slot].state == ProcessState.Free || table[slot].pid != pid) {
+            cpu_enable_interrupts()
             return 0
         }
         process_block(pid)
@@ -490,15 +513,21 @@ export fn process_mail_waiting(slot: uint64) -> uint64 {
 }
 
 export fn process_receive() -> uint64 {
-    while (table[current].mail_head == table[current].mail_tail) {
-        if (process_stop_wanted()) {
+    while (true) {
+        cpu_disable_interrupts()
+        if (table[current].mail_head != table[current].mail_tail) {
+            var message: uint64 = table[current].mail[table[current].mail_tail]
+            table[current].mail_tail = (table[current].mail_tail + 1) % MAIL_SLOTS
+            cpu_enable_interrupts()
+            return message
+        }
+        if (table[current].stop_wanted != 0) {
+            cpu_enable_interrupts()
             return 0
         }
         process_block(MAIL_CHANNEL + table[current].pid)
     }
-    var message: uint64 = table[current].mail[table[current].mail_tail]
-    table[current].mail_tail = (table[current].mail_tail + 1) % MAIL_SLOTS
-    return message
+    return 0
 }
 
 export fn process_broken_stacks() -> uint64 {
@@ -531,6 +560,11 @@ export fn process_collect_orphans() {
 fn wake_sleepers(moment: uint64) {
     for i: uint64 in 0..PROCESS_SLOTS {
         if (table[i].state == ProcessState.Sleeping && table[i].wake_at <= moment) {
+            make_ready(i)
+        }
+        if (table[i].state == ProcessState.Blocked && table[i].wake_at != 0 &&
+            table[i].wake_at <= moment) {
+            table[i].channel = 0
             make_ready(i)
         }
     }
