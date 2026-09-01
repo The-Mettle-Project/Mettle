@@ -38,6 +38,32 @@ names, which is how `-lc` and `-lm` resolve on Debian and Ubuntu.
 Only libraries something actually needs reach `DT_NEEDED`. Naming one no symbol
 comes from costs nothing.
 
+### A worked example
+
+raylib is the case this was built for. Declare what you call, pass its structs
+by value, and link the release directory:
+
+```mettle
+struct Color { r: uint8; g: uint8; b: uint8; a: uint8; }
+struct Vector2 { x: float32; y: float32; }
+
+extern fn InitWindow(width: int32, height: int32, title: cstring) = "InitWindow";
+extern fn BeginDrawing() = "BeginDrawing";
+extern fn ClearBackground(color: Color) = "ClearBackground";
+extern fn DrawCircleV(centre: Vector2, radius: float32, color: Color) = "DrawCircleV";
+extern fn EndDrawing() = "EndDrawing";
+extern fn CloseWindow() = "CloseWindow";
+```
+
+```bash
+mettle --build game.mettle -o game -L raylib/lib -lraylib --rpath raylib/lib
+```
+
+That opens a GLFW window, takes an OpenGL context and draws. A struct literal
+carries no type name before the brace: `var white: Color = { r: 245, g: 245,
+b: 245, a: 255 };`. Where a distribution ships no `-dev` symlink, name the file
+outright: `-l:libGL.so.1`, `-l:libX11.so.6`.
+
 ## What the linker emits
 
 A program that binds a library gains `.interp`, `.dynsym`, `.dynstr`, `.hash`,
