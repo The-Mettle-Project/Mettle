@@ -1,43 +1,68 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-if [ -d "./build-release/" ]; then
-	rm -r build-release/
+usage() {
+	cat <<EOF
+Usage: local-setup-linux.bash [--clean] [--jobs N]
+
+Configures and builds Release and Debug side by side in build-release/ and
+build-debug/. Incremental by default; --clean discards both trees first.
+EOF
+}
+
+clean=0
+jobs=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--clean) clean=1; shift ;;
+	--jobs) jobs="${2:-}"; shift 2 ;;
+	-h | --help) usage; exit 0 ;;
+	*) echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
+	esac
+done
+
+command -v cmake >/dev/null || { echo "need cmake" >&2; exit 1; }
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$root"
+
+if [ -z "$jobs" ]; then
+	if command -v nproc >/dev/null; then jobs="$(nproc)"; else jobs=4; fi
 fi
 
-if [ -d "./build-debug/" ]; then
-	rm -r build-debug/
+half=$((jobs / 2))
+[ "$half" -ge 1 ] || half=1
+
+if [ "$clean" -eq 1 ]; then
+	rm -rf build-release build-debug
 fi
 
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release &
 pid1=$!
-
 cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug &
 pid2=$!
+wait "$pid1"
+wait "$pid2"
 
-wait $pid1 $pid2
+start=$SECONDS
 
-start=$(date +%s.%N)
-
-cmake --build build-release --parallel &
+cmake --build build-release --parallel "$half" &
 pid1=$!
-
-cmake --build build-debug --parallel &
+cmake --build build-debug --parallel "$half" &
 pid2=$!
 
-wait $pid1 $pid2
+rc=0
+wait "$pid1" || rc=$?
+wait "$pid2" || rc=$?
 
-end=$(date +%s.%N)
+elapsed=$((SECONDS - start))
 
-format_time() {
-	local val="$1"
-	local sec="${val%%.*}"
-	local ns="${val#*.}"
-	# Pad to 9 digits (in case bc drops trailing zeros)
-	ns=$(printf "%-9s" "$ns" | tr ' ' '0' | cut -c1-9)
-	printf "%ss %sns\n" "$sec" "$ns"
-}
+echo
+if [ "$rc" -ne 0 ]; then
+	echo "Build FAILED after ${elapsed}s"
+	exit "$rc"
+fi
 
-echo ""
-echo "Build local complete [build-release, build-debug]"
-echo ""
-echo "build time: $(format_time "$(echo "$end - $start" | bc)")"
+printf 'Built build-release and build-debug in %dm %02ds with %d jobs each\n' \
+	$((elapsed / 60)) $((elapsed % 60)) "$half"
