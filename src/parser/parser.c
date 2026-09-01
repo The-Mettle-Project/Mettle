@@ -2653,7 +2653,11 @@ static char *parser_parse_array_suffix(Parser *parser, char *type_name) {
   snprintf(full_type, full_len, "%s[%s]", type_name, size_text);
   free(type_name);
   free(size_text);
-  return full_type;
+  /* Another '[' after a sized one is a further dimension: `int32[3][4]` is
+     three rows of four, the way the declaration reads. The slice form above
+     already stacked; only this branch stopped, which is what made a second
+     dimension a syntax error rather than a type. */
+  return parser_parse_array_suffix(parser, full_type);
 }
 
 static char *parser_parse_type_annotation_ex(Parser *parser, int allow_array) {

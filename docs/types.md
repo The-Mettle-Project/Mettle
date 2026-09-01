@@ -203,6 +203,21 @@ An array passed where a pointer is expected decays to a pointer to its first
 element. The compiler decides that from the destination type, so a parameter
 declared `int32*` receives the array.
 
+A suffix may repeat, and the dimensions read left to right the way the
+declaration does:
+
+```mettle
+var grid: int32[3][4];
+grid[2][3] = 7;
+```
+
+`int32[3][4]` is three rows of four, `sizeof` is 48, and `grid[i][j]` takes
+`i` from the first dimension and `j` from the second. Storage is row-major and
+contiguous: `grid[1]` is a row and decays to a pointer to its first element,
+and `&grid[0][0]` walks all twelve. Both dimensions are bounds-checked, at
+compile time for a constant index and under `--safe` for one computed at
+runtime. Further dimensions stack the same way.
+
 ## Structs
 
 Fields are separated by semicolons:

@@ -843,18 +843,30 @@ static int ii_parse_local_type(const char *text, int *elem_size, long long *coun
     }
     memcpy(base, text, base_len);
     base[base_len] = '\0';
-    long long n = 0;
-    const char *digit = bracket + 1;
-    if (*digit < '0' || *digit > '9') {
-      return 0;
-    }
-    for (; *digit >= '0' && *digit <= '9'; digit++) {
-      n = n * 10 + (*digit - '0');
-      if (n > (1 << 24)) {
+    /* Every dimension multiplies: `int32[3][4]` holds twelve elements, not
+     * three. Reading only the first sized a two-dimensional local at its outer
+     * count, and the first store past the opening row ran off the buffer. */
+    long long n = 1;
+    const char *scan = bracket;
+    while (*scan == '[') {
+      const char *digit = scan + 1;
+      long long dim = 0;
+      if (*digit < '0' || *digit > '9') {
         return 0;
       }
+      for (; *digit >= '0' && *digit <= '9'; digit++) {
+        dim = dim * 10 + (*digit - '0');
+        if (dim > (1 << 24)) {
+          return 0;
+        }
+      }
+      if (*digit != ']' || dim <= 0 || n > (1 << 24) / dim) {
+        return 0;
+      }
+      n *= dim;
+      scan = digit + 1;
     }
-    if (n <= 0) {
+    if (*scan != '\0') {
       return 0;
     }
     if (strcmp(base, "cstring") == 0 || strcmp(base, "rawptr") == 0) {

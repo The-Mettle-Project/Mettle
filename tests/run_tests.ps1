@@ -1593,6 +1593,10 @@ $cases = @(
   # aggregate as an address, so it stored the low bytes of one and trapped
   # reading another. Runs the same checks natively and under `mettle test`.
   @{ Name = "interp_register_aggregates"; Path = "tests/test_interp_register_aggregates.mettle"; ShouldSucceed = $true },
+  # Multidimensional arrays: `int32[3][4]` is three rows of four, indexed in
+  # declaration order, row-major and contiguous. Runs natively and under the
+  # compile-time interpreter, which sized such a local at its outer count.
+  @{ Name = "multidim_arrays"; Path = "tests/test_multidim_arrays.mettle"; ShouldSucceed = $true },
   @{ Name = "signed_arithmetic"; Path = "tests/test_signed_arithmetic.mettle"; ShouldSucceed = $true },
   @{
     Name          = "sign_extension"

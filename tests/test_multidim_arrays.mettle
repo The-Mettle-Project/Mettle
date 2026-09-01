@@ -1,0 +1,133 @@
+// Multidimensional arrays. Dimensions read left to right, so `int32[3][4]` is
+// three rows of four and `m[i][j]` indexes them in declaration order, matching
+// the way the type is written. Storage is row-major and contiguous, so a row
+// decays to a pointer to its first element and `&m[0][0]` walks the whole
+// thing. Runs natively and through the compile-time interpreter, which sized a
+// multidimensional local at its OUTER count until it learned to multiply.
+
+struct Cell { a: int32; b: int32; }
+
+var g: int32[2][3];
+var gf: float64[2][2];
+
+@noinline fn row_sum(r: int32*, n: int32) -> int32 {
+  var t: int32 = 0;
+  for i in 0..n { t = t + r[i]; }
+  return t;
+}
+
+@noinline fn fill2d(m: int32*, rows: int32, cols: int32) -> void {
+  for i in 0..rows { for j in 0..cols { m[i * cols + j] = i * 100 + j; } }
+}
+
+fn checks() -> int32 {
+  // Sizes and layout: dimensions read left to right.
+  if (sizeof(int32[3][4]) != 48) { return 1; }
+  if (sizeof(int32[4][3]) != 48) { return 2; }
+  if (sizeof(int8[2][3]) != 6) { return 3; }
+  if (sizeof(float64[2][2]) != 32) { return 4; }
+  if (sizeof(int32[2][3][4]) != 96) { return 5; }
+
+  // A fresh local is zeroed.
+  var z: int32[3][4];
+  var zt: int32 = 0;
+  for i in 0..3 { for j in 0..4 { zt = zt + z[i][j]; } }
+  if (zt != 0) { return 6; }
+
+  // Write and read back, non-square so a transposed index shows up.
+  var m: int32[3][4];
+  for i in 0..3 { for j in 0..4 { m[i][j] = i * 10 + j; } }
+  var t: int32 = 0;
+  for i in 0..3 { for j in 0..4 { t = t + m[i][j]; } }
+  if (t != 138) { return 7; }
+  if (m[0][0] != 0) { return 8; }
+  if (m[0][3] != 3) { return 9; }
+  if (m[2][0] != 20) { return 10; }
+  if (m[2][3] != 23) { return 11; }
+
+  // Row-major: the rows are contiguous and in declaration order.
+  var flat: int32* = &m[0][0];
+  if (flat[0] != 0) { return 12; }
+  if (flat[3] != 3) { return 13; }
+  if (flat[4] != 10) { return 14; }
+  if (flat[11] != 23) { return 15; }
+
+  // A row decays to a pointer to its first element.
+  if (row_sum(&m[1][0], 4) != 46) { return 16; }
+  if (row_sum(&m[2][0], 4) != 86) { return 17; }
+
+  // Writing through a flat pointer is visible through the two-index form.
+  fill2d(&m[0][0], 3, 4);
+  if (m[1][2] != 102) { return 18; }
+  if (m[2][3] != 203) { return 19; }
+
+  // Three dimensions.
+  var c: int32[2][3][4];
+  for i in 0..2 { for j in 0..3 { for k in 0..4 {
+    c[i][j][k] = i * 100 + j * 10 + k;
+  } } }
+  if (c[0][0][0] != 0) { return 20; }
+  if (c[1][2][3] != 123) { return 21; }
+  if (c[0][2][1] != 21) { return 22; }
+  var ct: int32 = 0;
+  for i in 0..2 { for j in 0..3 { for k in 0..4 { ct = ct + c[i][j][k]; } } }
+  if (ct != 1476) { return 23; }
+
+  // Narrow element types.
+  var b: int8[2][3];
+  for i in 0..2 { for j in 0..3 { b[i][j] = (int8)(0 - (i * 3 + j)); } }
+  if (b[0][0] != 0) { return 24; }
+  if (b[1][2] != -5) { return 25; }
+  var bt: int32 = 0;
+  for i in 0..2 { for j in 0..3 { bt = bt + (int32)b[i][j]; } }
+  if (bt != -15) { return 26; }
+
+  var u: uint16[2][2];
+  u[0][0] = (uint16)65535;
+  u[1][1] = (uint16)1;
+  if (u[0][0] != (uint16)65535) { return 27; }
+  if (u[0][1] != (uint16)0) { return 28; }
+  if (u[1][1] != (uint16)1) { return 29; }
+
+  // Floats.
+  var f: float64[2][2];
+  f[0][0] = 1.5; f[0][1] = -2.5; f[1][0] = 0.25; f[1][1] = 4.0;
+  if (f[0][0] + f[0][1] + f[1][0] + f[1][1] != 3.25) { return 30; }
+  if (f[0][1] != -2.5) { return 31; }
+
+  // Struct elements.
+  var s: Cell[2][2];
+  for i in 0..2 { for j in 0..2 { s[i][j].a = i; s[i][j].b = j; } }
+  if (s[0][0].a != 0 || s[0][0].b != 0) { return 32; }
+  if (s[1][0].a != 1 || s[1][0].b != 0) { return 33; }
+  if (s[0][1].a != 0 || s[0][1].b != 1) { return 34; }
+  if (sizeof(Cell[2][2]) != 32) { return 35; }
+
+  // Globals.
+  for i in 0..2 { for j in 0..3 { g[i][j] = i * 3 + j; } }
+  if (g[0][0] != 0 || g[1][2] != 5) { return 36; }
+  var gt: int32 = 0;
+  for i in 0..2 { for j in 0..3 { gt = gt + g[i][j]; } }
+  if (gt != 15) { return 37; }
+
+  gf[0][0] = 0.5; gf[1][1] = 1.5;
+  if (gf[0][0] + gf[1][1] != 2.0) { return 38; }
+  if (gf[0][1] != 0.0) { return 39; }
+
+  // A runtime index, so nothing is folded away.
+  var idx: int32 = 2;
+  var jdx: int32 = 3;
+  if (m[idx][jdx] != 203) { return 40; }
+  m[idx][jdx] = -7;
+  if (m[2][3] != -7) { return 41; }
+  if (flat[11] != -7) { return 42; }
+
+  return 0;
+}
+
+fn main() -> int32 { return checks(); }
+
+@test fn test_multidim_matches_native() -> int64 {
+  assert_eq(checks(), 0);
+  return 0;
+}

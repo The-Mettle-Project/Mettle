@@ -47,17 +47,75 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
     }
   }
 
+  /* Dimensions read left to right, so `int32[3][4]` is three rows of four and
+   * `m[i][j]` indexes them in the order they were declared. That makes the
+   * FIRST group this array's size and everything else part of its element, so
+   * step left from the last group, matching the same way, to reach the first.
+   * A single-dimension type never enters the loop. */
+  {
+    const char *first_l = lbracket;
+    for (;;) {
+      const char *end = first_l - 1;
+      const char *scan;
+      const char *found = NULL;
+      int depth = 0;
+      if (end <= name || *end != ']') {
+        break;
+      }
+      for (scan = end; scan > name; scan--) {
+        if (*scan == ']') {
+          depth++;
+        } else if (*scan == '[') {
+          depth--;
+          if (depth == 0) {
+            found = scan;
+            break;
+          }
+        }
+      }
+      if (!found || found == name) {
+        break;
+      }
+      first_l = found;
+    }
+    if (first_l != lbracket) {
+      const char *scan;
+      const char *first_r = NULL;
+      int depth = 0;
+      for (scan = first_l; *scan; scan++) {
+        if (*scan == '[') {
+          depth++;
+        } else if (*scan == ']') {
+          depth--;
+          if (depth == 0) {
+            first_r = scan;
+            break;
+          }
+        }
+      }
+      if (first_r) {
+        lbracket = first_l;
+        rbracket = first_r;
+      }
+    }
+  }
+
   size_t base_len = (size_t)(lbracket - name);
   if (base_len == 0) {
     return NULL;
   }
 
-  char *base_name = malloc(base_len + 1);
+  /* The element is the base plus whatever dimensions follow this one, so
+   * `int32[3][4]` resolves its element as `int32[4]` and recurses. With one
+   * dimension the tail is empty and this is the base name on its own. */
+  size_t tail_len = strlen(rbracket + 1);
+  char *base_name = malloc(base_len + tail_len + 1);
   if (!base_name) {
     return NULL;
   }
   memcpy(base_name, name, base_len);
-  base_name[base_len] = '\0';
+  memcpy(base_name + base_len, rbracket + 1, tail_len);
+  base_name[base_len + tail_len] = '\0';
 
   Type *base_type = type_checker_get_type_by_name(checker, base_name);
   free(base_name);
