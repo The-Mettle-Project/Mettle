@@ -91,13 +91,33 @@ static int relocation_resolve_target(const LinkResolution *resolution,
   return 1;
 }
 
+static int relocation_gotpcrelx_group_extension(unsigned char opcode,
+                                                unsigned char *extension_out) {
+  switch (opcode) {
+  case 0x03u: *extension_out = 0u; return 1;
+  case 0x0Bu: *extension_out = 1u; return 1;
+  case 0x13u: *extension_out = 2u; return 1;
+  case 0x1Bu: *extension_out = 3u; return 1;
+  case 0x23u: *extension_out = 4u; return 1;
+  case 0x2Bu: *extension_out = 5u; return 1;
+  case 0x33u: *extension_out = 6u; return 1;
+  case 0x3Bu: *extension_out = 7u; return 1;
+  default: return 0;
+  }
+}
+
 static int relocation_relax_gotpcrelx(LinkedSection *merged,
                                       size_t patch_offset,
                                       const char *symbol_name,
+                                      int *becomes_absolute_out,
                                       char **error_message_out) {
   unsigned char *opcode;
   unsigned char *modrm;
+  unsigned char *rex;
+  unsigned char extension = 0u;
+  unsigned char destination;
 
+  *becomes_absolute_out = 0;
   if (patch_offset < 2u) {
     mettle_set_error(error_message_out,
                      "GOTPCRELX relocation for symbol '%s' has no room for the "
@@ -107,7 +127,7 @@ static int relocation_relax_gotpcrelx(LinkedSection *merged,
   }
   opcode = merged->data + patch_offset - 2u;
   modrm = merged->data + patch_offset - 1u;
-  if (*opcode != 0x8Bu || (*modrm & 0xC7u) != 0x05u) {
+  if ((*modrm & 0xC7u) != 0x05u) {
     mettle_set_error(error_message_out,
                      "GOTPCRELX relocation for symbol '%s' is not the "
                      "RIP-relative load this linker can relax (opcode %02x, "
@@ -116,7 +136,47 @@ static int relocation_relax_gotpcrelx(LinkedSection *merged,
                      (unsigned)*opcode, (unsigned)*modrm);
     return 0;
   }
-  *opcode = 0x8Du;
+  if (*opcode == 0x8Bu) {
+    *opcode = 0x8Du;
+    return 1;
+  }
+  if (!relocation_gotpcrelx_group_extension(*opcode, &extension) &&
+      *opcode != 0x85u) {
+    mettle_set_error(error_message_out,
+                     "GOTPCRELX relocation for symbol '%s' is not the "
+                     "RIP-relative load this linker can relax (opcode %02x, "
+                     "modrm %02x)",
+                     symbol_name ? symbol_name : "<unknown>",
+                     (unsigned)*opcode, (unsigned)*modrm);
+    return 0;
+  }
+  if (patch_offset < 3u) {
+    mettle_set_error(error_message_out,
+                     "GOTPCRELX relocation for symbol '%s' has no room for the "
+                     "instruction it belongs to",
+                     symbol_name ? symbol_name : "<unknown>");
+    return 0;
+  }
+  rex = merged->data + patch_offset - 3u;
+  if ((*rex & 0xF0u) != 0x40u) {
+    mettle_set_error(error_message_out,
+                     "GOTPCRELX relocation for symbol '%s' folds into an "
+                     "immediate, which needs the REX prefix its operand width "
+                     "is written with (opcode %02x, prefix %02x)",
+                     symbol_name ? symbol_name : "<unknown>",
+                     (unsigned)*opcode, (unsigned)*rex);
+    return 0;
+  }
+  destination = (unsigned char)((*modrm >> 3) & 0x07u);
+  if (*opcode == 0x85u) {
+    *opcode = 0xF7u;
+    extension = 0u;
+  } else {
+    *opcode = 0x81u;
+  }
+  *modrm = (unsigned char)(0xC0u | (extension << 3) | destination);
+  *rex = (unsigned char)((*rex & 0xFAu) | ((*rex & 0x04u) >> 2));
+  *becomes_absolute_out = 1;
   return 1;
 }
 
@@ -140,6 +200,7 @@ static int link_apply_section_relocations(
     int64_t addend = 0;
     int64_t value = 0;
     size_t width = 0;
+    int gotpcrelx_absolute = 0;
 
     if (!relocation_resolve_target(resolution, input,
                                    relocation->symbol_index, &target,
@@ -185,8 +246,20 @@ static int link_apply_section_relocations(
 
     if (relocation->kind == LINK_RELOC_GOTPCRELX32 &&
         !relocation_relax_gotpcrelx(merged, patch_offset, target.name,
-                                    error_message_out)) {
+                                    &gotpcrelx_absolute, error_message_out)) {
       return 0;
+    }
+    if (gotpcrelx_absolute) {
+      value = (int64_t)target.virtual_address + addend + 4;
+      if (value < 0 || value > INT32_MAX) {
+        mettle_set_error(error_message_out,
+                             "GOTPCRELX relocation for symbol '%s' folds into "
+                             "an immediate that is out of range",
+                             target.name);
+        return 0;
+      }
+      linker_write_u32(merged->data + patch_offset, (uint32_t)(int32_t)value);
+      continue;
     }
     switch (relocation->kind) {
     case LINK_RELOC_PC32:
