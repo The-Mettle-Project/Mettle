@@ -1001,6 +1001,29 @@ static long long ii_narrow_int(long long v, int size, int is_unsigned) {
   }
 }
 
+/* An aggregate that fits in a register travels as its BYTES, not as an
+ * address: `s = arr[i]` on a two-int32 struct lowers to an 8-byte load feeding
+ * an aggregate assign, and a by-value argument of one is passed the same way.
+ * Fills `out` and answers 1 when the value is content rather than an address,
+ * which is decided by asking whether it addresses a live buffer at all. */
+static int ii_aggregate_value_is_bytes(IRInterpMachine *machine,
+                                       const IRInterpValue *value,
+                                       long long size, unsigned char *out) {
+  if (size <= 0 || size > 8 || value->is_float) {
+    return 0;
+  }
+  long long off = 0;
+  if (ii_addr_to_buffer(machine, (unsigned long long)ii_as_int(value), size,
+                        &off)) {
+    return 0; /* it really is an address */
+  }
+  unsigned long long raw = (unsigned long long)value->i;
+  for (long long i = 0; i < size; i++) {
+    out[i] = (unsigned char)((raw >> (i * 8)) & 0xFFu);
+  }
+  return 1;
+}
+
 static int ii_var_write(IRInterpMachine *machine, IIVar *var,
                         const IRInterpValue *value) {
   if (var->string_record && !value->is_float) {
@@ -1027,6 +1050,13 @@ static int ii_var_write(IRInterpMachine *machine, IIVar *var,
     long long src_off = 0, dst_off = 0;
     IIBuffer *sbuf = ii_addr_to_buffer(machine, src, var->agg_size, &src_off);
     IIBuffer *dbuf = ii_addr_to_buffer(machine, dst, var->agg_size, &dst_off);
+    if (!sbuf && dbuf) {
+      unsigned char bytes[8];
+      if (ii_aggregate_value_is_bytes(machine, value, var->agg_size, bytes)) {
+        memcpy(dbuf->data + dst_off, bytes, (size_t)var->agg_size);
+        return 1;
+      }
+    }
     if (!sbuf || !dbuf) {
       ii_fail(machine, IR_INTERP_TRAP,
               "aggregate copy out of bounds / after free");
@@ -1557,6 +1587,27 @@ static int ii_binary(IRInterpMachine *machine, const IRInstruction *insn,
   return 0;
 }
 
+static int ii_integer_cast_width(const char *type, int *size_out,
+                                 int *unsigned_out) {
+  static const struct {
+    const char *name;
+    int size;
+    int is_unsigned;
+  } widths[] = {{"int8", 1, 0},   {"int16", 2, 0},  {"int32", 4, 0},
+                {"int64", 8, 0},  {"uint8", 1, 1},  {"uint16", 2, 1},
+                {"uint32", 4, 1}, {"uint64", 8, 1}};
+  size_t i = 0u;
+
+  for (i = 0u; i < sizeof(widths) / sizeof(widths[0]); i++) {
+    if (strcmp(type, widths[i].name) == 0) {
+      *size_out = widths[i].size;
+      *unsigned_out = widths[i].is_unsigned;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
                    const IRInterpValue *in, IRInterpValue *out) {
   const char *type = insn->text ? insn->text : "";
@@ -1586,36 +1637,35 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
     return 1;
   }
   int size = 0, target_unsigned = 0;
-  if (strcmp(type, "int8") == 0) { size = 1; }
-  else if (strcmp(type, "int16") == 0) { size = 2; }
-  else if (strcmp(type, "int32") == 0) { size = 4; }
-  else if (strcmp(type, "int64") == 0) { size = 8; }
-  else if (strcmp(type, "uint8") == 0) { size = 1; target_unsigned = 1; }
-  else if (strcmp(type, "uint16") == 0) { size = 2; target_unsigned = 1; }
-  else if (strcmp(type, "uint32") == 0) { size = 4; target_unsigned = 1; }
-  else if (strcmp(type, "uint64") == 0) { size = 8; target_unsigned = 1; }
-  else if (strcmp(type, "bool") == 0) {
-    *out = ii_int_value(in->is_float ? in->f != 0.0 : in->i != 0);
-    return 1;
-  } else if (insn->value_type && insn->value_type->kind == MTLC_TYPE_ENUM) {
-    size = (insn->value_type->size == 1 || insn->value_type->size == 2 ||
-            insn->value_type->size == 8)
-               ? (int)insn->value_type->size
-               : 4;
-  } else if (insn->value_type &&
-             (insn->value_type->kind == MTLC_TYPE_POINTER ||
-              insn->value_type->kind == MTLC_TYPE_FUNCTION_POINTER ||
-              insn->value_type->kind == MTLC_TYPE_STRING)) {
-    *out = ii_int_value(ii_as_int(in));
-    return 1;
-  } else {
-    ii_fail(machine, IR_INTERP_UNSUPPORTED, "cast target type");
-    return 0;
+  if (!ii_integer_cast_width(type, &size, &target_unsigned)) {
+    if (strcmp(type, "bool") == 0) {
+      *out = ii_int_value(in->is_float ? in->f != 0.0 : in->i != 0);
+      return 1;
+    }
+    if (insn->value_type && insn->value_type->kind == MTLC_TYPE_ENUM) {
+      size = (insn->value_type->size == 1 || insn->value_type->size == 2 ||
+              insn->value_type->size == 8)
+                 ? (int)insn->value_type->size
+                 : 4;
+    } else if (insn->value_type &&
+               (insn->value_type->kind == MTLC_TYPE_POINTER ||
+                insn->value_type->kind == MTLC_TYPE_FUNCTION_POINTER ||
+                insn->value_type->kind == MTLC_TYPE_STRING)) {
+      *out = ii_int_value(ii_as_int(in));
+      return 1;
+    } else {
+      ii_fail(machine, IR_INTERP_UNSUPPORTED, "cast target type");
+      return 0;
+    }
   }
 
   long long v;
   if (in->is_float) {
-    /* Float -> int: truncate toward zero; x86 cvtt sentinel on overflow/NaN. */
+    /* Float -> int: truncate toward zero; x86 cvtt sentinel on overflow/NaN.
+     * The machine always truncates at 64 bits and narrows afterwards, so only
+     * the 64-bit range has a sentinel. Checking a 4-byte target against the
+     * int32 range instead answered 0x80000000 for `(uint32)4e9`, where the
+     * hardware gives 4000000000. */
     double d = in->f;
     if (size == 8 && target_unsigned) {
       /* A uint64 target reaches 2^64, and the backend biases the value down
@@ -1625,14 +1675,8 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
       } else {
         v = (long long)(unsigned long long)d;
       }
-    } else if (size == 8 || size == 4) {
-      double lo = size == 8 ? -9223372036854775808.0 : -2147483648.0;
-      double hi = size == 8 ? 9223372036854775808.0 : 2147483648.0;
-      if (!(d >= lo && d < hi)) {
-        v = size == 8 ? LLONG_MIN : (long long)INT_MIN;
-      } else {
-        v = (long long)d;
-      }
+    } else if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0)) {
+      v = LLONG_MIN;
     } else {
       v = (long long)d;
     }
@@ -1852,10 +1896,16 @@ static int ii_copy_aggregate_args(IRInterpMachine *machine, IIFrame *frame,
     unsigned long long src = (unsigned long long)ii_as_int(&args[i]);
     long long src_off = 0;
     IIBuffer *sbuf = ii_addr_to_buffer(machine, src, size, &src_off);
+    unsigned char inline_bytes[8];
+    int carried_in_value = 0;
     if (!sbuf) {
-      ii_fail(machine, IR_INTERP_TRAP,
-              "aggregate argument out of bounds / after free");
-      return 0;
+      carried_in_value =
+          ii_aggregate_value_is_bytes(machine, &args[i], size, inline_bytes);
+      if (!carried_in_value) {
+        ii_fail(machine, IR_INTERP_TRAP,
+                "aggregate argument out of bounds / after free");
+        return 0;
+      }
     }
     unsigned long long copy = ii_add_buffer_ex(machine, NULL, size, 1);
     if (!copy ||
@@ -1866,16 +1916,23 @@ static int ii_copy_aggregate_args(IRInterpMachine *machine, IIFrame *frame,
     }
     long long dst_off = 0;
     IIBuffer *dbuf = ii_addr_to_buffer(machine, copy, size, &dst_off);
-    sbuf = ii_addr_to_buffer(machine, src, size, &src_off);
-    if (!dbuf || !sbuf) {
+    sbuf = carried_in_value ? NULL
+                            : ii_addr_to_buffer(machine, src, size, &src_off);
+    if (!dbuf || (!sbuf && !carried_in_value)) {
       ii_fail(machine, IR_INTERP_TRAP, "aggregate argument copy");
       return 0;
     }
-    memcpy(dbuf->data + dst_off, sbuf->data + src_off, (size_t)size);
-    if (dbuf->init_map && sbuf->init_map) {
-      memcpy(dbuf->init_map + dst_off, sbuf->init_map + src_off, (size_t)size);
-    } else {
+    if (carried_in_value) {
+      memcpy(dbuf->data + dst_off, inline_bytes, (size_t)size);
       ii_mark_bytes(dbuf, dst_off, size, 1);
+    } else {
+      memcpy(dbuf->data + dst_off, sbuf->data + src_off, (size_t)size);
+      if (dbuf->init_map && sbuf->init_map) {
+        memcpy(dbuf->init_map + dst_off, sbuf->init_map + src_off,
+               (size_t)size);
+      } else {
+        ii_mark_bytes(dbuf, dst_off, size, 1);
+      }
     }
     args[i] = ii_int_value((long long)copy);
   }
