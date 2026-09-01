@@ -6,12 +6,19 @@
 # Downloads the latest Mettle release for this platform, installs it under
 # ~/.mettle, and adds the compiler to your PATH. No root required.
 #
+# --from-source builds with CMake instead of downloading, which is what you
+# want on an architecture no release ships for, or from a checkout you have
+# edited. It needs cmake, a C compiler, ld and ar, and it takes minutes.
+#
 # Environment overrides:
 #   METTLE_VERSION      install a specific tag (e.g. v0.13.0) instead of latest
 #   METTLE_INSTALL_DIR  install location (default: ~/.mettle)
 #   METTLE_NO_MODIFY_PATH=1  install but don't touch shell rc files
+#   METTLE_FROM_SOURCE=1     build from source instead of downloading
+#   METTLE_BUILD_TYPE        Release (default) or Debug, with --from-source
 #
-# Flags: --version <tag>, --dir <path>, --no-modify-path, --help
+# Flags: --version <tag>, --dir <path>, --from-source, --debug,
+#        --no-modify-path, --help
 
 set -eu
 
@@ -19,6 +26,8 @@ REPO="suidvandiewereld/Mettle"
 INSTALL_DIR="${METTLE_INSTALL_DIR:-$HOME/.mettle}"
 VERSION="${METTLE_VERSION:-}"
 NO_MODIFY_PATH="${METTLE_NO_MODIFY_PATH:-}"
+FROM_SOURCE="${METTLE_FROM_SOURCE:-}"
+BUILD_TYPE="${METTLE_BUILD_TYPE:-Release}"
 
 # --- pretty output (only colorize an interactive terminal) ------------------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -45,10 +54,13 @@ Usage: install.sh [options]
 Options:
   --version <tag>     Install a specific release (default: latest)
   --dir <path>        Install location (default: ~/.mettle)
+  --from-source       Build with CMake instead of downloading a release
+  --debug             Build a Debug compiler (implies --from-source)
   --no-modify-path    Don't add Mettle to your shell PATH
   -h, --help          Show this help
 
-Environment: METTLE_VERSION, METTLE_INSTALL_DIR, METTLE_NO_MODIFY_PATH
+Environment: METTLE_VERSION, METTLE_INSTALL_DIR, METTLE_NO_MODIFY_PATH,
+             METTLE_FROM_SOURCE, METTLE_BUILD_TYPE
 EOF
 }
 
@@ -56,6 +68,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="${2:-}"; shift 2 ;;
     --dir)     INSTALL_DIR="${2:-}"; shift 2 ;;
+    --from-source) FROM_SOURCE=1; shift ;;
+    --debug)   FROM_SOURCE=1; BUILD_TYPE=Debug; shift ;;
     --no-modify-path) NO_MODIFY_PATH=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
@@ -66,7 +80,6 @@ need() { command -v "$1" >/dev/null 2>&1; }
 
 # --- detect platform --------------------------------------------------------
 os="$(uname -s)"
-arch="$(uname -m)"
 
 case "$os" in
   Linux) platform="linux" ;;
@@ -76,62 +89,112 @@ case "$os" in
   *) die "unsupported OS '$os'. Mettle ships Linux and Windows builds." ;;
 esac
 
-case "$arch" in
-  x86_64|amd64) arch="x64" ;;
-  *) die "unsupported architecture '$arch'. Mettle currently targets x86-64." ;;
-esac
-
-target="${platform}-${arch}"
-
-# --- pick a downloader ------------------------------------------------------
-if need curl; then
-  dl() { curl -fsSL "$1" -o "$2"; }
-  dl_stdout() { curl -fsSL "$1"; }
-elif need wget; then
-  dl() { wget -qO "$2" "$1"; }
-  dl_stdout() { wget -qO - "$1"; }
-else
-  die "need curl or wget to download Mettle."
-fi
-
-need tar || die "need tar to unpack the Mettle release."
-
-# --- resolve version --------------------------------------------------------
-if [ -z "$VERSION" ]; then
-  say "Finding the latest Mettle release..."
-  api="https://api.github.com/repos/$REPO/releases/latest"
-  # Pull "tag_name": "vX.Y.Z" out of the JSON without needing jq.
-  VERSION="$(dl_stdout "$api" 2>/dev/null \
-    | grep -m1 '"tag_name"' \
-    | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')" || true
-  [ -n "$VERSION" ] || die "could not determine the latest release. Set METTLE_VERSION=vX.Y.Z and retry, or check https://github.com/$REPO/releases."
-fi
-
-bundle="mettle-${VERSION}-${target}"
-# METTLE_BASE_URL lets a mirror or a local test server stand in for GitHub.
-base_url="${METTLE_BASE_URL:-https://github.com/$REPO/releases/download/${VERSION}}"
-url="${base_url}/${bundle}.tar.gz"
-
-printf '%sInstalling Mettle %s%s%s for %s%s%s\n' \
-  "$BOLD" "$GREEN" "$VERSION" "$RESET$BOLD" "$GREEN" "$target" "$RESET"
-
-# --- download + extract -----------------------------------------------------
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/mettle-install.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-say "Downloading $url"
-if ! dl "$url" "$tmp/mettle.tar.gz"; then
-  die "download failed. Does $VERSION ship a $target build? See https://github.com/$REPO/releases."
+# --- build from source ------------------------------------------------------
+# Sets $src to a staged tree with the same bin/ stdlib/ runtime/ layout the
+# release tarball has, so the install step below does not care which path ran.
+build_from_source() {
+  need cmake || die "--from-source needs cmake."
+  need cc || need gcc || die "--from-source needs a C compiler (cc or gcc)."
+  need ld || die "--from-source needs ld."
+  need ar || die "--from-source needs ar."
+
+  # A checkout next to this script is the source. Otherwise clone one, and
+  # only then is a version a ref to check out: a checkout the user is sitting
+  # in is theirs, and moving it off their branch is not the installer's call.
+  self_dir="$(unset CDPATH; cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)" || self_dir=""
+  if [ -n "$self_dir" ] && [ -f "$self_dir/CMakeLists.txt" ]; then
+    checkout="$self_dir"
+    [ -z "$VERSION" ] || warn "ignoring --version $VERSION: building the checkout at $checkout as it stands"
+  elif [ -f ./CMakeLists.txt ]; then
+    checkout="$(pwd)"
+    [ -z "$VERSION" ] || warn "ignoring --version $VERSION: building the checkout at $checkout as it stands"
+  else
+    need git || die "need git to clone $REPO for a source build."
+    say "Cloning https://github.com/$REPO"
+    if [ -n "$VERSION" ]; then
+      git clone --depth 1 --branch "$VERSION" "https://github.com/$REPO.git" "$tmp/Mettle"         || die "could not clone $VERSION. Check https://github.com/$REPO/releases."
+    else
+      git clone --depth 1 "https://github.com/$REPO.git" "$tmp/Mettle" || die "clone failed."
+    fi
+    checkout="$tmp/Mettle"
+  fi
+
+  [ -f "$checkout/CMakeLists.txt" ] || die "no CMakeLists.txt in $checkout."
+
+  jobs="$( (need nproc && nproc) || echo 4)"
+  say "Configuring $BUILD_TYPE in $tmp/build"
+  cmake -S "$checkout" -B "$tmp/build"     -DCMAKE_BUILD_TYPE="$BUILD_TYPE"     ${NINJA_GEN:+-G Ninja} >/dev/null || die "cmake configure failed."
+  say "Building with $jobs jobs (this takes a few minutes)"
+  cmake --build "$tmp/build" --parallel "$jobs" || die "build failed."
+  cmake --install "$tmp/build" --prefix "$tmp/stage" >/dev/null || die "staging failed."
+
+  src="$tmp/stage"
+  [ -f "$src/bin/mettle" ] || die "the build produced no bin/mettle."
+}
+
+# --- download a release -----------------------------------------------------
+# Sets $src to the unpacked release bundle.
+download_release() {
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch="x64" ;;
+    *) die "no release ships for '$arch'. Build one instead: install.sh --from-source" ;;
+  esac
+  target="${platform}-${arch}"
+
+  if need curl; then
+    dl() { curl -fsSL "$1" -o "$2"; }
+    dl_stdout() { curl -fsSL "$1"; }
+  elif need wget; then
+    dl() { wget -qO "$2" "$1"; }
+    dl_stdout() { wget -qO - "$1"; }
+  else
+    die "need curl or wget to download Mettle (or build it: --from-source)."
+  fi
+
+  need tar || die "need tar to unpack the Mettle release."
+
+  if [ -z "$VERSION" ]; then
+    say "Finding the latest Mettle release..."
+    api="https://api.github.com/repos/$REPO/releases/latest"
+    # Pull "tag_name": "vX.Y.Z" out of the JSON without needing jq.
+    VERSION="$(dl_stdout "$api" 2>/dev/null \
+      | grep -m1 '"tag_name"' \
+      | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')" || true
+    [ -n "$VERSION" ] || die "could not determine the latest release. Set METTLE_VERSION=vX.Y.Z and retry, or check https://github.com/$REPO/releases."
+  fi
+
+  bundle="mettle-${VERSION}-${target}"
+  # METTLE_BASE_URL lets a mirror or a local test server stand in for GitHub.
+  base_url="${METTLE_BASE_URL:-https://github.com/$REPO/releases/download/${VERSION}}"
+  url="${base_url}/${bundle}.tar.gz"
+
+  printf '%sInstalling Mettle %s%s%s for %s%s%s\n' \
+    "$BOLD" "$GREEN" "$VERSION" "$RESET$BOLD" "$GREEN" "$target" "$RESET"
+
+  say "Downloading $url"
+  if ! dl "$url" "$tmp/mettle.tar.gz"; then
+    die "download failed. Does $VERSION ship a $target build? See https://github.com/$REPO/releases."
+  fi
+  [ -s "$tmp/mettle.tar.gz" ] || die "downloaded archive is empty."
+
+  say "Unpacking..."
+  tar -xzf "$tmp/mettle.tar.gz" -C "$tmp" || die "failed to unpack the archive."
+
+  # The tarball contains a top-level <bundle>/ directory.
+  src="$tmp/$bundle"
+  [ -d "$src" ] || src="$tmp"
+  [ -f "$src/bin/mettle" ] || die "archive did not contain bin/mettle (unexpected layout)."
+}
+
+if [ -n "$FROM_SOURCE" ]; then
+  build_from_source
+else
+  download_release
 fi
-[ -s "$tmp/mettle.tar.gz" ] || die "downloaded archive is empty."
-
-say "Unpacking..."
-tar -xzf "$tmp/mettle.tar.gz" -C "$tmp" || die "failed to unpack the archive."
-
-# The tarball contains a top-level <bundle>/ directory.
-src="$tmp/$bundle"
-[ -d "$src" ] || src="$tmp"
-[ -f "$src/bin/mettle" ] || die "archive did not contain bin/mettle (unexpected layout)."
 
 # --- install (replace any prior install atomically-ish) ---------------------
 say "Installing to $INSTALL_DIR"
@@ -208,7 +271,8 @@ else
 fi
 
 # --- done -------------------------------------------------------------------
-printf '\n%sMettle %s is installed.%s\n' "$GREEN$BOLD" "$VERSION" "$RESET"
+printf '\n%sMettle %s is installed.%s\n' \
+  "$GREEN$BOLD" "${VERSION:-(built from source)}" "$RESET"
 if [ "${PATH_NEEDS_RELOAD:-}" = "1" ]; then
   printf 'Open a new terminal (or run %ssource %s%s), then:\n' "$BOLD" "${rc:-your shell rc}" "$RESET"
 else

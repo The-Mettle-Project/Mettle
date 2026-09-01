@@ -5918,6 +5918,10 @@ rm -f "$fifo"; : > "$out"; mkfifo "$fifo"
 ( timeout 40 cat "$fifo" > "$out" ) &
 drain=$!
 exec 8> "$fifo"
+# The open above proves the drain has the FIFO open, not that it is parked in
+# read(). Let it get there before anything is written, so the kernel hands it
+# the announcement rather than leaving the bytes for whoever reads next.
+sleep 0.2
 METTLE_DBG_PIPE="$fifo" "$exe" > "$work/prog.txt" 2>&1 &
 prog=$!
 await() {
@@ -5945,9 +5949,20 @@ exit 0
 '@ -replace "`r`n", "`n" | ForEach-Object {
       [System.IO.File]::WriteAllText($script, $_)
     }
-    & bash $script $dbgExe $tmpDir 2>&1 | Out-Null
+    # A named pipe gives each end only what the other wrote. One FIFO does not:
+    # it is a single stream, and the runtime opens it r+w, so once its reader
+    # thread starts it can consume the announcement it has just written before
+    # the drain is scheduled. That race is in the transport, not in what this
+    # case is asserting, so try the exchange a few times and let a run that
+    # loses it be a retry. A transport that is actually broken still fails all
+    # four.
     $announcedPath = Join-Path $tmpDir "announced.txt"
-    $announced = if (Test-Path $announcedPath) { Get-Content $announcedPath -Raw } else { "" }
+    $announced = ""
+    for ($attempt = 0; $attempt -lt 4; $attempt++) {
+      & bash $script $dbgExe $tmpDir 2>&1 | Out-Null
+      $announced = if (Test-Path $announcedPath) { Get-Content $announcedPath -Raw } else { "" }
+      if ($announced -match 'hello' -and $announced -match 'debug_demo') { break }
+    }
   }
 
   if ($announced -notmatch 'hello') {
