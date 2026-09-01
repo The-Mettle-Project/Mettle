@@ -559,6 +559,15 @@ static int ir_ptr_collect_bindings(const IRFunction *function,
       return added == 0 ? 0 : -1;
     }
   }
+  for (size_t b = 0; b < *binding_count; b++) {
+    for (size_t i = body_start; i < body_end; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ir_instruction_writes_destination(ins) &&
+          ir_operand_is_symbol_named(&ins->dest, bindings[b].base)) {
+        return -1;
+      }
+    }
+  }
   return 1;
 }
 

@@ -402,6 +402,8 @@ typedef struct {
    * so the count travels with the pointer. NULL for `new T`, which allocates
    * one and yields `T*`. */
   ASTNode *count;
+  ASTNode **extents;
+  size_t extent_count;
 } NewExpression;
 
 typedef struct {
@@ -646,6 +648,7 @@ ASTNode *ast_create_new_expression(const char *type_name,
 void ast_release_children(ASTNode *node);
 
 /* `new T[count]`: a heap array whose length travels with it, as `T[]`. */
+int ast_new_expression_add_extent(ASTNode *node, ASTNode *extent);
 ASTNode *ast_create_new_array_expression(const char *type_name, ASTNode *count,
                                          SourceLocation location);
 ASTNode *ast_create_field_assignment(ASTNode *target, ASTNode *value,

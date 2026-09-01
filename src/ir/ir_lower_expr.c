@@ -2290,6 +2290,109 @@ static int ir_lower_func_ptr_call(IRLoweringContext *context,
   return 1;
 }
 
+static int ir_lower_new_view(IRLoweringContext *context, IRFunction *function,
+                             ASTNode *expression, NewExpression *new_expression,
+                             Type *view_type, IROperand *out_value) {
+  size_t rank = type_view_rank(view_type);
+  Type *element = view_type->base_type;
+  IROperand extents[16];
+  IROperand leads[16];
+  IROperand total = ir_operand_none();
+  IROperand bytes = ir_operand_none();
+  IROperand pointer = ir_operand_none();
+  IROperand view_address = ir_operand_none();
+  IROperand element_size = ir_operand_none();
+  IRInstruction allocate = {0};
+  char *view_name = NULL;
+  int ok = 0;
+
+  for (size_t k = 0; k < 16; k++) {
+    extents[k] = ir_operand_none();
+    leads[k] = ir_operand_none();
+  }
+  if (rank > 16 || new_expression->extent_count + 1 != rank) {
+    ir_set_error(context, "'new T[m, n]' extent count does not match its view");
+    return 0;
+  }
+  if (!ir_lower_expression(context, function, new_expression->count,
+                           &extents[0])) {
+    return 0;
+  }
+  for (size_t k = 1; k < rank; k++) {
+    if (!ir_lower_expression(context, function,
+                             new_expression->extents[k - 1], &extents[k])) {
+      goto done;
+    }
+  }
+  for (size_t k = rank - 1; k > 0; k--) {
+    if (k == rank - 1) {
+      leads[k - 1] = ir_clone_operand_local(&extents[k]);
+      if (leads[k - 1].kind != extents[k].kind) {
+        goto done;
+      }
+    } else if (!ir_emit_binary_temp(context, function, "*", &leads[k],
+                                    &extents[k], expression->location,
+                                    &leads[k - 1])) {
+      goto done;
+    }
+  }
+  if (!ir_emit_binary_temp(context, function, "*", &extents[0], &leads[0],
+                           expression->location, &total)) {
+    goto done;
+  }
+  element_size = ir_operand_int((long long)element->size);
+  if (!ir_emit_binary_temp(context, function, "*", &total, &element_size,
+                           expression->location, &bytes) ||
+      !ir_make_temp_operand(context, &pointer)) {
+    goto done;
+  }
+  allocate.op = IR_OP_NEW;
+  allocate.location = expression->location;
+  allocate.dest = pointer;
+  allocate.rhs = bytes;
+  allocate.text = (char *)ir_backend_type_name(new_expression->type_name);
+  if (!ir_emit(context, function, &allocate)) {
+    goto done;
+  }
+  view_name = ir_new_label_name(context, "view");
+  if (!view_name ||
+      !ir_emit_local_declaration(context, function, view_name,
+                                 view_type->name, expression->location) ||
+      !ir_emit_address_of_symbol(context, function, view_name,
+                                 expression->location, &view_address) ||
+      !ir_emit_store_word(context, function, &view_address, 0, &pointer,
+                          expression->location)) {
+    goto done;
+  }
+  for (size_t k = 0; k < rank; k++) {
+    if (!ir_emit_store_word(context, function, &view_address, 8 + 8 * k,
+                            &extents[k], expression->location)) {
+      goto done;
+    }
+  }
+  for (size_t k = 0; k + 1 < rank; k++) {
+    if (!ir_emit_store_word(context, function, &view_address,
+                            8 + 8 * rank + 8 * k, &leads[k],
+                            expression->location)) {
+      goto done;
+    }
+  }
+  *out_value = ir_operand_symbol(view_name);
+  ok = out_value->name != NULL;
+
+done:
+  free(view_name);
+  for (size_t k = 0; k < 16; k++) {
+    ir_operand_destroy(&extents[k]);
+    ir_operand_destroy(&leads[k]);
+  }
+  ir_operand_destroy(&total);
+  ir_operand_destroy(&bytes);
+  ir_operand_destroy(&pointer);
+  ir_operand_destroy(&view_address);
+  return ok;
+}
+
 static int ir_lower_new_expression(IRLoweringContext *context,
                                    IRFunction *function,
                                    ASTNode *expression,
@@ -2643,6 +2746,10 @@ static int ir_lower_new_expression(IRLoweringContext *context,
       ir_set_error(context, "'new T[n]' reached lowering without a slice "
                             "type");
       return 0;
+    }
+    if (type_view_rank(slice_type) > 1) {
+      return ir_lower_new_view(context, function, expression, new_expression,
+                               slice_type, out_value);
     }
     if (!ir_lower_expression(context, function, new_expression->count,
                              &count) ||

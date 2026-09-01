@@ -169,8 +169,10 @@ static int symbol_table_types_compatible(const Type *lhs, const Type *rhs) {
     return lhs->array_size == rhs->array_size &&
            symbol_table_types_compatible(lhs->base_type, rhs->base_type);
   case TYPE_POINTER:
-  case TYPE_SLICE:
     return symbol_table_types_compatible(lhs->base_type, rhs->base_type);
+  case TYPE_SLICE:
+    return type_view_rank(lhs) == type_view_rank(rhs) &&
+           symbol_table_types_compatible(lhs->base_type, rhs->base_type);
   case TYPE_STRUCT:
     if (lhs->name && rhs->name) {
       return symbol_table_names_equal(lhs->name, rhs->name);
@@ -429,6 +431,7 @@ Type *type_create(TypeKind kind, const char *name) {
   type->alignment = 0;
   type->base_type = NULL;
   type->array_size = 0;
+  type->view_rank = 0;
   type->fn_param_types = NULL;
   type->fn_param_count = 0;
   type->fn_return_type = NULL;
@@ -916,7 +919,20 @@ Type *type_get_field_type(Type *struct_type, const char *field_name) {
     }
   }
 
+  if (type_view_rank(struct_type) > 1 && struct_type->field_count > 1 &&
+      struct_type->field_types[1] &&
+      symbol_table_names_equal(field_name, "length")) {
+    return struct_type->field_types[1]->base_type;
+  }
+
   return NULL; // Field not found
+}
+
+size_t type_view_rank(const Type *type) {
+  if (!type || type->kind != TYPE_SLICE) {
+    return 0;
+  }
+  return type->view_rank > 1 ? type->view_rank : 1;
 }
 
 size_t type_get_field_offset(Type *struct_type, const char *field_name) {
@@ -925,6 +941,10 @@ size_t type_get_field_offset(Type *struct_type, const char *field_name) {
        struct_type->kind != TYPE_SLICE) ||
       !field_name) {
     return 0;
+  }
+  if (type_view_rank(struct_type) > 1 &&
+      symbol_table_names_equal(field_name, "length")) {
+    return 8;
   }
 
   for (size_t i = 0; i < struct_type->field_count; i++) {

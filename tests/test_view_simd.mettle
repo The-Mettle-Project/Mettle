@@ -1,0 +1,73 @@
+// The promise a view makes to the optimizer: a row is unit stride by
+// construction, so a loop over one vectorizes with no new recognizer. The
+// contract fails the build if a slice or view row loop stays scalar, which is
+// what happened before the descriptor loads were hoisted and named: every
+// `@simd!` over a slice died with "accesses 64-bit integers".
+
+extern fn free(ptr: rawptr) = "free";
+
+@noinline fn scale_rows(v: float32[,], k: float32) {
+  for i in 0..v.dims[0] {
+    var row: float32[] = v[i];
+    @simd! for j in 0..row.length { row[j] = row[j] * k + 1.0; }
+  }
+}
+
+@noinline fn row_sum(v: float32[,], i: int64) -> float32 {
+  var row: float32[] = v[i];
+  var s: float32 = 0.0;
+  @simd! for j in 0..row.length { s = s + row[j]; }
+  return s;
+}
+
+@noinline fn slice_scale(row: float32[], k: float32) {
+  @simd! for j in 0..row.length { row[j] = row[j] * k; }
+}
+
+@noinline fn fill_rows(v: int32[,], base: int32) {
+  for i in 0..v.dims[0] {
+    for j in 0..v.dims[1] {
+      v[i][j] = base + (int32)i * 100 + (int32)j;
+    }
+  }
+}
+
+fn checks() -> int32 {
+  for n in 1..41 {
+    var v: float32[,] = new float32[3, n];
+    for i in 0..3 { for j in 0..n { v[i][j] = (float32)(i * 10 + j); } }
+    scale_rows(v, 2.0);
+    for i in 0..3 {
+      for j in 0..n {
+        if (v[i][j] != (float32)(i * 10 + j) * 2.0 + 1.0) { free(v.data); return 1; }
+      }
+    }
+    var total: float32 = 0.0;
+    for i in 0..3 { total = total + row_sum(v, i); }
+    var expect: float32 = 0.0;
+    for i in 0..3 { for j in 0..n { expect = expect + (float32)(i * 10 + j) * 2.0 + 1.0; } }
+    if (total != expect) { free(v.data); return 2; }
+    slice_scale(v[1], 0.5);
+    if (v[1][n - 1] != ((float32)(10 + n - 1) * 2.0 + 1.0) * 0.5) { free(v.data); return 3; }
+    free(v.data);
+
+    var m: int32[,] = new int32[2, n];
+    fill_rows(m, 7);
+    for i in 0..2 {
+      for j in 0..n {
+        if (m[i][j] != 7 + (int32)i * 100 + (int32)j) { free(m.data); return 4; }
+      }
+    }
+    free(m.data);
+  }
+  return 0;
+}
+
+@test fn test_view_simd_matches_native() -> int64 {
+  assert_eq(checks(), 0);
+  return 0;
+}
+
+fn main() -> int32 {
+  return checks();
+}

@@ -1704,6 +1704,27 @@ static int ir_lower_gpu_launch(IRLoweringContext *context,
     if (!source_type) {
       source_type = ir_infer_expression_type(context, source_arg);
     }
+    if (launch->typed_kernel && source_arg &&
+        source_arg->type == AST_NUMBER_LITERAL && launch->kernel &&
+        launch->kernel->type == AST_IDENTIFIER && launch->kernel->data &&
+        context->type_checker) {
+      const char *kernel_name = ((Identifier *)launch->kernel->data)->name;
+      Symbol *kernel_symbol =
+          kernel_name ? symbol_table_lookup(context->type_checker->symbol_table,
+                                            kernel_name)
+                      : NULL;
+      Type *declared =
+          kernel_symbol && kernel_symbol->kind == SYMBOL_FUNCTION &&
+                  kernel_symbol->data.function.parameter_types &&
+                  i < kernel_symbol->data.function.parameter_count
+              ? kernel_symbol->data.function.parameter_types[i]
+              : NULL;
+      if (declared && (declared->kind == TYPE_FLOAT32 ||
+                       declared->kind == TYPE_FLOAT64 ||
+                       type_checker_is_integer_type(declared))) {
+        source_type = declared;
+      }
+    }
     argument_types[controls + i] =
         mtlc_type_from_frontend(source_type);
     if (!argument_types[controls + i]) {

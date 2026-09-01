@@ -53,6 +53,7 @@ typedef struct Type {
   size_t alignment;
   struct Type *base_type; // For pointers and arrays
   size_t array_size;      // For arrays
+  size_t view_rank;
   struct Type **fn_param_types; // For function pointers
   size_t fn_param_count;        // For function pointers
   struct Type *fn_return_type;  // For function pointers
@@ -246,6 +247,7 @@ Type *type_create_struct(const char *name, char **field_names,
                          Type **field_types, size_t field_count);
 Type *type_get_field_type(Type *struct_type, const char *field_name);
 size_t type_get_field_offset(Type *struct_type, const char *field_name);
+size_t type_view_rank(const Type *type);
 int type_get_field_index(const Type *struct_type, const char *field_name);
 
 /* One ordered struct (or string) field, as the type table answers it. */

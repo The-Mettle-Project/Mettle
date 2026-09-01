@@ -1,0 +1,27 @@
+// A view crosses the launch boundary as a record: the data pointer, the
+// extents, and the leading dimension arrive as the kernel's own bytes, and
+// `v[i]` inside the kernel is the same row operation the host has. The row is
+// a 16-byte local copied whole, which is what the emitter's widened aggregate
+// store exists for.
+
+kernel(block = 32) scale_rows(v: float32[,], k: float32) {
+  var i: int64 = (int64)thread.x;
+  if (i < v.dims[0]) {
+    var row: float32[] = v[i];
+    for j in 0..row.length {
+      row[j] = row[j] * k;
+    }
+  }
+}
+
+kernel(block = 32) fill_pages(w: int32[,,], base: int32) {
+  var b: int64 = (int64)thread.x;
+  if (b < w.dims[0]) {
+    var page: int32[,] = w[b];
+    for i in 0..page.dims[0] {
+      for j in 0..page.dims[1] {
+        page[i][j] = base + (int32)(b * 100 + i * 10 + j);
+      }
+    }
+  }
+}

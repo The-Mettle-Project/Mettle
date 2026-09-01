@@ -102,6 +102,52 @@ int ir_build_slice_operand_from_array(IRLoweringContext *context,
   ir_operand_destroy(&store.dest);
   ir_operand_destroy(&array_address);
 
+  if (type_view_rank(slice_type) > 1) {
+    size_t rank = type_view_rank(slice_type);
+    Type *level = array_type;
+    long long extents[16];
+    long long stride = 1;
+    if (rank > 16) {
+      ir_operand_destroy(&slice_address);
+      free(slice_name);
+      return 0;
+    }
+    for (size_t k = 0; k < rank; k++) {
+      if (!level || level->kind != TYPE_ARRAY) {
+        ir_operand_destroy(&slice_address);
+        free(slice_name);
+        return 0;
+      }
+      extents[k] = (long long)level->array_size;
+      level = level->base_type;
+    }
+    for (size_t k = 0; k < rank; k++) {
+      IROperand extent = ir_operand_int(extents[k]);
+      if (!ir_emit_store_word(context, function, &slice_address, 8 + 8 * k,
+                              &extent, location)) {
+        ir_operand_destroy(&slice_address);
+        free(slice_name);
+        return 0;
+      }
+    }
+    for (size_t k = rank - 1; k > 0; k--) {
+      IROperand lead;
+      stride *= extents[k];
+      lead = ir_operand_int(stride);
+      if (!ir_emit_store_word(context, function, &slice_address,
+                              8 + 8 * rank + 8 * (k - 1), &lead, location)) {
+        ir_operand_destroy(&slice_address);
+        free(slice_name);
+        return 0;
+      }
+    }
+    ir_operand_destroy(&slice_address);
+    ir_operand_destroy(value);
+    *value = ir_operand_symbol(slice_name);
+    free(slice_name);
+    return value->name != NULL;
+  }
+
   if (!ir_emit_address_with_offset(context, function, &slice_address, 8,
                                    location, &slot)) {
     ir_operand_destroy(&slice_address);

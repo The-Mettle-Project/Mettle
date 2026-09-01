@@ -163,8 +163,7 @@ int type_compute_layout(Type *type) {
     type->alignment = 8;
     return 1;
   case TYPE_SLICE:
-    /* { pointer, length }, same shape as string. */
-    type->size = 16;
+    type->size = 16 * type_view_rank(type);
     type->alignment = 8;
     return 1;
   case TYPE_ARRAY:

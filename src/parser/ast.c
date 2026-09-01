@@ -651,10 +651,20 @@ static ASTNode *ast_clone_new_expression(ASTNode *clone, const ASTNode *node) {
   }
   dst->type_name = ast_intern_string(src->type_name);
   dst->count = src->count ? ast_clone_node(src->count) : NULL;
+  dst->extents = NULL;
+  dst->extent_count = 0;
   if (dst->count) {
     ast_add_child(clone, dst->count);
   }
   clone->data = dst;
+  for (size_t i = 0; i < src->extent_count; i++) {
+    ASTNode *extent = ast_clone_node(src->extents[i]);
+    if (!extent || !ast_new_expression_add_extent(clone, extent)) {
+      ast_destroy_node(extent);
+      ast_destroy_node(clone);
+      return NULL;
+    }
+  }
   return clone;
 }
 
@@ -1422,6 +1432,7 @@ void ast_destroy_node(ASTNode *node) {
     NewExpression *new_expr = (NewExpression *)node->data;
     if (new_expr) {
       ast_free_string(new_expr->type_name);
+      free(new_expr->extents);
       free(new_expr);
     }
     break;
@@ -2527,9 +2538,28 @@ ASTNode *ast_create_new_expression(const char *type_name,
 
   new_expr->type_name = ast_intern_string(type_name);
   new_expr->count = NULL;
+  new_expr->extents = NULL;
+  new_expr->extent_count = 0;
   node->data = new_expr;
 
   return node;
+}
+
+int ast_new_expression_add_extent(ASTNode *node, ASTNode *extent) {
+  NewExpression *new_expr = node ? (NewExpression *)node->data : NULL;
+  ASTNode **grown = NULL;
+  if (!new_expr || !extent) {
+    return 0;
+  }
+  grown = realloc(new_expr->extents,
+                  (new_expr->extent_count + 1) * sizeof(ASTNode *));
+  if (!grown) {
+    return 0;
+  }
+  new_expr->extents = grown;
+  new_expr->extents[new_expr->extent_count++] = extent;
+  ast_add_child(node, extent);
+  return 1;
 }
 
 /* Drop a node's claim on its children without freeing them. The compiler uses

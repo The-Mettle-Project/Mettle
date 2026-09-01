@@ -412,6 +412,12 @@ int ir_emit_local_declaration(IRLoweringContext *context,
   local.location = location;
   local.dest = ir_operand_symbol(name);
   local.text = (char *)ir_backend_type_name(type_name);
+  {
+    Type *resolved = ir_resolve_named_type(context, type_name);
+    if (resolved) {
+      local.value_type = mtlc_type_from_frontend(resolved);
+    }
+  }
   if (!local.dest.name) {
     ir_set_error(context, "Out of memory while declaring IR local '%s'", name);
     return 0;
@@ -1003,6 +1009,111 @@ static int ir_lower_member_address(IRLoweringContext *context,
                                    IROperand *out_address,
                                    Type **out_type);
 
+static int ir_lower_view_row_address(IRLoweringContext *context,
+                                     IRFunction *function,
+                                     ASTNode *expression,
+                                     ArrayIndexExpression *index_expression,
+                                     Type *view_type, IROperand *out_address,
+                                     Type **out_type) {
+  size_t rank = type_view_rank(view_type);
+  Type *row_type = ir_infer_expression_type(context, expression);
+  IROperand view_address = ir_operand_none();
+  IROperand index = ir_operand_none();
+  IROperand base = ir_operand_none();
+  IROperand lead = ir_operand_none();
+  IROperand scaled = ir_operand_none();
+  IROperand bytes = ir_operand_none();
+  IROperand data = ir_operand_none();
+  IROperand row_address = ir_operand_none();
+  IROperand element_size = ir_operand_none();
+  char *row_name = NULL;
+  int ok = 0;
+
+  if (!row_type || row_type->kind != TYPE_SLICE || !view_type->base_type) {
+    ir_set_error(context, "View row reached lowering without a row type");
+    return 0;
+  }
+  if (!ir_lower_lvalue_address(context, function, index_expression->array,
+                               &view_address, NULL)) {
+    return 0;
+  }
+  if (!ir_lower_expression(context, function, index_expression->index,
+                           &index)) {
+    goto done;
+  }
+  if (!ir_emit_slice_bounds_check(context, function, expression->location,
+                                  &view_address, &index)) {
+    goto done;
+  }
+  element_size =
+      ir_operand_int(ir_type_array_element_stride(view_type->base_type));
+  if (!ir_emit_load_word(context, function, &view_address, 0,
+                         expression->location, &base) ||
+      !ir_emit_load_word(context, function, &view_address, 8 + 8 * rank,
+                         expression->location, &lead) ||
+      !ir_emit_binary_temp(context, function, "*", &index, &lead,
+                           expression->location, &scaled) ||
+      !ir_emit_binary_temp(context, function, "*", &scaled, &element_size,
+                           expression->location, &bytes) ||
+      !ir_emit_binary_temp(context, function, "+", &base, &bytes,
+                           expression->location, &data)) {
+    goto done;
+  }
+  row_name = ir_new_label_name(context, "row");
+  if (!row_name ||
+      !ir_emit_local_declaration(context, function, row_name, row_type->name,
+                                 expression->location) ||
+      !ir_emit_address_of_symbol(context, function, row_name,
+                                 expression->location, &row_address) ||
+      !ir_emit_store_word(context, function, &row_address, 0, &data,
+                          expression->location)) {
+    goto done;
+  }
+  for (size_t k = 1; k < rank; k++) {
+    IROperand word = ir_operand_none();
+    int stored =
+        ir_emit_load_word(context, function, &view_address, 8 + 8 * k,
+                          expression->location, &word) &&
+        ir_emit_store_word(context, function, &row_address, 8 + 8 * (k - 1),
+                           &word, expression->location);
+    ir_operand_destroy(&word);
+    if (!stored) {
+      goto done;
+    }
+  }
+  for (size_t k = 1; k + 1 < rank; k++) {
+    IROperand word = ir_operand_none();
+    int stored =
+        ir_emit_load_word(context, function, &view_address,
+                          8 + 8 * rank + 8 * k, expression->location, &word) &&
+        ir_emit_store_word(context, function, &row_address,
+                           8 + 8 * (rank - 1) + 8 * (k - 1), &word,
+                           expression->location);
+    ir_operand_destroy(&word);
+    if (!stored) {
+      goto done;
+    }
+  }
+  *out_address = row_address;
+  row_address = ir_operand_none();
+  if (out_type) {
+    *out_type = row_type;
+  }
+  ok = 1;
+
+done:
+  free(row_name);
+  ir_operand_destroy(&view_address);
+  ir_operand_destroy(&index);
+  ir_operand_destroy(&base);
+  ir_operand_destroy(&lead);
+  ir_operand_destroy(&scaled);
+  ir_operand_destroy(&bytes);
+  ir_operand_destroy(&data);
+  ir_operand_destroy(&row_address);
+  return ok;
+}
+
 int ir_lower_lvalue_address(IRLoweringContext *context,
                                    IRFunction *function, ASTNode *expression,
                                    IROperand *out_address, Type **out_type) {
@@ -1087,6 +1198,11 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
        indexing one reads the pointer first. The extent is right there beside
        it, which is what the bounds check below uses. */
     int base_is_slice = array_type && array_type->kind == TYPE_SLICE;
+    if (base_is_slice && type_view_rank(array_type) > 1) {
+      return ir_lower_view_row_address(context, function, expression,
+                                       index_expression, array_type,
+                                       out_address, out_type);
+    }
     Type *element_type = base_is_string
                              ? ir_resolve_named_type(context, "char")
                              : (array_type ? array_type->base_type : NULL);
@@ -1126,6 +1242,7 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
         load_data.dest = base;
         load_data.lhs = ir_clone_operand_local(&slice_address);
         load_data.rhs = ir_operand_int(8);
+        load_data.alias_class = IR_ALIAS_CLASS_POINTER;
         lowered_base = ir_emit(context, function, &load_data);
         ir_operand_destroy(&load_data.lhs);
       }

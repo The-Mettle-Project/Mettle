@@ -316,6 +316,16 @@ int ir_emit_null_check(IRLoweringContext *context, IRFunction *function,
                               SourceLocation location, const IROperand *value);
 
 /* Bounds-check an index against the length a slice carries. */
+int ir_emit_load_word(IRLoweringContext *context, IRFunction *function,
+                      const IROperand *base_address, size_t offset,
+                      SourceLocation location, IROperand *out_value);
+int ir_emit_store_word(IRLoweringContext *context, IRFunction *function,
+                       const IROperand *base_address, size_t offset,
+                       const IROperand *value, SourceLocation location);
+int ir_emit_binary_temp(IRLoweringContext *context, IRFunction *function,
+                        const char *operator_text, const IROperand *lhs,
+                        const IROperand *rhs, SourceLocation location,
+                        IROperand *out_value);
 int ir_emit_slice_bounds_check(IRLoweringContext *context, IRFunction *function,
                                SourceLocation location,
                                const IROperand *slice_address,

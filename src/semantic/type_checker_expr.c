@@ -3424,6 +3424,10 @@ static Type *type_checker_infer_index(TypeChecker *checker,
                                            "Indexed type has no element type");
         return NULL;
       }
+      if (type_view_rank(array_type) > 1) {
+        return type_checker_view_of(checker, array_type->base_type,
+                                    type_view_rank(array_type) - 1);
+      }
       return array_type->base_type;
     }
 
@@ -3532,6 +3536,23 @@ static Type *type_checker_infer_allocation(TypeChecker *checker,
         type_checker_report_type_mismatch(checker, new_expr->count->location,
                                           "integer type", count_type->name);
         return NULL;
+      }
+      for (size_t i = 0; i < new_expr->extent_count; i++) {
+        Type *extent_type =
+            type_checker_infer_type(checker, new_expr->extents[i]);
+        if (!extent_type) {
+          return NULL;
+        }
+        if (!type_checker_is_integer_type(extent_type)) {
+          type_checker_report_type_mismatch(checker,
+                                            new_expr->extents[i]->location,
+                                            "integer type", extent_type->name);
+          return NULL;
+        }
+      }
+      if (new_expr->extent_count > 0) {
+        return type_checker_view_of(checker, element,
+                                    new_expr->extent_count + 1);
       }
       return type_checker_slice_of(checker, element);
     }

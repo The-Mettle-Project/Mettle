@@ -7138,6 +7138,46 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
     case IR_OP_STORE: {
       /* *dest <- lhs [rhs size] */
       PtxVal addr = operand_desc(&fn, &in->dest);
+      if (in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value > 8) {
+        long long total = in->rhs.int_value;
+        long long offset = 0;
+        PtxVal source = operand_desc(&fn, &in->lhs);
+        const char *dst_space = ptx_memory_space(addr.address_space);
+        const char *src_space =
+            source.is_ptr ? ptx_memory_space(source.address_space) : "";
+        char dstreg[24], srcreg[24];
+        use_as(&fn, &in->dest, PC_B64, dstreg);
+        use_as(&fn, &in->lhs, PC_B64, srcreg);
+        if (!src_space) {
+          src_space = "";
+        }
+        if (addr.address_space == MTLC_ADDRESS_SPACE_CONSTANT) {
+          fn_error(&fn, "PTX: store to constant address space");
+          break;
+        }
+        if (!dst_space) {
+          fn_error(&fn, "PTX: invalid store address space %d",
+                   (int)addr.address_space);
+          break;
+        }
+        while (offset < total) {
+          long long width = total - offset >= 8 ? 8
+                            : total - offset >= 4 ? 4
+                            : total - offset >= 2 ? 2 : 1;
+          const char *suffix = width == 8 ? "b64"
+                               : width == 4 ? "b32"
+                               : width == 2 ? "u16" : "u8";
+          PtxClass cls = width == 8 ? PC_B64 : PC_B32;
+          char tmp[24];
+          reg_name(cls, new_reg(&fn, cls), tmp);
+          sb_printf(&fn.body, "\tld%s.%s %s, [%s+%lld];\n", src_space,
+                    suffix, tmp, srcreg, offset);
+          sb_printf(&fn.body, "\tst%s.%s [%s+%lld], %s;\n", dst_space,
+                    suffix, dstreg, offset, tmp);
+          offset += width;
+        }
+        break;
+      }
       MtlcTypeKind elem = addr.is_ptr ? addr.elem : MTLC_TYPE_VOID;
       if (elem == MTLC_TYPE_VOID) {
         long long sz = (in->rhs.kind == IR_OPERAND_INT) ? in->rhs.int_value : 4;

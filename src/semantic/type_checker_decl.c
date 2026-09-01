@@ -183,6 +183,7 @@ static int gpu_kernel_value_type(const Type *type, int depth) {
   case TYPE_ARRAY:
     return type->base_type && gpu_kernel_value_type(type->base_type, depth + 1);
   case TYPE_STRUCT:
+  case TYPE_SLICE:
     if (!type->field_count) {
       return 0;
     }

@@ -492,6 +492,390 @@ int ir_hoist_global_bases_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+static int ir_lbase_address_key(const IRFunction *function, size_t before,
+                                const IROperand *address, char *out,
+                                size_t out_size) {
+  long long offset = 0;
+  const char *base = NULL;
+  const IROperand *cursor = address;
+  for (int hops = 0; hops < 4 && cursor; hops++) {
+    if (cursor->kind == IR_OPERAND_SYMBOL && cursor->name) {
+      base = cursor->name;
+      break;
+    }
+    if (cursor->kind != IR_OPERAND_TEMP || !cursor->name) {
+      return 0;
+    }
+    const IRInstruction *def = NULL;
+    for (size_t i = 0; i < before; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name &&
+          strcmp(ins->dest.name, cursor->name) == 0) {
+        if (def) {
+          return 0;
+        }
+        def = ins;
+      }
+    }
+    if (!def) {
+      return 0;
+    }
+    if (def->op == IR_OP_ADDRESS_OF && def->lhs.kind == IR_OPERAND_SYMBOL &&
+        def->lhs.name) {
+      base = def->lhs.name;
+      break;
+    }
+    if (def->op == IR_OP_BINARY && def->text && strcmp(def->text, "+") == 0 &&
+        def->rhs.kind == IR_OPERAND_INT) {
+      offset += def->rhs.int_value;
+      cursor = &def->lhs;
+      continue;
+    }
+    return 0;
+  }
+  if (!base) {
+    return 0;
+  }
+  return snprintf(out, out_size, "%s+%lld", base, offset) < (int)out_size;
+}
+
+static int ir_lbase_temp_read_in(const IRFunction *function, size_t lo,
+                                 size_t hi, const char *temp) {
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_operand_is_temp_named(&ins->lhs, temp) ||
+        ir_operand_is_temp_named(&ins->rhs, temp)) {
+      return 1;
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      if (ir_operand_is_temp_named(&ins->arguments[a], temp)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+int ir_hoist_load_bases_pass(IRFunction *function, int *changed) {
+  static int g_load_base_counter;
+  if (!function) {
+    return 0;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    char loop_label[128];
+    char seen_keys[8][160];
+    char seen_names[8][128];
+    size_t seen_count = 0;
+    size_t latch = 0;
+
+    {
+      const IRInstruction *label = &function->instructions[header];
+      if (label->op != IR_OP_LABEL ||
+          !ir_cleanup_label_is_loop_header(label->text) ||
+          snprintf(loop_label, sizeof(loop_label), "%s", label->text) >=
+              (int)sizeof(loop_label)) {
+        continue;
+      }
+    }
+    latch = ir_cleanup_loop_latch(function, header, loop_label);
+    if (!latch) {
+      continue;
+    }
+
+    for (size_t i = 0; i < header; i++) {
+      char temp[128];
+      char base_name[128];
+      char key[160];
+      const char *ptr_type = NULL;
+      const char *reuse = NULL;
+      IRInstruction decl = {0};
+      IRInstruction init = {0};
+      const IRInstruction *load = &function->instructions[i];
+      if (load->op != IR_OP_LOAD || load->is_float ||
+          load->dest.kind != IR_OPERAND_TEMP || !load->dest.name ||
+          load->rhs.kind != IR_OPERAND_INT || load->rhs.int_value != 8 ||
+          (load->alias_class != IR_ALIAS_CLASS_POINTER &&
+           load->alias_class != IR_ALIAS_CLASS_I64) ||
+          snprintf(temp, sizeof(temp), "%s", load->dest.name) >=
+              (int)sizeof(temp)) {
+        continue;
+      }
+      if (load->alias_class == IR_ALIAS_CLASS_POINTER) {
+        ptr_type = ir_hoist_base_pointer_type(function, header, latch, temp);
+      } else if (ir_lbase_temp_read_in(function, header, latch, temp)) {
+        ptr_type = "int64";
+      }
+      if (!ptr_type) {
+        continue;
+      }
+      if (ir_lbase_address_key(function, i, &load->lhs, key, sizeof(key))) {
+        for (size_t k = 0; k < seen_count; k++) {
+          if (strcmp(seen_keys[k], key) == 0) {
+            reuse = seen_names[k];
+            break;
+          }
+        }
+      } else {
+        key[0] = 0;
+      }
+      if (reuse) {
+        ir_hoist_rename_temp_reads(function, header, latch, temp, reuse);
+        if (changed) {
+          *changed = 1;
+        }
+        continue;
+      }
+      if (snprintf(base_name, sizeof(base_name), "__lbase_%d",
+                   g_load_base_counter) >= (int)sizeof(base_name)) {
+        continue;
+      }
+      g_load_base_counter++;
+      decl.op = IR_OP_DECLARE_LOCAL;
+      decl.dest = ir_operand_symbol(base_name);
+      decl.text = mettle_strdup(ptr_type);
+      decl.location = load->location;
+      init.op = IR_OP_ASSIGN;
+      init.dest = ir_operand_symbol(base_name);
+      init.lhs = ir_operand_temp(temp);
+      init.location = load->location;
+      if (!decl.dest.name || !decl.text || !init.dest.name || !init.lhs.name ||
+          !ir_function_insert_instruction(function, i + 1, &decl) ||
+          !ir_function_insert_instruction(function, i + 2, &init)) {
+        ir_instruction_destroy_storage(&decl);
+        ir_instruction_destroy_storage(&init);
+        return 0;
+      }
+      ir_instruction_destroy_storage(&decl);
+      ir_instruction_destroy_storage(&init);
+      ir_hoist_rename_temp_reads(function, i + 3, function->instruction_count,
+                                 temp, base_name);
+      if (key[0] && seen_count < 8) {
+        snprintf(seen_keys[seen_count], sizeof(seen_keys[0]), "%s", key);
+        snprintf(seen_names[seen_count], sizeof(seen_names[0]), "%s",
+                 base_name);
+        seen_count++;
+      }
+      header += 2;
+      latch += 2;
+      i += 2;
+      if (changed) {
+        *changed = 1;
+      }
+    }
+  }
+  return 1;
+}
+
+#define IR_ASSIGN_CHAIN_MAX 16
+
+static size_t ir_chain_reads_in(const IRFunction *function, size_t lo,
+                                size_t hi, const char *temp) {
+  size_t count = 0;
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_operand_is_temp_named(&ins->lhs, temp)) {
+      count++;
+    }
+    if (ir_operand_is_temp_named(&ins->rhs, temp)) {
+      count++;
+    }
+    if (ins->op == IR_OP_STORE && ir_operand_is_temp_named(&ins->dest, temp)) {
+      count++;
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      if (ir_operand_is_temp_named(&ins->arguments[a], temp)) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
+static int ir_chain_collect(const IRFunction *function, size_t header,
+                            size_t latch, const IROperand *operand,
+                            size_t *chain, size_t *chain_count, int depth) {
+  if (operand->kind == IR_OPERAND_INT || operand->kind == IR_OPERAND_FLOAT ||
+      operand->kind == IR_OPERAND_NONE) {
+    return 1;
+  }
+  if (!operand->name || depth > 8) {
+    return 0;
+  }
+  if (operand->kind == IR_OPERAND_SYMBOL) {
+    if (ir_symbol_address_taken(function, operand->name)) {
+      return 0;
+    }
+    for (size_t i = header; i < latch; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ir_instruction_writes_destination(ins) &&
+          ir_operand_is_symbol_named(&ins->dest, operand->name)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+  if (operand->kind != IR_OPERAND_TEMP) {
+    return 0;
+  }
+  {
+    size_t def = (size_t)-1;
+    for (size_t i = 0; i < latch; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      if (ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name &&
+          strcmp(ins->dest.name, operand->name) == 0) {
+        if (def != (size_t)-1) {
+          return 0;
+        }
+        def = i;
+      }
+    }
+    if (def == (size_t)-1) {
+      return 0;
+    }
+    if (def < header) {
+      return 1;
+    }
+    for (size_t k = 0; k < *chain_count; k++) {
+      if (chain[k] == def) {
+        return 1;
+      }
+    }
+    {
+      const IRInstruction *ins = &function->instructions[def];
+      if ((ins->op != IR_OP_BINARY && ins->op != IR_OP_UNARY &&
+           ins->op != IR_OP_CAST && ins->op != IR_OP_ADDRESS_OF) ||
+          ins->is_volatile || *chain_count >= IR_ASSIGN_CHAIN_MAX ||
+          ir_chain_reads_in(function, header, latch, operand->name) != 1) {
+        return 0;
+      }
+      if (ins->op == IR_OP_ADDRESS_OF) {
+        if (ins->lhs.kind != IR_OPERAND_SYMBOL || !ins->lhs.name) {
+          return 0;
+        }
+      } else if (!ir_chain_collect(function, header, latch, &ins->lhs, chain,
+                                   chain_count, depth + 1) ||
+                 !ir_chain_collect(function, header, latch, &ins->rhs, chain,
+                                   chain_count, depth + 1)) {
+        return 0;
+      }
+      chain[(*chain_count)++] = def;
+      return 1;
+    }
+  }
+}
+
+static int ir_chain_index_less(const void *a, const void *b) {
+  size_t x = *(const size_t *)a;
+  size_t y = *(const size_t *)b;
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+int ir_hoist_invariant_assigns_pass(IRFunction *function, int *changed) {
+  if (!function) {
+    return 0;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    char loop_label[128];
+    size_t latch = 0;
+    {
+      const IRInstruction *label = &function->instructions[header];
+      if (label->op != IR_OP_LABEL ||
+          !ir_cleanup_label_is_loop_header(label->text) ||
+          snprintf(loop_label, sizeof(loop_label), "%s", label->text) >=
+              (int)sizeof(loop_label)) {
+        continue;
+      }
+    }
+    latch = ir_cleanup_loop_latch(function, header, loop_label);
+    if (!latch || header == 0) {
+      continue;
+    }
+    {
+      size_t p = header - 1;
+      while (p > 0 && function->instructions[p].op == IR_OP_NOP) {
+        p--;
+      }
+      IROpcode prev = function->instructions[p].op;
+      if (prev == IR_OP_JUMP || prev == IR_OP_RETURN ||
+          prev == IR_OP_BRANCH_ZERO || prev == IR_OP_BRANCH_EQ) {
+        continue;
+      }
+    }
+    for (size_t i = header + 1; i < latch; i++) {
+      const IRInstruction *ins = &function->instructions[i];
+      const char *name = NULL;
+      size_t writes = 0;
+      int read_before = 0;
+      size_t chain[IR_ASSIGN_CHAIN_MAX];
+      size_t chain_count = 0;
+      size_t moved = 0;
+      if (ins->op != IR_OP_ASSIGN || ins->dest.kind != IR_OPERAND_SYMBOL ||
+          !ins->dest.name || ins->is_volatile) {
+        continue;
+      }
+      name = ins->dest.name;
+      if (ir_function_local_declared_type(function, name) == NULL ||
+          ir_symbol_address_taken(function, name) ||
+          (strncmp(name, "ir_row_", 7) != 0 &&
+           strncmp(name, "ir_view_", 8) != 0)) {
+        continue;
+      }
+      for (size_t k = 0; k < function->instruction_count; k++) {
+        const IRInstruction *other = &function->instructions[k];
+        if (ir_instruction_writes_destination(other) &&
+            ir_operand_is_symbol_named(&other->dest, name)) {
+          writes++;
+        }
+      }
+      if (writes != 1) {
+        continue;
+      }
+      for (size_t k = header; k < i && !read_before; k++) {
+        const IRInstruction *other = &function->instructions[k];
+        read_before = ir_operand_is_symbol_named(&other->lhs, name) ||
+                      ir_operand_is_symbol_named(&other->rhs, name) ||
+                      (other->op == IR_OP_STORE &&
+                       ir_operand_is_symbol_named(&other->dest, name));
+        for (size_t a = 0; a < other->argument_count && !read_before; a++) {
+          read_before = ir_operand_is_symbol_named(&other->arguments[a], name);
+        }
+      }
+      if (read_before || ir_symbol_live_after_loop(function, latch + 1, name)) {
+        continue;
+      }
+      if (!ir_chain_collect(function, header, latch, &ins->lhs, chain,
+                            &chain_count, 0)) {
+        continue;
+      }
+      chain[chain_count++] = i;
+      qsort(chain, chain_count, sizeof(chain[0]), ir_chain_index_less);
+      for (size_t k = 0; k < chain_count; k++) {
+        IRInstruction hoisted;
+        size_t at = chain[k] + moved;
+        if (!ir_clone_instruction_plain(&function->instructions[at],
+                                        &hoisted)) {
+          return 0;
+        }
+        ir_instruction_make_nop(&function->instructions[at]);
+        if (!ir_function_insert_instruction(function, header + moved,
+                                            &hoisted)) {
+          ir_instruction_destroy_storage(&hoisted);
+          return 0;
+        }
+        ir_instruction_destroy_storage(&hoisted);
+        moved++;
+      }
+      header += moved;
+      latch += moved;
+      i += moved;
+      if (changed) {
+        *changed = 1;
+      }
+    }
+  }
+  return 1;
+}
+
 /* Is `sym` written by any instruction in [lo, hi)? */
 static int ir_row_symbol_written(const IRFunction *function, size_t lo,
                                  size_t hi, const char *sym) {

@@ -379,6 +379,86 @@ int ir_emit_bounds_check(IRLoweringContext *context,
 /* The bounds check a pointer could never have. A slice carries its length
  * beside its data, so the extent is loaded from the value itself, and a
  * negative index fails the same check as an oversized one. */
+int ir_emit_load_word(IRLoweringContext *context, IRFunction *function,
+                      const IROperand *base_address, size_t offset,
+                      SourceLocation location, IROperand *out_value) {
+  IROperand slot = ir_operand_none();
+  IRInstruction load = {0};
+  int ok = 0;
+  if (!context || !function || !base_address || !out_value) {
+    return 0;
+  }
+  *out_value = ir_operand_none();
+  if (!ir_emit_address_with_offset(context, function, base_address, offset,
+                                   location, &slot) ||
+      !ir_make_temp_operand(context, out_value)) {
+    ir_operand_destroy(&slot);
+    return 0;
+  }
+  load.op = IR_OP_LOAD;
+  load.location = location;
+  load.dest = *out_value;
+  load.lhs = slot;
+  load.rhs = ir_operand_int(8);
+  load.alias_class =
+      offset == 0 ? IR_ALIAS_CLASS_POINTER : IR_ALIAS_CLASS_I64;
+  ok = ir_emit(context, function, &load);
+  ir_operand_destroy(&slot);
+  if (!ok) {
+    ir_operand_destroy(out_value);
+  }
+  return ok;
+}
+
+int ir_emit_store_word(IRLoweringContext *context, IRFunction *function,
+                       const IROperand *base_address, size_t offset,
+                       const IROperand *value, SourceLocation location) {
+  IROperand slot = ir_operand_none();
+  IRInstruction store = {0};
+  int ok = 0;
+  if (!context || !function || !base_address || !value) {
+    return 0;
+  }
+  if (!ir_emit_address_with_offset(context, function, base_address, offset,
+                                   location, &slot)) {
+    return 0;
+  }
+  store.op = IR_OP_STORE;
+  store.location = location;
+  store.dest = slot;
+  store.lhs = *value;
+  store.rhs = ir_operand_int(8);
+  store.alias_class =
+      offset == 0 ? IR_ALIAS_CLASS_POINTER : IR_ALIAS_CLASS_I64;
+  ok = ir_emit(context, function, &store);
+  ir_operand_destroy(&slot);
+  return ok;
+}
+
+int ir_emit_binary_temp(IRLoweringContext *context, IRFunction *function,
+                        const char *operator_text, const IROperand *lhs,
+                        const IROperand *rhs, SourceLocation location,
+                        IROperand *out_value) {
+  IRInstruction binary = {0};
+  if (!context || !function || !operator_text || !lhs || !rhs || !out_value) {
+    return 0;
+  }
+  if (!ir_make_temp_operand(context, out_value)) {
+    return 0;
+  }
+  binary.op = IR_OP_BINARY;
+  binary.location = location;
+  binary.dest = *out_value;
+  binary.lhs = *lhs;
+  binary.rhs = *rhs;
+  binary.text = (char *)operator_text;
+  if (!ir_emit(context, function, &binary)) {
+    ir_operand_destroy(out_value);
+    return 0;
+  }
+  return 1;
+}
+
 int ir_emit_slice_bounds_check(IRLoweringContext *context, IRFunction *function,
                                SourceLocation location,
                                const IROperand *slice_address,
@@ -394,7 +474,7 @@ int ir_emit_slice_bounds_check(IRLoweringContext *context, IRFunction *function,
   if (!context || !function || !slice_address || !index) {
     return 0;
   }
-  if (!context->emit_runtime_checks) {
+  if (!context->emit_runtime_checks && !context->emit_safety_checks) {
     return 1;
   }
 
@@ -411,6 +491,7 @@ int ir_emit_slice_bounds_check(IRLoweringContext *context, IRFunction *function,
     load.dest = length;
     load.lhs = length_slot;
     load.rhs = ir_operand_int(8);
+    load.alias_class = IR_ALIAS_CLASS_I64;
     if (!ir_emit(context, function, &load)) {
       ir_operand_destroy(&length_slot);
       ir_operand_destroy(&length);

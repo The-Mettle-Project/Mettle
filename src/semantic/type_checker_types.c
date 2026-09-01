@@ -329,6 +329,61 @@ Type *type_checker_slice_of(TypeChecker *checker, Type *element) {
   return type_checker_canon_type(checker, slice);
 }
 
+Type *type_checker_view_of(TypeChecker *checker, Type *element, size_t rank) {
+  const char *element_name = NULL;
+  size_t name_length = 0;
+  char *name = NULL;
+  char extent_name[32];
+  Type *view = NULL;
+  Type *data = NULL;
+  Type *dims = NULL;
+  Type *lead = NULL;
+
+  if (!checker || !element) {
+    return NULL;
+  }
+  if (rank <= 1) {
+    return type_checker_slice_of(checker, element);
+  }
+  element_name = element->name ? element->name : "?";
+  name_length = strlen(element_name) + rank + 2;
+  name = malloc(name_length);
+  if (!name) {
+    return NULL;
+  }
+  snprintf(name, name_length, "%s[", element_name);
+  for (size_t i = 1; i < rank; i++) {
+    strcat(name, ",");
+  }
+  strcat(name, "]");
+
+  view = type_create(TYPE_SLICE, name);
+  free(name);
+  if (!view) {
+    return NULL;
+  }
+  data = type_checker_pointer_to(checker, element);
+  snprintf(extent_name, sizeof(extent_name), "int64[%zu]", rank);
+  dims = type_checker_get_type_by_name(checker, extent_name);
+  snprintf(extent_name, sizeof(extent_name), "int64[%zu]", rank - 1);
+  lead = type_checker_get_type_by_name(checker, extent_name);
+  if (!data || !dims || !lead || !type_alloc_fields(view, 3)) {
+    type_destroy(view);
+    return NULL;
+  }
+  view->base_type = element;
+  view->view_rank = rank;
+  view->size = 16 * rank;
+  view->alignment = 8;
+  type_set_field(view, 0, "data", data, 0);
+  type_set_field(view, 1, "dims", dims, 0);
+  type_set_field(view, 2, "lead", lead, 0);
+  view->field_offsets[0] = 0;
+  view->field_offsets[1] = 8;
+  view->field_offsets[2] = 8 + 8 * rank;
+  return type_checker_canon_type(checker, view);
+}
+
 /* Pointer to an arbitrary type, built from the type rather than from its
  * spelling. Address-of used to mangle "<name>*" and look the result up, which
  * works while the name is a plain identifier and fails the moment it is not:
@@ -398,6 +453,7 @@ Type *type_checker_volatile_of(TypeChecker *checker, Type *base) {
     qualified->is_volatile = 1;
     qualified->base_type = base->base_type;
     qualified->array_size = base->array_size;
+    qualified->view_rank = base->view_rank;
     qualified->fn_param_types = base->fn_param_types;
     qualified->fn_param_count = base->fn_param_count;
     qualified->fn_return_type = base->fn_return_type;
@@ -730,8 +786,10 @@ int type_checker_types_equal(const Type *lhs, const Type *rhs) {
 
   switch (lhs->kind) {
   case TYPE_POINTER:
-  case TYPE_SLICE:
     return type_checker_types_equal(lhs->base_type, rhs->base_type);
+  case TYPE_SLICE:
+    return type_view_rank(lhs) == type_view_rank(rhs) &&
+           type_checker_types_equal(lhs->base_type, rhs->base_type);
   case TYPE_ARRAY:
     return lhs->array_size == rhs->array_size &&
            type_checker_types_equal(lhs->base_type, rhs->base_type);
@@ -1040,6 +1098,25 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
       element = type_checker_get_type_by_name(checker, element_name);
       free(element_name);
       return element ? type_checker_slice_of(checker, element) : NULL;
+    }
+    if (length > 3 && name[length - 1] == ']' && name[length - 2] == ',') {
+      size_t open = length - 2;
+      while (open > 0 && name[open] == ',') {
+        open--;
+      }
+      if (name[open] == '[' && open > 0) {
+        size_t rank = length - 1 - open;
+        char *element_name = malloc(open + 1);
+        Type *element = NULL;
+        if (!element_name) {
+          return NULL;
+        }
+        memcpy(element_name, name, open);
+        element_name[open] = '\0';
+        element = type_checker_get_type_by_name(checker, element_name);
+        free(element_name);
+        return element ? type_checker_view_of(checker, element, rank) : NULL;
+      }
     }
   }
 
@@ -1367,9 +1444,19 @@ static int type_checker_pointer_conversion_allowed(Type *dest_type,
      carried becomes the length the value carries. Nothing is lost, and it is
      the conversion that lets a function be written once for any extent. */
   if (dest_type->kind == TYPE_SLICE && src_type->kind == TYPE_ARRAY &&
-      dest_type->base_type && src_type->base_type &&
-      type_checker_types_equal(dest_type->base_type, src_type->base_type)) {
-    return 1;
+      dest_type->base_type) {
+    Type *inner = src_type;
+    size_t rank = type_view_rank(dest_type);
+    for (size_t level = 0; level < rank; level++) {
+      if (!inner || inner->kind != TYPE_ARRAY) {
+        inner = NULL;
+        break;
+      }
+      inner = inner->base_type;
+    }
+    if (inner && type_checker_types_equal(dest_type->base_type, inner)) {
+      return 1;
+    }
   }
 
   /* A rawptr is an address with no element type, so it converts to and from

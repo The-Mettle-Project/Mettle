@@ -495,6 +495,9 @@ int ir_eliminate_unreachable_straightline_pass(IRFunction *function,
 int ir_hoist_body_locals_pass(IRFunction *function, int *changed);
 int ir_drop_dead_narrowing_pass(IRFunction *function, int *changed);
 int ir_hoist_global_bases_pass(IRFunction *function, int *changed);
+int ir_hoist_load_bases_pass(IRFunction *function, int *changed);
+int ir_hoist_descriptor_loads_pass(IRFunction *function, int *changed);
+int ir_hoist_invariant_assigns_pass(IRFunction *function, int *changed);
 /* `m[r + i]` with invariant `r`: hoist `r`'s scaled term into a row pointer
  * ahead of the loop so the in-loop index is the counter alone. */
 int ir_hoist_row_pointers_pass(IRFunction *function, int *changed);

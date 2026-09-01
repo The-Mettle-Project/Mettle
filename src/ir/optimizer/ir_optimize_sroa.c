@@ -293,9 +293,33 @@ static int ir_sroa_transform_all(IRFunction *function,
           decl.location = insn->location;
           char *nm = ir_sroa_scalar_name(fm->name, slots[s].offset);
           decl.dest = nm ? ir_operand_symbol(nm) : ir_operand_none();
-          decl.text = mettle_strdup(ir_builtin_scalar_type_for_slot(
-              slots[s].size, slots[s].is_float, slots[s].float_bits,
-              slots[s].is_unsigned));
+          {
+            const MtlcType *field = NULL;
+            const MtlcType *aggregate = insn->value_type;
+            for (size_t f = 0; aggregate && aggregate->field_types &&
+                               aggregate->field_offsets &&
+                               f < aggregate->field_count;
+                 f++) {
+              if ((long long)aggregate->field_offsets[f] == slots[s].offset &&
+                  aggregate->field_types[f] &&
+                  aggregate->field_types[f]->kind == MTLC_TYPE_POINTER &&
+                  aggregate->field_types[f]->base_type &&
+                  aggregate->field_types[f]->base_type->kind <= MTLC_TYPE_FLOAT64 &&
+                  aggregate->field_types[f]->name &&
+                  (long long)aggregate->field_types[f]->size == slots[s].size) {
+                field = aggregate->field_types[f];
+                break;
+              }
+            }
+            if (field) {
+              decl.text = mettle_strdup(field->name);
+              decl.value_type = (MtlcType *)field;
+            } else {
+              decl.text = mettle_strdup(ir_builtin_scalar_type_for_slot(
+                  slots[s].size, slots[s].is_float, slots[s].float_bits,
+                  slots[s].is_unsigned));
+            }
+          }
           free(nm);
           if (!decl.dest.name || !decl.text ||
               !ir_instruction_vector_append_move(&vec, &decl)) {

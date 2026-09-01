@@ -40,6 +40,7 @@ Type *type_checker_pointer_to(TypeChecker *checker, Type *base);
    a `T[N]` becomes at a boundary that does not know N, and what `new T[n]`
    produces. Canonical per element type. */
 Type *type_checker_slice_of(TypeChecker *checker, Type *element);
+Type *type_checker_view_of(TypeChecker *checker, Type *element, size_t rank);
 Type *type_checker_volatile_of(TypeChecker *checker, Type *base);
 Type *type_checker_parse_pointer_type(TypeChecker *checker,
                                              const char *name);

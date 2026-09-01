@@ -339,6 +339,58 @@ down, which is the one place the extent is asserted:
 var view: int32[] = { data: borrowed, length: 3 };
 ```
 
+## Views
+
+`T[,]` is the slice one rank up: a pointer to `T`, an extent per dimension, and
+a leading dimension per outer dimension, in one value. The innermost dimension
+is always contiguous, which is the fact every consumer of a matrix wants and
+the one the optimizer would otherwise have to prove. `T[,,]` is the rank-3
+form.
+
+```mettle
+var m: int32[3][4];
+var v: int32[,] = m;
+var w: float32[,] = new float32[rows, cols];
+```
+
+A `T[N][M]` converts to `T[,]` the way `T[N]` converts to `T[]`, with the
+extents the type carried, and `new T[m, n]` allocates `m * n` zeroed elements
+whose leading dimension is `n`. The fields are `.data`, `.dims`, and `.lead`,
+and `.length` is the outer extent, so `for row in v` walks the rows.
+
+Indexing drops a rank. `v[i]` is the row, a `T[]` of length `v.dims[1]`, and
+`v[i][j]` is then ordinary slice indexing. On a `T[,,]` the first index yields
+a `T[,]`. Nothing is copied: a row shares the view's memory.
+
+```mettle
+fn scale_rows(v: float32[,], k: float32) {
+  for i in 0..v.dims[0] {
+    var row: float32[] = v[i];
+    for j in 0..row.length { row[j] = row[j] * k; }
+  }
+}
+```
+
+A view over padded storage names its own leading dimension, which is how a
+tile of a larger matrix is passed without a copy:
+
+```mettle
+var tile: int32[,] = { data: &backing[1][2], dims: [2, 3], lead: [8] };
+```
+
+The row index is checked against the outer extent in a normal build and under
+[`--safe`](memory-safety.md), and dropped under `--release`, the same rule a
+slice's check follows. A loop over a row is a unit-stride loop over a pointer
+the optimizer can name, so it vectorizes the way the pointer form does, and
+[`@simd!`](declarations.md#decorators) holds it to that. A view never owns its data; the result of `new T[m, n]`
+is freed through `free(v.data)`.
+
+Three things a view does not offer, each because it would break the promise
+above: a column or a transposed view, whose stride would no longer be one; a
+strided step; and arithmetic on whole views, which would hide a loop nobody
+wrote. A view may be a `kernel` parameter, where it crosses the launch boundary
+as a record.
+
 ## Function types
 
 `fn(A, B) -> R` is a plain function pointer. It holds a code address and

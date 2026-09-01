@@ -1,0 +1,19 @@
+// A view carries its extents, so a row index past the outer extent is caught
+// by the same check a slice index gets, against a number the value holds.
+// `--release` drops the check the way it drops a slice's; `--safe` keeps it.
+
+fn row_at(v: int32[,], i: int64) -> int32[] {
+  return v[i];
+}
+
+fn main() -> int32 {
+  var m: int32[3][4];
+  for i in 0..3 { for j in 0..4 { m[i][j] = i * 10 + j; } }
+  var v: int32[,] = m;
+  var r: int32[] = row_at(v, 1);
+  if (r[2] != 12) {
+    return 90;
+  }
+  var bad: int32[] = row_at(v, 7);
+  return bad[0];
+}

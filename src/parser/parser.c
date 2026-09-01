@@ -2629,6 +2629,33 @@ static char *parser_parse_array_suffix(Parser *parser, char *type_name) {
     return parser_parse_array_suffix(parser, slice_type);
   }
 
+  if (parser->current_token.type == TOKEN_COMMA) {
+    size_t commas = 0;
+    size_t view_len;
+    char *view_type;
+    while (parser->current_token.type == TOKEN_COMMA) {
+      commas++;
+      parser_advance(parser);
+    }
+    if (!parser_expect(parser, TOKEN_RBRACKET)) {
+      free(type_name);
+      return NULL;
+    }
+    view_len = strlen(type_name) + commas + 3;
+    view_type = malloc(view_len);
+    if (!view_type) {
+      free(type_name);
+      return NULL;
+    }
+    snprintf(view_type, view_len, "%s[", type_name);
+    for (size_t i = 0; i < commas; i++) {
+      strcat(view_type, ",");
+    }
+    strcat(view_type, "]");
+    free(type_name);
+    return parser_parse_array_suffix(parser, view_type);
+  }
+
   if (parser->current_token.type != TOKEN_NUMBER &&
       parser->current_token.type != TOKEN_IDENTIFIER) {
     free(type_name);
@@ -3758,13 +3785,26 @@ ASTNode *parser_parse_primary_expression(Parser *parser) {
         free(type_name);
         return NULL;
       }
-      if (!parser_expect(parser, TOKEN_RBRACKET)) {
-        ast_destroy_node(count);
-        free(type_name);
-        return NULL;
-      }
       new_expr = ast_create_new_array_expression(type_name, count, location);
       free(type_name);
+      if (!new_expr) {
+        ast_destroy_node(count);
+        return NULL;
+      }
+      while (parser->current_token.type == TOKEN_COMMA) {
+        ASTNode *extent = NULL;
+        parser_advance(parser);
+        extent = parser_parse_expression(parser);
+        if (!extent || !ast_new_expression_add_extent(new_expr, extent)) {
+          ast_destroy_node(extent);
+          ast_destroy_node(new_expr);
+          return NULL;
+        }
+      }
+      if (!parser_expect(parser, TOKEN_RBRACKET)) {
+        ast_destroy_node(new_expr);
+        return NULL;
+      }
       return new_expr;
     }
 

@@ -2041,12 +2041,34 @@ static size_t re_straight_line_end(const IRFunction *function, size_t from,
   return fallback;
 }
 
+static int re_function_declares_local(const IRFunction *function,
+                                      const char *name) {
+  for (size_t k = 0; k < function->instruction_count; k++) {
+    const IRInstruction *ins = &function->instructions[k];
+    if (ins->op == IR_OP_DECLARE_LOCAL && ins->dest.kind == IR_OPERAND_SYMBOL &&
+        ins->dest.name && strcmp(ins->dest.name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int re_hoist_base_is_dereferenceable(
     const IRFunction *function, const REDefs *defs, const REAddr *addr,
     long long reach, size_t header, size_t at, size_t prefix_end,
     size_t body_prefix_end, size_t entry_end, int runs_at_least_once) {
   if (at < prefix_end) {
     return 1;
+  }
+  if (addr->is_address_of && addr->name &&
+      (ir_function_symbol_is_parameter(function, addr->name) ||
+       re_function_declares_local(function, addr->name))) {
+    for (size_t k = 0; k < function->instruction_count; k++) {
+      if (re_access_reaches(function, defs, &function->instructions[k], addr,
+                            reach)) {
+        return 1;
+      }
+    }
   }
   for (size_t k = header + 1; k < prefix_end; k++) {
     if (re_access_reaches(function, defs, &function->instructions[k], addr,
@@ -2108,17 +2130,90 @@ static int re_header_has_preheader(const IRFunction *function, size_t header) {
          prev->op != IR_OP_BRANCH_ZERO && prev->op != IR_OP_BRANCH_EQ;
 }
 
+static int re_symbol_load_dest_is_hoistable(const IRFunction *function,
+                                            size_t header, size_t index,
+                                            size_t latch, const char *name) {
+  size_t writes = 0;
+  if (!name || !re_function_declares_local(function, name) ||
+      ir_symbol_address_taken(function, name) ||
+      (strncmp(name, "ir_row_", 7) != 0 && strncmp(name, "ir_view_", 8) != 0)) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ir_operand_is_symbol_named(&ins->dest, name)) {
+      writes++;
+    }
+  }
+  if (writes != 1) {
+    return 0;
+  }
+  for (size_t i = header; i < index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_operand_is_symbol_named(&ins->lhs, name) ||
+        ir_operand_is_symbol_named(&ins->rhs, name) ||
+        (ins->op == IR_OP_STORE &&
+         ir_operand_is_symbol_named(&ins->dest, name))) {
+      return 0;
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      if (ir_operand_is_symbol_named(&ins->arguments[a], name)) {
+        return 0;
+      }
+    }
+  }
+  return !ir_symbol_live_after_loop(function, latch + 1, name);
+}
+
+static int re_hoist_descriptor_loads_only;
+
+static int re_symbol_is_descriptor(const IRFunction *function,
+                                   const char *name) {
+  const char *type = NULL;
+  size_t length;
+  if (!function || !name) {
+    return 0;
+  }
+  if (strncmp(name, "ir_row_", 7) == 0 || strncmp(name, "ir_view_", 8) == 0) {
+    return 1;
+  }
+  type = ir_function_local_declared_type(function, name);
+  if (!type && function->parameter_names && function->parameter_types) {
+    for (size_t i = 0; i < function->parameter_count; i++) {
+      if (function->parameter_names[i] &&
+          strcmp(function->parameter_names[i], name) == 0) {
+        type = function->parameter_types[i];
+        break;
+      }
+    }
+  }
+  if (!type) {
+    return 0;
+  }
+  length = strlen(type);
+  return length > 2 && type[length - 1] == ']' &&
+         (type[length - 2] == '[' || type[length - 2] == ',');
+}
+
 static int re_load_is_hoistable(const IRFunction *function, const REDefs *defs,
                                 REKillLog *writes, size_t header, size_t index,
-                                size_t prefix_end, size_t body_prefix_end,
-                                size_t entry_end, int runs_at_least_once,
-                                REAddr *addr) {
+                                size_t latch, size_t prefix_end,
+                                size_t body_prefix_end, size_t entry_end,
+                                int runs_at_least_once, REAddr *addr) {
   IRInstruction *load = &function->instructions[index];
   char membuf[RE_NAME_MAX + 1];
 
-  if (load->op != IR_OP_LOAD || load->is_volatile ||
-      load->dest.kind != IR_OPERAND_TEMP || !load->dest.name ||
+  if (load->op != IR_OP_LOAD || load->is_volatile || !load->dest.name ||
       load->rhs.kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  if (load->dest.kind == IR_OPERAND_SYMBOL) {
+    if (!re_symbol_load_dest_is_hoistable(function, header, index, latch,
+                                          load->dest.name)) {
+      return 0;
+    }
+  } else if (load->dest.kind != IR_OPERAND_TEMP) {
     return 0;
   }
   re_resolve_addr(function, defs, &load->lhs, addr, 0);
@@ -2127,7 +2222,15 @@ static int re_load_is_hoistable(const IRFunction *function, const REDefs *defs,
       (addr->kind == IR_OPERAND_TEMP && !addr->is_address_of)) {
     return 0;
   }
-  if (re_def_count(defs, IR_OPERAND_TEMP, load->dest.name) != 1) {
+  if (re_hoist_descriptor_loads_only &&
+      (!addr->is_address_of || load->rhs.int_value != 8 ||
+       !re_symbol_is_descriptor(function, addr->name) ||
+       (load->alias_class != IR_ALIAS_CLASS_POINTER &&
+        load->alias_class != IR_ALIAS_CLASS_I64))) {
+    return 0;
+  }
+  if (load->dest.kind == IR_OPERAND_TEMP &&
+      re_def_count(defs, IR_OPERAND_TEMP, load->dest.name) != 1) {
     return 0;
   }
   if (snprintf(membuf, sizeof(membuf), "%c%s", addr->is_address_of ? '&' : 's',
@@ -2152,9 +2255,11 @@ static int re_emit_hoist(IRFunction *function, size_t header, size_t index,
   size_t inserted = 0;
   int failed = 0;
 
+  char base_name[RE_NAME_MAX + 8];
+  snprintf(base_name, sizeof(base_name), "%sb", addr_name);
   if (addr->is_address_of) {
     lead.op = IR_OP_ADDRESS_OF;
-    lead.dest = ir_operand_temp(addr_name);
+    lead.dest = ir_operand_temp(addr->offset != 0 ? base_name : addr_name);
     lead.lhs = ir_operand_symbol(addr->name);
   } else {
     lead.op = IR_OP_BINARY;
@@ -2174,7 +2279,9 @@ static int re_emit_hoist(IRFunction *function, size_t header, size_t index,
     moved = &function->instructions[index + inserted];
     body.op = IR_OP_LOAD;
     body.location = moved->location;
-    body.dest = ir_operand_temp(moved->dest.name);
+    body.dest = moved->dest.kind == IR_OPERAND_SYMBOL
+                    ? ir_operand_symbol(moved->dest.name)
+                    : ir_operand_temp(moved->dest.name);
     body.lhs = ir_operand_temp(addr_name);
     body.rhs = ir_operand_int(moved->rhs.int_value);
     body.is_float = moved->is_float;
@@ -2193,7 +2300,7 @@ static int re_emit_hoist(IRFunction *function, size_t header, size_t index,
         add.op = IR_OP_BINARY;
         add.text = mettle_strdup("+");
         add.dest = ir_operand_temp(addr_name);
-        add.lhs = ir_operand_temp(addr_name);
+        add.lhs = ir_operand_temp(base_name);
         add.rhs = ir_operand_int(addr->offset);
         add.location = body.location;
         if (!ir_function_insert_instruction(function, header + 1, &add)) {
@@ -2263,7 +2370,7 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
       REAddr addr = {0};
       char addr_name[48];
       int hoisted;
-      if (!re_load_is_hoistable(function, &defs, &writes, header, i,
+      if (!re_load_is_hoistable(function, &defs, &writes, header, i, latch,
                                 prefix_end, body_prefix_end, entry_end,
                                 runs_at_least_once, &addr)) {
         continue;
@@ -2276,6 +2383,14 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
     re_kills_destroy(&writes);
   }
   return 0;
+}
+
+int ir_hoist_descriptor_loads_pass(IRFunction *function, int *changed) {
+  int ok;
+  re_hoist_descriptor_loads_only = 1;
+  ok = ir_hoist_invariant_loads_pass(function, changed);
+  re_hoist_descriptor_loads_only = 0;
+  return ok;
 }
 
 int ir_hoist_invariant_loads_pass(IRFunction *function, int *changed) {

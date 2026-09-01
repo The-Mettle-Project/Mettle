@@ -1184,6 +1184,10 @@ int ir_function_insert_instruction(IRFunction *function, size_t index,
   slot->is_float = instruction->is_float;
   slot->is_unsigned = instruction->is_unsigned;
   slot->float_bits = instruction->float_bits;
+  slot->is_volatile = instruction->is_volatile;
+  slot->allocates = instruction->allocates;
+  slot->alias_class = instruction->alias_class;
+  slot->expansion_note = instruction->expansion_note;
   slot->ast_ref = instruction->ast_ref;
   slot->value_type = instruction->value_type;
   slot->dest = ir_operand_clone(&instruction->dest);

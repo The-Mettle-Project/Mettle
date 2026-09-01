@@ -1610,6 +1610,28 @@ $cases = @(
   # declaration order, row-major and contiguous. Runs natively and under the
   # compile-time interpreter, which sized such a local at its outer count.
   @{ Name = "multidim_arrays"; Path = "tests/test_multidim_arrays.mettle"; ShouldSucceed = $true },
+  # Views: `T[,]` is the slice one rank up, with extents and a leading
+  # dimension; `v[i]` drops a rank and a nested array decays into one. Runs
+  # natively in both modes and under the compile-time interpreter.
+  @{ Name = "views"; Path = "tests/test_views.mettle"; ShouldSucceed = $true },
+  @{ Name = "views_release"; Path = "tests/test_views.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "views_interp"; Path = "tests/test_views.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true
+     OutputMustMatch = @("1 passed")
+     OutputMustNotMatch = @("failed") },
+  # A view is a record at the launch boundary, and a row inside a kernel is a
+  # 16-byte local copied whole through the emitter's widened aggregate store.
+  @{ Name = "gpu_view_param"; Path = "tests/test_gpu_view_param.mettle"; ShouldSucceed = $true; Args = @("--emit-ptx") },
+  # The optimizer promise: a slice or view row is unit stride by construction,
+  # so `@simd!` over one must hold. Sweeps lengths 1..40 so no tail hides.
+  @{ Name = "views_simd"; Path = "tests/test_view_simd.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "views_simd_debug"; Path = "tests/test_view_simd.mettle"; ShouldSucceed = $true },
+  @{ Name = "views_simd_interp"; Path = "tests/test_view_simd.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true
+     OutputMustMatch = @("1 passed")
+     OutputMustNotMatch = @("failed") },
   # A local copied from a parameter must be a copy even when the parameter is
   # assigned afterwards. The baseline emitter aliased it, because a parameter
   # is written once before any instruction runs and that write has no IR to
@@ -4291,7 +4313,7 @@ catch {
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
-  foreach ($case in @("test_slice_bounds", "test_slice_bounds_negative")) {
+  foreach ($case in @("test_slice_bounds", "test_slice_bounds_negative", "test_view_bounds")) {
     $debugExe = Join-Path $tmpDir "$case.debug.exe"
     & $CompilerPath --build "tests/$case.mettle" -o $debugExe 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
