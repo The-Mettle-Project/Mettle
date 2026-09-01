@@ -848,6 +848,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
   if (!program) {
     return 0;
   }
+  ir_optimize_set_program(program);
   if (options && options->target_neutral_only) {
     return ir_optimize_portable_program_pipeline(program, options);
   }

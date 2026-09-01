@@ -1547,6 +1547,63 @@ const IRBasicBlock *ir_function_blocks(IRFunction *function,
   return function->blocks;
 }
 
+/* True if any function in the module takes the address of the module-level
+ * variable `name`. A pointer that arrives as a parameter carries no
+ * provenance, so a global another function pointed at may be written through
+ * it here, even in a function that never spells `&g`. Built once per program;
+ * the array is owned, the names are borrowed interned IR strings. */
+int ir_program_global_address_taken(IRProgram *program, const char *name) {
+  if (!program || !name) {
+    return 0;
+  }
+  if (!program->alias_globals_computed) {
+    program->alias_globals_computed = 1;
+    for (size_t f = 0; f < program->function_count; f++) {
+      const IRFunction *fn = program->functions[f];
+      if (!fn) {
+        continue;
+      }
+      for (size_t i = 0; i < fn->instruction_count; i++) {
+        const IRInstruction *in = &fn->instructions[i];
+        const IRModuleSymbol *sym = NULL;
+        const char **grown = NULL;
+        int present = 0;
+        if (in->op != IR_OP_ADDRESS_OF || in->lhs.kind != IR_OPERAND_SYMBOL ||
+            !in->lhs.name) {
+          continue;
+        }
+        sym = ir_program_lookup_symbol(program, in->lhs.name);
+        if (!sym || sym->kind != IR_MODSYM_VARIABLE) {
+          continue;
+        }
+        for (size_t k = 0; k < program->alias_global_count; k++) {
+          if (strcmp(program->alias_globals[k], in->lhs.name) == 0) {
+            present = 1;
+            break;
+          }
+        }
+        if (present) {
+          continue;
+        }
+        grown = (const char **)realloc(
+            (void *)program->alias_globals,
+            (program->alias_global_count + 1) * sizeof(*grown));
+        if (!grown) {
+          return 1;
+        }
+        program->alias_globals = grown;
+        program->alias_globals[program->alias_global_count++] = in->lhs.name;
+      }
+    }
+  }
+  for (size_t k = 0; k < program->alias_global_count; k++) {
+    if (strcmp(program->alias_globals[k], name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 IRProgram *ir_program_create(void) {
   IRProgram *program = malloc(sizeof(IRProgram));
   if (!program) {
@@ -1573,6 +1630,9 @@ IRProgram *ir_program_create(void) {
   program->module_symbol_capacity = 0;
   program->main_wants_argc_argv = 0;
   program->dead_functions_eliminated = 0;
+  program->alias_globals = NULL;
+  program->alias_global_count = 0;
+  program->alias_globals_computed = 0;
   return program;
 }
 
@@ -1588,6 +1648,10 @@ void ir_program_destroy(IRProgram *program) {
    * to be unchanged, which only holds within one program's lifetime). */
   ir_symbol_index_invalidate(program);
   ir_type_index_invalidate(program);
+  free(program->alias_globals);
+  program->alias_globals = NULL;
+  program->alias_global_count = 0;
+  program->alias_globals_computed = 0;
 
   if (program->functions) {
     for (size_t i = 0; i < program->function_count; i++) {

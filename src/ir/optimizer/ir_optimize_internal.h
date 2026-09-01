@@ -612,6 +612,7 @@ int ir_hoist_pure_calls_pass(IRProgram *program, int *changed);
 
 /* Whole-program alias facts (ir_optimize_alias.c). Built once after inlining
  * has settled the call graph; queried by the memory passes. */
+void ir_optimize_set_program(IRProgram *program);
 void ir_alias_facts_build(IRProgram *program);
 void ir_alias_facts_reset(void);
 /* Do these two resolved bases provably reach different allocations? Bases are

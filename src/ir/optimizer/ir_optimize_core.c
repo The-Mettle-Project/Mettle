@@ -1019,9 +1019,33 @@ void ir_temp_value_map_remove_symbol_values(IRTempValueMap *map,
  * rescanning the whole function per map entry per store. The pass that uses
  * it builds it once: copy-propagation never introduces ADDRESS_OF, so the set
  * is stable across a pass run. */
+static IRProgram *g_ir_optimize_program = NULL;
+
+void ir_optimize_set_program(IRProgram *program) {
+  g_ir_optimize_program = program;
+}
+
+static int ir_addr_taken_seed_module_globals(IRTempValueMap *set,
+                                             const IROperand *one) {
+  IRProgram *p = g_ir_optimize_program;
+  if (!p) {
+    return 1;
+  }
+  (void)ir_program_global_address_taken(p, "");
+  for (size_t k = 0; k < p->alias_global_count; k++) {
+    if (!ir_temp_value_map_set(set, p->alias_globals[k], one)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int ir_addr_taken_set_build(const IRFunction *function, IRTempValueMap *set) {
   static const IROperand one = {.kind = IR_OPERAND_INT, .int_value = 1};
   if (!function || !set) {
+    return 0;
+  }
+  if (!ir_addr_taken_seed_module_globals(set, &one)) {
     return 0;
   }
   for (size_t i = 0; i < function->instruction_count; i++) {

@@ -810,6 +810,13 @@ typedef struct {
   size_t module_symbol_capacity;
   /* Whether main() takes (argc, argv), baked from the main function signature. */
   int main_wants_argc_argv;
+  /* Every global whose address is taken by any function in the module, so a
+   * pointer of unknown provenance reaching one function may alias a global
+   * another function pointed at. Borrowed interned IR names; built on first
+   * use, and only the array is owned. */
+  const char **alias_globals;
+  size_t alias_global_count;
+  int alias_globals_computed;
   /* Set once ir_program_eliminate_dead_functions has run. The binary backend
    * treats a missing IR body as an internal error; this flag tells it a missing
    * body means "eliminated as unreachable", which is expected, not a bug. */
@@ -872,6 +879,7 @@ int ir_function_rebuild_cfg(IRFunction *function);
 const IRBasicBlock *ir_function_blocks(IRFunction *function,
                                        size_t *block_count);
 
+int ir_program_global_address_taken(IRProgram *program, const char *name);
 IRProgram *ir_program_create(void);
 void ir_program_destroy(IRProgram *program);
 int ir_program_add_function(IRProgram *program, IRFunction *function);

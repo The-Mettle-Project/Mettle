@@ -1084,6 +1084,10 @@ static int binary_global_is_promotable(CodeGenerator *generator,
                                        BinaryFunctionContext *context,
                                        const char *name) {
   const CgSym *symbol = binary_global_symbol(generator, name);
+  if (generator && generator->ir_program &&
+      ir_program_global_address_taken(generator->ir_program, name)) {
+    return 0;
+  }
   return symbol && !symbol->is_extern &&
          binary_named_slot_table_get_offset(&context->local_slots, name) < 0 &&
          binary_named_slot_table_get_offset(&context->parameter_slots, name) <

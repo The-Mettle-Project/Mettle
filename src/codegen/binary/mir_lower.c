@@ -157,6 +157,14 @@ static int mir_global_address_escapes_via_initializer(CodeGenerator *g,
   return 0;
 }
 
+static int mir_global_address_taken_in_module(CodeGenerator *g,
+                                              const char *name) {
+  if (!g || !g->ir_program) {
+    return 0;
+  }
+  return ir_program_global_address_taken(g->ir_program, name);
+}
+
 /* True if `name` resolves to a read-accessible global scalar, a value we can
  * cache in a register at function entry (used by both the eligibility gate and
  * the entry-load emitter, so they agree exactly on what counts as cacheable). */
@@ -10014,7 +10022,8 @@ int code_generator_binary_emit_function_via_mir(
    * a pointer LOAD/STORE can still reach its memory. Give those the same
    * address-taken flush/reload discipline. */
   for (size_t i = 0; i < wb.all_count; i++) {
-    if (!mir_global_address_escapes_via_initializer(generator, wb.all[i])) {
+    if (!mir_global_address_escapes_via_initializer(generator, wb.all[i]) &&
+        !mir_global_address_taken_in_module(generator, wb.all[i])) {
       continue;
     }
     int present = 0;
