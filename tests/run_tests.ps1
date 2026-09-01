@@ -830,7 +830,8 @@ $cases = @(
       'Use of `scratch`',
       'warning.*`p` is allocated',
       'clean_guarded_null',
-      'clean_loop'
+      'clean_loop',
+      'clean_interior'
     )
   },
   @{

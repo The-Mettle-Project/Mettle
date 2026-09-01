@@ -565,6 +565,41 @@ static MemLocal *mem_expr_as_local(MemCtx *ctx, ASTNode *expr) {
   return id ? mem_find_local(ctx, id->name) : NULL;
 }
 
+static MemLocal *mem_addr_root_local(MemCtx *ctx, ASTNode *expr) {
+  ASTNode *node = expr;
+  int guard = 0;
+  while (node && guard++ < 16) {
+    node = mem_unwrap_cast(node);
+    if (!node) {
+      return NULL;
+    }
+    if (node->type == AST_IDENTIFIER) {
+      Identifier *id = (Identifier *)node->data;
+      return id ? mem_find_local(ctx, id->name) : NULL;
+    }
+    if (node->type == AST_INDEX_EXPRESSION) {
+      ArrayIndexExpression *index = (ArrayIndexExpression *)node->data;
+      node = index ? index->array : NULL;
+      continue;
+    }
+    if (node->type == AST_MEMBER_ACCESS) {
+      MemberAccess *member = (MemberAccess *)node->data;
+      node = member ? member->object : NULL;
+      continue;
+    }
+    if (node->type == AST_UNARY_EXPRESSION) {
+      UnaryExpression *unary = (UnaryExpression *)node->data;
+      if (unary && unary->operator && strcmp(unary->operator, "*") == 0) {
+        node = unary->operand;
+        continue;
+      }
+      return NULL;
+    }
+    return NULL;
+  }
+  return NULL;
+}
+
 /* ---- the expression walk -------------------------------------------------------
  * One pass per expression: flags use-after-free on every read of a freed
  * pointer, bounds-checks constant indexes into stack arrays, classifies
@@ -1471,6 +1506,11 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
         local->ever_freed = 1; /* could be freed through the alias */
         local->is_null = 0;
         local->is_wild = 0;
+        return;
+      }
+      MemLocal *root = mem_addr_root_local(ctx, unary->operand);
+      if (root && root->is_pointer) {
+        root->escaped = 1;
       }
       return;
     }
