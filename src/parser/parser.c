@@ -12,6 +12,26 @@
 #define PARSER_ERROR_BUF_SIZE 512
 #define PARSER_SCRATCH_BUF_SIZE 1024
 
+static void parser_skip_chain_continuation(Parser *parser) {
+  while (parser->current_token.type == TOKEN_NEWLINE &&
+         parser->peek_token.type == TOKEN_NEWLINE) {
+    parser_advance(parser);
+  }
+  if (parser->current_token.type == TOKEN_NEWLINE &&
+      (parser->peek_token.type == TOKEN_DOT ||
+       parser->peek_token.type == TOKEN_ARROW)) {
+    parser_advance(parser);
+  }
+}
+
+static int parser_at_contextual_keyword(Parser *parser, const char *word,
+                                        TokenType following) {
+  return parser_is_identifier_like(parser->current_token.type) &&
+         parser->current_token.value &&
+         strcmp(parser->current_token.value, word) == 0 &&
+         parser->peek_token.type == following;
+}
+
 static void parser_report_lexer_token_error(Parser *parser,
                                             const Token *token) {
   if (!parser || !token || token->type != TOKEN_ERROR) {
@@ -1047,10 +1067,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
 
   /* Contextual `comptime for` in declaration position: the body holds
    * declarations, and its expansions are spliced into the enclosing module. */
-  if (parser_is_identifier_like(parser->current_token.type) &&
-      parser->current_token.value &&
-      strcmp(parser->current_token.value, "comptime") == 0 &&
-      parser->peek_token.type == TOKEN_FOR) {
+  if (parser_at_contextual_keyword(parser, "comptime", TOKEN_FOR)) {
     return parser_parse_comptime_for(parser, 1);
   }
 
@@ -1756,10 +1773,7 @@ ASTNode *parser_parse_statement(Parser *parser) {
 
   // Contextual `comptime for`: only this exact pair starts a compile-time
   // loop, so `comptime` stays available as an ordinary identifier.
-  if (parser_is_identifier_like(parser->current_token.type) &&
-      parser->current_token.value &&
-      strcmp(parser->current_token.value, "comptime") == 0 &&
-      parser->peek_token.type == TOKEN_FOR) {
+  if (parser_at_contextual_keyword(parser, "comptime", TOKEN_FOR)) {
     return parser_parse_comptime_for(parser, 0);
   }
 
@@ -1768,10 +1782,7 @@ ASTNode *parser_parse_statement(Parser *parser) {
   // semicolon is what tells the marker from a variable of that name, and the
   // only thing it takes away is a bare `quiesce;` expression statement, which
   // reads a value and discards it.
-  if (parser_is_identifier_like(parser->current_token.type) &&
-      parser->current_token.value &&
-      strcmp(parser->current_token.value, "quiesce") == 0 &&
-      parser->peek_token.type == TOKEN_SEMICOLON) {
+  if (parser_at_contextual_keyword(parser, "quiesce", TOKEN_SEMICOLON)) {
     SourceLocation location = parser_current_location(parser);
     parser_advance(parser); // consume the contextual `quiesce`
     parser_advance(parser); // consume ';'
@@ -1781,10 +1792,7 @@ ASTNode *parser_parse_statement(Parser *parser) {
   /* Contextual `fallthrough;`: continue into the next case of a switch. A case
    * ends where the next one begins, so this is what asks for the other
    * behaviour, and it is contextual for the same reason `quiesce` is. */
-  if (parser_is_identifier_like(parser->current_token.type) &&
-      parser->current_token.value &&
-      strcmp(parser->current_token.value, "fallthrough") == 0 &&
-      parser->peek_token.type == TOKEN_SEMICOLON) {
+  if (parser_at_contextual_keyword(parser, "fallthrough", TOKEN_SEMICOLON)) {
     SourceLocation location = parser_current_location(parser);
     parser_advance(parser);
     parser_advance(parser);
@@ -4053,15 +4061,7 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
     /* A line opening with `.` or `->` continues this one, so a chain can be
      * written down the page. Neither can begin a statement, so nothing that
      * used to parse as two statements now parses as one. */
-    while (parser->current_token.type == TOKEN_NEWLINE &&
-           parser->peek_token.type == TOKEN_NEWLINE) {
-      parser_advance(parser);
-    }
-    if (parser->current_token.type == TOKEN_NEWLINE &&
-        (parser->peek_token.type == TOKEN_DOT ||
-         parser->peek_token.type == TOKEN_ARROW)) {
-      parser_advance(parser);
-    }
+    parser_skip_chain_continuation(parser);
     SourceLocation location = parser_current_location(parser);
 
     if (expr->type == AST_IDENTIFIER &&

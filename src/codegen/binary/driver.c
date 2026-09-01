@@ -319,6 +319,31 @@ static int binary_emit_function_body(CodeGenerator *generator,
 }
 
 
+static int code_generator_binary_track_debug_range(
+    CodeGenerator *generator, IRFunction *ir_function,
+    BinaryFunctionContext *context) {
+  if (!generator->debug_info || (!generator->generate_stack_trace_support &&
+                                 !generator->generate_crash_report)) {
+    return 1;
+  }
+  context->runtime_end_label =
+      code_generator_generate_label(generator, "mettledbg_func_end");
+  if (!context->runtime_end_label) {
+    code_generator_set_error(generator,
+                             "Out of memory while tracking function debug "
+                             "range in '%s'",
+                             ir_function->name);
+    return 0;
+  }
+  code_generator_add_runtime_function_mapping(
+      generator, ir_function->name, ir_function->name,
+      context->runtime_end_label,
+      ir_function->location.line, ir_function->location.column,
+      code_generator_runtime_filename(generator,
+                                      ir_function->location.filename));
+  return 1;
+}
+
 int code_generator_emit_binary_function(CodeGenerator *generator,
                                                IRFunction *ir_function) {
   BinaryEmitter *emitter = NULL;
@@ -366,24 +391,10 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
   generator->last_runtime_location_line = 0;
   generator->last_runtime_location_column = 0;
 
-  if (generator->debug_info && (generator->generate_stack_trace_support ||
-                               generator->generate_crash_report)) {
-    context.runtime_end_label =
-        code_generator_generate_label(generator, "mettledbg_func_end");
-    if (!context.runtime_end_label) {
-      code_generator_set_error(generator,
-                               "Out of memory while tracking function debug "
-                               "range in '%s'",
-                               ir_function->name);
-      binary_function_context_destroy(&context);
-      return 0;
-    }
-    code_generator_add_runtime_function_mapping(
-        generator, ir_function->name, ir_function->name,
-        context.runtime_end_label,
-        ir_function->location.line, ir_function->location.column,
-        code_generator_runtime_filename(generator,
-                                        ir_function->location.filename));
+  if (!code_generator_binary_track_debug_range(generator, ir_function,
+                                              &context)) {
+    binary_function_context_destroy(&context);
+    return 0;
   }
 
   if (ir_function->is_naked) {
