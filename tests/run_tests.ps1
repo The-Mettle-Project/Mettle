@@ -1607,6 +1607,10 @@ $cases = @(
   # which applies silu twice to an in-place kernel. The existing vectorizer
   # test uses n = 1024, so it never ran the tail.
   @{ Name = "simd_silu_tail"; Path = "tests/test_simd_silu_tail.mettle"; ShouldSucceed = $true },
+  # Every in-place SIMD kernel at every length 1..40, plus a guard that nothing
+  # past the count is touched. The vectorizer tests all use round lengths, so
+  # the tail path went unexercised across the whole family.
+  @{ Name = "simd_inplace_tails"; Path = "tests/test_simd_inplace_tails.mettle"; ShouldSucceed = $true },
   @{ Name = "signed_arithmetic"; Path = "tests/test_signed_arithmetic.mettle"; ShouldSucceed = $true },
   @{
     Name          = "sign_extension"
