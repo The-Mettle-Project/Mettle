@@ -175,6 +175,16 @@ static int code_generator_binary_emit_debug_cstring(
   return 1;
 }
 
+static int debug_alloc_symbol_pair(size_t count, char ***first,
+                                   char ***second) {
+  if (count == 0u) {
+    return 1;
+  }
+  *first = calloc(count, sizeof(char *));
+  *second = calloc(count, sizeof(char *));
+  return *first && *second;
+}
+
 int code_generator_binary_emit_runtime_debug_tables(CodeGenerator *generator) {
   BinaryEmitter *emitter = NULL;
   DebugInfo *debug_info = NULL;
@@ -223,24 +233,16 @@ int code_generator_binary_emit_runtime_debug_tables(CodeGenerator *generator) {
     return 0;
   }
 
-  if (debug_info->runtime_function_count > 0) {
-    function_name_symbols =
-        calloc(debug_info->runtime_function_count, sizeof(char *));
-    function_file_symbols =
-        calloc(debug_info->runtime_function_count, sizeof(char *));
-    if (!function_name_symbols || !function_file_symbols) {
-      goto fail;
-    }
+  if (!debug_alloc_symbol_pair(debug_info->runtime_function_count,
+                               &function_name_symbols,
+                               &function_file_symbols)) {
+    goto fail;
   }
 
-  if (debug_info->runtime_location_count > 0) {
-    location_name_symbols =
-        calloc(debug_info->runtime_location_count, sizeof(char *));
-    location_file_symbols =
-        calloc(debug_info->runtime_location_count, sizeof(char *));
-    if (!location_name_symbols || !location_file_symbols) {
-      goto fail;
-    }
+  if (!debug_alloc_symbol_pair(debug_info->runtime_location_count,
+                               &location_name_symbols,
+                               &location_file_symbols)) {
+    goto fail;
   }
 
   if (debug_info->runtime_trap_site_count > 0) {

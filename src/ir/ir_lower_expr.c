@@ -174,6 +174,11 @@ static void ir_declare_string_concat_helper(IRLoweringContext *context) {
   ir_program_add_symbol(context->program, &entry);
 }
 
+static int ir_lower_interpolation(IRLoweringContext *context,
+                                  IRFunction *function,
+                                  ASTNode *expression,
+                                  IROperand *out_value);
+
 int ir_lower_call_expression(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *expression,
                                     IROperand *out_value) {
@@ -270,134 +275,7 @@ int ir_lower_call_expression(IRLoweringContext *context,
    * picks, the same injected-call scheme mettle_string_eq uses. A string value
    * passes through untouched. */
   if (strcmp(call->function_name, "__mtl_interp") == 0) {
-    if (call->argument_count != 1 || !call->arguments || !call->arguments[0] ||
-        !context->type_checker) {
-      ir_set_error(context, "Malformed string interpolation");
-      return 0;
-    }
-    ASTNode *value_node = call->arguments[0];
-    Type *value_type = type_checker_infer_type(context->type_checker,
-                                               value_node);
-    if (!value_type) {
-      ir_set_error(context, "Cannot determine interpolated value type");
-      return 0;
-    }
-
-    IROperand operand = ir_operand_none();
-    if (!ir_lower_expression(context, function, value_node, &operand)) {
-      return 0;
-    }
-    if (value_type->kind == TYPE_STRING) {
-      *out_value = operand;
-      return 1;
-    }
-
-    const char *helper = NULL;
-    const char *widen_to = NULL;
-    int source_is_float = 0;
-    int source_float_bits = 0;
-    switch (value_type->kind) {
-    case TYPE_BOOL:
-      helper = "mettle_string_from_bool";
-      widen_to = "int64";
-      break;
-    /* The whole reason `char` is its own type: "{c}" writes the character,
-     * where the uint8 holding the same byte would write its number. */
-    case TYPE_CHAR:
-      helper = "mettle_string_from_char";
-      widen_to = "int64";
-      break;
-    case TYPE_INT8:
-    case TYPE_INT16:
-    case TYPE_INT32:
-      helper = "mettle_string_from_int";
-      widen_to = "int64";
-      break;
-    case TYPE_INT64:
-      helper = "mettle_string_from_int";
-      break;
-    case TYPE_UINT8:
-    case TYPE_UINT16:
-    case TYPE_UINT32:
-      helper = "mettle_string_from_uint";
-      widen_to = "uint64";
-      break;
-    case TYPE_UINT64:
-      helper = "mettle_string_from_uint";
-      break;
-    case TYPE_FLOAT32:
-      helper = "mettle_string_from_f64";
-      widen_to = "float64";
-      source_is_float = 1;
-      source_float_bits = 32;
-      break;
-    case TYPE_FLOAT64:
-      helper = "mettle_string_from_f64";
-      break;
-    default:
-      ir_operand_destroy(&operand);
-      ir_set_error(context, "Cannot interpolate a value of type '%s'",
-                   value_type->name ? value_type->name : "?");
-      return 0;
-    }
-
-    if (widen_to) {
-      IROperand widened = ir_operand_none();
-      if (!ir_make_temp_operand(context, &widened)) {
-        ir_operand_destroy(&operand);
-        return 0;
-      }
-      IRInstruction cast = {0};
-      cast.op = IR_OP_CAST;
-      cast.location = expression->location;
-      cast.dest = widened;
-      cast.lhs = operand;
-      cast.text = (char *)widen_to;
-      cast.is_float = source_is_float;
-      if (source_is_float) {
-        cast.float_bits = source_float_bits;
-        cast.dest.float_bits = 64;
-        widened.float_bits = 64;
-      }
-      int cast_ok = ir_emit(context, function, &cast);
-      ir_operand_destroy(&operand);
-      if (!cast_ok) {
-        ir_operand_destroy(&widened);
-        return 0;
-      }
-      operand = widened;
-    }
-    /* mettle_string_from_f64 takes the value's raw bits in a GP register (the
-     * symbol-less call has no parameter types for float routing), so a float64
-     * operand passes through untagged. */
-
-    ir_declare_interpolation_helper(context, helper);
-
-    IROperand converted = ir_operand_none();
-    if (!ir_make_temp_operand(context, &converted)) {
-      ir_operand_destroy(&operand);
-      return 0;
-    }
-    IROperand helper_args[1];
-    helper_args[0] = operand;
-    IRInstruction convert = {0};
-    convert.op = IR_OP_CALL;
-    convert.location = expression->location;
-    convert.dest = converted;
-    convert.text = (char *)helper;
-    convert.arguments = helper_args;
-    convert.argument_count = 1;
-    convert.value_type =
-        mtlc_type_from_frontend(context->type_checker->builtin_string);
-    convert.allocates = 1;
-    int convert_ok = ir_emit(context, function, &convert);
-    ir_operand_destroy(&operand);
-    if (!convert_ok) {
-      ir_operand_destroy(&converted);
-      return 0;
-    }
-    *out_value = converted;
-    return 1;
+    return ir_lower_interpolation(context, function, expression, out_value);
   }
 
   if (call->is_gpu_async_copy) {
@@ -1106,6 +984,141 @@ int ir_lower_call_expression(IRLoweringContext *context,
   free(arguments);
 
   *out_value = destination;
+  return 1;
+}
+
+static int ir_lower_interpolation(IRLoweringContext *context,
+                                  IRFunction *function,
+                                  ASTNode *expression,
+                                  IROperand *out_value) {
+  CallExpression *call = (CallExpression *)expression->data;
+  if (call->argument_count != 1 || !call->arguments || !call->arguments[0] ||
+      !context->type_checker) {
+    ir_set_error(context, "Malformed string interpolation");
+    return 0;
+  }
+  ASTNode *value_node = call->arguments[0];
+  Type *value_type = type_checker_infer_type(context->type_checker,
+                                             value_node);
+  if (!value_type) {
+    ir_set_error(context, "Cannot determine interpolated value type");
+    return 0;
+  }
+
+  IROperand operand = ir_operand_none();
+  if (!ir_lower_expression(context, function, value_node, &operand)) {
+    return 0;
+  }
+  if (value_type->kind == TYPE_STRING) {
+    *out_value = operand;
+    return 1;
+  }
+
+  const char *helper = NULL;
+  const char *widen_to = NULL;
+  int source_is_float = 0;
+  int source_float_bits = 0;
+  switch (value_type->kind) {
+  case TYPE_BOOL:
+    helper = "mettle_string_from_bool";
+    widen_to = "int64";
+    break;
+  /* The whole reason `char` is its own type: "{c}" writes the character,
+   * where the uint8 holding the same byte would write its number. */
+  case TYPE_CHAR:
+    helper = "mettle_string_from_char";
+    widen_to = "int64";
+    break;
+  case TYPE_INT8:
+  case TYPE_INT16:
+  case TYPE_INT32:
+    helper = "mettle_string_from_int";
+    widen_to = "int64";
+    break;
+  case TYPE_INT64:
+    helper = "mettle_string_from_int";
+    break;
+  case TYPE_UINT8:
+  case TYPE_UINT16:
+  case TYPE_UINT32:
+    helper = "mettle_string_from_uint";
+    widen_to = "uint64";
+    break;
+  case TYPE_UINT64:
+    helper = "mettle_string_from_uint";
+    break;
+  case TYPE_FLOAT32:
+    helper = "mettle_string_from_f64";
+    widen_to = "float64";
+    source_is_float = 1;
+    source_float_bits = 32;
+    break;
+  case TYPE_FLOAT64:
+    helper = "mettle_string_from_f64";
+    break;
+  default:
+    ir_operand_destroy(&operand);
+    ir_set_error(context, "Cannot interpolate a value of type '%s'",
+                 value_type->name ? value_type->name : "?");
+    return 0;
+  }
+
+  if (widen_to) {
+    IROperand widened = ir_operand_none();
+    if (!ir_make_temp_operand(context, &widened)) {
+      ir_operand_destroy(&operand);
+      return 0;
+    }
+    IRInstruction cast = {0};
+    cast.op = IR_OP_CAST;
+    cast.location = expression->location;
+    cast.dest = widened;
+    cast.lhs = operand;
+    cast.text = (char *)widen_to;
+    cast.is_float = source_is_float;
+    if (source_is_float) {
+      cast.float_bits = source_float_bits;
+      cast.dest.float_bits = 64;
+      widened.float_bits = 64;
+    }
+    int cast_ok = ir_emit(context, function, &cast);
+    ir_operand_destroy(&operand);
+    if (!cast_ok) {
+      ir_operand_destroy(&widened);
+      return 0;
+    }
+    operand = widened;
+  }
+  /* mettle_string_from_f64 takes the value's raw bits in a GP register (the
+   * symbol-less call has no parameter types for float routing), so a float64
+   * operand passes through untagged. */
+
+  ir_declare_interpolation_helper(context, helper);
+
+  IROperand converted = ir_operand_none();
+  if (!ir_make_temp_operand(context, &converted)) {
+    ir_operand_destroy(&operand);
+    return 0;
+  }
+  IROperand helper_args[1];
+  helper_args[0] = operand;
+  IRInstruction convert = {0};
+  convert.op = IR_OP_CALL;
+  convert.location = expression->location;
+  convert.dest = converted;
+  convert.text = (char *)helper;
+  convert.arguments = helper_args;
+  convert.argument_count = 1;
+  convert.value_type =
+      mtlc_type_from_frontend(context->type_checker->builtin_string);
+  convert.allocates = 1;
+  int convert_ok = ir_emit(context, function, &convert);
+  ir_operand_destroy(&operand);
+  if (!convert_ok) {
+    ir_operand_destroy(&converted);
+    return 0;
+  }
+  *out_value = converted;
   return 1;
 }
 
@@ -2277,6 +2290,15 @@ static int ir_lower_func_ptr_call(IRLoweringContext *context,
   return 1;
 }
 
+static int ir_lower_new_expression(IRLoweringContext *context,
+                                   IRFunction *function,
+                                   ASTNode *expression,
+                                   IROperand *out_value);
+static int ir_lower_cast_expression(IRLoweringContext *context,
+                                    IRFunction *function,
+                                    ASTNode *expression,
+                                    IROperand *out_value);
+
 int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
                                ASTNode *expression, IROperand *out_value) {
   if (!context || !function || !expression || !out_value) {
@@ -2567,276 +2589,11 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     return 1;
   }
 
-  case AST_NEW_EXPRESSION: {
-    NewExpression *new_expression = (NewExpression *)expression->data;
-    if (!new_expression || !new_expression->type_name) {
-      ir_set_error(context, "Invalid new expression");
-      return 0;
-    }
+  case AST_NEW_EXPRESSION:
+    return ir_lower_new_expression(context, function, expression, out_value);
 
-    /* `new T[n]`: n elements' worth of zeroed heap, and the count stored
-       beside the pointer, so what comes back is a slice and every read
-       through it can be checked against a length that is really there. */
-    if (new_expression->count) {
-      Type *slice_type = expression->resolved_type;
-      Type *element = slice_type ? slice_type->base_type : NULL;
-      IROperand count = ir_operand_none();
-      IROperand bytes = ir_operand_none();
-      IROperand pointer = ir_operand_none();
-      IROperand slice_address = ir_operand_none();
-      IROperand slot = ir_operand_none();
-      char *slice_name = NULL;
-      IRInstruction multiply = {0};
-      IRInstruction allocate = {0};
-      IRInstruction store = {0};
-
-      if (!slice_type || slice_type->kind != TYPE_SLICE || !element ||
-          element->size == 0) {
-        ir_set_error(context, "'new T[n]' reached lowering without a slice "
-                              "type");
-        return 0;
-      }
-      if (!ir_lower_expression(context, function, new_expression->count,
-                               &count) ||
-          !ir_make_temp_operand(context, &bytes) ||
-          !ir_make_temp_operand(context, &pointer)) {
-        ir_operand_destroy(&count);
-        ir_operand_destroy(&bytes);
-        ir_operand_destroy(&pointer);
-        return 0;
-      }
-
-      multiply.op = IR_OP_BINARY;
-      multiply.location = expression->location;
-      multiply.dest = bytes;
-      multiply.lhs = count;
-      multiply.rhs = ir_operand_int((long long)element->size);
-      multiply.text = "*";
-      if (!ir_emit(context, function, &multiply)) {
-        ir_operand_destroy(&count);
-        ir_operand_destroy(&bytes);
-        ir_operand_destroy(&pointer);
-        return 0;
-      }
-
-      allocate.op = IR_OP_NEW;
-      allocate.location = expression->location;
-      allocate.dest = pointer;
-      allocate.rhs = bytes;
-      allocate.text = (char *)ir_backend_type_name(new_expression->type_name);
-      if (!ir_emit(context, function, &allocate)) {
-        ir_operand_destroy(&count);
-        ir_operand_destroy(&bytes);
-        ir_operand_destroy(&pointer);
-        return 0;
-      }
-
-      slice_name = ir_new_label_name(context, "slice");
-      if (!slice_name ||
-          !ir_emit_local_declaration(context, function, slice_name,
-                                     slice_type->name, expression->location) ||
-          !ir_emit_address_of_symbol(context, function, slice_name,
-                                     expression->location, &slice_address)) {
-        free(slice_name);
-        ir_operand_destroy(&count);
-        ir_operand_destroy(&bytes);
-        ir_operand_destroy(&pointer);
-        ir_operand_destroy(&slice_address);
-        return 0;
-      }
-
-      store.op = IR_OP_STORE;
-      store.location = expression->location;
-      store.dest = ir_clone_operand_local(&slice_address);
-      store.lhs = pointer;
-      store.rhs = ir_operand_int(8);
-      if (!ir_emit(context, function, &store)) {
-        ir_operand_destroy(&store.dest);
-        free(slice_name);
-        ir_operand_destroy(&count);
-        ir_operand_destroy(&bytes);
-        ir_operand_destroy(&pointer);
-        ir_operand_destroy(&slice_address);
-        return 0;
-      }
-      ir_operand_destroy(&store.dest);
-
-      if (!ir_emit_address_with_offset(context, function, &slice_address, 8,
-                                       expression->location, &slot)) {
-        free(slice_name);
-        ir_operand_destroy(&count);
-        ir_operand_destroy(&bytes);
-        ir_operand_destroy(&pointer);
-        ir_operand_destroy(&slice_address);
-        return 0;
-      }
-      {
-        IRInstruction length = {0};
-        length.op = IR_OP_STORE;
-        length.location = expression->location;
-        length.dest = slot;
-        length.lhs = count;
-        length.rhs = ir_operand_int(8);
-        if (!ir_emit(context, function, &length)) {
-          ir_operand_destroy(&slot);
-          free(slice_name);
-          ir_operand_destroy(&count);
-          ir_operand_destroy(&bytes);
-          ir_operand_destroy(&pointer);
-          ir_operand_destroy(&slice_address);
-          return 0;
-        }
-      }
-      ir_operand_destroy(&slot);
-      ir_operand_destroy(&slice_address);
-      ir_operand_destroy(&count);
-      ir_operand_destroy(&bytes);
-      ir_operand_destroy(&pointer);
-
-      *out_value = ir_operand_symbol(slice_name);
-      free(slice_name);
-      return out_value->name != NULL;
-    }
-
-    Type *allocated_type = NULL;
-    if (context->type_checker) {
-      /*
-       * Prefer the already-resolved expression type: `new T` infers to `T*`,
-       * and using that avoids scope-sensitive type-name lookups here.
-       */
-      Type *new_expr_type =
-          type_checker_infer_type(context->type_checker, expression);
-      if (new_expr_type && new_expr_type->kind == TYPE_POINTER) {
-        allocated_type = new_expr_type->base_type;
-      }
-      if (!allocated_type) {
-        allocated_type = type_checker_get_type_by_name(context->type_checker,
-                                                       new_expression->type_name);
-      }
-    }
-    /*
-     * Allocation must use the full concrete type size.
-     * ir_type_storage_size() intentionally normalizes many operations to
-     * register-width storage, which is incorrect for `new` on structs/arrays.
-     */
-    int allocation_size =
-        (allocated_type && allocated_type->size > 0 &&
-         allocated_type->size <= (size_t)INT_MAX)
-            ? (int)allocated_type->size
-            : 8;
-
-    IROperand destination = ir_operand_none();
-    if (!ir_make_temp_operand(context, &destination)) {
-      return 0;
-    }
-
-    IRInstruction instruction = {0};
-    instruction.op = IR_OP_NEW;
-    instruction.location = expression->location;
-    instruction.dest = destination;
-    instruction.rhs = ir_operand_int(allocation_size);
-    instruction.text = (char *)ir_backend_type_name(new_expression->type_name);
-    if (!ir_emit(context, function, &instruction)) {
-      ir_operand_destroy(&destination);
-      return 0;
-    }
-
-    *out_value = destination;
-    return 1;
-  }
-
-  case AST_CAST_EXPRESSION: {
-    CastExpression *cast_expr = (CastExpression *)expression->data;
-    if (!cast_expr || !cast_expr->type_name || !cast_expr->operand) {
-      ir_set_error(context, "Invalid cast expression");
-      return 0;
-    }
-
-    Type *cast_target = ir_resolve_named_type(context, cast_expr->type_name);
-    int target_is_pointer =
-        cast_target && (cast_target->kind == TYPE_POINTER ||
-                        cast_target->kind == TYPE_FUNCTION_POINTER);
-    ASTNode *cast_operand = cast_expr->operand;
-
-    /* `(T*)((int64)p)` where p is already a pointer: the integer carries the
-     * same address with its provenance dropped. Lower the pointer instead, so
-     * the alias analysis, the borrow checker and --verify keep following the
-     * value the source laundered. The type checker reports M0120 on the same
-     * shape, so the spelling gets cleaned up as well. */
-    if (target_is_pointer && cast_operand->type == AST_CAST_EXPRESSION &&
-        cast_operand->data) {
-      CastExpression *inner = (CastExpression *)cast_operand->data;
-      Type *mid = inner->type_name
-                      ? ir_resolve_named_type(context, inner->type_name)
-                      : NULL;
-      Type *source = inner->operand ? inner->operand->resolved_type : NULL;
-      if (mid && source && inner->operand &&
-          type_checker_is_integer_type(mid) &&
-          (source->kind == TYPE_POINTER ||
-           source->kind == TYPE_FUNCTION_POINTER)) {
-        cast_operand = inner->operand;
-      }
-    }
-
-    IROperand operand = ir_operand_none();
-    if (!ir_lower_expression(context, function, cast_operand, &operand)) {
-      return 0;
-    }
-
-    /* Casting a `string` to a pointer or an integer means its characters, the
-     * same conversion a `cstring` binding gets implicitly. The record itself
-     * is not the address. */
-    if (cast_target && ir_expression_is_string(context, cast_operand) &&
-        (target_is_pointer || type_checker_is_integer_type(cast_target)) &&
-        !ir_coerce_string_operand_to_cstring(context, function, &operand,
-                                             expression->location)) {
-      ir_operand_destroy(&operand);
-      return 0;
-    }
-
-    IROperand destination = ir_operand_none();
-    if (!ir_make_temp_operand(context, &destination)) {
-      ir_operand_destroy(&operand);
-      return 0;
-    }
-
-    IRInstruction instruction = {0};
-    instruction.op = IR_OP_CAST;
-    instruction.location = expression->location;
-    instruction.dest = destination;
-    instruction.lhs = operand;
-    instruction.text = (char *)ir_backend_type_name(cast_expr->type_name);
-    instruction.is_float = ir_expression_is_floating(context, cast_operand);
-    if (instruction.is_float) {
-      /* float_bits on a CAST records the SOURCE operand width so the backend
-       * can pick cvttss2si/cvtss2sd (f32) vs cvttsd2si (f64). The TARGET
-       * width is resolved separately from instruction->text. */
-      instruction.float_bits = ir_expression_float_bits(context, cast_operand);
-      if (instruction.float_bits == 0) {
-        instruction.float_bits = 64;
-      }
-    }
-    {
-      /* Tag the destination with the target float width so a value produced
-       * by e.g. (float32)x is recognized as float32 by later consumers. */
-      int target_bits =
-          ir_named_type_float_bits(context, cast_expr->type_name);
-      if (target_bits) {
-        instruction.dest.float_bits = target_bits;
-        destination.float_bits = target_bits;
-      }
-    }
-
-    if (!ir_emit(context, function, &instruction)) {
-      ir_operand_destroy(&destination);
-      ir_operand_destroy(&operand);
-      return 0;
-    }
-
-    ir_operand_destroy(&operand);
-    *out_value = destination;
-    return 1;
-  }
+  case AST_CAST_EXPRESSION:
+    return ir_lower_cast_expression(context, function, expression, out_value);
 
   case AST_FUNCTION_CALL:
     return ir_lower_call_expression(context, function, expression, out_value);
@@ -2853,4 +2610,291 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     ir_set_error(context, "Unsupported expression type in pure IR lowering");
     return 0;
   }
+}
+
+static int ir_lower_new_expression(IRLoweringContext *context,
+                                   IRFunction *function,
+                                   ASTNode *expression,
+                                   IROperand *out_value) {
+  NewExpression *new_expression = (NewExpression *)expression->data;
+  if (!new_expression || !new_expression->type_name) {
+    ir_set_error(context, "Invalid new expression");
+    return 0;
+  }
+
+  /* `new T[n]`: n elements' worth of zeroed heap, and the count stored
+     beside the pointer, so what comes back is a slice and every read
+     through it can be checked against a length that is really there. */
+  if (new_expression->count) {
+    Type *slice_type = expression->resolved_type;
+    Type *element = slice_type ? slice_type->base_type : NULL;
+    IROperand count = ir_operand_none();
+    IROperand bytes = ir_operand_none();
+    IROperand pointer = ir_operand_none();
+    IROperand slice_address = ir_operand_none();
+    IROperand slot = ir_operand_none();
+    char *slice_name = NULL;
+    IRInstruction multiply = {0};
+    IRInstruction allocate = {0};
+    IRInstruction store = {0};
+
+    if (!slice_type || slice_type->kind != TYPE_SLICE || !element ||
+        element->size == 0) {
+      ir_set_error(context, "'new T[n]' reached lowering without a slice "
+                            "type");
+      return 0;
+    }
+    if (!ir_lower_expression(context, function, new_expression->count,
+                             &count) ||
+        !ir_make_temp_operand(context, &bytes) ||
+        !ir_make_temp_operand(context, &pointer)) {
+      ir_operand_destroy(&count);
+      ir_operand_destroy(&bytes);
+      ir_operand_destroy(&pointer);
+      return 0;
+    }
+
+    multiply.op = IR_OP_BINARY;
+    multiply.location = expression->location;
+    multiply.dest = bytes;
+    multiply.lhs = count;
+    multiply.rhs = ir_operand_int((long long)element->size);
+    multiply.text = "*";
+    if (!ir_emit(context, function, &multiply)) {
+      ir_operand_destroy(&count);
+      ir_operand_destroy(&bytes);
+      ir_operand_destroy(&pointer);
+      return 0;
+    }
+
+    allocate.op = IR_OP_NEW;
+    allocate.location = expression->location;
+    allocate.dest = pointer;
+    allocate.rhs = bytes;
+    allocate.text = (char *)ir_backend_type_name(new_expression->type_name);
+    if (!ir_emit(context, function, &allocate)) {
+      ir_operand_destroy(&count);
+      ir_operand_destroy(&bytes);
+      ir_operand_destroy(&pointer);
+      return 0;
+    }
+
+    slice_name = ir_new_label_name(context, "slice");
+    if (!slice_name ||
+        !ir_emit_local_declaration(context, function, slice_name,
+                                   slice_type->name, expression->location) ||
+        !ir_emit_address_of_symbol(context, function, slice_name,
+                                   expression->location, &slice_address)) {
+      free(slice_name);
+      ir_operand_destroy(&count);
+      ir_operand_destroy(&bytes);
+      ir_operand_destroy(&pointer);
+      ir_operand_destroy(&slice_address);
+      return 0;
+    }
+
+    store.op = IR_OP_STORE;
+    store.location = expression->location;
+    store.dest = ir_clone_operand_local(&slice_address);
+    store.lhs = pointer;
+    store.rhs = ir_operand_int(8);
+    if (!ir_emit(context, function, &store)) {
+      ir_operand_destroy(&store.dest);
+      free(slice_name);
+      ir_operand_destroy(&count);
+      ir_operand_destroy(&bytes);
+      ir_operand_destroy(&pointer);
+      ir_operand_destroy(&slice_address);
+      return 0;
+    }
+    ir_operand_destroy(&store.dest);
+
+    if (!ir_emit_address_with_offset(context, function, &slice_address, 8,
+                                     expression->location, &slot)) {
+      free(slice_name);
+      ir_operand_destroy(&count);
+      ir_operand_destroy(&bytes);
+      ir_operand_destroy(&pointer);
+      ir_operand_destroy(&slice_address);
+      return 0;
+    }
+    {
+      IRInstruction length = {0};
+      length.op = IR_OP_STORE;
+      length.location = expression->location;
+      length.dest = slot;
+      length.lhs = count;
+      length.rhs = ir_operand_int(8);
+      if (!ir_emit(context, function, &length)) {
+        ir_operand_destroy(&slot);
+        free(slice_name);
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&bytes);
+        ir_operand_destroy(&pointer);
+        ir_operand_destroy(&slice_address);
+        return 0;
+      }
+    }
+    ir_operand_destroy(&slot);
+    ir_operand_destroy(&slice_address);
+    ir_operand_destroy(&count);
+    ir_operand_destroy(&bytes);
+    ir_operand_destroy(&pointer);
+
+    *out_value = ir_operand_symbol(slice_name);
+    free(slice_name);
+    return out_value->name != NULL;
+  }
+
+  Type *allocated_type = NULL;
+  if (context->type_checker) {
+    /*
+     * Prefer the already-resolved expression type: `new T` infers to `T*`,
+     * and using that avoids scope-sensitive type-name lookups here.
+     */
+    Type *new_expr_type =
+        type_checker_infer_type(context->type_checker, expression);
+    if (new_expr_type && new_expr_type->kind == TYPE_POINTER) {
+      allocated_type = new_expr_type->base_type;
+    }
+    if (!allocated_type) {
+      allocated_type = type_checker_get_type_by_name(context->type_checker,
+                                                     new_expression->type_name);
+    }
+  }
+  /*
+   * Allocation must use the full concrete type size.
+   * ir_type_storage_size() intentionally normalizes many operations to
+   * register-width storage, which is incorrect for `new` on structs/arrays.
+   */
+  int allocation_size =
+      (allocated_type && allocated_type->size > 0 &&
+       allocated_type->size <= (size_t)INT_MAX)
+          ? (int)allocated_type->size
+          : 8;
+
+  IROperand destination = ir_operand_none();
+  if (!ir_make_temp_operand(context, &destination)) {
+    return 0;
+  }
+
+  IRInstruction instruction = {0};
+  instruction.op = IR_OP_NEW;
+  instruction.location = expression->location;
+  instruction.dest = destination;
+  instruction.rhs = ir_operand_int(allocation_size);
+  instruction.text = (char *)ir_backend_type_name(new_expression->type_name);
+  if (!ir_emit(context, function, &instruction)) {
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+
+  *out_value = destination;
+  return 1;
+}
+
+static int ir_lower_cast_expression(IRLoweringContext *context,
+                                    IRFunction *function,
+                                    ASTNode *expression,
+                                    IROperand *out_value) {
+  CastExpression *cast_expr = (CastExpression *)expression->data;
+  if (!cast_expr || !cast_expr->type_name || !cast_expr->operand) {
+    ir_set_error(context, "Invalid cast expression");
+    return 0;
+  }
+
+  Type *cast_target = ir_resolve_named_type(context, cast_expr->type_name);
+  int target_is_pointer =
+      cast_target && (cast_target->kind == TYPE_POINTER ||
+                      cast_target->kind == TYPE_FUNCTION_POINTER);
+  ASTNode *cast_operand = cast_expr->operand;
+
+  /* `(T*)((int64)p)` where p is already a pointer: the integer carries the
+   * same address with its provenance dropped. Lower the pointer instead, so
+   * the alias analysis, the borrow checker and --verify keep following the
+   * value the source laundered. The type checker reports M0120 on the same
+   * shape, so the spelling gets cleaned up as well. */
+  if (target_is_pointer && cast_operand->type == AST_CAST_EXPRESSION &&
+      cast_operand->data) {
+    CastExpression *inner = (CastExpression *)cast_operand->data;
+    Type *mid = inner->type_name
+                    ? ir_resolve_named_type(context, inner->type_name)
+                    : NULL;
+    Type *source = inner->operand ? inner->operand->resolved_type : NULL;
+    if (mid && source && inner->operand &&
+        type_checker_is_integer_type(mid) &&
+        (source->kind == TYPE_POINTER ||
+         source->kind == TYPE_FUNCTION_POINTER)) {
+      cast_operand = inner->operand;
+    }
+  }
+
+  IROperand operand = ir_operand_none();
+  if (!ir_lower_expression(context, function, cast_operand, &operand)) {
+    return 0;
+  }
+
+  /* Casting a `string` to a pointer or an integer means its characters, the
+   * same conversion a `cstring` binding gets implicitly. The record itself
+   * is not the address. */
+  if (cast_target && ir_expression_is_string(context, cast_operand) &&
+      (target_is_pointer || type_checker_is_integer_type(cast_target)) &&
+      !ir_coerce_string_operand_to_cstring(context, function, &operand,
+                                           expression->location)) {
+    ir_operand_destroy(&operand);
+    return 0;
+  }
+
+  IROperand destination = ir_operand_none();
+  if (!ir_make_temp_operand(context, &destination)) {
+    ir_operand_destroy(&operand);
+    return 0;
+  }
+
+  IRInstruction instruction = {0};
+  instruction.op = IR_OP_CAST;
+  instruction.location = expression->location;
+  instruction.dest = destination;
+  instruction.lhs = operand;
+  instruction.text = (char *)ir_backend_type_name(cast_expr->type_name);
+  instruction.is_float = ir_expression_is_floating(context, cast_operand);
+  /* is_unsigned on a CAST records that the SOURCE is an unsigned integer,
+   * the same way float_bits records the source's float width. x86-64 and
+   * AArch64 both convert a 64-bit integer to floating point as SIGNED
+   * unless told otherwise, so without this `(float64)(uint64)~0` answered
+   * -1.0. Only the backends that convert read it; the narrowing paths take
+   * their signedness from the target type in instruction->text. */
+  instruction.is_unsigned =
+      !instruction.is_float &&
+      ir_type_is_unsigned_integer(
+          ir_infer_expression_type(context, cast_operand));
+  if (instruction.is_float) {
+    /* float_bits on a CAST records the SOURCE operand width so the backend
+     * can pick cvttss2si/cvtss2sd (f32) vs cvttsd2si (f64). The TARGET
+     * width is resolved separately from instruction->text. */
+    instruction.float_bits = ir_expression_float_bits(context, cast_operand);
+    if (instruction.float_bits == 0) {
+      instruction.float_bits = 64;
+    }
+  }
+  {
+    /* Tag the destination with the target float width so a value produced
+     * by e.g. (float32)x is recognized as float32 by later consumers. */
+    int target_bits =
+        ir_named_type_float_bits(context, cast_expr->type_name);
+    if (target_bits) {
+      instruction.dest.float_bits = target_bits;
+      destination.float_bits = target_bits;
+    }
+  }
+
+  if (!ir_emit(context, function, &instruction)) {
+    ir_operand_destroy(&destination);
+    ir_operand_destroy(&operand);
+    return 0;
+  }
+
+  ir_operand_destroy(&operand);
+  *out_value = destination;
+  return 1;
 }

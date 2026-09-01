@@ -703,18 +703,255 @@ static int elf_image_write_file(const char *path, const ElfImageBuffer *image,
   return 1;
 }
 
+static void elf_image_read_options(const ElfImageOptions *options,
+                                   uint64_t *image_base, uint64_t *page_size,
+                                   int *emit_symbols,
+                                   int *produce_shared_library,
+                                   ElfDynamicOptions *dynamic_options) {
+  memset(dynamic_options, 0, sizeof(*dynamic_options));
+  if (!options) {
+    dynamic_options->produce_shared_library = *produce_shared_library;
+    dynamic_options->image_base = *image_base;
+    return;
+  }
+  *produce_shared_library = options->produce_shared_library ? 1 : 0;
+  if (*produce_shared_library) {
+    *image_base = 0u;
+  }
+  if (options->image_base != 0u) {
+    *image_base = options->image_base;
+  }
+  if (options->page_size != 0u) {
+    *page_size = options->page_size;
+  }
+  *emit_symbols = !options->strip_symbols;
+  dynamic_options->interpreter = options->interpreter;
+  dynamic_options->soname = options->soname;
+  dynamic_options->runpaths = options->runpaths;
+  dynamic_options->runpath_count = options->runpath_count;
+  dynamic_options->export_dynamic = options->export_dynamic ? 1 : 0;
+  dynamic_options->produce_shared_library = *produce_shared_library;
+  dynamic_options->image_base = *image_base;
+}
+
+typedef struct {
+  uint64_t symtab_offset;
+  uint64_t symtab_size;
+  uint64_t strtab_offset;
+  uint64_t strtab_size;
+  uint32_t local_symbol_count;
+  uint16_t symtab_index;
+  int emit_symbols;
+} ElfImageSymbolTables;
+
+static int elf_image_write_section_headers(
+    ElfImageBuffer *image, ElfImagePart *parts, size_t part_count,
+    ElfDynamicPlan *plan, const ElfImageSymbolTables *tables,
+    uint16_t shstrndx, uint64_t *section_header_offset_out,
+    char **error_message_out) {
+  ElfImageStrings shstrings;
+  unsigned char shdr[ELF_SHDR_SIZE];
+  uint64_t shstrtab_offset = 0u;
+  uint64_t section_header_offset = 0u;
+  uint64_t symtab_offset = tables->symtab_offset;
+  uint64_t symtab_size = tables->symtab_size;
+  uint64_t strtab_offset = tables->strtab_offset;
+  uint64_t strtab_size = tables->strtab_size;
+  uint32_t local_symbol_count = tables->local_symbol_count;
+  uint32_t shstrtab_name = 0u;
+  uint32_t symtab_name = 0u;
+  uint32_t strtab_name = 0u;
+  uint16_t symtab_index = tables->symtab_index;
+  int emit_symbols = tables->emit_symbols;
+  size_t i = 0u;
+
+  if (!elf_image_strings_init(&shstrings)) {
+    mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+    return 0;
+  }
+  for (i = 0u; i < part_count; i++) {
+    parts[i].alignment = parts[i].alignment ? parts[i].alignment : 1u;
+  }
+  {
+    uint32_t part_names[ELF_IMAGE_MAX_PARTS];
+    uint32_t blob_names[ELF_DYNAMIC_BLOB_COUNT];
+
+    memset(blob_names, 0, sizeof(blob_names));
+    for (i = 0u; i < part_count; i++) {
+      part_names[i] = elf_image_strings_add(&shstrings, parts[i].name);
+    }
+    for (i = 0u; i < ELF_DYNAMIC_BLOB_COUNT; i++) {
+      const ElfDynamicBlob *blob =
+          elf_dynamic_plan_blob(plan, (ElfDynamicBlobKind)i);
+      if (blob) {
+        blob_names[i] = elf_image_strings_add(&shstrings, blob->name);
+      }
+    }
+    if (emit_symbols) {
+      symtab_name = elf_image_strings_add(&shstrings, ".symtab");
+      strtab_name = elf_image_strings_add(&shstrings, ".strtab");
+    }
+    shstrtab_name = elf_image_strings_add(&shstrings, ".shstrtab");
+
+    shstrtab_offset = linker_align_up(image->size, 1u);
+    if (!elf_image_buffer_pad_to(image, (size_t)shstrtab_offset) ||
+        !elf_image_buffer_write(image, (size_t)shstrtab_offset,
+                                shstrings.data, shstrings.size)) {
+      free(shstrings.data);
+      mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+      return 0;
+    }
+
+    section_header_offset = linker_align_up(image->size, 8u);
+    if (!elf_image_buffer_pad_to(image, (size_t)section_header_offset)) {
+      free(shstrings.data);
+      mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+      return 0;
+    }
+
+    memset(shdr, 0, sizeof(shdr));
+    if (!elf_image_buffer_write(image, (size_t)section_header_offset, shdr,
+                                sizeof(shdr))) {
+      free(shstrings.data);
+      mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+      return 0;
+    }
+
+    for (i = 0u; i < part_count; i++) {
+      size_t at = (size_t)section_header_offset +
+                  (size_t)parts[i].section_header_index * ELF_SHDR_SIZE;
+
+      memset(shdr, 0, sizeof(shdr));
+      linker_write_u32(shdr + 0, part_names[i]);
+      linker_write_u32(shdr + 4, parts[i].section_type);
+      linker_write_u64(shdr + 8, parts[i].section_flags);
+      linker_write_u64(shdr + 16, parts[i].virtual_address);
+      linker_write_u64(shdr + 24, parts[i].file_offset);
+      linker_write_u64(shdr + 32, parts[i].memory_size);
+      linker_write_u64(shdr + 48, parts[i].alignment);
+      if (!elf_image_buffer_write(image, at, shdr, sizeof(shdr))) {
+        free(shstrings.data);
+        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+        return 0;
+      }
+    }
+
+    for (i = 0u; i < ELF_DYNAMIC_BLOB_COUNT; i++) {
+      const ElfDynamicBlob *blob =
+          elf_dynamic_plan_blob(plan, (ElfDynamicBlobKind)i);
+      const ElfDynamicBlob *dynsym =
+          elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_DYNSYM);
+      const ElfDynamicBlob *dynstr =
+          elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_DYNSTR);
+      const ElfDynamicBlob *got =
+          elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_GOT);
+      uint64_t blob_offset = 0u;
+      uint64_t blob_address = 0u;
+      uint32_t link = 0u;
+      uint32_t info = 0u;
+      size_t at = 0u;
+
+      if (!blob || !elf_image_blob_location(parts, part_count, blob,
+                                            &blob_offset, &blob_address)) {
+        continue;
+      }
+      if (blob->links_dynstr && dynstr) {
+        link = dynstr->section_header_index;
+      } else if (blob->links_dynsym && dynsym) {
+        link = dynsym->section_header_index;
+      }
+      if (i == ELF_DYNAMIC_BLOB_DYNSYM) {
+        info = 1u;
+      } else if (i == ELF_DYNAMIC_BLOB_RELA_PLT && got) {
+        info = got->section_header_index;
+      } else if (i == ELF_DYNAMIC_BLOB_VERNEED) {
+        info = (uint32_t)elf_dynamic_plan_verneed_count(plan);
+      }
+
+      at = (size_t)section_header_offset +
+           (size_t)blob->section_header_index * ELF_SHDR_SIZE;
+      memset(shdr, 0, sizeof(shdr));
+      linker_write_u32(shdr + 0, blob_names[i]);
+      linker_write_u32(shdr + 4, blob->section_type);
+      linker_write_u64(shdr + 8, blob->section_flags);
+      linker_write_u64(shdr + 16, blob_address);
+      linker_write_u64(shdr + 24, blob_offset);
+      linker_write_u64(shdr + 32, blob->size);
+      linker_write_u32(shdr + 40, link);
+      linker_write_u32(shdr + 44, info);
+      linker_write_u64(shdr + 48, blob->alignment);
+      linker_write_u64(shdr + 56, blob->entry_size);
+      if (!elf_image_buffer_write(image, at, shdr, sizeof(shdr))) {
+        free(shstrings.data);
+        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+        return 0;
+      }
+    }
+
+    if (emit_symbols) {
+      size_t at = (size_t)section_header_offset +
+                  (size_t)symtab_index * ELF_SHDR_SIZE;
+
+      memset(shdr, 0, sizeof(shdr));
+      linker_write_u32(shdr + 0, symtab_name);
+      linker_write_u32(shdr + 4, SHT_SYMTAB);
+      linker_write_u64(shdr + 24, symtab_offset);
+      linker_write_u64(shdr + 32, symtab_size);
+      linker_write_u32(shdr + 40, (uint32_t)symtab_index + 1u);
+      linker_write_u32(shdr + 44, local_symbol_count);
+      linker_write_u64(shdr + 48, 8u);
+      linker_write_u64(shdr + 56, ELF_SYM_SIZE);
+      if (!elf_image_buffer_write(image, at, shdr, sizeof(shdr))) {
+        free(shstrings.data);
+        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+        return 0;
+      }
+
+      memset(shdr, 0, sizeof(shdr));
+      linker_write_u32(shdr + 0, strtab_name);
+      linker_write_u32(shdr + 4, SHT_STRTAB);
+      linker_write_u64(shdr + 24, strtab_offset);
+      linker_write_u64(shdr + 32, strtab_size);
+      linker_write_u64(shdr + 48, 1u);
+      if (!elf_image_buffer_write(image, at + ELF_SHDR_SIZE, shdr,
+                                  sizeof(shdr))) {
+        free(shstrings.data);
+        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+        return 0;
+      }
+    }
+
+    {
+      size_t at = (size_t)section_header_offset + (size_t)shstrndx * ELF_SHDR_SIZE;
+
+      memset(shdr, 0, sizeof(shdr));
+      linker_write_u32(shdr + 0, shstrtab_name);
+      linker_write_u32(shdr + 4, SHT_STRTAB);
+      linker_write_u64(shdr + 24, shstrtab_offset);
+      linker_write_u64(shdr + 32, shstrings.size);
+      linker_write_u64(shdr + 48, 1u);
+      if (!elf_image_buffer_write(image, at, shdr, sizeof(shdr))) {
+        free(shstrings.data);
+        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+        return 0;
+      }
+    }
+  }
+  free(shstrings.data);
+  *section_header_offset_out = section_header_offset;
+  return 1;
+}
+
 int elf_image_emit_executable(LinkResolution *resolution,
                               const char *output_path,
                               const ElfImageOptions *options,
                               char **error_message_out) {
   ElfImagePart parts[ELF_IMAGE_MAX_PARTS];
   ElfImageBuffer image = {0};
-  ElfImageStrings shstrings;
   ElfDynamicPlan *plan = NULL;
   ElfDynamicOptions dynamic_options;
   LinkRelocationOptions relocation_options = {0};
   unsigned char ehdr[ELF_EHDR_SIZE];
-  unsigned char shdr[ELF_SHDR_SIZE];
   uint64_t image_base = 0x400000u;
   uint64_t page_size = 0x1000u;
   uint64_t headers_size = 0u;
@@ -724,12 +961,8 @@ int elf_image_emit_executable(LinkResolution *resolution,
   uint64_t symtab_size = 0u;
   uint64_t strtab_offset = 0u;
   uint64_t strtab_size = 0u;
-  uint64_t shstrtab_offset = 0u;
   uint64_t section_header_offset = 0u;
   uint32_t local_symbol_count = 1u;
-  uint32_t shstrtab_name = 0u;
-  uint32_t symtab_name = 0u;
-  uint32_t strtab_name = 0u;
   uint16_t phnum = 0u;
   uint16_t shnum = 0u;
   uint16_t shstrndx = 0u;
@@ -748,33 +981,14 @@ int elf_image_emit_executable(LinkResolution *resolution,
     mettle_set_error(error_message_out, "Invalid arguments while emitting ELF");
     return 0;
   }
-  memset(&dynamic_options, 0, sizeof(dynamic_options));
-  if (options) {
-    produce_shared_library = options->produce_shared_library ? 1 : 0;
-    if (produce_shared_library) {
-      image_base = 0u;
-    }
-    if (options->image_base != 0u) {
-      image_base = options->image_base;
-    }
-    if (options->page_size != 0u) {
-      page_size = options->page_size;
-    }
-    emit_symbols = !options->strip_symbols;
-  }
+  elf_image_read_options(options, &image_base, &page_size, &emit_symbols,
+                         &produce_shared_library, &dynamic_options);
   if (!resolution->entry_symbol && !produce_shared_library) {
     mettle_set_error(error_message_out,
                      "The entry symbol was not resolved before ELF emission");
     return 0;
   }
 
-  dynamic_options.interpreter = options ? options->interpreter : NULL;
-  dynamic_options.soname = options ? options->soname : NULL;
-  dynamic_options.runpaths = options ? options->runpaths : NULL;
-  dynamic_options.runpath_count = options ? options->runpath_count : 0u;
-  dynamic_options.produce_shared_library = produce_shared_library;
-  dynamic_options.export_dynamic = options && options->export_dynamic ? 1 : 0;
-  dynamic_options.image_base = image_base;
   if (!elf_dynamic_plan_create(resolution, &dynamic_options, &plan,
                                error_message_out)) {
     return 0;
@@ -892,189 +1106,25 @@ int elf_image_emit_executable(LinkResolution *resolution,
   shstrndx = shnum;
   shnum++;
 
-  if (!elf_image_strings_init(&shstrings)) {
-    elf_image_buffer_free(&image);
-    mettle_set_error(error_message_out, "Out of memory while emitting ELF");
-    return 0;
-  }
-  for (i = 0u; i < part_count; i++) {
-    parts[i].alignment = parts[i].alignment ? parts[i].alignment : 1u;
-  }
   {
-    uint32_t part_names[ELF_IMAGE_MAX_PARTS];
-    uint32_t blob_names[ELF_DYNAMIC_BLOB_COUNT];
+    ElfImageSymbolTables tables;
 
-    memset(blob_names, 0, sizeof(blob_names));
-    for (i = 0u; i < part_count; i++) {
-      part_names[i] = elf_image_strings_add(&shstrings, parts[i].name);
-    }
-    for (i = 0u; i < ELF_DYNAMIC_BLOB_COUNT; i++) {
-      const ElfDynamicBlob *blob =
-          elf_dynamic_plan_blob(plan, (ElfDynamicBlobKind)i);
-      if (blob) {
-        blob_names[i] = elf_image_strings_add(&shstrings, blob->name);
-      }
-    }
-    if (emit_symbols) {
-      symtab_name = elf_image_strings_add(&shstrings, ".symtab");
-      strtab_name = elf_image_strings_add(&shstrings, ".strtab");
-    }
-    shstrtab_name = elf_image_strings_add(&shstrings, ".shstrtab");
-
-    shstrtab_offset = linker_align_up(image.size, 1u);
-    if (!elf_image_buffer_pad_to(&image, (size_t)shstrtab_offset) ||
-        !elf_image_buffer_write(&image, (size_t)shstrtab_offset,
-                                shstrings.data, shstrings.size)) {
-      free(shstrings.data);
+    tables.symtab_offset = symtab_offset;
+    tables.symtab_size = symtab_size;
+    tables.strtab_offset = strtab_offset;
+    tables.strtab_size = strtab_size;
+    tables.local_symbol_count = local_symbol_count;
+    tables.symtab_index = symtab_index;
+    tables.emit_symbols = emit_symbols;
+    if (!elf_image_write_section_headers(&image, parts, part_count, plan,
+                                         &tables, shstrndx,
+                                         &section_header_offset,
+                                         error_message_out)) {
+      elf_dynamic_plan_destroy(plan);
       elf_image_buffer_free(&image);
-      mettle_set_error(error_message_out, "Out of memory while emitting ELF");
       return 0;
-    }
-
-    section_header_offset = linker_align_up(image.size, 8u);
-    if (!elf_image_buffer_pad_to(&image, (size_t)section_header_offset)) {
-      free(shstrings.data);
-      elf_image_buffer_free(&image);
-      mettle_set_error(error_message_out, "Out of memory while emitting ELF");
-      return 0;
-    }
-
-    memset(shdr, 0, sizeof(shdr));
-    if (!elf_image_buffer_write(&image, (size_t)section_header_offset, shdr,
-                                sizeof(shdr))) {
-      free(shstrings.data);
-      elf_image_buffer_free(&image);
-      mettle_set_error(error_message_out, "Out of memory while emitting ELF");
-      return 0;
-    }
-
-    for (i = 0u; i < part_count; i++) {
-      size_t at = (size_t)section_header_offset +
-                  (size_t)parts[i].section_header_index * ELF_SHDR_SIZE;
-
-      memset(shdr, 0, sizeof(shdr));
-      linker_write_u32(shdr + 0, part_names[i]);
-      linker_write_u32(shdr + 4, parts[i].section_type);
-      linker_write_u64(shdr + 8, parts[i].section_flags);
-      linker_write_u64(shdr + 16, parts[i].virtual_address);
-      linker_write_u64(shdr + 24, parts[i].file_offset);
-      linker_write_u64(shdr + 32, parts[i].memory_size);
-      linker_write_u64(shdr + 48, parts[i].alignment);
-      if (!elf_image_buffer_write(&image, at, shdr, sizeof(shdr))) {
-        free(shstrings.data);
-        elf_image_buffer_free(&image);
-        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
-        return 0;
-      }
-    }
-
-    for (i = 0u; i < ELF_DYNAMIC_BLOB_COUNT; i++) {
-      const ElfDynamicBlob *blob =
-          elf_dynamic_plan_blob(plan, (ElfDynamicBlobKind)i);
-      const ElfDynamicBlob *dynsym =
-          elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_DYNSYM);
-      const ElfDynamicBlob *dynstr =
-          elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_DYNSTR);
-      const ElfDynamicBlob *got =
-          elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_GOT);
-      uint64_t blob_offset = 0u;
-      uint64_t blob_address = 0u;
-      uint32_t link = 0u;
-      uint32_t info = 0u;
-      size_t at = 0u;
-
-      if (!blob || !elf_image_blob_location(parts, part_count, blob,
-                                            &blob_offset, &blob_address)) {
-        continue;
-      }
-      if (blob->links_dynstr && dynstr) {
-        link = dynstr->section_header_index;
-      } else if (blob->links_dynsym && dynsym) {
-        link = dynsym->section_header_index;
-      }
-      if (i == ELF_DYNAMIC_BLOB_DYNSYM) {
-        info = 1u;
-      } else if (i == ELF_DYNAMIC_BLOB_RELA_PLT && got) {
-        info = got->section_header_index;
-      } else if (i == ELF_DYNAMIC_BLOB_VERNEED) {
-        info = (uint32_t)elf_dynamic_plan_verneed_count(plan);
-      }
-
-      at = (size_t)section_header_offset +
-           (size_t)blob->section_header_index * ELF_SHDR_SIZE;
-      memset(shdr, 0, sizeof(shdr));
-      linker_write_u32(shdr + 0, blob_names[i]);
-      linker_write_u32(shdr + 4, blob->section_type);
-      linker_write_u64(shdr + 8, blob->section_flags);
-      linker_write_u64(shdr + 16, blob_address);
-      linker_write_u64(shdr + 24, blob_offset);
-      linker_write_u64(shdr + 32, blob->size);
-      linker_write_u32(shdr + 40, link);
-      linker_write_u32(shdr + 44, info);
-      linker_write_u64(shdr + 48, blob->alignment);
-      linker_write_u64(shdr + 56, blob->entry_size);
-      if (!elf_image_buffer_write(&image, at, shdr, sizeof(shdr))) {
-        free(shstrings.data);
-        elf_dynamic_plan_destroy(plan);
-        elf_image_buffer_free(&image);
-        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
-        return 0;
-      }
-    }
-
-    if (emit_symbols) {
-      size_t at = (size_t)section_header_offset +
-                  (size_t)symtab_index * ELF_SHDR_SIZE;
-
-      memset(shdr, 0, sizeof(shdr));
-      linker_write_u32(shdr + 0, symtab_name);
-      linker_write_u32(shdr + 4, SHT_SYMTAB);
-      linker_write_u64(shdr + 24, symtab_offset);
-      linker_write_u64(shdr + 32, symtab_size);
-      linker_write_u32(shdr + 40, (uint32_t)symtab_index + 1u);
-      linker_write_u32(shdr + 44, local_symbol_count);
-      linker_write_u64(shdr + 48, 8u);
-      linker_write_u64(shdr + 56, ELF_SYM_SIZE);
-      if (!elf_image_buffer_write(&image, at, shdr, sizeof(shdr))) {
-        free(shstrings.data);
-        elf_image_buffer_free(&image);
-        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
-        return 0;
-      }
-
-      memset(shdr, 0, sizeof(shdr));
-      linker_write_u32(shdr + 0, strtab_name);
-      linker_write_u32(shdr + 4, SHT_STRTAB);
-      linker_write_u64(shdr + 24, strtab_offset);
-      linker_write_u64(shdr + 32, strtab_size);
-      linker_write_u64(shdr + 48, 1u);
-      if (!elf_image_buffer_write(&image, at + ELF_SHDR_SIZE, shdr,
-                                  sizeof(shdr))) {
-        free(shstrings.data);
-        elf_image_buffer_free(&image);
-        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
-        return 0;
-      }
-    }
-
-    {
-      size_t at = (size_t)section_header_offset + (size_t)shstrndx * ELF_SHDR_SIZE;
-
-      memset(shdr, 0, sizeof(shdr));
-      linker_write_u32(shdr + 0, shstrtab_name);
-      linker_write_u32(shdr + 4, SHT_STRTAB);
-      linker_write_u64(shdr + 24, shstrtab_offset);
-      linker_write_u64(shdr + 32, shstrings.size);
-      linker_write_u64(shdr + 48, 1u);
-      if (!elf_image_buffer_write(&image, at, shdr, sizeof(shdr))) {
-        free(shstrings.data);
-        elf_image_buffer_free(&image);
-        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
-        return 0;
-      }
     }
   }
-  free(shstrings.data);
 
   memset(ehdr, 0, sizeof(ehdr));
   ehdr[0] = 0x7Fu;

@@ -128,6 +128,43 @@ static int ir_case_body_transfers_control(const ASTNode *body) {
          last->type == AST_FALLTHROUGH_STATEMENT;
 }
 
+static char **ir_alloc_switch_case_labels(IRLoweringContext *context,
+                                          size_t case_count) {
+  char **case_labels = calloc(case_count, sizeof(char *));
+  size_t i = 0u;
+
+  if (!case_labels) {
+    return NULL;
+  }
+  for (i = 0u; i < case_count; i++) {
+    case_labels[i] = ir_new_label_name(context, "case");
+    if (!case_labels[i]) {
+      size_t j = 0u;
+      for (j = 0u; j < i; j++) {
+        free(case_labels[j]);
+      }
+      free(case_labels);
+      return NULL;
+    }
+  }
+  return case_labels;
+}
+
+static char *ir_find_switch_default_label(SwitchStatement *switch_data,
+                                          char **case_labels,
+                                          char *end_label) {
+  size_t i = 0u;
+
+  for (i = 0u; i < switch_data->case_count; i++) {
+    ASTNode *case_node = switch_data->cases[i];
+    CaseClause *clause = case_node ? (CaseClause *)case_node->data : NULL;
+    if (clause && clause->is_default) {
+      return case_labels ? case_labels[i] : end_label;
+    }
+  }
+  return end_label;
+}
+
 int ir_lower_switch_statement(IRLoweringContext *context,
                                      IRFunction *function, ASTNode *statement,
                                      IRDeferScope *defers) {
@@ -157,7 +194,8 @@ int ir_lower_switch_statement(IRLoweringContext *context,
 
   char **case_labels = NULL;
   if (switch_data->case_count > 0) {
-    case_labels = calloc(switch_data->case_count, sizeof(char *));
+    case_labels = ir_alloc_switch_case_labels(context,
+                                             switch_data->case_count);
     if (!case_labels) {
       ir_operand_destroy(&switch_value);
       free(end_label);
@@ -165,34 +203,10 @@ int ir_lower_switch_statement(IRLoweringContext *context,
                    "Out of memory while allocating switch case labels");
       return 0;
     }
-    for (size_t i = 0; i < switch_data->case_count; i++) {
-      case_labels[i] = ir_new_label_name(context, "case");
-      if (!case_labels[i]) {
-        for (size_t j = 0; j < i; j++) {
-          free(case_labels[j]);
-        }
-        free(case_labels);
-        ir_operand_destroy(&switch_value);
-        free(end_label);
-        ir_set_error(context,
-                     "Out of memory while allocating switch case labels");
-        return 0;
-      }
-    }
   }
 
-  char *default_label = NULL;
-  for (size_t i = 0; i < switch_data->case_count; i++) {
-    ASTNode *case_node = switch_data->cases[i];
-    CaseClause *clause = case_node ? (CaseClause *)case_node->data : NULL;
-    if (clause && clause->is_default) {
-      default_label = case_labels ? case_labels[i] : NULL;
-      break;
-    }
-  }
-  if (!default_label) {
-    default_label = end_label;
-  }
+  char *default_label =
+      ir_find_switch_default_label(switch_data, case_labels, end_label);
 
   // Dispatch chain: if (switch_value == case_value) jump case label.
   for (size_t i = 0; i < switch_data->case_count; i++) {

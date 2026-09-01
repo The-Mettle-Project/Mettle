@@ -1,0 +1,72 @@
+// Converting between float and a 64-bit unsigned integer. Both machine
+// instructions are signed: cvtsi2sd reads bit 63 as a sign, so
+// `(float64)(uint64)~0` answered -1.0, and cvttsd2si answers its
+// integer-indefinite sentinel from 2^63 up, so `(uint64)1e19` answered
+// 9223372036854775808. Each direction needs a bias sequence around the
+// signed instruction. @noinline keeps the conversion at a real call boundary.
+
+@noinline fn u64_to_f64(x: uint64) -> float64 { return (float64)x; }
+@noinline fn u64_to_f32(x: uint64) -> float32 { return (float32)x; }
+@noinline fn u32_to_f64(x: uint32) -> float64 { return (float64)x; }
+@noinline fn f64_to_u64(x: float64) -> uint64 { return (uint64)x; }
+@noinline fn f32_to_u64(x: float32) -> uint64 { return (uint64)x; }
+@noinline fn f64_to_u32(x: float64) -> uint32 { return (uint32)x; }
+@noinline fn i64_to_f64(x: int64) -> float64 { return (float64)x; }
+
+fn main() -> int32 {
+  // Below 2^63 the signed conversion is already right; the bias path must not
+  // disturb it.
+  if (u64_to_f64((uint64)0) != 0.0) { return 1; }
+  if (u64_to_f64((uint64)5) != 5.0) { return 2; }
+  if (u64_to_f64((uint64)4294967295) != 4294967295.0) { return 3; }
+  if (u64_to_f32((uint64)64) != (float32)64.0) { return 4; }
+  if (u32_to_f64((uint32)4294967295) != 4294967295.0) { return 5; }
+
+  // At and above 2^63 the sign bit is part of the magnitude.
+  if (u64_to_f64((uint64)9223372036854775808) != 9223372036854775808.0) {
+    return 6;
+  }
+  if (u64_to_f64((uint64)18446744073709551615) != 18446744073709551616.0) {
+    return 7;
+  }
+  if (u64_to_f64((uint64)10000000000000000000) != 1e19) { return 8; }
+  if (u64_to_f32((uint64)9223372036854775808) != (float32)9223372036854775808.0) {
+    return 9;
+  }
+
+  // A signed source keeps reading bit 63 as a sign.
+  if (i64_to_f64(-1) != -1.0) { return 10; }
+  if (i64_to_f64(-9223372036854775807 - 1) != -9223372036854775808.0) {
+    return 11;
+  }
+
+  // Truncation toward zero into a uint64, on both sides of 2^63.
+  if (f64_to_u64(0.0) != (uint64)0) { return 12; }
+  if (f64_to_u64(5.75) != (uint64)5) { return 13; }
+  if (f64_to_u64(4294967295.0) != (uint64)4294967295) { return 14; }
+  if (f64_to_u64(9223372036854775808.0) != (uint64)9223372036854775808) {
+    return 15;
+  }
+  if (f64_to_u64(1e19) != (uint64)10000000000000000000) { return 16; }
+  if (f32_to_u64((float32)9223372036854775808.0) !=
+      (uint64)9223372036854775808) {
+    return 17;
+  }
+
+  // A narrower unsigned target is unaffected.
+  if (f64_to_u32(4000000000.0) != (uint32)4000000000) { return 18; }
+
+  // Round trips through both directions.
+  var big: uint64 = (uint64)18000000000000000000;
+  if (f64_to_u64(u64_to_f64(big)) != big) { return 19; }
+  var mid: uint64 = (uint64)9223372036854775809;
+  if (u64_to_f64(mid) != 9223372036854775808.0) { return 20; }
+
+  // The value travels through a variable, not just a literal.
+  var v: uint64 = (uint64)18446744073709551615;
+  var d: float64 = (float64)v;
+  if (d != 18446744073709551616.0) { return 21; }
+  if (d <= 0.0) { return 22; }
+
+  return 0;
+}

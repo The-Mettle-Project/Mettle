@@ -2075,14 +2075,21 @@ static int encode_cast_instruction(const Arm64Scope *scope,
     int dstf = in->dest.float_bits != 0;
     if (srcf && !dstf) { /* float -> int (truncating) */
       int d = operand_float_bits(fs, &in->lhs) != 32;
+      /* A uint64 target reaches past 2^63, where the signed truncation
+       * saturates; fcvtzu covers the whole range. */
+      int to_u64 = in->text && strcmp(in->text, "uint64") == 0;
       arm64_emit_word(e, arm64_fmov_gp(d, 0, load_into(e, slots, &in->lhs,
                                                        R_LHS)));
-      arm64_emit_word(e, arm64_fcvtzs(d, R_RES, 0));
+      arm64_emit_word(e, to_u64 ? arm64_fcvtzu(d, R_RES, 0)
+                                : arm64_fcvtzs(d, R_RES, 0));
       store_dest(e, slots, &in->dest, R_RES);
     } else if (!srcf && dstf) { /* int -> float */
       int d = in->dest.float_bits != 32;
-      arm64_emit_word(e, arm64_scvtf(d, 0, load_into(e, slots, &in->lhs,
-                                                     R_LHS)));
+      /* is_unsigned says the source is an unsigned integer, so bit 63 is part
+       * of the magnitude and not a sign. */
+      Arm64Reg src = load_into(e, slots, &in->lhs, R_LHS);
+      arm64_emit_word(e, in->is_unsigned ? arm64_ucvtf(d, 0, src)
+                                         : arm64_scvtf(d, 0, src));
       arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
       store_dest(e, slots, &in->dest, R_RES);
     } else if (srcf && dstf) { /* float -> float */

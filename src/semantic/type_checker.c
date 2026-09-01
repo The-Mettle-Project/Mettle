@@ -483,6 +483,61 @@ static int type_decl_refers_to(const ASTNode *decl, const char *name) {
  * "payload of unknown type 'Span'". A declaration waits while any type it names
  * is still pending; when a round settles nothing, the rest are processed in
  * source order so a genuine cycle or a genuinely unknown name reports itself. */
+static int type_checker_report_type_cycles(TypeChecker *checker,
+                                           Program *prog, char *pending,
+                                           size_t *remaining_out) {
+  size_t remaining = *remaining_out;
+  size_t i, j;
+  int ok = 1;
+
+  /* Nothing moved, so what is left refers to itself in a circle. A circle
+   * of pointers is a shape a program is entitled to write, and it has no
+   * order that puts every name before its use, so the names are declared
+   * first and the fields filled in afterwards. A circle that stores values
+   * has no layout at all and is reported here, once, naming both ends. */
+  for (i = 0; i < prog->declaration_count; i++) {
+    const char *self;
+    if (!pending[i]) {
+      continue;
+    }
+    self = type_decl_name(prog->declarations[i]);
+    if (!self) {
+      continue;
+    }
+    for (j = 0; j < prog->declaration_count; j++) {
+      const char *other;
+      if (j == i || !pending[j]) {
+        continue;
+      }
+      other = type_decl_name(prog->declarations[j]);
+      if (!other || !type_decl_holds_by_value(prog->declarations[i],
+                                              other) ||
+          !type_decl_holds_by_value(prog->declarations[j], self)) {
+        continue;
+      }
+      type_checker_set_error_at_location(
+          checker, prog->declarations[i]->location,
+          "'%s' and '%s' each store a value of the other, so neither has "
+          "a size. Hold one of them by pointer: '%s*'",
+          self, other, other);
+      ok = 0;
+      pending[i] = 0;
+      pending[j] = 0;
+      remaining -= 2;
+      break;
+    }
+  }
+  for (i = 0; i < prog->declaration_count; i++) {
+    if (pending[i] &&
+        prog->declarations[i]->type == AST_STRUCT_DECLARATION) {
+      type_checker_declare_struct_placeholder(checker,
+                                              prog->declarations[i]);
+    }
+  }
+  *remaining_out = remaining;
+  return ok;
+}
+
 static int type_checker_register_types(TypeChecker *checker, Program *prog,
                                        int generated_only) {
   int ok = 1;
@@ -547,49 +602,9 @@ static int type_checker_register_types(TypeChecker *checker, Program *prog,
       type_checker_leave_expansion_decl(checker, &expansion);
     }
     if (settled == 0) {
-      /* Nothing moved, so what is left refers to itself in a circle. A circle
-       * of pointers is a shape a program is entitled to write, and it has no
-       * order that puts every name before its use, so the names are declared
-       * first and the fields filled in afterwards. A circle that stores values
-       * has no layout at all and is reported here, once, naming both ends. */
-      for (i = 0; i < prog->declaration_count; i++) {
-        const char *self;
-        if (!pending[i]) {
-          continue;
-        }
-        self = type_decl_name(prog->declarations[i]);
-        if (!self) {
-          continue;
-        }
-        for (j = 0; j < prog->declaration_count; j++) {
-          const char *other;
-          if (j == i || !pending[j]) {
-            continue;
-          }
-          other = type_decl_name(prog->declarations[j]);
-          if (!other || !type_decl_holds_by_value(prog->declarations[i],
-                                                  other) ||
-              !type_decl_holds_by_value(prog->declarations[j], self)) {
-            continue;
-          }
-          type_checker_set_error_at_location(
-              checker, prog->declarations[i]->location,
-              "'%s' and '%s' each store a value of the other, so neither has "
-              "a size. Hold one of them by pointer: '%s*'",
-              self, other, other);
-          ok = 0;
-          pending[i] = 0;
-          pending[j] = 0;
-          remaining -= 2;
-          break;
-        }
-      }
-      for (i = 0; i < prog->declaration_count; i++) {
-        if (pending[i] &&
-            prog->declarations[i]->type == AST_STRUCT_DECLARATION) {
-          type_checker_declare_struct_placeholder(checker,
-                                                  prog->declarations[i]);
-        }
+      if (!type_checker_report_type_cycles(checker, prog, pending,
+                                           &remaining)) {
+        ok = 0;
       }
       break;
     }

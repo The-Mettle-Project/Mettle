@@ -392,8 +392,15 @@ void ir_load_apply_unsigned(IRInstruction *load, Type *loaded_type) {
   if (!load || !loaded_type) {
     return;
   }
+  /* `char` and `bool` are unsigned bytes, so they belong here too. Leaving
+   * char out sign-extended every byte from 0x80 up, but only when the load fed
+   * an expression directly: `var c: char = s[1]` went through the declared
+   * local and zero-extended, while `s[1] == 195` and `(int32)s[1]` answered
+   * -61. Every non-ASCII byte of a UTF-8 string read the wrong way round
+   * depending on whether it was assigned first. */
   if (loaded_type->kind == TYPE_UINT8 || loaded_type->kind == TYPE_UINT16 ||
-      loaded_type->kind == TYPE_UINT32 || loaded_type->kind == TYPE_UINT64) {
+      loaded_type->kind == TYPE_UINT32 || loaded_type->kind == TYPE_UINT64 ||
+      loaded_type->kind == TYPE_CHAR || loaded_type->kind == TYPE_BOOL) {
     load->is_unsigned = 1;
   }
 }

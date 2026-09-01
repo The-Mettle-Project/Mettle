@@ -249,6 +249,59 @@ static void print_block(AstPrinter *printer, const ASTNode *node) {
   fputs("}", printer->out);
 }
 
+static void print_loop_statement(AstPrinter *printer,
+                                 const ASTNode *node) {
+  switch (node->type) {
+case AST_WHILE_STATEMENT: {
+  const WhileStatement *loop = (const WhileStatement *)node->data;
+  if (!loop) {
+    break;
+  }
+  print_indent(printer);
+  fputs("while (", printer->out);
+  print_expression(printer, loop->condition);
+  fputc(')', printer->out);
+  print_block(printer, loop->body);
+  fputc('\n', printer->out);
+  break;
+}
+
+case AST_FOR_STATEMENT: {
+  const ForStatement *loop = (const ForStatement *)node->data;
+  if (!loop) {
+    break;
+  }
+  print_indent(printer);
+  fputs("for (", printer->out);
+  if (loop->initializer) {
+    fputs("/* init */ ", printer->out);
+  }
+  print_expression(printer, loop->condition);
+  fputc(')', printer->out);
+  print_block(printer, loop->body);
+  fputc('\n', printer->out);
+  break;
+}
+
+case AST_COMPTIME_FOR: {
+  /* Only reachable when expansion did not run (a parse-only dump), since a
+   * successful expand replaces the directive with its iterations. */
+  const ComptimeForStatement *directive =
+      (const ComptimeForStatement *)node->data;
+  print_indent(printer);
+  fprintf(printer->out, "comptime for %s in ",
+          directive && directive->binding_name ? directive->binding_name
+                                               : "<binding>");
+  print_expression(printer, directive ? directive->sequence : NULL);
+  print_block(printer, directive ? directive->body : NULL);
+  fputc('\n', printer->out);
+  break;
+}
+  default:
+    break;
+  }
+}
+
 static void print_statement(AstPrinter *printer, const ASTNode *node) {
   if (!node) {
     return;
@@ -341,51 +394,11 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
     break;
   }
 
-  case AST_WHILE_STATEMENT: {
-    const WhileStatement *loop = (const WhileStatement *)node->data;
-    if (!loop) {
-      break;
-    }
-    print_indent(printer);
-    fputs("while (", printer->out);
-    print_expression(printer, loop->condition);
-    fputc(')', printer->out);
-    print_block(printer, loop->body);
-    fputc('\n', printer->out);
+  case AST_WHILE_STATEMENT:
+  case AST_FOR_STATEMENT:
+  case AST_COMPTIME_FOR:
+    print_loop_statement(printer, node);
     break;
-  }
-
-  case AST_FOR_STATEMENT: {
-    const ForStatement *loop = (const ForStatement *)node->data;
-    if (!loop) {
-      break;
-    }
-    print_indent(printer);
-    fputs("for (", printer->out);
-    if (loop->initializer) {
-      fputs("/* init */ ", printer->out);
-    }
-    print_expression(printer, loop->condition);
-    fputc(')', printer->out);
-    print_block(printer, loop->body);
-    fputc('\n', printer->out);
-    break;
-  }
-
-  case AST_COMPTIME_FOR: {
-    /* Only reachable when expansion did not run (a parse-only dump), since a
-     * successful expand replaces the directive with its iterations. */
-    const ComptimeForStatement *directive =
-        (const ComptimeForStatement *)node->data;
-    print_indent(printer);
-    fprintf(printer->out, "comptime for %s in ",
-            directive && directive->binding_name ? directive->binding_name
-                                                 : "<binding>");
-    print_expression(printer, directive ? directive->sequence : NULL);
-    print_block(printer, directive ? directive->body : NULL);
-    fputc('\n', printer->out);
-    break;
-  }
 
   case AST_BREAK_STATEMENT:
     print_indent(printer);

@@ -493,6 +493,12 @@ $cases = @(
     Pattern       = "unknown instruction"
   },
   @{
+    Name          = "closure_captures_array_rejected"
+    Path          = "tests/err_closure_captures_array.mettle"
+    ShouldSucceed = $false
+    Pattern       = "cannot be captured by value"
+  },
+  @{
     Name          = "naked_body_must_be_asm"
     Path          = "tests/err_naked_has_statements.mettle"
     ShouldSucceed = $false
@@ -1580,6 +1586,50 @@ $cases = @(
   @{ Name = "signed_comparison"; Path = "tests/test_signed_comparison.mettle"; ShouldSucceed = $true },
   @{ Name = "float_negative_comparison"; Path = "tests/test_float_negative_comparison.mettle"; ShouldSucceed = $true },
   @{ Name = "signed_wraparound"; Path = "tests/test_signed_wraparound.mettle"; ShouldSucceed = $true },
+  # Both machine conversions between float and a 64-bit integer are signed:
+  # (float64)(uint64)~0 answered -1.0, and (uint64)1e19 answered the
+  # integer-indefinite sentinel. Each direction needs a bias sequence.
+  @{ Name = "unsigned_float_conversion"; Path = "tests/test_unsigned_float_conversion.mettle"; ShouldSucceed = $true },
+  # CSE invalidated an entry by its operands but not by the place the value
+  # lives in, so a constant held in an address-taken local outlived a store
+  # through that address and was reused as a stale read.
+  @{ Name = "cse_value_through_alias"; Path = "tests/test_cse_value_through_alias.mettle"; ShouldSucceed = $true },
+  # A struct at or below 8 bytes moves by word-sized load/store, because the
+  # backend keeps it in a register. The compile-time interpreter modelled every
+  # aggregate as an address, so it stored the low bytes of one and trapped
+  # reading another. Runs the same checks natively and under `mettle test`.
+  @{ Name = "interp_register_aggregates"; Path = "tests/test_interp_register_aggregates.mettle"; ShouldSucceed = $true },
+  # Multidimensional arrays: `int32[3][4]` is three rows of four, indexed in
+  # declaration order, row-major and contiguous. Runs natively and under the
+  # compile-time interpreter, which sized such a local at its outer count.
+  @{ Name = "multidim_arrays"; Path = "tests/test_multidim_arrays.mettle"; ShouldSucceed = $true },
+  # A local copied from a parameter must be a copy even when the parameter is
+  # assigned afterwards. The baseline emitter aliased it, because a parameter
+  # is written once before any instruction runs and that write has no IR to
+  # count, so a later assignment looked like the definitional one.
+  @{ Name = "param_copy_not_alias"; Path = "tests/test_param_copy_not_alias.mettle"; ShouldSucceed = $true },
+  # The vectorized SiLU/SwiGLU kernel at every length. It clamped the pointer
+  # back so the final vector OVERLAPPED elements the loop had already done,
+  # which applies silu twice to an in-place kernel. The existing vectorizer
+  # test uses n = 1024, so it never ran the tail.
+  @{ Name = "simd_silu_tail"; Path = "tests/test_simd_silu_tail.mettle"; ShouldSucceed = $true },
+  # Every in-place SIMD kernel at every length 1..40, plus a guard that nothing
+  # past the count is touched. The vectorizer tests all use round lengths, so
+  # the tail path went unexercised across the whole family.
+  @{ Name = "simd_inplace_tails"; Path = "tests/test_simd_inplace_tails.mettle"; ShouldSucceed = $true },
+  # What a closure may capture. A struct of any size and a string copy whole;
+  # an array does not travel by value and used to yield pointer fragments.
+  @{ Name = "closure_capture_aggregates"; Path = "tests/test_closure_capture_aggregates.mettle"; ShouldSucceed = $true },
+  # METTLE_NO_SIMD=1 turns the vectorizers off. It skipped EVERY pass instead,
+  # which left the loop canonical form unestablished while its checker still
+  # ran, so a local declared inside a loop became an internal compiler error.
+  # Documented in two places, tested in none, which is how that survived.
+  @{
+    Name          = "no_simd_env"
+    Path          = "tests/test_no_simd_env.mettle"
+    ShouldSucceed = $true
+    Env           = @{ METTLE_NO_SIMD = "1" }
+  },
   @{ Name = "signed_arithmetic"; Path = "tests/test_signed_arithmetic.mettle"; ShouldSucceed = $true },
   @{
     Name          = "sign_extension"
@@ -1605,6 +1655,12 @@ $cases = @(
   # int8/int16 loads widened with movzx whatever the element said, so a[0] set
   # to -1 read back as 255 and the answer moved with the optimization level.
   @{ Name = "narrow_signed_loads"; Path = "tests/test_narrow_signed_loads.mettle"; ShouldSucceed = $true },
+  # char is an unsigned byte, and a load of one must zero-extend. It was left
+  # out of ir_load_apply_unsigned, so a byte from 0x80 up sign-extended when
+  # the load fed an expression directly while assigning through a char local
+  # zero-extended: `s[1] == 195` was false and `var c: char = s[1]; c == 195`
+  # was true, for the same byte.
+  @{ Name = "char_load_unsigned"; Path = "tests/test_char_load_unsigned.mettle"; ShouldSucceed = $true },
   @{ Name = "integer_literal_wide"; Path = "tests/test_integer_literal_wide.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_mixed_locals"; Path = "tests/test_stack_mixed_locals.mettle"; ShouldSucceed = $true },
   @{ Name = "stack_large_struct"; Path = "tests/test_stack_large_struct.mettle"; ShouldSucceed = $true },
@@ -2191,6 +2247,11 @@ $cases = @(
   @{ Name = "errdefer_top_level"; Path = "tests/test_errdefer_top_level.mettle"; ShouldSucceed = $false; Pattern = "Defer statement outside of a function|Errdefer statement outside of a function" },
   @{ Name = "defer_block_statement"; Path = "tests/test_defer_block_statement.mettle"; ShouldSucceed = $true },
   @{ Name = "errdefer_assignment_statement"; Path = "tests/test_errdefer_assignment_statement.mettle"; ShouldSucceed = $true },
+  # What counts as the error path per return type. The test used to be
+  # "nonzero", whatever the type, which had the pointer idiom backwards:
+  # a successful non-null return ran the cleanup and freed what the caller
+  # had just been handed, while returning null leaked.
+  @{ Name = "errdefer_return_kinds"; Path = "tests/test_errdefer_return_kinds.mettle"; ShouldSucceed = $true },
   @{
     Name            = "errdefer_implicit_fallthrough"
     Path            = "tests/test_errdefer_implicit_fallthrough.mettle"

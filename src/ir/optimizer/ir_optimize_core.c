@@ -1632,6 +1632,28 @@ static void ir_expression_map_add_occurrence(IRExpressionMap *map,
   map->occ_count++;
 }
 
+/* List an entry among the ones a store can reach. The VALUE counts as much as
+ * the operands: an entry says "this expression is already available in that
+ * place", and a store through a pointer to a symbol changes what the place
+ * holds. `-3.5 -> @fy` outlived `*(&fy) <- x` and a later `-3.5` was rewritten
+ * to a read of @fy, which by then held something else. Duplicates are harmless:
+ * the store path only kills, and killing twice is a no-op. */
+static void ir_expression_map_note_symbol_entry(IRExpressionMap *map,
+                                                size_t index) {
+  if (map->sym_count == map->sym_capacity) {
+    size_t grown = map->sym_capacity ? map->sym_capacity * 2 : 32;
+    size_t *items = (size_t *)realloc(map->sym_entries, grown * sizeof(size_t));
+    if (!items) {
+      map->sym_capacity = 0;
+      map->sym_count = 0;
+      return; /* the store path then falls back to walking the map */
+    }
+    map->sym_entries = items;
+    map->sym_capacity = grown;
+  }
+  map->sym_entries[map->sym_count++] = index;
+}
+
 static void ir_expression_map_register_entry(IRExpressionMap *map,
                                              size_t index) {
   IRExpressionEntry *entry = &map->items[index];
@@ -1639,19 +1661,9 @@ static void ir_expression_map_register_entry(IRExpressionMap *map,
   ir_expression_map_add_occurrence(map, &entry->rhs, index);
   ir_expression_map_add_occurrence(map, &entry->value, index);
   if (entry->lhs.kind == IR_OPERAND_SYMBOL ||
-      entry->rhs.kind == IR_OPERAND_SYMBOL) {
-    if (map->sym_count == map->sym_capacity) {
-      size_t grown = map->sym_capacity ? map->sym_capacity * 2 : 32;
-      size_t *items = (size_t *)realloc(map->sym_entries, grown * sizeof(size_t));
-      if (!items) {
-        map->sym_capacity = 0;
-        map->sym_count = 0;
-        return; /* the store path then falls back to walking the map */
-      }
-      map->sym_entries = items;
-      map->sym_capacity = grown;
-    }
-    map->sym_entries[map->sym_count++] = index;
+      entry->rhs.kind == IR_OPERAND_SYMBOL ||
+      entry->value.kind == IR_OPERAND_SYMBOL) {
+    ir_expression_map_note_symbol_entry(map, index);
   }
 }
 
@@ -1776,6 +1788,13 @@ static int ir_expression_map_store_value_for_instruction(
     ir_operand_destroy(&map->items[existing_index].value);
     map->items[existing_index].value = new_value;
     ir_expression_map_note_name(map, &map->items[existing_index].value);
+    /* The entry now holds its value in a symbol, so a store can reach it even
+     * if neither operand named one when it was registered. */
+    if (new_value.kind == IR_OPERAND_SYMBOL &&
+        map->items[existing_index].lhs.kind != IR_OPERAND_SYMBOL &&
+        map->items[existing_index].rhs.kind != IR_OPERAND_SYMBOL) {
+      ir_expression_map_note_symbol_entry(map, (size_t)existing_index);
+    }
     return 1;
   }
 
@@ -2038,7 +2057,8 @@ static void ir_expression_map_invalidate_after_store(
         continue;
       }
       if (ir_operand_is_aliasable_symbol(addr_taken, &map->items[idx].lhs) ||
-          ir_operand_is_aliasable_symbol(addr_taken, &map->items[idx].rhs)) {
+          ir_operand_is_aliasable_symbol(addr_taken, &map->items[idx].rhs) ||
+          ir_operand_is_aliasable_symbol(addr_taken, &map->items[idx].value)) {
         ir_expression_map_kill(map, idx);
       }
     }
@@ -2051,7 +2071,8 @@ static void ir_expression_map_invalidate_after_store(
       continue;
     }
     if (ir_operand_is_aliasable_symbol(addr_taken, &map->items[i].lhs) ||
-        ir_operand_is_aliasable_symbol(addr_taken, &map->items[i].rhs)) {
+        ir_operand_is_aliasable_symbol(addr_taken, &map->items[i].rhs) ||
+        ir_operand_is_aliasable_symbol(addr_taken, &map->items[i].value)) {
       ir_expression_map_kill(map, i);
     }
   }

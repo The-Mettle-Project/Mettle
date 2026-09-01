@@ -1,0 +1,68 @@
+// What counts as the error path for `errdefer`, per return type.
+//
+// The test used to be "the returned value is nonzero", whatever the type. For
+// an integer status code that is the intended convention and two tests pin it.
+// For a POINTER it had the documented idiom exactly backwards:
+//
+//   var p: Buf* = new Buf;
+//   errdefer release(p);
+//   ...
+//   return p;        // non-null, so the cleanup RAN and freed the buffer
+//                    // the caller just received; returning null leaked
+//
+// and for a float, where 0.0 is an ordinary result, `return 1.5` was an error.
+// A pointer fails by being NULL, and a float has no failure convention at all.
+import "std/core";
+
+struct Buf { n: int32; }
+
+var runs: int32 = 0;
+
+fn mark() -> void { runs = runs + 1; }
+
+@noinline fn ret_i32(n: int32) -> int32 { errdefer mark(); return n; }
+@noinline fn ret_f64(x: float64) -> float64 { errdefer mark(); return x; }
+@noinline fn ret_f32(x: float32) -> float32 { errdefer mark(); return x; }
+@noinline fn ret_void() -> void { errdefer mark(); return; }
+
+@noinline fn make(ok: int32) -> Buf* {
+  var p: Buf* = new Buf;
+  errdefer mark();
+  if (ok == 0) { return (Buf*)0; }
+  p->n = 42;
+  return p;
+}
+
+@noinline fn ret_result(n: int32) -> Result<int32, string> {
+  errdefer mark();
+  if (n < 0) { return Err("neg"); }
+  return Ok(n);
+}
+
+fn main() -> int32 {
+  // Integer: nonzero is the error, which is the C status-code convention.
+  runs = 0; ret_i32(0);  if (runs != 0) { return 1; }
+  runs = 0; ret_i32(1);  if (runs != 1) { return 2; }
+  runs = 0; ret_i32(-1); if (runs != 1) { return 3; }
+  runs = 0; ret_i32(42); if (runs != 1) { return 4; }
+
+  // Pointer: NULL is the error, so a successful return must not clean up.
+  runs = 0; make(1); if (runs != 0) { return 5; }
+  runs = 0; make(0); if (runs != 1) { return 6; }
+
+  // Float: no failure convention, so never.
+  runs = 0; ret_f64(0.0); if (runs != 0) { return 7; }
+  runs = 0; ret_f64(1.5); if (runs != 0) { return 8; }
+  runs = 0; ret_f64(0.0 - 2.5); if (runs != 0) { return 9; }
+  runs = 0; ret_f32((float32)3.5); if (runs != 0) { return 10; }
+
+  // void: never.
+  runs = 0; ret_void(); if (runs != 0) { return 11; }
+
+  // Result: the Err variant, whatever the payload.
+  runs = 0; ret_result(5);  if (runs != 0) { return 12; }
+  runs = 0; ret_result(0);  if (runs != 0) { return 13; }
+  runs = 0; ret_result(-1); if (runs != 1) { return 14; }
+
+  return 0;
+}

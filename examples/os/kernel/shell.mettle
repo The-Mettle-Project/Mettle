@@ -4,12 +4,13 @@ import "keyboard"
 import "text"
 import "process"
 
-const COMMAND_SLOTS: uint64 = 32
+const COMMAND_SLOTS: uint64 = 64
 const HISTORY_SLOTS: uint64 = 8
 const LINE_BYTES: uint64 = 128
 const LINE_LIMIT: uint64 = LINE_BYTES - 2
 const WORD_BYTES: uint64 = 32
-const HELP_COLUMN: uint64 = 16
+const HELP_COLUMN: uint64 = 20
+const HELP_COLUMNS: uint64 = 4
 
 struct Command {
     name: cstring;
@@ -17,7 +18,7 @@ struct Command {
     handler: fn(cstring) -> void;
 }
 
-var commands: Command[32]
+var commands: Command[64]
 var count: uint64 = 0
 
 var line: uint8[128]
@@ -28,6 +29,9 @@ var history_count: uint64 = 0
 export fn shell_register(name: cstring, help: cstring,
                          handler: fn(cstring) -> void) {
     if (count >= COMMAND_SLOTS) {
+        console_write("the command table is full, ")
+        console_write(name)
+        console_write_line(" did not register")
         return
     }
     commands[count].name = name
@@ -36,13 +40,35 @@ export fn shell_register(name: cstring, help: cstring,
     count++
 }
 
-export fn shell_help() {
-    console_write_line("commands")
-    for i: uint64 in 0..count {
-        console_write("  ")
-        console_pad(commands[i].name, HELP_COLUMN)
-        console_write_line(commands[i].help)
+export fn shell_help(argument: cstring) {
+    if (!text_empty(argument)) {
+        for i: uint64 in 0..count {
+            if (text_equals(commands[i].name, argument)) {
+                console_write(commands[i].name)
+                console_write("  ")
+                console_write_line(commands[i].help)
+                return
+            }
+        }
+        console_write("no command called ")
+        console_write_line(argument)
+        return
     }
+    console_write_decimal(count)
+    console_write_line(" commands")
+    var column: uint64 = 0
+    for i: uint64 in 0..count {
+        console_pad(commands[i].name, HELP_COLUMN)
+        column++
+        if (column == HELP_COLUMNS) {
+            console_put('\n')
+            column = 0
+        }
+    }
+    if (column != 0) {
+        console_put('\n')
+    }
+    console_write_line("help <command> says what one does")
     console_write_line("arrow up and down walk the command history")
 }
 

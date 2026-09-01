@@ -404,6 +404,21 @@ size_t code_generator_binary_symbol_write_count(
     return 0;
   }
 
+  /* A parameter is written once before any instruction runs, by the call that
+   * passed it, and that write has no IR to count. Without it a parameter
+   * assigned once in the body looked like a symbol with a single DEFINITIONAL
+   * write, when the write is really a mutation of a value that already had
+   * one. The alias below leans on this count to decide whether a copy can
+   * share its source's storage: `var t: int64 = b; b = 5; return t;` returned
+   * 5. */
+  for (size_t p = 0; p < function->parameter_count; p++) {
+    if (function->parameter_names && function->parameter_names[p] &&
+        strcmp(function->parameter_names[p], name) == 0) {
+      count++;
+      break;
+    }
+  }
+
   for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *instruction = &function->instructions[i];
     if (!instruction ||
@@ -1718,6 +1733,63 @@ int code_generator_binary_validate_signature(CodeGenerator *generator,
 }
 
 
+static int code_generator_binary_mark_float_globals(
+    CodeGenerator *generator, IRFunction *ir_function,
+    BinaryFunctionContext *context) {
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    const IRInstruction *instruction = &ir_function->instructions[i];
+    if (!instruction) {
+      continue;
+    }
+    for (int k = 0;; k++) {
+      const IROperand *op;
+      if (k == 0) {
+        op = &instruction->dest;
+      } else if (k == 1) {
+        op = &instruction->lhs;
+      } else if (k == 2) {
+        op = &instruction->rhs;
+      } else if ((size_t)(k - 3) < instruction->argument_count) {
+        op = &instruction->arguments[k - 3];
+      } else {
+        break;
+      }
+      if (op->kind != IR_OPERAND_SYMBOL || !op->name || op->name[0] == '\0' ||
+          !generator->ir_program) {
+        continue;
+      }
+      /* A local or parameter of this function owns the name outright: the
+       * global of the same name is a different object and its width says
+       * nothing about this storage. Without this, an `int64` local named like
+       * a float-returning function (`var fmod: int64`) was marked float and
+       * every store to it converted, so it read back as the bits of a double.
+       * A function name is never a float value either -- a function symbol
+       * carries its RETURN type in ->type, which is not the type of the name. */
+      if (binary_named_slot_table_get_offset(&context->local_slots, op->name) >=
+              0 ||
+          binary_named_slot_table_get_offset(&context->parameter_slots,
+                                             op->name) >= 0) {
+        continue;
+      }
+      const CgSym *sym = code_generator_lookup_symbol(generator, op->name);
+      if (!sym || !sym->scope || sym->scope->type != CG_SCOPE_GLOBAL ||
+          sym->kind == CG_SYM_FUNCTION) {
+        continue;
+      }
+      int gfbits = code_generator_binary_resolved_type_float_bits(sym->type);
+      if (gfbits &&
+          !code_generator_binary_mark_float_symbol(context, op->name, gfbits)) {
+        code_generator_set_error(
+            generator, "Failed to allocate float global metadata in function "
+                       "'%s'",
+            ir_function->name);
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 int code_generator_binary_prepare_function_context(
     CodeGenerator *generator,
     IRFunction *ir_function, BinaryFunctionContext *context) {
@@ -2084,57 +2156,10 @@ int code_generator_binary_prepare_function_context(
    * instruction-result pass below at the temp's width (64), mislabeling a
    * float32 global. Globals are not declared by a DECLARE_LOCAL, so without this
    * they have no authoritative declared-width mark. */
-  for (size_t i = 0; i < ir_function->instruction_count; i++) {
-    const IRInstruction *instruction = &ir_function->instructions[i];
-    if (!instruction) {
-      continue;
-    }
-    for (int k = 0;; k++) {
-      const IROperand *op;
-      if (k == 0) {
-        op = &instruction->dest;
-      } else if (k == 1) {
-        op = &instruction->lhs;
-      } else if (k == 2) {
-        op = &instruction->rhs;
-      } else if ((size_t)(k - 3) < instruction->argument_count) {
-        op = &instruction->arguments[k - 3];
-      } else {
-        break;
-      }
-      if (op->kind != IR_OPERAND_SYMBOL || !op->name || op->name[0] == '\0' ||
-          !generator->ir_program) {
-        continue;
-      }
-      /* A local or parameter of this function owns the name outright: the
-       * global of the same name is a different object and its width says
-       * nothing about this storage. Without this, an `int64` local named like
-       * a float-returning function (`var fmod: int64`) was marked float and
-       * every store to it converted, so it read back as the bits of a double.
-       * A function name is never a float value either -- a function symbol
-       * carries its RETURN type in ->type, which is not the type of the name. */
-      if (binary_named_slot_table_get_offset(&context->local_slots, op->name) >=
-              0 ||
-          binary_named_slot_table_get_offset(&context->parameter_slots,
-                                             op->name) >= 0) {
-        continue;
-      }
-      const CgSym *sym = code_generator_lookup_symbol(generator, op->name);
-      if (!sym || !sym->scope || sym->scope->type != CG_SCOPE_GLOBAL ||
-          sym->kind == CG_SYM_FUNCTION) {
-        continue;
-      }
-      int gfbits = code_generator_binary_resolved_type_float_bits(sym->type);
-      if (gfbits &&
-          !code_generator_binary_mark_float_symbol(context, op->name, gfbits)) {
-        code_generator_set_error(
-            generator, "Failed to allocate float global metadata in function "
-                       "'%s'",
-            ir_function->name);
-        binary_function_context_destroy(context);
-        return 0;
-      }
-    }
+  if (!code_generator_binary_mark_float_globals(generator, ir_function,
+                                               context)) {
+    binary_function_context_destroy(context);
+    return 0;
   }
 
   for (size_t i = 0; i < ir_function->instruction_count; i++) {

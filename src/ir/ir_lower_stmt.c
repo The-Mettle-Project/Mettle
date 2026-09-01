@@ -493,6 +493,9 @@ static int ir_zero_fill_is_dead(IRLoweringContext *context, const char *name,
   return dead;
 }
 
+static int ir_lower_gpu_launch(IRLoweringContext *context,
+                               IRFunction *function, ASTNode *statement);
+
 int ir_lower_statement_with_defers(IRLoweringContext *context,
                                           IRFunction *function,
                                           ASTNode *statement,
@@ -1035,169 +1038,8 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     return ir_emit(context, function, &barrier);
   }
 
-  case AST_GPU_LAUNCH: {
-    GpuLaunchStatement *launch = (GpuLaunchStatement *)statement->data;
-    const size_t controls = IR_GPU_LAUNCH_CONTROL_ARGS;
-    const size_t total = controls + (launch ? launch->argument_count : 0u);
-    IROperand kernel = ir_operand_none();
-    IROperand *arguments = NULL;
-    MtlcType **argument_types = NULL;
-    if (!launch || !launch->kernel || !launch->dynamic_shared_bytes ||
-        !launch->stream) {
-      ir_set_error(context, "Malformed GPU launch statement");
-      return 0;
-    }
-    arguments = calloc(total, sizeof(*arguments));
-    argument_types = calloc(total, sizeof(*argument_types));
-    if (!arguments || !argument_types) {
-      free(arguments);
-      free(argument_types);
-      ir_set_error(context, "Out of memory while lowering GPU launch");
-      return 0;
-    }
-    /* A typed dispatch names a declared `extern kernel` rather than holding a
-     * handle in a host variable: resolve it by name against the loaded module.
-     * The runtime caches by the (compile-time constant) name pointer, so a
-     * per-token launch pays a pointer compare, not a driver lookup. */
-    if (launch->typed_kernel && launch->kernel &&
-        launch->kernel->type == AST_IDENTIFIER && launch->kernel->data) {
-      const char *kernel_name = ((Identifier *)launch->kernel->data)->name;
-      IROperand name_argument = ir_operand_string(kernel_name ? kernel_name : "");
-      IRInstruction resolve = {0};
-      if (!ir_make_temp_operand(context, &kernel)) {
-        ir_operand_destroy(&name_argument);
-        free(arguments);
-        free(argument_types);
-        return 0;
-      }
-      resolve.op = IR_OP_CALL;
-      resolve.location = statement->location;
-      resolve.dest = kernel;
-      resolve.text = "mtlc_gpu_kernel_handle";
-      resolve.arguments = &name_argument;
-      resolve.argument_count = 1;
-      if (!ir_emit(context, function, &resolve)) {
-        ir_operand_destroy(&name_argument);
-        goto gpu_launch_lower_fail;
-      }
-      ir_operand_destroy(&name_argument);
-    } else if (!ir_lower_expression(context, function, launch->kernel,
-                                    &kernel)) {
-      free(arguments);
-      free(argument_types);
-      return 0;
-    }
-    /* `work: N` launches ceil(N / block volume) blocks of the kernel's
-     * declared shape, so the host stops mirroring that arithmetic at every
-     * call site. */
-    if (launch->work) {
-      long long block_volume = (long long)launch->kernel_block[0] *
-                               (launch->kernel_block[1] > 0
-                                    ? launch->kernel_block[1]
-                                    : 1) *
-                               (launch->kernel_block[2] > 0
-                                    ? launch->kernel_block[2]
-                                    : 1);
-      /* One block covers block_volume threads, but a `per = warp` kernel
-       * spends 32 of them per work item, so it covers that many fewer. */
-      long long threads_per_item = launch->kernel_threads_per_item > 0
-                                       ? launch->kernel_threads_per_item
-                                       : 1;
-      block_volume /= threads_per_item;
-      IROperand work_value = ir_operand_none();
-      IROperand biased = ir_operand_none();
-      if (block_volume < 1) block_volume = 1;
-      if (!ir_lower_expression(context, function, launch->work, &work_value)) {
-        goto gpu_launch_lower_fail;
-      }
-      if (!ir_make_temp_operand(context, &biased) ||
-          !ir_emit_binary_instruction(context, function, statement->location,
-                                      "+", biased, work_value,
-                                      ir_operand_int(block_volume - 1))) {
-        ir_operand_destroy(&work_value);
-        ir_operand_destroy(&biased);
-        goto gpu_launch_lower_fail;
-      }
-      ir_operand_destroy(&work_value);
-      if (!ir_make_temp_operand(context, &arguments[0]) ||
-          !ir_emit_binary_instruction(context, function, statement->location,
-                                      "/", arguments[0], biased,
-                                      ir_operand_int(block_volume))) {
-        ir_operand_destroy(&biased);
-        goto gpu_launch_lower_fail;
-      }
-      ir_operand_destroy(&biased);
-      arguments[1] = ir_operand_int(1);
-      arguments[2] = ir_operand_int(1);
-      for (size_t d = 0; d < 3; d++) {
-        arguments[3 + d] =
-            ir_operand_int(launch->kernel_block[d] > 0 ? launch->kernel_block[d]
-                                                       : 1);
-      }
-    } else {
-      for (size_t d = 0; d < 3; d++) {
-        if (!ir_lower_expression(context, function, launch->grid[d],
-                                 &arguments[d]) ||
-            !ir_lower_expression(context, function, launch->block[d],
-                                 &arguments[3 + d])) {
-          goto gpu_launch_lower_fail;
-        }
-      }
-    }
-    if (!ir_lower_expression(context, function, launch->dynamic_shared_bytes,
-                             &arguments[6]) ||
-        !ir_lower_expression(context, function, launch->stream,
-                             &arguments[7])) {
-      goto gpu_launch_lower_fail;
-    }
-    for (size_t i = 0; i < launch->argument_count; i++) {
-      ASTNode *source_arg = launch->arguments[i];
-      Type *source_type = source_arg ? source_arg->resolved_type : NULL;
-      if (!ir_lower_expression(context, function, source_arg,
-                               &arguments[controls + i])) {
-        goto gpu_launch_lower_fail;
-      }
-      if (!source_type) {
-        source_type = ir_infer_expression_type(context, source_arg);
-      }
-      argument_types[controls + i] =
-          mtlc_type_from_frontend(source_type);
-      if (!argument_types[controls + i]) {
-        ir_set_error(context, "GPU launch argument has no backend ABI type");
-        goto gpu_launch_lower_fail;
-      }
-    }
-
-    {
-      IRInstruction instruction = {0};
-      instruction.op = IR_OP_GPU_LAUNCH;
-      instruction.location = statement->location;
-      instruction.lhs = kernel;
-      instruction.arguments = arguments;
-      instruction.argument_types = argument_types;
-      instruction.argument_count = total;
-      instruction.ast_ref = statement;
-      if (!ir_emit(context, function, &instruction)) {
-        goto gpu_launch_lower_fail;
-      }
-    }
-    ir_operand_destroy(&kernel);
-    for (size_t i = 0; i < total; i++) {
-      ir_operand_destroy(&arguments[i]);
-    }
-    free(arguments);
-    free(argument_types);
-    return 1;
-
-  gpu_launch_lower_fail:
-    ir_operand_destroy(&kernel);
-    for (size_t i = 0; i < total; i++) {
-      ir_operand_destroy(&arguments[i]);
-    }
-    free(arguments);
-    free(argument_types);
-    return 0;
-  }
+  case AST_GPU_LAUNCH:
+    return ir_lower_gpu_launch(context, function, statement);
 
   case AST_RETURN_STATEMENT: {
     ReturnStatement *ret = (ReturnStatement *)statement->data;
@@ -1722,4 +1564,181 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     return 0;
   }
   }
+}
+
+static int ir_lower_gpu_launch_work(IRLoweringContext *context,
+                                    IRFunction *function,
+                                    GpuLaunchStatement *launch,
+                                    ASTNode *statement,
+                                    IROperand *arguments) {
+if (launch->work) {
+  long long block_volume = (long long)launch->kernel_block[0] *
+                           (launch->kernel_block[1] > 0
+                                ? launch->kernel_block[1]
+                                : 1) *
+                           (launch->kernel_block[2] > 0
+                                ? launch->kernel_block[2]
+                                : 1);
+  /* One block covers block_volume threads, but a `per = warp` kernel
+   * spends 32 of them per work item, so it covers that many fewer. */
+  long long threads_per_item = launch->kernel_threads_per_item > 0
+                                   ? launch->kernel_threads_per_item
+                                   : 1;
+  block_volume /= threads_per_item;
+  IROperand work_value = ir_operand_none();
+  IROperand biased = ir_operand_none();
+  if (block_volume < 1) block_volume = 1;
+  if (!ir_lower_expression(context, function, launch->work, &work_value)) {
+    return 0;
+  }
+  if (!ir_make_temp_operand(context, &biased) ||
+      !ir_emit_binary_instruction(context, function, statement->location,
+                                  "+", biased, work_value,
+                                  ir_operand_int(block_volume - 1))) {
+    ir_operand_destroy(&work_value);
+    ir_operand_destroy(&biased);
+    return 0;
+  }
+  ir_operand_destroy(&work_value);
+  if (!ir_make_temp_operand(context, &arguments[0]) ||
+      !ir_emit_binary_instruction(context, function, statement->location,
+                                  "/", arguments[0], biased,
+                                  ir_operand_int(block_volume))) {
+    ir_operand_destroy(&biased);
+    return 0;
+  }
+  ir_operand_destroy(&biased);
+  arguments[1] = ir_operand_int(1);
+  arguments[2] = ir_operand_int(1);
+  for (size_t d = 0; d < 3; d++) {
+    arguments[3 + d] =
+        ir_operand_int(launch->kernel_block[d] > 0 ? launch->kernel_block[d]
+                                                   : 1);
+  }
+} else {
+  for (size_t d = 0; d < 3; d++) {
+    if (!ir_lower_expression(context, function, launch->grid[d],
+                             &arguments[d]) ||
+        !ir_lower_expression(context, function, launch->block[d],
+                             &arguments[3 + d])) {
+      return 0;
+    }
+  }
+}
+  return 1;
+}
+
+static int ir_lower_gpu_launch(IRLoweringContext *context,
+                               IRFunction *function, ASTNode *statement) {
+  GpuLaunchStatement *launch = (GpuLaunchStatement *)statement->data;
+  const size_t controls = IR_GPU_LAUNCH_CONTROL_ARGS;
+  const size_t total = controls + (launch ? launch->argument_count : 0u);
+  IROperand kernel = ir_operand_none();
+  IROperand *arguments = NULL;
+  MtlcType **argument_types = NULL;
+  if (!launch || !launch->kernel || !launch->dynamic_shared_bytes ||
+      !launch->stream) {
+    ir_set_error(context, "Malformed GPU launch statement");
+    return 0;
+  }
+  arguments = calloc(total, sizeof(*arguments));
+  argument_types = calloc(total, sizeof(*argument_types));
+  if (!arguments || !argument_types) {
+    free(arguments);
+    free(argument_types);
+    ir_set_error(context, "Out of memory while lowering GPU launch");
+    return 0;
+  }
+  /* A typed dispatch names a declared `extern kernel` rather than holding a
+   * handle in a host variable: resolve it by name against the loaded module.
+   * The runtime caches by the (compile-time constant) name pointer, so a
+   * per-token launch pays a pointer compare, not a driver lookup. */
+  if (launch->typed_kernel && launch->kernel &&
+      launch->kernel->type == AST_IDENTIFIER && launch->kernel->data) {
+    const char *kernel_name = ((Identifier *)launch->kernel->data)->name;
+    IROperand name_argument = ir_operand_string(kernel_name ? kernel_name : "");
+    IRInstruction resolve = {0};
+    if (!ir_make_temp_operand(context, &kernel)) {
+      ir_operand_destroy(&name_argument);
+      free(arguments);
+      free(argument_types);
+      return 0;
+    }
+    resolve.op = IR_OP_CALL;
+    resolve.location = statement->location;
+    resolve.dest = kernel;
+    resolve.text = "mtlc_gpu_kernel_handle";
+    resolve.arguments = &name_argument;
+    resolve.argument_count = 1;
+    if (!ir_emit(context, function, &resolve)) {
+      ir_operand_destroy(&name_argument);
+      goto gpu_launch_lower_fail;
+    }
+    ir_operand_destroy(&name_argument);
+  } else if (!ir_lower_expression(context, function, launch->kernel,
+                                  &kernel)) {
+    free(arguments);
+    free(argument_types);
+    return 0;
+  }
+  /* `work: N` launches ceil(N / block volume) blocks of the kernel's
+   * declared shape, so the host stops mirroring that arithmetic at every
+   * call site. */
+  if (!ir_lower_gpu_launch_work(context, function, launch, statement,
+                                arguments)) {
+    goto gpu_launch_lower_fail;
+  }
+  if (!ir_lower_expression(context, function, launch->dynamic_shared_bytes,
+                           &arguments[6]) ||
+      !ir_lower_expression(context, function, launch->stream,
+                           &arguments[7])) {
+    goto gpu_launch_lower_fail;
+  }
+  for (size_t i = 0; i < launch->argument_count; i++) {
+    ASTNode *source_arg = launch->arguments[i];
+    Type *source_type = source_arg ? source_arg->resolved_type : NULL;
+    if (!ir_lower_expression(context, function, source_arg,
+                             &arguments[controls + i])) {
+      goto gpu_launch_lower_fail;
+    }
+    if (!source_type) {
+      source_type = ir_infer_expression_type(context, source_arg);
+    }
+    argument_types[controls + i] =
+        mtlc_type_from_frontend(source_type);
+    if (!argument_types[controls + i]) {
+      ir_set_error(context, "GPU launch argument has no backend ABI type");
+      goto gpu_launch_lower_fail;
+    }
+  }
+
+  {
+    IRInstruction instruction = {0};
+    instruction.op = IR_OP_GPU_LAUNCH;
+    instruction.location = statement->location;
+    instruction.lhs = kernel;
+    instruction.arguments = arguments;
+    instruction.argument_types = argument_types;
+    instruction.argument_count = total;
+    instruction.ast_ref = statement;
+    if (!ir_emit(context, function, &instruction)) {
+      goto gpu_launch_lower_fail;
+    }
+  }
+  ir_operand_destroy(&kernel);
+  for (size_t i = 0; i < total; i++) {
+    ir_operand_destroy(&arguments[i]);
+  }
+  free(arguments);
+  free(argument_types);
+  return 1;
+
+gpu_launch_lower_fail:
+  ir_operand_destroy(&kernel);
+  for (size_t i = 0; i < total; i++) {
+    ir_operand_destroy(&arguments[i]);
+  }
+  free(arguments);
+  free(argument_types);
+  return 0;
 }

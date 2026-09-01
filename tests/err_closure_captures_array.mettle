@@ -1,0 +1,11 @@
+// Capturing an array by value silently produced garbage: the capture becomes a
+// field of the environment struct and the constructor takes it by value, but an
+// array decays to a pointer at every by-value boundary, so the field got an
+// address and the body read that address as elements. `arr[0]` came back as a
+// fragment of the pointer with no diagnostic at all.
+fn main() -> int32 {
+  var arr: int32[4];
+  for i in 0..4 { arr[i] = i + 1; }
+  var pick: Fn(int32) -> int32 = fn(i: int32) -> int32 { return arr[i]; };
+  return pick(0);
+}

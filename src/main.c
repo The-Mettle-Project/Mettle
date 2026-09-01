@@ -68,7 +68,7 @@ __declspec(dllimport) int __stdcall QueryPerformanceCounter(MettleQpcTicks *coun
 #ifdef METTLE_VERSION_RAW
 #define METTLE_VERSION METTLE_STRINGIFY(METTLE_VERSION_RAW)
 #else
-#define METTLE_VERSION "v0.16.3"
+#define METTLE_VERSION "v0.17.0"
 #endif
 #endif
 
@@ -1272,6 +1272,39 @@ static int elf_collect_on_demand_objects(const char *runtime_directory,
   return 1;
 }
 
+static int elf_append_runtime_helpers(int stack_trace, int profile_runtime,
+                                      char *crash_handler_object,
+                                      char *profile_object,
+                                      char **extra_objects,
+                                      size_t *extra_object_count) {
+  if ((stack_trace || profile_runtime) && !crash_handler_object) {
+    fprintf(stderr,
+            "Error: Could not locate bundled crash_handler.o for Linux runtime "
+            "support\n");
+    return 0;
+  }
+  if (profile_runtime && !profile_object) {
+    fprintf(stderr,
+            "Error: Could not locate bundled profile.o for Linux runtime "
+            "profiling\n");
+    return 0;
+  }
+
+  /* Everything appended past on_demand_object_count is owned by its own
+   * variable, so cleanup frees only what the on-demand loop allocated. */
+
+  /* crash_handler and profile join the same list so both link paths carry one
+   * ordered set of runtime objects. safety.o calls into the crash handler, so
+   * it must precede it here. */
+  if (crash_handler_object) {
+    extra_objects[(*extra_object_count)++] = crash_handler_object;
+  }
+  if (profile_object) {
+    extra_objects[(*extra_object_count)++] = profile_object;
+  }
+  return 1;
+}
+
 static int mettle_link_elf_executable(const char *object_filename,
                                       const char *executable_filename,
                                       const CompilerOptions *options,
@@ -1346,30 +1379,10 @@ static int mettle_link_elf_executable(const char *object_filename,
   /* The generated startup object defines _start and passes argc and argv to
    * main. The backend emits non-position-independent code, so the fallback
    * driver receives -no-pie as well as all three no-runtime switches. */
-  if ((stack_trace || profile_runtime) && !crash_handler_object) {
-    fprintf(stderr,
-            "Error: Could not locate bundled crash_handler.o for Linux runtime "
-            "support\n");
+  if (!elf_append_runtime_helpers(stack_trace, profile_runtime,
+                                 crash_handler_object, profile_object,
+                                 extra_objects, &extra_object_count)) {
     goto cleanup;
-  }
-  if (profile_runtime && !profile_object) {
-    fprintf(stderr,
-            "Error: Could not locate bundled profile.o for Linux runtime "
-            "profiling\n");
-    goto cleanup;
-  }
-
-  /* Everything appended past on_demand_object_count is owned by its own
-   * variable, so cleanup frees only what the on-demand loop allocated. */
-
-  /* crash_handler and profile join the same list so both link paths carry one
-   * ordered set of runtime objects. safety.o calls into the crash handler, so
-   * it must precede it here. */
-  if (crash_handler_object) {
-    extra_objects[extra_object_count++] = crash_handler_object;
-  }
-  if (profile_object) {
-    extra_objects[extra_object_count++] = profile_object;
   }
 
   if (!(options && options->link_argument_count > 0) &&
@@ -3463,6 +3476,67 @@ typedef enum {
   DRIVER_FLAG_FAILED
 } DriverFlagResult;
 
+static DriverFlagResult parse_flag_shared_library(CompilerOptions *options,
+                                                  int argc, char *argv[],
+                                                  int *index) {
+  int i = *index;
+  (void)argc;
+
+  if (strncmp(argv[i], "-l", 2) == 0 && argv[i][2] != '\0') {
+    if (!add_string_option(&options->shared_libraries,
+                           &options->shared_library_count, argv[i] + 2)) {
+      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i] + 2);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--library") == 0 && i + 1 < argc) {
+    if (!add_string_option(&options->shared_libraries,
+                           &options->shared_library_count, argv[++i])) {
+      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
+    if (!add_string_option(&options->library_search_paths,
+                           &options->library_search_path_count, argv[i] + 2)) {
+      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i] + 2);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if ((strcmp(argv[i], "--library-path") == 0 ||
+              strcmp(argv[i], "-L") == 0) &&
+             i + 1 < argc) {
+    if (!add_string_option(&options->library_search_paths,
+                           &options->library_search_path_count, argv[++i])) {
+      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--rpath") == 0 && i + 1 < argc) {
+    if (!add_string_option(&options->runpaths, &options->runpath_count,
+                           argv[++i])) {
+      fprintf(stderr, "Error: Failed to add rpath '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--shared") == 0) {
+    options->shared_output = 1;
+  } else if (strcmp(argv[i], "--export-dynamic") == 0 ||
+             strcmp(argv[i], "-rdynamic") == 0) {
+    options->export_dynamic = 1;
+  } else if (strcmp(argv[i], "--soname") == 0 && i + 1 < argc) {
+    options->soname = argv[++i];
+  } else if (strcmp(argv[i], "--dynamic-linker") == 0 && i + 1 < argc) {
+    options->dynamic_linker = argv[++i];
+  } else if (strcmp(argv[i], "--soname") == 0 ||
+             strcmp(argv[i], "--dynamic-linker") == 0 ||
+             strcmp(argv[i], "--rpath") == 0 ||
+             strcmp(argv[i], "--library") == 0 ||
+             strcmp(argv[i], "--library-path") == 0) {
+    fprintf(stderr, "Error: Missing value after '%s'\n", argv[i]);
+    return DRIVER_FLAG_FAILED;
+  } else {
+    return DRIVER_FLAG_UNMATCHED;
+  }
+  *index = i;
+  return DRIVER_FLAG_TAKEN;
+}
+
 static DriverFlagResult parse_flag_output(CompilerOptions *options,
                                      DriverFlags *flags,
                                      int argc, char *argv[],
@@ -3531,56 +3605,15 @@ static DriverFlagResult parse_flag_output(CompilerOptions *options,
       fprintf(stderr, "Error: Failed to add linker argument\n");
       return DRIVER_FLAG_FAILED;
     }
-  } else if (strncmp(argv[i], "-l", 2) == 0 && argv[i][2] != '\0') {
-    if (!add_string_option(&options->shared_libraries,
-                           &options->shared_library_count, argv[i] + 2)) {
-      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i] + 2);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if (strcmp(argv[i], "--library") == 0 && i + 1 < argc) {
-    if (!add_string_option(&options->shared_libraries,
-                           &options->shared_library_count, argv[++i])) {
-      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i]);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
-    if (!add_string_option(&options->library_search_paths,
-                           &options->library_search_path_count, argv[i] + 2)) {
-      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i] + 2);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if ((strcmp(argv[i], "--library-path") == 0 ||
-              strcmp(argv[i], "-L") == 0) &&
-             i + 1 < argc) {
-    if (!add_string_option(&options->library_search_paths,
-                           &options->library_search_path_count, argv[++i])) {
-      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i]);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if (strcmp(argv[i], "--rpath") == 0 && i + 1 < argc) {
-    if (!add_string_option(&options->runpaths, &options->runpath_count,
-                           argv[++i])) {
-      fprintf(stderr, "Error: Failed to add rpath '%s'\n", argv[i]);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if (strcmp(argv[i], "--shared") == 0) {
-    options->shared_output = 1;
-  } else if (strcmp(argv[i], "--export-dynamic") == 0 ||
-             strcmp(argv[i], "-rdynamic") == 0) {
-    options->export_dynamic = 1;
-  } else if (strcmp(argv[i], "--soname") == 0 && i + 1 < argc) {
-    options->soname = argv[++i];
-  } else if (strcmp(argv[i], "--dynamic-linker") == 0 && i + 1 < argc) {
-    options->dynamic_linker = argv[++i];
-  } else if (strcmp(argv[i], "--soname") == 0 ||
-             strcmp(argv[i], "--dynamic-linker") == 0 ||
-             strcmp(argv[i], "--rpath") == 0 ||
-             strcmp(argv[i], "--library") == 0 ||
-             strcmp(argv[i], "--library-path") == 0) {
-    fprintf(stderr, "Error: Missing value after '%s'\n", argv[i]);
-    return DRIVER_FLAG_FAILED;
   } else {
-    return DRIVER_FLAG_UNMATCHED;
+    DriverFlagResult shared =
+        parse_flag_shared_library(options, argc, argv, &i);
+    if (shared == DRIVER_FLAG_UNMATCHED) {
+      return DRIVER_FLAG_UNMATCHED;
+    }
+    if (shared == DRIVER_FLAG_FAILED) {
+      return DRIVER_FLAG_FAILED;
+    }
   }
   *index = i;
   return DRIVER_FLAG_TAKEN;
@@ -4028,6 +4061,152 @@ static int parse_arguments(CompilerOptions *options, DriverFlags *flags,
   return -1;
 }
 
+static int mettle_check_target_options(CompilerOptions *options,
+                                       DriverFlags *flags) {
+  /* A flat image IS the linked product: there is nothing left for a linker to
+   * do to it, and no container for a linker to put it in. */
+  if (options->flat_output && flags->build_executable) {
+    fprintf(stderr,
+            "Error: --emit-flat writes the linked image itself; drop --build\n");
+    free((void *)options->import_directories);
+    free((void *)options->link_arguments);
+    return 1;
+  }
+
+  /* No object format here carries 16- or 32-bit relocations, so a narrow
+   * target has exactly one product. Saying so beats emitting an object whose
+   * code is the wrong width for the header on it. */
+  if (!mtlc_target_is_object_capable(mtlc_target()) && !options->flat_output) {
+    fprintf(stderr,
+            "Error: the %s target emits a flat image only; add --emit-flat "
+            "<file> (and --image-base <addr>)\n",
+            mtlc_target()->triple);
+    free((void *)options->import_directories);
+    free((void *)options->link_arguments);
+    return 1;
+  }
+
+  if (flags->build_executable && mtlc_target()->explicit_triple) {
+    const MtlcTarget *target = mtlc_target();
+    if (target->freestanding) {
+      fprintf(stderr,
+              "Error: --build links against the host runtime, which the %s "
+              "target has none of; emit the image with --emit-flat, or the "
+              "object with --emit-obj and link it yourself\n",
+              target->triple);
+      free((void *)options->import_directories);
+      free((void *)options->link_arguments);
+      return 1;
+    }
+    if (target->os != mtlc_target_host_os()) {
+      fprintf(stderr,
+              "Error: --build for %s has to run that machine's linker against "
+              "that machine's runtime, and neither is here; emit the object "
+              "with --emit-obj and link it on a %s host\n",
+              target->triple, mtlc_target_os_name(target->os));
+      free((void *)options->import_directories);
+      free((void *)options->link_arguments);
+      return 1;
+    }
+  }
+
+  if (mtlc_target()->image_base_set && !options->flat_output) {
+    if (!flags->build_executable) {
+      fprintf(stderr,
+              "Error: --image-base says where a linked image loads, and this "
+              "compile produces a relocatable object; add --build, or "
+              "--emit-flat <file> for a raw image\n");
+      free((void *)options->import_directories);
+      free((void *)options->link_arguments);
+      return 1;
+    }
+    {
+      uint64_t base = mtlc_target()->image_base;
+      uint64_t alignment =
+          mtlc_target()->format == BINARY_TARGET_FORMAT_COFF_WIN64 ? 0x10000u
+                                                                   : 0x1000u;
+      if (base % alignment) {
+        fprintf(stderr,
+                "Error: --image-base 0x%llx is not aligned to 0x%llx, which is "
+                "the boundary a %s image loads on\n",
+                (unsigned long long)base, (unsigned long long)alignment,
+                mtlc_target()->format == BINARY_TARGET_FORMAT_COFF_WIN64
+                    ? "PE"
+                    : "ELF");
+        free((void *)options->import_directories);
+        free((void *)options->link_arguments);
+        return 1;
+      }
+    }
+  }
+
+  if (options->safe && mtlc_target()->freestanding) {
+    fprintf(stderr,
+            "Error: --safe on the %s target has no runtime to report a "
+            "violation to; its checks call into the shadow map the runtime "
+            "owns, and a freestanding image links no library\n",
+            mtlc_target()->triple);
+    free((void *)options->import_directories);
+    free((void *)options->link_arguments);
+    return 1;
+  }
+
+  /* No --gpu-arch given: target the GPU that is actually in this machine when
+   * one is visible. Detection failure (no driver, headless build host) keeps
+   * the GB10 default so cross-compiles for DGX Spark are unchanged. */
+  if (options->emit_ptx && !flags->gpu_arch_explicit &&
+      detect_host_gpu_ptx_target(flags->detected_ptx_target,
+                                 sizeof(flags->detected_ptx_target))) {
+    options->ptx_target = flags->detected_ptx_target;
+  }
+
+  /* A `.version` above what the local driver understands fails inside
+   * cuModuleLoadData at run time, where the only evidence is a status code.
+   * When the target came from this machine, take the ISA from it too. */
+  if (options->emit_ptx && !flags->ptx_version_explicit) {
+    int driver_major = 0, driver_minor = 0;
+    if (gpu_detect_ptx_isa(&driver_major, &driver_minor) &&
+        (driver_major < options->ptx_isa_major ||
+         (driver_major == options->ptx_isa_major &&
+          driver_minor < options->ptx_isa_minor))) {
+      options->ptx_isa_major = driver_major;
+      options->ptx_isa_minor = driver_minor;
+    }
+  }
+
+  if (options->tracy && !flags->build_executable) {
+    fprintf(stderr, "Error: --tracy requires --build\n");
+    free((void *)options->import_directories);
+    free((void *)options->link_arguments);
+    return 1;
+  }
+
+  if (options->emit_arm64_obj && options->emit_arm64) {
+    fprintf(stderr,
+            "Error: --emit-arm64 (self-contained AArch64 executable) and "
+            "--emit-arm64-obj (AArch64 relocatable object) are different "
+            "outputs; pick one\n");
+    free((void *)options->import_directories);
+    free((void *)options->link_arguments);
+    return 1;
+  }
+
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+  if (options->emit_arm64_obj && flags->build_executable) {
+    fprintf(stderr,
+            "Error: --emit-arm64-obj cannot be combined with --build on an "
+            "x86-64 host: the object is AArch64 and this host's linker cannot "
+            "link it. Link it on an ARM machine, or use --emit-arm64 for a "
+            "self-contained executable\n");
+    free((void *)options->import_directories);
+    free((void *)options->link_arguments);
+    return 1;
+  }
+#endif
+
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   CompilerOptions options = {0};
   mettle_compiler_crash_install(argc, argv);
@@ -4151,147 +4330,12 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  /* A flat image IS the linked product: there is nothing left for a linker to
-   * do to it, and no container for a linker to put it in. */
-  if (options.flat_output && flags.build_executable) {
-    fprintf(stderr,
-            "Error: --emit-flat writes the linked image itself; drop --build\n");
-    free((void *)options.import_directories);
-    free((void *)options.link_arguments);
-    return 1;
-  }
-
-  /* No object format here carries 16- or 32-bit relocations, so a narrow
-   * target has exactly one product. Saying so beats emitting an object whose
-   * code is the wrong width for the header on it. */
-  if (!mtlc_target_is_object_capable(mtlc_target()) && !options.flat_output) {
-    fprintf(stderr,
-            "Error: the %s target emits a flat image only; add --emit-flat "
-            "<file> (and --image-base <addr>)\n",
-            mtlc_target()->triple);
-    free((void *)options.import_directories);
-    free((void *)options.link_arguments);
-    return 1;
-  }
-
-  if (flags.build_executable && mtlc_target()->explicit_triple) {
-    const MtlcTarget *target = mtlc_target();
-    if (target->freestanding) {
-      fprintf(stderr,
-              "Error: --build links against the host runtime, which the %s "
-              "target has none of; emit the image with --emit-flat, or the "
-              "object with --emit-obj and link it yourself\n",
-              target->triple);
-      free((void *)options.import_directories);
-      free((void *)options.link_arguments);
-      return 1;
-    }
-    if (target->os != mtlc_target_host_os()) {
-      fprintf(stderr,
-              "Error: --build for %s has to run that machine's linker against "
-              "that machine's runtime, and neither is here; emit the object "
-              "with --emit-obj and link it on a %s host\n",
-              target->triple, mtlc_target_os_name(target->os));
-      free((void *)options.import_directories);
-      free((void *)options.link_arguments);
-      return 1;
+  {
+    int target_status = mettle_check_target_options(&options, &flags);
+    if (target_status != 0) {
+      return target_status;
     }
   }
-
-  if (mtlc_target()->image_base_set && !options.flat_output) {
-    if (!flags.build_executable) {
-      fprintf(stderr,
-              "Error: --image-base says where a linked image loads, and this "
-              "compile produces a relocatable object; add --build, or "
-              "--emit-flat <file> for a raw image\n");
-      free((void *)options.import_directories);
-      free((void *)options.link_arguments);
-      return 1;
-    }
-    {
-      uint64_t base = mtlc_target()->image_base;
-      uint64_t alignment =
-          mtlc_target()->format == BINARY_TARGET_FORMAT_COFF_WIN64 ? 0x10000u
-                                                                   : 0x1000u;
-      if (base % alignment) {
-        fprintf(stderr,
-                "Error: --image-base 0x%llx is not aligned to 0x%llx, which is "
-                "the boundary a %s image loads on\n",
-                (unsigned long long)base, (unsigned long long)alignment,
-                mtlc_target()->format == BINARY_TARGET_FORMAT_COFF_WIN64
-                    ? "PE"
-                    : "ELF");
-        free((void *)options.import_directories);
-        free((void *)options.link_arguments);
-        return 1;
-      }
-    }
-  }
-
-  if (options.safe && mtlc_target()->freestanding) {
-    fprintf(stderr,
-            "Error: --safe on the %s target has no runtime to report a "
-            "violation to; its checks call into the shadow map the runtime "
-            "owns, and a freestanding image links no library\n",
-            mtlc_target()->triple);
-    free((void *)options.import_directories);
-    free((void *)options.link_arguments);
-    return 1;
-  }
-
-  /* No --gpu-arch given: target the GPU that is actually in this machine when
-   * one is visible. Detection failure (no driver, headless build host) keeps
-   * the GB10 default so cross-compiles for DGX Spark are unchanged. */
-  if (options.emit_ptx && !flags.gpu_arch_explicit &&
-      detect_host_gpu_ptx_target(flags.detected_ptx_target,
-                                 sizeof(flags.detected_ptx_target))) {
-    options.ptx_target = flags.detected_ptx_target;
-  }
-
-  /* A `.version` above what the local driver understands fails inside
-   * cuModuleLoadData at run time, where the only evidence is a status code.
-   * When the target came from this machine, take the ISA from it too. */
-  if (options.emit_ptx && !flags.ptx_version_explicit) {
-    int driver_major = 0, driver_minor = 0;
-    if (gpu_detect_ptx_isa(&driver_major, &driver_minor) &&
-        (driver_major < options.ptx_isa_major ||
-         (driver_major == options.ptx_isa_major &&
-          driver_minor < options.ptx_isa_minor))) {
-      options.ptx_isa_major = driver_major;
-      options.ptx_isa_minor = driver_minor;
-    }
-  }
-
-  if (options.tracy && !flags.build_executable) {
-    fprintf(stderr, "Error: --tracy requires --build\n");
-    free((void *)options.import_directories);
-    free((void *)options.link_arguments);
-    return 1;
-  }
-
-  if (options.emit_arm64_obj && options.emit_arm64) {
-    fprintf(stderr,
-            "Error: --emit-arm64 (self-contained AArch64 executable) and "
-            "--emit-arm64-obj (AArch64 relocatable object) are different "
-            "outputs; pick one\n");
-    free((void *)options.import_directories);
-    free((void *)options.link_arguments);
-    return 1;
-  }
-
-#if !defined(__aarch64__) && !defined(_M_ARM64)
-  if (options.emit_arm64_obj && flags.build_executable) {
-    fprintf(stderr,
-            "Error: --emit-arm64-obj cannot be combined with --build on an "
-            "x86-64 host: the object is AArch64 and this host's linker cannot "
-            "link it. Link it on an ARM machine, or use --emit-arm64 for a "
-            "self-contained executable\n");
-    free((void *)options.import_directories);
-    free((void *)options.link_arguments);
-    return 1;
-  }
-#endif
-
   if (flags.build_executable) {
     options.emit_object = 1;
     if (!flags.linker_mode_explicit) {
@@ -5215,6 +5259,54 @@ static int compile_emit_arm64(IRProgram *ir_program, ASTNode *program,
 }
 
 
+static int compile_wants_debug_info(const CompilerOptions *options) {
+  return options->debug_mode || options->generate_debug_symbols ||
+         options->generate_line_mapping ||
+         options->generate_stack_trace_support ||
+         (options->generate_crash_report && options->building_executable);
+}
+
+static int compile_wants_debug_sidecar(const CompilerOptions *options) {
+  return options->debug_mode || options->generate_debug_symbols ||
+         options->generate_line_mapping
+             ? 1
+             : 0;
+}
+
+static void compile_prepend_auto_imports(const CompilerOptions *options,
+                                         ASTNode *program) {
+  const char *auto_imports[2];
+  size_t auto_import_count = 0;
+  if (options->prelude) {
+    auto_imports[auto_import_count++] = "std/prelude";
+  }
+  if (options->native_heap) {
+    auto_imports[auto_import_count++] = "std/alloc";
+  }
+  for (size_t ai = 0; ai < auto_import_count; ai++) {
+    Program *prog_data = (Program *)program->data;
+    SourceLocation auto_loc = {0, 0, NULL};
+    ASTNode *auto_import = ast_create_import_declaration(
+        auto_imports[ai], NULL, NULL, 0, auto_loc);
+    if (auto_import) {
+      // Prepend the import before all user declarations.
+      ASTNode **grown =
+          realloc(prog_data->declarations,
+                  (prog_data->declaration_count + 1) * sizeof(ASTNode *));
+      if (grown) {
+        memmove(grown + 1, grown,
+                prog_data->declaration_count * sizeof(ASTNode *));
+        grown[0] = auto_import;
+        prog_data->declarations = grown;
+        prog_data->declaration_count++;
+        ast_add_child(program, auto_import);
+      } else {
+        ast_destroy_node(auto_import);
+      }
+    }
+  }
+}
+
 int compile_file(const char *input_filename, const char *output_filename,
                  CompilerOptions *options) {
   CompilerProfile profile;
@@ -5323,10 +5415,7 @@ int compile_file(const char *input_filename, const char *output_filename,
     return 1;
   }
 
-  if (options->debug_mode || options->generate_debug_symbols ||
-      options->generate_line_mapping ||
-      options->generate_stack_trace_support ||
-      (options->generate_crash_report && options->building_executable)) {
+  if (compile_wants_debug_info(options)) {
     debug_info = debug_info_create(input_filename, output_filename);
     if (!debug_info) {
       compiler_profile_add(&profile, PROFILE_PHASE_INIT, phase_start);
@@ -5371,10 +5460,7 @@ int compile_file(const char *input_filename, const char *output_filename,
   if (debug_info) {
     code_generator_set_debug_sidecar_emission(
         code_generator,
-        (options->debug_mode || options->generate_debug_symbols ||
-         options->generate_line_mapping)
-            ? 1
-            : 0);
+        compile_wants_debug_sidecar(options));
   }
   code_generator_set_stack_trace_support(
       code_generator, options->generate_stack_trace_support ? 1 : 0);
@@ -5438,38 +5524,7 @@ int compile_file(const char *input_filename, const char *output_filename,
   // shims the backend rewrites new/malloc/calloc/realloc/free to call).
   compiler_set_phase(PROFILE_PHASE_PRELUDE);
   phase_start = compiler_profile_begin(&profile);
-  {
-    const char *auto_imports[2];
-    size_t auto_import_count = 0;
-    if (options->prelude) {
-      auto_imports[auto_import_count++] = "std/prelude";
-    }
-    if (options->native_heap) {
-      auto_imports[auto_import_count++] = "std/alloc";
-    }
-    for (size_t ai = 0; ai < auto_import_count; ai++) {
-      Program *prog_data = (Program *)program->data;
-      SourceLocation auto_loc = {0, 0, NULL};
-      ASTNode *auto_import = ast_create_import_declaration(
-          auto_imports[ai], NULL, NULL, 0, auto_loc);
-      if (auto_import) {
-        // Prepend the import before all user declarations.
-        ASTNode **grown =
-            realloc(prog_data->declarations,
-                    (prog_data->declaration_count + 1) * sizeof(ASTNode *));
-        if (grown) {
-          memmove(grown + 1, grown,
-                  prog_data->declaration_count * sizeof(ASTNode *));
-          grown[0] = auto_import;
-          prog_data->declarations = grown;
-          prog_data->declaration_count++;
-          ast_add_child(program, auto_import);
-        } else {
-          ast_destroy_node(auto_import);
-        }
-      }
-    }
-  }
+  compile_prepend_auto_imports(options, program);
   compiler_profile_add(&profile, PROFILE_PHASE_PRELUDE, phase_start);
 
   compiler_set_phase(PROFILE_PHASE_IMPORTS);
@@ -6223,6 +6278,7 @@ void print_usage(const char *program_name) {
          "always static\n");
   printf("  --musl              Rejected; owned runtime builds never link musl\n");
   printf("  --debug-compiler    Track compiler context for internal error reports\n");
+  printf("  -V, --version       Show version information\n");
   printf("  -h, --help          Show this help message\n");
   printf("\nExamples:\n");
   printf("  %s app.mettle -o app.obj\n", program_name);

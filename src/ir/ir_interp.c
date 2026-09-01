@@ -843,18 +843,30 @@ static int ii_parse_local_type(const char *text, int *elem_size, long long *coun
     }
     memcpy(base, text, base_len);
     base[base_len] = '\0';
-    long long n = 0;
-    const char *digit = bracket + 1;
-    if (*digit < '0' || *digit > '9') {
-      return 0;
-    }
-    for (; *digit >= '0' && *digit <= '9'; digit++) {
-      n = n * 10 + (*digit - '0');
-      if (n > (1 << 24)) {
+    /* Every dimension multiplies: `int32[3][4]` holds twelve elements, not
+     * three. Reading only the first sized a two-dimensional local at its outer
+     * count, and the first store past the opening row ran off the buffer. */
+    long long n = 1;
+    const char *scan = bracket;
+    while (*scan == '[') {
+      const char *digit = scan + 1;
+      long long dim = 0;
+      if (*digit < '0' || *digit > '9') {
         return 0;
       }
+      for (; *digit >= '0' && *digit <= '9'; digit++) {
+        dim = dim * 10 + (*digit - '0');
+        if (dim > (1 << 24)) {
+          return 0;
+        }
+      }
+      if (*digit != ']' || dim <= 0 || n > (1 << 24) / dim) {
+        return 0;
+      }
+      n *= dim;
+      scan = digit + 1;
     }
-    if (n <= 0) {
+    if (*scan != '\0') {
       return 0;
     }
     if (strcmp(base, "cstring") == 0 || strcmp(base, "rawptr") == 0) {
@@ -1001,6 +1013,29 @@ static long long ii_narrow_int(long long v, int size, int is_unsigned) {
   }
 }
 
+/* An aggregate that fits in a register travels as its BYTES, not as an
+ * address: `s = arr[i]` on a two-int32 struct lowers to an 8-byte load feeding
+ * an aggregate assign, and a by-value argument of one is passed the same way.
+ * Fills `out` and answers 1 when the value is content rather than an address,
+ * which is decided by asking whether it addresses a live buffer at all. */
+static int ii_aggregate_value_is_bytes(IRInterpMachine *machine,
+                                       const IRInterpValue *value,
+                                       long long size, unsigned char *out) {
+  if (size <= 0 || size > 8 || value->is_float) {
+    return 0;
+  }
+  long long off = 0;
+  if (ii_addr_to_buffer(machine, (unsigned long long)ii_as_int(value), size,
+                        &off)) {
+    return 0; /* it really is an address */
+  }
+  unsigned long long raw = (unsigned long long)value->i;
+  for (long long i = 0; i < size; i++) {
+    out[i] = (unsigned char)((raw >> (i * 8)) & 0xFFu);
+  }
+  return 1;
+}
+
 static int ii_var_write(IRInterpMachine *machine, IIVar *var,
                         const IRInterpValue *value) {
   if (var->string_record && !value->is_float) {
@@ -1027,6 +1062,13 @@ static int ii_var_write(IRInterpMachine *machine, IIVar *var,
     long long src_off = 0, dst_off = 0;
     IIBuffer *sbuf = ii_addr_to_buffer(machine, src, var->agg_size, &src_off);
     IIBuffer *dbuf = ii_addr_to_buffer(machine, dst, var->agg_size, &dst_off);
+    if (!sbuf && dbuf) {
+      unsigned char bytes[8];
+      if (ii_aggregate_value_is_bytes(machine, value, var->agg_size, bytes)) {
+        memcpy(dbuf->data + dst_off, bytes, (size_t)var->agg_size);
+        return 1;
+      }
+    }
     if (!sbuf || !dbuf) {
       ii_fail(machine, IR_INTERP_TRAP,
               "aggregate copy out of bounds / after free");
@@ -1557,6 +1599,27 @@ static int ii_binary(IRInterpMachine *machine, const IRInstruction *insn,
   return 0;
 }
 
+static int ii_integer_cast_width(const char *type, int *size_out,
+                                 int *unsigned_out) {
+  static const struct {
+    const char *name;
+    int size;
+    int is_unsigned;
+  } widths[] = {{"int8", 1, 0},   {"int16", 2, 0},  {"int32", 4, 0},
+                {"int64", 8, 0},  {"uint8", 1, 1},  {"uint16", 2, 1},
+                {"uint32", 4, 1}, {"uint64", 8, 1}};
+  size_t i = 0u;
+
+  for (i = 0u; i < sizeof(widths) / sizeof(widths[0]); i++) {
+    if (strcmp(type, widths[i].name) == 0) {
+      *size_out = widths[i].size;
+      *unsigned_out = widths[i].is_unsigned;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
                    const IRInterpValue *in, IRInterpValue *out) {
   const char *type = insn->text ? insn->text : "";
@@ -1573,54 +1636,59 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
     *out = ii_int_value(ii_as_int(in));
     return 1;
   }
-  if (strcmp(type, "float64") == 0) {
-    *out = ii_float_value(ii_as_float(in));
-    return 1;
-  }
-  if (strcmp(type, "float32") == 0) {
-    *out = ii_float_value((double)(float)ii_as_float(in));
+  /* is_unsigned on a CAST says the SOURCE is an unsigned integer, so a value
+   * with bit 63 set is a large positive number and not a negative one. */
+  if (strcmp(type, "float64") == 0 || strcmp(type, "float32") == 0) {
+    double d;
+    if (!in->is_float && insn->is_unsigned) {
+      d = (double)(unsigned long long)in->i;
+    } else {
+      d = ii_as_float(in);
+    }
+    *out = ii_float_value(strcmp(type, "float32") == 0 ? (double)(float)d : d);
     return 1;
   }
   int size = 0, target_unsigned = 0;
-  if (strcmp(type, "int8") == 0) { size = 1; }
-  else if (strcmp(type, "int16") == 0) { size = 2; }
-  else if (strcmp(type, "int32") == 0) { size = 4; }
-  else if (strcmp(type, "int64") == 0) { size = 8; }
-  else if (strcmp(type, "uint8") == 0) { size = 1; target_unsigned = 1; }
-  else if (strcmp(type, "uint16") == 0) { size = 2; target_unsigned = 1; }
-  else if (strcmp(type, "uint32") == 0) { size = 4; target_unsigned = 1; }
-  else if (strcmp(type, "uint64") == 0) { size = 8; target_unsigned = 1; }
-  else if (strcmp(type, "bool") == 0) {
-    *out = ii_int_value(in->is_float ? in->f != 0.0 : in->i != 0);
-    return 1;
-  } else if (insn->value_type && insn->value_type->kind == MTLC_TYPE_ENUM) {
-    size = (insn->value_type->size == 1 || insn->value_type->size == 2 ||
-            insn->value_type->size == 8)
-               ? (int)insn->value_type->size
-               : 4;
-  } else if (insn->value_type &&
-             (insn->value_type->kind == MTLC_TYPE_POINTER ||
-              insn->value_type->kind == MTLC_TYPE_FUNCTION_POINTER ||
-              insn->value_type->kind == MTLC_TYPE_STRING)) {
-    *out = ii_int_value(ii_as_int(in));
-    return 1;
-  } else {
-    ii_fail(machine, IR_INTERP_UNSUPPORTED, "cast target type");
-    return 0;
+  if (!ii_integer_cast_width(type, &size, &target_unsigned)) {
+    if (strcmp(type, "bool") == 0) {
+      *out = ii_int_value(in->is_float ? in->f != 0.0 : in->i != 0);
+      return 1;
+    }
+    if (insn->value_type && insn->value_type->kind == MTLC_TYPE_ENUM) {
+      size = (insn->value_type->size == 1 || insn->value_type->size == 2 ||
+              insn->value_type->size == 8)
+                 ? (int)insn->value_type->size
+                 : 4;
+    } else if (insn->value_type &&
+               (insn->value_type->kind == MTLC_TYPE_POINTER ||
+                insn->value_type->kind == MTLC_TYPE_FUNCTION_POINTER ||
+                insn->value_type->kind == MTLC_TYPE_STRING)) {
+      *out = ii_int_value(ii_as_int(in));
+      return 1;
+    } else {
+      ii_fail(machine, IR_INTERP_UNSUPPORTED, "cast target type");
+      return 0;
+    }
   }
 
   long long v;
   if (in->is_float) {
-    /* Float -> int: truncate toward zero; x86 cvtt sentinel on overflow/NaN. */
+    /* Float -> int: truncate toward zero; x86 cvtt sentinel on overflow/NaN.
+     * The machine always truncates at 64 bits and narrows afterwards, so only
+     * the 64-bit range has a sentinel. Checking a 4-byte target against the
+     * int32 range instead answered 0x80000000 for `(uint32)4e9`, where the
+     * hardware gives 4000000000. */
     double d = in->f;
-    if (size == 8 || size == 4) {
-      double lo = size == 8 ? -9223372036854775808.0 : -2147483648.0;
-      double hi = size == 8 ? 9223372036854775808.0 : 2147483648.0;
-      if (!(d >= lo && d < hi)) {
-        v = size == 8 ? LLONG_MIN : (long long)INT_MIN;
+    if (size == 8 && target_unsigned) {
+      /* A uint64 target reaches 2^64, and the backend biases the value down
+       * rather than letting the signed truncation answer its sentinel. */
+      if (!(d >= 0.0 && d < 18446744073709551616.0)) {
+        v = LLONG_MIN;
       } else {
-        v = (long long)d;
+        v = (long long)(unsigned long long)d;
       }
+    } else if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0)) {
+      v = LLONG_MIN;
     } else {
       v = (long long)d;
     }
@@ -1840,10 +1908,16 @@ static int ii_copy_aggregate_args(IRInterpMachine *machine, IIFrame *frame,
     unsigned long long src = (unsigned long long)ii_as_int(&args[i]);
     long long src_off = 0;
     IIBuffer *sbuf = ii_addr_to_buffer(machine, src, size, &src_off);
+    unsigned char inline_bytes[8];
+    int carried_in_value = 0;
     if (!sbuf) {
-      ii_fail(machine, IR_INTERP_TRAP,
-              "aggregate argument out of bounds / after free");
-      return 0;
+      carried_in_value =
+          ii_aggregate_value_is_bytes(machine, &args[i], size, inline_bytes);
+      if (!carried_in_value) {
+        ii_fail(machine, IR_INTERP_TRAP,
+                "aggregate argument out of bounds / after free");
+        return 0;
+      }
     }
     unsigned long long copy = ii_add_buffer_ex(machine, NULL, size, 1);
     if (!copy ||
@@ -1854,16 +1928,23 @@ static int ii_copy_aggregate_args(IRInterpMachine *machine, IIFrame *frame,
     }
     long long dst_off = 0;
     IIBuffer *dbuf = ii_addr_to_buffer(machine, copy, size, &dst_off);
-    sbuf = ii_addr_to_buffer(machine, src, size, &src_off);
-    if (!dbuf || !sbuf) {
+    sbuf = carried_in_value ? NULL
+                            : ii_addr_to_buffer(machine, src, size, &src_off);
+    if (!dbuf || (!sbuf && !carried_in_value)) {
       ii_fail(machine, IR_INTERP_TRAP, "aggregate argument copy");
       return 0;
     }
-    memcpy(dbuf->data + dst_off, sbuf->data + src_off, (size_t)size);
-    if (dbuf->init_map && sbuf->init_map) {
-      memcpy(dbuf->init_map + dst_off, sbuf->init_map + src_off, (size_t)size);
-    } else {
+    if (carried_in_value) {
+      memcpy(dbuf->data + dst_off, inline_bytes, (size_t)size);
       ii_mark_bytes(dbuf, dst_off, size, 1);
+    } else {
+      memcpy(dbuf->data + dst_off, sbuf->data + src_off, (size_t)size);
+      if (dbuf->init_map && sbuf->init_map) {
+        memcpy(dbuf->init_map + dst_off, sbuf->init_map + src_off,
+               (size_t)size);
+      } else {
+        ii_mark_bytes(dbuf, dst_off, size, 1);
+      }
     }
     args[i] = ii_int_value((long long)copy);
   }
@@ -4471,6 +4552,47 @@ static int ii_op_store(IRInterpMachine *machine, IIFrame *frame,
             source_buffer->data + source_offset, (size_t)size);
     return 1;
   }
+  /* An aggregate at or below 8 bytes is stored by a WORD-SIZED store, because
+   * the backend keeps its bytes in a register and the lvalue path declines the
+   * whole-struct memcpy at that size. The interpreter holds every aggregate as
+   * a buffer and hands out its ADDRESS, so both shapes wrote the low bytes of
+   * an address: `smalls[1] = one`, whose value operand is the aggregate symbol
+   * itself, and `smalls[2] = make_small(2, -2)`, whose value is the callee's
+   * buffer marked escaped_local. Only the interpreter's own bookkeeping can
+   * name either, so an ordinary pointer store is never taken for one. */
+  if (!value.is_float && !insn->is_float && value.i != 0) {
+    long long source_offset = 0;
+    IIBuffer *source_buffer = NULL;
+    int is_aggregate_source = 0;
+    if (insn->lhs.kind == IR_OPERAND_SYMBOL && insn->lhs.name) {
+      IIVar *var = ii_env_find(&frame->env, insn->lhs.name);
+      if (!var) {
+        var = ii_env_find(&machine->globals, insn->lhs.name);
+      }
+      is_aggregate_source = var && (long long)var->agg_size == size;
+    }
+    source_buffer = ii_addr_to_buffer(machine, (unsigned long long)value.i,
+                                      size, &source_offset);
+    if (source_buffer && (is_aggregate_source || source_buffer->escaped_local)) {
+      long long dest_offset = 0;
+      IIBuffer *dest_buffer =
+          ii_addr_to_buffer(machine, addr, size, &dest_offset);
+      if (!dest_buffer) {
+        ii_fail(machine, IR_INTERP_TRAP,
+                "block copy out of bounds / after free");
+        return 0;
+      }
+      memmove(dest_buffer->data + dest_offset,
+              source_buffer->data + source_offset, (size_t)size);
+      /* A consumed aggregate return has no other reader; a named local does. */
+      if (source_buffer->escaped_local && source_buffer != dest_buffer) {
+        ii_reclaim_buffer(machine,
+                          (size_t)((source_buffer->base - II_ADDR_BASE) /
+                                   II_ADDR_STRIDE));
+      }
+      return 1;
+    }
+  }
   unsigned long long raw;
   if (value.is_float || insn->is_float) {
     if (size == 4) {
@@ -4938,6 +5060,21 @@ static int ii_bind_parameters(IRInterpMachine *machine, IIFrame *frame,
       }
     }
     var->value = args[i];
+    /* An aggregate parameter holds the ADDRESS of the caller's copy, the same
+     * as an aggregate local, so record its size. Without it a word-sized store
+     * of the parameter -- which is how a closure constructor writes a captured
+     * struct into its environment -- wrote the low bytes of that address
+     * instead of the struct. A closure capturing a two-int32 struct read back
+     * as pointer bits under `mettle test` while the backend had it right. */
+    if (fn->parameter_types && fn->parameter_types[i] && machine->program) {
+      const MtlcType *pt =
+          ir_program_lookup_type(machine->program, fn->parameter_types[i]);
+      if (pt && pt->size > 0 &&
+          (pt->kind == MTLC_TYPE_STRUCT || pt->kind == MTLC_TYPE_ARRAY ||
+           pt->kind == MTLC_TYPE_TAGGED_ENUM)) {
+        var->agg_size = (long long)pt->size;
+      }
+    }
     if (fn->parameter_types && fn->parameter_types[i] &&
         strcmp(fn->parameter_types[i], "string") == 0 &&
         !var->value.is_float && var->value.i != 0) {

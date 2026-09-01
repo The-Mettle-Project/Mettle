@@ -319,6 +319,31 @@ static int binary_emit_function_body(CodeGenerator *generator,
 }
 
 
+static int code_generator_binary_track_debug_range(
+    CodeGenerator *generator, IRFunction *ir_function,
+    BinaryFunctionContext *context) {
+  if (!generator->debug_info || (!generator->generate_stack_trace_support &&
+                                 !generator->generate_crash_report)) {
+    return 1;
+  }
+  context->runtime_end_label =
+      code_generator_generate_label(generator, "mettledbg_func_end");
+  if (!context->runtime_end_label) {
+    code_generator_set_error(generator,
+                             "Out of memory while tracking function debug "
+                             "range in '%s'",
+                             ir_function->name);
+    return 0;
+  }
+  code_generator_add_runtime_function_mapping(
+      generator, ir_function->name, ir_function->name,
+      context->runtime_end_label,
+      ir_function->location.line, ir_function->location.column,
+      code_generator_runtime_filename(generator,
+                                      ir_function->location.filename));
+  return 1;
+}
+
 int code_generator_emit_binary_function(CodeGenerator *generator,
                                                IRFunction *ir_function) {
   BinaryEmitter *emitter = NULL;
@@ -366,24 +391,10 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
   generator->last_runtime_location_line = 0;
   generator->last_runtime_location_column = 0;
 
-  if (generator->debug_info && (generator->generate_stack_trace_support ||
-                               generator->generate_crash_report)) {
-    context.runtime_end_label =
-        code_generator_generate_label(generator, "mettledbg_func_end");
-    if (!context.runtime_end_label) {
-      code_generator_set_error(generator,
-                               "Out of memory while tracking function debug "
-                               "range in '%s'",
-                               ir_function->name);
-      binary_function_context_destroy(&context);
-      return 0;
-    }
-    code_generator_add_runtime_function_mapping(
-        generator, ir_function->name, ir_function->name,
-        context.runtime_end_label,
-        ir_function->location.line, ir_function->location.column,
-        code_generator_runtime_filename(generator,
-                                        ir_function->location.filename));
+  if (!code_generator_binary_track_debug_range(generator, ir_function,
+                                              &context)) {
+    binary_function_context_destroy(&context);
+    return 0;
   }
 
   if (ir_function->is_naked) {
@@ -700,6 +711,44 @@ mir_shared_append:
   cg_time_end("shared append", cg_t);
   return 1;
 }
+static size_t *code_generator_binary_pgo_emit_order(
+    CodeGenerator *generator, size_t function_count) {
+  size_t *emit_order = NULL;
+
+if (ir_pgo_enabled() && function_count > 1) {
+  emit_order = (size_t *)malloc(function_count * sizeof(size_t));
+  long long *heat = (long long *)malloc(function_count * sizeof(long long));
+  if (emit_order && heat) {
+    for (size_t i = 0; i < function_count; i++) {
+      emit_order[i] = i;
+      IRFunction *fn = generator->ir_program->functions[i];
+      heat[i] = (fn && fn->name && strcmp(fn->name, "main") == 0)
+                    ? LLONG_MAX
+                    : (fn && fn->name ? ir_pgo_callee_calls(fn->name) : 0);
+    }
+    /* Stable insertion sort of the function indices by heat, descending:
+     * ties (and cold/-1) keep declaration order. */
+    for (size_t i = 1; i < function_count; i++) {
+      size_t slot = emit_order[i];
+      long long h = heat[i];
+      size_t j = i;
+      while (j > 0 && heat[j - 1] < h) {
+        emit_order[j] = emit_order[j - 1];
+        heat[j] = heat[j - 1];
+        j--;
+      }
+      emit_order[j] = slot;
+      heat[j] = h;
+    }
+  } else {
+    free(emit_order);
+    emit_order = NULL;
+  }
+  free(heat);
+}
+  return emit_order;
+}
+
 int code_generator_generate_program_binary_object(CodeGenerator *generator) {
   if (!generator) {
     return 0;
@@ -731,38 +780,8 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator) {
    * interpretation of main(), no training run. Without a profile the order is
    * untouched. */
   size_t function_count = generator->ir_program->function_count;
-  size_t *emit_order = NULL;
-  if (ir_pgo_enabled() && function_count > 1) {
-    emit_order = (size_t *)malloc(function_count * sizeof(size_t));
-    long long *heat = (long long *)malloc(function_count * sizeof(long long));
-    if (emit_order && heat) {
-      for (size_t i = 0; i < function_count; i++) {
-        emit_order[i] = i;
-        IRFunction *fn = generator->ir_program->functions[i];
-        heat[i] = (fn && fn->name && strcmp(fn->name, "main") == 0)
-                      ? LLONG_MAX
-                      : (fn && fn->name ? ir_pgo_callee_calls(fn->name) : 0);
-      }
-      /* Stable insertion sort of the function indices by heat, descending:
-       * ties (and cold/-1) keep declaration order. */
-      for (size_t i = 1; i < function_count; i++) {
-        size_t slot = emit_order[i];
-        long long h = heat[i];
-        size_t j = i;
-        while (j > 0 && heat[j - 1] < h) {
-          emit_order[j] = emit_order[j - 1];
-          heat[j] = heat[j - 1];
-          j--;
-        }
-        emit_order[j] = slot;
-        heat[j] = h;
-      }
-    } else {
-      free(emit_order);
-      emit_order = NULL;
-    }
-    free(heat);
-  }
+  size_t *emit_order =
+      code_generator_binary_pgo_emit_order(generator, function_count);
 
   for (size_t i = 0; i < function_count; i++) {
     IRFunction *ir_function =

@@ -1976,6 +1976,68 @@ static void mem_walk_branch(MemCtx *ctx, ASTNode *body) {
   mem_walk_arms(ctx, arms, 1, 0);
 }
 
+static void mem_walk_return(MemCtx *ctx, ASTNode *statement) {
+  ReturnStatement *ret = (ReturnStatement *)statement->data;
+  if (!ret || !ret->value) {
+    return;
+  }
+  mem_walk_expr(ctx, ret->value);
+  if (ret->value) {
+    ctx->saw_value_return = 1;
+    /* Fresh if the value is an allocation expression, or a local that
+     * holds one exclusively (the `var p = malloc(n); ...; return p;`
+     * wrapper shape). A copy kept elsewhere disqualifies it: the caller
+     * would not be the sole owner. */
+    const char *via = NULL;
+    MemLocal *returned_local = mem_expr_as_local(ctx, ret->value);
+    int fresh = mem_is_allocation(ctx, ret->value, &via) ||
+                (returned_local && returned_local->holds_alloc &&
+                 !returned_local->escaped);
+    if (!fresh) {
+      ctx->returns_all_fresh = 0;
+    }
+  }
+  if (ctx->fn_returns_pointer && ctx->mode == MEM_MODE_LOCAL) {
+    MemLocal *stack_target = mem_addr_of_stack(ctx, ret->value);
+    const char *via = NULL;
+    if (!stack_target) {
+      MemLocal *local = mem_expr_as_local(ctx, ret->value);
+      if (local && local->points_to_stack) {
+        stack_target = mem_referent(ctx, local);
+        via = local->name;
+      }
+    }
+    if (stack_target) {
+      if (via) {
+        mem_error(ctx, "M0103", ret->value->location,
+                  "Allocate the memory (`new` / `malloc`) or have the "
+                  "caller pass a buffer in",
+                  "Returning `%s`, which points at stack local `%s`; the "
+                  "frame is destroyed when this function returns, so the "
+                  "caller receives a dangling pointer",
+                  via, stack_target->name);
+      } else {
+        mem_error(ctx, "M0103", ret->value->location,
+                  "Allocate the memory (`new` / `malloc`) or have the "
+                  "caller pass a buffer in",
+                  "Returning the address of stack local `%s`; the frame is "
+                  "destroyed when this function returns, so the caller "
+                  "receives a dangling pointer",
+                  stack_target->name);
+      }
+    }
+  }
+  MemLocal *returned = mem_expr_as_local(ctx, ret->value);
+  if (returned && returned->is_pointer) {
+    returned->escaped = 1;
+    if (ctx->mode == MEM_MODE_SUMMARY && returned->param_index >= 0 &&
+        returned->param_index < MEM_MAX_PARAMS && ctx->collect) {
+      ctx->collect->stores |= 1u << returned->param_index;
+    }
+  }
+  return;
+}
+
 static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
   if (!statement) {
     return;
@@ -2033,67 +2095,9 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     }
     return;
   }
-  case AST_RETURN_STATEMENT: {
-    ReturnStatement *ret = (ReturnStatement *)statement->data;
-    if (!ret || !ret->value) {
-      return;
-    }
-    mem_walk_expr(ctx, ret->value);
-    if (ret->value) {
-      ctx->saw_value_return = 1;
-      /* Fresh if the value is an allocation expression, or a local that
-       * holds one exclusively (the `var p = malloc(n); ...; return p;`
-       * wrapper shape). A copy kept elsewhere disqualifies it: the caller
-       * would not be the sole owner. */
-      const char *via = NULL;
-      MemLocal *returned_local = mem_expr_as_local(ctx, ret->value);
-      int fresh = mem_is_allocation(ctx, ret->value, &via) ||
-                  (returned_local && returned_local->holds_alloc &&
-                   !returned_local->escaped);
-      if (!fresh) {
-        ctx->returns_all_fresh = 0;
-      }
-    }
-    if (ctx->fn_returns_pointer && ctx->mode == MEM_MODE_LOCAL) {
-      MemLocal *stack_target = mem_addr_of_stack(ctx, ret->value);
-      const char *via = NULL;
-      if (!stack_target) {
-        MemLocal *local = mem_expr_as_local(ctx, ret->value);
-        if (local && local->points_to_stack) {
-          stack_target = mem_referent(ctx, local);
-          via = local->name;
-        }
-      }
-      if (stack_target) {
-        if (via) {
-          mem_error(ctx, "M0103", ret->value->location,
-                    "Allocate the memory (`new` / `malloc`) or have the "
-                    "caller pass a buffer in",
-                    "Returning `%s`, which points at stack local `%s`; the "
-                    "frame is destroyed when this function returns, so the "
-                    "caller receives a dangling pointer",
-                    via, stack_target->name);
-        } else {
-          mem_error(ctx, "M0103", ret->value->location,
-                    "Allocate the memory (`new` / `malloc`) or have the "
-                    "caller pass a buffer in",
-                    "Returning the address of stack local `%s`; the frame is "
-                    "destroyed when this function returns, so the caller "
-                    "receives a dangling pointer",
-                    stack_target->name);
-        }
-      }
-    }
-    MemLocal *returned = mem_expr_as_local(ctx, ret->value);
-    if (returned && returned->is_pointer) {
-      returned->escaped = 1;
-      if (ctx->mode == MEM_MODE_SUMMARY && returned->param_index >= 0 &&
-          returned->param_index < MEM_MAX_PARAMS && ctx->collect) {
-        ctx->collect->stores |= 1u << returned->param_index;
-      }
-    }
+  case AST_RETURN_STATEMENT:
+    mem_walk_return(ctx, statement);
     return;
-  }
   case AST_IF_STATEMENT: {
     IfStatement *if_stmt = (IfStatement *)statement->data;
     ASTNode **arms = NULL;

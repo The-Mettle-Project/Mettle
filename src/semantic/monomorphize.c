@@ -2424,6 +2424,32 @@ static int mono_match_type_text(const char *pattern, const char *actual,
   return result;
 }
 
+static char *mono_static_return_type_of_call(MonoContext *ctx,
+                                             ASTNode *expr) {
+  CallExpression *call = (CallExpression *)expr->data;
+  size_t i;
+  if (!call || !call->function_name || !ctx->module) {
+    return NULL;
+  }
+  for (i = 0; i < ctx->module->declaration_count; i++) {
+    ASTNode *decl = ctx->module->declarations[i];
+    FunctionDeclaration *fd;
+    if (!decl || decl->type != AST_FUNCTION_DECLARATION) {
+      continue;
+    }
+    fd = (FunctionDeclaration *)decl->data;
+    if (!fd || !fd->name || fd->type_param_count > 0 ||
+        strcmp(fd->name, call->function_name) != 0) {
+      continue;
+    }
+    return fd->return_type ? mettle_strdup(fd->return_type) : NULL;
+  }
+  return NULL;
+}
+
+static char *mono_static_type_of_element(MonoContext *ctx, ASTNode *expr,
+                                         MonoVarEnv *env);
+
 /* The type text of an expression, read off the program without checking it.
  * NULL means "this expression does not say", which costs nothing: another
  * argument may still say it, and if none does the call is reported. */
@@ -2469,6 +2495,37 @@ static char *mono_static_type_of(MonoContext *ctx, ASTNode *expr,
     snprintf(text, len, "%s*", ne->type_name);
     return text;
   }
+  case AST_UNARY_EXPRESSION:
+  case AST_INDEX_EXPRESSION:
+    return mono_static_type_of_element(ctx, expr, env);
+  case AST_BINARY_EXPRESSION: {
+    BinaryExpression *bin = (BinaryExpression *)expr->data;
+    char *left;
+    if (!bin || !bin->operator) {
+      return NULL;
+    }
+    if (strcmp(bin->operator, "==") == 0 || strcmp(bin->operator, "!=") == 0 ||
+        strcmp(bin->operator, "<") == 0 || strcmp(bin->operator, ">") == 0 ||
+        strcmp(bin->operator, "<=") == 0 || strcmp(bin->operator, ">=") == 0 ||
+        strcmp(bin->operator, "&&") == 0 || strcmp(bin->operator, "||") == 0) {
+      return NULL;
+    }
+    left = mono_static_type_of(ctx, bin->left, env);
+    if (left) {
+      return left;
+    }
+    return mono_static_type_of(ctx, bin->right, env);
+  }
+  case AST_FUNCTION_CALL:
+    return mono_static_return_type_of_call(ctx, expr);
+  default:
+    return NULL;
+  }
+}
+
+static char *mono_static_type_of_element(MonoContext *ctx, ASTNode *expr,
+                                         MonoVarEnv *env) {
+  switch (expr->type) {
   case AST_UNARY_EXPRESSION: {
     UnaryExpression *un = (UnaryExpression *)expr->data;
     char *inner;
@@ -2521,45 +2578,6 @@ static char *mono_static_type_of(MonoContext *ctx, ASTNode *expr,
       }
     }
     free(base);
-    return NULL;
-  }
-  case AST_BINARY_EXPRESSION: {
-    BinaryExpression *bin = (BinaryExpression *)expr->data;
-    char *left;
-    if (!bin || !bin->operator) {
-      return NULL;
-    }
-    if (strcmp(bin->operator, "==") == 0 || strcmp(bin->operator, "!=") == 0 ||
-        strcmp(bin->operator, "<") == 0 || strcmp(bin->operator, ">") == 0 ||
-        strcmp(bin->operator, "<=") == 0 || strcmp(bin->operator, ">=") == 0 ||
-        strcmp(bin->operator, "&&") == 0 || strcmp(bin->operator, "||") == 0) {
-      return NULL;
-    }
-    left = mono_static_type_of(ctx, bin->left, env);
-    if (left) {
-      return left;
-    }
-    return mono_static_type_of(ctx, bin->right, env);
-  }
-  case AST_FUNCTION_CALL: {
-    CallExpression *call = (CallExpression *)expr->data;
-    size_t i;
-    if (!call || !call->function_name || !ctx->module) {
-      return NULL;
-    }
-    for (i = 0; i < ctx->module->declaration_count; i++) {
-      ASTNode *decl = ctx->module->declarations[i];
-      FunctionDeclaration *fd;
-      if (!decl || decl->type != AST_FUNCTION_DECLARATION) {
-        continue;
-      }
-      fd = (FunctionDeclaration *)decl->data;
-      if (!fd || !fd->name || fd->type_param_count > 0 ||
-          strcmp(fd->name, call->function_name) != 0) {
-        continue;
-      }
-      return fd->return_type ? mettle_strdup(fd->return_type) : NULL;
-    }
     return NULL;
   }
   default:

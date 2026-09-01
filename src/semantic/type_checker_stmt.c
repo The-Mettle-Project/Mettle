@@ -673,6 +673,52 @@ static const ASTNode *type_checker_find_fallthrough(const ASTNode *node) {
   return NULL;
 }
 
+static int type_checker_check_switch_exhaustive(
+    TypeChecker *checker, ASTNode *statement, Type *switch_type,
+    int seen_default, const long long *case_values,
+    size_t case_value_count) {
+  if (switch_type->kind == TYPE_ENUM && !seen_default) {
+    Scope *global = checker->symbol_table->global_scope;
+    for (size_t i = 0; i < global->symbol_count; i++) {
+      Symbol *sym = global->symbols[i];
+      if (!sym || sym->kind != SYMBOL_CONSTANT || sym->type != switch_type) {
+        continue;
+      }
+      int covered = 0;
+      for (size_t j = 0; j < case_value_count; j++) {
+        if (case_values[j] == sym->data.constant.value) {
+          covered = 1;
+          break;
+        }
+      }
+      if (!covered) {
+        type_checker_set_error_at_location(
+            checker, statement->location,
+            "Non-exhaustive switch on '%s': variant '%s' not covered; "
+            "add a 'case %s:' arm or a 'default:' arm",
+            switch_type->name, sym->name, sym->name);
+        return 0;
+      }
+    }
+  }
+
+  if (switch_type->kind == TYPE_BOOL && !seen_default) {
+    int has_true = 0, has_false = 0;
+    for (size_t i = 0; i < case_value_count; i++) {
+      if (case_values[i] == 1) has_true = 1;
+      if (case_values[i] == 0) has_false = 1;
+    }
+    if (!has_true || !has_false) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "Non-exhaustive switch over 'bool': must cover both 'true' and "
+          "'false', or add a 'default:' arm");
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int type_checker_check_switch_statement(TypeChecker *checker,
                                                ASTNode *statement) {
   SwitchStatement *switch_stmt = (SwitchStatement *)statement->data;
@@ -944,86 +990,27 @@ int type_checker_check_switch_statement(TypeChecker *checker,
                                     init_snapshot_count);
   free(init_snapshot);
 
-  if (switch_type->kind == TYPE_ENUM && !seen_default) {
-    Scope *global = checker->symbol_table->global_scope;
-    for (size_t i = 0; i < global->symbol_count; i++) {
-      Symbol *sym = global->symbols[i];
-      if (!sym || sym->kind != SYMBOL_CONSTANT || sym->type != switch_type) {
-        continue;
-      }
-      int covered = 0;
-      for (size_t j = 0; j < case_value_count; j++) {
-        if (case_values[j] == sym->data.constant.value) {
-          covered = 1;
-          break;
-        }
-      }
-      if (!covered) {
-        type_checker_set_error_at_location(
-            checker, statement->location,
-            "Non-exhaustive switch on '%s': variant '%s' not covered; "
-            "add a 'case %s:' arm or a 'default:' arm",
-            switch_type->name, sym->name, sym->name);
-        free(case_values);
-        return 0;
-      }
-    }
-  }
-
-  if (switch_type->kind == TYPE_BOOL && !seen_default) {
-    int has_true = 0, has_false = 0;
-    for (size_t i = 0; i < case_value_count; i++) {
-      if (case_values[i] == 1) has_true = 1;
-      if (case_values[i] == 0) has_false = 1;
-    }
-    if (!has_true || !has_false) {
-      type_checker_set_error_at_location(
-          checker, statement->location,
-          "Non-exhaustive switch over 'bool': must cover both 'true' and "
-          "'false', or add a 'default:' arm");
-      free(case_values);
-      return 0;
-    }
+  if (!type_checker_check_switch_exhaustive(checker, statement, switch_type,
+                                            seen_default, case_values,
+                                            case_value_count)) {
+    free(case_values);
+    return 0;
   }
 
   free(case_values);
   return 1;
 }
 
+static int type_checker_check_defer_statement(TypeChecker *checker,
+                                              ASTNode *statement);
+
 int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
   if (!checker || !statement)
     return 0;
 
   switch (statement->type) {
-  case AST_DEFER_STATEMENT: {
-    if (!checker->current_function) {
-      type_checker_set_error_at_location(
-          checker, statement->location,
-          "Defer statement outside of a function");
-      return 0;
-    }
-
-    DeferStatement *defer_stmt = (DeferStatement *)statement->data;
-    if (!defer_stmt || !defer_stmt->statement) {
-      type_checker_set_error_at_location(checker, statement->location,
-                                         "Invalid defer statement");
-      return 0;
-    }
-
-    switch (defer_stmt->statement->type) {
-    case AST_FUNCTION_CALL:
-    case AST_ASSIGNMENT:
-    case AST_PROGRAM:
-      break;
-    default:
-      type_checker_set_error_at_location(
-          checker, defer_stmt->statement->location,
-          "Deferred statement must be a function call, assignment, or block");
-      return 0;
-    }
-
-    return type_checker_check_statement(checker, defer_stmt->statement);
-  }
+  case AST_DEFER_STATEMENT:
+    return type_checker_check_defer_statement(checker, statement);
 
   case AST_ERRDEFER_STATEMENT: {
     if (!checker->current_function) {
@@ -1500,4 +1487,35 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
     return 0;
   }
   }
+}
+
+static int type_checker_check_defer_statement(TypeChecker *checker,
+                                              ASTNode *statement) {
+  if (!checker->current_function) {
+    type_checker_set_error_at_location(
+        checker, statement->location,
+        "Defer statement outside of a function");
+    return 0;
+  }
+
+  DeferStatement *defer_stmt = (DeferStatement *)statement->data;
+  if (!defer_stmt || !defer_stmt->statement) {
+    type_checker_set_error_at_location(checker, statement->location,
+                                       "Invalid defer statement");
+    return 0;
+  }
+
+  switch (defer_stmt->statement->type) {
+  case AST_FUNCTION_CALL:
+  case AST_ASSIGNMENT:
+  case AST_PROGRAM:
+    break;
+  default:
+    type_checker_set_error_at_location(
+        checker, defer_stmt->statement->location,
+        "Deferred statement must be a function call, assignment, or block");
+    return 0;
+  }
+
+  return type_checker_check_statement(checker, defer_stmt->statement);
 }

@@ -243,6 +243,19 @@ static int ir_no_simd_enabled(void) {
   return v;
 }
 
+/* The passes METTLE_NO_SIMD turns off: the ones that emit a vector kernel, all
+ * of which are named for what they are. It used to skip EVERY pass, which is
+ * not what it says and not what the docs promise. Skipping the whole pipeline
+ * also left the loop canonical form unestablished while the checker that
+ * enforces it still ran, so `while (...) { var t: int64 = b; ... }` -- a local
+ * declared inside a loop, which hoist_body_locals exists to lift out -- turned
+ * -O and --release into an internal compiler error. */
+static int ir_pass_is_vectorizer(const char *name) {
+  return name && (strncmp(name, "simd_", 5) == 0 ||
+                  strncmp(name, "auto_vectorize", 14) == 0 ||
+                  strncmp(name, "outer_vectorize", 15) == 0);
+}
+
 /* A signature over the function's volatile accesses: how many there are, in
  * what order, and at what width. A pass that drops one, invents one, or swaps
  * two of them has broken the one guarantee `volatile` makes, and the program
@@ -286,7 +299,8 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
     return 0;
   }
 
-  if (ir_no_simd_enabled()) {
+  if (ir_no_simd_enabled() && ir_pass_is_vectorizer(pass->name)) {
+    ir_trace_pass_event(pass->name, "skipped", NULL, -1);
     return 1;                 /* baseline build: no vectorization, no AVX */
   }
 

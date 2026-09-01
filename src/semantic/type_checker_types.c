@@ -13,38 +13,97 @@ Type *type_checker_closure_env_sentinel(void) {
   return sentinel;
 }
 
-Type *type_checker_parse_array_type(TypeChecker *checker,
-                                           const char *name) {
-  if (!checker || !name)
-    return NULL;
-
-  /* The suffix is the last bracket group, found from the end so a bracket
-   * inside the element type is not mistaken for it: the element of
-   * `(fn(int32[4]) -> int32)[2]` is the whole parenthesised function type. */
+/* The bracket group that gives an array type its OUTER dimension, and the
+ * matching ']'. Dimensions read left to right, so `int32[3][4]` is three rows
+ * of four and the first group is the one this array measures; everything after
+ * it belongs to the element. Answers 0 when the name is not an array.
+ *
+ * The search starts from the END so a bracket inside the element type is not
+ * mistaken for a dimension: the element of `(fn(int32[4]) -> int32)[2]` is the
+ * whole parenthesised function type. It then steps left, group by group, to
+ * reach the first. A single-dimension name never enters that loop. */
+static int type_checker_array_outer_group(const char *name,
+                                          const char **lbracket_out,
+                                          const char **rbracket_out) {
+  size_t length = name ? strlen(name) : 0;
   const char *lbracket = NULL;
   const char *rbracket = NULL;
-  {
-    size_t length = strlen(name);
-    const char *scan;
-    int depth = 0;
-    if (length == 0 || name[length - 1] != ']') {
-      return NULL;
+  const char *scan;
+  int depth = 0;
+
+  if (length == 0 || name[length - 1] != ']') {
+    return 0;
+  }
+  rbracket = name + length - 1;
+  for (scan = rbracket; scan >= name; scan--) {
+    if (*scan == ']') {
+      depth++;
+    } else if (*scan == '[') {
+      depth--;
+      if (depth == 0) {
+        lbracket = scan;
+        break;
+      }
     }
-    rbracket = name + length - 1;
-    for (scan = rbracket; scan >= name; scan--) {
+  }
+  if (!lbracket) {
+    return 0;
+  }
+
+  for (;;) {
+    const char *end = lbracket - 1;
+    const char *found = NULL;
+    depth = 0;
+    if (end <= name || *end != ']') {
+      break;
+    }
+    for (scan = end; scan > name; scan--) {
       if (*scan == ']') {
         depth++;
       } else if (*scan == '[') {
         depth--;
         if (depth == 0) {
-          lbracket = scan;
+          found = scan;
           break;
         }
       }
     }
-    if (!lbracket) {
-      return NULL;
+    if (!found || found == name) {
+      break;
     }
+    lbracket = found;
+  }
+
+  depth = 0;
+  for (scan = lbracket; *scan; scan++) {
+    if (*scan == '[') {
+      depth++;
+    } else if (*scan == ']') {
+      depth--;
+      if (depth == 0) {
+        rbracket = scan;
+        break;
+      }
+    }
+  }
+  if (!rbracket || rbracket < lbracket) {
+    return 0;
+  }
+  *lbracket_out = lbracket;
+  *rbracket_out = rbracket;
+  return 1;
+}
+
+Type *type_checker_parse_array_type(TypeChecker *checker,
+                                           const char *name) {
+  const char *lbracket = NULL;
+  const char *rbracket = NULL;
+
+  if (!checker || !name) {
+    return NULL;
+  }
+  if (!type_checker_array_outer_group(name, &lbracket, &rbracket)) {
+    return NULL;
   }
 
   size_t base_len = (size_t)(lbracket - name);
@@ -52,12 +111,17 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
     return NULL;
   }
 
-  char *base_name = malloc(base_len + 1);
+  /* The element is the base plus whatever dimensions follow this one, so
+   * `int32[3][4]` resolves its element as `int32[4]` and recurses. With one
+   * dimension the tail is empty and this is the base name on its own. */
+  size_t tail_len = strlen(rbracket + 1);
+  char *base_name = malloc(base_len + tail_len + 1);
   if (!base_name) {
     return NULL;
   }
   memcpy(base_name, name, base_len);
-  base_name[base_len] = '\0';
+  memcpy(base_name + base_len, rbracket + 1, tail_len);
+  base_name[base_len + tail_len] = '\0';
 
   Type *base_type = type_checker_get_type_by_name(checker, base_name);
   free(base_name);
@@ -854,50 +918,98 @@ void type_checker_init_builtin_types(TypeChecker *checker) {
   }
 }
 
+static int type_checker_builtin_by_name(TypeChecker *checker,
+                                        const char *name, Type **out) {
+  if (strcmp(name, "bool") == 0) {
+    *out = checker->builtin_bool;
+    return 1;
+  }
+  if (strcmp(name, "char") == 0) {
+    *out = checker->builtin_char;
+    return 1;
+  }
+  if (strcmp(name, "int8") == 0) {
+    *out = checker->builtin_int8;
+    return 1;
+  }
+  if (strcmp(name, "int16") == 0) {
+    *out = checker->builtin_int16;
+    return 1;
+  }
+  if (strcmp(name, "int32") == 0) {
+    *out = checker->builtin_int32;
+    return 1;
+  }
+  if (strcmp(name, "int64") == 0) {
+    *out = checker->builtin_int64;
+    return 1;
+  }
+  if (strcmp(name, "uint8") == 0) {
+    *out = checker->builtin_uint8;
+    return 1;
+  }
+  if (strcmp(name, "uint16") == 0) {
+    *out = checker->builtin_uint16;
+    return 1;
+  }
+  if (strcmp(name, "uint32") == 0) {
+    *out = checker->builtin_uint32;
+    return 1;
+  }
+  if (strcmp(name, "uint64") == 0) {
+    *out = checker->builtin_uint64;
+    return 1;
+  }
+  if (strcmp(name, "float32") == 0) {
+    *out = checker->builtin_float32;
+    return 1;
+  }
+  if (strcmp(name, "float64") == 0) {
+    *out = checker->builtin_float64;
+    return 1;
+  }
+  if (strcmp(name, "string") == 0) {
+    *out = checker->builtin_string;
+    return 1;
+  }
+  if (strcmp(name, "cstring") == 0) {
+    *out = checker->builtin_cstring;
+    return 1;
+  }
+  if (strcmp(name, "rawptr") == 0) {
+    *out = checker->builtin_rawptr;
+    return 1;
+  }
+  if (strcmp(name, "void") == 0) {
+    *out = checker->builtin_void;
+    return 1;
+  }
+  if (strcmp(name, "Type") == 0) {
+    *out = checker->builtin_type;
+    return 1;
+  }
+  if (strcmp(name, "Field") == 0) {
+    *out = checker->builtin_field;
+    return 1;
+  }
+  if (strcmp(name, "Kind") == 0) {
+    type_checker_register_kind_enum(checker);
+    *out = checker->builtin_kind;
+    return 1;
+  }
+  return 0;
+}
+
 Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
   if (!checker || !name)
     return NULL;
 
   // Check built-in types by name
-  if (strcmp(name, "bool") == 0)
-    return checker->builtin_bool;
-  if (strcmp(name, "char") == 0)
-    return checker->builtin_char;
-  if (strcmp(name, "int8") == 0)
-    return checker->builtin_int8;
-  if (strcmp(name, "int16") == 0)
-    return checker->builtin_int16;
-  if (strcmp(name, "int32") == 0)
-    return checker->builtin_int32;
-  if (strcmp(name, "int64") == 0)
-    return checker->builtin_int64;
-  if (strcmp(name, "uint8") == 0)
-    return checker->builtin_uint8;
-  if (strcmp(name, "uint16") == 0)
-    return checker->builtin_uint16;
-  if (strcmp(name, "uint32") == 0)
-    return checker->builtin_uint32;
-  if (strcmp(name, "uint64") == 0)
-    return checker->builtin_uint64;
-  if (strcmp(name, "float32") == 0)
-    return checker->builtin_float32;
-  if (strcmp(name, "float64") == 0)
-    return checker->builtin_float64;
-  if (strcmp(name, "string") == 0)
-    return checker->builtin_string;
-  if (strcmp(name, "cstring") == 0)
-    return checker->builtin_cstring;
-  if (strcmp(name, "rawptr") == 0)
-    return checker->builtin_rawptr;
-  if (strcmp(name, "void") == 0)
-    return checker->builtin_void;
-  if (strcmp(name, "Type") == 0)
-    return checker->builtin_type;
-  if (strcmp(name, "Field") == 0)
-    return checker->builtin_field;
-  if (strcmp(name, "Kind") == 0) {
-    type_checker_register_kind_enum(checker);
-    return checker->builtin_kind;
+  {
+    Type *builtin = NULL;
+    if (type_checker_builtin_by_name(checker, name, &builtin)) {
+      return builtin;
+    }
   }
 
   /* `T[]`: a slice, which is `T*` and a length in one value. The brackets are
@@ -1244,39 +1356,8 @@ int type_checker_is_cast_valid(Type *from, Type *to) {
 
 // Type compatibility and conversion functions implementation
 
-int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
-                               Type *src_type) {
-  if (type_is_comptime_only(dest_type) || type_is_comptime_only(src_type)) {
-    return dest_type && src_type &&
-           type_checker_types_equal(dest_type, src_type);
-  }
-  if (!checker || !dest_type || !src_type)
-    return 0;
-
-  /* A closure (function-pointer type carrying an environment) and a thin
-   * function pointer are not interchangeable: a thin call site dispatches
-   * without the environment, and a closure call site reads a code pointer the
-   * thin value does not carry. Closures cross boundaries only as `Fn(...)->R`. */
-  {
-    int src_is_closure = src_type->kind == TYPE_FUNCTION_POINTER &&
-                         src_type->closure_env;
-    int dst_is_closure = dest_type->kind == TYPE_FUNCTION_POINTER &&
-                         dest_type->closure_env;
-    int src_is_thin_fn =
-        src_type->kind == TYPE_FUNCTION_POINTER && !src_type->closure_env;
-    int dst_is_thin_fn =
-        dest_type->kind == TYPE_FUNCTION_POINTER && !dest_type->closure_env;
-    if ((src_is_closure && dst_is_thin_fn) ||
-        (dst_is_closure && src_is_thin_fn)) {
-      return 0;
-    }
-  }
-
-  if (type_checker_types_equal(dest_type, src_type)) {
-    return 1;
-  }
-
-  /* A Mettle string can flow to a cstring by exposing its chars pointer. */
+static int type_checker_pointer_conversion_allowed(Type *dest_type,
+                                                   Type *src_type) {
   if (type_checker_is_cstring_type(dest_type) &&
       src_type->kind == TYPE_STRING) {
     return 1;
@@ -1323,6 +1404,45 @@ int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
   if (dest_type->kind == TYPE_POINTER && src_type->kind == TYPE_ARRAY &&
       dest_type->base_type && src_type->base_type &&
       type_checker_types_equal(dest_type->base_type, src_type->base_type)) {
+    return 1;
+  }
+  return 0;
+}
+
+int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
+                               Type *src_type) {
+  if (type_is_comptime_only(dest_type) || type_is_comptime_only(src_type)) {
+    return dest_type && src_type &&
+           type_checker_types_equal(dest_type, src_type);
+  }
+  if (!checker || !dest_type || !src_type)
+    return 0;
+
+  /* A closure (function-pointer type carrying an environment) and a thin
+   * function pointer are not interchangeable: a thin call site dispatches
+   * without the environment, and a closure call site reads a code pointer the
+   * thin value does not carry. Closures cross boundaries only as `Fn(...)->R`. */
+  {
+    int src_is_closure = src_type->kind == TYPE_FUNCTION_POINTER &&
+                         src_type->closure_env;
+    int dst_is_closure = dest_type->kind == TYPE_FUNCTION_POINTER &&
+                         dest_type->closure_env;
+    int src_is_thin_fn =
+        src_type->kind == TYPE_FUNCTION_POINTER && !src_type->closure_env;
+    int dst_is_thin_fn =
+        dest_type->kind == TYPE_FUNCTION_POINTER && !dest_type->closure_env;
+    if ((src_is_closure && dst_is_thin_fn) ||
+        (dst_is_closure && src_is_thin_fn)) {
+      return 0;
+    }
+  }
+
+  if (type_checker_types_equal(dest_type, src_type)) {
+    return 1;
+  }
+
+  /* A Mettle string can flow to a cstring by exposing its chars pointer. */
+  if (type_checker_pointer_conversion_allowed(dest_type, src_type)) {
     return 1;
   }
 

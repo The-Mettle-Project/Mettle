@@ -1,0 +1,88 @@
+// A local copied from a parameter is a COPY, even when the parameter is
+// assigned afterwards.
+//
+// The baseline emitter lets a local share its source's storage when the source
+// is written exactly once, because one write is the definitional one and the
+// value never changes under the alias. A parameter breaks that count: it is
+// written before any instruction runs, by the call that passed it, and that
+// write has no IR to count. So `b = 5` after the copy looked like b's single
+// definitional write, the alias was taken, and `t` read 5.
+//
+// gcd is the shape that found it: `var t = b; b = a % b; a = t;` returned 0
+// for every input under -s, which forces the baseline emitter. These functions
+// are @noinline so the parameter stays a parameter.
+
+@noinline fn copy_then_set(b: int64) -> int64 {
+  var t: int64 = b;
+  b = 5;
+  return t;
+}
+
+@noinline fn copy_then_compute(a: int64, b: int64) -> int64 {
+  var t: int64 = b;
+  b = a - b;
+  return t * 1000 + b;
+}
+
+@noinline fn copy_then_self_update(b: int64) -> int64 {
+  var t: int64 = b;
+  b = b + 1;
+  return t;
+}
+
+@noinline fn narrow_copy_then_set(b: int32) -> int32 {
+  var t: int32 = b;
+  b = 5;
+  return t;
+}
+
+@noinline fn chained_copy(b: int64) -> int64 {
+  var t: int64 = b;
+  var u: int64 = t;
+  b = 5;
+  return u;
+}
+
+@noinline fn gcd(a: int64, b: int64) -> int64 {
+  while (b != 0) {
+    var t: int64 = b;
+    b = a % b;
+    a = t;
+  }
+  return a;
+}
+
+@noinline fn gcd32(a: int32, b: int32) -> int32 {
+  while (b != 0) {
+    var t: int32 = b;
+    b = a % b;
+    a = t;
+  }
+  return a;
+}
+
+// A parameter that is never reassigned may still share storage, so this must
+// keep working: the fix must not reject every copy from a parameter.
+@noinline fn copy_only(b: int64) -> int64 {
+  var t: int64 = b;
+  return t + 1;
+}
+
+fn main() -> int32 {
+  if (copy_then_set(9) != 9) { return 1; }
+  if (copy_then_compute(10, 3) != 3007) { return 2; }
+  if (copy_then_self_update(9) != 9) { return 3; }
+  if (narrow_copy_then_set(9) != 9) { return 4; }
+  if (chained_copy(9) != 9) { return 5; }
+
+  if (gcd(1071, 462) != 21) { return 6; }
+  if (gcd(462, 1071) != 21) { return 7; }
+  if (gcd(-1071, 462) != 21) { return 8; }
+  if (gcd(17, 5) != 1) { return 9; }
+  if (gcd(100, 0) != 100) { return 10; }
+  if (gcd32(1071, 462) != 21) { return 11; }
+
+  if (copy_only(41) != 42) { return 12; }
+
+  return 0;
+}

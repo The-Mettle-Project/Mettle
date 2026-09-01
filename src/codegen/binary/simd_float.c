@@ -2434,6 +2434,37 @@ static int exp_fill_pool(BinaryCodeBuffer *b) {
   return 1;
 }
 
+/* RCX has passed end-32, so 1..7 elements are left. Put that count in R8 and
+ * jump to `tail`, which the caller patches to its n<8 gather/scatter path.
+ *
+ * Both in-place float kernels used to clamp RCX back to end-32 here and run
+ * one more full vector, overlapping elements the loop had already done. That
+ * is sound for a map into a separate destination; these write over their own
+ * input, so the overlap applied the kernel twice. RDX needs no adjustment
+ * because it advanced in lockstep with RCX. */
+static int simd_tail_count_to_r8(BinaryCodeBuffer *b, size_t *tail) {
+  return binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_R10, 0 /* add */, 32) &&
+         wcs_sub_reg_reg64(b, BINARY_GP_R10, BINARY_GP_RCX) &&
+         binary_emit_shift_reg_imm8(b, 5 /* shr */, BINARY_GP_R10, 2) &&
+         binary_emit_mov_reg_reg(b, BINARY_GP_R8, BINARY_GP_R10) &&
+         wcs_jcc(b, 0, tail);
+}
+
+/* One 8-wide exp at [RCX], then the loop's two exits: `done_main` when RCX has
+ * reached end-32 and this was the last whole vector, otherwise advance 32 and
+ * take `noclamp` unless that step left a partial tail. */
+static int simd_exp_step(BinaryCodeBuffer *b, size_t *done_main,
+                         size_t *noclamp) {
+  return wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) && exp_compute(b) &&
+         wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RCX, 0, 2) &&
+         binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) &&
+         wcs_jcc(b, 0x83 /* jae */, done_main) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) &&
+         binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) &&
+         wcs_jcc(b, 0x86 /* jbe */, noclamp);
+}
+
 /* IR_OP_SIMD_EXP_F32: in-place a[i] = exp(a[i]) over a float32 array.
  * dest = array base, arguments[0] = element count. */
 int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
@@ -2441,6 +2472,7 @@ int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
                                             const IRInstruction *instruction) {
   BinaryCodeBuffer *b = NULL;
   size_t loop_top = 0, done_main = 0, small = 0, fin = 0, noclamp = 0;
+  size_t tail = 0;
   if (!generator || !context || !instruction ||
       instruction->argument_count < 1 || !instruction->arguments) {
     code_generator_set_error(generator, "Malformed simd_exp_f32");
@@ -2470,19 +2502,16 @@ int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
       !wcs_jcc(b, 0x82 /* jb */, &small)) {
     return 0;
   }
-  /* R9 = last8 = end - 32; 8-wide loop overlapping the final vector. */
+  /* R9 = last8 = end - 32; the 8-wide loop runs only over whole vectors. */
   if (!wcs_addsub_reg_imm8(b, BINARY_GP_R9, 1 /* sub */, 32)) {
     return 0;
   }
   loop_top = b->size;
-  if (!wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) || !exp_compute(b) ||
-      !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RCX, 0, 2) ||
-      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
-      !wcs_jcc(b, 0x83 /* jae */, &done_main) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
-      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
-      !wcs_jcc(b, 0x86 /* jbe */, &noclamp) ||
-      !binary_emit_mov_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9)) {
+  if (!simd_exp_step(b, &done_main, &noclamp)) {
+    return 0;
+  }
+  /* In-place: an overlapped element came back as exp(exp(x)). */
+  if (!simd_tail_count_to_r8(b, &tail)) {
     return 0;
   }
   if (!wcs_patch_here(b, noclamp)) {
@@ -2501,7 +2530,7 @@ int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
   /* n < 8: copy n floats into the [rsp+0] scratch buffer (already reserved),
    * exp it 8-wide, copy the n results back. R9 saves the base; RCX/R10/R11/RAX
    * are scratch. */
-  if (!wcs_patch_here(b, small) ||
+  if (!wcs_patch_here(b, small) || !wcs_patch_here(b, tail) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_RCX) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_RSP) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R8)) {
@@ -2620,6 +2649,7 @@ int code_generator_binary_emit_simd_silu_f32(CodeGenerator *generator,
 int code_generator_binary_emit_simd_silu_f32_inline(BinaryCodeBuffer *b,
                                                     int has_mul) {
   size_t loop_top = 0, done_main = 0, small = 0, fin = 0, noclamp = 0;
+  size_t tail = 0;
   /* end = out + count*4. */
   if (!binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R8) ||
       !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
@@ -2655,20 +2685,13 @@ int code_generator_binary_emit_simd_silu_f32_inline(BinaryCodeBuffer *b,
   if (has_mul && !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
     return 0;
   }
-  /* If RCX overshot end-32, clamp it back (and shift RDX by the same delta). */
   if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
       !wcs_jcc(b, 0x86 /* jbe */, &noclamp)) {
     return 0;
   }
-  if (has_mul) {
-    /* RDX -= (RCX - R9): R10 = RCX - R9; RDX -= R10; RCX = R9. */
-    if (!binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_RCX) ||
-        !wcs_sub_reg_reg64(b, BINARY_GP_R10, BINARY_GP_R9) ||
-        !wcs_sub_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_R10)) {
-      return 0;
-    }
-  }
-  if (!binary_emit_mov_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9)) {
+  /* In-place: an overlapped element came back as silu(silu(x)) * u * u. For
+   * n = 11 that was elements 3..7, a 57% error on the first of them. */
+  if (!simd_tail_count_to_r8(b, &tail)) {
     return 0;
   }
   if (!wcs_patch_here(b, noclamp)) {
@@ -2686,7 +2709,7 @@ int code_generator_binary_emit_simd_silu_f32_inline(BinaryCodeBuffer *b,
 
   /* n < 8: gather g (and u) into the scratch buffers, run one 8-wide body on
    * them, scatter n results back. R9 saves the out base. */
-  if (!wcs_patch_here(b, small) ||
+  if (!wcs_patch_here(b, small) || !wcs_patch_here(b, tail) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_RCX)) {
     return 0;
   }

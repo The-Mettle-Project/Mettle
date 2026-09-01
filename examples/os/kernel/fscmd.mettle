@@ -386,7 +386,11 @@ export fn fs_run_script(name: cstring, announce: bool) -> uint64 {
     var line: uint8[256]
     var out: uint64 = 0
     var ran: uint64 = 0
-    for i: uint64 in 0..(got + 1) {
+    var start: uint64 = 0
+    if (got >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf) {
+        start = 3
+    }
+    for i: uint64 in start..(got + 1) {
         var ch: uint8 = 0
         if (i < got) {
             ch = bytes[i]

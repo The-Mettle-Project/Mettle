@@ -1250,6 +1250,24 @@ static int rewrite_program_names(ASTNode *program, const NameRewrite *rewrites,
   return 1;
 }
 
+static int rewrite_declaration_names(ASTNode *node,
+                                     const NameRewrite *rewrites,
+                                     size_t rewrite_count,
+                                     const NamespaceBinding *bindings,
+                                     size_t binding_count,
+                                     RewriteScope *scope,
+                                     int program_creates_scope);
+static int rewrite_function_declaration_names(ASTNode *node,
+                                              const NameRewrite *rewrites,
+                                              size_t rewrite_count,
+                                              const NamespaceBinding *bindings,
+                                              size_t binding_count,
+                                              RewriteScope *scope,
+                                              int program_creates_scope);
+static void collect_declaration_dependency_names(ASTNode *node, char ***names,
+                                                 size_t *count,
+                                                 size_t *capacity);
+
 static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
                               size_t rewrite_count,
                               const NamespaceBinding *bindings,
@@ -1289,178 +1307,14 @@ static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
   }
 
   case AST_FUNCTION_DECLARATION:
-  case AST_METHOD_DECLARATION: {
-    FunctionDeclaration *func_decl = (FunctionDeclaration *)node->data;
-    RewriteScope function_scope;
-
-    if (!func_decl) {
-      return 1;
-    }
-
-    if (!scope &&
-        !rename_string_if_needed(&func_decl->name, rewrites, rewrite_count)) {
-      return 0;
-    }
-
-    if (!rewrite_type_string_in_place(&func_decl->return_type, rewrites,
-                                      rewrite_count, bindings, binding_count)) {
-      return 0;
-    }
-
-    for (size_t i = 0; i < func_decl->parameter_count; i++) {
-      if (!rewrite_type_string_in_place(&func_decl->parameter_types[i], rewrites,
-                                        rewrite_count, bindings,
-                                        binding_count)) {
-        return 0;
-      }
-    }
-
-    for (size_t i = 0; i < func_decl->type_param_count; i++) {
-      if (func_decl->type_param_traits &&
-          !rewrite_type_string_in_place(&func_decl->type_param_traits[i],
-                                        rewrites, rewrite_count, bindings,
-                                        binding_count)) {
-        return 0;
-      }
-    }
-
-    memset(&function_scope, 0, sizeof(function_scope));
-    function_scope.parent = scope;
-    for (size_t i = 0; i < func_decl->parameter_count; i++) {
-      if (!scope_add_name(&function_scope, func_decl->parameter_names[i])) {
-        scope_cleanup(&function_scope);
-        return 0;
-      }
-    }
-
-    if (func_decl->body &&
-        !rewrite_program_names(func_decl->body, rewrites, rewrite_count,
-                               bindings, binding_count, &function_scope, 0)) {
-      scope_cleanup(&function_scope);
-      return 0;
-    }
-
-    scope_cleanup(&function_scope);
-    return 1;
-  }
-
-  case AST_STRUCT_DECLARATION: {
-    StructDeclaration *struct_decl = (StructDeclaration *)node->data;
-    if (!struct_decl) {
-      return 1;
-    }
-
-    if (!scope &&
-        !rename_string_if_needed(&struct_decl->name, rewrites, rewrite_count)) {
-      return 0;
-    }
-
-    for (size_t i = 0; i < struct_decl->field_count; i++) {
-      if (!rewrite_type_string_in_place(&struct_decl->field_types[i], rewrites,
-                                        rewrite_count, bindings,
-                                        binding_count)) {
-        return 0;
-      }
-    }
-
-    for (size_t i = 0; i < struct_decl->type_param_count; i++) {
-      if (struct_decl->type_param_traits &&
-          !rewrite_type_string_in_place(&struct_decl->type_param_traits[i],
-                                        rewrites, rewrite_count, bindings,
-                                        binding_count)) {
-        return 0;
-      }
-    }
-
-    for (size_t i = 0; i < struct_decl->method_count; i++) {
-      if (!rewrite_node_names(struct_decl->methods[i], rewrites, rewrite_count,
-                              bindings, binding_count, scope, 1)) {
-        return 0;
-      }
-    }
-
-    return 1;
-  }
-
-  case AST_ENUM_DECLARATION: {
-    EnumDeclaration *enum_decl = (EnumDeclaration *)node->data;
-    if (!enum_decl) {
-      return 1;
-    }
-
-    if (!scope &&
-        !rename_string_if_needed(&enum_decl->name, rewrites, rewrite_count)) {
-      return 0;
-    }
-
-    if (!scope) {
-      for (size_t i = 0; i < enum_decl->variant_count; i++) {
-        if (!rename_string_if_needed(&enum_decl->variants[i].name, rewrites,
-                                     rewrite_count)) {
-          return 0;
-        }
-      }
-    }
-
-    for (size_t i = 0; i < enum_decl->variant_count; i++) {
-      if (enum_decl->variants[i].value &&
-          !rewrite_node_names(enum_decl->variants[i].value, rewrites,
-                              rewrite_count, bindings, binding_count, scope,
-                              1)) {
-        return 0;
-      }
-    }
-
-    return 1;
-  }
-
-  case AST_TRAIT_DECLARATION: {
-    TraitDeclaration *trait_decl = (TraitDeclaration *)node->data;
-    if (!trait_decl) {
-      return 1;
-    }
-
-    if (!scope &&
-        !rename_string_if_needed(&trait_decl->name, rewrites, rewrite_count)) {
-      return 0;
-    }
-
-    for (size_t i = 0; i < trait_decl->method_count; i++) {
-      if (!rewrite_node_names(trait_decl->methods[i], rewrites, rewrite_count,
-                              bindings, binding_count, scope, 1)) {
-        return 0;
-      }
-    }
-
-    return 1;
-  }
-
-  case AST_IMPL_DECLARATION: {
-    ImplDeclaration *impl_decl = (ImplDeclaration *)node->data;
-    if (!impl_decl) {
-      return 1;
-    }
-
-    if (!rewrite_type_string_in_place(&impl_decl->trait_name, rewrites,
-                                      rewrite_count, bindings, binding_count)) {
-      return 0;
-    }
-
-    if (!rewrite_type_string_in_place(&impl_decl->for_type_name, rewrites,
-                                      rewrite_count, bindings,
-                                      binding_count)) {
-      return 0;
-    }
-
-    for (size_t i = 0; i < impl_decl->method_count; i++) {
-      if (!rewrite_node_names(impl_decl->methods[i], rewrites, rewrite_count,
-                              bindings, binding_count, scope, 1)) {
-        return 0;
-      }
-    }
-
-    return 1;
-  }
+  case AST_METHOD_DECLARATION:
+  case AST_STRUCT_DECLARATION:
+  case AST_ENUM_DECLARATION:
+  case AST_TRAIT_DECLARATION:
+  case AST_IMPL_DECLARATION:
+    return rewrite_declaration_names(node, rewrites, rewrite_count, bindings,
+                                     binding_count, scope,
+                                     program_creates_scope);
 
   case AST_ASSIGNMENT: {
     Assignment *assignment = (Assignment *)node->data;
@@ -1924,6 +1778,208 @@ static int rewrite_node_names(ASTNode *node, const NameRewrite *rewrites,
     return 1;
   }
 
+  default:
+    return 1;
+  }
+}
+
+static int rewrite_declaration_names(ASTNode *node,
+                                     const NameRewrite *rewrites,
+                                     size_t rewrite_count,
+                                     const NamespaceBinding *bindings,
+                                     size_t binding_count,
+                                     RewriteScope *scope,
+                                     int program_creates_scope) {
+  switch (node->type) {
+  case AST_FUNCTION_DECLARATION:
+  case AST_METHOD_DECLARATION:
+    return rewrite_function_declaration_names(
+        node, rewrites, rewrite_count, bindings, binding_count, scope, program_creates_scope);
+  case AST_STRUCT_DECLARATION: {
+    StructDeclaration *struct_decl = (StructDeclaration *)node->data;
+    if (!struct_decl) {
+      return 1;
+    }
+
+    if (!scope &&
+        !rename_string_if_needed(&struct_decl->name, rewrites, rewrite_count)) {
+      return 0;
+    }
+
+    for (size_t i = 0; i < struct_decl->field_count; i++) {
+      if (!rewrite_type_string_in_place(&struct_decl->field_types[i], rewrites,
+                                        rewrite_count, bindings,
+                                        binding_count)) {
+        return 0;
+      }
+    }
+
+    for (size_t i = 0; i < struct_decl->type_param_count; i++) {
+      if (struct_decl->type_param_traits &&
+          !rewrite_type_string_in_place(&struct_decl->type_param_traits[i],
+                                        rewrites, rewrite_count, bindings,
+                                        binding_count)) {
+        return 0;
+      }
+    }
+
+    for (size_t i = 0; i < struct_decl->method_count; i++) {
+      if (!rewrite_node_names(struct_decl->methods[i], rewrites, rewrite_count,
+                              bindings, binding_count, scope, 1)) {
+        return 0;
+      }
+    }
+
+    return 1;
+  }
+
+  case AST_ENUM_DECLARATION: {
+    EnumDeclaration *enum_decl = (EnumDeclaration *)node->data;
+    if (!enum_decl) {
+      return 1;
+    }
+
+    if (!scope &&
+        !rename_string_if_needed(&enum_decl->name, rewrites, rewrite_count)) {
+      return 0;
+    }
+
+    if (!scope) {
+      for (size_t i = 0; i < enum_decl->variant_count; i++) {
+        if (!rename_string_if_needed(&enum_decl->variants[i].name, rewrites,
+                                     rewrite_count)) {
+          return 0;
+        }
+      }
+    }
+
+    for (size_t i = 0; i < enum_decl->variant_count; i++) {
+      if (enum_decl->variants[i].value &&
+          !rewrite_node_names(enum_decl->variants[i].value, rewrites,
+                              rewrite_count, bindings, binding_count, scope,
+                              1)) {
+        return 0;
+      }
+    }
+
+    return 1;
+  }
+
+  case AST_TRAIT_DECLARATION: {
+    TraitDeclaration *trait_decl = (TraitDeclaration *)node->data;
+    if (!trait_decl) {
+      return 1;
+    }
+
+    if (!scope &&
+        !rename_string_if_needed(&trait_decl->name, rewrites, rewrite_count)) {
+      return 0;
+    }
+
+    for (size_t i = 0; i < trait_decl->method_count; i++) {
+      if (!rewrite_node_names(trait_decl->methods[i], rewrites, rewrite_count,
+                              bindings, binding_count, scope, 1)) {
+        return 0;
+      }
+    }
+
+    return 1;
+  }
+
+  case AST_IMPL_DECLARATION: {
+    ImplDeclaration *impl_decl = (ImplDeclaration *)node->data;
+    if (!impl_decl) {
+      return 1;
+    }
+
+    if (!rewrite_type_string_in_place(&impl_decl->trait_name, rewrites,
+                                      rewrite_count, bindings, binding_count)) {
+      return 0;
+    }
+
+    if (!rewrite_type_string_in_place(&impl_decl->for_type_name, rewrites,
+                                      rewrite_count, bindings,
+                                      binding_count)) {
+      return 0;
+    }
+
+    for (size_t i = 0; i < impl_decl->method_count; i++) {
+      if (!rewrite_node_names(impl_decl->methods[i], rewrites, rewrite_count,
+                              bindings, binding_count, scope, 1)) {
+        return 0;
+      }
+    }
+
+    return 1;
+  }
+  default:
+    return 1;
+  }
+}
+
+static int rewrite_function_declaration_names(ASTNode *node,
+                                              const NameRewrite *rewrites,
+                                              size_t rewrite_count,
+                                              const NamespaceBinding *bindings,
+                                              size_t binding_count,
+                                              RewriteScope *scope,
+                                              int program_creates_scope) {
+  switch (node->type) {
+  case AST_FUNCTION_DECLARATION:
+  case AST_METHOD_DECLARATION: {
+    FunctionDeclaration *func_decl = (FunctionDeclaration *)node->data;
+    RewriteScope function_scope;
+
+    if (!func_decl) {
+      return 1;
+    }
+
+    if (!scope &&
+        !rename_string_if_needed(&func_decl->name, rewrites, rewrite_count)) {
+      return 0;
+    }
+
+    if (!rewrite_type_string_in_place(&func_decl->return_type, rewrites,
+                                      rewrite_count, bindings, binding_count)) {
+      return 0;
+    }
+
+    for (size_t i = 0; i < func_decl->parameter_count; i++) {
+      if (!rewrite_type_string_in_place(&func_decl->parameter_types[i], rewrites,
+                                        rewrite_count, bindings,
+                                        binding_count)) {
+        return 0;
+      }
+    }
+
+    for (size_t i = 0; i < func_decl->type_param_count; i++) {
+      if (func_decl->type_param_traits &&
+          !rewrite_type_string_in_place(&func_decl->type_param_traits[i],
+                                        rewrites, rewrite_count, bindings,
+                                        binding_count)) {
+        return 0;
+      }
+    }
+
+    memset(&function_scope, 0, sizeof(function_scope));
+    function_scope.parent = scope;
+    for (size_t i = 0; i < func_decl->parameter_count; i++) {
+      if (!scope_add_name(&function_scope, func_decl->parameter_names[i])) {
+        scope_cleanup(&function_scope);
+        return 0;
+      }
+    }
+
+    if (func_decl->body &&
+        !rewrite_program_names(func_decl->body, rewrites, rewrite_count,
+                               bindings, binding_count, &function_scope, 0)) {
+      scope_cleanup(&function_scope);
+      return 0;
+    }
+
+    scope_cleanup(&function_scope);
+    return 1;
+  }
   default:
     return 1;
   }
@@ -2703,85 +2759,13 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     return;
   }
   case AST_FUNCTION_DECLARATION:
-  case AST_METHOD_DECLARATION: {
-    FunctionDeclaration *func = (FunctionDeclaration *)node->data;
-    if (!func) {
-      return;
-    }
-    collect_type_name_dependencies(func->return_type, names, count, capacity);
-    for (size_t i = 0; i < func->parameter_count; i++) {
-      collect_type_name_dependencies(func->parameter_types[i], names, count,
-                                     capacity);
-    }
-    for (size_t i = 0; i < func->type_param_count; i++) {
-      if (func->type_param_traits) {
-        collect_type_name_dependencies(func->type_param_traits[i], names,
-                                       count, capacity);
-      }
-    }
-    if (func->body) {
-      collect_dependency_names(func->body, names, count, capacity);
-    }
+  case AST_METHOD_DECLARATION:
+  case AST_STRUCT_DECLARATION:
+  case AST_ENUM_DECLARATION:
+  case AST_TRAIT_DECLARATION:
+  case AST_IMPL_DECLARATION:
+    collect_declaration_dependency_names(node, names, count, capacity);
     return;
-  }
-  case AST_STRUCT_DECLARATION: {
-    StructDeclaration *strct = (StructDeclaration *)node->data;
-    if (!strct) {
-      return;
-    }
-    for (size_t i = 0; i < strct->field_count; i++) {
-      collect_type_name_dependencies(strct->field_types[i], names, count,
-                                     capacity);
-    }
-    for (size_t i = 0; i < strct->type_param_count; i++) {
-      if (strct->type_param_traits) {
-        collect_type_name_dependencies(strct->type_param_traits[i], names,
-                                       count, capacity);
-      }
-    }
-    for (size_t i = 0; i < strct->method_count; i++) {
-      collect_dependency_names(strct->methods[i], names, count, capacity);
-    }
-    return;
-  }
-  case AST_ENUM_DECLARATION: {
-    EnumDeclaration *enm = (EnumDeclaration *)node->data;
-    if (!enm) {
-      return;
-    }
-    for (size_t i = 0; i < enm->variant_count; i++) {
-      collect_type_name_dependencies(enm->variants[i].payload_type, names,
-                                     count, capacity);
-      if (enm->variants[i].value) {
-        collect_dependency_names(enm->variants[i].value, names, count,
-                                 capacity);
-      }
-    }
-    return;
-  }
-  case AST_TRAIT_DECLARATION: {
-    TraitDeclaration *trait = (TraitDeclaration *)node->data;
-    if (!trait) {
-      return;
-    }
-    for (size_t i = 0; i < trait->method_count; i++) {
-      collect_dependency_names(trait->methods[i], names, count, capacity);
-    }
-    return;
-  }
-  case AST_IMPL_DECLARATION: {
-    ImplDeclaration *impl = (ImplDeclaration *)node->data;
-    if (!impl) {
-      return;
-    }
-    collect_type_name_dependencies(impl->trait_name, names, count, capacity);
-    collect_type_name_dependencies(impl->for_type_name, names, count,
-                                   capacity);
-    for (size_t i = 0; i < impl->method_count; i++) {
-      collect_dependency_names(impl->methods[i], names, count, capacity);
-    }
-    return;
-  }
   case AST_FUNCTION_CALL: {
     CallExpression *call = (CallExpression *)node->data;
     if (!call) {
@@ -2953,6 +2937,95 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     if (asm_block && asm_block->assembly_code) {
       collect_assembly_identifiers(asm_block->assembly_code, names, count,
                                    capacity);
+    }
+    return;
+  }
+  default:
+    return;
+  }
+}
+
+static void collect_declaration_dependency_names(ASTNode *node, char ***names,
+                                                 size_t *count,
+                                                 size_t *capacity) {
+  switch (node->type) {
+  case AST_FUNCTION_DECLARATION:
+  case AST_METHOD_DECLARATION: {
+    FunctionDeclaration *func = (FunctionDeclaration *)node->data;
+    if (!func) {
+      return;
+    }
+    collect_type_name_dependencies(func->return_type, names, count, capacity);
+    for (size_t i = 0; i < func->parameter_count; i++) {
+      collect_type_name_dependencies(func->parameter_types[i], names, count,
+                                     capacity);
+    }
+    for (size_t i = 0; i < func->type_param_count; i++) {
+      if (func->type_param_traits) {
+        collect_type_name_dependencies(func->type_param_traits[i], names,
+                                       count, capacity);
+      }
+    }
+    if (func->body) {
+      collect_dependency_names(func->body, names, count, capacity);
+    }
+    return;
+  }
+  case AST_STRUCT_DECLARATION: {
+    StructDeclaration *strct = (StructDeclaration *)node->data;
+    if (!strct) {
+      return;
+    }
+    for (size_t i = 0; i < strct->field_count; i++) {
+      collect_type_name_dependencies(strct->field_types[i], names, count,
+                                     capacity);
+    }
+    for (size_t i = 0; i < strct->type_param_count; i++) {
+      if (strct->type_param_traits) {
+        collect_type_name_dependencies(strct->type_param_traits[i], names,
+                                       count, capacity);
+      }
+    }
+    for (size_t i = 0; i < strct->method_count; i++) {
+      collect_dependency_names(strct->methods[i], names, count, capacity);
+    }
+    return;
+  }
+  case AST_ENUM_DECLARATION: {
+    EnumDeclaration *enm = (EnumDeclaration *)node->data;
+    if (!enm) {
+      return;
+    }
+    for (size_t i = 0; i < enm->variant_count; i++) {
+      collect_type_name_dependencies(enm->variants[i].payload_type, names,
+                                     count, capacity);
+      if (enm->variants[i].value) {
+        collect_dependency_names(enm->variants[i].value, names, count,
+                                 capacity);
+      }
+    }
+    return;
+  }
+  case AST_TRAIT_DECLARATION: {
+    TraitDeclaration *trait = (TraitDeclaration *)node->data;
+    if (!trait) {
+      return;
+    }
+    for (size_t i = 0; i < trait->method_count; i++) {
+      collect_dependency_names(trait->methods[i], names, count, capacity);
+    }
+    return;
+  }
+  case AST_IMPL_DECLARATION: {
+    ImplDeclaration *impl = (ImplDeclaration *)node->data;
+    if (!impl) {
+      return;
+    }
+    collect_type_name_dependencies(impl->trait_name, names, count, capacity);
+    collect_type_name_dependencies(impl->for_type_name, names, count,
+                                   capacity);
+    for (size_t i = 0; i < impl->method_count; i++) {
+      collect_dependency_names(impl->methods[i], names, count, capacity);
     }
     return;
   }
