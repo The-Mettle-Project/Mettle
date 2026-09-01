@@ -104,7 +104,7 @@ build_from_source() {
   # A checkout next to this script is the source. Otherwise clone one, and
   # only then is a version a ref to check out: a checkout the user is sitting
   # in is theirs, and moving it off their branch is not the installer's call.
-  self_dir="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)" || self_dir=""
+  self_dir="$(unset CDPATH; cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)" || self_dir=""
   if [ -n "$self_dir" ] && [ -f "$self_dir/CMakeLists.txt" ]; then
     checkout="$self_dir"
     [ -z "$VERSION" ] || warn "ignoring --version $VERSION: building the checkout at $checkout as it stands"
