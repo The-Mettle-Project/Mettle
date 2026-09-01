@@ -367,11 +367,33 @@ static int wcs_affine_f64_scalar_step(BinaryCodeBuffer *b, int b_is_one,
  * share one kernel. Assumes RCX = src (iterated), RDX = dst (output), R9 = src
  * end pointer (src + count*8), and the broadcast coefficients already in ymm4
  * (a), ymm5 (b), ymm3 (c). Emits the closing vzeroupper. */
+static int wcs_affine_alias_guard(BinaryCodeBuffer *b, size_t *j_alias) {
+  size_t j_same = 0, j_after = 0;
+  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RDX, BINARY_GP_RCX) ||
+      !wcs_jcc(b, 0x84 /* je */, &j_same) ||
+      !binary_emit_cmp_reg_reg(b, BINARY_GP_RDX, BINARY_GP_R9) ||
+      !wcs_jcc(b, 0x83 /* jae */, &j_after)) {
+    return 0;
+  }
+  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_RDX) ||
+      !wcs_add_reg_reg64(b, BINARY_GP_R11, BINARY_GP_R9) ||
+      !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R11, BINARY_GP_RCX) ||
+      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11) ||
+      !wcs_jcc(b, 0x82 /* jb */, j_alias)) {
+    return 0;
+  }
+  return wcs_patch_here(b, j_same) && wcs_patch_here(b, j_after);
+}
+
 int code_generator_binary_emit_simd_affine_map_f64_loop(BinaryCodeBuffer *b,
                                                         int b_is_one,
                                                         int b_is_zero,
                                                         int c_is_zero) {
   size_t loop_top = 0, j_done = 0, j_scalar = 0;
+  size_t j_alias = 0;
+  if (!wcs_affine_alias_guard(b, &j_alias)) {
+    return 0;
+  }
 
   /* The dst += a*src form first runs a 64-byte (8 doubles) unrolled loop: its
    * body is only load/load/fma/store twice, so at one chunk per iteration the
@@ -476,7 +498,7 @@ int code_generator_binary_emit_simd_affine_map_f64_loop(BinaryCodeBuffer *b,
   }
 
   /* Scalar tail: 1 double/iter up to src_end (r9), entry guard + bottom test. */
-  if (!wcs_patch_here(b, j_scalar) ||
+  if (!wcs_patch_here(b, j_scalar) || !wcs_patch_here(b, j_alias) ||
       !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
       !wcs_jcc(b, 0x83 /* jae */, &j_done)) {
     return 0;
@@ -609,6 +631,10 @@ int code_generator_binary_emit_simd_affine_map_f32_loop(BinaryCodeBuffer *b,
                                                         int b_is_zero,
                                                         int c_is_zero) {
   size_t loop_top = 0, j_done = 0, j_scalar = 0;
+  size_t j_alias = 0;
+  if (!wcs_affine_alias_guard(b, &j_alias)) {
+    return 0;
+  }
 
   /* vec_end (r11) = src_start + (src_end - src_start) rounded down to a 32-byte
    * multiple (8 floats/chunk). Hoisting the strip-mine bound out of the loop
@@ -664,7 +690,7 @@ int code_generator_binary_emit_simd_affine_map_f32_loop(BinaryCodeBuffer *b,
   }
 
   /* Scalar tail: 1 float/iter up to src_end (r9), entry guard + bottom test. */
-  if (!wcs_patch_here(b, j_scalar) ||
+  if (!wcs_patch_here(b, j_scalar) || !wcs_patch_here(b, j_alias) ||
       !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
       !wcs_jcc(b, 0x83 /* jae */, &j_done)) {
     return 0;
@@ -1171,6 +1197,33 @@ int code_generator_binary_emit_simd_vloop_f64(
     }
   }
 
+  size_t j_overlap[2 * VLOOP_KERNEL_MAX_BASES];
+  int n_overlap = 0;
+  if (!is_reduce) {
+    int shift = 0;
+    while ((1 << shift) < elem_bytes) {
+      shift++;
+    }
+    for (int j = 1; j < n_dist; j++) {
+      for (int dir = 0; dir < 2; dir++) {
+        int lo = dir ? (int)kGp[j] : (int)dst_reg;
+        int hi = dir ? (int)dst_reg : (int)kGp[j];
+        if (!binary_emit_mov_reg_reg(b, BINARY_GP_RAX, (BinaryGpRegister)hi) ||
+            !wcs_sub_reg_reg64(b, BINARY_GP_RAX, lo)) {
+          return 0;
+        }
+        if (shift && !wcs_shift_reg_imm(b, BINARY_GP_RAX, 1,
+                                        (unsigned char)shift)) {
+          return 0;
+        }
+        if (!wcs_cmp_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R10) ||
+            !wcs_jcc(b, 0x82 /* jb */, &j_overlap[n_overlap++])) {
+          return 0;
+        }
+      }
+    }
+  }
+
   /* ---- vector loop: while (count >= lanes) ---- */
   size_t vec_top = b->size;
   size_t j_tail = 0;
@@ -1393,6 +1446,11 @@ int code_generator_binary_emit_simd_vloop_f64(
   /* ---- scalar tail: while (count != 0) ---- */
   if (!wcs_patch_here(b, j_tail)) {
     return 0;
+  }
+  for (int j = 0; j < n_overlap; j++) {
+    if (!wcs_patch_here(b, j_overlap[j])) {
+      return 0;
+    }
   }
   size_t tail_top = b->size;
   size_t j_done = 0;
