@@ -13,6 +13,8 @@ var framebuffer: uint64 = 0
 var back: uint64 = 0
 var accelerated: uint64 = 0
 
+const OFF_LEFT: uint64 = 0x8000000000000000
+
 var clip_left: uint64 = 0
 var clip_top: uint64 = 0
 var clip_right: uint64 = 0
@@ -108,9 +110,36 @@ export fn video_clear_clip() {
     clip_bottom = height
 }
 
+fn span_start(value: uint64, low: uint64) -> uint64 {
+    if (value >= OFF_LEFT || value < low) {
+        return low
+    }
+    return value
+}
+
+fn span_end(start: uint64, size: uint64, high: uint64) -> uint64 {
+    var edge: uint64 = start + size
+    if (edge >= OFF_LEFT) {
+        return 0
+    }
+    if (edge > high) {
+        return high
+    }
+    return edge
+}
+
 export fn video_visible(x: uint64, y: uint64, w: uint64, h: uint64) -> bool {
-    return x < clip_right && y < clip_bottom && x + w > clip_left &&
-           y + h > clip_top
+    return span_start(x, clip_left) < span_end(x, w, clip_right) &&
+           span_start(y, clip_top) < span_end(y, h, clip_bottom)
+}
+
+export fn video_inside(x: uint64, y: uint64, w: uint64, h: uint64) -> bool {
+    return x < OFF_LEFT && y < OFF_LEFT && x >= clip_left && y >= clip_top &&
+           x + w <= clip_right && y + h <= clip_bottom
+}
+
+export fn video_row(y: uint64) -> uint64 {
+    return back + y * width * 4
 }
 
 fn row_address(y: uint64) -> uint64 {
@@ -118,6 +147,9 @@ fn row_address(y: uint64) -> uint64 {
 }
 
 export fn video_pixel(x: uint64, y: uint64, color: uint32) {
+    if (x >= OFF_LEFT || y >= OFF_LEFT) {
+        return
+    }
     if (x < clip_left || y < clip_top || x >= clip_right || y >= clip_bottom) {
         return
     }
@@ -164,22 +196,10 @@ fn fill_span(start: uint64, count: uint64, color: uint32) {
 }
 
 export fn video_fill(x: uint64, y: uint64, w: uint64, h: uint64, color: uint32) {
-    var left: uint64 = x
-    var top: uint64 = y
-    var right: uint64 = x + w
-    var bottom: uint64 = y + h
-    if (left < clip_left) {
-        left = clip_left
-    }
-    if (top < clip_top) {
-        top = clip_top
-    }
-    if (right > clip_right) {
-        right = clip_right
-    }
-    if (bottom > clip_bottom) {
-        bottom = clip_bottom
-    }
+    var left: uint64 = span_start(x, clip_left)
+    var top: uint64 = span_start(y, clip_top)
+    var right: uint64 = span_end(x, w, clip_right)
+    var bottom: uint64 = span_end(y, h, clip_bottom)
     if (left >= right || top >= bottom) {
         return
     }

@@ -210,7 +210,7 @@ export fn svga_update(x: uint64, y: uint64, w: uint64, h: uint64) {
     push((uint32)y)
     push((uint32)w)
     push((uint32)h)
-    svga_sync()
+    write_register(REG_SYNC, 1)
 }
 
 export fn svga_fill(x: uint64, y: uint64, w: uint64, h: uint64, color: uint32) -> bool {

@@ -26,6 +26,7 @@ const ICON_WIDTH: uint64 = 80
 const ICON_HEIGHT: uint64 = 62
 const TILE: uint64 = 30
 const LAUNCHER_SLOTS: uint64 = 5
+const OFF_SCREEN: uint64 = 0x8000000000000000
 
 struct Launcher {
     label: cstring;
@@ -58,6 +59,15 @@ fn mark(x: uint64, y: uint64, w: uint64, h: uint64) {
     var top: uint64 = y
     var right: uint64 = x + w
     var bottom: uint64 = y + h
+    if (right >= OFF_SCREEN || bottom >= OFF_SCREEN) {
+        return
+    }
+    if (left >= OFF_SCREEN) {
+        left = 0
+    }
+    if (top >= OFF_SCREEN) {
+        top = 0
+    }
     if (right > video_width()) {
         right = video_width()
     }
@@ -503,7 +513,28 @@ fn press(x: uint64, y: uint64) {
     }
 }
 
-fn poll_mouse() {
+fn keep_reachable(id: uint64) {
+    var grab: int64 = 80
+    var left: int64 = window_x(id)
+    var top: int64 = window_y(id)
+    var lowest: int64 = grab - (int64)window_width(id)
+    var highest: int64 = (int64)video_width() - grab
+    if (left < lowest) {
+        left = lowest
+    }
+    if (left > highest) {
+        left = highest
+    }
+    if (top < 0) {
+        top = 0
+    }
+    if (top > (int64)work_height() - 8) {
+        top = (int64)work_height() - 8
+    }
+    window_place(id, left, top)
+}
+
+fn poll_mouse() -> bool {
     var moved: bool = mouse_take_motion()
     var down: uint64 = 0
     if (mouse_left_down()) {
@@ -526,10 +557,12 @@ fn poll_mouse() {
     if (moved && dragging < WINDOW_SLOTS) {
         mark_window(dragging)
         window_move(dragging, (int64)x - drag_x, (int64)y - drag_y)
+        keep_reachable(dragging)
         drag_x = (int64)x
         drag_y = (int64)y
         mark_window(dragging)
     }
+    return moved
 }
 
 fn poll_keys() {
@@ -563,17 +596,17 @@ export fn desktop_run() {
         software_cursor_show()
     }
     while (true) {
-        if (!cursor_on_gpu()) {
-            software_cursor_hide()
-        }
         poll_keys()
-        poll_mouse()
+        var moved: bool = poll_mouse()
         if (terminal_touched()) {
+            var first: uint64 = terminal_dirty_first()
+            var last: uint64 = terminal_dirty_last()
             terminal_settle()
             var id: uint64 = window_of_kind(KIND_TERMINAL)
             if (id < WINDOW_SLOTS && !window_hidden(id)) {
-                mark(window_content_x(id), window_content_y(id),
-                     window_content_width(id), window_content_height(id))
+                mark(window_content_x(id),
+                     window_content_y(id) + first * GLYPH_HEIGHT,
+                     window_content_width(id), (last - first) * GLYPH_HEIGHT)
             }
         }
         if (clock_ticks() / CLOCK_HZ != last_second) {
@@ -589,8 +622,13 @@ export fn desktop_run() {
                 mark_window(monitor)
             }
         }
+        var painting: bool = damage_right > damage_left
+        var shift: bool = !cursor_on_gpu() && (painting || moved)
+        if (shift) {
+            software_cursor_hide()
+        }
         flush()
-        if (!cursor_on_gpu()) {
+        if (shift) {
             software_cursor_show()
         }
         process_sleep(1)

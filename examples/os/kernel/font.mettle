@@ -9,11 +9,32 @@ fn glyph_rows(ch: uint8) -> uint8* {
     return (uint8*)(FONT_BASE + (uint64)ch * GLYPH_HEIGHT)
 }
 
+fn draw_glyph_fast(x: uint64, y: uint64, rows: uint8*, color: uint32) {
+    for row: uint64 in 0..GLYPH_HEIGHT {
+        var bits: uint8 = rows[row]
+        if (bits != 0) {
+            var line: uint32* = (uint32*)video_row(y + row)
+            if ((bits & 0x80) != 0) { line[x] = color }
+            if ((bits & 0x40) != 0) { line[x + 1] = color }
+            if ((bits & 0x20) != 0) { line[x + 2] = color }
+            if ((bits & 0x10) != 0) { line[x + 3] = color }
+            if ((bits & 0x08) != 0) { line[x + 4] = color }
+            if ((bits & 0x04) != 0) { line[x + 5] = color }
+            if ((bits & 0x02) != 0) { line[x + 6] = color }
+            if ((bits & 0x01) != 0) { line[x + 7] = color }
+        }
+    }
+}
+
 export fn font_draw_char(x: uint64, y: uint64, ch: uint8, color: uint32) {
     if (!video_visible(x, y, GLYPH_WIDTH, GLYPH_HEIGHT)) {
         return
     }
     var rows: uint8* = glyph_rows(ch)
+    if (video_inside(x, y, GLYPH_WIDTH, GLYPH_HEIGHT)) {
+        draw_glyph_fast(x, y, rows, color)
+        return
+    }
     for row: uint64 in 0..GLYPH_HEIGHT {
         var bits: uint8 = rows[row]
         if (bits != 0) {

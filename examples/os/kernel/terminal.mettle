@@ -17,7 +17,8 @@ var tints: uint8[2000]
 var column: uint64 = 0
 var row: uint64 = 0
 var tint: uint8 = 7
-var dirty: volatile uint64 = 1
+var dirty_first: volatile uint64 = 0
+var dirty_last: volatile uint64 = 25
 
 var keys: uint8[64]
 var head: volatile uint64 = 0
@@ -32,11 +33,34 @@ export fn terminal_pixel_height() -> uint64 {
 }
 
 export fn terminal_touched() -> bool {
-    return dirty != 0
+    return dirty_first < dirty_last
 }
 
 export fn terminal_settle() {
-    dirty = 0
+    dirty_first = TERMINAL_ROWS
+    dirty_last = 0
+}
+
+export fn terminal_dirty_first() -> uint64 {
+    return dirty_first
+}
+
+export fn terminal_dirty_last() -> uint64 {
+    return dirty_last
+}
+
+fn touch(line: uint64) {
+    if (line < dirty_first) {
+        dirty_first = line
+    }
+    if (line + 1 > dirty_last) {
+        dirty_last = line + 1
+    }
+}
+
+fn touch_all() {
+    dirty_first = 0
+    dirty_last = TERMINAL_ROWS
 }
 
 fn clear_row(index: uint64) {
@@ -52,10 +76,11 @@ export fn terminal_clear() {
     }
     column = 0
     row = 0
-    dirty = 1
+    touch_all()
 }
 
 fn scroll() {
+    touch_all()
     for i: uint64 in 0..(CELLS - TERMINAL_COLUMNS) {
         glyphs[i] = glyphs[i + TERMINAL_COLUMNS]
         tints[i] = tints[i + TERMINAL_COLUMNS]
@@ -73,9 +98,10 @@ fn break_line() {
 }
 
 export fn terminal_put(ch: uint8) {
-    dirty = 1
+    touch(row)
     if (ch == '\n') {
         break_line()
+        touch(row)
         return
     }
     if (ch == '\r') {
@@ -101,6 +127,7 @@ export fn terminal_put(ch: uint8) {
     if (column >= TERMINAL_COLUMNS) {
         break_line()
     }
+    touch(row)
 }
 
 export fn terminal_tint(value: uint8) {

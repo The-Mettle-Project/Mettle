@@ -14,9 +14,11 @@ const MODEM_READY: uint8 = 0x0b
 const TRANSMITTER_EMPTY: uint8 = 0x20
 const DIVISOR_115200: uint8 = 1
 
-const SPIN_LIMIT: uint64 = 200000
+const SPIN_LIMIT: uint64 = 4000
+const PATIENCE: uint64 = 8
 
 var ready: bool = false
+var stalls: uint64 = 0
 
 export fn serial_init() {
     port_out(COM1_INTERRUPT_ENABLE, 0)
@@ -35,6 +37,14 @@ fn emit(ch: uint8) {
            spins < SPIN_LIMIT) {
         spins++
     }
+    if (spins >= SPIN_LIMIT) {
+        stalls++
+        if (stalls >= PATIENCE) {
+            ready = false
+        }
+        return
+    }
+    stalls = 0
     port_out(COM1_DATA, ch)
 }
 
