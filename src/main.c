@@ -6278,6 +6278,7 @@ void print_usage(const char *program_name) {
          "always static\n");
   printf("  --musl              Rejected; owned runtime builds never link musl\n");
   printf("  --debug-compiler    Track compiler context for internal error reports\n");
+  printf("  -V, --version       Show version information\n");
   printf("  -h, --help          Show this help message\n");
   printf("\nExamples:\n");
   printf("  %s app.mettle -o app.obj\n", program_name);
