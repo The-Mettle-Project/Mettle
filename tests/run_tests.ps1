@@ -493,6 +493,12 @@ $cases = @(
     Pattern       = "unknown instruction"
   },
   @{
+    Name          = "closure_captures_array_rejected"
+    Path          = "tests/err_closure_captures_array.mettle"
+    ShouldSucceed = $false
+    Pattern       = "cannot be captured by value"
+  },
+  @{
     Name          = "naked_body_must_be_asm"
     Path          = "tests/err_naked_has_statements.mettle"
     ShouldSucceed = $false
@@ -1611,6 +1617,9 @@ $cases = @(
   # past the count is touched. The vectorizer tests all use round lengths, so
   # the tail path went unexercised across the whole family.
   @{ Name = "simd_inplace_tails"; Path = "tests/test_simd_inplace_tails.mettle"; ShouldSucceed = $true },
+  # What a closure may capture. A struct of any size and a string copy whole;
+  # an array does not travel by value and used to yield pointer fragments.
+  @{ Name = "closure_capture_aggregates"; Path = "tests/test_closure_capture_aggregates.mettle"; ShouldSucceed = $true },
   # METTLE_NO_SIMD=1 turns the vectorizers off. It skipped EVERY pass instead,
   # which left the loop canonical form unestablished while its checker still
   # ran, so a local declared inside a loop became an internal compiler error.

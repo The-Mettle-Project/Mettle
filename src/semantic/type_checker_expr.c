@@ -2010,6 +2010,30 @@ static Type *type_checker_infer_lambda(TypeChecker *checker,
                  lam->return_type ? lam->return_type : "void");
     }
 
+    /* A capture becomes a field of the environment struct and the constructor
+     * takes it by value. An array does not travel that way here: it decays to
+     * a pointer at every by-value boundary, so the field received an address
+     * and the body then read that address as elements. `arr[0]` came back as a
+     * fragment of the pointer, with no diagnostic at all. A struct of any size
+     * and a string both copy whole and are unaffected. */
+    for (size_t i = 0; i < lam->captured_count; i++) {
+      Type *captured = (lam->captured_types && lam->captured_types[i])
+                           ? type_checker_get_type_by_name(
+                                 checker, lam->captured_types[i])
+                           : NULL;
+      if (captured && captured->kind == TYPE_ARRAY) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "Closure captures array '%s'; an array cannot be captured by "
+            "value. Capture a pointer to its first element, or hold it in a "
+            "struct",
+            lam->captured_names && lam->captured_names[i]
+                ? lam->captured_names[i]
+                : "?");
+        return NULL;
+      }
+    }
+
     if (lam->captured_count > 0) {
       Type **ptypes = NULL;
       if (lam->parameter_count > 0) {

@@ -1,0 +1,59 @@
+// What a closure may capture, and the two ways to carry an array into one.
+// A struct of any size and a string copy whole; an array does not travel by
+// value at all and is rejected (see err_closure_captures_array).
+
+struct S8 { a: int32; b: int32; }
+struct S24 { a: int64; b: int64; c: int64; }
+struct Holder { v: int32[4]; n: int32; }
+
+fn main() -> int32 {
+  // A struct that fits in a register.
+  var s8: S8;
+  s8.a = 1;
+  s8.b = 2;
+  var f8: Fn() -> int32 = fn() -> int32 { return s8.a + s8.b; };
+  if (f8() != 3) { return 1; }
+
+  // A struct that does not.
+  var s24: S24;
+  s24.a = 10;
+  s24.b = 20;
+  s24.c = 30;
+  var f24: Fn() -> int64 = fn() -> int64 { return s24.a + s24.b + s24.c; };
+  if (f24() != 60) { return 2; }
+
+  // The capture is a copy: writing the original must not reach the closure.
+  s8.a = 99;
+  if (f8() != 3) { return 3; }
+
+  // A string.
+  var text: string = "hello";
+  var flen: Fn() -> uint64 = fn() -> uint64 { return text.length; };
+  if (flen() != (uint64)5) { return 4; }
+
+  // First way to carry an array in: capture a pointer to its first element.
+  var arr: int32[4];
+  for i in 0..4 { arr[i] = i + 1; }
+  var p: int32* = &arr[0];
+  var viaptr: Fn(int32) -> int32 = fn(i: int32) -> int32 { return p[i]; };
+  if (viaptr(0) != 1) { return 5; }
+  if (viaptr(3) != 4) { return 6; }
+
+  // Through a pointer the closure sees later writes, unlike a by-value capture.
+  arr[0] = 77;
+  if (viaptr(0) != 77) { return 7; }
+
+  // Second way: hold it in a struct, which copies whole.
+  var h: Holder;
+  for i in 0..4 { h.v[i] = i + 10; }
+  h.n = 4;
+  var viastruct: Fn(int32) -> int32 = fn(i: int32) -> int32 { return h.v[i]; };
+  if (viastruct(0) != 10) { return 8; }
+  if (viastruct(3) != 13) { return 9; }
+
+  // That one IS a copy, so the original may move without the closure noticing.
+  h.v[0] = 88;
+  if (viastruct(0) != 10) { return 10; }
+
+  return 0;
+}
