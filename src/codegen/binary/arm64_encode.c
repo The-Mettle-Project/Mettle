@@ -272,6 +272,16 @@ uint32_t arm64_fcvtzs(int is_double, Arm64Reg xd, int fn) {
   uint32_t base = is_double ? 0x9E780000u : 0x9E380000u;
   return base | (R5(fn) << 5) | R5(xd);
 }
+/* UCVTF: unsigned int (Xn) -> fp (Dd). 64-bit source. */
+uint32_t arm64_ucvtf(int is_double, int fd, Arm64Reg xn) {
+  uint32_t base = is_double ? 0x9E630000u : 0x9E230000u;
+  return base | (R5(xn) << 5) | R5(fd);
+}
+/* FCVTZU: fp (Dn) -> unsigned int (Xd), round toward zero. 64-bit dest. */
+uint32_t arm64_fcvtzu(int is_double, Arm64Reg xd, int fn) {
+  uint32_t base = is_double ? 0x9E790000u : 0x9E390000u;
+  return base | (R5(fn) << 5) | R5(xd);
+}
 /* FCVT: convert precision. to_double: s->d (0x1E22C000); else d->s (0x1E624000). */
 uint32_t arm64_fcvt(int to_double, int fd, int fn) {
   uint32_t base = to_double ? 0x1E22C000u : 0x1E624000u;

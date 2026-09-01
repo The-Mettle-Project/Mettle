@@ -1573,12 +1573,16 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
     *out = ii_int_value(ii_as_int(in));
     return 1;
   }
-  if (strcmp(type, "float64") == 0) {
-    *out = ii_float_value(ii_as_float(in));
-    return 1;
-  }
-  if (strcmp(type, "float32") == 0) {
-    *out = ii_float_value((double)(float)ii_as_float(in));
+  /* is_unsigned on a CAST says the SOURCE is an unsigned integer, so a value
+   * with bit 63 set is a large positive number and not a negative one. */
+  if (strcmp(type, "float64") == 0 || strcmp(type, "float32") == 0) {
+    double d;
+    if (!in->is_float && insn->is_unsigned) {
+      d = (double)(unsigned long long)in->i;
+    } else {
+      d = ii_as_float(in);
+    }
+    *out = ii_float_value(strcmp(type, "float32") == 0 ? (double)(float)d : d);
     return 1;
   }
   int size = 0, target_unsigned = 0;
@@ -1613,7 +1617,15 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
   if (in->is_float) {
     /* Float -> int: truncate toward zero; x86 cvtt sentinel on overflow/NaN. */
     double d = in->f;
-    if (size == 8 || size == 4) {
+    if (size == 8 && target_unsigned) {
+      /* A uint64 target reaches 2^64, and the backend biases the value down
+       * rather than letting the signed truncation answer its sentinel. */
+      if (!(d >= 0.0 && d < 18446744073709551616.0)) {
+        v = LLONG_MIN;
+      } else {
+        v = (long long)(unsigned long long)d;
+      }
+    } else if (size == 8 || size == 4) {
       double lo = size == 8 ? -9223372036854775808.0 : -2147483648.0;
       double hi = size == 8 ? 9223372036854775808.0 : 2147483648.0;
       if (!(d >= lo && d < hi)) {

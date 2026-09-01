@@ -2807,6 +2807,16 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
     instruction.lhs = operand;
     instruction.text = (char *)ir_backend_type_name(cast_expr->type_name);
     instruction.is_float = ir_expression_is_floating(context, cast_operand);
+    /* is_unsigned on a CAST records that the SOURCE is an unsigned integer,
+     * the same way float_bits records the source's float width. x86-64 and
+     * AArch64 both convert a 64-bit integer to floating point as SIGNED
+     * unless told otherwise, so without this `(float64)(uint64)~0` answered
+     * -1.0. Only the backends that convert read it; the narrowing paths take
+     * their signedness from the target type in instruction->text. */
+    instruction.is_unsigned =
+        !instruction.is_float &&
+        ir_type_is_unsigned_integer(
+            ir_infer_expression_type(context, cast_operand));
     if (instruction.is_float) {
       /* float_bits on a CAST records the SOURCE operand width so the backend
        * can pick cvttss2si/cvtss2sd (f32) vs cvttsd2si (f64). The TARGET

@@ -4213,12 +4213,22 @@ static int mir_lower_cast(MirFunction *fn, CodeGenerator *g,
     int dfb = code_generator_binary_operand_float_bits(g, ctx, &in->dest);
     int sfb = code_generator_binary_operand_float_bits(g, ctx, &in->lhs);
     if (dfb && !sfb) {
-      /* int -> float */
-      return mir_emit1(fn, MIR_CVTSI2F, dst, a, mir_op_none(), dfb / 8, 0, 0);
+      /* int -> float. is_unsigned carries the SOURCE's signedness (set by IR
+       * lowering); an unsigned source needs the halve-convert-double sequence
+       * because the machine's conversion is signed. */
+      return mir_emit1(fn, MIR_CVTSI2F, dst, a, mir_op_none(), dfb / 8,
+                       in->is_unsigned ? 1 : 0, 0);
     }
     if (!dfb && sfb) {
-      /* float -> int (truncating); width selects cvttsd2si vs cvttss2si. */
-      return mir_emit1(fn, MIR_CVTF2SI, dst, a, mir_op_none(), sfb / 8, 0, 0);
+      /* float -> int (truncating); width selects cvttsd2si vs cvttss2si.
+       * A uint64 target needs the bias sequence: the machine's truncation is
+       * signed and answers its sentinel for anything at or above 2^63. */
+      MtlcType *tt = (in->text && g->ir_program)
+                     ? code_generator_named_type(g, in->text)
+                     : NULL;
+      int to_u64 = tt && tt->kind == MTLC_TYPE_UINT64;
+      return mir_emit1(fn, MIR_CVTF2SI, dst, a, mir_op_none(), sfb / 8,
+                       to_u64 ? 1 : 0, 0);
     }
     if (dfb && sfb) {
       /* float -> float; same width is just a copy, else cvtsd2ss/cvtss2sd. */

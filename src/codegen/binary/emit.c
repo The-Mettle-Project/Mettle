@@ -3142,6 +3142,137 @@ int code_generator_binary_emit_new(CodeGenerator *generator,
   return 1;
 }
 
+/* destination = (float)(uint64)source. x86-64 has no unsigned integer-to-float
+ * instruction below AVX-512, so a source with bit 63 set has to be halved,
+ * converted, and doubled. Halving with the low bit ORed back in (round to odd)
+ * keeps the one rounding the conversion is allowed, which the plainer
+ * "subtract 2^63, convert, add it back" can round twice.
+ *
+ * `work` and `odd` are scratch registers the caller owns; `source` is left
+ * alone unless it is `work`. */
+int code_generator_binary_emit_unsigned_int_to_float(
+    BinaryFunctionContext *context, int float_bits,
+    BinaryXmmRegister destination, BinaryGpRegister source,
+    BinaryGpRegister work, BinaryGpRegister odd) {
+  size_t to_negative = 0;
+  size_t to_done = 0;
+
+  if (!context || work == odd || source == odd) {
+    return 0;
+  }
+  if (source != work && !binary_emit_mov_reg_reg(&context->code, work, source)) {
+    return 0;
+  }
+  /* js: bit 63 set means the value does not fit a signed conversion. */
+  if (!binary_emit_test_reg_reg(&context->code, work) ||
+      !binary_emit_jcc_placeholder(&context->code, 0x88, &to_negative)) {
+    return 0;
+  }
+  if (float_bits == 32) {
+    if (!binary_emit_cvtsi2ss_xmm_reg(&context->code, destination, work)) {
+      return 0;
+    }
+  } else if (!binary_emit_cvtsi2sd_xmm_reg(&context->code, destination, work)) {
+    return 0;
+  }
+  if (!binary_emit_jmp_placeholder(&context->code, &to_done) ||
+      !binary_function_context_patch_rel32(context, to_negative,
+                                           context->code.size)) {
+    return 0;
+  }
+  /* odd = work & 1; work = (work >> 1) | odd; convert; double. */
+  if (!binary_emit_mov_reg_reg(&context->code, odd, work) ||
+      !binary_emit_alu_reg_imm32(&context->code, 4, odd, 1u) ||
+      !binary_emit_shift_reg_imm8(&context->code, 5, work, 1) ||
+      !binary_emit_alu_reg_reg(&context->code, 0x09, work, odd)) {
+    return 0;
+  }
+  if (float_bits == 32) {
+    if (!binary_emit_cvtsi2ss_xmm_reg(&context->code, destination, work) ||
+        !binary_emit_addss_xmm_xmm(&context->code, destination, destination)) {
+      return 0;
+    }
+  } else if (!binary_emit_cvtsi2sd_xmm_reg(&context->code, destination, work) ||
+             !binary_emit_addsd_xmm_xmm(&context->code, destination,
+                                        destination)) {
+    return 0;
+  }
+  return binary_function_context_patch_rel32(context, to_done,
+                                             context->code.size);
+}
+
+/* destination = (uint64)truncate(source). cvttsd2si is signed: anything at or
+ * above 2^63 comes back as the integer-indefinite sentinel. Above that
+ * threshold, subtract 2^63 before converting and put the bit back afterwards.
+ *
+ * `work` and `scratch` are scratch registers the caller owns; `source` is left
+ * alone. `destination` may be `work`. */
+int code_generator_binary_emit_float_to_unsigned_int(
+    BinaryFunctionContext *context, int float_bits,
+    BinaryGpRegister destination, BinaryXmmRegister source,
+    BinaryGpRegister work, BinaryXmmRegister scratch) {
+  /* 2^63 and -2^63 as float32 / float64 bit patterns. */
+  uint64_t bias = (float_bits == 32) ? 0x5F000000ull : 0x43E0000000000000ull;
+  uint64_t minus_bias = (float_bits == 32) ? 0xDF000000ull
+                                           : 0xC3E0000000000000ull;
+  size_t to_small = 0;
+  size_t to_done = 0;
+
+  if (!context || source == scratch) {
+    return 0;
+  }
+  if (!binary_emit_mov_reg_imm64(&context->code, work, bias)) {
+    return 0;
+  }
+  if (float_bits == 32) {
+    if (!binary_emit_movd_xmm_reg(&context->code, scratch, work) ||
+        !binary_emit_ucomiss_xmm_xmm(&context->code, source, scratch)) {
+      return 0;
+    }
+  } else if (!binary_emit_movq_xmm_reg(&context->code, scratch, work) ||
+             !binary_emit_ucomisd_xmm_xmm(&context->code, source, scratch)) {
+    return 0;
+  }
+  /* jb takes the signed path; an unordered compare sets CF too, so NaN lands
+   * there and keeps the sentinel a signed conversion would have produced. */
+  if (!binary_emit_jcc_placeholder(&context->code, 0x82, &to_small)) {
+    return 0;
+  }
+  if (!binary_emit_mov_reg_imm64(&context->code, work, minus_bias)) {
+    return 0;
+  }
+  if (float_bits == 32) {
+    if (!binary_emit_movd_xmm_reg(&context->code, scratch, work) ||
+        !binary_emit_addss_xmm_xmm(&context->code, scratch, source) ||
+        !binary_emit_cvttss2si_reg_xmm(&context->code, destination, scratch)) {
+      return 0;
+    }
+  } else if (!binary_emit_movq_xmm_reg(&context->code, scratch, work) ||
+             !binary_emit_addsd_xmm_xmm(&context->code, scratch, source) ||
+             !binary_emit_cvttsd2si_reg_xmm(&context->code, destination,
+                                            scratch)) {
+    return 0;
+  }
+  /* The difference is below 2^63, so its top bit is clear and xor sets it. */
+  if (!binary_emit_mov_reg_imm64(&context->code, work, 0x8000000000000000ull) ||
+      !binary_emit_alu_reg_reg(&context->code, 0x31, destination, work) ||
+      !binary_emit_jmp_placeholder(&context->code, &to_done) ||
+      !binary_function_context_patch_rel32(context, to_small,
+                                           context->code.size)) {
+    return 0;
+  }
+  if (float_bits == 32) {
+    if (!binary_emit_cvttss2si_reg_xmm(&context->code, destination, source)) {
+      return 0;
+    }
+  } else if (!binary_emit_cvttsd2si_reg_xmm(&context->code, destination,
+                                            source)) {
+    return 0;
+  }
+  return binary_function_context_patch_rel32(context, to_done,
+                                             context->code.size);
+}
+
 int code_generator_binary_emit_cast(CodeGenerator *generator,
                                            BinaryFunctionContext *context,
                                            const IRInstruction *instruction) {
@@ -3189,31 +3320,59 @@ int code_generator_binary_emit_cast(CodeGenerator *generator,
 
   if (instruction->is_float && !target_is_float) {
     /* float -> int: truncate at the SOURCE precision. */
+    int to_u64 = target_is_unsigned && target_size == 8;
     if (src_fbits == 32) {
       if (!binary_emit_movd_xmm_reg(&context->code, BINARY_XMM0,
-                                    BINARY_GP_RAX) ||
-          !binary_emit_cvttss2si_reg_xmm(&context->code, BINARY_GP_RAX,
-                                         BINARY_XMM0)) {
+                                    BINARY_GP_RAX)) {
+        goto emit_failure;
+      }
+      if (to_u64) {
+        if (!code_generator_binary_emit_float_to_unsigned_int(
+                context, 32, BINARY_GP_RAX, BINARY_XMM0, BINARY_GP_R10,
+                BINARY_XMM1)) {
+          goto emit_failure;
+        }
+      } else if (!binary_emit_cvttss2si_reg_xmm(&context->code, BINARY_GP_RAX,
+                                                BINARY_XMM0)) {
         goto emit_failure;
       }
     } else if (!binary_emit_movq_xmm_reg(&context->code, BINARY_XMM0,
-                                         BINARY_GP_RAX) ||
-               !binary_emit_cvttsd2si_reg_xmm(&context->code, BINARY_GP_RAX,
+                                         BINARY_GP_RAX)) {
+      goto emit_failure;
+    } else if (to_u64) {
+      if (!code_generator_binary_emit_float_to_unsigned_int(
+              context, 64, BINARY_GP_RAX, BINARY_XMM0, BINARY_GP_R10,
+              BINARY_XMM1)) {
+        goto emit_failure;
+      }
+    } else if (!binary_emit_cvttsd2si_reg_xmm(&context->code, BINARY_GP_RAX,
                                               BINARY_XMM0)) {
       goto emit_failure;
     }
   } else if (!instruction->is_float && target_is_float) {
     /* int -> float: produce a value at the TARGET precision. */
-    if (dst_fbits == 32) {
+    int bits = (dst_fbits == 32) ? 32 : 64;
+    if (instruction->is_unsigned) {
+      if (!code_generator_binary_emit_unsigned_int_to_float(
+              context, bits, BINARY_XMM0, BINARY_GP_RAX, BINARY_GP_R10,
+              BINARY_GP_R11)) {
+        goto emit_failure;
+      }
+    } else if (bits == 32) {
       if (!binary_emit_cvtsi2ss_xmm_reg(&context->code, BINARY_XMM0,
-                                        BINARY_GP_RAX) ||
-          !binary_emit_movd_reg_xmm(&context->code, BINARY_GP_RAX,
-                                    BINARY_XMM0)) {
+                                        BINARY_GP_RAX)) {
         goto emit_failure;
       }
     } else if (!binary_emit_cvtsi2sd_xmm_reg(&context->code, BINARY_XMM0,
-                                             BINARY_GP_RAX) ||
-               !binary_emit_movq_reg_xmm(&context->code, BINARY_GP_RAX,
+                                             BINARY_GP_RAX)) {
+      goto emit_failure;
+    }
+    if (bits == 32) {
+      if (!binary_emit_movd_reg_xmm(&context->code, BINARY_GP_RAX,
+                                    BINARY_XMM0)) {
+        goto emit_failure;
+      }
+    } else if (!binary_emit_movq_reg_xmm(&context->code, BINARY_GP_RAX,
                                          BINARY_XMM0)) {
       goto emit_failure;
     }

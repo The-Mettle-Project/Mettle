@@ -1,0 +1,56 @@
+// CSE records "this expression is already available in that place". The place
+// counts as much as the operands: `-3.5 -> @fy` survived a store through
+// `&fy`, and a later `-3.5` was rewritten into a read of @fy, which by then
+// held something else. Only the store list saw the operands, so an entry whose
+// VALUE was the aliased symbol was never invalidated and never even listed.
+//
+// Two instantiations of the same generic put two inlined bodies in one
+// function, which is what let the constant survive far enough to be reused.
+
+fn swap_through<T>(a: T*, b: T*) -> void {
+  var t: T = *a;
+  *a = *b;
+  *b = t;
+}
+
+@noinline fn overwrite(p: float64*, v: float64) -> void { *p = v; }
+@noinline fn overwrite_i(p: int32*, v: int32) -> void { *p = v; }
+
+fn main() -> int32 {
+  var fx: float64 = 1.25;
+  var fy: float64 = -3.5;
+  swap_through<float64>(&fx, &fy);
+  if (fx != -3.5 || fy != 1.25) { return 1; }
+
+  var ix: int32 = 7;
+  var iy: int32 = 250;
+  swap_through<int32>(&ix, &iy);
+  if (ix != 250 || iy != 7) { return 2; }
+
+  // The same shape without generics: a constant assigned to an address-taken
+  // local, the local written through the pointer, then the constant used.
+  var a: float64 = 8.25;
+  var pa: float64* = &a;
+  overwrite(pa, 99.5);
+  if (a != 99.5) { return 3; }
+  var b: float64 = 8.25;
+  if (b != 8.25) { return 4; }
+  if (a == b) { return 5; }
+
+  var n: int32 = 4242;
+  var pn: int32* = &n;
+  overwrite_i(pn, -1);
+  if (n != -1) { return 6; }
+  var m: int32 = 4242;
+  if (m != 4242) { return 7; }
+  if (n == m) { return 8; }
+
+  // The constant reused after the aliasing store must still be the constant.
+  var c: int32 = 11;
+  var pc: int32* = &c;
+  overwrite_i(pc, 12);
+  var d: int32 = 11;
+  if (c != 12 || d != 11) { return 9; }
+
+  return 0;
+}

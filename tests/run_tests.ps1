@@ -1580,6 +1580,14 @@ $cases = @(
   @{ Name = "signed_comparison"; Path = "tests/test_signed_comparison.mettle"; ShouldSucceed = $true },
   @{ Name = "float_negative_comparison"; Path = "tests/test_float_negative_comparison.mettle"; ShouldSucceed = $true },
   @{ Name = "signed_wraparound"; Path = "tests/test_signed_wraparound.mettle"; ShouldSucceed = $true },
+  # Both machine conversions between float and a 64-bit integer are signed:
+  # (float64)(uint64)~0 answered -1.0, and (uint64)1e19 answered the
+  # integer-indefinite sentinel. Each direction needs a bias sequence.
+  @{ Name = "unsigned_float_conversion"; Path = "tests/test_unsigned_float_conversion.mettle"; ShouldSucceed = $true },
+  # CSE invalidated an entry by its operands but not by the place the value
+  # lives in, so a constant held in an address-taken local outlived a store
+  # through that address and was reused as a stale read.
+  @{ Name = "cse_value_through_alias"; Path = "tests/test_cse_value_through_alias.mettle"; ShouldSucceed = $true },
   @{ Name = "signed_arithmetic"; Path = "tests/test_signed_arithmetic.mettle"; ShouldSucceed = $true },
   @{
     Name          = "sign_extension"

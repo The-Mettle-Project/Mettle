@@ -1307,8 +1307,17 @@ static int encode_cvtsi2f(MirFunction *fn, const MirInst *in) {
   }
   BinaryXmmRegister D;
   BinaryXmmRegister target = dst_is_xmm_reg(fn, &in->dst, &D) ? D : FSCRATCH_A;
-  int done = (in->width == 4) ? binary_emit_cvtsi2ss_xmm_reg(code, target, areg)
-                              : binary_emit_cvtsi2sd_xmm_reg(code, target, areg);
+  int done;
+  if (in->is_unsigned) {
+    /* Unsigned source: the machine's conversion is signed, so a value with bit
+     * 63 set has to be halved, converted, and doubled. */
+    done = code_generator_binary_emit_unsigned_int_to_float(
+        fn->context, in->width == 4 ? 32 : 64, target, areg, SCRATCH_A,
+        SCRATCH_B);
+  } else {
+    done = (in->width == 4) ? binary_emit_cvtsi2ss_xmm_reg(code, target, areg)
+                            : binary_emit_cvtsi2sd_xmm_reg(code, target, areg);
+  }
   if (!done) {
     return enc_err(fn, "out of memory in cvtsi2f");
   }
@@ -1326,8 +1335,18 @@ static int encode_cvtf2si(MirFunction *fn, const MirInst *in) {
   }
   BinaryGpRegister D;
   BinaryGpRegister target = dst_is_reg(fn, &in->dst, &D) ? D : SCRATCH_A;
-  int done = (in->width == 4) ? binary_emit_cvttss2si_reg_xmm(code, target, xval)
-                              : binary_emit_cvttsd2si_reg_xmm(code, target, xval);
+  int done;
+  if (in->is_unsigned) {
+    /* uint64 target: signed truncation answers its sentinel from 2^63 up, so
+     * bias the value down, truncate, and put the top bit back. */
+    done = code_generator_binary_emit_float_to_unsigned_int(
+        fn->context, in->width == 4 ? 32 : 64, target, xval, SCRATCH_B,
+        FSCRATCH_B);
+  } else {
+    done = (in->width == 4)
+               ? binary_emit_cvttss2si_reg_xmm(code, target, xval)
+               : binary_emit_cvttsd2si_reg_xmm(code, target, xval);
+  }
   if (!done) {
     return enc_err(fn, "out of memory in cvtf2si");
   }
