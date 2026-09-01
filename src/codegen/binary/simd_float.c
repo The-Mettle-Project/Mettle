@@ -2434,6 +2434,37 @@ static int exp_fill_pool(BinaryCodeBuffer *b) {
   return 1;
 }
 
+/* RCX has passed end-32, so 1..7 elements are left. Put that count in R8 and
+ * jump to `tail`, which the caller patches to its n<8 gather/scatter path.
+ *
+ * Both in-place float kernels used to clamp RCX back to end-32 here and run
+ * one more full vector, overlapping elements the loop had already done. That
+ * is sound for a map into a separate destination; these write over their own
+ * input, so the overlap applied the kernel twice. RDX needs no adjustment
+ * because it advanced in lockstep with RCX. */
+static int simd_tail_count_to_r8(BinaryCodeBuffer *b, size_t *tail) {
+  return binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_R10, 0 /* add */, 32) &&
+         wcs_sub_reg_reg64(b, BINARY_GP_R10, BINARY_GP_RCX) &&
+         binary_emit_shift_reg_imm8(b, 5 /* shr */, BINARY_GP_R10, 2) &&
+         binary_emit_mov_reg_reg(b, BINARY_GP_R8, BINARY_GP_R10) &&
+         wcs_jcc(b, 0, tail);
+}
+
+/* One 8-wide exp at [RCX], then the loop's two exits: `done_main` when RCX has
+ * reached end-32 and this was the last whole vector, otherwise advance 32 and
+ * take `noclamp` unless that step left a partial tail. */
+static int simd_exp_step(BinaryCodeBuffer *b, size_t *done_main,
+                         size_t *noclamp) {
+  return wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) && exp_compute(b) &&
+         wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RCX, 0, 2) &&
+         binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) &&
+         wcs_jcc(b, 0x83 /* jae */, done_main) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) &&
+         binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) &&
+         wcs_jcc(b, 0x86 /* jbe */, noclamp);
+}
+
 /* IR_OP_SIMD_EXP_F32: in-place a[i] = exp(a[i]) over a float32 array.
  * dest = array base, arguments[0] = element count. */
 int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
@@ -2476,26 +2507,11 @@ int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
     return 0;
   }
   loop_top = b->size;
-  if (!wcs_avx_vmovups_ymm_mem(b, 0, BINARY_GP_RCX, 0) || !exp_compute(b) ||
-      !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RCX, 0, 2) ||
-      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
-      !wcs_jcc(b, 0x83 /* jae */, &done_main) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
-      !binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
-      !wcs_jcc(b, 0x86 /* jbe */, &noclamp)) {
+  if (!simd_exp_step(b, &done_main, &noclamp)) {
     return 0;
   }
-  /* Past end-32 means a partial tail of 1..7. Clamping back to end-32 and
-   * running one more full vector would reprocess the overlap, and this kernel
-   * is in-place -- a[i] = exp(a[i]) -- so those elements came back as
-   * exp(exp(x)). R8 = (end - RCX) / 4 sends the remainder to the gather path
-   * the n < 8 case uses, which touches each element once. */
-  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_R10, 0 /* add */, 32) ||
-      !wcs_sub_reg_reg64(b, BINARY_GP_R10, BINARY_GP_RCX) ||
-      !binary_emit_shift_reg_imm8(b, 5 /* shr */, BINARY_GP_R10, 2) ||
-      !binary_emit_mov_reg_reg(b, BINARY_GP_R8, BINARY_GP_R10) ||
-      !wcs_jcc(b, 0, &tail)) {
+  /* In-place: an overlapped element came back as exp(exp(x)). */
+  if (!simd_tail_count_to_r8(b, &tail)) {
     return 0;
   }
   if (!wcs_patch_here(b, noclamp)) {
@@ -2669,29 +2685,13 @@ int code_generator_binary_emit_simd_silu_f32_inline(BinaryCodeBuffer *b,
   if (has_mul && !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
     return 0;
   }
-  /* RCX past end-32 means a partial tail of 1..7 elements.
-   *
-   * This used to clamp RCX back to end-32 and run one more full vector, so the
-   * final vector overlapped elements the loop had already done. That is sound
-   * for a map into a SEPARATE destination, where recomputing f(x) and storing
-   * it again lands the same bytes. This kernel writes over its own input --
-   * g[i] = silu(g[i]) * u[i] -- so an overlapped element had silu applied
-   * twice. For n = 11, elements 3..7 came back as silu(silu(x)) * u * u, and
-   * exactly 8 - (n % 8) elements were wrong for every n > 8 that is not a
-   * multiple of 8. Send the remainder through the gather/scatter path the
-   * n < 8 case already uses, which touches each element once. */
   if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
       !wcs_jcc(b, 0x86 /* jbe */, &noclamp)) {
     return 0;
   }
-  /* R8 = (end - RCX) / 4, where end is R9 + 32. RDX already advanced in
-   * lockstep with RCX, so it needs no adjustment. */
-  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_R10, 0 /* add */, 32) ||
-      !wcs_sub_reg_reg64(b, BINARY_GP_R10, BINARY_GP_RCX) ||
-      !binary_emit_shift_reg_imm8(b, 5 /* shr */, BINARY_GP_R10, 2) ||
-      !binary_emit_mov_reg_reg(b, BINARY_GP_R8, BINARY_GP_R10) ||
-      !wcs_jcc(b, 0, &tail)) {
+  /* In-place: an overlapped element came back as silu(silu(x)) * u * u. For
+   * n = 11 that was elements 3..7, a 57% error on the first of them. */
+  if (!simd_tail_count_to_r8(b, &tail)) {
     return 0;
   }
   if (!wcs_patch_here(b, noclamp)) {
