@@ -700,6 +700,44 @@ mir_shared_append:
   cg_time_end("shared append", cg_t);
   return 1;
 }
+static size_t *code_generator_binary_pgo_emit_order(
+    CodeGenerator *generator, size_t function_count) {
+  size_t *emit_order = NULL;
+
+if (ir_pgo_enabled() && function_count > 1) {
+  emit_order = (size_t *)malloc(function_count * sizeof(size_t));
+  long long *heat = (long long *)malloc(function_count * sizeof(long long));
+  if (emit_order && heat) {
+    for (size_t i = 0; i < function_count; i++) {
+      emit_order[i] = i;
+      IRFunction *fn = generator->ir_program->functions[i];
+      heat[i] = (fn && fn->name && strcmp(fn->name, "main") == 0)
+                    ? LLONG_MAX
+                    : (fn && fn->name ? ir_pgo_callee_calls(fn->name) : 0);
+    }
+    /* Stable insertion sort of the function indices by heat, descending:
+     * ties (and cold/-1) keep declaration order. */
+    for (size_t i = 1; i < function_count; i++) {
+      size_t slot = emit_order[i];
+      long long h = heat[i];
+      size_t j = i;
+      while (j > 0 && heat[j - 1] < h) {
+        emit_order[j] = emit_order[j - 1];
+        heat[j] = heat[j - 1];
+        j--;
+      }
+      emit_order[j] = slot;
+      heat[j] = h;
+    }
+  } else {
+    free(emit_order);
+    emit_order = NULL;
+  }
+  free(heat);
+}
+  return emit_order;
+}
+
 int code_generator_generate_program_binary_object(CodeGenerator *generator) {
   if (!generator) {
     return 0;
@@ -731,38 +769,8 @@ int code_generator_generate_program_binary_object(CodeGenerator *generator) {
    * interpretation of main(), no training run. Without a profile the order is
    * untouched. */
   size_t function_count = generator->ir_program->function_count;
-  size_t *emit_order = NULL;
-  if (ir_pgo_enabled() && function_count > 1) {
-    emit_order = (size_t *)malloc(function_count * sizeof(size_t));
-    long long *heat = (long long *)malloc(function_count * sizeof(long long));
-    if (emit_order && heat) {
-      for (size_t i = 0; i < function_count; i++) {
-        emit_order[i] = i;
-        IRFunction *fn = generator->ir_program->functions[i];
-        heat[i] = (fn && fn->name && strcmp(fn->name, "main") == 0)
-                      ? LLONG_MAX
-                      : (fn && fn->name ? ir_pgo_callee_calls(fn->name) : 0);
-      }
-      /* Stable insertion sort of the function indices by heat, descending:
-       * ties (and cold/-1) keep declaration order. */
-      for (size_t i = 1; i < function_count; i++) {
-        size_t slot = emit_order[i];
-        long long h = heat[i];
-        size_t j = i;
-        while (j > 0 && heat[j - 1] < h) {
-          emit_order[j] = emit_order[j - 1];
-          heat[j] = heat[j - 1];
-          j--;
-        }
-        emit_order[j] = slot;
-        heat[j] = h;
-      }
-    } else {
-      free(emit_order);
-      emit_order = NULL;
-    }
-    free(heat);
-  }
+  size_t *emit_order =
+      code_generator_binary_pgo_emit_order(generator, function_count);
 
   for (size_t i = 0; i < function_count; i++) {
     IRFunction *ir_function =

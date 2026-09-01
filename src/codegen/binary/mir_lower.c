@@ -4197,6 +4197,43 @@ static int mir_lower_unary(MirFunction *fn, CodeGenerator *g,
   return 0;
 }
 
+static int mir_lower_cast_across_banks(MirFunction *fn, CodeGenerator *g,
+                                       BinaryFunctionContext *ctx,
+                                       const IRInstruction *in,
+                                       MirOperand dst, MirOperand a,
+                                       int *crossed) {
+  *crossed = 1;
+  int dfb = code_generator_binary_operand_float_bits(g, ctx, &in->dest);
+  int sfb = code_generator_binary_operand_float_bits(g, ctx, &in->lhs);
+  if (dfb && !sfb) {
+    /* int -> float. is_unsigned carries the SOURCE's signedness (set by IR
+     * lowering); an unsigned source needs the halve-convert-double sequence
+     * because the machine's conversion is signed. */
+    return mir_emit1(fn, MIR_CVTSI2F, dst, a, mir_op_none(), dfb / 8,
+                     in->is_unsigned ? 1 : 0, 0);
+  }
+  if (!dfb && sfb) {
+    /* float -> int (truncating); width selects cvttsd2si vs cvttss2si.
+     * A uint64 target needs the bias sequence: the machine's truncation is
+     * signed and answers its sentinel for anything at or above 2^63. */
+    MtlcType *tt = (in->text && g->ir_program)
+                   ? code_generator_named_type(g, in->text)
+                   : NULL;
+    int to_u64 = tt && tt->kind == MTLC_TYPE_UINT64;
+    return mir_emit1(fn, MIR_CVTF2SI, dst, a, mir_op_none(), sfb / 8,
+                     to_u64 ? 1 : 0, 0);
+  }
+  if (dfb && sfb) {
+    /* float -> float; same width is just a copy, else cvtsd2ss/cvtss2sd. */
+    if (dfb == sfb) {
+      return mir_emit_fmov(fn, dst, a, dfb / 8);
+    }
+    return mir_emit1(fn, MIR_CVTF2F, dst, a, mir_op_none(), dfb / 8, 0, 0);
+  }
+  *crossed = 0;
+  return 0;
+}
+
 static int mir_lower_cast(MirFunction *fn, CodeGenerator *g,
                         BinaryFunctionContext *ctx, MirNameMap *map,
                         const IRInstruction *in,
@@ -4210,32 +4247,11 @@ static int mir_lower_cast(MirFunction *fn, CodeGenerator *g,
   case IR_OP_CAST: {
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
     MirOperand a = mir_value_operand(fn, g, ctx, map, &in->lhs);
-    int dfb = code_generator_binary_operand_float_bits(g, ctx, &in->dest);
-    int sfb = code_generator_binary_operand_float_bits(g, ctx, &in->lhs);
-    if (dfb && !sfb) {
-      /* int -> float. is_unsigned carries the SOURCE's signedness (set by IR
-       * lowering); an unsigned source needs the halve-convert-double sequence
-       * because the machine's conversion is signed. */
-      return mir_emit1(fn, MIR_CVTSI2F, dst, a, mir_op_none(), dfb / 8,
-                       in->is_unsigned ? 1 : 0, 0);
-    }
-    if (!dfb && sfb) {
-      /* float -> int (truncating); width selects cvttsd2si vs cvttss2si.
-       * A uint64 target needs the bias sequence: the machine's truncation is
-       * signed and answers its sentinel for anything at or above 2^63. */
-      MtlcType *tt = (in->text && g->ir_program)
-                     ? code_generator_named_type(g, in->text)
-                     : NULL;
-      int to_u64 = tt && tt->kind == MTLC_TYPE_UINT64;
-      return mir_emit1(fn, MIR_CVTF2SI, dst, a, mir_op_none(), sfb / 8,
-                       to_u64 ? 1 : 0, 0);
-    }
-    if (dfb && sfb) {
-      /* float -> float; same width is just a copy, else cvtsd2ss/cvtss2sd. */
-      if (dfb == sfb) {
-        return mir_emit_fmov(fn, dst, a, dfb / 8);
-      }
-      return mir_emit1(fn, MIR_CVTF2F, dst, a, mir_op_none(), dfb / 8, 0, 0);
+    int crossed = 0;
+    int converted =
+        mir_lower_cast_across_banks(fn, g, ctx, in, dst, a, &crossed);
+    if (crossed) {
+      return converted;
     }
     /* The cast's target type is named on the instruction (in->text) and is
      * always resolvable; the dest operand's type is not (a temp has no

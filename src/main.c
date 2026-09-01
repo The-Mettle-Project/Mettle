@@ -3463,6 +3463,67 @@ typedef enum {
   DRIVER_FLAG_FAILED
 } DriverFlagResult;
 
+static DriverFlagResult parse_flag_shared_library(CompilerOptions *options,
+                                                  int argc, char *argv[],
+                                                  int *index) {
+  int i = *index;
+  (void)argc;
+
+  if (strncmp(argv[i], "-l", 2) == 0 && argv[i][2] != '\0') {
+    if (!add_string_option(&options->shared_libraries,
+                           &options->shared_library_count, argv[i] + 2)) {
+      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i] + 2);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--library") == 0 && i + 1 < argc) {
+    if (!add_string_option(&options->shared_libraries,
+                           &options->shared_library_count, argv[++i])) {
+      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
+    if (!add_string_option(&options->library_search_paths,
+                           &options->library_search_path_count, argv[i] + 2)) {
+      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i] + 2);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if ((strcmp(argv[i], "--library-path") == 0 ||
+              strcmp(argv[i], "-L") == 0) &&
+             i + 1 < argc) {
+    if (!add_string_option(&options->library_search_paths,
+                           &options->library_search_path_count, argv[++i])) {
+      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--rpath") == 0 && i + 1 < argc) {
+    if (!add_string_option(&options->runpaths, &options->runpath_count,
+                           argv[++i])) {
+      fprintf(stderr, "Error: Failed to add rpath '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--shared") == 0) {
+    options->shared_output = 1;
+  } else if (strcmp(argv[i], "--export-dynamic") == 0 ||
+             strcmp(argv[i], "-rdynamic") == 0) {
+    options->export_dynamic = 1;
+  } else if (strcmp(argv[i], "--soname") == 0 && i + 1 < argc) {
+    options->soname = argv[++i];
+  } else if (strcmp(argv[i], "--dynamic-linker") == 0 && i + 1 < argc) {
+    options->dynamic_linker = argv[++i];
+  } else if (strcmp(argv[i], "--soname") == 0 ||
+             strcmp(argv[i], "--dynamic-linker") == 0 ||
+             strcmp(argv[i], "--rpath") == 0 ||
+             strcmp(argv[i], "--library") == 0 ||
+             strcmp(argv[i], "--library-path") == 0) {
+    fprintf(stderr, "Error: Missing value after '%s'\n", argv[i]);
+    return DRIVER_FLAG_FAILED;
+  } else {
+    return DRIVER_FLAG_UNMATCHED;
+  }
+  *index = i;
+  return DRIVER_FLAG_TAKEN;
+}
+
 static DriverFlagResult parse_flag_output(CompilerOptions *options,
                                      DriverFlags *flags,
                                      int argc, char *argv[],
@@ -3531,56 +3592,15 @@ static DriverFlagResult parse_flag_output(CompilerOptions *options,
       fprintf(stderr, "Error: Failed to add linker argument\n");
       return DRIVER_FLAG_FAILED;
     }
-  } else if (strncmp(argv[i], "-l", 2) == 0 && argv[i][2] != '\0') {
-    if (!add_string_option(&options->shared_libraries,
-                           &options->shared_library_count, argv[i] + 2)) {
-      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i] + 2);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if (strcmp(argv[i], "--library") == 0 && i + 1 < argc) {
-    if (!add_string_option(&options->shared_libraries,
-                           &options->shared_library_count, argv[++i])) {
-      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i]);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
-    if (!add_string_option(&options->library_search_paths,
-                           &options->library_search_path_count, argv[i] + 2)) {
-      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i] + 2);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if ((strcmp(argv[i], "--library-path") == 0 ||
-              strcmp(argv[i], "-L") == 0) &&
-             i + 1 < argc) {
-    if (!add_string_option(&options->library_search_paths,
-                           &options->library_search_path_count, argv[++i])) {
-      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i]);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if (strcmp(argv[i], "--rpath") == 0 && i + 1 < argc) {
-    if (!add_string_option(&options->runpaths, &options->runpath_count,
-                           argv[++i])) {
-      fprintf(stderr, "Error: Failed to add rpath '%s'\n", argv[i]);
-      return DRIVER_FLAG_FAILED;
-    }
-  } else if (strcmp(argv[i], "--shared") == 0) {
-    options->shared_output = 1;
-  } else if (strcmp(argv[i], "--export-dynamic") == 0 ||
-             strcmp(argv[i], "-rdynamic") == 0) {
-    options->export_dynamic = 1;
-  } else if (strcmp(argv[i], "--soname") == 0 && i + 1 < argc) {
-    options->soname = argv[++i];
-  } else if (strcmp(argv[i], "--dynamic-linker") == 0 && i + 1 < argc) {
-    options->dynamic_linker = argv[++i];
-  } else if (strcmp(argv[i], "--soname") == 0 ||
-             strcmp(argv[i], "--dynamic-linker") == 0 ||
-             strcmp(argv[i], "--rpath") == 0 ||
-             strcmp(argv[i], "--library") == 0 ||
-             strcmp(argv[i], "--library-path") == 0) {
-    fprintf(stderr, "Error: Missing value after '%s'\n", argv[i]);
-    return DRIVER_FLAG_FAILED;
   } else {
-    return DRIVER_FLAG_UNMATCHED;
+    DriverFlagResult shared =
+        parse_flag_shared_library(options, argc, argv, &i);
+    if (shared == DRIVER_FLAG_UNMATCHED) {
+      return DRIVER_FLAG_UNMATCHED;
+    }
+    if (shared == DRIVER_FLAG_FAILED) {
+      return DRIVER_FLAG_FAILED;
+    }
   }
   *index = i;
   return DRIVER_FLAG_TAKEN;
