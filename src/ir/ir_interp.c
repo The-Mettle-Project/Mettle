@@ -5060,6 +5060,21 @@ static int ii_bind_parameters(IRInterpMachine *machine, IIFrame *frame,
       }
     }
     var->value = args[i];
+    /* An aggregate parameter holds the ADDRESS of the caller's copy, the same
+     * as an aggregate local, so record its size. Without it a word-sized store
+     * of the parameter -- which is how a closure constructor writes a captured
+     * struct into its environment -- wrote the low bytes of that address
+     * instead of the struct. A closure capturing a two-int32 struct read back
+     * as pointer bits under `mettle test` while the backend had it right. */
+    if (fn->parameter_types && fn->parameter_types[i] && machine->program) {
+      const MtlcType *pt =
+          ir_program_lookup_type(machine->program, fn->parameter_types[i]);
+      if (pt && pt->size > 0 &&
+          (pt->kind == MTLC_TYPE_STRUCT || pt->kind == MTLC_TYPE_ARRAY ||
+           pt->kind == MTLC_TYPE_TAGGED_ENUM)) {
+        var->agg_size = (long long)pt->size;
+      }
+    }
     if (fn->parameter_types && fn->parameter_types[i] &&
         strcmp(fn->parameter_types[i], "string") == 0 &&
         !var->value.is_float && var->value.i != 0) {

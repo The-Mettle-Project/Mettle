@@ -6,7 +6,7 @@ struct S8 { a: int32; b: int32; }
 struct S24 { a: int64; b: int64; c: int64; }
 struct Holder { v: int32[4]; n: int32; }
 
-fn main() -> int32 {
+fn checks() -> int32 {
   // A struct that fits in a register.
   var s8: S8;
   s8.a = 1;
@@ -55,5 +55,18 @@ fn main() -> int32 {
   h.v[0] = 88;
   if (viastruct(0) != 10) { return 10; }
 
+  return 0;
+}
+
+fn main() -> int32 { return checks(); }
+
+// The compile-time interpreter had this wrong while the backend had it right:
+// a closure constructor writes its captured struct into the environment with a
+// word-sized store of an aggregate PARAMETER, and the interpreter holds such a
+// parameter as the address of the caller's copy. Without a recorded size for
+// it, the store wrote the low bytes of that address. Running the same checks
+// both ways is what caught it.
+@test fn test_capture_matches_native() -> int64 {
+  assert_eq(checks(), 0);
   return 0;
 }
