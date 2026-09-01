@@ -404,6 +404,21 @@ size_t code_generator_binary_symbol_write_count(
     return 0;
   }
 
+  /* A parameter is written once before any instruction runs, by the call that
+   * passed it, and that write has no IR to count. Without it a parameter
+   * assigned once in the body looked like a symbol with a single DEFINITIONAL
+   * write, when the write is really a mutation of a value that already had
+   * one. The alias below leans on this count to decide whether a copy can
+   * share its source's storage: `var t: int64 = b; b = 5; return t;` returned
+   * 5. */
+  for (size_t p = 0; p < function->parameter_count; p++) {
+    if (function->parameter_names && function->parameter_names[p] &&
+        strcmp(function->parameter_names[p], name) == 0) {
+      count++;
+      break;
+    }
+  }
+
   for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *instruction = &function->instructions[i];
     if (!instruction ||

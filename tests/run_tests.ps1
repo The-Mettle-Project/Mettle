@@ -1597,6 +1597,11 @@ $cases = @(
   # declaration order, row-major and contiguous. Runs natively and under the
   # compile-time interpreter, which sized such a local at its outer count.
   @{ Name = "multidim_arrays"; Path = "tests/test_multidim_arrays.mettle"; ShouldSucceed = $true },
+  # A local copied from a parameter must be a copy even when the parameter is
+  # assigned afterwards. The baseline emitter aliased it, because a parameter
+  # is written once before any instruction runs and that write has no IR to
+  # count, so a later assignment looked like the definitional one.
+  @{ Name = "param_copy_not_alias"; Path = "tests/test_param_copy_not_alias.mettle"; ShouldSucceed = $true },
   @{ Name = "signed_arithmetic"; Path = "tests/test_signed_arithmetic.mettle"; ShouldSucceed = $true },
   @{
     Name          = "sign_extension"
