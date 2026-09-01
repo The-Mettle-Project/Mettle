@@ -61,3 +61,5 @@ tests/parse_stress_test.mettle
 pondering/
 tests/test-failures.txt
 DS/
+build-release
+build-debug
