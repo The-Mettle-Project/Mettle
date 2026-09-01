@@ -41,6 +41,15 @@ if ($known -and $Recreate) {
 
 if ($known) {
   $info = & $manage showvminfo $Name --machinereadable
+  if ($info -match 'VMState="(running|paused|stuck)"') {
+    Invoke-Manage controlvm $Name poweroff
+    Start-Sleep -Milliseconds 1200
+    $info = & $manage showvminfo $Name --machinereadable
+  }
+  if ($info -match 'VMState="(saved|aborted-saved)"') {
+    & $manage discardstate $Name
+    $info = & $manage showvminfo $Name --machinereadable
+  }
   if ($info -match 'storagecontrollername\d+="Floppy"') {
     Invoke-Manage storageattach $Name --storagectl "Floppy" --port 0 --device 0 --medium none
     Invoke-Manage storagectl $Name --name "Floppy" --remove

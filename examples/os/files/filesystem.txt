@@ -1,0 +1,32 @@
+the filesystem lives in partition one, from sector 2048 to the end of the
+disk. it works in blocks of 4096 bytes, eight sectors at a time.
+
+  block 0        the superblock: sizes, where everything starts, what is free
+  next 2 blocks  a bitmap, one bit per block
+  next 128       the inode table, 4096 inodes of 128 bytes each
+  the rest       data
+
+an inode holds a mode, a link count, a size, two timestamps, ten direct block
+pointers, one single indirect pointer and one double indirect pointer. ten
+direct blocks reach 40 kilobytes, the single indirect reaches two megabytes,
+and the double indirect reaches a gigabyte, which is more than the partition
+holds.
+
+a directory is a file of 64 byte entries: an inode number, a kind, a used
+flag, and a name of up to 47 bytes. every directory carries a .. entry, and
+the root's .. points at itself. that is how pwd walks back up.
+
+a cache of 64 blocks sits between the filesystem and the disk. reads are
+served from it, writes go through it to the drive straight away, so pulling
+the power loses nothing that a command has already finished.
+
+one lock guards the whole filesystem. it is recursive, so a call that takes it
+can call another that takes it again, and a process that has to wait blocks
+rather than spins.
+
+the first time the kernel finds the partition blank it formats it and writes
+in every file the boot archive carried. after that it mounts what is there.
+format yes lays a fresh one down. install writes the archive in again.
+
+if a file called startup.txt sits in the root, the shell runs every line in it
+before it gives you a prompt. run <file> does the same thing on demand.

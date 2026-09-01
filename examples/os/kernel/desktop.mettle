@@ -623,6 +623,14 @@ export fn desktop_run() {
                 mark_window(monitor)
             }
         }
+        for id: uint64 in 0..WINDOW_SLOTS {
+            if (window_damaged(id)) {
+                window_settle(id)
+                if (!window_hidden(id)) {
+                    mark_window(id)
+                }
+            }
+        }
         var painting: bool = damage_right > damage_left
         var shift: bool = !cursor_on_gpu() && (painting || moved)
         if (shift) {

@@ -7,6 +7,11 @@ import "kernel/interrupt"
 import "kernel/clock"
 import "kernel/page"
 import "kernel/ata"
+import "kernel/lock"
+import "kernel/block"
+import "kernel/fs"
+import "kernel/file"
+import "kernel/fscmd"
 import "kernel/heap"
 import "kernel/process"
 import "kernel/jobs"
@@ -49,7 +54,30 @@ fn shell_task(argument: uint64) {
     console_write_line("")
     cmd_banner("")
     show_motd()
+    fs_run_startup()
     shell_run(&terminal_read_key)
+}
+
+fn filesystem_init() {
+    if (fs_init(DISK_PARTITION_LBA, ata_sector_count() - DISK_PARTITION_LBA)) {
+        console_write("filesystem mounted, ")
+        console_write_decimal(fs_free_blocks() * BLOCK_BYTES / BYTES_PER_MB)
+        console_write(" mb free of ")
+        console_write_decimal(fs_total_blocks() * BLOCK_BYTES / BYTES_PER_MB)
+        console_write_line(" mb")
+        return
+    }
+    console_write_line("the partition carries no filesystem, laying one down")
+    if (!fs_format()) {
+        console_write_line("the format failed")
+        return
+    }
+    var installed: uint64 = fs_install_archive()
+    console_write("formatted and installed ")
+    console_write_decimal(installed)
+    console_write(" of ")
+    console_write_decimal(archive_count())
+    console_write_line(" files")
 }
 
 fn disk_init() {
@@ -65,6 +93,8 @@ fn disk_init() {
     if (!archive_init()) {
         console_write_line("the disk carries no file archive")
     }
+    file_init()
+    filesystem_init()
 }
 
 fn machine_init() {
@@ -89,6 +119,7 @@ fn text_mode() {
     cmd_banner("")
     status_start()
     show_motd()
+    fs_run_startup()
     shell_run(&keyboard_read)
 }
 

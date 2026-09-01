@@ -5,7 +5,9 @@ import "font"
 import "theme"
 import "window"
 import "terminal"
-import "archive"
+import "fs"
+import "file"
+import "text"
 import "process"
 import "clock"
 import "page"
@@ -22,8 +24,13 @@ const LINE_STEP: uint64 = 18
 const PAD: uint64 = 10
 const PRINTABLE_FIRST: uint8 = 32
 const PRINTABLE_LAST: uint8 = 126
+const VIEWER_BYTES: uint64 = 32768
 
-var viewer_file: uint64 = 0
+var viewer_buffer: uint64 = 0
+var viewer_bytes: uint64 = 0
+var viewer_name: uint8[48]
+var browse_at: uint64 = 0
+var browse_ready: bool = false
 var vendor: uint8[16]
 
 fn line_y(id: uint64, index: uint64) -> uint64 {
@@ -54,35 +61,81 @@ export fn app_terminal_open() -> uint64 {
 fn files_ignore_click(id: uint64, x: uint64, y: uint64) {
 }
 
+fn browse_here() -> uint64 {
+    if (!browse_ready) {
+        browse_at = fs_root()
+        browse_ready = true
+    }
+    return browse_at
+}
+
 fn files_draw(id: uint64) {
     video_fill(window_content_x(id), window_content_y(id),
                window_content_width(id), window_content_height(id), WINDOW_BODY)
-    var count: uint64 = archive_count()
-    if (count == 0) {
-        label(id, 0, "no files travelled with the kernel", WINDOW_FAINT)
+    if (!fs_mounted()) {
+        label(id, 0, "no filesystem is mounted", WINDOW_FAINT)
         return
     }
-    label(id, 0, "click a file to read it", WINDOW_FAINT)
+    var here: uint64 = browse_here()
+    var path: uint8[192]
+    fs_path_of(here, &path[0], 192)
+    label(id, 0, (cstring)&path[0], WINDOW_FAINT)
+    var entry: DirEntry
+    var count: uint64 = fs_entry_count(here)
+    var row: uint64 = 2
+    var rows: uint64 = (window_content_height(id) - PAD * 2) / LINE_STEP
     for i: uint64 in 0..count {
-        var width: uint64 = label(id, i + 2, archive_name(i), WINDOW_TEXT)
-        font_draw_number(window_content_x(id) + PAD + 200, line_y(id, i + 2),
-                         archive_length(i), WINDOW_FAINT)
-        font_draw_text(window_content_x(id) + PAD + 260, line_y(id, i + 2),
-                       "bytes", WINDOW_FAINT)
+        if (row >= rows) {
+            return
+        }
+        if (!fs_entry_at(here, i, &entry)) {
+            continue
+        }
+        var tint: uint32 = WINDOW_TEXT
+        if (entry.kind == FS_DIRECTORY) {
+            tint = ACCENT
+        }
+        label(id, row, (cstring)&entry.name[0], tint)
+        if (entry.kind != FS_DIRECTORY) {
+            font_draw_number(window_content_x(id) + PAD + 200, line_y(id, row),
+                             fs_size(entry.inode), WINDOW_FAINT)
+            font_draw_text(window_content_x(id) + PAD + 260, line_y(id, row),
+                           "bytes", WINDOW_FAINT)
+        }
+        row++
+    }
+    if (row == 2) {
+        label(id, 2, "the directory is empty", WINDOW_FAINT)
     }
 }
 
 fn files_click(id: uint64, x: uint64, y: uint64) {
-    if (y < PAD + LINE_STEP * 2) {
+    if (!fs_mounted() || y < PAD + LINE_STEP * 2) {
         return
     }
-    var index: uint64 = (y - PAD) / LINE_STEP
-    if (index < 2) {
+    var row: uint64 = (y - PAD) / LINE_STEP
+    if (row < 2) {
         return
     }
-    index = index - 2
-    if (index < archive_count()) {
-        app_viewer_open(index)
+    var wanted: uint64 = row - 2
+    var here: uint64 = browse_here()
+    var entry: DirEntry
+    var count: uint64 = fs_entry_count(here)
+    var seen: uint64 = 0
+    for i: uint64 in 0..count {
+        if (!fs_entry_at(here, i, &entry)) {
+            continue
+        }
+        if (seen == wanted) {
+            if (entry.kind == FS_DIRECTORY) {
+                browse_at = entry.inode
+                window_damage(id)
+            } else {
+                app_viewer_open(entry.inode, (cstring)&entry.name[0])
+            }
+            return
+        }
+        seen++
     }
 }
 
@@ -97,17 +150,16 @@ fn viewer_ignore_key(id: uint64, ch: uint8) {
 fn viewer_draw(id: uint64) {
     video_fill(window_content_x(id), window_content_y(id),
                window_content_width(id), window_content_height(id), WINDOW_BODY)
-    if (!archive_holds(viewer_file)) {
-        label(id, 0, "that file is gone", WINDOW_FAINT)
+    if (viewer_buffer == 0 || viewer_bytes == 0) {
+        label(id, 0, "that file is empty", WINDOW_FAINT)
         return
     }
-    var data: uint8* = archive_data(viewer_file)
-    var length: uint64 = archive_length(viewer_file)
+    var data: uint8* = (uint8*)viewer_buffer
     var columns: uint64 = (window_content_width(id) - PAD * 2) / GLYPH_WIDTH
     var row: uint64 = 0
     var column: uint64 = 0
     var rows: uint64 = (window_content_height(id) - PAD * 2) / LINE_STEP
-    for i: uint64 in 0..length {
+    for i: uint64 in 0..viewer_bytes {
         if (row >= rows) {
             return
         }
@@ -127,15 +179,24 @@ fn viewer_draw(id: uint64) {
     }
 }
 
-export fn app_viewer_open(index: uint64) -> uint64 {
-    viewer_file = index
+export fn app_viewer_open(node: uint64, name: cstring) -> uint64 {
+    if (viewer_buffer == 0) {
+        viewer_buffer = heap_alloc(VIEWER_BYTES)
+    }
+    viewer_bytes = 0
+    if (viewer_buffer != 0) {
+        viewer_bytes = fs_read(node, 0, viewer_buffer, VIEWER_BYTES)
+    }
+    text_copy(&viewer_name[0], 48, name)
     var id: uint64 = window_of_kind(KIND_VIEWER)
     if (id < WINDOW_SLOTS) {
+        window_rename(id, (cstring)&viewer_name[0])
         window_raise(id)
+        window_damage(id)
         return id
     }
     return window_open_plain(KIND_VIEWER, 220, 200, 520, 320,
-                             archive_name(index), &viewer_draw)
+                             (cstring)&viewer_name[0], &viewer_draw)
 }
 
 fn tasks_draw(id: uint64) {

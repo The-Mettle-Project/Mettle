@@ -9,4 +9,5 @@ what runs here:
   a heap that hands out blocks of any size on runs of those pages
   a preemptive round robin scheduler driven by the timer interrupt
   an ata driver that reads and writes the disk without the firmware
+  a filesystem with inodes, directories and files that outlive a reboot
   a vga console, a ps2 keyboard, a cmos clock, a serial line

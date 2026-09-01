@@ -1,0 +1,66 @@
+import "port"
+import "process"
+
+const BACKOFF_TICKS: uint64 = 2
+
+export struct Lock {
+    held: uint64;
+    owner: uint64;
+    depth: uint64;
+    waiters: uint64;
+    contended: uint64;
+}
+
+export fn lock_clear(lock: Lock*) {
+    lock->held = 0
+    lock->owner = 0
+    lock->depth = 0
+    lock->waiters = 0
+    lock->contended = 0
+}
+
+export fn lock_take(lock: Lock*) {
+    while (true) {
+        var was_on: bool = cpu_interrupts_on()
+        cpu_disable_interrupts()
+        if (lock->held != 0 && lock->owner == process_current()) {
+            lock->depth++
+            cpu_restore_interrupts(was_on)
+            return
+        }
+        if (lock->held == 0) {
+            lock->held = 1
+            lock->owner = process_current()
+            lock->depth = 1
+            cpu_restore_interrupts(was_on)
+            return
+        }
+        lock->waiters++
+        lock->contended++
+        cpu_restore_interrupts(was_on)
+        process_wait_event((uint64)lock, BACKOFF_TICKS)
+    }
+}
+
+export fn lock_give(lock: Lock*) {
+    var was_on: bool = cpu_interrupts_on()
+    cpu_disable_interrupts()
+    if (lock->depth > 1) {
+        lock->depth--
+        cpu_restore_interrupts(was_on)
+        return
+    }
+    lock->depth = 0
+    lock->held = 0
+    lock->owner = 0
+    var waiting: uint64 = lock->waiters
+    lock->waiters = 0
+    cpu_restore_interrupts(was_on)
+    if (waiting != 0) {
+        process_wake_channel((uint64)lock)
+    }
+}
+
+export fn lock_contention(lock: Lock*) -> uint64 {
+    return lock->contended
+}

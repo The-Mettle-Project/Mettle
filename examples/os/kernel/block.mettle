@@ -1,0 +1,219 @@
+import "layout"
+import "ata"
+import "heap"
+
+export const BLOCK_BYTES: uint64 = 4096
+
+const SECTORS_PER_BLOCK: uint64 = 8
+const CACHE_SLOTS: uint64 = 64
+const NO_BLOCK: uint64 = 0xffffffffffffffff
+
+struct CacheSlot {
+    index: uint64;
+    loaded: uint64;
+    stamp: uint64;
+}
+
+var slots: CacheSlot[64]
+var arena: uint64 = 0
+var clock: uint64 = 0
+var origin: uint64 = 0
+var span: uint64 = 0
+var hits: uint64 = 0
+var misses: uint64 = 0
+var writes: uint64 = 0
+
+fn slot_data(slot: uint64) -> uint64 {
+    return arena + slot * BLOCK_BYTES
+}
+
+fn sector_of(index: uint64) -> uint64 {
+    return origin + index * SECTORS_PER_BLOCK
+}
+
+export fn block_ready() -> bool {
+    return arena != 0
+}
+
+export fn block_count() -> uint64 {
+    return span
+}
+
+export fn block_hits() -> uint64 {
+    return hits
+}
+
+export fn block_misses() -> uint64 {
+    return misses
+}
+
+export fn block_writes() -> uint64 {
+    return writes
+}
+
+export fn block_init(first_sector: uint64, sectors: uint64) -> bool {
+    if (!ata_present()) {
+        return false
+    }
+    if (arena == 0) {
+        arena = heap_alloc(CACHE_SLOTS * BLOCK_BYTES)
+        if (arena == 0) {
+            return false
+        }
+    }
+    origin = first_sector
+    span = sectors / SECTORS_PER_BLOCK
+    for i: uint64 in 0..CACHE_SLOTS {
+        slots[i].index = NO_BLOCK
+        slots[i].loaded = 0
+        slots[i].stamp = 0
+    }
+    clock = 0
+    hits = 0
+    misses = 0
+    writes = 0
+    return true
+}
+
+export fn block_forget() {
+    for i: uint64 in 0..CACHE_SLOTS {
+        slots[i].index = NO_BLOCK
+        slots[i].loaded = 0
+    }
+}
+
+fn find(index: uint64) -> uint64 {
+    for i: uint64 in 0..CACHE_SLOTS {
+        if (slots[i].loaded != 0 && slots[i].index == index) {
+            return i
+        }
+    }
+    return CACHE_SLOTS
+}
+
+fn oldest() -> uint64 {
+    var choice: uint64 = 0
+    var best: uint64 = 0xffffffffffffffff
+    for i: uint64 in 0..CACHE_SLOTS {
+        if (slots[i].loaded == 0) {
+            return i
+        }
+        if (slots[i].stamp < best) {
+            best = slots[i].stamp
+            choice = i
+        }
+    }
+    return choice
+}
+
+fn admit(index: uint64) -> uint64 {
+    var slot: uint64 = find(index)
+    if (slot < CACHE_SLOTS) {
+        hits++
+        clock++
+        slots[slot].stamp = clock
+        return slot
+    }
+    if (index >= span) {
+        return CACHE_SLOTS
+    }
+    slot = oldest()
+    if (!ata_read(sector_of(index), SECTORS_PER_BLOCK, slot_data(slot))) {
+        slots[slot].loaded = 0
+        slots[slot].index = NO_BLOCK
+        return CACHE_SLOTS
+    }
+    misses++
+    clock++
+    slots[slot].index = index
+    slots[slot].loaded = 1
+    slots[slot].stamp = clock
+    return slot
+}
+
+export fn block_read(index: uint64, buffer: uint64) -> bool {
+    return block_read_part(index, 0, buffer, BLOCK_BYTES)
+}
+
+export fn block_read_part(index: uint64, offset: uint64, buffer: uint64,
+                          length: uint64) -> bool {
+    if (arena == 0 || offset + length > BLOCK_BYTES) {
+        return false
+    }
+    var slot: uint64 = admit(index)
+    if (slot >= CACHE_SLOTS) {
+        return false
+    }
+    var source: uint8* = (uint8*)(slot_data(slot) + offset)
+    var target: uint8* = (uint8*)buffer
+    for i: uint64 in 0..length {
+        target[i] = source[i]
+    }
+    return true
+}
+
+fn store(index: uint64, slot: uint64) -> bool {
+    if (!ata_write(sector_of(index), SECTORS_PER_BLOCK, slot_data(slot))) {
+        return false
+    }
+    writes++
+    return true
+}
+
+export fn block_write(index: uint64, buffer: uint64) -> bool {
+    if (arena == 0 || index >= span) {
+        return false
+    }
+    var slot: uint64 = find(index)
+    if (slot >= CACHE_SLOTS) {
+        slot = oldest()
+        slots[slot].index = index
+        slots[slot].loaded = 1
+    }
+    clock++
+    slots[slot].stamp = clock
+    var source: uint8* = (uint8*)buffer
+    var target: uint8* = (uint8*)slot_data(slot)
+    for i: uint64 in 0..BLOCK_BYTES {
+        target[i] = source[i]
+    }
+    return store(index, slot)
+}
+
+export fn block_write_part(index: uint64, offset: uint64, buffer: uint64,
+                           length: uint64) -> bool {
+    if (arena == 0 || offset + length > BLOCK_BYTES) {
+        return false
+    }
+    var slot: uint64 = admit(index)
+    if (slot >= CACHE_SLOTS) {
+        return false
+    }
+    var source: uint8* = (uint8*)buffer
+    var target: uint8* = (uint8*)(slot_data(slot) + offset)
+    for i: uint64 in 0..length {
+        target[i] = source[i]
+    }
+    clock++
+    slots[slot].stamp = clock
+    return store(index, slot)
+}
+
+export fn block_zero(index: uint64) -> bool {
+    if (arena == 0 || index >= span) {
+        return false
+    }
+    var slot: uint64 = find(index)
+    if (slot >= CACHE_SLOTS) {
+        slot = oldest()
+        slots[slot].index = index
+        slots[slot].loaded = 1
+    }
+    clock++
+    slots[slot].stamp = clock
+    var target: uint8* = (uint8*)slot_data(slot)
+    for i: uint64 in 0..BLOCK_BYTES {
+        target[i] = 0
+    }
+    return store(index, slot)
+}

@@ -22,8 +22,16 @@ compiled to a flat image with `--target x86_64-none`.
   blocks on allocation and merging neighbours on free.
 - **Disk.** An ATA driver on the primary channel: IDENTIFY for the model and
   the capacity, LBA28 reads and writes in batches of up to 128 sectors, and a
-  cache flush after every write. The kernel loads its own file archive through
-  it at startup.
+  cache flush after every write.
+- **Filesystem.** A filesystem of its own on partition one: a superblock, a
+  block bitmap, an inode table, and directories. An inode reaches 40 KB
+  through ten direct blocks, two megabytes through a single indirect, and a
+  gigabyte through a double indirect. Sixty-four blocks of cache sit in front
+  of the drive, read back and written through. One recursive lock guards the
+  whole thing, and a process that has to wait for it blocks rather than spins.
+  The first time the kernel finds the partition blank it formats it and writes
+  in every file the boot archive carried; after that it mounts what is there,
+  and what you write survives the power going off.
 - **Processes.** A process has a pid, a parent, a priority, a state, its own
   stack, the pages it claimed, and accounting for the ticks it has burned. The
   scheduler runs on the timer: highest ready priority first, round robin inside
@@ -36,8 +44,8 @@ compiled to a flat image with `--target x86_64-none`.
 - **Input.** A PS/2 keyboard on IRQ1 filling a ring buffer, with shift,
   backspace, and arrow keys walking the command history.
 - **Files.** `build.ps1` packs everything in `files/` into an archive at sector
-  1024. The kernel reads it back over ATA, and `ls` and `cat` read it out of
-  memory.
+  1024. That archive is install media: the kernel writes it into the
+  filesystem the first time, and `install` writes it again on demand.
 - **GPU.** The kernel finds the VMware SVGA II device on the PCI bus, claims
   it, negotiates the protocol version, sets the mode itself, and drives it
   through its command FIFO. Damage rectangles go to the device rather than
@@ -70,6 +78,11 @@ nothing reaches into another module's globals.
 | --- | --- |
 | `layout` | Where things sit in physical memory and on the disk. Every fixed address in the system is here. |
 | `ata` | The disk: IDENTIFY, LBA28 reads and writes, cache flush. |
+| `block` | Four kilobyte blocks over the drive, with a cache in front of it. |
+| `fs` | The filesystem: superblock, bitmap, inodes, directories, paths. |
+| `file` | Open files: handles, positions, reading, writing, seeking. |
+| `fscmd` | Every command that touches the filesystem, and the startup script. |
+| `lock` | A recursive lock that blocks rather than spins. |
 | `pci` | Configuration space, and finding a device by its identity. |
 | `svga` | The VMware SVGA II driver: registers, command FIFO, hardware cursor. |
 | `video` | Drawing: fills, gradients, alpha, rounded shapes, discs, blits, presenting. |
@@ -95,7 +108,7 @@ nothing reaches into another module's globals.
 | `process` | The process table, states, priorities, scheduling, sleep, wait channels, exits. |
 | `jobs` | Demonstration processes: counters, processor burners, sleepers. |
 | `keyboard` | Scancodes to characters, and the ring buffer between them. |
-| `archive` | The files packed into the boot image. |
+| `archive` | The install media the build packs into the boot image. |
 | `shell` | The command registry, the line editor, and the history. |
 | `status` | The status bar and the counter tasks that draw it. |
 | `commands` | Every built-in command, registered at startup. |
@@ -126,7 +139,10 @@ shell_register("ps", "the task table", &cmd_ps)
   `console_add_stream(&put)` once. Every line the kernel prints goes there too.
 - **An interrupt.** Write an `@interrupt fn`, then
   `interrupt_install(vector, (uint64)&handler)` in your module's init.
-- **A file.** Drop it in `files/` and rebuild.
+- **A file.** Drop it in `files/` and rebuild, then `install` inside the
+  machine, or build with `-Fresh` to start the partition over.
+- **Something to run at boot.** Write `startup.txt` in the root of the
+  filesystem. The shell runs every line in it before it gives you a prompt.
 
 ## Files
 
@@ -136,7 +152,7 @@ shell_register("ps", "the task table", &cmd_ps)
 | `stage2.mettle` | At 0x8000. Reads 448 KB of kernel off the disk, then memory map, VESA mode, BIOS font, A20, page tables for the first four gigabytes, long mode. |
 | `kernel.mettle` | The entry point and the boot order. |
 | `kernel/` | The modules above. |
-| `files/` | Text carried in the boot image and read back by `ls` and `cat`. |
+| `files/` | What the build packs into the boot archive and the kernel installs on a blank partition. |
 | `build.ps1` | Compiles all three images, packs the archive, writes `mettleos.vhd`. |
 | `run.ps1` | Creates the VirtualBox machine, attaches the disk, starts it. |
 
@@ -222,8 +238,8 @@ Click a desktop icon or the start button to open a window. Drag a window by its
 title bar, minimise it to the taskbar, maximise it to fill the work area, close
 it with the red button. A taskbar button raises its window, or minimises it
 again if it is already in front. The terminal window runs the shell, and the
-keyboard goes to whichever window is in front. The files window lists what the
-boot image carried; click a file to read it. The processes window is the
+keyboard goes to whichever window is in front. The files window browses the
+filesystem: click a directory to go into it, click a file to read it. The processes window is the
 scheduler's own table with live processor shares, redrawn every second.
 
 If the firmware offers no 32-bit linear framebuffer, the kernel says so on the
@@ -245,8 +261,21 @@ the same commands.
 | `uptime` | Seconds and raw ticks since boot |
 | `date` | The CMOS clock |
 | `cpu` | The processor's vendor string, read with `cpuid` |
-| `ls` | The files carried in the boot image |
-| `cat <file>` | Print one of them |
+| `ls [path]` | What is in a directory |
+| `cat <file>` | Print a file |
+| `pwd` | The directory you are in |
+| `cd <path>` | Change directory |
+| `mkdir <path>` | Make a directory |
+| `touch <path>` | Make an empty file |
+| `rm <path>` | Remove a file, or an empty directory |
+| `mv <from> <to>` | Rename or move something |
+| `cp <from> <to>` | Copy a file |
+| `write <file> <text>` | Write a line to a file |
+| `append <file> <text>` | Add a line to a file |
+| `df` | What the filesystem is using, and how the cache is doing |
+| `run <file>` | Run a file of commands |
+| `install` | Write the boot archive into the filesystem again |
+| `format yes` | Lay a fresh filesystem on the partition |
 | `ps` | Every process with state, priority, processor share, and parent |
 | `top` | The same, ordered by processor share |
 | `spawn <n>` | Start counter processes |
@@ -266,10 +295,12 @@ timer interrupt switching between them.
 
 ## How it fits together
 
-The boot sector loads the kernel to 0x20000 and the file archive to 0x30000,
-identity maps the first gigabyte with 2 MB pages, and leaves the firmware's
-memory map at 0x5000. The kernel's stack starts at 0x90000, and every other
-stack comes from the page allocator.
+The boot sector reads the second stage to 0x8000. The second stage reads the
+kernel to 0x20000, identity maps the first four gigabytes with 2 MB pages, and
+leaves the firmware's memory map at 0x500. The kernel's stack runs down from
+0x1900000, the page bitmap and the boot archive sit above that, and the page
+allocator hands out everything from 32 megabytes up. Every other stack comes
+from the page allocator.
 
 The timer's entry point is a `@naked` function that pushes all fifteen general
 registers, hands the stack pointer to a Mettle function, and returns on the
@@ -281,9 +312,10 @@ shapes, with and without an error code.
 
 ## Limits
 
-There is no userspace and no privilege separation. The disk driver reads and
-writes sectors, but nothing above it keeps a filesystem yet, so the files are
-still the read-only archive the build packs. `hexdump` past the fourth
+There is no userspace and no privilege separation. The filesystem keeps no
+free list of its own, so allocation scans the bitmap. Nothing journals, so a
+power cut in the middle of a write leaves whatever reached the drive.
+`hexdump` past the fourth
 gigabyte walks off the identity map and takes a page fault, which the fault
 handler reports before stopping. Processes share the kernel's address space,
 so a wild pointer in one is a wild pointer in all of them.

@@ -1,0 +1,907 @@
+import "layout"
+import "block"
+import "clock"
+import "text"
+import "lock"
+
+export const FS_FREE: uint32 = 0
+export const FS_FILE: uint32 = 1
+export const FS_DIRECTORY: uint32 = 2
+
+export const FS_NAME_LIMIT: uint64 = 47
+export const FS_NO_INODE: uint64 = 0xffffffffffffffff
+
+const MAGIC: uint64 = 0x5346454c5454454d
+const VERSION: uint64 = 1
+
+const INODE_BYTES: uint64 = 128
+const INODES_PER_BLOCK: uint64 = 32
+const ENTRY_BYTES: uint64 = 64
+const ENTRIES_PER_BLOCK: uint64 = 64
+const DIRECT_COUNT: uint64 = 10
+const POINTERS_PER_BLOCK: uint64 = 512
+const BITS_PER_BLOCK: uint64 = 32768
+const INODE_TARGET: uint64 = 4096
+const NO_BLOCK: uint64 = 0
+
+export struct Inode {
+    mode: uint32;
+    links: uint32;
+    size: uint64;
+    created: uint64;
+    modified: uint64;
+    direct: uint64[10];
+    single: uint64;
+    double: uint64;
+}
+
+export struct DirEntry {
+    inode: uint64;
+    kind: uint32;
+    used: uint32;
+    name: uint8[48];
+}
+
+struct SuperBlock {
+    magic: uint64;
+    version: uint64;
+    block_bytes: uint64;
+    total_blocks: uint64;
+    bitmap_start: uint64;
+    bitmap_blocks: uint64;
+    inode_start: uint64;
+    inode_blocks: uint64;
+    inode_count: uint64;
+    data_start: uint64;
+    free_blocks: uint64;
+    free_inodes: uint64;
+    root: uint64;
+    generation: uint64;
+}
+
+var super: SuperBlock
+var mounted: bool = false
+var cwd: uint64 = 0
+var guard: Lock
+var block_hint: uint64 = 0
+var inode_hint: uint64 = 0
+
+export fn fs_mounted() -> bool {
+    return mounted
+}
+
+export fn fs_root() -> uint64 {
+    return super.root
+}
+
+export fn fs_cwd() -> uint64 {
+    return cwd
+}
+
+export fn fs_set_cwd(node: uint64) {
+    cwd = node
+}
+
+export fn fs_total_blocks() -> uint64 {
+    return super.total_blocks
+}
+
+export fn fs_free_blocks() -> uint64 {
+    return super.free_blocks
+}
+
+export fn fs_total_inodes() -> uint64 {
+    return super.inode_count
+}
+
+export fn fs_free_inodes() -> uint64 {
+    return super.free_inodes
+}
+
+export fn fs_data_start() -> uint64 {
+    return super.data_start
+}
+
+fn stamp() -> uint64 {
+    return clock_year() * 10000000000 + clock_month() * 100000000 +
+           clock_day() * 1000000 + clock_hour() * 10000 +
+           clock_minute() * 100 + clock_second()
+}
+
+fn super_store() -> bool {
+    super.generation++
+    return block_write_part(0, 0, (uint64)&super, 112)
+}
+
+fn super_load() -> bool {
+    return block_read_part(0, 0, (uint64)&super, 112)
+}
+
+fn bitmap_block_of(index: uint64) -> uint64 {
+    return super.bitmap_start + index / BITS_PER_BLOCK
+}
+
+fn bitmap_byte_of(index: uint64) -> uint64 {
+    return (index % BITS_PER_BLOCK) / 8
+}
+
+fn bitmap_read(index: uint64) -> uint8 {
+    var cell: uint8 = 0
+    block_read_part(bitmap_block_of(index), bitmap_byte_of(index), (uint64)&cell, 1)
+    return cell
+}
+
+fn bitmap_store(index: uint64, cell: uint8) -> bool {
+    return block_write_part(bitmap_block_of(index), bitmap_byte_of(index),
+                            (uint64)&cell, 1)
+}
+
+fn bitmap_taken(index: uint64) -> bool {
+    var cell: uint8 = bitmap_read(index)
+    return (cell & (uint8)((uint64)1 << (index % 8))) != 0
+}
+
+fn bitmap_take(index: uint64) -> bool {
+    var cell: uint8 = bitmap_read(index)
+    cell = cell | (uint8)((uint64)1 << (index % 8))
+    return bitmap_store(index, cell)
+}
+
+fn bitmap_release(index: uint64) -> bool {
+    var cell: uint8 = bitmap_read(index)
+    cell = cell & (uint8)~((uint64)1 << (index % 8))
+    return bitmap_store(index, cell)
+}
+
+fn block_claim() -> uint64 {
+    if (super.free_blocks == 0) {
+        return NO_BLOCK
+    }
+    var start: uint64 = block_hint
+    if (start < super.data_start) {
+        start = super.data_start
+    }
+    for step: uint64 in 0..(super.total_blocks - super.data_start) {
+        var index: uint64 = start + step
+        if (index >= super.total_blocks) {
+            index = super.data_start + (index - super.total_blocks)
+        }
+        if (!bitmap_taken(index)) {
+            if (!bitmap_take(index)) {
+                return NO_BLOCK
+            }
+            super.free_blocks--
+            block_hint = index + 1
+            if (!block_zero(index)) {
+                return NO_BLOCK
+            }
+            super_store()
+            return index
+        }
+    }
+    return NO_BLOCK
+}
+
+fn block_release(index: uint64) {
+    if (index < super.data_start || index >= super.total_blocks) {
+        return
+    }
+    if (!bitmap_taken(index)) {
+        return
+    }
+    bitmap_release(index)
+    super.free_blocks++
+    if (index < block_hint) {
+        block_hint = index
+    }
+    super_store()
+}
+
+export fn fs_inode_read(number: uint64, node: Inode*) -> bool {
+    if (!mounted || number >= super.inode_count) {
+        return false
+    }
+    var place: uint64 = super.inode_start + number / INODES_PER_BLOCK
+    var offset: uint64 = (number % INODES_PER_BLOCK) * INODE_BYTES
+    return block_read_part(place, offset, (uint64)node, INODE_BYTES)
+}
+
+export fn fs_inode_write(number: uint64, node: Inode*) -> bool {
+    if (!mounted || number >= super.inode_count) {
+        return false
+    }
+    var place: uint64 = super.inode_start + number / INODES_PER_BLOCK
+    var offset: uint64 = (number % INODES_PER_BLOCK) * INODE_BYTES
+    return block_write_part(place, offset, (uint64)node, INODE_BYTES)
+}
+
+fn inode_claim(mode: uint32) -> uint64 {
+    if (super.free_inodes == 0) {
+        return FS_NO_INODE
+    }
+    var node: Inode
+    for step: uint64 in 0..super.inode_count {
+        var number: uint64 = (inode_hint + step) % super.inode_count
+        if (!fs_inode_read(number, &node)) {
+            return FS_NO_INODE
+        }
+        if (node.mode == FS_FREE) {
+            node.mode = mode
+            node.links = 1
+            node.size = 0
+            node.created = stamp()
+            node.modified = node.created
+            for i: uint64 in 0..DIRECT_COUNT {
+                node.direct[i] = NO_BLOCK
+            }
+            node.single = NO_BLOCK
+            node.double = NO_BLOCK
+            if (!fs_inode_write(number, &node)) {
+                return FS_NO_INODE
+            }
+            super.free_inodes--
+            inode_hint = number + 1
+            super_store()
+            return number
+        }
+    }
+    return FS_NO_INODE
+}
+
+fn pointer_read(place: uint64, slot: uint64) -> uint64 {
+    var value: uint64 = 0
+    block_read_part(place, slot * 8, (uint64)&value, 8)
+    return value
+}
+
+fn pointer_store(place: uint64, slot: uint64, value: uint64) -> bool {
+    return block_write_part(place, slot * 8, (uint64)&value, 8)
+}
+
+fn map_block(number: uint64, node: Inode*, index: uint64, create: bool) -> uint64 {
+    if (index < DIRECT_COUNT) {
+        if (node->direct[index] == NO_BLOCK && create) {
+            var fresh: uint64 = block_claim()
+            if (fresh == NO_BLOCK) {
+                return NO_BLOCK
+            }
+            node->direct[index] = fresh
+            fs_inode_write(number, node)
+        }
+        return node->direct[index]
+    }
+
+    var single_index: uint64 = index - DIRECT_COUNT
+    if (single_index < POINTERS_PER_BLOCK) {
+        if (node->single == NO_BLOCK) {
+            if (!create) {
+                return NO_BLOCK
+            }
+            var fresh: uint64 = block_claim()
+            if (fresh == NO_BLOCK) {
+                return NO_BLOCK
+            }
+            node->single = fresh
+            fs_inode_write(number, node)
+        }
+        var leaf: uint64 = pointer_read(node->single, single_index)
+        if (leaf == NO_BLOCK && create) {
+            leaf = block_claim()
+            if (leaf == NO_BLOCK) {
+                return NO_BLOCK
+            }
+            pointer_store(node->single, single_index, leaf)
+        }
+        return leaf
+    }
+
+    var double_index: uint64 = single_index - POINTERS_PER_BLOCK
+    if (double_index >= POINTERS_PER_BLOCK * POINTERS_PER_BLOCK) {
+        return NO_BLOCK
+    }
+    if (node->double == NO_BLOCK) {
+        if (!create) {
+            return NO_BLOCK
+        }
+        var fresh: uint64 = block_claim()
+        if (fresh == NO_BLOCK) {
+            return NO_BLOCK
+        }
+        node->double = fresh
+        fs_inode_write(number, node)
+    }
+    var branch: uint64 = pointer_read(node->double, double_index / POINTERS_PER_BLOCK)
+    if (branch == NO_BLOCK) {
+        if (!create) {
+            return NO_BLOCK
+        }
+        branch = block_claim()
+        if (branch == NO_BLOCK) {
+            return NO_BLOCK
+        }
+        pointer_store(node->double, double_index / POINTERS_PER_BLOCK, branch)
+    }
+    var leaf: uint64 = pointer_read(branch, double_index % POINTERS_PER_BLOCK)
+    if (leaf == NO_BLOCK && create) {
+        leaf = block_claim()
+        if (leaf == NO_BLOCK) {
+            return NO_BLOCK
+        }
+        pointer_store(branch, double_index % POINTERS_PER_BLOCK, leaf)
+    }
+    return leaf
+}
+
+fn drop_blocks(number: uint64, node: Inode*) {
+    for i: uint64 in 0..DIRECT_COUNT {
+        if (node->direct[i] != NO_BLOCK) {
+            block_release(node->direct[i])
+            node->direct[i] = NO_BLOCK
+        }
+    }
+    if (node->single != NO_BLOCK) {
+        for i: uint64 in 0..POINTERS_PER_BLOCK {
+            var leaf: uint64 = pointer_read(node->single, i)
+            if (leaf != NO_BLOCK) {
+                block_release(leaf)
+            }
+        }
+        block_release(node->single)
+        node->single = NO_BLOCK
+    }
+    if (node->double != NO_BLOCK) {
+        for i: uint64 in 0..POINTERS_PER_BLOCK {
+            var branch: uint64 = pointer_read(node->double, i)
+            if (branch == NO_BLOCK) {
+                continue
+            }
+            for j: uint64 in 0..POINTERS_PER_BLOCK {
+                var leaf: uint64 = pointer_read(branch, j)
+                if (leaf != NO_BLOCK) {
+                    block_release(leaf)
+                }
+            }
+            block_release(branch)
+        }
+        block_release(node->double)
+        node->double = NO_BLOCK
+    }
+    node->size = 0
+    fs_inode_write(number, node)
+}
+
+export fn fs_read(number: uint64, offset: uint64, buffer: uint64,
+                  length: uint64) -> uint64 {
+    var node: Inode
+    lock_take(&guard)
+    if (!fs_inode_read(number, &node) || node.mode == FS_FREE) {
+        lock_give(&guard)
+        return 0
+    }
+    if (offset >= node.size) {
+        lock_give(&guard)
+        return 0
+    }
+    var want: uint64 = length
+    if (offset + want > node.size) {
+        want = node.size - offset
+    }
+    var done: uint64 = 0
+    while (done < want) {
+        var position: uint64 = offset + done
+        var place: uint64 = map_block(number, &node, position / BLOCK_BYTES, false)
+        var inside: uint64 = position % BLOCK_BYTES
+        var run: uint64 = BLOCK_BYTES - inside
+        if (run > want - done) {
+            run = want - done
+        }
+        if (place == NO_BLOCK) {
+            var gap: uint8* = (uint8*)(buffer + done)
+            for i: uint64 in 0..run {
+                gap[i] = 0
+            }
+        } else if (!block_read_part(place, inside, buffer + done, run)) {
+            lock_give(&guard)
+            return done
+        }
+        done += run
+    }
+    lock_give(&guard)
+    return done
+}
+
+export fn fs_write(number: uint64, offset: uint64, buffer: uint64,
+                   length: uint64) -> uint64 {
+    var node: Inode
+    lock_take(&guard)
+    if (!fs_inode_read(number, &node) || node.mode == FS_FREE) {
+        lock_give(&guard)
+        return 0
+    }
+    var done: uint64 = 0
+    while (done < length) {
+        var position: uint64 = offset + done
+        var place: uint64 = map_block(number, &node, position / BLOCK_BYTES, true)
+        if (place == NO_BLOCK) {
+            break
+        }
+        var inside: uint64 = position % BLOCK_BYTES
+        var run: uint64 = BLOCK_BYTES - inside
+        if (run > length - done) {
+            run = length - done
+        }
+        if (!block_write_part(place, inside, buffer + done, run)) {
+            break
+        }
+        done += run
+    }
+    if (offset + done > node.size) {
+        node.size = offset + done
+    }
+    node.modified = stamp()
+    fs_inode_write(number, &node)
+    lock_give(&guard)
+    return done
+}
+
+export fn fs_size(number: uint64) -> uint64 {
+    var node: Inode
+    if (!fs_inode_read(number, &node)) {
+        return 0
+    }
+    return node.size
+}
+
+export fn fs_kind(number: uint64) -> uint32 {
+    var node: Inode
+    if (!fs_inode_read(number, &node)) {
+        return FS_FREE
+    }
+    return node.mode
+}
+
+export fn fs_truncate(number: uint64) -> bool {
+    var node: Inode
+    lock_take(&guard)
+    if (!fs_inode_read(number, &node) || node.mode != FS_FILE) {
+        lock_give(&guard)
+        return false
+    }
+    drop_blocks(number, &node)
+    node.modified = stamp()
+    fs_inode_write(number, &node)
+    lock_give(&guard)
+    return true
+}
+
+export fn fs_entry_count(directory: uint64) -> uint64 {
+    var node: Inode
+    if (!fs_inode_read(directory, &node) || node.mode != FS_DIRECTORY) {
+        return 0
+    }
+    return node.size / ENTRY_BYTES
+}
+
+export fn fs_entry_at(directory: uint64, index: uint64, entry: DirEntry*) -> bool {
+    if (fs_read(directory, index * ENTRY_BYTES, (uint64)entry, ENTRY_BYTES) !=
+        ENTRY_BYTES) {
+        return false
+    }
+    return entry->used != 0
+}
+
+fn entry_store(directory: uint64, index: uint64, entry: DirEntry*) -> bool {
+    return fs_write(directory, index * ENTRY_BYTES, (uint64)entry, ENTRY_BYTES) ==
+           ENTRY_BYTES
+}
+
+export fn fs_lookup(directory: uint64, name: cstring) -> uint64 {
+    var entry: DirEntry
+    var count: uint64 = fs_entry_count(directory)
+    for i: uint64 in 0..count {
+        if (fs_entry_at(directory, i, &entry) &&
+            text_equals((cstring)&entry.name[0], name)) {
+            return entry.inode
+        }
+    }
+    return FS_NO_INODE
+}
+
+fn link_entry(directory: uint64, name: cstring, child: uint64, kind: uint32) -> bool {
+    var entry: DirEntry
+    var count: uint64 = fs_entry_count(directory)
+    var slot: uint64 = count
+    for i: uint64 in 0..count {
+        if (fs_read(directory, i * ENTRY_BYTES, (uint64)&entry, ENTRY_BYTES) ==
+            ENTRY_BYTES && entry.used == 0) {
+            slot = i
+            break
+        }
+    }
+    entry.inode = child
+    entry.kind = kind
+    entry.used = 1
+    for i: uint64 in 0..(FS_NAME_LIMIT + 1) {
+        entry.name[i] = 0
+    }
+    text_copy(&entry.name[0], FS_NAME_LIMIT + 1, name)
+    return entry_store(directory, slot, &entry)
+}
+
+fn unlink_entry(directory: uint64, name: cstring) -> uint64 {
+    var entry: DirEntry
+    var count: uint64 = fs_entry_count(directory)
+    for i: uint64 in 0..count {
+        if (fs_entry_at(directory, i, &entry) &&
+            text_equals((cstring)&entry.name[0], name)) {
+            var child: uint64 = entry.inode
+            entry.used = 0
+            entry.inode = FS_NO_INODE
+            entry.name[0] = 0
+            entry_store(directory, i, &entry)
+            return child
+        }
+    }
+    return FS_NO_INODE
+}
+
+fn is_dot(name: cstring) -> bool {
+    return name[0] == '.' && name[1] == 0
+}
+
+fn is_dot_dot(name: cstring) -> bool {
+    return name[0] == '.' && name[1] == '.' && name[2] == 0
+}
+
+fn segment_at(path: cstring, start: uint64, name: uint8*) -> uint64 {
+    var i: uint64 = start
+    while (path[i] == '/') {
+        i++
+    }
+    var out: uint64 = 0
+    while (path[i] != 0 && path[i] != '/') {
+        if (out < FS_NAME_LIMIT) {
+            name[out] = path[i]
+            out++
+        }
+        i++
+    }
+    name[out] = 0
+    return i
+}
+
+fn walk(path: cstring, from: uint64, stop_short: bool, tail: uint8*) -> uint64 {
+    var here: uint64 = from
+    if (path[0] == '/') {
+        here = super.root
+    }
+    var name: uint8[48]
+    var cursor: uint64 = 0
+    var last_written: bool = false
+    if (tail != 0) {
+        tail[0] = 0
+    }
+    while (true) {
+        cursor = segment_at(path, cursor, &name[0])
+        if (name[0] == 0) {
+            break
+        }
+        var rest: uint64 = cursor
+        while (path[rest] == '/') {
+            rest++
+        }
+        var final: bool = path[rest] == 0
+        if (final && stop_short) {
+            if (tail != 0) {
+                text_copy(tail, FS_NAME_LIMIT + 1, (cstring)&name[0])
+                last_written = true
+            }
+            return here
+        }
+        if (is_dot((cstring)&name[0])) {
+            continue
+        }
+        var next: uint64 = fs_lookup(here, (cstring)&name[0])
+        if (next == FS_NO_INODE) {
+            return FS_NO_INODE
+        }
+        here = next
+        if (final) {
+            return here
+        }
+        if (fs_kind(here) != FS_DIRECTORY) {
+            return FS_NO_INODE
+        }
+    }
+    if (stop_short && !last_written) {
+        return here
+    }
+    return here
+}
+
+export fn fs_resolve(path: cstring) -> uint64 {
+    if (!mounted) {
+        return FS_NO_INODE
+    }
+    if (text_empty(path)) {
+        return cwd
+    }
+    lock_take(&guard)
+    var found: uint64 = walk(path, cwd, false, 0)
+    lock_give(&guard)
+    return found
+}
+
+export fn fs_parent_of(path: cstring, name: uint8*) -> uint64 {
+    if (!mounted || text_empty(path)) {
+        return FS_NO_INODE
+    }
+    lock_take(&guard)
+    var parent: uint64 = walk(path, cwd, true, name)
+    lock_give(&guard)
+    if (parent == FS_NO_INODE || name[0] == 0) {
+        return FS_NO_INODE
+    }
+    if (fs_kind(parent) != FS_DIRECTORY) {
+        return FS_NO_INODE
+    }
+    return parent
+}
+
+export fn fs_create(path: cstring, mode: uint32) -> uint64 {
+    var name: uint8[48]
+    var parent: uint64 = fs_parent_of(path, &name[0])
+    if (parent == FS_NO_INODE) {
+        return FS_NO_INODE
+    }
+    lock_take(&guard)
+    var existing: uint64 = fs_lookup(parent, (cstring)&name[0])
+    if (existing != FS_NO_INODE) {
+        lock_give(&guard)
+        if (mode == FS_FILE && fs_kind(existing) == FS_FILE) {
+            return existing
+        }
+        return FS_NO_INODE
+    }
+    var child: uint64 = inode_claim(mode)
+    if (child == FS_NO_INODE) {
+        lock_give(&guard)
+        return FS_NO_INODE
+    }
+    if (!link_entry(parent, (cstring)&name[0], child, mode)) {
+        lock_give(&guard)
+        return FS_NO_INODE
+    }
+    if (mode == FS_DIRECTORY) {
+        link_entry(child, "..", parent, FS_DIRECTORY)
+    }
+    lock_give(&guard)
+    return child
+}
+
+fn inode_release(number: uint64) {
+    var node: Inode
+    if (!fs_inode_read(number, &node)) {
+        return
+    }
+    drop_blocks(number, &node)
+    node.mode = FS_FREE
+    node.links = 0
+    fs_inode_write(number, &node)
+    super.free_inodes++
+    if (number < inode_hint) {
+        inode_hint = number
+    }
+    super_store()
+}
+
+export fn fs_remove(path: cstring) -> bool {
+    var name: uint8[48]
+    var parent: uint64 = fs_parent_of(path, &name[0])
+    if (parent == FS_NO_INODE) {
+        return false
+    }
+    if (is_dot((cstring)&name[0]) || is_dot_dot((cstring)&name[0])) {
+        return false
+    }
+    lock_take(&guard)
+    var child: uint64 = fs_lookup(parent, (cstring)&name[0])
+    if (child == FS_NO_INODE || child == super.root) {
+        lock_give(&guard)
+        return false
+    }
+    if (fs_kind(child) == FS_DIRECTORY) {
+        var entry: DirEntry
+        var count: uint64 = fs_entry_count(child)
+        for i: uint64 in 0..count {
+            if (fs_entry_at(child, i, &entry) &&
+                !is_dot_dot((cstring)&entry.name[0])) {
+                lock_give(&guard)
+                return false
+            }
+        }
+    }
+    unlink_entry(parent, (cstring)&name[0])
+    inode_release(child)
+    lock_give(&guard)
+    return true
+}
+
+export fn fs_rename(from: cstring, to: cstring) -> bool {
+    var old_name: uint8[48]
+    var new_name: uint8[48]
+    var old_parent: uint64 = fs_parent_of(from, &old_name[0])
+    var new_parent: uint64 = fs_parent_of(to, &new_name[0])
+    if (old_parent == FS_NO_INODE || new_parent == FS_NO_INODE) {
+        return false
+    }
+    lock_take(&guard)
+    var child: uint64 = fs_lookup(old_parent, (cstring)&old_name[0])
+    if (child == FS_NO_INODE) {
+        lock_give(&guard)
+        return false
+    }
+    if (fs_lookup(new_parent, (cstring)&new_name[0]) != FS_NO_INODE) {
+        lock_give(&guard)
+        return false
+    }
+    var kind: uint32 = fs_kind(child)
+    unlink_entry(old_parent, (cstring)&old_name[0])
+    var linked: bool = link_entry(new_parent, (cstring)&new_name[0], child, kind)
+    if (kind == FS_DIRECTORY && old_parent != new_parent) {
+        unlink_entry(child, "..")
+        link_entry(child, "..", new_parent, FS_DIRECTORY)
+    }
+    lock_give(&guard)
+    return linked
+}
+
+export fn fs_path_of(node: uint64, out: uint8*, limit: uint64) -> uint64 {
+    if (node == super.root || !mounted) {
+        return text_copy(out, limit, "/")
+    }
+    var chain: uint64[16]
+    var depth: uint64 = 0
+    var here: uint64 = node
+    while (here != super.root && depth < 16) {
+        chain[depth] = here
+        depth++
+        var up: uint64 = fs_lookup(here, "..")
+        if (up == FS_NO_INODE || up == here) {
+            break
+        }
+        here = up
+    }
+    var written: uint64 = 0
+    var entry: DirEntry
+    var step: uint64 = depth
+    while (step > 0) {
+        step--
+        var parent: uint64 = super.root
+        if (step + 1 < depth) {
+            parent = chain[step + 1]
+        }
+        var target: uint64 = chain[step]
+        var found: bool = false
+        var count: uint64 = fs_entry_count(parent)
+        for i: uint64 in 0..count {
+            if (fs_entry_at(parent, i, &entry) && entry.inode == target &&
+                !is_dot_dot((cstring)&entry.name[0])) {
+                if (written + 1 < limit) {
+                    out[written] = '/'
+                    written++
+                }
+                written += text_copy(out + written, limit - written,
+                                     (cstring)&entry.name[0])
+                found = true
+                break
+            }
+        }
+        if (!found) {
+            break
+        }
+    }
+    if (written == 0) {
+        return text_copy(out, limit, "/")
+    }
+    out[written] = 0
+    return written
+}
+
+export fn fs_format() -> bool {
+    if (!block_ready()) {
+        return false
+    }
+    var total: uint64 = block_count()
+    if (total < 64) {
+        return false
+    }
+    var bitmap_blocks: uint64 = (total + BITS_PER_BLOCK - 1) / BITS_PER_BLOCK
+    var inode_count: uint64 = INODE_TARGET
+    if (inode_count > total / 4) {
+        inode_count = total / 4
+    }
+    var inode_blocks: uint64 = (inode_count + INODES_PER_BLOCK - 1) / INODES_PER_BLOCK
+    inode_count = inode_blocks * INODES_PER_BLOCK
+
+    super.magic = MAGIC
+    super.version = VERSION
+    super.block_bytes = BLOCK_BYTES
+    super.total_blocks = total
+    super.bitmap_start = 1
+    super.bitmap_blocks = bitmap_blocks
+    super.inode_start = 1 + bitmap_blocks
+    super.inode_blocks = inode_blocks
+    super.inode_count = inode_count
+    super.data_start = super.inode_start + inode_blocks
+    super.free_blocks = total - super.data_start
+    super.free_inodes = inode_count
+    super.root = 0
+    super.generation = 0
+    mounted = true
+
+    for i: uint64 in 0..bitmap_blocks {
+        if (!block_zero(super.bitmap_start + i)) {
+            mounted = false
+            return false
+        }
+    }
+    for i: uint64 in 0..inode_blocks {
+        if (!block_zero(super.inode_start + i)) {
+            mounted = false
+            return false
+        }
+    }
+    for i: uint64 in 0..super.data_start {
+        bitmap_take(i)
+    }
+
+    block_hint = super.data_start
+    inode_hint = 0
+    var root: uint64 = inode_claim(FS_DIRECTORY)
+    if (root != 0) {
+        mounted = false
+        return false
+    }
+    super.root = root
+    cwd = root
+    if (!link_entry(root, "..", root, FS_DIRECTORY)) {
+        mounted = false
+        return false
+    }
+    if (!super_store()) {
+        mounted = false
+        return false
+    }
+    return true
+}
+
+export fn fs_mount() -> bool {
+    mounted = false
+    if (!block_ready()) {
+        return false
+    }
+    if (!super_load()) {
+        return false
+    }
+    if (super.magic != MAGIC || super.version != VERSION ||
+        super.block_bytes != BLOCK_BYTES ||
+        super.total_blocks > block_count() ||
+        super.data_start >= super.total_blocks ||
+        super.inode_count == 0) {
+        return false
+    }
+    mounted = true
+    cwd = super.root
+    block_hint = super.data_start
+    inode_hint = 0
+    return true
+}
+
+export fn fs_init(first_sector: uint64, sectors: uint64) -> bool {
+    lock_clear(&guard)
+    if (!block_init(first_sector, sectors)) {
+        return false
+    }
+    return fs_mount()
+}

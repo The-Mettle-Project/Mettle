@@ -1,0 +1,165 @@
+import "fs"
+import "text"
+
+export const OPEN_READ: uint64 = 1
+export const OPEN_WRITE: uint64 = 2
+export const OPEN_CREATE: uint64 = 4
+export const OPEN_TRUNCATE: uint64 = 8
+export const OPEN_APPEND: uint64 = 16
+
+export const NO_HANDLE: uint64 = 0xffffffffffffffff
+
+const HANDLE_SLOTS: uint64 = 32
+
+struct Handle {
+    used: uint64;
+    inode: uint64;
+    position: uint64;
+    flags: uint64;
+}
+
+var handles: Handle[32]
+var opened: uint64 = 0
+
+export fn file_open_count() -> uint64 {
+    return opened
+}
+
+fn valid(handle: uint64) -> bool {
+    return handle < HANDLE_SLOTS && handles[handle].used != 0
+}
+
+export fn file_open(path: cstring, flags: uint64) -> uint64 {
+    if (!fs_mounted() || text_empty(path)) {
+        return NO_HANDLE
+    }
+    var node: uint64 = fs_resolve(path)
+    if (node == FS_NO_INODE) {
+        if ((flags & OPEN_CREATE) == 0) {
+            return NO_HANDLE
+        }
+        node = fs_create(path, FS_FILE)
+        if (node == FS_NO_INODE) {
+            return NO_HANDLE
+        }
+    }
+    if (fs_kind(node) != FS_FILE) {
+        return NO_HANDLE
+    }
+    if ((flags & OPEN_TRUNCATE) != 0) {
+        fs_truncate(node)
+    }
+    for i: uint64 in 0..HANDLE_SLOTS {
+        if (handles[i].used == 0) {
+            handles[i].used = 1
+            handles[i].inode = node
+            handles[i].flags = flags
+            handles[i].position = 0
+            if ((flags & OPEN_APPEND) != 0) {
+                handles[i].position = fs_size(node)
+            }
+            opened++
+            return i
+        }
+    }
+    return NO_HANDLE
+}
+
+export fn file_close(handle: uint64) {
+    if (!valid(handle)) {
+        return
+    }
+    handles[handle].used = 0
+    if (opened > 0) {
+        opened--
+    }
+}
+
+export fn file_read(handle: uint64, buffer: uint64, length: uint64) -> uint64 {
+    if (!valid(handle) || (handles[handle].flags & OPEN_READ) == 0) {
+        return 0
+    }
+    var got: uint64 = fs_read(handles[handle].inode, handles[handle].position,
+                              buffer, length)
+    handles[handle].position += got
+    return got
+}
+
+export fn file_write(handle: uint64, buffer: uint64, length: uint64) -> uint64 {
+    if (!valid(handle) || (handles[handle].flags & OPEN_WRITE) == 0) {
+        return 0
+    }
+    var put: uint64 = fs_write(handles[handle].inode, handles[handle].position,
+                               buffer, length)
+    handles[handle].position += put
+    return put
+}
+
+export fn file_seek(handle: uint64, position: uint64) {
+    if (!valid(handle)) {
+        return
+    }
+    handles[handle].position = position
+}
+
+export fn file_tell(handle: uint64) -> uint64 {
+    if (!valid(handle)) {
+        return 0
+    }
+    return handles[handle].position
+}
+
+export fn file_length(handle: uint64) -> uint64 {
+    if (!valid(handle)) {
+        return 0
+    }
+    return fs_size(handles[handle].inode)
+}
+
+export fn file_at_end(handle: uint64) -> bool {
+    if (!valid(handle)) {
+        return true
+    }
+    return handles[handle].position >= fs_size(handles[handle].inode)
+}
+
+export fn file_exists(path: cstring) -> bool {
+    return fs_resolve(path) != FS_NO_INODE
+}
+
+export fn file_load(path: cstring, buffer: uint64, limit: uint64) -> uint64 {
+    var handle: uint64 = file_open(path, OPEN_READ)
+    if (handle == NO_HANDLE) {
+        return 0
+    }
+    var got: uint64 = file_read(handle, buffer, limit)
+    file_close(handle)
+    return got
+}
+
+export fn file_store(path: cstring, buffer: uint64, length: uint64) -> bool {
+    var handle: uint64 = file_open(path, OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE)
+    if (handle == NO_HANDLE) {
+        return false
+    }
+    var put: uint64 = file_write(handle, buffer, length)
+    file_close(handle)
+    return put == length
+}
+
+export fn file_append(path: cstring, buffer: uint64, length: uint64) -> bool {
+    var handle: uint64 = file_open(path, OPEN_WRITE | OPEN_CREATE | OPEN_APPEND)
+    if (handle == NO_HANDLE) {
+        return false
+    }
+    var put: uint64 = file_write(handle, buffer, length)
+    file_close(handle)
+    return put == length
+}
+
+export fn file_init() {
+    for i: uint64 in 0..HANDLE_SLOTS {
+        handles[i].used = 0
+    }
+    opened = 0
+}

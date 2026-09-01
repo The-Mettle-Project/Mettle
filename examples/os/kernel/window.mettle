@@ -19,6 +19,7 @@ struct Window {
     saved_w: uint64;
     saved_h: uint64;
     grown: uint64;
+    dirty: uint64;
     draw: fn(uint64) -> void;
     key: fn(uint64, uint8) -> void;
     click: fn(uint64, uint64, uint64) -> void;
@@ -165,10 +166,35 @@ export fn window_open(kind: uint64, x: int64, y: int64, w: uint64, h: uint64,
     windows[id].used = 1
     windows[id].hidden = 0
     windows[id].grown = 0
+    windows[id].dirty = 1
     set_title(id, title)
     stack[depth] = id
     depth++
     return id
+}
+
+export fn window_damage(id: uint64) {
+    if (window_live(id)) {
+        windows[id].dirty = 1
+    }
+}
+
+export fn window_damaged(id: uint64) -> bool {
+    return window_live(id) && windows[id].dirty != 0
+}
+
+export fn window_settle(id: uint64) {
+    if (id < WINDOW_SLOTS) {
+        windows[id].dirty = 0
+    }
+}
+
+export fn window_rename(id: uint64, title: cstring) {
+    if (!window_live(id)) {
+        return
+    }
+    set_title(id, title)
+    windows[id].dirty = 1
 }
 
 export fn window_open_plain(kind: uint64, x: int64, y: int64, w: uint64,

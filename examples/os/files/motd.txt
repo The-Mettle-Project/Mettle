@@ -1,7 +1,9 @@
 welcome to mettle os.
 
-this text is a file on the disk. the build script packed it into an archive at
-sector 1024, and the kernel read it back with its own ata driver rather than
-asking the firmware. put your own files in examples/os/files and rebuild.
+this text is a real file on a real filesystem. the build script packed it into
+an archive at sector 1024, and the first time the kernel found the partition
+blank it laid a filesystem down and wrote the archive into it. everything you
+write from here on survives a reboot.
 
-the shell runs in this window. try help, disk, mem, ps, ls, cat about.txt
+try help for the command list, df for the filesystem, disk for the drive.
+try mkdir, write, cat, cp, mv, rm. the files window browses the same tree.

@@ -1,0 +1,455 @@
+import "layout"
+import "console"
+import "heap"
+import "text"
+import "shell"
+import "fs"
+import "file"
+import "block"
+import "archive"
+import "vga"
+
+const WORD_BYTES: uint64 = 64
+const PATH_BYTES: uint64 = 256
+const COPY_CHUNK: uint64 = 8192
+const PRINTABLE_FIRST: uint8 = 32
+const PRINTABLE_LAST: uint8 = 126
+
+var word: uint8[64]
+var path: uint8[256]
+var name: uint8[48]
+
+fn split(input: cstring) -> cstring {
+    var i: uint64 = 0
+    while (input[i] != 0 && input[i] != ' ' && i + 1 < WORD_BYTES) {
+        word[i] = input[i]
+        i++
+    }
+    word[i] = 0
+    while (input[i] == ' ') {
+        i++
+    }
+    return (cstring)&input[i]
+}
+
+fn first_word(input: cstring) -> cstring {
+    split(input)
+    return (cstring)&word[0]
+}
+
+fn need_filesystem() -> bool {
+    if (fs_mounted()) {
+        return true
+    }
+    console_write_line("no filesystem is mounted")
+    return false
+}
+
+fn kind_name(kind: uint32) -> cstring {
+    if (kind == FS_DIRECTORY) {
+        return "dir "
+    }
+    return "file"
+}
+
+fn cmd_ls(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    var here: uint64 = fs_cwd()
+    if (!text_empty(argument)) {
+        here = fs_resolve(argument)
+        if (here == FS_NO_INODE) {
+            console_write("no such path ")
+            console_write_line(argument)
+            return
+        }
+    }
+    if (fs_kind(here) != FS_DIRECTORY) {
+        console_write_padded(fs_size(here), 10)
+        console_write_line(argument)
+        return
+    }
+    var entry: DirEntry
+    var count: uint64 = fs_entry_count(here)
+    var shown: uint64 = 0
+    for i: uint64 in 0..count {
+        if (!fs_entry_at(here, i, &entry)) {
+            continue
+        }
+        if (text_equals((cstring)&entry.name[0], "..")) {
+            continue
+        }
+        console_write(kind_name(entry.kind))
+        console_write("  ")
+        console_write_padded(fs_size(entry.inode), 10)
+        console_write("  ")
+        console_write_line((cstring)&entry.name[0])
+        shown++
+    }
+    if (shown == 0) {
+        console_write_line("the directory is empty")
+    }
+}
+
+export fn cmd_cat(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    if (text_empty(argument)) {
+        console_write_line("cat wants a file name, ls lists them")
+        return
+    }
+    var handle: uint64 = file_open(argument, OPEN_READ)
+    if (handle == NO_HANDLE) {
+        console_write("no such file ")
+        console_write_line(argument)
+        return
+    }
+    var buffer: uint64 = heap_alloc(COPY_CHUNK)
+    if (buffer == 0) {
+        file_close(handle)
+        console_write_line("no room for a read buffer")
+        return
+    }
+    var bytes: uint8* = (uint8*)buffer
+    var got: uint64 = file_read(handle, buffer, COPY_CHUNK)
+    while (got > 0) {
+        for i: uint64 in 0..got {
+            var ch: uint8 = bytes[i]
+            if (ch == '\n' || (ch >= PRINTABLE_FIRST && ch <= PRINTABLE_LAST)) {
+                console_put(ch)
+            }
+        }
+        got = file_read(handle, buffer, COPY_CHUNK)
+    }
+    console_put('\n')
+    heap_free(buffer)
+    file_close(handle)
+}
+
+fn cmd_pwd(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    fs_path_of(fs_cwd(), &path[0], PATH_BYTES)
+    console_write_line((cstring)&path[0])
+}
+
+fn cmd_cd(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    if (text_empty(argument)) {
+        fs_set_cwd(fs_root())
+        return
+    }
+    var target: uint64 = fs_resolve(argument)
+    if (target == FS_NO_INODE) {
+        console_write("no such path ")
+        console_write_line(argument)
+        return
+    }
+    if (fs_kind(target) != FS_DIRECTORY) {
+        console_write("not a directory ")
+        console_write_line(argument)
+        return
+    }
+    fs_set_cwd(target)
+}
+
+fn cmd_mkdir(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    if (text_empty(argument)) {
+        console_write_line("mkdir wants a name")
+        return
+    }
+    if (fs_create(argument, FS_DIRECTORY) == FS_NO_INODE) {
+        console_write("could not make ")
+        console_write_line(argument)
+    }
+}
+
+fn cmd_touch(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    if (text_empty(argument)) {
+        console_write_line("touch wants a name")
+        return
+    }
+    var handle: uint64 = file_open(argument, OPEN_WRITE | OPEN_CREATE)
+    if (handle == NO_HANDLE) {
+        console_write("could not make ")
+        console_write_line(argument)
+        return
+    }
+    file_close(handle)
+}
+
+fn cmd_rm(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    if (text_empty(argument)) {
+        console_write_line("rm wants a name")
+        return
+    }
+    if (!fs_remove(argument)) {
+        console_write("could not remove ")
+        console_write(argument)
+        console_write_line(", a directory has to be empty first")
+    }
+}
+
+fn cmd_mv(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    var rest: cstring = split(argument)
+    text_copy(&path[0], PATH_BYTES, (cstring)&word[0])
+    if (path[0] == 0 || text_empty(rest)) {
+        console_write_line("mv wants a name to move and a name to move it to")
+        return
+    }
+    if (!fs_rename((cstring)&path[0], rest)) {
+        console_write_line("could not move it")
+    }
+}
+
+fn cmd_cp(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    var rest: cstring = split(argument)
+    text_copy(&path[0], PATH_BYTES, (cstring)&word[0])
+    if (path[0] == 0 || text_empty(rest)) {
+        console_write_line("cp wants a name to copy and a name to copy it to")
+        return
+    }
+    var source: uint64 = file_open((cstring)&path[0], OPEN_READ)
+    if (source == NO_HANDLE) {
+        console_write("no such file ")
+        console_write_line((cstring)&path[0])
+        return
+    }
+    var target: uint64 = file_open(rest, OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE)
+    if (target == NO_HANDLE) {
+        file_close(source)
+        console_write("could not write ")
+        console_write_line(rest)
+        return
+    }
+    var buffer: uint64 = heap_alloc(COPY_CHUNK)
+    if (buffer == 0) {
+        file_close(source)
+        file_close(target)
+        console_write_line("no room for a copy buffer")
+        return
+    }
+    var moved: uint64 = 0
+    var got: uint64 = file_read(source, buffer, COPY_CHUNK)
+    while (got > 0) {
+        moved += file_write(target, buffer, got)
+        got = file_read(source, buffer, COPY_CHUNK)
+    }
+    heap_free(buffer)
+    file_close(source)
+    file_close(target)
+    console_write_decimal(moved)
+    console_write_line(" bytes copied")
+}
+
+fn write_line_to(argument: cstring, append: bool) {
+    var rest: cstring = split(argument)
+    text_copy(&path[0], PATH_BYTES, (cstring)&word[0])
+    if (path[0] == 0) {
+        console_write_line("it wants a file name and then the text")
+        return
+    }
+    var length: uint64 = text_length(rest)
+    var buffer: uint64 = heap_alloc(length + 1)
+    if (buffer == 0) {
+        console_write_line("no room for the text")
+        return
+    }
+    var bytes: uint8* = (uint8*)buffer
+    for i: uint64 in 0..length {
+        bytes[i] = rest[i]
+    }
+    bytes[length] = '\n'
+    var done: bool = false
+    if (append) {
+        done = file_append((cstring)&path[0], buffer, length + 1)
+    } else {
+        done = file_store((cstring)&path[0], buffer, length + 1)
+    }
+    heap_free(buffer)
+    if (!done) {
+        console_write("could not write ")
+        console_write_line((cstring)&path[0])
+    }
+}
+
+fn cmd_write(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    write_line_to(argument, false)
+}
+
+fn cmd_append(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    write_line_to(argument, true)
+}
+
+fn cmd_df(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    var used: uint64 = fs_total_blocks() - fs_free_blocks()
+    console_write("blocks ")
+    console_write_decimal(used)
+    console_write(" used of ")
+    console_write_decimal(fs_total_blocks())
+    console_write(", ")
+    console_write_decimal(fs_free_blocks() * BLOCK_BYTES / BYTES_PER_MB)
+    console_write_line(" mb free")
+    console_write("inodes ")
+    console_write_decimal(fs_total_inodes() - fs_free_inodes())
+    console_write(" used of ")
+    console_write_decimal(fs_total_inodes())
+    console_write_line("")
+    console_write("cache ")
+    console_write_decimal(block_hits())
+    console_write(" hits, ")
+    console_write_decimal(block_misses())
+    console_write(" misses, ")
+    console_write_decimal(block_writes())
+    console_write_line(" writes")
+}
+
+export fn fs_install_archive() -> uint64 {
+    var installed: uint64 = 0
+    for i: uint64 in 0..archive_count() {
+        if (file_store(archive_name(i), (uint64)archive_data(i),
+                       archive_length(i))) {
+            installed++
+        }
+    }
+    return installed
+}
+
+fn cmd_install(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    var installed: uint64 = fs_install_archive()
+    console_write_decimal(installed)
+    console_write(" of ")
+    console_write_decimal(archive_count())
+    console_write_line(" files written from the boot archive")
+}
+
+fn cmd_format(argument: cstring) {
+    if (!text_equals(first_word(argument), "yes")) {
+        console_write_line("this erases the partition, type format yes to mean it")
+        return
+    }
+    if (!fs_format()) {
+        console_write_line("the format failed")
+        return
+    }
+    var installed: uint64 = fs_install_archive()
+    console_write("formatted, ")
+    console_write_decimal(installed)
+    console_write_line(" files written back from the boot archive")
+}
+
+const SCRIPT_BYTES: uint64 = 4096
+
+export fn fs_run_script(name: cstring, announce: bool) -> uint64 {
+    if (!fs_mounted() || !file_exists(name)) {
+        return 0
+    }
+    var buffer: uint64 = heap_alloc(SCRIPT_BYTES + 1)
+    if (buffer == 0) {
+        return 0
+    }
+    var bytes: uint8* = (uint8*)buffer
+    var got: uint64 = file_load(name, buffer, SCRIPT_BYTES)
+    bytes[got] = 0
+    var line: uint8[256]
+    var out: uint64 = 0
+    var ran: uint64 = 0
+    for i: uint64 in 0..(got + 1) {
+        var ch: uint8 = 0
+        if (i < got) {
+            ch = bytes[i]
+        }
+        if (ch == 13) {
+            continue
+        }
+        if (ch != 0 && ch != 10 && out + 1 < 256) {
+            line[out] = ch
+            out++
+            continue
+        }
+        line[out] = 0
+        if (out > 0 && line[0] != '#') {
+            if (announce) {
+                console_write_colored("script> ", COLOR_PROMPT)
+                console_write_line((cstring)&line[0])
+            }
+            shell_dispatch((cstring)&line[0])
+            ran++
+        }
+        out = 0
+    }
+    heap_free(buffer)
+    return ran
+}
+
+export fn fs_run_startup() {
+    fs_run_script("startup.txt", false)
+}
+
+fn cmd_run(argument: cstring) {
+    if (!need_filesystem()) {
+        return
+    }
+    if (text_empty(argument)) {
+        console_write_line("run wants the name of a file of commands")
+        return
+    }
+    if (!file_exists(argument)) {
+        console_write("no such file ")
+        console_write_line(argument)
+        return
+    }
+    var ran: uint64 = fs_run_script(argument, true)
+    console_write_decimal(ran)
+    console_write_line(" lines run")
+}
+
+export fn fs_commands_init() {
+    shell_register("run", "run a file of commands", &cmd_run)
+    shell_register("ls", "what is in a directory", &cmd_ls)
+    shell_register("cat", "print a file", &cmd_cat)
+    shell_register("pwd", "the directory you are in", &cmd_pwd)
+    shell_register("cd", "change directory", &cmd_cd)
+    shell_register("mkdir", "make a directory", &cmd_mkdir)
+    shell_register("touch", "make an empty file", &cmd_touch)
+    shell_register("rm", "remove a file or an empty directory", &cmd_rm)
+    shell_register("mv", "rename or move something", &cmd_mv)
+    shell_register("cp", "copy a file", &cmd_cp)
+    shell_register("write", "write a line to a file", &cmd_write)
+    shell_register("append", "add a line to a file", &cmd_append)
+    shell_register("df", "what the filesystem is using", &cmd_df)
+    shell_register("install", "write the boot archive into the filesystem", &cmd_install)
+    shell_register("format", "lay a fresh filesystem on the partition", &cmd_format)
+}
