@@ -106,6 +106,9 @@ static double aggregate_number_as_double(const AggregateNumber *value) {
  * `float64[]` table is exactly the kind of thing an aggregate constant is for.
  * Returns 0 without reporting when the expression is not a constant; the caller
  * reports, because it knows which element is at fault. */
+static int aggregate_fold_binary(TypeChecker *checker, ASTNode *expression,
+                                 AggregateNumber *out);
+
 static int aggregate_fold_number(TypeChecker *checker, ASTNode *expression,
                                  AggregateNumber *out) {
   if (!expression || !out) {
@@ -199,82 +202,8 @@ static int aggregate_fold_number(TypeChecker *checker, ASTNode *expression,
     return 0;
   }
 
-  case AST_BINARY_EXPRESSION: {
-    BinaryExpression *binary = (BinaryExpression *)expression->data;
-    AggregateNumber left = {0};
-    AggregateNumber right = {0};
-    if (!binary || !binary->operator|| !binary->left || !binary->right ||
-        !aggregate_fold_number(checker, binary->left, &left) ||
-        !aggregate_fold_number(checker, binary->right, &right)) {
-      return 0;
-    }
-    const char *op = binary->operator;
-    if (left.is_float || right.is_float) {
-      double l = aggregate_number_as_double(&left);
-      double r = aggregate_number_as_double(&right);
-      double result = 0.0;
-      if (strcmp(op, "+") == 0) {
-        result = l + r;
-      } else if (strcmp(op, "-") == 0) {
-        result = l - r;
-      } else if (strcmp(op, "*") == 0) {
-        result = l * r;
-      } else if (strcmp(op, "/") == 0) {
-        if (r == 0.0) {
-          return 0;
-        }
-        result = l / r;
-      } else {
-        return 0;
-      }
-      out->is_float = 1;
-      out->float_value = result;
-      out->int_value = (long long)result;
-      return 1;
-    }
-    long long value = 0;
-    if (!type_checker_eval_integer_constant_with_checker(checker, expression,
-                                                         &value)) {
-      /* Both sides already folded to integers above, so the operands are
-       * constant whether or not the shared integer folder can see them --
-       * a named const resolved from its symbol is the case it cannot. */
-      long long l = left.int_value;
-      long long r = right.int_value;
-      if (strcmp(op, "+") == 0) {
-        value = l + r;
-      } else if (strcmp(op, "-") == 0) {
-        value = l - r;
-      } else if (strcmp(op, "*") == 0) {
-        value = l * r;
-      } else if (strcmp(op, "/") == 0) {
-        if (r == 0) {
-          return 0;
-        }
-        value = l / r;
-      } else if (strcmp(op, "%") == 0) {
-        if (r == 0) {
-          return 0;
-        }
-        value = l % r;
-      } else if (strcmp(op, "<<") == 0 && r >= 0 && r < 64) {
-        value = (long long)((unsigned long long)l << r);
-      } else if (strcmp(op, ">>") == 0 && r >= 0 && r < 64) {
-        value = l >> r;
-      } else if (strcmp(op, "&") == 0) {
-        value = l & r;
-      } else if (strcmp(op, "|") == 0) {
-        value = l | r;
-      } else if (strcmp(op, "^") == 0) {
-        value = l ^ r;
-      } else {
-        return 0;
-      }
-    }
-    out->is_float = 0;
-    out->int_value = value;
-    out->float_value = (double)value;
-    return 1;
-  }
+  case AST_BINARY_EXPRESSION:
+    return aggregate_fold_binary(checker, expression, out);
 
   case AST_CAST_EXPRESSION: {
     CastExpression *cast = (CastExpression *)expression->data;
@@ -315,6 +244,84 @@ static int aggregate_fold_number(TypeChecker *checker, ASTNode *expression,
   default:
     return 0;
   }
+}
+
+static int aggregate_fold_binary(TypeChecker *checker, ASTNode *expression,
+                                 AggregateNumber *out) {
+  BinaryExpression *binary = (BinaryExpression *)expression->data;
+  AggregateNumber left = {0};
+  AggregateNumber right = {0};
+  if (!binary || !binary->operator|| !binary->left || !binary->right ||
+      !aggregate_fold_number(checker, binary->left, &left) ||
+      !aggregate_fold_number(checker, binary->right, &right)) {
+    return 0;
+  }
+  const char *op = binary->operator;
+  if (left.is_float || right.is_float) {
+    double l = aggregate_number_as_double(&left);
+    double r = aggregate_number_as_double(&right);
+    double result = 0.0;
+    if (strcmp(op, "+") == 0) {
+      result = l + r;
+    } else if (strcmp(op, "-") == 0) {
+      result = l - r;
+    } else if (strcmp(op, "*") == 0) {
+      result = l * r;
+    } else if (strcmp(op, "/") == 0) {
+      if (r == 0.0) {
+        return 0;
+      }
+      result = l / r;
+    } else {
+      return 0;
+    }
+    out->is_float = 1;
+    out->float_value = result;
+    out->int_value = (long long)result;
+    return 1;
+  }
+  long long value = 0;
+  if (!type_checker_eval_integer_constant_with_checker(checker, expression,
+                                                       &value)) {
+    /* Both sides already folded to integers above, so the operands are
+     * constant whether or not the shared integer folder can see them --
+     * a named const resolved from its symbol is the case it cannot. */
+    long long l = left.int_value;
+    long long r = right.int_value;
+    if (strcmp(op, "+") == 0) {
+      value = l + r;
+    } else if (strcmp(op, "-") == 0) {
+      value = l - r;
+    } else if (strcmp(op, "*") == 0) {
+      value = l * r;
+    } else if (strcmp(op, "/") == 0) {
+      if (r == 0) {
+        return 0;
+      }
+      value = l / r;
+    } else if (strcmp(op, "%") == 0) {
+      if (r == 0) {
+        return 0;
+      }
+      value = l % r;
+    } else if (strcmp(op, "<<") == 0 && r >= 0 && r < 64) {
+      value = (long long)((unsigned long long)l << r);
+    } else if (strcmp(op, ">>") == 0 && r >= 0 && r < 64) {
+      value = l >> r;
+    } else if (strcmp(op, "&") == 0) {
+      value = l & r;
+    } else if (strcmp(op, "|") == 0) {
+      value = l | r;
+    } else if (strcmp(op, "^") == 0) {
+      value = l ^ r;
+    } else {
+      return 0;
+    }
+  }
+  out->is_float = 0;
+  out->int_value = value;
+  out->float_value = (double)value;
+  return 1;
 }
 
 /* `&name`: the address of a module symbol, known only at link time. Returns the

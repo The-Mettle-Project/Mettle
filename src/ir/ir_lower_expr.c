@@ -174,6 +174,11 @@ static void ir_declare_string_concat_helper(IRLoweringContext *context) {
   ir_program_add_symbol(context->program, &entry);
 }
 
+static int ir_lower_interpolation(IRLoweringContext *context,
+                                  IRFunction *function,
+                                  ASTNode *expression,
+                                  IROperand *out_value);
+
 int ir_lower_call_expression(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *expression,
                                     IROperand *out_value) {
@@ -270,134 +275,7 @@ int ir_lower_call_expression(IRLoweringContext *context,
    * picks, the same injected-call scheme mettle_string_eq uses. A string value
    * passes through untouched. */
   if (strcmp(call->function_name, "__mtl_interp") == 0) {
-    if (call->argument_count != 1 || !call->arguments || !call->arguments[0] ||
-        !context->type_checker) {
-      ir_set_error(context, "Malformed string interpolation");
-      return 0;
-    }
-    ASTNode *value_node = call->arguments[0];
-    Type *value_type = type_checker_infer_type(context->type_checker,
-                                               value_node);
-    if (!value_type) {
-      ir_set_error(context, "Cannot determine interpolated value type");
-      return 0;
-    }
-
-    IROperand operand = ir_operand_none();
-    if (!ir_lower_expression(context, function, value_node, &operand)) {
-      return 0;
-    }
-    if (value_type->kind == TYPE_STRING) {
-      *out_value = operand;
-      return 1;
-    }
-
-    const char *helper = NULL;
-    const char *widen_to = NULL;
-    int source_is_float = 0;
-    int source_float_bits = 0;
-    switch (value_type->kind) {
-    case TYPE_BOOL:
-      helper = "mettle_string_from_bool";
-      widen_to = "int64";
-      break;
-    /* The whole reason `char` is its own type: "{c}" writes the character,
-     * where the uint8 holding the same byte would write its number. */
-    case TYPE_CHAR:
-      helper = "mettle_string_from_char";
-      widen_to = "int64";
-      break;
-    case TYPE_INT8:
-    case TYPE_INT16:
-    case TYPE_INT32:
-      helper = "mettle_string_from_int";
-      widen_to = "int64";
-      break;
-    case TYPE_INT64:
-      helper = "mettle_string_from_int";
-      break;
-    case TYPE_UINT8:
-    case TYPE_UINT16:
-    case TYPE_UINT32:
-      helper = "mettle_string_from_uint";
-      widen_to = "uint64";
-      break;
-    case TYPE_UINT64:
-      helper = "mettle_string_from_uint";
-      break;
-    case TYPE_FLOAT32:
-      helper = "mettle_string_from_f64";
-      widen_to = "float64";
-      source_is_float = 1;
-      source_float_bits = 32;
-      break;
-    case TYPE_FLOAT64:
-      helper = "mettle_string_from_f64";
-      break;
-    default:
-      ir_operand_destroy(&operand);
-      ir_set_error(context, "Cannot interpolate a value of type '%s'",
-                   value_type->name ? value_type->name : "?");
-      return 0;
-    }
-
-    if (widen_to) {
-      IROperand widened = ir_operand_none();
-      if (!ir_make_temp_operand(context, &widened)) {
-        ir_operand_destroy(&operand);
-        return 0;
-      }
-      IRInstruction cast = {0};
-      cast.op = IR_OP_CAST;
-      cast.location = expression->location;
-      cast.dest = widened;
-      cast.lhs = operand;
-      cast.text = (char *)widen_to;
-      cast.is_float = source_is_float;
-      if (source_is_float) {
-        cast.float_bits = source_float_bits;
-        cast.dest.float_bits = 64;
-        widened.float_bits = 64;
-      }
-      int cast_ok = ir_emit(context, function, &cast);
-      ir_operand_destroy(&operand);
-      if (!cast_ok) {
-        ir_operand_destroy(&widened);
-        return 0;
-      }
-      operand = widened;
-    }
-    /* mettle_string_from_f64 takes the value's raw bits in a GP register (the
-     * symbol-less call has no parameter types for float routing), so a float64
-     * operand passes through untagged. */
-
-    ir_declare_interpolation_helper(context, helper);
-
-    IROperand converted = ir_operand_none();
-    if (!ir_make_temp_operand(context, &converted)) {
-      ir_operand_destroy(&operand);
-      return 0;
-    }
-    IROperand helper_args[1];
-    helper_args[0] = operand;
-    IRInstruction convert = {0};
-    convert.op = IR_OP_CALL;
-    convert.location = expression->location;
-    convert.dest = converted;
-    convert.text = (char *)helper;
-    convert.arguments = helper_args;
-    convert.argument_count = 1;
-    convert.value_type =
-        mtlc_type_from_frontend(context->type_checker->builtin_string);
-    convert.allocates = 1;
-    int convert_ok = ir_emit(context, function, &convert);
-    ir_operand_destroy(&operand);
-    if (!convert_ok) {
-      ir_operand_destroy(&converted);
-      return 0;
-    }
-    *out_value = converted;
-    return 1;
+    return ir_lower_interpolation(context, function, expression, out_value);
   }
 
   if (call->is_gpu_async_copy) {
@@ -1106,6 +984,141 @@ int ir_lower_call_expression(IRLoweringContext *context,
   free(arguments);
 
   *out_value = destination;
+  return 1;
+}
+
+static int ir_lower_interpolation(IRLoweringContext *context,
+                                  IRFunction *function,
+                                  ASTNode *expression,
+                                  IROperand *out_value) {
+  CallExpression *call = (CallExpression *)expression->data;
+  if (call->argument_count != 1 || !call->arguments || !call->arguments[0] ||
+      !context->type_checker) {
+    ir_set_error(context, "Malformed string interpolation");
+    return 0;
+  }
+  ASTNode *value_node = call->arguments[0];
+  Type *value_type = type_checker_infer_type(context->type_checker,
+                                             value_node);
+  if (!value_type) {
+    ir_set_error(context, "Cannot determine interpolated value type");
+    return 0;
+  }
+
+  IROperand operand = ir_operand_none();
+  if (!ir_lower_expression(context, function, value_node, &operand)) {
+    return 0;
+  }
+  if (value_type->kind == TYPE_STRING) {
+    *out_value = operand;
+    return 1;
+  }
+
+  const char *helper = NULL;
+  const char *widen_to = NULL;
+  int source_is_float = 0;
+  int source_float_bits = 0;
+  switch (value_type->kind) {
+  case TYPE_BOOL:
+    helper = "mettle_string_from_bool";
+    widen_to = "int64";
+    break;
+  /* The whole reason `char` is its own type: "{c}" writes the character,
+   * where the uint8 holding the same byte would write its number. */
+  case TYPE_CHAR:
+    helper = "mettle_string_from_char";
+    widen_to = "int64";
+    break;
+  case TYPE_INT8:
+  case TYPE_INT16:
+  case TYPE_INT32:
+    helper = "mettle_string_from_int";
+    widen_to = "int64";
+    break;
+  case TYPE_INT64:
+    helper = "mettle_string_from_int";
+    break;
+  case TYPE_UINT8:
+  case TYPE_UINT16:
+  case TYPE_UINT32:
+    helper = "mettle_string_from_uint";
+    widen_to = "uint64";
+    break;
+  case TYPE_UINT64:
+    helper = "mettle_string_from_uint";
+    break;
+  case TYPE_FLOAT32:
+    helper = "mettle_string_from_f64";
+    widen_to = "float64";
+    source_is_float = 1;
+    source_float_bits = 32;
+    break;
+  case TYPE_FLOAT64:
+    helper = "mettle_string_from_f64";
+    break;
+  default:
+    ir_operand_destroy(&operand);
+    ir_set_error(context, "Cannot interpolate a value of type '%s'",
+                 value_type->name ? value_type->name : "?");
+    return 0;
+  }
+
+  if (widen_to) {
+    IROperand widened = ir_operand_none();
+    if (!ir_make_temp_operand(context, &widened)) {
+      ir_operand_destroy(&operand);
+      return 0;
+    }
+    IRInstruction cast = {0};
+    cast.op = IR_OP_CAST;
+    cast.location = expression->location;
+    cast.dest = widened;
+    cast.lhs = operand;
+    cast.text = (char *)widen_to;
+    cast.is_float = source_is_float;
+    if (source_is_float) {
+      cast.float_bits = source_float_bits;
+      cast.dest.float_bits = 64;
+      widened.float_bits = 64;
+    }
+    int cast_ok = ir_emit(context, function, &cast);
+    ir_operand_destroy(&operand);
+    if (!cast_ok) {
+      ir_operand_destroy(&widened);
+      return 0;
+    }
+    operand = widened;
+  }
+  /* mettle_string_from_f64 takes the value's raw bits in a GP register (the
+   * symbol-less call has no parameter types for float routing), so a float64
+   * operand passes through untagged. */
+
+  ir_declare_interpolation_helper(context, helper);
+
+  IROperand converted = ir_operand_none();
+  if (!ir_make_temp_operand(context, &converted)) {
+    ir_operand_destroy(&operand);
+    return 0;
+  }
+  IROperand helper_args[1];
+  helper_args[0] = operand;
+  IRInstruction convert = {0};
+  convert.op = IR_OP_CALL;
+  convert.location = expression->location;
+  convert.dest = converted;
+  convert.text = (char *)helper;
+  convert.arguments = helper_args;
+  convert.argument_count = 1;
+  convert.value_type =
+      mtlc_type_from_frontend(context->type_checker->builtin_string);
+  convert.allocates = 1;
+  int convert_ok = ir_emit(context, function, &convert);
+  ir_operand_destroy(&operand);
+  if (!convert_ok) {
+    ir_operand_destroy(&converted);
+    return 0;
+  }
+  *out_value = converted;
   return 1;
 }
 

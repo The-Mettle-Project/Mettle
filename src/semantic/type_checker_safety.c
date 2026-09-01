@@ -759,6 +759,10 @@ static int eval_comptime_from_symbol(TypeChecker *checker, Symbol *symbol,
   return 0;
 }
 
+static int type_checker_eval_comptime_member(TypeChecker *checker,
+                                             ASTNode *expression,
+                                             ComptimeValue *out_value);
+
 int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
                                ComptimeValue *out_value) {
   if (!checker || !expression || !out_value) {
@@ -862,60 +866,8 @@ int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
     return 0;
   }
 
-  case AST_MEMBER_ACCESS: {
-    MemberAccess *member = (MemberAccess *)expression->data;
-    if (!member || !member->object || !member->member) {
-      return 0;
-    }
-    ComptimeValue owner = comptime_none();
-    if (!type_checker_eval_comptime(checker, member->object, &owner)) {
-      return 0;
-    }
-    if (owner.kind == COMPTIME_FIELD_REF) {
-      return type_checker_eval_field_member(checker, owner, member->member,
-                                            out_value);
-    }
-    if (owner.kind == COMPTIME_SEQUENCE) {
-      return type_checker_eval_sequence_member(checker, owner, member->member,
-                                               out_value);
-    }
-    if (owner.kind == COMPTIME_ROW) {
-      return type_checker_eval_row_member(checker, owner, member->member,
-                                          out_value);
-    }
-    if (owner.kind != COMPTIME_TYPE_REF) {
-      return 0;
-    }
-    Type *referred =
-        type_checker_type_from_index(checker, owner.as.type_ref.type_index);
-    if (!referred) {
-      return 0;
-    }
-    /* `Color.Red` on a plain enum reads the member off the type table rather
-     * than the variant's bare global, so a compiler-registered enum that
-     * deliberately declares no bare globals still folds. */
-    if (referred->kind == TYPE_ENUM) {
-      for (size_t i = 0; i < referred->enum_member_count; i++) {
-        if (referred->enum_member_names[i] &&
-            strcmp(referred->enum_member_names[i], member->member) == 0) {
-          *out_value = comptime_int(referred->enum_member_values[i]);
-          return 1;
-        }
-      }
-      /* Not a variant, so fall through: an enum type answers the same shape
-       * queries every other type does (`typeof(Color).kind`). */
-    }
-    /* A struct field named the same as a query wins: the program's own
-     * declaration is never shadowed by the reflection surface. */
-    int field_index = type_get_field_index(referred, member->member);
-    if (field_index >= 0) {
-      *out_value = comptime_field_ref(owner.as.type_ref.type_index,
-                                      (uint32_t)field_index);
-      return 1;
-    }
-    return type_checker_eval_type_member(checker, owner, member->member,
-                                         out_value);
-  }
+  case AST_MEMBER_ACCESS:
+    return type_checker_eval_comptime_member(checker, expression, out_value);
 
   case AST_INDEX_EXPRESSION: {
     ArrayIndexExpression *index_expr =
@@ -938,6 +890,63 @@ int type_checker_eval_comptime(TypeChecker *checker, ASTNode *expression,
   default:
     return 0;
   }
+}
+
+static int type_checker_eval_comptime_member(TypeChecker *checker,
+                                             ASTNode *expression,
+                                             ComptimeValue *out_value) {
+  MemberAccess *member = (MemberAccess *)expression->data;
+  if (!member || !member->object || !member->member) {
+    return 0;
+  }
+  ComptimeValue owner = comptime_none();
+  if (!type_checker_eval_comptime(checker, member->object, &owner)) {
+    return 0;
+  }
+  if (owner.kind == COMPTIME_FIELD_REF) {
+    return type_checker_eval_field_member(checker, owner, member->member,
+                                          out_value);
+  }
+  if (owner.kind == COMPTIME_SEQUENCE) {
+    return type_checker_eval_sequence_member(checker, owner, member->member,
+                                             out_value);
+  }
+  if (owner.kind == COMPTIME_ROW) {
+    return type_checker_eval_row_member(checker, owner, member->member,
+                                        out_value);
+  }
+  if (owner.kind != COMPTIME_TYPE_REF) {
+    return 0;
+  }
+  Type *referred =
+      type_checker_type_from_index(checker, owner.as.type_ref.type_index);
+  if (!referred) {
+    return 0;
+  }
+  /* `Color.Red` on a plain enum reads the member off the type table rather
+   * than the variant's bare global, so a compiler-registered enum that
+   * deliberately declares no bare globals still folds. */
+  if (referred->kind == TYPE_ENUM) {
+    for (size_t i = 0; i < referred->enum_member_count; i++) {
+      if (referred->enum_member_names[i] &&
+          strcmp(referred->enum_member_names[i], member->member) == 0) {
+        *out_value = comptime_int(referred->enum_member_values[i]);
+        return 1;
+      }
+    }
+    /* Not a variant, so fall through: an enum type answers the same shape
+     * queries every other type does (`typeof(Color).kind`). */
+  }
+  /* A struct field named the same as a query wins: the program's own
+   * declaration is never shadowed by the reflection surface. */
+  int field_index = type_get_field_index(referred, member->member);
+  if (field_index >= 0) {
+    *out_value = comptime_field_ref(owner.as.type_ref.type_index,
+                                    (uint32_t)field_index);
+    return 1;
+  }
+  return type_checker_eval_type_member(checker, owner, member->member,
+                                       out_value);
 }
 
 int type_checker_validate_static_assert(TypeChecker *checker,

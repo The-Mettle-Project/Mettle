@@ -1356,39 +1356,8 @@ int type_checker_is_cast_valid(Type *from, Type *to) {
 
 // Type compatibility and conversion functions implementation
 
-int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
-                               Type *src_type) {
-  if (type_is_comptime_only(dest_type) || type_is_comptime_only(src_type)) {
-    return dest_type && src_type &&
-           type_checker_types_equal(dest_type, src_type);
-  }
-  if (!checker || !dest_type || !src_type)
-    return 0;
-
-  /* A closure (function-pointer type carrying an environment) and a thin
-   * function pointer are not interchangeable: a thin call site dispatches
-   * without the environment, and a closure call site reads a code pointer the
-   * thin value does not carry. Closures cross boundaries only as `Fn(...)->R`. */
-  {
-    int src_is_closure = src_type->kind == TYPE_FUNCTION_POINTER &&
-                         src_type->closure_env;
-    int dst_is_closure = dest_type->kind == TYPE_FUNCTION_POINTER &&
-                         dest_type->closure_env;
-    int src_is_thin_fn =
-        src_type->kind == TYPE_FUNCTION_POINTER && !src_type->closure_env;
-    int dst_is_thin_fn =
-        dest_type->kind == TYPE_FUNCTION_POINTER && !dest_type->closure_env;
-    if ((src_is_closure && dst_is_thin_fn) ||
-        (dst_is_closure && src_is_thin_fn)) {
-      return 0;
-    }
-  }
-
-  if (type_checker_types_equal(dest_type, src_type)) {
-    return 1;
-  }
-
-  /* A Mettle string can flow to a cstring by exposing its chars pointer. */
+static int type_checker_pointer_conversion_allowed(Type *dest_type,
+                                                   Type *src_type) {
   if (type_checker_is_cstring_type(dest_type) &&
       src_type->kind == TYPE_STRING) {
     return 1;
@@ -1435,6 +1404,45 @@ int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
   if (dest_type->kind == TYPE_POINTER && src_type->kind == TYPE_ARRAY &&
       dest_type->base_type && src_type->base_type &&
       type_checker_types_equal(dest_type->base_type, src_type->base_type)) {
+    return 1;
+  }
+  return 0;
+}
+
+int type_checker_is_assignable(TypeChecker *checker, Type *dest_type,
+                               Type *src_type) {
+  if (type_is_comptime_only(dest_type) || type_is_comptime_only(src_type)) {
+    return dest_type && src_type &&
+           type_checker_types_equal(dest_type, src_type);
+  }
+  if (!checker || !dest_type || !src_type)
+    return 0;
+
+  /* A closure (function-pointer type carrying an environment) and a thin
+   * function pointer are not interchangeable: a thin call site dispatches
+   * without the environment, and a closure call site reads a code pointer the
+   * thin value does not carry. Closures cross boundaries only as `Fn(...)->R`. */
+  {
+    int src_is_closure = src_type->kind == TYPE_FUNCTION_POINTER &&
+                         src_type->closure_env;
+    int dst_is_closure = dest_type->kind == TYPE_FUNCTION_POINTER &&
+                         dest_type->closure_env;
+    int src_is_thin_fn =
+        src_type->kind == TYPE_FUNCTION_POINTER && !src_type->closure_env;
+    int dst_is_thin_fn =
+        dest_type->kind == TYPE_FUNCTION_POINTER && !dest_type->closure_env;
+    if ((src_is_closure && dst_is_thin_fn) ||
+        (dst_is_closure && src_is_thin_fn)) {
+      return 0;
+    }
+  }
+
+  if (type_checker_types_equal(dest_type, src_type)) {
+    return 1;
+  }
+
+  /* A Mettle string can flow to a cstring by exposing its chars pointer. */
+  if (type_checker_pointer_conversion_allowed(dest_type, src_type)) {
     return 1;
   }
 

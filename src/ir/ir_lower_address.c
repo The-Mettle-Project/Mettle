@@ -997,6 +997,12 @@ int ir_emit_binary_instruction(IRLoweringContext *context,
   return ir_emit(context, function, &instruction);
 }
 
+static int ir_lower_member_address(IRLoweringContext *context,
+                                   IRFunction *function,
+                                   ASTNode *expression,
+                                   IROperand *out_address,
+                                   Type **out_type);
+
 int ir_lower_lvalue_address(IRLoweringContext *context,
                                    IRFunction *function, ASTNode *expression,
                                    IROperand *out_address, Type **out_type) {
@@ -1057,106 +1063,9 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
                                      expression->location, out_address);
   }
 
-  case AST_MEMBER_ACCESS: {
-    MemberAccess *member = (MemberAccess *)expression->data;
-    if (!member || !member->object || !member->member) {
-      ir_set_error(context, "Malformed member access lvalue");
-      return 0;
-    }
-
-    IROperand object_address = ir_operand_none();
-    Type *object_type = ir_infer_expression_type(context, member->object);
-    /* A field reached through a pointer is checked once the field's offset and
-     * width are known, a few statements below. Reaching one through an inline
-     * struct needs no check: the object's own storage is what bounds it, and
-     * whatever produced that storage was checked already. */
-    int base_is_pointer = 0;
-
-    if (object_type && object_type->kind == TYPE_POINTER) {
-      if (!ir_lower_expression(context, function, member->object,
-                               &object_address)) {
-        return 0;
-      }
-      base_is_pointer = 1;
-      if (!context->emit_safety_checks &&
-          !ir_emit_null_check(context, function, expression->location,
-                              &object_address)) {
-        ir_operand_destroy(&object_address);
-        return 0;
-      }
-      object_type = object_type->base_type;
-    } else {
-      /* `string` takes the struct path. It is a {chars, length} record, so the
-       * fields are measured from the record's address, and that is what the
-       * lvalue walk yields for a local, a parameter, or a field of another
-       * aggregate alike. Reading the object as a VALUE here was the other half
-       * of the two-representations problem: it worked for a parameter, whose
-       * slot happens to hold a pointer, and read a local's own first eight
-       * bytes as the base address. */
-      if (!ir_lower_lvalue_address(context, function, member->object,
-                                   &object_address, &object_type)) {
-        return 0;
-      }
-    }
-    if (!object_type || (object_type->kind != TYPE_STRUCT &&
-                         object_type->kind != TYPE_STRING &&
-                         object_type->kind != TYPE_SLICE)) {
-      ir_operand_destroy(&object_address);
-      ir_set_error(context,
-                   "Member access requires struct or string lvalue object");
-      return 0;
-    }
-
-    Type *field_type = type_get_field_type(object_type, member->member);
-    size_t field_offset = type_get_field_offset(object_type, member->member);
-    if (!field_type || field_offset == (size_t)-1) {
-      ir_operand_destroy(&object_address);
-      ir_set_error(context, "Unknown struct field '%s'", member->member);
-      return 0;
-    }
-
-    if (out_type) {
-      *out_type = field_type;
-    }
-
-    if (base_is_pointer) {
-      char described[128];
-      ir_safety_describe(expression, described, sizeof(described), 0);
-      IROperand field_offset_operand = ir_operand_int((long long)field_offset);
-      int checked = ir_emit_safety_check(
-          context, function, expression->location, &object_address,
-          &field_offset_operand, (long long)field_type->size,
-          IR_SAFETY_EXTENT_UNKNOWN, IR_SAFETY_ACCESS_READ, described);
-      ir_operand_destroy(&field_offset_operand);
-      if (!checked) {
-        ir_operand_destroy(&object_address);
-        return 0;
-      }
-    }
-
-    IROperand field_address = ir_operand_none();
-    if (!ir_make_temp_operand(context, &field_address)) {
-      ir_operand_destroy(&object_address);
-      return 0;
-    }
-
-    IRInstruction add = {0};
-    add.op = IR_OP_BINARY;
-    add.location = expression->location;
-    add.dest = field_address;
-    add.lhs = object_address;
-    add.rhs = ir_operand_int((long long)field_offset);
-    add.text = "+";
-    if (!ir_emit(context, function, &add)) {
-      ir_operand_destroy(&field_address);
-      ir_operand_destroy(&object_address);
-      return 0;
-    }
-
-    ir_operand_destroy(&object_address);
-    *out_address = field_address;
-    return 1;
-  }
+  case AST_MEMBER_ACCESS:
+    return ir_lower_member_address(context, function, expression,
+                                   out_address, out_type);
 
   case AST_INDEX_EXPRESSION: {
     ArrayIndexExpression *index_expression =
@@ -1467,4 +1376,109 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
                                      expression->location, out_address);
   }
   }
+}
+
+static int ir_lower_member_address(IRLoweringContext *context,
+                                   IRFunction *function,
+                                   ASTNode *expression,
+                                   IROperand *out_address,
+                                   Type **out_type) {
+  MemberAccess *member = (MemberAccess *)expression->data;
+  if (!member || !member->object || !member->member) {
+    ir_set_error(context, "Malformed member access lvalue");
+    return 0;
+  }
+
+  IROperand object_address = ir_operand_none();
+  Type *object_type = ir_infer_expression_type(context, member->object);
+  /* A field reached through a pointer is checked once the field's offset and
+   * width are known, a few statements below. Reaching one through an inline
+   * struct needs no check: the object's own storage is what bounds it, and
+   * whatever produced that storage was checked already. */
+  int base_is_pointer = 0;
+
+  if (object_type && object_type->kind == TYPE_POINTER) {
+    if (!ir_lower_expression(context, function, member->object,
+                             &object_address)) {
+      return 0;
+    }
+    base_is_pointer = 1;
+    if (!context->emit_safety_checks &&
+        !ir_emit_null_check(context, function, expression->location,
+                            &object_address)) {
+      ir_operand_destroy(&object_address);
+      return 0;
+    }
+    object_type = object_type->base_type;
+  } else {
+    /* `string` takes the struct path. It is a {chars, length} record, so the
+     * fields are measured from the record's address, and that is what the
+     * lvalue walk yields for a local, a parameter, or a field of another
+     * aggregate alike. Reading the object as a VALUE here was the other half
+     * of the two-representations problem: it worked for a parameter, whose
+     * slot happens to hold a pointer, and read a local's own first eight
+     * bytes as the base address. */
+    if (!ir_lower_lvalue_address(context, function, member->object,
+                                 &object_address, &object_type)) {
+      return 0;
+    }
+  }
+  if (!object_type || (object_type->kind != TYPE_STRUCT &&
+                       object_type->kind != TYPE_STRING &&
+                       object_type->kind != TYPE_SLICE)) {
+    ir_operand_destroy(&object_address);
+    ir_set_error(context,
+                 "Member access requires struct or string lvalue object");
+    return 0;
+  }
+
+  Type *field_type = type_get_field_type(object_type, member->member);
+  size_t field_offset = type_get_field_offset(object_type, member->member);
+  if (!field_type || field_offset == (size_t)-1) {
+    ir_operand_destroy(&object_address);
+    ir_set_error(context, "Unknown struct field '%s'", member->member);
+    return 0;
+  }
+
+  if (out_type) {
+    *out_type = field_type;
+  }
+
+  if (base_is_pointer) {
+    char described[128];
+    ir_safety_describe(expression, described, sizeof(described), 0);
+    IROperand field_offset_operand = ir_operand_int((long long)field_offset);
+    int checked = ir_emit_safety_check(
+        context, function, expression->location, &object_address,
+        &field_offset_operand, (long long)field_type->size,
+        IR_SAFETY_EXTENT_UNKNOWN, IR_SAFETY_ACCESS_READ, described);
+    ir_operand_destroy(&field_offset_operand);
+    if (!checked) {
+      ir_operand_destroy(&object_address);
+      return 0;
+    }
+  }
+
+  IROperand field_address = ir_operand_none();
+  if (!ir_make_temp_operand(context, &field_address)) {
+    ir_operand_destroy(&object_address);
+    return 0;
+  }
+
+  IRInstruction add = {0};
+  add.op = IR_OP_BINARY;
+  add.location = expression->location;
+  add.dest = field_address;
+  add.lhs = object_address;
+  add.rhs = ir_operand_int((long long)field_offset);
+  add.text = "+";
+  if (!ir_emit(context, function, &add)) {
+    ir_operand_destroy(&field_address);
+    ir_operand_destroy(&object_address);
+    return 0;
+  }
+
+  ir_operand_destroy(&object_address);
+  *out_address = field_address;
+  return 1;
 }
