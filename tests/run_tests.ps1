@@ -1602,6 +1602,11 @@ $cases = @(
   # is written once before any instruction runs and that write has no IR to
   # count, so a later assignment looked like the definitional one.
   @{ Name = "param_copy_not_alias"; Path = "tests/test_param_copy_not_alias.mettle"; ShouldSucceed = $true },
+  # The vectorized SiLU/SwiGLU kernel at every length. It clamped the pointer
+  # back so the final vector OVERLAPPED elements the loop had already done,
+  # which applies silu twice to an in-place kernel. The existing vectorizer
+  # test uses n = 1024, so it never ran the tail.
+  @{ Name = "simd_silu_tail"; Path = "tests/test_simd_silu_tail.mettle"; ShouldSucceed = $true },
   @{ Name = "signed_arithmetic"; Path = "tests/test_signed_arithmetic.mettle"; ShouldSucceed = $true },
   @{
     Name          = "sign_extension"

@@ -2620,6 +2620,7 @@ int code_generator_binary_emit_simd_silu_f32(CodeGenerator *generator,
 int code_generator_binary_emit_simd_silu_f32_inline(BinaryCodeBuffer *b,
                                                     int has_mul) {
   size_t loop_top = 0, done_main = 0, small = 0, fin = 0, noclamp = 0;
+  size_t tail = 0;
   /* end = out + count*4. */
   if (!binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R8) ||
       !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
@@ -2655,20 +2656,29 @@ int code_generator_binary_emit_simd_silu_f32_inline(BinaryCodeBuffer *b,
   if (has_mul && !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32)) {
     return 0;
   }
-  /* If RCX overshot end-32, clamp it back (and shift RDX by the same delta). */
+  /* RCX past end-32 means a partial tail of 1..7 elements.
+   *
+   * This used to clamp RCX back to end-32 and run one more full vector, so the
+   * final vector overlapped elements the loop had already done. That is sound
+   * for a map into a SEPARATE destination, where recomputing f(x) and storing
+   * it again lands the same bytes. This kernel writes over its own input --
+   * g[i] = silu(g[i]) * u[i] -- so an overlapped element had silu applied
+   * twice. For n = 11, elements 3..7 came back as silu(silu(x)) * u * u, and
+   * exactly 8 - (n % 8) elements were wrong for every n > 8 that is not a
+   * multiple of 8. Send the remainder through the gather/scatter path the
+   * n < 8 case already uses, which touches each element once. */
   if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
       !wcs_jcc(b, 0x86 /* jbe */, &noclamp)) {
     return 0;
   }
-  if (has_mul) {
-    /* RDX -= (RCX - R9): R10 = RCX - R9; RDX -= R10; RCX = R9. */
-    if (!binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_RCX) ||
-        !wcs_sub_reg_reg64(b, BINARY_GP_R10, BINARY_GP_R9) ||
-        !wcs_sub_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_R10)) {
-      return 0;
-    }
-  }
-  if (!binary_emit_mov_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9)) {
+  /* R8 = (end - RCX) / 4, where end is R9 + 32. RDX already advanced in
+   * lockstep with RCX, so it needs no adjustment. */
+  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
+      !wcs_addsub_reg_imm8(b, BINARY_GP_R10, 0 /* add */, 32) ||
+      !wcs_sub_reg_reg64(b, BINARY_GP_R10, BINARY_GP_RCX) ||
+      !binary_emit_shift_reg_imm8(b, 5 /* shr */, BINARY_GP_R10, 2) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_R8, BINARY_GP_R10) ||
+      !wcs_jcc(b, 0, &tail)) {
     return 0;
   }
   if (!wcs_patch_here(b, noclamp)) {
@@ -2686,7 +2696,7 @@ int code_generator_binary_emit_simd_silu_f32_inline(BinaryCodeBuffer *b,
 
   /* n < 8: gather g (and u) into the scratch buffers, run one 8-wide body on
    * them, scatter n results back. R9 saves the out base. */
-  if (!wcs_patch_here(b, small) ||
+  if (!wcs_patch_here(b, small) || !wcs_patch_here(b, tail) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_RCX)) {
     return 0;
   }

@@ -1,0 +1,74 @@
+// The vectorized SiLU/SwiGLU kernel at every length, not just a round one.
+//
+// The kernel walked 8 lanes at a time and, when the count was not a multiple
+// of 8, clamped the pointer back so the FINAL vector overlapped elements the
+// loop had already done. That is sound for a map into a separate destination,
+// where recomputing f(x) and storing it again lands the same bytes. This
+// kernel writes over its own input -- g[i] = silu(g[i]) * u[i] -- so every
+// overlapped element had silu applied twice: silu(silu(-1.5)) is -0.1182
+// where silu(-1.5) is -0.2736, a 57% error. Exactly 8 - (n % 8) elements were
+// wrong for every n > 8 that is not a multiple of 8.
+//
+// The existing vectorizer test uses n = 1024, so it never ran the tail at all.
+// This one sweeps 1..40 and checks every element.
+
+import "std/math";
+
+extern fn expf(x: float32) -> float32;
+
+fn ref_silu(x: float32) -> float32 {
+  return x / (1.0 + expf(0.0 - x));
+}
+
+fn vsilu_gate(g: float32*, u: float32*, n: int32) {
+  @simd for i in 0..n { g[i] = (g[i] / (1.0 + expf(0.0 - g[i]))) * u[i]; }
+}
+
+fn vsilu_plain(g: float32*, n: int32) {
+  @simd for i in 0..n { g[i] = g[i] / (1.0 + expf(0.0 - g[i])); }
+}
+
+fn main() -> int32 {
+  var g: float32[48];
+  var u: float32[48];
+  var bad: int32 = 0;
+
+  // The gated form, which is what SwiGLU uses.
+  for n in 1..41 {
+    for i in 0..n {
+      g[i] = (float32)((float64)(i % 17) * 0.5 - 4.0);
+      u[i] = (float32)((float64)(i % 3) + 0.5);
+    }
+    vsilu_gate(&g[0], &u[0], n);
+    for i in 0..n {
+      var x: float32 = (float32)((float64)(i % 17) * 0.5 - 4.0);
+      var want: float32 = ref_silu(x) * (float32)((float64)(i % 3) + 0.5);
+      // The vectorized exp is a polynomial, so this is an accuracy tolerance,
+      // not an exactness one. Double application misses it by ~0.1, which is
+      // three orders of magnitude outside.
+      if (fabs((float64)g[i] - (float64)want) > 0.001) { bad = bad + 1; }
+    }
+  }
+  if (bad != 0) { return 1; }
+
+  // The ungated form takes the same tail path.
+  for n in 1..41 {
+    for i in 0..n { g[i] = (float32)((float64)(i % 17) * 0.5 - 4.0); }
+    vsilu_plain(&g[0], n);
+    for i in 0..n {
+      var x: float32 = (float32)((float64)(i % 17) * 0.5 - 4.0);
+      var want: float32 = ref_silu(x);
+      if (fabs((float64)g[i] - (float64)want) > 0.001) { bad = bad + 1; }
+    }
+  }
+  if (bad != 0) { return 2; }
+
+  // Nothing past n may be touched.
+  for i in 0..48 { g[i] = (float32)7.0; u[i] = (float32)1.0; }
+  vsilu_gate(&g[0], &u[0], 11);
+  for i in 11..48 {
+    if (g[i] != (float32)7.0) { return 3; }
+  }
+
+  return 0;
+}
