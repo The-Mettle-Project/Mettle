@@ -122,6 +122,24 @@ typedef struct {
   size_t import_directory_count;
   const char **link_arguments;
   size_t link_argument_count;
+  /* -l<name> / --library <name>: shared objects the ELF link binds against.
+     A value naming a path is taken as that file; a bare name is looked up as
+     lib<name>.so along --library-path and then the platform directories. */
+  const char **shared_libraries;
+  size_t shared_library_count;
+  /* -L<dir> / --library-path <dir> */
+  const char **library_search_paths;
+  size_t library_search_path_count;
+  /* --rpath <dir>: written to DT_RUNPATH, colon joined. */
+  const char **runpaths;
+  size_t runpath_count;
+  /* --shared: emit ET_DYN with a DT_SONAME instead of a program. */
+  int shared_output;
+  /* --export-dynamic: publish the program's globals for libraries to bind. */
+  int export_dynamic;
+  const char *soname;
+  /* --dynamic-linker <path>: what PT_INTERP names. */
+  const char *dynamic_linker;
   const char *stdlib_directory;
   int prelude;
   int profile;

@@ -346,6 +346,8 @@ static int elf_parse_symbols(const ElfImage *image, LinkObject *object, char **e
 
     symbol->name = elf_dup_string(strtab, strtab_size, linker_read_u32(entry));
     symbol->value = linker_read_u64(entry + 8);
+    symbol->size = linker_read_u64(entry + 16);
+    symbol->elf_type = (uint8_t)(info & 0x0Fu);
     symbol->is_external = bind == STB_GLOBAL || bind == STB_WEAK;
     symbol->is_weak = bind == STB_WEAK;
 

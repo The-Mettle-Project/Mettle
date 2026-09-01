@@ -235,7 +235,7 @@ static int verify_pe(const unsigned char *data, size_t size, char *reason,
 }
 
 static int verify_elf(const unsigned char *data, size_t size, char *reason,
-                      size_t reason_size) {
+                      size_t reason_size, int allow_dynamic) {
   uint64_t program_offset;
   uint16_t program_size;
   uint16_t program_count;
@@ -244,7 +244,7 @@ static int verify_elf(const unsigned char *data, size_t size, char *reason,
     set_reason(reason, reason_size, "expected a little endian ELF64 executable");
     return 0;
   }
-  if (read_u16(data + 16u) != 2u) {
+  if (read_u16(data + 16u) != 2u && !(allow_dynamic && read_u16(data + 16u) == 3u)) {
     set_reason(reason, reason_size, "owned ELF output must use ET_EXEC");
     return 0;
   }
@@ -256,7 +256,7 @@ static int verify_elf(const unsigned char *data, size_t size, char *reason,
     set_reason(reason, reason_size, "truncated ELF program header table");
     return 0;
   }
-  for (i = 0; i < program_count; i++) {
+  for (i = 0; allow_dynamic == 0 && i < program_count; i++) {
     size_t offset = (size_t)program_offset + (size_t)i * program_size;
     uint32_t type = read_u32(data + offset);
     if (type == 3u) {
@@ -273,8 +273,25 @@ static int verify_elf(const unsigned char *data, size_t size, char *reason,
   return 1;
 }
 
+static int mettle_verify_owned_file(const char *path, int allow_dynamic,
+                                    char *reason, size_t reason_size);
+
 int mettle_verify_owned_executable(const char *path, char *reason,
                                    size_t reason_size) {
+  return mettle_verify_owned_file(path, 0, reason, reason_size);
+}
+
+int mettle_verify_owned_dynamic_executable(const char *path, char *reason,
+                                           size_t reason_size) {
+  return mettle_verify_owned_file(path, 1, reason, reason_size);
+}
+
+static int mettle_verify_owned_image_ex(const unsigned char *data, size_t size,
+                                        int allow_dynamic, char *reason,
+                                        size_t reason_size);
+
+static int mettle_verify_owned_file(const char *path, int allow_dynamic,
+                                    char *reason, size_t reason_size) {
   FILE *file = NULL;
   unsigned char *data = NULL;
   long length;
@@ -299,13 +316,20 @@ int mettle_verify_owned_executable(const char *path, char *reason,
     return 0;
   }
   fclose(file);
-  result = mettle_verify_owned_image(data, (size_t)length, reason, reason_size);
+  result = mettle_verify_owned_image_ex(data, (size_t)length, allow_dynamic,
+                                        reason, reason_size);
   free(data);
   return result;
 }
 
 int mettle_verify_owned_image(const unsigned char *data, size_t size,
                               char *reason, size_t reason_size) {
+  return mettle_verify_owned_image_ex(data, size, 0, reason, reason_size);
+}
+
+static int mettle_verify_owned_image_ex(const unsigned char *data, size_t size,
+                                        int allow_dynamic, char *reason,
+                                        size_t reason_size) {
   if (reason && reason_size) reason[0] = '\0';
   if (!data) {
     set_reason(reason, reason_size, "missing executable image");
@@ -313,7 +337,7 @@ int mettle_verify_owned_image(const unsigned char *data, size_t size,
   }
   if (size >= 4u && data[0] == 0x7fu && data[1] == 'E' && data[2] == 'L' &&
       data[3] == 'F') {
-    return verify_elf(data, size, reason, reason_size);
+    return verify_elf(data, size, reason, reason_size, allow_dynamic);
   }
   if (size >= 2u && data[0] == 'M' && data[1] == 'Z') {
     return verify_pe(data, size, reason, reason_size);

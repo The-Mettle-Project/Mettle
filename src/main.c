@@ -15,6 +15,7 @@
 #include "codegen/target.h"
 #include "codegen/flat_emitter.h"
 #include "linker/elf_image.h"
+#include "linker/elf_shared.h"
 #include "linker/pe_emitter.h"
 #include "string_intern.h"
 #include "compiler/compiler_context.h"
@@ -901,6 +902,11 @@ static int object_needs_tracy_helpers(const char *object_path) {
 }
 
 
+static int mettle_elf_dynamic_link_requested(const CompilerOptions *options) {
+  return options && (options->shared_library_count > 0u ||
+                     options->shared_output || options->export_dynamic);
+}
+
 #ifndef _WIN32
 #define METTLE_ELF_DYNAMIC_LINKER "/lib64/ld-linux-x86-64.so.2"
 
@@ -979,22 +985,114 @@ static int mettle_elf_external_linker_requested(const CompilerOptions *options) 
          options->linker_mode == LINKER_MODE_MSVC;
 }
 
+#define METTLE_DEFAULT_ELF_INTERPRETER "/lib64/ld-linux-x86-64.so.2"
+
+/* Turns each -l/--library value into a file. A value naming a path is used as
+ * given; a bare name is looked up as lib<name>.so along -L and then the
+ * platform directories, the way ld resolves one. */
+static char **mettle_resolve_shared_libraries(const CompilerOptions *options,
+                                              size_t *count_out) {
+  size_t count = options ? options->shared_library_count : 0u;
+  char **paths = NULL;
+  size_t i = 0u;
+
+  *count_out = 0u;
+  if (count == 0u) {
+    return NULL;
+  }
+  paths = calloc(count, sizeof(char *));
+  if (!paths) {
+    fprintf(stderr, "Error: Out of memory while resolving libraries\n");
+    return NULL;
+  }
+  for (i = 0u; i < count; i++) {
+    const char *name = options->shared_libraries[i];
+    char *error_message = NULL;
+
+    if (strchr(name, '/') != NULL) {
+      paths[i] = mettle_strdup(name);
+    } else {
+      paths[i] = elf_shared_library_locate(
+          name, options->library_search_paths,
+          options->library_search_path_count, &error_message);
+    }
+    if (!paths[i]) {
+      fprintf(stderr, "Error: %s\n",
+              error_message ? error_message : "Out of memory");
+      free(error_message);
+      while (i-- > 0u) {
+        free(paths[i]);
+      }
+      free(paths);
+      return NULL;
+    }
+    free(error_message);
+  }
+  *count_out = count;
+  return paths;
+}
+
+static void mettle_free_shared_libraries(char **paths, size_t count) {
+  size_t i = 0u;
+
+  for (i = 0u; i < count; i++) {
+    free(paths[i]);
+  }
+  free(paths);
+}
+
 static int mettle_link_elf_native(const char *startup_object,
                                   const char *object_filename,
                                   const char *executable_filename,
                                   const char *freestanding_object,
                                   const char *const *extra_objects,
                                   size_t extra_object_count,
-                                  int strip_symbols) {
+                                  int strip_symbols,
+                                  const CompilerOptions *options) {
   const char *object_paths[32];
   unsigned char runtime_defaults[32];
-  LinkResolutionOptions resolution_options = {"_start", 16u, 0, NULL};
-  ElfImageOptions emission_options = {0x400000u, 0x1000u, 0};
+  LinkResolutionOptions resolution_options;
+  ElfImageOptions emission_options;
   LinkResolution *resolution = NULL;
   char *error_message = NULL;
+  char **library_paths = NULL;
+  size_t library_count = 0u;
   size_t count = 0u;
   size_t i = 0u;
   int result = 1;
+
+  memset(&resolution_options, 0, sizeof(resolution_options));
+  memset(&emission_options, 0, sizeof(emission_options));
+  resolution_options.entry_symbol_name = "_start";
+  resolution_options.section_alignment = 16u;
+  emission_options.image_base = 0x400000u;
+  emission_options.page_size = 0x1000u;
+  emission_options.interpreter = METTLE_DEFAULT_ELF_INTERPRETER;
+
+  if (options) {
+    if (options->shared_library_count != 0u) {
+      library_paths = mettle_resolve_shared_libraries(options, &library_count);
+      if (!library_paths) {
+        return 1;
+      }
+    }
+    resolution_options.shared_library_paths =
+        (const char *const *)library_paths;
+    resolution_options.shared_library_path_count = library_count;
+    resolution_options.produce_shared_library = options->shared_output;
+    if (options->shared_output) {
+      resolution_options.entry_symbol_name = NULL;
+      emission_options.produce_shared_library = 1;
+      emission_options.soname = options->soname;
+      emission_options.interpreter = NULL;
+      emission_options.image_base = 0u;
+    } else if (options->dynamic_linker) {
+      emission_options.interpreter = options->dynamic_linker;
+    }
+    emission_options.export_dynamic = options->export_dynamic;
+    emission_options.runpaths = options->runpaths;
+    emission_options.runpath_count = options->runpath_count;
+  }
 
   /* --image-base: a freestanding image is placed where its loader puts it, not
    * where a hosted operating system would. An ELF segment is mapped by page, so
@@ -1005,19 +1103,23 @@ static int mettle_link_elf_native(const char *startup_object,
               "Error: --image-base 0x%llx is not page-aligned; an ELF image "
               "must load on a 0x1000 boundary\n",
               (unsigned long long)mtlc_target()->image_base);
+      mettle_free_shared_libraries(library_paths, library_count);
       return 1;
     }
     emission_options.image_base = mtlc_target()->image_base;
   }
 
-  if (!startup_object || !object_filename || !executable_filename ||
-      !freestanding_object ||
+  if ((!startup_object && !emission_options.produce_shared_library) ||
+      !object_filename || !executable_filename || !freestanding_object ||
       extra_object_count > sizeof(object_paths) / sizeof(object_paths[0]) - 3u) {
+    mettle_free_shared_libraries(library_paths, library_count);
     return 1;
   }
 
-  object_paths[count] = startup_object;
-  runtime_defaults[count++] = 1u;
+  if (startup_object) {
+    object_paths[count] = startup_object;
+    runtime_defaults[count++] = 1u;
+  }
   object_paths[count] = freestanding_object;
   runtime_defaults[count++] = 1u;
   for (i = 0u; i < extra_object_count; i++) {
@@ -1038,6 +1140,7 @@ static int mettle_link_elf_native(const char *startup_object,
     fprintf(stderr, "Error: Native ELF link failed: %s\n",
             error_message ? error_message : "symbol resolution failed");
     free(error_message);
+    mettle_free_shared_libraries(library_paths, library_count);
     return 1;
   }
 
@@ -1047,11 +1150,13 @@ static int mettle_link_elf_native(const char *startup_object,
             error_message ? error_message : "image emission failed");
     free(error_message);
     link_resolution_destroy(resolution);
+    mettle_free_shared_libraries(library_paths, library_count);
     return 1;
   }
 
   free(error_message);
   link_resolution_destroy(resolution);
+  mettle_free_shared_libraries(library_paths, library_count);
   result = 0;
   return result;
 }
@@ -1208,19 +1313,24 @@ static int mettle_link_elf_executable(const char *object_filename,
     }
   }
 
-  startup_object = replace_extension(executable_filename, ".startup.o");
   if (!freestanding_object || access(freestanding_object, F_OK) != 0) {
     fprintf(stderr,
             "Error: Required freestanding runtime object not found in '%s'\n",
             runtime_directory ? runtime_directory : "");
     goto cleanup;
   }
-  if (!startup_object ||
-      binary_write_program_startup_object(
-          startup_object, profile_runtime, stack_trace,
-          options && options->main_wants_argc_argv ? 1 : 0) != 0) {
-    fprintf(stderr, "Error: Could not generate freestanding ELF startup\n");
-    goto cleanup;
+  /* A shared object has no program entry: whoever loads it already has one,
+   * and _start would pull in a reference to a main this library does not
+   * define. */
+  if (!(options && options->shared_output)) {
+    startup_object = replace_extension(executable_filename, ".startup.o");
+    if (!startup_object ||
+        binary_write_program_startup_object(
+            startup_object, profile_runtime, stack_trace,
+            options && options->main_wants_argc_argv ? 1 : 0) != 0) {
+      fprintf(stderr, "Error: Could not generate freestanding ELF startup\n");
+      goto cleanup;
+    }
   }
 
   /* The generated startup object defines _start and passes argc and argv to
@@ -1258,8 +1368,20 @@ static int mettle_link_elf_executable(const char *object_filename,
                              executable_filename, freestanding_object,
                              (const char *const *)extra_objects,
                              extra_object_count,
-                             !mettle_elf_keep_symbols(options)) == 0) {
+                             !mettle_elf_keep_symbols(options), options) == 0) {
     result = 0;
+  }
+
+  /* A link that binds shared libraries, or that emits one, has no fallback:
+   * ld and gcc would produce an image whose runtime this compiler does not
+   * own, so a failure here is reported rather than papered over. */
+  if (mettle_elf_dynamic_link_requested(options)) {
+    if (result != 0) {
+      fprintf(stderr,
+              "Error: The internal ELF linker could not produce '%s'\n",
+              executable_filename);
+    }
+    goto cleanup;
   }
 
   if (result != 0 && !(options && options->link_argument_count > 0) &&
@@ -2845,6 +2967,23 @@ static int add_import_directory(CompilerOptions *options, const char *path) {
   return 1;
 }
 
+static int add_string_option(const char ***list, size_t *count,
+                             const char *value) {
+  const char **grown = NULL;
+
+  if (!value || value[0] == '\0') {
+    return 0;
+  }
+  grown = realloc((void *)*list, (*count + 1u) * sizeof(const char *));
+  if (!grown) {
+    return 0;
+  }
+  grown[*count] = value;
+  *list = grown;
+  *count += 1u;
+  return 1;
+}
+
 static int add_link_argument(CompilerOptions *options, const char *argument) {
   if (!options || !argument || argument[0] == '\0') {
     return 0;
@@ -3382,6 +3521,54 @@ static DriverFlagResult parse_flag_output(CompilerOptions *options,
       fprintf(stderr, "Error: Failed to add linker argument\n");
       return DRIVER_FLAG_FAILED;
     }
+  } else if (strncmp(argv[i], "-l", 2) == 0 && argv[i][2] != '\0') {
+    if (!add_string_option(&options->shared_libraries,
+                           &options->shared_library_count, argv[i] + 2)) {
+      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i] + 2);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--library") == 0 && i + 1 < argc) {
+    if (!add_string_option(&options->shared_libraries,
+                           &options->shared_library_count, argv[++i])) {
+      fprintf(stderr, "Error: Failed to add library '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
+    if (!add_string_option(&options->library_search_paths,
+                           &options->library_search_path_count, argv[i] + 2)) {
+      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i] + 2);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if ((strcmp(argv[i], "--library-path") == 0 ||
+              strcmp(argv[i], "-L") == 0) &&
+             i + 1 < argc) {
+    if (!add_string_option(&options->library_search_paths,
+                           &options->library_search_path_count, argv[++i])) {
+      fprintf(stderr, "Error: Failed to add library path '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--rpath") == 0 && i + 1 < argc) {
+    if (!add_string_option(&options->runpaths, &options->runpath_count,
+                           argv[++i])) {
+      fprintf(stderr, "Error: Failed to add rpath '%s'\n", argv[i]);
+      return DRIVER_FLAG_FAILED;
+    }
+  } else if (strcmp(argv[i], "--shared") == 0) {
+    options->shared_output = 1;
+  } else if (strcmp(argv[i], "--export-dynamic") == 0 ||
+             strcmp(argv[i], "-rdynamic") == 0) {
+    options->export_dynamic = 1;
+  } else if (strcmp(argv[i], "--soname") == 0 && i + 1 < argc) {
+    options->soname = argv[++i];
+  } else if (strcmp(argv[i], "--dynamic-linker") == 0 && i + 1 < argc) {
+    options->dynamic_linker = argv[++i];
+  } else if (strcmp(argv[i], "--soname") == 0 ||
+             strcmp(argv[i], "--dynamic-linker") == 0 ||
+             strcmp(argv[i], "--rpath") == 0 ||
+             strcmp(argv[i], "--library") == 0 ||
+             strcmp(argv[i], "--library-path") == 0) {
+    fprintf(stderr, "Error: Missing value after '%s'\n", argv[i]);
+    return DRIVER_FLAG_FAILED;
   } else {
     return DRIVER_FLAG_UNMATCHED;
   }
@@ -4123,6 +4310,23 @@ int main(int argc, char *argv[]) {
                   host_format == BINARY_TARGET_FORMAT_ELF_ARM64;
 
   if (flags.build_executable) {
+    if (!elf_build && (options.shared_library_count > 0u ||
+                       options.shared_output || options.export_dynamic ||
+                       options.runpath_count > 0u || options.soname ||
+                       options.dynamic_linker)) {
+      fprintf(stderr,
+              "Error: -l, -L, --shared, --soname, --rpath, --export-dynamic "
+              "and --dynamic-linker are ELF options; a PE build takes its "
+              "libraries through --link-arg\n");
+      free((void *)options.import_directories);
+      free((void *)options.link_arguments);
+      free((void *)options.shared_libraries);
+      free((void *)options.library_search_paths);
+      free((void *)options.runpaths);
+      free(auto_stdlib_directory);
+      free(auto_runtime_directory);
+      return 1;
+    }
     if (options.musl_link) {
       fprintf(stderr,
               "Error: --musl is not available in owned runtime mode because "
@@ -4226,9 +4430,15 @@ int main(int argc, char *argv[]) {
 #endif
     if (result == 0 && !g_link_output_ownership_verified) {
       char ownership_error[256];
-      if (!mettle_verify_owned_executable(build_output_filename,
-                                           ownership_error,
-                                           sizeof(ownership_error))) {
+      int owned =
+          mettle_elf_dynamic_link_requested(&options)
+              ? mettle_verify_owned_dynamic_executable(build_output_filename,
+                                                       ownership_error,
+                                                       sizeof(ownership_error))
+              : mettle_verify_owned_executable(build_output_filename,
+                                               ownership_error,
+                                               sizeof(ownership_error));
+      if (!owned) {
         fprintf(stderr,
                 "Error: Refusing linked output '%s': %s\n",
                 build_output_filename, ownership_error);
@@ -4260,6 +4470,9 @@ int main(int argc, char *argv[]) {
   }
   free((void *)options.import_directories);
   free((void *)options.link_arguments);
+  free((void *)options.shared_libraries);
+  free((void *)options.library_search_paths);
+  free((void *)options.runpaths);
   free(auto_stdlib_directory);
   free(auto_runtime_directory);
   free(build_output_filename);
@@ -5500,8 +5713,11 @@ int compile_file(const char *input_filename, const char *output_filename,
                              !options->debug_hooks;
   /* A foreign object on the link line (`--link-arg caller.o`) may call any
    * `export fn` without a single Mettle instruction naming it, so the exports
-   * have to stay rooted whenever one is present. */
-  int keep_exports = options->link_argument_count > 0;
+   * have to stay rooted whenever one is present. A shared object, and a program
+   * that publishes its symbols for one to bind, are the same situation: the
+   * caller is on the other side of the link. */
+  int keep_exports = options->link_argument_count > 0 ||
+                     options->shared_output || options->export_dynamic;
 
   /* Sweep once before the optimizer: a body that will not ship should not cost
    * a full pipeline first. The optimizer never synthesizes a call to a Mettle

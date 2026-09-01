@@ -2072,6 +2072,23 @@ static int mt_install_thread_pointer(void *mapping, mt_size mapping_size) {
 #endif
 }
 
+static int mt_thread_pointer_installed(void) {
+#if defined(__x86_64__)
+  mt_u64 base = 0;
+  if (mt_syscall6(MT_SYS_ARCH_PRCTL, 0x1003, (mt_i64)(mt_u64)&base, 0, 0, 0,
+                  0) != 0) {
+    return 0;
+  }
+  return base != 0;
+#elif defined(__aarch64__)
+  mt_u64 base = 0;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(base));
+  return base != 0;
+#else
+  return 0;
+#endif
+}
+
 static int mt_initialize_initial_tls(mt_i64 argc, char **argv) {
   char **environment = argv + argc + 1;
   while (*environment) environment++;
@@ -2101,6 +2118,7 @@ static int mt_initialize_initial_tls(mt_i64 argc, char **argv) {
     mt_tls_memory_size = (mt_size)header->memory_size;
     mt_tls_alignment = (mt_size)(header->alignment ? header->alignment : 1);
     if (mt_tls_memory_size == 0) return 1;
+    if (mt_thread_pointer_installed()) return 1;
 
     mt_size alignment = mt_tls_alignment > 16 ? mt_tls_alignment : 16;
     mt_size mapping_size = mt_tls_memory_size + alignment * 2 + 16;

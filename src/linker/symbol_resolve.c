@@ -784,8 +784,8 @@ static int link_resolution_index_insert(LinkResolution *resolution,
   return 1;
 }
 
-static LinkedSymbol *link_resolution_find_symbol_mutable(LinkResolution *resolution,
-                                                         const char *name) {
+LinkedSymbol *link_resolution_find_symbol_mutable(LinkResolution *resolution,
+                                                  const char *name) {
   size_t i = 0;
 
   if (!resolution || !name) {
@@ -885,6 +885,7 @@ static int link_resolution_record_global_symbol(
 
   global_symbol->is_external = 1;
   if (!object_symbol->is_defined) {
+    global_symbol->is_weak = object_symbol->is_weak;
     return 1;
   }
 
@@ -914,6 +915,8 @@ static int link_resolution_record_global_symbol(
   global_symbol->defining_symbol_index = object_symbol->symbol_index;
   global_symbol->merged_section_index = object_symbol->merged_section_index;
   global_symbol->merged_offset = object_symbol->merged_offset;
+  global_symbol->size = object_symbol->size;
+  global_symbol->elf_type = object_symbol->elf_type;
   return 1;
 }
 
@@ -949,6 +952,9 @@ static int link_resolution_build_symbols(LinkResolution *resolution,
       resolved->section_index = symbol->section_index;
       resolved->merged_section_index = LINKED_SECTION_INDEX_NONE;
       resolved->is_auxiliary = symbol->is_auxiliary;
+      resolved->size = symbol->size;
+      resolved->elf_type = symbol->elf_type;
+      resolved->is_weak = symbol->is_weak;
       resolved->name = mettle_strdup(symbol->name);
       if (symbol->name && !resolved->name) {
         mettle_set_error(error_message_out,
@@ -1066,6 +1072,129 @@ static int link_resolution_assign_virtual_addresses(
   return 1;
 }
 
+static int link_resolution_reserve_shared_imports(LinkResolution *resolution,
+                                                  size_t minimum_count,
+                                                  char **error_message_out) {
+  LinkedSharedImport *grown = NULL;
+  size_t capacity = resolution->shared_import_capacity;
+
+  if (capacity >= minimum_count) {
+    return 1;
+  }
+  capacity = capacity ? capacity : 16u;
+  while (capacity < minimum_count) {
+    capacity *= 2u;
+  }
+  grown = realloc(resolution->shared_imports,
+                  capacity * sizeof(LinkedSharedImport));
+  if (!grown) {
+    mettle_set_error(error_message_out,
+                     "Out of memory while growing the shared import table");
+    return 0;
+  }
+  memset(grown + resolution->shared_import_capacity, 0,
+         (capacity - resolution->shared_import_capacity) *
+             sizeof(LinkedSharedImport));
+  resolution->shared_imports = grown;
+  resolution->shared_import_capacity = capacity;
+  return 1;
+}
+
+static int link_resolution_add_shared_import(LinkResolution *resolution,
+                                             size_t symbol_index,
+                                             size_t library_index,
+                                             const ElfSharedSymbol *definition,
+                                             char **error_message_out) {
+  LinkedSharedImport *import = NULL;
+  LinkedSymbol *symbol = &resolution->symbols[symbol_index];
+
+  if (!link_resolution_reserve_shared_imports(
+          resolution, resolution->shared_import_count + 1u,
+          error_message_out)) {
+    return 0;
+  }
+  import = &resolution->shared_imports[resolution->shared_import_count];
+  memset(import, 0, sizeof(*import));
+  import->library_index = library_index;
+  import->symbol_index = symbol_index;
+  import->type = definition ? definition->type : ELF_SHARED_TYPE_NOTYPE;
+  import->size = definition ? definition->size : 0u;
+  import->is_weak = definition ? definition->is_weak : symbol->is_weak;
+  if (definition && definition->version) {
+    import->version = mettle_strdup(definition->version);
+    if (!import->version) {
+      mettle_set_error(error_message_out,
+                       "Out of memory while recording the version of '%s'",
+                       symbol->name ? symbol->name : "<unnamed>");
+      return 0;
+    }
+  }
+  symbol->is_shared_import = 1;
+  symbol->shared_import_index = resolution->shared_import_count;
+  resolution->shared_import_count++;
+  if (library_index != LINKED_LIBRARY_INDEX_NONE) {
+    resolution->shared_library_used[library_index] = 1u;
+  }
+  return 1;
+}
+
+static int link_resolution_bind_shared_libraries(
+    LinkResolution *resolution, const LinkResolutionOptions *options,
+    char **error_message_out) {
+  size_t path_count = options ? options->shared_library_path_count : 0u;
+  size_t i = 0u;
+
+  if (path_count == 0u && !(options && options->produce_shared_library)) {
+    return 1;
+  }
+
+  if (path_count != 0u) {
+    resolution->shared_libraries =
+        calloc(path_count, sizeof(*resolution->shared_libraries));
+    resolution->shared_library_used = calloc(path_count, 1u);
+    if (!resolution->shared_libraries || !resolution->shared_library_used) {
+      mettle_set_error(error_message_out,
+                       "Out of memory while loading shared libraries");
+      return 0;
+    }
+    for (i = 0u; i < path_count; i++) {
+      if (!elf_shared_library_read(options->shared_library_paths[i],
+                                   &resolution->shared_libraries[i],
+                                   error_message_out)) {
+        return 0;
+      }
+      resolution->shared_library_count++;
+    }
+  }
+
+  for (i = 0u; i < resolution->symbol_count; i++) {
+    LinkedSymbol *symbol = &resolution->symbols[i];
+    const ElfSharedSymbol *definition = NULL;
+    size_t library_index = LINKED_LIBRARY_INDEX_NONE;
+    size_t library = 0u;
+
+    if (symbol->is_defined || !symbol->is_external || !symbol->name) {
+      continue;
+    }
+    for (library = 0u; library < resolution->shared_library_count; library++) {
+      definition = elf_shared_library_find(resolution->shared_libraries[library],
+                                           symbol->name);
+      if (definition) {
+        library_index = library;
+        break;
+      }
+    }
+    if (!definition && !(options && options->produce_shared_library)) {
+      continue;
+    }
+    if (!link_resolution_add_shared_import(resolution, i, library_index,
+                                           definition, error_message_out)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int link_resolution_validate_externals(
     LinkResolution *resolution, const LinkResolutionOptions *options,
     char **error_message_out) {
@@ -1080,7 +1209,8 @@ static int link_resolution_validate_externals(
     for (symbol_index = 0; symbol_index < resolution->symbol_count;
          symbol_index++) {
       const LinkedSymbol *symbol = &resolution->symbols[symbol_index];
-      if (symbol->is_external && !symbol->is_defined) {
+      if (symbol->is_external && !symbol->is_defined &&
+          !symbol->is_shared_import) {
         mettle_set_error(error_message_out,
                                   "Unresolved external symbol '%s'",
                                   symbol->name ? symbol->name : "<unnamed>");
@@ -1155,6 +1285,8 @@ int link_resolution_build(const char **object_paths, size_t object_count,
       !link_resolution_merge_sections(resolution, section_alignment,
                                       error_message_out) ||
       !link_resolution_build_symbols(resolution, error_message_out) ||
+      !link_resolution_bind_shared_libraries(resolution, options,
+                                             error_message_out) ||
       !link_resolution_assign_virtual_addresses(resolution, section_alignment) ||
       !link_resolution_validate_externals(resolution, options,
                                           error_message_out)) {
@@ -1212,6 +1344,18 @@ void link_resolution_destroy(LinkResolution *resolution) {
     free(resolution->symbols[symbol_index].name);
   }
 
+  for (symbol_index = 0; symbol_index < resolution->shared_library_count;
+       symbol_index++) {
+    elf_shared_library_destroy(resolution->shared_libraries[symbol_index]);
+  }
+  for (symbol_index = 0; symbol_index < resolution->shared_import_count;
+       symbol_index++) {
+    free(resolution->shared_imports[symbol_index].version);
+  }
+
+  free(resolution->shared_libraries);
+  free(resolution->shared_library_used);
+  free(resolution->shared_imports);
   free(resolution->objects);
   free(resolution->symbols);
   free(resolution->symbol_buckets);

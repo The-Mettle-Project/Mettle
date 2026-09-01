@@ -1,3 +1,4 @@
+#include "linker/elf_dynamic.h"
 #include "linker/elf_image.h"
 #include "linker/linker_common.h"
 #include "linker/relocation.h"
@@ -17,7 +18,11 @@
 #define ELF_SYM_SIZE 24u
 
 #define PT_LOAD 1u
+#define PT_DYNAMIC 2u
+#define PT_INTERP 3u
 #define PT_TLS 7u
+#define PT_GNU_STACK 0x6474e551u
+#define PT_GNU_RELRO 0x6474e552u
 
 #define PF_X 1u
 #define PF_W 2u
@@ -27,6 +32,8 @@
 #define SHT_SYMTAB 2u
 #define SHT_STRTAB 3u
 #define SHT_NOBITS 8u
+#define ET_EXEC 2u
+#define ET_DYN 3u
 
 #define SHF_WRITE 1u
 #define SHF_ALLOC 2u
@@ -204,6 +211,28 @@ static size_t elf_image_merged_index(const LinkResolution *resolution,
   return LINKED_SECTION_INDEX_NONE;
 }
 
+static void elf_image_normalize_tls(LinkResolution *resolution) {
+  size_t i = 0u;
+
+  for (i = 0u; i < LINKED_SECTION_COUNT; i++) {
+    LinkedSection *section = &resolution->sections[i];
+    size_t alignment = 0u;
+    size_t size = 0u;
+
+    if (section->kind != LINK_SECTION_KIND_TLS) {
+      continue;
+    }
+    size = section->virtual_size > section->size ? section->virtual_size
+                                                 : section->size;
+    if (size == 0u) {
+      continue;
+    }
+    alignment = section->alignment > 16u ? section->alignment : 16u;
+    section->alignment = alignment;
+    section->virtual_size = linker_align_up(size, alignment);
+  }
+}
+
 static int elf_image_collect_parts(LinkResolution *resolution,
                                    ElfImagePart *parts, size_t *part_count_out,
                                    size_t *read_only_count_out) {
@@ -340,6 +369,26 @@ static int elf_image_apply_layout(LinkResolution *resolution,
   return 1;
 }
 
+static int elf_image_blob_location(const ElfImagePart *parts,
+                                   size_t part_count,
+                                   const ElfDynamicBlob *blob,
+                                   uint64_t *offset_out,
+                                   uint64_t *address_out) {
+  size_t i = 0u;
+
+  if (!blob) {
+    return 0;
+  }
+  for (i = 0u; i < part_count; i++) {
+    if (parts[i].merged_index == blob->merged_section_index) {
+      *offset_out = parts[i].file_offset + blob->offset;
+      *address_out = parts[i].virtual_address + blob->offset;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int elf_image_write_program_headers(ElfImageBuffer *image,
                                            const ElfImagePart *parts,
                                            size_t part_count,
@@ -348,6 +397,7 @@ static int elf_image_write_program_headers(ElfImageBuffer *image,
                                            uint64_t page_size,
                                            uint64_t read_only_end,
                                            uint64_t read_only_file_end,
+                                           const ElfDynamicPlan *plan,
                                            uint16_t *phnum_out) {
   unsigned char phdr[ELF_PHDR_SIZE];
   size_t offset = ELF_EHDR_SIZE;
@@ -401,6 +451,56 @@ static int elf_image_write_program_headers(ElfImageBuffer *image,
     count++;
   }
 
+  if (elf_dynamic_plan_is_active(plan)) {
+    static const struct {
+      ElfDynamicBlobKind kind;
+      uint32_t type;
+      uint32_t flags;
+      uint64_t alignment;
+    } segments[] = {
+        {ELF_DYNAMIC_BLOB_INTERP, PT_INTERP, PF_R, 1u},
+        {ELF_DYNAMIC_BLOB_DYNAMIC, PT_DYNAMIC, PF_R | PF_W, 8u},
+    };
+    size_t segment = 0u;
+
+    for (segment = 0u; segment < sizeof(segments) / sizeof(segments[0]);
+         segment++) {
+      const ElfDynamicBlob *blob =
+          elf_dynamic_plan_blob(plan, segments[segment].kind);
+      uint64_t blob_offset = 0u;
+      uint64_t blob_address = 0u;
+
+      if (!elf_image_blob_location(parts, part_count, blob, &blob_offset,
+                                   &blob_address)) {
+        continue;
+      }
+      memset(phdr, 0, sizeof(phdr));
+      linker_write_u32(phdr + 0, segments[segment].type);
+      linker_write_u32(phdr + 4, segments[segment].flags);
+      linker_write_u64(phdr + 8, blob_offset);
+      linker_write_u64(phdr + 16, blob_address);
+      linker_write_u64(phdr + 24, blob_address);
+      linker_write_u64(phdr + 32, blob->size);
+      linker_write_u64(phdr + 40, blob->size);
+      linker_write_u64(phdr + 48, segments[segment].alignment);
+      if (!elf_image_buffer_write(image, offset, phdr, sizeof(phdr))) {
+        return 0;
+      }
+      offset += ELF_PHDR_SIZE;
+      count++;
+    }
+
+    memset(phdr, 0, sizeof(phdr));
+    linker_write_u32(phdr + 0, PT_GNU_STACK);
+    linker_write_u32(phdr + 4, PF_R | PF_W);
+    linker_write_u64(phdr + 48, 16u);
+    if (!elf_image_buffer_write(image, offset, phdr, sizeof(phdr))) {
+      return 0;
+    }
+    offset += ELF_PHDR_SIZE;
+    count++;
+  }
+
   for (i = 0u; i < part_count; i++) {
     if (!parts[i].is_tls) {
       continue;
@@ -427,7 +527,8 @@ static int elf_image_write_program_headers(ElfImageBuffer *image,
 
 static uint16_t elf_image_count_program_headers(const ElfImagePart *parts,
                                                 size_t part_count,
-                                                size_t read_only_count) {
+                                                size_t read_only_count,
+                                                const ElfDynamicPlan *plan) {
   uint16_t count = 1u;
   size_t i = 0u;
 
@@ -436,6 +537,15 @@ static uint16_t elf_image_count_program_headers(const ElfImagePart *parts,
   }
   for (i = 0u; i < part_count; i++) {
     if (parts[i].is_tls) {
+      count++;
+    }
+  }
+  if (elf_dynamic_plan_is_active(plan)) {
+    count++;
+    if (elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_INTERP)) {
+      count++;
+    }
+    if (elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_DYNAMIC)) {
       count++;
     }
   }
@@ -600,6 +710,8 @@ int elf_image_emit_executable(LinkResolution *resolution,
   ElfImagePart parts[ELF_IMAGE_MAX_PARTS];
   ElfImageBuffer image = {0};
   ElfImageStrings shstrings;
+  ElfDynamicPlan *plan = NULL;
+  ElfDynamicOptions dynamic_options;
   LinkRelocationOptions relocation_options = {0};
   unsigned char ehdr[ELF_EHDR_SIZE];
   unsigned char shdr[ELF_SHDR_SIZE];
@@ -621,10 +733,12 @@ int elf_image_emit_executable(LinkResolution *resolution,
   uint16_t phnum = 0u;
   uint16_t shnum = 0u;
   uint16_t shstrndx = 0u;
+  uint16_t symtab_index = 0u;
   size_t part_count = 0u;
   size_t read_only_count = 0u;
   size_t i = 0u;
   int emit_symbols = 0;
+  int produce_shared_library = 0;
 
   if (error_message_out) {
     free(*error_message_out);
@@ -634,7 +748,12 @@ int elf_image_emit_executable(LinkResolution *resolution,
     mettle_set_error(error_message_out, "Invalid arguments while emitting ELF");
     return 0;
   }
+  memset(&dynamic_options, 0, sizeof(dynamic_options));
   if (options) {
+    produce_shared_library = options->produce_shared_library ? 1 : 0;
+    if (produce_shared_library) {
+      image_base = 0u;
+    }
     if (options->image_base != 0u) {
       image_base = options->image_base;
     }
@@ -643,24 +762,62 @@ int elf_image_emit_executable(LinkResolution *resolution,
     }
     emit_symbols = !options->strip_symbols;
   }
-  if (!resolution->entry_symbol) {
+  if (!resolution->entry_symbol && !produce_shared_library) {
     mettle_set_error(error_message_out,
                      "The entry symbol was not resolved before ELF emission");
     return 0;
   }
 
+  dynamic_options.interpreter = options ? options->interpreter : NULL;
+  dynamic_options.soname = options ? options->soname : NULL;
+  dynamic_options.runpaths = options ? options->runpaths : NULL;
+  dynamic_options.runpath_count = options ? options->runpath_count : 0u;
+  dynamic_options.produce_shared_library = produce_shared_library;
+  dynamic_options.export_dynamic = options && options->export_dynamic ? 1 : 0;
+  dynamic_options.image_base = image_base;
+  if (!elf_dynamic_plan_create(resolution, &dynamic_options, &plan,
+                               error_message_out)) {
+    return 0;
+  }
+  if (elf_dynamic_plan_is_active(plan) && !produce_shared_library &&
+      !elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_INTERP)) {
+    elf_dynamic_plan_destroy(plan);
+    mettle_set_error(error_message_out,
+                     "A shared library supplies a symbol this program needs, "
+                     "but no program loader was named for PT_INTERP");
+    return 0;
+  }
+
+  elf_image_normalize_tls(resolution);
+
   memset(parts, 0, sizeof(parts));
   if (!elf_image_collect_parts(resolution, parts, &part_count,
                                &read_only_count)) {
+    elf_dynamic_plan_destroy(plan);
     mettle_set_error(error_message_out, "Out of memory while planning ELF");
     return 0;
   }
   if (part_count == 0u) {
+    elf_dynamic_plan_destroy(plan);
     mettle_set_error(error_message_out, "The link produced no loadable content");
     return 0;
   }
 
-  phnum = elf_image_count_program_headers(parts, part_count, read_only_count);
+  shnum = 1u;
+  for (i = 0u; i < part_count; i++) {
+    parts[i].section_header_index = shnum;
+    shnum++;
+  }
+  for (i = 0u; i < ELF_DYNAMIC_BLOB_COUNT; i++) {
+    if (!elf_dynamic_plan_blob(plan, (ElfDynamicBlobKind)i)) {
+      continue;
+    }
+    elf_dynamic_plan_set_section_index(plan, (ElfDynamicBlobKind)i, shnum);
+    shnum++;
+  }
+
+  phnum = elf_image_count_program_headers(parts, part_count, read_only_count,
+                                          plan);
   headers_size = ELF_EHDR_SIZE + (uint64_t)phnum * ELF_PHDR_SIZE;
 
   elf_image_assign_addresses(parts, part_count, read_only_count, image_base,
@@ -669,16 +826,35 @@ int elf_image_emit_executable(LinkResolution *resolution,
 
   if (!elf_image_apply_layout(resolution, parts, part_count,
                               error_message_out)) {
+    elf_dynamic_plan_destroy(plan);
     return 0;
   }
 
   relocation_options.image_base = image_base;
   if (!link_apply_relocations(resolution, &relocation_options,
                               error_message_out)) {
+    elf_dynamic_plan_destroy(plan);
     return 0;
   }
 
+  if (elf_dynamic_plan_is_active(plan)) {
+    uint16_t merged_section_header_indices[LINKED_SECTION_COUNT];
+
+    memset(merged_section_header_indices, 0,
+           sizeof(merged_section_header_indices));
+    for (i = 0u; i < part_count; i++) {
+      merged_section_header_indices[parts[i].merged_index] =
+          parts[i].section_header_index;
+    }
+    if (!elf_dynamic_plan_write(plan, merged_section_header_indices,
+                                error_message_out)) {
+      elf_dynamic_plan_destroy(plan);
+      return 0;
+    }
+  }
+
   if (!elf_image_buffer_pad_to(&image, (size_t)headers_size)) {
+    elf_dynamic_plan_destroy(plan);
     mettle_set_error(error_message_out, "Out of memory while emitting ELF");
     return 0;
   }
@@ -700,20 +876,17 @@ int elf_image_emit_executable(LinkResolution *resolution,
     }
   }
 
-  shnum = 1u;
-  for (i = 0u; i < part_count; i++) {
-    parts[i].section_header_index = shnum;
-    shnum++;
-  }
   if (emit_symbols) {
     if (!elf_image_emit_symbols(&image, resolution, parts, part_count,
                                 &symtab_offset, &symtab_size, &strtab_offset,
                                 &strtab_size, &local_symbol_count)) {
+      elf_dynamic_plan_destroy(plan);
       elf_image_buffer_free(&image);
       mettle_set_error(error_message_out,
                        "Out of memory while emitting the ELF symbol table");
       return 0;
     }
+    symtab_index = shnum;
     shnum = (uint16_t)(shnum + 2u);
   }
   shstrndx = shnum;
@@ -729,9 +902,18 @@ int elf_image_emit_executable(LinkResolution *resolution,
   }
   {
     uint32_t part_names[ELF_IMAGE_MAX_PARTS];
+    uint32_t blob_names[ELF_DYNAMIC_BLOB_COUNT];
 
+    memset(blob_names, 0, sizeof(blob_names));
     for (i = 0u; i < part_count; i++) {
       part_names[i] = elf_image_strings_add(&shstrings, parts[i].name);
+    }
+    for (i = 0u; i < ELF_DYNAMIC_BLOB_COUNT; i++) {
+      const ElfDynamicBlob *blob =
+          elf_dynamic_plan_blob(plan, (ElfDynamicBlobKind)i);
+      if (blob) {
+        blob_names[i] = elf_image_strings_add(&shstrings, blob->name);
+      }
     }
     if (emit_symbols) {
       symtab_name = elf_image_strings_add(&shstrings, ".symtab");
@@ -786,16 +968,70 @@ int elf_image_emit_executable(LinkResolution *resolution,
       }
     }
 
+    for (i = 0u; i < ELF_DYNAMIC_BLOB_COUNT; i++) {
+      const ElfDynamicBlob *blob =
+          elf_dynamic_plan_blob(plan, (ElfDynamicBlobKind)i);
+      const ElfDynamicBlob *dynsym =
+          elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_DYNSYM);
+      const ElfDynamicBlob *dynstr =
+          elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_DYNSTR);
+      const ElfDynamicBlob *got =
+          elf_dynamic_plan_blob(plan, ELF_DYNAMIC_BLOB_GOT);
+      uint64_t blob_offset = 0u;
+      uint64_t blob_address = 0u;
+      uint32_t link = 0u;
+      uint32_t info = 0u;
+      size_t at = 0u;
+
+      if (!blob || !elf_image_blob_location(parts, part_count, blob,
+                                            &blob_offset, &blob_address)) {
+        continue;
+      }
+      if (blob->links_dynstr && dynstr) {
+        link = dynstr->section_header_index;
+      } else if (blob->links_dynsym && dynsym) {
+        link = dynsym->section_header_index;
+      }
+      if (i == ELF_DYNAMIC_BLOB_DYNSYM) {
+        info = 1u;
+      } else if (i == ELF_DYNAMIC_BLOB_RELA_PLT && got) {
+        info = got->section_header_index;
+      } else if (i == ELF_DYNAMIC_BLOB_VERNEED) {
+        info = (uint32_t)elf_dynamic_plan_verneed_count(plan);
+      }
+
+      at = (size_t)section_header_offset +
+           (size_t)blob->section_header_index * ELF_SHDR_SIZE;
+      memset(shdr, 0, sizeof(shdr));
+      linker_write_u32(shdr + 0, blob_names[i]);
+      linker_write_u32(shdr + 4, blob->section_type);
+      linker_write_u64(shdr + 8, blob->section_flags);
+      linker_write_u64(shdr + 16, blob_address);
+      linker_write_u64(shdr + 24, blob_offset);
+      linker_write_u64(shdr + 32, blob->size);
+      linker_write_u32(shdr + 40, link);
+      linker_write_u32(shdr + 44, info);
+      linker_write_u64(shdr + 48, blob->alignment);
+      linker_write_u64(shdr + 56, blob->entry_size);
+      if (!elf_image_buffer_write(&image, at, shdr, sizeof(shdr))) {
+        free(shstrings.data);
+        elf_dynamic_plan_destroy(plan);
+        elf_image_buffer_free(&image);
+        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+        return 0;
+      }
+    }
+
     if (emit_symbols) {
-      size_t symtab_index = (size_t)part_count + 1u;
-      size_t at = (size_t)section_header_offset + symtab_index * ELF_SHDR_SIZE;
+      size_t at = (size_t)section_header_offset +
+                  (size_t)symtab_index * ELF_SHDR_SIZE;
 
       memset(shdr, 0, sizeof(shdr));
       linker_write_u32(shdr + 0, symtab_name);
       linker_write_u32(shdr + 4, SHT_SYMTAB);
       linker_write_u64(shdr + 24, symtab_offset);
       linker_write_u64(shdr + 32, symtab_size);
-      linker_write_u32(shdr + 40, (uint32_t)(symtab_index + 1u));
+      linker_write_u32(shdr + 40, (uint32_t)symtab_index + 1u);
       linker_write_u32(shdr + 44, local_symbol_count);
       linker_write_u64(shdr + 48, 8u);
       linker_write_u64(shdr + 56, ELF_SYM_SIZE);
@@ -848,10 +1084,12 @@ int elf_image_emit_executable(LinkResolution *resolution,
   ehdr[4] = 2u;
   ehdr[5] = 1u;
   ehdr[6] = 1u;
-  elf_image_put_u16(ehdr + 16, 2u);
+  elf_image_put_u16(ehdr + 16, produce_shared_library ? ET_DYN : ET_EXEC);
   elf_image_put_u16(ehdr + 18, 62u);
   linker_write_u32(ehdr + 20, 1u);
-  linker_write_u64(ehdr + 24, resolution->entry_symbol->virtual_address);
+  linker_write_u64(ehdr + 24, resolution->entry_symbol
+                                  ? resolution->entry_symbol->virtual_address
+                                  : 0u);
   linker_write_u64(ehdr + 32, ELF_EHDR_SIZE);
   linker_write_u64(ehdr + 40, section_header_offset);
   linker_write_u32(ehdr + 48, 0u);
@@ -869,13 +1107,15 @@ int elf_image_emit_executable(LinkResolution *resolution,
 
   if (!elf_image_write_program_headers(&image, parts, part_count,
                                        read_only_count, image_base, page_size,
-                                       read_only_end, read_only_file_end,
+                                       read_only_end, read_only_file_end, plan,
                                        &phnum)) {
+    elf_dynamic_plan_destroy(plan);
     elf_image_buffer_free(&image);
     mettle_set_error(error_message_out, "Out of memory while emitting ELF");
     return 0;
   }
 
+  elf_dynamic_plan_destroy(plan);
   if (!elf_image_write_file(output_path, &image, error_message_out)) {
     elf_image_buffer_free(&image);
     return 0;

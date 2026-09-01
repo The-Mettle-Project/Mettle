@@ -63,6 +63,8 @@ typedef struct {
   int is_weak;
   int is_common;
   uint64_t aux_section_length;
+  uint64_t size;
+  uint8_t elf_type;
 } LinkSymbol;
 
 #define LINK_SECTION_INDEX_UNDEFINED ((int64_t)-1)

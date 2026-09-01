@@ -8,6 +8,12 @@
 int mettle_verify_owned_executable(const char *path, char *reason,
                                    size_t reason_size);
 
+/* The same check, but for a link the caller asked to bind shared libraries or
+ * to emit one. PT_INTERP, PT_DYNAMIC and ET_DYN are then the requested result
+ * rather than an unowned runtime sneaking in, so only the rest is audited. */
+int mettle_verify_owned_dynamic_executable(const char *path, char *reason,
+                                           size_t reason_size);
+
 /* The same check against an image already in memory. Reopening a file that was
  * just written costs whatever the machine's virus scanner charges to inspect a
  * fresh executable -- on this machine, a third of a second for a 95 KB binary,
