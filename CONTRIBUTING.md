@@ -87,10 +87,30 @@ make install                # optional: /usr/local
 make clean
 ```
 
-Both builds use `-O2 -g -fno-omit-frame-pointer`. When you add a `.c` file,
-register it in `build.bat` and in the `Makefile`. In the `Makefile`, put it in
+CMake builds the same thing, for editors that want a
+`compile_commands.json` and for out-of-tree build directories:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel "$(nproc)"   # build/bin/mettle
+cmake --install build --prefix ~/.mettle    # optional
+```
+
+The two are independent and can share a tree: `make` writes `obj/` and `bin/`
+at the root, CMake writes inside its own build directory. The scripts under
+`tools/` and `tests/` look for `./bin/mettle`, which is where `make` puts it, so
+pass the path explicitly against a CMake build (`tests/run_tests.ps1
+-CompilerPath build/bin/mettle`, `bash tools/test-elf-native.sh
+build/bin/mettle`).
+
+Both builds use `-O2 -g -fno-omit-frame-pointer`, and CMake's `Debug` type
+swaps that for `-g3 -O0 -DDEBUG`. When you add a `.c` file, register it in
+`build.bat` and in the `Makefile`. In the `Makefile`, put it in
 `BACKEND_SOURCES` or in `FRONTEND_SOURCES`. Those two lists are the boundary in
-executable form.
+executable form, and `CMakeLists.txt` carries the same split, so a file that
+belongs to neither list belongs in neither build. Files under `src/lexer`,
+`src/parser`, `src/semantic`, `src/ir` and `src/codegen/{asm,binary}` are
+globbed by CMake and still need naming in the `Makefile`.
 
 ## Testing
 

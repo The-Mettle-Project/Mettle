@@ -63,3 +63,4 @@ tests/test-failures.txt
 DS/
 build-release
 build-debug
+build/

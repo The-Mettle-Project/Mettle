@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 
 project(mettle C)
 
@@ -35,6 +35,8 @@ endif()
 set(EXTRA_CFLAGS "" CACHE STRING "")
 
 option(DGX_SPARK "DGX Spark profile" OFF)
+
+option(STRIP_IMAGE "Strip bin/mettle after linking" OFF)
 
 set(DGX_SPARK_CFLAGS "-march=armv9.2-a" CACHE STRING "")
 
@@ -84,7 +86,7 @@ if(_triple MATCHES "aarch64|arm64")
 
 endif()
 
-set(COMMON_CFLAGS -std=c99 -D_GNU_SOURCE ${ARCH_CFLAGS})
+set(COMMON_CFLAGS -Wall -Wextra -std=c99 -D_GNU_SOURCE ${ARCH_CFLAGS})
 
 set(HOST_BACKEND_CFLAGS
   -ffreestanding -fno-builtin -fno-stack-protector
@@ -103,26 +105,19 @@ set(RUNTIME_OBJ_CFLAGS ${FREESTANDING_CFLAGS} -D_GNU_SOURCE -I${SRCDIR})
 
 set(MTLC_CFLAGS ${COMMON_CFLAGS})
 
-set(LD_EXTRA "")
-
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-  list(APPEND MTLC_CFLAGS -Wall -Wextra -g3 -O0 -DDEBUG -fno-omit-frame-pointer)
+  list(APPEND MTLC_CFLAGS -g3 -O0 -DDEBUG -fno-omit-frame-pointer)
 else()
-
-  list(APPEND MTLC_CFLAGS -Oz -DNDEBUG -fomit-frame-pointer
-                          -ffunction-sections -fdata-sections
-                          -fno-asynchronous-unwind-tables -fno-unwind-tables
-                          -fno-ident)
-  set(LD_EXTRA -s)
+  list(APPEND MTLC_CFLAGS -O2 -g -fno-omit-frame-pointer)
 endif()
 
 if(EXTRA_CFLAGS)
-  separate_arguments(_extra NATIVE_COMMAND "${EXTRA_CFLAGS}")
+  separate_arguments(_extra UNIX_COMMAND "${EXTRA_CFLAGS}")
   list(APPEND MTLC_CFLAGS ${_extra})
 endif()
 
 if(DGX_SPARK)
-  separate_arguments(_dgx NATIVE_COMMAND "${DGX_SPARK_CFLAGS}")
+  separate_arguments(_dgx UNIX_COMMAND "${DGX_SPARK_CFLAGS}")
   list(APPEND MTLC_CFLAGS ${_dgx})
 endif()
 
@@ -212,12 +207,13 @@ add_custom_command(OUTPUT ${LIBMTLC}
           -DLABEL=${LIBMTLC}
           -P ${CMAKE_BINARY_DIR}/_check_undef.cmake
   DEPENDS mtlc_backend host_runtime
+          $<TARGET_OBJECTS:mtlc_backend> $<TARGET_OBJECTS:host_runtime>
   COMMAND_EXPAND_LISTS
   VERBATIM)
 
 add_custom_target(libmtlc ALL DEPENDS ${LIBMTLC})
 
-set(LD_IMAGE ${LD_EXECUTABLE} -static --gc-sections -e _start ${LD_EXTRA})
+set(LD_IMAGE ${LD_EXECUTABLE} -static --gc-sections -e _start)
 
 if(NOT WIN32)
   list(INSERT LD_IMAGE 2 -z noexecstack)
@@ -230,10 +226,11 @@ add_custom_command(OUTPUT ${TARGET}
   COMMAND ${CMAKE_COMMAND}
           -DREADELF=${READELF_EXECUTABLE}
           -DNM=${NM_EXECUTABLE}
-          -DSTRIP=$<IF:$<AND:$<NOT:$<STREQUAL:${CMAKE_BUILD_TYPE},Debug>>,$<BOOL:${STRIP_EXECUTABLE}>>,${STRIP_EXECUTABLE},>
+          -DSTRIP=$<IF:$<AND:$<BOOL:${STRIP_IMAGE}>,$<BOOL:${STRIP_EXECUTABLE}>>,${STRIP_EXECUTABLE},>
           -DBIN=${TARGET}
           -P ${CMAKE_BINARY_DIR}/_check_image.cmake
   DEPENDS host_startup mtlc_frontend ${LIBMTLC}
+          $<TARGET_OBJECTS:host_startup> $<TARGET_OBJECTS:mtlc_frontend>
   COMMAND_EXPAND_LISTS
   VERBATIM)
 
@@ -336,7 +333,7 @@ add_custom_target(bundle-runtime ALL
   DEPENDS ${TARGET} host_startup
   VERBATIM)
 
-add_dependencies(bundle-runtime mettle)
+add_dependencies(bundle-runtime mettle bundle-stdlib)
 
 add_custom_target(test
   COMMAND ${CMAKE_COMMAND} -E echo "Running owned runtime tests..."
@@ -373,13 +370,11 @@ add_custom_target(complexity
   COMMAND ${PYTHON} ${CMAKE_SOURCE_DIR}/tools/ci/complexity_audit.py --check
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} VERBATIM)
 
-install(CODE "
-  set(_root \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}\")
-  file(MAKE_DIRECTORY \"\${_root}/bin\" \"\${_root}/stdlib\" \"\${_root}/runtime\")
-  file(COPY \"${TARGET}\" DESTINATION \"\${_root}/bin\")
-  file(COPY \"${BINDIR}/stdlib/\" DESTINATION \"\${_root}/stdlib\")
-  file(COPY \"${BINDIR}/runtime/\" DESTINATION \"\${_root}/runtime\")
-")
+install(PROGRAMS ${TARGET} DESTINATION bin)
+
+install(DIRECTORY ${BINDIR}/stdlib/ DESTINATION stdlib)
+
+install(DIRECTORY ${BINDIR}/runtime/ DESTINATION runtime)
 
 add_custom_target(install-libmtlc
   COMMAND ${CMAKE_COMMAND}

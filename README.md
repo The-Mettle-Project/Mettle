@@ -206,6 +206,12 @@ make -j"$(nproc)"
 make check
 ```
 
+or, for an out-of-tree build and a `compile_commands.json`:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
+```
+
 `make check` runs the same `tests/run_tests.ps1` the Windows build gates on, so
 a test written on either platform runs on both. It needs
 [PowerShell Core](https://aka.ms/powershell). Without it, `bash
