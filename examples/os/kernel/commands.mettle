@@ -7,6 +7,7 @@ import "heap"
 import "clock"
 import "process"
 import "archive"
+import "ata"
 import "status"
 import "jobs"
 import "shell"
@@ -72,6 +73,127 @@ fn cmd_mem(argument: cstring) {
     console_write(" bytes handed out of ")
     console_write_decimal(heap_claimed())
     console_write_line(" bytes claimed")
+}
+
+fn cmd_disk(argument: cstring) {
+    if (!ata_present()) {
+        console_write_line("no ata disk answered on the primary channel")
+        return
+    }
+    console_write("model ")
+    console_write_line(ata_model())
+    console_write("size ")
+    console_write_decimal(ata_capacity_bytes() / BYTES_PER_MB)
+    console_write(" mb in ")
+    console_write_decimal(ata_sector_count())
+    console_write_line(" sectors of 512 bytes")
+    console_write("traffic ")
+    console_write_decimal(ata_read_count())
+    console_write(" sectors read, ")
+    console_write_decimal(ata_write_count())
+    console_write(" written, ")
+    console_write_decimal(ata_fault_count())
+    console_write_line(" faults")
+}
+
+fn cmd_sector(argument: cstring) {
+    if (text_empty(argument)) {
+        console_write_line("sector <number>")
+        return
+    }
+    var lba: uint64 = text_parse_number(argument)
+    var buffer: uint64 = heap_alloc(SECTOR_BYTES)
+    if (buffer == 0) {
+        console_write_line("no room for a sector buffer")
+        return
+    }
+    if (!ata_read(lba, 1, buffer)) {
+        console_write_line("that sector did not read")
+        heap_free(buffer)
+        return
+    }
+    console_write("sector ")
+    console_write_decimal(lba)
+    console_write_line("")
+    var bytes: uint8* = (uint8*)buffer
+    for row: uint64 in 0..DUMP_ROWS {
+        console_write_hex(row * DUMP_COLUMNS, 4)
+        console_write("  ")
+        dump_row(bytes, row * DUMP_COLUMNS)
+    }
+    heap_free(buffer)
+}
+
+fn cmd_selftest(argument: cstring) {
+    console_write_line("checking the heap, the pages and the disk")
+    var big: uint64 = heap_alloc(200000)
+    if (big == 0) {
+        console_write_line("heap refused 200000 bytes")
+    } else {
+        var bytes: uint8* = (uint8*)big
+        for i: uint64 in 0..200000 {
+            bytes[i] = (uint8)(i & 0xff)
+        }
+        var wrong: uint64 = 0
+        for i: uint64 in 0..200000 {
+            if (bytes[i] != (uint8)(i & 0xff)) {
+                wrong++
+            }
+        }
+        console_write("heap handed out 200000 bytes at ")
+        console_write_hex(big, 16)
+        console_write(", ")
+        console_write_decimal(wrong)
+        console_write_line(" bytes wrong")
+        heap_free(big)
+    }
+
+    var run: uint64 = page_alloc_pages(64)
+    if (run == 0) {
+        console_write_line("no contiguous run of 64 pages")
+    } else {
+        console_write("64 contiguous pages at ")
+        console_write_hex(run, 16)
+        console_write_line("")
+        page_free_pages(run, 64)
+    }
+
+    var buffer: uint64 = heap_alloc(SECTOR_BYTES * 4)
+    var check: uint64 = heap_alloc(SECTOR_BYTES * 4)
+    if (buffer == 0 || check == 0) {
+        console_write_line("no room for the disk buffers")
+        return
+    }
+    var out: uint8* = (uint8*)buffer
+    var back: uint8* = (uint8*)check
+    for i: uint64 in 0..(SECTOR_BYTES * 4) {
+        out[i] = (uint8)((i * 7 + 3) & 0xff)
+        back[i] = 0
+    }
+    if (!ata_write(DISK_PARTITION_LBA, 4, buffer)) {
+        console_write_line("the disk refused a four sector write")
+    } else if (!ata_read(DISK_PARTITION_LBA, 4, check)) {
+        console_write_line("the disk refused to read those sectors back")
+    } else {
+        var wrong: uint64 = 0
+        for i: uint64 in 0..(SECTOR_BYTES * 4) {
+            if (out[i] != back[i]) {
+                wrong++
+            }
+        }
+        console_write("four sectors written and read back, ")
+        console_write_decimal(wrong)
+        console_write_line(" bytes wrong")
+    }
+    heap_free(buffer)
+    heap_free(check)
+    console_write("heap ")
+    console_write_decimal(heap_used())
+    console_write(" in use of ")
+    console_write_decimal(heap_claimed())
+    console_write(" claimed, ")
+    console_write_decimal(heap_live_blocks())
+    console_write_line(" live blocks")
 }
 
 fn cmd_alloc(argument: cstring) {
@@ -439,6 +561,9 @@ export fn commands_init() {
     shell_register("echo", "print the rest of the line", &cmd_echo)
     shell_register("mem", "memory map, free pages, heap", &cmd_mem)
     shell_register("alloc", "exercise the heap and report", &cmd_alloc)
+    shell_register("disk", "the drive the kernel is running from", &cmd_disk)
+    shell_register("selftest", "exercise the heap, the pages and the disk", &cmd_selftest)
+    shell_register("sector", "128 bytes of a disk sector", &cmd_sector)
     shell_register("uptime", "seconds and ticks since boot", &cmd_uptime)
     shell_register("date", "the clock the firmware keeps", &cmd_date)
     shell_register("cpu", "what the processor calls itself", &cmd_cpu)

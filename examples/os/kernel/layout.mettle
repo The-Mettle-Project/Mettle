@@ -3,8 +3,7 @@ export const PAGE_SIZE: uint64 = 4096
 export const BOOT_INFO_BASE: uint64 = 0x500
 export const FONT_BASE: uint64 = 0x9000
 export const KERNEL_BASE: uint64 = 0x20000
-export const ARCHIVE_BASE: uint64 = 0x40000
-export const STACK_TOP: uint64 = 0x90000
+export const KERNEL_LIMIT: uint64 = 0x90000
 export const VGA_TEXT_BASE: uint64 = 0xb8000
 
 export const SCREEN_LIMIT_WIDTH: uint64 = 1280
@@ -13,8 +12,25 @@ export const SCREEN_LIMIT_HEIGHT: uint64 = 800
 export const BACK_BUFFER_BASE: uint64 = 0x400000
 export const WALLPAPER_BASE: uint64 = 0xc00000
 export const SPRITE_BASE: uint64 = 0x1400000
-export const HEAP_FLOOR: uint64 = 0x1800000
+export const SPRITE_LIMIT: uint64 = 0x1800000
+
+export const STACK_BASE: uint64 = 0x1800000
+export const STACK_TOP: uint64 = 0x1900000
+export const PAGE_BITMAP_BASE: uint64 = 0x1900000
+export const PAGE_BITMAP_LIMIT: uint64 = 0x1940000
+export const ARCHIVE_BASE: uint64 = 0x1940000
+export const ARCHIVE_LIMIT: uint64 = 0x2000000
+
+export const HEAP_FLOOR: uint64 = 0x2000000
 export const IDENTITY_LIMIT: uint64 = 0x100000000
+
+export const DISK_STAGE2_LBA: uint64 = 1
+export const DISK_STAGE2_SECTORS: uint64 = 32
+export const DISK_KERNEL_LBA: uint64 = 64
+export const DISK_KERNEL_SECTORS: uint64 = 896
+export const DISK_ARCHIVE_LBA: uint64 = 1024
+export const DISK_ARCHIVE_SECTORS: uint64 = 1024
+export const DISK_PARTITION_LBA: uint64 = 2048
 
 export const GDT_CODE_SELECTOR: uint64 = 0x08
 export const GDT_DATA_SELECTOR: uint64 = 0x10

@@ -101,3 +101,49 @@ export fn cpu_vendor(out: uint8*) {
     }
     out[12] = 0
 }
+
+export fn port_out16(port: uint16, value: uint16) {
+    asm {
+        mov dx, {port}
+        mov ax, {value}
+        out dx, ax
+    }
+}
+
+export fn port_in16(port: uint16) -> uint16 {
+    var value: uint16 = 0
+    asm {
+        mov dx, {port}
+        in ax, dx
+        mov {value}, ax
+    }
+    return value
+}
+
+export fn port_read_words(port: uint16, buffer: uint64, words: uint64) {
+    asm {
+        push rdi
+        push rcx
+        mov dx, {port}
+        mov rdi, {buffer}
+        mov rcx, {words}
+        cld
+        rep insw
+        pop rcx
+        pop rdi
+    }
+}
+
+export fn port_write_words(port: uint16, buffer: uint64, words: uint64) {
+    asm {
+        push rsi
+        push rcx
+        mov dx, {port}
+        mov rsi, {buffer}
+        mov rcx, {words}
+        cld
+        rep outsw
+        pop rcx
+        pop rsi
+    }
+}

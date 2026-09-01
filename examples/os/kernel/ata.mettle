@@ -1,0 +1,294 @@
+import "port"
+
+export const SECTOR_BYTES: uint64 = 512
+
+const WORDS_PER_SECTOR: uint64 = 256
+const MAX_SECTORS_PER_COMMAND: uint64 = 128
+
+const DATA_PORT: uint16 = 0x1f0
+const FEATURE_PORT: uint16 = 0x1f1
+const COUNT_PORT: uint16 = 0x1f2
+const LBA_LOW_PORT: uint16 = 0x1f3
+const LBA_MID_PORT: uint16 = 0x1f4
+const LBA_HIGH_PORT: uint16 = 0x1f5
+const DRIVE_PORT: uint16 = 0x1f6
+const COMMAND_PORT: uint16 = 0x1f7
+const CONTROL_PORT: uint16 = 0x3f6
+
+const STATUS_ERROR: uint8 = 0x01
+const STATUS_DATA_READY: uint8 = 0x08
+const STATUS_FAULT: uint8 = 0x20
+const STATUS_READY: uint8 = 0x40
+const STATUS_BUSY: uint8 = 0x80
+
+const COMMAND_READ: uint8 = 0x20
+const COMMAND_WRITE: uint8 = 0x30
+const COMMAND_IDENTIFY: uint8 = 0xec
+const COMMAND_FLUSH: uint8 = 0xe7
+
+const DRIVE_MASTER_LBA: uint8 = 0xe0
+const CONTROL_NO_INTERRUPT: uint8 = 0x02
+
+const IDENTIFY_MODEL_WORD: uint64 = 27
+const IDENTIFY_MODEL_WORDS: uint64 = 20
+const IDENTIFY_LBA28_WORD: uint64 = 60
+const IDENTIFY_LBA48_WORD: uint64 = 100
+const IDENTIFY_COMMAND_SET_WORD: uint64 = 83
+const IDENTIFY_LBA48_SUPPORTED: uint16 = 0x0400
+
+const SPIN_LIMIT: uint64 = 40000000
+
+var present: bool = false
+var sectors: uint64 = 0
+var model: uint8[41]
+var identity: uint16[256]
+var reads: uint64 = 0
+var writes: uint64 = 0
+var faults: uint64 = 0
+
+fn status() -> uint8 {
+    return port_in(COMMAND_PORT)
+}
+
+fn settle() {
+    port_in(CONTROL_PORT)
+    port_in(CONTROL_PORT)
+    port_in(CONTROL_PORT)
+    port_in(CONTROL_PORT)
+}
+
+fn wait_idle() -> bool {
+    var spins: uint64 = 0
+    while (spins < SPIN_LIMIT) {
+        if ((status() & STATUS_BUSY) == 0) {
+            return true
+        }
+        spins++
+    }
+    faults++
+    return false
+}
+
+fn wait_data() -> bool {
+    var spins: uint64 = 0
+    while (spins < SPIN_LIMIT) {
+        var state: uint8 = status()
+        if ((state & STATUS_BUSY) != 0) {
+            spins++
+            continue
+        }
+        if ((state & (STATUS_ERROR | STATUS_FAULT)) != 0) {
+            faults++
+            return false
+        }
+        if ((state & STATUS_DATA_READY) != 0) {
+            return true
+        }
+        spins++
+    }
+    faults++
+    return false
+}
+
+fn select_drive(lba: uint64) {
+    port_out(DRIVE_PORT, DRIVE_MASTER_LBA | (uint8)((lba >> 24) & 0x0f))
+    settle()
+}
+
+fn issue(lba: uint64, count: uint64, command: uint8) -> bool {
+    if (!wait_idle()) {
+        return false
+    }
+    select_drive(lba)
+    port_out(FEATURE_PORT, 0)
+    port_out(COUNT_PORT, (uint8)(count & 0xff))
+    port_out(LBA_LOW_PORT, (uint8)(lba & 0xff))
+    port_out(LBA_MID_PORT, (uint8)((lba >> 8) & 0xff))
+    port_out(LBA_HIGH_PORT, (uint8)((lba >> 16) & 0xff))
+    port_out(COMMAND_PORT, command)
+    settle()
+    return true
+}
+
+export fn ata_present() -> bool {
+    return present
+}
+
+export fn ata_model() -> cstring {
+    return (cstring)&model[0]
+}
+
+export fn ata_sector_count() -> uint64 {
+    return sectors
+}
+
+export fn ata_capacity_bytes() -> uint64 {
+    return sectors * SECTOR_BYTES
+}
+
+export fn ata_read_count() -> uint64 {
+    return reads
+}
+
+export fn ata_write_count() -> uint64 {
+    return writes
+}
+
+export fn ata_fault_count() -> uint64 {
+    return faults
+}
+
+fn read_chunk(lba: uint64, count: uint64, buffer: uint64) -> bool {
+    if (!issue(lba, count, COMMAND_READ)) {
+        return false
+    }
+    var cursor: uint64 = buffer
+    for i: uint64 in 0..count {
+        if (!wait_data()) {
+            return false
+        }
+        port_read_words(DATA_PORT, cursor, WORDS_PER_SECTOR)
+        settle()
+        cursor += SECTOR_BYTES
+    }
+    reads += count
+    return true
+}
+
+fn write_chunk(lba: uint64, count: uint64, buffer: uint64) -> bool {
+    if (!issue(lba, count, COMMAND_WRITE)) {
+        return false
+    }
+    var cursor: uint64 = buffer
+    for i: uint64 in 0..count {
+        if (!wait_data()) {
+            return false
+        }
+        port_write_words(DATA_PORT, cursor, WORDS_PER_SECTOR)
+        settle()
+        cursor += SECTOR_BYTES
+    }
+    writes += count
+    return true
+}
+
+export fn ata_read(lba: uint64, count: uint64, buffer: uint64) -> bool {
+    if (!present || count == 0) {
+        return false
+    }
+    if (lba + count > sectors) {
+        return false
+    }
+    var done: uint64 = 0
+    while (done < count) {
+        var batch: uint64 = count - done
+        if (batch > MAX_SECTORS_PER_COMMAND) {
+            batch = MAX_SECTORS_PER_COMMAND
+        }
+        if (!read_chunk(lba + done, batch, buffer + done * SECTOR_BYTES)) {
+            return false
+        }
+        done += batch
+    }
+    return true
+}
+
+export fn ata_write(lba: uint64, count: uint64, buffer: uint64) -> bool {
+    if (!present || count == 0) {
+        return false
+    }
+    if (lba + count > sectors) {
+        return false
+    }
+    var done: uint64 = 0
+    while (done < count) {
+        var batch: uint64 = count - done
+        if (batch > MAX_SECTORS_PER_COMMAND) {
+            batch = MAX_SECTORS_PER_COMMAND
+        }
+        if (!write_chunk(lba + done, batch, buffer + done * SECTOR_BYTES)) {
+            return false
+        }
+        done += batch
+    }
+    return ata_flush()
+}
+
+export fn ata_flush() -> bool {
+    if (!present) {
+        return false
+    }
+    if (!wait_idle()) {
+        return false
+    }
+    select_drive(0)
+    port_out(COMMAND_PORT, COMMAND_FLUSH)
+    settle()
+    return wait_idle()
+}
+
+fn take_model() {
+    var out: uint64 = 0
+    for i: uint64 in 0..IDENTIFY_MODEL_WORDS {
+        var word: uint16 = identity[IDENTIFY_MODEL_WORD + i]
+        model[out] = (uint8)(word >> 8)
+        model[out + 1] = (uint8)(word & 0xff)
+        out += 2
+    }
+    model[40] = 0
+    var last: uint64 = 40
+    while (last > 0 && (model[last - 1] == ' ' || model[last - 1] == 0)) {
+        last--
+    }
+    model[last] = 0
+}
+
+fn take_capacity() {
+    var lba28: uint64 = (uint64)identity[IDENTIFY_LBA28_WORD] |
+                        ((uint64)identity[IDENTIFY_LBA28_WORD + 1] << 16)
+    sectors = lba28
+    if ((identity[IDENTIFY_COMMAND_SET_WORD] & IDENTIFY_LBA48_SUPPORTED) != 0) {
+        var lba48: uint64 = (uint64)identity[IDENTIFY_LBA48_WORD] |
+                            ((uint64)identity[IDENTIFY_LBA48_WORD + 1] << 16) |
+                            ((uint64)identity[IDENTIFY_LBA48_WORD + 2] << 32) |
+                            ((uint64)identity[IDENTIFY_LBA48_WORD + 3] << 48)
+        if (lba48 > sectors && lba48 < 0x10000000) {
+            sectors = lba48
+        }
+    }
+    if (sectors > 0x0fffffff) {
+        sectors = 0x0fffffff
+    }
+}
+
+export fn ata_init() -> bool {
+    present = false
+    sectors = 0
+    model[0] = 0
+    port_out(CONTROL_PORT, CONTROL_NO_INTERRUPT)
+    port_out(DRIVE_PORT, DRIVE_MASTER_LBA)
+    settle()
+    port_out(COUNT_PORT, 0)
+    port_out(LBA_LOW_PORT, 0)
+    port_out(LBA_MID_PORT, 0)
+    port_out(LBA_HIGH_PORT, 0)
+    port_out(COMMAND_PORT, COMMAND_IDENTIFY)
+    settle()
+    if (status() == 0) {
+        return false
+    }
+    if (!wait_idle()) {
+        return false
+    }
+    if (port_in(LBA_MID_PORT) != 0 || port_in(LBA_HIGH_PORT) != 0) {
+        return false
+    }
+    if (!wait_data()) {
+        return false
+    }
+    port_read_words(DATA_PORT, (uint64)&identity[0], WORDS_PER_SECTOR)
+    take_model()
+    take_capacity()
+    present = sectors > 0
+    return present
+}

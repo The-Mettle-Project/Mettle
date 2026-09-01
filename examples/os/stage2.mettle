@@ -8,8 +8,38 @@
         mov ss, ax
         mov sp, 0x7c00
         cld
+        mov [boot_drive], dl
         sti
 
+        mov cx, 14
+    load_chunk:
+        push cx
+        mov si, packet
+        mov ah, 0x42
+        mov dl, [boot_drive]
+        int 0x13
+        jc load_failed
+        add word [packet_segment], 0x800
+        add dword [packet_lba], 64
+        pop cx
+        loop load_chunk
+        jmp loaded
+
+    load_failed:
+        mov si, disk_text
+    print_byte:
+        lodsb
+        test al, al
+        jz stopped
+        mov ah, 0x0e
+        mov bx, 7
+        int 0x10
+        jmp print_byte
+    stopped:
+        hlt
+        jmp stopped
+
+    loaded:
         mov word [0x0500], 0
         mov word [0x0502], 0
         mov word [0x0504], 0
@@ -183,6 +213,24 @@
         dw 0
     best_mode:
         dw 0
+    boot_drive:
+        db 0
+    disk_text:
+        db "kernel read failed", 13, 10, 0
+
+        align 4
+    packet:
+        db 0x10
+        db 0
+    packet_count:
+        dw 64
+    packet_offset:
+        dw 0
+    packet_segment:
+        dw 0x2000
+    packet_lba:
+        dd 64
+        dd 0
 
         align 8
     gdt_start:
@@ -201,7 +249,7 @@
         mov ss, ax
         mov fs, ax
         mov gs, ax
-        mov rsp, 0x90000
+        mov rsp, 0x1900000
         mov rax, 0x20000
         jmp rax
     }

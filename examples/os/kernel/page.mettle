@@ -4,6 +4,11 @@ const REGION_USABLE: uint32 = 1
 const MAP_COUNT_ADDRESS: uint64 = BOOT_INFO_BASE
 const MAP_ENTRY_ADDRESS: uint64 = BOOT_INFO_BASE + 16
 
+const BITS_PER_WORD: uint64 = 64
+const WORD_SHIFT: uint64 = 6
+const WORD_MASK: uint64 = 63
+const ALL_TAKEN: uint64 = 0
+
 export struct MemoryRegion {
     base: uint64;
     length: uint64;
@@ -11,9 +16,28 @@ export struct MemoryRegion {
     attributes: uint32;
 }
 
-var free_list: uint64 = 0
+var first_index: uint64 = 0
+var limit_index: uint64 = 0
+var cursor: uint64 = 0
 var free_pages: uint64 = 0
 var total_pages: uint64 = 0
+var biggest_run: uint64 = 0
+
+fn words() -> uint64* {
+    return (uint64*)PAGE_BITMAP_BASE
+}
+
+fn is_free(index: uint64) -> bool {
+    return ((words()[index >> WORD_SHIFT] >> (index & WORD_MASK)) & 1) != 0
+}
+
+fn take(index: uint64) {
+    words()[index >> WORD_SHIFT] &= ~((uint64)1 << (index & WORD_MASK))
+}
+
+fn give(index: uint64) {
+    words()[index >> WORD_SHIFT] |= (uint64)1 << (index & WORD_MASK)
+}
 
 export fn memory_map_count() -> uint64 {
     var count: uint16* = (uint16*)MAP_COUNT_ADDRESS
@@ -44,24 +68,6 @@ export fn memory_map_kind_name(kind: uint32) -> cstring {
     return "unknown"
 }
 
-export fn page_free(address: uint64) {
-    var link: uint64* = (uint64*)address
-    link[0] = free_list
-    free_list = address
-    free_pages++
-}
-
-export fn page_alloc() -> uint64 {
-    if (free_list == 0) {
-        return 0
-    }
-    var address: uint64 = free_list
-    var link: uint64* = (uint64*)address
-    free_list = link[0]
-    free_pages--
-    return address
-}
-
 export fn page_free_count() -> uint64 {
     return free_pages
 }
@@ -74,12 +80,89 @@ export fn page_free_bytes() -> uint64 {
     return free_pages * PAGE_SIZE
 }
 
+export fn page_largest_run() -> uint64 {
+    return biggest_run
+}
+
 fn round_up(value: uint64) -> uint64 {
     return (value + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE
 }
 
 fn round_down(value: uint64) -> uint64 {
     return value / PAGE_SIZE * PAGE_SIZE
+}
+
+export fn page_free_pages(address: uint64, count: uint64) {
+    if (address == 0 || count == 0) {
+        return
+    }
+    var index: uint64 = address / PAGE_SIZE
+    for i: uint64 in 0..count {
+        if (index + i >= first_index && index + i < limit_index &&
+            !is_free(index + i)) {
+            give(index + i)
+            free_pages++
+        }
+    }
+}
+
+export fn page_free(address: uint64) {
+    page_free_pages(address, 1)
+}
+
+fn run_at(index: uint64, wanted: uint64) -> uint64 {
+    var length: uint64 = 0
+    while (length < wanted && index + length < limit_index &&
+           is_free(index + length)) {
+        length++
+    }
+    return length
+}
+
+export fn page_alloc_pages(count: uint64) -> uint64 {
+    if (count == 0 || count > free_pages) {
+        return 0
+    }
+    var scanned: uint64 = 0
+    var span: uint64 = limit_index - first_index
+    var index: uint64 = cursor
+    while (scanned <= span) {
+        if (index + count > limit_index) {
+            scanned += limit_index - index + 1
+            index = first_index
+            continue
+        }
+        if ((index & WORD_MASK) == 0 &&
+            words()[index >> WORD_SHIFT] == ALL_TAKEN) {
+            index += BITS_PER_WORD
+            scanned += BITS_PER_WORD
+            continue
+        }
+        if (!is_free(index)) {
+            index++
+            scanned++
+            continue
+        }
+        var length: uint64 = run_at(index, count)
+        if (length == count) {
+            for i: uint64 in 0..count {
+                take(index + i)
+            }
+            free_pages -= count
+            cursor = index + count
+            if (cursor >= limit_index) {
+                cursor = first_index
+            }
+            return index * PAGE_SIZE
+        }
+        index += length + 1
+        scanned += length + 1
+    }
+    return 0
+}
+
+export fn page_alloc() -> uint64 {
+    return page_alloc_pages(1)
 }
 
 fn adopt_region(region: MemoryRegion*) {
@@ -93,14 +176,41 @@ fn adopt_region(region: MemoryRegion*) {
     }
     start = round_up(start)
     end = round_down(end)
+    if (start + PAGE_SIZE > end) {
+        return
+    }
+    var run: uint64 = (end - start) / PAGE_SIZE
+    if (run > biggest_run) {
+        biggest_run = run
+    }
     while (start + PAGE_SIZE <= end) {
-        page_free(start)
+        var index: uint64 = start / PAGE_SIZE
+        if (index >= limit_index) {
+            return
+        }
+        give(index)
+        free_pages++
         total_pages++
         start += PAGE_SIZE
     }
 }
 
 export fn page_init() {
+    first_index = HEAP_FLOOR / PAGE_SIZE
+    limit_index = IDENTITY_LIMIT / PAGE_SIZE
+    var bitmap_words: uint64 = (PAGE_BITMAP_LIMIT - PAGE_BITMAP_BASE) / 8
+    var span_words: uint64 = limit_index / BITS_PER_WORD
+    if (span_words > bitmap_words) {
+        limit_index = bitmap_words * BITS_PER_WORD
+        span_words = bitmap_words
+    }
+    for i: uint64 in 0..span_words {
+        words()[i] = ALL_TAKEN
+    }
+    cursor = first_index
+    free_pages = 0
+    total_pages = 0
+    biggest_run = 0
     for i: uint64 in 0..memory_map_count() {
         var region: MemoryRegion* = memory_map_region(i)
         if (region->kind == REGION_USABLE) {

@@ -1,7 +1,7 @@
 welcome to mettle os.
 
-this text is a file in the boot image. the build script packed it after the
-kernel, the boot sector read it off the floppy, and ls and cat read it out of
-memory. put your own files in examples/os/files and rebuild.
+this text is a file on the disk. the build script packed it into an archive at
+sector 1024, and the kernel read it back with its own ata driver rather than
+asking the firmware. put your own files in examples/os/files and rebuild.
 
-the shell runs in this window. try help, mem, ps, ls, cat about.txt
+the shell runs in this window. try help, disk, mem, ps, ls, cat about.txt

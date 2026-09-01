@@ -14,52 +14,27 @@
         mov si, loading_text
         call print
 
-        mov cx, 8
-        mov si, 1
-        mov bp, 0x0800
-        call load_run
+        mov ah, 0x41
+        mov bx, 0x55aa
+        mov dl, [boot_drive]
+        int 0x13
+        jc no_extensions
+        cmp bx, 0xaa55
+        jne no_extensions
 
-        mov cx, 384
-        mov si, 9
-        mov bp, 0x2000
-        call load_run
+        mov si, packet
+        mov ah, 0x42
+        mov dl, [boot_drive]
+        int 0x13
+        jc read_failed
 
         mov dl, [boot_drive]
         jmp 0x0000:0x8000
 
-    load_run:
-        call read_sector
-        inc si
-        add bp, 0x20
-        loop load_run
-        ret
-
-    read_sector:
-        push cx
-        push si
-        push bp
-        mov ax, si
-        xor dx, dx
-        mov di, 18
-        div di
-        mov cl, dl
-        inc cl
-        xor dx, dx
-        mov di, 2
-        div di
-        mov ch, al
-        mov dh, dl
-        mov dl, [boot_drive]
-        mov ax, bp
-        mov es, ax
-        xor bx, bx
-        mov ax, 0x0201
-        int 0x13
-        jc read_failed
-        pop bp
-        pop si
-        pop cx
-        ret
+    no_extensions:
+        mov si, plain_text
+        call print
+        jmp stopped
     read_failed:
         mov si, disk_text
         call print
@@ -81,11 +56,23 @@
         pop bx
         ret
 
+        align 4
+    packet:
+        db 0x10
+        db 0
+        dw 32
+        dw 0x8000
+        dw 0x0000
+        dd 1
+        dd 0
+
     boot_drive:
         db 0
     loading_text:
-        db "loading mettle os", 13, 10, 0
+        db "mettle os", 13, 10, 0
     disk_text:
         db "disk error", 13, 10, 0
+    plain_text:
+        db "no lba bios", 13, 10, 0
     }
 }

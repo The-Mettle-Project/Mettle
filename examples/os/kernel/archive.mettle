@@ -1,7 +1,9 @@
 import "layout"
 import "text"
+import "ata"
 
 const NAME_BYTES: uint64 = 32
+const ENTRY_BYTES: uint64 = 48
 const HEADER_BYTES: uint64 = 16
 
 struct FileEntry {
@@ -58,4 +60,25 @@ export fn archive_find(name: cstring) -> uint64 {
         }
     }
     return count
+}
+
+export fn archive_init() -> bool {
+    var bytes: uint8* = (uint8*)ARCHIVE_BASE
+    bytes[0] = 0
+    if (!ata_present()) {
+        return false
+    }
+    if (!ata_read(DISK_ARCHIVE_LBA, DISK_ARCHIVE_SECTORS, ARCHIVE_BASE)) {
+        return false
+    }
+    return magic_matches()
+}
+
+export fn archive_bytes() -> uint64 {
+    var count: uint64 = archive_count()
+    var total: uint64 = HEADER_BYTES + count * ENTRY_BYTES
+    for i: uint64 in 0..count {
+        total += archive_length(i)
+    }
+    return total
 }

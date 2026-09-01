@@ -1,12 +1,24 @@
 the path from power on to the shell:
 
-  the bios reads sector zero to 0x7c00 and jumps into it
-  the sector asks the bios for the memory map and leaves it at 0x5000
-  it reads 128 kilobytes from the floppy to 0x20000
+  the bios reads sector zero of the disk to 0x7c00 and jumps into it
+  the sector asks the bios for its lba extensions and reads sectors 1 to 32
+  those sectors are the second stage, which lands at 0x8000
+  the second stage reads 448 kilobytes of kernel from sector 64 to 0x20000
+  it asks the firmware for the memory map and leaves it at 0x500
+  it copies the bios 8x16 font out of the video rom to 0x9000
+  it walks the vesa mode list and asks for a linear framebuffer
   it opens the a20 line so addresses above one megabyte work
-  it builds page tables that identity map the first gigabyte
+  it builds page tables that identity map the first four gigabytes
   it turns on pae, long mode, and paging, then jumps to 64 bit code
   it jumps to 0x20000, where the kernel starts
 
-the kernel is linked at 0x20000 and the archive of files sits at 0x30000.
-the stack starts at 0x90000.
+the kernel is linked at 0x20000 with room to 0x90000. the stack runs down
+from 0x19000000. the page bitmap and the file archive sit above it, and the
+page allocator hands out everything from 32 megabytes up.
+
+the kernel never asks the bios for anything again. it reads and writes the
+disk itself, over ata port io on the primary channel.
+
+the disk holds the boot sector in sector 0, the second stage in 1 to 32, the
+kernel in 64 to 959, the file archive in 1024 to 2047, and a partition of its
+own from sector 2048 to the end.

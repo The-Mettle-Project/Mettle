@@ -6,6 +6,7 @@ import "kernel/console"
 import "kernel/interrupt"
 import "kernel/clock"
 import "kernel/page"
+import "kernel/ata"
 import "kernel/heap"
 import "kernel/process"
 import "kernel/jobs"
@@ -27,7 +28,7 @@ import "kernel/cursor"
 
 @naked fn _start() {
     asm {
-        mov rsp, 0x90000
+        mov rsp, 0x1900000
         call kernel_main
     parked:
         cli
@@ -51,6 +52,21 @@ fn shell_task(argument: uint64) {
     shell_run(&terminal_read_key)
 }
 
+fn disk_init() {
+    if (!ata_init()) {
+        console_write_line("no ata disk on the primary channel")
+        return
+    }
+    console_write("disk ")
+    console_write(ata_model())
+    console_write(", ")
+    console_write_decimal(ata_capacity_bytes() / BYTES_PER_MB)
+    console_write_line(" megabytes")
+    if (!archive_init()) {
+        console_write_line("the disk carries no file archive")
+    }
+}
+
 fn machine_init() {
     serial_init()
     console_add_sink(&serial_put, &serial_ignore_tint, &serial_ignore_wipe)
@@ -60,6 +76,7 @@ fn machine_init() {
     clock_init()
     process_init()
     keyboard_init()
+    disk_init()
     cpu_enable_interrupts()
     commands_init()
 }

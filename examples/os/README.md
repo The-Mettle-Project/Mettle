@@ -3,8 +3,12 @@
 A bootable operating system written in Mettle, with a desktop. The boot sector
 loads a second stage, which asks the firmware for a linear framebuffer and
 brings the machine into 64-bit long mode. The kernel manages memory, schedules
-tasks, drives the screen, the mouse, the keyboard, the clock and a serial line,
-and runs a windowed desktop with a shell inside it.
+processes, drives the disk, the screen, the mouse, the keyboard, the clock and
+a serial line, and runs a windowed desktop with a shell inside it.
+
+It boots off a hard disk it partitions itself, and once the second stage hands
+over, the kernel never asks the firmware for anything again: it reads and
+writes the disk over ATA on its own.
 
 Nothing outside the Mettle compiler builds it. The 512-byte boot sector is an
 `asm` block the compiler assembles itself, and the kernel is ordinary Mettle
@@ -12,9 +16,14 @@ compiled to a flat image with `--target x86_64-none`.
 
 ## What it does
 
-- **Memory.** The boot sector asks the firmware for the E820 map. The kernel
-  turns every usable region above 2 MB into a free page list, and runs a heap
-  on top of it that splits blocks on allocation and merges neighbours on free.
+- **Memory.** The second stage asks the firmware for the E820 map. The kernel
+  turns every usable region into a page bitmap that hands out contiguous runs,
+  and runs a heap on top of it that serves a request of any size, splitting
+  blocks on allocation and merging neighbours on free.
+- **Disk.** An ATA driver on the primary channel: IDENTIFY for the model and
+  the capacity, LBA28 reads and writes in batches of up to 128 sectors, and a
+  cache flush after every write. The kernel loads its own file archive through
+  it at startup.
 - **Processes.** A process has a pid, a parent, a priority, a state, its own
   stack, the pages it claimed, and accounting for the ticks it has burned. The
   scheduler runs on the timer: highest ready priority first, round robin inside
@@ -26,8 +35,9 @@ compiled to a flat image with `--target x86_64-none`.
   and 0x71.
 - **Input.** A PS/2 keyboard on IRQ1 filling a ring buffer, with shift,
   backspace, and arrow keys walking the command history.
-- **Files.** `build.ps1` packs everything in `files/` into an archive that
-  rides along on the disk. `ls` and `cat` read it out of memory.
+- **Files.** `build.ps1` packs everything in `files/` into an archive at sector
+  1024. The kernel reads it back over ATA, and `ls` and `cat` read it out of
+  memory.
 - **GPU.** The kernel finds the VMware SVGA II device on the PCI bus, claims
   it, negotiates the protocol version, sets the mode itself, and drives it
   through its command FIFO. Damage rectangles go to the device rather than
@@ -58,7 +68,8 @@ nothing reaches into another module's globals.
 
 | Module | Owns |
 | --- | --- |
-| `layout` | Where things sit in physical memory. Every fixed address in the system is here. |
+| `layout` | Where things sit in physical memory and on the disk. Every fixed address in the system is here. |
+| `ata` | The disk: IDENTIFY, LBA28 reads and writes, cache flush. |
 | `pci` | Configuration space, and finding a device by its identity. |
 | `svga` | The VMware SVGA II driver: registers, command FIFO, hardware cursor. |
 | `video` | Drawing: fills, gradients, alpha, rounded shapes, discs, blits, presenting. |
@@ -79,8 +90,8 @@ nothing reaches into another module's globals.
 | `console` | Byte output. Writes to the screen and to every registered stream. |
 | `interrupt` | The IDT, the fault handlers, and the PIC. |
 | `clock` | The timer, the CMOS clock, sleeping, and the speaker. |
-| `page` | The firmware memory map and the free page list built from it. |
-| `heap` | Splitting and merging blocks inside pages. |
+| `page` | The firmware memory map and the page bitmap built from it. |
+| `heap` | Splitting and merging blocks across runs of pages. |
 | `process` | The process table, states, priorities, scheduling, sleep, wait channels, exits. |
 | `jobs` | Demonstration processes: counters, processor burners, sleepers. |
 | `keyboard` | Scancodes to characters, and the ring buffer between them. |
@@ -121,13 +132,13 @@ shell_register("ps", "the task table", &cmd_ps)
 
 | File | What it is |
 | --- | --- |
-| `boot.mettle` | The boot sector at 0x7c00. Reads the second stage and 192 KB of kernel and files off the floppy. |
-| `stage2.mettle` | At 0x8000. Memory map, VESA mode, BIOS font, A20, page tables for the first four gigabytes, long mode. |
+| `boot.mettle` | The boot sector at 0x7c00. Asks the BIOS for its LBA extensions and reads the second stage off the disk. |
+| `stage2.mettle` | At 0x8000. Reads 448 KB of kernel off the disk, then memory map, VESA mode, BIOS font, A20, page tables for the first four gigabytes, long mode. |
 | `kernel.mettle` | The entry point and the boot order. |
 | `kernel/` | The modules above. |
 | `files/` | Text carried in the boot image and read back by `ls` and `cat`. |
-| `build.ps1` | Compiles both images, packs the archive, writes `mettleos.img`. |
-| `run.ps1` | Creates the VirtualBox machine, attaches the image, starts it. |
+| `build.ps1` | Compiles all three images, packs the archive, writes `mettleos.vhd`. |
+| `run.ps1` | Creates the VirtualBox machine, attaches the disk, starts it. |
 
 ## Build
 
@@ -135,9 +146,24 @@ shell_register("ps", "the task table", &cmd_ps)
 pwsh examples/os/build.ps1
 ```
 
-That writes `examples/os/mettleos.img`, a 1.44 MB floppy image. The script
-fails if the boot sector loses its signature, if the kernel outgrows the 64 KB
-the image reserves for it, or if the files outgrow theirs.
+That writes `examples/os/mettleos.vhd`, a 256 MB fixed VHD that VirtualBox
+attaches as it stands. The script fails if the boot sector loses its signature,
+if its code would run into the partition table at offset 446, if the kernel
+outgrows the 448 KB the disk reserves for it, or if the files outgrow theirs.
+
+Only the first megabyte of the disk belongs to the build. Everything from
+sector 2048 on is a partition of the machine's own, and a rebuild carries it
+over untouched. `-Fresh` wipes it instead.
+
+### The disk
+
+| Sectors | What lives there |
+| --- | --- |
+| 0 | The boot sector, with a partition table at offset 446 |
+| 1 to 32 | The second stage |
+| 64 to 959 | The kernel |
+| 1024 to 2047 | The file archive |
+| 2048 on | Partition 1, 255 MB, the machine's own |
 
 ## Run it in VirtualBox
 
@@ -147,14 +173,14 @@ the image reserves for it, or if the files outgrow theirs.
 pwsh examples/os/run.ps1
 ```
 
-It creates a machine called `MettleOS` if there is none, gives it 128 MB and a
-serial line, attaches the image to a floppy controller, and starts it with the
+It creates a machine called `MettleOS` if there is none, gives it 256 MB and a
+serial line, attaches the disk to an IDE controller, and starts it with the
 GUI. `-Headless` starts it without a window. `-Recreate` deletes the machine
 and builds it again. Everything the kernel prints also lands in
 `examples/os/serial.log`, which is the quickest way to see what happened.
 
-A machine called `MettleOS` is already registered and powered off, pointing at
-`mettleos.img`, so the script starts it as it stands.
+If the machine is left over from when this booted off a floppy, the script
+takes the floppy controller off it and attaches the disk instead.
 
 ### By hand, from the command line
 
@@ -163,15 +189,15 @@ VBoxManage createvm --name MettleOS --ostype Other_64 --register
 ```
 
 ```bash
-VBoxManage modifyvm MettleOS --memory 128 --vram 16 --boot1 floppy --boot2 none --boot3 none --boot4 none --nic1 none
+VBoxManage modifyvm MettleOS --memory 256 --vram 64 --boot1 disk --boot2 none --boot3 none --boot4 none --nic1 none
 ```
 
 ```bash
-VBoxManage storagectl MettleOS --name Floppy --add floppy
+VBoxManage storagectl MettleOS --name IDE --add ide --controller PIIX4 --bootable on
 ```
 
 ```bash
-VBoxManage storageattach MettleOS --storagectl Floppy --port 0 --device 0 --type fdd --medium examples/os/mettleos.img
+VBoxManage storageattach MettleOS --storagectl IDE --port 0 --device 0 --type hdd --medium examples/os/mettleos.vhd
 ```
 
 ```bash
@@ -183,13 +209,11 @@ VBoxManage startvm MettleOS
 1. Machine, New. Name it `MettleOS`, leave the ISO field empty, and tick
    "Skip Unattended Installation" if the wizard offers it. Type `Other`,
    version `Other/Unknown (64-bit)`.
-2. Give it 128 MB of memory and no hard disk. Answer yes when it warns about
-   starting without one.
-3. Settings, System, Motherboard: tick `Floppy` in the boot order and move it
-   to the top.
-4. Settings, Storage: add a Floppy controller, then attach
-   `examples/os/mettleos.img` to it. The file picker wants "Choose a disk
-   file", and `.img` is one of the types it takes.
+2. Give it 256 MB of memory. When the wizard asks about a hard disk, choose
+   "Use an Existing Virtual Hard Disk File" and pick
+   `examples/os/mettleos.vhd`.
+3. Settings, System, Motherboard: put `Hard Disk` at the top of the boot order.
+4. Settings, Display: 64 MB of video memory, graphics controller `VMSVGA`.
 5. Start.
 
 ## The desktop
@@ -215,6 +239,9 @@ the same commands.
 | `echo <text>` | Print the rest of the line |
 | `mem` | The firmware memory map, free pages, heap usage |
 | `alloc` | Allocate eight blocks, write them, read them back, free them |
+| `disk` | The drive's model, capacity and traffic |
+| `sector <n>` | 128 bytes of a disk sector |
+| `selftest` | Exercise the heap, the pages and the disk, and report |
 | `uptime` | Seconds and raw ticks since boot |
 | `date` | The CMOS clock |
 | `cpu` | The processor's vendor string, read with `cpuid` |
@@ -254,9 +281,9 @@ shapes, with and without an error code.
 
 ## Limits
 
-There is no userspace, no privilege separation, and no disk driver: the kernel
-never talks to the floppy again after the boot sector reads it. The heap tops
-out at one page per allocation. `hexdump` past the first gigabyte walks off
-the identity map and takes a page fault, which the fault handler reports
-before stopping. Tasks share the kernel's address space, so a wild pointer in
-one is a wild pointer in all of them.
+There is no userspace and no privilege separation. The disk driver reads and
+writes sectors, but nothing above it keeps a filesystem yet, so the files are
+still the read-only archive the build packs. `hexdump` past the fourth
+gigabyte walks off the identity map and takes a page fault, which the fault
+handler reports before stopping. Processes share the kernel's address space,
+so a wild pointer in one is a wild pointer in all of them.

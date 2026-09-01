@@ -1,19 +1,21 @@
 import "layout"
 import "page"
 
-const HEADER_BYTES: uint64 = 24
+const HEADER_BYTES: uint64 = 32
 const ALIGNMENT: uint64 = 16
-const SPLIT_THRESHOLD: uint64 = HEADER_BYTES + ALIGNMENT
+const SPLIT_THRESHOLD: uint64 = HEADER_BYTES + 64
 
 struct Block {
     size: uint64;
-    used: bool;
+    used: uint64;
     next: uint64;
+    span: uint64;
 }
 
 var first: uint64 = 0
 var claimed: uint64 = 0
 var handed_out: uint64 = 0
+var live: uint64 = 0
 
 export fn heap_used() -> uint64 {
     return handed_out
@@ -23,8 +25,12 @@ export fn heap_claimed() -> uint64 {
     return claimed
 }
 
+export fn heap_live_blocks() -> uint64 {
+    return live
+}
+
 export fn heap_largest_request() -> uint64 {
-    return PAGE_SIZE - HEADER_BYTES
+    return page_largest_run() * PAGE_SIZE - HEADER_BYTES
 }
 
 fn block_at(address: uint64) -> Block* {
@@ -39,20 +45,32 @@ fn last_block() -> Block* {
     return block_at(walk)
 }
 
-fn grow() -> bool {
-    var page: uint64 = page_alloc()
-    if (page == 0) {
+fn grow(need: uint64) -> bool {
+    var wanted: uint64 = (need + HEADER_BYTES + PAGE_SIZE - 1) / PAGE_SIZE
+    if (wanted < 4) {
+        wanted = 4
+    }
+    var run: uint64 = page_alloc_pages(wanted)
+    if (run == 0 && wanted > 4) {
         return false
     }
-    var block: Block* = block_at(page)
-    block->size = PAGE_SIZE - HEADER_BYTES
-    block->used = false
+    if (run == 0) {
+        wanted = 1
+        run = page_alloc_pages(1)
+    }
+    if (run == 0) {
+        return false
+    }
+    var block: Block* = block_at(run)
+    block->size = wanted * PAGE_SIZE - HEADER_BYTES
+    block->used = 0
     block->next = 0
-    claimed += PAGE_SIZE
+    block->span = wanted
+    claimed += wanted * PAGE_SIZE
     if (first == 0) {
-        first = page
+        first = run
     } else {
-        last_block()->next = page
+        last_block()->next = run
     }
     return true
 }
@@ -61,8 +79,9 @@ fn split(block: Block*, address: uint64, need: uint64) {
     var rest: uint64 = address + HEADER_BYTES + need
     var tail: Block* = block_at(rest)
     tail->size = block->size - need - HEADER_BYTES
-    tail->used = false
+    tail->used = 0
     tail->next = block->next
+    tail->span = 0
     block->size = need
     block->next = rest
 }
@@ -72,26 +91,38 @@ export fn heap_alloc(size: uint64) -> uint64 {
     if (need == 0) {
         need = ALIGNMENT
     }
-    if (need > heap_largest_request()) {
-        return 0
-    }
-    var walk: uint64 = first
-    while (walk != 0) {
-        var block: Block* = block_at(walk)
-        if (!block->used && block->size >= need) {
-            if (block->size >= need + SPLIT_THRESHOLD) {
-                split(block, walk, need)
+    for attempt: uint64 in 0..2 {
+        var walk: uint64 = first
+        while (walk != 0) {
+            var block: Block* = block_at(walk)
+            if (block->used == 0 && block->size >= need) {
+                if (block->size >= need + SPLIT_THRESHOLD) {
+                    split(block, walk, need)
+                }
+                block->used = 1
+                handed_out += block->size
+                live++
+                return walk + HEADER_BYTES
             }
-            block->used = true
-            handed_out += block->size
-            return walk + HEADER_BYTES
+            walk = block->next
         }
-        walk = block->next
+        if (!grow(need)) {
+            return 0
+        }
     }
-    if (!grow()) {
+    return 0
+}
+
+export fn heap_zeroed(size: uint64) -> uint64 {
+    var address: uint64 = heap_alloc(size)
+    if (address == 0) {
         return 0
     }
-    return heap_alloc(size)
+    var bytes: uint8* = (uint8*)address
+    for i: uint64 in 0..size {
+        bytes[i] = 0
+    }
+    return address
 }
 
 fn merge_neighbours() {
@@ -99,7 +130,8 @@ fn merge_neighbours() {
     while (walk != 0) {
         var block: Block* = block_at(walk)
         var next: uint64 = block->next
-        if (!block->used && next != 0 && !block_at(next)->used &&
+        if (block->used == 0 && next != 0 && block_at(next)->used == 0 &&
+            block_at(next)->span == 0 &&
             walk + HEADER_BYTES + block->size == next) {
             block->size += HEADER_BYTES + block_at(next)->size
             block->next = block_at(next)->next
@@ -114,12 +146,15 @@ export fn heap_free(pointer: uint64) {
         return
     }
     var block: Block* = block_at(pointer - HEADER_BYTES)
-    if (!block->used) {
+    if (block->used == 0) {
         return
     }
-    block->used = false
+    block->used = 0
     if (handed_out >= block->size) {
         handed_out -= block->size
+    }
+    if (live > 0) {
+        live--
     }
     merge_neighbours()
 }
