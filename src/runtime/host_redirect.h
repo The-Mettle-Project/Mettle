@@ -100,6 +100,7 @@ void *mtlc_host_bsearch(const void *, const void *, size_t, size_t,
                         int (*)(const void *, const void *));
 char *mtlc_host_getenv(const char *);
 clock_t mtlc_host_clock(void);
+int mtlc_host_clock_gettime(int, void *);
 void mtlc_host_abort(void);
 
 int mtlc_host_isspace(int);
