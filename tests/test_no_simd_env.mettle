@@ -1,0 +1,81 @@
+// METTLE_NO_SIMD=1 turns the vectorizers off. It used to skip EVERY
+// optimization pass instead, which is not what it says and not what the docs
+// promise. Skipping the whole pipeline also left the loop canonical form
+// unestablished while the checker that enforces it still ran, so a local
+// declared inside a loop -- which hoist_body_locals exists to lift out --
+// turned -O and --release into an internal compiler error:
+//
+//   internal error: loop canonical form does not hold in function 'gcd':
+//   declaration of 't' still inside loop 'ir_while_1'
+//
+// The env var is documented in two places and was tested in none, which is how
+// that survived. This file is built with it set, so it has to compile at all,
+// and the answers have to be the ones the vectorized build gives.
+
+fn gcd(a: int64, b: int64) -> int64 {
+  while (b != 0) {
+    var t: int64 = b;
+    b = a % b;
+    a = t;
+  }
+  return a;
+}
+
+fn reverse_in_place(a: int32*, n: int32) -> void {
+  var lo: int32 = 0;
+  var hi: int32 = n - 1;
+  while (lo < hi) {
+    var t: int32 = a[lo];
+    a[lo] = a[hi];
+    a[hi] = t;
+    lo = lo + 1;
+    hi = hi - 1;
+  }
+}
+
+fn sum_f64(a: float64*, n: int32) -> float64 {
+  var s: float64 = 0.0;
+  for i in 0..n { s = s + a[i]; }
+  return s;
+}
+
+fn sum_i32(a: int32*, n: int32) -> int32 {
+  var s: int32 = 0;
+  for i in 0..n { s = s + a[i]; }
+  return s;
+}
+
+fn scale(a: int32*, n: int32) -> void {
+  for i in 0..n { a[i] = a[i] * 3; }
+}
+
+fn main() -> int32 {
+  // The shape that ICEd: a local declared inside a while loop.
+  if (gcd(1071, 462) != 21) { return 1; }
+  if (gcd(17, 5) != 1) { return 2; }
+  if (gcd(100, 0) != 100) { return 3; }
+
+  var a: int32[32];
+  for i in 0..32 { a[i] = i + 1; }
+  reverse_in_place(&a[0], 32);
+  for i in 0..32 { if (a[i] != 32 - i) { return 4; } }
+
+  // Loops the vectorizers would otherwise take, at a length that is not a
+  // multiple of the lane width.
+  for i in 0..32 { a[i] = i + 1; }
+  if (sum_i32(&a[0], 11) != 66) { return 5; }
+  if (sum_i32(&a[0], 32) != 528) { return 6; }
+
+  scale(&a[0], 11);
+  for i in 0..11 { if (a[i] != (i + 1) * 3) { return 7; } }
+  for i in 11..32 { if (a[i] != i + 1) { return 8; } }
+
+  // A float summation, which is the case the docs name: with the vectorizers
+  // off the additions happen in source order, so the answer is exact here.
+  var f: float64[32];
+  for i in 0..32 { f[i] = (float64)(i + 1); }
+  if (sum_f64(&f[0], 32) != 528.0) { return 9; }
+  if (sum_f64(&f[0], 11) != 66.0) { return 10; }
+
+  return 0;
+}
