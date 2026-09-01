@@ -251,6 +251,33 @@ else
   echo "[$prelude_name] FAILED"; sed 's/^/    /' "$WORK/$prelude_name.log"; fail=1
 fi
 
+# A named library is the one case that is meant to carry a loader, and it must
+# still run. Everything above proves the default carries none.
+shared_name=shared_build
+printf '%s' '#include <stdio.h>
+int elf_native_probe(void) { return 77; }
+' > "$WORK/$shared_name.c"
+printf '%s' 'extern fn elf_native_probe() -> int32 = "elf_native_probe";
+fn main() -> int32 { return elf_native_probe(); }' \
+  > "$WORK/$shared_name.mettle"
+if gcc -shared -fPIC -o "$WORK/libelfnativeprobe.so" "$WORK/$shared_name.c" \
+      >"$WORK/$shared_name.log" 2>&1 \
+   && "$METTLE" --build "$WORK/$shared_name.mettle" -o "$WORK/$shared_name.bin" \
+        "-L$WORK" -lelfnativeprobe --rpath "$WORK" \
+        >>"$WORK/$shared_name.log" 2>&1 \
+   && readelf -l "$WORK/$shared_name.bin" | grep -q INTERP \
+   && readelf -d "$WORK/$shared_name.bin" | grep -q 'libelfnativeprobe.so'; then
+  "$WORK/$shared_name.bin"; shared_status=$?
+  if [ "$shared_status" = 77 ]; then
+    echo "[$shared_name] PASS (exit 77)"
+  else
+    echo "[$shared_name] FAIL the library answered $shared_status, want 77"
+    fail=1
+  fi
+else
+  echo "[$shared_name] FAILED"; sed 's/^/    /' "$WORK/$shared_name.log"; fail=1
+fi
+
 if [ "$fail" = 0 ]; then
   echo "ALL NATIVE ELF TESTS PASSED"
 else
