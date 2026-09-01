@@ -501,13 +501,27 @@ static int elf_shared_library_index(ElfSharedLibrary *library) {
   return 1;
 }
 
+static uint64_t elf_shared_section_alignment(const ElfSharedImage *image,
+                                             uint16_t section_index) {
+  const unsigned char *shdr = NULL;
+  uint64_t alignment = 0u;
+
+  if (section_index == 0u || section_index >= image->shnum) {
+    return 0u;
+  }
+  shdr = elf_shared_shdr(image, section_index);
+  if (!shdr) {
+    return 0u;
+  }
+  alignment = linker_read_u64(shdr + 48);
+  return alignment > 1u ? alignment : 0u;
+}
+
 static int elf_shared_collect_symbols(const ElfSharedImage *image,
                                       const ElfSharedTables *tables,
                                       ElfSharedLibrary *library,
                                       char **error_message_out) {
   size_t i = 0u;
-
-  (void)image;
   for (i = 1u; i < tables->symbol_count; i++) {
     const unsigned char *entry = tables->symbols + i * ELF_SHARED_SYM_SIZE;
     unsigned char info = entry[4];
@@ -552,6 +566,7 @@ static int elf_shared_collect_symbols(const ElfSharedImage *image,
     symbol->type = (uint8_t)(info & 0x0Fu);
     symbol->is_weak = (info >> 4) == 2u;
     symbol->size = linker_read_u64(entry + 16);
+    symbol->alignment = elf_shared_section_alignment(image, shndx);
     if (version_index > 1u) {
       const char *version = elf_shared_version_name(tables, version_index);
       if (version) {

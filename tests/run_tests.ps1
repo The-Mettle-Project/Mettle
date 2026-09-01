@@ -61,6 +61,43 @@ function Skip-WindowsOnly {
   Write-Host "[SKIP] $Name :: $Why"
 }
 
+$script:SkippedElfOnly = New-Object System.Collections.Generic.List[string]
+
+function Skip-ElfOnly {
+  param([string]$Name, [string]$Why = "ELF-only: shared objects are an ELF surface")
+  $script:SkippedElfOnly.Add("$Name ($Why)")
+  Write-Host "[SKIP] $Name :: $Why"
+}
+
+# The program header table of a linked ELF, by segment type. Reading the bytes
+# keeps these cases independent of whether binutils is installed.
+function Get-ElfSegmentTypes {
+  param([string]$Path)
+  $bytes = [System.IO.File]::ReadAllBytes($Path)
+  $offset = [System.BitConverter]::ToUInt64($bytes, 0x20)
+  $entrySize = [System.BitConverter]::ToUInt16($bytes, 0x36)
+  $count = [System.BitConverter]::ToUInt16($bytes, 0x38)
+  $types = New-Object System.Collections.Generic.List[uint32]
+  for ($i = 0; $i -lt $count; $i++) {
+    $at = [int]($offset + [uint64]($i * $entrySize))
+    $types.Add([System.BitConverter]::ToUInt32($bytes, $at))
+  }
+  return $types
+}
+
+function Get-ElfObjectType {
+  param([string]$Path)
+  $bytes = [System.IO.File]::ReadAllBytes($Path)
+  return [System.BitConverter]::ToUInt16($bytes, 0x10)
+}
+
+function Test-FileContainsText {
+  param([string]$Path, [string]$Text)
+  $bytes = [System.IO.File]::ReadAllBytes($Path)
+  $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+  return $ascii.Contains($Text)
+}
+
 # `--linker internal` selects the internal PE linker, which exists only on
 # Windows. On Linux the native ELF path is the default, so the switch is
 # dropped and the same program is built through the platform's own linker.
@@ -14588,6 +14625,337 @@ catch {
   Write-CaseResult -Name "image_base_is_honored" -Passed $false -Reason $_.Exception.Message
 }
 
+# Shared libraries through the internal ELF linker: binding one, producing one,
+# and letting a library call back into the program that loaded it. Each case
+# builds its own .so so the suite depends on nothing installed but gcc.
+$elfSharedNames = @("elf_shared_link_and_run", "elf_shared_copy_relocation",
+                    "elf_shared_versioned_symbols", "elf_shared_object_output",
+                    "elf_shared_export_dynamic", "elf_shared_diagnostics")
+if ($script:OnWindows) {
+  foreach ($elfSharedName in $elfSharedNames) {
+    Skip-ElfOnly $elfSharedName "ELF-only: dynamic linking is the ELF linker's surface"
+  }
+}
+else {
+  $sharedDir = Join-Path $tmpDir "elf_shared"
+  if (-not (Test-Path $sharedDir)) { New-Item -ItemType Directory -Path $sharedDir | Out-Null }
+  $sharedLib = Join-Path $sharedDir "libmettletest.so"
+  $sharedSource = Join-Path $sharedDir "mettletest.c"
+  Set-Content -Path $sharedSource -Encoding utf8 -Value @'
+#include <stdio.h>
+int shared_counter = 5;
+long shared_add(long a, long b) { return a + b; }
+int shared_read_counter(void) { return shared_counter; }
+void shared_greet(void) { printf("greeting from the library\n"); fflush(stdout); }
+'@
+  $sharedBuild = & gcc -shared -fPIC -o $sharedLib $sharedSource 2>&1 | Out-String
+
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $sharedLib)) {
+      throw "building the test shared library failed: $sharedBuild"
+    }
+    $callerSource = Join-Path $sharedDir "caller.mettle"
+    Set-Content -Path $callerSource -Encoding utf8 -Value @'
+import "std/io";
+
+extern fn shared_greet() = "shared_greet";
+extern fn shared_add(a: int64, b: int64) -> int64 = "shared_add";
+
+fn main() -> int32 {
+    shared_greet();
+    var total: int64 = shared_add(20, 22);
+    print("total {total}\n");
+    return 0;
+}
+'@
+    $callerExe = Join-Path $sharedDir "caller"
+    $callerBuild = & $CompilerPath $callerSource "--build" "-o" $callerExe `
+                     "-L$sharedDir" "-lmettletest" "--rpath" $sharedDir 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $callerExe)) {
+      throw "linking against the shared library failed: $callerBuild"
+    }
+    $segments = Get-ElfSegmentTypes $callerExe
+    if ($segments -notcontains 3) { throw "the linked program has no PT_INTERP" }
+    if ($segments -notcontains 2) { throw "the linked program has no PT_DYNAMIC" }
+    if (-not (Test-FileContainsText $callerExe "libmettletest.so")) {
+      throw "the linked program does not name its library in .dynstr"
+    }
+    $callerOut = (& $callerExe 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "the linked program exited $LASTEXITCODE : $callerOut" }
+    if ($callerOut -notmatch "greeting from the library") {
+      throw "the library's own output is missing: $callerOut"
+    }
+    if ($callerOut -notmatch "total 42") { throw "the library call returned wrong: $callerOut" }
+    Write-CaseResult -Name "elf_shared_link_and_run" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "elf_shared_link_and_run" -Passed $false -Reason $_.Exception.Message
+  }
+
+  # A data symbol crosses through a copy relocation: the storage moves into the
+  # program's .bss and the library must see the program's writes there.
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    if (-not (Test-Path $sharedLib)) { throw "the test shared library was not built" }
+    $dataSource = Join-Path $sharedDir "data.mettle"
+    Set-Content -Path $dataSource -Encoding utf8 -Value @'
+import "std/io";
+
+extern var shared_counter: int32 = "shared_counter";
+extern fn shared_read_counter() -> int32 = "shared_read_counter";
+
+fn main() -> int32 {
+    print("start {shared_counter}\n");
+    shared_counter = 9;
+    var seen: int32 = shared_read_counter();
+    print("library sees {seen}\n");
+    return 0;
+}
+'@
+    $dataExe = Join-Path $sharedDir "data"
+    $dataBuild = & $CompilerPath $dataSource "--build" "-o" $dataExe `
+                   "-L$sharedDir" "-lmettletest" "--rpath" $sharedDir 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dataExe)) {
+      throw "linking an imported data symbol failed: $dataBuild"
+    }
+    $dataOut = (& $dataExe 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "the program exited $LASTEXITCODE : $dataOut" }
+    if ($dataOut -notmatch "start 5") { throw "the imported initial value is wrong: $dataOut" }
+    if ($dataOut -notmatch "library sees 9") {
+      throw "the library did not see the program's write, so the copy relocation did not bind: $dataOut"
+    }
+    Write-CaseResult -Name "elf_shared_copy_relocation" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "elf_shared_copy_relocation" -Passed $false -Reason $_.Exception.Message
+  }
+
+  # glibc's symbols carry versions. Binding them without a version requirement
+  # is the failure that runs here and breaks on a different machine.
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $libcSource = Join-Path $sharedDir "libc.mettle"
+    Set-Content -Path $libcSource -Encoding utf8 -Value @'
+import "std/io";
+
+extern fn getpid() -> int32 = "getpid";
+
+fn main() -> int32 {
+    var id: int32 = getpid();
+    if (id > 0) {
+        print("pid ok\n");
+        return 0;
+    }
+    return 1;
+}
+'@
+    $libcExe = Join-Path $sharedDir "libc_user"
+    $libcBuild = & $CompilerPath $libcSource "--build" "-o" $libcExe "-lc" 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $libcExe)) {
+      throw "linking against the C library failed: $libcBuild"
+    }
+    if (-not (Test-FileContainsText $libcExe "libc.so.6")) {
+      throw "the ld script did not resolve to libc.so.6"
+    }
+    if (-not (Test-FileContainsText $libcExe "GLIBC_")) {
+      throw "no version requirement was recorded for a versioned symbol"
+    }
+    $libcOut = (& $libcExe 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "the program exited $LASTEXITCODE : $libcOut" }
+    if ($libcOut -notmatch "pid ok") { throw "the C library call went wrong: $libcOut" }
+    Write-CaseResult -Name "elf_shared_versioned_symbols" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "elf_shared_versioned_symbols" -Passed $false -Reason $_.Exception.Message
+  }
+
+  # --shared: a Mettle library a C program loads at run time.
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $libSource = Join-Path $sharedDir "mettlelib.mettle"
+    Set-Content -Path $libSource -Encoding utf8 -Value @'
+import "std/io";
+
+var labels: cstring[2] = ["first", "second"];
+
+export fn mettle_label(index: int64) -> cstring {
+    return labels[index];
+}
+
+export fn mettle_double(value: int64) -> int64 {
+    print("library doubling {value}\n");
+    return value * 2;
+}
+'@
+    $mettleLib = Join-Path $sharedDir "libmettlelib.so"
+    $libBuild = & $CompilerPath $libSource "--build" "--shared" "--soname" "libmettlelib.so" `
+                  "-o" $mettleLib 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $mettleLib)) {
+      throw "emitting a shared object failed: $libBuild"
+    }
+    if ((Get-ElfObjectType $mettleLib) -ne 3) { throw "the output is not ET_DYN" }
+    $libSegments = Get-ElfSegmentTypes $mettleLib
+    if ($libSegments -contains 3) { throw "a shared object must not request a program loader" }
+    if ($libSegments -notcontains 2) { throw "the shared object has no PT_DYNAMIC" }
+    if (Test-FileContainsText $mettleLib "mettle_rt_startup") {
+      throw "the shared object exports the bundled runtime"
+    }
+
+    $hostSource = Join-Path $sharedDir "host.c"
+    Set-Content -Path $hostSource -Encoding utf8 -Value @'
+#include <dlfcn.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+  void *handle = dlopen(argv[1], RTLD_NOW);
+  long (*doubler)(long);
+  const char *(*label)(long);
+  (void)argc;
+  if (!handle) { printf("dlopen failed: %s\n", dlerror()); return 1; }
+  doubler = dlsym(handle, "mettle_double");
+  label = dlsym(handle, "mettle_label");
+  if (!doubler || !label) { printf("dlsym failed\n"); return 1; }
+  printf("doubled %ld label %s\n", doubler(21), label(1));
+  return 0;
+}
+'@
+    $hostExe = Join-Path $sharedDir "host"
+    $hostBuild = & gcc -o $hostExe $hostSource 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $hostExe)) {
+      throw "building the C host failed: $hostBuild"
+    }
+    $hostOut = (& $hostExe $mettleLib 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "the C host exited $LASTEXITCODE : $hostOut" }
+    if ($hostOut -notmatch "library doubling 21") {
+      throw "the library's own runtime did not print: $hostOut"
+    }
+    if ($hostOut -notmatch "doubled 42 label second") {
+      throw "the loaded library returned wrong: $hostOut"
+    }
+    Write-CaseResult -Name "elf_shared_object_output" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "elf_shared_object_output" -Passed $false -Reason $_.Exception.Message
+  }
+
+  # --export-dynamic: the library leaves a symbol undefined and the program that
+  # loads it supplies the definition.
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $pluginSource = Join-Path $sharedDir "plugin.mettle"
+    Set-Content -Path $pluginSource -Encoding utf8 -Value @'
+extern fn host_supplied(value: int64) -> int64 = "host_supplied";
+
+export fn plugin_run(value: int64) -> int64 {
+    return host_supplied(value) + 1;
+}
+'@
+    $pluginLib = Join-Path $sharedDir "libplugin.so"
+    $pluginBuild = & $CompilerPath $pluginSource "--build" "--shared" "--soname" "libplugin.so" `
+                     "-o" $pluginLib 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $pluginLib)) {
+      throw "emitting a shared object with an undefined symbol failed: $pluginBuild"
+    }
+    $programSource = Join-Path $sharedDir "plugin_host.mettle"
+    Set-Content -Path $programSource -Encoding utf8 -Value @'
+import "std/io";
+
+export fn host_supplied(value: int64) -> int64 {
+    return value * 10;
+}
+
+extern fn plugin_run(value: int64) -> int64 = "plugin_run";
+
+fn main() -> int32 {
+    var result: int64 = plugin_run(4);
+    print("plugin returned {result}\n");
+    return 0;
+}
+'@
+    $programExe = Join-Path $sharedDir "plugin_host"
+    $programBuild = & $CompilerPath $programSource "--build" "-o" $programExe `
+                      "-L$sharedDir" "-lplugin" "--rpath" $sharedDir "--export-dynamic" 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $programExe)) {
+      throw "linking a program that exports its own symbols failed: $programBuild"
+    }
+    $programOut = (& $programExe 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "the program exited $LASTEXITCODE : $programOut" }
+    if ($programOut -notmatch "plugin returned 41") {
+      throw "the library did not bind back to the program: $programOut"
+    }
+    Write-CaseResult -Name "elf_shared_export_dynamic" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "elf_shared_export_dynamic" -Passed $false -Reason $_.Exception.Message
+  }
+
+  # What the linker says when it cannot do what was asked.
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $probeSource = Join-Path $sharedDir "probe.mettle"
+    Set-Content -Path $probeSource -Encoding utf8 -Value @'
+extern fn shared_add(a: int64, b: int64) -> int64 = "shared_add";
+
+fn main() -> int32 {
+    return (int32)shared_add(1, 2);
+}
+'@
+    $probeExe = Join-Path $sharedDir "probe"
+    if (Test-Path $probeExe) { Remove-Item -Path $probeExe -Force }
+    $missingOut = & $CompilerPath $probeSource "--build" "-o" $probeExe "-lnosuchlibrary" 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0 -or (Test-Path $probeExe)) {
+      throw "a missing library produced an executable anyway: $missingOut"
+    }
+    if ($missingOut -notmatch "libnosuchlibrary.so") {
+      throw "the missing library was not named: $missingOut"
+    }
+
+    if (Test-Path $probeExe) { Remove-Item -Path $probeExe -Force }
+    $unresolvedOut = & $CompilerPath $probeSource "--build" "-o" $probeExe "-lc" 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0 -or (Test-Path $probeExe)) {
+      throw "a symbol no library defines produced an executable anyway: $unresolvedOut"
+    }
+    if ($unresolvedOut -notmatch "shared_add") {
+      throw "the unresolved symbol was not named: $unresolvedOut"
+    }
+
+    $dataOnlySource = Join-Path $sharedDir "data_only.mettle"
+    Set-Content -Path $dataOnlySource -Encoding utf8 -Value @'
+extern var shared_counter: int32 = "shared_counter";
+
+export fn read_counter() -> int32 {
+    return shared_counter;
+}
+'@
+    $dataOnlyLib = Join-Path $sharedDir "libdataonly.so"
+    if (Test-Path $dataOnlyLib) { Remove-Item -Path $dataOnlyLib -Force }
+    $dataOnlyOut = & $CompilerPath $dataOnlySource "--build" "--shared" "-o" $dataOnlyLib `
+                     "-L$sharedDir" "-lmettletest" 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0 -or (Test-Path $dataOnlyLib)) {
+      throw "a shared object referencing imported data was emitted anyway: $dataOnlyOut"
+    }
+    if ($dataOnlyOut -notmatch "absolute addresses") {
+      throw "the reason a shared object cannot do this was not given: $dataOnlyOut"
+    }
+    Write-CaseResult -Name "elf_shared_diagnostics" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "elf_shared_diagnostics" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # 32-bit gate: the i386 target must reach the narrow code generator. Emitting
 # 64-bit code into a 32-bit image is the failure that looks like success, so
 # this asserts the shape of what came out rather than only that it came out.
@@ -14869,6 +15237,14 @@ if ($script:SkippedWindowsOnly.Count -gt 0) {
   }
 }
 
+if ($script:SkippedElfOnly.Count -gt 0) {
+  Write-Host ""
+  Write-Host "Skipped $($script:SkippedElfOnly.Count) ELF-only cases on this platform:"
+  foreach ($entry in $script:SkippedElfOnly) {
+    Write-Host "  - $entry"
+  }
+}
+
 # The failure log. Written on every run, green ones included, so it never
 # reports a failure the current run does not have. Concurrent cases interleave
 # their console output; this file is the ordered account of what broke.
@@ -14897,6 +15273,12 @@ if ($FailureLog) {
   if ($script:SkippedWindowsOnly.Count -gt 0) {
     $lines.Add("Skipped $($script:SkippedWindowsOnly.Count) Windows-only cases:")
     foreach ($entry in $script:SkippedWindowsOnly) {
+      $lines.Add("  - $entry")
+    }
+  }
+  if ($script:SkippedElfOnly.Count -gt 0) {
+    $lines.Add("Skipped $($script:SkippedElfOnly.Count) ELF-only cases:")
+    foreach ($entry in $script:SkippedElfOnly) {
       $lines.Add("  - $entry")
     }
   }

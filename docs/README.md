@@ -42,6 +42,8 @@ frontend can drive instead. The documentation is organized the same way.
   `@interrupt`, cross-compilation, a chosen link address, and 16-bit code.
 - [C interoperability](c-interop.md): calling out, being called, the struct
   ABI.
+- [Shared libraries](shared-libraries.md): binding a `.so`, emitting one, and
+  what the ELF linker refuses.
 
 ## Optimization
 

@@ -7,7 +7,8 @@ right subsystem.
 
 | Command | Codegen output | Link step | In-tree |
 |---------|----------------|-----------|---------|
-| `--build` on Linux | ELF `.o` | `ld` directly, with the owned runtime objects | Partly |
+| `--build` on Linux | ELF `.o` | Internal ELF linker in `src/linker`, falling back to `ld` and then `gcc` | Yes |
+| `--build` on Linux with `-l`, `--shared`, or `--export-dynamic` | ELF `.o` | Internal ELF linker only, no fallback | Yes |
 | `--build` on Linux with `--link-arg` | ELF `.o` | `gcc -nostartfiles`, because the arguments need driver parsing | No |
 | `--build --linker internal` on Windows | COFF `.obj` | Internal PE linker in `src/linker` | Yes |
 | `--build --linker gcc` on Windows | COFF `.obj` | `gcc -nostartfiles` | No |
@@ -16,10 +17,16 @@ right subsystem.
 `--linker` applies on Windows. On Linux, `--build` always goes through the ELF
 object backend.
 
-The Linux path calls `ld` with `--gc-sections`, `-e _start`, and the owned
-runtime objects, and nothing else. No libc, no C startup files. It falls back
-to the compiler driver only when `--link-arg` is present, because those
-arguments are written for a driver.
+The Linux path merges the owned runtime objects and the program's own in
+`src/linker`, entry `_start`, dead sections dropped. No libc, no C startup
+files. It falls back to `ld` and then to the compiler driver, and goes straight
+to the driver when `--link-arg` is present, because those arguments are written
+for a driver.
+
+A link that names a shared library, emits one, or exports its symbols has no
+fallback: `ld` and `gcc` would produce an image whose runtime this compiler
+does not own, so the internal linker's failure is reported instead. See
+[Shared libraries](shared-libraries.md).
 
 ## Triage
 

@@ -96,6 +96,7 @@ typedef struct {
   size_t symbol_index;
   char *version;
   uint64_t size;
+  uint64_t alignment;
   uint8_t type;
   int is_weak;
   int needs_plt;

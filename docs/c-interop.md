@@ -54,9 +54,10 @@ Two things can satisfy a name on Windows:
   **UCRT and MSVCRT are not in the set**, so a C-library name that the owned
   runtime does not carry has nowhere left to come from.
 
-On Linux there is only the first. No shared library ever links, so there is no
-equivalent of the DLL probe: the owned runtime is the whole surface, plus the
-syscall, socket and pthread entries the Linux build of it adds.
+On Linux the owned runtime is what a bare build resolves against, plus the
+syscall, socket and pthread entries the Linux build of it adds. Naming a shared
+library with `-l` adds its dynamic symbols to that set; see
+[Shared libraries](shared-libraries.md).
 
 To see the list for a target, read the symbols out of the runtime objects the
 build stages beside the compiler:
@@ -234,9 +235,24 @@ The default import set is `kernel32`, `user32`, `gdi32`, `advapi32`, and
 
 ## Linux
 
-A Linux build is freestanding: no libc on the link line, and no shared library
-ever links, because the ELF writer refuses a `PT_INTERP`. Static archives work
-against the owned subset.
+A Linux build is freestanding by default: no libc on the link line, and the
+ownership audit refuses a `PT_INTERP`. Static archives work against the owned
+subset.
+
+`-lname` binds a shared library instead, and the audit then allows the dynamic
+segments that link asked for. `sqrt` through `-lm` and `getpid` through `-lc`
+both resolve this way, versioned symbols included:
+
+```mettle
+extern fn getpid() -> int32 = "getpid";
+```
+
+```bash
+mettle --build app.mettle -o app -lc
+```
+
+[Shared libraries](shared-libraries.md) has the options, what the linker emits,
+and what it refuses.
 
 For sockets, `std/net` covers both platforms from one source. `std/net_posix`
 is the older Linux-only path. Its socket, error, atomic, and yield names come
@@ -246,5 +262,6 @@ is needed.
 ## See also
 
 - [Runtime model](runtime-model.md)
+- [Shared libraries](shared-libraries.md)
 - [Linker and build pipelines](linker-build-pipelines.md)
 - [Types](types.md)

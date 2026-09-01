@@ -159,6 +159,8 @@ bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 	cp -r $(RUNTIMEDIR) $(BINDIR)/runtime
 	$(CC) $(FREESTANDING_CFLAGS) -Os -c $(RUNTIMEDIR)/freestanding.c -o $(OBJDIR)/runtime/freestanding.o
 	cp $(OBJDIR)/runtime/freestanding.o $(BINDIR)/runtime/freestanding.o
+	$(CC) $(FREESTANDING_CFLAGS) -Os -DMT_SHARED_RUNTIME -c $(RUNTIMEDIR)/freestanding.c -o $(OBJDIR)/runtime/freestanding_shared.o
+	cp $(OBJDIR)/runtime/freestanding_shared.o $(BINDIR)/runtime/freestanding_shared.o
 	cp $(HOST_STARTUP_OBJECT) $(BINDIR)/runtime/host_startup.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(STDLIBDIR)/tracy_helpers.c -o $(OBJDIR)/runtime/tracy_helpers.o
 	cp $(OBJDIR)/runtime/tracy_helpers.o $(BINDIR)/runtime/tracy_helpers.o
@@ -167,6 +169,8 @@ bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 		-c $(RUNTIMEDIR)/atomics.c -o $(OBJDIR)/runtime/atomics.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/crash_handler.c -o $(OBJDIR)/runtime/crash_handler.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/safety.c        -o $(OBJDIR)/runtime/safety.o
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -DMT_SHARED_RUNTIME -c $(RUNTIMEDIR)/safety.c -o $(OBJDIR)/runtime/safety_shared.o
+	cp $(OBJDIR)/runtime/safety_shared.o $(BINDIR)/runtime/safety_shared.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/debug.c         -o $(OBJDIR)/runtime/debug.o
 	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/profile.c       -o $(OBJDIR)/runtime/profile.o
 	cp $(OBJDIR)/runtime/atomics.o       $(BINDIR)/runtime/atomics.o

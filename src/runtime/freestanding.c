@@ -64,7 +64,13 @@ typedef struct MtFile {
 static MtFile mt_stdin_file = {0, MT_FILE_STANDARD | MT_FILE_READ, 0, 0, 0, 0, 0, 0, 0};
 static MtFile mt_stdout_file = {1, MT_FILE_STANDARD | MT_FILE_WRITE, 0, 0, 0, 0, 0, 0, 0};
 static MtFile mt_stderr_file = {2, MT_FILE_STANDARD | MT_FILE_WRITE, 0, 0, 0, 0, 0, 0, 0};
-#if defined(_WIN32)
+/* A shared object reaches a thread-local at a fixed offset from the thread
+ * pointer, which is a program's privilege: the offset a loaded library would
+ * need is not known until the loader places it. The shared build of this
+ * runtime therefore keeps errno per process. Its threads are the loading
+ * program's, and a library that wants per-thread errno belongs in the
+ * program. */
+#if defined(_WIN32) || defined(MT_SHARED_RUNTIME)
 static int mt_errno_value;
 #else
 static __thread int mt_errno_value;

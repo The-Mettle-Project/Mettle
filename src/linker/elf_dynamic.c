@@ -522,6 +522,21 @@ static int elf_dynamic_visit_absolute_sites(ElfDynamicPlan *plan,
               input->path ? input->path : "<unknown>");
           return 0;
         }
+        if (relocation->kind == LINK_RELOC_TPOFF32) {
+          if (relocation->symbol_index < input->symbol_count) {
+            object_symbol = &input->symbols[relocation->symbol_index];
+          }
+          mettle_set_error(
+              error_message_out,
+              "Shared object output cannot use the thread-local '%s' from "
+              "'%s': it is reached at a fixed offset from the thread pointer, "
+              "which only a program can do. The bundled runtime records errno "
+              "in one, so a shared object cannot make system calls",
+              object_symbol && object_symbol->name ? object_symbol->name
+                                                   : "<unnamed>",
+              input->path ? input->path : "<unknown>");
+          return 0;
+        }
         if (relocation->kind != LINK_RELOC_ABS64) {
           continue;
         }
@@ -829,7 +844,10 @@ static int elf_dynamic_define_imports(ElfDynamicPlan *plan,
       return 0;
     }
     if (!elf_dynamic_section_append(&resolution->sections[bss_index],
-                                    import->size, 16u, &import->copy_offset,
+                                    import->size,
+                                    import->alignment > 16u ? import->alignment
+                                                            : 16u,
+                                    &import->copy_offset,
                                     error_message_out)) {
       return 0;
     }

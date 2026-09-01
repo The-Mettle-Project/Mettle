@@ -902,6 +902,8 @@ static int object_needs_tracy_helpers(const char *object_path) {
 }
 
 
+#define METTLE_DEFAULT_ELF_INTERPRETER "/lib64/ld-linux-x86-64.so.2"
+
 static int mettle_elf_dynamic_link_requested(const CompilerOptions *options) {
   return options && (options->shared_library_count > 0u ||
                      options->shared_output || options->export_dynamic);
@@ -984,8 +986,6 @@ static int mettle_elf_external_linker_requested(const CompilerOptions *options) 
   return options->linker_mode == LINKER_MODE_GCC ||
          options->linker_mode == LINKER_MODE_MSVC;
 }
-
-#define METTLE_DEFAULT_ELF_INTERPRETER "/lib64/ld-linux-x86-64.so.2"
 
 /* Turns each -l/--library value into a file. A value naming a path is used as
  * given; a bare name is looked up as lib<name>.so along -L and then the
@@ -1230,27 +1230,31 @@ static void elf_select_runtime_helpers(const char *runtime_directory,
 
 static int elf_collect_on_demand_objects(const char *runtime_directory,
                                          const char *object_filename,
+                                         int shared_output,
                                          char **extra_objects,
                                          size_t *extra_object_count,
                                          size_t *on_demand_object_count) {
   static const struct {
     const char *file;
+    const char *shared_file;
     int (*needed)(const char *);
   } on_demand[] = {
-      {"string.o", object_needs_string_runtime},
-      {"swap.o", object_needs_swap_runtime},
-      {"safety.o", object_needs_safety_runtime},
-      {"debug.o", object_needs_debug_runtime},
-      {"atomics.o", object_needs_atomics},
+      {"string.o", "string.o", object_needs_string_runtime},
+      {"swap.o", "swap.o", object_needs_swap_runtime},
+      {"safety.o", "safety_shared.o", object_needs_safety_runtime},
+      {"debug.o", "debug.o", object_needs_debug_runtime},
+      {"atomics.o", "atomics.o", object_needs_atomics},
   };
   size_t i = 0u;
 
   for (i = 0u; i < sizeof(on_demand) / sizeof(on_demand[0]); i++) {
     char *candidate = NULL;
+    const char *file = shared_output ? on_demand[i].shared_file
+                                     : on_demand[i].file;
     if (!on_demand[i].needed(object_filename)) {
       continue;
     }
-    candidate = join_paths(runtime_directory, on_demand[i].file);
+    candidate = join_paths(runtime_directory, file);
     if (!candidate) {
       continue;
     }
@@ -1258,7 +1262,7 @@ static int elf_collect_on_demand_objects(const char *runtime_directory,
       fprintf(stderr,
               "Error: Program references the %s runtime but '%s' is not in "
               "'%s'\n",
-              on_demand[i].file, on_demand[i].file, runtime_directory);
+              on_demand[i].file, file, runtime_directory);
       free(candidate);
       return 0;
     }
@@ -1296,7 +1300,12 @@ static int mettle_link_elf_executable(const char *object_filename,
    * direct system calls. No host library appears on the link line.
    */
   if (runtime_directory) {
-    freestanding_object = join_paths(runtime_directory, "freestanding.o");
+    /* A shared object gets the build of the runtime that keeps no thread-local
+     * state, because a loaded library cannot reach one. */
+    freestanding_object = join_paths(runtime_directory,
+                                     options && options->shared_output
+                                         ? "freestanding_shared.o"
+                                         : "freestanding.o");
 
     /* Same on-demand rule the Windows link follows: an object joins the link
      * only when the program leaves one of its symbols undefined. Naming none
@@ -1307,6 +1316,7 @@ static int mettle_link_elf_executable(const char *object_filename,
                                &crash_handler_object, &profile_object);
 
     if (!elf_collect_on_demand_objects(runtime_directory, object_filename,
+                                      options && options->shared_output,
                                       extra_objects, &extra_object_count,
                                       &on_demand_object_count)) {
       goto cleanup;
@@ -4327,6 +4337,19 @@ int main(int argc, char *argv[]) {
       free(auto_runtime_directory);
       return 1;
     }
+    if (options.static_link && mettle_elf_dynamic_link_requested(&options)) {
+      fprintf(stderr,
+              "Error: --static and shared libraries ask for opposite images; "
+              "drop one\n");
+      free((void *)options.import_directories);
+      free((void *)options.link_arguments);
+      free((void *)options.shared_libraries);
+      free((void *)options.library_search_paths);
+      free((void *)options.runpaths);
+      free(auto_stdlib_directory);
+      free(auto_runtime_directory);
+      return 1;
+    }
     if (options.musl_link) {
       fprintf(stderr,
               "Error: --musl is not available in owned runtime mode because "
@@ -6099,6 +6122,21 @@ void print_usage(const char *program_name) {
          "image gets no console window\n");
   printf("  --link-arg <arg>    Pass an extra linker argument (repeatable; "
          "use with --build)\n");
+  printf("  -l<name>            Bind shared library lib<name>.so (ELF; "
+         "repeatable, attached form only)\n");
+  printf("  -L<dir>             Search <dir> for shared libraries "
+         "(ELF; repeatable)\n");
+  printf("  --rpath <dir>       Record <dir> in DT_RUNPATH (ELF; "
+         "repeatable)\n");
+  printf("  --shared            Emit a shared object instead of a program "
+         "(ELF)\n");
+  printf("  --soname <name>     DT_SONAME for --shared output\n");
+  printf("  --export-dynamic    Publish the program's own symbols so a loaded "
+         "library can bind them\n");
+  printf("  --dynamic-linker <path>\n");
+  printf("                      Program loader for PT_INTERP (default "
+         "%s)\n",
+         METTLE_DEFAULT_ELF_INTERPRETER);
   printf("  --tracy             Link std/tracy with the Tracy profiler "
          "(requires --build)\n");
   printf("  --tracy-dir <dir>   Tracy repo root (default: TRACY_DIR env, then "

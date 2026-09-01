@@ -354,8 +354,9 @@ void mettle_safety_reregister(void *old_pointer, void *new_pointer,
  * checks. Nesting is counted rather than flagged: the allocator's entry points
  * call one another. Mingw gcc 16 emits native PE TLS only, which the internal
  * linker cannot carry (no TLS directory); degrade to a shared counter there. */
-#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__) && \
-    __GNUC__ >= 16
+#if (defined(_WIN32) && defined(__GNUC__) && !defined(__clang__) && \
+     __GNUC__ >= 16) ||                                            \
+    defined(MT_SHARED_RUNTIME)
 static unsigned g_safety_allocator_depth;
 #else
 static __thread unsigned g_safety_allocator_depth;

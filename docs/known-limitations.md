@@ -161,9 +161,14 @@ is treated as an error.
 
 ## Platform
 
-Linux links no shared library, ever. The ELF writer refuses a `PT_INTERP`, so
-a `.so` cannot be used and libraries such as raylib are out of reach. Static
-archives work against the owned subset.
+Shared libraries are ELF-only. `-l`, `--shared` and `--export-dynamic` are
+rejected on Windows, where the DLL import probe covers the same ground. A
+shared object Mettle emits cannot reference imported data, and holds no
+thread-local storage: its build of the runtime keeps `errno` per process. See
+[Shared libraries](shared-libraries.md).
+
+The Windows internal linker takes its libraries through `--link-arg`, not
+through `-l`.
 
 `std/ui`, the Win32 window and control helpers, is Windows-only. It has no
 Linux counterpart.

@@ -82,8 +82,11 @@ For PE32+ it reads the normal and delayed import tables and rejects names from
 UCRT, MSVCRT, VCRuntime, the Microsoft C++ library, libgcc, libstdc++, and
 libwinpthread.
 
-For ELF64 it requires `ET_EXEC` and rejects `PT_INTERP` and `PT_DYNAMIC`. That
-is why no shared library ever links on Linux.
+For ELF64 it requires `ET_EXEC` and rejects `PT_INTERP` and `PT_DYNAMIC`, which
+is what proves a plain Linux build carries no foreign runtime. Asking for `-l`,
+`--shared` or `--export-dynamic` states the opposite intent, so that link is
+audited without the dynamic-segment rule and with everything else unchanged.
+See [Shared libraries](shared-libraries.md).
 
 The driver also rejects a link argument naming a C, compiler, or thread
 runtime. The build scripts audit the compiler itself, and the libmtlc build

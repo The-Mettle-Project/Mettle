@@ -14,6 +14,7 @@ typedef struct {
   char *name;
   char *version;
   uint64_t size;
+  uint64_t alignment;
   uint8_t type;
   int is_weak;
 } ElfSharedSymbol;

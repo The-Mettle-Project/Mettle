@@ -1119,6 +1119,7 @@ static int link_resolution_add_shared_import(LinkResolution *resolution,
   import->symbol_index = symbol_index;
   import->type = definition ? definition->type : ELF_SHARED_TYPE_NOTYPE;
   import->size = definition ? definition->size : 0u;
+  import->alignment = definition ? definition->alignment : 0u;
   import->is_weak = definition ? definition->is_weak : symbol->is_weak;
   if (definition && definition->version) {
     import->version = mettle_strdup(definition->version);
