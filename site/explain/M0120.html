@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>M0120: Pointer cast to an integer and back to a pointer | Mettle</title>
+<meta name="description" content="M0120: Pointer cast to an integer and back to a pointer" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><img src="../assets/mark.svg" alt="" width="22" height="22" />Mettle</a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<h1><span class="code">M0120</span>Pointer cast to an integer and back to a pointer</h1>
+<p class="lede">Reported by the compiler as an error or warning.</p>
+<pre><code>mettle explain M0120</code></pre>
+
+<p>A pointer is cast to an integer and straight back to a pointer. The integer in the middle holds the same address the pointer already held, so nothing about the value changes. What changes is what the compiler can say about it: an integer has no provenance, so the borrow checker, the alias analysis and --verify all have to give up on where that address came from.</p>
+<h3>Example</h3>
+<pre><code>var p: float32* = (float32*)((int64)(&amp;(buf[0])));  // M0120
+var q: float32* = &amp;(buf[0]);                       // the same value</code></pre>
+<p>Lowering sees through the round trip, so the analyses are not blinded while the spelling is cleaned up. The value is not wrong; the detour is.</p>
+<p>Neither half is reported on its own, because each is sometimes the only way to say a thing. An integer that really is an address -- a handle from the operating system, a device pointer -- becomes a pointer by cast. A pointer becomes an integer to be printed, hashed or aligned. Only the round trip carries no information.</p>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="E0001.html"><span class="c">E0001</span><span class="t">Lexical error</span></a></li><li><a href="E0002.html"><span class="c">E0002</span><span class="t">Syntax error</span></a></li><li><a href="E0003.html"><span class="c">E0003</span><span class="t">Semantic error</span></a></li><li><a href="E0004.html"><span class="c">E0004</span><span class="t">Type mismatch</span></a></li><li><a href="E0005.html"><span class="c">E0005</span><span class="t">Scope error</span></a></li><li><a href="E0006.html"><span class="c">E0006</span><span class="t">I/O error</span></a></li><li><a href="E0007.html"><span class="c">E0007</span><span class="t">Internal compiler error</span></a></li><li><a href="M0101.html"><span class="c">M0101</span><span class="t">Use after free</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></footer>
+</body>
+</html>
