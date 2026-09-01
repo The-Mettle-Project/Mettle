@@ -1,0 +1,52 @@
+// Dividing the minimum by -1 wraps to the minimum, at every width.
+//
+// IDIV raises #DE when the quotient does not fit, which for a 64-bit divide
+// means exactly this case. int8/int16/int32 never reached it -- they divide
+// sign-extended at 64 bits and truncate after -- so the same expression was
+// defined at three widths and killed the process at the fourth, reported as
+// "unknown exception" because the handler had no name for the code. Dividing
+// by -1 is a negation with no remainder, and negation wraps the minimum to
+// itself, so the guarded path is the answer the narrow widths already gave.
+// Division by zero still traps.
+
+@noinline fn d8(a: int8, b: int8) -> int8 { return a / b; }
+@noinline fn m8(a: int8, b: int8) -> int8 { return a % b; }
+@noinline fn d16(a: int16, b: int16) -> int16 { return a / b; }
+@noinline fn m16(a: int16, b: int16) -> int16 { return a % b; }
+@noinline fn d32(a: int32, b: int32) -> int32 { return a / b; }
+@noinline fn m32(a: int32, b: int32) -> int32 { return a % b; }
+@noinline fn d64(a: int64, b: int64) -> int64 { return a / b; }
+@noinline fn m64(a: int64, b: int64) -> int64 { return a % b; }
+
+fn main() -> int32 {
+  var n8: int8 = (int8)-1;
+  if (d8((int8)-128, n8) != (int8)-128) { return 1; }
+  if (m8((int8)-128, n8) != (int8)0) { return 2; }
+
+  var n16: int16 = (int16)-1;
+  if (d16((int16)-32768, n16) != (int16)-32768) { return 3; }
+  if (m16((int16)-32768, n16) != (int16)0) { return 4; }
+
+  var n32: int32 = (int32)-1;
+  if (d32((int32)-2147483648, n32) != (int32)-2147483648) { return 5; }
+  if (m32((int32)-2147483648, n32) != (int32)0) { return 6; }
+
+  var mn: int64 = (int64)-9223372036854775807 - (int64)1;
+  var n64: int64 = (int64)-1;
+  if (d64(mn, n64) != mn) { return 7; }
+  if (m64(mn, n64) != (int64)0) { return 8; }
+
+  // An ordinary divisor of -1 is a negation, and the guard must not disturb
+  // the ordinary quotients around it.
+  if (d64((int64)100, n64) != (int64)-100) { return 9; }
+  if (m64((int64)100, n64) != (int64)0) { return 10; }
+  if (d64((int64)-100, n64) != (int64)100) { return 11; }
+  if (d64((int64)-7, (int64)2) != (int64)-3) { return 12; }
+  if (m64((int64)-7, (int64)2) != (int64)-1) { return 13; }
+  if (d64((int64)7, (int64)-2) != (int64)-3) { return 14; }
+  if (m64((int64)7, (int64)-2) != (int64)1) { return 15; }
+  if (d64(mn, (int64)7) != (int64)-1317624576693539401) { return 16; }
+  if (m64(mn, (int64)7) != (int64)-1) { return 17; }
+
+  return 0;
+}

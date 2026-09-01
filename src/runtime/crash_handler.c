@@ -161,6 +161,8 @@ const char *mettle_crash_exception_name(DWORD code) {
     return "in-page error";
   case EXCEPTION_INT_DIVIDE_BY_ZERO:
     return "integer divide by zero";
+  case EXCEPTION_INT_OVERFLOW:
+    return "integer overflow";
   case EXCEPTION_STACK_OVERFLOW:
     return "stack overflow";
   case STATUS_HEAP_CORRUPTION:

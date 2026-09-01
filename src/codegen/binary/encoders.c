@@ -1516,6 +1516,32 @@ int binary_emit_idiv_reg(BinaryCodeBuffer *buffer,
   return binary_emit_unary_reg(buffer, 7, divisor);
 }
 
+/* Signed division with the one case x86 traps on folded out. IDIV raises #DE
+ * when the quotient does not fit, which for a 64-bit divide means exactly
+ * INT64_MIN / -1. The narrower widths never reach it (they divide sign-extended
+ * at 64 bits and truncate after), so trapping there made one width of the same
+ * expression kill the process. Dividing by -1 is a negation and leaves no
+ * remainder, and negation wraps INT64_MIN to itself, so the guarded path is the
+ * wrapping answer the other widths already give. Division by zero still traps.
+ * RAX = dividend on entry; RAX = quotient, RDX = remainder on exit. */
+int binary_emit_idiv_wrapping(BinaryCodeBuffer *buffer,
+                              BinaryGpRegister divisor) {
+  size_t to_wrap = 0;
+  size_t to_done = 0;
+  if (!binary_emit_cmp_reg_imm32(buffer, divisor, 0xFFFFFFFFu) ||
+      !wcs_jcc(buffer, 0x84 /* je */, &to_wrap) || !binary_emit_cqo(buffer) ||
+      !binary_emit_idiv_reg(buffer, divisor) ||
+      !wcs_jcc(buffer, 0 /* jmp */, &to_done)) {
+    return 0;
+  }
+  if (!wcs_patch_here(buffer, to_wrap) ||
+      !binary_emit_neg_reg(buffer, BINARY_GP_RAX) ||
+      !binary_emit_xor_reg_reg32(buffer, BINARY_GP_RDX)) {
+    return 0;
+  }
+  return wcs_patch_here(buffer, to_done);
+}
+
 /* Unsigned one-operand DIV (F7 /6): RAX = RDX:RAX / src, RDX = remainder.
  * Caller must zero RDX (xor edx,edx) first. */
 int binary_emit_div_reg(BinaryCodeBuffer *buffer, BinaryGpRegister divisor) {

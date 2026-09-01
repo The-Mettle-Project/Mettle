@@ -831,6 +831,60 @@ static int irv_float_close(double a, double b) {
   return fabs(a - b) <= 1e-9 + 1e-6 * mag;
 }
 
+/* A pass whose result is deliberately not bit-identical. The vectorized SiLU
+ * and exp kernels compute in float32 lanes where the scalar loop carried a
+ * float64 intermediate, so the last mantissa bit can differ; demanding an
+ * exact match quarantined them on every function that used them, which
+ * silently dropped an optimization the programmer asked for with `@simd`.
+ * Such a pass declares the element type it writes, and its buffers are then
+ * compared as numbers, with the same tolerance scalar observations already
+ * use. Nothing else relaxes: a buffer whose element type is not declared here
+ * stays byte-exact, and a real miscompile in one of these kernels (applying
+ * the function twice, the bug the tail test was written for, is a ~57%%
+ * error) is orders of magnitude outside the tolerance. */
+typedef struct {
+  const char *pass;
+  int elem_bytes;
+} IRVInexactPass;
+
+static const IRVInexactPass g_inexact_passes[] = {
+    {"simd_exp_f32", 4},
+    {"simd_silu_f32", 4},
+};
+
+static int irv_pass_elem_bytes(const char *pass_name) {
+  if (!pass_name) {
+    return 0;
+  }
+  for (size_t i = 0; i < sizeof(g_inexact_passes) / sizeof(*g_inexact_passes);
+       i++) {
+    if (strcmp(g_inexact_passes[i].pass, pass_name) == 0) {
+      return g_inexact_passes[i].elem_bytes;
+    }
+  }
+  return 0;
+}
+
+/* Every float32 lane within tolerance. On failure `at` names the byte offset
+ * of the first lane that is not, so the report reads like the byte one. */
+static int irv_buffers_close_f32(const unsigned char *a, const unsigned char *b,
+                                 long long size, long long *at) {
+  if (size % 4 != 0) {
+    return 0;
+  }
+  for (long long i = 0; i < size; i += 4) {
+    float x = 0.0f;
+    float y = 0.0f;
+    memcpy(&x, a + i, sizeof(x));
+    memcpy(&y, b + i, sizeof(y));
+    if (!irv_float_close((double)x, (double)y)) {
+      *at = i;
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int irv_value_equal(const IRInterpValue *a, const IRInterpValue *b) {
   if (a->is_float || b->is_float) {
     double x = a->is_float ? a->f : (double)a->i;
@@ -878,8 +932,8 @@ static int irv_pointees_agree(IRInterpMachine *before, IRInterpMachine *after,
  * so is the divergence. */
 static int irv_input_buffers_agree(IRInterpMachine *before,
                                    IRInterpMachine *after,
-                                   size_t input_buffer_count, char *why,
-                                   size_t why_capacity) {
+                                   size_t input_buffer_count, int elem_bytes,
+                                   char *why, size_t why_capacity) {
   for (size_t i = 0; i < input_buffer_count; i++) {
     long long size_a = 0, size_b = 0;
     const unsigned char *a = ir_interp_buffer_data(before, i, &size_a);
@@ -901,6 +955,20 @@ static int irv_input_buffers_agree(IRInterpMachine *before,
     }
     if (memcmp(a, b, (size_t)size_a) != 0) {
       long long at = 0;
+      if (elem_bytes == 4 && irv_buffers_close_f32(a, b, size_a, &at)) {
+        continue;
+      }
+      if (elem_bytes == 4 && size_a % 4 == 0) {
+        float x = 0.0f;
+        float y = 0.0f;
+        memcpy(&x, a + at, sizeof(x));
+        memcpy(&y, b + at, sizeof(y));
+        snprintf(why, why_capacity,
+                 "buffer arg %zu differs at element %lld (%g -> %g)", i,
+                 at / 4, (double)x, (double)y);
+        return 0;
+      }
+      at = 0;
       while (at < size_a && a[at] == b[at]) {
         at++;
       }
@@ -919,8 +987,8 @@ static int irv_compare_observations(IRInterpMachine *before,
                                     IRInterpMachine *after,
                                     const IRInterpValue *ret_before,
                                     const IRInterpValue *ret_after,
-                                    size_t input_buffer_count, char *why,
-                                    size_t why_capacity) {
+                                    size_t input_buffer_count, int elem_bytes,
+                                    char *why, size_t why_capacity) {
   {
     int pointees = irv_pointees_agree(before, after, ret_before, ret_after);
     if (pointees == 0 ||
@@ -934,8 +1002,8 @@ static int irv_compare_observations(IRInterpMachine *before,
     }
   }
 
-  if (!irv_input_buffers_agree(before, after, input_buffer_count, why,
-                               why_capacity)) {
+  if (!irv_input_buffers_agree(before, after, input_buffer_count, elem_bytes,
+                               why, why_capacity)) {
     return 0;
   }
 
@@ -1254,20 +1322,24 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
                                              IRFunction *function,
                                              const IRVerifySnapshot *snapshot,
                                              IRVCheckResult *result,
-                                             const IRVHarvest *harvest);
+                                             const IRVHarvest *harvest,
+                                             int elem_bytes);
 
 static IRVCheckOutcome irv_check_function(IRProgram *program,
                                           IRFunction *function,
                                           const IRVerifySnapshot *snapshot,
-                                          IRVCheckResult *result) {
-  return irv_check_function_ex(program, function, snapshot, result, NULL);
+                                          IRVCheckResult *result,
+                                          int elem_bytes) {
+  return irv_check_function_ex(program, function, snapshot, result, NULL,
+                               elem_bytes);
 }
 
 static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
                                           IRFunction *function,
                                           const IRVerifySnapshot *snapshot,
                                           IRVCheckResult *result,
-                                          const IRVHarvest *harvest) {
+                                          const IRVHarvest *harvest,
+                                          int elem_bytes) {
   result->why[0] = '\0';
   result->cex[0] = '\0';
   result->skip_reason[0] = '\0';
@@ -1426,8 +1498,8 @@ static IRVCheckOutcome irv_check_function_ex(IRProgram *program,
     }
 
     if (!irv_compare_observations(machine_before, machine_after, &ret_before,
-                                  &ret_after, input_buffer_count, result->why,
-                                  sizeof(result->why))) {
+                                  &ret_after, input_buffer_count, elem_bytes,
+                                  result->why, sizeof(result->why))) {
       goto divergence;
     }
 
@@ -1489,7 +1561,8 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
   g_apps_checked++;
 
   IRVCheckResult result;
-  switch (irv_check_function(g_program, function, snapshot, &result)) {
+  switch (irv_check_function(g_program, function, snapshot, &result,
+                             irv_pass_elem_bytes(pass_name))) {
   case IRV_CHECK_UNVERIFIABLE:
     irv_note_skip(function, result.skip_reason);
     g_apps_unverifiable++;
@@ -1548,8 +1621,8 @@ IRVerifyRewriteVerdict ir_verify_check_rewrite(
   g_last_input_runs = IRV_INPUT_RUNS + harvest.count;
 
   IRVCheckResult result;
-  switch (irv_check_function_ex(program, function, snapshot, &result,
-                                &harvest)) {
+  switch (irv_check_function_ex(program, function, snapshot, &result, &harvest,
+                                0)) {
   case IRV_CHECK_DIVERGED:
     if (why && why_capacity) {
       snprintf(why, why_capacity, "%s", result.why);

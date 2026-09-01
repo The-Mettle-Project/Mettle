@@ -1562,9 +1562,18 @@ static int ii_binary(IRInterpMachine *machine, const IRInstruction *insn,
     return 1;
   }
   if (strcmp(op, "/") == 0 || strcmp(op, "%") == 0) {
-    if (sy == 0 || (!is_unsigned && sx == LLONG_MIN && sy == -1)) {
+    if (sy == 0) {
       ii_fail(machine, IR_INTERP_TRAP, "integer divide trap");
       return 0;
+    }
+    /* Dividing by -1 is a negation with no remainder, and the negation wraps
+     * INT64_MIN to itself. Spelled out because the host would call it
+     * undefined, and because it is what the compiled code now does. */
+    if (!is_unsigned && sy == -1) {
+      *out = ii_int_value(op[0] == '/'
+                              ? (long long)(0ULL - (unsigned long long)sx)
+                              : 0);
+      return 1;
     }
     long long q;
     if (is_unsigned) {

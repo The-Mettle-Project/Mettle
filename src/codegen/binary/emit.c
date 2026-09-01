@@ -5489,9 +5489,19 @@ static int binary_emit_binary_integer(CodeGenerator *generator,
           !binary_emit_div_reg(&context->code, BINARY_GP_R10)) {
         goto emit_failure;
       }
-    } else if (!binary_emit_cqo(&context->code) ||
-               !binary_emit_idiv_reg(&context->code, BINARY_GP_R10)) {
-      goto emit_failure;
+    } else {
+      /* A constant divisor that is not -1 cannot reach the overflow case, so
+       * it keeps the bare IDIV; anything else takes the guarded form. */
+      int needs_guard = !(instruction->rhs.kind == IR_OPERAND_INT &&
+                          instruction->rhs.int_value != -1);
+      if (needs_guard) {
+        if (!binary_emit_idiv_wrapping(&context->code, BINARY_GP_R10)) {
+          goto emit_failure;
+        }
+      } else if (!binary_emit_cqo(&context->code) ||
+                 !binary_emit_idiv_reg(&context->code, BINARY_GP_R10)) {
+        goto emit_failure;
+      }
     }
     if (strcmp(op, "%") == 0 &&
         !binary_emit_mov_reg_reg(&context->code, BINARY_GP_RAX,

@@ -1,0 +1,8 @@
+// An escape a string literal does not define is an error, the same as it is in
+// a character literal. It used to be kept as the backslash followed by the
+// character, so "a\xC3b" was six characters and nothing said so.
+
+fn main() -> int32 {
+  var s: string = "a\xC3b";
+  return (int32)s.length;
+}

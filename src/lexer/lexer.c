@@ -717,7 +717,7 @@ static Token lexer_lex_identifier_or_keyword(Lexer *lexer) {
 
 static int lexer_read_string_body(Lexer *lexer, char *buffer,
                                   size_t *buffer_pos_out,
-                                  int interpolation_aware) {
+                                  int interpolation_aware, int *bad_escape) {
   size_t buffer_pos = 0;
   size_t depth = 0;
   int in_nested = 0;
@@ -754,6 +754,9 @@ static int lexer_read_string_body(Lexer *lexer, char *buffer,
         buffer[buffer_pos++] = '\0';
         break;
       default:
+        if (bad_escape && *bad_escape == 0) {
+          *bad_escape = (unsigned char)escape_char;
+        }
         buffer[buffer_pos++] = '\\';
         buffer[buffer_pos++] = escape_char;
         break;
@@ -810,17 +813,32 @@ static Token lexer_lex_string_literal(Lexer *lexer) {
   size_t body_position = lexer->position;
   size_t body_column = lexer->column;
   size_t buffer_pos = 0;
+  int bad_escape = 0;
 
-  if (!lexer_read_string_body(lexer, buffer, &buffer_pos, 1)) {
+  if (!lexer_read_string_body(lexer, buffer, &buffer_pos, 1, &bad_escape)) {
     lexer->position = body_position;
     lexer->column = body_column;
-    lexer_read_string_body(lexer, buffer, &buffer_pos, 0);
+    bad_escape = 0;
+    lexer_read_string_body(lexer, buffer, &buffer_pos, 0, &bad_escape);
   }
 
   if (lexer->position >= lexer->length) {
     free(buffer);
     token.type = TOKEN_ERROR;
     token.value = strdup("Unterminated string literal");
+    lexer_set_error(lexer, token.value);
+    return token;
+  }
+
+  if (bad_escape != 0) {
+    /* Step past the closing quote so the next token is whatever follows the
+     * string: leaving the cursor on it re-lexes the body and reports a second,
+     * invented "unterminated string literal". */
+    lexer->position++;
+    lexer->column++;
+    free(buffer);
+    token.type = TOKEN_ERROR;
+    token.value = strdup("Invalid string escape sequence");
     lexer_set_error(lexer, token.value);
     return token;
   }

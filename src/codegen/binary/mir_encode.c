@@ -816,7 +816,14 @@ static int encode_div(MirFunction *fn, const MirInst *in) {
       return enc_err(fn, "out of memory in div");
     }
   } else {
-    if (!binary_emit_cqo(code) || !binary_emit_idiv_reg(code, divisor)) {
+    /* A constant divisor that is not -1 cannot reach the overflow case, so it
+     * keeps the bare IDIV; anything else takes the guarded form. */
+    int needs_guard = !(in->b.kind == MIR_OPK_IMM && in->b.imm != -1);
+    if (needs_guard) {
+      if (!binary_emit_idiv_wrapping(code, divisor)) {
+        return enc_err(fn, "out of memory in idiv");
+      }
+    } else if (!binary_emit_cqo(code) || !binary_emit_idiv_reg(code, divisor)) {
       return enc_err(fn, "out of memory in idiv");
     }
   }

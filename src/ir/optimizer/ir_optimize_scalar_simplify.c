@@ -1080,14 +1080,18 @@ static int ir_try_evaluate_integer_binary(const char *op, long long lhs,
   } else if (strcmp(op, "*") == 0) {
     *result = (long long)((unsigned long long)lhs * (unsigned long long)rhs);
   } else if (strcmp(op, "/") == 0) {
-    if (rhs == 0 || (lhs == LLONG_MIN && rhs == -1)) {
+    if (rhs == 0) {
       *folded = 0;
+    } else if (rhs == -1) {
+      *result = (long long)(0ULL - (unsigned long long)lhs);
     } else {
       *result = lhs / rhs;
     }
   } else if (strcmp(op, "%") == 0) {
-    if (rhs == 0 || (lhs == LLONG_MIN && rhs == -1)) {
+    if (rhs == 0) {
       *folded = 0;
+    } else if (rhs == -1) {
+      *result = 0;
     } else {
       *result = lhs % rhs;
     }

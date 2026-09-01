@@ -133,8 +133,8 @@ var nl: char = '\n';
 ## String literals
 
 Text in double quotes has type `string`. The escapes are `\n`, `\t`, `\r`,
-`\`, `\"`, and `\0`. An unrecognized escape is kept as the backslash followed
-by the character.
+`\`, `\"`, and `\0`. Any other escape is an error, as it is in a
+character literal.
 
 Every string literal is scanned for interpolation. `{expr}` splices the value
 of `expr` into the text, and `{{` writes one literal `{`:

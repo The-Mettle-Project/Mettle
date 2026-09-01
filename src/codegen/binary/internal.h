@@ -660,6 +660,7 @@ int binary_emit_movzx_reg_rip_mem8(BinaryCodeBuffer *buffer, BinaryGpRegister de
 int binary_emit_mulsd_xmm_xmm(BinaryCodeBuffer *buffer, BinaryXmmRegister destination, BinaryXmmRegister source);
 int binary_emit_mulss_xmm_xmm(BinaryCodeBuffer *buffer, BinaryXmmRegister destination, BinaryXmmRegister source);
 int binary_emit_neg_reg(BinaryCodeBuffer *buffer, BinaryGpRegister reg);
+int binary_emit_idiv_wrapping(BinaryCodeBuffer *buffer, BinaryGpRegister divisor);
 int binary_emit_not_reg(BinaryCodeBuffer *buffer, BinaryGpRegister reg);
 int binary_emit_or_reg_imm32(BinaryCodeBuffer *buffer, BinaryGpRegister reg, uint32_t immediate);
 int binary_emit_pop_reg(BinaryCodeBuffer *buffer, BinaryGpRegister reg);

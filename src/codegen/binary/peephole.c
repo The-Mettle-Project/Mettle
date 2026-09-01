@@ -907,8 +907,7 @@ int code_generator_binary_emit_integer_binary_to_rax(
           !binary_emit_div_reg(&context->code, BINARY_GP_R10)) {
         return 0;
       }
-    } else if (!binary_emit_cqo(&context->code) ||
-               !binary_emit_idiv_reg(&context->code, BINARY_GP_R10)) {
+    } else if (!binary_emit_idiv_wrapping(&context->code, BINARY_GP_R10)) {
       return 0;
     }
     if (strcmp(op, "%") == 0) {
@@ -2445,8 +2444,7 @@ int code_generator_binary_emit_rax_binary_rhs(
           !binary_emit_div_reg(&context->code, BINARY_GP_R10)) {
         return 0;
       }
-    } else if (!binary_emit_cqo(&context->code) ||
-               !binary_emit_idiv_reg(&context->code, BINARY_GP_R10)) {
+    } else if (!binary_emit_idiv_wrapping(&context->code, BINARY_GP_R10)) {
       return 0;
     }
     if (strcmp(op, "%") == 0) {
