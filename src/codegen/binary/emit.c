@@ -3273,6 +3273,57 @@ int code_generator_binary_emit_float_to_unsigned_int(
                                              context->code.size);
 }
 
+/* The value is in RAX. float -> int truncates at the SOURCE precision, and a
+ * uint64 target takes the biased sequence because the machine's truncation is
+ * signed from 2^63 up. */
+static int binary_cast_float_to_int(BinaryFunctionContext *context,
+                                    int src_fbits, int to_u64) {
+  if (src_fbits == 32) {
+    if (!binary_emit_movd_xmm_reg(&context->code, BINARY_XMM0, BINARY_GP_RAX)) {
+      return 0;
+    }
+  } else if (!binary_emit_movq_xmm_reg(&context->code, BINARY_XMM0,
+                                       BINARY_GP_RAX)) {
+    return 0;
+  }
+  if (to_u64) {
+    return code_generator_binary_emit_float_to_unsigned_int(
+        context, src_fbits, BINARY_GP_RAX, BINARY_XMM0, BINARY_GP_R10,
+        BINARY_XMM1);
+  }
+  return (src_fbits == 32)
+             ? binary_emit_cvttss2si_reg_xmm(&context->code, BINARY_GP_RAX,
+                                             BINARY_XMM0)
+             : binary_emit_cvttsd2si_reg_xmm(&context->code, BINARY_GP_RAX,
+                                             BINARY_XMM0);
+}
+
+/* The value is in RAX. int -> float converts at the TARGET precision and puts
+ * the result back in RAX; an unsigned source takes the halve-convert-double
+ * sequence because the machine's conversion is signed. */
+static int binary_cast_int_to_float(BinaryFunctionContext *context, int bits,
+                                    int source_is_unsigned) {
+  if (source_is_unsigned) {
+    if (!code_generator_binary_emit_unsigned_int_to_float(
+            context, bits, BINARY_XMM0, BINARY_GP_RAX, BINARY_GP_R10,
+            BINARY_GP_R11)) {
+      return 0;
+    }
+  } else if (bits == 32) {
+    if (!binary_emit_cvtsi2ss_xmm_reg(&context->code, BINARY_XMM0,
+                                      BINARY_GP_RAX)) {
+      return 0;
+    }
+  } else if (!binary_emit_cvtsi2sd_xmm_reg(&context->code, BINARY_XMM0,
+                                           BINARY_GP_RAX)) {
+    return 0;
+  }
+  return (bits == 32) ? binary_emit_movd_reg_xmm(&context->code, BINARY_GP_RAX,
+                                                 BINARY_XMM0)
+                      : binary_emit_movq_reg_xmm(&context->code, BINARY_GP_RAX,
+                                                 BINARY_XMM0);
+}
+
 int code_generator_binary_emit_cast(CodeGenerator *generator,
                                            BinaryFunctionContext *context,
                                            const IRInstruction *instruction) {
@@ -3319,61 +3370,13 @@ int code_generator_binary_emit_cast(CodeGenerator *generator,
       code_generator_binary_resolved_type_float_bits(target_type);
 
   if (instruction->is_float && !target_is_float) {
-    /* float -> int: truncate at the SOURCE precision. */
-    int to_u64 = target_is_unsigned && target_size == 8;
-    if (src_fbits == 32) {
-      if (!binary_emit_movd_xmm_reg(&context->code, BINARY_XMM0,
-                                    BINARY_GP_RAX)) {
-        goto emit_failure;
-      }
-      if (to_u64) {
-        if (!code_generator_binary_emit_float_to_unsigned_int(
-                context, 32, BINARY_GP_RAX, BINARY_XMM0, BINARY_GP_R10,
-                BINARY_XMM1)) {
-          goto emit_failure;
-        }
-      } else if (!binary_emit_cvttss2si_reg_xmm(&context->code, BINARY_GP_RAX,
-                                                BINARY_XMM0)) {
-        goto emit_failure;
-      }
-    } else if (!binary_emit_movq_xmm_reg(&context->code, BINARY_XMM0,
-                                         BINARY_GP_RAX)) {
-      goto emit_failure;
-    } else if (to_u64) {
-      if (!code_generator_binary_emit_float_to_unsigned_int(
-              context, 64, BINARY_GP_RAX, BINARY_XMM0, BINARY_GP_R10,
-              BINARY_XMM1)) {
-        goto emit_failure;
-      }
-    } else if (!binary_emit_cvttsd2si_reg_xmm(&context->code, BINARY_GP_RAX,
-                                              BINARY_XMM0)) {
+    if (!binary_cast_float_to_int(context, src_fbits,
+                                  target_is_unsigned && target_size == 8)) {
       goto emit_failure;
     }
   } else if (!instruction->is_float && target_is_float) {
-    /* int -> float: produce a value at the TARGET precision. */
-    int bits = (dst_fbits == 32) ? 32 : 64;
-    if (instruction->is_unsigned) {
-      if (!code_generator_binary_emit_unsigned_int_to_float(
-              context, bits, BINARY_XMM0, BINARY_GP_RAX, BINARY_GP_R10,
-              BINARY_GP_R11)) {
-        goto emit_failure;
-      }
-    } else if (bits == 32) {
-      if (!binary_emit_cvtsi2ss_xmm_reg(&context->code, BINARY_XMM0,
-                                        BINARY_GP_RAX)) {
-        goto emit_failure;
-      }
-    } else if (!binary_emit_cvtsi2sd_xmm_reg(&context->code, BINARY_XMM0,
-                                             BINARY_GP_RAX)) {
-      goto emit_failure;
-    }
-    if (bits == 32) {
-      if (!binary_emit_movd_reg_xmm(&context->code, BINARY_GP_RAX,
-                                    BINARY_XMM0)) {
-        goto emit_failure;
-      }
-    } else if (!binary_emit_movq_reg_xmm(&context->code, BINARY_GP_RAX,
-                                         BINARY_XMM0)) {
+    if (!binary_cast_int_to_float(context, (dst_fbits == 32) ? 32 : 64,
+                                  instruction->is_unsigned)) {
       goto emit_failure;
     }
   } else if (instruction->is_float && target_is_float) {

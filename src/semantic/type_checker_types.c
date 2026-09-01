@@ -13,91 +13,97 @@ Type *type_checker_closure_env_sentinel(void) {
   return sentinel;
 }
 
-Type *type_checker_parse_array_type(TypeChecker *checker,
-                                           const char *name) {
-  if (!checker || !name)
-    return NULL;
-
-  /* The suffix is the last bracket group, found from the end so a bracket
-   * inside the element type is not mistaken for it: the element of
-   * `(fn(int32[4]) -> int32)[2]` is the whole parenthesised function type. */
+/* The bracket group that gives an array type its OUTER dimension, and the
+ * matching ']'. Dimensions read left to right, so `int32[3][4]` is three rows
+ * of four and the first group is the one this array measures; everything after
+ * it belongs to the element. Answers 0 when the name is not an array.
+ *
+ * The search starts from the END so a bracket inside the element type is not
+ * mistaken for a dimension: the element of `(fn(int32[4]) -> int32)[2]` is the
+ * whole parenthesised function type. It then steps left, group by group, to
+ * reach the first. A single-dimension name never enters that loop. */
+static int type_checker_array_outer_group(const char *name,
+                                          const char **lbracket_out,
+                                          const char **rbracket_out) {
+  size_t length = name ? strlen(name) : 0;
   const char *lbracket = NULL;
   const char *rbracket = NULL;
-  {
-    size_t length = strlen(name);
-    const char *scan;
-    int depth = 0;
-    if (length == 0 || name[length - 1] != ']') {
-      return NULL;
+  const char *scan;
+  int depth = 0;
+
+  if (length == 0 || name[length - 1] != ']') {
+    return 0;
+  }
+  rbracket = name + length - 1;
+  for (scan = rbracket; scan >= name; scan--) {
+    if (*scan == ']') {
+      depth++;
+    } else if (*scan == '[') {
+      depth--;
+      if (depth == 0) {
+        lbracket = scan;
+        break;
+      }
     }
-    rbracket = name + length - 1;
-    for (scan = rbracket; scan >= name; scan--) {
+  }
+  if (!lbracket) {
+    return 0;
+  }
+
+  for (;;) {
+    const char *end = lbracket - 1;
+    const char *found = NULL;
+    depth = 0;
+    if (end <= name || *end != ']') {
+      break;
+    }
+    for (scan = end; scan > name; scan--) {
       if (*scan == ']') {
         depth++;
       } else if (*scan == '[') {
         depth--;
         if (depth == 0) {
-          lbracket = scan;
+          found = scan;
           break;
         }
       }
     }
-    if (!lbracket) {
-      return NULL;
+    if (!found || found == name) {
+      break;
     }
+    lbracket = found;
   }
 
-  /* Dimensions read left to right, so `int32[3][4]` is three rows of four and
-   * `m[i][j]` indexes them in the order they were declared. That makes the
-   * FIRST group this array's size and everything else part of its element, so
-   * step left from the last group, matching the same way, to reach the first.
-   * A single-dimension type never enters the loop. */
-  {
-    const char *first_l = lbracket;
-    for (;;) {
-      const char *end = first_l - 1;
-      const char *scan;
-      const char *found = NULL;
-      int depth = 0;
-      if (end <= name || *end != ']') {
+  depth = 0;
+  for (scan = lbracket; *scan; scan++) {
+    if (*scan == '[') {
+      depth++;
+    } else if (*scan == ']') {
+      depth--;
+      if (depth == 0) {
+        rbracket = scan;
         break;
       }
-      for (scan = end; scan > name; scan--) {
-        if (*scan == ']') {
-          depth++;
-        } else if (*scan == '[') {
-          depth--;
-          if (depth == 0) {
-            found = scan;
-            break;
-          }
-        }
-      }
-      if (!found || found == name) {
-        break;
-      }
-      first_l = found;
     }
-    if (first_l != lbracket) {
-      const char *scan;
-      const char *first_r = NULL;
-      int depth = 0;
-      for (scan = first_l; *scan; scan++) {
-        if (*scan == '[') {
-          depth++;
-        } else if (*scan == ']') {
-          depth--;
-          if (depth == 0) {
-            first_r = scan;
-            break;
-          }
-        }
-      }
-      if (first_r) {
-        lbracket = first_l;
-        rbracket = first_r;
-      }
-    }
+  }
+  if (!rbracket || rbracket < lbracket) {
+    return 0;
+  }
+  *lbracket_out = lbracket;
+  *rbracket_out = rbracket;
+  return 1;
+}
+
+Type *type_checker_parse_array_type(TypeChecker *checker,
+                                           const char *name) {
+  const char *lbracket = NULL;
+  const char *rbracket = NULL;
+
+  if (!checker || !name) {
+    return NULL;
+  }
+  if (!type_checker_array_outer_group(name, &lbracket, &rbracket)) {
+    return NULL;
   }
 
   size_t base_len = (size_t)(lbracket - name);
