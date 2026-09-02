@@ -323,6 +323,16 @@ println("{strlen("hello")} {add_two(20, 22)}");
 A string literal is already nul-terminated. For a run-time string, copy it with
 `cstr(name, &malloc)` and free the copy.
 
+## Asking the kernel
+
+```mettle
+var written: int64 = syscall(1, 1, &message[0], 12);   // Linux write(2)
+```
+
+The number first, then the arguments. Six of them on Linux, fifteen on Windows,
+where the number itself is read out of the `ntdll` stub because it moves between
+builds. [C interoperability](c-interop.md) has both conventions.
+
 ## Imports
 
 ```mettle

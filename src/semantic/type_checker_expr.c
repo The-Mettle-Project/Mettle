@@ -1,5 +1,6 @@
 // Type checker: expression type inference and checking.
 #include "type_checker_internal.h"
+#include "codegen/target.h"
 #include "monomorphize.h"
 #include "string_intern.h"
 
@@ -2366,6 +2367,95 @@ static Type *type_checker_infer_unary(TypeChecker *checker,
   return NULL;
 }
 
+static int type_checker_syscall_operand_type_ok(Type *type) {
+  if (!type) {
+    return 0;
+  }
+  if (type_checker_is_integer_type(type)) {
+    return 1;
+  }
+  switch (type->kind) {
+  case TYPE_BOOL:
+  case TYPE_CHAR:
+  case TYPE_POINTER:
+  case TYPE_FUNCTION_POINTER:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static Type *type_checker_check_syscall(TypeChecker *checker,
+                                        ASTNode *expression,
+                                        CallExpression *call) {
+  const MtlcTarget *target = mtlc_target();
+  int maximum = mtlc_target_syscall_max_arguments(target);
+  FunctionDeclaration *owner =
+      checker->current_function_decl &&
+              checker->current_function_decl->type == AST_FUNCTION_DECLARATION
+          ? (FunctionDeclaration *)checker->current_function_decl->data
+          : NULL;
+
+  if (owner && owner->is_kernel) {
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "'syscall' asks the operating system for something, and a GPU kernel "
+        "runs where there is no operating system");
+    return NULL;
+  }
+  if (maximum < 0) {
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "'syscall' has no instruction to emit on target '%s'",
+        target && target->triple[0] ? target->triple : "?");
+    return NULL;
+  }
+  if (call->argument_count == 0) {
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "'syscall' takes the system-call number first, then its arguments");
+    return NULL;
+  }
+  if (call->argument_count > (size_t)maximum + 1) {
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "'syscall' passes at most %d arguments after the number on target "
+        "'%s', got %llu",
+        maximum, target && target->triple[0] ? target->triple : "?",
+        (unsigned long long)(call->argument_count - 1));
+    return NULL;
+  }
+
+  for (size_t i = 0; i < call->argument_count; i++) {
+    if (call->argument_names && call->argument_names[i]) {
+      type_checker_set_error_at_location(
+          checker, call->arguments[i]->location,
+          "'syscall' operands are positional");
+      return NULL;
+    }
+    Type *operand = type_checker_infer_type(checker, call->arguments[i]);
+    if (!operand) {
+      return NULL;
+    }
+    if (i == 0 && !type_checker_is_integer_type(operand)) {
+      type_checker_set_error_at_location(
+          checker, call->arguments[0]->location,
+          "The system-call number must have integer type, got '%s'",
+          operand->name ? operand->name : "?");
+      return NULL;
+    }
+    if (!type_checker_syscall_operand_type_ok(operand)) {
+      type_checker_set_error_at_location(
+          checker, call->arguments[i]->location,
+          "'syscall' argument %llu has type '%s'; a system-call argument is an "
+          "integer, a boolean, a character, or a pointer",
+          (unsigned long long)i, operand->name ? operand->name : "?");
+      return NULL;
+    }
+  }
+  return checker->builtin_int64;
+}
+
 static Type *type_checker_infer_named_builtin(TypeChecker *checker,
                                               ASTNode *expression,
                                               CallExpression *call,
@@ -2416,6 +2506,10 @@ static Type *type_checker_infer_named_builtin(TypeChecker *checker,
     return type_checker_field_value(checker, owner,
                                     field.as.field_ref.field_index,
                                     expression);
+  }
+
+  if (strcmp(call->function_name, "syscall") == 0) {
+    return type_checker_check_syscall(checker, expression, call);
   }
 
   if (strcmp(call->function_name, "static_assert") == 0) {

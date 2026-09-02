@@ -1795,6 +1795,7 @@ static int mir_has_calls(const MirFunction *fn) {
      * reserved at the bottom of the frame just like a MIR_CALL. */
     if (fn->insns[i].op == MIR_CALL ||
         fn->insns[i].op == MIR_CALL_INDIRECT ||
+        fn->insns[i].op == MIR_SYSCALL ||
         fn->insns[i].op == MIR_TRAP) {
       return 1;
     }
@@ -2860,6 +2861,11 @@ int mir_encode(MirFunction *fn) {
                                             d2) ||
           !binary_emit_add_rsp_imm32(&ctx->code, 48)) {
         ok = enc_err(fn, "out of memory emitting heap allocation");
+      }
+      break;
+    }
+    case MIR_SYSCALL: {      if (!binary_emit_syscall(&ctx->code)) {
+        ok = enc_err(fn, "out of memory emitting a system call");
       }
       break;
     }

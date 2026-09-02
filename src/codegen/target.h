@@ -46,6 +46,12 @@ const char *mtlc_target_triple_list(void);
 
 int mtlc_target_is_object_capable(const MtlcTarget *target);
 
+#define MTLC_SYSCALL_MAX_ARGUMENTS_SYSV 6
+#define MTLC_SYSCALL_MAX_ARGUMENTS_SVC 6
+#define MTLC_SYSCALL_MAX_ARGUMENTS_NT 15
+
+int mtlc_target_syscall_max_arguments(const MtlcTarget *target);
+
 MtlcTargetOs mtlc_target_host_os(void);
 
 const char *mtlc_target_os_name(MtlcTargetOs os);

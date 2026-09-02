@@ -85,7 +85,7 @@ static const BinaryGpRegister MIR_GP_EXTRA[] = {
  * an operand the clobber index can see. */
 static int mir_op_is_call_barrier(MirOpcode op) {
   return op == MIR_CALL || op == MIR_CALL_INDIRECT || op == MIR_HEAP_NEW ||
-         op == MIR_REP_MOVSB || op == MIR_REP_STOSB ||
+         op == MIR_REP_MOVSB || op == MIR_REP_STOSB || op == MIR_SYSCALL ||
          mir_op_is_inline_kernel(op);
 }
 
@@ -215,7 +215,8 @@ static int mir_fn_has_real_calls(const MirFunction *fn) {
     if (fn->insns[i].op == MIR_CALL || fn->insns[i].op == MIR_CALL_INDIRECT ||
         fn->insns[i].op == MIR_HEAP_NEW ||
         fn->insns[i].op == MIR_REP_MOVSB ||
-        fn->insns[i].op == MIR_REP_STOSB) {
+        fn->insns[i].op == MIR_REP_STOSB ||
+        fn->insns[i].op == MIR_SYSCALL) {
       return 1;
     }
   }

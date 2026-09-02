@@ -33,6 +33,8 @@
  * annotated-unroll pass; transparent to every backend like the SIMD markers. */
 #define IR_UNROLL_MARKER_PREFIX "@@unroll:"
 
+#define IR_SYSCALL_CALL_NAME "__mtl_syscall"
+
 typedef enum {
   IR_OPERAND_NONE,
   IR_OPERAND_TEMP,

@@ -15048,6 +15048,167 @@ export fn read_counter() -> int32 {
   }
 }
 
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $syscallSource = if ($script:OnWindows) {
+    "tests/test_syscall_windows.mettle"
+  } else {
+    "tests/test_syscall_linux.mettle"
+  }
+  $syscallExe = Join-Path $tmpDir "syscall_runs.exe"
+  $previousMir = $env:METTLE_MIR
+  try {
+    foreach ($backend in @("mir", "baseline")) {
+      if ($backend -eq "baseline") { $env:METTLE_MIR = "0" } else { $env:METTLE_MIR = $null }
+      foreach ($mode in @(@(), @("-O"), @("--release"), @("--safe"))) {
+        if (Test-Path $syscallExe) { Remove-Item -Path $syscallExe -Force }
+        $syscallArgs = @($syscallSource, "--build", "-o", $syscallExe) + $mode
+        $syscallOut = & $CompilerPath @syscallArgs 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $syscallExe)) {
+          throw "building $syscallSource ($backend $($mode -join ' ')) failed: $syscallOut"
+        }
+        $ran = & $syscallExe 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+          throw "$syscallSource ($backend $($mode -join ' ')) exited $LASTEXITCODE : $ran"
+        }
+        if (-not $script:OnWindows -and $ran.Trim() -ne "ABCDEFGH") {
+          throw "the write system call put '$($ran.Trim())' on stdout ($backend $($mode -join ' '))"
+        }
+      }
+    }
+  }
+  finally { $env:METTLE_MIR = $previousMir }
+  Write-CaseResult -Name "syscall_runs" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "syscall_runs" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $encodingSource = "tests/test_syscall_encoding.mettle"
+  function Get-SyscallObjectHex {
+    param([string]$Triple, [string]$Name)
+    $object = Join-Path $tmpDir $Name
+    if (Test-Path $object) { Remove-Item -Path $object -Force }
+    $out = & $CompilerPath $encodingSource "--target" $Triple "--emit-obj" "-o" $object 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $object)) {
+      throw "compiling $encodingSource for $Triple failed: $out"
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($object)
+    return ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+  }
+
+  $sysvHex = Get-SyscallObjectHex "x86_64-linux" "syscall_sysv.o"
+  $sysvExpected = "bf01000000" + "be02000000" + "ba03000000" +
+                  "41b805000000" + "41b906000000" + "b83c000000" +
+                  "41ba04000000" + "0f05"
+  if ($sysvHex -notmatch $sysvExpected) {
+    throw "the Linux system-call sequence is not in the object"
+  }
+
+  $ntHex = Get-SyscallObjectHex "x86_64-windows" "syscall_nt.o"
+  $ntExpected = "41ba05000000" + "4c89542428" + "41ba06000000" + "4c89542430" +
+                "ba02000000" + "41b803000000" + "41b904000000" +
+                "b83c000000" + "41ba01000000" + "0f05"
+  if ($ntHex -notmatch $ntExpected) {
+    throw "the Windows system-call sequence is not in the object"
+  }
+
+  $svcHex = Get-SyscallObjectHex "aarch64-linux" "syscall_svc.o"
+  $svcExpected = "200080d2" + "410080d2" + "620080d2" + "830080d2" +
+                 "a40080d2" + "c50080d2" + "880780d2" + "010000d4"
+  if ($svcHex -notmatch $svcExpected) {
+    throw "the AArch64 system-call sequence is not in the object"
+  }
+
+  foreach ($object in @("syscall_sysv.o", "syscall_nt.o", "syscall_svc.o")) {
+    if (Test-FileContainsText (Join-Path $tmpDir $object) "__mtl_syscall") {
+      throw "$object still names the internal system-call callee"
+    }
+  }
+  Write-CaseResult -Name "syscall_encoding" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "syscall_encoding" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $badDir = Join-Path $tmpDir "syscall_bad"
+  if (Test-Path $badDir) { Remove-Item -Path $badDir -Recurse -Force }
+  New-Item -ItemType Directory -Path $badDir | Out-Null
+
+  function Assert-SyscallRefused {
+    param([string]$Name, [string]$Source, [string[]]$Extra, [string]$Expected)
+    $file = Join-Path $badDir "$Name.mettle"
+    Set-Content -Path $file -Encoding utf8 -Value $Source
+    $refusedArgs = @($file) + $Extra
+    $out = & $CompilerPath @refusedArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+      throw "$Name compiled: $out"
+    }
+    if ($out -notmatch $Expected) {
+      throw "$Name was refused for the wrong reason: $out"
+    }
+  }
+  $emitObject = @("--emit-obj", "-o", (Join-Path $badDir "refused.o"))
+
+  Assert-SyscallRefused "no_number" @'
+fn main() -> int32 {
+    return (int32)syscall();
+}
+'@ $emitObject "takes the system-call number first"
+
+  Assert-SyscallRefused "too_many" @'
+fn main() -> int32 {
+    return (int32)syscall(1, 1, 2, 3, 4, 5, 6, 7);
+}
+'@ (@("--target", "x86_64-linux") + $emitObject) "at most 6 arguments"
+
+  Assert-SyscallRefused "float_operand" @'
+fn main() -> int32 {
+    var x: float64 = 1.5;
+    return (int32)syscall(1, x);
+}
+'@ $emitObject "a system-call argument is an integer"
+
+  Assert-SyscallRefused "no_instruction" @'
+fn main() -> int32 {
+    return (int32)syscall(1, 2);
+}
+'@ @("--target", "i8086-none", "--image-base", "0x7c00", "--emit-flat",
+     (Join-Path $badDir "refused.bin")) "no instruction to emit"
+
+  Assert-SyscallRefused "in_a_kernel" @'
+kernel touch(a: int32*, n: int32) {
+    a[0] = (int32)syscall(1, 1);
+}
+'@ $emitObject "GPU kernel"
+
+  $interpFile = Join-Path $badDir "interpreted.mettle"
+  Set-Content -Path $interpFile -Encoding utf8 -Value @'
+@test fn kernel_answers_zero() -> int64 {
+    assert_eq(syscall(39), 0);
+    return 0;
+}
+'@
+  $interpOut = & $CompilerPath "test" $interpFile 2>&1 | Out-String
+  if ($interpOut -notmatch "skipped" -or $interpOut -notmatch "syscall") {
+    throw "the interpreter answered a system call instead of skipping: $interpOut"
+  }
+  Write-CaseResult -Name "syscall_diagnostics" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "syscall_diagnostics" -Passed $false -Reason $_.Exception.Message
+}
+
 # 32-bit gate: the i386 target must reach the narrow code generator. Emitting
 # 64-bit code into a 32-bit image is the failure that looks like success, so
 # this asserts the shape of what came out rather than only that it came out.

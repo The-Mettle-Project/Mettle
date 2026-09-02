@@ -5386,6 +5386,14 @@ static int ir_gpu_graph_visit(IRGpuGraphBuilder *builder, size_t index) {
         instruction->intrinsic != MTLC_INTRINSIC_NONE) {
       continue;
     }
+    if (instruction->text &&
+        strcmp(instruction->text, IR_SYSCALL_CALL_NAME) == 0) {
+      return ir_gpu_graph_fail(
+          builder,
+          "GPU device function '%s' makes a system call, and a device runs "
+          "where there is no operating system",
+          function->name ? function->name : "?");
+    }
     long callee_index =
         ir_gpu_graph_function_index(program, instruction->text);
     if (callee_index < 0) {

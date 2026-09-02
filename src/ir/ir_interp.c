@@ -4383,6 +4383,10 @@ static int ii_op_call(IRInterpMachine *machine, IIFrame *frame,
     ii_fail(machine, IR_INTERP_UNSUPPORTED, "call without callee");
     return 0;
   }
+  if (strcmp(insn->text, IR_SYSCALL_CALL_NAME) == 0) {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, "syscall");
+    return 0;
+  }
   IRInterpValue call_args[32];
   size_t call_arg_count = insn->argument_count;
   if (call_arg_count > 32) {

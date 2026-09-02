@@ -2,6 +2,7 @@
 #include "codegen/binary/strength_rules.h"
 #include "codegen/binary_emitter.h"
 #include "codegen/binary_emitter_internal.h"
+#include "codegen/target.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -2499,6 +2500,30 @@ static int encode_call_instruction(const Arm64Scope *scope,
       }
       break;
     }
+    if (strcmp(in->text, IR_SYSCALL_CALL_NAME) == 0) {
+      size_t syscall_arguments =
+          in->argument_count > 0 ? in->argument_count - 1 : 0;
+      if (in->argument_count == 0 ||
+          syscall_arguments > MTLC_SYSCALL_MAX_ARGUMENTS_SVC) {
+        arm64_fail(e,
+                   "'%s' makes a system call with %llu arguments; this target "
+                   "passes at most %d",
+                   fn->name, (unsigned long long)syscall_arguments,
+                   MTLC_SYSCALL_MAX_ARGUMENTS_SVC);
+        break;
+      }
+      for (size_t k = 0; k < syscall_arguments; k++) {
+        load_into(e, slots, &in->arguments[k + 1], (Arm64Reg)(ARM64_X0 + k));
+      }
+      load_into(e, slots, &in->arguments[0], ARM64_X8);
+      arm64_emit_word(e, ARM64_SVC0);
+      if (in->dest.kind == IR_OPERAND_TEMP ||
+          in->dest.kind == IR_OPERAND_SYMBOL) {
+        store_dest(e, slots, &in->dest, ARM64_X0);
+      }
+      break;
+    }
+
     if (!emit_call_arguments(e, slots, prog, fs, in)) break;
 
     int callee_sret = fn_aggregate_return_size(prog, in->text);

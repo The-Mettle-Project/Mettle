@@ -261,6 +261,7 @@ typedef enum {
    * either survives. */
   MIR_REP_MOVSB,  /* memcpy(arg0, arg1, arg2) -> rax */
   MIR_REP_STOSB,  /* memset(arg0, arg1, arg2) -> rax */
+  MIR_SYSCALL,
   MIR_STORE_OUTARG,/* store outgoing stack call argument a to [rsp + b.imm].
                       Used for the 5th+ GP argument (beyond the ABI's argument
                       registers); the prologue reserves the outgoing region. The

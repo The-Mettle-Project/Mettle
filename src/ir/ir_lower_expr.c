@@ -270,6 +270,56 @@ int ir_lower_call_expression(IRLoweringContext *context,
     return 1;
   }
 
+  if (strcmp(call->function_name, "syscall") == 0) {
+    if (call->argument_count == 0) {
+      ir_set_error(context, "Malformed system call reached IR lowering");
+      return 0;
+    }
+    IROperand destination = ir_operand_none();
+    if (!ir_make_temp_operand(context, &destination)) {
+      return 0;
+    }
+    IROperand *operands = calloc(call->argument_count, sizeof(IROperand));
+    if (!operands) {
+      ir_operand_destroy(&destination);
+      ir_set_error(context, "Out of memory while lowering a system call");
+      return 0;
+    }
+    for (size_t i = 0; i < call->argument_count; i++) {
+      if (!ir_lower_expression(context, function, call->arguments[i],
+                               &operands[i])) {
+        for (size_t j = 0; j < i; j++) {
+          ir_operand_destroy(&operands[j]);
+        }
+        free(operands);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
+    }
+    IRInstruction instruction = {0};
+    instruction.op = IR_OP_CALL;
+    instruction.text = (char *)IR_SYSCALL_CALL_NAME;
+    instruction.location = expression->location;
+    instruction.dest = destination;
+    instruction.arguments = operands;
+    instruction.argument_count = call->argument_count;
+    instruction.value_type =
+        expression->resolved_type
+            ? mtlc_type_from_frontend(expression->resolved_type)
+            : NULL;
+    int emitted = ir_emit(context, function, &instruction);
+    for (size_t i = 0; i < call->argument_count; i++) {
+      ir_operand_destroy(&operands[i]);
+    }
+    free(operands);
+    if (!emitted) {
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+    *out_value = destination;
+    return 1;
+  }
+
   /* String interpolation conversion. The parser wraps each "{expr}" in
    * __mtl_interp(); rewrite it here to the runtime helper the value's type
    * picks, the same injected-call scheme mettle_string_eq uses. A string value

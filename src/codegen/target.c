@@ -152,3 +152,18 @@ int mtlc_target_is_object_capable(const MtlcTarget *target) {
   }
   return target->code_bits == 64;
 }
+
+int mtlc_target_syscall_max_arguments(const MtlcTarget *target) {
+  if (!target || target->code_bits != 64) {
+    return -1;
+  }
+  if (target->arch == MTLC_TARGET_ARCH_AARCH64) {
+    return MTLC_SYSCALL_MAX_ARGUMENTS_SVC;
+  }
+  if (target->arch != MTLC_TARGET_ARCH_X86_64) {
+    return -1;
+  }
+  return target->os == MTLC_TARGET_OS_WINDOWS
+             ? MTLC_SYSCALL_MAX_ARGUMENTS_NT
+             : MTLC_SYSCALL_MAX_ARGUMENTS_SYSV;
+}

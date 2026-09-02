@@ -943,6 +943,42 @@ static int mir_call_is_runtime_trap(const IRInstruction *in) {
                       strcmp(in->text, "mettle_crash_trap") == 0);
 }
 
+static const BinaryGpRegister MIR_SYSCALL_SYSV_REGISTERS[] = {
+    BINARY_GP_RDI, BINARY_GP_RSI, BINARY_GP_RDX,
+    BINARY_GP_R10, BINARY_GP_R8,  BINARY_GP_R9};
+static const BinaryGpRegister MIR_SYSCALL_NT_REGISTERS[] = {
+    BINARY_GP_R10, BINARY_GP_RDX, BINARY_GP_R8, BINARY_GP_R9};
+#define MIR_SYSCALL_NT_STACK_OFFSET 0x28
+
+static int mir_call_is_syscall(const IRInstruction *in) {
+  return in->text && strcmp(in->text, IR_SYSCALL_CALL_NAME) == 0;
+}
+
+static int mir_syscall_operand_split(const IRInstruction *in,
+                                     const BinaryGpRegister **registers_out,
+                                     size_t *register_count_out,
+                                     size_t *stacked_out) {
+  const BinaryAbi *abi = code_generator_binary_active_abi();
+  int nt = abi->shadow_space_size > 0;
+  size_t register_count =
+      nt ? sizeof(MIR_SYSCALL_NT_REGISTERS) / sizeof(*MIR_SYSCALL_NT_REGISTERS)
+         : sizeof(MIR_SYSCALL_SYSV_REGISTERS) /
+               sizeof(*MIR_SYSCALL_SYSV_REGISTERS);
+  size_t arguments = 0;
+
+  if (in->argument_count == 0) {
+    return 0;
+  }
+  arguments = in->argument_count - 1;
+  if (arguments > register_count && !nt) {
+    return 0;
+  }
+  *registers_out = nt ? MIR_SYSCALL_NT_REGISTERS : MIR_SYSCALL_SYSV_REGISTERS;
+  *register_count_out = register_count;
+  *stacked_out = arguments > register_count ? arguments - register_count : 0;
+  return 1;
+}
+
 /* The zero-fill lowering emits for an aggregate local declared without an
  * initializer. It names memset, which the call lowering turns into an inline
  * rep stos rather than a call, so nothing about it needs a declared callee --
@@ -1253,6 +1289,22 @@ static int mir_call_is_supported(CodeGenerator *g,
     return 1;
   }
   if (mir_call_is_inline_zero_fill(in)) {
+    return 1;
+  }
+  if (mir_call_is_syscall(in)) {
+    const BinaryGpRegister *registers = NULL;
+    size_t register_count = 0;
+    size_t stacked = 0;
+    if (!mir_syscall_operand_split(in, &registers, &register_count, &stacked)) {
+      mir_call_trace("syscall_args>max");
+      return 0;
+    }
+    for (size_t a = 0; a < in->argument_count; a++) {
+      if (in->arguments[a].kind == IR_OPERAND_STRING) {
+        mir_call_trace("syscall_string_operand");
+        return 0;
+      }
+    }
     return 1;
   }
   if (in->argument_count > MIR_MAX_PARAMS) {
@@ -4757,6 +4809,78 @@ if (mir_call_is_runtime_trap(in)) {
   return 1;
 }
 
+static int mir_lower_syscall(MirFunction *fn, CodeGenerator *g,
+                             BinaryFunctionContext *ctx, MirNameMap *map,
+                             const IRInstruction *in) {
+  const BinaryGpRegister *registers = NULL;
+  size_t register_count = 0;
+  size_t stacked = 0;
+  size_t arguments = 0;
+
+  if (!mir_syscall_operand_split(in, &registers, &register_count, &stacked)) {
+    fn->has_error = 1;
+    return 0;
+  }
+  arguments = in->argument_count - 1;
+  if (stacked > 0) {
+    const BinaryAbi *abi = code_generator_binary_active_abi();
+    int needed = MIR_SYSCALL_NT_STACK_OFFSET - abi->shadow_space_size +
+                 (int)(stacked * 8u);
+    if (needed > fn->outgoing_stack_bytes) {
+      fn->outgoing_stack_bytes = needed;
+    }
+    for (size_t k = 0; k < stacked; k++) {
+      MirOperand value = mir_value_operand(
+          fn, g, ctx, map, &in->arguments[register_count + 1 + k]);
+      if (!mir_emit1(fn, MIR_STORE_OUTARG, mir_op_none(), value,
+                     mir_op_imm(MIR_SYSCALL_NT_STACK_OFFSET + (int)(k * 8u)), 8,
+                     0, 0)) {
+        return 0;
+      }
+    }
+  }
+  for (size_t k = 0; k < arguments && k < register_count; k++) {
+    if (registers[k] == BINARY_GP_R10) {
+      continue;
+    }
+    MirOperand value = mir_value_operand(fn, g, ctx, map, &in->arguments[k + 1]);
+    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(registers[k], MIR_RC_GP), value,
+                   mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+  }
+  {
+    MirOperand number = mir_value_operand(fn, g, ctx, map, &in->arguments[0]);
+    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RAX, MIR_RC_GP), number,
+                   mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+  }
+  for (size_t k = 0; k < arguments && k < register_count; k++) {
+    if (registers[k] != BINARY_GP_R10) {
+      continue;
+    }
+    MirOperand value = mir_value_operand(fn, g, ctx, map, &in->arguments[k + 1]);
+    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R10, MIR_RC_GP), value,
+                   mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+  }
+  if (!mir_emit1(fn, MIR_SYSCALL, mir_op_none(), mir_op_none(), mir_op_none(),
+                 8, 0, 0)) {
+    return 0;
+  }
+  if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
+    return 1;
+  }
+  {
+    MirOperand destination = mir_value_operand(fn, g, ctx, map, &in->dest);
+    return mir_emit1(fn, MIR_MOV, destination,
+                     mir_op_phys(BINARY_GP_RAX, MIR_RC_GP), mir_op_none(), 8, 0,
+                     0);
+  }
+}
+
 static int mir_marshal_stack_args(const MirCallArgs *c) {
   MirFunction *fn = c->fn;
   CodeGenerator *g = c->g;
@@ -5119,6 +5243,9 @@ static int mir_lower_call(MirFunction *fn, CodeGenerator *g,
      * trap arguments (kind, pc, rbp) are unused on that path. */
     if (mir_call_is_runtime_trap(in)) {
       return mir_lower_runtime_trap(fn, in);
+    }
+    if (mir_call_is_syscall(in)) {
+      return mir_lower_syscall(fn, g, ctx, map, in);
     }
     /* Declare external callees so the linker resolves the relocation. */
     IRFunction *target = code_generator_find_ir_function_binary(g, in->text);

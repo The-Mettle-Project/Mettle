@@ -259,6 +259,73 @@ is the older Linux-only path. Its socket, error, atomic, and yield names come
 from Mettle's own syscall runtime, so no helper C source and no pthread flag
 is needed.
 
+## System calls
+
+`syscall` asks the kernel directly. It is a built-in, not a function: the
+compiler writes the machine's system-call instruction where the call appears,
+so there is no stub to link against and nothing to resolve.
+
+```mettle
+var written: int64 = syscall(1, 1, &message[0], 12);   // Linux write(2)
+```
+
+The first operand is the system-call number and the rest are its arguments. An
+argument is an integer, a boolean, a character, or a pointer - whatever fits
+one register. A float or a struct is refused rather than reinterpreted, and a
+`string` is a two-word record, so pass `&text[0]` or a `cstring`.
+
+The result is the whole register the kernel returns, which is a count or a
+negative errno on Linux and an NTSTATUS on Windows.
+
+| Target | Number | Arguments | Instruction |
+| --- | --- | --- | --- |
+| x86-64 Linux | RAX | RDI, RSI, RDX, R10, R8, R9 | `syscall` |
+| x86-64 Windows | EAX | R10, RDX, R8, R9, then `[rsp+0x28]` onward | `syscall` |
+| AArch64 Linux | X8 | X0..X5 | `svc #0` |
+
+Linux fills its six argument registers and has nowhere to put a seventh, so
+seven arguments is a compile error there. Windows reads the rest off the stack
+and accepts up to fifteen. Both numbers come from the selected target, so
+`--target x86_64-linux` is checked against Linux's limit whatever host you are
+compiling on.
+
+The instruction clobbers RCX and R11 on x86-64. Both are caller-saved under
+either convention, so nothing you were holding is lost.
+
+### On Windows, read the number rather than writing it
+
+NT system-call numbers change between Windows builds and are not an interface
+Microsoft keeps. The number every version agrees on is the one inside the
+`ntdll` stub that would otherwise issue the call, which opens with
+`mov r10, rcx` (`4C 8B D1`) and then `mov eax, <number>` (`B8` and four bytes):
+
+```mettle
+extern fn GetModuleHandleA(name: cstring) -> rawptr = "GetModuleHandleA";
+extern fn GetProcAddress(module: rawptr, name: cstring) -> rawptr = "GetProcAddress";
+
+fn ntdll_number(name: cstring) -> int64 {
+    var stub: rawptr = GetProcAddress(GetModuleHandleA("ntdll.dll"), name);
+    var code: uint8* = (uint8*)stub;
+    var number: int64 = (int64)code[4];
+    number = number | ((int64)code[5] << 8);
+    number = number | ((int64)code[6] << 16);
+    number = number | ((int64)code[7] << 24);
+    return number;
+}
+```
+
+Going around `ntdll` also goes around everything it does on the way through, so
+prefer the documented Win32 entry points above for ordinary work. A raw system
+call is for the cases that have no documented entry point.
+
+### Where it is refused
+
+A GPU kernel has no operating system to ask, and a 16- or 32-bit target has no
+instruction the built-in knows how to write; both are compile errors. The
+compile-time interpreter refuses it too, so a `@test` calling one is reported
+as skipped rather than passing on a number nothing performed. Run such code
+natively through `main` and `--build`.
+
 ## See also
 
 - [Runtime model](runtime-model.md)

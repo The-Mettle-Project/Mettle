@@ -241,6 +241,7 @@ const char *mir_opcode_name(MirOpcode op) {
   case MIR_CALL_INDIRECT: return "call_indirect";
   case MIR_REP_MOVSB: return "rep_movsb";
   case MIR_REP_STOSB: return "rep_stosb";
+  case MIR_SYSCALL: return "syscall";
   case MIR_STORE_OUTARG: return "store_outarg";
   case MIR_LEA_OUTARG: return "lea_outarg";
   case MIR_TRAP: return "trap";

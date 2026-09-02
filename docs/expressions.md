@@ -180,6 +180,20 @@ which has a function-pointer type. It does not call it.
 `typeof(T)` is a compile-time `Type` value, for use with
 [`comptime for`](control-flow.md).
 
+## syscall
+
+`syscall(number, ...)` is the machine's system-call instruction, written where
+the call appears. The first operand is the number and the rest are its
+arguments; the result is the register the kernel returns.
+
+```mettle
+var written: int64 = syscall(1, 1, &message[0], 12);   // Linux write(2)
+```
+
+[C interoperability](c-interop.md) has the register conventions, the argument
+ceiling per target, and why a Windows number is read out of `ntdll` rather than
+written down.
+
 ## Lambdas
 
 A lambda is an expression:

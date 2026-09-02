@@ -3535,6 +3535,86 @@ int code_generator_binary_validate_indirect_call(
   return 1;
 }
 
+static const BinaryGpRegister BINARY_SYSCALL_SYSV_REGISTERS[] = {
+    BINARY_GP_RDI, BINARY_GP_RSI, BINARY_GP_RDX,
+    BINARY_GP_R10, BINARY_GP_R8,  BINARY_GP_R9};
+static const BinaryGpRegister BINARY_SYSCALL_NT_REGISTERS[] = {
+    BINARY_GP_R10, BINARY_GP_RDX, BINARY_GP_R8, BINARY_GP_R9};
+#define BINARY_SYSCALL_NT_STACK_OFFSET 0x28
+
+static int code_generator_binary_emit_syscall_inline(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRInstruction *instruction) {
+  const BinaryAbi *abi = code_generator_binary_active_abi();
+  int nt = abi->shadow_space_size > 0;
+  const BinaryGpRegister *registers =
+      nt ? BINARY_SYSCALL_NT_REGISTERS : BINARY_SYSCALL_SYSV_REGISTERS;
+  size_t register_count = nt ? sizeof(BINARY_SYSCALL_NT_REGISTERS) /
+                                   sizeof(*BINARY_SYSCALL_NT_REGISTERS)
+                             : sizeof(BINARY_SYSCALL_SYSV_REGISTERS) /
+                                   sizeof(*BINARY_SYSCALL_SYSV_REGISTERS);
+  size_t argument_count = 0;
+  size_t stacked = 0;
+  uint32_t reserved = 0;
+
+  if (instruction->argument_count == 0) {
+    code_generator_set_error(generator,
+                             "System call without a number in function '%s'",
+                             context->function_name);
+    return 0;
+  }
+  argument_count = instruction->argument_count - 1;
+  stacked = argument_count > register_count ? argument_count - register_count
+                                            : 0;
+  if (stacked > 0 && !nt) {
+    code_generator_set_error(
+        generator,
+        "System call in function '%s' passes %llu arguments; this target has "
+        "%llu argument registers and no stack slots",
+        context->function_name, (unsigned long long)argument_count,
+        (unsigned long long)register_count);
+    return 0;
+  }
+  if (stacked > 0) {
+    reserved = (uint32_t)(BINARY_SYSCALL_NT_STACK_OFFSET + stacked * 8u);
+    reserved = (reserved + 15u) & ~15u;
+    if (!binary_emit_sub_rsp_imm32(&context->code, reserved)) {
+      return 0;
+    }
+    for (size_t i = 0; i < stacked; i++) {
+      const IROperand *operand =
+          &instruction->arguments[register_count + 1 + i];
+      if (!code_generator_binary_emit_operand_load(generator, context, operand,
+                                                   BINARY_GP_RAX) ||
+          !binary_emit_mov_mem_reg(
+              &context->code, BINARY_GP_RSP,
+              BINARY_SYSCALL_NT_STACK_OFFSET + (int)(i * 8), BINARY_GP_RAX)) {
+        return 0;
+      }
+    }
+  }
+  for (size_t i = 0; i < argument_count && i < register_count; i++) {
+    if (!code_generator_binary_emit_operand_load(
+            generator, context, &instruction->arguments[i + 1], registers[i])) {
+      return 0;
+    }
+  }
+  if (!code_generator_binary_emit_operand_load(
+          generator, context, &instruction->arguments[0], BINARY_GP_RAX) ||
+      !binary_emit_syscall(&context->code)) {
+    return 0;
+  }
+  if (reserved > 0 && !binary_emit_add_rsp_imm32(&context->code, reserved)) {
+    return 0;
+  }
+  if (instruction->dest.kind == IR_OPERAND_NONE) {
+    return 1;
+  }
+  return code_generator_binary_emit_destination_store(generator, context,
+                                                      &instruction->dest,
+                                                      BINARY_GP_RAX);
+}
+
 int code_generator_binary_emit_call(CodeGenerator *generator,
                                            BinaryFunctionContext *context,
                                            const IRInstruction *instruction) {
@@ -3544,6 +3624,11 @@ int code_generator_binary_emit_call(CodeGenerator *generator,
   if (!generator || !context || !instruction || !instruction->text ||
       instruction->text[0] == '\0') {
     return 0;
+  }
+
+  if (strcmp(instruction->text, IR_SYSCALL_CALL_NAME) == 0) {
+    return code_generator_binary_emit_syscall_inline(generator, context,
+                                                     instruction);
   }
 
   if (strcmp(instruction->text, "mettle_crash_trap") == 0 ||

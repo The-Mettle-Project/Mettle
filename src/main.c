@@ -520,6 +520,8 @@ static int print_help_topic(const char *program_name, const char *argv0,
     printf("  Declare external C functions with extern fn.\n");
     printf("  Prefer std/win32 for common Windows OS APIs.\n");
     printf("  Use --link-arg for extra linker libraries in --build mode.\n");
+    printf("  syscall(number, ...) asks the kernel directly, with no stub to "
+           "link.\n");
     printf("  Example:\n");
     printf("    mettle --build --emit-obj --linker internal main.mettle -o "
            "main.exe\n");

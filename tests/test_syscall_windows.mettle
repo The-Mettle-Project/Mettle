@@ -1,0 +1,61 @@
+extern fn GetModuleHandleA(name: cstring) -> rawptr = "GetModuleHandleA";
+extern fn GetProcAddress(module: rawptr, name: cstring) -> rawptr = "GetProcAddress";
+
+fn ntdll_number(name: cstring) -> int64 {
+    var ntdll: rawptr = GetModuleHandleA("ntdll.dll")
+    var stub: rawptr = GetProcAddress(ntdll, name)
+    var code: uint8* = (uint8*)stub
+    if (code[0] != 76) {
+        return -1
+    }
+    if (code[1] != 139) {
+        return -1
+    }
+    if (code[2] != 209) {
+        return -1
+    }
+    if (code[3] != 184) {
+        return -1
+    }
+    var number: int64 = (int64)code[4]
+    number = number | ((int64)code[5] << 8)
+    number = number | ((int64)code[6] << 16)
+    number = number | ((int64)code[7] << 24)
+    return number
+}
+
+fn main() -> int32 {
+    var allocate: int64 = ntdll_number("NtAllocateVirtualMemory")
+    if (allocate < 0) {
+        return 10
+    }
+    var release: int64 = ntdll_number("NtFreeVirtualMemory")
+    if (release < 0) {
+        return 11
+    }
+
+    var base: int64 = 0
+    var size: int64 = 4096
+    if (syscall(allocate, -1, &base, 0, &size, 12288, 4) != 0) {
+        return 12
+    }
+    if (base == 0) {
+        return 13
+    }
+
+    var bytes: uint8* = (uint8*)base
+    var i: int64 = 0
+    while (i < 8) {
+        bytes[i] = (uint8)(65 + i)
+        i = i + 1
+    }
+    if (bytes[7] != 72) {
+        return 14
+    }
+
+    size = 0
+    if (syscall(release, -1, &base, &size, 32768) != 0) {
+        return 15
+    }
+    return 0
+}

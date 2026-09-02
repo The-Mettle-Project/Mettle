@@ -1,0 +1,38 @@
+fn main() -> int32 {
+    var page: int64 = syscall(9, 0, 4096, 3, 34, -1, 0)
+    if (page < 0) {
+        return 10
+    }
+
+    var bytes: uint8* = (uint8*)page
+    var i: int64 = 0
+    while (i < 8) {
+        bytes[i] = (uint8)(65 + i)
+        i = i + 1
+    }
+
+    var written: int64 = syscall(1, 1, bytes, 8)
+    if (written != 8) {
+        return 11
+    }
+
+    var nothing: int64 = syscall(1, 1, bytes, 0)
+    if (nothing != 0) {
+        return 12
+    }
+
+    var refused: int64 = syscall(1, -1, bytes, 8)
+    if (refused != -9) {
+        return 13
+    }
+
+    var pid: int64 = syscall(39)
+    if (pid <= 0) {
+        return 14
+    }
+
+    if (syscall(11, page, 4096) != 0) {
+        return 15
+    }
+    return 0
+}
