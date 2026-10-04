@@ -1,0 +1,23 @@
+struct F2 {
+  a: float32;
+  b: float32;
+}
+
+@inline fn make2(x: float32*, i: int32) -> F2 {
+  var r: F2;
+  r.a = x[i];
+  r.b = x[i + 1];
+  return r;
+}
+
+@inline fn sum2(r: F2) -> float32 {
+  return r.a + r.b;
+}
+
+@inline fn put2(r: F2, out: float32*, i: int32) {
+  out[i] = sum2(r);
+}
+
+kernel(block = 32) inline_record_handoff(x: float32*, out: float32*) {
+  put2(make2(x, thread.x * 2), out, thread.x);
+}

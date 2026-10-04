@@ -14809,6 +14809,7 @@ $script:MetalAccepted = @(
   "tests/gpu/compute_kernels.mettle",
   "tests/gpu/device_decorators.mettle",
   "tests/gpu/generic_shared_helper.mettle",
+  "tests/gpu/inline_record_handoff.mettle",
   "tests/gpu/layouts.mettle",
   "tests/gpu/native_indices.mettle",
   "tests/gpu/qwen3_typed_kernels.mettle",
@@ -15702,6 +15703,7 @@ catch {
 $ptxas = Get-Command ptxas -ErrorAction SilentlyContinue
 foreach ($src in @("tests/gpu/compute_kernels.mettle",
                    "tests/gpu/record_kernels.mettle",
+                   "tests/gpu/inline_record_handoff.mettle",
                    "tests/gpu/subgroup_shuffle.mettle",
                    "tests/gpu/atomic_kernels.mettle",
                    "tests/gpu/async_copy.mettle",

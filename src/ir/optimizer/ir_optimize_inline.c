@@ -559,10 +559,18 @@ static int ir_clone_instruction_for_inline(const IRInstruction *source,
 }
 
 static int ir_append_parameter_materialization(
-    IRInstructionVector *vector, const IRInstruction *call_instruction,
-    const IRFunction *callee, IRNameMap *symbol_map) {
+    const IRProgram *program, IRInstructionVector *vector,
+    const IRInstruction *call_instruction, const IRFunction *callee,
+    IRNameMap *symbol_map) {
   if (!vector || !call_instruction || !callee || !symbol_map) {
     return 0;
+  }
+  const IRModuleSymbol *callee_symbol =
+      ir_program_lookup_symbol(program, callee->name);
+  if (callee_symbol && (callee_symbol->kind != IR_MODSYM_FUNCTION ||
+                        callee_symbol->param_count != callee->parameter_count ||
+                        !callee_symbol->param_types)) {
+    callee_symbol = NULL;
   }
 
   for (size_t i = 0; i < callee->parameter_count; i++) {
@@ -587,6 +595,8 @@ static int ir_append_parameter_materialization(
     declare_local.location = call_instruction->location;
     declare_local.dest = ir_operand_symbol(mapped_name);
     declare_local.text = mettle_strdup(type_name);
+    declare_local.value_type =
+        callee_symbol ? callee_symbol->param_types[i] : NULL;
     if (!declare_local.dest.name || !declare_local.text ||
         !ir_instruction_vector_append_move(vector, &declare_local)) {
       ir_instruction_destroy_storage(&declare_local);
@@ -776,7 +786,8 @@ static int ir_inline_value_fits_return(const IRFunction *callee,
   }
 }
 
-static int ir_inline_call_instruction(IRInstructionVector *vector,
+static int ir_inline_call_instruction(const IRProgram *program,
+                                      IRInstructionVector *vector,
                                       const IRInstruction *call_instruction,
                                       const IRFunction *callee,
                                       size_t inline_site_id) {
@@ -836,8 +847,8 @@ static int ir_inline_call_instruction(IRInstructionVector *vector,
     }
   }
 
-  if (!ir_append_parameter_materialization(vector, call_instruction, callee,
-                                           &symbol_map)) {
+  if (!ir_append_parameter_materialization(program, vector, call_instruction,
+                                           callee, &symbol_map)) {
     goto cleanup;
   }
 
@@ -1071,7 +1082,7 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
             ir_explain_remark_trivial();
           }
         }
-        if (!ir_inline_call_instruction(&vector, instruction, callee,
+        if (!ir_inline_call_instruction(program, &vector, instruction, callee,
                                         (*inline_counter)++)) {
           ir_instruction_vector_destroy(&vector);
           free(in_loop);
@@ -1168,7 +1179,8 @@ static int ir_function_is_self_inline_candidate(const IRFunction *function,
   return has_return && self_calls > 0;
 }
 
-static int ir_inline_self_calls_once(IRFunction *function,
+static int ir_inline_self_calls_once(const IRProgram *program,
+                                     IRFunction *function,
                                      size_t *inline_counter, int *changed) {
   IRInstructionVector vector = {0};
   int local_changed = 0;
@@ -1180,7 +1192,7 @@ static int ir_inline_self_calls_once(IRFunction *function,
     if (instruction->op == IR_OP_CALL && instruction->text &&
         strcmp(instruction->text, function->name) == 0 &&
         instruction->argument_count == function->parameter_count) {
-      if (!ir_inline_call_instruction(&vector, instruction, function,
+      if (!ir_inline_call_instruction(program, &vector, instruction, function,
                                       (*inline_counter)++)) {
         ir_instruction_vector_destroy(&vector);
         return 0;
@@ -1237,7 +1249,7 @@ int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
         break;
       }
       int round_changed = 0;
-      if (!ir_inline_self_calls_once(function, &inline_counter,
+      if (!ir_inline_self_calls_once(program, function, &inline_counter,
                                      &round_changed)) {
         return 0;
       }
