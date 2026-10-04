@@ -15646,6 +15646,55 @@ catch {
   Write-CaseResult -Name "gpu_emit_kernel_decls" -Passed $false -Reason $_.Exception.Message
 }
 
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $importDir = Join-Path $tmpDir "kernel_decls_import"
+  New-Item -ItemType Directory -Force -Path $importDir | Out-Null
+  Set-Content -LiteralPath (Join-Path $importDir "k.mettle") -Encoding ascii -Value @'
+kernel(block = 32) fill(out: float32*, v: float32) {
+  out[thread.x] = v;
+}
+'@
+  Set-Content -LiteralPath (Join-Path $importDir "mid.mettle") -Encoding ascii -Value @'
+import "std/gpu";
+import "k_decls";
+
+export fn run(dst: int64) {
+  var st: int64 = gpu_stream_create();
+  dispatch fill[grid: (1, 1, 1), block: (32, 1, 1), stream: st](dst, (float32)1.0);
+  gpu_sync();
+}
+'@
+  Set-Content -LiteralPath (Join-Path $importDir "main.mettle") -Encoding ascii -Value @'
+import "std/gpu";
+import "mid";
+
+fn main() -> int32 {
+  if (gpu_open_kernels("k") == 0) { return 1; }
+  run(gpu_malloc(128));
+  return 0;
+}
+'@
+  $kDecls = Join-Path $importDir "k_decls.mettle"
+  $kOut = & $CompilerPath --emit-ptx (Join-Path $importDir "k.mettle") `
+    -o (Join-Path $importDir "k.ptx") "--emit-kernel-decls=$kDecls" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "--emit-kernel-decls failed: $kOut" }
+  $mainObj = Join-Path $importDir "main.obj"
+  $mainOut = & $CompilerPath --dump-ir (Join-Path $importDir "main.mettle") -o $mainObj 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "host importing the dispatching module failed: $mainOut" }
+  $mainIr = Get-Content -Raw -LiteralPath "$mainObj.ir"
+  if ($mainIr -notmatch 'mtlc_gpu_kernel_handle\("fill"\)') {
+    $handle = [regex]::Match($mainIr, 'mtlc_gpu_kernel_handle\("[^"]*"\)').Value
+    throw "a dispatch inside an imported module resolves the wrong kernel name: $handle"
+  }
+  Write-CaseResult -Name "gpu_dispatch_from_imported_module" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "gpu_dispatch_from_imported_module" -Passed $false -Reason $_.Exception.Message
+}
+
 # When NVIDIA's ptxas is installed, each portable module is assembled too; a
 # second GB10-specific gate assembles sm_121a when the installed toolkit knows
 # that target. This keeps non-NVIDIA CI useful without weakening the DGX Spark

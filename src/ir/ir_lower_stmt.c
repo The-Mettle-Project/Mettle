@@ -1771,6 +1771,15 @@ static int ir_lower_gpu_launch(IRLoweringContext *context,
   if (launch->typed_kernel && launch->kernel &&
       launch->kernel->type == AST_IDENTIFIER && launch->kernel->data) {
     const char *kernel_name = ((Identifier *)launch->kernel->data)->name;
+    Symbol *kernel_symbol =
+        kernel_name && context->type_checker
+            ? symbol_table_lookup(context->type_checker->symbol_table,
+                                  kernel_name)
+            : NULL;
+    if (kernel_symbol && kernel_symbol->is_extern && kernel_symbol->link_name &&
+        kernel_symbol->link_name[0]) {
+      kernel_name = kernel_symbol->link_name;
+    }
     IROperand name_argument = ir_operand_string(kernel_name ? kernel_name : "");
     IRInstruction resolve = {0};
     if (!ir_make_temp_operand(context, &kernel)) {
