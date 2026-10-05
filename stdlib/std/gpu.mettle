@@ -413,6 +413,37 @@ export fn mtlc_gpu_launch_checked(f: int64,
   __mtlc_gpu_process_exit(rc);
 }
 
+export fn gpu_launch_indirect(f: int64, counts: int64,
+                              bx: int32, by: int32, bz: int32,
+                              shared_bytes: int32, stream: int64,
+                              params: int64*, nargs: int32) -> int32 {
+  var grid: uint32[3];
+  var rc: int32 = cuCtxSynchronize();
+  if (rc != 0) { return rc; }
+  rc = cuMemcpyDtoH_v2((uint8*)&grid[0], counts, 12);
+  if (rc != 0) { return rc; }
+  if (grid[0] == (uint32)0 || grid[1] == (uint32)0 || grid[2] == (uint32)0) {
+    return 0;
+  }
+  return gpu_launch_3d(f, (int32)grid[0], (int32)grid[1], (int32)grid[2],
+                       bx, by, bz, shared_bytes, stream, params, nargs);
+}
+
+export fn mtlc_gpu_launch_indirect_checked(f: int64, counts: int64,
+                                           bx: int32, by: int32, bz: int32,
+                                           shared_bytes: int32, stream: int64,
+                                           params: int64*, nargs: int32) {
+  var rc: int32 = gpu_launch_indirect(f, counts, bx, by, bz, shared_bytes,
+                                      stream, params, nargs);
+  if (rc == 0) { return; }
+  var err: cstring = __mtlc_gpu_iob(2);
+  __mtlc_gpu_fputs(__mtlc_gpu_cstr("mettle: GPU launch of "), err);
+  __mtlc_gpu_fputs(__mtlc_gpu_kernel_name(f), err);
+  __mtlc_gpu_note(" failed with its grid read from the device, block {bx}x{by}x{bz}, {shared_bytes} shared bytes\n");
+  __mtlc_gpu_report("  driver status", rc);
+  __mtlc_gpu_process_exit(rc);
+}
+
 @inline export fn gpu_launch_on(f: int64, grid: int32, block: int32,
                         stream: int64, params: int64*, nargs: int32) -> int32 {
   return gpu_launch_3d(f, grid, 1, 1, block, 1, 1, 0, stream,

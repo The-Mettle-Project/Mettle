@@ -1,0 +1,6 @@
+fn main() -> int32 {
+  var handle: int64 = 0;
+  var counts: float32 = 0.0;
+  dispatch handle[grid_indirect: counts, block: (32, 1, 1)]();
+  return 0;
+}

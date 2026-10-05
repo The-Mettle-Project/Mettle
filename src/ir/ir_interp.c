@@ -5334,6 +5334,28 @@ static const char *ii_gpu_launch_kernel_name(IIFrame *frame,
 #include "ir_interp_gpu.inc"
 #include "ir_interp_numerics.inc"
 
+static int ii_gpu_launch_grid(IRInterpMachine *machine,
+                              const IRInstruction *insn,
+                              const IRInterpValue *controls_value,
+                              long long grid[3]) {
+  for (size_t d = 0; d < 3; d++) {
+    grid[d] = controls_value[d].i > 0 ? controls_value[d].i : 1;
+  }
+  if (!ir_gpu_launch_is_indirect(insn)) {
+    return 1;
+  }
+  for (size_t d = 0; d < 3; d++) {
+    unsigned long long count = 0;
+    if (!ii_mem_read(machine,
+                     (unsigned long long)controls_value[0].i + 4u * d, 4,
+                     &count)) {
+      return 0;
+    }
+    grid[d] = (long long)count;
+  }
+  return 1;
+}
+
 static int ii_op_gpu_launch(IRInterpMachine *machine, IIFrame *frame,
                             const IRInstruction *insn, size_t index) {
   const size_t controls = 8;
@@ -5375,11 +5397,16 @@ static int ii_op_gpu_launch(IRInterpMachine *machine, IIFrame *frame,
       return 0;
     }
   }
+  if (!ii_gpu_launch_grid(machine, insn, controls_value, grid)) {
+    return 0;
+  }
   for (size_t d = 0; d < 3; d++) {
-    grid[d] = controls_value[d].i > 0 ? controls_value[d].i : 1;
     block[d] = controls_value[3 + d].i > 0 ? controls_value[3 + d].i : 1;
   }
   total_threads = grid[0] * grid[1] * grid[2] * block[0] * block[1] * block[2];
+  if (grid[0] == 0 || grid[1] == 0 || grid[2] == 0) {
+    return 1;
+  }
   if (total_threads <= 0 || total_threads > II_GPU_MAX_THREADS) {
     snprintf(machine->detail, sizeof(machine->detail),
              "dispatch of '%s' asks for %lld work items; `mettle test` runs at "

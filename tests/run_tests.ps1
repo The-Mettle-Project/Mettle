@@ -2655,7 +2655,7 @@ $cases = @(
   @{ Name = "gpu_grid_on_the_cpu"; Path = "tests/gpu/grid_on_the_cpu.mettle"; ShouldSucceed = $true
      Args = @("test")
      SkipBinaryCheck = $true
-     OutputMustMatch = @("2 passed")
+     OutputMustMatch = @("3 passed")
      OutputMustNotMatch = @("failed") },
   @{ Name = "err_gpu_runtime_space_claim"; Path = "tests/err_gpu_runtime_space_claim.mettle"; ShouldSucceed = $false
      Args = @("test")
@@ -2747,6 +2747,8 @@ $cases = @(
   @{ Name = "err_gpu_dispatch_named_shared_type"; Path = "tests/err_gpu_dispatch_named_shared_type.mettle"; ShouldSucceed = $false; Pattern = "integer dynamic shared-memory byte count" },
   @{ Name = "err_gpu_dispatch_named_dimension"; Path = "tests/err_gpu_dispatch_named_dimension.mettle"; ShouldSucceed = $false; Pattern = "GPU grid dimension 1 must be greater than zero" },
   @{ Name = "err_gpu_dispatch_named_stream_type"; Path = "tests/err_gpu_dispatch_named_stream_type.mettle"; ShouldSucceed = $false; Pattern = "integer or pointer stream handle" },
+  @{ Name = "err_gpu_dispatch_indirect_with_grid"; Path = "tests/err_gpu_dispatch_indirect_with_grid.mettle"; ShouldSucceed = $false; Pattern = "reads the grid from the device; drop .grid:." },
+  @{ Name = "err_gpu_dispatch_indirect_type"; Path = "tests/err_gpu_dispatch_indirect_type.mettle"; ShouldSucceed = $false; Pattern = "device address of three uint32 threadgroup counts" },
   @{ Name = "err_gpu_nested_launch"; Path = "tests/err_gpu_nested_launch.mettle"; ShouldSucceed = $false; Pattern = "GPU kernel cannot launch another kernel" },
   @{ Name = "err_gpu_workgroup_outside_kernel"; Path = "tests/err_gpu_workgroup_outside_kernel.mettle"; ShouldSucceed = $false; Pattern = "workgroup storage is only legal inside a GPU kernel" },
   @{ Name = "err_gpu_address_space_shape"; Path = "tests/err_gpu_address_space_shape.mettle"; ShouldSucceed = $false; Pattern = "GPU address-space storage requires a statically sized array type" },

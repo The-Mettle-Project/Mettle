@@ -6,6 +6,11 @@ extern fn mtlc_gpu_launch_checked(
     bx: int32, by: int32, bz: int32,
     shared_bytes: int32, stream: int64,
     kernel_params: int64*, nargs: int32) = "mtlc_gpu_launch_checked";
+extern fn mtlc_gpu_launch_indirect_checked(
+    function: int64, counts: int64,
+    bx: int32, by: int32, bz: int32,
+    shared_bytes: int32, stream: int64,
+    kernel_params: int64*, nargs: int32) = "mtlc_gpu_launch_indirect_checked";
 extern fn gpu_stub_finish() -> int32 = "gpu_stub_finish";
 
 fn main() -> int32 {
@@ -23,5 +28,10 @@ fn main() -> int32 {
                   grid: (7, 3, 2),
                   stream: stream,
                   block: (32, 4, 1)](da, db, dc, n, scale);
+
+  var counts: int64 = 4096;
+  dispatch handle[grid_indirect: counts + 16,
+                  block: (64, 2, 1),
+                  shared: 128](da, db, dc, n, scale) on stream;
   return gpu_stub_finish();
 }

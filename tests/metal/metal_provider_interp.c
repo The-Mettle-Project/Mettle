@@ -264,3 +264,26 @@ int mettle_metal_launch(MettleMetal *metal, const char *kernel,
   dispatch.spurious_cas = spurious && spurious[0] == '1';
   return msl_dispatch(metal->program, &dispatch, error, error_size);
 }
+
+int mettle_metal_launch_indirect(MettleMetal *metal, const char *kernel,
+                                 uint64_t counts, const uint32_t block[3],
+                                 const void *args, size_t args_size,
+                                 size_t threadgroup_bytes, char *error,
+                                 size_t error_size) {
+  uint32_t grid[3];
+  const unsigned char *host =
+      metal && mettle_metal_span(metal, counts) >= sizeof(grid)
+          ? (const unsigned char *)mettle_metal_host(metal, counts)
+          : NULL;
+  if (!host || (counts & 3u)) {
+    interp_error(error, error_size,
+                 "an indirect grid is not three aligned uint32 in a buffer");
+    return 0;
+  }
+  memcpy(grid, host, sizeof(grid));
+  if (!grid[0] || !grid[1] || !grid[2]) {
+    return 1;
+  }
+  return mettle_metal_launch(metal, kernel, grid, block, args, args_size,
+                             threadgroup_bytes, error, error_size);
+}

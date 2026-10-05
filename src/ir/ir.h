@@ -211,6 +211,7 @@ typedef struct {
   int allocates;
   unsigned char asm_operands;
   unsigned char uniform_condition;
+  unsigned char gpu_launch_indirect;
   void *ast_ref;
   MtlcType *value_type;
   unsigned char alias_class;
@@ -609,6 +610,7 @@ int ir_instruction_dump(const IRInstruction *instruction,
 int ir_program_route_to_native_heap(IRProgram *program);
 
 int ir_program_lower_gpu_launches(IRProgram *program);
+int ir_gpu_launch_is_indirect(const IRInstruction *instruction);
 int ir_program_build_gpu_call_graph(const IRProgram *program,
                                     IRGpuCallGraph *graph, char **error);
 void ir_gpu_call_graph_destroy(IRGpuCallGraph *graph);

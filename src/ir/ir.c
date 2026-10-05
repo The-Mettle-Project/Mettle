@@ -2764,7 +2764,11 @@ static int ir_format_call_line(const IRInstruction *instruction,
   case IR_OP_GPU_LAUNCH: {
     size_t offset = 0;
     offset += (size_t)snprintf(buffer + offset, buffer_size - offset,
-                               "gpu_launch %s [", lhs);
+                               "gpu_launch%s %s [",
+                               ir_gpu_launch_is_indirect(instruction)
+                                   ? "_indirect"
+                                   : "",
+                               lhs);
     for (size_t arg_i = 0; arg_i < instruction->argument_count; arg_i++) {
       char arg_buffer[128];
       ir_format_operand(&instruction->arguments[arg_i], arg_buffer,
@@ -3785,6 +3789,44 @@ static int ir_gpu_launch_append_layout_slot(IRFunction *out,
   return 1;
 }
 
+int ir_gpu_launch_is_indirect(const IRInstruction *instruction) {
+  return instruction && instruction->op == IR_OP_GPU_LAUNCH &&
+         instruction->gpu_launch_indirect;
+}
+
+static int ir_gpu_launch_append_call(IRFunction *out,
+                                     const IRInstruction *launch, size_t nargs,
+                                     const char *params_base_name) {
+  const int indirect = ir_gpu_launch_is_indirect(launch);
+  IRInstruction call = {0};
+  IROperand call_args[11] = {0};
+  size_t count = 0;
+  call_args[count++] = launch->lhs;
+  for (size_t i = 0; i < IR_GPU_LAUNCH_CONTROL_ARGS; i++) {
+    if (indirect && (i == 1 || i == 2)) {
+      continue;
+    }
+    call_args[count++] = launch->arguments[i];
+  }
+  const size_t params_slot = count;
+  call_args[count++] = nargs > 0 ? ir_operand_temp(params_base_name)
+                                 : ir_operand_int(0);
+  call_args[count++] = ir_operand_int((long long)nargs);
+  call.op = IR_OP_CALL;
+  call.location = launch->location;
+  call.text = indirect ? "mtlc_gpu_launch_indirect_checked"
+                       : "mtlc_gpu_launch_checked";
+  call.arguments = call_args;
+  call.argument_count = count;
+  if ((nargs > 0 && !call_args[params_slot].name) ||
+      !ir_function_append_instruction(out, &call)) {
+    ir_operand_destroy(&call_args[params_slot]);
+    return 0;
+  }
+  ir_operand_destroy(&call_args[params_slot]);
+  return 1;
+}
+
 static int ir_gpu_launch_append_expansion(IRProgram *program, IRFunction *out,
                                           const IRInstruction *launch,
                                           size_t launch_id) {
@@ -3875,29 +3917,7 @@ static int ir_gpu_launch_append_expansion(IRProgram *program, IRFunction *out,
     }
   }
 
-  {
-    IRInstruction call = {0};
-    IROperand call_args[11] = {0};
-    call_args[0] = launch->lhs;
-    for (size_t i = 0; i < controls; i++) {
-      call_args[1 + i] = launch->arguments[i];
-    }
-    call_args[9] = nargs > 0 ? ir_operand_temp(params_base_name)
-                             : ir_operand_int(0);
-    call_args[10] = ir_operand_int((long long)nargs);
-    call.op = IR_OP_CALL;
-    call.location = launch->location;
-    call.text = "mtlc_gpu_launch_checked";
-    call.arguments = call_args;
-    call.argument_count = sizeof(call_args) / sizeof(call_args[0]);
-    if ((nargs > 0 && !call_args[9].name) ||
-        !ir_function_append_instruction(out, &call)) {
-      ir_operand_destroy(&call_args[9]);
-      return 0;
-    }
-    ir_operand_destroy(&call_args[9]);
-  }
-  return 1;
+  return ir_gpu_launch_append_call(out, launch, nargs, params_base_name);
 }
 
 int ir_program_lower_gpu_launches(IRProgram *program) {

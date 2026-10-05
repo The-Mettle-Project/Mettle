@@ -7609,6 +7609,192 @@ static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) 
                                   location);
 }
 
+typedef struct {
+  ASTNode *grid[3];
+  ASTNode *block[3];
+  ASTNode *shared;
+  ASTNode *stream;
+  ASTNode *work;
+  ASTNode *grid_indirect;
+  int stream_was_named;
+} DispatchControls;
+
+static void dispatch_controls_destroy(DispatchControls *c) {
+  for (size_t d = 0; d < 3; d++) {
+    ast_destroy_node(c->grid[d]);
+    ast_destroy_node(c->block[d]);
+  }
+  ast_destroy_node(c->shared);
+  ast_destroy_node(c->stream);
+  ast_destroy_node(c->work);
+  ast_destroy_node(c->grid_indirect);
+}
+
+static int parser_dispatch_control_option(const char *name) {
+  static const char *const names[] = {"grid",   "block", "shared",
+                                      "stream", "work",  "grid_indirect"};
+  for (int i = 0; i < 6; i++) {
+    if (!strcmp(name, names[i])) return i + 1;
+  }
+  return 0;
+}
+
+static int parser_parse_dispatch_tuple(Parser *parser, ASTNode **dimensions) {
+  if (!parser_expect(parser, TOKEN_LPAREN)) {
+    parser_set_error(parser, "Expected a three-dimensional dispatch tuple");
+    return 0;
+  }
+  for (size_t d = 0; d < 3; d++) {
+    dimensions[d] = parser_parse_expression(parser);
+    if (!dimensions[d]) return 0;
+    if (d < 2 && !parser_expect(parser, TOKEN_COMMA)) {
+      parser_set_error(parser,
+                       "Dispatch grid and block require exactly three dimensions");
+      return 0;
+    }
+  }
+  if (!parser_expect(parser, TOKEN_RPAREN)) {
+    parser_set_error(parser,
+                     "Dispatch grid and block require exactly three dimensions");
+    return 0;
+  }
+  return 1;
+}
+
+static int parser_parse_dispatch_named_control(Parser *parser,
+                                               DispatchControls *c) {
+  if (parser->current_token.type != TOKEN_IDENTIFIER ||
+      parser->peek_token.type != TOKEN_COLON) {
+    parser_set_error(parser,
+                     "Expected grid:, grid_indirect:, block:, shared:, or "
+                     "stream: in dispatch controls");
+    return 0;
+  }
+  int option = parser_dispatch_control_option(parser->current_token.value);
+  if (!option) {
+    parser_set_error(parser, "Unknown named dispatch control");
+    return 0;
+  }
+  ASTNode *seen[6] = {c->grid[0], c->block[0], c->shared,
+                      c->stream,  c->work,     c->grid_indirect};
+  if (seen[option - 1]) {
+    parser_set_error(parser, "Duplicate named dispatch control");
+    return 0;
+  }
+  parser_advance(parser);
+  if (!parser_expect(parser, TOKEN_COLON)) return 0;
+  if (option <= 2) {
+    return parser_parse_dispatch_tuple(parser,
+                                       option == 1 ? c->grid : c->block);
+  }
+  ASTNode **slots[4] = {&c->shared, &c->stream, &c->work, &c->grid_indirect};
+  ASTNode **value = slots[option - 3];
+  *value = parser_parse_expression(parser);
+  if (option == 4) c->stream_was_named = 1;
+  return *value != NULL;
+}
+
+static int parser_check_dispatch_named_controls(Parser *parser,
+                                                DispatchControls *c,
+                                                SourceLocation loc) {
+  if (c->grid_indirect) {
+    if (c->grid[0] || c->work) {
+      parser_set_error(parser,
+                       "Dispatch 'grid_indirect:' reads the grid from the "
+                       "device; drop 'grid:' and 'work:'");
+      return 0;
+    }
+    if (!c->block[0]) {
+      parser_set_error(parser, "Dispatch 'grid_indirect:' needs 'block:'");
+      return 0;
+    }
+    for (size_t d = 0; d < 3; d++)
+      c->grid[d] = ast_create_number_literal(1, loc, 10);
+  } else if (c->work) {
+    if (c->grid[0]) {
+      parser_set_error(parser,
+                       "Dispatch 'work:' computes the grid; drop 'grid:'");
+      return 0;
+    }
+  } else if (!c->grid[0] || !c->block[0]) {
+    parser_set_error(parser,
+                     "Named dispatch controls require grid and block, or "
+                     "'work:' to size the launch from the kernel's "
+                     "declared block");
+    return 0;
+  }
+  return 1;
+}
+
+static int parser_parse_dispatch_named_controls(Parser *parser,
+                                                DispatchControls *c,
+                                                SourceLocation loc) {
+  while (parser->current_token.type != TOKEN_RBRACKET) {
+    if (!parser_parse_dispatch_named_control(parser, c)) return 0;
+    if (parser->current_token.type == TOKEN_COMMA) {
+      parser_advance(parser);
+      if (parser->current_token.type == TOKEN_RBRACKET) {
+        parser_set_error(parser, "Trailing comma in named dispatch controls");
+        return 0;
+      }
+    } else if (parser->current_token.type != TOKEN_RBRACKET) {
+      parser_set_error(parser, "Expected ',' between named dispatch controls");
+      return 0;
+    }
+  }
+  if (!parser_check_dispatch_named_controls(parser, c, loc)) return 0;
+  return parser_expect(parser, TOKEN_RBRACKET);
+}
+
+static int parser_parse_dispatch_compact_controls(Parser *parser,
+                                                  DispatchControls *c,
+                                                  SourceLocation loc) {
+  c->grid[0] = parser_parse_expression(parser);
+  if (!c->grid[0] || !parser_expect(parser, TOKEN_COMMA)) {
+    if (c->grid[0] && !parser->has_error)
+      parser_set_error(parser,
+                       "Expected ',' between grid and block in dispatch");
+    return 0;
+  }
+  c->block[0] = parser_parse_expression(parser);
+  if (!c->block[0] || !parser_expect(parser, TOKEN_RBRACKET)) {
+    return 0;
+  }
+  c->grid[1] = ast_create_number_literal(1, loc, 10);
+  c->grid[2] = ast_create_number_literal(1, loc, 10);
+  c->block[1] = ast_create_number_literal(1, loc, 10);
+  c->block[2] = ast_create_number_literal(1, loc, 10);
+  return 1;
+}
+
+static int parser_parse_dispatch_controls(Parser *parser, DispatchControls *c,
+                                          SourceLocation loc) {
+  if (!parser_expect(parser, TOKEN_LBRACKET)) {
+    parser_set_error(parser, "Expected launch controls after the dispatch kernel");
+    return 0;
+  }
+  int named = parser->current_token.type == TOKEN_IDENTIFIER &&
+              parser->peek_token.type == TOKEN_COLON;
+  if (!(named ? parser_parse_dispatch_named_controls(parser, c, loc)
+              : parser_parse_dispatch_compact_controls(parser, c, loc))) {
+    return 0;
+  }
+  if (!c->shared) c->shared = ast_create_number_literal(0, loc, 10);
+  if (!c->stream) c->stream = ast_create_number_literal(0, loc, 10);
+  if (c->work) {
+    for (size_t d = 0; d < 3; d++) {
+      if (!c->grid[d]) c->grid[d] = ast_create_number_literal(1, loc, 10);
+      if (!c->block[d]) c->block[d] = ast_create_number_literal(1, loc, 10);
+    }
+  }
+  if (!c->grid[0] || !c->grid[1] || !c->grid[2] || !c->block[1] ||
+      !c->block[2] || !c->shared || !c->stream) {
+    parser_set_error(parser, "Out of memory creating GPU launch controls");
+    return 0;
+  }
+  return 1;
+}
+
 static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
   SourceLocation loc = parser_current_location(parser);
   parser_advance(parser);
@@ -7622,25 +7808,15 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
       ast_create_identifier(parser->current_token.value, loc);
   parser_advance(parser);
 
-  ASTNode *grid[3] = {NULL, NULL, NULL};
-  ASTNode *block[3] = {NULL, NULL, NULL};
-  ASTNode *shared = NULL;
-  ASTNode *stream = NULL;
-  ASTNode *work = NULL;
-  int stream_was_named = 0;
+  DispatchControls c;
+  memset(&c, 0, sizeof(c));
   ASTNode *args[64];
   size_t nargs = 0;
 
 #define DISP_FAIL()                                                            \
   do {                                                                         \
     ast_destroy_node(kernel);                                                  \
-    for (size_t _d = 0; _d < 3; _d++) {                                       \
-      ast_destroy_node(grid[_d]);                                              \
-      ast_destroy_node(block[_d]);                                             \
-    }                                                                          \
-    ast_destroy_node(shared);                                                  \
-    ast_destroy_node(stream);                                                  \
-    ast_destroy_node(work);                                                    \
+    dispatch_controls_destroy(&c);                                             \
     for (size_t _i = 0; _i < nargs; _i++)                                      \
       ast_destroy_node(args[_i]);                                              \
     return NULL;                                                               \
@@ -7650,134 +7826,7 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
     parser_set_error(parser, "Out of memory creating GPU launch handle");
     DISP_FAIL();
   }
-
-  if (!parser_expect(parser, TOKEN_LBRACKET)) {
-    parser_set_error(parser, "Expected launch controls after the dispatch kernel");
-    DISP_FAIL();
-  }
-  int named_controls = parser->current_token.type == TOKEN_IDENTIFIER &&
-                       parser->peek_token.type == TOKEN_COLON;
-  if (!named_controls) {
-    grid[0] = parser_parse_expression(parser);
-    if (!grid[0] || !parser_expect(parser, TOKEN_COMMA)) {
-      if (grid[0] && !parser->has_error)
-        parser_set_error(parser,
-                         "Expected ',' between grid and block in dispatch");
-      DISP_FAIL();
-    }
-    block[0] = parser_parse_expression(parser);
-    if (!block[0] || !parser_expect(parser, TOKEN_RBRACKET)) {
-      DISP_FAIL();
-    }
-    grid[1] = ast_create_number_literal(1, loc, 10);
-    grid[2] = ast_create_number_literal(1, loc, 10);
-    block[1] = ast_create_number_literal(1, loc, 10);
-    block[2] = ast_create_number_literal(1, loc, 10);
-  } else {
-    int have_grid = 0, have_block = 0, have_shared = 0, have_stream = 0;
-    while (parser->current_token.type != TOKEN_RBRACKET) {
-      if (parser->current_token.type != TOKEN_IDENTIFIER ||
-          parser->peek_token.type != TOKEN_COLON) {
-        parser_set_error(
-            parser,
-            "Expected grid:, block:, shared:, or stream: in dispatch controls");
-        DISP_FAIL();
-      }
-      int option = 0;
-      if (!strcmp(parser->current_token.value, "grid")) option = 1;
-      else if (!strcmp(parser->current_token.value, "block")) option = 2;
-      else if (!strcmp(parser->current_token.value, "shared")) option = 3;
-      else if (!strcmp(parser->current_token.value, "stream")) option = 4;
-      else if (!strcmp(parser->current_token.value, "work")) option = 5;
-      else {
-        parser_set_error(parser, "Unknown named dispatch control");
-        DISP_FAIL();
-      }
-      if ((option == 1 && have_grid) || (option == 2 && have_block) ||
-          (option == 3 && have_shared) || (option == 4 && have_stream) ||
-          (option == 5 && work)) {
-        parser_set_error(parser, "Duplicate named dispatch control");
-        DISP_FAIL();
-      }
-      if (option == 1) have_grid = 1;
-      else if (option == 2) have_block = 1;
-      else if (option == 3) have_shared = 1;
-      else if (option == 5) {  }
-      else {
-        have_stream = 1;
-        stream_was_named = 1;
-      }
-
-      parser_advance(parser);
-      if (!parser_expect(parser, TOKEN_COLON)) DISP_FAIL();
-      if (option == 1 || option == 2) {
-        ASTNode **dimensions = option == 1 ? grid : block;
-        if (!parser_expect(parser, TOKEN_LPAREN)) {
-          parser_set_error(parser,
-                           "Expected a three-dimensional dispatch tuple");
-          DISP_FAIL();
-        }
-        for (size_t d = 0; d < 3; d++) {
-          dimensions[d] = parser_parse_expression(parser);
-          if (!dimensions[d]) DISP_FAIL();
-          if (d < 2 && !parser_expect(parser, TOKEN_COMMA)) {
-            parser_set_error(parser,
-                             "Dispatch grid and block require exactly three dimensions");
-            DISP_FAIL();
-          }
-        }
-        if (!parser_expect(parser, TOKEN_RPAREN)) {
-          parser_set_error(parser,
-                           "Dispatch grid and block require exactly three dimensions");
-          DISP_FAIL();
-        }
-      } else {
-        ASTNode **value = option == 3 ? &shared
-                                      : (option == 5 ? &work : &stream);
-        *value = parser_parse_expression(parser);
-        if (!*value) DISP_FAIL();
-      }
-      if (parser->current_token.type == TOKEN_COMMA) {
-        parser_advance(parser);
-        if (parser->current_token.type == TOKEN_RBRACKET) {
-          parser_set_error(parser,
-                           "Trailing comma in named dispatch controls");
-          DISP_FAIL();
-        }
-      } else if (parser->current_token.type != TOKEN_RBRACKET) {
-        parser_set_error(parser,
-                         "Expected ',' between named dispatch controls");
-        DISP_FAIL();
-      }
-    }
-    if (work) {
-      if (have_grid) {
-        parser_set_error(parser,
-                         "Dispatch 'work:' computes the grid; drop 'grid:'");
-        DISP_FAIL();
-      }
-    } else if (!have_grid || !have_block) {
-      parser_set_error(parser,
-                       "Named dispatch controls require grid and block, or "
-                       "'work:' to size the launch from the kernel's "
-                       "declared block");
-      DISP_FAIL();
-    }
-    if (!parser_expect(parser, TOKEN_RBRACKET)) DISP_FAIL();
-  }
-
-  if (!shared) shared = ast_create_number_literal(0, loc, 10);
-  if (!stream) stream = ast_create_number_literal(0, loc, 10);
-  if (work) {
-    for (size_t d = 0; d < 3; d++) {
-      if (!grid[d]) grid[d] = ast_create_number_literal(1, loc, 10);
-      if (!block[d]) block[d] = ast_create_number_literal(1, loc, 10);
-    }
-  }
-  if (!grid[1] || !grid[2] || !block[1] || !block[2] || !shared || !stream) {
-    parser_set_error(parser, "Out of memory creating GPU launch controls");
-    DISP_FAIL();
-  }
+  if (!parser_parse_dispatch_controls(parser, &c, loc)) DISP_FAIL();
 
   if (!parser_expect(parser, TOKEN_LPAREN)) {
     parser_set_error(parser, "Expected '(' before dispatch arguments");
@@ -7807,33 +7856,33 @@ static ASTNode *parser_parse_dispatch_statement(Parser *parser) {
 
   if (parser->current_token.type == TOKEN_IDENTIFIER &&
       strcmp(parser->current_token.value, "on") == 0) {
-    if (stream_was_named) {
+    if (c.stream_was_named) {
       parser_set_error(parser,
                        "Dispatch stream is already given by the named "
                        "'stream:' control; drop one of the two");
       DISP_FAIL();
     }
     parser_advance(parser);
-    ast_destroy_node(stream);
-    stream = parser_parse_expression(parser);
-    if (!stream) {
+    ast_destroy_node(c.stream);
+    c.stream = parser_parse_expression(parser);
+    if (!c.stream) {
       if (!parser->has_error)
         parser_set_error(parser, "Expected a stream expression after 'on'");
       DISP_FAIL();
     }
   }
 
-  ASTNode *launch = ast_create_gpu_launch(kernel, grid, block, shared, stream,
-                                          args, nargs, loc);
+  ASTNode *launch = ast_create_gpu_launch(kernel, c.grid, c.block, c.shared,
+                                          c.stream, args, nargs, loc);
   if (!launch) {
     parser_set_error(parser, "Out of memory creating GPU launch");
     DISP_FAIL();
   }
-  if (work) {
-    GpuLaunchStatement *data = (GpuLaunchStatement *)launch->data;
-    data->work = work;
-    ast_add_child(launch, work);
-  }
+  GpuLaunchStatement *data = (GpuLaunchStatement *)launch->data;
+  data->work = c.work;
+  ast_add_child(launch, c.work);
+  data->grid_indirect = c.grid_indirect;
+  ast_add_child(launch, c.grid_indirect);
 #undef DISP_FAIL
   return launch;
 }

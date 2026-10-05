@@ -455,45 +455,13 @@ uint64_t mettle_metal_address_of(MettleMetal *metal, const void *host) {
   return 0;
 }
 
-int mettle_metal_launch(MettleMetal *metal, const char *kernel,
-                        const uint32_t grid[3], const uint32_t block[3],
-                        const void *args, size_t args_size,
-                        size_t threadgroup_bytes, char *error,
-                        size_t error_size) {
-  MetalPipeline *pipeline;
-  id spill = NULL;
-  MTLSize groups;
-  MTLSize threads;
-  void *pool;
-  int ok = 1;
-  unsigned long long block_threads;
-  if (!metal || !kernel) {
-    put_error(error, error_size, "no Metal device or kernel");
-    return 0;
-  }
-  pool = objc_autoreleasePoolPush();
-  pipeline = pipeline_for(metal, kernel, error, error_size);
-  if (!pipeline) {
-    objc_autoreleasePoolPop(pool);
-    return 0;
-  }
-  block_threads = (unsigned long long)block[0] * block[1] * block[2];
-  if (block_threads == 0 || block_threads > pipeline->max_threads) {
-    if (error && error_size) {
-      snprintf(error, error_size,
-               "'%s' launched with %llu threads per threadgroup; this GPU "
-               "runs at most %lu for it",
-               kernel, block_threads, (unsigned long)pipeline->max_threads);
-    }
-    objc_autoreleasePoolPop(pool);
-    return 0;
-  }
+static int grow_launch_tables(MettleMetal *metal, char *error,
+                              size_t error_size) {
   if (metal->spill_count == metal->spill_capacity) {
     size_t next = metal->spill_capacity ? metal->spill_capacity * 2 : 16;
     id *grown = (id *)realloc(metal->spills, next * sizeof(id));
     if (!grown) {
       put_error(error, error_size, "out of memory batching Metal launches");
-      objc_autoreleasePoolPop(pool);
       return 0;
     }
     metal->spills = grown;
@@ -504,12 +472,48 @@ int mettle_metal_launch(MettleMetal *metal, const char *kernel,
     id *grown = (id *)realloc(metal->resident, next * sizeof(id));
     if (!grown) {
       put_error(error, error_size, "out of memory batching Metal launches");
-      objc_autoreleasePoolPop(pool);
       return 0;
     }
     metal->resident = grown;
     metal->resident_capacity = next;
   }
+  return 1;
+}
+
+static void bind_arguments(MettleMetal *metal, const void *args,
+                           size_t args_size) {
+  id spill;
+  if (!args || !args_size) {
+    return;
+  }
+  if (args_size <= 4096) {
+    ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))msg_send())(
+        metal->encoder, SEL_OF("setBytes:length:atIndex:"), args,
+        (NSUInteger)args_size, (NSUInteger)0);
+    return;
+  }
+  spill = ((id(*)(id, SEL, const void *, NSUInteger, NSUInteger))msg_send())(
+      metal->device, SEL_OF("newBufferWithBytes:length:options:"), args,
+      (NSUInteger)args_size, (NSUInteger)0);
+  metal->spills[metal->spill_count++] = spill;
+  ((void (*)(id, SEL, id, NSUInteger, NSUInteger))msg_send())(
+      metal->encoder, SEL_OF("setBuffer:offset:atIndex:"), spill,
+      (NSUInteger)0, (NSUInteger)0);
+}
+
+static void use_buffers(MettleMetal *metal) {
+  if (!metal->buffer_count) {
+    return;
+  }
+  for (size_t i = 0; i < metal->buffer_count; i++) {
+    metal->resident[i] = metal->buffers[i].buffer;
+  }
+  ((void (*)(id, SEL, const id *, NSUInteger, NSUInteger))msg_send())(
+      metal->encoder, SEL_OF("useResources:count:usage:"), metal->resident,
+      (NSUInteger)metal->buffer_count, (NSUInteger)3);
+}
+
+static void open_encoder(MettleMetal *metal, const char *kernel) {
   if (!metal->command) {
     metal->command = SEND0(id, metal->queue, "commandBuffer");
     SEND0(id, metal->command, "retain");
@@ -521,51 +525,118 @@ int mettle_metal_launch(MettleMetal *metal, const char *kernel,
         metal->encoder, SEL_OF("memoryBarrierWithScope:"), (NSUInteger)1);
   }
   snprintf(metal->last_kernel, sizeof(metal->last_kernel), "%s", kernel);
+}
+
+static int encode_launch(MettleMetal *metal, const char *kernel,
+                         const uint32_t block[3], const void *args,
+                         size_t args_size, size_t threadgroup_bytes,
+                         char *error, size_t error_size) {
+  MetalPipeline *pipeline = pipeline_for(metal, kernel, error, error_size);
+  unsigned long long block_threads;
+  if (!pipeline) {
+    return 0;
+  }
+  block_threads = (unsigned long long)block[0] * block[1] * block[2];
+  if (block_threads == 0 || block_threads > pipeline->max_threads) {
+    if (error && error_size) {
+      snprintf(error, error_size,
+               "'%s' launched with %llu threads per threadgroup; this GPU "
+               "runs at most %lu for it",
+               kernel, block_threads, (unsigned long)pipeline->max_threads);
+    }
+    return 0;
+  }
+  if (!grow_launch_tables(metal, error, error_size)) {
+    return 0;
+  }
+  open_encoder(metal, kernel);
   ((void (*)(id, SEL, id))msg_send())(
       metal->encoder, SEL_OF("setComputePipelineState:"), pipeline->pipeline);
-  if (args && args_size) {
-    if (args_size <= 4096) {
-      ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))msg_send())(
-          metal->encoder, SEL_OF("setBytes:length:atIndex:"), args,
-          (NSUInteger)args_size, (NSUInteger)0);
-    } else {
-      spill = ((id(*)(id, SEL, const void *, NSUInteger, NSUInteger))msg_send())(
-          metal->device, SEL_OF("newBufferWithBytes:length:options:"), args,
-          (NSUInteger)args_size, (NSUInteger)0);
-      metal->spills[metal->spill_count++] = spill;
-      ((void (*)(id, SEL, id, NSUInteger, NSUInteger))msg_send())(
-          metal->encoder, SEL_OF("setBuffer:offset:atIndex:"), spill,
-          (NSUInteger)0, (NSUInteger)0);
-    }
-  }
-  if (metal->buffer_count) {
-    for (size_t i = 0; i < metal->buffer_count; i++) {
-      metal->resident[i] = metal->buffers[i].buffer;
-    }
-    ((void (*)(id, SEL, const id *, NSUInteger, NSUInteger))msg_send())(
-        metal->encoder, SEL_OF("useResources:count:usage:"), metal->resident,
-        (NSUInteger)metal->buffer_count, (NSUInteger)3);
-  }
+  bind_arguments(metal, args, args_size);
+  use_buffers(metal);
   if (threadgroup_bytes) {
     ((void (*)(id, SEL, NSUInteger, NSUInteger))msg_send())(
         metal->encoder, SEL_OF("setThreadgroupMemoryLength:atIndex:"),
         (NSUInteger)((threadgroup_bytes + 15) / 16 * 16), (NSUInteger)0);
   }
-  groups.width = grid[0];
-  groups.height = grid[1];
-  groups.depth = grid[2];
-  threads.width = block[0];
-  threads.height = block[1];
-  threads.depth = block[2];
-  ((void (*)(id, SEL, MTLSize, MTLSize))msg_send())(
-      metal->encoder, SEL_OF("dispatchThreadgroups:threadsPerThreadgroup:"),
-      groups, threads);
+  return 1;
+}
+
+static MTLSize size_of(const uint32_t v[3]) {
+  MTLSize size;
+  size.width = v[0];
+  size.height = v[1];
+  size.depth = v[2];
+  return size;
+}
+
+static int finish_launch(MettleMetal *metal, void *pool, char *error,
+                         size_t error_size) {
   metal->batched++;
   objc_autoreleasePoolPop(pool);
   if (metal->synchronous || metal->batched >= METAL_BATCH_LIMIT) {
-    ok = mettle_metal_sync(metal, error, error_size);
+    return mettle_metal_sync(metal, error, error_size);
   }
-  return ok;
+  return 1;
+}
+
+int mettle_metal_launch(MettleMetal *metal, const char *kernel,
+                        const uint32_t grid[3], const uint32_t block[3],
+                        const void *args, size_t args_size,
+                        size_t threadgroup_bytes, char *error,
+                        size_t error_size) {
+  void *pool;
+  if (!metal || !kernel) {
+    put_error(error, error_size, "no Metal device or kernel");
+    return 0;
+  }
+  pool = objc_autoreleasePoolPush();
+  if (!encode_launch(metal, kernel, block, args, args_size, threadgroup_bytes,
+                     error, error_size)) {
+    objc_autoreleasePoolPop(pool);
+    return 0;
+  }
+  ((void (*)(id, SEL, MTLSize, MTLSize))msg_send())(
+      metal->encoder, SEL_OF("dispatchThreadgroups:threadsPerThreadgroup:"),
+      size_of(grid), size_of(block));
+  return finish_launch(metal, pool, error, error_size);
+}
+
+int mettle_metal_launch_indirect(MettleMetal *metal, const char *kernel,
+                                 uint64_t counts, const uint32_t block[3],
+                                 const void *args, size_t args_size,
+                                 size_t threadgroup_bytes, char *error,
+                                 size_t error_size) {
+  MetalBuffer *buffer;
+  uint64_t offset;
+  void *pool;
+  if (!metal || !kernel) {
+    put_error(error, error_size, "no Metal device or kernel");
+    return 0;
+  }
+  buffer = find_buffer(metal, counts);
+  offset = buffer ? counts - buffer->address : 0;
+  if (!buffer || (counts & 3u) || buffer->size - offset < 12) {
+    if (error && error_size) {
+      snprintf(error, error_size,
+               "the grid of '%s' is read from 0x%llx, which is not a "
+               "4-byte aligned run of three uint32 inside a Metal buffer",
+               kernel, (unsigned long long)counts);
+    }
+    return 0;
+  }
+  pool = objc_autoreleasePoolPush();
+  if (!encode_launch(metal, kernel, block, args, args_size, threadgroup_bytes,
+                     error, error_size)) {
+    objc_autoreleasePoolPop(pool);
+    return 0;
+  }
+  ((void (*)(id, SEL, id, NSUInteger, MTLSize))msg_send())(
+      metal->encoder,
+      SEL_OF("dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:"
+             "threadsPerThreadgroup:"),
+      buffer->buffer, (NSUInteger)offset, size_of(block));
+  return finish_launch(metal, pool, error, error_size);
 }
 
 void mettle_metal_close(MettleMetal *metal) {

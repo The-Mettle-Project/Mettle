@@ -516,6 +516,8 @@ static ASTNode *ast_clone_gpu_launch(ASTNode *clone, const ASTNode *node) {
     dst->kernel_threads_per_item = src->kernel_threads_per_item;
     dst->work = ast_clone_node(src->work);
     ast_add_child(built, dst->work);
+    dst->grid_indirect = ast_clone_node(src->grid_indirect);
+    ast_add_child(built, dst->grid_indirect);
   }
   free(args);
   free(clone);

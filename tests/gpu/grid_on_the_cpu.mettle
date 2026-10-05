@@ -63,3 +63,32 @@ kernel tile_reduce(a: float32 global*, out: float32 global*) {
   if (out[1] != 26.0) { return 2; }
   return 0;
 }
+
+kernel tile_ids(out: int32 global*) {
+  out[(block.y * 4 + block.x) * 2 + thread.x] = block.y * 10 + block.x;
+}
+
+@test fn an_indirect_grid_is_read_from_memory() -> int32 {
+  var counts: uint32[3];
+  var out: int32[24];
+  var i: int32 = 0;
+  while (i < 24) {
+    out[i] = -1;
+    i = i + 1;
+  }
+  counts[0] = (uint32)3;
+  counts[1] = (uint32)2;
+  counts[2] = (uint32)1;
+  dispatch tile_ids[grid_indirect: &counts[0], block: (2, 1, 1)](
+      (int32 global*)&out[0]);
+  i = 0;
+  while (i < 24) {
+    var x: int32 = (i / 2) % 4;
+    var y: int32 = i / 8;
+    var want: int32 = -1;
+    if (x < 3 && y < 2) { want = y * 10 + x; }
+    if (out[i] != want) { return 1; }
+    i = i + 1;
+  }
+  return 0;
+}

@@ -7,6 +7,8 @@ extern kernel host_mixed(out: int64*, i8: int8, u16: uint16, x: float32, wide: i
                          p: HostParams, flag: bool, last: int32);
 extern kernel host_scale_rows(data: float32*, p: HostParams);
 extern kernel host_block_sum(x: int32*, out: int32*, n: int32);
+extern kernel host_plan(counts: uint32*, want: int32*);
+extern kernel host_tile_ids(out: int32*);
 
 extern fn malloc(bytes: int64) -> uint8* = "malloc";
 extern fn getenv(name: cstring) -> cstring = "getenv";
@@ -182,6 +184,76 @@ fn check_graph() -> int32 {
   return 0;
 }
 
+fn reset_tiles(host: int32*, dout: int64) -> int32 {
+  var i: int32 = 0;
+  while (i < 8 * 4 * 32) {
+    host[i] = -1;
+    i = i + 1;
+  }
+  return gpu_to_device(dout, (uint8*)host, (int64)(8 * 4 * 32) * 4);
+}
+
+fn tiles_match(host: int32*, dout: int64, gx: int32, gy: int32) -> int32 {
+  if (gpu_to_host((uint8*)host, dout, (int64)(8 * 4 * 32) * 4) != 0) { return 0; }
+  var y: int32 = 0;
+  while (y < 4) {
+    var x: int32 = 0;
+    while (x < 8) {
+      var want: int32 = -1;
+      if (x < gx && y < gy) { want = y * 100 + x; }
+      var t: int32 = 0;
+      while (t < 32) {
+        if (host[(y * 8 + x) * 32 + t] != want) { return 0; }
+        t = t + 1;
+      }
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return 1;
+}
+
+fn plan_tiles(dwant: int64, gx: int32, gy: int32) -> int32 {
+  var want: int32[2];
+  want[0] = gx;
+  want[1] = gy;
+  return gpu_to_device(dwant, (uint8*)&want[0], 8);
+}
+
+fn check_indirect() -> int32 {
+  var host: int32* = (int32*)malloc((int64)(8 * 4 * 32) * 4);
+  var dcounts: int64 = gpu_malloc(16);
+  var dwant: int64 = gpu_malloc(8);
+  var dout: int64 = gpu_malloc((int64)(8 * 4 * 32) * 4);
+  if (dcounts == 0 || dwant == 0 || dout == 0) { return 71; }
+  if (reset_tiles(host, dout) != 0 || plan_tiles(dwant, 5, 3) != 0) { return 72; }
+  dispatch host_plan[1, 32](dcounts, dwant);
+  dispatch host_tile_ids[grid_indirect: dcounts, block: (32, 1, 1)](dout);
+  if (tiles_match(host, dout, 5, 3) == 0) { return 73; }
+  if (reset_tiles(host, dout) != 0 || plan_tiles(dwant, 0, 2) != 0) { return 74; }
+  dispatch host_plan[1, 32](dcounts, dwant);
+  dispatch host_tile_ids[grid_indirect: dcounts, block: (32, 1, 1)](dout);
+  if (tiles_match(host, dout, 0, 0) == 0) { return 75; }
+  var stream: int64 = gpu_stream_create();
+  if (gpu_graph_capture_begin(stream) != 0) { return 76; }
+  dispatch host_plan[1, 32](dcounts, dwant) on stream;
+  dispatch host_tile_ids[grid_indirect: dcounts, block: (32, 1, 1),
+                         stream: stream](dout);
+  var graph: int64 = gpu_graph_capture_end(stream);
+  if (graph == 0) { return 77; }
+  if (reset_tiles(host, dout) != 0 || plan_tiles(dwant, 2, 4) != 0) { return 78; }
+  if (gpu_graph_launch(graph, stream) != 0) { return 79; }
+  if (tiles_match(host, dout, 2, 4) == 0) { return 80; }
+  if (reset_tiles(host, dout) != 0 || plan_tiles(dwant, 8, 1) != 0) { return 81; }
+  if (gpu_graph_launch(graph, stream) != 0) { return 82; }
+  if (tiles_match(host, dout, 8, 1) == 0) { return 83; }
+  gpu_graph_destroy(graph);
+  gpu_free(dcounts);
+  gpu_free(dwant);
+  gpu_free(dout);
+  return 0;
+}
+
 fn main() -> int32 {
   var path: cstring = getenv("METTLE_METAL_HOST_LIBRARY");
   if (path == 0) {
@@ -197,5 +269,7 @@ fn main() -> int32 {
   if (status != 0) { return status; }
   status = check_block_sum();
   if (status != 0) { return status; }
-  return check_graph();
+  status = check_graph();
+  if (status != 0) { return status; }
+  return check_indirect();
 }

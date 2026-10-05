@@ -45,6 +45,113 @@ static int gpu_launch_abi_type(const Type *type) {
   return type_checker_gpu_abi_type(type);
 }
 
+static int type_checker_check_launch_controls(TypeChecker *checker,
+                                              GpuLaunchStatement *launch) {
+  Type *shared_type =
+      type_checker_infer_type(checker, launch->dynamic_shared_bytes);
+  Type *stream_type = type_checker_infer_type(checker, launch->stream);
+  if (!shared_type || !stream_type) {
+    return 0;
+  }
+  if (!type_checker_is_integer_type(shared_type)) {
+    type_checker_report_type_mismatch(
+        checker, launch->dynamic_shared_bytes->location,
+        "integer dynamic shared-memory byte count", shared_type->name);
+    return 0;
+  }
+  if (!type_checker_is_integer_type(stream_type) &&
+      stream_type->kind != TYPE_POINTER) {
+    type_checker_report_type_mismatch(checker, launch->stream->location,
+                                      "integer or pointer stream handle",
+                                      stream_type->name);
+    return 0;
+  }
+  if (launch->grid_indirect) {
+    Type *grid_type = type_checker_infer_type(checker, launch->grid_indirect);
+    if (!grid_type) {
+      return 0;
+    }
+    if (!type_checker_is_integer_type(grid_type) &&
+        grid_type->kind != TYPE_POINTER) {
+      type_checker_report_type_mismatch(
+          checker, launch->grid_indirect->location,
+          "device address of three uint32 threadgroup counts",
+          grid_type->name);
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void type_checker_report_launch(ASTNode *statement,
+                                       GpuLaunchStatement *launch,
+                                       Symbol *kernel_symbol) {
+  long long grid[3] = {0, 0, 0};
+  long long block[3] = {0, 0, 0};
+  int grid_known = 1;
+  int block_known = 1;
+  if (!g_report_launches_header) {
+    printf("Launch report (grid and block where the compiler can fold "
+           "them):\n");
+    g_report_launches_header = 1;
+  }
+  for (size_t d = 0; d < 3; d++) {
+    if (!type_checker_eval_integer_constant(launch->grid[d], &grid[d]))
+      grid_known = 0;
+    if (!type_checker_eval_integer_constant(launch->block[d], &block[d]))
+      block_known = 0;
+  }
+  printf("  %s:%llu: %s",
+         statement->location.filename ? statement->location.filename : "?",
+         (unsigned long long)statement->location.line,
+         kernel_symbol && kernel_symbol->name ? kernel_symbol->name
+                                              : "<runtime handle>");
+  if (launch->work) {
+    long long work = 0;
+    long long threads = launch->kernel_block[0] *
+                        (launch->kernel_block[1] > 0 ? launch->kernel_block[1]
+                                                     : 1) *
+                        (launch->kernel_block[2] > 0 ? launch->kernel_block[2]
+                                                     : 1);
+    long long per_item = launch->kernel_threads_per_item > 0
+                             ? launch->kernel_threads_per_item
+                             : 1;
+    long long items = threads / per_item;
+    if (type_checker_eval_integer_constant(launch->work, &work) &&
+        items > 0) {
+      printf(" work %lld -> grid %lld", work, (work + items - 1) / items);
+    } else {
+      printf(" work <runtime> -> grid <runtime>");
+    }
+    printf(", block %lld (declared", threads);
+    if (per_item > 1) {
+      printf(", %lld items/block", items);
+    }
+    printf(")");
+  } else {
+    if (launch->grid_indirect) {
+      printf(" grid <device>");
+    } else if (grid_known) {
+      printf(" grid (%lld, %lld, %lld)", grid[0], grid[1], grid[2]);
+    } else {
+      printf(" grid <runtime>");
+    }
+    if (block_known) {
+      printf(", block (%lld, %lld, %lld)", block[0], block[1], block[2]);
+    } else {
+      printf(", block <runtime>");
+    }
+  }
+  if (kernel_symbol && launch->kernel_block[0] <= 0) {
+    printf("  [no declared block]");
+  }
+  if (!kernel_symbol) {
+    printf("  [untyped handle: declare it with 'extern kernel' to check "
+           "arguments]");
+  }
+  printf("\n");
+}
+
 static int type_checker_check_gpu_launch(TypeChecker *checker,
                                          ASTNode *statement) {
   GpuLaunchStatement *launch = (GpuLaunchStatement *)statement->data;
@@ -207,23 +314,7 @@ static int type_checker_check_gpu_launch(TypeChecker *checker,
     }
   }
 
-  Type *shared_type =
-      type_checker_infer_type(checker, launch->dynamic_shared_bytes);
-  Type *stream_type = type_checker_infer_type(checker, launch->stream);
-  if (!shared_type || !stream_type) {
-    return 0;
-  }
-  if (!type_checker_is_integer_type(shared_type)) {
-    type_checker_report_type_mismatch(
-        checker, launch->dynamic_shared_bytes->location,
-        "integer dynamic shared-memory byte count", shared_type->name);
-    return 0;
-  }
-  if (!type_checker_is_integer_type(stream_type) &&
-      stream_type->kind != TYPE_POINTER) {
-    type_checker_report_type_mismatch(checker, launch->stream->location,
-                                      "integer or pointer stream handle",
-                                      stream_type->name);
+  if (!type_checker_check_launch_controls(checker, launch)) {
     return 0;
   }
 
@@ -273,68 +364,7 @@ static int type_checker_check_gpu_launch(TypeChecker *checker,
   }
 
   if (g_report_launches) {
-    long long grid[3] = {0, 0, 0};
-    long long block[3] = {0, 0, 0};
-    int grid_known = 1;
-    int block_known = 1;
-    if (!g_report_launches_header) {
-      printf("Launch report (grid and block where the compiler can fold "
-             "them):\n");
-      g_report_launches_header = 1;
-    }
-    for (size_t d = 0; d < 3; d++) {
-      if (!type_checker_eval_integer_constant(launch->grid[d], &grid[d]))
-        grid_known = 0;
-      if (!type_checker_eval_integer_constant(launch->block[d], &block[d]))
-        block_known = 0;
-    }
-    printf("  %s:%llu: %s",
-           statement->location.filename ? statement->location.filename : "?",
-           (unsigned long long)statement->location.line,
-           kernel_symbol && kernel_symbol->name ? kernel_symbol->name
-                                                : "<runtime handle>");
-    if (launch->work) {
-      long long work = 0;
-      long long threads = launch->kernel_block[0] *
-                          (launch->kernel_block[1] > 0 ? launch->kernel_block[1]
-                                                       : 1) *
-                          (launch->kernel_block[2] > 0 ? launch->kernel_block[2]
-                                                       : 1);
-      long long per_item = launch->kernel_threads_per_item > 0
-                               ? launch->kernel_threads_per_item
-                               : 1;
-      long long items = threads / per_item;
-      if (type_checker_eval_integer_constant(launch->work, &work) &&
-          items > 0) {
-        printf(" work %lld -> grid %lld", work, (work + items - 1) / items);
-      } else {
-        printf(" work <runtime> -> grid <runtime>");
-      }
-      printf(", block %lld (declared", threads);
-      if (per_item > 1) {
-        printf(", %lld items/block", items);
-      }
-      printf(")");
-    } else {
-      if (grid_known) {
-        printf(" grid (%lld, %lld, %lld)", grid[0], grid[1], grid[2]);
-      } else {
-        printf(" grid <runtime>");
-      }
-      if (block_known) {
-        printf(", block (%lld, %lld, %lld)", block[0], block[1], block[2]);
-      } else {
-        printf(", block <runtime>");
-      }
-    }
-    if (kernel_symbol && launch->kernel_block[0] <= 0) {
-      printf("  [no declared block]");
-    }
-    if (!kernel_symbol) {
-      printf("  [untyped handle: declare it with 'extern kernel' to check "
-             "arguments]");
-    }
-    printf("\n");
+    type_checker_report_launch(statement, launch, kernel_symbol);
   }
   return 1;
 }

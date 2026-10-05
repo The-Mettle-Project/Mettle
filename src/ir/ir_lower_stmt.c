@@ -1743,6 +1743,13 @@ if (launch->work) {
       return 0;
     }
   }
+  if (launch->grid_indirect) {
+    ir_operand_destroy(&arguments[0]);
+    if (!ir_lower_expression(context, function, launch->grid_indirect,
+                             &arguments[0])) {
+      return 0;
+    }
+  }
 }
   return 1;
 }
@@ -1860,6 +1867,7 @@ static int ir_lower_gpu_launch(IRLoweringContext *context,
     IRInstruction instruction = {0};
     instruction.op = IR_OP_GPU_LAUNCH;
     instruction.location = statement->location;
+    instruction.gpu_launch_indirect = launch->grid_indirect != NULL;
     instruction.lhs = kernel;
     instruction.arguments = arguments;
     instruction.argument_types = argument_types;

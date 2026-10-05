@@ -54,3 +54,16 @@ kernel host_block_sum(x: int32*, out: int32*, n: int32) {
     out[block.x] = total;
   }
 }
+
+kernel host_plan(counts: uint32*, want: int32*) {
+  if (block.x == 0 && thread.x == 0) {
+    counts[0] = (uint32)want[0];
+    counts[1] = (uint32)want[1];
+    counts[2] = (uint32)1;
+  }
+}
+
+kernel host_tile_ids(out: int32*) {
+  var at: int32 = ((block.z * 4 + block.y) * 8 + block.x) * 32 + thread.x;
+  out[at] = block.y * 100 + block.x;
+}

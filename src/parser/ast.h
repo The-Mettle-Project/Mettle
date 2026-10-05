@@ -332,6 +332,7 @@ typedef struct {
   size_t argument_count;
   int typed_kernel;
   ASTNode *work;
+  ASTNode *grid_indirect;
   int kernel_block[3];
   int kernel_threads_per_item;
 } GpuLaunchStatement;

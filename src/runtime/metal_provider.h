@@ -44,6 +44,11 @@ int mettle_metal_launch(MettleMetal *metal, const char *kernel,
                         const void *args, size_t args_size,
                         size_t threadgroup_bytes, char *error,
                         size_t error_size);
+int mettle_metal_launch_indirect(MettleMetal *metal, const char *kernel,
+                                 uint64_t counts, const uint32_t block[3],
+                                 const void *args, size_t args_size,
+                                 size_t threadgroup_bytes, char *error,
+                                 size_t error_size);
 
 #ifdef __cplusplus
 }

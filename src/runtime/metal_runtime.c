@@ -31,6 +31,7 @@ static int g_version_minor = 2;
 typedef struct {
   int64_t kernel;
   uint32_t grid[3];
+  uint64_t counts;
   uint32_t block[3];
   unsigned char *args;
   size_t args_size;
@@ -346,63 +347,100 @@ static int rt_pack(const int64_t *params, int32_t nargs, unsigned char **block,
   return 1;
 }
 
+static int rt_capture(const RtLaunch *launch) {
+  RtGraph *graph = &g_graphs[g_capture];
+  if (graph->count == graph->capacity) {
+    size_t next = graph->capacity ? graph->capacity * 2 : 16;
+    RtLaunch *grown =
+        (RtLaunch *)realloc(graph->launches, next * sizeof(RtLaunch));
+    if (!grown) {
+      rt_error("out of memory capturing a Metal launch graph");
+      return 0;
+    }
+    graph->launches = grown;
+    graph->capacity = next;
+  }
+  graph->launches[graph->count++] = *launch;
+  return 1;
+}
+
+static int rt_run(const RtLaunch *launch) {
+  const char *name = g_kernels[launch->kernel - 1];
+  if (launch->counts) {
+    return mettle_metal_launch_indirect(
+        g_metal, name, launch->counts, launch->block, launch->args,
+        launch->args_size, launch->shared_bytes, g_error, sizeof(g_error));
+  }
+  return mettle_metal_launch(g_metal, name, launch->grid, launch->block,
+                             launch->args, launch->args_size,
+                             launch->shared_bytes, g_error, sizeof(g_error));
+}
+
+static int32_t rt_submit(RtLaunch *launch, const int64_t *params,
+                         int32_t nargs) {
+  int ok;
+  if (!g_metal || launch->kernel < 1 ||
+      (uint64_t)launch->kernel > g_kernel_count) {
+    rt_error("the launch names no prepared Metal kernel");
+    return 1;
+  }
+  if (!rt_pack(params, nargs, &launch->args, &launch->args_size)) {
+    return 1;
+  }
+  if (g_capturing) {
+    if (!rt_capture(launch)) {
+      free(launch->args);
+      return 1;
+    }
+    return 0;
+  }
+  ok = rt_run(launch);
+  free(launch->args);
+  return ok ? 0 : 1;
+}
+
 int32_t mettle_metal_rt_launch(int64_t kernel, int32_t gx, int32_t gy,
                                int32_t gz, int32_t bx, int32_t by, int32_t bz,
                                int32_t shared_bytes, int64_t stream,
                                const int64_t *params, int32_t nargs) {
-  unsigned char *block = NULL;
-  size_t block_size = 0;
-  uint32_t grid[3];
-  uint32_t threads[3];
-  int ok;
+  RtLaunch launch;
   (void)stream;
-  if (!g_metal || kernel < 1 || (uint64_t)kernel > g_kernel_count) {
-    rt_error("the launch names no prepared Metal kernel");
-    return 1;
-  }
   if (gx <= 0 || gy <= 0 || gz <= 0 || bx <= 0 || by <= 0 || bz <= 0 ||
       shared_bytes < 0) {
     rt_error("grid, block and shared bytes must be positive");
     return 1;
   }
-  if (!rt_pack(params, nargs, &block, &block_size)) {
+  memset(&launch, 0, sizeof(launch));
+  launch.kernel = kernel;
+  launch.grid[0] = (uint32_t)gx;
+  launch.grid[1] = (uint32_t)gy;
+  launch.grid[2] = (uint32_t)gz;
+  launch.block[0] = (uint32_t)bx;
+  launch.block[1] = (uint32_t)by;
+  launch.block[2] = (uint32_t)bz;
+  launch.shared_bytes = (size_t)shared_bytes;
+  return rt_submit(&launch, params, nargs);
+}
+
+int32_t mettle_metal_rt_launch_indirect(int64_t kernel, int64_t counts,
+                                        int32_t bx, int32_t by, int32_t bz,
+                                        int32_t shared_bytes, int64_t stream,
+                                        const int64_t *params, int32_t nargs) {
+  RtLaunch launch;
+  (void)stream;
+  if (counts == 0 || bx <= 0 || by <= 0 || bz <= 0 || shared_bytes < 0) {
+    rt_error("an indirect launch needs a grid address, and block and shared "
+             "bytes must be positive");
     return 1;
   }
-  grid[0] = (uint32_t)gx;
-  grid[1] = (uint32_t)gy;
-  grid[2] = (uint32_t)gz;
-  threads[0] = (uint32_t)bx;
-  threads[1] = (uint32_t)by;
-  threads[2] = (uint32_t)bz;
-  if (g_capturing) {
-    RtGraph *graph = &g_graphs[g_capture];
-    RtLaunch *launch;
-    if (graph->count == graph->capacity) {
-      size_t next = graph->capacity ? graph->capacity * 2 : 16;
-      RtLaunch *grown =
-          (RtLaunch *)realloc(graph->launches, next * sizeof(RtLaunch));
-      if (!grown) {
-        free(block);
-        rt_error("out of memory capturing a Metal launch graph");
-        return 1;
-      }
-      graph->launches = grown;
-      graph->capacity = next;
-    }
-    launch = &graph->launches[graph->count++];
-    launch->kernel = kernel;
-    memcpy(launch->grid, grid, sizeof(grid));
-    memcpy(launch->block, threads, sizeof(threads));
-    launch->args = block;
-    launch->args_size = block_size;
-    launch->shared_bytes = (size_t)shared_bytes;
-    return 0;
-  }
-  ok = mettle_metal_launch(g_metal, g_kernels[kernel - 1], grid, threads,
-                           block, block_size, (size_t)shared_bytes, g_error,
-                           sizeof(g_error));
-  free(block);
-  return ok ? 0 : 1;
+  memset(&launch, 0, sizeof(launch));
+  launch.kernel = kernel;
+  launch.counts = (uint64_t)counts;
+  launch.block[0] = (uint32_t)bx;
+  launch.block[1] = (uint32_t)by;
+  launch.block[2] = (uint32_t)bz;
+  launch.shared_bytes = (size_t)shared_bytes;
+  return rt_submit(&launch, params, nargs);
 }
 
 int32_t mettle_metal_rt_capture_begin(void) {
@@ -447,10 +485,7 @@ int32_t mettle_metal_rt_graph_launch(int64_t handle) {
       rt_error("a captured Metal graph outlived the library it launches");
       return 1;
     }
-    if (!mettle_metal_launch(g_metal, g_kernels[launch->kernel - 1],
-                             launch->grid, launch->block, launch->args,
-                             launch->args_size, launch->shared_bytes, g_error,
-                             sizeof(g_error))) {
+    if (!rt_run(launch)) {
       return 1;
     }
   }
@@ -500,6 +535,28 @@ void mettle_metal_rt_launch_checked(int64_t kernel, int32_t gx, int32_t gy,
              "mettle: GPU launch of %s failed with grid %dx%dx%d, block "
              "%dx%dx%d, %d shared bytes\n  Metal: %s\n",
              mettle_metal_rt_kernel_name(kernel), (int)gx, (int)gy, (int)gz,
+             (int)bx, (int)by, (int)bz, (int)shared_bytes, g_error);
+    rt_print(line);
+  }
+  exit(1);
+}
+
+void mettle_metal_rt_launch_indirect_checked(int64_t kernel, int64_t counts,
+                                             int32_t bx, int32_t by,
+                                             int32_t bz, int32_t shared_bytes,
+                                             int64_t stream,
+                                             const int64_t *params,
+                                             int32_t nargs) {
+  if (mettle_metal_rt_launch_indirect(kernel, counts, bx, by, bz, shared_bytes,
+                                      stream, params, nargs) == 0) {
+    return;
+  }
+  {
+    char line[2600];
+    snprintf(line, sizeof(line),
+             "mettle: GPU launch of %s failed with its grid at 0x%llx, block "
+             "%dx%dx%d, %d shared bytes\n  Metal: %s\n",
+             mettle_metal_rt_kernel_name(kernel), (unsigned long long)counts,
              (int)bx, (int)by, (int)bz, (int)shared_bytes, g_error);
     rt_print(line);
   }

@@ -1913,9 +1913,44 @@ dispatch KERNEL[
 - The arguments are passed by value. Device pointers are `int64` handles; scalars
   (`int32`, `float32`, ...) are forwarded with their natural width.
 
+#### A grid the GPU computed
+
+`grid_indirect:` takes the grid from device memory in place of `grid:`. Its
+value is a device address (an `int64` handle, an offset into one, or a pointer)
+of three `uint32` threadgroup counts that an earlier kernel wrote. `block:` is
+required and `grid:` and `work:` are not allowed with it.
+
+```mettle
+extern kernel moe_plan(tiles: uint32*, routes: int32*, n: int32);
+extern kernel(block = 128) expert_gemm(tiles: uint32*, x: float16*, y: float32*);
+
+dispatch moe_plan[1, 32](d_tiles, d_routes, n);
+dispatch expert_gemm[grid_indirect: d_tiles, block: (128, 1, 1)](d_tiles, dx, dy);
+```
+
+The second launch runs exactly as many threadgroups as `moe_plan` wrote, with
+no bound grid of blocks that exit early. A zero count launches nothing. Inside
+the kernel, `workgroup_uniform(tiles[0])` lets a barrier depend on the count.
+
+- Metal encodes `dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:`
+  on the buffer that holds the address, so the read happens on the GPU, in
+  order after the kernels before it. The address must be 4-byte aligned with 12
+  bytes left in its buffer. A captured graph reads the counts again on every
+  replay.
+- CUDA has no indirect launch. The provider calls `cuCtxSynchronize`, copies
+  the 12 bytes to the host and launches with those counts. That fallback
+  waits for all queued GPU work, so it costs a round trip per launch, and it
+  cannot be recorded into a CUDA graph.
+- `mettle test` reads the counts from the interpreter's memory.
+
+`gpu_launch_indirect(f, counts, bx, by, bz, shared_bytes, stream, params, nargs)`
+is the unchecked runtime form, next to `gpu_launch_3d`.
+
 `dispatch` becomes a typed, target-neutral launch operation in IR. Only host
 lowering marshals the argument cells and calls the stable
-`mtlc_gpu_launch_checked` runtime-provider ABI. The bundled CUDA provider maps
+`mtlc_gpu_launch_checked` runtime-provider ABI, or
+`mtlc_gpu_launch_indirect_checked(f, counts, bx, by, bz, shared_bytes, stream, params, nargs)`
+for `grid_indirect:`. The bundled CUDA provider maps
 that ABI to `cuLaunchKernel`; another frontend uses `mtlc_gpu_launch` to build
 the same operation without depending on Mettle syntax. A failed enqueue is not
 silently discarded: the checked statement contract names the kernel, the grid
