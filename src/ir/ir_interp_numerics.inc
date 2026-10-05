@@ -690,6 +690,9 @@ static int ii_sym_device_call(IRInterpMachine *machine,
     term = num_resize(machine->num, ii_sym_term(machine, &args[0], 64, 0), 32, 0);
     *out = ii_sym_value(machine, term, 1);
     return 1;
+  case MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32:
+    *out = args[0];
+    return 1;
   case MTLC_INTRINSIC_GPU_F32_TO_BITS:
     term = ii_sym_term(machine, &args[0], 32, 1);
     *out = ii_sym_value(machine, num_resize(machine->num, term, 64, 0), 0);

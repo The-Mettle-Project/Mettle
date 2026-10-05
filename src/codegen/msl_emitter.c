@@ -695,6 +695,7 @@ static MslClass intrinsic_class(MtlcIntrinsic intrinsic) {
   case MTLC_INTRINSIC_GPU_HFMA2:
   case MTLC_INTRINSIC_GPU_F2H2:
   case MTLC_INTRINSIC_GPU_F2BF:
+  case MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32:
     return MC_U32;
   default:
     break;
@@ -2982,6 +2983,10 @@ static int emit_bits(MslFn *fn, const IRInstruction *in) {
     materialize(fn, &in->arguments[0], MC_U32, a, sizeof(a));
     snprintf(expr, sizeof(expr), "as_type<float>(%s << 16)", a);
     store_dest(fn, in, expr, MC_F32);
+    return 1;
+  case MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32:
+    materialize(fn, &in->arguments[0], MC_U32, a, sizeof(a));
+    store_dest(fn, in, a, MC_U32);
     return 1;
   case MTLC_INTRINSIC_GPU_F2BF:
     materialize(fn, &in->arguments[0], MC_F32, a, sizeof(a));

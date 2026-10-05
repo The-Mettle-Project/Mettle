@@ -9717,6 +9717,17 @@ static void ptx_emit_numeric_intrinsic(IRProgram *program, IRFunction *func,
       sb_printf(&fn->body, "\tmov.b32 %s, %s;\n", dn, shifted_name);
       if (in->dest.name)
         bind_value(fn, in->dest.name, dv);
+    } else if (intrinsic == MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32 &&
+               in->argument_count >= 1) {
+      char a[24];
+      use_as(fn, &in->arguments[0], PC_B32, a);
+      PtxVal dv = {.cls = PC_B32, .is_unsigned = 1};
+      dv = destination_value(fn, &in->dest, dv);
+      char dn[24];
+      reg_name(PC_B32, dv.idx, dn);
+      sb_printf(&fn->body, "\tmov.b32 %s, %s;\n", dn, a);
+      if (in->dest.name)
+        bind_value(fn, in->dest.name, dv);
     } else if (intrinsic == MTLC_INTRINSIC_GPU_F2BF &&
                in->argument_count >= 1) {
       char a[24];

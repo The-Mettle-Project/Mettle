@@ -70,6 +70,7 @@ static const GpuIntrinsicSignature g_gpu_intrinsic_signatures[] = {
     {"f2h2", "uint32", 2, {"lo", "hi"}, {"float32", "float32"}},
     {"bf2f", "float32", 1, {"bits"}, {"uint32"}},
     {"f2bf", "uint32", 1, {"x"}, {"float32"}},
+    {"workgroup_uniform", "uint32", 1, {"value"}, {"uint32"}},
     {"gpu_print", NULL, 1, {"fmt"}, {"cstring"}},
     {"gpu_print_i32", NULL, 2, {"fmt", "v"}, {"cstring", "int32"}},
     {"gpu_print_f32", NULL, 2, {"fmt", "v"}, {"cstring", "float32"}},

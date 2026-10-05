@@ -427,6 +427,10 @@ static int ii_gpu_device_call(IRInterpMachine *machine,
     *out = ii_float_value((double)value);
     return 1;
   }
+  case MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32:
+    if (count < 1) break;
+    *out = ii_int_value((long long)(uint32_t)ii_as_int(&args[0]));
+    return 1;
   case MTLC_INTRINSIC_GPU_F32_TO_BITS: {
     float value;
     uint32_t bits;

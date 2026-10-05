@@ -82,6 +82,7 @@ static const IRIntrinsicName g_ir_intrinsics[] = {
     {"f2h2", MTLC_INTRINSIC_GPU_F2H2, 2},
     {"bf2f", MTLC_INTRINSIC_GPU_BF2F, 1},
     {"f2bf", MTLC_INTRINSIC_GPU_F2BF, 1},
+    {"workgroup_uniform", MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32, 1},
     {"gpu_print", MTLC_INTRINSIC_GPU_PRINT, 1},
     {"gpu_print_i32", MTLC_INTRINSIC_GPU_PRINT_I32, 2},
     {"gpu_print_f32", MTLC_INTRINSIC_GPU_PRINT_F32, 2},
@@ -5537,6 +5538,10 @@ static unsigned char ir_gpu_intrinsic_result_uniformity(
   case MTLC_INTRINSIC_GPU_BF2F:
   case MTLC_INTRINSIC_GPU_F2BF:
     return ir_gpu_uniform_arguments(map, instruction);
+  case MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32:
+    /* The programmer's assertion: e.g. a count every thread loads from one
+       address that nothing writes during the launch. */
+    return IR_GPU_UNIFORM_WORKGROUP;
   default:
     break;
   }

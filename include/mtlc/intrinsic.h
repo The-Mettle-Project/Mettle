@@ -76,6 +76,9 @@ typedef enum {
   MTLC_INTRINSIC_GPU_F2H2,
   MTLC_INTRINSIC_GPU_BF2F,
   MTLC_INTRINSIC_GPU_F2BF,
+  /* Identity that asserts its value is the same in every thread of the
+     workgroup, so control flow on it may guard barriers. */
+  MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32,
   MTLC_INTRINSIC_GPU_PRINT,
   MTLC_INTRINSIC_GPU_PRINT_I32,
   MTLC_INTRINSIC_GPU_PRINT_F32,

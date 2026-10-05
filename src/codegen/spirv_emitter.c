@@ -886,7 +886,8 @@ static SpvDesc call_result_desc(SpvFn *fn, const IRInstruction *in) {
              intrinsic == MTLC_INTRINSIC_GPU_HMUL2 ||
              intrinsic == MTLC_INTRINSIC_GPU_HFMA2 ||
              intrinsic == MTLC_INTRINSIC_GPU_F2H2 ||
-             intrinsic == MTLC_INTRINSIC_GPU_F2BF) {
+             intrinsic == MTLC_INTRINSIC_GPU_F2BF ||
+             intrinsic == MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32) {
     r.kind = MTLC_TYPE_UINT32;
     r.is_unsigned = 1;
   } else if (intrinsic == MTLC_INTRINSIC_GPU_LOAD4_F32 ||
@@ -1671,6 +1672,12 @@ static void emit_call_half_pack(SpvFn *fn, const IRInstruction *in, SpvMod *m, c
     uint32_t result = new_id(m);
     emitv(&m->functions, Op_Bitcast, 3, f32, result, shifted);
     if (in->dest.name) store_name(fn, in->dest.name, result);
+    return;
+  }
+  if (intrinsic == MTLC_INTRINSIC_GPU_WORKGROUP_UNIFORM_U32 &&
+      in->argument_count >= 1) {
+    uint32_t a = materialize(fn, &in->arguments[0], MTLC_TYPE_UINT32);
+    if (in->dest.name) store_name(fn, in->dest.name, a);
     return;
   }
   if (intrinsic == MTLC_INTRINSIC_GPU_F2BF && in->argument_count >= 1) {
