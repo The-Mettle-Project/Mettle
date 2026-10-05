@@ -2013,6 +2013,14 @@ asynchronous copies, stream-ordered allocation/free, managed memory, and
 `gpu_launch_3d` / `gpu_launch_on`. Those are runtime foundations; they do not
 yet constitute a hardware-validated scheduler or graph implementation.
 
+`gpu_graph_capture_begin(stream)` and `gpu_graph_capture_end(stream)` record
+the launches on a stream into a graph that `gpu_graph_launch(graph, stream)`
+replays. `gpu_graph_destroy` releases it, after which launching or destroying
+that handle again returns an error on both providers: CUDA's
+`CUDA_ERROR_INVALID_HANDLE` (400) from a table of live graphs, since the
+driver itself faults on a destroyed `CUgraphExec`. CUDA holds up to 256 live
+graphs.
+
 ## Building
 
 ```bash

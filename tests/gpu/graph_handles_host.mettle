@@ -1,0 +1,85 @@
+import "std/io";
+import "std/mem";
+import "std/gpu";
+
+extern kernel(block = 64) graph_bump(x: int32*, n: int32);
+extern kernel(block = 32) graph_plan(counts: uint32*, tiles: int32);
+extern kernel(block = 32) graph_tile_ids(out: int32*);
+
+fn all_equal(host: int32*, dx: int64, n: int32, want: int32) -> int32 {
+  gpu_to_host((uint8*)host, dx, (int64)n * 4);
+  var i: int32 = 0;
+  while (i < n) {
+    if (host[i] != want) { return 0; }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn check_graph_handles(host: int32*, dx: int64, n: int32) -> int32 {
+  var stream: int64 = gpu_stream_create();
+  var stale: int64 = 0;
+  var round: int32 = 0;
+  while (round < 8) {
+    if (gpu_graph_capture_begin(stream) != 0) { return 10; }
+    dispatch graph_bump[work: n](dx, n) on stream;
+    var graph: int64 = gpu_graph_capture_end(stream);
+    if (graph == 0) { return 11; }
+    if (gpu_graph_launch(graph, stream) != 0) { return 12; }
+    if (gpu_graph_launch(graph, stream) != 0) { return 12; }
+    gpu_stream_sync(stream);
+    if (stale == 0) { stale = graph; }
+    if (gpu_graph_destroy(graph) != 0) { return 13; }
+    round = round + 1;
+  }
+  if (all_equal(host, dx, n, 16) == 0) { return 14; }
+  if (gpu_graph_launch(stale, stream) == 0) { return 15; }
+  if (gpu_graph_destroy(stale) == 0) { return 16; }
+  if (gpu_graph_launch(0, stream) == 0) { return 17; }
+  if (all_equal(host, dx, n, 16) == 0) { return 18; }
+  return 0;
+}
+
+fn check_indirect_fallback(host: int32*) -> int32 {
+  var dcounts: int64 = gpu_malloc(12);
+  var dout: int64 = gpu_malloc(8 * 32 * 4);
+  var i: int32 = 0;
+  while (i < 8 * 32) {
+    host[i] = -1;
+    i = i + 1;
+  }
+  gpu_to_device(dout, (uint8*)host, 8 * 32 * 4);
+  dispatch graph_plan[1, 32](dcounts, 5);
+  dispatch graph_tile_ids[grid_indirect: dcounts, block: (32, 1, 1)](dout);
+  gpu_to_host((uint8*)host, dout, 8 * 32 * 4);
+  i = 0;
+  while (i < 8 * 32) {
+    var want: int32 = -1;
+    if (i / 32 < 5) { want = i / 32; }
+    if (host[i] != want) { return 20; }
+    i = i + 1;
+  }
+  dispatch graph_plan[1, 32](dcounts, 0);
+  dispatch graph_tile_ids[grid_indirect: dcounts, block: (32, 1, 1)](dout);
+  gpu_to_host((uint8*)host, dout, 8 * 32 * 4);
+  if (host[0] != 0 || host[5 * 32] != -1) { return 21; }
+  return 0;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 2 || gpu_init() == 0) { return 2; }
+  if (gpu_module_file(argv[1]) == 0) { return 3; }
+  var n: int32 = 300;
+  var host: int32* = (int32*)malloc(8 * 32 * 4);
+  var dx: int64 = gpu_malloc((int64)n * 4);
+  var i: int32 = 0;
+  while (i < n) {
+    host[i] = 0;
+    i = i + 1;
+  }
+  gpu_to_device(dx, (uint8*)host, (int64)n * 4);
+  var status: int32 = check_graph_handles(host, dx, n);
+  if (status == 0) { status = check_indirect_fallback(host); }
+  println("graph handles and indirect fallback on the GPU: status {status}");
+  return status;
+}

@@ -1,0 +1,16 @@
+kernel(block = 64) graph_bump(x: int32*, n: int32) {
+  var i: int32 = block.x * 64 + thread.x;
+  if (i < n) { x[i] = x[i] + 1; }
+}
+
+kernel(block = 32) graph_plan(counts: uint32*, tiles: int32) {
+  if (block.x == 0 && thread.x == 0) {
+    counts[0] = (uint32)tiles;
+    counts[1] = (uint32)1;
+    counts[2] = (uint32)1;
+  }
+}
+
+kernel(block = 32) graph_tile_ids(out: int32*) {
+  out[block.x * 32 + thread.x] = block.x;
+}

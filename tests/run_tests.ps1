@@ -2840,6 +2840,8 @@ $cases = @(
   @{ Name = "gpu_workgroup_uniform_ptx"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10"); OutputMustNotMatch = @("eligibility failed") },
   @{ Name = "gpu_workgroup_uniform_spirv"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-spirv"); OutputMustNotMatch = @("eligibility failed") },
   @{ Name = "gpu_workgroup_uniform_metal"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-metal"); OutputMustNotMatch = @("eligibility failed") },
+  @{ Name = "gpu_graph_handles_ptx"; Path = "tests/gpu/graph_handles.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
+  @{ Name = "gpu_graph_handles_host"; Path = "tests/gpu/graph_handles_host.mettle"; ShouldSucceed = $true; Args = @("--emit-obj") },
   @{ Name = "gpu_tensor_scale_rows_cpu"; Path = "tests/gpu/tensor_scale_rows.mettle"; ShouldSucceed = $true; Args = @("test"); SkipBinaryCheck = $true; OutputMustMatch = @("2 passed"); OutputMustNotMatch = @("failed", "skipped") },
   @{ Name = "err_gpu_tensor_scale_rows_ptx"; Path = "tests/gpu/tensor_scale_rows.mettle"; ShouldSucceed = $false; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10"); Pattern = "tensor_scale_rows is Metal only for now" },
   @{ Name = "err_gpu_tensor_scale_rows_shape"; Path = "tests/err_gpu_tensor_scale_rows_shape.mettle"; ShouldSucceed = $false; Args = @("--emit-metal"); Pattern = "tensor_scale_rows shape must be an identifier like m16n32" },

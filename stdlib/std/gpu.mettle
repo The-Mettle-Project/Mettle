@@ -457,6 +457,18 @@ export fn mtlc_gpu_launch_indirect_checked(f: int64, counts: int64,
   return cuStreamBeginCapture_v2(stream, 1);
 }
 
+var g_gpu_graphs: int64[256];
+var g_gpu_graph_count: int32 = 0;
+
+fn __mtlc_gpu_graph_slot(exec: int64) -> int32 {
+  var i: int32 = 0;
+  while (i < g_gpu_graph_count) {
+    if (g_gpu_graphs[i] == exec) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
 export fn gpu_graph_capture_end(stream: int64) -> int64 {
   var graph: int64 = 0;
   if (cuStreamEndCapture(stream, &graph) != 0) { return 0; }
@@ -465,14 +477,26 @@ export fn gpu_graph_capture_end(stream: int64) -> int64 {
   var rc: int32 = cuGraphInstantiateWithFlags(&exec, graph, 0);
   cuGraphDestroy(graph);
   if (rc != 0) { return 0; }
+  if (g_gpu_graph_count >= 256) {
+    cuGraphExecDestroy(exec);
+    __mtlc_gpu_note("mettle: 256 CUDA graphs are alive; destroy one before capturing another\n");
+    return 0;
+  }
+  g_gpu_graphs[g_gpu_graph_count] = exec;
+  g_gpu_graph_count = g_gpu_graph_count + 1;
   return exec;
 }
 
-@inline export fn gpu_graph_launch(exec: int64, stream: int64) -> int32 {
+export fn gpu_graph_launch(exec: int64, stream: int64) -> int32 {
+  if (exec == 0 || __mtlc_gpu_graph_slot(exec) < 0) { return 400; }
   return cuGraphLaunch(exec, stream);
 }
 
-@inline export fn gpu_graph_destroy(exec: int64) -> int32 {
+export fn gpu_graph_destroy(exec: int64) -> int32 {
+  var slot: int32 = __mtlc_gpu_graph_slot(exec);
+  if (exec == 0 || slot < 0) { return 400; }
+  g_gpu_graph_count = g_gpu_graph_count - 1;
+  g_gpu_graphs[slot] = g_gpu_graphs[g_gpu_graph_count];
   return cuGraphExecDestroy(exec);
 }
 

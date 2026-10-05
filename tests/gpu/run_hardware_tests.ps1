@@ -512,6 +512,15 @@ try {
   & $gridHost $gridPtx
   if ($LASTEXITCODE -ne 0) { throw "block-scaled int8 on the GPU differs from the CPU grid runner" }
 
+  $graphPtx = Join-Path $temp "graph_handles.ptx"
+  $graphHost = Join-Path $temp "graph_handles_host.exe"
+  & $compiler -O --emit-ptx "--gpu-arch=$tileArch" (Join-Path $root "tests/gpu/graph_handles.mettle") -o $graphPtx
+  if ($LASTEXITCODE -ne 0) { throw "graph handle PTX compilation failed" }
+  & $compiler --build (Join-Path $root "tests/gpu/graph_handles_host.mettle") -o $graphHost --link-arg (Join-Path $env:CUDA_PATH "lib/x64/cuda.lib")
+  if ($LASTEXITCODE -ne 0) { throw "graph handle host compilation failed" }
+  & $graphHost $graphPtx
+  if ($LASTEXITCODE -ne 0) { throw "CUDA graph handles or the indirect-dispatch fallback failed on the GPU" }
+
   if ($Sanitizer) {
     $computeSanitizer = Get-Command compute-sanitizer -ErrorAction SilentlyContinue
     if (-not $computeSanitizer) {
