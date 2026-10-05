@@ -492,6 +492,8 @@ jobs:
           test "$(/tmp/threads)" = "THREADS OK"
           ./bin/mettle --build examples/job_system/job_system.mettle -o /tmp/job_system
           test "$(/tmp/job_system)" = "jobs 32 of 32, phase 3, sum 95216"
+          ./bin/mettle --build tests/test_cstring_global.mettle -o /tmp/cstring_global
+          rc=0; /tmp/cstring_global || rc=$?; test $rc -eq 42
           ./bin/mettle --build tests/test_parallel_loop.mettle -o /tmp/parallel
           /tmp/parallel
 

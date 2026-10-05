@@ -153,7 +153,7 @@ static int module_symbol_numeric(const IRProgram *program, const char *name,
     num_from_int(out, s->const_value);
     return 1;
   }
-  if (s->kind == IR_MODSYM_VARIABLE && s->has_initializer) {
+  if (s->kind == IR_MODSYM_VARIABLE && s->has_initializer && !s->init_string) {
     if (s->init_is_float) {
       double d;
       memcpy(&d, &s->init_bits, sizeof(d));
@@ -651,6 +651,15 @@ static void populate_scalar_initializer(IRProgram *program, TypeChecker *tc,
     } else {
       entry->has_unfoldable_initializer = 1;
     }
+    return;
+  }
+
+  if (entry->type && entry->type->kind == MTLC_TYPE_POINTER &&
+      initializer->type == AST_STRING_LITERAL) {
+    StringLiteral *lit = (StringLiteral *)initializer->data;
+    entry->has_initializer = 1;
+    entry->init_string = lit && lit->value ? lit->value : "";
+    entry->init_string_length = lit && lit->value ? lit->length : 0;
     return;
   }
 

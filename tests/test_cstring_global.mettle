@@ -1,0 +1,23 @@
+var greeting: cstring = "hello";
+var empty: cstring = "";
+var letters: cstring = "abc";
+var nothing: cstring = 0;
+
+fn length_of(s: cstring) -> int64 {
+  var bytes: uint8* = (uint8*)s;
+  var n: int64 = 0;
+  while (bytes[n] != 0) {
+    n = n + 1;
+  }
+  return n;
+}
+
+fn main() -> int32 {
+  if (length_of(greeting) != 5) { return 1; }
+  if (length_of(empty) != 0) { return 2; }
+  if (((uint8*)letters)[2] != 99) { return 3; }
+  if (nothing != 0) { return 4; }
+  greeting = "xy";
+  if (length_of(greeting) != 2) { return 5; }
+  return 42;
+}

@@ -472,6 +472,49 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
     return 1;
   }
 
+  if (type->kind == MTLC_TYPE_POINTER && sym->has_initializer &&
+      sym->init_string) {
+    size_t rdata_section = binary_emitter_get_or_create_section(
+        emitter, ".rdata", BINARY_SECTION_RDATA, 0, 8);
+    size_t slot_section = binary_emitter_get_or_create_section(
+        emitter, ".data", BINARY_SECTION_DATA, 0, 8);
+    size_t chars_offset = 0;
+    size_t slot_offset = 0;
+    size_t length = sym->init_string_length;
+    unsigned char terminator = 0;
+    char *chars_label = code_generator_generate_label(generator, "str_chars");
+    int ok = 0;
+
+    if (rdata_section == (size_t)-1 || slot_section == (size_t)-1 ||
+        !chars_label) {
+      code_generator_set_error(generator,
+                               "Failed to emit pointer global '%s'", sym->name);
+      free(chars_label);
+      return 0;
+    }
+    ok = binary_emitter_append_bytes(emitter, rdata_section, sym->init_string,
+                                     length, &chars_offset) &&
+         binary_emitter_append_bytes(emitter, rdata_section, &terminator, 1,
+                                     NULL) &&
+         binary_emitter_define_symbol(emitter, chars_label, BINARY_SYMBOL_LOCAL,
+                                      rdata_section, chars_offset,
+                                      length + 1) &&
+         binary_emitter_align_section(emitter, slot_section, 8, 0) &&
+         binary_emitter_append_zeros(emitter, slot_section, 8, &slot_offset) &&
+         binary_emitter_add_relocation(emitter, slot_section, slot_offset,
+                                       BINARY_RELOCATION_ADDR64, chars_label,
+                                       0) &&
+         binary_emitter_define_symbol(emitter, link_name, BINARY_SYMBOL_GLOBAL,
+                                      slot_section, slot_offset, 8);
+    free(chars_label);
+    if (!ok) {
+      code_generator_binary_emitter_error(
+          generator, emitter, "Failed to emit pointer global string");
+      return 0;
+    }
+    return 1;
+  }
+
   if (sym->init_symbol_ref && sym->init_symbol_ref[0] != '\0') {
     size_t ref_section = 0;
     size_t ref_offset = 0;

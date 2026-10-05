@@ -9717,6 +9717,25 @@ catch {
   Write-CaseResult -Name "const_global_float_string_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $exePath = Join-Path $tmpDir "cstring_global.exe"
+  $buildOut = & $CompilerPath --build "tests/test_cstring_global.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "cstring global build failed: $buildOut"
+  }
+  & $exePath 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 42) {
+    throw "cstring global exited with $LASTEXITCODE (expected 42)"
+  }
+  Write-CaseResult -Name "cstring_global_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "cstring_global_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
 # Conditional imports: --build and verify off-target guarded imports are dropped.
 $total++
 try {
@@ -15260,6 +15279,15 @@ try {
   }
   if ((Get-ElfSectionSize ([IO.File]::ReadAllBytes($fnGlobalObj)) ".rela.data") -le 0) {
     throw "fn_pointer_global.o leaves its function-pointer global without a data relocation"
+  }
+
+  $cstringGlobalObj = Join-Path $objDir "cstring_global.o"
+  & $CompilerPath --emit-arm64-obj tests/test_cstring_global.mettle -o $cstringGlobalObj 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "mettle --emit-arm64-obj failed on test_cstring_global.mettle"
+  }
+  if ((Get-ElfSectionSize ([IO.File]::ReadAllBytes($cstringGlobalObj)) ".rela.data") -le 0) {
+    throw "cstring_global.o leaves its string-literal cstring globals without a data relocation"
   }
 
   # Cross output chooses its target OS standard library, not the compiler host.

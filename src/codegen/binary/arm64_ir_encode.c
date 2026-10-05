@@ -3297,6 +3297,20 @@ static int build_data_image(Arm64Data *d, const IRProgram *prog, Arm64Emit *e) {
       continue;
     }
 
+    if (s->type->kind == MTLC_TYPE_POINTER && s->has_initializer &&
+        s->init_string) {
+      size_t length = s->init_string_length;
+      size_t chars = data_reserve(d, length + 1, 1);
+      if (chars == (size_t)-1) {
+        arm64_fail(e, "out of memory storing the text of global '%s'", s->name);
+        return 0;
+      }
+      memcpy(d->bytes + chars, s->init_string, length + 1);
+      uint64_t address = (uint64_t)ELF_DATA_VADDR + (uint64_t)chars;
+      memcpy(d->bytes + base, &address, 8);
+      continue;
+    }
+
     if (s->init_symbol_ref ||
         (s->init_reloc_count > 0 && s->init_relocs[0].symbol)) {
       const char *target =
@@ -3710,6 +3724,33 @@ static int arm64_object_emit_global(Arm64ObjectContext *object,
       symbol->type->kind == MTLC_TYPE_ARRAY) {
     return arm64_object_emit_aggregate(object, symbol, link_name, data_section,
                                        bss_section);
+  }
+
+  if (symbol->type->kind == MTLC_TYPE_POINTER && symbol->has_initializer &&
+      symbol->init_string) {
+    char chars_symbol[64];
+    size_t chars_offset = 0;
+    size_t slot = 0;
+    size_t length = symbol->init_string_length;
+    snprintf(chars_symbol, sizeof(chars_symbol), ".Lmtlc.gstr.%u",
+             object->string_id++);
+    if (!binary_emitter_append_bytes(emitter, object->rodata_section,
+                                     symbol->init_string, length + 1,
+                                     &chars_offset) ||
+        !binary_emitter_define_symbol(emitter, chars_symbol,
+                                      BINARY_SYMBOL_LOCAL,
+                                      object->rodata_section, chars_offset,
+                                      length + 1) ||
+        !binary_emitter_align_section(emitter, data_section, 8, 0) ||
+        !binary_emitter_append_zeros(emitter, data_section, 8, &slot) ||
+        !binary_emitter_add_relocation(emitter, data_section, slot,
+                                       BINARY_RELOCATION_ADDR64, chars_symbol,
+                                       0)) {
+      return 0;
+    }
+    return binary_emitter_define_symbol(emitter, link_name,
+                                        BINARY_SYMBOL_GLOBAL, data_section,
+                                        slot, 8);
   }
 
   if (symbol->init_symbol_ref && symbol->init_symbol_ref[0]) {
