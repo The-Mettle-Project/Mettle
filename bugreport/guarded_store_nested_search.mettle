@@ -1,0 +1,53 @@
+import "std/io";
+import "std/mem";
+import "std/conv";
+
+fn put(label: cstring, v: int64) {
+  var buf: uint8[24];
+  int_to_dec(&buf[0], v);
+  print(str_from_cstr(label));
+  println(str_from_cstr(&buf[0]));
+}
+
+fn fill(ord: int32*, cur: int64*, home: int64*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    ord[i] = n - 1 - i;
+    home[i] = (int64)(1000 + i);
+    cur[i] = home[i];
+    if (i % 2 == 0) { cur[i] = (int64)i; }   // even entries already "cached"
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  var n: int32 = 64;
+  var ord: int32* = (int32*)malloc((int64)n * 4);
+  var cur: int64* = (int64*)malloc((int64)n * 8);
+  var home: int64* = (int64*)malloc((int64)n * 8);
+  fill(ord, cur, home, n);
+  var nslots: int32 = 64;
+  var occ: int32* = (int32*)malloc((int64)nslots * 4);
+  var k: int32 = 0;
+  while (k < nslots) {
+    occ[k] = -1;
+    if (k < 8) { occ[k] = 0; }
+    k = k + 1;
+  }
+  var moves: int32 = 0;
+  var free_slot: int32 = 0;
+  var r: int32 = 0;
+  while (r < n && moves < 1000) {
+    var cell: int64 = (int64)ord[r];
+    if (cur[cell] == home[cell]) {
+      while (free_slot < nslots && occ[free_slot] >= 0) { free_slot = free_slot + 1; }
+      if (free_slot >= nslots) { break; }
+      cur[cell] = (int64)(5000 + free_slot);
+      occ[free_slot] = (int32)cell;
+      moves = moves + 1;
+    }
+    r = r + 1;
+  }
+  put("moves (want 32) = ", (int64)moves);
+  return 0;
+}

@@ -1,0 +1,55 @@
+import "std/io";
+import "std/mem";
+import "std/conv";
+
+var g_frac: float32 = 0.5;
+
+fn put(label: cstring, v: int64) {
+  var buf: uint8[24];
+  int_to_dec(&buf[0], v);
+  print(str_from_cstr(label));
+  println(str_from_cstr(&buf[0]));
+}
+
+fn fill(order: int32*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    order[i] = i;
+    i = i + 1;
+  }
+}
+
+fn main() -> int32 {
+  var E: int32 = 128;
+  var inv: uint8* = (uint8*)malloc((int64)E);
+  var order: int32* = (int32*)malloc((int64)E * 4);
+  fill(order, E);
+  var q: int32 = 32;
+  var core: int32 = (int32)((float32)q * g_frac);
+  var nv: int32 = 0;
+  var homes: int32 = 0;
+  var r: int32 = 0;
+  while (r < E) {
+    var cell: int64 = (int64)order[r];
+    if (r < q) {
+      inv[cell] = 1;
+      if (r < core) { inv[cell] = 5; }
+      nv = nv + 1;
+    }
+    if (r >= core) {
+      inv[cell] = inv[cell] | 2;
+      homes = homes + 1;
+    }
+    r = r + 1;
+  }
+  var n5: int32 = 0;
+  var i: int32 = 0;
+  while (i < E) {
+    if (inv[i] == 5) { n5 = n5 + 1; }
+    i = i + 1;
+  }
+  put("nv (want 32) = ", (int64)nv);
+  put("homes (want 112) = ", (int64)homes);
+  put("core marks (want 16) = ", (int64)n5);
+  return 0;
+}

@@ -1,0 +1,24 @@
+import "std/io";
+import "std/mem";
+
+const CH = 32;
+var g_owner: int32* = 0;
+
+fn fill(b: int32) {
+  var k: int32 = 0;
+  while (k < CH) {
+    g_owner[b * CH + k] = -1;
+    k = k + 1;
+  }
+}
+
+fn main() -> int32 {
+  g_owner = (int32*)malloc(4 * 64 * 4);
+  fill(2);
+  if (g_owner[64] != -1 || g_owner[95] != -1) {
+    println("wrong");
+    return 1;
+  }
+  println("ok");
+  return 0;
+}

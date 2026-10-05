@@ -595,8 +595,13 @@ static int ir_append_parameter_materialization(
     declare_local.location = call_instruction->location;
     declare_local.dest = ir_operand_symbol(mapped_name);
     declare_local.text = mettle_strdup(type_name);
-    declare_local.value_type =
+    MtlcType *parameter_type =
         callee_symbol ? callee_symbol->param_types[i] : NULL;
+    if (parameter_type && (parameter_type->kind == MTLC_TYPE_STRUCT ||
+                           parameter_type->kind == MTLC_TYPE_ARRAY ||
+                           parameter_type->kind == MTLC_TYPE_TAGGED_ENUM)) {
+      declare_local.value_type = parameter_type;
+    }
     if (!declare_local.dest.name || !declare_local.text ||
         !ir_instruction_vector_append_move(vector, &declare_local)) {
       ir_instruction_destroy_storage(&declare_local);
