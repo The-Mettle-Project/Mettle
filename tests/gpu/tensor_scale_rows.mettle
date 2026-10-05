@@ -1,0 +1,115 @@
+kernel(block = 32) scale_resident(p: uint16*, v: uint16*, alpha: float32*,
+                                  d: float32 global*) {
+  workgroup var s: float32[16];
+  tensor_mma(p, v, 0.0, d, shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, d_layout: row, lda: 48, ldb: 48);
+  var chunk: int32 = 1;
+  while (chunk < 3) {
+    if (thread.x < 16) {
+      s[thread.x] = alpha[(chunk - 1) * 16 + thread.x];
+    }
+    barrier(workgroup, acq_rel);
+    tensor_scale_rows(d, &s[0], shape: m16n16);
+    tensor_mma(p + chunk * 16, v + chunk * 16, d, d, shape: m16n16k16,
+               input_type: f16, output_type: f32, a_layout: row, b_layout: col,
+               d_layout: row, lda: 48, ldb: 48);
+    barrier(workgroup, acq_rel);
+    chunk = chunk + 1;
+  }
+}
+
+kernel(block = 32) scale_memory(alpha: float32*, d: float32*, ld: int32) {
+  tensor_scale_rows(d, alpha, shape: m8n24, ldd: ld);
+}
+
+fn half_bits(x: int32) -> uint16 {
+  if (x == 0) { return (uint16)0; }
+  var sign: int32 = 0;
+  var m: int32 = x;
+  if (m < 0) {
+    sign = 0x8000;
+    m = -m;
+  }
+  var e: int32 = 0;
+  while ((1 << (e + 1)) <= m) { e = e + 1; }
+  return (uint16)(sign | ((e + 15) << 10) | ((m << (10 - e)) & 0x3FF));
+}
+
+fn p_value(r: int32, k: int32) -> int32 { return (3 * r + k) % 7 - 3; }
+fn v_value(k: int32, c: int32) -> int32 { return (c + 2 * k) % 5 - 2; }
+fn alpha_value(chunk: int32, r: int32) -> float32 {
+  if (chunk == 1) { return (float32)(r + 1) * 0.5; }
+  return (float32)(r % 4) - 1.5;
+}
+
+fn expected(r: int32, c: int32) -> float32 {
+  var acc: float32 = 0.0;
+  var chunk: int32 = 0;
+  while (chunk < 3) {
+    if (chunk > 0) { acc = acc * alpha_value(chunk, r); }
+    var k: int32 = chunk * 16;
+    while (k < chunk * 16 + 16) {
+      acc = acc + (float32)(p_value(r, k) * v_value(k, c));
+      k = k + 1;
+    }
+    chunk = chunk + 1;
+  }
+  return acc;
+}
+
+@test fn rows_scale_between_resident_updates() -> int32 {
+  var p: uint16[768];
+  var v: uint16[768];
+  var alpha: float32[32];
+  var d: float32[256];
+  var r: int32 = 0;
+  while (r < 16) {
+    var k: int32 = 0;
+    while (k < 48) {
+      p[r * 48 + k] = half_bits(p_value(r, k));
+      v[r * 48 + k] = half_bits(v_value(k, r));
+      k = k + 1;
+    }
+    alpha[r] = alpha_value(1, r);
+    alpha[16 + r] = alpha_value(2, r);
+    r = r + 1;
+  }
+  dispatch scale_resident[grid: (1, 1, 1), block: (32, 1, 1)](
+      &p[0], &v[0], &alpha[0], (float32 global*)&d[0]);
+  r = 0;
+  while (r < 16) {
+    var c: int32 = 0;
+    while (c < 16) {
+      if (d[r * 16 + c] != expected(r, c)) { return 1; }
+      c = c + 1;
+    }
+    r = r + 1;
+  }
+  return 0;
+}
+
+@test fn rows_scale_in_memory() -> int32 {
+  var alpha: float32[8];
+  var d: float32[256];
+  var i: int32 = 0;
+  while (i < 256) {
+    d[i] = (float32)i;
+    i = i + 1;
+  }
+  i = 0;
+  while (i < 8) {
+    alpha[i] = (float32)(i + 2) * 0.25;
+    i = i + 1;
+  }
+  dispatch scale_memory[grid: (1, 1, 1), block: (32, 1, 1)](&alpha[0], &d[0], 32);
+  i = 0;
+  while (i < 256) {
+    var r: int32 = i / 32;
+    var c: int32 = i % 32;
+    var want: float32 = (float32)i;
+    if (r < 8 && c < 24) { want = (float32)i * alpha[r]; }
+    if (d[i] != want) { return 1; }
+    i = i + 1;
+  }
+  return 0;
+}

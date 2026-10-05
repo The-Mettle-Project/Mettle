@@ -1308,6 +1308,56 @@ the region is entered only from inside it, that every block ending inside
 it leaves only to blocks inside it or to the commit, and the operand rules.
 PTX reports `mtlc.tensor_region resident ...` or `replay ...`.
 
+#### Scaling the rows of an accumulator
+
+`tensor_scale_rows(D, scale, shape: mXnY, ...)` multiplies row r of the
+M x N tile D by `scale[r]`, a `float32` in workgroup or device memory. It is
+the `O = diag(alpha) O` half of single-pass attention, where O has to stay in
+registers across key chunks:
+
+```mettle
+kernel(block = 32) attend(p: uint16*, v: uint16*, alpha: float32*,
+                          o: float32 global*) {
+  workgroup var s: float32[16];
+  tensor_mma(p, v, 0.0, o, shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, lda: 48, ldb: 48);
+  var chunk: int32 = 1;
+  while (chunk < 3) {
+    if (thread.x < 16) { s[thread.x] = alpha[(chunk - 1) * 16 + thread.x]; }
+    barrier(workgroup, acq_rel);
+    tensor_scale_rows(o, &s[0], shape: m16n16);
+    tensor_mma(p + chunk * 16, v + chunk * 16, o, o, shape: m16n16k16,
+               input_type: f16, output_type: f32, a_layout: row,
+               b_layout: col, lda: 48, ldb: 48);
+    barrier(workgroup, acq_rel);
+    chunk = chunk + 1;
+  }
+}
+```
+
+The options are `shape` (M and N, no K), `accumulator_type` or `output_type`
+(`f32`, the default, or `f16`), `d_layout` (`row` by default), `ldd` (a
+constant or a runtime integer; N or M by default) and `scope`. Every lane of
+the subgroup executes it, like `tensor_mma`.
+
+When D is a region-resident accumulator with the same shape, format, layout
+and leading dimension, the scale joins the group as an update that touches no
+memory: the region former accepts it, the verifier checks it, and Metal
+multiplies the `simdgroup_matrix` registers in place through
+`thread_elements()`. Lane l of an 8x8 fragment holds row
+`((l / 4) & 4) + (l / 2) % 4`, columns `((l / 4) & 2) * 2 + (l % 2) * 2` and
+the one after it; an M4 Pro returned exactly that map for every lane. As with
+any region, D needs a known address space (`float32 global*`) when the region
+stores to workgroup memory, and the start and the updates need the same MMA
+descriptor. Anywhere else the scale reads and writes D in memory. `--explain`
+says when the region formed, and the `.metal` file declares the accumulator as
+`simdgroup_float8x8 mtl_res_N[...]`.
+
+Metal only for now: PTX keeps resident accumulators in WMMA fragments, whose
+element layout is unspecified, and refuses `tensor_scale_rows`; there,
+`tensor_mma` with `c_scale_mode: per_row` scales C on its way in. SPIR-V has no
+tensor MMA. The CPU grid runner scales f32 tiles in memory.
+
 This accepts an arbitrary explicit N-stage sequence within the asynchronous
 group contract; it does not hard-code double buffering. The compiler does not
 yet generate the tile loop or buffer rotation, unroll an arbitrary MMA
@@ -2195,6 +2245,7 @@ dispatch. The launch-sized workgroup arena is `threadgroup(0)`, sized with
 | uint32 atomics | `atomic_uint`; ordered forms use `atomic_thread_fence` on Metal 3.2 and native orders on 4.1 |
 | `async_copy_workgroup` | ordinary copies, in order |
 | `tensor_mma` with f16, bf16 or f32 inputs | `simdgroup_matrix` 8x8 tiles |
+| `tensor_scale_rows` on a resident accumulator | `thread_elements()` of its `simdgroup_matrix` tiles |
 | block-scaled int8 x int8/int4 `tensor_mma` | exact integer dot products in scalar code, the CPU grid runner's rounding sequence |
 | `gpu_print`, `gpu_print_i32`, ... | `os_log_default.log`, Metal 3.2 |
 

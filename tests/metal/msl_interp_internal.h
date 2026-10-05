@@ -46,7 +46,7 @@ enum {
   MSL_OP_FIELD, MSL_OP_INDEX, MSL_OP_BINARY, MSL_OP_UNARY, MSL_OP_CAST, MSL_OP_ASTYPE,
   MSL_OP_PTR_TO_INT, MSL_OP_INT_TO_PTR, MSL_OP_EXTRACT, MSL_OP_JUMP, MSL_OP_JUMP_FALSE,
   MSL_OP_POP, MSL_OP_DUP, MSL_OP_CALL, MSL_OP_RETURN, MSL_OP_RETURN_VALUE, MSL_OP_BUILTIN,
-  MSL_OP_SYNC, MSL_OP_LOG, MSL_OP_FALL_OFF
+  MSL_OP_SYNC, MSL_OP_LOG, MSL_OP_FALL_OFF, MSL_OP_LANE_ELEM
 };
 
 enum { MSL_VAR_THREAD, MSL_VAR_GROUP, MSL_VAR_ARGS };
@@ -324,6 +324,7 @@ int msl_exec_thread(MslRun *run, MslThread *thread);
 int msl_exec_builtin(MslRun *run, MslThread *thread, const MslInsn *insn);
 int msl_exec_log(MslRun *run, MslThread *thread, const MslInsn *insn);
 int msl_resolve_simd(MslRun *run, MslThread **lanes, uint32_t count, const MslInsn *insn);
+uint32_t msl_matrix_lane_element(uint32_t lane);
 size_t msl_sync_arg_slots(const MslInsn *insn);
 uint64_t msl_set_step_budget(uint64_t budget);
 

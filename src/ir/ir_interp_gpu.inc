@@ -8,7 +8,7 @@ static int ii_sym_device_call(IRInterpMachine *machine,
                               IRInterpValue *out, int *handled);
 
 static int ii_gpu_is_collective(const IRInstruction *insn) {
-  if (insn->op == IR_OP_TENSOR_MMA) {
+  if (insn->op == IR_OP_TENSOR_MMA || insn->op == IR_OP_TENSOR_SCALE_ROWS) {
     return 1;
   }
   if (insn->op == IR_OP_BARRIER &&
@@ -899,6 +899,57 @@ static int ii_gpu_tensor_mma_symbolic(IRInterpMachine *machine,
   return 1;
 }
 
+static int ii_gpu_tensor_scale_rows(IRInterpMachine *machine,
+                                    IIFrame *frame,
+                                    const IRInstruction *insn) {
+  const MtlcTensorMmaDesc *desc = &IR_TENSOR_MMA(insn);
+  unsigned long long d = 0, scale = 0;
+  unsigned long long ld = desc->d_leading_dimension;
+  int row_major = desc->d_layout == MTLC_TENSOR_LAYOUT_ROW_MAJOR;
+  if (machine->num || desc->accumulator_element != MTLC_TENSOR_ELEMENT_FLOAT32 ||
+      insn->argument_count != ir_tensor_scale_rows_operand_count(desc)) {
+    ii_fail(machine, IR_INTERP_UNSUPPORTED,
+            "a tensor_scale_rows the CPU grid runner does not model: it "
+            "scales f32 accumulators");
+    return 0;
+  }
+  if (!ii_fetch_addr(machine, frame, &insn->arguments[0], &d) ||
+      !ii_fetch_addr(machine, frame, &insn->arguments[1], &scale)) {
+    return 0;
+  }
+  if (insn->argument_count > 2) {
+    long long value = 0;
+    if (!ii_fetch_int(machine, frame, &insn->arguments[2], &value)) {
+      return 0;
+    }
+    ld = (unsigned long long)value;
+  }
+  for (unsigned r = 0; r < desc->m; r++) {
+    double factor = 1.0;
+    if (!ii_mma_scale(machine, scale, r, MTLC_TENSOR_ELEMENT_FLOAT32,
+                      &factor)) {
+      return 0;
+    }
+    for (unsigned c = 0; c < desc->n; c++) {
+      unsigned long long at =
+          d + 4u * (row_major ? (unsigned long long)r * ld + c
+                              : (unsigned long long)c * ld + r);
+      unsigned char bytes[4];
+      float value;
+      if (!ii_gpu_read(machine, at, 4, bytes)) {
+        return 0;
+      }
+      memcpy(&value, bytes, 4);
+      value = value * (float)factor;
+      memcpy(bytes, &value, 4);
+      if (!ii_gpu_write(machine, at, 4, bytes)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 static int ii_gpu_tensor_mma(IRInterpMachine *machine, IIFrame *frame,
                              const IRInstruction *insn) {
   const MtlcTensorMmaDesc *desc = &IR_TENSOR_MMA(insn);
@@ -1254,10 +1305,14 @@ static int ii_gpu_run_collective(IRInterpMachine *machine,
                                  long long lanes) {
   const IRInstruction *insn = threads[first].site;
   int ok = 1;
-  if (insn->op == IR_OP_TENSOR_MMA) {
+  if (insn->op == IR_OP_TENSOR_MMA || insn->op == IR_OP_TENSOR_SCALE_ROWS) {
     ii_gpu_set_thread(machine, first);
     machine->gpu_current = &threads[first];
-    ok = ii_gpu_tensor_mma(machine, (IIFrame *)threads[first].frame, insn);
+    ok = insn->op == IR_OP_TENSOR_MMA
+             ? ii_gpu_tensor_mma(machine, (IIFrame *)threads[first].frame,
+                                 insn)
+             : ii_gpu_tensor_scale_rows(
+                   machine, (IIFrame *)threads[first].frame, insn);
     machine->gpu_current = NULL;
   } else if (insn->op == IR_OP_CALL) {
     ok = ii_gpu_subgroup_collective(machine, threads, first, lanes, insn);

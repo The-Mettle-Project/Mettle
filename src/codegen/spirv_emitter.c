@@ -2062,6 +2062,7 @@ static void emit_body_instr(SpvFn *fn, const IRInstruction *in) {
   case IR_OP_ASYNC_WAIT:
     break;
   case IR_OP_TENSOR_MMA:
+  case IR_OP_TENSOR_SCALE_ROWS:
     mod_error(fn->m,
               "SPIR-V OpenCL 2.0 profile has no cooperative-matrix capability; tensor MMA requires a newer explicit device profile");
     break;

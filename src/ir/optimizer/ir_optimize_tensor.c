@@ -388,6 +388,16 @@ static int tensor_region_control_valid(const IRFunction *function,
   return 1;
 }
 
+static int tensor_scale_rows_joins(const IRProgram *program,
+                                   const IRFunction *function,
+                                   const IRInstruction *first,
+                                   const IRInstruction *instruction) {
+  return instruction->op == IR_OP_TENSOR_SCALE_ROWS &&
+         instruction->tensor_residency_role == IR_TENSOR_RESIDENCY_NONE &&
+         instruction->tensor_residency_scope == IR_TENSOR_RESIDENCY_SCOPE_NONE &&
+         ir_tensor_scale_rows_joins(program, function, first, instruction);
+}
+
 static size_t tensor_region_scan_updates(const IRProgram *program,
                                          const IRFunction *function,
                                          const IRInstruction *first,
@@ -406,6 +416,10 @@ static size_t tensor_region_scan_updates(const IRProgram *program,
         ir_tensor_region_update_operands_clean(instruction, output)) {
       last_update_index = i;
       (*update_count)++;
+      continue;
+    }
+    if (tensor_scale_rows_joins(program, function, first, instruction)) {
+      last_update_index = i;
       continue;
     }
     if (!ir_tensor_region_instruction_allowed(program, function, instruction,
@@ -546,10 +560,13 @@ static int tensor_try_form_region_residency(IRFunction *function,
     IRInstruction *update = &function->instructions[i];
     // Only the MMAs that join this accumulator: another tensor op in the
     // region (its own tile, disjoint from D) stays outside the group.
-    if (update->op != IR_OP_TENSOR_MMA ||
-        update->tensor_residency_role != IR_TENSOR_RESIDENCY_NONE ||
-        !tensor_instruction_can_join(first, update) ||
-        !ir_tensor_region_update_operands_clean(update, output))
+    int joins_as_mma =
+        update->op == IR_OP_TENSOR_MMA &&
+        update->tensor_residency_role == IR_TENSOR_RESIDENCY_NONE &&
+        tensor_instruction_can_join(first, update) &&
+        ir_tensor_region_update_operands_clean(update, output);
+    if (!joins_as_mma &&
+        !tensor_scale_rows_joins(program, function, first, update))
       continue;
     update->tensor_residency_id = group_id;
     update->tensor_residency_role = IR_TENSOR_RESIDENCY_UPDATE;

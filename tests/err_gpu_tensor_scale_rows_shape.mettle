@@ -1,0 +1,3 @@
+kernel(block = 32) bad_shape(alpha: float32*, d: float32*) {
+  tensor_scale_rows(d, alpha, shape: m16n16k16);
+}

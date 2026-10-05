@@ -290,6 +290,7 @@ typedef struct {
   size_t tensor_transfer_coordinate_arguments[MTLC_TENSOR_MAX_RANK];
   int is_tensor_mma;
   int is_tensor_matmul;
+  int is_tensor_scale_rows;
   int tile_builtin;
   unsigned tensor_tile_mask;
   int tensor_c_zero;

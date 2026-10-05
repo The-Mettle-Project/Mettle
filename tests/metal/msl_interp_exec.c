@@ -730,6 +730,13 @@ static int step(MslRun *run, MslThread *t, const MslInsn *in) {
     case MSL_OP_STORE: return op_store(run, t, in);
     case MSL_OP_PTR_ADD: return op_ptr_add(run, t, in);
     case MSL_OP_FIELD: t->stack[t->sp - 1] += (uint64_t)in->a; return 1;
+    case MSL_OP_LANE_ELEM:
+      if (run->simd_width != 32) {
+        return msl_run_fail(run, t, in->line, "thread_elements() follows the 32-lane matrix layout; this dispatch has %u lanes",
+                            run->simd_width);
+      }
+      t->stack[t->sp - 1] += (uint64_t)((msl_matrix_lane_element(t->lane) + (uint32_t)in->a) * (uint64_t)in->b);
+      return 1;
     case MSL_OP_INDEX: return op_index(run, t, in);
     case MSL_OP_BINARY: return op_binary(run, t, in);
     case MSL_OP_UNARY: return op_unary(run, t, in);

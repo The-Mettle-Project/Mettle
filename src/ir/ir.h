@@ -120,6 +120,7 @@ typedef enum {
   IR_OP_PHI,
   IR_OP_ASM_RESULT,
   IR_OP_TILE,
+  IR_OP_TENSOR_SCALE_ROWS,
   IR_OP_KIND_COUNT
 } IROpcode;
 
@@ -252,6 +253,7 @@ size_t ir_tensor_epilogue_operand_count(
     const MtlcTensorEpilogueDesc *desc);
 unsigned ir_tensor_mma_runtime_stride_mask(const MtlcTensorMmaDesc *desc);
 size_t ir_tensor_mma_instruction_count(const IRInstruction *instruction);
+size_t ir_tensor_scale_rows_operand_count(const MtlcTensorMmaDesc *desc);
 int ir_tensor_mma_desc_equal(const MtlcTensorMmaDesc *lhs,
                              const MtlcTensorMmaDesc *rhs);
 int ir_operand_same(const IROperand *lhs, const IROperand *rhs);
@@ -629,6 +631,10 @@ int ir_tensor_region_instruction_allowed(const IRProgram *program,
                                          const IRFunction *function,
                                          const IRInstruction *instruction,
                                          const IROperand *output);
+int ir_tensor_scale_rows_joins(const IRProgram *program,
+                               const IRFunction *function,
+                               const IRInstruction *start,
+                               const IRInstruction *scale);
 int ir_tensor_region_update_operands_clean(const IRInstruction *update,
                                            const IROperand *output);
 

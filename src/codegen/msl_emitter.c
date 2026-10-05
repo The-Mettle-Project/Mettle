@@ -1556,7 +1556,7 @@ static unsigned direct_builtins(MslFn *fn) {
     const IRInstruction *in = &fn->func->instructions[i];
     unsigned bit;
     const char *base;
-    if (in->op == IR_OP_TENSOR_MMA) {
+    if (in->op == IR_OP_TENSOR_MMA || in->op == IR_OP_TENSOR_SCALE_ROWS) {
       mask |= MB_LANE | MB_LANES;
       continue;
     }
@@ -3915,6 +3915,96 @@ static void emit_tensor_mma(MslFn *fn, const IRInstruction *in) {
   }
 }
 
+static void emit_scale_rows_resident(MslFn *fn, const MtlcTensorMmaDesc *desc,
+                                     const char *scale, MslSpace scale_space,
+                                     size_t id, uint32_t group) {
+  unsigned mb = desc->m / 8u, nb = desc->n / 8u;
+  int half = desc->accumulator_element == MTLC_TENSOR_ELEMENT_FLOAT16;
+  line(fn, "{");
+  fn->indent++;
+  line(fn, "uint mtl_srow_%zu = ((mtl_lane / 4u) & 4u) + (mtl_lane / 2u) %% 4u;",
+       id);
+  for (unsigned i = 0; i < mb; i++) {
+    line(fn, "float mtl_s_%zu_%u = *(%s float*)(%s + (ulong)(%uu + mtl_srow_%zu) * 4ul);",
+         id, i, space_qual(fn->m, scale_space), scale, i * 8u, id);
+    for (unsigned j = 0; j < nb; j++) {
+      for (unsigned e = 0; e < 2 && half; e++) {
+        line(fn,
+             "mtl_res_%u[%u].thread_elements()[%u] = (half)((float)mtl_res_%u[%u]"
+             ".thread_elements()[%u] * mtl_s_%zu_%u);",
+             (unsigned)group, i * nb + j, e, (unsigned)group, i * nb + j, e,
+             id, i);
+      }
+      for (unsigned e = 0; e < 2 && !half; e++) {
+        line(fn, "mtl_res_%u[%u].thread_elements()[%u] *= mtl_s_%zu_%u;",
+             (unsigned)group, i * nb + j, e, id, i);
+      }
+    }
+  }
+  fn->indent--;
+  line(fn, "}");
+}
+
+static void emit_scale_rows_memory(MslFn *fn, const MtlcTensorMmaDesc *desc,
+                                   const IRInstruction *in, const char *scale,
+                                   MslSpace scale_space, size_t id) {
+  char d[2048], stride[2048];
+  MslSpace d_space;
+  int row_major = desc->d_layout == MTLC_TENSOR_LAYOUT_ROW_MAJOR;
+  const char *acc_type = mma_element_type(desc->accumulator_element);
+  pointer_expr(fn, &in->arguments[0], &d_space, d, sizeof(d));
+  if (in->argument_count > 2) {
+    materialize(fn, &in->arguments[2], MC_U64, stride, sizeof(stride));
+  } else {
+    snprintf(stride, sizeof(stride), "%uul",
+             (unsigned)desc->d_leading_dimension);
+  }
+  line(fn, "for (uint mtl_o_%zu = mtl_lane; mtl_o_%zu < %uu; mtl_o_%zu += mtl_lanes) {",
+       id, id, (unsigned)desc->m * desc->n, id);
+  fn->indent++;
+  line(fn, "uint mtl_r_%zu = mtl_o_%zu / %uu;", id, id, (unsigned)desc->n);
+  line(fn, "uint mtl_c_%zu = mtl_o_%zu %% %uu;", id, id, (unsigned)desc->n);
+  line(fn, "%s %s* mtl_p_%zu = (%s %s*)(%s + ((ulong)(mtl_%c_%zu) * %s + (ulong)(mtl_%c_%zu)) * %zuul);",
+       space_qual(fn->m, d_space), acc_type, id, space_qual(fn->m, d_space),
+       acc_type, d, row_major ? 'r' : 'c', id, stride, row_major ? 'c' : 'r',
+       id, mma_element_size(desc->accumulator_element));
+  line(fn, "*mtl_p_%zu = (%s)((float)*mtl_p_%zu * *(%s float*)(%s + (ulong)(mtl_r_%zu) * 4ul));",
+       id, acc_type, id, space_qual(fn->m, scale_space), scale, id);
+  fn->indent--;
+  line(fn, "}");
+}
+
+static void emit_tensor_scale_rows(MslFn *fn, const IRInstruction *in) {
+  const MtlcTensorMmaDesc *desc = &IR_TENSOR_MMA(in);
+  char scale[2048];
+  MslSpace scale_space;
+  size_t id = fn->temp_counter++;
+  int resident = in->tensor_residency_role == IR_TENSOR_RESIDENCY_UPDATE &&
+                 resident_group(fn, in->tensor_residency_id);
+  if (in->argument_count != ir_tensor_scale_rows_operand_count(desc) ||
+      !mma_element_type(desc->accumulator_element)) {
+    mod_error(fn->m, "Metal: malformed tensor_scale_rows in '%s'",
+              fn_name(fn));
+    return;
+  }
+  pointer_expr(fn, &in->arguments[1], &scale_space, scale, sizeof(scale));
+  if (scale_space == MS_THREAD) {
+    mod_error(fn->m,
+              "Metal: tensor_scale_rows in '%s' reads its row scales from "
+              "private memory; put them in threadgroup or device memory",
+              fn_name(fn));
+    return;
+  }
+  line(fn, "simdgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);");
+  if (resident) {
+    emit_scale_rows_resident(fn, desc, scale, scale_space, id,
+                             in->tensor_residency_id);
+  } else {
+    emit_scale_rows_memory(fn, desc, in, scale, scale_space, id);
+  }
+  line(fn, "simdgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);");
+}
+
 static void emit_instruction(MslFn *fn, const IRInstruction *in,
                              size_t index) {
   if (fn->m->error) {
@@ -3990,6 +4080,9 @@ static void emit_instruction(MslFn *fn, const IRInstruction *in,
     return;
   case IR_OP_TENSOR_MMA:
     emit_tensor_mma(fn, in);
+    return;
+  case IR_OP_TENSOR_SCALE_ROWS:
+    emit_tensor_scale_rows(fn, in);
     return;
   case IR_OP_TENSOR_COMMIT:
     if (resident_group(fn, in->tensor_residency_id)) {

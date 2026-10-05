@@ -9,6 +9,8 @@ extern kernel host_scale_rows(data: float32*, p: HostParams);
 extern kernel host_block_sum(x: int32*, out: int32*, n: int32);
 extern kernel host_plan(counts: uint32*, want: int32*);
 extern kernel host_tile_ids(out: int32*);
+extern kernel(block = 32) host_scale_resident(p: uint16*, v: uint16*,
+                                              alpha: float32*, d: float32*);
 
 extern fn malloc(bytes: int64) -> uint8* = "malloc";
 extern fn getenv(name: cstring) -> cstring = "getenv";
@@ -317,6 +319,84 @@ fn check_flush_groups() -> int32 {
   return 0;
 }
 
+fn half_bits(x: int32) -> uint16 {
+  if (x == 0) { return (uint16)0; }
+  var sign: int32 = 0;
+  var m: int32 = x;
+  if (m < 0) {
+    sign = 0x8000;
+    m = -m;
+  }
+  var e: int32 = 0;
+  while ((1 << (e + 1)) <= m) { e = e + 1; }
+  return (uint16)(sign | ((e + 15) << 10) | ((m << (10 - e)) & 0x3FF));
+}
+
+fn p_value(r: int32, k: int32) -> int32 { return (3 * r + k) % 7 - 3; }
+fn v_value(k: int32, c: int32) -> int32 { return (c + 2 * k) % 5 - 2; }
+fn alpha_value(chunk: int32, r: int32) -> float32 {
+  if (chunk == 1) { return (float32)(r + 1) * 0.5; }
+  return (float32)(r % 4) - 1.5;
+}
+
+fn scaled_sum(r: int32, c: int32) -> float32 {
+  var acc: float32 = 0.0;
+  var chunk: int32 = 0;
+  while (chunk < 3) {
+    if (chunk > 0) { acc = acc * alpha_value(chunk, r); }
+    var k: int32 = chunk * 16;
+    while (k < chunk * 16 + 16) {
+      acc = acc + (float32)(p_value(r, k) * v_value(k, c));
+      k = k + 1;
+    }
+    chunk = chunk + 1;
+  }
+  return acc;
+}
+
+fn check_scale_rows() -> int32 {
+  var hp: uint16* = (uint16*)malloc(768 * 2);
+  var hv: uint16* = (uint16*)malloc(768 * 2);
+  var ha: float32* = (float32*)malloc(32 * 4);
+  var hd: float32* = (float32*)malloc(256 * 4);
+  var r: int32 = 0;
+  while (r < 16) {
+    var k: int32 = 0;
+    while (k < 48) {
+      hp[r * 48 + k] = half_bits(p_value(r, k));
+      hv[r * 48 + k] = half_bits(v_value(k, r));
+      k = k + 1;
+    }
+    ha[r] = alpha_value(1, r);
+    ha[16 + r] = alpha_value(2, r);
+    r = r + 1;
+  }
+  var dp: int64 = gpu_malloc(768 * 2);
+  var dv: int64 = gpu_malloc(768 * 2);
+  var da: int64 = gpu_malloc(32 * 4);
+  var dd: int64 = gpu_malloc(256 * 4);
+  if (dp == 0 || dv == 0 || da == 0 || dd == 0) { return 121; }
+  if (gpu_to_device(dp, (uint8*)hp, 768 * 2) != 0) { return 122; }
+  if (gpu_to_device(dv, (uint8*)hv, 768 * 2) != 0) { return 122; }
+  if (gpu_to_device(da, (uint8*)ha, 32 * 4) != 0) { return 122; }
+  dispatch host_scale_resident[grid: (1, 1, 1), block: (32, 1, 1)](dp, dv, da, dd);
+  if (gpu_to_host((uint8*)hd, dd, 256 * 4) != 0) { return 123; }
+  r = 0;
+  while (r < 16) {
+    var c: int32 = 0;
+    while (c < 16) {
+      if (hd[r * 16 + c] != scaled_sum(r, c)) { return 124; }
+      c = c + 1;
+    }
+    r = r + 1;
+  }
+  gpu_free(dp);
+  gpu_free(dv);
+  gpu_free(da);
+  gpu_free(dd);
+  return 0;
+}
+
 fn main() -> int32 {
   var path: cstring = getenv("METTLE_METAL_HOST_LIBRARY");
   if (path == 0) {
@@ -336,5 +416,7 @@ fn main() -> int32 {
   if (status != 0) { return status; }
   status = check_indirect();
   if (status != 0) { return status; }
-  return check_flush_groups();
+  status = check_flush_groups();
+  if (status != 0) { return status; }
+  return check_scale_rows();
 }

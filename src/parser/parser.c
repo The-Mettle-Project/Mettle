@@ -4806,6 +4806,17 @@ static const char *parser_gpu_index_intrinsic(const char *obj,
   return buf;
 }
 
+static int parser_is_tensor_named_call(ASTNode *expr) {
+  static const char *const names[] = {
+      "tensor_mma",        "tensor_matmul", "tensor_epilogue",
+      "tensor_scale_rows", "tensor_transfer_workgroup",
+      "tile_load",         "tile_store"};
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    if (parser_identifier_name_is(expr, names[i])) return 1;
+  }
+  return 0;
+}
+
 ASTNode *parser_parse_postfix_expression(Parser *parser) {
   if (!parser)
     return NULL;
@@ -4884,13 +4895,7 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
     }
 
     if (parser->current_token.type == TOKEN_LPAREN) {
-      int tensor_named_call =
-          parser_identifier_name_is(expr, "tensor_mma") ||
-          parser_identifier_name_is(expr, "tensor_matmul") ||
-          parser_identifier_name_is(expr, "tensor_epilogue") ||
-          parser_identifier_name_is(expr, "tensor_transfer_workgroup") ||
-          parser_identifier_name_is(expr, "tile_load") ||
-          parser_identifier_name_is(expr, "tile_store");
+      int tensor_named_call = parser_is_tensor_named_call(expr);
       int atomic_named_call =
           parser_identifier_name_is(expr, "atomic_fetch_add") ||
           parser_identifier_name_is(expr, "atomic_fetch_sub") ||

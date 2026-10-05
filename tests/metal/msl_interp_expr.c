@@ -511,6 +511,32 @@ static MslExpr compile_unary_inner(MslCompiler *c) {
   return compile_postfix(c, compile_primary(c));
 }
 
+static MslExpr thread_elements(MslCompiler *c, MslExpr e, int line) {
+  const MslToken *index;
+  MslExpr out;
+  size_t insn;
+  mslc_expect(c, "(");
+  mslc_expect(c, ")");
+  mslc_expect(c, "[");
+  index = mslc_cur(c);
+  if (index->kind != MSL_TK_INT || index->int_value > 1) {
+    mslc_fail(c, line, "thread_elements() is indexed by the constant 0 or 1");
+  }
+  c->pos++;
+  mslc_expect(c, "]");
+  if (e.kind == MSL_E_VAR) {
+    emit_addr_local(c, e.local, line);
+  }
+  insn = mslc_emit(c, MSL_OP_LANE_ELEM, line);
+  mslc_insn(c, insn)->a = (int64_t)index->int_value;
+  mslc_insn(c, insn)->b = (int64_t)e.type->elem->size;
+  memset(&out, 0, sizeof out);
+  out.kind = MSL_E_MEM;
+  out.type = e.type->elem;
+  out.space = MSL_SP_THREAD;
+  return out;
+}
+
 static MslExpr member_access(MslCompiler *c, MslExpr e, int line) {
   const MslToken *name = mslc_cur(c);
   char tn[160];
@@ -550,6 +576,10 @@ static MslExpr member_access(MslCompiler *c, MslExpr e, int line) {
       mslc_insn(c, insn)->t1 = e.type;
       return mslc_value_expr(e.type->elem);
     }
+  }
+  if (e.type->kind == MSL_K_MATRIX && (e.kind == MSL_E_VAR || e.kind == MSL_E_MEM) && name->len == 15 &&
+      memcmp(name->text, "thread_elements", 15) == 0) {
+    return thread_elements(c, e, line);
   }
   mslc_fail(c, line, "member '%.*s' of '%s' is outside the dialect", (int)name->len, name->text, mslc_tname(e.type, tn, sizeof tn));
   return e;

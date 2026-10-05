@@ -2312,6 +2312,163 @@ static Type *type_checker_tensor_mma_builtin(TypeChecker *checker,
   return checker->builtin_void;
 }
 
+static int type_checker_tensor_scale_rows_option(TypeChecker *checker,
+                                                 CallExpression *call,
+                                                 size_t i,
+                                                 MtlcTensorMmaDesc *desc,
+                                                 TensorHave *have) {
+  const char *option = call->argument_names ? call->argument_names[i] : NULL;
+  ASTNode *value = call->arguments[i];
+  const char *identifier = type_checker_tensor_option_identifier(value);
+  if (!option) {
+    type_checker_set_error_at_location(
+        checker, value->location,
+        "tensor_scale_rows options after D and the row scales must be named");
+    return 0;
+  }
+  for (size_t prior = 2; prior < i; prior++) {
+    if (call->argument_names[prior] &&
+        strcmp(call->argument_names[prior], option) == 0) {
+      type_checker_set_error_at_location(checker, value->location,
+                                         "Duplicate tensor option '%s'",
+                                         option);
+      return 0;
+    }
+  }
+  if (!strcmp(option, "shape")) {
+    unsigned m = 0, n = 0;
+    char tail = 0;
+    if (!identifier || sscanf(identifier, "m%un%u%c", &m, &n, &tail) != 2 ||
+        m == 0 || n == 0 || m > UINT16_MAX || n > UINT16_MAX) {
+      type_checker_set_error_at_location(
+          checker, value->location,
+          "tensor_scale_rows shape must be an identifier like m16n32");
+      return 0;
+    }
+    desc->m = (uint16_t)m;
+    desc->n = (uint16_t)n;
+    have->shape = 1;
+    return 1;
+  }
+  if (!strcmp(option, "scope")) {
+    return type_checker_tensor_scope_option(checker, call, i, desc, option,
+                                            identifier, value);
+  }
+  if (!strcmp(option, "output_type") || !strcmp(option, "accumulator_type") ||
+      !strcmp(option, "d_layout") || !strcmp(option, "ldd")) {
+    return type_checker_tensor_type_option(checker, call, i, desc, have,
+                                           option, identifier, value);
+  }
+  type_checker_set_error_at_location(
+      checker, value->location,
+      "tensor_scale_rows takes shape, accumulator_type, d_layout, ldd and "
+      "scope; '%s' is none of them",
+      option);
+  return 0;
+}
+
+static int type_checker_tensor_scale_rows_operands(TypeChecker *checker,
+                                                   CallExpression *call,
+                                                   const MtlcTensorMmaDesc *desc) {
+  Type *d_type = type_checker_infer_type(checker, call->arguments[0]);
+  Type *scale_type = type_checker_infer_type(checker, call->arguments[1]);
+  if (!d_type || !scale_type) return 0;
+  if (!type_checker_tensor_pointer_matches(d_type, desc->accumulator_element)) {
+    type_checker_set_error_at_location(
+        checker, call->arguments[0]->location,
+        "tensor_scale_rows D has storage type '%s' incompatible with its "
+        "accumulator format",
+        d_type->name ? d_type->name : "unknown");
+    return 0;
+  }
+  if (!type_checker_tensor_pointer_matches(scale_type,
+                                           MTLC_TENSOR_ELEMENT_FLOAT32)) {
+    type_checker_set_error_at_location(
+        checker, call->arguments[1]->location,
+        "tensor_scale_rows row scales must be a float32 pointer, one value "
+        "per row of D");
+    return 0;
+  }
+  return 1;
+}
+
+static void type_checker_tensor_scale_rows_defaults(MtlcTensorMmaDesc *desc) {
+  desc->math_mode = MTLC_TENSOR_MATH_MULTIPLY_ADD;
+  desc->sparsity = MTLC_TENSOR_SPARSITY_DENSE;
+  desc->a_layout = MTLC_TENSOR_LAYOUT_ROW_MAJOR;
+  desc->b_layout = MTLC_TENSOR_LAYOUT_COLUMN_MAJOR;
+  desc->c_layout = MTLC_TENSOR_LAYOUT_ROW_MAJOR;
+  desc->d_layout = MTLC_TENSOR_LAYOUT_ROW_MAJOR;
+  desc->rounding = MTLC_TENSOR_ROUND_DEFAULT;
+  desc->overflow = MTLC_TENSOR_OVERFLOW_WRAP;
+  desc->scope = MTLC_MEMORY_SCOPE_SUBGROUP;
+  desc->a_element = desc->b_element = MTLC_TENSOR_ELEMENT_FLOAT16;
+  desc->accumulator_element = MTLC_TENSOR_ELEMENT_FLOAT32;
+  desc->k = 8;
+  desc->a_leading_dimension = desc->b_leading_dimension = 8;
+}
+
+static Type *type_checker_tensor_scale_rows_builtin(TypeChecker *checker,
+                                                    ASTNode *expression,
+                                                    CallExpression *call,
+                                                    int *handled) {
+  MtlcTensorMmaDesc desc = {0};
+  TensorHave have = {0};
+  *handled = 0;
+  if (!call || !call->function_name || call->object ||
+      strcmp(call->function_name, "tensor_scale_rows") != 0)
+    return NULL;
+  *handled = 1;
+  FunctionDeclaration *owner =
+      checker->current_function_decl &&
+              checker->current_function_decl->type == AST_FUNCTION_DECLARATION
+          ? (FunctionDeclaration *)checker->current_function_decl->data
+          : NULL;
+  if (!owner || !owner->is_kernel) {
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "tensor_scale_rows is only legal directly inside a GPU kernel");
+    return NULL;
+  }
+  if (call->argument_count < 3 ||
+      (call->argument_names &&
+       (call->argument_names[0] || call->argument_names[1]))) {
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "tensor_scale_rows expects D and the row scales, then named options "
+        "with at least shape");
+    return NULL;
+  }
+  type_checker_tensor_scale_rows_defaults(&desc);
+  call->tensor_c_stride_argument = SIZE_MAX;
+  call->tensor_d_stride_argument = SIZE_MAX;
+  for (size_t i = 2; i < call->argument_count; i++) {
+    if (!type_checker_tensor_scale_rows_option(checker, call, i, &desc,
+                                               &have))
+      return NULL;
+  }
+  desc.result_element = desc.accumulator_element;
+  if (!have.shape ||
+      (desc.accumulator_element != MTLC_TENSOR_ELEMENT_FLOAT32 &&
+       desc.accumulator_element != MTLC_TENSOR_ELEMENT_FLOAT16)) {
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "tensor_scale_rows needs shape: mXnY and scales an f32 or f16 "
+        "accumulator");
+    return NULL;
+  }
+  if (!have.stride[3])
+    desc.d_leading_dimension =
+        desc.d_layout == MTLC_TENSOR_LAYOUT_ROW_MAJOR ? desc.n : desc.m;
+  desc.c_layout = desc.d_layout;
+  desc.c_leading_dimension = desc.d_leading_dimension;
+  if (!type_checker_tensor_scale_rows_operands(checker, call, &desc))
+    return NULL;
+  call->is_tensor_scale_rows = 1;
+  call->tensor_mma_desc = desc;
+  return checker->builtin_void;
+}
+
 Type *type_checker_infer_type(TypeChecker *checker, ASTNode *expression) {
   if (!checker || !expression)
     return NULL;
@@ -3629,6 +3786,13 @@ static Type *type_checker_infer_call(TypeChecker *checker,
       Type *epilogue_type = type_checker_tensor_epilogue_builtin(
           checker, expression, call, &handled);
       if (handled) return epilogue_type;
+    }
+
+    {
+      int handled = 0;
+      Type *scale_type = type_checker_tensor_scale_rows_builtin(
+          checker, expression, call, &handled);
+      if (handled) return scale_type;
     }
 
     {

@@ -67,3 +67,23 @@ kernel host_tile_ids(out: int32*) {
   var at: int32 = ((block.z * 4 + block.y) * 8 + block.x) * 32 + thread.x;
   out[at] = block.y * 100 + block.x;
 }
+
+kernel(block = 32) host_scale_resident(p: uint16*, v: uint16*, alpha: float32*,
+                                       d: float32 global*) {
+  workgroup var s: float32[16];
+  tensor_mma(p, v, 0.0, d, shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, d_layout: row, lda: 48, ldb: 48);
+  var chunk: int32 = 1;
+  while (chunk < 3) {
+    if (thread.x < 16) {
+      s[thread.x] = alpha[(chunk - 1) * 16 + thread.x];
+    }
+    barrier(workgroup, acq_rel);
+    tensor_scale_rows(d, &s[0], shape: m16n16);
+    tensor_mma(p + chunk * 16, v + chunk * 16, d, d, shape: m16n16k16,
+               input_type: f16, output_type: f32, a_layout: row, b_layout: col,
+               d_layout: row, lda: 48, ldb: 48);
+    barrier(workgroup, acq_rel);
+    chunk = chunk + 1;
+  }
+}

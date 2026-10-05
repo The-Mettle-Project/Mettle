@@ -160,6 +160,8 @@ const char *ir_gpu_only_construct_name(IROpcode op) {
     return "tensor_epilogue";
   case IR_OP_TENSOR_COMMIT:
     return "tensor_commit";
+  case IR_OP_TENSOR_SCALE_ROWS:
+    return "tensor_scale_rows";
   case IR_OP_TILE:
     return "tile operation";
   default:
@@ -694,6 +696,10 @@ size_t ir_tensor_mma_instruction_count(const IRInstruction *instruction) {
   return instruction && instruction->tensor_mma_count > 1
              ? (size_t)instruction->tensor_mma_count
              : 1u;
+}
+
+size_t ir_tensor_scale_rows_operand_count(const MtlcTensorMmaDesc *desc) {
+  return desc && desc->d_leading_dimension == 0 ? 3u : 2u;
 }
 
 int ir_tensor_mma_desc_equal(const MtlcTensorMmaDesc *a,
@@ -2463,6 +2469,7 @@ static const char *const IR_OPCODE_NAMES[IR_OP_KIND_COUNT] = {
     [IR_OP_TENSOR_MATMUL] = "tensor_matmul",
     [IR_OP_TENSOR_EPILOGUE] = "tensor_epilogue",
     [IR_OP_TENSOR_COMMIT] = "tensor_commit",
+    [IR_OP_TENSOR_SCALE_ROWS] = "tensor_scale_rows",
     [IR_OP_ASSIGN] = "assign",
     [IR_OP_ADDRESS_OF] = "addr_of",
     [IR_OP_LOAD] = "load",
@@ -2793,6 +2800,29 @@ static int ir_format_call_line(const IRInstruction *instruction,
   return written;
 }
 
+static int ir_format_tensor_scale_rows_line(const IRInstruction *instruction,
+                                            char *buffer, size_t buffer_size) {
+  char operands[3][128];
+  for (size_t i = 0; i < 3; i++) {
+    operands[i][0] = '\0';
+    if (i < instruction->argument_count) {
+      ir_format_operand(&instruction->arguments[i], operands[i],
+                        sizeof(operands[i]));
+    }
+  }
+  return snprintf(buffer, buffer_size,
+                  "tensor_scale_rows %s, %s%s%s m%un%u acc=%d layout=%d "
+                  "ld=%u residency#%u",
+                  operands[0], operands[1],
+                  instruction->argument_count > 2 ? ", " : "", operands[2],
+                  (unsigned)IR_TENSOR_MMA(instruction).m,
+                  (unsigned)IR_TENSOR_MMA(instruction).n,
+                  (int)IR_TENSOR_MMA(instruction).accumulator_element,
+                  (int)IR_TENSOR_MMA(instruction).d_layout,
+                  (unsigned)IR_TENSOR_MMA(instruction).d_leading_dimension,
+                  instruction->tensor_residency_id);
+}
+
 static int ir_format_tensor_mma_line(const IRInstruction *instruction,
                                      char *buffer, size_t buffer_size) {
   char residency[96] = {0};
@@ -3029,6 +3059,10 @@ static int ir_format_gpu_line(const IRInstruction *instruction,
         IR_TENSOR_EPILOGUE(instruction).scope == MTLC_MEMORY_SCOPE_WORKGROUP
             ? "workgroup"
             : "subgroup");
+    break;
+  case IR_OP_TENSOR_SCALE_ROWS:
+    written = ir_format_tensor_scale_rows_line(instruction, buffer,
+                                               buffer_size);
     break;
   case IR_OP_TENSOR_COMMIT:
     written = snprintf(buffer, buffer_size,
@@ -3973,6 +4007,20 @@ typedef struct {
   char **error;
 } IRGpuGraphBuilder;
 
+static int ir_gpu_tensor_scale_rows_signature_matches(
+    const IRInstruction *instruction) {
+  const MtlcTensorMmaDesc *desc = &IR_TENSOR_MMA(instruction);
+  return instruction->tensor != NULL && desc->m > 0 && desc->n > 0 &&
+         (desc->accumulator_element == MTLC_TENSOR_ELEMENT_FLOAT32 ||
+          desc->accumulator_element == MTLC_TENSOR_ELEMENT_FLOAT16) &&
+         desc->result_element == desc->accumulator_element &&
+         (desc->d_layout == MTLC_TENSOR_LAYOUT_ROW_MAJOR ||
+          desc->d_layout == MTLC_TENSOR_LAYOUT_COLUMN_MAJOR) &&
+         instruction->argument_count ==
+             ir_tensor_scale_rows_operand_count(desc) &&
+         instruction->dest.kind == IR_OPERAND_NONE;
+}
+
 static int ir_gpu_graph_fail(IRGpuGraphBuilder *builder, const char *fmt, ...) {
   char buffer[512];
   va_list ap;
@@ -4465,6 +4513,12 @@ int ir_tensor_region_instruction_allowed(const IRProgram *program,
   case IR_OP_TENSOR_MATMUL:
     return ir_tensor_region_tensor_op_disjoint(program, function,
                                                instruction, output);
+  case IR_OP_TENSOR_SCALE_ROWS:
+    return instruction->argument_count >= 2 &&
+           ir_tensor_region_access_disjoint(
+               program, function, &instruction->arguments[0], output, 1) &&
+           ir_tensor_region_access_disjoint(
+               program, function, &instruction->arguments[1], output, 0);
   case IR_OP_CALL:
     return ir_tensor_region_call_allowed(program, function, instruction,
                                          output);
@@ -5014,6 +5068,36 @@ static int ir_gpu_tensor_pipeline_barrier(
 // ending in [start, commit) leaves only to blocks beginning in
 // (start, commit]. Everything between is an update of the group or an
 // instruction that cannot observe D.
+int ir_tensor_scale_rows_joins(const IRProgram *program,
+                               const IRFunction *function,
+                               const IRInstruction *start,
+                               const IRInstruction *scale) {
+  if (!program || !function || !start || !scale ||
+      start->op != IR_OP_TENSOR_MMA || scale->op != IR_OP_TENSOR_SCALE_ROWS ||
+      start->argument_count < 4 || scale->argument_count < 2)
+    return 0;
+  const MtlcTensorMmaDesc *want = &IR_TENSOR_MMA(start);
+  const MtlcTensorMmaDesc *have = &IR_TENSOR_MMA(scale);
+  const IROperand *output = &start->arguments[3];
+  size_t d_stride =
+      ir_tensor_runtime_stride_operand_index(want, MTLC_TENSOR_RUNTIME_STRIDE_D);
+  if (have->m != want->m || have->n != want->n ||
+      have->accumulator_element != want->accumulator_element ||
+      have->d_layout != want->d_layout ||
+      have->d_leading_dimension != want->d_leading_dimension ||
+      have->scope != want->scope ||
+      scale->argument_count != ir_tensor_scale_rows_operand_count(have) ||
+      !ir_operand_same(&scale->arguments[0], output) ||
+      ir_operand_same(&scale->arguments[1], output))
+    return 0;
+  if (d_stride != SIZE_MAX &&
+      (scale->argument_count < 3 || d_stride >= start->argument_count ||
+       !ir_operand_same(&scale->arguments[2], &start->arguments[d_stride])))
+    return 0;
+  return ir_tensor_region_access_disjoint(program, function,
+                                          &scale->arguments[1], output, 0);
+}
+
 static int ir_gpu_tensor_region_valid(const IRProgram *program,
                                       IRFunction *function,
                                       size_t start_index,
@@ -5024,7 +5108,10 @@ static int ir_gpu_tensor_region_valid(const IRProgram *program,
     const IRInstruction *middle = &function->instructions[j];
     if (middle->tensor_residency_id == start->tensor_residency_id &&
         middle->tensor_residency_role == IR_TENSOR_RESIDENCY_UPDATE) {
-      if (!ir_tensor_region_update_operands_clean(middle, output)) return 0;
+      if (middle->op == IR_OP_TENSOR_SCALE_ROWS
+              ? !ir_tensor_scale_rows_joins(program, function, start, middle)
+              : !ir_tensor_region_update_operands_clean(middle, output))
+        return 0;
       continue;
     }
     if (!ir_tensor_region_instruction_allowed(program, function, middle,
@@ -5058,6 +5145,44 @@ static int ir_gpu_tensor_region_valid(const IRProgram *program,
   return 1;
 }
 
+static int ir_gpu_tensor_residency_member_op(const IRInstruction *instruction) {
+  switch (instruction->op) {
+  case IR_OP_TENSOR_COMMIT:
+  case IR_OP_TENSOR_MMA:
+    return 1;
+  case IR_OP_TENSOR_SCALE_ROWS:
+    return instruction->tensor_residency_role == IR_TENSOR_RESIDENCY_UPDATE;
+  default:
+    return 0;
+  }
+}
+
+static int ir_gpu_tensor_residency_update_valid(const IRProgram *program,
+                                                const IRFunction *function,
+                                                const IRInstruction *start,
+                                                const IRInstruction *update) {
+  if (update->tensor_residency_scope != start->tensor_residency_scope)
+    return 0;
+  if (update->op == IR_OP_TENSOR_SCALE_ROWS)
+    return start->tensor_residency_scope == IR_TENSOR_RESIDENCY_SCOPE_REGION &&
+           ir_tensor_scale_rows_joins(program, function, start, update);
+  size_t c_stride = ir_tensor_runtime_stride_operand_index(
+      &IR_TENSOR_MMA(start), MTLC_TENSOR_RUNTIME_STRIDE_C);
+  size_t d_stride = ir_tensor_runtime_stride_operand_index(
+      &IR_TENSOR_MMA(start), MTLC_TENSOR_RUNTIME_STRIDE_D);
+  return ir_tensor_mma_desc_equal(&IR_TENSOR_MMA(start),
+                                  &IR_TENSOR_MMA(update)) &&
+         update->argument_count == start->argument_count &&
+         ir_operand_same(&update->arguments[2], &start->arguments[3]) &&
+         ir_operand_same(&update->arguments[3], &start->arguments[3]) &&
+         (d_stride == SIZE_MAX ||
+          (c_stride != SIZE_MAX &&
+           ir_operand_same(&update->arguments[c_stride],
+                           &start->arguments[d_stride]) &&
+           ir_operand_same(&update->arguments[d_stride],
+                           &start->arguments[d_stride])));
+}
+
 static int ir_gpu_tensor_residency_groups_valid(const IRProgram *program,
                                                 IRFunction *function) {
   if (!function) return 0;
@@ -5082,8 +5207,7 @@ static int ir_gpu_tensor_residency_groups_valid(const IRProgram *program,
          scope != IR_TENSOR_RESIDENCY_SCOPE_REGION) ||
         (role == IR_TENSOR_RESIDENCY_COMMIT) !=
             (instruction->op == IR_OP_TENSOR_COMMIT) ||
-        (role != IR_TENSOR_RESIDENCY_COMMIT &&
-         instruction->op != IR_OP_TENSOR_MMA) ||
+        !ir_gpu_tensor_residency_member_op(instruction) ||
         ir_tensor_mma_instruction_count(instruction) != 1)
       return 0;
     have_group = 1;
@@ -5131,27 +5255,13 @@ static int ir_gpu_tensor_residency_groups_valid(const IRProgram *program,
       if (!ir_operand_same(&commit->arguments[arg], &start->arguments[arg]))
         return 0;
     }
-    size_t c_stride = ir_tensor_runtime_stride_operand_index(
-        &IR_TENSOR_MMA(start), MTLC_TENSOR_RUNTIME_STRIDE_C);
-    size_t d_stride = ir_tensor_runtime_stride_operand_index(
-        &IR_TENSOR_MMA(start), MTLC_TENSOR_RUNTIME_STRIDE_D);
     for (size_t j = first_update_index; j <= last_update_index; j++) {
       const IRInstruction *update = &function->instructions[j];
       if (update->tensor_residency_id != start->tensor_residency_id ||
           update->tensor_residency_role != IR_TENSOR_RESIDENCY_UPDATE)
         continue;
-      if (update->tensor_residency_scope != start->tensor_residency_scope ||
-          !ir_tensor_mma_desc_equal(&IR_TENSOR_MMA(start),
-                                    &IR_TENSOR_MMA(update)) ||
-          update->argument_count != start->argument_count ||
-          !ir_operand_same(&update->arguments[2], &start->arguments[3]) ||
-          !ir_operand_same(&update->arguments[3], &start->arguments[3]) ||
-          (d_stride != SIZE_MAX &&
-           (c_stride == SIZE_MAX ||
-            !ir_operand_same(&update->arguments[c_stride],
-                             &start->arguments[d_stride]) ||
-            !ir_operand_same(&update->arguments[d_stride],
-                             &start->arguments[d_stride]))))
+      if (!ir_gpu_tensor_residency_update_valid(program, function, start,
+                                                update))
         return 0;
     }
 
@@ -5760,7 +5870,8 @@ static int ir_gpu_instruction_collective_requirement(
   }
   if (instruction->op == IR_OP_TENSOR_MMA ||
       instruction->op == IR_OP_TENSOR_MATMUL ||
-      instruction->op == IR_OP_TENSOR_COMMIT) {
+      instruction->op == IR_OP_TENSOR_COMMIT ||
+      instruction->op == IR_OP_TENSOR_SCALE_ROWS) {
     return IR_TENSOR_MMA(instruction).scope == MTLC_MEMORY_SCOPE_WORKGROUP
                ? IR_GPU_COLLECTIVE_WORKGROUP
                : IR_GPU_COLLECTIVE_SUBGROUP;
@@ -5826,12 +5937,37 @@ static const char *ir_gpu_collective_name(const IRInstruction *instruction,
     return "tensor epilogue";
   if (instruction && instruction->op == IR_OP_TENSOR_COMMIT)
     return "tensor accumulator commit";
+  if (instruction && instruction->op == IR_OP_TENSOR_SCALE_ROWS)
+    return "tensor row scale";
   if (instruction && instruction->op == IR_OP_CALL &&
       instruction->intrinsic == MTLC_INTRINSIC_NONE) {
     return "call to collective device function";
   }
   return requirement == IR_GPU_COLLECTIVE_WORKGROUP ? "workgroup barrier"
                                                     : "subgroup collective";
+}
+
+static int ir_gpu_tensor_operands_uniform(IRGpuGraphBuilder *builder,
+                                          const IRFunction *function,
+                                          const char *location,
+                                          const IRInstruction *instruction,
+                                          const IRGpuUniformMap *uniformity,
+                                          unsigned char allowed, int needed) {
+  for (size_t arg = 0; arg < instruction->argument_count; arg++) {
+    if (ir_gpu_uniform_operand(uniformity, &instruction->arguments[arg]) <=
+        allowed)
+      continue;
+    ir_gpu_graph_fail(
+        builder,
+        "GPU collective uniformity violation in '%s'%s: %s operand %llu is not %s-uniform",
+        function->name ? function->name : "?", location,
+        instruction->op == IR_OP_TENSOR_SCALE_ROWS ? "tensor row scale"
+                                                   : "tensor epilogue",
+        (unsigned long long)arg,
+        needed == IR_GPU_COLLECTIVE_WORKGROUP ? "workgroup" : "subgroup");
+    return 0;
+  }
+  return 1;
 }
 
 static int ir_gpu_validate_function_uniformity(
@@ -6015,21 +6151,12 @@ static int ir_gpu_validate_function_uniformity(
           goto done;
         }
       }
-      if (instruction->op == IR_OP_TENSOR_EPILOGUE) {
-        for (size_t arg = 0; arg < instruction->argument_count; arg++) {
-          unsigned char operand_rank = ir_gpu_uniform_operand(
-              &uniformity, &instruction->arguments[arg]);
-          if (operand_rank > allowed) {
-            ir_gpu_graph_fail(
-                builder,
-                "GPU collective uniformity violation in '%s'%s: tensor epilogue operand %llu is not %s-uniform",
-                function->name ? function->name : "?", location,
-                (unsigned long long)arg,
-                needed == IR_GPU_COLLECTIVE_WORKGROUP ? "workgroup"
-                                                      : "subgroup");
-            goto done;
-          }
-        }
+      if ((instruction->op == IR_OP_TENSOR_EPILOGUE ||
+           instruction->op == IR_OP_TENSOR_SCALE_ROWS) &&
+          !ir_gpu_tensor_operands_uniform(builder, function, location,
+                                          instruction, &uniformity, allowed,
+                                          needed)) {
+        goto done;
       }
       if (instruction->op == IR_OP_TENSOR_TRANSFER) {
         for (size_t arg = 0; arg < instruction->argument_count; arg++) {
@@ -6158,6 +6285,42 @@ static int ir_gpu_validate_collective_uniformity(IRGpuGraphBuilder *builder) {
   return 1;
 }
 
+static int ir_gpu_tensor_op_signature_ok(const IRProgram *program,
+                                         const IRFunction *function,
+                                         const IRInstruction *instruction,
+                                         const char **name) {
+  int ok;
+  switch (instruction->op) {
+  case IR_OP_TENSOR_MMA:
+  case IR_OP_TENSOR_COMMIT:
+    *name = "tensor MMA";
+    ok = ir_gpu_tensor_signature_matches(program, function, instruction);
+    break;
+  case IR_OP_TENSOR_MATMUL:
+    *name = "tensor_matmul";
+    ok = ir_gpu_tensor_matmul_signature_matches(program, function,
+                                                instruction);
+    break;
+  case IR_OP_TENSOR_SCALE_ROWS:
+    *name = "tensor_scale_rows";
+    ok = ir_gpu_tensor_scale_rows_signature_matches(instruction);
+    break;
+  case IR_OP_TENSOR_EPILOGUE:
+    *name = "tensor epilogue";
+    ok = ir_gpu_tensor_epilogue_signature_matches(program, function,
+                                                  instruction);
+    break;
+  case IR_OP_TENSOR_TRANSFER:
+    *name = "tensor transfer";
+    ok = ir_gpu_tensor_transfer_signature_matches(program, function,
+                                                  instruction);
+    break;
+  default:
+    return -1;
+  }
+  return ok ? 1 : 0;
+}
+
 static int ir_gpu_graph_visit(IRGpuGraphBuilder *builder, size_t index) {
   const IRProgram *program = builder->program;
   IRFunction *function = program->functions[index];
@@ -6196,46 +6359,16 @@ static int ir_gpu_graph_visit(IRGpuGraphBuilder *builder, size_t index) {
           builder, "GPU device function '%s' contains an indirect call",
           function->name ? function->name : "?");
     }
-    if (instruction->op == IR_OP_TENSOR_MMA ||
-        instruction->op == IR_OP_TENSOR_COMMIT) {
-      if (!ir_gpu_tensor_signature_matches(program, function, instruction)) {
-        return ir_gpu_graph_fail(
-            builder,
-            "GPU device function '%s' has an invalid tensor MMA descriptor or operand signature",
-            function->name ? function->name : "?");
-      }
-      continue;
+    const char *tensor_name = NULL;
+    int tensor_ok = ir_gpu_tensor_op_signature_ok(program, function,
+                                                  instruction, &tensor_name);
+    if (tensor_ok == 0) {
+      return ir_gpu_graph_fail(
+          builder,
+          "GPU device function '%s' has an invalid %s descriptor or operand signature",
+          function->name ? function->name : "?", tensor_name);
     }
-    if (instruction->op == IR_OP_TENSOR_MATMUL) {
-      if (!ir_gpu_tensor_matmul_signature_matches(program, function,
-                                                   instruction)) {
-        return ir_gpu_graph_fail(
-            builder,
-            "GPU device function '%s' has an invalid tensor_matmul descriptor or operand signature",
-            function->name ? function->name : "?");
-      }
-      continue;
-    }
-    if (instruction->op == IR_OP_TENSOR_EPILOGUE) {
-      if (!ir_gpu_tensor_epilogue_signature_matches(program, function,
-                                                     instruction)) {
-        return ir_gpu_graph_fail(
-            builder,
-            "GPU device function '%s' has an invalid tensor epilogue descriptor or operand signature",
-            function->name ? function->name : "?");
-      }
-      continue;
-    }
-    if (instruction->op == IR_OP_TENSOR_TRANSFER) {
-      if (!ir_gpu_tensor_transfer_signature_matches(program, function,
-                                                    instruction)) {
-        return ir_gpu_graph_fail(
-            builder,
-            "GPU device function '%s' has an invalid tensor transfer descriptor or operand signature",
-            function->name ? function->name : "?");
-      }
-      continue;
-    }
+    if (tensor_ok > 0) continue;
     if (instruction->op == IR_OP_CALL &&
         ir_intrinsic_is_subgroup(instruction->intrinsic)) {
       if ((size_t)ir_intrinsic_arity(instruction->intrinsic) !=

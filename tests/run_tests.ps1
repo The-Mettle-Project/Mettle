@@ -2840,6 +2840,9 @@ $cases = @(
   @{ Name = "gpu_workgroup_uniform_ptx"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10"); OutputMustNotMatch = @("eligibility failed") },
   @{ Name = "gpu_workgroup_uniform_spirv"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-spirv"); OutputMustNotMatch = @("eligibility failed") },
   @{ Name = "gpu_workgroup_uniform_metal"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-metal"); OutputMustNotMatch = @("eligibility failed") },
+  @{ Name = "gpu_tensor_scale_rows_cpu"; Path = "tests/gpu/tensor_scale_rows.mettle"; ShouldSucceed = $true; Args = @("test"); SkipBinaryCheck = $true; OutputMustMatch = @("2 passed"); OutputMustNotMatch = @("failed", "skipped") },
+  @{ Name = "err_gpu_tensor_scale_rows_ptx"; Path = "tests/gpu/tensor_scale_rows.mettle"; ShouldSucceed = $false; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10"); Pattern = "tensor_scale_rows is Metal only for now" },
+  @{ Name = "err_gpu_tensor_scale_rows_shape"; Path = "tests/err_gpu_tensor_scale_rows_shape.mettle"; ShouldSucceed = $false; Args = @("--emit-metal"); Pattern = "tensor_scale_rows shape must be an identifier like m16n32" },
   @{ Name = "gpu_bit_intrinsics"; Path = "tests/gpu/bit_intrinsics.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
   @{ Name = "gpu_bit_intrinsics_spirv"; Path = "tests/gpu/bit_intrinsics.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-spirv") },
   @{ Name = "gpu_u16_typed_loads"; Path = "tests/gpu/u16_typed_loads.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
@@ -14846,6 +14849,7 @@ $script:MetalAccepted = @(
   "tests/gpu/u16_typed_loads.mettle",
   "tests/gpu/uniform_collectives.mettle",
   "tests/gpu/vector_and_packed.mettle",
+  "tests/gpu/tensor_scale_rows.mettle",
   "tests/gpu/warp_row_early_return.mettle",
   "tests/gpu/workgroup_uniform.mettle"
 )
@@ -14886,6 +14890,8 @@ try {
     @{ File = "vadd_kernel.metal"; Pattern = "#pragma METAL fp math_mode\(safe\)" },
     @{ File = "tensor_chain.metal"; Pattern = "simdgroup_multiply_accumulate" },
     @{ File = "tensor_loop.metal"; Pattern = "simdgroup_store\(mtl_res_\d+\[" },
+    @{ File = "tensor_scale_rows.metal"; Pattern = "simdgroup_float8x8 mtl_res_\d+\[4\];" },
+    @{ File = "tensor_scale_rows.metal"; Pattern = "mtl_res_\d+\[3\]\.thread_elements\(\)\[1\] \*= mtl_s_" },
     @{ File = "tensor_block_scaled_i8.metal"; Pattern = "12582912\.0f" },
     @{ File = "subgroup_shuffle.metal"; Pattern = "simd_active_threads_mask" },
     @{ File = "record_kernels.metal"; Pattern = "static_assert\(sizeof\(" },

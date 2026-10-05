@@ -554,27 +554,57 @@ static uint64_t element_bits(const uint8_t *bytes, size_t index, size_t size) {
   return value;
 }
 
+uint32_t msl_matrix_lane_element(uint32_t lane) {
+  uint32_t q = lane / 4u;
+  uint32_t row = (q & 4u) + (lane / 2u) % 4u;
+  uint32_t col = (q & 2u) * 2u + (lane % 2u) * 2u;
+  return row * 8u + col;
+}
+
+static int assemble_matrix(MslRun *run, MslThread **lanes, uint32_t count, const MslInsn *in, const MslPtr *ptrs,
+                           const MslType *matrix, const char *name, uint64_t *out) {
+  uint64_t copy[64];
+  size_t size = matrix->elem->size;
+  int full = count == 32 && run->simd_width == 32;
+  uint32_t i;
+  if (!read_matrix(run, lanes[0], in, ptrs[0], matrix, out)) {
+    return 0;
+  }
+  for (i = 1; i < count; i++) {
+    uint32_t e;
+    if (!read_matrix(run, lanes[i], in, ptrs[i], matrix, copy)) {
+      return 0;
+    }
+    if (memcmp(out, copy, matrix->size) == 0) {
+      continue;
+    }
+    if (!full) {
+      return msl_run_fail(run, lanes[i], in->line, "%s: lane %u holds a different matrix than lane %u", name, lanes[i]->lane,
+                          lanes[0]->lane);
+    }
+    e = msl_matrix_lane_element(lanes[i]->lane);
+    memcpy((uint8_t *)out + e * size, (const uint8_t *)copy + e * size, 2 * size);
+  }
+  return 1;
+}
+
 static int matrix_store(MslRun *run, MslThread **lanes, uint32_t count, const MslInsn *in) {
   const MslType *matrix = in->t1;
   const MslType *elem = matrix->elem;
   uint64_t first[64];
-  uint64_t other[64];
+  MslPtr ptrs[64];
   MslMatrixIo io;
   uint32_t i;
   int r;
   int c;
-  if (!check_lanes_agree(run, lanes, count, in, &io) || !read_matrix(run, lanes[0], in, io.matrix, matrix, first)) {
+  if (!check_lanes_agree(run, lanes, count, in, &io)) {
     return 0;
   }
-  for (i = 1; i < count; i++) {
-    MslMatrixIo own = matrix_io_args(lanes[i]);
-    if (!read_matrix(run, lanes[i], in, own.matrix, matrix, other)) {
-      return 0;
-    }
-    if (memcmp(first, other, matrix->size) != 0) {
-      return msl_run_fail(run, lanes[i], in->line, "simdgroup_store: lane %u holds a different matrix than lane %u", lanes[i]->lane,
-                          lanes[0]->lane);
-    }
+  for (i = 0; i < count; i++) {
+    ptrs[i] = matrix_io_args(lanes[i]).matrix;
+  }
+  if (!assemble_matrix(run, lanes, count, in, ptrs, matrix, "simdgroup_store", first)) {
+    return 0;
   }
   for (r = 0; r < 8; r++) {
     for (c = 0; c < 8; c++) {
@@ -632,19 +662,22 @@ static int matrix_mac(MslRun *run, MslThread **lanes, uint32_t count, const MslI
   uint64_t inputs[3][64];
   uint64_t slots[64];
   uint8_t bytes[256];
+  MslPtr ptrs[64];
   uint32_t i;
+  int k;
+  for (k = 0; k < 3; k++) {
+    for (i = 0; i < count; i++) {
+      ptrs[i] = msl_ptr_unpack(&lanes[i]->stack[lanes[i]->sp - 8] + 2 * (k + 1));
+    }
+    if (!assemble_matrix(run, lanes, count, in, ptrs, types[k + 1], "simdgroup_multiply_accumulate", inputs[k])) {
+      return 0;
+    }
+  }
+  multiply_accumulate(types, inputs[0], inputs[1], inputs[2], bytes);
+  matrix_slots(types[0], bytes, slots);
   for (i = 0; i < count; i++) {
     MslThread *t = lanes[i];
-    const uint64_t *args = &t->stack[t->sp - 8];
-    int k;
-    for (k = 0; k < 3; k++) {
-      if (!read_matrix(run, t, in, msl_ptr_unpack(args + 2 * (k + 1)), types[k + 1], inputs[k])) {
-        return 0;
-      }
-    }
-    multiply_accumulate(types, inputs[0], inputs[1], inputs[2], bytes);
-    matrix_slots(types[0], bytes, slots);
-    if (!msl_write_value(run, t, in->line, msl_ptr_unpack(args), MSL_SP_THREAD, types[0], slots)) {
+    if (!msl_write_value(run, t, in->line, msl_ptr_unpack(&t->stack[t->sp - 8]), MSL_SP_THREAD, types[0], slots)) {
       return 0;
     }
   }

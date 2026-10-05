@@ -448,6 +448,7 @@ static int ir_propagate_instruction_operands(IRTempValueMap *temp_map,
   case IR_OP_TENSOR_MMA:
   case IR_OP_TENSOR_MATMUL:
   case IR_OP_TENSOR_COMMIT:
+  case IR_OP_TENSOR_SCALE_ROWS:
   case IR_OP_STORE:
     if (!ir_try_propagate_operand(temp_map, symbol_map, &instruction->dest,
                                   changed) ||
@@ -3087,6 +3088,7 @@ static const int IR_HAS_SIDE_EFFECT[IR_OP_KIND_COUNT] = {
     [IR_OP_TENSOR_MATMUL] = 1,
     [IR_OP_TENSOR_EPILOGUE] = 1,
     [IR_OP_TENSOR_COMMIT] = 1,
+    [IR_OP_TENSOR_SCALE_ROWS] = 1,
     [IR_OP_TILE] = 1,
     [IR_OP_STORE] = 1,
     [IR_OP_CALL] = 1,

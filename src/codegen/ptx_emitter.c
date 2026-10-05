@@ -8417,6 +8417,12 @@ static void ptx_emit_device(IRProgram *program, IRFunction *func, PtxFn *fn,
     if (!ptx_tensor_epilogue_was_consumed(fn, in))
       ptx_emit_tensor_epilogue(fn, in);
     break;
+  case IR_OP_TENSOR_SCALE_ROWS:
+    fn_error(fn, "tensor_scale_rows is Metal only for now: PTX keeps a "
+                 "resident accumulator in WMMA fragments, whose element "
+                 "layout is not specified; use tensor_mma with "
+                 "c_scale_mode: per_row on PTX");
+    break;
   case IR_OP_TENSOR_COMMIT: {
     size_t epilogue_index = 0;
     const IRInstruction *epilogue =

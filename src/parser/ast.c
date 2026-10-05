@@ -308,6 +308,7 @@ static ASTNode *ast_clone_function_call(ASTNode *clone, const ASTNode *node) {
          sizeof(dst->tensor_transfer_coordinate_arguments));
   dst->is_tensor_mma = src->is_tensor_mma;
   dst->is_tensor_matmul = src->is_tensor_matmul;
+  dst->is_tensor_scale_rows = src->is_tensor_scale_rows;
   dst->tile_builtin = src->tile_builtin;
   dst->tensor_tile_mask = src->tensor_tile_mask;
   dst->tensor_c_zero = src->tensor_c_zero;
@@ -2224,6 +2225,7 @@ ASTNode *ast_create_call_expression(const char *function_name,
   call_expr->atomic_memory_scope = MTLC_MEMORY_SCOPE_DEFAULT;
   call_expr->is_tensor_mma = 0;
   call_expr->is_tensor_matmul = 0;
+  call_expr->is_tensor_scale_rows = 0;
   call_expr->tile_builtin = TILE_BUILTIN_NONE;
   call_expr->tensor_tile_mask = 0;
   call_expr->tensor_c_zero = 0;
@@ -2702,6 +2704,7 @@ ASTNode *ast_create_method_call(ASTNode *object, const char *method_name,
   call_expr->atomic_memory_scope = MTLC_MEMORY_SCOPE_DEFAULT;
   call_expr->is_tensor_mma = 0;
   call_expr->is_tensor_matmul = 0;
+  call_expr->is_tensor_scale_rows = 0;
   call_expr->tile_builtin = TILE_BUILTIN_NONE;
   call_expr->tensor_tile_mask = 0;
   call_expr->tensor_c_zero = 0;

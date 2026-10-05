@@ -1114,7 +1114,51 @@ static int ir_lower_tensor_mma_call(IRLoweringContext *context, IRFunction *func
   return ir_lower_ordinary_call(context, function, expression, out_value, call, callee_symbol);
 }
 
+static int ir_lower_tensor_scale_rows_call(IRLoweringContext *context,
+                                           IRFunction *function,
+                                           ASTNode *expression,
+                                           IROperand *out_value,
+                                           CallExpression *call) {
+  size_t sources[3] = {0, 1, call->tensor_d_stride_argument};
+  size_t count = ir_tensor_scale_rows_operand_count(&call->tensor_mma_desc);
+  IROperand arguments[3];
+  MtlcType *argument_types[3] = {NULL, NULL, NULL};
+  size_t lowered = 0;
+  int ok = 1;
+  memset(arguments, 0, sizeof(arguments));
+  if (count > 2 && sources[2] >= call->argument_count) {
+    ir_set_error(context, "tensor_scale_rows lost its runtime ldd");
+    return 0;
+  }
+  for (; lowered < count && ok; lowered++) {
+    ASTNode *source = call->arguments[sources[lowered]];
+    ok = ir_lower_expression(context, function, source, &arguments[lowered]);
+    argument_types[lowered] =
+        source->resolved_type ? mtlc_type_from_frontend(source->resolved_type)
+                              : NULL;
+  }
+  if (ok) {
+    IRInstruction instruction = {0};
+    IRTensorAux tensor;
+    ir_instruction_tensor_attach(&instruction, &tensor);
+    tensor.mma = call->tensor_mma_desc;
+    instruction.op = IR_OP_TENSOR_SCALE_ROWS;
+    instruction.location = expression->location;
+    instruction.arguments = arguments;
+    instruction.argument_types = argument_types;
+    instruction.argument_count = count;
+    ok = ir_emit(context, function, &instruction);
+  }
+  for (size_t i = 0; i < lowered; i++) ir_operand_destroy(&arguments[i]);
+  *out_value = ir_operand_none();
+  return ok;
+}
+
 static int ir_lower_tensor_call(IRLoweringContext *context, IRFunction *function, ASTNode *expression, IROperand *out_value, CallExpression *call, Symbol *callee_symbol) {
+  if (call->is_tensor_scale_rows) {
+    return ir_lower_tensor_scale_rows_call(context, function, expression,
+                                           out_value, call);
+  }
   if (call->is_tensor_mma || call->is_tensor_matmul) {
     size_t count = call->is_tensor_matmul
                        ? ir_tensor_matmul_operand_count(&call->tensor_mma_desc)
