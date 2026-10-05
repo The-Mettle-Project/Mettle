@@ -1611,6 +1611,81 @@ static int binary_is_string_concat(const IRInstruction *in) {
          in->value_type && in->value_type->kind == MTLC_TYPE_STRING;
 }
 
+static void emit_concat_operand(Arm64Emit *e, SlotMap *slots, AggMap *ag,
+                                const IROperand *operand, int slot) {
+  if (operand->kind == IR_OPERAND_SYMBOL &&
+      agg_size_of(ag, operand->name) > 0) {
+    emit_lea_local(e, R_LHS, slot_off(slots, operand->name));
+  } else {
+    load_into(e, slots, operand, R_LHS);
+  }
+  emit_slot_str(e, R_LHS, slot);
+}
+
+static void emit_concat_lengths(Arm64Emit *e, int off_a, int off_b,
+                                Arm64Reg total) {
+  emit_slot_ldr(e, R_LHS, off_a);
+  arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
+  emit_slot_ldr(e, R_RHS, off_b);
+  arm64_emit_word(e, arm64_ldr_imm(1, R_RHS, R_RHS, 8));
+  arm64_emit_word(e, arm64_add_reg(1, total, R_LHS, R_RHS));
+}
+
+static void emit_concat_header_offset(Arm64Emit *e, Arm64Reg total,
+                                      Arm64Reg out) {
+  arm64_emit_word(e, arm64_add_imm(1, out, total, 8, 0));
+  arm64_emit_word(e, arm64_lsr_imm(1, out, out, 3));
+  arm64_emit_word(e, arm64_lsl_imm(1, out, out, 3));
+}
+
+static void emit_concat_copy(Arm64Emit *e, Arm64ObjectContext *object,
+                             const IRProgram *prog, LblMap *fns, int off_dst,
+                             int off_piece, int after_a, int off_a) {
+  emit_slot_ldr(e, ARM64_X0, off_dst);
+  if (after_a) {
+    emit_slot_ldr(e, R_LHS, off_a);
+    arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
+    arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, ARM64_X0, R_LHS));
+  }
+  emit_slot_ldr(e, R_LHS, off_piece);
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X1, R_LHS, 0));
+  arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
+  emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
+}
+
+static void emit_string_concat(Arm64Emit *e, SlotMap *slots, AggMap *ag,
+                               Arm64ObjectContext *object,
+                               const IRProgram *prog, LblMap *fns,
+                               const IRInstruction *in) {
+  int off_a = slot_off(slots, CONCAT_A_SLOT);
+  int off_b = slot_off(slots, CONCAT_B_SLOT);
+  int off_dst = slot_off(slots, CONCAT_DST_SLOT);
+  emit_concat_operand(e, slots, ag, &in->lhs, off_a);
+  emit_concat_operand(e, slots, ag, &in->rhs, off_b);
+  emit_concat_lengths(e, off_a, off_b, ARM64_X0);
+  emit_concat_header_offset(e, ARM64_X0, ARM64_X0);
+  arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
+  emit_runtime_call(e, object, prog, fns, STUB_MALLOC);
+  emit_slot_str(e, ARM64_X0, off_dst);
+  emit_concat_copy(e, object, prog, fns, off_dst, off_a, 0, off_a);
+  emit_concat_copy(e, object, prog, fns, off_dst, off_b, 1, off_a);
+  emit_concat_lengths(e, off_a, off_b, ARM64_X1);
+  emit_slot_ldr(e, ARM64_X0, off_dst);
+  arm64_emit_word(e, arm64_add_reg(1, ARM64_X2, ARM64_X0, ARM64_X1));
+  arm64_emit_word(e, arm64_strb_imm(ARM64_XZR, ARM64_X2, 0));
+  emit_concat_header_offset(e, ARM64_X1, ARM64_X2);
+  arm64_emit_word(e, arm64_add_reg(1, R_RES, ARM64_X0, ARM64_X2));
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X0, R_RES, 0));
+  arm64_emit_word(e, arm64_str_imm(1, ARM64_X1, R_RES, 8));
+  if (in->dest.kind == IR_OPERAND_SYMBOL &&
+      agg_size_of(ag, in->dest.name) > 8) {
+    emit_lea_local(e, R_RHS, slot_off(slots, in->dest.name));
+    emit_fixed_copy(e, R_RHS, R_RES, 16);
+  } else {
+    store_dest(e, slots, &in->dest, R_RES);
+  }
+}
+
 static int type_is_cstring(const MtlcType *type) {
   if (!type || type->kind != MTLC_TYPE_POINTER) return 0;
   if (type->name && strcmp(type->name, "cstring") == 0) return 1;
@@ -2172,67 +2247,7 @@ static int encode_arithmetic_instruction(const Arm64Scope *scope,
                    fn->name);
         break;
       }
-      int off_a = slot_off(slots, CONCAT_A_SLOT);
-      int off_b = slot_off(slots, CONCAT_B_SLOT);
-      int off_dst = slot_off(slots, CONCAT_DST_SLOT);
-      if (in->lhs.kind == IR_OPERAND_SYMBOL &&
-          agg_size_of(ag, in->lhs.name) > 0) {
-        emit_lea_local(e, R_LHS, slot_off(slots, in->lhs.name));
-      } else {
-        load_into(e, slots, &in->lhs, R_LHS);
-      }
-      emit_slot_str(e, R_LHS, off_a);
-      if (in->rhs.kind == IR_OPERAND_SYMBOL &&
-          agg_size_of(ag, in->rhs.name) > 0) {
-        emit_lea_local(e, R_LHS, slot_off(slots, in->rhs.name));
-      } else {
-        load_into(e, slots, &in->rhs, R_LHS);
-      }
-      emit_slot_str(e, R_LHS, off_b);
-      emit_slot_ldr(e, R_LHS, off_a);
-      arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
-      emit_slot_ldr(e, R_RHS, off_b);
-      arm64_emit_word(e, arm64_ldr_imm(1, R_RHS, R_RHS, 8));
-      arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, R_LHS, R_RHS));
-      arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 17, 0));
-      emit_runtime_call(e, object, prog, fns, STUB_MALLOC);
-      emit_slot_str(e, ARM64_X0, off_dst);
-      arm64_emit_word(e, arm64_add_imm(1, R_LHS, ARM64_X0, 16, 0));
-      arm64_emit_word(e, arm64_str_imm(1, R_LHS, ARM64_X0, 0));
-      emit_slot_ldr(e, R_LHS, off_a);
-      arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
-      emit_slot_ldr(e, R_RHS, off_b);
-      arm64_emit_word(e, arm64_ldr_imm(1, R_RHS, R_RHS, 8));
-      arm64_emit_word(e, arm64_add_reg(1, R_LHS, R_LHS, R_RHS));
-      arm64_emit_word(e, arm64_str_imm(1, R_LHS, ARM64_X0, 8));
-      emit_slot_ldr(e, ARM64_X0, off_dst);
-      arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
-      emit_slot_ldr(e, R_LHS, off_a);
-      arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X1, R_LHS, 0));
-      arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
-      emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
-      emit_slot_ldr(e, ARM64_X0, off_dst);
-      arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
-      emit_slot_ldr(e, R_LHS, off_a);
-      arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, R_LHS, 8));
-      arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, ARM64_X0, R_LHS));
-      emit_slot_ldr(e, R_LHS, off_b);
-      arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X1, R_LHS, 0));
-      arm64_emit_word(e, arm64_ldr_imm(1, ARM64_X2, R_LHS, 8));
-      emit_runtime_call(e, object, prog, fns, STUB_MEMCPY);
-      emit_slot_ldr(e, ARM64_X0, off_dst);
-      arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, ARM64_X0, 8));
-      arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
-      arm64_emit_word(e, arm64_add_reg(1, ARM64_X0, ARM64_X0, R_LHS));
-      arm64_emit_word(e, arm64_strb_imm(ARM64_XZR, ARM64_X0, 0));
-      emit_slot_ldr(e, R_RES, off_dst);
-      if (in->dest.kind == IR_OPERAND_SYMBOL &&
-          agg_size_of(ag, in->dest.name) > 8) {
-        emit_lea_local(e, R_RHS, slot_off(slots, in->dest.name));
-        emit_fixed_copy(e, R_RHS, R_RES, 16);
-      } else {
-        store_dest(e, slots, &in->dest, R_RES);
-      }
+      emit_string_concat(e, slots, ag, object, prog, fns, in);
       break;
     }
     lower_binary(e, slots, fs, us, in);

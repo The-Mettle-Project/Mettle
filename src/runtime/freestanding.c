@@ -2909,11 +2909,22 @@ void *calloc(mt_size count, mt_size size) {
   return memory;
 }
 
+static MT_NORETURN void mt_heap_bad_free(void) {
+  static const char message[] =
+      "mettle: free() of a pointer that malloc() did not return\n";
+  write(2, message, sizeof(message) - 1);
+  abort();
+}
+
 void free(void *memory) {
   if (!memory) {
     return;
   }
   mt_u64 *base = (mt_u64 *)memory - 2;
+  if (base[0] == 0 ||
+      (base[0] > MT_HEAP_CLASS_COUNT && base[0] != base[1] + MT_HEAP_HEADER)) {
+    mt_heap_bad_free();
+  }
   mt_free_count++;
   if (base[0] > MT_HEAP_CLASS_COUNT) {
 #if defined(MT_HOSTED)

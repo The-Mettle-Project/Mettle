@@ -1,0 +1,16 @@
+import "std/io";
+
+fn main() -> int32 {
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (i < 200) {
+    var q: int32 = i / 4;
+    var flag: bool = i % 3 == 0;
+    var line: string = "row {i}: ({q / 8},{q % 8}) {flag} {i * 7 - 300} [{q + 1}]";
+    var joined: string = line + " / " + "{i % 5}";
+    total = total + (int64)line.length + (int64)joined.length;
+    i = i + 1;
+  }
+  println("interpolation total {total}");
+  return 0;
+}

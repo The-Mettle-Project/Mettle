@@ -496,6 +496,10 @@ jobs:
           rc=0; /tmp/cstring_global || rc=$?; test $rc -eq 42
           ./bin/mettle --build tests/test_parallel_loop.mettle -o /tmp/parallel
           /tmp/parallel
+          ./bin/mettle --build tests/test_interpolation_frees.mettle -o /tmp/interpolation
+          test "$(/tmp/interpolation)" = "interpolation total 12024"
+          ./bin/mettle --release --build tests/test_interpolation_frees.mettle -o /tmp/interpolation_release
+          test "$(/tmp/interpolation_release)" = "interpolation total 12024"
 
       # GitHub's hosted macOS runners expose a paravirtual GPU without Metal 3,
       # so the steps that run kernels only run where the device has it.

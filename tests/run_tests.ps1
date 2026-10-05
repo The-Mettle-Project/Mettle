@@ -9746,6 +9746,25 @@ catch {
   Write-CaseResult -Name "cstring_global_runtime" -Passed $false -Reason $_.Exception.Message
 }
 
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $exePath = Join-Path $tmpDir "interpolation_frees.exe"
+  $buildOut = & $CompilerPath --build "tests/test_interpolation_frees.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "interpolation frees build failed: $buildOut"
+  }
+  $runOut = (& $exePath 2>&1 | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or $runOut -ne "interpolation total 12024") {
+    throw "interpolation frees printed '$runOut' and exited $LASTEXITCODE"
+  }
+  Write-CaseResult -Name "interpolation_frees_runtime" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "interpolation_frees_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
 # Conditional imports: --build and verify off-target guarded imports are dropped.
 $total++
 try {
