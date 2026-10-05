@@ -1,0 +1,8 @@
+kernel(block = 64) tiles_from_device(count: uint32*, x: float32*, out: float32*) {
+  workgroup var stage: float32[64];
+  var tiles: uint32 = workgroup_uniform(count[0]);
+  if ((uint32)block.x >= tiles) { return; }
+  stage[thread.x] = x[block.x * 64 + thread.x];
+  gpu_barrier();
+  out[block.x * 64 + thread.x] = stage[63 - thread.x];
+}

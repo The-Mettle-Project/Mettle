@@ -743,6 +743,7 @@ not as a CUDA warp. The initial portable collective surface is:
 | `subgroup_local_id() -> uint32` | caller's zero-based lane within its subgroup |
 | `subgroup_size() -> uint32` | number of lanes in the current subgroup |
 | `subgroup_broadcast(value, source_lane)` | u32/f32 value from one uniform, valid source lane, returned to every lane |
+| `workgroup_uniform(value: uint32) -> uint32` | returns `value` and asserts it is the same in every thread of the workgroup, so a barrier may sit under control flow on it |
 | `subgroup_reduce_add(value)` | u32/f32 subgroup sum, returned to every lane |
 | `subgroup_reduce_min(value)` / `subgroup_reduce_max(value)` | u32/f32 subgroup extrema, returned to every lane |
 | `subgroup_scan_inclusive_add(value)` | u32/f32 prefix sum including the caller's value |
@@ -769,7 +770,24 @@ workgroup, values uniform only within a subgroup, and work-item-varying values.
 Kernel arguments and group topology are workgroup-uniform; broadcast and
 reduction and vote results are subgroup-uniform, while shuffle, scan, and a
 ballot selected with a varying word index vary by lane. Local
-IDs, memory loads, and opaque call results are conservatively varying. Helper parameter ranks are joined from every
+IDs, memory loads, and opaque call results are conservatively varying.
+`workgroup_uniform(x)` marks a value the checker cannot prove uniform, such as
+a count every thread loads from one address that a previous kernel wrote:
+
+```mettle
+kernel(block = 64) tiles(count: uint32*, x: float32*) {
+  workgroup var stage: float32[64];
+  var n: uint32 = workgroup_uniform(count[0]);
+  if ((uint32)block.x >= n) { return; }
+  stage[thread.x] = x[block.x * 64 + thread.x];
+  gpu_barrier();
+  x[block.x * 64 + thread.x] = stage[63 - thread.x];
+}
+```
+
+It compiles to the value itself. The assertion is not checked: if threads of
+one workgroup see different values, the barrier hangs or the result is
+undefined. Helper parameter ranks are joined from every
 reachable call site. Collectives under control that is insufficiently uniform for their
 scope, varying-trip loops, and work-item-varying broadcast lanes are rejected
 without putting backend reconvergence rules in the frontend.

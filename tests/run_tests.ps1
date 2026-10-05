@@ -2835,6 +2835,9 @@ $cases = @(
   @{ Name = "gpu_uniform_collectives"; Path = "tests/gpu/uniform_collectives.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },
   @{ Name = "gpu_warp_row_early_return"; Path = "tests/gpu/warp_row_early_return.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
   @{ Name = "gpu_warp_row_early_return_spirv"; Path = "tests/gpu/warp_row_early_return.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-spirv") },
+  @{ Name = "gpu_workgroup_uniform_ptx"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10"); OutputMustNotMatch = @("eligibility failed") },
+  @{ Name = "gpu_workgroup_uniform_spirv"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-spirv"); OutputMustNotMatch = @("eligibility failed") },
+  @{ Name = "gpu_workgroup_uniform_metal"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-metal"); OutputMustNotMatch = @("eligibility failed") },
   @{ Name = "gpu_bit_intrinsics"; Path = "tests/gpu/bit_intrinsics.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
   @{ Name = "gpu_bit_intrinsics_spirv"; Path = "tests/gpu/bit_intrinsics.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-spirv") },
   @{ Name = "gpu_u16_typed_loads"; Path = "tests/gpu/u16_typed_loads.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
@@ -14841,7 +14844,8 @@ $script:MetalAccepted = @(
   "tests/gpu/u16_typed_loads.mettle",
   "tests/gpu/uniform_collectives.mettle",
   "tests/gpu/vector_and_packed.mettle",
-  "tests/gpu/warp_row_early_return.mettle"
+  "tests/gpu/warp_row_early_return.mettle",
+  "tests/gpu/workgroup_uniform.mettle"
 )
 
 $total++
