@@ -2260,11 +2260,52 @@ mettle -O --build host.mettle -o host
 
 `--gpu-provider=metal` picks the Metal provider on another host, which is how
 the tests run it against the interpreter. Launches collect in one command
-buffer, with a buffer barrier between dispatches, and the buffer commits when
-the host next touches device memory: a copy, a free, `gpu_sync`, an event
-record, every 512 launches, and at exit. An error in a batch names its first
-and last kernel; `METTLE_METAL_SYNC=1` waits after every launch to find the
-one that failed. Streams are one ordered queue, and events record host time
+buffer, with a buffer barrier between dispatches, and the host waits for it
+when it next touches device memory: a copy, a free, `gpu_sync`, an event
+record, and at exit. An error in a batch names its first and last kernel;
+`METTLE_METAL_SYNC=1` waits after every launch to find the one that failed.
+
+The GPU starts on a command buffer only once it is committed, so a host that
+encodes a long sequence (a prefill of hundreds of launches) leaves the GPU
+idle until `gpu_sync`. `gpu_flush()` commits what is queued without waiting
+and starts a new command buffer on the next launch. Command buffers run in
+the order they were committed, so a flush changes no result. `gpu_sync` waits
+for the last one and reports an error from any of them. The runtime flushes
+by itself every 512 launches. On an M4 Pro, 500 small dependent launches
+took 2.6 ms from the first encode to the end of `gpu_sync` with one command
+buffer and 1.1 ms with a flush every 50 launches.
+
+```mettle
+var layer: int32 = 0;
+while (layer < layers) {
+  encode_layer(layer);
+  gpu_flush();
+  layer = layer + 1;
+}
+gpu_sync();
+```
+
+Each launch waits for the one before it. Launches that do not depend on each
+other can run side by side between `gpu_barrier_off()` and `gpu_barrier_on()`:
+
+```mettle
+gpu_barrier_off();
+dispatch q_proj[work: n](x, wq, q);
+dispatch k_proj[work: n](x, wk, k);
+dispatch v_proj[work: n](x, wv, v);
+gpu_barrier_on();
+dispatch attention[work: n](q, k, v, out);
+```
+
+The group runs after everything launched before `gpu_barrier_off()` and before
+everything launched after `gpu_barrier_on()`; only the launches inside it are
+unordered against each other. A launch in the group that reads what another
+one in the group writes gets an undefined result. Metal encodes the group in
+a concurrent compute encoder and everything else in serial encoders, where
+removing the barrier alone would change nothing. 500 independent launches
+went from 2.4 ms to 1.7 ms as one group. Under CUDA, `gpu_flush`,
+`gpu_barrier_off` and `gpu_barrier_on` do nothing and return 0; launches on
+one stream run in order. Streams are one ordered queue, and events record host time
 after waiting. Graph capture records the packed launches, and a replay encodes
 them all into the current command buffer. Metal has one GPU per process and
 no managed memory (`gpu_managed_malloc` returns null). `gpu_open_kernels(stem)`

@@ -254,6 +254,69 @@ fn check_indirect() -> int32 {
   return 0;
 }
 
+fn group_chain(da: int64, db: int64, dc: int64, d1: int64, d2: int64,
+               de: int64, n: int32) {
+  dispatch host_vadd[work: n](da, db, dc, n);
+  gpu_barrier_off();
+  dispatch host_vadd[work: n](dc, da, d1, n);
+  dispatch host_vadd[work: n](dc, db, d2, n);
+  gpu_barrier_on();
+  gpu_flush();
+  dispatch host_vadd[work: n](d1, d2, de, n);
+}
+
+fn check_flush_groups() -> int32 {
+  var n: int32 = 300;
+  var bytes: int64 = (int64)n * 4;
+  var ha: float32* = (float32*)malloc(bytes);
+  var hb: float32* = (float32*)malloc(bytes);
+  var he: float32* = (float32*)malloc(bytes);
+  var i: int32 = 0;
+  while (i < n) {
+    ha[i] = (float32)i;
+    hb[i] = (float32)(2 * i + 1);
+    i = i + 1;
+  }
+  var da: int64 = gpu_malloc(bytes);
+  var db: int64 = gpu_malloc(bytes);
+  var dc: int64 = gpu_malloc(bytes);
+  var d1: int64 = gpu_malloc(bytes);
+  var d2: int64 = gpu_malloc(bytes);
+  var de: int64 = gpu_malloc(bytes);
+  if (da == 0 || db == 0 || dc == 0 || d1 == 0 || d2 == 0 || de == 0) { return 101; }
+  if (gpu_to_device(da, (uint8*)ha, bytes) != 0) { return 102; }
+  if (gpu_to_device(db, (uint8*)hb, bytes) != 0) { return 102; }
+  group_chain(da, db, dc, d1, d2, de, n);
+  if (gpu_sync() != 0) { return 103; }
+  if (gpu_to_host((uint8*)he, de, bytes) != 0) { return 104; }
+  i = 0;
+  while (i < n) {
+    if (he[i] != (float32)(3 * i + 3 * (2 * i + 1))) { return 105; }
+    he[i] = (float32)-1;
+    i = i + 1;
+  }
+  if (gpu_to_device(de, (uint8*)he, bytes) != 0) { return 106; }
+  var stream: int64 = gpu_stream_create();
+  if (gpu_graph_capture_begin(stream) != 0) { return 107; }
+  group_chain(da, db, dc, d1, d2, de, n);
+  var graph: int64 = gpu_graph_capture_end(stream);
+  if (graph == 0 || gpu_graph_launch(graph, stream) != 0) { return 108; }
+  if (gpu_to_host((uint8*)he, de, bytes) != 0) { return 109; }
+  i = 0;
+  while (i < n) {
+    if (he[i] != (float32)(3 * i + 3 * (2 * i + 1))) { return 110; }
+    i = i + 1;
+  }
+  gpu_graph_destroy(graph);
+  gpu_free(da);
+  gpu_free(db);
+  gpu_free(dc);
+  gpu_free(d1);
+  gpu_free(d2);
+  gpu_free(de);
+  return 0;
+}
+
 fn main() -> int32 {
   var path: cstring = getenv("METTLE_METAL_HOST_LIBRARY");
   if (path == 0) {
@@ -271,5 +334,7 @@ fn main() -> int32 {
   if (status != 0) { return status; }
   status = check_graph();
   if (status != 0) { return status; }
-  return check_indirect();
+  status = check_indirect();
+  if (status != 0) { return status; }
+  return check_flush_groups();
 }

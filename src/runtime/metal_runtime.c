@@ -28,7 +28,13 @@ static size_t g_kernel_count;
 static int g_version_major = 3;
 static int g_version_minor = 2;
 
+#define RT_OP_LAUNCH 0
+#define RT_OP_FLUSH 1
+#define RT_OP_BARRIERS_OFF 2
+#define RT_OP_BARRIERS_ON 3
+
 typedef struct {
+  int op;
   int64_t kernel;
   uint32_t grid[3];
   uint64_t counts;
@@ -365,7 +371,16 @@ static int rt_capture(const RtLaunch *launch) {
 }
 
 static int rt_run(const RtLaunch *launch) {
-  const char *name = g_kernels[launch->kernel - 1];
+  const char *name;
+  if (launch->op == RT_OP_FLUSH) {
+    mettle_metal_flush(g_metal);
+    return 1;
+  }
+  if (launch->op != RT_OP_LAUNCH) {
+    mettle_metal_set_barriers(g_metal, launch->op == RT_OP_BARRIERS_ON);
+    return 1;
+  }
+  name = g_kernels[launch->kernel - 1];
   if (launch->counts) {
     return mettle_metal_launch_indirect(
         g_metal, name, launch->counts, launch->block, launch->args,
@@ -443,6 +458,32 @@ int32_t mettle_metal_rt_launch_indirect(int64_t kernel, int64_t counts,
   return rt_submit(&launch, params, nargs);
 }
 
+static int32_t rt_control(int op) {
+  RtLaunch control;
+  if (g_capturing) {
+    memset(&control, 0, sizeof(control));
+    control.op = op;
+    return rt_capture(&control) ? 0 : 1;
+  }
+  if (!g_metal) {
+    return 0;
+  }
+  memset(&control, 0, sizeof(control));
+  control.op = op;
+  rt_run(&control);
+  return 0;
+}
+
+int32_t mettle_metal_rt_flush(void) { return rt_control(RT_OP_FLUSH); }
+
+int32_t mettle_metal_rt_barriers(int32_t on) {
+  return rt_control(on ? RT_OP_BARRIERS_ON : RT_OP_BARRIERS_OFF);
+}
+
+double mettle_metal_rt_gpu_ms(void) {
+  return g_metal ? mettle_metal_gpu_ms(g_metal) : 0.0;
+}
+
 int32_t mettle_metal_rt_capture_begin(void) {
   RtGraph *grown;
   if (g_capturing) {
@@ -481,7 +522,8 @@ int32_t mettle_metal_rt_graph_launch(int64_t handle) {
   graph = &g_graphs[handle - 1];
   for (size_t i = 0; i < graph->count; i++) {
     RtLaunch *launch = &graph->launches[i];
-    if ((uint64_t)launch->kernel > g_kernel_count) {
+    if (launch->op == RT_OP_LAUNCH &&
+        (uint64_t)launch->kernel > g_kernel_count) {
       rt_error("a captured Metal graph outlived the library it launches");
       return 1;
     }

@@ -66,8 +66,9 @@ mettle --build host.mettle -o host
 `gpu_open_kernels("kernels")` loads `kernels.metal` here and `kernels.ptx`
 under CUDA. `examples/gpu_inference` is a transformer decode step that runs
 unchanged on both. [GPU offload](gpu.md#metal-apple-gpu-target) covers what a
-kernel becomes, what Metal refuses, how launches are batched, and the
-environment variables:
+kernel becomes, what Metal refuses, how launches are batched (`gpu_flush`
+starts the GPU on what is queued, `gpu_barrier_off`/`gpu_barrier_on` let
+independent launches overlap), and the environment variables:
 
 | Variable | Effect |
 |---|---|

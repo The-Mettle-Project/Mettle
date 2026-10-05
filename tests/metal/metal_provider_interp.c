@@ -287,3 +287,15 @@ int mettle_metal_launch_indirect(MettleMetal *metal, const char *kernel,
   return mettle_metal_launch(metal, kernel, grid, block, args, args_size,
                              threadgroup_bytes, error, error_size);
 }
+
+void mettle_metal_flush(MettleMetal *metal) { (void)metal; }
+
+void mettle_metal_set_barriers(MettleMetal *metal, int on) {
+  (void)metal;
+  (void)on;
+}
+
+double mettle_metal_gpu_ms(const MettleMetal *metal) {
+  (void)metal;
+  return 0.0;
+}

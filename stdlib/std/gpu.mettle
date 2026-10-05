@@ -333,6 +333,9 @@ export fn gpu_host_mapped_malloc(bytes: int64, dev_ptr_out: int64*) -> uint8* {
   return cuMemcpyDtoH_v2(dst, src, bytes);
 }
 @inline export fn gpu_sync() -> int32 { return cuCtxSynchronize(); }
+@inline export fn gpu_flush() -> int32 { return 0; }
+@inline export fn gpu_barrier_off() -> int32 { return 0; }
+@inline export fn gpu_barrier_on() -> int32 { return 0; }
 
 export fn gpu_stream_create() -> int64 {
   var stream: int64 = 0;

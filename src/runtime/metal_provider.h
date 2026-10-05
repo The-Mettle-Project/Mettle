@@ -38,6 +38,9 @@ size_t mettle_metal_span(MettleMetal *metal, uint64_t address);
 uint64_t mettle_metal_address_of(MettleMetal *metal, const void *host);
 
 int mettle_metal_sync(MettleMetal *metal, char *error, size_t error_size);
+void mettle_metal_flush(MettleMetal *metal);
+void mettle_metal_set_barriers(MettleMetal *metal, int on);
+double mettle_metal_gpu_ms(const MettleMetal *metal);
 
 int mettle_metal_launch(MettleMetal *metal, const char *kernel,
                         const uint32_t grid[3], const uint32_t block[3],

@@ -32,6 +32,8 @@ extern fn __mtlc_metal_note(text: cstring) = "mettle_metal_rt_note";
 extern fn __mtlc_metal_fail(first: cstring, second: cstring, third: cstring) = "mettle_metal_rt_fail";
 extern fn __mtlc_metal_now_ms() -> float64 = "mettle_metal_rt_now_ms";
 extern fn __mtlc_metal_sync() -> int32 = "mettle_metal_rt_sync";
+extern fn __mtlc_metal_flush() -> int32 = "mettle_metal_rt_flush";
+extern fn __mtlc_metal_barriers(on: int32) -> int32 = "mettle_metal_rt_barriers";
 extern fn __mtlc_metal_capture_begin() -> int32 = "mettle_metal_rt_capture_begin";
 extern fn __mtlc_metal_capture_end() -> int64 = "mettle_metal_rt_capture_end";
 extern fn __mtlc_metal_graph_launch(graph: int64) -> int32 = "mettle_metal_rt_graph_launch";
@@ -189,6 +191,9 @@ export fn gpu_host_mapped_malloc(bytes: int64, dev_ptr_out: int64*) -> uint8* {
   return __mtlc_metal_to_host(dst, src, bytes);
 }
 @inline export fn gpu_sync() -> int32 { return __mtlc_metal_sync(); }
+@inline export fn gpu_flush() -> int32 { return __mtlc_metal_flush(); }
+@inline export fn gpu_barrier_off() -> int32 { return __mtlc_metal_barriers(0); }
+@inline export fn gpu_barrier_on() -> int32 { return __mtlc_metal_barriers(1); }
 
 export fn gpu_stream_create() -> int64 { return 1; }
 @inline export fn gpu_stream_destroy(stream: int64) -> int32 { return 0; }
