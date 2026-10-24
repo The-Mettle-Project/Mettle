@@ -77,7 +77,8 @@ static const char *ir_local_bind_impl(IRLoweringContext *context,
   int shadows_global = 0;
   if (allow_rename && context->symbol_table) {
     const Symbol *global = symbol_table_lookup(context->symbol_table, name);
-    shadows_global = global != NULL && global->kind == SYMBOL_VARIABLE;
+    shadows_global = global != NULL && (global->kind == SYMBOL_VARIABLE ||
+                                        global->kind == SYMBOL_FUNCTION);
   }
   if (!allow_rename) {
     ir_name = name;

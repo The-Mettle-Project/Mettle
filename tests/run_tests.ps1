@@ -10415,6 +10415,40 @@ foreach ($relFlag in @($true, $false)) {
   }
 }
 
+# A local or parameter that shadows a function. The local used to share the
+# function's IR name, and the MIR address-of asked for a function before a
+# local, so `buf[0] = v` on a local array named after `fn buf` wrote into the
+# function's code. A local named after a function now gets a name of its own.
+foreach ($relFlag in @($true, $false)) {
+  $total++
+  $variant = if ($relFlag) { "release" } else { "debug" }
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "test_function_shadowing_$variant.exe"
+    $buildArgs = @("--build")
+    if ($relFlag) { $buildArgs += "--release" }
+    $buildArgs += @("tests/test_function_shadowing.mettle", "-o", $exePath)
+
+    $buildOut = & $CompilerPath @buildArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "function-shadowing build ($variant) failed: $buildOut"
+    }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "function-shadowing ($variant) failed (exit $LASTEXITCODE): $runOut"
+    }
+    if ($runOut -notmatch "function_shadowing OK") {
+      throw "function-shadowing ($variant) did not print OK: $runOut"
+    }
+
+    Write-CaseResult -Name "function_shadowing_$variant" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "function_shadowing_$variant" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # The MIR encoder stages a spilled base/index/value through a scratch register.
 # RDX was a candidate, but RDX is in the allocator's pool: staging over the live
 # loop counter it held made the counter run past its bound and the release build

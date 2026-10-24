@@ -1,0 +1,61 @@
+import "std/io";
+
+struct P { x: int32; y: int32; }
+
+fn buf(n: int32) -> int32 {
+  return n + 1000;
+}
+
+fn pt(a: int32) -> P {
+  var r: P;
+  r.x = a;
+  r.y = a + 1;
+  return r;
+}
+
+fn dbl(x: int32) -> int32 {
+  return x * 2;
+}
+
+fn array_local(v: int32) -> int32 {
+  var buf: int32[4];
+  buf[0] = v;
+  buf[1] = v + 1;
+  return buf[0] + buf[1];
+}
+
+fn struct_local(v: int32) -> int32 {
+  var pt: P = pt(v);
+  pt.x = pt.x + 1;
+  return pt.x + pt.y;
+}
+
+fn struct_param(pt: P) -> int32 {
+  var q: P* = &pt;
+  return q.x * 10 + q.y;
+}
+
+fn value_then_local(v: int32) -> int32 {
+  var f: fn(int32) -> int32 = dbl;
+  var dbl: int32[2];
+  dbl[0] = v;
+  dbl[1] = f(v);
+  return dbl[0] + dbl[1];
+}
+
+fn scalar_local(v: int32) -> int32 {
+  var r: int32 = dbl(v);
+  var dbl: int32 = 11;
+  return r + dbl;
+}
+
+fn main() -> int32 {
+  if (array_local(3) != 7) { println("function_shadowing array WRONG"); return 1; }
+  if (struct_local(3) != 8) { println("function_shadowing struct WRONG"); return 2; }
+  if (struct_param(pt(4)) != 45) { println("function_shadowing param WRONG"); return 3; }
+  if (value_then_local(5) != 15) { println("function_shadowing value WRONG"); return 4; }
+  if (scalar_local(5) != 21) { println("function_shadowing scalar WRONG"); return 5; }
+  if (buf(1) != 1001 || dbl(4) != 8) { println("function_shadowing callee WRONG"); return 6; }
+  println("function_shadowing OK");
+  return 0;
+}

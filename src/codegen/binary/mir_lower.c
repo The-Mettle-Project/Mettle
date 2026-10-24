@@ -1388,16 +1388,16 @@ static MirAddrofKind mir_addressof_kind(CodeGenerator *g,
   if (in->lhs.kind != IR_OPERAND_SYMBOL || !in->lhs.name) {
     return MIR_ADDROF_UNSUPPORTED;
   }
-  const CgSym *sym = g && g->ir_program
-                    ? code_generator_lookup_symbol(g, in->lhs.name)
-                    : NULL;
-  if ((sym && sym->kind == CG_SYM_FUNCTION) ||
-      mir_find_ir_function_named(g, in->lhs.name)) {
-    return MIR_ADDROF_FUNCTION;
-  }
   int is_param = 0;
   const MtlcType *t = mir_local_or_param_type(g, ir_function, in->lhs.name, &is_param);
   if (!t) {
+    const CgSym *sym = g && g->ir_program
+                      ? code_generator_lookup_symbol(g, in->lhs.name)
+                      : NULL;
+    if ((sym && sym->kind == CG_SYM_FUNCTION) ||
+        mir_find_ir_function_named(g, in->lhs.name)) {
+      return MIR_ADDROF_FUNCTION;
+    }
     return mir_name_is_global_variable(g, in->lhs.name) ? MIR_ADDROF_GLOBAL
                                                         : MIR_ADDROF_UNSUPPORTED;
   }
@@ -3449,17 +3449,6 @@ static int mir_instruction_writes_symbol(const IRInstruction *in,
          strcmp(in->dest.name, name) == 0;
 }
 
-static int mir_address_of_function_target(CodeGenerator *g,
-                                          const IROperand *op) {
-  if (!g || !op || op->kind != IR_OPERAND_SYMBOL || !op->name) {
-    return 0;
-  }
-  const CgSym *s = g->ir_program ? code_generator_lookup_symbol(g, op->name)
-                              : NULL;
-  return (s && s->kind == CG_SYM_FUNCTION) ||
-         mir_find_ir_function_named(g, op->name) != NULL;
-}
-
 static const char *mir_known_function_pointer_target(CodeGenerator *g,
                                                      const IRFunction *irf,
                                                      size_t before,
@@ -3482,7 +3471,7 @@ static const char *mir_known_function_pointer_target(CodeGenerator *g,
     }
     writes++;
     if (writes > 1 || in->op != IR_OP_ADDRESS_OF ||
-        !mir_address_of_function_target(g, &in->lhs)) {
+        mir_addressof_kind(g, irf, in) != MIR_ADDROF_FUNCTION) {
       return NULL;
     }
     target = in->lhs.name;
