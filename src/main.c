@@ -3819,6 +3819,8 @@ static DriverFlagResult parse_flag_shared_library(CompilerOptions *options,
     options->soname = argv[++i];
   } else if (strcmp(argv[i], "--live") == 0) {
     options->live = 1;
+  } else if (strcmp(argv[i], "--live-patch-all") == 0) {
+    options->live_patch_all = 1;
   } else if (strcmp(argv[i], "--live-patch") == 0 && i + 1 < argc) {
     options->live = 1;
     options->live_patch_target = argv[++i];
@@ -4981,7 +4983,7 @@ int main(int argc, char *argv[]) {
     LivePatchSummary summary;
     char *live_error = NULL;
     if (!live_build_patch(options.output_filename, options.live_patch_target,
-                          &summary, &live_error)) {
+                          options.live_patch_all, &summary, &live_error)) {
       fprintf(stderr, "Error: %s\n",
               live_error ? live_error : "Failed to build a live patch");
       if (summary.names[0]) {

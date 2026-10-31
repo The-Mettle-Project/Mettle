@@ -127,6 +127,7 @@ typedef struct {
   const char *soname;
   int live;
   const char *live_patch_target;
+  int live_patch_all;
   const char *dynamic_linker;
   const char *stdlib_directory;
   int prelude;

@@ -1265,7 +1265,8 @@ static int live_write_patch(LiveBuilder *builder, const char *path) {
 }
 
 int live_build_patch(const char *object_path, const char *executable_path,
-                     LivePatchSummary *summary, char **error_message_out) {
+                     int replace_all, LivePatchSummary *summary,
+                     char **error_message_out) {
   LiveState state;
   LiveObjectIndex index;
   LiveBuilder builder;
@@ -1313,7 +1314,7 @@ int live_build_patch(const char *object_path, const char *executable_path,
     uint64_t hash = live_function_hash(&index, i);
     LiveEntry *previous = live_map_find(&state.hashes, index.functions[i].name);
     uint64_t ignored = 0;
-    if (previous && previous->a == hash) {
+    if (previous && previous->a == hash && !replace_all) {
       continue;
     }
     if (previous) {

@@ -31,6 +31,7 @@ int live_write_state(const LinkResolution *resolution, uint64_t image_base,
                      const char *executable_path, char **error_message_out);
 
 int live_build_patch(const char *object_path, const char *executable_path,
-                     LivePatchSummary *summary, char **error_message_out);
+                     int replace_all, LivePatchSummary *summary,
+                     char **error_message_out);
 
 #endif
