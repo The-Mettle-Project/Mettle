@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mettle</title>
+<meta name="description" content="A systems language where the toolchain is part of the contract. Require what the compiler must do, read what it did, and check that it kept your program's meaning.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 150 150'%3E%3Cg fill='%23121211'%3E%3Cpolygon points='56.4 63.7 69.5 34.8 113.7 32.3 133.5 51 122.3 74.9 130.2 88.3 147.6 48 119.6 20.8 62.4 20.9 42.4 63.7'/%3E%3Cpolygon points='60.6 63.7 68.9 57.7 95.6 57.7 108.9 63.6'/%3E%3Cpolygon points='47.9 67 109.2 88.8 114.3 97.6 138 109.5 114.2 66.9'/%3E%3Cpath d='m140.4 114.6-94.1-45.1-2.9 6 43.7 41.8-23.6 0.1-20.8-40.3-24.2 51.9 129.7-0.1-7.8-14.3z'/%3E%3Cpath d='m14.2 63-12.1 5.5 1.4 2.1 23.1 32.4 13.9-29.1-26.3-10.9zm14.7 22.3-17.3-19.9 24.4 10.3-7.1 9.6z'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f3f3ef;
+  --sheet: #ffffff;
+  --well: #ecebe5;
+  --ink: #121211;
+  --ink-2: #3c3c38;
+  --muted: #75746c;
+  --rule: #dcdbd3;
+  --rule-2: #bfbeb4;
+  --accent: #1f45c4;
+  --hl: rgba(31, 69, 196, 0.09);
+  --err: #b3261e;
+  --warn: #875a00;
+  --ok: #24693a;
+  --ty: #2a5a69;
+  --str: #7a4a0c;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f0f0e;
+    --sheet: #161615;
+    --well: #1b1b19;
+    --ink: #ecebe6;
+    --ink-2: #c5c4bd;
+    --muted: #8c8b84;
+    --rule: #2a2a27;
+    --rule-2: #3b3b37;
+    --accent: #8ea8ff;
+    --hl: rgba(142, 168, 255, 0.13);
+    --err: #f28c7e;
+    --warn: #e2b553;
+    --ok: #8ed09f;
+    --ty: #8dc2d1;
+    --str: #dbb97c;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f0f0e;
+  --sheet: #161615;
+  --well: #1b1b19;
+  --ink: #ecebe6;
+  --ink-2: #c5c4bd;
+  --muted: #8c8b84;
+  --rule: #2a2a27;
+  --rule-2: #3b3b37;
+  --accent: #8ea8ff;
+  --hl: rgba(142, 168, 255, 0.13);
+  --err: #f28c7e;
+  --warn: #e2b553;
+  --ok: #8ed09f;
+  --ty: #8dc2d1;
+  --str: #dbb97c;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-padding-top: 24px; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 17px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 0.2em; text-decoration-color: var(--rule-2); }
+a:hover { color: var(--accent); text-decoration-color: currentColor; }
+a:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+code, pre { font-family: var(--mono); }
+p code, li code, td code, h3 code { font-size: 0.86em; font-weight: 500; white-space: nowrap; }
+::selection { background: var(--hl); }
+
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 40px; }
+.grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: 32px; }
+
+.top { display: flex; align-items: center; justify-content: space-between; gap: 24px; height: 68px; border-bottom: 1px solid var(--rule); }
+.brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-weight: 600; font-size: 17px; letter-spacing: -0.01em; }
+.brand svg { width: 24px; height: 24px; fill: currentColor; }
+.brand:hover { color: var(--ink); }
+.top nav { display: flex; align-items: center; gap: 28px; font-size: 14.5px; }
+.top nav a { text-decoration: none; color: var(--ink-2); }
+.top nav a:hover { color: var(--accent); }
+.top nav .ver { font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
+
+.hero { padding: 120px 0 128px; align-items: end; }
+.hero-h { grid-column: 1 / span 7; }
+.hero-b { grid-column: 9 / span 4; }
+h1 {
+  font-size: clamp(36px, 4.6vw, 60px);
+  line-height: 1.04;
+  font-weight: 500;
+  letter-spacing: -0.035em;
+  margin: 0;
+  text-wrap: balance;
+}
+.hero-b p { margin: 0 0 28px; color: var(--ink-2); }
+.hero-b p strong { color: var(--ink); font-weight: 500; }
+
+.install-h { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+.kicker { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.switch { display: inline-flex; gap: 16px; font-family: var(--mono); font-size: 12px; }
+.switch button { font: inherit; color: var(--muted); background: none; border: 0; padding: 0 0 2px; cursor: pointer; border-bottom: 1px solid transparent; }
+.switch button:hover { color: var(--ink); }
+.switch button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+.cmdbox { display: flex; gap: 12px; align-items: flex-start; background: var(--ink); color: var(--bg); border-radius: 3px; padding: 13px 12px 13px 16px; }
+.cmdbox pre { margin: 0; flex: 1; min-width: 0; font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+.cmdbox .ps { opacity: 0.5; user-select: none; }
+.copy { flex: none; font-family: var(--mono); font-size: 11.5px; color: inherit; opacity: 0.7; background: none; border: 1px solid currentColor; border-radius: 2px; padding: 1px 7px; cursor: pointer; }
+.copy:hover { opacity: 1; }
+
+.sec { padding-top: 120px; }
+.sec-rule { display: flex; align-items: center; gap: 14px; font-family: var(--mono); font-size: 12.5px; color: var(--muted); margin-bottom: 48px; }
+.sec-rule b { font-weight: 500; color: var(--ink); }
+.sec-rule i { flex: 1; height: 1px; background: var(--rule-2); }
+
+h2 { font-size: 32px; line-height: 1.15; font-weight: 500; letter-spacing: -0.026em; margin: 0 0 16px; text-wrap: balance; }
+h3 { font-size: 20px; line-height: 1.3; font-weight: 500; letter-spacing: -0.014em; margin: 0 0 8px; }
+.intro { grid-column: 1 / span 7; margin-bottom: 64px; }
+.intro p { color: var(--ink-2); margin: 0; max-width: 36em; }
+
+.walk { align-items: start; }
+.pinned { grid-column: 1 / span 5; position: sticky; top: 28px; }
+.steps { grid-column: 6 / span 7; list-style: none; margin: 0; padding: 0; counter-reset: step; }
+.step { padding-bottom: 88px; }
+.step:last-child { padding-bottom: 0; }
+.step-h { display: flex; gap: 16px; align-items: baseline; }
+.step-n { font-family: var(--mono); font-size: 13px; color: var(--muted); min-width: 1.6em; }
+.step p { margin: 0 0 20px; color: var(--ink-2); padding-left: calc(1.6em + 16px); max-width: 36em; }
+.pinned .note { font-size: 13.5px; color: var(--muted); margin: 12px 0 0; }
+
+.sheet { background: var(--sheet); border: 1px solid var(--rule); border-radius: 3px; overflow: hidden; }
+.bar { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 0 14px; height: 38px; border-bottom: 1px solid var(--rule); font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.bar .file { color: var(--ink); font-weight: 500; }
+.term { background: var(--well); border: 1px solid var(--rule); border-radius: 3px; overflow: hidden; }
+.diff { background: var(--sheet); border: 1px solid var(--rule); border-bottom: 0; border-radius: 3px 3px 0 0; }
+.diff + .term { border-radius: 0 0 3px 3px; }
+pre.code, pre.out { margin: 0; overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--rule-2) transparent; }
+pre.code::-webkit-scrollbar, pre.out::-webkit-scrollbar { height: 6px; }
+pre.code::-webkit-scrollbar-thumb, pre.out::-webkit-scrollbar-thumb { background: var(--rule-2); border-radius: 3px; }
+pre.code { font-size: 13.25px; line-height: 1.7; padding: 14px 0; }
+.diff pre.code { padding: 10px 0; }
+pre.out { font-size: 12.5px; line-height: 1.65; padding: 14px 0; }
+.sl, .ol { display: block; min-height: 1.6em; position: relative; }
+.sl { padding-right: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.sl .g { position: absolute; left: 0; top: 0; width: 3.1em; text-indent: 0; text-align: right; color: var(--muted); opacity: 0.6; user-select: none; }
+.sl.mk { background: color-mix(in srgb, var(--ok) 9%, transparent); }
+.sl.mk .g { color: var(--ok); opacity: 1; }
+.sl.mk::before { content: "+"; position: absolute; left: 3.5em; top: 0; text-indent: 0; color: var(--ok); }
+.ol { padding-right: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ol.rl { white-space: pre; overflow: hidden; color: var(--muted); }
+.ol.cut { color: var(--muted); }
+.run + .run { margin-top: 14px; }
+.ol.cmd { display: flex; justify-content: space-between; gap: 16px; padding: 0 16px; color: var(--ink); font-weight: 500; white-space: pre-wrap; }
+.ol.cmd .ps { color: var(--muted); font-weight: 400; user-select: none; }
+.ol.cmd .x { color: var(--muted); font-weight: 400; white-space: nowrap; font-size: 11.5px; }
+.ol.cmd .x.bad { color: var(--err); }
+.sl.hl, .ol.hl { background: var(--hl); }
+.sl.hl .g { color: var(--accent); opacity: 1; }
+.sl.hl::after, .ol.hl::after { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--accent); }
+
+.k { font-weight: 600; }
+.t { color: var(--ty); }
+.st { color: var(--str); }
+.d { color: var(--err); font-weight: 600; }
+.c { color: var(--muted); font-style: italic; }
+.e { color: var(--err); font-weight: 600; }
+.w { color: var(--warn); font-weight: 600; }
+.okk { color: var(--ok); font-weight: 600; }
+.nt { color: var(--muted); font-weight: 600; }
+.cr { color: var(--err); }
+.dim { color: var(--muted); }
+
+.more { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--ink); }
+.more > li { padding: 22px 28px 28px 0; border-bottom: 1px solid var(--rule); min-width: 0; }
+.more > li:not(:nth-child(3n+1)) { padding-left: 28px; border-left: 1px solid var(--rule); }
+.more h3 { font-size: 17px; font-weight: 600; letter-spacing: -0.008em; margin: 0 0 6px; }
+.more p { margin: 0 0 16px; font-size: 15.5px; color: var(--ink-2); }
+.more pre.snip { margin: 0; font-size: 12.5px; line-height: 1.6; padding: 10px 12px; background: var(--sheet); border: 1px solid var(--rule); border-radius: 3px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.more .foot { display: flex; flex-wrap: wrap; gap: 0 20px; margin-top: 12px; font-family: var(--mono); font-size: 12px; }
+.more .foot a { order: 1; }
+.more details { order: 0; }
+.more details[open] { flex-basis: 100%; order: 2; }
+.more .foot a { color: var(--muted); }
+.more .foot a:hover { color: var(--accent); }
+.more details { margin-top: 12px; }
+.more summary { font-family: var(--mono); font-size: 12px; color: var(--muted); cursor: pointer; list-style: none; display: inline-block; text-decoration: underline; text-decoration-color: var(--rule-2); text-underline-offset: 0.2em; }
+.more summary::-webkit-details-marker { display: none; }
+.more summary:hover { color: var(--accent); }
+.more details[open] summary { color: var(--ink); }
+.more details .term { margin-top: 10px; }
+.more details pre.out { font-size: 11.5px; }
+.more details .ol.rl { white-space: pre; }
+.wide-out { grid-column: 1 / -1; }
+
+.ledger { width: 100%; border-collapse: collapse; font-size: 15.5px; line-height: 1.5; }
+.ledger th { text-align: left; font-family: var(--mono); font-size: 11.5px; font-weight: 400; color: var(--muted); padding: 0 24px 10px 0; border-bottom: 1px solid var(--ink); }
+.ledger td { padding: 14px 24px 14px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+.ledger td:nth-child(1) { width: 24%; font-weight: 500; }
+.ledger td:nth-child(2) { width: 46%; color: var(--ink-2); }
+.ledger td:nth-child(3) { color: var(--ink-2); }
+.ev-intro { grid-column: 1 / span 4; }
+.ev-intro p { color: var(--ink-2); margin: 0; }
+.ev-table { grid-column: 5 / span 8; }
+
+.docs { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--ink); }
+.docs li { border-bottom: 1px solid var(--rule); }
+.docs li + li { border-left: 1px solid var(--rule); }
+.docs a { display: block; padding: 16px 20px 20px; text-decoration: none; height: 100%; }
+.docs li:first-child a { padding-left: 0; }
+.docs strong { display: block; font-weight: 500; }
+.docs span { display: block; color: var(--ink-2); font-size: 15px; margin-top: 2px; }
+.docs a:hover strong { color: var(--accent); }
+
+.titleblock { margin: 136px 0 56px; border: 1px solid var(--ink); display: grid; grid-template-columns: 2.2fr 1fr 1fr 1fr 1.1fr; font-size: 13.5px; }
+.titleblock > div { padding: 12px 14px 14px; border-left: 1px solid var(--rule-2); min-width: 0; }
+.titleblock > div:first-child { border-left: 0; display: flex; gap: 12px; align-items: center; }
+.titleblock svg { width: 30px; height: 30px; fill: currentColor; flex: none; }
+.titleblock .tb-k { display: block; font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-bottom: 3px; }
+.titleblock .tb-v { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+.titleblock .name { font-weight: 600; font-size: 15px; display: block; }
+.titleblock .sub { color: var(--muted); font-size: 12.5px; }
+
+@media (max-width: 1080px) {
+  .hero { padding: 80px 0 96px; }
+  .hero-h, .hero-b, .intro, .pinned, .steps, .ev-intro, .ev-table { grid-column: 1 / -1; }
+  .hero-b { margin-top: 40px; max-width: 34em; }
+  .pinned { position: static; margin-bottom: 56px; }
+  .ev-intro { margin-bottom: 28px; }
+  .more { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .more > li:not(:nth-child(3n+1)) { padding-left: 0; border-left: 0; }
+  .more > li:nth-child(2n) { padding-left: 28px; border-left: 1px solid var(--rule); }
+  .docs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .docs li:nth-child(3) { border-left: 0; }
+  .docs li:nth-child(3) a { padding-left: 0; }
+  .titleblock { grid-template-columns: 1fr 1fr; }
+  .titleblock > div:first-child { grid-column: 1 / -1; }
+  .titleblock > div { border-top: 1px solid var(--rule-2); }
+  .titleblock > div:first-child { border-top: 0; }
+  .titleblock > div:nth-child(2n) { border-left: 0; }
+}
+@media (max-width: 680px) {
+  body { font-size: 16px; }
+  .wrap { padding: 0 16px; }
+  .grid { column-gap: 16px; }
+  .top nav { gap: 18px; font-size: 14px; }
+  .top nav .ver { display: none; }
+  .hero { padding: 56px 0 72px; }
+  .sec { padding-top: 88px; }
+  .sec-rule { margin-bottom: 32px; }
+  h2 { font-size: 26px; }
+  .intro { margin-bottom: 40px; }
+  .step { padding-bottom: 64px; }
+  .step p { padding-left: 0; }
+  pre.code { font-size: 12.5px; }
+  pre.out { font-size: 11.75px; }
+  .more { grid-template-columns: 1fr; }
+  .more > li:nth-child(n) { padding-left: 0; border-left: 0; padding-right: 0; }
+  .ledger thead { display: none; }
+  .ledger tr { display: block; padding: 14px 0; border-bottom: 1px solid var(--rule); }
+  .ledger td { display: block; width: auto !important; padding: 2px 0; border: 0; }
+  .ledger td:nth-child(3)::before { content: "not covered: "; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .docs { grid-template-columns: 1fr; }
+  .docs li + li { border-left: 0; }
+  .docs a { padding-left: 0; }
+  .titleblock { grid-template-columns: 1fr; }
+  .titleblock > div { border-left: 0 !important; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .sl, .ol { transition: background-color 90ms linear; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <a class="brand" href="#" aria-label="Mettle, top of page">
+    <svg viewBox="0 0 150 150" aria-hidden="true"><polygon points="56.4 63.7 69.5 34.8 113.7 32.3 133.5 51 122.3 74.9 130.2 88.3 147.6 48 119.6 20.8 62.4 20.9 42.4 63.7"/><polygon points="60.6 63.7 68.9 57.7 95.6 57.7 108.9 63.6"/><polygon points="47.9 67 109.2 88.8 114.3 97.6 138 109.5 114.2 66.9"/><path d="m140.4 114.6-94.1-45.1-2.9 6 43.7 41.8-23.6 0.1-20.8-40.3-24.2 51.9 129.7-0.1-7.8-14.3z"/><path d="m14.2 63-12.1 5.5 1.4 2.1 23.1 32.4 13.9-29.1-26.3-10.9zm14.7 22.3-17.3-19.9 24.4 10.3-7.1 9.6z"/></svg>
+    Mettle
+  </a>
+  <nav aria-label="Site">
+    <a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/README.md">Docs</a>
+    <a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/known-limitations.md">Limitations</a>
+    <a href="https://github.com/The-Mettle-Project/Mettle">Source</a>
+    <span class="ver">{{VERSION_SHORT}}</span>
+  </nav>
+</header>
+
+<section class="hero grid">
+  <div class="hero-h">
+    <h1>A systems language where the toolchain is part of the contract.</h1>
+  </div>
+  <div class="hero-b">
+    <p>Require what the compiler must do. Read what it did. Check that it kept your program's meaning.</p>
+    <p><strong>Native x86-64, ARM64 and GPU code from its own optimizer, linker and runtime.</strong> No LLVM, no VM, no GC.</p>
+    <div class="install">
+      <div class="install-h">
+        <span class="kicker">install</span>
+        <span class="switch" role="tablist" aria-label="Platform">
+          <button role="tab" aria-selected="true" data-os="linux">linux</button>
+          <button role="tab" aria-selected="false" data-os="windows">windows</button>
+        </span>
+      </div>
+      <div class="cmdbox">
+        <pre id="install-cmd"></pre>
+        <button class="copy" type="button" data-copy="install-cmd">copy</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="walk">
+  <div class="sec-rule"><span>--</span><b>one program</b><i></i><span>five steps</span></div>
+  <div class="grid">
+    <div class="intro">
+      <h2>Twenty lines, from source to binary.</h2>
+      <p>Each output below is the compiler's own, cut to the lines that matter. Point at a line of output to find the source line it names.</p>
+    </div>
+  </div>
+  <div class="walk grid">
+    <div class="pinned">
+      <div class="sheet" id="source"></div>
+      <p class="note">Every <code>var</code> carries its type. The compiler infers none.</p>
+    </div>
+    <ol class="steps">
+      <li class="step">
+        <div class="step-h"><span class="step-n">01</span><h3>Build it.</h3></div>
+        <p><code>@simd!</code> on line 4 is a demand. The loop vectorizes, or the build stops.</p>
+        <div data-ex="build"></div>
+      </li>
+      <li class="step">
+        <div class="step-h"><span class="step-n">02</span><h3>Ask what it did.</h3></div>
+        <p><code>--explain</code> reports on every loop and every call. The checksum became a 32-wide byte sum. The fill on line 15 stayed scalar, and the report says so.</p>
+        <div data-ex="explain"></div>
+      </li>
+      <li class="step">
+        <div class="step-h"><span class="step-n">03</span><h3>Break the contract.</h3></div>
+        <p>One early exit makes the loop body branch. The build stops at the loop and says why.</p>
+        <div data-ex="contract"></div>
+      </li>
+      <li class="step">
+        <div class="step-h"><span class="step-n">04</span><h3>Free the buffer too early.</h3></div>
+        <p>The memory analyser reads the whole program. Nothing ran and nothing was annotated. It infers lifetimes, and it reports only what it can prove.</p>
+        <div data-ex="free"></div>
+      </li>
+      <li class="step">
+        <div class="step-h"><span class="step-n">05</span><h3>Ship it.</h3></div>
+        <p>{{SIZE}} bytes. It imports {{IMPORTS}} functions from {{DLLS}}, <code>{{DLL}}</code>, and links no C runtime. On Linux the same program makes its own system calls and links no libc.</p>
+        <div data-ex="ship"></div>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section class="sec" id="more">
+  <div class="sec-rule"><span>--</span><b>beyond one program</b><i></i></div>
+  <div class="grid">
+    <div class="intro">
+      <h2>A program can state its own requirements.</h2>
+      <p>The compiler proves them on every build, or stops and shows where they fail.</p>
+    </div>
+  </div>
+  <ul class="more">
+    <li>
+      <h3>Types with a predicate</h3>
+      <p>A value becomes a <code>Percent</code> only where the compiler proves the range.</p>
+      <pre class="snip" data-snip>type Percent = int32 where value >= 0 &amp;&amp; value &lt;= 100;</pre>
+      <div class="foot"><details data-ex="types"><summary>compiler output</summary></details><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/types.md">docs</a></div>
+    </li>
+    <li>
+      <h3>Effects</h3>
+      <p>Proven over the whole call graph. A refusal prints the chain of calls.</p>
+      <pre class="snip" data-snip>fn mix(gain: int32) -> int32 forbids Render</pre>
+      <div class="foot"><details data-ex="effects"><summary>compiler output</summary></details><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/effects.md">docs</a></div>
+    </li>
+    <li>
+      <h3>Rules</h3>
+      <p>Ordinary functions that run in the compiler over the checked program. No binary carries them.</p>
+      <pre class="snip" data-snip>@rule fn no_recursion(p: Program) -> Verdict</pre>
+      <div class="foot"><details data-ex="rules"><summary>compiler output</summary></details><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/rules.md">docs</a></div>
+    </li>
+    <li>
+      <h3>Translation validation</h3>
+      <p>Each optimizer pass runs before and after on the same inputs. What it could not validate is listed.</p>
+      <pre class="snip">mettle --build --release --verify app.mettle</pre>
+      <div class="foot"><details data-ex="verify"><summary>compiler output</summary></details><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/translation-validation.md">docs</a></div>
+    </li>
+    <li>
+      <h3>Deadlines</h3>
+      <p>The longest path is costed against a model of the target, or the build stops.</p>
+      <pre class="snip" data-snip>fn tick() where cycles &lt; 400</pre>
+      <div class="foot"><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/types.md">docs</a></div>
+    </li>
+    <li>
+      <h3>GPU kernels</h3>
+      <p>Straight to PTX with no <code>nvcc</code> and no CUDA runtime, and to Metal on macOS.</p>
+      <pre class="snip" data-snip>dispatch vadd[work: n](da, db, dc, n);</pre>
+      <div class="foot"><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/gpu.md">docs</a></div>
+    </li>
+  </ul>
+</section>
+
+<section class="sec" id="evidence">
+  <div class="sec-rule"><span>--</span><b>where the evidence stops</b><i></i></div>
+  <div class="grid">
+    <div class="ev-intro">
+      <h2>What ran each claim.</h2>
+      <p>A gate that skips quietly is the same as no gate. So each target says what tested it, and what did not.</p>
+    </div>
+    <div class="ev-table">
+      <table class="ledger">
+        <thead><tr><th>claim</th><th>what ran it</th><th>not covered</th></tr></thead>
+        <tbody>
+          <tr><td>x86-64</td><td>The whole suite, on Windows and on Linux</td><td>AVX-512</td></tr>
+          <tr><td>AArch64</td><td>Every ARM fixture, under <code>qemu-aarch64</code></td><td>ARM hardware</td></tr>
+          <tr><td>macOS</td><td>An M4 Pro: threads, <code>@parallel</code>, 25 Metal kernels, a GPU inference example</td><td>Intel Macs</td></tr>
+          <tr><td>PTX</td><td>NVIDIA's <code>ptxas</code> assembles every portable module</td><td>A GPU in the test suite</td></tr>
+          <tr><td>SPIR-V</td><td>Structural validation</td><td>Any Vulkan driver</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="docs">
+  <div class="sec-rule"><span>--</span><b>start here</b><i></i></div>
+  <ul class="docs">
+    <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/getting-started.md"><strong>Getting started</strong><span>Install, a first program, a tour.</span></a></li>
+    <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/quick-reference.md"><strong>Quick reference</strong><span>The idioms you look up.</span></a></li>
+    <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/known-limitations.md"><strong>Known limitations</strong><span>What does not work yet.</span></a></li>
+    <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/ideology.md"><strong>Ideology</strong><span>What every proposal is measured against.</span></a></li>
+  </ul>
+</section>
+
+<footer class="titleblock">
+  <div>
+    <svg viewBox="0 0 150 150" aria-hidden="true"><polygon points="56.4 63.7 69.5 34.8 113.7 32.3 133.5 51 122.3 74.9 130.2 88.3 147.6 48 119.6 20.8 62.4 20.9 42.4 63.7"/><polygon points="60.6 63.7 68.9 57.7 95.6 57.7 108.9 63.6"/><polygon points="47.9 67 109.2 88.8 114.3 97.6 138 109.5 114.2 66.9"/><path d="m140.4 114.6-94.1-45.1-2.9 6 43.7 41.8-23.6 0.1-20.8-40.3-24.2 51.9 129.7-0.1-7.8-14.3z"/><path d="m14.2 63-12.1 5.5 1.4 2.1 23.1 32.4 13.9-29.1-26.3-10.9zm14.7 22.3-17.3-19.9 24.4 10.3-7.1 9.6z"/></svg>
+    <div><span class="name">Mettle</span><span class="sub">Every transcript on this page is generated by <a href="https://github.com/The-Mettle-Project/Mettle/tree/main/website">website/build.py</a>. Cuts are marked &#x22ef;.</span></div>
+  </div>
+  <div><span class="tb-k">compiler</span><span class="tb-v">{{VERSION}}</span></div>
+  <div><span class="tb-k">target</span><span class="tb-v">{{TARGET}}</span></div>
+  <div><span class="tb-k">generated</span><span class="tb-v">{{DATE}}</span></div>
+  <div><span class="tb-k">license</span><span class="tb-v">Apache 2.0</span></div>
+</footer>
+
+</div>
+
+<script type="application/json" id="exhibits">{{DATA}}</script>
+<script>
+(function () {
+  var DATA = JSON.parse(document.getElementById("exhibits").textContent);
+
+  var KW = /^(import|fn|var|const|for|in|return|if|else|break|continue|while|type|where|effect|forbids|requires|provides|with|extern|struct|enum|match|case|default|defer|errdefer|export|kernel|dispatch|none)$/;
+  var TY = /^(u?int(8|16|32|64)|float(16|32|64)|bool|char|string|cstring|rawptr|void|Program|Verdict|Percent|Result|Option|Fn)$/;
+
+  function esc(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function hlCode(line) {
+    var out = "";
+    var re = /(\/\/.*$)|("(?:[^"\\]|\\.)*")|(@[A-Za-z_]+!?)|([A-Za-z_][A-Za-z0-9_]*)|(\s+)|(.)/g;
+    var m;
+    while ((m = re.exec(line))) {
+      if (m[1]) out += '<span class="c">' + esc(m[1]) + "</span>";
+      else if (m[2]) out += '<span class="st">' + esc(m[2]) + "</span>";
+      else if (m[3]) out += '<span class="d">' + esc(m[3]) + "</span>";
+      else if (m[4]) {
+        if (KW.test(m[4])) out += '<span class="k">' + m[4] + "</span>";
+        else if (TY.test(m[4])) out += '<span class="t">' + m[4] + "</span>";
+        else out += m[4];
+      } else out += esc(m[0]);
+    }
+    return out;
+  }
+
+  function hlOut(line) {
+    var s = esc(line);
+    s = s.replace(/\b(error)(\[[A-Z]\d+\])?:/g, '<span class="e">$1$2:</span>');
+    s = s.replace(/\b(warning)(\[[A-Z]\d+\])?:/g, '<span class="w">$1$2:</span>');
+    s = s.replace(/^(\s*:\s+)(\^+)/, '$1<span class="cr">$2</span>');
+    s = s.replace(/(\|\s+)(note)(\s)/, '$1<span class="nt">$2</span>$3');
+    s = s.replace(/^(\s*)(help:)/, '$1<span class="nt">$2</span>');
+    s = s.replace(/NOT vectorized/, '<span class="w">NOT vectorized</span>');
+    s = s.replace(/: vectorized -&gt;/, ': <span class="okk">vectorized</span> -&gt;');
+    s = s.replace(/(translation validation: )(OK)/, '$1<span class="okk">$2</span>');
+    s = s.replace(/^(\s*)(not validated:)/, '$1<span class="w">$2</span>');
+    s = s.replace(/^(Built executable)/, '<span class="dim">$1</span>');
+    return s;
+  }
+
+  function refsOf(line, max) {
+    var found = {};
+    [/\.mettle:(\d+)/g, /@ line (\d+)/g, /\bat line (\d+)/g, /^\s+(\d+) \|/g].forEach(function (re) {
+      var m;
+      while ((m = re.exec(line))) {
+        var n = parseInt(m[1], 10);
+        if (n >= 1 && n <= max) found[n] = true;
+      }
+    });
+    return Object.keys(found).map(Number);
+  }
+
+  function lead(line) {
+    return /^ */.exec(line)[0].length;
+  }
+
+  function el(tag, cls, html) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html != null) e.innerHTML = html;
+    return e;
+  }
+
+  function hang(node, base, n) {
+    node.style.paddingLeft = "calc(" + base + " + " + n + "ch)";
+    node.style.textIndent = "-" + n + "ch";
+  }
+
+  function codeLine(n, text, cls) {
+    var s = el("span", "sl" + (cls ? " " + cls : ""), '<span class="g">' + n + "</span>" + hlCode(text));
+    hang(s, "4.4em", lead(text) + 4);
+    s.dataset.n = n;
+    return s;
+  }
+
+  var srcLines = DATA.source.src.replace(/\n$/, "").split("\n");
+  var srcEls = {};
+  var source = document.getElementById("source");
+  source.appendChild(el("div", "bar", '<span class="file">' + esc(DATA.source.file) + "</span><span>" + srcLines.length + " lines</span>"));
+  var srcPre = el("pre", "code");
+  srcLines.forEach(function (l, i) {
+    var s = codeLine(i + 1, l);
+    srcEls[i + 1] = s;
+    srcPre.appendChild(s);
+  });
+  source.appendChild(srcPre);
+
+  var outByRef = {};
+  function clear() {
+    document.querySelectorAll(".hl").forEach(function (x) { x.classList.remove("hl"); });
+  }
+
+  function term(ex, link) {
+    var box = el("div", "term");
+    var out = el("pre", "out");
+    ex.runs.forEach(function (r) {
+      var run = el("div", "run");
+      run.appendChild(el("span", "ol cmd", '<span><span class="ps">$ </span>' + esc(r.cmd) + '</span><span class="x' + (r.exit !== 0 ? " bad" : "") + '">exit ' + r.exit + "</span>"));
+      (r.out ? r.out.split("\n") : []).forEach(function (l) {
+        var cls = "ol";
+        if (/^\s*-[-+\s]*$/.test(l) || /^-- .*-{3,}\s*$/.test(l)) cls += " rl";
+        if (/^\s*⋯/.test(l)) cls += " cut";
+        var o = el("span", cls, l.length ? hlOut(l) : "");
+        if (/ rl/.test(cls)) o.style.paddingLeft = "16px";
+        else hang(o, "16px", lead(l) + 4);
+        var refs = link ? refsOf(l, srcLines.length) : [];
+        if (refs.length) {
+          o._refs = refs;
+          o.classList.add("ref");
+          refs.forEach(function (n) { (outByRef[n] = outByRef[n] || []).push(o); });
+        }
+        run.appendChild(o);
+      });
+      out.appendChild(run);
+    });
+    if (link) {
+      out.addEventListener("pointerover", function (e) {
+        clear();
+        var o = e.target.closest(".ol.ref");
+        if (!o) return;
+        o.classList.add("hl");
+        o._refs.forEach(function (n) { srcEls[n].classList.add("hl"); });
+      });
+      out.addEventListener("pointerleave", clear);
+    }
+    box.appendChild(out);
+    return box;
+  }
+
+  function diff(d) {
+    var box = el("div", "diff");
+    var pre = el("pre", "code");
+    d.lines.forEach(function (ln) { pre.appendChild(codeLine(ln.n, ln.text, ln.mark ? "mk" : "")); });
+    box.appendChild(pre);
+    return box;
+  }
+
+  document.querySelectorAll("[data-ex]").forEach(function (slot) {
+    var ex = DATA[slot.getAttribute("data-ex")];
+    if (!ex) return;
+    if (ex.diff) slot.appendChild(diff(ex.diff));
+    slot.appendChild(term(ex, !!ex.link));
+  });
+
+  srcPre.addEventListener("pointerover", function (e) {
+    clear();
+    var s = e.target.closest(".sl");
+    if (!s || !outByRef[+s.dataset.n]) return;
+    s.classList.add("hl");
+    outByRef[+s.dataset.n].forEach(function (o) { o.classList.add("hl"); });
+  });
+  srcPre.addEventListener("pointerleave", clear);
+
+  document.querySelectorAll("pre[data-snip]").forEach(function (p) {
+    p.innerHTML = hlCode(p.textContent);
+  });
+
+  var CMDS = {
+    linux: ["$ ", "curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.sh | sh"],
+    windows: ["PS> ", "irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex"]
+  };
+  var installPre = document.getElementById("install-cmd");
+  var osTabs = document.querySelectorAll(".install .switch button");
+  function setOS(os) {
+    osTabs.forEach(function (b) { b.setAttribute("aria-selected", b.dataset.os === os ? "true" : "false"); });
+    installPre.innerHTML = '<span class="ps">' + esc(CMDS[os][0]) + "</span>" + esc(CMDS[os][1]);
+    installPre.dataset.cmd = CMDS[os][1];
+  }
+  osTabs.forEach(function (b) { b.addEventListener("click", function () { setOS(b.dataset.os); }); });
+  setOS(/Win/.test(navigator.platform || navigator.userAgent) ? "windows" : "linux");
+
+  document.querySelectorAll(".copy").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var t = document.getElementById(b.dataset.copy).dataset.cmd;
+      if (!navigator.clipboard) return;
+      navigator.clipboard.writeText(t).then(function () {
+        b.textContent = "copied";
+        setTimeout(function () { b.textContent = "copy"; }, 1400);
+      }, function () {});
+    });
+  });
+})();
+</script>
+</body>
+</html>

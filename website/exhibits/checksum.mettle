@@ -1,0 +1,20 @@
+import "std/io";
+import "std/mem";
+
+@simd! fn checksum(data: uint8*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  for i: int64 in 0..n {
+    sum = sum + (int64)data[i];
+  }
+  return sum;
+}
+
+fn main() -> int32 {
+  var n: int64 = 1024;
+  var data: uint8* = malloc(n);
+  for i: int64 in 0..n { data[i] = (uint8)(i & 255); }
+
+  println("checksum = {checksum(data, n)}");
+  free(data);
+  return 0;
+}

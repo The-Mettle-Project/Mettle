@@ -1,0 +1,14 @@
+import "std/io";
+
+type Percent = int32 where value >= 0 && value <= 100;
+
+fn show(p: Percent) { println("volume {p}%"); }
+
+fn set_volume(raw: int32) {
+  show(raw);
+}
+
+fn main() -> int32 {
+  set_volume(40);
+  return 0;
+}
