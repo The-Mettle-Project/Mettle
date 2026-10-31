@@ -15,6 +15,7 @@ function Invoke-Program([string]$exe) {
     $out = Join-Path $scratch "stdout.txt"
     $err = Join-Path $scratch "stderr.txt"
     $process = Start-Process -FilePath $exe -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err -WorkingDirectory $root
+    $null = $process.Handle
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
         $process.Kill()
         return $null
@@ -37,29 +38,34 @@ foreach ($file in $files) {
     $match = [regex]::Match($source, "fn\s+main\s*\([^)]*\)[^{]*\{")
     if (-not $match.Success) { $skip++; continue }
 
+    $sourceDir = Join-Path $scratch "src"
+    New-Item -ItemType Directory -Force $sourceDir | Out-Null
+    $liveSource = Join-Path $sourceDir $file.Name
+    $include = "-I" + $file.DirectoryName
+    [System.IO.File]::WriteAllText($liveSource, $source)
     $plainExe = Join-Path $scratch "plain.exe"
     Remove-Item -Force $plainExe -ErrorAction SilentlyContinue
-    & $mettle --build $file.FullName -o $plainExe *> $null
-    if ($LASTEXITCODE -ne 0) { $skip++; continue }
+    & $mettle --build $include $liveSource -o $plainExe *> $null
+    if ($LASTEXITCODE -ne 0) { $skip++; Remove-Item -Force $liveSource; continue }
     $plain = Invoke-Program $plainExe
-    if ($null -eq $plain) { $skip++; continue }
+    if ($null -eq $plain) { $skip++; Remove-Item -Force $liveSource; continue }
 
-    $liveSource = Join-Path $file.DirectoryName ("live_oracle_" + $file.Name)
-    $patched = $source.Substring(0, $match.Index + $match.Length) + "`n    quiesce;`n" + $source.Substring($match.Index + $match.Length)
+    $patched = $source.Substring(0, $match.Index + $match.Length) + " quiesce;" + $source.Substring($match.Index + $match.Length)
     [System.IO.File]::WriteAllText($liveSource, $patched)
     $liveExe = Join-Path $scratch "live.exe"
     try {
-        $build = & $mettle --build --live $liveSource -o $liveExe 2>&1 | Out-String
+        $diagnostics = Join-Path $scratch "diagnostics.txt"
+        & $mettle --build --live $include $liveSource -o $liveExe 2> $diagnostics | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            $fail++; $failures += "$($file.Name): live build failed: $build"; continue
+            $fail++; $failures += "$($file.Name): live build failed: $(Get-Content -Raw $diagnostics)"; continue
         }
-        $same = & $mettle --live-patch $liveExe $liveSource 2>&1 | Out-String
+        $same = & $mettle --live-patch $liveExe $include $liveSource 2> $diagnostics | Out-String
         if ($same -notmatch "No function changed") {
-            $fail++; $failures += "$($file.Name): identical source produced a patch: $same"; continue
+            $fail++; $failures += "$($file.Name): identical source produced a patch: $same $(Get-Content -Raw $diagnostics)"; continue
         }
-        $all = & $mettle --live-patch $liveExe --live-patch-all $liveSource 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0 -or $all -notmatch "^Patch 1:") {
-            $fail++; $failures += "$($file.Name): replace-all patch refused: $all"; continue
+        $all = & $mettle --live-patch $liveExe --live-patch-all $include $liveSource 2> $diagnostics | Out-String
+        if ($LASTEXITCODE -ne 0 -or $all -notmatch "(?m)^Patch 1:") {
+            $fail++; $failures += "$($file.Name): replace-all patch refused: $all $(Get-Content -Raw $diagnostics)"; continue
         }
         $live = Invoke-Program $liveExe
         if ($null -eq $live) {

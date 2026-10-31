@@ -41,6 +41,7 @@ typedef struct {
   uint64_t thunk_offset;
   uint64_t body_offset;
   uint64_t end;
+  uint64_t signature;
 } LiveFunction;
 
 typedef struct {
@@ -119,6 +120,7 @@ typedef struct {
   LiveMap hashes;
   LiveMap sizes;
   LiveMap spares;
+  LiveMap signatures;
 } LiveState;
 
 static uint64_t live_text_hash(const char *text) {
@@ -384,6 +386,11 @@ static int live_index_build(LiveObjectIndex *index, const LinkObject *object) {
     if (thunk && thunk->section_index == (int64_t)section) {
       function->thunk_offset = thunk->value;
     }
+    if (object->sections[section].raw_data &&
+        function->body_offset >= function->thunk_offset + 16u) {
+      function->signature = linker_read_u64(object->sections[section].raw_data +
+                                            function->thunk_offset + 8u);
+    }
     index->section_function[section] = index->function_count;
     if (!live_map_put(&index->function_by_name, function->name,
                       index->function_count, 0)) {
@@ -604,6 +611,50 @@ static int live_function_holds_quiesce(const LiveObjectIndex *index,
   return 0;
 }
 
+static int live_function_calls(const LiveObjectIndex *index,
+                               size_t caller, size_t callee) {
+  const LiveFunction *function = &index->functions[caller];
+  const LinkSection *source = &index->object->sections[function->section];
+  for (size_t i = 0; i < source->relocation_count; i++) {
+    const LinkReloc *relocation = &source->relocations[i];
+    if (relocation->offset < function->body_offset) {
+      continue;
+    }
+    LiveTarget target = live_classify(index, relocation->symbol_index,
+                                      live_reloc_addend(source, relocation));
+    if (target.kind == LIVE_T_THUNK && target.function == callee) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int live_check_signatures(const LiveState *state,
+                                 const LiveObjectIndex *index,
+                                 char **error_message_out) {
+  for (size_t i = 0; i < index->function_count; i++) {
+    const LiveEntry *previous =
+        live_map_find(&state->signatures, index->functions[i].name);
+    if (!previous || previous->a == index->functions[i].signature) {
+      continue;
+    }
+    for (size_t holder = 0; holder < index->function_count; holder++) {
+      if (holder != i && live_function_holds_quiesce(index, holder) &&
+          live_function_calls(index, holder, i)) {
+        mettle_set_error(error_message_out,
+                         "'%s' changed its parameters or result, and '%s' is "
+                         "running at the quiesce point and would still call "
+                         "it the old way. Keep the old signature and add a "
+                         "new function, or restart",
+                         index->functions[i].name,
+                         index->functions[holder].name);
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 static uint64_t live_function_hash(const LiveObjectIndex *index,
                                    size_t function_index) {
   const LiveFunction *function = &index->functions[function_index];
@@ -690,6 +741,12 @@ static int live_state_save(const LiveState *state, const char *path,
       fprintf(file, "n %llu %s\n", (unsigned long long)entry->a, entry->key);
     }
   }
+  for (size_t i = 0; i < state->signatures.capacity; i++) {
+    const LiveEntry *entry = &state->signatures.items[i];
+    if (entry->key) {
+      fprintf(file, "q %llu %s\n", (unsigned long long)entry->a, entry->key);
+    }
+  }
   if (fclose(file) != 0) {
     mettle_set_error(error_message_out, "Cannot write the live state '%s'",
                      path);
@@ -753,6 +810,7 @@ static int live_state_load(LiveState *state, const char *path,
                      : line[0] == 'f' ? &state->hashes
                      : line[0] == 'g' ? &state->sizes
                      : line[0] == 'n' ? &state->spares
+                     : line[0] == 'q' ? &state->signatures
                                       : NULL;
       if (map && !live_map_put(map, name, a, 0)) {
         fclose(file);
@@ -771,6 +829,7 @@ static void live_state_destroy(LiveState *state) {
   live_map_destroy(&state->hashes);
   live_map_destroy(&state->sizes);
   live_map_destroy(&state->spares);
+  live_map_destroy(&state->signatures);
 }
 
 static int live_record_object(LiveState *state, const LinkObject *object) {
@@ -778,7 +837,9 @@ static int live_record_object(LiveState *state, const LinkObject *object) {
   int ok = live_index_build(&index, object);
   for (size_t i = 0; ok && i < index.function_count; i++) {
     ok = live_map_put(&state->hashes, index.functions[i].name,
-                      live_function_hash(&index, i), 0) != NULL;
+                      live_function_hash(&index, i), 0) != NULL &&
+         live_map_put(&state->signatures, index.functions[i].name,
+                      index.functions[i].signature, 0) != NULL;
   }
   for (size_t i = 0; ok && index.function_count && i < object->symbol_count;
        i++) {
@@ -1341,6 +1402,15 @@ int live_build_patch(const char *object_path, const char *executable_path,
   if (builder.changed + builder.created == 0u) {
     ok = 1;
     goto done;
+  }
+  if (!live_check_signatures(&state, &index, error_message_out)) {
+    goto done;
+  }
+  for (size_t i = 0; i < index.function_count; i++) {
+    if (!live_map_put(&state.signatures, index.functions[i].name,
+                      index.functions[i].signature, 0)) {
+      goto done;
+    }
   }
   while (builder.processed < builder.piece_count) {
     if (!live_process_piece(&builder, builder.processed++)) {

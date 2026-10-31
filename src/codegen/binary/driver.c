@@ -186,12 +186,34 @@ static int binary_function_is_live(CodeGenerator *generator,
          !ir_function->is_interrupt && !ir_function->is_rule;
 }
 
+static void binary_live_signature_text(uint64_t *hash, const char *text) {
+  const char *at = text ? text : "";
+  do {
+    *hash ^= (unsigned char)*at;
+    *hash *= 1099511628211ULL;
+  } while (*at++);
+}
+
+static uint64_t binary_live_signature(const IRFunction *ir_function) {
+  uint64_t hash = 1469598103934665603ULL;
+  hash ^= (uint64_t)ir_function->parameter_count;
+  hash *= 1099511628211ULL;
+  for (size_t i = 0; i < ir_function->parameter_count; i++) {
+    binary_live_signature_text(
+        &hash, ir_function->parameter_types ? ir_function->parameter_types[i]
+                                            : NULL);
+  }
+  binary_live_signature_text(&hash, ir_function->return_type_name);
+  return hash;
+}
+
 static int binary_append_live_thunk(CodeGenerator *generator,
                                     BinaryEmitter *emitter,
                                     const IRFunction *ir_function,
                                     size_t text_section,
                                     const char *body_name) {
-  static const unsigned char thunk[8] = {0xFF, 0x25, 0, 0, 0, 0, 0xCC, 0xCC};
+  unsigned char thunk[16] = {0xFF, 0x25, 0, 0, 0, 0, 0xCC, 0xCC};
+  uint64_t signature = binary_live_signature(ir_function);
   char slot_name[512];
   BinarySection *section = binary_emitter_get_section(emitter, text_section);
   size_t thunk_offset = 0;
@@ -204,6 +226,9 @@ static int binary_append_live_thunk(CodeGenerator *generator,
     code_generator_set_error(generator, "Live thunk name too long for '%s'",
                              ir_function->name);
     return 0;
+  }
+  for (size_t i = 0; i < 8u; i++) {
+    thunk[8u + i] = (unsigned char)(signature >> (8u * i));
   }
   thunk_offset = section->size;
   if (!binary_emitter_define_symbol(emitter, ir_function->name,
@@ -279,7 +304,9 @@ static int binary_append_function(CodeGenerator *generator,
     return code_generator_binary_emitter_error(generator, emitter,
                                  "Failed to create .text section");
   }
-  binding = binary_function_symbol_binding(generator, ir_function);
+  binding = generator->live
+                ? BINARY_SYMBOL_GLOBAL
+                : binary_function_symbol_binding(generator, ir_function);
   if (binary_function_is_live(generator, ir_function)) {
     if (snprintf(body_name, sizeof(body_name), "%s$body", ir_function->name) >=
         (int)sizeof(body_name)) {
