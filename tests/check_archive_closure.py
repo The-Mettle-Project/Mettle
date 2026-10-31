@@ -23,7 +23,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 LOWERING = {
     "ir_lowering", "ir_lower_address", "ir_lower_defer", "ir_lower_expr",
     "ir_lower_stmt", "ir_lower_support", "ir_lower_switch_match",
-    "ir_lower_tile", "ir_lower_types",
+    "ir_lower_tile", "ir_lower_types", "ir_lower_live",
 }
 
 DIRECTORIES = ["src/ir", "src/ir/optimizer", "src/codegen/binary",
