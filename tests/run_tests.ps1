@@ -12371,7 +12371,8 @@ $stringCstringExpected = @(
   "initialised true",
   "returned true",
   "concatenated true",
-  "system ok 0 code 7"
+  "system ok 0 code 7",
+  "system interpolated 7"
 ) -join "`n"
 
 $total++

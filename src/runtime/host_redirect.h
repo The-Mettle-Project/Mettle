@@ -72,6 +72,7 @@ char *mtlc_host_getcwd(char *, size_t);
 #endif
 char *mtlc_host_realpath(const char *, char *);
 int mtlc_host_unlink(const char *);
+int mtlc_host_rename(const char *, const char *);
 int mtlc_host_putenv(char *);
 int mtlc_host_system(const char *);
 FILE *mtlc_host_popen(const char *, const char *);

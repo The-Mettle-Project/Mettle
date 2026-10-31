@@ -1974,6 +1974,7 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #define MT_SYS_CLOCK_GETTIME 228
 #define MT_SYS_OPENAT 257
 #define MT_SYS_UNLINKAT 263
+#define MT_SYS_RENAMEAT2 316
 #define MT_SYS_CLONE 56
 #define MT_SYS_GETTID 186
 #define MT_SYS_FUTEX 202
@@ -1997,6 +1998,7 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 }
 #define MT_SYS_OPENAT 56
 #define MT_SYS_UNLINKAT 35
+#define MT_SYS_RENAMEAT2 276
 #define MT_SYS_CLOSE 57
 #define MT_SYS_LSEEK 62
 #define MT_SYS_IOCTL 29
@@ -2703,6 +2705,12 @@ int stat(const char *path, void *status) {
 int unlink(const char *path) {
   return (int)mt_sys_result(mt_syscall6(MT_SYS_UNLINKAT, MT_AT_FDCWD,
                                         (mt_i64)path, 0, 0, 0, 0));
+}
+
+int rename(const char *from, const char *to) {
+  return (int)mt_sys_result(mt_syscall6(MT_SYS_RENAMEAT2, MT_AT_FDCWD,
+                                        (mt_i64)from, MT_AT_FDCWD,
+                                        (mt_i64)to, 0, 0));
 }
 #endif
 

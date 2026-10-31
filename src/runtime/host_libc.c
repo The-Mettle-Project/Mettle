@@ -153,6 +153,7 @@ ssize_t mtlc_host_readlink(const char *p, char *b, size_t n) {
 char *mtlc_host_realpath(const char *p, char *r) { return realpath(p, r); }
 int mtlc_host_stat(const char *p, struct stat *s) { return stat(p, s); }
 int mtlc_host_unlink(const char *p) { return unlink(p); }
+int mtlc_host_rename(const char *f, const char *t) { return rename(f, t); }
 int mtlc_host_putenv(char *s) { return putenv(s); }
 int mtlc_host_system(const char *c) { return system(c); }
 FILE *mtlc_host_popen(const char *c, const char *m) { return popen(c, m); }

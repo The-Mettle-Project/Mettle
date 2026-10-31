@@ -63,6 +63,7 @@
 #define stat mtlc_host_stat
 #define unlink mtlc_host_unlink
 #define _unlink mtlc_host_unlink
+#define rename mtlc_host_rename
 #define putenv mtlc_host_putenv
 #define _putenv mtlc_host_putenv
 #define system mtlc_host_system
