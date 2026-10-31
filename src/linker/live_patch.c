@@ -585,6 +585,25 @@ static uint64_t live_hash_region(const LiveObjectIndex *index, size_t section,
   return hash;
 }
 
+static int live_function_holds_quiesce(const LiveObjectIndex *index,
+                                       size_t function_index) {
+  const LiveFunction *function = &index->functions[function_index];
+  const LinkSection *source = &index->object->sections[function->section];
+  for (size_t i = 0; i < source->relocation_count; i++) {
+    const LinkReloc *relocation = &source->relocations[i];
+    const LinkSymbol *symbol = NULL;
+    if (relocation->offset < function->body_offset ||
+        relocation->symbol_index >= index->object->symbol_count) {
+      continue;
+    }
+    symbol = &index->object->symbols[relocation->symbol_index];
+    if (symbol->name && strcmp(symbol->name, "mettle_live_quiesce") == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static uint64_t live_function_hash(const LiveObjectIndex *index,
                                    size_t function_index) {
   const LiveFunction *function = &index->functions[function_index];
@@ -1307,6 +1326,11 @@ int live_build_patch(const char *object_path, const char *executable_path,
       snprintf(summary->names + used, sizeof(summary->names) - used, "%s%s%s",
                used ? ", " : "", index.functions[i].name,
                previous ? "" : " (new)");
+      if (previous && live_function_holds_quiesce(&index, i)) {
+        used = strlen(summary->running);
+        snprintf(summary->running + used, sizeof(summary->running) - used,
+                 "%s%s", used ? ", " : "", index.functions[i].name);
+      }
     }
     if (!live_map_put(&state.hashes, index.functions[i].name, hash, 0) ||
         !live_ensure_function(&builder, i, &ignored)) {

@@ -24,6 +24,7 @@ typedef struct {
   size_t blob_size;
   char patch_path[1024];
   char names[1024];
+  char running[512];
 } LivePatchSummary;
 
 int live_write_state(const LinkResolution *resolution, uint64_t image_base,

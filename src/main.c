@@ -18,6 +18,7 @@
 #include "linker/elf_image.h"
 #include "linker/elf_shared.h"
 #include "linker/live_patch.h"
+#include "live_driver.h"
 #include "linker/pe_emitter.h"
 #include "string_intern.h"
 #include "compiler/compiler_context.h"
@@ -4712,6 +4713,9 @@ int main(int argc, char *argv[]) {
       argv[1] = argv[2];
       argc = 2;
     }
+    if (strcmp(argv[1], "live") == 0) {
+      return mettle_live_main(argc, argv);
+    }
     if (strcmp(argv[1], "swap-check") == 0) {
       options.swap_check_mode = 1;
       for (int i = 1; i + 1 < argc; i++) {
@@ -4994,6 +4998,11 @@ int main(int argc, char *argv[]) {
                summary.new_globals == 1u ? "" : "s");
       }
       printf(")\n");
+      if (summary.running[0]) {
+        printf("  %s %s running at the quiesce point and keeps its old code "
+               "until it is next called\n",
+               summary.running, strchr(summary.running, ',') ? "are" : "is");
+      }
     }
     free(live_error);
     remove(options.output_filename);
