@@ -42,6 +42,7 @@ frontend can drive instead. The documentation is organized the same way.
 - [Linker and build pipelines](linker-build-pipelines.md): which linker runs
   when.
 - [Runtime model](runtime-model.md): what an emitted program assumes of the OS, and a frame written down as data.
+- [Live programs](live.md): `mettle live` changes a running program on every save.
 - [Bare metal](bare-metal.md): inline assembly, `volatile`, `@naked` and
   `@interrupt`, cross-compilation, a described calling convention, a described
   instruction set, a chosen link address, 16-bit code, and one table of what
