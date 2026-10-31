@@ -77,7 +77,8 @@ program keeps running the code it has:
 
 - a global changed size, or a struct used by live state changed layout (M3
   lifts this)
-- a function signature changed (M2 lifts this)
+- a function signature changed while a frame that keeps its old code may
+  still call it the old way (M4 narrowed this to frames that cannot move)
 - the new code needs an import or a runtime component the program never linked
 - new thread-local storage
 - the spare thunks or the arena are exhausted
@@ -113,6 +114,95 @@ next patch file, and when it finds one:
 
 The old code is never freed. A thread inside an old body finishes there.
 
+## M4: frames move at quiesce
+
+A frame of the function that holds a `quiesce;` moves to the new code at that
+point. It is done in the IR, before optimization, so the new code is ordinary
+optimized code and no stack maps are needed.
+
+### Sites
+
+In a live build, `quiesce;` in a function `f` lowers to
+
+```text
+%flag <- &@f$live_frame
+%moved = mettle_live_frame_check(%flag, "f")
+branch_zero %moved -> resume
+  transfer path
+label resume
+```
+
+`mettle_live_frame_check` applies pending patches, then reports whether a
+patch asked `f` to move, and clears the request. `f$live_frame` is a global
+the patch sets through an init.
+
+All cross-statement state in lowered IR lives in named locals (loop
+counters, `for` indices, defer captures), so the named locals are the whole
+state of the frame at a quiesce point. Each local gets a transfer name: its
+source name, with the lowering's numeric suffixes replaced by an ordinal
+(`ir_defer_cap#1`, `x#2` for a shadowing `x`), and a key that hashes its type
+layout.
+
+The transfer path hands every local declared before the site to the runtime
+by address: a scalar through a copy in a `.live` local, so the variable itself
+stays in a register; an aggregate, or anything whose address the function
+takes, through its own storage. Then it calls `f$resume_k` and returns its
+result. It runs no defers; the continuation owns the rest of the function.
+
+### Continuations
+
+`f$resume_k` is generated per site from `f`'s IR. Its entry takes each local
+back by name (`mettle_live_frame_take`), and jumps to the point after site
+`k`. Entering a loop in the middle would make the control flow irreducible,
+which the optimizer's loop passes do not expect. The continuation avoids it
+with one copy of the function per enclosing loop level plus one:
+
+- copy `D`, for `D` enclosing loops numbered from the outside, is entered at
+  the site, and a back edge of enclosing loop `j` leaves it for copy `j`;
+- copy `j` is entered at the header of loop `j` through a landing label that
+  falls into it, the same shape a preheader has. Loop `j` and the loops inside
+  it keep their back edges, and a back edge of an outer loop `i` leaves for
+  copy `i`;
+- copy `0` is the whole function in steady state.
+
+Unreachable blocks are dropped. What remains is reducible, every loop is
+entered through its header, and the code size is about the loop nest depth
+times the function.
+
+A local that the continuation reaches only through its address adopts the
+old frame's storage, so pointers the old code saved stay valid. The
+continuation declares no storage for it; a local that is new gets zeroed heap
+memory. The old frame stays on the stack under the continuation, which is
+what keeps adopted storage alive.
+
+The continuation itself has sites, so a later patch moves it again.
+
+### Patches
+
+Continuations are ordinary live functions with thunks and slots, so the diff
+treats them like any other. When a continuation of `f` is in a patch, the
+patch sets `f$live_frame`, provided the running program has the flag, the
+same number of sites, and the same signature for `f`. Otherwise the frame
+keeps its old code and the summary says so.
+
+The signature refusal now asks which frames may keep running old code: a
+quiesce holder that will not move, or any function that calls into a holder
+of another family (it is on the stack while that holder applies the patch).
+Only those are checked for calls to a function whose signature changed. A
+`main` loop that moves calls the new signature from the new code.
+
+### Runtime
+
+| Call | Does |
+|---|---|
+| `mettle_live_frame_check(flag, owner)` | apply patches; if the flag is set, clear it and start a record |
+| `mettle_live_frame_put(name, key, size, place)` | record where a local's value is |
+| `mettle_live_frame_take(name, key, size)` | the place for a matching name and key, or 0 |
+| `mettle_live_frame_alloc(size)` | zeroed storage for a new adopted local |
+
+A name that is missing or whose key changed prints one line and the local
+starts from its constant initializer, or zero.
+
 ## M2 to M8
 
 - M2, signatures: a changed signature puts every caller in the patch. A frame
@@ -122,9 +212,9 @@ The old code is never freed. A thread inside an old body finishes there.
   roots. A changed layout runs a generated migration at `quiesce;`, and every
   pointer into moved memory is rewritten. Types reachable only through
   `rawptr` or integers are refused by name.
-- M4, the stack: every `quiesce;` records which values are live there, where,
-  and with what type. A swap maps the old frame onto the new one at the same
-  quiesce point and continues in the new code.
+- M4, the stack: built; see above. Next is moving frames that are on the
+  stack without holding a quiesce point, by giving every call site in a live
+  build the same transfer path.
 - M5, representations: a `migrate fn` from the old type to the new one, run
   once at the swap, with pointers rewritten as in M3.
 - M6, time: the allocator tracks dirty pages, so a snapshot every frame is

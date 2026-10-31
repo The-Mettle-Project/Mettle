@@ -21,10 +21,12 @@ typedef struct {
   size_t changed_functions;
   size_t new_functions;
   size_t new_globals;
+  size_t continuations;
   size_t blob_size;
   char patch_path[1024];
   char names[1024];
   char running[512];
+  char moving[512];
 } LivePatchSummary;
 
 int live_write_state(const LinkResolution *resolution, uint64_t image_base,

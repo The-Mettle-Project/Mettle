@@ -130,6 +130,11 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
       }
       return ir_lowering_fail(ir_program, &context, error_message);
     }
+    if (!ir_lower_live_frames(&context, function)) {
+      ir_function_destroy(function);
+      ir_set_error(&context, "Out of memory while preparing live frames");
+      return ir_lowering_fail(ir_program, &context, error_message);
+    }
 
     if (!ir_program_add_function(ir_program, function)) {
       ir_function_destroy(function);
@@ -151,6 +156,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   }
 
   mtlc_lower_populate_module(ir_program, program, type_checker, symbol_table);
+  ir_lower_live_register_symbols(ir_program);
   ir_mark_volatile_global_accesses(ir_program);
   if (context.emitted_task_check &&
       !ir_program_lookup_symbol(ir_program, "mettle_safety_task_capture_check")) {

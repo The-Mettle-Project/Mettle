@@ -18,6 +18,8 @@
 #define LIVE_FNV_BASIS 1469598103934665603ULL
 #define LIVE_FNV_PRIME 1099511628211ULL
 
+#define LIVE_RESUME_INFIX "$resume_"
+
 typedef struct {
   char *key;
   uint64_t a;
@@ -121,6 +123,7 @@ typedef struct {
   LiveMap sizes;
   LiveMap spares;
   LiveMap signatures;
+  LiveMap frames;
 } LiveState;
 
 static uint64_t live_text_hash(const char *text) {
@@ -617,25 +620,112 @@ static int live_function_holds_quiesce(const LiveObjectIndex *index,
       continue;
     }
     symbol = &index->object->symbols[relocation->symbol_index];
-    if (symbol->name && strcmp(symbol->name, "mettle_live_quiesce") == 0) {
+    if (symbol->name && (strcmp(symbol->name, "mettle_live_quiesce") == 0 ||
+                         strcmp(symbol->name, "mettle_live_frame_check") == 0)) {
       return 1;
     }
   }
   return 0;
 }
 
-static int live_function_calls(const LiveObjectIndex *index,
-                               size_t caller, size_t callee) {
+static size_t live_family_length(const char *name) {
+  const char *mark = strstr(name, LIVE_RESUME_INFIX);
+  return mark ? (size_t)(mark - name) : strlen(name);
+}
+
+static int live_is_continuation(const char *name) {
+  return strstr(name, LIVE_RESUME_INFIX) != NULL;
+}
+
+static int live_same_family(const char *a, const char *b) {
+  size_t length = live_family_length(a);
+  return length == live_family_length(b) && strncmp(a, b, length) == 0;
+}
+
+static size_t live_family_owner(const LiveObjectIndex *index, size_t i) {
+  const char *name = index->functions[i].name;
+  size_t length = live_family_length(name);
+  char owner[1024];
+  LiveEntry *entry;
+  if (length == strlen(name) || length >= sizeof(owner)) {
+    return i;
+  }
+  memcpy(owner, name, length);
+  owner[length] = '\0';
+  entry = live_map_find(&index->function_by_name, owner);
+  return entry ? (size_t)entry->a : i;
+}
+
+static size_t live_count_map_continuations(const LiveMap *map,
+                                           const char *owner) {
+  size_t length = strlen(owner);
+  size_t count = 0;
+  for (size_t i = 0; i < map->capacity; i++) {
+    const char *key = map->items[i].key;
+    if (key && strncmp(key, owner, length) == 0 &&
+        strncmp(key + length, LIVE_RESUME_INFIX,
+                strlen(LIVE_RESUME_INFIX)) == 0) {
+      count++;
+    }
+  }
+  return count;
+}
+
+static size_t live_count_index_continuations(const LiveObjectIndex *index,
+                                             const char *owner) {
+  size_t length = strlen(owner);
+  size_t count = 0;
+  for (size_t i = 0; i < index->function_count; i++) {
+    const char *name = index->functions[i].name;
+    if (strncmp(name, owner, length) == 0 &&
+        strncmp(name + length, LIVE_RESUME_INFIX,
+                strlen(LIVE_RESUME_INFIX)) == 0) {
+      count++;
+    }
+  }
+  return count;
+}
+
+static int live_function_callees(const LiveObjectIndex *index, size_t caller,
+                                 size_t **callees_out, size_t *count_out) {
   const LiveFunction *function = &index->functions[caller];
   const LinkSection *source = &index->object->sections[function->section];
+  size_t *callees = NULL;
+  size_t count = 0;
   for (size_t i = 0; i < source->relocation_count; i++) {
     const LinkReloc *relocation = &source->relocations[i];
+    size_t *grown;
+    int seen = 0;
     if (relocation->offset < function->body_offset) {
       continue;
     }
     LiveTarget target = live_classify(index, relocation->symbol_index,
                                       live_reloc_addend(source, relocation));
-    if (target.kind == LIVE_T_THUNK && target.function == callee) {
+    if (target.kind != LIVE_T_THUNK) {
+      continue;
+    }
+    for (size_t k = 0; k < count && !seen; k++) {
+      seen = callees[k] == target.function;
+    }
+    if (seen) {
+      continue;
+    }
+    grown = realloc(callees, (count + 1u) * sizeof(size_t));
+    if (!grown) {
+      free(callees);
+      return 0;
+    }
+    callees = grown;
+    callees[count++] = target.function;
+  }
+  *callees_out = callees;
+  *count_out = count;
+  return 1;
+}
+
+static int live_list_has(const size_t *items, size_t count, size_t value) {
+  for (size_t i = 0; i < count; i++) {
+    if (items[i] == value) {
       return 1;
     }
   }
@@ -644,28 +734,91 @@ static int live_function_calls(const LiveObjectIndex *index,
 
 static int live_check_signatures(const LiveState *state,
                                  const LiveObjectIndex *index,
+                                 const unsigned char *moves,
                                  char **error_message_out) {
-  for (size_t i = 0; i < index->function_count; i++) {
+  size_t n = index->function_count;
+  unsigned char *holder = NULL;
+  unsigned char *reaches = NULL;
+  size_t **callees = NULL;
+  size_t *callee_count = NULL;
+  int any = 0;
+  int ok = 0;
+  for (size_t i = 0; i < n && !any; i++) {
     const LiveEntry *previous =
         live_map_find(&state->signatures, index->functions[i].name);
-    if (!previous || previous->a == index->functions[i].signature) {
-      continue;
+    any = previous && previous->a != index->functions[i].signature;
+  }
+  if (!any) {
+    return 1;
+  }
+  holder = calloc(n ? n : 1u, 1u);
+  reaches = calloc(n ? n : 1u, 1u);
+  callees = calloc(n ? n : 1u, sizeof(size_t *));
+  callee_count = calloc(n ? n : 1u, sizeof(size_t));
+  if (!holder || !reaches || !callees || !callee_count) {
+    mettle_set_error(error_message_out, "Out of memory checking signatures");
+    goto done;
+  }
+  for (size_t i = 0; i < n; i++) {
+    holder[i] = (unsigned char)live_function_holds_quiesce(index, i);
+    if (!live_function_callees(index, i, &callees[i], &callee_count[i])) {
+      mettle_set_error(error_message_out, "Out of memory checking signatures");
+      goto done;
     }
-    for (size_t holder = 0; holder < index->function_count; holder++) {
-      if (holder != i && live_function_holds_quiesce(index, holder) &&
-          live_function_calls(index, holder, i)) {
-        mettle_set_error(error_message_out,
-                         "'%s' changed its parameters or result, and '%s' is "
-                         "running at the quiesce point and would still call "
-                         "it the old way. Keep the old signature and add a "
-                         "new function, or restart",
-                         index->functions[i].name,
-                         index->functions[holder].name);
-        return 0;
+  }
+  for (int changed = 1; changed;) {
+    changed = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (reaches[i]) {
+        continue;
+      }
+      for (size_t k = 0; k < callee_count[i]; k++) {
+        size_t j = callees[i][k];
+        if ((holder[j] || reaches[j]) &&
+            !live_same_family(index->functions[i].name,
+                              index->functions[j].name)) {
+          reaches[i] = 1;
+          changed = 1;
+          break;
+        }
       }
     }
   }
-  return 1;
+  for (size_t h = 0; h < n; h++) {
+    const LiveEntry *previous =
+        live_map_find(&state->signatures, index->functions[h].name);
+    if (!previous || previous->a == index->functions[h].signature) {
+      continue;
+    }
+    for (size_t i = 0; i < n; i++) {
+      size_t owner = live_family_owner(index, i);
+      int exposed = reaches[i] || (holder[i] && !moves[owner]);
+      if (!exposed ||
+          live_same_family(index->functions[i].name,
+                           index->functions[h].name) ||
+          !live_list_has(callees[i], callee_count[i], h)) {
+        continue;
+      }
+      mettle_set_error(error_message_out,
+                       "'%s' changed its parameters or result, and '%s' may "
+                       "be on the stack when the patch lands and would still "
+                       "call it the old way. Keep the old signature and add a "
+                       "new function, or restart",
+                       index->functions[h].name,
+                       index->functions[owner].name);
+      goto done;
+    }
+  }
+  ok = 1;
+done:
+  for (size_t i = 0; callees && i < n; i++) {
+    free(callees[i]);
+  }
+  free(callees);
+  free(callee_count);
+  free(holder);
+  free(reaches);
+  return ok;
 }
 
 static uint64_t live_function_hash(const LiveObjectIndex *index,
@@ -760,6 +913,12 @@ static int live_state_save(const LiveState *state, const char *path,
       fprintf(file, "q %llu %s\n", (unsigned long long)entry->a, entry->key);
     }
   }
+  for (size_t i = 0; i < state->frames.capacity; i++) {
+    const LiveEntry *entry = &state->frames.items[i];
+    if (entry->key) {
+      fprintf(file, "m %llu %s\n", (unsigned long long)entry->a, entry->key);
+    }
+  }
   if (fclose(file) != 0) {
     mettle_set_error(error_message_out, "Cannot write the live state '%s'",
                      path);
@@ -824,6 +983,7 @@ static int live_state_load(LiveState *state, const char *path,
                      : line[0] == 'g' ? &state->sizes
                      : line[0] == 'n' ? &state->spares
                      : line[0] == 'q' ? &state->signatures
+                     : line[0] == 'm' ? &state->frames
                                       : NULL;
       if (map && !live_map_put(map, name, a, 0)) {
         fclose(file);
@@ -843,6 +1003,7 @@ static void live_state_destroy(LiveState *state) {
   live_map_destroy(&state->sizes);
   live_map_destroy(&state->spares);
   live_map_destroy(&state->signatures);
+  live_map_destroy(&state->frames);
 }
 
 static int live_record_object(LiveState *state, const LinkObject *object) {
@@ -952,6 +1113,7 @@ typedef struct {
   LiveMap rodata_pieces;
   size_t changed;
   size_t created;
+  size_t continuations;
   size_t new_globals;
   char **error_message_out;
 } LiveBuilder;
@@ -1299,7 +1461,8 @@ static int live_write_patch(LiveBuilder *builder, const char *path) {
            live_buffer_u32(&out, (uint32_t)builder->fixup_count) &&
            live_buffer_u32(&out, (uint32_t)builder->swap_count) &&
            live_buffer_u32(&out, (uint32_t)builder->init_count) &&
-           live_buffer_u32(&out, (uint32_t)(builder->changed + builder->created)) &&
+           live_buffer_u32(&out, (uint32_t)(builder->changed + builder->created -
+                                            builder->continuations)) &&
            live_buffer_append(&out, NULL, LIVE_PATCH_HEADER_SIZE - out.size) &&
            live_buffer_append(&out, builder->blob.data, builder->blob.size) &&
            live_buffer_align(&out, 8u, 0);
@@ -1345,6 +1508,8 @@ int live_build_patch(const char *object_path, const char *executable_path,
   LiveObjectIndex index;
   LiveBuilder builder;
   LinkObject *object = NULL;
+  unsigned char *moves = NULL;
+  size_t *old_sites = NULL;
   char *state_path = live_join(executable_path, ".live");
   char *directory = live_join(executable_path, ".live.d");
   int ok = 0;
@@ -1384,6 +1549,18 @@ int live_build_patch(const char *object_path, const char *executable_path,
     builder.function_piece[i] = LIVE_NONE;
     builder.function_thunk[i] = LIVE_NONE;
   }
+  moves = calloc(index.function_count ? index.function_count : 1u, 1u);
+  old_sites = calloc(index.function_count ? index.function_count : 1u,
+                     sizeof(size_t));
+  if (!moves || !old_sites) {
+    goto done;
+  }
+  for (size_t i = 0; i < index.function_count; i++) {
+    if (!live_is_continuation(index.functions[i].name)) {
+      old_sites[i] =
+          live_count_map_continuations(&state.hashes, index.functions[i].name);
+    }
+  }
   for (size_t i = 0; i < index.function_count; i++) {
     uint64_t hash = live_function_hash(&index, i);
     LiveEntry *previous = live_map_find(&state.hashes, index.functions[i].name);
@@ -1396,16 +1573,13 @@ int live_build_patch(const char *object_path, const char *executable_path,
     } else {
       builder.created++;
     }
-    if (summary) {
+    if (live_is_continuation(index.functions[i].name)) {
+      builder.continuations++;
+    } else if (summary) {
       size_t used = strlen(summary->names);
       snprintf(summary->names + used, sizeof(summary->names) - used, "%s%s%s",
                used ? ", " : "", index.functions[i].name,
                previous ? "" : " (new)");
-      if (previous && live_function_holds_quiesce(&index, i)) {
-        used = strlen(summary->running);
-        snprintf(summary->running + used, sizeof(summary->running) - used,
-                 "%s%s", used ? ", " : "", index.functions[i].name);
-      }
     }
     if (!live_map_put(&state.hashes, index.functions[i].name, hash, 0) ||
         !live_ensure_function(&builder, i, &ignored)) {
@@ -1416,7 +1590,81 @@ int live_build_patch(const char *object_path, const char *executable_path,
     ok = 1;
     goto done;
   }
-  if (!live_check_signatures(&state, &index, error_message_out)) {
+  for (size_t i = 0; i < index.function_count; i++) {
+    static const unsigned char pending[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+    size_t owner = live_family_owner(&index, i);
+    const char *owner_name = index.functions[owner].name;
+    char flag[1024];
+    LiveEntry *flag_rva;
+    LiveEntry *signature;
+    LiveEntry *frame;
+    size_t frame_sites;
+    size_t new_sites;
+    LiveInit *grown;
+    if (owner == i || builder.function_piece[i] == LIVE_NONE || moves[owner]) {
+      continue;
+    }
+    moves[owner] = 2;
+    snprintf(flag, sizeof(flag), "%s$live_frame", owner_name);
+    flag_rva = live_map_find(&state.symbols, flag);
+    signature = live_map_find(&state.signatures, owner_name);
+    frame = live_map_find(&state.frames, owner_name);
+    frame_sites = frame ? (size_t)frame->a : old_sites[owner];
+    new_sites = live_count_index_continuations(&index, owner_name);
+    if (!flag_rva || !signature ||
+        signature->a != index.functions[owner].signature ||
+        frame_sites == 0 || frame_sites != new_sites) {
+      if (!live_map_put(&state.frames, owner_name, frame_sites, 0)) {
+        goto done;
+      }
+      continue;
+    }
+    if (!live_map_put(&state.frames, owner_name, new_sites, 0)) {
+      goto done;
+    }
+    grown = realloc(builder.inits, (builder.init_count + 1u) * sizeof(LiveInit));
+    if (!grown) {
+      goto done;
+    }
+    builder.inits = grown;
+    if (!live_buffer_align(&builder.blob, 8u, 0)) {
+      goto done;
+    }
+    builder.inits[builder.init_count].rva = flag_rva->a;
+    builder.inits[builder.init_count].blob_offset = builder.blob.size;
+    builder.inits[builder.init_count].size = sizeof(pending);
+    builder.init_count++;
+    if (!live_buffer_append(&builder.blob, pending, sizeof(pending))) {
+      goto done;
+    }
+    moves[owner] = 1;
+  }
+  for (size_t i = 0; i < index.function_count; i++) {
+    if (moves[i] == 2) {
+      moves[i] = 0;
+    }
+  }
+  if (summary) {
+    for (size_t i = 0; i < index.function_count; i++) {
+      const char *name = index.functions[i].name;
+      size_t used;
+      if (live_is_continuation(name)) {
+        continue;
+      }
+      if (moves[i]) {
+        used = strlen(summary->moving);
+        snprintf(summary->moving + used, sizeof(summary->moving) - used,
+                 "%s%s", used ? ", " : "", name);
+      } else if (builder.function_piece[i] != LIVE_NONE &&
+                 live_map_find(&state.signatures, name) &&
+                 live_function_holds_quiesce(&index, i)) {
+        used = strlen(summary->running);
+        snprintf(summary->running + used, sizeof(summary->running) - used,
+                 "%s%s", used ? ", " : "", name);
+      }
+    }
+  }
+  if (!live_check_signatures(&state, &index, moves, error_message_out)) {
     goto done;
   }
   for (size_t i = 0; i < index.function_count; i++) {
@@ -1469,6 +1717,7 @@ done:
     summary->patch_index = builder.changed + builder.created ? state.patch_index : 0u;
     summary->changed_functions = builder.changed;
     summary->new_functions = builder.created;
+    summary->continuations = builder.continuations;
     summary->new_globals = builder.new_globals;
     summary->blob_size = builder.blob.size;
   }
@@ -1482,6 +1731,8 @@ done:
   free(builder.inits);
   free(builder.function_piece);
   free(builder.function_thunk);
+  free(moves);
+  free(old_sites);
   live_map_destroy(&builder.rodata_pieces);
   live_index_destroy(&index);
   link_object_destroy(object);

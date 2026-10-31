@@ -76,7 +76,8 @@ LOWERING_SOURCES = \
 	$(SRCDIR)/ir/ir_lower_support.c \
 	$(SRCDIR)/ir/ir_lower_switch_match.c \
 	$(SRCDIR)/ir/ir_lower_tile.c \
-	$(SRCDIR)/ir/ir_lower_types.c
+	$(SRCDIR)/ir/ir_lower_types.c \
+	$(SRCDIR)/ir/ir_lower_live.c
 # Backend IR core (everything in src/ir except the lowering TUs) + optimizer.
 IR_CORE_SOURCES = $(filter-out $(LOWERING_SOURCES),$(wildcard $(SRCDIR)/ir/*.c)) $(wildcard $(SRCDIR)/ir/optimizer/*.c)
 # Public libmtlc API surface, and the frontend-side type-translation adapter.

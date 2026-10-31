@@ -1543,6 +1543,9 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     return ir_lower_block(context, function, statement, defers);
 
   case AST_QUIESCE_STATEMENT: {
+    if (g_ir_lowering_live) {
+      return ir_lower_live_site(context, function, statement->location);
+    }
     ir_declare_swap_apply_helper(context);
     IRInstruction apply = {0};
     apply.op = IR_OP_CALL;

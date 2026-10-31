@@ -5000,10 +5000,17 @@ int main(int argc, char *argv[]) {
                summary.new_globals == 1u ? "" : "s");
       }
       printf(")\n");
+      if (summary.moving[0]) {
+        printf("  %s %s to the new code at %s next quiesce point\n",
+               summary.moving, strchr(summary.moving, ',') ? "move" : "moves",
+               strchr(summary.moving, ',') ? "their" : "its");
+      }
       if (summary.running[0]) {
-        printf("  %s %s running at the quiesce point and keeps its old code "
-               "until it is next called\n",
-               summary.running, strchr(summary.running, ',') ? "are" : "is");
+        printf("  %s %s running at the quiesce point and %s the old code "
+               "until %s next called\n",
+               summary.running, strchr(summary.running, ',') ? "are" : "is",
+               strchr(summary.running, ',') ? "keep" : "keeps",
+               strchr(summary.running, ',') ? "they are" : "it is");
       }
     }
     free(live_error);
