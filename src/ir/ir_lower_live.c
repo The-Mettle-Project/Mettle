@@ -8,6 +8,7 @@
 #define IR_LIVE_TAKE_NAME "mettle_live_frame_take"
 #define IR_LIVE_ZERO_NAME "mettle_live_frame_zero"
 #define IR_LIVE_ALLOC_NAME "mettle_live_frame_alloc"
+#define IR_LIVE_END_NAME "mettle_live_frame_end"
 #define IR_LIVE_QUIESCE_NAME "mettle_live_quiesce"
 #define IR_LIVE_RESUME_INFIX "$resume_"
 #define IR_LIVE_FRAME_SUFFIX "$live_frame"
@@ -188,6 +189,7 @@ static void ir_live_declare_helpers(IRLoweringContext *context) {
   ir_live_declare_helper(context, IR_LIVE_TAKE_NAME, 1, 2);
   ir_live_declare_helper(context, IR_LIVE_ZERO_NAME, 0, 2);
   ir_live_declare_helper(context, IR_LIVE_ALLOC_NAME, 0, 1);
+  ir_live_declare_helper(context, IR_LIVE_END_NAME, 0, 0);
   if (context && context->program && context->type_checker &&
       !ir_program_lookup_symbol(context->program, IR_LIVE_CHECK_NAME)) {
     IRModuleSymbol entry = {0};
@@ -1488,9 +1490,14 @@ static IRFunction *ir_live_build_continuation(IRLoweringContext *context,
       goto done;
     }
   }
-  if (!ir_emit_jump_instruction(context, clone, entry_target,
-                                function->location)) {
-    goto done;
+  {
+    IROperand none = ir_operand_none();
+    if (!ir_live_emit_call(context, clone, IR_LIVE_END_NAME, NULL, 0, &none,
+                           function->location) ||
+        !ir_emit_jump_instruction(context, clone, entry_target,
+                                  function->location)) {
+      goto done;
+    }
   }
   for (size_t i = 0; i < staging->instruction_count; i++) {
     const IRInstruction *in = &staging->instructions[i];

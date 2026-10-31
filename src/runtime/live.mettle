@@ -13,6 +13,8 @@ extern fn mettle_live_os_std_handle(which: int32) -> int64 = "GetStdHandle";
 extern fn mettle_live_os_write(file: int64, buffer: uint8*, count: uint32, done: uint32*, overlapped: int64) -> int32 = "WriteFile";
 extern fn mettle_live_os_process() -> int64 = "GetCurrentProcess";
 extern fn mettle_live_os_flush(process: int64, address: int64, size: int64) -> int32 = "FlushInstructionCache";
+extern fn mettle_live_os_lock(lock: int64*) = "AcquireSRWLockExclusive";
+extern fn mettle_live_os_unlock(lock: int64*) = "ReleaseSRWLockExclusive";
 
 const METTLE_LIVE_MAGIC: int64 = 0x48435441504C544D;
 const METTLE_LIVE_PROBE_MS: uint64 = 50;
@@ -27,6 +29,8 @@ var mettle_live_ready: int64 = 0;
 var mettle_live_next: int64 = 1;
 var mettle_live_last_probe: uint64 = 0;
 var mettle_live_message: uint8[300];
+var mettle_live_poll_lock: int64 = 0;
+var mettle_live_frame_lock: int64 = 0;
 
 fn mettle_live_text(at: int64, text: string) -> int64 {
     var i: int64 = 0;
@@ -285,8 +289,12 @@ fn mettle_live_poll() {
 export fn mettle_live_quiesce() -> int64 {
     var now: uint64 = mettle_live_os_ticks();
     if (mettle_live_last_probe == (uint64)0 || now - mettle_live_last_probe >= METTLE_LIVE_PROBE_MS) {
-        mettle_live_last_probe = now;
-        mettle_live_poll();
+        mettle_live_os_lock(&mettle_live_poll_lock);
+        if (mettle_live_last_probe == (uint64)0 || now - mettle_live_last_probe >= METTLE_LIVE_PROBE_MS) {
+            mettle_live_last_probe = now;
+            mettle_live_poll();
+        }
+        mettle_live_os_unlock(&mettle_live_poll_lock);
     }
     return mettle_swap_apply();
 }
@@ -337,6 +345,11 @@ export fn mettle_live_frame_check(flag: int64, owner: string) -> int64 {
     if (*pending == 0) {
         return 0;
     }
+    mettle_live_os_lock(&mettle_live_frame_lock);
+    if (*pending == 0) {
+        mettle_live_os_unlock(&mettle_live_frame_lock);
+        return 0;
+    }
     *pending = 0;
     mettle_live_frame_count = 0;
     mettle_live_frame_owner = owner;
@@ -373,6 +386,12 @@ export fn mettle_live_frame_take(name: string, key: int64, size: int64) -> int64
         i = i + 1;
     }
     mettle_live_frame_note(name, "is new here and starts from its initial value");
+    return 0;
+}
+
+export fn mettle_live_frame_end() -> int64 {
+    mettle_live_frame_count = 0;
+    mettle_live_os_unlock(&mettle_live_frame_lock);
     return 0;
 }
 
