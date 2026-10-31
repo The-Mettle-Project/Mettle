@@ -1,0 +1,292 @@
+extern fn mettle_swap_apply() -> int64;
+
+extern fn mettle_live_os_alloc(address: int64, size: int64, kind: uint32, protect: uint32) -> int64 = "VirtualAlloc";
+extern fn mettle_live_os_protect(address: int64, size: int64, protect: uint32, old: uint32*) -> int32 = "VirtualProtect";
+extern fn mettle_live_os_free(address: int64, size: int64, kind: uint32) -> int32 = "VirtualFree";
+extern fn mettle_live_os_module_name(module: int64, buffer: uint8*, size: uint32) -> uint32 = "GetModuleFileNameA";
+extern fn mettle_live_os_open(name: uint8*, access: uint32, share: uint32, security: int64, disposition: uint32, flags: uint32, template: int64) -> int64 = "CreateFileA";
+extern fn mettle_live_os_file_size(file: int64, size: int64*) -> int32 = "GetFileSizeEx";
+extern fn mettle_live_os_read(file: int64, buffer: int64, count: uint32, done: uint32*, overlapped: int64) -> int32 = "ReadFile";
+extern fn mettle_live_os_close(handle: int64) -> int32 = "CloseHandle";
+extern fn mettle_live_os_ticks() -> uint64 = "GetTickCount64";
+extern fn mettle_live_os_std_handle(which: int32) -> int64 = "GetStdHandle";
+extern fn mettle_live_os_write(file: int64, buffer: uint8*, count: uint32, done: uint32*, overlapped: int64) -> int32 = "WriteFile";
+extern fn mettle_live_os_process() -> int64 = "GetCurrentProcess";
+extern fn mettle_live_os_flush(process: int64, address: int64, size: int64) -> int32 = "FlushInstructionCache";
+
+const METTLE_LIVE_MAGIC: int64 = 0x48435441504C544D;
+const METTLE_LIVE_PROBE_MS: uint64 = 50;
+
+export var mettle_live_anchor: int64 = 1;
+export var mettle_live_spare_slots: int64[4096];
+export var mettle_live_arena: uint8[1048576];
+
+var mettle_live_path: uint8[1100];
+var mettle_live_path_length: int64 = 0;
+var mettle_live_ready: int64 = 0;
+var mettle_live_next: int64 = 1;
+var mettle_live_last_probe: uint64 = 0;
+var mettle_live_message: uint8[300];
+
+fn mettle_live_text(at: int64, text: string) -> int64 {
+    var i: int64 = 0;
+    var n: int64 = (int64)text.length;
+    while (i < n && at + i < 290) {
+        mettle_live_message[at + i] = text.chars[i];
+        i = i + 1;
+    }
+    return at + i;
+}
+
+fn mettle_live_number(at: int64, value: int64) -> int64 {
+    var digits: int64 = 1;
+    var probe: int64 = value;
+    while (probe >= 10) {
+        probe = probe / 10;
+        digits = digits + 1;
+    }
+    if (at + digits >= 290) {
+        return at;
+    }
+    var i: int64 = at + digits;
+    var v: int64 = value;
+    while (i > at) {
+        i = i - 1;
+        mettle_live_message[i] = (uint8)(48 + v % 10);
+        v = v / 10;
+    }
+    return at + digits;
+}
+
+fn mettle_live_send(length: int64) {
+    var written: uint32 = (uint32)0;
+    mettle_live_message[length] = (uint8)10;
+    mettle_live_os_write(mettle_live_os_std_handle(-12), &mettle_live_message[0], (uint32)(length + 1), &written, 0);
+}
+
+fn mettle_live_refuse(index: int64, reason: string) {
+    var at: int64 = mettle_live_text(0, "[live] patch ");
+    at = mettle_live_number(at, index);
+    at = mettle_live_text(at, " refused: ");
+    at = mettle_live_text(at, reason);
+    mettle_live_send(at);
+}
+
+fn mettle_live_u32(address: int64) -> int64 {
+    var p: uint32* = (uint32*)address;
+    return (int64)*p;
+}
+
+fn mettle_live_u64(address: int64) -> int64 {
+    var p: int64* = (int64*)address;
+    return *p;
+}
+
+fn mettle_live_copy(target: int64, source: int64, count: int64) {
+    var i: int64 = 0;
+    var t: uint8* = (uint8*)target;
+    var s: uint8* = (uint8*)source;
+    while (i < count) {
+        t[i] = s[i];
+        i = i + 1;
+    }
+}
+
+fn mettle_live_prepare_path() -> int64 {
+    var n: int64 = (int64)mettle_live_os_module_name(0, &mettle_live_path[0], (uint32)1024);
+    if (n <= 0 || n >= 1024) {
+        return 0;
+    }
+    var suffix: string = ".live.d/";
+    var i: int64 = 0;
+    while (i < (int64)suffix.length) {
+        mettle_live_path[n + i] = suffix.chars[i];
+        i = i + 1;
+    }
+    mettle_live_path_length = n + i;
+    return 1;
+}
+
+fn mettle_live_name_patch(index: int64) {
+    var at: int64 = mettle_live_path_length;
+    var v: int64 = index;
+    var d: int64 = 5;
+    while (d >= 0) {
+        mettle_live_path[at + d] = (uint8)(48 + v % 10);
+        v = v / 10;
+        d = d - 1;
+    }
+    var ext: string = ".mpatch";
+    var i: int64 = 0;
+    while (i < (int64)ext.length) {
+        mettle_live_path[at + 6 + i] = ext.chars[i];
+        i = i + 1;
+    }
+    mettle_live_path[at + 6 + i] = (uint8)0;
+}
+
+fn mettle_live_read(size_out: int64*) -> int64 {
+    var file: int64 = mettle_live_os_open(&mettle_live_path[0], (uint32)0x80000000, (uint32)7, 0, (uint32)3, (uint32)0x80, 0);
+    if (file == -1) {
+        return 0;
+    }
+    var size: int64 = 0;
+    if (mettle_live_os_file_size(file, &size) == 0 || size < 64 || size > 0x40000000) {
+        mettle_live_os_close(file);
+        return -1;
+    }
+    var buffer: int64 = mettle_live_os_alloc(0, size, (uint32)0x3000, (uint32)0x04);
+    if (buffer == 0) {
+        mettle_live_os_close(file);
+        return -1;
+    }
+    var done: uint32 = (uint32)0;
+    var ok: int32 = mettle_live_os_read(file, buffer, (uint32)size, &done, 0);
+    mettle_live_os_close(file);
+    if (ok == 0 || (int64)done != size) {
+        mettle_live_os_free(buffer, 0, (uint32)0x8000);
+        return -1;
+    }
+    *size_out = size;
+    return buffer;
+}
+
+fn mettle_live_alloc_near(base: int64, size: int64) -> int64 {
+    var headers: int64 = base + mettle_live_u32(base + 60);
+    var image: int64 = mettle_live_u32(headers + 80);
+    var at: int64 = ((base + image + 65535) / 65536) * 65536;
+    var limit: int64 = base + 0x70000000;
+    while (at + size < limit) {
+        var got: int64 = mettle_live_os_alloc(at, size, (uint32)0x3000, (uint32)0x04);
+        if (got != 0) {
+            return got;
+        }
+        at = at + 65536;
+    }
+    return 0;
+}
+
+fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
+    if (mettle_live_u64(buffer) != METTLE_LIVE_MAGIC || mettle_live_u32(buffer + 8) != 1) {
+        mettle_live_refuse(index, "not a patch this runtime can read");
+        return 0;
+    }
+    var anchor_rva: int64 = mettle_live_u64(buffer + 16);
+    var blob_size: int64 = mettle_live_u64(buffer + 24);
+    var fixups: int64 = mettle_live_u32(buffer + 32);
+    var swaps: int64 = mettle_live_u32(buffer + 36);
+    var inits: int64 = mettle_live_u32(buffer + 40);
+    var functions: int64 = mettle_live_u32(buffer + 44);
+    var blob: int64 = buffer + 64;
+    var fixup_at: int64 = blob + ((blob_size + 7) / 8) * 8;
+    var swap_at: int64 = fixup_at + fixups * 24;
+    var init_at: int64 = swap_at + swaps * 16;
+    if (blob_size <= 0 || init_at + inits * 24 > buffer + size) {
+        mettle_live_refuse(index, "the file is truncated");
+        return 0;
+    }
+    var base: int64 = (int64)&mettle_live_anchor - anchor_rva;
+    var code: int64 = mettle_live_alloc_near(base, blob_size);
+    if (code == 0) {
+        mettle_live_refuse(index, "no memory within reach of the program");
+        return 0;
+    }
+    mettle_live_copy(code, blob, blob_size);
+    var i: int64 = 0;
+    while (i < inits) {
+        var entry: int64 = init_at + i * 24;
+        mettle_live_copy(base + mettle_live_u64(entry), blob + mettle_live_u64(entry + 8), mettle_live_u64(entry + 16));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < fixups) {
+        var fixup: int64 = fixup_at + i * 24;
+        var site: int64 = mettle_live_u32(fixup);
+        var kind: int64 = mettle_live_u32(fixup + 4);
+        var target: int64 = mettle_live_u64(fixup + 8) + mettle_live_u64(fixup + 16);
+        var site_address: int64 = code + site;
+        if ((kind & 0x100) != 0) {
+            site_address = base + site;
+        }
+        var target_address: int64 = code + target;
+        if ((kind & 0x200) != 0) {
+            target_address = base + target;
+        }
+        if ((kind & 0xFF) == 1) {
+            var wide: int64* = (int64*)site_address;
+            *wide = target_address;
+        } else if ((kind & 0xFF) == 2) {
+            var distance: int64 = target_address - (site_address + 4);
+            if (distance > 2147483647 || distance < -2147483648) {
+                mettle_live_refuse(index, "a displacement does not reach");
+                return 0;
+            }
+            var narrow: int32* = (int32*)site_address;
+            *narrow = (int32)distance;
+        } else {
+            mettle_live_refuse(index, "unknown fixup kind");
+            return 0;
+        }
+        i = i + 1;
+    }
+    var old: uint32 = (uint32)0;
+    if (mettle_live_os_protect(code, blob_size, (uint32)0x20, &old) == 0) {
+        mettle_live_refuse(index, "the code could not be made executable");
+        return 0;
+    }
+    mettle_live_os_flush(mettle_live_os_process(), code, blob_size);
+    i = 0;
+    while (i < swaps) {
+        var swap: int64 = swap_at + i * 16;
+        var slot: int64* = (int64*)(base + mettle_live_u64(swap));
+        *slot = code + mettle_live_u64(swap + 8);
+        i = i + 1;
+    }
+    var at: int64 = mettle_live_text(0, "[live] patch ");
+    at = mettle_live_number(at, index);
+    at = mettle_live_text(at, ": ");
+    at = mettle_live_number(at, functions);
+    if (functions == 1) {
+        at = mettle_live_text(at, " function");
+    } else {
+        at = mettle_live_text(at, " functions");
+    }
+    mettle_live_send(at);
+    return 1;
+}
+
+fn mettle_live_poll() {
+    if (mettle_live_ready == 0) {
+        mettle_live_ready = 2;
+        if (mettle_live_prepare_path() != 0) {
+            mettle_live_ready = 1;
+        }
+    }
+    if (mettle_live_ready != 1) {
+        return;
+    }
+    while (1 == 1) {
+        mettle_live_name_patch(mettle_live_next);
+        var size: int64 = 0;
+        var buffer: int64 = mettle_live_read(&size);
+        if (buffer == 0) {
+            return;
+        }
+        if (buffer == -1) {
+            mettle_live_refuse(mettle_live_next, "the file could not be read");
+        } else {
+            mettle_live_apply(mettle_live_next, buffer, size);
+            mettle_live_os_free(buffer, 0, (uint32)0x8000);
+        }
+        mettle_live_next = mettle_live_next + 1;
+    }
+}
+
+export fn mettle_live_quiesce() -> int64 {
+    var now: uint64 = mettle_live_os_ticks();
+    if (mettle_live_last_probe == (uint64)0 || now - mettle_live_last_probe >= METTLE_LIVE_PROBE_MS) {
+        mettle_live_last_probe = now;
+        mettle_live_poll();
+    }
+    return mettle_swap_apply();
+}

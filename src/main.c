@@ -17,6 +17,7 @@
 #include "codegen/flat_emitter.h"
 #include "linker/elf_image.h"
 #include "linker/elf_shared.h"
+#include "linker/live_patch.h"
 #include "linker/pe_emitter.h"
 #include "string_intern.h"
 #include "compiler/compiler_context.h"
@@ -1027,8 +1028,13 @@ static int object_needs_trace_runtime(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_trace_");
 }
 
+static int object_needs_live_runtime(const char *object_path) {
+  return object_needs_runtime_object(object_path, "mettle_live_");
+}
+
 static int object_needs_swap_runtime(const char *object_path) {
-  return object_needs_runtime_object(object_path, "mettle_swap_");
+  return object_needs_runtime_object(object_path, "mettle_swap_") ||
+         object_needs_live_runtime(object_path);
 }
 
 static int object_needs_string_runtime(const char *object_path) {
@@ -2572,6 +2578,17 @@ static int mettle_link_internal(const char **object_paths,
     }
     goto cleanup;
   }
+  if (options && options->live &&
+      !live_write_state(resolution,
+                        emission_options.image_base
+                            ? emission_options.image_base
+                            : 0x140000000ull,
+                        executable_filename, &error_message)) {
+    fprintf(stderr, "Error: %s\n",
+            error_message ? error_message : "Failed to write the live state");
+    remove(executable_filename);
+    goto cleanup;
+  }
 
   result = 0;
 
@@ -2718,6 +2735,7 @@ typedef enum {
   RUNTIME_OBJECT_SAFETY,
   RUNTIME_OBJECT_TRACE,
   RUNTIME_OBJECT_SWAP,
+  RUNTIME_OBJECT_LIVE,
   RUNTIME_OBJECT_STRING,
   RUNTIME_OBJECT_TRACY_HELPERS,
   RUNTIME_OBJECT_PARALLEL,
@@ -2741,6 +2759,7 @@ static const RuntimeObjectSpec RUNTIME_OBJECT_SPECS[RUNTIME_OBJECT_COUNT] = {
     [RUNTIME_OBJECT_SAFETY] = {"safety", "safety", object_needs_safety_runtime},
     [RUNTIME_OBJECT_TRACE] = {"trace", "trace", object_needs_trace_runtime},
     [RUNTIME_OBJECT_SWAP] = {"swap", "swap", object_needs_swap_runtime},
+    [RUNTIME_OBJECT_LIVE] = {"live", "live", object_needs_live_runtime},
     [RUNTIME_OBJECT_STRING] = {"string", "string", object_needs_string_runtime},
     [RUNTIME_OBJECT_PARALLEL] = {"parallel", "parallel",
                                  object_needs_parallel_runtime},
@@ -2790,6 +2809,7 @@ static const LinkObjectRequest LINK_INTERNAL_REQUESTS[] = {
     {RUNTIME_OBJECT_SAFETY, 0, LINK_OBJECT_REQUIRED},
     {RUNTIME_OBJECT_TRACE, 0, LINK_OBJECT_SKIP_MISSING},
     {RUNTIME_OBJECT_SWAP, 0, LINK_OBJECT_ANY},
+    {RUNTIME_OBJECT_LIVE, 0, LINK_OBJECT_REQUIRED},
     {RUNTIME_OBJECT_STRING, 0, LINK_OBJECT_ANY},
     {RUNTIME_OBJECT_TRACY_HELPERS, 0, LINK_OBJECT_ANY},
     {RUNTIME_OBJECT_PARALLEL, 0, LINK_OBJECT_ANY},
@@ -2802,6 +2822,7 @@ static const LinkObjectRequest LINK_GCC_REQUESTS[] = {
     {RUNTIME_OBJECT_PROFILE, 1, LINK_OBJECT_REQUIRED},
     {RUNTIME_OBJECT_STRING, 0, LINK_OBJECT_ANY},
     {RUNTIME_OBJECT_SWAP, 0, LINK_OBJECT_REQUIRED},
+    {RUNTIME_OBJECT_LIVE, 0, LINK_OBJECT_REQUIRED},
     {RUNTIME_OBJECT_SAFETY, 1, LINK_OBJECT_REQUIRED},
     {RUNTIME_OBJECT_DEBUG, 1, LINK_OBJECT_REQUIRED},
     {RUNTIME_OBJECT_TRACY_HELPERS, 0, LINK_OBJECT_ANY},
@@ -2815,6 +2836,7 @@ static const LinkObjectRequest LINK_MSVC_REQUESTS[] = {
     {RUNTIME_OBJECT_PROFILE, 0, LINK_OBJECT_REQUIRED},
     {RUNTIME_OBJECT_STRING, 0, LINK_OBJECT_ANY},
     {RUNTIME_OBJECT_SWAP, 0, LINK_OBJECT_REQUIRED},
+    {RUNTIME_OBJECT_LIVE, 0, LINK_OBJECT_REQUIRED},
     {RUNTIME_OBJECT_TRACE, 0, LINK_OBJECT_SKIP_MISSING},
     {RUNTIME_OBJECT_SAFETY, 0, LINK_OBJECT_REQUIRED},
     {RUNTIME_OBJECT_DEBUG, 0, LINK_OBJECT_REQUIRED},
@@ -3794,9 +3816,15 @@ static DriverFlagResult parse_flag_shared_library(CompilerOptions *options,
     options->export_dynamic = 1;
   } else if (strcmp(argv[i], "--soname") == 0 && i + 1 < argc) {
     options->soname = argv[++i];
+  } else if (strcmp(argv[i], "--live") == 0) {
+    options->live = 1;
+  } else if (strcmp(argv[i], "--live-patch") == 0 && i + 1 < argc) {
+    options->live = 1;
+    options->live_patch_target = argv[++i];
   } else if (strcmp(argv[i], "--dynamic-linker") == 0 && i + 1 < argc) {
     options->dynamic_linker = argv[++i];
   } else if (strcmp(argv[i], "--soname") == 0 ||
+             strcmp(argv[i], "--live-patch") == 0 ||
              strcmp(argv[i], "--dynamic-linker") == 0 ||
              strcmp(argv[i], "--rpath") == 0 ||
              strcmp(argv[i], "--library") == 0 ||
@@ -4811,6 +4839,23 @@ int main(int argc, char *argv[]) {
                   host_format == BINARY_TARGET_FORMAT_MACHO_X64 ||
                   host_format == BINARY_TARGET_FORMAT_MACHO_ARM64;
 
+  if (options.live && host_format != BINARY_TARGET_FORMAT_COFF_WIN64) {
+    fprintf(stderr, "Error: --live builds are Windows x64 only for now\n");
+    return 1;
+  }
+  if (options.live_patch_target) {
+    static char live_object_path[1024];
+    if (flags.build_executable) {
+      fprintf(stderr, "Error: --live-patch builds a patch, not an executable; "
+                      "drop --build\n");
+      return 1;
+    }
+    snprintf(live_object_path, sizeof(live_object_path), "%s.live.obj",
+             options.live_patch_target);
+    options.output_filename = live_object_path;
+    options.emit_object = 1;
+  }
+
   if (flags.build_executable) {
     if (!elf_build && (options.shared_library_count > 0u ||
                        options.export_dynamic || options.runpath_count > 0u ||
@@ -4921,13 +4966,38 @@ int main(int argc, char *argv[]) {
     options.output_filename = object_output_filename;
   }
 
-  options.building_executable = flags.build_executable;
+  options.building_executable =
+      flags.build_executable || options.live_patch_target != NULL;
 
   double command_profile_start =
       options.profile ? compiler_profile_now_ms() : 0.0;
   int result =
       compile_file(options.input_filename, options.output_filename, &options);
-  if (result == 0 && flags.build_executable) {
+  if (result == 0 && options.live_patch_target) {
+    LivePatchSummary summary;
+    char *live_error = NULL;
+    if (!live_build_patch(options.output_filename, options.live_patch_target,
+                          &summary, &live_error)) {
+      fprintf(stderr, "Error: %s\n",
+              live_error ? live_error : "Failed to build a live patch");
+      if (summary.names[0]) {
+        fprintf(stderr, "  The patch was to replace: %s\n", summary.names);
+      }
+      result = 1;
+    } else if (summary.patch_index == 0u) {
+      printf("No function changed\n");
+    } else {
+      printf("Patch %u: %s (%zu bytes", summary.patch_index, summary.names,
+             summary.blob_size);
+      if (summary.new_globals) {
+        printf(", %zu new global%s", summary.new_globals,
+               summary.new_globals == 1u ? "" : "s");
+      }
+      printf(")\n");
+    }
+    free(live_error);
+    remove(options.output_filename);
+  } else if (result == 0 && flags.build_executable) {
     double build_profile_start =
         options.profile ? compiler_profile_now_ms() : 0.0;
 #ifndef _WIN32
@@ -6546,6 +6616,7 @@ static void compile_session_configure(CompileContext *ctx) {
                                                                          : 0);
   code_generator_set_debug_hooks(ctx->code_generator,
                                  options->debug_hooks ? 1 : 0);
+  code_generator_set_live(ctx->code_generator, options->live ? 1 : 0);
   ctx->code_generator->whole_program = options->building_executable ? 1 : 0;
 }
 
@@ -6788,6 +6859,7 @@ static int compile_stage_lowering_modes(CompileContext *ctx) {
       options->check_proofs || options->test_mode ||
       options->trace_function != NULL || ir_verify_enabled());
   ir_lowering_set_task_checks(options->check_tasks);
+  ir_lowering_set_live(options->live);
   ir_lowering_set_overflow_checks(options->check_overflow);
   ir_lowering_set_assume_no_signed_overflow(options->assume_no_signed_overflow);
   ir_explain_safety_set_collect(options->explain && options->optimize,

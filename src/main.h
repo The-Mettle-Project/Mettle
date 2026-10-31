@@ -125,6 +125,8 @@ typedef struct {
   int shared_output;
   int export_dynamic;
   const char *soname;
+  int live;
+  const char *live_patch_target;
   const char *dynamic_linker;
   const char *stdlib_directory;
   int prelude;

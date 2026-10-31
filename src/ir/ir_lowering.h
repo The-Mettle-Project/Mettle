@@ -14,6 +14,7 @@ void ir_lowering_set_explain(int enabled);
 
 void ir_lowering_set_refinement_checks(int enabled);
 void ir_lowering_set_task_checks(int enabled);
+void ir_lowering_set_live(int enabled);
 void ir_lowering_set_overflow_checks(int enabled);
 void ir_lowering_set_assume_no_signed_overflow(int enabled);
 void ir_lowering_overflow_totals(size_t *emitted, size_t *proved);

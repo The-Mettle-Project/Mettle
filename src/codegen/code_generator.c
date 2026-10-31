@@ -202,6 +202,12 @@ void code_generator_set_debug_hooks(CodeGenerator *generator, int enable) {
   }
 }
 
+void code_generator_set_live(CodeGenerator *generator, int enable) {
+  if (generator) {
+    generator->live = enable ? 1 : 0;
+  }
+}
+
 int code_generator_register_profile_function(CodeGenerator *generator,
                                              const char *name,
                                              uint32_t *id_out) {

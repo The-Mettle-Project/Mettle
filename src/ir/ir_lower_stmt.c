@@ -2,15 +2,19 @@
 #include "frontend/mtlc_frontend.h"
 #include "string_intern.h"
 
+static const char *ir_quiesce_helper_name(void) {
+  return g_ir_lowering_live ? "mettle_live_quiesce" : "mettle_swap_apply";
+}
+
 static void ir_declare_swap_apply_helper(IRLoweringContext *context) {
   IRModuleSymbol entry = {0};
   if (!context || !context->program || !context->type_checker) {
     return;
   }
-  if (ir_program_lookup_symbol(context->program, "mettle_swap_apply")) {
+  if (ir_program_lookup_symbol(context->program, ir_quiesce_helper_name())) {
     return;
   }
-  entry.name = (char *)"mettle_swap_apply";
+  entry.name = (char *)ir_quiesce_helper_name();
   entry.kind = IR_MODSYM_FUNCTION;
   entry.is_extern = 1;
   entry.type = mtlc_type_from_frontend(context->type_checker->builtin_int64);
@@ -1544,7 +1548,7 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
     apply.op = IR_OP_CALL;
     apply.location = statement->location;
     apply.dest = ir_operand_none();
-    apply.text = "mettle_swap_apply";
+    apply.text = (char *)ir_quiesce_helper_name();
     apply.arguments = NULL;
     apply.argument_count = 0;
     return ir_emit(context, function, &apply);

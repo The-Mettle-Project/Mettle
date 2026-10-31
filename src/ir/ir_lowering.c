@@ -339,6 +339,7 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
 int g_ir_lowering_explain = 0;
 int g_ir_lowering_refinement_checks = 0;
 int g_ir_lowering_task_checks = 0;
+int g_ir_lowering_live = 0;
 int g_ir_lowering_overflow_checks = 0;
 int g_ir_lowering_assume_no_signed_overflow = 0;
 
@@ -346,6 +347,10 @@ void ir_lowering_set_explain(int enabled) { g_ir_lowering_explain = enabled; }
 
 void ir_lowering_set_refinement_checks(int enabled) {
   g_ir_lowering_refinement_checks = enabled;
+}
+
+void ir_lowering_set_live(int enabled) {
+  g_ir_lowering_live = enabled ? 1 : 0;
 }
 
 void ir_lowering_set_task_checks(int enabled) {

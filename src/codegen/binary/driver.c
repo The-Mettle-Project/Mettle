@@ -177,6 +177,60 @@ static BinarySymbolBinding binary_function_symbol_binding(
   return reachable_by_name ? BINARY_SYMBOL_GLOBAL : BINARY_SYMBOL_LOCAL;
 }
 
+static int binary_function_is_live(CodeGenerator *generator,
+                                   const IRFunction *ir_function) {
+  return generator->live &&
+         generator->binary_emitter->target_format ==
+             BINARY_TARGET_FORMAT_COFF_WIN64 &&
+         !ir_function->is_kernel && !ir_function->is_naked &&
+         !ir_function->is_interrupt && !ir_function->is_rule;
+}
+
+static int binary_append_live_thunk(CodeGenerator *generator,
+                                    BinaryEmitter *emitter,
+                                    const IRFunction *ir_function,
+                                    size_t text_section,
+                                    const char *body_name) {
+  static const unsigned char thunk[8] = {0xFF, 0x25, 0, 0, 0, 0, 0xCC, 0xCC};
+  char slot_name[512];
+  BinarySection *section = binary_emitter_get_section(emitter, text_section);
+  size_t thunk_offset = 0;
+  size_t data_section = 0;
+  size_t slot_offset = 0;
+
+  if (!section ||
+      snprintf(slot_name, sizeof(slot_name), "%s$slot", ir_function->name) >=
+          (int)sizeof(slot_name)) {
+    code_generator_set_error(generator, "Live thunk name too long for '%s'",
+                             ir_function->name);
+    return 0;
+  }
+  thunk_offset = section->size;
+  if (!binary_emitter_define_symbol(emitter, ir_function->name,
+                                    BINARY_SYMBOL_GLOBAL, text_section,
+                                    thunk_offset, 6u) ||
+      !binary_emitter_append_bytes(emitter, text_section, thunk, sizeof(thunk),
+                                   NULL) ||
+      !binary_emitter_add_relocation(emitter, text_section, thunk_offset + 2u,
+                                     BINARY_RELOCATION_REL32, slot_name, 0)) {
+    return code_generator_binary_emitter_error(generator, emitter,
+                                               "Failed to emit a live thunk");
+  }
+  data_section = binary_emitter_get_or_create_section(
+      emitter, ".data", BINARY_SECTION_DATA, 0, 8);
+  if (data_section == (size_t)-1 ||
+      !binary_emitter_align_section(emitter, data_section, 8, 0) ||
+      !binary_emitter_append_zeros(emitter, data_section, 8u, &slot_offset) ||
+      !binary_emitter_define_symbol(emitter, slot_name, BINARY_SYMBOL_GLOBAL,
+                                    data_section, slot_offset, 8u) ||
+      !binary_emitter_add_relocation(emitter, data_section, slot_offset,
+                                     BINARY_RELOCATION_ADDR64, body_name, 0)) {
+    return code_generator_binary_emitter_error(generator, emitter,
+                                               "Failed to emit a live slot");
+  }
+  return 1;
+}
+
 static int binary_record_function_relocations(
     CodeGenerator *generator, BinaryEmitter *emitter,
     const BinaryFunctionContext *context, size_t text_section,
@@ -212,6 +266,9 @@ static int binary_append_function(CodeGenerator *generator,
   BinarySection *section = NULL;
   size_t text_section = 0;
   size_t function_offset = 0;
+  const char *symbol_name = ir_function->name;
+  char body_name[512];
+  BinarySymbolBinding binding = BINARY_SYMBOL_LOCAL;
 
   if (!emitter) {
     code_generator_set_error(generator, "Binary emitter is not initialized");
@@ -221,6 +278,21 @@ static int binary_append_function(CodeGenerator *generator,
   if (text_section == (size_t)-1) {
     return code_generator_binary_emitter_error(generator, emitter,
                                  "Failed to create .text section");
+  }
+  binding = binary_function_symbol_binding(generator, ir_function);
+  if (binary_function_is_live(generator, ir_function)) {
+    if (snprintf(body_name, sizeof(body_name), "%s$body", ir_function->name) >=
+        (int)sizeof(body_name)) {
+      code_generator_set_error(generator, "Live body name too long for '%s'",
+                               ir_function->name);
+      return 0;
+    }
+    if (!binary_append_live_thunk(generator, emitter, ir_function,
+                                  text_section, body_name)) {
+      return 0;
+    }
+    symbol_name = body_name;
+    binding = BINARY_SYMBOL_GLOBAL;
   }
   if (!binary_emitter_align_section(emitter, text_section,
                                     context->wants_wide_loop_alignment
@@ -236,10 +308,9 @@ static int binary_append_function(CodeGenerator *generator,
     return 0;
   }
   function_offset = section->size;
-  if (!binary_emitter_define_symbol(
-          emitter, ir_function->name,
-          binary_function_symbol_binding(generator, ir_function), text_section,
-          function_offset, context->code.size) ||
+  if (!binary_emitter_define_symbol(emitter, symbol_name, binding,
+                                    text_section, function_offset,
+                                    context->code.size) ||
       !binary_emitter_append_bytes(emitter, text_section, context->code.data,
                                    context->code.size, NULL)) {
     return code_generator_binary_emitter_error(generator, emitter,

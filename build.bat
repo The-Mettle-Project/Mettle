@@ -448,6 +448,11 @@ bin\mettle.exe --release --emit-obj src\runtime\swap.mettle -o bin\runtime\swap.
 if %ERRORLEVEL% NEQ 0 exit /b 1
 copy /Y bin\runtime\swap.o bin\runtime\swap.obj >nul
 
+echo Compiling live patch runtime from Mettle source...
+bin\mettle.exe --release --emit-obj src\runtime\live.mettle -o bin\runtime\live.o
+if %ERRORLEVEL% NEQ 0 exit /b 1
+copy /Y bin\runtime\live.o bin\runtime\live.obj >nul
+
 echo Compiling string runtime from Mettle source...
 bin\mettle.exe --release --emit-obj src\runtime\string.mettle -o bin\runtime\string.o
 if %ERRORLEVEL% NEQ 0 exit /b 1

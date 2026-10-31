@@ -29,6 +29,7 @@ typedef struct {
   int profile_runtime;
   int assume_no_signed_overflow;
   int debug_hooks;
+  int live;
   char **profile_function_names;
   size_t profile_function_count;
   size_t profile_function_capacity;
@@ -51,6 +52,7 @@ void code_generator_set_profile_runtime(CodeGenerator *generator, int enable);
 void code_generator_set_assume_no_signed_overflow(CodeGenerator *generator,
                                                  int enable);
 void code_generator_set_debug_hooks(CodeGenerator *generator, int enable);
+void code_generator_set_live(CodeGenerator *generator, int enable);
 int code_generator_register_profile_function(CodeGenerator *generator,
                                              const char *name,
                                              uint32_t *id_out);

@@ -273,6 +273,7 @@ int ir_emit(IRLoweringContext *context, IRFunction *function,
 
 extern int g_ir_lowering_refinement_checks;
 extern int g_ir_lowering_task_checks;
+extern int g_ir_lowering_live;
 extern int g_ir_lowering_overflow_checks;
 extern int g_ir_lowering_assume_no_signed_overflow;
 int ir_emit_refinement_predicate(IRLoweringContext *context,
