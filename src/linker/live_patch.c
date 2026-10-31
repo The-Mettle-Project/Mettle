@@ -428,6 +428,19 @@ static const LinkSymbol *live_covering_symbol(const LiveObjectIndex *index,
   return found;
 }
 
+static const LinkSymbol *live_covering_external(const LiveObjectIndex *index,
+                                                size_t section, uint64_t loc) {
+  const LinkSymbol *found = NULL;
+  for (size_t i = 0; i < index->named_count[section]; i++) {
+    const LiveNamed *named = &index->named[section][i];
+    const LinkSymbol *symbol = &index->object->symbols[named->symbol];
+    if (named->value <= loc && symbol->is_external) {
+      found = symbol;
+    }
+  }
+  return found ? found : live_covering_symbol(index, section, loc, NULL);
+}
+
 static int64_t live_reloc_addend(const LinkSection *section,
                                  const LinkReloc *relocation) {
   if (relocation->addend_is_explicit) {
@@ -488,7 +501,7 @@ static LiveTarget live_classify(const LiveObjectIndex *index,
       }
       return target;
     }
-    const LinkSymbol *covering = live_covering_symbol(index, section, loc, NULL);
+    const LinkSymbol *covering = live_covering_external(index, section, loc);
     if (covering) {
       target.kind = LIVE_T_TEXT;
       target.name = covering->name;

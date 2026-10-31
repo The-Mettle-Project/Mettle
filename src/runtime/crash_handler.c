@@ -718,6 +718,17 @@ static void mettle_crash_note_image_range(void) {
   g_runtime_image_end = (uintptr_t)base + nt->OptionalHeader.SizeOfImage;
 }
 
+static int mettle_crash_address_is_live_code(uintptr_t address) {
+  MEMORY_BASIC_INFORMATION info;
+  if (address < g_runtime_image_end ||
+      address - g_runtime_image_start >= 0x80000000u ||
+      !VirtualQuery((LPCVOID)address, &info, sizeof(info))) {
+    return 0;
+  }
+  return info.State == MEM_COMMIT && info.Type == MEM_PRIVATE &&
+         (info.Protect & 0xFFu) == PAGE_EXECUTE_READ;
+}
+
 static LONG WINAPI
 mettle_crash_vectored_exception_filter(EXCEPTION_POINTERS *exception_info) {
   if (!exception_info || !exception_info->ExceptionRecord) {
@@ -726,7 +737,8 @@ mettle_crash_vectored_exception_filter(EXCEPTION_POINTERS *exception_info) {
   uintptr_t address =
       (uintptr_t)exception_info->ExceptionRecord->ExceptionAddress;
   if (g_runtime_image_end != 0 &&
-      (address < g_runtime_image_start || address >= g_runtime_image_end)) {
+      (address < g_runtime_image_start || address >= g_runtime_image_end) &&
+      !mettle_crash_address_is_live_code(address)) {
     return EXCEPTION_CONTINUE_SEARCH;
   }
   return mettle_crash_unhandled_exception_filter(exception_info);
