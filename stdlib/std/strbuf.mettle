@@ -1,4 +1,5 @@
 import "std/arena";
+import "std/conv";
 import "std/mem";
 
 export struct StrBuf {
@@ -171,6 +172,11 @@ export fn strbuf_append_hex(b: StrBuf*, n: uint64) -> int32 {
     if (strbuf_append_byte(b, tmp[i]) == 0) { return 0; }
   }
   return 1;
+}
+
+export fn strbuf_finish_string(b: StrBuf*) -> string {
+  if (b == 0) { return str_from_bytes(0, 0); }
+  return str_from_bytes(b->data, b->len);
 }
 
 export fn strbuf_finish_cstr(b: StrBuf*) -> cstring {

@@ -115,6 +115,16 @@ fn main() -> int32 {
     if (str_to_i64_or("007", 0 - 1) != 7) { return 55; }
     if (str_to_i64_or("-0", 0 - 1) != 0) { return 56; }
 
+    if (str_compare("alpha", "alpha") != 0) { return 57; }
+    if (str_compare("alpha", "alphabet") != -1) { return 58; }
+    if (str_compare("alphabet", "alpha") != 1) { return 59; }
+    if (str_compare("a", "b") != -1 || str_compare("b", "a") != 1) { return 60; }
+    if (str_compare("", "") != 0 || str_compare("", "a") != -1) { return 61; }
+    if (str_count("one two two", "two") != 2) { return 62; }
+    if (str_count("aaaa", "aa") != 2) { return 63; }
+    if (str_count("abc", "") != 4) { return 64; }
+    if (str_count("abc", "z") != 0) { return 65; }
+
     // Parsing a field sliced straight out of a larger buffer.
     var record: string = "id=907;";
     match (str_split_once(record, "=")) {

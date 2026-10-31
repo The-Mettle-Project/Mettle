@@ -18934,6 +18934,8 @@ $runFixtures = @(
      What = "narrow integer arithmetic kept more than its declared width" },
   @{ Name = "utf8"; Path = "tests/codegen/utf8.mettle"
      What = "a UTF-8 decode, encode, count or offset answered wrong, or malformed bytes were decoded as text instead of refused" },
+  @{ Name = "encoding"; Path = "tests/codegen/encoding.mettle"
+     What = "hex or Base64 encoding, decoding, size calculation or malformed-input handling answered wrong" },
   @{ Name = "characters"; Path = "tests/codegen/characters.mettle"
      What = "a character literal, a string index, a `for c in s` walk, char interpolation, or a std/conv classifier answered wrong" },
   @{ Name = "array_decay"; Path = "tests/codegen/array_decay.mettle"

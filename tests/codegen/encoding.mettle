@@ -1,0 +1,125 @@
+import "std/core";
+import "std/conv";
+import "std/encoding";
+
+fn failed(result: Result<string, string>) -> bool {
+  match (result) {
+    case Ok(value): { return false; }
+    case Err(why): { return true; }
+  }
+}
+
+fn size_is(result: Result<int64, string>, expected: int64) -> bool {
+  match (result) {
+    case Ok(value): { return value == expected; }
+    case Err(why): { return false; }
+  }
+}
+
+fn hex_roundtrip(src: string, expected: string) -> bool {
+  var encoded_buf: uint8[128];
+  var decoded_buf: uint8[64];
+  match (hex_encode(src, &encoded_buf[0], 128)) {
+    case Ok(encoded): {
+      if (encoded != expected) { return false; }
+    }
+    case Err(why): { return false; }
+  }
+  match (hex_decode(expected, &decoded_buf[0], 64)) {
+    case Ok(decoded): { return decoded == src; }
+    case Err(why): { return false; }
+  }
+}
+
+fn base64_roundtrip(src: string, expected: string) -> bool {
+  var encoded_buf: uint8[128];
+  var decoded_buf: uint8[64];
+  match (base64_encode(src, &encoded_buf[0], 128)) {
+    case Ok(encoded): {
+      if (encoded != expected) { return false; }
+    }
+    case Err(why): { return false; }
+  }
+  match (base64_decode(expected, &decoded_buf[0], 64)) {
+    case Ok(decoded): { return decoded == src; }
+    case Err(why): { return false; }
+  }
+}
+
+fn main() -> int32 {
+  if (!size_is(hex_encoded_len(3), 6)) { return 1; }
+  if (!size_is(hex_decoded_len("000f80ff"), 4)) { return 2; }
+  if (!size_is(base64_encoded_len(0), 0)) { return 3; }
+  if (!size_is(base64_encoded_len(1), 4)) { return 4; }
+  if (!size_is(base64_encoded_len(2), 4)) { return 5; }
+  if (!size_is(base64_encoded_len(3), 4)) { return 6; }
+  if (!size_is(base64_decoded_len("Zm9v"), 3)) { return 7; }
+  if (!size_is(base64_decoded_len("Zg=="), 1)) { return 8; }
+
+  if (!hex_roundtrip("", "")) { return 10; }
+  if (!hex_roundtrip("hello", "68656c6c6f")) { return 11; }
+  if (!hex_roundtrip("Hello", "48656c6c6f")) { return 12; }
+  var bytes: uint8[4];
+  bytes[0] = 0;
+  bytes[1] = 15;
+  bytes[2] = 128;
+  bytes[3] = 255;
+  var binary: string = str_from_bytes(&bytes[0], 4);
+  if (!hex_roundtrip(binary, "000f80ff")) { return 13; }
+  if (!hex_roundtrip("az", "617a")) { return 14; }
+
+  var buf: uint8[128];
+  match (hex_decode("AaFf", &buf[0], 128)) {
+    case Ok(decoded): {
+      if (decoded.length != 2 || (uint8)decoded.chars[0] != 170 ||
+          (uint8)decoded.chars[1] != 255) { return 15; }
+    }
+    case Err(why): { return 16; }
+  }
+  if (!failed(hex_decode("0", &buf[0], 128))) { return 17; }
+  if (!failed(hex_decode("xz", &buf[0], 128))) { return 18; }
+  if (!failed(hex_encode("abc", &buf[0], 5))) { return 19; }
+  if (!failed(hex_decode("abcd", &buf[0], 1))) { return 20; }
+  if (!failed(hex_encode("a", 0, 2))) { return 21; }
+  match (hex_encode("", 0, 0)) {
+    case Ok(empty): { if (empty.length != 0) { return 22; } }
+    case Err(why): { return 23; }
+  }
+
+  if (!base64_roundtrip("", "")) { return 30; }
+  if (!base64_roundtrip("f", "Zg==")) { return 31; }
+  if (!base64_roundtrip("fo", "Zm8=")) { return 32; }
+  if (!base64_roundtrip("foo", "Zm9v")) { return 33; }
+  if (!base64_roundtrip("foob", "Zm9vYg==")) { return 34; }
+  if (!base64_roundtrip("fooba", "Zm9vYmE=")) { return 35; }
+  if (!base64_roundtrip("foobar", "Zm9vYmFy")) { return 36; }
+  if (!base64_roundtrip(binary, "AA+A/w==")) { return 37; }
+  if (!base64_roundtrip("any carnal pleasure.", "YW55IGNhcm5hbCBwbGVhc3VyZS4=")) {
+    return 38;
+  }
+
+  if (!failed(base64_decode("Zg=", &buf[0], 128))) { return 40; }
+  if (!failed(base64_decode("Zg==AA==", &buf[0], 128))) { return 41; }
+  if (!failed(base64_decode("Zg=A", &buf[0], 128))) { return 42; }
+  if (!failed(base64_decode("Z===", &buf[0], 128))) { return 43; }
+  if (!failed(base64_decode("Zh==", &buf[0], 128))) { return 44; }
+  if (!failed(base64_decode("Zm9=", &buf[0], 128))) { return 45; }
+  if (!failed(base64_decode("Zm9v\n", &buf[0], 128))) { return 46; }
+  if (!failed(base64_decode("Zm-v", &buf[0], 128))) { return 47; }
+  if (!failed(base64_encode("foo", &buf[0], 3))) { return 48; }
+  if (!failed(base64_decode("Zm9v", &buf[0], 2))) { return 49; }
+  match (base64_decode("", 0, 0)) {
+    case Ok(empty): { if (empty.length != 0) { return 50; } }
+    case Err(why): { return 51; }
+  }
+
+  match (hex_encoded_len(-1)) {
+    case Ok(value): { return 60; }
+    case Err(why): { }
+  }
+  match (base64_encoded_len(9223372036854775807)) {
+    case Ok(value): { return 61; }
+    case Err(why): { }
+  }
+  return 0;
+}

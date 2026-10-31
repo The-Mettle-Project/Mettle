@@ -100,6 +100,8 @@ Searching and trimming:
 | `str_find(s: string, needle: string) -> Option<int64>` | Byte offset of the first match |
 | `str_find_byte(s: string, c: int32) -> Option<int64>` | Offset of a byte |
 | `str_contains(s: string, needle: string) -> int32` | 1 when present |
+| `str_compare(a: string, b: string) -> int32` | Unsigned-byte lexicographic ordering: -1, 0 or 1 |
+| `str_count(s: string, needle: string) -> int64` | Count non-overlapping matches; an empty needle matches at every boundary |
 | `str_starts_with(s: string, prefix: string) -> int32` | 1 when it does |
 | `str_ends_with(s: string, suffix: string) -> int32` | 1 when it does |
 | `str_eq_at(s: string, offset: int64, needle: string) -> int32` | Compare at an offset |
@@ -121,6 +123,35 @@ Numbers:
 | `format_i64(buf: uint8*, buf_len: int32, pattern: string, value: int64) -> int32` | Pattern format |
 
 `cstr_len`, `streq`, and `cstr_ncmp` work on `cstring` for the C boundary.
+
+## std/encoding
+
+Strict hexadecimal and RFC 4648 Base64 over arbitrary bytes. Both platforms.
+A `string` is a byte view here, so embedded nuls are ordinary input; use
+`str_from_bytes` to make one from a pointer and length.
+
+Size queries return `Result<int64, string>`:
+
+```text
+hex_encoded_len(src_len)       hex_decoded_len(src)
+base64_encoded_len(src_len)    base64_decoded_len(src)
+```
+
+The codecs take caller-owned output storage and return an `Ok(string)` view of
+the bytes they wrote. They allocate nothing and add no nul terminator:
+
+| Function | Effect |
+|----------|--------|
+| `hex_encode(src: string, dst: cstring, dst_cap: int64) -> Result<string, string>` | Lowercase hexadecimal |
+| `hex_decode(src: string, dst: cstring, dst_cap: int64) -> Result<string, string>` | Decode either letter case |
+| `base64_encode(src: string, dst: cstring, dst_cap: int64) -> Result<string, string>` | Standard alphabet with padding |
+| `base64_decode(src: string, dst: cstring, dst_cap: int64) -> Result<string, string>` | Strict padded Base64 |
+
+Hex rejects odd lengths and non-hex digits. Base64 rejects whitespace, the
+URL-safe alphabet, misplaced padding, lengths not divisible by four, and
+nonzero unused trailing bits. Empty input succeeds with a null destination and
+zero capacity. For nonempty output, the destination must be large enough and
+must not overlap the source. `Err` carries a static reason string.
 
 ## std/math
 
@@ -277,7 +308,69 @@ A growable byte buffer over an [arena](#stdarena). Both platforms.
 | `strbuf_append_int(b: StrBuf*, n: int64) -> int32` | Signed decimal |
 | `strbuf_append_uint(b: StrBuf*, n: uint64) -> int32` | Unsigned decimal |
 | `strbuf_append_hex(b: StrBuf*, n: uint64) -> int32` | Hexadecimal |
+| `strbuf_finish_string(b: StrBuf*) -> string` | Borrowed view; does not terminate |
 | `strbuf_finish_cstr(b: StrBuf*) -> cstring` | Terminate and hand back |
+
+The returned view or cstring remains owned by the arena and must not be freed
+separately. Take a fresh view after a later append, which can move the buffer's
+current storage.
+
+## std/collections
+
+Generic owning collections. Both platforms. Import `std/core` as well when
+matching their `Result` and `Option` returns.
+
+`List<T>` is a growable contiguous array. A zero-initialized value and
+`list_init<T>()` are both empty and ready to use:
+
+| Function | Effect |
+|----------|--------|
+| `list_reserve<T>(items: List<T>*, minimum: int64) -> Result<int32, string>` | Ensure capacity |
+| `list_push<T>(items: List<T>*, value: T) -> Result<int32, string>` | Append |
+| `list_pop<T>(items: List<T>*) -> Option<T>` | Remove and return the last element |
+| `list_get<T>(items: List<T>*, index: int64) -> Option<T>` | Checked copy |
+| `list_get_ptr<T>(items: List<T>*, index: int64) -> T*` | Checked borrowed pointer, or null |
+| `list_set<T>(items: List<T>*, index: int64, value: T) -> bool` | Checked replacement |
+| `list_remove<T>(items: List<T>*, index: int64) -> Option<T>` | Ordered removal, shifting later elements |
+| `list_clear<T>(items: List<T>*)` | Keep storage, reset length |
+| `list_free<T>(items: List<T>*)` | Release storage and reset the list |
+
+`HashMap<K, V>` is an open-addressed table with cached hashes and tombstones.
+`hash_map_init<K, V>(hash_fn, equal_fn)` takes plain function pointers of types
+`fn(rawptr) -> uint64` and `fn(rawptr, rawptr) -> bool`; the arguments point to
+keys. `std/hash` supplies ready-made callbacks for `string` and `int64` keys.
+
+| Function | Effect |
+|----------|--------|
+| `hash_map_put<K, V>(map: HashMap<K, V>*, key: K, value: V) -> Result<int32, string>` | Insert or replace |
+| `hash_map_get<K, V>(map: HashMap<K, V>*, key: K) -> Option<V>` | Checked copy |
+| `hash_map_get_ptr<K, V>(map: HashMap<K, V>*, key: K) -> V*` | Borrowed value pointer, or null |
+| `hash_map_contains<K, V>(map: HashMap<K, V>*, key: K) -> bool` | Membership |
+| `hash_map_remove<K, V>(map: HashMap<K, V>*, key: K) -> Option<V>` | Remove and return a value |
+| `hash_map_clear<K, V>(map: HashMap<K, V>*)` | Keep storage, remove every entry |
+| `hash_map_free<K, V>(map: HashMap<K, V>*)` | Release the slot array |
+
+Both collections shallow-copy their elements. They do not clone strings, free
+pointees, or run destructors, and copying the collection itself does not clone
+its storage. Pass the owning value by pointer and call its `free` exactly once.
+Pointers from `list_get_ptr` and `hash_map_get_ptr` are invalidated by growth or
+rehashing. A failed growth leaves the original collection usable.
+
+## std/hash
+
+Portable 64-bit hashing and key callbacks for `std/collections`:
+
+| Function | Effect |
+|----------|--------|
+| `hash_bytes(data: cstring, length: int64) -> uint64` | FNV-1a over bytes |
+| `hash_string(value: string) -> uint64` | FNV-1a over a string view |
+| `hash_string_ptr(value: rawptr) -> uint64` | Hash callback for a `string*` |
+| `string_equal_ptr(a: rawptr, b: rawptr) -> bool` | Equality callback for two `string*` |
+| `hash_int64_ptr(value: rawptr) -> uint64` | Mixing hash callback for an `int64*` |
+| `int64_equal_ptr(a: rawptr, b: rawptr) -> bool` | Equality callback for two `int64*` |
+
+These hashes are for hash tables, not passwords, signatures, or adversarial
+network input.
 
 ## std/utf8
 

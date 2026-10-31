@@ -29,6 +29,10 @@ fn main() -> int32 {
   if (out == 0) { return 7; }
   if (cstr_eq(out, "hello world") == 0) { return 8; }
 
+  var view: string = strbuf_finish_string(b);
+  if (view.length != (uint64)11) { return 9; }
+  if (cstr_eq(view.chars, "hello world") == 0 || view.chars != out) { return 10; }
+
   arena_free(arena);
   return 0;
 }

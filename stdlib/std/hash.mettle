@@ -1,0 +1,41 @@
+import "std/conv";
+
+export fn hash_bytes(data: cstring, length: int64) -> uint64 {
+  var hash: uint64 = (uint64)14695981039346656037;
+  if (data == 0 || length <= (int64)0) { return hash; }
+  var i: int64 = (int64)0;
+  while (i < length) {
+    hash = (hash ^ (uint64)(uint8)data[i]) * (uint64)1099511628211;
+    i = i + (int64)1;
+  }
+  return hash;
+}
+
+export fn hash_string(value: string) -> uint64 {
+  return hash_bytes(value.chars, (int64)value.length);
+}
+
+export fn hash_string_ptr(value: rawptr) -> uint64 {
+  var text: string* = (string*)value;
+  return hash_string(*text);
+}
+
+export fn string_equal_ptr(a: rawptr, b: rawptr) -> bool {
+  var left: string* = (string*)a;
+  var right: string* = (string*)b;
+  return *left == *right;
+}
+
+export fn hash_int64_ptr(value: rawptr) -> uint64 {
+  var number: int64* = (int64*)value;
+  var bits: uint64 = (uint64)*number;
+  bits = (bits ^ (bits >> (uint64)30)) * (uint64)13179938705083194719;
+  bits = (bits ^ (bits >> (uint64)27)) * (uint64)14204830363858196479;
+  return bits ^ (bits >> (uint64)31);
+}
+
+export fn int64_equal_ptr(a: rawptr, b: rawptr) -> bool {
+  var left: int64* = (int64*)a;
+  var right: int64* = (int64*)b;
+  return *left == *right;
+}

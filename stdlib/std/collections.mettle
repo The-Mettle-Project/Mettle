@@ -1,0 +1,280 @@
+import "std/core";
+import "std/mem";
+
+export struct List<T> {
+  data: T*;
+  length: int64;
+  capacity: int64;
+}
+
+export fn list_init<T>() -> List<T> {
+  var out: List<T>;
+  out.data = 0;
+  out.length = (int64)0;
+  out.capacity = (int64)0;
+  return out;
+}
+
+export fn list_reserve<T>(items: List<T>*, minimum: int64) -> Result<int32, string> {
+  if (items == 0) { return Err("null list"); }
+  if (minimum < (int64)0) { return Err("negative capacity"); }
+  if (minimum <= items->capacity) { return Ok(0); }
+
+  var new_capacity: int64 = items->capacity;
+  if (new_capacity < (int64)8) { new_capacity = (int64)8; }
+  while (new_capacity < minimum) {
+    if (new_capacity > (int64)4611686018427387903) {
+      return Err("capacity overflow");
+    }
+    new_capacity = new_capacity * (int64)2;
+  }
+
+  var allocation: T[] = new T[new_capacity];
+  var new_data: T* = allocation.data;
+  if (new_data == 0) { return Err("out of memory"); }
+  var i: int64 = (int64)0;
+  while (i < items->length) {
+    new_data[i] = items->data[i];
+    i = i + (int64)1;
+  }
+  if (items->data != 0) { free(items->data); }
+  items->data = new_data;
+  items->capacity = new_capacity;
+  return Ok(0);
+}
+
+export fn list_push<T>(items: List<T>*, value: T) -> Result<int32, string> {
+  if (items == 0) { return Err("null list"); }
+  var reserved: Result<int32, string> = list_reserve<T>(items, items->length + (int64)1);
+  match (reserved) {
+    case Ok(ignored): { }
+    case Err(why): { return Err(why); }
+  }
+  items->data[items->length] = value;
+  items->length = items->length + (int64)1;
+  return Ok(0);
+}
+
+export fn list_pop<T>(items: List<T>*) -> Option<T> {
+  if (items == 0 || items->length == (int64)0) { return None; }
+  items->length = items->length - (int64)1;
+  return Some(items->data[items->length]);
+}
+
+export fn list_get_ptr<T>(items: List<T>*, index: int64) -> T* {
+  if (items == 0 || index < (int64)0 || index >= items->length) { return 0; }
+  return &items->data[index];
+}
+
+export fn list_get<T>(items: List<T>*, index: int64) -> Option<T> {
+  var value: T* = list_get_ptr<T>(items, index);
+  if (value == 0) { return None; }
+  return Some(*value);
+}
+
+export fn list_set<T>(items: List<T>*, index: int64, value: T) -> bool {
+  var slot: T* = list_get_ptr<T>(items, index);
+  if (slot == 0) { return false; }
+  *slot = value;
+  return true;
+}
+
+export fn list_remove<T>(items: List<T>*, index: int64) -> Option<T> {
+  if (items == 0 || index < (int64)0 || index >= items->length) { return None; }
+  var removed: T = items->data[index];
+  var i: int64 = index;
+  while (i + (int64)1 < items->length) {
+    items->data[i] = items->data[i + (int64)1];
+    i = i + (int64)1;
+  }
+  items->length = items->length - (int64)1;
+  return Some(removed);
+}
+
+export fn list_clear<T>(items: List<T>*) {
+  if (items != 0) { items->length = (int64)0; }
+}
+
+export fn list_free<T>(items: List<T>*) {
+  if (items == 0) { return; }
+  if (items->data != 0) { free(items->data); }
+  items->data = 0;
+  items->length = (int64)0;
+  items->capacity = (int64)0;
+}
+
+export struct HashEntry<K, V> {
+  hash: uint64;
+  key: K;
+  value: V;
+  state: int32;
+}
+
+export struct HashMap<K, V> {
+  slots: HashEntry<K, V>*;
+  length: int64;
+  capacity: int64;
+  used: int64;
+  hash_fn: fn(rawptr) -> uint64;
+  equal_fn: fn(rawptr, rawptr) -> bool;
+}
+
+export fn hash_map_init<K, V>(hash_fn: fn(rawptr) -> uint64,
+    equal_fn: fn(rawptr, rawptr) -> bool) -> HashMap<K, V> {
+  var out: HashMap<K, V>;
+  out.slots = 0;
+  out.length = (int64)0;
+  out.capacity = (int64)0;
+  out.used = (int64)0;
+  out.hash_fn = hash_fn;
+  out.equal_fn = equal_fn;
+  return out;
+}
+
+fn hash_map_find<K, V>(map: HashMap<K, V>*, key: K, hash: uint64) -> int64 {
+  if (map->capacity == (int64)0) { return (int64)-1; }
+  var slot: int64 = (int64)(hash & (uint64)(map->capacity - (int64)1));
+  var probes: int64 = (int64)0;
+  while (probes < map->capacity) {
+    var entry: HashEntry<K, V>* = &map->slots[slot];
+    if (entry->state == 0) { return (int64)-1; }
+    if (entry->state == 1 && entry->hash == hash &&
+        map->equal_fn((rawptr)&entry->key, (rawptr)&key)) {
+      return slot;
+    }
+    slot = (slot + (int64)1) & (map->capacity - (int64)1);
+    probes = probes + (int64)1;
+  }
+  return (int64)-1;
+}
+
+fn hash_map_rehash<K, V>(map: HashMap<K, V>*, new_capacity: int64) -> int32 {
+  var allocation: HashEntry<K, V>[] = new HashEntry<K, V>[new_capacity];
+  var new_slots: HashEntry<K, V>* = allocation.data;
+  if (new_slots == 0) { return 1; }
+
+  var i: int64 = (int64)0;
+  while (i < new_capacity) {
+    new_slots[i].state = 0;
+    i = i + (int64)1;
+  }
+
+  i = (int64)0;
+  while (i < map->capacity) {
+    var old: HashEntry<K, V>* = &map->slots[i];
+    if (old->state == 1) {
+      var slot: int64 = (int64)(old->hash & (uint64)(new_capacity - (int64)1));
+      while (new_slots[slot].state == 1) {
+        slot = (slot + (int64)1) & (new_capacity - (int64)1);
+      }
+      new_slots[slot] = *old;
+    }
+    i = i + (int64)1;
+  }
+
+  if (map->slots != 0) { free(map->slots); }
+  map->slots = new_slots;
+  map->capacity = new_capacity;
+  map->used = map->length;
+  return 0;
+}
+
+fn hash_map_prepare_insert<K, V>(map: HashMap<K, V>*) -> int32 {
+  if (map->capacity != (int64)0 &&
+      (map->used + (int64)1) * (int64)10 < map->capacity * (int64)7) {
+    return 0;
+  }
+  var new_capacity: int64 = map->capacity;
+  if (new_capacity == (int64)0) {
+    new_capacity = (int64)16;
+  } else {
+    if (new_capacity > (int64)4611686018427387903) {
+      return 2;
+    }
+    new_capacity = new_capacity * (int64)2;
+  }
+  return hash_map_rehash<K, V>(map, new_capacity);
+}
+
+export fn hash_map_put<K, V>(map: HashMap<K, V>*, key: K,
+    value: V) -> Result<int32, string> {
+  if (map == 0) { return Err("null map"); }
+  var hash: uint64 = map->hash_fn((rawptr)&key);
+  var found: int64 = hash_map_find<K, V>(map, key, hash);
+  if (found >= (int64)0) {
+    map->slots[found].value = value;
+    return Ok(0);
+  }
+  var prepared: int32 = hash_map_prepare_insert<K, V>(map);
+  if (prepared == 1) { return Err("out of memory"); }
+  if (prepared == 2) { return Err("capacity overflow"); }
+
+  var slot: int64 = (int64)(hash & (uint64)(map->capacity - (int64)1));
+  var tombstone: int64 = (int64)-1;
+  while (map->slots[slot].state != 0) {
+    if (map->slots[slot].state == 2 && tombstone < (int64)0) {
+      tombstone = slot;
+    }
+    slot = (slot + (int64)1) & (map->capacity - (int64)1);
+  }
+  if (tombstone >= (int64)0) {
+    slot = tombstone;
+  } else {
+    map->used = map->used + (int64)1;
+  }
+  map->slots[slot].hash = hash;
+  map->slots[slot].key = key;
+  map->slots[slot].value = value;
+  map->slots[slot].state = 1;
+  map->length = map->length + (int64)1;
+  return Ok(0);
+}
+
+export fn hash_map_get_ptr<K, V>(map: HashMap<K, V>*, key: K) -> V* {
+  if (map == 0) { return 0; }
+  var hash: uint64 = map->hash_fn((rawptr)&key);
+  var found: int64 = hash_map_find<K, V>(map, key, hash);
+  if (found < (int64)0) { return 0; }
+  return &map->slots[found].value;
+}
+
+export fn hash_map_get<K, V>(map: HashMap<K, V>*, key: K) -> Option<V> {
+  var value: V* = hash_map_get_ptr<K, V>(map, key);
+  if (value == 0) { return None; }
+  return Some(*value);
+}
+
+export fn hash_map_contains<K, V>(map: HashMap<K, V>*, key: K) -> bool {
+  return hash_map_get_ptr<K, V>(map, key) != 0;
+}
+
+export fn hash_map_remove<K, V>(map: HashMap<K, V>*, key: K) -> Option<V> {
+  if (map == 0) { return None; }
+  var hash: uint64 = map->hash_fn((rawptr)&key);
+  var found: int64 = hash_map_find<K, V>(map, key, hash);
+  if (found < (int64)0) { return None; }
+  var removed: V = map->slots[found].value;
+  map->slots[found].state = 2;
+  map->length = map->length - (int64)1;
+  return Some(removed);
+}
+
+export fn hash_map_clear<K, V>(map: HashMap<K, V>*) {
+  if (map == 0) { return; }
+  var i: int64 = (int64)0;
+  while (i < map->capacity) {
+    map->slots[i].state = 0;
+    i = i + (int64)1;
+  }
+  map->length = (int64)0;
+  map->used = (int64)0;
+}
+
+export fn hash_map_free<K, V>(map: HashMap<K, V>*) {
+  if (map == 0) { return; }
+  if (map->slots != 0) { free(map->slots); }
+  map->slots = 0;
+  map->length = (int64)0;
+  map->capacity = (int64)0;
+  map->used = (int64)0;
+}

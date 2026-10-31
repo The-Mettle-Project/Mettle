@@ -123,6 +123,38 @@ export fn str_contains(s: string, needle: string) -> int32 {
   }
 }
 
+export fn str_compare(a: string, b: string) -> int32 {
+  var common: int64 = (int64)a.length;
+  if ((int64)b.length < common) { common = (int64)b.length; }
+  var i: int64 = 0;
+  while (i < common) {
+    var ac: int32 = (int32)(uint8)a.chars[i];
+    var bc: int32 = (int32)(uint8)b.chars[i];
+    if (ac < bc) { return -1; }
+    if (ac > bc) { return 1; }
+    i = i + 1;
+  }
+  if (a.length < b.length) { return -1; }
+  if (a.length > b.length) { return 1; }
+  return 0;
+}
+
+export fn str_count(s: string, needle: string) -> int64 {
+  var m: int64 = (int64)needle.length;
+  if (m == 0) { return (int64)s.length + 1; }
+  var count: int64 = 0;
+  var offset: int64 = 0;
+  while (offset + m <= (int64)s.length) {
+    if (str_eq_at(s, offset, needle) == 1) {
+      count = count + 1;
+      offset = offset + m;
+    } else {
+      offset = offset + 1;
+    }
+  }
+  return count;
+}
+
 export fn str_find_byte(s: string, c: int32) -> Option<int64> {
   var n: int64 = (int64)s.length;
   var i: int64 = 0;

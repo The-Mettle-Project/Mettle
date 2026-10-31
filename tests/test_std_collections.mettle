@@ -1,0 +1,171 @@
+import "std/core";
+import "std/collections";
+import "std/hash";
+
+fn succeeded(result: Result<int32, string>) -> bool {
+  match (result) {
+    case Ok(value): { return true; }
+    case Err(why): { return false; }
+  }
+}
+
+fn constant_hash(value: rawptr) -> uint64 {
+  return (uint64)1;
+}
+
+struct Pair {
+  a: int32;
+  b: int16;
+}
+
+fn list_at(items: List<int32>*, index: int64, missing: int32) -> int32 {
+  var result: Option<int32> = list_get<int32>(items, index);
+  match (result) {
+    case Some(value): { return value; }
+    case None: { return missing; }
+  }
+}
+
+fn int_map_at(map: HashMap<int64, int32>*, key: int64, missing: int32) -> int32 {
+  var result: Option<int32> = hash_map_get<int64, int32>(map, key);
+  match (result) {
+    case Some(value): { return value; }
+    case None: { return missing; }
+  }
+}
+
+fn string_map_at(map: HashMap<string, int32>*, key: string, missing: int32) -> int32 {
+  var result: Option<int32> = hash_map_get<string, int32>(map, key);
+  match (result) {
+    case Some(value): { return value; }
+    case None: { return missing; }
+  }
+}
+
+fn test_list() -> int32 {
+  var items: List<int32> = list_init<int32>();
+  if (items.length != 0 || items.capacity != 0) { return 1; }
+
+  var i: int32 = 0;
+  while (i < 100) {
+    if (!succeeded(list_push(&items, i * 3))) { return 2; }
+    i = i + 1;
+  }
+  if (items.length != 100 || items.capacity < 100) { return 3; }
+  if (!list_set(&items, 50, 9001)) { return 4; }
+  if (list_at(&items, 50, -1) != 9001) { return 5; }
+  if (list_at(&items, 100, -1) != -1) { return 7; }
+  if (list_get_ptr(&items, -1) != 0) { return 8; }
+
+  var removed: Option<int32> = list_remove<int32>(&items, 50);
+  match (removed) {
+    case Some(value): { if (value != 9001) { return 9; } }
+    case None: { return 10; }
+  }
+  if (items.length != 99) { return 11; }
+  if (list_at(&items, 50, -1) != 153) { return 12; }
+
+  var popped_result: Option<int32> = list_pop<int32>(&items);
+  var popped: int32 = -1;
+  match (popped_result) {
+    case Some(value): { popped = value; }
+    case None: { return 14; }
+  }
+  if (popped != 297 || items.length != 98) { return 15; }
+  list_clear(&items);
+  if (items.length != 0 || items.capacity == 0) { return 16; }
+  var empty_pop: Option<int32> = list_pop<int32>(&items);
+  match (empty_pop) {
+    case Some(value): { return 17; }
+    case None: { }
+  }
+  var reserved: Result<int32, string> = list_reserve<int32>(&items, 9223372036854775807);
+  match (reserved) {
+    case Ok(value): { return 18; }
+    case Err(why): { }
+  }
+  if (items.capacity == 0) { return 19; }
+  list_free(&items);
+  if (items.data != 0 || items.length != 0 || items.capacity != 0) { return 20; }
+
+  var pairs: List<Pair> = list_init<Pair>();
+  var pair: Pair;
+  pair.a = 42;
+  pair.b = 7;
+  if (!succeeded(list_push(&pairs, pair))) { return 21; }
+  var pair_result: Option<Pair> = list_get<Pair>(&pairs, 0);
+  match (pair_result) {
+    case Some(value): { if (value.a != 42 || value.b != 7) { return 22; } }
+    case None: { return 23; }
+  }
+  list_free(&pairs);
+  return 0;
+}
+
+fn test_int_map() -> int32 {
+  var map: HashMap<int64, int32> = hash_map_init<int64, int32>(
+      &constant_hash, &int64_equal_ptr);
+  var i: int64 = 0;
+  while (i < 100) {
+    if (!succeeded(hash_map_put(&map, i, (int32)(i * 2)))) { return 30; }
+    i = i + 1;
+  }
+  if (map.length != 100 || map.capacity < 100) { return 31; }
+  if (!succeeded(hash_map_put(&map, (int64)42, 999))) { return 32; }
+  if (map.length != 100 || int_map_at(&map, 42, -1) != 999) { return 34; }
+
+  i = 0;
+  while (i < 50) {
+    var removed: Option<int32> = hash_map_remove<int64, int32>(&map, i);
+    match (removed) {
+      case Some(value): {
+        var expected: int32 = (int32)(i * 2);
+        if (i == (int64)42) { expected = 999; }
+        if (value != expected) { return 36; }
+      }
+      case None: { return 37; }
+    }
+    i = i + 1;
+  }
+  if (map.length != 50 || hash_map_contains(&map, (int64)10)) { return 38; }
+  if (!hash_map_contains(&map, (int64)99)) { return 39; }
+
+  i = 100;
+  while (i < 150) {
+    if (!succeeded(hash_map_put(&map, i, (int32)i))) { return 40; }
+    i = i + 1;
+  }
+  if (map.length != 100 || !hash_map_contains(&map, (int64)149)) { return 41; }
+  var missing: Option<int32> = hash_map_remove<int64, int32>(&map, 10000);
+  match (missing) {
+    case Some(value): { return 42; }
+    case None: { }
+  }
+  hash_map_clear(&map);
+  if (map.length != 0 || map.used != 0 || hash_map_contains(&map, (int64)149)) {
+    return 43;
+  }
+  hash_map_free(&map);
+  if (map.slots != 0 || map.capacity != 0) { return 44; }
+  return 0;
+}
+
+fn test_string_map() -> int32 {
+  var map: HashMap<string, int32> = hash_map_init<string, int32>(
+      &hash_string_ptr, &string_equal_ptr);
+  if (!succeeded(hash_map_put(&map, "alpha", 1))) { return 50; }
+  if (!succeeded(hash_map_put(&map, "beta", 2))) { return 51; }
+  if (!succeeded(hash_map_put(&map, "alpha", 3))) { return 52; }
+  if (map.length != 2 || string_map_at(&map, "alpha", -1) != 3) { return 54; }
+  if (string_map_at(&map, "missing", -1) != -1) { return 56; }
+  hash_map_free(&map);
+  return 0;
+}
+
+fn main() -> int32 {
+  var result: int32 = test_list();
+  if (result != 0) { return result; }
+  result = test_int_map();
+  if (result != 0) { return result; }
+  return test_string_map();
+}

@@ -1,0 +1,203 @@
+import "std/core";
+import "std/conv";
+
+export fn hex_encoded_len(src_len: int64) -> Result<int64, string> {
+  if (src_len < (int64)0) { return Err("negative length"); }
+  if (src_len > (int64)4611686018427387903) { return Err("length overflow"); }
+  return Ok(src_len * (int64)2);
+}
+
+export fn hex_decoded_len(src: string) -> Result<int64, string> {
+  if ((src.length & (uint64)1) != (uint64)0) {
+    return Err("hex input must contain pairs of digits");
+  }
+  return Ok((int64)src.length / (int64)2);
+}
+
+fn hex_value(c: char) -> int32 {
+  if (c >= '0' && c <= '9') { return (int32)(c - '0'); }
+  if (c >= 'a' && c <= 'f') { return (int32)(c - 'a') + 10; }
+  if (c >= 'A' && c <= 'F') { return (int32)(c - 'A') + 10; }
+  return -1;
+}
+
+fn encoding_destination(dst: cstring, dst_cap: int64,
+    needed: int64) -> Result<int32, string> {
+  if (dst_cap < (int64)0) { return Err("negative destination capacity"); }
+  if (dst_cap < needed) { return Err("destination too small"); }
+  if (needed > (int64)0 && dst == 0) { return Err("null destination"); }
+  return Ok(0);
+}
+
+export fn hex_encode(src: string, dst: cstring,
+    dst_cap: int64) -> Result<string, string> {
+  var needed: int64 = (int64)0;
+  match (hex_encoded_len((int64)src.length)) {
+    case Ok(size): { needed = size; }
+    case Err(why): { return Err(why); }
+  }
+  match (encoding_destination(dst, dst_cap, needed)) {
+    case Ok(ignored): { }
+    case Err(why): { return Err(why); }
+  }
+
+  var alphabet: string = "0123456789abcdef";
+  var i: int64 = (int64)0;
+  while (i < (int64)src.length) {
+    var byte: int32 = (int32)(uint8)src.chars[i];
+    dst[i * (int64)2] = (uint8)alphabet.chars[byte >> 4];
+    dst[i * (int64)2 + (int64)1] = (uint8)alphabet.chars[byte & 15];
+    i = i + (int64)1;
+  }
+  return Ok(str_from_bytes(dst, needed));
+}
+
+export fn hex_decode(src: string, dst: cstring,
+    dst_cap: int64) -> Result<string, string> {
+  var needed: int64 = (int64)0;
+  match (hex_decoded_len(src)) {
+    case Ok(size): { needed = size; }
+    case Err(why): { return Err(why); }
+  }
+  match (encoding_destination(dst, dst_cap, needed)) {
+    case Ok(ignored): { }
+    case Err(why): { return Err(why); }
+  }
+
+  var i: int64 = (int64)0;
+  while (i < needed) {
+    var high: int32 = hex_value(src.chars[i * (int64)2]);
+    var low: int32 = hex_value(src.chars[i * (int64)2 + (int64)1]);
+    if (high < 0 || low < 0) { return Err("invalid hex digit"); }
+    dst[i] = (uint8)((high << 4) | low);
+    i = i + (int64)1;
+  }
+  return Ok(str_from_bytes(dst, needed));
+}
+
+export fn base64_encoded_len(src_len: int64) -> Result<int64, string> {
+  if (src_len < (int64)0) { return Err("negative length"); }
+  if (src_len > (int64)6917529027641081853) { return Err("length overflow"); }
+  return Ok(((src_len + (int64)2) / (int64)3) * (int64)4);
+}
+
+fn base64_value(c: char) -> int32 {
+  if (c >= 'A' && c <= 'Z') { return (int32)(c - 'A'); }
+  if (c >= 'a' && c <= 'z') { return (int32)(c - 'a') + 26; }
+  if (c >= '0' && c <= '9') { return (int32)(c - '0') + 52; }
+  if (c == '+') { return 62; }
+  if (c == '/') { return 63; }
+  return -1;
+}
+
+export fn base64_decoded_len(src: string) -> Result<int64, string> {
+  var n: int64 = (int64)src.length;
+  if (n == (int64)0) { return Ok((int64)0); }
+  if ((n & (int64)3) != (int64)0) {
+    return Err("base64 length must be a multiple of four");
+  }
+
+  var padding: int64 = (int64)0;
+  if (src.chars[n - (int64)1] == '=') { padding = (int64)1; }
+  if (padding == (int64)1 && src.chars[n - (int64)2] == '=') {
+    padding = (int64)2;
+  }
+
+  var i: int64 = (int64)0;
+  while (i < n - padding) {
+    if (src.chars[i] == '=') { return Err("invalid base64 padding"); }
+    if (base64_value(src.chars[i]) < 0) {
+      return Err("invalid base64 character");
+    }
+    i = i + (int64)1;
+  }
+
+  if (padding == (int64)1) {
+    var last: int32 = base64_value(src.chars[n - (int64)2]);
+    if ((last & 3) != 0) { return Err("non-canonical base64 trailing bits"); }
+  } else if (padding == (int64)2) {
+    var last: int32 = base64_value(src.chars[n - (int64)3]);
+    if ((last & 15) != 0) { return Err("non-canonical base64 trailing bits"); }
+  }
+
+  return Ok((n / (int64)4) * (int64)3 - padding);
+}
+
+export fn base64_encode(src: string, dst: cstring,
+    dst_cap: int64) -> Result<string, string> {
+  var needed: int64 = (int64)0;
+  match (base64_encoded_len((int64)src.length)) {
+    case Ok(size): { needed = size; }
+    case Err(why): { return Err(why); }
+  }
+  match (encoding_destination(dst, dst_cap, needed)) {
+    case Ok(ignored): { }
+    case Err(why): { return Err(why); }
+  }
+
+  var alphabet: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  var i: int64 = (int64)0;
+  var o: int64 = (int64)0;
+  while (i + (int64)3 <= (int64)src.length) {
+    var b0: int32 = (int32)(uint8)src.chars[i];
+    var b1: int32 = (int32)(uint8)src.chars[i + (int64)1];
+    var b2: int32 = (int32)(uint8)src.chars[i + (int64)2];
+    dst[o] = (uint8)alphabet.chars[b0 >> 2];
+    dst[o + (int64)1] = (uint8)alphabet.chars[((b0 << 4) | (b1 >> 4)) & 63];
+    dst[o + (int64)2] = (uint8)alphabet.chars[((b1 << 2) | (b2 >> 6)) & 63];
+    dst[o + (int64)3] = (uint8)alphabet.chars[b2 & 63];
+    i = i + (int64)3;
+    o = o + (int64)4;
+  }
+
+  var remaining: int64 = (int64)src.length - i;
+  if (remaining == (int64)1) {
+    var b0: int32 = (int32)(uint8)src.chars[i];
+    dst[o] = (uint8)alphabet.chars[b0 >> 2];
+    dst[o + (int64)1] = (uint8)alphabet.chars[(b0 << 4) & 63];
+    dst[o + (int64)2] = (uint8)61;
+    dst[o + (int64)3] = (uint8)61;
+  } else if (remaining == (int64)2) {
+    var b0: int32 = (int32)(uint8)src.chars[i];
+    var b1: int32 = (int32)(uint8)src.chars[i + (int64)1];
+    dst[o] = (uint8)alphabet.chars[b0 >> 2];
+    dst[o + (int64)1] = (uint8)alphabet.chars[((b0 << 4) | (b1 >> 4)) & 63];
+    dst[o + (int64)2] = (uint8)alphabet.chars[(b1 << 2) & 63];
+    dst[o + (int64)3] = (uint8)61;
+  }
+  return Ok(str_from_bytes(dst, needed));
+}
+
+export fn base64_decode(src: string, dst: cstring,
+    dst_cap: int64) -> Result<string, string> {
+  var needed: int64 = (int64)0;
+  match (base64_decoded_len(src)) {
+    case Ok(size): { needed = size; }
+    case Err(why): { return Err(why); }
+  }
+  match (encoding_destination(dst, dst_cap, needed)) {
+    case Ok(ignored): { }
+    case Err(why): { return Err(why); }
+  }
+
+  var i: int64 = (int64)0;
+  var o: int64 = (int64)0;
+  while (i < (int64)src.length) {
+    var a: int32 = base64_value(src.chars[i]);
+    var b: int32 = base64_value(src.chars[i + (int64)1]);
+    var c: int32 = base64_value(src.chars[i + (int64)2]);
+    var d: int32 = base64_value(src.chars[i + (int64)3]);
+    dst[o] = (uint8)((a << 2) | (b >> 4));
+    o = o + (int64)1;
+    if (src.chars[i + (int64)2] != '=') {
+      dst[o] = (uint8)((b << 4) | (c >> 2));
+      o = o + (int64)1;
+    }
+    if (src.chars[i + (int64)3] != '=') {
+      dst[o] = (uint8)((c << 6) | d);
+      o = o + (int64)1;
+    }
+    i = i + (int64)4;
+  }
+  return Ok(str_from_bytes(dst, needed));
+}
