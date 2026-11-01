@@ -277,6 +277,7 @@ extern int g_ir_lowering_live;
 int ir_lower_live_site(IRLoweringContext *context, IRFunction *function,
                        SourceLocation location);
 int ir_lower_live_program(IRLoweringContext *context, IRProgram *program);
+void ir_lower_live_forget_sources(void);
 void ir_lower_live_register_symbols(IRLoweringContext *context,
                                     IRProgram *program);
 int ir_lower_live_marks_statement(const IRFunction *function,

@@ -30,7 +30,11 @@ typedef struct {
   char running[512];
   char moving[512];
   unsigned undone;
+  size_t converted_globals;
 } LivePatchSummary;
+
+void live_set_global_layouts(const char *const *names,
+                             const char *const *layouts, size_t count);
 
 int live_write_state(const LinkResolution *resolution, uint64_t image_base,
                      const char *executable_path, char **error_message_out);

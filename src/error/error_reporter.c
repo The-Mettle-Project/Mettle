@@ -184,6 +184,25 @@ int error_reporter_register_source(ErrorReporter *reporter,
   return 1;
 }
 
+const char *error_reporter_source_for(ErrorReporter *reporter,
+                                      const char *filename) {
+  const ErrorReporterSource *entry;
+  if (!reporter) {
+    return NULL;
+  }
+  if (!filename) {
+    return reporter->source_code;
+  }
+  entry = error_reporter_find_source(reporter, filename);
+  if (entry) {
+    return entry->source_code;
+  }
+  if (reporter->filename && strcmp(reporter->filename, filename) == 0) {
+    return reporter->source_code;
+  }
+  return NULL;
+}
+
 int error_reporter_set_source_context(ErrorReporter *reporter,
                                       const char *filename,
                                       const char *source_code) {

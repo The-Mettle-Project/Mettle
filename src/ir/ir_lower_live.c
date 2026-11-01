@@ -30,6 +30,7 @@ typedef struct {
 typedef struct {
   const char *name;
   char *key;
+  char *descriptor;
   const char *type_text;
   MtlcType *type;
   long long layout;
@@ -211,6 +212,127 @@ static IROperand ir_live_new_temp(IRLoweringContext *context) {
   return operand;
 }
 
+typedef struct {
+  char *text;
+  size_t length;
+  size_t capacity;
+  int failed;
+} IRLiveText;
+
+static void ir_live_text_add(IRLiveText *out, const char *text) {
+  size_t length = strlen(text);
+  if (out->failed) {
+    return;
+  }
+  if (out->length + length + 1u > out->capacity) {
+    size_t grown = out->capacity ? out->capacity * 2u : 64u;
+    char *next;
+    while (grown < out->length + length + 1u) {
+      grown *= 2u;
+    }
+    next = realloc(out->text, grown);
+    if (!next) {
+      out->failed = 1;
+      return;
+    }
+    out->text = next;
+    out->capacity = grown;
+  }
+  memcpy(out->text + out->length, text, length + 1u);
+  out->length += length;
+}
+
+static void ir_live_text_number(IRLiveText *out, size_t value) {
+  char digits[32];
+  snprintf(digits, sizeof(digits), "%zu", value);
+  ir_live_text_add(out, digits);
+}
+
+static void ir_live_describe(IRLiveText *out, const MtlcType *type,
+                             unsigned depth) {
+  if (!type || depth > 8u) {
+    ir_live_text_add(out, "x");
+    ir_live_text_number(out, type ? type->size : 0u);
+    return;
+  }
+  switch (type->kind) {
+  case MTLC_TYPE_INT8:
+  case MTLC_TYPE_INT16:
+  case MTLC_TYPE_INT32:
+  case MTLC_TYPE_INT64:
+    ir_live_text_add(out, "i");
+    ir_live_text_number(out, type->size);
+    return;
+  case MTLC_TYPE_UINT8:
+  case MTLC_TYPE_UINT16:
+  case MTLC_TYPE_UINT32:
+  case MTLC_TYPE_UINT64:
+    ir_live_text_add(out, "u");
+    ir_live_text_number(out, type->size);
+    return;
+  case MTLC_TYPE_BOOL:
+    ir_live_text_add(out, "b");
+    ir_live_text_number(out, type->size);
+    return;
+  case MTLC_TYPE_ENUM:
+    ir_live_text_add(out, "e");
+    ir_live_text_number(out, type->size);
+    return;
+  case MTLC_TYPE_FLOAT32:
+  case MTLC_TYPE_FLOAT64:
+    ir_live_text_add(out, "f");
+    ir_live_text_number(out, type->size);
+    return;
+  case MTLC_TYPE_POINTER:
+  case MTLC_TYPE_FUNCTION_POINTER:
+    ir_live_text_add(out, "p8");
+    return;
+  case MTLC_TYPE_STRING:
+    ir_live_text_add(out, "s16");
+    return;
+  case MTLC_TYPE_ARRAY:
+    ir_live_text_add(out, "A");
+    ir_live_text_number(out, type->array_size);
+    ir_live_text_add(out, "[");
+    ir_live_describe(out, type->base_type, depth + 1u);
+    ir_live_text_add(out, "]");
+    return;
+  case MTLC_TYPE_STRUCT:
+    if (type->field_count && type->field_names && type->field_types &&
+        type->field_offsets) {
+      ir_live_text_add(out, "S");
+      ir_live_text_number(out, type->size);
+      ir_live_text_add(out, "{");
+      for (size_t i = 0; i < type->field_count; i++) {
+        ir_live_text_add(out, type->field_names[i] ? type->field_names[i]
+                                                   : "_");
+        ir_live_text_add(out, ":");
+        ir_live_text_number(out, type->field_offsets[i]);
+        ir_live_text_add(out, ":");
+        ir_live_describe(out, type->field_types[i], depth + 1u);
+        ir_live_text_add(out, ";");
+      }
+      ir_live_text_add(out, "}");
+      return;
+    }
+    break;
+  default:
+    break;
+  }
+  ir_live_text_add(out, "x");
+  ir_live_text_number(out, type->size);
+}
+
+char *ir_lower_live_descriptor(const MtlcType *type) {
+  IRLiveText out = {0};
+  ir_live_describe(&out, type, 0u);
+  if (out.failed) {
+    free(out.text);
+    return NULL;
+  }
+  return out.text;
+}
+
 static uint64_t ir_live_type_hash(const MtlcType *type, unsigned depth) {
   uint64_t hash = 1469598103934665603ull;
   if (!type) {
@@ -302,6 +424,7 @@ static char *ir_live_base_name(const char *name) {
 static void ir_live_locals_destroy(IRLiveLocals *locals) {
   for (size_t i = 0; i < locals->count; i++) {
     free(locals->items[i].key);
+    free(locals->items[i].descriptor);
     ir_operand_destroy(&locals->items[i].initial);
   }
   free(locals->items);
@@ -400,6 +523,10 @@ static int ir_live_add_local(IRLoweringContext *context, IRLiveLocals *locals,
   local->size = (long long)type->size;
   local->layout =
       (long long)(ir_live_type_hash(type, 0) & 0x7FFFFFFFFFFFFFFFull);
+  local->descriptor = ir_lower_live_descriptor(type);
+  if (!local->descriptor) {
+    return 0;
+  }
   local->scalar = ir_live_type_is_scalar(type);
   local->float_bits = type->kind == MTLC_TYPE_FLOAT32   ? 32
                       : type->kind == MTLC_TYPE_FLOAT64 ? 64
@@ -959,8 +1086,8 @@ static void ir_live_declare_helpers(IRLoweringContext *context) {
   ir_live_declare(context, IR_LIVE_QUIESCE_NAME, "");
   ir_live_declare(context, IR_LIVE_CHECK_NAME, "isis");
   ir_live_declare(context, IR_LIVE_MOVED_NAME, "isis");
-  ir_live_declare(context, IR_LIVE_PUT_NAME, "siiii");
-  ir_live_declare(context, IR_LIVE_TAKE_NAME, "siii");
+  ir_live_declare(context, IR_LIVE_PUT_NAME, "siiiis");
+  ir_live_declare(context, IR_LIVE_TAKE_NAME, "siiis");
   ir_live_declare(context, IR_LIVE_ZERO_NAME, "ii");
   ir_live_declare(context, IR_LIVE_COPY_NAME, "iii");
   ir_live_declare(context, IR_LIVE_END_NAME, "");
@@ -992,12 +1119,143 @@ int ir_lower_live_marks_statement(const IRFunction *function,
   }
 }
 
+typedef struct {
+  const char *source;
+  size_t *starts;
+  size_t count;
+} IRLiveLines;
+
+static IRLiveLines *g_ir_live_lines = NULL;
+static size_t g_ir_live_line_files = 0;
+
+void ir_lower_live_forget_sources(void) {
+  for (size_t i = 0; i < g_ir_live_line_files; i++) {
+    free(g_ir_live_lines[i].starts);
+  }
+  free(g_ir_live_lines);
+  g_ir_live_lines = NULL;
+  g_ir_live_line_files = 0;
+}
+
+static const IRLiveLines *ir_live_lines_for(const char *source) {
+  IRLiveLines *grown;
+  IRLiveLines *entry;
+  size_t count = 1;
+  size_t at = 1;
+  for (size_t i = 0; i < g_ir_live_line_files; i++) {
+    if (g_ir_live_lines[i].source == source) {
+      return &g_ir_live_lines[i];
+    }
+  }
+  for (const char *c = source; *c; c++) {
+    count += *c == '\n';
+  }
+  grown = realloc(g_ir_live_lines,
+                  (g_ir_live_line_files + 1u) * sizeof(IRLiveLines));
+  if (!grown) {
+    return NULL;
+  }
+  g_ir_live_lines = grown;
+  entry = &g_ir_live_lines[g_ir_live_line_files];
+  entry->source = source;
+  entry->count = count;
+  entry->starts = malloc(count * sizeof(size_t));
+  if (!entry->starts) {
+    return NULL;
+  }
+  entry->starts[0] = 0;
+  for (size_t i = 0; source[i]; i++) {
+    if (source[i] == '\n') {
+      entry->starts[at++] = i + 1u;
+    }
+  }
+  g_ir_live_line_files++;
+  return entry;
+}
+
+static uint64_t ir_live_source_hash(IRLoweringContext *context,
+                                    SourceLocation location,
+                                    int stop_at_brace) {
+  ErrorReporter *reporter = context && context->type_checker
+                                ? context->type_checker->error_reporter
+                                : NULL;
+  const char *source = error_reporter_source_for(reporter, location.filename);
+  const IRLiveLines *lines;
+  const char *c;
+  uint64_t hash = 1469598103934665603ull;
+  int depth = 0;
+  size_t taken = 0;
+  if (!source || location.line == 0) {
+    return 0;
+  }
+  lines = ir_live_lines_for(source);
+  if (!lines || location.line > lines->count) {
+    return 0;
+  }
+  c = source + lines->starts[location.line - 1u];
+  for (size_t column = 1; column < location.column && *c && *c != '\n';
+       column++) {
+    c++;
+  }
+  while (*c && taken < 4096u) {
+    char quote;
+    if (*c == '/' && c[1] == '/') {
+      while (*c && *c != '\n') {
+        c++;
+      }
+      continue;
+    }
+    if (*c == '\n' && depth <= 0) {
+      break;
+    }
+    if (*c == ' ' || *c == '\t' || *c == '\r' || *c == '\n') {
+      c++;
+      continue;
+    }
+    if (depth <= 0 && (*c == ';' || (stop_at_brace && *c == '{'))) {
+      break;
+    }
+    if (*c == '"' || *c == '\'') {
+      quote = *c;
+      hash = (hash ^ (unsigned char)*c++) * 1099511628211ull;
+      while (*c && *c != quote && *c != '\n') {
+        if (*c == '\\' && c[1]) {
+          hash = (hash ^ (unsigned char)*c++) * 1099511628211ull;
+        }
+        hash = (hash ^ (unsigned char)*c++) * 1099511628211ull;
+        taken++;
+      }
+      if (*c == quote) {
+        hash = (hash ^ (unsigned char)*c++) * 1099511628211ull;
+      }
+      continue;
+    }
+    if (*c == '(' || *c == '[' || *c == '{') {
+      depth++;
+    } else if (*c == ')' || *c == ']' || *c == '}') {
+      if (depth <= 0) {
+        break;
+      }
+      depth--;
+    }
+    hash = (hash ^ (unsigned char)*c++) * 1099511628211ull;
+    taken++;
+  }
+  if (taken == 0) {
+    return 0;
+  }
+  return hash ? hash : 1u;
+}
+
 int ir_lower_live_mark(IRLoweringContext *context, IRFunction *function,
                        int begin, SourceLocation location) {
   IRInstruction mark = {0};
   mark.op = IR_OP_NOP;
   mark.location = location;
   mark.text = begin ? IR_LIVE_BEGIN_MARK : IR_LIVE_END_MARK;
+  if (begin) {
+    mark.lhs = ir_operand_int((long long)ir_live_source_hash(context, location, 0));
+  }
   return ir_emit(context, function, &mark);
 }
 
@@ -1218,7 +1476,7 @@ static int ir_live_emit_put(IRLoweringContext *context, IRFunction *out,
                             const IRLiveLocal *local, int bottom,
                             SourceLocation location) {
   IROperand place = ir_live_new_temp(context);
-  IROperand arguments[5];
+  IROperand arguments[6];
   IROperand none = ir_operand_none();
   int ok = 1;
   int keep_flag = 0;
@@ -1260,9 +1518,10 @@ static int ir_live_emit_put(IRLoweringContext *context, IRFunction *out,
   } else {
     arguments[4] = ir_operand_int(0);
   }
-  ok = ok && ir_live_emit_call(context, out, IR_LIVE_PUT_NAME, arguments, 5,
+  arguments[5] = ir_operand_string(local->descriptor);
+  ok = ok && ir_live_emit_call(context, out, IR_LIVE_PUT_NAME, arguments, 6,
                                &none, location);
-  for (size_t i = 0; i < 5; i++) {
+  for (size_t i = 0; i < 6; i++) {
     ir_operand_destroy(&arguments[i]);
   }
   return ok;
@@ -1399,16 +1658,17 @@ static int ir_live_emit_clone_transfer(IRLoweringContext *context,
 static int ir_live_emit_take(IRLoweringContext *context, IRFunction *out,
                              const IRLiveLocal *local, int want_storage,
                              IROperand *found, SourceLocation location) {
-  IROperand arguments[4];
+  IROperand arguments[5];
   int ok;
   *found = ir_live_new_temp(context);
   arguments[0] = ir_operand_string(local->key);
   arguments[1] = ir_operand_int(local->layout);
   arguments[2] = ir_operand_int(local->size);
   arguments[3] = ir_operand_int(want_storage);
-  ok = ir_live_emit_call(context, out, IR_LIVE_TAKE_NAME, arguments, 4, found,
+  arguments[4] = ir_operand_string(local->descriptor);
+  ok = ir_live_emit_call(context, out, IR_LIVE_TAKE_NAME, arguments, 5, found,
                          location);
-  for (size_t i = 0; i < 4; i++) {
+  for (size_t i = 0; i < 5; i++) {
     ir_operand_destroy(&arguments[i]);
   }
   return ok;
@@ -1476,7 +1736,46 @@ static int ir_live_compare_size(const void *a, const void *b) {
   return x[1] < y[1] ? 1 : (x[1] > y[1] ? -1 : 0);
 }
 
-static uint64_t ir_live_loop_signature(const IRFunction *function,
+static uint64_t ir_live_header_hash(IRLoweringContext *context,
+                                    const IRFunction *function,
+                                    const IRBasicBlock *header) {
+  uint64_t hash = 1469598103934665603ull;
+  size_t last_line = 0;
+  size_t last_column = 0;
+  int found = 0;
+  for (size_t i = header->first_instruction;
+       i < header->first_instruction + header->instruction_count &&
+       i < function->instruction_count;
+       i++) {
+    const IRInstruction *in = &function->instructions[i];
+    uint64_t piece;
+    if (in->op == IR_OP_NOP || in->op == IR_OP_LABEL ||
+        in->location.line == 0 ||
+        (in->location.line == last_line &&
+         in->location.column == last_column)) {
+      continue;
+    }
+    last_line = in->location.line;
+    last_column = in->location.column;
+    piece = ir_live_source_hash(context, in->location, 1);
+    if (piece == 0) {
+      return ir_live_range_hash(function, header->first_instruction,
+                                header->first_instruction +
+                                    header->instruction_count);
+    }
+    hash = ir_live_mix(hash, piece);
+    found = 1;
+  }
+  if (!found) {
+    return ir_live_range_hash(function, header->first_instruction,
+                              header->first_instruction +
+                                  header->instruction_count);
+  }
+  return hash;
+}
+
+static uint64_t ir_live_loop_signature(IRLoweringContext *context,
+                                       const IRFunction *function,
                                        const IRLiveShape *shape,
                                        size_t block) {
   size_t (*pairs)[2] = NULL;
@@ -1500,10 +1799,7 @@ static uint64_t ir_live_loop_signature(const IRFunction *function,
   qsort(pairs, count, sizeof(*pairs), ir_live_compare_size);
   for (size_t i = 0; i < count; i++) {
     const IRBasicBlock *header = &function->blocks[pairs[i][0]];
-    hash = ir_live_mix(hash, ir_live_range_hash(function,
-                                                header->first_instruction,
-                                                header->first_instruction +
-                                                    header->instruction_count));
+    hash = ir_live_mix(hash, ir_live_header_hash(context, function, header));
   }
   free(pairs);
   return hash;
@@ -2258,7 +2554,11 @@ static int ir_live_process(IRLoweringContext *context, IRProgram *program,
         ranges = grown;
         ranges[range_count].begin = begin;
         ranges[range_count].end = i;
-        ranges[range_count].hash = ir_live_range_hash(function, begin + 1u, i);
+        ranges[range_count].hash =
+            function->instructions[begin].lhs.kind == IR_OPERAND_INT &&
+                    function->instructions[begin].lhs.int_value != 0
+                ? (uint64_t)function->instructions[begin].lhs.int_value
+                : ir_live_range_hash(function, begin + 1u, i);
         ranges[range_count].is_site = 0;
         for (size_t k = begin + 1u; k < i; k++) {
           const IRInstruction *call = &function->instructions[k];
@@ -2339,7 +2639,8 @@ static int ir_live_process(IRLoweringContext *context, IRProgram *program,
     combined = ir_live_mix(combined, statement);
     combined = ir_live_mix(combined, previous);
     combined = ir_live_mix(combined,
-                           ir_live_loop_signature(function, &shape, block));
+                           ir_live_loop_signature(context, function, &shape,
+                                                  block));
     site->key = combined;
   }
   for (size_t j = site_count; j-- > 0;) {
@@ -2477,6 +2778,7 @@ int ir_lower_live_program(IRLoweringContext *context, IRProgram *program) {
     }
   }
   ir_live_map_destroy(&mayq);
+  ir_lower_live_forget_sources();
   return ok;
 }
 

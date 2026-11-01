@@ -865,7 +865,8 @@ int code_generator_binary_collect_global_constants(CodeGenerator *generator) {
       int_value = (long long)float_value;
     }
 
-    int is_const = sym->name && !binary_written_set_contains(&written, sym->name);
+    int is_const = !generator->live && sym->name &&
+                   !binary_written_set_contains(&written, sym->name);
     if (!binary_global_const_table_add(sym->name, int_value, float_value,
                                        sym->init_is_float, is_const)) {
       code_generator_set_error(

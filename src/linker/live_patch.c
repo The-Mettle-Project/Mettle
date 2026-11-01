@@ -125,6 +125,9 @@ typedef struct {
   LiveMap signatures;
   unsigned *applied;
   size_t applied_count;
+  char **layout_names;
+  char **layout_texts;
+  size_t layout_count;
 } LiveState;
 
 static int live_state_push_applied(LiveState *state, unsigned index) {
@@ -136,6 +139,89 @@ static int live_state_push_applied(LiveState *state, unsigned index) {
   state->applied = grown;
   state->applied[state->applied_count++] = index;
   return 1;
+}
+
+static char **g_live_layout_names = NULL;
+static char **g_live_layout_texts = NULL;
+static size_t g_live_layout_count = 0;
+
+void live_set_global_layouts(const char *const *names,
+                             const char *const *layouts, size_t count) {
+  for (size_t i = 0; i < g_live_layout_count; i++) {
+    free(g_live_layout_names[i]);
+    free(g_live_layout_texts[i]);
+  }
+  free(g_live_layout_names);
+  free(g_live_layout_texts);
+  g_live_layout_names = calloc(count ? count : 1u, sizeof(char *));
+  g_live_layout_texts = calloc(count ? count : 1u, sizeof(char *));
+  g_live_layout_count = 0;
+  if (!g_live_layout_names || !g_live_layout_texts) {
+    return;
+  }
+  for (size_t i = 0; i < count; i++) {
+    g_live_layout_names[i] = mettle_strdup(names[i]);
+    g_live_layout_texts[i] = mettle_strdup(layouts[i]);
+    if (g_live_layout_names[i] && g_live_layout_texts[i]) {
+      g_live_layout_count++;
+    }
+  }
+}
+
+static const char *live_registry_layout(const char *name) {
+  for (size_t i = 0; i < g_live_layout_count; i++) {
+    if (strcmp(g_live_layout_names[i], name) == 0) {
+      return g_live_layout_texts[i];
+    }
+  }
+  return NULL;
+}
+
+static int live_state_set_layout(LiveState *state, const char *name,
+                                 const char *layout) {
+  char **names;
+  char **texts;
+  for (size_t i = 0; i < state->layout_count; i++) {
+    if (strcmp(state->layout_names[i], name) == 0) {
+      char *copy = mettle_strdup(layout);
+      if (!copy) {
+        return 0;
+      }
+      free(state->layout_texts[i]);
+      state->layout_texts[i] = copy;
+      return 1;
+    }
+  }
+  names = realloc(state->layout_names,
+                  (state->layout_count + 1u) * sizeof(char *));
+  if (!names) {
+    return 0;
+  }
+  state->layout_names = names;
+  texts = realloc(state->layout_texts,
+                  (state->layout_count + 1u) * sizeof(char *));
+  if (!texts) {
+    return 0;
+  }
+  state->layout_texts = texts;
+  state->layout_names[state->layout_count] = mettle_strdup(name);
+  state->layout_texts[state->layout_count] = mettle_strdup(layout);
+  if (!state->layout_names[state->layout_count] ||
+      !state->layout_texts[state->layout_count]) {
+    return 0;
+  }
+  state->layout_count++;
+  return 1;
+}
+
+static const char *live_state_layout(const LiveState *state,
+                                     const char *name) {
+  for (size_t i = 0; i < state->layout_count; i++) {
+    if (strcmp(state->layout_names[i], name) == 0) {
+      return state->layout_texts[i];
+    }
+  }
+  return NULL;
 }
 
 static int live_copy_file(const char *from, const char *to) {
@@ -906,6 +992,9 @@ static int live_state_save(const LiveState *state, const char *path,
   for (size_t i = 0; i < state->applied_count; i++) {
     fprintf(file, "a %u\n", state->applied[i]);
   }
+  for (size_t i = 0; i < state->layout_count; i++) {
+    fprintf(file, "t %s %s\n", state->layout_names[i], state->layout_texts[i]);
+  }
   for (size_t i = 0; i < state->symbols.capacity; i++) {
     const LiveEntry *entry = &state->symbols.items[i];
     if (entry->key) {
@@ -955,7 +1044,7 @@ static int live_state_save(const LiveState *state, const char *path,
 static int live_state_load(LiveState *state, const char *path,
                            char **error_message_out) {
   FILE *file = fopen(path, "rb");
-  char line[4096];
+  static char line[65536];
   memset(state, 0, sizeof(*state));
   if (!file) {
     mettle_set_error(error_message_out,
@@ -993,6 +1082,17 @@ static int live_state_load(LiveState *state, const char *path,
       state->arena_used = c;
     } else if (sscanf(line, "patch %llu", &a) == 1) {
       state->patch_index = (unsigned)a;
+    } else if (line[0] == 't' && line[1] == ' ') {
+      char *space = strchr(line + 2, ' ');
+      if (space) {
+        *space = '\0';
+        if (!live_state_set_layout(state, line + 2, space + 1)) {
+          fclose(file);
+          mettle_set_error(error_message_out, "Out of memory reading '%s'",
+                           path);
+          return 0;
+        }
+      }
     } else if (line[0] == 'a' && line[1] == ' ' &&
                sscanf(line + 2, "%llu", &a) == 1 && !strchr(line + 2, ' ')) {
       if (!live_state_push_applied(state, (unsigned)a)) {
@@ -1022,6 +1122,15 @@ static int live_state_load(LiveState *state, const char *path,
 }
 
 static void live_state_destroy(LiveState *state) {
+  for (size_t i = 0; i < state->layout_count; i++) {
+    free(state->layout_names[i]);
+    free(state->layout_texts[i]);
+  }
+  free(state->layout_names);
+  free(state->layout_texts);
+  state->layout_names = NULL;
+  state->layout_texts = NULL;
+  state->layout_count = 0;
   free(state->applied);
   state->applied = NULL;
   state->applied_count = 0;
@@ -1101,6 +1210,12 @@ int live_write_state(const LinkResolution *resolution, uint64_t image_base,
       goto done;
     }
   }
+  for (size_t i = 0; i < g_live_layout_count; i++) {
+    if (!live_state_set_layout(&state, g_live_layout_names[i],
+                               g_live_layout_texts[i])) {
+      goto done;
+    }
+  }
   path = live_join(executable_path, ".live");
   ok = path && live_state_save(&state, path, error_message_out);
   for (unsigned stale = 1u; ok; stale++) {
@@ -1147,6 +1262,8 @@ typedef struct {
   uint32_t debug_location_count;
   LiveBuffer imports;
   uint32_t import_count;
+  LiveBuffer migrations;
+  uint32_t migration_count;
   LiveMap import_slots;
   char **error_message_out;
 } LiveBuilder;
@@ -1391,6 +1508,85 @@ static int live_import(LiveBuilder *builder, const char *symbol,
   return 1;
 }
 
+static int live_function_references(const LiveObjectIndex *index,
+                                    size_t function_index, const char *name) {
+  const LiveFunction *function = &index->functions[function_index];
+  const LinkSection *source = &index->object->sections[function->section];
+  for (size_t i = 0; i < source->relocation_count; i++) {
+    const LinkReloc *relocation = &source->relocations[i];
+    LiveTarget target;
+    if (relocation->offset < function->body_offset ||
+        relocation->offset >= function->end) {
+      continue;
+    }
+    target = live_classify(index, relocation->symbol_index,
+                           live_reloc_addend(source, relocation));
+    if (target.kind == LIVE_T_GLOBAL && target.name &&
+        strcmp(target.name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int live_migrate_global(LiveBuilder *builder, const char *name,
+                               const LinkSymbol *symbol,
+                               const char *old_layout,
+                               const char *new_layout) {
+  LiveEntry *old_entry = live_map_find(&builder->state->symbols, name);
+  uint64_t size = live_global_size(builder->index, symbol);
+  uint64_t offset = (builder->state->arena_used + 15u) & ~(uint64_t)15u;
+  uint64_t rva;
+  uint64_t old_rva;
+  uint64_t old_text;
+  uint64_t new_text;
+  if (!old_entry || size == 0) {
+    return live_builder_fail(builder, "Cannot move the global '%s'", name);
+  }
+  if (offset + size > builder->state->arena_size) {
+    return live_builder_fail(builder,
+                             "The running program has no room left to give "
+                             "'%s' its new layout. Restart it",
+                             name);
+  }
+  old_rva = old_entry->a;
+  rva = builder->state->arena_rva + offset;
+  builder->state->arena_used = offset + size;
+  if (!live_buffer_align(&builder->blob, 8u, 0)) {
+    return 0;
+  }
+  old_text = builder->blob.size;
+  if (!live_buffer_append(&builder->blob, old_layout, strlen(old_layout)) ||
+      !live_buffer_align(&builder->blob, 8u, 0)) {
+    return 0;
+  }
+  new_text = builder->blob.size;
+  if (!live_buffer_append(&builder->blob, new_layout, strlen(new_layout)) ||
+      !live_buffer_u32(&builder->migrations, (uint32_t)old_rva) ||
+      !live_buffer_u32(&builder->migrations, (uint32_t)rva) ||
+      !live_buffer_u32(&builder->migrations, (uint32_t)size) ||
+      !live_buffer_u32(&builder->migrations, (uint32_t)old_text) ||
+      !live_buffer_u32(&builder->migrations, (uint32_t)strlen(old_layout)) ||
+      !live_buffer_u32(&builder->migrations, (uint32_t)new_text) ||
+      !live_buffer_u32(&builder->migrations, (uint32_t)strlen(new_layout)) ||
+      !live_buffer_u32(&builder->migrations, 0u) ||
+      !live_map_put(&builder->state->symbols, name, rva, 0) ||
+      !live_map_put(&builder->state->sizes, name, size, 0) ||
+      !live_state_set_layout(builder->state, name, new_layout)) {
+    return 0;
+  }
+  builder->migration_count++;
+  for (size_t f = 0; f < builder->index->function_count; f++) {
+    uint64_t ignored = 0;
+    if (builder->function_piece[f] == LIVE_NONE &&
+        live_function_references(builder->index, f, name) &&
+        !live_ensure_function(builder, f, &ignored)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int live_resolve(LiveBuilder *builder, const LiveTarget *target,
                         uint64_t *value_out, int *host_out) {
   LiveEntry *entry = NULL;
@@ -1436,8 +1632,21 @@ static int live_resolve(LiveBuilder *builder, const LiveTarget *target,
       LiveEntry *size = live_map_find(&builder->state->sizes, target->name);
       const LinkSymbol *symbol =
           link_object_find_symbol(builder->index->object, target->name);
-      if (size && symbol && live_symbol_is_named(symbol) &&
-          live_global_size(builder->index, symbol) != size->a) {
+      const char *old_layout = live_state_layout(builder->state, target->name);
+      const char *new_layout = live_registry_layout(target->name);
+      int resized = size && symbol && live_symbol_is_named(symbol) &&
+                    live_global_size(builder->index, symbol) != size->a;
+      if (old_layout && new_layout && symbol && live_symbol_is_named(symbol) &&
+          (resized || strcmp(old_layout, new_layout) != 0)) {
+        if (!live_migrate_global(builder, target->name, symbol, old_layout,
+                                 new_layout)) {
+          return 0;
+        }
+        entry = live_map_find(&builder->state->symbols, target->name);
+        *value_out = entry->a + (uint64_t)target->delta;
+        return 1;
+      }
+      if (resized) {
         return live_builder_fail(builder,
                                  "The global '%s' changed size, so the running "
                                  "program's value no longer fits. Restart to "
@@ -1807,6 +2016,7 @@ static int live_write_patch(LiveBuilder *builder, const char *path) {
            live_buffer_u32(&out, builder->import_count) &&
            live_buffer_u32(&out, (uint32_t)builder->imports.size) &&
            live_buffer_u32(&out, 0u) &&
+           live_buffer_u32(&out, builder->migration_count) &&
            live_buffer_append(&out, NULL, LIVE_PATCH_HEADER_SIZE - out.size) &&
            live_buffer_append(&out, builder->blob.data, builder->blob.size) &&
            live_buffer_align(&out, 8u, 0);
@@ -1825,8 +2035,10 @@ static int live_write_patch(LiveBuilder *builder, const char *path) {
          live_buffer_u64(&out, builder->inits[i].blob_offset) &&
          live_buffer_u64(&out, builder->inits[i].size);
   }
-  ok = ok && live_buffer_append(&out, builder->imports.data,
-                                builder->imports.size);
+  ok = ok &&
+       live_buffer_append(&out, builder->imports.data, builder->imports.size) &&
+       live_buffer_append(&out, builder->migrations.data,
+                          builder->migrations.size);
   if (ok) {
     file = fopen(temporary, "wb");
     ok = file && fwrite(out.data, 1u, out.size, file) == out.size;
@@ -2060,6 +2272,7 @@ done:
     summary->new_functions = builder.created;
     summary->continuations = builder.continuations;
     summary->new_globals = builder.new_globals;
+    summary->converted_globals = builder.migration_count;
     summary->blob_size = builder.blob.size;
   }
   if (!ok && error_message_out && !*error_message_out) {
@@ -2067,6 +2280,7 @@ done:
   }
   free(builder.blob.data);
   free(builder.imports.data);
+  free(builder.migrations.data);
   live_map_destroy(&builder.import_slots);
   free(builder.pieces);
   free(builder.fixups);

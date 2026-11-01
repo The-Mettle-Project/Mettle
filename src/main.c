@@ -5088,6 +5088,11 @@ int main(int argc, char *argv[]) {
         printf(", %zu new global%s", summary.new_globals,
                summary.new_globals == 1u ? "" : "s");
       }
+      if (summary.converted_globals) {
+        printf(", %zu global%s converted to a new layout",
+               summary.converted_globals,
+               summary.converted_globals == 1u ? "" : "s");
+      }
       printf(")\n");
       if (summary.moving[0]) {
         printf("  running frames of %s move to the new code at the next "
@@ -5697,6 +5702,33 @@ static int machine_emulate(const MachineDesc *desc, ASTNode *program_node,
   return 0;
 }
 
+static void live_record_global_layouts(const IRProgram *program) {
+  const char **names = calloc(program->module_symbol_count + 1u,
+                              sizeof(const char *));
+  char **layouts = calloc(program->module_symbol_count + 1u, sizeof(char *));
+  size_t count = 0;
+  if (names && layouts) {
+    for (size_t i = 0; i < program->module_symbol_count; i++) {
+      const IRModuleSymbol *symbol = &program->module_symbols[i];
+      if (symbol->kind != IR_MODSYM_VARIABLE || symbol->is_extern ||
+          !symbol->type || !symbol->name) {
+        continue;
+      }
+      layouts[count] = ir_lower_live_descriptor(symbol->type);
+      if (layouts[count]) {
+        names[count] = symbol->name;
+        count++;
+      }
+    }
+    live_set_global_layouts(names, (const char *const *)layouts, count);
+  }
+  for (size_t i = 0; layouts && i < count; i++) {
+    free(layouts[i]);
+  }
+  free(names);
+  free(layouts);
+}
+
 static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
                                SymbolTable *symbol_table,
                                int emit_runtime_checks, int emit_safety_checks,
@@ -5705,6 +5737,9 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
   *out_ir_program =
       ir_lower_program(program, type_checker, symbol_table, out_ir_error,
                        emit_runtime_checks, emit_safety_checks);
+  if (*out_ir_program) {
+    live_record_global_layouts(*out_ir_program);
+  }
   if (!*out_ir_program) {
     if (type_checker && type_checker->error_reporter &&
         error_reporter_has_errors(type_checker->error_reporter)) {
@@ -5888,7 +5923,8 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   }
   size_t global_const_count = 0;
   IRGlobalIntConst *global_consts =
-      collect_global_int_consts(ast_program, &global_const_count);
+      options->live ? NULL
+                    : collect_global_int_consts(ast_program, &global_const_count);
   ir_optimize_options.global_int_consts = global_consts;
   ir_optimize_options.global_int_const_count = global_const_count;
   ir_optimize_options.whole_program = options->building_executable;

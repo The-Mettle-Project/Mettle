@@ -91,6 +91,8 @@ int error_reporter_set_source_context(ErrorReporter *reporter,
                                       const char *source_code);
 const char *error_reporter_current_filename(ErrorReporter *reporter);
 const char *error_reporter_current_source_code(ErrorReporter *reporter);
+const char *error_reporter_source_for(ErrorReporter *reporter,
+                                      const char *filename);
 
 void error_reporter_add_error(ErrorReporter *reporter, ErrorType type,
                               SourceLocation location, const char *message);

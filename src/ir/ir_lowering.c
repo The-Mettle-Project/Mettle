@@ -102,6 +102,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   context.emit_overflow_checks = g_ir_lowering_overflow_checks;
   context.assume_no_signed_overflow = g_ir_lowering_assume_no_signed_overflow;
   context.program = ir_program;
+  ir_lower_live_forget_sources();
 
   Program *program_data = (Program *)program->data;
   if (!program_data) {
