@@ -209,51 +209,48 @@ static uint64_t binary_live_signature(const IRFunction *ir_function) {
   return hash;
 }
 
-static int binary_append_live_thunk(CodeGenerator *generator,
+static int binary_append_live_entry(CodeGenerator *generator,
                                     BinaryEmitter *emitter,
                                     const IRFunction *ir_function,
-                                    size_t text_section,
-                                    const char *body_name) {
-  unsigned char thunk[16] = {0xFF, 0x25, 0, 0, 0, 0, 0xCC, 0xCC};
+                                    size_t text_section, const char *body_name,
+                                    size_t alignment, size_t code_size) {
+  static const unsigned char filler[64] = {
+      0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+      0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+      0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+      0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+      0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+      0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+  unsigned char entry[16] = {0, 0, 0, 0, 0, 0, 0, 0,
+                             0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
   uint64_t signature = binary_live_signature(ir_function);
-  char slot_name[512];
   BinarySection *section = binary_emitter_get_section(emitter, text_section);
-  size_t thunk_offset = 0;
-  size_t data_section = 0;
-  size_t slot_offset = 0;
+  size_t start = 0;
+  size_t code_start = 0;
 
-  if (!section ||
-      snprintf(slot_name, sizeof(slot_name), "%s$slot", ir_function->name) >=
-          (int)sizeof(slot_name)) {
-    code_generator_set_error(generator, "Live thunk name too long for '%s'",
+  if (!section || alignment == 0u || alignment > sizeof(filler)) {
+    code_generator_set_error(generator, "Cannot place the live entry of '%s'",
                              ir_function->name);
     return 0;
   }
+  start = section->size;
+  code_start = (start + 16u + alignment - 1u) / alignment * alignment;
   for (size_t i = 0; i < 8u; i++) {
-    thunk[8u + i] = (unsigned char)(signature >> (8u * i));
+    entry[i] = (unsigned char)(signature >> (8u * i));
   }
-  thunk_offset = section->size;
-  if (!binary_emitter_define_symbol(emitter, ir_function->name,
-                                    BINARY_SYMBOL_GLOBAL, text_section,
-                                    thunk_offset, 6u) ||
-      !binary_emitter_append_bytes(emitter, text_section, thunk, sizeof(thunk),
+  if ((code_start - 16u > start &&
+       !binary_emitter_append_bytes(emitter, text_section, filler,
+                                    code_start - 16u - start, NULL)) ||
+      !binary_emitter_append_bytes(emitter, text_section, entry, sizeof(entry),
                                    NULL) ||
-      !binary_emitter_add_relocation(emitter, text_section, thunk_offset + 2u,
-                                     BINARY_RELOCATION_REL32, slot_name, 0)) {
+      !binary_emitter_define_symbol(emitter, ir_function->name,
+                                    BINARY_SYMBOL_GLOBAL, text_section,
+                                    code_start - 8u, code_size + 8u) ||
+      !binary_emitter_define_symbol(emitter, body_name, BINARY_SYMBOL_GLOBAL,
+                                    text_section, code_start - 8u,
+                                    code_size + 8u)) {
     return code_generator_binary_emitter_error(generator, emitter,
-                                               "Failed to emit a live thunk");
-  }
-  data_section = binary_emitter_get_or_create_section(
-      emitter, ".data", BINARY_SECTION_DATA, 0, 8);
-  if (data_section == (size_t)-1 ||
-      !binary_emitter_align_section(emitter, data_section, 8, 0) ||
-      !binary_emitter_append_zeros(emitter, data_section, 8u, &slot_offset) ||
-      !binary_emitter_define_symbol(emitter, slot_name, BINARY_SYMBOL_GLOBAL,
-                                    data_section, slot_offset, 8u) ||
-      !binary_emitter_add_relocation(emitter, data_section, slot_offset,
-                                     BINARY_RELOCATION_ADDR64, body_name, 0)) {
-    return code_generator_binary_emitter_error(generator, emitter,
-                                               "Failed to emit a live slot");
+                                               "Failed to emit a live entry");
   }
   return 1;
 }
@@ -296,6 +293,7 @@ static int binary_append_function(CodeGenerator *generator,
   const char *symbol_name = ir_function->name;
   char body_name[512];
   BinarySymbolBinding binding = BINARY_SYMBOL_LOCAL;
+  int live_entry = 0;
 
   if (!emitter) {
     code_generator_set_error(generator, "Binary emitter is not initialized");
@@ -309,19 +307,22 @@ static int binary_append_function(CodeGenerator *generator,
   binding = generator->live
                 ? BINARY_SYMBOL_GLOBAL
                 : binary_function_symbol_binding(generator, ir_function);
-  if (binary_function_is_live(generator, ir_function)) {
+  live_entry = binary_function_is_live(generator, ir_function);
+  if (live_entry) {
     if (snprintf(body_name, sizeof(body_name), "%s$body", ir_function->name) >=
         (int)sizeof(body_name)) {
       code_generator_set_error(generator, "Live body name too long for '%s'",
                                ir_function->name);
       return 0;
     }
-    if (!binary_append_live_thunk(generator, emitter, ir_function,
-                                  text_section, body_name)) {
+    if (!binary_append_live_entry(generator, emitter, ir_function,
+                                  text_section, body_name,
+                                  context->wants_wide_loop_alignment
+                                      ? (size_t)BINARY_LOOP_ALIGN_BIG
+                                      : (size_t)BINARY_TEXT_SECTION_ALIGNMENT,
+                                  context->code.size)) {
       return 0;
     }
-    symbol_name = body_name;
-    binding = BINARY_SYMBOL_GLOBAL;
   }
   if (!binary_emitter_align_section(emitter, text_section,
                                     context->wants_wide_loop_alignment
@@ -337,9 +338,10 @@ static int binary_append_function(CodeGenerator *generator,
     return 0;
   }
   function_offset = section->size;
-  if (!binary_emitter_define_symbol(emitter, symbol_name, binding,
-                                    text_section, function_offset,
-                                    context->code.size) ||
+  if ((!live_entry &&
+       !binary_emitter_define_symbol(emitter, symbol_name, binding,
+                                     text_section, function_offset,
+                                     context->code.size)) ||
       !binary_emitter_append_bytes(emitter, text_section, context->code.data,
                                    context->code.size, NULL)) {
     return code_generator_binary_emitter_error(generator, emitter,

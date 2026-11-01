@@ -44,8 +44,9 @@ Windows x64 and Linux x64.
 - On Windows, functions imported from DLLs the program never called before:
   the patch binds them when it loads.
 
-The running program keeps the value of every variable that already existed.
-Changing a variable's initializer does not reset it.
+The running program keeps the value of every `var` that already existed.
+Changing its initializer does not reset it. A `const` follows the source:
+changing one patches every function that uses it.
 
 ## Moving running frames
 
@@ -65,7 +66,7 @@ sequenceDiagram
     Old->>New: call with the statement key
     Rt-->>New: take locals by name
     New->>New: runs the rest of main
-    Note over Old,New: a later patch returns to main's loop, which calls the newest main$resume
+    Note over Old,New: when a later patch moves main$resume, it hands control back to main, which calls the newest main$resume
 ```
 
 - A local keeps its value when its name is the same. When its type changed,
@@ -128,14 +129,24 @@ original build.
 
 Patches apply on the thread that reaches `quiesce;`. On Windows every other
 thread is suspended while slots are stored and variables are converted. On
-Linux the other threads keep running, and each slot store is a single aligned
-eight-byte write, so a thread calls either the old or the new function. A frame
+Linux the other threads keep running, and each function entry is rewritten by
+one aligned eight-byte store, so a thread calls either the old or the new
+function. A frame
 moves only on the thread that runs it, at its own next site.
 
 ## Crashes in patched code
 
-A patch carries line tables for its functions. A crash inside patched code
-prints the function and line from the source the patch was built from.
+A patch carries line tables for its functions. In a program built with `-s`,
+a crash inside patched code prints the function and line from the source the
+patch was built from:
+
+```text
+Fatal error: null pointer dereference
+  --> s.mettle:8:9 in step
+Stack trace:
+  #0 step at s.mettle:8:9 (0x00000001401C0038)
+  #1 main at s.mettle:14:21 (0x000000014000B887)
+```
 
 ## What it refuses
 
@@ -165,11 +176,12 @@ image.
   function, changed or not.
 - `mettle --live-undo app.exe` undoes the latest patch.
 
-In a `--live` build every function `f` is called through an eight-byte thunk
-that jumps through `f$slot`. A patch is new machine code plus the slots to
-point at it. The running program finds the next patch file at `quiesce;`,
-places the code within reach of the image, fixes its addresses, and stores the
-slots.
+In a `--live` build every function starts with an eight-byte no-op, and calls
+go straight to it. A patch is new machine code plus the functions it replaces.
+The running program finds the next patch file at `quiesce;`, places the code
+within 2 GB of the image, fixes its addresses, and writes a jump over the
+no-op of each replaced function. A live build runs within 0.4% of a normal
+build (geometric mean over eight Suite 3 programs at `-O`).
 
 `tests/live/live_oracle.ps1` checks the mechanism on every test program: it
 puts a `quiesce;` at the top of `main`, builds a patch from the unchanged

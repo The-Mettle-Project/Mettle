@@ -44,6 +44,7 @@ typedef struct {
   uint64_t body_offset;
   uint64_t end;
   uint64_t signature;
+  int entry;
 } LiveFunction;
 
 typedef struct {
@@ -513,6 +514,13 @@ static int live_index_build(LiveObjectIndex *index, const LinkObject *object) {
         function->body_offset >= function->thunk_offset + 16u) {
       function->signature = linker_read_u64(object->sections[section].raw_data +
                                             function->thunk_offset + 8u);
+    } else if (thunk && thunk->value == function->body_offset &&
+               function->body_offset >= 8u) {
+      function->entry = 1;
+      if (object->sections[section].raw_data) {
+        function->signature = linker_read_u64(
+            object->sections[section].raw_data + function->body_offset - 8u);
+      }
     }
     index->section_function[section] = index->function_count;
     if (!live_map_put(&index->function_by_name, function->name,
@@ -616,7 +624,8 @@ static LiveTarget live_classify(const LiveObjectIndex *index,
       const LiveFunction *function = &index->functions[function_index];
       target.name = function->name;
       target.function = function_index;
-      if (loc < function->body_offset) {
+      if (loc < function->body_offset ||
+          (function->entry && loc == function->body_offset)) {
         target.kind = LIVE_T_THUNK;
         target.delta = (int64_t)(loc - function->thunk_offset);
       } else {
@@ -1351,6 +1360,14 @@ static int live_function_slot(LiveBuilder *builder, const char *name,
     snprintf(slot_name, sizeof(slot_name), "%s$slot", name);
     LiveEntry *slot = live_map_find(&builder->state->symbols, slot_name);
     if (!slot) {
+      LiveEntry *entry = live_map_find(&builder->state->symbols, name);
+      LiveEntry *body = NULL;
+      snprintf(slot_name, sizeof(slot_name), "%s$body", name);
+      body = live_map_find(&builder->state->symbols, slot_name);
+      if (entry && body && entry->a == body->a) {
+        *slot_rva_out = entry->a | LIVE_SWAP_ENTRY;
+        return 1;
+      }
       return live_builder_fail(builder,
                                "'%s' was not built with a slot, so it cannot "
                                "be replaced. Rebuild with --live",

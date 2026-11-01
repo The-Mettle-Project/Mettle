@@ -200,8 +200,13 @@ fn mettle_live_undo(index: int64, target: int64) -> int64 {
         m = m - 1;
     }
     while (k >= 0) {
-        var place: int64* = (int64*)mettle_live_u64(log + k * 16);
-        *place = mettle_live_u64(log + k * 16 + 8);
+        var spot: int64 = mettle_live_u64(log + k * 16);
+        if ((spot & 1) != 0) {
+            mettle_live_port_code_store(spot - 1, mettle_live_u64(log + k * 16 + 8));
+        } else {
+            var place: int64* = (int64*)spot;
+            *place = mettle_live_u64(log + k * 16 + 8);
+        }
         k = k - 1;
     }
     mettle_live_port_resume_others();
@@ -352,14 +357,32 @@ fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
     }
     while (i < swaps) {
         var swap: int64 = swap_at + i * 16;
-        var slot: int64* = (int64*)(base + mettle_live_u64(swap));
-        if (log != 0) {
-            var entry: int64* = (int64*)(log + logged * 16);
-            entry[0] = (int64)slot;
-            entry[1] = *slot;
-            logged = logged + 1;
+        var target_rva: int64 = mettle_live_u64(swap);
+        var body: int64 = code + mettle_live_u64(swap + 8);
+        if (target_rva < 0) {
+            var entry_at: int64 = base + (target_rva & 0x7FFFFFFFFFFFFFFF);
+            var before: int64 = mettle_live_u64(entry_at);
+            var tail: int64 = -1;
+            var low: int64 = 4294967295;
+            tail = tail << 40;
+            var jump: int64 = (before & tail) | 0xE9 | (((body - (entry_at + 5)) & low) << 8);
+            if (log != 0) {
+                var undo_code: int64* = (int64*)(log + logged * 16);
+                undo_code[0] = entry_at + 1;
+                undo_code[1] = before;
+                logged = logged + 1;
+            }
+            mettle_live_port_code_store(entry_at, jump);
+        } else {
+            var slot: int64* = (int64*)(base + target_rva);
+            if (log != 0) {
+                var entry: int64* = (int64*)(log + logged * 16);
+                entry[0] = (int64)slot;
+                entry[1] = *slot;
+                logged = logged + 1;
+            }
+            *slot = body;
         }
-        *slot = code + mettle_live_u64(swap + 8);
         i = i + 1;
     }
     i = 0;
