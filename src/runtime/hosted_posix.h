@@ -43,6 +43,12 @@ long long mt_hosted_spawn_shell_reader(const char *command,
                                        char *const *environment,
                                        int *read_descriptor);
 int mt_hosted_wait_process(long long pid, int *status);
+long long mt_hosted_spawn_process(const char *program,
+                                  const char *const *arguments);
+int mt_hosted_poll_process(long long pid, int *exit_code);
+void mt_hosted_sleep_ms(unsigned milliseconds);
+int mt_hosted_file_mtime(const char *path, long long *seconds,
+                         long long *nanoseconds);
 
 void mt_hosted_yield(void);
 unsigned mt_hosted_hardware_threads(void);

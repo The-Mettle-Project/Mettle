@@ -236,6 +236,7 @@ ifeq ($(UNAME_S),Darwin)
 endif
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/swap.mettle -o $(BINDIR)/runtime/swap.o
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/string.mettle -o $(BINDIR)/runtime/string.o
+	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/live.mettle -o $(BINDIR)/runtime/live.o
 else
 bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 	rm -rf $(BINDIR)/runtime
@@ -264,6 +265,7 @@ bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 	cp $(OBJDIR)/runtime/debug.o         $(BINDIR)/runtime/debug.o
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/swap.mettle -o $(BINDIR)/runtime/swap.o
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/string.mettle -o $(BINDIR)/runtime/string.o
+	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/live.mettle -o $(BINDIR)/runtime/live.o
 	cp $(OBJDIR)/runtime/profile.o       $(BINDIR)/runtime/profile.o
 	cp $(OBJDIR)/runtime/parallel.o      $(BINDIR)/runtime/parallel.o
 	cp $(OBJDIR)/runtime/trace.o         $(BINDIR)/runtime/trace.o

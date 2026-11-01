@@ -1,5 +1,5 @@
 param(
-    [string]$Pattern = "tests\test_*.mettle",
+    [string]$Pattern = "tests/test_*.mettle",
     [int]$Limit = 0,
     [int]$TimeoutSeconds = 20,
     [switch]$Loops,
@@ -8,11 +8,12 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
-$root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+$root = Resolve-Path (Join-Path $PSScriptRoot "../..")
 Set-Location $root
-$mettle = Join-Path $root "bin\mettle.exe"
+$mettle = Join-Path $root "bin/mettle.exe"
 if ($Compiler) { $mettle = (Resolve-Path $Compiler).Path }
-$scratch = Join-Path $root ".tmp\live\oracle"
+$scratch = Join-Path $root ".tmp/live/oracle"
+if ($IsLinux) { $scratch = Join-Path $root ".tmp/live/oracle-linux" }
 New-Item -ItemType Directory -Force $scratch | Out-Null
 
 function Invoke-Program([string]$exe) {

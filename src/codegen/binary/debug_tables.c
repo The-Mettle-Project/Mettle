@@ -147,6 +147,11 @@ static int code_generator_binary_emit_debug_cstring(
   unsigned char terminator = 0;
   int written = 0;
 
+  if (strstr(prefix, "_name") && length > 7u &&
+      strcmp(text + length - 7u, "$resume") == 0) {
+    length -= 7u;
+  }
+
   written = snprintf(NULL, 0, "%s_%zu", prefix, index);
   if (written <= 0) {
     return 0;

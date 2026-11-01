@@ -1234,6 +1234,7 @@ static int mettle_link_elf_native(const char *startup_object,
   memset(&emission_options, 0, sizeof(emission_options));
   resolution_options.entry_symbol_name = "_start";
   resolution_options.section_alignment = 16u;
+  resolution_options.keep_all_sections = options && options->live;
   emission_options.image_base = 0x400000u;
   emission_options.page_size = 0x1000u;
   emission_options.interpreter = METTLE_DEFAULT_ELF_INTERPRETER;
@@ -1332,6 +1333,19 @@ static int mettle_link_elf_native(const char *startup_object,
     return unresolved ? MTLC_ELF_LINK_REPORTED : 1;
   }
 
+  if (options && options->live) {
+    live_write_file_list(executable_filename, options->input_filename);
+    if (!live_write_state(resolution, emission_options.image_base,
+                          executable_filename, &error_message)) {
+      fprintf(stderr, "Error: %s\n",
+              error_message ? error_message : "Failed to write the live state");
+      free(error_message);
+      remove(executable_filename);
+      link_resolution_destroy(resolution);
+      mettle_free_shared_libraries(library_paths, library_count);
+      return MTLC_ELF_LINK_REPORTED;
+    }
+  }
   free(error_message);
   link_resolution_destroy(resolution);
   mettle_free_shared_libraries(library_paths, library_count);
@@ -1406,7 +1420,7 @@ static int object_needs_metal_runtime(const char *object_path) {
 
 static int elf_collect_on_demand_objects(const char *runtime_directory,
                                          const char *object_filename,
-                                         int shared_output,
+                                         int live, int shared_output,
                                          char **extra_objects,
                                          size_t *extra_object_count,
                                          size_t *on_demand_object_count) {
@@ -1425,6 +1439,7 @@ static int elf_collect_on_demand_objects(const char *runtime_directory,
       {"metal_runtime.o", "metal_runtime.o", object_needs_metal_runtime},
       {"metal_provider.o", "metal_provider.o", object_needs_metal_runtime},
       {"tracy_helpers.o", "tracy_helpers.o", object_needs_tracy_helpers},
+      {"live.o", "live.o", object_needs_live_runtime},
   };
   size_t i = 0u;
 
@@ -1432,7 +1447,13 @@ static int elf_collect_on_demand_objects(const char *runtime_directory,
     char *candidate = NULL;
     const char *file = shared_output ? on_demand[i].shared_file
                                      : on_demand[i].file;
-    if (!on_demand[i].needed(object_filename)) {
+    int general = on_demand[i].needed == object_needs_string_runtime ||
+                  on_demand[i].needed == object_needs_swap_runtime ||
+                  on_demand[i].needed == object_needs_safety_runtime ||
+                  on_demand[i].needed == object_needs_atomics ||
+                  on_demand[i].needed == object_needs_parallel_runtime ||
+                  on_demand[i].needed == object_needs_live_runtime;
+    if (!(live && general) && !on_demand[i].needed(object_filename)) {
       continue;
     }
     candidate = join_paths(runtime_directory, file);
@@ -1564,11 +1585,13 @@ static int elf_prepare_runtime_objects(const CompilerOptions *options,
                                         ? "freestanding_shared.o"
                                         : "freestanding.o");
   needs_safety = object_needs_safety_runtime(object_filename);
-  elf_select_runtime_helpers(runtime_directory, object_filename, stack_trace,
+  elf_select_runtime_helpers(runtime_directory, object_filename,
+                             stack_trace || (options && options->live),
                              profile_runtime, needs_safety,
                              crash_handler_object, profile_object);
   return elf_collect_on_demand_objects(
-      runtime_directory, object_filename, options && options->shared_output,
+      runtime_directory, object_filename, options && options->live,
+      options && options->shared_output,
       extra_objects, extra_object_count, on_demand_object_count);
 }
 
@@ -4908,8 +4931,10 @@ int main(int argc, char *argv[]) {
                   host_format == BINARY_TARGET_FORMAT_MACHO_X64 ||
                   host_format == BINARY_TARGET_FORMAT_MACHO_ARM64;
 
-  if (options.live && host_format != BINARY_TARGET_FORMAT_COFF_WIN64) {
-    fprintf(stderr, "Error: --live builds are Windows x64 only for now\n");
+  if (options.live && host_format != BINARY_TARGET_FORMAT_COFF_WIN64 &&
+      host_format != BINARY_TARGET_FORMAT_ELF_X64) {
+    fprintf(stderr,
+            "Error: --live builds are Windows and Linux x64 only for now\n");
     return 1;
   }
   if (options.live_patch_target) {

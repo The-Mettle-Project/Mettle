@@ -391,6 +391,54 @@ int mt_hosted_run_process(const char *program, const char *const *arguments,
   return (status >> 8) & 0xff;
 }
 
+long long mt_hosted_spawn_process(const char *program,
+                                  const char *const *arguments) {
+  pid_t pid = -1;
+  if (!program || !arguments ||
+      posix_spawn(&pid, program, NULL, NULL, (char *const *)arguments,
+                  mt_hosted_environ()) != 0) {
+    return -1;
+  }
+  return (long long)pid;
+}
+
+int mt_hosted_poll_process(long long pid, int *exit_code) {
+  int raw = 0;
+  pid_t result = waitpid((pid_t)pid, &raw, WNOHANG);
+  if (result == 0) {
+    return 0;
+  }
+  if (result < 0) {
+    return -1;
+  }
+  if (exit_code) {
+    *exit_code = (raw & 0x7f) != 0 ? 128 + (raw & 0x7f) : (raw >> 8) & 0xff;
+  }
+  return 1;
+}
+
+void mt_hosted_sleep_ms(unsigned milliseconds) {
+  struct timespec request;
+  request.tv_sec = (time_t)(milliseconds / 1000u);
+  request.tv_nsec = (long)(milliseconds % 1000u) * 1000000L;
+  (void)nanosleep(&request, NULL);
+}
+
+int mt_hosted_file_mtime(const char *path, long long *seconds,
+                         long long *nanoseconds) {
+  struct stat info;
+  if (!path || stat(path, &info) != 0) {
+    return 0;
+  }
+  *seconds = (long long)info.st_mtime;
+#if defined(__APPLE__)
+  *nanoseconds = (long long)info.st_mtimespec.tv_nsec;
+#else
+  *nanoseconds = (long long)info.st_mtim.tv_nsec;
+#endif
+  return 1;
+}
+
 long long mt_hosted_spawn_shell_reader(const char *command,
                                        char *const *environment,
                                        int *read_descriptor) {

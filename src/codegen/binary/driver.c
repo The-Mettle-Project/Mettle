@@ -180,8 +180,10 @@ static BinarySymbolBinding binary_function_symbol_binding(
 static int binary_function_is_live(CodeGenerator *generator,
                                    const IRFunction *ir_function) {
   return generator->live &&
-         generator->binary_emitter->target_format ==
-             BINARY_TARGET_FORMAT_COFF_WIN64 &&
+         (generator->binary_emitter->target_format ==
+              BINARY_TARGET_FORMAT_COFF_WIN64 ||
+          generator->binary_emitter->target_format ==
+              BINARY_TARGET_FORMAT_ELF_X64) &&
          !ir_function->is_kernel && !ir_function->is_naked &&
          !ir_function->is_interrupt && !ir_function->is_rule;
 }

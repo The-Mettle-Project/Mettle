@@ -3728,6 +3728,21 @@ int mettle_run_process(const char *program, const char *const *arguments) {
   return mt_hosted_run_process(program, arguments, mt_environment, path);
 }
 
+long mettle_spawn_process(const char *program, const char *const *arguments) {
+  return (long)mt_hosted_spawn_process(program, arguments);
+}
+
+int mettle_poll_process(long pid, int *exit_code) {
+  return mt_hosted_poll_process((long long)pid, exit_code);
+}
+
+void mettle_sleep_ms(unsigned milliseconds) { mt_hosted_sleep_ms(milliseconds); }
+
+int mettle_file_mtime(const char *path, long long *seconds,
+                      long long *nanoseconds) {
+  return mt_hosted_file_mtime(path, seconds, nanoseconds);
+}
+
 void *popen(const char *command, const char *mode) {
   int descriptor = -1;
   mt_i64 pid;
@@ -3773,6 +3788,47 @@ int pclose(void *stream) {
 }
 
 #else
+
+long mettle_spawn_process(const char *program, const char *const *arguments) {
+  mt_i64 pid = mt_syscall6(MT_SYS_CLONE, 17, 0, 0, 0, 0, 0);
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    mt_exec_search(program, arguments);
+    _exit(127);
+  }
+  return (long)pid;
+}
+
+int mettle_poll_process(long pid, int *exit_code) {
+  int status = 0;
+  mt_i64 result = mt_syscall6(MT_SYS_WAIT4, pid, (mt_i64)&status, 1, 0, 0, 0);
+  if (result == 0) return 0;
+  if (result < 0) return -1;
+  if (exit_code) {
+    *exit_code = (status & 0x7f) != 0 ? 128 + (status & 0x7f)
+                                      : (status >> 8) & 0xff;
+  }
+  return 1;
+}
+
+void mettle_sleep_ms(unsigned milliseconds) {
+  mt_i64 request[2];
+  request[0] = (mt_i64)(milliseconds / 1000u);
+  request[1] = (mt_i64)(milliseconds % 1000u) * 1000000;
+  (void)mt_syscall6(MT_SYS_NANOSLEEP, (mt_i64)request, 0, 0, 0, 0, 0);
+}
+
+int mettle_file_mtime(const char *path, long long *seconds,
+                      long long *nanoseconds) {
+  mt_i64 info[18];
+  if (!path || mt_syscall6(MT_SYS_NEWFSTATAT, MT_AT_FDCWD, (mt_i64)path,
+                           (mt_i64)info, 0, 0, 0) != 0) {
+    return 0;
+  }
+  *seconds = (long long)info[11];
+  *nanoseconds = (long long)info[12];
+  return 1;
+}
 
 int mettle_run_process(const char *program, const char *const *arguments) {
   mt_i64 pid = mt_syscall6(MT_SYS_CLONE, 17, 0, 0, 0, 0, 0);

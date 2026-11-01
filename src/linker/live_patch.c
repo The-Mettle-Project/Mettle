@@ -481,7 +481,8 @@ static const LinkSymbol *live_covering_external(const LiveObjectIndex *index,
 static int64_t live_reloc_addend(const LinkSection *section,
                                  const LinkReloc *relocation) {
   if (relocation->addend_is_explicit) {
-    return relocation->addend;
+    return relocation->kind == LINK_RELOC_PC32 ? relocation->addend + 4
+                                               : relocation->addend;
   }
   if (!section->raw_data) {
     return 0;
@@ -1582,15 +1583,23 @@ static int live_process_piece(LiveBuilder *builder, size_t piece_index) {
       kind = LIVE_FIXUP_ABS64;
     } else if (relocation->kind == LINK_RELOC_PC32) {
       kind = LIVE_FIXUP_PC32;
+    } else if (relocation->kind == LINK_RELOC_ABS32) {
+      kind = LIVE_FIXUP_ABS32;
     } else {
       return live_builder_fail(builder,
                                "The new code uses a %s relocation, which a "
                                "live patch cannot apply",
                                link_reloc_kind_name(relocation->kind));
     }
-    LiveTarget target = live_classify(
-        builder->index, relocation->symbol_index,
-        live_reloc_addend(source, relocation));
+    int64_t addend = live_reloc_addend(source, relocation);
+    int64_t extra = 0;
+    if (relocation->kind == LINK_RELOC_PC32 && relocation->addend_is_explicit &&
+        addend < 0) {
+      extra = addend;
+      addend = 0;
+    }
+    LiveTarget target = live_classify(builder->index,
+                                      relocation->symbol_index, addend);
     if (!live_resolve(builder, &target, &value, &host)) {
       return 0;
     }
@@ -1606,6 +1615,7 @@ static int live_process_piece(LiveBuilder *builder, size_t piece_index) {
     if (!live_add_fixup(builder, (uint32_t)site, kind, value)) {
       return 0;
     }
+    builder->fixups[builder->fixup_count - 1u].addend = extra;
   }
   return 1;
 }
@@ -1860,9 +1870,10 @@ int live_build_patch(const char *object_path, const char *executable_path,
       !link_object_read(object_path, &object, error_message_out)) {
     goto done;
   }
-  if (object->format != LINK_FORMAT_COFF) {
+  if (object->format != LINK_FORMAT_COFF && object->format != LINK_FORMAT_ELF) {
     mettle_set_error(error_message_out,
-                     "Live patches are built for Windows x64 objects only");
+                     "Live patches are built for Windows and Linux x64 objects "
+                     "only");
     goto done;
   }
   if (!live_index_build(&index, object)) {
