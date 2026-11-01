@@ -1165,6 +1165,71 @@ static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
   }
 }
 
+static int mem_child_is_field(const ASTNode *node, const ASTNode *child) {
+  switch (node->type) {
+  case AST_IF_STATEMENT: {
+    const IfStatement *s = (const IfStatement *)node->data;
+    if (!s) {
+      return 0;
+    }
+    if (child == s->condition || child == s->then_branch ||
+        child == s->else_branch) {
+      return 1;
+    }
+    for (size_t i = 0; i < s->else_if_count; i++) {
+      if (child == s->else_ifs[i].condition || child == s->else_ifs[i].body) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  case AST_WHILE_STATEMENT: {
+    const WhileStatement *s = (const WhileStatement *)node->data;
+    return s && (child == s->condition || child == s->body);
+  }
+  case AST_FOR_STATEMENT: {
+    const ForStatement *s = (const ForStatement *)node->data;
+    return s && (child == s->initializer || child == s->condition ||
+                 child == s->increment || child == s->body);
+  }
+  case AST_ASSIGNMENT: {
+    const Assignment *s = (const Assignment *)node->data;
+    return s && (child == s->target || child == s->value);
+  }
+  case AST_RETURN_STATEMENT: {
+    const ReturnStatement *s = (const ReturnStatement *)node->data;
+    return s && child == s->value;
+  }
+  case AST_INDEX_EXPRESSION: {
+    const ArrayIndexExpression *s = (const ArrayIndexExpression *)node->data;
+    return s && (child == s->array || child == s->index);
+  }
+  case AST_BINARY_EXPRESSION: {
+    const BinaryExpression *s = (const BinaryExpression *)node->data;
+    return s && (child == s->left || child == s->right);
+  }
+  case AST_UNARY_EXPRESSION: {
+    const UnaryExpression *s = (const UnaryExpression *)node->data;
+    return s && child == s->operand;
+  }
+  case AST_CAST_EXPRESSION: {
+    const CastExpression *s = (const CastExpression *)node->data;
+    return s && child == s->operand;
+  }
+  case AST_FUNCTION_CALL: {
+    const CallExpression *s = (const CallExpression *)node->data;
+    for (size_t i = 0; s && i < s->argument_count; i++) {
+      if (child == s->arguments[i]) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  default:
+    return 0;
+  }
+}
+
 static int mem_ast_contains_exit(ASTNode *node) {
   if (!node) {
     return 0;
@@ -1213,7 +1278,8 @@ static int mem_ast_contains_exit(ASTNode *node) {
     break;
   }
   for (size_t i = 0; i < node->child_count; i++) {
-    if (mem_ast_contains_exit(node->children[i])) {
+    if (!mem_child_is_field(node, node->children[i]) &&
+        mem_ast_contains_exit(node->children[i])) {
       return 1;
     }
   }
@@ -1291,6 +1357,9 @@ static void mem_count_iv_writes(ASTNode *node, const char *iv, int *count,
     }
   }
   for (size_t i = 0; i < node->child_count; i++) {
+    if (mem_child_is_field(node, node->children[i])) {
+      continue;
+    }
     mem_count_iv_writes(node->children[i], iv, count, clean_increment);
   }
 }
@@ -1410,6 +1479,9 @@ static void mem_find_oob_iv_indexes(MemCtx *ctx, ASTNode *node, const char *iv,
     break;
   }
   for (size_t i = 0; i < node->child_count && !*reported; i++) {
+    if (mem_child_is_field(node, node->children[i])) {
+      continue;
+    }
     mem_find_oob_iv_indexes(ctx, node->children[i], iv, max_iv, reported);
   }
 }
