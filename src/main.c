@@ -2508,7 +2508,8 @@ static int mettle_link_internal(const char **object_paths,
       .entry_symbol_name = want_shared ? NULL : "mettle_start",
       .section_alignment = 16u,
       .allow_unresolved_externals = 1,
-      .object_is_runtime_default = object_is_runtime_default};
+      .object_is_runtime_default = object_is_runtime_default,
+      .keep_all_sections = options && options->live};
   LinkResolution *resolution = NULL;
   PeEmissionOptions emission_options = {0};
   StringList import_library_paths = {0};
@@ -2886,8 +2887,16 @@ static void link_plan_survey(LinkPlan *plan) {
   if (plan->options && plan->options->debug_hooks) {
     plan->needed[RUNTIME_OBJECT_DEBUG] = 1;
   }
+  if (plan->needed[RUNTIME_OBJECT_LIVE]) {
+    plan->needed[RUNTIME_OBJECT_ATOMICS] = 1;
+    plan->needed[RUNTIME_OBJECT_SAFETY] = 1;
+    plan->needed[RUNTIME_OBJECT_SWAP] = 1;
+    plan->needed[RUNTIME_OBJECT_STRING] = 1;
+    plan->needed[RUNTIME_OBJECT_PARALLEL] = 1;
+  }
   if (plan->needed[RUNTIME_OBJECT_PROFILE] ||
-      plan->needed[RUNTIME_OBJECT_SAFETY]) {
+      plan->needed[RUNTIME_OBJECT_SAFETY] ||
+      plan->needed[RUNTIME_OBJECT_LIVE]) {
     plan->needed[RUNTIME_OBJECT_CRASH] = 1;
   }
 }

@@ -475,7 +475,8 @@ static int link_resolution_gc_sections(LinkResolution *resolution,
       if (section->kind == LINK_SECTION_KIND_UNKNOWN) {
         continue;
       }
-      if (!link_section_is_gc_eligible(section)) {
+      if (!link_section_is_gc_eligible(section) ||
+          (options && options->keep_all_sections)) {
         gc_mark(live, worklist, &worklist_count, object_index, i);
       }
     }

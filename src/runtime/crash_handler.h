@@ -75,6 +75,10 @@ void mettle_crash_register_image(const MettleCrashFunctionInfo *functions,
                                  const MettleCrashLocationInfo *locations,
                                  size_t location_count);
 void mettle_crash_register_debug_image(const MettleCrashDebugImage *image);
+void mettle_crash_register_extra_code(const MettleCrashFunctionInfo *functions,
+                                      size_t function_count,
+                                      const MettleCrashLocationInfo *locations,
+                                      size_t location_count);
 void mettle_crash_trap(const char *message, const void *program_counter,
                        const void *frame_pointer);
 void mettle_crash_trap_ex(uint32_t kind, const char *message,

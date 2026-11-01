@@ -104,6 +104,7 @@ typedef struct {
   const char *const *shared_library_paths;
   size_t shared_library_path_count;
   int produce_shared_library;
+  int keep_all_sections;
 } LinkResolutionOptions;
 
 typedef struct {

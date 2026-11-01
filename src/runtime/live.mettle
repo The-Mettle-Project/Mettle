@@ -15,6 +15,9 @@ extern fn mettle_live_os_process() -> int64 = "GetCurrentProcess";
 extern fn mettle_live_os_flush(process: int64, address: int64, size: int64) -> int32 = "FlushInstructionCache";
 extern fn mettle_live_os_lock(lock: int64*) = "AcquireSRWLockExclusive";
 extern fn mettle_live_os_unlock(lock: int64*) = "ReleaseSRWLockExclusive";
+extern fn mettle_live_os_load(name: int64) -> int64 = "LoadLibraryA";
+extern fn mettle_live_os_proc(module: int64, name: int64) -> int64 = "GetProcAddress";
+extern fn mettle_crash_register_extra_code(functions: int64, function_count: int64, locations: int64, location_count: int64);
 
 const METTLE_LIVE_MAGIC: int64 = 0x48435441504C544D;
 const METTLE_LIVE_PROBE_MS: uint64 = 50;
@@ -84,6 +87,40 @@ fn mettle_live_u32(address: int64) -> int64 {
 fn mettle_live_u64(address: int64) -> int64 {
     var p: int64* = (int64*)address;
     return *p;
+}
+
+fn mettle_live_cstring_length(address: int64) -> int64 {
+    var bytes: uint8* = (uint8*)address;
+    var n: int64 = 0;
+    while (bytes[n] != (uint8)0) {
+        n = n + 1;
+    }
+    return n;
+}
+
+fn mettle_live_bind_imports(index: int64, code: int64, at: int64, count: int64) -> int64 {
+    var start: int64 = at;
+    var i: int64 = 0;
+    while (i < count) {
+        var slot: int64 = mettle_live_u32(at);
+        var dll: int64 = at + 8;
+        var name: int64 = dll + mettle_live_cstring_length(dll) + 1;
+        var next: int64 = name + mettle_live_cstring_length(name) + 1;
+        var module: int64 = mettle_live_os_load(dll);
+        var proc: int64 = 0;
+        if (module != 0) {
+            proc = mettle_live_os_proc(module, name);
+        }
+        if (proc == 0) {
+            mettle_live_refuse(index, "an imported function could not be found");
+            return 0;
+        }
+        var target: int64* = (int64*)(code + slot);
+        *target = proc;
+        at = start + ((next - start + 7) / 8) * 8;
+        i = i + 1;
+    }
+    return 1;
 }
 
 fn mettle_live_copy(target: int64, source: int64, count: int64) {
@@ -171,7 +208,7 @@ fn mettle_live_alloc_near(base: int64, size: int64) -> int64 {
 }
 
 fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
-    if (mettle_live_u64(buffer) != METTLE_LIVE_MAGIC || mettle_live_u32(buffer + 8) != 1) {
+    if (mettle_live_u64(buffer) != METTLE_LIVE_MAGIC || mettle_live_u32(buffer + 8) != 2) {
         mettle_live_refuse(index, "not a patch this runtime can read");
         return 0;
     }
@@ -181,11 +218,13 @@ fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
     var swaps: int64 = mettle_live_u32(buffer + 36);
     var inits: int64 = mettle_live_u32(buffer + 40);
     var functions: int64 = mettle_live_u32(buffer + 44);
-    var blob: int64 = buffer + 64;
+    var blob: int64 = buffer + 80;
     var fixup_at: int64 = blob + ((blob_size + 7) / 8) * 8;
     var swap_at: int64 = fixup_at + fixups * 24;
     var init_at: int64 = swap_at + swaps * 16;
-    if (blob_size <= 0 || init_at + inits * 24 > buffer + size) {
+    var import_count: int64 = mettle_live_u32(buffer + 64);
+    var import_at: int64 = init_at + inits * 24;
+    if (blob_size <= 0 || import_at + mettle_live_u32(buffer + 68) > buffer + size) {
         mettle_live_refuse(index, "the file is truncated");
         return 0;
     }
@@ -233,12 +272,24 @@ fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
         }
         i = i + 1;
     }
+    if (import_count > 0 && mettle_live_bind_imports(index, code, import_at, import_count) == 0) {
+        return 0;
+    }
     var old: uint32 = (uint32)0;
     if (mettle_live_os_protect(code, blob_size, (uint32)0x20, &old) == 0) {
         mettle_live_refuse(index, "the code could not be made executable");
         return 0;
     }
     mettle_live_os_flush(mettle_live_os_process(), code, blob_size);
+    var debug_functions: int64 = mettle_live_u32(buffer + 52);
+    if (debug_functions > 0) {
+        var debug_locations: int64 = mettle_live_u32(buffer + 60);
+        var locations_at: int64 = 0;
+        if (debug_locations > 0) {
+            locations_at = code + mettle_live_u32(buffer + 56);
+        }
+        mettle_crash_register_extra_code(code + mettle_live_u32(buffer + 48), debug_functions, locations_at, debug_locations);
+    }
     i = 0;
     while (i < swaps) {
         var swap: int64 = swap_at + i * 16;

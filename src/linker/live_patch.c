@@ -1115,6 +1115,13 @@ typedef struct {
   size_t created;
   size_t continuations;
   size_t new_globals;
+  uint64_t debug_functions;
+  uint32_t debug_function_count;
+  uint64_t debug_locations;
+  uint32_t debug_location_count;
+  LiveBuffer imports;
+  uint32_t import_count;
+  LiveMap import_slots;
   char **error_message_out;
 } LiveBuilder;
 
@@ -1299,6 +1306,65 @@ static int live_new_global(LiveBuilder *builder, const char *name,
   return 1;
 }
 
+static const char *const LIVE_IMPORT_DLLS[] = {
+    "kernel32.dll", "ws2_32.dll", "user32.dll", "gdi32.dll",
+    "advapi32.dll", "winmm.dll",  "shell32.dll"};
+
+static const char *live_import_dll(const char *name) {
+#ifdef _WIN32
+  for (size_t i = 0; i < sizeof(LIVE_IMPORT_DLLS) / sizeof(LIVE_IMPORT_DLLS[0]);
+       i++) {
+    HMODULE module = LoadLibraryA(LIVE_IMPORT_DLLS[i]);
+    int has = module && GetProcAddress(module, name) != NULL;
+    if (module) {
+      FreeLibrary(module);
+    }
+    if (has) {
+      return LIVE_IMPORT_DLLS[i];
+    }
+  }
+#else
+  (void)name;
+#endif
+  return NULL;
+}
+
+static int live_import(LiveBuilder *builder, const char *symbol,
+                       uint64_t *offset_out) {
+  static const unsigned char stub[8] = {0xFF, 0x25, 0, 0, 0, 0, 0xCC, 0xCC};
+  const char *name = strncmp(symbol, "__imp_", 6) == 0 ? symbol + 6 : symbol;
+  int wants_slot = name != symbol;
+  LiveEntry *entry = live_map_find(&builder->import_slots, name);
+  if (!entry) {
+    const char *dll = live_import_dll(name);
+    uint64_t slot;
+    uint64_t jump;
+    if (!dll) {
+      return 0;
+    }
+    if (!live_buffer_align(&builder->blob, 16u, 0)) {
+      return -1;
+    }
+    slot = builder->blob.size;
+    jump = slot + 8u;
+    if (!live_buffer_append(&builder->blob, NULL, 8u) ||
+        !live_buffer_append(&builder->blob, stub, sizeof(stub)) ||
+        !live_add_fixup(builder, (uint32_t)(jump + 2u), LIVE_FIXUP_PC32,
+                        slot) ||
+        !live_buffer_u32(&builder->imports, (uint32_t)slot) ||
+        !live_buffer_u32(&builder->imports, 0u) ||
+        !live_buffer_append(&builder->imports, dll, strlen(dll) + 1u) ||
+        !live_buffer_append(&builder->imports, name, strlen(name) + 1u) ||
+        !live_buffer_align(&builder->imports, 8u, 0) ||
+        !(entry = live_map_put(&builder->import_slots, name, slot, jump))) {
+      return -1;
+    }
+    builder->import_count++;
+  }
+  *offset_out = wants_slot ? entry->a : entry->b;
+  return 1;
+}
+
 static int live_resolve(LiveBuilder *builder, const LiveTarget *target,
                         uint64_t *value_out, int *host_out) {
   LiveEntry *entry = NULL;
@@ -1387,6 +1453,17 @@ static int live_resolve(LiveBuilder *builder, const LiveTarget *target,
   case LIVE_T_EXTERN:
     entry = target->name ? live_map_find(&builder->state->symbols, target->name)
                          : NULL;
+    if (!entry && target->kind == LIVE_T_EXTERN && target->name) {
+      int found = live_import(builder, target->name, &base);
+      if (found < 0) {
+        return 0;
+      }
+      if (found) {
+        *host_out = 0;
+        *value_out = base + (uint64_t)target->delta;
+        return 1;
+      }
+    }
     if (!entry) {
       return live_builder_fail(builder,
                                "The new code needs '%s', which the running "
@@ -1448,6 +1525,171 @@ static int live_process_piece(LiveBuilder *builder, size_t piece_index) {
   return 1;
 }
 
+static int live_reloc_offset_compare(const void *a, const void *b) {
+  const LinkReloc *x = *(const LinkReloc *const *)a;
+  const LinkReloc *y = *(const LinkReloc *const *)b;
+  return x->offset < y->offset ? -1 : (x->offset > y->offset ? 1 : 0);
+}
+
+static const LinkReloc *live_sorted_reloc_at(const LinkReloc **sorted,
+                                             size_t count, uint64_t offset) {
+  size_t low = 0;
+  size_t high = count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2u;
+    if (sorted[mid]->offset < offset) {
+      low = mid + 1u;
+    } else if (sorted[mid]->offset > offset) {
+      high = mid;
+    } else {
+      return sorted[mid];
+    }
+  }
+  return NULL;
+}
+
+static uint32_t live_debug_header_count(const LiveObjectIndex *index,
+                                        size_t word) {
+  const LinkSymbol *header =
+      link_object_find_symbol(index->object, "mettle_debug_header");
+  const LinkSection *section;
+  if (!header || header->section_index < 0 ||
+      (size_t)header->section_index >= index->object->section_count) {
+    return 0;
+  }
+  section = &index->object->sections[header->section_index];
+  if (!section->raw_data ||
+      header->value + (word + 1u) * 4u > section->size_of_raw_data) {
+    return 0;
+  }
+  return linker_read_u32(section->raw_data + header->value + word * 4u);
+}
+
+static int live_append_debug_rows(LiveBuilder *builder, const char *table_name,
+                                  uint32_t row_count, size_t row_size,
+                                  size_t code_fields, size_t pointer_fields,
+                                  uint64_t *offset_out, uint32_t *count_out) {
+  const LinkObject *object = builder->index->object;
+  const LinkSymbol *table = link_object_find_symbol(object, table_name);
+  const LinkSection *source;
+  const LinkReloc **sorted = NULL;
+  size_t sorted_count = 0;
+  uint64_t *rows = NULL;
+  size_t *functions = NULL;
+  uint64_t start;
+  uint64_t end;
+  uint32_t count = 0;
+  int ok = 0;
+  *offset_out = 0;
+  *count_out = 0;
+  if (!table || row_count == 0 || table->section_index < 0 ||
+      (size_t)table->section_index >= object->section_count) {
+    return 1;
+  }
+  source = &object->sections[table->section_index];
+  start = table->value;
+  end = start + (uint64_t)row_count * row_size;
+  if (!source->raw_data || end > source->size_of_raw_data) {
+    return 1;
+  }
+  sorted = malloc((source->relocation_count ? source->relocation_count : 1u) *
+                  sizeof(*sorted));
+  if (!sorted) {
+    return 0;
+  }
+  for (size_t i = 0; i < source->relocation_count; i++) {
+    if (source->relocations[i].offset >= start &&
+        source->relocations[i].offset < end) {
+      sorted[sorted_count++] = &source->relocations[i];
+    }
+  }
+  qsort(sorted, sorted_count, sizeof(*sorted), live_reloc_offset_compare);
+  if (!live_buffer_align(&builder->blob, 16u, 0)) {
+    goto done;
+  }
+  *offset_out = builder->blob.size;
+  rows = malloc((size_t)row_count * sizeof(*rows));
+  functions = malloc((size_t)row_count * sizeof(*functions));
+  if (!rows || !functions) {
+    goto done;
+  }
+  for (uint32_t r = 0; r < row_count; r++) {
+    uint64_t row = start + (uint64_t)r * row_size;
+    const LinkReloc *first = live_sorted_reloc_at(sorted, sorted_count, row);
+    LiveTarget code;
+    if (!first) {
+      continue;
+    }
+    code = live_classify(builder->index, first->symbol_index,
+                         live_reloc_addend(source, first));
+    if ((code.kind != LIVE_T_BODY && code.kind != LIVE_T_THUNK) ||
+        code.function == LIVE_NONE ||
+        builder->function_piece[code.function] == LIVE_NONE) {
+      continue;
+    }
+    if (!live_buffer_append(&builder->blob, source->raw_data + row,
+                            row_size)) {
+      goto done;
+    }
+    rows[count] = row;
+    functions[count] = code.function;
+    count++;
+  }
+  for (uint32_t k = 0; k < count; k++) {
+    uint64_t row = rows[k];
+    uint64_t row_blob = *offset_out + (uint64_t)k * row_size;
+    size_t function = functions[k];
+    uint64_t function_blob =
+        builder->pieces[builder->function_piece[function]].blob_offset;
+    for (size_t field = 0; field < pointer_fields; field++) {
+      const LinkReloc *relocation =
+          live_sorted_reloc_at(sorted, sorted_count, row + field * 8u);
+      LiveTarget target;
+      uint64_t value = 0;
+      int host = 0;
+      if (!relocation) {
+        continue;
+      }
+      target = live_classify(builder->index, relocation->symbol_index,
+                             live_reloc_addend(source, relocation));
+      if (field < code_fields) {
+        if (target.function != function ||
+            (target.kind != LIVE_T_BODY && target.kind != LIVE_T_THUNK)) {
+          continue;
+        }
+        value = function_blob +
+                (target.kind == LIVE_T_BODY ? (uint64_t)target.delta : 0u);
+      } else if (!live_resolve(builder, &target, &value, &host)) {
+        goto done;
+      }
+      if (!live_add_fixup(builder, (uint32_t)(row_blob + field * 8u),
+                          LIVE_FIXUP_ABS64 |
+                              (host ? LIVE_FIXUP_TARGET_HOST : 0u),
+                          value)) {
+        goto done;
+      }
+    }
+  }
+  *count_out = count;
+  ok = 1;
+done:
+  free(sorted);
+  free(rows);
+  free(functions);
+  return ok;
+}
+
+static int live_add_debug_tables(LiveBuilder *builder) {
+  uint32_t functions = live_debug_header_count(builder->index, 2u);
+  uint32_t locations = live_debug_header_count(builder->index, 3u);
+  return live_append_debug_rows(builder, "mettle_debug_functions", functions,
+                                48u, 2u, 4u, &builder->debug_functions,
+                                &builder->debug_function_count) &&
+         live_append_debug_rows(builder, "mettle_debug_locations", locations,
+                                40u, 1u, 3u, &builder->debug_locations,
+                                &builder->debug_location_count);
+}
+
 static int live_write_patch(LiveBuilder *builder, const char *path) {
   LiveBuffer out = {0};
   char *temporary = live_join(path, ".tmp");
@@ -1463,6 +1705,12 @@ static int live_write_patch(LiveBuilder *builder, const char *path) {
            live_buffer_u32(&out, (uint32_t)builder->init_count) &&
            live_buffer_u32(&out, (uint32_t)(builder->changed + builder->created -
                                             builder->continuations)) &&
+           live_buffer_u32(&out, (uint32_t)builder->debug_functions) &&
+           live_buffer_u32(&out, builder->debug_function_count) &&
+           live_buffer_u32(&out, (uint32_t)builder->debug_locations) &&
+           live_buffer_u32(&out, builder->debug_location_count) &&
+           live_buffer_u32(&out, builder->import_count) &&
+           live_buffer_u32(&out, (uint32_t)builder->imports.size) &&
            live_buffer_append(&out, NULL, LIVE_PATCH_HEADER_SIZE - out.size) &&
            live_buffer_append(&out, builder->blob.data, builder->blob.size) &&
            live_buffer_align(&out, 8u, 0);
@@ -1481,6 +1729,8 @@ static int live_write_patch(LiveBuilder *builder, const char *path) {
          live_buffer_u64(&out, builder->inits[i].blob_offset) &&
          live_buffer_u64(&out, builder->inits[i].size);
   }
+  ok = ok && live_buffer_append(&out, builder->imports.data,
+                                builder->imports.size);
   if (ok) {
     file = fopen(temporary, "wb");
     ok = file && fwrite(out.data, 1u, out.size, file) == out.size;
@@ -1673,6 +1923,9 @@ int live_build_patch(const char *object_path, const char *executable_path,
       goto done;
     }
   }
+  if (!live_add_debug_tables(&builder)) {
+    goto done;
+  }
   while (builder.processed < builder.piece_count) {
     if (!live_process_piece(&builder, builder.processed++)) {
       goto done;
@@ -1725,6 +1978,8 @@ done:
     mettle_set_error(error_message_out, "Out of memory building a live patch");
   }
   free(builder.blob.data);
+  free(builder.imports.data);
+  live_map_destroy(&builder.import_slots);
   free(builder.pieces);
   free(builder.fixups);
   free(builder.swaps);

@@ -33,6 +33,18 @@ static size_t g_runtime_debug_trap_site_count = 0;
 static MettleCrashLocationInfo *g_runtime_sorted_locations = NULL;
 static size_t g_runtime_sorted_location_count = 0;
 
+#define METTLE_CRASH_EXTRA_CODE_LIMIT 4096u
+
+typedef struct {
+  const MettleCrashFunctionInfo *functions;
+  size_t function_count;
+  const MettleCrashLocationInfo *locations;
+  size_t location_count;
+} MettleCrashExtraCode;
+
+static MettleCrashExtraCode g_runtime_extra_code[METTLE_CRASH_EXTRA_CODE_LIMIT];
+static volatile size_t g_runtime_extra_code_count = 0;
+
 #if defined(_WIN32) || defined(_WIN64)
 static volatile LONG g_runtime_debug_handler_installed = 0;
 static volatile LONG g_runtime_debug_in_handler = 0;
@@ -288,7 +300,60 @@ mettle_crash_find_function(uintptr_t program_counter) {
       return info;
     }
   }
+  for (size_t t = g_runtime_extra_code_count; t-- > 0;) {
+    const MettleCrashExtraCode *extra = &g_runtime_extra_code[t];
+    for (size_t i = 0; i < extra->function_count; i++) {
+      const MettleCrashFunctionInfo *info = &extra->functions[i];
+      if (program_counter >= (uintptr_t)info->start_address &&
+          program_counter < (uintptr_t)info->end_address) {
+        return info;
+      }
+    }
+  }
   return NULL;
+}
+
+static const MettleCrashLocationInfo *
+mettle_crash_find_extra_location(uintptr_t program_counter,
+                                 const MettleCrashFunctionInfo *function_info) {
+  for (size_t t = 0; t < g_runtime_extra_code_count; t++) {
+    const MettleCrashExtraCode *extra = &g_runtime_extra_code[t];
+    const MettleCrashLocationInfo *best = NULL;
+    if (function_info < extra->functions ||
+        function_info >= extra->functions + extra->function_count) {
+      continue;
+    }
+    for (size_t i = 0; i < extra->location_count; i++) {
+      const MettleCrashLocationInfo *info = &extra->locations[i];
+      uintptr_t address = (uintptr_t)info->address;
+      if (address < (uintptr_t)function_info->start_address ||
+          address >= (uintptr_t)function_info->end_address ||
+          address > program_counter) {
+        continue;
+      }
+      if (!best || address >= (uintptr_t)best->address) {
+        best = info;
+      }
+    }
+    return best;
+  }
+  return NULL;
+}
+
+void mettle_crash_register_extra_code(const MettleCrashFunctionInfo *functions,
+                                      size_t function_count,
+                                      const MettleCrashLocationInfo *locations,
+                                      size_t location_count) {
+  size_t slot = g_runtime_extra_code_count;
+  if (!functions || function_count == 0 ||
+      slot >= METTLE_CRASH_EXTRA_CODE_LIMIT) {
+    return;
+  }
+  g_runtime_extra_code[slot].functions = functions;
+  g_runtime_extra_code[slot].function_count = function_count;
+  g_runtime_extra_code[slot].locations = locations;
+  g_runtime_extra_code[slot].location_count = locations ? location_count : 0;
+  g_runtime_extra_code_count = slot + 1u;
 }
 
 static const MettleCrashLocationInfo *
@@ -305,6 +370,12 @@ mettle_crash_find_location(uintptr_t program_counter,
   uintptr_t function_end =
       function_info ? (uintptr_t)function_info->end_address : UINTPTR_MAX;
 
+  if (function_info && g_runtime_extra_code_count > 0 &&
+      (function_info < g_runtime_debug_functions ||
+       function_info >= g_runtime_debug_functions +
+                            g_runtime_debug_function_count)) {
+    return mettle_crash_find_extra_location(program_counter, function_info);
+  }
   if (!locations || location_count == 0) {
     return NULL;
   }
