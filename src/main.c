@@ -4768,6 +4768,19 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1], "live") == 0) {
       return mettle_live_main(argc, argv);
     }
+    if (strcmp(argv[1], "--live-undo") == 0 && argc >= 3) {
+      LivePatchSummary summary;
+      char *live_error = NULL;
+      if (!live_build_undo(argv[2], &summary, &live_error)) {
+        fprintf(stderr, "Error: %s\n",
+                live_error ? live_error : "Failed to undo a live patch");
+        free(live_error);
+        return 1;
+      }
+      printf("Patch %u undoes patch %u\n", summary.patch_index,
+             summary.undone);
+      return 0;
+    }
     if (strcmp(argv[1], "swap-check") == 0) {
       options.swap_check_mode = 1;
       for (int i = 1; i + 1 < argc; i++) {
@@ -5052,9 +5065,9 @@ int main(int argc, char *argv[]) {
       }
       printf(")\n");
       if (summary.moving[0]) {
-        printf("  %s %s to the new code at %s next quiesce point\n",
-               summary.moving, strchr(summary.moving, ',') ? "move" : "moves",
-               strchr(summary.moving, ',') ? "their" : "its");
+        printf("  running frames of %s move to the new code at the next "
+               "statement that can reach a quiesce point\n",
+               summary.moving);
       }
       if (summary.running[0]) {
         printf("  %s %s running at the quiesce point and %s the old code "

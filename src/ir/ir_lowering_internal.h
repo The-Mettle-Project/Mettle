@@ -276,8 +276,13 @@ extern int g_ir_lowering_task_checks;
 extern int g_ir_lowering_live;
 int ir_lower_live_site(IRLoweringContext *context, IRFunction *function,
                        SourceLocation location);
-int ir_lower_live_frames(IRLoweringContext *context, IRFunction *function);
-void ir_lower_live_register_symbols(IRProgram *program);
+int ir_lower_live_program(IRLoweringContext *context, IRProgram *program);
+void ir_lower_live_register_symbols(IRLoweringContext *context,
+                                    IRProgram *program);
+int ir_lower_live_marks_statement(const IRFunction *function,
+                                  int statement_type);
+int ir_lower_live_mark(IRLoweringContext *context, IRFunction *function,
+                       int begin, SourceLocation location);
 extern int g_ir_lowering_overflow_checks;
 extern int g_ir_lowering_assume_no_signed_overflow;
 int ir_emit_refinement_predicate(IRLoweringContext *context,

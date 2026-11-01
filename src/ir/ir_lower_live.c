@@ -4,14 +4,21 @@
 #include <stdint.h>
 
 #define IR_LIVE_CHECK_NAME "mettle_live_frame_check"
+#define IR_LIVE_MOVED_NAME "mettle_live_frame_moved"
 #define IR_LIVE_PUT_NAME "mettle_live_frame_put"
 #define IR_LIVE_TAKE_NAME "mettle_live_frame_take"
 #define IR_LIVE_ZERO_NAME "mettle_live_frame_zero"
-#define IR_LIVE_ALLOC_NAME "mettle_live_frame_alloc"
+#define IR_LIVE_COPY_NAME "mettle_live_frame_copy"
 #define IR_LIVE_END_NAME "mettle_live_frame_end"
+#define IR_LIVE_HAND_BACK_NAME "mettle_live_frame_hand_back"
+#define IR_LIVE_AGAIN_NAME "mettle_live_frame_again"
+#define IR_LIVE_LAST_KEY_NAME "mettle_live_frame_last_key"
 #define IR_LIVE_QUIESCE_NAME "mettle_live_quiesce"
-#define IR_LIVE_RESUME_INFIX "$resume_"
+#define IR_LIVE_RESUME_SUFFIX "$resume"
 #define IR_LIVE_FRAME_SUFFIX "$live_frame"
+#define IR_LIVE_BEGIN_MARK "@@live_begin"
+#define IR_LIVE_END_MARK "@@live_end"
+#define IR_LIVE_KEY_PARAM ".live_resume_key"
 
 typedef struct {
   const char **keys;
@@ -42,9 +49,12 @@ typedef struct {
 } IRLiveLocals;
 
 typedef struct {
-  size_t call_index;
-  const char *resume_label;
+  size_t position;
+  size_t range_begin;
+  int is_quiesce;
+  uint64_t key;
   size_t local_count;
+  char *resume_label;
 } IRLiveSite;
 
 typedef struct {
@@ -58,6 +68,13 @@ typedef struct {
   unsigned char **loop_body;
   size_t *loop_size;
 } IRLiveShape;
+
+typedef struct {
+  size_t begin;
+  size_t end;
+  uint64_t hash;
+  int is_site;
+} IRLiveRange;
 
 static uint64_t ir_live_mix(uint64_t hash, uint64_t value) {
   for (int i = 0; i < 8; i++) {
@@ -151,62 +168,7 @@ static int ir_live_function_movable(const IRFunction *function) {
   return function && !function->is_kernel && !function->is_naked &&
          !function->is_interrupt && !function->is_rule &&
          !function->is_inline_contract && function->name &&
-         !strstr(function->name, IR_LIVE_RESUME_INFIX);
-}
-
-static void ir_live_declare_helper(IRLoweringContext *context,
-                                   const char *name, size_t string_params,
-                                   size_t int_params) {
-  IRModuleSymbol entry = {0};
-  MtlcType *params[6];
-  size_t count = 0;
-  if (!context || !context->program || !context->type_checker ||
-      ir_program_lookup_symbol(context->program, name)) {
-    return;
-  }
-  MtlcType *word = mtlc_type_from_frontend(context->type_checker->builtin_int64);
-  MtlcType *text =
-      mtlc_type_from_frontend(context->type_checker->builtin_string);
-  for (size_t i = 0; i < string_params && count < 6u; i++) {
-    params[count++] = text;
-  }
-  for (size_t i = 0; i < int_params && count < 6u; i++) {
-    params[count++] = word;
-  }
-  entry.name = (char *)name;
-  entry.kind = IR_MODSYM_FUNCTION;
-  entry.is_extern = 1;
-  entry.type = word;
-  entry.return_type = word;
-  entry.param_types = count ? params : NULL;
-  entry.param_count = count;
-  ir_program_add_symbol(context->program, &entry);
-}
-
-static void ir_live_declare_helpers(IRLoweringContext *context) {
-  ir_live_declare_helper(context, IR_LIVE_QUIESCE_NAME, 0, 0);
-  ir_live_declare_helper(context, IR_LIVE_PUT_NAME, 1, 3);
-  ir_live_declare_helper(context, IR_LIVE_TAKE_NAME, 1, 2);
-  ir_live_declare_helper(context, IR_LIVE_ZERO_NAME, 0, 2);
-  ir_live_declare_helper(context, IR_LIVE_ALLOC_NAME, 0, 1);
-  ir_live_declare_helper(context, IR_LIVE_END_NAME, 0, 0);
-  if (context && context->program && context->type_checker &&
-      !ir_program_lookup_symbol(context->program, IR_LIVE_CHECK_NAME)) {
-    IRModuleSymbol entry = {0};
-    MtlcType *params[2];
-    MtlcType *word =
-        mtlc_type_from_frontend(context->type_checker->builtin_int64);
-    params[0] = word;
-    params[1] = mtlc_type_from_frontend(context->type_checker->builtin_string);
-    entry.name = IR_LIVE_CHECK_NAME;
-    entry.kind = IR_MODSYM_FUNCTION;
-    entry.is_extern = 1;
-    entry.type = word;
-    entry.return_type = word;
-    entry.param_types = params;
-    entry.param_count = 2;
-    ir_program_add_symbol(context->program, &entry);
-  }
+         !strstr(function->name, IR_LIVE_RESUME_SUFFIX);
 }
 
 static int ir_live_emit_call(IRLoweringContext *context, IRFunction *function,
@@ -247,91 +209,6 @@ static IROperand ir_live_new_temp(IRLoweringContext *context) {
   IROperand operand = ir_operand_temp(name ? name : ".tlive");
   free(name);
   return operand;
-}
-
-int ir_lower_live_site(IRLoweringContext *context, IRFunction *function,
-                       SourceLocation location) {
-  char flag[512];
-  IRModuleSymbol entry = {0};
-  IROperand arguments[2];
-  IROperand address;
-  IROperand moved;
-  char *resume = NULL;
-  int ok;
-
-  ir_live_declare_helpers(context);
-  if (!ir_live_function_movable(function)) {
-    IROperand none = ir_operand_none();
-    return ir_live_emit_call(context, function, IR_LIVE_QUIESCE_NAME, NULL, 0,
-                             &none, location);
-  }
-  snprintf(flag, sizeof(flag), "%s" IR_LIVE_FRAME_SUFFIX, function->name);
-  if (!ir_program_lookup_symbol(context->program, flag)) {
-    entry.name = flag;
-    entry.kind = IR_MODSYM_VARIABLE;
-    entry.type = mtlc_type_from_frontend(context->type_checker->builtin_int64);
-    ir_program_add_symbol(context->program, &entry);
-  }
-  address = ir_live_new_temp(context);
-  moved = ir_live_new_temp(context);
-  resume = ir_new_label_name(context, "live_resume");
-  if (!resume ||
-      !ir_live_emit_simple(context, function, IR_OP_ADDRESS_OF,
-                           ir_operand_copy(&address), ir_operand_symbol(flag),
-                           ir_operand_none(), NULL, location)) {
-    free(resume);
-    ir_operand_destroy(&address);
-    ir_operand_destroy(&moved);
-    return 0;
-  }
-  arguments[0] = address;
-  arguments[1] = ir_operand_string(function->name);
-  ok = ir_live_emit_call(context, function, IR_LIVE_CHECK_NAME, arguments, 2,
-                         &moved, location) &&
-       ir_live_emit_simple(context, function, IR_OP_BRANCH_ZERO,
-                           ir_operand_none(), ir_operand_copy(&moved),
-                           ir_operand_none(), resume, location) &&
-       ir_emit_label_instruction(context, function, resume, location);
-  ir_operand_destroy(&arguments[0]);
-  ir_operand_destroy(&arguments[1]);
-  ir_operand_destroy(&moved);
-  free(resume);
-  return ok;
-}
-
-static int ir_live_is_site(const IRInstruction *instruction) {
-  return instruction->op == IR_OP_CALL && instruction->text &&
-         strcmp(instruction->text, IR_LIVE_CHECK_NAME) == 0;
-}
-
-static void ir_live_demote(IRFunction *function) {
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    IRInstruction *instruction = &function->instructions[i];
-    if (!ir_live_is_site(instruction)) {
-      continue;
-    }
-    for (size_t a = 0; a < instruction->argument_count; a++) {
-      ir_operand_destroy(&instruction->arguments[a]);
-    }
-    free(instruction->arguments);
-    instruction->arguments = NULL;
-    instruction->argument_count = 0;
-    ir_operand_destroy(&instruction->dest);
-    instruction->dest = ir_operand_none();
-    mettle_free_string(instruction->text);
-    instruction->text = mettle_strdup(IR_LIVE_QUIESCE_NAME);
-    if (i + 1u < function->instruction_count &&
-        function->instructions[i + 1u].op == IR_OP_BRANCH_ZERO) {
-      IRInstruction *branch = &function->instructions[i + 1u];
-      ir_operand_destroy(&branch->lhs);
-      branch->lhs = ir_operand_none();
-      mettle_free_string(branch->text);
-      branch->text = NULL;
-      branch->op = IR_OP_NOP;
-    }
-  }
-  ir_function_clear_cfg(function);
-  ir_function_touch(function);
 }
 
 static uint64_t ir_live_type_hash(const MtlcType *type, unsigned depth) {
@@ -596,107 +473,6 @@ static char *ir_live_local_name(const char *name, const char *suffix) {
   return text;
 }
 
-static char *ir_live_resume_name(const char *owner, size_t site) {
-  size_t length = strlen(owner) + 32u;
-  char *text = malloc(length);
-  if (text) {
-    snprintf(text, length, "%s" IR_LIVE_RESUME_INFIX "%zu", owner, site);
-  }
-  return text;
-}
-
-static int ir_live_emit_put(IRLoweringContext *context, IRFunction *out,
-                            const IRLiveLocal *local, SourceLocation location) {
-  IROperand place = ir_live_new_temp(context);
-  IROperand arguments[4];
-  IROperand none = ir_operand_none();
-  int ok = 1;
-  if (local->scalar && !local->address_taken) {
-    char *save = ir_live_local_name(local->name, ".live");
-    IRInstruction declare = {0};
-    IRInstruction assign = {0};
-    if (!save) {
-      ir_operand_destroy(&place);
-      return 0;
-    }
-    declare.op = IR_OP_DECLARE_LOCAL;
-    declare.location = location;
-    declare.dest = ir_operand_symbol(save);
-    declare.text = (char *)local->type_text;
-    declare.value_type = local->type;
-    assign.op = IR_OP_ASSIGN;
-    assign.location = location;
-    assign.dest = ir_operand_symbol(save);
-    assign.lhs = ir_operand_symbol(local->name);
-    if (local->float_bits) {
-      ir_assign_apply_float_bits(&assign, &assign.lhs, local->float_bits);
-    }
-    ok = ir_emit(context, out, &declare) && ir_emit(context, out, &assign) &&
-         ir_live_emit_simple(context, out, IR_OP_ADDRESS_OF,
-                             ir_operand_copy(&place), ir_operand_symbol(save),
-                             ir_operand_none(), NULL, location);
-    ir_operand_destroy(&declare.dest);
-    ir_operand_destroy(&assign.dest);
-    ir_operand_destroy(&assign.lhs);
-    free(save);
-  } else {
-    ok = ir_live_emit_simple(context, out, IR_OP_ADDRESS_OF,
-                             ir_operand_copy(&place),
-                             ir_operand_symbol(local->name), ir_operand_none(),
-                             NULL, location);
-  }
-  arguments[0] = ir_operand_string(local->key);
-  arguments[1] = ir_operand_int(local->layout);
-  arguments[2] = ir_operand_int(local->size);
-  arguments[3] = place;
-  ok = ok && ir_live_emit_call(context, out, IR_LIVE_PUT_NAME, arguments, 4,
-                               &none, location);
-  for (size_t i = 0; i < 4; i++) {
-    ir_operand_destroy(&arguments[i]);
-  }
-  return ok;
-}
-
-static int ir_live_emit_transfer(IRLoweringContext *context, IRFunction *out,
-                                 const IRFunction *function,
-                                 const IRLiveLocals *locals,
-                                 const IRLiveSite *site, size_t site_number) {
-  SourceLocation location = function->location;
-  char *resume = ir_live_resume_name(function->name, site_number);
-  IROperand result = ir_operand_none();
-  IRInstruction call = {0};
-  IRInstruction back = {0};
-  Type *return_type = NULL;
-  int ok = resume != NULL;
-  for (size_t i = 0; ok && i < site->local_count; i++) {
-    ok = ir_live_emit_put(context, out, &locals->items[i], location);
-  }
-  if (function->return_type_name &&
-      strcmp(function->return_type_name, "void") != 0) {
-    return_type = ir_resolve_named_type(context, function->return_type_name);
-    result = ir_live_new_temp(context);
-  }
-  call.op = IR_OP_CALL;
-  call.location = location;
-  call.text = resume;
-  call.dest = result;
-  call.value_type = return_type ? mtlc_type_from_frontend(return_type) : NULL;
-  ok = ok && ir_emit(context, out, &call);
-  back.op = IR_OP_RETURN;
-  back.location = location;
-  back.lhs = result;
-  if (result.kind != IR_OPERAND_NONE) {
-    int bits = ir_named_type_float_bits(context, function->return_type_name);
-    if (bits) {
-      ir_assign_apply_float_bits(&back, &back.lhs, bits);
-    }
-  }
-  ok = ok && ir_emit(context, out, &back);
-  ir_operand_destroy(&result);
-  free(resume);
-  return ok;
-}
-
 static void ir_live_shape_destroy(IRLiveShape *shape) {
   free(shape->rpo);
   free(shape->rpo_index);
@@ -894,20 +670,6 @@ done:
   return ok;
 }
 
-static size_t ir_live_label_block(const IRFunction *function,
-                                  const char *label) {
-  if (!label) {
-    return SIZE_MAX;
-  }
-  for (size_t b = 0; b < function->block_count; b++) {
-    if (function->blocks[b].label &&
-        strcmp(function->blocks[b].label, label) == 0) {
-      return b;
-    }
-  }
-  return SIZE_MAX;
-}
-
 static char *ir_live_fresh_label(IRLoweringContext *context,
                                  const char *original) {
   char prefix[96];
@@ -1011,18 +773,6 @@ static int ir_live_copy_instruction(IRLoweringContext *context,
   return ok;
 }
 
-typedef struct {
-  size_t header;
-  size_t loop;
-  char *land;
-} IRLiveLevel;
-
-static int ir_live_level_compare(const void *a, const void *b) {
-  const IRLiveLevel *x = (const IRLiveLevel *)a;
-  const IRLiveLevel *y = (const IRLiveLevel *)b;
-  return x->loop < y->loop ? 1 : (x->loop > y->loop ? -1 : 0);
-}
-
 static int ir_live_emit_load_into(IRLoweringContext *context, IRFunction *out,
                                   const IRLiveLocal *local,
                                   const IROperand *source,
@@ -1087,28 +837,17 @@ static int ir_live_emit_copy_bytes(IRLoweringContext *context,
                                    const IROperand *target,
                                    const IROperand *source,
                                    SourceLocation location) {
-  IRInstruction store = {0};
-  IROperand value = ir_operand_none();
-  int ok = 1;
-  store.op = IR_OP_STORE;
-  store.location = location;
-  store.dest = *target;
-  store.rhs = ir_operand_int(local->size);
-  if (local->size > 8) {
-    store.lhs = *source;
-  } else {
-    IRInstruction load = {0};
-    value = ir_live_new_temp(context);
-    load.op = IR_OP_LOAD;
-    load.location = location;
-    load.dest = value;
-    load.lhs = *source;
-    load.rhs = ir_operand_int(local->size);
-    ok = ir_emit(context, out, &load);
-    store.lhs = value;
+  IROperand arguments[3];
+  IROperand none = ir_operand_none();
+  int ok;
+  arguments[0] = ir_operand_copy(target);
+  arguments[1] = ir_operand_copy(source);
+  arguments[2] = ir_operand_int(local->size);
+  ok = ir_live_emit_call(context, out, IR_LIVE_COPY_NAME, arguments, 3, &none,
+                         location);
+  for (size_t i = 0; i < 3; i++) {
+    ir_operand_destroy(&arguments[i]);
   }
-  ok = ok && ir_emit(context, out, &store);
-  ir_operand_destroy(&value);
   return ok;
 }
 
@@ -1152,109 +891,6 @@ static int ir_live_emit_default_memory(IRLoweringContext *context,
   return ok;
 }
 
-static int ir_live_emit_take(IRLoweringContext *context, IRFunction *out,
-                             const IRLiveLocal *local, IROperand *found,
-                             SourceLocation location) {
-  IROperand arguments[3];
-  int ok;
-  *found = ir_live_new_temp(context);
-  arguments[0] = ir_operand_string(local->key);
-  arguments[1] = ir_operand_int(local->layout);
-  arguments[2] = ir_operand_int(local->size);
-  ok = ir_live_emit_call(context, out, IR_LIVE_TAKE_NAME, arguments, 3, found,
-                         location);
-  for (size_t i = 0; i < 3; i++) {
-    ir_operand_destroy(&arguments[i]);
-  }
-  return ok;
-}
-
-static int ir_live_emit_restore(IRLoweringContext *context, IRFunction *out,
-                                const IRLiveLocal *local, int address_only,
-                                SourceLocation location) {
-  IRInstruction declare = {0};
-  IROperand found = ir_operand_none();
-  IROperand place = ir_operand_none();
-  char *fallback = ir_new_label_name(context, "live_default");
-  char *done = ir_new_label_name(context, "live_restored");
-  char *at = address_only ? ir_live_local_name(local->name, ".at") : NULL;
-  int ok = fallback && done && (!address_only || at);
-  declare.op = IR_OP_DECLARE_LOCAL;
-  declare.location = location;
-  declare.dest = ir_operand_symbol(local->name);
-  declare.text = (char *)local->type_text;
-  declare.value_type = local->type;
-  ok = ok && (address_only || ir_emit(context, out, &declare));
-  ir_operand_destroy(&declare.dest);
-  if (ok && address_only) {
-    IRInstruction pointer = {0};
-    pointer.op = IR_OP_DECLARE_LOCAL;
-    pointer.location = location;
-    pointer.dest = ir_operand_symbol(at);
-    pointer.text = "rawptr";
-    pointer.value_type =
-        mtlc_type_from_frontend(context->type_checker->builtin_rawptr);
-    ok = ir_emit(context, out, &pointer);
-    ir_operand_destroy(&pointer.dest);
-  }
-  ok = ok && ir_live_emit_take(context, out, local, &found, location) &&
-       ir_live_emit_simple(context, out, IR_OP_BRANCH_ZERO, ir_operand_none(),
-                           ir_operand_copy(&found), ir_operand_none(),
-                           fallback, location);
-  if (ok && address_only) {
-    IROperand size = ir_operand_int(local->size);
-    place = ir_live_new_temp(context);
-    ok = ir_live_emit_simple(context, out, IR_OP_ASSIGN,
-                             ir_operand_symbol(at), ir_operand_copy(&found),
-                             ir_operand_none(), NULL, location) &&
-         ir_emit_jump_instruction(context, out, done, location) &&
-         ir_emit_label_instruction(context, out, fallback, location) &&
-         ir_live_emit_call(context, out, IR_LIVE_ALLOC_NAME, &size, 1, &place,
-                           location) &&
-         ir_live_emit_simple(context, out, IR_OP_ASSIGN,
-                             ir_operand_symbol(at), ir_operand_copy(&place),
-                             ir_operand_none(), NULL, location);
-    if (ok && local->initial_global) {
-      IROperand source = ir_live_new_temp(context);
-      ok = ir_live_emit_simple(context, out, IR_OP_ADDRESS_OF,
-                               ir_operand_copy(&source),
-                               ir_operand_symbol(local->initial_global),
-                               ir_operand_none(), NULL, location) &&
-           ir_live_emit_copy_bytes(context, out, local, &place, &source,
-                                   location);
-      ir_operand_destroy(&source);
-    }
-    ir_operand_destroy(&size);
-  } else if (ok && local->scalar) {
-    ok = ir_live_emit_load_into(context, out, local, &found, location) &&
-         ir_emit_jump_instruction(context, out, done, location) &&
-         ir_emit_label_instruction(context, out, fallback, location) &&
-         ir_live_emit_default_scalar(context, out, local, location);
-  } else if (ok) {
-    place = ir_live_new_temp(context);
-    ok = ir_live_emit_simple(context, out, IR_OP_ADDRESS_OF,
-                             ir_operand_copy(&place),
-                             ir_operand_symbol(local->name), ir_operand_none(),
-                             NULL, location) &&
-         ir_live_emit_copy_bytes(context, out, local, &place, &found,
-                                 location) &&
-         ir_emit_jump_instruction(context, out, done, location) &&
-         ir_emit_label_instruction(context, out, fallback, location) &&
-         ir_live_emit_simple(context, out, IR_OP_ADDRESS_OF,
-                             ir_operand_copy(&place),
-                             ir_operand_symbol(local->name), ir_operand_none(),
-                             NULL, location) &&
-         ir_live_emit_default_memory(context, out, local, &place, location);
-  }
-  ok = ok && ir_emit_label_instruction(context, out, done, location);
-  ir_operand_destroy(&found);
-  ir_operand_destroy(&place);
-  free(fallback);
-  free(done);
-  free(at);
-  return ok;
-}
-
 static int ir_live_symbol_mentioned(const IRInstruction *in,
                                     const char *name) {
   if ((in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
@@ -1294,64 +930,767 @@ static int ir_live_address_only(const IRFunction *body, size_t start,
   return 1;
 }
 
-static IRFunction *ir_live_build_continuation(IRLoweringContext *context,
-                                              IRFunction *function,
-                                              const IRLiveShape *shape,
-                                              const IRLiveLocals *locals,
-                                              const IRLiveSite *site,
-                                              size_t site_number) {
-  IRLiveLevel *levels = NULL;
-  size_t level_count = 0;
+static void ir_live_declare(IRLoweringContext *context, const char *name,
+                            const char *shape) {
+  IRModuleSymbol entry = {0};
+  MtlcType *params[8];
+  size_t count = 0;
+  if (!context || !context->program || !context->type_checker ||
+      ir_program_lookup_symbol(context->program, name)) {
+    return;
+  }
+  MtlcType *word = mtlc_type_from_frontend(context->type_checker->builtin_int64);
+  MtlcType *text =
+      mtlc_type_from_frontend(context->type_checker->builtin_string);
+  for (const char *c = shape; *c && count < 8u; c++) {
+    params[count++] = *c == 's' ? text : word;
+  }
+  entry.name = (char *)name;
+  entry.kind = IR_MODSYM_FUNCTION;
+  entry.is_extern = 1;
+  entry.type = word;
+  entry.return_type = word;
+  entry.param_types = count ? params : NULL;
+  entry.param_count = count;
+  ir_program_add_symbol(context->program, &entry);
+}
+
+static void ir_live_declare_helpers(IRLoweringContext *context) {
+  ir_live_declare(context, IR_LIVE_QUIESCE_NAME, "");
+  ir_live_declare(context, IR_LIVE_CHECK_NAME, "isis");
+  ir_live_declare(context, IR_LIVE_MOVED_NAME, "isis");
+  ir_live_declare(context, IR_LIVE_PUT_NAME, "siiii");
+  ir_live_declare(context, IR_LIVE_TAKE_NAME, "siii");
+  ir_live_declare(context, IR_LIVE_ZERO_NAME, "ii");
+  ir_live_declare(context, IR_LIVE_COPY_NAME, "iii");
+  ir_live_declare(context, IR_LIVE_END_NAME, "");
+  ir_live_declare(context, IR_LIVE_HAND_BACK_NAME, "i");
+  ir_live_declare(context, IR_LIVE_AGAIN_NAME, "");
+  ir_live_declare(context, IR_LIVE_LAST_KEY_NAME, "");
+}
+
+int ir_lower_live_marks_statement(const IRFunction *function,
+                                  int statement_type) {
+  if (!g_ir_lowering_live || !ir_live_function_movable(function)) {
+    return 0;
+  }
+  switch (statement_type) {
+  case AST_VAR_DECLARATION:
+  case AST_ASSIGNMENT:
+  case AST_FUNCTION_CALL:
+  case AST_FUNC_PTR_CALL:
+  case AST_GPU_LAUNCH:
+  case AST_UNARY_EXPRESSION:
+  case AST_BINARY_EXPRESSION:
+  case AST_MEMBER_ACCESS:
+  case AST_INDEX_EXPRESSION:
+  case AST_NEW_EXPRESSION:
+  case AST_CAST_EXPRESSION:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+int ir_lower_live_mark(IRLoweringContext *context, IRFunction *function,
+                       int begin, SourceLocation location) {
+  IRInstruction mark = {0};
+  mark.op = IR_OP_NOP;
+  mark.location = location;
+  mark.text = begin ? IR_LIVE_BEGIN_MARK : IR_LIVE_END_MARK;
+  return ir_emit(context, function, &mark);
+}
+
+static int ir_live_is_mark(const IRInstruction *instruction, const char *mark) {
+  return instruction->op == IR_OP_NOP && instruction->text &&
+         strcmp(instruction->text, mark) == 0;
+}
+
+static void ir_live_flag_name(const IRFunction *function, char *out,
+                              size_t capacity) {
+  snprintf(out, capacity, "%s" IR_LIVE_FRAME_SUFFIX, function->name);
+}
+
+static int ir_live_emit_address_of(IRLoweringContext *context,
+                                   IRFunction *out, const IROperand *dest,
+                                   const char *symbol,
+                                   SourceLocation location) {
+  return ir_live_emit_simple(context, out, IR_OP_ADDRESS_OF,
+                             ir_operand_copy(dest), ir_operand_symbol(symbol),
+                             ir_operand_none(), NULL, location);
+}
+
+static void ir_live_ensure_flag(IRLoweringContext *context,
+                                const IRFunction *function) {
+  char flag[512];
+  IRModuleSymbol entry = {0};
+  ir_live_flag_name(function, flag, sizeof(flag));
+  if (ir_program_lookup_symbol(context->program, flag)) {
+    return;
+  }
+  entry.name = flag;
+  entry.kind = IR_MODSYM_VARIABLE;
+  entry.type = mtlc_type_from_frontend(context->type_checker->builtin_int64);
+  ir_program_add_symbol(context->program, &entry);
+}
+
+int ir_lower_live_site(IRLoweringContext *context, IRFunction *function,
+                       SourceLocation location) {
+  char flag[512];
+  IROperand arguments[4];
+  IROperand address;
+  IROperand moved;
+  char *resume = NULL;
+  int ok;
+
+  ir_live_declare_helpers(context);
+  if (!ir_live_function_movable(function)) {
+    IROperand none = ir_operand_none();
+    return ir_live_emit_call(context, function, IR_LIVE_QUIESCE_NAME, NULL, 0,
+                             &none, location);
+  }
+  ir_live_flag_name(function, flag, sizeof(flag));
+  ir_live_ensure_flag(context, function);
+  address = ir_live_new_temp(context);
+  moved = ir_live_new_temp(context);
+  resume = ir_new_label_name(context, "live_resume");
+  if (!resume ||
+      !ir_live_emit_address_of(context, function, &address, flag, location)) {
+    free(resume);
+    ir_operand_destroy(&address);
+    ir_operand_destroy(&moved);
+    return 0;
+  }
+  arguments[0] = address;
+  arguments[1] = ir_operand_string("");
+  arguments[2] = ir_operand_int(0);
+  arguments[3] = ir_operand_string(function->name);
+  ok = ir_live_emit_call(context, function, IR_LIVE_CHECK_NAME, arguments, 4,
+                         &moved, location) &&
+       ir_live_emit_simple(context, function, IR_OP_BRANCH_ZERO,
+                           ir_operand_none(), ir_operand_copy(&moved),
+                           ir_operand_none(), resume, location) &&
+       ir_emit_label_instruction(context, function, resume, location);
+  for (size_t i = 0; i < 4; i++) {
+    ir_operand_destroy(&arguments[i]);
+  }
+  ir_operand_destroy(&moved);
+  free(resume);
+  return ok;
+}
+
+static int ir_live_is_site(const IRInstruction *instruction) {
+  return instruction->op == IR_OP_CALL && instruction->text &&
+         strcmp(instruction->text, IR_LIVE_CHECK_NAME) == 0;
+}
+
+static void ir_live_strip_marks(IRFunction *function) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+    if (ir_live_is_mark(instruction, IR_LIVE_BEGIN_MARK) ||
+        ir_live_is_mark(instruction, IR_LIVE_END_MARK)) {
+      mettle_free_string(instruction->text);
+      instruction->text = NULL;
+    }
+  }
+  ir_function_touch(function);
+}
+
+static uint64_t ir_live_operand_hash(uint64_t hash, const IROperand *operand) {
+  hash = ir_live_mix(hash, (uint64_t)operand->kind);
+  switch (operand->kind) {
+  case IR_OPERAND_SYMBOL: {
+    char *base = operand->name ? ir_live_base_name(operand->name) : NULL;
+    hash = ir_live_mix_text(hash, base);
+    free(base);
+    break;
+  }
+  case IR_OPERAND_INT:
+    hash = ir_live_mix(hash, (uint64_t)operand->int_value);
+    break;
+  case IR_OPERAND_FLOAT: {
+    uint64_t bits = 0;
+    memcpy(&bits, &operand->float_value, sizeof(bits));
+    hash = ir_live_mix(hash, bits);
+    break;
+  }
+  case IR_OPERAND_STRING: {
+    size_t length = ir_operand_string_length(operand);
+    hash = ir_live_mix(hash, length);
+    for (size_t i = 0; operand->name && i < length; i++) {
+      hash ^= (unsigned char)operand->name[i];
+      hash *= 1099511628211ull;
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  return hash;
+}
+
+static uint64_t ir_live_instruction_hash(uint64_t hash,
+                                         const IRInstruction *in) {
+  hash = ir_live_mix(hash, (uint64_t)in->op);
+  if (in->op != IR_OP_LABEL && in->op != IR_OP_JUMP &&
+      in->op != IR_OP_BRANCH_ZERO && in->op != IR_OP_BRANCH_EQ &&
+      in->op != IR_OP_NOP) {
+    hash = ir_live_mix_text(hash, in->text);
+  }
+  hash = ir_live_operand_hash(hash, &in->dest);
+  hash = ir_live_operand_hash(hash, &in->lhs);
+  hash = ir_live_operand_hash(hash, &in->rhs);
+  for (size_t a = 0; a < in->argument_count; a++) {
+    hash = ir_live_operand_hash(hash, &in->arguments[a]);
+  }
+  return hash;
+}
+
+static uint64_t ir_live_range_hash(const IRFunction *function, size_t from,
+                                   size_t to) {
+  uint64_t hash = 1469598103934665603ull;
+  for (size_t i = from; i < to && i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_NOP) {
+      continue;
+    }
+    hash = ir_live_instruction_hash(hash, in);
+  }
+  return hash;
+}
+
+static uint64_t ir_live_signature(const IRFunction *function) {
+  uint64_t hash = 1469598103934665603ull;
+  hash = ir_live_mix(hash, function->parameter_count);
+  for (size_t i = 0; i < function->parameter_count; i++) {
+    hash = ir_live_mix_text(hash, function->parameter_types
+                                      ? function->parameter_types[i]
+                                      : NULL);
+  }
+  return ir_live_mix_text(hash, function->return_type_name);
+}
+
+static int ir_live_returns_value(const IRFunction *function) {
+  return function->return_type_name &&
+         strcmp(function->return_type_name, "void") != 0;
+}
+
+static int ir_live_needs_persist(const IRLiveLocal *local) {
+  return !local->scalar || local->address_taken;
+}
+
+static int ir_live_emit_guard(IRLoweringContext *context, IRFunction *out,
+                              const char *count_name, size_t index,
+                              const char *skip, SourceLocation location) {
+  IROperand test = ir_live_new_temp(context);
+  int ok = ir_live_emit_simple(context, out, IR_OP_BINARY,
+                               ir_operand_copy(&test),
+                               ir_operand_symbol(count_name),
+                               ir_operand_int((long long)index), ">",
+                               location) &&
+           ir_live_emit_simple(context, out, IR_OP_BRANCH_ZERO,
+                               ir_operand_none(), ir_operand_copy(&test),
+                               ir_operand_none(), skip, location);
+  ir_operand_destroy(&test);
+  return ok;
+}
+
+static int ir_live_emit_declare(IRLoweringContext *context, IRFunction *out,
+                                const char *name, const char *type_text,
+                                MtlcType *type, SourceLocation location) {
+  IRInstruction declare = {0};
+  int ok;
+  declare.op = IR_OP_DECLARE_LOCAL;
+  declare.location = location;
+  declare.dest = ir_operand_symbol(name);
+  declare.text = (char *)type_text;
+  declare.value_type = type;
+  ok = ir_emit(context, out, &declare);
+  ir_operand_destroy(&declare.dest);
+  return ok;
+}
+
+static MtlcType *ir_live_word_type(IRLoweringContext *context) {
+  return mtlc_type_from_frontend(context->type_checker->builtin_int64);
+}
+
+static int ir_live_emit_put(IRLoweringContext *context, IRFunction *out,
+                            const IRLiveLocal *local, int bottom,
+                            SourceLocation location) {
+  IROperand place = ir_live_new_temp(context);
+  IROperand arguments[5];
+  IROperand none = ir_operand_none();
+  int ok = 1;
+  int keep_flag = 0;
+  if (local->scalar && !local->address_taken) {
+    char *save = ir_live_local_name(local->name, ".live");
+    IRInstruction assign = {0};
+    if (!save) {
+      ir_operand_destroy(&place);
+      return 0;
+    }
+    assign.op = IR_OP_ASSIGN;
+    assign.location = location;
+    assign.dest = ir_operand_symbol(save);
+    assign.lhs = ir_operand_symbol(local->name);
+    if (local->float_bits) {
+      ir_assign_apply_float_bits(&assign, &assign.lhs, local->float_bits);
+    }
+    ok = ir_live_emit_declare(context, out, save, local->type_text,
+                              local->type, location) &&
+         ir_emit(context, out, &assign) &&
+         ir_live_emit_address_of(context, out, &place, save, location);
+    ir_operand_destroy(&assign.dest);
+    ir_operand_destroy(&assign.lhs);
+    free(save);
+  } else {
+    ok = ir_live_emit_address_of(context, out, &place, local->name, location);
+    keep_flag = !bottom;
+  }
+  arguments[0] = ir_operand_string(local->key);
+  arguments[1] = ir_operand_int(local->layout);
+  arguments[2] = ir_operand_int(local->size);
+  arguments[3] = place;
+  if (bottom) {
+    arguments[4] = ir_operand_int(1);
+  } else if (keep_flag) {
+    char *persist = ir_live_local_name(local->name, ".persist");
+    arguments[4] = ir_operand_symbol(persist ? persist : local->name);
+    free(persist);
+  } else {
+    arguments[4] = ir_operand_int(0);
+  }
+  ok = ok && ir_live_emit_call(context, out, IR_LIVE_PUT_NAME, arguments, 5,
+                               &none, location);
+  for (size_t i = 0; i < 5; i++) {
+    ir_operand_destroy(&arguments[i]);
+  }
+  return ok;
+}
+
+static int ir_live_emit_guarded_puts(IRLoweringContext *context,
+                                     IRFunction *out,
+                                     const IRLiveLocals *locals, int bottom,
+                                     SourceLocation location) {
+  for (size_t i = 0; i < locals->count; i++) {
+    char *skip = ir_new_label_name(context, "live_put_skip");
+    int ok = skip &&
+             ir_live_emit_guard(context, out, ".live_count", i, skip,
+                                location) &&
+             ir_live_emit_put(context, out, &locals->items[i], bottom,
+                              location) &&
+             ir_emit_label_instruction(context, out, skip, location);
+    free(skip);
+    if (!ok) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static char *ir_live_resume_name(const char *owner) {
+  size_t length = strlen(owner) + sizeof(IR_LIVE_RESUME_SUFFIX);
+  char *text = malloc(length);
+  if (text) {
+    snprintf(text, length, "%s" IR_LIVE_RESUME_SUFFIX, owner);
+  }
+  return text;
+}
+
+static int ir_live_emit_return(IRLoweringContext *context, IRFunction *out,
+                               const IRFunction *function,
+                               const IROperand *value,
+                               SourceLocation location) {
+  IRInstruction back = {0};
+  back.op = IR_OP_RETURN;
+  back.location = location;
+  back.lhs = value ? *value : ir_operand_none();
+  if (back.lhs.kind != IR_OPERAND_NONE) {
+    int bits = ir_named_type_float_bits(context, function->return_type_name);
+    if (bits) {
+      ir_assign_apply_float_bits(&back, &back.lhs, bits);
+    }
+  }
+  return ir_emit(context, out, &back);
+}
+
+static int ir_live_emit_bottom_transfer(IRLoweringContext *context,
+                                        IRFunction *out,
+                                        const IRFunction *function,
+                                        const IRLiveLocals *locals,
+                                        const char *transfer_label) {
+  SourceLocation location = function->location;
+  char *resume = ir_live_resume_name(function->name);
+  char *again = ir_new_label_name(context, "live_again");
+  char *leave = ir_new_label_name(context, "live_leave");
+  IROperand result = ir_operand_none();
+  IROperand more = ir_live_new_temp(context);
+  IROperand key = ir_live_new_temp(context);
+  IROperand none = ir_operand_none();
+  IROperand argument = ir_operand_symbol(".live_key");
+  Type *return_type = NULL;
+  IRInstruction call = {0};
+  int ok = resume && again && leave;
+  if (ok && ir_live_returns_value(function)) {
+    return_type = ir_resolve_named_type(context, function->return_type_name);
+    result = ir_live_new_temp(context);
+  }
+  ok = ok && ir_emit_label_instruction(context, out, transfer_label, location) &&
+       ir_live_emit_guarded_puts(context, out, locals, 1, location) &&
+       ir_emit_label_instruction(context, out, again, location);
+  call.op = IR_OP_CALL;
+  call.location = location;
+  call.text = resume;
+  call.dest = result;
+  call.arguments = &argument;
+  call.argument_count = 1;
+  call.value_type = return_type ? mtlc_type_from_frontend(return_type) : NULL;
+  ok = ok && ir_emit(context, out, &call) &&
+       ir_live_emit_call(context, out, IR_LIVE_AGAIN_NAME, NULL, 0, &more,
+                         location) &&
+       ir_live_emit_simple(context, out, IR_OP_BRANCH_ZERO, ir_operand_none(),
+                           ir_operand_copy(&more), ir_operand_none(), leave,
+                           location) &&
+       ir_live_emit_call(context, out, IR_LIVE_LAST_KEY_NAME, NULL, 0, &key,
+                         location) &&
+       ir_live_emit_simple(context, out, IR_OP_ASSIGN,
+                           ir_operand_symbol(".live_key"),
+                           ir_operand_copy(&key), ir_operand_none(), NULL,
+                           location) &&
+       ir_emit_jump_instruction(context, out, again, location) &&
+       ir_emit_label_instruction(context, out, leave, location) &&
+       ir_live_emit_return(context, out, function,
+                           result.kind != IR_OPERAND_NONE ? &result : &none,
+                           location);
+  ir_operand_destroy(&result);
+  ir_operand_destroy(&more);
+  ir_operand_destroy(&key);
+  ir_operand_destroy(&argument);
+  free(resume);
+  free(again);
+  free(leave);
+  return ok;
+}
+
+static int ir_live_emit_clone_transfer(IRLoweringContext *context,
+                                       IRFunction *out,
+                                       const IRFunction *function,
+                                       const IRLiveLocals *locals,
+                                       const char *transfer_label) {
+  SourceLocation location = function->location;
+  IROperand argument = ir_operand_symbol(".live_key");
+  IROperand none = ir_operand_none();
+  IROperand result = ir_live_returns_value(function)
+                         ? ir_operand_symbol(".live_ret")
+                         : ir_operand_none();
+  int ok = ir_emit_label_instruction(context, out, transfer_label, location) &&
+           ir_live_emit_guarded_puts(context, out, locals, 0, location) &&
+           ir_live_emit_call(context, out, IR_LIVE_HAND_BACK_NAME, &argument,
+                             1, &none, location) &&
+           ir_live_emit_return(context, out, function,
+                               result.kind != IR_OPERAND_NONE ? &result
+                                                              : &none,
+                               location);
+  ir_operand_destroy(&argument);
+  ir_operand_destroy(&result);
+  return ok;
+}
+
+static int ir_live_emit_take(IRLoweringContext *context, IRFunction *out,
+                             const IRLiveLocal *local, int want_storage,
+                             IROperand *found, SourceLocation location) {
+  IROperand arguments[4];
+  int ok;
+  *found = ir_live_new_temp(context);
+  arguments[0] = ir_operand_string(local->key);
+  arguments[1] = ir_operand_int(local->layout);
+  arguments[2] = ir_operand_int(local->size);
+  arguments[3] = ir_operand_int(want_storage);
+  ok = ir_live_emit_call(context, out, IR_LIVE_TAKE_NAME, arguments, 4, found,
+                         location);
+  for (size_t i = 0; i < 4; i++) {
+    ir_operand_destroy(&arguments[i]);
+  }
+  return ok;
+}
+
+static int ir_live_emit_restore(IRLoweringContext *context, IRFunction *out,
+                                const IRLiveLocal *local, int address_only,
+                                SourceLocation location) {
+  IROperand found = ir_operand_none();
+  IROperand place = ir_operand_none();
+  char *fallback = ir_new_label_name(context, "live_default");
+  char *done = ir_new_label_name(context, "live_restored");
+  char *at = address_only ? ir_live_local_name(local->name, ".at") : NULL;
+  char *persist =
+      address_only ? ir_live_local_name(local->name, ".persist") : NULL;
+  int ok = fallback && done && (!address_only || (at && persist));
+  ok = ok &&
+       ir_live_emit_take(context, out, local, address_only, &found, location) &&
+       ir_live_emit_simple(context, out, IR_OP_BRANCH_ZERO, ir_operand_none(),
+                           ir_operand_copy(&found), ir_operand_none(),
+                           fallback, location);
+  if (ok && address_only) {
+    place = ir_live_new_temp(context);
+    ok = ir_live_emit_simple(context, out, IR_OP_ASSIGN,
+                             ir_operand_symbol(at), ir_operand_copy(&found),
+                             ir_operand_none(), NULL, location) &&
+         ir_live_emit_simple(context, out, IR_OP_ASSIGN,
+                             ir_operand_symbol(persist), ir_operand_int(1),
+                             ir_operand_none(), NULL, location) &&
+         ir_emit_jump_instruction(context, out, done, location) &&
+         ir_emit_label_instruction(context, out, fallback, location) &&
+         ir_live_emit_address_of(context, out, &place, local->name,
+                                 location) &&
+         ir_live_emit_default_memory(context, out, local, &place, location);
+  } else if (ok && local->scalar) {
+    ok = ir_live_emit_load_into(context, out, local, &found, location) &&
+         ir_emit_jump_instruction(context, out, done, location) &&
+         ir_emit_label_instruction(context, out, fallback, location) &&
+         ir_live_emit_default_scalar(context, out, local, location);
+  } else if (ok) {
+    place = ir_live_new_temp(context);
+    ok = ir_live_emit_address_of(context, out, &place, local->name,
+                                 location) &&
+         ir_live_emit_copy_bytes(context, out, local, &place, &found,
+                                 location) &&
+         ir_emit_jump_instruction(context, out, done, location) &&
+         ir_emit_label_instruction(context, out, fallback, location) &&
+         ir_live_emit_address_of(context, out, &place, local->name,
+                                 location) &&
+         ir_live_emit_default_memory(context, out, local, &place, location);
+  }
+  ok = ok && ir_emit_label_instruction(context, out, done, location);
+  ir_operand_destroy(&found);
+  ir_operand_destroy(&place);
+  free(fallback);
+  free(done);
+  free(at);
+  free(persist);
+  return ok;
+}
+
+static int ir_live_compare_size(const void *a, const void *b) {
+  const size_t *x = (const size_t *)a;
+  const size_t *y = (const size_t *)b;
+  return x[1] < y[1] ? 1 : (x[1] > y[1] ? -1 : 0);
+}
+
+static uint64_t ir_live_loop_signature(const IRFunction *function,
+                                       const IRLiveShape *shape,
+                                       size_t block) {
+  size_t (*pairs)[2] = NULL;
+  size_t count = 0;
+  uint64_t hash = 1469598103934665603ull;
+  if (block == SIZE_MAX || shape->rpo_index[block] == SIZE_MAX) {
+    return hash;
+  }
+  pairs = malloc((shape->loop_count ? shape->loop_count : 1u) *
+                 sizeof(*pairs));
+  if (!pairs) {
+    return hash;
+  }
+  for (size_t l = 0; l < shape->loop_count; l++) {
+    if (shape->loop_body[l][block]) {
+      pairs[count][0] = shape->loop_header[l];
+      pairs[count][1] = shape->loop_size[l];
+      count++;
+    }
+  }
+  qsort(pairs, count, sizeof(*pairs), ir_live_compare_size);
+  for (size_t i = 0; i < count; i++) {
+    const IRBasicBlock *header = &function->blocks[pairs[i][0]];
+    hash = ir_live_mix(hash, ir_live_range_hash(function,
+                                                header->first_instruction,
+                                                header->first_instruction +
+                                                    header->instruction_count));
+  }
+  free(pairs);
+  return hash;
+}
+
+static int ir_live_site_compare(const void *a, const void *b) {
+  const IRLiveSite *x = (const IRLiveSite *)a;
+  const IRLiveSite *y = (const IRLiveSite *)b;
+  return x->position < y->position ? -1 : (x->position > y->position ? 1 : 0);
+}
+
+static void ir_live_hex(char *out, uint64_t value) {
+  static const char digits[] = "0123456789abcdef";
+  for (int i = 15; i >= 0; i--) {
+    out[i] = digits[value & 15u];
+    value >>= 4;
+  }
+}
+
+static char *ir_live_table_text(const IRFunction *function,
+                                const IRLiveSite *sites, size_t count) {
+  size_t length = 4u + 16u + count * 16u + 1u;
+  char *text = malloc(length + 1u);
+  if (!text) {
+    return NULL;
+  }
+  memcpy(text, "MTLV", 4u);
+  ir_live_hex(text + 4, ir_live_signature(function));
+  for (size_t i = 0; i < count; i++) {
+    ir_live_hex(text + 20 + i * 16u, sites[i].key);
+  }
+  text[length - 1u] = '.';
+  text[length] = '\0';
+  return text;
+}
+
+static void ir_live_demote(IRFunction *function) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+    if (!ir_live_is_site(instruction)) {
+      continue;
+    }
+    for (size_t a = 0; a < instruction->argument_count; a++) {
+      ir_operand_destroy(&instruction->arguments[a]);
+    }
+    free(instruction->arguments);
+    instruction->arguments = NULL;
+    instruction->argument_count = 0;
+    ir_operand_destroy(&instruction->dest);
+    instruction->dest = ir_operand_none();
+    mettle_free_string(instruction->text);
+    instruction->text = mettle_strdup(IR_LIVE_QUIESCE_NAME);
+    if (i + 1u < function->instruction_count &&
+        function->instructions[i + 1u].op == IR_OP_BRANCH_ZERO) {
+      IRInstruction *branch = &function->instructions[i + 1u];
+      ir_operand_destroy(&branch->lhs);
+      branch->lhs = ir_operand_none();
+      mettle_free_string(branch->text);
+      branch->text = NULL;
+      branch->op = IR_OP_NOP;
+    }
+  }
+  ir_function_clear_cfg(function);
+  ir_function_touch(function);
+}
+
+static int ir_live_put_index(IRLiveMap *map, const char *key, size_t value) {
+  char *text = malloc(24);
+  if (!text) {
+    return 0;
+  }
+  snprintf(text, 24, "%zu", value);
+  if (!ir_live_map_put(map, key, text)) {
+    free(text);
+    return 0;
+  }
+  return 1;
+}
+
+static size_t ir_live_get_index(const IRLiveMap *map, const char *key) {
+  const char *text = ir_live_map_get(map, key);
+  return text ? (size_t)strtoull(text, NULL, 10) : SIZE_MAX;
+}
+
+static IRFunction *ir_live_build_continuation(
+    IRLoweringContext *context, IRFunction *function, const IRLiveShape *shape,
+    const IRLiveLocals *locals, const IRLiveSite *sites, size_t site_count,
+    size_t transfer_start, const char *transfer_label) {
+  size_t loops = shape->loop_count;
+  size_t *site_loop = calloc(site_count ? site_count : 1u, sizeof(size_t));
+  size_t *parent = calloc(loops ? loops : 1u, sizeof(size_t));
+  unsigned char *needed = calloc(loops ? loops : 1u, 1u);
+  size_t *copy_of = calloc(loops ? loops : 1u, sizeof(size_t));
+  size_t *copy_loop = calloc(loops + 1u, sizeof(size_t));
+  char **landing = calloc(loops ? loops : 1u, sizeof(char *));
+  char **entries = calloc(site_count ? site_count : 1u, sizeof(char *));
+  IRLiveMap label_blocks = {0};
   IRLiveMap *labels = NULL;
   IRLiveMap *temps = NULL;
   IRFunction *staging = NULL;
   IRFunction *clone = NULL;
   unsigned char *reachable = NULL;
   unsigned char *address_only = NULL;
-  char *name = ir_live_resume_name(function->name, site_number);
-  char *start = ir_new_label_name(context, "live_start");
-  size_t resume_block = ir_live_label_block(function, site->resume_label);
-  const char *entry_target = NULL;
+  char *name = ir_live_resume_name(function->name);
+  char *clone_transfer = ir_new_label_name(context, "live_transfer");
+  size_t copy_count = 0;
+  SourceLocation location = function->location;
   int ok = 0;
 
-  if (!name || !start || resume_block == SIZE_MAX ||
-      shape->rpo_index[resume_block] == SIZE_MAX) {
+  if (!site_loop || !parent || !needed || !copy_of || !copy_loop || !landing ||
+      !entries || !name || !clone_transfer) {
     goto done;
   }
-  for (size_t l = 0; l < shape->loop_count; l++) {
-    if (!shape->loop_body[l][resume_block]) {
-      continue;
-    }
-    IRLiveLevel *grown =
-        realloc(levels, (level_count + 1u) * sizeof(IRLiveLevel));
-    if (!grown) {
+  for (size_t b = 0; b < function->block_count; b++) {
+    if (function->blocks[b].label &&
+        !ir_live_put_index(&label_blocks, function->blocks[b].label, b)) {
       goto done;
     }
-    levels = grown;
-    levels[level_count].header = shape->loop_header[l];
-    levels[level_count].loop = shape->loop_size[l];
-    levels[level_count].land = NULL;
-    level_count++;
   }
-  qsort(levels, level_count, sizeof(IRLiveLevel), ir_live_level_compare);
-  for (size_t j = 0; j < level_count; j++) {
-    size_t loop = SIZE_MAX;
-    const IRBasicBlock *header = &function->blocks[levels[j].header];
-    for (size_t l = 0; l < shape->loop_count; l++) {
-      if (shape->loop_header[l] == levels[j].header) {
-        loop = l;
+  for (size_t j = 0; j < site_count; j++) {
+    size_t block = ir_live_get_index(&label_blocks, sites[j].resume_label);
+    size_t best = SIZE_MAX;
+    if (block == SIZE_MAX || shape->rpo_index[block] == SIZE_MAX) {
+      goto done;
+    }
+    for (size_t l = 0; l < loops; l++) {
+      if (shape->loop_body[l][block] &&
+          (best == SIZE_MAX || shape->loop_size[l] < shape->loop_size[best])) {
+        best = l;
       }
     }
-    levels[j].loop = loop;
-    if (loop == SIZE_MAX || !header->label || header->instruction_count == 0 ||
+    site_loop[j] = best;
+  }
+  for (size_t l = 0; l < loops; l++) {
+    size_t best = SIZE_MAX;
+    for (size_t m = 0; m < loops; m++) {
+      if (m == l || !shape->loop_body[m][shape->loop_header[l]] ||
+          shape->loop_size[m] <= shape->loop_size[l]) {
+        continue;
+      }
+      if (best == SIZE_MAX || shape->loop_size[m] < shape->loop_size[best]) {
+        best = m;
+      }
+    }
+    parent[l] = best;
+  }
+  for (size_t j = 0; j < site_count; j++) {
+    for (size_t x = site_loop[j]; x != SIZE_MAX; x = parent[x]) {
+      needed[x] = 1;
+    }
+  }
+  for (size_t round = 0; round < loops; round++) {
+    size_t pick = SIZE_MAX;
+    for (size_t l = 0; l < loops; l++) {
+      int placed = 0;
+      for (size_t c = 0; c < copy_count && !placed; c++) {
+        placed = copy_loop[c] == l;
+      }
+      if (!needed[l] || placed) {
+        continue;
+      }
+      if (pick == SIZE_MAX || shape->loop_size[l] < shape->loop_size[pick]) {
+        pick = l;
+      }
+    }
+    if (pick == SIZE_MAX) {
+      break;
+    }
+    copy_of[pick] = copy_count;
+    copy_loop[copy_count++] = pick;
+  }
+  copy_loop[copy_count++] = SIZE_MAX;
+  for (size_t l = 0; l < loops; l++) {
+    const IRBasicBlock *header;
+    if (!needed[l]) {
+      continue;
+    }
+    header = &function->blocks[shape->loop_header[l]];
+    if (!header->label || header->instruction_count == 0 ||
         header->instructions[0].op != IR_OP_LABEL) {
       goto done;
     }
     for (size_t b = 0; b < function->block_count; b++) {
       const IRBasicBlock *block = &function->blocks[b];
       const IRInstruction *last;
-      if (!shape->loop_body[loop][b] || block->instruction_count == 0 ||
-          b + 1u != levels[j].header) {
+      if (!shape->loop_body[l][b] || block->instruction_count == 0 ||
+          b + 1u != shape->loop_header[l]) {
         continue;
       }
       last = &block->instructions[block->instruction_count - 1u];
@@ -1359,47 +1698,77 @@ static IRFunction *ir_live_build_continuation(IRLoweringContext *context,
         goto done;
       }
     }
-    levels[j].land = ir_new_label_name(context, "live_land");
-    if (!levels[j].land) {
+    landing[l] = ir_new_label_name(context, "live_land");
+    if (!landing[l]) {
       goto done;
     }
   }
-  labels = calloc(level_count + 1u, sizeof(IRLiveMap));
-  temps = calloc(level_count + 1u, sizeof(IRLiveMap));
+  labels = calloc(copy_count, sizeof(IRLiveMap));
+  temps = calloc(copy_count, sizeof(IRLiveMap));
   staging = ir_function_create(name);
   if (!labels || !temps || !staging) {
     goto done;
   }
-  if (!ir_emit_label_instruction(context, staging, start, function->location)) {
-    goto done;
+  for (size_t j = 0; j < site_count; j++) {
+    size_t c = site_loop[j] == SIZE_MAX ? copy_count - 1u
+                                        : copy_of[site_loop[j]];
+    const char *renamed =
+        ir_live_rename(context, &labels[c], sites[j].resume_label, 1);
+    if (!renamed) {
+      goto done;
+    }
+    entries[j] = mettle_strdup(renamed);
+    if (!entries[j]) {
+      goto done;
+    }
   }
-  entry_target = ir_live_rename(context, &labels[level_count],
-                                site->resume_label, 1);
-  if (!entry_target ||
-      !ir_emit_jump_instruction(context, staging, entry_target,
-                                function->location)) {
-    goto done;
+  {
+    char *start = ir_new_label_name(context, "live_start");
+    int started = start && ir_emit_label_instruction(context, staging, start,
+                                                     location);
+    free(start);
+    if (!started) {
+      goto done;
+    }
+    for (size_t j = 0; j < site_count; j++) {
+      if (!ir_live_emit_simple(context, staging, IR_OP_BRANCH_ZERO,
+                               ir_operand_none(), ir_operand_int(0),
+                               ir_operand_none(), entries[j], location)) {
+        goto done;
+      }
+    }
+    if (!ir_live_emit_simple(context, staging, IR_OP_RETURN, ir_operand_none(),
+                             ir_operand_none(), ir_operand_none(), NULL,
+                             location)) {
+      goto done;
+    }
   }
-  for (size_t c = level_count + 1u; c-- > 0;) {
-    for (size_t i = 0; i < function->instruction_count; i++) {
+  for (size_t c = 0; c < copy_count; c++) {
+    size_t loop = copy_loop[c];
+    for (size_t i = 0; i < transfer_start; i++) {
       const IRInstruction *in = &function->instructions[i];
-      size_t block = shape->block_of[i];
       const char *target = NULL;
       if (in->op == IR_OP_NOP && in->text && strncmp(in->text, "@@", 2) == 0) {
         continue;
       }
-      if (c < level_count &&
-          i == function->blocks[levels[c].header].first_instruction &&
-          !ir_emit_label_instruction(context, staging, levels[c].land,
-                                     function->location)) {
-        goto done;
+      for (size_t l = 0; l < loops; l++) {
+        if (needed[l] && parent[l] == loop &&
+            i == function->blocks[shape->loop_header[l]].first_instruction &&
+            !ir_emit_label_instruction(context, staging, landing[l],
+                                       location)) {
+          goto done;
+        }
       }
-      if (ir_live_is_jump(in)) {
-        size_t to = ir_live_label_block(function, in->text);
-        for (size_t j = 0; j < c && j < level_count; j++) {
-          if (to == levels[j].header && shape->loop_body[levels[j].loop][block]) {
-            target = levels[j].land;
-            break;
+      if (ir_live_is_jump(in) && in->text) {
+        if (strcmp(in->text, transfer_label) == 0) {
+          target = clone_transfer;
+        } else {
+          size_t to = ir_live_get_index(&label_blocks, in->text);
+          size_t block = shape->block_of[i];
+          for (size_t y = loop; y != SIZE_MAX && !target; y = parent[y]) {
+            if (to == shape->loop_header[y] && shape->loop_body[y][block]) {
+              target = landing[y];
+            }
           }
         }
       }
@@ -1409,7 +1778,9 @@ static IRFunction *ir_live_build_continuation(IRLoweringContext *context,
       }
     }
   }
-  if (!ir_function_rebuild_cfg(staging)) {
+  if (!ir_live_emit_clone_transfer(context, staging, function, locals,
+                                   clone_transfer) ||
+      !ir_function_rebuild_cfg(staging)) {
     goto done;
   }
   reachable = calloc(staging->block_count ? staging->block_count : 1u, 1u);
@@ -1435,19 +1806,6 @@ static IRFunction *ir_live_build_continuation(IRLoweringContext *context,
     }
     free(stack);
   }
-  clone = ir_function_create(name);
-  if (!clone) {
-    goto done;
-  }
-  clone->location = function->location;
-  clone->is_noinline = 1;
-  clone->is_exported = 0;
-  if (function->return_type_name) {
-    clone->return_type_name = mettle_strdup(function->return_type_name);
-    if (!clone->return_type_name) {
-      goto done;
-    }
-  }
   {
     IRFunction *kept = ir_function_create(name);
     if (!kept) {
@@ -1468,34 +1826,154 @@ static IRFunction *ir_live_build_continuation(IRLoweringContext *context,
     ir_function_destroy(staging);
     staging = kept;
   }
-  address_only = calloc(site->local_count ? site->local_count : 1u, 1u);
-  if (!address_only) {
+  address_only = calloc(locals->count ? locals->count : 1u, 1u);
+  clone = ir_function_create(name);
+  if (!address_only || !clone) {
     goto done;
   }
+  for (size_t i = 0; i < locals->count; i++) {
+    address_only[i] =
+        (unsigned char)ir_live_address_only(staging, 0, locals->items[i].name);
+  }
   {
+    const char *parameter_names[1] = {IR_LIVE_KEY_PARAM};
+    const char *parameter_types[1] = {"int64"};
+    if (!ir_function_set_parameters(clone, parameter_names, parameter_types,
+                                    1)) {
+      goto done;
+    }
+  }
+  clone->location = location;
+  clone->is_noinline = 1;
+  if (function->return_type_name) {
+    clone->return_type_name = mettle_strdup(function->return_type_name);
+    if (!clone->return_type_name) {
+      goto done;
+    }
+  }
+  {
+    MtlcType *word = ir_live_word_type(context);
+    MtlcType *pointer =
+        mtlc_type_from_frontend(context->type_checker->builtin_rawptr);
     char *entry = ir_new_label_name(context, "entry");
-    int emitted = entry && ir_emit_label_instruction(context, clone, entry,
-                                                     function->location);
-    free(entry);
-    if (!emitted) {
-      goto done;
-    }
-  }
-  for (size_t i = 0; i < site->local_count; i++) {
-    const IRLiveLocal *local = &locals->items[i];
-    address_only[i] = (unsigned char)ir_live_address_only(staging, 0,
-                                                          local->name);
-    if (!ir_live_emit_restore(context, clone, local, address_only[i],
-                              function->location)) {
-      goto done;
-    }
-  }
-  {
+    char *restore = ir_new_label_name(context, "live_restore");
     IROperand none = ir_operand_none();
-    if (!ir_live_emit_call(context, clone, IR_LIVE_END_NAME, NULL, 0, &none,
-                           function->location) ||
-        !ir_emit_jump_instruction(context, clone, entry_target,
-                                  function->location)) {
+    int emitted = entry && restore &&
+                  ir_emit_label_instruction(context, clone, entry, location) &&
+                  ir_live_emit_declare(context, clone, ".live_key", "int64",
+                                       word, location) &&
+                  ir_live_emit_declare(context, clone, ".live_count", "int64",
+                                       word, location) &&
+                  ir_live_emit_declare(context, clone, ".live_n", "int64",
+                                       word, location) &&
+                  ir_live_emit_simple(context, clone, IR_OP_ASSIGN,
+                                      ir_operand_symbol(".live_n"),
+                                      ir_operand_int(0), ir_operand_none(),
+                                      NULL, location);
+    if (emitted && ir_live_returns_value(function)) {
+      Type *resolved =
+          ir_resolve_named_type(context, function->return_type_name);
+      emitted = ir_live_emit_declare(context, clone, ".live_ret",
+                                     function->return_type_name,
+                                     mtlc_type_from_frontend(resolved),
+                                     location);
+    }
+    for (size_t i = 0; emitted && i < locals->count; i++) {
+      const IRLiveLocal *local = &locals->items[i];
+      emitted = ir_live_emit_declare(context, clone, local->name,
+                                     local->type_text, local->type, location);
+      if (emitted && (ir_live_needs_persist(local) || address_only[i])) {
+        char *persist = ir_live_local_name(local->name, ".persist");
+        emitted = persist &&
+                  ir_live_emit_declare(context, clone, persist, "int64", word,
+                                       location) &&
+                  ir_live_emit_simple(context, clone, IR_OP_ASSIGN,
+                                      ir_operand_symbol(persist),
+                                      ir_operand_int(0), ir_operand_none(),
+                                      NULL, location);
+        free(persist);
+      }
+      if (emitted && address_only[i]) {
+        char *at = ir_live_local_name(local->name, ".at");
+        IROperand own = ir_live_new_temp(context);
+        emitted = at &&
+                  ir_live_emit_declare(context, clone, at, "rawptr", pointer,
+                                       location) &&
+                  ir_live_emit_address_of(context, clone, &own, local->name,
+                                          location) &&
+                  ir_live_emit_simple(context, clone, IR_OP_ASSIGN,
+                                      ir_operand_symbol(at),
+                                      ir_operand_copy(&own), ir_operand_none(),
+                                      NULL, location);
+        ir_operand_destroy(&own);
+        free(at);
+      }
+    }
+    for (size_t j = 0; emitted && j < site_count; j++) {
+      IROperand same = ir_live_new_temp(context);
+      char *next = ir_new_label_name(context, "live_site_next");
+      emitted = next &&
+                ir_live_emit_simple(context, clone, IR_OP_BINARY,
+                                    ir_operand_copy(&same),
+                                    ir_operand_symbol(IR_LIVE_KEY_PARAM),
+                                    ir_operand_int((long long)sites[j].key),
+                                    "==", location) &&
+                ir_live_emit_simple(context, clone, IR_OP_BRANCH_ZERO,
+                                    ir_operand_none(), ir_operand_copy(&same),
+                                    ir_operand_none(), next, location) &&
+                ir_live_emit_simple(context, clone, IR_OP_ASSIGN,
+                                    ir_operand_symbol(".live_n"),
+                                    ir_operand_int(
+                                        (long long)sites[j].local_count),
+                                    ir_operand_none(), NULL, location) &&
+                ir_emit_jump_instruction(context, clone, restore, location) &&
+                ir_emit_label_instruction(context, clone, next, location);
+      ir_operand_destroy(&same);
+      free(next);
+    }
+    emitted = emitted && ir_emit_label_instruction(context, clone, restore,
+                                                   location);
+    for (size_t i = 0; emitted && i < locals->count; i++) {
+      char *skip = ir_new_label_name(context, "live_restore_skip");
+      emitted = skip &&
+                ir_live_emit_guard(context, clone, ".live_n", i, skip,
+                                   location) &&
+                ir_live_emit_restore(context, clone, &locals->items[i],
+                                     address_only[i], location) &&
+                ir_emit_label_instruction(context, clone, skip, location);
+      free(skip);
+    }
+    emitted = emitted && ir_live_emit_call(context, clone, IR_LIVE_END_NAME,
+                                           NULL, 0, &none, location);
+    for (size_t j = 0; emitted && j < site_count; j++) {
+      IROperand same = ir_live_new_temp(context);
+      char *next = ir_new_label_name(context, "live_enter_next");
+      emitted = next &&
+                ir_live_emit_simple(context, clone, IR_OP_BINARY,
+                                    ir_operand_copy(&same),
+                                    ir_operand_symbol(IR_LIVE_KEY_PARAM),
+                                    ir_operand_int((long long)sites[j].key),
+                                    "==", location) &&
+                ir_live_emit_simple(context, clone, IR_OP_BRANCH_ZERO,
+                                    ir_operand_none(), ir_operand_copy(&same),
+                                    ir_operand_none(), next, location) &&
+                ir_emit_jump_instruction(context, clone, entries[j],
+                                         location) &&
+                ir_emit_label_instruction(context, clone, next, location);
+      ir_operand_destroy(&same);
+      free(next);
+    }
+    if (emitted) {
+      IROperand result = ir_live_returns_value(function)
+                             ? ir_operand_symbol(".live_ret")
+                             : ir_operand_none();
+      emitted = ir_live_emit_return(context, clone, function, &result,
+                                    location);
+      ir_operand_destroy(&result);
+    }
+    free(entry);
+    free(restore);
+    if (!emitted) {
       goto done;
     }
   }
@@ -1504,23 +1982,12 @@ static IRFunction *ir_live_build_continuation(IRLoweringContext *context,
     const IRLiveLocal *rewrite = NULL;
     if (in->op == IR_OP_ADDRESS_OF && in->lhs.kind == IR_OPERAND_SYMBOL &&
         in->lhs.name) {
-      for (size_t l = 0; l < site->local_count; l++) {
+      for (size_t l = 0; l < locals->count; l++) {
         if (address_only[l] &&
             strcmp(locals->items[l].name, in->lhs.name) == 0) {
           rewrite = &locals->items[l];
           break;
         }
-      }
-    }
-    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.kind == IR_OPERAND_SYMBOL &&
-        in->dest.name) {
-      int dropped = 0;
-      for (size_t l = 0; l < site->local_count && !dropped; l++) {
-        dropped = address_only[l] &&
-                  strcmp(locals->items[l].name, in->dest.name) == 0;
-      }
-      if (dropped) {
-        continue;
       }
     }
     if (rewrite) {
@@ -1552,31 +2019,43 @@ static IRFunction *ir_live_build_continuation(IRLoweringContext *context,
   ok = 1;
 
 done:
-  if (levels) {
-    for (size_t j = 0; j < level_count; j++) {
-      free(levels[j].land);
+  if (landing) {
+    for (size_t l = 0; l < loops; l++) {
+      free(landing[l]);
     }
-    free(levels);
+  }
+  if (entries) {
+    for (size_t j = 0; j < site_count; j++) {
+      free(entries[j]);
+    }
   }
   if (labels) {
-    for (size_t c = 0; c <= level_count; c++) {
+    for (size_t c = 0; c < copy_count; c++) {
       ir_live_map_destroy(&labels[c]);
     }
-    free(labels);
   }
   if (temps) {
-    for (size_t c = 0; c <= level_count; c++) {
+    for (size_t c = 0; c < copy_count; c++) {
       ir_live_map_destroy(&temps[c]);
     }
-    free(temps);
   }
-  if (staging) {
-    ir_function_destroy(staging);
-  }
+  ir_live_map_destroy(&label_blocks);
+  free(labels);
+  free(temps);
+  free(site_loop);
+  free(parent);
+  free(needed);
+  free(copy_of);
+  free(copy_loop);
+  free(landing);
+  free(entries);
   free(reachable);
   free(address_only);
   free(name);
-  free(start);
+  free(clone_transfer);
+  if (staging) {
+    ir_function_destroy(staging);
+  }
   if (!ok && clone) {
     ir_function_destroy(clone);
     clone = NULL;
@@ -1584,19 +2063,230 @@ done:
   return clone;
 }
 
-int ir_lower_live_frames(IRLoweringContext *context, IRFunction *function) {
-  IRLiveLocals locals = {0};
+static int ir_live_emit_boundary(IRLoweringContext *context, IRFunction *out,
+                                 const IRFunction *function,
+                                 const char *table, IRLiveSite *site,
+                                 const char *transfer_label) {
+  char flag[512];
+  SourceLocation location = function->location;
+  IROperand address = ir_live_new_temp(context);
+  IROperand moved = ir_live_new_temp(context);
+  IROperand arguments[4];
+  char *resume = ir_new_label_name(context, "live_resume");
+  int ok;
+  ir_live_flag_name(function, flag, sizeof(flag));
+  arguments[0] = ir_operand_copy(&address);
+  arguments[1] = ir_operand_string(table);
+  arguments[2] = ir_operand_int((long long)site->key);
+  arguments[3] = ir_operand_string(function->name);
+  ok = resume &&
+       ir_live_emit_address_of(context, out, &address, flag, location) &&
+       ir_live_emit_call(context, out, IR_LIVE_MOVED_NAME, arguments, 4,
+                         &moved, location) &&
+       ir_live_emit_simple(context, out, IR_OP_BRANCH_ZERO, ir_operand_none(),
+                           ir_operand_copy(&moved), ir_operand_none(), resume,
+                           location) &&
+       ir_live_emit_simple(context, out, IR_OP_ASSIGN,
+                           ir_operand_symbol(".live_key"),
+                           ir_operand_int((long long)site->key),
+                           ir_operand_none(), NULL, location) &&
+       ir_live_emit_simple(context, out, IR_OP_ASSIGN,
+                           ir_operand_symbol(".live_count"),
+                           ir_operand_int((long long)site->local_count),
+                           ir_operand_none(), NULL, location) &&
+       ir_emit_jump_instruction(context, out, transfer_label, location) &&
+       ir_emit_label_instruction(context, out, resume, location);
+  for (size_t i = 0; i < 4; i++) {
+    ir_operand_destroy(&arguments[i]);
+  }
+  ir_operand_destroy(&address);
+  ir_operand_destroy(&moved);
+  if (ok) {
+    site->resume_label = resume;
+  } else {
+    free(resume);
+  }
+  return ok;
+}
+
+static void ir_live_swap_instructions(IRFunction *a, IRFunction *b) {
+  IRInstruction *instructions = a->instructions;
+  size_t count = a->instruction_count;
+  size_t capacity = a->instruction_capacity;
+  a->instructions = b->instructions;
+  a->instruction_count = b->instruction_count;
+  a->instruction_capacity = b->instruction_capacity;
+  b->instructions = instructions;
+  b->instruction_count = count;
+  b->instruction_capacity = capacity;
+  ir_function_clear_cfg(a);
+  ir_function_clear_cfg(b);
+  ir_function_touch(a);
+  ir_function_touch(b);
+}
+
+static int ir_live_rebuild(IRLoweringContext *context, IRFunction *function,
+                           IRFunction *out, IRLiveSite *sites,
+                           size_t site_count, const IRLiveLocals *locals,
+                           const char *table, const char *transfer_label,
+                           size_t *transfer_start) {
+  SourceLocation location = function->location;
+  MtlcType *word = ir_live_word_type(context);
+  size_t next = 0;
+  size_t after_branch = SIZE_MAX;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (ir_live_is_mark(in, IR_LIVE_BEGIN_MARK)) {
+      continue;
+    }
+    if (ir_live_is_mark(in, IR_LIVE_END_MARK)) {
+      if (next < site_count && !sites[next].is_quiesce &&
+          sites[next].position == i) {
+        if (!ir_live_emit_boundary(context, out, function, table,
+                                   &sites[next], transfer_label)) {
+          return 0;
+        }
+        next++;
+      }
+      continue;
+    }
+    if (next < site_count && sites[next].is_quiesce &&
+        sites[next].position == i) {
+      IRInstruction copy = *in;
+      IROperand arguments[4];
+      int appended;
+      if (in->argument_count != 4) {
+        return 0;
+      }
+      arguments[0] = in->arguments[0];
+      arguments[1] = ir_operand_string(table);
+      arguments[2] = ir_operand_int((long long)sites[next].key);
+      arguments[3] = in->arguments[3];
+      copy.arguments = arguments;
+      appended = ir_function_append_instruction(out, &copy);
+      ir_operand_destroy(&arguments[1]);
+      ir_operand_destroy(&arguments[2]);
+      if (!appended) {
+        return 0;
+      }
+      after_branch = next;
+      next++;
+      continue;
+    }
+    if (!ir_function_append_instruction(out, in)) {
+      return 0;
+    }
+    if (i == 0 &&
+        (!ir_live_emit_declare(context, out, ".live_key", "int64", word,
+                               location) ||
+         !ir_live_emit_declare(context, out, ".live_count", "int64", word,
+                               location))) {
+      return 0;
+    }
+    if (after_branch != SIZE_MAX && in->op == IR_OP_BRANCH_ZERO) {
+      IRLiveSite *site = &sites[after_branch];
+      if (i + 1u >= function->instruction_count ||
+          function->instructions[i + 1u].op != IR_OP_LABEL ||
+          !(site->resume_label =
+                mettle_strdup(function->instructions[i + 1u].text)) ||
+          !ir_live_emit_simple(context, out, IR_OP_ASSIGN,
+                               ir_operand_symbol(".live_key"),
+                               ir_operand_int((long long)site->key),
+                               ir_operand_none(), NULL, location) ||
+          !ir_live_emit_simple(context, out, IR_OP_ASSIGN,
+                               ir_operand_symbol(".live_count"),
+                               ir_operand_int((long long)site->local_count),
+                               ir_operand_none(), NULL, location) ||
+          !ir_emit_jump_instruction(context, out, transfer_label, location)) {
+        return 0;
+      }
+      after_branch = SIZE_MAX;
+    }
+  }
+  *transfer_start = out->instruction_count;
+  return ir_live_emit_bottom_transfer(context, out, function, locals,
+                                      transfer_label);
+}
+
+static int ir_live_process(IRLoweringContext *context, IRProgram *program,
+                           IRFunction *function, const IRLiveMap *mayq) {
+  IRLiveRange *ranges = NULL;
+  size_t range_count = 0;
   IRLiveSite *sites = NULL;
   size_t site_count = 0;
-  IRFunction *rebuilt = NULL;
-  IRFunction **clones = NULL;
+  IRLiveLocals locals = {0};
   IRLiveShape shape;
+  IRLiveShape rebuilt_shape;
+  IRFunction *rebuilt = NULL;
+  IRFunction *clone = NULL;
+  char *transfer = NULL;
+  char *table = NULL;
+  size_t stack[256];
+  size_t depth = 0;
+  size_t transfer_start = 0;
   int usable = 1;
+  int swapped = 0;
   int ok = 1;
 
   memset(&shape, 0, sizeof(shape));
-  if (!context || !function || !g_ir_lowering_live) {
+  memset(&rebuilt_shape, 0, sizeof(rebuilt_shape));
+  if (!ir_live_function_movable(function)) {
+    ir_live_strip_marks(function);
     return 1;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (ir_live_is_mark(in, IR_LIVE_BEGIN_MARK)) {
+      if (depth < sizeof(stack) / sizeof(stack[0])) {
+        stack[depth++] = i;
+      } else {
+        usable = 0;
+      }
+    } else if (ir_live_is_mark(in, IR_LIVE_END_MARK)) {
+      if (depth == 0) {
+        usable = 0;
+        continue;
+      }
+      size_t begin = stack[--depth];
+      if (depth == 0) {
+        IRLiveRange *grown =
+            realloc(ranges, (range_count + 1u) * sizeof(IRLiveRange));
+        if (!grown) {
+          ok = 0;
+          goto finish;
+        }
+        ranges = grown;
+        ranges[range_count].begin = begin;
+        ranges[range_count].end = i;
+        ranges[range_count].hash = ir_live_range_hash(function, begin + 1u, i);
+        ranges[range_count].is_site = 0;
+        for (size_t k = begin + 1u; k < i; k++) {
+          const IRInstruction *call = &function->instructions[k];
+          if (call->op == IR_OP_CALL_INDIRECT ||
+              (call->op == IR_OP_CALL && call->text &&
+               ir_live_map_get(mayq, call->text))) {
+            ranges[range_count].is_site = 1;
+            break;
+          }
+        }
+        range_count++;
+      }
+    }
+  }
+  for (size_t r = 0; r < range_count; r++) {
+    if (!ranges[r].is_site) {
+      continue;
+    }
+    IRLiveSite *grown = realloc(sites, (site_count + 1u) * sizeof(IRLiveSite));
+    if (!grown) {
+      ok = 0;
+      goto finish;
+    }
+    sites = grown;
+    memset(&sites[site_count], 0, sizeof(IRLiveSite));
+    sites[site_count].position = ranges[r].end;
+    sites[site_count].range_begin = ranges[r].begin;
+    site_count++;
   }
   for (size_t i = 0; i < function->instruction_count; i++) {
     if (!ir_live_is_site(&function->instructions[i])) {
@@ -1604,151 +2294,215 @@ int ir_lower_live_frames(IRLoweringContext *context, IRFunction *function) {
     }
     IRLiveSite *grown = realloc(sites, (site_count + 1u) * sizeof(IRLiveSite));
     if (!grown) {
-      free(sites);
-      return 0;
+      ok = 0;
+      goto finish;
     }
     sites = grown;
-    sites[site_count].call_index = i;
-    sites[site_count].resume_label = NULL;
-    sites[site_count].local_count = 0;
-    if (i + 2u < function->instruction_count &&
-        function->instructions[i + 1u].op == IR_OP_BRANCH_ZERO &&
-        function->instructions[i + 2u].op == IR_OP_LABEL) {
-      sites[site_count].resume_label = function->instructions[i + 2u].text;
-    } else {
+    memset(&sites[site_count], 0, sizeof(IRLiveSite));
+    sites[site_count].position = i;
+    sites[site_count].range_begin = i;
+    sites[site_count].is_quiesce = 1;
+    if (i + 2u >= function->instruction_count ||
+        function->instructions[i + 1u].op != IR_OP_BRANCH_ZERO ||
+        function->instructions[i + 2u].op != IR_OP_LABEL) {
       usable = 0;
     }
     site_count++;
   }
   if (site_count == 0) {
-    return 1;
+    ir_live_strip_marks(function);
+    goto finish;
   }
-  function->is_noinline = 1;
-  if (!usable || !ir_live_collect_locals(context, function, &locals)) {
+  qsort(sites, site_count, sizeof(IRLiveSite), ir_live_site_compare);
+  if (!usable || !ir_live_collect_locals(context, function, &locals) ||
+      !ir_function_rebuild_cfg(function) ||
+      !ir_live_shape_build(function, &shape)) {
     goto demote;
   }
-  for (size_t s = 0; s < site_count; s++) {
-    while (sites[s].local_count < locals.count &&
-           locals.items[sites[s].local_count].declared_at <
-               sites[s].call_index) {
-      sites[s].local_count++;
+  for (size_t j = 0; j < site_count; j++) {
+    IRLiveSite *site = &sites[j];
+    uint64_t previous = 0;
+    uint64_t statement = 0x51u;
+    uint64_t combined = 1469598103934665603ull;
+    size_t block = site->position < function->instruction_count
+                       ? shape.block_of[site->position]
+                       : SIZE_MAX;
+    for (size_t r = 0; r < range_count; r++) {
+      if (ranges[r].end == site->position && !site->is_quiesce) {
+        statement = ranges[r].hash;
+      }
+      if (ranges[r].end < site->range_begin) {
+        previous = ranges[r].hash;
+      }
+    }
+    combined = ir_live_mix(combined, (uint64_t)site->is_quiesce);
+    combined = ir_live_mix(combined, statement);
+    combined = ir_live_mix(combined, previous);
+    combined = ir_live_mix(combined,
+                           ir_live_loop_signature(function, &shape, block));
+    site->key = combined;
+  }
+  for (size_t j = site_count; j-- > 0;) {
+    size_t occurrence = 0;
+    for (size_t k = 0; k < j; k++) {
+      occurrence += sites[k].key == sites[j].key;
+    }
+    sites[j].key = ir_live_mix(sites[j].key, occurrence) & 0x7FFFFFFFFFFFFFFFull;
+    if (sites[j].key == 0) {
+      sites[j].key = 1;
     }
   }
+  for (size_t j = 0; j < site_count; j++) {
+    size_t count = 0;
+    while (count < locals.count &&
+           locals.items[count].declared_at < sites[j].position) {
+      count++;
+    }
+    sites[j].local_count = count;
+  }
+  ir_live_ensure_flag(context, function);
+  table = ir_live_table_text(function, sites, site_count);
+  transfer = ir_new_label_name(context, "live_transfer");
   rebuilt = ir_function_create(function->name);
-  if (!rebuilt) {
+  if (!table || !transfer || !rebuilt) {
     ok = 0;
-    goto cleanup;
+    goto finish;
   }
-  {
-    size_t next_site = 0;
-    for (size_t i = 0; i < function->instruction_count; i++) {
-      if (!ir_function_append_instruction(rebuilt, &function->instructions[i])) {
-        ok = 0;
-        goto cleanup;
-      }
-      if (next_site < site_count && i == sites[next_site].call_index + 1u) {
-        if (!ir_live_emit_transfer(context, rebuilt, function, &locals,
-                                   &sites[next_site], next_site + 1u)) {
-          ok = 0;
-          goto cleanup;
-        }
-        next_site++;
-      }
-    }
+  if (!ir_live_rebuild(context, function, rebuilt, sites, site_count, &locals,
+                       table, transfer, &transfer_start)) {
+    goto demote;
   }
-  {
-    IRInstruction *instructions = function->instructions;
-    size_t count = function->instruction_count;
-    size_t capacity = function->instruction_capacity;
-    function->instructions = rebuilt->instructions;
-    function->instruction_count = rebuilt->instruction_count;
-    function->instruction_capacity = rebuilt->instruction_capacity;
-    rebuilt->instructions = instructions;
-    rebuilt->instruction_count = count;
-    rebuilt->instruction_capacity = capacity;
-    ir_function_clear_cfg(function);
-    ir_function_clear_cfg(rebuilt);
-    ir_function_touch(function);
-  }
+  ir_live_swap_instructions(function, rebuilt);
+  swapped = 1;
   if (!ir_function_rebuild_cfg(function) ||
-      !ir_live_shape_build(function, &shape)) {
+      !ir_live_shape_build(function, &rebuilt_shape)) {
     goto restore;
   }
-  clones = calloc(site_count, sizeof(IRFunction *));
-  if (!clones) {
+  clone = ir_live_build_continuation(context, function, &rebuilt_shape,
+                                     &locals, sites, site_count,
+                                     transfer_start, transfer);
+  if (!clone) {
+    goto restore;
+  }
+  function->is_noinline = 1;
+  if (!ir_program_add_function(program, clone)) {
+    ir_function_destroy(clone);
     ok = 0;
-    goto cleanup;
   }
-  for (size_t s = 0; s < site_count; s++) {
-    clones[s] = ir_live_build_continuation(context, function, &shape, &locals,
-                                           &sites[s], s + 1u);
-    if (!clones[s]) {
-      goto restore;
-    }
-  }
-  for (size_t s = 0; s < site_count; s++) {
-    if (!ir_program_add_function(context->program, clones[s])) {
-      ok = 0;
-      goto cleanup;
-    }
-    clones[s] = NULL;
-  }
-  goto cleanup;
+  goto finish;
 
 restore:
-  {
-    IRInstruction *instructions = function->instructions;
-    size_t count = function->instruction_count;
-    size_t capacity = function->instruction_capacity;
-    function->instructions = rebuilt->instructions;
-    function->instruction_count = rebuilt->instruction_count;
-    function->instruction_capacity = rebuilt->instruction_capacity;
-    rebuilt->instructions = instructions;
-    rebuilt->instruction_count = count;
-    rebuilt->instruction_capacity = capacity;
-    ir_function_clear_cfg(function);
-    ir_function_clear_cfg(rebuilt);
+  if (swapped) {
+    ir_live_swap_instructions(function, rebuilt);
+    swapped = 0;
   }
 demote:
+  ir_live_strip_marks(function);
   ir_live_demote(function);
 
-cleanup:
-  if (clones) {
-    for (size_t s = 0; s < site_count; s++) {
-      if (clones[s]) {
-        ir_function_destroy(clones[s]);
-      }
-    }
-    free(clones);
-  }
+finish:
   if (rebuilt) {
     ir_function_destroy(rebuilt);
   }
-  ir_live_shape_destroy(&shape);
-  ir_live_locals_destroy(&locals);
+  if (sites) {
+    for (size_t j = 0; j < site_count; j++) {
+      free(sites[j].resume_label);
+    }
+  }
   free(sites);
+  free(ranges);
+  free(table);
+  free(transfer);
+  ir_live_shape_destroy(&shape);
+  ir_live_shape_destroy(&rebuilt_shape);
+  ir_live_locals_destroy(&locals);
   if (ok && !function->cfg_valid && !ir_function_rebuild_cfg(function)) {
     ok = 0;
   }
   return ok;
 }
 
-void ir_lower_live_register_symbols(IRProgram *program) {
-  if (!program || !g_ir_lowering_live) {
+int ir_lower_live_program(IRLoweringContext *context, IRProgram *program) {
+  IRLiveMap mayq = {0};
+  size_t count;
+  int changed = 1;
+  int ok = 1;
+  if (!g_ir_lowering_live || !context || !program) {
+    return 1;
+  }
+  ir_live_declare_helpers(context);
+  count = program->function_count;
+  for (size_t f = 0; f < count; f++) {
+    IRFunction *function = program->functions[f];
+    for (size_t i = 0; function && i < function->instruction_count; i++) {
+      const IRInstruction *in = &function->instructions[i];
+      if (in->op == IR_OP_CALL_INDIRECT || ir_live_is_site(in)) {
+        char *mark = mettle_strdup("1");
+        if (!mark || !ir_live_map_put(&mayq, function->name, mark)) {
+          free(mark);
+          ir_live_map_destroy(&mayq);
+          return 0;
+        }
+        break;
+      }
+    }
+  }
+  while (changed) {
+    changed = 0;
+    for (size_t f = 0; f < count; f++) {
+      IRFunction *function = program->functions[f];
+      if (!function || !function->name ||
+          ir_live_map_get(&mayq, function->name)) {
+        continue;
+      }
+      for (size_t i = 0; i < function->instruction_count; i++) {
+        const IRInstruction *in = &function->instructions[i];
+        if (in->op == IR_OP_CALL && in->text &&
+            ir_live_map_get(&mayq, in->text)) {
+          char *mark = mettle_strdup("1");
+          if (!mark || !ir_live_map_put(&mayq, function->name, mark)) {
+            free(mark);
+            ir_live_map_destroy(&mayq);
+            return 0;
+          }
+          changed = 1;
+          break;
+        }
+      }
+    }
+  }
+  for (size_t f = 0; f < count && ok; f++) {
+    if (program->functions[f]) {
+      ok = ir_live_process(context, program, program->functions[f], &mayq);
+    }
+  }
+  ir_live_map_destroy(&mayq);
+  return ok;
+}
+
+void ir_lower_live_register_symbols(IRLoweringContext *context,
+                                    IRProgram *program) {
+  if (!program || !context || !g_ir_lowering_live) {
     return;
   }
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
-    const char *mark;
     char owner[512];
     const IRModuleSymbol *source;
     IRModuleSymbol entry = {0};
+    MtlcType *params[1];
+    size_t length;
     if (!function || !function->name ||
-        !(mark = strstr(function->name, IR_LIVE_RESUME_INFIX)) ||
         ir_program_lookup_symbol(program, function->name)) {
       continue;
     }
-    size_t length = (size_t)(mark - function->name);
+    length = strlen(function->name);
+    if (length <= strlen(IR_LIVE_RESUME_SUFFIX) ||
+        strcmp(function->name + length - strlen(IR_LIVE_RESUME_SUFFIX),
+               IR_LIVE_RESUME_SUFFIX) != 0) {
+      continue;
+    }
+    length -= strlen(IR_LIVE_RESUME_SUFFIX);
     if (length >= sizeof(owner)) {
       continue;
     }
@@ -1758,13 +2512,14 @@ void ir_lower_live_register_symbols(IRProgram *program) {
     if (!source) {
       continue;
     }
+    params[0] = ir_live_word_type(context);
     entry.name = function->name;
     entry.kind = IR_MODSYM_FUNCTION;
     entry.type = source->type;
     entry.return_type = source->return_type;
     entry.has_body = 1;
-    entry.param_types = NULL;
-    entry.param_count = 0;
+    entry.param_types = params;
+    entry.param_count = 1;
     ir_program_add_symbol(program, &entry);
   }
 }

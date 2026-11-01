@@ -13,6 +13,7 @@
 #define LIVE_FIXUP_PC32 2u
 #define LIVE_FIXUP_SITE_HOST 0x100u
 #define LIVE_FIXUP_TARGET_HOST 0x200u
+#define LIVE_FIXUP_UNDO 0x400u
 #define LIVE_SPARE_SLOT_COUNT 4096u
 #define LIVE_ARENA_SIZE 1048576u
 
@@ -27,6 +28,7 @@ typedef struct {
   char names[1024];
   char running[512];
   char moving[512];
+  unsigned undone;
 } LivePatchSummary;
 
 int live_write_state(const LinkResolution *resolution, uint64_t image_base,
@@ -35,5 +37,8 @@ int live_write_state(const LinkResolution *resolution, uint64_t image_base,
 int live_build_patch(const char *object_path, const char *executable_path,
                      int replace_all, LivePatchSummary *summary,
                      char **error_message_out);
+
+int live_build_undo(const char *executable_path, LivePatchSummary *summary,
+                    char **error_message_out);
 
 #endif

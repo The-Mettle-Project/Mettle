@@ -3,13 +3,15 @@ param(
     [int]$Limit = 0,
     [int]$TimeoutSeconds = 20,
     [switch]$Loops,
-    [switch]$Optimize
+    [switch]$Optimize,
+    [string]$Compiler = ""
 )
 
 $ErrorActionPreference = "Continue"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root
 $mettle = Join-Path $root "bin\mettle.exe"
+if ($Compiler) { $mettle = (Resolve-Path $Compiler).Path }
 $scratch = Join-Path $root ".tmp\live\oracle"
 New-Item -ItemType Directory -Force $scratch | Out-Null
 
@@ -109,7 +111,7 @@ foreach ($file in $files) {
         if ($live.Out -ne $plain.Out -or $live.Code -ne $plain.Code) {
             $fail++; $failures += "$($file.Name): output differs (exit $($plain.Code) vs $($live.Code))"; continue
         }
-        if ($live.Err -notmatch "\[live\] main moves to its new code") { $kept++; $keptNames += $file.Name }
+        if ($live.Err -notmatch "\[live\] main moves to the current code") { $kept++; $keptNames += $file.Name }
         $pass++
     } finally {
         Remove-Item -Force $liveSource -ErrorAction SilentlyContinue

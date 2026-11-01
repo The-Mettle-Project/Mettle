@@ -1530,10 +1530,35 @@ static int ir_lower_fallthrough_statement(IRLoweringContext *context, IRFunction
                                   statement->location);
 }
 
+static int ir_lower_statement_unmarked(IRLoweringContext *context,
+                                       IRFunction *function,
+                                       ASTNode *statement,
+                                       IRDeferScope *defers);
+
 int ir_lower_statement_with_defers(IRLoweringContext *context,
-                                          IRFunction *function,
-                                          ASTNode *statement,
-                                          IRDeferScope *defers) {
+                                   IRFunction *function, ASTNode *statement,
+                                   IRDeferScope *defers) {
+  int marked;
+  int ok;
+  if (!context || !function || !statement) {
+    return 0;
+  }
+  marked = ir_lower_live_marks_statement(function, (int)statement->type);
+  if (marked &&
+      !ir_lower_live_mark(context, function, 1, statement->location)) {
+    return 0;
+  }
+  ok = ir_lower_statement_unmarked(context, function, statement, defers);
+  if (ok && marked) {
+    ok = ir_lower_live_mark(context, function, 0, statement->location);
+  }
+  return ok;
+}
+
+static int ir_lower_statement_unmarked(IRLoweringContext *context,
+                                       IRFunction *function,
+                                       ASTNode *statement,
+                                       IRDeferScope *defers) {
   if (!context || !function || !statement) {
     return 0;
   }
