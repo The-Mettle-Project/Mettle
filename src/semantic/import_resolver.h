@@ -21,5 +21,7 @@ int resolve_imports_with_options(ASTNode *program, const char *base_path,
                                  const ImportResolverOptions *options);
 
 const char *import_resolver_module_for_file(const char *resolved_path);
+size_t import_resolver_file_count(void);
+const char *import_resolver_file_at(size_t index);
 
 #endif

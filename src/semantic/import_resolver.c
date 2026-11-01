@@ -2355,6 +2355,12 @@ static void module_name_registry_record(const char *resolved_path,
   g_module_name_count++;
 }
 
+size_t import_resolver_file_count(void) { return g_module_name_count; }
+
+const char *import_resolver_file_at(size_t index) {
+  return index < g_module_name_count ? g_module_names[index].path : NULL;
+}
+
 const char *import_resolver_module_for_file(const char *resolved_path) {
   if (!resolved_path || !g_module_names) {
     return NULL;

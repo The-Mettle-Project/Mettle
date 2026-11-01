@@ -129,6 +129,34 @@ static size_t live_scan(const char *directory, LiveWatched *files) {
   return count;
 }
 
+static size_t live_scan_list(const char *list_path, const char *directory,
+                             LiveWatched *files) {
+  FILE *list = fopen(list_path, "rb");
+  char line[MAX_PATH];
+  size_t count = 0;
+  if (!list) {
+    return live_scan(directory, files);
+  }
+  while (count < LIVE_MAX_FILES && fgets(line, sizeof(line), list)) {
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    size_t length = strlen(line);
+    while (length && (line[length - 1u] == '\n' || line[length - 1u] == '\r')) {
+      line[--length] = '\0';
+    }
+    if (!length) {
+      continue;
+    }
+    snprintf(files[count].path, sizeof(files[count].path), "%s", line);
+    memset(&files[count].written, 0, sizeof(files[count].written));
+    if (GetFileAttributesExA(line, GetFileExInfoStandard, &data)) {
+      files[count].written = data.ftLastWriteTime;
+    }
+    count++;
+  }
+  fclose(list);
+  return count ? count : live_scan(directory, files);
+}
+
 static int live_same(const LiveWatched *left, size_t left_count,
                      const LiveWatched *right, size_t right_count) {
   if (left_count != right_count) {
@@ -160,6 +188,7 @@ int mettle_live_main(int argc, char **argv) {
   char default_output[MAX_PATH];
   char self[MAX_PATH];
   char directory[MAX_PATH];
+  char list_path[MAX_PATH];
   LiveCommand flags = {0};
   LiveCommand host = {0};
   LiveCommand patch = {0};
@@ -203,6 +232,14 @@ int mettle_live_main(int argc, char **argv) {
   }
   if (!GetModuleFileNameA(NULL, self, sizeof(self))) {
     goto done;
+  }
+  {
+    char full_output[MAX_PATH];
+    if (GetFullPathNameA(output, (DWORD)sizeof(full_output), full_output,
+                         NULL)) {
+      snprintf(default_output, sizeof(default_output), "%s", full_output);
+      output = default_output;
+    }
   }
   snprintf(directory, sizeof(directory), "%s", input);
   {
@@ -257,11 +294,13 @@ int mettle_live_main(int argc, char **argv) {
     TerminateProcess(running.hProcess, 1);
     goto done;
   }
-  watched_count = live_scan(directory, watched);
-  fprintf(stderr, "[live] running %s; saving a .mettle file in %s patches it\n",
-          output, directory);
+  snprintf(list_path, sizeof(list_path), "%s.live.files", output);
+  watched_count = live_scan_list(list_path, directory, watched);
+  fprintf(stderr,
+          "[live] running %s; saving any of its %zu source files patches it\n",
+          output, watched_count);
   while (WaitForSingleObject(running.hProcess, LIVE_POLL_MS) == WAIT_TIMEOUT) {
-    size_t fresh_count = live_scan(directory, fresh);
+    size_t fresh_count = live_scan_list(list_path, directory, fresh);
     if (live_same(watched, watched_count, fresh, fresh_count)) {
       continue;
     }
@@ -269,9 +308,10 @@ int mettle_live_main(int argc, char **argv) {
       memcpy(watched, fresh, fresh_count * sizeof(LiveWatched));
       watched_count = fresh_count;
       Sleep(LIVE_SETTLE_MS);
-      fresh_count = live_scan(directory, fresh);
+      fresh_count = live_scan_list(list_path, directory, fresh);
     } while (!live_same(watched, watched_count, fresh, fresh_count));
     live_run(patch.text);
+    watched_count = live_scan_list(list_path, directory, watched);
   }
   GetExitCodeProcess(running.hProcess, &exit_code);
   CloseHandle(running.hThread);

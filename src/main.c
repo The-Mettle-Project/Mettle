@@ -61,6 +61,8 @@
 #include <direct.h>
 #include <io.h>
 #include <sys/stat.h>
+__declspec(dllimport) unsigned long __stdcall GetFullPathNameA(
+    const char *name, unsigned long length, char *buffer, char **file_part);
 #if !defined(__MINGW32__)
 typedef long long MettleQpcTicks;
 __declspec(dllimport) int __stdcall QueryPerformanceFrequency(MettleQpcTicks *frequency);
@@ -1027,6 +1029,42 @@ static int object_needs_safety_runtime(const char *object_path) {
 
 static int object_needs_trace_runtime(const char *object_path) {
   return object_needs_runtime_object(object_path, "mettle_trace_");
+}
+
+static void live_write_file_list(const char *executable, const char *input) {
+  char list_path[4096];
+  char full[4096];
+  FILE *file;
+  if (!executable || !input) {
+    return;
+  }
+  snprintf(list_path, sizeof(list_path), "%s.live.files", executable);
+  file = fopen(list_path, "wb");
+  if (!file) {
+    return;
+  }
+#ifdef _WIN32
+  if (GetFullPathNameA(input, (unsigned long)sizeof(full), full, NULL)) {
+    fprintf(file, "%s\n", full);
+  }
+#else
+  if (realpath(input, full)) {
+    fprintf(file, "%s\n", full);
+  }
+#endif
+  for (size_t i = 0; i < import_resolver_file_count(); i++) {
+    const char *path = import_resolver_file_at(i);
+#ifdef _WIN32
+    if (path && GetFullPathNameA(path, (unsigned long)sizeof(full), full, NULL)) {
+      fprintf(file, "%s\n", full);
+    }
+#else
+    if (path && realpath(path, full)) {
+      fprintf(file, "%s\n", full);
+    }
+#endif
+  }
+  fclose(file);
 }
 
 static int object_needs_live_runtime(const char *object_path) {
@@ -2579,6 +2617,9 @@ static int mettle_link_internal(const char **object_paths,
               error_message ? error_message : "unknown error");
     }
     goto cleanup;
+  }
+  if (options && options->live) {
+    live_write_file_list(executable_filename, options->input_filename);
   }
   if (options && options->live &&
       !live_write_state(resolution,
@@ -4989,6 +5030,7 @@ int main(int argc, char *argv[]) {
   int result =
       compile_file(options.input_filename, options.output_filename, &options);
   if (result == 0 && options.live_patch_target) {
+    live_write_file_list(options.live_patch_target, options.input_filename);
     LivePatchSummary summary;
     char *live_error = NULL;
     if (!live_build_patch(options.output_filename, options.live_patch_target,
