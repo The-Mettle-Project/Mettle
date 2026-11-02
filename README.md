@@ -13,6 +13,17 @@
 
 <sub>Gemma 4, QAT Q4_0, on one RTX 5060 Ti, against llama.cpp from LM Studio with every layer on the GPU and one engine in VRAM at a time. First token: 12B, a 128-token prompt. Code: 12B, with Gemma 4's assistant drafter in both engines. Memory: 26B-A4B, RAM right after four users.</sub>
 
+## Everything else stays close to C
+
+Across 16 whole programs, including parsers, compressors, interpreters and solvers, against `clang -O3` with the same answers on all 16:
+
+- **1.09× clang's run time, on average.** 22.2 ms against 20.4 ms.
+- **1.42× faster on a bytecode VM.** 28.0 ms against 39.7 ms.
+- **1.22× faster on a sudoku solver.** 24.5 ms against 29.9 ms.
+- **2× faster to build 90,000 lines.** 7.6 s against 16.0 s.
+
+<sub>clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. The slowest program is physics_grid at 1.29×. With `-march=native`, clang leads on all 16 and Mettle averages 1.13×. Build time is one generated file, and the lead grows on smaller ones. Run them yourself with `tools/benchmark/mc.ps1 -Suite 3`.</sub>
+
 ## What you can do
 
 - **Change it while it runs.** Save a file and the running program takes the new code, even after a crash. [Live programs](docs/live.md)

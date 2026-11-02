@@ -80,6 +80,8 @@ h1 span { display: block; text-wrap: balance; }
 .bar i { display: block; height: 6px; margin-top: 5px; background: var(--dim); transform: scaleX(0); transform-origin: 0 50%; transition: transform 1500ms cubic-bezier(0.16, 0.8, 0.24, 1); }
 .bar i.me { background: var(--accent); }
 .figs.shown .bar i { transform: scaleX(var(--w)); }
+.proof h2.next { margin-top: 112px; }
+.how code, .method code { font-family: var(--mono); font-size: 0.82em; white-space: nowrap; color: var(--ink); }
 .method { margin: 44px 0 0; max-width: 64em; font-size: 16px; line-height: 1.42; color: var(--ink-2); text-wrap: pretty; }
 .wall { padding-top: 0; padding-bottom: 112px; }
 .wall-lede { margin: 0; max-width: 17em; font-size: clamp(32px, 4.1vw, 62px); line-height: 1.06; letter-spacing: -0.024em; color: var(--ink); text-wrap: balance; }
@@ -193,7 +195,7 @@ h1 span { display: block; text-wrap: balance; }
 <section class="wrap proof">
   <h2><a href="https://systm.co.za/">Systm</a>'s Potentia runs LLMs on Mettle, faster than llama.cpp on the same card.</h2>
   <p class="how">Its GPU kernels are Mettle, compiled straight to PTX with no nvcc, C++ or Python in the pipeline. The build fails unless the GPU matches an independent CPU reference, logit for logit.</p>
-  <div class="figs" id="figs">
+  <div class="figs">
       <figure class="fig"><b>2.4&times;</b><figcaption>faster to the first token</figcaption>
         <div class="bar"><div class="row"><span>Potentia</span><span>35.7 ms</span></div><i class="me" style="--w:0.41"></i></div>
         <div class="bar"><div class="row"><span>llama.cpp</span><span>87.1 ms</span></div><i style="--w:1"></i></div>
@@ -212,6 +214,27 @@ h1 span { display: block; text-wrap: balance; }
       </figure>
   </div>
   <p class="method">Gemma 4, QAT Q4_0, on one RTX 5060 Ti, against llama.cpp from LM Studio with every layer on the GPU and one engine in VRAM at a time. First token: 12B, a 128-token prompt. Code: 12B, with Gemma 4's assistant drafter in both engines. Memory: 26B-A4B, RAM right after four users.</p>
+  <h2 class="next">Everything else stays close to C.</h2>
+  <p class="how">Across 16 whole programs, including parsers, compressors, interpreters and solvers, against <code>clang -O3</code> with the same answers on all 16.</p>
+  <div class="figs">
+      <figure class="fig"><b>1.09&times;</b><figcaption>clang's run time, on average</figcaption>
+        <div class="bar"><div class="row"><span>Mettle</span><span>22.2 ms</span></div><i class="me" style="--w:1"></i></div>
+        <div class="bar"><div class="row"><span>clang</span><span>20.4 ms</span></div><i style="--w:0.917"></i></div>
+      </figure>
+      <figure class="fig"><b>1.42&times;</b><figcaption>faster on a bytecode VM</figcaption>
+        <div class="bar"><div class="row"><span>Mettle</span><span>28.0 ms</span></div><i class="me" style="--w:0.705"></i></div>
+        <div class="bar"><div class="row"><span>clang</span><span>39.7 ms</span></div><i style="--w:1"></i></div>
+      </figure>
+      <figure class="fig"><b>1.22&times;</b><figcaption>faster on a sudoku solver</figcaption>
+        <div class="bar"><div class="row"><span>Mettle</span><span>24.5 ms</span></div><i class="me" style="--w:0.819"></i></div>
+        <div class="bar"><div class="row"><span>clang</span><span>29.9 ms</span></div><i style="--w:1"></i></div>
+      </figure>
+      <figure class="fig"><b>2&times;</b><figcaption>faster to build 90,000 lines</figcaption>
+        <div class="bar"><div class="row"><span>Mettle</span><span>7.6 s</span></div><i class="me" style="--w:0.477"></i></div>
+        <div class="bar"><div class="row"><span>clang</span><span>16.0 s</span></div><i style="--w:1"></i></div>
+      </figure>
+  </div>
+  <p class="method">clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. The slowest program is physics_grid at 1.29&times;. With <code>-march=native</code>, clang leads on all 16 and Mettle averages 1.13&times;. Build time is one generated file, and the lead grows on smaller ones.</p>
 </section>
 
 <main class="wrap wall" id="wall">
@@ -638,10 +661,11 @@ r2 = 0</span></pre>
     }, { threshold: 0.35 }).observe(document.querySelector(".wall-grid"));
   }
 
-  var figs = document.getElementById("figs");
-  if (still || !("IntersectionObserver" in window)) {
-    figs.classList.add("shown");
-  } else {
+  document.querySelectorAll(".figs").forEach(function (figs) {
+    if (still || !("IntersectionObserver" in window)) {
+      figs.classList.add("shown");
+      return;
+    }
     var figSeen = new IntersectionObserver(function (entries) {
       if (entries[0].isIntersecting) {
         figSeen.disconnect();
@@ -649,7 +673,7 @@ r2 = 0</span></pre>
       }
     }, { threshold: 0.3 });
     figSeen.observe(figs);
-  }
+  });
 
   function watch(video, margin) {
     if (still) {

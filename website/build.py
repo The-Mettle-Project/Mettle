@@ -1,6 +1,7 @@
 import base64
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -91,6 +92,19 @@ def main():
         print("potentia figures: match the README")
     else:
         print("potentia figures: NOT CHECKED, set POTENTIA_README")
+
+    perf = os.path.join(WORK, "..", "perf", "fair.json")
+    if os.path.exists(perf):
+        rows = json.loads(read(perf))
+        geo = lambda xs: math.exp(sum(math.log(x) for x in xs) / len(xs))
+        by = {r["name"]: r for r in rows}
+        require(len(rows) == 16 and round(geo([r["m"] / r["o3"] for r in rows]), 2) == 1.09, "Suite 3 to still average 1.09x clang -O3")
+        require(round(geo([r["m"] / r["native"] for r in rows]), 2) == 1.13, "Suite 3 to still average 1.13x clang -march=native")
+        require(round(by["bytecode_vm"]["o3"] / by["bytecode_vm"]["m"], 2) == 1.42, "bytecode_vm to still run 1.42x faster")
+        require(round(by["sudoku_solve"]["o3"] / by["sudoku_solve"]["m"], 2) == 1.22, "sudoku_solve to still run 1.22x faster")
+        print("c figures: match .tmp/perf/fair.json")
+    else:
+        print("c figures: NOT CHECKED, no .tmp/perf/fair.json")
 
     explain, code, _ = compile_in("explain", "checksum.mettle", ["--build", "--release", "--explain"])
     require(code == 0, "--explain to build")
