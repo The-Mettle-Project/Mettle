@@ -301,6 +301,10 @@ if defined BACKEND_ONLY (
     if not exist bin\mettle.exe set "RELINK=1"
     if not exist obj\link.ok set "RELINK=1"
 )
+if not defined RELINK if not defined BACKEND_ONLY (
+    powershell -NoProfile -Command "$stamp = (Get-Item obj\link.ok).LastWriteTime; if (Get-ChildItem src\runtime -File | Where-Object { $_.LastWriteTime -gt $stamp }) { exit 1 }"
+    if errorlevel 1 set "RELINK=1"
+)
 if not defined RELINK (
     echo Everything up to date.
     if defined BACKEND_ONLY goto backend_only_done
