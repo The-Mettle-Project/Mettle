@@ -224,8 +224,11 @@ bytes to 64 KB, and each block starts with a 16-byte header: a pointer to the
 type record (name and descriptor) and the element count. An object gets
 `bytes + bytes / 4 + 16` bytes of room. Freed blocks go on a free list per
 class. The owned allocator's `free` and `realloc` call into the live runtime
-first, which claims any pointer inside the arena with a single range check;
-objects too large for a class fall back to `calloc` and an address table.
+first, which claims any pointer inside the arena with a single range check. A
+`realloc` of a tracked object stays tracked: within its room the element count
+follows the new size, and past it the object moves to a larger block with the
+same type record. Objects too large for a class fall back to `calloc` and an
+address table.
 
 Lowering records each tracked type's descriptor; the state file keeps them
 (`y` lines), and a patch whose type descriptor differs carries a type
