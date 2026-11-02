@@ -60,6 +60,8 @@ ASTNode *ast_create_node(ASTNodeType type, SourceLocation location) {
   node->location = location;
   node->children = NULL;
   node->child_count = 0;
+  node->child_capacity = 0;
+  node->child_capacity_owner = NULL;
   node->data = NULL;
   node->resolved_type = NULL;
   node->proven_refinement = NULL;
@@ -1696,10 +1698,20 @@ void ast_add_child(ASTNode *parent, ASTNode *child) {
   if (!parent || !child)
     return;
 
-  parent->children =
-      realloc(parent->children, (parent->child_count + 1) * sizeof(ASTNode *));
-  if (!parent->children)
-    return;
+  size_t capacity = parent->child_count;
+  if (parent->children && parent->children == parent->child_capacity_owner &&
+      parent->child_capacity > capacity)
+    capacity = parent->child_capacity;
+
+  if (parent->child_count >= capacity) {
+    size_t grown = capacity < 4 ? 4 : capacity * 2;
+    ASTNode **children = realloc(parent->children, grown * sizeof(ASTNode *));
+    if (!children)
+      return;
+    parent->children = children;
+    parent->child_capacity = grown;
+    parent->child_capacity_owner = children;
+  }
 
   parent->children[parent->child_count] = child;
   parent->child_count++;

@@ -92,6 +92,7 @@ typedef struct {
   size_t comptime_binding_capacity;
 
   Type *builtin_kind;
+  int user_declares_kind;
   ComptimeSequenceArena *sequences;
 
   ASTNode **generic_enum_templates;

@@ -8048,8 +8048,8 @@ void print_usage(const char *program_name) {
   printf("  -l, --line-mapping  Generate source line mapping\n");
   printf("  -s, --stack-trace   Report a crash at the exact statement. Records\n"
          "                      a location per instruction, which the\n"
-         "                      register-allocating backend cannot carry, so\n"
-         "                      the affected functions use the baseline emitter\n");
+         "                      register-allocating backend carries through\n"
+         "                      lowering\n");
   printf("  --no-crash-report   Drop the default crash report from a linked\n"
          "                      executable. By default a fault names itself,\n"
          "                      its address and the function it happened in,\n"

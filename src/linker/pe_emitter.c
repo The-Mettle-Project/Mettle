@@ -1686,20 +1686,12 @@ static int pe_finalize_exports(LinkResolution *resolution, PeExportPlan *plan,
 
 static int pe_validate_unresolved_externals(const LinkResolution *resolution,
                                             char **error_message_out) {
-  size_t i = 0u;
-
   if (!resolution) {
     return 0;
   }
 
-  for (i = 0u; i < resolution->symbol_count; i++) {
-    const LinkedSymbol *symbol = &resolution->symbols[i];
-    if (symbol->is_external && !symbol->is_defined) {
-      link_unresolved_format(resolution,
-                             symbol->name ? symbol->name : "<unnamed>",
-                             error_message_out);
-      return 0;
-    }
+  if (link_unresolved_format_all(resolution, 0, error_message_out)) {
+    return 0;
   }
 
   return 1;

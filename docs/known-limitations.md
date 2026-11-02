@@ -8,9 +8,6 @@ entry is something a reader would otherwise hit and have to work out.
 A tagged-enum variant carries at most one payload. `Circle(float64)` works;
 `Pair(int32, int32)` does not parse. Wrap two values in a struct.
 
-An array is one-dimensional. `int64[3][4]` does not parse; index a flat
-`int64[12]` yourself.
-
 A `T[N]` has its length in its type, so `N` has to be a constant. A length the
 program computes belongs to a [slice](types.md), `T[]`.
 

@@ -129,8 +129,7 @@ returns success. The model is never trusted, only checked.
 `mtlc_emit_object` / `mtlc_emit(MTLC_ARCH_X86_64)` produce a relocatable object
 in the host container (COFF on Windows, ELF elsewhere) with hand-encoded
 machine code; there is no assembler and no text stage. Functions go through a
-register-allocating MIR backend when eligible, with a baseline stack-slot
-generator as the fallback, and the SIMD opcodes the optimizer planted become
+register-allocating MIR backend, and the SIMD opcodes the optimizer planted become
 AVX2 sequences. Globals, string literals, and jump tables are laid out in the
 object's data sections with relocations; externs become undefined symbols for
 the linker. This is the only target implementing the full IR surface.

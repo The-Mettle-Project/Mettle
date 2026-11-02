@@ -158,8 +158,8 @@ fn main() -> int32 {
 ```
 
 The memory arrives zeroed, which is why `n->next` is already a null pointer.
-`new` takes a struct type only: `new int32[8]` is rejected. Arrays go through
-`malloc`.
+`new int32[8]` returns an `int32[]` slice of eight zeroed elements. For a raw
+pointer, use `malloc`.
 
 ## An array
 

@@ -145,8 +145,11 @@ static void unresolved_append(char *buffer, size_t size, size_t *used,
   buffer[*used] = '\0';
 }
 
-void link_unresolved_format(const LinkResolution *resolution,
-                            const char *symbol_name, char **error_message_out) {
+static void unresolved_format_impl(const LinkResolution *resolution,
+                                   const char *symbol_name,
+                                   const char *const *others,
+                                   size_t other_count,
+                                   char **error_message_out) {
   char buffer[UNRESOLVED_BUFFER_SIZE];
   size_t used = 0;
   const char *name = symbol_name && symbol_name[0] ? symbol_name : "<unnamed>";
@@ -203,6 +206,16 @@ void link_unresolved_format(const LinkResolution *resolution,
   }
   unresolved_append(buffer, sizeof(buffer), &used, head);
 
+  for (i = 0; i < other_count && i < 32u; i++) {
+    snprintf(line, sizeof(line), "\nUnresolved external symbol '%s'", others[i]);
+    unresolved_append(buffer, sizeof(buffer), &used, line);
+  }
+  if (other_count > 32u) {
+    snprintf(line, sizeof(line), "\n... and %zu more unresolved symbols",
+             other_count - 32u);
+    unresolved_append(buffer, sizeof(buffer), &used, line);
+  }
+
   unresolved_append(buffer, sizeof(buffer), &used,
                     "\nhelp: `extern` declares a name; it does not provide one. "
                     "Nothing on the link provided '");
@@ -241,4 +254,47 @@ void link_unresolved_format(const LinkResolution *resolution,
   if (error_message_out) {
     *error_message_out = mettle_strdup(buffer);
   }
+}
+
+void link_unresolved_format(const LinkResolution *resolution,
+                            const char *symbol_name, char **error_message_out) {
+  unresolved_format_impl(resolution, symbol_name, NULL, 0u, error_message_out);
+}
+
+int link_unresolved_format_all(const LinkResolution *resolution,
+                               int skip_shared_imports,
+                               char **error_message_out) {
+  const char *first = NULL;
+  const char **others = NULL;
+  size_t other_count = 0u;
+  size_t i = 0u;
+
+  if (!resolution) {
+    return 0;
+  }
+  others = calloc(resolution->symbol_count ? resolution->symbol_count : 1u,
+                  sizeof(*others));
+  if (!others) {
+    return 0;
+  }
+  for (i = 0u; i < resolution->symbol_count; i++) {
+    const LinkedSymbol *symbol = &resolution->symbols[i];
+    const char *name = NULL;
+    if (!symbol->is_external || symbol->is_defined ||
+        (skip_shared_imports && symbol->is_shared_import)) {
+      continue;
+    }
+    name = symbol->name ? symbol->name : "<unnamed>";
+    if (!first) {
+      first = name;
+    } else {
+      others[other_count++] = name;
+    }
+  }
+  if (first) {
+    unresolved_format_impl(resolution, first, others, other_count,
+                           error_message_out);
+  }
+  free(others);
+  return first != NULL;
 }

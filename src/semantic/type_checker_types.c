@@ -1258,7 +1258,7 @@ static int type_checker_builtin_by_name(TypeChecker *checker,
     *out = checker->builtin_field;
     return 1;
   }
-  if (strcmp(name, "Kind") == 0) {
+  if (strcmp(name, "Kind") == 0 && !checker->user_declares_kind) {
     type_checker_register_kind_enum(checker);
     *out = checker->builtin_kind;
     return 1;

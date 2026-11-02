@@ -63,6 +63,8 @@ typedef struct ASTNode {
   SourceLocation location;
   struct ASTNode **children;
   size_t child_count;
+  size_t child_capacity;
+  struct ASTNode **child_capacity_owner;
   void *data;
   struct Type *resolved_type;
   struct Type *proven_refinement;

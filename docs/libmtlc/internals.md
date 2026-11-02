@@ -25,7 +25,7 @@ src/
     binary_emitter.c     object-file model: sections/symbols/relocations,
                          COFF and ELF writers
     binary/              x86-64 encoding: MIR lowering + encoder, ABI,
-                         peephole, globals, prologue/epilogue, startup object,
+                         globals, prologue/epilogue, startup object,
                          profile tables; arm64_*.c: the AArch64 path
     ptx_emitter.c        IR -> PTX text
     spirv_emitter.c      IR -> SPIR-V binary
@@ -96,10 +96,9 @@ full builder surface to all four targets.
 ## The x86-64 path in one paragraph
 
 `code_generator_generate_program` walks the module: functions from the IR
-program list, globals/externs from the module symbol table. Eligible functions
+program list, globals/externs from the module symbol table. Functions
 lower through MIR (a register-allocating pipeline with liveness, allocation,
-peephole, and encoding stages); the rest take the baseline stack-slot
-generator. Types resolve through the module type registry by name;
+and encoding stages). Types resolve through the module type registry by name;
 per-instruction result types ride on the IR (`value_type`, baked at lowering).
 Output accumulates in `binary_emitter` sections with relocations and is
 serialized as COFF or ELF. The `--annotate-asm` and `--explain` machinery
@@ -114,7 +113,7 @@ case in `tests/public_api_test.c`, and a note in the docs. If codegen must
 learn a new shape, that is a backend change first.
 
 An IR instruction touches: the opcode enum and dump/interp support in
-`src/ir/`, every consumer that must handle it (x86-64 MIR and baseline, and
+`src/ir/`, every consumer that must handle it (x86-64 MIR, and
 explicit rejection or support in arm64/ptx/spirv), the optimizer's feature
 scan if passes must see it, and the differential fuzzer's generator if it is
 reachable from source.

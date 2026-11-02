@@ -7,4 +7,8 @@ void link_unresolved_format(const LinkResolution *resolution,
                             const char *symbol_name,
                             char **error_message_out);
 
+int link_unresolved_format_all(const LinkResolution *resolution,
+                               int skip_shared_imports,
+                               char **error_message_out);
+
 #endif

@@ -13,7 +13,8 @@ Symbol *type_checker_resolve_identifier(TypeChecker *checker,
     return symbol;
   }
   symbol = symbol_table_lookup(checker->symbol_table, identifier->name);
-  if (!symbol && strcmp(identifier->name, "Kind") == 0) {
+  if (!symbol && !checker->user_declares_kind &&
+      strcmp(identifier->name, "Kind") == 0) {
     type_checker_register_kind_enum(checker);
     symbol = symbol_table_lookup(checker->symbol_table, identifier->name);
   }
@@ -714,6 +715,21 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
   if (!prog)
     return 0;
   checker->module_program = program;
+
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    const char *declared = NULL;
+    if (!decl || !decl->data)
+      continue;
+    if (decl->type == AST_STRUCT_DECLARATION)
+      declared = ((StructDeclaration *)decl->data)->name;
+    else if (decl->type == AST_ENUM_DECLARATION)
+      declared = ((EnumDeclaration *)decl->data)->name;
+    else if (decl->type == AST_TYPE_DECLARATION)
+      declared = ((TypeDeclaration *)decl->data)->name;
+    if (declared && strcmp(declared, "Kind") == 0 && !checker->builtin_kind)
+      checker->user_declares_kind = 1;
+  }
 
   int ok = 1;
   if (!schedule_expand(program, checker->error_reporter,

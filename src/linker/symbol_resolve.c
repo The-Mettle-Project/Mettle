@@ -1149,16 +1149,8 @@ static int link_resolution_validate_externals(
   }
 
   if (!options || !options->allow_unresolved_externals) {
-    for (symbol_index = 0; symbol_index < resolution->symbol_count;
-         symbol_index++) {
-      const LinkedSymbol *symbol = &resolution->symbols[symbol_index];
-      if (symbol->is_external && !symbol->is_defined &&
-          !symbol->is_shared_import) {
-        link_unresolved_format(resolution,
-                               symbol->name ? symbol->name : "<unnamed>",
-                               error_message_out);
-        return 0;
-      }
+    if (link_unresolved_format_all(resolution, 1, error_message_out)) {
+      return 0;
     }
   }
 

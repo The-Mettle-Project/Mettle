@@ -188,7 +188,7 @@ Two backends, and most functions take the first.
 
 MIR, in `src/codegen/binary/mir*.c`, is a machine-level IR with real register
 allocation. `mir_lower.c` lowers IR to MIR, `mir_regalloc.c` allocates,
-`peephole.c` cleans up, and `mir_encode.c` emits bytes.
+`mir_encode.c` emits bytes.
 
 Allocation is graph coloring by default; `METTLE_LINEAR_ALLOC` selects a
 linear allocator instead. `mir_cfg.c` builds the blocks, dominators, natural
@@ -209,9 +209,8 @@ rejects two live values in one register; `METTLE_REGALLOC_VERIFY=1` runs it,
 Loop rotation converts a top-testing loop to a bottom-testing one under three
 guards, the third being that the latch must be the only edge into the header.
 
-When MIR cannot take a function it falls back to a spill-everything backend
-that keeps every value on the stack. `--explain` reports which functions fell
-back and why, because the difference is large and silent otherwise.
+When MIR cannot take a function the build stops with a code generation error
+that names the function and the cause. `--explain` reports the same causes.
 
 ### ARM64
 
