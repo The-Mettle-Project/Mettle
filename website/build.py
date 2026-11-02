@@ -99,7 +99,7 @@ def main():
     c_o3 = "%.2f" % geo([r["m"] / r["o3"] for r in suite3])
     c_native = "%.2f" % geo([r["m"] / r["native"] for r in suite3])
     readme = read(os.path.join(REPO, "README.md"))
-    require("**" + c_o3 + "\u00d7 the run time of `clang -O3`" in readme and "**" + c_native + "\u00d7 the run time of `clang -O3 -march=native`" in readme, "the README to carry the same averages")
+    require(c_o3 + "\u00d7 the run time of clang -O3" in readme and c_native + "\u00d7 the run time of clang -O3 -march=native" in readme, "the README to carry the same averages")
     span = 0.35
     c_rows = ""
     for r in sorted(suite3, key=lambda x: x["m"] / x["o3"]):

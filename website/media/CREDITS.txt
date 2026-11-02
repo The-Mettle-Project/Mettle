@@ -9,3 +9,19 @@ Source: "Dramatic Aerial View of Utah's Rugged Canyons" by Alex Moliski
 https://www.pexels.com/video/dramatic-aerial-view-of-utah-s-rugged-canyons-34305686/
 License: Pexels License, https://www.pexels.com/license/
 Changes: cut to 4 seconds, slowed to 0.5x with eased ends, darkened, played forward then reversed, audio removed. See make_canyon.sh.
+
+readme-banner.jpg and og.jpg are rendered from the hero above.
+
+readme/power.jpg: "Stunning Godafoss Waterfall in Iceland's Rugged Landscape" by Raul Ling
+https://www.pexels.com/photo/stunning-godafoss-waterfall-in-iceland-s-rugged-landscape-32833863/
+
+readme/close.jpg: "Dramatic Icelandic Mountain Landscape in Winter" by Raul Ling
+https://www.pexels.com/photo/dramatic-icelandic-mountain-landscape-in-winter-32888759/
+
+readme/powers.jpg: "Scenic Moss-Covered Lava Field in Iceland" by Susanne Jutzeler, suju-foto
+https://www.pexels.com/photo/scenic-moss-covered-lava-field-in-iceland-33931095/
+
+readme/try.jpg: "Clouds Over Sea Shore With Rocks" by Julia Volk
+https://www.pexels.com/photo/clouds-over-sea-shore-with-rocks-5111061/
+
+These four are under the Pexels License, cropped and darkened, with type and data set over them by make_readme_art.py.

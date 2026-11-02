@@ -2,24 +2,11 @@
 
 **Mettle is a systems language with its own optimizer, linker, runtime and debugger.** It compiles to native code for x86-64 and ARM64, and to PTX, SPIR-V and Metal for GPUs.
 
-## Faster than llama.cpp, on the same card
+<img src="website/media/readme/power.jpg" width="100%" alt="Faster than llama.cpp, on the same card. Systm's Potentia runs LLMs on Mettle. Its GPU kernels are Mettle, compiled straight to PTX with no nvcc, C++ or Python in the pipeline, and the build fails unless the GPU matches an independent CPU reference, logit for logit. 1.7 to 2.4 times faster to the first token: 2.4 on a 128-token prompt, 1.9 on 512 tokens, 1.8 on 2,048 and 1.7 on 8,192. 1.07 to 1.41 times faster generating a reply: 1.41 on code with a drafter, 1.18 on prose with a drafter, 1.07 with no drafter. 8.5 to 23.5 times less RAM on the 26B model: 23.5 idle, 12.1 after four users, 8.5 two minutes on. 19 to 38 percent less energy per token: 38 at eight requests, 27 at four, 21 at two, 19 at one.">
 
-[Systm](https://systm.co.za/)'s Potentia runs LLMs on Mettle.
+<sub>[Systm](https://systm.co.za/)'s Potentia against llama.cpp from LM Studio, on Gemma 4 12B and 26B-A4B, QAT Q4_0, on one RTX 5060 Ti, with every layer on the GPU and one engine in VRAM at a time. Energy is board joules per token. At 16 requests, throughput is 473 against 446 tokens a second.</sub>
 
-- **1.7× to 2.4× faster to the first token.** 2.4× on a 128-token prompt, 1.7× on 8,192 tokens.
-- **1.07× to 1.41× faster generating a reply.** 1.07× alone, 1.18× on prose and 1.41× on code with a drafter.
-- **8.5× to 23.5× less RAM on the 26B model.** 23.5× idle, 12.1× after four users, 8.5× two minutes on.
-- **19% to 38% less energy per token.** 19% at one request, 38% at eight.
-
-<sub>Gemma 4 12B and 26B-A4B, QAT Q4_0, on one RTX 5060 Ti, against llama.cpp from LM Studio with every layer on the GPU and one engine in VRAM at a time. Energy is board joules per token.</sub>
-
-## Everything else stays close to C
-
-Every whole program in the benchmark suite, including parsers, compressors, interpreters and solvers:
-
-- **1.09× the run time of `clang -O3`, on average,** with the same answers on all 16. From 0.71× on a bytecode VM to 1.29× on a particle grid.
-- **1.13× the run time of `clang -O3 -march=native`,** which leads on all 16.
-- **2× faster to build a generated 90,000-line file.** 7.6 s against 16.0 s.
+<img src="website/media/readme/close.jpg" width="100%" alt="Everything else stays close to C. Every whole program in the benchmark suite. 1.09× the run time of clang -O3 on average, with the same answers on all 16. 1.13× the run time of clang -O3 -march=native, which leads on all 16. 2 times faster to build a generated 90,000-line file, 7.6 seconds against 16.0. A chart shows all 16 programs; the table below lists them.">
 
 <details>
 <summary>All 16 programs</summary>
@@ -47,7 +34,7 @@ Every whole program in the benchmark suite, including parsers, compressors, inte
 
 <sub>clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. Under `-march=native`, clang's physics_grid returns a different checksum. Run them with `tools/benchmark/mc.ps1 -Suite 3`.</sub>
 
-## What you can do
+<img src="website/media/readme/powers.jpg" width="100%" alt="What you can do.">
 
 - **Change it while it runs.** Save a file and the running program takes the new code, even after a crash. [Live programs](docs/live.md)
 - **Program the GPU directly.** A kernel is a Mettle function, compiled straight to PTX or Metal. [GPU offload](docs/gpu.md)
@@ -55,7 +42,7 @@ Every whole program in the benchmark suite, including parsers, compressors, inte
 - **Make it explain itself.** `--explain` names what it did with every loop and call, and what it took on trust. [Compilation](docs/compilation.md)
 - **Write your own laws.** A rule is a function you write that runs in the compiler and can stop the build. [Rules](docs/rules.md)
 - **Never write a lifetime.** It reads the whole program and tells you what it can prove. [Memory analyser](docs/borrow-checker.md)
-- **Redefine the machine.** A target is a Mettle value you can print, change and build for. [Bare metal](docs/bare-metal.md)
+- **Redefine the machine.** Print a target as Mettle, change it and build for it, or invent an instruction set and run on it. [Bare metal](docs/bare-metal.md)
 
 ```mettle
 @simd! fn checksum(data: uint8*, n: int64) -> int64 {
@@ -71,7 +58,7 @@ Every whole program in the benchmark suite, including parsers, compressors, inte
 checksum (loop @ line 6): vectorized -> vpsadbw, 32-wide byte sum (AVX2)
 ```
 
-## Install
+<img src="website/media/readme/try.jpg" width="100%" alt="Try it.">
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.sh | sh
@@ -85,4 +72,4 @@ These install v0.17.0. Live programs, rules, target descriptions and Metal are n
 
 [Getting started](docs/getting-started.md) | [Documentation](docs/README.md) | [What does not work yet](docs/known-limitations.md) | [Contributing](CONTRIBUTING.md)
 
-Apache 2.0.
+<sub>Apache 2.0. Photos by Ryan Shroyer, Raul Ling, Susanne Jutzeler and Julia Volk on Pexels.</sub>
