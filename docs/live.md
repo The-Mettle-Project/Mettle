@@ -206,7 +206,8 @@ Patch 3: step (160 bytes, at tick 5000)
 Each copy holds the patch until its own tick reaches 5000 and applies it at
 the next `quiesce;`, so frame 5000 runs the new code in every copy. A copy
 already past the tick applies it at its next poll. Patches after a held one
-wait behind it.
+wait behind it, except in a copy stopped at a fault: there the held patch
+applies as soon as another patch, such as the fix, arrives behind it.
 
 ## What it refuses
 

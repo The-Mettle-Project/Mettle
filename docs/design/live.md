@@ -412,6 +412,8 @@ program and polls source modification times.
   patch header. The loader reads a held patch at each poll, frees it, and
   keeps its tick; `quiesce;` then polls as soon as the program's tick reaches
   that value, without waiting out the 50 ms poll interval, so every copy
-  applies the patch in the same frame. Undo patches carry tick 0. Next:
+  applies the patch in the same frame. Undo patches carry tick 0. A thread
+  waiting at a fault cannot reach the tick, so while it waits the loader
+  checks for the patch after a held one, and when it exists both apply. Next:
   generated wire formats carry their own migrations, so old and new nodes can
   talk during a rollout.

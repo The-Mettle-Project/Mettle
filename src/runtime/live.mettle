@@ -25,6 +25,7 @@ var mettle_live_ready: int64 = 0;
 var mettle_live_next: int64 = 1;
 var mettle_live_last_probe: uint64 = 0;
 var mettle_live_held_tick: int64 = 0;
+var mettle_live_faulted: int64 = 0;
 var mettle_live_message: uint8[300];
 var mettle_live_poll_lock: int64 = 0;
 var mettle_live_message_lock: int64 = 0;
@@ -986,6 +987,23 @@ fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
     return 1;
 }
 
+fn mettle_live_queued_behind() -> int64 {
+    if (mettle_live_faulted == 0) {
+        return 0;
+    }
+    mettle_live_name_patch(mettle_live_next + 1);
+    var size: int64 = 0;
+    var buffer: int64 = mettle_live_read(&size);
+    mettle_live_name_patch(mettle_live_next);
+    if (buffer == 0) {
+        return 0;
+    }
+    if (buffer != -1) {
+        mettle_live_port_free(buffer, size);
+    }
+    return 1;
+}
+
 fn mettle_live_poll() {
     if (mettle_live_ready == 0) {
         mettle_live_ready = 2;
@@ -1003,7 +1021,7 @@ fn mettle_live_poll() {
         if (buffer == 0) {
             return;
         }
-        if (buffer != -1 && size >= 88 && mettle_live_u32(buffer + 8) == 3 && mettle_live_u64(buffer + 80) > mettle_live_get_tick()) {
+        if (buffer != -1 && size >= 88 && mettle_live_u32(buffer + 8) == 3 && mettle_live_u64(buffer + 80) > mettle_live_get_tick() && mettle_live_queued_behind() == 0) {
             mettle_live_held_tick = mettle_live_u64(buffer + 80);
             mettle_live_port_free(buffer, size);
             return;
@@ -1330,6 +1348,7 @@ export fn mettle_live_recover_wait(slot: int64) -> int64 {
     at = mettle_live_text(at, owner);
     at = mettle_live_text(at, " stopped at the fault. Save a fix and it continues from its last quiesce point");
     mettle_live_send(at);
+    mettle_live_faulted = 1;
     while (1 == 1) {
         var before: int64 = mettle_live_applied_count;
         mettle_live_port_lock(&mettle_live_poll_lock);
@@ -1355,6 +1374,7 @@ export fn mettle_live_recover_wait(slot: int64) -> int64 {
                 at = mettle_live_text(at, owner);
                 at = mettle_live_text(at, " continues from its last quiesce point");
                 mettle_live_send(at);
+                mettle_live_faulted = 0;
                 return 1;
             }
             at = mettle_live_text(0, "[live] the new ");

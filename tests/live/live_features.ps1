@@ -276,7 +276,7 @@ if ($built.Code -ne 0) {
     if (-not (Wait-For $err "stopped at the fault")) { Fail $name "the fault did not wait for a fix" }
     Write-Source $source $crashC
     Invoke-Mettle @("--live-patch", $exe, $source) | Out-Null
-    if (-not (Wait-For $err "continues from its last quiesce point")) { Fail $name "the program did not continue" }
+    if (-not (Wait-For $err "main continues from its last quiesce point")) { Fail $name "the program did not continue" }
     if (-not (Wait-For $out "score=\d{4,}\r?\n(.*\n){3}")) { Fail $name "the fixed code did not run" }
     Stop-Live $process
     Remove-Item -Force "$exe.live.watched" -ErrorAction SilentlyContinue
@@ -349,6 +349,50 @@ if ($built.Code -ne 0) {
     }
 }
 
+$heldA = $tickA.Replace(@'
+fn step(n: int64) -> int64 {
+    return n + 1;
+}
+'@, @'
+fn step(n: int64) -> int64 {
+    var p: int64* = (int64*)0;
+    if (n == 60) {
+        *p = n;
+    }
+    return n + 1;
+}
+'@)
+$heldB = $heldA.Replace("return n + 1;", "return n + 2;")
+$heldC = $tickA.Replace("return n + 1;", "return n + 1000;")
+
+$name = "held"
+Clear-Program $name
+$source = Join-Path $scratch "$name.mettle"
+$exe = Join-Path $scratch "$name$suffix"
+Write-Source $source $heldA
+$built = Invoke-Mettle @("--build", "--live", $source, "-o", $exe)
+if ($built.Code -ne 0) {
+    Fail $name "build failed: $($built.Text)"
+} else {
+    [System.IO.File]::WriteAllText("$exe.live.watched", "1`n")
+    $process = Start-Live $exe $name
+    $out = Join-Path $scratch "$name.out"
+    $err = Join-Path $scratch "$name.err"
+    if (-not (Wait-For $out "t=3 ")) { Fail $name "the program did not start" }
+    Write-Source $source $heldB
+    $patch = Invoke-Mettle @("--live-patch", $exe, "--live-at-tick", "1000000", $source)
+    if ($patch.Text -notmatch "at tick 1000000\)") { Fail $name "patch said: $($patch.Text)" }
+    if (-not (Wait-For $err "stopped at the fault")) { Fail $name "the old code did not fault" }
+    Start-Sleep -Milliseconds 500
+    if ((Read-Text $err) -match "patch 1:") { Fail $name "the held patch applied before a fix arrived" }
+    Write-Source $source $heldC
+    Invoke-Mettle @("--live-patch", $exe, $source) | Out-Null
+    if (-not (Wait-For $err "main continues from its last quiesce point")) { Fail $name "the fix stayed queued behind the held patch" }
+    if (-not (Wait-For $out "v=\d{4,}\r?\n(.*\n){3}")) { Fail $name "the fixed code did not run" }
+    Stop-Live $process
+    Remove-Item -Force "$exe.live.watched" -ErrorAction SilentlyContinue
+}
+
 foreach ($line in $failures) { "FAIL $line" }
-"live features: $(4 - @($failures | ForEach-Object { ($_ -split ':')[0] } | Sort-Object -Unique).Count) of 4 scenarios passed"
+"live features: $(5 - @($failures | ForEach-Object { ($_ -split ':')[0] } | Sort-Object -Unique).Count) of 5 scenarios passed"
 exit $failures.Count
