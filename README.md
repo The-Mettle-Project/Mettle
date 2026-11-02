@@ -1,97 +1,23 @@
-<div align="center">
+<a href="https://suidvandiewereld.github.io/Mettle/"><img src="website/media/readme-banner.jpg" alt="This is your language. Do what you want with it." width="100%"></a>
 
-<picture>
-  <source
-    media="(prefers-color-scheme: dark)"
-    srcset="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-dark.svg"
-    width="120" height="120" />
-  <img
-    src="https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/docs/assets/mettle-light.svg"
-    alt="Mettle" width="120" height="120" />
-</picture>
+**Mettle is a systems language with its own optimizer, linker, runtime and debugger.** It compiles to native code for x86-64 and ARM64, and to PTX, SPIR-V and Metal for GPUs.
 
-# Mettle
+[Website](https://suidvandiewereld.github.io/Mettle/) | [Getting started](docs/getting-started.md) | [Documentation](docs/README.md) | [What does not work yet](docs/known-limitations.md)
 
-Mettle is a systems language where the toolchain is part of the contract.
+## Faster than llama.cpp, on the same card
 
-Require what the compiler must do. Read what it did. Check that it kept your
-program's meaning.
+[Systm](https://systm.co.za/)'s Potentia runs LLMs on Mettle.
 
-Native x86-64, ARM64 and GPU code generation, with its own optimizer, linker,
-runtime and debugger. No LLVM, no VM, no GC.
+- **2.4× faster to the first token.** 35.7 ms against 87.1 ms.
+- **1.41× faster writing code.** 140.5 against 99.3 tokens a second.
+- **12× less memory after four users.** 1.8 GB against 21.5 GB.
+- **38% less energy per token at eight requests.** 0.38 J against 0.61 J.
 
-</div>
+Its GPU kernels are Mettle, compiled straight to PTX with no nvcc, C++ or Python in the pipeline. The build fails unless the GPU matches an independent CPU reference, logit for logit.
 
-## Example
+<sub>Gemma 4, QAT Q4_0, on one RTX 5060 Ti, against llama.cpp from LM Studio with every layer on the GPU and one engine in VRAM at a time. First token: 12B, a 128-token prompt. Code: 12B, with Gemma 4's assistant drafter in both engines. Memory: 26B-A4B, RAM right after four users.</sub>
 
-```mettle
-import "std/io";
-import "std/mem";
-
-@simd! fn checksum(data: uint8*, n: int64) -> int64 {
-  var sum: int64 = 0;
-  for i: int64 in 0..n {
-    sum = sum + (int64)data[i];
-  }
-  return sum;
-}
-
-fn main() -> int32 {
-  var n: int64 = 1024;
-  var data: uint8* = malloc(n);
-  for i: int64 in 0..n { data[i] = (uint8)(i & 255); }
-
-  println("checksum = {checksum(data, n)}");
-  free(data);
-  return 0;
-}
-```
-
-```bash
-mettle --build --release checksum.mettle
-./checksum          # on Windows, .\checksum.exe
-```
-
-You write the type on every `var`. Any expression fits between the braces of a
-string. And `@simd!` is a demand: that loop vectorizes or the build stops.
-
-Ask what the optimizer did with it.
-
-```bash
-mettle --build --release --explain checksum.mettle
-```
-
-```text
--- optimization report: checksum.mettle -------------------------------------
-  1 missed optimization in this file, none with a fix the compiler can name
-
-  checksum (loop @ line 6): vectorized -> vpsadbw, 32-wide byte sum (AVX2)
-  main (loop @ line 15): NOT vectorized  [store-only-fill]
-      15 | for i: int64 in 0..n { data[i] = (uint8)(i & 255); }
-      \_ reason: the loop fills 1-byte elements, and the fill kernel covers 2-, 4- and 8-byte elements only
-      \_ note: nothing to change here: this is a gap in the compiler, not a problem with the loop
-  main (call to `println` @ line 17): inlined
-  main (call to `checksum` @ line 17): inlined
-```
-
-It names the instruction it picked, and it names its own gaps.
-
-Now free the buffer one line early.
-
-```mettle
-  free(data);
-  println("checksum = {checksum(data, n)}");
-```
-
-```text
-warning[M0101]: Use of `data` after it was freed (freed at line 17); this is use-after-free
-
-   17 |    free(data);
-   18 |    println("checksum = {checksum(data, n)}");
-      :            ^
-```
-
-It found that by reading the program. You ran nothing and marked nothing.
+You get the same language. Here is what it lets you do.
 
 ## Install
 
@@ -107,144 +33,161 @@ Windows, in PowerShell:
 irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
 ```
 
-Both unpack to `~/.mettle` or `%LOCALAPPDATA%\Mettle` and add that to your PATH.
-Neither needs root or admin.
-
-## What it does
-
-**Finds memory bugs while it compiles.** It reads the whole program and reports
-use after free, double free, leaks, dangling returns, and pointers `realloc`
-left stale. It follows a pointer across a task boundary too: handing a task a
-pointer into the frame that spawned it stops the build, and so does writing
-through a message the sender already handed over. You write no lifetimes and no
-ownership marks. It infers them, and it reports only what it can prove. See
-[the memory analyser](docs/borrow-checker.md).
-
-**Checks the rest at run time, cheaply enough to ship.** `--check-overflow`
-traps on a signed add, subtract or multiply that leaves its type, and a
-declared range that bounds the operands deletes the check outright. `--safe`
-checks every memory access at every optimization level, then proves away what
-it can: a
-constant index, a counter its loop already bounds, an index its own arithmetic
-bounds, one check that covers a whole loop. What survives compares against an
-allocation the loop resolved once, and costs a few instructions. A vectorized
-dot product pays nothing, a CRC 1.04x, a heapsort whose indices come out of
-comparisons 2.5x. See [checked access](docs/memory-safety.md).
-
-**Says what the optimizer did.** `--explain` prints what became of every loop
-and every call, what stopped a loop from vectorizing, and what changed since
-your last build. It simulates each fix it offers before printing it, so it only
-prints fixes that worked. `--explain-json` feeds CI.
-
-**Says what it took on trust.** The same report lists every type it proved,
-every effect it inferred, every rule it ran, and, under **beliefs**, the
-externs it believed because it could not see them. Each mechanism is on a
-ledger and under a budget: `--report-proofs` with `--proof-budget=N`,
-`--report-effects` with `--effect-budget=N`, `--report-rules` with
-`--rule-budget=N`, `--report-expansion` with `--expansion-budget=N`. No
-annotation is believed for speed: `@pure` is checked and never consumed, and a
-call is hoisted only where purity was inferred.
-
-**Fails the build when a promise breaks.** `@simd!` demands that a loop
-vectorize, `@inline!` that every call site inline, `@noalloc` that a call graph
-allocate nothing. When the compiler cannot deliver, it stops and names the site
-that defeated it.
-
-**Lets the program add its own promises.** A `@rule fn` is an ordinary
-function the compiler runs while compiling, over the checked program as data,
-and a failing verdict stops the build at the site it names: no function in
-this module recurses, this struct stays under 64 bytes, every variant is
-handled in this file. `type Percent = int32 where value >= 0 && value <=
-100;` declares a type that carries a rule, and a value becomes one only where
-the compiler proves it. `fn tick() where cycles < 400` says the same kind of
-thing about a function's longest path, and the compiler costs that path from a
-model of the target or stops the build. `effect Render;` declares what a function may do or
-need: `fn mix() forbids Render`, `fn job() requires Worker`, inferred through
-the whole call graph and refused with the chain that broke it. Saying where
-code runs is enough to say which globals two threads share, so one written
-from two threads with nothing ordering them is refused too. A frame is data:
-a `const` of `std/schedule`'s `Schedule` names its phases, and the compiler
-generates the dispatcher for each thread from it, with a `quiesce` at every
-phase boundary and a call across one refused. A target is a
-Mettle `const` the compiler reads, so `mettle target x86_64-none` prints one
-and `--target mine.mettle` builds for it; a freestanding x86_64 or aarch64
-target chooses its integer argument registers there, and the aarch64 choice is
-checked by running the result on an emulated CPU. A whole machine can be a `const`
-too: `mettle emulate` assembles a program into an instruction set the file
-describes, decodes it back to check the description agrees with itself, and
-runs it by calling each instruction's own semantics function. [Rules](docs/rules.md),
-[Effects](docs/effects.md), [Types](docs/types.md) and
-[Bare metal](docs/bare-metal.md) cover them.
-
-**Vectorizes for AVX2** across reductions, maps, dot products, byte kernels,
-kernels over quantized integers, and some serial recurrences. It beats
-`gcc -O3` on several kernels in the benchmark suite.
-
-A branch that only picks a value counts as a value, so a clamp, a floor, a
-ReLU, a running extremum and a count of matches all vectorize, in whatever
-order you write the tests and whether or not you factor them into a helper.
-Buffers at file scope reach the same kernels as pointers passed in. `--explain`
-names the reason for every loop it leaves alone.
-
-**Offloads to NVIDIA GPUs**, straight to PTX, with no `nvcc` and no CUDA
-runtime. Write `kernel` functions, declare them on the host, and launch them:
+Neither needs root or admin. Both install v0.17.0, the latest release. Live programs, rules, effects, target descriptions, invented machines and Metal are newer: until the next release, [build from source](#build-from-source) to use them.
 
 ```mettle
-extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
+import "std/io";
+
+fn main() -> int32 {
+  println("hello");
+  return 0;
+}
+```
+
+```bash
+mettle --build hello.mettle
+```
+
+## Change it while it runs
+
+Run a program under `mettle live` and every save becomes a patch. It keeps its state, and every frame on the stack moves to the new code. If it crashes, it waits for your fix.
+
+```text
+1500000 records, 122784319 dollars settled
+Fatal error: array index out of bounds (index 9001, length 64)
+  --> settle.mettle:34:32 in post
+⋯
+[live] main stopped at the fault. Save a fix and it continues from its last quiesce point
+Patch 1: post (2304 bytes)
+⋯
+[live] main continues from its last quiesce point
+record 1500000 held: merchant 9001 does not exist
+2000000 records, 163680452 dollars settled
+```
+
+The program adds one line, `quiesce;`, where it may change. Add a struct field and save, and every value on the heap converts in place. Undo it, and they convert back. A live build runs within 0.7% of a normal one, as a geometric mean over eight programs at `-O`, on Windows x64 and Linux x64. [Live programs](docs/live.md)
+
+## Program the GPU directly
+
+A kernel is a Mettle function. It compiles straight to PTX or Metal, and one line launches it.
+
+```mettle
+kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    c[i] = a[i] + b[i];
+  }
+}
 
 dispatch vadd[work: n](da, db, dc, n);
 ```
 
-It checks the arguments against the declaration, and the grid follows from the
-declared block. A kernel says in its types where its memory lives and how it is
-laid out: `float32 global align(16)*`, `float32 shared*`, `float32 constant*`,
-and the compiler proves the alignment rather than taking it, which is what lets
-four adjacent loads become one `ld.global.v4.f32`. Subgroup collectives,
-atomics, tensor core operations, `printf` inside a kernel, and an occupancy
-report at build time all work. A kernel also says how its tiles are laid out
-(`float32[32, 32] layout swizzle128`), and the compiler proves an index against
-the extents and a subgroup's addresses against the banks. It says which values
-are the same in every work item, and proves that too: a branch on one lowers to
-`bra.uni`, and a warp collective reached under a branch the work items do not
-all agree on fails the build with the line that took the group away. See
-[GPU offload](docs/gpu.md).
+[GPU offload](docs/gpu.md)
 
-**Runs your code while it compiles.** `@test` functions run in the compiler and
-leave no binary behind. `mettle trace` interprets one function and prints its
-values line by line. `--pgo` runs `main` at build time and feeds the call counts
-it measured back to the optimizer.
+## Make the compiler obey
 
-**Debugs and reports crashes on its own.** Breakpoints, stepping, and reading
-and writing live variables over `--debug-hooks`, with no gdb, no PDB and no
-DWARF. Build with `-s` and a fault reports the bad address, such as a null field
-or a freed block.
+Put `@simd!` on a loop and it vectorizes, or the build stops and tells you why. `@inline!` and `@noalloc` work the same way.
 
-Windows and Linux are both first-class targets. One source tree builds them and
-one test suite gates them. Each owns its runtime: Windows links its own PE
-images, Linux emits ELF and reaches the kernel through direct system calls, so
-neither carries a libc. Windows has `std/ui` for windows and controls; Linux
-does not. See [what is missing](docs/known-limitations.md).
+```mettle
+@simd! fn checksum(data: uint8*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  for i: int64 in 0..n {
+    if (data[i] == 0) { break; }
+```
 
-macOS is newer. Mettle emits Mach-O for Apple silicon and Intel Macs, links
-against libSystem, and runs GPU kernels through Metal from the same `std/gpu`
-host code that drives CUDA. It has not yet run on a Mac; the `macos` CI job
-is the first place it will. See [macOS and Metal](docs/macos.md).
+```text
+error: @simd! loop was not vectorized: the loop body branches on data (an `if` or `&&`/`||` per iteration); only straight-line loop bodies vectorize
+```
 
-## Documentation
+## Make it explain itself
 
-- [Getting started](docs/getting-started.md): install, first program, a tour of
-  the language.
-- [Quick reference](docs/quick-reference.md): the idioms you look up.
-- [Known limitations](docs/known-limitations.md): what does not work yet.
-- [Full index](docs/README.md): the language, the backend, and the tooling.
+`--explain` names the instruction it chose, the loop it gave up on, and what it took on trust.
 
-The rendered docs live at <https://suidvandiewereld.github.io/Mettle/>.
+```text
+checksum (loop @ line 6): vectorized -> vpsadbw, 32-wide byte sum (AVX2)
+main (loop @ line 15): NOT vectorized  [store-only-fill]
+main (call to `checksum` @ line 17): inlined
+⋯
+10 things this build took on trust.
+⋯
+```
+
+`--verify` runs every optimizer pass on the same inputs before and after, and hands you a runnable counterexample if they differ. [Compilation](docs/compilation.md), [translation validation](docs/translation-validation.md)
+
+## Write your own laws
+
+A rule is a function you write. It runs in the compiler over your program, and when it fails, the build stops at the line it names.
+
+```mettle
+@rule fn no_recursion(p: Program) -> Verdict {
+  for f in p.functions {
+    if (f.module == "" && f.is_recursive) {
+      return verdict_fail(f.site, "this module forbids recursion");
+```
+
+```text
+error[R0002]: rule 'no_recursion' failed: this module forbids recursion
+```
+
+A type can carry a predicate, and a value becomes one only where the compiler proves it. A function can forbid an effect across its whole call graph, or bound its own longest path in cycles. [Rules](docs/rules.md), [effects](docs/effects.md), [types](docs/types.md)
+
+## Never write a lifetime
+
+The compiler reads the whole program and tells you what it can prove: use after free, double free, leaks, dangling returns. You mark nothing, and for a warning like this one the call stays yours.
+
+```mettle
+var data: uint8* = malloc(n);
+free(data);
+println("checksum = {checksum(data, n)}");
+```
+
+```text
+warning[M0101]: Use of `data` after it was freed (freed at line 17); this is use-after-free
+Built executable 'checksum.exe'
+```
+
+When you want run-time checks too, `--safe` checks every memory access and proves away what it can. [Memory analyser](docs/borrow-checker.md), [checked access](docs/memory-safety.md)
+
+## Redefine the machine
+
+A target is a Mettle value. Print one, change what you like, and build for it. Here the argument registers run backwards, and the code follows.
+
+```text
+$ mettle target x86_64-none > mine.mettle
+int_args: ["r9", "r8", "rcx", "rdx", "rsi", "rdi"],
+
+$ mettle add.mettle --target mine.mettle --emit-obj -o add.o
+mov rdx, r9
+mov rax, r8
+mov rbx, rcx
+```
+
+You can also describe an instruction set in a Mettle file. The compiler checks it, assembles your program for it, and runs it with `mettle emulate`. [Bare metal](docs/bare-metal.md)
+
+## How it fits together
+
+Everything runs in one process, from your source to the executable.
+
+```mermaid
+flowchart LR
+  A[Your source] --> B[Checked program<br>types, memory, your rules]
+  B --> C[Optimizer<br>--explain, --verify]
+  C --> D[x86-64 and ARM64]
+  C --> E[PTX, SPIR-V, Metal]
+  D --> F[Linker]
+  F --> G[Your program]
+  E --> G
+```
+
+[Architecture](docs/ARCHITECTURE.md), [Mettle and libmtlc](docs/mettle-and-libmtlc.md)
+
+## Where it runs
+
+Windows and Linux on x86-64 share one source tree and one test suite. Each owns its runtime: Windows links its own PE images, and Linux emits ELF and makes its own system calls. AArch64 is proven under an emulator. [macOS and Metal](docs/macos.md) have run on an M4 Pro, though `main` does not build there right now. [Bare metal](docs/bare-metal.md) lists what ran each claim.
 
 ## Build from source
 
-This repository holds the whole toolchain under one `src/`: the language and its
-frontend, and **libmtlc**, which is the IR, the optimizers, code generation and
-native linking. There is nothing to fetch. The build runs offline.
+The whole toolchain lives in this repository, and the build runs offline.
 
 Windows, with gcc or clang:
 
@@ -260,36 +203,7 @@ make -j"$(nproc)"
 make check
 ```
 
-`make check` runs the same `tests/run_tests.ps1` the Windows build gates on, so
-a test written on either platform runs on both. It needs
-[PowerShell Core](https://aka.ms/powershell). Without it, `bash
-tools/test-elf-native.sh` still covers the owned-ELF product on its own.
-
-To build the backend alone, the archive another frontend links against:
-
-```powershell
-.\build.bat --backend-only
-```
-
-See [Mettle and libmtlc](docs/mettle-and-libmtlc.md) for the line between the
-frontend and the backend.
-
-Samples live in [examples/](examples/). [examples/desk/](examples/desk/) is a
-four-channel mixing desk that carries the whole surface in one program: a
-schedule the two threads meet on, fixed point over declared types that deletes
-its own overflow checks, two blocks that declare what they may cost and are
-proven against the target's cost model, an indirect call the effect system
-still bounds, and seven rules that run over the checked program, over what it
-became and over a recording of a run. The benchmark suites pair Mettle against
-C:
-
-```powershell
-.\tools\benchmark\run-benchmarks.ps1
-```
-
-The editor extensions live in
-[MettleMisc](https://github.com/The-Mettle-Project/MettleMisc): `mettle-syntax`
-for VS Code and Cursor, `clion-plugin` for the IntelliJ family.
+`make check` needs [PowerShell Core](https://aka.ms/powershell). [Contributing](CONTRIBUTING.md) covers the rest, and editor extensions live in [MettleMisc](https://github.com/The-Mettle-Project/MettleMisc).
 
 ## License
 
