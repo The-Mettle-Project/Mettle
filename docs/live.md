@@ -206,8 +206,11 @@ In a `--live` build every function starts with an eight-byte no-op, and calls
 go straight to it. A patch is new machine code plus the functions it replaces.
 The running program finds the next patch file at `quiesce;`, places the code
 within 2 GB of the image, fixes its addresses, and writes a jump over the
-no-op of each replaced function. A live build runs within 0.4% of a normal
-build (geometric mean over eight Suite 3 programs at `-O`).
+no-op of each replaced function. A live build runs within 0.7% of a normal
+build (geometric mean over eight Suite 3 programs at `-O`). Single programs
+move up to 8% either way, since live builds send failed checks to the crash
+handler and that shifts code layout: json_parse runs 7% slower, interp_ast 8%
+faster.
 
 `tests/live/live_oracle.ps1` checks the mechanism on every test program: it
 puts a `quiesce;` at the top of `main`, builds a patch from the unchanged

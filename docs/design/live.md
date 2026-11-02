@@ -71,9 +71,10 @@ spare slots in the host's `.data`, and patch code calls them through a
 blob-local `jmp [rip + slot]`. A later patch that replaces one of them stores
 into the slot.
 
-A live build runs within 0.4% of a normal build: geometric mean over eight
-Suite 3 programs at `-O`, against 3.5% when every call went through a thunk
-and a slot. Live builds also keep `var` globals in memory: the read-only
+Entries cost 0.4% (geometric mean over eight Suite 3 programs at `-O`),
+against 3.5% when every call went through a thunk and a slot. With every
+other live build change since (trap routing, slack, the arena) the mean is
+0.7%; single programs move up to 8% either way with code layout. Live builds also keep `var` globals in memory: the read-only
 global fold is off, so a variable the program never assigns still takes the
 value the running program has.
 
