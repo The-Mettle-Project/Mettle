@@ -111,7 +111,7 @@ jobs:
   build-and-test:
     name: Build & test (windows gcc)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
 
@@ -141,6 +141,13 @@ jobs:
           METTLE_REGALLOC_VERIFY: "1"
           METTLE_RA_COALESCE_CHECK: "1"
         run: build.bat gcc
+
+      - name: Live patching
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/live/live_features.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File tests/live/live_oracle.ps1 -Loops
 
       # run_tests.ps1 writes generated .s/.ir output to $env:TEMP\Mettle-test-artifacts.
       # Surface that path so a failed run's codegen can be inspected from the UI.
@@ -202,7 +209,7 @@ jobs:
   elf-native:
     name: Build & test (linux ELF ${{ matrix.cc }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -245,6 +252,12 @@ jobs:
           METTLE_REGALLOC_VERIFY: "1"
           METTLE_RA_COALESCE_CHECK: "1"
         run: pwsh -NoProfile -File tests/run_tests.ps1 -CompilerPath ./bin/mettle
+
+      - name: Live patching
+        shell: bash
+        run: |
+          pwsh -NoProfile -File tests/live/live_features.ps1 -Compiler ./bin/mettle
+          pwsh -NoProfile -File tests/live/live_oracle.ps1 -Compiler ./bin/mettle -Loops
 
       - name: Upload test artifacts and ICE bundles on failure
         if: failure()
