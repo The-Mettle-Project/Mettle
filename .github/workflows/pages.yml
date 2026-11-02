@@ -39,7 +39,7 @@ jobs:
           mkdir -p _site/media
           cp -r site/. _site/
           cp website/index.html _site/index.html
-          cp website/media/hero.mp4 website/media/canyon.mp4 website/media/canyon-poster.jpg _site/media/
+          cp website/media/hero.mp4 website/media/canyon.mp4 website/media/canyon-poster.jpg website/media/og.jpg _site/media/
       - uses: actions/upload-pages-artifact@v4
         with:
           path: _site
