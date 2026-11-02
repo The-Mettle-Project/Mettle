@@ -2357,15 +2357,13 @@ void ir_name_index_insert(IRNameIndex *index, const char *name, size_t value) {
     return;
   }
   slot = ir_name_index_slot(index, name);
-  if (!index->names[slot]) {
-    if (!ir_name_index_room(index)) {
-      return;
-    }
-    slot = ir_name_index_slot(index, name);
-    index->names[slot] = name;
-    index->count++;
+  if (index->names[slot] || !ir_name_index_room(index)) {
+    return;
   }
+  slot = ir_name_index_slot(index, name);
+  index->names[slot] = name;
   index->values[slot] = value;
+  index->count++;
 }
 
 void ir_name_index_add(IRNameIndex *index, const char *name, size_t delta) {
