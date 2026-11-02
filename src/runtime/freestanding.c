@@ -2117,7 +2117,11 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #define MT_O_CREAT 0100
 #define MT_O_TRUNC 01000
 #define MT_O_APPEND 02000
+#if defined(__aarch64__)
+#define MT_O_DIRECTORY 040000
+#else
 #define MT_O_DIRECTORY 00200000
+#endif
 #define MT_FILE_MODE 0666
 #define MT_PROT_READ 1
 #define MT_PROT_WRITE 2

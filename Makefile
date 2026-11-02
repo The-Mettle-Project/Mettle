@@ -35,6 +35,7 @@ ifneq (,$(filter aarch64% arm64%,$(shell $(CC) -dumpmachine 2>/dev/null)))
 ARCH_CFLAGS := $(shell $(CC) -mno-outline-atomics -E -x c /dev/null > /dev/null 2>&1 \
 	&& echo -mno-outline-atomics)
 CFLAGS += $(ARCH_CFLAGS)
+HOST_IS_AARCH64 := 1
 endif
 LDFLAGS =
 SRCDIR = src
@@ -236,7 +237,9 @@ ifeq ($(UNAME_S),Darwin)
 endif
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/swap.mettle -o $(BINDIR)/runtime/swap.o
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/string.mettle -o $(BINDIR)/runtime/string.o
+ifeq ($(HOST_IS_AARCH64),)
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/live.mettle -o $(BINDIR)/runtime/live.o
+endif
 else
 bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 	rm -rf $(BINDIR)/runtime
@@ -265,7 +268,9 @@ bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
 	cp $(OBJDIR)/runtime/debug.o         $(BINDIR)/runtime/debug.o
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/swap.mettle -o $(BINDIR)/runtime/swap.o
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/string.mettle -o $(BINDIR)/runtime/string.o
+ifeq ($(HOST_IS_AARCH64),)
 	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/live.mettle -o $(BINDIR)/runtime/live.o
+endif
 	cp $(OBJDIR)/runtime/profile.o       $(BINDIR)/runtime/profile.o
 	cp $(OBJDIR)/runtime/parallel.o      $(BINDIR)/runtime/parallel.o
 	cp $(OBJDIR)/runtime/trace.o         $(BINDIR)/runtime/trace.o
