@@ -40,6 +40,8 @@ html, body { width: %dpx; overflow: hidden; }
 .art-body .bar .row { font-size: 21px; }
 .art-body .bar i { height: 7px; }
 .art-body .c-grid { display: block; margin-top: 36px; }
+.art-body .s-cols { display: block; }
+.art-body .s-col + .s-col .s-head { display: none; }
 .art-body .c-figs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 34px; margin-bottom: 40px; }
 .art-body .c-figs .fig + .fig { margin-top: 0; }
 .art-body .c-figs .fig b { font-size: 76px; }
@@ -58,9 +60,12 @@ def script(photo_url, heading, height, position, part):
     return """<script>
 (function () {
   var proof = document.querySelector(".proof");
-  var how = proof.querySelectorAll(".how");
+  var how = ["Systm's Potentia runs LLMs on Mettle. Its GPU kernels are Mettle, compiled straight to PTX with no nvcc, C++ or Python in the pipeline. The build fails unless the GPU matches an independent CPU reference, logit for logit.", "Every whole program in the benchmark suite, including parsers, compressors, interpreters and solvers."];
   var figs = proof.querySelector(".figs");
-  var grid = proof.querySelector(".c-grid");
+  var grid = document.createElement("div");
+  grid.className = "c-grid";
+  grid.appendChild(proof.querySelector(".c-figs"));
+  grid.appendChild(proof.querySelector(".spread"));
   var part = %s;
   document.querySelectorAll(".spread, .figs").forEach(function (e) { e.classList.add("shown"); });
   var photo = document.createElement("div");
@@ -73,8 +78,10 @@ def script(photo_url, heading, height, position, part):
   if (part !== null) {
     var body = document.createElement("div");
     body.className = "art-body";
-    if (part === 0) how[0].textContent = "Systm's Potentia runs LLMs on Mettle. " + how[0].textContent;
-    body.appendChild(how[part]);
+    var lead = document.createElement("p");
+    lead.className = "how";
+    lead.textContent = how[part];
+    body.appendChild(lead);
     body.appendChild(part === 0 ? figs : grid);
     nodes.push(body);
   }

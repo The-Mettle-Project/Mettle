@@ -1,3 +1,9 @@
+hero.jpg
+Source: "Beautiful Sunset Sky" by Karolina Grabowska
+https://www.pexels.com/photo/beautiful-sunset-sky-6241/
+License: Pexels License, https://www.pexels.com/license/
+Changes: resized, black point lowered so the tree line meets the page background, contrast and saturation raised.
+
 hero.mp4 and hero-poster.jpg
 Source: "Stunning Aerial View of Iceland's Vestrahorn Mountains" by Ryan Shroyer
 https://www.pexels.com/video/stunning-aerial-view-of-iceland-s-vestrahorn-mountains-36374734/
@@ -11,6 +17,8 @@ License: Pexels License, https://www.pexels.com/license/
 Changes: cut to 4 seconds, slowed to 0.5x with eased ends, darkened, played forward then reversed, audio removed. See make_canyon.sh.
 
 readme-banner.jpg and og.jpg are rendered from the hero above.
+
+plate-force.jpg, plate-cold.jpg and plate-dusk.jpg are readme/power.jpg, close.jpg and try.jpg's photographs below, resized and graded.
 
 readme/power.jpg: "Stunning Godafoss Waterfall in Iceland's Rugged Landscape" by Raul Ling
 https://www.pexels.com/photo/stunning-godafoss-waterfall-in-iceland-s-rugged-landscape-32833863/

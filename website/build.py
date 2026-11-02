@@ -101,7 +101,7 @@ def main():
     readme = read(os.path.join(REPO, "README.md"))
     require(c_o3 + "\u00d7 the run time of clang -O3" in readme and c_native + "\u00d7 the run time of clang -O3 -march=native" in readme, "the README to carry the same averages")
     span = 0.35
-    c_rows = ""
+    c_rows = []
     for r in sorted(suite3, key=lambda x: x["m"] / x["o3"]):
         ratio = r["m"] / r["o3"]
         native = r["m"] / r["native"]
@@ -109,7 +109,7 @@ def main():
         width = abs(ratio - 1) / span * 50
         kind = "down ahead" if ratio < 1 else "up"
         tick = 50 + (native - 1) / span * 50
-        c_rows += '      <div class="s-row"><span>%s</span><span class="s-track"><i class="o3 %s" style="width:%.2f%%"></i><i class="nat" style="left:%.2f%%"></i></span><span class="val">%.2f&times;</span></div>\n' % (r["name"], kind, width, tick, ratio)
+        c_rows.append('          <div class="s-row"><span>%s</span><span class="s-track"><i class="o3 %s" style="width:%.2f%%"></i><i class="nat" style="left:%.2f%%"></i></span><span class="val">%.2f&times;</span></div>\n' % (r["name"], kind, width, tick, ratio))
 
     explain, code, _ = compile_in("explain", "checksum.mettle", ["--build", "--release", "--explain"])
     require(code == 0, "--explain to build")
@@ -136,23 +136,6 @@ def main():
     ruled, code, _ = compile_in("rule", "rules.mettle", ["--build"], "rules.mettle")
     rule_error = re.search(r"^error\[R0002\]: .*$", ruled, re.M)
     require(code != 0 and rule_error, "R0002 from the recursion rule")
-
-    cwd = stage("target", [(os.path.join(EXHIBITS, "add.mettle"), "add.mettle")])
-    stock, code = run(cwd, [METTLE, "target", "x86_64-none"])
-    require(code == 0, "mettle target to print x86_64-none")
-    forward = 'int_args: ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]'
-    backward = 'int_args: ["r9", "r8", "rcx", "rdx", "rsi", "rdi"]'
-    require(forward in stock, "the printed target to list its integer argument registers")
-    write(os.path.join(cwd, "stock.mettle"), stock)
-    write(os.path.join(cwd, "mine.mettle"), stock.replace(forward, backward).replace('indirect_return: "rdi"', 'indirect_return: "r9"'))
-    _, code = run(cwd, [METTLE, "add.mettle", "--target", "stock.mettle", "--emit-obj", "-o", "stock.o"])
-    require(code == 0, "the printed target to build")
-    _, code = run(cwd, [METTLE, "add.mettle", "--target", "mine.mettle", "--emit-obj", "-o", "add.o"])
-    require(code == 0, "the edited target to build")
-    disasm, _ = run(cwd, ["objdump", "-d", "-M", "intel", "add.o"])
-    moves = re.findall(r"\t(mov\s+\w+,\s*(?:r9|r8|rcx))\s*$", disasm, re.M)
-    moves = [re.sub(r"\s+", " ", m).replace(",", ", ").replace(",  ", ", ") for m in moves]
-    require(len(moves) >= 3 and "r9" in moves[0] and "r8" in moves[1] and "rcx" in moves[2], "the edited target to read arguments from r9, r8 and rcx, found " + "; ".join(moves))
 
     little_path = os.path.join(REPO, "examples", "machine", "little.mettle")
     cwd = stage("machine", [(little_path, "little.mettle")])
@@ -181,12 +164,14 @@ def main():
         write(cached, json.dumps(session, ensure_ascii=False))
 
     version = run(REPO, [METTLE, "--version"])[0].split("\n")[0]
-    data = {k: session[k] for k in ("duration", "points", "events", "plateau")}
+    data = {k: session[k] for k in ("duration", "points", "events", "plateau", "lines", "entries")}
     facts = {
         "{{VERSION}}": version,
         "{{C_O3}}": c_o3,
         "{{C_NATIVE}}": c_native,
-        "{{C_ROWS}}": c_rows,
+        "{{C_ROWS_A}}": "".join(c_rows[:8]),
+        "{{C_ROWS_B}}": "".join(c_rows[8:]),
+        "{{LIVE_ADDRESS}}": session["address"],
         "{{DEMAND_CODE}}": esc("\n".join(demand[3:7] + ["    " + CUT])),
         "{{DEMAND_NOTE}}": esc(refusal.group(0)),
         "{{EXPLAIN_LINES}}": "\n".join(rows),
@@ -195,8 +180,6 @@ def main():
         "{{FREE_CODE}}": esc(freed[13].strip() + "\n" + freed[16].strip() + "\n" + freed[17].strip()),
         "{{FREE_NOTE}}": esc(warning.group(0)),
         "{{FREE_BUILT}}": esc(finished.group(0)),
-        "{{TARGET_LINE}}": esc(backward + ","),
-        "{{TARGET_DUMP}}": esc("\n".join(moves[:3])),
         "{{MACHINE_CODE}}": esc("\n".join(machine_code)),
         "{{MACHINE_OUT}}": esc("$ mettle emulate little.mettle\n" + "\n".join(machine_out[-3:])),
         "{{GPU_CODE}}": esc(kernel_src.replace("b: float32*, c:", "b: float32*,\n" + " " * 25 + "c:") + "\n\n" + launch),
@@ -207,7 +190,6 @@ def main():
     page = read(os.path.join(HERE, "template.html"))
     page = page.replace("{{DATA}}", json.dumps(data, separators=(",", ":")))
     page = page.replace("{{SERIF_WOFF2}}", read_b64("fonts", "GeistSerif-Regular.woff2"))
-    page = page.replace("{{HERO_POSTER}}", read_b64("media", "hero-poster.jpg"))
     for k, v in facts.items():
         page = page.replace(k, v)
     left = re.findall(r"\{\{[A-Z0-9_]+\}\}", page)
@@ -215,7 +197,7 @@ def main():
     write(os.path.join(HERE, "index.html"), page)
     print("wrote website/index.html")
     print("c averages: " + c_o3 + " " + c_native)
-    for k in ("{{TARGET_DUMP}}", "{{MACHINE_OUT}}", "{{DEMAND_NOTE}}"):
+    for k in ("{{MACHINE_OUT}}", "{{DEMAND_NOTE}}"):
         print(k.strip("{}").lower() + ": " + facts[k].replace("\n", " | ")[:150])
     print("explain: " + " | ".join(re.sub(r"<[^>]+>", "", r) for r in rows)[:420])
 
