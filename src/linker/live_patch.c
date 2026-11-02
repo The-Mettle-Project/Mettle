@@ -214,6 +214,10 @@ static void live_texts_replace(LiveTexts *texts, const char *const *names,
   }
 }
 
+static uint64_t g_live_patch_tick = 0;
+
+void live_set_patch_tick(uint64_t tick) { g_live_patch_tick = tick; }
+
 static LiveTexts g_live_layouts = {0};
 static LiveTexts g_live_types = {0};
 
@@ -2205,6 +2209,7 @@ static int live_write_patch(LiveBuilder *builder, const char *path) {
            live_buffer_u32(&out, (uint32_t)builder->imports.size) &&
            live_buffer_u32(&out, 0u) &&
            live_buffer_u32(&out, builder->migration_count) &&
+           live_buffer_u64(&out, g_live_patch_tick) &&
            live_buffer_append(&out, NULL, LIVE_PATCH_HEADER_SIZE - out.size) &&
            live_buffer_append(&out, builder->blob.data, builder->blob.size) &&
            live_buffer_align(&out, 8u, 0);
@@ -2475,6 +2480,7 @@ done:
     summary->converted_globals =
         builder.migration_count - builder.type_migration_count;
     summary->converted_types = builder.type_migration_count;
+    summary->at_tick = g_live_patch_tick;
     summary->blob_size = builder.blob.size;
   }
   if (!ok && error_message_out && !*error_message_out) {

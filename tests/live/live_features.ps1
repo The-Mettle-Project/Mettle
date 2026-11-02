@@ -282,6 +282,73 @@ if ($built.Code -ne 0) {
     Remove-Item -Force "$exe.live.watched" -ErrorAction SilentlyContinue
 }
 
+$tickA = @'
+import "std/live"
+
+fn step(n: int64) -> int64 {
+    return n + 1;
+}
+
+fn main() -> int32 {
+    var v: int64 = 0;
+    var t: int64 = 0;
+    while (t < 4000) {
+        live_tick(t);
+        quiesce;
+        v = step(v);
+        println("t={t} v={v}");
+        t = t + 1;
+        thread_sleep_ms((uint32)15);
+    }
+    return 0;
+}
+'@
+$tickB = $tickA.Replace("return n + 1;", "return n + 1000;")
+
+function Get-Tick([string]$text) {
+    $found = [regex]::Matches($text, "t=(\d+) ")
+    if ($found.Count -eq 0) { return -1 }
+    return [int64]$found[$found.Count - 1].Groups[1].Value
+}
+
+function Get-Switch([string]$text) {
+    $previous = 0
+    foreach ($match in [regex]::Matches($text, "t=(\d+) v=(\d+)")) {
+        $v = [int64]$match.Groups[2].Value
+        if ($v - $previous -ge 1000) { return [int64]$match.Groups[1].Value }
+        $previous = $v
+    }
+    return -1
+}
+
+$name = "tick"
+Clear-Program $name
+$source = Join-Path $scratch "$name.mettle"
+$exe = Join-Path $scratch "$name$suffix"
+Write-Source $source $tickA
+$built = Invoke-Mettle @("--build", "--live", $source, "-o", $exe)
+if ($built.Code -ne 0) {
+    Fail $name "build failed: $($built.Text)"
+} else {
+    $first = Start-Live $exe "$name-a"
+    if (-not (Wait-For (Join-Path $scratch "$name-a.out") "t=20 ")) { Fail $name "the first instance did not start" }
+    $second = Start-Live $exe "$name-b"
+    $outA = Join-Path $scratch "$name-a.out"
+    $outB = Join-Path $scratch "$name-b.out"
+    if (-not (Wait-For $outB "t=3 ")) { Fail $name "the second instance did not start" }
+    $at = [Math]::Max((Get-Tick (Read-Text $outA)), (Get-Tick (Read-Text $outB))) + 150
+    Write-Source $source $tickB
+    $patch = Invoke-Mettle @("--live-patch", $exe, "--live-at-tick", "$at", $source)
+    if ($patch.Text -notmatch "at tick $at\)") { Fail $name "patch said: $($patch.Text)" }
+    if (-not (Wait-For $outB "t=$($at + 3) ")) { Fail $name "the second instance never reached tick $at" }
+    Stop-Live $first
+    Stop-Live $second
+    foreach ($instance in @($outA, $outB)) {
+        $switch = Get-Switch (Read-Text $instance)
+        if ($switch -ne $at) { Fail $name "$(Split-Path -Leaf $instance) switched at tick $switch, wanted $at" }
+    }
+}
+
 foreach ($line in $failures) { "FAIL $line" }
-"live features: $(3 - @($failures | ForEach-Object { ($_ -split ':')[0] } | Sort-Object -Unique).Count) of 3 scenarios passed"
+"live features: $(4 - @($failures | ForEach-Object { ($_ -split ':')[0] } | Sort-Object -Unique).Count) of 4 scenarios passed"
 exit $failures.Count

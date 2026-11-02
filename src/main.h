@@ -128,6 +128,7 @@ typedef struct {
   int live;
   const char *live_patch_target;
   int live_patch_all;
+  long long live_at_tick;
   const char *dynamic_linker;
   const char *stdlib_directory;
   int prelude;

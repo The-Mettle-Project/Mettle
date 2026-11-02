@@ -29,6 +29,12 @@ static long long (*mt_live_forget_hook)(void *memory) = 0;
 static void (*mt_live_moved_hook)(void *from, void *to) = 0;
 static void *(*mt_live_regrow_hook)(void *memory, mt_size size) = 0;
 
+static long long mt_live_tick = 0;
+
+void mettle_live_set_tick(long long tick) { mt_live_tick = tick; }
+
+long long mettle_live_get_tick(void) { return mt_live_tick; }
+
 void mettle_set_live_heap_hooks(void *forget, void *moved, void *regrow) {
   mt_live_forget_hook = (long long (*)(void *))forget;
   mt_live_moved_hook = (void (*)(void *, void *))moved;

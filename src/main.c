@@ -3894,6 +3894,8 @@ static DriverFlagResult parse_flag_shared_library(CompilerOptions *options,
     options->live = 1;
   } else if (strcmp(argv[i], "--live-patch-all") == 0) {
     options->live_patch_all = 1;
+  } else if (strcmp(argv[i], "--live-at-tick") == 0 && i + 1 < argc) {
+    options->live_at_tick = strtoll(argv[++i], NULL, 10);
   } else if (strcmp(argv[i], "--live-patch") == 0 && i + 1 < argc) {
     options->live = 1;
     options->live_patch_target = argv[++i];
@@ -3901,6 +3903,7 @@ static DriverFlagResult parse_flag_shared_library(CompilerOptions *options,
     options->dynamic_linker = argv[++i];
   } else if (strcmp(argv[i], "--soname") == 0 ||
              strcmp(argv[i], "--live-patch") == 0 ||
+             strcmp(argv[i], "--live-at-tick") == 0 ||
              strcmp(argv[i], "--dynamic-linker") == 0 ||
              strcmp(argv[i], "--rpath") == 0 ||
              strcmp(argv[i], "--library") == 0 ||
@@ -5071,6 +5074,9 @@ int main(int argc, char *argv[]) {
     live_write_file_list(options.live_patch_target, options.input_filename);
     LivePatchSummary summary;
     char *live_error = NULL;
+    live_set_patch_tick(options.live_at_tick > 0
+                            ? (uint64_t)options.live_at_tick
+                            : 0u);
     if (!live_build_patch(options.output_filename, options.live_patch_target,
                           options.live_patch_all, &summary, &live_error)) {
       fprintf(stderr, "Error: %s\n",
@@ -5097,6 +5103,9 @@ int main(int argc, char *argv[]) {
         printf(", %zu heap type%s converted to a new layout",
                summary.converted_types,
                summary.converted_types == 1u ? "" : "s");
+      }
+      if (summary.at_tick) {
+        printf(", at tick %llu", (unsigned long long)summary.at_tick);
       }
       printf(")\n");
       if (summary.moving[0]) {

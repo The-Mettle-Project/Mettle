@@ -6,6 +6,7 @@ extern fn mettle_swap_apply() -> int64;
 extern fn mettle_crash_register_extra_code(functions: int64, function_count: int64, locations: int64, location_count: int64);
 extern fn mettle_crash_set_live_recovery(point: int64, wait: int64, jump: int64);
 extern fn mettle_set_live_heap_hooks(forget: int64, moved: int64, regrow: int64);
+extern fn mettle_live_get_tick() -> int64;
 extern fn mettle_live_os_calloc(count: int64, size: int64) -> int64 = "calloc";
 
 const METTLE_LIVE_MAGIC: int64 = 0x48435441504C544D;
@@ -23,6 +24,7 @@ var mettle_live_path_length: int64 = 0;
 var mettle_live_ready: int64 = 0;
 var mettle_live_next: int64 = 1;
 var mettle_live_last_probe: uint64 = 0;
+var mettle_live_held_tick: int64 = 0;
 var mettle_live_message: uint8[300];
 var mettle_live_poll_lock: int64 = 0;
 var mettle_live_message_lock: int64 = 0;
@@ -724,7 +726,8 @@ fn mettle_live_undo(index: int64, target: int64) -> int64 {
 }
 
 fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
-    if (mettle_live_u64(buffer) != METTLE_LIVE_MAGIC || mettle_live_u32(buffer + 8) != 2) {
+    var version: int64 = mettle_live_u32(buffer + 8);
+    if (mettle_live_u64(buffer) != METTLE_LIVE_MAGIC || (version != 2 && version != 3)) {
         mettle_live_refuse(index, "not a patch this runtime can read");
         return 0;
     }
@@ -743,6 +746,9 @@ fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
     var inits: int64 = mettle_live_u32(buffer + 40);
     var functions: int64 = mettle_live_u32(buffer + 44);
     var blob: int64 = buffer + 80;
+    if (version == 3) {
+        blob = buffer + 88;
+    }
     var fixup_at: int64 = blob + ((blob_size + 7) / 8) * 8;
     var swap_at: int64 = fixup_at + fixups * 24;
     var init_at: int64 = swap_at + swaps * 16;
@@ -997,6 +1003,12 @@ fn mettle_live_poll() {
         if (buffer == 0) {
             return;
         }
+        if (buffer != -1 && size >= 88 && mettle_live_u32(buffer + 8) == 3 && mettle_live_u64(buffer + 80) > mettle_live_get_tick()) {
+            mettle_live_held_tick = mettle_live_u64(buffer + 80);
+            mettle_live_port_free(buffer, size);
+            return;
+        }
+        mettle_live_held_tick = 0;
         if (buffer == -1) {
             mettle_live_refuse(mettle_live_next, "the file could not be read");
         } else {
@@ -1009,9 +1021,13 @@ fn mettle_live_poll() {
 
 export fn mettle_live_quiesce() -> int64 {
     var now: uint64 = mettle_live_port_ticks();
-    if (mettle_live_last_probe == (uint64)0 || now - mettle_live_last_probe >= METTLE_LIVE_PROBE_MS) {
+    var due: int64 = 0;
+    if (mettle_live_held_tick != 0 && mettle_live_get_tick() >= mettle_live_held_tick) {
+        due = 1;
+    }
+    if (due == 1 || mettle_live_last_probe == (uint64)0 || now - mettle_live_last_probe >= METTLE_LIVE_PROBE_MS) {
         mettle_live_port_lock(&mettle_live_poll_lock);
-        if (mettle_live_last_probe == (uint64)0 || now - mettle_live_last_probe >= METTLE_LIVE_PROBE_MS) {
+        if (due == 1 || mettle_live_last_probe == (uint64)0 || now - mettle_live_last_probe >= METTLE_LIVE_PROBE_MS) {
             mettle_live_last_probe = now;
             mettle_live_poll();
         }

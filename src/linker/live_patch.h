@@ -7,8 +7,8 @@
 #include <stdint.h>
 
 #define LIVE_PATCH_MAGIC 0x48435441504C544Dull
-#define LIVE_PATCH_VERSION 2u
-#define LIVE_PATCH_HEADER_SIZE 80u
+#define LIVE_PATCH_VERSION 3u
+#define LIVE_PATCH_HEADER_SIZE 88u
 #define LIVE_FIXUP_ABS64 1u
 #define LIVE_FIXUP_PC32 2u
 #define LIVE_FIXUP_ABS32 3u
@@ -33,12 +33,14 @@ typedef struct {
   unsigned undone;
   size_t converted_globals;
   size_t converted_types;
+  uint64_t at_tick;
 } LivePatchSummary;
 
 void live_set_global_layouts(const char *const *names,
                              const char *const *layouts, size_t count);
 void live_set_type_layouts(const char *const *names,
                            const char *const *layouts, size_t count);
+void live_set_patch_tick(uint64_t tick);
 
 int live_write_state(const LinkResolution *resolution, uint64_t image_base,
                      const char *executable_path, char **error_message_out);

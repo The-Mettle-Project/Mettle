@@ -620,6 +620,11 @@ Win32 window and message-loop helpers. Windows.
 
 Raw Win32 declarations the other Windows modules build on.
 
+## std/live
+
+`live_tick(tick: int64)` tells a [live build](live.md) which tick it is on. A
+patch built with `--live-at-tick N` waits until the tick reaches `N`.
+
 ## std/prelude
 
 Imports `std/core`, `std/io`, `std/math`, `std/conv`, `std/mem`, and

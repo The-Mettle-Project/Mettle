@@ -24,6 +24,8 @@ architecture of the parts that are built.
    point. **M7, built.** Rewinding to a snapshot is next.
 9. Timelines: one snapshot, K variants of the code, all run, all compared. M7.
 10. A fleet: clients, servers and GPUs swap together at one logical tick. M8.
+    **Patches that wait for a tick are built.** Wire formats that migrate
+    between versions are next.
 
 Every level keeps the rule from the runtime model: nothing is applied anywhere
 except a `quiesce;` the program wrote.
@@ -130,7 +132,7 @@ program keeps running the code it has:
 ```text
 offset  field
  0      "MTLPATCH"
- 8      version 2
+ 8      version 3; version 2 files, with no tick, still load
 12      patch index
 16      anchor_rva           relative address of mettle_live_anchor
 24      blob_size
@@ -143,7 +145,8 @@ offset  field
 64      import count, 68 import table size
 72      undo target          nonzero: undo that patch, nothing else
 76      migration count      32 bytes each, see M3
-80      blob, fixups, swaps, inits, imports, migrations
+80      apply at tick        0: apply at once
+88      blob, fixups, swaps, inits, imports, migrations
 ```
 
 A fixup's site is in the blob or in the host image (`0x100`), and its target
@@ -404,5 +407,11 @@ program and polls source modification times.
   patch cannot reach them. Launches by kernel name through a runtime table,
   which a patch refills from freshly loaded PTX, would let kernels change with
   the host code.
-- M8, fleets: patches carry a logical tick. Generated wire formats carry their
-  own migrations, so old and new nodes can talk during a rollout.
+- M8, fleets: built for the tick. `live_tick(t)` from `std/live` stores the
+  program's tick in the runtime, and `--live-at-tick N` writes `N` into the
+  patch header. The loader reads a held patch at each poll, frees it, and
+  keeps its tick; `quiesce;` then polls as soon as the program's tick reaches
+  that value, without waiting out the 50 ms poll interval, so every copy
+  applies the patch in the same frame. Undo patches carry tick 0. Next:
+  generated wire formats carry their own migrations, so old and new nodes can
+  talk during a rollout.

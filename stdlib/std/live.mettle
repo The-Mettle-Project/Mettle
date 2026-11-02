@@ -1,0 +1,1 @@
+export extern fn live_tick(tick: int64) = "mettle_live_set_tick";

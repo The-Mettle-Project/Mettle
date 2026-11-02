@@ -174,6 +174,40 @@ A patch carries line tables for its functions, so traces name patched code.
 A live build reports each frame's function and file; build with `-s` for the
 exact line and column.
 
+## Fleets
+
+Every copy of a program reads patches from the same `app.exe.live.d/`, so one
+patch reaches all of them. For the copies to switch on the same frame, the
+program counts its ticks and the patch names one:
+
+```mettle
+import "std/live"
+
+fn main() -> int32 {
+    var frame: int64 = 0;
+    while (frame < 100000) {
+        live_tick(frame);
+        quiesce;
+        step();
+        frame = frame + 1;
+    }
+    return 0;
+}
+```
+
+```bash
+mettle --live-patch app.exe --live-at-tick 5000 app.mettle
+```
+
+```text
+Patch 3: step (160 bytes, at tick 5000)
+```
+
+Each copy holds the patch until its own tick reaches 5000 and applies it at
+the next `quiesce;`, so frame 5000 runs the new code in every copy. A copy
+already past the tick applies it at its next poll. Patches after a held one
+wait behind it.
+
 ## What it refuses
 
 The build of the patch fails, and the program keeps running the code it has,
@@ -200,6 +234,8 @@ or an object on the heap has no room for its new layout.
   next patch into `app.exe.live.d/`.
 - `mettle --live-patch app.exe --live-patch-all file.mettle` replaces every
   function, changed or not.
+- `mettle --live-patch app.exe --live-at-tick N file.mettle` writes a patch
+  that each running copy holds until its tick reaches `N`.
 - `mettle --live-undo app.exe` undoes the latest patch.
 
 In a `--live` build every function starts with an eight-byte no-op, and calls
