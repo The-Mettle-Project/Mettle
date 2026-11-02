@@ -811,11 +811,123 @@ static char *substitute_type_string(const char *type_str, char **param_names,
                                     char **arg_names, size_t count,
                                     MonoContext *ctx);
 
+static char *substitute_function_type_string(const char *type_str,
+                                             char **param_names,
+                                             char **arg_names, size_t count,
+                                             MonoContext *ctx) {
+  size_t head = 3;
+  const char *params = type_str + head;
+  const char *scan = params;
+  int depth = 1;
+  while (*scan && depth > 0) {
+    if (*scan == '(')
+      depth++;
+    else if (*scan == ')')
+      depth--;
+    scan++;
+  }
+  if (depth != 0 || scan[0] != '-' || scan[1] != '>')
+    return NULL;
+  const char *params_end = scan - 1;
+  const char *ret = scan + 2;
+  const char *ret_end = ret;
+  int angle = 0;
+  int paren = 0;
+  while (*ret_end) {
+    if (*ret_end == '<')
+      angle++;
+    else if (*ret_end == '>')
+      angle--;
+    else if (*ret_end == '(')
+      paren++;
+    else if (*ret_end == ')')
+      paren--;
+    else if (*ret_end == ' ' && angle == 0 && paren == 0)
+      break;
+    ret_end++;
+  }
+
+  size_t cap = strlen(type_str) * 4 + 64;
+  for (size_t i = 0; i < count; i++)
+    cap += strlen(arg_names[i]) * 8;
+  char *out = malloc(cap);
+  if (!out)
+    return NULL;
+  size_t len = 0;
+  memcpy(out, type_str, head);
+  len = head;
+
+  const char *item = params;
+  int item_angle = 0;
+  int item_paren = 0;
+  for (const char *c = params; c <= params_end; c++) {
+    int at_end = c == params_end;
+    if (!at_end) {
+      if (*c == '<')
+        item_angle++;
+      else if (*c == '>')
+        item_angle--;
+      else if (*c == '(')
+        item_paren++;
+      else if (*c == ')')
+        item_paren--;
+    }
+    if (at_end || (*c == ',' && item_angle == 0 && item_paren == 0)) {
+      if (c > item) {
+        char *piece = malloc((size_t)(c - item) + 1);
+        memcpy(piece, item, (size_t)(c - item));
+        piece[c - item] = '\0';
+        char *swapped =
+            substitute_type_string(piece, param_names, arg_names, count, ctx);
+        free(piece);
+        size_t need = len + strlen(swapped) + strlen(ret_end) + 16;
+        if (need > cap) {
+          cap = need * 2;
+          out = realloc(out, cap);
+        }
+        memcpy(out + len, swapped, strlen(swapped));
+        len += strlen(swapped);
+        free(swapped);
+      }
+      if (!at_end)
+        out[len++] = ',';
+      item = c + 1;
+    }
+  }
+  out[len++] = ')';
+  out[len++] = '-';
+  out[len++] = '>';
+
+  char *ret_piece = malloc((size_t)(ret_end - ret) + 1);
+  memcpy(ret_piece, ret, (size_t)(ret_end - ret));
+  ret_piece[ret_end - ret] = '\0';
+  char *ret_swapped =
+      substitute_type_string(ret_piece, param_names, arg_names, count, ctx);
+  free(ret_piece);
+  size_t need = len + strlen(ret_swapped) + strlen(ret_end) + 1;
+  if (need > cap) {
+    cap = need;
+    out = realloc(out, cap);
+  }
+  memcpy(out + len, ret_swapped, strlen(ret_swapped));
+  len += strlen(ret_swapped);
+  free(ret_swapped);
+  strcpy(out + len, ret_end);
+  return out;
+}
+
 static char *substitute_type_string(const char *type_str, char **param_names,
                                     char **arg_names, size_t count,
                                     MonoContext *ctx) {
   if (!type_str)
     return NULL;
+
+  if ((strncmp(type_str, "fn(", 3) == 0 || strncmp(type_str, "Fn(", 3) == 0)) {
+    char *function_type = substitute_function_type_string(
+        type_str, param_names, arg_names, count, ctx);
+    if (function_type)
+      return function_type;
+  }
 
   size_t ts_len = strlen(type_str);
 
@@ -972,6 +1084,20 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
             mettle_free_string(ce->type_args[i]);
             ce->type_args[i] = new_arg;
           }
+        }
+      }
+      if (ce->function_name && strcmp(ce->function_name, "sizeof") == 0 &&
+          ce->argument_count == 1 && ce->arguments[0] &&
+          ce->arguments[0]->type == AST_IDENTIFIER) {
+        Identifier *type_id = (Identifier *)ce->arguments[0]->data;
+        char *new_name =
+            type_id && type_id->name
+                ? substitute_type_string(type_id->name, param_names, arg_names,
+                                         count, ctx)
+                : NULL;
+        if (new_name) {
+          mettle_free_string(type_id->name);
+          type_id->name = new_name;
         }
       }
       for (size_t i = 0; i < ce->argument_count; i++) {

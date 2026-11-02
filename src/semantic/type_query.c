@@ -166,7 +166,12 @@ void type_checker_register_kind_enum(TypeChecker *checker) {
   Symbol *symbol = symbol_create("Kind", SYMBOL_ENUM, kind);
   if (symbol) {
     symbol->is_initialized = 1;
+    Scope *inner = checker->symbol_table->current_scope;
+    if (checker->symbol_table->global_scope) {
+      checker->symbol_table->current_scope = checker->symbol_table->global_scope;
+    }
     symbol_table_insert(checker->symbol_table, symbol);
+    checker->symbol_table->current_scope = inner;
   }
 }
 

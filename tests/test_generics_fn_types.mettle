@@ -1,0 +1,5 @@
+import "std/io";
+fn apply<T>(x: T, f: fn(T) -> T) -> T { return f(x); }
+fn applyc<T>(x: T, f: Fn(T) -> T) -> T { return f(x); }
+fn inc(x: int32) -> int32 { return x + 1; }
+fn main() -> int32 { println("{apply<int32>(3, &inc)} (want 4)"); println("{apply(3, &inc)} (want 4)"); println("{applyc<int32>(3, fn(y: int32) -> int32 { return y + 2; })} (want 5)"); return 0; }

@@ -3211,6 +3211,18 @@ static int ir_lower_member_or_index(IRLoweringContext *context,
         Symbol *enum_sym =
             symbol_table_lookup(context->symbol_table, obj_id->name);
         if (enum_sym && enum_sym->kind == SYMBOL_ENUM) {
+          Type *enum_type = enum_sym->type;
+          if (enum_type && enum_type->kind == TYPE_ENUM &&
+              enum_type->enum_member_names) {
+            for (size_t i = 0; i < enum_type->enum_member_count; i++) {
+              if (enum_type->enum_member_names[i] &&
+                  strcmp(enum_type->enum_member_names[i], m->member) == 0 &&
+                  enum_type->enum_member_values) {
+                *out_value = ir_operand_int(enum_type->enum_member_values[i]);
+                return 1;
+              }
+            }
+          }
           Symbol *variant_sym =
               symbol_table_lookup(context->symbol_table, m->member);
           if (variant_sym && variant_sym->kind == SYMBOL_CONSTANT) {

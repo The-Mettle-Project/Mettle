@@ -20694,6 +20694,33 @@ else {
   }
 }
 
+# Reported bugs, each built and run, the output checked for what the program
+# should print. Entry is the file to build; Args are added to the build line.
+$issueRegressions = @(
+  @{ Name = "issue_generic_fn_type_param"; Entry = "tests/test_generics_fn_types.mettle"; Args = @(); Expect = "4 (want 4)`r?`n4 (want 4)`r?`n5 (want 5)" },
+  @{ Name = "issue_generic_sizeof_param"; Entry = "tests/test_generics_sizeof_param.mettle"; Args = @(); Expect = "5 (want 5)" }
+)
+foreach ($case in $issueRegressions) {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exe = Join-Path $tmpDir ($case.Name + $(if ($script:OnWindows) { ".exe" } else { "" }))
+    $buildOut = & $CompilerPath --build @($case.Args) $case.Entry -o $exe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "build failed:`n$buildOut"
+    }
+    $out = & $exe 2>&1 | Out-String
+    if ($out -notmatch $case.Expect) {
+      throw "expected /$($case.Expect)/, got:`n$out"
+    }
+    Write-CaseResult -Name $case.Name -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $case.Name -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Differential miscompile fuzzer gate. Generates UB-free programs, builds each
 # at debug and release, and fails on any exit-code divergence (a silent
 # miscompile). See tools/fuzz/README.md. Skipped if Python is unavailable or

@@ -1,0 +1,4 @@
+import "std/io";
+import "std/mem";
+fn alloc_n<T>(n: int64) -> T* { return (T*)malloc(sizeof(T) * n); }
+fn main() -> int32 { var p: int64* = alloc_n<int64>(4); p[3] = 5; println("{p[3]} (want 5)"); free(p); return 0; }
