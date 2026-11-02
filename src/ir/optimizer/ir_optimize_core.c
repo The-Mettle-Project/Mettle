@@ -2306,6 +2306,7 @@ int ir_name_index_init(IRNameIndex *index, size_t expected) {
   index->names = NULL;
   index->values = NULL;
   index->capacity = 0;
+  index->count = 0;
   while (capacity < expected * 2) {
     capacity *= 2;
   }
@@ -2319,43 +2320,72 @@ int ir_name_index_init(IRNameIndex *index, size_t expected) {
   return 1;
 }
 
+static size_t ir_name_index_slot(const IRNameIndex *index, const char *name) {
+  size_t mask = index->capacity - 1;
+  size_t slot = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (index->names[slot] && strcmp(index->names[slot], name) != 0) {
+    slot = (slot + 1) & mask;
+  }
+  return slot;
+}
+
+static int ir_name_index_room(IRNameIndex *index) {
+  IRNameIndex grown;
+  if ((index->count + 1) * 2 <= index->capacity) {
+    return 1;
+  }
+  if (!ir_name_index_init(&grown, index->capacity)) {
+    return (index->count + 1) < index->capacity;
+  }
+  for (size_t i = 0; i < index->capacity; i++) {
+    if (index->names[i]) {
+      size_t slot = ir_name_index_slot(&grown, index->names[i]);
+      grown.names[slot] = index->names[i];
+      grown.values[slot] = index->values[i];
+      grown.count++;
+    }
+  }
+  ir_name_index_destroy(index);
+  *index = grown;
+  return 1;
+}
+
 void ir_name_index_insert(IRNameIndex *index, const char *name, size_t value) {
-  size_t mask;
   size_t slot;
 
   if (!index || !index->capacity || !name) {
     return;
   }
-  mask = index->capacity - 1;
-  slot = (size_t)mettle_fnv1a_hash(name) & mask;
-  while (index->names[slot]) {
-    if (strcmp(index->names[slot], name) == 0) {
+  slot = ir_name_index_slot(index, name);
+  if (!index->names[slot]) {
+    if (!ir_name_index_room(index)) {
       return;
     }
-    slot = (slot + 1) & mask;
+    slot = ir_name_index_slot(index, name);
+    index->names[slot] = name;
+    index->count++;
   }
-  index->names[slot] = name;
   index->values[slot] = value;
 }
 
 void ir_name_index_add(IRNameIndex *index, const char *name, size_t delta) {
-  size_t mask;
   size_t slot;
 
   if (!index || !index->capacity || !name) {
     return;
   }
-  mask = index->capacity - 1;
-  slot = (size_t)mettle_fnv1a_hash(name) & mask;
-  while (index->names[slot]) {
-    if (strcmp(index->names[slot], name) == 0) {
-      index->values[slot] += delta;
-      return;
-    }
-    slot = (slot + 1) & mask;
+  slot = ir_name_index_slot(index, name);
+  if (index->names[slot]) {
+    index->values[slot] += delta;
+    return;
   }
+  if (!ir_name_index_room(index)) {
+    return;
+  }
+  slot = ir_name_index_slot(index, name);
   index->names[slot] = name;
   index->values[slot] = delta;
+  index->count++;
 }
 
 void ir_name_index_sub(IRNameIndex *index, const char *name, size_t delta) {

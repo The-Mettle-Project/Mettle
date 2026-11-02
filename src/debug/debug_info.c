@@ -13,6 +13,8 @@
 DebugInfo* debug_info_create(const char* source_filename, const char* assembly_filename) {
     DebugInfo* debug_info = malloc(sizeof(DebugInfo));
     if (!debug_info) return NULL;
+    debug_info->source_files = NULL;
+    debug_info->source_file_count = 0;
     
     debug_info->symbols = malloc(sizeof(DebugSymbol) * INITIAL_SYMBOL_CAPACITY);
     if (!debug_info->symbols) {
@@ -115,6 +117,13 @@ void debug_info_destroy(DebugInfo* debug_info) {
     }
     free(debug_info->runtime_trap_sites);
     
+    for (size_t i = 0; i < debug_info->source_file_count; i++) {
+        free(debug_info->source_files[i].filename);
+        free(debug_info->source_files[i].text);
+        free(debug_info->source_files[i].starts);
+    }
+    free(debug_info->source_files);
+
     free(debug_info->source_filename);
     free(debug_info->assembly_filename);
     free(debug_info);
@@ -290,35 +299,105 @@ void debug_info_add_runtime_location_mapping(DebugInfo* debug_info,
     debug_info->runtime_location_count++;
 }
 
-char* debug_info_read_source_line(const char* filename, size_t line_number) {
-    char buffer[4096];
-    size_t current_line = 1;
+static DebugSourceFile* debug_info_source_file(DebugInfo* debug_info,
+                                               const char* filename) {
+    DebugSourceFile* grown = NULL;
+    DebugSourceFile* entry = NULL;
     FILE* file = NULL;
-    char* result = NULL;
+    char* text = NULL;
+    size_t length = 0;
+    size_t capacity = 65536;
+    size_t lines = 1;
+    size_t at = 1;
 
-    if (!filename || line_number == 0) {
-        return NULL;
+    for (size_t i = 0; i < debug_info->source_file_count; i++) {
+        if (strcmp(debug_info->source_files[i].filename, filename) == 0) {
+            return &debug_info->source_files[i];
+        }
     }
-
     file = fopen(filename, "rb");
     if (!file) {
         return NULL;
     }
-
-    while (fgets(buffer, (int)sizeof(buffer), file)) {
-        if (current_line == line_number) {
-            size_t length = strlen(buffer);
-            while (length > 0 &&
-                   (buffer[length - 1] == '\n' || buffer[length - 1] == '\r')) {
-                buffer[--length] = '\0';
-            }
-            result = mettle_strdup(buffer);
+    text = malloc(capacity + 1);
+    while (text) {
+        size_t got = fread(text + length, 1, capacity - length, file);
+        length += got;
+        if (length < capacity) {
             break;
         }
-        current_line++;
+        capacity *= 2;
+        char* bigger = realloc(text, capacity + 1);
+        if (!bigger) {
+            free(text);
+            text = NULL;
+            break;
+        }
+        text = bigger;
     }
-
     fclose(file);
+    if (!text) {
+        return NULL;
+    }
+    text[length] = '\0';
+    for (size_t i = 0; i < length; i++) {
+        lines += text[i] == '\n';
+    }
+    grown = realloc(debug_info->source_files,
+                    (debug_info->source_file_count + 1) * sizeof(DebugSourceFile));
+    if (!grown) {
+        free(text);
+        return NULL;
+    }
+    debug_info->source_files = grown;
+    entry = &debug_info->source_files[debug_info->source_file_count];
+    entry->filename = mettle_strdup(filename);
+    entry->text = text;
+    entry->line_count = lines;
+    entry->starts = malloc(lines * sizeof(size_t));
+    if (!entry->filename || !entry->starts) {
+        free(entry->filename);
+        free(entry->starts);
+        free(text);
+        return NULL;
+    }
+    entry->starts[0] = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (text[i] == '\n') {
+            entry->starts[at++] = i + 1;
+        }
+    }
+    debug_info->source_file_count++;
+    return entry;
+}
+
+char* debug_info_read_source_line(DebugInfo* debug_info, const char* filename,
+                                  size_t line_number) {
+    DebugSourceFile* source = NULL;
+    const char* start = NULL;
+    size_t length = 0;
+    char* result = NULL;
+
+    if (!debug_info || !filename || line_number == 0) {
+        return NULL;
+    }
+    source = debug_info_source_file(debug_info, filename);
+    if (!source || line_number > source->line_count) {
+        return NULL;
+    }
+    start = source->text + source->starts[line_number - 1];
+    while (start[length] && start[length] != '\n') {
+        length++;
+    }
+    while (length > 0 && start[length - 1] == '\r') {
+        length--;
+    }
+    result = malloc(length + 1);
+    if (!result) {
+        return NULL;
+    }
+    memcpy(result, start, length);
+    result[length] = '\0';
     return result;
 }
 

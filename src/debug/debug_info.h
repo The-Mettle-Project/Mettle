@@ -63,6 +63,13 @@ typedef struct {
 } RuntimeTrapSiteMapping;
 
 typedef struct {
+    char* filename;
+    char* text;
+    size_t* starts;
+    size_t line_count;
+} DebugSourceFile;
+
+typedef struct {
     DebugSymbol* symbols;
     size_t symbol_count;
     size_t symbol_capacity;
@@ -85,6 +92,9 @@ typedef struct {
     
     char* source_filename;
     char* assembly_filename;
+
+    DebugSourceFile* source_files;
+    size_t source_file_count;
 } DebugInfo;
 
 DebugInfo* debug_info_create(const char* source_filename, const char* assembly_filename);
@@ -120,7 +130,8 @@ void debug_info_add_runtime_trap_site_mapping(DebugInfo* debug_info,
                                               const char* message_template,
                                               const char* static_context);
 
-char* debug_info_read_source_line(const char* filename, size_t line_number);
+char* debug_info_read_source_line(DebugInfo* debug_info, const char* filename,
+                                   size_t line_number);
 
 void debug_info_generate_dwarf(DebugInfo* debug_info, const char* output_filename);
 void debug_info_generate_stabs(DebugInfo* debug_info, const char* output_filename);

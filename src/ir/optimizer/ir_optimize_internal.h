@@ -271,6 +271,7 @@ typedef struct {
   const char **names;
   size_t *values;
   size_t capacity;
+  size_t count;
 } IRNameIndex;
 
 typedef struct {

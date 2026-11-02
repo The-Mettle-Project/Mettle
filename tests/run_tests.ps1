@@ -2249,6 +2249,12 @@ $cases = @(
     IrMustNotMatch = @("jump ir_while_", "%\.?t[0-9]+ = @v / 2")
   },
   @{
+    Name          = "opt_wide_forwarding_names"
+    Path          = "tests/test_optimize_wide_forwarding.mettle"
+    ShouldSucceed = $true
+    Args          = @("-O")
+  },
+  @{
     Name          = "opt_kernighan_popcount"
     Path          = "tests/test_kernighan_popcount.mettle"
     ShouldSucceed = $true

@@ -269,7 +269,8 @@ void code_generator_record_runtime_trap_site(
 
   const char *resolved_filename =
       code_generator_runtime_filename(generator, filename);
-  char *source_line = debug_info_read_source_line(resolved_filename, line);
+  char *source_line = debug_info_read_source_line(generator->debug_info,
+                                                   resolved_filename, line);
   debug_info_add_runtime_trap_site_mapping(
       generator->debug_info, trap_pc_label, kind,
       generator->current_function_name, resolved_filename, line, column,

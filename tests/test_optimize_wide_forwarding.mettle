@@ -1,0 +1,14 @@
+import "std/io"
+
+@noinline fn wide(p0: int64, p1: int64, p2: int64, p3: int64, p4: int64, p5: int64, p6: int64, p7: int64, p8: int64, p9: int64, p10: int64, p11: int64, p12: int64, p13: int64, p14: int64, p15: int64, p16: int64, p17: int64, p18: int64, p19: int64, p20: int64, p21: int64, p22: int64, p23: int64, p24: int64, p25: int64, p26: int64, p27: int64, p28: int64, p29: int64, p30: int64, p31: int64, p32: int64, p33: int64, p34: int64, p35: int64, p36: int64, p37: int64, p38: int64, p39: int64) -> int64 {
+    return p0 + p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9 + p10 + p11 + p12 + p13 + p14 + p15 + p16 + p17 + p18 + p19 + p20 + p21 + p22 + p23 + p24 + p25 + p26 + p27 + p28 + p29 + p30 + p31 + p32 + p33 + p34 + p35 + p36 + p37 + p38 + p39;
+}
+
+@noinline fn relay(p0: int64, p1: int64, p2: int64, p3: int64, p4: int64, p5: int64, p6: int64, p7: int64, p8: int64, p9: int64, p10: int64, p11: int64, p12: int64, p13: int64, p14: int64, p15: int64, p16: int64, p17: int64, p18: int64, p19: int64, p20: int64, p21: int64, p22: int64, p23: int64, p24: int64, p25: int64, p26: int64, p27: int64, p28: int64, p29: int64, p30: int64, p31: int64, p32: int64, p33: int64, p34: int64, p35: int64, p36: int64, p37: int64, p38: int64, p39: int64) -> int64 {
+    return wide(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, p21, p22, p23, p24, p25, p26, p27, p28, p29, p30, p31, p32, p33, p34, p35, p36, p37, p38, p39) + wide(p39, p38, p37, p36, p35, p34, p33, p32, p31, p30, p29, p28, p27, p26, p25, p24, p23, p22, p21, p20, p19, p18, p17, p16, p15, p14, p13, p12, p11, p10, p9, p8, p7, p6, p5, p4, p3, p2, p1, p0);
+}
+
+fn main() -> int32 {
+    println("{relay(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39)}");
+    return 0;
+}
