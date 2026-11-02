@@ -61,6 +61,8 @@ typedef struct {
   LiveFunction *functions;
   size_t function_count;
   LiveMap function_by_name;
+  LiveMap symbol_by_name;
+  const LinkReloc ***reloc_order;
 } LiveObjectIndex;
 
 typedef enum {
@@ -442,7 +444,44 @@ static void live_index_destroy(LiveObjectIndex *index) {
   free(index->section_function);
   free(index->functions);
   live_map_destroy(&index->function_by_name);
+  live_map_destroy(&index->symbol_by_name);
+  for (size_t i = 0; index->reloc_order && i < index->object->section_count;
+       i++) {
+    free(index->reloc_order[i]);
+  }
+  free(index->reloc_order);
   memset(index, 0, sizeof(*index));
+}
+
+static int live_reloc_compare(const void *left, const void *right) {
+  const LinkReloc *a = *(const LinkReloc *const *)left;
+  const LinkReloc *b = *(const LinkReloc *const *)right;
+  if (a->offset != b->offset) {
+    return a->offset < b->offset ? -1 : 1;
+  }
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+static size_t live_first_reloc(const LiveObjectIndex *index, size_t section,
+                               uint64_t start) {
+  const LinkReloc **order = index->reloc_order[section];
+  size_t low = 0;
+  size_t high = index->object->sections[section].relocation_count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2u;
+    if (order[mid]->offset < start) {
+      low = mid + 1u;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+static const LinkSymbol *live_find_symbol(const LiveObjectIndex *index,
+                                          const char *name) {
+  LiveEntry *entry = name ? live_map_find(&index->symbol_by_name, name) : NULL;
+  return entry ? &index->object->symbols[entry->a] : NULL;
 }
 
 static int live_index_build(LiveObjectIndex *index, const LinkObject *object) {
@@ -491,6 +530,31 @@ static int live_index_build(LiveObjectIndex *index, const LinkObject *object) {
     }
   }
   for (size_t i = 0; i < object->symbol_count; i++) {
+    const char *name = object->symbols[i].name;
+    if (name && !live_map_find(&index->symbol_by_name, name) &&
+        !live_map_put(&index->symbol_by_name, name, i, 0)) {
+      return 0;
+    }
+  }
+  index->reloc_order = calloc(sections ? sections : 1u, sizeof(*index->reloc_order));
+  if (!index->reloc_order) {
+    return 0;
+  }
+  for (size_t i = 0; i < sections; i++) {
+    const LinkSection *section = &object->sections[i];
+    index->reloc_order[i] =
+        malloc((section->relocation_count ? section->relocation_count : 1u) *
+               sizeof(const LinkReloc *));
+    if (!index->reloc_order[i]) {
+      return 0;
+    }
+    for (size_t r = 0; r < section->relocation_count; r++) {
+      index->reloc_order[i][r] = &section->relocations[r];
+    }
+    qsort(index->reloc_order[i], section->relocation_count,
+          sizeof(const LinkReloc *), live_reloc_compare);
+  }
+  for (size_t i = 0; i < object->symbol_count; i++) {
     const LinkSymbol *symbol = &object->symbols[i];
     if (!live_symbol_is_named(symbol) ||
         !live_name_has_suffix(symbol->name, "$body") ||
@@ -520,7 +584,7 @@ static int live_index_build(LiveObjectIndex *index, const LinkObject *object) {
     function->body_offset = symbol->value;
     function->thunk_offset = symbol->value;
     function->end = live_section_size(&object->sections[section]);
-    const LinkSymbol *thunk = link_object_find_symbol(object, function->name);
+    const LinkSymbol *thunk = live_find_symbol(index, function->name);
     if (thunk && thunk->section_index == (int64_t)section) {
       function->thunk_offset = thunk->value;
     }
@@ -689,22 +753,23 @@ static uint64_t live_hash_region(const LiveObjectIndex *index, size_t section,
       return 0;
     }
     memcpy(copy, source->raw_data + start, size);
-    for (size_t i = 0; i < source->relocation_count; i++) {
-      const LinkReloc *relocation = &source->relocations[i];
-      if (relocation->offset >= start && relocation->offset < end) {
-        size_t width = live_reloc_width(relocation);
-        size_t at = (size_t)(relocation->offset - start);
-        memset(copy + at, 0, at + width <= size ? width : size - at);
-      }
+    for (size_t i = live_first_reloc(index, section, start);
+         i < source->relocation_count &&
+         index->reloc_order[section][i]->offset < end;
+         i++) {
+      const LinkReloc *relocation = index->reloc_order[section][i];
+      size_t width = live_reloc_width(relocation);
+      size_t at = (size_t)(relocation->offset - start);
+      memset(copy + at, 0, at + width <= size ? width : size - at);
     }
     live_hash_bytes(&hash, copy, size);
     free(copy);
   }
-  for (size_t i = 0; i < source->relocation_count; i++) {
-    const LinkReloc *relocation = &source->relocations[i];
-    if (relocation->offset < start || relocation->offset >= end) {
-      continue;
-    }
+  for (size_t i = live_first_reloc(index, section, start);
+       i < source->relocation_count &&
+       index->reloc_order[section][i]->offset < end;
+       i++) {
+    const LinkReloc *relocation = index->reloc_order[section][i];
     int64_t addend = live_reloc_addend(source, relocation);
     LiveTarget target =
         live_classify(index, relocation->symbol_index, addend);
@@ -1449,7 +1514,7 @@ static int live_local_thunk(LiveBuilder *builder, size_t function_index,
 static int live_new_global(LiveBuilder *builder, const char *name,
                            uint64_t *rva_out) {
   const LinkObject *object = builder->index->object;
-  const LinkSymbol *symbol = link_object_find_symbol(object, name);
+  const LinkSymbol *symbol = live_find_symbol(builder->index, name);
   if (!symbol || !live_symbol_is_named(symbol)) {
     return live_builder_fail(builder, "Cannot place the new global '%s'", name);
   }
@@ -1752,7 +1817,7 @@ static int live_resolve(LiveBuilder *builder, const LiveTarget *target,
     if (entry) {
       LiveEntry *size = live_map_find(&builder->state->sizes, target->name);
       const LinkSymbol *symbol =
-          link_object_find_symbol(builder->index->object, target->name);
+          live_find_symbol(builder->index, target->name);
       const char *old_layout = live_state_layout(builder->state, target->name);
       const char *new_layout = live_registry_layout(target->name);
       int described = old_layout && new_layout && symbol &&
@@ -1902,15 +1967,15 @@ static int live_family_table(LiveBuilder *builder, size_t function_index,
 static int live_process_piece(LiveBuilder *builder, size_t piece_index) {
   LivePiece piece = builder->pieces[piece_index];
   const LinkSection *source = &builder->index->object->sections[piece.section];
-  for (size_t i = 0; i < source->relocation_count; i++) {
-    const LinkReloc *relocation = &source->relocations[i];
+  for (size_t i = live_first_reloc(builder->index, piece.section, piece.start);
+       i < source->relocation_count &&
+       builder->index->reloc_order[piece.section][i]->offset < piece.end;
+       i++) {
+    const LinkReloc *relocation = builder->index->reloc_order[piece.section][i];
     uint64_t value = 0;
     int host = 0;
     uint32_t kind = 0;
     uint64_t site = 0;
-    if (relocation->offset < piece.start || relocation->offset >= piece.end) {
-      continue;
-    }
     if (relocation->kind == LINK_RELOC_ABS64) {
       kind = LIVE_FIXUP_ABS64;
     } else if (relocation->kind == LINK_RELOC_PC32) {
@@ -1978,7 +2043,7 @@ static const LinkReloc *live_sorted_reloc_at(const LinkReloc **sorted,
 static uint32_t live_debug_header_count(const LiveObjectIndex *index,
                                         size_t word) {
   const LinkSymbol *header =
-      link_object_find_symbol(index->object, "mettle_debug_header");
+      live_find_symbol(index, "mettle_debug_header");
   const LinkSection *section;
   if (!header || header->section_index < 0 ||
       (size_t)header->section_index >= index->object->section_count) {
@@ -1997,7 +2062,7 @@ static int live_append_debug_rows(LiveBuilder *builder, const char *table_name,
                                   size_t code_fields, size_t pointer_fields,
                                   uint64_t *offset_out, uint32_t *count_out) {
   const LinkObject *object = builder->index->object;
-  const LinkSymbol *table = link_object_find_symbol(object, table_name);
+  const LinkSymbol *table = live_find_symbol(builder->index, table_name);
   const LinkSection *source;
   const LinkReloc **sorted = NULL;
   size_t sorted_count = 0;

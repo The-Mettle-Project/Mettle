@@ -3493,36 +3493,25 @@ static int ir_lower_new_expression(IRLoweringContext *context,
       return 0;
     }
 
-    {
-      IROperand room = ir_operand_none();
-      int tracked = ir_lower_live_heap_type(element);
-      if (tracked &&
-          (!ir_make_temp_operand(context, &room) ||
-           !ir_lower_live_capacity(context, function, &bytes, &room,
-                                   expression->location))) {
-        ir_operand_destroy(&room);
+    if (ir_lower_live_heap_type(element)) {
+      if (!ir_lower_live_new(context, function, &pointer, &bytes, element,
+                             &count, expression->location)) {
         ir_operand_destroy(&count);
         ir_operand_destroy(&bytes);
         ir_operand_destroy(&pointer);
         return 0;
       }
+    } else {
       allocate.op = IR_OP_NEW;
       allocate.location = expression->location;
       allocate.dest = pointer;
-      allocate.rhs = tracked ? room : bytes;
+      allocate.rhs = bytes;
       allocate.text = (char *)ir_backend_type_name(new_expression->type_name);
-      if (!ir_emit(context, function, &allocate) ||
-          (tracked &&
-           !ir_lower_live_track(context, function, &pointer, element, &count,
-                                &room, expression->location))) {
-        ir_operand_destroy(&room);
+      if (!ir_emit(context, function, &allocate)) {
         ir_operand_destroy(&count);
         ir_operand_destroy(&bytes);
         ir_operand_destroy(&pointer);
         return 0;
-      }
-      if (tracked) {
-        ir_operand_destroy(&room);
       }
     }
 
@@ -3616,26 +3605,25 @@ static int ir_lower_new_expression(IRLoweringContext *context,
     return 0;
   }
 
-  int tracked = ir_lower_live_heap_type(allocated_type);
-  int room = allocation_size +
-             (allocation_size / 4 > 16 ? allocation_size / 4 : 16);
+  if (ir_lower_live_heap_type(allocated_type)) {
+    IROperand bytes = ir_operand_int(allocation_size);
+    if (!ir_lower_live_new(context, function, &destination, &bytes,
+                           allocated_type, NULL, expression->location)) {
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+    *out_value = destination;
+    return 1;
+  }
   IRInstruction instruction = {0};
   instruction.op = IR_OP_NEW;
   instruction.location = expression->location;
   instruction.dest = destination;
-  instruction.rhs = ir_operand_int(tracked ? room : allocation_size);
+  instruction.rhs = ir_operand_int(allocation_size);
   instruction.text = (char *)ir_backend_type_name(new_expression->type_name);
   if (!ir_emit(context, function, &instruction)) {
     ir_operand_destroy(&destination);
     return 0;
-  }
-  if (tracked) {
-    IROperand capacity = ir_operand_int(room);
-    if (!ir_lower_live_track(context, function, &destination, allocated_type,
-                             NULL, &capacity, expression->location)) {
-      ir_operand_destroy(&destination);
-      return 0;
-    }
   }
 
   *out_value = destination;

@@ -25,12 +25,33 @@ int tolower(int character);
 void *malloc(mt_size size);
 void free(void *memory);
 
-static void (*mt_live_forget_hook)(void *memory) = 0;
+static long long (*mt_live_forget_hook)(void *memory) = 0;
 static void (*mt_live_moved_hook)(void *from, void *to) = 0;
+static long long (*mt_live_room_hook)(void *memory) = 0;
 
-void mettle_set_live_heap_hooks(void *forget, void *moved) {
-  mt_live_forget_hook = (void (*)(void *))forget;
+void mettle_set_live_heap_hooks(void *forget, void *moved, void *room) {
+  mt_live_forget_hook = (long long (*)(void *))forget;
   mt_live_moved_hook = (void (*)(void *, void *))moved;
+  mt_live_room_hook = (long long (*)(void *))room;
+}
+
+void *memcpy(void *destination, const void *source, mt_size count);
+
+static void *mt_live_realloc(void *memory, mt_size size) {
+  long long room = mt_live_room_hook(memory);
+  void *replacement;
+  if (room < 0) {
+    return MT_NULL;
+  }
+  if ((long long)size <= room) {
+    return memory;
+  }
+  replacement = malloc(size);
+  if (replacement) {
+    memcpy(replacement, memory, (mt_size)room);
+    free(memory);
+  }
+  return replacement;
 }
 struct MtFile;
 static int mt_stream_flush(struct MtFile *file);
@@ -1140,8 +1161,8 @@ void free(void *memory) {
   if (!memory) {
     return;
   }
-  if (mt_live_forget_hook) {
-    mt_live_forget_hook(memory);
+  if (mt_live_forget_hook && mt_live_forget_hook(memory)) {
+    return;
   }
   if (mt_win_owns(memory)) {
     int class_index = mt_win_class_at(memory);
@@ -1164,6 +1185,9 @@ void *realloc(void *memory, mt_size size) {
   if (size == 0) {
     free(memory);
     return MT_NULL;
+  }
+  if (mt_live_room_hook && mt_live_room_hook(memory) >= 0) {
+    return mt_live_realloc(memory, size);
   }
   if (mt_win_owns(memory)) {
     mt_size held = MT_WIN_CLASS_BYTES(mt_win_class_at(memory));
@@ -2948,8 +2972,8 @@ void free(void *memory) {
   if (!memory) {
     return;
   }
-  if (mt_live_forget_hook) {
-    mt_live_forget_hook(memory);
+  if (mt_live_forget_hook && mt_live_forget_hook(memory)) {
+    return;
   }
   mt_u64 *base = (mt_u64 *)memory - 2;
   if (base[0] == 0 ||
@@ -2978,6 +3002,9 @@ void *realloc(void *memory, mt_size size) {
   if (size == 0) {
     free(memory);
     return MT_NULL;
+  }
+  if (mt_live_room_hook && mt_live_room_hook(memory) >= 0) {
+    return mt_live_realloc(memory, size);
   }
   mt_u64 *base = (mt_u64 *)memory - 2;
   mt_size old_size = base[1];

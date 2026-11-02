@@ -103,6 +103,12 @@ address table entries. Read-only data the patch refers to is copied into it,
 deduplicated by content so every copy of a table in one patch is the same
 address.
 
+The builder indexes symbols by name and each section's relocations by offset,
+so hashing and copying stay linear in the size of the object. Warriors of
+Servitude (24,000 lines, a 1 MB `main` with its continuation) patches in
+10 s, 6 of them the compile; an unchanged save reports "No function changed"
+in 9 s.
+
 A new function takes a spare slot. A new global takes space in the arena, and
 its initial bytes travel in the patch. A function whose line rows the host
 recorded gets rows in the patch, so crash traces name patched code.
@@ -210,26 +216,30 @@ descriptor with its value, and `mettle_live_frame_take` converts into the new
 local when the descriptors differ.
 
 Heap objects convert in place. In a live build, lowering turns `new T` and
-`new T[n]` of a struct type into an allocation of `size + size / 4 + 16`
-bytes (`size + max(size / 4, 16)` for one object) followed by `mettle_live_track(pointer, element size, count, capacity,
-name, descriptor)`. The runtime keeps an open-addressed table keyed by
-address, and the owned allocator calls back on `free` (the entry goes) and
-`realloc` (the entry follows the block). Lowering also records each tracked
-type's descriptor; the state file keeps them (`y` lines), and a patch whose
-type descriptor differs carries a type migration (kind 1 in the migration
-table: name, old descriptor, new descriptor).
+`new T[n]` of a struct type into `mettle_live_new(bytes, element size, count,
+name, descriptor)`. The runtime reserves 64 GB of address space (top-down on
+Windows, so the 2 GB window around the image stays free for patch code) and
+commits it in 64 KB pages. Each page holds blocks of one size class, from 32
+bytes to 64 KB, and each block starts with a 16-byte header: a pointer to the
+type record (name and descriptor) and the element count. An object gets
+`bytes + bytes / 4 + 16` bytes of room. Freed blocks go on a free list per
+class. The owned allocator's `free` and `realloc` call into the live runtime
+first, which claims any pointer inside the arena with a single range check;
+objects too large for a class fall back to `calloc` and an address table.
 
-The loader takes the table's lock before it stops the other threads, checks
-that every object of the type has room (`count * new size <= capacity`),
-and refuses the whole patch if one does not. Otherwise it converts each
-object through a scratch copy and records the new descriptor on it. Each
-object converts from the descriptor it was allocated with, so objects that old
-code made after an earlier patch still convert correctly. Undo converts back.
+Lowering records each tracked type's descriptor; the state file keeps them
+(`y` lines), and a patch whose type descriptor differs carries a type
+migration (kind 1 in the migration table: name, old descriptor, new
+descriptor). The loader takes the heap lock before it stops the other threads,
+walks the arena page by page, checks that every object of the type has room
+(`count * new size <= room`), and refuses the whole patch if one does not.
+Otherwise it converts each object through a scratch copy and points its
+header at the record for the new descriptor. Each object converts from the
+descriptor it was allocated with, so objects that old code made after an
+earlier patch still convert. Undo converts back.
 
-The table costs about 40 ns per `new` and `free` pair of a small struct: two
-million pairs of a 16-byte node take 150 ms in a live build and 70 ms in a
-normal one. An arena for tracked objects, with the type in a block header and
-a range check on `free`, would remove the table and most of that cost.
+Two million `new` and `free` pairs of a 16-byte struct take 65 ms in a live
+build and 71 ms in a normal one on Windows, 49 ms and 26 ms on Linux.
 
 Module-scope variables get the same treatment through slack: a live build
 emits zero bytes after every variable (8 after a scalar, `size / 2 + 64` after

@@ -280,13 +280,10 @@ int ir_lower_live_program(IRLoweringContext *context, IRProgram *program);
 void ir_lower_live_forget_sources(void);
 void ir_lower_live_forget_heap_types(void);
 int ir_lower_live_heap_type(const Type *type);
-int ir_lower_live_capacity(IRLoweringContext *context, IRFunction *function,
-                           const IROperand *bytes, IROperand *capacity,
-                           SourceLocation location);
-int ir_lower_live_track(IRLoweringContext *context, IRFunction *function,
-                        const IROperand *pointer, const Type *type,
-                        const IROperand *count, const IROperand *capacity,
-                        SourceLocation location);
+int ir_lower_live_new(IRLoweringContext *context, IRFunction *function,
+                      const IROperand *pointer, const IROperand *bytes,
+                      const Type *type, const IROperand *count,
+                      SourceLocation location);
 void ir_lower_live_register_symbols(IRLoweringContext *context,
                                     IRProgram *program);
 int ir_lower_live_marks_statement(const IRFunction *function,

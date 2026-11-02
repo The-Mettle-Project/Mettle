@@ -162,6 +162,21 @@ export fn mettle_live_port_code_store(address: int64, value: int64) {
     }
 }
 
+export fn mettle_live_port_reserve(size: int64) -> int64 {
+    var got: int64 = syscall(9, 0, size, 0, 34 + 0x4000, -1, 0);
+    if (mettle_live_os_failed(got) != 0) {
+        return 0;
+    }
+    return got;
+}
+
+export fn mettle_live_port_commit(address: int64, size: int64) -> int64 {
+    if (syscall(10, address, size, 3) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
 export fn mettle_live_port_thread_id() -> int64 {
     return syscall(186);
 }

@@ -59,6 +59,7 @@ $undefined = @(
     "test_safe_stack_neighbours.mettle",
     "test_safe_stack_pointer.mettle",
     "test_safe_widen_overflow.mettle",
+    "test_safe_global_pointer.mettle",
     "test_crash_report_frames.mettle"
 )
 if ($Optimize) { $undefined += "test_schedule_joins.mettle" }

@@ -5,7 +5,7 @@
 
 #define IR_LIVE_CHECK_NAME "mettle_live_site_check"
 #define IR_LIVE_LEAVE_NAME "mettle_live_site_leave_here"
-#define IR_LIVE_TRACK_NAME "mettle_live_track"
+#define IR_LIVE_NEW_NAME "mettle_live_new"
 #define IR_LIVE_MOVED_NAME "mettle_live_frame_moved"
 #define IR_LIVE_PUT_NAME "mettle_live_frame_put"
 #define IR_LIVE_TAKE_NAME "mettle_live_frame_take"
@@ -1226,31 +1226,11 @@ int ir_lower_live_heap_type(const Type *type) {
          type->name && type->size > 0;
 }
 
-int ir_lower_live_capacity(IRLoweringContext *context, IRFunction *function,
-                           const IROperand *bytes, IROperand *capacity,
-                           SourceLocation location) {
-  IROperand half = ir_live_new_temp(context);
-  IROperand grown = ir_live_new_temp(context);
-  int ok = ir_live_emit_simple(context, function, IR_OP_BINARY,
-                               ir_operand_copy(&half), ir_operand_copy(bytes),
-                               ir_operand_int(4), "/", location) &&
-           ir_live_emit_simple(context, function, IR_OP_BINARY,
-                               ir_operand_copy(&grown), ir_operand_copy(bytes),
-                               ir_operand_copy(&half), "+", location) &&
-           ir_live_emit_simple(context, function, IR_OP_BINARY,
-                               ir_operand_copy(capacity),
-                               ir_operand_copy(&grown), ir_operand_int(16),
-                               "+", location);
-  ir_operand_destroy(&half);
-  ir_operand_destroy(&grown);
-  return ok;
-}
-
-int ir_lower_live_track(IRLoweringContext *context, IRFunction *function,
-                        const IROperand *pointer, const Type *type,
-                        const IROperand *count, const IROperand *capacity,
-                        SourceLocation location) {
-  IROperand arguments[6];
+int ir_lower_live_new(IRLoweringContext *context, IRFunction *function,
+                      const IROperand *pointer, const IROperand *bytes,
+                      const Type *type, const IROperand *count,
+                      SourceLocation location) {
+  IROperand arguments[5];
   char *layout = ir_lower_live_descriptor(mtlc_type_from_frontend(type));
   int ok;
   if (!layout || !ir_live_remember_type(type->name, layout)) {
@@ -1258,16 +1238,15 @@ int ir_lower_live_track(IRLoweringContext *context, IRFunction *function,
     ir_set_error(context, "Out of memory describing a live heap type");
     return 0;
   }
-  ir_live_declare(context, IR_LIVE_TRACK_NAME, "iiiiss");
-  arguments[0] = ir_operand_copy(pointer);
+  ir_live_declare(context, IR_LIVE_NEW_NAME, "iiiss");
+  arguments[0] = ir_operand_copy(bytes);
   arguments[1] = ir_operand_int((long long)type->size);
   arguments[2] = count ? ir_operand_copy(count) : ir_operand_int(1);
-  arguments[3] = ir_operand_copy(capacity);
-  arguments[4] = ir_operand_string(type->name);
-  arguments[5] = ir_operand_string(layout);
-  ok = ir_live_emit_call(context, function, IR_LIVE_TRACK_NAME, arguments, 6,
-                         NULL, location);
-  for (size_t i = 0; i < 6; i++) {
+  arguments[3] = ir_operand_string(type->name);
+  arguments[4] = ir_operand_string(layout);
+  ok = ir_live_emit_call(context, function, IR_LIVE_NEW_NAME, arguments, 5,
+                         pointer, location);
+  for (size_t i = 0; i < 5; i++) {
     ir_operand_destroy(&arguments[i]);
   }
   free(layout);

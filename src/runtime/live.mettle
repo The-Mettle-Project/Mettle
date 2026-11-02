@@ -5,10 +5,14 @@ extern fn mettle_swap_apply() -> int64;
 
 extern fn mettle_crash_register_extra_code(functions: int64, function_count: int64, locations: int64, location_count: int64);
 extern fn mettle_crash_set_live_recovery(point: int64, wait: int64, jump: int64);
-extern fn mettle_set_live_heap_hooks(forget: int64, moved: int64);
+extern fn mettle_set_live_heap_hooks(forget: int64, moved: int64, room: int64);
+extern fn mettle_live_os_calloc(count: int64, size: int64) -> int64 = "calloc";
 
 const METTLE_LIVE_MAGIC: int64 = 0x48435441504C544D;
 const METTLE_LIVE_PROBE_MS: uint64 = 50;
+const METTLE_LIVE_ARENA_RESERVE: int64 = 68719476736;
+const METTLE_LIVE_ARENA_PAGE: int64 = 65536;
+const METTLE_LIVE_CLASSES: int64 = 23;
 
 export var mettle_live_anchor: int64 = 1;
 export var mettle_live_spare_slots: int64[4096];
@@ -41,6 +45,17 @@ var mettle_live_objects_hooked: int64 = 0;
 var mettle_live_convert_scratch: int64 = 0;
 var mettle_live_convert_room: int64 = 0;
 var mettle_live_converted_objects: int64 = 0;
+var mettle_live_arena_base: int64 = 0;
+var mettle_live_arena_end: int64 = 0;
+var mettle_live_arena_top: int64 = 0;
+var mettle_live_arena_ready: int64 = 0;
+var mettle_live_page_class: uint8[1048576];
+var mettle_live_class_free: int64[24];
+var mettle_live_class_bump: int64[24];
+var mettle_live_class_left: int64[24];
+var mettle_live_kinds: int64[2048];
+var mettle_live_kind_count: int64 = 0;
+var mettle_live_last_kind: int64 = 0;
 var mettle_live_undo_move_counts: int64[4096];
 var mettle_live_applied: int64[4096];
 var mettle_live_applied_count: int64 = 0;
@@ -277,10 +292,7 @@ export fn mettle_live_track(pointer: int64, element_size: int64, count: int64, c
     if (pointer == 0) {
         return 0;
     }
-    if (mettle_live_objects_hooked == 0) {
-        mettle_live_objects_hooked = 1;
-        mettle_set_live_heap_hooks((int64)&mettle_live_forget, (int64)&mettle_live_moved_object);
-    }
+    mettle_live_hook_heap();
     mettle_live_port_lock(&mettle_live_object_lock);
     if ((mettle_live_object_used + 1) * 2 > mettle_live_object_slots && mettle_live_object_grow() == 0) {
         mettle_live_port_unlock(&mettle_live_object_lock);
@@ -303,17 +315,222 @@ export fn mettle_live_track(pointer: int64, element_size: int64, count: int64, c
     return pointer;
 }
 
-export fn mettle_live_forget(pointer: int64) {
+fn mettle_live_hook_heap() {
+    if (mettle_live_objects_hooked == 0) {
+        mettle_live_objects_hooked = 1;
+        mettle_set_live_heap_hooks((int64)&mettle_live_forget, (int64)&mettle_live_moved_object, (int64)&mettle_live_room);
+    }
+}
+
+@inline fn mettle_live_class_bytes(bucket: int64) -> int64 {
+    var base: int64 = 32;
+    if (bucket % 2 == 1) {
+        base = 48;
+    }
+    return base << (bucket / 2);
+}
+
+@inline fn mettle_live_in_arena(pointer: int64) -> int64 {
+    if (mettle_live_arena_base != 0 && pointer >= mettle_live_arena_base && pointer < mettle_live_arena_top) {
+        return 1;
+    }
+    return 0;
+}
+
+fn mettle_live_arena_class(block: int64) -> int64 {
+    return (int64)mettle_live_page_class[(block - mettle_live_arena_base) / METTLE_LIVE_ARENA_PAGE] - 1;
+}
+
+fn mettle_live_arena_start() -> int64 {
+    if (mettle_live_arena_ready == 0) {
+        mettle_live_arena_ready = 2;
+        var base: int64 = mettle_live_port_reserve(METTLE_LIVE_ARENA_RESERVE);
+        if (base != 0) {
+            mettle_live_arena_base = base;
+            mettle_live_arena_end = base + METTLE_LIVE_ARENA_RESERVE;
+            mettle_live_arena_top = base;
+            mettle_live_arena_ready = 1;
+        }
+    }
+    if (mettle_live_arena_ready == 1) {
+        return 1;
+    }
+    return 0;
+}
+
+fn mettle_live_arena_take(bucket: int64) -> int64 {
+    var head: int64 = mettle_live_class_free[bucket];
+    if (head != 0) {
+        var link: int64* = (int64*)(head + 16);
+        mettle_live_class_free[bucket] = *link;
+        return head;
+    }
+    var size: int64 = mettle_live_class_bytes(bucket);
+    if (mettle_live_class_left[bucket] < size) {
+        var page: int64 = mettle_live_arena_top;
+        if (page + METTLE_LIVE_ARENA_PAGE > mettle_live_arena_end || mettle_live_port_commit(page, METTLE_LIVE_ARENA_PAGE) == 0) {
+            return 0;
+        }
+        mettle_live_page_class[(page - mettle_live_arena_base) / METTLE_LIVE_ARENA_PAGE] = (uint8)(bucket + 1);
+        mettle_live_class_bump[bucket] = page;
+        mettle_live_class_left[bucket] = METTLE_LIVE_ARENA_PAGE;
+        mettle_live_arena_top = page + METTLE_LIVE_ARENA_PAGE;
+    }
+    var got: int64 = mettle_live_class_bump[bucket];
+    mettle_live_class_bump[bucket] = got + size;
+    mettle_live_class_left[bucket] = mettle_live_class_left[bucket] - size;
+    return got;
+}
+
+fn mettle_live_kind(name: int64, name_length: int64, layout: int64, layout_length: int64, element_size: int64) -> int64 {
+    if (mettle_live_last_kind != 0) {
+        var last: int64* = (int64*)mettle_live_last_kind;
+        if (last[0] == name && last[2] == layout && last[1] == name_length && last[3] == layout_length) {
+            return mettle_live_last_kind;
+        }
+    }
+    var i: int64 = 0;
+    while (i < mettle_live_kind_count) {
+        var known: int64* = (int64*)&mettle_live_kinds[i * 8];
+        if (known[0] == name && known[1] == name_length && known[2] == layout && known[3] == layout_length) {
+            mettle_live_last_kind = (int64)known;
+            return (int64)known;
+        }
+        i = i + 1;
+    }
+    if (mettle_live_kind_count >= 256) {
+        return 0;
+    }
+    var fresh: int64* = (int64*)&mettle_live_kinds[mettle_live_kind_count * 8];
+    fresh[0] = name;
+    fresh[1] = name_length;
+    fresh[2] = layout;
+    fresh[3] = layout_length;
+    fresh[4] = element_size;
+    mettle_live_kind_count = mettle_live_kind_count + 1;
+    return (int64)fresh;
+}
+
+export fn mettle_live_new(bytes: int64, element_size: int64, count: int64, name: string, layout: string) -> int64 {
+    var room: int64 = bytes + bytes / 4 + 16;
+    var bucket: int64 = 0;
+    while (bucket < METTLE_LIVE_CLASSES && mettle_live_class_bytes(bucket) < room + 16) {
+        bucket = bucket + 1;
+    }
+    if (bucket < METTLE_LIVE_CLASSES) {
+        mettle_live_hook_heap();
+        mettle_live_port_lock(&mettle_live_object_lock);
+        if (mettle_live_arena_start() != 0) {
+            var kind: int64 = mettle_live_kind((int64)name.chars, (int64)name.length, (int64)layout.chars, (int64)layout.length, element_size);
+            var block: int64 = 0;
+            if (kind != 0) {
+                block = mettle_live_arena_take(bucket);
+            }
+            mettle_live_port_unlock(&mettle_live_object_lock);
+            if (block != 0) {
+                var words: int64* = (int64*)(block + 16);
+                var word: int64 = 0;
+                var used: int64 = (bytes + 7) / 8;
+                while (word < used) {
+                    words[word] = 0;
+                    word = word + 1;
+                }
+                var cells: int64* = (int64*)block;
+                cells[1] = count;
+                cells[0] = kind;
+                return block + 16;
+            }
+        } else {
+            mettle_live_port_unlock(&mettle_live_object_lock);
+        }
+    }
+    var fallback: int64 = mettle_live_os_calloc(1, room);
+    return mettle_live_track(fallback, element_size, count, room, name, layout);
+}
+
+export fn mettle_live_room(pointer: int64) -> int64 {
+    if (mettle_live_in_arena(pointer) == 0) {
+        return -1;
+    }
+    return mettle_live_class_bytes(mettle_live_arena_class(pointer - 16)) - 16;
+}
+
+export fn mettle_live_forget(pointer: int64) -> int64 {
+    if (mettle_live_in_arena(pointer) != 0) {
+        var block: int64 = pointer - 16;
+        var bucket: int64 = mettle_live_arena_class(block);
+        var cells: int64* = (int64*)block;
+        var link: int64* = (int64*)pointer;
+        mettle_live_port_lock(&mettle_live_object_lock);
+        cells[0] = 0;
+        *link = mettle_live_class_free[bucket];
+        mettle_live_class_free[bucket] = block;
+        mettle_live_port_unlock(&mettle_live_object_lock);
+        return 1;
+    }
     if (mettle_live_object_slots == 0) {
-        return;
+        return 0;
     }
     mettle_live_port_lock(&mettle_live_object_lock);
     var entry: int64 = mettle_live_object_find(pointer);
     if (entry != 0) {
-        var cells: int64* = (int64*)entry;
-        cells[0] = -1;
+        var found: int64* = (int64*)entry;
+        found[0] = -1;
     }
     mettle_live_port_unlock(&mettle_live_object_lock);
+    return 0;
+}
+
+fn mettle_live_arena_walk(name: int64, name_length: int64, layout: int64, layout_length: int64, convert: int64) -> int64 {
+    if (mettle_live_arena_base == 0) {
+        return 1 - convert;
+    }
+    var size: int64 = mettle_live_desc_size((uint8*)layout, layout_length, 0);
+    var pages: int64 = (mettle_live_arena_top - mettle_live_arena_base) / METTLE_LIVE_ARENA_PAGE;
+    var converted: int64 = 0;
+    var page: int64 = 0;
+    while (page < pages) {
+        var bucket: int64 = (int64)mettle_live_page_class[page] - 1;
+        if (bucket >= 0) {
+            var bytes: int64 = mettle_live_class_bytes(bucket);
+            var start: int64 = mettle_live_arena_base + page * METTLE_LIVE_ARENA_PAGE;
+            var block: int64 = start;
+            while (block + bytes <= start + METTLE_LIVE_ARENA_PAGE) {
+                var cells: int64* = (int64*)block;
+                if (cells[0] != 0) {
+                    var kind: int64* = (int64*)cells[0];
+                    if (mettle_live_same_text(kind[0], kind[1], name, name_length) != 0 && mettle_live_same_text(kind[2], kind[3], layout, layout_length) == 0) {
+                        if (size * cells[1] > bytes - 16) {
+                            if (convert == 0) {
+                                return 0;
+                            }
+                        } else if (convert != 0) {
+                            var target: int64 = mettle_live_kind(kind[0], kind[1], layout, layout_length, size);
+                            var old_size: int64 = mettle_live_desc_size((uint8*)kind[2], kind[3], 0);
+                            var scratch: int64 = mettle_live_convert_room_for(old_size * cells[1]);
+                            if (target != 0 && scratch != 0) {
+                                mettle_live_copy(scratch, block + 16, old_size * cells[1]);
+                                mettle_live_frame_zero(block + 16, size * cells[1]);
+                                var k: int64 = 0;
+                                while (k < cells[1]) {
+                                    mettle_live_convert(block + 16 + k * size, (uint8*)layout, layout_length, 0, scratch + k * old_size, (uint8*)kind[2], kind[3], 0);
+                                    k = k + 1;
+                                }
+                                cells[0] = target;
+                                converted = converted + 1;
+                            }
+                        }
+                    }
+                }
+                block = block + bytes;
+            }
+        }
+        page = page + 1;
+    }
+    if (convert == 0) {
+        return 1;
+    }
+    return converted;
 }
 
 export fn mettle_live_moved_object(from: int64, to: int64) {
@@ -379,6 +596,9 @@ fn mettle_live_convert_at(target: int64, target_size: int64, target_layout: int6
 }
 
 fn mettle_live_objects_fit(name: int64, name_length: int64, layout: int64, layout_length: int64) -> int64 {
+    if (mettle_live_arena_walk(name, name_length, layout, layout_length, 0) == 0) {
+        return 0;
+    }
     var size: int64 = mettle_live_desc_size((uint8*)layout, layout_length, 0);
     var i: int64 = 0;
     while (i < mettle_live_object_slots) {
@@ -395,7 +615,7 @@ fn mettle_live_objects_fit(name: int64, name_length: int64, layout: int64, layou
 
 fn mettle_live_objects_convert(name: int64, name_length: int64, layout: int64, layout_length: int64) -> int64 {
     var size: int64 = mettle_live_desc_size((uint8*)layout, layout_length, 0);
-    var converted: int64 = 0;
+    var converted: int64 = mettle_live_arena_walk(name, name_length, layout, layout_length, 1);
     var i: int64 = 0;
     while (i < mettle_live_object_slots) {
         var cells: int64* = (int64*)(mettle_live_objects + i * 64);
