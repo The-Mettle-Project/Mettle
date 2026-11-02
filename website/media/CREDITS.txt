@@ -1,0 +1,11 @@
+hero.mp4 and hero-poster.jpg
+Source: "Stunning Aerial View of Iceland's Vestrahorn Mountains" by Ryan Shroyer
+https://www.pexels.com/video/stunning-aerial-view-of-iceland-s-vestrahorn-mountains-36374734/
+License: Pexels License, https://www.pexels.com/license/
+Changes: cut to 7 seconds, graded, eased at both ends, played forward then reversed, audio removed. See make_hero.sh.
+
+canyon.mp4 and canyon-poster.jpg
+Source: "Dramatic Aerial View of Utah's Rugged Canyons" by Alex Moliski
+https://www.pexels.com/video/dramatic-aerial-view-of-utah-s-rugged-canyons-34305686/
+License: Pexels License, https://www.pexels.com/license/
+Changes: cut to 4 seconds, slowed to 0.5x with eased ends, darkened, played forward then reversed, audio removed. See make_canyon.sh.

@@ -1,11 +1,13 @@
-import datetime
-import difflib
+import base64
+import html
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+
+import live_session
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -21,153 +23,178 @@ def read(path):
         return f.read().decode("utf-8").replace("\r\n", "\n")
 
 
-def clean(text):
-    lines = [line.rstrip().expandtabs(8) for line in text.replace("\r\n", "\n").split("\n")]
-    while lines and not lines[-1]:
-        lines.pop()
-    return "\n".join(lines)
+def write(path, text):
+    with open(path, "wb") as f:
+        f.write(text.encode("utf-8"))
 
 
-def fail(what):
-    sys.exit("build.py: expected " + what)
+def read_b64(*parts):
+    with open(os.path.join(HERE, *parts), "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
+
+
+def esc(text):
+    return html.escape(text, quote=False)
 
 
 def require(cond, what):
     if not cond:
-        fail(what)
+        sys.exit("build.py: expected " + what)
 
 
-def compile_in(run_id, source, shown_name, args):
+def run(cwd, argv):
+    proc = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return proc.stdout.decode("utf-8", "replace").replace("\r\n", "\n"), proc.returncode
+
+
+def stage(run_id, sources):
     cwd = os.path.join(WORK, run_id)
     shutil.rmtree(cwd, ignore_errors=True)
     os.makedirs(cwd)
-    shutil.copyfile(os.path.join(EXHIBITS, source), os.path.join(cwd, shown_name))
-    proc = subprocess.run([METTLE] + args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    return {"cmd": "mettle " + " ".join(args), "out": clean(proc.stdout.decode("utf-8", "replace")), "exit": proc.returncode}, cwd
+    for source, name in sources:
+        shutil.copyfile(source, os.path.join(cwd, name))
+    return cwd
 
 
-def execute(cwd, argv, shown):
-    exe = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0])
-    if not exe:
-        sys.exit("build.py: " + argv[0] + " is not on PATH")
-    proc = subprocess.run([exe] + argv[1:], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    return {"cmd": shown, "out": clean(proc.stdout.decode("utf-8", "replace")), "exit": proc.returncode}
+def compile_in(run_id, source, args, name="checksum.mettle"):
+    cwd = stage(run_id, [(os.path.join(EXHIBITS, source), name)])
+    out, code = run(cwd, [METTLE] + args + [name])
+    return out, code, cwd
 
 
-def excerpt(run, keep):
-    lines = run["out"].split("\n")
-    picked = []
-    last = -1
-    for i, l in enumerate(lines):
-        if keep(l):
-            if last != -1 and i != last + 1:
-                picked.append("  " + CUT)
-            elif last == -1 and i != 0:
-                picked.append(CUT)
-            picked.append(l)
-            last = i
-    require(picked, "an excerpt from `" + run["cmd"] + "`")
-    if last != len(lines) - 1:
-        picked.append(CUT)
-    return dict(run, out="\n".join(picked))
-
-
-def diff_view(base, changed, context):
-    a = base.split("\n")
-    b = changed.split("\n")
-    marked = []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
-        if tag in ("replace", "insert"):
-            marked.extend(range(j1 + 1, j2 + 1))
-    require(marked, "a change between the exhibit and its base")
-    lo = max(1, min(marked) - context)
-    hi = min(len(b), max(marked) + context)
-    return {"lines": [{"n": n, "text": b[n - 1], "mark": n in marked} for n in range(lo, hi + 1)]}
+def explain_lines(out):
+    rows = []
+    for line in out.split("\n"):
+        m = re.match(r"^  (\w+) \((loop) @ line (\d+)\): (.+)$", line)
+        if not m:
+            continue
+        head = esc(line[: m.start(4)].strip())
+        verdict = esc(m.group(4))
+        if m.group(4).startswith("NOT"):
+            verdict = '<span class="warn">' + verdict + "</span>"
+        elif m.group(4).startswith("vectorized"):
+            verdict = '<span class="ok">' + verdict + "</span>"
+        rows.append(head + " " + verdict)
+    return rows
 
 
 def main():
     if not os.path.exists(METTLE):
         sys.exit("build.py: no compiler at " + METTLE + "; set METTLE")
     os.makedirs(WORK, exist_ok=True)
-    base = read(os.path.join(EXHIBITS, "checksum.mettle"))
-    release = ["--build", "--release", "checksum.mettle"]
 
-    built, cwd = compile_in("build", "checksum.mettle", "checksum.mettle", release)
-    require(built["exit"] == 0, "checksum.mettle to build")
-    ran = execute(cwd, [os.path.join(cwd, "checksum" + EXE)], "./checksum")
-    require(ran["out"] == "checksum = 130560", "checksum to print 130560")
-    size = os.path.getsize(os.path.join(cwd, "checksum" + EXE))
+    potentia = os.environ.get("POTENTIA_README")
+    if potentia:
+        readme = read(potentia)
+        for figure in ("35.7 ms against 87.1 ms", "code 140.5 against 99.3", "1.8 against 21.5 GB", "8 requests 0.38 against 0.61"):
+            require(figure in readme, "the Potentia README to still report " + figure)
+        print("potentia figures: match the README")
+    else:
+        print("potentia figures: NOT CHECKED, set POTENTIA_README")
 
-    explain, _ = compile_in("explain", "checksum.mettle", "checksum.mettle", ["--build", "--release", "--explain", "checksum.mettle"])
-    require(explain["exit"] == 0, "--explain to build")
-    explain = excerpt(explain, lambda l: re.match(r"^  \w+ \(loop @ line \d+\)", l) is not None)
-    require("vpsadbw" in explain["out"], "the checksum loop to vectorize to vpsadbw")
+    explain, code, _ = compile_in("explain", "checksum.mettle", ["--build", "--release", "--explain"])
+    require(code == 0, "--explain to build")
+    rows = explain_lines(explain)
+    require(any("vpsadbw" in r for r in rows), "the checksum loop to vectorize to vpsadbw")
+    trust = re.search(r"^  (\d+ things this build took on trust)\.", explain, re.M)
+    require(trust, "the beliefs section to count what the build took on trust")
+    rows.append(esc("beliefs: " + trust.group(1)))
 
-    broken, _ = compile_in("contract", "checksum-early-exit.mettle", "checksum.mettle", release)
-    require(broken["exit"] != 0 and "@simd!" in broken["out"], "@simd! to stop the build on an early exit")
+    broken, code, _ = compile_in("contract", "checksum-early-exit.mettle", ["--build", "--release"])
+    refusal = re.search(r"error: @simd! loop was not vectorized.*$", broken, re.M)
+    require(code != 0 and refusal, "@simd! to stop the build on an early exit")
+    demand = read(os.path.join(EXHIBITS, "checksum-early-exit.mettle")).split("\n")
+    require(demand[6].strip().startswith("if (data[i] == 0)"), "the early exit on line 7")
 
-    early, _ = compile_in("free", "checksum-free-early.mettle", "checksum.mettle", release)
-    require("M0101" in early["out"], "M0101 for the early free")
-    early = excerpt(early, lambda l: "M0101" in l or re.match(r"^\s+1[78] \|", l) is not None or re.match(r"^\s+:\s+\^", l) is not None)
+    early, code, _ = compile_in("free", "checksum-free-early.mettle", ["--build", "--release"])
+    warning = re.search(r"^warning\[M0101\]: .*$", early, re.M)
+    finished = re.search(r"^Built executable .*$", early, re.M)
+    require(code == 0 and warning and finished, "M0101 to warn and the build to finish")
+    freed = read(os.path.join(EXHIBITS, "checksum-free-early.mettle")).split("\n")
+    require(freed[16].strip() == "free(data);" and freed[17].strip().startswith("println"), "the early free on lines 17 and 18")
 
-    dump = execute(cwd, ["objdump", "-p", "checksum" + EXE], "objdump -p checksum" + EXE)
-    dlines = dump["out"].split("\n")
-    dlls = [l.split("DLL Name:")[1].strip() for l in dlines if "DLL Name:" in l]
-    first = next(i for i, l in enumerate(dlines) if "DLL Name" in l)
-    imports = []
-    for l in dlines[first + 2:]:
-        if not l.strip():
-            break
-        imports.append(l)
-    require(dlls and imports, "an import table in checksum" + EXE)
-    shown = [dlines[first]] + imports[:5]
-    dump = dict(dump, out=CUT + "\n" + "\n".join(shown) + "\n        " + CUT + " " + str(len(imports) - 5) + " more from the same DLL\n" + CUT)
+    rule_src = read(os.path.join(EXHIBITS, "rules.mettle")).split("\n")
+    ruled, code, _ = compile_in("rule", "rules.mettle", ["--build"], "rules.mettle")
+    rule_error = re.search(r"^error\[R0002\]: .*$", ruled, re.M)
+    require(code != 0 and rule_error, "R0002 from the recursion rule")
 
-    vol_bad, _ = compile_in("types", "volume.mettle", "volume.mettle", ["--build", "volume.mettle"])
-    vol_ok, _ = compile_in("types-ok", "volume-guarded.mettle", "volume.mettle", ["--build", "volume.mettle"])
-    require(vol_bad["exit"] != 0 and vol_ok["exit"] == 0, "the unguarded Percent to fail and the guarded one to build")
-    mixer, _ = compile_in("effects", "mixer.mettle", "mixer.mettle", ["--build", "mixer.mettle"])
-    require("F0001" in mixer["out"], "F0001 for the mixer")
-    rules, _ = compile_in("rules", "rules.mettle", "rules.mettle", ["--build", "rules.mettle"])
-    require("R0002" in rules["out"], "R0002 for the recursion rule")
-    verify, _ = compile_in("verify", "checksum.mettle", "checksum.mettle", ["--build", "--release", "--verify", "checksum.mettle"])
-    require(verify["exit"] == 0 and "translation validation" in verify["out"], "--verify to report")
+    cwd = stage("target", [(os.path.join(EXHIBITS, "add.mettle"), "add.mettle")])
+    stock, code = run(cwd, [METTLE, "target", "x86_64-none"])
+    require(code == 0, "mettle target to print x86_64-none")
+    forward = 'int_args: ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]'
+    backward = 'int_args: ["r9", "r8", "rcx", "rdx", "rsi", "rdi"]'
+    require(forward in stock, "the printed target to list its integer argument registers")
+    write(os.path.join(cwd, "stock.mettle"), stock)
+    write(os.path.join(cwd, "mine.mettle"), stock.replace(forward, backward).replace('indirect_return: "rdi"', 'indirect_return: "r9"'))
+    _, code = run(cwd, [METTLE, "add.mettle", "--target", "stock.mettle", "--emit-obj", "-o", "stock.o"])
+    require(code == 0, "the printed target to build")
+    _, code = run(cwd, [METTLE, "add.mettle", "--target", "mine.mettle", "--emit-obj", "-o", "add.o"])
+    require(code == 0, "the edited target to build")
+    disasm, _ = run(cwd, ["objdump", "-d", "-M", "intel", "add.o"])
+    moves = re.findall(r"\t(mov\s+\w+,\s*(?:r9|r8|rcx))\s*$", disasm, re.M)
+    moves = [re.sub(r"\s+", " ", m).replace(",", ", ").replace(",  ", ", ") for m in moves]
+    require(len(moves) >= 3 and "r9" in moves[0] and "r8" in moves[1] and "rcx" in moves[2], "the edited target to read arguments from r9, r8 and rcx, found " + "; ".join(moves))
 
-    version = clean(subprocess.run([METTLE, "--version"], stdout=subprocess.PIPE).stdout.decode()).split("\n")
-    target = next((l.split(":", 1)[1].strip() for l in version if l.startswith("target:")), "")
+    little_path = os.path.join(REPO, "examples", "machine", "little.mettle")
+    cwd = stage("machine", [(little_path, "little.mettle")])
+    emulated, code = run(cwd, [METTLE, "emulate", "little.mettle"])
+    require(code == 0, "mettle emulate to run little.mettle")
+    little = read(little_path).split("\n")
+    at_add = next(i for i, l in enumerate(little) if l.startswith("fn ins_add"))
+    at_program = next(i for i, l in enumerate(little) if l.startswith("const PROGRAM"))
+    machine_code = little[at_add:at_add + 4] + [""] + little[at_program:at_program + 3] + ["  " + CUT]
+    machine_out = [l.rstrip() for l in emulated.split("\n") if re.match(r"^r\d+ = ", l)]
+    require(machine_out, "the invented machine to print its registers")
 
-    data = {
-        "source": {"file": "checksum.mettle", "src": base},
-        "build": {"runs": [built, ran], "link": True},
-        "explain": {"runs": [explain], "link": True},
-        "contract": {"diff": diff_view(base, read(os.path.join(EXHIBITS, "checksum-early-exit.mettle")), 1), "runs": [broken]},
-        "free": {"diff": diff_view(base, read(os.path.join(EXHIBITS, "checksum-free-early.mettle")), 1), "runs": [early]},
-        "ship": {"runs": [dump]},
-        "types": {"runs": [vol_bad]},
-        "effects": {"runs": [mixer]},
-        "rules": {"runs": [rules]},
-        "verify": {"runs": [verify]},
-    }
+    gpu_dir = os.path.join(REPO, "examples", "gpu_vadd")
+    kernel_src = read(os.path.join(gpu_dir, "vadd_kernel.mettle")).strip()
+    launch = next(l.strip() for l in read(os.path.join(gpu_dir, "vadd_host.mettle")).split("\n") if l.strip().startswith("dispatch "))
+    cwd = stage("ptx", [(os.path.join(gpu_dir, "vadd_kernel.mettle"), "vadd_kernel.mettle")])
+    _, code = run(cwd, [METTLE, "--emit-ptx", "vadd_kernel.mettle", "-o", "vadd_kernel.ptx"])
+    ptx_path = os.path.join(cwd, "vadd_kernel.ptx")
+    require(code == 0 and os.path.exists(ptx_path) and ".entry vadd" in read(ptx_path), "vadd_kernel to compile to a PTX entry")
 
+    cached = os.path.join(WORK, "live-session.json")
+    if "--reuse-live" in sys.argv and os.path.exists(cached):
+        session = json.loads(read(cached))
+    else:
+        session = live_session.record(REPO, METTLE, WORK)
+        write(cached, json.dumps(session, ensure_ascii=False))
+
+    version = run(REPO, [METTLE, "--version"])[0].split("\n")[0]
+    data = {k: session[k] for k in ("duration", "points", "events", "plateau")}
     facts = {
-        "{{VERSION_SHORT}}": version[0].split()[-1],
-        "{{VERSION}}": version[0],
-        "{{TARGET}}": target,
-        "{{DATE}}": datetime.date.today().strftime("%d %B %Y").lstrip("0"),
-        "{{SIZE}}": "{:,}".format(size),
-        "{{DLLS}}": "one DLL" if len(dlls) == 1 else str(len(dlls)) + " DLLs",
-        "{{DLL}}": dlls[0],
-        "{{IMPORTS}}": str(len(imports)),
+        "{{VERSION}}": version,
+        "{{DEMAND_CODE}}": esc("\n".join(demand[3:7] + ["    " + CUT])),
+        "{{DEMAND_NOTE}}": esc(refusal.group(0)),
+        "{{EXPLAIN_LINES}}": "\n".join(rows),
+        "{{RULE_CODE}}": esc("\n".join(rule_src[3:7] + ["  " + CUT])),
+        "{{RULE_NOTE}}": esc(rule_error.group(0)),
+        "{{FREE_CODE}}": esc(freed[13].strip() + "\n" + freed[16].strip() + "\n" + freed[17].strip()),
+        "{{FREE_NOTE}}": esc(warning.group(0)),
+        "{{FREE_BUILT}}": esc(finished.group(0)),
+        "{{TARGET_LINE}}": esc(backward + ","),
+        "{{TARGET_DUMP}}": esc("\n".join(moves[:3])),
+        "{{MACHINE_CODE}}": esc("\n".join(machine_code)),
+        "{{MACHINE_OUT}}": esc("$ mettle emulate little.mettle\n" + "\n".join(machine_out[-3:])),
+        "{{GPU_CODE}}": esc(kernel_src.replace("b: float32*, c:", "b: float32*,\n" + " " * 25 + "c:") + "\n\n" + launch),
+        "{{LIVE_FIX_MS}}": session["facts"]["{{LIVE_FIX_MS}}"],
+        "{{LIVE_WAIT}}": session["facts"]["{{LIVE_WAIT}}"],
     }
-    blob = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    page = read(os.path.join(HERE, "template.html")).replace("{{DATA}}", blob)
+
+    page = read(os.path.join(HERE, "template.html"))
+    page = page.replace("{{DATA}}", json.dumps(data, separators=(",", ":")))
+    page = page.replace("{{SERIF_WOFF2}}", read_b64("fonts", "GeistSerif-Regular.woff2"))
+    page = page.replace("{{HERO_POSTER}}", read_b64("media", "hero-poster.jpg"))
     for k, v in facts.items():
         page = page.replace(k, v)
-    left = re.findall(r"\{\{[A-Z_]+\}\}", page)
+    left = re.findall(r"\{\{[A-Z0-9_]+\}\}", page)
     require(not left, "every placeholder filled, found " + ", ".join(sorted(set(left))))
-    with open(os.path.join(HERE, "index.html"), "wb") as f:
-        f.write(page.encode("utf-8"))
-    print("wrote website/index.html: " + ", ".join(k.strip("{}").lower() + "=" + v for k, v in facts.items()))
+    write(os.path.join(HERE, "index.html"), page)
+    print("wrote website/index.html")
+    for k in ("{{TARGET_DUMP}}", "{{MACHINE_OUT}}", "{{DEMAND_NOTE}}"):
+        print(k.strip("{}").lower() + ": " + facts[k].replace("\n", " | ")[:150])
+    print("explain: " + " | ".join(re.sub(r"<[^>]+>", "", r) for r in rows)[:420])
 
 
 if __name__ == "__main__":
