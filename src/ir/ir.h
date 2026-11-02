@@ -434,6 +434,7 @@ typedef struct {
   size_t alias_global_count;
   int alias_globals_computed;
   int dead_functions_eliminated;
+  size_t next_inline_id;
 } IRProgram;
 
 typedef struct {

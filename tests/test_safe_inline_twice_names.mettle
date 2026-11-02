@@ -1,0 +1,32 @@
+import "std/io"
+
+@inline fn pick(x: float64) -> int64 {
+    if (x >= 0.0) {
+        return (int64)x;
+    }
+    return 0;
+}
+
+fn fill() -> float64 {
+    var a: uint16[4];
+    for z: int64 in 0..4 {
+        a[z] = (uint16)0;
+    }
+    return 0.125;
+}
+
+fn main() -> int32 {
+    var total: float64 = 0.0;
+    var i: int64 = 0;
+    while (i < 3) {
+        total = total + (float64)pick(2.5);
+        total = total + fill();
+        i = i + 1;
+    }
+    if (total != 6.375) {
+        println("FAIL {total}");
+        return 1;
+    }
+    println("PASS");
+    return 0;
+}

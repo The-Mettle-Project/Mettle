@@ -1236,7 +1236,6 @@ int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
     return 0;
   }
 
-  size_t inline_counter = 1800000000;
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
     size_t self_calls = 0;
@@ -1254,7 +1253,8 @@ int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
         break;
       }
       int round_changed = 0;
-      if (!ir_inline_self_calls_once(program, function, &inline_counter,
+      if (!ir_inline_self_calls_once(program, function,
+                                     &program->next_inline_id,
                                      &round_changed)) {
         return 0;
       }
@@ -1519,7 +1519,7 @@ int ir_inline_explain_simulate_force_inline(IRProgram *program,
   }
   int changed = 0;
   if (candidate) {
-    size_t inline_counter = 900000;
+    size_t inline_counter = program->next_inline_id;
     for (int round = 0; round < IR_INLINE_MAX_ROUNDS; round++) {
       int round_changed = 0;
       if (!ir_inline_calls_in_function(program, caller, &inline_counter,
@@ -1548,7 +1548,6 @@ int ir_inline_small_functions_pass(IRProgram *program, int *changed) {
     return 0;
   }
 
-  size_t inline_counter = 0;
   for (int round = 0; round < IR_INLINE_MAX_ROUNDS; round++) {
     int round_changed = 0;
 
@@ -1557,7 +1556,8 @@ int ir_inline_small_functions_pass(IRProgram *program, int *changed) {
         continue;
       }
       if (!ir_inline_calls_in_function(program, program->functions[i],
-                                       &inline_counter, &round_changed)) {
+                                       &program->next_inline_id,
+                                       &round_changed)) {
         return 0;
       }
     }

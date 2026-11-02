@@ -2249,6 +2249,18 @@ $cases = @(
     IrMustNotMatch = @("jump ir_while_", "%\.?t[0-9]+ = @v / 2")
   },
   @{
+    Name          = "safe_inline_twice_names_release"
+    Path          = "tests/test_safe_inline_twice_names.mettle"
+    ShouldSucceed = $true
+    Args          = @("--safe", "--release")
+  },
+  @{
+    Name          = "safe_inline_twice_names_opt"
+    Path          = "tests/test_safe_inline_twice_names.mettle"
+    ShouldSucceed = $true
+    Args          = @("--safe", "-O")
+  },
+  @{
     Name          = "opt_wide_forwarding_names"
     Path          = "tests/test_optimize_wide_forwarding.mettle"
     ShouldSucceed = $true

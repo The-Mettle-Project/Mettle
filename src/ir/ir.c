@@ -1925,6 +1925,7 @@ IRProgram *ir_program_create(void) {
   program->module_symbol_capacity = 0;
   program->main_wants_argc_argv = 0;
   program->dead_functions_eliminated = 0;
+  program->next_inline_id = 0;
   program->alias_globals = NULL;
   program->alias_global_count = 0;
   program->alias_globals_computed = 0;
