@@ -20704,18 +20704,28 @@ $issueRegressions = @(
   @{ Name = "issue_local_shadows_const"; Entry = "tests/issues/shadowing/local_const.mettle"; Args = @(); Expect = @("9 (want 9)") },
   @{ Name = "issue_param_shadows_function"; Entry = "tests/issues/shadowing/fn_param.mettle"; Args = @(); Expect = @("true (want true)", "argument (right)") },
   @{ Name = "issue_global_hoist_direct_call"; Entry = "tests/issues/global_hoist/direct.mettle"; Args = @("-O"); Expect = @("n=5 (want 5)") },
-  @{ Name = "issue_global_hoist_indirect_call"; Entry = "tests/issues/global_hoist/indirect.mettle"; Args = @("-O"); Expect = @("n=5 (want 5)") }
+  @{ Name = "issue_global_hoist_indirect_call"; Entry = "tests/issues/global_hoist/indirect.mettle"; Args = @("-O"); Expect = @("n=5 (want 5)") },
+  @{ Name = "issue_module_without_exports_imports_mem"; Entry = "tests/issues/mem_import/main.mettle"; Args = @(); Expect = @("42") },
+  @{ Name = "issue_directory_does_not_shadow_module"; Entry = "tests/issues/dir_shadow/main.mettle"; Args = @(); Expect = @("1") },
+  @{ Name = "issue_generic_call_as_match_subject"; Entry = "tests/issues/generic_match/match_subject.mettle"; Args = @(); Expect = @("7") },
+  @{ Name = "issue_literal_adapts_to_inferred_type_param"; Entry = "tests/issues/generic_match/literal_adapt.mettle"; Args = @(); Expect = @("5") },
+  @{ Name = "issue_trace_keeps_trailing_flags"; Command = @("trace", "tests/issues/trace_flags/main.mettle", "go", "3", "-I", "tests/issues/trace_flags/lib"); Expect = @("returns 6") }
 )
 foreach ($case in $issueRegressions) {
   $total++
   try {
     if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
-    $exe = Join-Path $tmpDir ($case.Name + $(if ($script:OnWindows) { ".exe" } else { "" }))
-    $buildOut = & $CompilerPath --build @($case.Args) $case.Entry -o $exe 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) {
-      throw "build failed:`n$buildOut"
+    if ($case.Command) {
+      $out = & $CompilerPath @($case.Command) 2>&1 | Out-String
     }
-    $out = & $exe 2>&1 | Out-String
+    else {
+      $exe = Join-Path $tmpDir ($case.Name + $(if ($script:OnWindows) { ".exe" } else { "" }))
+      $buildOut = & $CompilerPath --build @($case.Args) $case.Entry -o $exe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "build failed:`n$buildOut"
+      }
+      $out = & $exe 2>&1 | Out-String
+    }
     foreach ($want in $case.Expect) {
       if (-not $out.Contains($want)) {
         throw "expected '$want', got:`n$out"

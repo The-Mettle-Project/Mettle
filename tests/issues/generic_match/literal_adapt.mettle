@@ -1,0 +1,8 @@
+import "std/io";
+fn pick<T>(a: T, b: T) -> T { return b; }
+fn main() -> int32 {
+  var x: int64 = 1;
+  var r: int64 = pick(x, 5);
+  println("{r}");
+  return 0;
+}

@@ -4498,6 +4498,50 @@ static const DriverFlagParser DRIVER_FLAG_PARSERS[] = {
     parse_flag_checks,
     parse_flag_codegen, parse_flag_target};
 
+static int subcommand_flag_takes_value(const char *argument) {
+  static const char *const with_value[] = {
+      "-I",        "-L",       "-l",         "-o",
+      "--stdlib",  "--rpath",  "--link-arg", "--target",
+      "--library", "--soname", "--dynamic-linker", "--library-path"};
+  for (size_t i = 0; i < sizeof(with_value) / sizeof(with_value[0]); i++) {
+    if (strcmp(argument, with_value[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int subcommand_argument_is_flag(const char *argument) {
+  return argument[0] == '-' && argument[1] != '\0' &&
+         !(argument[1] >= '0' && argument[1] <= '9') && argument[1] != '.';
+}
+
+static int split_subcommand_flags(int argc, char *argv[], int first,
+                                  const char **positional,
+                                  int *positional_count) {
+  char **flags = malloc((size_t)argc * sizeof(char *));
+  int flag_count = 0;
+  *positional_count = 0;
+  if (!flags) {
+    return argc;
+  }
+  for (int i = first; i < argc; i++) {
+    if (subcommand_argument_is_flag(argv[i])) {
+      flags[flag_count++] = argv[i];
+      if (subcommand_flag_takes_value(argv[i]) && i + 1 < argc) {
+        flags[flag_count++] = argv[++i];
+      }
+    } else if (positional) {
+      positional[(*positional_count)++] = argv[i];
+    }
+  }
+  for (int i = 0; i < flag_count; i++) {
+    argv[2 + i] = flags[i];
+  }
+  free(flags);
+  return 2 + flag_count;
+}
+
 static int parse_arguments(CompilerOptions *options, DriverFlags *flags,
                            int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
@@ -4789,7 +4833,7 @@ int main(int argc, char *argv[]) {
       options.why_subject = argv[3];
       options.why_what = argv[4];
       argv[1] = argv[2];
-      argc = 2;
+      argc = split_subcommand_flags(argc, argv, 5, NULL, &(int){0});
     }
     if (strcmp(argv[1], "live") == 0) {
       return mettle_live_main(argc, argv);
@@ -4854,11 +4898,17 @@ int main(int argc, char *argv[]) {
                 "  parameters get a synthesized buffer\n");
         return 1;
       }
+      const char **trace_positional = malloc((size_t)argc * sizeof(char *));
+      int trace_positional_count = 0;
+      if (!trace_positional) {
+        return 1;
+      }
       options.trace_function = argv[3];
-      options.trace_args = (const char *const *)&argv[4];
-      options.trace_arg_count = (size_t)(argc - 4);
       argv[1] = argv[2];
-      argc = 2;
+      argc = split_subcommand_flags(argc, argv, 4, trace_positional,
+                                    &trace_positional_count);
+      options.trace_args = (const char *const *)trace_positional;
+      options.trace_arg_count = (size_t)trace_positional_count;
     }
     if (strcmp(argv[1], "docs") == 0) {
       if (argc >= 3) {

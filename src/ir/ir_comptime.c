@@ -206,6 +206,26 @@ int ir_comptime_run_tests(IRProgram *program, ErrorReporter *reporter,
       continue;
     }
 
+    if (status == IR_INTERP_OK) {
+      const char *unmodelled = NULL;
+      for (size_t t = 0; t < ir_interp_extern_trace_count(machine); t++) {
+        const IRInterpExternCall *call = ir_interp_extern_trace(machine, t);
+        if (call && !call->modelled) {
+          unmodelled = call->name;
+          break;
+        }
+      }
+      if (unmodelled) {
+        printf("test %s ... %sskipped%s (calls C function '%s'; the "
+               "interpreter cannot - run it natively via a main() + "
+               "--build)\n",
+               display, dim, reset, unmodelled);
+        totals.skipped++;
+        ir_interp_destroy(machine);
+        continue;
+      }
+    }
+
     switch (status) {
     case IR_INTERP_OK: {
       int leaks_before = totals.leaked;

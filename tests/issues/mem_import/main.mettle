@@ -1,0 +1,4 @@
+import "std/io";
+import "lib";
+fn main() -> int32 { print("{lib_answer()}
+"); return 0; }

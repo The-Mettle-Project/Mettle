@@ -1,0 +1,2 @@
+import "std/mem";
+fn lib_answer() -> int32 { return 42; }

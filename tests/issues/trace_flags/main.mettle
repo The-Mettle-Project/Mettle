@@ -1,0 +1,3 @@
+import "h";
+fn go(n: int32) -> int32 { return dbl(n); }
+fn main() -> int32 { return go(1); }

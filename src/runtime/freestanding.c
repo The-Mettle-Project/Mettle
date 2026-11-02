@@ -1924,6 +1924,39 @@ char *getenv(const char *name) {
   return mt_read_environment_value(name, name_length);
 }
 
+static char *mt_child_environment_items[512 + 64 + 1];
+
+static char **mt_child_environment(void) {
+  mt_size count = 0;
+  if (mt_environment_override_count == 0) {
+    return mt_environment;
+  }
+  if (mt_environment) {
+    for (char **item = mt_environment;
+         *item && count < 512 + 64; item++) {
+      const char *equals = strchr(*item, '=');
+      mt_size name_length = equals ? (mt_size)(equals - *item) : strlen(*item);
+      int replaced = 0;
+      for (mt_size i = 0; i < mt_environment_override_count; i++) {
+        if (strncmp(mt_environment_overrides[i], *item, name_length) == 0 &&
+            mt_environment_overrides[i][name_length] == '=') {
+          replaced = 1;
+          break;
+        }
+      }
+      if (!replaced) {
+        mt_child_environment_items[count++] = *item;
+      }
+    }
+  }
+  for (mt_size i = 0; i < mt_environment_override_count && count < 512 + 64;
+       i++) {
+    mt_child_environment_items[count++] = mt_environment_overrides[i];
+  }
+  mt_child_environment_items[count] = MT_NULL;
+  return mt_child_environment_items;
+}
+
 static unsigned long long mt_environment_write_list(
     char *buffer, unsigned long long size, unsigned long long used,
     char *const *items, mt_size count, const char *prefix,
@@ -2751,13 +2784,21 @@ int rename(const char *from, const char *to) {
 
 char *realpath(const char *path, char *resolved) {
   char full[4096];
+  char rest[4096];
+  char link[4096];
   mt_size used = 0;
+  mt_size rest_at = 0;
+  int links = 0;
   if (!path || access(path, 0) != 0) {
+    return MT_NULL;
+  }
+  if (strlen(path) >= sizeof(rest)) {
+    mt_errno_value = 36;
     return MT_NULL;
   }
   if (*path == '/') {
     full[used++] = '/';
-    path++;
+    strcpy(rest, path);
   } else {
     if (!mt_getcwd_impl(full, sizeof(full))) {
       return MT_NULL;
@@ -2766,12 +2807,14 @@ char *realpath(const char *path, char *resolved) {
     if (used == 0 || full[used - 1] != '/') {
       full[used++] = '/';
     }
+    strcpy(rest, path);
   }
-  while (*path) {
-    while (*path == '/') path++;
-    const char *component = path;
-    while (*path && *path != '/') path++;
-    mt_size length = (mt_size)(path - component);
+  while (rest[rest_at]) {
+    while (rest[rest_at] == '/') rest_at++;
+    const char *component = rest + rest_at;
+    mt_size length = 0;
+    while (component[length] && component[length] != '/') length++;
+    rest_at += length;
     if (length == 0 || (length == 1 && component[0] == '.')) {
       continue;
     }
@@ -2780,6 +2823,7 @@ char *realpath(const char *path, char *resolved) {
       while (used > 1 && full[used - 1] != '/') used--;
       continue;
     }
+    mt_size before = used;
     if (used > 1 && full[used - 1] != '/') full[used++] = '/';
     if (used + length + 1 >= sizeof(full)) {
       mt_errno_value = 36;
@@ -2787,6 +2831,29 @@ char *realpath(const char *path, char *resolved) {
     }
     memcpy(full + used, component, length);
     used += length;
+    full[used] = 0;
+    mt_ssize target = readlink(full, link, sizeof(link) - 1);
+    if (target >= 0) {
+      if (++links > 40) {
+        mt_errno_value = 40;
+        return MT_NULL;
+      }
+      link[target] = 0;
+      mt_size remainder = strlen(rest + rest_at);
+      if ((mt_size)target + 1 + remainder >= sizeof(rest)) {
+        mt_errno_value = 36;
+        return MT_NULL;
+      }
+      memmove(rest + target + 1, rest + rest_at, remainder + 1);
+      memcpy(rest, link, (mt_size)target);
+      rest[target] = '/';
+      rest_at = 0;
+      if (link[0] == '/') {
+        used = 1;
+      } else {
+        used = before;
+      }
+    }
   }
   if (used > 1 && full[used - 1] == '/') used--;
   full[used] = 0;
@@ -3718,7 +3785,7 @@ static void mt_exec_search(const char *program, const char *const *arguments) {
   char *const *argv = (char *const *)arguments;
   if (strchr(program, '/')) {
     (void)mt_syscall6(MT_SYS_EXECVE, (mt_i64)program, (mt_i64)argv,
-                      (mt_i64)mt_environment, 0, 0, 0);
+                      (mt_i64)mt_child_environment(), 0, 0, 0);
     return;
   }
   const char *path = getenv("PATH");
@@ -3734,7 +3801,7 @@ static void mt_exec_search(const char *program, const char *const *arguments) {
       candidate[directory_length] = '/';
       memcpy(candidate + directory_length + 1, program, program_length + 1);
       (void)mt_syscall6(MT_SYS_EXECVE, (mt_i64)candidate, (mt_i64)argv,
-                        (mt_i64)mt_environment, 0, 0, 0);
+                        (mt_i64)mt_child_environment(), 0, 0, 0);
     }
     path = *end ? end + 1 : end;
   }
@@ -3772,7 +3839,7 @@ int mettle_find_executable(const char *program) {
 int mettle_run_process(const char *program, const char *const *arguments) {
   const char *path = program && !strchr(program, '/') ? getenv("PATH")
                                                        : MT_NULL;
-  return mt_hosted_run_process(program, arguments, mt_environment, path);
+  return mt_hosted_run_process(program, arguments, mt_child_environment(), path);
 }
 
 long mettle_spawn_process(const char *program, const char *const *arguments) {
@@ -3798,7 +3865,7 @@ void *popen(const char *command, const char *mode) {
     return MT_NULL;
   }
   (void)getenv("PATH");
-  pid = mt_hosted_spawn_shell_reader(command, mt_environment, &descriptor);
+  pid = mt_hosted_spawn_shell_reader(command, mt_child_environment(), &descriptor);
   if (pid < 0) {
     return MT_NULL;
   }
@@ -3919,7 +3986,7 @@ void *popen(const char *command, const char *mode) {
     }
     const char *arguments[] = {"sh", "-c", command, MT_NULL};
     (void)mt_syscall6(MT_SYS_EXECVE, (mt_i64)"/bin/sh", (mt_i64)arguments,
-                      (mt_i64)mt_environment, 0, 0, 0);
+                      (mt_i64)mt_child_environment(), 0, 0, 0);
     _exit(127);
   }
   close(descriptors[1]);

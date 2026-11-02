@@ -119,6 +119,10 @@ static int file_exists_readable(const char *path) {
     return 0;
   }
 
+  if (mettle_path_is_directory(path)) {
+    return 0;
+  }
+
   FILE *file = fopen(path, "r");
   if (!file) {
     return 0;
@@ -3947,7 +3951,16 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
         }
 
         import_succeeded = imported_program != NULL;
+        int source_has_export = 0;
         if (imported_program) {
+          Program *source_prog = (Program *)imported_program->data;
+          for (size_t j = 0; source_prog && j < source_prog->declaration_count;
+               j++) {
+            if (is_declaration_exported(source_prog->declarations[j])) {
+              source_has_export = 1;
+              break;
+            }
+          }
           imported_program = process_imports_recursive(import_ctx,
                                                        imported_program,
                                                        full_path, had_error, 1);
@@ -3967,12 +3980,7 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
           size_t name_rewrite_count = 0;
           size_t name_rewrite_capacity = 0;
 
-          for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
-            if (is_declaration_exported(imported_prog_data->declarations[j])) {
-              has_any_export = 1;
-              break;
-            }
-          }
+          has_any_export = source_has_export;
 
           if (import_decl->selected_count > 0) {
             include_flags =

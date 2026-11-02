@@ -1,0 +1,10 @@
+import "std/io";
+import "std/core";
+fn wrap<T>(x: T) -> Option<T> { return Some(x); }
+fn main() -> int32 {
+  match (wrap(7)) {
+    case Some(v): { println("{v}"); }
+    case None: { println("none"); }
+  }
+  return 0;
+}

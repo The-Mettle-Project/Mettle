@@ -1191,6 +1191,15 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
     }
     break;
   }
+  case AST_MATCH_STATEMENT: {
+    MatchStatement *ms = (MatchStatement *)node->data;
+    if (ms) {
+      substitute_types_in_ast(ms->expression, param_names, arg_names, count, ctx);
+      for (size_t i = 0; i < ms->arm_count; i++)
+        substitute_types_in_ast(ms->arms[i].body, param_names, arg_names, count, ctx);
+    }
+    break;
+  }
   case AST_CASE_CLAUSE: {
     CaseClause *cc = (CaseClause *)node->data;
     if (cc) {
@@ -1516,6 +1525,15 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
     }
     break;
   }
+  case AST_MATCH_STATEMENT: {
+    MatchStatement *ms = (MatchStatement *)node->data;
+    if (ms) {
+      collect_type_instantiations(ms->expression, ctx);
+      for (size_t i = 0; i < ms->arm_count; i++)
+        collect_type_instantiations(ms->arms[i].body, ctx);
+    }
+    break;
+  }
   case AST_CASE_CLAUSE: {
     CaseClause *cc = (CaseClause *)node->data;
     if (cc) {
@@ -1823,6 +1841,15 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
       rewrite_generic_references(ss->expression, ctx);
       for (size_t i = 0; i < ss->case_count; i++)
         rewrite_generic_references(ss->cases[i], ctx);
+    }
+    break;
+  }
+  case AST_MATCH_STATEMENT: {
+    MatchStatement *ms = (MatchStatement *)node->data;
+    if (ms) {
+      rewrite_generic_references(ms->expression, ctx);
+      for (size_t i = 0; i < ms->arm_count; i++)
+        rewrite_generic_references(ms->arms[i].body, ctx);
     }
     break;
   }
@@ -2662,10 +2689,39 @@ static int mono_infer_call_type_args(MonoContext *ctx, ASTNode *node,
     bindings[i].name = def->type_params[i];
   }
 
+  for (int pass = 0; pass < 2; pass++) {
   for (i = 0; i < call->argument_count && i < fd->parameter_count; i++) {
-    char *actual = mono_static_type_of(ctx, call->arguments[i], env);
+    int adapts = 0;
+    char *actual = NULL;
+    if (call->arguments[i] && call->arguments[i]->type == AST_NUMBER_LITERAL) {
+      NumberLiteral *literal = (NumberLiteral *)call->arguments[i]->data;
+      if (literal && !literal->is_char) {
+        for (size_t p = 0; p < def->type_param_count; p++) {
+          if (strcmp(fd->parameter_types[i], def->type_params[p]) == 0) {
+            adapts = 1;
+          }
+        }
+      }
+    }
+    if (adapts != (pass == 1)) {
+      continue;
+    }
+    actual = mono_static_type_of(ctx, call->arguments[i], env);
     if (!actual) {
       continue;
+    }
+    if (adapts) {
+      int already_bound = 0;
+      for (size_t p = 0; p < def->type_param_count; p++) {
+        if (strcmp(fd->parameter_types[i], def->type_params[p]) == 0 &&
+            bindings[p].bound) {
+          already_bound = 1;
+        }
+      }
+      if (already_bound) {
+        free(actual);
+        continue;
+      }
     }
     if (!mono_match_type_text(fd->parameter_types[i], actual, def->type_params,
                               def->type_param_count, bindings)) {
@@ -2680,6 +2736,7 @@ static int mono_infer_call_type_args(MonoContext *ctx, ASTNode *node,
       goto done;
     }
     free(actual);
+  }
   }
 
   for (i = 0; i < def->type_param_count; i++) {
