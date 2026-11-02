@@ -191,6 +191,8 @@ struct Ship {
     fuel: float32
     y: int64
     x: int64
+    tag: string
+    speed: float64
 }
 '@).Replace('println("old t=', 'println("new t=')
 

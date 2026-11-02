@@ -113,8 +113,8 @@ Values convert in place, so pointers to them stay valid. A live build leaves
 room for that:
 
 - `new T` and `new T[n]` of a struct type come from an arena that gives
-  each object room to grow by a quarter of its size, and by at least 16
-  bytes, and records its type and count beside it. Two million `new` and
+  each object room to double its size, plus 16 bytes, and records its type
+  and count beside it. Two million `new` and
   `free` pairs of a 16-byte struct take 65 ms in a live build and 71 ms in a
   normal one on Windows, 49 ms and 26 ms on Linux. An object with no room for its new layout makes the
   running program refuse the patch, and it keeps running the code it has.

@@ -226,7 +226,7 @@ Windows, so the 2 GB window around the image stays free for patch code) and
 commits it in 64 KB pages. Each page holds blocks of one size class, from 32
 bytes to 64 KB, and each block starts with a 16-byte header: a pointer to the
 type record (name and descriptor) and the element count. An object gets
-`bytes + bytes / 4 + 16` bytes of room. Freed blocks go on a free list per
+`bytes * 2 + 16` bytes of room. Freed blocks go on a free list per
 class. The owned allocator's `free` and `realloc` call into the live runtime
 first, which claims any pointer inside the arena with a single range check. A
 `realloc` of a tracked object stays tracked: within its room the element count

@@ -423,7 +423,7 @@ export fn mettle_live_new(bytes: int64, element_size: int64, count: int64, name:
 }
 
 fn mettle_live_new_raw(bytes: int64, element_size: int64, count: int64, name: int64, name_length: int64, layout: int64, layout_length: int64) -> int64 {
-    var room: int64 = bytes + bytes / 4 + 16;
+    var room: int64 = bytes * 2 + 16;
     var bucket: int64 = 0;
     while (bucket < METTLE_LIVE_CLASSES && mettle_live_class_bytes(bucket) < room + 16) {
         bucket = bucket + 1;
