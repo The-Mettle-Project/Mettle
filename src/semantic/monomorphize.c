@@ -2660,6 +2660,35 @@ static char *mono_static_type_of_element(MonoContext *ctx, ASTNode *expr,
   }
 }
 
+static long mono_literal_param_index(const GenericDef *def,
+                                     const char *parameter_type,
+                                     const ASTNode *argument) {
+  const NumberLiteral *literal = NULL;
+  if (!argument || argument->type != AST_NUMBER_LITERAL ||
+      !argument->data) {
+    return -1;
+  }
+  literal = (const NumberLiteral *)argument->data;
+  if (literal->is_char) {
+    return -1;
+  }
+  for (size_t p = 0; p < def->type_param_count; p++) {
+    if (strcmp(parameter_type, def->type_params[p]) == 0) {
+      return (long)p;
+    }
+  }
+  return -1;
+}
+
+static int mono_literal_fits_type(const ASTNode *argument, const char *type) {
+  const NumberLiteral *literal = (const NumberLiteral *)argument->data;
+  if (strncmp(type, "float", 5) == 0 || strncmp(type, "bfloat", 6) == 0) {
+    return 1;
+  }
+  return !literal->is_float &&
+         (strncmp(type, "int", 3) == 0 || strncmp(type, "uint", 4) == 0);
+}
+
 static int mono_infer_call_type_args(MonoContext *ctx, ASTNode *node,
                                      MonoVarEnv *env) {
   CallExpression *call = (CallExpression *)node->data;
@@ -2690,53 +2719,38 @@ static int mono_infer_call_type_args(MonoContext *ctx, ASTNode *node,
   }
 
   for (int pass = 0; pass < 2; pass++) {
-  for (i = 0; i < call->argument_count && i < fd->parameter_count; i++) {
-    int adapts = 0;
-    char *actual = NULL;
-    if (call->arguments[i] && call->arguments[i]->type == AST_NUMBER_LITERAL) {
-      NumberLiteral *literal = (NumberLiteral *)call->arguments[i]->data;
-      if (literal && !literal->is_char) {
-        for (size_t p = 0; p < def->type_param_count; p++) {
-          if (strcmp(fd->parameter_types[i], def->type_params[p]) == 0) {
-            adapts = 1;
-          }
-        }
+    for (i = 0; i < call->argument_count && i < fd->parameter_count; i++) {
+      long literal_param = mono_literal_param_index(
+          def, fd->parameter_types[i], call->arguments[i]);
+      char *actual = NULL;
+      if ((literal_param >= 0) != (pass == 1)) {
+        continue;
       }
-    }
-    if (adapts != (pass == 1)) {
-      continue;
-    }
-    actual = mono_static_type_of(ctx, call->arguments[i], env);
-    if (!actual) {
-      continue;
-    }
-    if (adapts) {
-      int already_bound = 0;
-      for (size_t p = 0; p < def->type_param_count; p++) {
-        if (strcmp(fd->parameter_types[i], def->type_params[p]) == 0 &&
-            bindings[p].bound) {
-          already_bound = 1;
-        }
+      actual = mono_static_type_of(ctx, call->arguments[i], env);
+      if (!actual) {
+        continue;
       }
-      if (already_bound) {
+      if (literal_param >= 0 && bindings[literal_param].bound &&
+          mono_literal_fits_type(call->arguments[i],
+                                 bindings[literal_param].bound)) {
         free(actual);
         continue;
       }
-    }
-    if (!mono_match_type_text(fd->parameter_types[i], actual, def->type_params,
-                              def->type_param_count, bindings)) {
-      char message[512];
-      snprintf(message, sizeof(message),
-               "Argument %zu of '%s' asks for a different type parameter "
-               "than an earlier argument did. Name the types at the call",
-               i + 1, call->function_name);
-      mono_report_error(ctx, node->location, message);
+      if (!mono_match_type_text(fd->parameter_types[i], actual,
+                                def->type_params, def->type_param_count,
+                                bindings)) {
+        char message[512];
+        snprintf(message, sizeof(message),
+                 "Argument %zu of '%s' asks for a different type parameter "
+                 "than an earlier argument did. Name the types at the call",
+                 i + 1, call->function_name);
+        mono_report_error(ctx, node->location, message);
+        free(actual);
+        ok = 0;
+        goto done;
+      }
       free(actual);
-      ok = 0;
-      goto done;
     }
-    free(actual);
-  }
   }
 
   for (i = 0; i < def->type_param_count; i++) {

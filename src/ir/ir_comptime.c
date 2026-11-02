@@ -206,7 +206,7 @@ int ir_comptime_run_tests(IRProgram *program, ErrorReporter *reporter,
       continue;
     }
 
-    if (status == IR_INTERP_OK) {
+    if (status == IR_INTERP_OK && !result.is_float && result.i != 0) {
       const char *unmodelled = NULL;
       for (size_t t = 0; t < ir_interp_extern_trace_count(machine); t++) {
         const IRInterpExternCall *call = ir_interp_extern_trace(machine, t);
