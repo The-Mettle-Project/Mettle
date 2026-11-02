@@ -1273,6 +1273,11 @@ export fn mettle_live_resume_point(stack: int64) -> int64 {
     if (cells[12] != 1 || cells[8] <= stack) {
         return 0;
     }
+    var callee: int64* = (int64*)(cells[8] - 8);
+    var distance: int64 = *callee - cells[9];
+    if (distance > 4194304 || distance < -4194304) {
+        return 0;
+    }
     return slot;
 }
 
