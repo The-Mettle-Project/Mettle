@@ -335,6 +335,21 @@ int mtlc_host_run_process(const char *program, const char *const *arguments) {
   return mt_hosted_run_process(program, arguments, mt_hosted_environ(), path);
 }
 
+long mettle_spawn_process(const char *program, const char *const *arguments) {
+  return (long)mt_hosted_spawn_process(program, arguments);
+}
+
+int mettle_poll_process(long pid, int *exit_code) {
+  return mt_hosted_poll_process((long long)pid, exit_code);
+}
+
+void mettle_sleep_ms(unsigned milliseconds) { mt_hosted_sleep_ms(milliseconds); }
+
+int mettle_file_mtime(const char *path, long long *seconds,
+                      long long *nanoseconds) {
+  return mt_hosted_file_mtime(path, seconds, nanoseconds);
+}
+
 int mtlc_host_find_executable(const char *program) {
   const char *path;
   size_t program_length;
