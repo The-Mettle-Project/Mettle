@@ -23,6 +23,11 @@ AVI file. The container parser, the baseline JPEG decoder, the inverse DCT, the
 chroma upsampler, and the playback clock are all Mettle; Win32 supplies the
 window, the blit, and the wave device. See [`video_player/README.md`](video_player/README.md).
 
+## Live programs
+
+[`live/`](live/) is a fleet of ships to change while it runs: a function, a
+struct on the heap, a crash and an undo. See [`live/README.md`](live/README.md).
+
 ## Execution models
 
 [`job_system/`](job_system/) is a job queue on `std/thread` with a swap point

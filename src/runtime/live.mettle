@@ -943,7 +943,11 @@ fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
     if (mettle_live_converted_objects > 0) {
         at = mettle_live_text(at, ", ");
         at = mettle_live_number(at, mettle_live_converted_objects);
-        at = mettle_live_text(at, " heap objects converted");
+        if (mettle_live_converted_objects == 1) {
+            at = mettle_live_text(at, " heap object converted");
+        } else {
+            at = mettle_live_text(at, " heap objects converted");
+        }
     }
     mettle_live_send(at);
     return 1;

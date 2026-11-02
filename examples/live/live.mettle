@@ -1,0 +1,59 @@
+import "std/io"
+import "std/conv"
+import "std/thread"
+
+struct Ship {
+    x: float64
+    y: float64
+    fuel: float64
+}
+
+var frame: int64 = 0;
+var docked: int64 = 0;
+
+fn steer(ship: Ship*) {
+    ship->x = ship->x + 1.5;
+    ship->y = ship->y + 0.5;
+    ship->fuel = ship->fuel - 0.25;
+}
+
+fn dock(ship: Ship*) {
+    if (ship->fuel < 10.0) {
+        ship->fuel = 100.0;
+        docked = docked + 1;
+    }
+}
+
+fn report(fleet: Ship[]) {
+    println("frame {frame} lead x={fleet[0].x} y={fleet[0].y} fuel={fleet[0].fuel} docked={docked}");
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+    var frames: int64 = 200;
+    if (argc > 1) {
+        frames = (int64)atoi(argv[1]);
+    }
+    var fleet: Ship[] = new Ship[4];
+    var i: int64 = 0;
+    while (i < 4) {
+        fleet[i].fuel = 100.0 - (float64)(i * 20);
+        i = i + 1;
+    }
+    while (frame < frames) {
+        quiesce;
+        var k: int64 = 0;
+        while (k < 4) {
+            steer(&fleet[k]);
+            dock(&fleet[k]);
+            k = k + 1;
+        }
+        if (frame % 20 == 0) {
+            report(fleet);
+        }
+        frame = frame + 1;
+        if (frames > 200) {
+            thread_sleep_ms((uint32)50);
+        }
+    }
+    return 0;
+}
