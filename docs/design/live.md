@@ -11,8 +11,8 @@ architecture of the parts that are built.
 1. Any function body, with no annotation, in an optimized build. **M1, built.**
 2. Function signatures; callers are recompiled into the same patch. **M2,
    built.**
-3. Layouts: module-scope variables and frame locals convert to their new
-   types. **M3, built for variables and frames.** Heap objects are next.
+3. Layouts: module-scope variables, frame locals and heap objects convert to
+   their new types. **M3, built.**
 4. Every function on the stack, the main loop included. **M4, built.**
 5. Representations: an array becomes a map, an array of structs becomes a
    struct of arrays. M5.
@@ -191,11 +191,12 @@ x<n>                         anything else, n opaque bytes
 ```
 
 The state file keeps the descriptor of every variable (`t` lines). When the
-patch builder resolves a reference to a variable whose descriptor or size
-changed, it places the variable at new storage in the arena, puts both
-descriptors in the blob, adds a migration entry (old rva, new rva, size, old
-descriptor, new descriptor), and adds every function that refers to the
-variable to the patch, so no code is left reading the old storage.
+patch builder resolves a reference to a variable whose descriptor changed, it
+puts both descriptors in the blob and adds a migration entry (old rva, new
+rva, size, old descriptor, new descriptor). The variable converts in place
+when the new layout fits the room the host left after it (see below);
+otherwise it moves to new storage in the arena, and every function that
+refers to it joins the patch, so no code is left reading the old storage.
 
 The loader zeroes the new storage and converts with every other thread
 stopped. Conversion walks the new descriptor: struct fields match by name at
@@ -208,11 +209,36 @@ Frames use the same conversion. `mettle_live_frame_put` records each local's
 descriptor with its value, and `mettle_live_frame_take` converts into the new
 local when the descriptors differ.
 
-Next: heap objects. A live build can give every allocation a header with its
-type's descriptor, so a migration finds every object of a changed type and
-converts it, and pointers into moved storage can be rewritten from the same
-descriptors. Types reachable only through `rawptr` or integers would be
-refused by name.
+Heap objects convert in place. In a live build, lowering turns `new T` and
+`new T[n]` of a struct type into an allocation of `size + size / 4 + 16`
+bytes (`size + max(size / 4, 16)` for one object) followed by `mettle_live_track(pointer, element size, count, capacity,
+name, descriptor)`. The runtime keeps an open-addressed table keyed by
+address, and the owned allocator calls back on `free` (the entry goes) and
+`realloc` (the entry follows the block). Lowering also records each tracked
+type's descriptor; the state file keeps them (`y` lines), and a patch whose
+type descriptor differs carries a type migration (kind 1 in the migration
+table: name, old descriptor, new descriptor).
+
+The loader takes the table's lock before it stops the other threads, checks
+that every object of the type has room (`count * new size <= capacity`),
+and refuses the whole patch if one does not. Otherwise it converts each
+object through a scratch copy and records the new descriptor on it. Each
+object converts from the descriptor it was allocated with, so objects that old
+code made after an earlier patch still convert correctly. Undo converts back.
+
+The table costs about 40 ns per `new` and `free` pair of a small struct: two
+million pairs of a 16-byte node take 150 ms in a live build and 70 ms in a
+normal one. An arena for tracked objects, with the type in a block header and
+a range check on `free`, would remove the table and most of that cost.
+
+Module-scope variables get the same treatment through slack: a live build
+emits zero bytes after every variable (8 after a scalar, `size / 2 + 64` after
+anything larger, at most 64 KB), so the
+state file's size for it is its capacity. When the new layout fits, the patch
+carries a migration whose old and new address are the same, and the loader
+converts through a scratch copy. Only a variable that outgrows its room moves
+to the arena, and pointers into its old storage then keep the old value;
+rewriting them needs pointer types in descriptors (`p8` carries no pointee).
 
 ## M4: every frame moves
 
@@ -359,5 +385,9 @@ program and polls source modification times.
 - M7, rewind and timelines: with M6 snapshots, a crash rewinds memory to the
   last snapshot before it continues. One snapshot can fan out into K forks,
   each with a different patch, and the results are compared side by side.
+- GPU kernels: programs load PTX and keep `gpu_func` handles themselves, so a
+  patch cannot reach them. Launches by kernel name through a runtime table,
+  which a patch refills from freshly loaded PTX, would let kernels change with
+  the host code.
 - M8, fleets: patches carry a logical tick. Generated wire formats carry their
   own migrations, so old and new nodes can talk during a rollout.

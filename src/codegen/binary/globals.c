@@ -262,6 +262,18 @@ IRFunction *code_generator_find_ir_function_binary(CodeGenerator *generator,
   return NULL;
 }
 
+static int binary_live_slack(CodeGenerator *generator, BinaryEmitter *emitter,
+                             size_t section, size_t size) {
+  size_t slack = size <= 8u ? 8u : size / 2u + 64u;
+  if (!generator->live) {
+    return 1;
+  }
+  if (slack > 65536u) {
+    slack = 65536u;
+  }
+  return binary_emitter_append_zeros(emitter, section, slack, NULL);
+}
+
 static int code_generator_binary_emit_global_aggregate_image(
     CodeGenerator *generator, const char *link_name, const IRModuleSymbol *sym,
     size_t alignment) {
@@ -354,7 +366,9 @@ static int code_generator_binary_emit_global_aggregate_image(
 
   if (!binary_emitter_define_symbol(emitter, link_name, BINARY_SYMBOL_GLOBAL,
                                     data_section, image_offset,
-                                    sym->init_bytes_size)) {
+                                    sym->init_bytes_size) ||
+      !binary_live_slack(generator, emitter, data_section,
+                         sym->init_bytes_size)) {
     code_generator_binary_emitter_error(
         generator, emitter, "Failed to define aggregate global symbol");
     return 0;
@@ -464,7 +478,9 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
     }
     if (!binary_emitter_define_symbol(emitter, link_name, BINARY_SYMBOL_GLOBAL,
                                       aggregate_section, aggregate_offset,
-                                      aggregate_size)) {
+                                      aggregate_size) ||
+        !binary_live_slack(generator, emitter, aggregate_section,
+                           aggregate_size)) {
       code_generator_binary_emitter_error(
         generator, emitter, "Failed to define global aggregate symbol");
       return 0;
@@ -669,7 +685,8 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
   }
 
   if (!binary_emitter_define_symbol(emitter, link_name, BINARY_SYMBOL_GLOBAL,
-                                    section_index, value_offset, (size_t)size)) {
+                                    section_index, value_offset, (size_t)size) ||
+      !binary_live_slack(generator, emitter, section_index, (size_t)size)) {
     code_generator_binary_emitter_error(
         generator, emitter, "Failed to define global variable symbol");
     return 0;

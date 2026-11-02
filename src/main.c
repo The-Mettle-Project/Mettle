@@ -5093,6 +5093,11 @@ int main(int argc, char *argv[]) {
                summary.converted_globals,
                summary.converted_globals == 1u ? "" : "s");
       }
+      if (summary.converted_types) {
+        printf(", %zu heap type%s converted to a new layout",
+               summary.converted_types,
+               summary.converted_types == 1u ? "" : "s");
+      }
       printf(")\n");
       if (summary.moving[0]) {
         printf("  running frames of %s move to the new code at the next "
@@ -5738,7 +5743,11 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
       ir_lower_program(program, type_checker, symbol_table, out_ir_error,
                        emit_runtime_checks, emit_safety_checks);
   if (*out_ir_program) {
+    const char *const *type_names = NULL;
+    const char *const *type_layouts = NULL;
+    size_t type_count = ir_lower_live_type_layouts(&type_names, &type_layouts);
     live_record_global_layouts(*out_ir_program);
+    live_set_type_layouts(type_names, type_layouts, type_count);
   }
   if (!*out_ir_program) {
     if (type_checker && type_checker->error_reporter &&

@@ -103,6 +103,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   context.assume_no_signed_overflow = g_ir_lowering_assume_no_signed_overflow;
   context.program = ir_program;
   ir_lower_live_forget_sources();
+  ir_lower_live_forget_heap_types();
 
   Program *program_data = (Program *)program->data;
   if (!program_data) {

@@ -5,6 +5,7 @@
 
 #define IR_LIVE_CHECK_NAME "mettle_live_site_check"
 #define IR_LIVE_LEAVE_NAME "mettle_live_site_leave_here"
+#define IR_LIVE_TRACK_NAME "mettle_live_track"
 #define IR_LIVE_MOVED_NAME "mettle_live_frame_moved"
 #define IR_LIVE_PUT_NAME "mettle_live_frame_put"
 #define IR_LIVE_TAKE_NAME "mettle_live_frame_take"
@@ -1158,6 +1159,10 @@ typedef struct {
 static IRLiveLines *g_ir_live_lines = NULL;
 static size_t g_ir_live_line_files = 0;
 
+static char **g_ir_live_type_names = NULL;
+static char **g_ir_live_type_texts = NULL;
+static size_t g_ir_live_type_count = 0;
+
 void ir_lower_live_forget_sources(void) {
   for (size_t i = 0; i < g_ir_live_line_files; i++) {
     free(g_ir_live_lines[i].starts);
@@ -1165,6 +1170,108 @@ void ir_lower_live_forget_sources(void) {
   free(g_ir_live_lines);
   g_ir_live_lines = NULL;
   g_ir_live_line_files = 0;
+}
+
+void ir_lower_live_forget_heap_types(void) {
+  for (size_t i = 0; i < g_ir_live_type_count; i++) {
+    free(g_ir_live_type_names[i]);
+    free(g_ir_live_type_texts[i]);
+  }
+  free(g_ir_live_type_names);
+  free(g_ir_live_type_texts);
+  g_ir_live_type_names = NULL;
+  g_ir_live_type_texts = NULL;
+  g_ir_live_type_count = 0;
+}
+
+size_t ir_lower_live_type_layouts(const char *const **names,
+                                  const char *const **layouts) {
+  *names = (const char *const *)g_ir_live_type_names;
+  *layouts = (const char *const *)g_ir_live_type_texts;
+  return g_ir_live_type_count;
+}
+
+static int ir_live_remember_type(const char *name, const char *layout) {
+  char **names;
+  char **texts;
+  for (size_t i = 0; i < g_ir_live_type_count; i++) {
+    if (strcmp(g_ir_live_type_names[i], name) == 0) {
+      return 1;
+    }
+  }
+  names = realloc(g_ir_live_type_names,
+                  (g_ir_live_type_count + 1u) * sizeof(char *));
+  if (!names) {
+    return 0;
+  }
+  g_ir_live_type_names = names;
+  texts = realloc(g_ir_live_type_texts,
+                  (g_ir_live_type_count + 1u) * sizeof(char *));
+  if (!texts) {
+    return 0;
+  }
+  g_ir_live_type_texts = texts;
+  g_ir_live_type_names[g_ir_live_type_count] = mettle_strdup(name);
+  g_ir_live_type_texts[g_ir_live_type_count] = mettle_strdup(layout);
+  if (!g_ir_live_type_names[g_ir_live_type_count] ||
+      !g_ir_live_type_texts[g_ir_live_type_count]) {
+    return 0;
+  }
+  g_ir_live_type_count++;
+  return 1;
+}
+
+int ir_lower_live_heap_type(const Type *type) {
+  return g_ir_lowering_live && type && type->kind == TYPE_STRUCT &&
+         type->name && type->size > 0;
+}
+
+int ir_lower_live_capacity(IRLoweringContext *context, IRFunction *function,
+                           const IROperand *bytes, IROperand *capacity,
+                           SourceLocation location) {
+  IROperand half = ir_live_new_temp(context);
+  IROperand grown = ir_live_new_temp(context);
+  int ok = ir_live_emit_simple(context, function, IR_OP_BINARY,
+                               ir_operand_copy(&half), ir_operand_copy(bytes),
+                               ir_operand_int(4), "/", location) &&
+           ir_live_emit_simple(context, function, IR_OP_BINARY,
+                               ir_operand_copy(&grown), ir_operand_copy(bytes),
+                               ir_operand_copy(&half), "+", location) &&
+           ir_live_emit_simple(context, function, IR_OP_BINARY,
+                               ir_operand_copy(capacity),
+                               ir_operand_copy(&grown), ir_operand_int(16),
+                               "+", location);
+  ir_operand_destroy(&half);
+  ir_operand_destroy(&grown);
+  return ok;
+}
+
+int ir_lower_live_track(IRLoweringContext *context, IRFunction *function,
+                        const IROperand *pointer, const Type *type,
+                        const IROperand *count, const IROperand *capacity,
+                        SourceLocation location) {
+  IROperand arguments[6];
+  char *layout = ir_lower_live_descriptor(mtlc_type_from_frontend(type));
+  int ok;
+  if (!layout || !ir_live_remember_type(type->name, layout)) {
+    free(layout);
+    ir_set_error(context, "Out of memory describing a live heap type");
+    return 0;
+  }
+  ir_live_declare(context, IR_LIVE_TRACK_NAME, "iiiiss");
+  arguments[0] = ir_operand_copy(pointer);
+  arguments[1] = ir_operand_int((long long)type->size);
+  arguments[2] = count ? ir_operand_copy(count) : ir_operand_int(1);
+  arguments[3] = ir_operand_copy(capacity);
+  arguments[4] = ir_operand_string(type->name);
+  arguments[5] = ir_operand_string(layout);
+  ok = ir_live_emit_call(context, function, IR_LIVE_TRACK_NAME, arguments, 6,
+                         NULL, location);
+  for (size_t i = 0; i < 6; i++) {
+    ir_operand_destroy(&arguments[i]);
+  }
+  free(layout);
+  return ok;
 }
 
 static const IRLiveLines *ir_live_lines_for(const char *source) {

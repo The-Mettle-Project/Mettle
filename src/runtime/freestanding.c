@@ -24,6 +24,14 @@ int isspace(int character);
 int tolower(int character);
 void *malloc(mt_size size);
 void free(void *memory);
+
+static void (*mt_live_forget_hook)(void *memory) = 0;
+static void (*mt_live_moved_hook)(void *from, void *to) = 0;
+
+void mettle_set_live_heap_hooks(void *forget, void *moved) {
+  mt_live_forget_hook = (void (*)(void *))forget;
+  mt_live_moved_hook = (void (*)(void *, void *))moved;
+}
 struct MtFile;
 static int mt_stream_flush(struct MtFile *file);
 static void mt_open_write_track(struct MtFile *file);
@@ -1132,6 +1140,9 @@ void free(void *memory) {
   if (!memory) {
     return;
   }
+  if (mt_live_forget_hook) {
+    mt_live_forget_hook(memory);
+  }
   if (mt_win_owns(memory)) {
     int class_index = mt_win_class_at(memory);
 
@@ -1166,10 +1177,19 @@ void *realloc(void *memory, mt_size size) {
       return MT_NULL;
     }
     memcpy(replacement, memory, held);
+    if (mt_live_moved_hook) {
+      mt_live_moved_hook(memory, replacement);
+    }
     free(memory);
     return replacement;
   }
-  return HeapReAlloc(GetProcessHeap(), 0, memory, size);
+  {
+    void *moved = HeapReAlloc(GetProcessHeap(), 0, memory, size);
+    if (moved && moved != memory && mt_live_moved_hook) {
+      mt_live_moved_hook(memory, moved);
+    }
+    return moved;
+  }
 }
 
 typedef struct MtEmutlsControl {
@@ -2928,6 +2948,9 @@ void free(void *memory) {
   if (!memory) {
     return;
   }
+  if (mt_live_forget_hook) {
+    mt_live_forget_hook(memory);
+  }
   mt_u64 *base = (mt_u64 *)memory - 2;
   if (base[0] == 0 ||
       (base[0] > MT_HEAP_CLASS_COUNT && base[0] != base[1] + MT_HEAP_HEADER)) {
@@ -2968,6 +2991,9 @@ void *realloc(void *memory, mt_size size) {
     return MT_NULL;
   }
   memcpy(replacement, memory, old_size < size ? old_size : size);
+  if (mt_live_moved_hook) {
+    mt_live_moved_hook(memory, replacement);
+  }
   free(memory);
   return replacement;
 }

@@ -3,8 +3,8 @@
 `mettle live` runs a program and changes it while it runs. Every save of a
 `.mettle` file the program was built from becomes a patch, and the program
 takes the patch at its next `quiesce;`. Nothing in the source is annotated.
-The program keeps all of its state, and every frame on the stack moves to the
-new code.
+The program keeps all of its state, every frame on the stack moves to the new
+code, and a fault waits for the save that fixes it.
 
 ```bash
 mettle live game.mettle
@@ -36,9 +36,9 @@ Windows x64 and Linux x64.
   [Moving running frames](#moving-running-frames).
 - Function signatures. Callers are patched with them, and frames on the stack
   move before they could call the old way.
-- The layout of a module-scope variable: struct fields added, removed,
-  reordered or retyped, arrays grown or shrunk. See
-  [Layouts](#layouts).
+- The layout of a module-scope variable or of a struct the program creates
+  with `new`: fields added, removed, reordered or retyped, arrays grown or
+  shrunk. See [Layouts](#layouts).
 - New functions, new module-scope variables with their initial values, string
   literals and constant data.
 - On Windows, functions imported from DLLs the program never called before:
@@ -94,13 +94,13 @@ they are next called.
 
 ## Layouts
 
-When the type of a module-scope variable changed, the patch carries the old
-and new layout of the variable and new storage for it. The running program
-converts the value into the new storage, with every thread stopped, before any
-new code runs.
+When a struct or the type of a module-scope variable changes, the patch
+carries the old and new layout. The running program converts every value of
+it, with every thread stopped, before any new code runs:
 
 ```text
-Patch 1: step, main (14224 bytes, 2 globals converted to a new layout)
+Patch 1: step, main (18241 bytes, 1 heap type converted to a new layout)
+[live] patch 1: 2 functions, 2 heap objects converted
 ```
 
 Fields match by name at any depth. A field that is new starts at zero. An
@@ -109,9 +109,18 @@ integer field that became `int64`, a `float32` that became `float64`, a
 values. A field whose new type cannot hold the old value, a struct that became
 an integer for example, starts at zero.
 
-Pointers that other variables or the heap hold into the old storage keep
-pointing at it, and the old storage keeps the value it had at the patch.
-Objects on the heap keep their old layout.
+Values convert in place, so pointers to them stay valid. A live build leaves
+room for that:
+
+- `new T` and `new T[n]` of a struct type get room to grow by a quarter of
+  their size, and by at least 16 bytes, and the runtime remembers each
+  object's address, count and layout until it is freed. This costs about
+  40 ns per `new` and `free` of a small struct. An object with no room for its new layout makes the
+  running program refuse the patch, and it keeps running the code it has.
+- Every module-scope variable gets 8 spare bytes after a scalar, or half its
+  size plus 64 after anything larger, at most 64 KB. A variable that outgrows
+  its room moves to new storage, and pointers into the old storage keep the
+  value it had at the patch.
 
 ## Undo
 
