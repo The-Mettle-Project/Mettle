@@ -19,6 +19,7 @@ tmp_repro/
 *.live.files
 *.live.watched
 /examples/live/live
+/examples/settle/settle
 *.o
 *.obj
 *.s

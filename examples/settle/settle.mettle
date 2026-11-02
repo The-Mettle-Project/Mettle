@@ -1,0 +1,82 @@
+import "std/io"
+import "std/conv"
+import "std/thread"
+
+struct Merchant {
+    sales: int64
+    count: int64
+}
+
+fn mix(record: int64) -> int64 {
+    var x: int64 = record * 2654435761;
+    x = x ^ (x >> 15);
+    return x & 0x7FFFFFFF;
+}
+
+fn merchant_of(record: int64) -> int64 {
+    if (record == 1500000) {
+        return 9001;
+    }
+    return mix(record) % 64;
+}
+
+fn cents_of(record: int64) -> int64 {
+    var cents: int64 = mix(record + 7) % 20000;
+    if (record % 11 == 0) {
+        return -cents;
+    }
+    return cents;
+}
+
+fn post(book: Merchant[], record: int64) {
+    var merchant: int64 = merchant_of(record);
+    var cents: int64 = cents_of(record);
+    book[merchant].sales = book[merchant].sales + cents;
+    book[merchant].count = book[merchant].count + 1;
+}
+
+fn report(book: Merchant[], done: int64) {
+    var settled: int64 = 0;
+    var m: int64 = 0;
+    while (m < 64) {
+        settled = settled + book[m].sales;
+        m = m + 1;
+    }
+    println("{done} records, {settled / 100} dollars settled");
+}
+
+fn checksum(book: Merchant[]) -> int64 {
+    var sum: int64 = 0;
+    var m: int64 = 0;
+    while (m < 64) {
+        sum = (sum * 31 + book[m].sales * 7 + book[m].count) & 0xFFFFFFFFFFFF;
+        m = m + 1;
+    }
+    return sum;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+    var records: int64 = 500000;
+    var pause: int64 = 0;
+    if (argc > 1) {
+        records = (int64)atoi(argv[1]);
+    }
+    if (argc > 2) {
+        pause = (int64)atoi(argv[2]);
+    }
+    var book: Merchant[] = new Merchant[64];
+    var record: int64 = 0;
+    while (record < records) {
+        quiesce;
+        post(book, record);
+        record = record + 1;
+        if (record % 500000 == 0) {
+            report(book, record);
+        }
+        if (pause > 0 && record % 2000 == 0) {
+            thread_sleep_ms((uint32)pause);
+        }
+    }
+    println("checksum {checksum(book)}");
+    return 0;
+}

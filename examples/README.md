@@ -28,6 +28,10 @@ window, the blit, and the wave device. See [`video_player/README.md`](video_play
 [`live/`](live/) is a fleet of ships to change while it runs: a function, a
 struct on the heap, a crash and an undo. See [`live/README.md`](live/README.md).
 
+[`settle/`](settle/) is a settlement job that faults on a corrupt record, takes
+a fix while it waits, and ends on the same checksum as a run that never
+stopped. See [`settle/README.md`](settle/README.md).
+
 ## Execution models
 
 [`job_system/`](job_system/) is a job queue on `std/thread` with a swap point
