@@ -1293,6 +1293,8 @@ static int expand_one_round(TypeChecker *checker, ASTNode *block,
   memcpy(children, expanded, expanded_count * sizeof(ASTNode *));
   block->children = children;
   block->child_count = expanded_count;
+  block->child_capacity = 0;
+  block->child_capacity_owner = NULL;
   return 1;
 }
 

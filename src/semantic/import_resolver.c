@@ -4313,6 +4313,10 @@ process_imports_cleanup:
   prog_data->declaration_count = new_declaration_count;
 
   free(program->children);
+  program->children = NULL;
+  program->child_count = 0;
+  program->child_capacity = 0;
+  program->child_capacity_owner = NULL;
   if (new_declaration_count > 0) {
     program->children = malloc(new_declaration_count * sizeof(ASTNode *));
     if (!program->children) {
