@@ -1,0 +1,9 @@
+struct Pair { a: int32; b: int32; }
+fn priv_double(x: int32) -> int32 { return x * 2; }
+var g_k: int32 = 10;
+export fn mk(x: int32) -> int32 { var p: Pair = { a: priv_double(x), b: g_k }; return p.a + p.b; }
+export fn arr(x: int32) -> int32 { var a: int32[2] = [priv_double(x), g_k]; return a[0] + a[1]; }
+export fn lam(x: int32) -> int32 {
+  var f: Fn(int32) -> int32 = fn(y: int32) -> int32 { return priv_double(y) + g_k; };
+  return f(x);
+}

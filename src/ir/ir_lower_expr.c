@@ -3160,7 +3160,8 @@ static int ir_lower_identifier_value(IRLoweringContext *context, IRFunction *fun
       return 1;
     }
     Symbol *symbol =
-        context->symbol_table
+        context->symbol_table &&
+                !ir_local_binding_find(context, identifier->name)
             ? symbol_table_lookup(context->symbol_table, identifier->name)
             : NULL;
     if (symbol && symbol->kind == SYMBOL_CONSTANT) {

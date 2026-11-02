@@ -1,0 +1,7 @@
+import "std/io";
+const LIMIT: int32 = 5;
+fn main() -> int32 {
+  var LIMIT: int32 = 9;
+  println("{LIMIT} (want 9)");
+  return 0;
+}

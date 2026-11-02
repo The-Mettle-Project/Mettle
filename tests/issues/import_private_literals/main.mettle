@@ -1,0 +1,7 @@
+import "std/io";
+import "lib/f";
+import "lib/e" as e;
+fn main() -> int32 {
+  println("{mk(3)} {arr(3)} {lam(3)} {e.viaE(4)}");
+  return 0;
+}

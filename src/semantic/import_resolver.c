@@ -1705,6 +1705,29 @@ static int rewrite_call_names(ASTNode *node, const NameRewrite *rewrites,
     return 1;
   }
 
+  case AST_AGGREGATE_LITERAL: {
+    AggregateLiteral *aggregate = (AggregateLiteral *)node->data;
+    if (!aggregate) {
+      return 1;
+    }
+    for (size_t i = 0; i < aggregate->element_count; i++) {
+      if (!rewrite_node_names(aggregate->elements[i], rewrites, rewrite_count,
+                              bindings, binding_count, scope, 1)) {
+        return 0;
+      }
+    }
+    if (aggregate->repeat_count &&
+        !rewrite_node_names(aggregate->repeat_count, rewrites, rewrite_count,
+                            bindings, binding_count, scope, 1)) {
+      return 0;
+    }
+    return 1;
+  }
+
+  case AST_LAMBDA_EXPRESSION:
+    return rewrite_function_declaration_names(node, rewrites, rewrite_count,
+                                              bindings, binding_count, scope);
+
   case AST_FUNC_PTR_CALL: {
     FuncPtrCall *fp_call = (FuncPtrCall *)node->data;
     if (!fp_call) {
@@ -2012,6 +2035,7 @@ static int rewrite_function_declaration_names(ASTNode *node,
                                               size_t binding_count,
                                               RewriteScope *scope) {
   switch (node->type) {
+  case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION:
   case AST_METHOD_DECLARATION: {
     FunctionDeclaration *func_decl = (FunctionDeclaration *)node->data;
@@ -2021,7 +2045,7 @@ static int rewrite_function_declaration_names(ASTNode *node,
       return 1;
     }
 
-    if (!scope &&
+    if (!scope && func_decl->name &&
         !rename_string_if_needed(&func_decl->name, rewrites, rewrite_count)) {
       return 0;
     }
@@ -2857,6 +2881,7 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     }
     return;
   }
+  case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION:
   case AST_METHOD_DECLARATION:
   case AST_STRUCT_DECLARATION:
@@ -2867,6 +2892,19 @@ static void collect_dependency_names(ASTNode *node, char ***names,
   case AST_IMPL_DECLARATION:
     collect_declaration_dependency_names(node, names, count, capacity);
     return;
+  case AST_AGGREGATE_LITERAL: {
+    AggregateLiteral *aggregate = (AggregateLiteral *)node->data;
+    if (!aggregate) {
+      return;
+    }
+    for (size_t i = 0; i < aggregate->element_count; i++) {
+      collect_dependency_names(aggregate->elements[i], names, count, capacity);
+    }
+    if (aggregate->repeat_count) {
+      collect_dependency_names(aggregate->repeat_count, names, count, capacity);
+    }
+    return;
+  }
   case AST_FUNCTION_CALL: {
     CallExpression *call = (CallExpression *)node->data;
     if (!call) {
@@ -3047,6 +3085,7 @@ static void collect_declaration_dependency_names(ASTNode *node, char ***names,
                                                  size_t *count,
                                                  size_t *capacity) {
   switch (node->type) {
+  case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION:
   case AST_METHOD_DECLARATION: {
     FunctionDeclaration *func = (FunctionDeclaration *)node->data;

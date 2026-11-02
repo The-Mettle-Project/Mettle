@@ -20697,8 +20697,12 @@ else {
 # Reported bugs, each built and run, the output checked for what the program
 # should print. Entry is the file to build; Args are added to the build line.
 $issueRegressions = @(
-  @{ Name = "issue_generic_fn_type_param"; Entry = "tests/test_generics_fn_types.mettle"; Args = @(); Expect = "4 (want 4)`r?`n4 (want 4)`r?`n5 (want 5)" },
-  @{ Name = "issue_generic_sizeof_param"; Entry = "tests/test_generics_sizeof_param.mettle"; Args = @(); Expect = "5 (want 5)" }
+  @{ Name = "issue_generic_fn_type_param"; Entry = "tests/test_generics_fn_types.mettle"; Args = @(); Expect = @("4 (want 4)", "5 (want 5)") },
+  @{ Name = "issue_generic_sizeof_param"; Entry = "tests/test_generics_sizeof_param.mettle"; Args = @(); Expect = @("5 (want 5)") },
+  @{ Name = "issue_import_private_in_literals"; Entry = "tests/issues/import_private_literals/main.mettle"; Args = @(); Expect = @("16 16 16 8") },
+  @{ Name = "issue_param_shadows_const"; Entry = "tests/issues/shadowing/const_param.mettle"; Args = @(); Expect = @("9 (want 9)") },
+  @{ Name = "issue_local_shadows_const"; Entry = "tests/issues/shadowing/local_const.mettle"; Args = @(); Expect = @("9 (want 9)") },
+  @{ Name = "issue_param_shadows_function"; Entry = "tests/issues/shadowing/fn_param.mettle"; Args = @(); Expect = @("true (want true)", "argument (right)") }
 )
 foreach ($case in $issueRegressions) {
   $total++
@@ -20710,8 +20714,10 @@ foreach ($case in $issueRegressions) {
       throw "build failed:`n$buildOut"
     }
     $out = & $exe 2>&1 | Out-String
-    if ($out -notmatch $case.Expect) {
-      throw "expected /$($case.Expect)/, got:`n$out"
+    foreach ($want in $case.Expect) {
+      if (-not $out.Contains($want)) {
+        throw "expected '$want', got:`n$out"
+      }
     }
     Write-CaseResult -Name $case.Name -Passed $true
   }

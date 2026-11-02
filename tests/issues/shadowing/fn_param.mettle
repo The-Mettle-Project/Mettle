@@ -1,0 +1,10 @@
+import "std/io";
+fn hello() { println("global hello (WRONG)"); }
+fn other() { println("argument (right)"); }
+fn is_null(hello: fn() -> void) -> bool { return hello == 0; }
+fn run(hello: fn() -> void) { var g: fn() -> void = hello; g(); }
+fn main() -> int32 {
+  println("{is_null((fn() -> void)0)} (want true)");
+  run(&other);
+  return 0;
+}

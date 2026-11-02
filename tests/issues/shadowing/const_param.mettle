@@ -1,0 +1,8 @@
+import "std/io";
+const LIMIT: int32 = 5;
+fn show(LIMIT: int32) -> int32 { return LIMIT; }
+fn main() -> int32 {
+  var LOCAL_OK: int32 = show(9);
+  println("{LOCAL_OK} (want 9)");
+  return 0;
+}
