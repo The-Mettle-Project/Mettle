@@ -1,0 +1,33 @@
+import "std/io";
+
+struct P { text: string; pos: int64; }
+
+fn slen(s: string) -> int64 { return (int64)s.length; }
+fn s_byte(s: string, i: int64) -> int32 { return (int32)s.chars[i]; }
+fn s_view(p: uint8*, n: int64) -> string { var s: string; return s; }
+fn s_sub(s: string, a: int64, b: int64) -> string { return s_view(&s.chars[a], b - a); }
+fn s_eq(a: string, b: string) -> bool {
+  var n: int64 = slen(a);
+  var i: int64 = 0;
+  while (i < n) { if (a.chars[i] != b.chars[i]) { } }
+  return true;
+}
+
+fn f(p: P*) -> int32 {
+  var start: int64 = p->pos;
+  var word: string = s_sub(p->text, start, p->pos);
+  if (s_eq(word, "true") || s_eq(word, "false")) { }
+  var i: int64 = 0;
+  var ok: bool = slen(word) > 0;
+  while (ok && i < slen(word)) {
+    var sep: bool = s_byte(word, i) == 95 && i + 1 < slen(word) && s_byte(word, i + 1) > 47;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var p: P* = new P;
+  p->text = "true";
+  print("{f(p)}\n");
+  return 0;
+}

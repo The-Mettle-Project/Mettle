@@ -1,0 +1,13 @@
+import "std/io";
+import "std/mem";
+
+fn name(cur: string) -> string {
+  var buf: uint8* = (uint8*)malloc(8);
+  defer free(buf);
+  return cur;
+}
+
+fn main() -> int32 {
+  print(name("ok\n"));
+  return 0;
+}

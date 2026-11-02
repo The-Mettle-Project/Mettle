@@ -529,7 +529,7 @@ typedef struct {
   size_t partners[IR_SROA_MAX_GROUP];
   size_t partner_count;
   size_t addr_count;
-  int visited;
+  size_t visited;
 } IRSroaRec;
 
 static void ir_sroa_rec_add_partner(IRSroaRec *recs, size_t owner,
@@ -872,7 +872,7 @@ static int ir_sroa_round(IRFunction *function, int *changed,
     }
     size_t comp_count = 0, stack_count = 0;
     int comp_ok = 1;
-    recs[r].visited = 1;
+    recs[r].visited = r + 1;
     stack[stack_count++] = r;
     while (stack_count > 0) {
       size_t cur = stack[--stack_count];
@@ -883,8 +883,11 @@ static int ir_sroa_round(IRFunction *function, int *changed,
       comp[comp_count++] = cur;
       for (size_t p = 0; p < recs[cur].partner_count; p++) {
         size_t nxt = recs[cur].partners[p];
+        if (recs[nxt].visited && recs[nxt].visited != r + 1) {
+          comp_ok = 0;
+        }
         if (!recs[nxt].visited) {
-          recs[nxt].visited = 1;
+          recs[nxt].visited = r + 1;
           if (stack_count >= IR_SROA_MAX_GROUP) {
             comp_ok = 0;
             break;

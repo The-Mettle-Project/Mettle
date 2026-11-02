@@ -20709,7 +20709,9 @@ $issueRegressions = @(
   @{ Name = "issue_directory_does_not_shadow_module"; Entry = "tests/issues/dir_shadow/main.mettle"; Args = @(); Expect = @("1") },
   @{ Name = "issue_generic_call_as_match_subject"; Entry = "tests/issues/generic_match/match_subject.mettle"; Args = @(); Expect = @("7") },
   @{ Name = "issue_literal_adapts_to_inferred_type_param"; Entry = "tests/issues/generic_match/literal_adapt.mettle"; Args = @(); Expect = @("5") },
-  @{ Name = "issue_trace_keeps_trailing_flags"; Command = @("trace", "tests/issues/trace_flags/main.mettle", "go", "3", "-I", "tests/issues/trace_flags/lib"); Expect = @("returns 6") }
+  @{ Name = "issue_trace_keeps_trailing_flags"; Command = @("trace", "tests/issues/trace_flags/main.mettle", "go", "3", "-I", "tests/issues/trace_flags/lib"); Expect = @("returns 6") },
+  @{ Name = "issue_sroa_group_after_failed_component"; Entry = "tests/issues/string_inline/global_access.mettle"; Args = @("--release"); Expect = @("0") },
+  @{ Name = "issue_defer_in_string_returning_function"; Entry = "tests/issues/string_inline/indirect_agg.mettle"; Args = @("-O"); Expect = @("ok") }
 )
 foreach ($case in $issueRegressions) {
   $total++

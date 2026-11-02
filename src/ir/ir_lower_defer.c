@@ -303,6 +303,8 @@ static int ir_emit_errdefer_condition(IRLoweringContext *context,
   if (!value_type || value_type->kind != TYPE_TAGGED_ENUM) {
     Type *shape = declared ? declared : value_type;
     int aggregate = shape && (shape->kind == TYPE_STRUCT ||
+                              shape->kind == TYPE_STRING ||
+                              shape->kind == TYPE_SLICE ||
                               shape->kind == TYPE_ARRAY ||
                               shape->kind == TYPE_FLOAT32 ||
                               shape->kind == TYPE_FLOAT64 ||
