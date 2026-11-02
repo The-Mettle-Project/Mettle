@@ -186,8 +186,8 @@ when:
   for new and converted variables
 
 The running program refuses a patch, prints the reason and keeps running, when
-an import cannot be bound or the code cannot be placed within 2 GB of the
-image.
+an import cannot be bound, the code cannot be placed within 2 GB of the image,
+or an object on the heap has no room for its new layout.
 
 ## The pieces
 
