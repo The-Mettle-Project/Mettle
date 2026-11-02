@@ -137,12 +137,11 @@ original build.
 
 ## Threads
 
-Patches apply on the thread that reaches `quiesce;`. On Windows every other
-thread is suspended while slots are stored and variables are converted. On
-Linux the other threads keep running, and each function entry is rewritten by
-one aligned eight-byte store, so a thread calls either the old or the new
-function. A frame
-moves only on the thread that runs it, at its own next site.
+Patches apply on the thread that reaches `quiesce;`, with every other thread
+of the program stopped: suspended on Windows, parked by a signal on Linux.
+Slots, function entries and converted values all change while nothing else
+runs. A frame moves only on the thread that runs it, at its own next site. On
+Linux a thread that was sleeping when a patch landed wakes early.
 
 ## Crashes
 

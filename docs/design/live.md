@@ -366,12 +366,13 @@ at their next site, the same way they moved forward.
 
 ## Threads
 
-A patch applies on the thread that reaches `quiesce;`. On Windows the loader
-suspends every other thread of the process while it converts and swaps. On
-Linux the other threads run on; each entry is one aligned eight-byte store,
-and a migration on Linux is only safe when the other threads do not touch the
-migrated variables while it runs. A frame moves only on its own thread, at its
-own next site.
+A patch applies on the thread that reaches `quiesce;`. The loader stops every
+other thread first: Windows suspends them with `SuspendThread`; Linux lists
+`/proc/self/task`, sends each thread signal 40 with `tgkill`, and waits until
+each has entered a handler that spins on a flag (with `SA_RESTART`, so most
+interrupted system calls resume; a sleep returns early). The heap lock is
+taken before the stop, so no stopped thread can hold it. A frame moves only on
+its own thread, at its own next site.
 
 ## Linux
 
