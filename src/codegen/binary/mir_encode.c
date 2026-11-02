@@ -3928,8 +3928,8 @@ static int mir_encode_trap(MirEncodeState *st, const MirInst *in) {
   (void)i;
   switch (in->op) {
     case MIR_TRAP: {
-      if (fn->generator->generate_stack_trace_support && fn->ir_function &&
-          in->ir_index >= 0 &&
+      if ((fn->generator->generate_stack_trace_support || fn->generator->live) &&
+          fn->ir_function && in->ir_index >= 0 &&
           (size_t)in->ir_index < fn->ir_function->instruction_count) {
         ok = mir_encode_traced_trap(
             fn, in, &fn->ir_function->instructions[in->ir_index]);

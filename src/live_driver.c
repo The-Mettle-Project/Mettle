@@ -4,6 +4,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void live_mark_watched(const char *output, int on) {
+  char path[4096];
+  FILE *file;
+  if (snprintf(path, sizeof(path), "%s.live.watched", output) >=
+      (int)sizeof(path)) {
+    return;
+  }
+  if (!on) {
+    remove(path);
+    return;
+  }
+  file = fopen(path, "wb");
+  if (file) {
+    fputs("1\n", file);
+    fclose(file);
+  }
+}
+
 #ifdef _WIN32
 #include <windows.h>
 
@@ -275,6 +293,7 @@ int mettle_live_main(int argc, char **argv) {
     fprintf(stderr, "[live] the first build failed\n");
     goto done;
   }
+  live_mark_watched(output, 1);
   {
     LiveCommand launch = {0};
     int started = live_command_argument(&launch, output) &&
@@ -316,6 +335,7 @@ int mettle_live_main(int argc, char **argv) {
   GetExitCodeProcess(running.hProcess, &exit_code);
   CloseHandle(running.hThread);
   CloseHandle(running.hProcess);
+  live_mark_watched(output, 0);
   fprintf(stderr, "[live] %s exited with %lu\n", output,
           (unsigned long)exit_code);
   result = (int)exit_code;
@@ -508,6 +528,7 @@ int mettle_live_main(int argc, char **argv) {
   if (!watched || !fresh) {
     goto done;
   }
+  live_mark_watched(output, 1);
   pid = mettle_spawn_process(output, launch);
   if (pid <= 0) {
     fprintf(stderr, "[live] could not start '%s'\n", output);
@@ -538,6 +559,7 @@ int mettle_live_main(int argc, char **argv) {
     mettle_run_process(self, patch);
     watched_count = live_scan_list(list_path, input, watched);
   }
+  live_mark_watched(output, 0);
   fprintf(stderr, "[live] %s exited with %d\n", output, exit_code);
   result = exit_code;
 

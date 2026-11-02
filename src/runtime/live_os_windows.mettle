@@ -23,6 +23,7 @@ extern fn mettle_live_os_suspend(thread: int64) -> uint32 = "SuspendThread";
 extern fn mettle_live_os_resume(thread: int64) -> uint32 = "ResumeThread";
 extern fn mettle_live_os_process_id() -> uint32 = "GetCurrentProcessId";
 extern fn mettle_live_os_thread_id() -> uint32 = "GetCurrentThreadId";
+extern fn mettle_live_os_sleep(milliseconds: uint32) = "Sleep";
 
 var mettle_live_os_threads: int64[1024];
 var mettle_live_os_thread_count: int64 = 0;
@@ -81,6 +82,93 @@ export fn mettle_live_port_code_store(address: int64, value: int64) {
     *word = value;
     mettle_live_os_protect(address, 8, old, &ignored);
     mettle_live_os_flush(mettle_live_os_process(), address, 8);
+}
+
+@naked export fn mettle_live_site_check(flag: int64, table: string, key: int64, owner: string) -> int64 {
+    asm {
+        lea r10, [rsp + 8]
+        push rcx
+        push rdx
+        push r8
+        push r9
+        mov rcx, r10
+        sub rsp, 40
+        call mettle_live_resume_slot
+        add rsp, 40
+        pop r9
+        pop r8
+        pop rdx
+        pop rcx
+        test rax, rax
+        jz site_skip
+        mov [rax], rbx
+        mov [rax + 8], rbp
+        mov [rax + 16], rdi
+        mov [rax + 24], rsi
+        mov [rax + 32], r12
+        mov [rax + 40], r13
+        mov [rax + 48], r14
+        mov [rax + 56], r15
+        lea r10, [rsp + 8]
+        mov [rax + 64], r10
+        mov r10, [rsp]
+        mov [rax + 72], r10
+        movdqu [rax + 128], xmm6
+        movdqu [rax + 144], xmm7
+        movdqu [rax + 160], xmm8
+        movdqu [rax + 176], xmm9
+        movdqu [rax + 192], xmm10
+        movdqu [rax + 208], xmm11
+        movdqu [rax + 224], xmm12
+        movdqu [rax + 240], xmm13
+        movdqu [rax + 256], xmm14
+        movdqu [rax + 272], xmm15
+    site_skip:
+        jmp mettle_live_frame_check
+    }
+}
+
+@naked export fn mettle_live_site_leave_here() {
+    asm {
+        lea rcx, [rsp + 8]
+        jmp mettle_live_site_leave
+    }
+}
+
+@naked export fn mettle_live_resume_jump(slot: int64) {
+    asm {
+        mov rax, rcx
+        mov rbx, [rax]
+        mov rbp, [rax + 8]
+        mov rdi, [rax + 16]
+        mov rsi, [rax + 24]
+        mov r12, [rax + 32]
+        mov r13, [rax + 40]
+        mov r14, [rax + 48]
+        mov r15, [rax + 56]
+        movdqu xmm6, [rax + 128]
+        movdqu xmm7, [rax + 144]
+        movdqu xmm8, [rax + 160]
+        movdqu xmm9, [rax + 176]
+        movdqu xmm10, [rax + 192]
+        movdqu xmm11, [rax + 208]
+        movdqu xmm12, [rax + 224]
+        movdqu xmm13, [rax + 240]
+        movdqu xmm14, [rax + 256]
+        movdqu xmm15, [rax + 272]
+        mov rsp, [rax + 64]
+        mov r10, [rax + 72]
+        mov rax, 1
+        jmp r10
+    }
+}
+
+export fn mettle_live_port_thread_id() -> int64 {
+    return (int64)mettle_live_os_thread_id();
+}
+
+export fn mettle_live_port_sleep(milliseconds: int64) {
+    mettle_live_os_sleep((uint32)milliseconds);
 }
 
 export fn mettle_live_port_seal(address: int64, size: int64) -> int64 {

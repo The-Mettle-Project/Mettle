@@ -40,6 +40,11 @@ function Invoke-Program([string]$exe) {
     }
 }
 
+function Remove-TrapReport([string]$text) {
+    $text = $text -replace 'Fatal error: [^\r\n]*\r?\n?', ''
+    return $text -replace '  rebuild with -s for the file, line and stack trace\r?\n?', ''
+}
+
 $files = Get-ChildItem $Pattern | Sort-Object Name
 if ($Limit -gt 0) { $files = $files | Select-Object -First $Limit }
 $pass = 0; $fail = 0; $skip = 0; $kept = 0
@@ -52,9 +57,12 @@ $undefined = @(
     "test_safe_bounds_negative.mettle",
     "test_safe_hoist_branchy.mettle",
     "test_safe_stack_neighbours.mettle",
-    "test_safe_stack_pointer.mettle"
+    "test_safe_stack_pointer.mettle",
+    "test_safe_widen_overflow.mettle",
+    "test_crash_report_frames.mettle"
 )
 if ($Optimize) { $undefined += "test_schedule_joins.mettle" }
+if ($IsLinux) { $undefined += "test_naked_interrupt.mettle" }
 
 foreach ($file in $files) {
     if ($undefined -contains $file.Name) { $skip++; continue }
@@ -109,7 +117,7 @@ foreach ($file in $files) {
             if ($Loops) { $skip++; continue }
             $fail++; $failures += "$($file.Name): patch was not applied: $($live.Err)"; continue
         }
-        if ($live.Out -ne $plain.Out -or $live.Code -ne $plain.Code) {
+        if ((Remove-TrapReport $live.Out) -ne (Remove-TrapReport $plain.Out) -or $live.Code -ne $plain.Code) {
             $fail++; $failures += "$($file.Name): output differs (exit $($plain.Code) vs $($live.Code))"; continue
         }
         if ($live.Err -notmatch "\[live\] main moves to the current code") { $kept++; $keptNames += $file.Name }

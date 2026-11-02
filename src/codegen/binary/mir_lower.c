@@ -1485,7 +1485,7 @@ static const char *mir_operand_kind_name(int kind) {
 
 static int mir_runtime_trap_is_supported(CodeGenerator *g,
                                          const IRInstruction *in) {
-  if (!g->generate_stack_trace_support) {
+  if (!g->generate_stack_trace_support && !g->live) {
     return 1;
   }
   if (strcmp(in->text, "mettle_crash_trap_ex") == 0) {
@@ -5436,7 +5436,8 @@ static int mir_lower_runtime_trap(MirFunction *fn, CodeGenerator *g,
       in->arguments[msg_idx].name) {
     msg = in->arguments[msg_idx].name;
   }
-  if (is_ex && g->generate_stack_trace_support && in->argument_count >= 4) {
+  if (is_ex && (g->generate_stack_trace_support || g->live) &&
+      in->argument_count >= 4) {
     MirOperand second = mir_value_operand(fn, g, ctx, map, &in->arguments[3]);
     if (!mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_R10, MIR_RC_GP), second,
                    mir_op_none(), 8, 0, 0)) {

@@ -20,8 +20,8 @@ architecture of the parts that are built.
    M6.
 7. Speculation: the new code runs on a copy of the state first, then commits
    or is thrown away. M6.
-8. Crashes: a fault rewinds to the last snapshot and waits for a patch, then
-   continues. M7.
+8. Crashes: a fault waits for a patch, then continues from the last quiesce
+   point. **M7, built.** Rewinding to a snapshot is next.
 9. Timelines: one snapshot, K variants of the code, all run, all compared. M7.
 10. A fleet: clients, servers and GPUs swap together at one logical tick. M8.
 
@@ -151,9 +151,10 @@ a jump there. Otherwise it is a slot.
 ### Loading
 
 The loader is written in Mettle: `src/runtime/live.mettle` is portable, and
-`live_os_windows.mettle` and `live_os_linux.mettle` implement one port of
-twelve calls (write, lock, ticks, alloc, alloc near, seal, code store, exe
-path, read, bind, suspend others, resume others). `quiesce;` in a live build
+`live_os_windows.mettle` and `live_os_linux.mettle` implement one port: write,
+lock, unlock, ticks, alloc, free, alloc near, seal, code store, exe path, read,
+bind, suspend others, resume others, thread id and sleep, plus three naked
+functions for M7 (the site trampoline, the leave hook and the resume jump). `quiesce;` in a live build
 calls `mettle_live_quiesce`, which at most every 50 ms looks for the next
 patch file, and when it finds one:
 
@@ -286,6 +287,38 @@ stays on the stack under the continuation, which keeps that storage alive.
 A local that is missing prints one line and starts from its constant
 initializer, or zero.
 
+## M7: crashes continue
+
+A crash under `mettle live` waits for a patch and continues from the last
+quiesce point the thread passed, in a frame that is still on its stack.
+
+In a live build, `quiesce;` calls `mettle_live_site_check`, a naked trampoline
+in the port layer. It stores the callee-saved registers (and `xmm6` to `xmm15`
+on Windows), its caller's stack pointer and its return address into a
+per-thread stack of eight resume points, then jumps to
+`mettle_live_frame_check`, which records the frame's flag, key, table and
+owner beside them. Entries are keyed by stack pointer: a site in the same frame
+reuses its entry, a deeper frame pushes one, and every return from a function
+with quiesce sites calls `mettle_live_site_leave_here`, which pops the entries
+at or below the returning frame. The top entry is always a live frame.
+
+Live builds send every trap through the crash handler, including the checks a
+build without `-s` would turn into `puts` and `exit`. The Windows exception
+filter, the Linux signal handler and the trap reporter all end the same way:
+print the report, take the top resume point above the faulting stack pointer,
+and call `mettle_live_recover_wait`. That returns at once unless
+`app.exe.live.watched` exists, which `mettle live` writes before it starts the
+program and a `--live` link deletes. Otherwise it polls for patches every
+100 ms, and once one applies whose table still has the site's key and
+signature, it starts a frame move and returns. The handler then loads the
+resume point into the faulting context (or jumps to it from a trap) with
+`rax = 1`, so the quiesce site sees `mettle_live_frame_check` report a move.
+The function's transfer path hands its locals to the newest continuation, as
+for any move.
+
+The frames above the resume point are abandoned without running their defers.
+A stack overflow is not recovered: its guard page is gone.
+
 ## Undo
 
 `mettle --live-undo app.exe` restores the state snapshot taken before the
@@ -323,8 +356,8 @@ program and polls source modification times.
   outcomes compared, or run on a copy of the state for N frames before it is
   committed. Effects decide which calls reach the outside world during a
   speculative run.
-- M7, crashes and timelines: the crash handler rewinds to the last snapshot
-  and waits for a patch. One snapshot can fan out into K forks, each with a
-  different patch, and the results are compared side by side.
+- M7, rewind and timelines: with M6 snapshots, a crash rewinds memory to the
+  last snapshot before it continues. One snapshot can fan out into K forks,
+  each with a different patch, and the results are compared side by side.
 - M8, fleets: patches carry a logical tick. Generated wire formats carry their
   own migrations, so old and new nodes can talk during a rollout.

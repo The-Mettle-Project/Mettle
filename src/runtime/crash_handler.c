@@ -340,6 +340,25 @@ mettle_crash_find_extra_location(uintptr_t program_counter,
   return NULL;
 }
 
+static int64_t (*g_live_resume_point)(int64_t stack) = NULL;
+static int64_t (*g_live_recover_wait)(int64_t slot) = NULL;
+static void (*g_live_resume_jump)(int64_t slot) = NULL;
+
+void mettle_crash_set_live_recovery(int64_t point, int64_t wait, int64_t jump) {
+  g_live_resume_point = (int64_t (*)(int64_t))(uintptr_t)point;
+  g_live_recover_wait = (int64_t (*)(int64_t))(uintptr_t)wait;
+  g_live_resume_jump = (void (*)(int64_t))(uintptr_t)jump;
+}
+
+static int64_t *mettle_crash_live_resume_slot(uintptr_t stack) {
+  int64_t slot;
+  if (!g_live_resume_point || !g_live_recover_wait || !stack) {
+    return NULL;
+  }
+  slot = g_live_resume_point((int64_t)stack);
+  return slot ? (int64_t *)(uintptr_t)slot : NULL;
+}
+
 void mettle_crash_register_extra_code(const MettleCrashFunctionInfo *functions,
                                       size_t function_count,
                                       const MettleCrashLocationInfo *locations,
@@ -767,6 +786,26 @@ mettle_crash_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
   }
 
   mettle_crash_print_trace_from_frame(program_counter, frame_pointer);
+  if (record->ExceptionCode != EXCEPTION_STACK_OVERFLOW && context) {
+    int64_t *slot = mettle_crash_live_resume_slot((uintptr_t)context->Rsp);
+    if (slot && g_live_recover_wait((int64_t)(uintptr_t)slot)) {
+      CONTEXT *resume = exception_info->ContextRecord;
+      resume->Rbx = (DWORD64)slot[0];
+      resume->Rbp = (DWORD64)slot[1];
+      resume->Rdi = (DWORD64)slot[2];
+      resume->Rsi = (DWORD64)slot[3];
+      resume->R12 = (DWORD64)slot[4];
+      resume->R13 = (DWORD64)slot[5];
+      resume->R14 = (DWORD64)slot[6];
+      resume->R15 = (DWORD64)slot[7];
+      resume->Rsp = (DWORD64)slot[8];
+      resume->Rip = (DWORD64)slot[9];
+      resume->Rax = 1;
+      memcpy(&resume->Xmm6, &slot[16], 16u * 10u);
+      InterlockedExchange(&g_runtime_debug_in_handler, 0);
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
+  }
   mettle_crash_terminate_with_code(1);
   return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -896,6 +935,27 @@ static void mettle_crash_crash_signal_handler(int signo, siginfo_t *info,
         "Stack trace unavailable (no machine context for this platform)\n");
   }
 
+#if defined(__linux__) && defined(__x86_64__)
+  if (ucontext_raw) {
+    int64_t *slot = mettle_crash_live_resume_slot(
+        (uintptr_t)((ucontext_t *)ucontext_raw)->uc_mcontext.gregs[REG_RSP]);
+    if (slot && g_live_recover_wait((int64_t)(uintptr_t)slot)) {
+      ucontext_t *uc = (ucontext_t *)ucontext_raw;
+      uc->uc_mcontext.gregs[REG_RBX] = (greg_t)slot[0];
+      uc->uc_mcontext.gregs[REG_RBP] = (greg_t)slot[1];
+      uc->uc_mcontext.gregs[REG_R12] = (greg_t)slot[4];
+      uc->uc_mcontext.gregs[REG_R13] = (greg_t)slot[5];
+      uc->uc_mcontext.gregs[REG_R14] = (greg_t)slot[6];
+      uc->uc_mcontext.gregs[REG_R15] = (greg_t)slot[7];
+      uc->uc_mcontext.gregs[REG_RSP] = (greg_t)slot[8];
+      uc->uc_mcontext.gregs[REG_RIP] = (greg_t)slot[9];
+      uc->uc_mcontext.gregs[REG_RAX] = 1;
+      g_runtime_debug_in_handler = 0;
+      return;
+    }
+  }
+#endif
+
   mettle_crash_terminate_with_code(128 + signo);
 }
 #endif
@@ -1003,11 +1063,19 @@ static void mettle_crash_trap_impl(uint32_t kind, const char *message,
     mettle_crash_print_trace_from_frame((uintptr_t)program_counter,
                                         (uintptr_t)frame_pointer);
   }
+  if (g_live_resume_jump) {
+    int64_t *slot =
+        mettle_crash_live_resume_slot((uintptr_t)__builtin_frame_address(0));
+    if (slot && g_live_recover_wait((int64_t)(uintptr_t)slot)) {
 #if defined(_WIN32) || defined(_WIN64)
-  mettle_crash_terminate_with_code(1);
+      InterlockedExchange(&g_runtime_debug_in_handler, 0);
 #else
-  mettle_crash_terminate_with_code(1);
+      g_runtime_debug_in_handler = 0;
 #endif
+      g_live_resume_jump((int64_t)(uintptr_t)slot);
+    }
+  }
+  mettle_crash_terminate_with_code(1);
 }
 
 void mettle_crash_trap_ex(uint32_t kind, const char *message,

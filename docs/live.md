@@ -134,19 +134,36 @@ one aligned eight-byte store, so a thread calls either the old or the new
 function. A frame
 moves only on the thread that runs it, at its own next site.
 
-## Crashes in patched code
+## Crashes
 
-A patch carries line tables for its functions. In a program built with `-s`,
-a crash inside patched code prints the function and line from the source the
-patch was built from:
+Under `mettle live`, a fault does not end the program. The report prints and
+the program waits for a fix:
 
 ```text
 Fatal error: null pointer dereference
-  --> s.mettle:8:9 in step
+  --> game.mettle:5:1 in step
 Stack trace:
-  #0 step at s.mettle:8:9 (0x00000001401C0038)
-  #1 main at s.mettle:14:21 (0x000000014000B887)
+  #0 step at game.mettle:5:1 (0x00000001401F0032)
+  #1 main at game.mettle:9:1 (0x000000014000B887)
+[live] main stopped at the fault. Save a fix and it continues from its last quiesce point
+[live] patch 2: 1 function
+[live] main continues from its last quiesce point
 ```
+
+When the next patch lands, the thread continues from the last `quiesce;` it
+passed in a function that is still on its stack, and moves to the new code
+there the way any frame does. Globals and heap memory keep what the code wrote
+before the fault. A local that the function changed between the quiesce point
+and the fault may come back with either value.
+
+This covers access violations, divide by zero, and the checks the compiler
+inserts (null pointers, array bounds) on Windows, and SIGSEGV, SIGBUS, SIGFPE,
+SIGILL and SIGABRT on Linux. A stack overflow still ends the program. Run on
+its own, outside `mettle live`, a live build reports the fault and exits.
+
+A patch carries line tables for its functions, so traces name patched code.
+A live build reports each frame's function and file; build with `-s` for the
+exact line and column.
 
 ## What it refuses
 

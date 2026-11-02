@@ -75,6 +75,7 @@ void mettle_crash_register_image(const MettleCrashFunctionInfo *functions,
                                  const MettleCrashLocationInfo *locations,
                                  size_t location_count);
 void mettle_crash_register_debug_image(const MettleCrashDebugImage *image);
+void mettle_crash_set_live_recovery(int64_t point, int64_t wait, int64_t jump);
 void mettle_crash_register_extra_code(const MettleCrashFunctionInfo *functions,
                                       size_t function_count,
                                       const MettleCrashLocationInfo *locations,

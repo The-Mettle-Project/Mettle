@@ -1574,7 +1574,7 @@ int code_generator_binary_emit_runtime_trap_call(
   trap_symbol = is_trap_ex ? "mettle_crash_trap_ex" : "mettle_crash_trap";
   message_index = is_trap_ex ? 1u : 0u;
 
-  if (!generator->generate_stack_trace_support) {
+  if (!generator->generate_stack_trace_support && !generator->live) {
     return binary_emit_trap_abort(
         generator, context,
         instruction->argument_count > message_index

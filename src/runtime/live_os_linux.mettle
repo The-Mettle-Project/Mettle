@@ -103,6 +103,76 @@ export fn mettle_live_port_code_store(address: int64, value: int64) {
     syscall(10, page, 4096, 5);
 }
 
+@naked export fn mettle_live_site_check(flag: int64, table: string, key: int64, owner: string) -> int64 {
+    asm {
+        lea r10, [rsp + 8]
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push r8
+        push r9
+        mov rdi, r10
+        sub rsp, 8
+        call mettle_live_resume_slot
+        add rsp, 8
+        pop r9
+        pop r8
+        pop rcx
+        pop rdx
+        pop rsi
+        pop rdi
+        test rax, rax
+        jz site_skip
+        mov [rax], rbx
+        mov [rax + 8], rbp
+        mov [rax + 32], r12
+        mov [rax + 40], r13
+        mov [rax + 48], r14
+        mov [rax + 56], r15
+        lea r10, [rsp + 8]
+        mov [rax + 64], r10
+        mov r10, [rsp]
+        mov [rax + 72], r10
+    site_skip:
+        jmp mettle_live_frame_check
+    }
+}
+
+@naked export fn mettle_live_site_leave_here() {
+    asm {
+        lea rdi, [rsp + 8]
+        jmp mettle_live_site_leave
+    }
+}
+
+@naked export fn mettle_live_resume_jump(slot: int64) {
+    asm {
+        mov rax, rdi
+        mov rbx, [rax]
+        mov rbp, [rax + 8]
+        mov r12, [rax + 32]
+        mov r13, [rax + 40]
+        mov r14, [rax + 48]
+        mov r15, [rax + 56]
+        mov rsp, [rax + 64]
+        mov r10, [rax + 72]
+        mov rax, 1
+        jmp r10
+    }
+}
+
+export fn mettle_live_port_thread_id() -> int64 {
+    return syscall(186);
+}
+
+export fn mettle_live_port_sleep(milliseconds: int64) {
+    var spec: int64[2];
+    spec[0] = milliseconds / 1000;
+    spec[1] = (milliseconds % 1000) * 1000000;
+    syscall(35, (int64)&spec[0], 0);
+}
+
 export fn mettle_live_port_seal(address: int64, size: int64) -> int64 {
     var length: int64 = ((size + 4095) / 4096) * 4096;
     if (syscall(10, address, length, 5) != 0) {

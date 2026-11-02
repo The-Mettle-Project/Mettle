@@ -752,6 +752,7 @@ static int live_function_holds_quiesce(const LiveObjectIndex *index,
     symbol = &index->object->symbols[relocation->symbol_index];
     if (symbol->name && (strcmp(symbol->name, "mettle_live_quiesce") == 0 ||
                          strcmp(symbol->name, "mettle_live_frame_check") == 0 ||
+                         strcmp(symbol->name, "mettle_live_site_check") == 0 ||
                          strcmp(symbol->name, "mettle_live_frame_moved") == 0)) {
       return 1;
     }
@@ -1224,6 +1225,11 @@ int live_write_state(const LinkResolution *resolution, uint64_t image_base,
                                g_live_layout_texts[i])) {
       goto done;
     }
+  }
+  path = live_join(executable_path, ".live.watched");
+  if (path) {
+    remove(path);
+    free(path);
   }
   path = live_join(executable_path, ".live");
   ok = path && live_state_save(&state, path, error_message_out);

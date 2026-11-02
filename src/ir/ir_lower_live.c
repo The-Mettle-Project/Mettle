@@ -3,7 +3,8 @@
 #include <ctype.h>
 #include <stdint.h>
 
-#define IR_LIVE_CHECK_NAME "mettle_live_frame_check"
+#define IR_LIVE_CHECK_NAME "mettle_live_site_check"
+#define IR_LIVE_LEAVE_NAME "mettle_live_site_leave_here"
 #define IR_LIVE_MOVED_NAME "mettle_live_frame_moved"
 #define IR_LIVE_PUT_NAME "mettle_live_frame_put"
 #define IR_LIVE_TAKE_NAME "mettle_live_frame_take"
@@ -1094,6 +1095,35 @@ static void ir_live_declare_helpers(IRLoweringContext *context) {
   ir_live_declare(context, IR_LIVE_HAND_BACK_NAME, "i");
   ir_live_declare(context, IR_LIVE_AGAIN_NAME, "");
   ir_live_declare(context, IR_LIVE_LAST_KEY_NAME, "");
+  ir_live_declare(context, IR_LIVE_LEAVE_NAME, "");
+}
+
+static int ir_live_is_site(const IRInstruction *instruction);
+
+static int ir_live_add_leaves(IRFunction *function) {
+  int holds = 0;
+  for (size_t i = 0; i < function->instruction_count && !holds; i++) {
+    holds = ir_live_is_site(&function->instructions[i]);
+  }
+  if (!holds) {
+    return 1;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction leave = {0};
+    if (function->instructions[i].op != IR_OP_RETURN) {
+      continue;
+    }
+    leave.op = IR_OP_CALL;
+    leave.location = function->instructions[i].location;
+    leave.text = IR_LIVE_LEAVE_NAME;
+    leave.dest = ir_operand_none();
+    if (!ir_function_insert_instruction(function, i, &leave)) {
+      return 0;
+    }
+    i++;
+  }
+  ir_function_touch(function);
+  return 1;
 }
 
 int ir_lower_live_marks_statement(const IRFunction *function,
@@ -2775,6 +2805,11 @@ int ir_lower_live_program(IRLoweringContext *context, IRProgram *program) {
   for (size_t f = 0; f < count && ok; f++) {
     if (program->functions[f]) {
       ok = ir_live_process(context, program, program->functions[f], &mayq);
+    }
+  }
+  for (size_t f = 0; f < program->function_count && ok; f++) {
+    if (program->functions[f]) {
+      ok = ir_live_add_leaves(program->functions[f]);
     }
   }
   ir_live_map_destroy(&mayq);
