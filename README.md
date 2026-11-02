@@ -6,23 +6,46 @@
 
 [Systm](https://systm.co.za/)'s Potentia runs LLMs on Mettle.
 
-- **2.4× faster to the first token.** 35.7 ms against 87.1 ms.
-- **1.41× faster writing code.** 140.5 against 99.3 tokens a second.
-- **12× less memory after four users.** 1.8 GB against 21.5 GB.
-- **38% less energy per token at eight requests.** 0.38 J against 0.61 J.
+- **1.7× to 2.4× faster to the first token.** 2.4× on a 128-token prompt, 1.7× on 8,192 tokens.
+- **1.07× to 1.41× faster generating a reply.** 1.07× alone, 1.18× on prose and 1.41× on code with a drafter.
+- **8.5× to 23.5× less RAM on the 26B model.** 23.5× idle, 12.1× after four users, 8.5× two minutes on.
+- **19% to 38% less energy per token.** 19% at one request, 38% at eight.
 
-<sub>Gemma 4, QAT Q4_0, on one RTX 5060 Ti, against llama.cpp from LM Studio with every layer on the GPU and one engine in VRAM at a time. First token: 12B, a 128-token prompt. Code: 12B, with Gemma 4's assistant drafter in both engines. Memory: 26B-A4B, RAM right after four users.</sub>
+<sub>Gemma 4 12B and 26B-A4B, QAT Q4_0, on one RTX 5060 Ti, against llama.cpp from LM Studio with every layer on the GPU and one engine in VRAM at a time. Energy is board joules per token.</sub>
 
 ## Everything else stays close to C
 
-Across 16 whole programs, including parsers, compressors, interpreters and solvers, against `clang -O3` with the same answers on all 16:
+Every whole program in the benchmark suite, including parsers, compressors, interpreters and solvers:
 
-- **1.09× clang's run time, on average.** 22.2 ms against 20.4 ms.
-- **1.42× faster on a bytecode VM.** 28.0 ms against 39.7 ms.
-- **1.22× faster on a sudoku solver.** 24.5 ms against 29.9 ms.
-- **2× faster to build 90,000 lines.** 7.6 s against 16.0 s.
+- **1.09× the run time of `clang -O3`, on average,** with the same answers on all 16. From 0.71× on a bytecode VM to 1.29× on a particle grid.
+- **1.13× the run time of `clang -O3 -march=native`,** which leads on all 16.
+- **2× faster to build a generated 90,000-line file.** 7.6 s against 16.0 s.
 
-<sub>clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. The slowest program is physics_grid at 1.29×. With `-march=native`, clang leads on all 16 and Mettle averages 1.13×. Build time is one generated file, and the lead grows on smaller ones. Run them yourself with `tools/benchmark/mc.ps1 -Suite 3`.</sub>
+<details>
+<summary>All 16 programs</summary>
+
+| Program | Against `-O3` | Against `-march=native` |
+|---|---:|---:|
+| `bytecode_vm` | 0.71× | 1.06× |
+| `sudoku_solve` | 0.82× | 1.21× |
+| `huffman` | 1.00× | 1.05× |
+| `regex_match` | 1.02× | 1.04× |
+| `voxel_trace` | 1.10× | 1.09× |
+| `lz77` | 1.11× | 1.10× |
+| `word_freq` | 1.11× | 1.08× |
+| `mark_sweep` | 1.11× | 1.07× |
+| `astar_grid` | 1.11× | 1.08× |
+| `interp_ast` | 1.16× | 1.01× |
+| `diff_lcs` | 1.20× | 1.23× |
+| `btree_index` | 1.21× | 1.17× |
+| `csv_query` | 1.22× | 1.17× |
+| `link_resolve` | 1.24× | 1.27× |
+| `json_parse` | 1.26× | 1.28× |
+| `physics_grid` | 1.29× | 1.27× |
+
+</details>
+
+<sub>clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. Under `-march=native`, clang's physics_grid returns a different checksum. Run them with `tools/benchmark/mc.ps1 -Suite 3`.</sub>
 
 ## What you can do
 

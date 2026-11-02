@@ -87,24 +87,29 @@ def main():
     potentia = os.environ.get("POTENTIA_README")
     if potentia:
         readme = read(potentia)
-        for figure in ("35.7 ms against 87.1 ms", "code 140.5 against 99.3", "1.8 against 21.5 GB", "8 requests 0.38 against 0.61"):
+        for figure in ("2.4 times faster", "8192 tokens 2.29 against 3.85 s, 1.7 times", "alone 53.1 against 49.7", "code 140.5 against 99.3, 1.41 times", "prose 91.6 against 77.5, 1.18 times", "23.5 times less", "12.1 times less", "8.5 times less", "19 percent less", "2 requests 1.07 against 1.35", "4 requests 0.65 against 0.89", "0.38 against 0.61, 38 percent less", "16 requests 473 against 446"):
             require(figure in readme, "the Potentia README to still report " + figure)
         print("potentia figures: match the README")
     else:
         print("potentia figures: NOT CHECKED, set POTENTIA_README")
 
-    perf = os.path.join(WORK, "..", "perf", "fair.json")
-    if os.path.exists(perf):
-        rows = json.loads(read(perf))
-        geo = lambda xs: math.exp(sum(math.log(x) for x in xs) / len(xs))
-        by = {r["name"]: r for r in rows}
-        require(len(rows) == 16 and round(geo([r["m"] / r["o3"] for r in rows]), 2) == 1.09, "Suite 3 to still average 1.09x clang -O3")
-        require(round(geo([r["m"] / r["native"] for r in rows]), 2) == 1.13, "Suite 3 to still average 1.13x clang -march=native")
-        require(round(by["bytecode_vm"]["o3"] / by["bytecode_vm"]["m"], 2) == 1.42, "bytecode_vm to still run 1.42x faster")
-        require(round(by["sudoku_solve"]["o3"] / by["sudoku_solve"]["m"], 2) == 1.22, "sudoku_solve to still run 1.22x faster")
-        print("c figures: match .tmp/perf/fair.json")
-    else:
-        print("c figures: NOT CHECKED, no .tmp/perf/fair.json")
+    suite3 = json.loads(read(os.path.join(EXHIBITS, "suite3.json")))
+    require(len(suite3) == 16, "16 programs in suite3.json")
+    geo = lambda xs: math.exp(sum(math.log(x) for x in xs) / len(xs))
+    c_o3 = "%.2f" % geo([r["m"] / r["o3"] for r in suite3])
+    c_native = "%.2f" % geo([r["m"] / r["native"] for r in suite3])
+    readme = read(os.path.join(REPO, "README.md"))
+    require("**" + c_o3 + "\u00d7 the run time of `clang -O3`" in readme and "**" + c_native + "\u00d7 the run time of `clang -O3 -march=native`" in readme, "the README to carry the same averages")
+    span = 0.35
+    c_rows = ""
+    for r in sorted(suite3, key=lambda x: x["m"] / x["o3"]):
+        ratio = r["m"] / r["o3"]
+        native = r["m"] / r["native"]
+        require("| `%s` | %.2f\u00d7 | %.2f\u00d7 |" % (r["name"], ratio, native) in readme, "the README table to list " + r["name"])
+        width = abs(ratio - 1) / span * 50
+        kind = "down ahead" if ratio < 1 else "up"
+        tick = 50 + (native - 1) / span * 50
+        c_rows += '      <div class="s-row"><span>%s</span><span class="s-track"><i class="o3 %s" style="width:%.2f%%"></i><i class="nat" style="left:%.2f%%"></i></span><span class="val">%.2f&times;</span></div>\n' % (r["name"], kind, width, tick, ratio)
 
     explain, code, _ = compile_in("explain", "checksum.mettle", ["--build", "--release", "--explain"])
     require(code == 0, "--explain to build")
@@ -179,6 +184,9 @@ def main():
     data = {k: session[k] for k in ("duration", "points", "events", "plateau")}
     facts = {
         "{{VERSION}}": version,
+        "{{C_O3}}": c_o3,
+        "{{C_NATIVE}}": c_native,
+        "{{C_ROWS}}": c_rows,
         "{{DEMAND_CODE}}": esc("\n".join(demand[3:7] + ["    " + CUT])),
         "{{DEMAND_NOTE}}": esc(refusal.group(0)),
         "{{EXPLAIN_LINES}}": "\n".join(rows),
@@ -206,6 +214,7 @@ def main():
     require(not left, "every placeholder filled, found " + ", ".join(sorted(set(left))))
     write(os.path.join(HERE, "index.html"), page)
     print("wrote website/index.html")
+    print("c averages: " + c_o3 + " " + c_native)
     for k in ("{{TARGET_DUMP}}", "{{MACHINE_OUT}}", "{{DEMAND_NOTE}}"):
         print(k.strip("{}").lower() + ": " + facts[k].replace("\n", " | ")[:150])
     print("explain: " + " | ".join(re.sub(r"<[^>]+>", "", r) for r in rows)[:420])

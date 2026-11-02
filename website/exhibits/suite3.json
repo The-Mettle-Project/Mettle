@@ -1,0 +1,98 @@
+[
+ {
+  "name": "json_parse",
+  "m": 15121,
+  "o3": 11973,
+  "native": 11832
+ },
+ {
+  "name": "interp_ast",
+  "m": 15529,
+  "o3": 13378,
+  "native": 15343
+ },
+ {
+  "name": "word_freq",
+  "m": 42961,
+  "o3": 38671,
+  "native": 39659
+ },
+ {
+  "name": "huffman",
+  "m": 22220,
+  "o3": 22224,
+  "native": 21217
+ },
+ {
+  "name": "lz77",
+  "m": 14742,
+  "o3": 13339,
+  "native": 13460
+ },
+ {
+  "name": "astar_grid",
+  "m": 33083,
+  "o3": 29672,
+  "native": 30528
+ },
+ {
+  "name": "regex_match",
+  "m": 10227,
+  "o3": 10070,
+  "native": 9821
+ },
+ {
+  "name": "physics_grid",
+  "m": 24327,
+  "o3": 18811,
+  "native": 19164
+ },
+ {
+  "name": "btree_index",
+  "m": 33142,
+  "o3": 27432,
+  "native": 28281
+ },
+ {
+  "name": "bytecode_vm",
+  "m": 27997,
+  "o3": 39706,
+  "native": 26513
+ },
+ {
+  "name": "sudoku_solve",
+  "m": 24478,
+  "o3": 29897,
+  "native": 20256
+ },
+ {
+  "name": "voxel_trace",
+  "m": 19555,
+  "o3": 17814,
+  "native": 17923
+ },
+ {
+  "name": "diff_lcs",
+  "m": 21924,
+  "o3": 18316,
+  "native": 17871
+ },
+ {
+  "name": "csv_query",
+  "m": 25237,
+  "o3": 20741,
+  "native": 21484
+ },
+ {
+  "name": "mark_sweep",
+  "m": 28236,
+  "o3": 25325,
+  "native": 26277
+ },
+ {
+  "name": "link_resolve",
+  "m": 19015,
+  "o3": 15356,
+  "native": 14973
+ }
+]

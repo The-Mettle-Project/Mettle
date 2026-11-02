@@ -82,6 +82,30 @@ h1 span { display: block; text-wrap: balance; }
 .figs.shown .bar i { transform: scaleX(var(--w)); }
 .proof h2.next { margin-top: 112px; }
 .how code, .method code { font-family: var(--mono); font-size: 0.82em; white-space: nowrap; color: var(--ink); }
+.fig.range b { font-size: clamp(36px, 3.5vw, 54px); letter-spacing: -0.03em; line-height: 1.05; }
+.c-grid { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 7fr); column-gap: 72px; margin-top: 52px; align-items: start; }
+.c-figs .fig + .fig { margin-top: 36px; }
+.c-figs .fig figcaption { min-height: 0; max-width: 21em; color: var(--ink-2); }
+.fig figcaption code { font-family: var(--mono); font-size: 0.8em; white-space: nowrap; color: var(--ink); }
+.spread { margin: 0; min-width: 0; }
+.s-head, .s-row { display: grid; grid-template-columns: 8.2em minmax(0, 1fr) 3.4em; column-gap: 14px; align-items: center; }
+.s-head { font-size: 15px; color: var(--ink-2); margin-bottom: 8px; }
+.s-axis { display: flex; justify-content: space-between; }
+.s-row { height: 29px; font-family: var(--mono); font-size: 13.5px; color: var(--ink-2); }
+.s-row .val { text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; }
+.s-track { position: relative; height: 100%; }
+.s-track::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--ink-2); }
+.s-track .o3 { position: absolute; top: 8px; bottom: 8px; background: var(--dim); transform: scaleX(0); transition: transform 1400ms cubic-bezier(0.16, 0.8, 0.24, 1); }
+.s-track .o3.ahead { background: var(--accent); }
+.s-track .o3.up { left: 50%; transform-origin: 0 50%; }
+.s-track .o3.down { right: 50%; transform-origin: 100% 50%; }
+.spread.shown .s-track .o3 { transform: scaleX(1); }
+.s-track .nat { position: absolute; top: 4px; bottom: 4px; width: 2px; margin-left: -1px; background: var(--ink); opacity: 0; transition: opacity 500ms linear 900ms; }
+.spread.shown .s-track .nat { opacity: 1; }
+.spread figcaption { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 14px; font-size: 15px; color: var(--ink-2); }
+.spread figcaption code { font-family: var(--mono); font-size: 0.86em; margin-right: 14px; }
+.s-key { display: inline-block; width: 22px; height: 11px; background: var(--dim); }
+.s-key.tick { width: 2px; height: 19px; background: var(--ink); }
 .method { margin: 44px 0 0; max-width: 64em; font-size: 16px; line-height: 1.42; color: var(--ink-2); text-wrap: pretty; }
 .wall { padding-top: 0; padding-bottom: 112px; }
 .wall-lede { margin: 0; max-width: 17em; font-size: clamp(32px, 4.1vw, 62px); line-height: 1.06; letter-spacing: -0.024em; color: var(--ink); text-wrap: balance; }
@@ -155,6 +179,7 @@ h1 span { display: block; text-wrap: balance; }
 
 @media (max-width: 1000px) {
   .proof { padding-bottom: 88px; }
+  .c-grid { grid-template-columns: minmax(0, 1fr); row-gap: 40px; }
   .figs { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 44px; margin-top: 44px; }
   .wall { padding-top: 0; padding-bottom: 64px; }
   .wall-grid { grid-template-columns: minmax(0, 1fr); row-gap: 28px; margin-top: 36px; }
@@ -168,6 +193,8 @@ h1 span { display: block; text-wrap: balance; }
   .pane { padding: 22px 18px 24px; }
   .figs { grid-template-columns: minmax(0, 1fr); }
   .fig figcaption { min-height: 0; }
+  .s-head, .s-row { grid-template-columns: 7.4em minmax(0, 1fr) 3em; column-gap: 8px; }
+  .s-row { font-size: 12px; }
   .cmd pre { font-size: 13.5px; }
 }
 </style>
@@ -196,45 +223,44 @@ h1 span { display: block; text-wrap: balance; }
   <h2><a href="https://systm.co.za/">Systm</a>'s Potentia runs LLMs on Mettle, faster than llama.cpp on the same card.</h2>
   <p class="how">Its GPU kernels are Mettle, compiled straight to PTX with no nvcc, C++ or Python in the pipeline. The build fails unless the GPU matches an independent CPU reference, logit for logit.</p>
   <div class="figs">
-      <figure class="fig"><b>2.4&times;</b><figcaption>faster to the first token</figcaption>
-        <div class="bar"><div class="row"><span>Potentia</span><span>35.7 ms</span></div><i class="me" style="--w:0.41"></i></div>
-        <div class="bar"><div class="row"><span>llama.cpp</span><span>87.1 ms</span></div><i style="--w:1"></i></div>
+      <figure class="fig range"><b>1.7 to 2.4&times;</b><figcaption>faster to the first token</figcaption>
+        <div class="bar"><div class="row"><span>128-token prompt</span><span>2.4&times;</span></div><i class="me" style="--w:1.000"></i></div>
+        <div class="bar"><div class="row"><span>512 tokens</span><span>1.9&times;</span></div><i class="me" style="--w:0.792"></i></div>
+        <div class="bar"><div class="row"><span>2,048 tokens</span><span>1.8&times;</span></div><i class="me" style="--w:0.750"></i></div>
+        <div class="bar"><div class="row"><span>8,192 tokens</span><span>1.7&times;</span></div><i class="me" style="--w:0.708"></i></div>
       </figure>
-      <figure class="fig"><b>1.41&times;</b><figcaption>faster writing code</figcaption>
-        <div class="bar"><div class="row"><span>Potentia</span><span>140.5 tok/s</span></div><i class="me" style="--w:1"></i></div>
-        <div class="bar"><div class="row"><span>llama.cpp</span><span>99.3 tok/s</span></div><i style="--w:0.707"></i></div>
+      <figure class="fig range"><b>1.07 to 1.41&times;</b><figcaption>faster generating a reply</figcaption>
+        <div class="bar"><div class="row"><span>Code, with a drafter</span><span>1.41&times;</span></div><i class="me" style="--w:1.000"></i></div>
+        <div class="bar"><div class="row"><span>Prose, with a drafter</span><span>1.18&times;</span></div><i class="me" style="--w:0.837"></i></div>
+        <div class="bar"><div class="row"><span>No drafter</span><span>1.07&times;</span></div><i class="me" style="--w:0.759"></i></div>
       </figure>
-      <figure class="fig"><b>12&times;</b><figcaption>less memory after four users</figcaption>
-        <div class="bar"><div class="row"><span>Potentia</span><span>1.8 GB</span></div><i class="me" style="--w:0.084"></i></div>
-        <div class="bar"><div class="row"><span>llama.cpp</span><span>21.5 GB</span></div><i style="--w:1"></i></div>
+      <figure class="fig range"><b>8.5 to 23.5&times;</b><figcaption>less RAM on the 26B model</figcaption>
+        <div class="bar"><div class="row"><span>Idle</span><span>23.5&times;</span></div><i class="me" style="--w:1.000"></i></div>
+        <div class="bar"><div class="row"><span>After four users</span><span>12.1&times;</span></div><i class="me" style="--w:0.515"></i></div>
+        <div class="bar"><div class="row"><span>Two minutes on</span><span>8.5&times;</span></div><i class="me" style="--w:0.362"></i></div>
       </figure>
-      <figure class="fig"><b>38%</b><figcaption>less energy per token at eight requests</figcaption>
-        <div class="bar"><div class="row"><span>Potentia</span><span>0.38 J</span></div><i class="me" style="--w:0.623"></i></div>
-        <div class="bar"><div class="row"><span>llama.cpp</span><span>0.61 J</span></div><i style="--w:1"></i></div>
+      <figure class="fig range"><b>19 to 38%</b><figcaption>less energy per token</figcaption>
+        <div class="bar"><div class="row"><span>Eight requests</span><span>38%</span></div><i class="me" style="--w:1.000"></i></div>
+        <div class="bar"><div class="row"><span>Four requests</span><span>27%</span></div><i class="me" style="--w:0.711"></i></div>
+        <div class="bar"><div class="row"><span>Two requests</span><span>21%</span></div><i class="me" style="--w:0.553"></i></div>
+        <div class="bar"><div class="row"><span>One request</span><span>19%</span></div><i class="me" style="--w:0.500"></i></div>
       </figure>
   </div>
-  <p class="method">Gemma 4, QAT Q4_0, on one RTX 5060 Ti, against llama.cpp from LM Studio with every layer on the GPU and one engine in VRAM at a time. First token: 12B, a 128-token prompt. Code: 12B, with Gemma 4's assistant drafter in both engines. Memory: 26B-A4B, RAM right after four users.</p>
+  <p class="method">Gemma 4 12B and 26B-A4B, QAT Q4_0, on one RTX 5060 Ti, against llama.cpp from LM Studio with every layer on the GPU and one engine in VRAM at a time. Energy is board joules per token. At 16 requests, throughput is 473 against 446 tokens a second.</p>
   <h2 class="next">Everything else stays close to C.</h2>
-  <p class="how">Across 16 whole programs, including parsers, compressors, interpreters and solvers, against <code>clang -O3</code> with the same answers on all 16.</p>
-  <div class="figs">
-      <figure class="fig"><b>1.09&times;</b><figcaption>clang's run time, on average</figcaption>
-        <div class="bar"><div class="row"><span>Mettle</span><span>22.2 ms</span></div><i class="me" style="--w:1"></i></div>
-        <div class="bar"><div class="row"><span>clang</span><span>20.4 ms</span></div><i style="--w:0.917"></i></div>
-      </figure>
-      <figure class="fig"><b>1.42&times;</b><figcaption>faster on a bytecode VM</figcaption>
-        <div class="bar"><div class="row"><span>Mettle</span><span>28.0 ms</span></div><i class="me" style="--w:0.705"></i></div>
-        <div class="bar"><div class="row"><span>clang</span><span>39.7 ms</span></div><i style="--w:1"></i></div>
-      </figure>
-      <figure class="fig"><b>1.22&times;</b><figcaption>faster on a sudoku solver</figcaption>
-        <div class="bar"><div class="row"><span>Mettle</span><span>24.5 ms</span></div><i class="me" style="--w:0.819"></i></div>
-        <div class="bar"><div class="row"><span>clang</span><span>29.9 ms</span></div><i style="--w:1"></i></div>
-      </figure>
-      <figure class="fig"><b>2&times;</b><figcaption>faster to build 90,000 lines</figcaption>
-        <div class="bar"><div class="row"><span>Mettle</span><span>7.6 s</span></div><i class="me" style="--w:0.477"></i></div>
-        <div class="bar"><div class="row"><span>clang</span><span>16.0 s</span></div><i style="--w:1"></i></div>
-      </figure>
+  <p class="how">Every whole program in the benchmark suite, including parsers, compressors, interpreters and solvers.</p>
+  <div class="c-grid">
+    <div class="c-figs">
+      <figure class="fig"><b>{{C_O3}}&times;</b><figcaption>the run time of <code>clang -O3</code>, on average, with the same answers on all 16</figcaption></figure>
+      <figure class="fig"><b>{{C_NATIVE}}&times;</b><figcaption>the run time of <code>clang -O3 -march=native</code>, which leads on all 16</figcaption></figure>
+      <figure class="fig"><b>2&times;</b><figcaption>faster to build a generated 90,000-line file, 7.6&nbsp;s against 16.0&nbsp;s</figcaption></figure>
+    </div>
+    <figure class="spread" aria-label="Run time of each program relative to clang">
+      <div class="s-head"><span></span><span class="s-axis"><span>Mettle faster</span><span>clang faster</span></span><span></span></div>
+{{C_ROWS}}      <figcaption><i class="s-key"></i> against <code>-O3</code> <i class="s-key tick"></i> against <code>-march=native</code></figcaption>
+    </figure>
   </div>
-  <p class="method">clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. The slowest program is physics_grid at 1.29&times;. With <code>-march=native</code>, clang leads on all 16 and Mettle averages 1.13&times;. Build time is one generated file, and the lead grows on smaller ones.</p>
+  <p class="method">clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. Under <code>-march=native</code>, clang's physics_grid returns a different checksum. Run them with <code>tools/benchmark/mc.ps1 -Suite 3</code>.</p>
 </section>
 
 <main class="wrap wall" id="wall">
@@ -629,7 +655,7 @@ h1 span { display: block; text-wrap: balance; }
     }, { threshold: 0.35 }).observe(document.querySelector(".wall-grid"));
   }
 
-  document.querySelectorAll(".figs").forEach(function (figs) {
+  document.querySelectorAll(".figs, .spread").forEach(function (figs) {
     if (still || !("IntersectionObserver" in window)) {
       figs.classList.add("shown");
       return;
