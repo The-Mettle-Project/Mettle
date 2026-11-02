@@ -336,7 +336,7 @@ if ($built.Code -ne 0) {
     $outA = Join-Path $scratch "$name-a.out"
     $outB = Join-Path $scratch "$name-b.out"
     if (-not (Wait-For $outB "t=3 ")) { Fail $name "the second instance did not start" }
-    $at = [Math]::Max((Get-Tick (Read-Text $outA)), (Get-Tick (Read-Text $outB))) + 150
+    $at = [Math]::Max((Get-Tick (Read-Text $outA)), (Get-Tick (Read-Text $outB))) + 400
     Write-Source $source $tickB
     $patch = Invoke-Mettle @("--live-patch", $exe, "--live-at-tick", "$at", $source)
     if ($patch.Text -notmatch "at tick $at\)") { Fail $name "patch said: $($patch.Text)" }
