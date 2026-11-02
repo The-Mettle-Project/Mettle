@@ -1,6 +1,7 @@
 import "std/io"
 import "std/conv"
 import "std/thread"
+import "std/live"
 
 struct Ship {
     x: float64
@@ -40,6 +41,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
         i = i + 1;
     }
     while (frame < frames) {
+        live_tick(frame);
         quiesce;
         var k: int64 = 0;
         while (k < 4) {

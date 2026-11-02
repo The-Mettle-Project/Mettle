@@ -85,5 +85,29 @@ mettle --live-undo live.exe
 On Linux the program is `live`. This reverts the latest patch. Undo the fix
 from step 3 and the fault comes back, and the program waits again.
 
+## 5. Two at once
+
+Stop `mettle live`, build the program yourself, and start it in two
+terminals:
+
+```bash
+mettle --build --live live.mettle -o live.exe
+./live.exe 100000
+```
+
+Both copies read the same patches. Change `ship->y + 0.5` to `ship->y + 2.0`
+in `steer`, pick a frame a few seconds ahead of the later copy, and patch from
+a third terminal:
+
+```bash
+mettle --live-patch live.exe --live-at-tick 600 live.mettle
+```
+
+```text
+Patch 1: steer (678 bytes, at tick 600)
+```
+
+Each copy speeds up on its own frame 600.
+
 [Live programs](../../docs/live.md) covers what a patch can change;
 [the design](../../docs/design/live.md) covers how.
