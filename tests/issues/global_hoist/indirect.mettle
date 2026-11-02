@@ -1,0 +1,10 @@
+import "std/io";
+var g_v: int32 = 0;
+fn bump() { g_v = g_v + 1; }
+fn main() -> int32 {
+  var f: fn() -> void = &bump;
+  var n: int32 = 0;
+  while (g_v < 5 && n < 100) { f(); n += 1; }
+  println("n={n} (want 5)");
+  return 0;
+}

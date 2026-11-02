@@ -1080,6 +1080,23 @@ static int ir_licm_written_in(const IRFunction *function, size_t lo, size_t hi,
   return 0;
 }
 
+static int ir_licm_loop_has_call(const IRFunction *function, size_t lo,
+                                 size_t hi) {
+  for (size_t i = lo; i < hi && i < function->instruction_count; i++) {
+    const IROpcode op = function->instructions[i].op;
+    if (op == IR_OP_CALL || op == IR_OP_CALL_INDIRECT) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_licm_symbol_is_global(const IRFunction *function,
+                                    const char *name) {
+  return !ir_function_symbol_is_parameter(function, name) &&
+         !ir_function_find_declaration(function, name, 1);
+}
+
 int ir_hoist_invariant_arith_pass(IRFunction *function, int *changed) {
   if (!function || function->instruction_count == 0) {
     return 1;
@@ -1108,6 +1125,7 @@ int ir_hoist_invariant_arith_pass(IRFunction *function, int *changed) {
       continue;
     }
 
+    const int loop_calls = ir_licm_loop_has_call(function, header + 1, latch);
     for (size_t i = header + 1; i < latch && pick_count < IR_LICM_MAX_PER_LOOP;
          i++) {
       const IRInstruction *ins = &function->instructions[i];
@@ -1140,7 +1158,8 @@ int ir_hoist_invariant_arith_pass(IRFunction *function, int *changed) {
           }
           if (ir_licm_written_in(function, header + 1, latch, name) ||
               (slots[k]->kind == IR_OPERAND_SYMBOL &&
-               ir_symbol_address_taken(function, name))) {
+               (ir_symbol_address_taken(function, name) ||
+                (loop_calls && ir_licm_symbol_is_global(function, name))))) {
             ok = 0;
             break;
           }

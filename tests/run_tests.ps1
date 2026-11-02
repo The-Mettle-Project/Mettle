@@ -20702,7 +20702,9 @@ $issueRegressions = @(
   @{ Name = "issue_import_private_in_literals"; Entry = "tests/issues/import_private_literals/main.mettle"; Args = @(); Expect = @("16 16 16 8") },
   @{ Name = "issue_param_shadows_const"; Entry = "tests/issues/shadowing/const_param.mettle"; Args = @(); Expect = @("9 (want 9)") },
   @{ Name = "issue_local_shadows_const"; Entry = "tests/issues/shadowing/local_const.mettle"; Args = @(); Expect = @("9 (want 9)") },
-  @{ Name = "issue_param_shadows_function"; Entry = "tests/issues/shadowing/fn_param.mettle"; Args = @(); Expect = @("true (want true)", "argument (right)") }
+  @{ Name = "issue_param_shadows_function"; Entry = "tests/issues/shadowing/fn_param.mettle"; Args = @(); Expect = @("true (want true)", "argument (right)") },
+  @{ Name = "issue_global_hoist_direct_call"; Entry = "tests/issues/global_hoist/direct.mettle"; Args = @("-O"); Expect = @("n=5 (want 5)") },
+  @{ Name = "issue_global_hoist_indirect_call"; Entry = "tests/issues/global_hoist/indirect.mettle"; Args = @("-O"); Expect = @("n=5 (want 5)") }
 )
 foreach ($case in $issueRegressions) {
   $total++
