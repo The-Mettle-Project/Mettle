@@ -159,9 +159,14 @@ the one nearest the function runs first.
 
 The target comes as a `FunctionInfo` for a function, a `TypeInfo` for a struct and
 a `TraitInfo` for a trait. `FunctionInfo` holds the signature and the body as a
-structured tree over the unoptimized IR. `render_function` prints that tree back
-as Mettle, and a generator can walk it to write something else, which is how
-`grad` works. `refuse(why)` stops the build with your reason.
+structured tree over the IR. `render_function` prints that tree back as Mettle,
+and a generator can walk it to write something else, which is how `grad` works.
+`refuse(why)` stops the build with your reason.
+
+`@generate(optimized) fn g(f: FunctionInfo)` reads the function after the
+optimizer. Kernels and selects arrive spelled as loops and branches, and
+`f.kernels` names the ones that were there. `grad` works this way.
+`grad_unoptimized` reads the code as written.
 
 Generated source is a file like any other. It can import modules and declare or
 use generics, traits and closures. It can also hold `comptime for` and decorated

@@ -129,10 +129,32 @@ and call it. `grad(f)` is an ordinary call to a generator: the call site becomes
 the name the `Generated` value carries.
 
 `FunctionInfo` holds the signature, the locals and temporaries with their types,
-every function it reaches, and the body as a structured tree: code, `if`, `loop`,
-`block`, `break`, `continue` and `return`. The tree comes from the unoptimized IR
-through the structurizer the Metal backend uses, so an irreducible function is
-refused by name. `std/meta` prints the tree back as Mettle.
+every function it reaches, the structs those hold, and the body as a structured
+tree: code, `if`, `loop`, `block`, `break`, `continue` and `return`. The tree
+comes through the structurizer the Metal backend uses, so an irreducible function
+is refused by name. `std/meta` prints the tree back as Mettle.
+
+`@generate` reads the IR as lowered. `@generate(optimized)` reads it after the
+whole optimizer ran on the target and everything it reaches, in a stage build of
+its own. What the optimizer leaves is spelled in scalar operations before the
+generator sees it: `select` and `rotate_add` become branches and assigns, each
+SIMD kernel becomes the loop it stands for, and the names SSA leaves behind stay
+as locals. So `render_function` and `grad` have one vocabulary. `f.kernels` lists
+what was spelled. `simd_matmul_n32`, `inline_asm` and anything else with no scalar
+form is refused by name, in the operation's own words.
+
+`grad` reads optimized code. It builds the same tape either way, and on the same
+inputs the two return the same bits. Pinned minimums on three loop-heavy
+functions, optimized against `grad_unoptimized`:
+
+```mermaid
+xychart-beta
+  title "grad_unoptimized = 100, lower is faster"
+  x-axis ["pairs of structs --release", "pairs of structs no flags", "scalar loop and stencil --release"]
+  bar [97.5, 98.2, 97.7]
+```
+
+The cost is 13% more compile time on the first of those and a 4.6% larger binary.
 
 Parsed source runs through the type checker, borrow analysis, effects and
 contracts like anything else. Each generated function records which decorator

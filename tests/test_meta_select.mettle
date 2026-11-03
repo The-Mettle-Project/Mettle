@@ -1,0 +1,42 @@
+import "std/io";
+import "std/meta";
+
+@generate(optimized) fn selected_copy(f: FunctionInfo) -> Generated {
+  var found: bool = false;
+  for k in f.kernels {
+    if (k == "select") { found = true; }
+  }
+  if (!found) {
+    return refuse("'{f.name}' optimized without a select");
+  }
+  var rendered: Generated = render_function(f, "{f.name}__copy");
+  if (rendered.refused.length > 0) { return rendered; }
+  var t: Text;
+  text_add(&t, rendered.text);
+  text_add(&t, "\n@rule fn {f.name}__copy_holds(p: Program) -> Verdict {{\n  return verdict_pass();\n}\n");
+  return generated_as("{f.name}__copy", text_done(&t));
+}
+
+fn chosen(a: int64, b: int64) -> int64 {
+  var r: int64 = 0;
+  if (a > b) { r = a; } else { r = b; }
+  return r;
+}
+
+fn larger(a: float64, b: float64) -> float64 {
+  var r: float64 = 0.0;
+  if (a > b) { r = a; } else { r = b; }
+  return r * r;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  if (selected_copy(chosen)(9, 2) != 9) { bad = bad + 1; }
+  if (selected_copy(chosen)(2, 9) != 9) { bad = bad + 2; }
+  var g: larger__gradient = grad(larger)(3.0, 2.0);
+  if (g.d_a != 6.0 || g.d_b != 0.0) { bad = bad + 4; }
+  var h: larger__gradient = grad(larger)(1.0, 2.0);
+  if (h.d_a != 0.0 || h.d_b != 4.0) { bad = bad + 8; }
+  if (bad == 0) { println("ok"); }
+  return bad;
+}

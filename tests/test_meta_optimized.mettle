@@ -1,0 +1,461 @@
+import "std/io";
+import "std/math";
+import "std/meta";
+
+@generate(optimized) fn kernel_copy(f: FunctionInfo, args: string[]) -> Generated {
+  var found: bool = false;
+  for k in f.kernels {
+    if (k == args[0]) { found = true; }
+  }
+  if (!found) {
+    return refuse("'{f.name}' optimized without a '{args[0]}'");
+  }
+  var rendered: Generated = render_function(f, "{f.name}__copy");
+  if (rendered.refused.length > 0) { return rendered; }
+  var t: Text;
+  text_add(&t, rendered.text);
+  text_add(&t, "\n{signature_text(f.name, f)} {{\n");
+  if (f.return_type != "void") { text_add(&t, "  return "); } else { text_add(&t, "  "); }
+  text_add(&t, "{f.inner_name}({arguments_text(f)});\n}\n\n");
+  text_add(&t, "@rule fn {f.name}__copy_holds(p: Program) -> Verdict {{\n  return verdict_pass();\n}\n");
+  return generated(text_done(&t));
+}
+
+@kernel_copy(simd_sum_i32) fn k_sum(a: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) { s = s + (int64)a[i]; i = i + 1; }
+  return s;
+}
+
+@kernel_copy(simd_dot_i32) fn k_dot(a: int32*, b: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) { s = s + (int64)a[i] * (int64)b[i]; i = i + 1; }
+  return s;
+}
+
+@kernel_copy(simd_scale_i32) fn k_scale(src: int32*, dst: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[i] * 3 + 7;
+    dst[i] = v;
+    s = s + (int64)v;
+    i = i + 1;
+  }
+  return s;
+}
+
+@kernel_copy(simd_reverse_copy_i32) fn k_reverse(src: int32*, dst: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[n - 1 - i];
+    dst[i] = v;
+    s = s + (int64)v;
+    i = i + 1;
+  }
+  return s;
+}
+
+@kernel_copy(prefix_sum_i32) fn k_prefix(src: int32*, dst: int32*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int64)src[i];
+    dst[i] = (int32)sum;
+    i = i + 1;
+  }
+  return sum;
+}
+
+@kernel_copy(simd_insertion_sort_i32) fn k_sort(data: int32*, len: int32) {
+  var i: int32 = 1;
+  var cur: int32* = data + 1;
+  while (i < len) {
+    var key: int32 = *cur;
+    var scan: int32* = cur;
+    var j: int32 = i - 1;
+    while (j >= 0) {
+      var prev: int32* = scan - 1;
+      var current: int32 = *prev;
+      if (current <= key) {
+        break;
+      }
+      *scan = current;
+      scan = prev;
+      j = j - 1;
+    }
+    *scan = key;
+    cur = cur + 1;
+    i = i + 1;
+  }
+}
+
+@kernel_copy(simd_byte_map) fn k_map(buf: uint8*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    buf[i] = (uint8)(buf[i] * 3 + 7);
+    buf[i] = buf[i] ^ 0xA5;
+    i = i + 1;
+  }
+}
+
+@kernel_copy(simd_sum_f64) fn k_sum_f64(a: float64*, n: int64) -> float64 {
+  var s: float64 = 0.0;
+  var i: int64 = 0;
+  while (i < n) { s = s + a[i]; i = i + 1; }
+  return s;
+}
+
+@kernel_copy(simd_dot_f32) fn k_dot_f32(a: float32*, b: float32*, n: int64) -> float32 {
+  var s: float32 = 0.0;
+  var i: int64 = 0;
+  while (i < n) { s = s + a[i] * b[i]; i = i + 1; }
+  return s;
+}
+
+@kernel_copy(simd_affine_map_f64) fn k_affine(src: float64*, dst: float64*, n: int64) -> int32 {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = 2.0 * src[i] + 3.0 * dst[i] + 5.0;
+    i = i + 1;
+  }
+  return 0;
+}
+
+@kernel_copy(simd_vloop_f64) fn k_vloop(out: float64*, a: float64*, b: float64*, n: int32) {
+  for i in 0..n { out[i] = (a[i] + b[i]) * (a[i] - 1.5); }
+}
+
+@kernel_copy(simd_find) fn k_find(a: int32*, n: int32, k: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) {
+    if (a[i] == k) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+@kernel_copy(simd_lcg_u32) fn k_lcg(seed: int64, iters: int64) -> int64 {
+  var state: uint32 = (uint32)seed;
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < iters) {
+    state = state * 1103515245 + 12345;
+    sum = sum + (int64)(state & 2147483647);
+    i = i + 1;
+  }
+  return sum;
+}
+
+@kernel_copy(simd_minmax_i32) fn k_min(arr: int32*, n: int64) -> int64 {
+  var minv: int32 = arr[0];
+  var maxv: int32 = arr[0];
+  var i: int64 = 1;
+  while (i < n) {
+    var v: int32 = arr[i];
+    if (v < minv) { minv = v; }
+    if (v > maxv) { maxv = v; }
+    i = i + 1;
+  }
+  return (int64)minv * 100000 + (int64)maxv;
+}
+
+fn clamp1(v: int32, lo: int32, hi: int32) -> int32 {
+  if (v < lo) { return lo; }
+  if (v > hi) { return hi; }
+  return v;
+}
+
+@kernel_copy(simd_clamp_i32) fn k_clamp(src: int32*, dst: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = clamp1(src[i], -5, 5);
+    dst[i] = v;
+    s = s + (int64)v;
+    i = i + 1;
+  }
+  return s;
+}
+
+@kernel_copy(simd_sum_u8) fn k_sum_u8(buf: uint8*, n: int32) -> int64 {
+  var s: int64 = 0;
+  var i: int32 = 0;
+  while (i < n) { s = s + (int64)buf[i]; i = i + 1; }
+  return s;
+}
+
+@kernel_copy(simd_dot_i8) fn k_dot_i8(a: int8*, b: int8*, n: int64) -> int32 {
+  var sum: int32 = 0;
+  for i: int64 in 0..n {
+    sum = sum + (int32)a[i] * (int32)b[i];
+  }
+  return sum;
+}
+
+@kernel_copy(simd_copy) fn k_copy(dst: int32*, src: int32*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    dst[i] = src[i];
+    i += 1;
+  }
+}
+
+@kernel_copy(simd_fill) fn k_fill(buf: uint32*, n: int32, c: uint32) {
+  var i: int32 = 0;
+  while (i < n) { buf[i] = c; i = i + 1; }
+}
+
+@kernel_copy(count_word_starts) fn k_words(buf: cstring, len: int64) -> int64 {
+  var count: int64 = 0;
+  var i: int64 = 0;
+  var in_word: int32 = 0;
+  while (i < len) {
+    var c: uint8 = (uint8)buf[i];
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      in_word = 0;
+    } else {
+      if (in_word == 0) {
+        count = count + 1;
+      }
+      in_word = 1;
+    }
+    i = i + 1;
+  }
+  return count;
+}
+
+@kernel_copy(simd_i2f_reduce_f64) fn k_i2f() -> int64 {
+  var acc: int64 = 0;
+  var i: int64 = 0;
+  while (i < 100) {
+    acc = acc + (int64)((float64)i * 0.5);
+    i = i + 1;
+  }
+  return acc;
+}
+
+@kernel_copy(simd_outer_lane_f64) fn k_outer(P: int64, N: int64) -> float64 {
+  var total: float64 = 0.0;
+  var p: int64 = 0;
+  while (p < P) {
+    var iacc: float64 = 1.0;
+    var i: int64 = 0;
+    while (i < N) { iacc = iacc / 1.5; i = i + 1; }
+    total = total + iacc;
+    p = p + 1;
+  }
+  return total;
+}
+
+extern fn expf(x: float32) -> float32 = "expf";
+
+@kernel_copy(simd_silu_f32) fn k_silu(g: float32*, u: float32*, n: int32) {
+  for i in 0..n { g[i] = (g[i] / (1.0 + expf(0.0 - g[i]))) * u[i]; }
+}
+
+fn picked(a: float64, b: float64) -> float64 {
+  var r: float64 = a * 2.0;
+  if (b > a) { r = b * b; }
+  return r * a;
+}
+
+fn total_of(w: float64[], k: float64) -> float64 {
+  var t: float64 = 0.0;
+  for i in 0..w.length { t = t + w[i]; }
+  return t * k;
+}
+
+fn dotted(a: float64[], b: float64[]) -> float64 {
+  var t: float64 = 0.0;
+  for i in 0..a.length { t = t + a[i] * b[i]; }
+  return t;
+}
+
+fn mapped(w: float64[]) -> float64 {
+  var out: float64[8];
+  for i in 0..w.length { out[i] = w[i] * 3.0 + 1.0; }
+  var t: float64 = 0.0;
+  for i in 0..w.length { t = t + out[i] * out[i]; }
+  return t;
+}
+
+struct Pt {
+  x: float64;
+  y: float64;
+}
+
+fn shifted(p: Pt, by: float64) -> Pt {
+  var q: Pt;
+  q.x = p.x + by;
+  q.y = p.y * by;
+  return q;
+}
+
+fn through_struct(p: Pt, by: float64) -> float64 {
+  var q: Pt = shifted(p, by);
+  return q.x * q.y;
+}
+
+fn near(name: string, got: float64, want: float64) -> int32 {
+  var gap: float64 = got - want;
+  if (gap < 0.0) { gap = -gap; }
+  if (gap > 0.000000001) {
+    println("{name}: got {got}, want {want}");
+    return 1;
+  }
+  return 0;
+}
+
+fn check_int_kernels() -> int32 {
+  var bad: int32 = 0;
+  var a: int32[12];
+  var b: int32[12];
+  var c: int32[12];
+  var d: int32[12];
+  for i in 0..12 {
+    a[i] = (i * 7 - 30);
+    b[i] = (13 - i * 3);
+  }
+  if (k_sum(&a[0], 12) != k_sum__copy(&a[0], 12)) { bad = bad + 1; }
+  if (k_dot(&a[0], &b[0], 12) != k_dot__copy(&a[0], &b[0], 12)) { bad = bad + 1; }
+  if (k_scale(&a[0], &c[0], 12) != k_scale__copy(&a[0], &d[0], 12) || c[5] != d[5]) { bad = bad + 1; }
+  if (k_reverse(&a[0], &c[0], 12) != k_reverse__copy(&a[0], &d[0], 12) || c[3] != d[3]) { bad = bad + 1; }
+  if (k_prefix(&a[0], &c[0], 12) != k_prefix__copy(&a[0], &d[0], 12) || c[11] != d[11]) { bad = bad + 1; }
+  if (k_find(&a[0], 12, a[7]) != k_find__copy(&a[0], 12, a[7])) { bad = bad + 1; }
+  if (k_find(&a[0], 12, 9999) != k_find__copy(&a[0], 12, 9999)) { bad = bad + 1; }
+  if (k_lcg(5, 40) != k_lcg__copy(5, 40)) { bad = bad + 1; }
+  for i in 0..12 { c[i] = b[i]; d[i] = b[i]; }
+  k_sort(&c[0], 12);
+  k_sort__copy(&d[0], 12);
+  for i in 0..12 {
+    if (c[i] != d[i]) { bad = bad + 1; }
+  }
+  var bytes_a: uint8[20];
+  var bytes_b: uint8[20];
+  for i in 0..20 {
+    bytes_a[i] = (uint8)(i * 11);
+    bytes_b[i] = (uint8)(i * 11);
+  }
+  k_map(&bytes_a[0], 20);
+  k_map__copy(&bytes_b[0], 20);
+  for i in 0..20 {
+    if (bytes_a[i] != bytes_b[i]) { bad = bad + 1; }
+  }
+  if (k_sum_u8(&bytes_a[0], 20) != k_sum_u8__copy(&bytes_a[0], 20)) { bad = bad + 1; }
+  var signed_a: int8[9];
+  var signed_b: int8[9];
+  for i in 0..9 {
+    signed_a[i] = (int8)(i * 9 - 40);
+    signed_b[i] = (int8)(30 - i * 7);
+  }
+  if (k_dot_i8(&signed_a[0], &signed_b[0], 9) != k_dot_i8__copy(&signed_a[0], &signed_b[0], 9)) { bad = bad + 1; }
+  if (k_min(&a[0], 12) != k_min__copy(&a[0], 12)) { bad = bad + 1; }
+  if (k_clamp(&a[0], &c[0], 12) != k_clamp__copy(&a[0], &d[0], 12) || c[1] != d[1]) { bad = bad + 1; }
+  k_copy(&c[0], &a[0], 12);
+  k_copy__copy(&d[0], &a[0], 12);
+  for i in 0..12 {
+    if (c[i] != d[i] || c[i] != a[i]) { bad = bad + 1; }
+  }
+  var fills_a: uint32[10];
+  var fills_b: uint32[10];
+  k_fill(&fills_a[0], 10, (uint32)7);
+  k_fill__copy(&fills_b[0], 10, (uint32)7);
+  for i in 0..10 {
+    if (fills_a[i] != fills_b[i] || fills_b[i] != (uint32)7) { bad = bad + 1; }
+  }
+  var words: string = "  the quick\tbrown\n fox  ";
+  var text: cstring = (cstring)words.chars;
+  if (k_words(text, (int64)words.length) != k_words__copy(text, (int64)words.length) ||
+      k_words__copy(text, (int64)words.length) != 4) { bad = bad + 1; }
+  if (k_i2f() != k_i2f__copy()) { bad = bad + 1; }
+  if (bad > 0) { println("int kernels: {bad} differ"); }
+  return bad;
+}
+
+fn check_float_kernels() -> int32 {
+  var bad: int32 = 0;
+  var a: float64[8];
+  var b: float64[8];
+  var c: float64[8];
+  var f: float32[8];
+  var g: float32[8];
+  for i in 0..8 {
+    a[i] = (float64)(i + 1) * 0.5;
+    b[i] = 2.0 - (float64)i;
+    c[i] = b[i];
+    f[i] = (float32)(i + 1);
+    g[i] = (float32)(3 - i);
+  }
+  bad = bad + near("sum_f64", k_sum_f64__copy(&a[0], 8), k_sum_f64(&a[0], 8));
+  bad = bad + near("dot_f32", (float64)k_dot_f32__copy(&f[0], &g[0], 8), (float64)k_dot_f32(&f[0], &g[0], 8));
+  k_affine(&a[0], &b[0], 8);
+  k_affine__copy(&a[0], &c[0], 8);
+  for i in 0..8 { bad = bad + near("affine", c[i], b[i]); }
+  k_vloop(&b[0], &a[0], &c[0], 8);
+  var d: float64[8];
+  k_vloop__copy(&d[0], &a[0], &c[0], 8);
+  for i in 0..8 { bad = bad + near("vloop", d[i], b[i]); }
+  bad = bad + near("outer lane", k_outer__copy(3, 5), k_outer(3, 5));
+  var u: float32[8];
+  var v: float32[8];
+  for i in 0..8 {
+    u[i] = f[i];
+    v[i] = f[i];
+  }
+  k_silu(&u[0], &g[0], 8);
+  k_silu__copy(&v[0], &g[0], 8);
+  for i in 0..8 {
+    var gap: float32 = u[i] - v[i];
+    if (gap < (float32)0.0) { gap = (float32)0.0 - gap; }
+    if (gap > (float32)0.001) {
+      println("silu at {i}");
+      bad = bad + 1;
+    }
+  }
+  return bad;
+}
+
+fn check_grads() -> int32 {
+  var bad: int32 = 0;
+  var p: picked__gradient = grad(picked)(2.0, 3.0);
+  bad = bad + near("select value", p.value, 18.0);
+  bad = bad + near("select d_a", p.d_a, 9.0);
+  bad = bad + near("select d_b", p.d_b, 12.0);
+  var q: picked__gradient = grad(picked)(3.0, 2.0);
+  bad = bad + near("select other d_a", q.d_a, 12.0);
+  bad = bad + near("select other d_b", q.d_b, 0.0);
+
+  var w: float64[] = new float64[4];
+  for i in 0..4 { w[i] = (float64)(i + 1); }
+  var t: total_of__gradient = grad(total_of)(w, 2.0);
+  bad = bad + near("sum d_w", t.d_w[2], 2.0);
+  bad = bad + near("sum d_k", t.d_k, 10.0);
+
+  var v: float64[] = new float64[4];
+  for i in 0..4 { v[i] = 5.0 - (float64)i; }
+  var s: dotted__gradient = grad(dotted)(w, v);
+  bad = bad + near("dot d_a", s.d_a[1], v[1]);
+  bad = bad + near("dot d_b", s.d_b[3], w[3]);
+
+  var m: mapped__gradient = grad(mapped)(w);
+  bad = bad + near("map d_w", m.d_w[1], 2.0 * (w[1] * 3.0 + 1.0) * 3.0);
+
+  var pt: Pt;
+  pt.x = 2.0;
+  pt.y = 3.0;
+  var ts: through_struct__gradient = grad(through_struct)(pt, 4.0);
+  bad = bad + near("struct d_p.x", ts.d_p.x, 12.0);
+  bad = bad + near("struct d_p.y", ts.d_p.y, 24.0);
+  bad = bad + near("struct d_by", ts.d_by, 3.0 * 4.0 + 6.0 * 3.0);
+  return bad;
+}
+
+fn main() -> int32 {
+  var bad: int32 = check_int_kernels() + check_float_kernels() + check_grads();
+  if (bad == 0) { println("ok"); }
+  return bad;
+}

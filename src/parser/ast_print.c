@@ -496,7 +496,8 @@ static void print_function_declaration(AstPrinter *printer, const ASTNode *node)
   if (decl->meta_role == META_ROLE_LAYOUT) {
     fputs("@layout ", printer->out);
   } else if (decl->meta_role == META_ROLE_GENERATE) {
-    fputs("@generate ", printer->out);
+    fputs(decl->meta_optimized ? "@generate(optimized) " : "@generate ",
+          printer->out);
   }
   print_meta_decorators(printer, decl->meta_decorators,
                         decl->meta_decorator_count);

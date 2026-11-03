@@ -186,6 +186,7 @@ typedef struct {
   MetaDecorator *meta_decorators;
   size_t meta_decorator_count;
   int meta_role;
+  int meta_optimized;
   const char *generated_by;
 } FunctionDeclaration;
 

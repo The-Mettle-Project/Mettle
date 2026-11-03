@@ -34,8 +34,11 @@ foreach ($case in $Cases) {
         $name = "$case.$($mode.Name)"
         $exe = Join-Path $scratch "$name.exe"
         $flags = $mode.Args
+        if ($case -eq "test_meta_select") { $env:METTLE_IF_CONVERT = "1" }
         $built = & cmd /c "`"$Compiler`" --build $flags tests/$case.mettle -o `"$exe`" 2>&1" | Out-String
-        if ($LASTEXITCODE -ne 0) {
+        $buildCode = $LASTEXITCODE
+        if ($case -eq "test_meta_select") { Remove-Item Env:METTLE_IF_CONVERT }
+        if ($buildCode -ne 0) {
             $failed += "$name build: $built"
             continue
         }

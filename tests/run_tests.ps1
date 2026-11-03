@@ -1600,6 +1600,7 @@ $cases = @(
   @{ Name = "err_generate_impure_memoize"; Path = "tests/err_generate_impure_memoize.mettle"; ShouldSucceed = $false; Pattern = "@memoize needs a pure function: 'bump__inner' writes the global" },
   @{ Name = "err_generate_wrong_grad"; Path = "tests/err_generate_wrong_grad.mettle"; ShouldSucceed = $false; Pattern = "disagrees with finite differences" },
   @{ Name = "err_generate_grad_extern"; Path = "tests/err_generate_grad_extern.mettle"; ShouldSucceed = $false; Pattern = "has no derivative" },
+  @{ Name = "err_meta_optimized_refused"; Path = "tests/err_meta_optimized_refused.mettle"; ShouldSucceed = $false; Pattern = "grad\('add_via_asm'\): 'inline_asm' at line \d+ has no spelling in Mettle" },
   @{ Name = "err_generate_wrong_grad_struct"; Path = "tests/err_generate_wrong_grad_struct.mettle"; ShouldSucceed = $false; Pattern = "disagrees with finite differences on 'v.y'" },
   @{ Name = "err_generate_bad_source"; Path = "tests/err_generate_bad_source.mettle"; ShouldSucceed = $false; Pattern = "wrote source that does not parse" },
   @{ Name = "err_generate_bad_import"; Path = "tests/err_generate_bad_import.mettle"; ShouldSucceed = $false; Pattern = "wrote source that did not resolve: Could not resolve imported file 'std/no_such_module'" },
@@ -3768,7 +3769,7 @@ catch {
 
 # Layouts and generators written in Mettle: every access goes through the data a
 # metafunction returned, and every generated function runs, at every level.
-foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn", "test_meta_generated_source", "test_meta_grad_struct")) {
+foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn", "test_meta_generated_source", "test_meta_grad_struct", "test_meta_optimized")) {
   foreach ($layoutMode in @(@(), @("-O"), @("--release"))) {
     $total++
     $layoutName = "$($layoutCase)_$(($layoutMode -join '') -replace '-','')"
@@ -3786,6 +3787,27 @@ foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_t
       Write-CaseResult -Name $layoutName -Passed $false -Reason $_.Exception.Message
     }
   }
+}
+
+# A generator that reads optimized code reads a select as a branch. Selects only
+# appear with if-conversion on.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $exePath = Join-Path $tmpDir "meta_select.exe"
+  $env:METTLE_IF_CONVERT = "1"
+  $buildOut = & $CompilerPath --build "tests/test_meta_select.mettle" -o $exePath 2>&1 | Out-String
+  $buildCode = $LASTEXITCODE
+  Remove-Item Env:METTLE_IF_CONVERT
+  if ($buildCode -ne 0) { throw "build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "program returned ${LASTEXITCODE}: $runOut" }
+  Write-CaseResult -Name "meta_select" -Passed $true
+}
+catch {
+  if ($env:METTLE_IF_CONVERT) { Remove-Item Env:METTLE_IF_CONVERT }
+  $failed++
+  Write-CaseResult -Name "meta_select" -Passed $false -Reason $_.Exception.Message
 }
 
 # A metaprogram costs nothing where it is absent, and the build says what one

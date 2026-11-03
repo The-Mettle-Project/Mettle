@@ -680,6 +680,7 @@ typedef struct {
   int parallel_mode;
   char *numerics_contract;
   int meta_role;
+  int meta_optimized;
   MetaDecorator *meta;
   size_t meta_count;
 } ParsedDecorators;
@@ -915,7 +916,22 @@ static int parser_parse_one_decorator(Parser *parser,
     }
     out->meta_role =
         strcmp(name, "layout") == 0 ? META_ROLE_LAYOUT : META_ROLE_GENERATE;
+    int is_generator = out->meta_role == META_ROLE_GENERATE;
     parser_advance(parser);
+    if (is_generator && parser->current_token.type == TOKEN_LPAREN) {
+      parser_advance(parser);
+      if (!parser_is_identifier_like(parser->current_token.type) ||
+          strcmp(parser->current_token.value, "optimized") != 0) {
+        parser_set_error(parser, "'@generate' takes one argument, 'optimized', "
+                                 "to read the function after the optimizer");
+        return 0;
+      }
+      out->meta_optimized = 1;
+      parser_advance(parser);
+      if (!parser_expect(parser, TOKEN_RPAREN)) {
+        return 0;
+      }
+    }
   } else if (!parser_parse_meta_decorator(parser, out)) {
     return 0;
   }
@@ -940,6 +956,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->parallel_mode = 0;
   out->numerics_contract = NULL;
   out->meta_role = META_ROLE_NONE;
+  out->meta_optimized = 0;
   out->meta = NULL;
   out->meta_count = 0;
 
@@ -1024,6 +1041,7 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
   fd->meta_decorators = decos.meta;
   fd->meta_decorator_count = decos.meta_count;
   fd->meta_role = decos.meta_role;
+  fd->meta_optimized = decos.meta_optimized;
   if (fd->is_extern) {
     parser_set_error(parser,
                      "Decorators cannot be applied to extern functions");

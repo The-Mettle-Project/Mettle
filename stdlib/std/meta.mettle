@@ -59,6 +59,7 @@ export struct FunctionInfo {
   body: IRNode[];
   reached: FunctionInfo[];
   struct_types: TypeInfo[];
+  kernels: string[];
   refused: string;
 }
 
@@ -485,6 +486,23 @@ export fn arguments_text(f: FunctionInfo) -> string {
   return text_done(&t);
 }
 
+fn render_imports(t: Text*, f: FunctionInfo) {
+  for k in f.kernels {
+    if (k == "simd_exp_f32" || k == "simd_silu_f32") {
+      text_add(t, "import \"std/math\";\n");
+      return;
+    }
+  }
+  for held in f.reached {
+    for k in held.kernels {
+      if (k == "simd_exp_f32" || k == "simd_silu_f32") {
+        text_add(t, "import \"std/math\";\n");
+        return;
+      }
+    }
+  }
+}
+
 export fn render_declarations(t: Text*, f: FunctionInfo) {
   for i in 0..f.locals.length {
     text_add(t, "  var {f.locals[i].name}: {f.locals[i].type_name};\n");
@@ -497,11 +515,12 @@ export fn render_declarations(t: Text*, f: FunctionInfo) {
 
 export fn render_function(f: FunctionInfo, name: string) -> Generated {
   if (f.refused.length > 0) {
-    return refuse("'{f.name}' has control flow with no structure: {f.refused}");
+    return refuse("'{f.name}' cannot be read: {f.refused}");
   }
   var t: Text;
   var r: Render;
   r.out = &t;
+  render_imports(&t, f);
   text_add(&t, "{signature_text(name, f)} {{\n");
   render_declarations(&t, f);
   emit_nodes(&r, f.body, f);
@@ -1348,7 +1367,7 @@ fn ad_emit_node(r: Render*, node: IRNode, f: FunctionInfo, root: FunctionInfo) {
 fn ad_render_variant(t: Text*, r: Render*, f: FunctionInfo, root: FunctionInfo,
                      name: string) {
   if (f.refused.length > 0) {
-    render_refuse(r, "'{f.name}' has control flow with no structure: {f.refused}");
+    render_refuse(r, "'{f.name}' cannot be read: {f.refused}");
     return;
   }
   text_add(t, "fn {name}(");
@@ -1415,7 +1434,15 @@ fn grad_probe_value(probe: int64, param: int64) -> string {
   return "2.25";
 }
 
-@generate export fn grad(f: FunctionInfo) -> Generated {
+@generate(optimized) export fn grad(f: FunctionInfo) -> Generated {
+  return grad_of(f);
+}
+
+@generate export fn grad_unoptimized(f: FunctionInfo) -> Generated {
+  return grad_of(f);
+}
+
+fn grad_of(f: FunctionInfo) -> Generated {
   if (!type_is_float(f.return_type)) {
     return refuse("grad('{f.name}'): it returns '{f.return_type}', and a gradient needs a float");
   }
@@ -1426,6 +1453,7 @@ fn grad_probe_value(probe: int64, param: int64) -> string {
   if (params_problem.length > 0) {
     return refuse("grad('{f.name}'): {params_problem}");
   }
+  render_imports(&t, f);
   var needed: bool[] = new bool[f.reached.length];
   ad_mark_nodes(f.body, f, needed);
   for i in 0..f.reached.length {

@@ -1,0 +1,14 @@
+import "std/meta";
+
+fn add_via_asm(a: float64, b: int64) -> float64 {
+  var c: int64 = b;
+  asm {
+    "nop"
+  }
+  return a + (float64)c;
+}
+
+fn main() -> int32 {
+  var g: add_via_asm__gradient = grad(add_via_asm)(1.0, 2);
+  return (int32)g.d_a;
+}

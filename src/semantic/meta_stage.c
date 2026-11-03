@@ -3,7 +3,9 @@
 #include "../compiler/compiler_context.h"
 #include "../ir/ir_interp.h"
 #include "../ir/ir_lowering.h"
+#include "../ir/ir_optimize.h"
 #include "../ir/ir_rules.h"
+#include "../ir/ir_verify.h"
 #include "../lexer/lexer.h"
 #include "../parser/parser.h"
 #include "import_resolver.h"
@@ -1595,9 +1597,41 @@ static int build_for_generators(MetaStage *stage, const GenList *list,
   return built;
 }
 
+static int build_optimized(MetaStage *stage, const GenList *list,
+                           StageBuild *out) {
+  Program *program = (Program *)stage->program->data;
+  NameSet names = {0};
+  NameSet types = {0};
+  for (size_t i = 0; i < list->count; i++) {
+    if (list->items[i].generator->meta_optimized) {
+      name_set_add(&names, list->items[i].target, -1);
+    }
+  }
+  close_over_functions(program, &names, &types);
+  int built = stage_build(stage, &names, NULL, out);
+  if (!built) {
+    stage->report->stage_builds--;
+    built = stage_build(stage, NULL, NULL, out);
+  }
+  name_set_free(&names);
+  name_set_free(&types);
+  if (!built) {
+    return 0;
+  }
+  IROptimizeOptions options;
+  memset(&options, 0, sizeof(options));
+  int verifying = ir_verify_enabled();
+  ir_verify_set_enabled(0);
+  int optimized = ir_optimize_program(out->ir, &options);
+  ir_verify_set_enabled(verifying);
+  return optimized;
+}
+
 static int run_generator_list(MetaStage *stage, GenList *list,
                               StageBuild *build_in) {
   StageBuild build = *build_in;
+  StageBuild optimized;
+  int have_optimized = 0;
   for (size_t i = 0; i < list->count; i++) {
     GenWork *work = &list->items[i];
     char driver[64];
@@ -1608,10 +1642,25 @@ static int run_generator_list(MetaStage *stage, GenList *list,
     SourceLocation at = work->decl ? work->decl->location : work->call->location;
     int reads_function =
         strcmp(work->generator->parameter_types[0], "FunctionInfo") == 0;
+    StageBuild *read_from = &build;
+    if (reads_function && work->generator->meta_optimized) {
+      if (!have_optimized) {
+        if (!build_optimized(stage, list, &optimized)) {
+          report_at(stage, at, "L0001",
+                    "the optimizer could not run for a generator that reads "
+                    "optimized code",
+                    NULL);
+          return 0;
+        }
+        have_optimized = 1;
+      }
+      read_from = &optimized;
+    }
     int imaged =
         reads_function
-            ? rule_reflect_build_function(build.checker, build.ir, work->target,
-                                          work->inner_name, &image, &image_error)
+            ? rule_reflect_build_function(read_from->checker, read_from->ir,
+                                          work->target, work->inner_name, &image,
+                                          &image_error)
             : rule_reflect_build(build.checker, build.clone, stage->root_file,
                                  stage->target, NULL, &image, &image_error);
     if (!imaged) {

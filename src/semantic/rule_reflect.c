@@ -1,6 +1,7 @@
 #include "rule_reflect.h"
 #include "../codegen/gpu_structure.h"
 #include "../ir/ir_machine.h"
+#include "../ir/ir_scalarize.h"
 #include "../ir/ir_trace.h"
 #include "import_resolver.h"
 #include "type_checker_internal.h"
@@ -1286,6 +1287,9 @@ static const char *meta_result_type(MetaImage *m, const IRInstruction *ins) {
   case IR_OP_CALL: {
     Symbol *callee = meta_callee(m, ins);
     Type *returned = callee ? callee->data.function.return_type : NULL;
+    if (!returned && ins->is_float) {
+      return meta_float_name(ins->float_bits);
+    }
     if (returned && returned->name &&
         (returned->kind == TYPE_FLOAT32 || returned->kind == TYPE_FLOAT64 ||
          returned->kind == TYPE_STRUCT || returned->kind == TYPE_STRING ||
@@ -1833,7 +1837,6 @@ static void meta_put_function(MetaImage *m, size_t base, IRFunction *fn,
   const Type *t = m->function_type;
   char why[400];
   GpuStructure structure;
-  m->fn = fn;
   m->locals = NULL;
   m->local_count = 0;
   m->temps = NULL;
@@ -1851,6 +1854,30 @@ static void meta_put_function(MetaImage *m, size_t base, IRFunction *fn,
   put_site(image, m->site_type, base + field_offset(t, "site", image),
            &(IRRuleSite){fn->location.filename, fn->location.line,
                          fn->location.column});
+  why[0] = '\0';
+  {
+    const char **kernels = malloc((fn->instruction_count + 1) * sizeof(char *));
+    size_t kernel_count = 0;
+    for (size_t i = 0; kernels && i < fn->instruction_count; i++) {
+      if (ir_scalarize_opcode_is_kernel(fn->instructions[i].op) &&
+          fn->instructions[i].op != IR_OP_PREFETCH &&
+          fn->instructions[i].op != IR_OP_SAFETY_CHECK) {
+        kernels[kernel_count++] = ir_opcode_name(fn->instructions[i].op);
+      }
+    }
+    if (kernel_count > 0) {
+      size_t names = put_string_array(image, kernels, kernel_count);
+      put_slice(image, base + field_offset(t, "kernels", image), names,
+                kernel_count);
+    }
+    free(kernels);
+  }
+  fn = ir_scalarize_function(fn, why, sizeof(why));
+  if (!fn) {
+    image_put_string(image, base + field_offset(t, "refused", image), why);
+    return;
+  }
+  m->fn = fn;
   for (size_t p = 0; p < fn->parameter_count; p++) {
     meta_add_entry(&m->locals, &m->local_count, fn->parameter_names[p],
                    fn->parameter_types[p], 1);
