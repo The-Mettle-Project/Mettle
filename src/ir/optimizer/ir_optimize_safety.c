@@ -3343,7 +3343,7 @@ static int safety_describe_globals(IRProgram *program, IRFunction *entry) {
     }
     for (size_t r = 0; r < symbol->init_reloc_count; r++) {
       const IRInitReloc *reloc = &symbol->init_relocs[r];
-      int mode = reloc->string ? (reloc->string_wants_record ? 2 : 1) : 0;
+      int mode = reloc->string ? (reloc->string_wants_record ? 3 : 1) : 0;
       if (!safety_seed_global_pointer(&out, entry->location, symbol->name, reloc->offset,
                                       mode, reloc->string_length + 1)) {
         ir_instruction_vector_destroy(&out);

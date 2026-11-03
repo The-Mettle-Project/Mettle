@@ -1600,6 +1600,7 @@ $cases = @(
   @{ Name = "err_generate_impure_memoize"; Path = "tests/err_generate_impure_memoize.mettle"; ShouldSucceed = $false; Pattern = "@memoize needs a pure function: 'bump__inner' writes the global" },
   @{ Name = "err_generate_wrong_grad"; Path = "tests/err_generate_wrong_grad.mettle"; ShouldSucceed = $false; Pattern = "disagrees with finite differences" },
   @{ Name = "err_generate_grad_extern"; Path = "tests/err_generate_grad_extern.mettle"; ShouldSucceed = $false; Pattern = "has no derivative" },
+  @{ Name = "err_generate_wrong_grad_struct"; Path = "tests/err_generate_wrong_grad_struct.mettle"; ShouldSucceed = $false; Pattern = "disagrees with finite differences on 'v.y'" },
   @{ Name = "err_generate_bad_source"; Path = "tests/err_generate_bad_source.mettle"; ShouldSucceed = $false; Pattern = "wrote source that does not parse" },
   @{ Name = "err_generate_bad_import"; Path = "tests/err_generate_bad_import.mettle"; ShouldSucceed = $false; Pattern = "wrote source that did not resolve: Could not resolve imported file 'std/no_such_module'" },
   @{ Name = "err_generate_dyn_self"; Path = "tests/err_generate_dyn_self.mettle"; ShouldSucceed = $false; Pattern = "takes a second Self" },
@@ -3767,7 +3768,7 @@ catch {
 
 # Layouts and generators written in Mettle: every access goes through the data a
 # metafunction returned, and every generated function runs, at every level.
-foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn", "test_meta_generated_source")) {
+foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn", "test_meta_generated_source", "test_meta_grad_struct")) {
   foreach ($layoutMode in @(@(), @("-O"), @("--release"))) {
     $total++
     $layoutName = "$($layoutCase)_$(($layoutMode -join '') -replace '-','')"

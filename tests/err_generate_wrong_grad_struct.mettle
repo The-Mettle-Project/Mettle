@@ -1,0 +1,35 @@
+import "std/meta";
+
+struct Vec2 {
+  x: float64;
+  y: float64;
+}
+
+fn wrong_grad(f: FunctionInfo) -> string {
+  return grad_rule_text(f, "{f.name}__grad");
+}
+
+@generate fn wrong(f: FunctionInfo) -> Generated {
+  var t: Text;
+  text_add(&t, "struct {f.name}__gradient {{\n  value: float64;\n  d_v: Vec2;\n}\n\n");
+  text_add(&t, "fn {f.name}__grad(v_v: Vec2) -> {f.name}__gradient {{\n");
+  text_add(&t, "  var out: {f.name}__gradient;\n");
+  text_add(&t, "  out.value = {f.name}(v_v);\n");
+  text_add(&t, "  out.d_v.x = 1.0;\n  out.d_v.y = 2.0;\n");
+  text_add(&t, "  return out;\n}\n\n");
+  text_add(&t, wrong_grad(f));
+  return generated_as("{f.name}__grad", text_done(&t));
+}
+
+fn loss(v: Vec2) -> float64 {
+  return v.x * v.x + v.y;
+}
+
+fn main() -> int32 {
+  var v: Vec2;
+  v.x = 3.0;
+  v.y = 1.0;
+  var g: loss__gradient = wrong(loss)(v);
+  if (g.d_v.x > 0.0) { return 0; }
+  return 1;
+}

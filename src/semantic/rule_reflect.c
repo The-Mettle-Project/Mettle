@@ -1163,6 +1163,8 @@ typedef struct {
   const Type *local_type;
   const Type *function_type;
   const Type *site_type;
+  const Type *type_info_type;
+  const Type *field_info_type;
   IRFunction *fn;
   MetaLocal *locals;
   size_t local_count;
@@ -1886,6 +1888,115 @@ static void meta_put_function(MetaImage *m, size_t base, IRFunction *fn,
                  structure.uses_exit);
 }
 
+static void meta_note_held_type(MetaImage *m, const Type ***seen, size_t *count,
+                                const Type *type) {
+  if (!type) {
+    return;
+  }
+  if (type->kind == TYPE_ARRAY) {
+    meta_note_held_type(m, seen, count, type->base_type);
+    return;
+  }
+  if (type->kind != TYPE_STRUCT && type->kind != TYPE_TAGGED_ENUM) {
+    return;
+  }
+  for (size_t i = 0; i < *count; i++) {
+    if ((*seen)[i] == type) {
+      return;
+    }
+  }
+  const Type **grown = realloc(*seen, (*count + 1) * sizeof(Type *));
+  if (!grown) {
+    return;
+  }
+  *seen = grown;
+  (*seen)[(*count)++] = type;
+  if (type->kind == TYPE_STRUCT) {
+    for (size_t f = 0; f < type->field_count; f++) {
+      meta_note_held_type(m, seen, count, type->field_types[f]);
+    }
+  }
+}
+
+static void meta_note_function_types(MetaImage *m, const Type ***seen,
+                                     size_t *count, const IRFunction *fn) {
+  meta_note_held_type(
+      m, seen, count,
+      fn->return_type_name
+          ? type_checker_get_type_by_name(m->checker, fn->return_type_name)
+          : NULL);
+  for (size_t p = 0; p < fn->parameter_count; p++) {
+    meta_note_held_type(
+        m, seen, count,
+        type_checker_get_type_by_name(m->checker, fn->parameter_types[p]));
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *ins = &fn->instructions[i];
+    if (ins->op == IR_OP_DECLARE_LOCAL && ins->text) {
+      meta_note_held_type(m, seen, count,
+                          type_checker_get_type_by_name(m->checker, ins->text));
+    }
+    if (ins->op == IR_OP_CALL) {
+      Symbol *callee = meta_callee(m, ins);
+      if (callee) {
+        meta_note_held_type(m, seen, count,
+                            callee->data.function.return_type);
+      }
+    }
+  }
+}
+
+static void meta_put_held_types(MetaImage *m, size_t root, const Type **seen,
+                                size_t count) {
+  Image *image = m->image;
+  const Type *info = m->type_info_type;
+  const Type *field_info = m->field_info_type;
+  if (count == 0) {
+    return;
+  }
+  size_t array = image_reserve(image, info->size * count, info->alignment);
+  for (size_t i = 0; i < count; i++) {
+    const Type *type = seen[i];
+    size_t base = array + i * info->size;
+    image_put_string(image, base + field_offset(info, "name", image),
+                     type_display_name(type));
+    image_put_string(image, base + field_offset(info, "kind", image),
+                     type->kind == TYPE_STRUCT ? "struct" : "enum");
+    image_put_u64(image, base + field_offset(info, "size", image),
+                  (unsigned long long)type->size);
+    image_put_u64(image, base + field_offset(info, "align", image),
+                  (unsigned long long)type->alignment);
+    image_put_u64(image, base + field_offset(info, "layout", image),
+                  type->meta_layout
+                      ? (unsigned long long)type->meta_layout->region_count
+                      : 0ull);
+    size_t field_count = type->kind == TYPE_STRUCT ? type->field_count : 0;
+    if (field_count == 0) {
+      continue;
+    }
+    size_t fields = image_reserve(image, field_info->size * field_count,
+                                  field_info->alignment);
+    for (size_t f = 0; f < field_count; f++) {
+      size_t at = fields + f * field_info->size;
+      const Type *held = type->field_types[f];
+      image_put_string(image, at + field_offset(field_info, "name", image),
+                       type->field_names[f]);
+      image_put_string(image, at + field_offset(field_info, "type_name", image),
+                       type_display_name(held));
+      image_put_u64(image, at + field_offset(field_info, "offset", image),
+                    (unsigned long long)type->field_offsets[f]);
+      image_put_u64(image, at + field_offset(field_info, "size", image),
+                    held ? (unsigned long long)held->size : 0);
+      image_put_u64(image, at + field_offset(field_info, "align", image),
+                    held ? (unsigned long long)held->alignment : 0);
+    }
+    put_slice(image, base + field_offset(info, "fields", image), fields,
+              field_count);
+  }
+  put_slice(image, root + field_offset(m->function_type, "struct_types", image),
+            array, count);
+}
+
 static void meta_collect_reached(IRProgram *ir, IRFunction *fn,
                                  IRFunction ***out, size_t *count) {
   for (size_t i = 0; i < fn->instruction_count; i++) {
@@ -1933,8 +2044,11 @@ int rule_reflect_build_function(TypeChecker *checker, IRProgram *ir,
   m.local_type = lookup_qualified(checker, "std/meta.LocalInfo");
   m.function_type = lookup_qualified(checker, "std/meta.FunctionInfo");
   m.site_type = lookup_qualified(checker, "std/rule.Site");
+  m.type_info_type = lookup_qualified(checker, "std/rule.TypeInfo");
+  m.field_info_type = lookup_qualified(checker, "std/rule.FieldInfo");
   if (!m.value_type || !m.op_type || !m.node_type || !m.local_type ||
-      !m.function_type || !m.site_type) {
+      !m.function_type || !m.site_type || !m.type_info_type ||
+      !m.field_info_type) {
     *error_message = strdup("a generator needs 'import \"std/meta\";'");
     return 0;
   }
@@ -1961,6 +2075,14 @@ int rule_reflect_build_function(TypeChecker *checker, IRProgram *ir,
     put_slice(&image, root + field_offset(m.function_type, "reached", &image),
               array, reached_count);
   }
+  const Type **held_types = NULL;
+  size_t held_count = 0;
+  meta_note_function_types(&m, &held_types, &held_count, fn);
+  for (size_t r = 0; r < reached_count; r++) {
+    meta_note_function_types(&m, &held_types, &held_count, reached[r]);
+  }
+  meta_put_held_types(&m, root, held_types, held_count);
+  free(held_types);
   free(reached);
   size_t pool_base = image_reserve(&image, image.pool_size, 8);
   if (!image.failed && image.pool_size > 0) {

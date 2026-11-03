@@ -166,6 +166,17 @@ the same names to their own types. If a stage build fails for the whole list of
 generators, each generator runs alone, so one that needs another's output waits
 for the next round.
 
+## Gradients through memory
+
+A float temporary carries its tape node in a shadow local. Memory carries nodes in
+a table keyed by address, which a store and a load update. A struct passed by
+value lands at a new address, so the differentiated function takes the caller's
+address as an extra argument and copies the table entries for the struct's bytes
+on entry. A returned struct names its address in `ad_return_address`, and the
+caller copies from there straight after the call. A zeroing or integer store
+clears the entries it overwrites, so a stale node from an earlier frame cannot
+reach a fresh local.
+
 ## Checks on generated code
 
 A generator states what it promises by writing a `@rule` with its code. The rule

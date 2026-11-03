@@ -132,7 +132,8 @@ fn main() -> int32 {
 - `@memoize` caches results in a table.
 - `@trace` reports each entry and exit.
 - `grad(f)` is reverse-mode differentiation. Slices of floats are differentiated
-  element by element.
+  element by element. A struct passed by value gets a gradient of the same type,
+  so `grad(f)(s, t).d_s.a.x` is the derivative with respect to `s.a.x`.
 - `@dyn` on a trait writes a fat pointer type, one table per implementation and
   the forwarding functions.
 

@@ -1,0 +1,159 @@
+import "std/io";
+import "std/math";
+import "std/meta";
+
+struct Vec2 {
+  x: float64;
+  y: float64;
+}
+
+struct Seg {
+  a: Vec2;
+  b: Vec2;
+  w: float32;
+  n: int32;
+}
+
+struct Holds {
+  cells: float64[3];
+  scale: float32;
+}
+
+fn dot(a: Vec2, b: Vec2) -> float64 {
+  return a.x * b.x + a.y * b.y;
+}
+
+fn scaled(v: Vec2, k: float64) -> Vec2 {
+  var out: Vec2;
+  out.x = v.x * k;
+  out.y = v.y * k;
+  return out;
+}
+
+fn added(a: Vec2, b: Vec2) -> Vec2 {
+  var out: Vec2;
+  out.x = a.x + b.x;
+  out.y = a.y + b.y;
+  return out;
+}
+
+fn same(v: Vec2) -> Vec2 {
+  return v;
+}
+
+fn make(x: float64, y: float64) -> Vec2 {
+  var out: Vec2;
+  out.x = x;
+  out.y = y;
+  return out;
+}
+
+fn length2(v: Vec2) -> float64 {
+  return dot(v, v);
+}
+
+fn plain(v: Vec2, k: float64) -> float64 {
+  return v.x * v.x * k + sin(v.y);
+}
+
+fn nested(s: Seg, t: float64) -> float64 {
+  var mid: Vec2 = added(scaled(s.a, t), scaled(s.b, 1.0 - t));
+  return length2(same(mid)) * (float64)s.w + (float64)s.n;
+}
+
+fn through_memory(v: Vec2, k: float64) -> float64 {
+  var cells: Vec2[3];
+  cells[0] = v;
+  cells[1] = scaled(cells[0], k);
+  var p: Vec2* = &cells[1];
+  cells[2] = *p;
+  var held: Vec2 = cells[2];
+  return held.x + held.y * v.x;
+}
+
+fn only_return(x: float64) -> float64 {
+  var v: Vec2 = make(x * x, 3.0);
+  v = same(v);
+  return v.x + v.y;
+}
+
+fn from_array(h: Holds, k: float64) -> float64 {
+  var total: float64 = 0.0;
+  for i in 0..3 {
+    total = total + h.cells[i] * k;
+  }
+  return total * (float64)h.scale;
+}
+
+fn stale_frame(x: float64) -> float64 {
+  var first: Vec2 = make(x, x);
+  var fresh: float64 = zero_reader();
+  return first.x + fresh;
+}
+
+fn zero_reader() -> float64 {
+  var unset: Vec2;
+  return unset.x;
+}
+
+fn near(name: string, got: float64, want: float64) -> int32 {
+  var gap: float64 = got - want;
+  if (gap < 0.0) { gap = -gap; }
+  if (gap > 0.000000001) {
+    println("{name}: got {got}, want {want}");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  var v: Vec2;
+  v.x = 3.0;
+  v.y = 0.5;
+  var g: plain__gradient = grad(plain)(v, 2.0);
+  bad = bad + near("plain value", g.value, plain(v, 2.0));
+  bad = bad + near("plain d_v.x", g.d_v.x, 2.0 * 3.0 * 2.0);
+  bad = bad + near("plain d_v.y", g.d_v.y, cos(0.5));
+  bad = bad + near("plain d_k", g.d_k, 9.0);
+
+  var s: Seg;
+  s.a.x = 1.0;
+  s.a.y = 2.0;
+  s.b.x = 3.0;
+  s.b.y = 4.0;
+  s.w = 2.0;
+  s.n = 5;
+  var n: nested__gradient = grad(nested)(s, 0.25);
+  var mx: float64 = 1.0 * 0.25 + 3.0 * 0.75;
+  var my: float64 = 2.0 * 0.25 + 4.0 * 0.75;
+  bad = bad + near("nested value", n.value, (mx * mx + my * my) * 2.0 + 5.0);
+  bad = bad + near("nested d_s.a.x", n.d_s.a.x, 2.0 * 2.0 * mx * 0.25);
+  bad = bad + near("nested d_s.b.y", n.d_s.b.y, 2.0 * 2.0 * my * 0.75);
+  bad = bad + near("nested d_s.w", n.d_s.w, mx * mx + my * my);
+  bad = bad + near("nested d_t", n.d_t, 2.0 * 2.0 * (mx * (1.0 - 3.0) + my * (2.0 - 4.0)));
+
+  var m: through_memory__gradient = grad(through_memory)(v, 2.0);
+  bad = bad + near("memory d_v.x", m.d_v.x, 2.0 + v.y * 2.0);
+  bad = bad + near("memory d_v.y", m.d_v.y, 2.0 * v.x);
+  bad = bad + near("memory d_k", m.d_k, v.x + v.y * v.x);
+
+  var r: only_return__gradient = grad(only_return)(4.0);
+  bad = bad + near("return d_x", r.d_x, 8.0);
+
+  var h: Holds;
+  h.cells[0] = 1.0;
+  h.cells[1] = 2.0;
+  h.cells[2] = 3.0;
+  h.scale = 2.0;
+  var a: from_array__gradient = grad(from_array)(h, 3.0);
+  bad = bad + near("array d_h.cells[1]", a.d_h.cells[1], 3.0 * 2.0);
+  bad = bad + near("array d_h.scale", a.d_h.scale, 6.0 * 3.0);
+  bad = bad + near("array d_k", a.d_k, 6.0 * 2.0);
+
+  var f: stale_frame__gradient = grad(stale_frame)(2.0);
+  bad = bad + near("stale d_x", f.d_x, 1.0);
+
+  if (bad == 0) { println("ok"); }
+  return bad;
+}
