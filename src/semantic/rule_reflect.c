@@ -2,6 +2,7 @@
 #include "../codegen/gpu_structure.h"
 #include "../ir/ir_machine.h"
 #include "../ir/ir_scalarize.h"
+#include "../ir/optimizer/ir_optimize_internal.h"
 #include "../ir/ir_trace.h"
 #include "import_resolver.h"
 #include "type_checker_internal.h"
@@ -1986,7 +1987,7 @@ static void meta_put_held_types(MetaImage *m, size_t root, const Type **seen,
     const Type *type = seen[i];
     size_t base = array + i * info->size;
     image_put_string(image, base + field_offset(info, "name", image),
-                     type_display_name(type));
+                     strip_import_prefix(type->name));
     image_put_string(image, base + field_offset(info, "kind", image),
                      type->kind == TYPE_STRUCT ? "struct" : "enum");
     image_put_u64(image, base + field_offset(info, "size", image),
@@ -2009,7 +2010,7 @@ static void meta_put_held_types(MetaImage *m, size_t root, const Type **seen,
       image_put_string(image, at + field_offset(field_info, "name", image),
                        type->field_names[f]);
       image_put_string(image, at + field_offset(field_info, "type_name", image),
-                       type_display_name(held));
+                       held ? strip_import_prefix(held->name) : "?");
       image_put_u64(image, at + field_offset(field_info, "offset", image),
                     (unsigned long long)type->field_offsets[f]);
       image_put_u64(image, at + field_offset(field_info, "size", image),
@@ -2126,6 +2127,197 @@ int rule_reflect_build_function(TypeChecker *checker, IRProgram *ir,
     free(image.bytes);
     free(image.pointers);
     *error_message = strdup("could not lay out the function a generator reads");
+    return 0;
+  }
+  out->bytes = image.bytes;
+  out->size = image.size;
+  out->pointer_offsets = image.pointers;
+  out->pointer_count = image.pointer_count;
+  return 1;
+}
+
+int rule_reflect_build_one_function(TypeChecker *layouts, TypeChecker *program,
+                                    IRFunction *fn, IRRuleImage *out,
+                                    char **error_message) {
+  MetaImage m;
+  Image image;
+  memset(&m, 0, sizeof(m));
+  memset(&image, 0, sizeof(image));
+  memset(out, 0, sizeof(*out));
+  m.image = &image;
+  m.checker = program;
+  m.value_type = lookup_qualified(layouts, "std/meta.IRValue");
+  m.op_type = lookup_qualified(layouts, "std/meta.IROp");
+  m.node_type = lookup_qualified(layouts, "std/meta.IRNode");
+  m.local_type = lookup_qualified(layouts, "std/meta.LocalInfo");
+  m.function_type = lookup_qualified(layouts, "std/meta.FunctionInfo");
+  m.site_type = lookup_qualified(layouts, "std/rule.Site");
+  m.type_info_type = lookup_qualified(layouts, "std/rule.TypeInfo");
+  m.field_info_type = lookup_qualified(layouts, "std/rule.FieldInfo");
+  if (!m.value_type || !m.op_type || !m.node_type || !m.local_type ||
+      !m.function_type || !m.site_type || !m.type_info_type ||
+      !m.field_info_type) {
+    *error_message = strdup("printing a function needs std/meta");
+    return 0;
+  }
+  size_t root = image_reserve(&image, m.function_type->size,
+                              m.function_type->alignment);
+  meta_put_function(&m, root, fn, NULL);
+  const Type **held_types = NULL;
+  size_t held_count = 0;
+  meta_note_function_types(&m, &held_types, &held_count, fn);
+  meta_put_held_types(&m, root, held_types, held_count);
+  free(held_types);
+  size_t pool_base = image_reserve(&image, image.pool_size, 8);
+  if (!image.failed && image.pool_size > 0) {
+    memcpy(image.bytes + pool_base, image.pool, image.pool_size);
+  }
+  for (size_t i = 0; i < image.string_count && !image.failed; i++) {
+    image_put_pointer(&image, image.string_fields[i],
+                      pool_base + image.string_offsets[i]);
+  }
+  free(image.pool);
+  free(image.string_fields);
+  free(image.string_offsets);
+  if (image.failed) {
+    free(image.bytes);
+    free(image.pointers);
+    *error_message = strdup("could not lay out the function to print");
+    return 0;
+  }
+  out->bytes = image.bytes;
+  out->size = image.size;
+  out->pointer_offsets = image.pointers;
+  out->pointer_count = image.pointer_count;
+  return 1;
+}
+
+typedef struct {
+  Image *image;
+  const Type *operand_type;
+  const Type *op_type;
+  const IRTempUseMap *uses;
+} PassImage;
+
+static void pass_put_operand(PassImage *p, size_t base, const IROperand *operand) {
+  Image *image = p->image;
+  const Type *t = p->operand_type;
+  image_put_u64(image, base + field_offset(t, "kind", image),
+                (unsigned long long)operand->kind);
+  if (operand->name) {
+    image_put_string(image, base + field_offset(t, "name", image), operand->name);
+  }
+  image_put_u64(image, base + field_offset(t, "int_value", image),
+                (unsigned long long)operand->int_value);
+  unsigned long long bits = 0;
+  memcpy(&bits, &operand->float_value, sizeof(bits));
+  image_put_u64(image, base + field_offset(t, "float_value", image), bits);
+  image_put_u64(image, base + field_offset(t, "float_bits", image),
+                (unsigned long long)operand->float_bits);
+  if (operand->kind == IR_OPERAND_TEMP && operand->name) {
+    image_put_u64(image, base + field_offset(t, "uses", image),
+                  (unsigned long long)ir_temp_use_map_get(p->uses, operand->name));
+  }
+}
+
+int rule_reflect_build_pass(TypeChecker *checker, const IRFunction *fn,
+                            IRRuleImage *out, char **error_message) {
+  Image image;
+  PassImage p;
+  IRTempUseMap uses;
+  const Type *function_type = lookup_qualified(checker, "std/pass.PassFunction");
+  memset(&image, 0, sizeof(image));
+  memset(out, 0, sizeof(*out));
+  p.image = &image;
+  p.operand_type = lookup_qualified(checker, "std/pass.PassOperand");
+  p.op_type = lookup_qualified(checker, "std/pass.PassOp");
+  if (!function_type || !p.operand_type || !p.op_type) {
+    *error_message = strdup("a pass needs 'import \"std/pass\";'");
+    return 0;
+  }
+  if (!ir_temp_use_map_init(&uses)) {
+    return 0;
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    ir_collect_instruction_temp_uses(&uses, &fn->instructions[i]);
+  }
+  p.uses = &uses;
+  size_t root =
+      image_reserve(&image, function_type->size, function_type->alignment);
+  image_put_string(&image, root + field_offset(function_type, "name", &image),
+                   fn->name);
+  image_put_string(&image,
+                   root + field_offset(function_type, "return_type", &image),
+                   fn->return_type_name ? fn->return_type_name : "void");
+  if (fn->parameter_count > 0) {
+    size_t names =
+        put_string_array(&image, (const char *const *)fn->parameter_names,
+                         fn->parameter_count);
+    size_t types =
+        put_string_array(&image, (const char *const *)fn->parameter_types,
+                         fn->parameter_count);
+    put_slice(&image, root + field_offset(function_type, "param_names", &image),
+              names, fn->parameter_count);
+    put_slice(&image, root + field_offset(function_type, "param_types", &image),
+              types, fn->parameter_count);
+  }
+  size_t code = image_reserve(&image, p.op_type->size * (fn->instruction_count + 1),
+                              p.op_type->alignment);
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *ins = &fn->instructions[i];
+    size_t base = code + i * p.op_type->size;
+    image_put_string(&image, base + field_offset(p.op_type, "op", &image),
+                     ir_opcode_name(ins->op));
+    if (ins->text) {
+      image_put_string(&image, base + field_offset(p.op_type, "text", &image),
+                       ins->text);
+    }
+    pass_put_operand(&p, base + field_offset(p.op_type, "dest", &image), &ins->dest);
+    pass_put_operand(&p, base + field_offset(p.op_type, "lhs", &image), &ins->lhs);
+    pass_put_operand(&p, base + field_offset(p.op_type, "rhs", &image), &ins->rhs);
+    if (ins->argument_count > 0) {
+      size_t args = image_reserve(&image,
+                                  p.operand_type->size * ins->argument_count,
+                                  p.operand_type->alignment);
+      for (size_t a = 0; a < ins->argument_count; a++) {
+        pass_put_operand(&p, args + a * p.operand_type->size, &ins->arguments[a]);
+      }
+      put_slice(&image, base + field_offset(p.op_type, "args", &image), args,
+                ins->argument_count);
+    }
+    image_put_bool(&image, base + field_offset(p.op_type, "is_float", &image),
+                   ins->is_float);
+    image_put_u64(&image, base + field_offset(p.op_type, "float_bits", &image),
+                  (unsigned long long)ins->float_bits);
+    image_put_bool(&image, base + field_offset(p.op_type, "is_unsigned", &image),
+                   ins->is_unsigned);
+    image_put_bool(&image, base + field_offset(p.op_type, "is_volatile", &image),
+                   ins->is_volatile);
+    image_put_u64(&image, base + field_offset(p.op_type, "alias_class", &image),
+                  (unsigned long long)ins->alias_class);
+    image_put_u64(&image, base + field_offset(p.op_type, "origin", &image),
+                  (unsigned long long)i);
+    image_put_u64(&image, base + field_offset(p.op_type, "place", &image),
+                  (unsigned long long)i);
+  }
+  put_slice(&image, root + field_offset(function_type, "code", &image), code,
+            fn->instruction_count);
+  ir_temp_use_map_destroy(&uses);
+  size_t pool_base = image_reserve(&image, image.pool_size, 8);
+  if (!image.failed && image.pool_size > 0) {
+    memcpy(image.bytes + pool_base, image.pool, image.pool_size);
+  }
+  for (size_t i = 0; i < image.string_count && !image.failed; i++) {
+    image_put_pointer(&image, image.string_fields[i],
+                      pool_base + image.string_offsets[i]);
+  }
+  free(image.pool);
+  free(image.string_fields);
+  free(image.string_offsets);
+  if (image.failed) {
+    free(image.bytes);
+    free(image.pointers);
+    *error_message = strdup("could not lay out the function a pass reads");
     return 0;
   }
   out->bytes = image.bytes;

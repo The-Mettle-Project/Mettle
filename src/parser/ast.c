@@ -151,6 +151,7 @@ static ASTNode *ast_clone_method_declaration(ASTNode *clone, const ASTNode *node
   dst->meta_decorator_count = src->meta_decorator_count;
   dst->meta_role = src->meta_role;
   dst->meta_optimized = src->meta_optimized;
+  dst->meta_point = src->meta_point;
   dst->generated_by = src->generated_by;
   dst->name = ast_intern_string(src->name);
   dst->return_type = ast_intern_string(src->return_type);
@@ -1918,6 +1919,7 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->meta_decorator_count = 0;
   func_decl->meta_role = META_ROLE_NONE;
   func_decl->meta_optimized = 0;
+  func_decl->meta_point = NULL;
   func_decl->generated_by = NULL;
   func_decl->rewrite_role = 0;
   func_decl->effects_with = NULL;

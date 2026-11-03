@@ -11,6 +11,13 @@ int rule_reflect_build_function(TypeChecker *checker, IRProgram *ir,
                                 const char *name, const char *inner_name,
                                 IRRuleImage *out, char **error_message);
 
+int rule_reflect_build_pass(TypeChecker *checker, const IRFunction *fn,
+                            IRRuleImage *out, char **error_message);
+
+int rule_reflect_build_one_function(TypeChecker *layouts, TypeChecker *program,
+                                    IRFunction *fn, IRRuleImage *out,
+                                    char **error_message);
+
 int rule_reflect_build(TypeChecker *checker, ASTNode *program,
                        const char *root_file, const char *target,
                        const IREffectResults *effects, IRRuleImage *out,

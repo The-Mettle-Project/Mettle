@@ -308,6 +308,8 @@ static unsigned long long ir_volatile_signature(const IRFunction *function) {
   return signature;
 }
 
+static void ir_library_passes_after(IRFunction *function, const char *pass_name);
+
 static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
                              const char *failure_message, int *changed_out) {
   int changed = 0;
@@ -413,7 +415,57 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
   if (changed_out) {
     *changed_out = changed;
   }
+  ir_library_passes_after(function, pass->name);
   return 1;
+}
+
+static const IRLibraryPass *g_library_passes = NULL;
+static size_t g_library_pass_count = 0;
+static const IRLibraryPass *g_library_current = NULL;
+static int g_library_running = 0;
+
+void ir_library_passes_set(const IRLibraryPass *passes, size_t count) {
+  g_library_passes = passes;
+  g_library_pass_count = count;
+}
+
+static int ir_library_trampoline(IRFunction *function, int *changed) {
+  return g_library_current->run(function, g_library_current->context, changed);
+}
+
+void ir_library_passes_at(IRFunction *function, const char *point) {
+  if (g_library_pass_count == 0 || g_library_running) {
+    return;
+  }
+  for (size_t i = 0; i < g_library_pass_count; i++) {
+    const IRLibraryPass *pass = &g_library_passes[i];
+    if (strcmp(pass->point, point) != 0) {
+      continue;
+    }
+    IROptNamedPass named = {pass->name, ir_library_trampoline, {0, 0}};
+    g_library_running = 1;
+    g_library_current = pass;
+    ir_run_named_pass(function, &named, "library pass failed", NULL);
+    g_library_running = 0;
+  }
+}
+
+static void ir_library_passes_after(IRFunction *function, const char *pass_name) {
+  if (g_library_pass_count == 0 || g_library_running) {
+    return;
+  }
+  for (size_t i = 0; i < g_library_pass_count; i++) {
+    const IRLibraryPass *pass = &g_library_passes[i];
+    if (strncmp(pass->point, "after_", 6) != 0 ||
+        strcmp(pass->point + 6, pass_name) != 0) {
+      continue;
+    }
+    IROptNamedPass named = {pass->name, ir_library_trampoline, {0, 0}};
+    g_library_running = 1;
+    g_library_current = pass;
+    ir_run_named_pass(function, &named, "library pass failed", NULL);
+    g_library_running = 0;
+  }
 }
 
 int ir_run_named_pass_sequence(IRFunction *function,
@@ -476,10 +528,12 @@ int ir_run_named_stage_fixpoint(IRFunction *function,
           (any != 0 && (feature_flags & any) == 0)) {
         ir_trace_pass_event(pass->name, "disabled", &version, -1);
         clean_version[slot[i]] = version;
+        ir_library_passes_after(function, pass->name);
         continue;
       }
       if (clean_version[slot[i]] == version) {
         ir_trace_pass_event(pass->name, "already_clean", &version, -1);
+        ir_library_passes_after(function, pass->name);
         continue;
       }
 
@@ -531,17 +585,20 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
   if (!enabled) {
     ir_trace_pass_event(pass_name, "disabled", version, -1);
     clean_version[pass_id] = *version;
+    ir_library_passes_after(function, pass_name);
     return 1;
   }
 
   if (ir_pass_is_skipped(pass_id)) {
     ir_trace_pass_event(pass_name, "skipped", version, -1);
     clean_version[pass_id] = *version;
+    ir_library_passes_after(function, pass_name);
     return 1;
   }
 
   if (clean_version[pass_id] == *version) {
     ir_trace_pass_event(pass_name, "already_clean", version, -1);
+    ir_library_passes_after(function, pass_name);
     return 1;
   }
 
@@ -591,5 +648,6 @@ int ir_run_fixpoint_pass(IRFunction *function, IROptPassId pass_id,
   if (pass_changed) {
     ir_dump_pass_result(function, pass_name);
   }
+  ir_library_passes_after(function, pass_name);
   return 1;
 }

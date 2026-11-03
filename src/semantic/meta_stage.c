@@ -6,6 +6,7 @@
 #include "../ir/ir_optimize.h"
 #include "../ir/ir_rules.h"
 #include "../ir/ir_verify.h"
+#include "../ir/optimizer/ir_optimize_internal.h"
 #include "../lexer/lexer.h"
 #include "../parser/parser.h"
 #include "import_resolver.h"
@@ -1881,6 +1882,558 @@ static int stage_round(MetaStage *stage) {
   return ok;
 }
 
+typedef struct {
+  const char *name;
+  char driver[96];
+  StageBuild *build;
+} LatePass;
+
+static MetaStage g_late;
+static StageBuild g_late_build;
+static LatePass *g_late_passes = NULL;
+static size_t g_late_pass_count = 0;
+static IRLibraryPass *g_late_table = NULL;
+static StageBuild g_builtin_build;
+static int g_builtin_state = 0;
+static LatePass g_builtin_pass;
+
+static IROperand late_read_operand(IRInterpMachine *machine, const Type *t,
+                                   unsigned long long at) {
+  long long kind = read_i64(machine, at + field_at(t, "kind"));
+  char *name = read_text(machine, at + field_at(t, "name"));
+  long long int_value = read_i64(machine, at + field_at(t, "int_value"));
+  double float_value = 0.0;
+  read_bytes(machine, at + field_at(t, "float_value"), &float_value, 8);
+  long long float_bits = read_i64(machine, at + field_at(t, "float_bits"));
+  IROperand out = ir_operand_none();
+  switch (kind) {
+  case IR_OPERAND_TEMP:
+    out = ir_operand_temp(name);
+    break;
+  case IR_OPERAND_SYMBOL:
+    out = ir_operand_symbol(name);
+    break;
+  case IR_OPERAND_INT:
+    out = ir_operand_int(int_value);
+    break;
+  case IR_OPERAND_FLOAT:
+    out = ir_operand_float_sized(float_value, (int)float_bits);
+    break;
+  case IR_OPERAND_STRING:
+    out = ir_operand_string(name ? name : "");
+    break;
+  case IR_OPERAND_LABEL:
+    out = ir_operand_label(name);
+    break;
+  default:
+    break;
+  }
+  free(name);
+  return out;
+}
+
+static int late_opcode_named(const char *name, IROpcode *out) {
+  for (int op = 0; op < IR_OP_KIND_COUNT; op++) {
+    const char *known = ir_opcode_name((IROpcode)op);
+    if (known && name && strcmp(known, name) == 0) {
+      *out = (IROpcode)op;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int late_same_instruction(const IRInstruction *a, const IRInstruction *b) {
+  if (a->op != b->op || a->is_float != b->is_float ||
+      a->float_bits != b->float_bits || a->is_unsigned != b->is_unsigned ||
+      a->is_volatile != b->is_volatile || a->alias_class != b->alias_class ||
+      a->argument_count != b->argument_count ||
+      !ir_operand_same(&a->dest, &b->dest) || !ir_operand_same(&a->lhs, &b->lhs) ||
+      !ir_operand_same(&a->rhs, &b->rhs)) {
+    return 0;
+  }
+  if ((a->text == NULL) != (b->text == NULL) ||
+      (a->text && strcmp(a->text, b->text) != 0)) {
+    return 0;
+  }
+  for (size_t i = 0; i < a->argument_count; i++) {
+    if (!ir_operand_same(&a->arguments[i], &b->arguments[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void late_copy_kept_fields(IRInstruction *to, const IRInstruction *from) {
+  to->uniform_branch = from->uniform_branch;
+  to->uniform_value = from->uniform_value;
+  to->divergent_call = from->divergent_call;
+  to->gpu_launch_indirect = from->gpu_launch_indirect;
+  to->column_base = from->column_base;
+  to->expansion_note = from->expansion_note;
+  to->effect_signature = from->effect_signature;
+}
+
+static void late_error(const IRFunction *function, const char *format,
+                       const char *a, const char *b) {
+  const char *file =
+      function->location.filename ? function->location.filename : "?";
+  fprintf(stderr, "%s:%zu:%zu: error[L0007]: ", file,
+          (size_t)function->location.line, (size_t)function->location.column);
+  fprintf(stderr, format, a, b);
+  fputc('\n', stderr);
+  ir_optimize_note_user_error();
+}
+
+static int late_load_source(StageBuild *build, const char *text,
+                            const char *virtual_file) {
+  char *lower_error = NULL;
+  memset(build, 0, sizeof(*build));
+  Lexer *lexer = lexer_create(text);
+  ErrorReporter *reporter = error_reporter_create(virtual_file, text);
+  Parser *parser =
+      lexer && reporter ? parser_create_with_error_reporter(lexer, reporter) : NULL;
+  ASTNode *parsed = parser ? parser_parse_program(parser) : NULL;
+  if (!parsed || error_reporter_has_errors(reporter) ||
+      !resolve_imports_isolated(parsed, g_late.root_file, reporter) ||
+      !monomorphize_program(parsed, reporter)) {
+    return 0;
+  }
+  clear_clone_roles((Program *)parsed->data);
+  build->clone = parsed;
+  build->reporter = reporter;
+  build->symbols = symbol_table_create();
+  build->checker = build->symbols ? type_checker_create_with_error_reporter(
+                                        build->symbols, reporter)
+                                  : NULL;
+  if (!build->checker) {
+    return 0;
+  }
+  type_checker_set_launch_report(0);
+  type_checker_set_gpu_type_report(0);
+  ir_lowering_set_explain(0);
+  ir_lowering_set_refinement_checks(0);
+  ir_lowering_set_task_checks(0);
+  ir_lowering_set_live(0);
+  ir_lowering_set_overflow_checks(0);
+  ir_lowering_set_assume_no_signed_overflow(0);
+  type_checker_reset_declared_type_templates();
+  int checked = type_checker_check_program(build->checker, parsed);
+  type_checker_reset_declared_type_templates();
+  if (!checked) {
+    return 0;
+  }
+  build->ir = ir_lower_program(parsed, build->checker, build->symbols,
+                               &lower_error, 0, 0);
+  return build->ir != NULL;
+}
+
+static TypeChecker *g_capture_checker = NULL;
+static char *g_capture_text = NULL;
+static size_t g_capture_used = 0;
+static size_t g_capture_capacity = 0;
+static StageBuild g_render_build;
+static int g_render_state = 0;
+
+static void late_print_result(LatePass *pass, IRFunction *function) {
+  static const char RENDER[] =
+      "import \"std/meta\";\n"
+      "fn __meta_render(f: FunctionInfo) -> Generated {\n"
+      "  return render_function(f, f.name);\n"
+      "}\n";
+  char line[512];
+  if (g_render_state == 0) {
+    const char *pass_name = mettle_compiler_ctx()->pass_name;
+    const char *function_name = mettle_compiler_ctx()->function_name;
+    g_render_state = late_load_source(&g_render_build, RENDER, "<std/meta>") ? 1 : -1;
+    mettle_compiler_ctx_set_pass_name(pass_name);
+    mettle_compiler_ctx_set_function_name(function_name);
+  }
+  if (g_render_state < 0) {
+    late_error(function, "pass '%s' wrote code that cannot print: %s", pass->name,
+               "std/meta did not load");
+    return;
+  }
+  IRRuleImage image;
+  char *image_error = NULL;
+  if (!rule_reflect_build_one_function(g_render_build.checker, g_capture_checker,
+                                       function, &image, &image_error)) {
+    late_error(function, "pass '%s' wrote code that cannot print: %s", pass->name,
+               image_error ? image_error : "?");
+    return;
+  }
+  IRInterpMachine *machine = NULL;
+  unsigned long long address = 0;
+  size_t errors_before = g_late.reporter->count;
+  if (!run_driver(&g_late, &g_render_build, "__meta_render", &image, &machine,
+                  &address, function->location)) {
+    g_late.reporter->count = errors_before;
+    late_error(function, "pass '%s' wrote code that cannot print: %s", pass->name,
+               "the printer stopped");
+    return;
+  }
+  const Type *generated =
+      type_checker_get_type_by_name(g_render_build.checker, "Generated");
+  char *refused = read_text(machine, address + field_at(generated, "refused"));
+  char *text = read_text(machine, address + field_at(generated, "text"));
+  ir_interp_destroy(machine);
+  ir_rule_image_free(&image);
+  if (refused && refused[0]) {
+    late_error(function, "pass '%s' wrote code that cannot print: %s", pass->name,
+               refused);
+    return;
+  }
+  snprintf(line, sizeof(line), "\n// after @%s, '%s' reads:\n", pass->name,
+           function->name);
+  text_append(&g_capture_text, &g_capture_used, &g_capture_capacity, line);
+  text_append(&g_capture_text, &g_capture_used, &g_capture_capacity,
+              text ? text : "");
+}
+
+static int late_apply_pass(LatePass *pass, IRFunction *function,
+                           IRInterpMachine *machine, unsigned long long address,
+                           int *changed) {
+  TypeChecker *checker = pass->build->checker;
+  const Type *function_type =
+      type_checker_get_type_by_name(checker, "PassFunction");
+  const Type *op_type = type_checker_get_type_by_name(checker, "PassOp");
+  const Type *operand_type =
+      type_checker_get_type_by_name(checker, "PassOperand");
+  unsigned long long code = address + field_at(function_type, "code");
+  unsigned long long data = (unsigned long long)read_i64(machine, code);
+  size_t count = (size_t)read_i64(machine, code + 8);
+  size_t old_count = function->instruction_count;
+  IRInstruction *decoded = calloc(count + 1, sizeof(IRInstruction));
+  long long *origins = calloc(count + 1, sizeof(long long));
+  unsigned char *taken = calloc(old_count + 1, 1);
+  if (!decoded || !origins || !taken) {
+    return 0;
+  }
+  for (size_t i = 0; i < count; i++) {
+    unsigned long long at = data + i * op_type->size;
+    IRInstruction *ins = &decoded[i];
+    char *op_name = read_text(machine, at + field_at(op_type, "op"));
+    IROpcode op = IR_OP_NOP;
+    if (!late_opcode_named(op_name, &op)) {
+      late_error(function, "pass '%s' wrote an operation named '%s', and the IR has none",
+                 pass->name, op_name ? op_name : "");
+      free(op_name);
+      return 1;
+    }
+    free(op_name);
+    ins->op = op;
+    char *text = read_text(machine, at + field_at(op_type, "text"));
+    if (text && text[0]) {
+      ins->text = mettle_strdup(text);
+    }
+    free(text);
+    ins->dest =
+        late_read_operand(machine, operand_type, at + field_at(op_type, "dest"));
+    ins->lhs =
+        late_read_operand(machine, operand_type, at + field_at(op_type, "lhs"));
+    ins->rhs =
+        late_read_operand(machine, operand_type, at + field_at(op_type, "rhs"));
+    unsigned long long args = at + field_at(op_type, "args");
+    unsigned long long args_data = (unsigned long long)read_i64(machine, args);
+    size_t arg_count = (size_t)read_i64(machine, args + 8);
+    if (arg_count > 0) {
+      ins->arguments = calloc(arg_count, sizeof(IROperand));
+      ins->argument_count = arg_count;
+      for (size_t a = 0; a < arg_count; a++) {
+        ins->arguments[a] = late_read_operand(machine, operand_type,
+                                              args_data + a * operand_type->size);
+      }
+    }
+    unsigned char flag = 0;
+    read_bytes(machine, at + field_at(op_type, "is_float"), &flag, 1);
+    ins->is_float = flag != 0;
+    ins->float_bits = (int)read_i64(machine, at + field_at(op_type, "float_bits"));
+    flag = 0;
+    read_bytes(machine, at + field_at(op_type, "is_unsigned"), &flag, 1);
+    ins->is_unsigned = flag != 0;
+    flag = 0;
+    read_bytes(machine, at + field_at(op_type, "is_volatile"), &flag, 1);
+    ins->is_volatile = flag != 0;
+    ins->alias_class =
+        (unsigned char)read_i64(machine, at + field_at(op_type, "alias_class"));
+    origins[i] = read_i64(machine, at + field_at(op_type, "origin"));
+    long long place = read_i64(machine, at + field_at(op_type, "place"));
+    if (origins[i] >= (long long)old_count) {
+      origins[i] = -1;
+    }
+    ins->location = place >= 0 && place < (long long)old_count
+                        ? function->instructions[place].location
+                        : function->location;
+  }
+  int same = count == old_count;
+  for (size_t i = 0; same && i < count; i++) {
+    same = origins[i] == (long long)i &&
+           late_same_instruction(&decoded[i], &function->instructions[i]);
+  }
+  if (same) {
+    for (size_t i = 0; i < count; i++) {
+      ir_instruction_destroy_storage(&decoded[i]);
+    }
+    free(decoded);
+    free(origins);
+    free(taken);
+    return 1;
+  }
+  IRVerifySnapshot *before = ir_verify_snapshot_capture(function);
+  IRInstruction *old = function->instructions;
+  IRInstruction *items = calloc(count + 1, sizeof(IRInstruction));
+  if (!items) {
+    return 0;
+  }
+  for (size_t i = 0; i < count; i++) {
+    long long origin = origins[i];
+    if (origin >= 0 && !taken[origin] &&
+        late_same_instruction(&decoded[i], &old[origin])) {
+      items[i] = old[origin];
+      taken[origin] = 1;
+      ir_instruction_destroy_storage(&decoded[i]);
+      continue;
+    }
+    items[i] = decoded[i];
+    if (origin >= 0) {
+      IRInstruction *kept = &old[origin];
+      items[i].value_type = kept->value_type;
+      items[i].ast_ref = kept->ast_ref;
+      items[i].allocates = kept->allocates;
+      items[i].intrinsic = kept->intrinsic;
+      items[i].memory_order = kept->memory_order;
+      items[i].failure_memory_order = kept->failure_memory_order;
+      items[i].memory_scope = kept->memory_scope;
+      items[i].memory_regions = kept->memory_regions;
+      items[i].address_space = kept->address_space;
+      late_copy_kept_fields(&items[i], kept);
+    }
+  }
+  for (size_t i = 0; i < old_count; i++) {
+    if (!taken[i]) {
+      ir_instruction_destroy_storage(&old[i]);
+    }
+  }
+  free(old);
+  function->instructions = items;
+  function->instruction_count = count;
+  function->instruction_capacity = count + 1;
+  ir_function_clear_cfg(function);
+  free(decoded);
+  free(origins);
+  free(taken);
+  *changed = 1;
+  char structure[300];
+  IRStructureReport structure_report;
+  structure[0] = '\0';
+  memset(&structure_report, 0, sizeof(structure_report));
+  if (!ir_function_check_structure(function, &structure_report, structure,
+                                   sizeof(structure))) {
+    late_error(function, "pass '%s' wrote code with a broken shape: %s",
+               pass->name, structure);
+    ir_verify_snapshot_restore(function, before);
+    ir_function_clear_cfg(function);
+    ir_verify_snapshot_free(before);
+    *changed = 0;
+    return 1;
+  }
+  char why[400];
+  char cex[600];
+  char skip[300];
+  IRVerifyRewriteVerdict verdict = ir_verify_check_rewrite(
+      ir_optimize_get_program(), function, before, why, sizeof(why), cex,
+      sizeof(cex), skip, sizeof(skip));
+  if (verdict == IR_VERIFY_REWRITE_DIVERGED) {
+    late_error(function, "pass '%s' changed what '%s' does", pass->name,
+               function->name);
+    fprintf(stderr, "  counterexample %s\n  divergence: %s\n", cex, why);
+    ir_verify_snapshot_restore(function, before);
+    ir_function_clear_cfg(function);
+    *changed = 0;
+  } else if (verdict == IR_VERIFY_REWRITE_UNVERIFIABLE) {
+    g_late.report->passes_unchecked++;
+  } else {
+    g_late.report->passes_checked++;
+  }
+  ir_verify_snapshot_free(before);
+  if (*changed && g_capture_checker) {
+    late_print_result(pass, function);
+  }
+  return 1;
+}
+
+static int late_run_pass(IRFunction *function, void *context, int *changed) {
+  LatePass *pass = (LatePass *)context;
+  IRRuleImage image;
+  char *image_error = NULL;
+  IRInterpMachine *machine = NULL;
+  unsigned long long address = 0;
+  if (!rule_reflect_build_pass(pass->build->checker, function, &image,
+                               &image_error)) {
+    late_error(function, "pass '%s' could not read its function: %s", pass->name,
+               image_error ? image_error : "?");
+    return 1;
+  }
+  size_t errors_before = g_late.reporter->count;
+  if (!run_driver(&g_late, pass->build, pass->driver, &image, &machine, &address,
+                  function->location)) {
+    const char *message = g_late.reporter->count > errors_before
+                              ? g_late.reporter->errors[errors_before].message
+                              : "it did not run";
+    g_late.reporter->count = errors_before;
+    late_error(function, "pass '%s' stopped: %s", pass->name, message);
+    return 1;
+  }
+  g_late.report->passes_run++;
+  int ok = late_apply_pass(pass, function, machine, address, changed);
+  ir_interp_destroy(machine);
+  ir_rule_image_free(&image);
+  return ok;
+}
+
+static int late_load_builtin(void) {
+  static const char TEXT[] =
+      "import \"std/pass\";\n"
+      "fn __meta_builtin_or_chain_bitset(f: PassFunction) -> PassFunction {\n"
+      "  return or_chain_bitset(f);\n"
+      "}\n";
+  return late_load_source(&g_builtin_build, TEXT, "<std/pass>");
+}
+
+int meta_stage_has_passes(void) { return g_late_pass_count > 0; }
+
+void meta_stage_capture_passes(void *checker) {
+  g_capture_checker = (TypeChecker *)checker;
+}
+
+void meta_stage_print_captured(FILE *out) {
+  if (g_capture_text) {
+    fputs(g_capture_text, out);
+  }
+}
+
+static int late_builtin_run(const char *name, IRFunction *function, int *changed) {
+  const char *pass_name = mettle_compiler_ctx()->pass_name;
+  const char *function_name = mettle_compiler_ctx()->function_name;
+  if (g_builtin_state == 0) {
+    g_builtin_state = late_load_builtin() ? 1 : -1;
+    mettle_compiler_ctx_set_pass_name(pass_name);
+    mettle_compiler_ctx_set_function_name(function_name);
+  }
+  if (g_builtin_state < 0) {
+    late_error(function, "the pass '%s' could not load from %s", name, "std/pass");
+    return 1;
+  }
+  g_builtin_pass.name = name;
+  g_builtin_pass.build = &g_builtin_build;
+  snprintf(g_builtin_pass.driver, sizeof(g_builtin_pass.driver),
+           "__meta_builtin_%s", name);
+  return late_run_pass(function, &g_builtin_pass, changed);
+}
+
+static int late_prepare(MetaStage *stage) {
+  Program *program = (Program *)stage->program->data;
+  NameSet names = {0};
+  NameSet types = {0};
+  char *text = NULL;
+  size_t used = 0;
+  size_t capacity = 0;
+  char line[512];
+  size_t passes = 0;
+  text_append(&text, &used, &capacity, "");
+  for (size_t i = 0; i < program->declaration_count; i++) {
+    const ASTNode *decl = program->declarations[i];
+    const FunctionDeclaration *fd;
+    if (!decl || decl->type != AST_FUNCTION_DECLARATION || !decl->data) {
+      continue;
+    }
+    fd = (const FunctionDeclaration *)decl->data;
+    if (fd->meta_role != META_ROLE_PASS) {
+      continue;
+    }
+    if (fd->parameter_count != 1 ||
+        strcmp(meta_strip_import(fd->parameter_types[0]), "PassFunction") != 0 ||
+        !fd->return_type ||
+        strcmp(meta_strip_import(fd->return_type), "PassFunction") != 0) {
+      report_at(stage, decl->location, "L0001",
+                "A @pass function is 'fn name(f: PassFunction) -> PassFunction'",
+                NULL);
+      return 0;
+    }
+    if (!ir_optimizer_point_known(fd->meta_point)) {
+      snprintf(line, sizeof(line),
+               "The optimizer has no point named '%s': use a stage (pre_inline, "
+               "fixpoint, loop_canonical, recognizers, cleanup, ssa, end) or "
+               "after_<pass>",
+               fd->meta_point);
+      report_at(stage, decl->location, "L0001", line, NULL);
+      return 0;
+    }
+    snprintf(line, sizeof(line),
+             "fn __meta_pass_%zu(f: PassFunction) -> PassFunction {\n"
+             "  return %s(f);\n}\n",
+             passes, fd->name);
+    text_append(&text, &used, &capacity, line);
+    name_set_add(&names, fd->name, -1);
+    passes++;
+  }
+  if (passes == 0) {
+    name_set_free(&names);
+    name_set_free(&types);
+    free(text);
+    return 1;
+  }
+  close_over_functions(program, &names, &types);
+  for (size_t p = 0; p < passes; p++) {
+    snprintf(line, sizeof(line), "__meta_pass_%zu", p);
+    name_set_add(&names, line, -1);
+  }
+  int built = stage_build(stage, &names, text, &g_late_build);
+  if (!built) {
+    stage->report->stage_builds--;
+    const char *pruned_error = g_late_build.first_error;
+    built = stage_build(stage, NULL, text, &g_late_build);
+    if (!built) {
+      stage->report->pending_error =
+          g_late_build.first_error ? g_late_build.first_error : pruned_error;
+      free(text);
+      return 1;
+    }
+  }
+  free(text);
+  name_set_free(&names);
+  name_set_free(&types);
+  g_late_passes = calloc(passes, sizeof(LatePass));
+  g_late_table = calloc(passes, sizeof(IRLibraryPass));
+  if (!g_late_passes || !g_late_table) {
+    return 0;
+  }
+  size_t at = 0;
+  for (size_t i = 0; i < program->declaration_count; i++) {
+    const ASTNode *decl = program->declarations[i];
+    const FunctionDeclaration *fd;
+    if (!decl || decl->type != AST_FUNCTION_DECLARATION || !decl->data) {
+      continue;
+    }
+    fd = (const FunctionDeclaration *)decl->data;
+    if (fd->meta_role != META_ROLE_PASS) {
+      continue;
+    }
+    g_late_passes[at].name = meta_strip_import(fd->name);
+    snprintf(g_late_passes[at].driver, sizeof(g_late_passes[at].driver),
+             "__meta_pass_%zu", at);
+    g_late_passes[at].build = &g_late_build;
+    g_late_table[at].name = g_late_passes[at].name;
+    g_late_table[at].point = fd->meta_point;
+    g_late_table[at].run = late_run_pass;
+    g_late_table[at].context = &g_late_passes[at];
+    at++;
+  }
+  g_late_pass_count = at;
+  ir_library_passes_set(g_late_table, at);
+  return 1;
+}
+
 int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
                    const char *root_file, const char *source,
                    const char *target, long long fuel,
@@ -1889,10 +2442,6 @@ int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
   Program *data = program && program->type == AST_PROGRAM
                       ? (Program *)program->data
                       : NULL;
-  if (!data || (!program_has_decorators(data) &&
-                !program_declares_generator_calls(data))) {
-    return 1;
-  }
   stage.program = program;
   stage.reporter = reporter;
   stage.root_file = root_file;
@@ -1902,6 +2451,13 @@ int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
   stage.report = report;
   stage.calls_done = NULL;
   stage.calls_done_count = 0;
+  g_late = stage;
+  ir_builtin_library_set(late_builtin_run);
+  ir_library_passes_set(NULL, 0);
+  if (!data || (!program_has_decorators(data) &&
+                !program_declares_generator_calls(data))) {
+    return 1;
+  }
   for (int round = 0; round < META_MAX_ROUNDS; round++) {
     int progressed = 0;
     if (!stage_round(&stage) || report->pending_error) {
@@ -1917,7 +2473,8 @@ int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
       return report->pending_error ? 1 : 0;
     }
     if (!progressed) {
-      return check_decorators_known(&stage, (Program *)program->data);
+      return check_decorators_known(&stage, (Program *)program->data) &&
+             late_prepare(&stage);
     }
   }
   error_reporter_add_error(reporter, ERROR_SEMANTIC, program->location,
@@ -1928,7 +2485,7 @@ int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
 }
 
 void meta_stage_print_report(const MetaStageReport *report, FILE *out) {
-  if (!report->layouts && !report->generators) {
+  if (!report->layouts && !report->generators && !g_late_pass_count) {
     fprintf(out, "metaprograms: none; nothing ran\n");
     return;
   }
@@ -1937,4 +2494,12 @@ void meta_stage_print_report(const MetaStageReport *report, FILE *out) {
           "generated, %zu stage builds, %lld interpreter steps\n",
           report->layouts, report->generators, report->generated_bytes,
           report->stage_builds, report->steps);
+}
+
+void meta_stage_print_pass_report(const MetaStageReport *report, FILE *out) {
+  if (report->passes_run > 0) {
+    fprintf(out,
+            "passes: %zu runs, %zu results checked on inputs, %zu could not run\n",
+            report->passes_run, report->passes_checked, report->passes_unchecked);
+  }
 }

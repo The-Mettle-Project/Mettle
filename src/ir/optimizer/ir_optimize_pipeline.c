@@ -38,6 +38,37 @@ typedef struct {
 #define IR_GATE_LOOP_BRANCH                                                   \
   {IR_OPT_LABEL_JUMP, IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_BRANCH_EQ}
 
+static IRBuiltinLibraryRun g_ir_builtin_library = NULL;
+
+void ir_builtin_library_set(IRBuiltinLibraryRun run) {
+  g_ir_builtin_library = run;
+}
+
+static int ir_or_chain_library_pass(IRFunction *function, int *changed) {
+  const char *label = NULL;
+  int run = 0;
+  if (!g_ir_builtin_library) {
+    return 1;
+  }
+  for (size_t i = 0; i < function->instruction_count && run < 3; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP) {
+      continue;
+    }
+    if (ins->op == IR_OP_BRANCH_EQ && ins->rhs.kind == IR_OPERAND_INT && ins->text &&
+        (run == 0 || strcmp(ins->text, label) == 0)) {
+      label = ins->text;
+      run++;
+    } else {
+      run = 0;
+    }
+  }
+  if (run < 3) {
+    return 1;
+  }
+  return g_ir_builtin_library("or_chain_bitset", function, changed);
+}
+
 static const IROptNamedPass g_ir_pre_inline_canonical[] = {
     {"drop_dead_narrowing", ir_drop_dead_narrowing_pass,
      {IR_OPT_REQUIRE_NONE, IR_OPT_REQUIRE_NONE}},
@@ -184,7 +215,7 @@ static const IROptNamedPass g_ir_lowering_cleanup[] = {
      {IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
     {"fold_range_test", ir_fold_range_test_pass,
      {IR_OPT_FEATURE_BRANCH_ZERO, IR_OPT_REQUIRE_NONE}},
-    {"or_chain_bitset", ir_or_chain_to_bitset_pass,
+    {"or_chain_bitset", ir_or_chain_library_pass,
      {IR_OPT_FEATURE_BRANCH_EQ | IR_OPT_FEATURE_BRANCH_ZERO,
       IR_OPT_REQUIRE_NONE}},
     {"float_pow2_reciprocal", ir_float_divide_by_power_of_two_pass,
@@ -394,11 +425,15 @@ int ir_optimize_pre_inline_function(IRFunction *function) {
     return 0;
   }
   mettle_compiler_ctx_set_pass_name("pre-inline idiom recognition");
-  return ir_run_named_stage_fixpoint(
-      function, g_ir_pre_inline_recognizers,
-      IR_ARRAY_COUNT(g_ir_pre_inline_recognizers),
-      IR_OPT_RECOGNIZER_MAX_ITERATIONS, "pre-inline idiom recognition",
-      "IR optimization pre-inline pass failed", 0);
+  if (!ir_run_named_stage_fixpoint(
+          function, g_ir_pre_inline_recognizers,
+          IR_ARRAY_COUNT(g_ir_pre_inline_recognizers),
+          IR_OPT_RECOGNIZER_MAX_ITERATIONS, "pre-inline idiom recognition",
+          "IR optimization pre-inline pass failed", 0)) {
+    return 0;
+  }
+  ir_library_passes_at(function, "pre_inline");
+  return 1;
 }
 
 size_t ir_inline_cleaned_instruction_count(const IRFunction *function) {
@@ -541,6 +576,8 @@ static int ir_run_post_fixpoint_stages(IRFunction *function) {
     }
   }
 
+  ir_library_passes_at(function, "loop_canonical");
+
   mettle_compiler_ctx_set_pass_name("post-fixpoint idiom recognition");
   if (!ir_run_named_stage_fixpoint(
           function, g_ir_recognizer_passes,
@@ -549,6 +586,7 @@ static int ir_run_post_fixpoint_stages(IRFunction *function) {
           "IR optimization pass failed", 0)) {
     return 0;
   }
+  ir_library_passes_at(function, "recognizers");
   mettle_compiler_ctx_set_pass_name("post-recognizer tail");
   if (!ir_run_named_stage_fixpoint(
           function, g_ir_post_recognizer_tail,
@@ -649,6 +687,7 @@ int ir_optimize_function_pipeline(IRFunction *function) {
     ir_loop_fp_destroy(fp_entries, fp_count);
     return 0;
   }
+  ir_library_passes_at(function, "fixpoint");
 
   if (!ir_run_post_fixpoint_stages(function)) {
     ir_loop_fp_destroy(fp_entries, fp_count);
@@ -675,6 +714,7 @@ int ir_optimize_function_pipeline(IRFunction *function) {
           "IR optimization pass failed", 0)) {
     return 0;
   }
+  ir_library_passes_at(function, "cleanup");
 
   if (ir_ssa_enabled()) {
     mettle_compiler_ctx_set_pass_name("enter ssa");
@@ -698,7 +738,9 @@ int ir_optimize_function_pipeline(IRFunction *function) {
                                      0)) {
       return 0;
     }
+    ir_library_passes_at(function, "ssa");
   }
+  ir_library_passes_at(function, "end");
 
   t0 = ir_pass_time_begin();
   int ok = ir_function_rebuild_cfg(function);
@@ -951,6 +993,46 @@ static void ir_run_program_pass(IRProgram *program,
   ir_pass_time_end(pass->timing_label, started);
 }
 
+static int ir_named_list_holds(const IROptNamedPass *passes, size_t count,
+                               const char *name) {
+  for (size_t i = 0; i < count; i++) {
+    if (strcmp(passes[i].name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int ir_optimizer_point_known(const char *point) {
+  static const char *const STAGES[] = {"pre_inline",  "fixpoint", "loop_canonical",
+                                       "recognizers", "cleanup",  "ssa",
+                                       "end"};
+  for (size_t i = 0; i < IR_ARRAY_COUNT(STAGES); i++) {
+    if (strcmp(point, STAGES[i]) == 0) {
+      return 1;
+    }
+  }
+  if (strncmp(point, "after_", 6) != 0) {
+    return 0;
+  }
+  const char *name = point + 6;
+  for (int i = 0; i < IR_OPT_PASS_COUNT; i++) {
+    if (strcmp(ir_opt_pass_name((IROptPassId)i), name) == 0) {
+      return 1;
+    }
+  }
+#define IR_POINT_LIST(list)                                                    \
+  ir_named_list_holds(list, IR_ARRAY_COUNT(list), name)
+  return IR_POINT_LIST(g_ir_pre_inline_canonical) ||
+         IR_POINT_LIST(g_ir_pre_inline_recognizers) ||
+         IR_POINT_LIST(g_ir_loop_canonical_passes) ||
+         IR_POINT_LIST(g_ir_recognizer_passes) ||
+         IR_POINT_LIST(g_ir_post_recognizer_tail) ||
+         IR_POINT_LIST(g_ir_ssa_enter) || IR_POINT_LIST(g_ir_ssa_optimize) ||
+         IR_POINT_LIST(g_ir_ssa_leave) || IR_POINT_LIST(g_ir_lowering_cleanup);
+#undef IR_POINT_LIST
+}
+
 int ir_optimize_program_pipeline(IRProgram *program,
                                  const IROptimizeOptions *options) {
   if (!program) {
@@ -1044,6 +1126,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
   }
   contracts_ok &= ir_enforce_noalloc_contracts(program);
   contracts_ok &= ir_user_rewrite_end(program);
+  contracts_ok &= !ir_optimize_had_user_error();
 
   ir_inline_explain_report_remaining(program);
   ir_explain_flush();

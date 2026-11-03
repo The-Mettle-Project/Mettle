@@ -1,0 +1,12 @@
+import "std/pass";
+
+@pass(cleanup) fn writes_nonsense(f: PassFunction) -> PassFunction {
+  if (f.code.length > 0) {
+    f.code[0].op = "no_such_op";
+  }
+  return f;
+}
+
+fn main() -> int32 {
+  return 0;
+}

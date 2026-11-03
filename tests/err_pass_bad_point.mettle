@@ -1,0 +1,9 @@
+import "std/pass";
+
+@pass(nowhere) fn lost(f: PassFunction) -> PassFunction {
+  return f;
+}
+
+fn main() -> int32 {
+  return 0;
+}

@@ -681,6 +681,7 @@ typedef struct {
   char *numerics_contract;
   int meta_role;
   int meta_optimized;
+  char *meta_point;
   MetaDecorator *meta;
   size_t meta_count;
 } ParsedDecorators;
@@ -908,10 +909,37 @@ static int parser_parse_one_decorator(Parser *parser,
     if (!parser_parse_unroll_decorator(parser, out)) {
       return 0;
     }
+  } else if (strcmp(name, "pass") == 0 || strcmp(name, "regalloc") == 0) {
+    if (out->meta_role != META_ROLE_NONE) {
+      parser_set_error(parser, "A function is one metafunction: '@layout', "
+                               "'@generate', '@pass' or '@regalloc', once");
+      return 0;
+    }
+    int is_pass = strcmp(name, "pass") == 0;
+    out->meta_role = is_pass ? META_ROLE_PASS : META_ROLE_REGALLOC;
+    parser_advance(parser);
+    if (is_pass) {
+      if (parser->current_token.type != TOKEN_LPAREN) {
+        parser_set_error(parser, "'@pass' names the optimizer point it runs at, "
+                                 "as in '@pass(cleanup)'");
+        return 0;
+      }
+      parser_advance(parser);
+      if (!parser_is_identifier_like(parser->current_token.type)) {
+        parser_set_error(parser, "'@pass' names the optimizer point it runs at, "
+                                 "as in '@pass(cleanup)'");
+        return 0;
+      }
+      out->meta_point = strdup(parser->current_token.value);
+      parser_advance(parser);
+      if (!parser_expect(parser, TOKEN_RPAREN)) {
+        return 0;
+      }
+    }
   } else if (strcmp(name, "layout") == 0 || strcmp(name, "generate") == 0) {
     if (out->meta_role != META_ROLE_NONE) {
-      parser_set_error(parser, "A function is one metafunction: '@layout' or "
-                               "'@generate', once");
+      parser_set_error(parser, "A function is one metafunction: '@layout', "
+                               "'@generate', '@pass' or '@regalloc', once");
       return 0;
     }
     out->meta_role =
@@ -957,6 +985,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->numerics_contract = NULL;
   out->meta_role = META_ROLE_NONE;
   out->meta_optimized = 0;
+  out->meta_point = NULL;
   out->meta = NULL;
   out->meta_count = 0;
 
@@ -1042,6 +1071,7 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
   fd->meta_decorator_count = decos.meta_count;
   fd->meta_role = decos.meta_role;
   fd->meta_optimized = decos.meta_optimized;
+  fd->meta_point = decos.meta_point;
   if (fd->is_extern) {
     parser_set_error(parser,
                      "Decorators cannot be applied to extern functions");

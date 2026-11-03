@@ -12,6 +12,9 @@ typedef struct {
   size_t stage_builds;
   long long steps;
   const char *pending_error;
+  size_t passes_run;
+  size_t passes_checked;
+  size_t passes_unchecked;
 } MetaStageReport;
 
 int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
@@ -20,5 +23,10 @@ int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
                    MetaStageReport *report);
 
 void meta_stage_print_report(const MetaStageReport *report, FILE *out);
+void meta_stage_print_pass_report(const MetaStageReport *report, FILE *out);
+
+int meta_stage_has_passes(void);
+void meta_stage_capture_passes(void *checker);
+void meta_stage_print_captured(FILE *out);
 
 #endif

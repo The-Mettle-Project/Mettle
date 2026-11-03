@@ -1,0 +1,19 @@
+import "std/pass";
+
+@pass(cleanup) fn jumps_nowhere(f: PassFunction) -> PassFunction {
+  if (f.name != "target") { return f; }
+  var out: PassOp[] = new PassOp[f.code.length + 1];
+  out[0] = new_op("jump", 0);
+  out[0].text = "no_such_label";
+  for i in 0..f.code.length { out[i + 1] = f.code[i]; }
+  f.code = out;
+  return f;
+}
+
+@noinline fn target(x: int64) -> int64 {
+  return x + 1;
+}
+
+fn main() -> int32 {
+  return (int32)target(1);
+}

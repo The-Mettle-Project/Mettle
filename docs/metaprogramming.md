@@ -191,6 +191,42 @@ These run on every build under `--rule-budget` and never reach the binary. A rul
 checks the inputs it tries and no others. A generator with no rule gets `L0005` as
 a warning naming it.
 
+## Passes
+
+```mettle
+import "std/pass";
+
+@pass(cleanup) fn double_as_shift(f: PassFunction) -> PassFunction {
+  for i in 0..f.code.length {
+    var op: PassOp = f.code[i];
+    if (op.op == "binary" && op.text == "+" && !op.is_float &&
+        op.lhs.kind == OPERAND_SYMBOL && op.rhs.kind == OPERAND_SYMBOL &&
+        op.lhs.name == op.rhs.name) {
+      f.code[i].text = "<<";
+      f.code[i].rhs = operand_int(1);
+    }
+  }
+  return f;
+}
+```
+
+A pass receives one function's IR as a flat list of operations and returns the
+list it wants. To add an operation, build a longer `code` with `new_op`. To drop
+one, leave it out. It runs at `-O` and `--release`, once per function, at the point
+it names: `pre_inline`, `fixpoint`, `loop_canonical`, `recognizers`, `cleanup`,
+`ssa`, `end`, or `after_<pass>` for a built-in pass.
+
+Every result runs against the old function on generated inputs. A pass that
+changes what a function returns stops the build:
+
+```text
+tests\err_pass_changes_behavior.mettle:16:11: error[L0007]: pass 'wrong_doubling' changed what 'twice' does
+  counterexample (input set 0) twice(5)
+  divergence: return value was 10, is now 20
+```
+
+`mettle expand` prints each changed function as Mettle under the pass's name.
+
 ## Costs
 
 `--report-meta` prints what ran. `--meta-budget=N` stops the build when

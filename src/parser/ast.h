@@ -95,7 +95,9 @@ typedef struct {
 typedef enum {
   META_ROLE_NONE = 0,
   META_ROLE_LAYOUT,
-  META_ROLE_GENERATE
+  META_ROLE_GENERATE,
+  META_ROLE_PASS,
+  META_ROLE_REGALLOC
 } MetaRole;
 
 struct TypeMetaLayout;
@@ -187,6 +189,7 @@ typedef struct {
   size_t meta_decorator_count;
   int meta_role;
   int meta_optimized;
+  char *meta_point;
   const char *generated_by;
 } FunctionDeclaration;
 

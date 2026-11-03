@@ -451,7 +451,7 @@ int ir_ssa_propagate_pass(IRFunction *function, int *changed);
 void ir_ssa_opt_report_stats(void);
 int ir_select_adjacent_field_pass(IRFunction *function, int *changed);
 
-int ir_or_chain_to_bitset_pass(IRFunction *function, int *changed);
+void ir_library_passes_at(IRFunction *function, const char *point);
 int ir_ascii_casefold_range_pass(IRFunction *function, int *changed);
 int ir_fold_range_test_pass(IRFunction *function, int *changed);
 int ir_float_divide_by_power_of_two_pass(IRFunction *function, int *changed);

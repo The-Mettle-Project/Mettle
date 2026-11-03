@@ -1,0 +1,276 @@
+export const OPERAND_NONE: int64 = 0;
+export const OPERAND_TEMP: int64 = 1;
+export const OPERAND_SYMBOL: int64 = 2;
+export const OPERAND_INT: int64 = 3;
+export const OPERAND_FLOAT: int64 = 4;
+export const OPERAND_STRING: int64 = 5;
+export const OPERAND_LABEL: int64 = 6;
+
+export struct PassOperand {
+  kind: int64;
+  name: string;
+  int_value: int64;
+  float_value: float64;
+  float_bits: int64;
+  uses: int64;
+}
+
+export struct PassOp {
+  op: string;
+  text: string;
+  dest: PassOperand;
+  lhs: PassOperand;
+  rhs: PassOperand;
+  args: PassOperand[];
+  is_float: bool;
+  float_bits: int64;
+  is_unsigned: bool;
+  is_volatile: bool;
+  alias_class: int64;
+  origin: int64;
+  place: int64;
+}
+
+export struct PassFunction {
+  name: string;
+  return_type: string;
+  param_names: string[];
+  param_types: string[];
+  code: PassOp[];
+}
+
+export fn operand_int(value: int64) -> PassOperand {
+  var out: PassOperand;
+  out.kind = OPERAND_INT;
+  out.int_value = value;
+  return out;
+}
+
+export fn operand_temp(name: string) -> PassOperand {
+  var out: PassOperand;
+  out.kind = OPERAND_TEMP;
+  out.name = name;
+  return out;
+}
+
+export fn new_op(op: string, place: int64) -> PassOp {
+  var out: PassOp;
+  out.op = op;
+  out.origin = -1;
+  out.place = place;
+  return out;
+}
+
+export fn same_operand(a: PassOperand, b: PassOperand) -> bool {
+  return a.kind == b.kind && a.name == b.name &&
+         (a.kind == OPERAND_TEMP || a.kind == OPERAND_SYMBOL);
+}
+
+fn digits_of(value: int64) -> string {
+  var buffer: uint8[] = new uint8[24];
+  var at: int64 = 24;
+  var left: int64 = value;
+  if (left == 0) {
+    at = at - 1;
+    buffer[at] = 48;
+  }
+  while (left > 0) {
+    at = at - 1;
+    buffer[at] = (uint8)(48 + left % 10);
+    left = left / 10;
+  }
+  var out: string;
+  out.chars = &buffer[at];
+  out.length = (uint64)(24 - at);
+  return out;
+}
+
+export fn joined(prefix: string, value: int64) -> string {
+  var tail: string = digits_of(value);
+  var total: int64 = (int64)prefix.length + (int64)tail.length;
+  var buffer: uint8[] = new uint8[total];
+  for i in 0..(int64)prefix.length { buffer[i] = (uint8)prefix[i]; }
+  for i in 0..(int64)tail.length { buffer[(int64)prefix.length + i] = (uint8)tail[i]; }
+  var out: string;
+  out.chars = &buffer[0];
+  out.length = (uint64)total;
+  return out;
+}
+
+fn temp_named(code: PassOp[], name: string) -> bool {
+  for op in code {
+    if (op.dest.kind == OPERAND_TEMP && op.dest.name == name) { return true; }
+  }
+  return false;
+}
+
+export fn fresh_id(code: PassOp[], prefix: string) -> int64 {
+  var id: int64 = 0;
+  while (temp_named(code, joined(prefix, id))) {
+    id = id + 1;
+  }
+  return id;
+}
+
+fn next_real(code: PassOp[], from: int64) -> int64 {
+  var at: int64 = from;
+  while (at < code.length) {
+    if (code[at].op != "nop") { return at; }
+    at = at + 1;
+  }
+  return -1;
+}
+
+const BITSET_MIN_KEYS: int64 = 4;
+const BITSET_MAX_KEY: int64 = 62;
+
+fn key_fits(keys: int64[], count: int64, key: int64) -> bool {
+  if (key < 0 || key > BITSET_MAX_KEY) { return false; }
+  for i in 0..count {
+    if (keys[i] == key) { return false; }
+  }
+  return true;
+}
+
+fn chain_end(code: PassOp[], at: int64, keys: int64[], count_out: int64*) -> int64 {
+  var first: PassOp = code[at];
+  var count: int64 = 0;
+  *count_out = 0;
+  if (first.op != "branch_eq" || first.is_float || first.text.length == 0 ||
+      first.rhs.kind != OPERAND_INT ||
+      (first.lhs.kind != OPERAND_TEMP && first.lhs.kind != OPERAND_SYMBOL) ||
+      first.lhs.name.length == 0) {
+    return -1;
+  }
+  var scan: int64 = at;
+  while (scan < code.length) {
+    var op: PassOp = code[scan];
+    if (op.op == "nop") {
+      scan = scan + 1;
+      continue;
+    }
+    if (op.op != "branch_eq" || op.is_float || op.text != first.text ||
+        op.rhs.kind != OPERAND_INT || !same_operand(op.lhs, first.lhs) ||
+        !key_fits(keys, count, op.rhs.int_value)) {
+      break;
+    }
+    keys[count] = op.rhs.int_value;
+    count = count + 1;
+    scan = scan + 1;
+  }
+  if (count == 0) { return -1; }
+  var tail: int64 = next_real(code, scan);
+  if (tail < 0) { return -1; }
+  var cmp: PassOp = code[tail];
+  if (cmp.op != "binary" || cmp.is_float || cmp.text != "==" ||
+      cmp.rhs.kind != OPERAND_INT || cmp.dest.kind != OPERAND_TEMP ||
+      cmp.dest.name.length == 0 || !same_operand(cmp.lhs, first.lhs) ||
+      !key_fits(keys, count, cmp.rhs.int_value) || cmp.dest.uses != 1) {
+    return -1;
+  }
+  keys[count] = cmp.rhs.int_value;
+  count = count + 1;
+  var branch: int64 = next_real(code, tail + 1);
+  if (branch < 0) { return -1; }
+  var br: PassOp = code[branch];
+  if (br.op != "branch_zero" || br.lhs.kind != OPERAND_TEMP ||
+      br.lhs.name.length == 0 || br.text.length == 0 ||
+      br.lhs.name != cmp.dest.name) {
+    return -1;
+  }
+  var after: int64 = next_real(code, branch + 1);
+  if (after < 0) { return -1; }
+  var lab: PassOp = code[after];
+  if (lab.op != "label" || lab.text != first.text) { return -1; }
+  if (count < BITSET_MIN_KEYS) { return -1; }
+  *count_out = count;
+  return branch;
+}
+
+fn bit_test(code: PassOp[], at: int64, last: int64, keys: int64[], count: int64) -> PassOp[] {
+  var value: PassOperand = code[at].lhs;
+  var miss: string = code[last].text;
+  var mask: int64 = 0;
+  var max_key: int64 = 0;
+  var one: int64 = 1;
+  for k in 0..count {
+    mask = mask | (one << keys[k]);
+    if (keys[k] > max_key) { max_key = keys[k]; }
+  }
+  var id: int64 = fresh_id(code, "__bset_g");
+  var guard: PassOperand = operand_temp(joined("__bset_g", id));
+  var unit: PassOperand = operand_temp(joined("__bset_o", id));
+  var shifted: PassOperand = operand_temp(joined("__bset_s", id));
+  var set: PassOperand = operand_temp(joined("__bset_m", id));
+  var hit: PassOperand = operand_temp(joined("__bset_a", id));
+  var removed: int64 = last - at + 1;
+  var out: PassOp[] = new PassOp[code.length - removed + 7];
+  var w: int64 = 0;
+  for i in 0..at {
+    out[w] = code[i];
+    w = w + 1;
+  }
+  out[w] = new_op("binary", at);
+  out[w].text = "<=";
+  out[w].dest = guard;
+  out[w].lhs = value;
+  out[w].rhs = operand_int(max_key);
+  out[w].is_unsigned = true;
+  w = w + 1;
+  out[w] = new_op("branch_zero", at);
+  out[w].lhs = guard;
+  out[w].text = miss;
+  w = w + 1;
+  out[w] = new_op("assign", at);
+  out[w].dest = unit;
+  out[w].lhs = operand_int(1);
+  w = w + 1;
+  out[w] = new_op("binary", at);
+  out[w].text = "<<";
+  out[w].dest = shifted;
+  out[w].lhs = unit;
+  out[w].rhs = value;
+  w = w + 1;
+  out[w] = new_op("assign", at);
+  out[w].dest = set;
+  out[w].lhs = operand_int(mask);
+  w = w + 1;
+  out[w] = new_op("binary", at);
+  out[w].text = "&";
+  out[w].dest = hit;
+  out[w].lhs = shifted;
+  out[w].rhs = set;
+  w = w + 1;
+  out[w] = new_op("branch_zero", at);
+  out[w].lhs = hit;
+  out[w].text = miss;
+  w = w + 1;
+  var from: int64 = last + 1;
+  while (from < code.length) {
+    out[w] = code[from];
+    w = w + 1;
+    from = from + 1;
+  }
+  return out;
+}
+
+export fn or_chain_bitset(f: PassFunction) -> PassFunction {
+  var keys: int64[] = new int64[BITSET_MAX_KEY + 2];
+  var round: int64 = 0;
+  while (round < 64) {
+    var found: bool = false;
+    var i: int64 = 0;
+    while (i < f.code.length && !found) {
+      var count: int64 = 0;
+      var last: int64 = chain_end(f.code, i, keys, &count);
+      if (last >= 0) {
+        f.code = bit_test(f.code, i, last, keys, count);
+        found = true;
+      }
+      i = i + 1;
+    }
+    if (!found) { break; }
+    round = round + 1;
+  }
+  return f;
+}

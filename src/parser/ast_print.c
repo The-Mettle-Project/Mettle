@@ -498,6 +498,10 @@ static void print_function_declaration(AstPrinter *printer, const ASTNode *node)
   } else if (decl->meta_role == META_ROLE_GENERATE) {
     fputs(decl->meta_optimized ? "@generate(optimized) " : "@generate ",
           printer->out);
+  } else if (decl->meta_role == META_ROLE_PASS) {
+    fprintf(printer->out, "@pass(%s) ", decl->meta_point ? decl->meta_point : "");
+  } else if (decl->meta_role == META_ROLE_REGALLOC) {
+    fputs("@regalloc ", printer->out);
   }
   print_meta_decorators(printer, decl->meta_decorators,
                         decl->meta_decorator_count);

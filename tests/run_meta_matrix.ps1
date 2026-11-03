@@ -12,7 +12,11 @@ New-Item -ItemType Directory -Force $scratch | Out-Null
 $Cases = @($Cases | ForEach-Object { $_ -split "," })
 if ($Cases.Count -eq 0) {
     $Cases = (Get-ChildItem tests -Filter "test_layout_*.mettle").BaseName +
-             (Get-ChildItem tests -Filter "test_meta_*.mettle").BaseName
+             (Get-ChildItem tests -Filter "test_meta_*.mettle").BaseName +
+             (Get-ChildItem tests -Filter "test_pass_*.mettle").BaseName +
+             (Get-ChildItem tests -Filter "test_regalloc_from_*.mettle").BaseName +
+             (Get-ChildItem tests -Filter "test_element_*.mettle").BaseName
+    $Cases = @($Cases | Where-Object { $_ })
 }
 
 $modes = @(

@@ -3789,6 +3789,51 @@ foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_t
   }
 }
 
+# A pass written in Mettle changes the program, its result prints through expand,
+# and a pass that changes behavior stops the build with a counterexample.
+foreach ($passMode in @(@("--release"), @("-O"), @("--release", "--verify"))) {
+  $total++
+  $passName = "pass_from_mettle_$(($passMode -join '') -replace '-','')"
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "$passName.exe"
+    $buildOut = & $CompilerPath --build @passMode "tests/test_pass_from_mettle.mettle" -o $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "program returned ${LASTEXITCODE}: $runOut" }
+    Write-CaseResult -Name $passName -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $passName -Passed $false -Reason $_.Exception.Message
+  }
+}
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $printed = & $CompilerPath expand "tests/test_pass_from_mettle.mettle" 2>&1 | Out-String
+  foreach ($expected in @("@pass(cleanup) fn double_add_of_itself", "// after @double_add_of_itself, 'twice' reads:", "<< (int64)1", "// after @insert_a_copy, 'marked' reads:", "v___copy_of_result")) {
+    if ($printed -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in the expansion: $printed" }
+  }
+  $wrong = & $CompilerPath --build --release "tests/err_pass_changes_behavior.mettle" -o (Join-Path $tmpDir "pass_wrong.exe") 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "a pass that changes behavior built" }
+  $wrong = $wrong -replace "\s+", " "
+  foreach ($expected in @("error[L0007]: pass 'wrong_doubling' changed what 'twice' does", "counterexample (input set", "return value was")) {
+    if ($wrong -notmatch [regex]::Escape($expected)) { throw "missing '$expected': $wrong" }
+  }
+  $point = & $CompilerPath --build --release "tests/err_pass_bad_point.mettle" -o (Join-Path $tmpDir "pass_point.exe") 2>&1 | Out-String
+  if (($point -replace "\s+", " ") -notmatch "no point named 'nowhere'") { throw "a bad point was not named: $point" }
+  $op = & $CompilerPath --build --release "tests/err_pass_bad_op.mettle" -o (Join-Path $tmpDir "pass_op.exe") 2>&1 | Out-String
+  if (($op -replace "\s+", " ") -notmatch "wrote an operation named 'no_such_op'") { throw "a bad op was not named: $op" }
+  $shape = & $CompilerPath --build --release "tests/err_pass_bad_shape.mettle" -o (Join-Path $tmpDir "pass_shape.exe") 2>&1 | Out-String
+  if (($shape -replace "\s+", " ") -notmatch "broken shape") { throw "a broken result was not named: $shape" }
+  Write-CaseResult -Name "pass_expand_and_refusals" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "pass_expand_and_refusals" -Passed $false -Reason $_.Exception.Message
+}
+
 # A generator that reads optimized code reads a select as a branch. Selects only
 # appear with if-conversion on.
 $total++

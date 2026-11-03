@@ -1531,6 +1531,16 @@ static int rewrite_operator_names(ASTNode *node, const NameRewrite *rewrites,
     if (!new_expr) {
       return 1;
     }
+    if (!rewrite_node_names(new_expr->count, rewrites, rewrite_count, bindings,
+                            binding_count, scope, 1)) {
+      return 0;
+    }
+    for (size_t e = 0; e < new_expr->extent_count; e++) {
+      if (!rewrite_node_names(new_expr->extents[e], rewrites, rewrite_count,
+                              bindings, binding_count, scope, 1)) {
+        return 0;
+      }
+    }
     return rewrite_type_string_in_place(&new_expr->type_name, rewrites,
                                         rewrite_count, bindings, binding_count);
   }
@@ -3003,6 +3013,10 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     if (new_expr) {
       collect_type_name_dependencies(new_expr->type_name, names, count,
                                      capacity);
+      collect_dependency_names(new_expr->count, names, count, capacity);
+      for (size_t e = 0; e < new_expr->extent_count; e++) {
+        collect_dependency_names(new_expr->extents[e], names, count, capacity);
+      }
     }
     return;
   }
@@ -4375,6 +4389,21 @@ int resolve_imports_of_generated(ASTNode *fragment, const char *base_path,
   if (!fragment || fragment->type != AST_PROGRAM)
     return 0;
   return resolve_imports_keeping(fragment, base_path, reporter, &g_kept_options);
+}
+
+int resolve_imports_isolated(ASTNode *program, const char *base_path,
+                             ErrorReporter *reporter) {
+  char **held_files = g_kept_resolved_files;
+  size_t held_count = g_kept_resolved_count;
+  size_t held_capacity = g_kept_resolved_capacity;
+  g_kept_resolved_files = NULL;
+  g_kept_resolved_count = 0;
+  g_kept_resolved_capacity = 0;
+  int ok = resolve_imports_keeping(program, base_path, reporter, &g_kept_options);
+  g_kept_resolved_files = held_files;
+  g_kept_resolved_count = held_count;
+  g_kept_resolved_capacity = held_capacity;
+  return ok;
 }
 
 static int resolve_imports_keeping(ASTNode *program, const char *base_path,

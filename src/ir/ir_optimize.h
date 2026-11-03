@@ -25,7 +25,23 @@ int ir_optimize_safety_analysis(IRProgram *program, int preserve_boundaries);
 int ir_optimize_program(IRProgram *program,
                         const IROptimizeOptions *options);
 
+typedef struct {
+  const char *name;
+  const char *point;
+  int (*run)(IRFunction *function, void *context, int *changed);
+  void *context;
+} IRLibraryPass;
+
+void ir_library_passes_set(const IRLibraryPass *passes, size_t count);
+int ir_optimizer_point_known(const char *point);
+
+typedef int (*IRBuiltinLibraryRun)(const char *name, IRFunction *function,
+                                   int *changed);
+void ir_builtin_library_set(IRBuiltinLibraryRun run);
+
 int ir_optimize_had_user_error(void);
+void ir_optimize_note_user_error(void);
+IRProgram *ir_optimize_get_program(void);
 int ir_pass_name_is_skipped(const char *pass_name);
 int ir_instruction_writes_temp(const IRInstruction *instruction);
 void ir_note_parallel_loops_unverified(IRProgram *program);

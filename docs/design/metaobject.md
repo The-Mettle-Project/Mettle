@@ -217,10 +217,58 @@ writes a fat pointer type, one table per implementation and the forwarding
 functions as source. A table is a `const`, and `devirtualize_known_tables` turns a
 call through a table it can trace within a block into a direct call.
 
+## Passes
+
+`@pass(point) fn p(f: PassFunction) -> PassFunction` runs a Mettle function on a
+function's IR at a named point in the optimizer. A point is a stage (`pre_inline`,
+`fixpoint`, `loop_canonical`, `recognizers`, `cleanup`, `ssa`, `end`) or
+`after_<pass>` for any built-in pass, whether that pass fired or not. Passes run
+only when the optimizer runs, so at `-O` and `--release`.
+
+`std/pass` holds the data. A `PassOp` carries its opcode, operands and flags as
+written, plus `origin`, the index of the instruction it came from. What the data
+does not hold, such as a tensor descriptor or a volatile mark's kin, stays on the
+instruction through `origin`. A new op has `origin` -1 and `place`, the instruction
+whose source location it takes. Each temporary operand says how many times the
+function reads it.
+
+```mermaid
+flowchart LR
+  ir[function's IR] --> image[PassFunction in interpreter memory]
+  image --> run[pass runs in the interpreter]
+  run --> same{same code?}
+  same -- yes --> done[nothing changes]
+  same -- no --> shape[structure check]
+  shape --> check[run old and new on generated inputs]
+  check -- agree --> keep[keep it]
+  check -- differ --> stop[L0007 with the counterexample]
+```
+
+The structure check and the run on generated inputs happen on every build, the
+way a `@rewrite` rule is checked. A pass goes through the same driver as a
+built-in pass, so `--verify`, `METTLE_SKIP_PASS`, the volatile audit and the value
+checks all see it. A function the checker cannot run is counted, and
+`--report-meta` prints how many. `mettle expand` runs the optimizer when the
+program has a pass and prints each result as Mettle under the pass's name.
+
+A pass cannot reach a metafunction or the program it rewrites. It reads
+`PassFunction` and returns one.
+
+### A built-in pass written this way
+
+`or_chain_bitset` is `or_chain_bitset` in `std/pass`, and the C is gone. It turns
+`x == 'a' || x == 'b' || ...` into a mask test. The optimizer scans for three
+`branch_eq` in a row on one label, and only then loads `std/pass` as a small
+program of its own, so a program with no such chain pays for the scan. Across
+Suite 3 it fires in `json_parse` and `interp_ast`, and all 16 binaries are
+byte-identical to those of the C pass. `json_parse` compiles in 164 ms against
+139 ms, and programs where it does not fire compile as before.
+
 ## Costs
 
 `--report-meta` prints the layouts, generators, source bytes, stage builds and
-interpreter steps, and `--meta-budget=N` stops the build past N steps.
+interpreter steps, and `--meta-budget=N` stops the build past N steps. It prints
+how many pass runs there were and how many results were checked.
 
 ## Error codes
 
@@ -230,3 +278,5 @@ interpreter steps, and `--meta-budget=N` stops the build past N steps.
 - `L0004`: a custom layout crossed `extern` or a kernel.
 - `L0005`: a generator stated no relation.
 - `L0006`: a metafunction reaches a type whose layout depends on it.
+- `L0007`: a pass changed what a function does, or wrote code the compiler cannot
+  use.

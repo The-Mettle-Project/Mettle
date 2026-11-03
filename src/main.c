@@ -6799,6 +6799,7 @@ typedef struct {
   IRTwinSnapshots *twin_snapshots;
   int arm64_object_output;
   int machine_rules_pending;
+  int expand_after_passes;
   int explain_forced_for_rules;
   int emit_safety_checks;
   MetaStageReport meta_report;
@@ -7099,6 +7100,20 @@ static int compile_stage_expand(CompileContext *ctx) {
             "marked comments; this output is not a complete program\n",
             unprintable, unprintable == 1 ? "" : "s");
   }
+  if (meta_stage_has_passes()) {
+    meta_stage_capture_passes(ctx->type_checker);
+    ctx->options->optimize = 1;
+    ctx->expand_after_passes = 1;
+    return COMPILE_CONTINUE;
+  }
+  return 0;
+}
+
+static int compile_stage_expand_passes(CompileContext *ctx) {
+  if (!ctx->expand_after_passes) {
+    return COMPILE_CONTINUE;
+  }
+  meta_stage_print_captured(stdout);
   return 0;
 }
 
@@ -7582,6 +7597,9 @@ static int compile_stage_optimize(CompileContext *ctx) {
     if (!opt_ok) {
       return 1;
     }
+    if (ctx->options->report_meta) {
+      meta_stage_print_pass_report(&ctx->meta_report, stdout);
+    }
   } else {
     ir_note_simd_contracts_unverified(ctx->ir_program);
     ir_note_parallel_loops_unverified(ctx->ir_program);
@@ -7900,6 +7918,7 @@ static const CompileStage COMPILE_STAGES[] = {
     compile_stage_device_targets,
     compile_stage_hooks,
     compile_stage_optimize,
+    compile_stage_expand_passes,
     compile_stage_counters,
     compile_stage_dump_ir,
     compile_stage_codegen,
