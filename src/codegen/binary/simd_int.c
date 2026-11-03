@@ -714,6 +714,11 @@ int code_generator_binary_emit_simd_insertion_sort_i32(
     return 0;
   }
 
+  context->wants_wide_loop_alignment = 1;
+  if (!binary_emit_align_code(b, BINARY_LOOP_ALIGN_BIG,
+                              BINARY_LOOP_ALIGN_BIG_MAX_PAD)) {
+    return 0;
+  }
   inner_loop = b->size;
   if (!binary_emit_cmp_reg_reg(b, BINARY_GP_R10, BINARY_GP_RCX) ||
       !wcs_jcc(b, 0x82 , &j_insert_from_bound) ||
