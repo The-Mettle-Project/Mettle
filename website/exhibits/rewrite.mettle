@@ -1,0 +1,17 @@
+import "std/io";
+
+fn clamp(x: int64, lo: int64, hi: int64) -> int64 {
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  return x;
+}
+
+rewrite drop_clamp(x: int64) -> int64 {
+  from clamp(x, 0, 10);
+  to x;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  println("{clamp((int64)argc, 0, 10)}");
+  return 0;
+}

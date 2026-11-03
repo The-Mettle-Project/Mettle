@@ -1,4 +1,4 @@
-<a href="https://suidvandiewereld.github.io/Mettle/"><img src="website/media/readme-banner.jpg" alt="The future of programming." width="100%"></a>
+<a href="https://suidvandiewereld.github.io/Mettle/"><img src="website/media/readme-banner.jpg" alt="This is your language." width="100%"></a>
 
 **Mettle is a systems language with its own optimizer, linker, runtime and debugger.** It compiles to native code for x86-64 and ARM64, and to PTX, SPIR-V and Metal for GPUs.
 

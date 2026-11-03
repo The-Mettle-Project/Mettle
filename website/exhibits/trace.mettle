@@ -1,0 +1,7 @@
+fn total(n: int32) -> int32 {
+  var sum: int32 = 0;
+  for i in 0..n {
+    sum = sum + i;
+  }
+  return sum;
+}

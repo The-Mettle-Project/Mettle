@@ -1,0 +1,13 @@
+import "std/io";
+
+struct Packet { id: int32; len: int16; flags: uint8; }
+
+comptime for f in typeof(Packet).fields {
+  const ident("OFFSET_", f.name): int64 = f.offset;
+}
+
+fn main() -> int32 {
+  println("OFFSET_len = {OFFSET_len}");
+  println("OFFSET_flags = {OFFSET_flags}");
+  return 0;
+}

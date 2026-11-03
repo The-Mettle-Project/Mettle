@@ -1,0 +1,10 @@
+import "std/io";
+
+type Percent = int32 where value >= 0 && value <= 100;
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var a: Percent = 40;
+  var b: Percent = argc * 2;
+  println("{a} {b}");
+  return 0;
+}

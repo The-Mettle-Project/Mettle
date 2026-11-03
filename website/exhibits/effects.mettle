@@ -1,0 +1,11 @@
+import "std/mem";
+
+fn log_line() { var p: int32* = malloc(64); free(p); }
+fn gain() { log_line(); }
+
+fn mix_audio() forbids alloc { gain(); }
+
+fn main() -> int32 {
+  mix_audio();
+  return 0;
+}

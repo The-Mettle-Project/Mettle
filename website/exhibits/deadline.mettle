@@ -1,0 +1,12 @@
+import "std/io";
+
+fn tick(seed: int32) -> int32 where cycles < 20 {
+  var total: int32 = seed;
+  for i in 0..64 { total = total * 3 + i; }
+  return total;
+}
+
+fn main() -> int32 {
+  println("{tick(1)}");
+  return 0;
+}

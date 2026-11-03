@@ -1,0 +1,15 @@
+import "std/io";
+
+fn abs_slow(x: int32) -> int32 {
+  if (x < 0) { return -x; }
+  return x;
+}
+
+fn abs_fast(x: int32) -> int32 reference abs_slow {
+  return x & 2147483647;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  println("{abs_fast(argc)}");
+  return 0;
+}
