@@ -7197,6 +7197,8 @@ ASTNode *parser_parse_if_statement(Parser *parser) {
   if_data->else_if_count = else_if_count;
   if_data->else_branch = else_branch;
   if_data->uniform_mode = 0;
+  if_data->condition_uniform = 0;
+  if_data->warp_uniform = 0;
   if_node->data = if_data;
 
   ast_add_child(if_node, condition);
@@ -7280,6 +7282,7 @@ ASTNode *parser_parse_while_statement(Parser *parser) {
   while_data->simd_mode = SIMD_ATTR_NONE;
   while_data->unroll_factor = 0;
   while_data->uniform_mode = 0;
+  while_data->warp_uniform = 0;
   while_data->parallel_mode = 0;
   while_node->data = while_data;
 

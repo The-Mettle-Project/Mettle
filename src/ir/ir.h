@@ -220,6 +220,12 @@ typedef struct {
   const char *effect_signature;
 } IRInstruction;
 
+enum {
+  IR_DIVERGENT_NONE = 0,
+  IR_DIVERGENT_FULL = 1,
+  IR_DIVERGENT_BLOCK = 2
+};
+
 MtlcIntrinsic ir_intrinsic_from_name(const char *name);
 const char *ir_gpu_only_construct_name(IROpcode op);
 const char *ir_intrinsic_name(MtlcIntrinsic intrinsic);

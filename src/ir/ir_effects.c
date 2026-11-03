@@ -64,6 +64,7 @@ typedef struct {
   size_t owned_count;
   size_t owned_capacity;
   Word *group_mask;
+  Word *block_mask;
 } Ctx;
 
 struct IREffectResults {
@@ -736,6 +737,21 @@ static int scan_function(Ctx *ctx, size_t index) {
   return 1;
 }
 
+static const Word *divergence_loss(const Ctx *ctx, const EFn *efn,
+                                   size_t site) {
+  if (site == NO_SITE || site >= efn->fn->instruction_count) {
+    return NULL;
+  }
+  switch (efn->fn->instructions[site].divergent_call) {
+  case IR_DIVERGENT_FULL:
+    return ctx->group_mask;
+  case IR_DIVERGENT_BLOCK:
+    return ctx->block_mask;
+  default:
+    return NULL;
+  }
+}
+
 static void propagate(Ctx *ctx) {
   int changed = 1;
   while (changed) {
@@ -767,13 +783,12 @@ static void propagate(Ctx *ctx) {
       for (size_t c = 0; c < efn->callee_count; c++) {
         const Word *callee_needs = ctx->fns[efn->callees[c]].needs;
         size_t site = efn->callee_sites ? efn->callee_sites[c] : NO_SITE;
-        int divergent = site != NO_SITE &&
-                        site < efn->fn->instruction_count &&
-                        efn->fn->instructions[site].divergent_call;
+        const Word *lost =
+            divergence_loss(ctx, efn, site);
         ctx->steps++;
         for (size_t w = 0; w < ctx->words; w++) {
-          Word reaching = divergent ? (efn->provides[w] & ~ctx->group_mask[w])
-                                    : efn->provides[w];
+          Word reaching = lost ? (efn->provides[w] & ~lost[w])
+                               : efn->provides[w];
           gathered[w] |= callee_needs[w] & ~reaching;
         }
       }
@@ -825,10 +840,8 @@ static int trace_chain(Ctx *ctx, size_t start, size_t bit, int follow_needs,
       size_t next = efn->callees[c];
       EFn *callee = &ctx->fns[next];
       size_t call_site = efn->callee_sites ? efn->callee_sites[c] : NO_SITE;
-      int divergent = call_site != NO_SITE &&
-                      call_site < efn->fn->instruction_count &&
-                      efn->fn->instructions[call_site].divergent_call &&
-                      bit_test(ctx->group_mask, bit);
+      const Word *lost = divergence_loss(ctx, efn, call_site);
+      int divergent = lost && bit_test(lost, bit);
       int provided = bit_test(efn->provides, bit) && !divergent;
       int carries = follow_needs
                         ? bit_test(callee->needs, bit) && !provided
@@ -1080,20 +1093,25 @@ static int check_roots(Ctx *ctx) {
       describe_chain(chain, sizeof(chain), ctx, hops, length);
       if (bit_test(ctx->group_mask, bit) && bit_test(efn->provides, bit)) {
         size_t line = 0;
+        int by_warp = 0;
         for (size_t h = 1; h < length; h++) {
           size_t candidate = hops[h].via_site;
-          const IRFunction *owner = ctx->fns[hops[h - 1].function].fn;
-          if (candidate != NO_SITE && candidate < owner->instruction_count &&
-              owner->instructions[candidate].divergent_call) {
-            line = owner->instructions[candidate].location.line;
+          const EFn *owner = &ctx->fns[hops[h - 1].function];
+          const Word *lost = divergence_loss(ctx, owner, candidate);
+          if (lost && bit_test(lost, bit)) {
+            line = owner->fn->instructions[candidate].location.line;
+            by_warp = lost == ctx->block_mask;
             break;
           }
         }
         snprintf(message, sizeof(message),
                  "'%s' provides '%s' and a branch at line %llu takes it away "
-                 "again: no work item agrees on that condition, so the group a "
-                 "collective there speaks to is not all present%s%s",
+                 "again: %s, so the group a collective there speaks to is "
+                 "not all present%s%s",
                  name, effect_name(ctx, bit), (unsigned long long)line,
+                 by_warp ? "the work items of a warp agree on that condition "
+                           "and the warps of the block do not"
+                         : "no work item agrees on that condition",
                  length > 1 ? ": " : "", length > 1 ? chain : "");
         report(ctx, function_name_span(ctx, efn->fn), message,
                "the group is not all here", "F0002");
@@ -1577,6 +1595,7 @@ static void ctx_free(Ctx *ctx) {
   free(ctx->fns);
   free(ctx->index);
   free(ctx->group_mask);
+  free(ctx->block_mask);
 }
 
 static int why_effect(Ctx *ctx, const char *function, const char *effect,
@@ -1851,6 +1870,7 @@ static void effects_mark_groups(Ctx *ctx) {
   }
   if (block_bit >= 0) {
     bit_set(ctx->group_mask, (size_t)block_bit);
+    bit_set(ctx->block_mask, (size_t)block_bit);
   }
 }
 
@@ -1866,7 +1886,8 @@ static int effects_build(Ctx *ctx, const IREffectInput *input,
   ctx->fns = calloc(ctx->fn_count ? ctx->fn_count : 1, sizeof(EFn));
   ctx->index = calloc(ctx->fn_count ? ctx->fn_count : 1, sizeof(NameEntry));
   ctx->group_mask = words_new(ctx);
-  if (!ctx->fns || !ctx->index || !ctx->group_mask) {
+  ctx->block_mask = words_new(ctx);
+  if (!ctx->fns || !ctx->index || !ctx->group_mask || !ctx->block_mask) {
     return 0;
   }
   effects_mark_groups(ctx);

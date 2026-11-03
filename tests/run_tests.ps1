@@ -2750,6 +2750,10 @@ $cases = @(
   @{ Name = "err_gpu_uniform_contract"; Path = "tests/err_gpu_uniform_contract.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "'@uniform!' says every work item of the group takes the same arm, and thread.x varies by work item" },
   @{ Name = "err_gpu_uniform_unproven"; Path = "tests/err_gpu_uniform_unproven.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "which 'Uniform<int32>' requires: thread.x varies by work item" },
   @{ Name = "err_gpu_divergent_collective"; Path = "tests/err_gpu_divergent_collective.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "takes it away again: no work item agrees on that condition" },
+  @{ Name = "err_gpu_divergent_collective_else"; Path = "tests/err_gpu_divergent_collective_else.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "takes it away again: no work item agrees on that condition" },
+  @{ Name = "err_gpu_lane_branch_collective"; Path = "tests/err_gpu_lane_branch_collective.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "takes it away again: no work item agrees on that condition" },
+  @{ Name = "err_gpu_warp_branch_odd_shape"; Path = "tests/err_gpu_warp_branch_odd_shape.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "takes it away again: no work item agrees on that condition" },
+  @{ Name = "err_gpu_warp_branch_block_collective"; Path = "tests/err_gpu_warp_branch_block_collective.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "the work items of a warp agree on that condition and the warps of the block do not" },
   @{ Name = "err_gpu_space_mismatch"; Path = "tests/err_gpu_space_mismatch.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "shared memory is wanted and this address is in global memory" },
   @{ Name = "err_gpu_kernel_shared_param"; Path = "tests/err_gpu_kernel_shared_param.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "kernel parameter 'tile' is declared shared, and a launch has no shared address to pass" },
   @{ Name = "err_gpu_space_cast"; Path = "tests/err_gpu_space_cast.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "this address is in global memory and the cast claims shared memory" },
@@ -2856,6 +2860,8 @@ $cases = @(
   @{ Name = "err_gpu_async_copy_unbalanced"; Path = "tests/err_gpu_async_copy_unbalanced.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "invalid asynchronous-copy contract or unbalanced group" },
   @{ Name = "err_gpu_async_copy_space"; Path = "tests/err_gpu_async_copy_space.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "invalid asynchronous-copy contract or unbalanced group" },
   @{ Name = "gpu_uniform_collectives"; Path = "tests/gpu/uniform_collectives.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },
+  @{ Name = "gpu_warp_uniform_collectives"; Path = "tests/gpu/warp_uniform_collectives.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },
+  @{ Name = "gpu_warp_uniform_collectives_release"; Path = "tests/gpu/warp_uniform_collectives.mettle"; ShouldSucceed = $true; Args = @("--release", "--emit-ptx") },
   @{ Name = "gpu_warp_row_early_return"; Path = "tests/gpu/warp_row_early_return.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10") },
   @{ Name = "gpu_warp_row_early_return_spirv"; Path = "tests/gpu/warp_row_early_return.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-spirv") },
   @{ Name = "gpu_workgroup_uniform_ptx"; Path = "tests/gpu/workgroup_uniform.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx", "--gpu-arch=gb10"); OutputMustNotMatch = @("eligibility failed") },
@@ -14879,6 +14885,25 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "gpu_structure" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $reporterCapExe = "bin/error_reporter_cap_test.exe"
+  & gcc -Wall -Wextra -std=c99 -O2 -D_GNU_SOURCE -Isrc -Iinclude tests/error_reporter_cap_test.c src/error/error_reporter.c src/error/diag_style.c src/common.c src/lexer/lexer.c -o $reporterCapExe
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile the error reporter cap test"
+  }
+  $reporterCapOutput = & $reporterCapExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -or $reporterCapOutput -notmatch " 0 failures") {
+    throw "error reporter cap test failed:`n$reporterCapOutput"
+  }
+  Write-CaseResult -Name "error_reporter_cap" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "error_reporter_cap" -Passed $false -Reason $_.Exception.Message
 }
 
 $total++

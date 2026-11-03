@@ -837,6 +837,7 @@ static ASTNode *ast_clone_if_statement(ASTNode *clone, const ASTNode *node) {
   dst->else_if_count = src->else_if_count;
   dst->uniform_mode = src->uniform_mode;
   dst->condition_uniform = src->condition_uniform;
+  dst->warp_uniform = src->warp_uniform;
   if (src->else_if_count > 0 && src->else_ifs) {
     dst->else_ifs = malloc(src->else_if_count * sizeof(ElseIfClause));
     for (size_t i = 0; i < src->else_if_count; i++) {
@@ -875,6 +876,7 @@ static ASTNode *ast_clone_while_statement(ASTNode *clone, const ASTNode *node) {
   dst->simd_mode = src->simd_mode;
   dst->unroll_factor = src->unroll_factor;
   dst->uniform_mode = src->uniform_mode;
+  dst->warp_uniform = src->warp_uniform;
   dst->parallel_mode = src->parallel_mode;
   if (dst->condition)
     ast_add_child(clone, dst->condition);
@@ -900,6 +902,7 @@ static ASTNode *ast_clone_for_statement(ASTNode *clone, const ASTNode *node) {
   dst->simd_mode = src->simd_mode;
   dst->unroll_factor = src->unroll_factor;
   dst->uniform_mode = src->uniform_mode;
+  dst->warp_uniform = src->warp_uniform;
   dst->parallel_mode = src->parallel_mode;
   if (dst->initializer)
     ast_add_child(clone, dst->initializer);
@@ -2882,6 +2885,7 @@ ASTNode *ast_create_for_statement(ASTNode *initializer, ASTNode *condition,
   for_stmt->simd_mode = SIMD_ATTR_NONE;
   for_stmt->unroll_factor = 0;
   for_stmt->uniform_mode = 0;
+  for_stmt->warp_uniform = 0;
   for_stmt->parallel_mode = 0;
   node->data = for_stmt;
 

@@ -1,0 +1,8 @@
+import "std/warp";
+
+kernel(block = 256) lane_branch(x: float32*, out: float32*, n: int32) {
+  var lane: int32 = thread.x & 31;
+  if (lane < n) {
+    out[thread.x] = warp_sum_f32(x[thread.x]);
+  }
+}

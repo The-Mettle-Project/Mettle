@@ -1080,7 +1080,9 @@ static int ir_lower_for_statement(IRLoweringContext *context, IRFunction *functi
   int body_ok = ir_lower_statement_with_defers(context, function,
                                                for_data->body, defers);
   if (for_data->uniform_mode != 3) {
-    ir_mark_calls_divergent(function, for_body_before);
+    ir_mark_calls_divergent(function, for_body_before,
+                            for_data->warp_uniform ? IR_DIVERGENT_BLOCK
+                                                   : IR_DIVERGENT_FULL);
   }
   ir_pop_control_frame(context);
   if (!body_ok) {
@@ -1216,7 +1218,9 @@ static int ir_lower_while_statement(IRLoweringContext *context, IRFunction *func
   int body_ok = ir_lower_statement_with_defers(context, function,
                                                while_data->body, defers);
   if (while_data->uniform_mode != 3) {
-    ir_mark_calls_divergent(function, while_body_before);
+    ir_mark_calls_divergent(function, while_body_before,
+                            while_data->warp_uniform ? IR_DIVERGENT_BLOCK
+                                                     : IR_DIVERGENT_FULL);
   }
   ir_pop_control_frame(context);
   if (!body_ok) {
@@ -1293,7 +1297,9 @@ static int ir_lower_if_statement(IRLoweringContext *context, IRFunction *functio
         return 0;
       }
       if (if_data->uniform_mode != 3) {
-        ir_mark_calls_divergent(function, arm_before);
+        ir_mark_calls_divergent(function, arm_before,
+                                if_data->warp_uniform ? IR_DIVERGENT_BLOCK
+                                                      : IR_DIVERGENT_FULL);
       }
     }
 
@@ -1318,11 +1324,17 @@ static int ir_lower_if_statement(IRLoweringContext *context, IRFunction *functio
     }
   }
 
+  size_t else_before = function->instruction_count;
   if (if_data->else_branch &&
       !ir_lower_statement_with_defers(context, function, if_data->else_branch,
                                       defers)) {
     free(end_label);
     return 0;
+  }
+  if (if_data->else_branch && if_data->uniform_mode != 3) {
+    ir_mark_calls_divergent(function, else_before,
+                            if_data->warp_uniform ? IR_DIVERGENT_BLOCK
+                                                  : IR_DIVERGENT_FULL);
   }
 
   if (!ir_emit_label_instruction(context, function, end_label,

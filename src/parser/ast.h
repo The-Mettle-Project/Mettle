@@ -461,6 +461,7 @@ typedef struct {
   ASTNode *else_branch;
   int uniform_mode;
   int condition_uniform;
+  int warp_uniform;
 } IfStatement;
 
 typedef struct {
@@ -470,6 +471,7 @@ typedef struct {
   int simd_mode;
   int unroll_factor;
   int uniform_mode;
+  int warp_uniform;
   int parallel_mode;
 } WhileStatement;
 
@@ -482,6 +484,7 @@ typedef struct {
   int simd_mode;
   int unroll_factor;
   int uniform_mode;
+  int warp_uniform;
   int parallel_mode;
 } ForStatement;
 

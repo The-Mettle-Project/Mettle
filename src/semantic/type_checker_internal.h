@@ -65,6 +65,8 @@ int type_checker_expression_surely_varies(TypeChecker *checker,
                                           ASTNode *expression, int depth);
 int type_checker_expression_is_uniform(TypeChecker *checker,
                                        ASTNode *expression, const char **why);
+int type_checker_expression_is_warp_uniform(TypeChecker *checker,
+                                            ASTNode *expression);
 int type_checker_predicate_is_uniform(ASTNode *predicate, const char *binding);
 int type_checker_check_conflict_free(TypeChecker *checker, ASTNode *statement);
 void type_checker_set_gpu_type_report(int enabled);

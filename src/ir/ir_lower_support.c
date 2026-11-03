@@ -1240,7 +1240,7 @@ void ir_mark_branch_conditions_uniform(IRFunction *function, size_t from) {
   }
 }
 
-void ir_mark_calls_divergent(IRFunction *function, size_t from) {
+void ir_mark_calls_divergent(IRFunction *function, size_t from, int level) {
   if (!function) {
     return;
   }
@@ -1249,7 +1249,9 @@ void ir_mark_calls_divergent(IRFunction *function, size_t from) {
     if (instruction->op == IR_OP_CALL ||
         instruction->op == IR_OP_CALL_INDIRECT ||
         instruction->op == IR_OP_BARRIER) {
-      instruction->divergent_call = 1;
+      if (instruction->divergent_call != IR_DIVERGENT_FULL) {
+        instruction->divergent_call = (unsigned char)level;
+      }
     }
   }
 }

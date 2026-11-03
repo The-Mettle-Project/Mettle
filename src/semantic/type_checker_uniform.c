@@ -10,6 +10,7 @@ typedef struct {
   const char *visiting[16];
   size_t visiting_count;
   int depth;
+  int per_warp;
 } UniformContext;
 
 static int uniform_expression(UniformContext *context, ASTNode *expression);
@@ -213,6 +214,39 @@ static int uniform_call(UniformContext *context, ASTNode *expression) {
   return 1;
 }
 
+static int uniform_warp_index(UniformContext *context, BinaryExpression *binary) {
+  ASTNode *owner_node = context->checker->current_function_decl;
+  FunctionDeclaration *owner =
+      owner_node && owner_node->type == AST_FUNCTION_DECLARATION
+          ? (FunctionDeclaration *)owner_node->data
+          : NULL;
+  CallExpression *index;
+  NumberLiteral *amount;
+  long long rows;
+  if (!context->per_warp || !binary || !binary->operator || !owner ||
+      !owner->is_kernel || !binary->left || !binary->right ||
+      binary->left->type != AST_FUNCTION_CALL ||
+      binary->right->type != AST_NUMBER_LITERAL) {
+    return 0;
+  }
+  index = (CallExpression *)binary->left->data;
+  amount = (NumberLiteral *)binary->right->data;
+  if (!index || !index->function_name || !amount || amount->is_float ||
+      strcmp(index->function_name, "gpu_tid_x") != 0) {
+    return 0;
+  }
+  rows = (owner->kernel_block[1] > 1 ? owner->kernel_block[1] : 1) *
+         (owner->kernel_block[2] > 1 ? owner->kernel_block[2] : 1);
+  if (owner->kernel_block[0] <= 0 ||
+      (rows != 1 && owner->kernel_block[0] % 32 != 0)) {
+    return 0;
+  }
+  if (strcmp(binary->operator, ">>") == 0) {
+    return amount->int_value == 5;
+  }
+  return strcmp(binary->operator, "/") == 0 && amount->int_value == 32;
+}
+
 static int uniform_expression(UniformContext *context, ASTNode *expression) {
   if (!expression || context->depth > 64) {
     return expression == NULL;
@@ -235,8 +269,9 @@ static int uniform_expression(UniformContext *context, ASTNode *expression) {
   }
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *binary = (BinaryExpression *)expression->data;
-    int uniform = binary && uniform_expression(context, binary->left) &&
-                  uniform_expression(context, binary->right);
+    int uniform = binary && (uniform_warp_index(context, binary) ||
+                             (uniform_expression(context, binary->left) &&
+                              uniform_expression(context, binary->right)));
     context->depth--;
     return uniform;
   }
@@ -353,6 +388,18 @@ int type_checker_expression_is_uniform(TypeChecker *checker,
     *why = context.why ? context.why : "a value that varies by work item";
   }
   return uniform;
+}
+
+int type_checker_expression_is_warp_uniform(TypeChecker *checker,
+                                            ASTNode *expression) {
+  UniformContext context;
+  if (!checker || !expression) {
+    return 0;
+  }
+  memset(&context, 0, sizeof(context));
+  context.checker = checker;
+  context.per_warp = 1;
+  return uniform_expression(&context, expression);
 }
 
 typedef struct {

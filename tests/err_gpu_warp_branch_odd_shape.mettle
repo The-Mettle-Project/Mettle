@@ -1,0 +1,7 @@
+import "std/warp";
+
+kernel(block = (40, 4, 1)) odd_shape(x: float32*, out: float32*, n: int32) {
+  if ((thread.x >> 5) < n) {
+    out[thread.x] = warp_sum_f32(x[thread.x]);
+  }
+}

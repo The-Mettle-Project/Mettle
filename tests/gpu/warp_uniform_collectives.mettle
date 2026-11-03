@@ -1,0 +1,47 @@
+import "std/warp";
+
+@inline fn group_max(v: float32, lane: int32) -> float32 requires Warp {
+  var m: float32 = v;
+  m = fmaxf_(m, subgroup_shuffle(m, (uint32)(lane ^ 1)));
+  m = fmaxf_(m, subgroup_shuffle(m, (uint32)(lane ^ 2)));
+  return m;
+}
+
+@inline fn fmaxf_(a: float32, b: float32) -> float32 {
+  if (a > b) { return a; }
+  return b;
+}
+
+kernel(block = 256) per_warp_if(x: float32*, out: float32*, n: int32) {
+  var wid: int32 = thread.x >> 5;
+  var lane: int32 = thread.x & 31;
+  var ng: int32 = n >> 5;
+  var rounds: int32 = (ng + 7) >> 3;
+  var kk: int32 = 0;
+  while (kk < rounds) {
+    var g: int32 = kk * 8 + wid;
+    if (g < ng) {
+      out[g * 32 + lane] = group_max(x[g * 32 + lane], lane);
+    } else {
+      out[lane] = group_max(x[lane], lane);
+    }
+    kk = kk + 1;
+  }
+}
+
+kernel(block = 256) per_warp_loop(x: float32*, out: float32*, n: int32) {
+  var wid: int32 = thread.x >> 5;
+  var lane: int32 = thread.x & 31;
+  var round: int32 = 0;
+  while (round < wid) {
+    out[round * 32 + lane] = group_max(x[round * 32 + lane], lane);
+    round = round + 1;
+  }
+}
+
+kernel(block = 256) per_warp_division(x: float32*, out: float32*, n: int32) {
+  var lane: int32 = thread.x & 31;
+  if (thread.x / 32 < n) {
+    out[thread.x] = group_max(x[thread.x], lane);
+  }
+}

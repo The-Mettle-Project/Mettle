@@ -459,7 +459,11 @@ error[F0002]: 'row_sums' provides 'Warp' and a branch at line 7 takes it away
 
 An `if` on a `Uniform<bool>` keeps them, and so does `@uniform! if`. A loop
 whose trip count is uniform keeps them in its body; one whose trip count is not
-does not. That is the whole reason uniformity and the group effects belong
+does not. A condition built only from uniform values and `thread.x >> 5` or
+`thread.x / 32` is the same for every work item of a warp, so it keeps `Warp`
+and takes only `Block` away. That holds in a kernel whose block is one
+dimensional or whose x extent is a multiple of 32. The `else` arms of an `if`
+lose the effects the same way the `then` arm does. That is the whole reason uniformity and the group effects belong
 together: the uniformity proof is what decides whether a collective is
 reachable.
 

@@ -421,6 +421,15 @@ static int type_checker_if_check_uniform_condition(TypeChecker *checker,
     if_stmt->condition_uniform =
         type_checker_expression_is_uniform(checker, if_stmt->condition, &why);
   }
+  if (if_stmt->uniform_mode != 3 && type_checker_module_has_kernel(checker)) {
+    if_stmt->warp_uniform = type_checker_expression_is_warp_uniform(
+        checker, if_stmt->condition);
+    for (size_t i = 0; if_stmt->warp_uniform && i < if_stmt->else_if_count;
+         i++) {
+      if_stmt->warp_uniform = type_checker_expression_is_warp_uniform(
+          checker, if_stmt->else_ifs[i].condition);
+    }
+  }
   return 1;
 }
 
@@ -627,7 +636,8 @@ int type_checker_body_assigns(const ASTNode *node, const char *name) {
 
 static int type_checker_check_loop_uniformity(TypeChecker *checker,
                                               ASTNode *condition,
-                                              int *uniform_mode) {
+                                              int *uniform_mode,
+                                              int *warp_uniform) {
   const char *why = NULL;
   Type *condition_type = condition ? condition->resolved_type : NULL;
   if (!checker || !condition || !uniform_mode) {
@@ -647,6 +657,9 @@ static int type_checker_check_loop_uniformity(TypeChecker *checker,
         "number of times, and %s varies by work item",
         why ? why : "this condition");
     return 0;
+  }
+  if (type_checker_module_has_kernel(checker)) {
+    *warp_uniform = type_checker_expression_is_warp_uniform(checker, condition);
   }
   return 1;
 }
@@ -762,7 +775,8 @@ int type_checker_check_for_statement(TypeChecker *checker,
       return 0;
     }
     if (!type_checker_check_loop_uniformity(checker, for_stmt->condition,
-                                            &for_stmt->uniform_mode)) {
+                                            &for_stmt->uniform_mode,
+                                            &for_stmt->warp_uniform)) {
       free(post_init_snapshot);
       type_checker_init_tracker_exit_scope(checker);
       symbol_table_exit_scope(checker->symbol_table);
@@ -1298,7 +1312,8 @@ static int type_checker_check_while(TypeChecker *checker, ASTNode *statement) {
       return 0;
     }
     if (!type_checker_check_loop_uniformity(checker, while_stmt->condition,
-                                            &while_stmt->uniform_mode)) {
+                                            &while_stmt->uniform_mode,
+                                            &while_stmt->warp_uniform)) {
       return 0;
     }
 
