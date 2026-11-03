@@ -5424,8 +5424,7 @@ static mt_size mt_float_exponential(char *out, double value, int precision,
   if (precision < 0) {
     precision = 6;
   }
-  value += mt_decimal_round(precision);
-  if (value >= 10.0) {
+  if (value + mt_decimal_round(precision) >= 10.0) {
     value *= 0.1;
     exponent++;
   }

@@ -434,6 +434,8 @@ int ir_drop_dead_narrowing_pass(IRFunction *function, int *changed);
 int ir_hoist_global_bases_pass(IRFunction *function, int *changed);
 int ir_hoist_load_bases_pass(IRFunction *function, int *changed);
 int ir_hoist_column_bases_pass(IRFunction *function, int *changed);
+int ir_devirtualize_known_tables_pass(IRFunction *function, int *changed);
+void ir_devirtualize_set_program(IRProgram *program);
 int ir_hoist_descriptor_loads_pass(IRFunction *function, int *changed);
 int ir_hoist_invariant_assigns_pass(IRFunction *function, int *changed);
 int ir_hoist_row_pointers_pass(IRFunction *function, int *changed);

@@ -346,7 +346,9 @@ static int walk_body(Reflect *reflect, ASTNode *node) {
       RFunction *callee = find_function(reflect, call->function_name);
       const char *spelling =
           callee ? callee->qualified : strip_import_prefix(call->function_name);
-      if (strncmp(spelling, "__", 2) != 0 && !add_callee(current, spelling)) {
+      if ((strncmp(spelling, "__", 2) != 0 ||
+           strncmp(spelling, "__trait_", 8) == 0) &&
+          !add_callee(current, spelling)) {
         return 0;
       }
     }
@@ -1378,6 +1380,25 @@ static int meta_build_cfg(MetaImage *m, GpuStructure *structure, char *why,
   return ok;
 }
 
+static void meta_spell_float(char *out, size_t size, double value) {
+  for (int precision = 15; precision <= 17; precision++) {
+    snprintf(out, size, "%.*g", precision, value);
+    if (!strchr(out, '.') && !strchr(out, 'e') && !strchr(out, 'n') &&
+        strlen(out) + 3 < size) {
+      size_t digits = strlen(out);
+      out[digits] = '.';
+      out[digits + 1] = '0';
+      out[digits + 2] = '\0';
+    }
+    if (atof(out) == value) {
+      return;
+    }
+  }
+  unsigned long long bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  snprintf(out, size, "memo_float((int64)%lld)", (long long)bits);
+}
+
 static void meta_spell_name(char *out, size_t size, const char *name) {
   size_t used = (size_t)snprintf(out, size, "v_");
   for (const char *p = name ? name : ""; *p && used + 1 < size; p++) {
@@ -1449,14 +1470,7 @@ static void meta_put_value(MetaImage *m, size_t base,
     break;
   case IR_OPERAND_FLOAT:
     kind = 4;
-    snprintf(spelled, sizeof(spelled), "%.17g", operand->float_value);
-    if (!strchr(spelled, '.') && !strchr(spelled, 'e') &&
-        !strchr(spelled, 'n')) {
-      size_t digits = strlen(spelled);
-      spelled[digits] = '.';
-      spelled[digits + 1] = '0';
-      spelled[digits + 2] = '\0';
-    }
+    meta_spell_float(spelled, sizeof(spelled), operand->float_value);
     text = spelled;
     break;
   case IR_OPERAND_STRING:

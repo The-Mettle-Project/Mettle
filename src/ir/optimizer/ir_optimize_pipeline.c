@@ -192,6 +192,7 @@ static const IROptNamedPass g_ir_lowering_cleanup[] = {
     {"redundancy_elim", ir_redundancy_elimination_pass,
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
     {"redundancy_copy_prop", ir_copy_and_constant_propagation_pass, {0, 0}},
+    {"devirtualize_known_tables", ir_devirtualize_known_tables_pass, {0, 0}},
     {"merge_const_stores", ir_merge_adjacent_const_stores_pass, {0, 0}},
     {"merge_row_pointers", ir_merge_row_pointers_pass,
      {IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
@@ -958,6 +959,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
     return 0;
   }
   ir_optimize_set_program(program);
+  ir_devirtualize_set_program(program);
   if (options && options->target_neutral_only) {
     return ir_optimize_portable_program_pipeline(program, options);
   }

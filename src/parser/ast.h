@@ -255,6 +255,8 @@ typedef struct {
   size_t method_count;
   MetaDecorator *meta_decorators;
   size_t meta_decorator_count;
+  char **implementors;
+  size_t implementor_count;
 } TraitDeclaration;
 
 typedef struct {

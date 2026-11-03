@@ -429,6 +429,8 @@ static ASTNode *ast_clone_trait_declaration(ASTNode *clone, const ASTNode *node)
   dst->meta_decorators = ast_clone_meta_decorators(src->meta_decorators,
                                                    src->meta_decorator_count);
   dst->meta_decorator_count = src->meta_decorator_count;
+  dst->implementors = src->implementors;
+  dst->implementor_count = src->implementor_count;
   dst->name = ast_intern_string(src->name);
   dst->is_exported = src->is_exported;
   dst->method_count = src->method_count;
@@ -2224,6 +2226,8 @@ ASTNode *ast_create_trait_declaration(const char *name,
   trait_decl->method_count = 0;
   trait_decl->meta_decorators = NULL;
   trait_decl->meta_decorator_count = 0;
+  trait_decl->implementors = NULL;
+  trait_decl->implementor_count = 0;
   node->data = trait_decl;
   return node;
 }

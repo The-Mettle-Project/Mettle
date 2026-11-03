@@ -532,6 +532,171 @@ static size_t *ir_lbase_collect_candidates(const IRFunction *function,
   return cand;
 }
 
+static IRProgram *g_devirtualize_program;
+
+void ir_devirtualize_set_program(IRProgram *program) {
+  g_devirtualize_program = program;
+}
+
+static int ir_devirtualize_slot(const IRFunction *function, size_t at,
+                                const IROperand *address, const char **symbol,
+                                long long *offset) {
+  const IRInstruction *producer;
+  *offset = 0;
+  if (address->kind != IR_OPERAND_TEMP || !address->name) {
+    return 0;
+  }
+  producer = ir_find_temp_producer_before(function, at, address->name);
+  if (producer && producer->op == IR_OP_BINARY && producer->text &&
+      strcmp(producer->text, "+") == 0 && producer->rhs.kind == IR_OPERAND_INT &&
+      producer->lhs.kind == IR_OPERAND_TEMP && producer->lhs.name) {
+    *offset = producer->rhs.int_value;
+    producer = ir_find_temp_producer_before(function, at, producer->lhs.name);
+  }
+  if (!producer || producer->op != IR_OP_ADDRESS_OF ||
+      producer->lhs.kind != IR_OPERAND_SYMBOL || !producer->lhs.name) {
+    return 0;
+  }
+  *symbol = producer->lhs.name;
+  return 1;
+}
+
+static const char *ir_devirtualize_global_behind(const IRFunction *function,
+                                                 size_t at,
+                                                 const IROperand *value,
+                                                 int depth) {
+  const IRInstruction *producer;
+  const char *symbol = NULL;
+  long long offset = 0;
+  if (depth > 16 || value->kind != IR_OPERAND_TEMP || !value->name) {
+    return NULL;
+  }
+  producer = ir_find_temp_producer_before(function, at, value->name);
+  if (!producer) {
+    return NULL;
+  }
+  size_t producer_at = (size_t)(producer - function->instructions);
+  if (producer->op == IR_OP_ASSIGN) {
+    return ir_devirtualize_global_behind(function, producer_at, &producer->lhs,
+                                         depth + 1);
+  }
+  if (producer->op == IR_OP_ADDRESS_OF && producer->lhs.kind == IR_OPERAND_SYMBOL &&
+      producer->lhs.name &&
+      !ir_function_local_declared_type(function, producer->lhs.name) &&
+      !ir_function_symbol_is_parameter(function, producer->lhs.name)) {
+    return producer->lhs.name;
+  }
+  if (producer->op != IR_OP_LOAD ||
+      !ir_devirtualize_slot(function, producer_at, &producer->lhs, &symbol,
+                            &offset) ||
+      !ir_function_local_declared_type(function, symbol)) {
+    return NULL;
+  }
+  for (size_t j = producer_at; j-- > 0;) {
+    const IRInstruction *ins = &function->instructions[j];
+    if (ins->op == IR_OP_LABEL || ins->op == IR_OP_JUMP ||
+        ins->op == IR_OP_BRANCH_ZERO || ins->op == IR_OP_BRANCH_EQ ||
+        ins->op == IR_OP_CALL || ins->op == IR_OP_CALL_INDIRECT) {
+      return NULL;
+    }
+    if (ins->op == IR_OP_STORE) {
+      const char *stored_symbol = NULL;
+      long long stored_offset = 0;
+      if (!ir_devirtualize_slot(function, j, &ins->dest, &stored_symbol,
+                                &stored_offset)) {
+        return NULL;
+      }
+      if (strcmp(stored_symbol, symbol) == 0) {
+        if (stored_offset == offset && ins->rhs.kind == IR_OPERAND_INT &&
+            ins->rhs.int_value == 8) {
+          return ir_devirtualize_global_behind(function, j, &ins->lhs,
+                                               depth + 1);
+        }
+        long long end = stored_offset +
+                        (ins->rhs.kind == IR_OPERAND_INT ? ins->rhs.int_value : 0);
+        if (offset < end && offset + 8 > stored_offset) {
+          return NULL;
+        }
+      }
+      continue;
+    }
+    if (ins->op == IR_OP_ASSIGN && ins->dest.kind == IR_OPERAND_SYMBOL &&
+        ins->dest.name && strcmp(ins->dest.name, symbol) == 0) {
+      if (ins->lhs.kind != IR_OPERAND_SYMBOL || !ins->lhs.name) {
+        return NULL;
+      }
+      symbol = ins->lhs.name;
+    }
+  }
+  return NULL;
+}
+
+static const char *ir_devirtualize_table_entry(const IRFunction *function,
+                                               size_t at,
+                                               const IROperand *callee) {
+  const IRInstruction *load;
+  const IRInstruction *base;
+  long long offset = 0;
+  if (callee->kind != IR_OPERAND_TEMP || !callee->name) {
+    return NULL;
+  }
+  load = ir_find_temp_producer_before(function, at, callee->name);
+  if (!load || load->op != IR_OP_LOAD || load->rhs.kind != IR_OPERAND_INT ||
+      load->rhs.int_value != 8 || load->lhs.kind != IR_OPERAND_TEMP ||
+      !load->lhs.name) {
+    return NULL;
+  }
+  IROperand pointer = load->lhs;
+  base = ir_find_temp_producer_before(function, at, load->lhs.name);
+  if (base && base->op == IR_OP_BINARY && base->text &&
+      strcmp(base->text, "+") == 0 && base->rhs.kind == IR_OPERAND_INT &&
+      base->lhs.kind == IR_OPERAND_TEMP && base->lhs.name) {
+    offset = base->rhs.int_value;
+    pointer = base->lhs;
+  }
+  const char *global = ir_devirtualize_global_behind(function, at, &pointer, 0);
+  if (!global) {
+    return NULL;
+  }
+  const IRModuleSymbol *table =
+      ir_program_lookup_symbol(g_devirtualize_program, global);
+  if (!table || !table->is_immutable) {
+    return NULL;
+  }
+  for (size_t r = 0; r < table->init_reloc_count; r++) {
+    if ((long long)table->init_relocs[r].offset == offset &&
+        table->init_relocs[r].symbol) {
+      return table->init_relocs[r].symbol;
+    }
+  }
+  return NULL;
+}
+
+int ir_devirtualize_known_tables_pass(IRFunction *function, int *changed) {
+  if (!function || !g_devirtualize_program) {
+    return 1;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *ins = &function->instructions[i];
+    const char *target;
+    if (ins->op != IR_OP_CALL_INDIRECT) {
+      continue;
+    }
+    target = ir_devirtualize_table_entry(function, i, &ins->lhs);
+    if (!target) {
+      continue;
+    }
+    ir_operand_destroy(&ins->lhs);
+    ins->lhs = ir_operand_none();
+    ins->op = IR_OP_CALL;
+    ins->text = mettle_strdup(target);
+    if (changed) {
+      *changed = 1;
+    }
+  }
+  return 1;
+}
+
 static int ir_column_operand_invariant(const IRFunction *function, size_t header,
                                        size_t latch, const IROperand *operand) {
   if (operand->kind == IR_OPERAND_INT) {

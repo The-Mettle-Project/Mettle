@@ -390,6 +390,14 @@ static void prune_clone(Program *clone, const NameSet *keep) {
 }
 
 static void clear_clone_roles(Program *clone) {
+  size_t kept = 0;
+  for (size_t i = 0; i < clone->declaration_count; i++) {
+    ASTNode *decl = clone->declarations[i];
+    if (!decl || decl->type != AST_TRAIT_DECLARATION) {
+      clone->declarations[kept++] = decl;
+    }
+  }
+  clone->declaration_count = kept;
   for (size_t i = 0; i < clone->declaration_count; i++) {
     ASTNode *decl = clone->declarations[i];
     if (!decl || !decl->data) {
@@ -1054,6 +1062,32 @@ static int collect_generators(MetaStage *stage, GenList *list) {
       if (!fd->meta_role) {
         collect_generator_calls(stage, fd->body, list);
       }
+    } else if (decl->type == AST_TRAIT_DECLARATION) {
+      TraitDeclaration *td = (TraitDeclaration *)decl->data;
+      for (size_t d = 0; d < td->meta_decorator_count; d++) {
+        const FunctionDeclaration *generator =
+            generator_named(program, td->meta_decorators[d].name);
+        if (!generator) {
+          char message[300];
+          snprintf(message, sizeof(message),
+                   "'@%s' is a layout function, and it decorates the trait '%s'",
+                   td->meta_decorators[d].name, td->name);
+          report_at(stage, td->meta_decorators[d].location, "L0001", message,
+                    NULL);
+          return 0;
+        }
+        GenWork work;
+        memset(&work, 0, sizeof(work));
+        work.site = GEN_ON_TRAIT;
+        work.decl = decl;
+        work.decorator = &td->meta_decorators[d];
+        work.generator = generator;
+        work.generator_name = td->meta_decorators[d].name;
+        work.target = td->name;
+        if (!gen_list_add(list, work)) {
+          return 0;
+        }
+      }
     } else if (decl->type == AST_STRUCT_DECLARATION) {
       StructDeclaration *sd = (StructDeclaration *)decl->data;
       for (size_t d = 0; d < sd->meta_decorator_count; d++) {
@@ -1115,6 +1149,41 @@ static char *generator_driver_text(const Program *program, const GenList *list) 
                "  var f: TypeInfo = %s(p, \"%s\");\n",
                i, find ? find->name : "layout_type", work->target);
       text_append(&text, &used, &capacity, line);
+    } else if (strcmp(parameter, "TraitInfo") == 0 && work->site == GEN_ON_TRAIT) {
+      const TraitDeclaration *td = (const TraitDeclaration *)work->decl->data;
+      snprintf(line, sizeof(line),
+               "fn __meta_gen_%zu(p: Program) -> Generated {\n"
+               "  var f: TraitInfo;\n  f.name = \"%s\";\n"
+               "  f.implementors = new string[%zu];\n"
+               "  f.methods = new MethodInfo[%zu];\n",
+               i, td->name, td->implementor_count, td->method_count);
+      text_append(&text, &used, &capacity, line);
+      for (size_t k = 0; k < td->implementor_count; k++) {
+        snprintf(line, sizeof(line), "  f.implementors[%zu] = \"%s\";\n", k,
+                 td->implementors[k]);
+        text_append(&text, &used, &capacity, line);
+      }
+      for (size_t m = 0; m < td->method_count; m++) {
+        const FunctionDeclaration *method =
+            (const FunctionDeclaration *)td->methods[m]->data;
+        snprintf(line, sizeof(line),
+                 "  f.methods[%zu].name = \"%s\";\n"
+                 "  f.methods[%zu].return_type = \"%s\";\n"
+                 "  f.methods[%zu].param_names = new string[%zu];\n"
+                 "  f.methods[%zu].param_types = new string[%zu];\n",
+                 m, method->name, m,
+                 method->return_type ? method->return_type : "void", m,
+                 method->parameter_count, m, method->parameter_count);
+        text_append(&text, &used, &capacity, line);
+        for (size_t a = 0; a < method->parameter_count; a++) {
+          snprintf(line, sizeof(line),
+                   "  f.methods[%zu].param_names[%zu] = \"%s\";\n"
+                   "  f.methods[%zu].param_types[%zu] = \"%s\";\n",
+                   m, a, method->parameter_names[a], m, a,
+                   method->parameter_types[a]);
+          text_append(&text, &used, &capacity, line);
+        }
+      }
     } else {
       return NULL;
     }
@@ -1228,6 +1297,24 @@ static int apply_generated(MetaStage *stage, GenWork *work, const char *text,
       }
     }
     sd->meta_decorator_count = kept;
+  } else if (work->site == GEN_ON_TRAIT) {
+    TraitDeclaration *td = (TraitDeclaration *)work->decl->data;
+    size_t kept = 0;
+    for (size_t d = 0; d < td->meta_decorator_count; d++) {
+      if (&td->meta_decorators[d] != work->decorator) {
+        td->meta_decorators[kept++] = td->meta_decorators[d];
+      }
+    }
+    td->meta_decorator_count = kept;
+    if (kept == 0) {
+      size_t write = 0;
+      for (size_t i = 0; i < program->declaration_count; i++) {
+        if (program->declarations[i] != work->decl) {
+          program->declarations[write++] = program->declarations[i];
+        }
+      }
+      program->declaration_count = write;
+    }
   } else if (work->site == GEN_AT_CALL) {
     ASTNode *call = work->call;
     ASTNode *replacement =

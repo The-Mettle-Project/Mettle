@@ -4546,6 +4546,20 @@ int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
                (decl->type == AST_TRAIT_DECLARATION ||
                 decl->type == AST_IMPL_DECLARATION)) {
       is_compile_time_trait_decl = 1;
+      if (decl->type == AST_TRAIT_DECLARATION && decl->data &&
+          ((TraitDeclaration *)decl->data)->meta_decorator_count > 0) {
+        TraitDeclaration *td = (TraitDeclaration *)decl->data;
+        is_compile_time_trait_decl = 0;
+        td->implementors = calloc(ctx.impl_count + 1, sizeof(char *));
+        td->implementor_count = 0;
+        for (size_t k = 0; td->implementors && k < ctx.impl_count; k++) {
+          if (ctx.impls[k].trait_name &&
+              strcmp(ctx.impls[k].trait_name, td->name) == 0) {
+            td->implementors[td->implementor_count++] =
+                strdup(ctx.impls[k].for_type_name);
+          }
+        }
+      }
     }
 
     if (!is_generic && !is_compile_time_trait_decl) {

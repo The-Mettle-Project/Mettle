@@ -1,0 +1,60 @@
+import "std/io";
+import "std/meta";
+
+struct Circle {
+  r: float64;
+}
+
+struct Square {
+  side: float64;
+  hits: int32;
+}
+
+@dyn trait Shape {
+  fn area(self: Self) -> float64;
+  fn scaled(self: Self, k: float64) -> float64;
+  fn touch(self: Self*) -> int32;
+}
+
+impl Shape for Circle {
+  fn area(self: Self) -> float64 { return 3.0 * self.r * self.r; }
+  fn scaled(self: Self, k: float64) -> float64 { return k * self.r; }
+  fn touch(self: Self*) -> int32 { return 1; }
+}
+
+impl Shape for Square {
+  fn area(self: Self) -> float64 { return self.side * self.side; }
+  fn scaled(self: Self, k: float64) -> float64 { return k * self.side * 2.0; }
+  fn touch(self: Self*) -> int32 {
+    self.hits = self.hits + 1;
+    return self.hits;
+  }
+}
+
+fn total_area(shapes: Shape__dyn[]) -> float64 {
+  var sum: float64 = 0.0;
+  for i in 0..shapes.length {
+    sum = sum + shapes[i].area();
+  }
+  return sum;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  var c: Circle;
+  c.r = 2.0;
+  var s: Square;
+  s.side = 3.0;
+  var shapes: Shape__dyn[] = new Shape__dyn[2];
+  shapes[0] = Shape__from_Circle(&c);
+  shapes[1] = Shape__from_Square(&s);
+  if (total_area(shapes) != 21.0) { bad = bad + 1; println("total"); }
+  if (shapes[1].scaled(2.0) != 12.0) { bad = bad + 1; println("scaled"); }
+  shapes[1].touch();
+  if (shapes[1].touch() != 2 || s.hits != 2) { bad = bad + 1; println("touch"); }
+  var known: Shape__dyn = Shape__from_Circle(&c);
+  if (known.area() != 12.0) { bad = bad + 1; println("known"); }
+  free(shapes.data);
+  if (bad == 0) { println("ok"); }
+  return bad;
+}

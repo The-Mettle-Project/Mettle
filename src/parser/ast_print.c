@@ -95,7 +95,15 @@ static void print_expression(AstPrinter *printer, const ASTNode *node) {
     if (!literal) {
       fputs("0", printer->out);
     } else if (literal->is_float) {
-      fprintf(printer->out, "%g", literal->float_value);
+      char spelled[64];
+      for (int precision = 6; precision <= 17; precision++) {
+        snprintf(spelled, sizeof(spelled), "%.*g", precision,
+                 literal->float_value);
+        if (atof(spelled) == literal->float_value) {
+          break;
+        }
+      }
+      fputs(spelled, printer->out);
     } else if (literal->int_radix == 16) {
       fprintf(printer->out, "0x%llx", (unsigned long long)literal->int_value);
     } else {

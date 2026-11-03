@@ -548,7 +548,9 @@ export fn memo_float(bits: int64) -> float64 {
 
 fn function_named(p: Program, name: string) -> int64 {
   for i in 0..p.functions.length {
-    if (p.functions[i].name == name) { return i; }
+    if (p.functions[i].name == name || p.functions[i].qualified == name) {
+      return i;
+    }
   }
   return -1;
 }
@@ -571,12 +573,10 @@ fn purity_walk(p: Program, at: int64, skip: string, seen: bool*) -> string {
     return "'{f.name}' is extern and not declared @pure";
   }
   for c in f.callees {
-    if (c != skip) {
-      var callee: int64 = function_named(p, c);
-      if (callee >= 0) {
-        var why: string = purity_walk(p, callee, skip, seen);
-        if (why.length > 0) { return why; }
-      }
+    var callee: int64 = function_named(p, c);
+    if (callee >= 0 && p.functions[callee].name != skip) {
+      var why: string = purity_walk(p, callee, skip, seen);
+      if (why.length > 0) { return why; }
     }
   }
   return "";
@@ -1318,6 +1318,124 @@ fn grad_rule_text(f: FunctionInfo, grad_name: string) -> string {
   }
   text_add(&t, "  ad_release();\n  return verdict_pass();\n}\n");
   return text_done(&t);
+}
+
+export struct MethodInfo {
+  name: string;
+  return_type: string;
+  param_names: string[];
+  param_types: string[];
+}
+
+export struct TraitInfo {
+  name: string;
+  implementors: string[];
+  methods: MethodInfo[];
+}
+
+fn dyn_type_for(type_name: string, self_type: string) -> string {
+  if (type_name == "Self") { return self_type; }
+  if (type_name == "Self*") { return "{self_type}*"; }
+  return type_name;
+}
+
+fn dyn_thunk_signature(m: MethodInfo) -> string {
+  var t: Text;
+  text_add(&t, "fn(rawptr");
+  for i in 1..m.param_types.length {
+    text_add(&t, ", {m.param_types[i]}");
+  }
+  text_add(&t, ")");
+  if (m.return_type != "void") { text_add(&t, " -> {m.return_type}"); }
+  return text_done(&t);
+}
+
+fn dyn_parameters(m: MethodInfo, self_text: string) -> string {
+  var t: Text;
+  text_add(&t, self_text);
+  for i in 1..m.param_names.length {
+    text_add(&t, ", {m.param_names[i]}: {m.param_types[i]}");
+  }
+  return text_done(&t);
+}
+
+fn dyn_arguments(m: MethodInfo, self_text: string) -> string {
+  var t: Text;
+  text_add(&t, self_text);
+  for i in 1..m.param_names.length {
+    text_add(&t, ", {m.param_names[i]}");
+  }
+  return text_done(&t);
+}
+
+@generate export fn dyn(trait_info: TraitInfo) -> Generated {
+  var t: Text;
+  var name: string = trait_info.name;
+  for m in trait_info.methods {
+    if (m.param_types.length == 0 ||
+        (m.param_types[0] != "Self" && m.param_types[0] != "Self*")) {
+      return refuse("@dyn on '{name}': method '{m.name}' has no 'self' receiver to dispatch on");
+    }
+    for i in 1..m.param_types.length {
+      if (m.param_types[i] == "Self" || m.param_types[i] == "Self*") {
+        return refuse("@dyn on '{name}': method '{m.name}' takes a second Self, and a table only knows one type");
+      }
+    }
+    if (m.return_type == "Self" || m.return_type == "Self*") {
+      return refuse("@dyn on '{name}': method '{m.name}' returns Self, and a caller through a table does not know the type");
+    }
+  }
+  text_add(&t, "struct {name}__table {{\n");
+  for m in trait_info.methods {
+    text_add(&t, "  {m.name}: {dyn_thunk_signature(m)};\n");
+  }
+  text_add(&t, "}\n\n");
+  text_add(&t, "struct {name}__dyn {{\n  data: rawptr;\n  table: {name}__table*;\n}\n\n");
+  for m in trait_info.methods {
+    text_add(&t, "fn {name}__dyn_{m.name}({dyn_parameters(m, "self: {name}__dyn")})");
+    if (m.return_type != "void") { text_add(&t, " -> {m.return_type}"); }
+    text_add(&t, " {{\n  ");
+    if (m.return_type != "void") { text_add(&t, "return "); }
+    text_add(&t, "self.table.{m.name}({dyn_arguments(m, "self.data")});\n}\n\n");
+  }
+  for type_name in trait_info.implementors {
+    for m in trait_info.methods {
+      var self_text: string = "*({type_name}*)self";
+      if (m.param_types[0] == "Self*") { self_text = "({type_name}*)self"; }
+      text_add(&t, "fn {type_name}__as_{name}_{m.name}({dyn_parameters(m, "self: rawptr")})");
+      if (m.return_type != "void") { text_add(&t, " -> {m.return_type}"); }
+      text_add(&t, " {{\n  ");
+      if (m.return_type != "void") { text_add(&t, "return "); }
+      text_add(&t, "__trait_{name}__{type_name}__{m.name}({dyn_arguments(m, self_text)});\n}\n\n");
+    }
+    text_add(&t, "const {type_name}__{name}_table: {name}__table = {{\n");
+    for m in trait_info.methods {
+      text_add(&t, "  {m.name}: &{type_name}__as_{name}_{m.name},\n");
+    }
+    text_add(&t, "};\n\n");
+    text_add(&t, "fn {name}__from_{type_name}(value: {type_name}*) -> {name}__dyn {{\n");
+    text_add(&t, "  var out: {name}__dyn;\n  out.data = (rawptr)value;\n  out.table = &{type_name}__{name}_table;\n  return out;\n}\n\n");
+  }
+  text_add(&t, "@rule fn {name}__dyn_holds(p: Program) -> Verdict {{\n");
+  for type_name in trait_info.implementors {
+    for m in trait_info.methods {
+      var thunk: string = "{type_name}__as_{name}_{m.name}";
+      text_add(&t, "  if (!calls_function(p, \"{thunk}\", \"__trait_{name}__{type_name}__{m.name}\")) {{\n");
+      text_add(&t, "    return verdict_fail(function_site(p, \"{thunk}\"), \"{thunk} does not reach the method it stands for\");\n  }\n");
+    }
+  }
+  text_add(&t, "  return verdict_pass();\n}\n");
+  return generated_as(name, text_done(&t));
+}
+
+export fn calls_function(p: Program, caller: string, callee: string) -> bool {
+  var at: int64 = function_named(p, caller);
+  if (at < 0) { return false; }
+  for c in p.functions[at].callees {
+    var reached: int64 = function_named(p, c);
+    if (reached >= 0 && p.functions[reached].name == callee) { return true; }
+  }
+  return false;
 }
 
 var trace_depth: int64 = 0;
