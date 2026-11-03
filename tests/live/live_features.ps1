@@ -224,10 +224,201 @@ if ($built.Code -ne 0) {
     if ($text -match "tag=(?!3)") { Fail $name "a packed tag lost its value" }
 }
 
+function Test-HeapLayout([string]$name, [string]$before, [string]$after, [string]$objects, [string[]]$fields, [string]$keep) {
+    Clear-Program $name
+    $source = Join-Path $scratch "$name.mettle"
+    $exe = Join-Path $scratch "$name$suffix"
+    Write-Source $source $before
+    $built = Invoke-Mettle @("--build", "--live", $source, "-o", $exe)
+    if ($built.Code -ne 0) {
+        Fail $name "build failed: $($built.Text)"
+        return
+    }
+    $process = Start-Live $exe $name
+    $out = Join-Path $scratch "$name.out"
+    $err = Join-Path $scratch "$name.err"
+    if (-not (Wait-For $out "old t=3 ")) { Fail $name "the program did not start: $(Read-Text $err)" }
+    Write-Source $source $after
+    $patch = Invoke-Mettle @("--live-patch", $exe, $source)
+    if ($patch.Text -notmatch "heap types? converted to a new layout") { Fail $name "patch said: $($patch.Text)" }
+    if (-not (Wait-For $err "$objects heap objects? converted")) { Fail $name "the objects were not converted: $(Read-Text $err)" }
+    if (-not (Wait-For $out "new t=\d+ ")) { Fail $name "main never moved to the new code" }
+    Start-Sleep -Milliseconds 300
+    $undo = Invoke-Mettle @("--live-undo", $exe)
+    if (-not (Wait-For $out "new t=\d+ [^\n]*\n(.*\n)*old t=")) { Fail $name "undo never returned to the old code" }
+    Start-Sleep -Milliseconds 300
+    Stop-Live $process
+    $text = Read-Text $out
+    foreach ($field in $fields) {
+        $gap = Get-Consecutive $text $field
+        if ($gap) { Fail $name $gap }
+    }
+    if ($keep -and ($text -split "`n" | Where-Object { $_ -match " t=\d+ " -and $_ -notmatch $keep })) {
+        Fail $name "a line lost the value '$keep'"
+    }
+}
+
 $columnsHeapA = @'
 import "std/layout"
 
 @soa struct Ship {
+    x: int32
+    fuel: float64
+    id: int64
+}
+
+fn main() -> int32 {
+    var fleet: Ship[] = new Ship[4];
+    for i in 0..4 {
+        fleet[i].id = i * 10 + 7;
+        fleet[i].fuel = 1.5;
+    }
+    var t: int64 = 0;
+    while (t < 2000) {
+        quiesce;
+        fleet[1].x = fleet[1].x + 1;
+        println("old t={t} x={fleet[1].x} id={fleet[3].id} fuel={(int64)(fleet[2].fuel * 2.0)}");
+        t = t + 1;
+        thread_sleep_ms((uint32)15);
+    }
+    return 0;
+}
+'@
+$columnsHeapB = $columnsHeapA.Replace('fuel: float64', "extra: int32`n    fuel: float64").Replace('println("old t=', 'println("new t=')
+Test-HeapLayout "columns_heap" $columnsHeapA $columnsHeapB "1" @("x") "id=37 fuel=3"
+
+$structsToColumnsA = @'
+import "std/layout"
+
+struct Ship {
+    x: int32
+    fuel: float64
+    id: int64
+    name: string
+}
+
+fn main() -> int32 {
+    var fleet: Ship[] = new Ship[5];
+    var big: Ship[] = new Ship[4000];
+    for i in 0..5 {
+        fleet[i].id = i * 10 + 7;
+        fleet[i].fuel = 1.5;
+        fleet[i].name = "ship";
+    }
+    big[3999].id = 77;
+    var t: int64 = 0;
+    while (t < 2000) {
+        quiesce;
+        fleet[1].x = fleet[1].x + 1;
+        big[3999].x = big[3999].x + 1;
+        println("old t={t} x={fleet[1].x} y={big[3999].x} id={fleet[4].id} big={big[3999].id} name={fleet[2].name}");
+        t = t + 1;
+        thread_sleep_ms((uint32)15);
+    }
+    return 0;
+}
+'@
+$structsToColumnsB = $structsToColumnsA.Replace('struct Ship {', '@soa struct Ship {').Replace('println("old t=', 'println("new t=')
+Test-HeapLayout "structs_to_columns" $structsToColumnsA $structsToColumnsB "2" @("x", "y") "id=47 big=77 name=ship"
+
+$columnsToStructsB = $structsToColumnsA.Replace('println("old t=', 'println("new t=')
+$columnsToStructsA = $structsToColumnsA.Replace('struct Ship {', '@soa struct Ship {')
+Test-HeapLayout "columns_to_structs" $columnsToStructsA $columnsToStructsB "2" @("x", "y") "id=47 big=77 name=ship"
+
+$soaToHotColdA = @'
+import "std/layout"
+
+@soa struct Ship {
+    x: int32
+    fuel: float64
+    id: int64
+}
+
+fn main() -> int32 {
+    var fleet: Ship[] = new Ship[6];
+    for i in 0..6 {
+        fleet[i].id = i + 100;
+    }
+    var t: int64 = 0;
+    while (t < 2000) {
+        quiesce;
+        fleet[5].x = fleet[5].x + 1;
+        println("old t={t} x={fleet[5].x} id={fleet[5].id}");
+        t = t + 1;
+        thread_sleep_ms((uint32)15);
+    }
+    return 0;
+}
+'@
+$soaToHotColdB = $soaToHotColdA.Replace('@soa struct', '@hot_cold(x, id) struct').Replace('println("old t=', 'println("new t=')
+Test-HeapLayout "soa_to_hot_cold" $soaToHotColdA $soaToHotColdB "1" @("x") "id=105"
+
+$linkedA = @'
+import "std/layout"
+
+struct Node {
+    key: int64
+    next: Node*
+    note: float64
+}
+
+fn push(head: Node*, key: int64) -> Node* {
+    var n: Node* = new Node;
+    n.key = key;
+    n.next = head;
+    n.note = 0.5;
+    return n;
+}
+
+fn total(head: Node*) -> int64 {
+    var sum: int64 = 0;
+    var walk: Node* = head;
+    while (walk != 0) {
+        sum = sum + walk.key;
+        walk = walk.next;
+    }
+    return sum;
+}
+
+fn main() -> int32 {
+    var pool: Node[] = new Node[4];
+    var head: Node* = 0;
+    head = push(head, 1);
+    head = push(head, 2);
+    pool[0].key = 100;
+    pool[1].key = 200;
+    pool[1].next = &pool[0];
+    pool[2].key = 300;
+    pool[2].next = &pool[1];
+    pool[0].next = head;
+    var t: int64 = 0;
+    var entry: Node* = &pool[2];
+    while (t < 2000) {
+        quiesce;
+        entry.note = entry.note + 1.0;
+        println("old t={t} x={(int64)entry.note} sum={total(entry)}");
+        t = t + 1;
+        thread_sleep_ms((uint32)15);
+    }
+    return 0;
+}
+'@
+$linkedB = $linkedA.Replace('struct Node {', '@hot_cold(key, next) struct Node {').Replace('println("old t=', 'println("new t=')
+Test-HeapLayout "nodes_to_references" $linkedA $linkedB "3" @("x") "sum=603"
+Test-HeapLayout "references_to_nodes" $linkedB.Replace('println("new t=', 'println("old t=') $linkedA.Replace('println("old t=', 'println("new t=') "3" @("x") "sum=603"
+
+$ownAllocatorA = @'
+import "std/layout"
+
+fn take(bytes: int64, align: int64) -> rawptr {
+    return malloc(bytes);
+}
+
+fn give(p: rawptr) {
+    free(p);
+}
+
+@soa @allocate_with(take, give) struct Ship {
     x: int32
     fuel: float64
 }
@@ -245,13 +436,13 @@ fn main() -> int32 {
     return 0;
 }
 '@
-$columnsHeapB = $columnsHeapA.Replace('fuel: float64', "fuel: float64`n    extra: int32")
+$ownAllocatorB = $ownAllocatorA.Replace('fuel: float64', "fuel: float64`n    extra: int32")
 
-$name = "columns_heap"
+$name = "columns_own_allocator"
 Clear-Program $name
 $source = Join-Path $scratch "$name.mettle"
 $exe = Join-Path $scratch "$name$suffix"
-Write-Source $source $columnsHeapA
+Write-Source $source $ownAllocatorA
 $built = Invoke-Mettle @("--build", "--live", $source, "-o", $exe)
 if ($built.Code -ne 0) {
     Fail $name "build failed: $($built.Text)"
@@ -259,9 +450,9 @@ if ($built.Code -ne 0) {
     $process = Start-Live $exe $name
     $out = Join-Path $scratch "$name.out"
     if (-not (Wait-For $out "old t=3")) { Fail $name "the program did not start" }
-    Write-Source $source $columnsHeapB
+    Write-Source $source $ownAllocatorB
     $patch = Invoke-Mettle @("--live-patch", $exe, $source)
-    if ($patch.Code -eq 0 -or $patch.Text -notmatch "separate regions") { Fail $name "the patch was not refused: $($patch.Text)" }
+    if ($patch.Code -eq 0 -or $patch.Text -notmatch "its own allocator") { Fail $name "the patch was not refused: $($patch.Text)" }
     Stop-Live $process
 }
 
@@ -508,5 +699,6 @@ if ($built.Code -ne 0) {
 }
 
 foreach ($line in $failures) { "FAIL $line" }
-"live features: $(5 - @($failures | ForEach-Object { ($_ -split ':')[0] } | Sort-Object -Unique).Count) of 5 scenarios passed"
+$scenarios = @(Select-String -Path $PSCommandPath -Pattern '^(\$name = "|Test-HeapLayout ")').Count
+"live features: $($scenarios - @($failures | ForEach-Object { ($_ -split ':')[0] } | Sort-Object -Unique).Count) of $scenarios scenarios passed"
 exit $failures.Count

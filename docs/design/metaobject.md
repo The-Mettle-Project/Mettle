@@ -118,6 +118,32 @@ What a layout means for the rest of the language:
 - The live descriptor prints the regions and places, so conversion between two
   layouts works through the same field names as every other struct.
 
+A heap array keeps its element count in its arena header, or in the object table
+when it is too large for the arena, and its descriptor lists the regions:
+`C<lone>,<align>,<regions>,<stride>,<align>...{name:<lone offset>:G<region>,<offset>[<value>];}`.
+With the count the runtime works out each field's base and stride in both layouts
+and copies field by field through a scratch copy, so the block keeps its address
+and every slice keeps its meaning. A patch stops before it starts if any block
+lacks room for the new layout.
+
+```mermaid
+flowchart LR
+  patch[patch names old and new text] --> fit{every block fits?}
+  fit -- no --> refuse[refused, nothing changed]
+  fit -- yes --> kinds[note old and new element size per kind]
+  kinds --> blocks[convert each block in place]
+  blocks --> pointers["p8 to r24: base, (p - base) / old size, count"]
+  blocks --> back["r24 to p8: base + index * new size"]
+```
+
+A thin pointer and a reference convert into each other because the runtime finds
+the block that holds the address and reads its count. The kind table records both
+element sizes for the length of a patch, so the order blocks convert in does not
+matter, and a node that points at another node of its own type works. An address
+outside any block becomes a reference to one lone value. A pointer into the middle
+of a global array is the one case this gets wrong, and it dangled before columns
+for the same reason: globals move.
+
 A loop through references costs what a loop over columns costs. The reference is
 a local struct, so SROA splits it into words, the words forward to the loads they
 came from, and the column base hoists out of the loop with the index split off.

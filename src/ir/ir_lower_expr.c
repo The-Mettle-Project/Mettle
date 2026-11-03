@@ -3574,8 +3574,7 @@ static int ir_lower_new_expression(IRLoweringContext *context,
     }
 
     if (type_is_columnar(element)) {
-      if (!ir_lower_live_note_columns(element) ||
-          !ir_emit_column_bytes(context, function, element, &count,
+      if (!ir_emit_column_bytes(context, function, element, &count,
                                 expression->location, &bytes)) {
         ir_operand_destroy(&count);
         ir_operand_destroy(&pointer);
@@ -3602,7 +3601,8 @@ static int ir_lower_new_expression(IRLoweringContext *context,
     }
 
     if (element->meta_layout && element->meta_layout->allocator) {
-      if (!ir_emit_layout_allocation(context, function, element, &bytes,
+      if (!ir_lower_live_note_own_allocator(element) ||
+          !ir_emit_layout_allocation(context, function, element, &bytes,
                                      &pointer, expression->location)) {
         ir_operand_destroy(&count);
         ir_operand_destroy(&bytes);
@@ -3729,7 +3729,8 @@ static int ir_lower_new_expression(IRLoweringContext *context,
   if (allocated_type && allocated_type->meta_layout &&
       allocated_type->meta_layout->allocator) {
     IROperand bytes = ir_operand_int(allocation_size);
-    if (!ir_emit_layout_allocation(context, function, allocated_type, &bytes,
+    if (!ir_lower_live_note_own_allocator(allocated_type) ||
+        !ir_emit_layout_allocation(context, function, allocated_type, &bytes,
                                    &destination, expression->location)) {
       ir_operand_destroy(&destination);
       return 0;

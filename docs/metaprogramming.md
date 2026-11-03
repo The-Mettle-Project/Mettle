@@ -117,9 +117,10 @@ memory by the default rules. That stops with `L0004`. Copy into a default struct
 at the border.
 
 A running program converts to and from custom layouts. Adding `@soa` to a global
-array in a live patch moves its elements into columns and back on undo. A patch
-that changes the layout of a heap array in columns is refused, because the
-running program does not hold those arrays' element counts.
+or a heap array in a live patch moves its elements into columns in place, and
+undo moves them back. Thin pointers to that type become references and return to
+thin pointers on undo. A type that names its own allocator is refused, because
+the running program does not know where its values are.
 
 ## Generators
 

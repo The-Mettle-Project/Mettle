@@ -530,22 +530,19 @@ fn mettle_live_arena_walk(name: int64, name_length: int64, layout: int64, layout
                 if (cells[0] != 0) {
                     var kind: int64* = (int64*)cells[0];
                     if (mettle_live_same_text(kind[0], kind[1], name, name_length) != 0 && mettle_live_same_text(kind[2], kind[3], layout, layout_length) == 0) {
-                        if (size * cells[1] > bytes - 16) {
+                        var needed: int64 = mettle_live_heap_bytes((uint8*)layout, layout_length, cells[1]);
+                        if (needed > bytes - 16) {
                             if (convert == 0) {
                                 return 0;
                             }
                         } else if (convert != 0) {
                             var target: int64 = mettle_live_kind(kind[0], kind[1], layout, layout_length, size);
-                            var old_size: int64 = mettle_live_desc_size((uint8*)kind[2], kind[3], 0);
-                            var scratch: int64 = mettle_live_convert_room_for(old_size * cells[1]);
+                            var old_bytes: int64 = mettle_live_heap_bytes((uint8*)kind[2], kind[3], cells[1]);
+                            var scratch: int64 = mettle_live_convert_room_for(old_bytes);
                             if (target != 0 && scratch != 0) {
-                                mettle_live_copy(scratch, block + 16, old_size * cells[1]);
-                                mettle_live_frame_zero(block + 16, size * cells[1]);
-                                var k: int64 = 0;
-                                while (k < cells[1]) {
-                                    mettle_live_convert(block + 16 + k * size, (uint8*)layout, layout_length, 0, scratch + k * old_size, (uint8*)kind[2], kind[3], 0);
-                                    k = k + 1;
-                                }
+                                mettle_live_copy(scratch, block + 16, old_bytes);
+                                mettle_live_frame_zero(block + 16, needed);
+                                mettle_live_convert_heap(block + 16, (uint8*)layout, layout_length, scratch, (uint8*)kind[2], kind[3], cells[1]);
                                 cells[0] = target;
                                 converted = converted + 1;
                             }
@@ -629,12 +626,11 @@ fn mettle_live_objects_fit(name: int64, name_length: int64, layout: int64, layou
     if (mettle_live_arena_walk(name, name_length, layout, layout_length, 0) == 0) {
         return 0;
     }
-    var size: int64 = mettle_live_desc_size((uint8*)layout, layout_length, 0);
     var i: int64 = 0;
     while (i < mettle_live_object_slots) {
         var cells: int64* = (int64*)(mettle_live_objects + i * 64);
         if (cells[0] > 0 && mettle_live_same_text(cells[4], cells[5], name, name_length) != 0 && mettle_live_same_text(cells[6], cells[7], layout, layout_length) == 0) {
-            if (size * cells[2] > cells[3]) {
+            if (mettle_live_heap_bytes((uint8*)layout, layout_length, cells[2]) > cells[3]) {
                 return 0;
             }
         }
@@ -649,17 +645,13 @@ fn mettle_live_objects_convert(name: int64, name_length: int64, layout: int64, l
     var i: int64 = 0;
     while (i < mettle_live_object_slots) {
         var cells: int64* = (int64*)(mettle_live_objects + i * 64);
-        if (cells[0] > 0 && mettle_live_same_text(cells[4], cells[5], name, name_length) != 0 && mettle_live_same_text(cells[6], cells[7], layout, layout_length) == 0 && size * cells[2] <= cells[3]) {
-            var old_size: int64 = mettle_live_desc_size((uint8*)cells[6], cells[7], 0);
-            var scratch: int64 = mettle_live_convert_room_for(old_size * cells[2]);
+        if (cells[0] > 0 && mettle_live_same_text(cells[4], cells[5], name, name_length) != 0 && mettle_live_same_text(cells[6], cells[7], layout, layout_length) == 0 && mettle_live_heap_bytes((uint8*)layout, layout_length, cells[2]) <= cells[3]) {
+            var old_bytes: int64 = mettle_live_heap_bytes((uint8*)cells[6], cells[7], cells[2]);
+            var scratch: int64 = mettle_live_convert_room_for(old_bytes);
             if (scratch != 0) {
-                mettle_live_copy(scratch, cells[0], old_size * cells[2]);
-                mettle_live_frame_zero(cells[0], size * cells[2]);
-                var k: int64 = 0;
-                while (k < cells[2]) {
-                    mettle_live_convert(cells[0] + k * size, (uint8*)layout, layout_length, 0, scratch + k * old_size, (uint8*)cells[6], cells[7], 0);
-                    k = k + 1;
-                }
+                mettle_live_copy(scratch, cells[0], old_bytes);
+                mettle_live_frame_zero(cells[0], mettle_live_heap_bytes((uint8*)layout, layout_length, cells[2]));
+                mettle_live_convert_heap(cells[0], (uint8*)layout, layout_length, scratch, (uint8*)cells[6], cells[7], cells[2]);
                 cells[1] = size;
                 cells[6] = layout;
                 cells[7] = layout_length;
@@ -669,6 +661,114 @@ fn mettle_live_objects_convert(name: int64, name_length: int64, layout: int64, l
         i = i + 1;
     }
     return converted;
+}
+
+fn mettle_live_kinds_reset() {
+    var i: int64 = 0;
+    while (i < mettle_live_kind_count) {
+        var known: int64* = (int64*)&mettle_live_kinds[i * 8];
+        known[5] = 0;
+        known[6] = 0;
+        i = i + 1;
+    }
+}
+
+fn mettle_live_kinds_prepare(name: int64, name_length: int64, layout: int64, layout_length: int64) {
+    var size: int64 = mettle_live_desc_size((uint8*)layout, layout_length, 0);
+    var i: int64 = 0;
+    while (i < mettle_live_object_slots) {
+        var cells: int64* = (int64*)(mettle_live_objects + i * 64);
+        if (cells[0] > 0 && mettle_live_same_text(cells[4], cells[5], name, name_length) != 0) {
+            mettle_live_kind(cells[4], cells[5], cells[6], cells[7], cells[1]);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < mettle_live_kind_count) {
+        var known: int64* = (int64*)&mettle_live_kinds[i * 8];
+        if (mettle_live_same_text(known[0], known[1], name, name_length) != 0 && mettle_live_same_text(known[2], known[3], layout, layout_length) == 0) {
+            var target: int64 = mettle_live_kind(known[0], known[1], layout, layout_length, size);
+            if (target != 0) {
+                var fresh: int64* = (int64*)target;
+                fresh[5] = known[4];
+                known[6] = size;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn mettle_live_holder_of(pointer: int64, base: int64*, count: int64*) -> int64 {
+    if (mettle_live_in_arena(pointer) != 0) {
+        var page: int64 = (pointer - mettle_live_arena_base) / METTLE_LIVE_ARENA_PAGE;
+        var bucket: int64 = (int64)mettle_live_page_class[page] - 1;
+        if (bucket < 0) {
+            return 0;
+        }
+        var bytes: int64 = mettle_live_class_bytes(bucket);
+        var start: int64 = mettle_live_arena_base + page * METTLE_LIVE_ARENA_PAGE;
+        var block: int64 = start + ((pointer - start) / bytes) * bytes;
+        var cells: int64* = (int64*)block;
+        *base = block + 16;
+        *count = cells[1];
+        return cells[0];
+    }
+    var i: int64 = 0;
+    while (i < mettle_live_object_slots) {
+        var entry: int64* = (int64*)(mettle_live_objects + i * 64);
+        if (entry[0] > 0 && pointer >= entry[0] && pointer < entry[0] + entry[3]) {
+            *base = entry[0];
+            *count = entry[2];
+            return mettle_live_kind(entry[4], entry[5], entry[6], entry[7], entry[1]);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn mettle_live_ref_from_pointer(target: int64, pointer: int64) {
+    var words: int64* = (int64*)target;
+    words[0] = 0;
+    words[1] = 0;
+    words[2] = 0;
+    if (pointer == 0) {
+        return;
+    }
+    var base: int64 = 0;
+    var count: int64 = 0;
+    var holder: int64 = mettle_live_holder_of(pointer, &base, &count);
+    if (holder == 0) {
+        words[0] = pointer;
+        words[2] = 1;
+        return;
+    }
+    var kind: int64* = (int64*)holder;
+    var element: int64 = kind[5];
+    if (element == 0) {
+        element = kind[4];
+    }
+    words[0] = base;
+    words[1] = (pointer - base) / element;
+    words[2] = count;
+}
+
+fn mettle_live_pointer_from_ref(source: int64) -> int64 {
+    var words: int64* = (int64*)source;
+    if (words[0] == 0) {
+        return 0;
+    }
+    var base: int64 = 0;
+    var count: int64 = 0;
+    var holder: int64 = mettle_live_holder_of(words[0], &base, &count);
+    if (holder == 0) {
+        return words[0];
+    }
+    var kind: int64* = (int64*)holder;
+    var element: int64 = kind[4];
+    if (kind[5] == 0 && kind[6] != 0) {
+        element = kind[6];
+    }
+    return words[0] + words[1] * element;
 }
 
 fn mettle_live_undo(index: int64, target: int64) -> int64 {
@@ -693,6 +793,15 @@ fn mettle_live_undo(index: int64, target: int64) -> int64 {
         mettle_live_port_lock(&mettle_live_object_lock);
     }
     mettle_live_port_suspend_others();
+    mettle_live_kinds_reset();
+    m = mettle_live_undo_move_counts[slot] - 1;
+    while (moves != 0 && m >= 0) {
+        var prepare: int64* = (int64*)(moves + m * 64);
+        if (prepare[0] == 1) {
+            mettle_live_kinds_prepare(prepare[1], prepare[2], prepare[3], prepare[4]);
+        }
+        m = m - 1;
+    }
     m = mettle_live_undo_move_counts[slot] - 1;
     while (moves != 0 && m >= 0) {
         var back: int64* = (int64*)(moves + m * 64);
@@ -864,6 +973,15 @@ fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
             mettle_live_port_unlock(&mettle_live_object_lock);
             mettle_live_refuse(index, "an object on the heap has no room for its new layout; restart to take this change");
             return 0;
+        }
+        m = m + 1;
+    }
+    mettle_live_kinds_reset();
+    m = 0;
+    while (m < migrations) {
+        var ready: int64 = migration_at + m * 32;
+        if (mettle_live_u32(ready + 28) == 1) {
+            mettle_live_kinds_prepare(code + mettle_live_u32(ready), mettle_live_u32(ready + 4), code + mettle_live_u32(ready + 20), mettle_live_u32(ready + 24));
         }
         m = m + 1;
     }
@@ -1447,7 +1565,7 @@ fn mettle_live_desc_skip(text: uint8*, length: int64, at: int64) -> int64 {
         cursor = mettle_live_desc_skip(text, length, cursor + 1);
         return cursor + 1;
     }
-    if (kind == 82) {
+    if (kind == 82 || kind == 71) {
         mettle_live_desc_read(text, length, &cursor);
         cursor = cursor + 1;
         mettle_live_desc_read(text, length, &cursor);
@@ -1551,10 +1669,109 @@ fn mettle_live_desc_strided(text: uint8*, length: int64, at: int64, count: int64
     return cursor + 1;
 }
 
-fn mettle_live_desc_field(text: uint8*, length: int64, at: int64, name: uint8*, name_start: int64, name_end: int64, offset: int64*) -> int64 {
+fn mettle_live_desc_open(text: uint8*, length: int64, at: int64) -> int64 {
     var cursor: int64 = at + 1;
-    mettle_live_desc_read(text, length, &cursor);
+    while (cursor < length && text[cursor] != (uint8)123) {
+        cursor = cursor + 1;
+    }
+    return cursor + 1;
+}
+
+fn mettle_live_columns_part(text: uint8*, length: int64, part: int64) -> int64 {
+    var cursor: int64 = 1;
+    var value: int64 = mettle_live_desc_read(text, length, &cursor);
+    var k: int64 = 0;
+    while (k < part) {
+        cursor = cursor + 1;
+        value = mettle_live_desc_read(text, length, &cursor);
+        k = k + 1;
+    }
+    return value;
+}
+
+fn mettle_live_region_base(text: uint8*, length: int64, region: int64, count: int64) -> int64 {
+    var regions: int64 = mettle_live_columns_part(text, length, 2);
+    var base: int64 = 0;
+    var r: int64 = 0;
+    while (r < region && r < regions) {
+        base = base + mettle_live_columns_part(text, length, 3 + r * 2) * count;
+        if (r + 1 < regions) {
+            var align: int64 = mettle_live_columns_part(text, length, 4 + (r + 1) * 2);
+            base = ((base + align - 1) / align) * align;
+        }
+        r = r + 1;
+    }
+    return base;
+}
+
+fn mettle_live_heap_bytes(text: uint8*, length: int64, count: int64) -> int64 {
+    if (text[0] != (uint8)67) {
+        return mettle_live_desc_size(text, length, 0) * count;
+    }
+    var last: int64 = mettle_live_columns_part(text, length, 2) - 1;
+    var bytes: int64 = mettle_live_region_base(text, length, last, count) + mettle_live_columns_part(text, length, 3 + last * 2) * count;
+    var align: int64 = mettle_live_columns_part(text, length, 1);
+    return ((bytes + align - 1) / align) * align;
+}
+
+fn mettle_live_heap_place(text: uint8*, length: int64, field: int64, offset: int64, count: int64, base: int64*, stride: int64*) -> int64 {
+    if (text[0] != (uint8)67) {
+        *base = offset;
+        *stride = mettle_live_desc_size(text, length, 0);
+        return field;
+    }
+    var cursor: int64 = field + 1;
+    var region: int64 = mettle_live_desc_read(text, length, &cursor);
     cursor = cursor + 1;
+    var inner: int64 = mettle_live_desc_read(text, length, &cursor);
+    *base = mettle_live_region_base(text, length, region, count) + inner;
+    *stride = mettle_live_columns_part(text, length, 3 + region * 2);
+    return cursor + 1;
+}
+
+fn mettle_live_convert_heap(target: int64, to: uint8*, to_length: int64, source: int64, from: uint8*, from_length: int64, count: int64) {
+    if (to[0] != (uint8)67 && from[0] != (uint8)67) {
+        var to_size: int64 = mettle_live_desc_size(to, to_length, 0);
+        var from_size: int64 = mettle_live_desc_size(from, from_length, 0);
+        var e: int64 = 0;
+        while (e < count) {
+            mettle_live_convert(target + e * to_size, to, to_length, 0, source + e * from_size, from, from_length, 0);
+            e = e + 1;
+        }
+        return;
+    }
+    var cursor: int64 = mettle_live_desc_open(to, to_length, 0);
+    while (cursor < to_length && to[cursor] != (uint8)125) {
+        var name_start: int64 = cursor;
+        while (to[cursor] != (uint8)58) {
+            cursor = cursor + 1;
+        }
+        var name_end: int64 = cursor;
+        cursor = cursor + 1;
+        var offset: int64 = mettle_live_desc_read(to, to_length, &cursor);
+        cursor = cursor + 1;
+        var field: int64 = cursor;
+        cursor = mettle_live_desc_skip(to, to_length, cursor) + 1;
+        var old_offset: int64 = 0;
+        var old_field: int64 = mettle_live_desc_field(from, from_length, 0, to, name_start, name_end, &old_offset);
+        if (old_field >= 0) {
+            var to_base: int64 = 0;
+            var to_stride: int64 = 0;
+            var from_base: int64 = 0;
+            var from_stride: int64 = 0;
+            var to_value: int64 = mettle_live_heap_place(to, to_length, field, offset, count, &to_base, &to_stride);
+            var from_value: int64 = mettle_live_heap_place(from, from_length, old_field, old_offset, count, &from_base, &from_stride);
+            var k: int64 = 0;
+            while (k < count) {
+                mettle_live_convert(target + to_base + k * to_stride, to, to_length, to_value, source + from_base + k * from_stride, from, from_length, from_value);
+                k = k + 1;
+            }
+        }
+    }
+}
+
+fn mettle_live_desc_field(text: uint8*, length: int64, at: int64, name: uint8*, name_start: int64, name_end: int64, offset: int64*) -> int64 {
+    var cursor: int64 = mettle_live_desc_open(text, length, at);
     while (cursor < length && text[cursor] != (uint8)125) {
         var start: int64 = cursor;
         while (text[cursor] != (uint8)58) {
@@ -1761,6 +1978,16 @@ fn mettle_live_convert(target: int64, to: uint8*, to_length: int64, to_at: int64
                 }
             }
         }
+        return;
+    }
+    if (to_kind == 114 && from_kind == 112) {
+        var thin: int64* = (int64*)source;
+        mettle_live_ref_from_pointer(target, *thin);
+        return;
+    }
+    if (to_kind == 112 && from_kind == 114) {
+        var slot: int64* = (int64*)target;
+        *slot = mettle_live_pointer_from_ref(source);
         return;
     }
     var to_scalar: int64 = 0;

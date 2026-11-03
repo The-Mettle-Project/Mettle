@@ -381,6 +381,11 @@ static void ir_live_describe(IRLiveText *out, const MtlcType *type,
                               depth);
       return;
     }
+    if (type->field_count == 3 && type->field_names && type->field_names[0] &&
+        strcmp(type->field_names[0], "__base") == 0) {
+      ir_live_text_add(out, "r24");
+      return;
+    }
     if (type->field_count && type->field_names && type->field_types &&
         type->field_offsets) {
       ir_live_text_add(out, "S");
@@ -1309,25 +1314,63 @@ static int ir_live_remember_type(const char *name, const char *layout) {
 
 int ir_lower_live_heap_type(const Type *type) {
   return g_ir_lowering_live && type && type->kind == TYPE_STRUCT &&
-         type->name && type->size > 0 && !type_is_columnar(type);
+         type->name && type->size > 0;
 }
 
-int ir_lower_live_note_columns(const Type *type) {
+int ir_lower_live_note_own_allocator(const Type *type) {
   char *layout;
   int ok;
-  if (!g_ir_lowering_live || !type_is_columnar(type) || !type->name) {
+  if (!g_ir_lowering_live || !type || !type->name) {
     return 1;
   }
   layout = ir_lower_live_descriptor(mtlc_type_from_frontend(type));
   if (!layout) {
     return 0;
   }
-  layout[0] = 'C';
+  layout[0] = 'N';
   ok = ir_live_remember_type(type->name, layout);
-  if (!ok) {
-    free(layout);
-  }
+  free(layout);
   return ok;
+}
+
+static char *ir_live_heap_descriptor(const Type *type) {
+  IRLiveText out = {0};
+  const TypeMetaLayout *layout = type->meta_layout;
+  if (!type_is_columnar(type)) {
+    return ir_lower_live_descriptor(mtlc_type_from_frontend(type));
+  }
+  ir_live_text_add(&out, "C");
+  ir_live_text_number(&out, type->size);
+  ir_live_text_add(&out, ",");
+  ir_live_text_number(&out, type->alignment);
+  ir_live_text_add(&out, ",");
+  ir_live_text_number(&out, layout->region_count);
+  for (size_t r = 0; r < layout->region_count; r++) {
+    ir_live_text_add(&out, ",");
+    ir_live_text_number(&out, layout->regions[r].stride);
+    ir_live_text_add(&out, ",");
+    ir_live_text_number(&out, layout->regions[r].alignment);
+  }
+  ir_live_text_add(&out, "{");
+  for (size_t i = 0; i < type->field_count; i++) {
+    const TypeMetaPlace *place = type_field_place(type, i);
+    ir_live_text_add(&out, type->field_names[i] ? type->field_names[i] : "_");
+    ir_live_text_add(&out, ":");
+    ir_live_text_number(&out, type->field_offsets[i]);
+    ir_live_text_add(&out, ":G");
+    ir_live_text_number(&out, place->region);
+    ir_live_text_add(&out, ",");
+    ir_live_text_number(&out, place->offset);
+    ir_live_text_add(&out, "[");
+    ir_live_describe_field_value(&out, type, i, 0u);
+    ir_live_text_add(&out, "];");
+  }
+  ir_live_text_add(&out, "}");
+  if (out.failed) {
+    free(out.text);
+    return NULL;
+  }
+  return out.text;
 }
 
 int ir_lower_live_new(IRLoweringContext *context, IRFunction *function,
@@ -1335,7 +1378,7 @@ int ir_lower_live_new(IRLoweringContext *context, IRFunction *function,
                       const Type *type, const IROperand *count,
                       SourceLocation location) {
   IROperand arguments[5];
-  char *layout = ir_lower_live_descriptor(mtlc_type_from_frontend(type));
+  char *layout = ir_live_heap_descriptor(type);
   int ok;
   if (!layout || !ir_live_remember_type(type->name, layout)) {
     free(layout);
