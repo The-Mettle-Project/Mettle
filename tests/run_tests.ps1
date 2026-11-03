@@ -1795,6 +1795,8 @@ $cases = @(
   @{ Name = "gpu_view_param"; Path = "tests/test_gpu_view_param.mettle"; ShouldSucceed = $true; Args = @("--emit-ptx") },
   @{ Name = "gpu_narrowing_cast_kept_O"; Path = "tests/test_gpu_narrowing_cast_kept.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },
   @{ Name = "gpu_narrowing_cast_kept_release"; Path = "tests/test_gpu_narrowing_cast_kept.mettle"; ShouldSucceed = $true; Args = @("--release", "--emit-ptx") },
+  @{ Name = "gpu_uint32_high_constant_O"; Path = "tests/test_gpu_uint32_high_constant.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },
+  @{ Name = "gpu_uint32_high_constant_release"; Path = "tests/test_gpu_uint32_high_constant.mettle"; ShouldSucceed = $true; Args = @("--release", "--emit-ptx") },
   # float16 and bfloat16 storage: two-byte floats whose arithmetic is
   # float32. The 65536-pattern sweep asserts exact bits on the round trip for
   # both types, NaN quieting included, natively under both backends and both

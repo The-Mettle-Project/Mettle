@@ -11145,6 +11145,13 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
   ptx_emit_release(&e);
 }
 
+static int ptx_u32_immediate_beside_u32(const IROperand *imm,
+                                        const PtxVal *other) {
+  return imm->kind == IR_OPERAND_INT && imm->int_value >= 0 &&
+         imm->int_value <= 0xFFFFFFFFLL && other->cls == PC_B32 &&
+         other->is_unsigned;
+}
+
 static void emit_binary(PtxFn *fn, const IRInstruction *in) {
   const char *t = in->text ? in->text : "+";
   PtxVal la = operand_desc(fn, &in->lhs);
@@ -11200,7 +11207,10 @@ static void emit_binary(PtxFn *fn, const IRInstruction *in) {
     dv.address_space =
         la.is_ptr ? la.address_space : ra.address_space;
   } else {
-    dv.cls = (la.cls == PC_B64 || ra.cls == PC_B64) ? PC_B64 : PC_B32;
+    PtxClass lc = la.cls, rc = ra.cls;
+    if (ptx_u32_immediate_beside_u32(&in->rhs, &la)) rc = PC_B32;
+    if (ptx_u32_immediate_beside_u32(&in->lhs, &ra)) lc = PC_B32;
+    dv.cls = (lc == PC_B64 || rc == PC_B64) ? PC_B64 : PC_B32;
     dv.is_unsigned = la.is_unsigned || ra.is_unsigned;
   }
 

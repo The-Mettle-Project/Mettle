@@ -1,0 +1,18 @@
+kernel(block = 32) high_constant(x: uint32*, out: uint32*) {
+  var m: uint32 = x[thread.x] ^ (uint32)0x80000000;
+  out[thread.x] = m;
+}
+
+kernel(block = 32) ok(x: uint32*, out: uint32*) {
+  var k: uint32 = (uint32)0x80000000;
+  var m: uint32 = x[thread.x] ^ k;
+  out[thread.x] = m;
+}
+
+kernel(block = 32) high_ones(x: uint32*, out: uint32*) {
+  out[thread.x] = x[thread.x] & (uint32)0xFFFFFFFE;
+}
+
+kernel(block = 32) high_sum(x: uint32*, out: uint32*) {
+  out[thread.x] = (uint32)0x90000000 + x[thread.x];
+}
