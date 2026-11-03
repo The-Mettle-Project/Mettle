@@ -95,17 +95,21 @@ SourceSpan source_span_from_location(SourceLocation location, size_t length) {
   return span;
 }
 
+static void error_reporter_free_report(ErrorReport *report) {
+  free(report->filename);
+  free(report->message);
+  free(report->suggestion);
+  free(report->code_snippet);
+  free(report->span_label);
+  free(report->code_override);
+}
+
 void error_reporter_destroy(ErrorReporter *reporter) {
   if (!reporter)
     return;
 
   for (size_t i = 0; i < reporter->count; i++) {
-    free(reporter->errors[i].filename);
-    free(reporter->errors[i].message);
-    free(reporter->errors[i].suggestion);
-    free(reporter->errors[i].code_snippet);
-    free(reporter->errors[i].span_label);
-    free(reporter->errors[i].code_override);
+    error_reporter_free_report(&reporter->errors[i]);
   }
 
   for (size_t i = 0; i < reporter->source_count; i++) {
@@ -286,6 +290,26 @@ static int error_reporter_is_cascade(ErrorReporter *reporter, ErrorSeverity seve
   return 0;
 }
 
+static void error_reporter_drop_non_errors(ErrorReporter *reporter) {
+  size_t kept = 0;
+  int dropping = 0;
+  for (size_t i = 0; i < reporter->count; i++) {
+    ErrorReport *report = &reporter->errors[i];
+    if (report->severity != DIAG_SEVERITY_NOTE_OF) {
+      dropping = report->severity != DIAG_SEVERITY_ERROR;
+    }
+    if (dropping) {
+      error_reporter_free_report(report);
+      continue;
+    }
+    if (kept != i) {
+      reporter->errors[kept] = *report;
+    }
+    kept++;
+  }
+  reporter->count = kept;
+}
+
 static void error_reporter_add_report(ErrorReporter *reporter,
                                       ErrorSeverity severity, SourceSpan span,
                                       ErrorType type, const char *message,
@@ -293,6 +317,10 @@ static void error_reporter_add_report(ErrorReporter *reporter,
   if (!reporter)
     return;
   reporter->last_add_suppressed = 1;
+  if (reporter->count >= reporter->max_errors &&
+      severity == DIAG_SEVERITY_ERROR) {
+    error_reporter_drop_non_errors(reporter);
+  }
   if (reporter->count >= reporter->max_errors)
     return;
 
