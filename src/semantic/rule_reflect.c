@@ -2136,6 +2136,75 @@ int rule_reflect_build_function(TypeChecker *checker, IRProgram *ir,
   return 1;
 }
 
+int rule_reflect_build_alloc(TypeChecker *checker, const MirAllocRequest *request,
+                             IRRuleImage *out, char **error_message) {
+  Image image;
+  const Type *graph_type = lookup_qualified(checker, "std/regalloc.AllocGraph");
+  const Type *vreg_type = lookup_qualified(checker, "std/regalloc.AllocVreg");
+  memset(&image, 0, sizeof(image));
+  memset(out, 0, sizeof(*out));
+  if (!graph_type || !vreg_type) {
+    *error_message = strdup("an allocator needs 'import \"std/regalloc\";'");
+    return 0;
+  }
+  size_t root = image_reserve(&image, graph_type->size, graph_type->alignment);
+  image_put_string(&image, root + field_offset(graph_type, "function", &image),
+                   request->function);
+  size_t array = image_reserve(&image, vreg_type->size * (request->count + 1),
+                               vreg_type->alignment);
+  for (size_t i = 0; i < request->count; i++) {
+    const MirAllocVreg *v = &request->vregs[i];
+    size_t base = array + i * vreg_type->size;
+    image_put_u64(&image, base + field_offset(vreg_type, "id", &image),
+                  (unsigned long long)v->id);
+    image_put_u64(&image, base + field_offset(vreg_type, "rclass", &image),
+                  (unsigned long long)v->rclass);
+    image_put_u64(&image, base + field_offset(vreg_type, "width", &image),
+                  (unsigned long long)v->width);
+    image_put_u64(&image, base + field_offset(vreg_type, "allowed", &image),
+                  (unsigned long long)v->allowed);
+    image_put_u64(&image, base + field_offset(vreg_type, "saved", &image),
+                  (unsigned long long)v->saved);
+    image_put_u64(&image, base + field_offset(vreg_type, "cost", &image),
+                  (unsigned long long)v->cost);
+    image_put_u64(&image, base + field_offset(vreg_type, "hint", &image),
+                  (unsigned long long)(long long)v->hint);
+    if (v->neighbor_count > 0) {
+      size_t edges = image_reserve(&image, 8 * v->neighbor_count, 8);
+      for (size_t e = 0; e < v->neighbor_count; e++) {
+        image_put_u64(&image, edges + e * 8,
+                      (unsigned long long)v->neighbors[e]);
+      }
+      put_slice(&image, base + field_offset(vreg_type, "neighbors", &image), edges,
+                v->neighbor_count);
+    }
+  }
+  put_slice(&image, root + field_offset(graph_type, "vregs", &image), array,
+            request->count);
+  size_t pool_base = image_reserve(&image, image.pool_size, 8);
+  if (!image.failed && image.pool_size > 0) {
+    memcpy(image.bytes + pool_base, image.pool, image.pool_size);
+  }
+  for (size_t i = 0; i < image.string_count && !image.failed; i++) {
+    image_put_pointer(&image, image.string_fields[i],
+                      pool_base + image.string_offsets[i]);
+  }
+  free(image.pool);
+  free(image.string_fields);
+  free(image.string_offsets);
+  if (image.failed) {
+    free(image.bytes);
+    free(image.pointers);
+    *error_message = strdup("could not lay out the graph for an allocator");
+    return 0;
+  }
+  out->bytes = image.bytes;
+  out->size = image.size;
+  out->pointer_offsets = image.pointers;
+  out->pointer_count = image.pointer_count;
+  return 1;
+}
+
 int rule_reflect_build_one_function(TypeChecker *layouts, TypeChecker *program,
                                     IRFunction *fn, IRRuleImage *out,
                                     char **error_message) {

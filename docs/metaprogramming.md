@@ -227,6 +227,25 @@ tests\err_pass_changes_behavior.mettle:16:11: error[L0007]: pass 'wrong_doubling
 
 `mettle expand` prints each changed function as Mettle under the pass's name.
 
+## Register allocation
+
+```mettle
+import "std/regalloc";
+
+@regalloc fn mine(g: AllocGraph) -> Assignment {
+  return chaitin_briggs(g);
+}
+```
+
+A `@regalloc` function colours every function in the program. It reads each
+vreg's allowed registers and neighbours and returns one register per vreg, or -1
+to spill. A register outside the mask, or two live values in one register, stops
+the build and names your function:
+
+```text
+error: '@one_register_for_all' wrote a wrong assignment: two entry-live values share a register at instruction 0 (v0, v1) in function 'add3'
+```
+
 ## Costs
 
 `--report-meta` prints what ran. `--meta-budget=N` stops the build when

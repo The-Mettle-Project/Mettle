@@ -1,0 +1,97 @@
+export struct AllocVreg {
+  id: int64;
+  rclass: int64;
+  width: int64;
+  allowed: int64;
+  saved: int64;
+  cost: int64;
+  hint: int64;
+  neighbors: int64[];
+}
+
+export struct AllocGraph {
+  function: string;
+  vregs: AllocVreg[];
+}
+
+export struct Assignment {
+  registers: int64[];
+}
+
+fn bit_count(mask: int64) -> int64 {
+  var left: int64 = mask;
+  var count: int64 = 0;
+  while (left != 0) {
+    left = left & (left - 1);
+    count = count + 1;
+  }
+  return count;
+}
+
+fn first_register(mask: int64) -> int64 {
+  var one: int64 = 1;
+  for r in 0..32 {
+    if ((mask & (one << r)) != 0) { return r; }
+  }
+  return -1;
+}
+
+fn pick_register(v: AllocVreg, free_mask: int64) -> int64 {
+  var one: int64 = 1;
+  if (v.hint >= 0 && (free_mask & (one << v.hint)) != 0) { return v.hint; }
+  var cheap: int64 = free_mask & ~v.saved;
+  if (cheap != 0) { return first_register(cheap); }
+  return first_register(free_mask);
+}
+
+export fn chaitin_briggs(g: AllocGraph) -> Assignment {
+  var n: int64 = g.vregs.length;
+  var out: Assignment;
+  out.registers = new int64[n];
+  var degree: int64[] = new int64[n];
+  var removed: bool[] = new bool[n];
+  var stack: int64[] = new int64[n];
+  for i in 0..n {
+    degree[i] = g.vregs[i].neighbors.length;
+    out.registers[i] = -1;
+  }
+  var depth: int64 = 0;
+  while (depth < n) {
+    var pick: int64 = -1;
+    var pick_cost: int64 = 0;
+    var pick_is_low: bool = false;
+    for i in 0..n {
+      if (removed[i]) { continue; }
+      var low: bool = degree[i] < bit_count(g.vregs[i].allowed);
+      var weight: int64 = (g.vregs[i].cost + 1) * 1024 / (degree[i] + 1);
+      if (pick < 0 || (low && !pick_is_low) ||
+          (low == pick_is_low && weight < pick_cost)) {
+        pick = i;
+        pick_cost = weight;
+        pick_is_low = low;
+      }
+    }
+    removed[pick] = true;
+    stack[depth] = pick;
+    depth = depth + 1;
+    for b in g.vregs[pick].neighbors {
+      if (!removed[b]) { degree[b] = degree[b] - 1; }
+    }
+  }
+  var one: int64 = 1;
+  var at: int64 = n - 1;
+  while (at >= 0) {
+    var v: int64 = stack[at];
+    var free_mask: int64 = g.vregs[v].allowed;
+    for b in g.vregs[v].neighbors {
+      if (out.registers[b] >= 0) {
+        free_mask = free_mask & ~(one << out.registers[b]);
+      }
+    }
+    if (free_mask != 0) {
+      out.registers[v] = pick_register(g.vregs[v], free_mask);
+    }
+    at = at - 1;
+  }
+  return out;
+}

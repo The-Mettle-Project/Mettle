@@ -2,6 +2,7 @@
 #include "codegen/binary/mir_machine.h"
 #include "codegen/binary/mir_cfg.h"
 #include "codegen/binary/mir_color.h"
+#include "codegen/binary/mir_external.h"
 #include "../../common.h"
 #include "internal.h"
 
@@ -2496,6 +2497,127 @@ static void mir_color_check_merged_graph(const MirColorState *st,
   mir_ra_facts_free(&fresh);
 }
 
+static MirExternalAllocator g_mir_external_allocator = NULL;
+static const char *g_mir_external_allocator_name = NULL;
+
+void mir_set_external_allocator(MirExternalAllocator allocator,
+                                const char *name) {
+  g_mir_external_allocator = allocator;
+  g_mir_external_allocator_name = name;
+}
+
+const char *mir_external_allocator_name(void) {
+  return g_mir_external_allocator ? g_mir_external_allocator_name : NULL;
+}
+
+static int mir_color_ask_external(MirColorState *st, int *next_spill) {
+  MirFunction *fn = st->fn;
+  size_t count = 0;
+  int *index = (int *)malloc((st->count + 1) * sizeof(int));
+  if (!index) {
+    return 0;
+  }
+  for (size_t v = 0; v < st->count; v++) {
+    index[v] = st->colorable[v] ? (int)count++ : -1;
+  }
+  MirAllocVreg *vregs = (MirAllocVreg *)calloc(count + 1, sizeof(MirAllocVreg));
+  int *registers = (int *)calloc(count + 1, sizeof(int));
+  size_t total_edges = 0;
+  for (size_t v = 0; v < st->count; v++) {
+    if (st->colorable[v]) {
+      MIR_INTER_FOR_EACH(st, v, b) {
+        if (st->colorable[b]) {
+          total_edges++;
+        }
+      }
+    }
+  }
+  int *edges = (int *)malloc((total_edges + 1) * sizeof(int));
+  if (!vregs || !registers || !edges) {
+    free(index);
+    free(vregs);
+    free(registers);
+    free(edges);
+    return 0;
+  }
+  size_t edge_at = 0;
+  for (size_t v = 0; v < st->count; v++) {
+    if (!st->colorable[v]) {
+      continue;
+    }
+    MirAllocVreg *out = &vregs[index[v]];
+    const MirVreg *vr = &fn->vregs[v];
+    out->id = (int)v;
+    out->rclass = (int)vr->rclass;
+    out->width = vr->width;
+    out->allowed = st->mask[v];
+    out->cost = st->cost[v];
+    out->hint = st->phys_hint[v];
+    for (int r = 0; r < 16; r++) {
+      if (mir_color_reg_is_saved(vr, r)) {
+        out->saved |= 1u << r;
+      }
+    }
+    out->neighbors = edges + edge_at;
+    MIR_INTER_FOR_EACH(st, v, b) {
+      if (st->colorable[b]) {
+        edges[edge_at++] = index[b];
+        out->neighbor_count++;
+      }
+    }
+  }
+  MirAllocRequest request;
+  char why[400];
+  const char *function_name = mir_ra_trace_name();
+  why[0] = '\0';
+  request.function = function_name;
+  request.vregs = vregs;
+  request.count = count;
+  int ok = g_mir_external_allocator(&request, registers, why, sizeof(why));
+  if (!ok) {
+    if (fn->generator && !fn->generator->has_error) {
+      code_generator_set_error(fn->generator, "'@%s' could not allocate '%s': %s",
+                               g_mir_external_allocator_name, function_name, why);
+      fn->generator->has_user_error = 1;
+    }
+    fn->has_error = 1;
+  }
+  for (size_t v = 0; ok && v < st->count; v++) {
+    if (!st->colorable[v]) {
+      continue;
+    }
+    MirVreg *vr = &fn->vregs[v];
+    int reg = registers[index[v]];
+    if (reg >= 0 && (reg > 31 || !(st->mask[v] & (1u << (unsigned)reg)))) {
+      if (fn->generator && !fn->generator->has_error) {
+        code_generator_set_error(
+            fn->generator,
+            "'@%s' gave v%d of '%s' register %d, and the allowed set is 0x%x",
+            g_mir_external_allocator_name, (int)v, function_name, reg,
+            (unsigned)st->mask[v]);
+        fn->generator->has_user_error = 1;
+      }
+      fn->has_error = 1;
+      ok = 0;
+      break;
+    }
+    vr->assigned = 1;
+    if (reg < 0) {
+      *next_spill += vr->width > 8 ? 16 : 8;
+      vr->in_register = 0;
+      vr->spill_offset = *next_spill;
+    } else {
+      vr->in_register = 1;
+      vr->phys = reg;
+    }
+  }
+  free(index);
+  free(vregs);
+  free(registers);
+  free(edges);
+  return ok;
+}
+
 static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool,
                            size_t gp_leaf_n,
                            const BinaryGpRegister *gp_cross_pool,
@@ -2524,8 +2646,15 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
                                  gp_cross_n, allow_rbp);
   }
   mir_color_note_phys_hints(&st);
-  mir_color_assign(&st, mir_color_order_vregs(&st), next_spill);
-  mir_color_coalesce_moves(&st);
+  if (g_mir_external_allocator) {
+    if (!mir_color_ask_external(&st, next_spill)) {
+      mir_color_state_free(&st);
+      return 0;
+    }
+  } else {
+    mir_color_assign(&st, mir_color_order_vregs(&st), next_spill);
+    mir_color_coalesce_moves(&st);
+  }
   mir_color_mirror_members(&st);
   mir_color_state_free(&st);
   return 1;
@@ -2639,7 +2768,8 @@ static int mir_regalloc_finish(MirFunction *fn) {
   if (mir_regalloc_verify_sabotage_enabled()) {
     mir_regalloc_verify_sabotage(fn);
   }
-  if (mir_regalloc_verify_enabled() && !mir_regalloc_verify(fn)) {
+  if ((mir_regalloc_verify_enabled() || g_mir_external_allocator) &&
+      !mir_regalloc_verify(fn)) {
     fn->has_error = 1;
     return 0;
   }

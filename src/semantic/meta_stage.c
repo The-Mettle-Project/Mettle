@@ -2331,6 +2331,47 @@ static int late_builtin_run(const char *name, IRFunction *function, int *changed
   return late_run_pass(function, &g_builtin_pass, changed);
 }
 
+static int late_allocate(const MirAllocRequest *request, int *out_registers,
+                         char *why, size_t why_size) {
+  IRRuleImage image;
+  char *image_error = NULL;
+  StageBuild *build = &g_late_build;
+  if (!rule_reflect_build_alloc(build->checker, request, &image, &image_error)) {
+    snprintf(why, why_size, "%s", image_error ? image_error : "?");
+    return 0;
+  }
+  IRInterpMachine *machine = NULL;
+  unsigned long long address = 0;
+  size_t errors_before = g_late.reporter->count;
+  SourceLocation at = {0, 0, NULL};
+  if (!run_driver(&g_late, build, "__meta_regalloc", &image, &machine, &address,
+                  at)) {
+    snprintf(why, why_size, "%s",
+             g_late.reporter->count > errors_before
+                 ? g_late.reporter->errors[errors_before].message
+                 : "it did not run");
+    g_late.reporter->count = errors_before;
+    return 0;
+  }
+  const Type *assignment = type_checker_get_type_by_name(build->checker, "Assignment");
+  unsigned long long registers = address + field_at(assignment, "registers");
+  unsigned long long data = (unsigned long long)read_i64(machine, registers);
+  size_t count = (size_t)read_i64(machine, registers + 8);
+  if (count != request->count) {
+    snprintf(why, why_size, "it returned %zu registers for %zu vregs", count,
+             request->count);
+    ir_interp_destroy(machine);
+    ir_rule_image_free(&image);
+    return 0;
+  }
+  for (size_t i = 0; i < count; i++) {
+    out_registers[i] = (int)read_i64(machine, data + i * 8);
+  }
+  ir_interp_destroy(machine);
+  ir_rule_image_free(&image);
+  return 1;
+}
+
 static int late_prepare(MetaStage *stage) {
   Program *program = (Program *)stage->program->data;
   NameSet names = {0};
@@ -2340,6 +2381,7 @@ static int late_prepare(MetaStage *stage) {
   size_t capacity = 0;
   char line[512];
   size_t passes = 0;
+  const char *allocator = NULL;
   text_append(&text, &used, &capacity, "");
   for (size_t i = 0; i < program->declaration_count; i++) {
     const ASTNode *decl = program->declarations[i];
@@ -2348,6 +2390,30 @@ static int late_prepare(MetaStage *stage) {
       continue;
     }
     fd = (const FunctionDeclaration *)decl->data;
+    if (fd->meta_role == META_ROLE_REGALLOC) {
+      if (allocator) {
+        report_at(stage, decl->location, "L0001",
+                  "A program has one @regalloc function", NULL);
+        return 0;
+      }
+      if (fd->parameter_count != 1 ||
+          strcmp(meta_strip_import(fd->parameter_types[0]), "AllocGraph") != 0 ||
+          !fd->return_type ||
+          strcmp(meta_strip_import(fd->return_type), "Assignment") != 0) {
+        report_at(stage, decl->location, "L0001",
+                  "A @regalloc function is 'fn name(g: AllocGraph) -> Assignment'",
+                  NULL);
+        return 0;
+      }
+      allocator = fd->name;
+      snprintf(line, sizeof(line),
+               "fn __meta_regalloc(g: AllocGraph) -> Assignment {\n"
+               "  return %s(g);\n}\n",
+               fd->name);
+      text_append(&text, &used, &capacity, line);
+      name_set_add(&names, fd->name, -1);
+      continue;
+    }
     if (fd->meta_role != META_ROLE_PASS) {
       continue;
     }
@@ -2377,7 +2443,7 @@ static int late_prepare(MetaStage *stage) {
     name_set_add(&names, fd->name, -1);
     passes++;
   }
-  if (passes == 0) {
+  if (passes == 0 && !allocator) {
     name_set_free(&names);
     name_set_free(&types);
     free(text);
@@ -2388,6 +2454,7 @@ static int late_prepare(MetaStage *stage) {
     snprintf(line, sizeof(line), "__meta_pass_%zu", p);
     name_set_add(&names, line, -1);
   }
+  name_set_add(&names, "__meta_regalloc", -1);
   int built = stage_build(stage, &names, text, &g_late_build);
   if (!built) {
     stage->report->stage_builds--;
@@ -2403,8 +2470,11 @@ static int late_prepare(MetaStage *stage) {
   free(text);
   name_set_free(&names);
   name_set_free(&types);
-  g_late_passes = calloc(passes, sizeof(LatePass));
-  g_late_table = calloc(passes, sizeof(IRLibraryPass));
+  if (allocator) {
+    mir_set_external_allocator(late_allocate, meta_strip_import(allocator));
+  }
+  g_late_passes = calloc(passes + 1, sizeof(LatePass));
+  g_late_table = calloc(passes + 1, sizeof(IRLibraryPass));
   if (!g_late_passes || !g_late_table) {
     return 0;
   }
@@ -2454,6 +2524,7 @@ int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
   g_late = stage;
   ir_builtin_library_set(late_builtin_run);
   ir_library_passes_set(NULL, 0);
+  mir_set_external_allocator(NULL, NULL);
   if (!data || (!program_has_decorators(data) &&
                 !program_declares_generator_calls(data))) {
     return 1;
@@ -2485,7 +2556,8 @@ int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
 }
 
 void meta_stage_print_report(const MetaStageReport *report, FILE *out) {
-  if (!report->layouts && !report->generators && !g_late_pass_count) {
+  if (!report->layouts && !report->generators && !g_late_pass_count &&
+      !report->stage_builds) {
     fprintf(out, "metaprograms: none; nothing ran\n");
     return;
   }

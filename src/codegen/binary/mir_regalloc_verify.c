@@ -10,6 +10,7 @@
 #define MIR_VERIFY_MAX_SUCC 8
 
 extern const char *g_mir_ra_trace_name;
+const char *mir_external_allocator_name(void);
 
 typedef struct {
   const MirFunction *fn;
@@ -62,10 +63,19 @@ static int mir_verify_fail(MirFunction *fn, const char *what, size_t at,
   fprintf(stderr, "RA-VERIFY\t%s\tFAIL\t%s\tinsn=%zu\tv%d\tv%d\n", name, what,
           at, (int)a, (int)b);
   if (fn->generator && !fn->generator->has_error) {
-    code_generator_set_error(fn->generator,
-                             "register allocation verifier: %s at instruction "
-                             "%zu (v%d, v%d) in function '%s'",
-                             what, at, (int)a, (int)b, name);
+    const char *allocator = mir_external_allocator_name();
+    if (allocator) {
+      code_generator_set_error(fn->generator,
+                               "'@%s' wrote a wrong assignment: %s at "
+                               "instruction %zu (v%d, v%d) in function '%s'",
+                               allocator, what, at, (int)a, (int)b, name);
+      fn->generator->has_user_error = 1;
+    } else {
+      code_generator_set_error(fn->generator,
+                               "register allocation verifier: %s at instruction "
+                               "%zu (v%d, v%d) in function '%s'",
+                               what, at, (int)a, (int)b, name);
+    }
   }
   fn->has_error = 1;
   return 0;

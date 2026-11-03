@@ -3834,6 +3834,46 @@ catch {
   Write-CaseResult -Name "pass_expand_and_refusals" -Passed $false -Reason $_.Exception.Message
 }
 
+# An allocator written in Mettle compiles programs the MIR verifier accepts, and
+# a wrong one stops the build by name. huffman is a Suite 3 program with its own
+# source and one extra import.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $env:METTLE_MIR_VERIFY = "1"
+  $exePath = Join-Path $tmpDir "regalloc_mettle.exe"
+  $buildOut = & $CompilerPath --build --release "tests/test_regalloc_from_mettle.mettle" -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
+  $runOut = & $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "program returned ${LASTEXITCODE}: $runOut" }
+  $copy = Join-Path $tmpDir "huffman_regalloc.mettle"
+  $text = [System.IO.File]::ReadAllText((Join-Path (Get-Location) "examples/huffman/huffman.mettle"))
+  $text += "`nimport `"std/regalloc`";`n@regalloc fn colored_in_mettle(g: AllocGraph) -> Assignment {`n  return chaitin_briggs(g);`n}`n"
+  [System.IO.File]::WriteAllText($copy, $text)
+  $normalExe = Join-Path $tmpDir "huffman_normal.exe"
+  $buildOut = & $CompilerPath --build --release "examples/huffman/huffman.mettle" -o $normalExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "normal build failed: $buildOut" }
+  $mettleExe = Join-Path $tmpDir "huffman_regalloc.exe"
+  $buildOut = & $CompilerPath --build --release $copy -o $mettleExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "library allocator build failed: $buildOut" }
+  $normal = (& $normalExe 2>&1 | Out-String) -replace "Time:.*|Per pass.*", ""
+  $colored = (& $mettleExe 2>&1 | Out-String) -replace "Time:.*|Per pass.*", ""
+  if ($normal -ne $colored) { throw "the library allocator's program printed something else: $colored" }
+  Remove-Item Env:METTLE_MIR_VERIFY
+  $shared = & $CompilerPath --build --release "tests/err_regalloc_shared.mettle" -o (Join-Path $tmpDir "regalloc_shared.exe") 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "a wrong assignment built" }
+  if (($shared -replace "\s+", " ") -notmatch "'@one_register_for_all' wrote a wrong assignment: two (entry-live )?(live )?values share a register") { throw "the wrong assignment was not named: $shared" }
+  $denied = & $CompilerPath --build --release "tests/err_regalloc_not_allowed.mettle" -o (Join-Path $tmpDir "regalloc_denied.exe") 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "a forbidden register built" }
+  if (($denied -replace "\s+", " ") -notmatch "'@wants_the_stack_pointer' gave v\d+ of") { throw "the forbidden register was not named: $denied" }
+  Write-CaseResult -Name "regalloc_from_mettle" -Passed $true
+}
+catch {
+  if ($env:METTLE_MIR_VERIFY) { Remove-Item Env:METTLE_MIR_VERIFY }
+  $failed++
+  Write-CaseResult -Name "regalloc_from_mettle" -Passed $false -Reason $_.Exception.Message
+}
+
 # A generator that reads optimized code reads a select as a branch. Selects only
 # appear with if-conversion on.
 $total++

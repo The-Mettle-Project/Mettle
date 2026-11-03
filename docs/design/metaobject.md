@@ -264,6 +264,32 @@ Suite 3 it fires in `json_parse` and `interp_ast`, and all 16 binaries are
 byte-identical to those of the C pass. `json_parse` compiles in 164 ms against
 139 ms, and programs where it does not fire compile as before.
 
+## Register allocation
+
+`@regalloc fn a(g: AllocGraph) -> Assignment` takes over colouring for the whole
+program. For each function the compiler builds the exact interference graph and
+coalesces moves as it always does, then hands the metafunction every vreg with
+its class, width, the mask of registers it may use, the mask that cost a save,
+its spill cost, a hint and its neighbours. The answer is one register per vreg,
+or -1 to spill it.
+
+```mermaid
+flowchart LR
+  live[liveness, interference, coalescing] --> graph[AllocGraph in interpreter memory]
+  graph --> color[metafunction runs]
+  color --> mask{register in the vreg's mask?}
+  mask -- no --> stop[stop the build, naming the allocator]
+  mask -- yes --> verify[MIR allocation verifier, always on]
+  verify -- two live values share a register --> stop
+  verify -- passes --> encode[encode]
+```
+
+The allocation verifier dataflows live values through the finished code, so it
+trusts nothing the allocator said. `std/regalloc` holds `chaitin_briggs`, a plain
+optimistic colourer. All 16 Suite 3 programs build with it under
+`METTLE_MIR_VERIFY` and print what the built-in allocator's binaries print.
+Functions too large for the graph allocator keep the built-in linear scan.
+
 ## Costs
 
 `--report-meta` prints the layouts, generators, source bytes, stage builds and

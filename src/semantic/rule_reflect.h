@@ -4,6 +4,7 @@
 #include "type_checker.h"
 #include "../ir/ir_rules.h"
 #include "../ir/ir_effects.h"
+#include "../codegen/binary/mir_external.h"
 
 const char *rule_reflect_strip_import_prefix(const char *name);
 
@@ -13,6 +14,9 @@ int rule_reflect_build_function(TypeChecker *checker, IRProgram *ir,
 
 int rule_reflect_build_pass(TypeChecker *checker, const IRFunction *fn,
                             IRRuleImage *out, char **error_message);
+
+int rule_reflect_build_alloc(TypeChecker *checker, const MirAllocRequest *request,
+                             IRRuleImage *out, char **error_message);
 
 int rule_reflect_build_one_function(TypeChecker *layouts, TypeChecker *program,
                                     IRFunction *fn, IRRuleImage *out,

@@ -1,0 +1,30 @@
+import "std/io";
+import "std/regalloc";
+
+fn lowest(mask: int64) -> int64 {
+  var one: int64 = 1;
+  for r in 0..32 {
+    if ((mask & (one << r)) != 0) { return r; }
+  }
+  return -1;
+}
+
+@regalloc fn one_register_for_all(g: AllocGraph) -> Assignment {
+  var out: Assignment;
+  out.registers = new int64[g.vregs.length];
+  for i in 0..g.vregs.length {
+    out.registers[i] = lowest(g.vregs[i].allowed);
+  }
+  return out;
+}
+
+@noinline fn add3(a: int64, b: int64, c: int64) -> int64 {
+  var d: int64 = a + b;
+  var e: int64 = b + c;
+  return d * e + a;
+}
+
+fn main() -> int32 {
+  println("{add3(1, 2, 3)}");
+  return 0;
+}
