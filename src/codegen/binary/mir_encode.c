@@ -693,6 +693,17 @@ static int encode_div(MirFunction *fn, const MirInst *in) {
   if (!materialize_into(fn, &in->a, BINARY_GP_RAX)) {
     return 0;
   }
+  size_t to_wide = 0;
+  size_t to_done = 0;
+  if (!binary_emit_mov_reg_reg(code, SCRATCH_A, BINARY_GP_RAX) ||
+      !binary_emit_alu_reg_reg(code, 0x09, SCRATCH_A, divisor) ||
+      !binary_emit_shift_reg_imm8(code, 5, SCRATCH_A, 32) ||
+      !wcs_jcc(code, 0x85, &to_wide) ||
+      !binary_emit_xor_reg_reg32(code, BINARY_GP_RDX) ||
+      !binary_emit_unary_reg32(code, 6, divisor) ||
+      !wcs_jcc(code, 0, &to_done) || !wcs_patch_here(code, to_wide)) {
+    return enc_err(fn, "out of memory in narrow divide");
+  }
   if (in->is_unsigned) {
     if (!binary_emit_xor_reg_reg32(code, BINARY_GP_RDX) ||
         !binary_emit_div_reg(code, divisor)) {
@@ -707,6 +718,9 @@ static int encode_div(MirFunction *fn, const MirInst *in) {
     } else if (!binary_emit_cqo(code) || !binary_emit_idiv_reg(code, divisor)) {
       return enc_err(fn, "out of memory in idiv");
     }
+  }
+  if (!wcs_patch_here(code, to_done)) {
+    return enc_err(fn, "out of memory in narrow divide");
   }
   BinaryGpRegister result = in->cc ? BINARY_GP_RDX : BINARY_GP_RAX;
   return store_from(fn, &in->dst, result);

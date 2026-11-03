@@ -274,7 +274,7 @@ typedef struct {
   int float_return_bits;
 
   struct {
-    const char *name;
+    const void *sibling;
     MirVregId vreg;
   } divmod_precomp[16];
   size_t divmod_precomp_count;

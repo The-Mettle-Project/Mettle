@@ -2149,6 +2149,17 @@ $cases = @(
     # scale by the same exact value and round once. The check compares the
     # folded divide against a multiply the fold cannot reach, over
     # subnormals, both zeros, both infinities and NaN.
+    Name          = "divide_paths"
+    Path          = "tests/divide_paths_check.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+  },
+  @{
+    Name          = "divide_paths_debug"
+    Path          = "tests/divide_paths_check.mettle"
+    ShouldSucceed = $true
+  },
+  @{
     Name          = "fdiv_pow2"
     Path          = "tests/fdiv_pow2_check.mettle"
     ShouldSucceed = $true

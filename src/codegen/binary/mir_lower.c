@@ -4505,6 +4505,26 @@ static int mir_lower_float_binary(MirFunction *fn, CodeGenerator *g,
     return mir_emit1(fn, MIR_FSETCC, dst, fa, fbop, w, 0, cc);
 }
 
+static int mir_divmod_operand_is_stable(CodeGenerator *g, const IRFunction *irf,
+                                        const IROperand *op) {
+  if (op->kind == IR_OPERAND_INT || op->kind == IR_OPERAND_TEMP) {
+    return 1;
+  }
+  if (op->kind != IR_OPERAND_SYMBOL || !op->name ||
+      mir_name_is_global_variable(g, op->name)) {
+    return 0;
+  }
+  for (size_t i = 0; i < irf->instruction_count; i++) {
+    const IRInstruction *other = &irf->instructions[i];
+    if (other->op == IR_OP_INLINE_ASM ||
+        (other->op == IR_OP_ADDRESS_OF &&
+         mir_ir_operand_equal(&other->lhs, op))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static const IRInstruction *mir_find_divmod_sibling(
     MirFunction *fn, CodeGenerator *g, BinaryFunctionContext *ctx,
     const IRInstruction *in, unsigned char mod) {
@@ -4515,7 +4535,13 @@ static const IRInstruction *mir_find_divmod_sibling(
   const IRInstruction *sibling = NULL;
   if (irf && in >= irf->instructions &&
       in < irf->instructions + irf->instruction_count &&
-      fn->divmod_precomp_count < 16 && in->dest.kind == IR_OPERAND_TEMP) {
+      fn->divmod_precomp_count < 16 &&
+      (in->dest.kind == IR_OPERAND_TEMP ||
+       in->dest.kind == IR_OPERAND_SYMBOL) &&
+      !mir_ir_operand_equal(&in->dest, &in->lhs) &&
+      !mir_ir_operand_equal(&in->dest, &in->rhs) &&
+      mir_divmod_operand_is_stable(g, irf, &in->lhs) &&
+      mir_divmod_operand_is_stable(g, irf, &in->rhs)) {
     size_t idx = (size_t)(in - irf->instructions);
     for (size_t j = idx + 1; j < irf->instruction_count; j++) {
       const IRInstruction *nx = &irf->instructions[j];
@@ -4529,7 +4555,9 @@ static const IRInstruction *mir_find_divmod_sibling(
         break;
       }
       if (nx->op == IR_OP_BINARY && nx->text && !nx->is_float &&
-          ir_operand_is_temp(&nx->dest) &&
+          (nx->dest.kind == IR_OPERAND_TEMP ||
+           nx->dest.kind == IR_OPERAND_SYMBOL) &&
+          nx->is_unsigned == in->is_unsigned &&
           ((mod && strcmp(nx->text, "/") == 0) ||
            (!mod && strcmp(nx->text, "%") == 0)) &&
           mir_ir_operand_equal(&nx->lhs, &in->lhs) &&
@@ -4556,14 +4584,11 @@ static int mir_lower_divide(MirFunction *fn, CodeGenerator *g,
       return 1;
     }
 
-    if (in->dest.name) {
-      for (size_t k = 0; k < fn->divmod_precomp_count; k++) {
-        if (fn->divmod_precomp[k].name &&
-            strcmp(fn->divmod_precomp[k].name, in->dest.name) == 0) {
-          return mir_emit1(fn, MIR_MOV, dst,
-                           mir_op_vreg(fn->divmod_precomp[k].vreg),
-                           mir_op_none(), 8, 0, 0);
-        }
+    for (size_t k = 0; k < fn->divmod_precomp_count; k++) {
+      if (fn->divmod_precomp[k].sibling == in) {
+        return mir_emit1(fn, MIR_MOV, dst,
+                         mir_op_vreg(fn->divmod_precomp[k].vreg),
+                         mir_op_none(), 8, 0, 0);
       }
     }
 
@@ -4584,7 +4609,7 @@ static int mir_lower_divide(MirFunction *fn, CodeGenerator *g,
       }
       MirVregId mine = mod ? rv : qv;
       MirVregId theirs = mod ? qv : rv;
-      fn->divmod_precomp[fn->divmod_precomp_count].name = sibling->dest.name;
+      fn->divmod_precomp[fn->divmod_precomp_count].sibling = sibling;
       fn->divmod_precomp[fn->divmod_precomp_count].vreg = theirs;
       fn->divmod_precomp_count++;
       return mir_emit1(fn, MIR_MOV, dst, mir_op_vreg(mine), mir_op_none(), 8, 0,

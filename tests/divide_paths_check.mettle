@@ -1,0 +1,157 @@
+import "std/io";
+import "std/mem";
+
+var g_shared: int64 = 0;
+
+@noinline fn store_between(x: int64, d: int64, out: int64*) -> int64 {
+  var q: int64 = x / d;
+  *out = q;
+  var r: int64 = x % d;
+  return r;
+}
+
+@noinline fn dest_is_dividend(x: int64, d: int64) -> int64 {
+  var v: int64 = x;
+  v = v / d;
+  var r: int64 = v % d;
+  return r;
+}
+
+@noinline fn dest_is_divisor(x: int64, d: int64) -> int64 {
+  var v: int64 = d;
+  v = x / v;
+  var r: int64 = x % v;
+  return r;
+}
+
+@noinline fn address_taken_dividend(x: int64, d: int64) -> int64 {
+  var v: int64 = x;
+  var p: int64* = &v;
+  var q: int64 = v / d;
+  *p = q + 1000;
+  var r: int64 = v % d;
+  return r;
+}
+
+@noinline fn global_dividend(d: int64, p: int64*) -> int64 {
+  var q: int64 = g_shared / d;
+  *p = q + 1000;
+  var r: int64 = g_shared % d;
+  return r;
+}
+
+@noinline fn signed_div(a: int64, b: int64) -> int64 {
+  return a / b;
+}
+
+@noinline fn signed_mod(a: int64, b: int64) -> int64 {
+  return a % b;
+}
+
+@noinline fn unsigned_div(a: uint64, b: uint64) -> uint64 {
+  return a / b;
+}
+
+@noinline fn unsigned_mod(a: uint64, b: uint64) -> uint64 {
+  return a % b;
+}
+
+@noinline fn both_signed(a: int64, b: int64, q: int64*) -> int64 {
+  var dq: int64 = a / b;
+  var dr: int64 = a % b;
+  *q = dq;
+  return dr;
+}
+
+@noinline fn both_unsigned(a: uint64, b: uint64, q: uint64*) -> uint64 {
+  var dq: uint64 = a / b;
+  var dr: uint64 = a % b;
+  *q = dq;
+  return dr;
+}
+
+var g_fails: int32 = 0;
+
+fn check(label: int32, got: int64, want: int64) {
+  if (got != want) {
+    println("FAIL {label}: got {got}, want {want}");
+    g_fails += 1;
+  }
+}
+
+fn checku(label: int32, got: uint64, want: uint64) {
+  if (got != want) {
+    println("FAIL {label}: got {got}, want {want}");
+    g_fails += 1;
+  }
+}
+
+fn main() -> int32 {
+  var cell: int64 = 0;
+
+  check(1, store_between(100, 7, &cell), 2);
+  check(2, cell, 14);
+  check(3, dest_is_dividend(100, 7), 0);
+  check(4, dest_is_dividend(103, 5), 0);
+  check(5, dest_is_dividend(107, 5), 1);
+  check(6, dest_is_divisor(100, 7), 2);
+  check(7, address_taken_dividend(100, 7), 6);
+
+  g_shared = 100;
+  check(8, global_dividend(7, &g_shared), 6);
+  check(9, g_shared, 1014);
+
+  check(10, signed_div(4294967295, 1), 4294967295);
+  check(11, signed_div(4294967296, 1), 4294967296);
+  check(12, signed_div(4294967296, 2), 2147483648);
+  check(13, signed_div(4294967295, 4294967295), 1);
+  check(14, signed_div(4294967295, 4294967296), 0);
+  check(15, signed_mod(4294967295, 4294967296), 4294967295);
+  check(16, signed_mod(4294967296, 4294967295), 1);
+  check(17, signed_div(-1, 1), -1);
+  check(18, signed_div(1, -1), -1);
+  check(19, signed_div(-7, 2), -3);
+  check(20, signed_mod(-7, 2), -1);
+  check(21, signed_mod(7, -2), 1);
+  check(22, signed_div(-4294967296, 4294967296), -1);
+  check(23, signed_div(9223372036854775807, 3), 3074457345618258602);
+  check(24, signed_div((int64)-9223372036854775807 - 1, -1), (int64)-9223372036854775807 - 1);
+  check(25, signed_mod((int64)-9223372036854775807 - 1, -1), 0);
+  check(26, signed_div(0, 4294967295), 0);
+  check(27, signed_div(2147483648, 2147483648), 1);
+  check(28, signed_mod(3000000000, 2147483648), 852516352);
+
+  checku(29, unsigned_div(4294967295, 1), 4294967295);
+  checku(30, unsigned_div(4294967296, 4294967295), 1);
+  checku(31, unsigned_mod(4294967296, 4294967295), 1);
+  checku(32, unsigned_div(18446744073709551615, 4294967296), 4294967295);
+  checku(33, unsigned_mod(18446744073709551615, 4294967296), 4294967295);
+  checku(34, unsigned_div(18446744073709551615, 18446744073709551615), 1);
+  checku(35, unsigned_div(4294967295, 18446744073709551615), 0);
+  checku(36, unsigned_mod(4294967295, 18446744073709551615), 4294967295);
+
+  var q: int64 = 0;
+  var r: int64 = both_signed(-4294967297, 2, &q);
+  check(37, q, -2147483648);
+  check(38, r, -1);
+  r = both_signed(4294967295, 16, &q);
+  check(39, q, 268435455);
+  check(40, r, 15);
+  r = both_signed((int64)-9223372036854775807 - 1, -1, &q);
+  check(41, q, (int64)-9223372036854775807 - 1);
+  check(42, r, 0);
+
+  var uq: uint64 = 0;
+  var ur: uint64 = both_unsigned(18446744073709551615, 10, &uq);
+  checku(43, uq, 1844674407370955161);
+  checku(44, ur, 5);
+  ur = both_unsigned(4294967295, 4294967295, &uq);
+  checku(45, uq, 1);
+  checku(46, ur, 0);
+
+  if (g_fails == 0) {
+    println("divide_paths OK");
+    return 0;
+  }
+  return 1;
+}
