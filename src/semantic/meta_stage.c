@@ -1458,7 +1458,33 @@ static int run_generators(MetaStage *stage, GenList *list) {
   return 1;
 }
 
-static int stage_round(MetaStage *stage);
+static void direct_generated_calls(const Program *program, ASTNode *node) {
+  if (!node) {
+    return;
+  }
+  if (node->type == AST_FUNC_PTR_CALL && node->data) {
+    FuncPtrCall *call = (FuncPtrCall *)node->data;
+    if (call->function && call->function->type == AST_IDENTIFIER &&
+        call->function->data) {
+      const char *name = ((Identifier *)call->function->data)->name;
+      const FunctionDeclaration *target =
+          find_function(program, name, META_ROLE_NONE, NULL);
+      if (target && target->generated_by) {
+        ASTNode *direct = ast_create_call_expression(
+            name, call->arguments, call->argument_count, node->location);
+        if (direct) {
+          node->type = direct->type;
+          node->data = direct->data;
+          node->children = direct->children;
+          node->child_count = direct->child_count;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    direct_generated_calls(program, node->children[i]);
+  }
+}
 
 static int generator_round(MetaStage *stage, int *progressed) {
   GenList list = {0};
@@ -1472,6 +1498,16 @@ static int generator_round(MetaStage *stage, int *progressed) {
   *progressed = 1;
   int ok = run_generators(stage, &list);
   free(list.items);
+  if (ok && !stage->report->pending_error) {
+    Program *program = (Program *)stage->program->data;
+    for (size_t i = 0; i < program->declaration_count; i++) {
+      ASTNode *decl = program->declarations[i];
+      if (decl && decl->type == AST_FUNCTION_DECLARATION && decl->data) {
+        direct_generated_calls(program,
+                               ((FunctionDeclaration *)decl->data)->body);
+      }
+    }
+  }
   return ok;
 }
 

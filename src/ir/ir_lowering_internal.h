@@ -41,6 +41,7 @@ typedef struct {
   const char *current_expansion_note;
   int emit_runtime_checks;
   int emit_safety_checks;
+  int freeing_column_data;
   int emit_refinement_checks;
   int emit_task_checks;
   int emitted_task_check;
@@ -507,6 +508,8 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
                                    IRFunction *function, ASTNode *expression,
                                    IROperand *out_address, Type **out_type);
 
+void ir_layout_refuse(IRLoweringContext *context, SourceLocation location,
+                      const char *message);
 int ir_expression_is_column_element(IRLoweringContext *context,
                                     ASTNode *expression);
 int ir_lower_column_element_load(IRLoweringContext *context,

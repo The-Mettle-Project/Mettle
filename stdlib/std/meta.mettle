@@ -13,6 +13,7 @@ export struct IRValue {
 export struct IROp {
   op: string;
   text: string;
+  named_field: string;
   dest: IRValue;
   lhs: IRValue;
   rhs: IRValue;
@@ -168,6 +169,16 @@ fn value_read(v: IRValue) -> string {
   return "(int64){v.text}";
 }
 
+export fn type_is_pointer(name: string) -> bool {
+  if (name.length == 0) { return false; }
+  return name == "cstring" || name == "rawptr" || name[name.length - 1] == '*';
+}
+
+fn value_address(v: IRValue) -> string {
+  if (type_is_pointer(v.type_name)) { return "(cstring){v.text}"; }
+  return "(cstring){value_read(v)}";
+}
+
 fn cast_into(type_name: string, expression: string) -> string {
   if (type_name == "bool") { return "({expression}) != 0"; }
   return "({type_name})({expression})";
@@ -204,11 +215,27 @@ fn scalar_type_of_size(size: string, unsigned_load: bool) -> string {
   return "";
 }
 
+fn argument_text(op: IROp, i: int64) -> string {
+  var arg: IRValue = op.args[i];
+  if (i >= op.arg_types.length || arg.is_aggregate || arg.kind == VALUE_STRING) {
+    return value_read(arg);
+  }
+  if (type_is_pointer(arg.type_name)) {
+    return cast_into(op.arg_types[i], value_address(arg));
+  }
+  return cast_into(op.arg_types[i], value_read(arg));
+}
+
 fn emit_op(r: Render*, op: IROp) {
   if (op.op == "assign") {
     if (op.dest.kind == VALUE_TEMP || op.dest.kind == VALUE_LOCAL ||
         op.dest.kind == VALUE_GLOBAL) {
-      emit_store_to(r, op.dest, value_read(op.lhs));
+      if (type_is_pointer(op.dest.type_name) &&
+          type_is_pointer(op.lhs.type_name)) {
+        emit_store_to(r, op.dest, value_address(op.lhs));
+      } else {
+        emit_store_to(r, op.dest, value_read(op.lhs));
+      }
     }
     return;
   }
@@ -222,6 +249,16 @@ fn emit_op(r: Render*, op: IROp) {
       } else {
         emit_store_to(r, op.dest, "{a} {op.text} {b}");
       }
+      return;
+    }
+    if ((op.text == "+" || op.text == "-") && type_is_pointer(op.lhs.type_name)) {
+      emit_store_to(r, op.dest,
+                    "{value_address(op.lhs)} {op.text} {value_read(op.rhs)}");
+      return;
+    }
+    if (op.text == "+" && type_is_pointer(op.rhs.type_name)) {
+      emit_store_to(r, op.dest,
+                    "{value_address(op.rhs)} + {value_read(op.lhs)}");
       return;
     }
     if (op.is_unsigned && operator_cares_about_sign(op.text)) {
@@ -260,17 +297,33 @@ fn emit_op(r: Render*, op: IROp) {
       emit_store_to(r, op.dest, "(int64)({op.text}){value_read(op.lhs)}");
       return;
     }
+    if (type_is_pointer(op.dest.type_name)) {
+      emit_store_to(r, op.dest, value_address(op.lhs));
+      return;
+    }
     emit_store_to(r, op.dest, value_read(op.lhs));
     return;
   }
   if (op.op == "addr_of") {
-    emit_store_to(r, op.dest, "(int64)&{op.lhs.text}");
+    emit_store_to(r, op.dest, "(cstring)&{op.lhs.text}");
     return;
   }
   if (op.op == "load") {
     if (op.is_float) {
       emit_store_to(r, op.dest,
-                    "*({float_type_of(op)}*){value_read(op.lhs)}");
+                    "*({float_type_of(op)}*){value_address(op.lhs)}");
+      return;
+    }
+    if (op.named_field.length > 0) {
+      if (type_is_pointer(op.dest.type_name)) {
+        emit_store_to(r, op.dest, "(cstring){op.named_field}");
+      } else {
+        emit_store_to(r, op.dest, "(int64){op.named_field}");
+      }
+      return;
+    }
+    if (type_is_pointer(op.dest.type_name)) {
+      emit_store_to(r, op.dest, "*(cstring*){value_address(op.lhs)}");
       return;
     }
     var loaded: string = scalar_type_of_size(op.rhs.text, op.is_unsigned);
@@ -278,7 +331,7 @@ fn emit_op(r: Render*, op: IROp) {
       render_refuse(r, "it loads {op.rhs.text} bytes at once at line {op.line}");
       return;
     }
-    emit_store_to(r, op.dest, "(int64)*({loaded}*){value_read(op.lhs)}");
+    emit_store_to(r, op.dest, "(int64)*({loaded}*){value_address(op.lhs)}");
     return;
   }
   if (op.op == "store") {
@@ -286,24 +339,29 @@ fn emit_op(r: Render*, op: IROp) {
       var stored: string = "float64";
       if (op.rhs.text == "4") { stored = "float32"; }
       text_add(r.out,
-               "  *({stored}*){value_read(op.dest)} = ({stored}){value_read(op.lhs)};\n");
+               "  *({stored}*){value_address(op.dest)} = ({stored}){value_read(op.lhs)};\n");
+      return;
+    }
+    if (type_is_pointer(op.lhs.type_name) && op.rhs.text == "8") {
+      text_add(r.out,
+               "  *(cstring*){value_address(op.dest)} = {value_address(op.lhs)};\n");
       return;
     }
     var width: string = scalar_type_of_size(op.rhs.text, false);
     if (width.length > 0 && !op.lhs.is_aggregate) {
       text_add(r.out,
-               "  *({width}*){value_read(op.dest)} = ({width}){value_read(op.lhs)};\n");
+               "  *({width}*){value_address(op.dest)} = ({width}){value_read(op.lhs)};\n");
       return;
     }
     if (op.lhs.is_aggregate) {
-      text_add(r.out, "  memcpy((rawptr){value_read(op.dest)}, (rawptr)&{op.lhs.text}, {op.rhs.text});\n");
+      text_add(r.out, "  memcpy((rawptr){value_address(op.dest)}, (rawptr)&{op.lhs.text}, {op.rhs.text});\n");
       return;
     }
-    text_add(r.out, "  memcpy((rawptr){value_read(op.dest)}, (rawptr){value_read(op.lhs)}, {op.rhs.text});\n");
+    text_add(r.out, "  memcpy((rawptr){value_address(op.dest)}, (rawptr){value_address(op.lhs)}, {op.rhs.text});\n");
     return;
   }
   if (op.op == "new") {
-    emit_store_to(r, op.dest, "(int64)calloc(1, {value_read(op.rhs)})");
+    emit_store_to(r, op.dest, "(cstring)calloc(1, {value_read(op.rhs)})");
     return;
   }
   if (op.op == "call") {
@@ -311,13 +369,7 @@ fn emit_op(r: Render*, op: IROp) {
     text_add(&call, "{op.text}(");
     for i in 0..op.args.length {
       if (i > 0) { text_add(&call, ", "); }
-      var arg: IRValue = op.args[i];
-      if (i < op.arg_types.length && !arg.is_aggregate &&
-          arg.kind != VALUE_STRING) {
-        text_add(&call, cast_into(op.arg_types[i], value_read(arg)));
-      } else {
-        text_add(&call, value_read(arg));
-      }
+      text_add(&call, argument_text(op, i));
     }
     text_add(&call, ")");
     if (op.dest.kind == VALUE_NONE) {
@@ -326,6 +378,10 @@ fn emit_op(r: Render*, op: IROp) {
     }
     if (op.dest.is_aggregate || type_is_float(op.dest.type_name)) {
       text_add(r.out, "  {op.dest.text} = {text_done(&call)};\n");
+      return;
+    }
+    if (type_is_pointer(op.dest.type_name)) {
+      emit_store_to(r, op.dest, text_done(&call));
       return;
     }
     emit_store_to(r, op.dest, "(int64){text_done(&call)}");
@@ -375,6 +431,9 @@ fn emit_node(r: Render*, node: IRNode, f: FunctionInfo) {
       text_add(r.out, "  return;\n");
     } else if (node.returned.is_aggregate) {
       text_add(r.out, "  return {node.returned.text};\n");
+    } else if (type_is_pointer(node.returned.type_name)) {
+      text_add(r.out,
+               "  return {cast_into(f.return_type, value_address(node.returned))};\n");
     } else {
       text_add(r.out,
                "  return {cast_into(f.return_type, value_read(node.returned))};\n");
@@ -1023,12 +1082,7 @@ fn ad_emit_op(r: Render*, op: IROp, root: FunctionInfo) {
       text_add(&call, "{ad_variant_name(root, root.reached[callee].name)}(");
       for i in 0..op.args.length {
         if (i > 0) { text_add(&call, ", "); }
-        var arg: IRValue = op.args[i];
-        if (i < op.arg_types.length && !arg.is_aggregate && arg.kind != VALUE_STRING) {
-          text_add(&call, cast_into(op.arg_types[i], value_read(arg)));
-        } else {
-          text_add(&call, value_read(arg));
-        }
+        text_add(&call, argument_text(op, i));
       }
       for i in 0..op.args.length {
         if (i < op.arg_types.length && type_is_float(op.arg_types[i])) {

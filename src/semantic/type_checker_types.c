@@ -1900,7 +1900,7 @@ static int type_checker_pointer_conversion_allowed(Type *dest_type,
   if (dest_type->kind == TYPE_POINTER && src_type->kind == TYPE_ARRAY &&
       dest_type->device_space == DEVICE_SPACE_NONE &&
       dest_type->declared_align == 0 && dest_type->base_type &&
-      src_type->base_type &&
+      src_type->base_type && !type_is_columnar(src_type->base_type) &&
       type_checker_types_equal(dest_type->base_type, src_type->base_type)) {
     return 1;
   }

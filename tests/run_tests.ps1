@@ -1595,6 +1595,8 @@ $cases = @(
   @{ Name = "err_layout_packed_address"; Path = "tests/err_layout_packed_address.mettle"; ShouldSucceed = $false; Pattern = "error\[L0003\].*has no address" },
   @{ Name = "err_layout_calls_metafunction"; Path = "tests/err_layout_calls_metafunction.mettle"; ShouldSucceed = $false; Pattern = "is a metafunction" },
   @{ Name = "err_layout_extern"; Path = "tests/err_layout_extern.mettle"; ShouldSucceed = $false; Pattern = "error\[L0004\]" },
+  @{ Name = "err_layout_array_decay"; Path = "tests/err_layout_array_decay.mettle"; ShouldSucceed = $false; Pattern = "Point\[4\]" },
+  @{ Name = "err_layout_slice_data"; Path = "tests/err_layout_slice_data.mettle"; ShouldSucceed = $false; Pattern = "Only free\(s\.data\) reads it" },
   @{ Name = "err_generate_impure_memoize"; Path = "tests/err_generate_impure_memoize.mettle"; ShouldSucceed = $false; Pattern = "@memoize needs a pure function: 'bump__inner' writes the global" },
   @{ Name = "err_generate_wrong_grad"; Path = "tests/err_generate_wrong_grad.mettle"; ShouldSucceed = $false; Pattern = "disagrees with finite differences" },
   @{ Name = "err_generate_grad_extern"; Path = "tests/err_generate_grad_extern.mettle"; ShouldSucceed = $false; Pattern = "has no derivative" },
@@ -3764,7 +3766,7 @@ catch {
 
 # Layouts and generators written in Mettle: every access goes through the data a
 # metafunction returned, and every generated function runs, at every level.
-foreach ($layoutCase in @("test_layout_soa", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn")) {
+foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn")) {
   foreach ($layoutMode in @(@(), @("-O"), @("--release"))) {
     $total++
     $layoutName = "$($layoutCase)_$(($layoutMode -join '') -replace '-','')"

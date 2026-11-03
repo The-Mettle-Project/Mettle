@@ -1576,24 +1576,29 @@ int ir_lower_call_expression(IRLoweringContext *context,
     return ir_lower_tile_call(context, function, expression, out_value);
   }
 
-  if (call->argument_count == 1 && strcmp(call->function_name, "free") == 0) {
+  if (call->argument_count == 1 && strcmp(call->function_name, "free") == 0 &&
+      !context->freeing_column_data) {
     Type *freed = ir_infer_expression_type(context, call->arguments[0]);
     const TypeMetaLayout *layout =
         freed && freed->kind == TYPE_POINTER && freed->base_type
             ? freed->base_type->meta_layout
             : NULL;
-    if (layout && layout->allocator) {
-      if (!layout->releaser) {
-        ir_set_error(context,
-                     "'%s' comes from the allocator '%s', and its layout names "
-                     "no function to release it",
-                     freed->base_type->name, layout->allocator);
-        return 0;
-      }
+    if (layout && layout->allocator && !layout->releaser) {
+      ir_set_error(context,
+                   "'%s' comes from the allocator '%s', and its layout names "
+                   "no function to release it",
+                   freed->base_type->name, layout->allocator);
+      return 0;
+    }
+    if (layout) {
       char *written = call->function_name;
-      call->function_name = (char *)layout->releaser;
+      if (layout->allocator) {
+        call->function_name = (char *)layout->releaser;
+      }
+      context->freeing_column_data = 1;
       int released =
           ir_lower_call_expression(context, function, expression, out_value);
+      context->freeing_column_data = 0;
       call->function_name = written;
       return released;
     }
@@ -3233,6 +3238,21 @@ static int ir_lower_member_or_index(IRLoweringContext *context,
   }
   if (ir_expression_is_packed_field(context, expression)) {
     return ir_lower_packed_load(context, function, expression, out_value);
+  }
+  if (expression->type == AST_MEMBER_ACCESS && !context->freeing_column_data) {
+    MemberAccess *m = (MemberAccess *)expression->data;
+    Type *held = m && m->object ? ir_infer_expression_type(context, m->object)
+                                : NULL;
+    if (held && held->kind == TYPE_SLICE && type_is_columnar(held->base_type) &&
+        m->member && strcmp(m->member, "data") == 0) {
+      char message[400];
+      snprintf(message, sizeof(message),
+               "'.data' on a slice of '%s' points at the first region, and a "
+               "'%s*' expects them all together. Only free(s.data) reads it",
+               held->base_type->name, held->base_type->name);
+      ir_layout_refuse(context, expression->location, message);
+      return 0;
+    }
   }
   if (expression->type == AST_MEMBER_ACCESS) {
     MemberAccess *m = (MemberAccess *)expression->data;

@@ -7921,7 +7921,8 @@ for (size_t i = 0; i < f->instruction_count; i++) {
   for (int t = 0; t < 2; t++) {
     const IROperand *base = order[t][0];
     const IROperand *scaled = order[t][1];
-    if (scaled->kind != IR_OPERAND_TEMP || !scaled->name) {
+    if (scaled->kind != IR_OPERAND_TEMP || !scaled->name ||
+        (base->kind != IR_OPERAND_TEMP && base->kind != IR_OPERAND_SYMBOL)) {
       continue;
     }
     int scaled_reads = mir_temp_read_count(uses, scaled->name);

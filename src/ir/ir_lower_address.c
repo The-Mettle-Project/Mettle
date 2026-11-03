@@ -3,8 +3,6 @@
 #include "ir_explain_safety.h"
 #include "frontend/mtlc_frontend.h"
 
-static void ir_layout_refuse(IRLoweringContext *context, SourceLocation location,
-                             const char *message);
 static int ir_emit_packed_store(IRLoweringContext *context, IRFunction *function,
                                 const IROperand *word_address,
                                 const TypeMetaPlace *place,
@@ -1636,8 +1634,8 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
   }
 }
 
-static void ir_layout_refuse(IRLoweringContext *context, SourceLocation location,
-                             const char *message) {
+void ir_layout_refuse(IRLoweringContext *context, SourceLocation location,
+                      const char *message) {
   if (context->type_checker && context->type_checker->error_reporter) {
     error_reporter_add_error(context->type_checker->error_reporter,
                              ERROR_SEMANTIC, location, message);

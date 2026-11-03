@@ -1,0 +1,112 @@
+import "std/io";
+import "std/layout";
+
+@soa struct Cell {
+  a: int64;
+  b: int32;
+  c: uint8;
+}
+
+@soa struct Pair<T> {
+  left: T;
+  right: int64;
+}
+
+@compact struct Inner {
+  small: uint8;
+  big: int64;
+}
+
+@hot_cold(x) struct Outer {
+  name: Inner;
+  x: int32;
+  rows: int32[3];
+}
+
+@tagged(link, mark, 3) struct Tagged {
+  link: Tagged*;
+  mark: uint8;
+}
+
+fn check(name: string, got: int64, want: int64) -> int32 {
+  if (got != want) {
+    println("{name}: got {got}, want {want}");
+    return 1;
+  }
+  return 0;
+}
+
+fn takes_by_value(c: Cell) -> Cell {
+  var out: Cell = c;
+  out.a = out.a + 1;
+  return out;
+}
+
+const TABLE: Cell[2] = [{ a: 7, b: 8, c: 9 }, { a: 70, b: 80, c: 90 }];
+var global_cells: Cell[3];
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+
+  var literal: Cell[3] = [{ a: 1, b: 2, c: 3 }, { a: 4, b: 5, c: 6 }];
+  bad = bad + check("literal 0", literal[0].a, 1);
+  bad = bad + check("literal b", (int64)literal[1].b, 5);
+  bad = bad + check("literal c", (int64)literal[1].c, 6);
+  bad = bad + check("literal tail", literal[2].a, 0);
+  bad = bad + check("const table", TABLE[1].a + (int64)TABLE[0].c, 79);
+
+  global_cells[2].b = 11;
+  bad = bad + check("global", (int64)global_cells[2].b, 11);
+
+  var grid: Cell[2][3];
+  grid[1][2].b = 21;
+  grid[0][2].b = 20;
+  grid[1][0].a = 30;
+  bad = bad + check("grid", (int64)grid[1][2].b, 21);
+  bad = bad + check("grid other row", (int64)grid[0][2].b, 20);
+  bad = bad + check("grid first", grid[1][0].a, 30);
+
+  var round: Cell = takes_by_value(literal[1]);
+  bad = bad + check("by value", round.a, 5);
+  literal[2] = takes_by_value(round);
+  bad = bad + check("returned into a column", literal[2].a, 6);
+  bad = bad + check("returned keeps b", (int64)literal[2].b, 5);
+
+  var total: int64 = 0;
+  var view: Cell[] = literal;
+  for cell in view {
+    total = total + cell.a;
+  }
+  bad = bad + check("for over an array", total, 1 + 4 + 6);
+
+  var pairs: Pair<float64>[] = new Pair<float64>[4];
+  pairs[3].left = 2.5;
+  pairs[3].right = 9;
+  bad = bad + check("generic", (int64)(pairs[3].left * 2.0) + pairs[3].right, 14);
+  free(pairs.data);
+
+  var outers: Outer[2];
+  outers[1].name.big = 44;
+  outers[1].name.small = 4;
+  outers[1].rows[2] = 55;
+  outers[1].x = 6;
+  bad = bad + check("nested struct", outers[1].name.big, 44);
+  bad = bad + check("nested small", (int64)outers[1].name.small, 4);
+  bad = bad + check("array in a column", (int64)outers[1].rows[2], 55);
+  bad = bad + check("hot", (int64)outers[1].x, 6);
+  var inner_address: int64* = &outers[1].name.big;
+  *inner_address = 45;
+  bad = bad + check("through &", outers[1].name.big, 45);
+
+  var n: Tagged;
+  n.mark = 2;
+  n.mark += 3;
+  bad = bad + check("compound packed", (int64)n.mark, 5);
+  n.link = &n;
+  n.link.mark = 1;
+  bad = bad + check("chain through packed", (int64)n.mark, 1);
+  bad = bad + check("pointer intact", (int64)(n.link == &n), 1);
+
+  if (bad == 0) { println("ok"); }
+  return bad;
+}

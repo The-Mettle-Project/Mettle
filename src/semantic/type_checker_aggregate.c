@@ -10,6 +10,9 @@ typedef struct {
   AggregateRuntimeStore *runtime_stores;
   size_t runtime_store_count;
   size_t runtime_store_capacity;
+  const Type *column_element;
+  size_t column_index;
+  size_t column_count;
 } AggregateImage;
 
 static void aggregate_image_free(AggregateImage *out) {
@@ -457,6 +460,52 @@ static int aggregate_fold_array(TypeChecker *checker, ASTNode *expression,
 
   size_t stride = element_type->size;
 
+  if (type_is_columnar(element_type)) {
+    size_t written = literal->repeat_count ? 0 : literal->element_count;
+    if (literal->repeat_count) {
+      long long repeated = 0;
+      if (!type_checker_eval_integer_constant_with_checker(
+              checker, literal->repeat_count, &repeated) ||
+          repeated < 0 || (size_t)repeated > capacity) {
+        type_checker_set_error_at_location(
+            checker, expression->location,
+            "the repeat count does not fit '%s'",
+            type->name ? type->name : "?");
+        return 0;
+      }
+      written = (size_t)repeated;
+    }
+    if (written > capacity) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "%zu elements do not fit '%s', which holds %zu", written,
+          type->name ? type->name : "?", capacity);
+      return 0;
+    }
+    for (size_t i = 0; i < written; i++) {
+      ASTNode *element =
+          literal->elements[literal->repeat_count ? 0 : i];
+      if (element->type != AST_AGGREGATE_LITERAL) {
+        type_checker_set_error_at_location(
+            checker, element->location,
+            "an element of '%s' keeps its fields in separate regions, so a "
+            "literal for it spells each field",
+            element_type->name ? element_type->name : "?");
+        return 0;
+      }
+      out->column_element = element_type;
+      out->column_index = i;
+      out->column_count = capacity;
+      int folded =
+          aggregate_fold_element(checker, element, element_type, offset, out);
+      out->column_element = NULL;
+      if (!folded) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+
   if (literal->repeat_count) {
     long long count = 0;
     if (!type_checker_eval_integer_constant_with_checker(
@@ -541,6 +590,16 @@ static int aggregate_fold_struct(TypeChecker *checker, ASTNode *expression,
       }
     }
 
+    size_t field_offset = offset + type->field_offsets[field];
+    if (out->column_element == type) {
+      const TypeMetaPlace *place = type_field_place(type, field);
+      field_offset =
+          offset +
+          type_columns_region_base(type, place->region, out->column_count) +
+          out->column_index * type->meta_layout->regions[place->region].stride +
+          place->offset;
+    }
+
     if (type_field_is_packed(type, field)) {
       Type *element_type =
           type_checker_infer_type(checker, literal->elements[i]);
@@ -557,8 +616,7 @@ static int aggregate_fold_struct(TypeChecker *checker, ASTNode *expression,
             type->field_types[field], element_type);
         return 0;
       }
-      if (!aggregate_image_add_runtime_store(out,
-                                             offset + type->field_offsets[field],
+      if (!aggregate_image_add_runtime_store(out, field_offset,
                                              literal->elements[i],
                                              type->field_types[field])) {
         return 0;
@@ -568,9 +626,13 @@ static int aggregate_fold_struct(TypeChecker *checker, ASTNode *expression,
       continue;
     }
 
-    if (!aggregate_fold_element(checker, literal->elements[i],
-                                type->field_types[field],
-                                offset + type->field_offsets[field], out)) {
+    const Type *held_element = out->column_element;
+    out->column_element = NULL;
+    int field_folded = aggregate_fold_element(checker, literal->elements[i],
+                                              type->field_types[field],
+                                              field_offset, out);
+    out->column_element = held_element;
+    if (!field_folded) {
       return 0;
     }
   }

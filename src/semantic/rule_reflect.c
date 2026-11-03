@@ -1170,6 +1170,7 @@ typedef struct {
   size_t temp_count;
   MetaBlock *blocks;
   size_t block_count;
+  char *skip;
 } MetaImage;
 
 static const char *meta_find_type(const MetaLocal *entries, size_t count,
@@ -1242,6 +1243,12 @@ static Symbol *meta_callee(MetaImage *m, const IRInstruction *call) {
   return symbol && symbol->kind == SYMBOL_FUNCTION ? symbol : NULL;
 }
 
+static int meta_is_pointer_name(const char *name) {
+  size_t length = name ? strlen(name) : 0;
+  return length > 0 && (name[length - 1] == '*' || strcmp(name, "cstring") == 0 ||
+                        strcmp(name, "rawptr") == 0);
+}
+
 static const char *meta_result_type(MetaImage *m, const IRInstruction *ins) {
   switch (ins->op) {
   case IR_OP_BINARY:
@@ -1250,9 +1257,22 @@ static const char *meta_result_type(MetaImage *m, const IRInstruction *ins) {
         ins->text[0] != '>' && ins->text[0] != '=' && ins->text[0] != '!') {
       return meta_float_name(ins->float_bits);
     }
+    if (ins->op == IR_OP_BINARY && ins->text &&
+        (strcmp(ins->text, "+") == 0 || strcmp(ins->text, "-") == 0) &&
+        (meta_is_pointer_name(meta_operand_type(m, &ins->lhs)) ||
+         (ins->text[0] == '+' &&
+          meta_is_pointer_name(meta_operand_type(m, &ins->rhs))))) {
+      return "cstring";
+    }
     return "int64";
   case IR_OP_LOAD:
-    return ins->is_float ? meta_float_name(ins->float_bits) : "int64";
+    if (ins->is_float) {
+      return meta_float_name(ins->float_bits);
+    }
+    return ins->alias_class == IR_ALIAS_CLASS_POINTER ? "cstring" : "int64";
+  case IR_OP_ADDRESS_OF:
+  case IR_OP_NEW:
+    return "cstring";
   case IR_OP_CAST:
     if (ins->text && strcmp(ins->text, "float32") == 0) {
       return "float32";
@@ -1260,7 +1280,7 @@ static const char *meta_result_type(MetaImage *m, const IRInstruction *ins) {
     if (ins->text && strcmp(ins->text, "float64") == 0) {
       return "float64";
     }
-    return "int64";
+    return meta_is_pointer_name(ins->text) ? "cstring" : "int64";
   case IR_OP_CALL: {
     Symbol *callee = meta_callee(m, ins);
     Type *returned = callee ? callee->data.function.return_type : NULL;
@@ -1269,6 +1289,9 @@ static const char *meta_result_type(MetaImage *m, const IRInstruction *ins) {
          returned->kind == TYPE_STRUCT || returned->kind == TYPE_STRING ||
          returned->kind == TYPE_SLICE || returned->kind == TYPE_ARRAY)) {
       return returned->name;
+    }
+    if (returned && returned->kind == TYPE_POINTER) {
+      return "cstring";
     }
     return "int64";
   }
@@ -1499,13 +1522,129 @@ static void meta_put_value(MetaImage *m, size_t base,
   free(owned);
 }
 
+static const IRInstruction *meta_producer(const IRFunction *fn,
+                                          const IRInstruction *before,
+                                          const IROperand *operand) {
+  if (operand->kind != IR_OPERAND_TEMP || !operand->name) {
+    return NULL;
+  }
+  for (const IRInstruction *at = before; at-- > fn->instructions;) {
+    if (at->dest.kind == IR_OPERAND_TEMP && at->dest.name &&
+        strcmp(at->dest.name, operand->name) == 0) {
+      return at;
+    }
+  }
+  return NULL;
+}
+
+static int meta_named_pointer_field(MetaImage *m, const IRInstruction *load,
+                                    char *out, size_t size) {
+  const IRInstruction *address = meta_producer(m->fn, load, &load->lhs);
+  long long offset = 0;
+  char spelled[320];
+  if (address && address->op == IR_OP_BINARY && address->text &&
+      strcmp(address->text, "+") == 0 && address->rhs.kind == IR_OPERAND_INT) {
+    offset = address->rhs.int_value;
+    address = meta_producer(m->fn, address, &address->lhs);
+  }
+  if (!address || address->op != IR_OP_ADDRESS_OF ||
+      address->lhs.kind != IR_OPERAND_SYMBOL || !address->lhs.name) {
+    return 0;
+  }
+  const char *declared =
+      meta_find_type(m->locals, m->local_count, address->lhs.name);
+  Type *held = declared ? type_checker_get_type_by_name(m->checker, declared)
+                        : NULL;
+  if (!held || (held->kind != TYPE_SLICE && held->kind != TYPE_STRUCT) ||
+      !held->field_offsets || held->meta_layout) {
+    return 0;
+  }
+  meta_spell_name(spelled, sizeof(spelled), address->lhs.name);
+  for (size_t f = 0; f < held->field_count; f++) {
+    if ((long long)held->field_offsets[f] == offset && held->field_types[f] &&
+        load->rhs.kind == IR_OPERAND_INT &&
+        (long long)held->field_types[f]->size == load->rhs.int_value &&
+        (held->field_types[f]->kind == TYPE_POINTER ||
+         held->field_types[f]->kind == TYPE_INT64 ||
+         held->field_types[f]->kind == TYPE_INT32 ||
+         held->field_types[f]->kind == TYPE_UINT64)) {
+      snprintf(out, size, "%s.%s", spelled, held->field_names[f]);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int meta_reads_temp(const IRInstruction *ins, const char *name) {
+  if ((ins->lhs.kind == IR_OPERAND_TEMP && ins->lhs.name &&
+       strcmp(ins->lhs.name, name) == 0) ||
+      (ins->rhs.kind == IR_OPERAND_TEMP && ins->rhs.name &&
+       strcmp(ins->rhs.name, name) == 0) ||
+      (ins->op == IR_OP_STORE && ins->dest.kind == IR_OPERAND_TEMP &&
+       ins->dest.name && strcmp(ins->dest.name, name) == 0)) {
+    return 1;
+  }
+  for (size_t a = 0; a < ins->argument_count; a++) {
+    if (ins->arguments[a].kind == IR_OPERAND_TEMP && ins->arguments[a].name &&
+        strcmp(ins->arguments[a].name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void meta_mark_named_addresses(MetaImage *m) {
+  IRFunction *fn = m->fn;
+  char named[400];
+  free(m->skip);
+  m->skip = calloc(fn->instruction_count + 1, 1);
+  if (!m->skip) {
+    return;
+  }
+  for (size_t i = fn->instruction_count; i-- > 0;) {
+    const IRInstruction *ins = &fn->instructions[i];
+    int candidate =
+        ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name &&
+        (ins->op == IR_OP_ADDRESS_OF ||
+         (ins->op == IR_OP_BINARY && ins->text && strcmp(ins->text, "+") == 0 &&
+          ins->rhs.kind == IR_OPERAND_INT));
+    if (!candidate) {
+      continue;
+    }
+    int only_named = 1;
+    int read = 0;
+    for (size_t j = i + 1; j < fn->instruction_count && only_named; j++) {
+      const IRInstruction *reader = &fn->instructions[j];
+      if (!meta_reads_temp(reader, ins->dest.name)) {
+        continue;
+      }
+      read = 1;
+      if (m->skip[j]) {
+        continue;
+      }
+      if (reader->op != IR_OP_LOAD ||
+          !meta_named_pointer_field(m, reader, named, sizeof(named))) {
+        only_named = 0;
+      }
+    }
+    if (read && only_named) {
+      m->skip[i] = 1;
+    }
+  }
+}
+
 static void meta_put_op(MetaImage *m, size_t base, const IRInstruction *ins) {
   Image *image = m->image;
   const Type *t = m->op_type;
+  char named[400];
   image_put_string(image, base + field_offset(t, "op", image),
                    ir_opcode_name(ins->op));
   image_put_string(image, base + field_offset(t, "text", image),
                    ins->text ? ins->text : "");
+  if (ins->op == IR_OP_LOAD &&
+      meta_named_pointer_field(m, ins, named, sizeof(named))) {
+    image_put_string(image, base + field_offset(t, "named_field", image), named);
+  }
   meta_put_value(m, base + field_offset(t, "dest", image), &ins->dest);
   meta_put_value(m, base + field_offset(t, "lhs", image), &ins->lhs);
   meta_put_value(m, base + field_offset(t, "rhs", image), &ins->rhs);
@@ -1588,7 +1727,7 @@ static void meta_fill_node(MetaImage *m, size_t base, const GpuSNode *node) {
     for (size_t i = block->lo; i < block->hi; i++) {
       const IRInstruction *ins = &m->fn->instructions[i];
       if (ins != block->term && ins->op != IR_OP_LABEL && ins->op != IR_OP_NOP &&
-          ins->op != IR_OP_DECLARE_LOCAL) {
+          ins->op != IR_OP_DECLARE_LOCAL && !(m->skip && m->skip[i])) {
         count++;
       }
     }
@@ -1601,7 +1740,7 @@ static void meta_fill_node(MetaImage *m, size_t base, const GpuSNode *node) {
     for (size_t i = block->lo; i < block->hi; i++) {
       const IRInstruction *ins = &m->fn->instructions[i];
       if (ins != block->term && ins->op != IR_OP_LABEL && ins->op != IR_OP_NOP &&
-          ins->op != IR_OP_DECLARE_LOCAL) {
+          ins->op != IR_OP_DECLARE_LOCAL && !(m->skip && m->skip[i])) {
         meta_put_op(m, ops + at * m->op_type->size, ins);
         at++;
       }
@@ -1735,6 +1874,7 @@ static void meta_put_function(MetaImage *m, size_t base, IRFunction *fn,
   put_slice(image, base + field_offset(t, "locals", image), locals, kept);
   size_t temps = meta_put_locals(m, m->temps, m->temp_count, &kept, -1);
   put_slice(image, base + field_offset(t, "temps", image), temps, kept);
+  meta_mark_named_addresses(m);
   if (!meta_split_blocks(m) ||
       !meta_build_cfg(m, &structure, why, sizeof(why))) {
     image_put_string(image, base + field_offset(t, "refused", image), why);

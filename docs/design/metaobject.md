@@ -110,55 +110,57 @@ What a layout means for the rest of the language:
 
 ## Allocation
 
-A `Layout` may name an allocator, a Mettle function
-`fn(bytes: int64, align: int64) -> cstring`. `new T` and `new T[n]` call it. A
-layout with no allocator uses the program's allocator.
+A `Layout` may name an allocator, `fn(bytes: int64, align: int64) -> rawptr`, which
+returns zeroed memory, and a releaser, `fn(p: rawptr)`. `new T` and `new T[n]` call
+the allocator and `free` on a `T*` calls the releaser. The compiler checks the
+allocator's signature at each `new`.
 
 ## Generators
 
 ```mettle
-@generate fn memoize(f: FunctionInfo) -> string { ... }
+@generate fn memoize(f: FunctionInfo) -> Generated { ... }
 
 @memoize fn fib(n: int64) -> int64 { ... }
 ```
 
 A generator returns Mettle source. With a decorator on a function, the compiler
-renames the original to `name__inner`, so the source can define `name` and call
-it. `grad(f)` is an ordinary call to a generator: the call site becomes the name
-of the function the source defines, which `std/meta` spells `generated_name`.
+renames the original to `f.inner_name`, so the source can define the original name
+and call it. `grad(f)` is an ordinary call to a generator: the call site becomes
+the name the `Generated` value carries.
 
-`FunctionInfo` holds the signature, the inferred effects and purity, and the body
-as a structured tree: `block`, `loop`, `if`, `br`, `return` and instructions. The
-tree comes from the lowered IR with Ramsey's dominator tree structuring, so any
-function the compiler lowered has one, and an irreducible one is refused by name.
-`std/meta` renders the tree back to Mettle.
+`FunctionInfo` holds the signature, the locals and temporaries with their types,
+every function it reaches, and the body as a structured tree: code, `if`, `loop`,
+`block`, `break`, `continue` and `return`. The tree comes from the unoptimized IR
+through the structurizer the Metal backend uses, so an irreducible function is
+refused by name. `std/meta` prints the tree back as Mettle.
 
-Parsed source runs through the type checker, borrow analysis, effects, contracts
-and the expansion ledger. Generated source carries a note naming the decorator
-that wrote it, and `mettle expand` prints it.
+Parsed source runs through the type checker, borrow analysis, effects and
+contracts like anything else. Each generated function records which decorator
+wrote it, and `mettle expand` prints that above it. Diagnostics in generated code
+point into the generated source.
 
 ## Checks on generated code
 
-A generator states what it promises by emitting a `@rule` along with its code. The
-rule calls the original and the generated function in the interpreter on probe
-inputs, so the check runs on every build under the rule budget and never reaches
-the binary. `grad` compares against finite differences, `@memoize` needs inferred
-purity and equal results, and trace needs equal results.
+A generator states what it promises by writing a `@rule` with its code. The rule
+calls the original and the generated function in the interpreter on probe inputs,
+so the check runs on every build under the rule budget and never reaches the
+binary. `grad` compares against finite differences, `@memoize` walks the call
+graph for global writes and undeclared externs and compares results, and `@trace`
+compares results.
 
-A generator that emits no rule gets `L0005` as a warning naming it, and `--explain`
-lists it among the beliefs.
+A generator that writes no rule gets `L0005` as a warning naming it.
 
 ## Dispatch
 
 A trait's vtable scheme is a generator on the trait. `@dyn trait Shape { ... }`
-emits a fat pointer type, one table per implementation and the forwarding methods
-as source. A table is a `const`, so a call through a known table folds to a direct
-call.
+writes a fat pointer type, one table per implementation and the forwarding
+functions as source. A table is a `const`, and `devirtualize_known_tables` turns a
+call through a table it can trace within a block into a direct call.
 
 ## Costs
 
-Every metafunction reports its interpreter steps and every generator the nodes it
-produced, through `--report-meta` and the budget `--meta-budget=N`.
+`--report-meta` prints the layouts, generators, source bytes, stage builds and
+interpreter steps, and `--meta-budget=N` stops the build past N steps.
 
 ## Error codes
 

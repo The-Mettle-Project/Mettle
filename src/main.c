@@ -6975,10 +6975,17 @@ static int compile_stage_monomorphize(CompileContext *ctx) {
 static int compile_stage_metaprograms(CompileContext *ctx) {
   CompilerOptions *options = ctx->options;
   compiler_set_phase(PROFILE_PHASE_MONOMORPHIZE);
-  if (!meta_stage_run(ctx->program, ctx->error_reporter, ctx->input_filename,
-                      ctx->source, mtlc_target()->triple,
-                      options->meta_budget_set ? options->meta_budget : 0,
-                      &ctx->meta_report)) {
+  type_checker_set_launch_report(0);
+  type_checker_set_gpu_type_report(0);
+  int ran = meta_stage_run(ctx->program, ctx->error_reporter,
+                           ctx->input_filename, ctx->source,
+                           mtlc_target()->triple,
+                           options->meta_budget_set ? options->meta_budget : 0,
+                           &ctx->meta_report);
+  type_checker_set_launch_report(options->report_launches);
+  type_checker_set_gpu_type_report(options->report_gpu_types || options->explain ||
+                                   options->explain_all);
+  if (!ran) {
     error_reporter_print_errors(ctx->error_reporter);
     return 1;
   }
