@@ -18,3 +18,4 @@ floatcalc 35
 floatfn 110
 castvalue 63
 tagged 127
+indirect_float 103

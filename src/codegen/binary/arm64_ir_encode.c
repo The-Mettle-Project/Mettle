@@ -718,6 +718,13 @@ static int prog_fn_index(const IRProgram *prog, const char *name) {
   return -1;
 }
 
+static int cast_target_float_bits(const IRInstruction *in) {
+  if (in->dest.float_bits != 0) {
+    return in->dest.float_bits;
+  }
+  return type_text_is_float_scalar(in->text) ? type_text_float_bits(in->text) : 0;
+}
+
 static void build_float_set(const IRFunction *fn, const IRProgram *prog,
                             const int *retf, StrSet *fs) {
   for (size_t i = 0; prog && i < prog->module_symbol_count; i++) {
@@ -766,15 +773,20 @@ static void build_float_set(const IRFunction *fn, const IRProgram *prog,
         }
         break;
       case IR_OP_CAST:
-        if (in->dest.float_bits != 0)
-          set_add_bits(fs, in->dest.name, in->dest.float_bits);
+        if (cast_target_float_bits(in) != 0)
+          set_add_bits(fs, in->dest.name, cast_target_float_bits(in));
         break;
       case IR_OP_ASSIGN:
         if (operand_is_float(fs, &in->lhs))
           set_add_bits(fs, in->dest.name, operand_float_bits(fs, &in->lhs));
         break;
-      case IR_OP_CALL:
-      case IR_OP_CALL_INDIRECT: {
+      case IR_OP_CALL_INDIRECT:
+        if (in->value_type && mtlc_type_is_float(in->value_type)) {
+          set_add_bits(fs, in->dest.name,
+                       in->value_type->kind == MTLC_TYPE_FLOAT32 ? 32 : 64);
+        }
+        break;
+      case IR_OP_CALL: {
         const IRModuleSymbol *callee = module_function(prog, in->text);
         int ci = retf ? prog_fn_index(prog, in->text) : -1;
         if ((callee && mtlc_type_is_float(callee->return_type)) ||
@@ -1391,6 +1403,9 @@ static int call_arg_float_bits(const IRProgram *program,
 
 static int call_returns_float(const IRProgram *program,
                               const IRInstruction *call, const int *retf) {
+  if (call->op == IR_OP_CALL_INDIRECT) {
+    return call->value_type && mtlc_type_is_float(call->value_type);
+  }
   const IRModuleSymbol *callee = module_function(program, call->text);
   if (callee && callee->return_type) {
     return mtlc_type_is_float(callee->return_type);
@@ -1401,6 +1416,9 @@ static int call_returns_float(const IRProgram *program,
 
 static int call_return_float_bits(const IRProgram *program,
                                   const IRInstruction *call) {
+  if (call->op == IR_OP_CALL_INDIRECT && call->value_type) {
+    return call->value_type->kind == MTLC_TYPE_FLOAT32 ? 32 : 64;
+  }
   const IRModuleSymbol *callee = module_function(program, call->text);
   if (callee && callee->return_type) {
     return callee->return_type->kind == MTLC_TYPE_FLOAT32 ? 32 : 64;
@@ -2006,7 +2024,8 @@ static int encode_cast_instruction(const Arm64Scope *scope,
   switch (in->op) {
   case IR_OP_CAST: {
     int srcf = in->is_float;
-    int dstf = in->dest.float_bits != 0;
+    int dst_bits = cast_target_float_bits(in);
+    int dstf = dst_bits != 0;
     if (srcf && !dstf) {
       int d = operand_float_bits(fs, &in->lhs) != 32;
       int to_u64 = in->text && strcmp(in->text, "uint64") == 0;
@@ -2016,7 +2035,7 @@ static int encode_cast_instruction(const Arm64Scope *scope,
                                 : arm64_fcvtzs(d, R_RES, 0));
       store_dest(e, slots, &in->dest, R_RES);
     } else if (!srcf && dstf) {
-      int d = in->dest.float_bits != 32;
+      int d = dst_bits != 32;
       Arm64Reg src = load_into(e, slots, &in->lhs, R_LHS);
       arm64_emit_word(e, in->is_unsigned ? arm64_ucvtf(d, 0, src)
                                          : arm64_scvtf(d, 0, src));
@@ -2037,7 +2056,7 @@ static int encode_cast_instruction(const Arm64Scope *scope,
       store_dest(e, slots, &in->dest, R_RHS);
     } else if (srcf && dstf) {
       int sd = operand_float_bits(fs, &in->lhs) != 32;
-      int dd = in->dest.float_bits != 32;
+      int dd = dst_bits != 32;
       arm64_emit_word(e, arm64_fmov_gp(sd, 0, load_into(e, slots, &in->lhs,
                                                         R_LHS)));
       if (sd != dd) {
