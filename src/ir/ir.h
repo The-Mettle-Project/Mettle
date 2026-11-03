@@ -216,6 +216,7 @@ typedef struct {
   void *ast_ref;
   MtlcType *value_type;
   unsigned char alias_class;
+  unsigned char column_base;
   const char *expansion_note;
   const char *effect_signature;
 } IRInstruction;

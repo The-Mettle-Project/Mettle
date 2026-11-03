@@ -1,4 +1,5 @@
 #include "rule_reflect.h"
+#include "../codegen/gpu_structure.h"
 #include "../ir/ir_machine.h"
 #include "../ir/ir_trace.h"
 #include "import_resolver.h"
@@ -1133,6 +1134,701 @@ static int build_image(Reflect *reflect, const char *root_file,
   out->pointer_count = image.pointer_count;
   out->function_count = reflect->function_count;
   out->type_count = reflect->type_count;
+  return 1;
+}
+
+IRFunction *ir_program_find_function(IRProgram *program, const char *name);
+
+typedef struct {
+  char *name;
+  const char *type;
+  int is_parameter;
+} MetaLocal;
+
+typedef struct {
+  size_t lo;
+  size_t hi;
+  const IRInstruction *term;
+} MetaBlock;
+
+typedef struct {
+  Image *image;
+  TypeChecker *checker;
+  IRProgram *ir;
+  const Type *value_type;
+  const Type *op_type;
+  const Type *node_type;
+  const Type *local_type;
+  const Type *function_type;
+  const Type *site_type;
+  IRFunction *fn;
+  MetaLocal *locals;
+  size_t local_count;
+  MetaLocal *temps;
+  size_t temp_count;
+  MetaBlock *blocks;
+  size_t block_count;
+} MetaImage;
+
+static const char *meta_find_type(const MetaLocal *entries, size_t count,
+                                  const char *name) {
+  for (size_t i = 0; i < count; i++) {
+    if (strcmp(entries[i].name, name) == 0) {
+      return entries[i].type;
+    }
+  }
+  return NULL;
+}
+
+static int meta_add_entry(MetaLocal **entries, size_t *count, const char *name,
+                          const char *type, int is_parameter) {
+  if (meta_find_type(*entries, *count, name)) {
+    return 1;
+  }
+  MetaLocal *grown = realloc(*entries, (*count + 1) * sizeof(MetaLocal));
+  if (!grown) {
+    return 0;
+  }
+  *entries = grown;
+  (*entries)[*count].name = strdup(name);
+  (*entries)[*count].type = type;
+  (*entries)[*count].is_parameter = is_parameter;
+  (*count)++;
+  return 1;
+}
+
+static const char *meta_float_name(int bits) {
+  return bits == 32 ? "float32" : "float64";
+}
+
+static const char *meta_operand_type(MetaImage *m, const IROperand *operand) {
+  const char *type = NULL;
+  switch (operand->kind) {
+  case IR_OPERAND_INT:
+    return "int64";
+  case IR_OPERAND_FLOAT:
+    return meta_float_name(operand->float_bits);
+  case IR_OPERAND_STRING:
+    return "string";
+  case IR_OPERAND_TEMP:
+    type = operand->name
+               ? meta_find_type(m->temps, m->temp_count, operand->name)
+               : NULL;
+    return type ? type : "int64";
+  case IR_OPERAND_SYMBOL:
+    type = operand->name
+               ? meta_find_type(m->locals, m->local_count, operand->name)
+               : NULL;
+    if (!type && operand->name) {
+      Symbol *symbol =
+          symbol_table_lookup(m->checker->symbol_table, operand->name);
+      if (symbol && symbol->type && symbol->type->name &&
+          symbol->kind != SYMBOL_FUNCTION) {
+        return symbol->type->name;
+      }
+    }
+    return type ? type : "int64";
+  default:
+    return "int64";
+  }
+}
+
+static Symbol *meta_callee(MetaImage *m, const IRInstruction *call) {
+  Symbol *symbol =
+      call->text ? symbol_table_lookup(m->checker->symbol_table, call->text)
+                 : NULL;
+  return symbol && symbol->kind == SYMBOL_FUNCTION ? symbol : NULL;
+}
+
+static const char *meta_result_type(MetaImage *m, const IRInstruction *ins) {
+  switch (ins->op) {
+  case IR_OP_BINARY:
+  case IR_OP_UNARY:
+    if (ins->is_float && ins->text && ins->text[0] != '<' &&
+        ins->text[0] != '>' && ins->text[0] != '=' && ins->text[0] != '!') {
+      return meta_float_name(ins->float_bits);
+    }
+    return "int64";
+  case IR_OP_LOAD:
+    return ins->is_float ? meta_float_name(ins->float_bits) : "int64";
+  case IR_OP_CAST:
+    if (ins->text && strcmp(ins->text, "float32") == 0) {
+      return "float32";
+    }
+    if (ins->text && strcmp(ins->text, "float64") == 0) {
+      return "float64";
+    }
+    return "int64";
+  case IR_OP_CALL: {
+    Symbol *callee = meta_callee(m, ins);
+    Type *returned = callee ? callee->data.function.return_type : NULL;
+    if (returned && returned->name &&
+        (returned->kind == TYPE_FLOAT32 || returned->kind == TYPE_FLOAT64 ||
+         returned->kind == TYPE_STRUCT || returned->kind == TYPE_STRING ||
+         returned->kind == TYPE_SLICE || returned->kind == TYPE_ARRAY)) {
+      return returned->name;
+    }
+    return "int64";
+  }
+  case IR_OP_ASSIGN:
+    return meta_operand_type(m, &ins->lhs);
+  default:
+    return "int64";
+  }
+}
+
+static int meta_is_terminator(IROpcode op) {
+  return op == IR_OP_JUMP || op == IR_OP_BRANCH_ZERO ||
+         op == IR_OP_BRANCH_EQ || op == IR_OP_RETURN;
+}
+
+static int meta_split_blocks(MetaImage *m) {
+  IRFunction *fn = m->fn;
+  size_t count = fn->instruction_count;
+  size_t *starts = calloc(count + 2, sizeof(size_t));
+  size_t start_count = 0;
+  if (!starts) {
+    return 0;
+  }
+  starts[start_count++] = 0;
+  for (size_t i = 0; i < count; i++) {
+    IROpcode op = fn->instructions[i].op;
+    if (op == IR_OP_LABEL && starts[start_count - 1] != i) {
+      starts[start_count++] = i;
+    }
+    if (meta_is_terminator(op) && i + 1 < count &&
+        starts[start_count - 1] != i + 1) {
+      starts[start_count++] = i + 1;
+    }
+  }
+  m->blocks = calloc(start_count + 1, sizeof(MetaBlock));
+  m->block_count = 0;
+  if (!m->blocks) {
+    free(starts);
+    return 0;
+  }
+  for (size_t k = 0; k < start_count; k++) {
+    size_t lo = starts[k];
+    size_t hi = k + 1 < start_count ? starts[k + 1] : count;
+    if (lo >= hi) {
+      continue;
+    }
+    MetaBlock *block = &m->blocks[m->block_count++];
+    block->lo = lo;
+    block->hi = hi;
+    block->term = meta_is_terminator(fn->instructions[hi - 1].op)
+                      ? &fn->instructions[hi - 1]
+                      : NULL;
+  }
+  if (m->block_count == 0) {
+    m->block_count = 1;
+  }
+  free(starts);
+  return 1;
+}
+
+static long meta_block_of_label(const MetaImage *m, const char *label) {
+  for (size_t b = 0; b < m->block_count; b++) {
+    const IRInstruction *first = &m->fn->instructions[m->blocks[b].lo];
+    if (m->blocks[b].hi > m->blocks[b].lo && first->op == IR_OP_LABEL &&
+        first->text && label && strcmp(first->text, label) == 0) {
+      return (long)b;
+    }
+  }
+  return -1;
+}
+
+static int meta_build_cfg(MetaImage *m, GpuStructure *structure, char *why,
+                          size_t why_size) {
+  GpuCfgNode *cfg = calloc(m->block_count + 1, sizeof(GpuCfgNode));
+  int ok;
+  if (!cfg) {
+    return 0;
+  }
+  for (size_t b = 0; b < m->block_count; b++) {
+    const IRInstruction *term = m->blocks[b].term;
+    size_t next = b + 1;
+    if (term && term->op == IR_OP_RETURN) {
+      cfg[b].exit = GPU_CFG_RETURN;
+    } else if (term) {
+      long target = meta_block_of_label(m, term->text);
+      if (target < 0) {
+        snprintf(why, why_size, "a jump goes to the unknown label '%s'",
+                 term->text ? term->text : "?");
+        free(cfg);
+        return 0;
+      }
+      if (term->op == IR_OP_JUMP || next >= m->block_count) {
+        cfg[b].exit = GPU_CFG_JUMP;
+        cfg[b].target[0] = cfg[b].target[1] = (size_t)target;
+      } else {
+        cfg[b].exit = GPU_CFG_BRANCH;
+        cfg[b].target[0] = (size_t)target;
+        cfg[b].target[1] = next;
+      }
+    } else if (next < m->block_count) {
+      cfg[b].exit = GPU_CFG_JUMP;
+      cfg[b].target[0] = cfg[b].target[1] = next;
+    } else {
+      cfg[b].exit = GPU_CFG_RETURN;
+    }
+  }
+  ok = gpu_structure_build(cfg, m->block_count, 0, structure, why, why_size);
+  free(cfg);
+  return ok;
+}
+
+static void meta_spell_name(char *out, size_t size, const char *name) {
+  size_t used = (size_t)snprintf(out, size, "v_");
+  for (const char *p = name ? name : ""; *p && used + 1 < size; p++) {
+    char c = *p;
+    int plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_';
+    out[used++] = plain ? c : '_';
+  }
+  out[used] = '\0';
+}
+
+static char *meta_spell_string(const char *text) {
+  size_t length = text ? strlen(text) : 0;
+  char *out = malloc(length * 4 + 3);
+  size_t used = 0;
+  if (!out) {
+    return NULL;
+  }
+  out[used++] = '"';
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)text[i];
+    if (c == '"' || c == '\\' || c == '{' || c == '}') {
+      out[used++] = '\\';
+      out[used++] = (char)c;
+    } else if (c == '\n') {
+      out[used++] = '\\';
+      out[used++] = 'n';
+    } else if (c == '\t') {
+      out[used++] = '\\';
+      out[used++] = 't';
+    } else {
+      out[used++] = (char)c;
+    }
+  }
+  out[used++] = '"';
+  out[used] = '\0';
+  return out;
+}
+
+static void meta_put_value(MetaImage *m, size_t base,
+                           const IROperand *operand) {
+  Image *image = m->image;
+  const Type *t = m->value_type;
+  char spelled[320];
+  long long kind = 0;
+  const char *text = "";
+  char *owned = NULL;
+  switch (operand->kind) {
+  case IR_OPERAND_TEMP:
+    kind = 1;
+    meta_spell_name(spelled, sizeof(spelled), operand->name);
+    text = spelled;
+    break;
+  case IR_OPERAND_SYMBOL:
+    if (operand->name &&
+        meta_find_type(m->locals, m->local_count, operand->name)) {
+      kind = 2;
+      meta_spell_name(spelled, sizeof(spelled), operand->name);
+      text = spelled;
+    } else {
+      kind = 6;
+      text = operand->name ? operand->name : "";
+    }
+    break;
+  case IR_OPERAND_INT:
+    kind = 3;
+    snprintf(spelled, sizeof(spelled), "%lld", operand->int_value);
+    text = spelled;
+    break;
+  case IR_OPERAND_FLOAT:
+    kind = 4;
+    snprintf(spelled, sizeof(spelled), "%.17g", operand->float_value);
+    if (!strchr(spelled, '.') && !strchr(spelled, 'e') &&
+        !strchr(spelled, 'n')) {
+      size_t digits = strlen(spelled);
+      spelled[digits] = '.';
+      spelled[digits + 1] = '0';
+      spelled[digits + 2] = '\0';
+    }
+    text = spelled;
+    break;
+  case IR_OPERAND_STRING:
+    kind = 5;
+    owned = meta_spell_string(operand->name);
+    text = owned ? owned : "\"\"";
+    break;
+  default:
+    break;
+  }
+  image_put_u64(image, base + field_offset(t, "kind", image),
+                (unsigned long long)kind);
+  image_put_string(image, base + field_offset(t, "text", image), text);
+  const char *type_name = meta_operand_type(m, operand);
+  image_put_string(image, base + field_offset(t, "type_name", image),
+                   type_name);
+  if (kind == 1 || kind == 2 || kind == 6) {
+    Type *held = type_checker_get_type_by_name(m->checker, type_name);
+    image_put_bool(image, base + field_offset(t, "is_aggregate", image),
+                   held && (held->kind == TYPE_STRUCT ||
+                            held->kind == TYPE_STRING ||
+                            held->kind == TYPE_SLICE ||
+                            held->kind == TYPE_ARRAY ||
+                            held->kind == TYPE_TAGGED_ENUM));
+  }
+  free(owned);
+}
+
+static void meta_put_op(MetaImage *m, size_t base, const IRInstruction *ins) {
+  Image *image = m->image;
+  const Type *t = m->op_type;
+  image_put_string(image, base + field_offset(t, "op", image),
+                   ir_opcode_name(ins->op));
+  image_put_string(image, base + field_offset(t, "text", image),
+                   ins->text ? ins->text : "");
+  meta_put_value(m, base + field_offset(t, "dest", image), &ins->dest);
+  meta_put_value(m, base + field_offset(t, "lhs", image), &ins->lhs);
+  meta_put_value(m, base + field_offset(t, "rhs", image), &ins->rhs);
+  image_put_bool(image, base + field_offset(t, "is_float", image),
+                 ins->is_float);
+  image_put_u64(image, base + field_offset(t, "float_bits", image),
+                (unsigned long long)ins->float_bits);
+  image_put_bool(image, base + field_offset(t, "is_unsigned", image),
+                 ins->is_unsigned);
+  image_put_u64(image, base + field_offset(t, "line", image),
+                (unsigned long long)ins->location.line);
+  if (ins->argument_count > 0) {
+    size_t args = image_reserve(image, m->value_type->size * ins->argument_count,
+                                m->value_type->alignment);
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      meta_put_value(m, args + a * m->value_type->size, &ins->arguments[a]);
+    }
+    put_slice(image, base + field_offset(t, "args", image), args,
+              ins->argument_count);
+    Symbol *callee = ins->op == IR_OP_CALL ? meta_callee(m, ins) : NULL;
+    if (callee && callee->data.function.parameter_types &&
+        callee->data.function.parameter_count == ins->argument_count) {
+      const char **names = calloc(ins->argument_count, sizeof(char *));
+      if (names) {
+        for (size_t a = 0; a < ins->argument_count; a++) {
+          Type *param = callee->data.function.parameter_types[a];
+          names[a] = param && param->name ? param->name : "int64";
+        }
+        size_t types = put_string_array(image, names, ins->argument_count);
+        put_slice(image, base + field_offset(t, "arg_types", image), types,
+                  ins->argument_count);
+        free(names);
+      }
+    }
+  }
+}
+
+static size_t meta_put_node(MetaImage *m, const GpuSNode *node);
+static void meta_fill_node(MetaImage *m, size_t base, const GpuSNode *node);
+
+static void meta_put_child(MetaImage *m, size_t base, const char *field,
+                           const GpuSNode *child) {
+  if (!child) {
+    return;
+  }
+  size_t at = meta_put_node(m, child);
+  put_slice(m->image, base + field_offset(m->node_type, field, m->image), at, 1);
+}
+
+static size_t meta_put_node(MetaImage *m, const GpuSNode *node) {
+  size_t base = image_reserve(m->image, m->node_type->size,
+                              m->node_type->alignment);
+  meta_fill_node(m, base, node);
+  return base;
+}
+
+static void meta_fill_node(MetaImage *m, size_t base, const GpuSNode *node) {
+  Image *image = m->image;
+  const Type *t = m->node_type;
+  image_put_u64(image, base + field_offset(t, "kind", image),
+                (unsigned long long)node->kind);
+  image_put_u64(image, base + field_offset(t, "value", image),
+                (unsigned long long)(long long)node->value);
+  switch (node->kind) {
+  case GPU_SNODE_SEQ: {
+    if (node->child_count == 0) {
+      break;
+    }
+    size_t array = image_reserve(image, t->size * node->child_count, t->alignment);
+    for (size_t i = 0; i < node->child_count; i++) {
+      meta_fill_node(m, array + i * t->size, node->children[i]);
+    }
+    put_slice(image, base + field_offset(t, "children", image), array,
+              node->child_count);
+    break;
+  }
+  case GPU_SNODE_CODE: {
+    const MetaBlock *block = &m->blocks[node->block];
+    size_t count = 0;
+    for (size_t i = block->lo; i < block->hi; i++) {
+      const IRInstruction *ins = &m->fn->instructions[i];
+      if (ins != block->term && ins->op != IR_OP_LABEL && ins->op != IR_OP_NOP &&
+          ins->op != IR_OP_DECLARE_LOCAL) {
+        count++;
+      }
+    }
+    if (count == 0) {
+      break;
+    }
+    size_t ops = image_reserve(image, m->op_type->size * count,
+                               m->op_type->alignment);
+    size_t at = 0;
+    for (size_t i = block->lo; i < block->hi; i++) {
+      const IRInstruction *ins = &m->fn->instructions[i];
+      if (ins != block->term && ins->op != IR_OP_LABEL && ins->op != IR_OP_NOP &&
+          ins->op != IR_OP_DECLARE_LOCAL) {
+        meta_put_op(m, ops + at * m->op_type->size, ins);
+        at++;
+      }
+    }
+    put_slice(image, base + field_offset(t, "ops", image), ops, count);
+    break;
+  }
+  case GPU_SNODE_IF: {
+    const IRInstruction *term = m->blocks[node->block].term;
+    if (term) {
+      meta_put_op(m, base + field_offset(t, "condition", image), term);
+    }
+    meta_put_child(m, base, "then_body", node->then_node);
+    meta_put_child(m, base, "else_body", node->else_node);
+    break;
+  }
+  case GPU_SNODE_LOOP:
+  case GPU_SNODE_BLOCK:
+    meta_put_child(m, base, "body", node->body);
+    break;
+  case GPU_SNODE_RETURN: {
+    const IRInstruction *term = m->blocks[node->block].term;
+    if (term && term->op == IR_OP_RETURN) {
+      meta_put_value(m, base + field_offset(t, "returned", image), &term->lhs);
+    }
+    break;
+  }
+  case GPU_SNODE_CHECK:
+    if (node->case_count > 0) {
+      size_t values = image_reserve(image, 8 * node->case_count, 8);
+      size_t actions = image_reserve(image, 8 * node->case_count, 8);
+      for (size_t c = 0; c < node->case_count; c++) {
+        image_put_u64(image, values + c * 8,
+                      (unsigned long long)(long long)node->cases[c].value);
+        image_put_u64(image, actions + c * 8,
+                      (unsigned long long)node->cases[c].action);
+      }
+      put_slice(image, base + field_offset(t, "case_values", image), values,
+                node->case_count);
+      put_slice(image, base + field_offset(t, "case_actions", image), actions,
+                node->case_count);
+    }
+    break;
+  default:
+    break;
+  }
+}
+
+static size_t meta_put_locals(MetaImage *m, const MetaLocal *entries,
+                              size_t count, size_t *out_kept, int parameters) {
+  Image *image = m->image;
+  size_t kept = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (parameters < 0 || entries[i].is_parameter == parameters) {
+      kept++;
+    }
+  }
+  *out_kept = kept;
+  if (kept == 0) {
+    return 0;
+  }
+  size_t array = image_reserve(image, m->local_type->size * kept,
+                               m->local_type->alignment);
+  size_t at = 0;
+  for (size_t i = 0; i < count; i++) {
+    char spelled[320];
+    size_t base;
+    if (parameters >= 0 && entries[i].is_parameter != parameters) {
+      continue;
+    }
+    base = array + at * m->local_type->size;
+    meta_spell_name(spelled, sizeof(spelled), entries[i].name);
+    image_put_string(image, base + field_offset(m->local_type, "name", image),
+                     spelled);
+    image_put_string(image,
+                     base + field_offset(m->local_type, "source_name", image),
+                     entries[i].name);
+    image_put_string(image, base + field_offset(m->local_type, "type_name", image),
+                     entries[i].type);
+    at++;
+  }
+  return array;
+}
+
+static void meta_put_function(MetaImage *m, size_t base, IRFunction *fn,
+                              const char *inner_name) {
+  Image *image = m->image;
+  const Type *t = m->function_type;
+  char why[400];
+  GpuStructure structure;
+  m->fn = fn;
+  m->locals = NULL;
+  m->local_count = 0;
+  m->temps = NULL;
+  m->temp_count = 0;
+  memset(&structure, 0, sizeof(structure));
+  image_put_string(image, base + field_offset(t, "name", image),
+                   strip_import_prefix(fn->name));
+  image_put_string(image, base + field_offset(t, "ir_name", image), fn->name);
+  image_put_string(image, base + field_offset(t, "inner_name", image),
+                   inner_name ? inner_name : "");
+  image_put_string(image, base + field_offset(t, "return_type", image),
+                   fn->return_type_name ? fn->return_type_name : "void");
+  image_put_bool(image, base + field_offset(t, "is_pure_declared", image),
+                 fn->is_pure);
+  put_site(image, m->site_type, base + field_offset(t, "site", image),
+           &(IRRuleSite){fn->location.filename, fn->location.line,
+                         fn->location.column});
+  for (size_t p = 0; p < fn->parameter_count; p++) {
+    meta_add_entry(&m->locals, &m->local_count, fn->parameter_names[p],
+                   fn->parameter_types[p], 1);
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *ins = &fn->instructions[i];
+    if (ins->op == IR_OP_DECLARE_LOCAL && ins->dest.name) {
+      meta_add_entry(&m->locals, &m->local_count, ins->dest.name,
+                     ins->text ? ins->text : "int64", 0);
+    }
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *ins = &fn->instructions[i];
+    if (ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name) {
+      meta_add_entry(&m->temps, &m->temp_count, ins->dest.name,
+                     meta_result_type(m, ins), 0);
+    }
+  }
+  size_t kept = 0;
+  size_t params = meta_put_locals(m, m->locals, m->local_count, &kept, 1);
+  put_slice(image, base + field_offset(t, "params", image), params, kept);
+  size_t locals = meta_put_locals(m, m->locals, m->local_count, &kept, 0);
+  put_slice(image, base + field_offset(t, "locals", image), locals, kept);
+  size_t temps = meta_put_locals(m, m->temps, m->temp_count, &kept, -1);
+  put_slice(image, base + field_offset(t, "temps", image), temps, kept);
+  if (!meta_split_blocks(m) ||
+      !meta_build_cfg(m, &structure, why, sizeof(why))) {
+    image_put_string(image, base + field_offset(t, "refused", image), why);
+    return;
+  }
+  size_t body = meta_put_node(m, structure.root);
+  put_slice(image, base + field_offset(t, "body", image), body, 1);
+  image_put_bool(image, base + field_offset(t, "uses_exit", image),
+                 structure.uses_exit);
+}
+
+static void meta_collect_reached(IRProgram *ir, IRFunction *fn,
+                                 IRFunction ***out, size_t *count) {
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *ins = &fn->instructions[i];
+    int seen = 0;
+    if (ins->op != IR_OP_CALL || !ins->text) {
+      continue;
+    }
+    IRFunction *callee = ir_program_find_function(ir, ins->text);
+    if (!callee || callee == fn) {
+      continue;
+    }
+    for (size_t k = 0; k < *count; k++) {
+      if ((*out)[k] == callee) {
+        seen = 1;
+      }
+    }
+    if (seen) {
+      continue;
+    }
+    IRFunction **grown = realloc(*out, (*count + 1) * sizeof(IRFunction *));
+    if (!grown) {
+      return;
+    }
+    *out = grown;
+    (*out)[(*count)++] = callee;
+    meta_collect_reached(ir, callee, out, count);
+  }
+}
+
+int rule_reflect_build_function(TypeChecker *checker, IRProgram *ir,
+                                const char *name, const char *inner_name,
+                                IRRuleImage *out, char **error_message) {
+  MetaImage m;
+  Image image;
+  memset(&m, 0, sizeof(m));
+  memset(&image, 0, sizeof(image));
+  memset(out, 0, sizeof(*out));
+  m.image = &image;
+  m.checker = checker;
+  m.ir = ir;
+  m.value_type = lookup_qualified(checker, "std/meta.IRValue");
+  m.op_type = lookup_qualified(checker, "std/meta.IROp");
+  m.node_type = lookup_qualified(checker, "std/meta.IRNode");
+  m.local_type = lookup_qualified(checker, "std/meta.LocalInfo");
+  m.function_type = lookup_qualified(checker, "std/meta.FunctionInfo");
+  m.site_type = lookup_qualified(checker, "std/rule.Site");
+  if (!m.value_type || !m.op_type || !m.node_type || !m.local_type ||
+      !m.function_type || !m.site_type) {
+    *error_message = strdup("a generator needs 'import \"std/meta\";'");
+    return 0;
+  }
+  IRFunction *fn = ir_program_find_function(ir, name);
+  if (!fn) {
+    char message[300];
+    snprintf(message, sizeof(message),
+             "'%s' has no body for a generator to read", name);
+    *error_message = strdup(message);
+    return 0;
+  }
+  size_t root = image_reserve(&image, m.function_type->size,
+                              m.function_type->alignment);
+  meta_put_function(&m, root, fn, inner_name);
+  IRFunction **reached = NULL;
+  size_t reached_count = 0;
+  meta_collect_reached(ir, fn, &reached, &reached_count);
+  if (reached_count > 0) {
+    size_t array = image_reserve(&image, m.function_type->size * reached_count,
+                                 m.function_type->alignment);
+    for (size_t r = 0; r < reached_count; r++) {
+      meta_put_function(&m, array + r * m.function_type->size, reached[r], NULL);
+    }
+    put_slice(&image, root + field_offset(m.function_type, "reached", &image),
+              array, reached_count);
+  }
+  free(reached);
+  size_t pool_base = image_reserve(&image, image.pool_size, 8);
+  if (!image.failed && image.pool_size > 0) {
+    memcpy(image.bytes + pool_base, image.pool, image.pool_size);
+  }
+  for (size_t i = 0; i < image.string_count && !image.failed; i++) {
+    image_put_pointer(&image, image.string_fields[i],
+                      pool_base + image.string_offsets[i]);
+  }
+  free(image.pool);
+  free(image.string_fields);
+  free(image.string_offsets);
+  if (image.failed) {
+    free(image.bytes);
+    free(image.pointers);
+    *error_message = strdup("could not lay out the function a generator reads");
+    return 0;
+  }
+  out->bytes = image.bytes;
+  out->size = image.size;
+  out->pointer_offsets = image.pointers;
+  out->pointer_count = image.pointer_count;
   return 1;
 }
 

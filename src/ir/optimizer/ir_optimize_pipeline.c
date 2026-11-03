@@ -96,6 +96,7 @@ static const IROptNamedPass g_ir_loop_canonical_passes[] = {
     {"hoist_descriptor_loads", ir_hoist_descriptor_loads_pass,
      {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
     {"hoist_load_bases", ir_hoist_load_bases_pass, IR_GATE_LOOP},
+    {"hoist_column_bases", ir_hoist_column_bases_pass, IR_GATE_LOOP},
     {"hoist_dead_temps", ir_eliminate_dead_temp_writes_pass,
      {IR_OPT_REQUIRE_NONE, IR_OPT_REQUIRE_NONE}},
     {"hoist_invariant_assigns", ir_hoist_invariant_assigns_pass, IR_GATE_LOOP},
@@ -105,6 +106,11 @@ static const IROptNamedPass g_ir_loop_canonical_passes[] = {
 };
 
 static const IROptNamedPass g_ir_recognizer_passes[] = {
+    {"simd_sum_i32", ir_simd_sum_i32_pass, IR_GATE_LOOP_LOAD},
+    {"simd_sum_u8", ir_simd_sum_u8_pass, IR_GATE_LOOP_LOAD},
+    {"simd_byte_map", ir_simd_byte_map_pass, IR_GATE_LOOP_LOAD},
+    {"simd_dot_i32", ir_simd_dot_i32_pass, IR_GATE_LOOP_LOAD},
+    {"simd_dot_i8", ir_simd_dot_i8_pass, IR_GATE_LOOP_LOAD},
     {"simd_minmax_reduce", ir_simd_minmax_reduce_pass, IR_GATE_LOOP_LOAD},
     {"induction_pointer", ir_pointer_induction_pass, IR_GATE_LOOP},
     {"simd_fill", ir_simd_fill_pass, IR_GATE_LOOP},

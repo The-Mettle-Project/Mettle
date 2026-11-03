@@ -532,6 +532,104 @@ static size_t *ir_lbase_collect_candidates(const IRFunction *function,
   return cand;
 }
 
+static int ir_column_operand_invariant(const IRFunction *function, size_t header,
+                                       size_t latch, const IROperand *operand) {
+  if (operand->kind == IR_OPERAND_INT) {
+    return 1;
+  }
+  if (!operand->name) {
+    return 0;
+  }
+  for (size_t i = header; i <= latch; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->dest.name && strcmp(ins->dest.name, operand->name) == 0 &&
+        ins->dest.kind == operand->kind) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+int ir_hoist_column_bases_pass(IRFunction *function, int *changed) {
+  static int g_column_base_counter;
+  if (!function) {
+    return 0;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    const IRInstruction *label = &function->instructions[header];
+    size_t latch;
+    if (label->op != IR_OP_LABEL ||
+        !ir_cleanup_label_is_loop_header(label->text)) {
+      continue;
+    }
+    latch = ir_cleanup_loop_latch(function, header, label->text);
+    if (!latch) {
+      continue;
+    }
+    for (size_t i = header + 1; i < latch; i++) {
+      IRInstruction moved = {0};
+      char temp[128];
+      unsigned char mark = function->instructions[i].column_base;
+      if (!mark || function->instructions[i].op != IR_OP_BINARY ||
+          !ir_column_operand_invariant(function, header, latch,
+                                       &function->instructions[i].lhs) ||
+          !ir_column_operand_invariant(function, header, latch,
+                                       &function->instructions[i].rhs)) {
+        continue;
+      }
+      if (!ir_clone_instruction_plain(&function->instructions[i], &moved)) {
+        return 0;
+      }
+      snprintf(temp, sizeof(temp), "%s",
+               moved.dest.name ? moved.dest.name : "");
+      ir_instruction_make_nop(&function->instructions[i]);
+      if (!ir_function_insert_instruction(function, header, &moved)) {
+        ir_instruction_destroy_storage(&moved);
+        return 0;
+      }
+      ir_instruction_destroy_storage(&moved);
+      header++;
+      i++;
+      latch++;
+      if (changed) {
+        *changed = 1;
+      }
+      if (mark == 2 && temp[0]) {
+        const char *ptr_type =
+            ir_hoist_base_pointer_type(function, header, latch, temp);
+        char base_name[64];
+        IRInstruction decl = {0};
+        IRInstruction init = {0};
+        if (!ptr_type) {
+          continue;
+        }
+        snprintf(base_name, sizeof(base_name), "__cbase_%d",
+                 g_column_base_counter++);
+        decl.op = IR_OP_DECLARE_LOCAL;
+        decl.dest = ir_operand_symbol(base_name);
+        decl.text = mettle_strdup(ptr_type);
+        init.op = IR_OP_ASSIGN;
+        init.dest = ir_operand_symbol(base_name);
+        init.lhs = ir_operand_temp(temp);
+        if (!decl.dest.name || !decl.text || !init.dest.name || !init.lhs.name ||
+            !ir_function_insert_instruction(function, header, &decl) ||
+            !ir_function_insert_instruction(function, header + 1, &init)) {
+          ir_instruction_destroy_storage(&decl);
+          ir_instruction_destroy_storage(&init);
+          return 0;
+        }
+        ir_instruction_destroy_storage(&decl);
+        ir_instruction_destroy_storage(&init);
+        header += 2;
+        i += 2;
+        latch += 2;
+        ir_hoist_rename_temp_reads(function, header, latch, temp, base_name);
+      }
+    }
+  }
+  return 1;
+}
+
 int ir_hoist_load_bases_pass(IRFunction *function, int *changed) {
   static int g_load_base_counter;
   if (!function) {

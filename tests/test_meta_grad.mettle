@@ -1,0 +1,82 @@
+import "std/io";
+import "std/math";
+import "std/meta";
+
+fn loss(x: float64, y: float64) -> float64 {
+  return x * x * y + sin(y) / (1.0 + x * x);
+}
+
+fn square(v: float64) -> float64 {
+  return v * v;
+}
+
+fn looped(x: float64, n: int32) -> float64 {
+  var total: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (i % 2 == 0) {
+      total = total + square(x) * (float64)i;
+    } else {
+      total = total - exp(x * 0.1);
+    }
+    i = i + 1;
+  }
+  return total;
+}
+
+fn dot_loss(w: float64[], k: float64) -> float64 {
+  var total: float64 = 0.0;
+  for i in 0..w.length {
+    var scaled: float64 = w[i] * k;
+    total = total + scaled * scaled;
+  }
+  return total;
+}
+
+fn with_memory(x: float64) -> float64 {
+  var cells: float64[4];
+  cells[0] = x;
+  var i: int32 = 1;
+  while (i < 4) {
+    cells[i] = cells[i - 1] * x;
+    i = i + 1;
+  }
+  return cells[3];
+}
+
+fn near(name: string, got: float64, want: float64) -> int32 {
+  var gap: float64 = got - want;
+  if (gap < 0.0) { gap = -gap; }
+  if (gap > 0.000000001) {
+    println("{name}: got {got}, want {want}");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  var g: loss__gradient = grad(loss)(2.0, 3.0);
+  bad = bad + near("value", g.value, loss(2.0, 3.0));
+  var one_plus: float64 = 1.0 + 2.0 * 2.0;
+  bad = bad + near("d_x", g.d_x, 2.0 * 2.0 * 3.0 - sin(3.0) * 2.0 * 2.0 / (one_plus * one_plus));
+  bad = bad + near("d_y", g.d_y, 2.0 * 2.0 + cos(3.0) / one_plus);
+
+  var l: looped__gradient = grad(looped)(1.5, 5);
+  bad = bad + near("loop", l.d_x, 2.0 * 1.5 * 6.0 - 2.0 * 0.1 * exp(0.15));
+
+  var w: float64[] = new float64[3];
+  w[0] = 1.0;
+  w[1] = 2.0;
+  w[2] = 3.0;
+  var d: dot_loss__gradient = grad(dot_loss)(w, 2.0);
+  bad = bad + near("slice 0", d.d_w[0], 8.0);
+  bad = bad + near("slice 2", d.d_w[2], 24.0);
+  bad = bad + near("slice k", d.d_k, 2.0 * 2.0 * 14.0);
+
+  var m: with_memory__gradient = grad(with_memory)(2.0);
+  bad = bad + near("through memory", m.d_x, 4.0 * 8.0);
+
+  if (bad == 0) { println("ok"); }
+  return bad;
+}

@@ -1,0 +1,59 @@
+import "std/io";
+import "std/meta";
+
+var calls: int64 = 0;
+
+@memoize fn fib(n: int64) -> int64 {
+  if (n < 2) { return n; }
+  return fib(n - 1) + fib(n - 2);
+}
+
+@memoize fn mix(a: int32, b: float64, c: bool) -> float64 {
+  if (c) { return b * (float64)a; }
+  return b + (float64)a;
+}
+
+@trace fn add(a: int32, b: int32) -> int32 {
+  return a + b;
+}
+
+@generate fn copy_of(f: FunctionInfo) -> Generated {
+  return render_function(f, "{f.name}__copy");
+}
+
+fn loopy(x: float64, n: int32) -> float64 {
+  var s: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < n) {
+    if (i % 2 == 0) {
+      s = s + x * 2.0;
+    } else {
+      if (i == 5) { break; }
+      s = s - 1.5;
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+fn check(name: string, got: int64, want: int64) -> int32 {
+  if (got != want) {
+    println("{name}: got {got}, want {want}");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  bad = bad + check("memoized fib", fib(60), 1548008755920);
+  bad = bad + check("memoized twice", fib(60), 1548008755920);
+  bad = bad + check("mix true", (int64)(mix(3, 1.5, true) * 2.0), 9);
+  bad = bad + check("mix false", (int64)(mix(3, 1.5, false) * 2.0), 9);
+  bad = bad + check("trace", (int64)add(2, 3), 5);
+  var copied: fn(float64, int32) -> float64 = copy_of(loopy);
+  bad = bad + check("rendered loop", (int64)(copied(1.0, 9) * 2.0),
+                    (int64)(loopy(1.0, 9) * 2.0));
+  if (bad == 0) { println("ok"); }
+  return bad;
+}

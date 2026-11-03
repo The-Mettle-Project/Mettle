@@ -1652,6 +1652,7 @@ typedef struct {
   IROperand base;
   IROperand index;
   IROperand count;
+  IROperand slice_address;
   long long known_count;
 } IRColumnAccess;
 
@@ -1659,6 +1660,37 @@ static void ir_column_access_end(IRColumnAccess *access) {
   ir_operand_destroy(&access->base);
   ir_operand_destroy(&access->index);
   ir_operand_destroy(&access->count);
+  ir_operand_destroy(&access->slice_address);
+}
+
+static void ir_column_mark_last(IRFunction *function, unsigned char mark) {
+  if (function->instruction_count > 0) {
+    function->instructions[function->instruction_count - 1].column_base = mark;
+  }
+}
+
+static int ir_column_load_count(IRLoweringContext *context,
+                                IRFunction *function, IRColumnAccess *access,
+                                SourceLocation location) {
+  IROperand slot = ir_operand_none();
+  IRInstruction load = {0};
+  if (access->count.kind != IR_OPERAND_NONE) {
+    return 1;
+  }
+  if (!ir_emit_address_with_offset(context, function, &access->slice_address, 8,
+                                   location, &slot) ||
+      !ir_make_temp_operand(context, &access->count)) {
+    return 0;
+  }
+  load.op = IR_OP_LOAD;
+  load.location = location;
+  load.dest = access->count;
+  load.lhs = slot;
+  load.rhs = ir_operand_int(8);
+  load.alias_class = IR_ALIAS_CLASS_I64;
+  int ok = ir_emit(context, function, &load);
+  ir_operand_destroy(&slot);
+  return ok;
 }
 
 static int ir_column_access_begin(IRLoweringContext *context,
@@ -1670,6 +1702,7 @@ static int ir_column_access_begin(IRLoweringContext *context,
   SourceLocation location = index_node->location;
   memset(out, 0, sizeof(*out));
   out->known_count = -1;
+  out->slice_address = ir_operand_none();
   if (!array_type || !array_type->base_type) {
     ir_set_error(context, "Column access reached lowering without an element "
                           "type");
@@ -1702,21 +1735,7 @@ static int ir_column_access_begin(IRLoweringContext *context,
       return 0;
     }
     ir_operand_destroy(&load.lhs);
-    if (!ir_emit_address_with_offset(context, function, &slice_address, 8,
-                                     location, &length_slot) ||
-        !ir_make_temp_operand(context, &out->count)) {
-      return 0;
-    }
-    IRInstruction load_count = {0};
-    load_count.op = IR_OP_LOAD;
-    load_count.location = location;
-    load_count.dest = out->count;
-    load_count.lhs = length_slot;
-    load_count.rhs = ir_operand_int(8);
-    if (!ir_emit(context, function, &load_count)) {
-      return 0;
-    }
-    ir_operand_destroy(&length_slot);
+    out->slice_address = ir_clone_operand_local(&slice_address);
   } else {
     char message[400];
     snprintf(message, sizeof(message),
@@ -1750,44 +1769,75 @@ static int ir_column_access_begin(IRLoweringContext *context,
 }
 
 static int ir_column_region_base(IRLoweringContext *context,
-                                 IRFunction *function,
-                                 const IRColumnAccess *access, size_t region,
-                                 SourceLocation location, IROperand *out) {
+                                 IRFunction *function, IRColumnAccess *access,
+                                 size_t region, SourceLocation location,
+                                 IROperand *out) {
   const TypeMetaLayout *layout = access->element->meta_layout;
   if (access->known_count >= 0) {
     *out = ir_operand_int((long long)type_columns_region_base(
         access->element, region, (size_t)access->known_count));
     return 1;
   }
+  if (region > 0 && !ir_column_load_count(context, function, access, location)) {
+    return 0;
+  }
   IROperand running = ir_operand_int(0);
-  for (size_t r = 0; r < region; r++) {
-    IROperand stride = ir_operand_int((long long)layout->regions[r].stride);
+  size_t r = 0;
+  while (r < region) {
+    size_t strides = 0;
+    size_t last = r;
+    while (last < region) {
+      strides += layout->regions[last].stride;
+      if (layout->regions[last].stride % layout->regions[last + 1].alignment !=
+          0) {
+        break;
+      }
+      last++;
+    }
+    size_t rounded_after = last < region ? last : region - 1;
+    size_t next_align = layout->regions[rounded_after + 1].alignment;
+    IROperand per_element = ir_operand_int((long long)strides);
     IROperand bytes = ir_operand_none();
     IROperand sum = ir_operand_none();
-    size_t next_align = layout->regions[r + 1].alignment;
-    if (!ir_emit_binary_temp(context, function, "*", &access->count, &stride,
-                             location, &bytes) ||
-        !ir_emit_binary_temp(context, function, "+", &running, &bytes, location,
-                             &sum)) {
+    if (!ir_emit_binary_temp(context, function, "*", &access->count,
+                             &per_element, location, &bytes)) {
       return 0;
     }
-    ir_operand_destroy(&bytes);
+    ir_column_mark_last(function, 1);
+    if (running.kind == IR_OPERAND_INT && running.int_value == 0) {
+      sum = bytes;
+    } else {
+      if (!ir_emit_binary_temp(context, function, "+", &running, &bytes,
+                               location, &sum)) {
+        return 0;
+      }
+      ir_column_mark_last(function, 1);
+      ir_operand_destroy(&bytes);
+    }
     ir_operand_destroy(&running);
     running = sum;
-    if (layout->regions[r].stride % next_align != 0) {
+    if (last < region) {
       IROperand up = ir_operand_int((long long)next_align - 1);
       IROperand down = ir_operand_int(-(long long)next_align);
       IROperand raised = ir_operand_none();
       IROperand aligned = ir_operand_none();
       if (!ir_emit_binary_temp(context, function, "+", &running, &up, location,
-                               &raised) ||
-          !ir_emit_binary_temp(context, function, "&", &raised, &down, location,
+                               &raised)) {
+        return 0;
+      }
+      ir_column_mark_last(function, 1);
+      if (!ir_emit_binary_temp(context, function, "&", &raised, &down, location,
                                &aligned)) {
         return 0;
       }
+      ir_column_mark_last(function, 1);
       ir_operand_destroy(&raised);
       ir_operand_destroy(&running);
       running = aligned;
+    }
+    r = last + 1;
+    if (last == region) {
+      break;
     }
   }
   *out = running;
@@ -1796,39 +1846,50 @@ static int ir_column_region_base(IRLoweringContext *context,
 
 static int ir_column_region_address(IRLoweringContext *context,
                                     IRFunction *function,
-                                    const IRColumnAccess *access, size_t region,
+                                    IRColumnAccess *access, size_t region,
                                     SourceLocation location, IROperand *out) {
   const TypeMetaLayout *layout = access->element->meta_layout;
   IROperand region_base = ir_operand_none();
   IROperand stride = ir_operand_int((long long)layout->regions[region].stride);
   IROperand scaled = ir_operand_none();
-  IROperand offset = ir_operand_none();
+  IROperand column = ir_operand_none();
   if (!ir_column_region_base(context, function, access, region, location,
                              &region_base) ||
       !ir_emit_binary_temp(context, function, "*", &access->index, &stride,
-                           location, &scaled) ||
-      !ir_emit_binary_temp(context, function, "+", &region_base, &scaled,
-                           location, &offset)) {
+                           location, &scaled)) {
     return 0;
   }
-  ir_operand_destroy(&region_base);
-  ir_operand_destroy(&scaled);
   if (context->emit_safety_checks) {
+    IROperand offset = ir_operand_none();
     long long extent = access->known_count >= 0
                            ? (long long)type_columns_bytes(
                                  access->element, (size_t)access->known_count)
                            : IR_SAFETY_EXTENT_UNKNOWN;
-    if (!ir_emit_safety_check(context, function, location, &access->base,
+    if (!ir_emit_binary_temp(context, function, "+", &region_base, &scaled,
+                             location, &offset) ||
+        !ir_emit_safety_check(context, function, location, &access->base,
                               &offset, (long long)layout->regions[region].stride,
                               extent, IR_SAFETY_ACCESS_READ, "column element")) {
       return 0;
     }
+    ir_operand_destroy(&offset);
   }
-  if (!ir_emit_binary_temp(context, function, "+", &access->base, &offset,
-                           location, out)) {
+  if (region_base.kind == IR_OPERAND_INT && region_base.int_value == 0) {
+    column = ir_clone_operand_local(&access->base);
+  } else {
+    if (!ir_emit_binary_temp(context, function, "+", &access->base, &region_base,
+                             location, &column)) {
+      return 0;
+    }
+    ir_column_mark_last(function, 2);
+  }
+  ir_operand_destroy(&region_base);
+  if (!ir_emit_binary_temp(context, function, "+", &column, &scaled, location,
+                           out)) {
     return 0;
   }
-  ir_operand_destroy(&offset);
+  ir_operand_destroy(&column);
+  ir_operand_destroy(&scaled);
   return 1;
 }
 
@@ -1991,6 +2052,7 @@ int ir_emit_column_bytes(IRLoweringContext *context, IRFunction *function,
   access.element = element;
   access.known_count = -1;
   access.count = ir_clone_operand_local(count);
+  access.slice_address = ir_operand_none();
   if (!ir_column_region_base(context, function, &access, last, location,
                              &region_base) ||
       !ir_emit_binary_temp(context, function, "*", count, &stride, location,

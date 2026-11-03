@@ -1,0 +1,1364 @@
+import "std/io";
+import "std/layout";
+import "std/mem";
+import "std/rule";
+
+export struct IRValue {
+  kind: int64;
+  text: string;
+  type_name: string;
+  is_aggregate: bool;
+}
+
+export struct IROp {
+  op: string;
+  text: string;
+  dest: IRValue;
+  lhs: IRValue;
+  rhs: IRValue;
+  args: IRValue[];
+  arg_types: string[];
+  is_float: bool;
+  float_bits: int64;
+  is_unsigned: bool;
+  line: int64;
+}
+
+export struct IRNode {
+  kind: int64;
+  value: int64;
+  ops: IROp[];
+  children: IRNode[];
+  condition: IROp;
+  then_body: IRNode[];
+  else_body: IRNode[];
+  body: IRNode[];
+  returned: IRValue;
+  case_values: int64[];
+  case_actions: int64[];
+}
+
+export struct LocalInfo {
+  name: string;
+  source_name: string;
+  type_name: string;
+}
+
+export struct FunctionInfo {
+  name: string;
+  ir_name: string;
+  inner_name: string;
+  return_type: string;
+  is_pure_declared: bool;
+  uses_exit: bool;
+  site: Site;
+  params: LocalInfo[];
+  locals: LocalInfo[];
+  temps: LocalInfo[];
+  body: IRNode[];
+  reached: FunctionInfo[];
+  refused: string;
+}
+
+export struct Generated {
+  text: string;
+  refused: string;
+  name: string;
+}
+
+export fn generated(text: string) -> Generated {
+  var out: Generated;
+  out.text = text;
+  return out;
+}
+
+export fn generated_as(name: string, text: string) -> Generated {
+  var out: Generated;
+  out.text = text;
+  out.name = name;
+  return out;
+}
+
+export fn refuse(why: string) -> Generated {
+  var out: Generated;
+  out.refused = why;
+  return out;
+}
+
+export struct Text {
+  data: uint8*;
+  length: int64;
+  capacity: int64;
+}
+
+export fn text_add(t: Text*, s: string) {
+  var needed: int64 = t.length + (int64)s.length;
+  if (needed + 1 > t.capacity) {
+    var capacity: int64 = t.capacity * 2;
+    if (capacity < needed + 256) { capacity = needed + 256; }
+    var grown: uint8* = (uint8*)malloc(capacity);
+    var k: int64 = 0;
+    while (k < t.length) {
+      grown[k] = t.data[k];
+      k = k + 1;
+    }
+    t.data = grown;
+    t.capacity = capacity;
+  }
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    t.data[t.length + i] = (uint8)s[i];
+    i = i + 1;
+  }
+  t.length = needed;
+}
+
+export fn text_done(t: Text*) -> string {
+  var out: string;
+  out.chars = t.data;
+  out.length = (uint64)t.length;
+  return out;
+}
+
+const NODE_SEQ: int64 = 0;
+const NODE_CODE: int64 = 1;
+const NODE_IF: int64 = 2;
+const NODE_LOOP: int64 = 3;
+const NODE_BLOCK: int64 = 4;
+const NODE_BREAK: int64 = 6;
+const NODE_CONTINUE: int64 = 7;
+const NODE_RETURN: int64 = 8;
+const NODE_SET_EXIT: int64 = 9;
+const NODE_CHECK: int64 = 10;
+
+const VALUE_NONE: int64 = 0;
+const VALUE_TEMP: int64 = 1;
+const VALUE_LOCAL: int64 = 2;
+const VALUE_INT: int64 = 3;
+const VALUE_FLOAT: int64 = 4;
+const VALUE_STRING: int64 = 5;
+const VALUE_GLOBAL: int64 = 6;
+
+export fn type_is_float(name: string) -> bool {
+  return name == "float64" || name == "float32";
+}
+
+export fn type_is_integer(name: string) -> bool {
+  return name == "int8" || name == "int16" || name == "int32" ||
+         name == "int64" || name == "uint8" || name == "uint16" ||
+         name == "uint32" || name == "uint64" || name == "bool" ||
+         name == "char";
+}
+
+export struct Render {
+  out: Text*;
+  refused: string;
+}
+
+fn render_refuse(r: Render*, why: string) {
+  if (r.refused.length == 0) { r.refused = why; }
+}
+
+fn value_read(v: IRValue) -> string {
+  if (v.kind == VALUE_INT) { return "(int64){v.text}"; }
+  if (v.is_aggregate || v.kind == VALUE_FLOAT || v.kind == VALUE_STRING) {
+    return v.text;
+  }
+  if (type_is_float(v.type_name)) { return v.text; }
+  return "(int64){v.text}";
+}
+
+fn cast_into(type_name: string, expression: string) -> string {
+  if (type_name == "bool") { return "({expression}) != 0"; }
+  return "({type_name})({expression})";
+}
+
+fn emit_store_to(r: Render*, dest: IRValue, expression: string) {
+  if (dest.is_aggregate) {
+    text_add(r.out, "  {dest.text} = {expression};\n");
+    return;
+  }
+  text_add(r.out, "  {dest.text} = {cast_into(dest.type_name, expression)};\n");
+}
+
+fn float_type_of(op: IROp) -> string {
+  if (op.float_bits == 32) { return "float32"; }
+  return "float64";
+}
+
+fn operator_is_comparison(text: string) -> bool {
+  return text == "<" || text == "<=" || text == ">" || text == ">=" ||
+         text == "==" || text == "!=";
+}
+
+fn operator_cares_about_sign(text: string) -> bool {
+  return operator_is_comparison(text) || text == "/" || text == "%" ||
+         text == ">>";
+}
+
+fn scalar_type_of_size(size: string, unsigned_load: bool) -> string {
+  if (size == "1") { if (unsigned_load) { return "uint8"; } return "int8"; }
+  if (size == "2") { if (unsigned_load) { return "uint16"; } return "int16"; }
+  if (size == "4") { if (unsigned_load) { return "uint32"; } return "int32"; }
+  if (size == "8") { if (unsigned_load) { return "uint64"; } return "int64"; }
+  return "";
+}
+
+fn emit_op(r: Render*, op: IROp) {
+  if (op.op == "assign") {
+    if (op.dest.kind == VALUE_TEMP || op.dest.kind == VALUE_LOCAL ||
+        op.dest.kind == VALUE_GLOBAL) {
+      emit_store_to(r, op.dest, value_read(op.lhs));
+    }
+    return;
+  }
+  if (op.op == "binary") {
+    if (op.is_float) {
+      var t: string = float_type_of(op);
+      var a: string = "({t}){value_read(op.lhs)}";
+      var b: string = "({t}){value_read(op.rhs)}";
+      if (operator_is_comparison(op.text)) {
+        emit_store_to(r, op.dest, "(int64)({a} {op.text} {b})");
+      } else {
+        emit_store_to(r, op.dest, "{a} {op.text} {b}");
+      }
+      return;
+    }
+    if (op.is_unsigned && operator_cares_about_sign(op.text)) {
+      var left: string = "(uint64){value_read(op.lhs)}";
+      var right: string = "(uint64){value_read(op.rhs)}";
+      emit_store_to(r, op.dest, "(int64)({left} {op.text} {right})");
+      return;
+    }
+    if (operator_is_comparison(op.text)) {
+      emit_store_to(r, op.dest,
+                    "(int64)({value_read(op.lhs)} {op.text} {value_read(op.rhs)})");
+      return;
+    }
+    emit_store_to(r, op.dest,
+                  "{value_read(op.lhs)} {op.text} {value_read(op.rhs)}");
+    return;
+  }
+  if (op.op == "unary") {
+    if (op.text == "!") {
+      emit_store_to(r, op.dest, "(int64)({value_read(op.lhs)} == 0)");
+      return;
+    }
+    emit_store_to(r, op.dest, "{op.text}{value_read(op.lhs)}");
+    return;
+  }
+  if (op.op == "cast") {
+    if (type_is_float(op.text)) {
+      emit_store_to(r, op.dest, "({op.text}){value_read(op.lhs)}");
+      return;
+    }
+    if (op.text == "bool") {
+      emit_store_to(r, op.dest, "(int64)({value_read(op.lhs)} != 0)");
+      return;
+    }
+    if (type_is_integer(op.text)) {
+      emit_store_to(r, op.dest, "(int64)({op.text}){value_read(op.lhs)}");
+      return;
+    }
+    emit_store_to(r, op.dest, value_read(op.lhs));
+    return;
+  }
+  if (op.op == "addr_of") {
+    emit_store_to(r, op.dest, "(int64)&{op.lhs.text}");
+    return;
+  }
+  if (op.op == "load") {
+    if (op.is_float) {
+      emit_store_to(r, op.dest,
+                    "*({float_type_of(op)}*){value_read(op.lhs)}");
+      return;
+    }
+    var loaded: string = scalar_type_of_size(op.rhs.text, op.is_unsigned);
+    if (loaded.length == 0) {
+      render_refuse(r, "it loads {op.rhs.text} bytes at once at line {op.line}");
+      return;
+    }
+    emit_store_to(r, op.dest, "(int64)*({loaded}*){value_read(op.lhs)}");
+    return;
+  }
+  if (op.op == "store") {
+    if (op.is_float || type_is_float(op.lhs.type_name)) {
+      var stored: string = "float64";
+      if (op.rhs.text == "4") { stored = "float32"; }
+      text_add(r.out,
+               "  *({stored}*){value_read(op.dest)} = ({stored}){value_read(op.lhs)};\n");
+      return;
+    }
+    var width: string = scalar_type_of_size(op.rhs.text, false);
+    if (width.length > 0 && !op.lhs.is_aggregate) {
+      text_add(r.out,
+               "  *({width}*){value_read(op.dest)} = ({width}){value_read(op.lhs)};\n");
+      return;
+    }
+    if (op.lhs.is_aggregate) {
+      text_add(r.out, "  memcpy((rawptr){value_read(op.dest)}, (rawptr)&{op.lhs.text}, {op.rhs.text});\n");
+      return;
+    }
+    text_add(r.out, "  memcpy((rawptr){value_read(op.dest)}, (rawptr){value_read(op.lhs)}, {op.rhs.text});\n");
+    return;
+  }
+  if (op.op == "new") {
+    emit_store_to(r, op.dest, "(int64)calloc(1, {value_read(op.rhs)})");
+    return;
+  }
+  if (op.op == "call") {
+    var call: Text;
+    text_add(&call, "{op.text}(");
+    for i in 0..op.args.length {
+      if (i > 0) { text_add(&call, ", "); }
+      var arg: IRValue = op.args[i];
+      if (i < op.arg_types.length && !arg.is_aggregate &&
+          arg.kind != VALUE_STRING) {
+        text_add(&call, cast_into(op.arg_types[i], value_read(arg)));
+      } else {
+        text_add(&call, value_read(arg));
+      }
+    }
+    text_add(&call, ")");
+    if (op.dest.kind == VALUE_NONE) {
+      text_add(r.out, "  {text_done(&call)};\n");
+      return;
+    }
+    if (op.dest.is_aggregate || type_is_float(op.dest.type_name)) {
+      text_add(r.out, "  {op.dest.text} = {text_done(&call)};\n");
+      return;
+    }
+    emit_store_to(r, op.dest, "(int64){text_done(&call)}");
+    return;
+  }
+  render_refuse(r, "'{op.op}' at line {op.line} has no spelling in Mettle");
+}
+
+fn condition_text(op: IROp) -> string {
+  if (op.op == "branch_zero") { return "{value_read(op.lhs)} == 0"; }
+  return "{value_read(op.lhs)} == {value_read(op.rhs)}";
+}
+
+fn emit_nodes(r: Render*, nodes: IRNode[], f: FunctionInfo) {
+  for i in 0..nodes.length {
+    emit_node(r, nodes[i], f);
+  }
+}
+
+fn emit_node(r: Render*, node: IRNode, f: FunctionInfo) {
+  if (node.kind == NODE_SEQ) {
+    emit_nodes(r, node.children, f);
+  } else if (node.kind == NODE_CODE) {
+    for i in 0..node.ops.length {
+      emit_op(r, node.ops[i]);
+    }
+  } else if (node.kind == NODE_IF) {
+    text_add(r.out, "  if ({condition_text(node.condition)}) {{\n");
+    emit_nodes(r, node.then_body, f);
+    text_add(r.out, "  } else {{\n");
+    emit_nodes(r, node.else_body, f);
+    text_add(r.out, "  }\n");
+  } else if (node.kind == NODE_LOOP) {
+    text_add(r.out, "  while (true) {{\n");
+    emit_nodes(r, node.body, f);
+    text_add(r.out, "  }\n");
+  } else if (node.kind == NODE_BLOCK) {
+    text_add(r.out, "  switch (0) {{\n  default: {{\n");
+    emit_nodes(r, node.body, f);
+    text_add(r.out, "  }\n  }\n");
+  } else if (node.kind == NODE_BREAK) {
+    text_add(r.out, "  break;\n");
+  } else if (node.kind == NODE_CONTINUE) {
+    text_add(r.out, "  continue;\n");
+  } else if (node.kind == NODE_RETURN) {
+    if (node.returned.kind == VALUE_NONE) {
+      text_add(r.out, "  return;\n");
+    } else if (node.returned.is_aggregate) {
+      text_add(r.out, "  return {node.returned.text};\n");
+    } else {
+      text_add(r.out,
+               "  return {cast_into(f.return_type, value_read(node.returned))};\n");
+    }
+  } else if (node.kind == NODE_SET_EXIT) {
+    text_add(r.out, "  v__exit = {node.value};\n");
+  } else if (node.kind == NODE_CHECK) {
+    for c in 0..node.case_values.length {
+      text_add(r.out, "  if (v__exit == {node.case_values[c]}) {{\n");
+      if (node.case_actions[c] == 0) {
+        text_add(r.out, "    v__exit = 0;\n    break;\n");
+      } else if (node.case_actions[c] == 1) {
+        text_add(r.out, "    v__exit = 0;\n    continue;\n");
+      } else {
+        text_add(r.out, "    break;\n");
+      }
+      text_add(r.out, "  }\n");
+    }
+  } else {
+    render_refuse(r, "a structured node of kind {node.kind} has no spelling");
+  }
+}
+
+export fn signature_text(name: string, f: FunctionInfo) -> string {
+  var t: Text;
+  text_add(&t, "fn {name}(");
+  for i in 0..f.params.length {
+    if (i > 0) { text_add(&t, ", "); }
+    text_add(&t, "{f.params[i].name}: {f.params[i].type_name}");
+  }
+  text_add(&t, ")");
+  if (f.return_type != "void") {
+    text_add(&t, " -> {f.return_type}");
+  }
+  return text_done(&t);
+}
+
+export fn arguments_text(f: FunctionInfo) -> string {
+  var t: Text;
+  for i in 0..f.params.length {
+    if (i > 0) { text_add(&t, ", "); }
+    text_add(&t, f.params[i].name);
+  }
+  return text_done(&t);
+}
+
+export fn render_declarations(t: Text*, f: FunctionInfo) {
+  for i in 0..f.locals.length {
+    text_add(t, "  var {f.locals[i].name}: {f.locals[i].type_name};\n");
+  }
+  for i in 0..f.temps.length {
+    text_add(t, "  var {f.temps[i].name}: {f.temps[i].type_name};\n");
+  }
+  if (f.uses_exit) { text_add(t, "  var v__exit: int64 = 0;\n"); }
+}
+
+export fn render_function(f: FunctionInfo, name: string) -> Generated {
+  if (f.refused.length > 0) {
+    return refuse("'{f.name}' has control flow with no structure: {f.refused}");
+  }
+  var t: Text;
+  var r: Render;
+  r.out = &t;
+  text_add(&t, "{signature_text(name, f)} {{\n");
+  render_declarations(&t, f);
+  emit_nodes(&r, f.body, f);
+  text_add(&t, "}\n");
+  if (r.refused.length > 0) {
+    return refuse("'{f.name}' cannot print as Mettle: {r.refused}");
+  }
+  return generated_as(name, text_done(&t));
+}
+
+export struct MemoTable {
+  keys: int64*;
+  values: int64*;
+  used: uint8*;
+  capacity: int64;
+  count: int64;
+}
+
+fn memo_hash(key: int64*, arity: int64) -> int64 {
+  var hash: int64 = 1469598103;
+  for i in 0..arity {
+    hash = (hash ^ key[i]) * 1099511627;
+    hash = hash ^ (hash >> 29);
+  }
+  return hash & 9223372036854775807;
+}
+
+fn memo_slot(table: MemoTable*, key: int64*, arity: int64) -> int64 {
+  var at: int64 = memo_hash(key, arity) % table.capacity;
+  while (table.used[at] != 0) {
+    var same: bool = true;
+    for i in 0..arity {
+      if (table.keys[at * arity + i] != key[i]) { same = false; }
+    }
+    if (same) { return at; }
+    at = at + 1;
+    if (at == table.capacity) { at = 0; }
+  }
+  return at;
+}
+
+export fn memo_find(table: MemoTable*, key: int64*, arity: int64) -> int64 {
+  if (table.capacity == 0) { return -1; }
+  var at: int64 = memo_slot(table, key, arity);
+  if (table.used[at] == 0) { return -1; }
+  return at;
+}
+
+export fn memo_value(table: MemoTable*, at: int64) -> int64 {
+  return table.values[at];
+}
+
+export fn memo_store(table: MemoTable*, key: int64*, arity: int64, value: int64) {
+  if ((table.count + 1) * 2 > table.capacity) {
+    var old: MemoTable = *table;
+    var capacity: int64 = table.capacity * 2;
+    if (capacity < 64) { capacity = 64; }
+    table.capacity = capacity;
+    table.keys = (int64*)calloc(capacity * arity, 8);
+    table.values = (int64*)calloc(capacity, 8);
+    table.used = (uint8*)calloc(capacity, 1);
+    table.count = 0;
+    for i in 0..old.capacity {
+      if (old.used[i] != 0) {
+        var moved: int64 = memo_slot(table, &old.keys[i * arity], arity);
+        for k in 0..arity {
+          table.keys[moved * arity + k] = old.keys[i * arity + k];
+        }
+        table.values[moved] = old.values[i];
+        table.used[moved] = 1;
+        table.count = table.count + 1;
+      }
+    }
+    if (old.capacity > 0) {
+      free(old.keys);
+      free(old.values);
+      free(old.used);
+    }
+  }
+  var at: int64 = memo_slot(table, key, arity);
+  if (table.used[at] == 0) { table.count = table.count + 1; }
+  for k in 0..arity {
+    table.keys[at * arity + k] = key[k];
+  }
+  table.values[at] = value;
+  table.used[at] = 1;
+}
+
+export fn memo_reset(table: MemoTable*) {
+  if (table.capacity > 0) {
+    free(table.keys);
+    free(table.values);
+    free(table.used);
+  }
+  table.capacity = 0;
+  table.count = 0;
+}
+
+export fn memo_bits(x: float64) -> int64 {
+  var held: float64 = x;
+  return *(int64*)&held;
+}
+
+export fn memo_float(bits: int64) -> float64 {
+  var held: int64 = bits;
+  return *(float64*)&held;
+}
+
+fn function_named(p: Program, name: string) -> int64 {
+  for i in 0..p.functions.length {
+    if (p.functions[i].name == name) { return i; }
+  }
+  return -1;
+}
+
+export fn function_site(p: Program, name: string) -> Site {
+  var at: int64 = function_named(p, name);
+  if (at >= 0) { return p.functions[at].site; }
+  var none: Site;
+  return none;
+}
+
+fn purity_walk(p: Program, at: int64, skip: string, seen: bool*) -> string {
+  if (seen[at]) { return ""; }
+  seen[at] = true;
+  var f: Function = p.functions[at];
+  if (f.writes_globals.length > 0) {
+    return "'{f.name}' writes the global '{f.writes_globals[0]}'";
+  }
+  if (f.is_extern && !f.is_pure) {
+    return "'{f.name}' is extern and not declared @pure";
+  }
+  for c in f.callees {
+    if (c != skip) {
+      var callee: int64 = function_named(p, c);
+      if (callee >= 0) {
+        var why: string = purity_walk(p, callee, skip, seen);
+        if (why.length > 0) { return why; }
+      }
+    }
+  }
+  return "";
+}
+
+export fn purity_problem(p: Program, name: string, skip: string) -> string {
+  var at: int64 = function_named(p, name);
+  if (at < 0) { return "'{name}' is not in the program"; }
+  var seen: bool[] = new bool[p.functions.length];
+  var why: string = purity_walk(p, at, skip, seen.data);
+  free(seen.data);
+  return why;
+}
+
+fn check_scalar_signature(f: FunctionInfo) -> string {
+  for i in 0..f.params.length {
+    var t: string = f.params[i].type_name;
+    if (!type_is_integer(t) && !type_is_float(t)) {
+      return "parameter '{f.params[i].source_name}' is a '{t}', and only integers, bools and floats can be probed";
+    }
+  }
+  if (!type_is_integer(f.return_type) && !type_is_float(f.return_type)) {
+    return "it returns '{f.return_type}', and only integers, bools and floats can be compared";
+  }
+  return "";
+}
+
+fn probe_argument_text(f: FunctionInfo, probe: int64) -> string {
+  var t: Text;
+  for i in 0..f.params.length {
+    if (i > 0) { text_add(&t, ", "); }
+    var type_name: string = f.params[i].type_name;
+    if (type_name == "bool") {
+      if (probe % 2 == 0) { text_add(&t, "false"); } else { text_add(&t, "true"); }
+    } else if (type_is_float(type_name)) {
+      text_add(&t, "({type_name}){probe}.5");
+    } else {
+      text_add(&t, "({type_name}){probe + i}");
+    }
+  }
+  return text_done(&t);
+}
+
+fn equal_probes_text(f: FunctionInfo, wrapper: string, inner: string) -> string {
+  var t: Text;
+  for probe in 0..6 {
+    var args: string = probe_argument_text(f, probe);
+    text_add(&t, "  if ({wrapper}({args}) != {inner}({args})) {{\n");
+    text_add(&t, "    return verdict_fail(function_site(p, \"{inner}\"), \"{wrapper} differs from {inner} at ({args})\");\n");
+    text_add(&t, "  }\n");
+  }
+  return text_done(&t);
+}
+
+@generate export fn memoize(f: FunctionInfo) -> Generated {
+  var problem: string = check_scalar_signature(f);
+  if (problem.length > 0) {
+    return refuse("@memoize on '{f.name}': {problem}");
+  }
+  var t: Text;
+  var arity: int64 = f.params.length;
+  if (arity == 0) { arity = 1; }
+  var bits_of_result: string = "(int64)result";
+  var from_bits: string = "({f.return_type})memo_value(&{f.name}__memo, at)";
+  if (type_is_float(f.return_type)) {
+    bits_of_result = "memo_bits((float64)result)";
+    from_bits = "({f.return_type})memo_float(memo_value(&{f.name}__memo, at))";
+  }
+  if (f.return_type == "bool") {
+    from_bits = "memo_value(&{f.name}__memo, at) != 0";
+  }
+  text_add(&t, "var {f.name}__memo: MemoTable;\n\n");
+  text_add(&t, "{signature_text(f.name, f)} {{\n");
+  text_add(&t, "  var key: int64[{arity}];\n");
+  for i in 0..f.params.length {
+    var param: LocalInfo = f.params[i];
+    if (type_is_float(param.type_name)) {
+      text_add(&t, "  key[{i}] = memo_bits((float64){param.name});\n");
+    } else {
+      text_add(&t, "  key[{i}] = (int64){param.name};\n");
+    }
+  }
+  text_add(&t, "  var at: int64 = memo_find(&{f.name}__memo, &key[0], {arity});\n");
+  text_add(&t, "  if (at >= 0) {{ return {from_bits}; }\n");
+  text_add(&t, "  var result: {f.return_type} = {f.inner_name}({arguments_text(f)});\n");
+  text_add(&t, "  memo_store(&{f.name}__memo, &key[0], {arity}, {bits_of_result});\n");
+  text_add(&t, "  return result;\n");
+  text_add(&t, "}\n\n");
+  text_add(&t, "@rule fn {f.name}__memo_holds(p: Program) -> Verdict {{\n");
+  text_add(&t, "  var impure: string = purity_problem(p, \"{f.inner_name}\", \"{f.name}\");\n");
+  text_add(&t, "  if (impure.length > 0) {{\n");
+  text_add(&t, "    return verdict_fail(function_site(p, \"{f.inner_name}\"), \"@memoize needs a pure function: {{impure}\");\n");
+  text_add(&t, "  }\n");
+  text_add(&t, equal_probes_text(f, f.name, f.inner_name));
+  text_add(&t, "  memo_reset(&{f.name}__memo);\n");
+  text_add(&t, "  return verdict_pass();\n");
+  text_add(&t, "}\n");
+  return generated_as(f.name, text_done(&t));
+}
+
+var ad_parent_a: int64* = 0;
+var ad_parent_b: int64* = 0;
+var ad_partial_a: float64* = 0;
+var ad_partial_b: float64* = 0;
+var ad_adjoints: float64* = 0;
+var ad_count: int64 = 0;
+var ad_capacity: int64 = 0;
+var ad_shadow_keys: int64* = 0;
+var ad_shadow_values: int64* = 0;
+var ad_shadow_capacity: int64 = 0;
+var ad_shadow_count: int64 = 0;
+export var ad_return_node: int64 = -1;
+
+fn ad_grow_tape() {
+  var capacity: int64 = ad_capacity * 2;
+  if (capacity < 256) { capacity = 256; }
+  var a: int64* = (int64*)malloc(capacity * 8);
+  var b: int64* = (int64*)malloc(capacity * 8);
+  var pa: float64* = (float64*)malloc(capacity * 8);
+  var pb: float64* = (float64*)malloc(capacity * 8);
+  for i in 0..ad_count {
+    a[i] = ad_parent_a[i];
+    b[i] = ad_parent_b[i];
+    pa[i] = ad_partial_a[i];
+    pb[i] = ad_partial_b[i];
+  }
+  if (ad_capacity > 0) {
+    free(ad_parent_a);
+    free(ad_parent_b);
+    free(ad_partial_a);
+    free(ad_partial_b);
+  }
+  ad_parent_a = a;
+  ad_parent_b = b;
+  ad_partial_a = pa;
+  ad_partial_b = pb;
+  ad_capacity = capacity;
+}
+
+export fn ad_node(a: int64, partial_a: float64, b: int64, partial_b: float64) -> int64 {
+  if (a < 0 && b < 0) { return -1; }
+  if (ad_count == ad_capacity) { ad_grow_tape(); }
+  ad_parent_a[ad_count] = a;
+  ad_parent_b[ad_count] = b;
+  ad_partial_a[ad_count] = partial_a;
+  ad_partial_b[ad_count] = partial_b;
+  ad_count = ad_count + 1;
+  return ad_count - 1;
+}
+
+export fn ad_leaf() -> int64 {
+  if (ad_count == ad_capacity) { ad_grow_tape(); }
+  ad_parent_a[ad_count] = -1;
+  ad_parent_b[ad_count] = -1;
+  ad_count = ad_count + 1;
+  return ad_count - 1;
+}
+
+fn ad_shadow_slot(address: int64) -> int64 {
+  var at: int64 = ((address >> 2) * 2654435761) & (ad_shadow_capacity - 1);
+  while (ad_shadow_keys[at] != 0 && ad_shadow_keys[at] != address) {
+    at = (at + 1) & (ad_shadow_capacity - 1);
+  }
+  return at;
+}
+
+fn ad_shadow_grow() {
+  var old_keys: int64* = ad_shadow_keys;
+  var old_values: int64* = ad_shadow_values;
+  var old_capacity: int64 = ad_shadow_capacity;
+  var capacity: int64 = old_capacity * 2;
+  if (capacity < 256) { capacity = 256; }
+  ad_shadow_keys = (int64*)calloc(capacity, 8);
+  ad_shadow_values = (int64*)calloc(capacity, 8);
+  ad_shadow_capacity = capacity;
+  for i in 0..old_capacity {
+    if (old_keys[i] != 0) {
+      var moved: int64 = ad_shadow_slot(old_keys[i]);
+      ad_shadow_keys[moved] = old_keys[i];
+      ad_shadow_values[moved] = old_values[i];
+    }
+  }
+  if (old_capacity > 0) {
+    free(old_keys);
+    free(old_values);
+  }
+}
+
+export fn ad_shadow_set(address: int64, node: int64) {
+  if (node < 0 && ad_shadow_capacity == 0) { return; }
+  if ((ad_shadow_count + 1) * 2 > ad_shadow_capacity) { ad_shadow_grow(); }
+  var at: int64 = ad_shadow_slot(address);
+  if (ad_shadow_keys[at] == 0) { ad_shadow_count = ad_shadow_count + 1; }
+  ad_shadow_keys[at] = address;
+  ad_shadow_values[at] = node;
+}
+
+export fn ad_shadow_get(address: int64) -> int64 {
+  if (ad_shadow_capacity == 0) { return -1; }
+  var at: int64 = ad_shadow_slot(address);
+  if (ad_shadow_keys[at] == 0) { return -1; }
+  return ad_shadow_values[at];
+}
+
+export fn ad_shadow_copy(dest: int64, source: int64, size: int64) {
+  var offset: int64 = 0;
+  while (offset < size) {
+    ad_shadow_set(dest + offset, ad_shadow_get(source + offset));
+    offset = offset + 4;
+  }
+}
+
+export fn ad_begin() {
+  ad_count = 0;
+  ad_return_node = -1;
+  for i in 0..ad_shadow_capacity {
+    ad_shadow_keys[i] = 0;
+  }
+  ad_shadow_count = 0;
+}
+
+export fn ad_sweep(root: int64) {
+  if (ad_count == 0) { return; }
+  ad_adjoints = (float64*)calloc(ad_count, 8);
+  if (root >= 0) { ad_adjoints[root] = 1.0; }
+  var i: int64 = ad_count - 1;
+  while (i >= 0) {
+    var adjoint: float64 = ad_adjoints[i];
+    if (adjoint != 0.0) {
+      var a: int64 = ad_parent_a[i];
+      var b: int64 = ad_parent_b[i];
+      if (a >= 0) { ad_adjoints[a] = ad_adjoints[a] + adjoint * ad_partial_a[i]; }
+      if (b >= 0) { ad_adjoints[b] = ad_adjoints[b] + adjoint * ad_partial_b[i]; }
+    }
+    i = i - 1;
+  }
+}
+
+export fn ad_adjoint(node: int64) -> float64 {
+  if (node < 0 || ad_count == 0) { return 0.0; }
+  return ad_adjoints[node];
+}
+
+export fn ad_end() {
+  if (ad_count > 0) { free(ad_adjoints); }
+  ad_adjoints = 0;
+}
+
+export fn ad_release() {
+  ad_end();
+  if (ad_capacity > 0) {
+    free(ad_parent_a);
+    free(ad_parent_b);
+    free(ad_partial_a);
+    free(ad_partial_b);
+  }
+  if (ad_shadow_capacity > 0) {
+    free(ad_shadow_keys);
+    free(ad_shadow_values);
+  }
+  ad_capacity = 0;
+  ad_count = 0;
+  ad_shadow_capacity = 0;
+  ad_shadow_count = 0;
+}
+
+export fn grad_close(numeric: float64, exact: float64) -> bool {
+  if (numeric != numeric || exact != exact) { return true; }
+  var gap: float64 = numeric - exact;
+  if (gap < 0.0) { gap = -gap; }
+  var scale: float64 = numeric;
+  if (scale < 0.0) { scale = -scale; }
+  return gap <= 0.0005 * (1.0 + scale);
+}
+
+fn ad_shadow_of(v: IRValue) -> string {
+  if ((v.kind == VALUE_TEMP || v.kind == VALUE_LOCAL) &&
+      type_is_float(v.type_name)) {
+    return "d__{v.text}";
+  }
+  return "(int64)-1";
+}
+
+fn as_f64(v: IRValue) -> string {
+  return "(float64){value_read(v)}";
+}
+
+fn ad_unary_derivative(name: string, x: string) -> string {
+  if (name == "sin") { return "cos({x})"; }
+  if (name == "cos") { return "-sin({x})"; }
+  if (name == "tan") { return "1.0 + tan({x}) * tan({x})"; }
+  if (name == "exp") { return "exp({x})"; }
+  if (name == "exp2") { return "exp2({x}) * 0.693147180559945309"; }
+  if (name == "expm1") { return "exp({x})"; }
+  if (name == "log") { return "1.0 / ({x})"; }
+  if (name == "log2") { return "1.0 / (({x}) * 0.693147180559945309)"; }
+  if (name == "log10") { return "1.0 / (({x}) * 2.30258509299404568)"; }
+  if (name == "log1p") { return "1.0 / (1.0 + ({x}))"; }
+  if (name == "sqrt") { return "0.5 / sqrt({x})"; }
+  if (name == "sinh") { return "cosh({x})"; }
+  if (name == "cosh") { return "sinh({x})"; }
+  if (name == "tanh") { return "1.0 - tanh({x}) * tanh({x})"; }
+  if (name == "atan") { return "1.0 / (1.0 + ({x}) * ({x}))"; }
+  if (name == "asin") { return "1.0 / sqrt(1.0 - ({x}) * ({x}))"; }
+  if (name == "acos") { return "-1.0 / sqrt(1.0 - ({x}) * ({x}))"; }
+  if (name == "fabs") { return "ad_sign({x})"; }
+  if (name == "floor" || name == "ceil" || name == "round" || name == "trunc") {
+    return "0.0";
+  }
+  return "";
+}
+
+export fn ad_sign(x: float64) -> float64 {
+  if (x < 0.0) { return -1.0; }
+  if (x > 0.0) { return 1.0; }
+  return 0.0;
+}
+
+fn ad_touches_float(f: FunctionInfo) -> bool {
+  for p in f.params {
+    if (type_is_float(p.type_name) || p.type_name == "float64[]" ||
+        p.type_name == "float32[]" || p.type_name == "float64*" ||
+        p.type_name == "float32*") {
+      return true;
+    }
+  }
+  for l in f.locals {
+    if (type_is_float(l.type_name)) { return true; }
+  }
+  for l in f.temps {
+    if (type_is_float(l.type_name)) { return true; }
+  }
+  return false;
+}
+
+fn ad_reached(root: FunctionInfo, name: string) -> int64 {
+  for i in 0..root.reached.length {
+    if (root.reached[i].ir_name == name) { return i; }
+  }
+  return -1;
+}
+
+fn ad_variant_name(root: FunctionInfo, name: string) -> string {
+  return "{root.name}__ad__{name}";
+}
+
+fn ad_check_params(f: FunctionInfo) -> string {
+  for p in f.params {
+    var t: string = p.type_name;
+    var by_value: bool = !type_is_integer(t) && !type_is_float(t) &&
+                         t != "string" && t != "cstring" && t != "rawptr" &&
+                         t[t.length - 1] != '*' && t[t.length - 1] != ']';
+    if (by_value) {
+      return "'{f.name}' takes the struct '{p.source_name}' by value, and memory shadows follow addresses. Pass it by pointer";
+    }
+  }
+  return "";
+}
+
+fn ad_emit_op(r: Render*, op: IROp, root: FunctionInfo) {
+  var t: Text* = r.out;
+  if (op.op == "assign" && type_is_float(op.dest.type_name)) {
+    text_add(t, "  d__{op.dest.text} = {ad_shadow_of(op.lhs)};\n");
+    emit_op(r, op);
+    return;
+  }
+  if (op.op == "binary" && op.is_float && !operator_is_comparison(op.text)) {
+    var a: string = as_f64(op.lhs);
+    var b: string = as_f64(op.rhs);
+    var da: string = ad_shadow_of(op.lhs);
+    var db: string = ad_shadow_of(op.rhs);
+    if (op.text == "+") {
+      text_add(t, "  d__{op.dest.text} = ad_node({da}, 1.0, {db}, 1.0);\n");
+    } else if (op.text == "-") {
+      text_add(t, "  d__{op.dest.text} = ad_node({da}, 1.0, {db}, -1.0);\n");
+    } else if (op.text == "*") {
+      text_add(t, "  d__{op.dest.text} = ad_node({da}, {b}, {db}, {a});\n");
+    } else if (op.text == "/") {
+      text_add(t, "  d__{op.dest.text} = ad_node({da}, 1.0 / ({b}), {db}, -({a}) / (({b}) * ({b})));\n");
+    } else {
+      render_refuse(r, "the float operator '{op.text}' at line {op.line} has no derivative");
+    }
+    emit_op(r, op);
+    return;
+  }
+  if (op.op == "unary" && type_is_float(op.dest.type_name)) {
+    text_add(t, "  d__{op.dest.text} = ad_node({ad_shadow_of(op.lhs)}, -1.0, (int64)-1, 0.0);\n");
+    emit_op(r, op);
+    return;
+  }
+  if (op.op == "cast" && type_is_float(op.dest.type_name)) {
+    text_add(t, "  d__{op.dest.text} = {ad_shadow_of(op.lhs)};\n");
+    emit_op(r, op);
+    return;
+  }
+  if (op.op == "load" && op.is_float) {
+    text_add(t, "  d__{op.dest.text} = ad_shadow_get({value_read(op.lhs)});\n");
+    emit_op(r, op);
+    return;
+  }
+  if (op.op == "store") {
+    var width: string = scalar_type_of_size(op.rhs.text, false);
+    if (op.is_float || type_is_float(op.lhs.type_name)) {
+      text_add(t, "  ad_shadow_set({value_read(op.dest)}, {ad_shadow_of(op.lhs)});\n");
+    } else if (width.length == 0 || op.lhs.is_aggregate) {
+      if (op.lhs.is_aggregate) {
+        text_add(t, "  ad_shadow_copy({value_read(op.dest)}, (int64)&{op.lhs.text}, {op.rhs.text});\n");
+      } else {
+        text_add(t, "  ad_shadow_copy({value_read(op.dest)}, {value_read(op.lhs)}, {op.rhs.text});\n");
+      }
+    }
+    emit_op(r, op);
+    return;
+  }
+  if (op.op == "call") {
+    var deriv: string = "";
+    if (op.args.length == 1) {
+      deriv = ad_unary_derivative(op.text, as_f64(op.args[0]));
+    }
+    if (deriv.length > 0 && type_is_float(op.args[0].type_name)) {
+      text_add(t, "  d__{op.dest.text} = ad_node({ad_shadow_of(op.args[0])}, {deriv}, (int64)-1, 0.0);\n");
+      emit_op(r, op);
+      return;
+    }
+    if (op.text == "pow" && op.args.length == 2) {
+      var base: string = as_f64(op.args[0]);
+      var power: string = as_f64(op.args[1]);
+      text_add(t, "  d__{op.dest.text} = ad_node({ad_shadow_of(op.args[0])}, ({power}) * pow({base}, ({power}) - 1.0), {ad_shadow_of(op.args[1])}, pow({base}, {power}) * log({base}));\n");
+      emit_op(r, op);
+      return;
+    }
+    if ((op.text == "fmin" || op.text == "fmax") && op.args.length == 2) {
+      var x: string = as_f64(op.args[0]);
+      var y: string = as_f64(op.args[1]);
+      var compare: string = "<=";
+      if (op.text == "fmax") { compare = ">="; }
+      text_add(t, "  if (({x}) {compare} ({y})) {{ d__{op.dest.text} = {ad_shadow_of(op.args[0])}; } else {{ d__{op.dest.text} = {ad_shadow_of(op.args[1])}; }\n");
+      emit_op(r, op);
+      return;
+    }
+    var callee: int64 = ad_reached(root, op.text);
+    if (callee >= 0 && ad_touches_float(root.reached[callee])) {
+      var call: Text;
+      text_add(&call, "{ad_variant_name(root, root.reached[callee].name)}(");
+      for i in 0..op.args.length {
+        if (i > 0) { text_add(&call, ", "); }
+        var arg: IRValue = op.args[i];
+        if (i < op.arg_types.length && !arg.is_aggregate && arg.kind != VALUE_STRING) {
+          text_add(&call, cast_into(op.arg_types[i], value_read(arg)));
+        } else {
+          text_add(&call, value_read(arg));
+        }
+      }
+      for i in 0..op.args.length {
+        if (i < op.arg_types.length && type_is_float(op.arg_types[i])) {
+          text_add(&call, ", {ad_shadow_of(op.args[i])}");
+        }
+      }
+      text_add(&call, ")");
+      if (op.dest.kind == VALUE_NONE) {
+        text_add(t, "  {text_done(&call)};\n");
+      } else if (type_is_float(op.dest.type_name)) {
+        text_add(t, "  {op.dest.text} = {text_done(&call)};\n");
+        text_add(t, "  d__{op.dest.text} = ad_return_node;\n");
+      } else {
+        emit_store_to(r, op.dest, "(int64){text_done(&call)}");
+      }
+      return;
+    }
+    var float_argument: bool = type_is_float(op.dest.type_name);
+    for i in 0..op.args.length {
+      if (type_is_float(op.args[i].type_name)) { float_argument = true; }
+    }
+    if (float_argument) {
+      render_refuse(r, "the call to '{op.text}' at line {op.line} has no derivative. Write the function in Mettle, or add it to the table in std/meta");
+      return;
+    }
+    emit_op(r, op);
+    return;
+  }
+  emit_op(r, op);
+}
+
+fn ad_emit_nodes(r: Render*, nodes: IRNode[], f: FunctionInfo, root: FunctionInfo) {
+  for i in 0..nodes.length {
+    ad_emit_node(r, nodes[i], f, root);
+  }
+}
+
+fn ad_emit_node(r: Render*, node: IRNode, f: FunctionInfo, root: FunctionInfo) {
+  if (node.kind == NODE_SEQ) {
+    ad_emit_nodes(r, node.children, f, root);
+  } else if (node.kind == NODE_CODE) {
+    for i in 0..node.ops.length {
+      ad_emit_op(r, node.ops[i], root);
+    }
+  } else if (node.kind == NODE_IF) {
+    text_add(r.out, "  if ({condition_text(node.condition)}) {{\n");
+    ad_emit_nodes(r, node.then_body, f, root);
+    text_add(r.out, "  } else {{\n");
+    ad_emit_nodes(r, node.else_body, f, root);
+    text_add(r.out, "  }\n");
+  } else if (node.kind == NODE_LOOP) {
+    text_add(r.out, "  while (true) {{\n");
+    ad_emit_nodes(r, node.body, f, root);
+    text_add(r.out, "  }\n");
+  } else if (node.kind == NODE_BLOCK) {
+    text_add(r.out, "  switch (0) {{\n  default: {{\n");
+    ad_emit_nodes(r, node.body, f, root);
+    text_add(r.out, "  }\n  }\n");
+  } else if (node.kind == NODE_RETURN) {
+    if (node.returned.kind != VALUE_NONE) {
+      text_add(r.out, "  ad_return_node = {ad_shadow_of(node.returned)};\n");
+    }
+    emit_node(r, node, f);
+  } else {
+    emit_node(r, node, f);
+  }
+}
+
+fn ad_render_variant(t: Text*, r: Render*, f: FunctionInfo, root: FunctionInfo,
+                     name: string) {
+  if (f.refused.length > 0) {
+    render_refuse(r, "'{f.name}' has control flow with no structure: {f.refused}");
+    return;
+  }
+  var by_value: string = ad_check_params(f);
+  if (by_value.length > 0) {
+    render_refuse(r, by_value);
+    return;
+  }
+  text_add(t, "fn {name}(");
+  for i in 0..f.params.length {
+    if (i > 0) { text_add(t, ", "); }
+    text_add(t, "{f.params[i].name}: {f.params[i].type_name}");
+  }
+  var first: bool = f.params.length == 0;
+  for p in f.params {
+    if (type_is_float(p.type_name)) {
+      if (!first) { text_add(t, ", "); }
+      first = false;
+      text_add(t, "d__{p.name}: int64");
+    }
+  }
+  text_add(t, ")");
+  if (f.return_type != "void") { text_add(t, " -> {f.return_type}"); }
+  text_add(t, " {{\n");
+  render_declarations(t, f);
+  for l in f.locals {
+    if (type_is_float(l.type_name)) { text_add(t, "  var d__{l.name}: int64 = -1;\n"); }
+  }
+  for l in f.temps {
+    if (type_is_float(l.type_name)) { text_add(t, "  var d__{l.name}: int64 = -1;\n"); }
+  }
+  ad_emit_nodes(r, f.body, f, root);
+  text_add(t, "}\n\n");
+}
+
+fn ad_has_rule(name: string) -> bool {
+  return ad_unary_derivative(name, "x").length > 0 || name == "pow" ||
+         name == "fmin" || name == "fmax";
+}
+
+fn ad_mark_nodes(nodes: IRNode[], root: FunctionInfo, needed: bool[]) {
+  for n in 0..nodes.length {
+    var node: IRNode = nodes[n];
+    for i in 0..node.ops.length {
+      var op: IROp = node.ops[i];
+      if (op.op == "call" && !ad_has_rule(op.text)) {
+        var at: int64 = ad_reached(root, op.text);
+        if (at >= 0 && !needed[at] && ad_touches_float(root.reached[at])) {
+          needed[at] = true;
+          ad_mark_nodes(root.reached[at].body, root, needed);
+        }
+      }
+    }
+    ad_mark_nodes(node.children, root, needed);
+    ad_mark_nodes(node.then_body, root, needed);
+    ad_mark_nodes(node.else_body, root, needed);
+    ad_mark_nodes(node.body, root, needed);
+  }
+}
+
+fn grad_probe_value(probe: int64, param: int64) -> string {
+  if ((probe + param) % 4 == 0) { return "0.5"; }
+  if ((probe + param) % 4 == 1) { return "1.5"; }
+  if ((probe + param) % 4 == 2) { return "-0.75"; }
+  return "2.25";
+}
+
+@generate export fn grad(f: FunctionInfo) -> Generated {
+  if (!type_is_float(f.return_type)) {
+    return refuse("grad('{f.name}'): it returns '{f.return_type}', and a gradient needs a float");
+  }
+  var t: Text;
+  var r: Render;
+  r.out = &t;
+  var needed: bool[] = new bool[f.reached.length];
+  ad_mark_nodes(f.body, f, needed);
+  for i in 0..f.reached.length {
+    if (needed[i]) {
+      ad_render_variant(&t, &r, f.reached[i], f,
+                        ad_variant_name(f, f.reached[i].name));
+    }
+  }
+  var root_name: string = ad_variant_name(f, f.name);
+  ad_render_variant(&t, &r, f, f, root_name);
+  if (r.refused.length > 0) {
+    return refuse("grad('{f.name}'): {r.refused}");
+  }
+  text_add(&t, "struct {f.name}__gradient {{\n  value: float64;\n");
+  for p in f.params {
+    if (type_is_float(p.type_name)) {
+      text_add(&t, "  d_{p.source_name}: float64;\n");
+    } else if (p.type_name == "float64[]" || p.type_name == "float32[]") {
+      text_add(&t, "  d_{p.source_name}: float64[];\n");
+    }
+  }
+  text_add(&t, "}\n\n");
+  var grad_name: string = "{f.name}__grad";
+  text_add(&t, "fn {grad_name}(");
+  for i in 0..f.params.length {
+    if (i > 0) { text_add(&t, ", "); }
+    text_add(&t, "{f.params[i].name}: {f.params[i].type_name}");
+  }
+  text_add(&t, ") -> {f.name}__gradient {{\n  ad_begin();\n");
+  for p in f.params {
+    if (type_is_float(p.type_name)) {
+      text_add(&t, "  var d__{p.name}: int64 = ad_leaf();\n");
+    } else if (p.type_name == "float64[]") {
+      text_add(&t, "  var d__{p.name}: int64 = ad_seed_slice((int64){p.name}.data, 8, {p.name}.length);\n");
+    } else if (p.type_name == "float32[]") {
+      text_add(&t, "  var d__{p.name}: int64 = ad_seed_slice((int64){p.name}.data, 4, {p.name}.length);\n");
+    }
+  }
+  text_add(&t, "  var out: {f.name}__gradient;\n");
+  text_add(&t, "  out.value = (float64){root_name}({arguments_text(f)}");
+  for p in f.params {
+    if (type_is_float(p.type_name)) {
+      text_add(&t, ", d__{p.name}");
+    }
+  }
+  text_add(&t, ");\n  ad_sweep(ad_return_node);\n");
+  for p in f.params {
+    if (type_is_float(p.type_name)) {
+      text_add(&t, "  out.d_{p.source_name} = ad_adjoint(d__{p.name});\n");
+    } else if (p.type_name == "float64[]" || p.type_name == "float32[]") {
+      text_add(&t, "  out.d_{p.source_name} = new float64[{p.name}.length];\n");
+      text_add(&t, "  for i in 0..{p.name}.length {{\n");
+      text_add(&t, "    out.d_{p.source_name}[i] = ad_adjoint(d__{p.name} + i);\n  }\n");
+    }
+  }
+  text_add(&t, "  ad_end();\n  return out;\n}\n\n");
+  text_add(&t, grad_rule_text(f, grad_name));
+  return generated_as(grad_name, text_done(&t));
+}
+
+export fn ad_seed_slice(address: int64, stride: int64, length: int64) -> int64 {
+  var first: int64 = ad_count;
+  for i in 0..length {
+    ad_shadow_set(address + i * stride, ad_leaf());
+  }
+  return first;
+}
+
+fn grad_arguments(f: FunctionInfo, changed: int64, changed_text: string) -> string {
+  var t: Text;
+  for i in 0..f.params.length {
+    if (i > 0) { text_add(&t, ", "); }
+    if (i == changed) {
+      text_add(&t, changed_text);
+    } else {
+      text_add(&t, "a_{i}");
+    }
+  }
+  return text_done(&t);
+}
+
+fn grad_rule_text(f: FunctionInfo, grad_name: string) -> string {
+  var t: Text;
+  var site: string = "function_site(p, \"{f.name}\")";
+  text_add(&t, "@rule fn {f.name}__grad_holds(p: Program) -> Verdict {{\n");
+  for p in f.params {
+    var type_name: string = p.type_name;
+    if (!type_is_float(type_name) && !type_is_integer(type_name) &&
+        type_name != "float64[]" && type_name != "float32[]") {
+      text_add(&t, "  return verdict_gap({site}, \"grad could not probe the parameter '{p.source_name}'\");\n}\n");
+      return text_done(&t);
+    }
+  }
+  text_add(&t, "  var h: float64 = 0.00001;\n");
+  for probe in 0..3 {
+    text_add(&t, "  {{\n");
+    for i in 0..f.params.length {
+      var param: LocalInfo = f.params[i];
+      if (type_is_float(param.type_name)) {
+        text_add(&t, "    var a_{i}: {param.type_name} = ({param.type_name}){grad_probe_value(probe, i)};\n");
+      } else if (param.type_name == "float64[]" || param.type_name == "float32[]") {
+        var element: string = "float64";
+        if (param.type_name == "float32[]") { element = "float32"; }
+        text_add(&t, "    var a_{i}: {param.type_name} = new {element}[3];\n");
+        for k in 0..3 {
+          text_add(&t, "    a_{i}[{k}] = {grad_probe_value(probe + k, i)};\n");
+        }
+      } else if (param.type_name == "bool") {
+        text_add(&t, "    var a_{i}: bool = true;\n");
+      } else {
+        text_add(&t, "    var a_{i}: {param.type_name} = ({param.type_name})3;\n");
+      }
+    }
+    text_add(&t, "    var g: {f.name}__gradient = {grad_name}({grad_arguments(f, -1, "")});\n");
+    for i in 0..f.params.length {
+      var param: LocalInfo = f.params[i];
+      if (type_is_float(param.type_name)) {
+        var t_name: string = param.type_name;
+        text_add(&t, "    var up_{i}: float64 = (float64){f.name}({grad_arguments(f, i, "a_{i} + ({t_name})h")});\n");
+        text_add(&t, "    var down_{i}: float64 = (float64){f.name}({grad_arguments(f, i, "a_{i} - ({t_name})h")});\n");
+        text_add(&t, "    if (!grad_close((up_{i} - down_{i}) / (2.0 * h), g.d_{param.source_name})) {{\n");
+        text_add(&t, "      return verdict_fail({site}, \"grad of '{f.name}' disagrees with finite differences on '{param.source_name}'\");\n    }\n");
+      } else if (param.type_name == "float64[]" || param.type_name == "float32[]") {
+        text_add(&t, "    for k in 0..3 {{\n");
+        text_add(&t, "      var held: float64 = (float64)a_{i}[k];\n");
+        text_add(&t, "      a_{i}[k] = held + h;\n");
+        text_add(&t, "      var up: float64 = (float64){f.name}({grad_arguments(f, -1, "")});\n");
+        text_add(&t, "      a_{i}[k] = held - h;\n");
+        text_add(&t, "      var down: float64 = (float64){f.name}({grad_arguments(f, -1, "")});\n");
+        text_add(&t, "      a_{i}[k] = held;\n");
+        text_add(&t, "      if (!grad_close((up - down) / (2.0 * h), g.d_{param.source_name}[k])) {{\n");
+        text_add(&t, "        return verdict_fail({site}, \"grad of '{f.name}' disagrees with finite differences on '{param.source_name}'\");\n      }\n    }\n");
+      }
+    }
+    for i in 0..f.params.length {
+      var param: LocalInfo = f.params[i];
+      if (param.type_name == "float64[]" || param.type_name == "float32[]") {
+        text_add(&t, "    free(g.d_{param.source_name}.data);\n    free(a_{i}.data);\n");
+      }
+    }
+    text_add(&t, "  }\n");
+  }
+  text_add(&t, "  ad_release();\n  return verdict_pass();\n}\n");
+  return text_done(&t);
+}
+
+var trace_depth: int64 = 0;
+
+export fn trace_enter(name: string) {
+  for i in 0..trace_depth { print_err("  "); }
+  println_err("> {name}");
+  trace_depth = trace_depth + 1;
+}
+
+export fn trace_exit(name: string) {
+  trace_depth = trace_depth - 1;
+  for i in 0..trace_depth { print_err("  "); }
+  println_err("< {name}");
+}
+
+@generate export fn trace(f: FunctionInfo) -> Generated {
+  var t: Text;
+  var returns: bool = f.return_type != "void";
+  text_add(&t, "{signature_text(f.name, f)} {{\n");
+  text_add(&t, "  trace_enter(\"{f.name}\");\n");
+  if (returns) {
+    text_add(&t, "  var result: {f.return_type} = {f.inner_name}({arguments_text(f)});\n");
+  } else {
+    text_add(&t, "  {f.inner_name}({arguments_text(f)});\n");
+  }
+  text_add(&t, "  trace_exit(\"{f.name}\");\n");
+  if (returns) { text_add(&t, "  return result;\n"); }
+  text_add(&t, "}\n\n");
+  var problem: string = check_scalar_signature(f);
+  text_add(&t, "@rule fn {f.name}__trace_holds(p: Program) -> Verdict {{\n");
+  if (problem.length > 0 || !returns) {
+    text_add(&t, "  return verdict_gap(function_site(p, \"{f.inner_name}\"), \"@trace could not probe it\");\n");
+  } else {
+    text_add(&t, "  var impure: string = purity_problem(p, \"{f.inner_name}\", \"{f.name}\");\n");
+    text_add(&t, "  if (impure.length > 0) {{\n");
+    text_add(&t, "    return verdict_gap(function_site(p, \"{f.inner_name}\"), \"@trace could not probe it: {{impure}\");\n");
+    text_add(&t, "  }\n");
+    text_add(&t, equal_probes_text(f, f.name, f.inner_name));
+    text_add(&t, "  return verdict_pass();\n");
+  }
+  text_add(&t, "}\n");
+  return generated_as(f.name, text_done(&t));
+}
