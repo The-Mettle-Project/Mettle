@@ -23,6 +23,10 @@ static int dbg_type_display_name(MtlcType *type, char *buffer, size_t cap) {
     if (!dbg_type_display_name(type->base_type, inner, sizeof(inner))) {
       return 0;
     }
+    if (type->frontend_layout_type) {
+      snprintf(buffer, cap, "columns of %s", inner);
+      return 1;
+    }
     snprintf(buffer, cap, "%s[%zu]", inner, type->array_size);
     return 1;
   }
@@ -341,9 +345,12 @@ int code_generator_binary_emit_profile_tables(CodeGenerator *generator) {
               st->field_names && st->field_names[f] ? st->field_names[f] : "?";
           field_offsets[cursor] =
               st->field_offsets ? (uint64_t)st->field_offsets[f] : 0;
-          if (!dbg_type_display_name(
-                  st->field_types ? st->field_types[f] : NULL, display,
-                  sizeof(display))) {
+          if (st->field_bit_widths && st->field_bit_widths[f] > 0) {
+            snprintf(display, sizeof(display), "packed %u bits",
+                     st->field_bit_widths[f]);
+          } else if (!dbg_type_display_name(
+                         st->field_types ? st->field_types[f] : NULL, display,
+                         sizeof(display))) {
             snprintf(display, sizeof(display), "?");
           }
           field_type_names[cursor] = strdup(display);

@@ -69,6 +69,9 @@ typedef struct MtlcType {
   size_t tagged_variant_count;
   size_t tagged_data_offset;
   size_t tagged_data_size;
+
+  const void *frontend_layout_type;
+  const uint32_t *field_bit_widths;
 } MtlcType;
 
 const MtlcType *mtlc_type_scalar(MtlcTypeKind kind);

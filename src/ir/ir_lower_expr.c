@@ -3487,6 +3487,13 @@ static int ir_lower_new_expression(IRLoweringContext *context,
       return 0;
     }
     if (type_view_rank(slice_type) > 1) {
+      if (type_is_columnar(element)) {
+        ir_set_error(context,
+                     "A view of more than one dimension needs one element "
+                     "size, and '%s' keeps its fields in separate regions",
+                     element->name ? element->name : "?");
+        return 0;
+      }
       return ir_lower_new_view(context, function, expression, new_expression,
                                slice_type, out_value);
     }
@@ -3499,7 +3506,8 @@ static int ir_lower_new_expression(IRLoweringContext *context,
     }
 
     if (type_is_columnar(element)) {
-      if (!ir_emit_column_bytes(context, function, element, &count,
+      if (!ir_lower_live_note_columns(element) ||
+          !ir_emit_column_bytes(context, function, element, &count,
                                 expression->location, &bytes)) {
         ir_operand_destroy(&count);
         ir_operand_destroy(&pointer);

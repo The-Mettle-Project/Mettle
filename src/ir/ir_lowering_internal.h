@@ -280,6 +280,7 @@ int ir_lower_live_program(IRLoweringContext *context, IRProgram *program);
 void ir_lower_live_forget_sources(void);
 void ir_lower_live_forget_heap_types(void);
 int ir_lower_live_heap_type(const Type *type);
+int ir_lower_live_note_columns(const Type *type);
 int ir_lower_live_new(IRLoweringContext *context, IRFunction *function,
                       const IROperand *pointer, const IROperand *bytes,
                       const Type *type, const IROperand *count,

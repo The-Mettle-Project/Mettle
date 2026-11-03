@@ -772,6 +772,32 @@ void type_checker_reset_declared_type_templates(void) {
   g_declared_type_template_count = 0;
 }
 
+const Type *type_checker_find_custom_layout(const Type *type, int depth) {
+  if (!type || depth > 16) {
+    return NULL;
+  }
+  if (type->kind == TYPE_POINTER || type->kind == TYPE_ARRAY ||
+      type->kind == TYPE_SLICE) {
+    return type_checker_find_custom_layout(type->base_type, depth + 1);
+  }
+  if (type->kind != TYPE_STRUCT) {
+    return NULL;
+  }
+  if (type->meta_layout) {
+    return type;
+  }
+  for (size_t f = 0; f < type->field_count; f++) {
+    const Type *field = type->field_types ? type->field_types[f] : NULL;
+    if (field && field->kind != TYPE_POINTER) {
+      const Type *found = type_checker_find_custom_layout(field, depth + 1);
+      if (found) {
+        return found;
+      }
+    }
+  }
+  return NULL;
+}
+
 ASTNode *type_checker_declared_type_template(const char *name) {
   if (!name) {
     return NULL;
@@ -2378,6 +2404,34 @@ static int type_checker_process_function(TypeChecker *checker,
       if (!type_checker_validate_rule_signature(checker, declaration, func_decl,
                                                 rule_params, rule_return)) {
         return 0;
+      }
+    }
+
+    if (func_decl->is_extern || func_decl->is_kernel) {
+      Symbol *border =
+          symbol_table_lookup(checker->symbol_table, func_decl->name);
+      if (border && border->kind == SYMBOL_FUNCTION) {
+        for (size_t p = 0; p <= func_decl->parameter_count; p++) {
+          Type *crossing =
+              p < func_decl->parameter_count
+                  ? (border->data.function.parameter_types
+                         ? border->data.function.parameter_types[p]
+                         : NULL)
+                  : border->data.function.return_type;
+          const Type *custom = type_checker_find_custom_layout(crossing, 0);
+          if (custom) {
+            char message[400];
+            snprintf(message, sizeof(message),
+                     "'%s' has a custom layout from a metafunction, and "
+                     "'%s' reads memory by the default rules",
+                     custom->name ? custom->name : "?", func_decl->name);
+            error_reporter_add_error(checker->error_reporter, ERROR_SEMANTIC,
+                                     declaration->location, message);
+            error_reporter_set_last_code(checker->error_reporter, "L0004");
+            checker->has_error = 1;
+            return 0;
+          }
+        }
       }
     }
 

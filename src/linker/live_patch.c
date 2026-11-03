@@ -1759,6 +1759,13 @@ static int live_migrate_type(LiveBuilder *builder, const char *name,
   uint64_t name_at = 0;
   uint64_t old_at = 0;
   uint64_t new_at = 0;
+  if (old_layout[0] == 'C' || new_layout[0] == 'C') {
+    return live_builder_fail(
+        builder,
+        "Heap arrays of '%s' keep their fields in separate regions, and a "
+        "running program does not hold their element counts. Restart it",
+        name);
+  }
   if (!live_blob_text(builder, name, &name_at) ||
       !live_blob_text(builder, old_layout, &old_at) ||
       !live_blob_text(builder, new_layout, &new_at) ||

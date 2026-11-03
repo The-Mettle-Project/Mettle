@@ -238,6 +238,12 @@ MtlcType *mtlc_type_from_frontend(const Type *type) {
       type->tagged_variant_payloads, type->tagged_variant_count);
   out->tagged_data_offset = type->tagged_data_offset;
   out->tagged_data_size = type->tagged_data_size;
+  out->frontend_layout_type =
+      type->meta_layout ||
+              (type->kind == TYPE_ARRAY && type_is_columnar(type->base_type))
+          ? type
+          : NULL;
+  out->field_bit_widths = type->meta_layout ? type->field_bit_widths : NULL;
 
   return out;
 }

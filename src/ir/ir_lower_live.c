@@ -251,6 +251,77 @@ static void ir_live_text_number(IRLiveText *out, size_t value) {
 }
 
 static void ir_live_describe(IRLiveText *out, const MtlcType *type,
+                             unsigned depth);
+
+static void ir_live_describe_field_value(IRLiveText *out, const Type *owner,
+                                         size_t field, unsigned depth) {
+  const Type *field_type = owner->field_types[field];
+  const TypeMetaPlace *place = type_field_place(owner, field);
+  if (place && place->width > 0) {
+    int is_signed = field_type->kind == TYPE_INT8 ||
+                    field_type->kind == TYPE_INT16 ||
+                    field_type->kind == TYPE_INT32 ||
+                    field_type->kind == TYPE_INT64;
+    ir_live_text_add(out, "P");
+    ir_live_text_number(out, field_type->size);
+    ir_live_text_add(out, ",");
+    ir_live_text_number(out, place->word);
+    ir_live_text_add(out, ",");
+    ir_live_text_number(out, place->bit);
+    ir_live_text_add(out, ",");
+    ir_live_text_number(out, place->width);
+    ir_live_text_add(out, ",");
+    ir_live_text_number(out, place->scale);
+    ir_live_text_add(out, ",");
+    ir_live_text_number(out, is_signed ? 1u : 0u);
+    return;
+  }
+  ir_live_describe(out, mtlc_type_from_frontend(field_type), depth + 1u);
+}
+
+static void ir_live_describe_placed(IRLiveText *out, const Type *type,
+                                    unsigned depth) {
+  ir_live_text_add(out, "S");
+  ir_live_text_number(out, type->size);
+  ir_live_text_add(out, "{");
+  for (size_t i = 0; i < type->field_count; i++) {
+    ir_live_text_add(out, type->field_names[i] ? type->field_names[i] : "_");
+    ir_live_text_add(out, ":");
+    ir_live_text_number(out, type->field_offsets[i]);
+    ir_live_text_add(out, ":");
+    ir_live_describe_field_value(out, type, i, depth);
+    ir_live_text_add(out, ";");
+  }
+  ir_live_text_add(out, "}");
+}
+
+static void ir_live_describe_columns(IRLiveText *out, const Type *array,
+                                     unsigned depth) {
+  const Type *element = array->base_type;
+  ir_live_text_add(out, "S");
+  ir_live_text_number(out, array->size);
+  ir_live_text_add(out, "{");
+  for (size_t i = 0; i < element->field_count; i++) {
+    const TypeMetaPlace *place = type_field_place(element, i);
+    ir_live_text_add(out, element->field_names[i] ? element->field_names[i]
+                                                  : "_");
+    ir_live_text_add(out, ":");
+    ir_live_text_number(out, type_columns_region_base(element, place->region,
+                                                      array->array_size) +
+                                 place->offset);
+    ir_live_text_add(out, ":R");
+    ir_live_text_number(out, array->array_size);
+    ir_live_text_add(out, ",");
+    ir_live_text_number(out,
+                        element->meta_layout->regions[place->region].stride);
+    ir_live_text_add(out, "[");
+    ir_live_describe_field_value(out, element, i, depth);
+    ir_live_text_add(out, "];");
+  }
+  ir_live_text_add(out, "}");
+}
+
+static void ir_live_describe(IRLiveText *out, const MtlcType *type,
                              unsigned depth) {
   if (!type || depth > 8u) {
     ir_live_text_add(out, "x");
@@ -293,6 +364,11 @@ static void ir_live_describe(IRLiveText *out, const MtlcType *type,
     ir_live_text_add(out, "s16");
     return;
   case MTLC_TYPE_ARRAY:
+    if (type->frontend_layout_type) {
+      ir_live_describe_columns(out, (const Type *)type->frontend_layout_type,
+                               depth);
+      return;
+    }
     ir_live_text_add(out, "A");
     ir_live_text_number(out, type->array_size);
     ir_live_text_add(out, "[");
@@ -300,6 +376,11 @@ static void ir_live_describe(IRLiveText *out, const MtlcType *type,
     ir_live_text_add(out, "]");
     return;
   case MTLC_TYPE_STRUCT:
+    if (type->frontend_layout_type) {
+      ir_live_describe_placed(out, (const Type *)type->frontend_layout_type,
+                              depth);
+      return;
+    }
     if (type->field_count && type->field_names && type->field_types &&
         type->field_offsets) {
       ir_live_text_add(out, "S");
@@ -343,6 +424,11 @@ static uint64_t ir_live_type_hash(const MtlcType *type, unsigned depth) {
   hash = ir_live_mix(hash, (uint64_t)type->kind);
   hash = ir_live_mix(hash, (uint64_t)type->size);
   hash = ir_live_mix_text(hash, type->name);
+  if (type->frontend_layout_type) {
+    char *placed = ir_lower_live_descriptor(type);
+    hash = ir_live_mix_text(hash, placed);
+    free(placed);
+  }
   if (depth >= 6u) {
     return hash;
   }
@@ -1223,7 +1309,25 @@ static int ir_live_remember_type(const char *name, const char *layout) {
 
 int ir_lower_live_heap_type(const Type *type) {
   return g_ir_lowering_live && type && type->kind == TYPE_STRUCT &&
-         type->name && type->size > 0;
+         type->name && type->size > 0 && !type_is_columnar(type);
+}
+
+int ir_lower_live_note_columns(const Type *type) {
+  char *layout;
+  int ok;
+  if (!g_ir_lowering_live || !type_is_columnar(type) || !type->name) {
+    return 1;
+  }
+  layout = ir_lower_live_descriptor(mtlc_type_from_frontend(type));
+  if (!layout) {
+    return 0;
+  }
+  layout[0] = 'C';
+  ok = ir_live_remember_type(type->name, layout);
+  if (!ok) {
+    free(layout);
+  }
+  return ok;
 }
 
 int ir_lower_live_new(IRLoweringContext *context, IRFunction *function,

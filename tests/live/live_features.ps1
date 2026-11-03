@@ -153,6 +153,118 @@ if ($built.Code -ne 0) {
     if ($text -match "name=(?!flag)") { Fail $name "a name lost its value" }
 }
 
+$layoutsA = @'
+import "std/layout"
+
+struct Ship {
+    x: int32
+    fuel: float64
+    kind: uint8
+    next: Ship*
+}
+
+var fleet: Ship[3];
+var flagship: Ship;
+
+fn main() -> int32 {
+    fleet[1].x = 0;
+    fleet[2].fuel = 2.5;
+    fleet[0].kind = 5;
+    flagship.next = &flagship;
+    flagship.kind = 3;
+    var t: int64 = 0;
+    while (t < 2000) {
+        quiesce;
+        fleet[1].x = fleet[1].x + 1;
+        println("old t={t} x={fleet[1].x} fuel={fleet[2].fuel} kind={fleet[0].kind} self={flagship.next == &flagship} tag={flagship.kind}");
+        t = t + 1;
+        thread_sleep_ms((uint32)15);
+    }
+    return 0;
+}
+'@
+$layoutsB = $layoutsA.Replace('struct Ship {', '@tagged(next, kind, 3) struct Tagged {').Replace('println("old t=', 'println("new t=')
+$layoutsB = $layoutsB.Replace('var fleet: Ship[3];', @'
+@soa struct Column {
+    x: int32
+    fuel: float64
+    kind: uint8
+}
+
+var fleet: Column[3];
+'@).Replace('var flagship: Ship;', 'var flagship: Tagged;').Replace('next: Ship*', 'next: Tagged*')
+
+$name = "layouts"
+Clear-Program $name
+$source = Join-Path $scratch "$name.mettle"
+$exe = Join-Path $scratch "$name$suffix"
+Write-Source $source $layoutsA
+$built = Invoke-Mettle @("--build", "--live", $source, "-o", $exe)
+if ($built.Code -ne 0) {
+    Fail $name "build failed: $($built.Text)"
+} else {
+    $process = Start-Live $exe $name
+    $out = Join-Path $scratch "$name.out"
+    if (-not (Wait-For $out "old t=3 ")) { Fail $name "the program did not start" }
+    Write-Source $source $layoutsB
+    $patch = Invoke-Mettle @("--live-patch", $exe, $source)
+    if ($patch.Text -notmatch "2 globals converted to a new layout") { Fail $name "patch said: $($patch.Text)" }
+    if (-not (Wait-For $out "new t=\d+ ")) { Fail $name "main never moved to the new code" }
+    $undo = Invoke-Mettle @("--live-undo", $exe)
+    if ($undo.Text -notmatch "undoes patch 1") { Fail $name "undo said: $($undo.Text)" }
+    if (-not (Wait-For $out "new t=\d+ [^\n]*\n(.*\n)*old t=")) { Fail $name "undo never returned to the old code" }
+    Start-Sleep -Milliseconds 200
+    Stop-Live $process
+    $text = Read-Text $out
+    $gap = Get-Consecutive $text "x"
+    if ($gap) { Fail $name $gap }
+    if ($text -match "fuel=(?!2\.5)") { Fail $name "a column lost its value: $text" }
+    if ($text -match "kind=(?!5)") { Fail $name "a narrow column lost its value" }
+    if ($text -match "self=false") { Fail $name "a packed pointer lost its value" }
+    if ($text -match "tag=(?!3)") { Fail $name "a packed tag lost its value" }
+}
+
+$columnsHeapA = @'
+import "std/layout"
+
+@soa struct Ship {
+    x: int32
+    fuel: float64
+}
+
+fn main() -> int32 {
+    var fleet: Ship[] = new Ship[4];
+    var t: int64 = 0;
+    while (t < 2000) {
+        quiesce;
+        fleet[1].x = fleet[1].x + 1;
+        println("old t={t}");
+        t = t + 1;
+        thread_sleep_ms((uint32)15);
+    }
+    return 0;
+}
+'@
+$columnsHeapB = $columnsHeapA.Replace('fuel: float64', "fuel: float64`n    extra: int32")
+
+$name = "columns_heap"
+Clear-Program $name
+$source = Join-Path $scratch "$name.mettle"
+$exe = Join-Path $scratch "$name$suffix"
+Write-Source $source $columnsHeapA
+$built = Invoke-Mettle @("--build", "--live", $source, "-o", $exe)
+if ($built.Code -ne 0) {
+    Fail $name "build failed: $($built.Text)"
+} else {
+    $process = Start-Live $exe $name
+    $out = Join-Path $scratch "$name.out"
+    if (-not (Wait-For $out "old t=3")) { Fail $name "the program did not start" }
+    Write-Source $source $columnsHeapB
+    $patch = Invoke-Mettle @("--live-patch", $exe, $source)
+    if ($patch.Code -eq 0 -or $patch.Text -notmatch "separate regions") { Fail $name "the patch was not refused: $($patch.Text)" }
+    Stop-Live $process
+}
+
 $heapA = @'
 struct Ship {
     x: int32

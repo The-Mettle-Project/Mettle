@@ -30,6 +30,22 @@ static void print_provenance(AstPrinter *printer, const ASTNode *block) {
   fprintf(printer->out, "// %s\n", note);
 }
 
+static void print_meta_decorators(AstPrinter *printer,
+                                  const MetaDecorator *decorators,
+                                  size_t count) {
+  for (size_t d = 0; d < count; d++) {
+    fprintf(printer->out, "@%s", decorators[d].name);
+    if (decorators[d].arg_count > 0) {
+      fputc('(', printer->out);
+      for (size_t a = 0; a < decorators[d].arg_count; a++) {
+        fprintf(printer->out, "%s%s", a ? ", " : "", decorators[d].args[a]);
+      }
+      fputc(')', printer->out);
+    }
+    fputc(' ', printer->out);
+  }
+}
+
 static void print_unprintable(AstPrinter *printer, const char *what) {
   fprintf(printer->out, "/* <mettle expand: no source form for %s> */", what);
   printer->unprintable++;
@@ -466,6 +482,13 @@ static void print_function_declaration(AstPrinter *printer, const ASTNode *node)
   if (decl->is_rule) {
     fputs("@rule ", printer->out);
   }
+  if (decl->meta_role == META_ROLE_LAYOUT) {
+    fputs("@layout ", printer->out);
+  } else if (decl->meta_role == META_ROLE_GENERATE) {
+    fputs("@generate ", printer->out);
+  }
+  print_meta_decorators(printer, decl->meta_decorators,
+                        decl->meta_decorator_count);
   if (decl->is_swappable) {
     fputs("@swappable ", printer->out);
   }
@@ -527,6 +550,9 @@ static void print_declaration(AstPrinter *printer, const ASTNode *node) {
     if (!decl) {
       break;
     }
+    print_provenance(printer, node);
+    print_meta_decorators(printer, decl->meta_decorators,
+                          decl->meta_decorator_count);
     fprintf(printer->out, "struct %s {\n",
             decl->name ? decl->name : "<name>");
     for (size_t i = 0; i < decl->field_count; i++) {

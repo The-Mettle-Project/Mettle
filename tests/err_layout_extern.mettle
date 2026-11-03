@@ -1,0 +1,13 @@
+import "std/layout";
+
+@soa struct Point {
+  x: int32;
+  y: int64;
+}
+
+extern fn takes_point(p: Point*) -> int32 = "takes_point";
+
+fn main() -> int32 {
+  var q: Point;
+  return takes_point(&q);
+}

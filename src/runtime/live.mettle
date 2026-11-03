@@ -1447,6 +1447,23 @@ fn mettle_live_desc_skip(text: uint8*, length: int64, at: int64) -> int64 {
         cursor = mettle_live_desc_skip(text, length, cursor + 1);
         return cursor + 1;
     }
+    if (kind == 82) {
+        mettle_live_desc_read(text, length, &cursor);
+        cursor = cursor + 1;
+        mettle_live_desc_read(text, length, &cursor);
+        cursor = mettle_live_desc_skip(text, length, cursor + 1);
+        return cursor + 1;
+    }
+    if (kind == 80) {
+        mettle_live_desc_read(text, length, &cursor);
+        var part: int64 = 0;
+        while (part < 5) {
+            cursor = cursor + 1;
+            mettle_live_desc_read(text, length, &cursor);
+            part = part + 1;
+        }
+        return cursor;
+    }
     if (kind == 83) {
         mettle_live_desc_read(text, length, &cursor);
         cursor = cursor + 1;
@@ -1472,7 +1489,66 @@ fn mettle_live_desc_size(text: uint8*, length: int64, at: int64) -> int64 {
     if (kind == 65) {
         return count * mettle_live_desc_size(text, length, cursor + 1);
     }
+    if (kind == 82) {
+        cursor = cursor + 1;
+        return count * mettle_live_desc_read(text, length, &cursor);
+    }
     return count;
+}
+
+fn mettle_live_packed_part(text: uint8*, length: int64, at: int64, part: int64) -> int64 {
+    var cursor: int64 = at + 1;
+    var value: int64 = mettle_live_desc_read(text, length, &cursor);
+    var k: int64 = 0;
+    while (k < part) {
+        cursor = cursor + 1;
+        value = mettle_live_desc_read(text, length, &cursor);
+        k = k + 1;
+    }
+    return value;
+}
+
+fn mettle_live_read_packed(text: uint8*, length: int64, at: int64, address: int64) -> int64 {
+    var word: int64 = mettle_live_packed_part(text, length, at, 1);
+    var bit: int64 = mettle_live_packed_part(text, length, at, 2);
+    var width: int64 = mettle_live_packed_part(text, length, at, 3);
+    var scale: int64 = mettle_live_packed_part(text, length, at, 4);
+    var value: int64 = mettle_live_read_integer(117, word, address) >> bit;
+    var one: int64 = 1;
+    if (width < 64) {
+        value = value & ((one << width) - 1);
+        if (mettle_live_packed_part(text, length, at, 5) != 0) {
+            value = (value << (64 - width)) >> (64 - width);
+        }
+    }
+    return value << scale;
+}
+
+fn mettle_live_write_packed(text: uint8*, length: int64, at: int64, address: int64, value: int64) {
+    var word: int64 = mettle_live_packed_part(text, length, at, 1);
+    var bit: int64 = mettle_live_packed_part(text, length, at, 2);
+    var width: int64 = mettle_live_packed_part(text, length, at, 3);
+    var scale: int64 = mettle_live_packed_part(text, length, at, 4);
+    var mask: int64 = -1;
+    var one: int64 = 1;
+    if (width < 64) {
+        mask = (one << width) - 1;
+    }
+    var stored: int64 = mettle_live_read_integer(117, word, address);
+    stored = (stored & ~(mask << bit)) | (((value >> scale) & mask) << bit);
+    mettle_live_write_integer(word, address, stored);
+}
+
+fn mettle_live_desc_strided(text: uint8*, length: int64, at: int64, count: int64*, stride: int64*) -> int64 {
+    var cursor: int64 = at + 1;
+    *count = mettle_live_desc_read(text, length, &cursor);
+    if ((int64)text[at] == 82) {
+        cursor = cursor + 1;
+        *stride = mettle_live_desc_read(text, length, &cursor);
+        return cursor + 1;
+    }
+    *stride = mettle_live_desc_size(text, length, cursor + 1);
+    return cursor + 1;
 }
 
 fn mettle_live_desc_field(text: uint8*, length: int64, at: int64, name: uint8*, name_start: int64, name_end: int64, offset: int64*) -> int64 {
@@ -1601,31 +1677,125 @@ fn mettle_live_convert(target: int64, to: uint8*, to_length: int64, to_at: int64
         }
         return;
     }
-    if (to_kind == 65 && from_kind == 65) {
-        var to_cursor: int64 = to_at + 1;
-        var to_count: int64 = mettle_live_desc_read(to, to_length, &to_cursor);
-        var from_cursor: int64 = from_at + 1;
-        var from_count: int64 = mettle_live_desc_read(from, from_length, &from_cursor);
-        var to_stride: int64 = mettle_live_desc_size(to, to_length, to_cursor + 1);
-        var from_stride: int64 = mettle_live_desc_size(from, from_length, from_cursor + 1);
+    if ((to_kind == 65 || to_kind == 82) && (from_kind == 65 || from_kind == 82)) {
+        var to_count: int64 = 0;
+        var to_stride: int64 = 0;
+        var to_element: int64 = mettle_live_desc_strided(to, to_length, to_at, &to_count, &to_stride);
+        var from_count: int64 = 0;
+        var from_stride: int64 = 0;
+        var from_element: int64 = mettle_live_desc_strided(from, from_length, from_at, &from_count, &from_stride);
         var k: int64 = 0;
         while (k < to_count && k < from_count) {
-            mettle_live_convert(target + k * to_stride, to, to_length, to_cursor + 1, source + k * from_stride, from, from_length, from_cursor + 1);
+            mettle_live_convert(target + k * to_stride, to, to_length, to_element, source + k * from_stride, from, from_length, from_element);
             k = k + 1;
+        }
+        return;
+    }
+    if (to_kind == 83 && (from_kind == 65 || from_kind == 82)) {
+        var count: int64 = 0;
+        var stride: int64 = 0;
+        var element: int64 = mettle_live_desc_strided(from, from_length, from_at, &count, &stride);
+        if ((int64)from[element] != 83) {
+            return;
+        }
+        var column: int64 = to_at + 1;
+        mettle_live_desc_read(to, to_length, &column);
+        column = column + 1;
+        while (column < to_length && to[column] != (uint8)125) {
+            var start: int64 = column;
+            while (to[column] != (uint8)58) {
+                column = column + 1;
+            }
+            var end: int64 = column;
+            column = column + 1;
+            var place: int64 = mettle_live_desc_read(to, to_length, &column);
+            column = column + 1;
+            var column_type: int64 = column;
+            column = mettle_live_desc_skip(to, to_length, column) + 1;
+            var kept_offset: int64 = 0;
+            var kept: int64 = mettle_live_desc_field(from, from_length, element, to, start, end, &kept_offset);
+            if (kept >= 0 && ((int64)to[column_type] == 82 || (int64)to[column_type] == 65)) {
+                var column_count: int64 = 0;
+                var column_stride: int64 = 0;
+                var column_element: int64 = mettle_live_desc_strided(to, to_length, column_type, &column_count, &column_stride);
+                var n: int64 = 0;
+                while (n < column_count && n < count) {
+                    mettle_live_convert(target + place + n * column_stride, to, to_length, column_element, source + n * stride + kept_offset, from, from_length, kept);
+                    n = n + 1;
+                }
+            }
+        }
+        return;
+    }
+    if ((to_kind == 65 || to_kind == 82) && from_kind == 83) {
+        var rows: int64 = 0;
+        var row_stride: int64 = 0;
+        var row: int64 = mettle_live_desc_strided(to, to_length, to_at, &rows, &row_stride);
+        if ((int64)to[row] != 83) {
+            return;
+        }
+        var part: int64 = row + 1;
+        mettle_live_desc_read(to, to_length, &part);
+        part = part + 1;
+        while (part < to_length && to[part] != (uint8)125) {
+            var part_start: int64 = part;
+            while (to[part] != (uint8)58) {
+                part = part + 1;
+            }
+            var part_end: int64 = part;
+            part = part + 1;
+            var part_offset: int64 = mettle_live_desc_read(to, to_length, &part);
+            part = part + 1;
+            var part_type: int64 = part;
+            part = mettle_live_desc_skip(to, to_length, part) + 1;
+            var column_offset: int64 = 0;
+            var old_column: int64 = mettle_live_desc_field(from, from_length, from_at, to, part_start, part_end, &column_offset);
+            if (old_column >= 0 && ((int64)from[old_column] == 82 || (int64)from[old_column] == 65)) {
+                var old_count: int64 = 0;
+                var old_stride: int64 = 0;
+                var old_element: int64 = mettle_live_desc_strided(from, from_length, old_column, &old_count, &old_stride);
+                var m: int64 = 0;
+                while (m < rows && m < old_count) {
+                    mettle_live_convert(target + m * row_stride + part_offset, to, to_length, part_type, source + column_offset + m * old_stride, from, from_length, old_element);
+                    m = m + 1;
+                }
+            }
         }
         return;
     }
     var to_scalar: int64 = 0;
     var from_scalar: int64 = 0;
-    if (to_kind == 105 || to_kind == 117 || to_kind == 98 || to_kind == 101 || to_kind == 112 || to_kind == 102) {
+    if (to_kind == 105 || to_kind == 117 || to_kind == 98 || to_kind == 101 || to_kind == 112 || to_kind == 102 || to_kind == 80) {
         to_scalar = 1;
     }
-    if (from_kind == 105 || from_kind == 117 || from_kind == 98 || from_kind == 101 || from_kind == 112 || from_kind == 102) {
+    if (from_kind == 105 || from_kind == 117 || from_kind == 98 || from_kind == 101 || from_kind == 112 || from_kind == 102 || from_kind == 80) {
         from_scalar = 1;
     }
     if (to_scalar == 0 || from_scalar == 0) {
         if (to_kind == from_kind && to_size == from_size) {
             mettle_live_copy(target, source, to_size);
+        }
+        return;
+    }
+    if (from_kind == 80 || to_kind == 80) {
+        var moved: int64 = 0;
+        if (from_kind == 80) {
+            moved = mettle_live_read_packed(from, from_length, from_at, source);
+        } else if (from_kind == 102) {
+            moved = (int64)mettle_live_read_float(from_size, source);
+        } else {
+            moved = mettle_live_read_integer(from_kind, from_size, source);
+        }
+        if (to_kind == 80) {
+            mettle_live_write_packed(to, to_length, to_at, target, moved);
+        } else if (to_kind == 102) {
+            mettle_live_write_float(to_size, target, (float64)moved);
+        } else if (to_kind == 98) {
+            if (moved != 0) {
+                mettle_live_write_integer(to_size, target, 1);
+            }
+        } else {
+            mettle_live_write_integer(to_size, target, moved);
         }
         return;
     }

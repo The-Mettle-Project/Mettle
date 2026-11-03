@@ -5326,6 +5326,41 @@ static int compile_monomorphize(ASTNode *program,
 }
 
 static const char *expand_annotate(void *context, const ASTNode *block) {
+  if (block && block->type == AST_STRUCT_DECLARATION && block->data) {
+    const TypeMetaLayout *layout =
+        ((const StructDeclaration *)block->data)->meta_layout;
+    static char note[4096];
+    size_t used = 0;
+    if (!layout) {
+      return NULL;
+    }
+    used += (size_t)snprintf(note, sizeof(note), "layout from @%s, %zu region%s:",
+                             layout->written_by ? layout->written_by : "?",
+                             layout->region_count,
+                             layout->region_count == 1 ? "" : "s");
+    for (size_t r = 0; r < layout->region_count && used < sizeof(note); r++) {
+      used += (size_t)snprintf(note + used, sizeof(note) - used,
+                               " [stride %zu align %zu]",
+                               layout->regions[r].stride,
+                               layout->regions[r].alignment);
+    }
+    for (size_t p = 0; p < layout->place_count && used < sizeof(note); p++) {
+      const TypeMetaPlace *place = &layout->places[p];
+      used += (size_t)snprintf(note + used, sizeof(note) - used,
+                               " %s=%u+%zu", place->field, place->region,
+                               place->offset);
+      if (place->width > 0 && used < sizeof(note)) {
+        used += (size_t)snprintf(note + used, sizeof(note) - used,
+                                 ".%u:%u<<%u", place->bit, place->width,
+                                 place->scale);
+      }
+    }
+    if (layout->allocator && used < sizeof(note)) {
+      snprintf(note + used, sizeof(note) - used, " allocated by %s",
+               layout->allocator);
+    }
+    return note;
+  }
   return type_checker_expansion_note((TypeChecker *)context, block, NULL);
 }
 
