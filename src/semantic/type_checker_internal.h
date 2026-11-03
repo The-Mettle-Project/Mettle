@@ -89,6 +89,7 @@ int type_checker_check_gpu_intrinsic_declaration(TypeChecker *checker,
 int type_checker_static_view_index_is_bounded(TypeChecker *checker,
                                               ASTNode *index, size_t extent);
 ASTNode *type_checker_declared_type_template(const char *name);
+void type_checker_reset_declared_type_templates(void);
 Type *type_checker_instantiate_declared_type(TypeChecker *checker,
                                              const char *base_name,
                                              const char *argument_text);

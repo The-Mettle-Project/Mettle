@@ -506,6 +506,25 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
                                    IRFunction *function, ASTNode *expression,
                                    IROperand *out_address, Type **out_type);
 
+int ir_expression_is_column_element(IRLoweringContext *context,
+                                    ASTNode *expression);
+int ir_lower_column_element_load(IRLoweringContext *context,
+                                 IRFunction *function, ASTNode *expression,
+                                 IROperand *out_value);
+int ir_lower_column_element_store(IRLoweringContext *context,
+                                  IRFunction *function, ASTNode *target,
+                                  ASTNode *value_node, SourceLocation location);
+int ir_emit_column_bytes(IRLoweringContext *context, IRFunction *function,
+                         Type *element, const IROperand *count,
+                         SourceLocation location, IROperand *out);
+int ir_expression_is_packed_field(IRLoweringContext *context,
+                                  ASTNode *expression);
+int ir_lower_packed_load(IRLoweringContext *context, IRFunction *function,
+                         ASTNode *expression, IROperand *out_value);
+int ir_lower_packed_store(IRLoweringContext *context, IRFunction *function,
+                          ASTNode *target, const IROperand *value,
+                          SourceLocation location);
+
 int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
                                ASTNode *expression, IROperand *out_value);
 

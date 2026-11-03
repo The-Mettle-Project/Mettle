@@ -36,6 +36,30 @@ typedef enum {
   TYPE_SEQUENCE
 } TypeKind;
 
+typedef struct {
+  size_t stride;
+  size_t alignment;
+} TypeMetaRegion;
+
+typedef struct {
+  const char *field;
+  uint32_t region;
+  size_t offset;
+  uint32_t word;
+  uint32_t bit;
+  uint32_t width;
+  uint32_t scale;
+} TypeMetaPlace;
+
+typedef struct TypeMetaLayout {
+  TypeMetaRegion *regions;
+  size_t region_count;
+  TypeMetaPlace *places;
+  size_t place_count;
+  const char *allocator;
+  const char *written_by;
+} TypeMetaLayout;
+
 typedef enum {
   DEVICE_SPACE_NONE = 0,
   DEVICE_SPACE_GENERIC,
@@ -89,6 +113,7 @@ typedef struct Type {
   uint32_t *field_bit_offsets;
   uint32_t *field_bit_widths;
   size_t field_count;
+  const struct TypeMetaLayout *meta_layout;
 
   char **tagged_variant_names;
   int *tagged_variant_tags;
@@ -159,6 +184,7 @@ typedef struct Symbol {
   MtlcAddressSpace address_space;
   int is_builtin;
   int is_rule;
+  int is_meta;
   int is_kernel;
   int kernel_block[3];
   int kernel_threads_per_item;
@@ -264,6 +290,13 @@ int type_alloc_fields(Type *type, size_t field_count);
 int type_set_field(Type *type, size_t index, const char *name,
                    Type *field_type, uint32_t bit_width);
 int type_compute_layout(Type *type);
+int type_is_columnar(const Type *type);
+const TypeMetaPlace *type_field_place(const Type *type, size_t index);
+int type_field_is_packed(const Type *type, size_t index);
+size_t type_columns_region_base(const Type *type, size_t region, size_t count);
+size_t type_columns_bytes(const Type *type, size_t count);
+int type_apply_meta_layout(Type *type, TypeMetaLayout *layout, char *why,
+                           size_t why_size);
 
 size_t type_field_count(const Type *type);
 int type_field_at(const Type *type, size_t index, TypeField *out);

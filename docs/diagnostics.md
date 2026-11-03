@@ -129,6 +129,19 @@ Rule diagnostics:
 
 [Rules](rules.md) covers the R codes in context.
 
+Metaprogram diagnostics:
+
+| Code | Meaning |
+|------|---------|
+| L0001 | A metafunction could not run |
+| L0002 | A layout failed its proof |
+| L0003 | An operation needs an address or a count the layout lacks |
+| L0004 | A custom layout crossed extern or a kernel |
+| L0005 | A generator stated no relation |
+| L0006 | A metafunction reaches a type whose layout it decides |
+
+[The metaobject protocol](design/metaobject.md) covers the L codes in context.
+
 Proof diagnostics:
 
 | Code | Meaning |

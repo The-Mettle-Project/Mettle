@@ -379,6 +379,31 @@ static void report_leaks(ErrorReporter *reporter, IRInterpMachine *machine,
   }
 }
 
+int ir_rule_image_place(IRInterpMachine *machine, const IRRuleImage *image,
+                        unsigned long long *out_address) {
+  unsigned char *bytes = malloc(image->size ? image->size : 1);
+  if (!bytes) {
+    return 0;
+  }
+  memcpy(bytes, image->bytes, image->size);
+  unsigned long long base = ir_interp_next_buffer_address(machine);
+  for (size_t i = 0; i < image->pointer_count; i++) {
+    size_t offset = image->pointer_offsets[i];
+    unsigned long long value = 0;
+    if (offset + 8 > image->size) {
+      continue;
+    }
+    memcpy(&value, bytes + offset, 8);
+    value += base;
+    memcpy(bytes + offset, &value, 8);
+  }
+  unsigned long long address =
+      ir_interp_add_buffer(machine, bytes, (long long)image->size);
+  free(bytes);
+  *out_address = address;
+  return address == base;
+}
+
 static int run_one_rule(IRProgram *program, IRFunction *rule,
                         const IRRuleImage *image, ErrorReporter *reporter,
                         FILE *report, long long fuel, IRRuleStats *stats,

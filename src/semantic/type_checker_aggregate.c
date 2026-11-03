@@ -46,6 +46,7 @@ static int aggregate_image_add_runtime_store(AggregateImage *out, size_t offset,
   out->runtime_stores[out->runtime_store_count].offset = offset;
   out->runtime_stores[out->runtime_store_count].element = element;
   out->runtime_stores[out->runtime_store_count].element_type = type;
+  out->runtime_stores[out->runtime_store_count].packed_place = NULL;
   out->runtime_store_count++;
   return 1;
 }
@@ -538,6 +539,33 @@ static int aggregate_fold_struct(TypeChecker *checker, ASTNode *expression,
             "field '%s' is initialized twice in this struct literal", name);
         return 0;
       }
+    }
+
+    if (type_field_is_packed(type, field)) {
+      Type *element_type =
+          type_checker_infer_type(checker, literal->elements[i]);
+      if (!element_type) {
+        return 0;
+      }
+      if (!(type_checker_type_accepts_null_pointer(type->field_types[field]) &&
+            type_checker_is_null_pointer_constant(literal->elements[i])) &&
+          !type_checker_is_assignable_from(checker, type->field_types[field],
+                                           element_type,
+                                           literal->elements[i])) {
+        type_checker_report_assign_mismatch(
+            checker, literal->elements[i], literal->elements[i]->location,
+            type->field_types[field], element_type);
+        return 0;
+      }
+      if (!aggregate_image_add_runtime_store(out,
+                                             offset + type->field_offsets[field],
+                                             literal->elements[i],
+                                             type->field_types[field])) {
+        return 0;
+      }
+      out->runtime_stores[out->runtime_store_count - 1].packed_place =
+          type_field_place(type, field);
+      continue;
     }
 
     if (!aggregate_fold_element(checker, literal->elements[i],

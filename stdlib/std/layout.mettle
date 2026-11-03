@@ -1,0 +1,208 @@
+import "std/rule";
+
+export struct Region {
+  stride: int64;
+  align: int64;
+}
+
+export struct Place {
+  field: string;
+  region: int64;
+  offset: int64;
+  word: int64;
+  bit: int64;
+  width: int64;
+  scale: int64;
+}
+
+export struct Layout {
+  regions: Region[];
+  places: Place[];
+  allocator: string;
+}
+
+fn align_to(value: int64, alignment: int64) -> int64 {
+  if (alignment <= 1) { return value; }
+  return ((value + alignment - 1) / alignment) * alignment;
+}
+
+export fn layout_type(p: Program, name: string) -> TypeInfo {
+  for t in p.types {
+    if (t.name == name) { return t; }
+  }
+  var none: TypeInfo;
+  return none;
+}
+
+export fn layout_default(t: TypeInfo) -> Layout {
+  var l: Layout;
+  l.regions = new Region[1];
+  l.places = new Place[t.fields.length];
+  l.regions[0].stride = t.size;
+  l.regions[0].align = t.align;
+  for i in 0..t.fields.length {
+    l.places[i].field = t.fields[i].name;
+    l.places[i].offset = t.fields[i].offset;
+  }
+  return l;
+}
+
+export fn layout_field(t: TypeInfo, name: string) -> FieldInfo {
+  for f in t.fields {
+    if (f.name == name) { return f; }
+  }
+  var none: FieldInfo;
+  return none;
+}
+
+fn sort_fields_by_align(t: TypeInfo, order: int64[]) {
+  for i in 0..order.length { order[i] = i; }
+  var i: int64 = 1;
+  while (i < order.length) {
+    var moving: int64 = order[i];
+    var j: int64 = i - 1;
+    while (j >= 0 && t.fields[order[j]].align < t.fields[moving].align) {
+      order[j + 1] = order[j];
+      j = j - 1;
+    }
+    order[j + 1] = moving;
+    i = i + 1;
+  }
+}
+
+@layout export fn soa(t: TypeInfo, l: Layout) -> Layout {
+  var out: Layout;
+  var order: int64[] = new int64[t.fields.length];
+  sort_fields_by_align(t, order);
+  out.regions = new Region[t.fields.length];
+  out.places = new Place[t.fields.length];
+  for r in 0..order.length {
+    var f: FieldInfo = t.fields[order[r]];
+    out.regions[r].stride = f.size;
+    out.regions[r].align = f.align;
+    out.places[r].field = f.name;
+    out.places[r].region = r;
+  }
+  out.allocator = l.allocator;
+  return out;
+}
+
+fn name_listed(name: string, names: string[]) -> bool {
+  for n in names {
+    if (n == name) { return true; }
+  }
+  return false;
+}
+
+@layout export fn hot_cold(t: TypeInfo, l: Layout, hot: string[]) -> Layout {
+  var out: Layout;
+  var order: int64[] = new int64[t.fields.length];
+  sort_fields_by_align(t, order);
+  out.regions = new Region[2];
+  out.places = new Place[t.fields.length];
+  var region: int64 = 0;
+  var at: int64 = 0;
+  while (region < 2) {
+    var offset: int64 = 0;
+    var widest: int64 = 1;
+    for i in 0..order.length {
+      var f: FieldInfo = t.fields[order[i]];
+      var is_hot: bool = name_listed(f.name, hot);
+      if ((region == 0) == is_hot) {
+        offset = align_to(offset, f.align);
+        out.places[at].field = f.name;
+        out.places[at].region = region;
+        out.places[at].offset = offset;
+        at = at + 1;
+        offset = offset + f.size;
+        if (f.align > widest) { widest = f.align; }
+      }
+    }
+    out.regions[region].stride = align_to(offset, widest);
+    out.regions[region].align = widest;
+    region = region + 1;
+  }
+  out.allocator = l.allocator;
+  return out;
+}
+
+@layout export fn compact(t: TypeInfo, l: Layout) -> Layout {
+  var out: Layout;
+  var order: int64[] = new int64[t.fields.length];
+  sort_fields_by_align(t, order);
+  out.regions = new Region[1];
+  out.places = new Place[t.fields.length];
+  var offset: int64 = 0;
+  var widest: int64 = 1;
+  for i in 0..order.length {
+    var f: FieldInfo = t.fields[order[i]];
+    offset = align_to(offset, f.align);
+    out.places[i].field = f.name;
+    out.places[i].offset = offset;
+    offset = offset + f.size;
+    if (f.align > widest) { widest = f.align; }
+  }
+  out.regions[0].stride = align_to(offset, widest);
+  out.regions[0].align = widest;
+  out.allocator = l.allocator;
+  return out;
+}
+
+export fn tag_bits_in_pointer(t: TypeInfo, l: Layout, pointer: string,
+                              tag: string, bits: int64) -> Layout {
+  var out: Layout = l;
+  var p: FieldInfo = layout_field(t, pointer);
+  var word_offset: int64 = 0;
+  var removed: int64 = 0;
+  for i in 0..out.places.length {
+    if (out.places[i].field == pointer) { word_offset = out.places[i].offset; }
+    if (out.places[i].field == tag) { removed = out.places[i].offset; }
+  }
+  for i in 0..out.places.length {
+    if (out.places[i].field == pointer) {
+      out.places[i].word = 8;
+      out.places[i].bit = bits;
+      out.places[i].width = 64 - bits;
+      out.places[i].scale = bits;
+    }
+    if (out.places[i].field == tag) {
+      out.places[i].offset = word_offset;
+      out.places[i].word = 8;
+      out.places[i].bit = 0;
+      out.places[i].width = bits;
+      out.places[i].scale = 0;
+    } else if (out.places[i].field != pointer && out.places[i].offset > removed) {
+      out.places[i].offset = out.places[i].offset - layout_field(t, tag).size;
+    }
+  }
+  return out;
+}
+
+fn parse_small(text: string) -> int64 {
+  var value: int64 = 0;
+  for i in 0..text.length {
+    value = value * 10 + ((int64)text[i] - 48);
+  }
+  return value;
+}
+
+@layout export fn tagged(t: TypeInfo, l: Layout, args: string[]) -> Layout {
+  var compacted: Layout = compact(t, l);
+  var out: Layout = tag_bits_in_pointer(t, compacted, args[0], args[1],
+                                        parse_small(args[2]));
+  var end: int64 = 0;
+  for i in 0..out.places.length {
+    var f: FieldInfo = layout_field(t, out.places[i].field);
+    var taken: int64 = f.size;
+    if (out.places[i].width > 0) { taken = 8; }
+    if (out.places[i].offset + taken > end) { end = out.places[i].offset + taken; }
+  }
+  out.regions[0].stride = align_to(end, out.regions[0].align);
+  return out;
+}
+
+@layout export fn allocate_with(t: TypeInfo, l: Layout, args: string[]) -> Layout {
+  var out: Layout = l;
+  out.allocator = args[0];
+  return out;
+}

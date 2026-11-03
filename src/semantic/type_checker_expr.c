@@ -3653,12 +3653,13 @@ static Type *type_checker_infer_user_call(TypeChecker *checker,
         checker->current_function_decl && checker->current_function_decl->data
             ? (FunctionDeclaration *)checker->current_function_decl->data
             : NULL;
-    if (!caller || !caller->is_rule) {
+    if (!caller || (!caller->is_rule && !caller->meta_role)) {
       char error_msg[256];
       snprintf(error_msg, sizeof(error_msg),
-               "'%s' is a @rule: it runs while compiling and is not part of "
+               "'%s' is a %s: it runs while compiling and is not part of "
                "the program, so the program cannot call it",
-               call->function_name);
+               call->function_name,
+               func_symbol->is_meta ? "metafunction" : "@rule");
       checker->has_error = 1;
       free(checker->error_message);
       checker->error_message = strdup(error_msg);

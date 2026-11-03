@@ -5,6 +5,8 @@
 #include "../ir/ir_rules.h"
 #include "../ir/ir_effects.h"
 
+const char *rule_reflect_strip_import_prefix(const char *name);
+
 int rule_reflect_build(TypeChecker *checker, ASTNode *program,
                        const char *root_file, const char *target,
                        const IREffectResults *effects, IRRuleImage *out,

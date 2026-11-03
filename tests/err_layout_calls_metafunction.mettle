@@ -1,0 +1,8 @@
+import "std/layout";
+
+fn main() -> int32 {
+  var t: TypeInfo;
+  var l: Layout;
+  var out: Layout = soa(t, l);
+  return 0;
+}

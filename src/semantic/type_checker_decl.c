@@ -359,6 +359,16 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
         "Failed to compute layout for struct '%s'", decl->name);
     return 0;
   }
+  if (decl->meta_layout) {
+    char why[512];
+    if (!type_apply_meta_layout(struct_type, decl->meta_layout, why,
+                                sizeof(why))) {
+      free(field_types);
+      type_checker_set_error_at_location(checker, struct_decl->location,
+                                         "%s", why);
+      return 0;
+    }
+  }
   if (struct_type->size > (size_t)INT_MAX) {
     free(field_types);
     type_checker_set_error_at_location(
@@ -758,6 +768,10 @@ int type_checker_predicate_is_uniform(ASTNode *predicate,
 static ASTNode *g_declared_type_templates[64];
 static size_t g_declared_type_template_count = 0;
 
+void type_checker_reset_declared_type_templates(void) {
+  g_declared_type_template_count = 0;
+}
+
 ASTNode *type_checker_declared_type_template(const char *name) {
   if (!name) {
     return NULL;
@@ -839,6 +853,7 @@ int type_checker_process_type_declaration(TypeChecker *checker,
   refined->field_bit_offsets = base->field_bit_offsets;
   refined->field_bit_widths = base->field_bit_widths;
   refined->field_count = base->field_count;
+  refined->meta_layout = base->meta_layout;
   refined->refinement = decl->predicate;
   refined->refine_binding =
       decl->binding ? string_intern(decl->binding) : "value";
@@ -925,6 +940,7 @@ Type *type_checker_instantiate_declared_type(TypeChecker *checker,
   refined->field_bit_offsets = base->field_bit_offsets;
   refined->field_bit_widths = base->field_bit_widths;
   refined->field_count = base->field_count;
+  refined->meta_layout = base->meta_layout;
   refined->refinement = decl->predicate;
   refined->refine_binding =
       decl->binding ? string_intern(decl->binding) : "value";

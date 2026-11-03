@@ -11,6 +11,8 @@ export struct FieldInfo {
   type_name: string;
   offset: int64;
   size: int64;
+  align: int64;
+  pointee_align: int64;
 }
 
 export struct TypeInfo {

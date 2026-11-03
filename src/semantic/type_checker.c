@@ -369,7 +369,8 @@ int type_checker_register_function_signature(TypeChecker *checker,
   func_symbol->data.function.return_type = return_type;
   func_symbol->data.function.is_variadic = func_decl->is_variadic;
   func_symbol->is_kernel = func_decl->is_kernel;
-  func_symbol->is_rule = func_decl->is_rule;
+  func_symbol->is_rule = func_decl->is_rule || func_decl->meta_role;
+  func_symbol->is_meta = func_decl->meta_role != META_ROLE_NONE;
   func_symbol->kernel_block[0] = func_decl->kernel_block[0];
   func_symbol->kernel_block[1] = func_decl->kernel_block[1];
   func_symbol->kernel_block[2] = func_decl->kernel_block[2];

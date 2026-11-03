@@ -679,7 +679,54 @@ typedef struct {
   int conflict_free_mode;
   int parallel_mode;
   char *numerics_contract;
+  int meta_role;
+  MetaDecorator *meta;
+  size_t meta_count;
 } ParsedDecorators;
+
+static int parser_parse_meta_decorator(Parser *parser, ParsedDecorators *out) {
+  MetaDecorator *grown =
+      realloc(out->meta, (out->meta_count + 1) * sizeof(MetaDecorator));
+  if (!grown) {
+    return 0;
+  }
+  out->meta = grown;
+  MetaDecorator *entry = &out->meta[out->meta_count++];
+  memset(entry, 0, sizeof(*entry));
+  entry->name = strdup(parser->current_token.value);
+  entry->location = parser_current_location(parser);
+  parser_advance(parser);
+  if (parser->current_token.type != TOKEN_LPAREN) {
+    return 1;
+  }
+  parser_advance(parser);
+  while (parser->current_token.type != TOKEN_RPAREN) {
+    if (parser->current_token.type != TOKEN_STRING &&
+        parser->current_token.type != TOKEN_NUMBER &&
+        !parser_is_identifier_like(parser->current_token.type)) {
+      parser_set_error(parser, "A decorator's arguments are names, numbers and "
+                               "strings, because they are read before the "
+                               "program has types");
+      return 0;
+    }
+    char **args =
+        realloc(entry->args, (entry->arg_count + 1) * sizeof(char *));
+    if (!args) {
+      return 0;
+    }
+    entry->args = args;
+    entry->args[entry->arg_count++] = strdup(parser->current_token.value);
+    parser_advance(parser);
+    if (parser->current_token.type == TOKEN_COMMA) {
+      parser_advance(parser);
+    } else if (parser->current_token.type != TOKEN_RPAREN) {
+      parser_set_error(parser, "Expected ',' or ')' in decorator arguments");
+      return 0;
+    }
+  }
+  parser_advance(parser);
+  return 1;
+}
 
 static int parser_parse_numerics_decorator(Parser *parser,
                                            ParsedDecorators *out) {
@@ -860,12 +907,16 @@ static int parser_parse_one_decorator(Parser *parser,
     if (!parser_parse_unroll_decorator(parser, out)) {
       return 0;
     }
-  } else {
-    parser_set_error(parser,
-                     "Unknown decorator after '@' (expected 'inline', "
-                     "'noinline', 'pure', 'noalloc', 'test', 'rule', "
-                     "'naked', 'interrupt', 'swappable', 'simd', "
-                     "'parallel', 'numerics', or 'unroll')");
+  } else if (strcmp(name, "layout") == 0 || strcmp(name, "generate") == 0) {
+    if (out->meta_role != META_ROLE_NONE) {
+      parser_set_error(parser, "A function is one metafunction: '@layout' or "
+                               "'@generate', once");
+      return 0;
+    }
+    out->meta_role =
+        strcmp(name, "layout") == 0 ? META_ROLE_LAYOUT : META_ROLE_GENERATE;
+    parser_advance(parser);
+  } else if (!parser_parse_meta_decorator(parser, out)) {
     return 0;
   }
   return 1;
@@ -888,6 +939,9 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->conflict_free_mode = 0;
   out->parallel_mode = 0;
   out->numerics_contract = NULL;
+  out->meta_role = META_ROLE_NONE;
+  out->meta = NULL;
+  out->meta_count = 0;
 
   while (parser->current_token.type == TOKEN_AT) {
     if (!parser_parse_one_decorator(parser, out)) {
@@ -898,6 +952,17 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   if (out->is_inline && out->is_noinline) {
     parser_set_error(parser,
                      "'@inline' and '@noinline' are mutually exclusive");
+    return 0;
+  }
+  if (out->meta_role != META_ROLE_NONE &&
+      (out->is_inline || out->is_noinline || out->is_pure || out->is_noalloc ||
+       out->is_test || out->is_swappable || out->is_naked ||
+       out->is_interrupt || out->is_rule || out->simd_mode != SIMD_ATTR_NONE ||
+       out->meta_count > 0)) {
+    parser_set_error(parser,
+                     "'@layout' and '@generate' stand alone: a metafunction "
+                     "runs while compiling and never becomes code, so no other "
+                     "decorator applies to it");
     return 0;
   }
   if (out->is_rule &&
@@ -930,6 +995,24 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
   ASTNode *decl = parser_parse_declaration(parser);
   if (!decl)
     return NULL;
+  int only_library_decorators =
+      decos.meta_count > 0 && !decos.is_inline && !decos.is_noinline &&
+      !decos.is_pure && !decos.is_noalloc && !decos.is_test &&
+      !decos.is_swappable && !decos.is_naked && !decos.is_interrupt &&
+      !decos.is_rule && decos.simd_mode == SIMD_ATTR_NONE &&
+      decos.meta_role == META_ROLE_NONE;
+  if (only_library_decorators && decl->type == AST_STRUCT_DECLARATION) {
+    StructDeclaration *sd = (StructDeclaration *)decl->data;
+    sd->meta_decorators = decos.meta;
+    sd->meta_decorator_count = decos.meta_count;
+    return decl;
+  }
+  if (only_library_decorators && decl->type == AST_TRAIT_DECLARATION) {
+    TraitDeclaration *td = (TraitDeclaration *)decl->data;
+    td->meta_decorators = decos.meta;
+    td->meta_decorator_count = decos.meta_count;
+    return decl;
+  }
   if (decl->type != AST_FUNCTION_DECLARATION) {
     parser_set_error(parser,
                      "Decorators (@inline/@noinline/@pure/@simd) may only "
@@ -938,6 +1021,9 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
     return NULL;
   }
   FunctionDeclaration *fd = (FunctionDeclaration *)decl->data;
+  fd->meta_decorators = decos.meta;
+  fd->meta_decorator_count = decos.meta_count;
+  fd->meta_role = decos.meta_role;
   if (fd->is_extern) {
     parser_set_error(parser,
                      "Decorators cannot be applied to extern functions");
@@ -2348,6 +2434,12 @@ static ASTNode *parser_parse_decorated_statement(Parser *parser) {
   ParsedDecorators decos;
   if (!parser_parse_decorator_chain(parser, &decos))
     return NULL;
+  if (decos.meta_count > 0 || decos.meta_role != META_ROLE_NONE) {
+    parser_set_error(parser,
+                     "Unknown decorator after '@' before this statement: a "
+                     "library decorator applies to a declaration");
+    return NULL;
+  }
   if (decos.is_inline || decos.is_noinline || decos.is_pure ||
       decos.is_noalloc || decos.is_swappable || decos.is_rule) {
     parser_set_error(parser,

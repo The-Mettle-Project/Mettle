@@ -75,6 +75,21 @@ typedef struct ASTNode {
 } ASTNode;
 
 typedef struct {
+  char *name;
+  char **args;
+  size_t arg_count;
+  SourceLocation location;
+} MetaDecorator;
+
+typedef enum {
+  META_ROLE_NONE = 0,
+  META_ROLE_LAYOUT,
+  META_ROLE_GENERATE
+} MetaRole;
+
+struct TypeMetaLayout;
+
+typedef struct {
   char *module_name;
   char *namespace_alias;
   char **selected_names;
@@ -157,6 +172,9 @@ typedef struct {
   size_t captured_count;
   char *env_struct_name;
   ASTNode *composed_name;
+  MetaDecorator *meta_decorators;
+  size_t meta_decorator_count;
+  int meta_role;
 } FunctionDeclaration;
 
 typedef struct {
@@ -179,6 +197,9 @@ typedef struct {
   char **type_param_traits;
   size_t type_param_count;
   ASTNode *composed_name;
+  MetaDecorator *meta_decorators;
+  size_t meta_decorator_count;
+  struct TypeMetaLayout *meta_layout;
 } StructDeclaration;
 
 typedef struct {
@@ -231,6 +252,8 @@ typedef struct {
   int is_exported;
   ASTNode **methods;
   size_t method_count;
+  MetaDecorator *meta_decorators;
+  size_t meta_decorator_count;
 } TraitDeclaration;
 
 typedef struct {
@@ -432,6 +455,7 @@ typedef struct {
   size_t offset;
   ASTNode *element;
   struct Type *element_type;
+  const void *packed_place;
 } AggregateRuntimeStore;
 
 typedef struct {
@@ -526,6 +550,8 @@ typedef struct {
 
 ASTNode *ast_create_node(ASTNodeType type, SourceLocation location);
 ASTNode *ast_clone_node(ASTNode *node);
+MetaDecorator *ast_clone_meta_decorators(const MetaDecorator *decorators,
+                                         size_t count);
 void ast_destroy_node(ASTNode *node);
 void ast_add_child(ASTNode *parent, ASTNode *child);
 

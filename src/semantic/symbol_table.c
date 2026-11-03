@@ -420,6 +420,7 @@ Type *type_create(TypeKind kind, const char *name) {
   type->field_bit_offsets = NULL;
   type->field_bit_widths = NULL;
   type->field_count = 0;
+  type->meta_layout = NULL;
   type->tagged_variant_names = NULL;
   type->tagged_variant_tags = NULL;
   type->tagged_variant_payloads = NULL;
@@ -640,6 +641,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind, Type *type) {
   symbol->address_space = MTLC_ADDRESS_SPACE_DEFAULT;
   symbol->is_builtin = 0;
   symbol->is_rule = 0;
+  symbol->is_meta = 0;
   symbol->link_name = NULL;
   symbol->decl_line = 0;
   symbol->decl_column = 0;

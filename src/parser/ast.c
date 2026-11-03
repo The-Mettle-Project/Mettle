@@ -118,6 +118,26 @@ static ASTNode *ast_clone_var_declaration(ASTNode *clone, const ASTNode *node) {
   return clone;
 }
 
+MetaDecorator *ast_clone_meta_decorators(const MetaDecorator *decorators,
+                                         size_t count) {
+  MetaDecorator *copy;
+  if (!decorators || count == 0) {
+    return NULL;
+  }
+  copy = calloc(count, sizeof(MetaDecorator));
+  if (!copy) {
+    return NULL;
+  }
+  for (size_t i = 0; i < count; i++) {
+    copy[i].name = ast_copy_string(decorators[i].name);
+    copy[i].arg_count = decorators[i].arg_count;
+    copy[i].args = ast_copy_string_array(decorators[i].args,
+                                         decorators[i].arg_count);
+    copy[i].location = decorators[i].location;
+  }
+  return copy;
+}
+
 static ASTNode *ast_clone_method_declaration(ASTNode *clone, const ASTNode *node) {
   FunctionDeclaration *src = (FunctionDeclaration *)node->data;
   FunctionDeclaration *dst = malloc(sizeof(FunctionDeclaration));
@@ -125,6 +145,10 @@ static ASTNode *ast_clone_method_declaration(ASTNode *clone, const ASTNode *node
     free(clone);
     return NULL;
   }
+  dst->meta_decorators = ast_clone_meta_decorators(src->meta_decorators,
+                                                   src->meta_decorator_count);
+  dst->meta_decorator_count = src->meta_decorator_count;
+  dst->meta_role = src->meta_role;
   dst->name = ast_intern_string(src->name);
   dst->return_type = ast_intern_string(src->return_type);
   dst->return_type_count = src->return_type_count;
@@ -246,6 +270,10 @@ static ASTNode *ast_clone_struct_declaration(ASTNode *clone, const ASTNode *node
     free(clone);
     return NULL;
   }
+  dst->meta_decorators = ast_clone_meta_decorators(src->meta_decorators,
+                                                   src->meta_decorator_count);
+  dst->meta_decorator_count = src->meta_decorator_count;
+  dst->meta_layout = src->meta_layout;
   dst->name = ast_intern_string(src->name);
   dst->field_count = src->field_count;
   dst->method_count = src->method_count;
@@ -397,6 +425,9 @@ static ASTNode *ast_clone_trait_declaration(ASTNode *clone, const ASTNode *node)
     free(clone);
     return NULL;
   }
+  dst->meta_decorators = ast_clone_meta_decorators(src->meta_decorators,
+                                                   src->meta_decorator_count);
+  dst->meta_decorator_count = src->meta_decorator_count;
   dst->name = ast_intern_string(src->name);
   dst->is_exported = src->is_exported;
   dst->method_count = src->method_count;
@@ -1877,6 +1908,9 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->is_naked = 0;
   func_decl->is_interrupt = 0;
   func_decl->is_rule = 0;
+  func_decl->meta_decorators = NULL;
+  func_decl->meta_decorator_count = 0;
+  func_decl->meta_role = META_ROLE_NONE;
   func_decl->rewrite_role = 0;
   func_decl->effects_with = NULL;
   func_decl->effects_with_count = 0;
@@ -1945,6 +1979,9 @@ ASTNode *ast_create_struct_declaration(const char *name, char **field_names,
   struct_decl->type_param_traits = NULL;
   struct_decl->type_param_count = 0;
   struct_decl->composed_name = NULL;
+  struct_decl->meta_decorators = NULL;
+  struct_decl->meta_decorator_count = 0;
+  struct_decl->meta_layout = NULL;
 
   if (field_count > 0) {
     struct_decl->field_names = malloc(field_count * sizeof(char *));
@@ -2183,6 +2220,8 @@ ASTNode *ast_create_trait_declaration(const char *name,
   trait_decl->is_exported = 0;
   trait_decl->methods = NULL;
   trait_decl->method_count = 0;
+  trait_decl->meta_decorators = NULL;
+  trait_decl->meta_decorator_count = 0;
   node->data = trait_decl;
   return node;
 }

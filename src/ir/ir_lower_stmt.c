@@ -838,6 +838,13 @@ static int ir_lower_assignment(IRLoweringContext *context, IRFunction *function,
                                      statement->location);
   }
 
+  if (assignment->target &&
+      ir_expression_is_column_element(context, assignment->target)) {
+    return ir_lower_column_element_store(context, function, assignment->target,
+                                         assignment->value,
+                                         statement->location);
+  }
+
   if (assignment->value->type == AST_AGGREGATE_LITERAL) {
     Type *literal_type = assignment->value->resolved_type;
     if (assignment->variable_name) {
@@ -902,6 +909,13 @@ static int ir_lower_assignment(IRLoweringContext *context, IRFunction *function,
     ir_operand_destroy(&value);
     ir_set_error(context, "Assignment target is missing");
     return 0;
+  }
+
+  if (ir_expression_is_packed_field(context, assignment->target)) {
+    int stored = ir_lower_packed_store(context, function, assignment->target,
+                                       &value, statement->location);
+    ir_operand_destroy(&value);
+    return stored;
   }
 
   IROperand address = ir_operand_none();

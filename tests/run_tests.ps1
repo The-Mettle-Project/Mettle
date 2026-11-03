@@ -1588,6 +1588,12 @@ $cases = @(
   # rather than left to surface as a missing symbol somewhere downstream.
   @{ Name = "comptime_for_declarations"; Path = "tests/test_comptime_for_declarations.mettle"; ShouldSucceed = $true },
   @{ Name = "comptime_for_range"; Path = "tests/test_comptime_for_range.mettle"; ShouldSucceed = $true },
+  @{ Name = "err_layout_overlap"; Path = "tests/err_layout_overlap.mettle"; ShouldSucceed = $false; Pattern = "error\[L0002\].*'x' and 'y' overlap" },
+  @{ Name = "err_layout_cycle"; Path = "tests/err_layout_cycle.mettle"; ShouldSucceed = $false; Pattern = "error\[L0006\].*Point <- helper <- sized_by_itself" },
+  @{ Name = "err_layout_element_address"; Path = "tests/err_layout_element_address.mettle"; ShouldSucceed = $false; Pattern = "error\[L0003\].*no single address" },
+  @{ Name = "err_layout_thin_pointer"; Path = "tests/err_layout_thin_pointer.mettle"; ShouldSucceed = $false; Pattern = "error\[L0003\].*a pointer has none" },
+  @{ Name = "err_layout_packed_address"; Path = "tests/err_layout_packed_address.mettle"; ShouldSucceed = $false; Pattern = "error\[L0003\].*has no address" },
+  @{ Name = "err_layout_calls_metafunction"; Path = "tests/err_layout_calls_metafunction.mettle"; ShouldSucceed = $false; Pattern = "is a metafunction" },
   @{ Name = "err_comptime_range_runtime"; Path = "tests/err_comptime_range_runtime.mettle"; ShouldSucceed = $false
      Pattern = "a .comptime for. range ends at a compile-time integer"
      OutputMustNotMatch = @("internal compiler error") },
@@ -3748,6 +3754,28 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "comptime_for_declarations_runtime" -Passed $false -Reason $_.Exception.Message
+}
+
+# Layouts written in Mettle: every access goes through the data a metafunction
+# returned, at every optimization level, and a program with none spends nothing.
+foreach ($layoutCase in @("test_layout_soa", "test_layout_tagged")) {
+  foreach ($layoutMode in @(@(), @("-O"), @("--release"))) {
+    $total++
+    $layoutName = "$($layoutCase)_$(($layoutMode -join '') -replace '-','')"
+    try {
+      if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+      $exePath = Join-Path $tmpDir "$layoutName.exe"
+      $buildOut = & $CompilerPath --build @layoutMode "tests/$layoutCase.mettle" -o $exePath 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
+      $runOut = & $exePath 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "program returned ${LASTEXITCODE}: $runOut" }
+      Write-CaseResult -Name $layoutName -Passed $true
+    }
+    catch {
+      $failed++
+      Write-CaseResult -Name $layoutName -Passed $false -Reason $_.Exception.Message
+    }
+  }
 }
 
 # A generated declaration gets exactly the trust a written one gets, which is

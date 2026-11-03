@@ -81,6 +81,9 @@ typedef struct {
   int report_rules;
   long long rule_budget;
   int rule_budget_set;
+  int report_meta;
+  long long meta_budget;
+  int meta_budget_set;
   void *trace_rule_checker;
   int report_twins;
   int apply_rule_fixes;

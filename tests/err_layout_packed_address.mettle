@@ -1,0 +1,12 @@
+import "std/layout";
+
+@tagged(next, kind, 3) struct Node {
+  next: Node*;
+  kind: uint8;
+}
+
+fn main() -> int32 {
+  var n: Node;
+  var k: uint8* = &n.kind;
+  return (int32)*k;
+}

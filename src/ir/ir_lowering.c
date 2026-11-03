@@ -121,7 +121,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
       ir_set_error(&context, "Malformed function declaration");
       return ir_lowering_fail(ir_program, &context, error_message);
     }
-    if (!function_data->body) {
+    if (!function_data->body || function_data->meta_role) {
       continue;
     }
 

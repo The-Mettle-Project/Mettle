@@ -1,0 +1,12 @@
+import "std/layout";
+
+@soa struct Point {
+  x: int32;
+  y: int64;
+}
+
+fn main() -> int32 {
+  var ps: Point[4];
+  var p: Point* = &ps[1];
+  return p.x;
+}

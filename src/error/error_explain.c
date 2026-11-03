@@ -344,6 +344,45 @@ static const ErrorCodeDoc DOCS[] = {
      "\n"
      "Fix: return one of the three verdicts, take the site from the\n"
      "Program, and if the rule is expensive raise `--rule-budget=N`.\n"},
+    {"L0001", "A metafunction could not run",
+     "A decorator names no `@layout` or `@generate` function, or the one it\n"
+     "names trapped, ran out of steps, or returned something the compiler\n"
+     "could not read. Metafunctions run in the compile-time interpreter\n"
+     "before the program is type checked.\n"
+     "\n"
+     "Fix: import the module that declares the decorator, or fix the function\n"
+     "the diagnostic names. `--meta-budget=N` sets its step budget.\n"},
+    {"L0002", "A layout failed its proof",
+     "The compiler checks every `Layout` before using one. Each field needs\n"
+     "one place, no two places may share a bit, each place must fit its\n"
+     "region's stride and keep its field's alignment, and a packed value must\n"
+     "fit its width. The message names the field that failed.\n"
+     "\n"
+     "Fix: change the layout function the diagnostic names.\n"},
+    {"L0003", "An operation needs an address or a count the layout lacks",
+     "A struct with more than one region has no single address per element,\n"
+     "so `&a[i]` and indexing a `T*` cannot work. A packed field has no\n"
+     "address at all.\n"
+     "\n"
+     "Fix: take `&a[i].field`, hold the elements in an array or a slice, or\n"
+     "copy the value out of the packed field.\n"},
+    {"L0004", "A custom layout crossed extern or a kernel",
+     "C code and GPU kernels read memory by the default rules, so a struct\n"
+     "with a custom layout cannot cross into one.\n"
+     "\n"
+     "Fix: copy into a struct with the default layout at the boundary.\n"},
+    {"L0005", "A generator stated no relation",
+     "A `@generate` function wrote code and no `@rule` that checks it against\n"
+     "what it replaced, so nothing checks the output. The build goes on and\n"
+     "says so.\n"
+     "\n"
+     "Fix: emit a `@rule` with the generated source.\n"},
+    {"L0006", "A metafunction reaches a type whose layout it decides",
+     "A metafunction runs before the layouts it computes exist, so the code\n"
+     "it reaches cannot use a struct whose layout depends on it. The message\n"
+     "prints the chain.\n"
+     "\n"
+     "Fix: read field names and sizes from the `TypeInfo` it receives.\n"},
     {"R0002", "A rule failed the build",
      "A `@rule fn` the program declares returned verdict_fail for the site\n"
      "the diagnostic points at, with the message it wrote. The build stops\n"

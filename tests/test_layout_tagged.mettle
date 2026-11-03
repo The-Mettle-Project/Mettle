@@ -1,0 +1,113 @@
+import "std/io";
+import "std/layout";
+
+@tagged(next, kind, 3) struct Node {
+  next: Node*;
+  kind: uint8;
+  value: int32;
+}
+
+struct Pad64 {
+  a: int64;
+}
+
+struct Signed {
+  low: int32;
+  high: int32;
+}
+
+@layout fn nibbles(t: TypeInfo, l: Layout) -> Layout {
+  var out: Layout;
+  out.regions = new Region[1];
+  out.regions[0].stride = 4;
+  out.regions[0].align = 4;
+  out.places = new Place[t.fields.length];
+  for i in 0..t.fields.length {
+    out.places[i].field = t.fields[i].name;
+    out.places[i].word = 4;
+    out.places[i].bit = i * 8;
+    out.places[i].width = 8;
+  }
+  return out;
+}
+
+@nibbles struct Bytes {
+  a: int8;
+  b: uint8;
+  c: bool;
+  d: int16;
+}
+
+fn check(name: string, got: int64, want: int64) -> int32 {
+  if (got != want) {
+    println("{name}: got {got}, want {want}");
+    return 1;
+  }
+  return 0;
+}
+
+fn list_sum(head: Node*) -> int64 {
+  var sum: int64 = 0;
+  var at: Node* = head;
+  while (at != 0) {
+    sum = sum + (int64)at.value + (int64)at.kind;
+    at = at.next;
+  }
+  return sum;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  bad = bad + check("size of node", sizeof(Node), 16);
+  bad = bad + check("size of bytes", sizeof(Bytes), 4);
+
+  var a: Node* = new Node;
+  var b: Node* = new Node;
+  var c: Node* = new Node;
+  a.next = b;
+  a.kind = 5;
+  a.value = 10;
+  b.next = c;
+  b.kind = 7;
+  b.value = 20;
+  c.next = 0;
+  c.kind = 1;
+  c.value = 30;
+  bad = bad + check("kind survives next", (int64)a.kind, 5);
+  bad = bad + check("next survives kind", (int64)(a.next == b), 1);
+  a.kind = 2;
+  bad = bad + check("rewrite kind keeps next", (int64)(a.next == b), 1);
+  bad = bad + check("list", list_sum(a), 60 + 2 + 7 + 1);
+
+  var copy: Node = *a;
+  bad = bad + check("copy keeps the word", (int64)copy.kind, 2);
+  bad = bad + check("copy keeps next", (int64)(copy.next == b), 1);
+
+  var literal: Node = { next: b, kind: 6, value: 77 };
+  bad = bad + check("literal kind", (int64)literal.kind, 6);
+  bad = bad + check("literal next", (int64)(literal.next == b), 1);
+  bad = bad + check("literal value", (int64)literal.value, 77);
+
+  var nodes: Node[3];
+  nodes[1].kind = 3;
+  nodes[1].next = c;
+  nodes[2].kind = 4;
+  bad = bad + check("array element", (int64)nodes[1].kind, 3);
+  bad = bad + check("array neighbour", (int64)nodes[2].kind, 4);
+
+  var by: Bytes;
+  by.a = -3;
+  by.b = 250;
+  by.c = true;
+  by.d = -100;
+  bad = bad + check("signed", (int64)by.a, -3);
+  bad = bad + check("unsigned", (int64)by.b, 250);
+  bad = bad + check("bool", (int64)by.c, 1);
+  bad = bad + check("signed wide type", (int64)by.d, -100);
+  by.a = by.a + 1;
+  bad = bad + check("compound", (int64)by.a, -2);
+  bad = bad + check("compound keeps neighbour", (int64)by.b, 250);
+
+  if (bad == 0) { println("ok"); }
+  return bad;
+}

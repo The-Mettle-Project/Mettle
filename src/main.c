@@ -34,6 +34,7 @@
 #include "ir/ir_debug_hooks.h"
 #include "semantic/import_resolver.h"
 #include "semantic/rule_reflect.h"
+#include "semantic/meta_stage.h"
 #include "semantic/target_desc.h"
 #include "ir/ir_rules.h"
 #include "ir/ir_deadline.h"
@@ -4289,6 +4290,16 @@ static DriverFlagResult parse_flag_checks(CompilerOptions *options,
     }
     options->rule_budget = budget;
     options->rule_budget_set = 1;
+  } else if (strcmp(argv[i], "--report-meta") == 0) {
+    options->report_meta = 1;
+  } else if (strncmp(argv[i], "--meta-budget=", 14) == 0) {
+    long long budget = atoll(argv[i] + 14);
+    if (budget <= 0) {
+      fprintf(stderr, "--meta-budget must be a positive step count\n");
+      return DRIVER_FLAG_FAILED;
+    }
+    options->meta_budget = budget;
+    options->meta_budget_set = 1;
   } else if (strcmp(argv[i], "--report-expansion") == 0) {
     options->report_expansion = 1;
   } else if (strncmp(argv[i], "--expansion-budget=", 19) == 0) {
@@ -6755,6 +6766,7 @@ typedef struct {
   int machine_rules_pending;
   int explain_forced_for_rules;
   int emit_safety_checks;
+  MetaStageReport meta_report;
 } CompileContext;
 
 typedef int (*CompileStage)(CompileContext *ctx);
@@ -6923,6 +6935,40 @@ static int compile_stage_monomorphize(CompileContext *ctx) {
   compiler_profile_add(&ctx->profile, PROFILE_PHASE_MONOMORPHIZE,
                        ctx->phase_start);
   return mono_ok ? COMPILE_CONTINUE : 1;
+}
+
+static int compile_stage_metaprograms(CompileContext *ctx) {
+  CompilerOptions *options = ctx->options;
+  compiler_set_phase(PROFILE_PHASE_MONOMORPHIZE);
+  if (!meta_stage_run(ctx->program, ctx->error_reporter, ctx->input_filename,
+                      ctx->source, mtlc_target()->triple,
+                      options->meta_budget_set ? options->meta_budget : 0,
+                      &ctx->meta_report)) {
+    error_reporter_print_errors(ctx->error_reporter);
+    return 1;
+  }
+  return COMPILE_CONTINUE;
+}
+
+static int compile_stage_metaprogram_report(CompileContext *ctx) {
+  CompilerOptions *options = ctx->options;
+  if (ctx->meta_report.pending_error) {
+    fprintf(stderr, "error[L0001]: the metaprogram could not be built: %s\n",
+            ctx->meta_report.pending_error);
+    return 1;
+  }
+  if (options->report_meta) {
+    meta_stage_print_report(&ctx->meta_report, stdout);
+  }
+  if (options->meta_budget_set &&
+      ctx->meta_report.steps > options->meta_budget) {
+    fprintf(stderr,
+            "error[L0001]: metaprograms spent %lld interpreter steps, more "
+            "than the %lld --meta-budget allows\n",
+            ctx->meta_report.steps, options->meta_budget);
+    return 1;
+  }
+  return COMPILE_CONTINUE;
 }
 
 static int compile_stage_type_check(CompileContext *ctx) {
@@ -7785,7 +7831,9 @@ static const CompileStage COMPILE_STAGES[] = {
     compile_stage_parse,
     compile_stage_imports,
     compile_stage_monomorphize,
+    compile_stage_metaprograms,
     compile_stage_type_check,
+    compile_stage_metaprogram_report,
     compile_stage_type_reports,
     compile_stage_proof_budget,
     compile_stage_expand,
@@ -8045,6 +8093,8 @@ void print_usage(const char *program_name) {
          "                      --release)\n");
   printf("  --report-target     Print the target in effect as a Mettle TargetDesc\n");
   printf("  --rule-budget=N     Fail the build when the rules spend more than N steps\n");
+  printf("  --report-meta       Print what metafunctions ran and what they cost\n");
+  printf("  --meta-budget=N     Fail the build when metafunctions spend more than N steps\n");
   printf("  --report-proofs     Print every declared-type proof, its route and its cost\n");
   printf("  --report-twins      Print what each `reference` twin was checked on\n");
   printf("  --fix               Apply the replacement lines failing @rules proposed\n");

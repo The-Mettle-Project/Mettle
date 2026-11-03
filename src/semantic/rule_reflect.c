@@ -131,6 +131,10 @@ static const char *strip_import_prefix(const char *name) {
   return p;
 }
 
+const char *rule_reflect_strip_import_prefix(const char *name) {
+  return strip_import_prefix(name);
+}
+
 static char *qualify(const char *module, const char *name) {
   size_t length = strlen(module) + strlen(name) + 2;
   char *out = malloc(length);
@@ -415,7 +419,8 @@ static int collect_global(Reflect *reflect, ASTNode *decl) {
 
 static int collect_function(Reflect *reflect, ASTNode *decl) {
   FunctionDeclaration *fd = (FunctionDeclaration *)decl->data;
-  if (!fd || !fd->name || fd->is_test || fd->is_rule || fd->rewrite_role) {
+  if (!fd || !fd->name || fd->is_test || fd->is_rule || fd->rewrite_role ||
+      fd->meta_role) {
     return 1;
   }
   if (!grow((void **)&reflect->functions, &reflect->function_capacity,
@@ -1038,6 +1043,19 @@ static int build_image(Reflect *reflect, const char *root_file,
                       fbase + field_offset(field_info_type, "size", &image),
                       type->field_types && type->field_types[f]
                           ? type->field_types[f]->size
+                          : 0);
+        image_put_u64(&image,
+                      fbase + field_offset(field_info_type, "align", &image),
+                      type->field_types && type->field_types[f]
+                          ? type->field_types[f]->alignment
+                          : 0);
+        image_put_u64(&image,
+                      fbase +
+                          field_offset(field_info_type, "pointee_align", &image),
+                      type->field_types && type->field_types[f] &&
+                              type->field_types[f]->kind == TYPE_POINTER &&
+                              type->field_types[f]->base_type
+                          ? type->field_types[f]->base_type->alignment
                           : 0);
       }
     }

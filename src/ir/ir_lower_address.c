@@ -3,6 +3,14 @@
 #include "ir_explain_safety.h"
 #include "frontend/mtlc_frontend.h"
 
+static void ir_layout_refuse(IRLoweringContext *context, SourceLocation location,
+                             const char *message);
+static int ir_emit_packed_store(IRLoweringContext *context, IRFunction *function,
+                                const IROperand *word_address,
+                                const TypeMetaPlace *place,
+                                const IROperand *value,
+                                SourceLocation location);
+
 static void ir_safety_describe(const ASTNode *expression, char *buffer,
                                size_t capacity, int depth) {
   if (!buffer || capacity == 0) {
@@ -153,6 +161,17 @@ static int ir_emit_aggregate_runtime_stores(IRLoweringContext *context,
                                      entry->offset, location, &slot)) {
       ir_operand_destroy(&value);
       return 0;
+    }
+    if (entry->packed_place) {
+      int stored = ir_emit_packed_store(
+          context, function, &slot, (const TypeMetaPlace *)entry->packed_place,
+          &value, location);
+      ir_operand_destroy(&value);
+      ir_operand_destroy(&slot);
+      if (!stored) {
+        return 0;
+      }
+      continue;
     }
     if (ir_try_emit_aggregate_address_memcpy(context, function, &slot, &value,
                                              element_type, location)) {
@@ -804,6 +823,12 @@ int ir_try_lower_pointer_arithmetic(IRLoweringContext *context,
     IROperand offset = ir_operand_none();
     IROperand destination = ir_operand_none();
     int stride = ir_type_array_element_stride(pointer_type->base_type);
+    if (type_is_columnar(pointer_type->base_type)) {
+      ir_layout_refuse(context, location,
+                       "Pointer arithmetic needs one element size, and this "
+                       "type keeps its fields in separate regions");
+      return 0;
+    }
 
     if (!ir_lower_expression(context, function, pointer_expr, &base) ||
         !ir_lower_index_expression(context, function, index_expr, &index) ||
@@ -839,6 +864,12 @@ int ir_try_lower_pointer_arithmetic(IRLoweringContext *context,
     IROperand offset = ir_operand_none();
     IROperand destination = ir_operand_none();
     int stride = ir_type_array_element_stride(pointer_type->base_type);
+    if (type_is_columnar(pointer_type->base_type)) {
+      ir_layout_refuse(context, location,
+                       "Pointer arithmetic needs one element size, and this "
+                       "type keeps its fields in separate regions");
+      return 0;
+    }
 
     if (!ir_lower_expression(context, function, binary->left, &base) ||
         !ir_lower_index_expression(context, function, binary->right, &index) ||
@@ -1304,6 +1335,21 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
       return 0;
     }
 
+    if (type_is_columnar(element_type)) {
+      char message[400];
+      snprintf(message, sizeof(message),
+               array_type->kind == TYPE_POINTER
+                   ? "'%s' keeps its fields in separate regions, so indexing "
+                     "it needs an element count, and a pointer has none. Use "
+                     "an array or a slice"
+                   : "An element of '%s' keeps its fields in separate regions, "
+                     "so it has no single address. Take '&a[i].field', or copy "
+                     "the element",
+               element_type->name ? element_type->name : "?");
+      ir_layout_refuse(context, expression->location, message);
+      return 0;
+    }
+
     if (out_type) {
       *out_type = element_type;
     }
@@ -1590,15 +1636,633 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
   }
 }
 
+static void ir_layout_refuse(IRLoweringContext *context, SourceLocation location,
+                             const char *message) {
+  if (context->type_checker && context->type_checker->error_reporter) {
+    error_reporter_add_error(context->type_checker->error_reporter,
+                             ERROR_SEMANTIC, location, message);
+    error_reporter_set_last_code(context->type_checker->error_reporter,
+                                 "L0003");
+  }
+  ir_set_error(context, "%s", message);
+}
+
+typedef struct {
+  Type *element;
+  IROperand base;
+  IROperand index;
+  IROperand count;
+  long long known_count;
+} IRColumnAccess;
+
+static void ir_column_access_end(IRColumnAccess *access) {
+  ir_operand_destroy(&access->base);
+  ir_operand_destroy(&access->index);
+  ir_operand_destroy(&access->count);
+}
+
+static int ir_column_access_begin(IRLoweringContext *context,
+                                  IRFunction *function, ASTNode *index_node,
+                                  IRColumnAccess *out) {
+  ArrayIndexExpression *indexing = (ArrayIndexExpression *)index_node->data;
+  Type *array_type = ir_infer_expression_type(context, indexing->array);
+  IROperand slice_address = ir_operand_none();
+  SourceLocation location = index_node->location;
+  memset(out, 0, sizeof(*out));
+  out->known_count = -1;
+  if (!array_type || !array_type->base_type) {
+    ir_set_error(context, "Column access reached lowering without an element "
+                          "type");
+    return 0;
+  }
+  out->element = array_type->base_type;
+  if (array_type->kind == TYPE_ARRAY) {
+    if (!ir_lower_lvalue_address(context, function, indexing->array, &out->base,
+                                 NULL)) {
+      return 0;
+    }
+    out->known_count = (long long)array_type->array_size;
+    out->count = ir_operand_int(out->known_count);
+  } else if (array_type->kind == TYPE_SLICE && type_view_rank(array_type) == 1 &&
+             !array_type->view_extents[0]) {
+    IROperand length_slot = ir_operand_none();
+    IRInstruction load = {0};
+    if (!ir_lower_lvalue_address(context, function, indexing->array,
+                                 &slice_address, NULL) ||
+        !ir_make_temp_operand(context, &out->base)) {
+      return 0;
+    }
+    load.op = IR_OP_LOAD;
+    load.location = location;
+    load.dest = out->base;
+    load.lhs = ir_clone_operand_local(&slice_address);
+    load.rhs = ir_operand_int(8);
+    load.alias_class = IR_ALIAS_CLASS_POINTER;
+    if (!ir_emit(context, function, &load)) {
+      return 0;
+    }
+    ir_operand_destroy(&load.lhs);
+    if (!ir_emit_address_with_offset(context, function, &slice_address, 8,
+                                     location, &length_slot) ||
+        !ir_make_temp_operand(context, &out->count)) {
+      return 0;
+    }
+    IRInstruction load_count = {0};
+    load_count.op = IR_OP_LOAD;
+    load_count.location = location;
+    load_count.dest = out->count;
+    load_count.lhs = length_slot;
+    load_count.rhs = ir_operand_int(8);
+    if (!ir_emit(context, function, &load_count)) {
+      return 0;
+    }
+    ir_operand_destroy(&length_slot);
+  } else {
+    char message[400];
+    snprintf(message, sizeof(message),
+             "'%s' keeps its fields in separate regions, so indexing it needs "
+             "an element count, and a pointer has none. Use an array or a "
+             "slice",
+             out->element->name ? out->element->name : "?");
+    ir_layout_refuse(context, location, message);
+    return 0;
+  }
+  if (!ir_lower_index_expression(context, function, indexing->index,
+                                 &out->index)) {
+    return 0;
+  }
+  if (!context->emit_safety_checks) {
+    if (array_type->kind == TYPE_ARRAY &&
+        !type_checker_refined_index_fits(indexing->index->resolved_type,
+                                         array_type->array_size) &&
+        !ir_emit_bounds_check(context, function, location, &out->index,
+                              array_type->array_size)) {
+      return 0;
+    }
+    if (array_type->kind == TYPE_SLICE &&
+        !ir_emit_slice_bounds_check(context, function, location, &slice_address,
+                                    &out->index)) {
+      return 0;
+    }
+  }
+  ir_operand_destroy(&slice_address);
+  return 1;
+}
+
+static int ir_column_region_base(IRLoweringContext *context,
+                                 IRFunction *function,
+                                 const IRColumnAccess *access, size_t region,
+                                 SourceLocation location, IROperand *out) {
+  const TypeMetaLayout *layout = access->element->meta_layout;
+  if (access->known_count >= 0) {
+    *out = ir_operand_int((long long)type_columns_region_base(
+        access->element, region, (size_t)access->known_count));
+    return 1;
+  }
+  IROperand running = ir_operand_int(0);
+  for (size_t r = 0; r < region; r++) {
+    IROperand stride = ir_operand_int((long long)layout->regions[r].stride);
+    IROperand bytes = ir_operand_none();
+    IROperand sum = ir_operand_none();
+    size_t next_align = layout->regions[r + 1].alignment;
+    if (!ir_emit_binary_temp(context, function, "*", &access->count, &stride,
+                             location, &bytes) ||
+        !ir_emit_binary_temp(context, function, "+", &running, &bytes, location,
+                             &sum)) {
+      return 0;
+    }
+    ir_operand_destroy(&bytes);
+    ir_operand_destroy(&running);
+    running = sum;
+    if (layout->regions[r].stride % next_align != 0) {
+      IROperand up = ir_operand_int((long long)next_align - 1);
+      IROperand down = ir_operand_int(-(long long)next_align);
+      IROperand raised = ir_operand_none();
+      IROperand aligned = ir_operand_none();
+      if (!ir_emit_binary_temp(context, function, "+", &running, &up, location,
+                               &raised) ||
+          !ir_emit_binary_temp(context, function, "&", &raised, &down, location,
+                               &aligned)) {
+        return 0;
+      }
+      ir_operand_destroy(&raised);
+      ir_operand_destroy(&running);
+      running = aligned;
+    }
+  }
+  *out = running;
+  return 1;
+}
+
+static int ir_column_region_address(IRLoweringContext *context,
+                                    IRFunction *function,
+                                    const IRColumnAccess *access, size_t region,
+                                    SourceLocation location, IROperand *out) {
+  const TypeMetaLayout *layout = access->element->meta_layout;
+  IROperand region_base = ir_operand_none();
+  IROperand stride = ir_operand_int((long long)layout->regions[region].stride);
+  IROperand scaled = ir_operand_none();
+  IROperand offset = ir_operand_none();
+  if (!ir_column_region_base(context, function, access, region, location,
+                             &region_base) ||
+      !ir_emit_binary_temp(context, function, "*", &access->index, &stride,
+                           location, &scaled) ||
+      !ir_emit_binary_temp(context, function, "+", &region_base, &scaled,
+                           location, &offset)) {
+    return 0;
+  }
+  ir_operand_destroy(&region_base);
+  ir_operand_destroy(&scaled);
+  if (context->emit_safety_checks) {
+    long long extent = access->known_count >= 0
+                           ? (long long)type_columns_bytes(
+                                 access->element, (size_t)access->known_count)
+                           : IR_SAFETY_EXTENT_UNKNOWN;
+    if (!ir_emit_safety_check(context, function, location, &access->base,
+                              &offset, (long long)layout->regions[region].stride,
+                              extent, IR_SAFETY_ACCESS_READ, "column element")) {
+      return 0;
+    }
+  }
+  if (!ir_emit_binary_temp(context, function, "+", &access->base, &offset,
+                           location, out)) {
+    return 0;
+  }
+  ir_operand_destroy(&offset);
+  return 1;
+}
+
+static int ir_emit_bytes_copy(IRLoweringContext *context, IRFunction *function,
+                              const IROperand *dest, const IROperand *source,
+                              size_t size, SourceLocation location) {
+  IRInstruction store = {0};
+  IROperand value = ir_operand_none();
+  store.op = IR_OP_STORE;
+  store.location = location;
+  store.dest = ir_clone_operand_local(dest);
+  store.rhs = ir_operand_int((long long)size);
+  if (size == 1 || size == 2 || size == 4 || size == 8) {
+    IRInstruction load = {0};
+    if (!ir_make_temp_operand(context, &value)) {
+      return 0;
+    }
+    load.op = IR_OP_LOAD;
+    load.location = location;
+    load.dest = value;
+    load.lhs = ir_clone_operand_local(source);
+    load.rhs = ir_operand_int((long long)size);
+    load.is_unsigned = 1;
+    if (!ir_emit(context, function, &load)) {
+      return 0;
+    }
+    ir_operand_destroy(&load.lhs);
+    store.lhs = value;
+  } else {
+    store.lhs = ir_clone_operand_local(source);
+  }
+  int ok = ir_emit(context, function, &store);
+  ir_operand_destroy(&store.dest);
+  ir_operand_destroy(&store.lhs);
+  return ok;
+}
+
+int ir_expression_is_column_element(IRLoweringContext *context,
+                                    ASTNode *expression) {
+  if (!expression || expression->type != AST_INDEX_EXPRESSION) {
+    return 0;
+  }
+  return type_is_columnar(ir_infer_expression_type(context, expression));
+}
+
+static int ir_column_element_copy(IRLoweringContext *context,
+                                  IRFunction *function, ASTNode *index_node,
+                                  const IROperand *lone_address, int into_column,
+                                  SourceLocation location) {
+  IRColumnAccess access;
+  if (!ir_column_access_begin(context, function, index_node, &access)) {
+    return 0;
+  }
+  const TypeMetaLayout *layout = access.element->meta_layout;
+  for (size_t r = 0; r < layout->region_count; r++) {
+    IROperand column = ir_operand_none();
+    IROperand lone = ir_operand_none();
+    size_t lone_offset = type_columns_region_base(access.element, r, 1);
+    if (!ir_column_region_address(context, function, &access, r, location,
+                                  &column) ||
+        !ir_emit_address_with_offset(context, function, lone_address,
+                                     (long long)lone_offset, location, &lone)) {
+      ir_column_access_end(&access);
+      return 0;
+    }
+    int ok = ir_emit_bytes_copy(context, function, into_column ? &column : &lone,
+                                into_column ? &lone : &column,
+                                layout->regions[r].stride, location);
+    ir_operand_destroy(&column);
+    ir_operand_destroy(&lone);
+    if (!ok) {
+      ir_column_access_end(&access);
+      return 0;
+    }
+  }
+  ir_column_access_end(&access);
+  return 1;
+}
+
+int ir_lower_column_element_load(IRLoweringContext *context,
+                                 IRFunction *function, ASTNode *expression,
+                                 IROperand *out_value) {
+  Type *element = ir_infer_expression_type(context, expression);
+  char *name = ir_new_label_name(context, "column_element");
+  IROperand address = ir_operand_none();
+  if (!name ||
+      !ir_emit_local_declaration(context, function, name, element->name,
+                                 expression->location) ||
+      !ir_emit_address_of_symbol(context, function, name, expression->location,
+                                 &address) ||
+      !ir_column_element_copy(context, function, expression, &address, 0,
+                              expression->location)) {
+    free(name);
+    return 0;
+  }
+  ir_operand_destroy(&address);
+  *out_value = ir_operand_symbol(name);
+  free(name);
+  return out_value->name != NULL;
+}
+
+int ir_lower_column_element_store(IRLoweringContext *context,
+                                  IRFunction *function, ASTNode *target,
+                                  ASTNode *value_node, SourceLocation location) {
+  Type *element = ir_infer_expression_type(context, target);
+  char *name = ir_new_label_name(context, "column_element");
+  IROperand value = ir_operand_none();
+  IROperand address = ir_operand_none();
+  if (!name || !ir_emit_local_declaration(context, function, name,
+                                          element->name, location)) {
+    free(name);
+    return 0;
+  }
+  if (!ir_emit_address_of_symbol(context, function, name, location, &address)) {
+    free(name);
+    return 0;
+  }
+  if (value_node->type == AST_AGGREGATE_LITERAL) {
+    if (!ir_emit_aggregate_literal_copy(context, function, &address, value_node,
+                                        element, location)) {
+      free(name);
+      return 0;
+    }
+  } else {
+    IRInstruction assign = {0};
+    if (!ir_lower_expression(context, function, value_node, &value)) {
+      free(name);
+      return 0;
+    }
+    assign.op = IR_OP_ASSIGN;
+    assign.location = location;
+    assign.dest = ir_operand_symbol(name);
+    assign.lhs = value;
+    int ok = ir_emit(context, function, &assign);
+    ir_operand_destroy(&assign.dest);
+    ir_operand_destroy(&value);
+    if (!ok) {
+      free(name);
+      return 0;
+    }
+  }
+  free(name);
+  int ok = ir_column_element_copy(context, function, target, &address, 1,
+                                  location);
+  ir_operand_destroy(&address);
+  return ok;
+}
+
+int ir_emit_column_bytes(IRLoweringContext *context, IRFunction *function,
+                         Type *element, const IROperand *count,
+                         SourceLocation location, IROperand *out) {
+  const TypeMetaLayout *layout = element->meta_layout;
+  IRColumnAccess access;
+  size_t last = layout->region_count - 1;
+  IROperand region_base = ir_operand_none();
+  IROperand stride = ir_operand_int((long long)layout->regions[last].stride);
+  IROperand bytes = ir_operand_none();
+  IROperand sum = ir_operand_none();
+  memset(&access, 0, sizeof(access));
+  access.element = element;
+  access.known_count = -1;
+  access.count = ir_clone_operand_local(count);
+  if (!ir_column_region_base(context, function, &access, last, location,
+                             &region_base) ||
+      !ir_emit_binary_temp(context, function, "*", count, &stride, location,
+                           &bytes) ||
+      !ir_emit_binary_temp(context, function, "+", &region_base, &bytes,
+                           location, &sum)) {
+    return 0;
+  }
+  ir_operand_destroy(&access.count);
+  ir_operand_destroy(&region_base);
+  ir_operand_destroy(&bytes);
+  *out = sum;
+  return 1;
+}
+
+static int ir_lower_member_address_any(IRLoweringContext *context,
+                                       IRFunction *function,
+                                       ASTNode *expression,
+                                       IROperand *out_address,
+                                       Type **out_type);
+
+static const TypeMetaPlace *ir_member_packed_place(IRLoweringContext *context,
+                                                   ASTNode *expression,
+                                                   Type **out_field_type) {
+  MemberAccess *member;
+  Type *object_type;
+  int index;
+  if (!expression || expression->type != AST_MEMBER_ACCESS ||
+      !expression->data) {
+    return NULL;
+  }
+  member = (MemberAccess *)expression->data;
+  if (!member->object || !member->member) {
+    return NULL;
+  }
+  object_type = ir_infer_expression_type(context, member->object);
+  if (object_type && object_type->kind == TYPE_POINTER) {
+    object_type = object_type->base_type;
+  }
+  if (!object_type || !object_type->meta_layout) {
+    return NULL;
+  }
+  index = type_get_field_index(object_type, member->member);
+  if (index < 0 || !type_field_is_packed(object_type, (size_t)index)) {
+    return NULL;
+  }
+  if (out_field_type) {
+    *out_field_type = object_type->field_types[index];
+  }
+  return type_field_place(object_type, (size_t)index);
+}
+
+int ir_expression_is_packed_field(IRLoweringContext *context,
+                                  ASTNode *expression) {
+  return ir_member_packed_place(context, expression, NULL) != NULL;
+}
+
+static int ir_emit_shift_mask(IRLoweringContext *context, IRFunction *function,
+                              const char *op, const IROperand *value,
+                              long long amount, SourceLocation location,
+                              IROperand *out) {
+  IROperand right = ir_operand_int(amount);
+  return ir_emit_binary_temp(context, function, op, value, &right, location, out);
+}
+
+int ir_lower_packed_load(IRLoweringContext *context, IRFunction *function,
+                         ASTNode *expression, IROperand *out_value) {
+  Type *field_type = NULL;
+  const TypeMetaPlace *place =
+      ir_member_packed_place(context, expression, &field_type);
+  IROperand address = ir_operand_none();
+  IROperand value = ir_operand_none();
+  IROperand next = ir_operand_none();
+  IRInstruction load = {0};
+  SourceLocation location = expression->location;
+  if (!place ||
+      !ir_lower_member_address_any(context, function, expression, &address,
+                                   NULL) ||
+      !ir_make_temp_operand(context, &value)) {
+    return 0;
+  }
+  load.op = IR_OP_LOAD;
+  load.location = location;
+  load.dest = value;
+  load.lhs = address;
+  load.rhs = ir_operand_int(place->word);
+  load.is_unsigned = 1;
+  if (!ir_emit(context, function, &load)) {
+    return 0;
+  }
+  ir_operand_destroy(&address);
+  if (place->bit > 0) {
+    if (!ir_emit_shift_mask(context, function, ">>", &value, place->bit,
+                            location, &next)) {
+      return 0;
+    }
+    ir_operand_destroy(&value);
+    value = next;
+  }
+  if (place->width < 64) {
+    if (!ir_emit_shift_mask(context, function, "&", &value,
+                            (long long)((1ull << place->width) - 1), location,
+                            &next)) {
+      return 0;
+    }
+    ir_operand_destroy(&value);
+    value = next;
+  }
+  int is_signed = field_type->kind == TYPE_INT8 ||
+                  field_type->kind == TYPE_INT16 ||
+                  field_type->kind == TYPE_INT32 ||
+                  field_type->kind == TYPE_INT64;
+  if (is_signed && place->width < 64) {
+    IROperand raised = ir_operand_none();
+    if (!ir_emit_shift_mask(context, function, "<<", &value, 64 - place->width,
+                            location, &raised) ||
+        !ir_emit_shift_mask(context, function, ">>", &raised, 64 - place->width,
+                            location, &next)) {
+      return 0;
+    }
+    ir_operand_destroy(&raised);
+    ir_operand_destroy(&value);
+    value = next;
+  }
+  if (place->scale > 0) {
+    if (!ir_emit_shift_mask(context, function, "<<", &value, place->scale,
+                            location, &next)) {
+      return 0;
+    }
+    ir_operand_destroy(&value);
+    value = next;
+  }
+  *out_value = value;
+  return 1;
+}
+
+static int ir_emit_packed_store(IRLoweringContext *context, IRFunction *function,
+                                const IROperand *word_address,
+                                const TypeMetaPlace *place,
+                                const IROperand *value,
+                                SourceLocation location) {
+  unsigned long long mask =
+      place->width >= 64 ? ~0ull : (1ull << place->width) - 1;
+  IROperand word = ir_operand_none();
+  IROperand shifted = ir_operand_none();
+  IROperand masked = ir_operand_none();
+  IROperand placed = ir_operand_none();
+  IROperand kept = ir_operand_none();
+  IROperand merged = ir_operand_none();
+  IRInstruction load = {0};
+  IRInstruction store = {0};
+  if (!ir_make_temp_operand(context, &word)) {
+    return 0;
+  }
+  load.op = IR_OP_LOAD;
+  load.location = location;
+  load.dest = word;
+  load.lhs = ir_clone_operand_local(word_address);
+  load.rhs = ir_operand_int(place->word);
+  load.is_unsigned = 1;
+  if (!ir_emit(context, function, &load)) {
+    return 0;
+  }
+  ir_operand_destroy(&load.lhs);
+  if (!ir_emit_shift_mask(context, function, ">>", value, place->scale, location,
+                          &shifted) ||
+      !ir_emit_shift_mask(context, function, "&", &shifted, (long long)mask,
+                          location, &masked) ||
+      !ir_emit_shift_mask(context, function, "<<", &masked, place->bit, location,
+                          &placed) ||
+      !ir_emit_shift_mask(context, function, "&", &word,
+                          (long long)~(mask << place->bit), location, &kept) ||
+      !ir_emit_binary_temp(context, function, "|", &kept, &placed, location,
+                           &merged)) {
+    return 0;
+  }
+  store.op = IR_OP_STORE;
+  store.location = location;
+  store.dest = ir_clone_operand_local(word_address);
+  store.lhs = merged;
+  store.rhs = ir_operand_int(place->word);
+  int ok = ir_emit(context, function, &store);
+  ir_operand_destroy(&store.dest);
+  ir_operand_destroy(&merged);
+  ir_operand_destroy(&word);
+  ir_operand_destroy(&shifted);
+  ir_operand_destroy(&masked);
+  ir_operand_destroy(&placed);
+  ir_operand_destroy(&kept);
+  return ok;
+}
+
+int ir_lower_packed_store(IRLoweringContext *context, IRFunction *function,
+                          ASTNode *target, const IROperand *value,
+                          SourceLocation location) {
+  const TypeMetaPlace *place = ir_member_packed_place(context, target, NULL);
+  IROperand address = ir_operand_none();
+  if (!place || !ir_lower_member_address_any(context, function, target, &address,
+                                             NULL)) {
+    return 0;
+  }
+  int ok =
+      ir_emit_packed_store(context, function, &address, place, value, location);
+  ir_operand_destroy(&address);
+  return ok;
+}
+
 static int ir_lower_member_address(IRLoweringContext *context,
                                    IRFunction *function,
                                    ASTNode *expression,
                                    IROperand *out_address,
                                    Type **out_type) {
+  if (ir_expression_is_packed_field(context, expression)) {
+    char message[300];
+    MemberAccess *member = (MemberAccess *)expression->data;
+    snprintf(message, sizeof(message),
+             "Field '%s' is packed into part of a word, so it has no address",
+             member->member);
+    ir_layout_refuse(context, expression->location, message);
+    return 0;
+  }
+  return ir_lower_member_address_any(context, function, expression, out_address,
+                                     out_type);
+}
+
+static int ir_lower_column_member_address(IRLoweringContext *context,
+                                          IRFunction *function,
+                                          ASTNode *expression,
+                                          MemberAccess *member,
+                                          IROperand *out_address,
+                                          Type **out_type) {
+  IRColumnAccess access;
+  IROperand region = ir_operand_none();
+  if (!ir_column_access_begin(context, function, member->object, &access)) {
+    return 0;
+  }
+  int field = type_get_field_index(access.element, member->member);
+  if (field < 0) {
+    ir_column_access_end(&access);
+    ir_set_error(context, "Unknown struct field '%s'", member->member);
+    return 0;
+  }
+  const TypeMetaPlace *place = type_field_place(access.element, (size_t)field);
+  if (!ir_column_region_address(context, function, &access, place->region,
+                                expression->location, &region) ||
+      !ir_emit_address_with_offset(context, function, &region,
+                                   (long long)place->offset,
+                                   expression->location, out_address)) {
+    ir_column_access_end(&access);
+    return 0;
+  }
+  if (out_type) {
+    *out_type = access.element->field_types[field];
+  }
+  ir_operand_destroy(&region);
+  ir_column_access_end(&access);
+  return 1;
+}
+
+static int ir_lower_member_address_any(IRLoweringContext *context,
+                                       IRFunction *function,
+                                       ASTNode *expression,
+                                       IROperand *out_address,
+                                       Type **out_type) {
   MemberAccess *member = (MemberAccess *)expression->data;
   if (!member || !member->object || !member->member) {
     ir_set_error(context, "Malformed member access lvalue");
     return 0;
+  }
+  if (ir_expression_is_column_element(context, member->object)) {
+    return ir_lower_column_member_address(context, function, expression, member,
+                                          out_address, out_type);
   }
 
   IROperand object_address = ir_operand_none();

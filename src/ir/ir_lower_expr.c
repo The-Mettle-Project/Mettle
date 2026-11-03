@@ -3204,6 +3204,13 @@ static int ir_lower_member_or_index(IRLoweringContext *context,
                                     IRFunction *function,
                                     ASTNode *expression,
                                     IROperand *out_value) {
+  if (ir_expression_is_column_element(context, expression)) {
+    return ir_lower_column_element_load(context, function, expression,
+                                        out_value);
+  }
+  if (ir_expression_is_packed_field(context, expression)) {
+    return ir_lower_packed_load(context, function, expression, out_value);
+  }
   if (expression->type == AST_MEMBER_ACCESS) {
     MemberAccess *m = (MemberAccess *)expression->data;
     if (m && m->object && m->object->type == AST_IDENTIFIER && m->member) {
@@ -3485,25 +3492,37 @@ static int ir_lower_new_expression(IRLoweringContext *context,
     }
     if (!ir_lower_expression(context, function, new_expression->count,
                              &count) ||
-        !ir_make_temp_operand(context, &bytes) ||
         !ir_make_temp_operand(context, &pointer)) {
       ir_operand_destroy(&count);
-      ir_operand_destroy(&bytes);
       ir_operand_destroy(&pointer);
       return 0;
     }
 
-    multiply.op = IR_OP_BINARY;
-    multiply.location = expression->location;
-    multiply.dest = bytes;
-    multiply.lhs = count;
-    multiply.rhs = ir_operand_int((long long)element->size);
-    multiply.text = "*";
-    if (!ir_emit(context, function, &multiply)) {
-      ir_operand_destroy(&count);
-      ir_operand_destroy(&bytes);
-      ir_operand_destroy(&pointer);
-      return 0;
+    if (type_is_columnar(element)) {
+      if (!ir_emit_column_bytes(context, function, element, &count,
+                                expression->location, &bytes)) {
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&pointer);
+        return 0;
+      }
+    } else {
+      if (!ir_make_temp_operand(context, &bytes)) {
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&pointer);
+        return 0;
+      }
+      multiply.op = IR_OP_BINARY;
+      multiply.location = expression->location;
+      multiply.dest = bytes;
+      multiply.lhs = count;
+      multiply.rhs = ir_operand_int((long long)element->size);
+      multiply.text = "*";
+      if (!ir_emit(context, function, &multiply)) {
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&bytes);
+        ir_operand_destroy(&pointer);
+        return 0;
+      }
     }
 
     if (ir_lower_live_heap_type(element)) {

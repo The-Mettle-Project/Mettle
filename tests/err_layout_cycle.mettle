@@ -1,0 +1,22 @@
+import "std/layout";
+
+fn helper() -> int64 {
+  var p: Point;
+  return sizeof(Point);
+}
+
+@layout fn sized_by_itself(t: TypeInfo, l: Layout) -> Layout {
+  var out: Layout = l;
+  out.regions[0].stride = helper();
+  return out;
+}
+
+@sized_by_itself struct Point {
+  x: int32;
+  y: int32;
+}
+
+fn main() -> int32 {
+  var p: Point;
+  return p.x;
+}

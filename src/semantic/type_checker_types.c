@@ -493,6 +493,7 @@ Type *type_checker_volatile_of(TypeChecker *checker, Type *base) {
     qualified->field_bit_offsets = base->field_bit_offsets;
     qualified->field_bit_widths = base->field_bit_widths;
     qualified->field_count = base->field_count;
+    qualified->meta_layout = base->meta_layout;
     qualified->tagged_variant_names = base->tagged_variant_names;
     qualified->tagged_variant_tags = base->tagged_variant_tags;
     qualified->tagged_variant_payloads = base->tagged_variant_payloads;

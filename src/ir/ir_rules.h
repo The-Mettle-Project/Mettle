@@ -25,6 +25,11 @@ typedef struct {
 
 void ir_rule_image_free(IRRuleImage *image);
 
+struct IRInterpMachine;
+int ir_rule_image_place(struct IRInterpMachine *machine,
+                        const IRRuleImage *image,
+                        unsigned long long *out_address);
+
 typedef struct {
   size_t rules;
   size_t passed;
