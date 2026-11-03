@@ -10,7 +10,7 @@ https://www.pexels.com/video/dramatic-aerial-view-of-utah-s-rugged-canyons-34305
 License: Pexels License, https://www.pexels.com/license/
 Changes: cut to 4 seconds, slowed to 0.5x with eased ends, darkened, played forward then reversed, audio removed. See make_canyon.sh.
 
-readme-banner.jpg and og.jpg are rendered from the hero above.
+card-frame.jpg is a frame of the hero source. readme-banner.jpg and og.jpg are that frame in the page's colour halftone, rendered by make_cards.py.
 
 The videos' dither on the page follows Motion Core's DitheredImage, and its halftone threshold table is copied from it.
 https://motion-core.dev/docs/dithered-image
