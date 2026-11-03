@@ -10782,6 +10782,8 @@ static void mir_build_jump_tables(MirFunction *fn) {
 }
 
 #define MIR_ROTATE_MAX_BACK_EDGES 8
+#define MIR_ROTATE_MAX_PREFIX 2
+#define MIR_ROTATE_MAX_PREFIXED_LOOPS 64
 
 static int mir_insert_at(MirFunction *fn, size_t at, const MirInst *inst) {
   if (fn->insn_count >= fn->insn_capacity) {
@@ -11231,16 +11233,66 @@ static int mir_rotate_apply(MirFunction *fn, MirRotateRefs *refs, size_t j,
   return 1;
 }
 
-static int mir_rotate_header_at(const MirFunction *fn, size_t j) {
-  return fn->insns[j].op == MIR_LABEL &&
-         fn->insns[j].dst.kind == MIR_OPK_LABEL && fn->insns[j].dst.sym &&
-         fn->insns[j + 1].op == MIR_CMPBR &&
-         fn->insns[j + 1].dst.kind == MIR_OPK_LABEL && fn->insns[j + 1].dst.sym;
+static int mir_rotate_prefix_insn_clones(const MirFunction *fn,
+                                         const MirInst *in) {
+  if (in->op != MIR_MOV && in->op != MIR_MOVZX && in->op != MIR_MOVSX) {
+    return 0;
+  }
+  return in->dst.kind == MIR_OPK_VREG &&
+         !fn->vregs[in->dst.vreg].address_taken &&
+         (in->a.kind == MIR_OPK_VREG || in->a.kind == MIR_OPK_IMM ||
+          (in->a.kind == MIR_OPK_MEM && !in->a.mem.phys_base_valid));
+}
+
+static int mir_rotate_header_at(const MirFunction *fn, size_t j,
+                                size_t *prefix) {
+  size_t n = 0;
+
+  if (fn->insns[j].op != MIR_LABEL || fn->insns[j].dst.kind != MIR_OPK_LABEL ||
+      !fn->insns[j].dst.sym) {
+    return 0;
+  }
+  while (n < MIR_ROTATE_MAX_PREFIX && j + 1 + n < fn->insn_count &&
+         mir_rotate_prefix_insn_clones(fn, &fn->insns[j + 1 + n])) {
+    n++;
+  }
+  if (j + 1 + n >= fn->insn_count || fn->insns[j + 1 + n].op != MIR_CMPBR ||
+      fn->insns[j + 1 + n].dst.kind != MIR_OPK_LABEL ||
+      !fn->insns[j + 1 + n].dst.sym) {
+    return 0;
+  }
+  *prefix = n;
+  return 1;
+}
+
+static int mir_rotate_apply_prefixed(MirFunction *fn, MirRotateRefs *refs,
+                                     size_t j, size_t n, const char *ename,
+                                     const size_t *bes, size_t nbe) {
+  MirInst label = fn->insns[j];
+  MirInst test = fn->insns[j + 1 + n];
+  MirInst clones[MIR_ROTATE_MAX_PREFIX];
+
+  memcpy(clones, &fn->insns[j + 1], n * sizeof(MirInst));
+  memmove(&fn->insns[j], &fn->insns[j + 1], (n + 1) * sizeof(MirInst));
+  fn->insns[j + 1 + n] = label;
+  for (size_t e = nbe; e-- > 0;) {
+    if (!mir_rotate_back_edge_takes_test(fn, refs, bes[e], &test, ename)) {
+      return 0;
+    }
+    for (size_t k = 0; k < n; k++) {
+      if (!mir_insert_at(fn, bes[e] + k, &clones[k])) {
+        return 0;
+      }
+    }
+  }
+  refs->stale = 1;
+  return 1;
 }
 
 static void mir_rotate_loops(MirFunction *fn) {
   MirRotateCfg cfg = {0};
   MirRotateRefs refs = {0};
+  size_t prefixed_left = MIR_ROTATE_MAX_PREFIXED_LOOPS;
 
   if (!fn || fn->insn_count < 3) {
     return;
@@ -11255,15 +11307,19 @@ static void mir_rotate_loops(MirFunction *fn) {
   for (size_t j = 0; j + 1 < fn->insn_count; j++) {
     size_t bes[MIR_ROTATE_MAX_BACK_EDGES];
     size_t nbe = 0;
+    size_t prefix = 0;
     const char *hname;
     const char *ename;
     int fatal = 0;
 
-    if (!mir_rotate_header_at(fn, j)) {
+    if (!mir_rotate_header_at(fn, j, &prefix)) {
+      continue;
+    }
+    if (prefix > 0 && prefixed_left == 0) {
       continue;
     }
     hname = fn->insns[j].dst.sym;
-    ename = fn->insns[j + 1].dst.sym;
+    ename = fn->insns[j + 1 + prefix].dst.sym;
     if (refs.stale && !mir_rotate_refs_build(fn, &refs)) {
       mir_rotate_refs_destroy(&refs);
       mir_rotate_cfg_destroy(&cfg);
@@ -11281,7 +11337,12 @@ static void mir_rotate_loops(MirFunction *fn) {
       }
       continue;
     }
-    if (!mir_rotate_apply(fn, &refs, j, hname, ename, bes, nbe)) {
+    if (prefix > 0) {
+      prefixed_left--;
+    }
+    if (prefix > 0
+            ? !mir_rotate_apply_prefixed(fn, &refs, j, prefix, ename, bes, nbe)
+            : !mir_rotate_apply(fn, &refs, j, hname, ename, bes, nbe)) {
       mir_rotate_refs_destroy(&refs);
       mir_rotate_cfg_destroy(&cfg);
       return;
