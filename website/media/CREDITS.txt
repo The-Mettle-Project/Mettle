@@ -1,8 +1,12 @@
 hero.mp4 and hero-poster.jpg
-Source: "Falling" by Film Composite
+Sources, under the Pexels License, https://www.pexels.com/license/
+"Falling" by Film Composite
 https://www.pexels.com/video/falling-16296843/
-License: Pexels License, https://www.pexels.com/license/
-Changes: scaled to 1280x720, lightly graded, eased at both ends, played forward then reversed, audio removed. See make_hero.sh.
+"Stunning Aerial View of Snowy Mountains" by K
+https://www.pexels.com/video/stunning-aerial-view-of-snowy-mountains-28638515/
+"Canyonlands" by Roger Holzberg
+https://www.pexels.com/video/canyonlands-28543610/
+Changes: trimmed, the second two cropped or darkened and graded, scaled to 1280x720, joined into one loop, audio removed. See make_hero.sh.
 
 canyon.mp4 and canyon-poster.jpg
 Source: "Dramatic Aerial View of Utah's Rugged Canyons" by Alex Moliski
