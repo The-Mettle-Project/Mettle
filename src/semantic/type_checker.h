@@ -44,6 +44,7 @@ typedef struct TypeCheckerEffectObligation {
 typedef struct {
   SymbolTable *symbol_table;
   int has_error;
+  int defer_unresolved_comptime;
   char *error_message;
   ErrorReporter *error_reporter;
   struct TypeCheckerGuard *guards;
@@ -305,6 +306,9 @@ Type *type_checker_canon_type(TypeChecker *checker, Type *type);
 
 int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block,
                                        int module_scope);
+int type_checker_expand_directive_now(TypeChecker *checker, ASTNode *directive,
+                                      ASTNode ***out, size_t *out_count);
+int type_checker_prepare_directives(TypeChecker *checker, ASTNode *program);
 
 typedef struct {
   size_t bindings_pushed;

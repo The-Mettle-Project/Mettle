@@ -8,6 +8,11 @@
 
 int monomorphize_program(ASTNode *program, ErrorReporter *reporter);
 
+int monomorphize_generated(ASTNode *fragment, ASTNode *whole,
+                           ErrorReporter *reporter, int *new_generics);
+
+int monomorphize_revisit(ASTNode *whole, ErrorReporter *reporter);
+
 int closure_convert_program(ASTNode *program, ErrorReporter *reporter);
 
 int closure_adapt_program(ASTNode *program, ErrorReporter *reporter);

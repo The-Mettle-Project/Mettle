@@ -7026,6 +7026,10 @@ static int compile_stage_type_check(CompileContext *ctx) {
                              ctx->error_reporter);
   compiler_profile_add(&ctx->profile, PROFILE_PHASE_TYPE_CHECK,
                        ctx->phase_start);
+  if (!tc_ok && ctx->meta_report.pending_error) {
+    fprintf(stderr, "note: the metaprogram stopped first: %s\n",
+            ctx->meta_report.pending_error);
+  }
   return tc_ok ? COMPILE_CONTINUE : 1;
 }
 

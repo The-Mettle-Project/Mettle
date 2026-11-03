@@ -69,6 +69,7 @@ ASTNode *ast_create_node(ASTNodeType type, SourceLocation location) {
   node->type_registered = 0;
   node->proven_binding = NULL;
   node->conflict_free_mode = 0;
+  node->expansion_origin = NULL;
 
   return node;
 }
@@ -1243,6 +1244,7 @@ ASTNode *ast_clone_node(ASTNode *node) {
   if (node->type < 0 || node->type >= AST_NODE_TYPE_COUNT) {
     return clone;
   }
+  clone->expansion_origin = node->expansion_origin;
   AstCloneHandler handler = AST_CLONE_HANDLERS[node->type];
   if (!handler) {
     return clone;

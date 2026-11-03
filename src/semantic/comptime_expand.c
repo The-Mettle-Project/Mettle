@@ -841,6 +841,49 @@ static void push_frame(TypeChecker *checker, const char *binding_name,
   }
 }
 
+static int resolve_directive_sequence(TypeChecker *checker,
+                                      ComptimeForStatement *directive,
+                                      ComptimeSource *source) {
+  memset(source, 0, sizeof(*source));
+  return directive->range_end
+             ? resolve_range_sequence(checker, directive, source)
+             : resolve_sequence(checker, directive->sequence, source);
+}
+
+static void push_origin(TypeChecker *checker,
+                        const ComptimeExpansionOrigin *origin,
+                        ComptimeDeclScope *scope) {
+  ComptimeForStatement directive;
+  ComptimeSource source;
+  TypeField field;
+  char note[256];
+  if (origin->parent) {
+    push_origin(checker, origin->parent, scope);
+  }
+  memset(&directive, 0, sizeof(directive));
+  directive.binding_name = (char *)origin->binding_name;
+  directive.sequence = ast_clone_node(origin->sequence);
+  directive.range_end = ast_clone_node(origin->range_end);
+  directive.range_inclusive = origin->range_inclusive;
+  directive.keyword_location = origin->keyword_location;
+  if (!resolve_directive_sequence(checker, &directive, &source) ||
+      origin->index >= source.count) {
+    return;
+  }
+  memset(&field, 0, sizeof(field));
+  if (!source.is_table && !source.is_range &&
+      !read_field(checker, &directive, source.owner, origin->index, &field)) {
+    return;
+  }
+  iteration_note(note, sizeof(note), &source, &field, origin->index);
+  push_frame(checker, string_intern(origin->binding_name),
+             iteration_value(checker, &source, origin->index),
+             binding_declared_type(&source),
+             source_span_from_location(origin->keyword_location,
+                                       strlen("comptime")),
+             string_intern(note), scope);
+}
+
 void type_checker_enter_expansion_decl(TypeChecker *checker,
                                        const ASTNode *declaration,
                                        ComptimeDeclScope *scope) {
@@ -852,6 +895,9 @@ void type_checker_enter_expansion_decl(TypeChecker *checker,
   const ComptimeExpansion *entry =
       expansion_table_get(checker->expansions, declaration);
   if (!entry) {
+    if (declaration->expansion_origin) {
+      push_origin(checker, declaration->expansion_origin, scope);
+    }
     return;
   }
   for (size_t i = 0; i < entry->inherited_count; i++) {
@@ -1170,12 +1216,22 @@ static int expand_one_round(TypeChecker *checker, ASTNode *block,
       ComptimeForStatement *directive = (ComptimeForStatement *)child->data;
       ComptimeSource source;
       memset(&source, 0, sizeof(source));
+      size_t errors_before = checker->error_reporter
+                                 ? (size_t)checker->error_reporter->count
+                                 : 0;
       if (!directive ||
           !(directive->range_end
                 ? resolve_range_sequence(checker, directive, &source)
                 : resolve_sequence(checker, directive->sequence, &source))) {
-        ok = 0;
         type_checker_leave_expansion_decl(checker, &outer);
+        if (directive && module_scope && checker->defer_unresolved_comptime) {
+          if (checker->error_reporter) {
+            checker->error_reporter->count = errors_before;
+          }
+          checker->has_error = 0;
+          continue;
+        }
+        ok = 0;
         break;
       }
       if (!directive->body || !directive->binding_name) {
@@ -1295,6 +1351,82 @@ static int expand_one_round(TypeChecker *checker, ASTNode *block,
   block->child_count = expanded_count;
   block->child_capacity = 0;
   block->child_capacity_owner = NULL;
+  return 1;
+}
+
+static const ComptimeExpansionOrigin *
+origin_create(const ComptimeForStatement *directive,
+              const ComptimeExpansionOrigin *parent, size_t index) {
+  ComptimeExpansionOrigin *origin = calloc(1, sizeof(*origin));
+  if (origin) {
+    origin->binding_name = string_intern(directive->binding_name);
+    origin->sequence = ast_clone_node(directive->sequence);
+    origin->range_end = ast_clone_node(directive->range_end);
+    origin->range_inclusive = directive->range_inclusive;
+    origin->index = index;
+    origin->keyword_location = directive->keyword_location;
+    origin->parent = parent;
+  }
+  return origin;
+}
+
+int type_checker_expand_directive_now(TypeChecker *checker, ASTNode *directive,
+                                      ASTNode ***out, size_t *out_count) {
+  ASTNode *probe = ast_clone_node(directive);
+  ComptimeForStatement *statement =
+      probe ? (ComptimeForStatement *)probe->data : NULL;
+  ComptimeDeclScope outer = {0, 0};
+  ComptimeSource source;
+  size_t errors_before =
+      checker->error_reporter ? (size_t)checker->error_reporter->count : 0;
+  ASTNode **made = NULL;
+  size_t produced = 0;
+  int ok = 0;
+  *out = NULL;
+  *out_count = 0;
+  if (!statement || !statement->body) {
+    return 0;
+  }
+  if (!checker->expansions) {
+    checker->expansions = calloc(1, sizeof(ComptimeExpansionTable));
+    if (!checker->expansions) {
+      return 0;
+    }
+  }
+  type_checker_enter_expansion_decl(checker, directive, &outer);
+  if (resolve_directive_sequence(checker, statement, &source)) {
+    Program *body = (Program *)statement->body->data;
+    size_t per_iteration = body ? body->declaration_count : 0;
+    made = calloc(source.count * per_iteration + 1, sizeof(ASTNode *));
+    ok = made != NULL;
+    for (size_t f = 0; ok && f < source.count; f++) {
+      size_t first = produced;
+      ok = expand_declaration_iteration(checker, statement, &source, f, made,
+                                        &produced);
+      if (ok) {
+        const ComptimeExpansionOrigin *origin =
+            origin_create(statement, directive->expansion_origin, f);
+        ok = origin != NULL;
+        for (size_t k = first; ok && k < produced; k++) {
+          made[k]->expansion_origin = origin;
+        }
+      }
+    }
+    if (ok) {
+      ok = check_generated_names(checker, statement, made, produced);
+    }
+  }
+  type_checker_leave_expansion_decl(checker, &outer);
+  if (!ok) {
+    if (checker->error_reporter) {
+      checker->error_reporter->count = errors_before;
+    }
+    checker->has_error = 0;
+    free(made);
+    return 0;
+  }
+  *out = made;
+  *out_count = produced;
   return 1;
 }
 

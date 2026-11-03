@@ -162,8 +162,11 @@ structured tree over the unoptimized IR. `render_function` prints that tree back
 as Mettle, and a generator can walk it to write something else, which is how
 `grad` works. `refuse(why)` stops the build with your reason.
 
-Generated source cannot import, so a generator's module imports what its output
-calls.
+Generated source is a file like any other. It can import modules and declare or
+use generics, traits and closures. It can also hold `comptime for` and decorated
+declarations. A `comptime for` can reflect on a struct a generator wrote, and a
+`comptime for` body can hold a decorated function. The compiler keeps expanding
+and generating until nothing new appears, 16 rounds at most.
 
 ### Stating what you promise
 

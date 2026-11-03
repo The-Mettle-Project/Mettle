@@ -1,0 +1,15 @@
+import "std/meta";
+
+@generate fn imports_nothing(f: FunctionInfo) -> Generated {
+  var t: Text;
+  text_add(&t, "import \"std/no_such_module\";\n");
+  text_add(&t, "fn {f.name}__copy() {{ }\n");
+  return generated_as("{f.name}__copy", text_done(&t));
+}
+
+fn base() { }
+
+fn main() -> int32 {
+  imports_nothing(base)();
+  return 0;
+}

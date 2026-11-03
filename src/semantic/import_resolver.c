@@ -4344,20 +4344,49 @@ process_imports_cleanup:
   return program;
 }
 
+static char **g_kept_resolved_files = NULL;
+static size_t g_kept_resolved_count = 0;
+static size_t g_kept_resolved_capacity = 0;
+static ImportResolverOptions g_kept_options;
+
+static int resolve_imports_keeping(ASTNode *program, const char *base_path,
+                                   ErrorReporter *reporter,
+                                   const ImportResolverOptions *options);
+
 int resolve_imports_with_options(ASTNode *program, const char *base_path,
                                  ErrorReporter *reporter,
                                  const ImportResolverOptions *options) {
   if (!program || program->type != AST_PROGRAM)
     return 0;
-
-  import_path_cache_reset();
   module_name_registry_reset();
+  for (size_t i = 0; i < g_kept_resolved_count; i++) {
+    free(g_kept_resolved_files[i]);
+  }
+  g_kept_resolved_count = 0;
+  memset(&g_kept_options, 0, sizeof(g_kept_options));
+  if (options) {
+    g_kept_options = *options;
+  }
+  return resolve_imports_keeping(program, base_path, reporter, options);
+}
+
+int resolve_imports_of_generated(ASTNode *fragment, const char *base_path,
+                                 ErrorReporter *reporter) {
+  if (!fragment || fragment->type != AST_PROGRAM)
+    return 0;
+  return resolve_imports_keeping(fragment, base_path, reporter, &g_kept_options);
+}
+
+static int resolve_imports_keeping(ASTNode *program, const char *base_path,
+                                   ErrorReporter *reporter,
+                                   const ImportResolverOptions *options) {
+  import_path_cache_reset();
   deps_walk_cache_reset();
 
   ImportContext ctx;
-  ctx.resolved_files = NULL;
-  ctx.resolved_count = 0;
-  ctx.resolved_capacity = 0;
+  ctx.resolved_files = g_kept_resolved_files;
+  ctx.resolved_count = g_kept_resolved_count;
+  ctx.resolved_capacity = g_kept_resolved_capacity;
   ctx.active_files = NULL;
   ctx.active_count = 0;
   ctx.active_capacity = 0;
@@ -4380,10 +4409,9 @@ int resolve_imports_with_options(ASTNode *program, const char *base_path,
       (last_slash > last_backslash) ? last_slash : last_backslash;
   const char *base_name = last_sep ? last_sep + 1 : base_path;
   if (!push_import_chain(&ctx, base_name)) {
-    for (size_t i = 0; i < ctx.resolved_count; i++) {
-      free(ctx.resolved_files[i]);
-    }
-    free(ctx.resolved_files);
+    g_kept_resolved_files = ctx.resolved_files;
+    g_kept_resolved_count = ctx.resolved_count;
+    g_kept_resolved_capacity = ctx.resolved_capacity;
     for (size_t i = 0; i < ctx.active_count; i++) {
       free(ctx.active_files[i]);
     }
@@ -4399,10 +4427,9 @@ int resolve_imports_with_options(ASTNode *program, const char *base_path,
   process_import_strs_in_node(&ctx, program, base_path, &had_error);
 
   pop_import_chain(&ctx);
-  for (size_t i = 0; i < ctx.resolved_count; i++) {
-    free(ctx.resolved_files[i]);
-  }
-  free(ctx.resolved_files);
+  g_kept_resolved_files = ctx.resolved_files;
+  g_kept_resolved_count = ctx.resolved_count;
+  g_kept_resolved_capacity = ctx.resolved_capacity;
   for (size_t i = 0; i < ctx.active_count; i++) {
     free(ctx.active_files[i]);
   }

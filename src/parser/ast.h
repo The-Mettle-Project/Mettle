@@ -72,7 +72,18 @@ typedef struct ASTNode {
   int type_registered;
   const char *proven_binding;
   int conflict_free_mode;
+  const struct ComptimeExpansionOrigin *expansion_origin;
 } ASTNode;
+
+typedef struct ComptimeExpansionOrigin {
+  const char *binding_name;
+  struct ASTNode *sequence;
+  struct ASTNode *range_end;
+  int range_inclusive;
+  size_t index;
+  SourceLocation keyword_location;
+  const struct ComptimeExpansionOrigin *parent;
+} ComptimeExpansionOrigin;
 
 typedef struct {
   char *name;

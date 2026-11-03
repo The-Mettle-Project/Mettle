@@ -6,6 +6,8 @@
 #include "../ir/ir_rules.h"
 #include "../lexer/lexer.h"
 #include "../parser/parser.h"
+#include "import_resolver.h"
+#include "monomorphize.h"
 #include "rule_reflect.h"
 #include "symbol_table.h"
 #include "type_checker_internal.h"
@@ -28,6 +30,12 @@ typedef struct {
 } NameSet;
 
 typedef struct {
+  const FunctionDeclaration *generator;
+  const char *target;
+  const char *name;
+} MetaCallDone;
+
+typedef struct {
   ASTNode *program;
   ErrorReporter *reporter;
   const char *root_file;
@@ -35,6 +43,8 @@ typedef struct {
   const char *target;
   long long fuel;
   MetaStageReport *report;
+  MetaCallDone *calls_done;
+  size_t calls_done_count;
 } MetaStage;
 
 typedef struct {
@@ -284,12 +294,20 @@ static int program_has_decorators(const Program *program) {
       return 1;
     }
     if (decl->type == AST_FUNCTION_DECLARATION &&
-        ((const FunctionDeclaration *)decl->data)->meta_decorator_count > 0) {
+        (((const FunctionDeclaration *)decl->data)->meta_decorator_count > 0 ||
+         ((const FunctionDeclaration *)decl->data)->meta_role !=
+             META_ROLE_NONE)) {
       return 1;
     }
     if (decl->type == AST_TRAIT_DECLARATION &&
         ((const TraitDeclaration *)decl->data)->meta_decorator_count > 0) {
       return 1;
+    }
+    if (decl->type == AST_COMPTIME_FOR) {
+      const ASTNode *body = ((const ComptimeForStatement *)decl->data)->body;
+      if (body && body->data && program_has_decorators((const Program *)body->data)) {
+        return 1;
+      }
     }
   }
   return 0;
@@ -349,6 +367,121 @@ static int check_decorators_known(MetaStage *stage, const Program *program) {
     }
   }
   return ok;
+}
+
+static int calls_generator(const Program *program, const ASTNode *node) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_FUNCTION_CALL && node->data) {
+    const CallExpression *call = (const CallExpression *)node->data;
+    if (call->function_name &&
+        find_function(program, call->function_name, META_ROLE_GENERATE, NULL)) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (calls_generator(program, node->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int directive_wants_stage(const Program *program, const ASTNode *directive) {
+  const ASTNode *body = ((const ComptimeForStatement *)directive->data)->body;
+  const Program *declared = body ? (const Program *)body->data : NULL;
+  if (!declared) {
+    return 0;
+  }
+  if (program_has_decorators(declared)) {
+    return 1;
+  }
+  for (size_t i = 0; i < declared->declaration_count; i++) {
+    const ASTNode *decl = declared->declarations[i];
+    if (decl && decl->type == AST_FUNCTION_DECLARATION && decl->data &&
+        calls_generator(program,
+                        ((const FunctionDeclaration *)decl->data)->body)) {
+      return 1;
+    }
+    if (decl && decl->type == AST_COMPTIME_FOR &&
+        directive_wants_stage(program, decl)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void clear_clone_roles(Program *clone);
+
+static int expand_wanted_directives(MetaStage *stage, int *progressed) {
+  Program *program = (Program *)stage->program->data;
+  int wanted = 0;
+  for (size_t i = 0; i < program->declaration_count && !wanted; i++) {
+    const ASTNode *decl = program->declarations[i];
+    wanted = decl && decl->type == AST_COMPTIME_FOR && decl->data &&
+             directive_wants_stage(program, decl);
+  }
+  if (!wanted) {
+    return 1;
+  }
+  ASTNode *clone = ast_clone_node(stage->program);
+  ErrorReporter *reporter = error_reporter_create(stage->root_file, stage->source);
+  SymbolTable *symbols = symbol_table_create();
+  TypeChecker *checker =
+      symbols && reporter
+          ? type_checker_create_with_error_reporter(symbols, reporter)
+          : NULL;
+  if (!clone || !checker) {
+    return 0;
+  }
+  clear_clone_roles((Program *)clone->data);
+  checker->defer_unresolved_comptime = 1;
+  type_checker_reset_declared_type_templates();
+  type_checker_prepare_directives(checker, clone);
+  type_checker_reset_declared_type_templates();
+  ASTNode **rebuilt = NULL;
+  size_t rebuilt_count = 0;
+  size_t rebuilt_capacity = 0;
+  for (size_t i = 0; i < program->declaration_count; i++) {
+    ASTNode *decl = program->declarations[i];
+    ASTNode *single[1] = {decl};
+    ASTNode **batch = single;
+    size_t incoming = 1;
+    ASTNode **made = NULL;
+    size_t made_count = 0;
+    if (decl && decl->type == AST_COMPTIME_FOR && decl->data &&
+        directive_wants_stage(program, decl) &&
+        type_checker_expand_directive_now(checker, decl, &made, &made_count)) {
+      batch = made;
+      incoming = made_count;
+      *progressed = 1;
+    }
+    if (rebuilt_count + incoming > rebuilt_capacity) {
+      size_t next = (rebuilt_count + incoming) * 2 + 8;
+      ASTNode **grown = realloc(rebuilt, next * sizeof(ASTNode *));
+      if (!grown) {
+        return 0;
+      }
+      rebuilt = grown;
+      rebuilt_capacity = next;
+    }
+    memcpy(rebuilt + rebuilt_count, batch, incoming * sizeof(ASTNode *));
+    rebuilt_count += incoming;
+    free(made);
+  }
+  free(program->declarations);
+  program->declarations = rebuilt;
+  program->declaration_count = rebuilt_count;
+  free(stage->program->children);
+  stage->program->children = NULL;
+  stage->program->child_count = 0;
+  stage->program->child_capacity = 0;
+  stage->program->child_capacity_owner = NULL;
+  for (size_t i = 0; i < rebuilt_count; i++) {
+    ast_add_child(stage->program, rebuilt[i]);
+  }
+  return 1;
 }
 
 static void close_over_functions(const Program *clone, NameSet *names,
@@ -464,6 +597,79 @@ static int append_parsed(MetaStage *stage, ASTNode *into, const char *text,
   return 1;
 }
 
+static int append_generated(MetaStage *stage, const char *text,
+                            const char *virtual_file, ASTNode ***out_new,
+                            size_t *out_count) {
+  Program *program = (Program *)stage->program->data;
+  Lexer *lexer = lexer_create(text);
+  ErrorReporter *reporter = error_reporter_create(virtual_file, text);
+  Parser *parser;
+  ASTNode *parsed;
+  Program *data;
+  const char *previous = mettle_compiler_ctx()->current_filename;
+  if (!lexer || !reporter) {
+    return 0;
+  }
+  parser = parser_create_with_error_reporter(lexer, reporter);
+  if (!parser) {
+    return 0;
+  }
+  mettle_compiler_ctx_set_current_filename(virtual_file);
+  parsed = parser_parse_program(parser);
+  mettle_compiler_ctx_set_current_filename(previous);
+  if (!parsed || error_reporter_has_errors(reporter) || !parsed->data) {
+    if (reporter->count > 0 && reporter->errors[0].message && stage->report) {
+      stage->report->pending_error = strdup(reporter->errors[0].message);
+    }
+    return 0;
+  }
+  if (!resolve_imports_of_generated(parsed, stage->root_file, stage->reporter)) {
+    if (stage->report && stage->reporter->count > 0) {
+      stage->report->pending_error =
+          strdup(stage->reporter->errors[stage->reporter->count - 1].message);
+      stage->reporter->count--;
+    }
+    return -1;
+  }
+  mettle_compiler_ctx_set_current_filename(virtual_file);
+  int new_generics = 0;
+  int monomorphized = monomorphize_generated(parsed, stage->program,
+                                             stage->reporter, &new_generics);
+  mettle_compiler_ctx_set_current_filename(previous);
+  if (!monomorphized) {
+    if (stage->report && stage->reporter->count > 0) {
+      stage->report->pending_error =
+          strdup(stage->reporter->errors[stage->reporter->count - 1].message);
+      stage->reporter->count--;
+    }
+    return -1;
+  }
+  data = (Program *)parsed->data;
+  ASTNode **grown =
+      realloc(program->declarations, (program->declaration_count +
+                                      data->declaration_count + 1) *
+                                         sizeof(ASTNode *));
+  if (!grown) {
+    return 0;
+  }
+  program->declarations = grown;
+  size_t first = program->declaration_count;
+  for (size_t i = 0; i < data->declaration_count; i++) {
+    program->declarations[program->declaration_count++] = data->declarations[i];
+    ast_add_child(stage->program, data->declarations[i]);
+  }
+  if (new_generics && !monomorphize_revisit(stage->program, stage->reporter)) {
+    return 0;
+  }
+  if (out_new) {
+    *out_new = program->declarations + first;
+  }
+  if (out_count) {
+    *out_count = program->declaration_count - first;
+  }
+  return 1;
+}
+
 static const FunctionDeclaration *library_function(const Program *program,
                                                    const char *name) {
   return find_function(program, name, META_ROLE_NONE, NULL);
@@ -574,6 +780,7 @@ static int stage_build(MetaStage *stage, const NameSet *keep, const char *driver
   if (!out->checker) {
     return 0;
   }
+  out->checker->defer_unresolved_comptime = 1;
   stage->report->stage_builds++;
   type_checker_reset_declared_type_templates();
   int checked = type_checker_check_program(out->checker, out->clone);
@@ -1037,7 +1244,8 @@ static int collect_generators(MetaStage *stage, GenList *list) {
             &fd->meta_decorators[fd->meta_decorator_count - 1];
         const FunctionDeclaration *generator =
             generator_named(program, last->name);
-        if (!generator) {
+        if (!generator && find_function(program, last->name, META_ROLE_LAYOUT,
+                                        NULL)) {
           char message[300];
           snprintf(message, sizeof(message),
                    "'@%s' is a layout function, and it decorates the function "
@@ -1046,17 +1254,19 @@ static int collect_generators(MetaStage *stage, GenList *list) {
           report_at(stage, last->location, "L0001", message, NULL);
           return 0;
         }
-        GenWork work;
-        memset(&work, 0, sizeof(work));
-        work.site = GEN_ON_FUNCTION;
-        work.decl = decl;
-        work.decorator = last;
-        work.generator = generator;
-        work.generator_name = last->name;
-        work.target = fd->name;
-        work.inner_name = unused_inner_name(program, fd->name);
-        if (!gen_list_add(list, work)) {
-          return 0;
+        if (generator) {
+          GenWork work;
+          memset(&work, 0, sizeof(work));
+          work.site = GEN_ON_FUNCTION;
+          work.decl = decl;
+          work.decorator = last;
+          work.generator = generator;
+          work.generator_name = last->name;
+          work.target = fd->name;
+          work.inner_name = unused_inner_name(program, fd->name);
+          if (!gen_list_add(list, work)) {
+            return 0;
+          }
         }
       }
       if (!fd->meta_role) {
@@ -1067,7 +1277,8 @@ static int collect_generators(MetaStage *stage, GenList *list) {
       for (size_t d = 0; d < td->meta_decorator_count; d++) {
         const FunctionDeclaration *generator =
             generator_named(program, td->meta_decorators[d].name);
-        if (!generator) {
+        if (!generator && find_function(program, td->meta_decorators[d].name,
+                                        META_ROLE_LAYOUT, NULL)) {
           char message[300];
           snprintf(message, sizeof(message),
                    "'@%s' is a layout function, and it decorates the trait '%s'",
@@ -1075,6 +1286,9 @@ static int collect_generators(MetaStage *stage, GenList *list) {
           report_at(stage, td->meta_decorators[d].location, "L0001", message,
                     NULL);
           return 0;
+        }
+        if (!generator) {
+          continue;
         }
         GenWork work;
         memset(&work, 0, sizeof(work));
@@ -1237,23 +1451,26 @@ static int apply_generated(MetaStage *stage, GenWork *work, const char *text,
     FunctionDeclaration *fd = (FunctionDeclaration *)work->decl->data;
     fd->name = work->inner_name;
   }
-  if (!append_parsed(stage, stage->program, kept_text, kept_file, &added,
-                     &added_count)) {
+  error_reporter_register_source(stage->reporter, kept_file, kept_text);
+  int appended = append_generated(stage, kept_text, kept_file, &added, &added_count);
+  if (appended != 1) {
     char message[900];
-    snprintf(message, sizeof(message),
-             "'@%s' wrote source that does not parse: %s", work->generator_name,
+    snprintf(message, sizeof(message), "'@%s' wrote source that %s: %s",
+             work->generator_name,
+             appended == 0 ? "does not parse" : "did not resolve",
              stage->report->pending_error ? stage->report->pending_error : "?");
     stage->report->pending_error = NULL;
     SourceLocation at = work->decl ? work->decl->location : work->call->location;
     report_at(stage, at, "L0001", message, kept_text);
     return 0;
   }
-  error_reporter_register_source(stage->reporter, kept_file, kept_text);
   program = (Program *)stage->program->data;
   int states_a_relation = 0;
   for (size_t i = 0; i < added_count; i++) {
     ASTNode *decl = added[i];
-    if (decl->type == AST_FUNCTION_DECLARATION && decl->data) {
+    if (decl->type == AST_FUNCTION_DECLARATION && decl->data &&
+        decl->location.filename &&
+        strcmp(decl->location.filename, kept_file) == 0) {
       FunctionDeclaration *fd = (FunctionDeclaration *)decl->data;
       fd->generated_by = kept_note;
       if (fd->is_rule) {
@@ -1331,11 +1548,11 @@ static int apply_generated(MetaStage *stage, GenWork *work, const char *text,
   return 1;
 }
 
-static int run_generators(MetaStage *stage, GenList *list) {
+static int build_for_generators(MetaStage *stage, const GenList *list,
+                                StageBuild *build, const char **why) {
   Program *program = (Program *)stage->program->data;
   NameSet names = {0};
   NameSet types = {0};
-  StageBuild build;
   for (size_t i = 0; i < list->count; i++) {
     name_set_add(&names, list->items[i].generator->name, -1);
     name_set_add(&names, list->items[i].target, -1);
@@ -1363,24 +1580,24 @@ static int run_generators(MetaStage *stage, GenList *list) {
               NULL);
     return 0;
   }
-  int built = stage_build(stage, &names, drivers, &build);
+  int built = stage_build(stage, &names, drivers, build);
   if (!built) {
     stage->report->stage_builds--;
-    const char *pruned_error = build.first_error;
-    built = stage_build(stage, NULL, drivers, &build);
+    const char *pruned_error = build->first_error;
+    built = stage_build(stage, NULL, drivers, build);
     if (!built) {
-      stage->report->pending_error =
-          build.first_error ? build.first_error : pruned_error;
-      free(drivers);
-      name_set_free(&names);
-      name_set_free(&types);
-      return 1;
+      *why = build->first_error ? build->first_error : pruned_error;
     }
   }
   free(drivers);
   name_set_free(&names);
   name_set_free(&types);
+  return built;
+}
 
+static int run_generator_list(MetaStage *stage, GenList *list,
+                              StageBuild *build_in) {
+  StageBuild build = *build_in;
   for (size_t i = 0; i < list->count; i++) {
     GenWork *work = &list->items[i];
     char driver[64];
@@ -1432,28 +1649,64 @@ static int run_generators(MetaStage *stage, GenList *list) {
     }
     int reused = 0;
     if (work->site == GEN_AT_CALL) {
-      for (size_t earlier = 0; earlier < i; earlier++) {
-        GenWork *other = &list->items[earlier];
-        if (other->site == GEN_AT_CALL && other->reuse_name &&
-            other->generator == work->generator &&
+      for (size_t earlier = 0; earlier < stage->calls_done_count; earlier++) {
+        MetaCallDone *other = &stage->calls_done[earlier];
+        if (other->generator == work->generator &&
             strcmp(other->target, work->target) == 0) {
           ASTNode *replacement =
-              ast_create_identifier(other->reuse_name, work->call->location);
+              ast_create_identifier(other->name, work->call->location);
           work->call->type = replacement->type;
           work->call->data = replacement->data;
           work->call->child_count = 0;
-          work->reuse_name = other->reuse_name;
           reused = 1;
           break;
         }
       }
       if (!reused) {
-        work->reuse_name = name && *name ? name : work->target;
+        MetaCallDone *grown =
+            realloc(stage->calls_done,
+                    (stage->calls_done_count + 1) * sizeof(MetaCallDone));
+        if (!grown) {
+          return 0;
+        }
+        stage->calls_done = grown;
+        stage->calls_done[stage->calls_done_count].generator = work->generator;
+        stage->calls_done[stage->calls_done_count].target = work->target;
+        stage->calls_done[stage->calls_done_count].name =
+            name && *name ? name : work->target;
+        stage->calls_done_count++;
       }
     }
     if (!reused && !apply_generated(stage, work, text, name)) {
       return 0;
     }
+  }
+  return 1;
+}
+
+static int run_generators(MetaStage *stage, GenList *list, int *ran) {
+  StageBuild build;
+  const char *first_error = NULL;
+  const char *why = NULL;
+  if (build_for_generators(stage, list, &build, &why)) {
+    *ran = 1;
+    return run_generator_list(stage, list, &build);
+  }
+  first_error = why;
+  for (size_t i = 0; i < list->count; i++) {
+    GenList one = {&list->items[i], 1};
+    why = NULL;
+    if (build_for_generators(stage, &one, &build, &why)) {
+      *ran = 1;
+      if (!run_generator_list(stage, &one, &build)) {
+        return 0;
+      }
+    } else if (!first_error) {
+      first_error = why;
+    }
+  }
+  if (!*ran) {
+    stage->report->pending_error = first_error;
   }
   return 1;
 }
@@ -1488,15 +1741,13 @@ static void direct_generated_calls(const Program *program, ASTNode *node) {
 
 static int generator_round(MetaStage *stage, int *progressed) {
   GenList list = {0};
-  *progressed = 0;
   if (!collect_generators(stage, &list)) {
     return 0;
   }
   if (list.count == 0) {
     return 1;
   }
-  *progressed = 1;
-  int ok = run_generators(stage, &list);
+  int ok = run_generators(stage, &list, progressed);
   free(list.items);
   if (ok && !stage->report->pending_error) {
     Program *program = (Program *)stage->program->data;
@@ -1600,11 +1851,16 @@ int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
   stage.target = target;
   stage.fuel = fuel > 0 ? fuel : META_DEFAULT_FUEL;
   stage.report = report;
-  if (!check_decorators_known(&stage, data)) {
-    return 0;
-  }
+  stage.calls_done = NULL;
+  stage.calls_done_count = 0;
   for (int round = 0; round < META_MAX_ROUNDS; round++) {
     int progressed = 0;
+    if (!stage_round(&stage) || report->pending_error) {
+      return report->pending_error ? 1 : 0;
+    }
+    if (!expand_wanted_directives(&stage, &progressed)) {
+      return 0;
+    }
     if (!stage_round(&stage) || report->pending_error) {
       return report->pending_error ? 1 : 0;
     }
@@ -1612,7 +1868,7 @@ int meta_stage_run(ASTNode *program, ErrorReporter *reporter,
       return report->pending_error ? 1 : 0;
     }
     if (!progressed) {
-      return 1;
+      return check_decorators_known(&stage, (Program *)program->data);
     }
   }
   error_reporter_add_error(reporter, ERROR_SEMANTIC, program->location,

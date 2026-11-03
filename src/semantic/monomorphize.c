@@ -3476,6 +3476,8 @@ static void cc_rewrite_captures(ASTNode *node, const CCEnv *caps) {
 }
 
 static int g_cc_counter;
+static int g_closures_continue = 0;
+static Program *g_adapt_whole = NULL;
 
 static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
                               CCEnv *caps, ASTNode *program, Program *prog,
@@ -3743,7 +3745,9 @@ int closure_convert_program(ASTNode *program, ErrorReporter *reporter) {
   if (!prog)
     return 1;
 
-  g_cc_counter = 0;
+  if (!g_closures_continue) {
+    g_cc_counter = 0;
+  }
   int had_error = 0;
 
   for (size_t i = 0; i < prog->declaration_count; i++) {
@@ -4316,18 +4320,28 @@ int closure_adapt_program(ASTNode *program, ErrorReporter *reporter) {
   if (!prog)
     return 1;
 
-  g_adapt_counter = 0;
+  if (!g_closures_continue) {
+    g_adapt_counter = 0;
+  }
   int had_error = 0;
 
-  ASTNode **top_decls = malloc(prog->declaration_count * sizeof(ASTNode *));
+  size_t whole_count = g_adapt_whole ? g_adapt_whole->declaration_count : 0;
+  ASTNode **top_decls =
+      malloc((prog->declaration_count + whole_count) * sizeof(ASTNode *));
   size_t top_count = 0;
-  if (!top_decls && prog->declaration_count > 0) {
+  if (!top_decls && prog->declaration_count + whole_count > 0) {
     return 0;
   }
   for (size_t i = 0; i < prog->declaration_count; i++) {
     if (prog->declarations[i] &&
         prog->declarations[i]->type == AST_FUNCTION_DECLARATION) {
       top_decls[top_count++] = prog->declarations[i];
+    }
+  }
+  for (size_t i = 0; i < whole_count; i++) {
+    if (g_adapt_whole->declarations[i] &&
+        g_adapt_whole->declarations[i]->type == AST_FUNCTION_DECLARATION) {
+      top_decls[top_count++] = g_adapt_whole->declarations[i];
     }
   }
 
@@ -4467,6 +4481,194 @@ static void mono_order_instantiations_before_use(MonoContext *ctx,
   }
 }
 
+static ASTNode **g_mono_retained = NULL;
+static size_t g_mono_retained_count = 0;
+static Instantiation *g_mono_pending = NULL;
+static size_t g_mono_pending_count = 0;
+
+static void mono_keep_pending(const Instantiation *instance) {
+  Instantiation *grown = realloc(
+      g_mono_pending, (g_mono_pending_count + 1) * sizeof(Instantiation));
+  if (!grown) {
+    return;
+  }
+  g_mono_pending = grown;
+  Instantiation *kept = &g_mono_pending[g_mono_pending_count++];
+  memset(kept, 0, sizeof(*kept));
+  kept->generic_name = strdup(instance->generic_name);
+  kept->type_arg_count = instance->type_arg_count;
+  kept->location = instance->location;
+  kept->type_args = calloc(instance->type_arg_count + 1, sizeof(char *));
+  for (size_t i = 0; kept->type_args && i < instance->type_arg_count; i++) {
+    kept->type_args[i] = strdup(instance->type_args[i]);
+  }
+}
+
+static void mono_retain(ASTNode *decl) {
+  for (size_t i = 0; i < g_mono_retained_count; i++) {
+    if (g_mono_retained[i] == decl) {
+      return;
+    }
+  }
+  ASTNode **grown = realloc(g_mono_retained,
+                            (g_mono_retained_count + 1) * sizeof(ASTNode *));
+  if (grown) {
+    g_mono_retained = grown;
+    g_mono_retained[g_mono_retained_count++] = decl;
+  }
+}
+
+static const char *mono_decl_name(const ASTNode *decl) {
+  if (decl->type == AST_STRUCT_DECLARATION && decl->data) {
+    return ((const StructDeclaration *)decl->data)->name;
+  }
+  if (decl->type == AST_FUNCTION_DECLARATION && decl->data) {
+    return ((const FunctionDeclaration *)decl->data)->name;
+  }
+  return NULL;
+}
+
+static int mono_program_declares(const Program *program, const char *name) {
+  for (size_t i = 0; i < program->declaration_count; i++) {
+    const ASTNode *decl = program->declarations[i];
+    const char *held = decl ? mono_decl_name(decl) : NULL;
+    if (held && strcmp(held, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int monomorphize_revisit(ASTNode *whole, ErrorReporter *reporter) {
+  Program *prog = (Program *)whole->data;
+  MonoContext ctx = {0};
+  int success = 1;
+  ASTNode *holder = ast_create_node(AST_PROGRAM, whole->location);
+  Program *held = calloc(1, sizeof(Program));
+  if (!holder || !held) {
+    return 0;
+  }
+  held->declarations = g_mono_retained;
+  held->declaration_count = g_mono_retained_count;
+  holder->data = held;
+  ctx.reporter = reporter;
+  collect_generic_defs(holder, &ctx);
+  if (ctx.had_error || ctx.def_count == 0) {
+    return !ctx.had_error;
+  }
+  ctx.module = prog;
+  if (!mono_infer_type_args(&ctx, whole)) {
+    return 0;
+  }
+  collect_type_instantiations(whole, &ctx);
+  for (size_t i = 0; i < g_mono_pending_count; i++) {
+    mono_add_instantiation(&ctx, g_mono_pending[i].generic_name,
+                           g_mono_pending[i].type_args,
+                           g_mono_pending[i].type_arg_count,
+                           g_mono_pending[i].location);
+  }
+  size_t processed = 0;
+  while (processed < ctx.instance_count) {
+    size_t current = ctx.instance_count;
+    for (size_t i = processed; i < current; i++) {
+      if (!mono_emit_instantiation(&ctx, prog, whole, i, &success) || !success) {
+        return 0;
+      }
+    }
+    processed = current;
+  }
+  rewrite_generic_references(whole, &ctx);
+  mono_order_instantiations_before_use(&ctx, prog);
+  size_t kept = 0;
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    const char *name = decl ? mono_decl_name(decl) : NULL;
+    int duplicate = 0;
+    for (size_t k = 0; name && k < ctx.instance_count && !duplicate; k++) {
+      if (ctx.instances[k].mangled_name &&
+          strcmp(ctx.instances[k].mangled_name, name) == 0) {
+        for (size_t earlier = 0; earlier < kept && !duplicate; earlier++) {
+          const char *other = mono_decl_name(prog->declarations[earlier]);
+          duplicate = other && strcmp(other, name) == 0;
+        }
+      }
+    }
+    if (!duplicate) {
+      prog->declarations[kept++] = decl;
+    }
+  }
+  prog->declaration_count = kept;
+  free(whole->children);
+  whole->children = NULL;
+  whole->child_count = 0;
+  whole->child_capacity = 0;
+  whole->child_capacity_owner = NULL;
+  for (size_t i = 0; i < kept; i++) {
+    ast_add_child(whole, prog->declarations[i]);
+  }
+  return !ctx.had_error;
+}
+
+int monomorphize_generated(ASTNode *fragment, ASTNode *whole,
+                           ErrorReporter *reporter, int *new_generics) {
+  Program *prog = (Program *)fragment->data;
+  Program *whole_prog = (Program *)whole->data;
+  size_t own_count = prog->declaration_count;
+  size_t retained_count = g_mono_retained_count;
+  size_t kept = 0;
+  int ok = 1;
+  ASTNode **own = malloc((own_count + 1) * sizeof(ASTNode *));
+  ASTNode **joined =
+      malloc((own_count + retained_count + 1) * sizeof(ASTNode *));
+  if (!own || !joined) {
+    return 0;
+  }
+  memcpy(own, prog->declarations, own_count * sizeof(ASTNode *));
+  memcpy(joined, g_mono_retained, retained_count * sizeof(ASTNode *));
+  memcpy(joined + retained_count, own, own_count * sizeof(ASTNode *));
+  free(prog->declarations);
+  prog->declarations = joined;
+  prog->declaration_count = own_count + retained_count;
+  ok = monomorphize_program(fragment, reporter);
+  *new_generics = g_mono_retained_count > retained_count;
+  if (ok) {
+    for (size_t i = 0; i < prog->declaration_count; i++) {
+      ASTNode *decl = prog->declarations[i];
+      int was_own = 0;
+      int was_retained = 0;
+      const char *name = decl ? mono_decl_name(decl) : NULL;
+      for (size_t k = 0; k < own_count && !was_own; k++) {
+        was_own = own[k] == decl;
+      }
+      for (size_t k = 0; k < g_mono_retained_count && !was_retained; k++) {
+        was_retained = g_mono_retained[k] == decl;
+      }
+      if (was_retained ||
+          (!was_own && name && mono_program_declares(whole_prog, name))) {
+        continue;
+      }
+      prog->declarations[kept++] = decl;
+    }
+    prog->declaration_count = kept;
+    free(fragment->children);
+    fragment->children = NULL;
+    fragment->child_count = 0;
+    fragment->child_capacity = 0;
+    fragment->child_capacity_owner = NULL;
+    for (size_t i = 0; i < kept; i++) {
+      ast_add_child(fragment, prog->declarations[i]);
+    }
+    g_closures_continue = 1;
+    g_adapt_whole = whole_prog;
+    ok = closure_convert_program(fragment, reporter) &&
+         closure_adapt_program(fragment, reporter);
+    g_closures_continue = 0;
+    g_adapt_whole = NULL;
+  }
+  free(own);
+  return ok;
+}
+
 int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
   if (!program || program->type != AST_PROGRAM)
     return 1;
@@ -4562,6 +4764,10 @@ int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
       }
     }
 
+    if (is_generic || is_compile_time_trait_decl ||
+        (decl && decl->type == AST_TRAIT_DECLARATION)) {
+      mono_retain(decl);
+    }
     if (!is_generic && !is_compile_time_trait_decl) {
       prog->declarations[write_idx++] = decl;
     }
@@ -4592,6 +4798,9 @@ cleanup:
   free(ctx.defs);
 
   for (size_t i = 0; i < ctx.instance_count; i++) {
+    if (!ctx.instances[i].emitted) {
+      mono_keep_pending(&ctx.instances[i]);
+    }
     free(ctx.instances[i].generic_name);
     free(ctx.instances[i].mangled_name);
     for (size_t j = 0; j < ctx.instances[i].type_arg_count; j++)

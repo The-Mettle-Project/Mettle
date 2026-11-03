@@ -707,14 +707,9 @@ int type_checker_register_generated_types(TypeChecker *checker,
   return type_checker_register_types(checker, prog, 1);
 }
 
-int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
-  if (!checker || !program || program->type != AST_PROGRAM) {
-    return 0;
-  }
-
+int type_checker_prepare_directives(TypeChecker *checker, ASTNode *program) {
   Program *prog = (Program *)program->data;
-  if (!prog)
-    return 0;
+  int ok = 1;
   checker->module_program = program;
 
   for (size_t i = 0; i < prog->declaration_count; i++) {
@@ -732,7 +727,6 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
       checker->user_declares_kind = 1;
   }
 
-  int ok = 1;
   if (!schedule_expand(program, checker->error_reporter,
                        &checker->schedule_stats)) {
     ok = 0;
@@ -747,6 +741,19 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
   if (!type_checker_expand_comptime_block(checker, program, 1)) {
     ok = 0;
   }
+  return ok;
+}
+
+int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
+  if (!checker || !program || program->type != AST_PROGRAM) {
+    return 0;
+  }
+
+  Program *prog = (Program *)program->data;
+  if (!prog)
+    return 0;
+
+  int ok = type_checker_prepare_directives(checker, program);
   if (!type_checker_check_composed_names(checker, program)) {
     ok = 0;
   }

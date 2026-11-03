@@ -19,6 +19,8 @@ int resolve_imports(ASTNode *program, const char *base_path,
 int resolve_imports_with_options(ASTNode *program, const char *base_path,
                                  ErrorReporter *reporter,
                                  const ImportResolverOptions *options);
+int resolve_imports_of_generated(ASTNode *fragment, const char *base_path,
+                                 ErrorReporter *reporter);
 
 const char *import_resolver_module_for_file(const char *resolved_path);
 size_t import_resolver_file_count(void);

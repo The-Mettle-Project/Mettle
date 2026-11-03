@@ -1,0 +1,123 @@
+import "std/io";
+import "std/meta";
+
+struct Box<T> {
+  value: T;
+}
+
+fn box_of<T>(v: T) -> Box<T> {
+  var b: Box<T>;
+  b.value = v;
+  return b;
+}
+
+trait Area {
+  fn area(self: Self) -> int64;
+}
+
+struct Square {
+  side: int64;
+}
+
+impl Area for Square {
+  fn area(self: Self) -> int64 {
+    return self.side * self.side;
+  }
+}
+
+@generate fn writes_imports(f: FunctionInfo) -> Generated {
+  var t: Text;
+  text_add(&t, "import \"std/math\";\n");
+  text_add(&t, "import \"std/io\";\n");
+  text_add(&t, "import \"std/math\" as m;\n");
+  text_add(&t, "fn {f.name}__root(x: float64) -> float64 {{\n");
+  text_add(&t, "  return sqrt(x) + m.floor(0.5);\n}\n");
+  text_add(&t, "@rule fn {f.name}__root_holds(p: Program) -> Verdict {{\n");
+  text_add(&t, "  if ({f.name}__root(16.0) != 4.0) {{ return verdict_fail(function_site(p, \"{f.name}\"), \"bad root\"); }\n");
+  text_add(&t, "  return verdict_pass();\n}\n");
+  return generated_as("{f.name}__root", text_done(&t));
+}
+
+@generate fn writes_generics(f: FunctionInfo) -> Generated {
+  var t: Text;
+  text_add(&t, "struct Pair<A, B> {{\n  a: A;\n  b: B;\n}\n");
+  text_add(&t, "fn pair_of<A, B>(a: A, b: B) -> Pair<A, B> {{\n");
+  text_add(&t, "  var p: Pair<A, B>;\n  p.a = a;\n  p.b = b;\n  return p;\n}\n");
+  text_add(&t, "fn {f.name}__pairs(n: int64) -> int64 {{\n");
+  text_add(&t, "  var p: Pair<int64, float64> = pair_of<int64, float64>(n, 2.5);\n");
+  text_add(&t, "  var q: Box<int64> = box_of<int64>(p.a + 1);\n");
+  text_add(&t, "  var r: Box<int32> = box_of<int32>(7);\n");
+  text_add(&t, "  var s: Square;\n  s.side = q.value;\n");
+  text_add(&t, "  var add: Fn(int64) -> int64 = fn(x: int64) -> int64 {{ return x + (int64)r.value; };\n");
+  text_add(&t, "  return add(s.area());\n}\n");
+  text_add(&t, "@rule fn {f.name}__pairs_holds(p: Program) -> Verdict {{\n");
+  text_add(&t, "  return verdict_pass();\n}\n");
+  return generated_as("{f.name}__pairs", text_done(&t));
+}
+
+@generate fn writes_struct(t: TypeInfo) -> Generated {
+  var out: Text;
+  text_add(&out, "struct {t.name}__record {{\n");
+  for field in t.fields {
+    text_add(&out, "  {field.name}: {field.type_name};\n");
+  }
+  text_add(&out, "  extra: int64;\n}\n\n");
+  text_add(&out, "comptime for g in typeof({t.name}__later).fields {{\n");
+  text_add(&out, "  fn ident(\"later_\", g.name)() -> int64 {{ return g.type.size; }\n");
+  text_add(&out, "}\n\n");
+  text_add(&out, "@writes_later struct {t.name}__stem {{\n  stem: int16;\n}\n\n");
+  text_add(&out, "@rule fn {t.name}__record_holds(p: Program) -> Verdict {{\n");
+  text_add(&out, "  return verdict_pass();\n}\n");
+  return generated(text_done(&out));
+}
+
+@generate fn writes_later(t: TypeInfo) -> Generated {
+  var out: Text;
+  text_add(&out, "@soa struct Seed__later {{\n  deep: int32;\n  deeper: float64;\n}\n\n");
+  text_add(&out, "struct LaterRow {{\n  name: string;\n  value: int64;\n}\n");
+  text_add(&out, "const LATER_TABLE: LaterRow[2] = [{{name: \"eleven\", value: 11}, {{name: \"twentytwo\", value: 22}];\n\n");
+  text_add(&out, "@rule fn {t.name}__later_holds(p: Program) -> Verdict {{\n");
+  text_add(&out, "  return verdict_pass();\n}\n");
+  return generated(text_done(&out));
+}
+
+@writes_struct struct Seed {
+  a: int32;
+  b: float64;
+}
+
+comptime for f in typeof(Seed__record).fields {
+  fn ident("size_of_", f.name)() -> int64 {
+    return f.type.size;
+  }
+
+  @memoize fn ident("doubled_", f.name)(n: int64) -> int64 {
+    return n * 2 + f.type.size;
+  }
+}
+
+comptime for r in LATER_TABLE.rows {
+  fn ident("row_", r.name)() -> int64 {
+    return r.value;
+  }
+}
+
+fn base(x: int64) -> int64 {
+  return x;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  if (writes_imports(base)(25.0) != 5.0) { bad = bad + 1; }
+  if (writes_generics(base)(3) != 23) { bad = bad + 2; }
+  if (writes_generics(base)(1) != 11) { bad = bad + 4; }
+  if (size_of_a() != 4 || size_of_b() != 8 || size_of_extra() != 8) { bad = bad + 8; }
+  if (doubled_a(10) != 24 || doubled_b(1) != 10) { bad = bad + 16; }
+  if (doubled_extra(0) != 8) { bad = bad + 32; }
+  if (later_deep() != 4 || later_deeper() != 8) { bad = bad + 64; }
+  var made: Pair<int32, int16> = pair_of<int32, int16>(3, (int16)4);
+  if (made.a != 3 || made.b != (int16)4) { bad = bad + 128; }
+  if (row_eleven() != 11 || row_twentytwo() != 22) { bad = bad + 256; }
+  if (bad == 0) { println("ok"); }
+  return bad;
+}

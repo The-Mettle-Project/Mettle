@@ -139,6 +139,33 @@ contracts like anything else. Each generated function records which decorator
 wrote it, and `mettle expand` prints that above it. Diagnostics in generated code
 point into the generated source.
 
+Each round's output goes through the import resolver and the monomorphizer before
+it joins the program. The resolver keeps the set of files it already merged, so a
+generated import of a module the program holds adds nothing. The monomorphizer
+keeps the generic definitions, traits and impls it removed from the program, so
+generated code can instantiate a generic the program wrote and the program can
+instantiate a generic a generator wrote. An instantiation already in the program
+is dropped.
+
+```mermaid
+flowchart TD
+  layouts[run layouts] --> expand[expand each comptime for<br/>that holds a decorator or generator call]
+  expand --> gens[run generators]
+  gens --> resolve[resolve imports, monomorphize,<br/>convert closures, append]
+  resolve --> more{anything new?}
+  more -- yes --> layouts
+  more -- no --> check[type check the program]
+```
+
+A module-scope `comptime for` that names a type or table no round has written yet
+is left out of that round's stage build and tried again in the next. The type
+checker expands what is left, and reports anything still unknown by name. A
+`comptime for` expanded early records its sequence and iteration on the
+declarations it makes, so every later stage build and the final type check bind
+the same names to their own types. If a stage build fails for the whole list of
+generators, each generator runs alone, so one that needs another's output waits
+for the next round.
+
 ## Checks on generated code
 
 A generator states what it promises by writing a `@rule` with its code. The rule
