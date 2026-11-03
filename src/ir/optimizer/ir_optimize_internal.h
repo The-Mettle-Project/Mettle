@@ -552,7 +552,6 @@ void ir_index_vector_destroy(IRIndexVector *vector);
 int ir_inline_small_functions_pass(IRProgram *program, int *changed);
 int ir_inline_self_recursion_pass(IRProgram *program, int *changed);
 int ir_tail_recursion_elimination_pass(IRProgram *program, int *changed);
-int ir_layout_factor_pass(IRProgram *program, int *changed);
 struct IRGlobalIntConst;
 int ir_fold_readonly_globals_pass(IRProgram *program,
                                   const struct IRGlobalIntConst *consts,

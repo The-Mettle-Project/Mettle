@@ -3,7 +3,7 @@ import "std/mem";
 import "std/bench";
 
 const NODE_COUNT: int32 = 65536;
-const NODE_BYTES: int64 = 16;
+const NODE_BYTES: int64 = 8;
 
 fn node_next(nodes: cstring, idx: int32) -> int32 {
   return *(int32*)(nodes + (int64)idx * NODE_BYTES);

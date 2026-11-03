@@ -1406,10 +1406,6 @@ static const DecisionDoc DECISIONS[] = {
      "The loop walks memory with a stride the compiler can see ahead of, so it\n"
      "asks for the line some iterations early. This hides part of the memory\n"
      "latency on a loop whose limit is bandwidth rather than arithmetic.\n"},
-    {"layout-optimized", DECISION_APPLIED,
-     "A data layout was reshaped",
-     "Fields or elements were reordered so the accesses in the hot loop fall\n"
-     "in the same cache lines. Nothing in the program's meaning changes.\n"},
     {"noalloc-verified", DECISION_APPLIED,
      "The @noalloc contract holds",
      "The function is marked @noalloc, and the compiler walked everything it\n"

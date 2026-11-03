@@ -1,0 +1,12 @@
+import "std/meta";
+
+extern fn mystery(x: float64) -> float64 = "mystery";
+
+fn loss(x: float64) -> float64 {
+  return mystery(x) * 2.0;
+}
+
+fn main() -> int32 {
+  var g: loss__gradient = grad(loss)(2.0);
+  return (int32)g.d_x;
+}

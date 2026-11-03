@@ -58,7 +58,6 @@ BEHAVIOUR = [
 REPORTING = [
     ("METTLE_ALIAS_TRACE", "1"),
     ("METTLE_BP_TRACE", "1"),
-    ("METTLE_LAYOUT_DEBUG", "1"),
     ("METTLE_LOOP_FINGERPRINT", "1"),
     ("METTLE_MIR_DUMP", "1"),
     ("METTLE_MIR_TRACE", "1"),

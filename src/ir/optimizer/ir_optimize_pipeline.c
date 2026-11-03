@@ -919,8 +919,6 @@ static const IRProgramPass kProgramPasses[] = {
     {"hoist_pure_calls", "hoist_pure_calls [program]",
      ir_hoist_pure_calls_pass,
      "IR optimization pure-call hoisting pass failed", 0, 0, 0},
-    {"layout_factor", "layout_factor [program]", ir_layout_factor_pass,
-     "IR layout factorization pass failed", 1, 1, 0},
 };
 
 static const IRProgramPass kParallelizePass = {

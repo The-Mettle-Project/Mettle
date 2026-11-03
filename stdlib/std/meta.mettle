@@ -1255,7 +1255,7 @@ fn grad_arguments(f: FunctionInfo, changed: int64, changed_text: string) -> stri
   return text_done(&t);
 }
 
-fn grad_rule_text(f: FunctionInfo, grad_name: string) -> string {
+export fn grad_rule_text(f: FunctionInfo, grad_name: string) -> string {
   var t: Text;
   var site: string = "function_site(p, \"{f.name}\")";
   text_add(&t, "@rule fn {f.name}__grad_holds(p: Program) -> Verdict {{\n");

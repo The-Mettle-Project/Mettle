@@ -1,0 +1,13 @@
+import "std/meta";
+
+@generate fn nonsense(f: FunctionInfo) -> Generated {
+  return generated("fn {f.name}( this does not parse");
+}
+
+@nonsense fn target(x: int64) -> int64 {
+  return x;
+}
+
+fn main() -> int32 {
+  return (int32)target(1);
+}

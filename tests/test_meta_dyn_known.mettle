@@ -1,0 +1,22 @@
+import "std/io";
+import "std/meta";
+
+struct Circle {
+  r: float64;
+}
+
+@dyn trait Shape {
+  fn area(self: Self) -> float64;
+}
+
+impl Shape for Circle {
+  fn area(self: Self) -> float64 { return 3.0 * self.r * self.r; }
+}
+
+fn main() -> int32 {
+  var c: Circle;
+  c.r = 2.0;
+  var known: Shape__dyn = Shape__from_Circle(&c);
+  println("{known.area()}");
+  return 0;
+}

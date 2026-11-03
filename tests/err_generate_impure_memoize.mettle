@@ -1,0 +1,12 @@
+import "std/meta";
+
+var seen: int64 = 0;
+
+@memoize fn bump(n: int64) -> int64 {
+  seen = seen + 1;
+  return n + seen;
+}
+
+fn main() -> int32 {
+  return (int32)bump(1);
+}

@@ -1,0 +1,20 @@
+import "std/meta";
+
+fn step(x: float64) -> float64 {
+  return x * x;
+}
+
+@generate fn broken_grad(f: FunctionInfo) -> Generated {
+  var name: string = "{f.name}__broken";
+  var t: Text;
+  text_add(&t, "struct {f.name}__gradient {{\n  value: float64;\n  d_x: float64;\n}\n\n");
+  text_add(&t, "fn {name}(x: float64) -> {f.name}__gradient {{\n");
+  text_add(&t, "  var out: {f.name}__gradient;\n  out.value = {f.name}(x);\n  out.d_x = 3.0 * x;\n  return out;\n}\n\n");
+  text_add(&t, grad_rule_text(f, name));
+  return generated_as(name, text_done(&t));
+}
+
+fn main() -> int32 {
+  var g: step__gradient = broken_grad(step)(2.0);
+  return (int32)g.d_x;
+}

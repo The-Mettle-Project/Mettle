@@ -36,6 +36,57 @@ fn loopy(x: float64, n: int32) -> float64 {
   return s;
 }
 
+fn nested(limit: int32) -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 0;
+  outer: while (i < limit) {
+    var j: int32 = 0;
+    while (j < limit) {
+      if (j == 3) {
+        j = j + 1;
+        continue;
+      }
+      if (i * j > 12) { break outer; }
+      if (i == 2 && j == 1) {
+        i = i + 1;
+        continue outer;
+      }
+      total = total + (int64)(i * 10 + j);
+      j = j + 1;
+    }
+    i = i + 1;
+    if (total > 100000) { return -1; }
+  }
+  return total;
+}
+
+fn picked(x: int32) -> int32 {
+  switch (x) {
+  case 0:
+    return 10;
+  case 1: {
+    var y: int32 = x * 3;
+    return y + 1;
+  }
+  default:
+    return x - 1;
+  }
+}
+
+struct Pair {
+  a: int32;
+  b: float64;
+}
+
+fn with_struct(k: int32) -> float64 {
+  var p: Pair;
+  p.a = k;
+  p.b = 1.5;
+  var q: Pair = p;
+  q.a = q.a + 1;
+  return (float64)q.a * q.b;
+}
+
 fn check(name: string, got: int64, want: int64) -> int32 {
   if (got != want) {
     println("{name}: got {got}, want {want}");
@@ -54,6 +105,17 @@ fn main() -> int32 {
   var copied: fn(float64, int32) -> float64 = copy_of(loopy);
   bad = bad + check("rendered loop", (int64)(copied(1.0, 9) * 2.0),
                     (int64)(loopy(1.0, 9) * 2.0));
+  var nested_copy: fn(int32) -> int64 = copy_of(nested);
+  for n in 0..9 {
+    bad = bad + check("nested exits", nested_copy((int32)n), nested((int32)n));
+  }
+  var picked_copy: fn(int32) -> int32 = copy_of(picked);
+  for n in 0..4 {
+    bad = bad + check("switch", (int64)picked_copy((int32)n),
+                      (int64)picked((int32)n));
+  }
+  var struct_copy: fn(int32) -> float64 = copy_of(with_struct);
+  bad = bad + check("struct locals", (int64)(struct_copy(3) * 2.0), 12);
   if (bad == 0) { println("ok"); }
   return bad;
 }

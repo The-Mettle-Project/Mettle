@@ -1,38 +1,45 @@
 import "std/io";
 import "std/mem";
 import "std/bench";
+import "std/layout";
 
 const REC_COUNT: int32 = 1048576;
-const REC_BYTES: int64 = 32;
 
-fn set_field(pool: cstring, idx: int32, field: int32, v: int32) {
-  *(int32*)(pool + (int64)idx * REC_BYTES + (int64)field * 4) = v;
+@soa struct Rec {
+  f0: int32;
+  f1: int32;
+  f2: int32;
+  f3: int32;
+  f4: int32;
+  f5: int32;
+  f6: int32;
+  f7: int32;
 }
 
-fn build_records(pool: cstring, count: int32) {
+fn build_records(pool: Rec[], count: int32) {
   var state: uint32 = 2463534242;
   var i: int32 = 0;
   while (i < count) {
-    set_field(pool, i, 0, i & 4095);
+    pool[i].f0 = i & 4095;
     state = state ^ (state << 13);
     state = state ^ (state >> 17);
     state = state ^ (state << 5);
-    set_field(pool, i, 1, (int32)(state & 65535));
-    set_field(pool, i, 2, (int32)(state >> 16));
-    set_field(pool, i, 3, i * 3);
-    set_field(pool, i, 4, i - count);
-    set_field(pool, i, 5, (i ^ 12345) & 4095);
-    set_field(pool, i, 6, i + 7);
-    set_field(pool, i, 7, (int32)(state ^ (uint32)i));
+    pool[i].f1 = (int32)(state & 65535);
+    pool[i].f2 = (int32)(state >> 16);
+    pool[i].f3 = i * 3;
+    pool[i].f4 = i - count;
+    pool[i].f5 = (i ^ 12345) & 4095;
+    pool[i].f6 = i + 7;
+    pool[i].f7 = (int32)(state ^ (uint32)i);
     i = i + 1;
   }
 }
 
-fn sum_field0(pool: cstring, count: int32) -> int64 {
+fn sum_field0(pool: Rec[], count: int32) -> int64 {
   var total: int64 = 0;
   var i: int32 = 0;
   while (i < count) {
-    total = total + (int64)*(int32*)(pool + (int64)i * REC_BYTES);
+    total = total + (int64)pool[i].f0;
     i = i + 1;
   }
   return total;
@@ -40,15 +47,11 @@ fn sum_field0(pool: cstring, count: int32) -> int64 {
 
 fn main() -> int32 {
   var count: int32 = REC_COUNT;
-  var pool: cstring = malloc((int64)count * REC_BYTES);
-  if (pool == 0) {
-    println("malloc failed");
-    return 1;
-  }
+  var pool: Rec[] = new Rec[count];
 
   build_records(pool, count);
 
-  println("Field-selective AoS walk: 1048576 records (32B), field 0 only");
+  println("Field-selective walk: 1048576 records (32B), field 0 only");
 
   var check: int64 = sum_field0(pool, count);
   print("Checksum = ");
@@ -77,6 +80,6 @@ fn main() -> int32 {
   print("{per_pass}");
   println(" us");
 
-  free(pool);
+  free(pool.data);
   return 0;
 }

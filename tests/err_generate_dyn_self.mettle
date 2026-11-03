@@ -1,0 +1,17 @@
+import "std/meta";
+
+struct Number {
+  v: int32;
+}
+
+@dyn trait Addable {
+  fn plus(self: Self, other: Self) -> int32;
+}
+
+impl Addable for Number {
+  fn plus(self: Self, other: Self) -> int32 { return self.v + other.v; }
+}
+
+fn main() -> int32 {
+  return 0;
+}

@@ -5,7 +5,7 @@
  * hot loop sums only field 0 from every record, 100 passes. Array-of-structs
  * layout means each 4-byte read pulls a full record's cache line. GCC -O3
  * keeps base+offset addressing tight but cannot change the heap layout, so it
- * pays the same 8x memory-traffic overhead the Mettle SoA transform removes.
+ * pays the 8x memory-traffic overhead that @soa on the Mettle struct removes.
  *
  * Build: build.bat (or: gcc -O3 -o field_sum_c.exe field_sum.c -lkernel32)
  * Run: field_sum_c.exe
