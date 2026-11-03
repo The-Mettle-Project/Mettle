@@ -188,6 +188,36 @@ static void type_checker_format_bounds(const Type *type, char *out,
   snprintf(out, out_size, "%lld..%llu", min, max);
 }
 
+static const char *type_checker_spell_ref(const Type *type, const char *name,
+                                          char *room, size_t room_size) {
+  if (!type_is_element_ref(type)) {
+    return name;
+  }
+  snprintf(room, room_size, "%s*", type->base_type->name);
+  return room;
+}
+
+static int type_checker_refuse_bare_pointer(TypeChecker *checker,
+                                            SourceLocation where,
+                                            const Type *dest_type,
+                                            const Type *src_type) {
+  char refused[400];
+  if (!checker || !type_is_element_ref(dest_type) || !src_type ||
+      src_type->kind != TYPE_POINTER) {
+    return 0;
+  }
+  snprintf(refused, sizeof(refused),
+           "'%s*' holds a base, an index and a count, and this value is a bare "
+           "pointer. Allocate with 'new %s[n]' and take '&a[i]'. Only "
+           "free(s.data) reads a slice's data pointer",
+           dest_type->base_type->name, dest_type->base_type->name);
+  type_checker_set_error_at_location(checker, where, "%s", refused);
+  if (checker->error_reporter) {
+    error_reporter_set_last_code(checker->error_reporter, "L0003");
+  }
+  return 1;
+}
+
 void type_checker_report_assign_mismatch(TypeChecker *checker,
                                          const ASTNode *src_expr,
                                          SourceLocation location,
@@ -206,26 +236,9 @@ void type_checker_report_assign_mismatch(TypeChecker *checker,
   SourceLocation where = src_expr ? src_expr->location : location;
   char expected_ref[160];
   char actual_ref[160];
-  if (type_is_element_ref(dest_type)) {
-    snprintf(expected_ref, sizeof(expected_ref), "%s*", dest_type->base_type->name);
-    expected = expected_ref;
-  }
-  if (type_is_element_ref(src_type)) {
-    snprintf(actual_ref, sizeof(actual_ref), "%s*", src_type->base_type->name);
-    actual = actual_ref;
-  }
-  if (checker && type_is_element_ref(dest_type) && src_type &&
-      src_type->kind == TYPE_POINTER) {
-    char refused[400];
-    snprintf(refused, sizeof(refused),
-             "'%s' holds a base, an index and a count, and this value is a bare "
-             "pointer. Allocate with 'new %s[n]' and take '&a[i]'. Only "
-             "free(s.data) reads a slice's data pointer",
-             expected, dest_type->base_type->name);
-    type_checker_set_error_at_location(checker, where, "%s", refused);
-    if (checker->error_reporter) {
-      error_reporter_set_last_code(checker->error_reporter, "L0003");
-    }
+  expected = type_checker_spell_ref(dest_type, expected, expected_ref, sizeof(expected_ref));
+  actual = type_checker_spell_ref(src_type, actual, actual_ref, sizeof(actual_ref));
+  if (type_checker_refuse_bare_pointer(checker, where, dest_type, src_type)) {
     return;
   }
   long long folded = 0;

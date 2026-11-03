@@ -1708,7 +1708,8 @@ static int ir_column_load_count(IRLoweringContext *context,
   load.dest = access->count;
   load.lhs = slot;
   load.rhs = ir_operand_int(8);
-  load.alias_class = IR_ALIAS_CLASS_I64;
+  load.alias_class =
+      access->count_offset == 16 ? IR_ALIAS_CLASS_POINTER : IR_ALIAS_CLASS_I64;
   int ok = ir_emit(context, function, &load);
   ir_operand_destroy(&slot);
   return ok;
@@ -1783,8 +1784,7 @@ static int ir_emit_ref_bounds_check(IRLoweringContext *context,
 
 static int ir_ref_load_word(IRLoweringContext *context, IRFunction *function,
                             const IROperand *ref_address, long long offset,
-                            unsigned char alias_class, SourceLocation location,
-                            IROperand *out) {
+                            SourceLocation location, IROperand *out) {
   IROperand slot = ir_operand_none();
   IRInstruction load = {0};
   if (!ir_emit_address_with_offset(context, function, ref_address, offset,
@@ -1797,7 +1797,7 @@ static int ir_ref_load_word(IRLoweringContext *context, IRFunction *function,
   load.dest = *out;
   load.lhs = slot;
   load.rhs = ir_operand_int(8);
-  load.alias_class = alias_class;
+  load.alias_class = IR_ALIAS_CLASS_POINTER;
   int ok = ir_emit(context, function, &load);
   ir_operand_destroy(&slot);
   return ok;
@@ -1805,8 +1805,7 @@ static int ir_ref_load_word(IRLoweringContext *context, IRFunction *function,
 
 static int ir_ref_store_word(IRLoweringContext *context, IRFunction *function,
                              const IROperand *ref_address, long long offset,
-                             const IROperand *value, unsigned char alias_class,
-                             SourceLocation location) {
+                             const IROperand *value, SourceLocation location) {
   IROperand slot = ir_operand_none();
   IRInstruction store = {0};
   if (!ir_emit_address_with_offset(context, function, ref_address, offset,
@@ -1818,7 +1817,7 @@ static int ir_ref_store_word(IRLoweringContext *context, IRFunction *function,
   store.dest = slot;
   store.lhs = ir_clone_operand_local(value);
   store.rhs = ir_operand_int(8);
-  store.alias_class = alias_class;
+  store.alias_class = IR_ALIAS_CLASS_POINTER;
   int ok = ir_emit(context, function, &store);
   ir_operand_destroy(&store.dest);
   ir_operand_destroy(&store.lhs);
@@ -1839,10 +1838,9 @@ static int ir_column_access_from_ref(IRLoweringContext *context,
   out->offset = ir_operand_none();
   out->element = ref_type->base_type;
   if (!ir_lower_lvalue_address(context, function, ref_node, &ref_address, NULL) ||
-      !ir_ref_load_word(context, function, &ref_address, 0,
-                        IR_ALIAS_CLASS_POINTER, location, &out->base) ||
-      !ir_ref_load_word(context, function, &ref_address, 8, IR_ALIAS_CLASS_I64,
-                        location, &out->held_index)) {
+      !ir_ref_load_word(context, function, &ref_address, 0, location, &out->base) ||
+      !ir_ref_load_word(context, function, &ref_address, 8, location,
+                        &out->held_index)) {
     return 0;
   }
   out->slice_address = ref_address;
@@ -2172,12 +2170,9 @@ int ir_lower_make_element_ref(IRLoweringContext *context, IRFunction *function,
   char *name = NULL;
   IROperand address = ir_operand_none();
   if (!ir_ref_declare(context, function, ref_type, location, &name, &address) ||
-      !ir_ref_store_word(context, function, &address, 0, base,
-                         IR_ALIAS_CLASS_POINTER, location) ||
-      !ir_ref_store_word(context, function, &address, 8, index, IR_ALIAS_CLASS_I64,
-                         location) ||
-      !ir_ref_store_word(context, function, &address, 16, count,
-                         IR_ALIAS_CLASS_I64, location)) {
+      !ir_ref_store_word(context, function, &address, 0, base, location) ||
+      !ir_ref_store_word(context, function, &address, 8, index, location) ||
+      !ir_ref_store_word(context, function, &address, 16, count, location)) {
     return 0;
   }
   ir_operand_destroy(&address);
@@ -2227,16 +2222,15 @@ int ir_lower_element_ref_arithmetic(IRLoweringContext *context,
   IROperand address = ir_operand_none();
   IROperand index = ir_operand_none();
   if (!ir_lower_lvalue_address(context, function, ref_node, &address, NULL) ||
-      !ir_ref_load_word(context, function, &address, 8, IR_ALIAS_CLASS_I64,
-                        location, &index)) {
+      !ir_ref_load_word(context, function, &address, 8, location, &index)) {
     return 0;
   }
   if (both) {
     IROperand other_address = ir_operand_none();
     IROperand other_index = ir_operand_none();
     if (!ir_lower_lvalue_address(context, function, other, &other_address, NULL) ||
-        !ir_ref_load_word(context, function, &other_address, 8, IR_ALIAS_CLASS_I64,
-                          location, &other_index) ||
+        !ir_ref_load_word(context, function, &other_address, 8, location,
+                          &other_index) ||
         !ir_emit_binary_temp(context, function, "-", &index, &other_index, location,
                              out_value)) {
       return 0;
@@ -2251,10 +2245,8 @@ int ir_lower_element_ref_arithmetic(IRLoweringContext *context,
   IROperand count = ir_operand_none();
   IROperand offset = ir_operand_none();
   IROperand moved = ir_operand_none();
-  if (!ir_ref_load_word(context, function, &address, 0, IR_ALIAS_CLASS_POINTER,
-                        location, &base) ||
-      !ir_ref_load_word(context, function, &address, 16, IR_ALIAS_CLASS_I64,
-                        location, &count) ||
+  if (!ir_ref_load_word(context, function, &address, 0, location, &base) ||
+      !ir_ref_load_word(context, function, &address, 16, location, &count) ||
       !ir_lower_index_expression(context, function, other, &offset) ||
       !ir_emit_binary_temp(context, function, binary->operator, &index, &offset,
                            location, &moved)) {
@@ -2283,8 +2275,7 @@ int ir_lower_element_ref_compare(IRLoweringContext *context, IRFunction *functio
     ASTNode *ref_node = type_is_element_ref(left_type) ? binary->left : binary->right;
     IROperand zero = ir_operand_int(0);
     if (!ir_lower_lvalue_address(context, function, ref_node, &left, NULL) ||
-        !ir_ref_load_word(context, function, &left, 0, IR_ALIAS_CLASS_POINTER,
-                          location, &left_base) ||
+        !ir_ref_load_word(context, function, &left, 0, location, &left_base) ||
         !ir_emit_binary_temp(context, function, equals ? "==" : "!=", &left_base,
                              &zero, location, out_value)) {
       return 0;
@@ -2302,14 +2293,10 @@ int ir_lower_element_ref_compare(IRLoweringContext *context, IRFunction *functio
   IROperand both = ir_operand_none();
   if (!ir_lower_lvalue_address(context, function, binary->left, &left, NULL) ||
       !ir_lower_lvalue_address(context, function, binary->right, &right, NULL) ||
-      !ir_ref_load_word(context, function, &left, 0, IR_ALIAS_CLASS_POINTER,
-                        location, &left_base) ||
-      !ir_ref_load_word(context, function, &right, 0, IR_ALIAS_CLASS_POINTER,
-                        location, &right_base) ||
-      !ir_ref_load_word(context, function, &left, 8, IR_ALIAS_CLASS_I64, location,
-                        &left_index) ||
-      !ir_ref_load_word(context, function, &right, 8, IR_ALIAS_CLASS_I64, location,
-                        &right_index) ||
+      !ir_ref_load_word(context, function, &left, 0, location, &left_base) ||
+      !ir_ref_load_word(context, function, &right, 0, location, &right_base) ||
+      !ir_ref_load_word(context, function, &left, 8, location, &left_index) ||
+      !ir_ref_load_word(context, function, &right, 8, location, &right_index) ||
       !ir_emit_binary_temp(context, function, "==", &left_base, &right_base,
                            location, &same_base) ||
       !ir_emit_binary_temp(context, function, "==", &left_index, &right_index,

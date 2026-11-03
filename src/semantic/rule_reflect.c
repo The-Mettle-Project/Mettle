@@ -1253,22 +1253,45 @@ static int meta_is_pointer_name(const char *name) {
                         strcmp(name, "rawptr") == 0);
 }
 
+static const char *meta_arithmetic_result_type(MetaImage *m,
+                                               const IRInstruction *ins) {
+  if (ins->is_float && ins->text && ins->text[0] != '<' &&
+      ins->text[0] != '>' && ins->text[0] != '=' && ins->text[0] != '!') {
+    return meta_float_name(ins->float_bits);
+  }
+  if (ins->op == IR_OP_BINARY && ins->text &&
+      (strcmp(ins->text, "+") == 0 || strcmp(ins->text, "-") == 0) &&
+      (meta_is_pointer_name(meta_operand_type(m, &ins->lhs)) ||
+       (ins->text[0] == '+' &&
+        meta_is_pointer_name(meta_operand_type(m, &ins->rhs))))) {
+    return "cstring";
+  }
+  return "int64";
+}
+
+static const char *meta_call_result_type(MetaImage *m, const IRInstruction *ins) {
+  Symbol *callee = meta_callee(m, ins);
+  Type *returned = callee ? callee->data.function.return_type : NULL;
+  if (!returned && ins->is_float) {
+    return meta_float_name(ins->float_bits);
+  }
+  if (returned && returned->name &&
+      (returned->kind == TYPE_FLOAT32 || returned->kind == TYPE_FLOAT64 ||
+       returned->kind == TYPE_STRUCT || returned->kind == TYPE_STRING ||
+       returned->kind == TYPE_SLICE || returned->kind == TYPE_ARRAY)) {
+    return returned->name;
+  }
+  if (returned && returned->kind == TYPE_POINTER) {
+    return "cstring";
+  }
+  return "int64";
+}
+
 static const char *meta_result_type(MetaImage *m, const IRInstruction *ins) {
   switch (ins->op) {
   case IR_OP_BINARY:
   case IR_OP_UNARY:
-    if (ins->is_float && ins->text && ins->text[0] != '<' &&
-        ins->text[0] != '>' && ins->text[0] != '=' && ins->text[0] != '!') {
-      return meta_float_name(ins->float_bits);
-    }
-    if (ins->op == IR_OP_BINARY && ins->text &&
-        (strcmp(ins->text, "+") == 0 || strcmp(ins->text, "-") == 0) &&
-        (meta_is_pointer_name(meta_operand_type(m, &ins->lhs)) ||
-         (ins->text[0] == '+' &&
-          meta_is_pointer_name(meta_operand_type(m, &ins->rhs))))) {
-      return "cstring";
-    }
-    return "int64";
+    return meta_arithmetic_result_type(m, ins);
   case IR_OP_LOAD:
     if (ins->is_float) {
       return meta_float_name(ins->float_bits);
@@ -1285,23 +1308,8 @@ static const char *meta_result_type(MetaImage *m, const IRInstruction *ins) {
       return "float64";
     }
     return meta_is_pointer_name(ins->text) ? "cstring" : "int64";
-  case IR_OP_CALL: {
-    Symbol *callee = meta_callee(m, ins);
-    Type *returned = callee ? callee->data.function.return_type : NULL;
-    if (!returned && ins->is_float) {
-      return meta_float_name(ins->float_bits);
-    }
-    if (returned && returned->name &&
-        (returned->kind == TYPE_FLOAT32 || returned->kind == TYPE_FLOAT64 ||
-         returned->kind == TYPE_STRUCT || returned->kind == TYPE_STRING ||
-         returned->kind == TYPE_SLICE || returned->kind == TYPE_ARRAY)) {
-      return returned->name;
-    }
-    if (returned && returned->kind == TYPE_POINTER) {
-      return "cstring";
-    }
-    return "int64";
-  }
+  case IR_OP_CALL:
+    return meta_call_result_type(m, ins);
   case IR_OP_ASSIGN:
     return meta_operand_type(m, &ins->lhs);
   default:

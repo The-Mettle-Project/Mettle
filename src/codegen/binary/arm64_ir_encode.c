@@ -725,6 +725,61 @@ static int cast_target_float_bits(const IRInstruction *in) {
   return type_text_is_float_scalar(in->text) ? type_text_float_bits(in->text) : 0;
 }
 
+static void float_set_note_call(const IRInstruction *in, const IRProgram *prog,
+                                const int *retf, StrSet *fs) {
+  if (in->op == IR_OP_CALL_INDIRECT) {
+    if (in->value_type && mtlc_type_is_float(in->value_type)) {
+      set_add_bits(fs, in->dest.name,
+                   in->value_type->kind == MTLC_TYPE_FLOAT32 ? 32 : 64);
+    }
+    return;
+  }
+  const IRModuleSymbol *callee = module_function(prog, in->text);
+  int ci = retf ? prog_fn_index(prog, in->text) : -1;
+  if ((callee && mtlc_type_is_float(callee->return_type)) ||
+      (ci >= 0 && retf[ci])) {
+    set_add_bits(fs, in->dest.name,
+                 callee && callee->return_type
+                     ? (callee->return_type->kind == MTLC_TYPE_FLOAT32 ? 32 : 64)
+                     : 0);
+  }
+}
+
+static void float_set_note_result(const IRInstruction *in, const IRProgram *prog,
+                                  const int *retf, StrSet *fs) {
+  switch (in->op) {
+  case IR_OP_LOAD:
+    if (in->is_float) {
+      int loaded = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
+      set_add_bits(fs, in->dest.name,
+                   in->float_bits ? in->float_bits : (loaded == 4 ? 32 : 64));
+    }
+    break;
+  case IR_OP_BINARY:
+  case IR_OP_UNARY:
+    if (in->is_float) {
+      set_add_bits(fs, in->dest.name,
+                   in->float_bits ? in->float_bits
+                                  : float_op_bits(fs, &in->lhs, &in->rhs, 0));
+    }
+    break;
+  case IR_OP_CAST:
+    if (cast_target_float_bits(in) != 0)
+      set_add_bits(fs, in->dest.name, cast_target_float_bits(in));
+    break;
+  case IR_OP_ASSIGN:
+    if (operand_is_float(fs, &in->lhs))
+      set_add_bits(fs, in->dest.name, operand_float_bits(fs, &in->lhs));
+    break;
+  case IR_OP_CALL_INDIRECT:
+  case IR_OP_CALL:
+    float_set_note_call(in, prog, retf, fs);
+    break;
+  default:
+    break;
+  }
+}
+
 static void build_float_set(const IRFunction *fn, const IRProgram *prog,
                             const int *retf, StrSet *fs) {
   for (size_t i = 0; prog && i < prog->module_symbol_count; i++) {
@@ -751,57 +806,8 @@ static void build_float_set(const IRFunction *fn, const IRProgram *prog,
   for (int pass = 0; pass < 4; pass++) {
     for (size_t i = 0; i < fn->instruction_count; i++) {
       const IRInstruction *in = &fn->instructions[i];
-      if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL)
-        continue;
-      switch (in->op) {
-      case IR_OP_LOAD:
-        if (in->is_float) {
-          int loaded = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value
-                                                      : 8;
-          set_add_bits(fs, in->dest.name,
-                       in->float_bits ? in->float_bits
-                                      : (loaded == 4 ? 32 : 64));
-        }
-        break;
-      case IR_OP_BINARY:
-      case IR_OP_UNARY:
-        if (in->is_float) {
-          set_add_bits(fs, in->dest.name,
-                       in->float_bits
-                           ? in->float_bits
-                           : float_op_bits(fs, &in->lhs, &in->rhs, 0));
-        }
-        break;
-      case IR_OP_CAST:
-        if (cast_target_float_bits(in) != 0)
-          set_add_bits(fs, in->dest.name, cast_target_float_bits(in));
-        break;
-      case IR_OP_ASSIGN:
-        if (operand_is_float(fs, &in->lhs))
-          set_add_bits(fs, in->dest.name, operand_float_bits(fs, &in->lhs));
-        break;
-      case IR_OP_CALL_INDIRECT:
-        if (in->value_type && mtlc_type_is_float(in->value_type)) {
-          set_add_bits(fs, in->dest.name,
-                       in->value_type->kind == MTLC_TYPE_FLOAT32 ? 32 : 64);
-        }
-        break;
-      case IR_OP_CALL: {
-        const IRModuleSymbol *callee = module_function(prog, in->text);
-        int ci = retf ? prog_fn_index(prog, in->text) : -1;
-        if ((callee && mtlc_type_is_float(callee->return_type)) ||
-            (ci >= 0 && retf[ci])) {
-          set_add_bits(fs, in->dest.name,
-                       callee && callee->return_type
-                           ? (callee->return_type->kind == MTLC_TYPE_FLOAT32
-                                  ? 32
-                                  : 64)
-                           : 0);
-        }
-        break;
-      }
-      default:
-        break;
+      if (in->dest.kind == IR_OPERAND_TEMP || in->dest.kind == IR_OPERAND_SYMBOL) {
+        float_set_note_result(in, prog, retf, fs);
       }
     }
   }

@@ -154,16 +154,27 @@ one field of 1048576 records, 100 passes, pinned, minimum of 15 interleaved runs
 xychart-beta
   title "Microseconds for 100 passes"
   x-axis ["hand columns", "@soa first field", "@soa second field", "T* indexed", "T* passed per element", "T* local per element", "T* stepped", "int32* stepped"]
-  bar [8257, 8269, 8244, 8265, 8214, 8234, 22432, 22493]
+  bar [8033, 8030, 8002, 8007, 8039, 7931, 22350, 22041]
 ```
 
 Stepping a reference with `r = r + 1` stays scalar, and so does stepping a plain
 `int32*`, at the same speed.
 
-A field of type `T*` costs 24 bytes in place of 8. Chasing 65536 shuffled nodes:
-plain struct with thin pointers 168087 us, `@hot_cold(key, next)` with references
-170945 us. The port of `physics_grid` to `@hot_cold(x, y)` prints the same hash as
-the struct version.
+A reference held in memory costs more than one in a local. It cannot split into
+words, so each access does more address arithmetic, and no pass hoists a load
+through a pointer parameter. `physics_grid` reaches its particles through
+`w->live[i]`, and prints the same hash in all three forms:
+
+```mermaid
+xychart-beta
+  title "physics_grid, microseconds for 2 passes"
+  x-axis ["plain struct", "@hot_cold in slices", "@hot_cold through T* fields"]
+  bar [23956, 24320, 26742]
+```
+
+A field of type `T*` costs 24 bytes in place of 8. Chasing 65536 shuffled nodes
+200 times takes 154820 us with thin pointers in a plain struct and 162462 us with
+references under `@hot_cold(key, next)`.
 
 ## Allocation
 

@@ -332,6 +332,179 @@ static int ir_sroa_load_pieces(IRInstructionVector *vec,
   return 1;
 }
 
+static const MtlcType *ir_sroa_piece_field(const MtlcType *aggregate,
+                                           const IRSroaSlot *slot) {
+  for (size_t f = 0; aggregate && aggregate->field_types &&
+                     aggregate->field_offsets && f < aggregate->field_count;
+       f++) {
+    if ((long long)aggregate->field_offsets[f] == slot->offset &&
+        aggregate->field_types[f] &&
+        aggregate->field_types[f]->kind == MTLC_TYPE_POINTER &&
+        aggregate->field_types[f]->base_type &&
+        aggregate->field_types[f]->base_type->kind <= MTLC_TYPE_BFLOAT16 &&
+        aggregate->field_types[f]->name &&
+        (long long)aggregate->field_types[f]->size == slot->size) {
+      return aggregate->field_types[f];
+    }
+  }
+  if (!slot->is_float) {
+    const MtlcType *scalar =
+        ir_sroa_integer_field_at(aggregate, slot->offset, slot->size, 0);
+    if (scalar && scalar->name) {
+      return scalar;
+    }
+  }
+  return NULL;
+}
+
+static int ir_sroa_declare_pieces(IRInstructionVector *vec, const IRInstruction *insn,
+                                  const IRSroaFlatMember *owner,
+                                  const IRSroaLayout *layout) {
+  for (size_t s = 0; s < layout->slot_count; s++) {
+    const IRSroaSlot *slot = &layout->slots[s];
+    IRInstruction decl = {0};
+    decl.op = IR_OP_DECLARE_LOCAL;
+    decl.location = insn->location;
+    char *nm = ir_sroa_scalar_name(owner->name, slot->offset);
+    decl.dest = nm ? ir_operand_symbol(nm) : ir_operand_none();
+    const MtlcType *field =
+        ir_sroa_piece_field(ir_sroa_declared_aggregate(insn), slot);
+    if (field) {
+      decl.text = mettle_strdup(field->name);
+      decl.value_type = (MtlcType *)field;
+    } else {
+      decl.text = mettle_strdup(ir_builtin_scalar_type_for_slot(
+          slot->size, slot->is_float, slot->float_bits, slot->is_unsigned));
+    }
+    free(nm);
+    if (!decl.dest.name || !decl.text ||
+        !ir_instruction_vector_append_move(vec, &decl)) {
+      ir_instruction_destroy_storage(&decl);
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ir_sroa_copy_pieces(IRInstructionVector *vec, const IRInstruction *insn,
+                               const IRSroaFlatMember *to,
+                               const IRSroaFlatMember *from,
+                               const IRSroaLayout *layout) {
+  for (size_t s = 0; s < layout->slot_count; s++) {
+    const IRSroaSlot *slot = &layout->slots[s];
+    IRInstruction a = {0};
+    a.op = IR_OP_ASSIGN;
+    a.location = insn->location;
+    a.is_float = slot->is_float;
+    a.float_bits = slot->float_bits;
+    char *dn = ir_sroa_scalar_name(to->name, slot->offset);
+    char *sn = ir_sroa_scalar_name(from->name, slot->offset);
+    a.dest = dn ? ir_operand_symbol(dn) : ir_operand_none();
+    a.lhs = sn ? ir_operand_symbol(sn) : ir_operand_none();
+    if (a.dest.name) {
+      a.dest.float_bits = slot->float_bits;
+    }
+    if (a.lhs.name) {
+      a.lhs.float_bits = slot->float_bits;
+    }
+    free(dn);
+    free(sn);
+    if (!a.dest.name || !a.lhs.name ||
+        !ir_instruction_vector_append_move(vec, &a)) {
+      ir_instruction_destroy_storage(&a);
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ir_sroa_load_from_symbol(IRInstructionVector *vec, const IRInstruction *insn,
+                                    const IRSroaFlatMember *owner,
+                                    const IRSroaLayout *layout) {
+  IRInstruction take = {0};
+  take.op = IR_OP_ADDRESS_OF;
+  take.location = insn->location;
+  take.dest = ir_sroa_fresh_temp();
+  take.lhs = ir_operand_symbol(insn->lhs.name);
+  IROperand whole = ir_operand_copy(&take.dest);
+  int ok = take.dest.name && take.lhs.name &&
+           ir_instruction_vector_append_move(vec, &take) &&
+           ir_sroa_load_pieces(vec, owner, layout, &whole, insn->location);
+  ir_operand_destroy(&whole);
+  return ok;
+}
+
+static int ir_sroa_read_piece(IRInstructionVector *vec, const IRFunction *function,
+                              const IRInstruction *insn,
+                              const IRSroaFlatMember *owner,
+                              const IRSroaLayout *layout, long long offset) {
+  const IRSroaSlot *slot =
+      ir_sroa_find_const_slot(layout->slots, layout->slot_count, offset);
+  if (!slot) {
+    return 0;
+  }
+  IRInstruction assign = {0};
+  assign.op = IR_OP_ASSIGN;
+  assign.location = insn->location;
+  assign.is_float = slot->is_float;
+  assign.float_bits = slot->float_bits;
+  if (!slot->is_float && slot->size < 8 &&
+      (insn->is_unsigned ? 1 : 0) !=
+          ir_sroa_piece_is_unsigned(function, owner, slot)) {
+    const char *view = ir_sroa_int_view_name(slot->size, insn->is_unsigned);
+    if (view) {
+      assign.op = IR_OP_CAST;
+      assign.text = mettle_strdup(view);
+      assign.is_unsigned = insn->is_unsigned;
+      assign.value_type = insn->value_type;
+      if (!assign.text) {
+        return 0;
+      }
+    }
+  }
+  char *nm = ir_sroa_scalar_name(owner->name, offset);
+  if (!nm || !ir_operand_clone(&insn->dest, &assign.dest)) {
+    free(nm);
+    ir_instruction_destroy_storage(&assign);
+    return 0;
+  }
+  assign.lhs = ir_operand_symbol(nm);
+  assign.lhs.float_bits = slot->float_bits;
+  free(nm);
+  if (!assign.lhs.name || !ir_instruction_vector_append_move(vec, &assign)) {
+    ir_instruction_destroy_storage(&assign);
+    return 0;
+  }
+  return 1;
+}
+
+static int ir_sroa_write_piece(IRInstructionVector *vec, const IRInstruction *insn,
+                               const IRSroaFlatMember *owner,
+                               const IRSroaLayout *layout, long long offset) {
+  const IRSroaSlot *slot =
+      ir_sroa_find_const_slot(layout->slots, layout->slot_count, offset);
+  if (!slot) {
+    return 0;
+  }
+  IRInstruction assign = {0};
+  assign.op = IR_OP_ASSIGN;
+  assign.location = insn->location;
+  assign.is_float = slot->is_float;
+  assign.float_bits = slot->float_bits;
+  char *nm = ir_sroa_scalar_name(owner->name, offset);
+  assign.dest = nm ? ir_operand_symbol(nm) : ir_operand_none();
+  if (assign.dest.name) {
+    assign.dest.float_bits = slot->float_bits;
+  }
+  free(nm);
+  if (!assign.dest.name || !ir_operand_clone(&insn->lhs, &assign.lhs) ||
+      !ir_instruction_vector_append_move(vec, &assign)) {
+    ir_instruction_destroy_storage(&assign);
+    return 0;
+  }
+  return 1;
+}
+
 static int ir_sroa_transform_all(IRFunction *function,
                                  const IRSroaFlatMember *members,
                                  size_t member_count,
@@ -353,55 +526,7 @@ static int ir_sroa_transform_all(IRFunction *function,
       const IRSroaHashEnt *me = ir_sroa_hash_get(member_hash, insn->dest.name);
       if (me && members[me->member].decl_index == i) {
         const IRSroaFlatMember *fm = &members[me->member];
-        const IRSroaSlot *slots = layouts[fm->layout].slots;
-        size_t slot_count = layouts[fm->layout].slot_count;
-        for (size_t s = 0; s < slot_count && ok; s++) {
-          IRInstruction decl = {0};
-          decl.op = IR_OP_DECLARE_LOCAL;
-          decl.location = insn->location;
-          char *nm = ir_sroa_scalar_name(fm->name, slots[s].offset);
-          decl.dest = nm ? ir_operand_symbol(nm) : ir_operand_none();
-          {
-            const MtlcType *field = NULL;
-            const MtlcType *aggregate = ir_sroa_declared_aggregate(insn);
-            for (size_t f = 0; aggregate && aggregate->field_types &&
-                               aggregate->field_offsets &&
-                               f < aggregate->field_count;
-                 f++) {
-              if ((long long)aggregate->field_offsets[f] == slots[s].offset &&
-                  aggregate->field_types[f] &&
-                  aggregate->field_types[f]->kind == MTLC_TYPE_POINTER &&
-                  aggregate->field_types[f]->base_type &&
-                  aggregate->field_types[f]->base_type->kind <= MTLC_TYPE_BFLOAT16 &&
-                  aggregate->field_types[f]->name &&
-                  (long long)aggregate->field_types[f]->size == slots[s].size) {
-                field = aggregate->field_types[f];
-                break;
-              }
-            }
-            if (!field && !slots[s].is_float) {
-              const MtlcType *scalar = ir_sroa_integer_field_at(
-                  aggregate, slots[s].offset, slots[s].size, 0);
-              if (scalar && scalar->name) {
-                field = scalar;
-              }
-            }
-            if (field) {
-              decl.text = mettle_strdup(field->name);
-              decl.value_type = (MtlcType *)field;
-            } else {
-              decl.text = mettle_strdup(ir_builtin_scalar_type_for_slot(
-                  slots[s].size, slots[s].is_float, slots[s].float_bits,
-                  slots[s].is_unsigned));
-            }
-          }
-          free(nm);
-          if (!decl.dest.name || !decl.text ||
-              !ir_instruction_vector_append_move(&vec, &decl)) {
-            ir_instruction_destroy_storage(&decl);
-            ok = 0;
-          }
-        }
+        ok = ir_sroa_declare_pieces(&vec, insn, fm, &layouts[fm->layout]);
         continue;
       }
     }
@@ -420,51 +545,14 @@ static int ir_sroa_transform_all(IRFunction *function,
       const IRSroaHashEnt *se = ir_sroa_hash_get(member_hash, insn->lhs.name);
       if (de && se &&
           members[de->member].layout == members[se->member].layout) {
-        const char *dst_m = members[de->member].name;
-        const char *src_m = members[se->member].name;
-        const IRSroaSlot *slots = layouts[members[de->member].layout].slots;
-        size_t slot_count = layouts[members[de->member].layout].slot_count;
-        for (size_t s = 0; s < slot_count && ok; s++) {
-          IRInstruction a = {0};
-          a.op = IR_OP_ASSIGN;
-          a.location = insn->location;
-          a.is_float = slots[s].is_float;
-          a.float_bits = slots[s].float_bits;
-          char *dn = ir_sroa_scalar_name(dst_m, slots[s].offset);
-          char *sn = ir_sroa_scalar_name(src_m, slots[s].offset);
-          a.dest = dn ? ir_operand_symbol(dn) : ir_operand_none();
-          a.lhs = sn ? ir_operand_symbol(sn) : ir_operand_none();
-          if (a.dest.name) {
-            a.dest.float_bits = slots[s].float_bits;
-          }
-          if (a.lhs.name) {
-            a.lhs.float_bits = slots[s].float_bits;
-          }
-          free(dn);
-          free(sn);
-          if (!a.dest.name || !a.lhs.name ||
-              !ir_instruction_vector_append_move(&vec, &a)) {
-            ir_instruction_destroy_storage(&a);
-            ok = 0;
-          }
-        }
+        ok = ir_sroa_copy_pieces(&vec, insn, &members[de->member],
+                                 &members[se->member],
+                                 &layouts[members[de->member].layout]);
         continue;
       }
       if (de && !se) {
         const IRSroaFlatMember *owner = &members[de->member];
-        IRInstruction take = {0};
-        take.op = IR_OP_ADDRESS_OF;
-        take.location = insn->location;
-        take.dest = ir_sroa_fresh_temp();
-        take.lhs = ir_operand_symbol(insn->lhs.name);
-        IROperand whole = ir_operand_copy(&take.dest);
-        if (!take.dest.name || !take.lhs.name ||
-            !ir_instruction_vector_append_move(&vec, &take) ||
-            !ir_sroa_load_pieces(&vec, owner, &layouts[owner->layout], &whole,
-                                 insn->location)) {
-          ok = 0;
-        }
-        ir_operand_destroy(&whole);
+        ok = ir_sroa_load_from_symbol(&vec, insn, owner, &layouts[owner->layout]);
         continue;
       }
     }
@@ -472,51 +560,9 @@ static int ir_sroa_transform_all(IRFunction *function,
     if (insn->op == IR_OP_LOAD && insn->lhs.kind == IR_OPERAND_TEMP) {
       const IRSroaHashEnt *ae = ir_sroa_hash_get(addr_hash, insn->lhs.name);
       if (ae) {
-        long long off = ae->offset;
         const IRSroaFlatMember *owner = &members[ae->member];
-        const IRSroaSlot *slot =
-            ir_sroa_find_const_slot(layouts[owner->layout].slots,
-                                    layouts[owner->layout].slot_count, off);
-        if (!slot) {
-          ok = 0;
-          continue;
-        }
-        IRInstruction assign = {0};
-        assign.op = IR_OP_ASSIGN;
-        assign.location = insn->location;
-        assign.is_float = slot->is_float;
-        assign.float_bits = slot->float_bits;
-        if (!slot->is_float && slot->size < 8 &&
-            (insn->is_unsigned ? 1 : 0) !=
-                ir_sroa_piece_is_unsigned(function, owner, slot)) {
-          const char *view =
-              ir_sroa_int_view_name(slot->size, insn->is_unsigned);
-          if (view) {
-            assign.op = IR_OP_CAST;
-            assign.text = mettle_strdup(view);
-            assign.is_unsigned = insn->is_unsigned;
-            assign.value_type = insn->value_type;
-            if (!assign.text) {
-              ok = 0;
-              continue;
-            }
-          }
-        }
-        char *nm = ir_sroa_scalar_name(owner->name, off);
-        if (!nm || !ir_operand_clone(&insn->dest, &assign.dest)) {
-          free(nm);
-          ir_instruction_destroy_storage(&assign);
-          ok = 0;
-        } else {
-          assign.lhs = ir_operand_symbol(nm);
-          assign.lhs.float_bits = slot->float_bits;
-          free(nm);
-          if (!assign.lhs.name ||
-              !ir_instruction_vector_append_move(&vec, &assign)) {
-            ir_instruction_destroy_storage(&assign);
-            ok = 0;
-          }
-        }
+        ok = ir_sroa_read_piece(&vec, function, insn, owner, &layouts[owner->layout],
+                                ae->offset);
         continue;
       }
     }
@@ -524,40 +570,12 @@ static int ir_sroa_transform_all(IRFunction *function,
     if (insn->op == IR_OP_STORE && insn->dest.kind == IR_OPERAND_TEMP) {
       const IRSroaHashEnt *ae = ir_sroa_hash_get(addr_hash, insn->dest.name);
       if (ae) {
-        long long off = ae->offset;
         const IRSroaFlatMember *owner = &members[ae->member];
-        if (insn->rhs.kind == IR_OPERAND_INT && insn->rhs.int_value > 8) {
-          if (!ir_sroa_load_pieces(&vec, owner, &layouts[owner->layout], &insn->lhs,
-                                   insn->location)) {
-            ok = 0;
-          }
-          continue;
-        }
-        const IRSroaSlot *slot =
-            ir_sroa_find_const_slot(layouts[owner->layout].slots,
-                                    layouts[owner->layout].slot_count, off);
-        if (!slot) {
-          ok = 0;
-          continue;
-        }
-        IRInstruction assign = {0};
-        assign.op = IR_OP_ASSIGN;
-        assign.location = insn->location;
-        assign.is_float = slot->is_float;
-        assign.float_bits = slot->float_bits;
-        char *nm = ir_sroa_scalar_name(owner->name, off);
-        assign.dest = nm ? ir_operand_symbol(nm) : ir_operand_none();
-        if (assign.dest.name) {
-          assign.dest.float_bits = slot->float_bits;
-        }
-        free(nm);
-        if (!assign.dest.name || !ir_operand_clone(&insn->lhs, &assign.lhs)) {
-          ir_instruction_destroy_storage(&assign);
-          ok = 0;
-        } else if (!ir_instruction_vector_append_move(&vec, &assign)) {
-          ir_instruction_destroy_storage(&assign);
-          ok = 0;
-        }
+        ok = insn->rhs.kind == IR_OPERAND_INT && insn->rhs.int_value > 8
+                 ? ir_sroa_load_pieces(&vec, owner, &layouts[owner->layout],
+                                       &insn->lhs, insn->location)
+                 : ir_sroa_write_piece(&vec, insn, owner, &layouts[owner->layout],
+                                       ae->offset);
         continue;
       }
     }
@@ -661,6 +679,26 @@ static int ir_sroa_rec_is_struct(const IRFunction *function, const IRSroaRec *re
          !ir_sroa_text_is_descriptor(decl->text);
 }
 
+static void ir_sroa_refuse_address(IRSroaRec *recs, const IRSroaHash *addr_hash,
+                                   const IROperand *operand) {
+  if (ir_operand_is_temp(operand)) {
+    const IRSroaHashEnt *known = ir_sroa_hash_get(addr_hash, operand->name);
+    if (known) {
+      recs[known->member].eligible = 0;
+    }
+  }
+}
+
+static void ir_sroa_note_access(IRSroaRec *rec, const IRInstruction *insn,
+                                long long offset) {
+  int size = insn->rhs.kind == IR_OPERAND_INT ? (int)insn->rhs.int_value : 8;
+  if (!ir_sroa_scalar_access_width(size) ||
+      !ir_sroa_note_slot(rec->slots, &rec->slot_count, offset, size, insn->is_float,
+                         insn->float_bits, insn->is_unsigned, insn->alias_class)) {
+    rec->eligible = 0;
+  }
+}
+
 static int ir_sroa_scan_uses(IRFunction *function, size_t i, IRSroaRec *recs,
                              IRSroaHash *addr_hash) {
   const IRInstruction *insn = &function->instructions[i];
@@ -678,32 +716,9 @@ static int ir_sroa_scan_uses(IRFunction *function, size_t i, IRSroaRec *recs,
         rec->eligible = 0;
         return 1;
       }
-      if (ir_operand_is_temp(&insn->dest)) {
-        const IRSroaHashEnt *o =
-            ir_sroa_hash_get(addr_hash, insn->dest.name);
-        if (o) {
-          recs[o->member].eligible = 0;
-        }
-      }
-      if (ir_operand_is_temp(&insn->rhs)) {
-        const IRSroaHashEnt *o =
-            ir_sroa_hash_get(addr_hash, insn->rhs.name);
-        if (o) {
-          recs[o->member].eligible = 0;
-        }
-      }
-      int size = (insn->rhs.kind == IR_OPERAND_INT)
-                     ? (int)insn->rhs.int_value
-                     : 8;
-      if (!ir_sroa_scalar_access_width(size)) {
-        rec->eligible = 0;
-        return 1;
-      }
-      if (!ir_sroa_note_slot(rec->slots, &rec->slot_count, ae->offset,
-                             size, insn->is_float, insn->float_bits,
-                             insn->is_unsigned, insn->alias_class)) {
-        rec->eligible = 0;
-      }
+      ir_sroa_refuse_address(recs, addr_hash, &insn->dest);
+      ir_sroa_refuse_address(recs, addr_hash, &insn->rhs);
+      ir_sroa_note_access(rec, insn, ae->offset);
       return 1;
     }
   }
@@ -722,32 +737,9 @@ static int ir_sroa_scan_uses(IRFunction *function, size_t i, IRSroaRec *recs,
           ir_sroa_is_whole_size(function, rec, insn->rhs.int_value)) {
         return 1;
       }
-      if (ir_operand_is_temp(&insn->lhs)) {
-        const IRSroaHashEnt *o =
-            ir_sroa_hash_get(addr_hash, insn->lhs.name);
-        if (o) {
-          recs[o->member].eligible = 0;
-        }
-      }
-      if (ir_operand_is_temp(&insn->rhs)) {
-        const IRSroaHashEnt *o =
-            ir_sroa_hash_get(addr_hash, insn->rhs.name);
-        if (o) {
-          recs[o->member].eligible = 0;
-        }
-      }
-      int size = (insn->rhs.kind == IR_OPERAND_INT)
-                     ? (int)insn->rhs.int_value
-                     : 8;
-      if (!ir_sroa_scalar_access_width(size)) {
-        rec->eligible = 0;
-        return 1;
-      }
-      if (!ir_sroa_note_slot(rec->slots, &rec->slot_count, ae->offset,
-                             size, insn->is_float, insn->float_bits,
-                             insn->is_unsigned, insn->alias_class)) {
-        rec->eligible = 0;
-      }
+      ir_sroa_refuse_address(recs, addr_hash, &insn->lhs);
+      ir_sroa_refuse_address(recs, addr_hash, &insn->rhs);
+      ir_sroa_note_access(rec, insn, ae->offset);
       return 1;
     }
   }
@@ -858,6 +850,28 @@ static int ir_sroa_collect_records(IRFunction *function, size_t i,
       if (m) {
         recs[m->member].eligible = 0;
       }
+    }
+  }
+  return 1;
+}
+
+static int ir_sroa_component_layout(const IRFunction *function, const IRSroaRec *recs,
+                                    const size_t *comp, size_t comp_count,
+                                    IRSroaLayout *merged) {
+  for (size_t c = 0; c < comp_count; c++) {
+    const IRSroaRec *m = &recs[comp[c]];
+    if (!m->eligible || m->comp_fail ||
+        !ir_sroa_merge_slots(merged, m->slots, m->slot_count)) {
+      return 0;
+    }
+  }
+  if (merged->slot_count == 0 || !ir_sroa_slots_apart(merged)) {
+    return 0;
+  }
+  for (size_t c = 0; c < comp_count; c++) {
+    const IRSroaRec *m = &recs[comp[c]];
+    if (!ir_sroa_rec_is_struct(function, m) && m->slot_count != merged->slot_count) {
+      return 0;
     }
   }
   return 1;
@@ -1011,25 +1025,8 @@ static int ir_sroa_round(IRFunction *function, int *changed,
       }
     }
     IRSroaLayout merged = {0};
-    if (comp_ok) {
-      for (size_t c = 0; c < comp_count && comp_ok; c++) {
-        const IRSroaRec *m = &recs[comp[c]];
-        if (!m->eligible || m->comp_fail ||
-            !ir_sroa_merge_slots(&merged, m->slots, m->slot_count)) {
-          comp_ok = 0;
-        }
-      }
-      if (comp_ok && (merged.slot_count == 0 || !ir_sroa_slots_apart(&merged))) {
-        comp_ok = 0;
-      }
-      for (size_t c = 0; c < comp_count && comp_ok; c++) {
-        const IRSroaRec *m = &recs[comp[c]];
-        if (!ir_sroa_rec_is_struct(function, m) && m->slot_count != merged.slot_count) {
-          comp_ok = 0;
-        }
-      }
-    }
-    if (!comp_ok) {
+    if (!comp_ok ||
+        !ir_sroa_component_layout(function, recs, comp, comp_count, &merged)) {
       continue;
     }
 
@@ -1205,6 +1202,52 @@ static int ir_sroa_forward_read(IRFunction *function, const IRSroaHash *sources,
   return 1;
 }
 
+static void ir_sroa_count_writes(const IRFunction *function, IRSroaHash *piece_writes,
+                                 IRSroaHash *temp_writes) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL) {
+      if (ir_sroa_operand_is_piece(&in->dest) && !ir_sroa_type_is_word(in->text)) {
+        ir_sroa_count_up(piece_writes, in->dest.name, 2);
+      }
+      continue;
+    }
+    if (in->op == IR_OP_ADDRESS_OF && ir_sroa_operand_is_piece(&in->lhs)) {
+      ir_sroa_count_up(piece_writes, in->lhs.name, 2);
+    }
+    if (ir_instruction_writes_destination(in)) {
+      if (ir_sroa_operand_is_piece(&in->dest)) {
+        ir_sroa_count_up(piece_writes, in->dest.name, 1);
+      } else if (ir_operand_is_temp(&in->dest)) {
+        ir_sroa_count_up(temp_writes, in->dest.name, 1);
+      }
+    }
+  }
+}
+
+static void ir_sroa_note_sources(const IRFunction *function,
+                                 const IRSroaHash *piece_writes,
+                                 const IRSroaHash *temp_writes, IRSroaHash *sources) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op != IR_OP_ASSIGN || !ir_sroa_operand_is_piece(&in->dest) || in->is_float) {
+      continue;
+    }
+    const IRSroaHashEnt *writes = ir_sroa_hash_get(piece_writes, in->dest.name);
+    if (!writes || writes->offset != 1) {
+      continue;
+    }
+    if (in->lhs.kind == IR_OPERAND_INT) {
+      ir_sroa_hash_put(sources, in->dest.name, i, 0);
+    } else if (ir_operand_is_temp(&in->lhs)) {
+      const IRSroaHashEnt *temp = ir_sroa_hash_get(temp_writes, in->lhs.name);
+      if (temp && temp->offset == 1) {
+        ir_sroa_hash_put(sources, in->dest.name, i, 0);
+      }
+    }
+  }
+}
+
 int ir_forward_piece_copies_pass(IRFunction *function, int *changed) {
   size_t candidates = 0;
   for (size_t i = 0; i < function->instruction_count; i++) {
@@ -1227,43 +1270,8 @@ int ir_forward_piece_copies_pass(IRFunction *function, int *changed) {
     free(temp_writes.ents);
     return 0;
   }
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    const IRInstruction *in = &function->instructions[i];
-    if (in->op == IR_OP_DECLARE_LOCAL) {
-      if (ir_sroa_operand_is_piece(&in->dest) && !ir_sroa_type_is_word(in->text)) {
-        ir_sroa_count_up(&piece_writes, in->dest.name, 2);
-      }
-      continue;
-    }
-    if (in->op == IR_OP_ADDRESS_OF && ir_sroa_operand_is_piece(&in->lhs)) {
-      ir_sroa_count_up(&piece_writes, in->lhs.name, 2);
-    }
-    if (ir_instruction_writes_destination(in)) {
-      if (ir_sroa_operand_is_piece(&in->dest)) {
-        ir_sroa_count_up(&piece_writes, in->dest.name, 1);
-      } else if (ir_operand_is_temp(&in->dest)) {
-        ir_sroa_count_up(&temp_writes, in->dest.name, 1);
-      }
-    }
-  }
-  for (size_t i = 0; i < function->instruction_count; i++) {
-    const IRInstruction *in = &function->instructions[i];
-    if (in->op != IR_OP_ASSIGN || !ir_sroa_operand_is_piece(&in->dest) || in->is_float) {
-      continue;
-    }
-    const IRSroaHashEnt *writes = ir_sroa_hash_get(&piece_writes, in->dest.name);
-    if (!writes || writes->offset != 1) {
-      continue;
-    }
-    if (in->lhs.kind == IR_OPERAND_INT) {
-      ir_sroa_hash_put(&sources, in->dest.name, i, 0);
-    } else if (ir_operand_is_temp(&in->lhs)) {
-      const IRSroaHashEnt *temp = ir_sroa_hash_get(&temp_writes, in->lhs.name);
-      if (temp && temp->offset == 1) {
-        ir_sroa_hash_put(&sources, in->dest.name, i, 0);
-      }
-    }
-  }
+  ir_sroa_count_writes(function, &piece_writes, &temp_writes);
+  ir_sroa_note_sources(function, &piece_writes, &temp_writes, &sources);
   int forwarded = 0;
   int ok = 1;
   for (size_t i = 0; i < function->instruction_count && ok; i++) {
