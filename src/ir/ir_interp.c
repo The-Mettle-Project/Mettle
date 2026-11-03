@@ -6240,6 +6240,7 @@ static int ii_bind_parameters(IRInterpMachine *machine, IIFrame *frame,
       IIBuffer *src = ii_addr_to_buffer(
           machine, (unsigned long long)var->value.i, 16, &src_off);
       if (src) {
+        const unsigned char *source_bytes = src->data + src_off;
         unsigned long long copy = ii_add_buffer_ex(machine, NULL, 16, 1);
         if (!copy ||
             !ii_frame_own(frame,
@@ -6248,7 +6249,7 @@ static int ii_bind_parameters(IRInterpMachine *machine, IIFrame *frame,
           return 0;
         }
         memcpy(machine->buffers[(copy - II_ADDR_BASE) / II_ADDR_STRIDE].data,
-               src->data + src_off, 16);
+               source_bytes, 16);
         var->value = ii_int_value((long long)copy);
         var->has_local_storage = 1;
       }

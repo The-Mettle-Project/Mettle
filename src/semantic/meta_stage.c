@@ -720,7 +720,7 @@ static void refresh_stage_types(TypeChecker *checker) {
 static const char *interp_failure(IRInterpMachine *machine,
                                   IRInterpStatus status) {
   if (status == IR_INTERP_FUEL) {
-    return "did not finish within its step budget";
+    return "did not finish within its step budget; --meta-budget=N raises it";
   }
   if (status == IR_INTERP_UNSUPPORTED) {
     return ir_interp_status_detail(machine);
