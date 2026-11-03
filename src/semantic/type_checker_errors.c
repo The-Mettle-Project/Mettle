@@ -204,6 +204,30 @@ void type_checker_report_assign_mismatch(TypeChecker *checker,
   const char *actual = src_type && src_type->name ? src_type->name : "?";
   size_t span_length = src_expr ? type_checker_node_span_length(src_expr) : 1;
   SourceLocation where = src_expr ? src_expr->location : location;
+  char expected_ref[160];
+  char actual_ref[160];
+  if (type_is_element_ref(dest_type)) {
+    snprintf(expected_ref, sizeof(expected_ref), "%s*", dest_type->base_type->name);
+    expected = expected_ref;
+  }
+  if (type_is_element_ref(src_type)) {
+    snprintf(actual_ref, sizeof(actual_ref), "%s*", src_type->base_type->name);
+    actual = actual_ref;
+  }
+  if (checker && type_is_element_ref(dest_type) && src_type &&
+      src_type->kind == TYPE_POINTER) {
+    char refused[400];
+    snprintf(refused, sizeof(refused),
+             "'%s' holds a base, an index and a count, and this value is a bare "
+             "pointer. Allocate with 'new %s[n]' and take '&a[i]'. Only "
+             "free(s.data) reads a slice's data pointer",
+             expected, dest_type->base_type->name);
+    type_checker_set_error_at_location(checker, where, "%s", refused);
+    if (checker->error_reporter) {
+      error_reporter_set_last_code(checker->error_reporter, "L0003");
+    }
+    return;
+  }
   long long folded = 0;
   int is_integer_pair = dest_type && src_type &&
                         type_checker_is_integer_type(dest_type) &&

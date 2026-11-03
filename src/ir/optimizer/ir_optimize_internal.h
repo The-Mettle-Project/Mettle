@@ -834,6 +834,7 @@ int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
 int ir_simd_byte_map_pass(IRFunction *function, int *changed);
 int ir_simd_lcg_pass(IRFunction *function, int *changed);
 int ir_sroa_pass(IRFunction *function, int *changed);
+int ir_forward_piece_copies_pass(IRFunction *function, int *changed);
 int ir_strength_reduce_rotate_loops_pass(IRFunction *function, int *changed);
 int ir_symbol_address_taken(const IRFunction *function,
                                    const char *symbol_name);

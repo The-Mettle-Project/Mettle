@@ -421,6 +421,8 @@ Type *type_create(TypeKind kind, const char *name) {
   type->field_bit_widths = NULL;
   type->field_count = 0;
   type->meta_layout = NULL;
+  type->columnar_hint = 0;
+  type->is_element_ref = 0;
   type->tagged_variant_names = NULL;
   type->tagged_variant_tags = NULL;
   type->tagged_variant_payloads = NULL;

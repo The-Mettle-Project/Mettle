@@ -1,0 +1,229 @@
+import "std/io";
+import "std/layout";
+
+@soa struct P {
+  x: int32;
+  y: float64;
+  tag: uint8;
+}
+
+@hot_cold(key, next) struct Node {
+  key: int64;
+  next: Node*;
+  note: float64;
+  extra: int32;
+}
+
+struct Holder {
+  first: P*;
+  count: int64;
+}
+
+fn bump(p: P*, by: int32) {
+  p.x = p.x + by;
+  p.y = p.y * 2.0;
+  p.tag = (uint8)(p.tag + 1);
+}
+
+fn read_x(p: P*) -> int32 {
+  return p.x;
+}
+
+fn second_of(p: P*) -> P* {
+  return p + 1;
+}
+
+fn sum_y(p: P*, n: int64) -> float64 {
+  var t: float64 = 0.0;
+  for i in 0..n {
+    t = t + p[i].y;
+  }
+  return t;
+}
+
+fn fill(a: P[]) {
+  for i in 0..a.length {
+    var e: P* = &a[i];
+    e.x = (int32)i * 10;
+    e.y = (float64)i + 0.5;
+    e.tag = (uint8)i;
+  }
+}
+
+fn fix_array() -> int32 {
+  var bad: int32 = 0;
+  var a: P[4];
+  for i in 0..4 {
+    bump(&a[i], i);
+  }
+  if (a[3].x != 3 || a[3].tag != 1) { bad = bad + 1; }
+  var r: P* = &a[1];
+  r.y = 7.5;
+  if (a[1].y != 7.5) { bad = bad + 2; }
+  if (read_x(second_of(r)) != 2) { bad = bad + 4; }
+  var last: P* = r + 2;
+  if (last.x != 3) { bad = bad + 8; }
+  if (last - r != 2) { bad = bad + 16; }
+  var back: P* = last - 1;
+  if (back.x != 2) { bad = bad + 32; }
+  return bad;
+}
+
+fn on_slice() -> int32 {
+  var bad: int32 = 0;
+  var s: P[] = new P[6];
+  fill(s);
+  if (s[4].x != 40 || s[4].y != 4.5 || s[4].tag != 4) { bad = bad + 1; }
+  var total: float64 = sum_y(&s[0], 6);
+  if (total != 18.0) { bad = bad + 2; }
+  var middle: float64 = sum_y(&s[2], 3);
+  if (middle != 2.5 + 3.5 + 4.5) { bad = bad + 4; }
+  var one: P* = &s[2];
+  if (one[1].x != 30) { bad = bad + 8; }
+  var copied: P = *one;
+  if (copied.x != 20 || copied.y != 2.5 || copied.tag != 2) { bad = bad + 16; }
+  copied.x = 99;
+  *one = copied;
+  if (s[2].x != 99 || s[2].tag != 2) { bad = bad + 32; }
+  var field: float64* = &one.y;
+  *field = 11.25;
+  if (s[2].y != 11.25) { bad = bad + 64; }
+  var same: P* = &s[2];
+  if (one != same) { bad = bad + 128; }
+  if (one == &s[3]) { bad = bad + 256; }
+  free(s.data);
+  return bad;
+}
+
+fn lone_values() -> int32 {
+  var bad: int32 = 0;
+  var v: P;
+  v.x = 5;
+  v.y = 1.5;
+  var r: P* = &v;
+  bump(r, 2);
+  if (v.x != 7 || v.y != 3.0 || v.tag != 1) { bad = bad + 1; }
+  var h: P* = new P;
+  h.x = 9;
+  h.y = 0.25;
+  bump(h, 1);
+  if (h.x != 10 || h.y != 0.5) { bad = bad + 2; }
+  free(h);
+  var empty: P* = 0;
+  if (empty != 0) { bad = bad + 4; }
+  if (r == 0) { bad = bad + 8; }
+  empty = r;
+  if (empty == 0 || empty.x != 7) { bad = bad + 16; }
+  return bad;
+}
+
+fn inside_structs() -> int32 {
+  var bad: int32 = 0;
+  var s: P[] = new P[3];
+  fill(s);
+  var h: Holder;
+  h.first = &s[1];
+  h.count = 2;
+  if (h.first.x != 10) { bad = bad + 1; }
+  h.first[1].x = 123;
+  if (s[2].x != 123) { bad = bad + 2; }
+  var held: Holder = h;
+  if (sum_y(held.first, held.count) != 1.5 + 2.5) { bad = bad + 4; }
+  var refs: P*[2];
+  refs[0] = &s[0];
+  refs[1] = &s[2];
+  if (refs[1].x != 123 || refs[0].y != 0.5) { bad = bad + 8; }
+  free(s.data);
+  return bad;
+}
+
+fn push(head: Node*, key: int64) -> Node* {
+  var n: Node* = new Node;
+  n.key = key;
+  n.note = (float64)key * 0.5;
+  n.extra = (int32)key;
+  n.next = head;
+  return n;
+}
+
+fn linked_list() -> int32 {
+  var bad: int32 = 0;
+  var head: Node* = 0;
+  for k in 1..=5 {
+    head = push(head, k);
+  }
+  var total: int64 = 0;
+  var notes: float64 = 0.0;
+  var walk: Node* = head;
+  while (walk != 0) {
+    total = total + walk.key;
+    notes = notes + walk.note;
+    walk = walk.next;
+  }
+  if (total != 15) { bad = bad + 1; }
+  if (notes != 7.5) { bad = bad + 2; }
+  var pool: Node[] = new Node[4];
+  for i in 0..4 {
+    pool[i].key = i * 100;
+    if (i > 0) {
+      pool[i].next = &pool[i - 1];
+    }
+    pool[i].extra = i;
+  }
+  var inner: Node* = &pool[3];
+  var hops: int64 = 0;
+  while (inner != 0) {
+    hops = hops + inner.key + (int64)inner.extra;
+    inner = inner.next;
+  }
+  if (hops != 606) { bad = bad + 4; }
+  free(pool.data);
+  return bad;
+}
+
+@soa struct Counted {
+  x: int64;
+  y: int64;
+
+  method total() -> int64 {
+    return this.x + this.y;
+  }
+
+  method grow(by: int64) {
+    this.x = this.x + by;
+  }
+}
+
+fn pick<T>(p: T*, i: int64) -> T* {
+  return &p[i];
+}
+
+fn methods_and_generics() -> int32 {
+  var bad: int32 = 0;
+  var a: Counted[3];
+  a[1].x = 2;
+  a[1].y = 5;
+  var e: Counted* = &a[1];
+  if (e->total() != 7) { bad = bad + 1; }
+  e->grow(4);
+  if (a[1].x != 6) { bad = bad + 2; }
+  if (a[1].total() != 11) { bad = bad + 4; }
+  var f: Counted* = pick<Counted>(&a[0], 1);
+  if (f.x != 6 || sizeof(Counted*) != 24) { bad = bad + 8; }
+  var copy: Counted = *e;
+  copy.y = 9;
+  *e = copy;
+  if (a[1].y != 9) { bad = bad + 16; }
+  return bad;
+}
+
+fn main() -> int32 {
+  var bad: int32 = fix_array();
+  if (methods_and_generics() != 0) { println("methods {methods_and_generics()}"); return 1; }
+  bad = bad + on_slice() * 16;
+  bad = bad + lone_values() * 256;
+  bad = bad + inside_structs() * 4096;
+  bad = bad + linked_list() * 65536;
+  if (bad == 0) { println("ok"); } else { println("bad {bad}"); }
+  return bad;
+}

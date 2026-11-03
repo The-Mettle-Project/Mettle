@@ -606,8 +606,7 @@ static int aggregate_fold_struct(TypeChecker *checker, ASTNode *expression,
       if (!element_type) {
         return 0;
       }
-      if (!(type_checker_type_accepts_null_pointer(type->field_types[field]) &&
-            type_checker_is_null_pointer_constant(literal->elements[i])) &&
+      if (!(type_checker_takes_null(type->field_types[field], literal->elements[i])) &&
           !type_checker_is_assignable_from(checker, type->field_types[field],
                                            element_type,
                                            literal->elements[i])) {
@@ -713,8 +712,7 @@ static int aggregate_fold_element(TypeChecker *checker, ASTNode *element,
   if (!element_type) {
     return 0;
   }
-  if (!(type_checker_type_accepts_null_pointer(type) &&
-        type_checker_is_null_pointer_constant(element)) &&
+  if (!(type_checker_takes_null(type, element)) &&
       !type_checker_is_assignable_from(checker, type, element_type, element)) {
     type_checker_report_assign_mismatch(checker, element, element->location,
                                         type, element_type);

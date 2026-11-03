@@ -115,6 +115,8 @@ typedef struct Type {
   uint32_t *field_bit_widths;
   size_t field_count;
   const struct TypeMetaLayout *meta_layout;
+  int columnar_hint;
+  int is_element_ref;
 
   char **tagged_variant_names;
   int *tagged_variant_tags;
@@ -292,6 +294,8 @@ int type_set_field(Type *type, size_t index, const char *name,
                    Type *field_type, uint32_t bit_width);
 int type_compute_layout(Type *type);
 int type_is_columnar(const Type *type);
+int type_is_element_ref(const Type *type);
+int type_needs_element_ref(const Type *type);
 const TypeMetaPlace *type_field_place(const Type *type, size_t index);
 int type_field_is_packed(const Type *type, size_t index);
 size_t type_columns_region_base(const Type *type, size_t region, size_t count);

@@ -7,6 +7,6 @@ import "std/layout";
 
 fn main() -> int32 {
   var ps: Point[4];
-  var p: Point* = &ps[1];
-  return p.x;
+  var p: int64* = (int64*)&ps[1];
+  return (int32)p[0];
 }

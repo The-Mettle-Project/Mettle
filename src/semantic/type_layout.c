@@ -153,6 +153,14 @@ int type_is_columnar(const Type *type) {
   return type && type->meta_layout && type->meta_layout->region_count > 1;
 }
 
+int type_is_element_ref(const Type *type) {
+  return type && type->is_element_ref;
+}
+
+int type_needs_element_ref(const Type *type) {
+  return type && (type_is_columnar(type) || type->columnar_hint);
+}
+
 const TypeMetaPlace *type_field_place(const Type *type, size_t index) {
   if (!type || !type->meta_layout || index >= type->meta_layout->place_count) {
     return NULL;

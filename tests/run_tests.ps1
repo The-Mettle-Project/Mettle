@@ -1590,13 +1590,14 @@ $cases = @(
   @{ Name = "comptime_for_range"; Path = "tests/test_comptime_for_range.mettle"; ShouldSucceed = $true },
   @{ Name = "err_layout_overlap"; Path = "tests/err_layout_overlap.mettle"; ShouldSucceed = $false; Pattern = "error\[L0002\].*'x' and 'y' overlap" },
   @{ Name = "err_layout_cycle"; Path = "tests/err_layout_cycle.mettle"; ShouldSucceed = $false; Pattern = "error\[L0006\].*Point <- helper <- sized_by_itself" },
-  @{ Name = "err_layout_element_address"; Path = "tests/err_layout_element_address.mettle"; ShouldSucceed = $false; Pattern = "error\[L0003\].*no single address" },
-  @{ Name = "err_layout_thin_pointer"; Path = "tests/err_layout_thin_pointer.mettle"; ShouldSucceed = $false; Pattern = "error\[L0003\].*a pointer has none" },
+  @{ Name = "err_layout_element_address"; Path = "tests/err_layout_element_address.mettle"; ShouldSucceed = $false; Pattern = "error\[L0003\].*does not cast" },
+  @{ Name = "err_layout_thin_pointer"; Path = "tests/err_layout_thin_pointer.mettle"; ShouldSucceed = $false; Pattern = "error\[L0003\].*does not cast" },
+  @{ Name = "err_element_ref_dangling"; Path = "tests/err_element_ref_dangling.mettle"; ShouldSucceed = $false; Pattern = "error\[M0103\].*stack local" },
   @{ Name = "err_layout_packed_address"; Path = "tests/err_layout_packed_address.mettle"; ShouldSucceed = $false; Pattern = "error\[L0003\].*has no address" },
   @{ Name = "err_layout_calls_metafunction"; Path = "tests/err_layout_calls_metafunction.mettle"; ShouldSucceed = $false; Pattern = "is a metafunction" },
   @{ Name = "err_layout_extern"; Path = "tests/err_layout_extern.mettle"; ShouldSucceed = $false; Pattern = "error\[L0004\]" },
   @{ Name = "err_layout_array_decay"; Path = "tests/err_layout_array_decay.mettle"; ShouldSucceed = $false; Pattern = "Point\[4\]" },
-  @{ Name = "err_layout_slice_data"; Path = "tests/err_layout_slice_data.mettle"; ShouldSucceed = $false; Pattern = "Only free\(s\.data\) reads it" },
+  @{ Name = "err_layout_slice_data"; Path = "tests/err_layout_slice_data.mettle"; ShouldSucceed = $false; Pattern = "Only free\(s\.data\) reads" },
   @{ Name = "err_generate_impure_memoize"; Path = "tests/err_generate_impure_memoize.mettle"; ShouldSucceed = $false; Pattern = "@memoize needs a pure function: 'bump__inner' writes the global" },
   @{ Name = "err_generate_wrong_grad"; Path = "tests/err_generate_wrong_grad.mettle"; ShouldSucceed = $false; Pattern = "disagrees with finite differences" },
   @{ Name = "err_generate_grad_extern"; Path = "tests/err_generate_grad_extern.mettle"; ShouldSucceed = $false; Pattern = "has no derivative" },
@@ -3769,7 +3770,7 @@ catch {
 
 # Layouts and generators written in Mettle: every access goes through the data a
 # metafunction returned, and every generated function runs, at every level.
-foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn", "test_meta_generated_source", "test_meta_grad_struct", "test_meta_optimized")) {
+foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn", "test_meta_generated_source", "test_meta_grad_struct", "test_meta_optimized", "test_element_reference")) {
   foreach ($layoutMode in @(@(), @("-O"), @("--release"))) {
     $total++
     $layoutName = "$($layoutCase)_$(($layoutMode -join '') -replace '-','')"
@@ -3786,6 +3787,33 @@ foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_t
       $failed++
       Write-CaseResult -Name $layoutName -Passed $false -Reason $_.Exception.Message
     }
+  }
+}
+
+# A reference to an element checks its count in every build and its identity
+# under --safe.
+foreach ($refCase in @(
+    @{ Name = "element_ref_past_count"; Path = "tests/err_element_ref_past_count.mettle"; Flags = @(); Pattern = "element reference index out of bounds" },
+    @{ Name = "element_ref_past_count_safe"; Path = "tests/err_element_ref_past_count.mettle"; Flags = @("--safe"); Pattern = "element reference index out of bounds" },
+    @{ Name = "element_ref_past_count_release_safe"; Path = "tests/err_element_ref_past_count.mettle"; Flags = @("--release", "--safe"); Pattern = "element reference index out of bounds" },
+    @{ Name = "element_ref_after_free_safe"; Path = "tests/err_element_ref_after_free.mettle"; Flags = @("--safe"); Pattern = "after it was freed" },
+    @{ Name = "column_past_count_safe"; Path = "tests/err_layout_column_past_count.mettle"; Flags = @("--safe"); Pattern = "out of bounds" },
+    @{ Name = "column_past_count_release_safe"; Path = "tests/err_layout_column_past_count.mettle"; Flags = @("--release", "--safe"); Pattern = "out of bounds" })) {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "$($refCase.Name).exe"
+    $flags = $refCase.Flags
+    $buildOut = & $CompilerPath --build @flags $refCase.Path -o $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
+    $runOut = & $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) { throw "program returned 0: $runOut" }
+    if ($runOut -notmatch $refCase.Pattern) { throw "no '$($refCase.Pattern)' in: $runOut" }
+    Write-CaseResult -Name $refCase.Name -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $refCase.Name -Passed $false -Reason $_.Exception.Message
   }
 }
 

@@ -1857,6 +1857,13 @@ static int re_symbol_is_descriptor(const IRFunction *function,
     return 0;
   }
   length = strlen(type);
+  if (length > 5 && strcmp(type + length - 5, "__ref") == 0) {
+    return 1;
+  }
+  if (length > 1 && type[length - 1] == '*') {
+    const MtlcType *held = ir_program_lookup_type(ir_optimize_get_program(), type);
+    return held && held->kind == MTLC_TYPE_STRUCT;
+  }
   return length > 2 && type[length - 1] == ']' &&
          (type[length - 2] == '[' || type[length - 2] == ',');
 }

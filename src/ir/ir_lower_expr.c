@@ -1580,7 +1580,8 @@ int ir_lower_call_expression(IRLoweringContext *context,
       !context->freeing_column_data) {
     Type *freed = ir_infer_expression_type(context, call->arguments[0]);
     const TypeMetaLayout *layout =
-        freed && freed->kind == TYPE_POINTER && freed->base_type
+        freed && (freed->kind == TYPE_POINTER || type_is_element_ref(freed)) &&
+                freed->base_type
             ? freed->base_type->meta_layout
             : NULL;
     if (layout && layout->allocator && !layout->releaser) {
@@ -1592,14 +1593,22 @@ int ir_lower_call_expression(IRLoweringContext *context,
     }
     if (layout) {
       char *written = call->function_name;
+      ASTNode *written_argument = call->arguments[0];
       if (layout->allocator) {
         call->function_name = (char *)layout->releaser;
+      }
+      if (type_is_element_ref(freed)) {
+        call->arguments[0] = ast_create_member_access(
+            written_argument, "__base", expression->location);
+        call->arguments[0]->resolved_type =
+            context->type_checker->builtin_rawptr;
       }
       context->freeing_column_data = 1;
       int released =
           ir_lower_call_expression(context, function, expression, out_value);
       context->freeing_column_data = 0;
       call->function_name = written;
+      call->arguments[0] = written_argument;
       return released;
     }
   }
@@ -2413,6 +2422,13 @@ static int ir_lower_binary_expression(IRLoweringContext *context,
                                       expression->location, out_value)) {
     return 1;
   }
+  if ((strcmp(binary->operator, "==") == 0 ||
+       strcmp(binary->operator, "!=") == 0) &&
+      (type_is_element_ref(ir_infer_expression_type(context, binary->left)) ||
+       type_is_element_ref(ir_infer_expression_type(context, binary->right)))) {
+    return ir_lower_element_ref_compare(context, function, binary,
+                                        expression->location, out_value);
+  }
 
   IROperand left = ir_operand_none();
   IROperand right = ir_operand_none();
@@ -2576,6 +2592,11 @@ static int ir_lower_unary_expression(IRLoweringContext *context,
 
   if (strcmp(unary->operator, "&") == 0) {
     Type *target_type = NULL;
+    Type *taken = ir_infer_expression_type(context, expression);
+    if (type_is_element_ref(taken)) {
+      return ir_lower_address_of_element(context, function, unary->operand, taken,
+                                         expression->location, out_value);
+    }
     if (!ir_lower_lvalue_address(context, function, unary->operand, out_value,
                                  &target_type)) {
       return 0;
@@ -2586,6 +2607,10 @@ static int ir_lower_unary_expression(IRLoweringContext *context,
   if (strcmp(unary->operator, "*") == 0) {
     IROperand address = ir_operand_none();
     Type *target_type = NULL;
+    if (ir_expression_is_column_element(context, expression)) {
+      return ir_lower_column_element_load(context, function, expression,
+                                          out_value);
+    }
     if (!ir_lower_lvalue_address(context, function, expression, &address,
                                  &target_type)) {
       return 0;
@@ -3674,11 +3699,16 @@ static int ir_lower_new_expression(IRLoweringContext *context,
   }
 
   Type *allocated_type = NULL;
+  Type *new_ref_type = NULL;
   if (context->type_checker) {
     Type *new_expr_type =
         type_checker_infer_type(context->type_checker, expression);
     if (new_expr_type && new_expr_type->kind == TYPE_POINTER) {
       allocated_type = new_expr_type->base_type;
+    }
+    if (type_is_element_ref(new_expr_type)) {
+      allocated_type = new_expr_type->base_type;
+      new_ref_type = new_expr_type;
     }
     if (!allocated_type) {
       allocated_type = type_checker_get_type_by_name(context->type_checker,
@@ -3704,31 +3734,34 @@ static int ir_lower_new_expression(IRLoweringContext *context,
       ir_operand_destroy(&destination);
       return 0;
     }
-    *out_value = destination;
-    return 1;
-  }
-
-  if (ir_lower_live_heap_type(allocated_type)) {
+  } else if (ir_lower_live_heap_type(allocated_type)) {
     IROperand bytes = ir_operand_int(allocation_size);
     if (!ir_lower_live_new(context, function, &destination, &bytes,
                            allocated_type, NULL, expression->location)) {
       ir_operand_destroy(&destination);
       return 0;
     }
-    *out_value = destination;
-    return 1;
-  }
-  IRInstruction instruction = {0};
-  instruction.op = IR_OP_NEW;
-  instruction.location = expression->location;
-  instruction.dest = destination;
-  instruction.rhs = ir_operand_int(allocation_size);
-  instruction.text = (char *)ir_backend_type_name(new_expression->type_name);
-  if (!ir_emit(context, function, &instruction)) {
-    ir_operand_destroy(&destination);
-    return 0;
+  } else {
+    IRInstruction instruction = {0};
+    instruction.op = IR_OP_NEW;
+    instruction.location = expression->location;
+    instruction.dest = destination;
+    instruction.rhs = ir_operand_int(allocation_size);
+    instruction.text = (char *)ir_backend_type_name(new_expression->type_name);
+    if (!ir_emit(context, function, &instruction)) {
+      ir_operand_destroy(&destination);
+      return 0;
+    }
   }
 
+  if (new_ref_type) {
+    IROperand zero = ir_operand_int(0);
+    IROperand one = ir_operand_int(1);
+    int ok = ir_lower_make_element_ref(context, function, new_ref_type, &destination,
+                                       &zero, &one, expression->location, out_value);
+    ir_operand_destroy(&destination);
+    return ok;
+  }
   *out_value = destination;
   return 1;
 }
@@ -3744,6 +3777,14 @@ static int ir_lower_cast_expression(IRLoweringContext *context,
   }
 
   Type *cast_target = ir_resolve_named_type(context, cast_expr->type_name);
+  if (type_is_element_ref(cast_target)) {
+    if (type_is_element_ref(ir_infer_expression_type(context, cast_expr->operand))) {
+      return ir_lower_expression(context, function, cast_expr->operand, out_value);
+    }
+    IROperand zero = ir_operand_int(0);
+    return ir_lower_make_element_ref(context, function, cast_target, &zero, &zero,
+                                     &zero, expression->location, out_value);
+  }
   int target_is_pointer =
       cast_target && (cast_target->kind == TYPE_POINTER ||
                       cast_target->kind == TYPE_FUNCTION_POINTER);

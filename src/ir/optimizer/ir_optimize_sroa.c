@@ -81,26 +81,33 @@ static void ir_sroa_sort_slots(IRSroaSlot *slots, size_t count) {
   }
 }
 
-static int ir_sroa_slots_match(const IRSroaSlot *a, size_t an,
-                               const IRSroaSlot *b, size_t bn) {
-  if (an != bn) {
-    return 0;
+typedef struct {
+  IRSroaSlot slots[IR_SROA_MAX_SLOTS];
+  size_t slot_count;
+} IRSroaLayout;
+
+static int ir_sroa_merge_slots(IRSroaLayout *merged, const IRSroaSlot *slots,
+                               size_t slot_count) {
+  for (size_t s = 0; s < slot_count; s++) {
+    if (!ir_sroa_note_slot(merged->slots, &merged->slot_count, slots[s].offset,
+                           slots[s].size, slots[s].is_float, slots[s].float_bits,
+                           slots[s].is_unsigned, slots[s].alias_class)) {
+      return 0;
+    }
   }
-  for (size_t i = 0; i < an; i++) {
-    if (a[i].offset != b[i].offset || a[i].size != b[i].size ||
-        a[i].is_float != b[i].is_float ||
-        a[i].float_bits != b[i].float_bits ||
-        a[i].alias_class != b[i].alias_class) {
+  ir_sroa_sort_slots(merged->slots, merged->slot_count);
+  return 1;
+}
+
+static int ir_sroa_slots_apart(const IRSroaLayout *merged) {
+  for (size_t s = 1; s < merged->slot_count; s++) {
+    if (merged->slots[s - 1].offset + merged->slots[s - 1].size >
+        merged->slots[s].offset) {
       return 0;
     }
   }
   return 1;
 }
-
-typedef struct {
-  IRSroaSlot slots[IR_SROA_MAX_SLOTS];
-  size_t slot_count;
-} IRSroaLayout;
 
 typedef struct {
   const char *name;
@@ -283,6 +290,48 @@ static const char *ir_sroa_int_view_name(int size, int is_unsigned) {
   }
 }
 
+static IROperand ir_sroa_fresh_temp(void) {
+  static int g_sroa_temp_counter;
+  char name[48];
+  snprintf(name, sizeof(name), "__sroa_word_%d", g_sroa_temp_counter++);
+  return ir_operand_temp(name);
+}
+
+static int ir_sroa_load_pieces(IRInstructionVector *vec,
+                               const IRSroaFlatMember *owner,
+                               const IRSroaLayout *layout, const IROperand *from,
+                               SourceLocation location) {
+  for (size_t s = 0; s < layout->slot_count; s++) {
+    const IRSroaSlot *slot = &layout->slots[s];
+    IRInstruction step = {0};
+    step.op = IR_OP_BINARY;
+    step.location = location;
+    step.text = mettle_strdup("+");
+    step.dest = ir_sroa_fresh_temp();
+    step.lhs = ir_operand_copy(from);
+    step.rhs = ir_operand_int(slot->offset);
+    IRInstruction read = {0};
+    read.op = IR_OP_LOAD;
+    read.location = location;
+    read.is_float = slot->is_float;
+    read.float_bits = slot->float_bits;
+    read.is_unsigned = slot->is_unsigned;
+    read.alias_class = slot->alias_class;
+    char *piece = ir_sroa_scalar_name(owner->name, slot->offset);
+    read.dest = piece ? ir_operand_symbol(piece) : ir_operand_none();
+    read.dest.float_bits = slot->float_bits;
+    free(piece);
+    read.lhs = ir_operand_copy(&step.dest);
+    read.rhs = ir_operand_int(slot->size);
+    if (!step.text || !step.dest.name || !step.lhs.name || !read.dest.name ||
+        !read.lhs.name || !ir_instruction_vector_append_move(vec, &step) ||
+        !ir_instruction_vector_append_move(vec, &read)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int ir_sroa_transform_all(IRFunction *function,
                                  const IRSroaFlatMember *members,
                                  size_t member_count,
@@ -401,6 +450,23 @@ static int ir_sroa_transform_all(IRFunction *function,
         }
         continue;
       }
+      if (de && !se) {
+        const IRSroaFlatMember *owner = &members[de->member];
+        IRInstruction take = {0};
+        take.op = IR_OP_ADDRESS_OF;
+        take.location = insn->location;
+        take.dest = ir_sroa_fresh_temp();
+        take.lhs = ir_operand_symbol(insn->lhs.name);
+        IROperand whole = ir_operand_copy(&take.dest);
+        if (!take.dest.name || !take.lhs.name ||
+            !ir_instruction_vector_append_move(&vec, &take) ||
+            !ir_sroa_load_pieces(&vec, owner, &layouts[owner->layout], &whole,
+                                 insn->location)) {
+          ok = 0;
+        }
+        ir_operand_destroy(&whole);
+        continue;
+      }
     }
 
     if (insn->op == IR_OP_LOAD && insn->lhs.kind == IR_OPERAND_TEMP) {
@@ -460,6 +526,13 @@ static int ir_sroa_transform_all(IRFunction *function,
       if (ae) {
         long long off = ae->offset;
         const IRSroaFlatMember *owner = &members[ae->member];
+        if (insn->rhs.kind == IR_OPERAND_INT && insn->rhs.int_value > 8) {
+          if (!ir_sroa_load_pieces(&vec, owner, &layouts[owner->layout], &insn->lhs,
+                                   insn->location)) {
+            ok = 0;
+          }
+          continue;
+        }
         const IRSroaSlot *slot =
             ir_sroa_find_const_slot(layouts[owner->layout].slots,
                                     layouts[owner->layout].slot_count, off);
@@ -568,6 +641,26 @@ static void ir_sroa_rec_add_addr(IRSroaRec *recs, size_t owner,
   rec->addr_count++;
 }
 
+static int ir_sroa_text_is_descriptor(const char *text) {
+  size_t length = text ? strlen(text) : 0;
+  return length > 0 && (text[length - 1] == ']' || strcmp(text, "string") == 0);
+}
+
+static int ir_sroa_is_whole_size(const IRFunction *function, const IRSroaRec *rec,
+                                 long long bytes) {
+  const IRInstruction *decl = &function->instructions[rec->decl_index];
+  const MtlcType *type = ir_sroa_declared_aggregate(decl);
+  return type && type->kind == MTLC_TYPE_STRUCT &&
+         !ir_sroa_text_is_descriptor(decl->text) && (long long)type->size == bytes;
+}
+
+static int ir_sroa_rec_is_struct(const IRFunction *function, const IRSroaRec *rec) {
+  const IRInstruction *decl = &function->instructions[rec->decl_index];
+  const MtlcType *type = ir_sroa_declared_aggregate(decl);
+  return type && type->kind == MTLC_TYPE_STRUCT &&
+         !ir_sroa_text_is_descriptor(decl->text);
+}
+
 static int ir_sroa_scan_uses(IRFunction *function, size_t i, IRSroaRec *recs,
                              IRSroaHash *addr_hash) {
   const IRInstruction *insn = &function->instructions[i];
@@ -621,6 +714,12 @@ static int ir_sroa_scan_uses(IRFunction *function, size_t i, IRSroaRec *recs,
       IRSroaRec *rec = &recs[ae->member];
       if (ir_operand_is_temp_named(&insn->lhs, insn->dest.name)) {
         rec->eligible = 0;
+        return 1;
+      }
+      if (ae->offset == 0 && !insn->is_volatile && ir_operand_is_temp(&insn->lhs) &&
+          !ir_sroa_hash_get(addr_hash, insn->lhs.name) &&
+          insn->rhs.kind == IR_OPERAND_INT && insn->rhs.int_value > 8 &&
+          ir_sroa_is_whole_size(function, rec, insn->rhs.int_value)) {
         return 1;
       }
       if (ir_operand_is_temp(&insn->lhs)) {
@@ -683,6 +782,16 @@ static int ir_sroa_scan_uses(IRFunction *function, size_t i, IRSroaRec *recs,
   return 1;
 }
 
+static int ir_sroa_is_parameter(const IRFunction *function, const char *name) {
+  for (size_t p = 0; p < function->parameter_count; p++) {
+    if (function->parameter_names[p] &&
+        strcmp(function->parameter_names[p], name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int ir_sroa_collect_records(IRFunction *function, size_t i,
                                    IRSroaRec *recs, IRSroaHash *rec_hash,
                                    IRSroaHash *addr_hash) {
@@ -717,7 +826,8 @@ static int ir_sroa_collect_records(IRFunction *function, size_t i,
       if (de && se) {
         ir_sroa_rec_add_partner(recs, de->member, se->member);
         ir_sroa_rec_add_partner(recs, se->member, de->member);
-      } else {
+      } else if (!de || !ir_sroa_is_parameter(function, insn->lhs.name) ||
+                 !ir_sroa_rec_is_struct(function, &recs[de->member])) {
         recs[(de ? de : se)->member].comp_fail = 1;
       }
       return 1;
@@ -835,7 +945,8 @@ static int ir_sroa_round(IRFunction *function, int *changed,
   }
 
   for (size_t r = 0; r < rec_count; r++) {
-    if (recs[r].addr_count == 0 || recs[r].slot_count == 0) {
+    if ((recs[r].partner_count == 0 || !ir_sroa_rec_is_struct(function, &recs[r])) &&
+        (recs[r].addr_count == 0 || recs[r].slot_count == 0)) {
       recs[r].eligible = 0;
     }
     ir_sroa_sort_slots(recs[r].slots, recs[r].slot_count);
@@ -899,13 +1010,21 @@ static int ir_sroa_round(IRFunction *function, int *changed,
         break;
       }
     }
+    IRSroaLayout merged = {0};
     if (comp_ok) {
-      const IRSroaRec *seed = &recs[comp[0]];
       for (size_t c = 0; c < comp_count && comp_ok; c++) {
         const IRSroaRec *m = &recs[comp[c]];
         if (!m->eligible || m->comp_fail ||
-            !ir_sroa_slots_match(seed->slots, seed->slot_count, m->slots,
-                                 m->slot_count)) {
+            !ir_sroa_merge_slots(&merged, m->slots, m->slot_count)) {
+          comp_ok = 0;
+        }
+      }
+      if (comp_ok && (merged.slot_count == 0 || !ir_sroa_slots_apart(&merged))) {
+        comp_ok = 0;
+      }
+      for (size_t c = 0; c < comp_count && comp_ok; c++) {
+        const IRSroaRec *m = &recs[comp[c]];
+        if (!ir_sroa_rec_is_struct(function, m) && m->slot_count != merged.slot_count) {
           comp_ok = 0;
         }
       }
@@ -925,9 +1044,7 @@ static int ir_sroa_round(IRFunction *function, int *changed,
       layouts = grown;
       layout_cap = nc;
     }
-    memcpy(layouts[layout_count].slots, recs[comp[0]].slots,
-           sizeof(layouts[layout_count].slots));
-    layouts[layout_count].slot_count = recs[comp[0]].slot_count;
+    layouts[layout_count] = merged;
 
     if (member_count + comp_count > member_cap) {
       size_t nc = member_cap ? member_cap * 2 : 16;
@@ -998,15 +1115,291 @@ static int ir_sroa_round(IRFunction *function, int *changed,
   return 1;
 }
 
+static void ir_sroa_note_piece_read(IRSroaHash *reads, const IROperand *operand) {
+  if (ir_operand_is_symbol(operand) && strchr(operand->name, '$')) {
+    ir_sroa_hash_put(reads, operand->name, 0, 0);
+  }
+}
+
+static void ir_sroa_drop_unread_pieces(IRFunction *function) {
+  for (int removed = 1; removed;) {
+    IRSroaHash reads = {0};
+    removed = 0;
+    if (!ir_sroa_hash_init(&reads, function->instruction_count)) {
+      return;
+    }
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *in = &function->instructions[i];
+      if (in->op == IR_OP_ADDRESS_OF || in->op == IR_OP_STORE) {
+        ir_sroa_note_piece_read(&reads, &in->dest);
+      }
+      ir_sroa_note_piece_read(&reads, &in->lhs);
+      ir_sroa_note_piece_read(&reads, &in->rhs);
+      for (size_t a = 0; a < in->argument_count; a++) {
+        ir_sroa_note_piece_read(&reads, &in->arguments[a]);
+      }
+    }
+    unsigned char *unread = calloc(function->instruction_count, 1);
+    if (!unread) {
+      free(reads.ents);
+      return;
+    }
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *in = &function->instructions[i];
+      if (!ir_operand_is_symbol(&in->dest) || !strchr(in->dest.name, '$') ||
+          ir_sroa_hash_get(&reads, in->dest.name)) {
+        continue;
+      }
+      if (in->op == IR_OP_DECLARE_LOCAL || in->op == IR_OP_ASSIGN ||
+          (in->op == IR_OP_LOAD && !in->is_volatile)) {
+        unread[i] = 1;
+      }
+    }
+    free(reads.ents);
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      if (unread[i]) {
+        ir_instruction_make_nop(&function->instructions[i]);
+        removed = 1;
+      }
+    }
+    free(unread);
+  }
+}
+
+static int ir_sroa_operand_is_piece(const IROperand *operand) {
+  return ir_operand_is_symbol(operand) && strchr(operand->name, '$') != NULL;
+}
+
+static void ir_sroa_count_up(IRSroaHash *counts, const char *name, long long by) {
+  ir_sroa_hash_put(counts, name, 0, 0);
+  const IRSroaHashEnt *known = ir_sroa_hash_get(counts, name);
+  if (known) {
+    ((IRSroaHashEnt *)known)->offset += by;
+  }
+}
+
+static int ir_sroa_type_is_word(const char *type) {
+  size_t length = type ? strlen(type) : 0;
+  return length > 0 && (strcmp(type, "int64") == 0 || strcmp(type, "uint64") == 0 ||
+                        type[length - 1] == '*');
+}
+
+static int ir_sroa_forward_read(IRFunction *function, const IRSroaHash *sources,
+                                size_t at, IROperand *operand, int *changed) {
+  if (!ir_sroa_operand_is_piece(operand)) {
+    return 1;
+  }
+  const IRSroaHashEnt *source = ir_sroa_hash_get(sources, operand->name);
+  if (!source || !ir_function_instruction_dominates(function, source->member, at)) {
+    return 1;
+  }
+  IROperand value = ir_operand_none();
+  if (!ir_operand_clone(&function->instructions[source->member].lhs, &value)) {
+    return 0;
+  }
+  ir_operand_destroy(operand);
+  *operand = value;
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
+int ir_forward_piece_copies_pass(IRFunction *function, int *changed) {
+  size_t candidates = 0;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_ASSIGN && ir_sroa_operand_is_piece(&in->dest) && !in->is_float &&
+        (ir_operand_is_temp(&in->lhs) || in->lhs.kind == IR_OPERAND_INT)) {
+      candidates++;
+    }
+  }
+  if (!candidates) {
+    return 1;
+  }
+  IRSroaHash piece_writes = {0};
+  IRSroaHash temp_writes = {0};
+  IRSroaHash sources = {0};
+  if (!ir_sroa_hash_init(&piece_writes, function->instruction_count) ||
+      !ir_sroa_hash_init(&temp_writes, function->instruction_count) ||
+      !ir_sroa_hash_init(&sources, candidates)) {
+    free(piece_writes.ents);
+    free(temp_writes.ents);
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL) {
+      if (ir_sroa_operand_is_piece(&in->dest) && !ir_sroa_type_is_word(in->text)) {
+        ir_sroa_count_up(&piece_writes, in->dest.name, 2);
+      }
+      continue;
+    }
+    if (in->op == IR_OP_ADDRESS_OF && ir_sroa_operand_is_piece(&in->lhs)) {
+      ir_sroa_count_up(&piece_writes, in->lhs.name, 2);
+    }
+    if (ir_instruction_writes_destination(in)) {
+      if (ir_sroa_operand_is_piece(&in->dest)) {
+        ir_sroa_count_up(&piece_writes, in->dest.name, 1);
+      } else if (ir_operand_is_temp(&in->dest)) {
+        ir_sroa_count_up(&temp_writes, in->dest.name, 1);
+      }
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op != IR_OP_ASSIGN || !ir_sroa_operand_is_piece(&in->dest) || in->is_float) {
+      continue;
+    }
+    const IRSroaHashEnt *writes = ir_sroa_hash_get(&piece_writes, in->dest.name);
+    if (!writes || writes->offset != 1) {
+      continue;
+    }
+    if (in->lhs.kind == IR_OPERAND_INT) {
+      ir_sroa_hash_put(&sources, in->dest.name, i, 0);
+    } else if (ir_operand_is_temp(&in->lhs)) {
+      const IRSroaHashEnt *temp = ir_sroa_hash_get(&temp_writes, in->lhs.name);
+      if (temp && temp->offset == 1) {
+        ir_sroa_hash_put(&sources, in->dest.name, i, 0);
+      }
+    }
+  }
+  int forwarded = 0;
+  int ok = 1;
+  for (size_t i = 0; i < function->instruction_count && ok; i++) {
+    IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL || in->op == IR_OP_NOP) {
+      continue;
+    }
+    ok = ir_sroa_forward_read(function, &sources, i, &in->lhs, &forwarded) &&
+         ir_sroa_forward_read(function, &sources, i, &in->rhs, &forwarded);
+    if (ok && in->op == IR_OP_STORE) {
+      ok = ir_sroa_forward_read(function, &sources, i, &in->dest, &forwarded);
+    }
+    for (size_t a = 0; a < in->argument_count && ok; a++) {
+      ok = ir_sroa_forward_read(function, &sources, i, &in->arguments[a], &forwarded);
+    }
+  }
+  free(piece_writes.ents);
+  free(temp_writes.ents);
+  free(sources.ents);
+  if (forwarded) {
+    ir_sroa_drop_unread_pieces(function);
+    if (changed) {
+      *changed = 1;
+    }
+  }
+  return ok;
+}
+
+static size_t ir_sroa_struct_bytes(const IRFunction *function, const char *name) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && ir_operand_is_symbol(&in->dest) &&
+        strcmp(in->dest.name, name) == 0) {
+      const MtlcType *type = ir_sroa_declared_aggregate(in);
+      return type && type->kind == MTLC_TYPE_STRUCT &&
+                     !ir_sroa_text_is_descriptor(in->text)
+                 ? type->size
+                 : 0;
+    }
+  }
+  if (function->parameter_types && ir_optimize_get_program()) {
+    for (size_t p = 0; p < function->parameter_count; p++) {
+      if (function->parameter_names[p] &&
+          strcmp(function->parameter_names[p], name) == 0) {
+        const MtlcType *type = ir_program_lookup_type(ir_optimize_get_program(),
+                                                      function->parameter_types[p]);
+        return type && type->kind == MTLC_TYPE_STRUCT &&
+                       !ir_sroa_text_is_descriptor(function->parameter_types[p])
+                   ? type->size
+                   : 0;
+      }
+    }
+  }
+  return 0;
+}
+
+static int ir_sroa_name_whole_copies(IRFunction *function, int *changed) {
+  IRSroaHash addresses = {0};
+  if (!ir_sroa_hash_init(&addresses, function->instruction_count)) {
+    return 0;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_ADDRESS_OF && ir_operand_is_symbol(&in->lhs) &&
+        ir_operand_is_temp(&in->dest)) {
+      ir_sroa_hash_put(&addresses, in->dest.name, i, 0);
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (!ir_operand_is_temp(&in->dest) || in->op == IR_OP_STORE) {
+      continue;
+    }
+    const IRSroaHashEnt *known = ir_sroa_hash_get(&addresses, in->dest.name);
+    if (known && known->member != i) {
+      ((IRSroaHashEnt *)known)->offset = -1;
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *in = &function->instructions[i];
+    if (in->op != IR_OP_STORE || in->is_volatile ||
+        !ir_operand_is_temp(&in->dest) || !ir_operand_is_temp(&in->lhs) ||
+        in->rhs.kind != IR_OPERAND_INT || in->rhs.int_value <= 8) {
+      continue;
+    }
+    const IRSroaHashEnt *to = ir_sroa_hash_get(&addresses, in->dest.name);
+    const IRSroaHashEnt *from = ir_sroa_hash_get(&addresses, in->lhs.name);
+    if (!to || !from || to->offset != 0 || from->offset != 0) {
+      continue;
+    }
+    const char *target = function->instructions[to->member].lhs.name;
+    const char *source = function->instructions[from->member].lhs.name;
+    if (strcmp(target, source) == 0 ||
+        (long long)ir_sroa_struct_bytes(function, target) != in->rhs.int_value ||
+        (long long)ir_sroa_struct_bytes(function, source) != in->rhs.int_value) {
+      continue;
+    }
+    IRInstruction named = {0};
+    named.op = IR_OP_ASSIGN;
+    named.location = in->location;
+    named.dest = ir_operand_symbol(target);
+    named.lhs = ir_operand_symbol(source);
+    if (!named.dest.name || !named.lhs.name) {
+      ir_instruction_destroy_storage(&named);
+      free(addresses.ents);
+      return 0;
+    }
+    ir_instruction_destroy_storage(in);
+    *in = named;
+    if (changed) {
+      *changed = 1;
+    }
+  }
+  free(addresses.ents);
+  return 1;
+}
+
 int ir_sroa_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
   }
 
+  if (!ir_sroa_name_whole_copies(function, changed)) {
+    return 0;
+  }
+  int split = 0;
   for (int iter = 0; iter < 32; iter++) {
-    if (!ir_sroa_round(function, changed, iter)) {
+    if (!ir_sroa_round(function, &split, iter)) {
       break;
     }
+  }
+  if (split) {
+    if (changed) {
+      *changed = 1;
+    }
+    ir_sroa_drop_unread_pieces(function);
   }
   return 1;
 }

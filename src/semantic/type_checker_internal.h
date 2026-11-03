@@ -31,6 +31,8 @@ int type_checker_ensure_multi_return_type(TypeChecker *checker,
                                           SourceLocation location);
 
 Type *type_checker_pointer_to(TypeChecker *checker, Type *base);
+Type *type_checker_element_ref_to(TypeChecker *checker, Type *base);
+int type_checker_takes_null(const Type *type, ASTNode *value);
 
 Type *type_checker_slice_of(TypeChecker *checker, Type *element);
 Type *type_checker_view_of(TypeChecker *checker, Type *element, size_t rank);

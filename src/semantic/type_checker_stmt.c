@@ -1434,8 +1434,7 @@ static int type_checker_check_return(TypeChecker *checker, ASTNode *statement) {
 
       type_checker_note_return_range(checker, value);
       if (checker->current_function) {
-        if (!(func_return_type->kind == TYPE_POINTER &&
-              type_checker_is_null_pointer_constant(value)) &&
+        if (!type_checker_takes_null(func_return_type, value) &&
             !type_checker_is_assignable_from(checker, func_return_type,
                                              value_type, value)) {
           type_checker_report_assign_mismatch(checker, value, value->location,

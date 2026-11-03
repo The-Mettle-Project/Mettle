@@ -1804,7 +1804,29 @@ int type_checker_type_accepts_null_pointer(const Type *type) {
   if (!type) {
     return 0;
   }
-  return type->kind == TYPE_POINTER || type->kind == TYPE_FUNCTION_POINTER;
+  return type->kind == TYPE_POINTER || type->kind == TYPE_FUNCTION_POINTER ||
+         type_is_element_ref(type);
+}
+
+int type_checker_takes_null(const Type *type, ASTNode *value) {
+  if (!type_checker_type_accepts_null_pointer(type) ||
+      !type_checker_is_null_pointer_constant(value)) {
+    return 0;
+  }
+  if (type_is_element_ref(type) && value->type != AST_CAST_EXPRESSION) {
+    ASTNode *zero = ast_create_number_literal(0, value->location, 10);
+    ASTNode *cast = ast_create_cast_expression(type->name, zero, value->location);
+    if (zero && cast) {
+      value->type = cast->type;
+      value->data = cast->data;
+      value->children = cast->children;
+      value->child_count = cast->child_count;
+      value->child_capacity = cast->child_capacity;
+      value->child_capacity_owner = cast->child_capacity_owner;
+      value->resolved_type = (struct Type *)type;
+    }
+  }
+  return 1;
 }
 
 int type_checker_statement_guarantees_termination(ASTNode *statement) {

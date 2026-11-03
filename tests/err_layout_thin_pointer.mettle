@@ -5,11 +5,8 @@ import "std/layout";
   y: int64;
 }
 
-fn second(p: Point*) -> int32 {
-  return p[1].x;
-}
-
 fn main() -> int32 {
-  var q: Point;
-  return second(&q);
+  var raw: int64 = 4096;
+  var p: Point* = (Point*)raw;
+  return p.x;
 }

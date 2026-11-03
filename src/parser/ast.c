@@ -278,6 +278,7 @@ static ASTNode *ast_clone_struct_declaration(ASTNode *clone, const ASTNode *node
                                                    src->meta_decorator_count);
   dst->meta_decorator_count = src->meta_decorator_count;
   dst->meta_layout = src->meta_layout;
+  dst->meta_ref_hint = src->meta_ref_hint;
   dst->name = ast_intern_string(src->name);
   dst->field_count = src->field_count;
   dst->method_count = src->method_count;
@@ -1992,6 +1993,7 @@ ASTNode *ast_create_struct_declaration(const char *name, char **field_names,
   struct_decl->meta_decorators = NULL;
   struct_decl->meta_decorator_count = 0;
   struct_decl->meta_layout = NULL;
+  struct_decl->meta_ref_hint = 0;
 
   if (field_count > 0) {
     struct_decl->field_names = malloc(field_count * sizeof(char *));

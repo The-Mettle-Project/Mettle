@@ -227,6 +227,9 @@ int type_checker_declare_struct_placeholder(TypeChecker *checker,
   if (!struct_type) {
     return 0;
   }
+  struct_type->columnar_hint =
+      decl->meta_ref_hint ||
+      (decl->meta_layout && decl->meta_layout->region_count > 1);
   struct_symbol = symbol_create(decl->name, SYMBOL_STRUCT, struct_type);
   if (!struct_symbol) {
     type_destroy(struct_type);
@@ -291,6 +294,9 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
     if (!struct_type) {
       return 0;
     }
+    struct_type->columnar_hint =
+        decl->meta_ref_hint ||
+        (decl->meta_layout && decl->meta_layout->region_count > 1);
     struct_symbol = symbol_create(decl->name, SYMBOL_STRUCT, struct_type);
     if (!struct_symbol) {
       type_destroy(struct_type);
@@ -777,7 +783,7 @@ const Type *type_checker_find_custom_layout(const Type *type, int depth) {
     return NULL;
   }
   if (type->kind == TYPE_POINTER || type->kind == TYPE_ARRAY ||
-      type->kind == TYPE_SLICE) {
+      type->kind == TYPE_SLICE || type_is_element_ref(type)) {
     return type_checker_find_custom_layout(type->base_type, depth + 1);
   }
   if (type->kind != TYPE_STRUCT) {
@@ -1388,8 +1394,7 @@ static int type_checker_check_variable_initializer(
         type_checker_reject_comptime_escape(
             checker, var_decl->initializer->location, init_type);
         poisoned = 1;
-      } else if (!(type_checker_type_accepts_null_pointer(var_type) &&
-            type_checker_is_null_pointer_constant(var_decl->initializer)) &&
+      } else if (!(type_checker_takes_null(var_type, var_decl->initializer)) &&
           !type_checker_is_assignable_from(checker, var_type, init_type,
                                            var_decl->initializer)) {
         type_checker_report_assign_mismatch(
@@ -2643,6 +2648,9 @@ static int type_checker_check_member_assignment(
   if (object_type->kind == TYPE_POINTER && object_type->base_type) {
     object_type = object_type->base_type;
   }
+  if (type_is_element_ref(object_type)) {
+    object_type = object_type->base_type;
+  }
 
   if (object_type->kind != TYPE_STRUCT &&
       object_type->kind != TYPE_STRING) {
@@ -2678,8 +2686,7 @@ static int type_checker_check_member_assignment(
     return 0;
   }
 
-  if (!(type_checker_type_accepts_null_pointer(field_type) &&
-        type_checker_is_null_pointer_constant(assignment->value)) &&
+  if (!(type_checker_takes_null(field_type, assignment->value)) &&
       !type_checker_is_assignable_from(checker, field_type, value_type,
                                        assignment->value)) {
     type_checker_report_assign_mismatch(checker, assignment->value,
@@ -2768,8 +2775,7 @@ static int type_checker_check_target_assignment(
         return 0;
       }
 
-      if (!(type_checker_type_accepts_null_pointer(element_type) &&
-            type_checker_is_null_pointer_constant(assignment->value)) &&
+      if (!(type_checker_takes_null(element_type, assignment->value)) &&
           !type_checker_is_assignable_from(checker, element_type, value_type,
                                            assignment->value)) {
         type_checker_report_assign_mismatch(checker, assignment->value,
@@ -2808,8 +2814,7 @@ static int type_checker_check_target_assignment(
         return 0;
       }
 
-      if (!(type_checker_type_accepts_null_pointer(target_type) &&
-            type_checker_is_null_pointer_constant(assignment->value)) &&
+      if (!(type_checker_takes_null(target_type, assignment->value)) &&
           !type_checker_is_assignable_from(checker, target_type, value_type,
                                            assignment->value)) {
         type_checker_report_assign_mismatch(checker, assignment->value,
@@ -2923,8 +2928,7 @@ static int type_checker_process_assignment(TypeChecker *checker,
       return 0;
     }
 
-    if (!(type_checker_type_accepts_null_pointer(var_symbol->type) &&
-          type_checker_is_null_pointer_constant(assignment->value)) &&
+    if (!(type_checker_takes_null(var_symbol->type, assignment->value)) &&
         !type_checker_is_assignable_from(checker, var_symbol->type, value_type,
                                          assignment->value)) {
       type_checker_report_assign_mismatch(checker, assignment->value,

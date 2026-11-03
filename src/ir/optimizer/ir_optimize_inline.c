@@ -408,6 +408,7 @@ int ir_clone_instruction_plain(const IRInstruction *source,
   out->uniform_condition = source->uniform_condition;
   out->ast_ref = source->ast_ref;
   out->value_type = source->value_type;
+  out->column_base = source->column_base;
 
   if (!ir_operand_clone(&source->dest, &out->dest) ||
       !ir_operand_clone(&source->lhs, &out->lhs) ||
@@ -496,6 +497,7 @@ static int ir_clone_instruction_for_inline(const IRInstruction *source,
   out->uniform_condition = source->uniform_condition;
   out->ast_ref = NULL;
   out->value_type = source->value_type;
+  out->column_base = source->column_base;
 
   if (!ir_inline_rewrite_operand(&source->dest, &out->dest, symbol_map,
                                  temp_map, label_map, inline_prefix) ||

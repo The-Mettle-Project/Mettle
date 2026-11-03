@@ -709,6 +709,18 @@ static int safety_origins_function(IRProgram *program, IRFunction *function) {
   ir_operand_destroy(&name);
   if (!addressed || !origin_call(&origins, function->location,
        "mettle_safety_call_enter", &address, 1, &entry)) goto done;
+  size_t first = 0;
+  while (first + 1 < function->instruction_count) {
+    const IRInstruction *take = &function->instructions[first];
+    const IRInstruction *note = &function->instructions[first + 1];
+    if (take->op != IR_OP_ADDRESS_OF || !take->dest.name ||
+        strncmp(take->dest.name, SAFETY_TEMP_PREFIX, strlen(SAFETY_TEMP_PREFIX)) ||
+        note->op != IR_OP_CALL || !note->text ||
+        strcmp(note->text, "mettle_safety_register_static")) break;
+    if (!origin_instruction(&origins, &function->instructions[first], &entry) ||
+        !origin_instruction(&origins, &function->instructions[first + 1], &entry)) goto done;
+    first += 2;
+  }
   for (size_t p = 0; p < function->parameter_count; p++) {
     IROperand parameter = ir_operand_symbol(function->parameter_names[p]);
     SafetyOrigin *origin = origin_find(&origins, &parameter);
@@ -731,7 +743,7 @@ static int safety_origins_function(IRProgram *program, IRFunction *function) {
     ir_operand_destroy(&parameter);
     if (!passed) goto done;
   }
-  for (size_t i = 0; i < function->instruction_count; i++) {
+  for (size_t i = first; i < function->instruction_count; i++) {
     if (!origins.return_prepared) {
       size_t next = i;
       while (next + 1 < function->instruction_count) {

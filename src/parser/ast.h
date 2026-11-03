@@ -216,6 +216,7 @@ typedef struct {
   MetaDecorator *meta_decorators;
   size_t meta_decorator_count;
   struct TypeMetaLayout *meta_layout;
+  int meta_ref_hint;
 } StructDeclaration;
 
 typedef struct {

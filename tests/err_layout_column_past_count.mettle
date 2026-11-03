@@ -1,0 +1,18 @@
+import "std/io";
+import "std/layout";
+
+@soa struct Point {
+  x: int64;
+  y: int64;
+}
+
+@noinline fn write_at(p: Point[], i: int64) {
+  p[i].x = 3;
+}
+
+fn main() -> int32 {
+  var p: Point[] = new Point[3];
+  write_at(p, 3);
+  println("wrote {p[0].y}");
+  return 0;
+}

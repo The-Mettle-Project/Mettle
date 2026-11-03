@@ -1878,6 +1878,52 @@ static int stage_round(MetaStage *stage) {
   name_set_free(&names);
   name_set_free(&types);
   name_set_free(&ambient);
+  if (ok && !stage->report->pending_error) {
+    int rerun = 0;
+    for (size_t t = 0; t < target_count; t++) {
+      StructDeclaration *sd = targets[t].sd;
+      if (!sd->meta_layout) {
+        continue;
+      }
+      if (sd->meta_layout->region_count <= 1) {
+        if (sd->meta_ref_hint) {
+          report_at(stage, targets[t].decl->location, "L0002",
+                    "This layout keeps its fields in separate regions when "
+                    "pointers to the struct are thin, and in one region when "
+                    "they are references",
+                    NULL);
+          free(targets);
+          return 0;
+        }
+        continue;
+      }
+      if (sd->meta_ref_hint) {
+        continue;
+      }
+      sd->meta_ref_hint = 1;
+      for (size_t i = 0; i < program->declaration_count && !rerun; i++) {
+        const ASTNode *decl = program->declarations[i];
+        if (!decl || decl->type != AST_STRUCT_DECLARATION || !decl->data) {
+          continue;
+        }
+        const StructDeclaration *holder = (const StructDeclaration *)decl->data;
+        size_t length = strlen(sd->name);
+        for (size_t f = 0; f < holder->field_count && !rerun; f++) {
+          const char *type = holder->field_types[f];
+          rerun = type && strncmp(type, sd->name, length) == 0 &&
+                  type[length] == '*';
+        }
+      }
+    }
+    if (rerun) {
+      for (size_t t = 0; t < target_count; t++) {
+        targets[t].sd->meta_layout = NULL;
+        stage->report->layouts--;
+      }
+      free(targets);
+      return stage_round(stage);
+    }
+  }
   free(targets);
   return ok;
 }

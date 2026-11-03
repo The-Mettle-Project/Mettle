@@ -82,13 +82,32 @@ the field.
 
 ### What a layout changes
 
-More than one region means an element has no single address:
+More than one region means an element has no single address, so `T*` holds the
+base, the index and the count, 24 bytes in all:
+
+```mettle
+fn bump(p: P*) { p.y = p.y + 1.0; }
+
+var a: P[8];
+bump(&a[3]);
+
+var e: P* = &a[0];
+e[2].x = 1;
+e = e + 1;
+```
 
 - `a[i].f` works on arrays and slices, which carry the element count.
+- `&a[i]` and `new T` make a `T*`. `e.f`, `*e`, `e[i]`, `e + n`, `e - f`, `==`,
+  `free(e)` and `e->method()` work as on any pointer.
 - `&a[i].f` is a plain pointer into the column.
 - `x = a[i]` and `a[i] = x` copy region by region.
-- `&a[i]`, indexing a `T*` and `T*` arithmetic stop with `L0003`.
 - `new T[n]` returns a slice, as it does for every type.
+- `@hot_cold(key, next)` works on a node with a `next: Node*`. Allocate with `new`
+  and take `&a[i]`. `var e: T* = malloc(n)` and `(T*)p` stop with `L0003`, because
+  a bare pointer has no count.
+
+Debug and `--safe` builds check the index against the count on every access, and
+`--release` drops the check.
 
 A packed field has no address, so `&p.f` stops with `L0003`. Its type stays what
 you wrote, so the borrow analyser and effects read a tagged `Node*` as a `Node*`.

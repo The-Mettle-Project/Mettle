@@ -496,6 +496,20 @@ int ir_lower_call_expression(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *expression,
                                     IROperand *out_value);
 
+int ir_lower_make_element_ref(IRLoweringContext *context, IRFunction *function,
+                              Type *ref_type, const IROperand *base,
+                              const IROperand *index, const IROperand *count,
+                              SourceLocation location, IROperand *out_value);
+int ir_lower_address_of_element(IRLoweringContext *context, IRFunction *function,
+                                ASTNode *operand, Type *ref_type,
+                                SourceLocation location, IROperand *out_value);
+int ir_lower_element_ref_arithmetic(IRLoweringContext *context,
+                                    IRFunction *function, BinaryExpression *binary,
+                                    SourceLocation location,
+                                    IROperand *out_value);
+int ir_lower_element_ref_compare(IRLoweringContext *context, IRFunction *function,
+                                 BinaryExpression *binary, SourceLocation location,
+                                 IROperand *out_value);
 Type *ir_infer_expression_type(IRLoweringContext *context,
                                       ASTNode *expression);
 

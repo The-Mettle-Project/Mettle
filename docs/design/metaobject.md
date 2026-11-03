@@ -94,12 +94,22 @@ What a layout means for the rest of the language:
   calls and `p.x` work with one offset per field. `T[N]` takes the size the
   regions need for N elements.
 - With more than one region, `a[i].f` needs the element count. Fixed arrays have
-  it and slices carry it. Indexing a `T*` or doing arithmetic on one stops the
-  build with `L0003`, because a thin pointer has no count. `new T[n]` already
-  returns a slice.
-- `&a[i]` has no address under more than one region and stops with `L0003`.
-  `&a[i].f` is a plain pointer into a column. Reading or writing a whole `a[i]`
-  copies field by field.
+  it and slices carry it. `new T[n]` returns a slice.
+- `T*` for such a `T` is a reference: 24 bytes holding the base, the index and the
+  count. `&a[i]` makes one, `new T` makes one with a count of 1, and `0` is the
+  all-zero reference. `e.f`, `*e`, `e[i]`, `e + n`, `e - f`, `==`, `free(e)` and
+  methods work as they do on a pointer. `&a[i].f` is a plain pointer into a column.
+  Reading or writing a whole element copies region by region.
+- Every access through a reference checks its index against its count, in debug
+  and under `--safe`, because a run past a column stays inside the allocation.
+  `--release` drops the check. The borrow analyser reads `T*` by its spelling, so
+  use after free and returning a stack address report as they do for a pointer.
+- A reference does not cast to or from a thin pointer. There is no count to invent
+  and no single address to hand over. `(T*)p` and `var e: T* = malloc(n)` stop with
+  `L0003`, and so does assigning `s.data`, whose only reader is `free(s.data)`.
+- A struct with a `T*` field for its own type needs the layout first and the
+  reference size second, so the stage runs twice: once to learn which types have
+  several regions, once to lay them out with their fields at 24 bytes.
 - A packed field has no address, and `&p.f` stops with `L0003`. Its type stays
   what you wrote, so the borrow analyser and effects see a `Node*` where a tagged
   `Node*` is stored. Loads and stores become shift and mask.
@@ -107,6 +117,27 @@ What a layout means for the rest of the language:
   crossing either stops with `L0004`.
 - The live descriptor prints the regions and places, so conversion between two
   layouts works through the same field names as every other struct.
+
+A loop through references costs what a loop over columns costs. The reference is
+a local struct, so SROA splits it into words, the words forward to the loads they
+came from, and the column base hoists out of the loop with the index split off.
+The recognizers then see the same `base + i * stride` a slice gives them. Summing
+one field of 1048576 records, 100 passes, pinned, minimum of 15 interleaved runs:
+
+```mermaid
+xychart-beta
+  title "Microseconds for 100 passes"
+  x-axis ["hand columns", "@soa first field", "@soa second field", "T* indexed", "T* passed per element", "T* local per element", "T* stepped", "int32* stepped"]
+  bar [8257, 8269, 8244, 8265, 8214, 8234, 22432, 22493]
+```
+
+Stepping a reference with `r = r + 1` stays scalar, and so does stepping a plain
+`int32*`, at the same speed.
+
+A field of type `T*` costs 24 bytes in place of 8. Chasing 65536 shuffled nodes:
+plain struct with thin pointers 168087 us, `@hot_cold(key, next)` with references
+170945 us. The port of `physics_grid` to `@hot_cold(x, y)` prints the same hash as
+the struct version.
 
 ## Allocation
 
@@ -300,7 +331,8 @@ how many pass runs there were and how many results were checked.
 
 - `L0001`: a metafunction could not run, or it returned something unreadable.
 - `L0002`: a layout failed its proof.
-- `L0003`: an operation needs an address or a count the layout does not have.
+- `L0003`: an operation needs an address or a count the layout does not have: a
+  packed field's address, or a cast between a reference and a thin pointer.
 - `L0004`: a custom layout crossed `extern` or a kernel.
 - `L0005`: a generator stated no relation.
 - `L0006`: a metafunction reaches a type whose layout depends on it.

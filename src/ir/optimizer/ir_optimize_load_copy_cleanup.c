@@ -699,7 +699,7 @@ int ir_devirtualize_known_tables_pass(IRFunction *function, int *changed) {
 
 static int ir_column_operand_invariant(const IRFunction *function, size_t header,
                                        size_t latch, const IROperand *operand) {
-  if (operand->kind == IR_OPERAND_INT) {
+  if (operand->kind == IR_OPERAND_INT || operand->kind == IR_OPERAND_NONE) {
     return 1;
   }
   if (!operand->name) {
@@ -735,7 +735,9 @@ int ir_hoist_column_bases_pass(IRFunction *function, int *changed) {
       IRInstruction moved = {0};
       char temp[128];
       unsigned char mark = function->instructions[i].column_base;
-      if (!mark || function->instructions[i].op != IR_OP_BINARY ||
+      if (!mark ||
+          (function->instructions[i].op != IR_OP_BINARY &&
+           function->instructions[i].op != IR_OP_ASSIGN) ||
           !ir_column_operand_invariant(function, header, latch,
                                        &function->instructions[i].lhs) ||
           !ir_column_operand_invariant(function, header, latch,

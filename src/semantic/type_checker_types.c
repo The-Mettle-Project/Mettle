@@ -404,6 +404,31 @@ Type *type_checker_view_of(TypeChecker *checker, Type *element, size_t rank) {
                                      0, "");
 }
 
+Type *type_checker_element_ref_to(TypeChecker *checker, Type *base) {
+  char name[512];
+  snprintf(name, sizeof(name), "%s__ref", base->name ? base->name : "ptr");
+  for (size_t i = 0; i < checker->type_table_count; i++) {
+    Type *held = checker->type_table[i];
+    if (held && held->is_element_ref && held->base_type == base) {
+      return held;
+    }
+  }
+  Type *ref = type_create(TYPE_STRUCT, name);
+  if (!ref || !type_alloc_fields(ref, 3)) {
+    return NULL;
+  }
+  ref->is_element_ref = 1;
+  ref->base_type = base;
+  type_set_field(ref, 0, "__base", checker->builtin_rawptr, 0);
+  type_set_field(ref, 1, "__index", checker->builtin_int64, 0);
+  type_set_field(ref, 2, "__count", checker->builtin_int64, 0);
+  if (!type_compute_layout(ref)) {
+    type_destroy(ref);
+    return NULL;
+  }
+  return type_checker_canon_type(checker, ref);
+}
+
 Type *type_checker_device_pointer_to(TypeChecker *checker, Type *base,
                                      unsigned char space, size_t align,
                                      const char *qualifiers) {
@@ -414,12 +439,14 @@ Type *type_checker_device_pointer_to(TypeChecker *checker, Type *base,
     qualifiers = "";
   }
   const char *base_name = base->name ? base->name : "ptr";
-  size_t pointer_name_len = strlen(base_name) + strlen(qualifiers) + 2;
+  size_t pointer_name_len = strlen(base_name) + strlen(qualifiers) + 16;
   char *pointer_name = malloc(pointer_name_len);
   if (!pointer_name) {
     return NULL;
   }
-  snprintf(pointer_name, pointer_name_len, "%s%s*", base_name, qualifiers);
+  snprintf(pointer_name, pointer_name_len,
+           type_needs_element_ref(base) ? "%s%s__first*" : "%s%s*", base_name,
+           qualifiers);
 
   Type *existing = type_checker_get_type_by_name(checker, pointer_name);
   if (existing) {
@@ -443,6 +470,9 @@ Type *type_checker_device_pointer_to(TypeChecker *checker, Type *base,
 }
 
 Type *type_checker_pointer_to(TypeChecker *checker, Type *base) {
+  if (type_needs_element_ref(base)) {
+    return type_checker_element_ref_to(checker, base);
+  }
   return type_checker_device_pointer_to(checker, base, DEVICE_SPACE_NONE, 0,
                                         "");
 }
@@ -689,6 +719,14 @@ Type *type_checker_parse_pointer_type(TypeChecker *checker,
 
   Type *current = base_type;
   for (size_t i = 0; i < pointer_depth; i++) {
+    if (type_needs_element_ref(current) && !(i == 0 && qualifiers)) {
+      current = type_checker_element_ref_to(checker, current);
+      if (!current) {
+        free(qualifiers);
+        return NULL;
+      }
+      continue;
+    }
     const char *current_name = current && current->name ? current->name : "ptr";
     const char *qualifier_text = (i == 0 && qualifiers) ? qualifiers : "";
     size_t pointer_name_len =
@@ -1482,6 +1520,21 @@ Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name) {
   Type *named = NULL;
   if (!checker || !name)
     return NULL;
+
+  {
+    size_t length = strlen(name);
+    if (length > 5 && strcmp(name + length - 5, "__ref") == 0) {
+      char base_name[512];
+      if (length - 5 < sizeof(base_name)) {
+        memcpy(base_name, name, length - 5);
+        base_name[length - 5] = '\0';
+        Type *base = type_checker_get_type_by_name(checker, base_name);
+        if (type_needs_element_ref(base)) {
+          return type_checker_element_ref_to(checker, base);
+        }
+      }
+    }
+  }
 
   {
     Type *builtin = NULL;

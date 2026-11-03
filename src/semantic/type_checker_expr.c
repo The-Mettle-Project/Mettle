@@ -324,8 +324,9 @@ static ASTNode *type_checker_pointer_receiver(TypeChecker *checker,
     return NULL;
   }
   inner_type = type_checker_infer_type(checker, unary->operand);
-  if (!inner_type || inner_type->kind != TYPE_POINTER || !inner_type->base_type ||
-      inner_type->base_type->kind != TYPE_STRUCT) {
+  if (!inner_type ||
+      (inner_type->kind != TYPE_POINTER && !type_is_element_ref(inner_type)) ||
+      !inner_type->base_type || inner_type->base_type->kind != TYPE_STRUCT) {
     return NULL;
   }
   return unary->operand;
@@ -334,6 +335,9 @@ static ASTNode *type_checker_pointer_receiver(TypeChecker *checker,
 Type *type_checker_method_receiver_struct_type(Type *receiver_type) {
   if (!receiver_type) {
     return NULL;
+  }
+  if (type_is_element_ref(receiver_type)) {
+    return receiver_type->base_type;
   }
   if (receiver_type->kind == TYPE_STRUCT) {
     return receiver_type;
@@ -2977,6 +2981,9 @@ static Type *type_checker_infer_unary(TypeChecker *checker,
                                            "Null pointer dereference");
         return NULL;
       }
+      if (type_is_element_ref(operand_type)) {
+        return operand_type->base_type;
+      }
       if (operand_type->kind != TYPE_POINTER || !operand_type->base_type) {
         type_checker_set_error_at_location(
             checker, expression->location,
@@ -3308,8 +3315,7 @@ if ((func_symbol->kind == SYMBOL_VARIABLE ||
     }
     Type *param_type = fp_type->fn_param_types[i];
     int is_null =
-        (param_type && param_type->kind == TYPE_POINTER &&
-         type_checker_is_null_pointer_constant(call->arguments[i]));
+        type_checker_takes_null(param_type, call->arguments[i]);
     if (!is_null &&
         !type_checker_is_assignable_from(checker, param_type, arg_type,
                                          call->arguments[i])) {
@@ -3354,8 +3360,7 @@ static int type_checker_check_gathered_arguments(TypeChecker *checker,
     if (!argument) {
       return 0;
     }
-    if (!(parameter && type_checker_type_accepts_null_pointer(parameter) &&
-          type_checker_is_null_pointer_constant(call->arguments[i])) &&
+    if (!(parameter && type_checker_takes_null(parameter, call->arguments[i])) &&
         !type_checker_is_assignable_from(checker, parameter, argument,
                                          call->arguments[i])) {
       type_checker_report_assign_mismatch(checker, call->arguments[i],
@@ -3382,8 +3387,7 @@ static int type_checker_check_gathered_arguments(TypeChecker *checker,
     if (!argument) {
       return 0;
     }
-    if (!(type_checker_type_accepts_null_pointer(element) &&
-          type_checker_is_null_pointer_constant(call->arguments[i])) &&
+    if (!(type_checker_takes_null(element, call->arguments[i])) &&
         !type_checker_is_assignable_from(checker, element, argument,
                                          call->arguments[i])) {
       type_checker_report_assign_mismatch(checker, call->arguments[i],
@@ -3530,8 +3534,11 @@ for (size_t i = 0; i < call->argument_count; i++) {
 
   Type *param_type = func_symbol->data.function.parameter_types[i];
   int is_null_pointer_arg =
-      (param_type && param_type->kind == TYPE_POINTER &&
-       type_checker_is_null_pointer_constant(call->arguments[i]));
+      type_checker_takes_null(param_type, call->arguments[i]);
+  if (type_is_element_ref(arg_type) && call->function_name &&
+      strcmp(call->function_name, "free") == 0) {
+    is_null_pointer_arg = 1;
+  }
   if (!is_null_pointer_arg &&
        !type_checker_is_assignable_from(checker, param_type, arg_type,
                                         call->arguments[i])) {
@@ -3909,8 +3916,7 @@ static Type *type_checker_infer_indirect_call(TypeChecker *checker,
 
       Type *param_type = func_type->fn_param_types[i];
       int is_null_pointer_arg =
-          (param_type && param_type->kind == TYPE_POINTER &&
-           type_checker_is_null_pointer_constant(fp_call->arguments[i]));
+          type_checker_takes_null(param_type, fp_call->arguments[i]);
       if (!is_null_pointer_arg &&
           !type_checker_is_assignable_from(checker, param_type, arg_type,
                                            fp_call->arguments[i])) {
@@ -4057,6 +4063,10 @@ static Type *type_checker_infer_member(TypeChecker *checker,
     Type *object_type = type_checker_infer_type(checker, member->object);
     if (object_type && object_type->kind == TYPE_POINTER &&
         object_type->base_type) {
+      object_type = object_type->base_type;
+    }
+    if (type_is_element_ref(object_type) && member->member &&
+        strncmp(member->member, "__", 2) != 0) {
       object_type = object_type->base_type;
     }
     {
@@ -4271,6 +4281,10 @@ static Type *type_checker_infer_index(TypeChecker *checker,
         return type_checker_view_of(checker, array_type->base_type,
                                     type_view_rank(array_type) - 1);
       }
+      return array_type->base_type;
+    }
+
+    if (type_is_element_ref(array_type)) {
       return array_type->base_type;
     }
 
@@ -4509,6 +4523,32 @@ static Type *type_checker_infer_cast(TypeChecker *checker,
                                     target_type);
     }
 
+    if ((type_is_element_ref(operand_type) || type_is_element_ref(target_type)) &&
+        !type_checker_types_equal(operand_type, target_type) &&
+        !(type_is_element_ref(target_type) &&
+          type_checker_is_null_pointer_constant(cast_expr->operand))) {
+      char error_msg[512];
+      const Type *held = type_is_element_ref(target_type) ? target_type->base_type
+                                                          : operand_type->base_type;
+      snprintf(error_msg, sizeof(error_msg),
+               "'%s*' holds a base, an index and a count, because '%s' keeps "
+               "its fields in separate regions, so it does not cast to or from "
+               "'%s'. Allocate with 'new %s[n]' and take '&a[i]'",
+               held->name,
+               held->name,
+               type_is_element_ref(target_type) ? operand_type->name
+                                                : target_type->name,
+               held->name);
+      type_checker_set_error_at_location(checker, expression->location, "%s",
+                                         error_msg);
+      if (checker->error_reporter) {
+        error_reporter_set_last_code(checker->error_reporter, "L0003");
+      }
+      return NULL;
+    }
+    if (type_is_element_ref(target_type)) {
+      return target_type;
+    }
     if (!type_checker_is_cast_valid(operand_type, target_type)) {
       char error_msg[512];
       snprintf(error_msg, sizeof(error_msg),
@@ -4711,8 +4751,10 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
   }
 
   if (strcmp(op, "+") == 0 || strcmp(op, "-") == 0) {
-    int left_is_pointer = left_type->kind == TYPE_POINTER;
-    int right_is_pointer = right_type->kind == TYPE_POINTER;
+    int left_is_pointer =
+        left_type->kind == TYPE_POINTER || type_is_element_ref(left_type);
+    int right_is_pointer =
+        right_type->kind == TYPE_POINTER || type_is_element_ref(right_type);
     int left_is_integer = type_checker_is_integer_type(left_type);
     int right_is_integer = type_checker_is_integer_type(right_type);
 

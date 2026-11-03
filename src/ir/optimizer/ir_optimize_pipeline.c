@@ -124,6 +124,7 @@ static const IROptNamedPass g_ir_loop_canonical_passes[] = {
     {"hoist_body_locals", ir_hoist_body_locals_pass, IR_GATE_LOOP},
     {"hoist_global_bases", ir_hoist_global_bases_pass, IR_GATE_LOOP},
     {"hoist_row_pointers", ir_hoist_row_pointers_pass, IR_GATE_LOOP},
+    {"forward_piece_copies", ir_forward_piece_copies_pass, IR_GATE_LOOP},
     {"hoist_descriptor_loads", ir_hoist_descriptor_loads_pass,
      {IR_OPT_FEATURE_LOAD | IR_OPT_FEATURE_LABEL, IR_OPT_REQUIRE_NONE}},
     {"hoist_load_bases", ir_hoist_load_bases_pass, IR_GATE_LOOP},
