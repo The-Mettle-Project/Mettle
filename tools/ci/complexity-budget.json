@@ -49,7 +49,7 @@
     "src/codegen/binary/startup.c::binary_write_program_startup_object_for_target": 46,
     "src/codegen/binary_emitter.c::binary_emitter_write_coff_object_file": 113,
     "src/codegen/elf_emitter.c::binary_emitter_write_elf_object_file": 100,
-    "src/codegen/ptx_emitter.c::emit_binary": 74,
+    "src/codegen/ptx_emitter.c::emit_binary": 72,
     "src/codegen/ptx_emitter.c::ptx_emit_atomic_intrinsic": 67,
     "src/codegen/ptx_emitter.c::ptx_emit_call": 60,
     "src/codegen/ptx_emitter.c::ptx_emit_memory": 57,

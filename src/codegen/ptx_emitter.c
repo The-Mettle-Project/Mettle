@@ -11152,6 +11152,14 @@ static int ptx_u32_immediate_beside_u32(const IROperand *imm,
          other->is_unsigned;
 }
 
+static PtxClass ptx_integer_result_class(const IRInstruction *in,
+                                         const PtxVal *la, const PtxVal *ra) {
+  PtxClass lc = la->cls, rc = ra->cls;
+  if (ptx_u32_immediate_beside_u32(&in->rhs, la)) rc = PC_B32;
+  if (ptx_u32_immediate_beside_u32(&in->lhs, ra)) lc = PC_B32;
+  return (lc == PC_B64 || rc == PC_B64) ? PC_B64 : PC_B32;
+}
+
 static void emit_binary(PtxFn *fn, const IRInstruction *in) {
   const char *t = in->text ? in->text : "+";
   PtxVal la = operand_desc(fn, &in->lhs);
@@ -11207,10 +11215,7 @@ static void emit_binary(PtxFn *fn, const IRInstruction *in) {
     dv.address_space =
         la.is_ptr ? la.address_space : ra.address_space;
   } else {
-    PtxClass lc = la.cls, rc = ra.cls;
-    if (ptx_u32_immediate_beside_u32(&in->rhs, &la)) rc = PC_B32;
-    if (ptx_u32_immediate_beside_u32(&in->lhs, &ra)) lc = PC_B32;
-    dv.cls = (lc == PC_B64 || rc == PC_B64) ? PC_B64 : PC_B32;
+    dv.cls = ptx_integer_result_class(in, &la, &ra);
     dv.is_unsigned = la.is_unsigned || ra.is_unsigned;
   }
 
