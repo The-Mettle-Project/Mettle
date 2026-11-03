@@ -2006,6 +2006,25 @@ int ir_emit_column_bytes(IRLoweringContext *context, IRFunction *function,
   return 1;
 }
 
+int ir_emit_layout_allocation(IRLoweringContext *context, IRFunction *function,
+                              const Type *element, const IROperand *bytes,
+                              const IROperand *dest, SourceLocation location) {
+  IROperand arguments[2];
+  IRInstruction call = {0};
+  arguments[0] = ir_clone_operand_local(bytes);
+  arguments[1] = ir_operand_int((long long)element->alignment);
+  call.op = IR_OP_CALL;
+  call.location = location;
+  call.text = (char *)element->meta_layout->allocator;
+  call.dest = *dest;
+  call.arguments = arguments;
+  call.argument_count = 2;
+  int ok = ir_emit(context, function, &call);
+  ir_operand_destroy(&arguments[0]);
+  ir_operand_destroy(&arguments[1]);
+  return ok;
+}
+
 static int ir_lower_member_address_any(IRLoweringContext *context,
                                        IRFunction *function,
                                        ASTNode *expression,

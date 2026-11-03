@@ -518,6 +518,9 @@ int ir_lower_column_element_store(IRLoweringContext *context,
 int ir_emit_column_bytes(IRLoweringContext *context, IRFunction *function,
                          Type *element, const IROperand *count,
                          SourceLocation location, IROperand *out);
+int ir_emit_layout_allocation(IRLoweringContext *context, IRFunction *function,
+                              const Type *element, const IROperand *bytes,
+                              const IROperand *dest, SourceLocation location);
 int ir_expression_is_packed_field(IRLoweringContext *context,
                                   ASTNode *expression);
 int ir_lower_packed_load(IRLoweringContext *context, IRFunction *function,

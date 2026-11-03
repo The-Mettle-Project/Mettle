@@ -4341,6 +4341,37 @@ static Type *type_checker_infer_allocation(TypeChecker *checker,
 
   case AST_NEW_EXPRESSION: {
     NewExpression *new_expr = (NewExpression *)expression->data;
+    if (new_expr && new_expr->type_name) {
+      const Type *allocated =
+          type_checker_get_type_by_name(checker, new_expr->type_name);
+      if (allocated && allocated->meta_layout &&
+          allocated->meta_layout->allocator) {
+        const char *named = allocated->meta_layout->allocator;
+        Symbol *allocator = symbol_table_lookup(checker->symbol_table, named);
+        Type **params = allocator && allocator->kind == SYMBOL_FUNCTION
+                            ? allocator->data.function.parameter_types
+                            : NULL;
+        Type *returned = allocator && allocator->kind == SYMBOL_FUNCTION
+                             ? allocator->data.function.return_type
+                             : NULL;
+        if (!params || !returned ||
+            allocator->data.function.parameter_count != 2 ||
+            params[0]->kind != TYPE_INT64 || params[1]->kind != TYPE_INT64 ||
+            returned->kind == TYPE_VOID || returned->size != 8) {
+          char error_msg[400];
+          snprintf(error_msg, sizeof(error_msg),
+                   "The layout of '%s' allocates with '%s', which must be "
+                   "'fn %s(bytes: int64, align: int64) -> cstring' and return "
+                   "zeroed memory",
+                   allocated->name, named, named);
+          error_reporter_add_error(checker->error_reporter, ERROR_SEMANTIC,
+                                   expression->location, error_msg);
+          error_reporter_set_last_code(checker->error_reporter, "L0001");
+          checker->has_error = 1;
+          return NULL;
+        }
+      }
+    }
     if (!new_expr || !new_expr->type_name) {
       type_checker_set_error_at_location(checker, expression->location,
                                          "Invalid 'new' expression");

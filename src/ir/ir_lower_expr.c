@@ -1576,6 +1576,29 @@ int ir_lower_call_expression(IRLoweringContext *context,
     return ir_lower_tile_call(context, function, expression, out_value);
   }
 
+  if (call->argument_count == 1 && strcmp(call->function_name, "free") == 0) {
+    Type *freed = ir_infer_expression_type(context, call->arguments[0]);
+    const TypeMetaLayout *layout =
+        freed && freed->kind == TYPE_POINTER && freed->base_type
+            ? freed->base_type->meta_layout
+            : NULL;
+    if (layout && layout->allocator) {
+      if (!layout->releaser) {
+        ir_set_error(context,
+                     "'%s' comes from the allocator '%s', and its layout names "
+                     "no function to release it",
+                     freed->base_type->name, layout->allocator);
+        return 0;
+      }
+      char *written = call->function_name;
+      call->function_name = (char *)layout->releaser;
+      int released =
+          ir_lower_call_expression(context, function, expression, out_value);
+      call->function_name = written;
+      return released;
+    }
+  }
+
   if (strcmp(call->function_name, "layout_copy") == 0 &&
       call->argument_count == 2) {
     *out_value = ir_operand_int(0);
@@ -3533,7 +3556,15 @@ static int ir_lower_new_expression(IRLoweringContext *context,
       }
     }
 
-    if (ir_lower_live_heap_type(element)) {
+    if (element->meta_layout && element->meta_layout->allocator) {
+      if (!ir_emit_layout_allocation(context, function, element, &bytes,
+                                     &pointer, expression->location)) {
+        ir_operand_destroy(&count);
+        ir_operand_destroy(&bytes);
+        ir_operand_destroy(&pointer);
+        return 0;
+      }
+    } else if (ir_lower_live_heap_type(element)) {
       if (!ir_lower_live_new(context, function, &pointer, &bytes, element,
                              &count, expression->location)) {
         ir_operand_destroy(&count);
@@ -3643,6 +3674,18 @@ static int ir_lower_new_expression(IRLoweringContext *context,
   IROperand destination = ir_operand_none();
   if (!ir_make_temp_operand(context, &destination)) {
     return 0;
+  }
+
+  if (allocated_type && allocated_type->meta_layout &&
+      allocated_type->meta_layout->allocator) {
+    IROperand bytes = ir_operand_int(allocation_size);
+    if (!ir_emit_layout_allocation(context, function, allocated_type, &bytes,
+                                   &destination, expression->location)) {
+      ir_operand_destroy(&destination);
+      return 0;
+    }
+    *out_value = destination;
+    return 1;
   }
 
   if (ir_lower_live_heap_type(allocated_type)) {

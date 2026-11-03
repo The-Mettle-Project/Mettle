@@ -1,0 +1,62 @@
+import "std/io";
+import "std/layout";
+import "std/mem";
+
+var taken: int64 = 0;
+var returned: int64 = 0;
+var last_align: int64 = 0;
+
+fn pool_take(bytes: int64, align: int64) -> rawptr {
+  taken = taken + bytes;
+  last_align = align;
+  return calloc(bytes, 1);
+}
+
+fn pool_give(p: rawptr) {
+  returned = returned + 1;
+  free(p);
+}
+
+@allocate_with(pool_take, pool_give) struct Node {
+  value: int64;
+  next: Node*;
+}
+
+@soa @allocate_with(pool_take, pool_give) struct Sample {
+  a: int64;
+  b: int32;
+}
+
+fn check(name: string, got: int64, want: int64) -> int32 {
+  if (got != want) {
+    println("{name}: got {got}, want {want}");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  var n: Node* = new Node;
+  bad = bad + check("taken one", taken, 16);
+  bad = bad + check("alignment", last_align, 8);
+  bad = bad + check("zeroed", n.value, 0);
+  n.value = 9;
+  bad = bad + check("usable", n.value, 9);
+  free(n);
+  bad = bad + check("released", returned, 1);
+
+  taken = 0;
+  var s: Sample[] = new Sample[10];
+  bad = bad + check("columns taken", taken, 8 * 10 + 4 * 10 + 0);
+  s[9].b = 4;
+  s[0].a = 5;
+  bad = bad + check("columns", (int64)s[9].b + s[0].a, 9);
+
+  for sample in s {
+    bad = bad + check("for over columns", sample.a + 0 * (int64)sample.b >= 0, 1);
+  }
+
+  if (bad == 0) { println("ok"); }
+  return bad;
+}

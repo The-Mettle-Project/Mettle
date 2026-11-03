@@ -57,6 +57,7 @@ typedef struct TypeMetaLayout {
   TypeMetaPlace *places;
   size_t place_count;
   const char *allocator;
+  const char *releaser;
   const char *written_by;
 } TypeMetaLayout;
 

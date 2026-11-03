@@ -666,6 +666,9 @@ static TypeMetaLayout *decode_layout(IRInterpMachine *machine,
   char *allocator =
       read_text(machine, address + field_at(layout_type, "allocator"));
   layout->allocator = allocator && *allocator ? allocator : NULL;
+  char *releaser =
+      read_text(machine, address + field_at(layout_type, "releaser"));
+  layout->releaser = releaser && *releaser ? releaser : NULL;
   layout->written_by = written_by;
   return layout;
 }

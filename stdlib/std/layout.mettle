@@ -19,6 +19,7 @@ export struct Layout {
   regions: Region[];
   places: Place[];
   allocator: string;
+  releaser: string;
 }
 
 fn align_to(value: int64, alignment: int64) -> int64 {
@@ -84,6 +85,7 @@ fn sort_fields_by_align(t: TypeInfo, order: int64[]) {
     out.places[r].region = r;
   }
   out.allocator = l.allocator;
+  out.releaser = l.releaser;
   return out;
 }
 
@@ -123,6 +125,7 @@ fn name_listed(name: string, names: string[]) -> bool {
     region = region + 1;
   }
   out.allocator = l.allocator;
+  out.releaser = l.releaser;
   return out;
 }
 
@@ -145,6 +148,7 @@ fn name_listed(name: string, names: string[]) -> bool {
   out.regions[0].stride = align_to(offset, widest);
   out.regions[0].align = widest;
   out.allocator = l.allocator;
+  out.releaser = l.releaser;
   return out;
 }
 
@@ -204,5 +208,6 @@ fn parse_small(text: string) -> int64 {
 @layout export fn allocate_with(t: TypeInfo, l: Layout, args: string[]) -> Layout {
   var out: Layout = l;
   out.allocator = args[0];
+  out.releaser = args[1];
   return out;
 }
