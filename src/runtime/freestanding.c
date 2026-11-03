@@ -497,6 +497,8 @@ static unsigned long long mt_environment_append_entry(
 #define MT_CREATE_ALWAYS 2u
 #define MT_OPEN_ALWAYS 4u
 #define MT_FILE_ATTRIBUTE_NORMAL 0x00000080u
+#define MT_FILE_FLAG_DELETE_ON_CLOSE 0x04000000u
+#define MT_FILE_SHARE_DELETE 0x00000004u
 #define MT_FILE_END 2u
 
 typedef struct MtProcessInfo {
@@ -1461,6 +1463,8 @@ static mt_u16 *mt_widen_path(const char *path) {
 void *fopen(const char *path, const char *mode) {
   mt_u32 access = MT_GENERIC_READ;
   mt_u32 creation = MT_OPEN_EXISTING;
+  mt_u32 attributes = MT_FILE_ATTRIBUTE_NORMAL;
+  mt_u32 sharing = MT_FILE_SHARE_READ;
   int append = 0;
   if (!path || !mode || !mode[0]) {
     return MT_NULL;
@@ -1476,14 +1480,17 @@ void *fopen(const char *path, const char *mode) {
   for (mt_size i = 1; mode[i]; i++) {
     if (mode[i] == '+') {
       access = MT_GENERIC_READ | MT_GENERIC_WRITE;
+    } else if (mode[i] == 'D') {
+      attributes |= MT_FILE_FLAG_DELETE_ON_CLOSE;
+      sharing |= MT_FILE_SHARE_DELETE;
     }
   }
   mt_u16 *wide_path = mt_widen_path(path);
   if (!wide_path) {
     return MT_NULL;
   }
-  void *handle = CreateFileW(wide_path, access, MT_FILE_SHARE_READ, MT_NULL,
-                             creation, MT_FILE_ATTRIBUTE_NORMAL, MT_NULL);
+  void *handle = CreateFileW(wide_path, access, sharing, MT_NULL,
+                             creation, attributes, MT_NULL);
   free(wide_path);
   if (handle == MT_INVALID_HANDLE) {
     return MT_NULL;

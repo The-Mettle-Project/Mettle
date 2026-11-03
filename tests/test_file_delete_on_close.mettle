@@ -1,0 +1,27 @@
+import "std/io";
+
+extern fn remove(path: cstring) -> int32 = "remove";
+
+fn exists(path: cstring) -> int32 {
+  var f: cstring = fopen(path, "rb");
+  if (f == (cstring)0) { return 0; }
+  fclose(f);
+  return 1;
+}
+
+fn main() -> int32 {
+  var kept: cstring = fopen("delete_on_close_kept.bin", "wb");
+  if (kept == (cstring)0) { return 1; }
+  fclose(kept);
+  if (exists("delete_on_close_kept.bin") == 0) { return 2; }
+  remove("delete_on_close_kept.bin");
+
+  var gone: cstring = fopen("delete_on_close_gone.bin", "wbD");
+  if (gone == (cstring)0) { return 3; }
+  fclose(gone);
+  if (exists("delete_on_close_gone.bin") != 0) {
+    remove("delete_on_close_gone.bin");
+    return 4;
+  }
+  return 0;
+}

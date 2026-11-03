@@ -1977,6 +1977,7 @@ $cases = @(
   @{ Name = "string_cstring_coercions"; Path = "tests/test_string_cstring_coercions.mettle"; ShouldSucceed = $true },
   @{ Name = "std_conv_format_i64"; Path = "tests/test_std_conv_format_i64.mettle"; ShouldSucceed = $true },
   @{ Name = "file_seek64"; Path = "tests/test_file_seek64.mettle"; ShouldSucceed = $true },
+  @{ Name = "file_delete_on_close"; Path = "tests/test_file_delete_on_close.mettle"; ShouldSucceed = $true },
 
   # ABI tests (MS x64 on Windows; patterns may need adjustment for SysV/Linux)
   @{
