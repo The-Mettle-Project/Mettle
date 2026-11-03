@@ -284,6 +284,8 @@ typedef struct {
   IRTempValueMap decl_types;
   IRTempValueMap addr_taken;
   IRTempValueMap monotone;
+  IRTempValueMap counter_lo;
+  IRTempValueMap counter_hi;
   IRTempValueMap label_guard;
   IRTempValueMap unique_def;
   IRTempValueMap label_refs;
@@ -434,6 +436,7 @@ int ir_hoist_load_bases_pass(IRFunction *function, int *changed);
 int ir_hoist_descriptor_loads_pass(IRFunction *function, int *changed);
 int ir_hoist_invariant_assigns_pass(IRFunction *function, int *changed);
 int ir_hoist_row_pointers_pass(IRFunction *function, int *changed);
+int ir_merge_row_pointers_pass(IRFunction *function, int *changed);
 int ir_hoist_invariant_arith_pass(IRFunction *function, int *changed);
 int ir_if_convert_accumulate_pass(IRFunction *function, int *changed);
 int ir_normalize_scan_from_first_pass(IRFunction *function, int *changed);

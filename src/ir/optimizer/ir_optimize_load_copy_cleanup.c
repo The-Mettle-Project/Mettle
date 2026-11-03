@@ -1900,6 +1900,372 @@ static int ir_row_hoist_shift(IRRowPass *pass, size_t s, size_t *out_inserted) {
   return 1;
 }
 
+#define IR_ROW_MERGE_MAX 64
+#define IR_ROW_LINEAR_DEPTH 8
+
+typedef struct {
+  const IROperand *base;
+  long long coef;
+  long long cst;
+  size_t first_at;
+} IRRowLinear;
+
+typedef struct {
+  size_t at;
+  const char *name;
+  const IROperand *array;
+  IRRowLinear row;
+  long long bias;
+  long long shift;
+  int leader;
+  int mergeable;
+} IRRowMember;
+
+static const IRInstruction *ir_row_merge_single_def(const IRFunction *function,
+                                                    const IROperand *operand) {
+  const IRInstruction *found = NULL;
+
+  if (operand->kind != IR_OPERAND_TEMP && operand->kind != IR_OPERAND_SYMBOL) {
+    return NULL;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (ir_instruction_writes_destination(in) &&
+        in->op != IR_OP_DECLARE_LOCAL && ir_operand_same(&in->dest, operand)) {
+      if (found) {
+        return NULL;
+      }
+      found = in;
+    }
+  }
+  return found;
+}
+
+static int ir_row_merge_fits_int32(long long coef, long long cst,
+                                   const IRIntRange *range) {
+  long long a = coef * range->lo + cst;
+  long long b = coef * range->hi + cst;
+  return a >= -2147483648LL && a <= 2147483647LL && b >= -2147483648LL &&
+         b <= 2147483647LL;
+}
+
+static int ir_row_merge_step(const IRInstruction *def, IRRowLinear *form) {
+  long long value;
+
+  if (def->rhs.kind != IR_OPERAND_INT || !def->text) {
+    return 0;
+  }
+  value = def->rhs.int_value;
+  if (value < -1048576 || value > 1048576) {
+    return 0;
+  }
+  if (strcmp(def->text, "+") == 0) {
+    form->cst += value;
+  } else if (strcmp(def->text, "-") == 0) {
+    form->cst -= value;
+  } else if (strcmp(def->text, "*") == 0) {
+    form->coef *= value;
+    form->cst *= value;
+  } else if (strcmp(def->text, "<<") == 0 && value >= 0 && value < 20) {
+    form->coef <<= value;
+    form->cst *= (1LL << value);
+  } else {
+    return 0;
+  }
+  return 1;
+}
+
+static int ir_row_merge_dest_is_wide(const IRFunction *function,
+                                     const IROperand *dest) {
+  const IRInstruction *declaration;
+
+  if (dest->kind == IR_OPERAND_TEMP) {
+    return 1;
+  }
+  declaration = ir_function_find_declaration(function, dest->name, 1);
+  return declaration && declaration->text &&
+         (strcmp(declaration->text, "int32") == 0 ||
+          strcmp(declaration->text, "int64") == 0);
+}
+
+static void ir_row_merge_linear(const IRFunction *function,
+                                IRValueRangeCtx *ctx, size_t at,
+                                const IROperand *operand, int depth,
+                                IRRowLinear *out, IRIntRange *range) {
+  const IRInstruction *def =
+      depth > 0 ? ir_row_merge_single_def(function, operand) : NULL;
+  IRRowLinear form;
+
+  out->base = operand;
+  out->coef = 1;
+  out->cst = 0;
+  out->first_at = at;
+  if (def && ir_row_merge_dest_is_wide(function, &def->dest)) {
+    size_t def_at = (size_t)(def - function->instructions);
+
+    if (def->op == IR_OP_ASSIGN ||
+        (def->op == IR_OP_CAST && def->text &&
+         (strcmp(def->text, "int32") == 0 ||
+          strcmp(def->text, "int64") == 0))) {
+      ir_row_merge_linear(function, ctx, at, &def->lhs, depth - 1, out, range);
+      if (def_at < out->first_at) {
+        out->first_at = def_at;
+      }
+      return;
+    }
+    if (def->op == IR_OP_BINARY && !def->is_float && !def->is_unsigned) {
+      ir_row_merge_linear(function, ctx, at, &def->lhs, depth - 1, &form,
+                          range);
+      if (ir_row_merge_step(def, &form) &&
+          ir_row_merge_fits_int32(form.coef, form.cst, range)) {
+        *out = form;
+        if (def_at < out->first_at) {
+          out->first_at = def_at;
+        }
+        return;
+      }
+    }
+  }
+  out->base = operand;
+  out->coef = 1;
+  out->cst = 0;
+  out->first_at = at;
+  ir_value_range_of(ctx, at, operand, range);
+}
+
+static int ir_row_merge_read_shape_ok(const IRInstruction *in,
+                                      const IROperand *row) {
+  if (in->op == IR_OP_DECLARE_LOCAL) {
+    return 1;
+  }
+  if (ir_operand_same(&in->dest, row) || ir_operand_same(&in->rhs, row)) {
+    return 0;
+  }
+  for (size_t a = 0; a < in->argument_count; a++) {
+    if (ir_operand_same(&in->arguments[a], row)) {
+      return 0;
+    }
+  }
+  if (!ir_operand_same(&in->lhs, row)) {
+    return 1;
+  }
+  return in->op == IR_OP_BINARY && in->text && strcmp(in->text, "+") == 0 &&
+         in->dest.kind == IR_OPERAND_TEMP;
+}
+
+static int ir_row_merge_describe(const IRFunction *function,
+                                 IRValueRangeCtx *ctx, size_t at,
+                                 IRRowMember *member) {
+  const IRInstruction *add = &function->instructions[at];
+  const IROperand *index = &add->rhs;
+  const IRInstruction *def = ir_row_merge_single_def(function, index);
+  IRIntRange range;
+
+  member->at = at;
+  member->name = add->dest.name;
+  member->array = &add->lhs;
+  member->bias = 0;
+  member->shift = 0;
+  member->leader = 0;
+  member->mergeable = 1;
+  if (add->lhs.kind != IR_OPERAND_SYMBOL ||
+      (index->kind != IR_OPERAND_TEMP && index->kind != IR_OPERAND_SYMBOL)) {
+    return 0;
+  }
+  if (def && def->op == IR_OP_BINARY && def->text &&
+      strcmp(def->text, "<<") == 0 && def->rhs.kind == IR_OPERAND_INT) {
+    member->shift = def->rhs.int_value;
+    index = &def->lhs;
+    def = ir_row_merge_single_def(function, index);
+  }
+  if (def && def->op == IR_OP_BINARY && def->text &&
+      strcmp(def->text, "+") == 0 && def->rhs.kind == IR_OPERAND_INT &&
+      index->kind == IR_OPERAND_TEMP && index->name &&
+      strncmp(index->name, "__rowbias_", 10) == 0) {
+    member->bias = def->rhs.int_value;
+    index = &def->lhs;
+  }
+  ir_row_merge_linear(function, ctx, at, index, IR_ROW_LINEAR_DEPTH,
+                      &member->row, &range);
+  return 1;
+}
+
+static int ir_row_merge_same_block(const IRFunction *function, size_t lo,
+                                   size_t hi) {
+  for (size_t i = lo; i < hi; i++) {
+    IROpcode op = function->instructions[i].op;
+    if (op == IR_OP_LABEL || op == IR_OP_JUMP || op == IR_OP_BRANCH_ZERO ||
+        op == IR_OP_BRANCH_EQ || op == IR_OP_RETURN) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ir_row_merge_no_write_between(const IRFunction *function, size_t lo,
+                                         size_t hi, const IROperand *operand) {
+  for (size_t i = lo; i <= hi; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (ir_instruction_writes_destination(in) &&
+        in->op != IR_OP_DECLARE_LOCAL && ir_operand_same(&in->dest, operand)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ir_row_merge_label_entered_later(const IRFunction *function,
+                                            size_t lo, size_t hi) {
+  for (size_t l = lo; l <= hi; l++) {
+    const IRInstruction *label = &function->instructions[l];
+    if (label->op != IR_OP_LABEL || !label->text) {
+      continue;
+    }
+    for (size_t i = hi + 1; i < function->instruction_count; i++) {
+      const IRInstruction *in = &function->instructions[i];
+      if (in->op != IR_OP_LABEL && in->text &&
+          strcmp(in->text, label->text) == 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int ir_row_merge_same_row(const IRFunction *function,
+                                 const IRRowMember *a, const IRRowMember *b) {
+  size_t lo = a->row.first_at < b->row.first_at ? a->row.first_at
+                                                : b->row.first_at;
+  size_t hi = b->at;
+
+  return ir_operand_same(a->array, b->array) && a->shift == b->shift &&
+         a->row.coef == b->row.coef &&
+         ir_operand_same(a->row.base, b->row.base) &&
+         ir_row_merge_same_block(function, a->at, b->at) &&
+         ir_row_merge_no_write_between(function, lo, hi, a->array) &&
+         ir_row_merge_no_write_between(function, lo, hi, a->row.base) &&
+         !ir_row_merge_label_entered_later(function, lo, hi);
+}
+
+static long long ir_row_merge_offset(const IRRowMember *member) {
+  return (member->row.cst + member->bias) * (1LL << member->shift);
+}
+
+static int ir_row_merge_rewrite_use(IRFunction *function, size_t at,
+                                    const char *leader, long long displacement) {
+  IRInstruction *use = &function->instructions[at];
+  IRInstruction shift = {0};
+  char raw[48];
+  static int raw_counter;
+
+  ir_operand_destroy(&use->lhs);
+  use->lhs = ir_operand_symbol(leader);
+  if (displacement == 0) {
+    return use->lhs.name != NULL;
+  }
+  snprintf(raw, sizeof(raw), "__rowraw_%d", raw_counter++);
+  shift.op = IR_OP_BINARY;
+  shift.location = use->location;
+  shift.text = mettle_strdup("+");
+  shift.dest = use->dest;
+  shift.lhs = ir_operand_temp(raw);
+  shift.rhs = ir_operand_int(displacement);
+  use->dest = ir_operand_temp(raw);
+  if (!shift.text || !shift.lhs.name || !use->dest.name) {
+    ir_instruction_destroy_storage(&shift);
+    return 0;
+  }
+  return ir_instruction_insert_move(function, at + 1, &shift);
+}
+
+static int ir_row_merge_member(IRFunction *function, const IRRowMember *member,
+                               const IRRowMember *leader, int *changed) {
+  long long displacement =
+      ir_row_merge_offset(member) - ir_row_merge_offset(leader);
+  IROperand row = ir_operand_symbol(member->name);
+  const char *leader_name = leader->name;
+
+  if (!row.name || displacement < -1073741824LL ||
+      displacement > 1073741824LL) {
+    ir_operand_destroy(&row);
+    return row.name != NULL;
+  }
+  for (size_t i = function->instruction_count; i-- > 0;) {
+    if (i != member->at && ir_operand_same(&function->instructions[i].lhs, &row) &&
+        function->instructions[i].op != IR_OP_DECLARE_LOCAL &&
+        !ir_row_merge_rewrite_use(function, i, leader_name, displacement)) {
+      ir_operand_destroy(&row);
+      return 0;
+    }
+  }
+  ir_operand_destroy(&row);
+  ir_instruction_make_nop(&function->instructions[member->at]);
+  *changed = 1;
+  return 1;
+}
+
+static size_t ir_row_merge_collect(const IRFunction *function,
+                                   IRValueRangeCtx *ctx, IRRowMember *members) {
+  size_t count = 0;
+
+  for (size_t i = 0; i < function->instruction_count && count < IR_ROW_MERGE_MAX;
+       i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_BINARY && in->dest.kind == IR_OPERAND_SYMBOL &&
+        in->dest.name && strncmp(in->dest.name, "__rowp_", 7) == 0 &&
+        in->text && strcmp(in->text, "+") == 0 &&
+        ir_row_merge_describe(function, ctx, i, &members[count])) {
+      count++;
+    }
+  }
+  return count;
+}
+
+static void ir_row_merge_check_uses(const IRFunction *function,
+                                    IRRowMember *member) {
+  IROperand row = ir_operand_symbol(member->name);
+
+  for (size_t i = 0; row.name && i < function->instruction_count; i++) {
+    if (i != member->at &&
+        !ir_row_merge_read_shape_ok(&function->instructions[i], &row)) {
+      member->mergeable = 0;
+      break;
+    }
+  }
+  ir_operand_destroy(&row);
+}
+
+int ir_merge_row_pointers_pass(IRFunction *function, int *changed) {
+  IRRowMember members[IR_ROW_MERGE_MAX];
+  IRValueRangeCtx ctx;
+  size_t count;
+  int ok = 1;
+
+  if (!function || function->instruction_count < 4) {
+    return 1;
+  }
+  ir_value_range_ctx_init(&ctx, function);
+  count = ir_row_merge_collect(function, &ctx, members);
+  for (size_t m = 0; m < count; m++) {
+    ir_row_merge_check_uses(function, &members[m]);
+  }
+  for (size_t m = count; ok && m-- > 1;) {
+    IRRowMember *member = &members[m];
+    if (!member->mergeable || member->leader) {
+      continue;
+    }
+    for (size_t l = 0; l < m; l++) {
+      if (ir_row_merge_same_row(function, &members[l], member)) {
+        members[l].leader = 1;
+        ok = ir_row_merge_member(function, member, &members[l], changed);
+        break;
+      }
+    }
+  }
+  ir_value_range_ctx_destroy(&ctx);
+  return ok;
+}
+
 int ir_hoist_row_pointers_pass(IRFunction *function, int *changed) {
   IRRowCacheEntry cache[IR_ROW_MAX_CACHE];
   IRRowPass pass;

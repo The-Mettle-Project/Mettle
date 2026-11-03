@@ -130,6 +130,8 @@ void ir_value_range_ctx_destroy(IRValueRangeCtx *ctx) {
   ir_temp_value_map_destroy(&ctx->decl_types);
   ir_temp_value_map_destroy(&ctx->addr_taken);
   ir_temp_value_map_destroy(&ctx->monotone);
+  ir_temp_value_map_destroy(&ctx->counter_lo);
+  ir_temp_value_map_destroy(&ctx->counter_hi);
   ir_temp_value_map_destroy(&ctx->label_guard);
   ir_temp_value_map_destroy(&ctx->unique_def);
   ir_temp_value_map_destroy(&ctx->label_refs);
@@ -219,6 +221,8 @@ static int vr_ctx_build(IRValueRangeCtx *ctx) {
   if (!ir_temp_value_map_init(&ctx->decl_types) ||
       !ir_temp_value_map_init(&ctx->addr_taken) ||
       !ir_temp_value_map_init(&ctx->monotone) ||
+      !ir_temp_value_map_init(&ctx->counter_lo) ||
+      !ir_temp_value_map_init(&ctx->counter_hi) ||
       !ir_temp_value_map_init(&ctx->label_guard) ||
       !ir_temp_value_map_init(&ctx->unique_def) ||
       !ir_temp_value_map_init(&ctx->label_refs)) {
@@ -641,6 +645,170 @@ static int vr_symbol_is_monotone_counter(IRValueRangeCtx *ctx,
   return result;
 }
 
+static const IRInstruction *vr_counter_next_real(const IRFunction *fn,
+                                                 size_t at) {
+  for (size_t i = at + 1; i < fn->instruction_count; i++) {
+    if (fn->instructions[i].op != IR_OP_NOP) {
+      return &fn->instructions[i];
+    }
+  }
+  return NULL;
+}
+
+static int vr_counter_step_of(const IRFunction *fn, const IRInstruction *write,
+                              const char *symbol, long long *step) {
+  const IRInstruction *add = write;
+
+  if (write->op == IR_OP_ASSIGN) {
+    add = NULL;
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      const IRInstruction *in = &fn->instructions[i];
+      if (ir_instruction_writes_destination(in) &&
+          ir_operand_same(&in->dest, &write->lhs)) {
+        if (add && in->op != IR_OP_DECLARE_LOCAL) {
+          return 0;
+        }
+        if (in->op != IR_OP_DECLARE_LOCAL) {
+          add = in;
+        }
+      }
+    }
+  }
+  if (!add || add->op != IR_OP_BINARY || !add->text ||
+      strcmp(add->text, "+") != 0 || add->rhs.kind != IR_OPERAND_INT ||
+      add->rhs.int_value <= 0 || add->lhs.kind != IR_OPERAND_SYMBOL ||
+      strcmp(add->lhs.name, symbol) != 0) {
+    return 0;
+  }
+  *step = add->rhs.int_value;
+  return 1;
+}
+
+static int vr_counter_init_of(const IRFunction *fn, const IRInstruction *write,
+                              long long *init) {
+  if (write->op != IR_OP_ASSIGN) {
+    return 0;
+  }
+  if (write->lhs.kind == IR_OPERAND_INT) {
+    *init = write->lhs.int_value;
+    return 1;
+  }
+  const IRInstruction *def = NULL;
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op != IR_OP_DECLARE_LOCAL && ir_instruction_writes_destination(in) &&
+        ir_operand_same(&in->dest, &write->lhs)) {
+      if (def) {
+        return 0;
+      }
+      def = in;
+    }
+  }
+  if (!def || def->op != IR_OP_ASSIGN || def->lhs.kind != IR_OPERAND_INT) {
+    return 0;
+  }
+  *init = def->lhs.int_value;
+  return 1;
+}
+
+static int vr_counter_guard_limit(const IRFunction *fn, const char *header,
+                                  const char *symbol, long long *limit) {
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *label = &fn->instructions[i];
+    const IRInstruction *compare;
+    const IRInstruction *branch;
+
+    if (label->op != IR_OP_LABEL || !label->text ||
+        strcmp(label->text, header) != 0) {
+      continue;
+    }
+    compare = vr_counter_next_real(fn, i);
+    branch = compare ? vr_counter_next_real(
+                           fn, (size_t)(compare - fn->instructions))
+                     : NULL;
+    if (!branch || compare->op != IR_OP_BINARY || !compare->text ||
+        compare->lhs.kind != IR_OPERAND_SYMBOL ||
+        strcmp(compare->lhs.name, symbol) != 0 ||
+        compare->rhs.kind != IR_OPERAND_INT ||
+        branch->op != IR_OP_BRANCH_ZERO ||
+        !ir_operand_same(&branch->lhs, &compare->dest)) {
+      return 0;
+    }
+    if (strcmp(compare->text, "<") == 0) {
+      *limit = compare->rhs.int_value - 1;
+      return 1;
+    }
+    if (strcmp(compare->text, "<=") == 0) {
+      *limit = compare->rhs.int_value;
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+static int vr_counter_bounds_scan(IRValueRangeCtx *ctx, const char *symbol,
+                                  IRIntRange *bounds) {
+  const IRFunction *fn = ctx->function;
+  const IRInstruction *writes[2];
+  const IRInstruction *jump;
+  size_t count = 0;
+  long long init = 0;
+  long long step = 0;
+  long long limit = 0;
+  IROperand target = ir_operand_symbol(symbol);
+
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL ||
+        !ir_instruction_writes_destination(in) ||
+        !ir_operand_same(&in->dest, &target)) {
+      continue;
+    }
+    if (count == 2) {
+      ir_operand_destroy(&target);
+      return 0;
+    }
+    writes[count++] = in;
+  }
+  ir_operand_destroy(&target);
+  if (count != 2 || vr_symbol_address_taken(ctx, symbol) ||
+      !vr_counter_init_of(fn, writes[0], &init) ||
+      !vr_counter_step_of(fn, writes[1], symbol, &step)) {
+    return 0;
+  }
+  jump = vr_counter_next_real(fn, (size_t)(writes[1] - fn->instructions));
+  if (!jump || jump->op != IR_OP_JUMP || !jump->text ||
+      !vr_counter_guard_limit(fn, jump->text, symbol, &limit) ||
+      limit > 2147483647LL - step || init > limit) {
+    return 0;
+  }
+  bounds->lo = init;
+  bounds->hi = limit + step;
+  return 1;
+}
+
+static int vr_counter_bounds(IRValueRangeCtx *ctx, const char *symbol,
+                             IRIntRange *bounds) {
+  const IROperand *lo = ir_temp_value_map_lookup(&ctx->counter_lo, symbol);
+  const IROperand *hi = ir_temp_value_map_lookup(&ctx->counter_hi, symbol);
+  IROperand lo_value;
+  IROperand hi_value;
+  int found;
+
+  if (lo && hi && lo->kind == IR_OPERAND_INT && hi->kind == IR_OPERAND_INT) {
+    bounds->lo = lo->int_value;
+    bounds->hi = hi->int_value;
+    return bounds->lo <= bounds->hi;
+  }
+  found = vr_counter_bounds_scan(ctx, symbol, bounds);
+  lo_value = ir_operand_int(found ? bounds->lo : 1);
+  hi_value = ir_operand_int(found ? bounds->hi : 0);
+  ir_temp_value_map_set(&ctx->counter_lo, symbol, &lo_value);
+  ir_temp_value_map_set(&ctx->counter_hi, symbol, &hi_value);
+  return found;
+}
+
 static int vr_add_ok(long long a, long long b, long long *out) {
   if ((b > 0 && a > VR_MAX - b) || (b < 0 && a < VR_MIN - b)) {
     return 0;
@@ -895,6 +1063,11 @@ static void vr_operand_range(IRValueRangeCtx *ctx, size_t at,
   if (out->lo < 0 && vr_symbol_is_monotone_counter(ctx, operand->name)) {
     IRIntRange nonneg = {0, VR_MAX};
     vr_intersect(out, &nonneg);
+  }
+
+  IRIntRange counter;
+  if (vr_counter_bounds(ctx, operand->name, &counter)) {
+    vr_intersect(out, &counter);
   }
 
   vr_apply_guards(ctx, at, operand->name, depth, out);

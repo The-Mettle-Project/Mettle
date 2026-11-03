@@ -2149,6 +2149,17 @@ $cases = @(
     # scale by the same exact value and round once. The check compares the
     # folded divide against a multiply the fold cannot reach, over
     # subnormals, both zeros, both infinities and NaN.
+    Name          = "row_pointers"
+    Path          = "tests/row_pointers_check.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release")
+  },
+  @{
+    Name          = "row_pointers_debug"
+    Path          = "tests/row_pointers_check.mettle"
+    ShouldSucceed = $true
+  },
+  @{
     Name          = "divide_paths"
     Path          = "tests/divide_paths_check.mettle"
     ShouldSucceed = $true

@@ -1,0 +1,81 @@
+import "std/io";
+import "std/mem";
+
+const ROWS: int32 = 8;
+const COLS: int32 = 16;
+
+@noinline fn stencil(src: int64*) -> int64 {
+  var total: int64 = 0;
+  var r: int32 = 1;
+  while (r < ROWS - 1) {
+    var up: int32 = (r - 1) * COLS;
+    var mid: int32 = r * COLS;
+    var dn: int32 = (r + 1) * COLS;
+    var i: int32 = 1;
+    while (i < COLS - 1) {
+      total += src[up + i - 1] + src[up + i] + src[mid + i + 1] + src[dn + i];
+      i += 1;
+    }
+    r += 1;
+  }
+  return total;
+}
+
+@noinline fn stencil_expected() -> int64 {
+  var total: int64 = 0;
+  var r: int32 = 1;
+  while (r < ROWS - 1) {
+    var i: int32 = 1;
+    while (i < COLS - 1) {
+      var a: int64 = (int64)(r - 1) * (int64)COLS + (int64)i - 1;
+      var b: int64 = a + 1;
+      var c: int64 = (int64)r * (int64)COLS + (int64)i + 1;
+      var d: int64 = (int64)(r + 1) * (int64)COLS + (int64)i;
+      total += a * 3 + b * 3 + c * 3 + d * 3;
+      i += 1;
+    }
+    r += 1;
+  }
+  return total;
+}
+
+@noinline fn runtime_rows(src: int64*, stride: int32, rows: int32) -> int64 {
+  var total: int64 = 0;
+  var r: int32 = 1;
+  while (r < rows) {
+    var a: int32 = (r - 1) * stride;
+    var b: int32 = r * stride;
+    var i: int32 = 0;
+    while (i < stride) {
+      total += src[a + i] * 2 + src[b + i];
+      i += 1;
+    }
+    r += 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var cells: int64 = (int64)ROWS * (int64)COLS;
+  var src: int64* = (int64*)malloc(cells * 8);
+  var k: int64 = 0;
+  while (k < cells) {
+    src[k] = k * 3;
+    k += 1;
+  }
+  var fails: int32 = 0;
+  if (stencil(src) != stencil_expected()) {
+    println("FAIL stencil");
+    fails += 1;
+  }
+  if (runtime_rows(src, 4, 3) != 348) {
+    println("FAIL runtime_rows");
+    fails += 1;
+  }
+  free(src);
+  if (fails == 0) {
+    println("row_pointers OK");
+    return 0;
+  }
+  return 1;
+}
