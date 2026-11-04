@@ -1756,6 +1756,51 @@ int mir_rewrite_string_concat_calls(IRFunction *ir_function) {
   return 1;
 }
 
+int mir_route_global_call_results(CodeGenerator *generator,
+                                  IRFunction *ir_function) {
+  static unsigned counter;
+  if (!generator || !ir_function) {
+    return 1;
+  }
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    IRInstruction *in = &ir_function->instructions[i];
+    IRInstruction declare = {0};
+    IRInstruction assign = {0};
+    const CgSym *global;
+    char local_name[48];
+    if ((in->op != IR_OP_CALL && in->op != IR_OP_CALL_INDIRECT) ||
+        !ir_operand_is_symbol(&in->dest) ||
+        !mir_name_is_global_aggregate(generator, ir_function, in->dest.name)) {
+      continue;
+    }
+    global = code_generator_lookup_symbol(generator, in->dest.name);
+    if (!global || !global->type || !global->type->name) {
+      continue;
+    }
+    snprintf(local_name, sizeof(local_name), "__global_ret_%u", counter++);
+    assign.op = IR_OP_ASSIGN;
+    assign.location = in->location;
+    assign.dest = ir_operand_symbol(in->dest.name);
+    assign.lhs = ir_operand_symbol(local_name);
+    ir_operand_destroy(&in->dest);
+    in->dest = ir_operand_symbol(local_name);
+    declare.op = IR_OP_DECLARE_LOCAL;
+    declare.location = in->location;
+    declare.dest = ir_operand_symbol(local_name);
+    declare.text = mettle_strdup(global->type->name);
+    if (!ir_function_insert_instruction(ir_function, i + 1, &assign) ||
+        !ir_function_insert_instruction(ir_function, i, &declare)) {
+      ir_instruction_destroy(&assign);
+      ir_instruction_destroy(&declare);
+      return 0;
+    }
+    ir_instruction_destroy(&assign);
+    ir_instruction_destroy(&declare);
+    i += 2;
+  }
+  return 1;
+}
+
 static int mir_gate_control(CodeGenerator *generator,
                        const IRFunction *ir_function,
                        const IRInstruction *in, size_t i,
@@ -2725,7 +2770,8 @@ static int mir_indirect_is_whole_struct_assign(CodeGenerator *generator,
   int lea_able =
       mir_operand_struct_home_size(generator, ir_function, &in->dest) > 0 ||
       (ir_operand_is_symbol(&in->dest) &&
-       mir_name_is_global_aggregate(generator, ir_function, in->dest.name));
+       (mir_name_is_global_aggregate(generator, ir_function, in->dest.name) ||
+        mir_name_is_indirect_param(generator, ir_function, in->dest.name)));
 
   return in->op == IR_OP_ASSIGN && (o == &in->dest || o == &in->lhs) &&
          lea_able &&
@@ -4417,6 +4463,24 @@ static int mir_lower_assign(MirFunction *fn, CodeGenerator *g,
                        mir_op_symbol(in->dest.name), mir_op_none(), 8,
                        is_extern, 0) ||
             !mir_emit_struct_copy(fn, db, sb, gsz)) {
+          return 0;
+        }
+        return 1;
+      }
+      if (ir_operand_is_symbol(&in->dest) &&
+          mir_name_is_indirect_param(g, airf, in->dest.name)) {
+        const MtlcType *pt =
+            mir_local_or_param_type(g, airf, in->dest.name, NULL);
+        int psz = pt ? (int)code_generator_abi_type_size(pt) : 0;
+        MirOperand pointer = mir_value_operand(fn, g, ctx, map, &in->dest);
+        MirVregId sb;
+        if (psz <= 0 || pointer.kind != MIR_OPK_VREG) {
+          fn->has_error = 1;
+          return 0;
+        }
+        sb = mir_emit_indirect_source_addr(fn, g, ctx, map, airf, &in->lhs, psz);
+        if (sb == MIR_VREG_NONE ||
+            !mir_emit_struct_copy(fn, pointer.vreg, sb, psz)) {
           return 0;
         }
         return 1;

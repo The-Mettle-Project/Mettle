@@ -423,6 +423,8 @@ static inline int mir_fsetcc_unordered_cc(unsigned char cc) {
 int mir_encode(MirFunction *fn);
 
 int mir_rewrite_string_concat_calls(IRFunction *ir_function);
+int mir_route_global_call_results(CodeGenerator *generator,
+                                  IRFunction *ir_function);
 
 void mir_fold_shared_address(MirFunction *fn);
 void mir_sink_partial_loads(MirFunction *fn);

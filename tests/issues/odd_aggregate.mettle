@@ -1,0 +1,69 @@
+import "std/io";
+
+struct R3 { r: uint8; g: uint8; b: uint8; }
+struct R5 { a: uint8[5]; }
+struct R6 { a: uint16; b: uint16; c: uint16; }
+struct R7 { a: uint8[7]; }
+struct Holder { before: uint8; c: R3; after: uint8; five: R5; last: uint8; six: R6; end: uint8; seven: R7; tail: uint8; }
+
+fn mk3(k: int32) -> R3 { var c: R3; c.r = (uint8)k; c.g = (uint8)(k + 1); c.b = (uint8)(k + 2); return c; }
+fn mk5(k: int32) -> R5 { var c: R5; for i in 0..5 { c.a[i] = (uint8)(k + i); } return c; }
+fn mk6(k: int32) -> R6 { var c: R6; c.a = (uint16)k; c.b = (uint16)(k + 1); c.c = (uint16)(k + 2); return c; }
+fn mk7(k: int32) -> R7 { var c: R7; for i in 0..7 { c.a[i] = (uint8)(k + i); } return c; }
+fn sum3(c: R3) -> int32 { return (int32)c.r + (int32)c.g + (int32)c.b; }
+
+fn set3(p: R3*, v: R3) { *p = v; }
+
+fn main() -> int32 {
+  var h: Holder;
+  h.before = (uint8)11;
+  h.after = (uint8)22;
+  h.last = (uint8)33;
+  h.end = (uint8)44;
+  h.tail = (uint8)55;
+  var c3: R3 = mk3(1);
+  var c5: R5 = mk5(1);
+  var c6: R6 = mk6(1);
+  var c7: R7 = mk7(1);
+  h.after = (uint8)22;
+  h.five = c5;
+  h.c = c3;
+  h.six = c6;
+  h.seven = c7;
+  println("{h.before} {h.c.r} {h.c.b} {h.after} {h.five.a[4]} {h.last} {h.six.c} {h.end} {h.seven.a[6]} {h.tail}");
+  h.c = mk3(5);
+  h.five = mk5(5);
+  h.six = mk6(5);
+  h.seven = mk7(5);
+  println("{h.before} {h.c.r} {h.c.b} {h.after} {h.five.a[4]} {h.last} {h.six.c} {h.end} {h.seven.a[6]} {h.tail}");
+  var a: R3[4];
+  a[0] = c3;
+  a[1] = mk3(10);
+  a[2] = a[1];
+  a[3] = c3;
+  a[1] = a[3];
+  println("{a[0].b} {a[1].b} {a[2].b} {a[3].b} {sum3(a[2])}");
+  var guard1: uint8[4] = [1, 2, 3, 4];
+  var b: R3[2];
+  b[1] = mk3(40);
+  b[0] = mk3(30);
+  println("{b[0].b} {b[1].r} {b[1].b} {guard1[0]}");
+  var p: R3* = &b[0];
+  *p = mk3(50);
+  println("{b[0].r} {b[1].r}");
+  p->g = (uint8)99;
+  set3(&b[1], *p);
+  println("{b[1].g} {b[0].b}");
+  var f: R5[3];
+  f[0] = mk5(1);
+  f[2] = mk5(20);
+  f[1] = c5;
+  f[1] = mk5(7);
+  println("{f[0].a[4]} {f[1].a[0]} {f[1].a[4]} {f[2].a[0]}");
+  var s7: R7[3];
+  s7[2] = mk7(30);
+  s7[0] = mk7(10);
+  s7[1] = s7[0];
+  println("{s7[0].a[6]} {s7[1].a[6]} {s7[2].a[0]} {s7[2].a[6]}");
+  return 0;
+}

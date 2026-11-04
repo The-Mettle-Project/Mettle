@@ -367,7 +367,8 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
   if (!code_generator_binary_validate_signature(generator, ir_function)) {
     return 0;
   }
-  if (!mir_rewrite_string_concat_calls(ir_function)) {
+  if (!mir_rewrite_string_concat_calls(ir_function) ||
+      !mir_route_global_call_results(generator, ir_function)) {
     code_generator_set_error(generator,
                              "Out of memory while lowering string concat in "
                              "'%s'",

@@ -1,0 +1,21 @@
+import "std/io";
+
+var g_why: string = "";
+
+fn first_line(s: string) -> string { return "{s}f"; }
+
+fn unpack(a: string) -> string {
+  if (a.length > 5) { g_why = "long"; return ""; }
+  g_why = first_line(a);
+  return a;
+}
+fn repeat(a: string) -> string {
+  for i in 0..3 { g_why = first_line(g_why); }
+  return g_why;
+}
+fn main() -> int32 {
+  println(unpack("abc"));
+  println(g_why);
+  println(repeat("x"));
+  return 0;
+}

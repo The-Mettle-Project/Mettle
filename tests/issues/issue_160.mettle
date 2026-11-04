@@ -1,0 +1,27 @@
+import "std/io";
+
+struct Rgb { r: uint8; g: uint8; b: uint8; }
+struct Five { a: uint8[5]; }
+struct Seven { a: uint8[7]; }
+
+fn pick(c: Rgb) -> int32 { return (int32)c.r * 100 + (int32)c.g * 10 + (int32)c.b; }
+fn make() -> Rgb { var c: Rgb; c.r = (uint8)4; c.g = (uint8)5; c.b = (uint8)6; return c; }
+fn tail(f: Five) -> int32 { return (int32)f.a[0] + (int32)f.a[4]; }
+
+fn main() -> int32 {
+  var t: uint8[3] = [1, 2, 3];
+  var u: uint8[5] = [1, 2, 3, 4, 5];
+  var v: uint8[6] = [1, 2, 3, 4, 5, 6];
+  var w: uint8[7] = [1, 2, 3, 4, 5, 6, 7];
+  var t2: uint8[3] = t;
+  var w2: uint8[7] = w;
+  t2[0] = (uint8)9;
+  var f: Five;
+  f.a = u;
+  var s: Seven;
+  s.a = w2;
+  println("{t[0]} {t[1]} {t[2]} {t2[0]} {t2[2]}");
+  println("{u[0]} {u[4]} {v[5]} {w[0]} {w[3]} {w[6]} {w2[6]}");
+  println("{pick(make())} {tail(f)} {s.a[5]}");
+  return 0;
+}

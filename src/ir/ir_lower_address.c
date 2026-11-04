@@ -442,13 +442,30 @@ IROperand ir_clone_operand_local(const IROperand *operand) {
   }
 }
 
+static int ir_spill_aggregate_value_to_local(IRLoweringContext *context,
+                                             IRFunction *function,
+                                             const IROperand *value,
+                                             Type *dest_type,
+                                             SourceLocation location,
+                                             IROperand *out_symbol);
+
+static int ir_function_has_parameter(const IRFunction *function,
+                                     const char *name) {
+  for (size_t i = 0; i < function->parameter_count; i++) {
+    if (function->parameter_names[i] &&
+        strcmp(function->parameter_names[i], name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int ir_try_emit_aggregate_symbol_memcpy(
     IRLoweringContext *context, IRFunction *function, const char *dest_name,
     const IROperand *value, Type *dest_type, SourceLocation location) {
   int nbytes = 0;
 
-  if (!context || !function || !dest_name || !value ||
-      value->kind != IR_OPERAND_SYMBOL || !value->name) {
+  if (!context || !function || !dest_name || !value) {
     return 0;
   }
   if (!dest_type ||
@@ -463,6 +480,18 @@ int ir_try_emit_aggregate_symbol_memcpy(
   nbytes = (int)dest_type->size;
   if (nbytes <= 8) {
     return 0;
+  }
+  if (value->kind != IR_OPERAND_SYMBOL || !value->name) {
+    IROperand spilled = ir_operand_none();
+    int copied = 0;
+    if (ir_function_has_parameter(function, dest_name) &&
+        ir_spill_aggregate_value_to_local(context, function, value, dest_type,
+                                          location, &spilled)) {
+      copied = ir_try_emit_aggregate_symbol_memcpy(
+          context, function, dest_name, &spilled, dest_type, location);
+      ir_operand_destroy(&spilled);
+    }
+    return copied;
   }
 
   {
@@ -553,6 +582,52 @@ static int ir_spill_aggregate_value_to_local(IRLoweringContext *context,
   return 1;
 }
 
+static int ir_emit_small_array_copy(IRLoweringContext *context,
+                                    IRFunction *function,
+                                    const IROperand *dest_addr,
+                                    const IROperand *value, int nbytes,
+                                    SourceLocation location) {
+  IROperand src_addr = ir_operand_none();
+  IROperand word = ir_operand_none();
+  IRInstruction load = {0};
+  IRInstruction store = {0};
+  int ok = 0;
+
+  if (value->kind == IR_OPERAND_SYMBOL && value->name) {
+    if (!ir_emit_address_of_symbol(context, function, value->name, location,
+                                   &src_addr)) {
+      return 0;
+    }
+  } else if (value->kind == IR_OPERAND_TEMP) {
+    src_addr = ir_clone_operand_local(value);
+  } else {
+    return 0;
+  }
+  if (!ir_make_temp_operand(context, &word)) {
+    ir_operand_destroy(&src_addr);
+    return 0;
+  }
+  load.op = IR_OP_LOAD;
+  load.location = location;
+  load.dest = word;
+  load.lhs = src_addr;
+  load.rhs = ir_operand_int(nbytes);
+  load.is_unsigned = 1;
+  ok = ir_emit(context, function, &load);
+  ir_operand_destroy(&src_addr);
+  if (ok) {
+    store.op = IR_OP_STORE;
+    store.location = location;
+    store.dest = ir_clone_operand_local(dest_addr);
+    store.lhs = word;
+    store.rhs = ir_operand_int(nbytes);
+    ok = ir_emit(context, function, &store);
+    ir_operand_destroy(&store.dest);
+  }
+  ir_operand_destroy(&word);
+  return ok;
+}
+
 int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
                                          IRFunction *function,
                                          const IROperand *dest_addr,
@@ -566,15 +641,19 @@ int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
   if (!dest_type ||
       (dest_type->kind != TYPE_STRUCT && dest_type->kind != TYPE_STRING &&
        dest_type->kind != TYPE_SLICE &&
-       dest_type->kind != TYPE_TAGGED_ENUM)) {
+       dest_type->kind != TYPE_TAGGED_ENUM &&
+       dest_type->kind != TYPE_ARRAY)) {
     return 0;
   }
   if (dest_type->size == 0 || dest_type->size > (size_t)INT_MAX) {
     return 0;
   }
   nbytes = (int)dest_type->size;
-  if (nbytes <= 8) {
-    return 0;
+  if (nbytes == 1 || nbytes == 2 || nbytes == 4 || nbytes == 8) {
+    return dest_type->kind == TYPE_ARRAY
+               ? ir_emit_small_array_copy(context, function, dest_addr, value,
+                                          nbytes, location)
+               : 0;
   }
 
   {
@@ -585,9 +664,22 @@ int ir_try_emit_aggregate_address_memcpy(IRLoweringContext *context,
     IRInstruction store = {0};
     int ok = 0;
 
-    if (ir_spill_aggregate_value_to_local(context, function, value, dest_type,
+    if (dest_type->kind != TYPE_ARRAY &&
+        ir_spill_aggregate_value_to_local(context, function, value, dest_type,
                                           location, &spilled)) {
       source = &spilled;
+    }
+    if (dest_type->kind == TYPE_ARRAY && value->kind == IR_OPERAND_TEMP) {
+      dest_copy = ir_clone_operand_local(dest_addr);
+      store.op = IR_OP_STORE;
+      store.location = location;
+      store.dest = dest_copy;
+      store.lhs = ir_clone_operand_local(value);
+      store.rhs = ir_operand_int((long long)nbytes);
+      ok = ir_emit(context, function, &store);
+      ir_operand_destroy(&store.dest);
+      ir_operand_destroy(&store.lhs);
+      return ok;
     }
     if (source->kind != IR_OPERAND_SYMBOL || !source->name) {
       ir_operand_destroy(&spilled);

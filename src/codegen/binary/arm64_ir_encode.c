@@ -2202,7 +2202,7 @@ static int encode_memory_instruction(const Arm64Scope *scope,
   case IR_OP_STORE: {
     int size = in->rhs.kind == IR_OPERAND_INT ? (int)in->rhs.int_value : 8;
     Arm64Reg addr = address_operand(e, slots, ag, &in->dest, R_LHS);
-    if (size > 8) {
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
       Arm64Reg src;
       if (in->lhs.kind == IR_OPERAND_SYMBOL &&
           agg_size_of(ag, in->lhs.name) > 0) {
