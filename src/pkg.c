@@ -1652,7 +1652,8 @@ static int pkg_finish_install(const PkgNeeds *roots, const PkgPicks *picks,
 static int pkg_apply_roots(const PkgNeeds *roots, const PkgLockFile *lock) {
   PkgPicks picks;
   memset(&picks, 0, sizeof(picks));
-  if (!pkg_resolve_graph(roots, &picks) || !pkg_seal_picks(&picks, lock) ||
+  if (!pkg_deps_check(roots) || !pkg_resolve_graph(roots, &picks) ||
+      !pkg_seal_picks(&picks, lock) ||
       !pkg_finish_install(roots, &picks, 1)) {
     return 0;
   }

@@ -1,7 +1,9 @@
 import argparse
 import datetime
+import functools
 import hashlib
 import html
+import http.server
 import json
 import os
 import pathlib
@@ -10,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 HERE = pathlib.Path(__file__).resolve().parent
 PACKAGES = HERE / "registry" / "packages"
@@ -74,6 +77,7 @@ h1 { font-size: clamp(38px, 6.5vw, 118px); line-height: 1.02; font-weight: 400; 
 .head { padding-top: clamp(40px, 9vh, 112px); padding-bottom: 48px; }
 .head p { margin: 16px 0 0; max-width: 34em; font-size: clamp(20px, 2vw, 30px); line-height: 1.16; letter-spacing: -0.012em; text-wrap: pretty; }
 .head .up { margin: 0 0 10px; font-size: 16px; letter-spacing: 0; color: var(--ink-2); }
+.head .lead { margin-top: 24px; }
 h2 { margin: 0; font-size: clamp(32px, 3.6vw, 56px); line-height: 1.04; font-weight: 400; letter-spacing: -0.024em; }
 .sec { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); column-gap: 56px; padding-top: 30px; padding-bottom: 44px; border-top: 1px solid var(--faint); }
 .sec > .side { position: sticky; top: calc(var(--bar) + 28px); align-self: start; }
@@ -603,7 +607,7 @@ filter.addEventListener("input", function () {
 </script>"""
     body = f"""<div class="wrap head">
   <h1>Packages</h1>
-  <p>Add one with <code>mettle pkg add</code>. Every version here is pinned by its SHA-256, tested on every compiler commit, and never changes after it is published.</p>
+  <div class="lead">{command_block("mettle pkg add sha256")}</div>
 </div>
 <section class="wrap sec">
   <div class="side">
@@ -611,23 +615,30 @@ filter.addEventListener("input", function () {
     <input id="filter" class="filter" type="search" placeholder="Name or description" aria-label="Filter packages" autocomplete="off">
     <p class="count" id="count">{count} {noun}</p>
   </div>
-  <ul class="rows" id="list">
+  <div>
+    <ul class="rows" id="list">
 {chr(10).join(rows)}
-  </ul>
+    </ul>
+    <p class="note" id="empty" hidden>No package matches.</p>
+  </div>
 </section>
-<p class="wrap note" id="empty" hidden>No package matches.</p>
 <section class="wrap sec">
   <h2 class="side">Use</h2>
   <ul class="rows">
-    <li>{command_block("mettle pkg add sha256")}<p>Run it in your project. It writes <code>mettle.package</code>, <code>mettle.lock</code> and <code>mettle.deps</code>, and <code>import "sha256";</code> works from then on.</p></li>
-    <li>{command_block("mettle pkg install --frozen")}<p>Installs exactly what <code>mettle.lock</code> names and fails if a hash differs. Use this in CI.</p></li>
+    <li><h3><a href="{DOCS_URL}">Add a package</a></h3><p><code>mettle pkg add</code> writes <code>mettle.package</code>, <code>mettle.lock</code> and <code>mettle.deps</code>. Then <code>import "sha256";</code> resolves.</p></li>
+    <li><h3><a href="{DOCS_URL}#in-ci">Install in CI</a></h3><p><code>mettle pkg install --frozen</code> installs what <code>mettle.lock</code> names and fails if a hash differs.</p></li>
   </ul>
 </section>
 <section class="wrap sec">
   <h2 class="side">Publish</h2>
   <ul class="rows">
-    <li><h3><a href="{DOCS_URL}#publishing">Open a pull request</a></h3><p>A package is a folder in this repository. CI checks the hash, compiles the package with the current compiler and runs its <code>@test</code> functions.</p></li>
-    <li><h3><a href="v1/index.json">Read the index</a></h3><p>All of it is static files: <code>v1/index.json</code> for tools, <code>v1/packages/&lt;name&gt;.txt</code> and <code>v1/archives/&lt;name&gt;-&lt;version&gt;.tar</code> for the compiler.</p></li>
+    <li><h3><a href="{DOCS_URL}#publishing">Open a pull request</a></h3><p>A package is a folder in this repository. CI checks its hash, compiles it with the current compiler and runs its <code>@test</code> functions. A published version cannot change.</p></li>
+  </ul>
+</section>
+<section class="wrap sec">
+  <h2 class="side">Index</h2>
+  <ul class="rows">
+    <li><h3><a href="v1/index.json">v1/index.json</a></h3><p>Every package and version, for tools.</p></li>
   </ul>
 </section>
 {script}"""
@@ -772,6 +783,11 @@ def check_append_only(base):
     print(f"{checked} published versions unchanged since {base}")
 
 
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format, *arguments):
+        pass
+
+
 def run_tool(command, cwd, env=None):
     merged = dict(os.environ)
     merged.update(env or {})
@@ -794,9 +810,19 @@ def check_with_compiler(registry, compiler):
         out = scratch / "site"
         out.mkdir()
         write_index_files(out, registry)
-        environment = {"METTLE_REGISTRY": str(out / "v1"), "METTLE_CACHE": str(scratch / "cache")}
-        for name, versions in registry.items():
-            check_latest(name, versions[latest_of(versions)], compiler, scratch, environment)
+        handler = functools.partial(QuietHandler, directory=str(out))
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        environment = {
+            "METTLE_REGISTRY": f"http://127.0.0.1:{server.server_address[1]}/v1",
+            "METTLE_CACHE": str(scratch / "cache"),
+        }
+        try:
+            for name, versions in registry.items():
+                check_latest(name, versions[latest_of(versions)], compiler, scratch, environment)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 def check_latest(name, package, compiler, scratch, environment):
@@ -806,8 +832,10 @@ def check_latest(name, package, compiler, scratch, environment):
     (project / "main.mettle").write_text(f'import "{name}";\n\nfn main() -> int32 {{\n  return 0;\n}}\n', encoding="ascii")
     run_tool([compiler, "main.mettle", "-o", "main.obj"], project)
     installed = project / ".mettle" / "packages" / f"{name}-{package['version']}"
-    output = run_tool([compiler, "test", f"{name}.mettle"], installed)
-    print(f"{name} {package['version']}: {output.strip().splitlines()[-1]}")
+    for path in package["files"]:
+        if path.endswith(".mettle") and "@test" in (installed / path).read_text(encoding="utf-8"):
+            output = run_tool([compiler, "test", path], installed)
+            print(f"{name} {package['version']}: {output.strip().splitlines()[-1]}")
 
 
 def command_check(arguments):

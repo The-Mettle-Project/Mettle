@@ -1,4 +1,4 @@
-import "number";
+import "./number";
 
 export const JSON_END = 0;
 export const JSON_OBJECT_START = 1;

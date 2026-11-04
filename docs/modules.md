@@ -145,8 +145,10 @@ vendor_json=C:/deps/json
 ```
 
 With that file in or above the importing file's directory,
-`import "mylib/widget";` resolves to `./packages/mylib/widget.mettle`. A
-relative root is read relative to the `mettle.deps` file holding it.
+`import "mylib/widget";` resolves to `./packages/mylib/widget.mettle`, and
+`import "mylib";` to `./packages/mylib/mylib.mettle`. A relative root is read
+relative to the `mettle.deps` file holding it. [`mettle pkg`](packages.md) writes
+these lines for packages from the registry.
 
 ## Duplicate and circular imports
 

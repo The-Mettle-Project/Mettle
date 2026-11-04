@@ -1,6 +1,7 @@
 name: Deploy site to GitHub Pages
 
-# Publishes website/pages/ to GitHub Pages, with website/index.html and its media as the landing page.
+# Publishes website/pages/ to GitHub Pages, with website/index.html and its media as the landing page,
+# and the package registry under registry/.
 # One-time setup: repo Settings → Pages → Source → "GitHub Actions".
 
 on:
@@ -10,6 +11,9 @@ on:
       - "website/pages/**"
       - "website/index.html"
       - "website/media/**"
+      - "website/registry/**"
+      - "website/registry.py"
+      - "website/fonts/**"
       - "tools/gen-site-reference.py"
       - "src/error/error_explain.c"
       - ".github/workflows/pages.yml"
@@ -40,6 +44,8 @@ jobs:
           cp -r website/pages/. _site/
           cp website/index.html _site/index.html
           cp website/media/hero.mp4 website/media/canyon.mp4 website/media/canyon-poster.jpg website/media/og.jpg _site/media/
+      - name: Build the package registry
+        run: python3 website/registry.py build --out _site/registry
       - uses: actions/upload-pages-artifact@v4
         with:
           path: _site
