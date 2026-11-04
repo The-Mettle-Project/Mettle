@@ -577,6 +577,37 @@ The Winsock constants are functions: `AF_INET()`, `SOCK_STREAM()`,
 `http_fetch_to_file(url: cstring, output_path: cstring) -> int32` downloads a
 URL to a file.
 
+## std/file
+
+Files by descriptor, for programs that manage their own storage: reads and
+writes at an offset, sync, truncate, rename, remove and locks. Linux, macOS
+and Windows. Every call returns a count, size or descriptor, or a negative
+error code (`-FILE_ENOENT`, `-FILE_EACCES`, `-FILE_EEXIST`,
+`-FILE_EWOULDBLOCK`, `-FILE_EINTR`, or another platform code). On Linux the
+calls are raw system calls.
+
+`file_open(path: string, flags: int32) -> int64` takes `FILE_READ`,
+`FILE_WRITE`, `FILE_CREATE`, `FILE_TRUNCATE`, `FILE_APPEND` and `FILE_NEW`
+(with `FILE_CREATE`, fail if the file exists). New files get mode 0644, and
+the descriptor is close-on-exec. On Windows the result is a `HANDLE`, and
+`FILE_APPEND` has no effect.
+
+| Function | Effect |
+|----------|--------|
+| `file_read_at(fd, buf: uint8*, n: int64, offset: int64) -> int64` | Read at an offset without moving the file position. 0 is end of file |
+| `file_write_at(fd, buf, n, offset) -> int64` | Write at an offset |
+| `file_sync(fd)` | Flush data and metadata to the device (`F_FULLFSYNC` on macOS) |
+| `file_sync_data(fd)` | Flush data (`fdatasync` on Linux) |
+| `file_truncate(fd, size)`, `file_size(fd)` | Set or read the length |
+| `file_rename(from, to)` | Rename, replacing `to` |
+| `file_remove(path)` | Delete |
+| `file_lock(fd, FILE_LOCK_SHARED or FILE_LOCK_EXCLUSIVE, wait: bool)` | Lock the whole file. With `wait` false, a conflict fails at once with `-FILE_EWOULDBLOCK` |
+| `file_unlock(fd)`, `file_close(fd)` | Release |
+
+Locks are `flock` locks on Linux and macOS: advisory, and held per open, so a
+second `file_open` of the same file in the same process conflicts too. On
+Windows they are `LockFileEx` locks, which are mandatory.
+
 ## std/dir
 
 Paths and directories. Windows.
