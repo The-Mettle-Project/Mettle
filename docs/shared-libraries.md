@@ -147,9 +147,13 @@ no `.reloc` is emitted yet, so the loader must place it at its preferred base.
 - **The runtimes stay separate.** A library built by Mettle carries its own
   allocator. Memory it returns must be freed by it, not by the program's
   `free`, and the same holds in reverse.
-- **Only the main thread may call a foreign library.** Threads Mettle starts
-  install their own thread pointer, which a C library's own thread-local state
-  will not recognize.
+- **Threads.** A program that binds a shared library is started by ld.so,
+  so glibc is loaded. Then `CreateThread` and the runtime's `pthread_create`
+  start threads with glibc's own `pthread_create`, found through ld.so's link
+  map. Every thread gets a real glibc thread record, so C libraries can be
+  called from any thread (errno, malloc, `getrandom` and the stack canary all
+  work). A program with no shared library keeps the runtime's own clone
+  threads. Test: `tests/test_threads_glibc.mettle`.
 - **x86-64 only.** The ELF image writer emits `EM_X86_64`.
 
 ## The ownership audit
