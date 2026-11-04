@@ -627,6 +627,12 @@ input, 1 output and 2 error.
 When standard input is a pipe or a file, `term_read_secret` reads the line as
 it is, so scripts can feed a password in.
 
+On a terminal, `term_read_secret` turns the line editor off while it reads,
+and handles Backspace itself. Ctrl-C and Ctrl-\ end the prompt: the terminal
+is put back first, and then the program gets SIGINT or SIGQUIT, as it would
+have. So a program that stops on Ctrl-C does not leave echo off. A program
+that catches the signal (for example with `proc_signal_fd`) gets -4 back.
+
 ## std/dl
 
 Load a shared library at run time and look up its symbols. Linux, macOS and

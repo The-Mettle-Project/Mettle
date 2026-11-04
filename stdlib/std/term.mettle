@@ -9,9 +9,14 @@ import "std/term_os";
 // is not a terminal (a pipe, a file), it reads the line as it is.
 export fn term_read_secret(prompt: string, buf: uint8*, cap: int64) -> int64 {
   if (prompt.length > (uint64)0) { term_os_write(2, prompt.chars, (int64)prompt.length); }
-  var was: int64 = term_set_echo(0, false);
+  // On a terminal, the line editor is off while the secret is read, so this
+  // loop handles Backspace itself, and Ctrl-C and Ctrl-\ arrive as bytes. The
+  // terminal is put back first, and then the signal is sent, so a program
+  // that stops on Ctrl-C does not leave echo off.
+  var saved: int64 = term_os_secret_begin(0);
   var n: int64 = 0;
   var err: int64 = 0;
+  var sig: int32 = 0;
   var c: uint8[4];
   while (true) {
     var r: int64 = term_os_read(0, &c[0], 1);
@@ -21,17 +26,37 @@ export fn term_read_secret(prompt: string, buf: uint8*, cap: int64) -> int64 {
       break;
     }
     if (r == 0 || c[0] == (uint8)10) { break; }
-    if (c[0] == (uint8)13) { continue; }
+    if (c[0] == (uint8)13) {
+      if (saved >= 0) { break; }   // a raw console ends the line with CR
+      continue;
+    }
+    if (saved >= 0 && c[0] == (uint8)3) {
+      sig = TERM_SIGINT;
+      break;
+    }
+    if (saved >= 0 && c[0] == (uint8)28) {
+      sig = TERM_SIGQUIT;
+      break;
+    }
+    if (saved >= 0 && (c[0] == (uint8)127 || c[0] == (uint8)8)) {
+      if (n > 0) { n = n - 1; }
+      continue;
+    }
     if (n < cap) {
       buf[n] = c[0];
       n = n + 1;
     }
   }
-  if (was == 1) {
-    term_set_echo(0, true);
+  if (saved >= 0) {
+    term_os_secret_end(0);
     // The Enter the user typed was not echoed either.
     var nl: string = "\n";
     term_os_write(2, nl.chars, 1);
+  }
+  if (sig != 0) {
+    term_os_raise(sig);
+    // A program that catches the signal gets -4 (EINTR) back.
+    return -4;
   }
   if (err < 0) { return err; }
   return n;

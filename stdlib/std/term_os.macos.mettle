@@ -7,8 +7,11 @@ extern fn term_c_isatty(fd: int32) -> int32 = "isatty";
 extern fn term_c_read(fd: int32, buf: uint8*, n: uint64) -> int64 = "read";
 extern fn term_c_write(fd: int32, buf: uint8*, n: uint64) -> int64 = "write";
 extern fn term_c_errno() -> int32* = "__error";
+extern fn term_c_raise(sig: int32) -> int32 = "raise";
 
 const ECHO = 8;
+const ISIG = 0x80;
+const ICANON = 0x100;
 
 export fn term_is_tty(fd: int64) -> bool {
   return term_c_isatty((int32)fd) == 1;
@@ -41,3 +44,35 @@ export fn term_os_write(fd: int64, buf: uint8*, n: int64) -> int64 {
   if (r < 0) { return -(int64)*term_c_errno(); }
   return r;
 }
+
+// For a secret prompt: echo off, the line editor off (so Ctrl-C arrives at
+// once), and Ctrl-C / Ctrl-\ delivered as bytes instead of signals, so the
+// caller can put the terminal back before acting on them. The whole termios
+// is saved for term_os_secret_end. Returns 0, or a negative code when fd is
+// not a terminal.
+var g_term_saved: uint64[16];
+
+export fn term_os_secret_begin(fd: int64) -> int64 {
+  if (term_c_tcgetattr((int32)fd, &g_term_saved[0]) != 0) { return -(int64)*term_c_errno(); }
+  var t: uint64[16];
+  for i in 0..16 { t[i] = g_term_saved[i]; }
+  t[3] = t[3] & ~((uint64)ECHO | (uint64)ISIG | (uint64)ICANON);
+  // c_cc starts at byte 32: VMIN is c_cc[16] and VTIME c_cc[17].
+  var cc: uint8* = (uint8*)&t[0];
+  cc[32 + 16] = (uint8)1;
+  cc[32 + 17] = (uint8)0;
+  if (term_c_tcsetattr((int32)fd, 0, &t[0]) != 0) { return -(int64)*term_c_errno(); }
+  return 0;
+}
+
+export fn term_os_secret_end(fd: int64) {
+  term_c_tcsetattr((int32)fd, 0, &g_term_saved[0]);
+}
+
+// Sends sig to this process, as the terminal would have.
+export fn term_os_raise(sig: int32) {
+  term_c_raise(sig);
+}
+
+export const TERM_SIGINT = 2;
+export const TERM_SIGQUIT = 3;
