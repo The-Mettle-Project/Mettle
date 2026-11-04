@@ -188,8 +188,60 @@ static void type_checker_format_bounds(const Type *type, char *out,
   snprintf(out, out_size, "%lld..%llu", min, max);
 }
 
+static size_t type_checker_spell_function(const Type *type, char *room,
+                                          size_t room_size, size_t used) {
+  const char *head = "fn(";
+  for (const char *c = head; *c && used + 1 < room_size; c++) {
+    room[used++] = *c;
+  }
+  for (size_t i = 0; i < type->fn_param_count; i++) {
+    const Type *param = type->fn_param_types ? type->fn_param_types[i] : NULL;
+    const char *text = param && param->name ? param->name : "?";
+    if (i > 0 && used + 2 < room_size) {
+      room[used++] = ',';
+      room[used++] = ' ';
+    }
+    if (param && param->kind == TYPE_FUNCTION_POINTER) {
+      used = type_checker_spell_function(param, room, room_size, used);
+    } else {
+      for (const char *c = text; *c && used + 1 < room_size; c++) {
+        room[used++] = *c;
+      }
+    }
+  }
+  const char *mid = ") -> ";
+  for (const char *c = mid; *c && used + 1 < room_size; c++) {
+    room[used++] = *c;
+  }
+  const Type *ret = type->fn_return_type;
+  if (ret && ret->kind == TYPE_FUNCTION_POINTER) {
+    used = type_checker_spell_function(ret, room, room_size, used);
+  } else {
+    const char *text = ret && ret->name ? ret->name : "void";
+    for (const char *c = text; *c && used + 1 < room_size; c++) {
+      room[used++] = *c;
+    }
+  }
+  room[used] = '\0';
+  return used;
+}
+
+const char *type_checker_spell_type(const Type *type, char *room,
+                                    size_t room_size) {
+  const char *name = type && type->name ? type->name : "?";
+  if (type && type->kind == TYPE_FUNCTION_POINTER && room_size > 1) {
+    type_checker_spell_function(type, room, room_size, 0);
+    return room;
+  }
+  return name;
+}
+
 static const char *type_checker_spell_ref(const Type *type, const char *name,
                                           char *room, size_t room_size) {
+  if (type && type->kind == TYPE_FUNCTION_POINTER && room_size > 1) {
+    type_checker_spell_function(type, room, room_size, 0);
+    return room;
+  }
   if (!type_is_element_ref(type)) {
     return name;
   }

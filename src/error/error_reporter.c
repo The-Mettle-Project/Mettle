@@ -68,6 +68,9 @@ ErrorReporter *error_reporter_create(const char *filename,
   reporter->sources = NULL;
   reporter->source_count = 0;
   reporter->source_capacity = 0;
+  reporter->retired_sources = NULL;
+  reporter->retired_count = 0;
+  reporter->retired_capacity = 0;
   reporter->current_filename = reporter->filename;
   reporter->current_source_code = reporter->source_code;
   reporter->last_add_suppressed = 0;
@@ -116,6 +119,10 @@ void error_reporter_destroy(ErrorReporter *reporter) {
     free(reporter->sources[i].filename);
     free(reporter->sources[i].source_code);
   }
+  for (size_t i = 0; i < reporter->retired_count; i++) {
+    free(reporter->retired_sources[i]);
+  }
+  free(reporter->retired_sources);
   for (size_t i = 0; i < reporter->note_frame_count; i++) {
     free(reporter->note_frames[i].message);
   }
@@ -152,11 +159,31 @@ int error_reporter_register_source(ErrorReporter *reporter,
   ErrorReporterSource *existing =
       (ErrorReporterSource *)error_reporter_find_source(reporter, filename);
   if (existing) {
+    if (existing->source_code &&
+        strcmp(existing->source_code, source_code) == 0) {
+      return 1;
+    }
     char *source_copy = mettle_strdup(source_code);
     if (!source_copy) {
       return 0;
     }
-    free(existing->source_code);
+    if (reporter->retired_count >= reporter->retired_capacity) {
+      size_t grown_capacity =
+          reporter->retired_capacity == 0 ? 8 : reporter->retired_capacity * 2;
+      char **grown = realloc(reporter->retired_sources,
+                             grown_capacity * sizeof(char *));
+      if (!grown) {
+        free(source_copy);
+        return 0;
+      }
+      reporter->retired_sources = grown;
+      reporter->retired_capacity = grown_capacity;
+    }
+    if (reporter->current_source_code == existing->source_code) {
+      reporter->current_source_code = source_copy;
+    }
+    reporter->retired_sources[reporter->retired_count++] =
+        existing->source_code;
     existing->source_code = source_copy;
     return 1;
   }

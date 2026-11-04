@@ -71,6 +71,9 @@ typedef struct {
   ErrorReporterSource *sources;
   size_t source_count;
   size_t source_capacity;
+  char **retired_sources;
+  size_t retired_count;
+  size_t retired_capacity;
   const char *current_filename;
   const char *current_source_code;
   int last_add_suppressed;

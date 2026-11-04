@@ -556,7 +556,9 @@ static int print_help_topic(const char *program_name, const char *argv0,
       strcmp(topic, "warnings") == 0) {
     printf("diagnostics - compile errors, warnings, and tooling output\n\n");
     printf("  Every diagnostic carries a stable code (E0001..E0007, "
-           "M0101..M0117), a source snippet\n");
+           "M0101..M0123, R0001..R0005,\n");
+    printf("  P0001..P0004, V0001, and more: mettle explain list), a source "
+           "snippet\n");
     printf("  with the offending range underlined, and a help suggestion. The "
            "compiler recovers after\n");
     printf("  errors, so one compile reports every problem in the file.\n\n");
@@ -4387,7 +4389,11 @@ static DriverFlagResult parse_flag_codegen(CompilerOptions *options,
     options->generate_crash_report = 0;
   } else if (strcmp(argv[i], "--debug-format") == 0 && i + 1 < argc) {
     options->debug_format = argv[++i];
-  } else if (strcmp(argv[i], "-O") == 0 ||
+  } else if (strcmp(argv[i], "-O0") == 0) {
+    options->optimize = options->release;
+  } else if (strcmp(argv[i], "-O") == 0 || strcmp(argv[i], "-O1") == 0 ||
+             strcmp(argv[i], "-O2") == 0 || strcmp(argv[i], "-O3") == 0 ||
+             strcmp(argv[i], "-Os") == 0 ||
              strcmp(argv[i], "--optimize") == 0) {
     options->optimize = 1;
   } else if (strcmp(argv[i], "-r") == 0 ||
@@ -4678,6 +4684,9 @@ static int mettle_check_target_options(CompilerOptions *options,
     free((void *)options->import_directories);
     free((void *)options->link_arguments);
     return 1;
+  }
+  if (options->generate_stack_trace_support && mtlc_target()->freestanding) {
+    options->generate_stack_trace_support = 0;
   }
   if (options->check_effects && mtlc_target()->freestanding) {
     fprintf(stderr,

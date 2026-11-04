@@ -262,6 +262,8 @@ void type_checker_report_assign_mismatch(TypeChecker *checker,
                                          const ASTNode *src_expr,
                                          SourceLocation location,
                                          Type *dest_type, Type *src_type);
+const char *type_checker_spell_type(const Type *type, char *room,
+                                    size_t room_size);
 void type_checker_set_error(TypeChecker *checker, const char *format, ...);
 void type_checker_set_error_at_location(TypeChecker *checker,
                                         SourceLocation location,

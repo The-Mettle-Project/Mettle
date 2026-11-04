@@ -1230,6 +1230,17 @@ static int parser_parse_effect_name_list(Parser *parser, char ***out_names,
     if (parser->current_token.type != TOKEN_COMMA) {
       break;
     }
+    if (parser_is_identifier_like(parser->peek_token.type)) {
+      const Lexer *lexer = parser->lexer;
+      size_t at = lexer->position;
+      while (at < lexer->length &&
+             (lexer->source[at] == ' ' || lexer->source[at] == '\t')) {
+        at++;
+      }
+      if (at < lexer->length && lexer->source[at] == ':') {
+        break;
+      }
+    }
     parser_advance(parser);
   }
   *out_names = names;
@@ -3198,11 +3209,14 @@ static char *parser_parse_function_pointer_type(Parser *parser,
     free(params_buf);
     return NULL;
   }
-  if (!parser_expect(parser, TOKEN_ARROW)) {
-    parser_set_error(parser, "Expected '->' after ')' in function pointer type");
+  if (parser->current_token.type != TOKEN_ARROW) {
+    parser_set_error(parser,
+                     "Expected '->' after ')' in function pointer type: a "
+                     "function type names its result, write '-> void' for none");
     free(params_buf);
     return NULL;
   }
+  parser_advance(parser);
   ret = parser_parse_type_annotation(parser);
   if (!ret) {
     if (!parser->has_error)

@@ -511,7 +511,7 @@ functions directly when the work does not fit a counted loop.
 body runs once on the calling thread, so a short range costs one call and no
 thread. The caller always runs the last chunk itself.
 
-`METTLE_PARALLEL_THREADS` overrides the core count at run time, capped at 16.
+`METTLE_PARALLEL_THREADS` overrides the core count at run time, capped at 64.
 
 How much this buys depends on what the loop waits for. A body that computes
 scales close to the core count; one that streams memory saturates the memory

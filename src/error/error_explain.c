@@ -808,6 +808,24 @@ static const ErrorCodeDoc DOCS[] = {
      "Fix: declare fewer refined types on hot paths, narrow what they are\n"
      "computed from so the prover settles sooner, or raise the budget\n"
      "deliberately.\n"},
+    {"P0004", "The declared-type prover stopped at its step ceiling",
+     "The prover that settles declared types stops after a fixed number of\n"
+     "steps so one hard predicate cannot stall a build. Past that point it\n"
+     "answers every remaining question as unknown, and an unknown proof\n"
+     "refuses exactly as a false one does.\n"
+     "\n"
+     "`--report-proofs` prints what each proof cost.\n"
+     "\n"
+     "Fix: narrow the values a declared type is computed from so the prover\n"
+     "settles sooner, or split the function that carries the proofs.\n"},
+    {"V0001", "A trust variable makes the build record what it did not check",
+     "METTLE_TRUST_REFINEMENTS, METTLE_TRUST_EFFECTS and\n"
+     "METTLE_TRUST_DEADLINES switch off a family of checks: declared-type\n"
+     "proofs, effect checks, or deadline checks. A build with one set\n"
+     "records those properties as established without establishing them,\n"
+     "and prints this warning so the record is not mistaken for a proof.\n"
+     "\n"
+     "Fix: unset the variable to get the checked build.\n"},
     {"P0002", "A bounds check was proven away by a declared type",
      "Not an error. `--explain` reports it: an index whose declared type\n"
      "pins its range inside the array it indexes needs no bounds check, so\n"

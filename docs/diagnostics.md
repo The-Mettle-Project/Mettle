@@ -126,6 +126,7 @@ Rule diagnostics:
 | R0002 | A rule failed the build |
 | R0003 | A rule could not decide |
 | R0004 | Rules spent more than their budget |
+| R0005 | A rule answered differently on a second run |
 
 [Rules](rules.md) covers the R codes in context.
 
@@ -149,6 +150,8 @@ Proof diagnostics:
 | P0001 | A declared type's rule could not be proven here |
 | P0002 | A bounds check was proven away by a declared type (reported by `--explain`) |
 | P0003 | The declared-type prover spent more than its budget |
+| P0004 | The declared-type prover stopped at its step ceiling |
+| V0001 | A trust variable makes the build record what it did not check |
 
 [Types](types.md) covers declared types and what the compiler proves.
 

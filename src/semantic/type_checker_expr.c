@@ -3548,11 +3548,16 @@ for (size_t i = 0; i < call->argument_count; i++) {
     if (func_symbol->data.function.parameter_names &&
         func_symbol->data.function.parameter_names[i] &&
         checker->error_reporter) {
-      char label[192];
+      char label[512];
+      char expected_room[160];
+      char actual_room[160];
       snprintf(label, sizeof(label),
                "parameter '%s' expects '%s', this argument is '%s'",
                func_symbol->data.function.parameter_names[i],
-               param_type->name, arg_type->name);
+               type_checker_spell_type(param_type, expected_room,
+                                       sizeof(expected_room)),
+               type_checker_spell_type(arg_type, actual_room,
+                                       sizeof(actual_room)));
       error_reporter_set_last_label(checker->error_reporter, label);
     }
     type_checker_note_declared_here(checker, func_symbol, "function");
