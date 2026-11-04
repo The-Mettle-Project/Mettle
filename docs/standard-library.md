@@ -569,6 +569,40 @@ say what an instruction of each kind costs on the machine. `mettle target
 reads one back. [Bare metal](bare-metal.md) covers what a description may
 change, and [Types](types.md) covers what the cost fields are read for.
 
+## std/random
+
+Random numbers from the operating system, good for keys, tokens and ids:
+`getrandom` on Linux, `getentropy` on macOS, `RtlGenRandom` on Windows. There
+is no seed and no shared state, so it is safe from any thread.
+
+| Function | Effect |
+|----------|--------|
+| `random_bytes(buf: uint8*, n: int64) -> int64` | Fill `buf`. Returns 0, or a negative code if the OS has no randomness to give |
+| `random_u64() -> uint64`, `random_u32() -> uint32` | One value. The program stops if the OS refuses |
+| `random_below(n: uint64) -> uint64` | Uniform in `0..n-1`, with no bias |
+| `random_range(lo: int64, hi: int64) -> int64` | Uniform in `lo..hi`, both included |
+| `random_float64() -> float64` | Uniform in `[0, 1)`, from 53 bits |
+
+Each call asks the OS. For fast simulation noise, seed your own generator from
+`random_u64()`.
+
+## std/env
+
+Environment variables and program arguments. Linux, macOS and Windows.
+
+| Function | Effect |
+|----------|--------|
+| `env_get(name) -> Option<string>` | A variable's value. The view lasts until the variable is set again |
+| `env_get_or(name, fallback) -> string`, `env_has(name) -> bool` | The same, shorter |
+| `env_set(name, value) -> int64` | Set a variable. 0, or -22 for a name with `=` or a NUL |
+| `env_list(buf, cap, prefix) -> int64` | Every variable as `NAME=value` lines, or only names starting with `prefix` |
+| `env_args(out: string*, max: int32) -> int32` | The program's arguments, `argv[0]` first. Returns how many there are in all |
+
+On Linux no libc is linked, so the runtime keeps the environment: it reads the
+block the kernel passed in, and keeps changes in a table of its own. The
+arguments come from `/proc/self/cmdline` on Linux, `_NSGetArgv` on macOS, and
+`GetCommandLineA` on Windows, split with the MSVCRT rules (at most 256).
+
 ## std/socket
 
 TCP and UDP over IPv4 and IPv6, with timeouts, polling and host-name lookup.
@@ -1190,6 +1224,15 @@ the descriptor is close-on-exec. On Windows the result is a `HANDLE`, and
 Locks are `flock` locks on Linux and macOS: advisory, and held per open, so a
 second `file_open` of the same file in the same process conflicts too. On
 Windows they are `LockFileEx` locks, which are mandatory.
+
+**Memory maps.** `file_map(fd, offset, length, flags, &m: FileMap) -> int64`
+maps part of an open file. `flags` is `FILE_MAP_READ`, plus `FILE_MAP_WRITE`
+for writes that reach the file, plus `FILE_MAP_PRIVATE` to keep those writes in
+this process instead. Any offset works: `m.data` points at the byte asked for,
+and `m.length` is the length. The file must already be long enough, so grow it
+with `file_truncate` first. `file_map_sync(&m)` writes a shared map's changes
+to the file; on Windows it does not wait for the device, so call `file_sync`
+as well. `file_unmap(&m)` releases it, and a second call does nothing.
 
 ## std/dir
 

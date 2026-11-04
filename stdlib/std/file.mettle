@@ -160,3 +160,79 @@ export fn file_unlock(fd: int64) -> int64 {
   if (file_w_unlock(fd, (uint32)0, (uint32)0xFFFFFFFF, (uint32)0xFFFFFFFF, &ov[0]) == 0) { return file_fail(); }
   return 0;
 }
+
+// ---- Memory-mapped files ----------------------------------------------------
+
+export const FILE_MAP_READ = 1;      // the bytes can be read
+export const FILE_MAP_WRITE = 2;     // writes reach the file (shared)
+export const FILE_MAP_PRIVATE = 4;   // with FILE_MAP_WRITE: writes stay in this process
+
+// A mapped range of a file. data points at the first byte asked for.
+export struct FileMap {
+  data: uint8*;
+  length: int64;
+  base: uint8*;      // the aligned start the OS mapped
+  base_length: int64;
+  handle: int64;     // the Windows mapping object; unused elsewhere
+}
+
+// Offsets are aligned down to 64 KiB, a multiple of every page size in use
+// (4, 16 and 64 KiB) and of the Windows mapping granularity.
+const FILE_MAP_ALIGN = 65536;
+
+extern fn file_w_create_mapping(h: int64, sec: uint8*, protect: uint32, size_high: uint32, size_low: uint32, name: uint8*) -> int64 = "CreateFileMappingA";
+extern fn file_w_map_view(map: int64, access: uint32, off_high: uint32, off_low: uint32, n: uint64) -> uint8* = "MapViewOfFile";
+extern fn file_w_flush_view(addr: uint8*, n: uint64) -> int32 = "FlushViewOfFile";
+extern fn file_w_unmap_view(addr: uint8*) -> int32 = "UnmapViewOfFile";
+
+// Maps length bytes of the file from offset. flags is FILE_MAP_READ, with
+// FILE_MAP_WRITE and optionally FILE_MAP_PRIVATE. The file must already be
+// long enough (use file_truncate to grow it). Returns 0 or a negative code.
+export fn file_map(fd: int64, offset: int64, length: int64, flags: int32, out: FileMap*) -> int64 {
+  if (length <= 0 || offset < 0) { return -87; }   // ERROR_INVALID_PARAMETER
+  var start: int64 = offset - offset % FILE_MAP_ALIGN;
+  var span: int64 = length + (offset - start);
+  var protect: uint32 = (uint32)2;                 // PAGE_READONLY
+  var access: uint32 = (uint32)4;                  // FILE_MAP_READ
+  if ((flags & FILE_MAP_WRITE) != 0) {
+    protect = (uint32)4;                           // PAGE_READWRITE
+    access = (uint32)2;                            // FILE_MAP_WRITE
+    if ((flags & FILE_MAP_PRIVATE) != 0) {
+      protect = (uint32)8;                         // PAGE_WRITECOPY
+      access = (uint32)1;                          // FILE_MAP_COPY
+    }
+  }
+  var end: int64 = offset + length;
+  var map: int64 = file_w_create_mapping(fd, (uint8*)0, protect, (uint32)((end >> 32) & 0xFFFFFFFF), (uint32)(end & 0xFFFFFFFF), (uint8*)0);
+  if (map == 0) { return file_fail(); }
+  var p: uint8* = file_w_map_view(map, access, (uint32)((start >> 32) & 0xFFFFFFFF), (uint32)(start & 0xFFFFFFFF), (uint64)span);
+  if (p == 0) {
+    var e: int64 = file_fail();
+    file_w_close(map);
+    return e;
+  }
+  out->base = p;
+  out->base_length = span;
+  out->data = p + (offset - start);
+  out->length = length;
+  out->handle = map;
+  return 0;
+}
+
+// Writes a shared mapping's changed pages to the file. Windows writes them
+// out but does not wait for the device; call file_sync on the file for that.
+export fn file_map_sync(m: FileMap*) -> int64 {
+  if (file_w_flush_view(m->base, (uint64)m->base_length) == 0) { return file_fail(); }
+  return 0;
+}
+
+export fn file_unmap(m: FileMap*) -> int64 {
+  if (m->base == 0) { return 0; }
+  var r: int64 = 0;
+  if (file_w_unmap_view(m->base) == 0) { r = file_fail(); }
+  if (m->handle != 0) { file_w_close(m->handle); }
+  m->base = (uint8*)0;
+  m->data = (uint8*)0;
+  m->handle = 0;
+  return r;
+}

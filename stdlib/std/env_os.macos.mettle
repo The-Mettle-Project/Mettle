@@ -1,0 +1,20 @@
+// macOS program arguments for std/env: _NSGetArgc and _NSGetArgv from
+// libSystem, which keep the arguments main was given.
+
+extern fn env_c_argc() -> int32* = "_NSGetArgc";
+extern fn env_c_argv() -> uint8*** = "_NSGetArgv";
+extern fn env_c_strlen(s: uint8*) -> uint64 = "strlen";
+
+// Writes up to max arguments into out (views that stay valid for the whole
+// run) and returns how many there are in all.
+export fn env_os_args(out: string*, max: int32) -> int32 {
+  var argc: int32 = *env_c_argc();
+  var argv: uint8** = *env_c_argv();
+  for i in 0..argc {
+    if (i < max) {
+      out[i].chars = argv[i];
+      out[i].length = env_c_strlen(argv[i]);
+    }
+  }
+  return argc;
+}

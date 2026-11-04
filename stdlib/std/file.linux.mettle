@@ -102,3 +102,56 @@ export fn file_lock(fd: int64, kind: int32, wait: bool) -> int64 {
 }
 
 export fn file_unlock(fd: int64) -> int64 { return syscall(LINUX_SYS_FLOCK, fd, 8); }
+
+// ---- Memory-mapped files ----------------------------------------------------
+
+export const FILE_MAP_READ = 1;      // the bytes can be read
+export const FILE_MAP_WRITE = 2;     // writes reach the file (shared)
+export const FILE_MAP_PRIVATE = 4;   // with FILE_MAP_WRITE: writes stay in this process
+
+// A mapped range of a file. data points at the first byte asked for.
+export struct FileMap {
+  data: uint8*;
+  length: int64;
+  base: uint8*;      // the aligned start the OS mapped
+  base_length: int64;
+  handle: int64;     // the Windows mapping object; unused elsewhere
+}
+
+// Offsets are aligned down to 64 KiB, a multiple of every page size in use
+// (4, 16 and 64 KiB) and of the Windows mapping granularity.
+const FILE_MAP_ALIGN = 65536;
+
+// Maps length bytes of the file from offset. flags is FILE_MAP_READ, with
+// FILE_MAP_WRITE and optionally FILE_MAP_PRIVATE. The file must already be
+// long enough (use file_truncate to grow it). Returns 0 or a negative code.
+export fn file_map(fd: int64, offset: int64, length: int64, flags: int32, out: FileMap*) -> int64 {
+  if (length <= 0 || offset < 0) { return -22; }
+  var start: int64 = offset - offset % FILE_MAP_ALIGN;
+  var span: int64 = length + (offset - start);
+  var prot: int64 = 1;                      // PROT_READ
+  if ((flags & FILE_MAP_WRITE) != 0) { prot = prot | 2; }
+  var share: int64 = 1;                     // MAP_SHARED
+  if ((flags & FILE_MAP_PRIVATE) != 0) { share = 2; }
+  var r: int64 = syscall(LINUX_SYS_MMAP, 0, span, prot, share, fd, start);
+  if (r < 0 && r > -4096) { return r; }
+  out->base = (uint8*)r;
+  out->base_length = span;
+  out->data = out->base + (offset - start);
+  out->length = length;
+  out->handle = 0;
+  return 0;
+}
+
+// Writes a shared mapping's changed pages to the file and waits for it.
+export fn file_map_sync(m: FileMap*) -> int64 {
+  return syscall(LINUX_SYS_MSYNC, m->base, m->base_length, 4);   // MS_SYNC
+}
+
+export fn file_unmap(m: FileMap*) -> int64 {
+  if (m->base == 0) { return 0; }
+  var r: int64 = syscall(LINUX_SYS_MUNMAP, m->base, m->base_length);
+  m->base = (uint8*)0;
+  m->data = (uint8*)0;
+  return r;
+}

@@ -53,3 +53,25 @@ export const LINUX_SYS_EXIT_GROUP = 231;
 export const LINUX_SYS_SIGNALFD4 = 289;
 export const LINUX_SYS_DUP3 = 292;
 export const LINUX_SYS_PIPE2 = 293;
+
+// Files, directories, memory maps and randomness.
+export const LINUX_SYS_MMAP = 9;
+export const LINUX_SYS_MUNMAP = 11;
+export const LINUX_SYS_MSYNC = 26;
+export const LINUX_SYS_MADVISE = 28;
+export const LINUX_SYS_GETCWD = 79;
+export const LINUX_SYS_FCHDIR = 81;
+export const LINUX_SYS_GETDENTS64 = 217;
+export const LINUX_SYS_MKDIRAT = 258;
+export const LINUX_SYS_NEWFSTATAT = 262;
+export const LINUX_SYS_SYMLINKAT = 266;
+export const LINUX_SYS_READLINKAT = 267;
+export const LINUX_SYS_GETRANDOM = 318;
+
+// struct stat field offsets (bytes). x86-64 has its own layout.
+export const LINUX_STAT_SIZE = 144;
+export const LINUX_STAT_MODE_AT = 24;
+export const LINUX_STAT_SIZE_AT = 48;
+export const LINUX_STAT_ATIME_AT = 72;
+export const LINUX_STAT_MTIME_AT = 88;
+export const LINUX_STAT_CTIME_AT = 104;

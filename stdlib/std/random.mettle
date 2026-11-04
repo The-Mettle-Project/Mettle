@@ -1,0 +1,55 @@
+// Random numbers from the operating system, good for keys, tokens and ids.
+//
+// Every value comes straight from the OS (getrandom on Linux, getentropy on
+// macOS, RtlGenRandom on Windows), so there is no seed and no state to share
+// between threads. For fast simulation noise, use your own generator seeded
+// from random_u64().
+
+import "std/random_os";
+
+extern fn random_abort() = "abort";
+
+// Fills buf with n random bytes. Returns 0, or a negative error code. It
+// fails only if the OS has no randomness to give.
+export fn random_bytes(buf: uint8*, n: int64) -> int64 {
+  if (n <= 0) { return 0; }
+  return random_os_fill(buf, n);
+}
+
+// A random 64-bit value. If the OS refuses, the program stops: carrying on
+// with a guessable value would be worse.
+export fn random_u64() -> uint64 {
+  var v: uint64 = 0;
+  if (random_os_fill((uint8*)&v, 8) != 0) { random_abort(); }
+  return v;
+}
+
+export fn random_u32() -> uint32 {
+  return (uint32)(random_u64() >> 32);
+}
+
+// A uniform value in 0..n-1, with no bias toward small values. n of 0 gives 0.
+export fn random_below(n: uint64) -> uint64 {
+  if (n <= (uint64)1) { return (uint64)0; }
+  // Reject the top sliver that would make some results more likely.
+  var limit: uint64 = (uint64)0 - ((uint64)0 - n) % n;
+  while (true) {
+    var v: uint64 = random_u64();
+    if (limit == (uint64)0 || v < limit) { return v % n; }
+  }
+  return (uint64)0;
+}
+
+// A uniform value in lo..hi, both included.
+export fn random_range(lo: int64, hi: int64) -> int64 {
+  if (hi <= lo) { return lo; }
+  var span: uint64 = (uint64)(hi - lo) + (uint64)1;
+  if (span == (uint64)0) { return (int64)random_u64(); }   // the whole int64 range
+  return lo + (int64)random_below(span);
+}
+
+// A uniform float64 in [0, 1), from 53 random bits.
+export fn random_float64() -> float64 {
+  var bits: uint64 = random_u64() >> 11;
+  return (float64)(int64)bits / 9007199254740992.0;
+}

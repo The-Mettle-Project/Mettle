@@ -1,0 +1,16 @@
+// macOS randomness for std/random: getentropy, at most 256 bytes a call.
+
+extern fn random_c_getentropy(buf: uint8*, n: uint64) -> int32 = "getentropy";
+extern fn random_c_errno() -> int32* = "__error";
+
+// Fills buf with n random bytes. Returns 0, or a negative error code.
+export fn random_os_fill(buf: uint8*, n: int64) -> int64 {
+  var done: int64 = 0;
+  while (done < n) {
+    var step: int64 = n - done;
+    if (step > 256) { step = 256; }
+    if (random_c_getentropy(buf + done, (uint64)step) != 0) { return -(int64)*random_c_errno(); }
+    done = done + step;
+  }
+  return 0;
+}

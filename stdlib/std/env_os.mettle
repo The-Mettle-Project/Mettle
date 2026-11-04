@@ -1,0 +1,105 @@
+// Windows program arguments for std/env: GetCommandLineA, split with the
+// MSVCRT rules, so the result matches what a C program's argv would be.
+
+extern fn env_w_command_line() -> uint8* = "GetCommandLineA";
+extern fn env_c_malloc(n: uint64) -> uint8* = "malloc";
+
+var g_env_buf: uint8* = (uint8*)0;
+var g_env_ends: int64[256];
+var g_env_count: int32 = -1;
+
+fn env_os_split() {
+  if (g_env_count >= 0) { return; }
+  g_env_count = 0;
+  var line: uint8* = env_w_command_line();
+  if (line == 0) { return; }
+  var n: int64 = 0;
+  while (line[n] != (uint8)0) { n = n + 1; }
+  g_env_buf = env_c_malloc((uint64)(n + 1));
+  if (g_env_buf == 0) { return; }
+  var i: int64 = 0;
+  var o: int64 = 0;
+  // argv[0] ends at the first space outside quotes; backslashes are literal.
+  var quoted: bool = false;
+  while (i < n) {
+    var c: int32 = (int32)line[i];
+    if (c == 34) {
+      quoted = !quoted;
+      i = i + 1;
+      continue;
+    }
+    if (!quoted && (c == 32 || c == 9)) { break; }
+    g_env_buf[o] = line[i];
+    o = o + 1;
+    i = i + 1;
+  }
+  g_env_ends[0] = o;
+  g_env_count = 1;
+  // The other arguments: 2n backslashes before a quote give n backslashes
+  // and toggle quoting; 2n+1 give n backslashes and a literal quote.
+  while (i < n && g_env_count < 256) {
+    while (i < n && ((int32)line[i] == 32 || (int32)line[i] == 9)) { i = i + 1; }
+    if (i >= n) { break; }
+    quoted = false;
+    while (i < n) {
+      var c2: int32 = (int32)line[i];
+      if (c2 == 92) {
+        var slashes: int64 = 0;
+        while (i < n && (int32)line[i] == 92) {
+          slashes = slashes + 1;
+          i = i + 1;
+        }
+        if (i < n && (int32)line[i] == 34) {
+          for k in 0..(slashes / 2) {
+            g_env_buf[o] = (uint8)92;
+            o = o + 1;
+          }
+          if (slashes % 2 == 1) {
+            g_env_buf[o] = (uint8)34;
+            o = o + 1;
+            i = i + 1;
+          }
+        } else {
+          for k in 0..slashes {
+            g_env_buf[o] = (uint8)92;
+            o = o + 1;
+          }
+        }
+        continue;
+      }
+      if (c2 == 34) {
+        // "" inside quotes is a literal quote.
+        if (quoted && i + 1 < n && (int32)line[i + 1] == 34) {
+          g_env_buf[o] = (uint8)34;
+          o = o + 1;
+          i = i + 2;
+          continue;
+        }
+        quoted = !quoted;
+        i = i + 1;
+        continue;
+      }
+      if (!quoted && (c2 == 32 || c2 == 9)) { break; }
+      g_env_buf[o] = line[i];
+      o = o + 1;
+      i = i + 1;
+    }
+    g_env_ends[g_env_count] = o;
+    g_env_count = g_env_count + 1;
+  }
+}
+
+// Writes up to max arguments into out (views that stay valid for the whole
+// run) and returns how many there are in all (at most 256 on Windows).
+export fn env_os_args(out: string*, max: int32) -> int32 {
+  env_os_split();
+  var start: int64 = 0;
+  for i in 0..g_env_count {
+    if (i < max) {
+      out[i].chars = g_env_buf + start;
+      out[i].length = (uint64)(g_env_ends[i] - start);
+    }
+    start = g_env_ends[i];
+  }
+  return g_env_count;
+}
