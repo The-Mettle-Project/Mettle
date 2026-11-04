@@ -109,7 +109,7 @@ ERROR_SOURCES = $(SRCDIR)/error/error_explain.c
 DEBUG_SOURCES = $(SRCDIR)/debug/debug_info.c
 COMPILER_SOURCES = $(SRCDIR)/compiler/compiler_context.c $(SRCDIR)/compiler/compiler_crash.c $(SRCDIR)/compiler/compiler_self_profile.c
 COMMON_SOURCES = $(SRCDIR)/common.c
-MAIN_SOURCES = $(SRCDIR)/main.c $(SRCDIR)/tune.c $(SRCDIR)/live_driver.c
+MAIN_SOURCES = $(SRCDIR)/main.c $(SRCDIR)/tune.c $(SRCDIR)/live_driver.c $(SRCDIR)/pkg.c
 
 # libmtlc: the standalone, frontend-agnostic backend (IR core, optimizer + GNN,
 # code generators, native linker, public API).
@@ -307,9 +307,12 @@ test: $(TARGET) bundle-runtime
 	$(TARGET) --build -l:libc.so.6 tests/test_threads_glibc.mettle \
 		-o $(BINDIR)/glibc-threads-test
 	@$(BINDIR)/glibc-threads-test
+	$(TARGET) --build -s tests/concurrent_crash_recovery.mettle \
+		-o $(BINDIR)/owned-concurrent-crash-test
+	@$(BINDIR)/owned-concurrent-crash-test 2>/dev/null
 	@for product in $(TARGET) $(BINDIR)/owned-threads-test \
 		$(BINDIR)/owned-pthread-test $(BINDIR)/owned-dir-test \
-		$(BINDIR)/owned-crash-test; do \
+		$(BINDIR)/owned-crash-test $(BINDIR)/owned-concurrent-crash-test; do \
 		if readelf -l $$product | grep -q INTERP; then \
 			echo "error: $$product has a dynamic loader"; exit 1; fi; \
 		if readelf -d $$product 2>&1 | grep -q NEEDED; then \

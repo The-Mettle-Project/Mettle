@@ -1,0 +1,1652 @@
+// std/websocket: handshake, frames, close frames, messages, UTF-8.
+// Returns 0 when every check holds. Otherwise it prints the label of each
+// failed check and returns the number of the first (at most 255, the most an
+// exit status can carry).
+import "std/websocket";
+import "std/strbuf";
+import "std/arena";
+import "std/utf8";
+import "std/conv";
+import "std/mem";
+import "std/io";
+
+var g_checks: int32 = 0;
+var g_first_fail: int32 = 0;
+
+fn t_expect(ok: bool, label: string) {
+  g_checks = g_checks + 1;
+  if (!ok) {
+    println("FAIL check {g_checks}: {label}");
+    if (g_first_fail == 0) { g_first_fail = g_checks; }
+  }
+}
+
+// The bytes under test, loaded from a list of ints.
+var g_in: uint8[300];
+var g_in_n: int64 = 0;
+var g_h: WsHeader;
+var g_mask: uint8[4];
+
+fn t_load(xs: int32[..]) {
+  g_in_n = 0;
+  for x in xs {
+    g_in[g_in_n] = (uint8)x;
+    g_in_n = g_in_n + 1;
+  }
+}
+
+fn t_hash(p: uint8*, n: int64) -> int64 {
+  var h: int64 = 7;
+  for i in 0..n {
+    h = h * 31 + (int64)p[i] + 1;
+  }
+  return h;
+}
+
+fn t_hash_s(s: string) -> int64 {
+  return t_hash(s.chars, (int64)s.length);
+}
+
+fn t_sb_is(b: StrBuf*, want: string) -> bool {
+  if (b->len != (int64)want.length) { return false; }
+  for i in 0..b->len {
+    if ((int32)b->data[i] != (int32)want[i]) { return false; }
+  }
+  return true;
+}
+
+fn t_sb_is_loaded(b: StrBuf*) -> bool {
+  if (b->len != g_in_n) { return false; }
+  for i in 0..b->len {
+    if (b->data[i] != g_in[i]) { return false; }
+  }
+  return true;
+}
+
+// ---- SHA-1 ----
+
+fn t_hex(d: uint8*, out: uint8*) {
+  var digits: string = "0123456789abcdef";
+  for i in 0..20 {
+    out[i * 2] = digits.chars[(int64)(d[i] >> 4)];
+    out[i * 2 + 1] = digits.chars[(int64)(d[i] & 15)];
+  }
+}
+
+fn t_sha_is(p: uint8*, n: int64, want: string) -> bool {
+  var d: uint8[20];
+  if (ws_sha1(p, n, &d[0]) != 0) { return false; }
+  var hex: uint8[40];
+  t_hex(&d[0], &hex[0]);
+  return str_from_bytes((cstring)&hex[0], 40) == want;
+}
+
+fn t_sha_str(s: string, want: string) -> bool {
+  return t_sha_is(s.chars, (int64)s.length, want);
+}
+
+fn t_sha_a(n: int64, want: string) -> bool {
+  var a: uint8[130];
+  for i in 0..130 { a[i] = (uint8)97; }
+  return t_sha_is(&a[0], n, want);
+}
+
+fn t_sha1() {
+  t_expect(t_sha_str("abc", "a9993e364706816aba3e25717850c26c9cd0d89d"), "sha1 abc");
+  t_expect(t_sha_str("", "da39a3ee5e6b4b0d3255bfef95601890afd80709"), "sha1 empty");
+  t_expect(t_sha_str("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+    "84983e441c3bd26ebaae4aa1f95129e5e54670f1"), "sha1 two blocks");
+  t_expect(t_sha_str("The quick brown fox jumps over the lazy dog",
+    "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12"), "sha1 fox");
+  // The padding edges: the length field fits in the block up to 55 bytes.
+  t_expect(t_sha_a(55, "c1c8bbdc22796e28c0e15163d20899b65621d65a"), "sha1 55");
+  t_expect(t_sha_a(56, "c2db330f6083854c99d4b5bfb6e8f29f201be699"), "sha1 56");
+  t_expect(t_sha_a(57, "f08f24908d682555111be7ff6f004e78283d989a"), "sha1 57");
+  t_expect(t_sha_a(63, "03f09f5b158a7a8cdad920bddc29b81c18a551f5"), "sha1 63");
+  t_expect(t_sha_a(64, "0098ba824b5c16427bd7a1122a5a442a25ec644d"), "sha1 64");
+  t_expect(t_sha_a(65, "11655326c708d70319be2610e8a57d9a5b959d3b"), "sha1 65");
+  t_expect(t_sha_a(119, "ee971065aaa017e0632a8ca6c77bb3bf8b1dfc56"), "sha1 119");
+  t_expect(t_sha_a(120, "f34c1488385346a55709ba056ddd08280dd4c6d6"), "sha1 120");
+  t_expect(t_sha_a(127, "89d95fa32ed44a7c610b7ee38517ddf57e0bb975"), "sha1 127");
+  t_expect(t_sha_a(128, "ad5b3fdbcb526778c2839d2f151ea753995e26a0"), "sha1 128");
+  // A million 'a' (FIPS 180 test vector).
+  var big: uint8[] = new uint8[1000000];
+  for i in 0..1000000 { big[i] = (uint8)97; }
+  t_expect(t_sha_is(big.data, 1000000, "34aa973cd4c4daa4f61eeb2bdbad27316534016f"), "sha1 million");
+  free(big.data);
+  var d: uint8[20];
+  t_expect(ws_sha1(0, 3, &d[0]) == -1, "sha1 null input");
+  t_expect(ws_sha1(&d[0], -1, &d[0]) == -1, "sha1 negative length");
+  t_expect(ws_sha1(&d[0], 0, 0) == -1, "sha1 null out");
+}
+
+// ---- handshake ----
+
+fn t_accept_is(key: string, want: string) -> bool {
+  var out: uint8[40];
+  var n: int64 = ws_accept_key(key, &out[0], 40);
+  if (n != (int64)want.length) { return false; }
+  return str_from_bytes((cstring)&out[0], n) == want;
+}
+
+fn t_head_ok(head: string, want: int32) -> bool {
+  return ws_check_request_head(head) == want;
+}
+
+fn t_handshake_keys() {
+  t_expect(t_accept_is("dGhlIHNhbXBsZSBub25jZQ==", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "rfc accept");
+  t_expect(t_accept_is("AAECAwQFBgcICQoLDA0ODw==", "Bz3qJYTGdOe8gUSpLosEdiLKDrk="), "accept 0..15");
+  t_expect(t_accept_is("/////////////////////w==", "XXpj4jYzLM2yUE0C7TIgMwTQh2g="), "accept ff");
+  var out: uint8[40];
+  t_expect(ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==", &out[0], 27) == -1, "accept small cap");
+  t_expect(ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==", &out[0], 28) == 28, "accept exact cap");
+  t_expect(ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==", 0, 40) == -1, "accept null out");
+  t_expect(ws_key_valid("dGhlIHNhbXBsZSBub25jZQ=="), "key valid");
+  t_expect(!ws_key_valid(""), "key empty");
+  t_expect(!ws_key_valid("dGhlIHNhbXBsZSBub25jZQ="), "key 23 chars");
+  t_expect(!ws_key_valid("dGhlIHNhbXBsZSBub25jZQ==="), "key 25 chars");
+  t_expect(!ws_key_valid("dGhlIHNhbXBsZSBub25jZ!=="), "key bad char");
+  t_expect(!ws_key_valid("dGhlIHNhbXBsZSBub25jZR=="), "key non-canonical bits");
+  t_expect(!ws_key_valid("dGhlIHNhbXBsZSBub25jZQ=A"), "key bad padding");
+  t_expect(!ws_key_valid("dGhlIHNhbXBsZSBub25jZQAA"), "key decodes to 17 bytes");
+  t_expect(!ws_key_valid("dGhlIHNhbXBsZSBub25jZQ=="  + " "), "key trailing space");
+  t_expect(ws_accept_key("short", &out[0], 40) == -1, "accept bad key");
+
+  var k: uint8[16];
+  for i in 0..16 { k[i] = (uint8)i; }
+  var text: uint8[24];
+  t_expect(ws_client_key(&k[0], &text[0], 24) == 24, "client key len");
+  t_expect(str_from_bytes((cstring)&text[0], 24) == "AAECAwQFBgcICQoLDA0ODw==", "client key text");
+  t_expect(ws_client_key(&k[0], &text[0], 23) == -1, "client key small cap");
+  t_expect(ws_key_valid(str_from_bytes((cstring)&text[0], 24)), "client key is a valid key");
+}
+
+fn t_tokens() {
+  t_expect(ws_has_token("keep-alive, Upgrade", "upgrade"), "token second item");
+  t_expect(ws_has_token("UPGRADE", "upgrade"), "token upper case");
+  t_expect(ws_has_token("WebSocket", "websocket"), "token mixed case");
+  t_expect(ws_has_token("  websocket  , x", "websocket"), "token padded");
+  t_expect(ws_has_token(",,upgrade", "upgrade"), "token after empty items");
+  t_expect(!ws_has_token("upgrades", "upgrade"), "token not a prefix match");
+  t_expect(!ws_has_token("xupgrade", "upgrade"), "token not a suffix match");
+  t_expect(!ws_has_token("", "upgrade"), "token empty list");
+  t_expect(!ws_has_token("keep-alive", "upgrade"), "token absent");
+  t_expect(ws_header_value("GET / HTTP/1.1\r\nX:   a b  \r\nY: c\r\n\r\n", "x") == "a b", "header value trimmed");
+  t_expect(ws_header_value("GET / HTTP/1.1\r\nx-A: 1\r\nX-a: 2\r\n\r\n", "X-A") == "1", "header value first match");
+  t_expect(ws_header_value("GET / HTTP/1.1\r\nA: 1\r\n\r\nB: 2\r\n", "b").length == 0, "header value stops at blank line");
+  t_expect(ws_header_value("A: 1\r\nB: 2\r\n\r\n", "a").length == 0, "header value skips first line");
+  t_expect(ws_header_value("GET / HTTP/1.1\r\nA: 1\n\n", "a") == "1", "header value bare LF");
+  t_expect(ws_head_has_token("GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: Upgrade\r\n\r\n",
+    "connection", "upgrade"), "token across repeated headers");
+  t_expect(ws_status_code("HTTP/1.1 101 Switching Protocols\r\n") == 101, "status 101");
+  t_expect(ws_status_code("HTTP/1.0 404") == 404, "status 404 no reason");
+  t_expect(ws_status_code("HTTP/2 200 OK") == -1, "status http2");
+  t_expect(ws_status_code("HTTP/1.1 10x") == -1, "status not digits");
+  t_expect(ws_status_code("HTTP/1.1 1011") == -1, "status four digits");
+  t_expect(ws_status_code("") == -1, "status empty");
+  t_load(65, 13, 10, 13, 10, 66);
+  t_expect(ws_find_head_end(&g_in[0], g_in_n) == 5, "head end found");
+  t_expect(ws_find_head_end(&g_in[0], 4) == -1, "head end not yet");
+  t_expect(ws_find_head_end(&g_in[0], 5) == 5, "head end at the edge");
+  t_load(13, 10, 13, 10);
+  t_expect(ws_find_head_end(&g_in[0], g_in_n) == 4, "head end at start");
+  t_load(13, 10, 13, 66, 13, 10);
+  t_expect(ws_find_head_end(&g_in[0], g_in_n) == -1, "head end broken");
+  t_expect(ws_find_head_end(&g_in[0], 0) == -1, "head end empty");
+}
+
+fn t_check_request() {
+  var key: string = "dGhlIHNhbXBsZSBub25jZQ==";
+  t_expect(ws_check_request("GET", "websocket", "Upgrade", key, "13") == WS_UPGRADE_OK, "request ok");
+  t_expect(ws_check_request("GET", "WebSocket", "keep-alive, Upgrade", key, " 13 ") == 0, "request ok loose");
+  t_expect(ws_check_request("POST", "websocket", "Upgrade", key, "13") == 405, "request POST");
+  t_expect(ws_check_request("get", "websocket", "Upgrade", key, "13") == 405, "request lower get");
+  t_expect(ws_check_request("GET", "", "Upgrade", key, "13") == 400, "request no upgrade");
+  t_expect(ws_check_request("GET", "h2c", "Upgrade", key, "13") == 400, "request wrong upgrade");
+  t_expect(ws_check_request("GET", "websocket", "", key, "13") == 400, "request no connection");
+  t_expect(ws_check_request("GET", "websocket", "keep-alive", key, "13") == 400, "request connection lacks upgrade");
+  t_expect(ws_check_request("GET", "websocket", "Upgrade", "", "13") == 400, "request no key");
+  t_expect(ws_check_request("GET", "websocket", "Upgrade", "short", "13") == 400, "request short key");
+  t_expect(ws_check_request("GET", "websocket", "Upgrade", key, "") == 426, "request no version");
+  t_expect(ws_check_request("GET", "websocket", "Upgrade", key, "8") == 426, "request version 8");
+  t_expect(ws_check_request("GET", "websocket", "Upgrade", key, "13, 8") == 426, "request version list");
+
+  var base: string = "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+  t_expect(t_head_ok(base, 0), "head ok");
+  t_expect(t_head_ok("GET /chat HTTP/1.1\r\nhost: x\r\nUPGRADE: WebSocket\r\nconnection: keep-alive\r\nConnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n", 0), "head ok mixed");
+  t_expect(t_head_ok("POST /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", 405), "head POST");
+  t_expect(t_head_ok("GET /chat HTTP/1.0\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", 400), "head http 1.0");
+  t_expect(t_head_ok("GET /chat HTTP/1.1\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", 400), "head no upgrade");
+  t_expect(t_head_ok("GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", 400), "head no connection");
+  t_expect(t_head_ok("GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n", 400), "head no key");
+  t_expect(t_head_ok("GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", 400), "head two keys");
+  t_expect(t_head_ok("GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: nope\r\nSec-WebSocket-Version: 13\r\n\r\n", 400), "head bad key");
+  t_expect(t_head_ok("GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n", 426), "head version 8");
+  t_expect(t_head_ok("GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", 426), "head no version");
+  t_expect(t_head_ok("", 405), "head empty");
+}
+
+fn t_protocols() {
+  t_expect(ws_select_protocol("chat, superchat", "superchat,chat") == "chat", "protocol client order");
+  t_expect(ws_select_protocol("a, b, c", "c, b") == "b", "protocol first supported");
+  t_expect(ws_select_protocol("a,b", "c").length == 0, "protocol none");
+  t_expect(ws_select_protocol("", "c").length == 0, "protocol nothing offered");
+  t_expect(ws_select_protocol("a", "").length == 0, "protocol nothing supported");
+  t_expect(ws_select_protocol("Chat", "chat").length == 0, "protocol case-sensitive");
+  t_expect(ws_select_protocol(" ,, v1.json ,", "v1.json") == "v1.json", "protocol padded");
+}
+
+fn t_handshake_writers(arena: Arena*) {
+  var b: StrBuf* = strbuf_new(arena, 64);
+  var key: string = "dGhlIHNhbXBsZSBub25jZQ==";
+  t_expect(ws_write_101(b, key, "") == 1, "101 written");
+  t_expect(t_sb_is(b, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), "101 exact");
+  b->len = 0;
+  t_expect(ws_write_101(b, key, "chat") == 1, "101 with protocol");
+  t_expect(t_sb_is(b, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: chat\r\n\r\n"), "101 protocol exact");
+  var before: int64 = b->len;
+  t_expect(ws_write_101(b, "bad", "") == 0, "101 bad key");
+  t_expect(ws_write_101(b, key, "a\r\nX: y") == 0, "101 protocol injection");
+  t_expect(ws_write_101(b, key, "a b") == 0, "101 protocol space");
+  t_expect(b->len == before, "101 failure leaves the buffer");
+  t_expect(ws_write_101(0, key, "") == 0, "101 null buffer");
+
+  b->len = 0;
+  t_expect(ws_write_refusal(b, 426) == 1, "refusal 426");
+  t_expect(t_sb_is(b, "HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"), "refusal 426 exact");
+  b->len = 0;
+  t_expect(ws_write_refusal(b, 405) == 1, "refusal 405");
+  t_expect(t_sb_is(b, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"), "refusal 405 exact");
+  b->len = 0;
+  t_expect(ws_write_refusal(b, 400) == 1, "refusal 400");
+  t_expect(t_sb_is(b, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"), "refusal 400 exact");
+  b->len = 0;
+  t_expect(ws_write_refusal(b, 200) == 0 && b->len == 0, "refusal other status");
+
+  var k: uint8[16];
+  for i in 0..16 { k[i] = (uint8)i; }
+  b->len = 0;
+  t_expect(ws_write_request(b, "example.com:8080", "/chat?room=1", &k[0], "", "") == 1, "request written");
+  t_expect(t_sb_is(b, "GET /chat?room=1 HTTP/1.1\r\nHost: example.com:8080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==\r\nSec-WebSocket-Version: 13\r\n\r\n"), "request exact");
+  t_expect(ws_find_head_end((uint8*)b->data, b->len) == b->len, "request is one head");
+  b->len = 0;
+  t_expect(ws_write_request(b, "h", "/", &k[0], "chat, v2", "https://o.example") == 1, "request with extras");
+  t_expect(t_sb_is(b, "GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat, v2\r\nOrigin: https://o.example\r\n\r\n"), "request extras exact");
+  t_expect(ws_check_request_head(strbuf_finish_string(b)) == 0, "request passes the server check");
+  b->len = 0;
+  t_expect(ws_write_request(b, "h\r\nX: y", "/", &k[0], "", "") == 0, "request host injection");
+  t_expect(ws_write_request(b, "h", "/ HTTP/1.1\r\nX: y", &k[0], "", "") == 0, "request path injection");
+  t_expect(ws_write_request(b, "h", "chat", &k[0], "", "") == 0, "request path without slash");
+  t_expect(ws_write_request(b, "h", "/", &k[0], "a\r\nX: y", "") == 0, "request protocol injection");
+  t_expect(ws_write_request(b, "h", "/", &k[0], "", "o\nX: y") == 0, "request origin injection");
+  t_expect(ws_write_request(b, "", "/", &k[0], "", "") == 0, "request empty host");
+  t_expect(ws_write_request(b, "h", "/", 0, "", "") == 0, "request null key");
+  t_expect(b->len == 0, "request failure leaves the buffer");
+}
+
+fn t_response() {
+  var key: string = "dGhlIHNhbXBsZSBub25jZQ==";
+  var ok: string = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+  t_expect(ws_check_response(ok, key, "") == 0, "response ok");
+  t_expect(ws_check_response("HTTP/1.1 101 Switching Protocols\r\nupgrade: WebSocket\r\nconnection: upgrade\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n", key, "") == 0, "response ok lower case");
+  t_expect(ws_check_response("HTTP/1.1 200 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n", key, "") == WS_HS_BAD_STATUS, "response status 200");
+  t_expect(ws_check_response("garbage", key, "") == WS_HS_BAD_STATUS, "response garbage");
+  t_expect(ws_check_response("HTTP/1.1 101 x\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n", key, "") == WS_HS_BAD_UPGRADE, "response no upgrade");
+  t_expect(ws_check_response("HTTP/1.1 101 x\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n", key, "") == WS_HS_BAD_UPGRADE, "response wrong upgrade");
+  t_expect(ws_check_response("HTTP/1.1 101 x\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n", key, "") == WS_HS_BAD_CONNECTION, "response no connection");
+  t_expect(ws_check_response("HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", key, "") == WS_HS_BAD_ACCEPT, "response no accept");
+  t_expect(ws_check_response("HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOO=\r\n\r\n", key, "") == WS_HS_BAD_ACCEPT, "response wrong accept");
+  t_expect(ws_check_response(ok, "AAECAwQFBgcICQoLDA0ODw==", "") == WS_HS_BAD_ACCEPT, "response for another key");
+  t_expect(ws_check_response(ok, "bad", "") == WS_HS_BAD_ACCEPT, "response bad client key");
+  t_expect(ws_check_response("HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", key, "") == WS_HS_BAD_EXTENSION, "response extension");
+  var withp: string = "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: chat\r\n\r\n";
+  t_expect(ws_check_response(withp, key, "v1, chat") == 0, "response offered protocol");
+  t_expect(ws_check_response(withp, key, "") == WS_HS_BAD_PROTOCOL, "response protocol not offered");
+  t_expect(ws_check_response(withp, key, "v1, Chat") == WS_HS_BAD_PROTOCOL, "response protocol other case");
+  t_expect(ws_check_response(ok, key, "chat") == 0, "response no protocol chosen is fine");
+}
+
+// A client's request, the server's check and 101, and the client's check.
+fn t_handshake_round_trip(arena: Arena*) {
+  var k: uint8[16];
+  for i in 0..16 { k[i] = (uint8)(i * 17 + 3); }
+  var req: StrBuf* = strbuf_new(arena, 64);
+  var resp: StrBuf* = strbuf_new(arena, 64);
+  t_expect(ws_write_request(req, "srv:9", "/ws", &k[0], "a, b", "") == 1, "round trip request");
+  var head: string = strbuf_finish_string(req);
+  t_expect(ws_check_request_head(head) == 0, "round trip server accepts");
+  var offered: string = ws_header_value(head, "sec-websocket-protocol");
+  var chosen: string = ws_select_protocol(offered, "b, z");
+  t_expect(chosen == "b", "round trip chosen");
+  t_expect(ws_write_101(resp, ws_header_value(head, "sec-websocket-key"), chosen) == 1, "round trip 101");
+  var text: uint8[24];
+  ws_client_key(&k[0], &text[0], 24);
+  var ckey: string = str_from_bytes((cstring)&text[0], 24);
+  t_expect(ws_check_response(strbuf_finish_string(resp), ckey, "a, b") == 0, "round trip client accepts");
+  t_expect(ws_header_value(strbuf_finish_string(resp), "sec-websocket-protocol") == "b", "round trip protocol read back");
+}
+
+// ---- frame headers ----
+
+fn t_parse(role: int32, max: int64, n: int64) -> int32 {
+  return ws_parse_header(&g_in[0], n, role, max, &g_h);
+}
+
+fn t_ready(role: int32, max: int64) -> bool {
+  return t_parse(role, max, g_in_n) == WS_HEADER;
+}
+
+fn t_hdr_is(fin: bool, op: int32, masked: bool, len: int64, hlen: int64) -> bool {
+  return g_h.fin == fin && g_h.opcode == op && g_h.masked == masked &&
+         g_h.payload_len == len && g_h.header_len == hlen;
+}
+
+// Every shorter prefix wants more, and the whole header is ready.
+fn t_prefix_walk(role: int32, hlen: int64) -> bool {
+  var k: int64 = 0;
+  while (k < hlen) {
+    if (t_parse(role, 0, k) != WS_NEED_MORE) { return false; }
+    k = k + 1;
+  }
+  return t_parse(role, 0, hlen) == WS_HEADER && g_h.header_len == hlen;
+}
+
+fn t_err(role: int32, max: int64, code: int32) -> bool {
+  var r: int32 = t_parse(role, max, g_in_n);
+  return r == WS_ERROR && g_h.error_code == code && g_h.error.length > 0;
+}
+
+fn t_rfc_frames(arena: Arena*) {
+  var b: StrBuf* = strbuf_new(arena, 64);
+  var mk: uint8[4] = [0x37, 0xfa, 0x21, 0x3d];
+
+  // RFC 6455 section 5.7: "Hello", unmasked.
+  t_load(0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0), "unmasked hello parses");
+  t_expect(t_hdr_is(true, WS_OP_TEXT, false, 5, 2), "unmasked hello fields");
+  t_expect(t_prefix_walk(WS_ROLE_CLIENT, 2), "unmasked hello incremental");
+  t_expect(ws_write_text(b, "Hello", 0) == 7 && t_sb_is_loaded(b), "unmasked hello written");
+
+  // The same text masked, from a client.
+  t_load(0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  t_expect(t_ready(WS_ROLE_SERVER, 0), "masked hello parses");
+  t_expect(t_hdr_is(true, WS_OP_TEXT, true, 5, 6), "masked hello fields");
+  t_expect(g_h.mask[0] == (uint8)0x37 && g_h.mask[1] == (uint8)0xfa &&
+           g_h.mask[2] == (uint8)0x21 && g_h.mask[3] == (uint8)0x3d, "masked hello key");
+  t_expect(t_prefix_walk(WS_ROLE_SERVER, 6), "masked hello incremental");
+  ws_unmask(&g_in[6], 5, &g_h.mask[0], 0);
+  t_expect(t_hash(&g_in[6], 5) == t_hash_s("Hello"), "masked hello unmasks");
+  b->len = 0;
+  t_load(0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  t_expect(ws_write_text(b, "Hello", &mk[0]) == 11 && t_sb_is_loaded(b), "masked hello written");
+
+  // A fragmented message: "Hel" then "lo".
+  t_load(0x01, 0x03, 0x48, 0x65, 0x6c);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && t_hdr_is(false, WS_OP_TEXT, false, 3, 2), "first fragment");
+  b->len = 0;
+  t_expect(ws_write_frame(b, false, WS_OP_TEXT, (uint8*)"Hel".chars, 3, 0) == 5 && t_sb_is_loaded(b), "first fragment written");
+  t_load(0x80, 0x02, 0x6c, 0x6f);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && t_hdr_is(true, WS_OP_CONT, false, 2, 2), "last fragment");
+  b->len = 0;
+  t_expect(ws_write_frame(b, true, WS_OP_CONT, (uint8*)"lo".chars, 2, 0) == 4 && t_sb_is_loaded(b), "last fragment written");
+
+  // Ping, and a masked pong, both "Hello".
+  t_load(0x89, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && t_hdr_is(true, WS_OP_PING, false, 5, 2), "ping");
+  b->len = 0;
+  t_expect(ws_write_ping(b, (uint8*)"Hello".chars, 5, 0) == 7 && t_sb_is_loaded(b), "ping written");
+  t_load(0x8a, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  t_expect(t_ready(WS_ROLE_SERVER, 0) && t_hdr_is(true, WS_OP_PONG, true, 5, 6), "masked pong");
+  b->len = 0;
+  t_expect(ws_write_pong(b, (uint8*)"Hello".chars, 5, &mk[0]) == 11 && t_sb_is_loaded(b), "pong written");
+
+  // 256 bytes in a binary frame: the 16-bit length.
+  t_load(0x82, 0x7E, 0x01, 0x00);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && t_hdr_is(true, WS_OP_BINARY, false, 256, 4), "256 byte header");
+  t_expect(t_prefix_walk(WS_ROLE_CLIENT, 4), "256 byte incremental");
+  var pay: uint8[] = new uint8[65536];
+  for i in 0..65536 { pay[i] = (uint8)(i * 7); }
+  b->len = 0;
+  t_expect(ws_write_binary(b, pay.data, 256, 0) == 260, "256 byte frame written");
+  t_expect(b->len == 260 && b->data[0] == (uint8)0x82 && b->data[1] == (uint8)0x7E &&
+           b->data[2] == (uint8)1 && b->data[3] == (uint8)0 && b->data[4] == pay[0] &&
+           b->data[259] == pay[255], "256 byte frame bytes");
+
+  // 64 KiB: the 64-bit length.
+  t_load(0x82, 0x7F, 0, 0, 0, 0, 0, 1, 0, 0);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && t_hdr_is(true, WS_OP_BINARY, false, 65536, 10), "64k header");
+  t_expect(t_prefix_walk(WS_ROLE_CLIENT, 10), "64k incremental");
+  t_expect(t_ready(WS_ROLE_CLIENT, 65536), "64k within max");
+  b->len = 0;
+  t_expect(ws_write_binary(b, pay.data, 65536, 0) == 65546, "64k frame written");
+  t_expect(b->data[0] == (uint8)0x82 && b->data[1] == (uint8)0x7F && b->data[7] == (uint8)1 &&
+           b->data[8] == (uint8)0 && b->data[9] == (uint8)0 && b->data[10] == pay[0] &&
+           b->data[65545] == pay[65535], "64k frame bytes");
+  // Masked on the way out, unmasked on the way back.
+  b->len = 0;
+  t_expect(ws_write_binary(b, pay.data, 65536, &mk[0]) == 65550, "64k masked written");
+  var back: uint8* = (uint8*)b->data;
+  t_expect(ws_parse_header(back, b->len, WS_ROLE_SERVER, 0, &g_h) == WS_HEADER &&
+           t_hdr_is(true, WS_OP_BINARY, true, 65536, 14), "64k masked header");
+  ws_unmask(back + 14, 65536, &g_h.mask[0], 0);
+  t_expect(t_hash(back + 14, 65536) == t_hash(pay.data, 65536), "64k masked round trip");
+  free(pay.data);
+}
+
+fn t_header_edges() {
+  // The largest legal length parses, and a bound turns it into 1009.
+  t_load(0x82, 0x7F, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && g_h.payload_len == 9223372036854775807, "length 2^63-1 parses");
+  t_expect(t_err(WS_ROLE_CLIENT, 1000, 1009), "length 2^63-1 over a bound");
+  t_load(0x82, 0x7F, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && g_h.payload_len == 4294967296, "length 2^32 parses");
+  t_load(0x82, 0x7E, 0xFF, 0xFF);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && g_h.payload_len == 65535, "length 65535 parses");
+  t_load(0x82, 0x7E, 0x00, 0x7E);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && g_h.payload_len == 126, "length 126 parses");
+  t_load(0x82, 0x7D);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && g_h.payload_len == 125, "length 125 parses");
+  t_load(0x82, 0x00);
+  t_expect(t_ready(WS_ROLE_CLIENT, 0) && g_h.payload_len == 0, "length 0 parses");
+  // The bound is for data frames, and is inclusive.
+  t_load(0x82, 0x7D);
+  t_expect(t_ready(WS_ROLE_CLIENT, 125), "bound is inclusive");
+  t_expect(t_err(WS_ROLE_CLIENT, 124, 1009), "one past the bound");
+  t_load(0x89, 0x7D);
+  t_expect(t_ready(WS_ROLE_CLIENT, 10), "control frames ignore the bound");
+  // Masked, extended length: the key follows the length.
+  t_load(0x82, 0xFE, 0x01, 0x00, 1, 2, 3, 4);
+  t_expect(t_ready(WS_ROLE_SERVER, 0) && t_hdr_is(true, WS_OP_BINARY, true, 256, 8), "masked 16-bit length");
+  t_expect(t_prefix_walk(WS_ROLE_SERVER, 8), "masked 16-bit incremental");
+  t_expect(g_h.mask[0] == (uint8)1 && g_h.mask[3] == (uint8)4, "masked 16-bit key");
+  t_load(0x82, 0xFF, 0, 0, 0, 0, 0, 1, 0, 0, 9, 8, 7, 6);
+  t_expect(t_ready(WS_ROLE_SERVER, 0) && t_hdr_is(true, WS_OP_BINARY, true, 65536, 14), "masked 64-bit length");
+  t_expect(t_prefix_walk(WS_ROLE_SERVER, 14), "masked 64-bit incremental");
+  t_expect(g_h.mask[0] == (uint8)9 && g_h.mask[3] == (uint8)6, "masked 64-bit key");
+  // Nothing at all, and a null-ish call.
+  t_expect(t_parse(WS_ROLE_SERVER, 0, 0) == WS_NEED_MORE, "empty input wants more");
+}
+
+fn t_header_errors() {
+  var s: int32 = WS_ROLE_SERVER;
+  var c: int32 = WS_ROLE_CLIENT;
+  // RSV bits.
+  t_load(0xC1, 0x80, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "rsv1");
+  t_load(0xA1, 0x80, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "rsv2");
+  t_load(0x91, 0x80, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "rsv3");
+  t_load(0xF1, 0x80, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "rsv all");
+  t_load(0x41);
+  t_expect(t_err(s, 0, 1002), "rsv seen from one byte");
+  // Reserved opcodes: 3 to 7 and 11 to 15.
+  var bad: int32 = 0;
+  var op: int32 = 3;
+  while (op <= 15) {
+    if (op < 8 || op > 10) {
+      t_load(0x80 | op, 0x80, 0, 0, 0, 0);
+      if (!t_err(s, 0, 1002)) { bad = bad + 1; }
+      t_load(0x80 | op, 0x00);
+      if (!t_err(c, 0, 1002)) { bad = bad + 1; }
+    }
+    op = op + 1;
+  }
+  t_expect(bad == 0, "reserved opcodes");
+  // Control frames: FIN set, 125 bytes at most.
+  t_load(0x08, 0x80, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "fragmented close");
+  t_load(0x09, 0x80, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "fragmented ping");
+  t_load(0x0A, 0x80, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "fragmented pong");
+  t_load(0x09);
+  t_expect(t_err(s, 0, 1002), "fragmented ping seen from one byte");
+  t_load(0x89, 0xFE, 0x00, 0x7E, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "ping with 16-bit length");
+  t_load(0x89, 0xFE);
+  t_expect(t_err(s, 0, 1002), "ping with 16-bit length seen early");
+  t_load(0x88, 0xFF, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "close with 64-bit length");
+  t_load(0x8A, 0xFE, 0x00, 0x7E, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "pong with 126 bytes");
+  t_load(0x89, 0xFD, 0, 0, 0, 0);
+  t_expect(t_ready(s, 0) && g_h.payload_len == 125, "ping with 125 bytes is fine");
+  // Masking by role.
+  t_load(0x81, 0x05);
+  t_expect(t_err(s, 0, 1002), "unmasked frame to a server");
+  t_load(0x88, 0x00);
+  t_expect(t_err(s, 0, 1002), "unmasked close to a server");
+  t_load(0x81, 0x85, 0, 0, 0, 0);
+  t_expect(t_err(c, 0, 1002), "masked frame to a client");
+  t_load(0x81);
+  t_expect(t_parse(s, 0, 1) == WS_NEED_MORE, "one byte wants more");
+  // Lengths that are not minimal.
+  t_load(0x82, 0xFE, 0x00, 0x7D, 0, 0, 0, 0);
+  t_expect(t_err(s, 0, 1002), "16-bit length 125");
+  t_load(0x82, 0x7E, 0x00, 0x00);
+  t_expect(t_err(c, 0, 1002), "16-bit length 0");
+  t_load(0x82, 0x7E, 0x00, 0x7D);
+  t_expect(t_err(c, 0, 1002), "16-bit length 125 from a server");
+  t_load(0x82, 0x7F, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF);
+  t_expect(t_err(c, 0, 1002), "64-bit length 65535");
+  t_load(0x82, 0x7F, 0, 0, 0, 0, 0, 0, 0, 5);
+  t_expect(t_err(c, 0, 1002), "64-bit length 5");
+  // A 64-bit length with the top bit set.
+  t_load(0x82, 0x7F, 0x80, 0, 0, 0, 0, 0, 0, 0);
+  t_expect(t_err(c, 0, 1002), "64-bit length top bit");
+  t_load(0x82, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
+  t_expect(t_err(c, 0, 1002), "64-bit length all ones");
+  // Too big: 1009, as soon as the length is known.
+  t_load(0x82, 0x7E, 0x04, 0x00);
+  t_expect(t_err(c, 1023, 1009), "16-bit length over the bound");
+  t_load(0x82, 0xFE, 0x04, 0x00);
+  t_expect(t_err(s, 1023, 1009), "length over the bound before the mask key");
+  t_load(0x82, 0x7F, 0, 0, 0, 1, 0, 0, 0, 0);
+  t_expect(t_err(c, 1000000, 1009), "64-bit length over the bound");
+  t_load(0x01, 0x7E, 0x04, 0x00);
+  t_expect(t_err(c, 1023, 1009), "text fragment over the bound");
+  // A parse error does not leave a ready-looking header behind.
+  t_load(0x82, 0x7E, 0x04, 0x00);
+  t_parse(c, 1023, g_in_n);
+  t_expect(!g_h.fin && g_h.header_len == 0 && g_h.payload_len == 0, "error leaves a blank header");
+}
+
+fn t_unmask() {
+  var data: uint8[40];
+  var want: uint8[40];
+  var mask: uint8[4] = [0x12, 0xAB, 0xCD, 0x07];
+  for i in 0..40 {
+    data[i] = (uint8)(i * 13 + 1);
+    want[i] = (uint8)(i * 13 + 1);
+  }
+  // The plain loop, as the reference.
+  for i in 0..37 { want[i] = (uint8)(want[i] ^ mask[i & 3]); }
+  var whole: uint8[40];
+  for i in 0..40 { whole[i] = data[i]; }
+  ws_unmask(&whole[0], 37, &mask[0], 0);
+  var same: bool = true;
+  for i in 0..40 { if (whole[i] != want[i]) { same = false; } }
+  t_expect(same, "unmask whole");
+  // Twice is the identity.
+  ws_unmask(&whole[0], 37, &mask[0], 0);
+  same = true;
+  for i in 0..40 { if (whole[i] != data[i]) { same = false; } }
+  t_expect(same, "unmask twice");
+  // Two pieces at every split.
+  var all_two: bool = true;
+  for s in 0..38 {
+    var p: uint8[40];
+    for i in 0..40 { p[i] = data[i]; }
+    ws_unmask(&p[0], (int64)s, &mask[0], 0);
+    ws_unmask(&p[s], (int64)(37 - s), &mask[0], (int64)s);
+    for i in 0..40 { if (p[i] != want[i]) { all_two = false; } }
+  }
+  t_expect(all_two, "unmask in two pieces");
+  // Three pieces at every pair of splits.
+  var all_three: bool = true;
+  for s in 0..38 {
+    for e in s..38 {
+      var p: uint8[40];
+      for i in 0..40 { p[i] = data[i]; }
+      ws_unmask(&p[0], (int64)s, &mask[0], 0);
+      ws_unmask(&p[s], (int64)(e - s), &mask[0], (int64)s);
+      ws_unmask(&p[e], (int64)(37 - e), &mask[0], (int64)e);
+      for i in 0..40 { if (p[i] != want[i]) { all_three = false; } }
+    }
+  }
+  t_expect(all_three, "unmask in three pieces");
+  // Byte at a time.
+  var p1: uint8[40];
+  for i in 0..40 { p1[i] = data[i]; }
+  for i in 0..37 { ws_unmask(&p1[i], 1, &mask[0], (int64)i); }
+  same = true;
+  for i in 0..40 { if (p1[i] != want[i]) { same = false; } }
+  t_expect(same, "unmask byte by byte");
+  // A zero-length piece changes nothing. The offset only matters mod 4.
+  ws_unmask(&p1[0], 0, &mask[0], 5);
+  var q: uint8[8];
+  for i in 0..8 { q[i] = (uint8)i; }
+  ws_unmask(&q[0], 8, &mask[0], 4);
+  same = true;
+  for i in 0..8 { if (q[i] != (uint8)(i ^ (int32)mask[i & 3])) { same = false; } }
+  t_expect(same, "unmask offset is mod 4");
+  var r: uint8[8];
+  for i in 0..8 { r[i] = (uint8)i; }
+  ws_unmask(&r[0], 8, &mask[0], 7);
+  same = true;
+  for i in 0..8 { if (r[i] != (uint8)(i ^ (int32)mask[(i + 7) & 3])) { same = false; } }
+  t_expect(same, "unmask odd offset");
+}
+
+fn t_hdr_bytes(len: int64, masked: bool, hlen: int64) -> bool {
+  var out: uint8[14];
+  var mk: uint8[4] = [1, 2, 3, 4];
+  var mp: uint8* = (uint8*)0;
+  if (masked) { mp = &mk[0]; }
+  var n: int64 = ws_header_write(&out[0], 14, true, WS_OP_BINARY, len, mp);
+  if (n != hlen) { return false; }
+  // Read it back as the other side would.
+  var role: int32 = WS_ROLE_CLIENT;
+  if (masked) { role = WS_ROLE_SERVER; }
+  var h: WsHeader;
+  if (ws_parse_header(&out[0], n, role, 0, &h) != WS_HEADER) { return false; }
+  if (h.payload_len != len || h.header_len != hlen || h.masked != masked) { return false; }
+  if (masked && (h.mask[0] != (uint8)1 || h.mask[3] != (uint8)4)) { return false; }
+  // One byte short must want more.
+  if (ws_parse_header(&out[0], n - 1, role, 0, &h) != WS_NEED_MORE) { return false; }
+  return true;
+}
+
+fn t_header_writer() {
+  t_expect(t_hdr_bytes(0, false, 2), "write len 0");
+  t_expect(t_hdr_bytes(1, false, 2), "write len 1");
+  t_expect(t_hdr_bytes(125, false, 2), "write len 125");
+  t_expect(t_hdr_bytes(126, false, 4), "write len 126");
+  t_expect(t_hdr_bytes(65535, false, 4), "write len 65535");
+  t_expect(t_hdr_bytes(65536, false, 10), "write len 65536");
+  t_expect(t_hdr_bytes(70000, false, 10), "write len 70000");
+  t_expect(t_hdr_bytes(4294967296, false, 10), "write len 2^32");
+  t_expect(t_hdr_bytes(9223372036854775807, false, 10), "write len 2^63-1");
+  t_expect(t_hdr_bytes(0, true, 6), "write masked len 0");
+  t_expect(t_hdr_bytes(125, true, 6), "write masked len 125");
+  t_expect(t_hdr_bytes(126, true, 8), "write masked len 126");
+  t_expect(t_hdr_bytes(65536, true, 14), "write masked len 65536");
+  t_expect(t_hdr_bytes(4294967296, true, 14), "write masked len 2^32");
+
+  var out: uint8[14];
+  var mk: uint8[4] = [1, 2, 3, 4];
+  // Exact bytes for the opcode and FIN bits.
+  t_expect(ws_header_write(&out[0], 14, true, WS_OP_TEXT, 5, 0) == 2 &&
+           out[0] == (uint8)0x81 && out[1] == (uint8)5, "write text head");
+  t_expect(ws_header_write(&out[0], 14, false, WS_OP_TEXT, 5, 0) == 2 && out[0] == (uint8)0x01, "write text no fin");
+  t_expect(ws_header_write(&out[0], 14, true, WS_OP_CONT, 5, 0) == 2 && out[0] == (uint8)0x80, "write cont");
+  t_expect(ws_header_write(&out[0], 14, true, WS_OP_CLOSE, 2, 0) == 2 && out[0] == (uint8)0x88, "write close");
+  t_expect(ws_header_write(&out[0], 14, true, WS_OP_TEXT, 5, &mk[0]) == 6 && out[1] == (uint8)0x85 &&
+           out[2] == (uint8)1 && out[5] == (uint8)4, "write masked head");
+  // Refused.
+  t_expect(ws_header_write(&out[0], 14, true, 3, 5, 0) == -1, "write opcode 3");
+  t_expect(ws_header_write(&out[0], 14, true, 11, 5, 0) == -1, "write opcode 11");
+  t_expect(ws_header_write(&out[0], 14, true, 16, 5, 0) == -1, "write opcode 16");
+  t_expect(ws_header_write(&out[0], 14, true, -1, 5, 0) == -1, "write opcode -1");
+  t_expect(ws_header_write(&out[0], 14, false, WS_OP_PING, 5, 0) == -1, "write fragmented ping");
+  t_expect(ws_header_write(&out[0], 14, false, WS_OP_CLOSE, 0, 0) == -1, "write fragmented close");
+  t_expect(ws_header_write(&out[0], 14, true, WS_OP_PING, 126, 0) == -1, "write ping 126");
+  t_expect(ws_header_write(&out[0], 14, true, WS_OP_PING, 125, 0) == 2, "write ping 125");
+  t_expect(ws_header_write(&out[0], 14, true, WS_OP_TEXT, -1, 0) == -1, "write negative length");
+  t_expect(ws_header_write(&out[0], 1, true, WS_OP_TEXT, 5, 0) == -1, "write cap 1");
+  t_expect(ws_header_write(&out[0], 5, true, WS_OP_TEXT, 5, &mk[0]) == -1, "write masked cap 5");
+  t_expect(ws_header_write(&out[0], 6, true, WS_OP_TEXT, 5, &mk[0]) == 6, "write masked cap 6");
+  t_expect(ws_header_write(&out[0], 9, true, WS_OP_TEXT, 65536, 0) == -1, "write 64-bit cap 9");
+  t_expect(ws_header_write(0, 14, true, WS_OP_TEXT, 5, 0) == -1, "write null out");
+}
+
+fn t_frame_writers(arena: Arena*) {
+  var b: StrBuf* = strbuf_new(arena, 16);
+  var mk: uint8[4] = [0x37, 0xfa, 0x21, 0x3d];
+  var d: uint8[200];
+  for i in 0..200 { d[i] = (uint8)i; }
+  t_expect(ws_write_ping(b, &d[0], 126, 0) == -1 && b->len == 0, "ping 126 refused");
+  t_expect(ws_write_ping(b, &d[0], 125, 0) == 127 && b->len == 127, "ping 125 written");
+  b->len = 0;
+  t_expect(ws_write_frame(b, false, WS_OP_PONG, &d[0], 1, 0) == -1, "fragmented pong refused");
+  t_expect(ws_write_frame(b, true, 5, &d[0], 1, 0) == -1, "bad opcode refused");
+  t_expect(ws_write_frame(b, true, WS_OP_BINARY, 0, 3, 0) == -1, "null payload refused");
+  t_expect(ws_write_frame(b, true, WS_OP_BINARY, 0, 0, 0) == 2, "empty frame with no pointer");
+  b->len = 0;
+  t_expect(ws_write_binary(b, &d[0], 0, &mk[0]) == 6 && b->len == 6, "empty masked frame");
+  b->len = 0;
+  // The text must be UTF-8.
+  var bad: uint8[2] = [0xC3, 0x28];
+  t_expect(ws_write_text(b, str_from_bytes((cstring)&bad[0], 2), 0) == -1 && b->len == 0, "bad text refused");
+  t_expect(ws_write_text(b, "", 0) == 2 && b->len == 2, "empty text");
+  b->len = 0;
+  // A data frame written then parsed back, masked, a payload at a time.
+  t_expect(ws_write_binary(b, &d[0], 200, &mk[0]) == 208, "masked 200 written");
+  var w: uint8* = (uint8*)b->data;
+  t_expect(ws_parse_header(w, b->len, WS_ROLE_SERVER, 0, &g_h) == WS_HEADER &&
+           t_hdr_is(true, WS_OP_BINARY, true, 200, 8), "masked 200 header");
+  ws_unmask(w + 8, 77, &g_h.mask[0], 0);
+  ws_unmask(w + 8 + 77, 123, &g_h.mask[0], 77);
+  t_expect(t_hash(w + 8, 200) == t_hash(&d[0], 200), "masked 200 round trip");
+  // The wire is masked: the payload on it is not the data.
+  b->len = 0;
+  ws_write_binary(b, &d[0], 200, &mk[0]);
+  t_expect(t_hash((uint8*)b->data + 8, 200) != t_hash(&d[0], 200), "masked payload differs on the wire");
+  t_expect(d[5] == (uint8)5, "the caller's payload is not touched");
+}
+
+// ---- close frames ----
+
+fn t_codes() {
+  var good: int32[16] = [1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 3000, 3999, 4000, 4999];
+  var bad: int32[16] = [0, 1, 999, 1004, 1005, 1006, 1015, 1016, 2000, 2999, 5000, 65535, -1000, 1100, 4500000, 5];
+  var ok: bool = true;
+  for i in 0..16 {
+    if (!ws_close_code_valid(good[i])) { ok = false; }
+    if (ws_close_code_valid(bad[i])) { ok = false; }
+  }
+  t_expect(ok, "close code table");
+  var every: int32 = 0;
+  for c in 0..70000 {
+    if (ws_close_code_valid(c)) { every = every + 1; }
+  }
+  // 1000..1003 (4), 1007..1014 (8), 3000..4999 (2000).
+  t_expect(every == 2012, "close code count");
+}
+
+fn t_close_encode() {
+  var out: uint8[125];
+  t_expect(ws_close_encode(1000, "", &out[0], 125) == 2 && out[0] == (uint8)0x03 && out[1] == (uint8)0xE8, "encode 1000");
+  t_expect(ws_close_encode(1001, "bye", &out[0], 125) == 5 && out[1] == (uint8)0xE9 &&
+           out[2] == (uint8)98 && out[4] == (uint8)101, "encode with reason");
+  t_expect(ws_close_encode(4999, "", &out[0], 125) == 2 && out[0] == (uint8)0x13 && out[1] == (uint8)0x87, "encode 4999");
+  t_expect(ws_close_encode(1005, "", &out[0], 125) == 0, "encode no status is empty");
+  t_expect(ws_close_encode(1005, "x", &out[0], 125) == -1, "encode no status with reason");
+  t_expect(ws_close_encode(1006, "", &out[0], 125) == -1, "encode 1006");
+  t_expect(ws_close_encode(1004, "", &out[0], 125) == -1, "encode 1004");
+  t_expect(ws_close_encode(1015, "", &out[0], 125) == -1, "encode 1015");
+  t_expect(ws_close_encode(999, "", &out[0], 125) == -1, "encode 999");
+  t_expect(ws_close_encode(2000, "", &out[0], 125) == -1, "encode 2000");
+  t_expect(ws_close_encode(0, "", &out[0], 125) == -1, "encode 0");
+  var rbytes: uint8[124];
+  for i in 0..124 { rbytes[i] = (uint8)97; }
+  var r123: string = str_from_bytes((cstring)&rbytes[0], 123);
+  var r124: string = str_from_bytes((cstring)&rbytes[0], 124);
+  t_expect(r123.length == 123, "reason sample is 123 bytes");
+  t_expect(ws_close_encode(1000, r123, &out[0], 125) == 125, "encode 123 byte reason");
+  t_expect(ws_close_encode(1000, r124, &out[0], 125) == -1, "encode 124 byte reason");
+  t_expect(ws_close_encode(1000, "abc", &out[0], 4) == -1, "encode small cap");
+  t_expect(ws_close_encode(1000, "abc", &out[0], 5) == 5, "encode exact cap");
+  t_expect(ws_close_encode(1000, "", 0, 125) == -1, "encode null out");
+  var badr: uint8[2] = [0xC3, 0x28];
+  t_expect(ws_close_encode(1000, str_from_bytes((cstring)&badr[0], 2), &out[0], 125) == -1, "encode bad UTF-8 reason");
+  // A reason with a multi-byte character.
+  t_expect(ws_close_encode(1000, "é", &out[0], 125) == 4, "encode UTF-8 reason");
+}
+
+fn t_close_parse() {
+  var c: WsClose;
+  t_expect(ws_close_parse((uint8*)0, 0, &c) == 0 && c.code == 1005 && c.reason.length == 0, "parse empty");
+  t_load(0x03);
+  t_expect(ws_close_parse(&g_in[0], 1, &c) == 1002, "parse one byte");
+  t_load(0x03, 0xE8);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 0 && c.code == 1000 && c.reason.length == 0, "parse code only");
+  t_load(0x03, 0xE8, 0x62, 0x79, 0x65);
+  t_expect(ws_close_parse(&g_in[0], 5, &c) == 0 && c.code == 1000 && c.reason == "bye", "parse with reason");
+  t_load(0x03, 0xED);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 1002, "parse 1005 on the wire");
+  t_load(0x03, 0xEE);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 1002, "parse 1006 on the wire");
+  t_load(0x03, 0xEC);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 1002, "parse 1004 on the wire");
+  t_load(0x03, 0xF7);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 1002, "parse 1015 on the wire");
+  t_load(0x03, 0xE7);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 1002, "parse 999");
+  t_load(0x00, 0x00);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 1002, "parse 0");
+  t_load(0x03, 0xF8);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 1002, "parse 1016");
+  t_load(0x0B, 0xB7);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 1002, "parse 2999");
+  t_load(0x0B, 0xB8);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 0 && c.code == 3000, "parse 3000");
+  t_load(0x13, 0x88);
+  t_expect(ws_close_parse(&g_in[0], 2, &c) == 1002, "parse 5000");
+  t_load(0x03, 0xE8, 0xC3, 0x28);
+  t_expect(ws_close_parse(&g_in[0], 4, &c) == 1007, "parse bad UTF-8 reason");
+  t_load(0x03, 0xE8, 0xC3);
+  t_expect(ws_close_parse(&g_in[0], 3, &c) == 1007, "parse cut-off reason");
+  t_load(0x03, 0xE8, 0xC3, 0xA9);
+  t_expect(ws_close_parse(&g_in[0], 4, &c) == 0 && c.reason.length == 2, "parse UTF-8 reason");
+  // Every code goes through encode and parse the same way.
+  var same: bool = true;
+  var out: uint8[125];
+  for code in 0..5100 {
+    var n: int64 = ws_close_encode(code, "", &out[0], 125);
+    out[0] = (uint8)((code >> 8) & 255);
+    out[1] = (uint8)(code & 255);
+    var r: int32 = ws_close_parse(&out[0], 2, &c);
+    if (ws_close_code_valid(code)) {
+      if (n != 2 || r != 0 || c.code != code) { same = false; }
+    } else {
+      if (code != 1005 && n != -1) { same = false; }
+      if (r != 1002) { same = false; }
+    }
+  }
+  t_expect(same, "encode and parse agree on every code");
+}
+
+fn t_close_write(arena: Arena*) {
+  var b: StrBuf* = strbuf_new(arena, 32);
+  var mk: uint8[4] = [1, 2, 3, 4];
+  t_expect(ws_write_close(b, 1000, "bye", 0) == 7, "close frame written");
+  t_load(0x88, 0x05, 0x03, 0xE8, 0x62, 0x79, 0x65);
+  t_expect(t_sb_is_loaded(b), "close frame bytes");
+  b->len = 0;
+  t_expect(ws_write_close(b, 1005, "", 0) == 2 && b->data[0] == (uint8)0x88 && b->data[1] == (uint8)0, "empty close frame");
+  b->len = 0;
+  t_expect(ws_write_close(b, 1006, "", 0) == -1 && b->len == 0, "close frame bad code");
+  t_expect(ws_write_close(b, 1000, "bye", &mk[0]) == 11, "masked close frame");
+  t_expect(b->data[1] == (uint8)0x85 && b->data[6] == (uint8)(3 ^ 1) && b->data[7] == (uint8)(0xE8 ^ 2), "masked close bytes");
+}
+
+// ---- UTF-8 ----
+
+// The bytes in g_in, fed whole and split at every position.
+fn t_utf8_case(valid: bool) -> bool {
+  var v: WsUtf8;
+  ws_utf8_reset(&v);
+  var one: bool = ws_utf8_feed(&v, &g_in[0], g_in_n) && ws_utf8_done(&v);
+  if (one != valid) { return false; }
+  if (ws_utf8_valid(&g_in[0], g_in_n) != valid) { return false; }
+  var s: int64 = 0;
+  while (s <= g_in_n) {
+    var w: WsUtf8;
+    ws_utf8_reset(&w);
+    var r: bool = ws_utf8_feed(&w, &g_in[0], s);
+    if (r) { r = ws_utf8_feed(&w, &g_in[s], g_in_n - s); }
+    if (r) { r = ws_utf8_done(&w); }
+    if (r != valid) { return false; }
+    s = s + 1;
+  }
+  // And one byte at a time.
+  var x: WsUtf8;
+  ws_utf8_reset(&x);
+  var all: bool = true;
+  var i: int64 = 0;
+  while (i < g_in_n && all) {
+    all = ws_utf8_feed(&x, &g_in[i], 1);
+    i = i + 1;
+  }
+  if (all) { all = ws_utf8_done(&x); }
+  return all == valid;
+}
+
+fn t_utf8_valid(xs: int32[..]) -> bool {
+  g_in_n = 0;
+  for x in xs {
+    g_in[g_in_n] = (uint8)x;
+    g_in_n = g_in_n + 1;
+  }
+  return t_utf8_case(true);
+}
+
+fn t_utf8_invalid(xs: int32[..]) -> bool {
+  g_in_n = 0;
+  for x in xs {
+    g_in[g_in_n] = (uint8)x;
+    g_in_n = g_in_n + 1;
+  }
+  return t_utf8_case(false);
+}
+
+fn t_utf8_set() {
+  t_expect(t_utf8_valid(), "utf8 empty");
+  t_expect(t_utf8_valid(0x68, 0x65, 0x6C, 0x6C, 0x6F), "utf8 ascii");
+  t_expect(t_utf8_valid(0x00, 0x7F), "utf8 nul and del");
+  t_expect(t_utf8_valid(0xC2, 0x80), "utf8 U+0080");
+  t_expect(t_utf8_valid(0xDF, 0xBF), "utf8 U+07FF");
+  t_expect(t_utf8_valid(0xE0, 0xA0, 0x80), "utf8 U+0800");
+  t_expect(t_utf8_valid(0xE1, 0x80, 0x80), "utf8 U+1000");
+  t_expect(t_utf8_valid(0xEC, 0xBF, 0xBF), "utf8 U+CFFF");
+  t_expect(t_utf8_valid(0xED, 0x9F, 0xBF), "utf8 U+D7FF");
+  t_expect(t_utf8_valid(0xEE, 0x80, 0x80), "utf8 U+E000");
+  t_expect(t_utf8_valid(0xEF, 0xBF, 0xBD), "utf8 U+FFFD");
+  t_expect(t_utf8_valid(0xEF, 0xBF, 0xBF), "utf8 U+FFFF");
+  t_expect(t_utf8_valid(0xF0, 0x90, 0x80, 0x80), "utf8 U+10000");
+  t_expect(t_utf8_valid(0xF1, 0x80, 0x80, 0x80), "utf8 U+40000");
+  t_expect(t_utf8_valid(0xF3, 0xBF, 0xBF, 0xBF), "utf8 U+FFFFF");
+  t_expect(t_utf8_valid(0xF4, 0x8F, 0xBF, 0xBF), "utf8 U+10FFFF");
+  t_expect(t_utf8_valid(0x61, 0xC3, 0xA9, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80, 0x7A), "utf8 mixed");
+  t_expect(t_utf8_valid(0xCE, 0xBA, 0xE1, 0xBD, 0xB9, 0xCF, 0x83, 0xCE, 0xBC, 0xCE, 0xB5), "utf8 kosme");
+
+  t_expect(t_utf8_invalid(0x80), "utf8 lone continuation");
+  t_expect(t_utf8_invalid(0xBF), "utf8 lone continuation BF");
+  t_expect(t_utf8_invalid(0xC0, 0x80), "utf8 overlong C0 80");
+  t_expect(t_utf8_invalid(0xC1, 0xBF), "utf8 overlong C1 BF");
+  t_expect(t_utf8_invalid(0xC2), "utf8 cut after C2");
+  t_expect(t_utf8_invalid(0xC2, 0x41), "utf8 C2 then ascii");
+  t_expect(t_utf8_invalid(0xC2, 0xC2), "utf8 C2 then C2");
+  t_expect(t_utf8_invalid(0xE0, 0x80, 0x80), "utf8 overlong E0 80 80");
+  t_expect(t_utf8_invalid(0xE0, 0x9F, 0xBF), "utf8 overlong E0 9F BF");
+  t_expect(t_utf8_invalid(0xE0, 0xA0), "utf8 cut after E0 A0");
+  t_expect(t_utf8_invalid(0xED, 0xA0, 0x80), "utf8 surrogate D800");
+  t_expect(t_utf8_invalid(0xED, 0xAF, 0xBF), "utf8 surrogate DBFF");
+  t_expect(t_utf8_invalid(0xED, 0xBF, 0xBF), "utf8 surrogate DFFF");
+  t_expect(t_utf8_invalid(0xE2, 0x82), "utf8 cut after E2 82");
+  t_expect(t_utf8_invalid(0xE2, 0x28, 0xA1), "utf8 E2 28 A1");
+  t_expect(t_utf8_invalid(0xE2, 0x82, 0x28), "utf8 E2 82 28");
+  t_expect(t_utf8_invalid(0xF0, 0x80, 0x80, 0x80), "utf8 overlong F0 80 80 80");
+  t_expect(t_utf8_invalid(0xF0, 0x8F, 0xBF, 0xBF), "utf8 overlong F0 8F BF BF");
+  t_expect(t_utf8_invalid(0xF0, 0x9F, 0x98), "utf8 cut after F0 9F 98");
+  t_expect(t_utf8_invalid(0xF4, 0x90, 0x80, 0x80), "utf8 above U+10FFFF");
+  t_expect(t_utf8_invalid(0xF5, 0x80, 0x80, 0x80), "utf8 F5");
+  t_expect(t_utf8_invalid(0xF7, 0xBF, 0xBF, 0xBF), "utf8 F7");
+  t_expect(t_utf8_invalid(0xF8, 0x88, 0x80, 0x80, 0x80), "utf8 five-byte form");
+  t_expect(t_utf8_invalid(0xFC, 0x84, 0x80, 0x80, 0x80, 0x80), "utf8 six-byte form");
+  t_expect(t_utf8_invalid(0xFE), "utf8 FE");
+  t_expect(t_utf8_invalid(0xFF), "utf8 FF");
+  t_expect(t_utf8_invalid(0x61, 0xC3), "utf8 text ends in a lead byte");
+  t_expect(t_utf8_invalid(0x61, 0xC3, 0xA9, 0x80), "utf8 stray continuation after a character");
+  t_expect(t_utf8_invalid(0x61, 0xF0, 0x9F, 0x98, 0x80, 0x80), "utf8 extra continuation");
+}
+
+// Checked against std/utf8 over many inputs.
+fn t_utf8_cross() {
+  var buf: uint8[4];
+  var bad: int32 = 0;
+  // Every one- and two-byte input.
+  for a in 0..256 {
+    buf[0] = (uint8)a;
+    if (ws_utf8_valid(&buf[0], 1) != utf8_valid(str_from_bytes((cstring)&buf[0], 1))) { bad = bad + 1; }
+    for b in 0..256 {
+      buf[1] = (uint8)b;
+      if (ws_utf8_valid(&buf[0], 2) != utf8_valid(str_from_bytes((cstring)&buf[0], 2))) { bad = bad + 1; }
+    }
+  }
+  t_expect(bad == 0, "utf8 one and two bytes match std/utf8");
+  // Every three-byte input from a lead byte of E0 to EF, and a sample of
+  // continuation values for four-byte inputs.
+  for a in 224..240 {
+    buf[0] = (uint8)a;
+    for b in 0..256 {
+      buf[1] = (uint8)b;
+      for c in 0..256 {
+        buf[2] = (uint8)c;
+        if (ws_utf8_valid(&buf[0], 3) != utf8_valid(str_from_bytes((cstring)&buf[0], 3))) { bad = bad + 1; }
+      }
+    }
+  }
+  t_expect(bad == 0, "utf8 three bytes match std/utf8");
+  var edge: int32[6] = [0x00, 0x7F, 0x80, 0x8F, 0x90, 0xBF];
+  var edge2: int32[4] = [0x80, 0xBF, 0xC0, 0x7F];
+  for a in 240..256 {
+    buf[0] = (uint8)a;
+    for b in 0..256 {
+      buf[1] = (uint8)b;
+      for c in 0..4 {
+        buf[2] = (uint8)edge2[c];
+        for d in 0..6 {
+          buf[3] = (uint8)edge[d];
+          if (ws_utf8_valid(&buf[0], 4) != utf8_valid(str_from_bytes((cstring)&buf[0], 4))) { bad = bad + 1; }
+        }
+      }
+    }
+  }
+  t_expect(bad == 0, "utf8 four bytes match std/utf8");
+}
+
+// ---- messages: a driver over ws_decode ----
+
+var g_ev: int32[16];
+var g_evh: int64[16];
+var g_evn: int32 = 0;
+var g_err: int32 = 0;
+var g_left: int64 = 0;
+var g_wire_masked: bool = true;
+
+fn t_role() -> int32 {
+  if (g_wire_masked) { return WS_ROLE_SERVER; }
+  return WS_ROLE_CLIENT;
+}
+
+fn t_frame(b: StrBuf*, fin: bool, op: int32, p: uint8*, n: int64) {
+  var mp: uint8* = (uint8*)0;
+  if (g_wire_masked) { mp = &g_mask[0]; }
+  ws_write_frame(b, fin, op, p, n, mp);
+}
+
+fn t_frame_s(b: StrBuf*, fin: bool, op: int32, s: string) {
+  t_frame(b, fin, op, s.chars, (int64)s.length);
+}
+
+// Feeds wire[0..n) to the assembler chunk bytes at a time, keeping what
+// decode did not use, and logs each event. Returns 0, or WS_ERROR (then
+// g_err is the close code).
+fn t_drive(a: WsAssembler*, wire: uint8*, n: int64, chunk: int64) -> int32 {
+  var pend: uint8[5000];
+  var have: int64 = 0;
+  var src: int64 = 0;
+  g_evn = 0;
+  g_err = 0;
+  g_left = 0;
+  while (true) {
+    var take: int64 = n - src;
+    if (take > chunk) { take = chunk; }
+    if (take > 5000 - have) { take = 5000 - have; }
+    for i in 0..take { pend[have + i] = wire[src + i]; }
+    have = have + take;
+    src = src + take;
+    var used: int64 = 0;
+    var ev: int32 = ws_decode(a, &pend[0], have, &used);
+    var rest: int64 = have - used;
+    for i in 0..rest { pend[i] = pend[used + i]; }
+    have = rest;
+    if (ev == WS_ERROR) {
+      g_err = a->error_code;
+      return WS_ERROR;
+    }
+    if (ev != WS_EV_NONE) {
+      g_ev[g_evn] = ev;
+      if (ev == WS_EV_MESSAGE) {
+        var m: string = ws_assembler_message(a);
+        g_evh[g_evn] = t_hash_s(m);
+        if ((int64)m.length != a->message_len) { g_evh[g_evn] = -1; }
+      } else if (ev == WS_EV_CLOSE) {
+        g_evh[g_evn] = (int64)a->close.code;
+      } else {
+        g_evh[g_evn] = t_hash_s(ws_assembler_control(a));
+      }
+      g_evn = g_evn + 1;
+    } else if (src >= n) {
+      g_left = have;
+      return 0;
+    }
+  }
+  return 0;
+}
+
+fn t_ev1(ev: int32, h: int64) -> bool {
+  return g_evn == 1 && g_ev[0] == ev && g_evh[0] == h && g_err == 0;
+}
+
+// Runs the wire at several chunk sizes with a fresh assembler each time.
+// check(chunk) must hold for all.
+fn t_run(wire: StrBuf*, sink: StrBuf*, max: int64, chunk: int64) -> int32 {
+  var a: WsAssembler;
+  ws_assembler_init(&a, t_role(), max, sink);
+  return t_drive(&a, (uint8*)wire->data, wire->len, chunk);
+}
+
+fn t_chunks_agree(wire: StrBuf*, sink: StrBuf*, max: int64, ev: int32, h: int64) -> bool {
+  var sizes: int32[7] = [1, 2, 3, 5, 7, 64, 4000];
+  for i in 0..7 {
+    if (t_run(wire, sink, max, (int64)sizes[i]) != 0) { return false; }
+    if (!t_ev1(ev, h)) { return false; }
+  }
+  return true;
+}
+
+fn t_chunks_fail(wire: StrBuf*, sink: StrBuf*, max: int64, code: int32) -> bool {
+  var sizes: int32[7] = [1, 2, 3, 5, 7, 64, 4000];
+  for i in 0..7 {
+    if (t_run(wire, sink, max, (int64)sizes[i]) != WS_ERROR) { return false; }
+    if (g_err != code) { return false; }
+  }
+  return true;
+}
+
+fn t_messages(arena: Arena*) {
+  var wire: StrBuf* = strbuf_new(arena, 256);
+  var sink: StrBuf* = strbuf_new(arena, 64);
+  g_mask[0] = (uint8)0x12;
+  g_mask[1] = (uint8)0x34;
+  g_mask[2] = (uint8)0x56;
+  g_mask[3] = (uint8)0x78;
+
+  // A single frame, masked (server) and not (client).
+  for pass in 0..2 {
+    g_wire_masked = pass == 0;
+    wire->len = 0;
+    t_frame_s(wire, true, WS_OP_TEXT, "Hello");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_MESSAGE, t_hash_s("Hello")), "single text frame");
+    wire->len = 0;
+    t_frame_s(wire, true, WS_OP_BINARY, "Hello");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_MESSAGE, t_hash_s("Hello")), "single binary frame");
+    // The empty message.
+    wire->len = 0;
+    t_frame_s(wire, true, WS_OP_TEXT, "");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_MESSAGE, t_hash_s("")), "empty text message");
+    wire->len = 0;
+    t_frame_s(wire, true, WS_OP_BINARY, "");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_MESSAGE, t_hash_s("")), "empty binary message");
+    // Fragments.
+    wire->len = 0;
+    t_frame_s(wire, false, WS_OP_TEXT, "Hel");
+    t_frame_s(wire, true, WS_OP_CONT, "lo");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_MESSAGE, t_hash_s("Hello")), "two fragments");
+    wire->len = 0;
+    t_frame_s(wire, false, WS_OP_BINARY, "He");
+    t_frame_s(wire, false, WS_OP_CONT, "");
+    t_frame_s(wire, false, WS_OP_CONT, "l");
+    t_frame_s(wire, true, WS_OP_CONT, "lo");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_MESSAGE, t_hash_s("Hello")), "four fragments with an empty one");
+    wire->len = 0;
+    t_frame_s(wire, false, WS_OP_TEXT, "Hello");
+    t_frame_s(wire, true, WS_OP_CONT, "");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_MESSAGE, t_hash_s("Hello")), "empty last fragment");
+    // Control frames.
+    wire->len = 0;
+    t_frame_s(wire, true, WS_OP_PING, "Hello");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_PING, t_hash_s("Hello")), "ping");
+    wire->len = 0;
+    t_frame_s(wire, true, WS_OP_PONG, "Hello");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_PONG, t_hash_s("Hello")), "pong");
+    wire->len = 0;
+    t_frame_s(wire, true, WS_OP_PING, "");
+    t_expect(t_chunks_agree(wire, sink, 0, WS_EV_PING, t_hash_s("")), "empty ping");
+  }
+}
+
+fn t_fragments(arena: Arena*) {
+  var wire: StrBuf* = strbuf_new(arena, 256);
+  var sink: StrBuf* = strbuf_new(arena, 64);
+  var a: WsAssembler;
+  g_wire_masked = true;
+
+  // Control frames between fragments: the message survives, in order.
+  wire->len = 0;
+  t_frame_s(wire, false, WS_OP_TEXT, "Hel");
+  t_frame_s(wire, true, WS_OP_PING, "p1");
+  t_frame_s(wire, false, WS_OP_CONT, "l");
+  t_frame_s(wire, true, WS_OP_PONG, "p2");
+  t_frame_s(wire, true, WS_OP_CONT, "o");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 3) == 0, "interleaved runs");
+  t_expect(g_evn == 3 && g_ev[0] == WS_EV_PING && g_evh[0] == t_hash_s("p1") &&
+           g_ev[1] == WS_EV_PONG && g_evh[1] == t_hash_s("p2") &&
+           g_ev[2] == WS_EV_MESSAGE && g_evh[2] == t_hash_s("Hello"), "interleaved events");
+  t_expect(a.message_type == WS_OP_TEXT && a.message_len == 5, "interleaved message info");
+  // Byte by byte gives the same.
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 1) == 0, "interleaved bytewise runs");
+  t_expect(g_evn == 3 && g_ev[2] == WS_EV_MESSAGE && g_evh[2] == t_hash_s("Hello"), "interleaved bytewise events");
+
+  // Two messages in a row; the sink holds only the latest.
+  wire->len = 0;
+  t_frame_s(wire, true, WS_OP_TEXT, "first message");
+  t_frame_s(wire, false, WS_OP_BINARY, "sec");
+  t_frame_s(wire, true, WS_OP_CONT, "ond");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 4) == 0, "two messages run");
+  t_expect(g_evn == 2 && g_evh[0] == t_hash_s("first message") && g_evh[1] == t_hash_s("second") &&
+           a.message_type == WS_OP_BINARY && a.message_len == 6 && sink->len == 6, "two messages");
+
+  // A data frame inside a fragmented message.
+  wire->len = 0;
+  t_frame_s(wire, false, WS_OP_TEXT, "Hel");
+  t_frame_s(wire, true, WS_OP_TEXT, "lo");
+  t_expect(t_chunks_fail(wire, sink, 0, 1002), "text inside a fragmented text");
+  wire->len = 0;
+  t_frame_s(wire, false, WS_OP_BINARY, "Hel");
+  t_frame_s(wire, true, WS_OP_TEXT, "lo");
+  t_expect(t_chunks_fail(wire, sink, 0, 1002), "text inside a fragmented binary");
+  wire->len = 0;
+  t_frame_s(wire, false, WS_OP_TEXT, "Hel");
+  t_frame_s(wire, false, WS_OP_BINARY, "lo");
+  t_expect(t_chunks_fail(wire, sink, 0, 1002), "binary inside a fragmented text");
+  // A continuation with nothing to continue.
+  wire->len = 0;
+  t_frame_s(wire, true, WS_OP_CONT, "lo");
+  t_expect(t_chunks_fail(wire, sink, 0, 1002), "continuation first");
+  wire->len = 0;
+  t_frame_s(wire, true, WS_OP_TEXT, "Hello");
+  t_frame_s(wire, true, WS_OP_CONT, "lo");
+  t_expect(t_chunks_fail(wire, sink, 0, 1002), "continuation after a whole message");
+  wire->len = 0;
+  t_frame_s(wire, true, WS_OP_PING, "x");
+  t_frame_s(wire, false, WS_OP_CONT, "lo");
+  t_expect(t_chunks_fail(wire, sink, 0, 1002), "continuation after a ping");
+  // A new message may start once the last one ended.
+  wire->len = 0;
+  t_frame_s(wire, false, WS_OP_TEXT, "a");
+  t_frame_s(wire, true, WS_OP_CONT, "b");
+  t_frame_s(wire, true, WS_OP_TEXT, "c");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == 0 && g_evn == 2 && g_evh[1] == t_hash_s("c"), "message after a message");
+
+  // After a failure the assembler stays failed.
+  wire->len = 0;
+  t_frame_s(wire, true, WS_OP_CONT, "x");
+  t_frame_s(wire, true, WS_OP_TEXT, "fine");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == WS_ERROR && a.failed && a.error_code == 1002 &&
+           a.error.length > 0, "failure is recorded");
+  var used: int64 = 0;
+  t_expect(ws_decode(&a, (uint8*)wire->data, wire->len, &used) == WS_ERROR && a.error_code == 1002, "failure sticks");
+}
+
+fn t_limits(arena: Arena*) {
+  var wire: StrBuf* = strbuf_new(arena, 256);
+  var sink: StrBuf* = strbuf_new(arena, 64);
+  var a: WsAssembler;
+  g_wire_masked = true;
+  // The cap is on the message, and exact.
+  wire->len = 0;
+  t_frame_s(wire, true, WS_OP_BINARY, "0123456789");
+  t_expect(t_chunks_agree(wire, sink, 10, WS_EV_MESSAGE, t_hash_s("0123456789")), "message at the cap");
+  wire->len = 0;
+  t_frame_s(wire, true, WS_OP_BINARY, "0123456789A");
+  t_expect(t_chunks_fail(wire, sink, 10, 1009), "message one over the cap");
+  // Several fragments add up.
+  wire->len = 0;
+  t_frame_s(wire, false, WS_OP_TEXT, "01234");
+  t_frame_s(wire, false, WS_OP_CONT, "56789");
+  t_frame_s(wire, true, WS_OP_CONT, "");
+  t_expect(t_chunks_agree(wire, sink, 10, WS_EV_MESSAGE, t_hash_s("0123456789")), "fragments at the cap");
+  wire->len = 0;
+  t_frame_s(wire, false, WS_OP_TEXT, "012345");
+  t_frame_s(wire, true, WS_OP_CONT, "56789");
+  t_expect(t_chunks_fail(wire, sink, 10, 1009), "fragments over the cap");
+  // The cap is checked when the header comes, before the payload.
+  wire->len = 0;
+  t_frame_s(wire, true, WS_OP_BINARY, "0123456789A");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 10, sink);
+  sink->len = 0;
+  var used: int64 = 0;
+  t_expect(ws_decode(&a, (uint8*)wire->data, 6 + 1, &used) == WS_ERROR && a.error_code == 1009 && sink->len == 0, "over the cap on the header alone");
+  // Each message starts the count again.
+  wire->len = 0;
+  t_frame_s(wire, true, WS_OP_BINARY, "0123456789");
+  t_frame_s(wire, true, WS_OP_BINARY, "0123456789");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 10, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 9) == 0 && g_evn == 2, "the cap is per message");
+  // Control frames are not counted.
+  wire->len = 0;
+  t_frame_s(wire, false, WS_OP_BINARY, "012345");
+  t_frame_s(wire, true, WS_OP_PING, "0123456789");
+  t_frame_s(wire, true, WS_OP_CONT, "6789");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 10, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == 0 && g_evn == 2 && g_ev[1] == WS_EV_MESSAGE, "control frames do not count");
+  // A huge advertised length against a small cap: 1009 and not a long wait.
+  t_load(0x82, 0xFF, 0, 0, 0, 1, 0, 0, 0, 0, 1, 2, 3, 4);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 1000, sink);
+  t_expect(ws_decode(&a, &g_in[0], g_in_n, &used) == WS_ERROR && a.error_code == 1009, "huge frame refused");
+  // No cap at all.
+  wire->len = 0;
+  var big: uint8[] = new uint8[70000];
+  for i in 0..70000 { big[i] = (uint8)(i * 3); }
+  ws_write_frame(wire, true, WS_OP_BINARY, big.data, 70000, &g_mask[0]);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 1500) == 0 && g_evn == 1 && g_evh[0] == t_hash(big.data, 70000) &&
+           a.message_len == 70000, "70000 byte message");
+  // 64 KiB through a cap of exactly that.
+  wire->len = 0;
+  ws_write_frame(wire, true, WS_OP_BINARY, big.data, 65536, &g_mask[0]);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 65536, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 4000) == 0 && g_evn == 1 && g_evh[0] == t_hash(big.data, 65536), "64k at the cap");
+  free(big.data);
+}
+
+// A text sample in g_in, sent as two or three fragments at every split.
+fn t_text_split_all(sink: StrBuf*, wire: StrBuf*, valid: bool) -> bool {
+  var sample: uint8[300];
+  var n: int64 = g_in_n;
+  for i in 0..n { sample[i] = g_in[i]; }
+  var want: int64 = t_hash(&sample[0], n);
+  var i: int64 = 0;
+  while (i <= n) {
+    var j: int64 = i;
+    while (j <= n) {
+      wire->len = 0;
+      t_frame(wire, false, WS_OP_TEXT, &sample[0], i);
+      t_frame(wire, false, WS_OP_CONT, &sample[i], j - i);
+      t_frame(wire, true, WS_OP_CONT, &sample[j], n - j);
+      var chunk: int64 = 4000;
+      var pass: int32 = 0;
+      while (pass < 2) {
+        var a: WsAssembler;
+        ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+        var r: int32 = t_drive(&a, (uint8*)wire->data, wire->len, chunk);
+        if (valid) {
+          if (r != 0 || g_evn != 1 || g_ev[0] != WS_EV_MESSAGE || g_evh[0] != want) { return false; }
+        } else {
+          if (r != WS_ERROR || g_err != 1007 || g_evn != 0) { return false; }
+        }
+        chunk = 1;
+        pass = pass + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  // Binary takes the same bytes whatever they are.
+  wire->len = 0;
+  t_frame(wire, false, WS_OP_BINARY, &sample[0], n / 2);
+  t_frame(wire, true, WS_OP_CONT, &sample[n / 2], n - n / 2);
+  var b: WsAssembler;
+  ws_assembler_init(&b, WS_ROLE_SERVER, 0, sink);
+  if (t_drive(&b, (uint8*)wire->data, wire->len, 3) != 0 || g_evh[0] != want) { return false; }
+  return true;
+}
+
+fn t_text_valid(sink: StrBuf*, wire: StrBuf*, xs: int32[..]) -> bool {
+  g_in_n = 0;
+  for x in xs {
+    g_in[g_in_n] = (uint8)x;
+    g_in_n = g_in_n + 1;
+  }
+  return t_text_split_all(sink, wire, true);
+}
+
+fn t_text_invalid(sink: StrBuf*, wire: StrBuf*, xs: int32[..]) -> bool {
+  g_in_n = 0;
+  for x in xs {
+    g_in[g_in_n] = (uint8)x;
+    g_in_n = g_in_n + 1;
+  }
+  return t_text_split_all(sink, wire, false);
+}
+
+fn t_text_messages(arena: Arena*) {
+  var wire: StrBuf* = strbuf_new(arena, 256);
+  var sink: StrBuf* = strbuf_new(arena, 64);
+  g_wire_masked = true;
+  t_expect(t_text_valid(sink, wire), "text empty");
+  t_expect(t_text_valid(sink, wire, 0x61, 0x62, 0x63), "text ascii");
+  t_expect(t_text_valid(sink, wire, 0xC3, 0xA9), "text two-byte split");
+  t_expect(t_text_valid(sink, wire, 0xE2, 0x82, 0xAC), "text three-byte split");
+  t_expect(t_text_valid(sink, wire, 0xF0, 0x9F, 0x98, 0x80), "text four-byte split");
+  t_expect(t_text_valid(sink, wire, 0x61, 0xC3, 0xA9, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80, 0x7A), "text mixed split");
+  t_expect(t_text_valid(sink, wire, 0xED, 0x9F, 0xBF), "text D7FF split");
+  t_expect(t_text_valid(sink, wire, 0xF4, 0x8F, 0xBF, 0xBF), "text 10FFFF split");
+  t_expect(t_text_invalid(sink, wire, 0x80), "text lone continuation");
+  t_expect(t_text_invalid(sink, wire, 0xC0, 0x80), "text overlong two-byte");
+  t_expect(t_text_invalid(sink, wire, 0xC3), "text ends in a lead byte");
+  t_expect(t_text_invalid(sink, wire, 0xC3, 0x28), "text bad continuation");
+  t_expect(t_text_invalid(sink, wire, 0xE0, 0x80, 0x80), "text overlong three-byte");
+  t_expect(t_text_invalid(sink, wire, 0xE2, 0x82), "text three-byte cut");
+  t_expect(t_text_invalid(sink, wire, 0xED, 0xA0, 0x80), "text surrogate");
+  t_expect(t_text_invalid(sink, wire, 0xF0, 0x80, 0x80, 0x80), "text overlong four-byte");
+  t_expect(t_text_invalid(sink, wire, 0xF0, 0x9F, 0x98), "text four-byte cut");
+  t_expect(t_text_invalid(sink, wire, 0xF4, 0x90, 0x80, 0x80), "text above 10FFFF");
+  t_expect(t_text_invalid(sink, wire, 0xF5, 0x80, 0x80, 0x80), "text F5");
+  t_expect(t_text_invalid(sink, wire, 0xFF), "text FF");
+  t_expect(t_text_invalid(sink, wire, 0x61, 0x62, 0xC3, 0xA9, 0x80), "text stray continuation at the end");
+  t_expect(t_text_invalid(sink, wire, 0xE2, 0x28, 0xA1), "text E2 28 A1");
+
+  // Invalid text fails at the bad byte, not at the end of the message.
+  var a: WsAssembler;
+  var tail: uint8[4] = [0xC0, 0x80, 0x61, 0];
+  wire->len = 0;
+  t_frame(wire, false, WS_OP_TEXT, &tail[0], 3);
+  // Only the header and the first byte have arrived.
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  var used: int64 = 0;
+  t_expect(ws_decode(&a, (uint8*)wire->data, 6 + 1, &used) == WS_ERROR && a.error_code == 1007, "text fails at the bad byte");
+  t_expect(used == 6, "text failure reports the bytes used before it");
+  // A cut-off character at the end of a final fragment is an error there.
+  var cut: uint8[2] = [0x61, 0xC3];
+  wire->len = 0;
+  t_frame(wire, false, WS_OP_TEXT, &cut[0], 2);
+  t_frame(wire, true, WS_OP_CONT, &cut[0], 0);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == WS_ERROR && g_err == 1007, "text ends mid-character");
+  // Control frames between fragments do not disturb a split character.
+  var e1: uint8[1] = [0xE2];
+  var e2: uint8[2] = [0x82, 0xAC];
+  wire->len = 0;
+  t_frame(wire, false, WS_OP_TEXT, &e1[0], 1);
+  t_frame_s(wire, true, WS_OP_PING, "x");
+  t_frame(wire, true, WS_OP_CONT, &e2[0], 2);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 2) == 0 && g_evn == 2 && g_ev[1] == WS_EV_MESSAGE && a.message_len == 3, "ping inside a split character");
+  // Binary messages are not checked.
+  var junk: uint8[4] = [0xFF, 0xC0, 0x80, 0xED];
+  wire->len = 0;
+  t_frame(wire, true, WS_OP_BINARY, &junk[0], 4);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == 0 && g_evn == 1 && g_evh[0] == t_hash(&junk[0], 4), "binary is not checked");
+}
+
+fn t_close_frames(arena: Arena*) {
+  var wire: StrBuf* = strbuf_new(arena, 256);
+  var sink: StrBuf* = strbuf_new(arena, 64);
+  var a: WsAssembler;
+  var mk: uint8[4] = [5, 6, 7, 8];
+
+  // A close with a code and a reason, masked.
+  ws_write_close(wire, 1001, "going", &mk[0]);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 2) == 0 && g_evn == 1 && g_ev[0] == WS_EV_CLOSE, "close event");
+  t_expect(a.close.code == 1001 && a.close.reason == "going" && a.closed, "close fields");
+  // An empty close, unmasked, for a client.
+  wire->len = 0;
+  ws_write_close(wire, 1005, "", 0);
+  ws_assembler_init(&a, WS_ROLE_CLIENT, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 1) == 0 && g_ev[0] == WS_EV_CLOSE && a.close.code == 1005 && a.close.reason.length == 0, "empty close");
+  // Nothing may follow a close.
+  wire->len = 0;
+  ws_write_close(wire, 1000, "", 0);
+  ws_write_frame(wire, true, WS_OP_TEXT, (uint8*)"x".chars, 1, 0);
+  ws_assembler_init(&a, WS_ROLE_CLIENT, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == WS_ERROR && g_err == 1002 && g_evn == 1, "data after close");
+  wire->len = 0;
+  ws_write_close(wire, 1000, "", 0);
+  ws_write_ping(wire, (uint8*)"x".chars, 1, 0);
+  ws_assembler_init(&a, WS_ROLE_CLIENT, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == WS_ERROR && g_err == 1002, "ping after close");
+  // Bad close payloads, as raw frames from a client.
+  g_wire_masked = true;
+  var one: uint8[1] = [0x03];
+  wire->len = 0;
+  t_frame(wire, true, WS_OP_CLOSE, &one[0], 1);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == WS_ERROR && g_err == 1002, "close of one byte");
+  var c1005: uint8[2] = [0x03, 0xED];
+  wire->len = 0;
+  t_frame(wire, true, WS_OP_CLOSE, &c1005[0], 2);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == WS_ERROR && g_err == 1002, "close with 1005");
+  var c999: uint8[2] = [0x03, 0xE7];
+  wire->len = 0;
+  t_frame(wire, true, WS_OP_CLOSE, &c999[0], 2);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == WS_ERROR && g_err == 1002, "close with 999");
+  var badr: uint8[4] = [0x03, 0xE8, 0xC3, 0x28];
+  wire->len = 0;
+  t_frame(wire, true, WS_OP_CLOSE, &badr[0], 4);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == WS_ERROR && g_err == 1007, "close with bad UTF-8 reason");
+  var cutr: uint8[4] = [0x03, 0xE8, 0xC3, 0];
+  wire->len = 0;
+  t_frame(wire, true, WS_OP_CLOSE, &cutr[0], 3);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, wire->len, 100) == WS_ERROR && g_err == 1007, "close with cut-off reason");
+}
+
+fn t_header_errors_in_decode(arena: Arena*) {
+  var sink: StrBuf* = strbuf_new(arena, 64);
+  var a: WsAssembler;
+  var used: int64 = 0;
+  // An unmasked frame to a server.
+  t_load(0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(ws_decode(&a, &g_in[0], g_in_n, &used) == WS_ERROR && a.error_code == 1002 && used == 0, "unmasked to a server");
+  // A masked frame to a client.
+  t_load(0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  ws_assembler_init(&a, WS_ROLE_CLIENT, 0, sink);
+  t_expect(ws_decode(&a, &g_in[0], g_in_n, &used) == WS_ERROR && a.error_code == 1002, "masked to a client");
+  // The RFC's own masked example decodes, in place.
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(ws_decode(&a, &g_in[0], g_in_n, &used) == WS_EV_MESSAGE && used == 11 &&
+           ws_assembler_message(&a) == "Hello" && a.message_type == WS_OP_TEXT, "rfc masked hello decodes");
+  // RSV set, and a reserved opcode.
+  t_load(0xC1, 0x80, 0, 0, 0, 0);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(ws_decode(&a, &g_in[0], g_in_n, &used) == WS_ERROR && a.error_code == 1002, "rsv in decode");
+  t_load(0x83, 0x80, 0, 0, 0, 0);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(ws_decode(&a, &g_in[0], g_in_n, &used) == WS_ERROR && a.error_code == 1002, "opcode 3 in decode");
+  // A partial header consumes nothing; the rest of the stream continues.
+  t_load(0x81, 0x85, 0x37, 0xfa);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(ws_decode(&a, &g_in[0], g_in_n, &used) == WS_EV_NONE && used == 0, "partial header consumes nothing");
+  t_expect(ws_decode(&a, &g_in[0], 0, &used) == WS_EV_NONE && used == 0, "no bytes");
+  // Without a sink, a data frame is refused; control frames still work.
+  t_load(0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, (StrBuf*)0);
+  t_expect(ws_decode(&a, &g_in[0], g_in_n, &used) == WS_ERROR && a.error_code == 1011, "data without a sink");
+  t_load(0x8A, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, (StrBuf*)0);
+  t_expect(ws_decode(&a, &g_in[0], g_in_n, &used) == WS_EV_PONG && ws_assembler_control(&a) == "Hello", "pong without a sink");
+  // One call returns at each event and leaves the rest.
+  g_wire_masked = false;
+  var wire: StrBuf* = strbuf_new(arena, 64);
+  t_frame_s(wire, true, WS_OP_TEXT, "ab");
+  t_frame_s(wire, true, WS_OP_PING, "cd");
+  ws_assembler_init(&a, WS_ROLE_CLIENT, 0, sink);
+  t_expect(ws_decode(&a, (uint8*)wire->data, wire->len, &used) == WS_EV_MESSAGE && used == 4, "decode stops at the first event");
+  var first: int64 = used;
+  t_expect(ws_decode(&a, (uint8*)wire->data + first, wire->len - first, &used) == WS_EV_PING && used == 4, "decode goes on from there");
+  t_expect(ws_decode(&a, (uint8*)wire->data + first + used, 0, &used) == WS_EV_NONE, "decode at the end");
+}
+
+// The one-frame-at-a-time calls.
+fn t_low_level(arena: Arena*) {
+  var a: WsAssembler;
+  var h: WsHeader;
+  var sink: StrBuf* = strbuf_new(arena, 64);
+  // With no sink, feed hands back the real bytes.
+  t_load(0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, (StrBuf*)0);
+  t_expect(ws_parse_header(&g_in[0], g_in_n, WS_ROLE_SERVER, 0, &h) == WS_HEADER, "low: header");
+  t_expect(ws_assembler_begin(&a, &h) == 0 && ws_assembler_remaining(&a) == 5, "low: begin");
+  t_expect(ws_assembler_feed(&a, &g_in[6], 2) == 0 && ws_assembler_remaining(&a) == 3, "low: feed 2");
+  t_expect(t_hash(&g_in[6], 2) == t_hash_s("He"), "low: first piece unmasked in place");
+  t_expect(ws_assembler_end(&a) == WS_ERROR && a.error_code == 1011, "low: end before the frame is done");
+
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, (StrBuf*)0);
+  t_load(0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  ws_parse_header(&g_in[0], g_in_n, WS_ROLE_SERVER, 0, &h);
+  ws_assembler_begin(&a, &h);
+  t_expect(ws_assembler_begin(&a, &h) == WS_ERROR && a.error_code == 1011, "low: begin inside a frame");
+
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, (StrBuf*)0);
+  t_load(0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  ws_parse_header(&g_in[0], g_in_n, WS_ROLE_SERVER, 0, &h);
+  ws_assembler_begin(&a, &h);
+  t_expect(ws_assembler_feed(&a, &g_in[6], 6) == WS_ERROR && a.error_code == 1011, "low: feed past the end");
+
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, (StrBuf*)0);
+  t_expect(ws_assembler_feed(&a, &g_in[6], 1) == WS_ERROR && a.error_code == 1011, "low: feed with no frame");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, (StrBuf*)0);
+  t_expect(ws_assembler_end(&a) == WS_ERROR && a.error_code == 1011, "low: end with no frame");
+
+  // The whole of one frame, then the message event, with no sink.
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, (StrBuf*)0);
+  t_load(0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58);
+  ws_parse_header(&g_in[0], g_in_n, WS_ROLE_SERVER, 0, &h);
+  ws_assembler_begin(&a, &h);
+  ws_assembler_feed(&a, &g_in[6], 5);
+  t_expect(ws_assembler_end(&a) == WS_EV_MESSAGE && a.message_len == 5 && a.message_type == WS_OP_TEXT, "low: message");
+  t_expect(t_hash(&g_in[6], 5) == t_hash_s("Hello"), "low: payload unmasked");
+
+  // A header the assembler refuses even though the parser was bypassed.
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  var bad: WsHeader;
+  bad.fin = false;
+  bad.opcode = WS_OP_PING;
+  t_expect(ws_assembler_begin(&a, &bad) == WS_ERROR && a.error_code == 1002, "low: fragmented ping");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  bad.fin = true;
+  bad.payload_len = 126;
+  t_expect(ws_assembler_begin(&a, &bad) == WS_ERROR && a.error_code == 1002, "low: ping of 126");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  bad.opcode = 5;
+  bad.payload_len = 0;
+  t_expect(ws_assembler_begin(&a, &bad) == WS_ERROR && a.error_code == 1002, "low: opcode 5");
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  bad.opcode = WS_OP_TEXT;
+  bad.payload_len = -1;
+  t_expect(ws_assembler_begin(&a, &bad) == WS_ERROR && a.error_code == 1002, "low: negative length");
+  // Zero-length frames need begin and end only.
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  bad.payload_len = 0;
+  bad.fin = false;
+  t_expect(ws_assembler_begin(&a, &bad) == 0 && ws_assembler_remaining(&a) == 0 &&
+           ws_assembler_end(&a) == WS_EV_NONE, "low: empty first fragment");
+}
+
+// The same bytes through the stream as every other way: the driver with
+// chunk sizes from 1 to 40 over a long mixed stream.
+fn t_stream(arena: Arena*) {
+  var wire: StrBuf* = strbuf_new(arena, 512);
+  var sink: StrBuf* = strbuf_new(arena, 64);
+  var a: WsAssembler;
+  g_wire_masked = true;
+  var p126: uint8[130];
+  for i in 0..130 { p126[i] = (uint8)(0x41 + (i % 26)); }
+  t_frame_s(wire, false, WS_OP_TEXT, "one ");
+  t_frame_s(wire, true, WS_OP_PING, "pi");
+  t_frame_s(wire, false, WS_OP_CONT, "two ");
+  t_frame(wire, true, WS_OP_CONT, &p126[0], 130);
+  t_frame_s(wire, true, WS_OP_BINARY, "");
+  t_frame_s(wire, true, WS_OP_PONG, "po");
+  t_frame(wire, true, WS_OP_TEXT, &p126[0], 126);
+  ws_write_close(wire, 1000, "done", &g_mask[0]);
+  var all: bool = true;
+  for chunk in 1..41 {
+    ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+    var r: int32 = t_drive(&a, (uint8*)wire->data, wire->len, (int64)chunk);
+    if (r != 0 || g_evn != 6 || g_left != 0) { all = false; }
+    if (g_ev[0] != WS_EV_PING || g_ev[1] != WS_EV_MESSAGE || g_ev[2] != WS_EV_MESSAGE ||
+        g_ev[3] != WS_EV_PONG || g_ev[4] != WS_EV_MESSAGE || g_ev[5] != WS_EV_CLOSE) { all = false; }
+    if (g_evh[2] != t_hash_s("") || g_evh[3] != t_hash_s("po") || g_evh[4] != t_hash(&p126[0], 126) ||
+        g_evh[5] != 1000) { all = false; }
+  }
+  t_expect(all, "mixed stream at chunk sizes 1 to 40");
+  // The first message is "one two " plus the 130 bytes.
+  var first: StrBuf* = strbuf_new(arena, 256);
+  strbuf_append_string(first, "one two ");
+  strbuf_append_bytes(first, (cstring)&p126[0], 130);
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_drive(&a, (uint8*)wire->data, wire->len, 13);
+  t_expect(g_evh[1] == t_hash((uint8*)first->data, first->len), "mixed stream first message");
+  // A stream that stops in the middle of a frame leaves bytes to keep.
+  ws_assembler_init(&a, WS_ROLE_SERVER, 0, sink);
+  t_expect(t_drive(&a, (uint8*)wire->data, 4, 2) == 0 && g_left == 4, "a cut stream leaves its partial header");
+}
+
+fn main() -> int32 {
+  var arena: Arena* = arena_init((int64)0);
+  g_mask[0] = (uint8)0x12;
+  g_mask[1] = (uint8)0x34;
+  g_mask[2] = (uint8)0x56;
+  g_mask[3] = (uint8)0x78;
+
+  t_sha1();
+  t_handshake_keys();
+  t_tokens();
+  t_check_request();
+  t_protocols();
+  t_handshake_writers(arena);
+  t_response();
+  t_handshake_round_trip(arena);
+
+  t_rfc_frames(arena);
+  t_header_edges();
+  t_header_errors();
+  t_unmask();
+  t_header_writer();
+  t_frame_writers(arena);
+
+  t_codes();
+  t_close_encode();
+  t_close_parse();
+  t_close_write(arena);
+
+  t_utf8_set();
+  t_utf8_cross();
+
+  t_messages(arena);
+  t_fragments(arena);
+  t_limits(arena);
+  t_text_messages(arena);
+  t_close_frames(arena);
+  t_header_errors_in_decode(arena);
+  t_low_level(arena);
+  t_stream(arena);
+
+  arena_free(arena);
+  if (g_first_fail != 0) {
+    println("first failure: check {g_first_fail} of {g_checks}");
+    if (g_first_fail > 255) { return 255; }
+    return g_first_fail;
+  }
+  println("all {g_checks} checks passed");
+  return 0;
+}

@@ -151,6 +151,11 @@ main { padding-bottom: 72px; }
   .snip { padding-left: 12px; }
   .cmd pre { font-size: 13.5px; }
 }
+@media (max-width: 440px) {
+  .top .wrap { gap: 16px; }
+  .top nav { gap: 14px; font-size: 15px; }
+  .brand { gap: 0; font-size: 0; }
+}
 </style>
 <noscript><style>.sky video, .end video { opacity: 1; }</style></noscript>
 </head>
@@ -175,6 +180,7 @@ main { padding-bottom: 72px; }
     </nav>
     <nav class="actions" aria-label="Site">
       <a href="#start">Install</a>
+      <a href="registry/">Packages</a>
       <a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/README.md">Docs</a>
       <a href="https://github.com/The-Mettle-Project/Mettle">Source</a>
     </nav>
@@ -354,6 +360,7 @@ r0 = 55</span></pre></li>
     <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/benchmarks/README.md">Fast builds</a></h3><p>A generated 90,000-line file builds in 7.6&nbsp;s. clang takes 16.0&nbsp;s.</p></li>
     <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/runtime-model.md">Its own runtime</a></h3><p>No C runtime, garbage collector or scheduler on Windows and Linux. The safety, profiler and debug parts link only when you ask for them.</p></li>
     <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/c-interop.md">Call C, and be called</a></h3><p><code>extern</code> and <code>export</code>, with structs by value in both directions under the Windows x64 and System V rules. Bind a <code>.so</code>, or emit a <code>.so</code> or a DLL.</p></li>
+    <li><h3><a href="registry/">Packages</a></h3><p><code>mettle pkg add</code> installs from a static registry on this site. A lock file pins every version by its SHA-256, and a new release changes nothing until you ask.</p></li>
     <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/embedding.md">Your own frontend</a></h3><p>Drive libmtlc's C API and your language gets the IR, the optimizers, code generation and the linkers.</p></li>
   </ul>
 </section>

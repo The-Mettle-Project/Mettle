@@ -511,6 +511,39 @@ int mettle_path_is_directory(const char *path) {
 
 int mettle_make_directory(const char *path) { return mkdir(path, 0777); }
 
+int mettle_remove_directory(const char *path) { return rmdir(path); }
+
+int mettle_move_path(const char *from, const char *to) {
+  return rename(from, to);
+}
+
+int mettle_dir_list(const char *path, char *names, int capacity) {
+  void *directory = path ? mt_hosted_dir_open(path) : NULL;
+  const char *name;
+  int type = 0;
+  int used = 0;
+  int count = 0;
+  if (!directory || !names || capacity <= 0) {
+    return -1;
+  }
+  while ((name = mt_hosted_dir_next(directory, &type))) {
+    size_t name_length = strlen(name);
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+      continue;
+    }
+    if ((size_t)used + name_length + 2 > (size_t)capacity) {
+      count = -1;
+      break;
+    }
+    names[used++] = type == 4 ? 'd' : type == 8 ? 'f' : 'l';
+    memcpy(names + used, name, name_length + 1);
+    used += (int)name_length + 1;
+    count++;
+  }
+  mt_hosted_dir_close(directory);
+  return count;
+}
+
 int mettle_dir_exists(const char *path) {
   return mettle_path_is_directory(path);
 }

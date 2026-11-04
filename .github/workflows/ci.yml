@@ -239,6 +239,25 @@ jobs:
         if: matrix.cc == 'gcc'
         run: python3 tools/gen-site-reference.py --compiler ./bin/mettle --check
 
+      # A published version never changes. The base ref holds every hash ever
+      # published, so the gate compares against it; the checkout is shallow, so
+      # it fetches that one commit. Each package's latest version then installs
+      # through the client over HTTP, compiles and runs its @test functions.
+      - name: Package registry
+        if: matrix.cc == 'gcc'
+        env:
+          REGISTRY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base_args=()
+          case "$REGISTRY_BASE" in
+            ""|0000000000000000000000000000000000000000) ;;
+            *)
+              git fetch --depth=1 origin "$REGISTRY_BASE"
+              base_args=(--base FETCH_HEAD)
+              ;;
+          esac
+          python3 website/registry.py check --compiler ./bin/mettle "${base_args[@]}"
+
       - name: Native ELF backend tests
         run: bash tools/test-elf-native.sh
 
@@ -496,6 +515,9 @@ jobs:
 
       - name: Build compiler
         run: make -k -j"$(sysctl -n hw.ncpu)"
+
+      - name: Package registry
+        run: python3 website/registry.py check --compiler ./bin/mettle
 
       - name: Build and run programs
         run: |

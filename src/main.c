@@ -45,6 +45,7 @@
 #include "ir/ir_purity.h"
 #include "ir/ir_twins.h"
 #include "ir/ir_machine.h"
+#include "pkg.h"
 #include "tune.h"
 #include "ir/ir_trace.h"
 #include "ir/ir_explain_ledger.h"
@@ -439,7 +440,7 @@ static void print_doc_reference(const char *argv0, const char *relative_path) {
   free(docs_dir);
 }
 
-#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify, test (alias: trace)"
+#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify, test (alias: trace), pkg"
 
 static int print_help_topic(const char *program_name, const char *argv0,
                             const char *topic) {
@@ -519,6 +520,13 @@ static int print_help_topic(const char *program_name, const char *argv0,
     printf("      Interpret one function on concrete arguments and print its\n");
     printf("      source annotated with the values each line produced.\n");
     print_doc_reference(argv0, "testing.md");
+    return 0;
+  }
+
+  if (strcmp(topic, "pkg") == 0 || strcmp(topic, "packages") == 0) {
+    char *help_argv[] = {(char *)argv0, (char *)"pkg", (char *)"help", NULL};
+    mettle_pkg_main(3, help_argv, METTLE_VERSION);
+    print_doc_reference(argv0, "packages.md");
     return 0;
   }
 
@@ -4732,6 +4740,18 @@ static int mettle_check_target_options(CompilerOptions *options,
   return 0;
 }
 
+static int run_tool_subcommand(int argc, char **argv, int *exit_code) {
+  if (strcmp(argv[1], "pkg") == 0) {
+    *exit_code = mettle_pkg_main(argc, argv, METTLE_VERSION);
+    return 1;
+  }
+  if (strcmp(argv[1], "live") == 0) {
+    *exit_code = mettle_live_main(argc, argv);
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   CompilerOptions options = {0};
   mettle_compiler_crash_install(argc, argv);
@@ -4778,6 +4798,10 @@ int main(int argc, char *argv[]) {
                                    self_path ? self_path : argv[0]);
       free(self_path);
       return tuned;
+    }
+    int tool_exit_code = 0;
+    if (run_tool_subcommand(argc, argv, &tool_exit_code)) {
+      return tool_exit_code;
     }
     if (strcmp(argv[1], "explain") == 0) {
       if (argc >= 4) {
@@ -4845,9 +4869,6 @@ int main(int argc, char *argv[]) {
       options.why_what = argv[4];
       argv[1] = argv[2];
       argc = split_subcommand_flags(argc, argv, 5, NULL, &(int){0});
-    }
-    if (strcmp(argv[1], "live") == 0) {
-      return mettle_live_main(argc, argv);
     }
     if (strcmp(argv[1], "--live-undo") == 0 && argc >= 3) {
       LivePatchSummary summary;
@@ -6946,6 +6967,10 @@ static int compile_stage_imports(CompileContext *ctx) {
       (options && (options->emit_arm64 || options->emit_arm64_obj)) ||
       host_target_is_posix();
   import_options.target_is_macos = host_target_is_macho();
+  import_options.target_is_arm64 =
+      (options && (options->emit_arm64 || options->emit_arm64_obj)) ||
+      mtlc_target()->format == BINARY_TARGET_FORMAT_ELF_ARM64 ||
+      mtlc_target()->format == BINARY_TARGET_FORMAT_MACHO_ARM64;
   import_options.gpu_provider_metal =
       options && (options->gpu_provider == 2 ||
                   (options->gpu_provider == 0 && host_target_is_macho()));
@@ -8003,6 +8028,8 @@ void print_usage(const char *program_name) {
   printf("Usage: %s [options] <input.mettle>\n", program_name);
   printf("       %s help [topic]\n", program_name);
   printf("       %s docs [topic]\n", program_name);
+  printf("       %s pkg <command>    Add and install packages; 'pkg help' for the commands\n",
+         program_name);
   printf("       %s explain <CODE>   Explain a code: a diagnostic (E0004, M0103) or an --explain\n"
          "                            decision (dot-shape-address); 'list' for the index\n",
          program_name);

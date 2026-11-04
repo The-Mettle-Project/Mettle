@@ -341,7 +341,8 @@ deps_walk_lookup(const char *start_dir, size_t *out_count) {
 }
 
 static char *resolve_dependency_import(const char *current_file_path,
-                                      const char *import_path) {
+                                      const char *import_path,
+                                      int want_main_module) {
   char *search_dir = NULL;
   char *result = NULL;
   size_t package_name_len = 0;
@@ -354,7 +355,7 @@ static char *resolve_dependency_import(const char *current_file_path,
   package_rest = strpbrk(import_path, "/\\");
   package_name_len =
       package_rest ? (size_t)(package_rest - import_path) : strlen(import_path);
-  if (package_name_len == 0) {
+  if (package_name_len == 0 || (want_main_module && package_rest)) {
     return NULL;
   }
   if (package_rest) {
@@ -427,7 +428,13 @@ static char *resolve_dependency_import(const char *current_file_path,
             candidate_base = dep_root;
           }
 
-          result = resolve_candidate_path(candidate_base);
+          if (want_main_module) {
+            char *main_module = join_paths(candidate_base, name);
+            result = resolve_candidate_path(main_module);
+            free(main_module);
+          } else {
+            result = resolve_candidate_path(candidate_base);
+          }
           free(candidate_base);
           if (result) {
             fclose(deps_file);
@@ -2575,7 +2582,7 @@ static char *resolve_import_path_uncached(ImportContext *ctx,
 
   {
     char *dependency_candidate =
-        resolve_dependency_import(current_file_path, import_path);
+        resolve_dependency_import(current_file_path, import_path, 0);
     if (dependency_candidate) {
       return dependency_candidate;
     }
@@ -2616,7 +2623,13 @@ static char *resolve_import_path_uncached(ImportContext *ctx,
     }
   }
 
-  return resolve_candidate_path(import_path);
+  {
+    char *resolved = resolve_candidate_path(import_path);
+    if (resolved) {
+      return resolved;
+    }
+  }
+  return resolve_dependency_import(current_file_path, import_path, 1);
 }
 
 static char *read_file_content(const char *filename, size_t *length_out) {
@@ -3741,10 +3754,21 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
   }
 }
 
-static int import_platform_matches(const char *guard, int target_is_elf,
-                                   int target_is_macos) {
+static int import_platform_matches(const char *guard,
+                                   const ImportResolverOptions *options) {
+  int target_is_elf = options && options->target_is_elf;
+  int target_is_macos = options && options->target_is_macos;
+  int target_is_arm64 = options && options->target_is_arm64;
   if (!guard) {
     return 1;
+  }
+  /* The architecture guards let a file pick per-CPU data, such as Linux
+     system call numbers, which differ between x86-64 and AArch64. */
+  if (strcmp(guard, "x86_64") == 0) {
+    return !target_is_arm64;
+  }
+  if (strcmp(guard, "aarch64") == 0) {
+    return target_is_arm64;
   }
   if (strcmp(guard, "posix") == 0) {
     return target_is_elf;
@@ -3794,10 +3818,8 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
     if (decl->type == AST_IMPORT) {
       ImportDeclaration *import_decl = (ImportDeclaration *)decl->data;
 
-      if (!import_platform_matches(
-              import_decl->platform_guard,
-              ctx && ctx->options && ctx->options->target_is_elf,
-              ctx && ctx->options && ctx->options->target_is_macos)) {
+      if (!import_platform_matches(import_decl->platform_guard,
+                                   ctx ? ctx->options : NULL)) {
         ast_destroy_node(decl);
         continue;
       }

@@ -1,0 +1,568 @@
+import "./number";
+
+export const JSON_END = 0;
+export const JSON_OBJECT_START = 1;
+export const JSON_OBJECT_END = 2;
+export const JSON_ARRAY_START = 3;
+export const JSON_ARRAY_END = 4;
+export const JSON_KEY = 5;
+export const JSON_STRING = 6;
+export const JSON_NUMBER = 7;
+export const JSON_TRUE = 8;
+export const JSON_FALSE = 9;
+export const JSON_NULL = 10;
+export const JSON_ERROR = 11;
+export const JSON_MAX_DEPTH = 128;
+
+const WANT_VALUE = 0;
+const WANT_VALUE_OR_CLOSE = 1;
+const WANT_KEY_OR_CLOSE = 2;
+const WANT_KEY = 3;
+const WANT_SEPARATOR = 4;
+const WANT_NOTHING = 5;
+
+const IN_OBJECT = 1;
+const IN_ARRAY = 2;
+
+export struct JsonReader {
+  text: uint8*;
+  length: int64;
+  at: int64;
+  depth: int32;
+  stack: uint8[128];
+  state: int32;
+  event: int32;
+  start: int64;
+  stop: int64;
+}
+
+export fn json_begin(reader: JsonReader*, document: string) {
+  reader->text = (uint8*)document.chars;
+  reader->length = (int64)document.length;
+  reader->at = 0;
+  reader->depth = 0;
+  reader->state = WANT_VALUE;
+  reader->event = JSON_END;
+  reader->start = 0;
+  reader->stop = 0;
+}
+
+fn peek(reader: JsonReader*) -> int32 {
+  if (reader->at >= reader->length) {
+    return -1;
+  }
+  return (int32)reader->text[reader->at];
+}
+
+fn skip_space(reader: JsonReader*) {
+  var c: int32 = peek(reader);
+  while (c == 32 || c == 9 || c == 10 || c == 13) {
+    reader->at = reader->at + 1;
+    c = peek(reader);
+  }
+}
+
+fn fail(reader: JsonReader*) -> int32 {
+  reader->event = JSON_ERROR;
+  return JSON_ERROR;
+}
+
+fn hex_value(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) {
+    return c - 48;
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 87;
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 55;
+  }
+  return -1;
+}
+
+fn read_hex4(text: uint8*, at: int64, length: int64) -> int32 {
+  if (at + 4 > length) {
+    return -1;
+  }
+  var value: int32 = 0;
+  for i in 0..4 {
+    var digit: int32 = hex_value((int32)text[at + i]);
+    if (digit < 0) {
+      return -1;
+    }
+    value = value * 16 + digit;
+  }
+  return value;
+}
+
+fn scan_unicode_escape(reader: JsonReader*) -> bool {
+  var unit: int32 = read_hex4(reader->text, reader->at, reader->length);
+  if (unit < 0 || (unit >= 0xDC00 && unit <= 0xDFFF)) {
+    return false;
+  }
+  reader->at = reader->at + 4;
+  if (unit < 0xD800 || unit > 0xDBFF) {
+    return true;
+  }
+  if (peek(reader) != 92 || reader->at + 2 > reader->length ||
+      reader->text[reader->at + 1] != 117) {
+    return false;
+  }
+  var low: int32 = read_hex4(reader->text, reader->at + 2, reader->length);
+  if (low < 0xDC00 || low > 0xDFFF) {
+    return false;
+  }
+  reader->at = reader->at + 6;
+  return true;
+}
+
+fn scan_string(reader: JsonReader*) -> bool {
+  reader->at = reader->at + 1;
+  reader->start = reader->at;
+  while (true) {
+    var c: int32 = peek(reader);
+    if (c < 32) {
+      return false;
+    }
+    reader->at = reader->at + 1;
+    if (c == 34) {
+      reader->stop = reader->at - 1;
+      return true;
+    }
+    if (c == 92) {
+      var escape: int32 = peek(reader);
+      reader->at = reader->at + 1;
+      if (escape == 117) {
+        if (!scan_unicode_escape(reader)) {
+          return false;
+        }
+      } else if (escape != 34 && escape != 92 && escape != 47 && escape != 98 &&
+                 escape != 102 && escape != 110 && escape != 114 && escape != 116) {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+fn scan_digits(reader: JsonReader*) -> bool {
+  var c: int32 = peek(reader);
+  if (c < 48 || c > 57) {
+    return false;
+  }
+  while (c >= 48 && c <= 57) {
+    reader->at = reader->at + 1;
+    c = peek(reader);
+  }
+  return true;
+}
+
+fn scan_number(reader: JsonReader*) -> bool {
+  reader->start = reader->at;
+  if (peek(reader) == 45) {
+    reader->at = reader->at + 1;
+  }
+  if (peek(reader) == 48) {
+    reader->at = reader->at + 1;
+  } else if (!scan_digits(reader)) {
+    return false;
+  }
+  if (peek(reader) == 46) {
+    reader->at = reader->at + 1;
+    if (!scan_digits(reader)) {
+      return false;
+    }
+  }
+  var c: int32 = peek(reader);
+  if (c == 101 || c == 69) {
+    reader->at = reader->at + 1;
+    c = peek(reader);
+    if (c == 43 || c == 45) {
+      reader->at = reader->at + 1;
+    }
+    if (!scan_digits(reader)) {
+      return false;
+    }
+  }
+  reader->stop = reader->at;
+  return true;
+}
+
+fn scan_word(reader: JsonReader*, word: string) -> bool {
+  if (reader->at + (int64)word.length > reader->length) {
+    return false;
+  }
+  for i in 0..(int64)word.length {
+    if (reader->text[reader->at + i] != (uint8)word.chars[i]) {
+      return false;
+    }
+  }
+  reader->start = reader->at;
+  reader->at = reader->at + (int64)word.length;
+  reader->stop = reader->at;
+  return true;
+}
+
+fn after_value(reader: JsonReader*) {
+  if (reader->depth == 0) {
+    reader->state = WANT_NOTHING;
+  } else {
+    reader->state = WANT_SEPARATOR;
+  }
+}
+
+fn open_container(reader: JsonReader*, kind: int32, state: int32, event: int32) -> int32 {
+  if (reader->depth >= JSON_MAX_DEPTH) {
+    return fail(reader);
+  }
+  reader->stack[reader->depth] = (uint8)kind;
+  reader->depth = reader->depth + 1;
+  reader->at = reader->at + 1;
+  reader->state = state;
+  reader->event = event;
+  return event;
+}
+
+fn close_container(reader: JsonReader*, kind: int32, event: int32) -> int32 {
+  if (reader->depth == 0 || (int32)reader->stack[reader->depth - 1] != kind) {
+    return fail(reader);
+  }
+  reader->depth = reader->depth - 1;
+  reader->at = reader->at + 1;
+  after_value(reader);
+  reader->event = event;
+  return event;
+}
+
+fn finish_scalar(reader: JsonReader*, ok: bool, event: int32) -> int32 {
+  if (!ok) {
+    return fail(reader);
+  }
+  after_value(reader);
+  reader->event = event;
+  return event;
+}
+
+fn read_value(reader: JsonReader*) -> int32 {
+  var c: int32 = peek(reader);
+  switch (c) {
+    case 123: { return open_container(reader, IN_OBJECT, WANT_KEY_OR_CLOSE, JSON_OBJECT_START); }
+    case 91: { return open_container(reader, IN_ARRAY, WANT_VALUE_OR_CLOSE, JSON_ARRAY_START); }
+    case 34: { return finish_scalar(reader, scan_string(reader), JSON_STRING); }
+    case 116: { return finish_scalar(reader, scan_word(reader, "true"), JSON_TRUE); }
+    case 102: { return finish_scalar(reader, scan_word(reader, "false"), JSON_FALSE); }
+    case 110: { return finish_scalar(reader, scan_word(reader, "null"), JSON_NULL); }
+    default: { return finish_scalar(reader, scan_number(reader), JSON_NUMBER); }
+  }
+  return fail(reader);
+}
+
+fn read_key(reader: JsonReader*) -> int32 {
+  if (peek(reader) != 34 || !scan_string(reader)) {
+    return fail(reader);
+  }
+  skip_space(reader);
+  if (peek(reader) != 58) {
+    return fail(reader);
+  }
+  reader->at = reader->at + 1;
+  reader->state = WANT_VALUE;
+  reader->event = JSON_KEY;
+  return JSON_KEY;
+}
+
+fn read_separator(reader: JsonReader*) -> int32 {
+  var c: int32 = peek(reader);
+  if (c == 125) {
+    return close_container(reader, IN_OBJECT, JSON_OBJECT_END);
+  }
+  if (c == 93) {
+    return close_container(reader, IN_ARRAY, JSON_ARRAY_END);
+  }
+  if (c != 44) {
+    return fail(reader);
+  }
+  reader->at = reader->at + 1;
+  skip_space(reader);
+  if ((int32)reader->stack[reader->depth - 1] == IN_OBJECT) {
+    return read_key(reader);
+  }
+  return read_value(reader);
+}
+
+export fn json_next(reader: JsonReader*) -> int32 {
+  if (reader->event == JSON_ERROR) {
+    return JSON_ERROR;
+  }
+  skip_space(reader);
+  switch (reader->state) {
+    case 0: { return read_value(reader); }
+    case 1: {
+      if (peek(reader) == 93) {
+        return close_container(reader, IN_ARRAY, JSON_ARRAY_END);
+      }
+      return read_value(reader);
+    }
+    case 2: {
+      if (peek(reader) == 125) {
+        return close_container(reader, IN_OBJECT, JSON_OBJECT_END);
+      }
+      return read_key(reader);
+    }
+    case 3: { return read_key(reader); }
+    case 4: { return read_separator(reader); }
+    default: {
+      if (peek(reader) != -1) {
+        return fail(reader);
+      }
+      reader->event = JSON_END;
+      return JSON_END;
+    }
+  }
+  return fail(reader);
+}
+
+export fn json_error_offset(reader: JsonReader*) -> int64 {
+  return reader->at;
+}
+
+export fn json_skip(reader: JsonReader*) -> int32 {
+  if (reader->event != JSON_OBJECT_START && reader->event != JSON_ARRAY_START) {
+    return reader->event;
+  }
+  var floor: int32 = reader->depth - 1;
+  while (reader->depth > floor) {
+    if (json_next(reader) == JSON_ERROR) {
+      return JSON_ERROR;
+    }
+  }
+  return reader->event;
+}
+
+fn write_utf8(code: int32, out: uint8*) -> int64 {
+  if (code < 0x80) {
+    out[0] = (uint8)code;
+    return 1;
+  }
+  if (code < 0x800) {
+    out[0] = (uint8)(0xC0 | (code >> 6));
+    out[1] = (uint8)(0x80 | (code & 0x3F));
+    return 2;
+  }
+  if (code < 0x10000) {
+    out[0] = (uint8)(0xE0 | (code >> 12));
+    out[1] = (uint8)(0x80 | ((code >> 6) & 0x3F));
+    out[2] = (uint8)(0x80 | (code & 0x3F));
+    return 3;
+  }
+  out[0] = (uint8)(0xF0 | (code >> 18));
+  out[1] = (uint8)(0x80 | ((code >> 12) & 0x3F));
+  out[2] = (uint8)(0x80 | ((code >> 6) & 0x3F));
+  out[3] = (uint8)(0x80 | (code & 0x3F));
+  return 4;
+}
+
+fn simple_escape(c: int32) -> int32 {
+  switch (c) {
+    case 98: { return 8; }
+    case 102: { return 12; }
+    case 110: { return 10; }
+    case 114: { return 13; }
+    case 116: { return 9; }
+    default: { return c; }
+  }
+  return c;
+}
+
+fn decode_step(reader: JsonReader*, at: int64*, out: uint8*) -> int64 {
+  var c: int32 = (int32)reader->text[*at];
+  if (c != 92) {
+    out[0] = (uint8)c;
+    *at = *at + 1;
+    return 1;
+  }
+  var escape: int32 = (int32)reader->text[*at + 1];
+  if (escape != 117) {
+    out[0] = (uint8)simple_escape(escape);
+    *at = *at + 2;
+    return 1;
+  }
+  var unit: int32 = read_hex4(reader->text, *at + 2, reader->stop);
+  *at = *at + 6;
+  if (unit >= 0xD800 && unit <= 0xDBFF) {
+    var low: int32 = read_hex4(reader->text, *at + 2, reader->stop);
+    *at = *at + 6;
+    unit = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+  }
+  return write_utf8(unit, out);
+}
+
+export fn json_string_length(reader: JsonReader*) -> int64 {
+  var scratch: uint8[4];
+  var at: int64 = reader->start;
+  var total: int64 = 0;
+  while (at < reader->stop) {
+    total = total + decode_step(reader, &at, &scratch[0]);
+  }
+  return total;
+}
+
+export fn json_string_copy(reader: JsonReader*, out: uint8*, capacity: int64) -> int64 {
+  var scratch: uint8[4];
+  var at: int64 = reader->start;
+  var total: int64 = 0;
+  while (at < reader->stop) {
+    var count: int64 = decode_step(reader, &at, &scratch[0]);
+    if (total + count > capacity) {
+      return -1;
+    }
+    for i in 0..count {
+      out[total + i] = scratch[i];
+    }
+    total = total + count;
+  }
+  return total;
+}
+
+export fn json_text_is(reader: JsonReader*, text: string) -> bool {
+  var scratch: uint8[4];
+  var at: int64 = reader->start;
+  var seen: int64 = 0;
+  var length: int64 = (int64)text.length;
+  while (at < reader->stop) {
+    var count: int64 = decode_step(reader, &at, &scratch[0]);
+    if (seen + count > length) {
+      return false;
+    }
+    for i in 0..count {
+      if (scratch[i] != (uint8)text.chars[seen + i]) {
+        return false;
+      }
+    }
+    seen = seen + count;
+  }
+  return seen == length;
+}
+
+export fn json_read_int64(reader: JsonReader*, out: int64*) -> bool {
+  return number_read_int64(reader->text + reader->start, reader->stop - reader->start, out);
+}
+
+export fn json_read_float64(reader: JsonReader*) -> float64 {
+  return number_read_float64(reader->text + reader->start, reader->stop - reader->start);
+}
+
+fn count_events(document: string) -> int32 {
+  var reader: JsonReader;
+  json_begin(&reader, document);
+  var total: int32 = 0;
+  var event: int32 = json_next(&reader);
+  while (event != JSON_END) {
+    if (event == JSON_ERROR) {
+      return -1;
+    }
+    total = total + 1;
+    event = json_next(&reader);
+  }
+  return total;
+}
+
+@test fn accepts_every_shape() -> int32 {
+  assert_eq(count_events("true"), 1);
+  assert_eq(count_events(" 12 "), 1);
+  assert_eq(count_events("[]"), 2);
+  assert_eq(count_events("{{}"), 2);
+  assert_eq(count_events("[1, [2, 3], {{\"a\": null}]"), 11);
+  assert_eq(count_events("{{\"a\": {{\"b\": [true, false]}, \"c\": \"d\"}"), 12);
+  assert_eq(count_events("-0.5e+10"), 1);
+  return 0;
+}
+
+@test fn refuses_what_the_grammar_refuses() -> int32 {
+  assert_eq(count_events(""), -1);
+  assert_eq(count_events("[1,]"), -1);
+  assert_eq(count_events("{{\"a\":1,}"), -1);
+  assert_eq(count_events("{{\"a\" 1}"), -1);
+  assert_eq(count_events("[1}"), -1);
+  assert_eq(count_events("{{\"a\":1]"), -1);
+  assert_eq(count_events("01"), -1);
+  assert_eq(count_events("1."), -1);
+  assert_eq(count_events("1e"), -1);
+  assert_eq(count_events("-"), -1);
+  assert_eq(count_events("tru"), -1);
+  assert_eq(count_events("\"open"), -1);
+  assert_eq(count_events("\"\\x\""), -1);
+  assert_eq(count_events("\"\\uD800\""), -1);
+  assert_eq(count_events("\"\\uDC00\""), -1);
+  assert_eq(count_events("1 2"), -1);
+  assert_eq(count_events("[1 2]"), -1);
+  return 0;
+}
+
+@test fn depth_stops_at_the_limit() -> int32 {
+  var document: uint8[129];
+  for i in 0..129 {
+    document[i] = 91;
+  }
+  var text: string;
+  text.chars = (cstring)&document[0];
+  text.length = (uint64)129;
+  var reader: JsonReader;
+  json_begin(&reader, text);
+  var event: int32 = 0;
+  for i in 0..129 {
+    event = json_next(&reader);
+  }
+  assert_eq(event, JSON_ERROR);
+  return 0;
+}
+
+fn first_string_is(document: string, expected: string) -> bool {
+  var reader: JsonReader;
+  json_begin(&reader, document);
+  if (json_next(&reader) != JSON_STRING) {
+    return false;
+  }
+  if (json_string_length(&reader) != (int64)expected.length) {
+    return false;
+  }
+  return json_text_is(&reader, expected);
+}
+
+@test fn decodes_escapes_to_utf8() -> int32 {
+  assert(first_string_is("\"plain\"", "plain"));
+  assert(first_string_is("\"a\\n\\t\\\"\\\\\\/b\"", "a\n\t\"\\/b"));
+  assert(first_string_is("\"\\u0041\"", "A"));
+  assert(first_string_is("\"\\u00e9\"", "é"));
+  assert(first_string_is("\"\\u20AC\"", "€"));
+  assert(first_string_is("\"\\uD83D\\uDE00\"", "😀"));
+  return 0;
+}
+
+@test fn copy_respects_capacity() -> int32 {
+  var out: uint8[4];
+  var reader: JsonReader;
+  json_begin(&reader, "\"abcdef\"");
+  json_next(&reader);
+  assert_eq(json_string_copy(&reader, &out[0], 4), -1);
+  json_begin(&reader, "\"ab\"");
+  json_next(&reader);
+  assert_eq(json_string_copy(&reader, &out[0], 4), 2);
+  assert_eq((int32)out[1], 98);
+  return 0;
+}
+
+@test fn skip_jumps_a_container() -> int32 {
+  var reader: JsonReader;
+  json_begin(&reader, "{{\"a\": [1, {{\"b\": 2}, 3], \"c\": 4}");
+  assert_eq(json_next(&reader), JSON_OBJECT_START);
+  assert_eq(json_next(&reader), JSON_KEY);
+  assert_eq(json_next(&reader), JSON_ARRAY_START);
+  assert_eq(json_skip(&reader), JSON_ARRAY_END);
+  assert_eq(json_next(&reader), JSON_KEY);
+  assert(json_text_is(&reader, "c"));
+  assert_eq(json_next(&reader), JSON_NUMBER);
+  assert_eq(json_next(&reader), JSON_OBJECT_END);
+  assert_eq(json_next(&reader), JSON_END);
+  return 0;
+}

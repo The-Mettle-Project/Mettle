@@ -1,0 +1,162 @@
+// Windows file calls for std/file, through Kernel32. A file is a HANDLE held
+// in an int64. Every call returns a count or size, or a negative Win32 error
+// code (-GetLastError()).
+
+export const FILE_READ = 1;       // open for reading
+export const FILE_WRITE = 2;      // open for writing
+export const FILE_CREATE = 4;     // create the file if it is missing
+export const FILE_TRUNCATE = 8;   // empty it on open
+export const FILE_APPEND = 16;    // every write goes to the end
+export const FILE_NEW = 32;       // with FILE_CREATE: fail if it exists
+
+export const FILE_LOCK_SHARED = 1;
+export const FILE_LOCK_EXCLUSIVE = 2;
+
+export const FILE_ENOENT = 2;          // ERROR_FILE_NOT_FOUND
+export const FILE_EACCES = 5;          // ERROR_ACCESS_DENIED
+export const FILE_EEXIST = 80;         // ERROR_FILE_EXISTS
+export const FILE_EWOULDBLOCK = 33;    // ERROR_LOCK_VIOLATION
+export const FILE_EINTR = 995;         // ERROR_OPERATION_ABORTED
+
+extern fn file_w_error() -> uint32 = "GetLastError";
+extern fn file_w_create(path: uint8*, access: uint32, share: uint32, sec: uint8*, disposition: uint32, attrs: uint32, template: int64) -> int64 = "CreateFileA";
+extern fn file_w_close(h: int64) -> int32 = "CloseHandle";
+extern fn file_w_read(h: int64, buf: uint8*, n: uint32, got: uint32*, ov: uint8*) -> int32 = "ReadFile";
+extern fn file_w_write(h: int64, buf: uint8*, n: uint32, put: uint32*, ov: uint8*) -> int32 = "WriteFile";
+extern fn file_w_flush(h: int64) -> int32 = "FlushFileBuffers";
+extern fn file_w_size(h: int64, size: int64*) -> int32 = "GetFileSizeEx";
+extern fn file_w_set_info(h: int64, class: int32, info: uint8*, n: uint32) -> int32 = "SetFileInformationByHandle";
+extern fn file_w_move(from: uint8*, to: uint8*, flags: uint32) -> int32 = "MoveFileExA";
+extern fn file_w_delete(path: uint8*) -> int32 = "DeleteFileA";
+extern fn file_w_lock(h: int64, flags: uint32, reserved: uint32, low: uint32, high: uint32, ov: uint8*) -> int32 = "LockFileEx";
+extern fn file_w_unlock(h: int64, reserved: uint32, low: uint32, high: uint32, ov: uint8*) -> int32 = "UnlockFileEx";
+
+fn file_fail() -> int64 { return -(int64)file_w_error(); }
+
+// Copies a path into buf with a NUL. Returns false if it does not fit.
+fn file_cpath(path: string, buf: uint8*) -> bool {
+  if (path.length >= (uint64)4096) { return false; }
+  for i in 0..path.length { buf[i] = (uint8)path[i]; }
+  buf[(int64)path.length] = (uint8)0;
+  return true;
+}
+
+// An OVERLAPPED that carries a file offset.
+fn file_overlapped(ov: uint8*, offset: int64) {
+  for i in 0..32 { ov[i] = (uint8)0; }
+  *(uint32*)(ov + 16) = (uint32)(offset & 0xFFFFFFFF);
+  *(uint32*)(ov + 20) = (uint32)((offset >> 32) & 0xFFFFFFFF);
+}
+
+// Opens path with FILE_* flags. Other processes may read, write and rename
+// the file while it is open; use file_lock to keep them out. FILE_APPEND has
+// no effect here: file_write_at always writes at the offset it is given.
+export fn file_open(path: string, flags: int32) -> int64 {
+  var cp: uint8[4096];
+  if (!file_cpath(path, &cp[0])) { return -206; }   // ERROR_FILENAME_EXCED_RANGE
+  var access: uint32 = 0;
+  if ((flags & FILE_READ) != 0) { access = access | (uint32)0x80000000; }
+  if ((flags & FILE_WRITE) != 0) { access = access | (uint32)0x40000000; }
+  var disposition: uint32 = 3;                       // OPEN_EXISTING
+  var create: bool = (flags & FILE_CREATE) != 0;
+  var trunc: bool = (flags & FILE_TRUNCATE) != 0;
+  if (create && (flags & FILE_NEW) != 0) {
+    disposition = 1;                                 // CREATE_NEW
+  } else if (create && trunc) {
+    disposition = 2;                                 // CREATE_ALWAYS
+  } else if (create) {
+    disposition = 4;                                 // OPEN_ALWAYS
+  } else if (trunc) {
+    disposition = 5;                                 // TRUNCATE_EXISTING
+  }
+  var h: int64 = file_w_create(&cp[0], access, (uint32)7, (uint8*)0, disposition, (uint32)0x80, 0);
+  if (h == -1) { return file_fail(); }
+  return h;
+}
+
+export fn file_close(fd: int64) -> int64 {
+  if (file_w_close(fd) == 0) { return file_fail(); }
+  return 0;
+}
+
+fn file_clamp(n: int64) -> uint32 {
+  if (n > (int64)0x7FFFFFFF) { return (uint32)0x7FFFFFFF; }
+  return (uint32)n;
+}
+
+// Reads up to n bytes at offset. 0 means end of file.
+export fn file_read_at(fd: int64, buf: uint8*, n: int64, offset: int64) -> int64 {
+  var ov: uint8[32];
+  file_overlapped(&ov[0], offset);
+  var got: uint32 = 0;
+  if (file_w_read(fd, buf, file_clamp(n), &got, &ov[0]) == 0) {
+    var e: uint32 = file_w_error();
+    if (e == (uint32)38) { return 0; }   // ERROR_HANDLE_EOF
+    return -(int64)e;
+  }
+  return (int64)got;
+}
+
+// Writes up to n bytes at offset.
+export fn file_write_at(fd: int64, buf: uint8*, n: int64, offset: int64) -> int64 {
+  var ov: uint8[32];
+  file_overlapped(&ov[0], offset);
+  var put: uint32 = 0;
+  if (file_w_write(fd, buf, file_clamp(n), &put, &ov[0]) == 0) { return file_fail(); }
+  return (int64)put;
+}
+
+export fn file_sync(fd: int64) -> int64 {
+  if (file_w_flush(fd) == 0) { return file_fail(); }
+  return 0;
+}
+
+export fn file_sync_data(fd: int64) -> int64 { return file_sync(fd); }
+
+export fn file_truncate(fd: int64, size: int64) -> int64 {
+  var end: int64 = size;
+  if (file_w_set_info(fd, 6, (uint8*)&end, (uint32)8) == 0) { return file_fail(); }   // FileEndOfFileInfo
+  return 0;
+}
+
+export fn file_size(fd: int64) -> int64 {
+  var size: int64 = 0;
+  if (file_w_size(fd, &size) == 0) { return file_fail(); }
+  return size;
+}
+
+// Renames, replacing any file already at to.
+export fn file_rename(from: string, to: string) -> int64 {
+  var a: uint8[4096];
+  var b: uint8[4096];
+  if (!file_cpath(from, &a[0]) || !file_cpath(to, &b[0])) { return -206; }
+  if (file_w_move(&a[0], &b[0], (uint32)1) == 0) { return file_fail(); }   // MOVEFILE_REPLACE_EXISTING
+  return 0;
+}
+
+export fn file_remove(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!file_cpath(path, &cp[0])) { return -206; }
+  if (file_w_delete(&cp[0]) == 0) { return file_fail(); }
+  return 0;
+}
+
+// Locks the whole file: FILE_LOCK_SHARED or FILE_LOCK_EXCLUSIVE. Windows
+// locks are mandatory, not advisory. With wait false it fails at once with
+// -FILE_EWOULDBLOCK when another holder has a conflicting lock.
+export fn file_lock(fd: int64, kind: int32, wait: bool) -> int64 {
+  var ov: uint8[32];
+  file_overlapped(&ov[0], 0);
+  var flags: uint32 = 0;
+  if (kind == FILE_LOCK_EXCLUSIVE) { flags = flags | (uint32)2; }   // LOCKFILE_EXCLUSIVE_LOCK
+  if (!wait) { flags = flags | (uint32)1; }                         // LOCKFILE_FAIL_IMMEDIATELY
+  if (file_w_lock(fd, flags, (uint32)0, (uint32)0xFFFFFFFF, (uint32)0xFFFFFFFF, &ov[0]) == 0) { return file_fail(); }
+  return 0;
+}
+
+export fn file_unlock(fd: int64) -> int64 {
+  var ov: uint8[32];
+  file_overlapped(&ov[0], 0);
+  if (file_w_unlock(fd, (uint32)0, (uint32)0xFFFFFFFF, (uint32)0xFFFFFFFF, &ov[0]) == 0) { return file_fail(); }
+  return 0;
+}

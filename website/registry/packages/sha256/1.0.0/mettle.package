@@ -1,0 +1,5 @@
+name = sha256
+version = 1.0.0
+description = SHA-256 over bytes, streams and strings, checked against the NIST vectors
+license = Apache-2.0
+source = https://github.com/The-Mettle-Project/Mettle/tree/master/website/registry/packages/sha256

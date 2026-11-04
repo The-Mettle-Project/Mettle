@@ -1,0 +1,48 @@
+// reports/039: a timed mutex_lock keeps one deadline. A holder that unlocks
+// and at once locks again wakes the waiter over and over; each wake used to
+// restart the full timeout, so the waiter could wait many times too long.
+import "std/thread";
+
+extern fn md_clock_gettime(id: int32, ts: int64*) -> int32 = "clock_gettime";
+
+fn now_ns() -> int64 {
+  var ts: int64[2];
+  md_clock_gettime(1, &ts[0]);
+  return ts[0] * 1000000000 + ts[1];
+}
+
+var g_mutex: int64 = 0;
+var g_stop: int32 = 0;
+
+fn churn(arg: cstring) -> uint32 {
+  while (atomic_compare_exchange_i32(&g_stop, 0, 0) == 0) {
+    // Hold for a few milliseconds, then unlock and lock again at once, so a
+    // woken waiter almost always finds the lock taken.
+    mutex_lock_infinite(g_mutex);
+    var t0: int64 = now_ns();
+    while (now_ns() - t0 < 3000000) { }
+    mutex_unlock(g_mutex);
+  }
+  return (uint32)0;
+}
+
+fn main() -> int32 {
+  g_mutex = mutex_create();
+  var tid: uint32 = 0;
+  var t: int64 = CreateThread((cstring)0, (uint64)0, &churn, (cstring)0, (uint32)0, &tid);
+  // Give the holder time to start churning.
+  thread_sleep_ms((uint32)20);
+  var worst: int64 = 0;
+  for round in 0..10 {
+    var t0: int64 = now_ns();
+    var r: int32 = mutex_lock(g_mutex, (uint32)30);
+    var spent: int64 = now_ns() - t0;
+    if (r == 1) { mutex_unlock(g_mutex); }
+    if (spent > worst) { worst = spent; }
+  }
+  atomic_exchange_i32(&g_stop, 1);
+  thread_join_infinite(t);
+  // 30 ms asked for; allow generous scheduling slack, but not many times over.
+  if (worst > 300000000) { return 1; }
+  return 0;
+}

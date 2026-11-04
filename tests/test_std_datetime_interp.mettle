@@ -1,0 +1,19 @@
+// std/datetime makes no syscalls, so it runs in the compile-time interpreter.
+import "std/datetime";
+
+@test fn datetime_breakdown() -> int32 {
+  var dt: DateTime = time_utc((int64)1793871015 * TIME_SECOND);
+  if (dt.year != 2026 || dt.month != 11 || dt.day != 5 || dt.weekday != 4) { return 1; }
+  var buf: uint8[48];
+  var n: int64 = time_format_iso8601(dt, 0, &buf[0], (int64)48);
+  if (n != (int64)20 || buf[10] != (uint8)84 || buf[19] != (uint8)90) { return 2; }
+  return 0;
+}
+
+@test fn datetime_parse() -> int32 {
+  match (time_parse_iso8601("2026-11-05T10:30:15+01:00")) {
+    case Ok(dt): { if (time_to_unix(dt) != (int64)1793871015) { return 1; } }
+    case Err(e): { return 2; }
+  }
+  return 0;
+}

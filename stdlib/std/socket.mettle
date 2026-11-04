@@ -1,0 +1,200 @@
+// TCP and UDP sockets.
+//
+// Importing std/socket brings in the whole layer: addresses (std/netaddr),
+// the raw calls (std/socket_os: sock_open, sock_send, sock_poll, ...), and
+// name lookup (std/dns). This file adds the helpers most programs want:
+// connect by name with a timeout, listen, send everything, wait for a socket.
+//
+// The raw calls return a count or a negative error code (-NET_EAGAIN,
+// -NET_ECONNREFUSED, ...). The helpers here return Result with a NetError.
+
+import "std/core";
+import "std/netaddr";
+import "std/socket_os";
+import "std/dns";
+
+export struct NetError {
+  code: int64;       // the positive error code (NET_E*), or 0 for a lookup failure
+  message: string;
+}
+
+// A short description of an error code.
+export fn net_error_text(code: int64) -> string {
+  var c: int64 = code;
+  if (c < 0) { c = -c; }
+  if (c == NET_EAGAIN) { return "timed out or would block"; }
+  if (c == NET_ETIMEDOUT) { return "timed out"; }
+  if (c == NET_ECONNREFUSED) { return "connection refused"; }
+  if (c == NET_ECONNRESET) { return "connection reset by peer"; }
+  if (c == NET_EPIPE) { return "connection closed by peer"; }
+  if (c == NET_EADDRINUSE) { return "address already in use"; }
+  if (c == NET_ENOTCONN) { return "not connected"; }
+  if (c == NET_EHOSTUNREACH) { return "host unreachable"; }
+  if (c == NET_ENETUNREACH) { return "network unreachable"; }
+  if (c == NET_EINTR) { return "interrupted"; }
+  if (c == NET_EBADF) { return "bad socket"; }
+  if (c == NET_EINVAL) { return "invalid argument"; }
+  if (c == NET_EINPROGRESS) { return "in progress"; }
+  return "socket error";
+}
+
+fn net_err(code: int64) -> NetError {
+  var e: NetError;
+  e.code = code;
+  if (e.code < 0) { e.code = -e.code; }
+  e.message = net_error_text(e.code);
+  return e;
+}
+
+// Waits until fd is ready for events (NET_POLL_IN, NET_POLL_OUT), for at
+// most timeout_ms (-1 waits forever). Returns the ready bits, 0 on timeout,
+// or a negative error code.
+export fn sock_wait(fd: int64, events: int32, timeout_ms: int64) -> int64 {
+  var deadline: int64 = net_now_ms() + timeout_ms;
+  while (true) {
+    var wait: int64 = -1;
+    if (timeout_ms >= 0) {
+      wait = deadline - net_now_ms();
+      if (wait < 0) { wait = 0; }
+    }
+    if (wait > (int64)0x7FFFFFFF) { wait = (int64)0x7FFFFFFF; }
+    var p: NetPollFd;
+    p.fd = fd;
+    p.events = events;
+    var r: int64 = sock_poll(&p, 1, (int32)wait);
+    if (r == -NET_EINTR) { continue; }
+    if (r <= 0) { return r; }
+    return (int64)p.revents;
+  }
+  return 0;
+}
+
+// Sends all n bytes, retrying short writes and interrupts. On a
+// non-blocking socket it waits for room. Returns n or a negative code.
+export fn sock_send_all(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var sent: int64 = 0;
+  while (sent < n) {
+    var r: int64 = sock_send(fd, buf + sent, n - sent);
+    if (r == -NET_EINTR) { continue; }
+    if (r == -NET_EAGAIN) {
+      var w: int64 = sock_wait(fd, NET_POLL_OUT, -1);
+      if (w < 0) { return w; }
+      continue;
+    }
+    if (r < 0) { return r; }
+    sent = sent + r;
+  }
+  return n;
+}
+
+// Receives exactly n bytes. Returns n, 0 if the peer closed first, or a
+// negative code (-NET_EAGAIN when a receive timeout ran out).
+export fn sock_recv_exact(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var got: int64 = 0;
+  while (got < n) {
+    var r: int64 = sock_recv(fd, buf + got, n - got);
+    if (r == -NET_EINTR) { continue; }
+    if (r < 0) { return r; }
+    if (r == 0) { return 0; }
+    got = got + r;
+  }
+  return n;
+}
+
+// Connects to one address, giving up after timeout_ms (-1 waits as long
+// as the OS does). Returns a blocking socket or a negative code.
+export fn tcp_connect_addr(a: NetAddr*, timeout_ms: int64) -> int64 {
+  var fd: int64 = sock_open(a->family, NET_TCP);
+  if (fd < 0) { return fd; }
+  if (timeout_ms < 0) {
+    var r: int64 = sock_connect(fd, a);
+    while (r == -NET_EINTR) { r = sock_connect(fd, a); }
+    if (r < 0) {
+      sock_close(fd);
+      return r;
+    }
+    return fd;
+  }
+  sock_set_nonblocking(fd, true);
+  var c: int64 = sock_connect(fd, a);
+  if (c < 0 && c != -NET_EINPROGRESS && c != -NET_EAGAIN && c != -NET_EINTR) {
+    sock_close(fd);
+    return c;
+  }
+  if (c < 0) {
+    var w: int64 = sock_wait(fd, NET_POLL_OUT, timeout_ms);
+    if (w <= 0) {
+      sock_close(fd);
+      if (w == 0) { return -NET_ETIMEDOUT; }
+      return w;
+    }
+    var e: int64 = sock_take_error(fd);
+    if (e < 0) {
+      sock_close(fd);
+      return e;
+    }
+  }
+  sock_set_nonblocking(fd, false);
+  return fd;
+}
+
+// Resolves host and connects to the first address that answers, sharing
+// timeout_ms between lookup and the attempts. Returns a blocking socket.
+export fn tcp_connect(host: string, port: int32, timeout_ms: int64) -> Result<int64, NetError> {
+  var start: int64 = net_now_ms();
+  var addrs: NetAddr[16];
+  var count: int32 = 0;
+  match (net_resolve(host, port, DNS_WANT_ANY, &addrs[0], 16, timeout_ms)) {
+    case Ok(n): { count = n; }
+    case Err(e): {
+      var ne: NetError;
+      ne.code = 0;
+      ne.message = e.message;
+      return Err(ne);
+    }
+  }
+  var last: int64 = -NET_ECONNREFUSED;
+  for i in 0..count {
+    var left: int64 = timeout_ms - (net_now_ms() - start);
+    if (timeout_ms >= 0 && left <= 0) {
+      last = -NET_ETIMEDOUT;
+      break;
+    }
+    // Give each remaining address a fair slice, so one dead address does
+    // not eat the whole budget.
+    var slice: int64 = left;
+    if (timeout_ms >= 0 && count - i > 1) { slice = left / (int64)(count - i) + 1; }
+    if (timeout_ms < 0) { slice = -1; }
+    var fd: int64 = tcp_connect_addr(&addrs[i], slice);
+    if (fd >= 0) { return Ok(fd); }
+    last = fd;
+  }
+  return Err(net_err(last));
+}
+
+// A listening TCP socket on a, with SO_REUSEADDR set. Port 0 picks a free
+// port; read it back with sock_local_addr.
+export fn tcp_listen(a: NetAddr*, backlog: int32) -> Result<int64, NetError> {
+  var fd: int64 = sock_open(a->family, NET_TCP);
+  if (fd < 0) { return Err(net_err(fd)); }
+  sock_set_option(fd, NET_OPT_REUSEADDR, 1);
+  var r: int64 = sock_bind(fd, a);
+  if (r >= 0) { r = sock_listen(fd, backlog); }
+  if (r < 0) {
+    sock_close(fd);
+    return Err(net_err(r));
+  }
+  return Ok(fd);
+}
+
+// A UDP socket bound to a.
+export fn udp_bind(a: NetAddr*) -> Result<int64, NetError> {
+  var fd: int64 = sock_open(a->family, NET_UDP);
+  if (fd < 0) { return Err(net_err(fd)); }
+  var r: int64 = sock_bind(fd, a);
+  if (r < 0) {
+    sock_close(fd);
+    return Err(net_err(r));
+  }
+  return Ok(fd);
+}

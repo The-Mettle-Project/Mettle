@@ -38,6 +38,7 @@ frontend can drive instead. The documentation is organized the same way.
 
 - [Compilation](compilation.md): the driver and every option.
 - [Diagnostics](diagnostics.md): reading errors, the code index, JSON output.
+- [Packages](packages.md): `mettle pkg`, the registry, and publishing.
 - [Compile-time execution](testing.md): `mettle test` and `mettle trace`.
 - [Linker and build pipelines](linker-build-pipelines.md): which linker runs
   when.

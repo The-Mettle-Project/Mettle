@@ -34,7 +34,9 @@ drifted from the compiler.
 ## Deploying
 
 A workflow at [`.github/workflows/pages.yml`](../../.github/workflows/pages.yml)
-publishes this folder on every push to `master` that touches it.
+publishes this folder on every push to `master` that touches it, along with
+the package registry that [`website/registry.py`](../registry.py) builds from
+`website/registry/packages/` into `registry/`.
 
 One-time setup: **Settings → Pages → Source → "GitHub Actions"**. The next push
 (or a manual *Run workflow*) deploys it. The site then lives at

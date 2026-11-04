@@ -1,3 +1,15 @@
+// HTTP/1.1 (RFC 9110, RFC 9112): head parsers, header helpers, body framing,
+// a chunked decoder, URLs and queries, writers, and a small blocking client.
+//
+// The parsers are pure functions over a buffer you own. They allocate nothing
+// and every string they return is a view into that buffer, so keep the buffer
+// alive while you use the result. They are strict, for untrusted input: see
+// http_parse_request. http_fetch_to_file, below, is older and stands alone.
+
+import "std/core";
+import "std/arena";
+import "std/strbuf";
+import "std/socket";
 import "std/system";
 import "std/conv";
 import "std/mem";
@@ -45,4 +57,1576 @@ export fn http_fetch_to_file(url: cstring, output_path: cstring) -> int32 {
   var result: int32 = system(buf);
   free(buf);
   return result;
+}
+
+// ---- Limits and error codes ----
+
+export const HTTP_MAX_HEADERS = 64;
+// The most bytes a request or response head may take, blank line included.
+export const HTTP_MAX_HEAD = 65536;
+
+// Every function that returns a status gives 0 or a positive count on success
+// and one of these on failure.
+export const HTTP_ERR_START_LINE = -1;          // request or status line is malformed
+export const HTTP_ERR_METHOD = -2;              // empty method, or a byte that is not a token char
+export const HTTP_ERR_TARGET = -3;              // empty request target, or a bad byte in it
+export const HTTP_ERR_VERSION = -4;             // not HTTP/1.0 or HTTP/1.1
+export const HTTP_ERR_STATUS = -5;              // status code is not three digits 100..599
+export const HTTP_ERR_HEADER = -6;              // header line without a colon, or a bad name
+export const HTTP_ERR_OBS_FOLD = -7;            // a header line that starts with a space or tab
+export const HTTP_ERR_BARE_CR = -8;             // CR not followed by LF
+export const HTTP_ERR_BARE_LF = -9;             // LF not preceded by CR
+export const HTTP_ERR_NUL = -10;                // a zero byte in the head
+export const HTTP_ERR_CONTROL = -11;            // another control byte in the head
+export const HTTP_ERR_HEAD_TOO_LARGE = -12;     // over HTTP_MAX_HEAD with no blank line
+export const HTTP_ERR_TOO_MANY_HEADERS = -13;   // over HTTP_MAX_HEADERS
+export const HTTP_ERR_CONTENT_LENGTH = -14;     // not digits, too big, or values that differ
+export const HTTP_ERR_TRANSFER_ENCODING = -15;  // a request whose last coding is not chunked, and so on
+export const HTTP_ERR_LENGTH_CONFLICT = -16;    // Content-Length together with Transfer-Encoding
+export const HTTP_ERR_HOST = -17;               // HTTP/1.1 request without exactly one Host
+export const HTTP_ERR_CHUNK = -18;              // bad chunked framing
+export const HTTP_ERR_BODY_TOO_LARGE = -19;     // body over the caller's limit
+export const HTTP_ERR_URL = -20;                // URL does not parse
+export const HTTP_ERR_ESCAPE = -21;             // bad percent escape
+export const HTTP_ERR_TOO_SMALL = -22;          // caller's buffer is too small
+export const HTTP_ERR_NAME = -23;               // writer: header name is not a token
+export const HTTP_ERR_VALUE = -24;              // writer: CR, LF, NUL or another control byte in a value
+export const HTTP_ERR_NOMEM = -25;              // out of memory
+export const HTTP_ERR_TLS = -26;                // https needs TLS, which is not supported yet
+export const HTTP_ERR_CONNECT = -27;            // client: could not connect
+export const HTTP_ERR_IO = -28;                 // a socket read or write failed
+export const HTTP_ERR_TIMEOUT = -29;            // a socket read or write timed out
+export const HTTP_ERR_CLOSED = -30;             // the peer closed the connection too early
+export const HTTP_ERR_ABSENT = -31;             // lookup found nothing
+
+export fn http_error_text(code: int64) -> string {
+  switch (code) {
+    case 0: { return "ok"; }
+    case -1: { return "malformed start line"; }
+    case -2: { return "bad method"; }
+    case -3: { return "bad request target"; }
+    case -4: { return "unsupported HTTP version"; }
+    case -5: { return "bad status code"; }
+    case -6: { return "malformed header line"; }
+    case -7: { return "obsolete line folding"; }
+    case -8: { return "bare CR"; }
+    case -9: { return "bare LF"; }
+    case -10: { return "NUL byte in head"; }
+    case -11: { return "control byte in head"; }
+    case -12: { return "head too large"; }
+    case -13: { return "too many headers"; }
+    case -14: { return "bad Content-Length"; }
+    case -15: { return "bad Transfer-Encoding"; }
+    case -16: { return "Content-Length with Transfer-Encoding"; }
+    case -17: { return "bad Host header"; }
+    case -18: { return "bad chunked framing"; }
+    case -19: { return "body too large"; }
+    case -20: { return "bad URL"; }
+    case -21: { return "bad percent escape"; }
+    case -22: { return "buffer too small"; }
+    case -23: { return "bad header name"; }
+    case -24: { return "bad header value"; }
+    case -25: { return "out of memory"; }
+    case -26: { return "TLS is not supported yet"; }
+    case -27: { return "connect failed"; }
+    case -28: { return "socket error"; }
+    case -29: { return "timed out"; }
+    case -30: { return "connection closed early"; }
+    case -31: { return "not found"; }
+    default: { return "unknown error"; }
+  }
+}
+
+// ---- Types ----
+
+export struct HttpHeader {
+  name: string;
+  value: string;    // surrounding spaces and tabs already trimmed
+}
+
+export struct HttpRequest {
+  verb: string;               // the method, such as GET (method is a keyword)
+  target: string;
+  minor: int32;               // the 1 in HTTP/1.1, or 0 for HTTP/1.0
+  nheaders: int32;
+  head_len: int64;            // bytes of the head, through the blank line
+  headers: HttpHeader[64];       // HTTP_MAX_HEADERS
+}
+
+export struct HttpResponse {
+  reason: string;             // may be empty
+  status: int32;              // 100..599
+  minor: int32;
+  nheaders: int32;
+  head_len: int64;
+  headers: HttpHeader[64];       // HTTP_MAX_HEADERS
+}
+
+// ---- Byte classes and small helpers (private) ----
+
+fn hp_tchar(c: int32) -> bool {
+  if (c >= 97 && c <= 122) { return true; }
+  if (c >= 65 && c <= 90) { return true; }
+  if (c >= 48 && c <= 57) { return true; }
+  if (c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39) { return true; }
+  if (c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95) { return true; }
+  if (c == 96 || c == 124 || c == 126) { return true; }
+  return false;
+}
+
+fn hp_lower(c: int32) -> int32 {
+  if (c >= 65 && c <= 90) { return c + 32; }
+  return c;
+}
+
+fn hp_view(p: uint8*, from: int64, len: int64) -> string {
+  var s: string;
+  s.chars = p + from;
+  s.length = (uint64)len;
+  return s;
+}
+
+// Case-insensitive (ASCII) equality.
+fn hp_ieq(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  var n: int64 = (int64)a.length;
+  var i: int64 = 0;
+  while (i < n) {
+    if (hp_lower((int32)a.chars[i]) != hp_lower((int32)b.chars[i])) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// True when the bytes at p[i..] equal lit and stay below end.
+fn hp_at(p: uint8*, i: int64, end: int64, lit: string) -> bool {
+  var n: int64 = (int64)lit.length;
+  if (i + n > end) { return false; }
+  var k: int64 = 0;
+  while (k < n) {
+    if ((int32)p[i + k] != (int32)lit.chars[k]) { return false; }
+    k = k + 1;
+  }
+  return true;
+}
+
+// Splits a comma list. Start with *pos = 0. Items come back trimmed of spaces
+// and tabs, and may be empty. Returns false after the last item.
+fn hp_list_next(s: string, pos: int64*, item: string*) -> bool {
+  var n: int64 = (int64)s.length;
+  var i: int64 = *pos;
+  if (i > n) { return false; }
+  var j: int64 = i;
+  while (j < n && (int32)s.chars[j] != 44) { j = j + 1; }
+  var a: int64 = i;
+  var b: int64 = j;
+  while (a < b && ((int32)s.chars[a] == 32 || (int32)s.chars[a] == 9)) { a = a + 1; }
+  while (b > a && ((int32)s.chars[b - 1] == 32 || (int32)s.chars[b - 1] == 9)) { b = b - 1; }
+  *item = hp_view(s.chars, a, b - a);
+  *pos = j + 1;
+  return true;
+}
+
+// ---- Head scanning ----
+
+// Finds the end of a request or response head. Returns the index just past the
+// blank line, 0 when more bytes are needed, or a negative HTTP_ERR_*. Bytes
+// that can never be valid fail at once, before the head is complete: a bare CR
+// or LF, a NUL, and control bytes other than the tab. The scan stops at
+// HTTP_MAX_HEAD bytes. Every call rescans from the start, so feed it big reads.
+export fn http_find_head_end(p: uint8*, n: int64) -> int64 {
+  var limit: int64 = n;
+  if (limit > (int64)HTTP_MAX_HEAD) { limit = (int64)HTTP_MAX_HEAD; }
+  var line_start: int64 = 0;
+  var i: int64 = 0;
+  while (i < limit) {
+    var c: int32 = (int32)p[i];
+    if (c == 13) {
+      if (i + 1 < n && (int32)p[i + 1] != 10) { return HTTP_ERR_BARE_CR; }
+    } else if (c == 10) {
+      if (i == 0 || (int32)p[i - 1] != 13) { return HTTP_ERR_BARE_LF; }
+      if (i - 1 == line_start) {
+        // An empty line. As the very first line it is not a head at all.
+        if (line_start == 0) { return HTTP_ERR_START_LINE; }
+        return i + 1;
+      }
+      line_start = i + 1;
+    } else if (c == 0) {
+      return HTTP_ERR_NUL;
+    } else if ((c < 32 && c != 9) || c == 127) {
+      return HTTP_ERR_CONTROL;
+    }
+    i = i + 1;
+  }
+  if (n >= (int64)HTTP_MAX_HEAD) { return HTTP_ERR_HEAD_TOO_LARGE; }
+  return 0;
+}
+
+// Parses header lines from p[start], which sits at the start of the first
+// header line of a head that http_find_head_end has already accepted. Stops
+// at the blank line. Returns 0 or an error.
+fn hp_parse_headers(p: uint8*, start: int64, h: HttpHeader*, count: int32*) -> int64 {
+  var i: int64 = start;
+  var n: int32 = 0;
+  while ((int32)p[i] != 13) {
+    var first: int32 = (int32)p[i];
+    if (first == 32 || first == 9) { return HTTP_ERR_OBS_FOLD; }
+    if (n >= HTTP_MAX_HEADERS) { return HTTP_ERR_TOO_MANY_HEADERS; }
+    var name0: int64 = i;
+    while (hp_tchar((int32)p[i])) { i = i + 1; }
+    if (i == name0 || (int32)p[i] != 58) { return HTTP_ERR_HEADER; }
+    var name_len: int64 = i - name0;
+    i = i + 1;
+    while ((int32)p[i] == 32 || (int32)p[i] == 9) { i = i + 1; }
+    var v0: int64 = i;
+    while ((int32)p[i] != 13) { i = i + 1; }
+    var v1: int64 = i;
+    while (v1 > v0 && ((int32)p[v1 - 1] == 32 || (int32)p[v1 - 1] == 9)) { v1 = v1 - 1; }
+    h[n].name = hp_view(p, name0, name_len);
+    h[n].value = hp_view(p, v0, v1 - v0);
+    n = n + 1;
+    i = i + 2;
+  }
+  *count = n;
+  return 0;
+}
+
+// ---- Header lookup ----
+
+// Index of the next header called name (any case) at or after from, or -1.
+export fn http_header_find(h: HttpHeader*, count: int32, name: string, from: int32) -> int32 {
+  var i: int32 = from;
+  if (i < 0) { i = 0; }
+  while (i < count) {
+    if (hp_ieq(h[i].name, name)) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// The value of the first header called name, in any case.
+export fn http_header(h: HttpHeader*, count: int32, name: string) -> Option<string> {
+  var at: int32 = http_header_find(h, count, name, 0);
+  if (at < 0) { return None; }
+  return Some(h[at].value);
+}
+
+// True when a comma list such as "keep-alive, Upgrade" holds token, in any case.
+export fn http_header_has_token(value: string, token: string) -> bool {
+  var pos: int64 = 0;
+  var item: string;
+  while (hp_list_next(value, &pos, &item)) {
+    if (item.length != 0 && hp_ieq(item, token)) { return true; }
+  }
+  return false;
+}
+
+// True when any header called name holds token in its comma list.
+export fn http_header_list_has(h: HttpHeader*, count: int32, name: string, token: string) -> bool {
+  var at: int32 = http_header_find(h, count, name, 0);
+  while (at >= 0) {
+    if (http_header_has_token(h[at].value, token)) { return true; }
+    at = http_header_find(h, count, name, at + 1);
+  }
+  return false;
+}
+
+// Whether the connection stays open after this message. HTTP/1.1 keeps it
+// unless Connection has "close". HTTP/1.0 closes unless it has "keep-alive".
+export fn http_keep_alive(minor: int32, h: HttpHeader*, count: int32) -> bool {
+  if (http_header_list_has(h, count, "connection", "close")) { return false; }
+  if (minor >= 1) { return true; }
+  return http_header_list_has(h, count, "connection", "keep-alive");
+}
+
+// ---- Body framing ----
+
+struct HpFrame {
+  cl: int64;
+  has_cl: int32;
+  has_te: int32;
+  chunked_last: int32;
+}
+
+// Reads one Content-Length item: 1 to 18 digits and nothing else. -1 if bad.
+fn hp_cl_item(item: string) -> int64 {
+  var n: int64 = (int64)item.length;
+  if (n == 0 || n > 18) { return -1; }
+  var v: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)item.chars[i];
+    if (c < 48 || c > 57) { return -1; }
+    v = v * 10 + (int64)(c - 48);
+    i = i + 1;
+  }
+  return v;
+}
+
+// Reads Content-Length and Transfer-Encoding. Repeated or comma-listed
+// Content-Length values are fine if they all agree and fail if they differ.
+fn hp_framing(h: HttpHeader*, count: int32, f: HpFrame*) -> int64 {
+  f->cl = 0;
+  f->has_cl = 0;
+  f->has_te = 0;
+  f->chunked_last = 0;
+  var chunked_count: int32 = 0;
+  var tokens: int32 = 0;
+  var k: int32 = 0;
+  while (k < count) {
+    var item: string;
+    var pos: int64 = 0;
+    if (hp_ieq(h[k].name, "content-length")) {
+      while (hp_list_next(h[k].value, &pos, &item)) {
+        var v: int64 = hp_cl_item(item);
+        if (v < 0) { return HTTP_ERR_CONTENT_LENGTH; }
+        if (f->has_cl != 0 && v != f->cl) { return HTTP_ERR_CONTENT_LENGTH; }
+        f->has_cl = 1;
+        f->cl = v;
+      }
+    } else if (hp_ieq(h[k].name, "transfer-encoding")) {
+      f->has_te = 1;
+      while (hp_list_next(h[k].value, &pos, &item)) {
+        if (item.length != 0) {
+          tokens = tokens + 1;
+          if (hp_ieq(item, "chunked")) {
+            chunked_count = chunked_count + 1;
+            f->chunked_last = 1;
+          } else {
+            f->chunked_last = 0;
+          }
+        }
+      }
+    }
+    k = k + 1;
+  }
+  if (f->has_te != 0 && (tokens == 0 || chunked_count > 1)) { return HTTP_ERR_TRANSFER_ENCODING; }
+  return 0;
+}
+
+export const HTTP_BODY_NONE = 0;       // no body
+export const HTTP_BODY_LENGTH = 1;     // exactly HttpBody.length bytes
+export const HTTP_BODY_CHUNKED = 2;    // chunked: use HttpChunkDecoder
+export const HTTP_BODY_CLOSE = 3;      // everything until the peer closes (responses only)
+export const HTTP_BODY_INVALID = 4;    // the headers contradict each other; HttpBody.length is the HTTP_ERR_*
+
+export struct HttpBody {
+  kind: int32;
+  length: int64;
+}
+
+// How a request body is framed. A request without Content-Length or
+// Transfer-Encoding has no body.
+export fn http_request_body_kind(req: HttpRequest*) -> HttpBody {
+  var out: HttpBody;
+  var f: HpFrame;
+  var err: int64 = hp_framing(&req->headers[0], req->nheaders, &f);
+  if (err == 0 && f.has_cl != 0 && f.has_te != 0) { err = HTTP_ERR_LENGTH_CONFLICT; }
+  if (err == 0 && f.has_te != 0 && (f.chunked_last == 0 || req->minor == 0)) { err = HTTP_ERR_TRANSFER_ENCODING; }
+  if (err != 0) {
+    out.kind = HTTP_BODY_INVALID;
+    out.length = err;
+    return out;
+  }
+  if (f.has_te != 0) {
+    out.kind = HTTP_BODY_CHUNKED;
+  } else if (f.has_cl != 0) {
+    out.kind = HTTP_BODY_LENGTH;
+    out.length = f.cl;
+    if (f.cl == 0) { out.kind = HTTP_BODY_NONE; }
+  } else {
+    out.kind = HTTP_BODY_NONE;
+  }
+  return out;
+}
+
+// How a response body is framed. head_request says the request was HEAD.
+// A response to HEAD, any 1xx, 204 and 304 never has a body, whatever the
+// headers say. Otherwise chunked wins, then Content-Length, and a response
+// with neither runs until the peer closes. A Transfer-Encoding whose last
+// coding is not chunked also runs until close (RFC 9112 section 6.3).
+export fn http_response_body_kind(res: HttpResponse*, head_request: bool) -> HttpBody {
+  var out: HttpBody;
+  if (head_request || (res->status >= 100 && res->status < 200) || res->status == 204 || res->status == 304) {
+    out.kind = HTTP_BODY_NONE;
+    return out;
+  }
+  var f: HpFrame;
+  var err: int64 = hp_framing(&res->headers[0], res->nheaders, &f);
+  if (err == 0 && f.has_cl != 0 && f.has_te != 0) { err = HTTP_ERR_LENGTH_CONFLICT; }
+  if (err != 0) {
+    out.kind = HTTP_BODY_INVALID;
+    out.length = err;
+    return out;
+  }
+  if (f.has_te != 0) {
+    out.kind = HTTP_BODY_CLOSE;
+    if (f.chunked_last != 0) { out.kind = HTTP_BODY_CHUNKED; }
+  } else if (f.has_cl != 0) {
+    out.kind = HTTP_BODY_LENGTH;
+    out.length = f.cl;
+    if (f.cl == 0) { out.kind = HTTP_BODY_NONE; }
+  } else {
+    out.kind = HTTP_BODY_CLOSE;
+  }
+  return out;
+}
+
+// ---- Head parsers ----
+
+// Parses a request head from buf. Returns the bytes of head consumed, through
+// the blank line (the body, if any, starts there), 0 if the head is not
+// complete yet, or a negative HTTP_ERR_*. Call it again with more bytes after
+// a 0. Strings in *req point into buf.
+//
+// What it refuses: a method that is not a token; a target with a space, a
+// control byte or a byte over 0x7E; a version other than HTTP/1.0 and
+// HTTP/1.1; a header name that is not a token (so a space before the colon
+// fails); a header line that starts with a space or tab (obsolete folding); a
+// bare CR or bare LF where CRLF belongs (bare LF line ends are not accepted);
+// NUL and other control bytes; a head over HTTP_MAX_HEAD bytes; more than
+// HTTP_MAX_HEADERS headers. For smuggling: Content-Length with
+// Transfer-Encoding; Content-Length values that are not plain digits or that
+// differ; Transfer-Encoding on HTTP/1.0 or whose last coding is not chunked or
+// that names chunked twice. An HTTP/1.1 request needs exactly one Host.
+export fn http_parse_request(buf: string, req: HttpRequest*) -> int64 {
+  var p: uint8* = buf.chars;
+  var end: int64 = http_find_head_end(p, (int64)buf.length);
+  if (end <= 0) { return end; }
+
+  var i: int64 = 0;
+  while (hp_tchar((int32)p[i])) { i = i + 1; }
+  if (i == 0) { return HTTP_ERR_METHOD; }
+  if ((int32)p[i] != 32) {
+    if ((int32)p[i] == 13) { return HTTP_ERR_START_LINE; }
+    return HTTP_ERR_METHOD;
+  }
+  req->verb = hp_view(p, 0, i);
+  i = i + 1;
+
+  var t0: int64 = i;
+  while ((int32)p[i] > 32 && (int32)p[i] < 127) { i = i + 1; }
+  if (i == t0) { return HTTP_ERR_TARGET; }
+  if ((int32)p[i] != 32) {
+    if ((int32)p[i] == 13) { return HTTP_ERR_START_LINE; }
+    return HTTP_ERR_TARGET;
+  }
+  req->target = hp_view(p, t0, i - t0);
+  i = i + 1;
+
+  // The version is the rest of the line, and must be exactly 8 bytes.
+  var minor: int32 = -1;
+  if (hp_at(p, i, end, "HTTP/1.0") && (int32)p[i + 8] == 13) { minor = 0; }
+  if (hp_at(p, i, end, "HTTP/1.1") && (int32)p[i + 8] == 13) { minor = 1; }
+  if (minor < 0) {
+    if (hp_at(p, i, end, "HTTP/")) { return HTTP_ERR_VERSION; }
+    return HTTP_ERR_START_LINE;
+  }
+  req->minor = minor;
+  i = i + 10;
+
+  var err: int64 = hp_parse_headers(p, i, &req->headers[0], &req->nheaders);
+  if (err != 0) { return err; }
+  req->head_len = end;
+
+  var f: HpFrame;
+  err = hp_framing(&req->headers[0], req->nheaders, &f);
+  if (err != 0) { return err; }
+  if (f.has_cl != 0 && f.has_te != 0) { return HTTP_ERR_LENGTH_CONFLICT; }
+  if (f.has_te != 0 && (f.chunked_last == 0 || minor == 0)) { return HTTP_ERR_TRANSFER_ENCODING; }
+
+  if (minor == 1) {
+    var at: int32 = http_header_find(&req->headers[0], req->nheaders, "host", 0);
+    if (at < 0) { return HTTP_ERR_HOST; }
+    if (req->headers[at].value.length == 0) { return HTTP_ERR_HOST; }
+    if (http_header_find(&req->headers[0], req->nheaders, "host", at + 1) >= 0) { return HTTP_ERR_HOST; }
+  }
+  return end;
+}
+
+// Parses a response head the same way. The status line is HTTP/1.x, one
+// space, three digits 100..599, and then a space and a reason phrase (a
+// missing space and reason is accepted). The framing checks are the same,
+// except that a Transfer-Encoding that does not end in chunked is allowed:
+// it makes the body run until close. Interim 1xx responses parse like any
+// other, so call again on the bytes after one.
+export fn http_parse_response(buf: string, res: HttpResponse*) -> int64 {
+  var p: uint8* = buf.chars;
+  var end: int64 = http_find_head_end(p, (int64)buf.length);
+  if (end <= 0) { return end; }
+
+  var minor: int32 = -1;
+  if (hp_at(p, 0, end, "HTTP/1.0")) { minor = 0; }
+  if (hp_at(p, 0, end, "HTTP/1.1")) { minor = 1; }
+  if (minor < 0) {
+    if (hp_at(p, 0, end, "HTTP/")) { return HTTP_ERR_VERSION; }
+    return HTTP_ERR_START_LINE;
+  }
+  if ((int32)p[8] != 32) { return HTTP_ERR_START_LINE; }
+  var d0: int32 = (int32)p[9];
+  var d1: int32 = (int32)p[10];
+  var d2: int32 = (int32)p[11];
+  if (d0 < 49 || d0 > 53 || d1 < 48 || d1 > 57 || d2 < 48 || d2 > 57) { return HTTP_ERR_STATUS; }
+  res->status = (d0 - 48) * 100 + (d1 - 48) * 10 + (d2 - 48);
+  res->minor = minor;
+
+  var i: int64 = 12;
+  if ((int32)p[i] == 13) {
+    res->reason = hp_view(p, i, 0);
+  } else if ((int32)p[i] == 32) {
+    i = i + 1;
+    var r0: int64 = i;
+    while ((int32)p[i] != 13) { i = i + 1; }
+    res->reason = hp_view(p, r0, i - r0);
+  } else {
+    return HTTP_ERR_STATUS;
+  }
+  i = i + 2;
+
+  var err: int64 = hp_parse_headers(p, i, &res->headers[0], &res->nheaders);
+  if (err != 0) { return err; }
+  res->head_len = end;
+
+  var f: HpFrame;
+  err = hp_framing(&res->headers[0], res->nheaders, &f);
+  if (err != 0) { return err; }
+  if (f.has_cl != 0 && f.has_te != 0) { return HTTP_ERR_LENGTH_CONFLICT; }
+  return end;
+}
+
+// ---- Chunked bodies ----
+
+export const HTTP_CHUNK_MORE = 0;   // all input was used; feed more
+export const HTTP_CHUNK_DONE = 1;   // the body is complete; see consumed
+export const HTTP_CHUNK_FULL = 2;   // the output buffer filled up; drain it and feed the rest
+
+// Bytes of chunk extensions and trailers the decoder skips before it gives up.
+const HP_CHUNK_MAX_SKIP = 16384;
+
+const CH_SIZE = 0;
+const CH_EXT = 1;
+const CH_SIZE_LF = 2;
+const CH_DATA = 3;
+const CH_DATA_CR = 4;
+const CH_DATA_LF = 5;
+const CH_TRAILER = 6;
+const CH_TRAILER_SKIP = 7;
+const CH_TRAILER_LF = 8;
+const CH_FINAL_LF = 9;
+const CH_DONE = 10;
+const CH_ERROR = 11;
+
+// Decodes a chunked body a few bytes at a time. Start it with http_chunk_init.
+export struct HttpChunkDecoder {
+  state: int32;
+  digits: int32;
+  size: int64;        // the chunk size being read
+  remaining: int64;   // data bytes left in the current chunk
+  total: int64;       // body bytes announced so far, which counts a chunk not yet delivered
+  max_body: int64;    // 0 means no limit
+  skipped: int64;     // extension and trailer bytes skipped in this run
+}
+
+export struct HttpChunkFeed {
+  consumed: int64;    // bytes of src used
+  produced: int64;    // body bytes written to dst
+}
+
+// max_body caps the body: a chunk that would take the total over it fails
+// with HTTP_ERR_BODY_TOO_LARGE. Pass 0 for no limit.
+export fn http_chunk_init(d: HttpChunkDecoder*, max_body: int64) {
+  d->state = CH_SIZE;
+  d->digits = 0;
+  d->size = 0;
+  d->remaining = 0;
+  d->total = 0;
+  d->max_body = max_body;
+  d->skipped = 0;
+}
+
+fn hp_hex(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  return -1;
+}
+
+fn hp_ch_fail(d: HttpChunkDecoder*, out: HttpChunkFeed*, i: int64, w: int64, err: int64) -> int64 {
+  d->state = CH_ERROR;
+  out->consumed = i;
+  out->produced = w;
+  return err;
+}
+
+// Feeds n bytes of chunked framing from src, and writes the body bytes it
+// finds to dst (at most cap). *out says how much of each was used. The result
+// is HTTP_CHUNK_MORE (src was used up, send more), HTTP_CHUNK_DONE (the final
+// chunk and the empty line after the trailers were read; out->consumed stops
+// there, so any bytes after belong to the next message), HTTP_CHUNK_FULL (dst
+// is full: use out->produced bytes, then call again with the unused part of
+// src), or a negative error: HTTP_ERR_CHUNK for a bad size, bad framing, or a
+// bare CR or LF, and HTTP_ERR_BODY_TOO_LARGE. An error is final. dst may equal
+// src, which decodes in place, since output never runs ahead of input.
+// Chunk extensions and trailer fields are checked for control bytes and then
+// skipped.
+export fn http_chunk_feed(d: HttpChunkDecoder*, src: uint8*, n: int64, dst: uint8*, cap: int64, out: HttpChunkFeed*) -> int64 {
+  var i: int64 = 0;
+  var w: int64 = 0;
+  if (d->state == CH_ERROR) { return hp_ch_fail(d, out, 0, 0, HTTP_ERR_CHUNK); }
+  while (i < n && d->state != CH_DONE) {
+    if (d->state == CH_DATA) {
+      var take: int64 = d->remaining;
+      if (take > n - i) { take = n - i; }
+      if (take > cap - w) { take = cap - w; }
+      if (take <= 0) {
+        out->consumed = i;
+        out->produced = w;
+        return HTTP_CHUNK_FULL;
+      }
+      if (dst + w != src + i) { memmove(dst + w, src + i, take); }
+      i = i + take;
+      w = w + take;
+      d->remaining = d->remaining - take;
+      if (d->remaining == 0) { d->state = CH_DATA_CR; }
+    } else {
+      var c: int32 = (int32)src[i];
+      i = i + 1;
+      if (d->state == CH_SIZE) {
+        var hv: int32 = hp_hex(c);
+        if (hv >= 0) {
+          if (d->size >= ((int64)1 << 59)) { return hp_ch_fail(d, out, i, w, HTTP_ERR_BODY_TOO_LARGE); }
+          d->size = d->size * 16 + (int64)hv;
+          d->digits = d->digits + 1;
+        } else if (d->digits == 0) {
+          return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK);
+        } else if (c == 13) {
+          d->state = CH_SIZE_LF;
+        } else if (c == 59 || c == 32 || c == 9) {
+          d->state = CH_EXT;
+        } else {
+          return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK);
+        }
+      } else if (d->state == CH_EXT || d->state == CH_TRAILER_SKIP) {
+        if (c == 13) {
+          if (d->state == CH_TRAILER_SKIP) {
+            d->state = CH_TRAILER_LF;
+          } else {
+            d->state = CH_SIZE_LF;
+          }
+        } else if (c == 10 || c == 0 || (c < 32 && c != 9) || c == 127) {
+          return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK);
+        } else {
+          d->skipped = d->skipped + 1;
+          if (d->skipped > (int64)HP_CHUNK_MAX_SKIP) { return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK); }
+        }
+      } else if (d->state == CH_SIZE_LF) {
+        if (c != 10) { return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK); }
+        if (d->size == 0) {
+          d->state = CH_TRAILER;
+        } else {
+          if (d->max_body > 0 && d->size > d->max_body - d->total) {
+            return hp_ch_fail(d, out, i, w, HTTP_ERR_BODY_TOO_LARGE);
+          }
+          d->total = d->total + d->size;
+          d->remaining = d->size;
+          d->state = CH_DATA;
+        }
+      } else if (d->state == CH_DATA_CR) {
+        if (c != 13) { return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK); }
+        d->state = CH_DATA_LF;
+      } else if (d->state == CH_DATA_LF) {
+        if (c != 10) { return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK); }
+        d->state = CH_SIZE;
+        d->size = 0;
+        d->digits = 0;
+        d->skipped = 0;
+      } else if (d->state == CH_TRAILER) {
+        if (c == 13) {
+          d->state = CH_FINAL_LF;
+        } else if (hp_tchar(c)) {
+          d->state = CH_TRAILER_SKIP;
+          d->skipped = d->skipped + 1;
+        } else {
+          return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK);
+        }
+      } else if (d->state == CH_TRAILER_LF) {
+        if (c != 10) { return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK); }
+        d->state = CH_TRAILER;
+      } else if (d->state == CH_FINAL_LF) {
+        if (c != 10) { return hp_ch_fail(d, out, i, w, HTTP_ERR_CHUNK); }
+        d->state = CH_DONE;
+      }
+    }
+  }
+  out->consumed = i;
+  out->produced = w;
+  if (d->state == CH_DONE) { return HTTP_CHUNK_DONE; }
+  return HTTP_CHUNK_MORE;
+}
+
+// ---- Percent encoding and query strings ----
+
+// Decodes %XX escapes from src into dst. With plus_is_space, '+' becomes a
+// space, as in query strings; leave it false for paths. Output is never longer
+// than src. Returns the decoded length, HTTP_ERR_ESCAPE for a '%' not followed
+// by two hex digits, or HTTP_ERR_TOO_SMALL if cap is too small. A %00 decodes
+// to a NUL byte, so check for it if the result will be used as a C string.
+export fn http_percent_decode(src: string, dst: uint8*, cap: int64, plus_is_space: bool) -> int64 {
+  var n: int64 = (int64)src.length;
+  var i: int64 = 0;
+  var w: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)src.chars[i];
+    if (c == 37) {
+      if (i + 2 >= n) { return HTTP_ERR_ESCAPE; }
+      var hi: int32 = hp_hex((int32)src.chars[i + 1]);
+      var lo: int32 = hp_hex((int32)src.chars[i + 2]);
+      if (hi < 0 || lo < 0) { return HTTP_ERR_ESCAPE; }
+      c = hi * 16 + lo;
+      i = i + 3;
+    } else {
+      if (c == 43 && plus_is_space) { c = 32; }
+      i = i + 1;
+    }
+    if (w >= cap) { return HTTP_ERR_TOO_SMALL; }
+    dst[w] = (uint8)c;
+    w = w + 1;
+  }
+  return w;
+}
+
+fn hp_unreserved(c: int32) -> bool {
+  if (c >= 97 && c <= 122) { return true; }
+  if (c >= 65 && c <= 90) { return true; }
+  if (c >= 48 && c <= 57) { return true; }
+  return c == 45 || c == 46 || c == 95 || c == 126;
+}
+
+// Appends s to b with every byte that is not a letter, digit, '-', '.', '_'
+// or '~' written as %XX (upper-case hex). Returns the bytes appended, or an
+// error.
+export fn http_percent_encode(b: StrBuf*, s: string) -> int64 {
+  var start: int64 = b->len;
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    var ok: int32 = 1;
+    if (hp_unreserved(c)) {
+      ok = strbuf_append_byte(b, (uint8)c);
+    } else {
+      var hi: int32 = c / 16;
+      var lo: int32 = c % 16;
+      var h0: int32 = 48 + hi;
+      var h1: int32 = 48 + lo;
+      if (hi > 9) { h0 = 55 + hi; }
+      if (lo > 9) { h1 = 55 + lo; }
+      ok = strbuf_append_byte(b, (uint8)37);
+      if (ok != 0) { ok = strbuf_append_byte(b, (uint8)h0); }
+      if (ok != 0) { ok = strbuf_append_byte(b, (uint8)h1); }
+    }
+    if (ok == 0) {
+      b->len = start;
+      return HTTP_ERR_NOMEM;
+    }
+    i = i + 1;
+  }
+  return b->len - start;
+}
+
+// Steps through the name=value pairs of a query string. Start with *pos = 0.
+// The strings are the raw, still-encoded text, as views into query. A pair
+// with no '=' has an empty value. Empty pairs ("a=1&&b=2") are skipped.
+// Returns false when there are no more.
+export fn http_query_next(query: string, pos: int64*, name: string*, value: string*) -> bool {
+  var n: int64 = (int64)query.length;
+  var i: int64 = *pos;
+  while (i < n) {
+    var j: int64 = i;
+    while (j < n && (int32)query.chars[j] != 38) { j = j + 1; }
+    if (j > i) {
+      var eq: int64 = i;
+      while (eq < j && (int32)query.chars[eq] != 61) { eq = eq + 1; }
+      *name = hp_view(query.chars, i, eq - i);
+      if (eq < j) {
+        *value = hp_view(query.chars, eq + 1, j - eq - 1);
+      } else {
+        *value = hp_view(query.chars, j, 0);
+      }
+      *pos = j + 1;
+      return true;
+    }
+    i = j + 1;
+  }
+  *pos = n + 1;
+  return false;
+}
+
+// True when raw, percent-decoded with '+' as space, equals plain. A bad
+// escape never matches.
+fn hp_pct_eq(raw: string, plain: string) -> bool {
+  var n: int64 = (int64)raw.length;
+  var m: int64 = (int64)plain.length;
+  var i: int64 = 0;
+  var k: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)raw.chars[i];
+    if (c == 37) {
+      if (i + 2 >= n) { return false; }
+      var hi: int32 = hp_hex((int32)raw.chars[i + 1]);
+      var lo: int32 = hp_hex((int32)raw.chars[i + 2]);
+      if (hi < 0 || lo < 0) { return false; }
+      c = hi * 16 + lo;
+      i = i + 3;
+    } else {
+      if (c == 43) { c = 32; }
+      i = i + 1;
+    }
+    if (k >= m || (int32)plain.chars[k] != c) { return false; }
+    k = k + 1;
+  }
+  return k == m;
+}
+
+// The raw value of the first parameter called name. The name in the query is
+// percent-decoded before the comparison. Case matters.
+export fn http_query_find(query: string, name: string) -> Option<string> {
+  var pos: int64 = 0;
+  var k: string;
+  var v: string;
+  while (http_query_next(query, &pos, &k, &v)) {
+    if (hp_pct_eq(k, name)) { return Some(v); }
+  }
+  return None;
+}
+
+// Decodes the first parameter called name into dst. Returns its length,
+// HTTP_ERR_ABSENT if there is no such parameter, HTTP_ERR_ESCAPE, or
+// HTTP_ERR_TOO_SMALL.
+export fn http_query_get(query: string, name: string, dst: uint8*, cap: int64) -> int64 {
+  match (http_query_find(query, name)) {
+    case Some(v): { return http_percent_decode(v, dst, cap, true); }
+    case None: { return HTTP_ERR_ABSENT; }
+  }
+}
+
+// ---- URLs ----
+
+// The parts of a URL, as views into the string that was parsed.
+export struct HttpUrl {
+  scheme: string;     // as written, "http"
+  userinfo: string;   // before the '@', empty if none
+  host: string;       // without the brackets of an IPv6 address
+  path: string;       // "/" if the URL has none
+  query: string;      // after the '?', empty if none
+  fragment: string;   // after the '#', empty if none
+  port: int32;        // the default for the scheme if the URL has none
+  ipv6: int32;        // 1 if the host was in brackets
+  tls: int32;         // 1 for https and wss
+}
+
+fn hp_reg_name_char(c: int32) -> bool {
+  if (hp_unreserved(c)) { return true; }
+  if (c == 37 || c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41) { return true; }
+  return c == 42 || c == 43 || c == 44 || c == 59 || c == 61;
+}
+
+// Parses scheme://[userinfo@]host[:port][/path][?query][#fragment]. The
+// scheme must be http, https, ws or wss (any case). The URL must be written
+// in ASCII with no spaces or control bytes, so escape the rest first. An empty
+// port after the colon means the default. Port 0 is refused. Returns 0 or
+// HTTP_ERR_URL; *out is only valid after 0.
+export fn http_url_parse(url: string, out: HttpUrl*) -> int64 {
+  var p: uint8* = url.chars;
+  var n: int64 = (int64)url.length;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)p[i];
+    if (c <= 32 || c >= 127) { return HTTP_ERR_URL; }
+    i = i + 1;
+  }
+
+  i = 0;
+  while (i < n && (int32)p[i] != 58) { i = i + 1; }
+  if (i == 0 || i + 2 >= n) { return HTTP_ERR_URL; }
+  if ((int32)p[i + 1] != 47 || (int32)p[i + 2] != 47) { return HTTP_ERR_URL; }
+  out->scheme = hp_view(p, 0, i);
+  out->tls = 0;
+  if (hp_ieq(out->scheme, "http") || hp_ieq(out->scheme, "ws")) {
+    out->port = 80;
+  } else if (hp_ieq(out->scheme, "https") || hp_ieq(out->scheme, "wss")) {
+    out->port = 443;
+    out->tls = 1;
+  } else {
+    return HTTP_ERR_URL;
+  }
+
+  var a0: int64 = i + 3;
+  var a1: int64 = a0;
+  while (a1 < n && (int32)p[a1] != 47 && (int32)p[a1] != 63 && (int32)p[a1] != 35) { a1 = a1 + 1; }
+
+  // userinfo: everything before the last '@' of the authority
+  var h0: int64 = a0;
+  var k: int64 = a1;
+  out->userinfo = hp_view(p, a0, 0);
+  while (k > a0) {
+    k = k - 1;
+    if ((int32)p[k] == 64) {
+      out->userinfo = hp_view(p, a0, k - a0);
+      h0 = k + 1;
+      k = a0;
+    }
+  }
+
+  var rest: int64 = h0;
+  out->ipv6 = 0;
+  if (h0 < a1 && (int32)p[h0] == 91) {
+    var rb: int64 = h0;
+    while (rb < a1 && (int32)p[rb] != 93) { rb = rb + 1; }
+    if (rb >= a1) { return HTTP_ERR_URL; }
+    out->host = hp_view(p, h0 + 1, rb - h0 - 1);
+    out->ipv6 = 1;
+    var colons: int32 = 0;
+    var j: int64 = h0 + 1;
+    var zone: bool = false;
+    while (j < rb) {
+      var hc: int32 = (int32)p[j];
+      if (zone) {
+        if (!hp_reg_name_char(hc)) { return HTTP_ERR_URL; }
+      } else if (hc == 37) {
+        zone = true;
+      } else if (hc == 58) {
+        colons = colons + 1;
+      } else if (hp_hex(hc) < 0 && hc != 46) {
+        return HTTP_ERR_URL;
+      }
+      j = j + 1;
+    }
+    if (colons < 2) { return HTTP_ERR_URL; }
+    rest = rb + 1;
+  } else {
+    var j2: int64 = h0;
+    while (j2 < a1 && (int32)p[j2] != 58) {
+      if (!hp_reg_name_char((int32)p[j2])) { return HTTP_ERR_URL; }
+      j2 = j2 + 1;
+    }
+    out->host = hp_view(p, h0, j2 - h0);
+    rest = j2;
+  }
+  if (out->host.length == 0) { return HTTP_ERR_URL; }
+
+  if (rest < a1) {
+    if ((int32)p[rest] != 58) { return HTTP_ERR_URL; }
+    var digits: int64 = a1 - rest - 1;
+    if (digits > 5) { return HTTP_ERR_URL; }
+    if (digits > 0) {
+      var port: int32 = 0;
+      var m: int64 = rest + 1;
+      while (m < a1) {
+        var d: int32 = (int32)p[m];
+        if (d < 48 || d > 57) { return HTTP_ERR_URL; }
+        port = port * 10 + (d - 48);
+        m = m + 1;
+      }
+      if (port < 1 || port > 65535) { return HTTP_ERR_URL; }
+      out->port = port;
+    }
+  }
+
+  i = a1;
+  var path0: int64 = i;
+  while (i < n && (int32)p[i] != 63 && (int32)p[i] != 35) { i = i + 1; }
+  out->path = hp_view(p, path0, i - path0);
+  if (out->path.length == 0) { out->path = "/"; }
+  out->query = hp_view(p, i, 0);
+  if (i < n && (int32)p[i] == 63) {
+    i = i + 1;
+    var q0: int64 = i;
+    while (i < n && (int32)p[i] != 35) { i = i + 1; }
+    out->query = hp_view(p, q0, i - q0);
+  }
+  out->fragment = hp_view(p, i, 0);
+  if (i < n && (int32)p[i] == 35) {
+    out->fragment = hp_view(p, i + 1, n - i - 1);
+  }
+  return 0;
+}
+
+// ---- Writers ----
+
+// The standard reason phrase for a status code, or "Unknown".
+export fn http_status_text(code: int32) -> string {
+  switch (code) {
+    case 100: { return "Continue"; }
+    case 101: { return "Switching Protocols"; }
+    case 200: { return "OK"; }
+    case 201: { return "Created"; }
+    case 202: { return "Accepted"; }
+    case 203: { return "Non-Authoritative Information"; }
+    case 204: { return "No Content"; }
+    case 205: { return "Reset Content"; }
+    case 206: { return "Partial Content"; }
+    case 300: { return "Multiple Choices"; }
+    case 301: { return "Moved Permanently"; }
+    case 302: { return "Found"; }
+    case 303: { return "See Other"; }
+    case 304: { return "Not Modified"; }
+    case 307: { return "Temporary Redirect"; }
+    case 308: { return "Permanent Redirect"; }
+    case 400: { return "Bad Request"; }
+    case 401: { return "Unauthorized"; }
+    case 402: { return "Payment Required"; }
+    case 403: { return "Forbidden"; }
+    case 404: { return "Not Found"; }
+    case 405: { return "Method Not Allowed"; }
+    case 406: { return "Not Acceptable"; }
+    case 407: { return "Proxy Authentication Required"; }
+    case 408: { return "Request Timeout"; }
+    case 409: { return "Conflict"; }
+    case 410: { return "Gone"; }
+    case 411: { return "Length Required"; }
+    case 412: { return "Precondition Failed"; }
+    case 413: { return "Content Too Large"; }
+    case 414: { return "URI Too Long"; }
+    case 415: { return "Unsupported Media Type"; }
+    case 416: { return "Range Not Satisfiable"; }
+    case 417: { return "Expectation Failed"; }
+    case 421: { return "Misdirected Request"; }
+    case 422: { return "Unprocessable Content"; }
+    case 426: { return "Upgrade Required"; }
+    case 428: { return "Precondition Required"; }
+    case 429: { return "Too Many Requests"; }
+    case 431: { return "Request Header Fields Too Large"; }
+    case 500: { return "Internal Server Error"; }
+    case 501: { return "Not Implemented"; }
+    case 502: { return "Bad Gateway"; }
+    case 503: { return "Service Unavailable"; }
+    case 504: { return "Gateway Timeout"; }
+    case 505: { return "HTTP Version Not Supported"; }
+    default: { return "Unknown"; }
+  }
+}
+
+// True for a non-empty method or header name made only of token characters.
+export fn http_valid_token(s: string) -> bool {
+  if (s.length == 0) { return false; }
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    if (!hp_tchar((int32)s.chars[i])) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// True for a header value (or reason phrase) with no NUL, CR, LF or other
+// control byte. A tab is fine.
+export fn http_valid_field_value(s: string) -> bool {
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if ((c < 32 && c != 9) || c == 127) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn hp_valid_target(s: string) -> bool {
+  if (s.length == 0) { return false; }
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (c <= 32 || c >= 127) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn hp_check_headers(h: HttpHeader*, n: int32) -> int64 {
+  var i: int32 = 0;
+  while (i < n) {
+    if (!http_valid_token(h[i].name)) { return HTTP_ERR_NAME; }
+    if (!http_valid_field_value(h[i].value)) { return HTTP_ERR_VALUE; }
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn hp_put_headers(b: StrBuf*, h: HttpHeader*, n: int32) -> bool {
+  var i: int32 = 0;
+  while (i < n) {
+    if (strbuf_append_string(b, h[i].name) == 0) { return false; }
+    if (strbuf_append_bytes(b, ": ", 2) == 0) { return false; }
+    if (strbuf_append_string(b, h[i].value) == 0) { return false; }
+    if (strbuf_append_bytes(b, "\r\n", 2) == 0) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// Appends one header line, "Name: value" and CRLF. The name must be a token
+// and the value must have no CR, LF, NUL or other control byte, so a caller
+// cannot smuggle in a second header or a second message. On an error nothing
+// is appended and the result is HTTP_ERR_NAME or HTTP_ERR_VALUE. Otherwise it
+// is the bytes appended.
+export fn http_write_header(b: StrBuf*, name: string, value: string) -> int64 {
+  var h: HttpHeader;
+  h.name = name;
+  h.value = value;
+  var err: int64 = hp_check_headers(&h, 1);
+  if (err != 0) { return err; }
+  var start: int64 = b->len;
+  if (!hp_put_headers(b, &h, 1)) {
+    b->len = start;
+    return HTTP_ERR_NOMEM;
+  }
+  return b->len - start;
+}
+
+// Appends "METHOD target HTTP/1.1", the headers, and the blank line. Nothing
+// is added for you: not Host, not Content-Length. Every part is checked
+// first, and on an error nothing is appended: HTTP_ERR_METHOD,
+// HTTP_ERR_TARGET (empty, or a space, control or non-ASCII byte), or the
+// header errors of http_write_header. Returns the bytes appended.
+export fn http_write_request_head(b: StrBuf*, verb: string, target: string, h: HttpHeader*, n: int32) -> int64 {
+  if (!http_valid_token(verb)) { return HTTP_ERR_METHOD; }
+  if (!hp_valid_target(target)) { return HTTP_ERR_TARGET; }
+  var err: int64 = hp_check_headers(h, n);
+  if (err != 0) { return err; }
+  var start: int64 = b->len;
+  var ok: bool = strbuf_append_string(b, verb) != 0;
+  if (ok) { ok = strbuf_append_bytes(b, " ", 1) != 0; }
+  if (ok) { ok = strbuf_append_string(b, target) != 0; }
+  if (ok) { ok = strbuf_append_bytes(b, " HTTP/1.1\r\n", 11) != 0; }
+  if (ok) { ok = hp_put_headers(b, h, n); }
+  if (ok) { ok = strbuf_append_bytes(b, "\r\n", 2) != 0; }
+  if (!ok) {
+    b->len = start;
+    return HTTP_ERR_NOMEM;
+  }
+  return b->len - start;
+}
+
+// Appends "HTTP/1.1 status reason", the headers, and the blank line. An empty
+// reason uses http_status_text. The status must be 100..599. Checked first, as
+// above, with HTTP_ERR_STATUS for a bad code and HTTP_ERR_VALUE for a reason
+// with control bytes. Returns the bytes appended.
+export fn http_write_response_head(b: StrBuf*, status: int32, reason: string, h: HttpHeader*, n: int32) -> int64 {
+  if (status < 100 || status > 599) { return HTTP_ERR_STATUS; }
+  if (!http_valid_field_value(reason)) { return HTTP_ERR_VALUE; }
+  var err: int64 = hp_check_headers(h, n);
+  if (err != 0) { return err; }
+  var text: string = reason;
+  if (text.length == 0) { text = http_status_text(status); }
+  var start: int64 = b->len;
+  var ok: bool = strbuf_append_bytes(b, "HTTP/1.1 ", 9) != 0;
+  if (ok) { ok = strbuf_append_int(b, (int64)status) != 0; }
+  if (ok) { ok = strbuf_append_bytes(b, " ", 1) != 0; }
+  if (ok) { ok = strbuf_append_string(b, text) != 0; }
+  if (ok) { ok = strbuf_append_bytes(b, "\r\n", 2) != 0; }
+  if (ok) { ok = hp_put_headers(b, h, n); }
+  if (ok) { ok = strbuf_append_bytes(b, "\r\n", 2) != 0; }
+  if (!ok) {
+    b->len = start;
+    return HTTP_ERR_NOMEM;
+  }
+  return b->len - start;
+}
+
+// Appends one chunk: the size in hex, CRLF, the n bytes, CRLF. An empty chunk
+// would end the body, so n <= 0 appends nothing and returns 0. Use
+// http_write_last_chunk to end it.
+export fn http_write_chunk(b: StrBuf*, data: uint8*, n: int64) -> int64 {
+  if (n <= 0) { return 0; }
+  var start: int64 = b->len;
+  var ok: bool = strbuf_append_hex(b, (uint64)n) != 0;
+  if (ok) { ok = strbuf_append_bytes(b, "\r\n", 2) != 0; }
+  if (ok) { ok = strbuf_append_bytes(b, (cstring)data, n) != 0; }
+  if (ok) { ok = strbuf_append_bytes(b, "\r\n", 2) != 0; }
+  if (!ok) {
+    b->len = start;
+    return HTTP_ERR_NOMEM;
+  }
+  return b->len - start;
+}
+
+// Appends the end of a chunked body: "0", CRLF, and a blank line.
+export fn http_write_last_chunk(b: StrBuf*) -> int64 {
+  var start: int64 = b->len;
+  if (strbuf_append_bytes(b, "0\r\n\r\n", 5) == 0) {
+    b->len = start;
+    return HTTP_ERR_NOMEM;
+  }
+  return 5;
+}
+
+// The same with trailer fields before the blank line. The trailers are
+// checked like any header.
+export fn http_write_last_chunk_trailers(b: StrBuf*, h: HttpHeader*, n: int32) -> int64 {
+  var err: int64 = hp_check_headers(h, n);
+  if (err != 0) { return err; }
+  var start: int64 = b->len;
+  var ok: bool = strbuf_append_bytes(b, "0\r\n", 3) != 0;
+  if (ok) { ok = hp_put_headers(b, h, n); }
+  if (ok) { ok = strbuf_append_bytes(b, "\r\n", 2) != 0; }
+  if (!ok) {
+    b->len = start;
+    return HTTP_ERR_NOMEM;
+  }
+  return b->len - start;
+}
+
+// ---- Sockets: reading a head, and a small client ----
+
+// Reads one chunk of up to n bytes into p, waiting until deadline (a
+// net_now_ms time; -1 for none). Returns the bytes read, 0 if the peer
+// closed, HTTP_ERR_TIMEOUT or HTTP_ERR_IO.
+fn hp_recv(fd: int64, p: uint8*, n: int64, deadline: int64) -> int64 {
+  while (true) {
+    var wait: int64 = -1;
+    if (deadline >= 0) {
+      wait = deadline - net_now_ms();
+      if (wait < 0) { return HTTP_ERR_TIMEOUT; }
+    }
+    var w: int64 = sock_wait(fd, NET_POLL_IN, wait);
+    if (w == 0) { return HTTP_ERR_TIMEOUT; }
+    if (w < 0) { return HTTP_ERR_IO; }
+    var r: int64 = sock_recv(fd, p, n);
+    if (r == -NET_EINTR || r == -NET_EAGAIN) { continue; }
+    if (r < 0) { return HTTP_ERR_IO; }
+    return r;
+  }
+  return 0;
+}
+
+fn hp_deadline(timeout_ms: int64) -> int64 {
+  if (timeout_ms <= 0) { return -1; }
+  return net_now_ms() + timeout_ms;
+}
+
+// Reads from fd into buf until a whole request or response head is there.
+// buf already holds `have` bytes (left over from the last message on a
+// keep-alive connection, or 0); cap is its size. timeout_ms is for the whole
+// head, so a client that trickles bytes cannot hold the connection forever
+// (0 or less: no limit). Returns the bytes now in buf, and sets *head_end to
+// where the head ends, so buf[head_end..] is the start of the body (or of the
+// next message). Parse buf[0..head_end] with http_parse_request. On failure
+// it returns a negative HTTP_ERR_*: HTTP_ERR_CLOSED if the peer closed first
+// (an ordinary end on a keep-alive connection when have was 0),
+// HTTP_ERR_TIMEOUT, HTTP_ERR_IO, HTTP_ERR_HEAD_TOO_LARGE when cap or
+// HTTP_MAX_HEAD bytes passed without a blank line, or the error
+// http_find_head_end reports for a bad byte.
+export fn http_read_head(fd: int64, buf: uint8*, cap: int64, have: int64, timeout_ms: int64, head_end: int64*) -> int64 {
+  var deadline: int64 = hp_deadline(timeout_ms);
+  var n: int64 = have;
+  while (true) {
+    var e: int64 = http_find_head_end(buf, n);
+    if (e < 0) { return e; }
+    if (e > 0) {
+      *head_end = e;
+      return n;
+    }
+    if (n >= cap) { return HTTP_ERR_HEAD_TOO_LARGE; }
+    var r: int64 = hp_recv(fd, buf + n, cap - n, deadline);
+    if (r < 0) { return r; }
+    if (r == 0) { return HTTP_ERR_CLOSED; }
+    n = n + r;
+  }
+  return 0;
+}
+
+// What http_request returns. Everything in it lives in the arena.
+export struct HttpClientResponse {
+  status: int32;
+  nheaders: int32;
+  reason: string;
+  headers: HttpHeader*;
+  body: string;       // followed by a zero byte that is not counted in the length
+}
+
+// The most body bytes the client will take: 64 MiB.
+export const HTTP_CLIENT_MAX_BODY: int64 = 67108864;
+
+struct HpConn {
+  fd: int64;
+  deadline: int64;
+  rbuf: uint8*;
+  rcap: int64;
+  rlen: int64;
+  body: uint8*;
+  bcap: int64;
+  blen: int64;
+}
+
+fn hp_copy(arena: Arena*, s: string) -> string {
+  var out: string;
+  var n: int64 = (int64)s.length;
+  var p: uint8* = (uint8*)arena_alloc(arena, n + 1);
+  if (p == 0) {
+    out.chars = 0;
+    out.length = (uint64)0;
+    return out;
+  }
+  if (n > 0) { memcpy(p, s.chars, n); }
+  p[n] = (uint8)0;
+  out.chars = p;
+  out.length = s.length;
+  return out;
+}
+
+// Makes room in the body buffer for need bytes. False if out of memory.
+fn hp_body_reserve(c: HpConn*, need: int64) -> bool {
+  if (need <= c->bcap) { return true; }
+  var cap: int64 = c->bcap * 2;
+  if (cap < 4096) { cap = 4096; }
+  if (cap < need) { cap = need; }
+  var p: uint8* = (uint8*)realloc(c->body, cap);
+  if (p == 0) { return false; }
+  c->body = p;
+  c->bcap = cap;
+  return true;
+}
+
+fn hp_send_code(r: int64) -> int64 {
+  if (r == -NET_EAGAIN || r == -NET_ETIMEDOUT) { return HTTP_ERR_TIMEOUT; }
+  return HTTP_ERR_IO;
+}
+
+// Sends the request and reads the response into out. Returns 0 or an error.
+// The buffers in c are the caller's to free.
+fn hp_exchange(c: HpConn*, arena: Arena*, head: string, body: string, is_head: bool, out: HttpClientResponse*) -> int64 {
+  var s: int64 = sock_send_all(c->fd, head.chars, (int64)head.length);
+  if (s < 0) { return hp_send_code(s); }
+  if (body.length > 0) {
+    s = sock_send_all(c->fd, body.chars, (int64)body.length);
+    if (s < 0) { return hp_send_code(s); }
+  }
+
+  c->rcap = 16384;
+  c->rbuf = (uint8*)malloc(c->rcap);
+  if (c->rbuf == 0) { return HTTP_ERR_NOMEM; }
+  c->rlen = 0;
+
+  // The head. Interim 1xx responses (100 Continue, 103 Early Hints) are dropped.
+  var res: HttpResponse;
+  var head_len: int64 = 0;
+  while (head_len == 0) {
+    var r: int64 = http_parse_response(hp_view(c->rbuf, 0, c->rlen), &res);
+    if (r < 0) { return r; }
+    if (r > 0) {
+      if (res.status >= 100 && res.status < 200 && res.status != 101) {
+        memmove(c->rbuf, c->rbuf + r, c->rlen - r);
+        c->rlen = c->rlen - r;
+      } else {
+        head_len = r;
+      }
+    } else {
+      if (c->rlen == c->rcap) {
+        var bigger: uint8* = (uint8*)realloc(c->rbuf, c->rcap * 2);
+        if (bigger == 0) { return HTTP_ERR_NOMEM; }
+        c->rbuf = bigger;
+        c->rcap = c->rcap * 2;
+      }
+      var n: int64 = hp_recv(c->fd, c->rbuf + c->rlen, c->rcap - c->rlen, c->deadline);
+      if (n < 0) { return n; }
+      if (n == 0) { return HTTP_ERR_CLOSED; }
+      c->rlen = c->rlen + n;
+    }
+  }
+
+  // Copy what the caller keeps into the arena before the buffer is reused.
+  out->status = res.status;
+  out->reason = hp_copy(arena, res.reason);
+  out->nheaders = res.nheaders;
+  out->headers = (HttpHeader*)arena_alloc(arena, (int64)(res.nheaders + 1) * (int64)sizeof(HttpHeader));
+  if (out->headers == 0 || (out->reason.chars == 0 && res.reason.length > 0)) { return HTTP_ERR_NOMEM; }
+  for i in 0..res.nheaders {
+    out->headers[i].name = hp_copy(arena, res.headers[i].name);
+    out->headers[i].value = hp_copy(arena, res.headers[i].value);
+  }
+  var kind: HttpBody = http_response_body_kind(&res, is_head);
+  if (kind.kind == HTTP_BODY_INVALID) { return kind.length; }
+
+  var left: int64 = c->rlen - head_len;
+  memmove(c->rbuf, c->rbuf + head_len, left);
+  c->rlen = left;
+  c->blen = 0;
+
+  if (kind.kind == HTTP_BODY_LENGTH) {
+    if (kind.length > HTTP_CLIENT_MAX_BODY) { return HTTP_ERR_BODY_TOO_LARGE; }
+    if (!hp_body_reserve(c, kind.length)) { return HTTP_ERR_NOMEM; }
+    var take: int64 = left;
+    if (take > kind.length) { take = kind.length; }
+    memcpy(c->body, c->rbuf, take);
+    c->blen = take;
+    while (c->blen < kind.length) {
+      var n2: int64 = hp_recv(c->fd, c->body + c->blen, kind.length - c->blen, c->deadline);
+      if (n2 < 0) { return n2; }
+      if (n2 == 0) { return HTTP_ERR_CLOSED; }
+      c->blen = c->blen + n2;
+    }
+  } else if (kind.kind == HTTP_BODY_CHUNKED) {
+    var d: HttpChunkDecoder;
+    var feed: HttpChunkFeed;
+    http_chunk_init(&d, HTTP_CLIENT_MAX_BODY);
+    var avail: int64 = left;
+    var done: bool = false;
+    while (!done) {
+      if (avail > 0) {
+        if (!hp_body_reserve(c, c->blen + avail)) { return HTTP_ERR_NOMEM; }
+        var st: int64 = http_chunk_feed(&d, c->rbuf, avail, c->body + c->blen, c->bcap - c->blen, &feed);
+        if (st < 0) { return st; }
+        c->blen = c->blen + feed.produced;
+        if (st == HTTP_CHUNK_DONE) { done = true; }
+      }
+      if (!done) {
+        var n3: int64 = hp_recv(c->fd, c->rbuf, c->rcap, c->deadline);
+        if (n3 < 0) { return n3; }
+        if (n3 == 0) { return HTTP_ERR_CLOSED; }
+        avail = n3;
+      }
+    }
+  } else if (kind.kind == HTTP_BODY_CLOSE) {
+    if (left > HTTP_CLIENT_MAX_BODY) { return HTTP_ERR_BODY_TOO_LARGE; }
+    if (!hp_body_reserve(c, left + 4096)) { return HTTP_ERR_NOMEM; }
+    memcpy(c->body, c->rbuf, left);
+    c->blen = left;
+    var open: bool = true;
+    while (open) {
+      if (!hp_body_reserve(c, c->blen + 4096)) { return HTTP_ERR_NOMEM; }
+      var n4: int64 = hp_recv(c->fd, c->body + c->blen, c->bcap - c->blen, c->deadline);
+      if (n4 < 0) { return n4; }
+      if (n4 == 0) {
+        open = false;
+      } else {
+        c->blen = c->blen + n4;
+        if (c->blen > HTTP_CLIENT_MAX_BODY) { return HTTP_ERR_BODY_TOO_LARGE; }
+      }
+    }
+  }
+
+  var tail: uint8* = (uint8*)arena_alloc(arena, c->blen + 1);
+  if (tail == 0) { return HTTP_ERR_NOMEM; }
+  if (c->blen > 0) { memcpy(tail, c->body, c->blen); }
+  tail[c->blen] = (uint8)0;
+  out->body = hp_view(tail, 0, c->blen);
+  return 0;
+}
+
+fn hp_text(arena: Arena*, a: string, b: string) -> string {
+  var sb: StrBuf* = strbuf_new(arena, 64);
+  if (sb == 0) { return a; }
+  strbuf_append_string(sb, a);
+  strbuf_append_string(sb, b);
+  return strbuf_finish_string(sb);
+}
+
+// A blocking HTTP/1.1 request over plain TCP. Only http:// URLs: an https://
+// URL gives the error "TLS is not supported yet". It opens one connection,
+// sends the request with Host, Content-Length (for a body, or for POST, PUT and
+// PATCH) and "Connection: close", reads the whole response, and closes. The
+// reply may use Content-Length, chunked, or close-delimited framing; interim
+// 1xx replies are skipped. Redirects are not followed.
+//
+// headers are extra request headers. A Host header of yours replaces the
+// default one; Content-Length, Transfer-Encoding and Connection are the
+// client's own, and passing them is an error. Names and values are checked as
+// http_write_header does.
+//
+// timeout_ms covers connecting, sending and reading the whole response
+// together; 0 or less means no limit. A body over HTTP_CLIENT_MAX_BODY is an
+// error. The result and everything it points to are allocated in arena. The
+// error is a short message; it is in the arena too when it has detail.
+export fn http_request(arena: Arena*, verb: string, url: string, headers: HttpHeader*, nheaders: int32, body: string, timeout_ms: int64) -> Result<HttpClientResponse*, string> {
+  var u: HttpUrl;
+  if (http_url_parse(url, &u) != 0) { return Err("bad URL"); }
+  if (u.tls != 0) { return Err(http_error_text(HTTP_ERR_TLS)); }
+  if (!hp_ieq(u.scheme, "http")) { return Err("not an http URL"); }
+
+  var has_host: bool = false;
+  for i in 0..nheaders {
+    if (hp_ieq(headers[i].name, "host")) { has_host = true; }
+    if (hp_ieq(headers[i].name, "content-length") || hp_ieq(headers[i].name, "transfer-encoding") || hp_ieq(headers[i].name, "connection")) {
+      return Err("Content-Length, Transfer-Encoding and Connection are set by the client");
+    }
+  }
+
+  // The request target: path and query.
+  var tb: StrBuf* = strbuf_new(arena, 128);
+  if (tb == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+  strbuf_append_string(tb, u.path);
+  if (u.query.length > 0) {
+    strbuf_append_byte(tb, (uint8)63);
+    strbuf_append_string(tb, u.query);
+  }
+
+  // The headers to send: yours, then Host, Content-Length and Connection.
+  var all: HttpHeader* = (HttpHeader*)arena_alloc(arena, (int64)(nheaders + 3) * (int64)sizeof(HttpHeader));
+  if (all == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+  var count: int32 = 0;
+  for i in 0..nheaders {
+    all[count] = headers[i];
+    count = count + 1;
+  }
+  if (!has_host) {
+    var hb: StrBuf* = strbuf_new(arena, 64);
+    if (hb == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+    if (u.ipv6 != 0) { strbuf_append_byte(hb, (uint8)91); }
+    strbuf_append_string(hb, u.host);
+    if (u.ipv6 != 0) { strbuf_append_byte(hb, (uint8)93); }
+    if (u.port != 80) {
+      strbuf_append_byte(hb, (uint8)58);
+      strbuf_append_int(hb, (int64)u.port);
+    }
+    all[count].name = "Host";
+    all[count].value = strbuf_finish_string(hb);
+    count = count + 1;
+  }
+  if (body.length > 0 || verb == "POST" || verb == "PUT" || verb == "PATCH") {
+    var lb: StrBuf* = strbuf_new(arena, 24);
+    if (lb == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+    strbuf_append_uint(lb, body.length);
+    all[count].name = "Content-Length";
+    all[count].value = strbuf_finish_string(lb);
+    count = count + 1;
+  }
+  all[count].name = "Connection";
+  all[count].value = "close";
+  count = count + 1;
+
+  var hd: StrBuf* = strbuf_new(arena, 512);
+  if (hd == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+  var wrote: int64 = http_write_request_head(hd, verb, strbuf_finish_string(tb), all, count);
+  if (wrote < 0) { return Err(http_error_text(wrote)); }
+
+  var connect_ms: int64 = timeout_ms;
+  if (connect_ms <= 0) { connect_ms = -1; }
+  var fd: int64 = 0;
+  match (tcp_connect(u.host, u.port, connect_ms)) {
+    case Ok(s): { fd = s; }
+    case Err(e): { return Err(hp_text(arena, "connect failed: ", e.message)); }
+  }
+
+  var resp: HttpClientResponse* = (HttpClientResponse*)arena_alloc_zeroed(arena, (int64)sizeof(HttpClientResponse));
+  if (resp == 0) {
+    sock_close(fd);
+    return Err(http_error_text(HTTP_ERR_NOMEM));
+  }
+  var c: HpConn;
+  c.fd = fd;
+  c.deadline = hp_deadline(timeout_ms);
+  if (timeout_ms > 0) { sock_set_timeout(fd, -1, timeout_ms); }
+  var code: int64 = hp_exchange(&c, arena, strbuf_finish_string(hd), body, verb == "HEAD", resp);
+  if (c.rbuf != 0) { free(c.rbuf); }
+  if (c.body != 0) { free(c.body); }
+  sock_close(fd);
+  if (code != 0) { return Err(http_error_text(code)); }
+  return Ok(resp);
+}
+
+// GET url with no extra headers. See http_request.
+export fn http_get(arena: Arena*, url: string, timeout_ms: int64) -> Result<HttpClientResponse*, string> {
+  return http_request(arena, "GET", url, (HttpHeader*)0, 0, "", timeout_ms);
 }

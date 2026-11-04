@@ -1,0 +1,416 @@
+const LIMBS = 320;
+const MAX_DIGITS = 800;
+
+struct Big {
+  limb: uint32[320];
+  used: int32;
+}
+
+struct Decimal {
+  negative: bool;
+  significant: uint64;
+  digit_count: int32;
+  exponent: int64;
+  fast: bool;
+}
+
+fn big_set_small(value: Big*, small: uint32) {
+  value->used = 0;
+  if (small != 0) {
+    value->limb[0] = small;
+    value->used = 1;
+  }
+}
+
+fn big_mul_add(value: Big*, factor: uint32, addend: uint32) {
+  var carry: uint64 = (uint64)addend;
+  for i in 0..value->used {
+    var product: uint64 = (uint64)value->limb[i] * (uint64)factor + carry;
+    value->limb[i] = (uint32)(product & 0xFFFFFFFF);
+    carry = product >> 32;
+  }
+  if (carry != 0) {
+    value->limb[value->used] = (uint32)carry;
+    value->used = value->used + 1;
+  }
+}
+
+fn big_mul_pow10(value: Big*, power: int64) {
+  var left: int64 = power;
+  while (left >= 9) {
+    big_mul_add(value, 1000000000, 0);
+    left = left - 9;
+  }
+  var factor: uint32 = 1;
+  for i in 0..left {
+    factor = factor * 10;
+  }
+  if (factor > 1) {
+    big_mul_add(value, factor, 0);
+  }
+}
+
+fn big_bits(value: Big*) -> int64 {
+  if (value->used == 0) {
+    return 0;
+  }
+  var top: uint32 = value->limb[value->used - 1];
+  var bits: int64 = (int64)(value->used - 1) * 32;
+  while (top != 0) {
+    bits = bits + 1;
+    top = top >> 1;
+  }
+  return bits;
+}
+
+fn big_shift_left(value: Big*, bits: int64) {
+  if (value->used == 0 || bits == 0) {
+    return;
+  }
+  var limbs: int32 = (int32)(bits / 32);
+  var rest: uint32 = (uint32)(bits % 32);
+  var i: int32 = value->used - 1;
+  var top: int32 = value->used + limbs;
+  value->limb[top] = 0;
+  while (i >= 0) {
+    var word: uint32 = value->limb[i];
+    if (rest != 0) {
+      value->limb[i + limbs + 1] = value->limb[i + limbs + 1] | (word >> (32 - rest));
+      value->limb[i + limbs] = word << rest;
+    } else {
+      value->limb[i + limbs] = word;
+    }
+    i = i - 1;
+  }
+  for k in 0..limbs {
+    value->limb[k] = 0;
+  }
+  value->used = top + 1;
+  while (value->used > 0 && value->limb[value->used - 1] == 0) {
+    value->used = value->used - 1;
+  }
+}
+
+fn big_shift_right_one(value: Big*) {
+  var carry: uint32 = 0;
+  var i: int32 = value->used - 1;
+  while (i >= 0) {
+    var word: uint32 = value->limb[i];
+    value->limb[i] = (word >> 1) | carry;
+    carry = (word & 1) << 31;
+    i = i - 1;
+  }
+  while (value->used > 0 && value->limb[value->used - 1] == 0) {
+    value->used = value->used - 1;
+  }
+}
+
+fn big_compare(left: Big*, right: Big*) -> int32 {
+  if (left->used != right->used) {
+    if (left->used < right->used) {
+      return -1;
+    }
+    return 1;
+  }
+  var i: int32 = left->used - 1;
+  while (i >= 0) {
+    if (left->limb[i] != right->limb[i]) {
+      if (left->limb[i] < right->limb[i]) {
+        return -1;
+      }
+      return 1;
+    }
+    i = i - 1;
+  }
+  return 0;
+}
+
+fn big_subtract(left: Big*, right: Big*) {
+  var borrow: uint64 = 0;
+  for i in 0..left->used {
+    var take: uint64 = borrow;
+    if (i < right->used) {
+      take = take + (uint64)right->limb[i];
+    }
+    var word: uint64 = (uint64)left->limb[i];
+    if (word >= take) {
+      left->limb[i] = (uint32)(word - take);
+      borrow = 0;
+    } else {
+      left->limb[i] = (uint32)((word + 0x100000000) - take);
+      borrow = 1;
+    }
+  }
+  while (left->used > 0 && left->limb[left->used - 1] == 0) {
+    left->used = left->used - 1;
+  }
+}
+
+fn float_from_bits(bits: uint64, negative: bool) -> float64 {
+  var word: uint64 = bits;
+  if (negative) {
+    word = word | (uint64)0x8000000000000000;
+  }
+  var out: float64 = *(float64*)&word;
+  return out;
+}
+
+fn round_to_float(quotient: uint64, sticky: bool, shift: int64, negative: bool) -> float64 {
+  var width: int64 = 0;
+  var probe: uint64 = quotient;
+  while (probe != 0) {
+    width = width + 1;
+    probe = probe >> 1;
+  }
+  var power: int64 = width - 1 - shift;
+  var drop: int64 = width - 53;
+  if (power < -1022) {
+    drop = drop + (-1022 - power);
+  }
+  if (drop > 64) {
+    return float_from_bits(0, negative);
+  }
+  var kept: uint64 = 0;
+  var removed: uint64 = quotient;
+  if (drop < 64) {
+    kept = quotient >> drop;
+    removed = quotient & (((uint64)1 << drop) - 1);
+  }
+  var half: uint64 = (uint64)1 << (drop - 1);
+  if (removed > half || (removed == half && (sticky || (kept & 1) != 0))) {
+    kept = kept + 1;
+  }
+  if (power < -1022) {
+    return float_from_bits(kept, negative);
+  }
+  if (kept == ((uint64)1 << 53)) {
+    kept = kept >> 1;
+    power = power + 1;
+  }
+  if (power > 1023) {
+    return float_from_bits((uint64)0x7FF0000000000000, negative);
+  }
+  var field: uint64 = (uint64)(power + 1023);
+  return float_from_bits((field << 52) | (kept & (((uint64)1 << 52) - 1)), negative);
+}
+
+fn divide_to_float(top: Big*, bottom: Big*, negative: bool) -> float64 {
+  var shift: int64 = 63 - (big_bits(top) - big_bits(bottom));
+  if (shift > 0) {
+    big_shift_left(top, shift);
+  } else if (shift < 0) {
+    big_shift_left(bottom, -shift);
+  }
+  big_shift_left(bottom, 63);
+  var quotient: uint64 = 0;
+  var bit: int32 = 63;
+  while (bit >= 0) {
+    if (big_compare(top, bottom) >= 0) {
+      big_subtract(top, bottom);
+      quotient = quotient | ((uint64)1 << bit);
+    }
+    big_shift_right_one(bottom);
+    bit = bit - 1;
+  }
+  return round_to_float(quotient, top->used != 0, shift, negative);
+}
+
+fn read_exponent(text: uint8*, at: int64, length: int64) -> int64 {
+  var i: int64 = at;
+  var minus: bool = false;
+  if (i < length && (text[i] == 43 || text[i] == 45)) {
+    minus = text[i] == 45;
+    i = i + 1;
+  }
+  var value: int64 = 0;
+  while (i < length) {
+    if (value < 1000000) {
+      value = value * 10 + (int64)(text[i] - 48);
+    }
+    i = i + 1;
+  }
+  if (minus) {
+    return -value;
+  }
+  return value;
+}
+
+fn add_digit(top: Big*, decimal: Decimal*, digit: uint32) {
+  if (decimal->digit_count == 0 && digit == 0) {
+    return;
+  }
+  if (decimal->digit_count < MAX_DIGITS) {
+    big_mul_add(top, 10, digit);
+    if (decimal->digit_count < 19) {
+      decimal->significant = decimal->significant * 10 + (uint64)digit;
+    }
+    decimal->digit_count = decimal->digit_count + 1;
+    return;
+  }
+  decimal->exponent = decimal->exponent + 1;
+  if (digit != 0) {
+    decimal->fast = false;
+    top->limb[0] = top->limb[0] | 1;
+  }
+}
+
+fn read_decimal(text: uint8*, length: int64, top: Big*, decimal: Decimal*) {
+  var i: int64 = 0;
+  var after_point: bool = false;
+  decimal->negative = false;
+  decimal->significant = 0;
+  decimal->digit_count = 0;
+  decimal->exponent = 0;
+  decimal->fast = true;
+  big_set_small(top, 0);
+  if (i < length && text[i] == 45) {
+    decimal->negative = true;
+    i = i + 1;
+  }
+  while (i < length && text[i] != 101 && text[i] != 69) {
+    if (text[i] == 46) {
+      after_point = true;
+    } else {
+      if (after_point) {
+        decimal->exponent = decimal->exponent - 1;
+      }
+      add_digit(top, decimal, (uint32)text[i] - 48);
+    }
+    i = i + 1;
+  }
+  if (i < length) {
+    decimal->exponent = decimal->exponent + read_exponent(text, i + 1, length);
+  }
+}
+
+fn pow10_exact(power: int64) -> float64 {
+  var out: float64 = 1.0;
+  for i in 0..power {
+    out = out * 10.0;
+  }
+  return out;
+}
+
+export fn number_read_float64(text: uint8*, length: int64) -> float64 {
+  var top: Big;
+  var bottom: Big;
+  var decimal: Decimal;
+  read_decimal(text, length, &top, &decimal);
+  if (decimal.digit_count == 0) {
+    return float_from_bits(0, decimal.negative);
+  }
+  if (decimal.exponent + (int64)decimal.digit_count > 310) {
+    return float_from_bits((uint64)0x7FF0000000000000, decimal.negative);
+  }
+  if (decimal.exponent + (int64)decimal.digit_count < -330) {
+    return float_from_bits(0, decimal.negative);
+  }
+  if (decimal.fast && decimal.digit_count <= 15 && decimal.exponent >= -22 && decimal.exponent <= 22) {
+    var value: float64 = (float64)(int64)decimal.significant;
+    if (decimal.exponent < 0) {
+      value = value / pow10_exact(-decimal.exponent);
+    } else {
+      value = value * pow10_exact(decimal.exponent);
+    }
+    if (decimal.negative) {
+      return -value;
+    }
+    return value;
+  }
+  big_set_small(&bottom, 1);
+  if (decimal.exponent >= 0) {
+    big_mul_pow10(&top, decimal.exponent);
+  } else {
+    big_mul_pow10(&bottom, -decimal.exponent);
+  }
+  return divide_to_float(&top, &bottom, decimal.negative);
+}
+
+export fn number_read_int64(text: uint8*, length: int64, out: int64*) -> bool {
+  var i: int64 = 0;
+  var negative: bool = false;
+  if (length > 0 && text[0] == 45) {
+    negative = true;
+    i = 1;
+  }
+  if (i == length) {
+    return false;
+  }
+  var value: uint64 = 0;
+  var limit: uint64 = (uint64)0x7FFFFFFFFFFFFFFF;
+  if (negative) {
+    limit = limit + 1;
+  }
+  while (i < length) {
+    if (text[i] < 48 || text[i] > 57) {
+      return false;
+    }
+    var digit: uint64 = (uint64)(text[i] - 48);
+    if (value > (limit - digit) / 10) {
+      return false;
+    }
+    value = value * 10 + digit;
+    i = i + 1;
+  }
+  if (negative) {
+    *out = (int64)(0 - value);
+  } else {
+    *out = (int64)value;
+  }
+  return true;
+}
+
+fn bits_of(text: string) -> uint64 {
+  var value: float64 = number_read_float64((uint8*)text.chars, (int64)text.length);
+  var out: uint64 = *(uint64*)&value;
+  return out;
+}
+
+@test fn fast_path_matches_python() -> int32 {
+  assert(bits_of("0") == (uint64)0);
+  assert(bits_of("-0") == (uint64)0x8000000000000000);
+  assert(bits_of("1.5") == (uint64)0x3FF8000000000000);
+  assert(bits_of("0.1") == (uint64)0x3FB999999999999A);
+  return 0;
+}
+
+@test fn slow_path_matches_python() -> int32 {
+  assert(bits_of("1e23") == (uint64)0x44B52D02C7E14AF6);
+  assert(bits_of("8.41e21") == (uint64)0x447C7E83209E90B2);
+  assert(bits_of("9007199254740993") == (uint64)0x4340000000000000);
+  assert(bits_of("123456789012345678901234567890") == (uint64)0x45F8EE90FF6C373E);
+  assert(bits_of("3.141592653589793238462643383279") == (uint64)0x400921FB54442D18);
+  return 0;
+}
+
+@test fn range_edges_match_python() -> int32 {
+  assert(bits_of("2.2250738585072014e-308") == (uint64)0x0010000000000000);
+  assert(bits_of("2.2250738585072011e-308") == (uint64)0x000FFFFFFFFFFFFF);
+  assert(bits_of("1.7976931348623157e308") == (uint64)0x7FEFFFFFFFFFFFFF);
+  assert(bits_of("1.7976931348623159e308") == (uint64)0x7FF0000000000000);
+  assert(bits_of("5e-324") == (uint64)0x0000000000000001);
+  assert(bits_of("2.4703282292062327e-324") == (uint64)0);
+  assert(bits_of("2.4703282292062328e-324") == (uint64)1);
+  assert(bits_of("1e400") == (uint64)0x7FF0000000000000);
+  assert(bits_of("1e-400") == (uint64)0);
+  return 0;
+}
+
+fn read_int(text: string, out: int64*) -> bool {
+  return number_read_int64((uint8*)text.chars, (int64)text.length, out);
+}
+
+@test fn int64_takes_the_whole_range_and_no_more() -> int32 {
+  var value: int64 = 0;
+  assert(read_int("9223372036854775807", &value));
+  assert(value == 9223372036854775807);
+  assert(read_int("-9223372036854775808", &value));
+  assert(value == (int64)(0 - (uint64)0x8000000000000000));
+  assert(!read_int("9223372036854775808", &value));
+  assert(!read_int("-9223372036854775809", &value));
+  assert(!read_int("1.5", &value));
+  assert(!read_int("1e3", &value));
+  assert(read_int("0", &value));
+  assert(value == 0);
+  return 0;
+}

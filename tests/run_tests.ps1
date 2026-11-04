@@ -1679,7 +1679,7 @@ $cases = @(
   @{ Name = "err_global_init_address_arith"; Path = "tests/err_global_init_address_arith.mettle"; ShouldSucceed = $false
      Pattern = "a global's initializer must be known at compile time"
      OutputMustNotMatch = @("internal compiler error") },
-  @{ Name = "err_import_guard_bad_platform"; Path = "tests/err_import_guard_bad_platform.mettle"; ShouldSucceed = $false; Pattern = "Import guard platform must be 'windows', 'linux', 'macos' or 'posix'" },
+  @{ Name = "err_import_guard_bad_platform"; Path = "tests/err_import_guard_bad_platform.mettle"; ShouldSucceed = $false; Pattern = "Import guard must be 'windows', 'linux', 'macos', 'posix', 'x86_64' or 'aarch64'" },
   @{ Name = "block_comment"; Path = "tests/test_block_comment.mettle"; ShouldSucceed = $true },
   @{ Name = "compound_assign"; Path = "tests/test_compound_assign.mettle"; ShouldSucceed = $true },
   @{ Name = "compound_assign_for"; Path = "tests/test_compound_assign_for.mettle"; ShouldSucceed = $true },
@@ -1833,6 +1833,24 @@ $cases = @(
   # natively in both modes and under the compile-time interpreter.
   @{ Name = "views"; Path = "tests/test_views.mettle"; ShouldSucceed = $true },
   @{ Name = "views_release"; Path = "tests/test_views.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_time"; Path = "tests/test_std_time.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_time_release"; Path = "tests/test_std_time.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_datetime_interp"; Path = "tests/test_std_datetime_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
+  @{ Name = "std_file"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_file_release"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "import_guard_arch"; Path = "tests/test_import_guard_arch.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_http2"; Path = "tests/test_std_http2.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_http2_release"; Path = "tests/test_std_http2.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_http2_interp"; Path = "tests/test_std_http2_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
+  @{ Name = "std_websocket"; Path = "tests/test_std_websocket.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_websocket_release"; Path = "tests/test_std_websocket.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_websocket_interp"; Path = "tests/test_std_websocket_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
   @{ Name = "views_interp"; Path = "tests/test_views.mettle"; ShouldSucceed = $true
      Args = @("test")
      SkipBinaryCheck = $true
@@ -3225,6 +3243,20 @@ $cases = @(
     Pattern       = "Could not resolve|import chain"
   }
 )
+
+# std/socket talks over the loopback interface and uses epoll, so it runs on
+# Linux; the macOS and Windows halves are checked by cross-compiling.
+if ($IsLinux) {
+  $cases += @(
+    @{ Name = "std_socket"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_socket_release"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_http"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_http_release"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_sync"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_sync_release"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "mutex_timeout_deadline"; Path = "tests/test_mutex_timeout_deadline.mettle"; ShouldSucceed = $true }
+  )
+}
 
 $total = 0
 $failed = 0
@@ -10389,6 +10421,274 @@ fn main() -> int32 {
 catch {
   $failed++
   Write-CaseResult -Name "mettle_deps_package_resolution" -Passed $false -Reason $_.Exception.Message
+}
+
+# A one-component import reaches a package's main module only when every other
+# lookup misses, so adding a package to mettle.deps never changes which file a
+# program already compiles.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $mainCompiler = (Resolve-Path $CompilerPath).Path
+  $mainRoot = Join-Path $tmpDir "mettle-deps-main-module"
+  if (Test-Path $mainRoot) { Remove-Item -Path $mainRoot -Recurse -Force }
+
+  function Write-MainFile([string]$Path, [string]$Text) {
+    New-Item -Path (Split-Path $Path) -ItemType Directory -Force | Out-Null
+    [System.IO.File]::WriteAllText($Path, $Text)
+  }
+  function Get-MainAnswer([string]$Project, [string[]]$ExtraArgs = @()) {
+    Push-Location $Project
+    try {
+      $out = & $mainCompiler --build main.mettle -o main.exe @ExtraArgs 2>&1 | ForEach-Object { "$_" }
+      if ($LASTEXITCODE -ne 0) { throw "build failed in ${Project}: $($out -join ' ')" }
+      & (Join-Path $Project "main.exe")
+      return $LASTEXITCODE
+    }
+    finally {
+      Pop-Location
+    }
+  }
+  function New-MainProject([string]$Name) {
+    $project = Join-Path $mainRoot $Name
+    Write-MainFile (Join-Path $project "main.mettle") "import `"logger`";`nfn main() -> int32 { return which(); }`n"
+    Write-MainFile (Join-Path $project "mettle.deps") "logger=./pkgs/logger`n"
+    Write-MainFile (Join-Path $project "pkgs/logger/logger.mettle") "export fn which() -> int32 { return 11; }`n"
+    return $project
+  }
+
+  $packageOnly = New-MainProject "package-only"
+  $answer = Get-MainAnswer $packageOnly
+  if ($answer -ne 11) { throw "with no other file, the package's main module should load: got $answer" }
+
+  $sibling = New-MainProject "sibling"
+  Write-MainFile (Join-Path $sibling "logger.mettle") "export fn which() -> int32 { return 22; }`n"
+  $answer = Get-MainAnswer $sibling
+  if ($answer -ne 22) { throw "a file beside the importer should beat a package's main module: got $answer" }
+
+  $included = New-MainProject "include-dir"
+  $includeDir = Join-Path $included "inc"
+  Write-MainFile (Join-Path $includeDir "logger.mettle") "export fn which() -> int32 { return 33; }`n"
+  $answer = Get-MainAnswer $included @("-I", $includeDir)
+  if ($answer -ne 33) { throw "a -I directory should beat a package's main module: got $answer" }
+
+  $rootFile = New-MainProject "root-file"
+  Write-MainFile (Join-Path $rootFile "pkgs/logger.mettle") "export fn which() -> int32 { return 44; }`n"
+  $answer = Get-MainAnswer $rootFile
+  if ($answer -ne 44) { throw "a file named after the package root should load first, as it always has: got $answer" }
+
+  $nested = New-MainProject "nested"
+  Write-MainFile (Join-Path $nested "pkgs/logger/extra.mettle") "export fn which() -> int32 { return 55; }`n"
+  Write-MainFile (Join-Path $nested "main.mettle") "import `"logger/extra`";`nfn main() -> int32 { return which(); }`n"
+  $answer = Get-MainAnswer $nested
+  if ($answer -ne 55) { throw "a path inside a package should still resolve through mettle.deps: got $answer" }
+
+  Write-CaseResult -Name "mettle_deps_main_module_is_last" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "mettle_deps_main_module_is_last" -Passed $false -Reason $_.Exception.Message
+}
+
+# mettle pkg: a registry built by hand from what `pkg pack` writes, so the client's
+# hash meets an independent one, and every way a download can go wrong is refused.
+$total++
+$pkgSavedRegistry = $env:METTLE_REGISTRY
+$pkgSavedCache = $env:METTLE_CACHE
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $pkgCompiler = (Resolve-Path $CompilerPath).Path
+  $pkgRoot = Join-Path $tmpDir "mettle-pkg"
+  if (Test-Path $pkgRoot) { Remove-Item -Path $pkgRoot -Recurse -Force }
+  $pkgSite = Join-Path $pkgRoot "site"
+  New-Item -Path (Join-Path $pkgSite "packages") -ItemType Directory -Force | Out-Null
+  New-Item -Path (Join-Path $pkgSite "archives") -ItemType Directory -Force | Out-Null
+  $pkgProject = Join-Path $pkgRoot "project"
+  New-Item -Path $pkgProject -ItemType Directory | Out-Null
+  $env:METTLE_REGISTRY = $pkgSite
+  $env:METTLE_CACHE = Join-Path $pkgRoot "cache"
+
+  function Write-PkgText([string]$Path, [string]$Text) {
+    New-Item -Path (Split-Path $Path) -ItemType Directory -Force | Out-Null
+    [System.IO.File]::WriteAllText($Path, $Text.Replace("`r`n", "`n"))
+  }
+  function Invoke-Pkg([string[]]$PkgArgs) {
+    $output = & $pkgCompiler pkg @PkgArgs 2>&1 | ForEach-Object { "$_" }
+    return [pscustomobject]@{ Code = $LASTEXITCODE; Text = ($output -join "`n") }
+  }
+  function Publish-PkgVersion([string]$Name, [string]$Version, [string]$Source, [string]$Needs, [string]$State = "live") {
+    $dir = Join-Path $pkgRoot "src/$Name-$Version"
+    $requireLines = ""
+    $needsField = "-"
+    if ($Needs) {
+      $requireLines = (($Needs -split ",") | ForEach-Object { "require = " + ($_ -replace "@", " ") + "`n" }) -join ""
+      $needsField = $Needs
+    }
+    Write-PkgText (Join-Path $dir "mettle.package") "name = $Name`nversion = $Version`ndescription = test package $Name`nlicense = MIT`n$requireLines"
+    Write-PkgText (Join-Path $dir "LICENSE") "MIT`n"
+    Write-PkgText (Join-Path $dir "$Name.mettle") $Source
+    $archive = Join-Path $pkgSite "archives/$Name-$Version.tar"
+    $packed = Invoke-Pkg @("pack", $dir, "-o", $archive)
+    if ($packed.Code -ne 0) { throw "pack $Name $Version failed: $($packed.Text)" }
+    $independent = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+    if ($packed.Text -notmatch "sha256 $independent") { throw "pack printed a hash Get-FileHash disagrees with: $($packed.Text) vs $independent" }
+    $size = (Get-Item $archive).Length
+    $line = "release`t$Version`t$independent`t$size`t-`t$State`t$needsField`n"
+    $indexPath = Join-Path $pkgSite "packages/$Name.txt"
+    if (-not (Test-Path $indexPath)) {
+      Write-PkgText $indexPath "mettle-registry-1`nname`t$Name`ndescription`ttest package $Name`n"
+    }
+    [System.IO.File]::AppendAllText($indexPath, $line)
+    return $independent
+  }
+  function Assert-PkgFails($Result, [string]$Pattern, [string]$What) {
+    if ($Result.Code -eq 0) { throw "$What should have failed: $($Result.Text)" }
+    if ($Result.Text -notmatch $Pattern) { throw "$What failed with the wrong message: $($Result.Text)" }
+  }
+
+  $baseHash = Publish-PkgVersion "base" "1.0.0" "export fn base_value() -> int32 { return 40; }`n" ""
+  Publish-PkgVersion "base" "1.1.0" "export fn base_value() -> int32 { return 41; }`n" "" | Out-Null
+  Publish-PkgVersion "base" "2.0.0" "export fn base_value() -> int32 { return 99; }`n" "" | Out-Null
+  Publish-PkgVersion "top" "1.0.0" "import `"base`";`nexport fn top_value() -> int32 { return base_value() + 2; }`n" "base@1.0.0" | Out-Null
+  Publish-PkgVersion "newer" "1.0.0" "import `"base`";`nexport fn newer_value() -> int32 { return base_value(); }`n" "base@1.1.0" | Out-Null
+  Publish-PkgVersion "breaking" "1.0.0" "import `"base`";`nexport fn breaking_value() -> int32 { return base_value(); }`n" "base@2.0.0" | Out-Null
+  Publish-PkgVersion "pulled" "1.0.0" "export fn pulled_value() -> int32 { return 7; }`n" "" "yanked" | Out-Null
+  Write-PkgText (Join-Path $pkgSite "index.txt") "mettle-registry-1`npackage`tbase`t1.1.0`ttest package base`npackage`ttop`t1.0.0`ttest package top`n"
+
+  Push-Location $pkgProject
+  try {
+    $found = Invoke-Pkg @("search", "TOP")
+    if ($found.Code -ne 0 -or $found.Text -notmatch "top\s+1\.0\.0" -or $found.Text -match "base\s+1") { throw "search: $($found.Text)" }
+
+    Assert-PkgFails (Invoke-Pkg @("add", "..\evil")) "not a package name" "a path as a name"
+    Assert-PkgFails (Invoke-Pkg @("add", "nosuch")) "no package named nosuch" "an unknown package"
+    Assert-PkgFails (Invoke-Pkg @("add", "base@9.9.9")) "has no base 9\.9\.9" "an unknown version"
+    if (Test-Path "mettle.package") { throw "a failed add wrote mettle.package" }
+
+    $added = Invoke-Pkg @("add", "top")
+    if ($added.Code -ne 0) { throw "add top: $($added.Text)" }
+    $lock = [System.IO.File]::ReadAllText((Join-Path $pkgProject "mettle.lock"))
+    if ($lock -notmatch "package\tbase\t1\.0\.0\t$baseHash") { throw "the lock does not pin base 1.0.0, the version named: $lock" }
+    if ([System.IO.File]::ReadAllText((Join-Path $pkgProject "mettle.deps")) -match "base=") { throw "an indirect package reached the project's mettle.deps" }
+
+    Write-PkgText (Join-Path $pkgProject "main.mettle") "import `"top`";`nfn main() -> int32 { return top_value(); }`n"
+    $built = & $pkgCompiler --build main.mettle -o main.exe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "a program importing a package did not build: $built" }
+    & (Join-Path $pkgProject "main.exe")
+    if ($LASTEXITCODE -ne 42) { throw "the program returned $LASTEXITCODE, expected 42" }
+
+    Write-PkgText (Join-Path $pkgProject "phantom.mettle") "import `"base`";`nfn main() -> int32 { return base_value(); }`n"
+    $phantom = & $pkgCompiler phantom.mettle -o phantom.obj 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) { throw "a project imported a package it only has indirectly" }
+
+    $installedFile = Join-Path $pkgProject ".mettle/packages/top-1.0.0/top.mettle"
+    $original = [System.IO.File]::ReadAllText($installedFile)
+    [System.IO.File]::WriteAllText($installedFile, "fn tampered() {}`n")
+    $again = Invoke-Pkg @("install", "--frozen")
+    if ($again.Code -ne 0 -or $again.Text -notmatch "changed on disk") { throw "a changed file was not noticed: $($again.Text)" }
+    if ([System.IO.File]::ReadAllText($installedFile) -ne $original) { throw "install did not restore the changed file" }
+
+    $env:METTLE_REGISTRY = Join-Path $pkgRoot "nowhere"
+    Remove-Item -Path (Join-Path $pkgProject ".mettle") -Recurse -Force
+    $offline = Invoke-Pkg @("install", "--frozen")
+    if ($offline.Code -ne 0) { throw "a locked project with a full cache needed the registry: $($offline.Text)" }
+    $env:METTLE_REGISTRY = $pkgSite
+
+    Remove-Item -Path (Join-Path $pkgProject ".mettle") -Recurse -Force
+    Remove-Item -Path $env:METTLE_CACHE -Recurse -Force
+    $archivePath = Join-Path $pkgSite "archives/base-1.0.0.tar"
+    $goodArchive = [System.IO.File]::ReadAllBytes($archivePath)
+    $badArchive = [byte[]]$goodArchive.Clone()
+    $badArchive[600] = $badArchive[600] -bxor 1
+    [System.IO.File]::WriteAllBytes($archivePath, $badArchive)
+    Assert-PkgFails (Invoke-Pkg @("install")) "expected $baseHash" "a corrupt download"
+    [System.IO.File]::WriteAllBytes($archivePath, $goodArchive)
+    if ((Invoke-Pkg @("install")).Code -ne 0) { throw "install failed after the archive was restored" }
+
+    $raised = Invoke-Pkg @("add", "newer")
+    if ($raised.Code -ne 0) { throw "add newer: $($raised.Text)" }
+    if ([System.IO.File]::ReadAllText((Join-Path $pkgProject "mettle.lock")) -notmatch "package\tbase\t1\.1\.0") { throw "the highest named version did not win" }
+    if (Test-Path (Join-Path $pkgProject ".mettle/packages/base-1.0.0")) { throw "the superseded version stayed installed" }
+
+    $beforeConflict = [System.IO.File]::ReadAllText((Join-Path $pkgProject "mettle.package"))
+    Assert-PkgFails (Invoke-Pkg @("add", "breaking")) "cannot share a program" "two majors of one package"
+    if ([System.IO.File]::ReadAllText((Join-Path $pkgProject "mettle.package")) -ne $beforeConflict) { throw "a failed add changed mettle.package" }
+
+    Assert-PkgFails (Invoke-Pkg @("add", "pulled")) "no release" "a package with only a yanked version"
+    $pinned = Invoke-Pkg @("add", "pulled@1.0.0")
+    if ($pinned.Code -ne 0 -or $pinned.Text -notmatch "yanked") { throw "an explicit yanked version should install with a warning: $($pinned.Text)" }
+
+    $lockText = [System.IO.File]::ReadAllText((Join-Path $pkgProject "mettle.lock"))
+    $lockBad = $lockText -replace "(package\ttop\t1\.0\.0\t)0", '${1}1'
+    if ($lockBad -eq $lockText) { $lockBad = $lockText -replace "(package\ttop\t1\.0\.0\t)[1-9a-f]", '${1}0' }
+    [System.IO.File]::WriteAllText((Join-Path $pkgProject "mettle.lock"), $lockBad)
+    Assert-PkgFails (Invoke-Pkg @("add", "base@1.1.0")) "treat this as tampering" "a registry hash that differs from the lock"
+    [System.IO.File]::WriteAllText((Join-Path $pkgProject "mettle.lock"), $lockText)
+
+    $removed = Invoke-Pkg @("remove", "newer", "pulled")
+    if ($removed.Code -ne 0) { throw "remove: $($removed.Text)" }
+    if (Test-Path (Join-Path $pkgProject ".mettle/packages/newer-1.0.0")) { throw "remove left the package installed" }
+    if ([System.IO.File]::ReadAllText((Join-Path $pkgProject "mettle.lock")) -notmatch "package\tbase\t1\.0\.0") { throw "remove did not lower base to what remains named" }
+
+    $handWritten = "vendored=./vendor/lib`n"
+    $depsPath = Join-Path $pkgProject "mettle.deps"
+    [System.IO.File]::AppendAllText($depsPath, $handWritten)
+    if ((Invoke-Pkg @("install")).Code -ne 0) { throw "install with a hand-written deps line failed" }
+    $updated = Invoke-Pkg @("add", "newer")
+    if ($updated.Code -ne 0) { throw "add newer again: $($updated.Text)" }
+    if ([System.IO.File]::ReadAllText($depsPath) -notmatch "vendored=\./vendor/lib") { throw "a hand-written mettle.deps line was lost" }
+    [System.IO.File]::AppendAllText($depsPath, "base=./vendor/base`n")
+    Assert-PkgFails (Invoke-Pkg @("add", "base@1.1.0")) "already maps base" "a package a hand-written line already maps"
+    $depsLines = [System.IO.File]::ReadAllText($depsPath) -replace "base=\./vendor/base`n", ""
+    [System.IO.File]::WriteAllText($depsPath, $depsLines)
+
+    $headerBytes = New-Object byte[] 1536
+    $unsafeName = [System.Text.Encoding]::ASCII.GetBytes("../evil.mettle")
+    [Array]::Copy($unsafeName, 0, $headerBytes, 0, $unsafeName.Length)
+    foreach ($field in @(@(100, "0000644"), @(108, "0000000"), @(116, "0000000"), @(124, "00000000000"), @(136, "00000000000"), @(329, "0000000"), @(337, "0000000"))) {
+      $bytes = [System.Text.Encoding]::ASCII.GetBytes($field[1])
+      [Array]::Copy($bytes, 0, $headerBytes, $field[0], $bytes.Length)
+    }
+    $headerBytes[156] = [byte][char]'0'
+    $magic = [System.Text.Encoding]::ASCII.GetBytes("ustar")
+    [Array]::Copy($magic, 0, $headerBytes, 257, $magic.Length)
+    $headerBytes[263] = [byte][char]'0'
+    $headerBytes[264] = [byte][char]'0'
+    for ($i = 148; $i -lt 156; $i++) { $headerBytes[$i] = 32 }
+    $sum = 0
+    for ($i = 0; $i -lt 512; $i++) { $sum += $headerBytes[$i] }
+    $sumBytes = [System.Text.Encoding]::ASCII.GetBytes([Convert]::ToString($sum, 8).PadLeft(6, '0'))
+    [Array]::Copy($sumBytes, 0, $headerBytes, 148, 6)
+    $headerBytes[154] = 0
+    $unsafePath = Join-Path $pkgSite "archives/unsafe-1.0.0.tar"
+    [System.IO.File]::WriteAllBytes($unsafePath, $headerBytes)
+    $unsafeHash = (Get-FileHash -Algorithm SHA256 -Path $unsafePath).Hash.ToLowerInvariant()
+    Write-PkgText (Join-Path $pkgSite "packages/unsafe.txt") "mettle-registry-1`nname`tunsafe`ndescription`tx`nrelease`t1.0.0`t$unsafeHash`t1536`t-`tlive`t-`n"
+    Assert-PkgFails (Invoke-Pkg @("add", "unsafe")) "unsafe path" "an archive that climbs out of its folder"
+    if (Test-Path (Join-Path $pkgProject ".mettle/evil.mettle")) { throw "the unsafe path was written" }
+    if (Test-Path (Join-Path $pkgProject ".mettle/tmp/evil.mettle")) { throw "the unsafe path was written" }
+  }
+  finally {
+    Pop-Location
+  }
+
+  $badPackage = Join-Path $pkgRoot "src/bad"
+  Write-PkgText (Join-Path $badPackage "mettle.package") "name = bad`nversion = 1.0.0`ndescription = x`nlicense = MIT`n"
+  Write-PkgText (Join-Path $badPackage "bad.mettle") "fn f() {}`n"
+  Assert-PkgFails (Invoke-Pkg @("pack", $badPackage)) "LICENSE is missing" "a package with no license file"
+  Write-PkgText (Join-Path $badPackage "LICENSE") "MIT`n"
+  Write-PkgText (Join-Path $badPackage "tool.exe") "MZ"
+  Assert-PkgFails (Invoke-Pkg @("pack", $badPackage)) "not binaries" "a package holding a binary"
+
+  Write-CaseResult -Name "mettle_pkg_client" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "mettle_pkg_client" -Passed $false -Reason $_.Exception.Message
+}
+finally {
+  $env:METTLE_REGISTRY = $pkgSavedRegistry
+  $env:METTLE_CACHE = $pkgSavedCache
 }
 
 # Function pointer test: build and run

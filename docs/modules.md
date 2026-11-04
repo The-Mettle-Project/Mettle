@@ -57,6 +57,14 @@ macOS. An import for another platform is dropped before the path is resolved,
 so that file need not exist on this machine. Guards work on all three import
 forms.
 
+Two more guards pick a CPU: `x86_64` and `aarch64`. They are for data that
+differs by architecture, such as Linux system call numbers:
+
+```mettle
+import "std/linux_sys_x86_64" if x86_64;
+import "std/linux_sys_aarch64" if aarch64;
+```
+
 A `std/` import without an extension picks the platform's file when one
 exists: `std/io.linux.mettle` on Linux, and on macOS `std/io.macos.mettle`
 first, then the Linux file. With the Metal GPU provider (the default on
@@ -131,6 +139,8 @@ For `import` and `import_str` alike, the resolver tries, in order:
 4. Relative to the importing file.
 5. The `-I` directories, in the order given.
 6. The path as written, relative to the working directory.
+7. For a one-component import, the module named after it in the package root of
+   the same name, so `import "mylib";` can load `mylib/mylib.mettle`.
 
 `std/` resolves against the stdlib bundled next to the compiler, then against
 `./stdlib`. `--stdlib <dir>` overrides the root. On Linux, a `std/` import
@@ -145,8 +155,11 @@ vendor_json=C:/deps/json
 ```
 
 With that file in or above the importing file's directory,
-`import "mylib/widget";` resolves to `./packages/mylib/widget.mettle`. A
-relative root is read relative to the `mettle.deps` file holding it.
+`import "mylib/widget";` resolves to `./packages/mylib/widget.mettle`. A file
+named `mylib.mettle` beside the importer takes `import "mylib";` first; with no
+such file it loads `./packages/mylib/mylib.mettle`. A relative root is read
+relative to the `mettle.deps` file holding it. [`mettle pkg`](packages.md) writes
+these lines for packages from the registry.
 
 ## Duplicate and circular imports
 

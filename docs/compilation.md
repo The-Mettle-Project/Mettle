@@ -258,11 +258,15 @@ mettle docs [topic]
 mettle explain <CODE>
 mettle test <file> [--filter=S]
 mettle trace <file> <fn> [args...]
+mettle pkg <command>
 ```
 
-`help` covers build, runtime, interop, stdlib, web, diagnostics, verify, and
-test; `help all` prints every topic. `docs` prints the path of the matching
+`help` covers build, runtime, interop, stdlib, web, diagnostics, verify, test,
+and pkg; `help all` prints every topic. `docs` prints the path of the matching
 documentation file.
+
+`pkg` adds and installs packages from the registry. [Packages](packages.md)
+covers it.
 
 `explain` takes a diagnostic code such as `E0004` or `M0103`, or an
 [`--explain` decision code](explain-json.md) such as `dot-shape-address`.

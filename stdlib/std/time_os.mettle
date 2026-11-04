@@ -1,0 +1,39 @@
+// Windows clocks for std/time. FILETIME counts 100 ns ticks since 1601-01-01.
+
+extern fn time_os_filetime(ticks: int64*) = "GetSystemTimePreciseAsFileTime";
+extern fn time_os_qpc(counter: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn time_os_qpc_freq(freq: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn time_os_sleep_ms(ms: uint32) = "Sleep";
+
+var g_time_os_freq: int64 = 0;
+
+// Nanoseconds since 1970-01-01 00:00:00 UTC.
+export fn time_unix_ns() -> int64 {
+  var ticks: int64 = 0;
+  time_os_filetime(&ticks);
+  return (ticks - (int64)116444736000000000) * (int64)100;
+}
+
+// Nanoseconds on a clock that never jumps. Only differences mean anything.
+export fn time_mono_ns() -> int64 {
+  if (g_time_os_freq == (int64)0) { time_os_qpc_freq(&g_time_os_freq); }
+  if (g_time_os_freq == (int64)0) { return (int64)0; }
+  var c: int64 = 0;
+  time_os_qpc(&c);
+  // Split the division so the product cannot overflow.
+  var whole: int64 = c / g_time_os_freq;
+  var part: int64 = c % g_time_os_freq;
+  return whole * (int64)1000000000 + part * (int64)1000000000 / g_time_os_freq;
+}
+
+// Sleeps at least ns nanoseconds. Windows sleeps in whole milliseconds.
+export fn time_sleep_ns(ns: int64) {
+  if (ns <= (int64)0) { return; }
+  var ms: int64 = (ns + (int64)999999) / (int64)1000000;
+  while (ms > (int64)0) {
+    var step: int64 = ms;
+    if (step > (int64)86400000) { step = (int64)86400000; }
+    time_os_sleep_ms((uint32)step);
+    ms = ms - step;
+  }
+}

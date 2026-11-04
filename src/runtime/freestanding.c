@@ -598,6 +598,8 @@ MT_DLLIMPORT mt_u32 GetFileAttributesA(const char *path);
 MT_DLLIMPORT int CreateDirectoryA(const char *path, void *security);
 MT_DLLIMPORT void *FindFirstFileA(const char *pattern, MtFindData *data);
 MT_DLLIMPORT int FindNextFileA(void *handle, MtFindData *data);
+MT_DLLIMPORT int RemoveDirectoryA(const char *path);
+MT_DLLIMPORT int MoveFileExA(const char *from, const char *to, mt_u32 flags);
 MT_DLLIMPORT int FindClose(void *handle);
 MT_DLLIMPORT void GetSystemTimeAsFileTime(MtFileTime *time);
 MT_DLLIMPORT int CreatePipe(void **read_pipe, void **write_pipe,
@@ -762,6 +764,53 @@ int mkdir(const char *path, unsigned int mode) {
 int _mkdir(const char *path) { return mkdir(path, 0); }
 
 int mettle_make_directory(const char *path) { return mkdir(path, 0777); }
+
+int mettle_remove_directory(const char *path) {
+  return RemoveDirectoryA(path) ? 0 : -1;
+}
+
+int mettle_move_path(const char *from, const char *to) {
+  return MoveFileExA(from, to, 1u) ? 0 : -1;
+}
+
+int mettle_dir_list(const char *path, char *names, mt_i32 capacity) {
+  char pattern[1024];
+  MtFindData data;
+  mt_size path_length = path ? strlen(path) : 0;
+  mt_i32 used = 0;
+  mt_i32 count = 0;
+  void *handle;
+  if (!names || capacity <= 0 || path_length == 0 ||
+      path_length + 3 > sizeof(pattern)) {
+    return -1;
+  }
+  memcpy(pattern, path, path_length);
+  pattern[path_length] = '\\';
+  pattern[path_length + 1] = '*';
+  pattern[path_length + 2] = 0;
+  handle = FindFirstFileA(pattern, &data);
+  if (handle == MT_INVALID_HANDLE) {
+    return -1;
+  }
+  do {
+    mt_size name_length = strlen(data.name);
+    if (strcmp(data.name, ".") == 0 || strcmp(data.name, "..") == 0) {
+      continue;
+    }
+    if ((mt_size)used + name_length + 2 > (mt_size)capacity) {
+      FindClose(handle);
+      return -1;
+    }
+    names[used++] = (data.attributes & 0x400u) ? 'l'
+                    : (data.attributes & MT_FILE_ATTRIBUTE_DIRECTORY) ? 'd'
+                                                                      : 'f';
+    memcpy(names + used, data.name, name_length + 1);
+    used += (mt_i32)name_length + 1;
+    count++;
+  } while (FindNextFileA(handle, &data));
+  FindClose(handle);
+  return count;
+}
 
 mt_i64 mettle_executable_path(char *buffer, mt_u64 size) {
   if (!buffer || size == 0 || size > 0xffffffffu) return -1;
@@ -2735,6 +2784,96 @@ static void mt_scan_md_files(const char *root, const char *prefix, char *paths,
   mt_syscall6(MT_SYS_CLOSE, directory, 0, 0, 0, 0, 0);
 }
 
+int mettle_remove_directory(const char *path) {
+  return (int)mt_sys_result(mt_syscall6(MT_SYS_UNLINKAT, MT_AT_FDCWD,
+                                        (mt_i64)path, 0x200, 0, 0, 0));
+}
+
+int mettle_move_path(const char *from, const char *to) {
+  return (int)mt_sys_result(mt_syscall6(MT_SYS_RENAMEAT2, MT_AT_FDCWD,
+                                        (mt_i64)from, MT_AT_FDCWD,
+                                        (mt_i64)to, 0, 0));
+}
+
+static mt_i32 mt_dir_list_entries(const char *entries, mt_i64 bytes,
+                                  const char *path, char *names,
+                                  mt_i32 capacity, mt_i32 *used) {
+  mt_i64 offset = 0;
+  mt_i32 count = 0;
+  while (offset < bytes) {
+    const MtLinuxDirent64 *entry = (const MtLinuxDirent64 *)(entries + offset);
+    mt_size name_length;
+    char kind = 'f';
+    if (entry->record_length < 20 || offset + entry->record_length > bytes) {
+      return -1;
+    }
+    offset += entry->record_length;
+    if (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0) {
+      continue;
+    }
+    name_length = strlen(entry->name);
+    if ((mt_size)*used + name_length + 2 > (mt_size)capacity) {
+      return -1;
+    }
+    if (entry->type == 0) {
+      char full_path[4096];
+      mt_size path_length = strlen(path);
+      if (path_length + name_length + 2 > sizeof(full_path)) {
+        return -1;
+      }
+      memcpy(full_path, path, path_length);
+      full_path[path_length] = '/';
+      memcpy(full_path + path_length + 1, entry->name, name_length + 1);
+      kind = mettle_path_is_directory(full_path) ? 'd' : 'f';
+    } else if (entry->type == 4) {
+      kind = 'd';
+    } else if (entry->type != 8) {
+      kind = 'l';
+    }
+    names[(*used)++] = kind;
+    memcpy(names + *used, entry->name, name_length + 1);
+    *used += (mt_i32)name_length + 1;
+    count++;
+  }
+  return count;
+}
+
+int mettle_dir_list(const char *path, char *names, mt_i32 capacity) {
+  char entries[8192];
+  mt_i32 used = 0;
+  mt_i32 count = 0;
+  mt_i64 directory;
+  if (!path || !names || capacity <= 0) {
+    return -1;
+  }
+  directory = mt_sys_result(mt_syscall6(MT_SYS_OPENAT, MT_AT_FDCWD,
+                                        (mt_i64)path,
+                                        MT_O_RDONLY | MT_O_DIRECTORY, 0, 0, 0));
+  if (directory < 0) {
+    return -1;
+  }
+  for (;;) {
+    mt_i32 added;
+    mt_i64 bytes = mt_sys_result(mt_syscall6(MT_SYS_GETDENTS64, directory,
+                                             (mt_i64)entries, sizeof(entries),
+                                             0, 0, 0));
+    if (bytes <= 0) {
+      if (bytes < 0) {
+        count = -1;
+      }
+      break;
+    }
+    added = mt_dir_list_entries(entries, bytes, path, names, capacity, &used);
+    if (added < 0) {
+      count = -1;
+      break;
+    }
+    count += added;
+  }
+  mt_syscall6(MT_SYS_CLOSE, directory, 0, 0, 0, 0, 0);
+  return count;
+}
+
 #endif
 
 int mettle_dir_list_md_files(const char *root, char *paths, mt_i32 capacity,
@@ -3831,27 +3970,40 @@ mt_u32 mettle_mutex_wait(mt_i64 handle, mt_u32 milliseconds) {
   if (!mutex) {
     return MT_WAIT_FAILED;
   }
-  mt_i64 timeout_value[2];
-  const void *timeout = MT_NULL;
-  if (milliseconds != MT_INFINITE) {
-    timeout_value[0] = milliseconds / 1000u;
-    timeout_value[1] = (milliseconds % 1000u) * 1000000u;
-    timeout = timeout_value;
+  /* state is 0 free, 1 locked, 2 locked with waiters. One deadline covers
+     the whole call: a waiter woken by an unlock that another thread wins
+     waits again only for the time that is left. */
+  int expected = 0;
+  if (__atomic_compare_exchange_n(&mutex->state, &expected, 1, 0,
+                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    return MT_WAIT_OBJECT_0;
   }
-  for (;;) {
-    int expected = 0;
-    if (__atomic_compare_exchange_n(&mutex->state, &expected, 1, 0,
-                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-      return MT_WAIT_OBJECT_0;
+  mt_i64 deadline = -1;
+  mt_i64 now[2];
+  if (milliseconds != MT_INFINITE) {
+    clock_gettime(1, now);
+    deadline = now[0] * 1000000000 + now[1] + (mt_i64)milliseconds * 1000000;
+  }
+  while (__atomic_exchange_n(&mutex->state, 2, __ATOMIC_ACQUIRE) != 0) {
+    mt_i64 timeout_value[2];
+    const void *timeout = MT_NULL;
+    if (deadline >= 0) {
+      clock_gettime(1, now);
+      mt_i64 left = deadline - (now[0] * 1000000000 + now[1]);
+      if (left <= 0) {
+        return MT_WAIT_TIMEOUT;
+      }
+      timeout_value[0] = left / 1000000000;
+      timeout_value[1] = left % 1000000000;
+      timeout = timeout_value;
     }
-    int result = mt_futex(&mutex->state, MT_FUTEX_WAIT, 1, timeout);
-    if (result < 0 && mt_errno_value == 110) {
-      return MT_WAIT_TIMEOUT;
-    }
-    if (result < 0 && mt_errno_value != 4 && mt_errno_value != 11) {
+    int result = mt_futex(&mutex->state, MT_FUTEX_WAIT, 2, timeout);
+    if (result < 0 && mt_errno_value != 110 && mt_errno_value != 4 &&
+        mt_errno_value != 11) {
       return MT_WAIT_FAILED;
     }
   }
+  return MT_WAIT_OBJECT_0;
 }
 
 int mettle_mutex_release(mt_i64 handle) {
@@ -3859,8 +4011,10 @@ int mettle_mutex_release(mt_i64 handle) {
   if (!mutex) {
     return 0;
   }
-  __atomic_store_n(&mutex->state, 0, __ATOMIC_RELEASE);
-  mt_futex(&mutex->state, MT_FUTEX_WAKE, 1, MT_NULL);
+  /* Only a contended lock has anyone to wake. */
+  if (__atomic_exchange_n(&mutex->state, 0, __ATOMIC_RELEASE) == 2) {
+    mt_futex(&mutex->state, MT_FUTEX_WAKE, 1, MT_NULL);
+  }
   return 1;
 }
 

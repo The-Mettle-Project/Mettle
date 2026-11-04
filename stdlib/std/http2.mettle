@@ -1,0 +1,1054 @@
+// HTTP/2 framing (RFC 9113) and gRPC message framing. No sockets and no OS
+// calls, and it runs in the compile-time interpreter. The header compression
+// lives in std/hpack, which this module imports.
+//
+// Three layers:
+//   - frames: the 9-byte header, a builder and a parser for each frame type,
+//     SETTINGS values, flow-control windows, and an incremental reader that
+//     cuts frames out of a byte buffer;
+//   - gRPC: the 5-byte message prefix, grpc-timeout, and grpc-status codes.
+//
+// Builders write a whole frame into a caller buffer and return its size, or -1
+// if it does not fit or an argument is out of range. Parsers take the frame
+// header and the payload bytes, fill a small struct that points into that
+// payload (nothing is copied), and return 0 or an H2_* error code. They check
+// the RFC's frame-level rules, not the connection state; stream state, header
+// block assembly and SETTINGS_MAX_FRAME_SIZE for sending belong to the caller.
+
+import "std/hpack";
+
+export const H2_PREFACE: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+export const H2_PREFACE_LEN = 24;
+export const H2_FRAME_HEADER_LEN = 9;
+
+export const H2_DEFAULT_MAX_FRAME_SIZE = 16384;
+export const H2_MAX_FRAME_SIZE_LIMIT = 16777215;
+export const H2_DEFAULT_WINDOW = 65535;
+export const H2_MAX_WINDOW = 2147483647;
+export const H2_MAX_STREAM_ID = 2147483647;
+
+// Frame types.
+export const H2_FRAME_DATA = 0;
+export const H2_FRAME_HEADERS = 1;
+export const H2_FRAME_PRIORITY = 2;
+export const H2_FRAME_RST_STREAM = 3;
+export const H2_FRAME_SETTINGS = 4;
+export const H2_FRAME_PUSH_PROMISE = 5;
+export const H2_FRAME_PING = 6;
+export const H2_FRAME_GOAWAY = 7;
+export const H2_FRAME_WINDOW_UPDATE = 8;
+export const H2_FRAME_CONTINUATION = 9;
+
+// Frame flags. END_STREAM and ACK share a bit; which one applies depends on
+// the frame type.
+export const H2_FLAG_END_STREAM = 1;
+export const H2_FLAG_ACK = 1;
+export const H2_FLAG_END_HEADERS = 4;
+export const H2_FLAG_PADDED = 8;
+export const H2_FLAG_PRIORITY = 32;
+
+// Error codes. 0 also means "no error" in a parser's return value.
+export const H2_NO_ERROR = 0;
+export const H2_PROTOCOL_ERROR = 1;
+export const H2_INTERNAL_ERROR = 2;
+export const H2_FLOW_CONTROL_ERROR = 3;
+export const H2_SETTINGS_TIMEOUT = 4;
+export const H2_STREAM_CLOSED = 5;
+export const H2_FRAME_SIZE_ERROR = 6;
+export const H2_REFUSED_STREAM = 7;
+export const H2_CANCEL = 8;
+export const H2_COMPRESSION_ERROR = 9;
+export const H2_CONNECT_ERROR = 10;
+export const H2_ENHANCE_YOUR_CALM = 11;
+export const H2_INADEQUATE_SECURITY = 12;
+export const H2_HTTP_1_1_REQUIRED = 13;
+
+// SETTINGS identifiers.
+export const H2_SETTINGS_HEADER_TABLE_SIZE = 1;
+export const H2_SETTINGS_ENABLE_PUSH = 2;
+export const H2_SETTINGS_MAX_CONCURRENT_STREAMS = 3;
+export const H2_SETTINGS_INITIAL_WINDOW_SIZE = 4;
+export const H2_SETTINGS_MAX_FRAME_SIZE = 5;
+export const H2_SETTINGS_MAX_HEADER_LIST_SIZE = 6;
+
+// A SETTINGS value that was never set: no limit.
+export const H2_UNLIMITED: int64 = 4294967295;
+
+export fn h2_error_name(code: int64) -> string {
+  switch ((int32)code) {
+    case 0: { return "NO_ERROR"; }
+    case 1: { return "PROTOCOL_ERROR"; }
+    case 2: { return "INTERNAL_ERROR"; }
+    case 3: { return "FLOW_CONTROL_ERROR"; }
+    case 4: { return "SETTINGS_TIMEOUT"; }
+    case 5: { return "STREAM_CLOSED"; }
+    case 6: { return "FRAME_SIZE_ERROR"; }
+    case 7: { return "REFUSED_STREAM"; }
+    case 8: { return "CANCEL"; }
+    case 9: { return "COMPRESSION_ERROR"; }
+    case 10: { return "CONNECT_ERROR"; }
+    case 11: { return "ENHANCE_YOUR_CALM"; }
+    case 12: { return "INADEQUATE_SECURITY"; }
+    case 13: { return "HTTP_1_1_REQUIRED"; }
+    default: { return "UNKNOWN_ERROR"; }
+  }
+}
+
+export fn h2_frame_type_name(type: int32) -> string {
+  switch (type) {
+    case 0: { return "DATA"; }
+    case 1: { return "HEADERS"; }
+    case 2: { return "PRIORITY"; }
+    case 3: { return "RST_STREAM"; }
+    case 4: { return "SETTINGS"; }
+    case 5: { return "PUSH_PROMISE"; }
+    case 6: { return "PING"; }
+    case 7: { return "GOAWAY"; }
+    case 8: { return "WINDOW_UPDATE"; }
+    case 9: { return "CONTINUATION"; }
+    default: { return "UNKNOWN"; }
+  }
+}
+
+// ---- Byte helpers -------------------------------------------------------------
+
+fn h2_put16(out: uint8*, v: int64) {
+  out[0] = (uint8)((v >> 8) & 255);
+  out[1] = (uint8)(v & 255);
+}
+
+fn h2_put32(out: uint8*, v: int64) {
+  out[0] = (uint8)((v >> 24) & 255);
+  out[1] = (uint8)((v >> 16) & 255);
+  out[2] = (uint8)((v >> 8) & 255);
+  out[3] = (uint8)(v & 255);
+}
+
+fn h2_get16(src: uint8*) -> int64 {
+  return ((int64)src[0] << 8) | (int64)src[1];
+}
+
+// An unsigned 32-bit value, as an int64.
+fn h2_get32(src: uint8*) -> int64 {
+  return ((int64)src[0] << 24) | ((int64)src[1] << 16) | ((int64)src[2] << 8) | (int64)src[3];
+}
+
+fn h2_copy(dst: uint8*, src: uint8*, n: int64) {
+  for i in 0..n {
+    dst[i] = src[i];
+  }
+}
+
+// ---- Frame header (RFC 9113 section 4.1) ---------------------------------------
+
+export struct H2FrameHeader {
+  length: int64;      // payload length, 0..16777215
+  type: int32;        // H2_FRAME_*
+  flags: int32;
+  stream_id: int32;   // 31 bits; the reserved bit is dropped on reading
+}
+
+// Writes the 9 header bytes into out.
+export fn h2_frame_header_write(h: H2FrameHeader, out: uint8*) {
+  out[0] = (uint8)((h.length >> 16) & 255);
+  out[1] = (uint8)((h.length >> 8) & 255);
+  out[2] = (uint8)(h.length & 255);
+  out[3] = (uint8)h.type;
+  out[4] = (uint8)h.flags;
+  h2_put32(out + 5, (int64)h.stream_id & (int64)2147483647);
+}
+
+// Reads 9 bytes. The caller makes sure they are there.
+export fn h2_frame_header_read(src: uint8*) -> H2FrameHeader {
+  var h: H2FrameHeader;
+  h.length = ((int64)src[0] << 16) | ((int64)src[1] << 8) | (int64)src[2];
+  h.type = (int32)src[3];
+  h.flags = (int32)src[4];
+  h.stream_id = (int32)(h2_get32(src + 5) & (int64)2147483647);
+  return h;
+}
+
+// H2_FRAME_SIZE_ERROR if the payload is longer than `max_frame_size`
+// (SETTINGS_MAX_FRAME_SIZE as we advertised it), else 0.
+export fn h2_check_frame_length(h: H2FrameHeader, max_frame_size: int64) -> int32 {
+  if (h.length > max_frame_size) { return H2_FRAME_SIZE_ERROR; }
+  return H2_NO_ERROR;
+}
+
+// True when a parser's error on this frame is a stream error: reset the stream
+// with that code and carry on. Anything else is a connection error: send GOAWAY
+// and close. A HEADERS frame whose priority depends on its own stream is also a
+// stream error (PROTOCOL_ERROR); the parser does not flag it, so compare
+// H2Headers.priority.dependency with the stream id.
+export fn h2_is_stream_error(h: H2FrameHeader, err: int32) -> bool {
+  if (err == H2_NO_ERROR || h.stream_id == 0) { return false; }
+  if (h.type == H2_FRAME_PRIORITY) { return true; }
+  if (h.type == H2_FRAME_WINDOW_UPDATE && err == H2_PROTOCOL_ERROR) { return true; }
+  return false;
+}
+
+// Writes the frame header at the start of out, after checking that the whole
+// frame (header and `payload` bytes) fits in cap and the arguments are in range.
+fn h2_begin(out: uint8*, cap: int64, payload: int64, type: int32, flags: int32, stream_id: int32) -> bool {
+  if (payload < 0 || payload > (int64)H2_MAX_FRAME_SIZE_LIMIT) { return false; }
+  if (stream_id < 0) { return false; }
+  if (cap < 9 + payload) { return false; }
+  var h: H2FrameHeader;
+  h.length = payload;
+  h.type = type;
+  h.flags = flags;
+  h.stream_id = stream_id;
+  h2_frame_header_write(h, out);
+  return true;
+}
+
+// ---- Priority fields -----------------------------------------------------------
+
+export struct H2Priority {
+  dependency: int32;   // the stream this one depends on
+  weight: int32;       // 1..256 (the wire byte plus one)
+  exclusive: bool;
+}
+
+fn h2_priority_read(src: uint8*, out: H2Priority*) {
+  var v: int64 = h2_get32(src);
+  out->exclusive = (v & (int64)2147483648) != 0;
+  out->dependency = (int32)(v & (int64)2147483647);
+  out->weight = (int32)src[4] + 1;
+}
+
+fn h2_priority_write(dst: uint8*, dependency: int32, weight: int32, exclusive: bool) {
+  var v: int64 = (int64)dependency & (int64)2147483647;
+  if (exclusive) { v = v | (int64)2147483648; }
+  h2_put32(dst, v);
+  dst[4] = (uint8)(weight - 1);
+}
+
+// ---- DATA (6.1) ----------------------------------------------------------------
+
+export struct H2Data {
+  data: uint8*;        // points into the payload
+  length: int64;
+  pad_length: int32;   // 0 when the frame is not padded
+  end_stream: bool;
+}
+
+// Splits the optional pad length off a payload. Returns an error, or 0 with the
+// pad length and the offset where the body starts. A padded frame needs one
+// byte for the pad length (else FRAME_SIZE_ERROR), and the padding must fit in
+// what is left (else PROTOCOL_ERROR).
+fn h2_unpad(h: H2FrameHeader, payload: uint8*, fixed: int64, pad: int32*, body_at: int64*, body_len: int64*) -> int32 {
+  var at: int64 = 0;
+  var p: int64 = 0;
+  if ((h.flags & H2_FLAG_PADDED) != 0) {
+    if (h.length < 1) { return H2_FRAME_SIZE_ERROR; }
+    p = (int64)payload[0];
+    at = 1;
+  }
+  if (h.length < at + fixed) { return H2_FRAME_SIZE_ERROR; }
+  if (p > h.length - at - fixed) { return H2_PROTOCOL_ERROR; }
+  *pad = (int32)p;
+  *body_at = at;
+  *body_len = h.length - at - p;
+  return H2_NO_ERROR;
+}
+
+export fn h2_parse_data(h: H2FrameHeader, payload: uint8*, out: H2Data*) -> int32 {
+  if (h.stream_id == 0) { return H2_PROTOCOL_ERROR; }
+  var pad: int32 = 0;
+  var at: int64 = 0;
+  var len: int64 = 0;
+  var r: int32 = h2_unpad(h, payload, 0, &pad, &at, &len);
+  if (r != 0) { return r; }
+  out->data = payload + at;
+  out->length = len;
+  out->pad_length = pad;
+  out->end_stream = (h.flags & H2_FLAG_END_STREAM) != 0;
+  return H2_NO_ERROR;
+}
+
+// Builds a DATA frame. `pad` is -1 for none, or 0..255 zero bytes of padding
+// (0 still sets the PADDED flag).
+export fn h2_build_data(out: uint8*, cap: int64, stream_id: int32, data: uint8*, n: int64, end_stream: bool, pad: int32) -> int64 {
+  if (pad < -1 || pad > 255 || n < 0) { return -1; }
+  var payload: int64 = n;
+  var flags: int32 = 0;
+  if (end_stream) { flags = H2_FLAG_END_STREAM; }
+  if (pad >= 0) {
+    payload = payload + 1 + (int64)pad;
+    flags = flags | H2_FLAG_PADDED;
+  }
+  if (!h2_begin(out, cap, payload, H2_FRAME_DATA, flags, stream_id)) { return -1; }
+  var at: int64 = 9;
+  if (pad >= 0) {
+    out[at] = (uint8)pad;
+    at = at + 1;
+  }
+  h2_copy(out + at, data, n);
+  at = at + n;
+  for i in 0..(int64)pad {
+    out[at + i] = (uint8)0;
+  }
+  return 9 + payload;
+}
+
+// ---- HEADERS (6.2) -------------------------------------------------------------
+
+export struct H2Headers {
+  block: uint8*;       // the header block fragment, points into the payload
+  block_len: int64;
+  pad_length: int32;
+  end_stream: bool;
+  end_headers: bool;
+  has_priority: bool;
+  priority: H2Priority;
+}
+
+export fn h2_parse_headers(h: H2FrameHeader, payload: uint8*, out: H2Headers*) -> int32 {
+  if (h.stream_id == 0) { return H2_PROTOCOL_ERROR; }
+  var has_prio: bool = (h.flags & H2_FLAG_PRIORITY) != 0;
+  var fixed: int64 = 0;
+  if (has_prio) { fixed = 5; }
+  var pad: int32 = 0;
+  var at: int64 = 0;
+  var len: int64 = 0;
+  var r: int32 = h2_unpad(h, payload, fixed, &pad, &at, &len);
+  if (r != 0) { return r; }
+  out->has_priority = has_prio;
+  if (has_prio) {
+    h2_priority_read(payload + at, &out->priority);
+  }
+  out->block = payload + at + fixed;
+  out->block_len = len - fixed;
+  out->pad_length = pad;
+  out->end_stream = (h.flags & H2_FLAG_END_STREAM) != 0;
+  out->end_headers = (h.flags & H2_FLAG_END_HEADERS) != 0;
+  return H2_NO_ERROR;
+}
+
+// Builds a HEADERS frame around an already-encoded header block. `pad` is -1
+// for none, or 0..255. `priority` is a null pointer for none.
+export fn h2_build_headers(out: uint8*, cap: int64, stream_id: int32, block: uint8*, n: int64, end_stream: bool, end_headers: bool, pad: int32, priority: H2Priority*) -> int64 {
+  if (pad < -1 || pad > 255 || n < 0 || stream_id == 0) { return -1; }
+  var payload: int64 = n;
+  var flags: int32 = 0;
+  if (end_stream) { flags = flags | H2_FLAG_END_STREAM; }
+  if (end_headers) { flags = flags | H2_FLAG_END_HEADERS; }
+  if (pad >= 0) {
+    payload = payload + 1 + (int64)pad;
+    flags = flags | H2_FLAG_PADDED;
+  }
+  if (priority != (H2Priority*)0) {
+    payload = payload + 5;
+    flags = flags | H2_FLAG_PRIORITY;
+  }
+  if (!h2_begin(out, cap, payload, H2_FRAME_HEADERS, flags, stream_id)) { return -1; }
+  var at: int64 = 9;
+  if (pad >= 0) {
+    out[at] = (uint8)pad;
+    at = at + 1;
+  }
+  if (priority != (H2Priority*)0) {
+    h2_priority_write(out + at, priority->dependency, priority->weight, priority->exclusive);
+    at = at + 5;
+  }
+  h2_copy(out + at, block, n);
+  at = at + n;
+  for i in 0..(int64)pad {
+    out[at + i] = (uint8)0;
+  }
+  return 9 + payload;
+}
+
+// ---- PRIORITY (6.3) ------------------------------------------------------------
+
+// A bad PRIORITY frame is a stream error (see h2_is_stream_error), except on
+// stream 0, which is a connection error.
+export fn h2_parse_priority(h: H2FrameHeader, payload: uint8*, out: H2Priority*) -> int32 {
+  if (h.stream_id == 0) { return H2_PROTOCOL_ERROR; }
+  if (h.length != 5) { return H2_FRAME_SIZE_ERROR; }
+  h2_priority_read(payload, out);
+  if (out->dependency == h.stream_id) { return H2_PROTOCOL_ERROR; }
+  return H2_NO_ERROR;
+}
+
+export fn h2_build_priority(out: uint8*, cap: int64, stream_id: int32, dependency: int32, weight: int32, exclusive: bool) -> int64 {
+  if (stream_id == 0 || weight < 1 || weight > 256 || dependency < 0) { return -1; }
+  if (!h2_begin(out, cap, 5, H2_FRAME_PRIORITY, 0, stream_id)) { return -1; }
+  h2_priority_write(out + 9, dependency, weight, exclusive);
+  return 14;
+}
+
+// ---- RST_STREAM (6.4) ----------------------------------------------------------
+
+export fn h2_parse_rst_stream(h: H2FrameHeader, payload: uint8*, error_code: int64*) -> int32 {
+  if (h.stream_id == 0) { return H2_PROTOCOL_ERROR; }
+  if (h.length != 4) { return H2_FRAME_SIZE_ERROR; }
+  *error_code = h2_get32(payload);
+  return H2_NO_ERROR;
+}
+
+export fn h2_build_rst_stream(out: uint8*, cap: int64, stream_id: int32, error_code: int64) -> int64 {
+  if (stream_id == 0) { return -1; }
+  if (!h2_begin(out, cap, 4, H2_FRAME_RST_STREAM, 0, stream_id)) { return -1; }
+  h2_put32(out + 9, error_code);
+  return 13;
+}
+
+// ---- SETTINGS (6.5) ------------------------------------------------------------
+
+export struct H2Setting {
+  id: int32;
+  value: int64;      // an unsigned 32-bit value
+}
+
+// The six settings with their values. h2_settings_defaults gives the protocol's
+// starting values.
+export struct H2Settings {
+  header_table_size: int64;
+  enable_push: int64;
+  max_concurrent_streams: int64;
+  initial_window_size: int64;
+  max_frame_size: int64;
+  max_header_list_size: int64;
+}
+
+export fn h2_settings_defaults(s: H2Settings*) {
+  s->header_table_size = 4096;
+  s->enable_push = 1;
+  s->max_concurrent_streams = H2_UNLIMITED;
+  s->initial_window_size = 65535;
+  s->max_frame_size = 16384;
+  s->max_header_list_size = H2_UNLIMITED;
+}
+
+// Checks one setting against its range. Unknown identifiers pass, as the RFC
+// says to ignore them. Returns 0 or the error code to close the connection with:
+// ENABLE_PUSH other than 0 or 1 and MAX_FRAME_SIZE outside 16384..16777215 are
+// PROTOCOL_ERROR, INITIAL_WINDOW_SIZE above 2^31-1 is FLOW_CONTROL_ERROR.
+export fn h2_setting_check(id: int32, value: int64) -> int32 {
+  if (value < 0 || value > (int64)4294967295) { return H2_PROTOCOL_ERROR; }
+  if (id == H2_SETTINGS_ENABLE_PUSH && value > 1) { return H2_PROTOCOL_ERROR; }
+  if (id == H2_SETTINGS_INITIAL_WINDOW_SIZE && value > (int64)H2_MAX_WINDOW) { return H2_FLOW_CONTROL_ERROR; }
+  if (id == H2_SETTINGS_MAX_FRAME_SIZE && (value < (int64)H2_DEFAULT_MAX_FRAME_SIZE || value > (int64)H2_MAX_FRAME_SIZE_LIMIT)) {
+    return H2_PROTOCOL_ERROR;
+  }
+  return H2_NO_ERROR;
+}
+
+// Checks one setting, then stores it. Unknown identifiers are ignored.
+export fn h2_setting_apply(s: H2Settings*, id: int32, value: int64) -> int32 {
+  var r: int32 = h2_setting_check(id, value);
+  if (r != 0) { return r; }
+  switch (id) {
+    case 1: { s->header_table_size = value; }
+    case 2: { s->enable_push = value; }
+    case 3: { s->max_concurrent_streams = value; }
+    case 4: { s->initial_window_size = value; }
+    case 5: { s->max_frame_size = value; }
+    case 6: { s->max_header_list_size = value; }
+    default: { }
+  }
+  return H2_NO_ERROR;
+}
+
+// How many 6-byte entries a SETTINGS payload holds.
+export fn h2_settings_count(h: H2FrameHeader) -> int64 {
+  return h.length / 6;
+}
+
+// Entry i of a SETTINGS payload (0 <= i < h2_settings_count).
+export fn h2_settings_entry(payload: uint8*, i: int64) -> H2Setting {
+  var e: H2Setting;
+  e.id = (int32)h2_get16(payload + i * 6);
+  e.value = h2_get32(payload + i * 6 + 2);
+  return e;
+}
+
+// Checks a whole SETTINGS frame: stream 0 (PROTOCOL_ERROR), an ACK with no
+// payload and a length that is a multiple of 6 (FRAME_SIZE_ERROR), and every
+// value in range.
+export fn h2_settings_validate_frame(h: H2FrameHeader, payload: uint8*) -> int32 {
+  if (h.stream_id != 0) { return H2_PROTOCOL_ERROR; }
+  if ((h.flags & H2_FLAG_ACK) != 0) {
+    if (h.length != 0) { return H2_FRAME_SIZE_ERROR; }
+    return H2_NO_ERROR;
+  }
+  if (h.length % 6 != 0) { return H2_FRAME_SIZE_ERROR; }
+  var n: int64 = h.length / 6;
+  for i in 0..n {
+    var e: H2Setting = h2_settings_entry(payload, i);
+    var r: int32 = h2_setting_check(e.id, e.value);
+    if (r != 0) { return r; }
+  }
+  return H2_NO_ERROR;
+}
+
+// Validates a SETTINGS frame, then stores every value into `s` in order. Either
+// all of it applies or none. A frame with the ACK flag changes nothing. The
+// caller still has to send the ACK, and act on a changed INITIAL_WINDOW_SIZE
+// (h2_window_adjust on each stream) and HEADER_TABLE_SIZE.
+export fn h2_settings_apply_frame(s: H2Settings*, h: H2FrameHeader, payload: uint8*) -> int32 {
+  var r: int32 = h2_settings_validate_frame(h, payload);
+  if (r != 0) { return r; }
+  if ((h.flags & H2_FLAG_ACK) != 0) { return H2_NO_ERROR; }
+  var n: int64 = h.length / 6;
+  for i in 0..n {
+    var e: H2Setting = h2_settings_entry(payload, i);
+    h2_setting_apply(s, e.id, e.value);
+  }
+  return H2_NO_ERROR;
+}
+
+export fn h2_build_settings(out: uint8*, cap: int64, list: H2Setting*, count: int64) -> int64 {
+  if (count < 0) { return -1; }
+  if (!h2_begin(out, cap, count * 6, H2_FRAME_SETTINGS, 0, 0)) { return -1; }
+  for i in 0..count {
+    h2_put16(out + 9 + i * 6, (int64)list[i].id);
+    h2_put32(out + 9 + i * 6 + 2, list[i].value);
+  }
+  return 9 + count * 6;
+}
+
+export fn h2_build_settings_ack(out: uint8*, cap: int64) -> int64 {
+  if (!h2_begin(out, cap, 0, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0)) { return -1; }
+  return 9;
+}
+
+// ---- PUSH_PROMISE (6.6) --------------------------------------------------------
+
+export struct H2PushPromise {
+  promised_id: int32;
+  block: uint8*;
+  block_len: int64;
+  pad_length: int32;
+  end_headers: bool;
+}
+
+export fn h2_parse_push_promise(h: H2FrameHeader, payload: uint8*, out: H2PushPromise*) -> int32 {
+  if (h.stream_id == 0) { return H2_PROTOCOL_ERROR; }
+  var pad: int32 = 0;
+  var at: int64 = 0;
+  var len: int64 = 0;
+  var r: int32 = h2_unpad(h, payload, 4, &pad, &at, &len);
+  if (r != 0) { return r; }
+  out->promised_id = (int32)(h2_get32(payload + at) & (int64)2147483647);
+  if (out->promised_id == 0) { return H2_PROTOCOL_ERROR; }
+  out->block = payload + at + 4;
+  out->block_len = len - 4;
+  out->pad_length = pad;
+  out->end_headers = (h.flags & H2_FLAG_END_HEADERS) != 0;
+  return H2_NO_ERROR;
+}
+
+export fn h2_build_push_promise(out: uint8*, cap: int64, stream_id: int32, promised_id: int32, block: uint8*, n: int64, end_headers: bool, pad: int32) -> int64 {
+  if (pad < -1 || pad > 255 || n < 0 || stream_id == 0 || promised_id <= 0) { return -1; }
+  var payload: int64 = n + 4;
+  var flags: int32 = 0;
+  if (end_headers) { flags = flags | H2_FLAG_END_HEADERS; }
+  if (pad >= 0) {
+    payload = payload + 1 + (int64)pad;
+    flags = flags | H2_FLAG_PADDED;
+  }
+  if (!h2_begin(out, cap, payload, H2_FRAME_PUSH_PROMISE, flags, stream_id)) { return -1; }
+  var at: int64 = 9;
+  if (pad >= 0) {
+    out[at] = (uint8)pad;
+    at = at + 1;
+  }
+  h2_put32(out + at, (int64)promised_id);
+  at = at + 4;
+  h2_copy(out + at, block, n);
+  at = at + n;
+  for i in 0..(int64)pad {
+    out[at + i] = (uint8)0;
+  }
+  return 9 + payload;
+}
+
+// ---- PING (6.7) ----------------------------------------------------------------
+
+// Copies the 8 opaque bytes into `data`. h.flags & H2_FLAG_ACK tells a reply.
+export fn h2_parse_ping(h: H2FrameHeader, payload: uint8*, data: uint8*) -> int32 {
+  if (h.stream_id != 0) { return H2_PROTOCOL_ERROR; }
+  if (h.length != 8) { return H2_FRAME_SIZE_ERROR; }
+  h2_copy(data, payload, 8);
+  return H2_NO_ERROR;
+}
+
+// `data` is 8 bytes. To answer a PING, send the same bytes with ack set.
+export fn h2_build_ping(out: uint8*, cap: int64, data: uint8*, ack: bool) -> int64 {
+  var flags: int32 = 0;
+  if (ack) { flags = H2_FLAG_ACK; }
+  if (!h2_begin(out, cap, 8, H2_FRAME_PING, flags, 0)) { return -1; }
+  h2_copy(out + 9, data, 8);
+  return 17;
+}
+
+// ---- GOAWAY (6.8) --------------------------------------------------------------
+
+export struct H2Goaway {
+  last_stream_id: int32;
+  error_code: int64;
+  debug: uint8*;         // opaque debug data, points into the payload
+  debug_len: int64;
+}
+
+export fn h2_parse_goaway(h: H2FrameHeader, payload: uint8*, out: H2Goaway*) -> int32 {
+  if (h.stream_id != 0) { return H2_PROTOCOL_ERROR; }
+  if (h.length < 8) { return H2_FRAME_SIZE_ERROR; }
+  out->last_stream_id = (int32)(h2_get32(payload) & (int64)2147483647);
+  out->error_code = h2_get32(payload + 4);
+  out->debug = payload + 8;
+  out->debug_len = h.length - 8;
+  return H2_NO_ERROR;
+}
+
+export fn h2_build_goaway(out: uint8*, cap: int64, last_stream_id: int32, error_code: int64, debug: uint8*, n: int64) -> int64 {
+  if (n < 0 || last_stream_id < 0) { return -1; }
+  if (!h2_begin(out, cap, 8 + n, H2_FRAME_GOAWAY, 0, 0)) { return -1; }
+  h2_put32(out + 9, (int64)last_stream_id);
+  h2_put32(out + 13, error_code);
+  h2_copy(out + 17, debug, n);
+  return 17 + n;
+}
+
+// ---- WINDOW_UPDATE (6.9) -------------------------------------------------------
+
+// A zero increment is PROTOCOL_ERROR: a stream error on a stream, a connection
+// error on stream 0 (see h2_is_stream_error). A length other than 4 is a
+// connection FRAME_SIZE_ERROR.
+export fn h2_parse_window_update(h: H2FrameHeader, payload: uint8*, increment: int64*) -> int32 {
+  if (h.length != 4) { return H2_FRAME_SIZE_ERROR; }
+  var v: int64 = h2_get32(payload) & (int64)2147483647;
+  *increment = v;
+  if (v == 0) { return H2_PROTOCOL_ERROR; }
+  return H2_NO_ERROR;
+}
+
+// `stream_id` 0 updates the connection window. `increment` is 1..2^31-1.
+export fn h2_build_window_update(out: uint8*, cap: int64, stream_id: int32, increment: int64) -> int64 {
+  if (increment < 1 || increment > (int64)H2_MAX_WINDOW) { return -1; }
+  if (!h2_begin(out, cap, 4, H2_FRAME_WINDOW_UPDATE, 0, stream_id)) { return -1; }
+  h2_put32(out + 9, increment);
+  return 13;
+}
+
+// ---- CONTINUATION (6.10) -------------------------------------------------------
+
+export struct H2Continuation {
+  block: uint8*;
+  block_len: int64;
+  end_headers: bool;
+}
+
+export fn h2_parse_continuation(h: H2FrameHeader, payload: uint8*, out: H2Continuation*) -> int32 {
+  if (h.stream_id == 0) { return H2_PROTOCOL_ERROR; }
+  out->block = payload;
+  out->block_len = h.length;
+  out->end_headers = (h.flags & H2_FLAG_END_HEADERS) != 0;
+  return H2_NO_ERROR;
+}
+
+export fn h2_build_continuation(out: uint8*, cap: int64, stream_id: int32, block: uint8*, n: int64, end_headers: bool) -> int64 {
+  if (stream_id == 0 || n < 0) { return -1; }
+  var flags: int32 = 0;
+  if (end_headers) { flags = H2_FLAG_END_HEADERS; }
+  if (!h2_begin(out, cap, n, H2_FRAME_CONTINUATION, flags, stream_id)) { return -1; }
+  h2_copy(out + 9, block, n);
+  return 9 + n;
+}
+
+// ---- Flow control (5.2, 6.9) ---------------------------------------------------
+
+// A flow-control window: how many DATA bytes may still be sent (or, on the
+// receiving side, still arrive). It can go negative after a SETTINGS change.
+export struct H2Window {
+  size: int64;
+}
+
+export fn h2_window_init(w: H2Window*, initial: int64) {
+  w->size = initial;
+}
+
+// The bytes that may be sent now (never negative).
+export fn h2_window_available(w: H2Window*) -> int64 {
+  if (w->size < 0) { return 0; }
+  return w->size;
+}
+
+// Adds a WINDOW_UPDATE increment. Past 2^31-1 it is FLOW_CONTROL_ERROR and the
+// window is left as it was. A zero or negative increment is PROTOCOL_ERROR.
+export fn h2_window_credit(w: H2Window*, n: int64) -> int32 {
+  if (n < 1) { return H2_PROTOCOL_ERROR; }
+  if (w->size + n > (int64)H2_MAX_WINDOW) { return H2_FLOW_CONTROL_ERROR; }
+  w->size = w->size + n;
+  return H2_NO_ERROR;
+}
+
+// Takes `n` bytes out of the window, when DATA is sent or arrives. More than
+// the window holds is FLOW_CONTROL_ERROR and nothing is taken.
+export fn h2_window_debit(w: H2Window*, n: int64) -> int32 {
+  if (n < 0) { return H2_INTERNAL_ERROR; }
+  if (n > w->size) { return H2_FLOW_CONTROL_ERROR; }
+  w->size = w->size - n;
+  return H2_NO_ERROR;
+}
+
+// Applies a change of SETTINGS_INITIAL_WINDOW_SIZE: `delta` is the new value
+// minus the old one. The window may go negative; past 2^31-1 it is
+// FLOW_CONTROL_ERROR.
+export fn h2_window_adjust(w: H2Window*, delta: int64) -> int32 {
+  if (w->size + delta > (int64)H2_MAX_WINDOW) { return H2_FLOW_CONTROL_ERROR; }
+  w->size = w->size + delta;
+  return H2_NO_ERROR;
+}
+
+// ---- Incremental frame reader (4.1, 3.4) ---------------------------------------
+
+export const H2_READ_MORE = 0;      // not enough bytes yet; see H2Frame.need
+export const H2_READ_FRAME = 1;     // a whole frame is ready
+export const H2_READ_ERROR = 2;     // a connection error; see H2Frame.error
+export const H2_READ_PREFACE = 3;   // the client preface was read; skip `consumed` bytes
+
+// What h2_reader_next found.
+export struct H2Frame {
+  header: H2FrameHeader;
+  payload: uint8*;      // points into the caller's buffer
+  consumed: int64;      // bytes to drop from the front of the buffer
+  need: int64;          // for H2_READ_MORE: the least the buffer must hold
+  error: int32;         // for H2_READ_ERROR: the H2_* code for GOAWAY
+}
+
+// Reader state. `want_preface` is set for a server, which must see the 24-byte
+// client preface first. `continuation_stream` is the stream whose header block
+// is still open; only its CONTINUATION frames may follow.
+export struct H2Reader {
+  max_frame_size: int64;
+  want_preface: bool;
+  continuation_stream: int32;
+}
+
+export fn h2_reader_init(r: H2Reader*, max_frame_size: int64, expect_preface: bool) {
+  r->max_frame_size = max_frame_size;
+  r->want_preface = expect_preface;
+  r->continuation_stream = 0;
+}
+
+fn h2_reader_fail(out: H2Frame*, code: int32) -> int32 {
+  out->error = code;
+  return H2_READ_ERROR;
+}
+
+// Looks at the front of buf[0..n) and says what is there. Call it again after
+// dropping `consumed` bytes, until it says H2_READ_MORE. Nothing is copied, and
+// a MORE or ERROR answer changes no state, so asking again with more bytes is
+// safe. It checks, as soon as the 9 header bytes are in:
+//   - the payload length against max_frame_size (FRAME_SIZE_ERROR);
+//   - stream 0 for SETTINGS, PING and GOAWAY, and not 0 for DATA, HEADERS,
+//     PRIORITY, RST_STREAM, PUSH_PROMISE and CONTINUATION (PROTOCOL_ERROR);
+//   - that nothing but CONTINUATION on the same stream follows a HEADERS or
+//     PUSH_PROMISE without END_HEADERS, and that no other CONTINUATION appears
+//     (PROTOCOL_ERROR).
+// Unknown frame types pass through for the caller to ignore.
+export fn h2_reader_next(r: H2Reader*, buf: uint8*, n: int64, out: H2Frame*) -> int32 {
+  out->consumed = 0;
+  out->need = 0;
+  out->error = 0;
+  out->payload = buf;
+  if (r->want_preface) {
+    var m: int64 = n;
+    if (m > 24) { m = 24; }
+    for i in 0..m {
+      if ((int32)buf[i] != (int32)H2_PREFACE[i]) { return h2_reader_fail(out, H2_PROTOCOL_ERROR); }
+    }
+    if (n < 24) {
+      out->need = 24;
+      return H2_READ_MORE;
+    }
+    r->want_preface = false;
+    out->consumed = 24;
+    return H2_READ_PREFACE;
+  }
+  if (n < 9) {
+    out->need = 9;
+    return H2_READ_MORE;
+  }
+  var h: H2FrameHeader = h2_frame_header_read(buf);
+  if (h.length > r->max_frame_size) { return h2_reader_fail(out, H2_FRAME_SIZE_ERROR); }
+  if (r->continuation_stream != 0) {
+    if (h.type != H2_FRAME_CONTINUATION || h.stream_id != r->continuation_stream) {
+      return h2_reader_fail(out, H2_PROTOCOL_ERROR);
+    }
+  } else if (h.type == H2_FRAME_CONTINUATION) {
+    return h2_reader_fail(out, H2_PROTOCOL_ERROR);
+  }
+  var needs_stream: bool = h.type == H2_FRAME_DATA || h.type == H2_FRAME_HEADERS || h.type == H2_FRAME_PRIORITY || h.type == H2_FRAME_RST_STREAM || h.type == H2_FRAME_PUSH_PROMISE || h.type == H2_FRAME_CONTINUATION;
+  var is_connection: bool = h.type == H2_FRAME_SETTINGS || h.type == H2_FRAME_PING || h.type == H2_FRAME_GOAWAY;
+  if (needs_stream && h.stream_id == 0) { return h2_reader_fail(out, H2_PROTOCOL_ERROR); }
+  if (is_connection && h.stream_id != 0) { return h2_reader_fail(out, H2_PROTOCOL_ERROR); }
+  if (n < 9 + h.length) {
+    out->need = 9 + h.length;
+    return H2_READ_MORE;
+  }
+  // The whole frame is here: take it, and move the header-block state.
+  if ((h.type == H2_FRAME_HEADERS || h.type == H2_FRAME_PUSH_PROMISE || h.type == H2_FRAME_CONTINUATION)) {
+    if ((h.flags & H2_FLAG_END_HEADERS) != 0) {
+      r->continuation_stream = 0;
+    } else {
+      r->continuation_stream = h.stream_id;
+    }
+  }
+  out->header = h;
+  out->payload = buf + 9;
+  out->consumed = 9 + h.length;
+  return H2_READ_FRAME;
+}
+
+// Checks the client preface at the front of buf[0..n) without a reader: 1 if all
+// 24 bytes are there and right, 0 if the bytes so far are a correct start, -1 if
+// they differ.
+export fn h2_preface_check(buf: uint8*, n: int64) -> int32 {
+  var m: int64 = n;
+  if (m > 24) { m = 24; }
+  for i in 0..m {
+    if ((int32)buf[i] != (int32)H2_PREFACE[i]) { return -1; }
+  }
+  if (n >= 24) { return 1; }
+  return 0;
+}
+
+// ---- gRPC message framing ------------------------------------------------------
+//
+// Each gRPC message in an HTTP/2 DATA stream is a 5-byte prefix, then the
+// message: one byte that is 1 if the message is compressed (with the encoding
+// named in grpc-encoding), and a 32-bit big-endian length. A message may span
+// several DATA frames and one frame may hold several messages, so the reader
+// works on a buffer the caller keeps filling.
+
+export const H2_GRPC_HEADER_LEN = 5;
+export const H2_GRPC_DEFAULT_MAX_MESSAGE = 4194304;   // 4 MiB, the usual default
+
+// Results of h2_grpc_read.
+export const H2_GRPC_READ_MORE = 0;
+export const H2_GRPC_READ_MESSAGE = 1;
+export const H2_GRPC_READ_ERROR = 2;
+
+// grpc-status codes.
+export const H2_GRPC_OK = 0;
+export const H2_GRPC_CANCELLED = 1;
+export const H2_GRPC_UNKNOWN = 2;
+export const H2_GRPC_INVALID_ARGUMENT = 3;
+export const H2_GRPC_DEADLINE_EXCEEDED = 4;
+export const H2_GRPC_NOT_FOUND = 5;
+export const H2_GRPC_ALREADY_EXISTS = 6;
+export const H2_GRPC_PERMISSION_DENIED = 7;
+export const H2_GRPC_RESOURCE_EXHAUSTED = 8;
+export const H2_GRPC_FAILED_PRECONDITION = 9;
+export const H2_GRPC_ABORTED = 10;
+export const H2_GRPC_OUT_OF_RANGE = 11;
+export const H2_GRPC_UNIMPLEMENTED = 12;
+export const H2_GRPC_INTERNAL = 13;
+export const H2_GRPC_UNAVAILABLE = 14;
+export const H2_GRPC_DATA_LOSS = 15;
+export const H2_GRPC_UNAUTHENTICATED = 16;
+
+// Writes the 5-byte prefix for a message of n bytes.
+export fn h2_grpc_write_prefix(out: uint8*, n: int64, compressed: bool) {
+  out[0] = (uint8)0;
+  if (compressed) { out[0] = (uint8)1; }
+  h2_put32(out + 1, n);
+}
+
+// Writes prefix and message: 5 + n bytes. Returns the size, or -1 if it does not
+// fit in cap or n is over 2^32-1.
+export fn h2_grpc_write(out: uint8*, cap: int64, msg: uint8*, n: int64, compressed: bool) -> int64 {
+  if (n < 0 || n > (int64)4294967295 || cap < 5 + n) { return -1; }
+  h2_grpc_write_prefix(out, n, compressed);
+  h2_copy(out + 5, msg, n);
+  return 5 + n;
+}
+
+// One message found by h2_grpc_read.
+export struct H2GrpcMessage {
+  compressed: bool;
+  data: uint8*;      // points into the caller's buffer
+  length: int64;
+  consumed: int64;   // bytes to drop from the front of the buffer: 5 + length
+  need: int64;       // for H2_GRPC_READ_MORE: the least the buffer must hold
+  status: int32;     // for H2_GRPC_READ_ERROR: the grpc-status to answer with
+}
+
+// Looks at the front of buf[0..n). Returns H2_GRPC_READ_MESSAGE with the message,
+// H2_GRPC_READ_MORE if it is not all there (the length is known after 5 bytes,
+// so `need` is exact once they arrive), or H2_GRPC_READ_ERROR: a first byte
+// other than 0 or 1 gives INTERNAL, and a length above `max_message` gives
+// RESOURCE_EXHAUSTED, before any of the body has to arrive.
+export fn h2_grpc_read(buf: uint8*, n: int64, max_message: int64, out: H2GrpcMessage*) -> int32 {
+  out->compressed = false;
+  out->data = buf;
+  out->length = 0;
+  out->consumed = 0;
+  out->need = 0;
+  out->status = 0;
+  if (n < 5) {
+    out->need = 5;
+    return H2_GRPC_READ_MORE;
+  }
+  var flag: int32 = (int32)buf[0];
+  if (flag > 1) {
+    out->status = H2_GRPC_INTERNAL;
+    return H2_GRPC_READ_ERROR;
+  }
+  var len: int64 = h2_get32(buf + 1);
+  if (len > max_message) {
+    out->status = H2_GRPC_RESOURCE_EXHAUSTED;
+    return H2_GRPC_READ_ERROR;
+  }
+  if (n < 5 + len) {
+    out->need = 5 + len;
+    return H2_GRPC_READ_MORE;
+  }
+  out->compressed = flag == 1;
+  out->data = buf + 5;
+  out->length = len;
+  out->consumed = 5 + len;
+  return H2_GRPC_READ_MESSAGE;
+}
+
+// ---- grpc-timeout --------------------------------------------------------------
+//
+// The header value is 1 to 8 digits and one unit: H hours, M minutes, S seconds,
+// m milliseconds, u microseconds, n nanoseconds. Times here are in
+// milliseconds, the unit sockets use.
+
+// Parses a grpc-timeout value into milliseconds, rounded up (so "1u" is 1).
+// Returns -1 if the text is not a valid value.
+export fn h2_grpc_timeout_parse(s: string) -> int64 {
+  var n: int64 = (int64)s.length;
+  if (n < 2 || n > 9) { return -1; }
+  var v: int64 = 0;
+  for i in 0..(n - 1) {
+    var c: int32 = (int32)s[i];
+    if (c < 48 || c > 57) { return -1; }
+    v = v * 10 + (int64)(c - 48);
+  }
+  var unit: int32 = (int32)s[n - 1];
+  switch (unit) {
+    case 72: { return v * 3600000; }
+    case 77: { return v * 60000; }
+    case 83: { return v * 1000; }
+    case 109: { return v; }
+    case 117: { return (v + 999) / 1000; }
+    case 110: { return (v + 999999) / 1000000; }
+    default: { return -1; }
+  }
+}
+
+// Writes milliseconds as a grpc-timeout value into out. It picks the largest of
+// H, M, S that divides evenly, else milliseconds; and if that is over 8 digits,
+// the next unit up, rounded up. Returns the length written, or -1 for a negative
+// value or a buffer that is too small. Nothing is NUL-terminated.
+export fn h2_grpc_timeout_format(ms: int64, out: uint8*, cap: int64) -> int64 {
+  if (ms < 0) { return -1; }
+  var v: int64 = ms;
+  var unit: int32 = 109;
+  if (ms > 0 && ms % 3600000 == 0) {
+    v = ms / 3600000;
+    unit = 72;
+  } else if (ms > 0 && ms % 60000 == 0) {
+    v = ms / 60000;
+    unit = 77;
+  } else if (ms > 0 && ms % 1000 == 0) {
+    v = ms / 1000;
+    unit = 83;
+  }
+  // Too many digits: move to a coarser unit, rounding up.
+  if (v > 99999999 && unit == 109) {
+    v = (ms + 999) / 1000;
+    unit = 83;
+  }
+  if (v > 99999999 && unit == 83) {
+    v = (v + 59) / 60;
+    unit = 77;
+  }
+  if (v > 99999999 && unit == 77) {
+    v = (v + 59) / 60;
+    unit = 72;
+  }
+  if (v > 99999999) { return -1; }
+  var digits: uint8[10];
+  var nd: int32 = 0;
+  var rest: int64 = v;
+  if (rest == 0) {
+    digits[0] = (uint8)48;
+    nd = 1;
+  }
+  while (rest > 0) {
+    digits[nd] = (uint8)(48 + (int32)(rest % 10));
+    rest = rest / 10;
+    nd = nd + 1;
+  }
+  if (cap < (int64)nd + 1) { return -1; }
+  for i in 0..nd {
+    out[i] = digits[nd - 1 - i];
+  }
+  out[nd] = (uint8)unit;
+  return (int64)nd + 1;
+}
+
+// ---- grpc-status ---------------------------------------------------------------
+
+export fn h2_grpc_status_name(code: int32) -> string {
+  switch (code) {
+    case 0: { return "OK"; }
+    case 1: { return "CANCELLED"; }
+    case 2: { return "UNKNOWN"; }
+    case 3: { return "INVALID_ARGUMENT"; }
+    case 4: { return "DEADLINE_EXCEEDED"; }
+    case 5: { return "NOT_FOUND"; }
+    case 6: { return "ALREADY_EXISTS"; }
+    case 7: { return "PERMISSION_DENIED"; }
+    case 8: { return "RESOURCE_EXHAUSTED"; }
+    case 9: { return "FAILED_PRECONDITION"; }
+    case 10: { return "ABORTED"; }
+    case 11: { return "OUT_OF_RANGE"; }
+    case 12: { return "UNIMPLEMENTED"; }
+    case 13: { return "INTERNAL"; }
+    case 14: { return "UNAVAILABLE"; }
+    case 15: { return "DATA_LOSS"; }
+    case 16: { return "UNAUTHENTICATED"; }
+    default: { return "UNKNOWN"; }
+  }
+}
+
+// Parses a grpc-status header value: decimal digits, 0..16. Returns -1 if it is
+// not one; the gRPC spec says to treat that as UNKNOWN.
+export fn h2_grpc_status_parse(s: string) -> int32 {
+  var n: int64 = (int64)s.length;
+  if (n < 1 || n > 2) { return -1; }
+  var v: int32 = 0;
+  for i in 0..n {
+    var c: int32 = (int32)s[i];
+    if (c < 48 || c > 57) { return -1; }
+    v = v * 10 + (c - 48);
+  }
+  if (v > 16) { return -1; }
+  return v;
+}
+
+// The grpc-status to use for a response that has an HTTP status but no
+// grpc-status, as the gRPC HTTP/2 spec maps it.
+export fn h2_grpc_status_from_http(http_status: int32) -> int32 {
+  switch (http_status) {
+    case 400: { return H2_GRPC_INTERNAL; }
+    case 401: { return H2_GRPC_UNAUTHENTICATED; }
+    case 403: { return H2_GRPC_PERMISSION_DENIED; }
+    case 404: { return H2_GRPC_UNIMPLEMENTED; }
+    case 429: { return H2_GRPC_UNAVAILABLE; }
+    case 502: { return H2_GRPC_UNAVAILABLE; }
+    case 503: { return H2_GRPC_UNAVAILABLE; }
+    case 504: { return H2_GRPC_UNAVAILABLE; }
+    default: { return H2_GRPC_UNKNOWN; }
+  }
+}

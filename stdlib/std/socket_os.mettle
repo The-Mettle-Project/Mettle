@@ -1,0 +1,298 @@
+// Windows sockets for std/socket, through Winsock. Every call returns a count
+// or socket, or a negative Winsock error code, as the POSIX halves do.
+
+import "std/netaddr";
+
+export const NET_EINTR = 10004;
+export const NET_EBADF = 10009;
+export const NET_EAGAIN = 10035;
+export const NET_EINVAL = 10022;
+export const NET_EPIPE = 10058;
+export const NET_EADDRINUSE = 10048;
+export const NET_ENETUNREACH = 10051;
+export const NET_ECONNRESET = 10054;
+export const NET_ENOTCONN = 10057;
+export const NET_ETIMEDOUT = 10060;
+export const NET_ECONNREFUSED = 10061;
+export const NET_EHOSTUNREACH = 10065;
+// A non-blocking connect reports WSAEWOULDBLOCK, the same code as NET_EAGAIN.
+export const NET_EINPROGRESS = 10035;
+
+extern fn sock_w_startup(version: int32, data: uint8*) -> int32 = "WSAStartup";
+extern fn sock_w_error() -> int32 = "WSAGetLastError";
+extern fn sock_w_socket(af: int32, kind: int32, proto: int32) -> int64 = "socket";
+extern fn sock_w_close(s: int64) -> int32 = "closesocket";
+extern fn sock_w_bind(s: int64, addr: uint8*, len: int32) -> int32 = "bind";
+extern fn sock_w_listen(s: int64, backlog: int32) -> int32 = "listen";
+extern fn sock_w_accept(s: int64, addr: uint8*, len: int32*) -> int64 = "accept";
+extern fn sock_w_connect(s: int64, addr: uint8*, len: int32) -> int32 = "connect";
+extern fn sock_w_send(s: int64, buf: uint8*, n: int32, flags: int32) -> int32 = "send";
+extern fn sock_w_recv(s: int64, buf: uint8*, n: int32, flags: int32) -> int32 = "recv";
+extern fn sock_w_sendto(s: int64, buf: uint8*, n: int32, flags: int32, addr: uint8*, len: int32) -> int32 = "sendto";
+extern fn sock_w_recvfrom(s: int64, buf: uint8*, n: int32, flags: int32, addr: uint8*, len: int32*) -> int32 = "recvfrom";
+extern fn sock_w_shutdown(s: int64, how: int32) -> int32 = "shutdown";
+extern fn sock_w_setsockopt(s: int64, level: int32, name: int32, v: uint8*, len: int32) -> int32 = "setsockopt";
+extern fn sock_w_getsockopt(s: int64, level: int32, name: int32, v: uint8*, len: int32*) -> int32 = "getsockopt";
+extern fn sock_w_getsockname(s: int64, addr: uint8*, len: int32*) -> int32 = "getsockname";
+extern fn sock_w_getpeername(s: int64, addr: uint8*, len: int32*) -> int32 = "getpeername";
+extern fn sock_w_ioctl(s: int64, cmd: int32, arg: uint32*) -> int32 = "ioctlsocket";
+extern fn sock_w_poll(fds: uint8*, n: uint32, timeout: int32) -> int32 = "WSAPoll";
+
+const AF_INET = 2;
+const AF_INET6 = 23;
+const SOL_SOCKET = 0xFFFF;
+
+var g_sock_w_ready: int32 = 0;
+
+fn sock_os_init() {
+  if (g_sock_w_ready != 0) { return; }
+  var data: uint8[408];
+  if (sock_w_startup(0x0202, &data[0]) == 0) { g_sock_w_ready = 1; }
+}
+
+// Turns a Winsock result into the count or -code.
+fn sock_os_ret(r: int64) -> int64 {
+  if (r < 0) { return -(int64)sock_w_error(); }
+  return r;
+}
+
+fn sock_os_clamp(n: int64) -> int32 {
+  if (n > (int64)0x7FFFFFFF) { return 0x7FFFFFFF; }
+  return (int32)n;
+}
+
+// Writes a NetAddr as a sockaddr_in or sockaddr_in6. Returns its length.
+fn sock_os_to_raw(a: NetAddr*, raw: uint8*) -> int64 {
+  for i in 0..28 { raw[i] = (uint8)0; }
+  raw[2] = (uint8)((a->port >> 8) & 255);
+  raw[3] = (uint8)(a->port & 255);
+  if (a->family == NET_IPV6) {
+    raw[0] = (uint8)AF_INET6;
+    for i in 0..16 { raw[8 + i] = a->ip[i]; }
+    *(uint32*)(raw + 24) = a->scope_id;
+    return 28;
+  }
+  raw[0] = (uint8)AF_INET;
+  for i in 0..4 { raw[4 + i] = a->ip[i]; }
+  return 16;
+}
+
+fn sock_os_from_raw(raw: uint8*, a: NetAddr*) {
+  var empty: NetAddr;
+  *a = empty;
+  a->port = ((int32)raw[2] << 8) | (int32)raw[3];
+  if ((int32)raw[0] == AF_INET6) {
+    a->family = NET_IPV6;
+    for i in 0..16 { a->ip[i] = raw[8 + i]; }
+    a->scope_id = *(uint32*)(raw + 24);
+    return;
+  }
+  a->family = NET_IPV4;
+  for i in 0..4 { a->ip[i] = raw[4 + i]; }
+}
+
+fn sock_os_setopt(fd: int64, level: int32, name: int32, value: int32) -> int64 {
+  var v: int32 = value;
+  return sock_os_ret((int64)sock_w_setsockopt(fd, level, name, (uint8*)&v, 4));
+}
+
+// A new socket. type is NET_TCP or NET_UDP; family is NET_IPV4 or NET_IPV6.
+export fn sock_open(family: int32, type: int32) -> int64 {
+  sock_os_init();
+  var af: int32 = AF_INET;
+  if (family == NET_IPV6) { af = AF_INET6; }
+  var kind: int32 = 1;
+  var proto: int32 = 6;
+  if (type == 2) {
+    kind = 2;
+    proto = 17;
+  }
+  return sock_os_ret(sock_w_socket(af, kind, proto));
+}
+
+export fn sock_close(fd: int64) -> int64 { return sock_os_ret((int64)sock_w_close(fd)); }
+
+export fn sock_bind(fd: int64, a: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var n: int64 = sock_os_to_raw(a, &raw[0]);
+  return sock_os_ret((int64)sock_w_bind(fd, &raw[0], (int32)n));
+}
+
+export fn sock_listen(fd: int64, backlog: int32) -> int64 {
+  return sock_os_ret((int64)sock_w_listen(fd, backlog));
+}
+
+// Accepts one connection. peer may be null.
+export fn sock_accept(fd: int64, peer: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: int32 = 28;
+  var r: int64 = sock_os_ret(sock_w_accept(fd, &raw[0], &len));
+  if (r >= 0 && peer != 0) { sock_os_from_raw(&raw[0], peer); }
+  return r;
+}
+
+// Like sock_accept, but the new socket is non-blocking.
+export fn sock_accept_nonblocking(fd: int64, peer: NetAddr*) -> int64 {
+  var r: int64 = sock_accept(fd, peer);
+  if (r >= 0) { sock_set_nonblocking(r, true); }
+  return r;
+}
+
+// -NET_EINPROGRESS on a non-blocking socket means the connect is under way;
+// wait for NET_POLL_OUT, then read sock_take_error.
+export fn sock_connect(fd: int64, a: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var n: int64 = sock_os_to_raw(a, &raw[0]);
+  return sock_os_ret((int64)sock_w_connect(fd, &raw[0], (int32)n));
+}
+
+export fn sock_send(fd: int64, buf: uint8*, n: int64) -> int64 {
+  return sock_os_ret((int64)sock_w_send(fd, buf, sock_os_clamp(n), 0));
+}
+
+// 0 means the peer closed its side.
+export fn sock_recv(fd: int64, buf: uint8*, n: int64) -> int64 {
+  return sock_os_ret((int64)sock_w_recv(fd, buf, sock_os_clamp(n), 0));
+}
+
+export fn sock_sendto(fd: int64, buf: uint8*, n: int64, to: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: int64 = sock_os_to_raw(to, &raw[0]);
+  return sock_os_ret((int64)sock_w_sendto(fd, buf, sock_os_clamp(n), 0, &raw[0], (int32)len));
+}
+
+// from may be null.
+export fn sock_recvfrom(fd: int64, buf: uint8*, n: int64, from: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: int32 = 28;
+  var r: int64 = sock_os_ret((int64)sock_w_recvfrom(fd, buf, sock_os_clamp(n), 0, &raw[0], &len));
+  if (r >= 0 && from != 0) { sock_os_from_raw(&raw[0], from); }
+  return r;
+}
+
+export fn sock_shutdown(fd: int64, how: int32) -> int64 {
+  return sock_os_ret((int64)sock_w_shutdown(fd, how));
+}
+
+// opt is one of the NET_OPT_* constants; value is 1 to turn it on, 0 off.
+// Windows has no SO_REUSEPORT; asking for it fails with -NET_EINVAL.
+export fn sock_set_option(fd: int64, opt: int32, value: int32) -> int64 {
+  switch (opt) {
+    case 1: { return sock_os_setopt(fd, SOL_SOCKET, 4, value); }      // SO_REUSEADDR
+    case 3: { return sock_os_setopt(fd, 6, 1, value); }               // TCP_NODELAY
+    case 4: { return sock_os_setopt(fd, SOL_SOCKET, 8, value); }      // SO_KEEPALIVE
+    case 5: { return sock_os_setopt(fd, 41, 27, value); }             // IPV6_V6ONLY
+    case 6: { return sock_os_setopt(fd, SOL_SOCKET, 0x20, value); }   // SO_BROADCAST
+    default: { }
+  }
+  return -NET_EINVAL;
+}
+
+export fn sock_set_nonblocking(fd: int64, on: bool) -> int64 {
+  var v: uint32 = 0;
+  if (on) { v = 1; }
+  return sock_os_ret((int64)sock_w_ioctl(fd, (int32)0x8004667E, &v));   // FIONBIO
+}
+
+// Blocking reads and writes give up after this many milliseconds with
+// -NET_ETIMEDOUT. 0 waits forever; a negative value leaves that side alone.
+export fn sock_set_timeout(fd: int64, recv_ms: int64, send_ms: int64) -> int64 {
+  if (recv_ms >= 0) {
+    var r: int64 = sock_os_setopt(fd, SOL_SOCKET, 0x1006, (int32)recv_ms);   // SO_RCVTIMEO
+    if (r < 0) { return r; }
+  }
+  if (send_ms >= 0) {
+    return sock_os_setopt(fd, SOL_SOCKET, 0x1005, (int32)send_ms);           // SO_SNDTIMEO
+  }
+  return 0;
+}
+
+export fn sock_local_addr(fd: int64, out: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: int32 = 28;
+  var r: int64 = sock_os_ret((int64)sock_w_getsockname(fd, &raw[0], &len));
+  if (r >= 0) { sock_os_from_raw(&raw[0], out); }
+  return r;
+}
+
+export fn sock_peer_addr(fd: int64, out: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: int32 = 28;
+  var r: int64 = sock_os_ret((int64)sock_w_getpeername(fd, &raw[0], &len));
+  if (r >= 0) { sock_os_from_raw(&raw[0], out); }
+  return r;
+}
+
+// The socket's pending error as -code, or 0. Reading it clears it.
+export fn sock_take_error(fd: int64) -> int64 {
+  var v: int32 = 0;
+  var len: int32 = 4;
+  var r: int64 = sock_os_ret((int64)sock_w_getsockopt(fd, SOL_SOCKET, 0x1007, (uint8*)&v, &len));
+  if (r < 0) { return r; }
+  return -(int64)v;
+}
+
+// Waits until one of the sockets is ready or timeout_ms passes (-1 waits
+// forever). Returns how many have revents set, 0 on timeout. WSAPoll's bits
+// differ from POSIX, so they are mapped both ways.
+export fn sock_poll(fds: NetPollFd*, n: int32, timeout_ms: int32) -> int64 {
+  if (n > 64) { return -NET_EINVAL; }
+  // WSAPOLLFD: 8-byte socket, 2-byte events, 2-byte revents, 4 of padding.
+  var raw: int64[128];
+  for i in 0..n {
+    var ev: int32 = 0;
+    if ((fds[i].events & NET_POLL_IN) != 0) { ev = ev | 0x100; }    // POLLRDNORM
+    if ((fds[i].events & NET_POLL_OUT) != 0) { ev = ev | 0x10; }    // POLLWRNORM
+    raw[i * 2] = fds[i].fd;
+    raw[i * 2 + 1] = (int64)ev;
+  }
+  var r: int64 = sock_os_ret((int64)sock_w_poll((uint8*)&raw[0], (uint32)n, timeout_ms));
+  for i in 0..n {
+    var got: int32 = (int32)((raw[i * 2 + 1] >> 16) & 0xFFFF);
+    var out: int32 = 0;
+    if (r >= 0) {
+      if ((got & 0x300) != 0) { out = out | NET_POLL_IN; }
+      if ((got & 0x10) != 0) { out = out | NET_POLL_OUT; }
+      if ((got & 1) != 0) { out = out | NET_POLL_ERR; }
+      if ((got & 2) != 0) { out = out | NET_POLL_HUP; }
+      if ((got & 4) != 0) { out = out | NET_POLL_NVAL; }
+    }
+    fds[i].revents = out;
+  }
+  return r;
+}
+
+extern fn sock_w_ticks() -> uint64 = "GetTickCount64";
+
+// Milliseconds on a monotonic clock, for timeouts. Only differences mean
+// anything.
+export fn net_now_ms() -> int64 {
+  return (int64)sock_w_ticks();
+}
+
+extern fn sock_w_getaddrinfo(node: cstring, service: cstring, hints: uint8*, res: uint8**) -> int32 = "getaddrinfo";
+extern fn sock_w_freeaddrinfo(res: uint8*) = "freeaddrinfo";
+
+// Looks a name up through the system resolver. Windows keeps its DNS
+// settings in the registry, so std/dns asks getaddrinfo here. host must
+// end in a NUL. Returns how many addresses were written, or -1 on failure.
+export fn sock_os_system_resolve(host: cstring, out: NetAddr*, max: int32) -> int32 {
+  sock_os_init();
+  var hints: uint8[48];
+  for i in 0..48 { hints[i] = (uint8)0; }
+  hints[8] = (uint8)1;   // ai_socktype = SOCK_STREAM, one entry per address
+  var res: uint8* = (uint8*)0;
+  if (sock_w_getaddrinfo(host, (cstring)0, &hints[0], &res) != 0) { return -1; }
+  var n: int32 = 0;
+  var cur: uint8* = res;
+  while (cur != 0 && n < max) {
+    var addr: uint8* = *(uint8**)(cur + 32);
+    if (addr != 0) {
+      sock_os_from_raw(addr, &out[n]);
+      n = n + 1;
+    }
+    cur = *(uint8**)(cur + 40);
+  }
+  sock_w_freeaddrinfo(res);
+  return n;
+}
