@@ -603,6 +603,64 @@ Three C entry points: `exit(code: int32)`, `rand() -> int32`, and
 `bench_time_us() -> int64` reads a microsecond clock. Both platforms, with a
 `.linux` half.
 
+## std/time
+
+Clocks, durations and dates. Linux, macOS and Windows; the clock calls live in
+`std/time_os`, which `std/time` imports.
+
+A duration is an `int64` count of nanoseconds. Build one from the units
+`TIME_NANOSECOND`, `TIME_MICROSECOND`, `TIME_MILLISECOND`, `TIME_SECOND`,
+`TIME_MINUTE`, `TIME_HOUR` and `TIME_DAY`: `(int64)5 * TIME_SECOND`.
+
+| Function | Effect |
+|----------|--------|
+| `time_unix_ns() -> int64` | Wall clock, nanoseconds since 1970-01-01 UTC |
+| `time_unix()`, `time_unix_ms()`, `time_unix_us()` | The same in seconds, ms and µs |
+| `time_mono_ns() -> int64` | Monotonic clock; only differences mean anything |
+| `time_mono_us()`, `time_mono_ms()` | The same in µs and ms |
+| `time_since_ns(start: int64) -> int64` | Nanoseconds since a `time_mono_ns()` reading |
+| `time_sleep_ns(ns: int64)` | Sleep at least `ns`; Windows rounds up to whole ms |
+| `time_sleep_us(us: int64)`, `time_sleep_ms(ms: int64)` | The same in µs and ms |
+
+Dates use the proleptic Gregorian calendar. `DateTime` holds `year`, `month`
+(1-12), `day`, `hour`, `minute`, `second`, `nanos`, `weekday` (0 is Sunday),
+`yearday` (1-366) and `offset_min`, the zone's offset from UTC in minutes. The
+other fields are local to that offset.
+
+| Function | Effect |
+|----------|--------|
+| `time_utc(unix_ns: int64) -> DateTime` | Break a time into UTC fields |
+| `time_at_offset(unix_ns: int64, offset_min: int32) -> DateTime` | The same at a fixed offset |
+| `time_now_utc() -> DateTime` | The current UTC date and time |
+| `time_date(year, month, day, hour, minute, second) -> DateTime` | Build a UTC `DateTime`; out-of-range parts roll over |
+| `time_to_unix(dt) -> int64`, `time_to_unix_ns(dt) -> int64` | Back to unix seconds or nanoseconds |
+| `time_days_from_civil(year: int64, month: int32, day: int32) -> int64` | Days since 1970-01-01 |
+| `time_weekday_of_days(days: int64) -> int32` | Weekday of a day count |
+| `time_is_leap_year(year: int64) -> bool` | Gregorian leap year |
+| `time_days_in_month(year: int64, month: int32) -> int32` | 28 to 31, or 0 for a bad month |
+| `time_floor_div(a, b)`, `time_floor_mod(a, b)` | Division that rounds down, for times before 1970 |
+
+The formatters write into a caller buffer, add a nul, and return the length,
+or -1 if the buffer is too small or the year is outside 0-9999.
+`TIME_FORMAT_MAX` (48) bytes is always enough.
+
+| Function | Output |
+|----------|--------|
+| `time_format_iso8601(dt, frac_digits: int32, buf: uint8*, cap: int64) -> int64` | `2026-11-05T09:30:15.123Z`, or `+01:00` for a non-zero offset |
+| `time_format_date(dt, buf, cap) -> int64` | `2026-11-05` |
+| `time_format_http(unix_ns, buf, cap) -> int64` | `Thu, 05 Nov 2026 09:30:15 GMT` |
+| `time_format_duration(ns, buf, cap) -> int64` | `1h2m3.5s`, `1.5ms`, `250us`, `0s` |
+
+`time_append_iso8601(b, dt, frac_digits)`, `time_append_http(b, unix_ns)` and
+`time_append_duration(b, ns)` append the same text to a `StrBuf*` and return 1,
+or 0 on failure.
+
+`time_parse_iso8601(s: string) -> Result<DateTime, string>` reads a date
+(`2026-11-05`) or a date-time with optional seconds, fraction and zone
+(`Z`, `+01:00`, `+0100`, `+01`). A space may stand in for the `T`, and no zone
+means UTC. `time_parse_http(s: string) -> Result<int64, string>` reads an HTTP
+date and returns unix nanoseconds.
+
 ## std/gpu
 
 Device memory, streams, and launches for the [GPU targets](gpu.md).

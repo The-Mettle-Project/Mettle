@@ -1,0 +1,119 @@
+// std/time: clocks, calendar math, formatting and parsing.
+import "std/time";
+
+fn same(buf: uint8*, n: int64, want: string) -> bool {
+  if (n != (int64)want.length) { return false; }
+  for i in 0..n {
+    if ((int32)buf[i] != (int32)want[i]) { return false; }
+  }
+  return true;
+}
+
+fn check_iso(unix_ns: int64, offset: int32, digits: int32, want: string) -> bool {
+  var buf: uint8[48];
+  var dt: DateTime = time_at_offset(unix_ns, offset);
+  return same(&buf[0], time_format_iso8601(dt, digits, &buf[0], (int64)48), want);
+}
+
+fn check_dur(ns: int64, want: string) -> bool {
+  var buf: uint8[48];
+  return same(&buf[0], time_format_duration(ns, &buf[0], (int64)48), want);
+}
+
+fn parses_to(s: string, want_ns: int64) -> bool {
+  match (time_parse_iso8601(s)) {
+    case Ok(dt): { return time_to_unix_ns(dt) == want_ns; }
+    case Err(e): { return false; }
+  }
+}
+
+fn rejects(s: string) -> bool {
+  match (time_parse_iso8601(s)) {
+    case Ok(dt): { return false; }
+    case Err(e): { return true; }
+  }
+}
+
+fn main() -> int32 {
+  // Calendar math against known dates.
+  if (time_days_from_civil((int64)1970, 1, 1) != (int64)0) { return 1; }
+  if (time_days_from_civil((int64)2000, 3, 1) != (int64)11017) { return 2; }
+  if (time_days_from_civil((int64)1969, 12, 31) != (int64)-1) { return 3; }
+  if (!time_is_leap_year((int64)2000) || time_is_leap_year((int64)1900) || !time_is_leap_year((int64)2024)) { return 4; }
+  if (time_days_in_month((int64)2024, 2) != 29 || time_days_in_month((int64)2023, 2) != 28 || time_days_in_month((int64)2023, 4) != 30) { return 5; }
+
+  // 2026-11-05T09:30:15.123456789Z is a Thursday, day 309 of the year.
+  var t: int64 = (int64)1793871015 * TIME_SECOND + (int64)123456789;
+  var dt: DateTime = time_utc(t);
+  if (dt.year != 2026 || dt.month != 11 || dt.day != 5) { return 6; }
+  if (dt.hour != 9 || dt.minute != 30 || dt.second != 15 || dt.nanos != 123456789) { return 7; }
+  if (dt.weekday != 4 || dt.yearday != 309) { return 8; }
+  if (time_to_unix_ns(dt) != t) { return 9; }
+
+  // Before 1970 the floor division must still land on the right day.
+  var old: DateTime = time_utc((int64)-1);
+  if (old.year != 1969 || old.month != 12 || old.day != 31 || old.hour != 23 || old.second != 59 || old.nanos != 999999999) { return 10; }
+
+  // Days 274 years either side of 1970 round-trip (int64 nanoseconds reach about 292 years).
+  var d: int64 = (int64)-100000;
+  while (d < (int64)100000) {
+    var x: DateTime = time_utc(d * TIME_DAY);
+    if (time_days_from_civil((int64)x.year, x.month, x.day) != d) { return 11; }
+    d = d + (int64)13;
+  }
+
+  // Formatting.
+  if (!check_iso(t, 0, 0, "2026-11-05T09:30:15Z")) { return 20; }
+  if (!check_iso(t, 0, 3, "2026-11-05T09:30:15.123Z")) { return 21; }
+  if (!check_iso(t, 0, 9, "2026-11-05T09:30:15.123456789Z")) { return 22; }
+  if (!check_iso(t, 60, 0, "2026-11-05T10:30:15+01:00")) { return 23; }
+  if (!check_iso(t, -330, 0, "2026-11-05T04:00:15-05:30")) { return 24; }
+  var hb: uint8[48];
+  if (!same(&hb[0], time_format_http(t, &hb[0], (int64)48), "Thu, 05 Nov 2026 09:30:15 GMT")) { return 25; }
+  var db: uint8[48];
+  if (!same(&db[0], time_format_date(dt, &db[0], (int64)48), "2026-11-05")) { return 26; }
+  var small: uint8[8];
+  if (time_format_iso8601(dt, 0, &small[0], (int64)8) != (int64)-1) { return 27; }
+  if (!check_dur((int64)0, "0s")) { return 30; }
+  if (!check_dur((int64)999, "999ns")) { return 31; }
+  if (!check_dur((int64)1500, "1.5us")) { return 32; }
+  if (!check_dur((int64)1500000, "1.5ms")) { return 33; }
+  if (!check_dur((int64)3723 * TIME_SECOND + (int64)500000000, "1h2m3.5s")) { return 34; }
+  if (!check_dur((int64)2 * TIME_MINUTE, "2m0s")) { return 35; }
+  if (!check_dur((int64)-90 * TIME_SECOND, "-1m30s")) { return 36; }
+
+  // Parsing.
+  var base: int64 = (int64)1793871015 * TIME_SECOND;
+  if (!parses_to("2026-11-05T09:30:15Z", base)) { return 40; }
+  if (!parses_to("2026-11-05T09:30:15", base)) { return 41; }
+  if (!parses_to("2026-11-05 09:30:15.123456789Z", t)) { return 42; }
+  if (!parses_to("2026-11-05T10:30:15+01:00", base)) { return 43; }
+  if (!parses_to("2026-11-05T04:00:15-0530", base)) { return 44; }
+  if (!parses_to("2026-11-05", (int64)1793836800 * TIME_SECOND)) { return 45; }
+  if (!parses_to("2026-11-05T09:30Z", base - (int64)15 * TIME_SECOND)) { return 46; }
+  if (!rejects("2026-02-30")) { return 47; }
+  if (!rejects("2026-11-05T25:00:00Z")) { return 48; }
+  if (!rejects("2026-11-05T09:30:15Zjunk")) { return 49; }
+  if (!rejects("26-11-05")) { return 50; }
+  match (time_parse_http("Thu, 05 Nov 2026 09:30:15 GMT")) {
+    case Ok(ns): { if (ns != base) { return 51; } }
+    case Err(e): { return 52; }
+  }
+  match (time_parse_http("Thu, 05 Foo 2026 09:30:15 GMT")) {
+    case Ok(ns): { return 53; }
+    case Err(e): { }
+  }
+  var rolled: DateTime = time_date(2026, 13, 1, 0, 0, 0);
+  if (rolled.year != 2027 || rolled.month != 1 || rolled.day != 1) { return 54; }
+
+  // Clocks: the wall clock is after 2020 and the monotonic clock moves
+  // forward across a sleep.
+  if (time_unix() < (int64)1577836800) { return 60; }
+  if (time_unix_ms() / (int64)1000 < (int64)1577836800) { return 61; }
+  var start: int64 = time_mono_ns();
+  time_sleep_ms((int64)20);
+  var spent: int64 = time_since_ns(start);
+  if (spent < (int64)19 * TIME_MILLISECOND) { return 62; }
+  if (spent > (int64)5 * TIME_SECOND) { return 63; }
+  return 0;
+}
