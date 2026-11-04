@@ -1,0 +1,60 @@
+// URL-safe base64 in std/encoding: the RFC 4648 vectors, the two URL-safe
+// characters, padded and unpadded input, and refused input.
+import "std/encoding";
+import "std/conv";
+
+fn enc_is(src: string, want: string) -> bool {
+  var buf: uint8[64];
+  match (base64url_encode(src, (cstring)&buf[0], (int64)64)) {
+    case Ok(s): { return s == want; }
+    case Err(e): { return false; }
+  }
+}
+
+fn dec_is(src: string, want: string) -> bool {
+  var buf: uint8[64];
+  match (base64url_decode(src, (cstring)&buf[0], (int64)64)) {
+    case Ok(s): { return s == want; }
+    case Err(e): { return false; }
+  }
+}
+
+fn refused(src: string) -> bool {
+  var buf: uint8[64];
+  match (base64url_decode(src, (cstring)&buf[0], (int64)64)) {
+    case Ok(s): { return false; }
+    case Err(e): { return true; }
+  }
+}
+
+fn main() -> int32 {
+  if (!enc_is("", "") || !enc_is("f", "Zg") || !enc_is("fo", "Zm8") || !enc_is("foo", "Zm9v")) { return 1; }
+  if (!enc_is("foob", "Zm9vYg") || !enc_is("fooba", "Zm9vYmE") || !enc_is("foobar", "Zm9vYmFy")) { return 2; }
+  if (!dec_is("Zg", "f") || !dec_is("Zg==", "f") || !dec_is("Zm8", "fo") || !dec_is("Zm8=", "fo")) { return 3; }
+  if (!dec_is("Zm9vYmFy", "foobar") || !dec_is("", "")) { return 4; }
+  // 0xFB 0xFF is "+/8=" in standard base64 and "-_8" here.
+  var raw: uint8[4];
+  raw[0] = (uint8)0xFB;
+  raw[1] = (uint8)0xFF;
+  var two: string = str_from_bytes((cstring)&raw[0], (int64)2);
+  if (!enc_is(two, "-_8") || !dec_is("-_8", two)) { return 5; }
+  if (!refused("+/8") || !refused("Zg=") || !refused("Z") || !refused("Zh") || !refused("Zm9=v") || !refused("Zg===")) { return 6; }
+  // Every length from 0 to 40 round-trips.
+  var src: uint8[40];
+  for i in 0..40 { src[i] = (uint8)(i * 37 + 11); }
+  for n in 0..41 {
+    var text: uint8[64];
+    var back: uint8[64];
+    var s: string = str_from_bytes((cstring)&src[0], (int64)n);
+    var e: string;
+    match (base64url_encode(s, (cstring)&text[0], (int64)64)) {
+      case Ok(v): { e = v; }
+      case Err(why): { return 7; }
+    }
+    match (base64url_decode(e, (cstring)&back[0], (int64)64)) {
+      case Ok(v): { if (v != s) { return 8; } }
+      case Err(why): { return 9; }
+    }
+  }
+  return 0;
+}

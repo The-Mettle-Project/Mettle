@@ -1853,6 +1853,10 @@ $cases = @(
   @{ Name = "import_guard_arch"; Path = "tests/test_import_guard_arch.mettle"; ShouldSucceed = $true },
   @{ Name = "std_path"; Path = "tests/test_std_path_interp.mettle"; ShouldSucceed = $true },
   @{ Name = "std_path_release"; Path = "tests/test_std_path_interp.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_base64url"; Path = "tests/test_std_base64url.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_base64url_release"; Path = "tests/test_std_base64url.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  # Needs a GPU and the CUDA driver to run; CI checks that it compiles.
+  @{ Name = "std_gpu_query_obj"; Path = "tests/test_std_gpu_query.mettle"; ShouldSucceed = $true; Args = @("--emit-obj") },
   @{ Name = "std_path_interp"; Path = "tests/test_std_path_interp.mettle"; ShouldSucceed = $true
      Args = @("test")
      SkipBinaryCheck = $true },
@@ -3276,7 +3280,10 @@ if ($IsLinux) {
     @{ Name = "std_sys_release"; Path = "tests/test_std_sys.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_term"; Path = "tests/test_std_term.mettle"; ShouldSucceed = $true },
     @{ Name = "std_fs"; Path = "tests/test_std_fs.mettle"; ShouldSucceed = $true },
-    @{ Name = "std_fs_release"; Path = "tests/test_std_fs.mettle"; ShouldSucceed = $true; Args = @("--release") }
+    @{ Name = "std_fs_release"; Path = "tests/test_std_fs.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_dl"; Path = "tests/test_std_dl.mettle"; ShouldSucceed = $true; Args = @("-l:libc.so.6") },
+    @{ Name = "std_dl_release"; Path = "tests/test_std_dl.mettle"; ShouldSucceed = $true; Args = @("--release", "-l:libc.so.6") },
+    @{ Name = "thread_id_cached"; Path = "tests/test_thread_id_cached.mettle"; ShouldSucceed = $true }
   )
 }
 

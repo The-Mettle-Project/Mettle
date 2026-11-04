@@ -3974,9 +3974,19 @@ int mettle_thread_close(mt_i64 handle) {
   return 1;
 }
 
+/* The kernel thread id, read once per thread and kept in thread-local
+   storage: a gettid system call costs about 40 times a compare-and-swap,
+   and recursive locks ask for the id on every lock. A child made by a raw
+   fork keeps its parent thread's cached id, which is fine for std/process,
+   whose child only calls execve. */
+static __thread mt_u32 mt_cached_thread_id;
+
 mt_u32 mettle_thread_current_id(void) {
-  return (mt_u32)mt_sys_result(
-      mt_syscall6(MT_SYS_GETTID, 0, 0, 0, 0, 0, 0));
+  if (mt_cached_thread_id == 0) {
+    mt_cached_thread_id = (mt_u32)mt_sys_result(
+        mt_syscall6(MT_SYS_GETTID, 0, 0, 0, 0, 0, 0));
+  }
+  return mt_cached_thread_id;
 }
 
 void mettle_thread_sleep_ms(mt_u32 milliseconds) {

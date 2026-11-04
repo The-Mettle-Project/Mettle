@@ -153,6 +153,13 @@ nonzero unused trailing bits. Empty input succeeds with a null destination and
 zero capacity. For nonempty output, the destination must be large enough and
 must not overlap the source. `Err` carries a static reason string.
 
+**URL-safe Base64.** `base64url_encoded_len`, `base64url_decoded_len`,
+`base64url_encode` and `base64url_decode` take the same arguments as the
+Base64 functions and use the RFC 4648 section 5 alphabet (`-` and `_` in place
+of `+` and `/`). Encoding writes no `=` padding, as JWTs and URLs expect.
+Decoding accepts text with or without correct padding, and is as strict as
+`base64_decode` otherwise.
+
 ## std/math
 
 Floating-point maths in Mettle source, no libm on the link line. Both
@@ -619,6 +626,31 @@ input, 1 output and 2 error.
 
 When standard input is a pipe or a file, `term_read_secret` reads the line as
 it is, so scripts can feed a password in.
+
+## std/dl
+
+Load a shared library at run time and look up its symbols. Linux, macOS and
+Windows.
+
+| Function | Effect |
+|----------|--------|
+| `dl_open(path) -> rawptr` | Load a library, resolving its symbols now. A name with no slash is searched the usual way. 0 on failure |
+| `dl_sym(handle, name) -> rawptr` | The address of a function or variable, or 0 |
+| `dl_close(handle) -> int32` | Unload it once nothing else holds it. 0, or -1 |
+| `dl_error() -> string` | Why the last call failed, or `""` |
+
+Cast a function's address to its type, then call it:
+
+```mettle
+var m: rawptr = dl_open("libm.so.6");
+var cos_fn: fn(float64) -> float64 = (fn(float64) -> float64)dl_sym(m, "cos");
+var one: float64 = cos_fn(0.0);
+```
+
+A Linux build links no libc by default, and `dlopen` lives in libc, so build
+with `-l:libc.so.6`. macOS uses libSystem's `dlopen`, and Windows uses
+`LoadLibraryA` and `GetProcAddress`, where `dl_error` gives the Win32 error
+code as text.
 
 ## std/socket
 
@@ -1588,6 +1620,14 @@ date and returns unix nanoseconds.
 ## std/gpu
 
 Device memory, streams, and launches for the [GPU targets](gpu.md).
+
+On Linux, link the CUDA driver with `-lcuda`. Nothing else is needed.
+
+`gpu_stream_done(stream)` and `gpu_event_done(event)` check without waiting.
+They return 1 if the work before them has finished, 0 if it is still running,
+or a negative CUDA error. A scheduler can use them to poll the GPU. On Metal,
+an event is done once it is recorded, but `gpu_stream_done` still waits, since
+the provider has no way to ask without waiting yet.
 
 ## std/tracy
 

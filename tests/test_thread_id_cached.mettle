@@ -1,0 +1,27 @@
+// GetCurrentThreadId is the same on every call in a thread and differs
+// between threads, now that the runtime keeps it after the first call. (The
+// speed is not checked here: the live-patching harness rebuilds every test
+// with trampolines, which changes the timing.)
+import "std/thread";
+
+var g_other: uint32 = 0;
+
+fn other(arg: cstring) -> uint32 {
+  var a: uint32 = GetCurrentThreadId();
+  if (GetCurrentThreadId() != a) { a = (uint32)0; }
+  g_other = a;
+  return (uint32)0;
+}
+
+fn main() -> int32 {
+  var me: uint32 = GetCurrentThreadId();
+  if (me == (uint32)0) { return 1; }
+  var tid: uint32 = 0;
+  var t: int64 = CreateThread((cstring)0, (uint64)0, &other, (cstring)0, (uint32)0, &tid);
+  thread_join_infinite(t);
+  if (g_other == (uint32)0 || g_other == me) { return 2; }
+  var sum: uint64 = 0;
+  for i in 0..100000 { sum = sum + (uint64)GetCurrentThreadId(); }
+  if (sum != (uint64)me * (uint64)100000) { return 3; }
+  return 0;
+}
