@@ -3226,6 +3226,15 @@ $cases = @(
   }
 )
 
+# std/socket talks over the loopback interface and uses epoll, so it runs on
+# Linux; the macOS and Windows halves are checked by cross-compiling.
+if ($IsLinux) {
+  $cases += @(
+    @{ Name = "std_socket"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_socket_release"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true; Args = @("--release") }
+  )
+}
+
 $total = 0
 $failed = 0
 
