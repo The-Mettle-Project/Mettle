@@ -1,0 +1,56 @@
+// A string literal through a function pointer or a closure reaches the callee
+// the same as a string variable does.
+struct Holder {
+  run: fn(string) -> int64;
+}
+
+fn length_of(s: string) -> int64 {
+  return (int64)s.length;
+}
+
+fn first_byte(s: string) -> char {
+  return s[0];
+}
+
+fn mixed(a: int32, s: string, f: float64, t: string) -> int64 {
+  return (int64)a + (int64)s.length + (int64)f + (int64)t.length;
+}
+
+fn gives_string(n: int32) -> string {
+  return "abc";
+}
+
+fn main() -> int32 {
+  var by_name: fn(string) -> int64 = length_of;
+  if (by_name("xy") != 2) {
+    return 1;
+  }
+  var text: string = "four";
+  if (by_name(text) != 4) {
+    return 2;
+  }
+  var byte_of: fn(string) -> char = first_byte;
+  if (byte_of("q") != 'q') {
+    return 3;
+  }
+  var several: fn(int32, string, float64, string) -> int64 = mixed;
+  if (several(1, "ab", 3.0, "cde") != 9) {
+    return 4;
+  }
+  var returned: fn(int32) -> string = gives_string;
+  if (by_name(returned(1)) != 3) {
+    return 5;
+  }
+  var through_closure: Fn(string) -> int64 = fn(z: string) -> int64 {
+    return (int64)z.length + (int64)text.length;
+  };
+  if (through_closure("abc") != 7) {
+    return 6;
+  }
+  var holder: Holder;
+  holder.run = length_of;
+  if (holder.run("seven..") != 7) {
+    return 7;
+  }
+  return 0;
+}

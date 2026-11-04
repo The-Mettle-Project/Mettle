@@ -1,0 +1,88 @@
+// A closure captures the binding its name resolves to at that point, whatever
+// earlier blocks declared under the same name.
+enum Shape {
+  Circle(int32),
+  Square(int32)
+}
+
+var global_count: int32 = 40;
+
+fn earlier_block() -> int32 {
+  {
+    var x: string = "s";
+    if (x.length != 1) {
+      return 1;
+    }
+  }
+  var x: int32 = 5;
+  var f: Fn() -> int32 = fn() -> int32 { return x; };
+  return f() - 5;
+}
+
+fn inner_shadow() -> int32 {
+  var x: int64 = 8;
+  {
+    var x: int32 = 3;
+    var f: Fn() -> int32 = fn() -> int32 { return x; };
+    if (f() != 3) {
+      return 1;
+    }
+  }
+  var g: Fn() -> int64 = fn() -> int64 { return x; };
+  return (int32)g() - 8;
+}
+
+fn sibling_names_a_global() -> int32 {
+  {
+    var global_count: string = "not this one";
+    if (global_count.length != 12) {
+      return 1;
+    }
+  }
+  var f: fn() -> int32 = fn() -> int32 { return global_count; };
+  return f() - 40;
+}
+
+fn loop_initializer() -> int32 {
+  var total: int32 = 0;
+  for (var i: int32 = 1; i <= 2; i = i + 1) {
+    var f: Fn() -> int32 = fn() -> int32 { return i * 10; };
+    total = total + f();
+  }
+  return total - 30;
+}
+
+fn parameter(p: int32) -> int32 {
+  {
+    var p_copy: string = "x";
+    if (p_copy.length != 1) {
+      return 1;
+    }
+  }
+  var f: Fn() -> int32 = fn() -> int32 { return p; };
+  return f() - 6;
+}
+
+fn main() -> int32 {
+  var code = earlier_block();
+  if (code != 0) {
+    return 10 + code;
+  }
+  code = inner_shadow();
+  if (code != 0) {
+    return 20 + code;
+  }
+  code = sibling_names_a_global();
+  if (code != 0) {
+    return 30 + code;
+  }
+  code = loop_initializer();
+  if (code != 0) {
+    return 40 + code;
+  }
+  code = parameter(6);
+  if (code != 0) {
+    return 50 + code;
+  }
+  return 0;
+}

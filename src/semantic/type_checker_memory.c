@@ -228,6 +228,29 @@ static MemLocal *mem_find_local(MemCtx *ctx, const char *name) {
   return NULL;
 }
 
+static int mem_names_local(MemCtx *ctx, const ASTNode *node) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_IDENTIFIER && node->data &&
+      mem_find_local(ctx, ((const Identifier *)node->data)->name)) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (mem_names_local(ctx, node->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int mem_eval_constant(MemCtx *ctx, ASTNode *expression,
+                             long long *out_value) {
+  return !mem_names_local(ctx, expression) &&
+         type_checker_eval_integer_constant_with_checker(ctx->checker,
+                                                         expression, out_value);
+}
+
 static MemLocal *mem_referent(MemCtx *ctx, MemLocal *borrow) {
   if (!ctx || !borrow || !borrow->points_to_stack) {
     return NULL;
@@ -378,8 +401,7 @@ static MemLocal *mem_addr_of_stack_at(MemCtx *ctx, ASTNode *expr,
       MemLocal *local = id ? mem_find_local(ctx, id->name) : NULL;
       long long constant = 0;
       if (local && local->is_stack) {
-        if (type_checker_eval_integer_constant_with_checker(
-                ctx->checker, index->index, &constant) &&
+        if (mem_eval_constant(ctx, index->index, &constant) &&
             constant >= 0) {
           *offset_out = constant;
         }
@@ -449,8 +471,7 @@ static MemLocal *mem_addr_of_heap_at(MemCtx *ctx, ASTNode *expr,
   }
   long long constant = 0;
   if (offset_out &&
-      type_checker_eval_integer_constant_with_checker(ctx->checker,
-                                                       index->index, &constant) &&
+      mem_eval_constant(ctx, index->index, &constant) &&
       constant >= 0) {
     *offset_out = constant;
   }
@@ -815,8 +836,7 @@ static long long mem_dest_capacity(MemCtx *ctx, ASTNode *dest,
       long long offset = 0;
       if (local && local->is_stack &&
           mem_array_extent(ctx, local->type_name, &count, &elem_size) &&
-          type_checker_eval_integer_constant_with_checker(
-              ctx->checker, index->index, &offset) &&
+          mem_eval_constant(ctx, index->index, &offset) &&
           offset >= 0 && offset <= count) {
         *array_name_out = local->name;
         return (count - offset) * elem_size;
@@ -853,8 +873,7 @@ static void mem_check_mem_op(MemCtx *ctx, CallExpression *call,
       return;
     }
     long long size = 0;
-    if (!type_checker_eval_integer_constant_with_checker(
-            ctx->checker, call->arguments[MEM_OPS[i].size_index], &size) ||
+    if (!mem_eval_constant(ctx, call->arguments[MEM_OPS[i].size_index], &size) ||
         size <= 0) {
       return;
     }
@@ -885,8 +904,7 @@ static void mem_check_const_index(MemCtx *ctx, ASTNode *expr) {
   MemLocal *local = id ? mem_find_local(ctx, id->name) : NULL;
   long long count = 0, elem_size = 0, value = 0;
   if (!local ||
-      !type_checker_eval_integer_constant_with_checker(ctx->checker,
-                                                       index->index, &value)) {
+      !mem_eval_constant(ctx, index->index, &value)) {
     return;
   }
   if (local->is_stack &&
@@ -1128,8 +1146,7 @@ static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
   }
   long long value = 0;
   if (strcmp(binary->operator, "/") == 0 || strcmp(binary->operator, "%") == 0) {
-    if (type_checker_eval_integer_constant_with_checker(ctx->checker,
-                                                        binary->right, &value) &&
+    if (mem_eval_constant(ctx, binary->right, &value) &&
         value == 0) {
       mem_error(ctx, "M0116", loc, "Fix the constant, or guard the divisor",
                 "%s by a constant zero; this traps the moment it executes",
@@ -1139,8 +1156,7 @@ static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
   }
   if (strcmp(binary->operator, "<<") == 0 ||
       strcmp(binary->operator, ">>") == 0) {
-    if (!type_checker_eval_integer_constant_with_checker(ctx->checker,
-                                                         binary->right, &value)) {
+    if (!mem_eval_constant(ctx, binary->right, &value)) {
       return;
     }
     Type *left_type = binary->left ? binary->left->resolved_type : NULL;
@@ -1510,8 +1526,7 @@ static void mem_check_loop_bounds(MemCtx *ctx, ASTNode *condition,
   const char *iv = iv_id->name;
 
   long long bound = 0;
-  if (!type_checker_eval_integer_constant_with_checker(ctx->checker,
-                                                       cmp->right, &bound)) {
+  if (!mem_eval_constant(ctx, cmp->right, &bound)) {
     return;
   }
   long long max_iv = strcmp(cmp->operator, "<=") == 0 ? bound : bound - 1;
@@ -1710,8 +1725,7 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
         local->null_loc = loc;
       } else if (!ctx->in_defer && ctx->depth == 0) {
         long long constant = 0;
-        if (type_checker_eval_integer_constant_with_checker(
-                ctx->checker, mem_unwrap_cast(value), &constant) &&
+        if (mem_eval_constant(ctx, mem_unwrap_cast(value), &constant) &&
             constant > 0 && constant < 65536) {
           local->is_wild = 1;
           local->wild_value = constant;
@@ -1752,8 +1766,7 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
       local->has_const_value = 0;
       long long value_const = 0;
       if (!ctx->in_defer && ctx->depth == 0 &&
-          type_checker_eval_integer_constant_with_checker(ctx->checker, value,
-                                                          &value_const)) {
+          mem_eval_constant(ctx, value, &value_const)) {
         local->has_const_value = 1;
         local->const_value = value_const;
       }
@@ -2104,8 +2117,7 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     if (!decl_type) {
       long long structural_start = 0;
       if (decl->structural_type && decl->initializer &&
-          type_checker_eval_integer_constant_with_checker(
-              ctx->checker, decl->initializer, &structural_start)) {
+          mem_eval_constant(ctx, decl->initializer, &structural_start)) {
         decl_type = "int64";
       }
     }

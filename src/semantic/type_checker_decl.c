@@ -2150,6 +2150,7 @@ static int type_checker_process_variable(TypeChecker *checker,
     Type *var_type = NULL;
 
     if (var_decl->type_name && !var_decl->type_is_inferred) {
+      type_checker_bake_local_sizes(checker, &var_decl->type_name);
       var_type = type_checker_get_type_by_name(checker, var_decl->type_name);
       if (!var_type) {
         type_checker_report_undefined_symbol(checker, declaration->location,

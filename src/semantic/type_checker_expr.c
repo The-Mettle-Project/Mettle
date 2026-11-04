@@ -4356,6 +4356,7 @@ static Type *type_checker_infer_allocation(TypeChecker *checker,
   case AST_NEW_EXPRESSION: {
     NewExpression *new_expr = (NewExpression *)expression->data;
     if (new_expr && new_expr->type_name) {
+      type_checker_bake_local_sizes(checker, &new_expr->type_name);
       const Type *allocated =
           type_checker_get_type_by_name(checker, new_expr->type_name);
       if (allocated && allocated->meta_layout &&
@@ -4490,6 +4491,7 @@ static Type *type_checker_infer_cast(TypeChecker *checker,
       return NULL;
     }
 
+    type_checker_bake_local_sizes(checker, &cast_expr->type_name);
     Type *target_type =
         type_checker_get_type_by_name(checker, cast_expr->type_name);
     if (!target_type) {

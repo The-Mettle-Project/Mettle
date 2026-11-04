@@ -3859,14 +3859,14 @@ static int cc_env_has(const CCEnv *e, const char *name) {
 static const char *cc_env_type(const CCEnv *e, const char *name) {
   if (!name)
     return NULL;
-  for (size_t i = 0; i < e->count; i++)
-    if (strcmp(e->names[i], name) == 0)
-      return e->types[i];
+  for (size_t i = e->count; i > 0; i--)
+    if (strcmp(e->names[i - 1], name) == 0)
+      return e->types[i - 1];
   return NULL;
 }
 
-static void cc_env_add(CCEnv *e, const char *name, const char *type) {
-  if (!name || cc_env_has(e, name))
+static void cc_env_push(CCEnv *e, const char *name, const char *type) {
+  if (!name)
     return;
   if (e->count == e->cap) {
     size_t ncap = e->cap ? e->cap * 2 : 8;
@@ -3884,6 +3884,19 @@ static void cc_env_add(CCEnv *e, const char *name, const char *type) {
   e->names[e->count] = strdup(name);
   e->types[e->count] = type ? strdup(type) : NULL;
   e->count++;
+}
+
+static void cc_env_add(CCEnv *e, const char *name, const char *type) {
+  if (!cc_env_has(e, name))
+    cc_env_push(e, name, type);
+}
+
+static void cc_env_truncate(CCEnv *e, size_t count) {
+  while (e->count > count) {
+    e->count--;
+    free(e->names[e->count]);
+    free(e->types[e->count]);
+  }
 }
 
 static void cc_env_free(CCEnv *e) {
@@ -4287,16 +4300,40 @@ static void cc_lift_lambda(ASTNode *lambda, ASTNode *program, Program *prog,
   fd->name = (char *)string_intern(name);
 }
 
-static void cc_walk(ASTNode *node, const CCEnv *enclosing, ASTNode *program,
+static void cc_walk(ASTNode *node, CCEnv *enclosing, ASTNode *program,
                     Program *prog, ErrorReporter *reporter, int *had_error) {
+  size_t scope;
   if (!node)
     return;
   if (node->type == AST_LAMBDA_EXPRESSION) {
     cc_lift_lambda(node, program, prog, enclosing, reporter, had_error);
     return;
   }
+  if (node->type == AST_VAR_DECLARATION && node->data) {
+    VarDeclaration *vd = (VarDeclaration *)node->data;
+    cc_env_push(enclosing, vd->name, vd->type_name);
+  }
+  if (node->type == AST_MATCH_STATEMENT && node->data) {
+    MatchStatement *match = (MatchStatement *)node->data;
+    cc_walk(match->expression, enclosing, program, prog, reporter, had_error);
+    for (size_t i = 0; i < match->arm_count; i++) {
+      size_t arm_scope = enclosing->count;
+      cc_env_push(enclosing, match->arms[i].binding_name, NULL);
+      cc_walk(match->arms[i].body, enclosing, program, prog, reporter,
+              had_error);
+      cc_env_truncate(enclosing, arm_scope);
+    }
+    return;
+  }
+  scope = enclosing->count;
+  if (node->type == AST_COMPTIME_FOR && node->data) {
+    cc_env_push(enclosing, ((ComptimeForStatement *)node->data)->binding_name,
+                NULL);
+  }
   for (size_t i = 0; i < node->child_count; i++)
     cc_walk(node->children[i], enclosing, program, prog, reporter, had_error);
+  if (mono_node_opens_scope(node))
+    cc_env_truncate(enclosing, scope);
 }
 
 static void cc_process_fn(ASTNode *fnnode, ASTNode *program, Program *prog,
@@ -4305,7 +4342,8 @@ static void cc_process_fn(ASTNode *fnnode, ASTNode *program, Program *prog,
   if (!fd || !fd->body)
     return;
   CCEnv locals = {0};
-  cc_collect_fn_env(fd, &locals);
+  for (size_t i = 0; i < fd->parameter_count; i++)
+    cc_env_push(&locals, fd->parameter_names[i], fd->parameter_types[i]);
   cc_walk(fd->body, &locals, program, prog, reporter, had_error);
   cc_env_free(&locals);
 }
@@ -4342,6 +4380,7 @@ int closure_convert_program(ASTNode *program, ErrorReporter *reporter) {
       if (vd && vd->initializer) {
         CCEnv empty = {0};
         cc_walk(vd->initializer, &empty, program, prog, reporter, &had_error);
+        cc_env_free(&empty);
       }
     }
   }

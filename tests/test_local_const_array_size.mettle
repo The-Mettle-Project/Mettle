@@ -1,0 +1,60 @@
+// A local const sizes an array wherever a type is written. IR lowering runs
+// after the local scope is gone, and two functions can use one name for two
+// sizes, so a shared global of that name must not win either.
+const COUNT = 100;
+
+struct Pair {
+  a: int32;
+  b: int32;
+}
+
+fn four() -> int32 {
+  const COUNT = 4;
+  var table: int32[COUNT];
+  table[COUNT - 1] = 12;
+  if (sizeof(int32[COUNT]) != 16 || sizeof(Pair[COUNT]) != 32) {
+    return 1;
+  }
+  var row = new int32[COUNT];
+  row[COUNT - 1] = 5;
+  var first = &table[0];
+  if (row.length != 4 || first[3] != 12) {
+    return 2;
+  }
+  return 0;
+}
+
+fn six() -> int32 {
+  const COUNT: int64 = 6;
+  var table: int64[COUNT];
+  table[COUNT - 1] = 7;
+  if (sizeof(int64[COUNT]) != 48 || table[5] != 7) {
+    return 1;
+  }
+  return 0;
+}
+
+fn global_size() -> int32 {
+  var table: uint8[COUNT];
+  table[COUNT - 1] = (uint8)9;
+  if (sizeof(uint8[COUNT]) != 100 || table[99] != 9) {
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var code = four();
+  if (code != 0) {
+    return 10 + code;
+  }
+  code = six();
+  if (code != 0) {
+    return 20 + code;
+  }
+  code = global_size();
+  if (code != 0) {
+    return 30 + code;
+  }
+  return 0;
+}

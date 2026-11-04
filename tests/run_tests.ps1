@@ -1477,6 +1477,9 @@ $cases = @(
   @{ Name = "var_inferred_kernel"; Path = "tests/test_var_inferred_kernel.mettle"; ShouldSucceed = $true; Args = @("--emit-ptx") },
   @{ Name = "var_inferred_interp"; Path = "tests/test_var_inferred_interp.mettle"; ShouldSucceed = $true; Args = @("test"); SkipBinaryCheck = $true; OutputMustMatch = @("1 passed"); OutputMustNotMatch = @("failed", "LEAKED") },
   @{ Name = "warn_var_inferred_borrow"; Path = "tests/warn_var_inferred_borrow.mettle"; ShouldSucceed = $true; OutputMustMatch = @('Use of `held` after the scope of `storage` ended') },
+  @{ Name = "local_const_array_size"; Path = "tests/test_local_const_array_size.mettle"; ShouldSucceed = $true },
+  @{ Name = "fn_pointer_string_argument"; Path = "tests/test_fn_pointer_string_argument.mettle"; ShouldSucceed = $true },
+  @{ Name = "closure_capture_scope"; Path = "tests/test_closure_capture_scope.mettle"; ShouldSucceed = $true },
   @{ Name = "closure_capture"; Path = "tests/test_closure_capture.mettle"; ShouldSucceed = $true },
   @{ Name = "closure_crossboundary"; Path = "tests/test_closure_crossboundary.mettle"; ShouldSucceed = $true },
   @{ Name = "closure_field"; Path = "tests/test_closure_field.mettle"; ShouldSucceed = $true },
@@ -4101,6 +4104,7 @@ try {
       "var big: int64 = ",
       "var boxed: Box__int32 = ",
       "var added: fn(int32,int32)->int32 = add;",
+      "var row: int32[] = new int32[4];",
       "var capture: Fn(int32)->int64 = ",
       "const WIDE: int64 = (int64)3;")) {
     if ($out -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in: $out" }

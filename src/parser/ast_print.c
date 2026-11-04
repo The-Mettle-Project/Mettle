@@ -78,6 +78,21 @@ static void print_string_literal(AstPrinter *printer, const char *value) {
   fputc('"', printer->out);
 }
 
+static void print_new_expression(AstPrinter *printer,
+                                 const NewExpression *expr) {
+  fprintf(printer->out, "new %s",
+          expr && expr->type_name ? expr->type_name : "<type>");
+  if (expr && expr->count) {
+    fputc('[', printer->out);
+    print_expression(printer, expr->count);
+    for (size_t i = 0; i < expr->extent_count; i++) {
+      fputs(", ", printer->out);
+      print_expression(printer, expr->extents[i]);
+    }
+    fputc(']', printer->out);
+  }
+}
+
 static void print_expression(AstPrinter *printer, const ASTNode *node) {
   if (!node) {
     fputs("/* <null> */", printer->out);
@@ -176,9 +191,7 @@ static void print_expression(AstPrinter *printer, const ASTNode *node) {
     break;
   }
   case AST_NEW_EXPRESSION: {
-    const NewExpression *expr = (const NewExpression *)node->data;
-    fprintf(printer->out, "new %s",
-            expr && expr->type_name ? expr->type_name : "<type>");
+    print_new_expression(printer, (const NewExpression *)node->data);
     break;
   }
   case AST_FUNCTION_CALL: {

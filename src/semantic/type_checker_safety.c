@@ -648,6 +648,9 @@ Type *type_checker_resolve_sizeof_argument(TypeChecker *checker,
   }
 
   Identifier *type_id = (Identifier *)arg->data;
+  if (type_id) {
+    type_checker_bake_local_sizes(checker, &type_id->name);
+  }
   Type *type = type_id ? type_checker_get_type_by_name(checker, type_id->name)
                        : NULL;
   if (!type) {

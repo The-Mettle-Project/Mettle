@@ -81,6 +81,64 @@ static int type_checker_array_outer_group(const char *name,
   return 1;
 }
 
+void type_checker_bake_local_sizes(TypeChecker *checker, char **type_text) {
+  const char *text = type_text ? *type_text : NULL;
+  char baked[512];
+  size_t used = 0;
+  int depth = 0;
+  int changed = 0;
+  if (!checker || !text || !strchr(text, '[')) {
+    return;
+  }
+  for (const char *p = text; *p;) {
+    size_t run = 0;
+    if (used + 32 >= sizeof(baked)) {
+      return;
+    }
+    if (depth > 0 && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                      *p == '_')) {
+      char name[256];
+      const Symbol *symbol;
+      while ((p[run] >= 'a' && p[run] <= 'z') ||
+             (p[run] >= 'A' && p[run] <= 'Z') ||
+             (p[run] >= '0' && p[run] <= '9') || p[run] == '_') {
+        run++;
+      }
+      if (run >= sizeof(name) || used + run + 32 >= sizeof(baked)) {
+        return;
+      }
+      memcpy(name, p, run);
+      name[run] = '\0';
+      symbol = symbol_table_lookup(checker->symbol_table, name);
+      if (symbol && symbol->scope && symbol->scope->type != SCOPE_GLOBAL &&
+          symbol->has_constant_value && !symbol->constant_is_float &&
+          symbol->constant_integer_value > 0) {
+        used += (size_t)snprintf(baked + used, sizeof(baked) - used, "%lld",
+                                 symbol->constant_integer_value);
+        changed = 1;
+      } else {
+        memcpy(baked + used, p, run);
+        used += run;
+      }
+      p += run;
+      continue;
+    }
+    if (*p == '[') {
+      depth++;
+    } else if (*p == ']') {
+      depth--;
+    }
+    baked[used++] = *p++;
+  }
+  if (changed) {
+    baked[used] = '\0';
+    if (!string_is_interned(*type_text)) {
+      free(*type_text);
+    }
+    *type_text = (char *)string_intern(baked);
+  }
+}
+
 Type *type_checker_parse_array_type(TypeChecker *checker,
                                            const char *name) {
   const char *lbracket = NULL;

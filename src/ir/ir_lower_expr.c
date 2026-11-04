@@ -318,6 +318,50 @@ static int ir_pass_aggregate_argument_by_address(IRLoweringContext *context,
   return 1;
 }
 
+static int ir_hold_string_literal_argument(IRLoweringContext *context,
+                                           IRFunction *function,
+                                           IROperand *argument,
+                                           SourceLocation location) {
+  char *held_name;
+  IRInstruction assign = {0};
+  int ok;
+
+  if (argument->kind != IR_OPERAND_STRING) {
+    return 1;
+  }
+  held_name = ir_new_label_name(context, "str_arg");
+  if (!held_name) {
+    ir_set_error(context, "Out of memory while holding a string argument");
+    return 0;
+  }
+  if (!ir_emit_local_declaration(context, function, held_name, "string",
+                                 location)) {
+    free(held_name);
+    return 0;
+  }
+  assign.op = IR_OP_ASSIGN;
+  assign.location = location;
+  assign.dest = ir_operand_symbol(held_name);
+  assign.lhs = *argument;
+  ok = ir_emit(context, function, &assign);
+  ir_operand_destroy(argument);
+  *argument = assign.dest;
+  free(held_name);
+  return ok;
+}
+
+static int ir_prepare_indirect_argument(IRLoweringContext *context,
+                                        IRFunction *function,
+                                        IROperand *argument, Type *type,
+                                        SourceLocation location) {
+  if (!ir_hold_string_literal_argument(context, function, argument, location)) {
+    return 0;
+  }
+  return !ir_indirect_arg_passes_by_address(type) ||
+         ir_pass_aggregate_argument_by_address(context, function, argument,
+                                               type, location);
+}
+
 static void ir_declare_interpolation_helper(IRLoweringContext *context,
                                             const char *name) {
   IRModuleSymbol entry = {0};
@@ -867,12 +911,8 @@ static int ir_lower_call_emit(IRLoweringContext *context, IRFunction *function, 
     for (size_t i = 0; i < call->argument_count; i++) {
       Type *argument_type =
           call->arguments[i] ? call->arguments[i]->resolved_type : NULL;
-      if (!ir_indirect_arg_passes_by_address(argument_type)) {
-        continue;
-      }
-      if (!ir_pass_aggregate_argument_by_address(context, function,
-                                                 &arguments[i], argument_type,
-                                                 call->arguments[i]->location)) {
+      if (!ir_prepare_indirect_argument(context, function, &arguments[i],
+                                        argument_type, expression->location)) {
         for (size_t j = 0; j < call->argument_count; j++) {
           ir_operand_destroy(&arguments[j]);
         }
@@ -2907,12 +2947,8 @@ static int ir_lower_func_ptr_call(IRLoweringContext *context,
   for (size_t i = 0; i < fp_call->argument_count; i++) {
     Type *argument_type =
         fp_call->arguments[i] ? fp_call->arguments[i]->resolved_type : NULL;
-    if (!ir_indirect_arg_passes_by_address(argument_type)) {
-      continue;
-    }
-    if (!ir_pass_aggregate_argument_by_address(
-            context, function, &arguments[i], argument_type,
-            fp_call->arguments[i]->location)) {
+    if (!ir_prepare_indirect_argument(context, function, &arguments[i],
+                                      argument_type, expression->location)) {
       for (size_t j = 0; j < fp_call->argument_count; j++) {
         ir_operand_destroy(&arguments[j]);
       }
