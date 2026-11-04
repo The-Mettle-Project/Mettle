@@ -2299,6 +2299,22 @@ static int declaration_is_public_for_import(
   return 1;
 }
 
+static int declaration_private_copy_present(ASTNode *const *declarations,
+                                            size_t count, ASTNode *decl) {
+  const char *name = get_declaration_name(decl);
+  if (!name || strncmp(name, "__import_", 9) != 0) {
+    return 0;
+  }
+  for (size_t i = 0; i < count; i++) {
+    const char *other = get_declaration_name(declarations[i]);
+    if (declarations[i]->type == decl->type && other &&
+        strcmp(other, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int collect_private_dependency_rewrites(
     NameRewrite **rewrites, size_t *rewrite_count, size_t *rewrite_capacity,
     ASTNode *decl, const char *module_path) {
@@ -2314,6 +2330,9 @@ static int collect_private_dependency_rewrites(
   }
 
   decl_name = get_declaration_name(decl);
+  if (decl_name && strncmp(decl_name, "__import_", 9) == 0) {
+    return 1;
+  }
   if (decl_name) {
     private_name = build_private_import_name(module_path, decl_name);
     if (!private_name ||
@@ -4307,7 +4326,12 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
               include_decl = include_flags[j];
             }
 
-            if (include_decl && !repeated_alias) {
+            if (include_decl && !repeated_alias &&
+                declaration_private_copy_present(new_declarations,
+                                                 new_declaration_count,
+                                                 imp_decl)) {
+              ast_destroy_node(imp_decl);
+            } else if (include_decl && !repeated_alias) {
               ADD_DECL(imp_decl);
             } else {
               ast_destroy_node(imp_decl);

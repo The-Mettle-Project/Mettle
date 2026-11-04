@@ -8257,7 +8257,8 @@ void print_usage(const char *program_name) {
          "                      for about 8 KB and no change to codegen\n");
   printf("  --debug-format <fmt> Debug format: dwarf, stabs, or map (default: "
          "dwarf)\n");
-  printf("  -O, --optimize      Enable optimizations\n");
+  printf("  -O, --optimize      Enable optimizations (-O1/-O2/-O3/-Os the same; "
+         "-O0 off)\n");
   printf("  -r, --release       Optimize for size (enables -O, strips comments, "
          "and drops unreachable functions)\n");
   printf("  --prelude           Auto-import the standard prelude (std/io, "

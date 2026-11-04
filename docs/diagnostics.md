@@ -141,6 +141,7 @@ Metaprogram diagnostics:
 | L0004 | A custom layout crossed extern or a kernel |
 | L0005 | A generator stated no relation |
 | L0006 | A metafunction reaches a type whose layout it decides |
+| L0007 | A pass the program wrote produced code the compiler refused |
 
 [The metaobject protocol](design/metaobject.md) covers the L codes in context.
 

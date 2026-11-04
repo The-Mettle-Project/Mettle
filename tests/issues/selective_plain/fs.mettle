@@ -1,0 +1,2 @@
+import "base";
+export fn fs_size(s: string) -> int64 { return slen(s); }

@@ -1,0 +1,3 @@
+var g_count: int32 = 0;
+export fn slen(s: string) -> int64 { g_count = g_count + 1; return (int64)s.length; }
+export fn b_count() -> int32 { return g_count; }

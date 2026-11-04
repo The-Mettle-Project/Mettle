@@ -68,7 +68,7 @@ code generation.
 
 | Option | Effect |
 |--------|--------|
-| `-O`, `--optimize` | Turn the optimizer on. |
+| `-O`, `--optimize` | Turn the optimizer on. `-O1`, `-O2`, `-O3` and `-Os` mean the same; `-O0` leaves it off. |
 | `-r`, `--release` | Optimize for size. Implies `-O`, strips comments, drops unreachable functions. |
 | `--safe` | Check every memory access not proven in bounds. Kept under `--release`. |
 | `--native-heap` | Route `new` and the `malloc` family through `std/alloc`. |

@@ -3153,7 +3153,7 @@ $cases = @(
   @{ Name = "err_trait_bound_missing_impl"; Path = "tests/err_trait_bound_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'Addable'" },
   @{ Name = "err_trait_bound_missing_second_impl"; Path = "tests/err_trait_bound_missing_second_impl.mettle"; ShouldSucceed = $false; Pattern = "does not implement trait 'SignedNumber'" },
   @{ Name = "err_trait_method_missing_impl"; Path = "tests/err_trait_method_missing_impl.mettle"; ShouldSucceed = $false; Pattern = "missing trait method 'next_value'" },
-  @{ Name = "err_generics_generic_fn_ptr_address"; Path = "tests/err_generics_generic_fn_ptr_address.mettle"; ShouldSucceed = $false; Pattern = "Expected an expression" },
+  @{ Name = "generics_generic_fn_ptr_address"; Path = "tests/generics_generic_fn_ptr_address.mettle"; ShouldSucceed = $true },
 
   # Syntax diagnostics. Each of these guards a message that used to say
   # nothing. The "1 previous error" patterns are the anti-cascade guards: one
@@ -21376,6 +21376,7 @@ $issueRegressions = @(
   @{ Name = "issue_lambda_in_generic_and_reference_to_instance"; Entry = "tests/issues/issue_100.mettle"; Args = @(); Expect = @("4 2.5 9 4 1.5 7") },
   @{ Name = "issue_lambda_in_generic_and_reference_to_instance_release"; Entry = "tests/issues/issue_100.mettle"; Args = @("--release"); Expect = @("4 2.5 9 4 1.5 7") },
   @{ Name = "issue_module_imported_as_same_alias_twice_is_one_module"; Entry = "tests/issues/alias_twice/main.mettle"; Args = @(); Expect = @("counter=2") },
+  @{ Name = "issue_selective_and_plain_import_share_globals"; Entry = "tests/issues/selective_plain/main.mettle"; Args = @(); Expect = @("len=6 count=2") },
   @{ Name = "issue_driver_accepts_O0"; Command = @("--build", "-O0", "tests/issues/issue_073_074.mettle", "-o", ".tmp/issue_o0.exe"); Expect = @("Built executable") }
 )
 foreach ($case in $issueRegressions) {

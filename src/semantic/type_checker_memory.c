@@ -1705,6 +1705,9 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
   }
   case AST_AGGREGATE_LITERAL: {
     AggregateLiteral *literal = (AggregateLiteral *)expr->data;
+    if (literal && literal->repeat_count) {
+      mem_walk_expr(ctx, literal->repeat_count);
+    }
     for (size_t i = 0; literal && i < literal->element_count; i++) {
       ASTNode *element = literal->elements ? literal->elements[i] : NULL;
       mem_walk_expr(ctx, element);

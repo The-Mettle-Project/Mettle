@@ -1,0 +1,4 @@
+import { slen, b_count } from "base";
+import { fs_size } from "fs";
+export fn mb_len(s: string) -> int64 { return slen(s) + fs_size(s); }
+export fn mb_count() -> int32 { return b_count(); }

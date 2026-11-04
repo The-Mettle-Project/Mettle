@@ -396,6 +396,18 @@ static const ErrorCodeDoc DOCS[] = {
      "prints the chain.\n"
      "\n"
      "Fix: read field names and sizes from the `TypeInfo` it receives.\n"},
+    {"L0007", "A pass the program wrote produced code the compiler refused",
+     "A `@pass` function runs on the optimizer's IR for a function and\n"
+     "writes code back. The compiler checks that code before it replaces\n"
+     "the original, and refused it. The message says which check failed: the\n"
+     "pass wrote text that does not print, named an operation the IR does\n"
+     "not have, broke the shape of the function, or changed what the\n"
+     "function does, in which case the counterexample follows.\n"
+     "\n"
+     "The original function is kept and the build stops.\n"
+     "\n"
+     "Fix: run the pass on the smaller function the counterexample names and\n"
+     "compare the IR it writes with the IR it read.\n"},
     {"R0002", "A rule failed the build",
      "A `@rule fn` the program declares returned verdict_fail for the site\n"
      "the diagnostic points at, with the message it wrote. The build stops\n"
