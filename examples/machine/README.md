@@ -62,10 +62,10 @@ rest of the program.
 ## What it does not contribute
 
 The register allocator does not schedule around a described instruction, and
-a rewrite rule cannot map IR onto one. Both need the emitters and the allocator
-open to Mettle, which
-[the ideology](../../docs/ideology.md#5-the-compiler-is-open) calls for and
-nothing builds yet. A described machine here is one you
-write programs for and run; it is not one the compiler's backend can be aimed
-at. [Known limitations](../../docs/known-limitations.md) says so in the same
-words.
+a rewrite rule cannot map IR onto one. Both need the emitters open to Mettle,
+which [the ideology](../../docs/ideology.md#5-the-compiler-is-open) calls for and
+nothing builds yet. [`@regalloc`](../../docs/metaprogramming.md#register-allocation)
+opens the allocator, and it only colours a built-in target's registers. A
+described machine here is one you write programs for and run; it is not one the
+compiler's backend can be aimed at.
+[Known limitations](../../docs/known-limitations.md) says so in the same words.

@@ -251,8 +251,9 @@ Go through these in order. The first failure ends it.
   objects, undo, crash recovery.
 - Compile-time reflection, `comptime for`, computed globals, `@rule` over the program,
   the machine and a trace, and `rewrite` rules checked in the interpreter.
-- Declared types with proofs, inferred lifetimes, inferred effects, deadlines from a cost
-  model, optimization contracts.
+- Declared types with proofs, inferred local types, lifetimes and effects, deadlines from
+  a cost model, optimization contracts.
+- Layouts, generators, optimizer passes and register allocators written in Mettle.
 - PE and ELF linkers, x86-64 and AArch64 backends, GPU kernels as PTX, SPIR-V and Metal,
   freestanding targets, described machines.
 - `--verify`, `--explain` with simulated fixes and a list of beliefs, `mettle expand`.
@@ -262,7 +263,7 @@ Go through these in order. The first failure ends it.
 - Every program alive by default. Today that takes a `--live` build and a `quiesce`
   point, and only on Windows and Linux x64. Single programs move up to 8% either way.
 - Overriding a proven-wrong stop in source.
-- Leaving a binding's type off. The compiler refuses `var x = 5` today.
+- Emitters and the order of the built-in passes. Nothing reaches those from Mettle.
 - The loader arriving with the first change. A live build links it now.
 - Snapshots and crash rewind.
 - Moving the older runtime components to Mettle. The crash handler, profiler, safety and

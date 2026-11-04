@@ -412,10 +412,11 @@ built.
 
 What this does not do is aim the compiler's backend at a described machine.
 The register allocator does not schedule around a described instruction, and a
-rewrite rule cannot map IR onto one, because both need the allocator and the
-emitters open to Mettle. [The ideology](ideology.md#5-the-compiler-is-open) calls
-for that and nothing builds it yet, and
-[known limitations](known-limitations.md) says so.
+rewrite rule cannot map IR onto one, because both need the emitters open to
+Mettle. [The ideology](ideology.md#5-the-compiler-is-open) calls for that and
+nothing builds it yet. [`@regalloc`](metaprogramming.md#register-allocation)
+opens the allocator, and it only colours a built-in target's registers.
+[Known limitations](known-limitations.md) says so.
 
 ## What is proven, and on which machine
 
@@ -438,11 +439,12 @@ proven on an emulator and not on silicon, and the GPU backends are proven
 well-formed and not executed. Both are stated here rather than left for a
 reader to discover, because a gate that skips quietly is the same as no gate.
 
-The machinery is out of a description's reach. The emitters, the register
-allocator and the pass ordering are libmtlc's today: a description says what a
-machine has, and the emitter decides what to do about it.
-[The ideology](ideology.md#5-the-compiler-is-open) calls for opening them to
-Mettle, and nothing builds that yet.
+The machinery is out of a description's reach. A description says what a machine
+has, and the emitter decides what to do about it. Mettle can replace the
+[register allocator](metaprogramming.md#register-allocation) and add
+[passes](metaprogramming.md#passes) through their own decorators. The emitters
+and the order of the built-in passes are libmtlc's today, and
+[the ideology](ideology.md#5-the-compiler-is-open) calls for opening them.
 
 ## A chosen link address
 

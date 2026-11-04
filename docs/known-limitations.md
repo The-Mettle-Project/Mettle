@@ -79,9 +79,10 @@ self-consistent and calls nothing built with another.
 A described machine is one a program is written for and run on. It is not one
 the compiler's backend can be aimed at: the register allocator does not
 schedule around a described instruction, and a rewrite rule cannot map IR onto
-one. Both need the allocator and the emitters open to Mettle, which
+one. Both need the emitters open to Mettle, which
 [the ideology](ideology.md#5-the-compiler-is-open) calls for and nothing builds
-yet.
+yet. [`@regalloc`](metaprogramming.md#register-allocation) opens the allocator,
+and it only colours a built-in target's registers.
 
 An operand occupies exactly one byte, so an immediate is 0 to 255 and a
 program larger than that has to build wider values out of instructions.
