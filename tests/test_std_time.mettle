@@ -72,6 +72,8 @@ fn main() -> int32 {
   if (!same(&hb[0], time_format_http(t, &hb[0], (int64)48), "Thu, 05 Nov 2026 09:30:15 GMT")) { return 25; }
   var db: uint8[48];
   if (!same(&db[0], time_format_date(dt, &db[0], (int64)48), "2026-11-05")) { return 26; }
+  var cb: uint8[16];
+  if (!same(&cb[0], time_format_clock(dt, &cb[0], (int64)16), "09:30:15")) { return 28; }
   var small: uint8[8];
   if (time_format_iso8601(dt, 0, &small[0], (int64)8) != (int64)-1) { return 27; }
   if (!check_dur((int64)0, "0s")) { return 30; }

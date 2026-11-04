@@ -605,8 +605,12 @@ Three C entry points: `exit(code: int32)`, `rand() -> int32`, and
 
 ## std/time
 
-Clocks, durations and dates. Linux, macOS and Windows; the clock calls live in
-`std/time_os`, which `std/time` imports.
+Clocks, durations and dates. Linux, macOS and Windows.
+
+`std/time` holds the clocks and sleep, and imports `std/datetime`, which holds
+everything else. `std/datetime` reads no clock, so code that must run in the
+compile-time interpreter can import it alone. The OS calls live in
+`std/time_os`.
 
 A duration is an `int64` count of nanoseconds. Build one from the units
 `TIME_NANOSECOND`, `TIME_MICROSECOND`, `TIME_MILLISECOND`, `TIME_SECOND`,
@@ -631,7 +635,7 @@ other fields are local to that offset.
 |----------|--------|
 | `time_utc(unix_ns: int64) -> DateTime` | Break a time into UTC fields |
 | `time_at_offset(unix_ns: int64, offset_min: int32) -> DateTime` | The same at a fixed offset |
-| `time_now_utc() -> DateTime` | The current UTC date and time |
+| `time_now_utc() -> DateTime` | The current UTC date and time (`std/time`) |
 | `time_date(year, month, day, hour, minute, second) -> DateTime` | Build a UTC `DateTime`; out-of-range parts roll over |
 | `time_to_unix(dt) -> int64`, `time_to_unix_ns(dt) -> int64` | Back to unix seconds or nanoseconds |
 | `time_days_from_civil(year: int64, month: int32, day: int32) -> int64` | Days since 1970-01-01 |
@@ -648,6 +652,7 @@ or -1 if the buffer is too small or the year is outside 0-9999.
 |----------|--------|
 | `time_format_iso8601(dt, frac_digits: int32, buf: uint8*, cap: int64) -> int64` | `2026-11-05T09:30:15.123Z`, or `+01:00` for a non-zero offset |
 | `time_format_date(dt, buf, cap) -> int64` | `2026-11-05` |
+| `time_format_clock(dt, buf, cap) -> int64` | `09:30:15` |
 | `time_format_http(unix_ns, buf, cap) -> int64` | `Thu, 05 Nov 2026 09:30:15 GMT` |
 | `time_format_duration(ns, buf, cap) -> int64` | `1h2m3.5s`, `1.5ms`, `250us`, `0s` |
 
