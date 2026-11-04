@@ -1,0 +1,232 @@
+// Locks and condition variables for threads.
+//
+// SyncMutex, SyncRwLock, SyncCond and SyncSem are plain structs: zero is the
+// unlocked, empty state, so `var m: SyncMutex;` or a zeroed field is ready to
+// use, and none of them allocates. Share them by pointer, never by copy.
+//
+// Every timed call takes a timeout in milliseconds and keeps one deadline for
+// the whole call, so a waiter that is woken and loses the race waits only for
+// the time that is left (reports/039). A negative timeout waits forever.
+//
+// They are built on the platform's wait-on-address call (futex on Linux,
+// __ulock on macOS, SRW locks and condition variables on Windows).
+
+import "std/sync_os";
+
+extern fn sync_cas(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+extern fn sync_xchg(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn sync_inc(target: int32*) -> int32 with none = "mettle_atomic_inc_i32";
+extern fn sync_dec(target: int32*) -> int32 with none = "mettle_atomic_dec_i32";
+
+// An atomic read: a compare-and-swap that never changes the value.
+fn sync_load(p: int32*) -> int32 {
+  return sync_cas(p, 0, 0);
+}
+
+fn sync_deadline(timeout_ms: int64) -> int64 {
+  if (timeout_ms < 0) { return -1; }
+  return sync_os_now_ns() + timeout_ms * 1000000;
+}
+
+// Nanoseconds left before deadline: -1 for none, 0 once it has passed.
+fn sync_left(deadline: int64) -> int64 {
+  if (deadline < 0) { return -1; }
+  var left: int64 = deadline - sync_os_now_ns();
+  if (left < 0) { return 0; }
+  return left;
+}
+
+// ---- Mutex ------------------------------------------------------------------
+
+// 0 unlocked, 1 locked, 2 locked with waiters. An unlock with nobody
+// waiting makes no system call.
+export struct SyncMutex {
+  state: int32;
+}
+
+export fn sync_mutex_try_lock(m: SyncMutex*) -> bool {
+  return sync_cas(&m->state, 1, 0) == 0;
+}
+
+// Takes the lock, waiting at most timeout_ms. Returns false on timeout.
+export fn sync_mutex_lock_timeout(m: SyncMutex*, timeout_ms: int64) -> bool {
+  if (sync_cas(&m->state, 1, 0) == 0) { return true; }
+  var deadline: int64 = sync_deadline(timeout_ms);
+  // Mark the lock contended; whoever unlocks will wake one waiter.
+  while (sync_xchg(&m->state, 2) != 0) {
+    var left: int64 = sync_left(deadline);
+    if (left == 0) { return false; }
+    sync_os_wait(&m->state, 2, left);
+  }
+  return true;
+}
+
+export fn sync_mutex_lock(m: SyncMutex*) {
+  sync_mutex_lock_timeout(m, -1);
+}
+
+export fn sync_mutex_unlock(m: SyncMutex*) {
+  if (sync_xchg(&m->state, 0) == 2) { sync_os_wake(&m->state, false); }
+}
+
+// ---- Condition variable -----------------------------------------------------
+
+// Waiters sleep on a sequence number that every signal moves on.
+export struct SyncCond {
+  seq: int32;
+}
+
+// Unlocks m, waits for a signal or timeout_ms, and locks m again before it
+// returns. Returns false on timeout. A signal that comes just as the wait
+// begins can wake a waiter that was not the one meant, so wait in a loop
+// that re-checks the condition.
+export fn sync_cond_wait_timeout(c: SyncCond*, m: SyncMutex*, timeout_ms: int64) -> bool {
+  var deadline: int64 = sync_deadline(timeout_ms);
+  var seen: int32 = sync_load(&c->seq);
+  sync_mutex_unlock(m);
+  // Keep waiting until a signal moves seq on or the deadline passes. A
+  // platform wait can end a little early (Windows timers are coarse), and
+  // that alone must not count as a wake-up.
+  var left: int64 = sync_left(deadline);
+  while (left != 0 && sync_load(&c->seq) == seen) {
+    sync_os_wait(&c->seq, seen, left);
+    left = sync_left(deadline);
+  }
+  var woken: bool = sync_load(&c->seq) != seen;
+  // Take the lock as contended: other waiters may be queued behind us.
+  while (sync_xchg(&m->state, 2) != 0) {
+    sync_os_wait(&m->state, 2, -1);
+  }
+  return woken;
+}
+
+export fn sync_cond_wait(c: SyncCond*, m: SyncMutex*) {
+  sync_cond_wait_timeout(c, m, -1);
+}
+
+// Wakes one waiter.
+export fn sync_cond_signal(c: SyncCond*) {
+  sync_inc(&c->seq);
+  sync_os_wake(&c->seq, false);
+}
+
+// Wakes every waiter.
+export fn sync_cond_broadcast(c: SyncCond*) {
+  sync_inc(&c->seq);
+  sync_os_wake(&c->seq, true);
+}
+
+// ---- Reader/writer lock -----------------------------------------------------
+
+// Many readers or one writer. state is the reader count, or -1 while a
+// writer holds it. A waiting writer stops new readers from coming in, so
+// writers are not starved.
+export struct SyncRwLock {
+  state: int32;
+  writers_waiting: int32;
+}
+
+export fn sync_rwlock_try_read(l: SyncRwLock*) -> bool {
+  var s: int32 = sync_load(&l->state);
+  if (s < 0 || sync_load(&l->writers_waiting) > 0) { return false; }
+  return sync_cas(&l->state, s + 1, s) == s;
+}
+
+export fn sync_rwlock_read_timeout(l: SyncRwLock*, timeout_ms: int64) -> bool {
+  var deadline: int64 = sync_deadline(timeout_ms);
+  while (true) {
+    var s: int32 = sync_load(&l->state);
+    if (s >= 0 && sync_load(&l->writers_waiting) == 0) {
+      if (sync_cas(&l->state, s + 1, s) == s) { return true; }
+      continue;
+    }
+    var left: int64 = sync_left(deadline);
+    if (left == 0) { return false; }
+    sync_os_wait(&l->state, s, left);
+  }
+  return false;
+}
+
+export fn sync_rwlock_read(l: SyncRwLock*) {
+  sync_rwlock_read_timeout(l, -1);
+}
+
+export fn sync_rwlock_try_write(l: SyncRwLock*) -> bool {
+  return sync_cas(&l->state, -1, 0) == 0;
+}
+
+export fn sync_rwlock_write_timeout(l: SyncRwLock*, timeout_ms: int64) -> bool {
+  if (sync_cas(&l->state, -1, 0) == 0) { return true; }
+  var deadline: int64 = sync_deadline(timeout_ms);
+  sync_inc(&l->writers_waiting);
+  while (true) {
+    if (sync_cas(&l->state, -1, 0) == 0) {
+      sync_dec(&l->writers_waiting);
+      return true;
+    }
+    var left: int64 = sync_left(deadline);
+    if (left == 0) {
+      // Readers held back by this writer may go now.
+      sync_dec(&l->writers_waiting);
+      sync_os_wake(&l->state, true);
+      return false;
+    }
+    var s: int32 = sync_load(&l->state);
+    if (s != 0) { sync_os_wait(&l->state, s, left); }
+  }
+  return false;
+}
+
+export fn sync_rwlock_write(l: SyncRwLock*) {
+  sync_rwlock_write_timeout(l, -1);
+}
+
+// Releases a read or a write hold.
+export fn sync_rwlock_unlock(l: SyncRwLock*) {
+  var s: int32 = sync_load(&l->state);
+  if (s < 0) {
+    sync_xchg(&l->state, 0);
+    sync_os_wake(&l->state, true);
+    return;
+  }
+  // The last reader out wakes everyone, so a waiting writer can go.
+  if (sync_dec(&l->state) == 0) { sync_os_wake(&l->state, true); }
+}
+
+// ---- Semaphore --------------------------------------------------------------
+
+// A counting semaphore. Set count before sharing it, or start from zero.
+export struct SyncSem {
+  count: int32;
+}
+
+export fn sync_sem_try_acquire(s: SyncSem*) -> bool {
+  var c: int32 = sync_load(&s->count);
+  while (c > 0) {
+    var seen: int32 = sync_cas(&s->count, c - 1, c);
+    if (seen == c) { return true; }
+    c = seen;
+  }
+  return false;
+}
+
+// Takes one unit, waiting at most timeout_ms. Returns false on timeout.
+export fn sync_sem_acquire_timeout(s: SyncSem*, timeout_ms: int64) -> bool {
+  var deadline: int64 = sync_deadline(timeout_ms);
+  while (true) {
+    if (sync_sem_try_acquire(s)) { return true; }
+    var left: int64 = sync_left(deadline);
+    if (left == 0) { return false; }
+    sync_os_wait(&s->count, 0, left);
+  }
+  return false;
+}
+
+export fn sync_sem_acquire(s: SyncSem*) {
+  sync_sem_acquire_timeout(s, -1);
+}
+
+export fn sync_sem_release(s: SyncSem*) {
+  sync_inc(&s->count);
+  sync_os_wake(&s->count, false);
+}

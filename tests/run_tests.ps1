@@ -1679,7 +1679,7 @@ $cases = @(
   @{ Name = "err_global_init_address_arith"; Path = "tests/err_global_init_address_arith.mettle"; ShouldSucceed = $false
      Pattern = "a global's initializer must be known at compile time"
      OutputMustNotMatch = @("internal compiler error") },
-  @{ Name = "err_import_guard_bad_platform"; Path = "tests/err_import_guard_bad_platform.mettle"; ShouldSucceed = $false; Pattern = "Import guard platform must be 'windows', 'linux', 'macos' or 'posix'" },
+  @{ Name = "err_import_guard_bad_platform"; Path = "tests/err_import_guard_bad_platform.mettle"; ShouldSucceed = $false; Pattern = "Import guard must be 'windows', 'linux', 'macos', 'posix', 'x86_64' or 'aarch64'" },
   @{ Name = "block_comment"; Path = "tests/test_block_comment.mettle"; ShouldSucceed = $true },
   @{ Name = "compound_assign"; Path = "tests/test_compound_assign.mettle"; ShouldSucceed = $true },
   @{ Name = "compound_assign_for"; Path = "tests/test_compound_assign_for.mettle"; ShouldSucceed = $true },
@@ -1833,6 +1833,24 @@ $cases = @(
   # natively in both modes and under the compile-time interpreter.
   @{ Name = "views"; Path = "tests/test_views.mettle"; ShouldSucceed = $true },
   @{ Name = "views_release"; Path = "tests/test_views.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_time"; Path = "tests/test_std_time.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_time_release"; Path = "tests/test_std_time.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_datetime_interp"; Path = "tests/test_std_datetime_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
+  @{ Name = "std_file"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_file_release"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "import_guard_arch"; Path = "tests/test_import_guard_arch.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_http2"; Path = "tests/test_std_http2.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_http2_release"; Path = "tests/test_std_http2.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_http2_interp"; Path = "tests/test_std_http2_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
+  @{ Name = "std_websocket"; Path = "tests/test_std_websocket.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_websocket_release"; Path = "tests/test_std_websocket.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_websocket_interp"; Path = "tests/test_std_websocket_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
   @{ Name = "views_interp"; Path = "tests/test_views.mettle"; ShouldSucceed = $true
      Args = @("test")
      SkipBinaryCheck = $true
@@ -3225,6 +3243,20 @@ $cases = @(
     Pattern       = "Could not resolve|import chain"
   }
 )
+
+# std/socket talks over the loopback interface and uses epoll, so it runs on
+# Linux; the macOS and Windows halves are checked by cross-compiling.
+if ($IsLinux) {
+  $cases += @(
+    @{ Name = "std_socket"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_socket_release"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_http"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_http_release"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_sync"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_sync_release"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "mutex_timeout_deadline"; Path = "tests/test_mutex_timeout_deadline.mettle"; ShouldSucceed = $true }
+  )
+}
 
 $total = 0
 $failed = 0

@@ -1,0 +1,36 @@
+// macOS waiting for std/sync: __ulock_wait and __ulock_wake from libSystem.
+// They are not in Apple's public headers, but they are stable since macOS
+// 10.12 and are what the C++ runtime's atomic wait uses.
+
+extern fn sync_c_ulock_wait(op: uint32, addr: int32*, value: uint64, timeout_us: uint32) -> int32 with none = "__ulock_wait";
+extern fn sync_c_ulock_wake(op: uint32, addr: int32*, value: uint64) -> int32 with none = "__ulock_wake";
+extern fn sync_c_clock_gettime(id: int32, ts: int64*) -> int32 with none = "clock_gettime";
+
+const UL_COMPARE_AND_WAIT = 1;
+const ULF_WAKE_ALL = 0x100;
+
+// Sleeps while *addr == expected, for at most timeout_ns (negative waits
+// forever). It may also return early for no reason; callers re-check.
+export fn sync_os_wait(addr: int32*, expected: int32, timeout_ns: int64) {
+  var us: int64 = 0;   // 0 means no timeout to __ulock_wait
+  if (timeout_ns >= 0) {
+    us = (timeout_ns + 999) / 1000;
+    if (us < 1) { us = 1; }
+    if (us > 0xFFFFFFFF) { us = 0xFFFFFFFF; }
+  }
+  sync_c_ulock_wait((uint32)UL_COMPARE_AND_WAIT, addr, (uint64)(uint32)expected, (uint32)us);
+}
+
+// Wakes one waiter on addr, or all of them.
+export fn sync_os_wake(addr: int32*, all: bool) {
+  var op: uint32 = (uint32)UL_COMPARE_AND_WAIT;
+  if (all) { op = op | (uint32)ULF_WAKE_ALL; }
+  sync_c_ulock_wake(op, addr, (uint64)0);
+}
+
+// Nanoseconds on the monotonic clock.
+export fn sync_os_now_ns() -> int64 {
+  var ts: int64[2];
+  if (sync_c_clock_gettime(6, &ts[0]) != 0) { return 0; }
+  return ts[0] * 1000000000 + ts[1];
+}

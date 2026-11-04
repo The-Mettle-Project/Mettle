@@ -1,0 +1,125 @@
+// macOS file calls for std/file, through libc. Every call returns a count,
+// size or descriptor, or a negative error code (-errno), as on Linux.
+
+export const FILE_READ = 1;       // open for reading
+export const FILE_WRITE = 2;      // open for writing
+export const FILE_CREATE = 4;     // create the file if it is missing
+export const FILE_TRUNCATE = 8;   // empty it on open
+export const FILE_APPEND = 16;    // every write goes to the end
+export const FILE_NEW = 32;       // with FILE_CREATE: fail if it exists
+
+export const FILE_LOCK_SHARED = 1;
+export const FILE_LOCK_EXCLUSIVE = 2;
+
+export const FILE_ENOENT = 2;
+export const FILE_EACCES = 13;
+export const FILE_EEXIST = 17;
+export const FILE_EWOULDBLOCK = 35;
+export const FILE_EINTR = 4;
+
+extern fn file_c_errno() -> int32* = "__error";
+// open and fcntl are variadic. x86-64 reads the variadic argument from the
+// third register, arm64 from the first stack slot; passing it as both the
+// 3rd and the 9th argument puts it in both places.
+extern fn file_c_open_v(path: uint8*, flags: int32, a3: int64, a4: int64, a5: int64, a6: int64, a7: int64, a8: int64, a9: int64) -> int32 = "open";
+extern fn file_c_fcntl_v(fd: int32, cmd: int32, a3: int64, a4: int64, a5: int64, a6: int64, a7: int64, a8: int64, a9: int64) -> int32 = "fcntl";
+extern fn file_c_close(fd: int32) -> int32 = "close";
+extern fn file_c_pread(fd: int32, buf: uint8*, n: int64, off: int64) -> int64 = "pread";
+extern fn file_c_pwrite(fd: int32, buf: uint8*, n: int64, off: int64) -> int64 = "pwrite";
+extern fn file_c_fsync(fd: int32) -> int32 = "fsync";
+extern fn file_c_ftruncate(fd: int32, size: int64) -> int32 = "ftruncate";
+extern fn file_c_fstat(fd: int32, st: uint8*) -> int32 = "fstat";
+extern fn file_c_rename(from: uint8*, to: uint8*) -> int32 = "rename";
+extern fn file_c_unlink(path: uint8*) -> int32 = "unlink";
+extern fn file_c_flock(fd: int32, op: int32) -> int32 = "flock";
+
+fn file_ret(r: int64) -> int64 {
+  if (r < 0) { return -(int64)*file_c_errno(); }
+  return r;
+}
+
+// Copies a path into buf with a NUL. Returns false if it does not fit.
+fn file_cpath(path: string, buf: uint8*) -> bool {
+  if (path.length >= (uint64)4096) { return false; }
+  for i in 0..path.length { buf[i] = (uint8)path[i]; }
+  buf[(int64)path.length] = (uint8)0;
+  return true;
+}
+
+// Opens path with FILE_* flags. New files get mode 0644. The descriptor is
+// close-on-exec.
+export fn file_open(path: string, flags: int32) -> int64 {
+  var cp: uint8[4096];
+  if (!file_cpath(path, &cp[0])) { return -63; }   // ENAMETOOLONG
+  var o: int32 = 0x1000000;                      // O_CLOEXEC
+  if ((flags & FILE_READ) != 0 && (flags & FILE_WRITE) != 0) {
+    o = o | 2;
+  } else if ((flags & FILE_WRITE) != 0) {
+    o = o | 1;
+  }
+  if ((flags & FILE_CREATE) != 0) { o = o | 0x200; }
+  if ((flags & FILE_NEW) != 0) { o = o | 0x800; }
+  if ((flags & FILE_TRUNCATE) != 0) { o = o | 0x400; }
+  if ((flags & FILE_APPEND) != 0) { o = o | 8; }
+  return file_ret((int64)file_c_open_v(&cp[0], o, 420, 0, 0, 0, 0, 0, 420));
+}
+
+export fn file_close(fd: int64) -> int64 { return file_ret((int64)file_c_close((int32)fd)); }
+
+// Reads up to n bytes at offset, leaving the file position alone. 0 means
+// end of file.
+export fn file_read_at(fd: int64, buf: uint8*, n: int64, offset: int64) -> int64 {
+  return file_ret(file_c_pread((int32)fd, buf, n, offset));
+}
+
+// Writes up to n bytes at offset, leaving the file position alone.
+export fn file_write_at(fd: int64, buf: uint8*, n: int64, offset: int64) -> int64 {
+  return file_ret(file_c_pwrite((int32)fd, buf, n, offset));
+}
+
+// Flushes data and metadata to the device. On macOS fsync alone leaves data
+// in the drive's cache, so this asks for F_FULLFSYNC first.
+export fn file_sync(fd: int64) -> int64 {
+  if (file_c_fcntl_v((int32)fd, 51, 0, 0, 0, 0, 0, 0, 0) == 0) { return 0; }
+  return file_ret((int64)file_c_fsync((int32)fd));
+}
+
+// Flushes data. macOS has no fdatasync, so this is fsync.
+export fn file_sync_data(fd: int64) -> int64 { return file_ret((int64)file_c_fsync((int32)fd)); }
+
+export fn file_truncate(fd: int64, size: int64) -> int64 {
+  return file_ret((int64)file_c_ftruncate((int32)fd, size));
+}
+
+export fn file_size(fd: int64) -> int64 {
+  var st: int64[18];   // struct stat is 144 bytes; st_size is at 96
+  var r: int64 = file_ret((int64)file_c_fstat((int32)fd, (uint8*)&st[0]));
+  if (r < 0) { return r; }
+  return st[12];
+}
+
+// Renames, replacing any file already at to.
+export fn file_rename(from: string, to: string) -> int64 {
+  var a: uint8[4096];
+  var b: uint8[4096];
+  if (!file_cpath(from, &a[0]) || !file_cpath(to, &b[0])) { return -63; }
+  return file_ret((int64)file_c_rename(&a[0], &b[0]));
+}
+
+export fn file_remove(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!file_cpath(path, &cp[0])) { return -63; }
+  return file_ret((int64)file_c_unlink(&cp[0]));
+}
+
+// Takes an advisory lock on the whole file: FILE_LOCK_SHARED or
+// FILE_LOCK_EXCLUSIVE. With wait false it fails at once with
+// -FILE_EWOULDBLOCK when another holder has a conflicting lock.
+export fn file_lock(fd: int64, kind: int32, wait: bool) -> int64 {
+  var op: int32 = 1;
+  if (kind == FILE_LOCK_EXCLUSIVE) { op = 2; }
+  if (!wait) { op = op | 4; }
+  return file_ret((int64)file_c_flock((int32)fd, op));
+}
+
+export fn file_unlock(fd: int64) -> int64 { return file_ret((int64)file_c_flock((int32)fd, 8)); }

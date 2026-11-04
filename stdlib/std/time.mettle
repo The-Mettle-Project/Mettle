@@ -1,0 +1,25 @@
+// Clocks and sleep. Imports std/datetime, so durations, dates and the
+// formatters come with it.
+
+import "std/datetime";
+import "std/time_os";
+
+// ---- Clocks -----------------------------------------------------------------
+
+export fn time_unix() -> int64 { return time_floor_div(time_unix_ns(), TIME_SECOND); }
+export fn time_unix_ms() -> int64 { return time_floor_div(time_unix_ns(), TIME_MILLISECOND); }
+export fn time_unix_us() -> int64 { return time_floor_div(time_unix_ns(), TIME_MICROSECOND); }
+
+export fn time_mono_us() -> int64 { return time_mono_ns() / TIME_MICROSECOND; }
+export fn time_mono_ms() -> int64 { return time_mono_ns() / TIME_MILLISECOND; }
+
+// Nanoseconds elapsed since a time_mono_ns() reading.
+export fn time_since_ns(start: int64) -> int64 { return time_mono_ns() - start; }
+
+export fn time_sleep_us(us: int64) { time_sleep_ns(us * TIME_MICROSECOND); }
+export fn time_sleep_ms(ms: int64) { time_sleep_ns(ms * TIME_MILLISECOND); }
+
+// The current UTC date and time.
+export fn time_now_utc() -> DateTime {
+  return time_at_offset(time_unix_ns(), 0);
+}

@@ -11,6 +11,7 @@ typedef struct {
   const char *stdlib_directory;
   int target_is_elf;
   int target_is_macos;
+  int target_is_arm64;
   int gpu_provider_metal;
 } ImportResolverOptions;
 

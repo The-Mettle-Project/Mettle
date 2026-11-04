@@ -1,0 +1,56 @@
+// std/file: positional reads and writes, sync, truncate, size, rename,
+// remove and locks, on a scratch file in the working directory.
+import "std/file";
+import "std/conv";
+
+fn main() -> int32 {
+  var path: string = "test_std_file.tmp";
+  var moved: string = "test_std_file_moved.tmp";
+  file_remove(path);
+  file_remove(moved);
+
+  // Opening a missing file without FILE_CREATE fails with -FILE_ENOENT.
+  if (file_open(path, FILE_READ) != -(int64)FILE_ENOENT) { return 1; }
+  var fd: int64 = file_open(path, FILE_READ | FILE_WRITE | FILE_CREATE | FILE_NEW);
+  if (fd < 0) { return 2; }
+  // FILE_NEW refuses a file that exists.
+  if (file_open(path, FILE_WRITE | FILE_CREATE | FILE_NEW) != -(int64)FILE_EEXIST) { return 3; }
+
+  var a: string = "hello";
+  var b: string = "world";
+  if (file_write_at(fd, a.chars, (int64)5, (int64)0) != 5) { return 4; }
+  // A write past the end leaves a hole of zeros.
+  if (file_write_at(fd, b.chars, (int64)5, (int64)10) != 5) { return 5; }
+  if (file_size(fd) != (int64)15) { return 6; }
+  var buf: uint8[32];
+  if (file_read_at(fd, &buf[0], (int64)32, (int64)0) != (int64)15) { return 7; }
+  if (str_from_bytes((cstring)&buf[0], (int64)5) != a || buf[7] != (uint8)0) { return 8; }
+  if (file_read_at(fd, &buf[0], (int64)5, (int64)10) != 5 || str_from_bytes((cstring)&buf[0], (int64)5) != b) { return 9; }
+  // Reading at the end gives 0.
+  if (file_read_at(fd, &buf[0], (int64)8, (int64)15) != 0) { return 10; }
+  if (file_sync(fd) != 0 || file_sync_data(fd) != 0) { return 11; }
+  if (file_truncate(fd, (int64)3) != 0 || file_size(fd) != (int64)3) { return 12; }
+
+  // A second open of the same file cannot take a conflicting lock.
+  var fd2: int64 = file_open(path, FILE_READ | FILE_WRITE);
+  if (fd2 < 0) { return 13; }
+  if (file_lock(fd, FILE_LOCK_EXCLUSIVE, false) != 0) { return 14; }
+  if (file_lock(fd2, FILE_LOCK_EXCLUSIVE, false) != -(int64)FILE_EWOULDBLOCK) { return 15; }
+  if (file_unlock(fd) != 0) { return 16; }
+  if (file_lock(fd2, FILE_LOCK_SHARED, false) != 0) { return 17; }
+  if (file_lock(fd, FILE_LOCK_SHARED, false) != 0) { return 18; }
+  file_unlock(fd);
+  file_unlock(fd2);
+  if (file_close(fd2) != 0 || file_close(fd) != 0) { return 19; }
+
+  // FILE_TRUNCATE empties an existing file.
+  var t: int64 = file_open(path, FILE_WRITE | FILE_TRUNCATE);
+  if (t < 0 || file_size(t) != 0) { return 20; }
+  file_close(t);
+
+  if (file_rename(path, moved) != 0) { return 21; }
+  if (file_open(path, FILE_READ) != -(int64)FILE_ENOENT) { return 22; }
+  if (file_remove(moved) != 0) { return 23; }
+  if (file_remove(moved) != -(int64)FILE_ENOENT) { return 24; }
+  return 0;
+}

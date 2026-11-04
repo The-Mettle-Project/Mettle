@@ -1,0 +1,60 @@
+// Windows waiting for std/sync. WaitOnAddress is not in kernel32, so this
+// builds the same thing from kernel32's SRW locks and condition variables:
+// each address hashes to one of 64 buckets, and a waiter sleeps on its
+// bucket's condition variable while the value is unchanged.
+
+extern fn sync_w_acquire(lock: int64*) with none = "AcquireSRWLockExclusive";
+extern fn sync_w_release(lock: int64*) with none = "ReleaseSRWLockExclusive";
+extern fn sync_w_sleep(cv: int64*, lock: int64*, ms: uint32, flags: uint32) -> int32 with none = "SleepConditionVariableSRW";
+extern fn sync_w_wake_all(cv: int64*) with none = "WakeAllConditionVariable";
+extern fn sync_w_qpc(counter: int64*) -> int32 with none = "QueryPerformanceCounter";
+extern fn sync_w_qpf(freq: int64*) -> int32 with none = "QueryPerformanceFrequency";
+extern fn sync_w_cas(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+// SRWLOCK and CONDITION_VARIABLE are one pointer each, and zero is their
+// initial state, so zeroed globals need no setup.
+var g_sync_locks: int64[64];
+var g_sync_conds: int64[64];
+var g_sync_freq: int64 = 0;
+
+fn sync_os_bucket(addr: int32*) -> int64 {
+  var a: uint64 = (uint64)(int64)addr;
+  return (int64)(((a >> 2) * (uint64)0x9E3779B97F4A7C15) >> 58);
+}
+
+// Sleeps while *addr == expected, for at most timeout_ns (negative waits
+// forever). It may also return early for no reason; callers re-check.
+export fn sync_os_wait(addr: int32*, expected: int32, timeout_ns: int64) {
+  var b: int64 = sync_os_bucket(addr);
+  var ms: uint32 = (uint32)0xFFFFFFFF;   // INFINITE
+  if (timeout_ns >= 0) {
+    var m: int64 = (timeout_ns + 999999) / 1000000;
+    if (m > 0xFFFFFFFE) { m = 0xFFFFFFFE; }
+    ms = (uint32)m;
+  }
+  sync_w_acquire(&g_sync_locks[b]);
+  // The value is read under the bucket lock, and a waker takes the same
+  // lock after changing it, so a wake cannot fall between check and sleep.
+  if (sync_w_cas(addr, expected, expected) == expected) {
+    sync_w_sleep(&g_sync_conds[b], &g_sync_locks[b], ms, (uint32)0);
+  }
+  sync_w_release(&g_sync_locks[b]);
+}
+
+// Wakes the waiters on addr. Waiters on other addresses in the same bucket
+// wake too, re-check and sleep again.
+export fn sync_os_wake(addr: int32*, all: bool) {
+  var b: int64 = sync_os_bucket(addr);
+  sync_w_acquire(&g_sync_locks[b]);
+  sync_w_wake_all(&g_sync_conds[b]);
+  sync_w_release(&g_sync_locks[b]);
+}
+
+// Nanoseconds on the monotonic clock.
+export fn sync_os_now_ns() -> int64 {
+  if (g_sync_freq == 0) { sync_w_qpf(&g_sync_freq); }
+  if (g_sync_freq == 0) { return 0; }
+  var c: int64 = 0;
+  sync_w_qpc(&c);
+  return (c / g_sync_freq) * 1000000000 + (c % g_sync_freq) * 1000000000 / g_sync_freq;
+}

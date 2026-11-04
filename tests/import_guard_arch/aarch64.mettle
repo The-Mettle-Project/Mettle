@@ -1,0 +1,2 @@
+// Taken only on AArch64 targets.
+export const GUARD_ARCH = 2;

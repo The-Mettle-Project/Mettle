@@ -1,0 +1,6 @@
+// Linux system call numbers for the target CPU. The stdlib's raw-syscall
+// files import this instead of hard-coding one architecture's numbers.
+// fstat's struct stat puts st_size at byte 48 on both.
+
+import "std/linux_sys_x86_64" if x86_64;
+import "std/linux_sys_aarch64" if aarch64;

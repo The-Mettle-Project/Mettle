@@ -1,0 +1,80 @@
+// std/hpack and std/http2 run in the compile-time interpreter.
+import "std/hpack";
+import "std/http2";
+import "std/arena";
+
+@test fn integers_and_huffman_in_the_interpreter() -> int32 {
+  var buf: uint8[16];
+  var n: int64 = hpack_int_encode(1337, 5, 0, &buf[0], 16);
+  var back: int64 = 0;
+  if (n != 3 || buf[0] != (uint8)0x1f || buf[1] != (uint8)0x9a || buf[2] != (uint8)0x0a) { return 1; }
+  if (hpack_int_decode(&buf[0], n, 5, &back) != 3 || back != 1337) { return 2; }
+  var text: string = "www.example.com";
+  var enc: uint8[32];
+  var dec: uint8[32];
+  var m: int64 = hpack_huffman_encode(text.chars, (int64)text.length, &enc[0], 32);
+  if (m != 12 || enc[0] != (uint8)0xf1 || enc[11] != (uint8)0xff) { return 3; }
+  if (hpack_huffman_decode(&enc[0], m, &dec[0], 32) != 15 || dec[14] != (uint8)109) { return 4; }
+  enc[11] = (uint8)0x00;
+  if (hpack_huffman_decode(&enc[0], m, &dec[0], 32) != HPACK_ERR_HUFFMAN) { return 5; }
+  return 0;
+}
+
+@test fn rfc_request_sequence_in_the_interpreter() -> int32 {
+  var arena: Arena* = arena_init((int64)0);
+  var d: HpackDecoder;
+  var e: HpackEncoder;
+  if (!hpack_decoder_init(&d, arena, 4096, 0) || !hpack_encoder_init(&e, arena, 4096, true)) { return 1; }
+  // RFC 7541 C.4.1 and C.4.2, with Huffman.
+  var first: uint8[17] = [0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff];
+  var h: HpackHeaders;
+  hpack_headers_init(&h, arena);
+  if (hpack_decode(&d, &first[0], 17, &h) != 0 || h.count != 4) { return 2; }
+  if (h.items[3].name != ":authority" || h.items[3].value != "www.example.com") { return 3; }
+  if (d.table.size != 57 || hpack_table_len(&d.table) != 1) { return 4; }
+  var out: uint8[64];
+  var o: HpackOut;
+  hpack_out_init(&o, &out[0], 64);
+  if (hpack_encode_block(&e, &o, h.items, h.count) != 0 || o.len != 17) { return 5; }
+  for i in 0..17 {
+    if (out[i] != first[i]) { return 6; }
+  }
+  var second: uint8[12] = [0x82, 0x86, 0x84, 0xbe, 0x58, 0x86, 0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf];
+  hpack_headers_clear(&h);
+  if (hpack_decode(&d, &second[0], 12, &h) != 0 || h.count != 5) { return 7; }
+  if (h.items[4].name != "cache-control" || h.items[4].value != "no-cache" || d.table.size != 110) { return 8; }
+  // A bad index is refused.
+  var bad: uint8[1] = [0xbf];
+  hpack_decoder_init(&d, arena, 4096, 0);
+  hpack_headers_clear(&h);
+  if (hpack_decode(&d, &bad[0], 1, &h) != HPACK_ERR_INDEX) { return 9; }
+  arena_free(arena);
+  return 0;
+}
+
+@test fn frames_and_grpc_in_the_interpreter() -> int32 {
+  var buf: uint8[64];
+  var data: uint8[4] = [1, 2, 3, 4];
+  var n: int64 = h2_build_data(&buf[0], 64, 5, &data[0], 4, true, 2);
+  if (n != 9 + 1 + 4 + 2) { return 1; }
+  var r: H2Reader;
+  var f: H2Frame;
+  h2_reader_init(&r, 16384, false);
+  if (h2_reader_next(&r, &buf[0], n - 1, &f) != H2_READ_MORE || f.need != n) { return 2; }
+  if (h2_reader_next(&r, &buf[0], n, &f) != H2_READ_FRAME) { return 3; }
+  var dp: H2Data;
+  if (h2_parse_data(f.header, f.payload, &dp) != 0 || dp.length != 4 || dp.pad_length != 2 || !dp.end_stream) { return 4; }
+  var w: H2Window;
+  h2_window_init(&w, H2_MAX_WINDOW);
+  if (h2_window_credit(&w, 1) != H2_FLOW_CONTROL_ERROR) { return 5; }
+  var g: uint8[16];
+  var gn: int64 = h2_grpc_write(&g[0], 16, &data[0], 4, false);
+  var m: H2GrpcMessage;
+  if (gn != 9 || h2_grpc_read(&g[0], gn, 100, &m) != H2_GRPC_READ_MESSAGE || m.length != 4) { return 6; }
+  if (h2_grpc_timeout_parse("5S") != 5000 || h2_grpc_timeout_parse("100m") != 100) { return 7; }
+  var t: uint8[16];
+  var tn: int64 = h2_grpc_timeout_format(5000, &t[0], 16);
+  if (tn != 2 || t[0] != (uint8)53 || t[1] != (uint8)83) { return 8; }
+  if (h2_grpc_status_name(H2_GRPC_UNAVAILABLE) != "UNAVAILABLE") { return 9; }
+  return 0;
+}

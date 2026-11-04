@@ -3754,10 +3754,21 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
   }
 }
 
-static int import_platform_matches(const char *guard, int target_is_elf,
-                                   int target_is_macos) {
+static int import_platform_matches(const char *guard,
+                                   const ImportResolverOptions *options) {
+  int target_is_elf = options && options->target_is_elf;
+  int target_is_macos = options && options->target_is_macos;
+  int target_is_arm64 = options && options->target_is_arm64;
   if (!guard) {
     return 1;
+  }
+  /* The architecture guards let a file pick per-CPU data, such as Linux
+     system call numbers, which differ between x86-64 and AArch64. */
+  if (strcmp(guard, "x86_64") == 0) {
+    return !target_is_arm64;
+  }
+  if (strcmp(guard, "aarch64") == 0) {
+    return target_is_arm64;
   }
   if (strcmp(guard, "posix") == 0) {
     return target_is_elf;
@@ -3807,10 +3818,8 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
     if (decl->type == AST_IMPORT) {
       ImportDeclaration *import_decl = (ImportDeclaration *)decl->data;
 
-      if (!import_platform_matches(
-              import_decl->platform_guard,
-              ctx && ctx->options && ctx->options->target_is_elf,
-              ctx && ctx->options && ctx->options->target_is_macos)) {
+      if (!import_platform_matches(import_decl->platform_guard,
+                                   ctx ? ctx->options : NULL)) {
         ast_destroy_node(decl);
         continue;
       }

@@ -1,0 +1,1426 @@
+// std/hpack and std/http2: HPACK integers, Huffman, tables, the RFC 7541
+// appendix C examples, HTTP/2 frames, the frame reader, flow control, and gRPC
+// framing.
+import "std/hpack";
+import "std/http2";
+import "std/arena";
+import "std/io";
+
+fn hexval(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return -1;
+}
+
+// "0a1f" or "0a 1f" into bytes.
+fn hex_to_bytes(hex: string, out: uint8*) -> int64 {
+  var n: int64 = 0;
+  var hi: int32 = -1;
+  for i in 0..(int64)hex.length {
+    var c: int32 = (int32)hex[i];
+    if (c == 32) { continue; }
+    var v: int32 = hexval(c);
+    if (hi < 0) {
+      hi = v;
+    } else {
+      out[n] = (uint8)(hi * 16 + v);
+      n = n + 1;
+      hi = -1;
+    }
+  }
+  return n;
+}
+
+fn eq_hex(buf: uint8*, n: int64, hex: string) -> bool {
+  var want: uint8[600];
+  var m: int64 = hex_to_bytes(hex, &want[0]);
+  if (m != n) { return false; }
+  for i in 0..n {
+    if (buf[i] != want[i]) { return false; }
+  }
+  return true;
+}
+
+fn str_is(p: uint8*, n: int64, want: string) -> bool {
+  if (n != (int64)want.length) { return false; }
+  for i in 0..n {
+    if ((int32)p[i] != (int32)want[i]) { return false; }
+  }
+  return true;
+}
+
+var g_seed: int64 = 12345;
+
+fn rnd(n: int32) -> int32 {
+  g_seed = (g_seed * 1103515245 + 12345) & 2147483647;
+  return (int32)((g_seed >> 8) % (int64)n);
+}
+
+const ALPHA: string = "abcdefghijklmnopqrstuvwxyz0123456789-_/:.= ";
+
+fn rand_string(arena: Arena*, max_len: int32) -> string {
+  var len: int32 = rnd(max_len + 1);
+  var p: uint8* = (uint8*)arena_alloc(arena, (int64)len + 1);
+  for i in 0..len {
+    if (rnd(10) < 7) {
+      p[i] = (uint8)ALPHA[rnd(43)];
+    } else {
+      p[i] = (uint8)rnd(256);
+    }
+  }
+  p[len] = (uint8)0;
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)len;
+  return s;
+}
+
+fn mk(length: int64, type: int32, flags: int32, stream_id: int32) -> H2FrameHeader {
+  var h: H2FrameHeader;
+  h.length = length;
+  h.type = type;
+  h.flags = flags;
+  h.stream_id = stream_id;
+  return h;
+}
+
+// ---- HPACK integers ----
+
+fn int_is(value: int64, prefix: int32, flags: int32, hex: string) -> bool {
+  var buf: uint8[16];
+  var n: int64 = hpack_int_encode(value, prefix, flags, &buf[0], 16);
+  if (n < 0 || !eq_hex(&buf[0], n, hex)) { return false; }
+  var back: int64 = -1;
+  var used: int64 = hpack_int_decode(&buf[0], n, prefix, &back);
+  return used == n && back == value;
+}
+
+fn t_integers() -> int32 {
+  // RFC 7541 appendix C.1.
+  if (!int_is(10, 5, 0, "0a")) { return 1; }
+  if (!int_is(1337, 5, 0, "1f9a0a")) { return 2; }
+  if (!int_is(42, 8, 0, "2a")) { return 3; }
+  // The value equal to the prefix maximum takes a second byte.
+  if (!int_is(31, 5, 0, "1f00")) { return 4; }
+  if (!int_is(127, 7, 128, "ff00")) { return 5; }
+  if (!int_is(128, 7, 0, "7f01")) { return 6; }
+  if (!int_is(255, 8, 0, "ff00")) { return 7; }
+  if (!int_is(254, 8, 0, "fe")) { return 8; }
+  if (!int_is(0, 1, 0, "00")) { return 9; }
+  if (!int_is(1, 1, 0, "0100")) { return 10; }
+  if (!int_is(0, 8, 0, "00")) { return 11; }
+  // Flag bits above the prefix are written and ignored on reading.
+  if (!int_is(3, 6, 64, "43")) { return 12; }
+  if (!int_is(HPACK_INT_MAX, 7, 0, "7f80ffffff0f")) { return 13; }
+  var buf: uint8[16];
+  var v: int64 = 0;
+  // Beyond the largest accepted value.
+  var n: int64 = hpack_int_encode(HPACK_INT_MAX + 1, 7, 0, &buf[0], 16);
+  if (n < 0) { return 14; }
+  if (hpack_int_decode(&buf[0], n, 7, &v) != HPACK_ERR_INTEGER) { return 15; }
+  // Too many continuation bytes, even if every one is zero.
+  var lng: uint8[8] = [0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+  if (hpack_int_decode(&lng[0], 8, 5, &v) != HPACK_ERR_INTEGER) { return 16; }
+  var big: uint8[8] = [0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00];
+  if (hpack_int_decode(&big[0], 8, 5, &v) != HPACK_ERR_INTEGER) { return 17; }
+  // Cut off.
+  var cut: uint8[2] = [0x1f, 0x9a];
+  if (hpack_int_decode(&cut[0], 2, 5, &v) != HPACK_ERR_TRUNCATED) { return 18; }
+  if (hpack_int_decode(&cut[0], 0, 5, &v) != HPACK_ERR_TRUNCATED) { return 19; }
+  // Encoder refusals.
+  if (hpack_int_encode(-1, 5, 0, &buf[0], 16) != -1) { return 20; }
+  if (hpack_int_encode(5, 0, 0, &buf[0], 16) != -1) { return 21; }
+  if (hpack_int_encode(5, 9, 0, &buf[0], 16) != -1) { return 22; }
+  if (hpack_int_encode(5, 5, 0, &buf[0], 0) != -1) { return 23; }
+  if (hpack_int_encode(1337, 5, 0, &buf[0], 2) != -1) { return 24; }
+  if (hpack_int_encode(1337, 5, 0, &buf[0], 3) != 3) { return 25; }
+  return 0;
+}
+
+// ---- Huffman ----
+
+fn huff_is(plain: string, hex: string) -> bool {
+  var buf: uint8[300];
+  var n: int64 = hpack_huffman_encode(plain.chars, (int64)plain.length, &buf[0], 300);
+  if (n < 0 || !eq_hex(&buf[0], n, hex)) { return false; }
+  if (hpack_huffman_encoded_len(plain.chars, (int64)plain.length) != n) { return false; }
+  var back: uint8[300];
+  var m: int64 = hpack_huffman_decode(&buf[0], n, &back[0], 300);
+  if (!str_is(&back[0], m, plain)) { return false; }
+  return hpack_huffman_decode(&buf[0], n, (uint8*)0, 0) == m;
+}
+
+fn huff_rejects(hex: string) -> bool {
+  var buf: uint8[64];
+  var n: int64 = hex_to_bytes(hex, &buf[0]);
+  var out: uint8[256];
+  return hpack_huffman_decode(&buf[0], n, &out[0], 256) == HPACK_ERR_HUFFMAN
+    && hpack_huffman_decode(&buf[0], n, (uint8*)0, 0) == HPACK_ERR_HUFFMAN;
+}
+
+fn t_huffman() -> int32 {
+  // RFC 7541 appendix C.4 and C.6.
+  if (!huff_is("www.example.com", "f1e3c2e5f23a6ba0ab90f4ff")) { return 26; }
+  if (!huff_is("no-cache", "a8eb10649cbf")) { return 27; }
+  if (!huff_is("custom-key", "25a849e95ba97d7f")) { return 28; }
+  if (!huff_is("custom-value", "25a849e95bb8e8b4bf")) { return 29; }
+  if (!huff_is("302", "6402")) { return 30; }
+  if (!huff_is("307", "640eff")) { return 31; }
+  if (!huff_is("private", "aec3771a4b")) { return 32; }
+  if (!huff_is("gzip", "9bd9ab")) { return 33; }
+  if (!huff_is("Mon, 21 Oct 2013 20:13:21 GMT", "d07abe941054d444a8200595040b8166e082a62d1bff")) { return 34; }
+  if (!huff_is("https://www.example.com", "9d29ad171863c78f0b97c8e9ae82ae43d3")) { return 35; }
+  if (!huff_is("foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1", "94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007")) { return 36; }
+  if (!huff_is("a", "1f")) { return 37; }
+  if (!huff_is("", "")) { return 38; }
+  // Every byte value, alone and together.
+  var all: uint8[256];
+  for i in 0..256 {
+    all[i] = (uint8)i;
+  }
+  var enc: uint8[1200];
+  var dec: uint8[300];
+  var n: int64 = hpack_huffman_encode(&all[0], 256, &enc[0], 1200);
+  if (n < 0 || hpack_huffman_encoded_len(&all[0], 256) != n) { return 39; }
+  var m: int64 = hpack_huffman_decode(&enc[0], n, &dec[0], 300);
+  if (m != 256) { return 40; }
+  for i in 0..256 {
+    if (dec[i] != all[i]) { return 41; }
+    var one: uint8[1] = [(uint8)i];
+    var e1: uint8[8];
+    var d1: uint8[4];
+    var n1: int64 = hpack_huffman_encode(&one[0], 1, &e1[0], 8);
+    if (n1 < 1 || n1 > 4) { return 42; }
+    if (hpack_huffman_decode(&e1[0], n1, &d1[0], 4) != 1 || d1[0] != one[0]) { return 43; }
+  }
+  // Random strings.
+  for round in 0..300 {
+    var len: int32 = rnd(120);
+    var src: uint8[128];
+    for i in 0..len {
+      src[i] = (uint8)rnd(256);
+      if (rnd(3) != 0) { src[i] = (uint8)(97 + rnd(26)); }
+    }
+    var e2: uint8[600];
+    var d2: uint8[128];
+    var n2: int64 = hpack_huffman_encode(&src[0], (int64)len, &e2[0], 600);
+    if (n2 != hpack_huffman_encoded_len(&src[0], (int64)len)) { return 44; }
+    if (hpack_huffman_decode(&e2[0], n2, &d2[0], 128) != (int64)len) { return 45; }
+    for i in 0..len {
+      if (d2[i] != src[i]) { return 46; }
+    }
+  }
+  // Bad data. EOS (thirty ones) inside the data, in the first bytes or later.
+  if (!huff_rejects("ffffffff")) { return 47; }
+  if (!huff_rejects("fffffffc")) { return 48; }
+  if (!huff_rejects("1fffffffff")) { return 49; }
+  // More than 7 bits of padding, all ones: "a" then eight more ones.
+  if (!huff_rejects("1fff")) { return 50; }
+  if (!huff_rejects("ff")) { return 51; }
+  // Padding that is not all ones: "a" (00011) then 000, and then 110.
+  if (!huff_rejects("18")) { return 52; }
+  if (!huff_rejects("1e")) { return 53; }
+  // Exactly 7 padding bits are fine: byte 199 has a 25-bit code, so 7 bits fill the last byte.
+  var ok: uint8[4] = [0xff, 0xff, 0xf6, 0x7f];
+  var outb: uint8[4];
+  if (hpack_huffman_decode(&ok[0], 4, &outb[0], 4) != 1 || outb[0] != (uint8)199) { return 54; }
+  ok[3] = (uint8)0x7e;
+  if (hpack_huffman_decode(&ok[0], 4, &outb[0], 4) != HPACK_ERR_HUFFMAN) { return 55; }
+  // Output and input limits.
+  var small: uint8[2];
+  var plain: string = "www.example.com";
+  if (hpack_huffman_encode(plain.chars, 15, &small[0], 2) != -1) { return 56; }
+  var packed: uint8[12];
+  hex_to_bytes("f1e3c2e5f23a6ba0ab90f4ff", &packed[0]);
+  if (hpack_huffman_decode(&packed[0], 12, &small[0], 2) != HPACK_ERR_NOSPACE) { return 57; }
+  if (hpack_huffman_decode(&packed[0], 12, &enc[0], 15) != 15) { return 58; }
+  if (hpack_huffman_decode(&packed[0], 12, &enc[0], 14) != HPACK_ERR_NOSPACE) { return 59; }
+  return 0;
+}
+
+// ---- String literals ----
+
+fn t_strings() -> int32 {
+  var buf: uint8[64];
+  var plain: string = "custom-key";
+  var n: int64 = hpack_string_encode(plain, false, &buf[0], 64);
+  if (!eq_hex(&buf[0], n, "0a63757374 6f6d2d6b6579")) { return 60; }
+  n = hpack_string_encode(plain, true, &buf[0], 64);
+  if (!eq_hex(&buf[0], n, "8825a849e95ba97d7f")) { return 61; }
+  var out: uint8[64];
+  var len: int64 = 0;
+  if (hpack_string_decode(&buf[0], n, &out[0], 64, &len) != n) { return 62; }
+  if (!str_is(&out[0], len, "custom-key")) { return 63; }
+  // The length claims more bytes than there are.
+  if (hpack_string_decode(&buf[0], n - 1, &out[0], 64, &len) != HPACK_ERR_TRUNCATED) { return 64; }
+  if (hpack_string_decode(&buf[0], 0, &out[0], 64, &len) != HPACK_ERR_TRUNCATED) { return 65; }
+  if (hpack_string_decode(&buf[0], n, &out[0], 5, &len) != HPACK_ERR_NOSPACE) { return 66; }
+  if (hpack_string_encode(plain, false, &buf[0], 10) != -1) { return 67; }
+  if (hpack_string_encode(plain, false, &buf[0], 11) != 11) { return 68; }
+  // A string longer than 127 bytes needs a two-byte length.
+  var longer: uint8[200];
+  for i in 0..200 {
+    longer[i] = (uint8)97;
+  }
+  var ls: string;
+  ls.chars = &longer[0];
+  ls.length = (uint64)200;
+  var big: uint8[300];
+  n = hpack_string_encode(ls, false, &big[0], 300);
+  if (n != 202 || big[0] != (uint8)0x7f || big[1] != (uint8)73) { return 69; }
+  var back: uint8[300];
+  if (hpack_string_decode(&big[0], n, &back[0], 300, &len) != n || len != 200) { return 70; }
+  return 0;
+}
+
+// ---- Tables ----
+
+fn field_is(t: HpackTable*, index: int64, name: string, value: string) -> bool {
+  var f: HpackField;
+  if (!hpack_table_get(t, index, &f)) { return false; }
+  return f.name == name && f.value == value;
+}
+
+fn t_tables(arena: Arena*) -> int32 {
+  var t: HpackTable;
+  if (!hpack_table_init(&t, arena, 128)) { return 71; }
+  if (!field_is(&t, 1, ":authority", "")) { return 72; }
+  if (!field_is(&t, 2, ":method", "GET")) { return 73; }
+  if (!field_is(&t, 8, ":status", "200")) { return 74; }
+  if (!field_is(&t, 16, "accept-encoding", "gzip, deflate")) { return 75; }
+  if (!field_is(&t, 61, "www-authenticate", "")) { return 76; }
+  var f: HpackField;
+  if (hpack_table_get(&t, 0, &f)) { return 77; }
+  if (hpack_table_get(&t, 62, &f)) { return 78; }
+  if (hpack_table_get(&t, -3, &f)) { return 79; }
+  // Each entry is 4 bytes of text and 32 of overhead.
+  hpack_table_add(&t, "aa", "11");
+  hpack_table_add(&t, "bb", "22");
+  hpack_table_add(&t, "cc", "33");
+  if (t.size != 108 || hpack_table_len(&t) != 3) { return 80; }
+  if (!field_is(&t, 62, "cc", "33") || !field_is(&t, 64, "aa", "11")) { return 81; }
+  // The fourth does not fit in 128: the oldest goes.
+  hpack_table_add(&t, "dd", "44");
+  if (t.size != 108 || hpack_table_len(&t) != 3) { return 82; }
+  if (!field_is(&t, 62, "dd", "44") || !field_is(&t, 64, "bb", "22")) { return 83; }
+  if (hpack_table_get(&t, 65, &f)) { return 84; }
+  // Shrinking the limit evicts.
+  hpack_table_set_max(&t, 80);
+  if (t.size != 72 || hpack_table_len(&t) != 2 || !field_is(&t, 63, "cc", "33")) { return 85; }
+  // A limit above the capacity is clamped.
+  hpack_table_set_max(&t, 100000);
+  if (t.max_size != 128) { return 86; }
+  hpack_table_set_max(&t, 0);
+  if (t.size != 0 || hpack_table_len(&t) != 0) { return 87; }
+  hpack_table_set_max(&t, 128);
+  // An entry bigger than the limit empties the table and is not added.
+  hpack_table_add(&t, "aa", "11");
+  var huge: string = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
+  if (hpack_table_add(&t, "x", huge)) { return 88; }
+  if (t.size != 0 || hpack_table_len(&t) != 0) { return 89; }
+  // Many adds: the byte store wraps around and slides, and the entries stay right.
+  for i in 0..400 {
+    var name: string = "k{i}";
+    var value: string = "v{i * 7}";
+    if (!hpack_table_add(&t, name, value)) { return 90; }
+    if (!field_is(&t, 62, name, value)) { return 91; }
+    if (i >= 1) {
+      if (!field_is(&t, 63, "k{i - 1}", "v{(i - 1) * 7}")) { return 92; }
+    }
+    if (t.size > 128) { return 93; }
+  }
+  // A table with no room at all takes nothing.
+  var zero: HpackTable;
+  if (!hpack_table_init(&zero, arena, 0)) { return 94; }
+  if (hpack_table_add(&zero, "", "")) { return 95; }
+  return 0;
+}
+
+// ---- RFC 7541 appendix C ----
+
+fn decode_hex(d: HpackDecoder*, arena: Arena*, hex: string, h: HpackHeaders*) -> int32 {
+  var blk: uint8[600];
+  var n: int64 = hex_to_bytes(hex, &blk[0]);
+  hpack_headers_init(h, arena);
+  return hpack_decode(d, &blk[0], n, h);
+}
+
+fn hdr_is(h: HpackHeaders*, i: int64, name: string, value: string) -> bool {
+  if (i >= h->count) { return false; }
+  return h->items[i].name == name && h->items[i].value == value;
+}
+
+// One step of a request or response sequence: decode `hex`, check the list and
+// the dynamic table, then encode the same list with the encoder and expect the
+// same bytes. Returns 0, or a code that says which check failed.
+fn rfc_step(arena: Arena*, d: HpackDecoder*, e: HpackEncoder*, hex: string, count: int64, last_name: string, last_value: string, dyn_count: int64, dyn_size: int64, newest_name: string, newest_value: string) -> int32 {
+  var h: HpackHeaders;
+  if (decode_hex(d, arena, hex, &h) != 0) { return 1; }
+  if (h.count != count) { return 2; }
+  if (!hdr_is(&h, count - 1, last_name, last_value)) { return 3; }
+  if (hpack_table_len(&d->table) != dyn_count || d->table.size != dyn_size) { return 4; }
+  if (dyn_count > 0 && !field_is(&d->table, 62, newest_name, newest_value)) { return 5; }
+  var out: uint8[600];
+  var o: HpackOut;
+  hpack_out_init(&o, &out[0], 600);
+  if (hpack_encode_block(e, &o, h.items, h.count) != 0) { return 6; }
+  if (!eq_hex(&out[0], o.len, hex)) { return 7; }
+  if (hpack_table_len(&e->table) != dyn_count || e->table.size != dyn_size) { return 8; }
+  if (dyn_count > 0 && !field_is(&e->table, 62, newest_name, newest_value)) { return 9; }
+  return 0;
+}
+
+fn t_rfc_c2(arena: Arena*) -> int32 {
+  var d: HpackDecoder;
+  var h: HpackHeaders;
+  // C.2.1: literal with incremental indexing, new name.
+  if (!hpack_decoder_init(&d, arena, 4096, 0)) { return 96; }
+  if (decode_hex(&d, arena, "400a637573746f6d2d6b65790d637573746f6d2d686561646572", &h) != 0) { return 97; }
+  if (h.count != 1 || !hdr_is(&h, 0, "custom-key", "custom-header")) { return 98; }
+  if (d.table.size != 55 || hpack_table_len(&d.table) != 1) { return 99; }
+  if (!field_is(&d.table, 62, "custom-key", "custom-header")) { return 100; }
+  // C.2.2: literal without indexing, indexed name.
+  if (!hpack_decoder_init(&d, arena, 4096, 0)) { return 101; }
+  if (decode_hex(&d, arena, "040c2f73616d706c652f70617468", &h) != 0) { return 102; }
+  if (h.count != 1 || !hdr_is(&h, 0, ":path", "/sample/path") || h.items[0].never_index) { return 103; }
+  if (d.table.size != 0) { return 104; }
+  // C.2.3: literal never indexed.
+  if (decode_hex(&d, arena, "100870617373776f726406736563726574", &h) != 0) { return 105; }
+  if (h.count != 1 || !hdr_is(&h, 0, "password", "secret") || !h.items[0].never_index) { return 106; }
+  if (d.table.size != 0) { return 107; }
+  // C.2.4: indexed.
+  if (decode_hex(&d, arena, "82", &h) != 0) { return 108; }
+  if (h.count != 1 || !hdr_is(&h, 0, ":method", "GET")) { return 109; }
+
+  // The encoder writes the same bytes.
+  var e: HpackEncoder;
+  var out: uint8[100];
+  var o: HpackOut;
+  if (!hpack_encoder_init(&e, arena, 4096, false)) { return 110; }
+  hpack_out_init(&o, &out[0], 100);
+  if (hpack_encode_field(&e, &o, "custom-key", "custom-header", HPACK_ENC_INDEX) != 0) { return 111; }
+  if (!eq_hex(&out[0], o.len, "400a637573746f6d2d6b65790d637573746f6d2d686561646572")) { return 112; }
+  if (e.table.size != 55) { return 113; }
+  if (!hpack_encoder_init(&e, arena, 4096, false)) { return 114; }
+  hpack_out_init(&o, &out[0], 100);
+  if (hpack_encode_field(&e, &o, ":path", "/sample/path", HPACK_ENC_NO_INDEX) != 0) { return 115; }
+  if (!eq_hex(&out[0], o.len, "040c2f73616d706c652f70617468") || e.table.size != 0) { return 116; }
+  hpack_out_init(&o, &out[0], 100);
+  if (hpack_encode_field(&e, &o, "password", "secret", HPACK_ENC_NEVER) != 0) { return 117; }
+  if (!eq_hex(&out[0], o.len, "100870617373776f726406736563726574") || e.table.size != 0) { return 118; }
+  hpack_out_init(&o, &out[0], 100);
+  if (hpack_encode_field(&e, &o, ":method", "GET", HPACK_ENC_INDEX) != 0) { return 119; }
+  if (!eq_hex(&out[0], o.len, "82")) { return 120; }
+  // A never-indexed field is never sent as an index, even when it matches one.
+  hpack_out_init(&o, &out[0], 100);
+  if (hpack_encode_field(&e, &o, ":method", "GET", HPACK_ENC_NEVER) != 0) { return 121; }
+  if (!eq_hex(&out[0], o.len, "1203474554")) { return 122; }
+  return 0;
+}
+
+fn t_rfc_c3_c4(arena: Arena*) -> int32 {
+  var d: HpackDecoder;
+  var e: HpackEncoder;
+  var r: int32 = 0;
+  // C.3: requests without Huffman. C.4: the same with Huffman.
+  if (!hpack_decoder_init(&d, arena, 4096, 0) || !hpack_encoder_init(&e, arena, 4096, false)) { return 123; }
+  r = rfc_step(arena, &d, &e, "828684410f7777772e6578616d706c652e636f6d", 4, ":authority", "www.example.com", 1, 57, ":authority", "www.example.com");
+  if (r != 0) { return 1020 + r; }
+  r = rfc_step(arena, &d, &e, "828684be58086e6f2d6361636865", 5, "cache-control", "no-cache", 2, 110, "cache-control", "no-cache");
+  if (r != 0) { return 1040 + r; }
+  r = rfc_step(arena, &d, &e, "828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565", 5, "custom-key", "custom-value", 3, 164, "custom-key", "custom-value");
+  if (r != 0) { return 1060 + r; }
+  if (!field_is(&d.table, 63, "cache-control", "no-cache") || !field_is(&d.table, 64, ":authority", "www.example.com")) { return 124; }
+
+  if (!hpack_decoder_init(&d, arena, 4096, 0) || !hpack_encoder_init(&e, arena, 4096, true)) { return 125; }
+  r = rfc_step(arena, &d, &e, "828684418cf1e3c2e5f23a6ba0ab90f4ff", 4, ":authority", "www.example.com", 1, 57, ":authority", "www.example.com");
+  if (r != 0) { return 1080 + r; }
+  r = rfc_step(arena, &d, &e, "828684be5886a8eb10649cbf", 5, "cache-control", "no-cache", 2, 110, "cache-control", "no-cache");
+  if (r != 0) { return 1100 + r; }
+  r = rfc_step(arena, &d, &e, "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf", 5, "custom-key", "custom-value", 3, 164, "custom-key", "custom-value");
+  if (r != 0) { return 1120 + r; }
+  return 0;
+}
+
+fn t_rfc_c5_c6(arena: Arena*) -> int32 {
+  var d: HpackDecoder;
+  var e: HpackEncoder;
+  var r: int32 = 0;
+  // C.5: responses without Huffman, with the table limited to 256 bytes. C.6: with.
+  if (!hpack_decoder_init(&d, arena, 256, 0) || !hpack_encoder_init(&e, arena, 256, false)) { return 126; }
+  r = rfc_step(arena, &d, &e, "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d", 4, "location", "https://www.example.com", 4, 222, "location", "https://www.example.com");
+  if (r != 0) { return 1140 + r; }
+  // :status 302 is evicted to make room for :status 307.
+  r = rfc_step(arena, &d, &e, "4803333037c1c0bf", 4, "location", "https://www.example.com", 4, 222, ":status", "307");
+  if (r != 0) { return 1160 + r; }
+  if (!field_is(&d.table, 65, "cache-control", "private")) { return 127; }
+  r = rfc_step(arena, &d, &e, "88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076657273696f6e3d31", 6, "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1", 3, 215, "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1");
+  if (r != 0) { return 1180 + r; }
+  if (!field_is(&d.table, 63, "content-encoding", "gzip") || !field_is(&d.table, 64, "date", "Mon, 21 Oct 2013 20:13:22 GMT")) { return 128; }
+
+  if (!hpack_decoder_init(&d, arena, 256, 0) || !hpack_encoder_init(&e, arena, 256, true)) { return 129; }
+  r = rfc_step(arena, &d, &e, "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3", 4, "location", "https://www.example.com", 4, 222, "location", "https://www.example.com");
+  if (r != 0) { return 1200 + r; }
+  r = rfc_step(arena, &d, &e, "4883640effc1c0bf", 4, "location", "https://www.example.com", 4, 222, ":status", "307");
+  if (r != 0) { return 1220 + r; }
+  r = rfc_step(arena, &d, &e, "88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f958731606 5c003ed4ee5b1063d5007", 6, "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1", 3, 215, "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1");
+  if (r != 0) { return 1240 + r; }
+  return 0;
+}
+
+// ---- Decoder: errors and limits ----
+
+fn decode_fails(arena: Arena*, capacity: int64, max_list: int64, hex: string, want: int32) -> bool {
+  var d: HpackDecoder;
+  var h: HpackHeaders;
+  hpack_decoder_init(&d, arena, capacity, max_list);
+  return decode_hex(&d, arena, hex, &h) == want;
+}
+
+fn t_decoder_errors(arena: Arena*) -> int32 {
+  // Index 0, and an index past the table.
+  if (!decode_fails(arena, 4096, 0, "80", HPACK_ERR_INDEX)) { return 130; }
+  if (!decode_fails(arena, 4096, 0, "be", HPACK_ERR_INDEX)) { return 131; }
+  if (!decode_fails(arena, 4096, 0, "ff00", HPACK_ERR_INDEX)) { return 132; }
+  // A literal that names an index past the table.
+  if (!decode_fails(arena, 4096, 0, "7f0001 61", HPACK_ERR_INDEX)) { return 133; }
+  // The block ends inside a field.
+  if (!decode_fails(arena, 4096, 0, "400a63", HPACK_ERR_TRUNCATED)) { return 134; }
+  if (!decode_fails(arena, 4096, 0, "40", HPACK_ERR_TRUNCATED)) { return 135; }
+  if (!decode_fails(arena, 4096, 0, "4001610a", HPACK_ERR_TRUNCATED)) { return 136; }
+  if (!decode_fails(arena, 4096, 0, "ff", HPACK_ERR_TRUNCATED)) { return 137; }
+  // Bad Huffman data inside a literal.
+  if (!decode_fails(arena, 4096, 0, "4081ff0161", HPACK_ERR_HUFFMAN)) { return 138; }
+  if (!decode_fails(arena, 4096, 0, "408418ffffff0161", HPACK_ERR_HUFFMAN)) { return 139; }
+  // A huge integer.
+  if (!decode_fails(arena, 4096, 0, "ffffffffffffff01", HPACK_ERR_INTEGER)) { return 140; }
+  // A size update after a field, and one above the limit.
+  if (!decode_fails(arena, 4096, 0, "8220", HPACK_ERR_SIZE_UPDATE)) { return 141; }
+  if (!decode_fails(arena, 256, 0, "3fe102", HPACK_ERR_SIZE_UPDATE)) { return 142; }
+  if (!decode_fails(arena, 256, 0, "3fe101", 0)) { return 143; }
+  // Several updates at the start are fine; the last one stands.
+  var d: HpackDecoder;
+  var h: HpackHeaders;
+  hpack_decoder_init(&d, arena, 4096, 0);
+  if (decode_hex(&d, arena, "20 3f21 82", &h) != 0 || h.count != 1) { return 144; }
+  if (d.table.max_size != 64) { return 145; }
+  // The limit can move: a new SETTINGS value.
+  hpack_decoder_set_limit(&d, 100);
+  if (decode_hex(&d, arena, "3f46", &h) != HPACK_ERR_SIZE_UPDATE) { return 146; }
+  if (decode_hex(&d, arena, "3f45", &h) != 0 || d.table.max_size != 100) { return 147; }
+  hpack_decoder_set_limit(&d, 100000);
+  if (d.limit != 4096) { return 148; }
+  // A size update to 0 empties the table.
+  hpack_decoder_init(&d, arena, 4096, 0);
+  decode_hex(&d, arena, "400a637573746f6d2d6b65790d637573746f6d2d686561646572", &h);
+  if (hpack_table_len(&d.table) != 1) { return 149; }
+  if (decode_hex(&d, arena, "20be", &h) != HPACK_ERR_INDEX) { return 150; }
+  if (hpack_table_len(&d.table) != 0 || d.table.size != 0) { return 151; }
+  // Literals that are not indexed leave the table alone; incremental ones fill it.
+  hpack_decoder_init(&d, arena, 4096, 0);
+  decode_hex(&d, arena, "040c2f73616d706c652f70617468", &h);
+  decode_hex(&d, arena, "100870617373776f726406736563726574", &h);
+  if (hpack_table_len(&d.table) != 0) { return 152; }
+  // An incremental entry bigger than the table empties it and still decodes.
+  var blk: uint8[400];
+  hpack_decoder_init(&d, arena, 256, 0);
+  decode_hex(&d, arena, "400a637573746f6d2d6b65790d637573746f6d2d686561646572", &h);
+  if (hpack_table_len(&d.table) != 1) { return 153; }
+  blk[0] = (uint8)0x40;
+  blk[1] = (uint8)1;
+  blk[2] = (uint8)97;
+  hpack_int_encode(300, 7, 0, &blk[3], 5);
+  for i in 0..300 {
+    blk[6 + i] = (uint8)120;
+  }
+  hpack_headers_init(&h, arena);
+  if (hpack_decode(&d, &blk[0], 306, &h) != 0) { return 154; }
+  if (h.count != 1 || h.items[0].value.length != (uint64)300) { return 155; }
+  if (hpack_table_len(&d.table) != 0 || d.table.size != 0) { return 156; }
+  // The header list cap: one big value, and many small ones.
+  if (!decode_fails(arena, 4096, 100, "400a637573746f6d2d6b65790d637573746f6d2d686561646572", 0)) { return 157; }
+  if (!decode_fails(arena, 4096, 50, "400a637573746f6d2d6b65790d637573746f6d2d686561646572", HPACK_ERR_TOO_LARGE)) { return 158; }
+  if (!decode_fails(arena, 4096, 100, "8286828682868286", HPACK_ERR_TOO_LARGE)) { return 159; }
+  if (!decode_fails(arena, 4096, 100, "8286", 0)) { return 160; }
+  if (!decode_fails(arena, 4096, 100, "82868286", HPACK_ERR_TOO_LARGE)) { return 161; }
+  if (!decode_fails(arena, 4096, 100, "400161026263", 0)) { return 162; }
+  // The cap counts name + value + 32 for each field: ":method GET" is 7 + 3 + 32.
+  if (!decode_fails(arena, 4096, 41, "82", HPACK_ERR_TOO_LARGE)) { return 163; }
+  if (!decode_fails(arena, 4096, 42, "82", 0)) { return 164; }
+  // A Huffman string whose decoded size is over the cap is refused.
+  if (!decode_fails(arena, 4096, 47, "400161 8cf1e3c2e5f23a6ba0ab90f4ff", HPACK_ERR_TOO_LARGE)) { return 165; }
+  if (!decode_fails(arena, 4096, 48, "400161 8cf1e3c2e5f23a6ba0ab90f4ff", 0)) { return 166; }
+  return 0;
+}
+
+// ---- Encoder: size updates, limits ----
+
+fn t_encoder(arena: Arena*) -> int32 {
+  var e: HpackEncoder;
+  var out: uint8[200];
+  var o: HpackOut;
+  if (!hpack_encoder_init(&e, arena, 4096, false)) { return 167; }
+  if (e.table.max_size != 4096) { return 168; }
+  // No pending update: nothing is written.
+  hpack_out_init(&o, &out[0], 200);
+  if (hpack_encode_begin(&e, &o) != 0 || o.len != 0) { return 169; }
+  // Setting the size it already has writes nothing.
+  hpack_encoder_set_table_size(&e, 4096);
+  if (hpack_encode_begin(&e, &o) != 0 || o.len != 0) { return 170; }
+  // The limit dips to 0 and comes back to 4096: two updates, smallest first.
+  hpack_encoder_set_table_size(&e, 0);
+  hpack_encoder_set_table_size(&e, 4096);
+  if (hpack_encode_begin(&e, &o) != 0) { return 171; }
+  if (!eq_hex(&out[0], o.len, "203fe11f")) { return 172; }
+  // And only once.
+  var before: int64 = o.len;
+  if (hpack_encode_begin(&e, &o) != 0 || o.len != before) { return 173; }
+  // A drop with no rise is one update.
+  hpack_encoder_set_table_size(&e, 100);
+  hpack_out_init(&o, &out[0], 200);
+  hpack_encode_begin(&e, &o);
+  if (!eq_hex(&out[0], o.len, "3f45")) { return 174; }
+  // Asking for more than the capacity is clamped.
+  hpack_encoder_set_table_size(&e, 99999);
+  if (e.table.max_size != 4096) { return 175; }
+  // No room for the update: nothing is written, and the update stays queued.
+  hpack_out_init(&o, &out[0], 1);
+  if (hpack_encode_begin(&e, &o) != HPACK_ERR_NOSPACE || o.len != 0) { return 176; }
+  hpack_out_init(&o, &out[0], 200);
+  if (hpack_encode_begin(&e, &o) != 0 || o.len == 0) { return 177; }
+  // A field with no room writes nothing and leaves the table alone.
+  hpack_encoder_init(&e, arena, 4096, false);
+  hpack_out_init(&o, &out[0], 5);
+  if (hpack_encode_field(&e, &o, "custom-key", "custom-header", HPACK_ENC_INDEX) != HPACK_ERR_NOSPACE) { return 178; }
+  if (o.len != 0 || hpack_table_len(&e.table) != 0) { return 179; }
+  // A name with no room for the value.
+  hpack_out_init(&o, &out[0], 14);
+  if (hpack_encode_field(&e, &o, "custom-key", "custom-header", HPACK_ENC_INDEX) != HPACK_ERR_NOSPACE || o.len != 0) { return 180; }
+  // A field bigger than the whole table is sent without indexing.
+  hpack_encoder_init(&e, arena, 100, false);
+  hpack_out_init(&o, &out[0], 200);
+  if (hpack_encode_field(&e, &o, "x-big", "0123456789012345678901234567890123456789012345678901234567890123456789", HPACK_ENC_INDEX) != 0) { return 181; }
+  if (hpack_table_len(&e.table) != 0 || (int32)out[0] != 0) { return 182; }
+  // Huffman is used only when it is no longer than the raw form.
+  hpack_encoder_init(&e, arena, 4096, true);
+  hpack_out_init(&o, &out[0], 200);
+  hpack_encode_field(&e, &o, "x", "~~~~", HPACK_ENC_NO_INDEX);
+  // The name "x" is one byte either way, so it is Huffman-coded; "~" has a
+  // 13-bit code, so four of them take 7 bytes and the raw form wins.
+  if (!eq_hex(&out[0], o.len, "0081f3047e7e7e7e")) { return 183; }
+  return 0;
+}
+
+// ---- Encoder and decoder together ----
+
+fn tables_match(a: HpackTable*, b: HpackTable*) -> bool {
+  if (a->size != b->size || a->count != b->count || a->max_size != b->max_size) { return false; }
+  for k in 0..a->count {
+    var fa: HpackField;
+    var fb: HpackField;
+    hpack_table_get(a, 62 + k, &fa);
+    hpack_table_get(b, 62 + k, &fb);
+    if (fa.name != fb.name || fa.value != fb.value) { return false; }
+  }
+  return true;
+}
+
+const POOL_NAME: string[6] = [":authority", "cookie", "content-type", "user-agent", "x-trace", "accept"];
+const POOL_VALUE: string[4] = ["example.com", "text/html", "gzip, deflate", "curl/8.0"];
+
+fn t_roundtrip(arena: Arena*) -> int32 {
+  for huffman in 0..2 {
+    var tables: Arena* = arena_init(0);
+    var work: Arena* = arena_init(0);
+    var e: HpackEncoder;
+    var d: HpackDecoder;
+    hpack_encoder_init(&e, tables, 512, huffman == 1);
+    hpack_decoder_init(&d, tables, 512, 0);
+    var buf: uint8[8192];
+    for round in 0..400 {
+      arena_reset(work);
+      // Now and then the table limit changes, and the decoder is told by the block.
+      if (round % 31 == 30) {
+        hpack_encoder_set_table_size(&e, (int64)rnd(513));
+      }
+      var count: int32 = 1 + rnd(7);
+      var list: HpackHeader[8];
+      for i in 0..count {
+        if (rnd(2) == 0) {
+          list[i].name = POOL_NAME[rnd(6)];
+        } else {
+          list[i].name = rand_string(work, 10);
+        }
+        if (rnd(3) == 0) {
+          list[i].value = POOL_VALUE[rnd(4)];
+        } else if (rnd(12) == 0) {
+          list[i].value = rand_string(work, 700);
+        } else {
+          list[i].value = rand_string(work, 30);
+        }
+        list[i].never_index = rnd(15) == 0;
+      }
+      var o: HpackOut;
+      hpack_out_init(&o, &buf[0], 8192);
+      if (hpack_encode_block(&e, &o, &list[0], (int64)count) != 0) { return 184; }
+      var h: HpackHeaders;
+      hpack_headers_init(&h, work);
+      if (hpack_decode(&d, &buf[0], o.len, &h) != 0) { return 185; }
+      if (h.count != (int64)count) { return 186; }
+      for i in 0..count {
+        if (h.items[i].name != list[i].name || h.items[i].value != list[i].value) { return 187; }
+        if (list[i].never_index && !h.items[i].never_index) { return 188; }
+      }
+      if (!tables_match(&e.table, &d.table)) { return 189; }
+    }
+    arena_free(work);
+    arena_free(tables);
+  }
+  return 0;
+}
+
+// ---- HTTP/2 frame header, builders and parsers ----
+
+fn t_frame_header() -> int32 {
+  if (H2_PREFACE.length != (uint64)24 || H2_PREFACE_LEN != 24) { return 190; }
+  var pre: uint8[24];
+  hex_to_bytes("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a", &pre[0]);
+  if (!str_is(&pre[0], 24, H2_PREFACE)) { return 191; }
+  var buf: uint8[16];
+  var h: H2FrameHeader = mk(16777215, H2_FRAME_HEADERS, 0x25, 2147483647);
+  h2_frame_header_write(h, &buf[0]);
+  if (!eq_hex(&buf[0], 9, "ffffff0125 7fffffff")) { return 192; }
+  var back: H2FrameHeader = h2_frame_header_read(&buf[0]);
+  if (back.length != 16777215 || back.type != H2_FRAME_HEADERS || back.flags != 0x25 || back.stream_id != 2147483647) { return 193; }
+  // The reserved bit is dropped on reading.
+  hex_to_bytes("000004080080000003", &buf[0]);
+  back = h2_frame_header_read(&buf[0]);
+  if (back.length != 4 || back.type != H2_FRAME_WINDOW_UPDATE || back.stream_id != 3) { return 194; }
+  h = mk(0, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0);
+  h2_frame_header_write(h, &buf[0]);
+  if (!eq_hex(&buf[0], 9, "000000040100000000")) { return 195; }
+  if (h2_check_frame_length(mk(16385, 0, 0, 1), 16384) != H2_FRAME_SIZE_ERROR) { return 196; }
+  if (h2_check_frame_length(mk(16384, 0, 0, 1), 16384) != 0) { return 197; }
+  if (h2_frame_type_name(H2_FRAME_GOAWAY) != "GOAWAY" || h2_frame_type_name(77) != "UNKNOWN") { return 198; }
+  if (h2_error_name(H2_FLOW_CONTROL_ERROR) != "FLOW_CONTROL_ERROR" || h2_error_name(99) != "UNKNOWN_ERROR") { return 199; }
+  return 0;
+}
+
+fn t_frames() -> int32 {
+  var buf: uint8[600];
+  var h: H2FrameHeader;
+  var n: int64 = 0;
+  var data: uint8[8] = [104, 101, 108, 108, 111, 33, 0, 0];
+
+  // DATA, plain, then padded with END_STREAM.
+  n = h2_build_data(&buf[0], 600, 5, &data[0], 6, false, -1);
+  if (n != 15 || !eq_hex(&buf[0], n, "000006000000000005 68656c6c6f21")) { return 200; }
+  h = h2_frame_header_read(&buf[0]);
+  var dp: H2Data;
+  if (h2_parse_data(h, &buf[0] + 9, &dp) != 0) { return 201; }
+  if (dp.length != 6 || dp.pad_length != 0 || dp.end_stream || !str_is(dp.data, 6, "hello!")) { return 202; }
+  n = h2_build_data(&buf[0], 600, 5, &data[0], 6, true, 3);
+  if (n != 19 || !eq_hex(&buf[0], n, "00000a0009 00000005 03 68656c6c6f21 000000")) { return 203; }
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_parse_data(h, &buf[0] + 9, &dp) != 0) { return 204; }
+  if (dp.length != 6 || dp.pad_length != 3 || !dp.end_stream || !str_is(dp.data, 6, "hello!")) { return 205; }
+  // PADDED with zero padding bytes, and an empty body.
+  n = h2_build_data(&buf[0], 600, 1, &data[0], 0, false, 0);
+  if (n != 10 || !eq_hex(&buf[0], n, "000001000800000001 00")) { return 206; }
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_parse_data(h, &buf[0] + 9, &dp) != 0 || dp.length != 0 || dp.pad_length != 0) { return 207; }
+  // Largest padding.
+  n = h2_build_data(&buf[0], 600, 1, &data[0], 1, false, 255);
+  if (n != 9 + 1 + 1 + 255) { return 208; }
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_parse_data(h, &buf[0] + 9, &dp) != 0 || dp.length != 1 || dp.pad_length != 255) { return 209; }
+
+  // HEADERS: plain, padded, with priority.
+  var block: uint8[4] = [0x82, 0x86, 0x84, 0x41];
+  n = h2_build_headers(&buf[0], 600, 3, &block[0], 4, true, true, -1, (H2Priority*)0);
+  if (!eq_hex(&buf[0], n, "000004010500000003 82868441")) { return 210; }
+  h = h2_frame_header_read(&buf[0]);
+  var hp: H2Headers;
+  if (h2_parse_headers(h, &buf[0] + 9, &hp) != 0) { return 211; }
+  if (hp.block_len != 4 || !hp.end_stream || !hp.end_headers || hp.has_priority || hp.pad_length != 0 || hp.block[3] != (uint8)0x41) { return 212; }
+  var pr: H2Priority;
+  pr.dependency = 7;
+  pr.weight = 256;
+  pr.exclusive = true;
+  n = h2_build_headers(&buf[0], 600, 3, &block[0], 4, false, false, 2, &pr);
+  if (!eq_hex(&buf[0], n, "00000c012800000003 02 80000007ff 82868441 0000")) { return 213; }
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_parse_headers(h, &buf[0] + 9, &hp) != 0) { return 214; }
+  if (hp.block_len != 4 || hp.end_stream || hp.end_headers || !hp.has_priority || hp.pad_length != 2) { return 215; }
+  if (hp.priority.dependency != 7 || hp.priority.weight != 256 || !hp.priority.exclusive || hp.block[0] != (uint8)0x82) { return 216; }
+
+  // PRIORITY.
+  n = h2_build_priority(&buf[0], 600, 9, 3, 16, false);
+  if (n != 14 || !eq_hex(&buf[0], n, "000005020000000009 00000003 0f")) { return 217; }
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_parse_priority(h, &buf[0] + 9, &pr) != 0) { return 218; }
+  if (pr.dependency != 3 || pr.weight != 16 || pr.exclusive) { return 219; }
+
+  // RST_STREAM.
+  n = h2_build_rst_stream(&buf[0], 600, 5, H2_CANCEL);
+  if (n != 13 || !eq_hex(&buf[0], n, "000004030000000005 00000008")) { return 220; }
+  h = h2_frame_header_read(&buf[0]);
+  var code: int64 = 0;
+  if (h2_parse_rst_stream(h, &buf[0] + 9, &code) != 0 || code != 8) { return 221; }
+  // An error code above 2^31 survives.
+  n = h2_build_rst_stream(&buf[0], 600, 5, (int64)4294967295);
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_parse_rst_stream(h, &buf[0] + 9, &code) != 0 || code != (int64)4294967295) { return 222; }
+
+  // SETTINGS and the ACK.
+  var list: H2Setting[3];
+  list[0].id = H2_SETTINGS_MAX_CONCURRENT_STREAMS;
+  list[0].value = 100;
+  list[1].id = H2_SETTINGS_INITIAL_WINDOW_SIZE;
+  list[1].value = 1048576;
+  list[2].id = H2_SETTINGS_ENABLE_PUSH;
+  list[2].value = 0;
+  n = h2_build_settings(&buf[0], 600, &list[0], 3);
+  if (n != 27 || !eq_hex(&buf[0], n, "000012040000000000 000300000064 000400100000 000200000000")) { return 223; }
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_settings_count(h) != 3) { return 224; }
+  var e1: H2Setting = h2_settings_entry(&buf[0] + 9, 1);
+  if (e1.id != 4 || e1.value != 1048576) { return 225; }
+  var st: H2Settings;
+  h2_settings_defaults(&st);
+  if (h2_settings_apply_frame(&st, h, &buf[0] + 9) != 0) { return 226; }
+  if (st.max_concurrent_streams != 100 || st.initial_window_size != 1048576 || st.enable_push != 0) { return 227; }
+  if (st.header_table_size != 4096 || st.max_frame_size != 16384 || st.max_header_list_size != H2_UNLIMITED) { return 228; }
+  n = h2_build_settings(&buf[0], 600, &list[0], 0);
+  if (n != 9 || !eq_hex(&buf[0], n, "000000040000000000")) { return 229; }
+  n = h2_build_settings_ack(&buf[0], 600);
+  if (n != 9 || !eq_hex(&buf[0], n, "000000040100000000")) { return 230; }
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_settings_validate_frame(h, &buf[0] + 9) != 0) { return 231; }
+
+  // PUSH_PROMISE.
+  n = h2_build_push_promise(&buf[0], 600, 1, 2, &block[0], 4, true, 1);
+  if (!eq_hex(&buf[0], n, "00000a050c00000001 01 00000002 82868441 00")) { return 232; }
+  h = h2_frame_header_read(&buf[0]);
+  var pp: H2PushPromise;
+  if (h2_parse_push_promise(h, &buf[0] + 9, &pp) != 0) { return 233; }
+  if (pp.promised_id != 2 || pp.block_len != 4 || pp.pad_length != 1 || !pp.end_headers || pp.block[1] != (uint8)0x86) { return 234; }
+  n = h2_build_push_promise(&buf[0], 600, 1, 4, &block[0], 4, false, -1);
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_parse_push_promise(h, &buf[0] + 9, &pp) != 0 || pp.promised_id != 4 || pp.end_headers || pp.pad_length != 0) { return 235; }
+
+  // PING and its answer.
+  var opaque: uint8[8] = [1, 2, 3, 4, 5, 6, 7, 8];
+  n = h2_build_ping(&buf[0], 600, &opaque[0], false);
+  if (n != 17 || !eq_hex(&buf[0], n, "000008060000000000 0102030405060708")) { return 236; }
+  h = h2_frame_header_read(&buf[0]);
+  var got: uint8[8];
+  if (h2_parse_ping(h, &buf[0] + 9, &got[0]) != 0 || got[7] != (uint8)8 || got[0] != (uint8)1) { return 237; }
+  if ((h.flags & H2_FLAG_ACK) != 0) { return 238; }
+  n = h2_build_ping(&buf[0], 600, &got[0], true);
+  h = h2_frame_header_read(&buf[0]);
+  if ((h.flags & H2_FLAG_ACK) == 0 || h.length != 8) { return 239; }
+
+  // GOAWAY, with and without debug data.
+  var dbg: uint8[4] = [111, 111, 112, 0];
+  n = h2_build_goaway(&buf[0], 600, 31, H2_ENHANCE_YOUR_CALM, &dbg[0], 3);
+  if (n != 20 || !eq_hex(&buf[0], n, "00000b070000000000 0000001f 0000000b 6f6f70")) { return 240; }
+  h = h2_frame_header_read(&buf[0]);
+  var ga: H2Goaway;
+  if (h2_parse_goaway(h, &buf[0] + 9, &ga) != 0) { return 241; }
+  if (ga.last_stream_id != 31 || ga.error_code != 11 || ga.debug_len != 3 || !str_is(ga.debug, 3, "oop")) { return 242; }
+  n = h2_build_goaway(&buf[0], 600, 0, H2_NO_ERROR, &dbg[0], 0);
+  h = h2_frame_header_read(&buf[0]);
+  if (n != 17 || h2_parse_goaway(h, &buf[0] + 9, &ga) != 0 || ga.debug_len != 0) { return 243; }
+
+  // WINDOW_UPDATE.
+  n = h2_build_window_update(&buf[0], 600, 0, 65535);
+  if (n != 13 || !eq_hex(&buf[0], n, "000004080000000000 0000ffff")) { return 244; }
+  h = h2_frame_header_read(&buf[0]);
+  var inc: int64 = 0;
+  if (h2_parse_window_update(h, &buf[0] + 9, &inc) != 0 || inc != 65535) { return 245; }
+  n = h2_build_window_update(&buf[0], 600, 7, 2147483647);
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_parse_window_update(h, &buf[0] + 9, &inc) != 0 || inc != 2147483647 || h.stream_id != 7) { return 246; }
+
+  // CONTINUATION.
+  n = h2_build_continuation(&buf[0], 600, 3, &block[0], 4, true);
+  if (!eq_hex(&buf[0], n, "000004090400000003 82868441")) { return 247; }
+  h = h2_frame_header_read(&buf[0]);
+  var cp: H2Continuation;
+  if (h2_parse_continuation(h, &buf[0] + 9, &cp) != 0 || cp.block_len != 4 || !cp.end_headers) { return 248; }
+  n = h2_build_continuation(&buf[0], 600, 3, &block[0], 0, false);
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_parse_continuation(h, &buf[0] + 9, &cp) != 0 || cp.block_len != 0 || cp.end_headers) { return 249; }
+  return 0;
+}
+
+fn t_build_refusals() -> int32 {
+  var buf: uint8[64];
+  var data: uint8[4] = [1, 2, 3, 4];
+  var pr: H2Priority;
+  pr.dependency = 1;
+  pr.weight = 1;
+  // Does not fit.
+  if (h2_build_data(&buf[0], 12, 1, &data[0], 4, false, -1) != -1) { return 250; }
+  if (h2_build_data(&buf[0], 13, 1, &data[0], 4, false, -1) != 13) { return 251; }
+  if (h2_build_settings_ack(&buf[0], 8) != -1) { return 252; }
+  if (h2_build_ping(&buf[0], 16, &data[0], false) != -1) { return 253; }
+  if (h2_build_goaway(&buf[0], 16, 1, 0, &data[0], 0) != -1) { return 254; }
+  // Out-of-range arguments.
+  if (h2_build_data(&buf[0], 64, 0, &data[0], 4, false, -1) == 0) { return 255; }
+  if (h2_build_data(&buf[0], 64, -1, &data[0], 4, false, -1) != -1) { return 256; }
+  if (h2_build_data(&buf[0], 64, 1, &data[0], 4, false, 256) != -1) { return 257; }
+  if (h2_build_data(&buf[0], 64, 1, &data[0], 4, false, -2) != -1) { return 258; }
+  if (h2_build_headers(&buf[0], 64, 0, &data[0], 4, false, true, -1, (H2Priority*)0) != -1) { return 259; }
+  if (h2_build_priority(&buf[0], 64, 1, 0, 0, false) != -1) { return 260; }
+  if (h2_build_priority(&buf[0], 64, 1, 0, 257, false) != -1) { return 261; }
+  if (h2_build_priority(&buf[0], 64, 0, 0, 1, false) != -1) { return 262; }
+  if (h2_build_rst_stream(&buf[0], 64, 0, 0) != -1) { return 263; }
+  if (h2_build_window_update(&buf[0], 64, 1, 0) != -1) { return 264; }
+  if (h2_build_window_update(&buf[0], 64, 1, 2147483648) != -1) { return 265; }
+  if (h2_build_push_promise(&buf[0], 64, 1, 0, &data[0], 4, true, -1) != -1) { return 266; }
+  if (h2_build_continuation(&buf[0], 64, 0, &data[0], 4, true) != -1) { return 267; }
+  // A payload over 2^24-1 is refused before anything is copied.
+  if (h2_build_data(&buf[0], 64, 1, &data[0], 16777216, false, -1) != -1) { return 268; }
+  return 0;
+}
+
+fn t_parse_errors() -> int32 {
+  var p: uint8[300];
+  var dp: H2Data;
+  var hp: H2Headers;
+  var pr: H2Priority;
+  var pp: H2PushPromise;
+  var code: int64 = 0;
+  var inc: int64 = 0;
+  var ga: H2Goaway;
+  var cp: H2Continuation;
+  var got: uint8[8];
+  for i in 0..300 {
+    p[i] = (uint8)0;
+  }
+  // DATA: stream 0; PADDED with no pad length byte; padding longer than the data.
+  if (h2_parse_data(mk(3, 0, 0, 0), &p[0], &dp) != H2_PROTOCOL_ERROR) { return 269; }
+  if (h2_parse_data(mk(0, 0, H2_FLAG_PADDED, 1), &p[0], &dp) != H2_FRAME_SIZE_ERROR) { return 270; }
+  p[0] = (uint8)3;
+  if (h2_parse_data(mk(3, 0, H2_FLAG_PADDED, 1), &p[0], &dp) != H2_PROTOCOL_ERROR) { return 271; }
+  p[0] = (uint8)2;
+  if (h2_parse_data(mk(3, 0, H2_FLAG_PADDED, 1), &p[0], &dp) != 0 || dp.length != 0) { return 272; }
+  p[0] = (uint8)255;
+  if (h2_parse_data(mk(256, 0, H2_FLAG_PADDED, 1), &p[0], &dp) != 0 || dp.length != 0) { return 273; }
+  if (h2_parse_data(mk(255, 0, H2_FLAG_PADDED, 1), &p[0], &dp) != H2_PROTOCOL_ERROR) { return 274; }
+  // HEADERS: stream 0; PRIORITY flag without 5 bytes; bad padding.
+  p[0] = (uint8)0;
+  if (h2_parse_headers(mk(3, 1, 0, 0), &p[0], &hp) != H2_PROTOCOL_ERROR) { return 275; }
+  if (h2_parse_headers(mk(4, 1, H2_FLAG_PRIORITY, 1), &p[0], &hp) != H2_FRAME_SIZE_ERROR) { return 276; }
+  if (h2_parse_headers(mk(5, 1, H2_FLAG_PRIORITY, 1), &p[0], &hp) != 0 || hp.block_len != 0) { return 277; }
+  if (h2_parse_headers(mk(5, 1, H2_FLAG_PRIORITY | H2_FLAG_PADDED, 1), &p[0], &hp) != H2_FRAME_SIZE_ERROR) { return 278; }
+  p[0] = (uint8)1;
+  if (h2_parse_headers(mk(6, 1, H2_FLAG_PRIORITY | H2_FLAG_PADDED, 1), &p[0], &hp) != H2_PROTOCOL_ERROR) { return 279; }
+  p[0] = (uint8)0;
+  if (h2_parse_headers(mk(6, 1, H2_FLAG_PRIORITY | H2_FLAG_PADDED, 1), &p[0], &hp) != 0 || hp.block_len != 0) { return 280; }
+  // A HEADERS priority that depends on its own stream is reported as it is.
+  p[0] = (uint8)0;
+  p[4] = (uint8)5;
+  if (h2_parse_headers(mk(5, 1, H2_FLAG_PRIORITY, 5), &p[0], &hp) != 0 || hp.priority.dependency != 0) { return 281; }
+  p[3] = (uint8)0;
+  p[4] = (uint8)0;
+  // PRIORITY: stream 0 (connection error), wrong size, self-dependency (stream errors).
+  if (h2_parse_priority(mk(5, 2, 0, 0), &p[0], &pr) != H2_PROTOCOL_ERROR) { return 282; }
+  if (h2_is_stream_error(mk(5, 2, 0, 0), H2_PROTOCOL_ERROR)) { return 283; }
+  if (h2_parse_priority(mk(4, 2, 0, 3), &p[0], &pr) != H2_FRAME_SIZE_ERROR) { return 284; }
+  if (!h2_is_stream_error(mk(4, 2, 0, 3), H2_FRAME_SIZE_ERROR)) { return 285; }
+  p[3] = (uint8)3;
+  if (h2_parse_priority(mk(5, 2, 0, 3), &p[0], &pr) != H2_PROTOCOL_ERROR) { return 286; }
+  if (!h2_is_stream_error(mk(5, 2, 0, 3), H2_PROTOCOL_ERROR)) { return 287; }
+  p[3] = (uint8)0;
+  // RST_STREAM.
+  if (h2_parse_rst_stream(mk(4, 3, 0, 0), &p[0], &code) != H2_PROTOCOL_ERROR) { return 288; }
+  if (h2_parse_rst_stream(mk(3, 3, 0, 1), &p[0], &code) != H2_FRAME_SIZE_ERROR) { return 289; }
+  if (h2_parse_rst_stream(mk(5, 3, 0, 1), &p[0], &code) != H2_FRAME_SIZE_ERROR) { return 290; }
+  if (h2_is_stream_error(mk(3, 3, 0, 1), H2_FRAME_SIZE_ERROR)) { return 291; }
+  // SETTINGS.
+  if (h2_settings_validate_frame(mk(6, 4, 0, 1), &p[0]) != H2_PROTOCOL_ERROR) { return 292; }
+  if (h2_settings_validate_frame(mk(5, 4, 0, 0), &p[0]) != H2_FRAME_SIZE_ERROR) { return 293; }
+  if (h2_settings_validate_frame(mk(7, 4, 0, 0), &p[0]) != H2_FRAME_SIZE_ERROR) { return 294; }
+  if (h2_settings_validate_frame(mk(6, 4, H2_FLAG_ACK, 0), &p[0]) != H2_FRAME_SIZE_ERROR) { return 295; }
+  if (h2_settings_validate_frame(mk(0, 4, H2_FLAG_ACK, 0), &p[0]) != 0) { return 296; }
+  if (h2_settings_validate_frame(mk(0, 4, 0, 0), &p[0]) != 0) { return 297; }
+  // PUSH_PROMISE.
+  if (h2_parse_push_promise(mk(4, 5, 0, 0), &p[0], &pp) != H2_PROTOCOL_ERROR) { return 298; }
+  if (h2_parse_push_promise(mk(3, 5, 0, 1), &p[0], &pp) != H2_FRAME_SIZE_ERROR) { return 299; }
+  if (h2_parse_push_promise(mk(4, 5, 0, 1), &p[0], &pp) != H2_PROTOCOL_ERROR) { return 300; }
+  p[3] = (uint8)2;
+  if (h2_parse_push_promise(mk(4, 5, 0, 1), &p[0], &pp) != 0 || pp.promised_id != 2) { return 301; }
+  p[0] = (uint8)200;
+  if (h2_parse_push_promise(mk(5, 5, H2_FLAG_PADDED, 1), &p[0], &pp) != H2_PROTOCOL_ERROR) { return 302; }
+  p[0] = (uint8)0;
+  p[3] = (uint8)0;
+  // PING.
+  if (h2_parse_ping(mk(8, 6, 0, 1), &p[0], &got[0]) != H2_PROTOCOL_ERROR) { return 303; }
+  if (h2_parse_ping(mk(7, 6, 0, 0), &p[0], &got[0]) != H2_FRAME_SIZE_ERROR) { return 304; }
+  if (h2_parse_ping(mk(9, 6, 0, 0), &p[0], &got[0]) != H2_FRAME_SIZE_ERROR) { return 305; }
+  // GOAWAY.
+  if (h2_parse_goaway(mk(8, 7, 0, 1), &p[0], &ga) != H2_PROTOCOL_ERROR) { return 306; }
+  if (h2_parse_goaway(mk(7, 7, 0, 0), &p[0], &ga) != H2_FRAME_SIZE_ERROR) { return 307; }
+  // WINDOW_UPDATE: a zero increment is a stream error on a stream, a connection error on 0.
+  if (h2_parse_window_update(mk(4, 8, 0, 3), &p[0], &inc) != H2_PROTOCOL_ERROR) { return 308; }
+  if (!h2_is_stream_error(mk(4, 8, 0, 3), H2_PROTOCOL_ERROR)) { return 309; }
+  if (h2_parse_window_update(mk(4, 8, 0, 0), &p[0], &inc) != H2_PROTOCOL_ERROR) { return 310; }
+  if (h2_is_stream_error(mk(4, 8, 0, 0), H2_PROTOCOL_ERROR)) { return 311; }
+  if (h2_parse_window_update(mk(3, 8, 0, 3), &p[0], &inc) != H2_FRAME_SIZE_ERROR) { return 312; }
+  if (h2_is_stream_error(mk(3, 8, 0, 3), H2_FRAME_SIZE_ERROR)) { return 313; }
+  // The reserved bit of an increment is ignored.
+  p[0] = (uint8)0x80;
+  if (h2_parse_window_update(mk(4, 8, 0, 3), &p[0], &inc) != H2_PROTOCOL_ERROR) { return 314; }
+  p[0] = (uint8)0;
+  // CONTINUATION.
+  if (h2_parse_continuation(mk(0, 9, 0, 0), &p[0], &cp) != H2_PROTOCOL_ERROR) { return 315; }
+  return 0;
+}
+
+fn t_settings() -> int32 {
+  if (h2_setting_check(H2_SETTINGS_ENABLE_PUSH, 0) != 0 || h2_setting_check(H2_SETTINGS_ENABLE_PUSH, 1) != 0) { return 316; }
+  if (h2_setting_check(H2_SETTINGS_ENABLE_PUSH, 2) != H2_PROTOCOL_ERROR) { return 317; }
+  if (h2_setting_check(H2_SETTINGS_INITIAL_WINDOW_SIZE, 2147483647) != 0) { return 318; }
+  if (h2_setting_check(H2_SETTINGS_INITIAL_WINDOW_SIZE, 2147483648) != H2_FLOW_CONTROL_ERROR) { return 319; }
+  if (h2_setting_check(H2_SETTINGS_MAX_FRAME_SIZE, 16383) != H2_PROTOCOL_ERROR) { return 320; }
+  if (h2_setting_check(H2_SETTINGS_MAX_FRAME_SIZE, 16384) != 0) { return 321; }
+  if (h2_setting_check(H2_SETTINGS_MAX_FRAME_SIZE, 16777215) != 0) { return 322; }
+  if (h2_setting_check(H2_SETTINGS_MAX_FRAME_SIZE, 16777216) != H2_PROTOCOL_ERROR) { return 323; }
+  if (h2_setting_check(H2_SETTINGS_HEADER_TABLE_SIZE, 4294967295) != 0) { return 324; }
+  if (h2_setting_check(H2_SETTINGS_MAX_CONCURRENT_STREAMS, 0) != 0) { return 325; }
+  if (h2_setting_check(H2_SETTINGS_MAX_HEADER_LIST_SIZE, 0) != 0) { return 326; }
+  // Unknown identifiers are fine, and change nothing.
+  if (h2_setting_check(77, 12345) != 0) { return 327; }
+  var s: H2Settings;
+  h2_settings_defaults(&s);
+  if (h2_setting_apply(&s, 77, 5) != 0) { return 328; }
+  if (h2_setting_apply(&s, H2_SETTINGS_MAX_FRAME_SIZE, 65536) != 0 || s.max_frame_size != 65536) { return 329; }
+  if (h2_setting_apply(&s, H2_SETTINGS_MAX_FRAME_SIZE, 1) != H2_PROTOCOL_ERROR || s.max_frame_size != 65536) { return 330; }
+  if (h2_setting_apply(&s, H2_SETTINGS_MAX_HEADER_LIST_SIZE, 8192) != 0 || s.max_header_list_size != 8192) { return 331; }
+  if (h2_setting_apply(&s, H2_SETTINGS_HEADER_TABLE_SIZE, 0) != 0 || s.header_table_size != 0) { return 332; }
+  // A frame with one bad value applies none of its values.
+  var list: H2Setting[2];
+  list[0].id = H2_SETTINGS_MAX_CONCURRENT_STREAMS;
+  list[0].value = 50;
+  list[1].id = H2_SETTINGS_INITIAL_WINDOW_SIZE;
+  list[1].value = 2147483648;
+  var buf: uint8[64];
+  h2_build_settings(&buf[0], 64, &list[0], 2);
+  var h: H2FrameHeader = h2_frame_header_read(&buf[0]);
+  var t: H2Settings;
+  h2_settings_defaults(&t);
+  if (h2_settings_apply_frame(&t, h, &buf[0] + 9) != H2_FLOW_CONTROL_ERROR) { return 333; }
+  if (t.max_concurrent_streams != H2_UNLIMITED) { return 334; }
+  // An ACK applies nothing.
+  h2_build_settings_ack(&buf[0], 64);
+  h = h2_frame_header_read(&buf[0]);
+  if (h2_settings_apply_frame(&t, h, &buf[0] + 9) != 0) { return 335; }
+  return 0;
+}
+
+fn t_window() -> int32 {
+  var w: H2Window;
+  h2_window_init(&w, H2_DEFAULT_WINDOW);
+  if (w.size != 65535 || h2_window_available(&w) != 65535) { return 336; }
+  if (h2_window_debit(&w, 65535) != 0 || w.size != 0) { return 337; }
+  if (h2_window_debit(&w, 1) != H2_FLOW_CONTROL_ERROR || w.size != 0) { return 338; }
+  if (h2_window_debit(&w, 0) != 0) { return 339; }
+  if (h2_window_credit(&w, 100) != 0 || w.size != 100) { return 340; }
+  if (h2_window_debit(&w, 101) != H2_FLOW_CONTROL_ERROR || w.size != 100) { return 341; }
+  if (h2_window_credit(&w, 0) != H2_PROTOCOL_ERROR || h2_window_credit(&w, -5) != H2_PROTOCOL_ERROR) { return 342; }
+  // Credit up to exactly 2^31-1, and one past it.
+  if (h2_window_credit(&w, 2147483547) != 0 || w.size != 2147483647) { return 343; }
+  if (h2_window_credit(&w, 1) != H2_FLOW_CONTROL_ERROR || w.size != 2147483647) { return 344; }
+  if (h2_window_debit(&w, 2147483647) != 0 || w.size != 0) { return 345; }
+  if (h2_window_credit(&w, 2147483647) != 0) { return 346; }
+  h2_window_init(&w, 10);
+  if (h2_window_credit(&w, 2147483638) != H2_FLOW_CONTROL_ERROR) { return 347; }
+  if (h2_window_credit(&w, 2147483637) != 0) { return 348; }
+  // A smaller SETTINGS_INITIAL_WINDOW_SIZE can push a window below zero.
+  h2_window_init(&w, 100);
+  if (h2_window_adjust(&w, -300) != 0 || w.size != -200) { return 349; }
+  if (h2_window_available(&w) != 0) { return 350; }
+  if (h2_window_debit(&w, 1) != H2_FLOW_CONTROL_ERROR) { return 351; }
+  if (h2_window_credit(&w, 250) != 0 || w.size != 50) { return 352; }
+  if (h2_window_adjust(&w, 2147483647) != H2_FLOW_CONTROL_ERROR || w.size != 50) { return 353; }
+  if (h2_window_adjust(&w, 2147483597) != 0 || w.size != 2147483647) { return 354; }
+  return 0;
+}
+
+// ---- Frame reader ----
+
+// Feeds `total` bytes of `stream` to a reader a few at a time, and records the
+// type of each frame in `types`. Returns the frame count, or a negative number
+// for an error (minus the error code), or -100 for a broken answer.
+fn drive(r: H2Reader*, stream: uint8*, total: int64, step: int64, types: int32*, max_types: int32) -> int32 {
+  var pos: int64 = 0;
+  var avail: int64 = 0;
+  var count: int32 = 0;
+  var f: H2Frame;
+  while (true) {
+    var res: int32 = h2_reader_next(r, stream + pos, avail - pos, &f);
+    if (res == H2_READ_MORE) {
+      if (f.need <= avail - pos) { return -100; }
+      if (avail >= total) { return count; }
+      avail = avail + step;
+      if (avail > total) { avail = total; }
+    } else if (res == H2_READ_PREFACE) {
+      pos = pos + f.consumed;
+    } else if (res == H2_READ_FRAME) {
+      if (f.consumed != 9 + f.header.length || count >= max_types) { return -100; }
+      types[count] = f.header.type;
+      count = count + 1;
+      pos = pos + f.consumed;
+    } else {
+      return 0 - f.error;
+    }
+  }
+  return -100;
+}
+
+fn t_reader() -> int32 {
+  var stream: uint8[1200];
+  var at: int64 = 0;
+  var block: uint8[4] = [0x82, 0x86, 0x84, 0x41];
+  var data: uint8[8] = [1, 2, 3, 4, 5, 0, 0, 0];
+  var opaque: uint8[8] = [0, 0, 0, 0, 0, 0, 0, 0];
+  hex_to_bytes("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a", &stream[0]);
+  at = 24;
+  at = at + h2_build_settings(&stream[0] + at, 1000, (H2Setting*)0, 0);
+  at = at + h2_build_headers(&stream[0] + at, 1000, 1, &block[0], 4, false, false, -1, (H2Priority*)0);
+  at = at + h2_build_continuation(&stream[0] + at, 1000, 1, &block[0], 4, false);
+  at = at + h2_build_continuation(&stream[0] + at, 1000, 1, &block[0], 4, true);
+  at = at + h2_build_data(&stream[0] + at, 1000, 1, &data[0], 5, true, -1);
+  at = at + h2_build_ping(&stream[0] + at, 1000, &opaque[0], false);
+  at = at + h2_build_window_update(&stream[0] + at, 1000, 0, 10);
+  // An unknown frame type passes through.
+  hex_to_bytes("000003 ee 00 00000001 010203", &stream[0] + at);
+  at = at + 12;
+  var types: int32[16];
+  var r: H2Reader;
+  for step in 1..40 {
+    h2_reader_init(&r, 16384, true);
+    var n: int32 = drive(&r, &stream[0], at, (int64)step, &types[0], 16);
+    if (n != 8) { return 355; }
+    if (types[0] != H2_FRAME_SETTINGS || types[1] != H2_FRAME_HEADERS || types[2] != H2_FRAME_CONTINUATION) { return 356; }
+    if (types[3] != H2_FRAME_CONTINUATION || types[4] != H2_FRAME_DATA || types[5] != H2_FRAME_PING) { return 357; }
+    if (types[6] != H2_FRAME_WINDOW_UPDATE || types[7] != 0xee) { return 358; }
+  }
+  // Without the preface (a client reading a server's frames).
+  h2_reader_init(&r, 16384, false);
+  if (drive(&r, &stream[0] + 24, at - 24, 1000, &types[0], 16) != 8) { return 359; }
+  // The payload view and need.
+  var f: H2Frame;
+  h2_reader_init(&r, 16384, false);
+  var pk: uint8[40];
+  var m: int64 = h2_build_data(&pk[0], 40, 3, &data[0], 5, false, -1);
+  if (h2_reader_next(&r, &pk[0], 5, &f) != H2_READ_MORE || f.need != 9) { return 360; }
+  if (h2_reader_next(&r, &pk[0], 12, &f) != H2_READ_MORE || f.need != 14) { return 361; }
+  if (h2_reader_next(&r, &pk[0], m, &f) != H2_READ_FRAME) { return 362; }
+  if (f.consumed != 14 || f.header.stream_id != 3 || f.payload != &pk[9] || f.payload[4] != (uint8)5) { return 363; }
+  // A bad preface fails at the first wrong byte.
+  h2_reader_init(&r, 16384, true);
+  var bad: uint8[24];
+  hex_to_bytes("505249202a20485454502f322e300d0a0d0a534d0d0a0d0b", &bad[0]);
+  if (h2_reader_next(&r, &bad[0], 24, &f) != H2_READ_ERROR || f.error != H2_PROTOCOL_ERROR) { return 364; }
+  if (h2_reader_next(&r, &bad[0], 23, &f) != H2_READ_MORE) { return 365; }
+  if (h2_reader_next(&r, &bad[0], 2, &f) != H2_READ_MORE || f.need != 24) { return 366; }
+  bad[1] = (uint8)0;
+  if (h2_reader_next(&r, &bad[0], 2, &f) != H2_READ_ERROR) { return 367; }
+  if (h2_preface_check(&stream[0], 24) != 1 || h2_preface_check(&stream[0], 10) != 0 || h2_preface_check(&bad[0], 24) != -1) { return 368; }
+  if (h2_preface_check(&stream[0], 0) != 0) { return 369; }
+
+  // Frame too long, caught from the header alone.
+  var hb: uint8[9];
+  hex_to_bytes("004001000000000001", &hb[0]);
+  h2_reader_init(&r, 16384, false);
+  if (h2_reader_next(&r, &hb[0], 9, &f) != H2_READ_ERROR || f.error != H2_FRAME_SIZE_ERROR) { return 370; }
+  h2_reader_init(&r, 16385, false);
+  if (h2_reader_next(&r, &hb[0], 9, &f) != H2_READ_MORE || f.need != 9 + 16385) { return 371; }
+  // Stream 0 where a stream is needed, and a stream where none may be.
+  hex_to_bytes("000000000000000000", &hb[0]);
+  h2_reader_init(&r, 16384, false);
+  if (h2_reader_next(&r, &hb[0], 9, &f) != H2_READ_ERROR || f.error != H2_PROTOCOL_ERROR) { return 372; }
+  hex_to_bytes("000000010400000000", &hb[0]);
+  if (h2_reader_next(&r, &hb[0], 9, &f) != H2_READ_ERROR) { return 373; }
+  hex_to_bytes("000000040000000001", &hb[0]);
+  if (h2_reader_next(&r, &hb[0], 9, &f) != H2_READ_ERROR) { return 374; }
+  hex_to_bytes("000008060000000001", &hb[0]);
+  if (h2_reader_next(&r, &hb[0], 9, &f) != H2_READ_ERROR) { return 375; }
+  hex_to_bytes("000008070000000001", &hb[0]);
+  if (h2_reader_next(&r, &hb[0], 9, &f) != H2_READ_ERROR) { return 376; }
+  // WINDOW_UPDATE and unknown frames may use either.
+  hex_to_bytes("0000000b0000000000", &hb[0]);
+  if (h2_reader_next(&r, &hb[0], 9, &f) != H2_READ_FRAME) { return 377; }
+  // CONTINUATION without a HEADERS before it.
+  hex_to_bytes("000000090400000001", &hb[0]);
+  h2_reader_init(&r, 16384, false);
+  if (h2_reader_next(&r, &hb[0], 9, &f) != H2_READ_ERROR || f.error != H2_PROTOCOL_ERROR) { return 378; }
+  // A header block interrupted by another frame, and by another stream's CONTINUATION.
+  var two: uint8[100];
+  at = 0;
+  at = at + h2_build_headers(&two[0], 100, 1, &block[0], 4, false, false, -1, (H2Priority*)0);
+  at = at + h2_build_data(&two[0] + at, 100 - at, 1, &data[0], 5, false, -1);
+  h2_reader_init(&r, 16384, false);
+  if (drive(&r, &two[0], at, 100, &types[0], 16) != -H2_PROTOCOL_ERROR) { return 379; }
+  at = h2_build_headers(&two[0], 100, 1, &block[0], 4, false, false, -1, (H2Priority*)0);
+  at = at + h2_build_continuation(&two[0] + at, 100 - at, 3, &block[0], 4, true);
+  h2_reader_init(&r, 16384, false);
+  if (drive(&r, &two[0], at, 100, &types[0], 16) != -H2_PROTOCOL_ERROR) { return 380; }
+  // The same through PUSH_PROMISE.
+  at = h2_build_push_promise(&two[0], 100, 1, 2, &block[0], 4, false, -1);
+  at = at + h2_build_ping(&two[0] + at, 100 - at, &opaque[0], false);
+  h2_reader_init(&r, 16384, false);
+  if (drive(&r, &two[0], at, 100, &types[0], 16) != -H2_PROTOCOL_ERROR) { return 381; }
+  // An error answer changes no state: asking again gives the same answer.
+  h2_reader_init(&r, 16384, false);
+  if (h2_reader_next(&r, &two[0], at, &f) != H2_READ_FRAME) { return 382; }
+  var first: int64 = f.consumed;
+  if (h2_reader_next(&r, &two[0] + first, at - first, &f) != H2_READ_ERROR) { return 383; }
+  if (h2_reader_next(&r, &two[0] + first, at - first, &f) != H2_READ_ERROR || f.error != H2_PROTOCOL_ERROR) { return 384; }
+  return 0;
+}
+
+// ---- gRPC ----
+
+fn t_grpc() -> int32 {
+  var buf: uint8[64];
+  var msg: uint8[4] = [1, 2, 3, 0];
+  var n: int64 = h2_grpc_write(&buf[0], 64, &msg[0], 3, false);
+  if (n != 8 || !eq_hex(&buf[0], n, "00 00000003 010203")) { return 385; }
+  var m: H2GrpcMessage;
+  if (h2_grpc_read(&buf[0], 8, H2_GRPC_DEFAULT_MAX_MESSAGE, &m) != H2_GRPC_READ_MESSAGE) { return 386; }
+  if (m.compressed || m.length != 3 || m.consumed != 8 || m.data[2] != (uint8)3 || m.data != &buf[5]) { return 387; }
+  n = h2_grpc_write(&buf[0], 64, &msg[0], 3, true);
+  if (h2_grpc_read(&buf[0], n, 100, &m) != H2_GRPC_READ_MESSAGE || !m.compressed) { return 388; }
+  // Empty message.
+  n = h2_grpc_write(&buf[0], 64, &msg[0], 0, false);
+  if (n != 5 || !eq_hex(&buf[0], n, "0000000000")) { return 389; }
+  if (h2_grpc_read(&buf[0], 5, 0, &m) != H2_GRPC_READ_MESSAGE || m.length != 0 || m.consumed != 5) { return 390; }
+  // Incremental: need is 5 until the prefix is in, then the whole message.
+  n = h2_grpc_write(&buf[0], 64, &msg[0], 3, false);
+  if (h2_grpc_read(&buf[0], 0, 100, &m) != H2_GRPC_READ_MORE || m.need != 5) { return 391; }
+  if (h2_grpc_read(&buf[0], 4, 100, &m) != H2_GRPC_READ_MORE || m.need != 5) { return 392; }
+  if (h2_grpc_read(&buf[0], 5, 100, &m) != H2_GRPC_READ_MORE || m.need != 8) { return 393; }
+  if (h2_grpc_read(&buf[0], 7, 100, &m) != H2_GRPC_READ_MORE || m.need != 8) { return 394; }
+  // Two messages back to back.
+  var two: uint8[32];
+  var a: int64 = h2_grpc_write(&two[0], 32, &msg[0], 3, false);
+  var b: int64 = h2_grpc_write(&two[0] + a, 32 - a, &msg[0], 2, true);
+  if (a != 8 || b != 7) { return 395; }
+  if (h2_grpc_read(&two[0], a + b, 100, &m) != H2_GRPC_READ_MESSAGE || m.consumed != 8) { return 396; }
+  if (h2_grpc_read(&two[0] + 8, b, 100, &m) != H2_GRPC_READ_MESSAGE || !m.compressed || m.length != 2) { return 397; }
+  // Too large: refused as soon as the prefix is in. A bad flag byte.
+  hex_to_bytes("00 00100001", &buf[0]);
+  if (h2_grpc_read(&buf[0], 5, 1048576, &m) != H2_GRPC_READ_ERROR || m.status != H2_GRPC_RESOURCE_EXHAUSTED) { return 398; }
+  if (h2_grpc_read(&buf[0], 5, 1048577, &m) != H2_GRPC_READ_MORE || m.need != 5 + 1048577) { return 399; }
+  hex_to_bytes("ff ffffffff", &buf[0]);
+  if (h2_grpc_read(&buf[0], 5, 100, &m) != H2_GRPC_READ_ERROR || m.status != H2_GRPC_INTERNAL) { return 400; }
+  hex_to_bytes("00 ffffffff", &buf[0]);
+  if (h2_grpc_read(&buf[0], 5, 100, &m) != H2_GRPC_READ_ERROR || m.status != H2_GRPC_RESOURCE_EXHAUSTED) { return 401; }
+  if (h2_grpc_read(&buf[0], 5, (int64)4294967295, &m) != H2_GRPC_READ_MORE) { return 402; }
+  hex_to_bytes("02 00000000", &buf[0]);
+  if (h2_grpc_read(&buf[0], 5, 100, &m) != H2_GRPC_READ_ERROR || m.status != H2_GRPC_INTERNAL) { return 403; }
+  // Writing: no room.
+  if (h2_grpc_write(&buf[0], 7, &msg[0], 3, false) != -1) { return 404; }
+  if (h2_grpc_write(&buf[0], 8, &msg[0], 3, false) != 8) { return 405; }
+  var pre: uint8[5];
+  h2_grpc_write_prefix(&pre[0], 258, true);
+  if (!eq_hex(&pre[0], 5, "0100000102")) { return 406; }
+
+  // Status codes.
+  if (H2_GRPC_OK != 0 || H2_GRPC_UNAUTHENTICATED != 16 || H2_GRPC_UNAVAILABLE != 14) { return 407; }
+  if (h2_grpc_status_name(0) != "OK" || h2_grpc_status_name(4) != "DEADLINE_EXCEEDED") { return 408; }
+  if (h2_grpc_status_name(16) != "UNAUTHENTICATED" || h2_grpc_status_name(99) != "UNKNOWN") { return 409; }
+  if (h2_grpc_status_name(-1) != "UNKNOWN") { return 410; }
+  for i in 0..17 {
+    var name: string = h2_grpc_status_name(i);
+    if (name.length == (uint64)0) { return 411; }
+  }
+  if (h2_grpc_status_parse("0") != 0 || h2_grpc_status_parse("14") != 14 || h2_grpc_status_parse("16") != 16) { return 412; }
+  if (h2_grpc_status_parse("17") != -1 || h2_grpc_status_parse("") != -1 || h2_grpc_status_parse("1x") != -1 || h2_grpc_status_parse("100") != -1) { return 413; }
+  if (h2_grpc_status_from_http(404) != H2_GRPC_UNIMPLEMENTED || h2_grpc_status_from_http(503) != H2_GRPC_UNAVAILABLE) { return 414; }
+  if (h2_grpc_status_from_http(401) != H2_GRPC_UNAUTHENTICATED || h2_grpc_status_from_http(500) != H2_GRPC_UNKNOWN) { return 415; }
+  return 0;
+}
+
+fn timeout_is(ms: int64, want: string) -> bool {
+  var buf: uint8[16];
+  var n: int64 = h2_grpc_timeout_format(ms, &buf[0], 16);
+  return str_is(&buf[0], n, want);
+}
+
+fn t_timeout() -> int32 {
+  if (h2_grpc_timeout_parse("100m") != 100) { return 416; }
+  if (h2_grpc_timeout_parse("5S") != 5000) { return 417; }
+  if (h2_grpc_timeout_parse("2M") != 120000) { return 418; }
+  if (h2_grpc_timeout_parse("1H") != 3600000) { return 419; }
+  if (h2_grpc_timeout_parse("1500u") != 2) { return 420; }
+  if (h2_grpc_timeout_parse("1u") != 1) { return 421; }
+  if (h2_grpc_timeout_parse("0u") != 0) { return 422; }
+  if (h2_grpc_timeout_parse("2000000n") != 2) { return 423; }
+  if (h2_grpc_timeout_parse("2000001n") != 3) { return 424; }
+  if (h2_grpc_timeout_parse("0S") != 0) { return 425; }
+  if (h2_grpc_timeout_parse("99999999H") != (int64)99999999 * 3600000) { return 426; }
+  // Bad values.
+  if (h2_grpc_timeout_parse("") != -1 || h2_grpc_timeout_parse("S") != -1 || h2_grpc_timeout_parse("5") != -1) { return 427; }
+  if (h2_grpc_timeout_parse("5s") != -1 || h2_grpc_timeout_parse("5X") != -1 || h2_grpc_timeout_parse("-5S") != -1) { return 428; }
+  if (h2_grpc_timeout_parse("100000000S") != -1) { return 429; }
+  if (h2_grpc_timeout_parse("1.5S") != -1 || h2_grpc_timeout_parse(" 5S") != -1 || h2_grpc_timeout_parse("5 S") != -1) { return 430; }
+  if (h2_grpc_timeout_parse("5Sx") != -1) { return 431; }
+  // Formatting picks the coarsest unit that is exact.
+  if (!timeout_is(100, "100m")) { return 432; }
+  if (!timeout_is(5000, "5S")) { return 433; }
+  if (!timeout_is(120000, "2M")) { return 434; }
+  if (!timeout_is(3600000, "1H")) { return 435; }
+  if (!timeout_is(1500, "1500m")) { return 436; }
+  if (!timeout_is(0, "0m")) { return 437; }
+  if (!timeout_is(1, "1m")) { return 438; }
+  // More than 8 digits moves up a unit, rounding up.
+  if (!timeout_is(99999999, "99999999m")) { return 439; }
+  if (!timeout_is(100000001, "100001S")) { return 440; }
+  if (!timeout_is(100000000, "100000S") && !timeout_is(100000000, "1667M")) { return 441; }
+  var buf: uint8[16];
+  if (h2_grpc_timeout_format(-1, &buf[0], 16) != -1) { return 442; }
+  if (h2_grpc_timeout_format(100, &buf[0], 3) != -1) { return 443; }
+  if (h2_grpc_timeout_format(100, &buf[0], 4) != 4) { return 444; }
+  // Beyond 99999999 hours does not fit.
+  if (h2_grpc_timeout_format((int64)99999999 * 3600000 + 1, &buf[0], 16) != -1) { return 445; }
+  // Parse and format agree on values in range.
+  for i in 0..200 {
+    var ms: int64 = (int64)rnd(2000000000);
+    if (i % 3 == 0) { ms = ms * 1000; }
+    var n: int64 = h2_grpc_timeout_format(ms, &buf[0], 16);
+    if (n < 2) { return 446; }
+    var s: string;
+    s.chars = &buf[0];
+    s.length = (uint64)n;
+    var back: int64 = h2_grpc_timeout_parse(s);
+    if (back < ms || back > ms + 3600000) { return 447; }
+    if (back != ms && n < 9) { return 448; }
+  }
+  return 0;
+}
+
+// ---- HEADERS frames carrying HPACK blocks ----
+
+fn t_integration(arena: Arena*) -> int32 {
+  var e: HpackEncoder;
+  var d: HpackDecoder;
+  hpack_encoder_init(&e, arena, 4096, true);
+  hpack_decoder_init(&d, arena, 4096, 0);
+  var list: HpackHeader[4];
+  list[0].name = ":method";
+  list[0].value = "POST";
+  list[1].name = ":path";
+  list[1].value = "/pkg.Service/Method";
+  list[2].name = "content-type";
+  list[2].value = "application/grpc";
+  list[3].name = "grpc-timeout";
+  list[3].value = "100m";
+  var block: uint8[512];
+  var o: HpackOut;
+  hpack_out_init(&o, &block[0], 512);
+  if (hpack_encode_block(&e, &o, &list[0], 4) != 0) { return 449; }
+  var frame: uint8[600];
+  var n: int64 = h2_build_headers(&frame[0], 600, 1, &block[0], o.len, false, true, -1, (H2Priority*)0);
+  if (n != 9 + o.len) { return 450; }
+  var r: H2Reader;
+  var f: H2Frame;
+  h2_reader_init(&r, 16384, false);
+  if (h2_reader_next(&r, &frame[0], n, &f) != H2_READ_FRAME || f.header.type != H2_FRAME_HEADERS) { return 451; }
+  var hp: H2Headers;
+  var cp: H2Continuation;
+  if (h2_parse_headers(f.header, f.payload, &hp) != 0 || !hp.end_headers) { return 452; }
+  var out: HpackHeaders;
+  hpack_headers_init(&out, arena);
+  if (hpack_decode(&d, hp.block, hp.block_len, &out) != 0 || out.count != 4) { return 453; }
+  if (!hdr_is(&out, 1, ":path", "/pkg.Service/Method") || !hdr_is(&out, 3, "grpc-timeout", "100m")) { return 454; }
+  // The block split over HEADERS and two CONTINUATIONs, as one block again.
+  var split: uint8[700];
+  var at: int64 = 0;
+  at = at + h2_build_headers(&split[0], 700, 3, &block[0], 5, false, false, -1, (H2Priority*)0);
+  at = at + h2_build_continuation(&split[0] + at, 700 - at, 3, &block[0] + 5, 7, false);
+  at = at + h2_build_continuation(&split[0] + at, 700 - at, 3, &block[0] + 12, o.len - 12, true);
+  var joined: uint8[512];
+  var jn: int64 = 0;
+  var pos: int64 = 0;
+  h2_reader_init(&r, 16384, false);
+  while (pos < at) {
+    if (h2_reader_next(&r, &split[0] + pos, at - pos, &f) != H2_READ_FRAME) { return 455; }
+    if (f.header.type == H2_FRAME_HEADERS) {
+      h2_parse_headers(f.header, f.payload, &hp);
+      for i in 0..hp.block_len {
+        joined[jn + i] = hp.block[i];
+      }
+      jn = jn + hp.block_len;
+    } else {
+      h2_parse_continuation(f.header, f.payload, &cp);
+      for i in 0..cp.block_len {
+        joined[jn + i] = cp.block[i];
+      }
+      jn = jn + cp.block_len;
+    }
+    pos = pos + f.consumed;
+  }
+  if (jn != o.len) { return 456; }
+  hpack_decoder_init(&d, arena, 4096, 0);
+  hpack_headers_init(&out, arena);
+  if (hpack_decode(&d, &joined[0], jn, &out) != 0 || out.count != 4) { return 457; }
+  return 0;
+}
+
+// Reports the full check number, and makes an exit code that is never zero.
+fn fail(code: int32) -> int32 {
+  println("test_std_http2: check {code} failed");
+  return 1 + code % 255;
+}
+
+fn main() -> int32 {
+  var arena: Arena* = arena_init((int64)0);
+  var r: int32 = t_integers();
+  if (r != 0) { return fail(r); }
+  r = t_huffman();
+  if (r != 0) { return fail(r); }
+  r = t_strings();
+  if (r != 0) { return fail(r); }
+  r = t_tables(arena);
+  if (r != 0) { return fail(r); }
+  r = t_rfc_c2(arena);
+  if (r != 0) { return fail(r); }
+  r = t_rfc_c3_c4(arena);
+  if (r != 0) { return fail(r); }
+  r = t_rfc_c5_c6(arena);
+  if (r != 0) { return fail(r); }
+  r = t_decoder_errors(arena);
+  if (r != 0) { return fail(r); }
+  r = t_encoder(arena);
+  if (r != 0) { return fail(r); }
+  r = t_roundtrip(arena);
+  if (r != 0) { return fail(r); }
+  r = t_frame_header();
+  if (r != 0) { return fail(r); }
+  r = t_frames();
+  if (r != 0) { return fail(r); }
+  r = t_build_refusals();
+  if (r != 0) { return fail(r); }
+  r = t_parse_errors();
+  if (r != 0) { return fail(r); }
+  r = t_settings();
+  if (r != 0) { return fail(r); }
+  r = t_window();
+  if (r != 0) { return fail(r); }
+  r = t_reader();
+  if (r != 0) { return fail(r); }
+  r = t_grpc();
+  if (r != 0) { return fail(r); }
+  r = t_timeout();
+  if (r != 0) { return fail(r); }
+  r = t_integration(arena);
+  if (r != 0) { return fail(r); }
+  arena_free(arena);
+  return 0;
+}
