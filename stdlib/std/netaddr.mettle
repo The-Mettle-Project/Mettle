@@ -1,0 +1,409 @@
+// IPv4 and IPv6 addresses, with no OS calls. std/socket uses NetAddr for
+// every address it takes or returns.
+
+import "std/core";
+
+export const NET_IPV4 = 4;
+export const NET_IPV6 = 6;
+
+// Socket kinds for sock_open.
+export const NET_TCP = 1;
+export const NET_UDP = 2;
+
+// Options for sock_set_option.
+export const NET_OPT_REUSEADDR = 1;
+export const NET_OPT_REUSEPORT = 2;
+export const NET_OPT_NODELAY = 3;
+export const NET_OPT_KEEPALIVE = 4;
+export const NET_OPT_V6ONLY = 5;
+export const NET_OPT_BROADCAST = 6;
+
+// Directions for sock_shutdown.
+export const NET_SHUT_READ = 0;
+export const NET_SHUT_WRITE = 1;
+export const NET_SHUT_BOTH = 2;
+
+// Readiness bits for sock_poll, the same on every platform.
+export const NET_POLL_IN = 1;
+export const NET_POLL_OUT = 4;
+export const NET_POLL_ERR = 8;
+export const NET_POLL_HUP = 16;
+export const NET_POLL_NVAL = 32;
+
+export struct NetPollFd {
+  fd: int64;
+  events: int32;    // NET_POLL_IN and/or NET_POLL_OUT
+  revents: int32;   // filled by sock_poll
+}
+
+// Enough room for any net_addr_format result, port and brackets included.
+export const NET_ADDR_FORMAT_MAX: int64 = 64;
+
+// An IP address and port. An IPv4 address sits in ip[0..4).
+export struct NetAddr {
+  family: int32;      // NET_IPV4 or NET_IPV6
+  port: int32;        // 0..65535
+  ip: uint8[16];
+  scope_id: uint32;   // IPv6 zone index (the %N in fe80::1%2)
+}
+
+export fn net_addr_v4(a: int32, b: int32, c: int32, d: int32, port: int32) -> NetAddr {
+  var out: NetAddr;
+  out.family = NET_IPV4;
+  out.port = port;
+  out.ip[0] = (uint8)a;
+  out.ip[1] = (uint8)b;
+  out.ip[2] = (uint8)c;
+  out.ip[3] = (uint8)d;
+  return out;
+}
+
+// 127.0.0.1 or ::1.
+export fn net_addr_loopback(family: int32, port: int32) -> NetAddr {
+  var out: NetAddr;
+  out.family = family;
+  out.port = port;
+  if (family == NET_IPV6) {
+    out.ip[15] = (uint8)1;
+  } else {
+    out.family = NET_IPV4;
+    out.ip[0] = (uint8)127;
+    out.ip[3] = (uint8)1;
+  }
+  return out;
+}
+
+// 0.0.0.0 or ::, for listening on every interface.
+export fn net_addr_any(family: int32, port: int32) -> NetAddr {
+  var out: NetAddr;
+  out.family = family;
+  if (family != NET_IPV6) { out.family = NET_IPV4; }
+  out.port = port;
+  return out;
+}
+
+export fn net_addr_equal(a: NetAddr, b: NetAddr) -> bool {
+  if (a.family != b.family || a.port != b.port || a.scope_id != b.scope_id) { return false; }
+  var n: int32 = 4;
+  if (a.family == NET_IPV6) { n = 16; }
+  for i in 0..n {
+    if (a.ip[i] != b.ip[i]) { return false; }
+  }
+  return true;
+}
+
+export fn net_addr_is_loopback(a: NetAddr) -> bool {
+  if (a.family == NET_IPV4) { return a.ip[0] == (uint8)127; }
+  for i in 0..15 {
+    if (a.ip[i] != (uint8)0) { return false; }
+  }
+  return a.ip[15] == (uint8)1;
+}
+
+// ---- Parsing ----------------------------------------------------------------
+
+fn net_hex(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  return -1;
+}
+
+// Dotted IPv4 in s[at..end) into out[0..4). Exactly four decimal parts,
+// no leading zeros.
+fn net_parse_v4(s: string, at: int64, end: int64, out: uint8*) -> bool {
+  var i: int64 = at;
+  for part in 0..4 {
+    if (part > 0) {
+      if (i >= end || (int32)s[i] != 46) { return false; }
+      i = i + 1;
+    }
+    var v: int32 = 0;
+    var digits: int32 = 0;
+    while (i < end && (int32)s[i] >= 48 && (int32)s[i] <= 57) {
+      if (digits > 0 && v == 0) { return false; }
+      v = v * 10 + ((int32)s[i] - 48);
+      digits = digits + 1;
+      i = i + 1;
+      if (v > 255) { return false; }
+    }
+    if (digits == 0) { return false; }
+    out[part] = (uint8)v;
+  }
+  return i == end;
+}
+
+// IPv6 text in s[at..end) into out[0..16): groups of hex, one "::", and an
+// optional dotted IPv4 tail.
+fn net_parse_v6(s: string, at: int64, end: int64, out: uint8*) -> bool {
+  var words: int32[8];
+  var count: int32 = 0;
+  var gap: int32 = -1;
+  var i: int64 = at;
+  if (end - at >= 2 && (int32)s[at] == 58 && (int32)s[at + 1] == 58) {
+    gap = 0;
+    i = at + 2;
+  } else if (i < end && (int32)s[i] == 58) {
+    return false;
+  }
+  while (i < end) {
+    if (count >= 8) { return false; }
+    // An IPv4 tail takes two words.
+    var dot: bool = false;
+    var j: int64 = i;
+    while (j < end && (int32)s[j] != 58) {
+      if ((int32)s[j] == 46) { dot = true; }
+      j = j + 1;
+    }
+    if (dot) {
+      if (j != end || count > 6) { return false; }
+      var v4: uint8[4];
+      if (!net_parse_v4(s, i, end, &v4[0])) { return false; }
+      words[count] = ((int32)v4[0] << 8) | (int32)v4[1];
+      words[count + 1] = ((int32)v4[2] << 8) | (int32)v4[3];
+      count = count + 2;
+      i = end;
+      break;
+    }
+    var v: int32 = 0;
+    var digits: int32 = 0;
+    while (i < end && net_hex((int32)s[i]) >= 0) {
+      v = v * 16 + net_hex((int32)s[i]);
+      digits = digits + 1;
+      i = i + 1;
+      if (digits > 4) { return false; }
+    }
+    if (digits == 0) { return false; }
+    words[count] = v;
+    count = count + 1;
+    if (i == end) { break; }
+    if ((int32)s[i] != 58) { return false; }
+    i = i + 1;
+    if (i < end && (int32)s[i] == 58) {
+      if (gap >= 0) { return false; }
+      gap = count;
+      i = i + 1;
+    } else if (i == end) {
+      return false;
+    }
+  }
+  if (gap < 0 && count != 8) { return false; }
+  if (gap >= 0 && count > 7) { return false; }
+  var full: int32[8];
+  if (gap < 0) {
+    for k in 0..8 { full[k] = words[k]; }
+  } else {
+    var tail: int32 = count - gap;
+    for k in 0..gap { full[k] = words[k]; }
+    for k in gap..(8 - tail) { full[k] = 0; }
+    for k in 0..tail { full[8 - tail + k] = words[gap + k]; }
+  }
+  for k in 0..8 {
+    out[k * 2] = (uint8)(full[k] >> 8);
+    out[k * 2 + 1] = (uint8)(full[k] & 255);
+  }
+  return true;
+}
+
+// Parses an IP address with no port: "192.0.2.1", "2001:db8::1",
+// "fe80::1%3" (a numeric zone). The port comes back 0.
+export fn net_addr_parse(s: string) -> Result<NetAddr, string> {
+  var out: NetAddr;
+  var n: int64 = (int64)s.length;
+  var colon: bool = false;
+  for i in 0..n {
+    if ((int32)s[i] == 58) { colon = true; }
+  }
+  if (!colon) {
+    if (!net_parse_v4(s, 0, n, &out.ip[0])) { return Err("not an IPv4 address"); }
+    out.family = NET_IPV4;
+    return Ok(out);
+  }
+  var end: int64 = n;
+  for i in 0..n {
+    if ((int32)s[i] == 37 && end == n) { end = i; }
+  }
+  if (end < n) {
+    var zone: int64 = 0;
+    if (end + 1 == n) { return Err("empty IPv6 zone"); }
+    for i in (end + 1)..n {
+      var c: int32 = (int32)s[i];
+      if (c < 48 || c > 57) { return Err("IPv6 zone must be a number"); }
+      zone = zone * 10 + (int64)(c - 48);
+      if (zone > (int64)0xFFFFFFFF) { return Err("IPv6 zone out of range"); }
+    }
+    out.scope_id = (uint32)zone;
+  }
+  if (!net_parse_v6(s, 0, end, &out.ip[0])) { return Err("not an IPv6 address"); }
+  out.family = NET_IPV6;
+  return Ok(out);
+}
+
+// Host and port, split without lookup: "example.com:80", "192.0.2.1:80",
+// "[2001:db8::1]:443". With no port, default_port is used. host is a view
+// into s, without brackets.
+export struct NetHostPort {
+  host: string;
+  port: int32;
+}
+
+export fn net_split_host_port(s: string, default_port: int32) -> Result<NetHostPort, string> {
+  var out: NetHostPort;
+  out.port = default_port;
+  var n: int64 = (int64)s.length;
+  if (n == 0) { return Err("empty host"); }
+  var host_start: int64 = 0;
+  var host_end: int64 = n;
+  var port_at: int64 = -1;
+  if ((int32)s[0] == 91) {
+    var close: int64 = -1;
+    for i in 1..n {
+      if ((int32)s[i] == 93 && close < 0) { close = i; }
+    }
+    if (close < 0) { return Err("missing ]"); }
+    host_start = 1;
+    host_end = close;
+    if (close + 1 < n) {
+      if ((int32)s[close + 1] != 58) { return Err("expected : after ]"); }
+      port_at = close + 2;
+    }
+  } else {
+    var colons: int32 = 0;
+    var last: int64 = -1;
+    for i in 0..n {
+      if ((int32)s[i] == 58) {
+        colons = colons + 1;
+        last = i;
+      }
+    }
+    if (colons > 1) {
+      // A bare IPv6 address has no port.
+      host_end = n;
+    } else if (colons == 1) {
+      host_end = last;
+      port_at = last + 1;
+    }
+  }
+  if (host_end <= host_start) { return Err("empty host"); }
+  if (port_at >= 0) {
+    if (port_at >= n) { return Err("empty port"); }
+    var p: int32 = 0;
+    for i in port_at..n {
+      var c: int32 = (int32)s[i];
+      if (c < 48 || c > 57) { return Err("port is not a number"); }
+      p = p * 10 + (c - 48);
+      if (p > 65535) { return Err("port out of range"); }
+    }
+    out.port = p;
+  }
+  out.host.chars = s.chars + host_start;
+  out.host.length = (uint64)(host_end - host_start);
+  return Ok(out);
+}
+
+// ---- Formatting -------------------------------------------------------------
+
+fn net_put(buf: uint8*, cap: int64, at: int64*, c: int32) -> bool {
+  if (*at + 1 >= cap) { return false; }
+  buf[*at] = (uint8)c;
+  *at = *at + 1;
+  return true;
+}
+
+fn net_put_dec(buf: uint8*, cap: int64, at: int64*, v: int64) -> bool {
+  var tmp: uint8[20];
+  var n: int32 = 0;
+  var x: int64 = v;
+  if (x == 0) {
+    tmp[0] = (uint8)48;
+    n = 1;
+  }
+  while (x > 0) {
+    tmp[n] = (uint8)(48 + x % 10);
+    x = x / 10;
+    n = n + 1;
+  }
+  while (n > 0) {
+    n = n - 1;
+    if (!net_put(buf, cap, at, (int32)tmp[n])) { return false; }
+  }
+  return true;
+}
+
+fn net_put_ip(a: NetAddr*, buf: uint8*, cap: int64, at: int64*) -> bool {
+  if (a->family == NET_IPV4) {
+    for k in 0..4 {
+      if (k > 0 && !net_put(buf, cap, at, 46)) { return false; }
+      if (!net_put_dec(buf, cap, at, (int64)a->ip[k])) { return false; }
+    }
+    return true;
+  }
+  var w: int32[8];
+  for k in 0..8 { w[k] = ((int32)a->ip[k * 2] << 8) | (int32)a->ip[k * 2 + 1]; }
+  // RFC 5952: the longest run of two or more zero words becomes "::".
+  var best: int32 = -1;
+  var best_len: int32 = 1;
+  var k: int32 = 0;
+  while (k < 8) {
+    if (w[k] == 0) {
+      var e: int32 = k;
+      while (e < 8 && w[e] == 0) { e = e + 1; }
+      if (e - k > best_len) {
+        best = k;
+        best_len = e - k;
+      }
+      k = e;
+    } else {
+      k = k + 1;
+    }
+  }
+  var hex: string = "0123456789abcdef";
+  var i: int32 = 0;
+  while (i < 8) {
+    if (i == best) {
+      if (!net_put(buf, cap, at, 58) || !net_put(buf, cap, at, 58)) { return false; }
+      i = i + best_len;
+      continue;
+    }
+    if (i > 0 && i != best + best_len) {
+      if (!net_put(buf, cap, at, 58)) { return false; }
+    }
+    var started: bool = false;
+    var shift: int32 = 12;
+    while (shift >= 0) {
+      var d: int32 = (w[i] >> shift) & 15;
+      if (d != 0 || started || shift == 0) {
+        if (!net_put(buf, cap, at, (int32)hex[(int64)d])) { return false; }
+        started = true;
+      }
+      shift = shift - 4;
+    }
+    i = i + 1;
+  }
+  if (a->scope_id != (uint32)0) {
+    if (!net_put(buf, cap, at, 37)) { return false; }
+    if (!net_put_dec(buf, cap, at, (int64)a->scope_id)) { return false; }
+  }
+  return true;
+}
+
+// The address alone: 192.0.2.1, 2001:db8::1. Writes a NUL after the text
+// and returns its length, or -1 if buf is too small.
+export fn net_addr_format_ip(a: NetAddr, buf: uint8*, cap: int64) -> int64 {
+  var at: int64 = 0;
+  if (!net_put_ip(&a, buf, cap, &at)) { return -1; }
+  buf[at] = (uint8)0;
+  return at;
+}
+
+// Address and port: 192.0.2.1:80, [2001:db8::1]:443.
+export fn net_addr_format(a: NetAddr, buf: uint8*, cap: int64) -> int64 {
+  var at: int64 = 0;
+  if (a.family == NET_IPV6 && !net_put(buf, cap, &at, 91)) { return -1; }
+  if (!net_put_ip(&a, buf, cap, &at)) { return -1; }
+  if (a.family == NET_IPV6 && !net_put(buf, cap, &at, 93)) { return -1; }
+  if (!net_put(buf, cap, &at, 58)) { return -1; }
+  if (!net_put_dec(buf, cap, &at, (int64)a.port)) { return -1; }
+  buf[at] = (uint8)0;
+  return at;
+}

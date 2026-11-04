@@ -1,0 +1,493 @@
+// Host name lookup.
+//
+// net_resolve turns a name into addresses: an IP literal is returned as is,
+// "localhost" is the loopback address, then the hosts file, then DNS over
+// UDP to the servers in /etc/resolv.conf (TCP when a reply is truncated).
+// On Windows, names that are not literals or localhost go to the system
+// resolver instead. The message codec is exported so a caller can run its
+// own queries.
+
+import "std/core";
+import "std/netaddr";
+import "std/socket_os";
+
+export const DNS_TYPE_A = 1;
+export const DNS_TYPE_CNAME = 5;
+export const DNS_TYPE_AAAA = 28;
+
+export const DNS_MAX_SERVERS = 3;
+export const DNS_MAX_ADDRS = 16;
+
+// Which address families net_resolve returns.
+export const DNS_WANT_ANY = 0;
+export const DNS_WANT_V4 = 4;
+export const DNS_WANT_V6 = 6;
+
+extern fn dns_c_fopen(path: cstring, mode: cstring) -> cstring = "fopen";
+extern fn dns_c_fread(buf: cstring, size: int64, count: int64, fp: cstring) -> int64 = "fread";
+extern fn dns_c_fclose(fp: cstring) -> int32 = "fclose";
+
+var g_dns_seq: uint32 = 0;
+
+// ---- Messages ---------------------------------------------------------------
+
+// Writes a standard recursive query for name. Returns its length, or -1 if
+// the name is not a valid host name or buf is too small.
+export fn dns_build_query(id: int32, name: string, qtype: int32, buf: uint8*, cap: int64) -> int64 {
+  var n: int64 = (int64)name.length;
+  if (n > 0 && (int32)name[n - 1] == 46) { n = n - 1; }   // a trailing dot is allowed
+  if (n == 0 || n > 253 || cap < n + 18) { return -1; }
+  for i in 0..12 { buf[i] = (uint8)0; }
+  buf[0] = (uint8)((id >> 8) & 255);
+  buf[1] = (uint8)(id & 255);
+  buf[2] = (uint8)1;   // RD: ask for recursion
+  buf[5] = (uint8)1;   // one question
+  var at: int64 = 12;
+  var start: int64 = 0;
+  var i: int64 = 0;
+  while (i <= n) {
+    if (i == n || (int32)name[i] == 46) {
+      var len: int64 = i - start;
+      if (len == 0 || len > 63) { return -1; }
+      buf[at] = (uint8)len;
+      at = at + 1;
+      for k in start..i {
+        buf[at] = (uint8)name[k];
+        at = at + 1;
+      }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  buf[at] = (uint8)0;
+  buf[at + 1] = (uint8)((qtype >> 8) & 255);
+  buf[at + 2] = (uint8)(qtype & 255);
+  buf[at + 3] = (uint8)0;
+  buf[at + 4] = (uint8)1;   // class IN
+  return at + 5;
+}
+
+fn dns_u16(msg: uint8*, at: int64) -> int32 {
+  return ((int32)msg[at] << 8) | (int32)msg[at + 1];
+}
+
+// Skips a possibly compressed name. Returns the offset after it, or -1.
+fn dns_skip_name(msg: uint8*, n: int64, at: int64) -> int64 {
+  var i: int64 = at;
+  while (i < n) {
+    var len: int32 = (int32)msg[i];
+    if (len == 0) { return i + 1; }
+    if ((len & 0xC0) == 0xC0) {
+      if (i + 2 > n) { return -1; }
+      return i + 2;
+    }
+    if ((len & 0xC0) != 0) { return -1; }
+    i = i + 1 + (int64)len;
+  }
+  return -1;
+}
+
+// What dns_parse_response found.
+export struct DnsAnswer {
+  rcode: int32;        // 0 = no error, 3 = no such name
+  truncated: bool;     // the reply was cut; ask again over TCP
+  count: int32;        // addresses written
+}
+
+// Reads the A and AAAA records out of a reply to query id, into out[0..max).
+// The port of each address is set to port. Returns Err for a reply that is
+// malformed or answers some other query.
+export fn dns_parse_response(msg: uint8*, n: int64, id: int32, port: int32, out: NetAddr*, max: int32) -> Result<DnsAnswer, string> {
+  var ans: DnsAnswer;
+  if (n < 12) { return Err("reply too short"); }
+  if (dns_u16(msg, 0) != (id & 0xFFFF)) { return Err("reply id does not match"); }
+  var flags: int32 = dns_u16(msg, 2);
+  if ((flags & 0x8000) == 0) { return Err("not a reply"); }
+  ans.truncated = (flags & 0x0200) != 0;
+  ans.rcode = flags & 15;
+  var qd: int32 = dns_u16(msg, 4);
+  var an: int32 = dns_u16(msg, 6);
+  var at: int64 = 12;
+  for q in 0..qd {
+    at = dns_skip_name(msg, n, at);
+    if (at < 0 || at + 4 > n) { return Err("bad question"); }
+    at = at + 4;
+  }
+  for r in 0..an {
+    at = dns_skip_name(msg, n, at);
+    if (at < 0 || at + 10 > n) { return Err("bad answer"); }
+    var rtype: int32 = dns_u16(msg, at);
+    var rclass: int32 = dns_u16(msg, at + 2);
+    var rlen: int64 = (int64)dns_u16(msg, at + 8);
+    at = at + 10;
+    if (at + rlen > n) { return Err("bad answer length"); }
+    // CNAME chains come with the final records in the same reply, so every
+    // A and AAAA record is taken.
+    if (rclass == 1 && ans.count < max) {
+      if (rtype == DNS_TYPE_A && rlen == 4) {
+        var a: NetAddr;
+        a.family = NET_IPV4;
+        a.port = port;
+        for k in 0..4 { a.ip[k] = msg[at + (int64)k]; }
+        out[ans.count] = a;
+        ans.count = ans.count + 1;
+      } else if (rtype == DNS_TYPE_AAAA && rlen == 16) {
+        var a6: NetAddr;
+        a6.family = NET_IPV6;
+        a6.port = port;
+        for k in 0..16 { a6.ip[k] = msg[at + (int64)k]; }
+        out[ans.count] = a6;
+        ans.count = ans.count + 1;
+      }
+    }
+    at = at + rlen;
+  }
+  return Ok(ans);
+}
+
+// ---- Config files -----------------------------------------------------------
+
+// Reads a small text file into buf. Returns its length, or -1.
+fn dns_read_file(path: cstring, buf: uint8*, cap: int64) -> int64 {
+  var fp: cstring = dns_c_fopen(path, "rb");
+  if (fp == 0) { return -1; }
+  var n: int64 = dns_c_fread((cstring)buf, 1, cap - 1, fp);
+  dns_c_fclose(fp);
+  if (n < 0) { return -1; }
+  buf[n] = (uint8)0;
+  return n;
+}
+
+fn dns_is_space(c: int32) -> bool {
+  return c == 32 || c == 9 || c == 13;
+}
+
+fn dns_lower(c: int32) -> int32 {
+  if (c >= 65 && c <= 90) { return c + 32; }
+  return c;
+}
+
+fn dns_word(text: uint8*, start: int64, end: int64) -> string {
+  var s: string;
+  s.chars = text + start;
+  s.length = (uint64)(end - start);
+  return s;
+}
+
+fn dns_same_name(a: string, b: string) -> bool {
+  var na: int64 = (int64)a.length;
+  var nb: int64 = (int64)b.length;
+  if (na > 0 && (int32)a[na - 1] == 46) { na = na - 1; }
+  if (nb > 0 && (int32)b[nb - 1] == 46) { nb = nb - 1; }
+  if (na != nb) { return false; }
+  for i in 0..na {
+    if (dns_lower((int32)a[i]) != dns_lower((int32)b[i])) { return false; }
+  }
+  return true;
+}
+
+// Looks name up in hosts-file text ("address name alias..." per line, # for
+// comments). Returns how many addresses were written.
+export fn dns_hosts_lookup(text: string, name: string, port: int32, want: int32, out: NetAddr*, max: int32) -> int32 {
+  var n: int64 = (int64)text.length;
+  var found: int32 = 0;
+  var line: int64 = 0;
+  while (line < n && found < max) {
+    var end: int64 = line;
+    while (end < n && (int32)text[end] != 10) { end = end + 1; }
+    var stop: int64 = line;
+    while (stop < end && (int32)text[stop] != 35) { stop = stop + 1; }
+    // First word: the address. The rest: names.
+    var i: int64 = line;
+    var words: int32 = 0;
+    var addr: NetAddr;
+    var addr_ok: bool = false;
+    while (i < stop) {
+      while (i < stop && dns_is_space((int32)text[i])) { i = i + 1; }
+      var w: int64 = i;
+      while (i < stop && !dns_is_space((int32)text[i])) { i = i + 1; }
+      if (i == w) { break; }
+      var word: string = dns_word(text.chars, w, i);
+      if (words == 0) {
+        match (net_addr_parse(word)) {
+          case Ok(a): {
+            addr = a;
+            addr_ok = true;
+          }
+          case Err(e): { }
+        }
+      } else if (addr_ok && dns_same_name(word, name)) {
+        if (want == DNS_WANT_ANY || want == addr.family) {
+          addr.port = port;
+          out[found] = addr;
+          found = found + 1;
+        }
+        break;
+      }
+      words = words + 1;
+    }
+    line = end + 1;
+  }
+  return found;
+}
+
+// Reads the nameserver lines of resolv.conf text. Returns how many servers
+// were written (port 53).
+export fn dns_parse_resolv_conf(text: string, out: NetAddr*, max: int32) -> int32 {
+  var n: int64 = (int64)text.length;
+  var found: int32 = 0;
+  var line: int64 = 0;
+  var key: string = "nameserver";
+  while (line < n && found < max) {
+    var end: int64 = line;
+    while (end < n && (int32)text[end] != 10) { end = end + 1; }
+    var i: int64 = line;
+    while (i < end && dns_is_space((int32)text[i])) { i = i + 1; }
+    var w: int64 = i;
+    while (i < end && !dns_is_space((int32)text[i])) { i = i + 1; }
+    if (dns_word(text.chars, w, i) == key) {
+      while (i < end && dns_is_space((int32)text[i])) { i = i + 1; }
+      var v: int64 = i;
+      while (i < end && !dns_is_space((int32)text[i])) { i = i + 1; }
+      match (net_addr_parse(dns_word(text.chars, v, i))) {
+        case Ok(a): {
+          var s: NetAddr = a;
+          s.port = 53;
+          out[found] = s;
+          found = found + 1;
+        }
+        case Err(e): { }
+      }
+    }
+    line = end + 1;
+  }
+  return found;
+}
+
+// ---- Queries ----------------------------------------------------------------
+
+fn dns_next_id() -> int32 {
+  // Not cryptographic: the OS picks a random source port, which does most
+  // of the work against spoofed replies.
+  var local: int32 = 0;
+  var mix: uint64 = (uint64)net_now_ms() * (uint64)0x9E3779B97F4A7C15 + (uint64)(int64)&local;
+  g_dns_seq = g_dns_seq + (uint32)0x6D2B79F5;
+  mix = mix ^ (uint64)g_dns_seq;
+  mix = mix ^ (mix >> 29);
+  return (int32)(mix & (uint64)0xFFFF);
+}
+
+fn dns_query_tcp(server: NetAddr*, query: uint8*, qlen: int64, reply: uint8*, cap: int64, deadline: int64) -> int64 {
+  var fd: int64 = sock_open(server->family, NET_TCP);
+  if (fd < 0) { return fd; }
+  var left: int64 = deadline - net_now_ms();
+  if (left < 1) { left = 1; }
+  sock_set_timeout(fd, left, left);
+  if (sock_connect(fd, server) < 0) {
+    sock_close(fd);
+    return -NET_ECONNREFUSED;
+  }
+  var head: uint8[2];
+  head[0] = (uint8)((qlen >> 8) & 255);
+  head[1] = (uint8)(qlen & 255);
+  if (sock_send(fd, &head[0], 2) != 2 || sock_send(fd, query, qlen) != qlen) {
+    sock_close(fd);
+    return -NET_ECONNRESET;
+  }
+  var got: int64 = 0;
+  var want: int64 = 2;
+  var have_len: bool = false;
+  while (got < want) {
+    var r: int64 = sock_recv(fd, reply + got, want - got);
+    if (r <= 0) {
+      sock_close(fd);
+      return -NET_ECONNRESET;
+    }
+    got = got + r;
+    if (!have_len && got == 2) {
+      want = ((int64)reply[0] << 8) | (int64)reply[1];
+      if (want > cap) { want = cap; }
+      got = 0;
+      have_len = true;
+    }
+  }
+  sock_close(fd);
+  return got;
+}
+
+// Asks one server for one record type. Returns the address count, or a
+// negative code: -NET_ETIMEDOUT, or -1000 - rcode for a DNS error.
+fn dns_ask(server: NetAddr*, name: string, qtype: int32, port: int32, out: NetAddr*, max: int32, deadline: int64) -> int32 {
+  var query: uint8[300];
+  var id: int32 = dns_next_id();
+  var qlen: int64 = dns_build_query(id, name, qtype, &query[0], 300);
+  if (qlen < 0) { return -1003; }
+  var fd: int64 = sock_open(server->family, NET_UDP);
+  if (fd < 0) { return (int32)fd; }
+  var reply: uint8[1500];
+  if (sock_sendto(fd, &query[0], qlen, server) < 0) {
+    sock_close(fd);
+    return -NET_ENETUNREACH;
+  }
+  while (true) {
+    var left: int64 = deadline - net_now_ms();
+    if (left <= 0) { break; }
+    var p: NetPollFd;
+    p.fd = fd;
+    p.events = NET_POLL_IN;
+    var ready: int64 = sock_poll(&p, 1, (int32)left);
+    if (ready < 0 && ready != -NET_EINTR) { break; }
+    if (ready <= 0) { continue; }
+    var from: NetAddr;
+    var n: int64 = sock_recvfrom(fd, &reply[0], 1500, &from);
+    if (n <= 0) { continue; }
+    from.port = server->port;
+    if (!net_addr_equal(from, *server)) { continue; }   // not from the server we asked
+    match (dns_parse_response(&reply[0], n, id, port, out, max)) {
+      case Ok(ans): {
+        sock_close(fd);
+        if (ans.truncated) {
+          var big: uint8[4096];
+          var tn: int64 = dns_query_tcp(server, &query[0], qlen, &big[0], 4096, deadline);
+          if (tn <= 0) { return -NET_ETIMEDOUT; }
+          match (dns_parse_response(&big[0], tn, id, port, out, max)) {
+            case Ok(tans): {
+              if (tans.rcode != 0) { return -1000 - tans.rcode; }
+              return tans.count;
+            }
+            case Err(e): { return -NET_ETIMEDOUT; }
+          }
+        }
+        if (ans.rcode != 0) { return -1000 - ans.rcode; }
+        return ans.count;
+      }
+      case Err(e): { }   // a stray or forged reply; keep waiting
+    }
+  }
+  sock_close(fd);
+  return -NET_ETIMEDOUT;
+}
+
+// Asks one server for one record type (DNS_TYPE_A or DNS_TYPE_AAAA) and
+// writes the addresses it returns, with port set. Returns the count, 0 for
+// an empty answer, -NET_ETIMEDOUT, or -1000 - rcode when the server answers
+// with an error (-1003: no such name).
+export fn dns_query(server: NetAddr*, name: string, qtype: int32, port: int32, out: NetAddr*, max: int32, timeout_ms: int64) -> int32 {
+  return dns_ask(server, name, qtype, port, out, max, net_now_ms() + timeout_ms);
+}
+
+// Why net_resolve failed.
+export struct DnsError {
+  code: int32;       // DNS_ERR_*
+  message: string;
+}
+
+export const DNS_ERR_NOT_FOUND = 1;
+export const DNS_ERR_TIMEOUT = 2;
+export const DNS_ERR_BAD_NAME = 3;
+export const DNS_ERR_NO_SERVERS = 4;
+export const DNS_ERR_SERVER = 5;
+
+fn dns_fail(code: int32, message: string) -> Result<int32, DnsError> {
+  var e: DnsError;
+  e.code = code;
+  e.message = message;
+  return Err(e);
+}
+
+fn dns_is_localhost(name: string) -> bool {
+  var n: int64 = (int64)name.length;
+  if (n > 0 && (int32)name[n - 1] == 46) { n = n - 1; }
+  var word: string = "localhost";
+  if (n == 9) { return dns_same_name(dns_word(name.chars, 0, n), word); }
+  // RFC 6761: names under .localhost are loopback too.
+  if (n > 10 && (int32)name[n - 10] == 46) {
+    return dns_same_name(dns_word(name.chars, n - 9, n), word);
+  }
+  return false;
+}
+
+// Resolves host to at most max addresses (DNS_MAX_ADDRS is plenty) with the
+// given port, IPv4 first. want is DNS_WANT_ANY, DNS_WANT_V4 or DNS_WANT_V6.
+// Returns how many were written.
+export fn net_resolve(host: string, port: int32, want: int32, out: NetAddr*, max: int32, timeout_ms: int64) -> Result<int32, DnsError> {
+  if (max <= 0) { return dns_fail(DNS_ERR_BAD_NAME, "no room for addresses"); }
+  match (net_addr_parse(host)) {
+    case Ok(a): {
+      if (want != DNS_WANT_ANY && want != a.family) { return dns_fail(DNS_ERR_NOT_FOUND, "address is of the other family"); }
+      var lit: NetAddr = a;
+      lit.port = port;
+      out[0] = lit;
+      return Ok(1);
+    }
+    case Err(e): { }
+  }
+  if (host.length == (uint64)0 || host.length > (uint64)253) { return dns_fail(DNS_ERR_BAD_NAME, "bad host name"); }
+  if (dns_is_localhost(host)) {
+    var k: int32 = 0;
+    if (want != DNS_WANT_V6) {
+      out[k] = net_addr_loopback(NET_IPV4, port);
+      k = k + 1;
+    }
+    if (want != DNS_WANT_V4 && k < max) {
+      out[k] = net_addr_loopback(NET_IPV6, port);
+      k = k + 1;
+    }
+    return Ok(k);
+  }
+
+  var cname: uint8[256];
+  for i in 0..host.length { cname[i] = (uint8)host[i]; }
+  cname[(int64)host.length] = (uint8)0;
+  var sys: int32 = sock_os_system_resolve((cstring)&cname[0], out, max);
+  if (sys > 0) { return Ok(sys); }
+  if (sys == 0) { return dns_fail(DNS_ERR_NOT_FOUND, "host not found"); }
+
+  var file: uint8[16384];
+  var flen: int64 = dns_read_file("/etc/hosts", &file[0], 16384);
+  if (flen > 0) {
+    var hn: int32 = dns_hosts_lookup(dns_word(&file[0], 0, flen), host, port, want, out, max);
+    if (hn > 0) { return Ok(hn); }
+  }
+
+  var servers: NetAddr[3];
+  var ns: int32 = 0;
+  flen = dns_read_file("/etc/resolv.conf", &file[0], 16384);
+  if (flen > 0) { ns = dns_parse_resolv_conf(dns_word(&file[0], 0, flen), &servers[0], DNS_MAX_SERVERS); }
+  if (ns == 0) {
+    // With no resolv.conf, glibc and musl both try a local resolver.
+    servers[0] = net_addr_loopback(NET_IPV4, 53);
+    ns = 1;
+  }
+
+  var deadline: int64 = net_now_ms() + timeout_ms;
+  var got: int32 = 0;
+  var saw_error: int32 = 0;
+  var not_found: bool = false;
+  for s in 0..ns {
+    if (net_now_ms() >= deadline) { break; }
+    // Split what is left between the remaining servers.
+    var share: int64 = (deadline - net_now_ms()) / (int64)(ns - s);
+    var until: int64 = net_now_ms() + share;
+    got = 0;
+    not_found = false;
+    if (want != DNS_WANT_V6) {
+      var r4: int32 = dns_ask(&servers[s], host, DNS_TYPE_A, port, out, max, until);
+      if (r4 > 0) { got = r4; }
+      if (r4 == -1003) { not_found = true; }
+      if (r4 < 0 && r4 != -1003) { saw_error = r4; }
+    }
+    if (want != DNS_WANT_V4 && got < max && !not_found) {
+      var until6: int64 = until;
+      if (got > 0) { until6 = net_now_ms() + share / 2; }
+      var r6: int32 = dns_ask(&servers[s], host, DNS_TYPE_AAAA, port, out + got, max - got, until6);
+      if (r6 > 0) { got = got + r6; }
+      if (r6 == -1003) { not_found = true; }
+    }
+    if (got > 0) { return Ok(got); }
+    if (not_found) { return dns_fail(DNS_ERR_NOT_FOUND, "host not found"); }
+  }
+  if (saw_error == -NET_ETIMEDOUT) { return dns_fail(DNS_ERR_TIMEOUT, "DNS query timed out"); }
+  if (saw_error <= -1000) { return dns_fail(DNS_ERR_SERVER, "DNS server refused the query"); }
+  return dns_fail(DNS_ERR_NOT_FOUND, "host not found");
+}

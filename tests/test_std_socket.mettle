@@ -1,0 +1,212 @@
+// std/socket: addresses, loopback TCP and UDP, poll, epoll, and DNS against
+// a fake server on a thread. Linux only (it uses epoll).
+import "std/socket";
+import "std/thread";
+import "std/conv";
+
+fn fmt_is(a: NetAddr, want: string) -> bool {
+  var buf: uint8[64];
+  var n: int64 = net_addr_format(a, &buf[0], (int64)64);
+  return n >= 0 && str_from_bytes((cstring)&buf[0], n) == want;
+}
+
+fn ip_round_trip(text: string, want: string) -> bool {
+  match (net_addr_parse(text)) {
+    case Ok(a): {
+      var buf: uint8[64];
+      var n: int64 = net_addr_format_ip(a, &buf[0], (int64)64);
+      return n >= 0 && str_from_bytes((cstring)&buf[0], n) == want;
+    }
+    case Err(e): { return false; }
+  }
+}
+
+fn ip_rejects(text: string) -> bool {
+  match (net_addr_parse(text)) {
+    case Ok(a): { return false; }
+    case Err(e): { return true; }
+  }
+}
+
+// The fake DNS server: answers one A query with 10.1.2.3.
+var g_dns_fd: int64 = 0;
+
+fn fake_dns(arg: cstring) -> uint32 {
+  var buf: uint8[600];
+  var from: NetAddr;
+  var n: int64 = sock_recvfrom(g_dns_fd, &buf[0], (int64)512, &from);
+  if (n < 12) { return (uint32)1; }
+  buf[2] = (uint8)0x81;   // QR + RD
+  buf[3] = (uint8)0x80;   // RA, rcode 0
+  buf[7] = (uint8)1;      // one answer
+  var at: int64 = n;
+  buf[at] = (uint8)0xC0; buf[at + 1] = (uint8)12;           // name: pointer to the question
+  buf[at + 2] = (uint8)0; buf[at + 3] = (uint8)1;           // type A
+  buf[at + 4] = (uint8)0; buf[at + 5] = (uint8)1;           // class IN
+  buf[at + 6] = (uint8)0; buf[at + 7] = (uint8)0; buf[at + 8] = (uint8)0; buf[at + 9] = (uint8)60;
+  buf[at + 10] = (uint8)0; buf[at + 11] = (uint8)4;
+  buf[at + 12] = (uint8)10; buf[at + 13] = (uint8)1; buf[at + 14] = (uint8)2; buf[at + 15] = (uint8)3;
+  sock_sendto(g_dns_fd, &buf[0], at + 16, &from);
+  return (uint32)0;
+}
+
+fn main() -> int32 {
+  // ---- addresses ----
+  if (!ip_round_trip("192.0.2.1", "192.0.2.1")) { return 1; }
+  if (!ip_round_trip("2001:0db8:0000:0000:0000:0000:0000:0001", "2001:db8::1")) { return 2; }
+  if (!ip_round_trip("::", "::")) { return 3; }
+  if (!ip_round_trip("::1", "::1")) { return 4; }
+  if (!ip_round_trip("1:0:0:2:0:0:0:3", "1:0:0:2::3")) { return 5; }
+  if (!ip_round_trip("2001:db8:0:1:1:1:1:1", "2001:db8:0:1:1:1:1:1")) { return 6; }
+  if (!ip_round_trip("::ffff:192.0.2.1", "::ffff:c000:201")) { return 7; }
+  if (!ip_round_trip("fe80::1%3", "fe80::1%3")) { return 8; }
+  if (!ip_rejects("256.1.1.1") || !ip_rejects("1.2.3") || !ip_rejects("01.2.3.4") || !ip_rejects("1::2::3")) { return 9; }
+  if (!ip_rejects("1:2:3:4:5:6:7:8:9") || !ip_rejects(":1") || !ip_rejects("1:") || !ip_rejects("12345::")) { return 10; }
+  if (!fmt_is(net_addr_v4(127, 0, 0, 1, 80), "127.0.0.1:80")) { return 11; }
+  if (!fmt_is(net_addr_loopback(NET_IPV6, 443), "[::1]:443")) { return 12; }
+  match (net_split_host_port("[2001:db8::1]:8443", 80)) {
+    case Ok(hp): { if (hp.host != "2001:db8::1" || hp.port != 8443) { return 13; } }
+    case Err(e): { return 14; }
+  }
+  match (net_split_host_port("example.com", 80)) {
+    case Ok(hp): { if (hp.host != "example.com" || hp.port != 80) { return 15; } }
+    case Err(e): { return 16; }
+  }
+  match (net_split_host_port("example.com:99999", 80)) {
+    case Ok(hp): { return 17; }
+    case Err(e): { }
+  }
+
+  // ---- TCP over loopback ----
+  var any: NetAddr = net_addr_loopback(NET_IPV4, 0);
+  var lfd: int64 = 0;
+  match (tcp_listen(&any, 16)) {
+    case Ok(fd): { lfd = fd; }
+    case Err(e): { return 20; }
+  }
+  var bound: NetAddr;
+  if (sock_local_addr(lfd, &bound) < 0 || bound.port == 0) { return 21; }
+  var cfd: int64 = 0;
+  match (tcp_connect("127.0.0.1", bound.port, (int64)2000)) {
+    case Ok(fd): { cfd = fd; }
+    case Err(e): { return 22; }
+  }
+  // The listener is readable once a connection waits.
+  if ((sock_wait(lfd, NET_POLL_IN, (int64)1000) & (int64)NET_POLL_IN) == 0) { return 23; }
+  var peer: NetAddr;
+  var sfd: int64 = sock_accept(lfd, &peer);
+  if (sfd < 0 || !net_addr_is_loopback(peer)) { return 24; }
+  var msg: string = "hello over tcp";
+  if (sock_send_all(cfd, msg.chars, (int64)msg.length) != (int64)msg.length) { return 25; }
+  var got: uint8[64];
+  if (sock_recv_exact(sfd, &got[0], (int64)msg.length) != (int64)msg.length) { return 26; }
+  if (str_from_bytes((cstring)&got[0], (int64)msg.length) != msg) { return 27; }
+  // A receive timeout comes back as -NET_EAGAIN, not as a closed peer.
+  sock_set_timeout(sfd, (int64)50, (int64)-1);
+  if (sock_recv(sfd, &got[0], (int64)64) != -(int64)NET_EAGAIN) { return 28; }
+  sock_set_option(cfd, NET_OPT_NODELAY, 1);
+  // The peer closes: recv sees 0, and sending gives an error, not SIGPIPE.
+  sock_close(cfd);
+  if (sock_recv(sfd, &got[0], (int64)64) != 0) { return 29; }
+  var big: uint8[65536];
+  var sent_err: int64 = 0;
+  for i in 0..64 {
+    var r: int64 = sock_send(sfd, &big[0], (int64)65536);
+    if (r < 0) {
+      sent_err = r;
+      break;
+    }
+  }
+  if (sent_err != -(int64)NET_EPIPE && sent_err != -(int64)NET_ECONNRESET) { return 30; }
+  sock_close(sfd);
+
+  // Nothing listens on a closed port.
+  var closed_port: int32 = bound.port;
+  sock_close(lfd);
+  match (tcp_connect("127.0.0.1", closed_port, (int64)1000)) {
+    case Ok(fd): { return 31; }
+    case Err(e): { if (e.code != (int64)NET_ECONNREFUSED) { return 32; } }
+  }
+
+  // IPv6 loopback, when the host has it.
+  var any6: NetAddr = net_addr_loopback(NET_IPV6, 0);
+  match (tcp_listen(&any6, 4)) {
+    case Ok(fd6): {
+      var b6: NetAddr;
+      sock_local_addr(fd6, &b6);
+      var c6: int64 = tcp_connect_addr(&b6, (int64)1000);
+      if (c6 < 0) { return 33; }
+      var s6: int64 = sock_accept(fd6, (NetAddr*)0);
+      if (s6 < 0) { return 34; }
+      sock_close(c6);
+      sock_close(s6);
+      sock_close(fd6);
+    }
+    case Err(e): { }
+  }
+
+  // ---- UDP ----
+  var ua: NetAddr = net_addr_loopback(NET_IPV4, 0);
+  var u1: int64 = 0;
+  var u2: int64 = 0;
+  match (udp_bind(&ua)) { case Ok(fd): { u1 = fd; } case Err(e): { return 40; } }
+  match (udp_bind(&ua)) { case Ok(fd): { u2 = fd; } case Err(e): { return 41; } }
+  var a2: NetAddr;
+  sock_local_addr(u2, &a2);
+  var dgram: string = "ping";
+  if (sock_sendto(u1, dgram.chars, (int64)4, &a2) != 4) { return 42; }
+  var from: NetAddr;
+  if (sock_wait(u2, NET_POLL_IN, (int64)1000) <= 0) { return 43; }
+  if (sock_recvfrom(u2, &got[0], (int64)64, &from) != 4 || !net_addr_is_loopback(from)) { return 44; }
+
+  // ---- epoll ----
+  var ep: int64 = net_epoll_create();
+  if (ep < 0) { return 50; }
+  if (net_epoll_ctl(ep, NET_EPOLL_ADD, u2, (uint32)NET_POLL_IN, (uint64)77) < 0) { return 51; }
+  var evs: NetEpollEvent[4];
+  if (net_epoll_wait(ep, &evs[0], 4, 0) != 0) { return 52; }
+  sock_sendto(u1, dgram.chars, (int64)4, &a2);
+  if (net_epoll_wait(ep, &evs[0], 4, 1000) != 1 || evs[0].data != (uint64)77) { return 53; }
+  sock_close(ep);
+
+  // ---- DNS ----
+  var q: uint8[300];
+  var ql: int64 = dns_build_query(0x1234, "example.com", DNS_TYPE_A, &q[0], (int64)300);
+  if (ql != (int64)29 || q[12] != (uint8)7 || q[20] != (uint8)3) { return 60; }
+  if (dns_build_query(1, "bad..name", DNS_TYPE_A, &q[0], (int64)300) != (int64)-1) { return 61; }
+  var hosts: string = "# comment\n127.0.0.1 localhost\n10.0.0.5  db.internal db  # the database\n::1 ip6-localhost\n";
+  var found: NetAddr[4];
+  if (dns_hosts_lookup(hosts, "DB.internal", 5490, DNS_WANT_ANY, &found[0], 4) != 1) { return 62; }
+  if (!fmt_is(found[0], "10.0.0.5:5490")) { return 63; }
+  if (dns_hosts_lookup(hosts, "db", 1, DNS_WANT_V6, &found[0], 4) != 0) { return 64; }
+  var servers: NetAddr[3];
+  if (dns_parse_resolv_conf("search lan\nnameserver 10.0.0.1\nnameserver ::1\n", &servers[0], 3) != 2) { return 65; }
+  if (!fmt_is(servers[1], "[::1]:53")) { return 66; }
+  match (net_resolve("localhost", 8080, DNS_WANT_V4, &found[0], 4, (int64)1000)) {
+    case Ok(n): { if (n != 1 || !fmt_is(found[0], "127.0.0.1:8080")) { return 67; } }
+    case Err(e): { return 68; }
+  }
+  match (net_resolve("2001:db8::7", 1, DNS_WANT_ANY, &found[0], 4, (int64)1000)) {
+    case Ok(n): { if (n != 1 || found[0].family != NET_IPV6) { return 69; } }
+    case Err(e): { return 70; }
+  }
+  // A query to a fake server on this machine.
+  var da: NetAddr = net_addr_loopback(NET_IPV4, 0);
+  match (udp_bind(&da)) { case Ok(fd): { g_dns_fd = fd; } case Err(e): { return 71; } }
+  var dns_at: NetAddr;
+  sock_local_addr(g_dns_fd, &dns_at);
+  var tid: uint32 = 0;
+  var th: int64 = CreateThread((cstring)0, (uint64)0, &fake_dns, (cstring)0, (uint32)0, &tid);
+  if (th == 0) { return 72; }
+  var dn: int32 = dns_query(&dns_at, "svc.test", DNS_TYPE_A, 443, &found[0], 4, (int64)2000);
+  thread_join_infinite(th);
+  if (dn != 1 || !fmt_is(found[0], "10.1.2.3:443")) { return 73; }
+  // Nobody answers: a timeout, not a hang.
+  var t0: int64 = net_now_ms();
+  if (dns_query(&dns_at, "svc.test", DNS_TYPE_A, 1, &found[0], 4, (int64)100) != -NET_ETIMEDOUT) { return 74; }
+  if (net_now_ms() - t0 > (int64)2000) { return 75; }
+  sock_close(g_dns_fd);
+  sock_close(u1);
+  sock_close(u2);
+  return 0;
+}

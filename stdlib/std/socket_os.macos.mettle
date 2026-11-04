@@ -1,0 +1,268 @@
+// macOS sockets for std/socket, through libc. Every call returns a count or
+// descriptor, or a negative error code (-errno), as on Linux.
+
+import "std/netaddr";
+
+export const NET_EINTR = 4;
+export const NET_EBADF = 9;
+export const NET_EAGAIN = 35;
+export const NET_EINVAL = 22;
+export const NET_EPIPE = 32;
+export const NET_EADDRINUSE = 48;
+export const NET_ENETUNREACH = 51;
+export const NET_ECONNRESET = 54;
+export const NET_ENOTCONN = 57;
+export const NET_ETIMEDOUT = 60;
+export const NET_ECONNREFUSED = 61;
+export const NET_EHOSTUNREACH = 65;
+export const NET_EINPROGRESS = 36;
+
+extern fn sock_c_errno() -> int32* = "__error";
+extern fn sock_c_socket(af: int32, kind: int32, proto: int32) -> int32 = "socket";
+extern fn sock_c_close(fd: int32) -> int32 = "close";
+extern fn sock_c_bind(fd: int32, addr: uint8*, len: uint32) -> int32 = "bind";
+extern fn sock_c_listen(fd: int32, backlog: int32) -> int32 = "listen";
+extern fn sock_c_accept(fd: int32, addr: uint8*, len: uint32*) -> int32 = "accept";
+extern fn sock_c_connect(fd: int32, addr: uint8*, len: uint32) -> int32 = "connect";
+extern fn sock_c_sendto(fd: int32, buf: uint8*, n: int64, flags: int32, addr: uint8*, len: uint32) -> int64 = "sendto";
+extern fn sock_c_recvfrom(fd: int32, buf: uint8*, n: int64, flags: int32, addr: uint8*, len: uint32*) -> int64 = "recvfrom";
+extern fn sock_c_shutdown(fd: int32, how: int32) -> int32 = "shutdown";
+extern fn sock_c_setsockopt(fd: int32, level: int32, name: int32, v: uint8*, len: uint32) -> int32 = "setsockopt";
+extern fn sock_c_getsockopt(fd: int32, level: int32, name: int32, v: uint8*, len: uint32*) -> int32 = "getsockopt";
+extern fn sock_c_getsockname(fd: int32, addr: uint8*, len: uint32*) -> int32 = "getsockname";
+extern fn sock_c_getpeername(fd: int32, addr: uint8*, len: uint32*) -> int32 = "getpeername";
+extern fn sock_c_fcntl(fd: int32, cmd: int32, arg: int32) -> int32 = "fcntl";
+extern fn sock_c_poll(fds: uint8*, n: uint32, timeout: int32) -> int32 = "poll";
+
+const AF_INET = 2;
+const AF_INET6 = 30;
+const SOL_SOCKET = 0xFFFF;
+const O_NONBLOCK = 4;
+
+// Turns a libc result into the count or -errno.
+fn sock_os_ret(r: int64) -> int64 {
+  if (r < 0) { return -(int64)*sock_c_errno(); }
+  return r;
+}
+
+// Sockets are file descriptors, so a kqueue or poll loop can watch them.
+
+// Writes a NetAddr as a sockaddr_in or sockaddr_in6, which on macOS start
+// with a length byte. Returns the length.
+fn sock_os_to_raw(a: NetAddr*, raw: uint8*) -> int64 {
+  for i in 0..28 { raw[i] = (uint8)0; }
+  raw[2] = (uint8)((a->port >> 8) & 255);
+  raw[3] = (uint8)(a->port & 255);
+  if (a->family == NET_IPV6) {
+    raw[0] = (uint8)28;
+    raw[1] = (uint8)AF_INET6;
+    for i in 0..16 { raw[8 + i] = a->ip[i]; }
+    *(uint32*)(raw + 24) = a->scope_id;
+    return 28;
+  }
+  raw[0] = (uint8)16;
+  raw[1] = (uint8)AF_INET;
+  for i in 0..4 { raw[4 + i] = a->ip[i]; }
+  return 16;
+}
+
+fn sock_os_from_raw(raw: uint8*, a: NetAddr*) {
+  var empty: NetAddr;
+  *a = empty;
+  a->port = ((int32)raw[2] << 8) | (int32)raw[3];
+  if ((int32)raw[1] == AF_INET6) {
+    a->family = NET_IPV6;
+    for i in 0..16 { a->ip[i] = raw[8 + i]; }
+    a->scope_id = *(uint32*)(raw + 24);
+    return;
+  }
+  a->family = NET_IPV4;
+  for i in 0..4 { a->ip[i] = raw[4 + i]; }
+}
+
+fn sock_os_setopt(fd: int64, level: int32, name: int32, value: int32) -> int64 {
+  var v: int32 = value;
+  return sock_os_ret((int64)sock_c_setsockopt((int32)fd, level, name, (uint8*)&v, (uint32)4));
+}
+
+// A new socket. type is NET_TCP or NET_UDP; family is NET_IPV4 or NET_IPV6.
+// SO_NOSIGPIPE is set, so a closed peer gives -NET_EPIPE, not a signal.
+export fn sock_open(family: int32, type: int32) -> int64 {
+  var af: int32 = AF_INET;
+  if (family == NET_IPV6) { af = AF_INET6; }
+  var kind: int32 = 1;
+  if (type == 2) { kind = 2; }
+  var fd: int64 = sock_os_ret((int64)sock_c_socket(af, kind, 0));
+  if (fd < 0) { return fd; }
+  sock_c_fcntl((int32)fd, 2, 1);           // F_SETFD FD_CLOEXEC
+  sock_os_setopt(fd, SOL_SOCKET, 0x1022, 1);  // SO_NOSIGPIPE
+  return fd;
+}
+
+export fn sock_close(fd: int64) -> int64 { return sock_os_ret((int64)sock_c_close((int32)fd)); }
+
+export fn sock_bind(fd: int64, a: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var n: int64 = sock_os_to_raw(a, &raw[0]);
+  return sock_os_ret((int64)sock_c_bind((int32)fd, &raw[0], (uint32)n));
+}
+
+export fn sock_listen(fd: int64, backlog: int32) -> int64 {
+  return sock_os_ret((int64)sock_c_listen((int32)fd, backlog));
+}
+
+// Accepts one connection. peer may be null.
+export fn sock_accept(fd: int64, peer: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: uint32 = 28;
+  var r: int64 = sock_os_ret((int64)sock_c_accept((int32)fd, &raw[0], &len));
+  if (r >= 0) {
+    sock_c_fcntl((int32)r, 2, 1);
+    sock_os_setopt(r, SOL_SOCKET, 0x1022, 1);
+    if (peer != 0) { sock_os_from_raw(&raw[0], peer); }
+  }
+  return r;
+}
+
+// -NET_EINPROGRESS on a non-blocking socket means the connect is under way;
+// wait for NET_POLL_OUT, then read sock_take_error.
+export fn sock_connect(fd: int64, a: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var n: int64 = sock_os_to_raw(a, &raw[0]);
+  return sock_os_ret((int64)sock_c_connect((int32)fd, &raw[0], (uint32)n));
+}
+
+export fn sock_send(fd: int64, buf: uint8*, n: int64) -> int64 {
+  return sock_os_ret(sock_c_sendto((int32)fd, buf, n, 0, (uint8*)0, (uint32)0));
+}
+
+// 0 means the peer closed its side.
+export fn sock_recv(fd: int64, buf: uint8*, n: int64) -> int64 {
+  return sock_os_ret(sock_c_recvfrom((int32)fd, buf, n, 0, (uint8*)0, (uint32*)0));
+}
+
+export fn sock_sendto(fd: int64, buf: uint8*, n: int64, to: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: int64 = sock_os_to_raw(to, &raw[0]);
+  return sock_os_ret(sock_c_sendto((int32)fd, buf, n, 0, &raw[0], (uint32)len));
+}
+
+// from may be null.
+export fn sock_recvfrom(fd: int64, buf: uint8*, n: int64, from: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: uint32 = 28;
+  var r: int64 = sock_os_ret(sock_c_recvfrom((int32)fd, buf, n, 0, &raw[0], &len));
+  if (r >= 0 && from != 0) { sock_os_from_raw(&raw[0], from); }
+  return r;
+}
+
+export fn sock_shutdown(fd: int64, how: int32) -> int64 {
+  return sock_os_ret((int64)sock_c_shutdown((int32)fd, how));
+}
+
+// opt is one of the NET_OPT_* constants; value is 1 to turn it on, 0 off.
+export fn sock_set_option(fd: int64, opt: int32, value: int32) -> int64 {
+  switch (opt) {
+    case 1: { return sock_os_setopt(fd, SOL_SOCKET, 4, value); }      // SO_REUSEADDR
+    case 2: { return sock_os_setopt(fd, SOL_SOCKET, 0x200, value); }  // SO_REUSEPORT
+    case 3: { return sock_os_setopt(fd, 6, 1, value); }               // TCP_NODELAY
+    case 4: { return sock_os_setopt(fd, SOL_SOCKET, 8, value); }      // SO_KEEPALIVE
+    case 5: { return sock_os_setopt(fd, 41, 27, value); }             // IPV6_V6ONLY
+    case 6: { return sock_os_setopt(fd, SOL_SOCKET, 0x20, value); }   // SO_BROADCAST
+    default: { }
+  }
+  return -NET_EINVAL;
+}
+
+export fn sock_set_nonblocking(fd: int64, on: bool) -> int64 {
+  var flags: int64 = sock_os_ret((int64)sock_c_fcntl((int32)fd, 3, 0));
+  if (flags < 0) { return flags; }
+  if (on) {
+    flags = flags | O_NONBLOCK;
+  } else {
+    flags = flags & ~O_NONBLOCK;
+  }
+  return sock_os_ret((int64)sock_c_fcntl((int32)fd, 4, (int32)flags));
+}
+
+fn sock_os_timeout(fd: int64, name: int32, ms: int64) -> int64 {
+  // struct timeval: 8-byte seconds, 4-byte microseconds, 4 bytes of padding.
+  var tv: int64[2];
+  tv[0] = ms / 1000;
+  tv[1] = (ms % 1000) * 1000;
+  return sock_os_ret((int64)sock_c_setsockopt((int32)fd, SOL_SOCKET, name, (uint8*)&tv[0], (uint32)16));
+}
+
+// Blocking reads and writes give up after this many milliseconds with
+// -NET_EAGAIN. 0 waits forever; a negative value leaves that side alone.
+export fn sock_set_timeout(fd: int64, recv_ms: int64, send_ms: int64) -> int64 {
+  if (recv_ms >= 0) {
+    var r: int64 = sock_os_timeout(fd, 0x1006, recv_ms);   // SO_RCVTIMEO
+    if (r < 0) { return r; }
+  }
+  if (send_ms >= 0) {
+    return sock_os_timeout(fd, 0x1005, send_ms);           // SO_SNDTIMEO
+  }
+  return 0;
+}
+
+export fn sock_local_addr(fd: int64, out: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: uint32 = 28;
+  var r: int64 = sock_os_ret((int64)sock_c_getsockname((int32)fd, &raw[0], &len));
+  if (r >= 0) { sock_os_from_raw(&raw[0], out); }
+  return r;
+}
+
+export fn sock_peer_addr(fd: int64, out: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: uint32 = 28;
+  var r: int64 = sock_os_ret((int64)sock_c_getpeername((int32)fd, &raw[0], &len));
+  if (r >= 0) { sock_os_from_raw(&raw[0], out); }
+  return r;
+}
+
+// The socket's pending error as -code, or 0. Reading it clears it.
+export fn sock_take_error(fd: int64) -> int64 {
+  var v: int32 = 0;
+  var len: uint32 = 4;
+  var r: int64 = sock_os_ret((int64)sock_c_getsockopt((int32)fd, SOL_SOCKET, 0x1007, (uint8*)&v, &len));
+  if (r < 0) { return r; }
+  return -(int64)v;
+}
+
+// Waits until one of the sockets is ready or timeout_ms passes (-1 waits
+// forever). Returns how many have revents set, 0 on timeout.
+export fn sock_poll(fds: NetPollFd*, n: int32, timeout_ms: int32) -> int64 {
+  if (n > 64) { return -NET_EINVAL; }
+  var raw: int32[128];
+  for i in 0..n {
+    raw[i * 2] = (int32)fds[i].fd;
+    raw[i * 2 + 1] = fds[i].events & 0xFFFF;
+  }
+  var r: int64 = sock_os_ret((int64)sock_c_poll((uint8*)&raw[0], (uint32)n, timeout_ms));
+  for i in 0..n {
+    if (r >= 0) {
+      fds[i].revents = (raw[i * 2 + 1] >> 16) & 0xFFFF;
+    } else {
+      fds[i].revents = 0;
+    }
+  }
+  return r;
+}
+
+extern fn sock_c_clock_gettime(id: int32, ts: int64*) -> int32 = "clock_gettime";
+
+// Milliseconds on a monotonic clock, for timeouts. Only differences mean
+// anything.
+export fn net_now_ms() -> int64 {
+  var ts: int64[2];
+  if (sock_c_clock_gettime(6, &ts[0]) != 0) { return 0; }   // CLOCK_MONOTONIC
+  return ts[0] * 1000 + ts[1] / 1000000;
+}
+
+// The system resolver hook. On this platform std/dns reads /etc/hosts and
+// /etc/resolv.conf itself, so this always says "not handled".
+export fn sock_os_system_resolve(host: cstring, out: NetAddr*, max: int32) -> int32 {
+  return -1;
+}

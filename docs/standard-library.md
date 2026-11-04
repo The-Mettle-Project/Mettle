@@ -541,6 +541,93 @@ say what an instruction of each kind costs on the machine. `mettle target
 reads one back. [Bare metal](bare-metal.md) covers what a description may
 change, and [Types](types.md) covers what the cost fields are read for.
 
+## std/socket
+
+TCP and UDP over IPv4 and IPv6, with timeouts, polling and host-name lookup.
+Linux, macOS and Windows. Use it for new code; `std/net` below is the older
+Winsock-style API.
+
+`import "std/socket"` brings in four modules:
+
+| Module | Holds |
+|--------|-------|
+| `std/netaddr` | `NetAddr`, parsing and formatting, and the shared constants. No OS calls |
+| `std/socket_os` | The raw calls, one file per platform |
+| `std/dns` | `net_resolve` and the DNS message codec |
+| `std/socket` | Helpers: connect by name, listen, send all, wait |
+
+The raw calls return a count or descriptor, or a negative error code:
+`-NET_EAGAIN`, `-NET_ECONNREFUSED`, `-NET_ETIMEDOUT`, `-NET_ECONNRESET`,
+`-NET_EPIPE`, `-NET_EINPROGRESS`, `-NET_EINTR` and others. The codes are the
+platform's own (errno, or Winsock's), named the same everywhere. So a receive
+timeout (`-NET_EAGAIN`) is easy to tell from a closed peer (0). On Linux the
+calls are raw system calls, with no libc.
+
+Sockets are plain descriptors, so any event loop can watch them, alph's epoll
+reactor included.
+
+**Addresses.** `NetAddr` has `family` (`NET_IPV4` or `NET_IPV6`), `port`,
+`ip` (16 bytes; IPv4 uses the first 4) and `scope_id`.
+
+| Function | Effect |
+|----------|--------|
+| `net_addr_parse(s) -> Result<NetAddr, string>` | `192.0.2.1`, `2001:db8::1`, `::ffff:192.0.2.1`, `fe80::1%3` |
+| `net_addr_v4(a, b, c, d, port)`, `net_addr_loopback(family, port)`, `net_addr_any(family, port)` | Build one |
+| `net_addr_format(a, buf, cap) -> int64` | `192.0.2.1:80`, `[2001:db8::1]:443` |
+| `net_addr_format_ip(a, buf, cap) -> int64` | The address alone, in RFC 5952 form |
+| `net_addr_equal(a, b)`, `net_addr_is_loopback(a)` | Compare |
+| `net_split_host_port(s, default_port) -> Result<NetHostPort, string>` | Split `host:port` or `[v6]:port`, with no lookup |
+
+**Raw calls.** `sock_open(family, NET_TCP or NET_UDP)`, `sock_close`,
+`sock_bind(fd, &addr)`, `sock_listen(fd, backlog)`, `sock_accept(fd, &peer)`,
+`sock_connect(fd, &addr)`, `sock_send(fd, buf, n)`, `sock_recv(fd, buf, n)`,
+`sock_sendto`, `sock_recvfrom`, `sock_shutdown(fd, NET_SHUT_READ, _WRITE or
+_BOTH)`, `sock_local_addr`, `sock_peer_addr`, and `sock_take_error` (the
+pending error, after a non-blocking connect).
+
+Sending never raises SIGPIPE; a closed peer gives `-NET_EPIPE`.
+
+| Function | Effect |
+|----------|--------|
+| `sock_set_option(fd, opt, 1 or 0)` | `NET_OPT_REUSEADDR`, `_REUSEPORT` (not Windows), `_NODELAY`, `_KEEPALIVE`, `_V6ONLY`, `_BROADCAST` |
+| `sock_set_nonblocking(fd, on: bool)` | Non-blocking mode |
+| `sock_set_timeout(fd, recv_ms, send_ms)` | Blocking calls give up after this long. 0 waits forever, -1 leaves that side alone |
+| `sock_poll(fds: NetPollFd*, n, timeout_ms) -> int64` | Up to 64 sockets. `NET_POLL_IN`, `_OUT`, `_ERR`, `_HUP`, `_NVAL` are the same on every platform |
+| `net_now_ms() -> int64` | A monotonic clock in ms, for deadlines |
+
+On Linux there is also epoll: `net_epoll_create()`, `net_epoll_ctl(ep,
+NET_EPOLL_ADD, _MOD or _DEL, fd, events, data)` and `net_epoll_wait(ep, out:
+NetEpollEvent*, max, timeout_ms)`. `NET_EPOLL_ET` asks for edge-triggered
+events.
+
+**Helpers.** These return `Result<int64, NetError>`, where `NetError` has a
+positive `code` and a `message`. `net_error_text(code)` describes a code.
+
+| Function | Effect |
+|----------|--------|
+| `tcp_connect(host, port, timeout_ms)` | Resolve, then try each address in turn within the timeout. Gives a blocking socket |
+| `tcp_connect_addr(&addr, timeout_ms) -> int64` | Connect to one address |
+| `tcp_listen(&addr, backlog)` | Bind with `SO_REUSEADDR` and listen. Port 0 picks a free port |
+| `udp_bind(&addr)` | A bound UDP socket |
+| `sock_send_all(fd, buf, n) -> int64` | Send everything, through short writes |
+| `sock_recv_exact(fd, buf, n) -> int64` | Receive exactly `n` bytes; 0 if the peer closed first |
+| `sock_wait(fd, events, timeout_ms) -> int64` | Wait for one socket |
+
+**Names.** `net_resolve(host, port, want, out: NetAddr*, max, timeout_ms) ->
+Result<int32, DnsError>` returns how many addresses it wrote. `want` is
+`DNS_WANT_ANY`, `_V4` or `_V6`. It tries, in order: an IP literal,
+`localhost` and names under `.localhost`, `/etc/hosts`, then DNS over UDP to
+the servers in `/etc/resolv.conf`, falling back to TCP when a reply is
+truncated. IPv4 addresses come first. `search` domains are not applied. On
+Windows, names past `localhost` go to the system resolver. `DnsError.code` is
+one of `DNS_ERR_NOT_FOUND`, `_TIMEOUT`, `_BAD_NAME`, `_NO_SERVERS` or
+`_SERVER`.
+
+The pieces are exported too: `dns_query(&server, name, DNS_TYPE_A or
+DNS_TYPE_AAAA, port, out, max, timeout_ms)` asks one server,
+`dns_build_query` and `dns_parse_response` are the message codec, and
+`dns_hosts_lookup` and `dns_parse_resolv_conf` read the two files' text.
+
 ## std/net
 
 TCP and UDP sockets. Windows, over Winsock. On Linux import
