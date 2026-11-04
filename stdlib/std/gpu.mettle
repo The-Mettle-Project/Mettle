@@ -1,3 +1,5 @@
+import "std/io";
+
 export extern fn cuInit(flags: uint32) -> int32 = "cuInit";
 export extern fn cuDeviceGet(dev: int32*, ordinal: int32) -> int32 = "cuDeviceGet";
 export extern fn cuDeviceGetAttribute(value: int32*, attribute: int32, dev: int32) -> int32 = "cuDeviceGetAttribute";
@@ -32,6 +34,8 @@ export extern fn cuStreamWaitEvent(stream: int64, event: int64, flags: uint32) -
 export extern fn cuEventCreate(event: int64*, flags: uint32) -> int32 = "cuEventCreate";
 export extern fn cuEventDestroy_v2(event: int64) -> int32 = "cuEventDestroy_v2";
 export extern fn cuEventRecord(event: int64, stream: int64) -> int32 = "cuEventRecord";
+export extern fn cuEventQuery(event: int64) -> int32 = "cuEventQuery";
+export extern fn cuStreamQuery(stream: int64) -> int32 = "cuStreamQuery";
 export extern fn cuEventSynchronize(event: int64) -> int32 = "cuEventSynchronize";
 export extern fn cuEventElapsedTime(ms: float32*, start: int64, finish: int64) -> int32 = "cuEventElapsedTime";
 export extern fn cuLaunchKernel(f: int64, gx: uint32, gy: uint32, gz: uint32,
@@ -47,7 +51,6 @@ export extern fn cuGraphExecDestroy(exec: int64) -> int32 = "cuGraphExecDestroy"
 export extern fn cuGraphDestroy(graph: int64) -> int32 = "cuGraphDestroy";
 extern fn __mtlc_gpu_process_exit(code: int32) = "exit";
 extern fn __mtlc_gpu_fputs(text: cstring, stream: cstring) -> int32 = "fputs";
-extern fn __mtlc_gpu_iob(index: int32) -> cstring = "__acrt_iob_func";
 extern fn __mtlc_gpu_fopen(path: cstring, mode: cstring) -> cstring = "fopen";
 extern fn __mtlc_gpu_fclose(fp: cstring) -> int32 = "fclose";
 extern fn __mtlc_gpu_fread(buf: uint8*, size: int64, count: int64, fp: cstring) -> int64 = "fread";
@@ -59,11 +62,11 @@ extern fn __mtlc_gpu_release(block: uint8*) = "free";
 @inline fn __mtlc_gpu_cstr(s: string) -> cstring { return s.chars; }
 
 fn __mtlc_gpu_note(text: string) {
-  __mtlc_gpu_fputs(text.chars, __mtlc_gpu_iob(2));
+  __mtlc_gpu_fputs(text.chars, get_stderr());
 }
 
 fn __mtlc_gpu_fail(part1: cstring, part2: cstring, part3: cstring) {
-  var err: cstring = __mtlc_gpu_iob(2);
+  var err: cstring = get_stderr();
   __mtlc_gpu_fputs(part1, err);
   __mtlc_gpu_fputs(part2, err);
   __mtlc_gpu_fputs(part3, err);
@@ -88,7 +91,7 @@ export fn gpu_error_text(status: int32) -> cstring {
 }
 
 fn __mtlc_gpu_report(what: string, status: int32) {
-  var err: cstring = __mtlc_gpu_iob(2);
+  var err: cstring = get_stderr();
   __mtlc_gpu_fputs(what.chars, err);
   __mtlc_gpu_fputs(__mtlc_gpu_cstr(": "), err);
   __mtlc_gpu_fputs(gpu_error_name(status), err);
@@ -127,6 +130,8 @@ export fn gpu_init_on(ordinal: int32) -> int64 {
 
 export fn gpu_device_count() -> int32 {
   var count: int32 = 0;
+  // The driver answers nothing before cuInit, which is safe to call again.
+  if (cuInit(0) != 0) { return 0; }
   if (cuDeviceGetCount(&count) != 0) { return 0; }
   return count;
 }
@@ -224,7 +229,7 @@ export fn gpu_module(ptx_image: uint8*) -> int64 {
     __mtlc_gpu_report("mettle: the GPU module would not load", status);
     if (g_gpu_jit_log[0] != 0) {
       __mtlc_gpu_note("--- CUDA PTX JIT log ---\n");
-      __mtlc_gpu_fputs((cstring)&g_gpu_jit_log[0], __mtlc_gpu_iob(2));
+      __mtlc_gpu_fputs((cstring)&g_gpu_jit_log[0], get_stderr());
       __mtlc_gpu_note("\n------------------------\n");
     }
     return 0;
@@ -255,7 +260,7 @@ export fn gpu_module_file(path: cstring) -> int64 {
   var fp: cstring = __mtlc_gpu_fopen(path, __mtlc_gpu_cstr("rb"));
   if (fp == 0) {
     __mtlc_gpu_note("mettle: cannot open the GPU module '");
-    __mtlc_gpu_fputs(path, __mtlc_gpu_iob(2));
+    __mtlc_gpu_fputs(path, get_stderr());
     __mtlc_gpu_note("'; emit it first with `mettle --emit-ptx`\n");
     return 0;
   }
@@ -265,7 +270,7 @@ export fn gpu_module_file(path: cstring) -> int64 {
   if (size <= 0) {
     __mtlc_gpu_fclose(fp);
     __mtlc_gpu_note("mettle: the GPU module '");
-    __mtlc_gpu_fputs(path, __mtlc_gpu_iob(2));
+    __mtlc_gpu_fputs(path, get_stderr());
     __mtlc_gpu_note("' is empty\n");
     return 0;
   }
@@ -371,6 +376,23 @@ export fn gpu_event_create() -> int64 {
 @inline export fn gpu_event_sync(event: int64) -> int32 {
   return cuEventSynchronize(event);
 }
+
+// Checks without waiting. 1 if everything before the event (or on the
+// stream) has finished, 0 if work is still running, or the negative CUDA
+// error. CUDA_ERROR_NOT_READY (600) is the "still running" answer.
+export fn gpu_event_done(event: int64) -> int32 {
+  var r: int32 = cuEventQuery(event);
+  if (r == 0) { return 1; }
+  if (r == 600) { return 0; }
+  return -r;
+}
+
+export fn gpu_stream_done(stream: int64) -> int32 {
+  var r: int32 = cuStreamQuery(stream);
+  if (r == 0) { return 1; }
+  if (r == 600) { return 0; }
+  return -r;
+}
 @inline export fn gpu_stream_wait_event(stream: int64, event: int64) -> int32 {
   return cuStreamWaitEvent(stream, event, 0);
 }
@@ -408,7 +430,7 @@ export fn mtlc_gpu_launch_checked(f: int64,
   var rc: int32 = gpu_launch_3d(f, gx, gy, gz, bx, by, bz, shared_bytes,
                                 stream, params, nargs);
   if (rc == 0) { return; }
-  var err: cstring = __mtlc_gpu_iob(2);
+  var err: cstring = get_stderr();
   __mtlc_gpu_fputs(__mtlc_gpu_cstr("mettle: GPU launch of "), err);
   __mtlc_gpu_fputs(__mtlc_gpu_kernel_name(f), err);
   __mtlc_gpu_note(" failed with grid {gx}x{gy}x{gz}, block {bx}x{by}x{bz}, {shared_bytes} shared bytes\n");
@@ -439,7 +461,7 @@ export fn mtlc_gpu_launch_indirect_checked(f: int64, counts: int64,
   var rc: int32 = gpu_launch_indirect(f, counts, bx, by, bz, shared_bytes,
                                       stream, params, nargs);
   if (rc == 0) { return; }
-  var err: cstring = __mtlc_gpu_iob(2);
+  var err: cstring = get_stderr();
   __mtlc_gpu_fputs(__mtlc_gpu_cstr("mettle: GPU launch of "), err);
   __mtlc_gpu_fputs(__mtlc_gpu_kernel_name(f), err);
   __mtlc_gpu_note(" failed with its grid read from the device, block {bx}x{by}x{bz}, {shared_bytes} shared bytes\n");
