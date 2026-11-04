@@ -1838,6 +1838,8 @@ $cases = @(
   @{ Name = "std_datetime_interp"; Path = "tests/test_std_datetime_interp.mettle"; ShouldSucceed = $true
      Args = @("test")
      SkipBinaryCheck = $true },
+  @{ Name = "std_file"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_file_release"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true; Args = @("--release") },
   @{ Name = "views_interp"; Path = "tests/test_views.mettle"; ShouldSucceed = $true
      Args = @("test")
      SkipBinaryCheck = $true
