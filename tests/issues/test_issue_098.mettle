@@ -1,0 +1,4 @@
+var g_n: int64 = 0;
+fn note(name: string) -> int64 { return (int64)name.length; }
+@test fn fails() -> int32 { if (note("x " + "a") != 3) { return 2; } if (g_n == 0) { return 1; } return 0; }
+@test fn passes() -> int32 { if (note("x " + "a") != 3) { return 2; } return 0; }

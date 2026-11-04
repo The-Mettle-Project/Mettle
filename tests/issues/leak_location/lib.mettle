@@ -1,0 +1,10 @@
+import "std/mem";
+
+// padding
+// padding
+// padding
+// padding
+export fn make() -> int32* {
+  var p: int32* = (int32*)malloc(8);
+  return p;
+}

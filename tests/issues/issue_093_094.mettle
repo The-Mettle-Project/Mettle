@@ -1,0 +1,23 @@
+import "std/io";
+
+struct E { text: string; }
+struct Holder { text: string; n: int32; }
+
+fn tail() -> string { return "world"; }
+
+fn head5(s: string) -> string { var r: string; r.chars = s.chars; r.length = 5; return r; }
+fn keep(s: string) -> E { var t: string = s; var e: E; e.text = t; return e; }
+fn hold(s: string) -> Holder { var h: Holder = { text: s, n: 1 }; return h; }
+
+fn main() -> int32 {
+  var w: string = head5("hello " + tail());
+  var other: string = "XXXXXXXXXXXX" + tail();
+  var e: E = keep("hello " + tail());
+  var other2: string = "XXXXXX" + tail();
+  var h: Holder = hold("hello " + tail());
+  var other3: string = "YYYYYY" + tail();
+  println("[{w}] {other.length}");
+  println("[{e.text}] {other2.length}");
+  println("[{h.text}] {other3.length}");
+  return 0;
+}

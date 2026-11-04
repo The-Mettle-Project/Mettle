@@ -1,0 +1,19 @@
+import "std/io";
+
+struct Table { f4: fn(float32, float32, float32, float32) -> float32; }
+
+fn make(f: fn(int64) -> int64 with alloc, syscall, v: int64) -> int64 { return f(v); }
+fn id(x: int64) -> int64 { return x; }
+
+fn sum4(a: float32, b: float32, c: float32, d: float32) -> float32 { return a + b + c + d; }
+
+fn main() -> int32 {
+  if (make(&id, 3) != 3) { return 1; }
+  var t: Table;
+  t.f4 = &sum4;
+  if (t.f4(0.5, 0.25, 0.125, 1.0) != 1.875) { return 2; }
+  var p: Table* = &t;
+  if (p->f4(0.5, 0.25, 0.125, 1.0) != 1.875) { return 3; }
+  println("ok");
+  return 0;
+}

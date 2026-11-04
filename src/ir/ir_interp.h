@@ -114,6 +114,8 @@ int ir_interp_assert_info(const IRInterpMachine *machine, size_t *line,
 
 size_t ir_interp_buffer_alloc_line(const IRInterpMachine *machine,
                                    size_t index);
+SourceLocation ir_interp_buffer_alloc_location(const IRInterpMachine *machine,
+                                               size_t index);
 int ir_interp_buffer_freed(const IRInterpMachine *machine, size_t index);
 
 typedef void (*IRInterpValueHook)(void *ctx, size_t line, const char *name,

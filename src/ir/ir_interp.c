@@ -43,6 +43,8 @@ typedef struct {
   int freed;
   int escaped_local;
   size_t alloc_line;
+  size_t alloc_column;
+  const char *alloc_file;
   unsigned char *init_map;
   unsigned char device_space;
   uint32_t *pending;
@@ -535,6 +537,8 @@ static unsigned long long ii_add_buffer_ex(IRInterpMachine *machine,
   buf->freed = 0;
   buf->escaped_local = 0;
   buf->alloc_line = 0;
+  buf->alloc_column = 0;
+  buf->alloc_file = NULL;
   buf->base = II_ADDR_BASE + (unsigned long long)index * II_ADDR_STRIDE;
   buf->init_map = NULL;
   buf->pending = NULL;
@@ -2930,6 +2934,24 @@ static int ii_extern_memory(IRInterpMachine *machine, const char *name,
     ir_trace_record("free", name, machine->current_call_loc.filename,
                     machine->current_call_loc.line,
                     machine->current_call_loc.column, ii_as_int(&args[0]));
+  }
+  if (strcmp(name, "mettle_string_free") == 0 && arg_count == 1) {
+    unsigned long long record = (unsigned long long)ii_as_int(&args[0]);
+    long long record_offset = 0;
+    IIBuffer *record_buf =
+        record ? ii_addr_to_buffer(machine, record, 16, &record_offset) : NULL;
+    if (record_buf) {
+      unsigned long long chars = 0;
+      long long chars_offset = 0;
+      memcpy(&chars, record_buf->data + record_offset, 8);
+      IIBuffer *chars_buf =
+          chars ? ii_addr_to_buffer(machine, chars, 0, &chars_offset) : NULL;
+      if (chars_buf && chars_offset == 0) {
+        chars_buf->freed = 1;
+      }
+    }
+    *result = ii_int_value(0);
+    return 1;
   }
   if (strcmp(name, "free") == 0 && arg_count == 1) {
     unsigned long long addr = (unsigned long long)ii_as_int(&args[0]);
@@ -5532,6 +5554,8 @@ static int ii_op_call(IRInterpMachine *machine, IIFrame *frame,
     if (strncmp(insn->text, "mettle_string_", 14) != 0) {
       for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
         machine->buffers[bi].alloc_line = insn->location.line;
+        machine->buffers[bi].alloc_column = insn->location.column;
+        machine->buffers[bi].alloc_file = insn->location.filename;
       }
     }
     if (handled < 0 || machine->status != IR_INTERP_OK) {
@@ -5568,6 +5592,10 @@ static int ii_op_new(IRInterpMachine *machine, IIFrame *frame,
   }
   machine->buffers[machine->buffer_count - 1].alloc_line =
       insn->location.line;
+  machine->buffers[machine->buffer_count - 1].alloc_column =
+      insn->location.column;
+  machine->buffers[machine->buffer_count - 1].alloc_file =
+      insn->location.filename;
   IRInterpValue value = ii_int_value((long long)addr);
   if (!ii_store_dest(machine, frame, &insn->dest, &value)) {
     return 0;
@@ -5625,6 +5653,8 @@ static int ii_op_call_indirect(IRInterpMachine *machine, IIFrame *frame,
                                  call_arg_count, &call_result);
     for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
       machine->buffers[bi].alloc_line = insn->location.line;
+      machine->buffers[bi].alloc_column = insn->location.column;
+      machine->buffers[bi].alloc_file = insn->location.filename;
     }
     if (handled < 0 || machine->status != IR_INTERP_OK) {
       if (machine->status == IR_INTERP_OK) {
@@ -6928,6 +6958,18 @@ size_t ir_interp_buffer_alloc_line(const IRInterpMachine *machine,
     return 0;
   }
   return machine->buffers[index].alloc_line;
+}
+
+SourceLocation ir_interp_buffer_alloc_location(const IRInterpMachine *machine,
+                                               size_t index) {
+  SourceLocation location = {0, 0, NULL};
+  if (!machine || index >= machine->buffer_count) {
+    return location;
+  }
+  location.line = machine->buffers[index].alloc_line;
+  location.column = machine->buffers[index].alloc_column;
+  location.filename = machine->buffers[index].alloc_file;
+  return location;
 }
 
 int ir_interp_buffer_freed(const IRInterpMachine *machine, size_t index) {

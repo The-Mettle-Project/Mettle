@@ -1,0 +1,4 @@
+import "std/meta";
+@dyn export trait Shape {
+  fn area(self: Self*) -> int32;
+}

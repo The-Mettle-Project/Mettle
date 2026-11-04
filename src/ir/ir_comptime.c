@@ -122,7 +122,10 @@ static void ict_report_leaks(ErrorReporter *reporter,
     snprintf(message, sizeof(message),
              "test '%s' leaked %lld bytes: this allocation is never freed",
              ict_display_name(test_name), size);
-    SourceLocation loc = source_location_create(line, 1);
+    SourceLocation loc = ir_interp_buffer_alloc_location(machine, i);
+    if (loc.column == 0) {
+      loc.column = 1;
+    }
     error_reporter_add_warning_with_suggestion(
         reporter, ERROR_SEMANTIC, loc, message,
         "free it before the test returns, or `defer free(...)` right after "

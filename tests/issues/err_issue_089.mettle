@@ -1,0 +1,2 @@
+struct S { cb: fn(rawptr); }
+fn main() -> int32 { return 0; }

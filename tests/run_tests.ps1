@@ -21355,7 +21355,19 @@ $issueRegressions = @(
   @{ Name = "issue_literal_adapts_to_inferred_type_param"; Entry = "tests/issues/generic_match/literal_adapt.mettle"; Args = @(); Expect = @("5") },
   @{ Name = "issue_trace_keeps_trailing_flags"; Command = @("trace", "tests/issues/trace_flags/main.mettle", "go", "3", "-I", "tests/issues/trace_flags/lib"); Expect = @("returns 6") },
   @{ Name = "issue_sroa_group_after_failed_component"; Entry = "tests/issues/string_inline/global_access.mettle"; Args = @("--release"); Expect = @("0") },
-  @{ Name = "issue_defer_in_string_returning_function"; Entry = "tests/issues/string_inline/indirect_agg.mettle"; Args = @("-O"); Expect = @("ok") }
+  @{ Name = "issue_defer_in_string_returning_function"; Entry = "tests/issues/string_inline/indirect_agg.mettle"; Args = @("-O"); Expect = @("ok") },
+  @{ Name = "issue_global_call_result_and_return_literal"; Entry = "tests/issues/issue_073_074.mettle"; Args = @(); Expect = @("ok") },
+  @{ Name = "issue_global_call_result_and_return_literal_release"; Entry = "tests/issues/issue_073_074.mettle"; Args = @("--release"); Expect = @("ok") },
+  @{ Name = "issue_effect_list_then_param_and_field_float_args"; Entry = "tests/issues/issue_075_087.mettle"; Args = @(); Expect = @("ok") },
+  @{ Name = "issue_effect_list_then_param_and_field_float_args_release"; Entry = "tests/issues/issue_075_087.mettle"; Args = @("--release"); Expect = @("ok") },
+  @{ Name = "issue_fn_type_without_result_says_how"; Command = @("--build", "tests/issues/err_issue_089.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("a function type names its result", "write '-> void'") },
+  @{ Name = "issue_fn_type_mismatch_prints_both_signatures"; Command = @("--build", "tests/issues/err_issue_090.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("expected 'fn(int64) -> int64', found 'fn(int32) -> int32'", "expects 'fn(int64) -> int64', this argument") },
+  @{ Name = "issue_failing_test_with_string_temp_is_not_skipped"; Command = @("test", "tests/issues/test_issue_098.mettle"); Expect = @("test fails ... ", "FAILED (returned 1", "1 passed, 1 failed") },
+  @{ Name = "issue_leak_warning_names_the_allocating_file"; Command = @("test", "tests/issues/leak_location/t.mettle"); Expect = @("lib.mettle:8:33", "leaked 8 bytes") },
+  @{ Name = "issue_promotion_refuses_loop_with_late_back_edge"; Entry = "tests/issues/issue_085.mettle"; Args = @("--release"); Expect = @("pos 5 (want 5)") },
+  @{ Name = "issue_string_temp_outlives_call_through_view_alias_literal"; Entry = "tests/issues/issue_093_094.mettle"; Args = @(); Expect = @("[hello] 17", "[hello world] 11", "[hello world] 11") },
+  @{ Name = "issue_dyn_impl_for_private_struct"; Entry = "tests/issues/dyn_private/main.mettle"; Args = @(); Expect = @("9") },
+  @{ Name = "issue_driver_accepts_O0"; Command = @("--build", "-O0", "tests/issues/issue_073_074.mettle", "-o", ".tmp/issue_o0.exe"); Expect = @("Built executable") }
 )
 foreach ($case in $issueRegressions) {
   $total++

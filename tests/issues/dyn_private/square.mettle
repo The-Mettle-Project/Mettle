@@ -1,0 +1,10 @@
+import "shape.mettle";
+struct Square { side: int32; }
+impl Shape for Square {
+  fn area(self: Self*) -> int32 { return self.side * self.side; }
+}
+export fn square_new(side: int32) -> Shape__dyn {
+  var s: Square* = new Square;
+  s->side = side;
+  return Shape__from_Square(s);
+}

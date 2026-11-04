@@ -1,0 +1,7 @@
+import "lib.mettle";
+@test fn leaks() -> int32 {
+  var p: int32* = make();
+  p[0] = 1;
+  return 0;
+}
+fn main() -> int32 { return 0; }

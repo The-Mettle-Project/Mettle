@@ -1,0 +1,52 @@
+import "std/io";
+import "std/mem";
+
+extern fn c_strlen(s: cstring) -> int64 = "strlen";
+
+struct P { x: int32; y: int32; }
+struct Theme { a: int64; b: int64; c: int64; d: int64; e: int64; }
+
+fn s_view(p: uint8*, n: int64) -> string {
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+fn s_dup(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  var p: uint8* = (uint8*)malloc(n + 1);
+  var i: int64 = 0;
+  while (i < n) { p[i] = s.chars[i]; i = i + 1; }
+  p[n] = 0;
+  return s_view(p, n);
+}
+
+fn s_from_c(c: cstring) -> string {
+  return s_dup(s_view((uint8*)c, c_strlen(c)));
+}
+
+fn make_theme() -> Theme {
+  var t: Theme;
+  t.a = 1; t.b = 2; t.c = 3; t.d = 4; t.e = 5;
+  return t;
+}
+
+fn mk() -> P { return { x: 1, y: 2 }; }
+fn mk_run(n: int32) -> P { return { x: n, y: n + 1 }; }
+
+var g_work: string;
+var g_theme: Theme;
+
+fn main() -> int32 {
+  g_work = s_from_c("hello");
+  g_theme = make_theme();
+  var p: P = mk();
+  var q: P = mk_run(5);
+  if (g_work.length != 5) { return 1; }
+  if (g_theme.e != 5 || g_theme.a != 1) { return 2; }
+  if (p.x != 1 || p.y != 2) { return 3; }
+  if (q.x != 5 || q.y != 6) { return 4; }
+  println("ok");
+  return 0;
+}

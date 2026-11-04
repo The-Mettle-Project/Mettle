@@ -81,6 +81,7 @@ typedef struct {
   int handed_over;
   SourceLocation handover_loc;
   const char *handover_via;
+  unsigned param_alias_mask;
 } MemLocal;
 
 typedef struct {
@@ -519,6 +520,21 @@ static MemLocal *mem_expr_as_local(MemCtx *ctx, ASTNode *expr) {
   return id ? mem_find_local(ctx, id->name) : NULL;
 }
 
+static MemLocal *mem_expr_view_source(MemCtx *ctx, ASTNode *expr) {
+  ASTNode *node = mem_unwrap_cast(expr);
+  if (node && node->type == AST_MEMBER_ACCESS) {
+    MemberAccess *member = (MemberAccess *)node->data;
+    if (member && member->member && strcmp(member->member, "chars") == 0) {
+      MemLocal *base = mem_expr_as_local(ctx, member->object);
+      if (base && base->type_name && strcmp(base->type_name, "string") == 0) {
+        return base;
+      }
+    }
+    return NULL;
+  }
+  return mem_expr_as_local(ctx, expr);
+}
+
 static MemLocal *mem_addr_root_local(MemCtx *ctx, ASTNode *expr) {
   ASTNode *node = expr;
   int guard = 0;
@@ -953,11 +969,14 @@ static void mem_check_const_index(MemCtx *ctx, ASTNode *expr) {
 }
 
 static void mem_collect_param_store(MemCtx *ctx, MemLocal *local) {
-  if (ctx->mode == MEM_MODE_SUMMARY && local && local->param_index >= 0 &&
-      local->param_index < MEM_MAX_PARAMS && !local->reassigned &&
-      ctx->collect) {
+  if (ctx->mode != MEM_MODE_SUMMARY || !local || !ctx->collect) {
+    return;
+  }
+  if (local->param_index >= 0 && local->param_index < MEM_MAX_PARAMS &&
+      !local->reassigned) {
     ctx->collect->stores |= 1u << local->param_index;
   }
+  ctx->collect->stores |= local->param_alias_mask;
 }
 
 static void mem_collect_param_maybe_free(MemCtx *ctx, MemLocal *local) {
@@ -1569,6 +1588,19 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
     }
     return;
   }
+  case AST_AGGREGATE_LITERAL: {
+    AggregateLiteral *literal = (AggregateLiteral *)expr->data;
+    for (size_t i = 0; literal && i < literal->element_count; i++) {
+      ASTNode *element = literal->elements ? literal->elements[i] : NULL;
+      mem_walk_expr(ctx, element);
+      MemLocal *source = mem_expr_view_source(ctx, element);
+      if (source && source->is_pointer) {
+        source->escaped = 1;
+        mem_collect_param_store(ctx, source);
+      }
+    }
+    return;
+  }
   case AST_CAST_EXPRESSION: {
     CastExpression *cast = (CastExpression *)expr->data;
     mem_walk_expr(ctx, cast ? cast->operand : NULL);
@@ -1752,9 +1784,14 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
       if (heap_target && ctx->depth == 0 && !ctx->in_defer) {
         local->borrows_heap = heap_target->name;
       }
-      MemLocal *source = mem_expr_as_local(ctx, value);
+      MemLocal *source = mem_expr_view_source(ctx, value);
       if (source && source->is_pointer) {
         source->escaped = 1;
+        local->param_alias_mask |= source->param_alias_mask;
+        if (source->param_index >= 0 && source->param_index < MEM_MAX_PARAMS &&
+            !source->reassigned) {
+          local->param_alias_mask |= 1u << source->param_index;
+        }
         if (ctx->depth == 0 && !ctx->in_defer) {
           local->points_to_stack = source->points_to_stack;
           local->points_to_slot = source->points_to_slot;
@@ -1781,13 +1818,10 @@ static void mem_apply_assignment(MemCtx *ctx, const char *name, ASTNode *value,
              "address is dangling as soon as this function returns",
              name, stack_target->name);
   }
-  MemLocal *source = mem_expr_as_local(ctx, value);
+  MemLocal *source = mem_expr_view_source(ctx, value);
   if (source && source->is_pointer) {
     source->escaped = 1;
-    if (ctx->mode == MEM_MODE_SUMMARY && source->param_index >= 0 &&
-        source->param_index < MEM_MAX_PARAMS && ctx->collect) {
-      ctx->collect->stores |= 1u << source->param_index;
-    }
+    mem_collect_param_store(ctx, source);
   }
 }
 
@@ -2095,10 +2129,7 @@ static void mem_walk_return(MemCtx *ctx, ASTNode *statement) {
   MemLocal *returned = mem_expr_as_local(ctx, ret->value);
   if (returned && returned->is_pointer) {
     returned->escaped = 1;
-    if (ctx->mode == MEM_MODE_SUMMARY && returned->param_index >= 0 &&
-        returned->param_index < MEM_MAX_PARAMS && ctx->collect) {
-      ctx->collect->stores |= 1u << returned->param_index;
-    }
+    mem_collect_param_store(ctx, returned);
   }
   return;
 }
@@ -2143,13 +2174,10 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     if (assign->target) {
       mem_walk_expr(ctx, assign->target);
       mem_check_handover_write(ctx, assign->target, statement->location);
-      MemLocal *source = mem_expr_as_local(ctx, assign->value);
+      MemLocal *source = mem_expr_view_source(ctx, assign->value);
       if (source && source->is_pointer) {
         source->escaped = 1;
-        if (ctx->mode == MEM_MODE_SUMMARY && source->param_index >= 0 &&
-            source->param_index < MEM_MAX_PARAMS && ctx->collect) {
-          ctx->collect->stores |= 1u << source->param_index;
-        }
+        mem_collect_param_store(ctx, source);
       }
       return;
     }

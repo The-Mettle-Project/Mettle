@@ -1682,6 +1682,23 @@ export struct TraitInfo {
   methods: MethodInfo[];
 }
 
+fn dyn_shown(type_name: string) -> string {
+  var n: int64 = (int64)type_name.length;
+  var prefix: string = "__import_";
+  if (n <= 9) { return type_name; }
+  for i in 0..9 {
+    if (type_name[i] != prefix[i]) { return type_name; }
+  }
+  var at: int64 = 9;
+  while (at < n && type_name[at] != (uint8)95) { at = at + 1; }
+  at = at + 1;
+  if (at >= n) { return type_name; }
+  var out: string;
+  out.chars = type_name.chars + at;
+  out.length = (uint64)(n - at);
+  return out;
+}
+
 fn dyn_type_for(type_name: string, self_type: string) -> string {
   if (type_name == "Self") { return self_type; }
   if (type_name == "Self*") { return "{self_type}*"; }
@@ -1762,13 +1779,13 @@ fn dyn_arguments(m: MethodInfo, self_text: string) -> string {
       text_add(&t, "  {m.name}: &{type_name}__as_{name}_{m.name},\n");
     }
     text_add(&t, "};\n\n");
-    text_add(&t, "fn {name}__from_{type_name}(value: {type_name}*) -> {name}__dyn {{\n");
+    text_add(&t, "fn {name}__from_{dyn_shown(type_name)}(value: {type_name}*) -> {name}__dyn {{\n");
     text_add(&t, "  var out: {name}__dyn;\n  out.data = (rawptr)value;\n  out.table = &{type_name}__{name}_table;\n  return out;\n}\n\n");
   }
   text_add(&t, "@rule fn {name}__dyn_holds(p: Program) -> Verdict {{\n");
   for type_name in trait_info.implementors {
     for m in trait_info.methods {
-      var thunk: string = "{type_name}__as_{name}_{m.name}";
+      var thunk: string = "{dyn_shown(type_name)}__as_{name}_{m.name}";
       text_add(&t, "  if (!calls_function(p, \"{thunk}\", \"__trait_{name}__{type_name}__{m.name}\")) {{\n");
       text_add(&t, "    return verdict_fail(function_site(p, \"{thunk}\"), \"{thunk} does not reach the method it stands for\");\n  }\n");
     }

@@ -1,0 +1,29 @@
+import "std/io";
+
+struct Lx { src: uint8*; n: int32; pos: int32; }
+
+fn is_space(c: uint8) -> bool { return c == (uint8)32 || c == (uint8)10; }
+
+fn skip(lx: Lx*) -> int32 {
+  while (lx->pos < lx->n) {
+    var c0: uint8 = lx->src[lx->pos];
+    if (is_space(c0)) {
+      lx->pos += 1;
+    } else if (c0 == (uint8)45 && lx->pos + 1 < lx->n && lx->src[lx->pos + 1] == (uint8)45) {
+      while (lx->pos < lx->n && lx->src[lx->pos] != (uint8)10) { lx->pos += 1; }
+    } else {
+      break;
+    }
+  }
+  return lx->pos;
+}
+
+fn main() -> int32 {
+  var s: string = "-- c\nX";
+  var lx: Lx;
+  lx.src = s.chars;
+  lx.n = (int32)s.length;
+  lx.pos = 0;
+  println("pos {skip(&lx)} (want 5)");
+  return 0;
+}
