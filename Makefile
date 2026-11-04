@@ -304,9 +304,12 @@ test: $(TARGET) bundle-runtime
 	$(TARGET) --build -s tests/test_runtime_null_deref_check.mettle \
 		-o $(BINDIR)/owned-crash-test
 	@$(BINDIR)/owned-crash-test >/dev/null 2>&1; test $$? -eq 1
+	$(TARGET) --build -s tests/concurrent_crash_recovery.mettle \
+		-o $(BINDIR)/owned-concurrent-crash-test
+	@$(BINDIR)/owned-concurrent-crash-test 2>/dev/null
 	@for product in $(TARGET) $(BINDIR)/owned-threads-test \
 		$(BINDIR)/owned-pthread-test $(BINDIR)/owned-dir-test \
-		$(BINDIR)/owned-crash-test; do \
+		$(BINDIR)/owned-crash-test $(BINDIR)/owned-concurrent-crash-test; do \
 		if readelf -l $$product | grep -q INTERP; then \
 			echo "error: $$product has a dynamic loader"; exit 1; fi; \
 		if readelf -d $$product 2>&1 | grep -q NEEDED; then \

@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <pthread.h>
 #include <sys/ucontext.h>
 #elif defined(__linux__)
 #include <ucontext.h>
@@ -47,14 +48,59 @@ static volatile size_t g_runtime_extra_code_count = 0;
 
 #if defined(_WIN32) || defined(_WIN64)
 static volatile LONG g_runtime_debug_handler_installed = 0;
-static volatile LONG g_runtime_debug_in_handler = 0;
 static PVOID g_runtime_debug_vectored_handler = NULL;
 static uintptr_t g_runtime_image_start = 0;
 static uintptr_t g_runtime_image_end = 0;
 #else
 static volatile sig_atomic_t g_runtime_debug_handler_installed = 0;
-static volatile sig_atomic_t g_runtime_debug_in_handler = 0;
 #endif
+
+/* The thread writing a crash report, or 0. A thread id, not a thread-local
+   flag, because this object is also linked into shared objects, which may
+   not use thread-local storage. */
+static volatile uintptr_t g_runtime_debug_owner = 0;
+
+/* The calling thread's id, never 0. Asked of the system directly, so this
+   file needs nothing from the rest of the runtime. */
+static uintptr_t mettle_crash_thread_id(void) {
+#if defined(_WIN32) || defined(_WIN64)
+  return (uintptr_t)GetCurrentThreadId();
+#elif defined(__linux__) && defined(__x86_64__)
+  long id;
+  __asm__ volatile("syscall" : "=a"(id) : "a"(186L) : "rcx", "r11", "memory");
+  return (uintptr_t)id;
+#elif defined(__linux__) && defined(__aarch64__)
+  register long number __asm__("x8") = 178;
+  register long id __asm__("x0");
+  __asm__ volatile("svc 0" : "=r"(id) : "r"(number) : "memory");
+  return (uintptr_t)id;
+#else
+  return (uintptr_t)pthread_self();
+#endif
+}
+
+/* Begins handling a crash. One thread reports at a time: a crash on another
+   thread waits its turn instead of ending the process, so each can be
+   recovered. Returns 0 for a crash inside the handler on the same thread,
+   which must end the process. */
+static int mettle_crash_handler_enter(void) {
+  uintptr_t self = mettle_crash_thread_id();
+  if (__atomic_load_n(&g_runtime_debug_owner, __ATOMIC_ACQUIRE) == self) {
+    return 0;
+  }
+  for (;;) {
+    uintptr_t expected = 0;
+    if (__atomic_compare_exchange_n(&g_runtime_debug_owner, &expected, self, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      return 1;
+    }
+  }
+}
+
+/* Ends handling a crash that is being recovered. */
+static void mettle_crash_handler_leave(void) {
+  __atomic_store_n(&g_runtime_debug_owner, 0, __ATOMIC_RELEASE);
+}
 
 static void mettle_crash_write_decimal_uintptr(uintptr_t value) {
   char buffer[32];
@@ -711,7 +757,7 @@ mettle_crash_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
     }
   }
 
-  if (InterlockedExchange(&g_runtime_debug_in_handler, 1) != 0) {
+  if (!mettle_crash_handler_enter()) {
     mettle_crash_terminate_with_code(1);
   }
 
@@ -802,7 +848,7 @@ mettle_crash_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
       resume->Rip = (DWORD64)slot[9];
       resume->Rax = 1;
       memcpy(&resume->Xmm6, &slot[16], 16u * 10u);
-      InterlockedExchange(&g_runtime_debug_in_handler, 0);
+      mettle_crash_handler_leave();
       return EXCEPTION_CONTINUE_EXECUTION;
     }
   }
@@ -900,10 +946,9 @@ static void mettle_crash_extract_fault_context(void *ucontext_raw,
 
 static void mettle_crash_crash_signal_handler(int signo, siginfo_t *info,
                                               void *ucontext_raw) {
-  if (g_runtime_debug_in_handler) {
+  if (!mettle_crash_handler_enter()) {
     mettle_crash_terminate_with_code(128 + signo);
   }
-  g_runtime_debug_in_handler = 1;
 
   mettle_crash_write_stderr("Unhandled runtime signal ");
   mettle_crash_write_decimal_uintptr((uintptr_t)signo);
@@ -950,7 +995,7 @@ static void mettle_crash_crash_signal_handler(int signo, siginfo_t *info,
       uc->uc_mcontext.gregs[REG_RSP] = (greg_t)slot[8];
       uc->uc_mcontext.gregs[REG_RIP] = (greg_t)slot[9];
       uc->uc_mcontext.gregs[REG_RAX] = 1;
-      g_runtime_debug_in_handler = 0;
+      mettle_crash_handler_leave();
       return;
     }
   }
@@ -1044,18 +1089,10 @@ static void mettle_crash_trap_impl(uint32_t kind, const char *message,
                                    const void *program_counter,
                                    const void *frame_pointer, uint64_t arg0,
                                    uint64_t arg1) {
-#if defined(_WIN32) || defined(_WIN64)
-  if (InterlockedExchange(&g_runtime_debug_in_handler, 1) != 0) {
+  if (!mettle_crash_handler_enter()) {
     mettle_crash_terminate_with_code(1);
     return;
   }
-#else
-  if (g_runtime_debug_in_handler) {
-    mettle_crash_terminate_with_code(1);
-    return;
-  }
-  g_runtime_debug_in_handler = 1;
-#endif
 
   mettle_crash_write_trap_report((uintptr_t)program_counter, kind, message, arg0,
                                  arg1);
@@ -1067,11 +1104,7 @@ static void mettle_crash_trap_impl(uint32_t kind, const char *message,
     int64_t *slot =
         mettle_crash_live_resume_slot((uintptr_t)__builtin_frame_address(0));
     if (slot && g_live_recover_wait((int64_t)(uintptr_t)slot)) {
-#if defined(_WIN32) || defined(_WIN64)
-      InterlockedExchange(&g_runtime_debug_in_handler, 0);
-#else
-      g_runtime_debug_in_handler = 0;
-#endif
+      mettle_crash_handler_leave();
       g_live_resume_jump((int64_t)(uintptr_t)slot);
     }
   }
