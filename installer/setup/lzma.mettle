@@ -1,0 +1,355 @@
+import "std/mem";
+
+const TOP_VALUE: uint32 = 16777216;
+const STATES: int32 = 12;
+const POS_STATES: int32 = 16;
+const LEN_STATES: int32 = 4;
+const ALIGN_BITS: int32 = 4;
+const END_POS_MODEL: int32 = 14;
+const FULL_DISTANCES: int32 = 128;
+const MATCH_MIN: int32 = 2;
+
+const IS_MATCH: int32 = 0;
+const IS_REP: int32 = IS_MATCH + STATES * POS_STATES;
+const IS_REP_G0: int32 = IS_REP + STATES;
+const IS_REP_G1: int32 = IS_REP_G0 + STATES;
+const IS_REP_G2: int32 = IS_REP_G1 + STATES;
+const IS_REP0_LONG: int32 = IS_REP_G2 + STATES;
+const POS_SLOT: int32 = IS_REP0_LONG + STATES * POS_STATES;
+const POS_SPECIAL: int32 = POS_SLOT + LEN_STATES * 64;
+const POS_ALIGN: int32 = POS_SPECIAL + FULL_DISTANCES - END_POS_MODEL + 1;
+const LEN_CODER: int32 = POS_ALIGN + 16;
+const LEN_CODER_SIZE: int32 = 2 + POS_STATES * 8 * 2 + 256;
+const REP_LEN_CODER: int32 = LEN_CODER + LEN_CODER_SIZE;
+const LITERAL: int32 = REP_LEN_CODER + LEN_CODER_SIZE;
+
+export struct Lzma {
+  input: uint8*;
+  in_pos: int64;
+  in_len: int64;
+  range: uint32;
+  code: uint32;
+  probs: uint16*;
+  dict: uint8*;
+  dict_cap: int64;
+  dict_pos: int64;
+  total: int64;
+  state: int32;
+  rep0: uint32;
+  rep1: uint32;
+  rep2: uint32;
+  rep3: uint32;
+  match_left: int32;
+  lc: int32;
+  lp_mask: int32;
+  pos_mask: int32;
+  failed: int32;
+  ended: int32;
+}
+
+fn rc_next(l: Lzma*) -> uint32 {
+  if (l.in_pos >= l.in_len) {
+    l.failed = 1;
+    return 0;
+  }
+  var b: uint32 = (uint32)l.input[l.in_pos];
+  l.in_pos = l.in_pos + 1;
+  return b;
+}
+
+fn rc_bit(l: Lzma*, index: int32) -> int32 {
+  if (l.range < TOP_VALUE) {
+    l.range = l.range << 8;
+    l.code = (l.code << 8) | rc_next(l);
+  }
+  var prob: uint32 = (uint32)l.probs[index];
+  var bound: uint32 = (l.range >> 11) * prob;
+  if (l.code < bound) {
+    l.range = bound;
+    l.probs[index] = (uint16)(prob + ((2048 - prob) >> 5));
+    return 0;
+  }
+  l.range = l.range - bound;
+  l.code = l.code - bound;
+  l.probs[index] = (uint16)(prob - (prob >> 5));
+  return 1;
+}
+
+fn rc_direct(l: Lzma*, count: int32) -> uint32 {
+  var result: uint32 = 0;
+  var i: int32 = 0;
+  while (i < count) {
+    if (l.range < TOP_VALUE) {
+      l.range = l.range << 8;
+      l.code = (l.code << 8) | rc_next(l);
+    }
+    l.range = l.range >> 1;
+    result = result << 1;
+    if (l.code >= l.range) {
+      l.code = l.code - l.range;
+      result = result | 1;
+    }
+    i += 1;
+  }
+  return result;
+}
+
+fn rc_tree(l: Lzma*, base: int32, bits: int32) -> int32 {
+  var m: int32 = 1;
+  var i: int32 = 0;
+  while (i < bits) {
+    m = (m << 1) + rc_bit(l, base + m);
+    i += 1;
+  }
+  return m - (1 << bits);
+}
+
+fn rc_reverse(l: Lzma*, base: int32, bits: int32) -> int32 {
+  var m: int32 = 1;
+  var symbol: int32 = 0;
+  var i: int32 = 0;
+  while (i < bits) {
+    var bit: int32 = rc_bit(l, base + m);
+    m = (m << 1) + bit;
+    symbol = symbol | (bit << i);
+    i += 1;
+  }
+  return symbol;
+}
+
+fn read_length(l: Lzma*, coder: int32, pos_state: int32) -> int32 {
+  if (rc_bit(l, coder) == 0) {
+    return rc_tree(l, coder + 2 + pos_state * 8, 3);
+  }
+  if (rc_bit(l, coder + 1) == 0) {
+    return 8 + rc_tree(l, coder + 2 + POS_STATES * 8 + pos_state * 8, 3);
+  }
+  return 16 + rc_tree(l, coder + 2 + POS_STATES * 16, 8);
+}
+
+fn byte_back(l: Lzma*, distance: uint32) -> uint8 {
+  var at: int64 = l.dict_pos - (int64)distance - 1;
+  if (at < 0) {
+    at = at + l.dict_cap;
+  }
+  return l.dict[at];
+}
+
+fn read_literal(l: Lzma*) {
+  var previous: int32 = 0;
+  if (l.total > 0) {
+    previous = (int32)byte_back(l, 0);
+  }
+  var slot: int32 = (((int32)l.total & l.lp_mask) << l.lc) + (previous >> (8 - l.lc));
+  var base: int32 = LITERAL + 768 * slot;
+  var symbol: int32 = 1;
+  if (l.state >= 7) {
+    var match_byte: int32 = (int32)byte_back(l, l.rep0);
+    while (symbol < 256) {
+      var match_bit: int32 = (match_byte >> 7) & 1;
+      match_byte = match_byte << 1;
+      var bit: int32 = rc_bit(l, base + ((1 + match_bit) << 8) + symbol);
+      symbol = (symbol << 1) | bit;
+      if (match_bit != bit) {
+        break;
+      }
+    }
+  }
+  while (symbol < 256) {
+    symbol = (symbol << 1) | rc_bit(l, base + symbol);
+  }
+  l.dict[l.dict_pos] = (uint8)symbol;
+  l.dict_pos = l.dict_pos + 1;
+  l.total = l.total + 1;
+  if (l.state < 4) {
+    l.state = 0;
+  } else if (l.state < 10) {
+    l.state = l.state - 3;
+  } else {
+    l.state = l.state - 6;
+  }
+}
+
+fn read_distance(l: Lzma*, length: int32) -> uint32 {
+  var len_state: int32 = length;
+  if (len_state >= LEN_STATES) {
+    len_state = LEN_STATES - 1;
+  }
+  var slot: int32 = rc_tree(l, POS_SLOT + len_state * 64, 6);
+  if (slot < 4) {
+    return (uint32)slot;
+  }
+  var direct: int32 = (slot >> 1) - 1;
+  var distance: uint32 = (uint32)((2 | (slot & 1)) << direct);
+  if (slot < END_POS_MODEL) {
+    var base: int32 = POS_SPECIAL + (int32)distance - slot;
+    return distance + (uint32)rc_reverse(l, base, direct);
+  }
+  distance = distance + (rc_direct(l, direct - ALIGN_BITS) << ALIGN_BITS);
+  return distance + (uint32)rc_reverse(l, POS_ALIGN, ALIGN_BITS);
+}
+
+fn read_match(l: Lzma*, pos_state: int32) -> int32 {
+  if (rc_bit(l, IS_REP + l.state) != 0) {
+    if (l.total == 0) {
+      l.failed = 1;
+      return 0;
+    }
+    if (rc_bit(l, IS_REP_G0 + l.state) == 0) {
+      if (rc_bit(l, IS_REP0_LONG + l.state * POS_STATES + pos_state) == 0) {
+        if (l.state < 7) {
+          l.state = 9;
+        } else {
+          l.state = 11;
+        }
+        return 1;
+      }
+    } else {
+      var distance: uint32 = 0;
+      if (rc_bit(l, IS_REP_G1 + l.state) == 0) {
+        distance = l.rep1;
+      } else {
+        if (rc_bit(l, IS_REP_G2 + l.state) == 0) {
+          distance = l.rep2;
+        } else {
+          distance = l.rep3;
+          l.rep3 = l.rep2;
+        }
+        l.rep2 = l.rep1;
+      }
+      l.rep1 = l.rep0;
+      l.rep0 = distance;
+    }
+    if (l.state < 7) {
+      l.state = 8;
+    } else {
+      l.state = 11;
+    }
+    return read_length(l, REP_LEN_CODER, pos_state) + MATCH_MIN;
+  }
+  l.rep3 = l.rep2;
+  l.rep2 = l.rep1;
+  l.rep1 = l.rep0;
+  var length: int32 = read_length(l, LEN_CODER, pos_state);
+  if (l.state < 7) {
+    l.state = 7;
+  } else {
+    l.state = 10;
+  }
+  l.rep0 = read_distance(l, length);
+  if (l.rep0 == 0xFFFFFFFF) {
+    l.ended = 1;
+    return 0;
+  }
+  return length + MATCH_MIN;
+}
+
+export fn lzma_open(l: Lzma*, data: uint8*, size: int64) -> int32 {
+  if (size < 18) {
+    return 0;
+  }
+  var props: int32 = (int32)data[0];
+  if (props >= 225) {
+    return 0;
+  }
+  var lc: int32 = props % 9;
+  var rest: int32 = props / 9;
+  var lp: int32 = rest % 5;
+  var pb: int32 = rest / 5;
+  var dict_size: int64 = (int64)data[1] | ((int64)data[2] << 8) | ((int64)data[3] << 16) | ((int64)data[4] << 24);
+  if (dict_size < 4096) {
+    dict_size = 4096;
+  }
+  var count: int32 = LITERAL + (768 << (lc + lp));
+  l.probs = (uint16*)malloc((int64)count * 2);
+  l.dict = (uint8*)malloc(dict_size);
+  if (l.probs == 0 || l.dict == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < count) {
+    l.probs[i] = 1024;
+    i += 1;
+  }
+  l.input = data;
+  l.in_len = size;
+  l.in_pos = 13;
+  l.dict_cap = dict_size;
+  l.dict_pos = 0;
+  l.total = 0;
+  l.state = 0;
+  l.rep0 = 0;
+  l.rep1 = 0;
+  l.rep2 = 0;
+  l.rep3 = 0;
+  l.match_left = 0;
+  l.lc = lc;
+  l.lp_mask = (1 << lp) - 1;
+  l.pos_mask = (1 << pb) - 1;
+  l.failed = 0;
+  l.ended = 0;
+  l.range = 0xFFFFFFFF;
+  l.code = 0;
+  if (rc_next(l) != 0) {
+    return 0;
+  }
+  i = 0;
+  while (i < 4) {
+    l.code = (l.code << 8) | rc_next(l);
+    i += 1;
+  }
+  return 1;
+}
+
+export fn lzma_close(l: Lzma*) {
+  free((rawptr)l.probs);
+  free((rawptr)l.dict);
+  l.probs = 0;
+  l.dict = 0;
+}
+
+export fn lzma_run(l: Lzma*, limit: int64) -> int64 {
+  if (l.dict_pos == l.dict_cap) {
+    l.dict_pos = 0;
+  }
+  var start: int64 = l.dict_pos;
+  var stop: int64 = l.dict_cap;
+  if (stop - start > limit) {
+    stop = start + limit;
+  }
+  while (l.dict_pos < stop && l.failed == 0 && l.ended == 0) {
+    if (l.match_left > 0) {
+      var from: int64 = l.dict_pos - (int64)l.rep0 - 1;
+      if (from < 0) {
+        from = from + l.dict_cap;
+      }
+      while (l.match_left > 0 && l.dict_pos < stop) {
+        l.dict[l.dict_pos] = l.dict[from];
+        l.dict_pos = l.dict_pos + 1;
+        from = from + 1;
+        if (from == l.dict_cap) {
+          from = 0;
+        }
+        l.match_left = l.match_left - 1;
+        l.total = l.total + 1;
+      }
+      continue;
+    }
+    var pos_state: int32 = (int32)l.total & l.pos_mask;
+    if (rc_bit(l, IS_MATCH + l.state * POS_STATES + pos_state) == 0) {
+      read_literal(l);
+    } else {
+      var length: int32 = read_match(l, pos_state);
+      if (l.ended == 0 && l.failed == 0) {
+        if ((int64)l.rep0 >= l.total && l.total < l.dict_cap) {
+          l.failed = 1;
+        } else if ((int64)l.rep0 >= l.dict_cap) {
+          l.failed = 1;
+        } else {
+          l.match_left = length;
+        }
+      }
+    }
+  }
+  return l.dict_pos - start;
+}

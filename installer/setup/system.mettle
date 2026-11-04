@@ -1,0 +1,852 @@
+import "std/mem";
+
+export const WMAX: int32 = 1024;
+export const HKCU: int64 = -2147483647;
+export const HKLM: int64 = -2147483646;
+export const INVALID_HANDLE: int64 = -1;
+
+const GENERIC_READ: uint32 = 0x80000000;
+const GENERIC_WRITE: uint32 = 0x40000000;
+const FILE_SHARE_READ: uint32 = 1;
+const OPEN_EXISTING: uint32 = 3;
+const CREATE_ALWAYS: uint32 = 2;
+const FILE_ATTRIBUTE_DIRECTORY: uint32 = 16;
+const FILE_ATTRIBUTE_NORMAL: uint32 = 128;
+const INVALID_ATTRIBUTES: uint32 = 0xFFFFFFFF;
+const PAGE_READONLY: uint32 = 2;
+const FILE_MAP_READ: uint32 = 4;
+const CP_UTF8: uint32 = 65001;
+const KEY_READ: uint32 = 0x20019;
+const KEY_WRITE: uint32 = 0x20006;
+const KEY_WOW64_64KEY: uint32 = 0x0100;
+const REG_SZ: uint32 = 1;
+const REG_EXPAND_SZ: uint32 = 2;
+const REG_DWORD: uint32 = 4;
+const STARTF_USESTDHANDLES: uint32 = 0x100;
+const STARTF_USESHOWWINDOW: uint32 = 1;
+const CREATE_NO_WINDOW: uint32 = 0x08000000;
+const HANDLE_FLAG_INHERIT: uint32 = 1;
+const MOVEFILE_WRITE_THROUGH: uint32 = 8;
+const FORMAT_FROM_SYSTEM: uint32 = 0x1000;
+const FORMAT_IGNORE_INSERTS: uint32 = 0x200;
+const WAIT_INFINITE: uint32 = 0xFFFFFFFF;
+const WM_SETTINGCHANGE: uint32 = 0x001A;
+const HWND_BROADCAST: int64 = 0xFFFF;
+const SMTO_ABORTIFHUNG: uint32 = 2;
+const SHCNE_ASSOCCHANGED: int32 = 0x08000000;
+const SEE_MASK_NOCLOSEPROCESS: uint32 = 0x40;
+const ATTACH_PARENT: uint32 = 0xFFFFFFFF;
+
+struct FindData {
+  attributes: uint32;
+  created: uint32[2];
+  accessed: uint32[2];
+  written: uint32[2];
+  size_high: uint32;
+  size_low: uint32;
+  reserved0: uint32;
+  reserved1: uint32;
+  name: uint16[260];
+  alternate: uint16[14];
+}
+
+struct SecurityAttributes {
+  length: uint32;
+  descriptor: int64;
+  inherit: int32;
+}
+
+struct StartupInfo {
+  size: uint32;
+  reserved: int64;
+  desktop: int64;
+  title: int64;
+  x: uint32;
+  y: uint32;
+  x_size: uint32;
+  y_size: uint32;
+  x_chars: uint32;
+  y_chars: uint32;
+  fill: uint32;
+  flags: uint32;
+  show: uint16;
+  reserved2: uint16;
+  reserved3: int64;
+  input: int64;
+  output: int64;
+  error: int64;
+}
+
+struct ProcessInfo {
+  process: int64;
+  thread: int64;
+  process_id: uint32;
+  thread_id: uint32;
+}
+
+struct ShellExecuteInfo {
+  size: uint32;
+  mask: uint32;
+  window: int64;
+  verb: uint16*;
+  file: uint16*;
+  parameters: uint16*;
+  directory: uint16*;
+  show: int32;
+  instance: int64;
+  id_list: int64;
+  class_name: int64;
+  class_key: int64;
+  hot_key: uint32;
+  icon: int64;
+  process: int64;
+}
+
+extern fn GetModuleFileNameW(module: int64, out: uint16*, size: uint32) -> uint32 = "GetModuleFileNameW";
+extern fn CreateFileW(name: uint16*, access: uint32, share: uint32, security: int64, disposition: uint32, flags: uint32, template: int64) -> int64 = "CreateFileW";
+extern fn Sys_ReadFile(file: int64, buffer: rawptr, count: uint32, done: uint32*, overlapped: int64) -> int32 = "ReadFile";
+extern fn Sys_WriteFile(file: int64, buffer: rawptr, count: uint32, done: uint32*, overlapped: int64) -> int32 = "WriteFile";
+extern fn Sys_CloseHandle(handle: int64) -> int32 = "CloseHandle";
+extern fn GetFileSizeEx(file: int64, size: int64*) -> int32 = "GetFileSizeEx";
+extern fn CreateFileMappingW(file: int64, security: int64, protect: uint32, high: uint32, low: uint32, name: int64) -> int64 = "CreateFileMappingW";
+extern fn MapViewOfFile(mapping: int64, access: uint32, high: uint32, low: uint32, size: int64) -> rawptr = "MapViewOfFile";
+extern fn CreateDirectoryW(name: uint16*, security: int64) -> int32 = "CreateDirectoryW";
+extern fn RemoveDirectoryW(name: uint16*) -> int32 = "RemoveDirectoryW";
+extern fn DeleteFileW(name: uint16*) -> int32 = "DeleteFileW";
+extern fn MoveFileExW(from: uint16*, to: uint16*, flags: uint32) -> int32 = "MoveFileExW";
+extern fn GetFileAttributesW(name: uint16*) -> uint32 = "GetFileAttributesW";
+extern fn SetFileAttributesW(name: uint16*, attributes: uint32) -> int32 = "SetFileAttributesW";
+extern fn FindFirstFileW(name: uint16*, data: FindData*) -> int64 = "FindFirstFileW";
+extern fn FindNextFileW(find: int64, data: FindData*) -> int32 = "FindNextFileW";
+extern fn FindClose(find: int64) -> int32 = "FindClose";
+extern fn Sys_GetLastError() -> uint32 = "GetLastError";
+extern fn FormatMessageW(flags: uint32, source: int64, id: uint32, language: uint32, out: uint16*, size: uint32, args: int64) -> uint32 = "FormatMessageW";
+extern fn GetEnvironmentVariableW(name: uint16*, out: uint16*, size: uint32) -> uint32 = "GetEnvironmentVariableW";
+extern fn SetEnvironmentVariableW(name: uint16*, value: uint16*) -> int32 = "SetEnvironmentVariableW";
+extern fn GetCommandLineW() -> uint16* = "GetCommandLineW";
+extern fn CommandLineToArgvW(line: uint16*, count: int32*) -> uint16** = "CommandLineToArgvW";
+extern fn CreateProcessW(application: int64, command: uint16*, process_security: int64, thread_security: int64, inherit: int32, flags: uint32, environment: int64, directory: uint16*, startup: StartupInfo*, info: ProcessInfo*) -> int32 = "CreateProcessW";
+extern fn CreatePipe(read_end: int64*, write_end: int64*, security: SecurityAttributes*, size: uint32) -> int32 = "CreatePipe";
+extern fn SetHandleInformation(handle: int64, mask: uint32, flags: uint32) -> int32 = "SetHandleInformation";
+extern fn Sys_WaitForSingleObject(handle: int64, milliseconds: uint32) -> uint32 = "WaitForSingleObject";
+extern fn GetExitCodeProcess(process: int64, code: uint32*) -> int32 = "GetExitCodeProcess";
+extern fn ExitProcess(code: uint32) = "ExitProcess";
+extern fn GetTempPathW(size: uint32, out: uint16*) -> uint32 = "GetTempPathW";
+extern fn GetCurrentProcessId() -> uint32 = "GetCurrentProcessId";
+extern fn GetFullPathNameW(path: uint16*, size: uint32, out: uint16*, file_part: int64) -> uint32 = "GetFullPathNameW";
+extern fn Sleep(milliseconds: uint32) = "Sleep";
+extern fn QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn MultiByteToWideChar(page: uint32, flags: uint32, text: uint8*, length: int32, out: uint16*, size: int32) -> int32 = "MultiByteToWideChar";
+extern fn WideCharToMultiByte(page: uint32, flags: uint32, text: uint16*, length: int32, out: uint8*, size: int32, fallback: int64, used: int64) -> int32 = "WideCharToMultiByte";
+extern fn AttachConsole(process: uint32) -> int32 = "AttachConsole";
+extern fn GetStdHandle(which: int32) -> int64 = "GetStdHandle";
+extern fn RegCreateKeyExW(root: int64, subkey: uint16*, reserved: uint32, class_name: int64, options: uint32, access: uint32, security: int64, out: int64*, disposition: int64) -> int32 = "RegCreateKeyExW";
+extern fn RegOpenKeyExW(root: int64, subkey: uint16*, options: uint32, access: uint32, out: int64*) -> int32 = "RegOpenKeyExW";
+extern fn RegQueryValueExW(key: int64, name: uint16*, reserved: int64, kind: uint32*, data: rawptr, size: uint32*) -> int32 = "RegQueryValueExW";
+extern fn RegSetValueExW(key: int64, name: uint16*, reserved: uint32, kind: uint32, data: rawptr, size: uint32) -> int32 = "RegSetValueExW";
+extern fn RegDeleteTreeW(key: int64, subkey: uint16*) -> int32 = "RegDeleteTreeW";
+extern fn RegDeleteKeyW(key: int64, subkey: uint16*) -> int32 = "RegDeleteKeyW";
+extern fn RegCloseKey(key: int64) -> int32 = "RegCloseKey";
+extern fn SendMessageTimeoutW(window: int64, message: uint32, wparam: int64, lparam: uint16*, flags: uint32, timeout: uint32, result: int64*) -> int64 = "SendMessageTimeoutW";
+extern fn ShellExecuteExW(info: ShellExecuteInfo*) -> int32 = "ShellExecuteExW";
+extern fn ShellExecuteW(window: int64, verb: uint16*, file: uint16*, parameters: uint16*, directory: uint16*, show: int32) -> int64 = "ShellExecuteW";
+extern fn SHChangeNotify(event: int32, flags: uint32, item1: int64, item2: int64) = "SHChangeNotify";
+extern fn IsUserAnAdmin() -> int32 = "IsUserAnAdmin";
+
+export fn wlen(text: uint16*) -> int32 {
+  var n: int32 = 0;
+  while (text[n] != 0) {
+    n += 1;
+  }
+  return n;
+}
+
+export fn wcopy(out: uint16*, text: uint16*) {
+  var i: int32 = 0;
+  while (text[i] != 0 && i < WMAX - 1) {
+    out[i] = text[i];
+    i += 1;
+  }
+  out[i] = 0;
+}
+
+export fn wadd(out: uint16*, text: uint16*) {
+  var at: int32 = wlen(out);
+  var i: int32 = 0;
+  while (text[i] != 0 && at < WMAX - 1) {
+    out[at] = text[i];
+    at += 1;
+    i += 1;
+  }
+  out[at] = 0;
+}
+
+export fn wadd_utf8(out: uint16*, text: uint8*, length: int32) {
+  var at: int32 = wlen(out);
+  var made: int32 = MultiByteToWideChar(CP_UTF8, 0, text, length, out + (int64)at, WMAX - 1 - at);
+  out[at + made] = 0;
+}
+
+export fn cstr_len(text: cstring) -> int32 {
+  var p: uint8* = (uint8*)text;
+  var n: int32 = 0;
+  while (p[n] != 0) {
+    n += 1;
+  }
+  return n;
+}
+
+export fn wc(out: uint16*, text: cstring) {
+  out[0] = 0;
+  wadd_utf8(out, (uint8*)text, cstr_len(text));
+}
+
+export fn wa(out: uint16*, text: cstring) {
+  wadd_utf8(out, (uint8*)text, cstr_len(text));
+}
+
+export fn wlower(c: uint16) -> uint16 {
+  if (c >= 65 && c <= 90) {
+    return (uint16)((int32)c + 32);
+  }
+  return c;
+}
+
+export fn wsame(a: uint16*, b: uint16*) -> int32 {
+  var i: int32 = 0;
+  while (a[i] != 0 && b[i] != 0) {
+    if (wlower(a[i]) != wlower(b[i])) {
+      return 0;
+    }
+    i += 1;
+  }
+  if (a[i] == b[i]) {
+    return 1;
+  }
+  return 0;
+}
+
+export fn wsame_c(a: uint16*, text: cstring) -> int32 {
+  var wide: uint16[WMAX];
+  wc(&wide[0], text);
+  return wsame(a, &wide[0]);
+}
+
+export fn wadd_int(out: uint16*, value: int64) {
+  var digits: uint16[24];
+  var n: int32 = 0;
+  var v: int64 = value;
+  if (v == 0) {
+    digits[0] = 48;
+    n = 1;
+  }
+  while (v > 0) {
+    digits[n] = (uint16)(48 + (int32)(v % 10));
+    v = v / 10;
+    n += 1;
+  }
+  var at: int32 = wlen(out);
+  while (n > 0) {
+    n -= 1;
+    out[at] = digits[n];
+    at += 1;
+  }
+  out[at] = 0;
+}
+
+export fn wtrim_slash(path: uint16*) {
+  var n: int32 = wlen(path);
+  while (n > 3 && (path[n - 1] == 92 || path[n - 1] == 47)) {
+    n -= 1;
+    path[n] = 0;
+  }
+}
+
+export fn wfull_path(path: uint16*) {
+  var full: uint16[WMAX];
+  var got: uint32 = GetFullPathNameW(path, (uint32)WMAX, &full[0], 0);
+  if (got > 0 && got < (uint32)WMAX) {
+    wcopy(path, &full[0]);
+  }
+  wtrim_slash(path);
+}
+
+export fn dir_only_holds(path: uint16*, name: cstring) -> int32 {
+  var pattern: uint16[WMAX];
+  wjoin(&pattern[0], path, "*");
+  var data: FindData;
+  var find: int64 = FindFirstFileW(&pattern[0], &data);
+  if (find == INVALID_HANDLE) {
+    return 1;
+  }
+  var only: int32 = 1;
+  var more: int32 = 1;
+  while (more != 0) {
+    var ignore: int32 = wsame_c(&data.name[0], name);
+    if (data.name[0] == 46 && data.name[1] == 0) {
+      ignore = 1;
+    }
+    if (data.name[0] == 46 && data.name[1] == 46 && data.name[2] == 0) {
+      ignore = 1;
+    }
+    if (ignore == 0) {
+      only = 0;
+    }
+    more = FindNextFileW(find, &data);
+  }
+  FindClose(find);
+  return only;
+}
+
+export fn sleep_ms(milliseconds: uint32) {
+  Sleep(milliseconds);
+}
+
+export fn wjoin(out: uint16*, base: uint16*, name: cstring) {
+  wcopy(out, base);
+  wa(out, "\\");
+  wa(out, name);
+}
+
+export fn wjoin_w(out: uint16*, base: uint16*, name: uint16*) {
+  wcopy(out, base);
+  wa(out, "\\");
+  wadd(out, name);
+}
+
+export fn wparent(path: uint16*) {
+  var n: int32 = wlen(path);
+  while (n > 0 && path[n - 1] != 92 && path[n - 1] != 47) {
+    n -= 1;
+  }
+  if (n > 0) {
+    n -= 1;
+  }
+  path[n] = 0;
+}
+
+export fn env_get(out: uint16*, name: cstring) -> int32 {
+  var wide: uint16[64];
+  wc(&wide[0], name);
+  var got: uint32 = GetEnvironmentVariableW(&wide[0], out, (uint32)WMAX);
+  if (got == 0 || got >= (uint32)WMAX) {
+    out[0] = 0;
+    return 0;
+  }
+  return 1;
+}
+
+export fn env_set(name: cstring, value: uint16*) {
+  var wide: uint16[64];
+  wc(&wide[0], name);
+  SetEnvironmentVariableW(&wide[0], value);
+}
+
+export fn path_exists(path: uint16*) -> int32 {
+  if (GetFileAttributesW(path) != INVALID_ATTRIBUTES) {
+    return 1;
+  }
+  return 0;
+}
+
+export fn is_dir(path: uint16*) -> int32 {
+  var a: uint32 = GetFileAttributesW(path);
+  if (a != INVALID_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+export fn is_file(path: uint16*) -> int32 {
+  var a: uint32 = GetFileAttributesW(path);
+  if (a != INVALID_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+export fn make_dirs(path: uint16*) -> int32 {
+  if (is_dir(path) != 0) {
+    return 1;
+  }
+  var work: uint16[WMAX];
+  wcopy(&work[0], path);
+  var n: int32 = wlen(&work[0]);
+  var i: int32 = 3;
+  while (i <= n) {
+    if (i == n || work[i] == 92 || work[i] == 47) {
+      var keep: uint16 = work[i];
+      work[i] = 0;
+      if (is_dir(&work[0]) == 0) {
+        if (CreateDirectoryW(&work[0], 0) == 0 && is_dir(&work[0]) == 0) {
+          return 0;
+        }
+      }
+      work[i] = keep;
+    }
+    i += 1;
+  }
+  return 1;
+}
+
+export fn delete_tree(path: uint16*) -> int32 {
+  var a: uint32 = GetFileAttributesW(path);
+  if (a == INVALID_ATTRIBUTES) {
+    return 1;
+  }
+  if ((a & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    return DeleteFileW(path);
+  }
+  var pattern: uint16[WMAX];
+  wjoin(&pattern[0], path, "*");
+  var data: FindData;
+  var find: int64 = FindFirstFileW(&pattern[0], &data);
+  var ok: int32 = 1;
+  if (find != INVALID_HANDLE) {
+    var more: int32 = 1;
+    while (more != 0) {
+      var skip: int32 = 0;
+      if (data.name[0] == 46 && data.name[1] == 0) {
+        skip = 1;
+      }
+      if (data.name[0] == 46 && data.name[1] == 46 && data.name[2] == 0) {
+        skip = 1;
+      }
+      if (skip == 0) {
+        var child: uint16[WMAX];
+        wjoin_w(&child[0], path, &data.name[0]);
+        if (delete_tree(&child[0]) == 0) {
+          ok = 0;
+        }
+      }
+      more = FindNextFileW(find, &data);
+    }
+    FindClose(find);
+  }
+  SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+  if (RemoveDirectoryW(path) == 0) {
+    ok = 0;
+  }
+  return ok;
+}
+
+export fn dir_empty(path: uint16*) -> int32 {
+  var pattern: uint16[WMAX];
+  wjoin(&pattern[0], path, "*");
+  var data: FindData;
+  var find: int64 = FindFirstFileW(&pattern[0], &data);
+  if (find == INVALID_HANDLE) {
+    return 1;
+  }
+  var empty: int32 = 1;
+  var more: int32 = 1;
+  while (more != 0) {
+    var dot: int32 = 0;
+    if (data.name[0] == 46 && data.name[1] == 0) {
+      dot = 1;
+    }
+    if (data.name[0] == 46 && data.name[1] == 46 && data.name[2] == 0) {
+      dot = 1;
+    }
+    if (dot == 0) {
+      empty = 0;
+    }
+    more = FindNextFileW(find, &data);
+  }
+  FindClose(find);
+  return empty;
+}
+
+export fn move_path(from: uint16*, to: uint16*) -> int32 {
+  return MoveFileExW(from, to, MOVEFILE_WRITE_THROUGH);
+}
+
+export fn remove_empty_dir(path: uint16*) {
+  RemoveDirectoryW(path);
+}
+
+export fn file_create(path: uint16*) -> int64 {
+  return CreateFileW(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+}
+
+export fn file_write(file: int64, data: uint8*, size: int64) -> int32 {
+  var left: int64 = size;
+  var at: uint8* = data;
+  while (left > 0) {
+    var chunk: uint32 = 1048576;
+    if (left < 1048576) {
+      chunk = (uint32)left;
+    }
+    var done: uint32 = 0;
+    if (Sys_WriteFile(file, (rawptr)at, chunk, &done, 0) == 0 || done == 0) {
+      return 0;
+    }
+    at = at + (int64)done;
+    left = left - (int64)done;
+  }
+  return 1;
+}
+
+export fn file_close(file: int64) {
+  Sys_CloseHandle(file);
+}
+
+export fn map_file(path: uint16*, size: int64*) -> uint8* {
+  var file: int64 = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  if (file == INVALID_HANDLE) {
+    return 0;
+  }
+  GetFileSizeEx(file, size);
+  var mapping: int64 = CreateFileMappingW(file, 0, PAGE_READONLY, 0, 0, 0);
+  Sys_CloseHandle(file);
+  if (mapping == 0) {
+    return 0;
+  }
+  var view: rawptr = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+  Sys_CloseHandle(mapping);
+  return (uint8*)view;
+}
+
+export fn own_path(out: uint16*) {
+  var got: uint32 = GetModuleFileNameW(0, out, (uint32)WMAX);
+  out[got] = 0;
+}
+
+export fn system_text(out: uint16*, code: uint32) {
+  var at: int32 = wlen(out);
+  var made: uint32 = FormatMessageW(FORMAT_FROM_SYSTEM | FORMAT_IGNORE_INSERTS, 0, code, 0, out + (int64)at, (uint32)(WMAX - 1 - at), 0);
+  var end: int32 = at + (int32)made;
+  while (end > at && (out[end - 1] == 10 || out[end - 1] == 13 || out[end - 1] == 32 || out[end - 1] == 46)) {
+    end -= 1;
+  }
+  out[end] = 0;
+}
+
+export fn last_error() -> uint32 {
+  return Sys_GetLastError();
+}
+
+export fn now_ms() -> float64 {
+  var count: int64 = 0;
+  var frequency: int64 = 1;
+  QueryPerformanceCounter(&count);
+  QueryPerformanceFrequency(&frequency);
+  return (float64)count * 1000.0 / (float64)frequency;
+}
+
+export fn exit_now(code: int32) {
+  ExitProcess((uint32)code);
+}
+
+export fn args_get(count: int32*) -> uint16** {
+  return CommandLineToArgvW(GetCommandLineW(), count);
+}
+
+export fn is_admin() -> int32 {
+  return IsUserAnAdmin();
+}
+
+export fn console_attach() {
+  AttachConsole(ATTACH_PARENT);
+}
+
+export fn console_line(text: uint16*) {
+  var out: int64 = GetStdHandle(-11);
+  if (out == 0 || out == INVALID_HANDLE) {
+    return;
+  }
+  var bytes: uint8[4096];
+  var made: int32 = WideCharToMultiByte(CP_UTF8, 0, text, wlen(text), &bytes[0], 4094, 0, 0);
+  bytes[made] = 10;
+  var done: uint32 = 0;
+  Sys_WriteFile(out, (rawptr)&bytes[0], (uint32)(made + 1), &done, 0);
+}
+
+export fn key_open(root: int64, subkey: uint16*, write: int32) -> int64 {
+  var key: int64 = 0;
+  var access: uint32 = KEY_READ | KEY_WOW64_64KEY;
+  if (write != 0) {
+    access = access | KEY_WRITE;
+  }
+  if (RegOpenKeyExW(root, subkey, 0, access, &key) != 0) {
+    return 0;
+  }
+  return key;
+}
+
+export fn key_create(root: int64, subkey: uint16*) -> int64 {
+  var key: int64 = 0;
+  if (RegCreateKeyExW(root, subkey, 0, 0, 0, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, 0, &key, 0) != 0) {
+    return 0;
+  }
+  return key;
+}
+
+export fn key_close(key: int64) {
+  RegCloseKey(key);
+}
+
+export fn key_get(key: int64, name: cstring, out: uint16*, kind: uint32*) -> int32 {
+  var wide: uint16[128];
+  wc(&wide[0], name);
+  var size: uint32 = (uint32)((WMAX - 1) * 2);
+  var found: uint32 = 0;
+  if (RegQueryValueExW(key, &wide[0], 0, &found, (rawptr)out, &size) != 0) {
+    out[0] = 0;
+    return 0;
+  }
+  out[(int32)size / 2] = 0;
+  if (kind != 0) {
+    kind[0] = found;
+  }
+  return 1;
+}
+
+export fn key_set(key: int64, name: cstring, value: uint16*, kind: uint32) -> int32 {
+  var wide: uint16[128];
+  wc(&wide[0], name);
+  var size: uint32 = (uint32)((wlen(value) + 1) * 2);
+  if (RegSetValueExW(key, &wide[0], 0, kind, (rawptr)value, size) != 0) {
+    return 0;
+  }
+  return 1;
+}
+
+export fn key_set_sz(key: int64, name: cstring, value: uint16*) -> int32 {
+  return key_set(key, name, value, REG_SZ);
+}
+
+export fn key_set_dword(key: int64, name: cstring, value: uint32) -> int32 {
+  var wide: uint16[128];
+  wc(&wide[0], name);
+  var v: uint32 = value;
+  if (RegSetValueExW(key, &wide[0], 0, REG_DWORD, (rawptr)&v, 4) != 0) {
+    return 0;
+  }
+  return 1;
+}
+
+export fn key_delete_tree(root: int64, subkey: uint16*) {
+  RegDeleteTreeW(root, subkey);
+  RegDeleteKeyW(root, subkey);
+}
+
+export fn path_kind_expand() -> uint32 {
+  return REG_EXPAND_SZ;
+}
+
+export fn path_entry_present(list: uint16*, entry: uint16*) -> int32 {
+  var i: int32 = 0;
+  var n: int32 = wlen(list);
+  var e: int32 = wlen(entry);
+  while (i <= n) {
+    var stop: int32 = i;
+    while (stop < n && list[stop] != 59) {
+      stop += 1;
+    }
+    var m: int32 = stop - i;
+    while (m > 0 && list[i + m - 1] == 92) {
+      m -= 1;
+    }
+    if (m == e) {
+      var k: int32 = 0;
+      while (k < e && wlower(list[i + k]) == wlower(entry[k])) {
+        k += 1;
+      }
+      if (k == e) {
+        return 1;
+      }
+    }
+    i = stop + 1;
+  }
+  return 0;
+}
+
+export fn path_entry_remove(list: uint16*, entry: uint16*) -> int32 {
+  var out: uint16[WMAX];
+  out[0] = 0;
+  var o: int32 = 0;
+  var removed: int32 = 0;
+  var i: int32 = 0;
+  var n: int32 = wlen(list);
+  var e: int32 = wlen(entry);
+  while (i < n) {
+    var stop: int32 = i;
+    while (stop < n && list[stop] != 59) {
+      stop += 1;
+    }
+    var m: int32 = stop - i;
+    while (m > 0 && list[i + m - 1] == 92) {
+      m -= 1;
+    }
+    var same: int32 = 0;
+    if (m == e) {
+      var k: int32 = 0;
+      while (k < e && wlower(list[i + k]) == wlower(entry[k])) {
+        k += 1;
+      }
+      if (k == e) {
+        same = 1;
+      }
+    }
+    if (same != 0) {
+      removed = 1;
+    } else if (stop > i) {
+      if (o > 0) {
+        out[o] = 59;
+        o += 1;
+      }
+      var c: int32 = i;
+      while (c < stop && o < WMAX - 1) {
+        out[o] = list[c];
+        o += 1;
+        c += 1;
+      }
+    }
+    i = stop + 1;
+  }
+  out[o] = 0;
+  if (removed != 0) {
+    wcopy(list, &out[0]);
+  }
+  return removed;
+}
+
+export fn broadcast_environment() {
+  var word: uint16[32];
+  wc(&word[0], "Environment");
+  var result: int64 = 0;
+  SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, &word[0], SMTO_ABORTIFHUNG, 1500, &result);
+}
+
+export fn broadcast_associations() {
+  SHChangeNotify(SHCNE_ASSOCCHANGED, 0, 0, 0);
+}
+
+export fn run_capture(command: uint16*, directory: uint16*, out: uint8*, cap: int32, exit_code: int32*) -> int32 {
+  var security: SecurityAttributes;
+  memset((rawptr)&security, 0, (int64)sizeof(SecurityAttributes));
+  security.length = (uint32)sizeof(SecurityAttributes);
+  security.inherit = 1;
+  var read_end: int64 = 0;
+  var write_end: int64 = 0;
+  if (CreatePipe(&read_end, &write_end, &security, 0) == 0) {
+    return -1;
+  }
+  SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
+  var startup: StartupInfo;
+  memset((rawptr)&startup, 0, (int64)sizeof(StartupInfo));
+  startup.size = (uint32)sizeof(StartupInfo);
+  startup.flags = STARTF_USESTDHANDLES;
+  startup.output = write_end;
+  startup.error = write_end;
+  var info: ProcessInfo;
+  var line: uint16[WMAX];
+  wcopy(&line[0], command);
+  if (CreateProcessW(0, &line[0], 0, 0, 1, CREATE_NO_WINDOW, 0, directory, &startup, &info) == 0) {
+    Sys_CloseHandle(read_end);
+    Sys_CloseHandle(write_end);
+    return -1;
+  }
+  Sys_CloseHandle(write_end);
+  var total: int32 = 0;
+  while (total < cap - 1) {
+    var done: uint32 = 0;
+    if (Sys_ReadFile(read_end, (rawptr)(out + (int64)total), (uint32)(cap - 1 - total), &done, 0) == 0 || done == 0) {
+      break;
+    }
+    total = total + (int32)done;
+  }
+  out[total] = 0;
+  Sys_CloseHandle(read_end);
+  Sys_WaitForSingleObject(info.process, WAIT_INFINITE);
+  var code: uint32 = 1;
+  GetExitCodeProcess(info.process, &code);
+  exit_code[0] = (int32)code;
+  Sys_CloseHandle(info.process);
+  Sys_CloseHandle(info.thread);
+  return total;
+}
+
+export fn run_wait(command: uint16*, exit_code: int32*) -> int32 {
+  var startup: StartupInfo;
+  memset((rawptr)&startup, 0, (int64)sizeof(StartupInfo));
+  startup.size = (uint32)sizeof(StartupInfo);
+  var info: ProcessInfo;
+  var line: uint16[WMAX];
+  wcopy(&line[0], command);
+  if (CreateProcessW(0, &line[0], 0, 0, 0, CREATE_NO_WINDOW, 0, 0, &startup, &info) == 0) {
+    return 0;
+  }
+  Sys_WaitForSingleObject(info.process, WAIT_INFINITE);
+  var code: uint32 = 1;
+  GetExitCodeProcess(info.process, &code);
+  exit_code[0] = (int32)code;
+  Sys_CloseHandle(info.process);
+  Sys_CloseHandle(info.thread);
+  return 1;
+}
+
+export fn run_detached(command: uint16*, directory: uint16*, hidden: int32) -> int32 {
+  var startup: StartupInfo;
+  memset((rawptr)&startup, 0, (int64)sizeof(StartupInfo));
+  startup.size = (uint32)sizeof(StartupInfo);
+  var flags: uint32 = 0x00000010;
+  if (hidden != 0) {
+    flags = CREATE_NO_WINDOW;
+  }
+  var info: ProcessInfo;
+  var line: uint16[WMAX];
+  wcopy(&line[0], command);
+  if (CreateProcessW(0, &line[0], 0, 0, 0, flags, 0, directory, &startup, &info) == 0) {
+    return 0;
+  }
+  Sys_CloseHandle(info.process);
+  Sys_CloseHandle(info.thread);
+  return 1;
+}
+
+export fn run_elevated(file: uint16*, parameters: uint16*, window: int64, wait: int32, exit_code: int32*) -> int32 {
+  var verb: uint16[8];
+  wc(&verb[0], "runas");
+  var info: ShellExecuteInfo;
+  memset((rawptr)&info, 0, (int64)sizeof(ShellExecuteInfo));
+  info.size = (uint32)sizeof(ShellExecuteInfo);
+  info.mask = SEE_MASK_NOCLOSEPROCESS;
+  info.window = window;
+  info.verb = &verb[0];
+  info.file = file;
+  info.parameters = parameters;
+  info.show = 1;
+  if (ShellExecuteExW(&info) == 0) {
+    return 0;
+  }
+  if (wait != 0 && info.process != 0) {
+    Sys_WaitForSingleObject(info.process, WAIT_INFINITE);
+    var code: uint32 = 1;
+    GetExitCodeProcess(info.process, &code);
+    exit_code[0] = (int32)code;
+  }
+  if (info.process != 0) {
+    Sys_CloseHandle(info.process);
+  }
+  return 1;
+}
+
+export fn open_shell(target: uint16*) {
+  var verb: uint16[8];
+  wc(&verb[0], "open");
+  ShellExecuteW(0, &verb[0], target, 0, 0, 1);
+}
+
+export fn temp_dir(out: uint16*) {
+  var got: uint32 = GetTempPathW((uint32)WMAX, out);
+  out[got] = 0;
+  wtrim_slash(out);
+}
+
+export fn process_id() -> uint32 {
+  return GetCurrentProcessId();
+}

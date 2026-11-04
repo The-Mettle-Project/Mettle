@@ -13277,6 +13277,27 @@ catch {
 }
 }
 
+if (-not $script:OnWindows) { Skip-WindowsOnly "installer_setup_program" "Windows-only: the installer is a Win32 program" } else {
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $exePath = Join-Path $tmpDir "installer_setup_program.exe"
+  $buildOut = & $CompilerPath --build --release --subsystem windows -I installer/setup --link-arg -lshell32 --link-arg -lole32 --link-arg -ldwmapi installer/setup/setup.mettle -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "the setup program did not build: $buildOut"
+  }
+  $run = Start-Process -FilePath $exePath -Wait -PassThru
+  if ($run.ExitCode -ne 2) {
+    throw "the setup program with no payload exited with $($run.ExitCode) (expected 2)"
+  }
+  Write-CaseResult -Name "installer_setup_program" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "installer_setup_program" -Passed $false -Reason $_.Exception.Message
+}
+}
+
 # Internal linker UI test: std/ui resolves user32/gdi32 without link args
 if (-not $script:OnWindows) { Skip-WindowsOnly "internal_link_ui" "Windows-only: std/ui is a Win32 surface" } else {
 $total++

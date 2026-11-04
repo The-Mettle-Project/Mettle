@@ -1,0 +1,884 @@
+import "std/mem";
+import "system";
+import "lzma";
+
+export const PHASE_IDLE: int32 = 0;
+export const PHASE_EXTRACT: int32 = 1;
+export const PHASE_REPLACE_OLD: int32 = 2;
+export const PHASE_SWAP: int32 = 3;
+export const PHASE_REGISTER: int32 = 4;
+export const PHASE_VERIFY: int32 = 5;
+export const PHASE_REMOVE: int32 = 6;
+export const PHASE_DONE: int32 = 7;
+export const PHASE_FAILED: int32 = 8;
+
+const FOOTER_SIZE: int64 = 64;
+const OLD_UNINSTALL_WAIT_MS: int32 = 60000;
+const UNINSTALL_NAME: cstring = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Mettle";
+const OLD_UNINSTALL_NAME: cstring = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{{D9F4D8EF-0B2C-4B37-A9B0-5A6E30C3D2A1}_is1";
+const MACHINE_ENVIRONMENT: cstring = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+
+export struct Entry {
+  path: uint8*;
+  path_length: int32;
+  size: int64;
+  crc: uint32;
+}
+
+export struct Archive {
+  base: uint8*;
+  size: int64;
+  art: uint8*;
+  art_size: int64;
+  index: uint8*;
+  index_size: int64;
+  data: uint8*;
+  data_size: int64;
+  uninstaller_size: int64;
+  entries: Entry*;
+  count: int32;
+  total: int64;
+  version: uint16[32];
+}
+
+export struct Existing {
+  found: int32;
+  old_kind: int32;
+  everyone: int32;
+  dir: uint16[1024];
+  version: uint16[64];
+}
+
+export var g_archive: Archive;
+export var g_phase: int32 = PHASE_IDLE;
+export var g_done_bytes: int64 = 0;
+export var g_error: uint16[WMAX];
+export var g_current: uint16[WMAX];
+export var g_verify_output: uint16[WMAX];
+export var g_dir: uint16[WMAX];
+export var g_everyone: int32 = 0;
+export var g_add_path: int32 = 1;
+export var g_associate: int32 = 1;
+export var g_test_root: uint16[WMAX];
+export var g_files_left: int32 = 0;
+
+var g_staging: uint16[WMAX];
+var g_stale: uint16[WMAX];
+var g_lzma: Lzma;
+var g_lzma_open: int32 = 0;
+var g_file: int64 = -1;
+var g_entry: int32 = 0;
+var g_entry_left: int64 = 0;
+var g_crc: uint32 = 0;
+var g_crc_table: uint32[256];
+var g_tops: uint16[64][128];
+var g_top_count: int32 = 0;
+var g_prior: Existing;
+
+fn read_u16(p: uint8*) -> int32 {
+  return (int32)p[0] | ((int32)p[1] << 8);
+}
+
+fn read_u32(p: uint8*) -> uint32 {
+  return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
+
+fn read_u64(p: uint8*) -> int64 {
+  return (int64)read_u32(p) | ((int64)read_u32(p + 4) << 32);
+}
+
+fn crc_init() {
+  var i: uint32 = 0;
+  while (i < 256) {
+    var c: uint32 = i;
+    var k: int32 = 0;
+    while (k < 8) {
+      if ((c & 1) != 0) {
+        c = 0xEDB88320 ^ (c >> 1);
+      } else {
+        c = c >> 1;
+      }
+      k += 1;
+    }
+    g_crc_table[i] = c;
+    i += 1;
+  }
+}
+
+fn crc_add(crc: uint32, data: uint8*, size: int64) -> uint32 {
+  var c: uint32 = crc;
+  var i: int64 = 0;
+  while (i < size) {
+    c = g_crc_table[(c ^ (uint32)data[i]) & 255] ^ (c >> 8);
+    i += 1;
+  }
+  return c;
+}
+
+fn note_top(path: uint8*, length: int32) {
+  var n: int32 = 0;
+  while (n < length && path[n] != 47) {
+    n += 1;
+  }
+  var name: uint16[128];
+  name[0] = 0;
+  wadd_utf8(&name[0], path, n);
+  var i: int32 = 0;
+  while (i < g_top_count) {
+    if (wsame(&g_tops[i][0], &name[0]) != 0) {
+      return;
+    }
+    i += 1;
+  }
+  if (g_top_count < 64) {
+    wcopy(&g_tops[g_top_count][0], &name[0]);
+    g_top_count += 1;
+  }
+}
+
+export fn archive_open() -> int32 {
+  crc_init();
+  var self_path: uint16[WMAX];
+  own_path(&self_path[0]);
+  var size: int64 = 0;
+  var base: uint8* = map_file(&self_path[0], &size);
+  if (base == 0 || size < FOOTER_SIZE) {
+    return 0;
+  }
+  var footer: uint8* = base + size - FOOTER_SIZE;
+  if (memcmp((rawptr)footer, (rawptr)"METTLEIN", 8) != 0) {
+    return 0;
+  }
+  var a: Archive* = &g_archive;
+  a.base = base;
+  a.size = size;
+  var art_at: int64 = read_u64(footer + 8);
+  a.art = base + art_at;
+  a.art_size = read_u64(footer + 16);
+  var index_at: int64 = read_u64(footer + 24);
+  a.index = base + index_at;
+  a.index_size = read_u64(footer + 32);
+  a.data = base + read_u64(footer + 40);
+  a.data_size = read_u64(footer + 48);
+  a.uninstaller_size = art_at + a.art_size;
+  a.total = read_u64(a.index);
+  a.count = (int32)read_u32(a.index + 8);
+  var version_length: int32 = read_u16(a.index + 12);
+  a.version[0] = 0;
+  wadd_utf8(&a.version[0], a.index + 14, version_length);
+  a.entries = (Entry*)malloc((int64)a.count * (int64)sizeof(Entry));
+  var at: uint8* = a.index + 14 + (int64)version_length;
+  var i: int32 = 0;
+  while (i < a.count) {
+    var e: Entry* = a.entries + (int64)i;
+    e.path_length = read_u16(at);
+    e.path = at + 2;
+    at = at + 2 + (int64)e.path_length;
+    e.size = read_u64(at);
+    e.crc = read_u32(at + 8);
+    at = at + 12;
+    note_top(e.path, e.path_length);
+    i += 1;
+  }
+  return 1;
+}
+
+export fn archive_has_files() -> int32 {
+  if (g_archive.data_size > 0) {
+    return 1;
+  }
+  return 0;
+}
+
+fn fail(what: cstring, path: uint16*, code: uint32) {
+  wc(&g_error[0], what);
+  if (path != 0) {
+    wa(&g_error[0], " ");
+    wadd(&g_error[0], path);
+  }
+  if (code != 0) {
+    wa(&g_error[0], ". ");
+    system_text(&g_error[0], code);
+  }
+  wa(&g_error[0], ".");
+  g_phase = PHASE_FAILED;
+}
+
+fn root_for(everyone: int32) -> int64 {
+  if (g_test_root[0] != 0) {
+    return HKCU;
+  }
+  if (everyone != 0) {
+    return HKLM;
+  }
+  return HKCU;
+}
+
+fn key_path(out: uint16*, name: cstring) {
+  out[0] = 0;
+  if (g_test_root[0] != 0) {
+    wcopy(out, &g_test_root[0]);
+    wa(out, "\\");
+  }
+  wa(out, name);
+}
+
+fn read_install(root: int64, name: cstring, kind: int32, out: Existing*) -> int32 {
+  var path: uint16[WMAX];
+  key_path(&path[0], name);
+  var key: int64 = key_open(root, &path[0], 0);
+  if (key == 0) {
+    return 0;
+  }
+  var ok: int32 = key_get(key, "InstallLocation", &out.dir[0], 0);
+  if (ok == 0) {
+    ok = key_get(key, "Inno Setup: App Path", &out.dir[0], 0);
+  }
+  key_get(key, "DisplayVersion", &out.version[0], 0);
+  key_close(key);
+  if (ok == 0 || out.dir[0] == 0) {
+    return 0;
+  }
+  wtrim_slash(&out.dir[0]);
+  out.found = 1;
+  out.old_kind = kind;
+  return 1;
+}
+
+export fn find_existing(out: Existing*) {
+  out.found = 0;
+  out.old_kind = 0;
+  out.everyone = 0;
+  out.dir[0] = 0;
+  out.version[0] = 0;
+  if (read_install(HKCU, UNINSTALL_NAME, 0, out) != 0) {
+    return;
+  }
+  if (read_install(HKCU, OLD_UNINSTALL_NAME, 1, out) != 0) {
+    return;
+  }
+  if (g_test_root[0] != 0) {
+    return;
+  }
+  if (read_install(HKLM, UNINSTALL_NAME, 0, out) != 0) {
+    out.everyone = 1;
+    return;
+  }
+  if (read_install(HKLM, OLD_UNINSTALL_NAME, 1, out) != 0) {
+    out.everyone = 1;
+  }
+}
+
+export fn default_dir(out: uint16*, everyone: int32) {
+  if (everyone != 0) {
+    if (env_get(out, "ProgramW6432") == 0) {
+      env_get(out, "ProgramFiles");
+    }
+    wa(out, "\\Mettle");
+    return;
+  }
+  env_get(out, "LOCALAPPDATA");
+  wa(out, "\\Programs\\Mettle");
+}
+
+export fn holds_mettle(dir: uint16*) -> int32 {
+  var probe: uint16[WMAX];
+  wjoin(&probe[0], dir, "bin\\mettle.exe");
+  return is_file(&probe[0]);
+}
+
+export fn dir_usable(dir: uint16*) -> int32 {
+  if (is_dir(dir) == 0) {
+    if (path_exists(dir) != 0) {
+      return 0;
+    }
+    return 1;
+  }
+  if (dir_empty(dir) != 0 || holds_mettle(dir) != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+fn close_current() {
+  if (g_file != -1) {
+    file_close(g_file);
+    g_file = -1;
+  }
+}
+
+fn open_entry() -> int32 {
+  var e: Entry* = g_archive.entries + (int64)g_entry;
+  var path: uint16[WMAX];
+  wcopy(&path[0], &g_staging[0]);
+  wa(&path[0], "\\");
+  wadd_utf8(&path[0], e.path, e.path_length);
+  var i: int32 = 0;
+  var last: int32 = 0;
+  while (path[i] != 0) {
+    if (path[i] == 47) {
+      path[i] = 92;
+    }
+    if (path[i] == 92) {
+      last = i;
+    }
+    i += 1;
+  }
+  path[last] = 0;
+  if (make_dirs(&path[0]) == 0) {
+    fail("Could not create", &path[0], last_error());
+    return 0;
+  }
+  path[last] = 92;
+  g_current[0] = 0;
+  wadd_utf8(&g_current[0], e.path, e.path_length);
+  g_file = file_create(&path[0]);
+  if (g_file == -1) {
+    fail("Could not write", &path[0], last_error());
+    return 0;
+  }
+  g_entry_left = e.size;
+  g_crc = 0xFFFFFFFF;
+  return 1;
+}
+
+fn finish_entry() -> int32 {
+  close_current();
+  var e: Entry* = g_archive.entries + (int64)g_entry;
+  if ((g_crc ^ 0xFFFFFFFF) != e.crc) {
+    wc(&g_error[0], "This installer is damaged: ");
+    wadd(&g_error[0], &g_current[0]);
+    wa(&g_error[0], " failed its checksum. Download it again.");
+    g_phase = PHASE_FAILED;
+    return 0;
+  }
+  g_entry += 1;
+  return 1;
+}
+
+export fn engine_start() -> int32 {
+  find_existing(&g_prior);
+  wtrim_slash(&g_dir[0]);
+  if (dir_usable(&g_dir[0]) == 0) {
+    fail("This folder holds other files. Pick an empty folder:", &g_dir[0], 0);
+    return 0;
+  }
+  var parent: uint16[WMAX];
+  wcopy(&parent[0], &g_dir[0]);
+  wparent(&parent[0]);
+  if (make_dirs(&parent[0]) == 0) {
+    fail("Could not create", &parent[0], last_error());
+    return 0;
+  }
+  wcopy(&g_staging[0], &g_dir[0]);
+  wa(&g_staging[0], ".installing");
+  wcopy(&g_stale[0], &g_dir[0]);
+  wa(&g_stale[0], ".replaced");
+  delete_tree(&g_staging[0]);
+  delete_tree(&g_stale[0]);
+  if (make_dirs(&g_staging[0]) == 0) {
+    fail("Could not create", &g_staging[0], last_error());
+    return 0;
+  }
+  if (lzma_open(&g_lzma, g_archive.data, g_archive.data_size) == 0) {
+    fail("This installer is damaged. Download it again", 0, 0);
+    return 0;
+  }
+  g_lzma_open = 1;
+  g_entry = 0;
+  g_done_bytes = 0;
+  g_phase = PHASE_EXTRACT;
+  return 1;
+}
+
+fn extract_some(budget_ms: float64) {
+  var stop_at: float64 = now_ms() + budget_ms;
+  var entries: int32 = g_archive.count;
+  while (g_entry < entries) {
+    if (g_file == -1) {
+      if (open_entry() == 0) {
+        return;
+      }
+    }
+    while (g_entry_left > 0) {
+      var ask: int64 = g_entry_left;
+      if (ask > 262144) {
+        ask = 262144;
+      }
+      if (g_lzma.dict_pos == g_lzma.dict_cap) {
+        g_lzma.dict_pos = 0;
+      }
+      var start: int64 = g_lzma.dict_pos;
+      var got: int64 = lzma_run(&g_lzma, ask);
+      if (g_lzma.failed != 0 || got == 0) {
+        close_current();
+        fail("This installer is damaged. Download it again", 0, 0);
+        return;
+      }
+      if (file_write(g_file, g_lzma.dict + start, got) == 0) {
+        var code: uint32 = last_error();
+        close_current();
+        fail("Could not write", &g_current[0], code);
+        return;
+      }
+      g_crc = crc_add(g_crc, g_lzma.dict + start, got);
+      g_entry_left = g_entry_left - got;
+      g_done_bytes = g_done_bytes + got;
+      if (now_ms() >= stop_at && g_entry_left > 0) {
+        return;
+      }
+    }
+    if (finish_entry() == 0) {
+      return;
+    }
+    if (now_ms() >= stop_at) {
+      return;
+    }
+  }
+  lzma_close(&g_lzma);
+  g_lzma_open = 0;
+  write_uninstaller();
+  if (g_phase != PHASE_FAILED) {
+    g_phase = PHASE_REPLACE_OLD;
+  }
+}
+
+fn write_u64(p: uint8*, value: int64) {
+  var i: int32 = 0;
+  while (i < 8) {
+    p[i] = (uint8)((value >> (i * 8)) & 255);
+    i += 1;
+  }
+}
+
+fn write_uninstaller() {
+  var path: uint16[WMAX];
+  wjoin(&path[0], &g_staging[0], "uninstall.exe");
+  var file: int64 = file_create(&path[0]);
+  if (file == -1) {
+    fail("Could not write", &path[0], last_error());
+    return;
+  }
+  var a: Archive* = &g_archive;
+  var footer: uint8[64];
+  var original: uint8* = a.base + a.size - FOOTER_SIZE;
+  memcpy((rawptr)&footer[0], (rawptr)original, FOOTER_SIZE);
+  write_u64(&footer[24], a.uninstaller_size);
+  write_u64(&footer[40], a.uninstaller_size + a.index_size);
+  write_u64(&footer[48], 0);
+  var ok: int32 = file_write(file, a.base, a.uninstaller_size);
+  if (ok != 0) {
+    ok = file_write(file, a.index, a.index_size);
+  }
+  if (ok != 0) {
+    ok = file_write(file, &footer[0], FOOTER_SIZE);
+  }
+  var code: uint32 = last_error();
+  file_close(file);
+  if (ok == 0) {
+    fail("Could not write", &path[0], code);
+  }
+}
+
+fn command_program(command: uint16*, out: uint16*) {
+  var at: int32 = 0;
+  var o: int32 = 0;
+  var stop: uint16 = 32;
+  if (command[0] == 34) {
+    stop = 34;
+    at = 1;
+  }
+  while (command[at] != 0 && command[at] != stop && o < WMAX - 1) {
+    out[o] = command[at];
+    o += 1;
+    at += 1;
+  }
+  out[o] = 0;
+}
+
+fn replace_old() {
+  if (g_prior.found != 0 && g_prior.old_kind != 0 && wsame(&g_prior.dir[0], &g_dir[0]) != 0) {
+    var path: uint16[WMAX];
+    key_path(&path[0], OLD_UNINSTALL_NAME);
+    var key: int64 = key_open(root_for(g_prior.everyone), &path[0], 0);
+    if (key != 0) {
+      var command: uint16[WMAX];
+      var has: int32 = key_get(key, "UninstallString", &command[0], 0);
+      key_close(key);
+      if (has != 0) {
+        var old_exe: uint16[WMAX];
+        command_program(&command[0], &old_exe[0]);
+        wa(&command[0], " /VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
+        var code: int32 = 0;
+        if (run_wait(&command[0], &code) == 0 || code != 0) {
+          fail("Could not remove the older Mettle in", &g_dir[0], 0);
+          return;
+        }
+        var waited: int32 = 0;
+        while (is_file(&old_exe[0]) != 0) {
+          if (waited >= OLD_UNINSTALL_WAIT_MS) {
+            fail("The older Mettle's uninstaller did not finish in", &g_dir[0], 0);
+            return;
+          }
+          sleep_ms(50);
+          waited += 50;
+        }
+      }
+    }
+  }
+  g_phase = PHASE_SWAP;
+}
+
+fn swap_in() {
+  if (make_dirs(&g_dir[0]) == 0) {
+    fail("Could not create", &g_dir[0], last_error());
+    return;
+  }
+  make_dirs(&g_stale[0]);
+  var i: int32 = 0;
+  var total: int32 = g_top_count;
+  var moved_old: int32[65];
+  while (i <= total) {
+    var name: uint16[128];
+    if (i == total) {
+      wc(&name[0], "uninstall.exe");
+    } else {
+      wcopy(&name[0], &g_tops[i][0]);
+    }
+    var live: uint16[WMAX];
+    var aside: uint16[WMAX];
+    var fresh: uint16[WMAX];
+    wjoin_w(&live[0], &g_dir[0], &name[0]);
+    wjoin_w(&aside[0], &g_stale[0], &name[0]);
+    wjoin_w(&fresh[0], &g_staging[0], &name[0]);
+    moved_old[i] = 0;
+    var ok: int32 = 1;
+    if (path_exists(&live[0]) != 0) {
+      ok = move_path(&live[0], &aside[0]);
+      if (ok != 0) {
+        moved_old[i] = 1;
+      }
+    }
+    if (ok != 0) {
+      ok = move_path(&fresh[0], &live[0]);
+    }
+    if (ok == 0) {
+      var code: uint32 = last_error();
+      roll_back(i, &moved_old[0]);
+      fail("Could not replace", &live[0], code);
+      return;
+    }
+    i += 1;
+  }
+  delete_tree(&g_stale[0]);
+  delete_tree(&g_staging[0]);
+  g_phase = PHASE_REGISTER;
+}
+
+fn roll_back(reached: int32, moved_old: int32*) {
+  var i: int32 = reached;
+  while (i >= 0) {
+    var name: uint16[128];
+    if (i == g_top_count) {
+      wc(&name[0], "uninstall.exe");
+    } else {
+      wcopy(&name[0], &g_tops[i][0]);
+    }
+    var live: uint16[WMAX];
+    var aside: uint16[WMAX];
+    var fresh: uint16[WMAX];
+    wjoin_w(&live[0], &g_dir[0], &name[0]);
+    wjoin_w(&aside[0], &g_stale[0], &name[0]);
+    wjoin_w(&fresh[0], &g_staging[0], &name[0]);
+    if (path_exists(&fresh[0]) == 0 && path_exists(&live[0]) != 0) {
+      move_path(&live[0], &fresh[0]);
+    }
+    if (moved_old[i] != 0) {
+      move_path(&aside[0], &live[0]);
+    }
+    i -= 1;
+  }
+  delete_tree(&g_stale[0]);
+  delete_tree(&g_staging[0]);
+}
+
+fn environment_key(out: uint16*) -> int64 {
+  if (g_test_root[0] != 0) {
+    key_path(out, "Environment");
+    return HKCU;
+  }
+  if (g_everyone != 0) {
+    wc(out, MACHINE_ENVIRONMENT);
+    return HKLM;
+  }
+  wc(out, "Environment");
+  return HKCU;
+}
+
+fn add_to_path(bin: uint16*) -> int32 {
+  var name: uint16[WMAX];
+  var root: int64 = environment_key(&name[0]);
+  var key: int64 = key_create(root, &name[0]);
+  if (key == 0) {
+    return 0;
+  }
+  var value: uint16[WMAX];
+  var kind: uint32 = path_kind_expand();
+  key_get(key, "Path", &value[0], &kind);
+  var ok: int32 = 1;
+  if (path_entry_present(&value[0], bin) == 0) {
+    if (wlen(&value[0]) + wlen(bin) + 2 >= WMAX) {
+      key_close(key);
+      return 0;
+    }
+    var n: int32 = wlen(&value[0]);
+    if (n > 0 && value[n - 1] != 59) {
+      wa(&value[0], ";");
+    }
+    wadd(&value[0], bin);
+    ok = key_set(key, "Path", &value[0], kind);
+  }
+  key_close(key);
+  return ok;
+}
+
+fn remove_from_path(bin: uint16*) {
+  var name: uint16[WMAX];
+  var root: int64 = environment_key(&name[0]);
+  var key: int64 = key_open(root, &name[0], 1);
+  if (key == 0) {
+    return;
+  }
+  var value: uint16[WMAX];
+  var kind: uint32 = path_kind_expand();
+  if (key_get(key, "Path", &value[0], &kind) != 0) {
+    if (path_entry_remove(&value[0], bin) != 0) {
+      key_set(key, "Path", &value[0], kind);
+    }
+  }
+  key_close(key);
+}
+
+fn classes_path(out: uint16*, name: cstring) {
+  key_path(out, "Software\\Classes\\");
+  wa(out, name);
+}
+
+fn register_association() -> int32 {
+  var root: int64 = root_for(g_everyone);
+  var path: uint16[WMAX];
+  var value: uint16[WMAX];
+  classes_path(&path[0], ".mettle");
+  var key: int64 = key_create(root, &path[0]);
+  if (key == 0) {
+    return 0;
+  }
+  var empty: cstring = "";
+  wc(&value[0], "MettleFile");
+  key_set_sz(key, empty, &value[0]);
+  key_close(key);
+  classes_path(&path[0], "MettleFile");
+  key = key_create(root, &path[0]);
+  if (key == 0) {
+    return 0;
+  }
+  wc(&value[0], "Mettle source");
+  key_set_sz(key, empty, &value[0]);
+  key_close(key);
+  classes_path(&path[0], "MettleFile\\DefaultIcon");
+  key = key_create(root, &path[0]);
+  if (key == 0) {
+    return 0;
+  }
+  wjoin(&value[0], &g_dir[0], "mettle.ico");
+  key_set_sz(key, empty, &value[0]);
+  key_close(key);
+  return 1;
+}
+
+fn remove_association() {
+  var root: int64 = root_for(g_everyone);
+  var path: uint16[WMAX];
+  classes_path(&path[0], "MettleFile");
+  key_delete_tree(root, &path[0]);
+  classes_path(&path[0], ".mettle");
+  var key: int64 = key_open(root, &path[0], 0);
+  if (key != 0) {
+    var value: uint16[WMAX];
+    var mine: int32 = 0;
+    var empty: cstring = "";
+    if (key_get(key, empty, &value[0], 0) != 0 && wsame_c(&value[0], "MettleFile") != 0) {
+      mine = 1;
+    }
+    key_close(key);
+    if (mine != 0) {
+      key_delete_tree(root, &path[0]);
+    }
+  }
+}
+
+fn register_install() {
+  var root: int64 = root_for(g_everyone);
+  var path: uint16[WMAX];
+  key_path(&path[0], UNINSTALL_NAME);
+  var key: int64 = key_create(root, &path[0]);
+  if (key == 0) {
+    fail("Could not write to the registry at", &path[0], last_error());
+    return;
+  }
+  var value: uint16[WMAX];
+  wc(&value[0], "Mettle ");
+  wadd(&value[0], &g_archive.version[0]);
+  key_set_sz(key, "DisplayName", &value[0]);
+  key_set_sz(key, "DisplayVersion", &g_archive.version[0]);
+  wc(&value[0], "The Mettle Project");
+  key_set_sz(key, "Publisher", &value[0]);
+  wc(&value[0], "https://github.com/The-Mettle-Project/Mettle");
+  key_set_sz(key, "URLInfoAbout", &value[0]);
+  key_set_sz(key, "InstallLocation", &g_dir[0]);
+  wjoin(&value[0], &g_dir[0], "mettle.ico");
+  key_set_sz(key, "DisplayIcon", &value[0]);
+  var flags: uint16[32];
+  flags[0] = 0;
+  if (g_everyone != 0) {
+    wa(&flags[0], " --everyone");
+  }
+  wc(&value[0], "\"");
+  wadd(&value[0], &g_dir[0]);
+  wa(&value[0], "\\uninstall.exe\"");
+  wadd(&value[0], &flags[0]);
+  key_set_sz(key, "UninstallString", &value[0]);
+  wa(&value[0], " --silent");
+  key_set_sz(key, "QuietUninstallString", &value[0]);
+  key_set_dword(key, "NoModify", 1);
+  key_set_dword(key, "NoRepair", 1);
+  key_set_dword(key, "EstimatedSize", (uint32)(g_archive.total / 1024));
+  key_close(key);
+  if (g_add_path != 0) {
+    var bin: uint16[WMAX];
+    wjoin(&bin[0], &g_dir[0], "bin");
+    if (add_to_path(&bin[0]) == 0) {
+      fail("Could not add Mettle to PATH. PATH is full or locked", 0, 0);
+      return;
+    }
+    var live: uint16[WMAX];
+    env_get(&live[0], "PATH");
+    if (path_entry_present(&live[0], &bin[0]) == 0) {
+      wa(&live[0], ";");
+      wadd(&live[0], &bin[0]);
+      env_set("PATH", &live[0]);
+    }
+    if (g_test_root[0] == 0) {
+      broadcast_environment();
+    }
+  }
+  if (g_associate != 0) {
+    if (register_association() != 0 && g_test_root[0] == 0) {
+      broadcast_associations();
+    }
+  }
+  g_phase = PHASE_VERIFY;
+}
+
+fn verify_install() {
+  var command: uint16[WMAX];
+  wc(&command[0], "\"");
+  wadd(&command[0], &g_dir[0]);
+  wa(&command[0], "\\bin\\mettle.exe\" --version");
+  var output: uint8[4096];
+  var code: int32 = 1;
+  var got: int32 = run_capture(&command[0], &g_dir[0], &output[0], 4096, &code);
+  if (got < 0 || code != 0) {
+    fail("Mettle installed, but it would not run from", &g_dir[0], 0);
+    return;
+  }
+  var line: int32 = 0;
+  while (line < got && output[line] != 10 && output[line] != 13) {
+    line += 1;
+  }
+  g_verify_output[0] = 0;
+  wadd_utf8(&g_verify_output[0], &output[0], line);
+  g_phase = PHASE_DONE;
+}
+
+export fn engine_step(budget_ms: float64) {
+  if (g_phase == PHASE_EXTRACT) {
+    extract_some(budget_ms);
+  } else if (g_phase == PHASE_REPLACE_OLD) {
+    replace_old();
+  } else if (g_phase == PHASE_SWAP) {
+    swap_in();
+  } else if (g_phase == PHASE_REGISTER) {
+    register_install();
+  } else if (g_phase == PHASE_VERIFY) {
+    verify_install();
+  } else if (g_phase == PHASE_REMOVE) {
+    remove_step();
+  }
+}
+
+export fn engine_cancel() {
+  close_current();
+  if (g_lzma_open != 0) {
+    lzma_close(&g_lzma);
+    g_lzma_open = 0;
+  }
+  if (g_staging[0] != 0) {
+    delete_tree(&g_staging[0]);
+  }
+  g_phase = PHASE_IDLE;
+  g_done_bytes = 0;
+}
+
+var g_remove_index: int32 = 0;
+
+export fn remove_start() -> int32 {
+  wtrim_slash(&g_dir[0]);
+  if (holds_mettle(&g_dir[0]) == 0) {
+    fail("Mettle is not installed in", &g_dir[0], 0);
+    return 0;
+  }
+  g_remove_index = 0;
+  g_done_bytes = 0;
+  g_phase = PHASE_REMOVE;
+  return 1;
+}
+
+fn remove_registry() {
+  var root: int64 = root_for(g_everyone);
+  var path: uint16[WMAX];
+  key_path(&path[0], UNINSTALL_NAME);
+  key_delete_tree(root, &path[0]);
+  var bin: uint16[WMAX];
+  wjoin(&bin[0], &g_dir[0], "bin");
+  remove_from_path(&bin[0]);
+  remove_association();
+  if (g_test_root[0] == 0) {
+    broadcast_environment();
+    broadcast_associations();
+  }
+}
+
+fn remove_step() {
+  if (g_remove_index < g_top_count) {
+    var live: uint16[WMAX];
+    wjoin_w(&live[0], &g_dir[0], &g_tops[g_remove_index][0]);
+    wcopy(&g_current[0], &g_tops[g_remove_index][0]);
+    if (delete_tree(&live[0]) == 0) {
+      fail("Could not remove", &live[0], last_error());
+      return;
+    }
+    g_remove_index += 1;
+    g_done_bytes = g_archive.total * (int64)g_remove_index / (int64)g_top_count;
+    return;
+  }
+  var own_copy: uint16[WMAX];
+  wjoin(&own_copy[0], &g_dir[0], "uninstall.exe");
+  delete_tree(&own_copy[0]);
+  remove_registry();
+  if (dir_only_holds(&g_dir[0], "uninstall.exe") == 0) {
+    g_files_left = 1;
+  }
+  remove_empty_dir(&g_dir[0]);
+  g_phase = PHASE_DONE;
+}

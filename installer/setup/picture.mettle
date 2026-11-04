@@ -1,0 +1,218 @@
+import "std/mem";
+import "std/math";
+import "system";
+import "lzma";
+
+const LUT_SIZE: int32 = 1024;
+const GROUND_R: float64 = 23.0;
+const GROUND_G: float64 = 24.0;
+const GROUND_B: float64 = 26.0;
+
+export const GROUND: uint32 = 0xFF17181A;
+
+const HALFTONE: int32[64] = [24, 10, 12, 26, 35, 47, 49, 37, 8, 0, 2, 14, 45, 59, 61, 51, 22, 6, 4, 16, 43, 57, 63, 53, 30, 20, 18, 28, 33, 41, 55, 39, 34, 46, 48, 36, 25, 11, 13, 27, 44, 58, 60, 50, 9, 1, 3, 15, 42, 56, 62, 52, 23, 7, 5, 17, 32, 40, 54, 38, 31, 21, 19, 29];
+
+export var g_font_bytes: uint8* = 0;
+export var g_font_size: int32 = 0;
+
+var g_image_w: int32 = 0;
+var g_image_h: int32 = 0;
+var g_luma: uint8* = 0;
+var g_blue: uint8* = 0;
+var g_red: uint8* = 0;
+var g_shape_lut: float32[LUT_SIZE];
+var g_gain_lut: float32[LUT_SIZE];
+
+var g_width: int32 = 0;
+var g_height: int32 = 0;
+var g_cell_shape: uint16* = 0;
+var g_cell_limit: uint16* = 0;
+var g_cell_ink: uint32* = 0;
+
+fn read_u32(p: uint8*) -> int32 {
+  return (int32)p[0] | ((int32)p[1] << 8) | ((int32)p[2] << 16) | ((int32)p[3] << 24);
+}
+
+export fn picture_load(art: uint8*, size: int64) {
+  g_image_w = read_u32(art);
+  g_image_h = read_u32(art + 4);
+  g_font_size = read_u32(art + 8);
+  g_font_bytes = art + 12;
+  var stream: uint8* = art + 12 + (int64)g_font_size;
+  var total: int64 = (int64)g_image_w * (int64)g_image_h + 2 * (int64)(g_image_w / 2) * (int64)(g_image_h / 2);
+  var out: uint8* = (uint8*)malloc(total);
+  var l: Lzma;
+  if (lzma_open(&l, stream, size - 12 - (int64)g_font_size) == 0) {
+    memset((rawptr)out, 40, total);
+  } else {
+    var at: int64 = 0;
+    while (at < total && l.failed == 0 && l.ended == 0) {
+      var ask: int64 = total - at;
+      if (ask > 1048576) {
+        ask = 1048576;
+      }
+      if (l.dict_pos == l.dict_cap) {
+        l.dict_pos = 0;
+      }
+      var start: int64 = l.dict_pos;
+      var got: int64 = lzma_run(&l, ask);
+      memcpy((rawptr)(out + at), (rawptr)(l.dict + start), got);
+      at = at + got;
+    }
+    lzma_close(&l);
+  }
+  g_luma = out;
+  g_blue = out + (int64)g_image_w * (int64)g_image_h;
+  g_red = g_blue + (int64)(g_image_w / 2) * (int64)(g_image_h / 2);
+  var i: int32 = 0;
+  while (i < LUT_SIZE) {
+    var lum: float64 = ((float64)i + 0.5) / (float64)LUT_SIZE;
+    g_shape_lut[i] = (float32)pow(lum, 0.62);
+    var floor_lum: float64 = lum;
+    if (floor_lum < 0.05) {
+      floor_lum = 0.05;
+    }
+    g_gain_lut[i] = (float32)(0.95 * pow(floor_lum, -0.38));
+    i += 1;
+  }
+}
+
+fn smooth(edge0: float64, edge1: float64, x: float64) -> float64 {
+  var t: float64 = (x - edge0) / (edge1 - edge0);
+  if (t < 0.0) {
+    t = 0.0;
+  }
+  if (t > 1.0) {
+    t = 1.0;
+  }
+  return t * t * (3.0 - 2.0 * t);
+}
+
+fn clamp01(x: float64) -> float64 {
+  if (x < 0.0) {
+    return 0.0;
+  }
+  if (x > 1.0) {
+    return 1.0;
+  }
+  return x;
+}
+
+fn sample(plane: uint8*, w: int32, h: int32, x: float64, y: float64) -> float64 {
+  var fx: float64 = x * (float64)w - 0.5;
+  var fy: float64 = y * (float64)h - 0.5;
+  if (fx < 0.0) {
+    fx = 0.0;
+  }
+  if (fy < 0.0) {
+    fy = 0.0;
+  }
+  var ix: int32 = (int32)fx;
+  var iy: int32 = (int32)fy;
+  if (ix > w - 2) {
+    ix = w - 2;
+  }
+  if (iy > h - 2) {
+    iy = h - 2;
+  }
+  var tx: float64 = fx - (float64)ix;
+  var ty: float64 = fy - (float64)iy;
+  var row: uint8* = plane + (int64)iy * (int64)w;
+  var a: float64 = (float64)row[ix] + ((float64)row[ix + 1] - (float64)row[ix]) * tx;
+  var below: uint8* = row + (int64)w;
+  var b: float64 = (float64)below[ix] + ((float64)below[ix + 1] - (float64)below[ix]) * tx;
+  return a + (b - a) * ty;
+}
+
+export fn picture_prepare(width: int32, height: int32, pitch: int32, clear: float64*, clear_count: int32, soft: float64) {
+  if (g_cell_shape != 0) {
+    free((rawptr)g_cell_shape);
+    free((rawptr)g_cell_limit);
+    free((rawptr)g_cell_ink);
+  }
+  g_width = width;
+  g_height = height;
+  var count: int64 = (int64)width * (int64)height;
+  g_cell_shape = (uint16*)malloc(count * 2);
+  g_cell_limit = (uint16*)malloc(count * 2);
+  g_cell_ink = (uint32*)malloc(count * 4);
+  var half_w: int32 = g_image_w / 2;
+  var half_h: int32 = g_image_h / 2;
+  var y: int32 = 0;
+  while (y < height) {
+    var cell_y: int32 = y / pitch;
+    var x: int32 = 0;
+    while (x < width) {
+      var cell_x: int32 = x / pitch;
+      var u: float64 = ((float64)(cell_x * pitch) + 0.5 * (float64)pitch) / (float64)width;
+      var v: float64 = ((float64)(cell_y * pitch) + 0.5 * (float64)pitch) / (float64)height;
+      var shape: uint16 = 0;
+      var ink: uint32 = GROUND;
+      var fade: float64 = 1.0;
+      var c: int32 = 0;
+      while (c < clear_count) {
+        var box: float64* = clear + (int64)(c * 4);
+        var gap_x: float64 = box[0] - (float64)x;
+        if ((float64)x - box[2] > gap_x) {
+          gap_x = (float64)x - box[2];
+        }
+        var gap_y: float64 = box[1] - (float64)y;
+        if ((float64)y - box[3] > gap_y) {
+          gap_y = (float64)y - box[3];
+        }
+        if (gap_x < 0.0) {
+          gap_x = 0.0;
+        }
+        if (gap_y < 0.0) {
+          gap_y = 0.0;
+        }
+        fade = fade * smooth(0.0, soft, sqrt(gap_x * gap_x + gap_y * gap_y));
+        c += 1;
+      }
+      if (fade > 0.0) {
+        var luma: float64 = sample(g_luma, g_image_w, g_image_h, u, v) / 255.0;
+        var cb: float64 = sample(g_blue, half_w, half_h, u, v) / 255.0 - 0.5;
+        var cr: float64 = sample(g_red, half_w, half_h, u, v) / 255.0 - 0.5;
+        var red: float64 = clamp01(luma + 1.402 * cr);
+        var green: float64 = clamp01(luma - 0.344136 * cb - 0.714136 * cr);
+        var blue: float64 = clamp01(luma + 1.772 * cb);
+        var lum: float64 = 0.299 * red + 0.587 * green + 0.114 * blue;
+        var slot: int32 = (int32)(lum * (float64)LUT_SIZE);
+        if (slot >= LUT_SIZE) {
+          slot = LUT_SIZE - 1;
+        }
+        var gain: float64 = (float64)g_gain_lut[slot];
+        var ink_r: float64 = clamp01((lum + (red - lum) * 1.25) * gain);
+        var ink_g: float64 = clamp01((lum + (green - lum) * 1.25) * gain);
+        var ink_b: float64 = clamp01((lum + (blue - lum) * 1.25) * gain);
+        ink = 0xFF000000 | ((uint32)(ink_r * 255.0) << 16) | ((uint32)(ink_g * 255.0) << 8) | (uint32)(ink_b * 255.0);
+        var shaped: float64 = (float64)g_shape_lut[slot] * fade;
+        shape = (uint16)(shaped * 65535.0);
+      }
+      var row: int32 = height - 1 - cell_y;
+      var limit: int32 = HALFTONE[(cell_x & 7) + (row & 7) * 8];
+      var threshold: int32 = limit * 1024 + 2228;
+      var at: int64 = (int64)y * (int64)width + (int64)x;
+      g_cell_shape[at] = shape;
+      g_cell_limit[at] = (uint16)threshold;
+      g_cell_ink[at] = ink;
+      x += 1;
+    }
+    y += 1;
+  }
+}
+
+export fn picture_draw(out: uint32*, exposure: float64) {
+  var gain: int64 = (int64)(exposure * 256.0);
+  var count: int64 = (int64)g_width * (int64)g_height;
+  var i: int64 = 0;
+  while (i < count) {
+    var value: int64 = ((int64)g_cell_shape[i] * gain) >> 8;
+    if (value > (int64)g_cell_limit[i]) {
+      out[i] = g_cell_ink[i];
+    } else {
+      out[i] = GROUND;
+    }
+    i += 1;
+  }
+}

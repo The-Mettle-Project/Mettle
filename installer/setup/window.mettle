@@ -1,0 +1,1660 @@
+import "std/mem";
+import "system";
+import "engine";
+import "picture";
+
+const LOGICAL_W: int32 = 900;
+const LOGICAL_H: int32 = 560;
+const TABLE_X: int32 = 476;
+const TABLE_W: int32 = 388;
+const LABEL_W: int32 = 76;
+const ROW_H: int32 = 38;
+const ACTION_Y: int32 = 478;
+const ACTION_H: int32 = 46;
+const LEFT_X: int32 = 36;
+const LEFT_W: int32 = 410;
+const HEAD_Y: int32 = 412;
+const SUB_Y: int32 = 478;
+const NOTE_Y: int32 = 502;
+
+const PAGE_READY: int32 = 0;
+const PAGE_WORK: int32 = 1;
+const PAGE_DONE: int32 = 2;
+const PAGE_FAILED: int32 = 3;
+const PAGE_REMOVE: int32 = 4;
+const PAGE_REMOVING: int32 = 5;
+const PAGE_REMOVED: int32 = 6;
+
+const W_NONE: int32 = 0;
+const W_CLOSE: int32 = 1;
+const W_PRIMARY: int32 = 2;
+const W_SECONDARY: int32 = 3;
+const W_CHANGE: int32 = 4;
+const W_JUST_ME: int32 = 5;
+const W_EVERYONE: int32 = 6;
+const W_PATH: int32 = 7;
+const W_ASSOCIATE: int32 = 8;
+const W_LICENSE: int32 = 9;
+const W_DOCS: int32 = 10;
+const W_MINIMIZE: int32 = 11;
+const WIDGETS: int32 = 12;
+
+const F_BODY: int32 = 0;
+const F_SMALL: int32 = 1;
+const F_BUTTON: int32 = 2;
+const F_MONO: int32 = 3;
+const F_ICON: int32 = 4;
+const F_HEAD: int32 = 5;
+const FONTS: int32 = 6;
+
+const INK: uint32 = 0x00E9EFF1;
+const INK_2: uint32 = 0x009FA6A8;
+const FAINT: uint32 = 0x003A3633;
+const GROUND_REF: uint32 = 0x001A1817;
+const ERROR_INK: uint32 = 0x008394F3;
+const HOVER_FILL: uint32 = 0x002B2826;
+
+const WM_DESTROY: uint32 = 2;
+const WM_SIZE: uint32 = 5;
+const WM_PAINT: uint32 = 15;
+const WM_CLOSE: uint32 = 16;
+const WM_ERASEBKGND: uint32 = 20;
+const WM_SETCURSOR: uint32 = 32;
+const WM_NCCALCSIZE: uint32 = 131;
+const WM_NCHITTEST: uint32 = 132;
+const WM_KEYDOWN: uint32 = 256;
+const WM_MOUSEMOVE: uint32 = 512;
+const WM_LBUTTONDOWN: uint32 = 513;
+const WM_LBUTTONUP: uint32 = 514;
+const WM_MOUSELEAVE: uint32 = 675;
+const WM_DPICHANGED: uint32 = 736;
+const WM_QUIT: uint32 = 18;
+const VK_TAB: int64 = 9;
+const VK_RETURN: int64 = 13;
+const VK_ESCAPE: int64 = 27;
+const VK_SPACE: int64 = 32;
+const VK_SHIFT: int32 = 16;
+const HTCLIENT: int64 = 1;
+const HTCAPTION: int64 = 2;
+const WINDOW_STYLE: uint32 = 0x80CA0000;
+const SW_SHOW: int32 = 5;
+const SWP_RECOMPUTE_FRAME: uint32 = 0x0027;
+const PM_REMOVE: uint32 = 1;
+const SRCCOPY: uint32 = 0x00CC0020;
+const TRANSPARENT: int32 = 1;
+const DT_CENTER: uint32 = 1;
+const DT_RIGHT: uint32 = 2;
+const DT_VCENTER: uint32 = 4;
+const DT_WORDBREAK: uint32 = 0x10;
+const DT_SINGLELINE: uint32 = 0x20;
+const DT_NOPREFIX: uint32 = 0x800;
+const DT_EDIT_CONTROL: uint32 = 0x2000;
+const DT_PATH_ELLIPSIS: uint32 = 0x4000;
+const DT_END_ELLIPSIS: uint32 = 0x8000;
+const TME_LEAVE: uint32 = 2;
+const DPI_PER_MONITOR_V2: int64 = -4;
+const DWMWA_DARK: uint32 = 20;
+const DWMWA_CORNER: uint32 = 33;
+const DWMWA_BORDER: uint32 = 34;
+const CLEARTYPE_NATURAL: uint32 = 6;
+const ANTIALIASED: uint32 = 4;
+const COINIT_APARTMENT: uint32 = 2;
+const CLSCTX_ALL: uint32 = 23;
+const FOS_PICKFOLDERS: uint32 = 0x20;
+const FOS_FORCEFILESYSTEM: uint32 = 0x40;
+const SIGDN_FILESYSPATH: uint32 = 0x80058000;
+
+struct Rect {
+  left: int32;
+  top: int32;
+  right: int32;
+  bottom: int32;
+}
+
+struct Point {
+  x: int32;
+  y: int32;
+}
+
+struct Size {
+  cx: int32;
+  cy: int32;
+}
+
+struct Message {
+  window: int64;
+  message: uint32;
+  wparam: int64;
+  lparam: int64;
+  time: uint32;
+  point: Point;
+  private_data: uint32;
+}
+
+struct PaintStruct {
+  dc: int64;
+  erase: int32;
+  paint: Rect;
+  restore: int32;
+  update: int32;
+  reserved: uint8[32];
+}
+
+struct WindowClass {
+  size: uint32;
+  style: uint32;
+  proc: fn(int64, uint32, int64, int64) -> int64;
+  class_extra: int32;
+  window_extra: int32;
+  instance: int64;
+  icon: int64;
+  cursor: int64;
+  background: int64;
+  menu_name: int64;
+  class_name: uint16*;
+  small_icon: int64;
+}
+
+struct BitmapHeader {
+  size: uint32;
+  width: int32;
+  height: int32;
+  planes: uint16;
+  bit_count: uint16;
+  compression: uint32;
+  size_image: uint32;
+  x_pels: int32;
+  y_pels: int32;
+  clr_used: uint32;
+  clr_important: uint32;
+}
+
+struct TrackMouse {
+  size: uint32;
+  flags: uint32;
+  target: int64;
+  hover: uint32;
+}
+
+struct Guid {
+  a: uint32;
+  b: uint16;
+  c: uint16;
+  d: uint8[8];
+}
+
+extern fn GetModuleHandleW(name: int64) -> int64 = "GetModuleHandleW";
+extern fn RegisterClassExW(info: WindowClass*) -> uint16 = "RegisterClassExW";
+extern fn CreateWindowExW(ex_style: uint32, class_name: uint16*, title: uint16*, style: uint32, x: int32, y: int32, w: int32, h: int32, parent: int64, menu: int64, instance: int64, param: int64) -> int64 = "CreateWindowExW";
+extern fn DefWindowProcW(window: int64, message: uint32, wparam: int64, lparam: int64) -> int64 = "DefWindowProcW";
+extern fn DestroyWindow(window: int64) -> int32 = "DestroyWindow";
+extern fn ShowWindow(window: int64, how: int32) -> int32 = "ShowWindow";
+extern fn UpdateWindow(window: int64) -> int32 = "UpdateWindow";
+extern fn PeekMessageW(message: Message*, window: int64, low: uint32, high: uint32, remove: uint32) -> int32 = "PeekMessageW";
+extern fn WaitMessage() -> int32 = "WaitMessage";
+extern fn TranslateMessage(message: Message*) -> int32 = "TranslateMessage";
+extern fn DispatchMessageW(message: Message*) -> int64 = "DispatchMessageW";
+extern fn PostQuitMessage(code: int32) = "PostQuitMessage";
+extern fn GetDC(window: int64) -> int64 = "GetDC";
+extern fn ReleaseDC(window: int64, dc: int64) -> int32 = "ReleaseDC";
+extern fn BeginPaint(window: int64, paint: PaintStruct*) -> int64 = "BeginPaint";
+extern fn EndPaint(window: int64, paint: PaintStruct*) -> int32 = "EndPaint";
+extern fn GetSystemMetrics(index: int32) -> int32 = "GetSystemMetrics";
+extern fn GetWindowRect(window: int64, rect: Rect*) -> int32 = "GetWindowRect";
+extern fn GetDpiForWindow(window: int64) -> uint32 = "GetDpiForWindow";
+extern fn GetDpiForSystem() -> uint32 = "GetDpiForSystem";
+extern fn SetWindowPos(window: int64, after: int64, x: int32, y: int32, w: int32, h: int32, flags: uint32) -> int32 = "SetWindowPos";
+extern fn SetProcessDpiAwarenessContext(context: int64) -> int32 = "SetProcessDpiAwarenessContext";
+extern fn SetCursor(cursor: int64) -> int64 = "SetCursor";
+extern fn LoadCursorW(instance: int64, name: int64) -> int64 = "LoadCursorW";
+extern fn LoadIconW(instance: int64, name: int64) -> int64 = "LoadIconW";
+extern fn TrackMouseEvent(track: TrackMouse*) -> int32 = "TrackMouseEvent";
+extern fn SetCapture(window: int64) -> int64 = "SetCapture";
+extern fn ReleaseCapture() -> int32 = "ReleaseCapture";
+extern fn GetKeyState(key: int32) -> int16 = "GetKeyState";
+extern fn CreateDIBSection(dc: int64, info: BitmapHeader*, usage: uint32, bits: rawptr*, section: int64, offset: uint32) -> int64 = "CreateDIBSection";
+extern fn CreateCompatibleDC(dc: int64) -> int64 = "CreateCompatibleDC";
+extern fn SelectObject(dc: int64, object: int64) -> int64 = "SelectObject";
+extern fn DeleteObject(object: int64) -> int32 = "DeleteObject";
+extern fn DeleteDC(dc: int64) -> int32 = "DeleteDC";
+extern fn BitBlt(dest: int64, x: int32, y: int32, w: int32, h: int32, source: int64, sx: int32, sy: int32, rop: uint32) -> int32 = "BitBlt";
+extern fn GdiFlush() -> int32 = "GdiFlush";
+extern fn SetBkMode(dc: int64, mode: int32) -> int32 = "SetBkMode";
+extern fn SetTextColor(dc: int64, color: uint32) -> uint32 = "SetTextColor";
+extern fn DrawTextW(dc: int64, text: uint16*, length: int32, rect: Rect*, format: uint32) -> int32 = "DrawTextW";
+extern fn TextOutW(dc: int64, x: int32, y: int32, text: uint16*, length: int32) -> int32 = "TextOutW";
+extern fn GetTextExtentPoint32W(dc: int64, text: uint16*, length: int32, size: Size*) -> int32 = "GetTextExtentPoint32W";
+extern fn CreateFontW(height: int32, width: int32, escapement: int32, orientation: int32, weight: int32, italic: uint32, underline: uint32, strike: uint32, charset: uint32, precision: uint32, clip: uint32, quality: uint32, pitch: uint32, face: uint16*) -> int64 = "CreateFontW";
+extern fn AddFontMemResourceEx(data: uint8*, size: uint32, reserved: int64, count: uint32*) -> int64 = "AddFontMemResourceEx";
+extern fn DwmSetWindowAttribute(window: int64, attribute: uint32, value: rawptr, size: uint32) -> int32 = "DwmSetWindowAttribute";
+extern fn DwmFlush() -> int32 = "DwmFlush";
+extern fn CoInitializeEx(reserved: int64, flags: uint32) -> int32 = "CoInitializeEx";
+extern fn CoCreateInstance(clsid: Guid*, outer: int64, context: uint32, iid: Guid*, out: int64*) -> int32 = "CoCreateInstance";
+extern fn CoTaskMemFree(memory: rawptr) = "CoTaskMemFree";
+extern fn SHCreateItemFromParsingName(path: uint16*, context: int64, iid: Guid*, out: int64*) -> int32 = "SHCreateItemFromParsingName";
+
+var g_window: int64 = 0;
+var g_scale: float64 = 1.0;
+var g_width: int32 = 0;
+var g_height: int32 = 0;
+var g_dc: int64 = 0;
+var g_bitmap: int64 = 0;
+var g_old_bitmap: int64 = 0;
+var g_pixels: uint32* = 0;
+var g_previous: uint32* = 0;
+var g_big_dc: int64 = 0;
+var g_big_bitmap: int64 = 0;
+var g_big_pixels: uint32* = 0;
+var g_big_w: int32 = 0;
+var g_big_h: int32 = 0;
+var g_fonts: int64[FONTS];
+var g_mark: uint8* = 0;
+var g_mark_size: int32 = 0;
+var g_placed: int32 = 0;
+var g_place_x: int32 = 0;
+var g_place_y: int32 = 0;
+
+var g_page: int32 = PAGE_READY;
+var g_uninstall_mode: int32 = 0;
+var g_start_now: int32 = 0;
+var g_exit_code: int32 = 0;
+var g_exposure: float64 = 0.0;
+var g_exposure_target: float64 = 0.62;
+var g_fade: float64 = 1.0;
+var g_progress_shown: float64 = 0.0;
+var g_last_frame: float64 = 0.0;
+var g_mouse_x: int32 = -1;
+var g_mouse_y: int32 = -1;
+var g_mouse_inside: int32 = 0;
+var g_hot: int32 = W_NONE;
+var g_pressed: int32 = W_NONE;
+var g_focus: int32 = W_NONE;
+var g_focus_visible: int32 = 0;
+var g_action: int32 = W_NONE;
+var g_dirty: int32 = 1;
+var g_hover: float64[WIDGETS];
+var g_rect_left: int32[WIDGETS];
+var g_rect_top: int32[WIDGETS];
+var g_rect_right: int32[WIDGETS];
+var g_rect_bottom: int32[WIDGETS];
+var g_rect_live: int32[WIDGETS];
+var g_prior_install: Existing;
+var g_running: int32 = 1;
+
+fn S(value: int32) -> int32 {
+  return (int32)((float64)value * g_scale + 0.5);
+}
+
+export fn window_place(x: int32, y: int32) {
+  g_placed = 1;
+  g_place_x = x;
+  g_place_y = y;
+}
+
+export fn window_note_existing(prior: Existing*) {
+  memcpy((rawptr)&g_prior_install, (rawptr)prior, (int64)sizeof(Existing));
+}
+
+export fn window_set_mode(uninstalling: int32, start_now: int32) {
+  g_uninstall_mode = uninstalling;
+  g_start_now = start_now;
+  if (uninstalling != 0) {
+    g_page = PAGE_REMOVE;
+  } else {
+    g_page = PAGE_READY;
+  }
+}
+
+fn make_font(index: int32, height: int32, weight: int32, face: cstring, quality: uint32) {
+  var wide: uint16[64];
+  wc(&wide[0], face);
+  g_fonts[index] = CreateFontW(-height, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, quality, 0, &wide[0]);
+}
+
+fn build_mark(size: int32) {
+  if (g_mark != 0) {
+    free((rawptr)g_mark);
+  }
+  g_mark_size = size;
+  g_mark = (uint8*)malloc((int64)size * (int64)size);
+  var paths: float32[66] = [
+    56.4, 63.7, 69.5, 34.8, 113.7, 32.3, 133.5, 51.0, 122.3, 74.9, 130.2, 88.3, 147.6, 48.0, 119.6, 20.8, 62.531, 23.38, 42.4, 63.7,
+    60.6, 63.7, 68.9, 57.7, 95.6, 57.7, 108.9, 63.6,
+    47.9, 67.0, 109.2, 88.8, 114.3, 97.6, 138.0, 109.5, 114.2, 66.9,
+    140.4, 114.6, 46.3, 69.5, 43.4, 75.5, 87.1, 117.3, 63.5, 117.4, 42.7, 77.1, 18.5, 129.0, 148.2, 128.9,
+    14.2, 63.0, 2.1, 68.5, 3.5, 70.6, 26.6, 103.0, 40.5, 73.9
+  ];
+  var hole: float32[6] = [28.9, 85.3, 11.6, 65.4, 36.0, 75.7];
+  var counts: int32[5] = [10, 4, 5, 8, 5];
+  var y: int32 = 0;
+  var unit: float64 = 150.0 / (float64)size;
+  while (y < size) {
+    var x: int32 = 0;
+    while (x < size) {
+      var hits: int32 = 0;
+      var sy: int32 = 0;
+      while (sy < 4) {
+        var sx: int32 = 0;
+        while (sx < 4) {
+          var px: float64 = ((float64)x + ((float64)sx + 0.5) / 4.0) * unit;
+          var py: float64 = ((float64)y + ((float64)sy + 0.5) / 4.0) * unit;
+          var inside: int32 = 0;
+          var base: int32 = 0;
+          var shape: int32 = 0;
+          while (shape < 5) {
+            var count: int32 = counts[shape];
+            var flip: int32 = polygon_crossings(&paths[base], count, px, py);
+            if (shape == 4) {
+              flip = flip + polygon_crossings(&hole[0], 3, px, py);
+            }
+            if ((flip & 1) != 0) {
+              inside = 1;
+            }
+            base = base + count * 2;
+            shape += 1;
+          }
+          hits = hits + inside;
+          sx += 1;
+        }
+        sy += 1;
+      }
+      g_mark[(int64)y * (int64)size + (int64)x] = (uint8)(hits * 255 / 16);
+      x += 1;
+    }
+    y += 1;
+  }
+}
+
+fn polygon_crossings(points: float32*, count: int32, px: float64, py: float64) -> int32 {
+  var crossings: int32 = 0;
+  var i: int32 = 0;
+  while (i < count) {
+    var j: int32 = (i + 1) % count;
+    var x0: float64 = (float64)points[i * 2];
+    var y0: float64 = (float64)points[i * 2 + 1];
+    var x1: float64 = (float64)points[j * 2];
+    var y1: float64 = (float64)points[j * 2 + 1];
+    if ((y0 > py) != (y1 > py)) {
+      var at: float64 = x0 + (py - y0) * (x1 - x0) / (y1 - y0);
+      if (px < at) {
+        crossings += 1;
+      }
+    }
+    i += 1;
+  }
+  return crossings;
+}
+
+fn release_surface() {
+  if (g_dc != 0) {
+    SelectObject(g_dc, g_old_bitmap);
+    DeleteObject(g_bitmap);
+    DeleteDC(g_dc);
+    g_dc = 0;
+    free((rawptr)g_previous);
+  }
+  if (g_big_dc != 0) {
+    DeleteObject(g_big_bitmap);
+    DeleteDC(g_big_dc);
+    g_big_dc = 0;
+  }
+  var i: int32 = 0;
+  while (i < FONTS) {
+    if (g_fonts[i] != 0) {
+      DeleteObject(g_fonts[i]);
+      g_fonts[i] = 0;
+    }
+    i += 1;
+  }
+}
+
+fn make_dib(dc: int64, width: int32, height: int32, bits: uint32**) -> int64 {
+  var header: BitmapHeader;
+  memset((rawptr)&header, 0, (int64)sizeof(BitmapHeader));
+  header.size = (uint32)sizeof(BitmapHeader);
+  header.width = width;
+  header.height = -height;
+  header.planes = 1;
+  header.bit_count = 32;
+  var raw: rawptr = 0;
+  var bitmap: int64 = CreateDIBSection(dc, &header, 0, &raw, 0, 0);
+  bits[0] = (uint32*)raw;
+  return bitmap;
+}
+
+fn set_clear(out: float64*, index: int32, x0: int32, y0: int32, x1: int32, y1: int32) {
+  out[index * 4] = (float64)S(x0);
+  out[index * 4 + 1] = (float64)S(y0);
+  out[index * 4 + 2] = (float64)S(x1);
+  out[index * 4 + 3] = (float64)S(y1);
+}
+
+fn build_surface(scale_percent: int32) {
+  release_surface();
+  g_scale = (float64)scale_percent / 100.0;
+  g_width = S(LOGICAL_W);
+  g_height = S(LOGICAL_H);
+  g_dc = CreateCompatibleDC(0);
+  g_bitmap = make_dib(g_dc, g_width, g_height, &g_pixels);
+  g_old_bitmap = SelectObject(g_dc, g_bitmap);
+  g_previous = (uint32*)malloc((int64)g_width * (int64)g_height * 4);
+  SetBkMode(g_dc, TRANSPARENT);
+  g_big_w = S(LEFT_W) * 4;
+  g_big_h = S(80) * 4;
+  g_big_dc = CreateCompatibleDC(0);
+  g_big_bitmap = make_dib(g_big_dc, g_big_w, g_big_h, &g_big_pixels);
+  SelectObject(g_big_dc, g_big_bitmap);
+  SetBkMode(g_big_dc, TRANSPARENT);
+  make_font(F_BODY, S(14), 400, "Segoe UI", CLEARTYPE_NATURAL);
+  make_font(F_SMALL, S(12), 400, "Segoe UI", CLEARTYPE_NATURAL);
+  make_font(F_BUTTON, S(14), 600, "Segoe UI", CLEARTYPE_NATURAL);
+  make_font(F_MONO, S(13), 400, "Consolas", CLEARTYPE_NATURAL);
+  make_font(F_ICON, S(10), 400, "Segoe MDL2 Assets", ANTIALIASED);
+  make_font(F_HEAD, S(50) * 4, 400, "Geist Serif", ANTIALIASED);
+  build_mark(S(44));
+  var clear: float64[16];
+  set_clear(&clear[0], 0, 26, 22, 74, 70);
+  set_clear(&clear[0], 1, LOGICAL_W - 90, 0, LOGICAL_W, 36);
+  set_clear(&clear[0], 2, 0, HEAD_Y + 8, LEFT_X + LEFT_W, LOGICAL_H);
+  set_clear(&clear[0], 3, TABLE_X, ACTION_Y - ROW_H * 4, LOGICAL_W, LOGICAL_H);
+  var pitch: int32 = (int32)g_scale;
+  if (pitch < 1) {
+    pitch = 1;
+  }
+  picture_prepare(g_width, g_height, pitch, &clear[0], 4, (float64)S(58));
+  g_dirty = 1;
+}
+
+fn lerp_color(a: uint32, b: uint32, t: float64) -> uint32 {
+  var ar: int32 = (int32)(a & 255);
+  var ag: int32 = (int32)((a >> 8) & 255);
+  var ab: int32 = (int32)((a >> 16) & 255);
+  var br: int32 = (int32)(b & 255);
+  var bg: int32 = (int32)((b >> 8) & 255);
+  var bb: int32 = (int32)((b >> 16) & 255);
+  var r: int32 = ar + (int32)((float64)(br - ar) * t);
+  var g: int32 = ag + (int32)((float64)(bg - ag) * t);
+  var c: int32 = ab + (int32)((float64)(bb - ab) * t);
+  return (uint32)r | ((uint32)g << 8) | ((uint32)c << 16);
+}
+
+fn text_w(font: int32, x: int32, y: int32, w: int32, h: int32, text: uint16*, color: uint32, flags: uint32) {
+  var rect: Rect;
+  rect.left = x;
+  rect.top = y;
+  rect.right = x + w;
+  rect.bottom = y + h;
+  SelectObject(g_dc, g_fonts[font]);
+  SetTextColor(g_dc, color);
+  DrawTextW(g_dc, text, -1, &rect, flags | DT_NOPREFIX);
+}
+
+fn text_c(font: int32, x: int32, y: int32, w: int32, h: int32, text: cstring, color: uint32, flags: uint32) {
+  var wide: uint16[WMAX];
+  wc(&wide[0], text);
+  text_w(font, x, y, w, h, &wide[0], color, flags);
+}
+
+fn fill_rect(x: int32, y: int32, w: int32, h: int32, color: uint32) {
+  var pixel: uint32 = 0xFF000000 | ((color & 255) << 16) | (color & 0xFF00) | ((color >> 16) & 255);
+  var yy: int32 = y;
+  while (yy < y + h) {
+    if (yy >= 0 && yy < g_height) {
+      var row: uint32* = g_pixels + (int64)yy * (int64)g_width;
+      var xx: int32 = x;
+      while (xx < x + w) {
+        if (xx >= 0 && xx < g_width) {
+          row[xx] = pixel;
+        }
+        xx += 1;
+      }
+    }
+    yy += 1;
+  }
+}
+
+fn outline_rect(x: int32, y: int32, w: int32, h: int32, thick: int32, color: uint32) {
+  fill_rect(x, y, w, thick, color);
+  fill_rect(x, y + h - thick, w, thick, color);
+  fill_rect(x, y, thick, h, color);
+  fill_rect(x + w - thick, y, thick, h, color);
+}
+
+fn big_text(font: int32, x: int32, y: int32, text: uint16*, color: uint32) {
+  var length: int32 = wlen(text);
+  SelectObject(g_big_dc, g_fonts[font]);
+  var extent: Size;
+  GetTextExtentPoint32W(g_big_dc, text, length, &extent);
+  var w4: int32 = extent.cx + 8;
+  var h4: int32 = extent.cy;
+  if (w4 > g_big_w) {
+    w4 = g_big_w;
+  }
+  if (h4 > g_big_h) {
+    h4 = g_big_h;
+  }
+  memset((rawptr)g_big_pixels, 0, (int64)g_big_w * (int64)g_big_h * 4);
+  SetTextColor(g_big_dc, 0x00FFFFFF);
+  TextOutW(g_big_dc, 0, 0, text, length);
+  GdiFlush();
+  var r: int32 = (int32)(color & 255);
+  var g: int32 = (int32)((color >> 8) & 255);
+  var b: int32 = (int32)((color >> 16) & 255);
+  var yy: int32 = 0;
+  while (yy * 4 < h4) {
+    var dy: int32 = y + yy;
+    if (dy >= 0 && dy < g_height) {
+      var row: uint32* = g_pixels + (int64)dy * (int64)g_width;
+      var xx: int32 = 0;
+      while (xx * 4 < w4) {
+        var dx: int32 = x + xx;
+        if (dx >= 0 && dx < g_width) {
+          var sum: int32 = 0;
+          var sy: int32 = 0;
+          while (sy < 4) {
+            var source: uint32* = g_big_pixels + (int64)(yy * 4 + sy) * (int64)g_big_w + (int64)(xx * 4);
+            sum = sum + (int32)(source[0] & 255) + (int32)(source[1] & 255) + (int32)(source[2] & 255) + (int32)(source[3] & 255);
+            sy += 1;
+          }
+          var alpha: int32 = sum / 16;
+          if (alpha > 0) {
+            var d: uint32 = row[dx];
+            var dr: int32 = (int32)((d >> 16) & 255);
+            var dg: int32 = (int32)((d >> 8) & 255);
+            var db: int32 = (int32)(d & 255);
+            dr = dr + (r - dr) * alpha / 255;
+            dg = dg + (g - dg) * alpha / 255;
+            db = db + (b - db) * alpha / 255;
+            row[dx] = 0xFF000000 | ((uint32)dr << 16) | ((uint32)dg << 8) | (uint32)db;
+          }
+        }
+        xx += 1;
+      }
+    }
+    yy += 1;
+  }
+}
+
+fn draw_mark(x: int32, y: int32, color: uint32) {
+  draw_mask(g_mark, g_mark_size, x, y, color);
+}
+
+fn draw_mask(pixels: uint8*, size: int32, x: int32, y: int32, color: uint32) {
+  var r: int32 = (int32)(color & 255);
+  var g: int32 = (int32)((color >> 8) & 255);
+  var b: int32 = (int32)((color >> 16) & 255);
+  var yy: int32 = 0;
+  while (yy < size) {
+    var row: uint32* = g_pixels + (int64)(y + yy) * (int64)g_width + (int64)x;
+    var mask: uint8* = pixels + (int64)yy * (int64)size;
+    var xx: int32 = 0;
+    while (xx < size) {
+      var alpha: int32 = (int32)mask[xx];
+      if (alpha > 0) {
+        var d: uint32 = row[xx];
+        var dr: int32 = (int32)((d >> 16) & 255);
+        var dg: int32 = (int32)((d >> 8) & 255);
+        var db: int32 = (int32)(d & 255);
+        dr = dr + (r - dr) * alpha / 255;
+        dg = dg + (g - dg) * alpha / 255;
+        db = db + (b - db) * alpha / 255;
+        row[xx] = 0xFF000000 | ((uint32)dr << 16) | ((uint32)dg << 8) | (uint32)db;
+      }
+      xx += 1;
+    }
+    yy += 1;
+  }
+}
+
+fn widget(id: int32, x: int32, y: int32, w: int32, h: int32) {
+  g_rect_left[id] = x;
+  g_rect_top[id] = y;
+  g_rect_right[id] = x + w;
+  g_rect_bottom[id] = y + h;
+  g_rect_live[id] = 1;
+  if (g_focus_visible != 0 && g_focus == id) {
+    outline_rect(x - S(3), y - S(3), w + S(6), h + S(6), 1, INK_2);
+  }
+}
+
+fn widget_at(x: int32, y: int32) -> int32 {
+  var i: int32 = 1;
+  while (i < WIDGETS) {
+    if (g_rect_live[i] != 0 && x >= g_rect_left[i] && x < g_rect_right[i] && y >= g_rect_top[i] && y < g_rect_bottom[i]) {
+      return i;
+    }
+    i += 1;
+  }
+  return W_NONE;
+}
+
+fn draw_title_buttons() {
+  var size: int32 = S(44);
+  var x: int32 = g_width - size;
+  var hover: float64 = g_hover[W_CLOSE];
+  if (hover > 0.01) {
+    fill_rect(x, 0, size, S(36), lerp_color(GROUND_REF, 0x00232BC4, hover));
+  }
+  widget(W_CLOSE, x, 0, size, S(36));
+  var glyph: uint16[2];
+  glyph[0] = 0xE8BB;
+  glyph[1] = 0;
+  text_w(F_ICON, x, 0, size, S(36), &glyph[0], lerp_color(INK_2, INK, hover), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  x = x - size;
+  var hover_min: float64 = g_hover[W_MINIMIZE];
+  if (hover_min > 0.01) {
+    fill_rect(x, 0, size, S(36), lerp_color(GROUND_REF, 0x00403B38, hover_min));
+  }
+  widget(W_MINIMIZE, x, 0, size, S(36));
+  glyph[0] = 0xE921;
+  text_w(F_ICON, x, 0, size, S(36), &glyph[0], lerp_color(INK_2, INK, hover_min), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+fn action(id: int32, label: cstring) {
+  var x: int32 = S(TABLE_X);
+  var y: int32 = S(ACTION_Y);
+  var w: int32 = S(TABLE_W);
+  var h: int32 = S(ACTION_H);
+  var color: uint32 = lerp_color(INK, 0x00FFFFFF, g_hover[id]);
+  if (g_pressed == id) {
+    color = 0x00C8CED0;
+  }
+  fill_rect(x, y, w, h, color);
+  widget(id, x, y, w, h);
+  text_c(F_BUTTON, x + S(LABEL_W), y, w - S(LABEL_W), h, label, GROUND_REF, DT_VCENTER | DT_SINGLELINE);
+}
+
+fn quiet_action(id: int32, label: cstring) {
+  var x: int32 = S(TABLE_X);
+  var y: int32 = S(ACTION_Y);
+  var w: int32 = S(TABLE_W);
+  var h: int32 = S(ACTION_H);
+  var hover: float64 = g_hover[id];
+  if (hover > 0.01) {
+    fill_rect(x, y, w, h, lerp_color(GROUND_REF, HOVER_FILL, hover));
+  }
+  fill_rect(x, y, w, S(1), FAINT);
+  fill_rect(x, y + h - S(1), w, S(1), FAINT);
+  widget(id, x, y, w, h);
+  text_c(F_BUTTON, x + S(LABEL_W), y, w - S(LABEL_W), h, label, INK, DT_VCENTER | DT_SINGLELINE);
+}
+
+fn row_y(from_action: int32) -> int32 {
+  return S(ACTION_Y) - S(ROW_H) * from_action;
+}
+
+fn row_frame(id: int32, y: int32, label: cstring) {
+  var x: int32 = S(TABLE_X);
+  var w: int32 = S(TABLE_W);
+  var h: int32 = S(ROW_H);
+  if (id != W_NONE) {
+    var hover: float64 = g_hover[id];
+    if (hover > 0.01) {
+      fill_rect(x, y, w, h, lerp_color(GROUND_REF, HOVER_FILL, hover));
+    }
+    widget(id, x, y, w, h);
+  }
+  fill_rect(x, y, w, S(1), FAINT);
+  text_c(F_BODY, x, y, S(LABEL_W), h, label, INK_2, DT_VCENTER | DT_SINGLELINE);
+}
+
+fn row_value(y: int32, text: uint16*, flags: uint32, room: int32) {
+  text_w(F_BODY, S(TABLE_X + LABEL_W), y, S(TABLE_W - LABEL_W - room), S(ROW_H), text, INK, DT_VCENTER | DT_SINGLELINE | flags);
+}
+
+fn row_value_c(y: int32, text: cstring, room: int32) {
+  text_c(F_BODY, S(TABLE_X + LABEL_W), y, S(TABLE_W - LABEL_W - room), S(ROW_H), text, INK, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+fn row_right(y: int32, text: cstring, color: uint32) {
+  text_c(F_BODY, S(TABLE_X), y, S(TABLE_W), S(ROW_H), text, color, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+}
+
+fn toggle_row(id: int32, y: int32, label: cstring, value: cstring, on: int32) {
+  row_frame(id, y, label);
+  row_value_c(y, value, 40);
+  if (on != 0) {
+    row_right(y, "On", INK);
+  } else {
+    row_right(y, "Off", INK_2);
+  }
+}
+
+fn word(id: int32, x: int32, y: int32, label: cstring, selected: int32) -> int32 {
+  var wide: uint16[128];
+  wc(&wide[0], label);
+  SelectObject(g_dc, g_fonts[F_BODY]);
+  var extent: Size;
+  GetTextExtentPoint32W(g_dc, &wide[0], wlen(&wide[0]), &extent);
+  var color: uint32 = lerp_color(INK_2, INK, g_hover[id]);
+  if (selected != 0) {
+    color = INK;
+  }
+  widget(id, x, y, extent.cx, S(ROW_H));
+  text_w(F_BODY, x, y, extent.cx + S(2), S(ROW_H), &wide[0], color, DT_VCENTER | DT_SINGLELINE);
+  return extent.cx;
+}
+
+fn sub_line(text: uint16*) {
+  text_w(F_BODY, S(LEFT_X), S(SUB_Y), S(LEFT_W), S(22), text, INK_2, DT_SINGLELINE | DT_PATH_ELLIPSIS);
+}
+
+fn sub_line_c(text: cstring) {
+  var wide: uint16[WMAX];
+  wc(&wide[0], text);
+  sub_line(&wide[0]);
+}
+
+fn link(id: int32, x: int32, y: int32, h: int32, label: cstring, base: uint32) -> int32 {
+  var wide: uint16[128];
+  wc(&wide[0], label);
+  SelectObject(g_dc, g_fonts[F_BODY]);
+  var extent: Size;
+  GetTextExtentPoint32W(g_dc, &wide[0], wlen(&wide[0]), &extent);
+  var color: uint32 = lerp_color(base, INK, g_hover[id]);
+  widget(id, x, y, extent.cx, h);
+  text_w(F_BODY, x, y, extent.cx + S(2), h, &wide[0], color, DT_VCENTER | DT_SINGLELINE);
+  var underline: float64 = g_hover[id];
+  fill_rect(x, y + h - S(3), (int32)((float64)extent.cx * underline), 1, color);
+  return extent.cx;
+}
+
+fn size_text(out: uint16*, bytes: int64) {
+  var tenths: int64 = (bytes + 50000) / 100000;
+  wadd_int(out, tenths / 10);
+  wa(out, ".");
+  wadd_int(out, tenths % 10);
+}
+
+fn headline(text: uint16*) {
+  big_text(F_HEAD, S(LEFT_X) - S(2), S(HEAD_Y), text, INK);
+}
+
+fn headline_c(text: cstring) {
+  var wide: uint16[128];
+  wc(&wide[0], text);
+  headline(&wide[0]);
+}
+
+fn draw_ready() {
+  var title: uint16[128];
+  wc(&title[0], "Mettle ");
+  wadd(&title[0], &g_archive.version[0]);
+  headline(&title[0]);
+  var line: uint16[WMAX];
+  wc(&line[0], "Compiler, standard library, runtime and docs. ");
+  size_text(&line[0], g_archive.total);
+  wa(&line[0], " MB.");
+  sub_line(&line[0]);
+  link(W_LICENSE, S(LEFT_X), S(NOTE_Y), S(22), "Apache 2.0", INK_2);
+  var replacing: int32 = 0;
+  if (g_prior_install.found != 0 && wsame(&g_prior_install.dir[0], &g_dir[0]) != 0) {
+    replacing = 1;
+  }
+  var y: int32 = row_y(4);
+  row_frame(W_CHANGE, y, "Folder");
+  row_value(y, &g_dir[0], DT_PATH_ELLIPSIS, 64);
+  row_right(y, "Change", lerp_color(INK_2, INK, g_hover[W_CHANGE]));
+  y = row_y(3);
+  row_frame(W_NONE, y, "For");
+  var value_x: int32 = S(TABLE_X + LABEL_W);
+  var used: int32 = word(W_JUST_ME, value_x, y, "Just me", 1 - g_everyone);
+  word(W_EVERYONE, value_x + used + S(18), y, "Everyone", g_everyone);
+  if (g_everyone != 0 && is_admin() == 0) {
+    text_c(F_SMALL, S(TABLE_X), y, S(TABLE_W), S(ROW_H), "Windows will ask", INK_2, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+  }
+  toggle_row(W_PATH, row_y(2), "PATH", "Add mettle", g_add_path);
+  toggle_row(W_ASSOCIATE, row_y(1), "Icon", "Show on .mettle files", g_associate);
+  if (replacing != 0) {
+    var label: uint16[64];
+    wc(&label[0], "Replace ");
+    if (g_prior_install.version[0] != 0) {
+      wadd(&label[0], &g_prior_install.version[0]);
+    } else {
+      wa(&label[0], "the older Mettle");
+    }
+    action_w(W_PRIMARY, &label[0]);
+  } else {
+    action(W_PRIMARY, "Install");
+  }
+}
+
+fn action_w(id: int32, label: uint16*) {
+  var x: int32 = S(TABLE_X);
+  var y: int32 = S(ACTION_Y);
+  var w: int32 = S(TABLE_W);
+  var h: int32 = S(ACTION_H);
+  var color: uint32 = lerp_color(INK, 0x00FFFFFF, g_hover[id]);
+  if (g_pressed == id) {
+    color = 0x00C8CED0;
+  }
+  fill_rect(x, y, w, h, color);
+  widget(id, x, y, w, h);
+  text_w(F_BUTTON, x + S(LABEL_W), y, w - S(LABEL_W), h, label, GROUND_REF, DT_VCENTER | DT_SINGLELINE);
+}
+
+fn progress_fraction() -> float64 {
+  if (g_archive.total <= 0) {
+    return 1.0;
+  }
+  return (float64)g_done_bytes / (float64)g_archive.total;
+}
+
+fn phase_caption(out: uint16*) {
+  if (g_phase == PHASE_EXTRACT) {
+    wcopy(out, &g_current[0]);
+  } else if (g_phase == PHASE_REPLACE_OLD) {
+    wc(out, "Removing the older Mettle");
+  } else if (g_phase == PHASE_SWAP) {
+    wc(out, "Moving into place");
+  } else if (g_phase == PHASE_REGISTER) {
+    wc(out, "Registering");
+  } else if (g_phase == PHASE_VERIFY) {
+    wc(out, "Running mettle --version");
+  } else {
+    wc(out, "Preparing");
+  }
+}
+
+fn percent_text(out: uint16*) {
+  var percent: int32 = (int32)(g_progress_shown * 100.0);
+  if (percent > 100) {
+    percent = 100;
+  }
+  wadd_int(out, (int64)percent);
+  wa(out, "%");
+}
+
+fn draw_bar() {
+  var y: int32 = g_height - S(3);
+  fill_rect(0, y, g_width, S(3), FAINT);
+  fill_rect(0, y, (int32)((float64)g_width * g_progress_shown), S(3), INK);
+}
+
+fn draw_work() {
+  headline_c("Installing");
+  sub_line(&g_dir[0]);
+  var line: uint16[WMAX];
+  line[0] = 0;
+  percent_text(&line[0]);
+  var y: int32 = row_y(2);
+  row_frame(W_NONE, y, "Done");
+  row_value(y, &line[0], 0, 120);
+  line[0] = 0;
+  size_text(&line[0], g_done_bytes);
+  wa(&line[0], " of ");
+  size_text(&line[0], g_archive.total);
+  wa(&line[0], " MB");
+  text_w(F_BODY, S(TABLE_X), y, S(TABLE_W), S(ROW_H), &line[0], INK_2, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+  y = row_y(1);
+  row_frame(W_NONE, y, "File");
+  phase_caption(&line[0]);
+  text_w(F_MONO, S(TABLE_X + LABEL_W), y, S(TABLE_W - LABEL_W), S(ROW_H), &line[0], INK_2, DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+  quiet_action(W_SECONDARY, "Cancel");
+  draw_bar();
+}
+
+fn draw_done() {
+  headline_c("Installed.");
+  sub_line(&g_dir[0]);
+  var y: int32 = row_y(3);
+  row_frame(W_NONE, y, "Ran");
+  text_c(F_MONO, S(TABLE_X + LABEL_W), y, S(TABLE_W - LABEL_W), S(ROW_H), "mettle --version", INK_2, DT_VCENTER | DT_SINGLELINE);
+  y = row_y(2);
+  row_frame(W_NONE, y, "Output");
+  text_w(F_MONO, S(TABLE_X + LABEL_W), y, S(TABLE_W - LABEL_W), S(ROW_H), &g_verify_output[0], INK, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+  y = row_y(1);
+  row_frame(W_DOCS, y, "Docs");
+  row_value_c(y, "docs/README.md on GitHub", 64);
+  row_right(y, "Open", lerp_color(INK_2, INK, g_hover[W_DOCS]));
+  if (is_admin() != 0) {
+    action(W_PRIMARY, "Close");
+  } else {
+    action(W_PRIMARY, "Open a terminal");
+  }
+}
+
+fn draw_failed() {
+  if (g_uninstall_mode != 0) {
+    headline_c("Not removed.");
+  } else {
+    headline_c("Not installed.");
+  }
+  sub_line_c("Nothing else changed.");
+  var y: int32 = row_y(4);
+  fill_rect(S(TABLE_X), y, S(TABLE_W), S(1), FAINT);
+  text_w(F_BODY, S(TABLE_X), y + S(12), S(TABLE_W), S(ROW_H) * 4 - S(16), &g_error[0], ERROR_INK, DT_WORDBREAK | DT_EDIT_CONTROL);
+  action(W_PRIMARY, "Back");
+}
+
+fn draw_remove() {
+  var title: uint16[128];
+  wc(&title[0], "Remove ");
+  wadd(&title[0], &g_archive.version[0]);
+  headline(&title[0]);
+  sub_line_c("Compiler, standard library, runtime, docs and the PATH entry.");
+  var y: int32 = row_y(1);
+  row_frame(W_NONE, y, "Folder");
+  row_value(y, &g_dir[0], DT_PATH_ELLIPSIS, 0);
+  action(W_PRIMARY, "Remove");
+}
+
+fn draw_removing() {
+  headline_c("Removing");
+  sub_line(&g_dir[0]);
+  var y: int32 = row_y(1);
+  row_frame(W_NONE, y, "Folder");
+  text_w(F_MONO, S(TABLE_X + LABEL_W), y, S(TABLE_W - LABEL_W), S(ROW_H), &g_current[0], INK_2, DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+  draw_bar();
+}
+
+fn draw_removed() {
+  headline_c("Removed.");
+  if (g_files_left != 0) {
+    sub_line_c("Files you added stay in the folder.");
+    var y: int32 = row_y(1);
+    row_frame(W_NONE, y, "Folder");
+    row_value(y, &g_dir[0], DT_PATH_ELLIPSIS, 0);
+  }
+  action(W_PRIMARY, "Close");
+}
+
+fn draw_frame() {
+  var i: int32 = 0;
+  while (i < WIDGETS) {
+    g_rect_live[i] = 0;
+    i += 1;
+  }
+  picture_draw(g_pixels, g_exposure);
+  draw_mark(S(28), S(24), INK);
+  if (g_page == PAGE_READY) {
+    draw_ready();
+  } else if (g_page == PAGE_WORK) {
+    draw_work();
+  } else if (g_page == PAGE_DONE) {
+    draw_done();
+  } else if (g_page == PAGE_FAILED) {
+    draw_failed();
+  } else if (g_page == PAGE_REMOVE) {
+    draw_remove();
+  } else if (g_page == PAGE_REMOVING) {
+    draw_removing();
+  } else {
+    draw_removed();
+  }
+  draw_title_buttons();
+  GdiFlush();
+  if (g_fade < 1.0) {
+    var count: int64 = (int64)g_width * (int64)g_height;
+    var eased: float64 = g_fade * g_fade * (3.0 - 2.0 * g_fade);
+    var weight: uint32 = (uint32)(eased * 256.0);
+    var keep: uint32 = 256 - weight;
+    var at: int64 = 0;
+    while (at < count) {
+      var a: uint32 = g_previous[at];
+      var b: uint32 = g_pixels[at];
+      var rb: uint32 = (((a & 0x00FF00FF) * keep + (b & 0x00FF00FF) * weight) >> 8) & 0x00FF00FF;
+      var gg: uint32 = (((a & 0x0000FF00) * keep + (b & 0x0000FF00) * weight) >> 8) & 0x0000FF00;
+      g_pixels[at] = 0xFF000000 | rb | gg;
+      at += 1;
+    }
+  }
+}
+
+fn present() {
+  if (g_window == 0) {
+    return;
+  }
+  var dc: int64 = GetDC(g_window);
+  BitBlt(dc, 0, 0, g_width, g_height, g_dc, 0, 0, SRCCOPY);
+  ReleaseDC(g_window, dc);
+}
+
+fn go_to(page: int32) {
+  if (g_pixels != 0 && g_previous != 0) {
+    memcpy((rawptr)g_previous, (rawptr)g_pixels, (int64)g_width * (int64)g_height * 4);
+    g_fade = 0.0;
+  }
+  g_page = page;
+  g_focus = W_NONE;
+  g_focus_visible = 0;
+  g_dirty = 1;
+}
+
+fn set_scope(everyone: int32) {
+  if (g_everyone == everyone) {
+    return;
+  }
+  g_everyone = everyone;
+  var was_default: uint16[WMAX];
+  default_dir(&was_default[0], 1 - everyone);
+  if (wsame(&was_default[0], &g_dir[0]) != 0) {
+    default_dir(&g_dir[0], everyone);
+  }
+}
+
+fn wadd_signed(out: uint16*, value: int32) {
+  if (value < 0) {
+    wa(out, "-");
+    wadd_int(out, (int64)(-value));
+  } else {
+    wadd_int(out, (int64)value);
+  }
+}
+
+fn begin_install() {
+  if (g_everyone != 0 && is_admin() == 0 && g_test_root[0] == 0) {
+    var self_path: uint16[WMAX];
+    own_path(&self_path[0]);
+    var parameters: uint16[WMAX];
+    var place: Rect;
+    GetWindowRect(g_window, &place);
+    wc(&parameters[0], "--go --everyone --at ");
+    wadd_signed(&parameters[0], place.left);
+    wa(&parameters[0], " ");
+    wadd_signed(&parameters[0], place.top);
+    wa(&parameters[0], " --dir \"");
+    wadd(&parameters[0], &g_dir[0]);
+    wa(&parameters[0], "\"");
+    if (g_add_path == 0) {
+      wa(&parameters[0], " --no-path");
+    }
+    if (g_associate == 0) {
+      wa(&parameters[0], " --no-association");
+    }
+    var code: int32 = 0;
+    if (run_elevated(&self_path[0], &parameters[0], g_window, 0, &code) != 0) {
+      g_running = 0;
+    }
+    return;
+  }
+  go_to(PAGE_WORK);
+  g_progress_shown = 0.0;
+  if (engine_start() == 0) {
+    go_to(PAGE_FAILED);
+  }
+}
+
+fn begin_remove() {
+  go_to(PAGE_REMOVING);
+  g_progress_shown = 0.0;
+  if (remove_start() == 0) {
+    go_to(PAGE_FAILED);
+  }
+}
+
+fn call_u(object: int64, slot: int32, value: uint32) -> int32 {
+  var table: int64* = (int64*)((int64*)object)[0];
+  var target: fn(int64, uint32) -> int32 = (fn(int64, uint32) -> int32)table[slot];
+  return target(object, value);
+}
+
+fn call_p(object: int64, slot: int32, value: int64) -> int32 {
+  var table: int64* = (int64*)((int64*)object)[0];
+  var target: fn(int64, int64) -> int32 = (fn(int64, int64) -> int32)table[slot];
+  return target(object, value);
+}
+
+fn call_uu(object: int64, slot: int32, value: uint32, out: int64*) -> int32 {
+  var table: int64* = (int64*)((int64*)object)[0];
+  var target: fn(int64, uint32, int64*) -> int32 = (fn(int64, uint32, int64*) -> int32)table[slot];
+  return target(object, value, out);
+}
+
+fn call_o(object: int64, slot: int32, out: int64*) -> int32 {
+  var table: int64* = (int64*)((int64*)object)[0];
+  var target: fn(int64, int64*) -> int32 = (fn(int64, int64*) -> int32)table[slot];
+  return target(object, out);
+}
+
+fn call_release(object: int64) {
+  var table: int64* = (int64*)((int64*)object)[0];
+  var target: fn(int64) -> uint32 = (fn(int64) -> uint32)table[2];
+  target(object);
+}
+
+fn set_guid(g: Guid*, a: uint32, b: uint16, c: uint16, d0: uint8, d1: uint8, d2: uint8, d3: uint8, d4: uint8, d5: uint8, d6: uint8, d7: uint8) {
+  g.a = a;
+  g.b = b;
+  g.c = c;
+  g.d[0] = d0;
+  g.d[1] = d1;
+  g.d[2] = d2;
+  g.d[3] = d3;
+  g.d[4] = d4;
+  g.d[5] = d5;
+  g.d[6] = d6;
+  g.d[7] = d7;
+}
+
+fn pick_folder() {
+  var clsid: Guid;
+  var iid: Guid;
+  var item_iid: Guid;
+  set_guid(&clsid, 0xDC1C5A9C, 0xE88A, 0x4DDE, 0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7);
+  set_guid(&iid, 0xD57C7288, 0xD4AD, 0x4768, 0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60);
+  set_guid(&item_iid, 0x43826D1E, 0xE718, 0x42EE, 0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE);
+  CoInitializeEx(0, COINIT_APARTMENT);
+  var dialog: int64 = 0;
+  if (CoCreateInstance(&clsid, 0, CLSCTX_ALL, &iid, &dialog) != 0) {
+    return;
+  }
+  var current: uint32 = 0;
+  var table: int64* = (int64*)((int64*)dialog)[0];
+  var get_options: fn(int64, uint32*) -> int32 = (fn(int64, uint32*) -> int32)table[10];
+  get_options(dialog, &current);
+  call_u(dialog, 9, current | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+  var start_at: uint16[WMAX];
+  wcopy(&start_at[0], &g_dir[0]);
+  while (start_at[0] != 0 && is_dir(&start_at[0]) == 0) {
+    wparent(&start_at[0]);
+  }
+  if (start_at[0] != 0) {
+    var folder: int64 = 0;
+    if (SHCreateItemFromParsingName(&start_at[0], 0, &item_iid, &folder) == 0) {
+      call_p(dialog, 12, folder);
+      call_release(folder);
+    }
+  }
+  if (call_p(dialog, 3, g_window) == 0) {
+    var result: int64 = 0;
+    if (call_o(dialog, 20, &result) == 0) {
+      var name: int64 = 0;
+      if (call_uu(result, 5, SIGDN_FILESYSPATH, &name) == 0) {
+        var chosen: uint16[WMAX];
+        wcopy(&chosen[0], (uint16*)name);
+        CoTaskMemFree((rawptr)name);
+        wtrim_slash(&chosen[0]);
+        if (is_dir(&chosen[0]) != 0 && dir_empty(&chosen[0]) == 0 && holds_mettle(&chosen[0]) == 0) {
+          wa(&chosen[0], "\\Mettle");
+        }
+        wfull_path(&chosen[0]);
+        wcopy(&g_dir[0], &chosen[0]);
+      }
+      call_release(result);
+    }
+  }
+  call_release(dialog);
+  g_dirty = 1;
+}
+
+fn open_terminal() {
+  var command: uint16[WMAX];
+  wc(&command[0], "cmd.exe /k \"\"");
+  wadd(&command[0], &g_dir[0]);
+  wa(&command[0], "\\bin\\mettle.exe\" --version\"");
+  var home: uint16[WMAX];
+  env_get(&home[0], "USERPROFILE");
+  run_detached(&command[0], &home[0], 0);
+}
+
+fn open_link(text: cstring) {
+  var target: uint16[WMAX];
+  wc(&target[0], text);
+  open_shell(&target[0]);
+}
+
+fn close_requested() {
+  if (g_page == PAGE_WORK) {
+    engine_cancel();
+  }
+  if (g_page == PAGE_WORK || g_page == PAGE_READY || g_page == PAGE_REMOVE) {
+    g_exit_code = 1;
+  }
+  if (g_page == PAGE_REMOVING) {
+    return;
+  }
+  g_running = 0;
+}
+
+fn activate(id: int32) {
+  if (id == W_CLOSE) {
+    close_requested();
+  } else if (id == W_MINIMIZE) {
+    ShowWindow(g_window, 6);
+  } else if (id == W_CHANGE) {
+    pick_folder();
+  } else if (id == W_JUST_ME) {
+    set_scope(0);
+  } else if (id == W_EVERYONE) {
+    set_scope(1);
+  } else if (id == W_PATH) {
+    g_add_path = 1 - g_add_path;
+  } else if (id == W_ASSOCIATE) {
+    g_associate = 1 - g_associate;
+  } else if (id == W_LICENSE) {
+    open_link("https://github.com/The-Mettle-Project/Mettle/blob/master/LICENSE");
+  } else if (id == W_DOCS) {
+    open_link("https://github.com/The-Mettle-Project/Mettle/blob/master/docs/README.md");
+  } else if (id == W_PRIMARY) {
+    if (g_page == PAGE_READY) {
+      begin_install();
+    } else if (g_page == PAGE_DONE) {
+      if (is_admin() == 0) {
+        open_terminal();
+      }
+      g_running = 0;
+    } else if (g_page == PAGE_FAILED) {
+      engine_cancel();
+      if (g_uninstall_mode != 0) {
+        go_to(PAGE_REMOVE);
+      } else {
+        go_to(PAGE_READY);
+      }
+    } else if (g_page == PAGE_REMOVE) {
+      begin_remove();
+    } else if (g_page == PAGE_REMOVED) {
+      g_running = 0;
+    }
+  } else if (id == W_SECONDARY) {
+    if (g_page == PAGE_WORK) {
+      engine_cancel();
+      go_to(PAGE_READY);
+    } else {
+      close_requested();
+    }
+  }
+  g_dirty = 1;
+}
+
+fn cycle_focus(backward: int32) {
+  var order: int32[WIDGETS];
+  var count: int32 = 0;
+  var i: int32 = 1;
+  while (i < WIDGETS) {
+    if (g_rect_live[i] != 0 && i != W_CLOSE && i != W_MINIMIZE) {
+      order[count] = i;
+      count += 1;
+    }
+    i += 1;
+  }
+  if (count == 0) {
+    return;
+  }
+  var at: int32 = -1;
+  i = 0;
+  while (i < count) {
+    if (order[i] == g_focus) {
+      at = i;
+    }
+    i += 1;
+  }
+  if (backward != 0) {
+    at = at - 1;
+    if (at < 0) {
+      at = count - 1;
+    }
+  } else {
+    at = (at + 1) % count;
+  }
+  g_focus = order[at];
+  g_focus_visible = 1;
+  g_dirty = 1;
+}
+
+fn window_proc(window: int64, message: uint32, wparam: int64, lparam: int64) -> int64 {
+  if (message == WM_NCCALCSIZE) {
+    return 0;
+  } else if (message == WM_NCHITTEST) {
+    var base: int64 = DefWindowProcW(window, message, wparam, lparam);
+    if (base != HTCLIENT) {
+      return base;
+    }
+    var at: Rect;
+    GetWindowRect(window, &at);
+    var sx: int32 = (int32)(int16)(lparam & 0xFFFF) - at.left;
+    var sy: int32 = (int32)(int16)((lparam >> 16) & 0xFFFF) - at.top;
+    if (widget_at(sx, sy) != W_NONE) {
+      return HTCLIENT;
+    }
+    return HTCAPTION;
+  } else if (message == WM_ERASEBKGND) {
+    return 1;
+  } else if (message == WM_PAINT) {
+    var paint: PaintStruct;
+    var dc: int64 = BeginPaint(window, &paint);
+    BitBlt(dc, 0, 0, g_width, g_height, g_dc, 0, 0, SRCCOPY);
+    EndPaint(window, &paint);
+    return 0;
+  } else if (message == WM_MOUSEMOVE) {
+    g_mouse_x = (int32)(int16)(lparam & 0xFFFF);
+    g_mouse_y = (int32)(int16)((lparam >> 16) & 0xFFFF);
+    if (g_mouse_inside == 0) {
+      g_mouse_inside = 1;
+      var track: TrackMouse;
+      track.size = (uint32)sizeof(TrackMouse);
+      track.flags = TME_LEAVE;
+      track.target = window;
+      track.hover = 0;
+      TrackMouseEvent(&track);
+    }
+    g_hot = widget_at(g_mouse_x, g_mouse_y);
+    g_dirty = 1;
+    return 0;
+  } else if (message == WM_MOUSELEAVE) {
+    g_mouse_inside = 0;
+    g_hot = W_NONE;
+    g_dirty = 1;
+    return 0;
+  } else if (message == WM_LBUTTONDOWN) {
+    g_pressed = widget_at((int32)(int16)(lparam & 0xFFFF), (int32)(int16)((lparam >> 16) & 0xFFFF));
+    if (g_pressed != W_NONE) {
+      SetCapture(window);
+    }
+    g_focus_visible = 0;
+    g_dirty = 1;
+    return 0;
+  } else if (message == WM_LBUTTONUP) {
+    var released: int32 = widget_at((int32)(int16)(lparam & 0xFFFF), (int32)(int16)((lparam >> 16) & 0xFFFF));
+    ReleaseCapture();
+    if (released != W_NONE && released == g_pressed) {
+      g_action = released;
+    }
+    g_pressed = W_NONE;
+    g_dirty = 1;
+    return 0;
+  } else if (message == WM_SETCURSOR) {
+    if ((lparam & 0xFFFF) == HTCLIENT && g_hot != W_NONE) {
+      SetCursor(LoadCursorW(0, 32649));
+      return 1;
+    }
+  } else if (message == WM_KEYDOWN) {
+    if (wparam == VK_TAB) {
+      cycle_focus((int32)(GetKeyState(VK_SHIFT) < 0));
+      return 0;
+    }
+    if (wparam == VK_ESCAPE) {
+      g_action = W_CLOSE;
+      return 0;
+    }
+    if (wparam == VK_RETURN || wparam == VK_SPACE) {
+      if (g_focus != W_NONE && g_focus_visible != 0) {
+        g_action = g_focus;
+      } else if (wparam == VK_RETURN && g_rect_live[W_PRIMARY] != 0) {
+        g_action = W_PRIMARY;
+      }
+      return 0;
+    }
+  } else if (message == WM_CLOSE) {
+    g_action = W_CLOSE;
+    return 0;
+  } else if (message == WM_DPICHANGED) {
+    var suggested: Rect* = (Rect*)lparam;
+    var dpi: int32 = (int32)(wparam & 0xFFFF);
+    build_surface(dpi * 100 / 96);
+    SetWindowPos(window, 0, suggested.left, suggested.top, g_width, g_height, 0x14);
+    return 0;
+  } else if (message == WM_DESTROY) {
+    PostQuitMessage(0);
+    return 0;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
+fn ease_toward(value: float64, target: float64, elapsed_ms: float64, tau_ms: float64) -> float64 {
+  var t: float64 = elapsed_ms / tau_ms;
+  if (t > 1.0) {
+    t = 1.0;
+  }
+  var next: float64 = value + (target - value) * t;
+  var gap: float64 = next - target;
+  if (gap < 0.0) {
+    gap = -gap;
+  }
+  if (gap < 0.002) {
+    return target;
+  }
+  return next;
+}
+
+fn update_exposure_target() {
+  if (g_page == PAGE_READY || g_page == PAGE_REMOVE) {
+    g_exposure_target = 0.66;
+  } else if (g_page == PAGE_WORK) {
+    g_exposure_target = 0.66 + 0.5 * progress_fraction();
+  } else if (g_page == PAGE_DONE) {
+    g_exposure_target = 1.16;
+  } else if (g_page == PAGE_FAILED) {
+    g_exposure_target = 0.3;
+  } else if (g_page == PAGE_REMOVING) {
+    g_exposure_target = 0.66 - 0.5 * progress_fraction();
+  } else {
+    g_exposure_target = 0.12;
+  }
+}
+
+fn animate(elapsed_ms: float64) -> int32 {
+  var moving: int32 = 0;
+  var i: int32 = 1;
+  while (i < WIDGETS) {
+    var target: float64 = 0.0;
+    if (g_hot == i) {
+      target = 1.0;
+    }
+    if (g_hover[i] != target) {
+      g_hover[i] = ease_toward(g_hover[i], target, elapsed_ms, 70.0);
+      moving = 1;
+    }
+    i += 1;
+  }
+  update_exposure_target();
+  if (g_exposure != g_exposure_target) {
+    g_exposure = ease_toward(g_exposure, g_exposure_target, elapsed_ms, 260.0);
+    moving = 1;
+  }
+  var goal: float64 = progress_fraction();
+  if (g_page == PAGE_DONE || g_page == PAGE_REMOVED) {
+    goal = 1.0;
+  }
+  if (g_progress_shown != goal) {
+    g_progress_shown = ease_toward(g_progress_shown, goal, elapsed_ms, 140.0);
+    moving = 1;
+  }
+  if (g_fade < 1.0) {
+    g_fade = g_fade + elapsed_ms / 240.0;
+    if (g_fade > 1.0) {
+      g_fade = 1.0;
+    }
+    moving = 1;
+  }
+  return moving;
+}
+
+fn run_engine() {
+  if (g_page != PAGE_WORK && g_page != PAGE_REMOVING) {
+    return;
+  }
+  engine_step(12.0);
+  g_dirty = 1;
+  if (g_phase == PHASE_DONE) {
+    if (g_page == PAGE_WORK) {
+      go_to(PAGE_DONE);
+    } else {
+      go_to(PAGE_REMOVED);
+    }
+  } else if (g_phase == PHASE_FAILED) {
+    go_to(PAGE_FAILED);
+    g_exit_code = 1;
+  }
+}
+
+export fn window_run() -> int32 {
+  SetProcessDpiAwarenessContext(DPI_PER_MONITOR_V2);
+  var font_count: uint32 = 0;
+  AddFontMemResourceEx(g_font_bytes, (uint32)g_font_size, 0, &font_count);
+  var instance: int64 = GetModuleHandleW(0);
+  var class_name: uint16[32];
+  wc(&class_name[0], "MettleSetup");
+  var info: WindowClass;
+  memset((rawptr)&info, 0, (int64)sizeof(WindowClass));
+  info.size = (uint32)sizeof(WindowClass);
+  info.proc = &window_proc;
+  info.instance = instance;
+  info.icon = LoadIconW(instance, 1);
+  info.small_icon = info.icon;
+  info.cursor = LoadCursorW(0, 32512);
+  info.class_name = &class_name[0];
+  RegisterClassExW(&info);
+  var dpi: uint32 = GetDpiForSystem();
+  build_surface((int32)dpi * 100 / 96);
+  var x: int32 = (GetSystemMetrics(0) - g_width) / 2;
+  var y: int32 = (GetSystemMetrics(1) - g_height) / 2;
+  if (g_placed != 0) {
+    x = g_place_x;
+    y = g_place_y;
+  }
+  var title: uint16[64];
+  wc(&title[0], "Mettle ");
+  wadd(&title[0], &g_archive.version[0]);
+  g_window = CreateWindowExW(0, &class_name[0], &title[0], WINDOW_STYLE, x, y, g_width, g_height, 0, 0, instance, 0);
+  if (g_window == 0) {
+    return 1;
+  }
+  var on: int32 = 1;
+  DwmSetWindowAttribute(g_window, DWMWA_DARK, (rawptr)&on, 4);
+  var corner: int32 = 2;
+  DwmSetWindowAttribute(g_window, DWMWA_CORNER, (rawptr)&corner, 4);
+  var border: uint32 = FAINT;
+  DwmSetWindowAttribute(g_window, DWMWA_BORDER, (rawptr)&border, 4);
+  var actual_dpi: uint32 = GetDpiForWindow(g_window);
+  if (actual_dpi != dpi) {
+    build_surface((int32)actual_dpi * 100 / 96);
+    SetWindowPos(g_window, 0, 0, 0, g_width, g_height, 0x16);
+  }
+  SetWindowPos(g_window, 0, 0, 0, 0, 0, SWP_RECOMPUTE_FRAME);
+  g_exposure = 0.0;
+  update_exposure_target();
+  draw_frame();
+  ShowWindow(g_window, SW_SHOW);
+  UpdateWindow(g_window);
+  if (g_start_now != 0) {
+    begin_install();
+  }
+  g_last_frame = now_ms();
+  var message: Message;
+  while (g_running != 0) {
+    var had_message: int32 = 0;
+    while (PeekMessageW(&message, 0, 0, 0, PM_REMOVE) != 0) {
+      had_message = 1;
+      if (message.message == WM_QUIT) {
+        g_running = 0;
+        break;
+      }
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+    if (g_running == 0) {
+      break;
+    }
+    if (g_action != W_NONE) {
+      var id: int32 = g_action;
+      g_action = W_NONE;
+      activate(id);
+      if (g_running == 0) {
+        break;
+      }
+    }
+    run_engine();
+    var now: float64 = now_ms();
+    var elapsed: float64 = now - g_last_frame;
+    g_last_frame = now;
+    var moving: int32 = animate(elapsed);
+    if (moving != 0 || g_dirty != 0) {
+      g_dirty = 0;
+      draw_frame();
+      present();
+      DwmFlush();
+    } else if (had_message == 0) {
+      WaitMessage();
+      g_last_frame = now_ms();
+    }
+  }
+  DestroyWindow(g_window);
+  return g_exit_code;
+}
+
+fn write_bitmap(path: uint16*) -> int32 {
+  var file: int64 = file_create(path);
+  if (file == -1) {
+    return 0;
+  }
+  var header: uint8[54];
+  memset((rawptr)&header[0], 0, 54);
+  header[0] = 66;
+  header[1] = 77;
+  var size: int64 = (int64)g_width * (int64)g_height * 4;
+  var total: int64 = size + 54;
+  var i: int32 = 0;
+  while (i < 4) {
+    header[2 + i] = (uint8)((total >> (i * 8)) & 255);
+    header[18 + i] = (uint8)(((int64)g_width >> (i * 8)) & 255);
+    header[22 + i] = (uint8)(((int64)(-g_height) >> (i * 8)) & 255);
+    header[34 + i] = (uint8)((size >> (i * 8)) & 255);
+    i += 1;
+  }
+  header[10] = 54;
+  header[14] = 40;
+  header[26] = 1;
+  header[28] = 32;
+  file_write(file, &header[0], 54);
+  file_write(file, (uint8*)g_pixels, size);
+  file_close(file);
+  return 1;
+}
+
+export fn window_render_page(name: uint16*, out: uint16*, scale_percent: int32) -> int32 {
+  SetProcessDpiAwarenessContext(DPI_PER_MONITOR_V2);
+  var font_count: uint32 = 0;
+  AddFontMemResourceEx(g_font_bytes, (uint32)g_font_size, 0, &font_count);
+  build_surface(scale_percent);
+  g_fade = 1.0;
+  if (wsame_c(name, "ready") != 0) {
+    g_page = PAGE_READY;
+  } else if (wsame_c(name, "upgrade") != 0) {
+    g_page = PAGE_READY;
+    g_prior_install.found = 1;
+    wcopy(&g_prior_install.dir[0], &g_dir[0]);
+    wc(&g_prior_install.version[0], "0.16.3");
+  } else if (wsame_c(name, "everyone") != 0) {
+    g_page = PAGE_READY;
+    g_everyone = 1;
+    default_dir(&g_dir[0], 1);
+  } else if (wsame_c(name, "work") != 0) {
+    g_page = PAGE_WORK;
+    g_phase = PHASE_EXTRACT;
+    g_done_bytes = g_archive.total * 41 / 100;
+    wc(&g_current[0], "runtime/libmtlc-closure.o");
+    g_progress_shown = 0.41;
+  } else if (wsame_c(name, "done") != 0) {
+    g_page = PAGE_DONE;
+    wc(&g_verify_output[0], "mettle ");
+    wa(&g_verify_output[0], "v");
+    wadd(&g_verify_output[0], &g_archive.version[0]);
+  } else if (wsame_c(name, "failed") != 0) {
+    g_page = PAGE_FAILED;
+    wc(&g_error[0], "Could not replace ");
+    wadd(&g_error[0], &g_dir[0]);
+    wa(&g_error[0], "\\bin. ");
+    system_text(&g_error[0], 5);
+    wa(&g_error[0], ".");
+  } else if (wsame_c(name, "remove") != 0) {
+    g_page = PAGE_REMOVE;
+  } else if (wsame_c(name, "removing") != 0) {
+    g_page = PAGE_REMOVING;
+    g_done_bytes = g_archive.total * 58 / 100;
+    wc(&g_current[0], "runtime");
+    g_progress_shown = 0.58;
+  } else if (wsame_c(name, "removed") != 0) {
+    g_page = PAGE_REMOVED;
+  } else {
+    return 2;
+  }
+  update_exposure_target();
+  g_exposure = g_exposure_target;
+  draw_frame();
+  GdiFlush();
+  if (write_bitmap(out) == 0) {
+    return 1;
+  }
+  return 0;
+}

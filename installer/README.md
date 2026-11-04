@@ -1,43 +1,69 @@
-# Mettle Installer
+# Windows installer
 
-Native Windows setup wizard built with [Inno Setup 6](https://jrsoftware.org/isinfo.php). Produces a single `Mettle-Setup.exe` — no PowerShell required to run it.
+`Mettle-Setup.exe` is a Mettle program. It draws its own window, unpacks its own payload with an LZMA decoder written in Mettle, and needs no other tools to run.
 
-## Features
-- Copies `mettle.exe`, `stdlib\`, and `runtime\` to the installation directory.
-- Installs opt-in helper objects (`crash_handler.o`, `atomics.o`, etc.) so `--build` can link them on demand.
-- Installs `mettle-build.bat` as a thin wrapper over `mettle --build`.
-- Per-user or all-users install (chosen at launch; UAC only when needed).
-- Optional PATH and `.mettle` file association tasks.
-- Built-in uninstaller registered in Windows Settings.
-- Modern Inno 6 wizard UI (HiDPI, Windows light/dark aware) — no custom bitmap assets.
+## Build
 
-## Build the installer
-
-1. Build the compiler first: `build.bat gcc` from the repo root.
-2. Install [Inno Setup 6](https://jrsoftware.org/isinfo.php).
-3. Compile:
-   ```bat
-   "C:\Path\To\Inno Setup 6\ISCC.exe" installer\Mettle.iss
-   ```
-   Or stamp a version explicitly:
-   ```bat
-   ISCC.exe /DMyAppVersion=0.13.0 installer\Mettle.iss
-   ```
-4. Output: `installer\out\Mettle-Setup.exe`
-
-CI builds the same way in `.github/workflows/release.yml`.
-
-## After installation
+Build the compiler first, then pack:
 
 ```bat
-mettle --version
-mettle --build my_program.mettle
-mettle help
+build.bat gcc
+python -m pip install pillow fonttools brotli
+python installer\pack.py
 ```
 
-`mettle-build.bat my_program.mettle` forwards to `mettle --build`.
+The result is `installer\out\Mettle-Setup.exe`. `--fast` compresses less, for testing. `--compiler` names a different compiler to build the setup program with.
 
-## Other install paths
+## How the file is laid out
 
-- **GUI (this installer):** `Mettle-Setup.exe` — full wizard, uninstaller, file associations.
-- **Script (download latest release):** `install.ps1` at the repo root — one-liner for `%LOCALAPPDATA%\Mettle`, no admin.
+```mermaid
+flowchart LR
+  A[setup program<br/>compiled from installer/setup] --> B[resources<br/>icon, manifest, version]
+  B --> C[art<br/>font and photo]
+  C --> D[index<br/>paths, sizes, CRC-32]
+  D --> E[payload<br/>one LZMA stream]
+  E --> F[footer<br/>64 bytes, offsets]
+```
+
+`pack.py` adds the resources, because the compiler's PE writer has no resource section. An installed `uninstall.exe` is the same file with the payload left out.
+
+## What it does
+
+```mermaid
+flowchart TD
+  A[unpack beside the target, checking every CRC] --> B{older Inno install here?}
+  B -->|yes| C[run its uninstaller and wait for its clone to finish]
+  B -->|no| D[move each shipped name into place]
+  C --> D
+  D --> E[register, add to PATH, set the file icon]
+  E --> F[run mettle --version from the new folder]
+```
+
+- A failure while moving files puts the old ones back. Cancelling removes the unpacked copy and changes nothing else.
+- It only moves and deletes the names it ships. A file you added to the folder stays through an upgrade and an uninstall.
+- It refuses a folder that holds other files and no Mettle install.
+- Choosing Everyone installs to Program Files and relaunches through the Windows permission prompt.
+
+## Options
+
+```text
+Mettle-Setup.exe [--silent] [--dir <folder>] [--everyone | --just-me] [--no-path] [--no-association]
+uninstall.exe [--silent] [--everyone]
+```
+
+`--silent` shows no window, prints to the console it was started from and exits 0 on success. `--everyone` with `--silent` needs an elevated shell.
+
+## Test
+
+```bat
+python installer\test_setup.py
+python installer\test_setup.py --window
+```
+
+The first run needs no display. It renders every page at three scales, installs, upgrades, refuses a bad folder, takes over an older install and uninstalls. Every registry write goes under `HKCU\Software\MettleSetupTest`, through `--registry-root`, and is removed at the end. `--window` also drives the real window on your screen: the picker, cancelling mid-install, and removal.
+
+`--render <page> <file.bmp> [--scale <percent>]` writes one page to a file. The pages are `ready`, `upgrade`, `everyone`, `work`, `done`, `failed`, `remove`, `removing` and `removed`.
+
+## Other ways to install
+
+`install.ps1` at the repository root downloads the latest release zip to `%LOCALAPPDATA%\Mettle`. `mettle-build.bat` forwards to `mettle --build`.
