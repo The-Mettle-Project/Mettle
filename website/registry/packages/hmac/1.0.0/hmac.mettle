@@ -1,0 +1,115 @@
+import "sha256";
+
+export const HMAC_SHA256_BYTES = 32;
+
+export fn hmac_sha256(key: uint8*, key_length: int64, message: uint8*,
+                      message_length: int64, tag: uint8*) {
+  var block_key: uint8[64];
+  var pad: uint8[64];
+  var inner: uint8[32];
+  var ctx: Sha256;
+  for i in 0..64 {
+    block_key[i] = 0;
+  }
+  if (key_length > 64) {
+    sha256_bytes(key, key_length, &block_key[0]);
+  } else {
+    for i in 0..key_length {
+      block_key[i] = key[i];
+    }
+  }
+  for i in 0..64 {
+    pad[i] = block_key[i] ^ 0x36;
+  }
+  sha256_init(&ctx);
+  sha256_update(&ctx, &pad[0], 64);
+  sha256_update(&ctx, message, message_length);
+  sha256_final(&ctx, &inner[0]);
+  for i in 0..64 {
+    pad[i] = block_key[i] ^ 0x5c;
+  }
+  sha256_init(&ctx);
+  sha256_update(&ctx, &pad[0], 64);
+  sha256_update(&ctx, &inner[0], 32);
+  sha256_final(&ctx, tag);
+}
+
+export fn hmac_sha256_text(key: string, message: string, tag: uint8*) {
+  hmac_sha256((uint8*)key.chars, (int64)key.length, (uint8*)message.chars,
+              (int64)message.length, tag);
+}
+
+export fn hmac_equal(left: uint8*, right: uint8*) -> bool {
+  var difference: uint8 = 0;
+  for i in 0..HMAC_SHA256_BYTES {
+    difference = difference | (left[i] ^ right[i]);
+  }
+  return difference == 0;
+}
+
+fn tag_is(tag: uint8*, expected: string) -> int32 {
+  var hex: uint8[65];
+  sha256_hex(tag, &hex[0]);
+  var bad: int32 = 0;
+  for i in 0..64 {
+    if (hex[i] != (uint8)expected.chars[i]) {
+      bad = 1;
+    }
+  }
+  return bad;
+}
+
+fn fill(out: uint8*, value: uint8, count: int64) {
+  for i in 0..count {
+    out[i] = value;
+  }
+}
+
+@test fn rfc4231_case_1() -> int32 {
+  var key: uint8[20];
+  var tag: uint8[32];
+  fill(&key[0], 0x0b, 20);
+  var message: string = "Hi There";
+  hmac_sha256(&key[0], 20, (uint8*)message.chars, (int64)message.length, &tag[0]);
+  return tag_is(&tag[0], "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+}
+
+@test fn rfc4231_case_2() -> int32 {
+  var tag: uint8[32];
+  hmac_sha256_text("Jefe", "what do ya want for nothing?", &tag[0]);
+  return tag_is(&tag[0], "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+}
+
+@test fn rfc4231_case_3() -> int32 {
+  var key: uint8[20];
+  var message: uint8[50];
+  var tag: uint8[32];
+  fill(&key[0], 0xaa, 20);
+  fill(&message[0], 0xdd, 50);
+  hmac_sha256(&key[0], 20, &message[0], 50, &tag[0]);
+  return tag_is(&tag[0], "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+}
+
+@test fn rfc4231_case_6_key_longer_than_a_block() -> int32 {
+  var key: uint8[131];
+  var tag: uint8[32];
+  fill(&key[0], 0xaa, 131);
+  var message: string = "Test Using Larger Than Block-Size Key - Hash Key First";
+  hmac_sha256(&key[0], 131, (uint8*)message.chars, (int64)message.length, &tag[0]);
+  return tag_is(&tag[0], "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+}
+
+@test fn equal_finds_a_difference_in_the_last_byte() -> int32 {
+  var left: uint8[32];
+  var right: uint8[32];
+  fill(&left[0], 7, 32);
+  fill(&right[0], 7, 32);
+  if (!hmac_equal(&left[0], &right[0])) {
+    return 1;
+  }
+  right[31] = 8;
+  if (hmac_equal(&left[0], &right[0])) {
+    return 2;
+  }
+  return 0;
+}

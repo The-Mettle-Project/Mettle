@@ -1,0 +1,6 @@
+name = hmac
+version = 1.0.0
+description = HMAC-SHA-256 from RFC 2104, checked against the RFC 4231 vectors
+license = Apache-2.0
+source = https://github.com/The-Mettle-Project/Mettle/tree/master/website/registry/packages/hmac
+require = sha256 1.0.0

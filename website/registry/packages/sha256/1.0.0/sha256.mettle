@@ -1,0 +1,207 @@
+export const SHA256_DIGEST_BYTES = 32;
+export const SHA256_BLOCK_BYTES = 64;
+export const SHA256_HEX_BYTES = 65;
+
+export struct Sha256 {
+  state: uint32[8];
+  block: uint8[64];
+  filled: int64;
+  total: int64;
+}
+
+var ROUND: uint32[64] = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+];
+
+fn rotr(value: uint32, bits: uint32) -> uint32 {
+  return (value >> bits) | (value << (32 - bits));
+}
+
+fn compress(state: uint32*, block: uint8*) {
+  var w: uint32[64];
+  for i in 0..16 {
+    var at: int64 = (int64)i * 4;
+    w[i] = ((uint32)block[at] << 24) | ((uint32)block[at + 1] << 16) |
+           ((uint32)block[at + 2] << 8) | (uint32)block[at + 3];
+  }
+  for i in 16..64 {
+    var s0: uint32 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+    var s1: uint32 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+  }
+  var a: uint32 = state[0];
+  var b: uint32 = state[1];
+  var c: uint32 = state[2];
+  var d: uint32 = state[3];
+  var e: uint32 = state[4];
+  var f: uint32 = state[5];
+  var g: uint32 = state[6];
+  var h: uint32 = state[7];
+  for i in 0..64 {
+    var s1: uint32 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+    var choose: uint32 = (e & f) ^ (~e & g);
+    var t1: uint32 = h + s1 + choose + ROUND[i] + w[i];
+    var s0: uint32 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+    var majority: uint32 = (a & b) ^ (a & c) ^ (b & c);
+    var t2: uint32 = s0 + majority;
+    h = g;
+    g = f;
+    f = e;
+    e = d + t1;
+    d = c;
+    c = b;
+    b = a;
+    a = t1 + t2;
+  }
+  state[0] = state[0] + a;
+  state[1] = state[1] + b;
+  state[2] = state[2] + c;
+  state[3] = state[3] + d;
+  state[4] = state[4] + e;
+  state[5] = state[5] + f;
+  state[6] = state[6] + g;
+  state[7] = state[7] + h;
+}
+
+export fn sha256_init(ctx: Sha256*) {
+  ctx->state[0] = 0x6a09e667;
+  ctx->state[1] = 0xbb67ae85;
+  ctx->state[2] = 0x3c6ef372;
+  ctx->state[3] = 0xa54ff53a;
+  ctx->state[4] = 0x510e527f;
+  ctx->state[5] = 0x9b05688c;
+  ctx->state[6] = 0x1f83d9ab;
+  ctx->state[7] = 0x5be0cd19;
+  ctx->filled = 0;
+  ctx->total = 0;
+}
+
+export fn sha256_update(ctx: Sha256*, data: uint8*, length: int64) {
+  var at: int64 = 0;
+  ctx->total = ctx->total + length;
+  while (at < length) {
+    if (ctx->filled == 0 && length - at >= SHA256_BLOCK_BYTES) {
+      compress(&ctx->state[0], data + at);
+      at = at + SHA256_BLOCK_BYTES;
+    } else {
+      ctx->block[ctx->filled] = data[at];
+      ctx->filled = ctx->filled + 1;
+      at = at + 1;
+      if (ctx->filled == SHA256_BLOCK_BYTES) {
+        compress(&ctx->state[0], &ctx->block[0]);
+        ctx->filled = 0;
+      }
+    }
+  }
+}
+
+export fn sha256_final(ctx: Sha256*, digest: uint8*) {
+  var bits: int64 = ctx->total * 8;
+  ctx->block[ctx->filled] = 0x80;
+  ctx->filled = ctx->filled + 1;
+  if (ctx->filled > 56) {
+    while (ctx->filled < SHA256_BLOCK_BYTES) {
+      ctx->block[ctx->filled] = 0;
+      ctx->filled = ctx->filled + 1;
+    }
+    compress(&ctx->state[0], &ctx->block[0]);
+    ctx->filled = 0;
+  }
+  while (ctx->filled < 56) {
+    ctx->block[ctx->filled] = 0;
+    ctx->filled = ctx->filled + 1;
+  }
+  for i in 0..8 {
+    ctx->block[63 - i] = (uint8)((bits >> (i * 8)) & 255);
+  }
+  compress(&ctx->state[0], &ctx->block[0]);
+  for i in 0..8 {
+    var word: uint32 = ctx->state[i];
+    digest[i * 4] = (uint8)((word >> 24) & 255);
+    digest[i * 4 + 1] = (uint8)((word >> 16) & 255);
+    digest[i * 4 + 2] = (uint8)((word >> 8) & 255);
+    digest[i * 4 + 3] = (uint8)(word & 255);
+  }
+}
+
+export fn sha256_bytes(data: uint8*, length: int64, digest: uint8*) {
+  var ctx: Sha256;
+  sha256_init(&ctx);
+  sha256_update(&ctx, data, length);
+  sha256_final(&ctx, digest);
+}
+
+export fn sha256_text(text: string, digest: uint8*) {
+  sha256_bytes((uint8*)text.chars, (int64)text.length, digest);
+}
+
+fn hex_digit(value: uint8) -> uint8 {
+  if (value < 10) {
+    return value + 48;
+  }
+  return value + 87;
+}
+
+export fn sha256_hex(digest: uint8*, out: uint8*) {
+  for i in 0..SHA256_DIGEST_BYTES {
+    out[i * 2] = hex_digit(digest[i] >> 4);
+    out[i * 2 + 1] = hex_digit(digest[i] & 15);
+  }
+  out[SHA256_DIGEST_BYTES * 2] = 0;
+}
+
+fn hex_is(digest: uint8*, expected: string) -> int32 {
+  var hex: uint8[65];
+  sha256_hex(digest, &hex[0]);
+  var bad: int32 = 0;
+  for i in 0..64 {
+    if (hex[i] != (uint8)expected.chars[i]) {
+      bad = 1;
+    }
+  }
+  return bad;
+}
+
+@test fn nist_empty() -> int32 {
+  var digest: uint8[32];
+  sha256_text("", &digest[0]);
+  return hex_is(&digest[0], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+@test fn nist_abc() -> int32 {
+  var digest: uint8[32];
+  sha256_text("abc", &digest[0]);
+  return hex_is(&digest[0], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+@test fn nist_two_blocks() -> int32 {
+  var digest: uint8[32];
+  sha256_text("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", &digest[0]);
+  return hex_is(&digest[0], "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
+
+@test fn padding_crosses_a_block() -> int32 {
+  var digest: uint8[32];
+  sha256_text("0123456789012345678901234567890123456789012345678901234567890123", &digest[0]);
+  return hex_is(&digest[0], "9674d9e078535b7cec43284387a6ee39956188e735a85452b0050b55341cda56");
+}
+
+@test fn split_update_matches_one_call() -> int32 {
+  var text: string = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+  var data: uint8* = (uint8*)text.chars;
+  var ctx: Sha256;
+  var digest: uint8[32];
+  sha256_init(&ctx);
+  sha256_update(&ctx, data, 5);
+  sha256_update(&ctx, data + 5, 40);
+  sha256_update(&ctx, data + 45, (int64)text.length - 45);
+  sha256_final(&ctx, &digest[0]);
+  return hex_is(&digest[0], "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}

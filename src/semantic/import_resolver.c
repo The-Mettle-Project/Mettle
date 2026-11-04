@@ -428,6 +428,11 @@ static char *resolve_dependency_import(const char *current_file_path,
           }
 
           result = resolve_candidate_path(candidate_base);
+          if (!result && (!package_rest || package_rest[0] == '\0')) {
+            char *main_module = join_paths(candidate_base, name);
+            result = resolve_candidate_path(main_module);
+            free(main_module);
+          }
           free(candidate_base);
           if (result) {
             fclose(deps_file);

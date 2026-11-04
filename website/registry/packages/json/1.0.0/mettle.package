@@ -1,0 +1,5 @@
+name = json
+version = 1.0.0
+description = A strict RFC 8259 pull reader that never allocates, with correctly rounded numbers
+license = Apache-2.0
+source = https://github.com/The-Mettle-Project/Mettle/tree/master/website/registry/packages/json

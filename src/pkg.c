@@ -1721,9 +1721,12 @@ static int pkg_add_one(const char *spec, PkgNeeds *roots) {
                       g_pkg_compiler);
     }
     version = latest->version;
+  } else if (!pkg_find_release(index, version)) {
+    return pkg_fail("the registry has no %s %s; `mettle pkg info %s` lists its "
+                    "versions",
+                    name, pkg_version_text(version), name);
   }
   pkg_needs_set(roots, name, version);
-  printf("added %s %s\n", name, pkg_version_text(version));
   return 1;
 }
 
@@ -1741,7 +1744,14 @@ static int pkg_cmd_add(int argc, char **argv) {
       return 0;
     }
   }
-  return pkg_apply_roots(&manifest.needs, &lock);
+  if (!pkg_apply_roots(&manifest.needs, &lock)) {
+    return 0;
+  }
+  for (size_t i = 0; i < manifest.needs.count; i++) {
+    printf("requires %s %s\n", manifest.needs.items[i].name,
+           pkg_version_text(manifest.needs.items[i].version));
+  }
+  return 1;
 }
 
 static int pkg_cmd_remove(int argc, char **argv) {
