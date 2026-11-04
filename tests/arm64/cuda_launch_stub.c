@@ -117,6 +117,8 @@ int cuEventCreate(int64_t *event, unsigned flags) { (void)flags; return stub_out
 int cuEventDestroy_v2(int64_t event) { (void)event; return 0; }
 int cuEventRecord(int64_t event, int64_t stream) { (void)event; (void)stream; return 0; }
 int cuEventSynchronize(int64_t event) { (void)event; return 0; }
+int cuEventQuery(int64_t event) { (void)event; return 0; }
+int cuStreamQuery(int64_t stream) { (void)stream; return 0; }
 int cuEventElapsedTime(float *ms, int64_t start, int64_t end) {
   if (ms) *ms = 0.0f;
   (void)start; (void)end;
