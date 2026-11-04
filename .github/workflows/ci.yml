@@ -516,6 +516,9 @@ jobs:
       - name: Build compiler
         run: make -k -j"$(sysctl -n hw.ncpu)"
 
+      - name: Package registry
+        run: python3 website/registry.py check --compiler ./bin/mettle
+
       - name: Build and run programs
         run: |
           ./bin/mettle --build examples/hello/hello.mettle -o /tmp/hello
