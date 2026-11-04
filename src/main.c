@@ -45,6 +45,7 @@
 #include "ir/ir_purity.h"
 #include "ir/ir_twins.h"
 #include "ir/ir_machine.h"
+#include "pkg.h"
 #include "tune.h"
 #include "ir/ir_trace.h"
 #include "ir/ir_explain_ledger.h"
@@ -439,7 +440,7 @@ static void print_doc_reference(const char *argv0, const char *relative_path) {
   free(docs_dir);
 }
 
-#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify, test (alias: trace)"
+#define METTLE_HELP_TOPICS "build, runtime (alias: heap, gc), interop, stdlib, web, diagnostics (alias: errors), verify, test (alias: trace), pkg"
 
 static int print_help_topic(const char *program_name, const char *argv0,
                             const char *topic) {
@@ -519,6 +520,13 @@ static int print_help_topic(const char *program_name, const char *argv0,
     printf("      Interpret one function on concrete arguments and print its\n");
     printf("      source annotated with the values each line produced.\n");
     print_doc_reference(argv0, "testing.md");
+    return 0;
+  }
+
+  if (strcmp(topic, "pkg") == 0 || strcmp(topic, "packages") == 0) {
+    char *help_argv[] = {(char *)argv0, (char *)"pkg", (char *)"help", NULL};
+    mettle_pkg_main(3, help_argv, METTLE_VERSION);
+    print_doc_reference(argv0, "packages.md");
     return 0;
   }
 
@@ -4778,6 +4786,9 @@ int main(int argc, char *argv[]) {
                                    self_path ? self_path : argv[0]);
       free(self_path);
       return tuned;
+    }
+    if (strcmp(argv[1], "pkg") == 0) {
+      return mettle_pkg_main(argc, argv, METTLE_VERSION);
     }
     if (strcmp(argv[1], "explain") == 0) {
       if (argc >= 4) {
