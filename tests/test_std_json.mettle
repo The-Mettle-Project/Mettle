@@ -120,6 +120,36 @@ fn main() -> int32 {
   if (count_events("01") != -1) { return 53; }
   if (count_events("[1] 2") != -1) { return 54; }
 
+  // Untrusted input: bad UTF-8, lone surrogates and raw control bytes fail.
+  var bad: uint8[8];
+  bad[0] = (uint8)34; bad[1] = (uint8)0xC0; bad[2] = (uint8)0xAF; bad[3] = (uint8)34;   // overlong '/'
+  if (count_events(str_from_bytes((cstring)&bad[0], (int64)4)) != -1) { return 55; }
+  bad[1] = (uint8)0xED; bad[2] = (uint8)0xA0; bad[3] = (uint8)0x80; bad[4] = (uint8)34;  // encoded surrogate
+  if (count_events(str_from_bytes((cstring)&bad[0], (int64)5)) != -1) { return 56; }
+  bad[1] = (uint8)0xE2; bad[2] = (uint8)0x82; bad[3] = (uint8)34;                         // cut short
+  if (count_events(str_from_bytes((cstring)&bad[0], (int64)4)) != -1) { return 57; }
+  bad[1] = (uint8)0xE2; bad[2] = (uint8)0x82; bad[3] = (uint8)0xAC; bad[4] = (uint8)34;  // the euro sign is fine
+  if (count_events(str_from_bytes((cstring)&bad[0], (int64)5)) != 1) { return 58; }
+  bad[1] = (uint8)9; bad[2] = (uint8)34;                                                  // raw tab
+  if (count_events(str_from_bytes((cstring)&bad[0], (int64)3)) != -1) { return 59; }
+  if (count_events("\"\\ud800\"") != -1 || count_events("\"\\udc00\"") != -1) { return 100; }
+  if (count_events("\"\\ud83d\\ude00\"") != 1) { return 101; }
+  var ir: JsonReader;
+  var iv: int64 = 0;
+  json_begin(&ir, "[9223372036854775808, -9223372036854775809, 9223372036854775807]");
+  json_next(&ir);
+  json_next(&ir);
+  if (json_read_int64(&ir, &iv)) { return 102; }
+  json_next(&ir);
+  if (json_read_int64(&ir, &iv)) { return 103; }
+  json_next(&ir);
+  if (!json_read_int64(&ir, &iv) || iv != (int64)9223372036854775807) { return 104; }
+  json_begin(&ir, "[[[1]]]");
+  ir.max_depth = 2;
+  json_next(&ir);
+  json_next(&ir);
+  if (json_next(&ir) != JSON_ERROR) { return 105; }
+
   // ---- tree ----
   var arena: Arena* = arena_init((int64)0);
   if (arena == 0) { return 60; }
@@ -147,6 +177,46 @@ fn main() -> int32 {
     case Ok(v): { return 75; }
     case Err(e): { if (e.offset != (int64)11) { return 76; } }
   }
+
+  // Limits.
+  var lim: JsonLimits;
+  lim.max_bytes = (int64)10;
+  match (json_parse_with(arena, "[1, 2, 3, 4, 5]", lim)) {
+    case Ok(v): { return 110; }
+    case Err(e): { if (e.message != "document too large") { return 111; } }
+  }
+  lim.max_bytes = (int64)0;
+  lim.max_values = (int64)4;
+  match (json_parse_with(arena, "[1, 2, 3, 4, 5]", lim)) {
+    case Ok(v): { return 112; }
+    case Err(e): { if (e.message != "too many values") { return 113; } }
+  }
+  lim.max_values = (int64)0;
+  lim.max_depth = 2;
+  match (json_parse_with(arena, "[[[1]]]", lim)) {
+    case Ok(v): { return 114; }
+    case Err(e): { if (e.message != "nested too deep") { return 115; } }
+  }
+  lim.max_depth = 0;
+  lim.reject_duplicates = true;
+  match (json_parse_with(arena, "{{\"a\": 1, \"b\": 2, \"a\": 3}", lim)) {
+    case Ok(v): { return 116; }
+    case Err(e): { if (e.message != "duplicate key") { return 117; } }
+  }
+  match (json_parse(arena, "{{\"a\": 1, \"a\": 3}")) {
+    case Ok(v): { if (json_int_or(json_get(v, "a"), 0) != (int64)1) { return 118; } }
+    case Err(e): { return 119; }
+  }
+
+  // Escaping: U+2028 always, <, > and & in the HTML-safe form.
+  var eb: StrBuf* = strbuf_new(arena, (int64)0);
+  var es: uint8[16];
+  es[0] = (uint8)60; es[1] = (uint8)47; es[2] = (uint8)0xE2; es[3] = (uint8)0x80; es[4] = (uint8)0xA8; es[5] = (uint8)38; es[6] = (uint8)62;
+  json_escape_into(eb, str_from_bytes((cstring)&es[0], (int64)7));
+  if (strbuf_finish_string(eb) != "\"</\\u2028&>\"") { return 120; }
+  var hb2: StrBuf* = strbuf_new(arena, (int64)0);
+  json_escape_html_into(hb2, str_from_bytes((cstring)&es[0], (int64)7));
+  if (strbuf_finish_string(hb2) != "\"\\u003c/\\u2028\\u0026\\u003e\"") { return 121; }
 
   // ---- building and writing ----
   // "line\nnext\t\"q\" \\ " plus a 0x01 byte.

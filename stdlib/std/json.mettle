@@ -43,6 +43,7 @@ export struct JsonReader {
   at: int64;
   depth: int32;
   stack: uint8[128];
+  max_depth: int32;     // json_begin sets JSON_MAX_DEPTH; lower it to taste
   state: int32;
   event: int32;
   start: int64;
@@ -58,6 +59,7 @@ export fn json_begin(reader: JsonReader*, document: string) {
   reader->event = JSON_END;
   reader->start = 0;
   reader->stop = 0;
+  reader->max_depth = JSON_MAX_DEPTH;
 }
 
 fn peek(reader: JsonReader*) -> int32 {
@@ -129,6 +131,43 @@ fn scan_unicode_escape(reader: JsonReader*) -> bool {
   return true;
 }
 
+// One UTF-8 sequence starting at reader->at. Refuses overlong forms,
+// encoded surrogates, values past U+10FFFF and cut-off sequences.
+fn scan_utf8(reader: JsonReader*) -> bool {
+  var c: int32 = peek(reader);
+  var need: int32 = 0;
+  var low: int32 = 0x80;
+  var high: int32 = 0xBF;
+  if (c >= 0xC2 && c <= 0xDF) {
+    need = 1;
+  } else if (c >= 0xE0 && c <= 0xEF) {
+    need = 2;
+    if (c == 0xE0) { low = 0xA0; }
+    if (c == 0xED) { high = 0x9F; }
+  } else if (c >= 0xF0 && c <= 0xF4) {
+    need = 3;
+    if (c == 0xF0) { low = 0x90; }
+    if (c == 0xF4) { high = 0x8F; }
+  } else {
+    return false;
+  }
+  if (reader->at + (int64)need >= reader->length) {
+    return false;
+  }
+  for i in 1..(need + 1) {
+    var b: int32 = (int32)reader->text[reader->at + (int64)i];
+    if (i == 1) {
+      if (b < low || b > high) {
+        return false;
+      }
+    } else if (b < 0x80 || b > 0xBF) {
+      return false;
+    }
+  }
+  reader->at = reader->at + (int64)need + 1;
+  return true;
+}
+
 fn scan_string(reader: JsonReader*) -> bool {
   reader->at = reader->at + 1;
   reader->start = reader->at;
@@ -136,6 +175,12 @@ fn scan_string(reader: JsonReader*) -> bool {
     var c: int32 = peek(reader);
     if (c < 32) {
       return false;
+    }
+    if (c >= 0x80) {
+      if (!scan_utf8(reader)) {
+        return false;
+      }
+      continue;
     }
     reader->at = reader->at + 1;
     if (c == 34) {
@@ -225,7 +270,7 @@ fn after_value(reader: JsonReader*) {
 }
 
 fn open_container(reader: JsonReader*, kind: int32, state: int32, event: int32) -> int32 {
-  if (reader->depth >= JSON_MAX_DEPTH) {
+  if (reader->depth >= reader->max_depth || reader->depth >= JSON_MAX_DEPTH) {
     return fail(reader);
   }
   reader->stack[reader->depth] = (uint8)kind;
@@ -560,12 +605,32 @@ fn json_fail_at(offset: int64, message: string) -> Result<JsonValue*, JsonError>
   return Err(e);
 }
 
+// Limits for json_parse_with. A zero field means no limit (depth is still
+// capped at JSON_MAX_DEPTH).
+export struct JsonLimits {
+  max_depth: int32;          // nesting levels
+  max_bytes: int64;          // document size
+  max_values: int64;         // values in the whole tree
+  reject_duplicates: bool;   // refuse an object that repeats a key
+}
+
 // Parses a whole document into a tree in arena. Strings are decoded and
 // copied; numbers keep their text, so int64 values stay exact. Duplicate
-// keys are kept; json_get finds the first.
+// keys are kept, and json_get finds the first. For untrusted input, use
+// json_parse_with and set limits.
 export fn json_parse(arena: Arena*, document: string) -> Result<JsonValue*, JsonError> {
+  var none: JsonLimits;
+  return json_parse_with(arena, document, none);
+}
+
+export fn json_parse_with(arena: Arena*, document: string, limits: JsonLimits) -> Result<JsonValue*, JsonError> {
+  if (limits.max_bytes > 0 && (int64)document.length > limits.max_bytes) {
+    return json_fail_at(limits.max_bytes, "document too large");
+  }
   var reader: JsonReader;
   json_begin(&reader, document);
+  if (limits.max_depth > 0) { reader.max_depth = limits.max_depth; }
+  var values: int64 = 0;
   var stack: JsonValue*[128];
   var depth: int32 = 0;
   var root: JsonValue* = (JsonValue*)0;
@@ -574,6 +639,11 @@ export fn json_parse(arena: Arena*, document: string) -> Result<JsonValue*, Json
   var event: int32 = json_next(&reader);
   while (event != JSON_END) {
     if (event == JSON_ERROR) {
+      var at_open: bool = reader.at < reader.length &&
+        (reader.text[reader.at] == (uint8)91 || reader.text[reader.at] == (uint8)123);
+      if (reader.depth >= reader.max_depth && at_open) {
+        return json_fail_at(json_error_offset(&reader), "nested too deep");
+      }
       return json_fail_at(json_error_offset(&reader), "invalid JSON");
     }
     if (event == JSON_KEY) {
@@ -601,11 +671,20 @@ export fn json_parse(arena: Arena*, document: string) -> Result<JsonValue*, Json
         default: { v = json_node(arena, JSON_KIND_NULL); }
       }
       if (v == 0 || !ok) { return json_fail_at(reader.at, "out of memory"); }
+      values = values + 1;
+      if (limits.max_values > 0 && values > limits.max_values) {
+        return json_fail_at(reader.start, "too many values");
+      }
       if (depth == 0) {
         root = v;
       } else {
         var parent: JsonValue* = stack[depth - 1];
-        if (parent->kind == JSON_KIND_OBJECT) { v->key = key; }
+        if (parent->kind == JSON_KIND_OBJECT) {
+          if (limits.reject_duplicates && json_get(parent, key) != 0) {
+            return json_fail_at(reader.start, "duplicate key");
+          }
+          v->key = key;
+        }
         json_append_child(parent, v);
       }
       if (event == JSON_OBJECT_START || event == JSON_ARRAY_START) {
@@ -858,20 +937,55 @@ export fn json_remove(obj: JsonValue*, key: string) -> bool {
 
 // ---- Writing ----------------------------------------------------------------
 
-// Appends s as a quoted JSON string. Quotes, backslashes and control bytes
-// are escaped; other bytes pass through as they are.
+// Appends s as a quoted JSON string. Quotes, backslashes, control bytes and
+// U+2028/U+2029 (line breaks to JavaScript) are escaped; other bytes pass
+// through as they are.
 export fn json_escape_into(b: StrBuf*, s: string) -> int32 {
+  return json_escape_with(b, s, false);
+}
+
+// Like json_escape_into, and also escapes <, > and &, so the text is safe
+// inside an HTML <script> element.
+export fn json_escape_html_into(b: StrBuf*, s: string) -> int32 {
+  return json_escape_with(b, s, true);
+}
+
+fn json_put_u(b: StrBuf*, code: int32) -> int32 {
+  var hex: string = "0123456789abcdef";
+  if (strbuf_append_cstr(b, "\\u") == 0) { return 0; }
+  var shift: int32 = 12;
+  while (shift >= 0) {
+    if (strbuf_append_byte(b, (uint8)hex[(int64)((code >> shift) & 15)]) == 0) { return 0; }
+    shift = shift - 4;
+  }
+  return 1;
+}
+
+fn json_escape_with(b: StrBuf*, s: string, html: bool) -> int32 {
   var hex: string = "0123456789abcdef";
   if (strbuf_append_byte(b, (uint8)34) == 0) { return 0; }
   var run: int64 = 0;
   var n: int64 = (int64)s.length;
   for i in 0..n {
     var c: int32 = (int32)s.chars[i];
-    if (c >= 32 && c != 34 && c != 92) { continue; }
+    // U+2028 and U+2029 are E2 80 A8 and E2 80 A9.
+    var sep: bool = c == 0xE2 && i + 2 < n && (int32)s.chars[i + 1] == 0x80 &&
+      ((int32)s.chars[i + 2] == 0xA8 || (int32)s.chars[i + 2] == 0xA9);
+    var markup: bool = html && (c == 60 || c == 62 || c == 38);
+    if (c >= 32 && c != 34 && c != 92 && !sep && !markup) { continue; }
     if (i > run) {
       if (strbuf_append_bytes(b, (cstring)(s.chars + run), i - run) == 0) { return 0; }
     }
     run = i + 1;
+    if (sep) {
+      if (json_put_u(b, 0x2028 + (int32)s.chars[i + 2] - 0xA8) == 0) { return 0; }
+      run = i + 3;   // the next two bytes are >= 0x80 and are skipped
+      continue;
+    }
+    if (markup) {
+      if (json_put_u(b, c) == 0) { return 0; }
+      continue;
+    }
     var esc: int32 = 0;
     switch (c) {
       case 34: { esc = 34; }
@@ -917,6 +1031,7 @@ export struct JsonWriter {
   has_flush: bool;
   flush_at: int64;
   flush: Fn(string) -> bool;
+  html_safe: bool;        // escape <, > and & in strings and keys
 }
 
 export fn json_writer_init(w: JsonWriter*, out: StrBuf*, indent: int32) {
@@ -928,6 +1043,7 @@ export fn json_writer_init(w: JsonWriter*, out: StrBuf*, indent: int32) {
   w->failed = out == 0;
   w->has_flush = false;
   w->flush_at = 0;
+  w->html_safe = false;
 }
 
 // Calls flush with the buffered text each time it reaches threshold bytes
@@ -1005,7 +1121,7 @@ export fn json_key(w: JsonWriter*, key: string) {
   }
   w->items[level] = (uint8)1;
   json_w_newline(w);
-  if (json_escape_into(w->out, key) == 0) { w->failed = true; }
+  if (json_escape_with(w->out, key, w->html_safe) == 0) { w->failed = true; }
   if (w->indent > 0) { json_w_put(w, ": "); } else { json_w_put(w, ":"); }
   w->after_key = true;
 }
@@ -1042,7 +1158,7 @@ export fn json_array_end(w: JsonWriter*) { json_w_close(w, 2, 93); }
 
 export fn json_write_string(w: JsonWriter*, s: string) {
   if (!json_w_value_slot(w)) { return; }
-  if (json_escape_into(w->out, s) == 0) { w->failed = true; }
+  if (json_escape_with(w->out, s, w->html_safe) == 0) { w->failed = true; }
   json_w_value_done(w);
 }
 

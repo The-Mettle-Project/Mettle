@@ -185,14 +185,26 @@ The reader allocates nothing. `json_begin(&reader, text)` starts it, and
 `json_string_length` and `json_string_copy` decode escapes to UTF-8,
 `json_read_int64` and `json_read_float64` read numbers, `json_token` gives the
 raw text, and `json_skip` jumps past a container. `json_error_offset` gives the
-byte where a document went wrong. Nesting stops at 128 levels.
+byte where a document went wrong. Nesting stops at `reader.max_depth`, which
+`json_begin` sets to `JSON_MAX_DEPTH` (128); lower it after `json_begin`.
+
+The reader is strict, for untrusted input: it refuses invalid UTF-8 (overlong
+forms, encoded surrogates, cut-off sequences), lone surrogate escapes such as
+`\ud800`, raw control bytes in strings, and integers that overflow `int64` in
+`json_read_int64`.
 
 `json_parse(arena: Arena*, text: string) -> Result<JsonValue*, JsonError>`
 builds a tree in an arena. A `JsonValue` has a `kind` (`JSON_KIND_NULL`,
 `_BOOL`, `_NUMBER`, `_STRING`, `_ARRAY`, `_OBJECT`), and the children of an
 array or object hang off `first`, linked by `next`, in document order. Numbers
 keep their text, so `int64` values stay exact. `JsonError` has the byte
-`offset` and a `message`.
+`offset` and a `message`. Duplicate keys are kept, and `json_get` returns the
+first.
+
+For untrusted input, use `json_parse_with(arena, text, limits: JsonLimits)`.
+`JsonLimits` has `max_depth`, `max_bytes` (document size), `max_values`
+(values in the whole tree) and `reject_duplicates`, which refuses an object
+that repeats a key. A zero field means no limit.
 
 Every reader below takes a null pointer as missing, so lookups chain:
 `json_int_or(json_get(json_get(cfg, "server"), "port"), 8080)`.
@@ -237,7 +249,12 @@ the calls; `json_writer_finish` returns false if one was out of place or a
 container is still open. `json_writer_flush_to(&w, f: Fn(string) -> bool,
 threshold)` hands the buffered text to `f` each time it reaches `threshold`
 bytes, then empties the buffer, so a large document can go out as it is
-written. `json_escape_into(b: StrBuf*, s: string)` appends one quoted string.
+written. Set `w.html_safe = true` to also escape `<`, `>` and `&`, so the
+output can sit inside an HTML `<script>` element.
+
+`json_escape_into(b: StrBuf*, s: string)` appends one quoted string. It
+escapes quotes, backslashes, control bytes, U+2028 and U+2029.
+`json_escape_html_into` also escapes `<`, `>` and `&`.
 
 ## std/math
 
