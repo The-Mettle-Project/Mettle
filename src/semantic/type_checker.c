@@ -1,4 +1,5 @@
 #include "type_checker_internal.h"
+#include "import_resolver.h"
 
 Symbol *type_checker_resolve_identifier(TypeChecker *checker,
                                         Identifier *identifier) {
@@ -821,6 +822,7 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
     return 0;
   }
 
+  import_resolver_strip_check_only(program);
   return 1;
 }
 

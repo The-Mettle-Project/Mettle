@@ -1,0 +1,2 @@
+import "u";
+export fn c_two() -> int32 { var x: Box = u_box(5); return u_bump() + x.v; }

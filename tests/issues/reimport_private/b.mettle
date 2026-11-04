@@ -1,0 +1,2 @@
+import "u";
+export fn b_two() -> int32 { return u_bump(); }

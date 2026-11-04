@@ -74,6 +74,7 @@ typedef struct ASTNode {
   int type_registered;
   const char *proven_binding;
   int conflict_free_mode;
+  int check_only;
   const struct ComptimeExpansionOrigin *expansion_origin;
 } ASTNode;
 

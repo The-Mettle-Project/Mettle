@@ -1,0 +1,6 @@
+var counter: int32 = 0;
+enum Color { Red, Green }
+struct Box { v: int32; }
+fn u_bump() -> int32 { counter = counter + 1; return counter; }
+fn u_box(v: int32) -> Box { var b: Box; b.v = v; return b; }
+fn u_never() -> int32 { return 99; }

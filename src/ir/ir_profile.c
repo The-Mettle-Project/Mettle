@@ -84,6 +84,10 @@ static int ir_profile_should_instrument(const IRFunction *function) {
     return 0;
   }
 
+  if (function->is_naked) {
+    return 0;
+  }
+
   name = function->name;
   if (strncmp(name, "mettle_profile_", 15) == 0) {
     return 0;

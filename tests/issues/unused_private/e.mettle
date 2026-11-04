@@ -1,0 +1,2 @@
+import "lib";
+fn main() -> int32 { return used(); }

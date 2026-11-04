@@ -1,0 +1,10 @@
+import "std/io";
+import "d";
+import "u";
+fn main() -> int32 {
+  var s: int32 = d_two();
+  var b: Box = u_box(7);
+  if (Green == Red) { return 1; }
+  println("{s} {u_bump()} {counter} {b.v} {u_never()}");
+  return 0;
+}

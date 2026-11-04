@@ -25,6 +25,8 @@ int resolve_imports_of_generated(ASTNode *fragment, const char *base_path,
 int resolve_imports_isolated(ASTNode *program, const char *base_path,
                              ErrorReporter *reporter);
 
+void import_resolver_strip_check_only(ASTNode *program);
+
 const char *import_resolver_module_for_file(const char *resolved_path);
 size_t import_resolver_file_count(void);
 const char *import_resolver_file_at(size_t index);

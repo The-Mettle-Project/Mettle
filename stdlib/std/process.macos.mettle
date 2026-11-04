@@ -156,19 +156,6 @@ struct ProcExec {
   return n + 1;
 }
 
-// Copies s into dst with a NUL. Returns the bytes used.
-@noinline fn proc_put(dst: uint8*, s: string) -> int64 {
-  var src: uint8* = s.chars;
-  var n: int64 = (int64)s.length;
-  var i: int64 = 0;
-  while (i < n) {
-    dst[i] = src[i];
-    i = i + 1;
-  }
-  dst[n] = (uint8)0;
-  return n + 1;
-}
-
 fn proc_cstr_len(p: uint8*) -> int64 {
   var n: int64 = 0;
   while (p[n] != (uint8)0) { n = n + 1; }

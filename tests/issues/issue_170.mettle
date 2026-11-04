@@ -1,0 +1,171 @@
+import "std/io";
+
+fn wipe_from(p: volatile uint8*, n: int64) {
+  var i: int64 = 4;
+  while (i < n) { p[i] = (uint8)0; i = i + 1; }
+}
+fn wipe_zero(p: volatile uint8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) { p[i] = (uint8)0; i = i + 1; }
+}
+fn wipe_inclusive(a: uint8*, n: int64) {
+  var p: volatile uint8* = (volatile uint8*)a;
+  var i: int64 = 1;
+  while (i <= n) { p[i] = (uint8)7; i = i + 1; }
+}
+fn fill_words(p: volatile int32*, n: int32) {
+  for i in 2..n { p[i] = 9; }
+}
+fn walk(start: volatile uint8*, end: volatile uint8*) {
+  var q: volatile uint8* = start;
+  while (q != end) { *q = (uint8)3; q = q + 1; }
+}
+fn cr_wipe(b: uint8*, off: int64, n: int64) {
+  var p: volatile uint8* = (volatile uint8*)b;
+  var i: int64 = off;
+  while (i < n) { p[i] = (uint8)0; i = i + 1; }
+}
+fn copy_in(dst: volatile uint8*, src: uint8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) { dst[i] = src[i]; i = i + 1; }
+}
+fn copy_out(dst: uint8*, src: volatile uint8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) { dst[i] = src[i]; i = i + 1; }
+}
+fn copy_walk(dst: volatile uint8*, src: uint8*, end: uint8*) {
+  var s: uint8* = src;
+  var d: volatile uint8* = dst;
+  while (s != end) { *d = *s; s = s + 1; d = d + 1; }
+}
+fn sum_bytes(p: volatile uint8*, n: int64) -> int64 {
+  var i: int64 = 0;
+  var t: int64 = 0;
+  while (i < n) { t = t + (int64)p[i]; i = i + 1; }
+  return t;
+}
+fn sum_ints(p: volatile int32*, n: int32) -> int32 {
+  var t: int32 = 0;
+  for i in 0..n { t = t + p[i]; }
+  return t;
+}
+fn max_int(p: volatile int32*, n: int32) -> int32 {
+  var t: int32 = 0;
+  for i in 0..n { if (p[i] > t) { t = p[i]; } }
+  return t;
+}
+fn count_eq(p: volatile uint8*, n: int64, c: uint8) -> int64 {
+  var i: int64 = 0;
+  var t: int64 = 0;
+  while (i < n) { if (p[i] == c) { t = t + 1; } i = i + 1; }
+  return t;
+}
+fn find_byte(p: volatile uint8*, n: int64, c: uint8) -> int64 {
+  var i: int64 = 0;
+  while (i < n) { if (p[i] == c) { return i; } i = i + 1; }
+  return -1;
+}
+fn strlen_v(p: volatile uint8*) -> int64 {
+  var i: int64 = 0;
+  while (p[i] != (uint8)0) { i = i + 1; }
+  return i;
+}
+fn equal_v(a: volatile uint8*, b: uint8*, n: int64) -> bool {
+  var i: int64 = 0;
+  while (i < n) { if (a[i] != b[i]) { return false; } i = i + 1; }
+  return true;
+}
+fn add_in_place(p: volatile int32*, n: int32, k: int32) {
+  for i in 0..n { p[i] = p[i] + k; }
+}
+fn dot_v(a: volatile int32*, b: int32*, n: int32) -> int32 {
+  var t: int32 = 0;
+  for i in 0..n { t = t + a[i] * b[i]; }
+  return t;
+}
+fn twice(p: volatile int32*, n: int32) {
+  for i in 0..n { p[0] = i; p[0] = i + 1; }
+}
+fn prefix(p: volatile int32*, n: int32) {
+  var t: int32 = 0;
+  for i in 0..n { t = t + p[i]; p[i] = t; }
+}
+fn shift_up(p: volatile int32*, n: int32) {
+  var i: int32 = n - 1;
+  while (i > 0) { p[i] = p[i - 1]; i = i - 1; }
+}
+fn lower(p: volatile int32*, n: int32, key: int32) -> int32 {
+  var lo: int32 = 0;
+  var hi: int32 = n;
+  while (lo < hi) {
+    var mid: int32 = lo + (hi - lo) / 2;
+    if (p[mid] < key) { lo = mid + 1; } else { hi = mid; }
+  }
+  return lo;
+}
+fn small_const(p: volatile int32*) {
+  for i in 0..4 { p[0] = i; }
+}
+fn unrolled(p: volatile int32*, n: int32) {
+  var i: int32 = 0;
+  @unroll(4) while (i < n) { p[i] = i * 2; i = i + 1; }
+}
+fn floats(p: volatile float64*, n: int32) -> float64 {
+  var t: float64 = 0.0;
+  for i in 0..n { t = t + p[i] * 2.0; }
+  return t;
+}
+fn map_float(p: volatile float32*, n: int32) {
+  for i in 0..n { p[i] = p[i] * 2.0 + 1.0; }
+}
+fn byte_map(p: volatile uint8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) { p[i] = (uint8)(p[i] + (uint8)1); i = i + 1; }
+}
+var flag: volatile int32 = 0;
+fn spin_flag(n: int32) -> int32 {
+  var t: int32 = 0;
+  for i in 0..n { flag = i; t = t + flag; }
+  return t;
+}
+fn main() -> int32 {
+  var a: uint8[64];
+  var b: uint8[64];
+  for i in 0..64 { a[i] = (uint8)1; b[i] = (uint8)(i + 1); }
+  wipe_from((volatile uint8*)&a[0], 16);
+  wipe_zero((volatile uint8*)&a[20], 2);
+  wipe_inclusive(&a[0], 2);
+  walk((volatile uint8*)&a[24], (volatile uint8*)&a[26]);
+  cr_wipe(&a[0], 28, 30);
+  copy_in((volatile uint8*)&a[32], &b[0], 4);
+  copy_out(&a[36], (volatile uint8*)&b[4], 4);
+  copy_walk((volatile uint8*)&a[40], &b[8], &b[12]);
+  var w: int32[16];
+  for i in 0..16 { w[i] = i; }
+  fill_words((volatile int32*)&w[0], 8);
+  add_in_place((volatile int32*)&w[8], 4, 100);
+  var z: int32[4];
+  for i in 0..4 { z[i] = 2; }
+  twice((volatile int32*)&z[3], 5);
+  var s: int64 = 0;
+  for i in 0..64 { s = s * 3 + (int64)a[i]; }
+  var zs: uint8[3] = [(uint8)65, (uint8)66, (uint8)0];
+  println("{s}");
+  println("{sum_bytes((volatile uint8*)&a[0], 64)} {sum_ints((volatile int32*)&w[0], 16)} {max_int((volatile int32*)&w[0], 16)}");
+  println("{count_eq((volatile uint8*)&a[0], 64, (uint8)1)} {find_byte((volatile uint8*)&b[0], 64, (uint8)9)} {strlen_v((volatile uint8*)&zs[0])}");
+  println("{equal_v((volatile uint8*)&b[0], &b[0], 64)} {dot_v((volatile int32*)&w[0], &w[0], 4)} {z[3]} {spin_flag(5)}");
+  var c: int32[8];
+  for i in 0..8 { c[i] = i + 1; }
+  prefix((volatile int32*)&c[0], 8);
+  shift_up((volatile int32*)&c[0], 8);
+  println("{c[0]} {c[1]} {c[7]} {lower((volatile int32*)&c[0], 8, 10)}");
+  small_const((volatile int32*)&c[2]);
+  unrolled((volatile int32*)&c[3], 5);
+  println("{c[2]} {c[3]} {c[7]}");
+  var d: float64[4] = [1.0, 2.0, 3.0, 4.0];
+  var e: float32[4] = [(float32)1.0, (float32)2.0, (float32)3.0, (float32)4.0];
+  map_float((volatile float32*)&e[0], 4);
+  byte_map((volatile uint8*)&b[0], 8);
+  println("{floats((volatile float64*)&d[0], 4)} {e[3]} {b[7]}");
+  return 0;
+}

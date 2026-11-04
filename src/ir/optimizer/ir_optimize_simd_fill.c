@@ -15,7 +15,7 @@ static int ir_simd_collect_body(const IRFunction *function, size_t lo,
     if (ins->op == IR_OP_NOP) {
       continue;
     }
-    if (count >= capacity) {
+    if (count >= capacity || ins->is_volatile) {
       return 0;
     }
     body[count++] = ins;

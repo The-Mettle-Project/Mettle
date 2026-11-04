@@ -1,0 +1,13 @@
+import "std/io";
+
+@naked fn seven() -> int64 {
+  asm {
+    mov rax, 7
+    ret
+  }
+}
+
+fn main() -> int32 {
+  println("{seven()}");
+  return 0;
+}

@@ -1,0 +1,2 @@
+fn unused(s: string) -> int64 { return s.nosuch + undefined_name; }
+export fn used() -> int32 { return 1; }

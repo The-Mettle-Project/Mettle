@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "import_resolver.h"
+#include <stdint.h>
 #include "codegen/binary_emitter.h"
 #include "compiler/compiler_context.h"
 #include "lexer/lexer.h"
@@ -2316,6 +2317,7 @@ static int declaration_is_public_for_import(
 static int declaration_private_copy_present(ASTNode *const *declarations,
                                             size_t count, ASTNode *decl) {
   const char *name = get_declaration_name(decl);
+  int present = 0;
   if (!name || strncmp(name, "__import_", 9) != 0) {
     return 0;
   }
@@ -2323,10 +2325,18 @@ static int declaration_private_copy_present(ASTNode *const *declarations,
     const char *other = get_declaration_name(declarations[i]);
     if (declarations[i]->type == decl->type && other &&
         strcmp(other, name) == 0) {
-      return 1;
+      present = 1;
+      if (!decl->check_only) {
+        declarations[i]->check_only = 0;
+      }
     }
   }
-  return 0;
+  return present;
+}
+
+static const char *declaration_origin_path(const ASTNode *decl,
+                                           const char *importing_path) {
+  return decl->location.filename ? decl->location.filename : importing_path;
 }
 
 static int collect_private_dependency_rewrites(
@@ -2451,6 +2461,10 @@ const char *import_resolver_module_for_file(const char *resolved_path) {
   }
   return NULL;
 }
+
+static char **g_privatized_modules = NULL;
+static size_t g_privatized_module_count = 0;
+static size_t g_privatized_module_capacity = 0;
 
 static char **g_namespaced_modules = NULL;
 static size_t g_namespaced_module_count = 0;
@@ -3301,18 +3315,32 @@ static int expand_import_dependency_closure(Program *prog_data,
     return 0;
   }
 
-  for (size_t i = 0; i < decl_count; i++) {
-    const char *name = get_declaration_name(prog_data->declarations[i]);
-    if (name) {
-      decl_name_map_put(&name_map, name, i);
-    }
-  }
-
   size_t *worklist =
       malloc(decl_count ? decl_count * sizeof(size_t) : sizeof(size_t));
-  if (!worklist) {
+  size_t *next_same_name =
+      malloc(decl_count ? decl_count * sizeof(size_t) : sizeof(size_t));
+  if (!worklist || !next_same_name) {
+    free(worklist);
+    free(next_same_name);
     decl_name_map_destroy(&name_map);
     return 0;
+  }
+
+  for (size_t i = 0; i < decl_count; i++) {
+    const char *name = get_declaration_name(prog_data->declarations[i]);
+    size_t first = 0;
+    next_same_name[i] = SIZE_MAX;
+    if (!name) {
+      continue;
+    }
+    if (decl_name_map_get(&name_map, name, &first)) {
+      while (next_same_name[first] != SIZE_MAX) {
+        first = next_same_name[first];
+      }
+      next_same_name[first] = i;
+    } else {
+      decl_name_map_put(&name_map, name, i);
+    }
   }
 
   size_t worklist_len = 0;
@@ -3325,6 +3353,18 @@ static int expand_import_dependency_closure(Program *prog_data,
   while (worklist_len > 0) {
     size_t decl_index = worklist[--worklist_len];
     size_t names_before = *required_count;
+    size_t same = 0;
+
+    if (decl_name_map_get(&name_map,
+                          get_declaration_name(prog_data->declarations[decl_index]),
+                          &same)) {
+      for (; same != SIZE_MAX; same = next_same_name[same]) {
+        if (!include_flags[same]) {
+          include_flags[same] = 1;
+          worklist[worklist_len++] = same;
+        }
+      }
+    }
 
     collect_dependency_names(prog_data->declarations[decl_index],
                              required_names, required_count,
@@ -3332,14 +3372,20 @@ static int expand_import_dependency_closure(Program *prog_data,
 
     for (size_t n = names_before; n < *required_count; n++) {
       size_t target = 0;
-      if (decl_name_map_get(&name_map, (*required_names)[n], &target) &&
-          !include_flags[target]) {
-        include_flags[target] = 1;
-        worklist[worklist_len++] = target;
+      if (decl_name_map_get(&name_map, (*required_names)[n], &target)) {
+        for (; target != SIZE_MAX; target = next_same_name[target]) {
+          if (!include_flags[target]) {
+            include_flags[target] = 1;
+            worklist[worklist_len++] = target;
+          }
+        }
       }
+      free((*required_names)[n]);
     }
+    *required_count = names_before;
   }
 
+  free(next_same_name);
   free(worklist);
   decl_name_map_destroy(&name_map);
   return 1;
@@ -3867,8 +3913,11 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
   NamespaceBinding *namespace_bindings = NULL;
   size_t namespace_binding_count = 0;
   size_t namespace_binding_capacity = 0;
+  NameRewrite *importer_rewrites = NULL;
+  size_t importer_rewrite_count = 0;
+  size_t importer_rewrite_capacity = 0;
 
-#define ADD_DECL(decl_node)                                                    \
+#define ADD_DECL(decl_node)                                                  \
   do {                                                                         \
     if (new_declaration_count >= new_capacity) {                               \
       size_t grown_capacity = new_capacity == 0 ? 16 : new_capacity * 2;       \
@@ -3938,12 +3987,17 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
         continue;
       }
 
+      int reimport_private = 0;
       if (!import_decl->namespace_alias && import_decl->selected_count == 0 &&
           path_set_contains(ctx->resolved_files, ctx->resolved_count,
                             full_path)) {
-        free(full_path);
-        ast_destroy_node(decl);
-        continue;
+        if (!path_set_contains(g_privatized_modules, g_privatized_module_count,
+                               full_path)) {
+          free(full_path);
+          ast_destroy_node(decl);
+          continue;
+        }
+        reimport_private = 1;
       }
 
       int add_active_status = path_set_add(&ctx->active_files, &ctx->active_count,
@@ -4167,22 +4221,14 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
                       "Failed to process exports (out of memory)");
                 }
               } else {
-                size_t decl_count = imported_prog_data->declaration_count;
-                DeclNameMap name_map;
-                decl_name_map_init(&name_map, decl_count);
-                for (size_t j = 0; j < decl_count; j++) {
-                  const char *dn =
-                      get_declaration_name(imported_prog_data->declarations[j]);
-                  if (dn) {
-                    decl_name_map_put(&name_map, dn, j);
-                  }
+                for (size_t j = 0; j < imported_prog_data->declaration_count;
+                     j++) {
+                  include_flags[j] = is_declaration_exported(
+                      imported_prog_data->declarations[j]);
                 }
-
-                size_t *worklist = malloc(decl_count ? decl_count *
-                                                           sizeof(size_t)
-                                                     : sizeof(size_t));
-                size_t worklist_len = 0;
-                if (!worklist) {
+                if (!expand_import_dependency_closure(
+                        imported_prog_data, include_flags, &required_names,
+                        &required_count, &required_capacity)) {
                   include_all = 1;
                   *had_error = 1;
                   if (ctx->reporter) {
@@ -4190,34 +4236,6 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
                         ctx->reporter, ERROR_INTERNAL, decl->location,
                         "Failed to process exports (out of memory)");
                   }
-                  decl_name_map_destroy(&name_map);
-                } else {
-                  for (size_t j = 0; j < decl_count; j++) {
-                    if (is_declaration_exported(
-                            imported_prog_data->declarations[j])) {
-                      include_flags[j] = 1;
-                      worklist[worklist_len++] = j;
-                    }
-                  }
-
-                  while (worklist_len > 0) {
-                    size_t j = worklist[--worklist_len];
-                    size_t names_before = required_count;
-                    collect_dependency_names(
-                        imported_prog_data->declarations[j], &required_names,
-                        &required_count, &required_capacity);
-                    for (size_t n = names_before; n < required_count; n++) {
-                      size_t target;
-                      if (decl_name_map_get(&name_map, required_names[n],
-                                            &target) &&
-                          !include_flags[target]) {
-                        include_flags[target] = 1;
-                        worklist[worklist_len++] = target;
-                      }
-                    }
-                  }
-                  free(worklist);
-                  decl_name_map_destroy(&name_map);
                 }
               }
             } else {
@@ -4226,32 +4244,49 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
           }
 
           if (import_succeeded && !import_decl->namespace_alias &&
-              (import_decl->selected_count > 0 || has_any_export)) {
+              (import_decl->selected_count > 0 || has_any_export ||
+               reimport_private)) {
             NameRewrite *private_rewrites = NULL;
             size_t private_rewrite_count = 0;
             size_t private_rewrite_capacity = 0;
 
             for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
-              int include_decl = include_all;
-              if (!include_decl && include_flags) {
-                include_decl = include_flags[j];
-              }
-              if (!include_decl ||
-                  declaration_is_public_for_import(
-                      import_decl, imported_prog_data->declarations[j],
-                      has_any_export)) {
+              ASTNode *candidate = imported_prog_data->declarations[j];
+              const char *candidate_name = get_declaration_name(candidate);
+              const char *origin = declaration_origin_path(candidate, full_path);
+              if (!candidate_name ||
+                  (!reimport_private &&
+                   declaration_is_public_for_import(import_decl, candidate,
+                                                    has_any_export))) {
                 continue;
+              }
+
+              if (strcmp(origin, full_path) != 0 &&
+                  strncmp(candidate_name, "__import_", 9) != 0) {
+                path_set_add(&g_privatized_modules, &g_privatized_module_count,
+                             &g_privatized_module_capacity, origin);
               }
 
               if (!collect_private_dependency_rewrites(
                       &private_rewrites, &private_rewrite_count,
-                      &private_rewrite_capacity,
-                      imported_prog_data->declarations[j], full_path)) {
+                      &private_rewrite_capacity, candidate, origin)) {
                 if (ctx->reporter) {
                   error_reporter_add_error(
                       ctx->reporter, ERROR_INTERNAL, decl->location,
                       "Failed to isolate private import dependencies");
                 }
+                *had_error = 1;
+                import_succeeded = 0;
+                break;
+              }
+            }
+
+            for (size_t r = 0; reimport_private && r < private_rewrite_count;
+                 r++) {
+              if (!add_name_rewrite(&importer_rewrites, &importer_rewrite_count,
+                                    &importer_rewrite_capacity,
+                                    private_rewrites[r].old_name,
+                                    private_rewrites[r].new_name)) {
                 *had_error = 1;
                 import_succeeded = 0;
                 break;
@@ -4276,13 +4311,6 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
 
           if (import_succeeded && import_decl->namespace_alias) {
             for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
-              int include_decl = include_all;
-              if (!include_decl && include_flags) {
-                include_decl = include_flags[j];
-              }
-              if (!include_decl) {
-                continue;
-              }
               if (!collect_namespaced_rewrites(
                       &name_rewrites, &name_rewrite_count,
                       &name_rewrite_capacity,
@@ -4363,16 +4391,22 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
             }
           }
 
+          size_t declarations_before_import = new_declaration_count;
           for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
             ASTNode *imp_decl = imported_prog_data->declarations[j];
             int include_decl = import_succeeded ? include_all : 0;
             if (import_succeeded && !include_decl && include_flags) {
               include_decl = include_flags[j];
             }
+            if (import_succeeded && !include_decl &&
+                get_declaration_name(imp_decl)) {
+              imp_decl->check_only = 1;
+              include_decl = 1;
+            }
 
             if (include_decl && !repeated_alias &&
                 declaration_private_copy_present(new_declarations,
-                                                 new_declaration_count,
+                                                 declarations_before_import,
                                                  imp_decl)) {
               ast_destroy_node(imp_decl);
             } else if (include_decl && !repeated_alias) {
@@ -4472,7 +4506,63 @@ process_imports_cleanup:
 
   free_namespace_bindings(namespace_bindings, namespace_binding_count);
 
+  if (importer_rewrite_count > 0 &&
+      !rewrite_program_names(program, importer_rewrites,
+                             importer_rewrite_count, NULL, 0, NULL, 0)) {
+    *had_error = 1;
+  }
+  free_name_rewrites(importer_rewrites, importer_rewrite_count);
+
   return program;
+}
+
+void import_resolver_strip_check_only(ASTNode *program) {
+  Program *prog = program ? (Program *)program->data : NULL;
+  int *live = NULL;
+  char **names = NULL;
+  size_t name_count = 0;
+  size_t name_capacity = 0;
+  size_t kept = 0;
+  int any = 0;
+
+  if (!prog) {
+    return;
+  }
+  for (size_t i = 0; i < prog->declaration_count && !any; i++) {
+    any = prog->declarations[i] && prog->declarations[i]->check_only;
+  }
+  if (!any) {
+    return;
+  }
+  live = calloc(prog->declaration_count, sizeof(int));
+  if (!live) {
+    return;
+  }
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    live[i] = prog->declarations[i] && !prog->declarations[i]->check_only;
+  }
+  if (!expand_import_dependency_closure(prog, live, &names, &name_count,
+                                        &name_capacity)) {
+    free(live);
+    return;
+  }
+  free(names);
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    if (live[i] || !prog->declarations[i]) {
+      if (prog->declarations[i]) {
+        prog->declarations[i]->check_only = 0;
+      }
+      prog->declarations[kept++] = prog->declarations[i];
+    }
+  }
+  free(live);
+  prog->declaration_count = kept;
+  if (program->children) {
+    for (size_t i = 0; i < kept; i++) {
+      program->children[i] = prog->declarations[i];
+    }
+    program->child_count = kept;
+  }
 }
 
 static char **g_kept_resolved_files = NULL;
@@ -4490,6 +4580,10 @@ int resolve_imports_with_options(ASTNode *program, const char *base_path,
   if (!program || program->type != AST_PROGRAM)
     return 0;
   module_name_registry_reset();
+  for (size_t i = 0; i < g_privatized_module_count; i++) {
+    free(g_privatized_modules[i]);
+  }
+  g_privatized_module_count = 0;
   for (size_t i = 0; i < g_kept_resolved_count; i++) {
     free(g_kept_resolved_files[i]);
   }

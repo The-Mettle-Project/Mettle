@@ -1,0 +1,4 @@
+fn term_inside(a: int32, b: int32, c: int32, d: int32) -> int32 { return a + b + c + d; }
+fn other() -> int32 { return term_inside(1, 2, 3, 4); }
+fn term_inside(a: int32) -> int32 { return a * 100; }
+export fn go() -> int32 { return other(); }

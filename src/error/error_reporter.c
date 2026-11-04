@@ -337,6 +337,30 @@ static void error_reporter_drop_non_errors(ErrorReporter *reporter) {
   reporter->count = kept;
 }
 
+static char *error_reporter_without_private_prefixes(const char *text) {
+  char *clean = mettle_strdup(text);
+  char *out = clean;
+  const char *in = text;
+  if (!clean) {
+    return NULL;
+  }
+  while (*in) {
+    if (strncmp(in, "__import_", 9) == 0) {
+      const char *hex = in + 9;
+      while ((*hex >= '0' && *hex <= '9') || (*hex >= 'a' && *hex <= 'f')) {
+        hex++;
+      }
+      if (hex > in + 9 && *hex == '_') {
+        in = hex + 1;
+        continue;
+      }
+    }
+    *out++ = *in++;
+  }
+  *out = '\0';
+  return clean;
+}
+
 static void error_reporter_add_report(ErrorReporter *reporter,
                                       ErrorSeverity severity, SourceSpan span,
                                       ErrorType type, const char *message,
@@ -378,8 +402,9 @@ static void error_reporter_add_report(ErrorReporter *reporter,
   error->span.filename = filename;
   error->filename = filename ? mettle_strdup(filename) : NULL;
   error->source_code = source_code;
-  error->message = mettle_strdup(message);
-  error->suggestion = suggestion ? mettle_strdup(suggestion) : NULL;
+  error->message = error_reporter_without_private_prefixes(message);
+  error->suggestion =
+      suggestion ? error_reporter_without_private_prefixes(suggestion) : NULL;
   error->code_snippet =
       error_reporter_get_line_from_source(source_code, span.line);
   error->span_label = NULL;

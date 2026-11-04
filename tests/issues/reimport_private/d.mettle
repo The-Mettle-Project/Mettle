@@ -1,0 +1,3 @@
+import "b";
+import "c";
+export fn d_two() -> int32 { return b_two() + c_two(); }

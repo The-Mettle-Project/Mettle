@@ -1,0 +1,3 @@
+import "lib";
+import "std/io";
+fn main() -> int32 { println("{go()}"); return 0; }

@@ -2649,6 +2649,13 @@ static int type_checker_bind_function_symbol(
   }
 
   func_symbol->is_initialized = 1;
+  if (existing_before && existing_before->kind == SYMBOL_FUNCTION &&
+      !existing_before->is_forward_declaration) {
+    type_checker_report_duplicate_declaration(checker, declaration->location,
+                                              func_decl->name);
+    symbol_destroy(func_symbol);
+    return 0;
+  }
   if (!symbol_table_resolve_forward_declaration(checker->symbol_table,
                                                 func_symbol)) {
     type_checker_set_error_at_location(

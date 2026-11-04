@@ -273,6 +273,14 @@ static int ir_pass_is_vectorizer(const char *name) {
                   strncmp(name, "outer_vectorize", 15) == 0);
 }
 
+static int ir_pass_rewrites_whole_loop(const char *name) {
+  return ir_pass_is_vectorizer(name) ||
+         (name && (strcmp(name, "prefix_sum_i32") == 0 ||
+                   strcmp(name, "lower_bound_i32") == 0 ||
+                   strcmp(name, "detect_shift_loops") == 0 ||
+                   strcmp(name, "induction_pointer") == 0));
+}
+
 static int ir_no_slp_enabled(void) {
   static int v = -1;
   if (v < 0) {
@@ -326,6 +334,11 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
   }
 
   if (ir_no_simd_enabled() && ir_pass_is_vectorizer(pass->name)) {
+    ir_trace_pass_event(pass->name, "skipped", NULL, -1);
+    return 1;
+  }
+
+  if (audit_volatile && ir_pass_rewrites_whole_loop(pass->name)) {
     ir_trace_pass_event(pass->name, "skipped", NULL, -1);
     return 1;
   }

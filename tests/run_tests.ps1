@@ -21525,7 +21525,16 @@ $issueRegressions = @(
   @{ Name = "issue_driver_accepts_O0"; Command = @("--build", "-O0", "tests/issues/issue_073_074.mettle", "-o", ".tmp/issue_o0.exe"); Expect = @("Built executable") },
   @{ Name = "issue_octal_literals"; Entry = "tests/issues/issue_182.mettle"; Args = @(); Expect = @("493 18446744073709551615 0 1.5 15") },
   @{ Name = "issue_leading_zero_is_an_error"; Command = @("--build", "tests/issues/err_issue_182.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("write 0o755 for octal") },
-  @{ Name = "issue_hoisted_load_from_string_param"; Entry = "tests/issues/issue_159.mettle"; Args = @("--release"); Expect = @("false") }
+  @{ Name = "issue_hoisted_load_from_string_param"; Entry = "tests/issues/issue_159.mettle"; Args = @("--release"); Expect = @("false") },
+  @{ Name = "issue_exportless_module_imported_twice"; Entry = "tests/issues/reimport_private/main.mettle"; Args = @(); Expect = @("8 3 3 7 99") },
+  @{ Name = "issue_exportless_module_imported_twice_release"; Entry = "tests/issues/reimport_private/main.mettle"; Args = @("--release"); Expect = @("8 3 3 7 99") },
+  @{ Name = "issue_unused_private_function_is_checked"; Command = @("--build", "tests/issues/unused_private/e.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("undefined_name") },
+  @{ Name = "issue_duplicate_private_function_is_an_error"; Command = @("--build", "tests/issues/dup_private/m.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Duplicate declaration of 'term_inside'") },
+  @{ Name = "issue_forward_declared_private_function"; Entry = "tests/issues/forward_private/m.mettle"; Args = @(); Expect = @("102") },
+  @{ Name = "issue_profile_runtime_skips_naked"; Entry = "tests/issues/issue_162.mettle"; Args = @("--profile-runtime"); Expect = @("7") },
+  @{ Name = "issue_profile_blocks_skips_naked"; Entry = "tests/issues/issue_162.mettle"; Args = @("--profile-blocks"); Expect = @("7") },
+  @{ Name = "issue_volatile_loops_release"; Entry = "tests/issues/issue_170.mettle"; Args = @("--release"); Expect = @("8498579009051162534", "130 547 111", "33 8 2", "true 163 5 10", "1 1 28 4", "3 0 8", "20.0 9.0 9") },
+  @{ Name = "issue_volatile_loops_debug"; Entry = "tests/issues/issue_170.mettle"; Args = @(); Expect = @("8498579009051162534", "130 547 111", "33 8 2", "true 163 5 10", "1 1 28 4", "3 0 8", "20.0 9.0 9") }
 )
 foreach ($case in $issueRegressions) {
   $total++

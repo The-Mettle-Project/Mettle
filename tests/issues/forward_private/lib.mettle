@@ -1,0 +1,5 @@
+fn later(a: int32) -> int32;
+fn same(a: int32) -> int32 { return a + 1; }
+fn other() -> int32 { return later(1) + same(1); }
+fn later(a: int32) -> int32 { return a * 100; }
+export fn go() -> int32 { return other(); }
