@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>L0001: A metafunction could not run | Mettle</title>
+<meta name="description" content="L0001: A metafunction could not run" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><img src="../assets/mark.svg" alt="" width="22" height="22" />Mettle</a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<h1><span class="code">L0001</span>A metafunction could not run</h1>
+<p class="lede">Reported by the compiler as an error or warning.</p>
+<pre><code>mettle explain L0001</code></pre>
+
+<p>A decorator names no <code>@layout</code> or <code>@generate</code> function, or the one it names trapped, ran out of steps, or returned something the compiler could not read. Metafunctions run in the compile-time interpreter before the program is type checked.</p>
+<p>Fix: import the module that declares the decorator, or fix the function the diagnostic names. <code>--meta-budget=N</code> sets its step budget.</p>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="E0001.html"><span class="c">E0001</span><span class="t">Lexical error</span></a></li><li><a href="E0002.html"><span class="c">E0002</span><span class="t">Syntax error</span></a></li><li><a href="E0003.html"><span class="c">E0003</span><span class="t">Semantic error</span></a></li><li><a href="E0004.html"><span class="c">E0004</span><span class="t">Type mismatch</span></a></li><li><a href="E0005.html"><span class="c">E0005</span><span class="t">Scope error</span></a></li><li><a href="E0006.html"><span class="c">E0006</span><span class="t">I/O error</span></a></li><li><a href="E0007.html"><span class="c">E0007</span><span class="t">Internal compiler error</span></a></li><li><a href="M0101.html"><span class="c">M0101</span><span class="t">Use after free</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></footer>
+</body>
+</html>
