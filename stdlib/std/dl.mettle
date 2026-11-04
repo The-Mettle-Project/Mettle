@@ -1,0 +1,79 @@
+// Windows shared libraries for std/dl: LoadLibraryA, GetProcAddress and
+// FreeLibrary from kernel32.
+
+extern fn dl_w_load(path: uint8*) -> rawptr = "LoadLibraryA";
+extern fn dl_w_sym(handle: rawptr, name: uint8*) -> rawptr = "GetProcAddress";
+extern fn dl_w_free(handle: rawptr) -> int32 = "FreeLibrary";
+extern fn dl_w_error() -> uint32 = "GetLastError";
+
+var g_dl_code: uint32 = 0;
+var g_dl_text: uint8[48];
+
+fn dl_cstr(s: string, buf: uint8*) -> bool {
+  if (s.length >= (uint64)4096) { return false; }
+  for i in 0..s.length {
+    if ((int32)s[i] == 0) { return false; }
+    buf[i] = (uint8)s[i];
+  }
+  buf[(int64)s.length] = (uint8)0;
+  return true;
+}
+
+// Loads a DLL. A name with no path is searched the usual Windows way.
+// Returns a handle, or 0; dl_error says why.
+export fn dl_open(path: string) -> rawptr {
+  var cp: uint8[4096];
+  if (!dl_cstr(path, &cp[0])) { return (rawptr)0; }
+  var h: rawptr = dl_w_load(&cp[0]);
+  if (h == 0) { g_dl_code = dl_w_error(); }
+  return h;
+}
+
+// The address of an exported function or variable, or 0. Cast a function's
+// address to its fn type to call it.
+export fn dl_sym(handle: rawptr, name: string) -> rawptr {
+  var cn: uint8[4096];
+  if (handle == 0 || !dl_cstr(name, &cn[0])) { return (rawptr)0; }
+  var p: rawptr = dl_w_sym(handle, &cn[0]);
+  if (p == 0) { g_dl_code = dl_w_error(); }
+  return p;
+}
+
+// Unloads the DLL once nothing else holds it. Returns 0 or -1.
+export fn dl_close(handle: rawptr) -> int32 {
+  if (handle == 0) { return -1; }
+  if (dl_w_free(handle) == 0) {
+    g_dl_code = dl_w_error();
+    return -1;
+  }
+  return 0;
+}
+
+// The Win32 error code of the last failure as text ("Windows error 126"),
+// or "".
+export fn dl_error() -> string {
+  var s: string;
+  if (g_dl_code == (uint32)0) { return s; }
+  var prefix: string = "Windows error ";
+  var n: int64 = 0;
+  for i in 0..prefix.length {
+    g_dl_text[n] = (uint8)prefix[i];
+    n = n + 1;
+  }
+  var digits: uint8[12];
+  var d: int32 = 0;
+  var v: uint32 = g_dl_code;
+  while (v > (uint32)0) {
+    digits[d] = (uint8)((uint32)48 + v % (uint32)10);
+    v = v / (uint32)10;
+    d = d + 1;
+  }
+  while (d > 0) {
+    d = d - 1;
+    g_dl_text[n] = digits[d];
+    n = n + 1;
+  }
+  s.chars = &g_dl_text[0];
+  s.length = (uint64)n;
+  return s;
+}
