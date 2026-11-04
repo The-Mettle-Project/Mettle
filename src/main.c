@@ -4740,6 +4740,18 @@ static int mettle_check_target_options(CompilerOptions *options,
   return 0;
 }
 
+static int run_tool_subcommand(int argc, char **argv, int *exit_code) {
+  if (strcmp(argv[1], "pkg") == 0) {
+    *exit_code = mettle_pkg_main(argc, argv, METTLE_VERSION);
+    return 1;
+  }
+  if (strcmp(argv[1], "live") == 0) {
+    *exit_code = mettle_live_main(argc, argv);
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   CompilerOptions options = {0};
   mettle_compiler_crash_install(argc, argv);
@@ -4787,8 +4799,9 @@ int main(int argc, char *argv[]) {
       free(self_path);
       return tuned;
     }
-    if (strcmp(argv[1], "pkg") == 0) {
-      return mettle_pkg_main(argc, argv, METTLE_VERSION);
+    int tool_exit_code = 0;
+    if (run_tool_subcommand(argc, argv, &tool_exit_code)) {
+      return tool_exit_code;
     }
     if (strcmp(argv[1], "explain") == 0) {
       if (argc >= 4) {
@@ -4856,9 +4869,6 @@ int main(int argc, char *argv[]) {
       options.why_what = argv[4];
       argv[1] = argv[2];
       argc = split_subcommand_flags(argc, argv, 5, NULL, &(int){0});
-    }
-    if (strcmp(argv[1], "live") == 0) {
-      return mettle_live_main(argc, argv);
     }
     if (strcmp(argv[1], "--live-undo") == 0 && argc >= 3) {
       LivePatchSummary summary;
