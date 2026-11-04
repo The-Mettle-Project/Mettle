@@ -789,13 +789,34 @@ static int mir_guard_one_counter(MirFunction *fn, size_t add_at, size_t ext_at,
          mir_insertions_push(list, fn->insn_count, &jump);
 }
 
+static int mir_block_shares_loop_with_table(const MirCfg *cfg, int block) {
+  int header = cfg->blocks[block].loop_header;
+  if (cfg->blocks[block].loop_depth == 0 || header < 0) {
+    return 0;
+  }
+  for (size_t b = 0; b < cfg->block_count; b++) {
+    if (cfg->blocks[b].loop_header == header &&
+        cfg->fn->insns[cfg->blocks[b].end - 1].op == MIR_JMP_TABLE) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 void mir_guard_counter_wrap(MirFunction *fn) {
   MirCfg cfg;
   MirInsertions list = {0};
   int ok = 1;
+  int has_table = 0;
   unsigned char *canonical;
   if (!fn || fn->insn_count < 3 || fn->vreg_count == 0 ||
       !mir_function_ends_closed(fn)) {
+    return;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    has_table |= fn->insns[i].op == MIR_JMP_TABLE;
+  }
+  if (!has_table) {
     return;
   }
   canonical = mir_canonical_int32_vregs(fn);
@@ -809,7 +830,7 @@ void mir_guard_counter_wrap(MirFunction *fn) {
   }
   for (size_t i = 0; ok && i < fn->insn_count; i++) {
     size_t ext_at = 0;
-    if (cfg.blocks[cfg.block_of[i]].loop_depth > 0 &&
+    if (mir_block_shares_loop_with_table(&cfg, cfg.block_of[i]) &&
         mir_increment_extend_at(fn, i, &ext_at) &&
         cfg.block_of[ext_at] == cfg.block_of[i] &&
         canonical[fn->insns[i].a.vreg] &&

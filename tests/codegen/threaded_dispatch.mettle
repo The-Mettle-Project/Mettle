@@ -471,10 +471,21 @@ fn build_sum(ops: Op*) {
   var n: int32 = 0;
   var probe: int64* = cells - (int64)2147483645;
   while (n < steps) {
-    if (n < 3) {
-      total = total + probe[i];
-    } else {
-      total = total * 2 + (int64)i;
+    switch (n) {
+      case 0:
+      case 1:
+      case 2:
+        total = total + probe[i];
+        break;
+      case 3:
+      case 4:
+      case 5:
+      case 6:
+        total = total * 2 + (int64)i;
+        break;
+      default:
+        total = -1;
+        break;
     }
     i += 1;
     n += 1;
