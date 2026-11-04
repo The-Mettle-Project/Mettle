@@ -390,11 +390,7 @@ static int64_t (*g_live_resume_point)(int64_t stack) = NULL;
 static int64_t (*g_live_recover_wait)(int64_t slot) = NULL;
 static void (*g_live_resume_jump)(int64_t slot) = NULL;
 
-/* With quiet recovery on, a crash that the recovery hook handles prints no
-   report: the hook runs first, and the report is written only if it declines.
-   A supervisor that restarts crashed workers (alph) wants this, since the
-   report costs more than the restart. Off by default, so `mettle live` still
-   shows the report before it waits for a fix. */
+/* Quiet recovery: ask the hook first, and print no report if it resumes. */
 static int g_crash_quiet_recovery = 0;
 
 void mettle_crash_set_quiet_recovery(int32_t on) { g_crash_quiet_recovery = on != 0; }
@@ -752,8 +748,6 @@ static void mettle_crash_terminate_with_code(UINT exit_code) {
   TerminateProcess(process, exit_code);
 }
 
-/* Resumes at the live recovery point if the hook takes the crash. Returns 1
-   when the context was rewritten to resume there. */
 static int mettle_crash_win_try_resume(EXCEPTION_POINTERS *exception_info) {
   const EXCEPTION_RECORD *record = exception_info->ExceptionRecord;
   const CONTEXT *context = exception_info->ContextRecord;
@@ -974,8 +968,6 @@ static void mettle_crash_extract_fault_context(void *ucontext_raw,
 }
 
 #if defined(__linux__) && defined(__x86_64__)
-/* Resumes at the live recovery point if the hook takes the crash. Returns 1
-   when the machine context was rewritten to resume there. */
 static int mettle_crash_posix_try_resume(void *ucontext_raw) {
   if (ucontext_raw) {
     int64_t *slot = mettle_crash_live_resume_slot(

@@ -41,11 +41,7 @@ export fn term_os_write(fd: int64, buf: uint8*, n: int64) -> int64 {
   return syscall(LINUX_SYS_WRITE, fd, buf, n);
 }
 
-// For a secret prompt: echo off, the line editor off (so Ctrl-C arrives at
-// once), and Ctrl-C / Ctrl-\ delivered as bytes instead of signals, so the
-// caller can put the terminal back before acting on them. The whole termios
-// is saved for term_os_secret_end. Returns 0, or a negative code when fd is
-// not a terminal.
+// Echo, line editing and signal keys off; returns 0 or a negative code.
 var g_term_saved: uint32[16];
 
 export fn term_os_secret_begin(fd: int64) -> int64 {
@@ -54,8 +50,7 @@ export fn term_os_secret_begin(fd: int64) -> int64 {
   var t: uint32[16];
   for i in 0..16 { t[i] = g_term_saved[i]; }
   t[LFLAG_AT] = t[LFLAG_AT] & ~((uint32)ECHO | (uint32)ISIG | (uint32)ICANON);
-  // c_cc starts at byte 17: VTIME is c_cc[5] and VMIN c_cc[6]. Wait for one
-  // byte, with no timer.
+  // VTIME = 0, VMIN = 1 (c_cc starts at byte 17).
   var cc: uint8* = (uint8*)&t[0];
   cc[17 + 5] = (uint8)0;
   cc[17 + 6] = (uint8)1;
@@ -66,7 +61,6 @@ export fn term_os_secret_end(fd: int64) {
   syscall(LINUX_SYS_IOCTL, fd, TCSETS, &g_term_saved[0]);
 }
 
-// Sends sig to this process, as the terminal would have.
 export fn term_os_raise(sig: int32) {
   syscall(LINUX_SYS_KILL, syscall(LINUX_SYS_GETPID), (int64)sig);
 }
