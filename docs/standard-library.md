@@ -580,12 +580,15 @@ reactor included.
 
 **Raw calls.** `sock_open(family, NET_TCP or NET_UDP)`, `sock_close`,
 `sock_bind(fd, &addr)`, `sock_listen(fd, backlog)`, `sock_accept(fd, &peer)`,
-`sock_connect(fd, &addr)`, `sock_send(fd, buf, n)`, `sock_recv(fd, buf, n)`,
+`sock_accept_nonblocking(fd, &peer)`, `sock_connect(fd, &addr)`,
+`sock_send(fd, buf, n)`, `sock_recv(fd, buf, n)`,
 `sock_sendto`, `sock_recvfrom`, `sock_shutdown(fd, NET_SHUT_READ, _WRITE or
 _BOTH)`, `sock_local_addr`, `sock_peer_addr`, and `sock_take_error` (the
 pending error, after a non-blocking connect).
 
-Sending never raises SIGPIPE; a closed peer gives `-NET_EPIPE`.
+Sending never raises SIGPIPE; a closed peer gives `-NET_EPIPE`. Every socket
+is close-on-exec. On a non-blocking socket, `sock_connect` returns
+`-NET_EINPROGRESS`; wait for `NET_POLL_OUT`, then read `sock_take_error`.
 
 | Function | Effect |
 |----------|--------|
@@ -627,6 +630,9 @@ The pieces are exported too: `dns_query(&server, name, DNS_TYPE_A or
 DNS_TYPE_AAAA, port, out, max, timeout_ms)` asks one server,
 `dns_build_query` and `dns_parse_response` are the message codec, and
 `dns_hosts_lookup` and `dns_parse_resolv_conf` read the two files' text.
+To resolve on your own event loop, take `dns_system_servers(out, max)`, build
+a query with `dns_new_id` and `dns_build_query`, send it on your own
+non-blocking UDP socket, and read the reply with `dns_parse_response`.
 
 ## std/net
 

@@ -266,6 +266,11 @@ export fn dns_parse_resolv_conf(text: string, out: NetAddr*, max: int32) -> int3
 
 // ---- Queries ----------------------------------------------------------------
 
+// A fresh query id, for callers that build their own queries.
+export fn dns_new_id() -> int32 {
+  return dns_next_id();
+}
+
 fn dns_next_id() -> int32 {
   // Not cryptographic: the OS picks a random source port, which does most
   // of the work against spoofed replies.
@@ -368,6 +373,22 @@ fn dns_ask(server: NetAddr*, name: string, qtype: int32, port: int32, out: NetAd
   return -NET_ETIMEDOUT;
 }
 
+// The nameservers from /etc/resolv.conf, or 127.0.0.1 when there are none.
+// With dns_new_id, dns_build_query and dns_parse_response, this is enough to
+// run lookups on your own non-blocking UDP socket and event loop. On Windows
+// there is no resolv.conf; use net_resolve there.
+export fn dns_system_servers(out: NetAddr*, max: int32) -> int32 {
+  var file: uint8[16384];
+  var n: int32 = 0;
+  var flen: int64 = dns_read_file("/etc/resolv.conf", &file[0], 16384);
+  if (flen > 0) { n = dns_parse_resolv_conf(dns_word(&file[0], 0, flen), out, max); }
+  if (n == 0 && max > 0) {
+    out[0] = net_addr_loopback(NET_IPV4, 53);
+    n = 1;
+  }
+  return n;
+}
+
 // Asks one server for one record type (DNS_TYPE_A or DNS_TYPE_AAAA) and
 // writes the addresses it returns, with port set. Returns the count, 0 for
 // an empty answer, -NET_ETIMEDOUT, or -1000 - rcode when the server answers
@@ -450,15 +471,10 @@ export fn net_resolve(host: string, port: int32, want: int32, out: NetAddr*, max
     if (hn > 0) { return Ok(hn); }
   }
 
+  // With no resolv.conf, glibc and musl both try a local resolver, and so
+  // does dns_system_servers.
   var servers: NetAddr[3];
-  var ns: int32 = 0;
-  flen = dns_read_file("/etc/resolv.conf", &file[0], 16384);
-  if (flen > 0) { ns = dns_parse_resolv_conf(dns_word(&file[0], 0, flen), &servers[0], DNS_MAX_SERVERS); }
-  if (ns == 0) {
-    // With no resolv.conf, glibc and musl both try a local resolver.
-    servers[0] = net_addr_loopback(NET_IPV4, 53);
-    ns = 1;
-  }
+  var ns: int32 = dns_system_servers(&servers[0], DNS_MAX_SERVERS);
 
   var deadline: int64 = net_now_ms() + timeout_ms;
   var got: int32 = 0;

@@ -101,12 +101,22 @@ export fn sock_listen(fd: int64, backlog: int32) -> int64 {
   return syscall(SYS_LISTEN, fd, (int64)backlog);
 }
 
-// Accepts one connection. peer may be null. The new socket inherits
-// nothing; set it non-blocking yourself if you need that.
+// Accepts one connection. peer may be null. The new socket is blocking and
+// close-on-exec.
 export fn sock_accept(fd: int64, peer: NetAddr*) -> int64 {
   var raw: uint8[28];
   var len: int32 = 28;
   var r: int64 = syscall(SYS_ACCEPT4, fd, &raw[0], &len, SOCK_CLOEXEC);
+  if (r >= 0 && peer != 0) { sock_os_from_raw(&raw[0], peer); }
+  return r;
+}
+
+// Like sock_accept, but the new socket is already non-blocking (one
+// accept4 call, so no other thread can see it blocking).
+export fn sock_accept_nonblocking(fd: int64, peer: NetAddr*) -> int64 {
+  var raw: uint8[28];
+  var len: int32 = 28;
+  var r: int64 = syscall(SYS_ACCEPT4, fd, &raw[0], &len, SOCK_CLOEXEC | 0x800);   // SOCK_NONBLOCK
   if (r >= 0 && peer != 0) { sock_os_from_raw(&raw[0], peer); }
   return r;
 }

@@ -128,6 +128,24 @@ fn main() -> int32 {
     case Err(e): { if (e.code != (int64)NET_ECONNREFUSED) { return 32; } }
   }
 
+  // A non-blocking connect and accept, the way an event loop does it.
+  var nl: int64 = 0;
+  match (tcp_listen(&any, 4)) { case Ok(fd): { nl = fd; } case Err(e): { return 35; } }
+  var nb: NetAddr;
+  sock_local_addr(nl, &nb);
+  var nc: int64 = sock_open(NET_IPV4, NET_TCP);
+  sock_set_nonblocking(nc, true);
+  var cr: int64 = sock_connect(nc, &nb);
+  if (cr != 0 && cr != -(int64)NET_EINPROGRESS) { return 36; }
+  if ((sock_wait(nc, NET_POLL_OUT, (int64)1000) & (int64)NET_POLL_OUT) == 0 || sock_take_error(nc) != 0) { return 37; }
+  sock_wait(nl, NET_POLL_IN, (int64)1000);
+  var na: int64 = sock_accept_nonblocking(nl, (NetAddr*)0);
+  if (na < 0) { return 38; }
+  if (sock_recv(na, &got[0], (int64)8) != -(int64)NET_EAGAIN) { return 39; }
+  sock_close(na);
+  sock_close(nc);
+  sock_close(nl);
+
   // IPv6 loopback, when the host has it.
   var any6: NetAddr = net_addr_loopback(NET_IPV6, 0);
   match (tcp_listen(&any6, 4)) {
@@ -179,6 +197,8 @@ fn main() -> int32 {
   if (dns_hosts_lookup(hosts, "DB.internal", 5490, DNS_WANT_ANY, &found[0], 4) != 1) { return 62; }
   if (!fmt_is(found[0], "10.0.0.5:5490")) { return 63; }
   if (dns_hosts_lookup(hosts, "db", 1, DNS_WANT_V6, &found[0], 4) != 0) { return 64; }
+  var sys_ns: NetAddr[3];
+  if (dns_system_servers(&sys_ns[0], 3) < 1) { return 76; }
   var servers: NetAddr[3];
   if (dns_parse_resolv_conf("search lan\nnameserver 10.0.0.1\nnameserver ::1\n", &servers[0], 3) != 2) { return 65; }
   if (!fmt_is(servers[1], "[::1]:53")) { return 66; }

@@ -131,6 +131,13 @@ export fn sock_accept(fd: int64, peer: NetAddr*) -> int64 {
   return r;
 }
 
+// Like sock_accept, but the new socket is non-blocking.
+export fn sock_accept_nonblocking(fd: int64, peer: NetAddr*) -> int64 {
+  var r: int64 = sock_accept(fd, peer);
+  if (r >= 0) { sock_set_nonblocking(r, true); }
+  return r;
+}
+
 // -NET_EINPROGRESS on a non-blocking socket means the connect is under way;
 // wait for NET_POLL_OUT, then read sock_take_error.
 export fn sock_connect(fd: int64, a: NetAddr*) -> int64 {
