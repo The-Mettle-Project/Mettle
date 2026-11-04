@@ -3687,27 +3687,40 @@ mt_u32 mettle_mutex_wait(mt_i64 handle, mt_u32 milliseconds) {
   if (!mutex) {
     return MT_WAIT_FAILED;
   }
-  mt_i64 timeout_value[2];
-  const void *timeout = MT_NULL;
-  if (milliseconds != MT_INFINITE) {
-    timeout_value[0] = milliseconds / 1000u;
-    timeout_value[1] = (milliseconds % 1000u) * 1000000u;
-    timeout = timeout_value;
+  /* state is 0 free, 1 locked, 2 locked with waiters. One deadline covers
+     the whole call: a waiter woken by an unlock that another thread wins
+     waits again only for the time that is left. */
+  int expected = 0;
+  if (__atomic_compare_exchange_n(&mutex->state, &expected, 1, 0,
+                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    return MT_WAIT_OBJECT_0;
   }
-  for (;;) {
-    int expected = 0;
-    if (__atomic_compare_exchange_n(&mutex->state, &expected, 1, 0,
-                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-      return MT_WAIT_OBJECT_0;
+  mt_i64 deadline = -1;
+  mt_i64 now[2];
+  if (milliseconds != MT_INFINITE) {
+    clock_gettime(1, now);
+    deadline = now[0] * 1000000000 + now[1] + (mt_i64)milliseconds * 1000000;
+  }
+  while (__atomic_exchange_n(&mutex->state, 2, __ATOMIC_ACQUIRE) != 0) {
+    mt_i64 timeout_value[2];
+    const void *timeout = MT_NULL;
+    if (deadline >= 0) {
+      clock_gettime(1, now);
+      mt_i64 left = deadline - (now[0] * 1000000000 + now[1]);
+      if (left <= 0) {
+        return MT_WAIT_TIMEOUT;
+      }
+      timeout_value[0] = left / 1000000000;
+      timeout_value[1] = left % 1000000000;
+      timeout = timeout_value;
     }
-    int result = mt_futex(&mutex->state, MT_FUTEX_WAIT, 1, timeout);
-    if (result < 0 && mt_errno_value == 110) {
-      return MT_WAIT_TIMEOUT;
-    }
-    if (result < 0 && mt_errno_value != 4 && mt_errno_value != 11) {
+    int result = mt_futex(&mutex->state, MT_FUTEX_WAIT, 2, timeout);
+    if (result < 0 && mt_errno_value != 110 && mt_errno_value != 4 &&
+        mt_errno_value != 11) {
       return MT_WAIT_FAILED;
     }
   }
+  return MT_WAIT_OBJECT_0;
 }
 
 int mettle_mutex_release(mt_i64 handle) {
@@ -3715,8 +3728,10 @@ int mettle_mutex_release(mt_i64 handle) {
   if (!mutex) {
     return 0;
   }
-  __atomic_store_n(&mutex->state, 0, __ATOMIC_RELEASE);
-  mt_futex(&mutex->state, MT_FUTEX_WAKE, 1, MT_NULL);
+  /* Only a contended lock has anyone to wake. */
+  if (__atomic_exchange_n(&mutex->state, 0, __ATOMIC_RELEASE) == 2) {
+    mt_futex(&mutex->state, MT_FUTEX_WAKE, 1, MT_NULL);
+  }
   return 1;
 }
 

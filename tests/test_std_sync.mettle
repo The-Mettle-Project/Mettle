@@ -1,0 +1,150 @@
+// std/sync: mutex, condition variable, reader/writer lock and semaphore,
+// under real threads, and timeouts that keep their deadline.
+import "std/sync";
+import "std/thread";
+import "std/io";
+
+var g_m: SyncMutex;
+var g_total: int64 = 0;
+
+fn add_many(arg: cstring) -> uint32 {
+  for i in 0..20000 {
+    sync_mutex_lock(&g_m);
+    g_total = g_total + 1;
+    sync_mutex_unlock(&g_m);
+  }
+  return (uint32)0;
+}
+
+// Producer and consumer over a one-slot box.
+var g_box_m: SyncMutex;
+var g_box_c: SyncCond;
+var g_box_full: int32 = 0;
+var g_box_value: int64 = 0;
+var g_box_sum: int64 = 0;
+
+fn consume(arg: cstring) -> uint32 {
+  for i in 0..1000 {
+    sync_mutex_lock(&g_box_m);
+    while (g_box_full == 0) { sync_cond_wait(&g_box_c, &g_box_m); }
+    g_box_sum = g_box_sum + g_box_value;
+    g_box_full = 0;
+    sync_cond_broadcast(&g_box_c);
+    sync_mutex_unlock(&g_box_m);
+  }
+  return (uint32)0;
+}
+
+// Writers keep two counters equal; readers check they always are.
+var g_rw: SyncRwLock;
+var g_a: int64 = 0;
+var g_b: int64 = 0;
+var g_torn: int32 = 0;
+
+fn rw_writer(arg: cstring) -> uint32 {
+  for i in 0..5000 {
+    sync_rwlock_write(&g_rw);
+    g_a = g_a + 1;
+    g_b = g_b + 1;
+    sync_rwlock_unlock(&g_rw);
+  }
+  return (uint32)0;
+}
+
+fn rw_reader(arg: cstring) -> uint32 {
+  for i in 0..5000 {
+    sync_rwlock_read(&g_rw);
+    if (g_a != g_b) { g_torn = 1; }
+    sync_rwlock_unlock(&g_rw);
+  }
+  return (uint32)0;
+}
+
+var g_sem: SyncSem;
+var g_sem_got: int32 = 0;
+
+fn sem_taker(arg: cstring) -> uint32 {
+  for i in 0..100 {
+    sync_sem_acquire(&g_sem);
+    atomic_inc_i32(&g_sem_got);
+  }
+  return (uint32)0;
+}
+
+fn start(f: fn(cstring) -> uint32) -> int64 {
+  var tid: uint32 = 0;
+  return CreateThread((cstring)0, (uint64)0, f, (cstring)0, (uint32)0, &tid);
+}
+
+fn check(ok: bool, id: int32) -> int32 {
+  if (!ok) { println("test_std_sync: check {id} failed"); return id; }
+  return 0;
+}
+
+fn main() -> int32 {
+  // Mutex under contention.
+  var t: int64[4];
+  for i in 0..4 { t[i] = start(&add_many); }
+  for i in 0..4 { thread_join_infinite(t[i]); }
+  if (g_total != 80000) { return check(false, 1); }
+
+  // try_lock and a timed lock that gives up on time.
+  sync_mutex_lock(&g_m);
+  if (sync_mutex_try_lock(&g_m)) { return check(false, 2); }
+  var t0: int64 = sync_os_now_ns();
+  if (sync_mutex_lock_timeout(&g_m, 50)) { return check(false, 3); }
+  var spent: int64 = sync_os_now_ns() - t0;
+  if (spent < 45000000 || spent > 1000000000) { return check(false, 4); }
+  sync_mutex_unlock(&g_m);
+  if (!sync_mutex_lock_timeout(&g_m, 50)) { return check(false, 5); }
+  sync_mutex_unlock(&g_m);
+
+  // Condition variable: hand 1000 values to a consumer.
+  var ct: int64 = start(&consume);
+  var want: int64 = 0;
+  for i in 1..1001 {
+    sync_mutex_lock(&g_box_m);
+    while (g_box_full != 0) { sync_cond_wait(&g_box_c, &g_box_m); }
+    g_box_value = (int64)i;
+    g_box_full = 1;
+    want = want + (int64)i;
+    sync_cond_broadcast(&g_box_c);
+    sync_mutex_unlock(&g_box_m);
+  }
+  thread_join_infinite(ct);
+  if (g_box_sum != want) { return check(false, 6); }
+  // A wait with no signal times out, and still hands the lock back.
+  var lone_c: SyncCond;
+  sync_mutex_lock(&g_box_m);
+  t0 = sync_os_now_ns();
+  if (sync_cond_wait_timeout(&lone_c, &g_box_m, 30)) { return check(false, 7); }
+  spent = sync_os_now_ns() - t0;
+  if (spent < 25000000 || spent > 1000000000) { return check(false, 8); }
+  if (sync_mutex_try_lock(&g_box_m)) { return check(false, 9); }
+  sync_mutex_unlock(&g_box_m);
+
+  // Reader/writer lock: shared reads, exclusive writes.
+  sync_rwlock_read(&g_rw);
+  if (!sync_rwlock_try_read(&g_rw)) { return check(false, 10); }
+  if (sync_rwlock_try_write(&g_rw)) { return check(false, 11); }
+  if (sync_rwlock_write_timeout(&g_rw, 30)) { return check(false, 12); }
+  sync_rwlock_unlock(&g_rw);
+  sync_rwlock_unlock(&g_rw);
+  if (!sync_rwlock_try_write(&g_rw)) { return check(false, 13); }
+  if (sync_rwlock_try_read(&g_rw) || sync_rwlock_read_timeout(&g_rw, 20)) { return check(false, 14); }
+  sync_rwlock_unlock(&g_rw);
+  var rt: int64[6];
+  for i in 0..2 { rt[i] = start(&rw_writer); }
+  for i in 2..6 { rt[i] = start(&rw_reader); }
+  for i in 0..6 { thread_join_infinite(rt[i]); }
+  if (g_torn != 0 || g_a != 10000 || g_b != 10000) { return check(false, 15); }
+
+  // Semaphore: 200 units over two takers.
+  if (sync_sem_try_acquire(&g_sem) || sync_sem_acquire_timeout(&g_sem, 20)) { return check(false, 16); }
+  var st: int64[2];
+  for i in 0..2 { st[i] = start(&sem_taker); }
+  for i in 0..200 { sync_sem_release(&g_sem); }
+  for i in 0..2 { thread_join_infinite(st[i]); }
+  if (g_sem_got != 200 || g_sem.count != 0) { return check(false, 17); }
+  return 0;
+}

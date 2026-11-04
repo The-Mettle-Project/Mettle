@@ -3251,7 +3251,10 @@ if ($IsLinux) {
     @{ Name = "std_socket"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true },
     @{ Name = "std_socket_release"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_http"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true },
-    @{ Name = "std_http_release"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true; Args = @("--release") }
+    @{ Name = "std_http_release"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_sync"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_sync_release"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "mutex_timeout_deadline"; Path = "tests/test_mutex_timeout_deadline.mettle"; ShouldSucceed = $true }
   )
 }
 

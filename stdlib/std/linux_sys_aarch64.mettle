@@ -37,3 +37,19 @@ export const LINUX_SYS_EPOLL_CREATE1 = 20;
 // struct epoll_event has natural alignment on AArch64: the data starts at 8.
 export const LINUX_EPOLL_EVENT_SIZE = 16;
 export const LINUX_EPOLL_DATA_AT = 8;
+
+// Processes and signals.
+export const LINUX_SYS_READ = 63;
+export const LINUX_SYS_WRITE = 64;
+export const LINUX_SYS_RT_SIGPROCMASK = 135;
+export const LINUX_SYS_CLONE = 220;
+export const LINUX_SYS_EXECVE = 221;
+export const LINUX_SYS_EXIT = 93;
+export const LINUX_SYS_WAIT4 = 260;
+export const LINUX_SYS_CHDIR = 49;
+export const LINUX_SYS_GETPPID = 173;
+export const LINUX_SYS_SETSID = 157;
+export const LINUX_SYS_EXIT_GROUP = 94;
+export const LINUX_SYS_SIGNALFD4 = 74;
+export const LINUX_SYS_DUP3 = 24;
+export const LINUX_SYS_PIPE2 = 59;

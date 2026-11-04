@@ -437,6 +437,34 @@ ones that do take a resource, `CreateThread` and `CreateMutexA`, declare
 nothing and are read as performing anything, which is what an unannotated
 extern means.
 
+## std/sync
+
+Locks and condition variables for threads: `SyncMutex`, `SyncCond`,
+`SyncRwLock` and `SyncSem`. Linux, macOS and Windows. Each is a plain struct
+whose zero value is ready to use, so `var m: SyncMutex;` or a zeroed field
+needs no setup, and none of them allocates. Share them by pointer, never by
+copy.
+
+Every timed call takes milliseconds and keeps one deadline for the whole call,
+so a waiter that is woken and loses the race waits only for the time that is
+left. A negative timeout waits forever. The timed calls return false on
+timeout.
+
+| Function | Effect |
+|----------|--------|
+| `sync_mutex_lock(&m)`, `sync_mutex_lock_timeout(&m, ms) -> bool`, `sync_mutex_try_lock(&m) -> bool`, `sync_mutex_unlock(&m)` | A mutex. An unlock with nobody waiting makes no system call |
+| `sync_cond_wait(&c, &m)`, `sync_cond_wait_timeout(&c, &m, ms) -> bool` | Unlock `m`, wait, and lock `m` again. It can wake for no reason, so wait in a loop that re-checks |
+| `sync_cond_signal(&c)`, `sync_cond_broadcast(&c)` | Wake one waiter, or all |
+| `sync_rwlock_read(&l)`, `sync_rwlock_read_timeout`, `sync_rwlock_try_read` | Shared hold |
+| `sync_rwlock_write(&l)`, `sync_rwlock_write_timeout`, `sync_rwlock_try_write` | Exclusive hold. A waiting writer keeps new readers out |
+| `sync_rwlock_unlock(&l)` | Release either kind |
+| `sync_sem_acquire(&s)`, `sync_sem_acquire_timeout`, `sync_sem_try_acquire`, `sync_sem_release(&s)` | A counting semaphore; set `s.count` before sharing it |
+
+They sit on the platform's wait-on-address call, which `std/sync_os` exports:
+`sync_os_wait(addr, expected, timeout_ns)`, `sync_os_wake(addr, all)` and
+`sync_os_now_ns()`. That is futex on Linux and `__ulock_wait` on macOS. On
+Windows it is built from kernel32's SRW locks and condition variables.
+
 ## std/parallel
 
 Runs one body over a range of indexes across the machine's cores. Both

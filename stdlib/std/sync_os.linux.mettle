@@ -1,0 +1,33 @@
+// Linux waiting for std/sync: the futex system call.
+
+import "std/linux_sys";
+
+const FUTEX_WAIT_PRIVATE = 128;
+const FUTEX_WAKE_PRIVATE = 129;
+
+// Sleeps while *addr == expected, for at most timeout_ns (negative waits
+// forever). It may also return early for no reason; callers re-check.
+export fn sync_os_wait(addr: int32*, expected: int32, timeout_ns: int64) {
+  if (timeout_ns < 0) {
+    syscall(LINUX_SYS_FUTEX, addr, FUTEX_WAIT_PRIVATE, (int64)expected, 0, 0, 0);
+    return;
+  }
+  var ts: int64[2];
+  ts[0] = timeout_ns / 1000000000;
+  ts[1] = timeout_ns % 1000000000;
+  syscall(LINUX_SYS_FUTEX, addr, FUTEX_WAIT_PRIVATE, (int64)expected, &ts[0], 0, 0);
+}
+
+// Wakes one waiter on addr, or all of them.
+export fn sync_os_wake(addr: int32*, all: bool) {
+  var n: int64 = 1;
+  if (all) { n = 0x7FFFFFFF; }
+  syscall(LINUX_SYS_FUTEX, addr, FUTEX_WAKE_PRIVATE, n, 0, 0, 0);
+}
+
+// Nanoseconds on the monotonic clock.
+export fn sync_os_now_ns() -> int64 {
+  var ts: int64[2];
+  if (syscall(LINUX_SYS_CLOCK_GETTIME, 1, &ts[0]) < 0) { return 0; }
+  return ts[0] * 1000000000 + ts[1];
+}
