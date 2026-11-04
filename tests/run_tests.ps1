@@ -10391,6 +10391,73 @@ catch {
   Write-CaseResult -Name "mettle_deps_package_resolution" -Passed $false -Reason $_.Exception.Message
 }
 
+# A one-component import reaches a package's main module only when every other
+# lookup misses, so adding a package to mettle.deps never changes which file a
+# program already compiles.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $mainCompiler = (Resolve-Path $CompilerPath).Path
+  $mainRoot = Join-Path $tmpDir "mettle-deps-main-module"
+  if (Test-Path $mainRoot) { Remove-Item -Path $mainRoot -Recurse -Force }
+
+  function Write-MainFile([string]$Path, [string]$Text) {
+    New-Item -Path (Split-Path $Path) -ItemType Directory -Force | Out-Null
+    [System.IO.File]::WriteAllText($Path, $Text)
+  }
+  function Get-MainAnswer([string]$Project, [string[]]$ExtraArgs = @()) {
+    Push-Location $Project
+    try {
+      $out = & $mainCompiler --build main.mettle -o main.exe @ExtraArgs 2>&1 | ForEach-Object { "$_" }
+      if ($LASTEXITCODE -ne 0) { throw "build failed in ${Project}: $($out -join ' ')" }
+      & (Join-Path $Project "main.exe")
+      return $LASTEXITCODE
+    }
+    finally {
+      Pop-Location
+    }
+  }
+  function New-MainProject([string]$Name) {
+    $project = Join-Path $mainRoot $Name
+    Write-MainFile (Join-Path $project "main.mettle") "import `"logger`";`nfn main() -> int32 { return which(); }`n"
+    Write-MainFile (Join-Path $project "mettle.deps") "logger=./pkgs/logger`n"
+    Write-MainFile (Join-Path $project "pkgs/logger/logger.mettle") "export fn which() -> int32 { return 11; }`n"
+    return $project
+  }
+
+  $packageOnly = New-MainProject "package-only"
+  $answer = Get-MainAnswer $packageOnly
+  if ($answer -ne 11) { throw "with no other file, the package's main module should load: got $answer" }
+
+  $sibling = New-MainProject "sibling"
+  Write-MainFile (Join-Path $sibling "logger.mettle") "export fn which() -> int32 { return 22; }`n"
+  $answer = Get-MainAnswer $sibling
+  if ($answer -ne 22) { throw "a file beside the importer should beat a package's main module: got $answer" }
+
+  $included = New-MainProject "include-dir"
+  $includeDir = Join-Path $included "inc"
+  Write-MainFile (Join-Path $includeDir "logger.mettle") "export fn which() -> int32 { return 33; }`n"
+  $answer = Get-MainAnswer $included @("-I", $includeDir)
+  if ($answer -ne 33) { throw "a -I directory should beat a package's main module: got $answer" }
+
+  $rootFile = New-MainProject "root-file"
+  Write-MainFile (Join-Path $rootFile "pkgs/logger.mettle") "export fn which() -> int32 { return 44; }`n"
+  $answer = Get-MainAnswer $rootFile
+  if ($answer -ne 44) { throw "a file named after the package root should load first, as it always has: got $answer" }
+
+  $nested = New-MainProject "nested"
+  Write-MainFile (Join-Path $nested "pkgs/logger/extra.mettle") "export fn which() -> int32 { return 55; }`n"
+  Write-MainFile (Join-Path $nested "main.mettle") "import `"logger/extra`";`nfn main() -> int32 { return which(); }`n"
+  $answer = Get-MainAnswer $nested
+  if ($answer -ne 55) { throw "a path inside a package should still resolve through mettle.deps: got $answer" }
+
+  Write-CaseResult -Name "mettle_deps_main_module_is_last" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "mettle_deps_main_module_is_last" -Passed $false -Reason $_.Exception.Message
+}
+
 # mettle pkg: a registry built by hand from what `pkg pack` writes, so the client's
 # hash meets an independent one, and every way a download can go wrong is refused.
 $total++

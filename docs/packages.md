@@ -56,8 +56,10 @@ file. A file in your project sees only the packages it requires. A file inside a
 package also sees `.mettle/packages/mettle.deps`, which maps every resolved package.
 Importing a package you only have indirectly fails until you add it.
 
-`import "json";` loads `json.mettle` in the package's root. `import "json/number";`
-loads another file in it.
+`import "json";` loads `json.mettle` in the package's root, unless a file with that
+name is beside the importer or in a `-I` directory: those win, so adding a package
+never changes which file a program compiles. `import "json/number";` loads another
+file in the package.
 
 ## Versions
 
@@ -132,9 +134,6 @@ A package holds source. Paths use letters, digits, `_`, `-`, `.` and `+`. Files 
 names start with a dot are left out. Binaries, archives and links are refused, and
 the limit is 16 MiB. `README.md` appears on the package's page, along with the
 signature of everything it exports. Put `@test` functions in the source.
-
-Import a package's own files as `import "./number";`. A bare `import "number";` looks
-at `mettle.deps` first, so a package named `number` would win.
 
 Check it, then add it to a clone of this repository and open a pull request:
 
