@@ -8024,6 +8024,8 @@ void print_usage(const char *program_name) {
   printf("Usage: %s [options] <input.mettle>\n", program_name);
   printf("       %s help [topic]\n", program_name);
   printf("       %s docs [topic]\n", program_name);
+  printf("       %s pkg <command>    Add and install packages; 'pkg help' for the commands\n",
+         program_name);
   printf("       %s explain <CODE>   Explain a code: a diagnostic (E0004, M0103) or an --explain\n"
          "                            decision (dot-shape-address); 'list' for the index\n",
          program_name);
