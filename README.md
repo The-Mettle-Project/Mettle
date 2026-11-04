@@ -6,33 +6,33 @@
 
 <sub>[Systm](https://systm.co.za/)'s Potentia against llama.cpp from LM Studio, on Gemma 4 12B and 26B-A4B, QAT Q4_0, on one RTX 5060 Ti, with every layer on the GPU and one engine in VRAM at a time. Energy is board joules per token. At 16 requests, throughput is 473 against 446 tokens a second.</sub>
 
-<img src="website/media/readme/close.jpg" width="100%" alt="Everything else stays close to C. Every whole program in the benchmark suite. 1.09× the run time of clang -O3 on average, with the same answers on all 16. 1.13× the run time of clang -O3 -march=native, which leads on all 16. 2 times faster to build a generated 90,000-line file, 7.6 seconds against 16.0. A chart shows all 16 programs; the table below lists them.">
+<img src="website/media/readme/close.jpg" width="100%" alt="Everything else stays close to C. Every whole program in the benchmark suite. 1.04× the run time of clang -O3 on average, with the same answers on all 16. 1.09× the run time of clang -O3 -march=native, which leads on 15 of 16. 1.7 times faster to build a generated 90,000-line file, 6.8 seconds against 11.7. A chart shows all 16 programs; the table below lists them.">
 
 <details>
 <summary>All 16 programs</summary>
 
 | Program | Against `-O3` | Against `-march=native` |
 |---|---:|---:|
-| `bytecode_vm` | 0.71× | 1.06× |
-| `sudoku_solve` | 0.82× | 1.21× |
-| `huffman` | 1.00× | 1.05× |
-| `regex_match` | 1.02× | 1.04× |
-| `voxel_trace` | 1.10× | 1.09× |
-| `lz77` | 1.11× | 1.10× |
-| `word_freq` | 1.11× | 1.08× |
-| `mark_sweep` | 1.11× | 1.07× |
-| `astar_grid` | 1.11× | 1.08× |
-| `interp_ast` | 1.16× | 1.01× |
-| `diff_lcs` | 1.20× | 1.23× |
-| `btree_index` | 1.21× | 1.17× |
-| `csv_query` | 1.22× | 1.17× |
-| `link_resolve` | 1.24× | 1.27× |
-| `json_parse` | 1.26× | 1.28× |
-| `physics_grid` | 1.29× | 1.27× |
+| `bytecode_vm` | 0.42× | 0.65× |
+| `sudoku_solve` | 0.76× | 1.12× |
+| `regex_match` | 0.98× | 1.01× |
+| `huffman` | 1.02× | 1.04× |
+| `csv_query` | 1.04× | 1.06× |
+| `voxel_trace` | 1.09× | 1.12× |
+| `word_freq` | 1.10× | 1.09× |
+| `lz77` | 1.11× | 1.09× |
+| `mark_sweep` | 1.13× | 1.13× |
+| `btree_index` | 1.13× | 1.14× |
+| `astar_grid` | 1.14× | 1.14× |
+| `json_parse` | 1.16× | 1.17× |
+| `link_resolve` | 1.22× | 1.23× |
+| `interp_ast` | 1.22× | 1.05× |
+| `physics_grid` | 1.28× | 1.29× |
+| `diff_lcs` | 1.29× | 1.32× |
 
 </details>
 
-<sub>clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. Under `-march=native`, clang's physics_grid returns a different checksum. Run them with `tools/benchmark/mc.ps1 -Suite 3`.</sub>
+<sub>clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. Under `-march=native`, clang's physics_grid returns a different checksum. Run them with `tools/benchmark/suite3_exhibit.ps1`.</sub>
 
 <img src="website/media/readme/powers.jpg" width="100%" alt="What you can do.">
 

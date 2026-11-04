@@ -1,7 +1,6 @@
 import base64
 import html
 import json
-import math
 import os
 import re
 import shutil
@@ -9,6 +8,7 @@ import subprocess
 import sys
 
 import live_session
+import suite3_facts
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -93,16 +93,15 @@ def main():
     else:
         print("potentia figures: NOT CHECKED, set POTENTIA_README")
 
-    suite3 = json.loads(read(os.path.join(EXHIBITS, "suite3.json")))
-    require(len(suite3) == 16, "16 programs in suite3.json")
-    geo = lambda xs: math.exp(sum(math.log(x) for x in xs) / len(xs))
-    c_o3 = "%.2f" % geo([r["m"] / r["o3"] for r in suite3])
-    c_native = "%.2f" % geo([r["m"] / r["native"] for r in suite3])
+    suite3 = suite3_facts.load(EXHIBITS)
+    c_o3 = suite3["c_o3"]
+    c_native = suite3["c_native"]
     readme = read(os.path.join(REPO, "README.md"))
     require(c_o3 + "\u00d7 the run time of clang -O3" in readme and c_native + "\u00d7 the run time of clang -O3 -march=native" in readme, "the README to carry the same averages")
-    for r in suite3:
+    require("-march=native, which leads on " + suite3["native_leads"] + "." in readme, "the README to say clang leads on " + suite3["native_leads"])
+    require("%s times faster to build a generated 90,000-line file, %s seconds against %s." % (suite3["build_ratio"], suite3["build_m"], suite3["build_c"]) in readme, "the README to carry the same build times")
+    for r in suite3["rows"]:
         require("| `%s` | %.2f\u00d7 | %.2f\u00d7 |" % (r["name"], r["m"] / r["o3"], r["m"] / r["native"]) in readme, "the README table to list " + r["name"])
-    ratios = [r["m"] / r["o3"] for r in suite3]
 
     built, code, cwd = compile_in("reflect", "reflect.mettle", ["--build"], "reflect.mettle")
     require(code == 0, "reflect.mettle to build")
@@ -200,8 +199,11 @@ def main():
         "{{DOCS}}": "https://github.com/The-Mettle-Project/Mettle/blob/master/docs/",
         "{{C_O3}}": c_o3,
         "{{C_NATIVE}}": c_native,
-        "{{C_LOW}}": "%.2f" % min(ratios),
-        "{{C_HIGH}}": "%.2f" % max(ratios),
+        "{{C_LOW}}": suite3["c_low"],
+        "{{C_HIGH}}": suite3["c_high"],
+        "{{C_NATIVE_LEADS}}": suite3["native_leads"],
+        "{{BUILD_M}}": suite3["build_m"],
+        "{{BUILD_C}}": suite3["build_c"],
         "{{REFLECT_CODE}}": esc("\n".join(reflect_src[2:7] + [""] + [l[2:] for l in reflect_src[9:11]])),
         "{{REFLECT_OUT}}": esc(reflect_out.strip()),
         "{{TRACE_OUT}}": esc("\n".join(trace_lines)),
