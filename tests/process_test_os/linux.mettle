@@ -1,0 +1,2 @@
+// test_std_process runs here.
+export const PROC_TEST_RUNS = 1;

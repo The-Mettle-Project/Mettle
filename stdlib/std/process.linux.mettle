@@ -1,0 +1,858 @@
+// Processes on Linux, through raw system calls (x86-64 or AArch64, numbers
+// from std/linux_sys): spawn a program, wait for it, kill it, capture its
+// output, and take signals as a pollable descriptor.
+//
+// Every call that can fail returns 0, a count or a flag, or a negative error
+// code (-errno), the same style as std/socket and std/file. Pipe ends are
+// close-on-exec. The program is started with clone then execve; if execve
+// fails, the child reports the real errno through a close-on-exec pipe, so
+// proc_spawn returns -PROC_ENOENT for a program that does not exist.
+//
+// exit, rand and srand are here because std/prelude takes them from this
+// module; every platform file exports them.
+
+import "std/linux_sys";
+import "std/mem";
+import "std/strbuf";
+
+export extern fn exit(code: int32) = "exit";
+
+export extern fn rand() -> int32 = "rand";
+
+export extern fn srand(seed: int32) = "srand";
+
+// What a child does with each of its standard streams.
+export const PROC_INHERIT = 0;     // share the parent's
+export const PROC_PIPE = 1;        // a pipe; the parent gets the other end
+export const PROC_NULL = 2;        // /dev/null
+export const PROC_TO_STDOUT = 3;   // stderr only: the same place as stdout
+
+export const PROC_SIGHUP = 1;
+export const PROC_SIGINT = 2;
+export const PROC_SIGKILL = 9;
+export const PROC_SIGUSR1 = 10;
+export const PROC_SIGUSR2 = 12;
+export const PROC_SIGPIPE = 13;
+export const PROC_SIGTERM = 15;
+export const PROC_SIGCHLD = 17;
+
+export const PROC_ENOENT = 2;
+export const PROC_ESRCH = 3;
+export const PROC_EINTR = 4;
+export const PROC_E2BIG = 7;
+export const PROC_ECHILD = 10;
+export const PROC_EAGAIN = 11;
+export const PROC_ENOMEM = 12;
+export const PROC_EACCES = 13;
+export const PROC_EINVAL = 22;
+export const PROC_EPIPE = 32;
+export const PROC_ENOSYS = 38;
+export const PROC_ETIMEDOUT = 110;
+
+const PROC_ENOTDIR = 20;
+const PROC_O_CLOEXEC = 0x80000;
+const PROC_O_NONBLOCK = 0x800;
+
+// How a process ended: exited with a code, or was killed by a signal.
+export struct ProcStatus {
+  signaled: int32;   // 1 if a signal killed it, 0 if it exited
+  code: int32;       // the exit code, when signaled is 0
+  signal: int32;     // the signal number, when signaled is 1
+}
+
+export struct ProcOptions {
+  argv: string[];    // argv[0] is the program; it is searched on PATH if it has no '/'
+  env: string[];     // "NAME=value" entries, used only when has_env is 1
+  has_env: int32;    // 0: inherit the parent's environment, 1: use env alone
+  cwd: string;       // the child's working directory; empty keeps the parent's
+  stdin: int32;      // PROC_INHERIT, PROC_PIPE or PROC_NULL
+  stdout: int32;     // PROC_INHERIT, PROC_PIPE or PROC_NULL
+  stderr: int32;     // the same, or PROC_TO_STDOUT
+}
+
+// A running (or finished) child. The pipe fields hold the parent's ends of
+// any PROC_PIPE streams, or -1.
+export struct Proc {
+  pid: int64;
+  stdin_fd: int64;    // write here to feed the child
+  stdout_fd: int64;   // read the child's output here
+  stderr_fd: int64;
+  done: int32;        // 1 once the child has been reaped
+  status: ProcStatus; // valid when done is 1
+}
+
+// Sets the stream modes to PROC_INHERIT, no environment and no directory.
+export fn proc_options_init(o: ProcOptions*, argv: string[]) {
+  var blank: ProcOptions;
+  *o = blank;
+  o->argv = argv;
+}
+
+// ---- building the exec arguments before the fork ---------------------------
+
+// Everything the child needs, built before the fork so the child only makes
+// system calls.
+struct ProcExec {
+  block: uint8*;       // one allocation holding the arrays and strings below
+  envblock: uint8*;    // /proc/self/environ, when the child inherits it
+  argv: uint8**;
+  envp: uint8**;
+  cwd: uint8*;         // 0 to keep the directory
+  paths: uint8**;      // programs to try with execve, ending in 0
+  in_fd: int64;        // descriptors to dup onto 0, 1 and 2, or -1
+  out_fd: int64;
+  err_fd: int64;
+  err_to_out: int32;
+  errw: int64;         // where the child reports an exec failure
+  errv: int64;
+}
+
+// Copies s into dst with a NUL. Returns the bytes used.
+@noinline fn proc_put(dst: uint8*, s: string) -> int64 {
+  var src: uint8* = s.chars;
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = src[i];
+    i = i + 1;
+  }
+  dst[n] = (uint8)0;
+  return n + 1;
+}
+
+// Reads /proc/self/environ into a new block, NUL-terminated. Returns 0 if it
+// cannot be read. *len gets the byte count.
+fn proc_read_environ(len: int64*) -> uint8* {
+  *len = 0;
+  var path: string = "/proc/self/environ";
+  var fd: int64 = syscall(LINUX_SYS_OPENAT, -100, path.chars, PROC_O_CLOEXEC, 0);
+  if (fd < 0) { return (uint8*)0; }
+  var cap: int64 = 16384;
+  var buf: uint8* = malloc(cap);
+  if (buf == (uint8*)0) {
+    syscall(LINUX_SYS_CLOSE, fd);
+    return (uint8*)0;
+  }
+  var n: int64 = 0;
+  while (true) {
+    if (n + 1 >= cap) {
+      cap = cap * 2;
+      var bigger: uint8* = realloc(buf, cap);
+      if (bigger == (uint8*)0) {
+        free(buf);
+        syscall(LINUX_SYS_CLOSE, fd);
+        return (uint8*)0;
+      }
+      buf = bigger;
+    }
+    var r: int64 = syscall(LINUX_SYS_READ, fd, buf + n, cap - n - 1);
+    if (r == -PROC_EINTR) { continue; }
+    if (r <= 0) { break; }
+    n = n + r;
+  }
+  syscall(LINUX_SYS_CLOSE, fd);
+  buf[n] = (uint8)0;
+  *len = n;
+  return buf;
+}
+
+// The value of PATH in an environ block, or 0.
+fn proc_find_path(block: uint8*, len: int64) -> uint8* {
+  var i: int64 = 0;
+  while (i < len) {
+    if (i + 5 <= len && block[i] == (uint8)80 && block[i + 1] == (uint8)65 && block[i + 2] == (uint8)84 && block[i + 3] == (uint8)72 && block[i + 4] == (uint8)61) {
+      return block + i + 5;
+    }
+    while (i < len && block[i] != (uint8)0) { i = i + 1; }
+    i = i + 1;
+  }
+  return (uint8*)0;
+}
+
+fn proc_cstr_len(p: uint8*) -> int64 {
+  var n: int64 = 0;
+  while (p[n] != (uint8)0) { n = n + 1; }
+  return n;
+}
+
+// Builds argv, envp, cwd and the list of programs to try. Returns 0 or
+// -errno. proc_exec_free releases it.
+fn proc_prep(o: ProcOptions*, x: ProcExec*) -> int64 {
+  var blank: ProcExec;
+  *x = blank;
+  var nargs: int64 = (int64)o->argv.length;
+  if (nargs == 0) { return -PROC_EINVAL; }
+  var prog: string = o->argv[0];
+  if (prog.length == 0) { return -PROC_ENOENT; }
+  var proglen: int64 = (int64)prog.length;
+
+  var slash: bool = false;
+  for i in 0..proglen {
+    if ((int32)prog.chars[i] == 47) { slash = true; }
+  }
+
+  // The inherited environment is read when we need it for the child or for PATH.
+  var elen: int64 = 0;
+  if (o->has_env == 0 || !slash) {
+    x->envblock = proc_read_environ(&elen);
+    if (o->has_env == 0 && x->envblock == (uint8*)0) { return -PROC_ENOMEM; }
+  }
+
+  // How many environment entries the child gets.
+  var nenv: int64 = 0;
+  if (o->has_env != 0) {
+    nenv = (int64)o->env.length;
+  } else {
+    for i in 0..elen {
+      if (x->envblock[i] == (uint8)0) { nenv = nenv + 1; }
+    }
+  }
+
+  // The programs to try: argv[0] itself, or argv[0] under each PATH entry.
+  var pathv: uint8* = (uint8*)0;
+  var pathlen: int64 = 0;
+  var ncand: int64 = 1;
+  var cand_bytes: int64 = proglen + 1;
+  if (!slash) {
+    if (x->envblock != (uint8*)0) { pathv = proc_find_path(x->envblock, elen); }
+    var fallback: string = "/bin:/usr/bin";
+    if (pathv == (uint8*)0) { pathv = fallback.chars; }
+    pathlen = proc_cstr_len(pathv);
+    ncand = 1;
+    for i in 0..pathlen {
+      if (pathv[i] == (uint8)58) { ncand = ncand + 1; }
+    }
+    cand_bytes = pathlen + ncand * (proglen + 3);
+  }
+
+  var arg_bytes: int64 = 0;
+  for i in 0..nargs { arg_bytes = arg_bytes + (int64)o->argv[i].length + 1; }
+  var env_bytes: int64 = 0;
+  if (o->has_env != 0) {
+    for i in 0..nenv { env_bytes = env_bytes + (int64)o->env[i].length + 1; }
+  }
+  var cwd_bytes: int64 = (int64)o->cwd.length + 1;
+  var ptr_bytes: int64 = (nargs + 1 + nenv + 1 + ncand + 1) * 8;
+  var total: int64 = ptr_bytes + arg_bytes + env_bytes + cwd_bytes + cand_bytes + 16;
+
+  x->block = malloc(total);
+  if (x->block == (uint8*)0) { return -PROC_ENOMEM; }
+  var base: uint8* = x->block;
+  x->argv = (uint8**)base;
+  x->envp = (uint8**)(base + (nargs + 1) * 8);
+  x->paths = (uint8**)(base + (nargs + 1 + nenv + 1) * 8);
+  var cur: uint8* = base + ptr_bytes;
+
+  for i in 0..nargs {
+    x->argv[i] = cur;
+    cur = cur + proc_put(cur, o->argv[i]);
+  }
+  x->argv[nargs] = (uint8*)0;
+
+  if (o->has_env != 0) {
+    for i in 0..nenv {
+      x->envp[i] = cur;
+      cur = cur + proc_put(cur, o->env[i]);
+    }
+  } else {
+    // Point into the block we read; each entry ends at its NUL.
+    var at: int64 = 0;
+    var k: int64 = 0;
+    while (at < elen) {
+      x->envp[k] = x->envblock + at;
+      k = k + 1;
+      while (at < elen && x->envblock[at] != (uint8)0) { at = at + 1; }
+      at = at + 1;
+    }
+    nenv = k;
+  }
+  x->envp[nenv] = (uint8*)0;
+
+  if (o->cwd.length > 0) {
+    x->cwd = cur;
+    cur = cur + proc_put(cur, o->cwd);
+  }
+
+  if (slash) {
+    x->paths[0] = x->argv[0];
+    x->paths[1] = (uint8*)0;
+  } else {
+    var k: int64 = 0;
+    var at: int64 = 0;
+    while (at <= pathlen) {
+      var start: int64 = at;
+      while (at < pathlen && pathv[at] != (uint8)58) { at = at + 1; }
+      x->paths[k] = cur;
+      k = k + 1;
+      if (at == start) {
+        cur[0] = (uint8)46;     // an empty PATH entry means the current directory
+        cur = cur + 1;
+      } else {
+        for j in start..at {
+          cur[0] = pathv[j];
+          cur = cur + 1;
+        }
+      }
+      cur[0] = (uint8)47;
+      cur = cur + 1;
+      for j in 0..proglen {
+        cur[0] = prog.chars[j];
+        cur = cur + 1;
+      }
+      cur[0] = (uint8)0;
+      cur = cur + 1;
+      at = at + 1;
+    }
+    x->paths[k] = (uint8*)0;
+  }
+  return 0;
+}
+
+fn proc_exec_free(x: ProcExec*) {
+  if (x->block != (uint8*)0) { free(x->block); }
+  if (x->envblock != (uint8*)0) { free(x->envblock); }
+  x->block = (uint8*)0;
+  x->envblock = (uint8*)0;
+}
+
+// ---- descriptors -----------------------------------------------------------
+
+fn proc_close_fd(fd: int64) {
+  if (fd >= 0) { syscall(LINUX_SYS_CLOSE, fd); }
+}
+
+// Moves a descriptor out of 0..2, so dup3 onto the child's standard streams
+// never overwrites a source. Returns the new descriptor or -errno.
+fn proc_fd_high(fd: int64) -> int64 {
+  if (fd >= 3) { return fd; }
+  var n: int64 = syscall(LINUX_SYS_FCNTL, fd, 1030, 3);   // F_DUPFD_CLOEXEC
+  syscall(LINUX_SYS_CLOSE, fd);
+  return n;
+}
+
+// A close-on-exec pipe: *rd and *wr, both 3 or higher.
+fn proc_pipe(rd: int64*, wr: int64*) -> int64 {
+  var fds: int32[2];
+  var r: int64 = syscall(LINUX_SYS_PIPE2, &fds[0], PROC_O_CLOEXEC);
+  if (r < 0) { return r; }
+  var a: int64 = proc_fd_high((int64)fds[0]);
+  if (a < 0) {
+    proc_close_fd((int64)fds[1]);
+    return a;
+  }
+  var b: int64 = proc_fd_high((int64)fds[1]);
+  if (b < 0) {
+    proc_close_fd(a);
+    return b;
+  }
+  *rd = a;
+  *wr = b;
+  return 0;
+}
+
+struct ProcFds {
+  nul: int64;                          // /dev/null, shared by every PROC_NULL stream
+  c_in: int64; c_out: int64; c_err: int64;   // the child's ends
+  p_in: int64; p_out: int64; p_err: int64;   // the parent's ends
+  er: int64; ew: int64;                // the exec-failure pipe
+}
+
+fn proc_fds_init(f: ProcFds*) {
+  f->nul = -1;
+  f->c_in = -1; f->c_out = -1; f->c_err = -1;
+  f->p_in = -1; f->p_out = -1; f->p_err = -1;
+  f->er = -1; f->ew = -1;
+}
+
+// Closes the ends the child owns (and our copy of the exec-failure writer).
+fn proc_fds_close_child_side(f: ProcFds*) {
+  if (f->c_in != f->nul) { proc_close_fd(f->c_in); }
+  if (f->c_out != f->nul) { proc_close_fd(f->c_out); }
+  if (f->c_err != f->nul) { proc_close_fd(f->c_err); }
+  proc_close_fd(f->nul);
+  proc_close_fd(f->ew);
+  f->c_in = -1; f->c_out = -1; f->c_err = -1; f->nul = -1; f->ew = -1;
+}
+
+fn proc_fds_close_parent_side(f: ProcFds*) {
+  proc_close_fd(f->p_in);
+  proc_close_fd(f->p_out);
+  proc_close_fd(f->p_err);
+  proc_close_fd(f->er);
+  f->p_in = -1; f->p_out = -1; f->p_err = -1; f->er = -1;
+}
+
+// Sets up one stream. child_reads is 1 for stdin. Does nothing for PROC_INHERIT.
+fn proc_stdio(mode: int32, child_reads: int32, f: ProcFds*, child_end: int64*, parent_end: int64*) -> int64 {
+  if (mode == PROC_INHERIT) { return 0; }
+  if (mode == PROC_PIPE) {
+    var rd: int64 = -1;
+    var wr: int64 = -1;
+    var r: int64 = proc_pipe(&rd, &wr);
+    if (r < 0) { return r; }
+    if (child_reads != 0) {
+      *child_end = rd;
+      *parent_end = wr;
+    } else {
+      *child_end = wr;
+      *parent_end = rd;
+    }
+    return 0;
+  }
+  if (mode == PROC_NULL) {
+    if (f->nul < 0) {
+      var path: string = "/dev/null";
+      var fd: int64 = syscall(LINUX_SYS_OPENAT, -100, path.chars, 2 | PROC_O_CLOEXEC, 0);   // O_RDWR
+      if (fd < 0) { return fd; }
+      f->nul = proc_fd_high(fd);
+      if (f->nul < 0) { return f->nul; }
+    }
+    *child_end = f->nul;
+    return 0;
+  }
+  return -PROC_EINVAL;
+}
+
+// ---- the child -------------------------------------------------------------
+
+// Reports an exec failure to the parent and exits. Never returns.
+@noinline fn proc_child_die(x: ProcExec*, code: int64) {
+  x.errv = code;
+  syscall(LINUX_SYS_WRITE, x.errw, &x.errv, 4);
+  while (true) { syscall(LINUX_SYS_EXIT_GROUP, 127); }
+}
+
+// Runs in the forked child: only system calls and memory writes. Never returns.
+@noinline fn proc_child(x: ProcExec*) {
+  // The parent may have blocked signals (proc_signal_fd); the child starts clean.
+  var empty: int64 = 0;
+  syscall(LINUX_SYS_RT_SIGPROCMASK, 2, &empty, 0, 8);   // SIG_SETMASK
+  var r: int64 = 0;
+  if (x.in_fd >= 0) {
+    r = syscall(LINUX_SYS_DUP3, x.in_fd, 0, 0);
+    if (r < 0) { proc_child_die(x, -r); }
+  }
+  if (x.out_fd >= 0) {
+    r = syscall(LINUX_SYS_DUP3, x.out_fd, 1, 0);
+    if (r < 0) { proc_child_die(x, -r); }
+  }
+  if (x.err_fd >= 0) {
+    r = syscall(LINUX_SYS_DUP3, x.err_fd, 2, 0);
+    if (r < 0) { proc_child_die(x, -r); }
+  }
+  if (x.err_to_out != 0) {
+    r = syscall(LINUX_SYS_DUP3, 1, 2, 0);
+    if (r < 0) { proc_child_die(x, -r); }
+  }
+  if (x.cwd != (uint8*)0) {
+    r = syscall(LINUX_SYS_CHDIR, x.cwd);
+    if (r < 0) { proc_child_die(x, -r); }
+  }
+  // Like execvp: skip ENOENT and ENOTDIR, remember EACCES, stop on anything else.
+  var err: int64 = PROC_ENOENT;
+  var i: int64 = 0;
+  while (x.paths[i] != (uint8*)0) {
+    r = syscall(LINUX_SYS_EXECVE, x.paths[i], x.argv, x.envp);
+    var e: int64 = -r;
+    if (e != PROC_ENOENT && e != PROC_ENOTDIR) {
+      err = e;
+      if (e != PROC_EACCES) { break; }
+    }
+    i = i + 1;
+  }
+  proc_child_die(x, err);
+}
+
+// ---- spawn and wait --------------------------------------------------------
+
+fn proc_decode(raw: int32, st: ProcStatus*) {
+  var blank: ProcStatus;
+  *st = blank;
+  if ((raw & 0x7f) == 0) {
+    st->code = (raw >> 8) & 0xff;
+  } else {
+    st->signaled = 1;
+    st->signal = raw & 0x7f;
+  }
+}
+
+// Starts a program. Returns 0 and fills out, or -errno; a program that does
+// not exist gives -PROC_ENOENT and one that cannot run gives -PROC_EACCES.
+export fn proc_spawn(opts: ProcOptions*, out: Proc*) -> int64 {
+  var none: Proc;
+  *out = none;
+  out->stdin_fd = -1;
+  out->stdout_fd = -1;
+  out->stderr_fd = -1;
+  if (opts->stdin == PROC_TO_STDOUT || opts->stdout == PROC_TO_STDOUT) { return -PROC_EINVAL; }
+
+  var x: ProcExec;
+  var r: int64 = proc_prep(opts, &x);
+  if (r < 0) {
+    proc_exec_free(&x);
+    return r;
+  }
+  var f: ProcFds;
+  proc_fds_init(&f);
+
+  r = proc_stdio(opts->stdin, 1, &f, &f.c_in, &f.p_in);
+  if (r >= 0) { r = proc_stdio(opts->stdout, 0, &f, &f.c_out, &f.p_out); }
+  if (r >= 0 && opts->stderr != PROC_TO_STDOUT) { r = proc_stdio(opts->stderr, 0, &f, &f.c_err, &f.p_err); }
+  if (r >= 0) { r = proc_pipe(&f.er, &f.ew); }
+  if (r < 0) {
+    proc_fds_close_child_side(&f);
+    proc_fds_close_parent_side(&f);
+    proc_exec_free(&x);
+    return r;
+  }
+
+  x.in_fd = f.c_in;
+  x.out_fd = f.c_out;
+  x.err_fd = f.c_err;
+  if (opts->stderr == PROC_TO_STDOUT) { x.err_to_out = 1; }
+  x.errw = f.ew;
+
+  var pid: int64 = syscall(LINUX_SYS_CLONE, 17, 0, 0, 0, 0);   // SIGCHLD: a plain fork
+  if (pid == 0) {
+    proc_child(&x);
+  }
+  proc_exec_free(&x);
+  proc_fds_close_child_side(&f);
+  if (pid < 0) {
+    proc_fds_close_parent_side(&f);
+    return pid;
+  }
+
+  // The pipe closes on a successful exec, so reading it gives 0 bytes. If
+  // exec failed the child wrote its errno first.
+  var failed: int64 = 0;
+  var n: int64 = -PROC_EINTR;
+  while (n == -PROC_EINTR) {
+    n = syscall(LINUX_SYS_READ, f.er, &failed, 4);
+  }
+  if (n == 4) {
+    var raw: int32 = 0;
+    var w: int64 = -PROC_EINTR;
+    while (w == -PROC_EINTR) { w = syscall(LINUX_SYS_WAIT4, pid, &raw, 0, 0); }
+    proc_fds_close_parent_side(&f);
+    return -(failed & 0xffffffff);
+  }
+  proc_close_fd(f.er);
+  out->pid = pid;
+  out->stdin_fd = f.p_in;
+  out->stdout_fd = f.p_out;
+  out->stderr_fd = f.p_err;
+  return 0;
+}
+
+// Checks without blocking. Returns 1 and fills st if the child has ended
+// (st may be 0), 0 if it is still running, or -errno. Reaps the child.
+export fn proc_try_wait(p: Proc*, st: ProcStatus*) -> int64 {
+  if (p->done == 0) {
+    var raw: int32 = 0;
+    var r: int64 = -PROC_EINTR;
+    while (r == -PROC_EINTR) { r = syscall(LINUX_SYS_WAIT4, p->pid, &raw, 1, 0); }   // WNOHANG
+    if (r == 0) { return 0; }
+    if (r < 0) { return r; }
+    proc_decode(raw, &p->status);
+    p->done = 1;
+  }
+  if (st != (ProcStatus*)0) { *st = p->status; }
+  return 1;
+}
+
+// Waits for the child to end. Returns 0 and fills st (st may be 0), or -errno.
+export fn proc_wait(p: Proc*, st: ProcStatus*) -> int64 {
+  if (p->done == 0) {
+    var raw: int32 = 0;
+    var r: int64 = -PROC_EINTR;
+    while (r == -PROC_EINTR) { r = syscall(LINUX_SYS_WAIT4, p->pid, &raw, 0, 0); }
+    if (r < 0) { return r; }
+    proc_decode(raw, &p->status);
+    p->done = 1;
+  }
+  if (st != (ProcStatus*)0) { *st = p->status; }
+  return 0;
+}
+
+// Milliseconds on a monotonic clock. Only differences mean anything.
+fn proc_now_ms() -> int64 {
+  var ts: int64[2];
+  if (syscall(LINUX_SYS_CLOCK_GETTIME, 1, &ts[0]) < 0) { return 0; }   // CLOCK_MONOTONIC
+  return ts[0] * 1000 + ts[1] / 1000000;
+}
+
+// Waits for descriptors. fds is an array of pollfd (fd, events, revents). A
+// negative timeout waits forever. Returns how many are ready, 0 on timeout.
+fn proc_poll(fds: int32*, n: int64, timeout_ms: int64) -> int64 {
+  var ts: int64[2];
+  var tsp: int64* = &ts[0];
+  if (timeout_ms < 0) {
+    tsp = (int64*)0;
+  } else {
+    ts[0] = timeout_ms / 1000;
+    ts[1] = (timeout_ms % 1000) * 1000000;
+  }
+  return syscall(LINUX_SYS_PPOLL, fds, n, tsp, 0, 8);
+}
+
+// Waits for the child for at most ms milliseconds (negative waits forever).
+// Returns 1 and fills st if it ended, 0 on timeout, or -errno. The child is
+// not killed on timeout: that is yours to decide. Linux has no timed wait for
+// a child, so this checks every 1 to 10 ms.
+export fn proc_wait_timeout(p: Proc*, ms: int64, st: ProcStatus*) -> int64 {
+  if (ms < 0) {
+    var r: int64 = proc_wait(p, st);
+    if (r < 0) { return r; }
+    return 1;
+  }
+  var deadline: int64 = proc_now_ms() + ms;
+  var step: int64 = 1;
+  while (true) {
+    var r: int64 = proc_try_wait(p, st);
+    if (r != 0) { return r; }
+    var left: int64 = deadline - proc_now_ms();
+    if (left <= 0) { return 0; }
+    var nap: int64 = step;
+    if (nap > left) { nap = left; }
+    proc_poll((int32*)0, 0, nap);
+    if (step < 10) { step = step * 2; }
+  }
+  return 0;
+}
+
+// ---- kill, ids -------------------------------------------------------------
+
+// Sends a signal to a process id. Signal 0 only checks that it exists. A
+// negative pid or pid 0 addresses a process group, as in kill(2).
+export fn proc_kill(pid: int64, sig: int32) -> int64 {
+  return syscall(LINUX_SYS_KILL, pid, (int64)sig);
+}
+
+// Sends a signal to a child, unless it has already been reaped (then its pid
+// may belong to someone else): that gives -PROC_ESRCH.
+export fn proc_send(p: Proc*, sig: int32) -> int64 {
+  if (p->done != 0) { return -PROC_ESRCH; }
+  return syscall(LINUX_SYS_KILL, p->pid, (int64)sig);
+}
+
+export fn proc_pid() -> int64 { return syscall(LINUX_SYS_GETPID); }
+
+export fn proc_parent_pid() -> int64 { return syscall(LINUX_SYS_GETPPID); }
+
+// ---- pipes -----------------------------------------------------------------
+
+// Closes the parent's end of the child's stdin, so the child sees end of file.
+export fn proc_close_stdin(p: Proc*) {
+  proc_close_fd(p->stdin_fd);
+  p->stdin_fd = -1;
+}
+
+// Closes whatever pipe ends are still open.
+export fn proc_close(p: Proc*) {
+  proc_close_fd(p->stdin_fd);
+  proc_close_fd(p->stdout_fd);
+  proc_close_fd(p->stderr_fd);
+  p->stdin_fd = -1;
+  p->stdout_fd = -1;
+  p->stderr_fd = -1;
+}
+
+// One read from a pipe. 0 means end of file. -PROC_EAGAIN on a non-blocking
+// end with nothing to read.
+export fn proc_read(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var r: int64 = -PROC_EINTR;
+  while (r == -PROC_EINTR) { r = syscall(LINUX_SYS_READ, fd, buf, n); }
+  return r;
+}
+
+// One write to a pipe: the count written, or -errno (-PROC_EPIPE when the
+// child has closed its end). A write to a dead pipe would raise SIGPIPE and
+// kill the program, so SIGPIPE is held back for the call and then dropped.
+export fn proc_write(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var mask: int64 = (int64)1 << (PROC_SIGPIPE - 1);
+  var old: int64 = 0;
+  syscall(LINUX_SYS_RT_SIGPROCMASK, 0, &mask, &old, 8);   // SIG_BLOCK
+  var r: int64 = -PROC_EINTR;
+  while (r == -PROC_EINTR) { r = syscall(LINUX_SYS_WRITE, fd, buf, n); }
+  if (r == -PROC_EPIPE) {
+    // Take the pending SIGPIPE off through a signalfd, so unblocking cannot deliver it.
+    var sfd: int64 = syscall(LINUX_SYS_SIGNALFD4, -1, &mask, 8, PROC_O_CLOEXEC | PROC_O_NONBLOCK);
+    if (sfd >= 0) {
+      var info: int64[16];
+      syscall(LINUX_SYS_READ, sfd, &info[0], 128);
+      syscall(LINUX_SYS_CLOSE, sfd);
+    }
+  }
+  syscall(LINUX_SYS_RT_SIGPROCMASK, 2, &old, 0, 8);   // SIG_SETMASK
+  return r;
+}
+
+fn proc_set_nonblocking(fd: int64) {
+  var flags: int64 = syscall(LINUX_SYS_FCNTL, fd, 3);   // F_GETFL
+  if (flags >= 0) { syscall(LINUX_SYS_FCNTL, fd, 4, flags | PROC_O_NONBLOCK); }
+}
+
+// ---- capture ---------------------------------------------------------------
+
+// Reads one chunk from a pipe end into b. Closes the end at end of file or on
+// an error.
+fn proc_drain(fdp: int64*, b: StrBuf*, buf: uint8*) {
+  var r: int64 = proc_read(*fdp, buf, 65536);
+  if (r > 0) {
+    if (b != (StrBuf*)0) { strbuf_append_bytes(b, (cstring)buf, r); }
+    return;
+  }
+  if (r == -PROC_EAGAIN) { return; }
+  proc_close_fd(*fdp);
+  *fdp = -1;
+}
+
+// Feeds stdin_text to the child's stdin and collects its stdout and stderr
+// into out and err (either may be 0 to discard), polling all the pipes so
+// none can fill up and stall the child. Only the pipes that exist are used.
+// Stdin is closed once the text is sent. After timeout_ms (negative: no
+// limit) the child is killed with SIGKILL and reaped, and the call returns
+// -PROC_ETIMEDOUT. Otherwise it waits for the child and returns 0. st gets
+// the final status. All the pipe ends are closed on return.
+export fn proc_communicate(p: Proc*, stdin_text: string, out: StrBuf*, err: StrBuf*, timeout_ms: int64, st: ProcStatus*) -> int64 {
+  var deadline: int64 = 0;
+  if (timeout_ms >= 0) { deadline = proc_now_ms() + timeout_ms; }
+  var n: int64 = (int64)stdin_text.length;
+  var sent: int64 = 0;
+  if (p->stdin_fd >= 0) {
+    if (n == 0) { proc_close_stdin(p); } else { proc_set_nonblocking(p->stdin_fd); }
+  }
+  if (p->stdout_fd >= 0) { proc_set_nonblocking(p->stdout_fd); }
+  if (p->stderr_fd >= 0) { proc_set_nonblocking(p->stderr_fd); }
+
+  var buf: uint8* = malloc(65536);
+  if (buf == (uint8*)0) { return -PROC_ENOMEM; }
+  var rc: int64 = 0;
+  var timed_out: bool = false;
+  while (p->stdout_fd >= 0 || p->stderr_fd >= 0) {
+    // pollfd is {fd: int32, events: int16, revents: int16}; which says whose it is.
+    var pf: int32[6];
+    var which: int32[3];
+    var k: int32 = 0;
+    if (p->stdin_fd >= 0) {
+      pf[k * 2] = (int32)p->stdin_fd; pf[k * 2 + 1] = 4;   // POLLOUT
+      which[k] = 0; k = k + 1;
+    }
+    if (p->stdout_fd >= 0) {
+      pf[k * 2] = (int32)p->stdout_fd; pf[k * 2 + 1] = 1;  // POLLIN
+      which[k] = 1; k = k + 1;
+    }
+    if (p->stderr_fd >= 0) {
+      pf[k * 2] = (int32)p->stderr_fd; pf[k * 2 + 1] = 1;
+      which[k] = 2; k = k + 1;
+    }
+    var wait: int64 = -1;
+    if (timeout_ms >= 0) {
+      wait = deadline - proc_now_ms();
+      if (wait < 0) { wait = 0; }
+    }
+    var ready: int64 = proc_poll(&pf[0], (int64)k, wait);
+    if (ready == -PROC_EINTR) { continue; }
+    if (ready < 0) { rc = ready; break; }
+    if (ready == 0) {
+      if (timeout_ms >= 0 && proc_now_ms() >= deadline) { timed_out = true; break; }
+      continue;
+    }
+    for j in 0..k {
+      var revents: int32 = (pf[j * 2 + 1] >> 16) & 0xFFFF;
+      if (revents == 0) { continue; }
+      if (which[j] == 0) {
+        // Stdin: send what we can. A dead reader (EPIPE or an error) ends it.
+        var chunk: int64 = n - sent;
+        if (chunk > 65536) { chunk = 65536; }
+        var w: int64 = proc_write(p->stdin_fd, stdin_text.chars + sent, chunk);
+        if (w >= 0) { sent = sent + w; }
+        if (w >= 0 && sent >= n) { proc_close_stdin(p); }
+        if (w < 0 && w != -PROC_EAGAIN) { proc_close_stdin(p); }
+      } else if (which[j] == 1) {
+        proc_drain(&p->stdout_fd, out, buf);
+      } else {
+        proc_drain(&p->stderr_fd, err, buf);
+      }
+    }
+  }
+  free(buf);
+  proc_close_stdin(p);
+
+  // Both streams are done: wait for the child within what is left of the time.
+  if (!timed_out && rc == 0) {
+    var left: int64 = -1;
+    if (timeout_ms >= 0) {
+      left = deadline - proc_now_ms();
+      if (left < 0) { left = 0; }
+    }
+    var r: int64 = proc_wait_timeout(p, left, st);
+    if (r < 0) { rc = r; }
+    if (r == 0) { timed_out = true; }
+  }
+  if (timed_out || rc < 0) {
+    proc_send(p, PROC_SIGKILL);
+    proc_wait(p, st);
+  }
+  proc_close(p);
+  if (timed_out) { return -PROC_ETIMEDOUT; }
+  return rc;
+}
+
+// Runs a program to completion with stdin fed from stdin_text and stdout and
+// stderr captured into out and err (see proc_communicate). Returns 0, a
+// spawn error (-PROC_ENOENT ...), or -PROC_ETIMEDOUT after the child was
+// killed. st gets the exit status.
+export fn proc_run(argv: string[], stdin_text: string, out: StrBuf*, err: StrBuf*, timeout_ms: int64, st: ProcStatus*) -> int64 {
+  var o: ProcOptions;
+  proc_options_init(&o, argv);
+  o.stdin = PROC_PIPE;
+  o.stdout = PROC_PIPE;
+  o.stderr = PROC_PIPE;
+  var p: Proc;
+  var r: int64 = proc_spawn(&o, &p);
+  if (r < 0) { return r; }
+  return proc_communicate(&p, stdin_text, out, err, timeout_ms, st);
+}
+
+// ---- signals as readiness --------------------------------------------------
+
+fn proc_sigmask(signals: int32[]) -> int64 {
+  var mask: int64 = 0;
+  for s in signals {
+    if (s >= 1 && s <= 64) { mask = mask | ((int64)1 << (s - 1)); }
+  }
+  return mask;
+}
+
+// Blocks the given signals in this thread and returns a descriptor that
+// becomes readable when one arrives (poll it, then call proc_signal_read).
+// The descriptor is close-on-exec. Call it before starting threads, so every
+// thread blocks the signals too. Children start with no signals blocked.
+// Returns the descriptor or -errno. SIGKILL and SIGSTOP cannot be caught.
+export fn proc_signal_fd(signals: int32[..]) -> int64 {
+  var mask: int64 = proc_sigmask(signals);
+  if (mask == 0) { return -PROC_EINVAL; }
+  var r: int64 = syscall(LINUX_SYS_RT_SIGPROCMASK, 0, &mask, 0, 8);   // SIG_BLOCK
+  if (r < 0) { return r; }
+  return syscall(LINUX_SYS_SIGNALFD4, -1, &mask, 8, PROC_O_CLOEXEC);
+}
+
+// Waits for the next signal on the descriptor and returns its number, or a
+// negative -errno. It blocks until one arrives, so poll first to avoid that.
+export fn proc_signal_read(fd: int64) -> int32 {
+  var info: int64[16];   // struct signalfd_siginfo is 128 bytes; ssi_signo comes first
+  var r: int64 = -PROC_EINTR;
+  while (r == -PROC_EINTR) { r = syscall(LINUX_SYS_READ, fd, &info[0], 128); }
+  if (r < 0) { return (int32)r; }
+  if (r < 4) { return -PROC_EINVAL; }
+  return (int32)(info[0] & 0xFFFFFFFF);
+}
+
+// Closes a descriptor from proc_signal_fd and unblocks the same signals.
+export fn proc_signal_release(fd: int64, signals: int32[..]) {
+  var mask: int64 = proc_sigmask(signals);
+  syscall(LINUX_SYS_CLOSE, fd);
+  if (mask != 0) { syscall(LINUX_SYS_RT_SIGPROCMASK, 1, &mask, 0, 8); }   // SIG_UNBLOCK
+}

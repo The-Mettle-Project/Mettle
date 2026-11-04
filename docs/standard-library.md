@@ -1205,8 +1205,141 @@ Paths and directories. Windows.
 
 ## std/process
 
-Three C entry points: `exit(code: int32)`, `rand() -> int32`, and
-`srand(seed: int32)`.
+Start programs, wait for them, kill them, and capture their output. Linux,
+macOS and Windows. Every call returns 0, a count, a flag, or a negative error
+code (`-PROC_ENOENT`, `-PROC_EACCES`, `-PROC_EINVAL`, `-PROC_ETIMEDOUT`, or
+another platform code). On Linux the calls are raw system calls.
+
+`exit(code: int32)`, `rand() -> int32` and `srand(seed: int32)` are still
+here, and `std/prelude` still takes them from this module.
+
+### Starting a program
+
+Fill a `ProcOptions` and call `proc_spawn`.
+
+```mettle
+var argv: string[2] = ["/bin/echo", "hello"];
+var o: ProcOptions;
+proc_options_init(&o, argv);
+o.stdout = PROC_PIPE;
+var p: Proc;
+if (proc_spawn(&o, &p) != 0) { return 1; }
+// read p.stdout_fd with proc_read ...
+var st: ProcStatus;
+proc_wait(&p, &st);
+proc_close(&p);
+```
+
+| Field | Meaning |
+|-------|---------|
+| `argv: string[]` | `argv[0]` is the program. With no `/` in it, `PATH` is searched |
+| `env: string[]`, `has_env: int32` | `"NAME=value"` entries. With `has_env` 0 (the default) the child inherits the environment. With 1 it gets `env` alone, and an empty `env` means an empty environment |
+| `cwd: string` | The child's working directory. Empty keeps ours |
+| `stdin`, `stdout`, `stderr: int32` | `PROC_INHERIT` (default), `PROC_PIPE`, or `PROC_NULL`. `stderr` may also be `PROC_TO_STDOUT` |
+
+`proc_options_init(o, argv)` zeroes the options and sets `argv`.
+
+`proc_spawn(opts, out: Proc*) -> int64` returns 0 or a negative code. If the
+program does not exist it returns `-PROC_ENOENT`, and if it cannot be run
+`-PROC_EACCES`. On Linux and macOS the child reports the real `errno`
+through a close-on-exec pipe, so a failed `execve` is seen by the parent
+before `proc_spawn` returns. A bad `cwd` fails the same way.
+
+`Proc` has `pid`, and `stdin_fd`, `stdout_fd`, `stderr_fd`: our ends of the
+pipes, or -1. Pipe ends are close-on-exec. The child's signal mask is
+cleared, so signals blocked by `proc_signal_fd` do not reach it.
+
+On Linux the inherited environment is the one the process started with
+(`/proc/self/environ`); variables set later with `putenv` are not passed on.
+
+### Waiting and killing
+
+`ProcStatus` has `signaled` (1 if a signal killed the process), `code` (the
+exit code when `signaled` is 0) and `signal` (the signal number when
+`signaled` is 1).
+
+| Function | Effect |
+|----------|--------|
+| `proc_wait(p, st) -> int64` | Block until the child ends. Returns 0 and fills `st` (which may be 0) |
+| `proc_try_wait(p, st) -> int64` | Do not block. 1 if it ended (`st` filled), 0 if still running |
+| `proc_wait_timeout(p, ms, st) -> int64` | Wait up to `ms` (negative waits forever). 1 if it ended, 0 on timeout. It does not kill the child. On Linux and macOS it checks every 1 to 10 ms |
+| `proc_kill(pid: int64, sig: int32) -> int64` | Send a signal. Signal 0 only checks that the process exists |
+| `proc_send(p, sig) -> int64` | The same for a `Proc`. Gives `-PROC_ESRCH` once the child was reaped, so a reused pid is never hit |
+| `proc_pid()`, `proc_parent_pid()` | Our ids |
+
+A wait reaps the child and the answer is kept in `Proc`, so waiting again
+returns the same status. The signal constants are `PROC_SIGHUP`, `PROC_SIGINT`,
+`PROC_SIGKILL`, `PROC_SIGUSR1`, `PROC_SIGUSR2`, `PROC_SIGPIPE`, `PROC_SIGTERM`
+and `PROC_SIGCHLD`; their values follow the platform.
+
+### Pipes
+
+| Function | Effect |
+|----------|--------|
+| `proc_read(fd, buf: uint8*, n) -> int64` | One read. 0 is end of file |
+| `proc_write(fd, buf, n) -> int64` | One write. `-PROC_EPIPE` if the child closed its end. It does not kill your program with `SIGPIPE` |
+| `proc_close_stdin(p)` | Close the child's stdin, so it sees end of file |
+| `proc_close(p)` | Close every pipe end still open |
+
+### Running to completion
+
+`proc_run(argv: string[], stdin_text: string, out: StrBuf*, err: StrBuf*,
+timeout_ms: int64, st: ProcStatus*) -> int64` starts the program with all
+three streams piped, feeds `stdin_text` and closes stdin, and appends stdout
+to `out` and stderr to `err` (either may be 0 to discard). It polls all the
+pipes together, so a large output cannot stall the child. It returns 0 when
+the program ended, a spawn error, or `-PROC_ETIMEDOUT` if `timeout_ms`
+(negative: no limit) passed. On timeout the child is killed with `SIGKILL`
+and reaped, and `st` says so. A non-zero exit code is not an error: look at
+`st`.
+
+`proc_communicate(p, stdin_text, out, err, timeout_ms, st)` does the same for
+a `Proc` you spawned yourself. It uses only the pipes that exist, and closes
+them all before it returns.
+
+### Signals as readiness
+
+There are no handlers. `proc_signal_fd(signals: int32[..]) -> int64` returns a
+descriptor that becomes readable when one of the signals arrives. Poll it with
+`sock_poll`, then call `proc_signal_read(fd) -> int32` for the signal number
+(it blocks if none is waiting; a negative result is an error).
+`proc_signal_release(fd, signals...)` closes the descriptor and gives the
+signals back.
+
+```mettle
+var fd: int64 = proc_signal_fd(PROC_SIGINT, PROC_SIGTERM);
+// poll fd for NET_POLL_IN in the event loop, then:
+var sig: int32 = proc_signal_read(fd);
+```
+
+On Linux the signals are blocked in the calling thread and the descriptor is a
+`signalfd`. Call it before starting threads, so every thread blocks them.
+
+### macOS
+
+The calls are libc calls (`fork`, `execve`, `waitpid`). `pipe` has no
+close-on-exec flag, so the flag is set right after; a `fork` on another
+thread in between could leak an end. `proc_write` ignores `SIGPIPE` for the
+duration of the call, for the whole process.
+
+Signals use a self-pipe: a handler writes the signal number as one byte, and
+the read end is the descriptor. There is one pipe for the process, so every
+`proc_signal_fd` call returns the same descriptor, and `proc_signal_release`
+frees it for all signals.
+
+### Windows
+
+The calls are Kernel32 calls (`CreateProcessA`, `CreatePipe`,
+`WaitForSingleObject`). The command line is built from `argv` with the MSVCRT
+quoting rules, so an argument with spaces or quotes arrives intact; Windows
+searches `PATH` and adds `.exe`. Pipe ends are `HANDLE`s.
+
+There are no signals. `proc_kill` and `proc_send` end the process at once
+whatever the signal is (signal 0 only checks that it runs), and the exit
+code is 1: `signaled` is never 1. `proc_signal_fd` and `proc_signal_read`
+return `-PROC_ENOSYS`. `proc_communicate` feeds stdin from a helper thread and
+checks the output pipes every millisecond. A `PROC_INHERIT` stream is shared
+only if the parent's own handle is inheritable.
 
 ## std/system
 
