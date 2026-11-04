@@ -1264,8 +1264,8 @@ constants, not with numbers. On Linux the calls are raw system calls.
 Paths are strings. Each is copied into a NUL-terminated 4096-byte buffer, and a
 longer one fails with `-FS_ENAMETOOLONG`. Calls that return text write it into
 a `buf` and `cap` you give, put a NUL after it, and return its length. If it
-does not fit, they return `-FS_ERANGE`. `mode` arguments are permission bits.
-Mettle has no octal literals, so write 0755 as `493`.
+does not fit, they return `-FS_ERANGE`. `mode` arguments are permission bits,
+such as `0o755`.
 
 **Stat.** `fs_stat(path, &st: FsStat) -> int64` follows symbolic links.
 `fs_lstat` describes a link itself. `FsStat` has `kind` (`FS_FILE`, `FS_DIR`,

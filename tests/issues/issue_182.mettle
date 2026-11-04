@@ -1,0 +1,10 @@
+import "std/io";
+
+fn main() -> int32 {
+  var o: int32 = 0o755;
+  var top: uint64 = 0O1777777777777777777777;
+  var zero: int32 = 0;
+  var f: float64 = 01.5;
+  println("{o} {top} {zero} {f} {0o17}");
+  return 0;
+}

@@ -1,0 +1,22 @@
+import "std/io";
+
+fn sha(out: uint8*) -> int32 {
+  var i: int64 = 0;
+  while (i < 20) { out[i] = (uint8)(i * 11 + 97); i = i + 1; }
+  return 0;
+}
+fn t_sha_is(want: string) -> bool {
+  var d: uint8[20];
+  if (sha(&d[0]) != 0) { return false; }
+  var digits: string = "0123456789abcdef";
+  for i in 0..20 {
+    if (digits[(int64)(d[i] >> 4)] != want[i * 2]) { return false; }
+    if (digits[(int64)(d[i] & 15)] != want[i * 2 + 1]) { return false; }
+  }
+  return true;
+}
+fn t_sha_a(want: string) -> bool { return t_sha_is(want); }
+fn main() -> int32 {
+  println("{t_sha_a("c1c8bbdc22796e28c0e15163d20899b65621d65a")}");
+  return 0;
+}

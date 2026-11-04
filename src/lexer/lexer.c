@@ -395,6 +395,51 @@ static Token lexer_lex_char_literal(Lexer *lexer) {
   return token;
 }
 
+static Token lexer_lex_octal_number(Lexer *lexer) {
+  Token token = {TOKEN_EOF, NULL, {NULL, 0}, lexer->line, lexer->column, 0};
+  size_t start = lexer->position;
+  unsigned long long value = 0;
+  const char *problem = NULL;
+
+  lexer->position += 2;
+  lexer->column += 2;
+  size_t digits_start = lexer->position;
+  while (lexer->position < lexer->length &&
+         lexer->source[lexer->position] >= '0' &&
+         lexer->source[lexer->position] <= '7') {
+    if (value >> 61) {
+      problem = "Octal literal is out of range";
+    }
+    value = (value << 3) | (unsigned)(lexer->source[lexer->position] - '0');
+    lexer->position++;
+    lexer->column++;
+  }
+  if (lexer->position == digits_start ||
+      (lexer->position < lexer->length &&
+       isdigit((unsigned char)lexer->source[lexer->position]))) {
+    problem = "Invalid octal literal";
+  }
+  if (problem) {
+    token.type = TOKEN_ERROR;
+    token.value = strdup(problem);
+    lexer_set_error(lexer, token.value);
+    return token;
+  }
+
+  char normalized[32];
+  snprintf(normalized, sizeof(normalized), "0x%llX", value);
+  token.type = TOKEN_NUMBER;
+  token.value = strdup(normalized);
+  if (!token.value) {
+    token.type = TOKEN_ERROR;
+    token.value = strdup("Memory allocation failed");
+    lexer_set_error(lexer, token.value);
+    return token;
+  }
+  token_set_lexeme(&token, &lexer->source[start], lexer->position - start);
+  return token;
+}
+
 static Token lexer_lex_number(Lexer *lexer) {
   Token token = {TOKEN_EOF, NULL, {NULL, 0}, lexer->line, lexer->column, 0};
   size_t start = lexer->position;
@@ -429,12 +474,18 @@ static Token lexer_lex_number(Lexer *lexer) {
       lexer->position++;
       lexer->column++;
     }
-    if (lexer->position == digits_start) {
+    if (lexer->position == digits_start ||
+        (lexer->position < lexer->length &&
+         isdigit((unsigned char)lexer->source[lexer->position]))) {
       token.type = TOKEN_ERROR;
       token.value = strdup("Invalid binary literal");
       lexer_set_error(lexer, token.value);
       return token;
     }
+  } else if (current == '0' && lexer->position + 1 < lexer->length &&
+             (lexer->source[lexer->position + 1] == 'o' ||
+              lexer->source[lexer->position + 1] == 'O')) {
+    return lexer_lex_octal_number(lexer);
   } else {
     while (lexer->position < lexer->length &&
            (isdigit(lexer->source[lexer->position]) ||
@@ -464,6 +515,44 @@ static Token lexer_lex_number(Lexer *lexer) {
           lexer->column++;
         }
       }
+    }
+
+    size_t run = lexer->position - start;
+    int all_digits = 1;
+    for (size_t i = 0; i < run; i++) {
+      if (!isdigit((unsigned char)lexer->source[start + i])) {
+        all_digits = 0;
+      }
+    }
+    if (current == '0' && run > 1 && all_digits) {
+      char message[160];
+      int shown = run > 40 ? 40 : (int)run;
+      int digits = shown;
+      const char *rest = &lexer->source[start];
+      while (digits > 1 && *rest == '0') {
+        rest++;
+        digits--;
+      }
+      int octal = 1;
+      for (int i = 0; i < shown; i++) {
+        if (lexer->source[start + i] > '7') {
+          octal = 0;
+        }
+      }
+      if (octal) {
+        snprintf(message, sizeof(message),
+                 "An integer literal cannot start with 0: write 0o%.*s for "
+                 "octal or %.*s for decimal",
+                 digits, rest, digits, rest);
+      } else {
+        snprintf(message, sizeof(message),
+                 "An integer literal cannot start with 0: write %.*s", digits,
+                 rest);
+      }
+      token.type = TOKEN_ERROR;
+      token.value = strdup(message);
+      lexer_set_error(lexer, token.value);
+      return token;
     }
   }
 

@@ -96,12 +96,14 @@ Only `{name}` reaches back into Mettle, to name a variable. See
 
 ## Integer literals
 
-Decimal, hexadecimal with `0x`, and binary with `0b`. Hex digits and the `x`
-or `b` marker may be upper or lower case.
+Decimal, hexadecimal with `0x`, octal with `0o`, and binary with `0b`. Hex
+digits and the `x`, `o` or `b` marker may be upper or lower case. A decimal
+integer cannot start with `0`, so `0755` is an error: write `0o755` or `755`.
 
 ```mettle
 var d: int32 = 1000;
 var h: int32 = 0xFF;
+var o: int32 = 0o755;
 var b: int32 = 0b1010;
 ```
 

@@ -1,0 +1,4 @@
+fn main() -> int32 {
+  var mode: int32 = 0755;
+  return mode;
+}

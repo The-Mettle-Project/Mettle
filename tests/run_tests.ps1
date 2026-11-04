@@ -21522,7 +21522,10 @@ $issueRegressions = @(
   @{ Name = "issue_int_min_divided_by_minus_one_wraps"; Entry = "tests/issues/int_min_division.mettle"; Args = @(); Expect = @("-2147483648 -2147483648 -2147483648 -2147483648 2147483647", "neg") },
   @{ Name = "issue_int_min_divided_by_minus_one_wraps_release"; Entry = "tests/issues/int_min_division.mettle"; Args = @("--release"); Expect = @("-2147483648 -2147483648 -2147483648 -2147483648 2147483647", "neg") },
   @{ Name = "issue_array_negative_index_traps"; Entry = "tests/issues/array_negative_index.mettle"; Args = @(); Expect = @("array index out of bounds") },
-  @{ Name = "issue_driver_accepts_O0"; Command = @("--build", "-O0", "tests/issues/issue_073_074.mettle", "-o", ".tmp/issue_o0.exe"); Expect = @("Built executable") }
+  @{ Name = "issue_driver_accepts_O0"; Command = @("--build", "-O0", "tests/issues/issue_073_074.mettle", "-o", ".tmp/issue_o0.exe"); Expect = @("Built executable") },
+  @{ Name = "issue_octal_literals"; Entry = "tests/issues/issue_182.mettle"; Args = @(); Expect = @("493 18446744073709551615 0 1.5 15") },
+  @{ Name = "issue_leading_zero_is_an_error"; Command = @("--build", "tests/issues/err_issue_182.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("write 0o755 for octal") },
+  @{ Name = "issue_hoisted_load_from_string_param"; Entry = "tests/issues/issue_159.mettle"; Args = @("--release"); Expect = @("false") }
 )
 foreach ($case in $issueRegressions) {
   $total++

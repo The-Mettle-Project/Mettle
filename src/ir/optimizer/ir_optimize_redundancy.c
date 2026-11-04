@@ -1955,6 +1955,30 @@ static void re_merge_repeated_loads(IRFunction *function, const REDefs *defs,
   }
 }
 
+static int re_symbol_names_aggregate(const IRFunction *function,
+                                     const REAddr *addr) {
+  const char *type_name;
+  const MtlcType *type;
+  if (addr->kind != IR_OPERAND_SYMBOL || !addr->name) {
+    return 0;
+  }
+  type_name = ir_function_local_declared_type(function, addr->name);
+  for (size_t i = 0; !type_name && function->parameter_names &&
+                     function->parameter_types && i < function->parameter_count;
+       i++) {
+    if (function->parameter_names[i] &&
+        strcmp(function->parameter_names[i], addr->name) == 0) {
+      type_name = function->parameter_types[i];
+    }
+  }
+  type = type_name ? ir_program_lookup_type(ir_optimize_get_program(), type_name)
+                   : NULL;
+  return type &&
+         (type->kind == MTLC_TYPE_STRUCT || type->kind == MTLC_TYPE_ARRAY ||
+          type->kind == MTLC_TYPE_TAGGED_ENUM ||
+          type->kind == MTLC_TYPE_STRING);
+}
+
 static int re_emit_hoist(IRFunction *function, size_t header, size_t index,
                          const REAddr *addr, const char *addr_name,
                          int *changed) {
@@ -1966,7 +1990,7 @@ static int re_emit_hoist(IRFunction *function, size_t header, size_t index,
 
   char base_name[RE_NAME_MAX + 8];
   snprintf(base_name, sizeof(base_name), "%sb", addr_name);
-  if (addr->is_address_of) {
+  if (addr->is_address_of || re_symbol_names_aggregate(function, addr)) {
     lead.op = IR_OP_ADDRESS_OF;
     lead.dest = ir_operand_temp(addr->offset != 0 ? base_name : addr_name);
     lead.lhs = ir_operand_symbol(addr->name);
