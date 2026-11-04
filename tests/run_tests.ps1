@@ -1840,6 +1840,11 @@ $cases = @(
      SkipBinaryCheck = $true },
   @{ Name = "std_file"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true },
   @{ Name = "std_file_release"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_http2"; Path = "tests/test_std_http2.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_http2_release"; Path = "tests/test_std_http2.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_http2_interp"; Path = "tests/test_std_http2_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
   @{ Name = "std_websocket"; Path = "tests/test_std_websocket.mettle"; ShouldSucceed = $true },
   @{ Name = "std_websocket_release"; Path = "tests/test_std_websocket.mettle"; ShouldSucceed = $true; Args = @("--release") },
   @{ Name = "std_websocket_interp"; Path = "tests/test_std_websocket_interp.mettle"; ShouldSucceed = $true

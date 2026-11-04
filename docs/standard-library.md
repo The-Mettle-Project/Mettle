@@ -934,6 +934,204 @@ Not done: extensions such as permessage-deflate, and the connection state
 machine around the close handshake (sending your own close and waiting for the
 peer's). A caller does that with the pieces above.
 
+## std/hpack
+
+HPACK (RFC 7541), the header compression of HTTP/2. Linux, macOS and
+Windows, no sockets, and it runs in the compile-time interpreter.
+
+Errors are negative `int32` codes: `HPACK_ERR_TRUNCATED`, `_INTEGER`,
+`_HUFFMAN`, `_INDEX`, `_SIZE_UPDATE`, `_TOO_LARGE` and `_NOSPACE`.
+`hpack_error_name(code)` gives text. After a decode error the dynamic table is
+out of step with the peer, so close the connection (HTTP/2 calls it
+`COMPRESSION_ERROR`).
+
+The building blocks work on raw bytes:
+
+| Function | Effect |
+|----------|--------|
+| `hpack_int_encode(value: int64, prefix_bits: int32, flags: int32, out: uint8*, cap: int64) -> int64` | Prefix integer; bytes written, or -1 |
+| `hpack_int_decode(src: uint8*, n: int64, prefix_bits: int32, value: int64*) -> int64` | Bytes used, or an error; values above `HPACK_INT_MAX` (2^32-1) are refused |
+| `hpack_huffman_encode(src, n, dst, cap) -> int64` | Bytes written, or -1 |
+| `hpack_huffman_encoded_len(src, n) -> int64` | Size of the Huffman form |
+| `hpack_huffman_decode(src, n, dst, cap) -> int64` | Decoded length, or an error; with `dst` null it only checks |
+| `hpack_string_encode(s: string, huffman: bool, out, cap) -> int64` | A string literal |
+| `hpack_string_decode(src, n, dst, cap, out_len: int64*) -> int64` | Bytes used |
+
+The Huffman decoder refuses EOS in the data, padding of more than 7 bits, and
+padding that is not all ones.
+
+`HpackTable` is the dynamic table, with a byte limit, eviction and size
+updates. `hpack_table_init(&t, arena, capacity)` takes its storage from the
+arena once; `capacity` is the most it can ever hold, and the limit starts at
+`min(capacity, 4096)`. `hpack_table_get(&t, index, &field)` reads index 1..61
+from the static table and 62 and up from the dynamic one, newest first. For a
+dynamic entry the strings stay valid only until the next change.
+`hpack_table_add`, `hpack_table_set_max` and `hpack_table_len` do the rest.
+
+### Decoding
+
+```mettle
+var d: HpackDecoder;
+hpack_decoder_init(&d, tables_arena, 4096, 16384);   // capacity, max list size
+var h: HpackHeaders;
+hpack_headers_init(&h, request_arena);
+var err: int32 = hpack_decode(&d, block, block_len, &h);
+for i in 0..h.count {
+  // h.items[i].name, .value, .never_index
+}
+```
+
+`hpack_decode` takes one complete header block (a HEADERS or PUSH_PROMISE
+block with its CONTINUATIONs joined). Every string and the array of fields go
+into the arena given to `hpack_headers_init`, so reset that arena between
+blocks. Static-table strings are not copied.
+
+The list is capped at `max_list_size` (name + value + 32 bytes for each field,
+the way `SETTINGS_MAX_HEADER_LIST_SIZE` counts); zero picks 65536. A string
+that would pass the cap is refused before it is copied. A size update is
+accepted only before the first field and only up to the decoder's limit.
+`hpack_decoder_set_limit(&d, n)` moves that limit when a new
+`SETTINGS_HEADER_TABLE_SIZE` takes effect.
+
+### Encoding
+
+```mettle
+var e: HpackEncoder;
+hpack_encoder_init(&e, tables_arena, 4096, true);     // capacity, use Huffman
+var o: HpackOut;
+hpack_out_init(&o, buf, cap);
+hpack_encode_begin(&e, &o);                           // queued size updates
+hpack_encode_field(&e, &o, ":method", "GET", HPACK_ENC_INDEX);
+hpack_encode_field(&e, &o, "authorization", token, HPACK_ENC_NEVER);
+// o.len bytes of buf are the block
+```
+
+`hpack_encode_block(&e, &o, list, count)` does the begin and all the fields
+for an array of `HpackHeader`. A field that matches a table entry exactly is
+written as an index. Otherwise it is a literal, added to the table in
+`HPACK_ENC_INDEX` mode, not added in `HPACK_ENC_NO_INDEX`, and in
+`HPACK_ENC_NEVER` mode (for secrets) marked so that proxies do not add it
+either; that mode never uses a full index. A field bigger than the whole table
+is sent without indexing. Huffman is used for a string when it is no longer
+than the raw form.
+
+When the peer's `SETTINGS_HEADER_TABLE_SIZE` arrives, call
+`hpack_encoder_set_table_size(&e, n)`. The size update is written by the next
+`hpack_encode_begin`: the smallest size first if the limit dipped and came
+back, then the last one.
+
+If the buffer is full, `hpack_encode_field` returns `HPACK_ERR_NOSPACE` and
+writes nothing; the table is not changed either. `hpack_encode_block` can fail
+half way, with the table already moved, so give it room or drop the
+connection.
+
+## std/http2
+
+HTTP/2 framing (RFC 9113) and gRPC message framing, over `std/hpack`. Linux, macOS and
+Windows, no sockets, and it runs in the compile-time interpreter. It does not
+track streams or connection state; it cuts frames out of bytes and builds them.
+
+Builders (`h2_build_*`) write a whole frame into a buffer and return its size,
+or -1 if it does not fit or an argument is out of range. Parsers (`h2_parse_*`)
+take the frame header and the payload, fill a struct whose pointers point into
+the payload (nothing is copied), and return 0 or an error code: `H2_NO_ERROR`,
+`H2_PROTOCOL_ERROR`, `H2_FLOW_CONTROL_ERROR`, `H2_FRAME_SIZE_ERROR`,
+`H2_COMPRESSION_ERROR` and the rest of RFC 9113 section 7. `h2_error_name` and
+`h2_frame_type_name` give text.
+
+Constants: `H2_PREFACE` (24 bytes), the frame types `H2_FRAME_DATA` to
+`H2_FRAME_CONTINUATION`, flags `H2_FLAG_END_STREAM`, `_ACK`, `_END_HEADERS`,
+`_PADDED` and `_PRIORITY`, and `H2_SETTINGS_*` identifiers.
+
+### Reading frames
+
+`h2_reader_next(&r, buf, n, &frame) -> int32` looks at the front of a buffer:
+
+| Result | Meaning |
+|--------|---------|
+| `H2_READ_MORE` | Not enough bytes; `frame.need` is the least the buffer must hold |
+| `H2_READ_FRAME` | A frame is ready: `frame.header` (`length`, `type`, `flags`, `stream_id`), `frame.payload`, and `frame.consumed` to drop |
+| `H2_READ_PREFACE` | The client preface was read; drop `frame.consumed` |
+| `H2_READ_ERROR` | A connection error; send GOAWAY with `frame.error` |
+
+`h2_reader_init(&r, max_frame_size, expect_preface)` sets it up; a server
+passes true. Asking again after `MORE` or `ERROR` is safe. As soon as the 9
+header bytes are in, it checks the length against `max_frame_size`, that
+stream 0 is used only by SETTINGS, PING and GOAWAY and never by DATA, HEADERS,
+PRIORITY, RST_STREAM, PUSH_PROMISE or CONTINUATION, and that a header block is
+followed only by CONTINUATION on the same stream. Unknown frame types come
+through for you to ignore.
+
+### Frames
+
+| Function | Effect |
+|----------|--------|
+| `h2_frame_header_read(src) -> H2FrameHeader`, `h2_frame_header_write(h, out)` | The 9-byte header; the reserved bit is dropped |
+| `h2_build_data(out, cap, stream, data, n, end_stream, pad)` / `h2_parse_data(h, payload, &H2Data)` | `pad` is -1 for none, or 0..255 |
+| `h2_build_headers(out, cap, stream, block, n, end_stream, end_headers, pad, &H2Priority or 0)` / `h2_parse_headers` | Padding and priority |
+| `h2_build_priority` / `h2_parse_priority` | A stream that depends on itself is an error |
+| `h2_build_rst_stream` / `h2_parse_rst_stream` | |
+| `h2_build_settings(out, cap, list, count)`, `h2_build_settings_ack` | |
+| `h2_build_push_promise` / `h2_parse_push_promise` | |
+| `h2_build_ping(out, cap, data8, ack)` / `h2_parse_ping` | |
+| `h2_build_goaway` / `h2_parse_goaway` | Last stream, error code, debug data |
+| `h2_build_window_update` / `h2_parse_window_update` | A zero increment is `H2_PROTOCOL_ERROR` |
+| `h2_build_continuation` / `h2_parse_continuation` | |
+
+`h2_is_stream_error(h, err)` says whether an error from a parser is a stream
+error (reset that stream with `RST_STREAM`) or a connection error (GOAWAY).
+One case it cannot see: a HEADERS frame whose priority depends on its own
+stream is a stream error, so compare `H2Headers.priority.dependency` with the
+stream id yourself.
+
+`h2_check_frame_length(h, max_frame_size)` is the size check on its own.
+Builders do not check the peer's `SETTINGS_MAX_FRAME_SIZE`; split big payloads
+yourself.
+
+### Settings and flow control
+
+`H2Settings` holds the six settings, and `h2_settings_defaults(&s)` fills in
+the protocol defaults. `h2_settings_apply_frame(&s, h, payload)` checks a whole
+SETTINGS frame and then stores it, all or nothing. It returns `H2_FRAME_SIZE_ERROR`
+for a length that is not a multiple of 6 or an ACK with a payload,
+`H2_PROTOCOL_ERROR` for `ENABLE_PUSH` above 1 or `MAX_FRAME_SIZE` outside
+16384..16777215, and `H2_FLOW_CONTROL_ERROR` for `INITIAL_WINDOW_SIZE` above
+2^31-1. Unknown settings are ignored. `h2_setting_check(id, value)` and
+`h2_settings_entry(payload, i)` work one setting at a time.
+
+`H2Window` is a flow-control window:
+
+| Function | Effect |
+|----------|--------|
+| `h2_window_init(&w, size)` | Start (`H2_DEFAULT_WINDOW` is 65535) |
+| `h2_window_credit(&w, n) -> int32` | Add a WINDOW_UPDATE; past 2^31-1 is `H2_FLOW_CONTROL_ERROR` |
+| `h2_window_debit(&w, n) -> int32` | Take bytes out; more than it holds is `H2_FLOW_CONTROL_ERROR` |
+| `h2_window_adjust(&w, delta) -> int32` | A `SETTINGS_INITIAL_WINDOW_SIZE` change; may go below zero |
+| `h2_window_available(&w) -> int64` | Bytes that may be sent now |
+
+A failed call leaves the window as it was.
+
+### gRPC
+
+A gRPC message is a 5-byte prefix (a compressed flag and a 32-bit big-endian
+length) and the message. `h2_grpc_write(out, cap, msg, n, compressed)` writes
+both. `h2_grpc_read(buf, n, max_message, &m)` returns `H2_GRPC_READ_MORE`
+(with `m.need`), `H2_GRPC_READ_MESSAGE` (with `m.data`, `m.length`,
+`m.compressed`, `m.consumed`) or `H2_GRPC_READ_ERROR`. A flag byte other than
+0 or 1 gives `m.status = H2_GRPC_INTERNAL`, and a length over `max_message`
+(`H2_GRPC_DEFAULT_MAX_MESSAGE` is 4 MiB) gives `H2_GRPC_RESOURCE_EXHAUSTED`,
+as soon as the prefix is in.
+
+`h2_grpc_timeout_parse("100m") -> int64` reads a `grpc-timeout` value into
+milliseconds, rounded up, or -1 if it is not valid. `h2_grpc_timeout_format(ms,
+out, cap) -> int64` writes one, using the coarsest unit that is exact (`5S`,
+`2M`, `100m`) and moving up a unit, rounded up, when it would pass 8 digits.
+
+`H2_GRPC_OK` to `H2_GRPC_UNAUTHENTICATED` are the `grpc-status` codes.
+`h2_grpc_status_name(code)`, `h2_grpc_status_parse(text)` (-1 if invalid) and
+`h2_grpc_status_from_http(http_status)` (the mapping for a response with no
+`grpc-status`) round them out.
+
 ## std/file
 
 Files by descriptor, for programs that manage their own storage: reads and
