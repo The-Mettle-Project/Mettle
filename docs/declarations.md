@@ -12,6 +12,18 @@ fn add(a: int32, b: int32) -> int32 {
 }
 ```
 
+The last expression, with no `;`, is also the return value, and a body of one
+expression can follow `=`:
+
+```mettle
+fn add(a: int32, b: int32) -> int32 { a + b }
+fn square(x: int32) -> int32 = x * x;
+```
+
+[Control flow](control-flow.md#functions) has the rules. A string literal alone
+after `=` stays a link name, so write `{ "text" }` for a function that returns
+one.
+
 Parameters carry types. The return type follows `->`. A function that returns
 nothing leaves the arrow off:
 
@@ -275,6 +287,7 @@ A decorator sits before a declaration and asks the compiler for something.
 | `@inline` | Inline this callee past the size budget |
 | `@noinline` | Never inline this callee |
 | `@pure` | A contract: the build fails if the function writes anything |
+| `@noreturn` | Calls to this function never come back, so an arm that ends in one needs no value; the only decorator an `extern` takes |
 | `@simd` | Report whether this loop vectorized |
 | `@unroll(n)` | Unroll this loop n times |
 | `@parallel` | Run this loop's iterations across the machine's cores |

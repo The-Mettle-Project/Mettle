@@ -205,6 +205,16 @@ var dbl: fn(int32) -> int32 = fn(x: int32) -> int32 { return x * 2; };
 Stored in a `Fn(...)` it may capture. [Declarations](declarations.md) covers
 the capture rules.
 
+## Control flow as a value
+
+`if`, `match`, `switch`, a block and a loop are expressions:
+
+```mettle
+var size = if (n < 16) { 16 } else { n * 2 };
+```
+
+[Control flow](control-flow.md#values) has the rules.
+
 ## String interpolation
 
 Every string literal is scanned for `{expr}`. The expression is evaluated and

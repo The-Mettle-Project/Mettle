@@ -3007,7 +3007,7 @@ $cases = @(
   @{ Name = "diag_multi_error"; Path = "tests/diag_multi_error.mettle"; ShouldSucceed = $false
      OutputMustMatch = @("due to 4 previous errors", "Undefined variable 'missing1'", "Undefined variable 'missing2'") },
   @{ Name = "diag_parser_no_cascade"; Path = "tests/diag_parser_no_cascade.mettle"; ShouldSucceed = $false
-     Pattern = "Expected '\(' after 'if'"
+     Pattern = "Expected '}', found end of file"
      OutputMustNotMatch = @("Expected '\(', found identifier", "due to [4-9] previous") },
   @{ Name = "diag_for_step_undeclared"; Path = "tests/diag_for_step_undeclared.mettle"; ShouldSucceed = $false
      Pattern = "Undefined variable 'nosuch'"
@@ -3175,7 +3175,7 @@ $cases = @(
   @{ Name = "err_syntax_paren_comma"; Path = "tests/err_syntax_paren_comma.mettle"; ShouldSucceed = $false; Pattern = "the grouped expression holds one value" },
   @{ Name = "err_syntax_nested_group_comma"; Path = "tests/err_syntax_nested_group_comma.mettle"; ShouldSucceed = $false; Pattern = "the grouped expression holds one value" },
   @{ Name = "err_syntax_no_cascade"; Path = "tests/err_syntax_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
-  @{ Name = "err_syntax_no_cascade_msg"; Path = "tests/err_syntax_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "Expected '\(' after 'if'" },
+  @{ Name = "err_syntax_no_cascade_msg"; Path = "tests/err_syntax_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "Expected '\{' after the condition of 'if'" },
   @{ Name = "err_syntax_c_for_header"; Path = "tests/err_syntax_c_for_header.mettle"; ShouldSucceed = $false; Pattern = "A 'for' header needs 'in' or parentheses" },
   @{ Name = "err_syntax_c_for_header_once"; Path = "tests/err_syntax_c_for_header.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },
   @{ Name = "err_syntax_lexical_no_cascade"; Path = "tests/err_syntax_lexical_no_cascade.mettle"; ShouldSucceed = $false; Pattern = "due to 1 previous error" },

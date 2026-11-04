@@ -1,12 +1,9 @@
 # Control flow
 
 Branching, looping, matching, and the statements that run on the way out of a
-scope.
+scope. Every branching form also gives a value; [Values](#values) has the rules.
 
 ## if
-
-The condition goes in parentheses and the body in braces. Braces are required
-even for one statement.
 
 ```mettle
 if (n < 0) {
@@ -18,6 +15,15 @@ if (n < 0) {
 }
 ```
 
+The parentheses are optional when a braced body follows, and the same goes for
+`while`, `switch` and `match`:
+
+```mettle
+if n < 0 {
+  return 0;
+}
+```
+
 The condition is a `bool`. Comparison and the logical operators produce one,
 and an integer converts to one, with any nonzero value counting as `true`.
 
@@ -25,11 +31,171 @@ and an integer converts to one, with any nonzero value counting as `true`.
 
 ```mettle
 var i: int32 = 0;
-while (i < 5) {
+while i < 5 {
   total = total + i;
   i = i + 1;
 }
 ```
+
+## Values
+
+`if`, `match`, `switch`, a block and a loop all work anywhere an expression
+does. A block's value is its last expression, written with no `;`:
+
+```mettle
+var size = if (n < 16) { 16 } else { n * 2 };
+
+var name = switch (code) {
+  case 1: "one",
+  case 2..4: "a few",
+  default: "many",
+};
+
+var area = match (s) {
+  case Circle(r): 3.0 * r * r,
+  case Square(w): (float64)(w * w),
+  case Empty: 0.0,
+};
+
+var squared = {
+  var t = next();
+  t * t
+};
+```
+
+A `;` after the last expression drops the value, and the compiler says so if
+something needed it.
+
+An arm with one expression needs no braces, so `if (a > b) a else b` is the
+short form. Braces are required when the condition has no parentheses.
+
+An `if` used as a value needs an `else`, and a `switch` needs a `default`. A
+`match` must cover every variant, as it always does.
+
+An arm can leave instead of giving a value, with `return`, `break`, `continue`
+or a call to a [`@noreturn`](declarations.md#decorators) function:
+
+```mettle
+var v = match (read_config()) {
+  case Ok(c): c,
+  case Err(e): return Err(e),
+};
+```
+
+### The type of a value
+
+When the value goes somewhere with a type, each arm converts to that type the
+way an initializer does:
+
+```mettle
+var wide: int64 = if (big) { x } else { 0 };
+var point: Point = if (flip) { { x: 1, y: 2 } } else { { x: 2, y: 1 } };
+```
+
+With no type to go to, the arms must agree. A bare number takes the type of the
+arm beside it. Two different types are an error, and a cast settles it:
+
+```text
+error[E0003]: The branches of this 'if' give different types, 'int32' and
+'int64'; cast one so they agree
+```
+
+Refinements hold through arms. Each arm is proved on its own, so
+`var p: Positive = if (c) { -1 } else { 2 };` fails on the `-1`.
+
+### Constants
+
+A `const` or a global may use `if` or `switch` when its conditions are
+constants. The compiler picks the arm and sees only that value:
+
+```mettle
+const SLOTS: int32 = if (WIDE) { 64 } else { 16 };
+var table: int32[SLOTS];
+```
+
+### Functions
+
+A function's last expression is its return value:
+
+```mettle
+fn abs(x: int32) -> int32 {
+  if (x < 0) { -x } else { x }
+}
+```
+
+This compiles to the same code as writing `return` in each arm. `return` still
+works everywhere, and the two mix freely.
+
+`main` has one exception. A last call in `main` leaves the exit status alone,
+because programs have always ended that way. If the call returns a value that
+could have been the status, the compiler warns:
+
+```text
+warning[E0003]: main drops the value of its last call; write 'return' to make
+it the exit status, or add ';' to say it is dropped
+```
+
+### Order
+
+Operands run left to right, and an arm that writes a variable counts. In
+`x + if (x == 1) { x = 10; 5 } else { 6 }` with `x` at 1, the left `x` is read
+first, so the sum is 6.
+
+## Loops as values
+
+`break` can carry a value out of its loop. `else` runs when the loop ends with
+no `break`, and gives the value for that path:
+
+```mettle
+var at = for i in 0..n {
+  if (xs[i] == want) { break i; }
+} else {
+  -1
+};
+```
+
+A `while (true)` has no other way out, so it needs no `else`:
+
+```mettle
+var line = while (true) {
+  var candidate = next_record();
+  if (candidate.length > 0) { break candidate; }
+};
+```
+
+`else` also works on a plain loop that gives no value:
+
+```mettle
+for i in 0..n {
+  if (xs[i] == want) { found(i); break; }
+} else {
+  missing();
+}
+```
+
+Inside a `switch` in a loop, a bare `break` leaves the `switch`, and `break`
+with a value leaves the loop.
+
+A label names which loop `break` means, and the value comes after it. A block
+can carry a label too, which gives it an early way out:
+
+```mettle
+var hit = outer: for i in 0..h {
+  for j in 0..w {
+    if (grid[i][j] == want) { break outer i * w + j; }
+  }
+} else {
+  -1
+};
+
+var r = checked: {
+  if (n < 0) { break checked -1; }
+  n * 2
+};
+```
+
+A name after `break` is a label when a loop or block by that name is in scope,
+and otherwise a value.
 
 ## for over a range
 
@@ -150,7 +316,7 @@ switch ((int32)c) {
 ## match
 
 `match` reads a tagged enum. Each `case` names a variant, binds its payload,
-and takes a braced body:
+and takes a body, in braces or as one statement:
 
 ```mettle
 enum Shape {

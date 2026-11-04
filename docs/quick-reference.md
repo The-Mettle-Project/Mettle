@@ -146,6 +146,56 @@ match (half(8)) {
 }
 ```
 
+## Control flow as a value
+
+```mettle
+fn abs(x: int32) -> int32 {
+  if (x < 0) { -x } else { x }
+}
+
+fn square(x: int32) -> int32 = x * x;
+```
+
+```mettle
+var n: int32 = 20;
+var size = if n < 16 { 16 } else { n * 2 };
+var bigger = if (n > size) n else size;
+
+var word = switch (n) {
+  case 1: "one",
+  case 2..9: "few",
+  default: "many",
+};
+
+var total = {
+  var t = n + 1;
+  t * t
+};
+
+println("{abs(-3)} {square(4)} {size} {bigger} {word} {total}");
+```
+
+```text
+3 16 40 40 many 441
+```
+
+The last expression of a block, with no `;`, is its value. An arm may also leave
+with `return`, `break`, `continue` or a call to a `@noreturn` function.
+
+```mettle
+var xs: int32[3] = [4, 5, 6];
+var at = for i in 0..3 {
+  if (xs[i] == 5) { break i; }
+} else {
+  -1
+};
+println("{at}");
+```
+
+```text
+1
+```
+
 ## Loops
 
 ```mettle
