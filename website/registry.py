@@ -16,15 +16,23 @@ import threading
 
 HERE = pathlib.Path(__file__).resolve().parent
 PACKAGES = HERE / "registry" / "packages"
-FONT = HERE / "fonts" / "GeistSerif-Regular.woff2"
-SOURCE_URL = "https://github.com/The-Mettle-Project/Mettle/blob/master/website/registry/packages"
-DOCS_URL = "https://github.com/The-Mettle-Project/Mettle/blob/master/docs/packages.md"
+SITE_ASSETS = {
+    "site.css": HERE / "registry" / "site.css",
+    "site.js": HERE / "registry" / "site.js",
+    "geist-serif.woff2": HERE / "fonts" / "GeistSerif-Regular.woff2",
+    "ridge.jpg": HERE / "media" / "card-frame.jpg",
+    "canyon.jpg": HERE / "media" / "canyon-poster.jpg",
+}
+REPOSITORY = "https://github.com/The-Mettle-Project/Mettle"
+SOURCE_URL = f"{REPOSITORY}/blob/master/website/registry/packages"
+DOCS_URL = f"{REPOSITORY}/blob/master/docs/packages.md"
 INDEX_HEADER = "mettle-registry-1"
 MANIFEST = "mettle.package"
 LEDGER = "versions"
 TAR_BLOCK = 512
 MAX_ARCHIVE = 16 << 20
 MAX_FILES = 4096
+API_LINES = 4
 NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\Z")
 COMPONENT = re.compile(r"[A-Za-z0-9_+.-]+\Z")
@@ -32,6 +40,11 @@ RESERVED_NAMES = {"std", "mettle", "con", "prn", "aux", "nul", "v1"}
 RESERVED_STEMS = {"con", "prn", "aux", "nul"}
 BINARY = {".exe", ".dll", ".so", ".dylib", ".o", ".obj", ".a", ".lib", ".pdb", ".tar", ".zip", ".gz"}
 SKIPPED_ROOT_FILES = {"mettle.deps", "mettle.lock"}
+CODE_KEYWORD = re.compile(
+    r"(import|fn|var|const|for|in|return|if|else|break|continue|while|struct|enum|extern|export|type|defer|switch|case|default|match)\Z"
+)
+CODE_TYPE = re.compile(r"(u?int(8|16|32|64)|float(16|32|64)|bool|char|string|cstring|rawptr)\Z")
+CODE_TOKEN = re.compile(r'("(?:[^"\\]|\\.)*")|([A-Za-z_][A-Za-z0-9_]*)|(\s+)|(.)')
 EMBLEM = (
     '<svg viewBox="0 0 150 150" aria-hidden="true">'
     '<polygon points="56.4 63.7 69.5 34.8 113.7 32.3 133.5 51 122.3 74.9 130.2 88.3 147.6 48 119.6 20.8 62.4 20.9 42.4 63.7"/>'
@@ -41,98 +54,6 @@ EMBLEM = (
     '<path d="m14.2 63-12.1 5.5 1.4 2.1 23.1 32.4 13.9-29.1-26.3-10.9zm14.7 22.3-17.3-19.9 24.4 10.3-7.1 9.6z"/>'
     "</svg>"
 )
-STYLE = """@font-face {
-  font-family: "Geist Serif";
-  src: url(geist-serif.woff2) format("woff2");
-  font-weight: 400;
-  font-style: normal;
-}
-:root {
-  --bg: #17181a;
-  --ink: #f1efe9;
-  --ink-2: #a8a69f;
-  --faint: #33363a;
-  --accent: #e8a468;
-  --serif: "Geist Serif", "Times New Roman", Times, serif;
-  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
-  --bar: 56px;
-  color-scheme: dark;
-}
-* { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; background: var(--bg); scroll-padding-top: var(--bar); }
-body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--serif); font-synthesis: none; font-size: 20px; line-height: 1.42; -webkit-font-smoothing: antialiased; overflow-x: clip; }
-a { color: inherit; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 0.18em; text-decoration-color: var(--faint); }
-a:hover { text-decoration-color: currentColor; }
-a:focus-visible, input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-::selection { background: rgba(232, 164, 104, 0.32); }
-.wrap { max-width: 1400px; margin: 0 auto; padding-left: 40px; padding-right: 40px; }
-.top { position: sticky; top: 0; z-index: 10; background: var(--bg); box-shadow: 0 1px 0 var(--faint); }
-.top .wrap { display: flex; align-items: center; gap: 36px; height: var(--bar); }
-.brand { display: inline-flex; align-items: center; gap: 10px; flex: none; color: #fff; text-decoration: none; }
-.brand svg { width: 24px; height: 24px; fill: currentColor; }
-.top nav { display: flex; gap: 22px; font-size: 16px; white-space: nowrap; margin-left: auto; }
-.top nav a { text-decoration: none; }
-.top nav a:hover, .top nav a[aria-current] { text-decoration: underline; }
-h1 { font-size: clamp(38px, 6.5vw, 118px); line-height: 1.02; font-weight: 400; letter-spacing: -0.028em; margin: 0; overflow-wrap: anywhere; }
-.head { padding-top: clamp(40px, 9vh, 112px); padding-bottom: 48px; }
-.head p { margin: 16px 0 0; max-width: 34em; font-size: clamp(20px, 2vw, 30px); line-height: 1.16; letter-spacing: -0.012em; text-wrap: pretty; }
-.head .up { margin: 0 0 10px; font-size: 16px; letter-spacing: 0; color: var(--ink-2); }
-.head .lead { margin-top: 24px; }
-h2 { margin: 0; font-size: clamp(32px, 3.6vw, 56px); line-height: 1.04; font-weight: 400; letter-spacing: -0.024em; }
-.sec { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); column-gap: 56px; padding-top: 30px; padding-bottom: 44px; border-top: 1px solid var(--faint); }
-.sec > .side { position: sticky; top: calc(var(--bar) + 28px); align-self: start; }
-.rows { list-style: none; margin: 0; padding: 0; min-width: 0; }
-.rows > li { min-width: 0; padding-bottom: 24px; }
-.rows > li:last-child { padding-bottom: 0; }
-h3 { margin: 0; font-size: clamp(22px, 1.8vw, 26px); line-height: 1.16; font-weight: 400; letter-spacing: -0.012em; }
-h3 a { text-decoration: none; }
-h3 a:hover { text-decoration: underline; }
-.rows p, .note { margin: 4px 0 0; max-width: 44em; font-size: clamp(17px, 1.25vw, 18px); line-height: 1.34; color: var(--ink-2); text-wrap: pretty; }
-code { font-family: var(--mono); font-size: 0.84em; color: var(--ink); }
-.facts { margin: 6px 0 0; font-family: var(--mono); font-size: 13.5px; line-height: 1.6; color: var(--ink-2); overflow-wrap: anywhere; }
-.facts a { color: inherit; }
-.cmd { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 20px; }
-.cmd pre { margin: 0; padding: 14px 20px; background: #0e0f10; color: #fff; font-family: var(--mono); font-size: clamp(14px, 1.08vw, 17px); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
-.cmd .ps { color: rgba(255, 255, 255, 0.6); user-select: none; }
-.cmd button { padding: 0; font: inherit; font-size: 17px; color: var(--ink-2); background: none; border: 0; cursor: pointer; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 0.18em; text-decoration-color: var(--faint); }
-.cmd button:hover { color: var(--ink); text-decoration-color: currentColor; }
-.filter { display: block; width: 100%; margin-top: 18px; padding: 8px 0; font: inherit; font-size: 19px; color: var(--ink); background: none; border: 0; border-bottom: 1px solid var(--ink-2); border-radius: 0; }
-.filter::placeholder { color: var(--ink-2); }
-.count { margin: 12px 0 0; font-size: 16px; color: var(--ink-2); }
-.snip { margin: 0; padding-left: 18px; border-left: 1px solid var(--faint); font-family: var(--mono); font-size: clamp(12.5px, 0.98vw, 14.5px); line-height: 1.6; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
-.snip + .snip { margin-top: 14px; }
-.file { margin: 18px 0 8px; font-family: var(--mono); font-size: 13.5px; color: var(--ink-2); }
-.file:first-child { margin-top: 0; }
-.ver { display: grid; grid-template-columns: 7em minmax(0, 1fr); column-gap: 20px; padding: 12px 0; border-top: 1px solid var(--faint); font-size: 18px; }
-.ver:first-child { padding-top: 0; border-top: 0; }
-.ver .facts { margin: 0; }
-.ver s { color: var(--ink-2); }
-.readme { max-width: 44em; font-size: clamp(17px, 1.25vw, 18px); line-height: 1.4; color: var(--ink-2); }
-.readme h2, .readme h3, .readme h4 { margin: 28px 0 0; font-size: clamp(22px, 1.8vw, 26px); line-height: 1.16; font-weight: 400; letter-spacing: -0.012em; color: var(--ink); }
-.readme > :first-child { margin-top: 0; }
-.readme p, .readme ul { margin: 10px 0 0; }
-.readme ul { padding-left: 1.1em; }
-.readme li + li { margin-top: 6px; }
-.readme pre { margin: 12px 0 0; padding-left: 18px; border-left: 1px solid var(--faint); font-family: var(--mono); font-size: clamp(12.5px, 0.98vw, 14.5px); line-height: 1.6; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
-.readme pre code { font-size: inherit; }
-.files { margin: 0; padding: 0; list-style: none; font-family: var(--mono); font-size: 14px; line-height: 1.7; overflow-wrap: anywhere; }
-main { padding-bottom: 88px; }
-.foot { padding-top: 24px; padding-bottom: 40px; border-top: 1px solid var(--faint); font-size: 16px; color: var(--ink-2); }
-[hidden] { display: none !important; }
-@media (max-width: 1000px) {
-  .sec { display: block; padding-top: 28px; }
-  .sec > .side { position: static; margin-bottom: 22px; }
-}
-@media (max-width: 680px) {
-  :root { --bar: 52px; }
-  body { font-size: 18px; }
-  .wrap { padding-left: 16px; padding-right: 16px; }
-  .top .wrap { gap: 18px; }
-  .top nav { gap: 18px; }
-  .snip, .readme pre { padding-left: 12px; }
-  .ver { grid-template-columns: 5.5em minmax(0, 1fr); }
-}
-"""
 
 
 class RegistryError(Exception):
@@ -449,6 +370,29 @@ def exports_of(package):
     return groups
 
 
+def export_listing(found):
+    constants = [line.split(None, 1)[1] for line in found if line.startswith("const ")]
+    others = sorted((line for line in found if not line.startswith("const ")), key=lambda line: line.startswith("fn "))
+    if constants:
+        others.append("const " + ", ".join(constants))
+    return "\n".join(others)
+
+
+def highlight_code(text):
+    out = []
+    for match in CODE_TOKEN.finditer(text):
+        token = match.group(0)
+        if match.group(1):
+            out.append(f'<span class="st">{text_escape(token)}</span>')
+        elif match.group(2) and CODE_KEYWORD.match(token):
+            out.append(f'<span class="k">{token}</span>')
+        elif match.group(2) and CODE_TYPE.match(token):
+            out.append(f'<span class="t">{token}</span>')
+        else:
+            out.append(text_escape(token))
+    return "".join(out)
+
+
 def inline_markdown(text):
     pieces = re.split(r"(`[^`]+`)", text)
     out = []
@@ -481,7 +425,7 @@ def render_readme(text):
                 code.append(lines[at])
                 at += 1
             at += 1
-            blocks.append(f"<pre><code>{text_escape(chr(10).join(code))}</code></pre>")
+            blocks.append(f"<pre><code>{highlight_code(chr(10).join(code))}</code></pre>")
         elif line.startswith("#"):
             level = len(line) - len(line.lstrip("#"))
             title = line[level:].strip()
@@ -489,7 +433,7 @@ def render_readme(text):
             if level == 1 and not title_skipped:
                 title_skipped = True
                 continue
-            tag = f"h{min(max(level, 2), 4)}"
+            tag = f"h{min(max(level + 1, 3), 4)}"
             blocks.append(f"<{tag}>{inline_markdown(title)}</{tag}>")
         elif re.match(r"[-*] ", line):
             items = []
@@ -512,7 +456,35 @@ def render_readme(text):
     return "\n".join(blocks)
 
 
-def page(title, description, depth, body, current=False):
+def format_size(size):
+    if size < 1024:
+        return f"{size} B"
+    return f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB"
+
+
+def add_button(name):
+    command = f"mettle pkg add {name}"
+    return f'<button class="add" type="button" data-copy="{command}"><code>{command}</code><span>Copy</span></button>'
+
+
+def footer(up):
+    command = "python website/registry.py add path/to/mylib"
+    return f"""<footer class="end" data-image="{up}assets/canyon.jpg" data-fade="0.14 0.4 0.5 0.95">
+  <div class="wrap">
+    <h2>Publish yours.</h2>
+    <div class="cmd"><pre><span class="ps">$ </span>{command}</pre><button type="button" data-copy="{command}">Copy</button></div>
+    <ul class="go">
+      <li><a href="{DOCS_URL}#publishing">How publishing works</a></li>
+      <li><a href="{DOCS_URL}">Using packages</a></li>
+      <li><a href="{up}v1/index.json">The index as JSON</a></li>
+      <li><a href="{REPOSITORY}/tree/master/website/registry/packages">Every package's source</a></li>
+    </ul>
+    <p class="fine">Footage by <a href="https://www.pexels.com/video/falling-16296843/">Film Composite</a> and <a href="https://www.pexels.com/video/dramatic-aerial-view-of-utah-s-rugged-canyons-34305686/">Alex Moliski</a>. Dither after <a href="https://motion-core.dev/docs/dithered-image">Motion Core</a>.</p>
+  </div>
+</footer>"""
+
+
+def page(title, description, depth, hero, body, current=False):
     up = "../" * depth
     site = up + "../"
     mark = ' aria-current="page"' if current else ""
@@ -527,7 +499,7 @@ def page(title, description, depth, body, current=False):
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="{up}assets/registry.css">
+<link rel="stylesheet" href="{up}assets/site.css">
 <link rel="icon" href="{up}assets/emblem.svg">
 </head>
 <body>
@@ -536,113 +508,82 @@ def page(title, description, depth, body, current=False):
     <a class="brand" href="{site}" aria-label="Mettle, home">{EMBLEM} Mettle</a>
     <nav aria-label="Site">
       <a href="{up}"{mark}>Packages</a>
-      <a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/README.md">Docs</a>
-      <a href="https://github.com/The-Mettle-Project/Mettle">Source</a>
+      <a href="{REPOSITORY}/blob/master/docs/README.md">Docs</a>
+      <a href="{REPOSITORY}">Source</a>
     </nav>
   </div>
 </header>
+{hero}
 <main>
 {body}
 </main>
-<script>
-document.addEventListener("click", function (event) {{
-  var button = event.target.closest("button[data-copy]");
-  if (!button || !navigator.clipboard) {{ return; }}
-  navigator.clipboard.writeText(button.getAttribute("data-copy")).then(function () {{
-    button.textContent = "Copied";
-    setTimeout(function () {{ button.textContent = "Copy"; }}, 1600);
-  }});
-}});
-</script>
+{footer(up)}
+<script src="{up}assets/site.js"></script>
 </body>
 </html>
 """
 
 
-def format_size(size):
-    if size < 1024:
-        return f"{size} B"
-    return f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB"
+def main_module_signatures(package):
+    source_name = f"{package['name']}.mettle"
+    for path, found in exports_of(package):
+        if path == source_name:
+            return [line for line in found if line.startswith("fn ")]
+    return []
 
 
-def command_block(text):
-    return (
-        '<div class="cmd"><pre><span class="ps">$ </span>'
-        f'{text_escape(text)}</pre><button type="button" data-copy="{text_escape(text)}">Copy</button></div>'
-    )
+def index_row(name, versions):
+    latest = versions[latest_of(versions)]
+    manifest = latest["manifest"]
+    signatures = main_module_signatures(latest)
+    every_export = " ".join(line for _, found in exports_of(latest) for line in found)
+    search = text_escape(f"{name} {manifest['description']} {every_export}".lower())
+    api = highlight_code("\n".join(signatures[:API_LINES]))
+    facts = [latest["version"], text_escape(manifest["license"]), format_size(len(latest["archive"]))]
+    needs = sorted(manifest["require"])
+    if needs:
+        links = ", ".join(f'<a href="{need}/">{need}</a>' for need in needs)
+        facts.append(f"requires {links}")
+    facts_html = "".join(f"<li>{fact}</li>" for fact in facts)
+    return f"""<li class="pkg wrap" data-search="{search}">
+  <div>
+    <h2><a href="{name}/">{name}</a></h2>
+    {add_button(name)}
+  </div>
+  <div>
+    <p class="desc">{text_escape(manifest['description'])}</p>
+    <pre class="api"><code>{api}</code></pre>
+    <ul class="facts">{facts_html}</ul>
+  </div>
+</li>"""
 
 
 def index_page(registry):
-    rows = []
-    for name, versions in registry.items():
-        latest = versions[latest_of(versions)]
-        manifest = latest["manifest"]
-        needs = ", ".join(sorted(manifest["require"]))
-        requires = f" requires {text_escape(needs)}" if needs else ""
-        search = text_escape(f"{name} {manifest['description']}".lower())
-        rows.append(
-            f'<li data-search="{search}"><h3><a href="{name}/">{name}</a></h3>'
-            f"<p>{text_escape(manifest['description'])}</p>"
-            f'<p class="facts">{latest["version"]} {text_escape(manifest["license"])}{requires}</p></li>'
-        )
     count = len(registry)
     noun = "package" if count == 1 else "packages"
-    script = """<script>
-var filter = document.getElementById("filter");
-var rows = document.querySelectorAll("#list > li");
-var count = document.getElementById("count");
-var empty = document.getElementById("empty");
-filter.addEventListener("input", function () {
-  var words = filter.value.toLowerCase().split(/\\s+/).filter(Boolean);
-  var shown = 0;
-  rows.forEach(function (row) {
-    var text = row.getAttribute("data-search");
-    var hit = words.every(function (word) { return text.indexOf(word) >= 0; });
-    row.hidden = !hit;
-    if (hit) { shown++; }
-  });
-  count.textContent = shown + (shown === 1 ? " package" : " packages");
-  empty.hidden = shown !== 0;
-});
-</script>"""
-    body = f"""<div class="wrap head">
-  <h1>Packages</h1>
-  <div class="lead">{command_block("mettle pkg add sha256")}</div>
-</div>
-<section class="wrap sec">
-  <div class="side">
-    <h2>Find</h2>
-    <input id="filter" class="filter" type="search" placeholder="Name or description" aria-label="Filter packages" autocomplete="off">
-    <p class="count" id="count">{count} {noun}</p>
+    rows = "\n".join(index_row(name, versions) for name, versions in registry.items())
+    hero = f"""<div class="sky" data-image="assets/ridge.jpg" data-fade="0.42 0.17 -1 0" data-focus="0.9">
+  <div class="wrap">
+    <h1 class="hide">Mettle packages</h1>
+    <label class="find"><span class="hide">Find a package by name, description or function</span><input id="filter" type="search" placeholder="Find a package" autocomplete="off" spellcheck="false"></label>
+    <p class="tally" id="tally">{count} {noun}</p>
+  </div>
+</div>"""
+    body = f"""<ul class="ledger" id="ledger">
+{rows}
+</ul>
+<div class="pkg wrap none" id="none" hidden>
+  <div>
+    <h2>None yet.</h2>
   </div>
   <div>
-    <ul class="rows" id="list">
-{chr(10).join(rows)}
+    <p class="desc">No package has &ldquo;<span id="none-query"></span>&rdquo; in its name, description or functions.</p>
+    <ul class="facts">
+      <li><button id="clear" type="button">Show all {count} {noun}</button></li>
     </ul>
-    <p class="note" id="empty" hidden>No package matches.</p>
   </div>
-</section>
-<section class="wrap sec">
-  <h2 class="side">Use</h2>
-  <ul class="rows">
-    <li><h3><a href="{DOCS_URL}">Add a package</a></h3><p><code>mettle pkg add</code> writes <code>mettle.package</code>, <code>mettle.lock</code> and <code>mettle.deps</code>. Then <code>import "sha256";</code> resolves.</p></li>
-    <li><h3><a href="{DOCS_URL}#in-ci">Install in CI</a></h3><p><code>mettle pkg install --frozen</code> installs what <code>mettle.lock</code> names and fails if a hash differs.</p></li>
-  </ul>
-</section>
-<section class="wrap sec">
-  <h2 class="side">Publish</h2>
-  <ul class="rows">
-    <li><h3><a href="{DOCS_URL}#publishing">Open a pull request</a></h3><p>A package is a folder in this repository. CI checks its hash, compiles it with the current compiler and runs its <code>@test</code> functions. A published version cannot change.</p></li>
-  </ul>
-</section>
-<section class="wrap sec">
-  <h2 class="side">Index</h2>
-  <ul class="rows">
-    <li><h3><a href="v1/index.json">v1/index.json</a></h3><p>Every package and version, for tools.</p></li>
-  </ul>
-</section>
-{script}"""
-    return page("Packages", "Packages for the Mettle language.", 0, body, current=True)
+</div>"""
+    return page("Mettle packages", "Packages for the Mettle language.", 0, hero, body, current=True)
 
 
 def required_by(registry, target):
@@ -652,6 +593,48 @@ def required_by(registry, target):
         if target in latest["manifest"]["require"]:
             users.append(name)
     return users
+
+
+def rail_facts(registry, name, latest):
+    manifest = latest["manifest"]
+    rows = [
+        ("Version", latest["version"]),
+        ("License", text_escape(manifest["license"])),
+        ("Size", format_size(len(latest["archive"]))),
+        ("Published", latest["date"]),
+    ]
+    if manifest.get("compiler"):
+        rows.append(("Compiler", f"{text_escape(manifest['compiler'])} or newer"))
+    if manifest["require"]:
+        needs = "".join(
+            f'<li><a href="../{need}/">{need}</a> {wanted}</li>' for need, wanted in sorted(manifest["require"].items())
+        )
+        rows.append(("Requires", f"<ul>{needs}</ul>"))
+    users = required_by(registry, name)
+    if users:
+        rows.append(("Used by", "<ul>" + "".join(f'<li><a href="../{user}/">{user}</a></li>' for user in users) + "</ul>"))
+    if manifest.get("source") and re.match(r"https?://", manifest["source"]):
+        rows.append(("Source", f'<a href="{text_escape(manifest["source"])}">Repository</a>'))
+    files = "".join(
+        f'<li><a href="{SOURCE_URL}/{name}/{latest["version"]}/{path}">{text_escape(path)}</a></li>'
+        for path in latest["files"]
+    )
+    rows.append(("Files", f"<ul>{files}</ul>"))
+    return "".join(f"<dt>{label}</dt><dd>{value}</dd>" for label, value in rows)
+
+
+def version_rows(name, versions):
+    rows = []
+    for version in sorted(versions, key=version_key, reverse=True):
+        package = versions[version]
+        label = f"<s>{version}</s>" if package["yanked"] else version
+        state = " yanked" if package["yanked"] else ""
+        rows.append(
+            f'<div class="ver"><div>{label}</div><div>{package["date"]}{state} '
+            f'<a href="../v1/archives/{name}-{version}.tar">{format_size(len(package["archive"]))}</a>'
+            f'<code>sha256 {package["sha256"]}</code></div></div>'
+        )
+    return "".join(rows)
 
 
 def package_page(registry, name):
@@ -664,71 +647,40 @@ def package_page(registry, name):
         blocks = []
         for path, found in groups:
             blocks.append(f'<p class="file">{text_escape(path)}</p>')
-            blocks.append(f'<pre class="snip">{text_escape(chr(10).join(found))}</pre>')
+            blocks.append(f'<pre class="api"><code>{highlight_code(export_listing(found))}</code></pre>')
         sections.append(("Exports", "".join(blocks)))
     readme_path = latest["directory"] / "README.md"
     if readme_path.is_file():
-        sections.append(("Readme", f'<div class="readme">{render_readme(readme_path.read_text(encoding="utf-8"))}</div>'))
-    needs = manifest["require"]
-    if needs:
-        items = "".join(
-            f'<li><h3><a href="../{need}/">{need}</a></h3><p class="facts">{wanted} or newer</p></li>'
-            for need, wanted in sorted(needs.items())
-        )
-        sections.append(("Requires", f'<ul class="rows">{items}</ul>'))
-    users = required_by(registry, name)
-    if users:
-        items = "".join(f'<li><h3><a href="../{user}/">{user}</a></h3></li>' for user in users)
-        sections.append(("Required by", f'<ul class="rows">{items}</ul>'))
-    rows = []
-    for version in sorted(versions, key=version_key, reverse=True):
-        package = versions[version]
-        label = f"<s>{version}</s>" if package["yanked"] else version
-        state = " yanked" if package["yanked"] else ""
-        rows.append(
-            f'<div class="ver"><div>{label}</div><p class="facts">{package["date"]}{state} '
-            f'<a href="../v1/archives/{name}-{version}.tar">{format_size(len(package["archive"]))}</a><br>'
-            f'sha256 {package["sha256"]}</p></div>'
-        )
-    sections.append(("Versions", "".join(rows)))
-    files = "".join(
-        f'<li><a href="{SOURCE_URL}/{name}/{latest["version"]}/{path}">{text_escape(path)}</a></li>'
-        for path in latest["files"]
-    )
-    sections.append(("Files", f'<ul class="files">{files}</ul>'))
-    rendered = "\n".join(
-        f'<section class="wrap sec"><h2 class="side">{title}</h2><div>{content}</div></section>'
-        for title, content in sections
-    )
-    source = manifest.get("source")
-    source_text = f' <a href="{text_escape(source)}">Source</a>' if source and re.match(r"https?://", source) else ""
-    compiler = manifest.get("compiler")
-    compiler_text = f" Needs mettle {text_escape(compiler)} or newer." if compiler else ""
-    body = f"""<div class="wrap head">
-  <p class="up"><a href="../">Packages</a></p>
-  <h1>{name}</h1>
-  <p>{text_escape(manifest['description'])}</p>
-</div>
-<section class="wrap sec">
-  <h2 class="side">Use</h2>
-  <div>
-    {command_block(f"mettle pkg add {name}")}
-    <p class="note"><code>import "{name}";</code></p>
-    <p class="facts">{latest['version']} {text_escape(manifest['license'])}.{compiler_text}{source_text}</p>
+        rendered = render_readme(readme_path.read_text(encoding="utf-8"))
+        sections.append(("Readme", f'<div class="readme">{rendered}</div>'))
+    sections.append(("Versions", version_rows(name, versions)))
+    content = "\n".join(f"<section><h2>{title}</h2>{html_text}</section>" for title, html_text in sections)
+    hero = f"""<div class="sky low" data-image="../assets/ridge.jpg" data-fade="0.62 0.17 -1 0" data-focus="0.9">
+  <div class="wrap">
+    <h1>{name}</h1>
+    <p class="what">{text_escape(manifest['description'])}</p>
   </div>
-</section>
-{rendered}"""
-    return page(f"{name}: Mettle package", manifest["description"], 1, body)
+</div>"""
+    body = f"""<div class="wrap page">
+  <aside class="rail">
+    {add_button(name)}
+    <dl>{rail_facts(registry, name, latest)}</dl>
+  </aside>
+  <div class="body">
+{content}
+  </div>
+</div>"""
+    return page(f"{name} package", manifest["description"], 1, hero, body)
 
 
 def write_pages(out, registry):
     assets = out / "assets"
     assets.mkdir(parents=True, exist_ok=True)
-    (assets / "registry.css").write_bytes(STYLE.encode("utf-8"))
+    for published, source in SITE_ASSETS.items():
+        shutil.copyfile(source, assets / published)
     (assets / "emblem.svg").write_bytes(
         EMBLEM.replace('<svg viewBox="0 0 150 150" aria-hidden="true">', '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 150 150" fill="#121211">').encode("utf-8")
     )
-    shutil.copyfile(FONT, assets / "geist-serif.woff2")
     (out / "index.html").write_bytes(index_page(registry).encode("utf-8"))
     for name in registry:
         folder = out / name
