@@ -1,0 +1,9 @@
+// macOS libc entry points whose struct layout depends on the CPU. Apple silicon has only the 64-bit-inode layouts, under the plain names.
+// std/macos_abi picks this file by target.
+
+export extern fn macos_c_stat(path: uint8*, st: uint8*) -> int32 = "stat";
+export extern fn macos_c_lstat(path: uint8*, st: uint8*) -> int32 = "lstat";
+export extern fn macos_c_fstat(fd: int32, st: uint8*) -> int32 = "fstat";
+export extern fn macos_c_opendir(path: uint8*) -> uint8* = "opendir";
+export extern fn macos_c_fdopendir(fd: int32) -> uint8* = "fdopendir";
+export extern fn macos_c_readdir(dir: uint8*) -> uint8* = "readdir";

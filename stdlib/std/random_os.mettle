@@ -1,0 +1,18 @@
+// Windows randomness for std/random: RtlGenRandom, exported by advapi32 as
+// SystemFunction036. BCryptGenRandom would need bcrypt.dll, which the
+// linker does not search.
+
+extern fn random_w_gen(buf: uint8*, n: uint32) -> uint8 = "SystemFunction036";
+extern fn random_w_error() -> uint32 = "GetLastError";
+
+// Fills buf with n random bytes. Returns 0, or a negative error code.
+export fn random_os_fill(buf: uint8*, n: int64) -> int64 {
+  var done: int64 = 0;
+  while (done < n) {
+    var step: int64 = n - done;
+    if (step > 0x10000000) { step = 0x10000000; }
+    if (random_w_gen(buf + done, (uint32)step) == (uint8)0) { return -(int64)random_w_error(); }
+    done = done + step;
+  }
+  return 0;
+}

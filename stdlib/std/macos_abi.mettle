@@ -1,0 +1,5 @@
+// macOS libc calls whose struct stat and struct dirent layout depend on the
+// CPU, under the names that give the 64-bit-inode layout on both.
+
+import "std/macos_abi_x86_64" if x86_64;
+import "std/macos_abi_aarch64" if aarch64;

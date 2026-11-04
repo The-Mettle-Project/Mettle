@@ -409,6 +409,9 @@ Pages from the operating system, under the heap. Both platforms, with a
 | `os_mem_unmap(p: cstring, n: int64)` | Unmap |
 | `os_mem_protect_noaccess(p: cstring, n: int64)` | Make a range unreadable |
 
+On Linux these make raw system calls, so they also work in a self-contained
+ELF (`--emit-arm64`), which links no libc.
+
 ## std/thread
 
 Threads, mutexes, and atomics. Both platforms, with a `.linux` half and a
@@ -568,6 +571,54 @@ say what an instruction of each kind costs on the machine. `mettle target
 <triple>` prints one for every built-in target and `--target desc.mettle`
 reads one back. [Bare metal](bare-metal.md) covers what a description may
 change, and [Types](types.md) covers what the cost fields are read for.
+
+## std/random
+
+Random numbers from the operating system, good for keys, tokens and ids:
+`getrandom` on Linux, `getentropy` on macOS, `RtlGenRandom` on Windows. There
+is no seed and no shared state, so it is safe from any thread.
+
+| Function | Effect |
+|----------|--------|
+| `random_bytes(buf: uint8*, n: int64) -> int64` | Fill `buf`. Returns 0, or a negative code if the OS has no randomness to give |
+| `random_u64() -> uint64`, `random_u32() -> uint32` | One value. The program stops if the OS refuses |
+| `random_below(n: uint64) -> uint64` | Uniform in `0..n-1`, with no bias |
+| `random_range(lo: int64, hi: int64) -> int64` | Uniform in `lo..hi`, both included |
+| `random_float64() -> float64` | Uniform in `[0, 1)`, from 53 bits |
+
+Each call asks the OS. For fast simulation noise, seed your own generator from
+`random_u64()`.
+
+## std/env
+
+Environment variables and program arguments. Linux, macOS and Windows.
+
+| Function | Effect |
+|----------|--------|
+| `env_get(name) -> Option<string>` | A variable's value. The view lasts until the variable is set again |
+| `env_get_or(name, fallback) -> string`, `env_has(name) -> bool` | The same, shorter |
+| `env_set(name, value) -> int64` | Set a variable. 0, or -22 for a name with `=` or a NUL |
+| `env_list(buf, cap, prefix) -> int64` | Every variable as `NAME=value` lines, or only names starting with `prefix` |
+| `env_args(out: string*, max: int32) -> int32` | The program's arguments, `argv[0]` first. Returns how many there are in all |
+
+On Linux no libc is linked, so the runtime keeps the environment: it reads the
+block the kernel passed in, and keeps changes in a table of its own. The
+arguments come from `/proc/self/cmdline` on Linux, `_NSGetArgv` on macOS, and
+`GetCommandLineA` on Windows, split with the MSVCRT rules (at most 256).
+
+## std/term
+
+Terminal basics, for prompts. Linux, macOS and Windows. fd 0 is standard
+input, 1 output and 2 error.
+
+| Function | Effect |
+|----------|--------|
+| `term_is_tty(fd) -> bool` | Is `fd` a terminal (a console on Windows) |
+| `term_set_echo(fd, on: bool) -> int64` | Turn echo on or off. Returns 1 or 0 for whether it was on before, or a negative code when `fd` is not a terminal |
+| `term_read_secret(prompt, buf, cap) -> int64` | Write `prompt` to standard error, read one line from standard input with echo off, and turn echo back on. Returns the length, without the line ending |
+
+When standard input is a pipe or a file, `term_read_secret` reads the line as
+it is, so scripts can feed a password in.
 
 ## std/socket
 
@@ -1190,6 +1241,127 @@ the descriptor is close-on-exec. On Windows the result is a `HANDLE`, and
 Locks are `flock` locks on Linux and macOS: advisory, and held per open, so a
 second `file_open` of the same file in the same process conflicts too. On
 Windows they are `LockFileEx` locks, which are mandatory.
+
+**Memory maps.** `file_map(fd, offset, length, flags, &m: FileMap) -> int64`
+maps part of an open file. `flags` is `FILE_MAP_READ`, plus `FILE_MAP_WRITE`
+for writes that reach the file, plus `FILE_MAP_PRIVATE` to keep those writes in
+this process instead. Any offset works: `m.data` points at the byte asked for,
+and `m.length` is the length. The file must already be long enough, so grow it
+with `file_truncate` first. `file_map_sync(&m)` writes a shared map's changes
+to the file; on Windows it does not wait for the device, so call `file_sync`
+as well. `file_unmap(&m)` releases it, and a second call does nothing.
+
+## std/fs
+
+Information about paths, and directories: stat, listing, make and remove,
+symbolic links, the current directory and the temp directory. Linux, macOS and
+Windows. Every call returns 0, a length, or a negative error code
+(`-FS_ENOENT`, `-FS_EACCES`, `-FS_EEXIST`, `-FS_ENOTDIR`, `-FS_EINVAL`,
+`-FS_ERANGE`, `-FS_ENAMETOOLONG`, `-FS_ENOTEMPTY`, `-FS_ELOOP`). The codes are
+`errno` on Linux and macOS and `GetLastError()` on Windows, so compare with the
+constants, not with numbers. On Linux the calls are raw system calls.
+
+Paths are strings. Each is copied into a NUL-terminated 4096-byte buffer, and a
+longer one fails with `-FS_ENAMETOOLONG`. Calls that return text write it into
+a `buf` and `cap` you give, put a NUL after it, and return its length. If it
+does not fit, they return `-FS_ERANGE`. `mode` arguments are permission bits.
+Mettle has no octal literals, so write 0755 as `493`.
+
+**Stat.** `fs_stat(path, &st: FsStat) -> int64` follows symbolic links.
+`fs_lstat` describes a link itself. `FsStat` has `kind` (`FS_FILE`, `FS_DIR`,
+`FS_SYMLINK` or `FS_OTHER`), `size`, `mode` (the low 12 permission bits; 0 on
+Windows), and `mtime_ns`, `atime_ns` and `ctime_ns` (Unix nanoseconds).
+`fs_exists`, `fs_is_dir` and `fs_is_file` return `bool` and follow links, so a
+dangling link does not exist.
+
+**Listing.** A listing allocates nothing.
+
+```mettle
+var d: FsDir;
+var e: FsDirEntry;
+if (fs_dir_open("src", &d) == 0) {
+  while (fs_dir_next(&d, &e) == 1) {
+    println("{e.name}");
+  }
+  fs_dir_close(&d);
+}
+```
+
+`fs_dir_next` returns 1 and fills `e`, 0 at the end, or a negative error. It
+skips `.` and `..`, and the order is the file system's. `e.name` is a view
+into the `FsDir`, valid until the next call. `e.kind` says what the entry is;
+when the file system does not say, the call asks with an lstat. A link shows
+as `FS_SYMLINK`. On Linux an `FsDir` holds a 4 KB read buffer.
+
+| Function | Effect |
+|----------|--------|
+| `fs_mkdir(path, mode)` | Make one directory. `-FS_EEXIST` if it exists |
+| `fs_mkdir_all(path, mode)` | Make a path and its parents, like `mkdir -p`. An existing directory is fine; an existing file gives `-FS_ENOTDIR` |
+| `fs_rmdir(path)` | Remove an empty directory |
+| `fs_remove(path)` | Remove a file or a link (the link, not its target) |
+| `fs_remove_all(path)` | Remove a tree, like `rm -rf` |
+| `fs_symlink(target, link)` | Make a link. The target need not exist |
+| `fs_readlink(path, buf, cap)` | The text of a link. `-FS_EINVAL` if it is not a link |
+| `fs_realpath(path, buf, cap)` | The absolute path with links resolved. The path must exist |
+| `fs_getcwd(buf, cap)`, `fs_chdir(path)` | Read or change the current directory of the whole process |
+| `fs_temp_dir(buf, cap)` | `$TMPDIR` if it is set and not empty, else `/tmp`. On Windows, `GetTempPathA` |
+
+**`fs_remove_all` and links.** It never follows a symbolic link. A link is
+unlinked, and what it points to is left alone. This holds for `path` itself and
+for every link inside the tree. A trailing slash is ignored, so `"link/"` names
+the link. It removes a path that does not exist without an error. It refuses
+`""`, `/`, `.`, `..`, and any path ending in `/.` or `/..`, with
+`-FS_EINVAL`. It stops at the first error; what it already removed stays
+removed. A tree deeper than 256 levels fails with `-FS_ELOOP`. On Linux and
+macOS it works by directory descriptor, and it checks that each directory it
+opens is the one it looked at, so a link swapped in during the run is not
+entered.
+
+**`fs_realpath`.** On Linux it opens the path with `O_PATH` and reads
+`/proc/self/fd/N`, so it needs `/proc`. macOS uses `realpath`. Windows uses
+`GetFinalPathNameByHandleA`, and the result has backslashes.
+
+**Windows.** `mode` is ignored and `FsStat.mode` is 0. A "path not found"
+error is reported as `-FS_ENOENT`. Making a symbolic link needs the privilege
+for it (Developer Mode, or an administrator) and fails with an access error
+without it. Junctions show as plain directories. `fs_remove` clears the
+read-only attribute of a file it cannot delete, like `unlink`. Paths that come
+back have backslashes. This code is built but has not been run.
+
+**macOS.** The calls go through libc. On an Intel Mac, `stat`, `lstat`,
+`fstat`, `opendir`, `fdopendir` and `readdir` are taken under their
+`$INODE64` names (from `std/macos_abi`), which give the same layouts as on
+Apple silicon. This code is built but has not been run.
+
+## std/path
+
+Path text helpers. Pure: no system calls, the same everywhere, and they run
+under `mettle test`. The separator is `/`; a backslash is an ordinary byte.
+
+| Function | Effect |
+|----------|--------|
+| `path_join(a, b, buf, cap) -> int64` | Join with a slash and clean. Empty parts are skipped, and a `b` that starts with `/` does not reset the path: `path_join("a", "/b")` is `a/b` |
+| `path_clean(p, buf, cap) -> int64` | Clean a path, with the rules of Go's `path.Clean` |
+| `path_base(p) -> string` | The last element. `""` gives `.`, and only slashes gives `/` |
+| `path_dir(p) -> string` | Everything before the last element |
+| `path_ext(p) -> string` | The extension with its dot, or `""` |
+| `path_stem(p) -> string` | The last element without its extension |
+| `path_is_abs(p) -> bool` | True if `p` starts with `/` |
+
+`path_join` and `path_clean` write into `buf` with a NUL and return the length,
+or `-PATH_ERANGE` if the result and NUL do not fit. Cleaning collapses
+repeated slashes, drops `.`, resolves `..` against the element before it, drops
+a `..` that would climb above a leading `/`, and keeps leading `..` in a
+relative path. A trailing slash goes, and an empty result is `.`.
+`path_join("", "")` is `""`.
+
+`path_base`, `path_dir`, `path_ext` and `path_stem` return views into `p`.
+Nothing is copied, so keep `p` alive while you use them. A trailing slash is
+ignored by `path_base`, `path_ext` and `path_stem`. `path_dir` follows Go: it
+cuts at the last slash, so `a/b/` gives `a/b`; it removes the slashes at the
+cut but does not clean the rest, so `a//b/c` gives `a//b`. Run `path_clean` on
+it if you need that. A dot at the start of a name is part of the name:
+`path_ext(".bashrc")` is `""`, and `path_ext("a.tar.gz")` is `.gz`.
 
 ## std/dir
 

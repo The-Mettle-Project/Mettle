@@ -79,7 +79,8 @@ typedef enum {
   STUB_MALLOC, STUB_CALLOC, STUB_FREE, STUB_PUTS, STUB_PUTCHAR, STUB_WRITE,
   STUB_STRLEN, STUB_MEMCPY, STUB_MEMMOVE, STUB_MEMSET, STUB_EXIT, STUB_ABORT,
   STUB_STR_FROM_INT, STUB_STR_FROM_UINT, STUB_STR_FROM_BOOL,
-  STUB_STR_FROM_CHAR, STUB_STR_EQ, STUB_STR_FREE,
+  STUB_STR_FROM_CHAR, STUB_STR_EQ, STUB_STR_FREE, STUB_REGION_BEGIN,
+  STUB_REGION_END,
   STUB_COUNT
 } Arm64StubId;
 
@@ -95,6 +96,8 @@ static const struct {
     {"mettle_string_from_char", 1},
     {"mettle_string_eq", 0},
     {"mettle_string_free", 0},
+    {"mettle_safety_region_begin", 0},
+    {"mettle_safety_region_end", 0},
 };
 
 static int runtime_stub_index(const char *name) {
@@ -934,6 +937,17 @@ static void emit_string_literal_address(Arm64Emit *e, Arm64ObjectContext *object
 
 static const IRModuleSymbol *module_function(const IRProgram *program,
                                              const char *name);
+
+/* A call names an extern by its Mettle name; the stub table is keyed by the
+   link name the extern gives (`memory_region = "mettle_safety_region_begin"`),
+   so look the stub up under both. */
+static int call_stub_index(const IRProgram *prog, const char *name) {
+  int stub = runtime_stub_index(name);
+  if (stub >= 0) return stub;
+  const IRModuleSymbol *callee = module_function(prog, name);
+  const char *link_name = callee ? module_link_name(callee) : NULL;
+  return link_name ? runtime_stub_index(link_name) : -1;
+}
 
 static int emit_external_call(Arm64Emit *e, Arm64ObjectContext *object,
                               const IRProgram *prog, const char *name) {
@@ -2419,7 +2433,7 @@ static int encode_call_instruction(const Arm64Scope *scope,
     if (callee_sret) {
       emit_lea_local(e, ARM64_X8, slot_off(slots, SRET_BUFFER_SLOT));
     }
-    int stub = object ? -1 : runtime_stub_index(in->text);
+    int stub = object ? -1 : call_stub_index(prog, in->text);
     if (prog_fn_index(prog, in->text) >= 0) {
       arm64_emit_bl(e, label_for(e, fns, in->text));
     } else if (object) {
@@ -3168,6 +3182,10 @@ static void emit_runtime_stub(Arm64Emit *e, int id, int malloc_label) {
   case STUB_STR_FROM_CHAR: emit_string_from_char(e, malloc_label); break;
   case STUB_STR_EQ: emit_string_eq(e); break;
   case STUB_STR_FREE: emit_stub_free(e); break;
+  /* memory_region and memory_region_end mark a region for the safety
+     runtime, which a self-contained ELF does not carry: they do nothing. */
+  case STUB_REGION_BEGIN: emit_stub_free(e); break;
+  case STUB_REGION_END: emit_stub_free(e); break;
   default: arm64_fail(e, "internal: no runtime stub %d", id); break;
   }
 }
@@ -3515,7 +3533,7 @@ int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
         stub_used[STUB_PUTS] = 1;
       } else if (in->op == IR_OP_CALL && in->text &&
                  find_fn(prog, in->text) < 0) {
-        int id = runtime_stub_index(in->text);
+        int id = call_stub_index(prog, in->text);
         if (id >= 0) stub_used[id] = 1;
       } else if (in->op == IR_OP_CALL && in->text &&
                  strcmp(in->text, "cstr") == 0 &&

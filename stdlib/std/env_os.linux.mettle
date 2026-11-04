@@ -1,0 +1,51 @@
+// Linux program arguments for std/env: /proc/self/cmdline, read once. The
+// runtime does not keep main's argv anywhere else.
+
+import "std/linux_sys";
+
+extern fn env_c_malloc(n: uint64) -> uint8* = "malloc";
+
+var g_env_cmdline: uint8* = (uint8*)0;
+var g_env_cmdline_len: int64 = -1;
+
+fn env_os_load() {
+  if (g_env_cmdline_len >= 0) { return; }
+  g_env_cmdline_len = 0;
+  var path: string = "/proc/self/cmdline";
+  var fd: int64 = syscall(LINUX_SYS_OPENAT, -100, path.chars, 0x80000, 0);
+  if (fd < 0) { return; }
+  var cap: int64 = 65536;
+  var buf: uint8* = env_c_malloc((uint64)cap);
+  if (buf == 0) {
+    syscall(LINUX_SYS_CLOSE, fd);
+    return;
+  }
+  var n: int64 = 0;
+  while (n < cap - 1) {
+    var r: int64 = syscall(LINUX_SYS_READ, fd, buf + n, cap - 1 - n);
+    if (r <= 0) { break; }
+    n = n + r;
+  }
+  syscall(LINUX_SYS_CLOSE, fd);
+  g_env_cmdline = buf;
+  g_env_cmdline_len = n;
+}
+
+// Writes up to max arguments into out (views that stay valid for the whole
+// run) and returns how many there are in all.
+export fn env_os_args(out: string*, max: int32) -> int32 {
+  env_os_load();
+  var count: int32 = 0;
+  var start: int64 = 0;
+  for i in 0..g_env_cmdline_len {
+    if (g_env_cmdline[i] == (uint8)0) {
+      if (count < max) {
+        out[count].chars = g_env_cmdline + start;
+        out[count].length = (uint64)(i - start);
+      }
+      count = count + 1;
+      start = i + 1;
+    }
+  }
+  return count;
+}
