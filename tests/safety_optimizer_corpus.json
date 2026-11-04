@@ -581,7 +581,7 @@
         {
           "args": [],
           "exit": 1,
-          "fatal": "Fatal error: free of memory after it was freed: 0 bytes at offset 0 of a 64 byte allocation"
+          "fatal": "Fatal error: free of memory after it was freed: a 64 byte allocation"
         }
       ]
     },
@@ -657,7 +657,7 @@
         {
           "args": [],
           "exit": 1,
-          "fatal": "Fatal error: use of memory after it was freed: 1 bytes at offset 0 of a 0 byte allocation (line 8)"
+          "fatal": "Fatal error: use of memory after it was freed: 1 bytes at offset 0 (line 8)"
         }
       ]
     },
@@ -809,7 +809,7 @@
         {
           "args": [],
           "exit": 1,
-          "fatal": "Fatal error: use of memory after it was freed: 8 bytes at offset 0 of a 0 byte allocation (line 7)"
+          "fatal": "Fatal error: use of memory after it was freed: 8 bytes at offset 0 (line 7)"
         }
       ]
     },
@@ -828,7 +828,7 @@
         {
           "args": [],
           "exit": 1,
-          "fatal": "Fatal error: free of stack or global memory: 0 bytes at offset 0 of a 32 byte allocation"
+          "fatal": "Fatal error: free of stack or global memory: a 32 byte allocation"
         }
       ]
     },
