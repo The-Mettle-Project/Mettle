@@ -1,0 +1,7 @@
+import "std/io";
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var s: string = "abc";
+  var i: int32 = argc + 9;
+  println("{s[i]}");
+  return 0;
+}

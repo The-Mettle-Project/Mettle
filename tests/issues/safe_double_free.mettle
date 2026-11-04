@@ -1,0 +1,9 @@
+import "std/io";
+import "std/mem";
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var p: int32* = (int32*)malloc(16);
+  free(p);
+  if (argc > 0) { free(p); }
+  println("done");
+  return 0;
+}

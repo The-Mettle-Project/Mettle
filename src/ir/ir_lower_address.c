@@ -1363,12 +1363,17 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
         ir_expression_is_address_space_allocation(context, function,
                                                   index_expression->array);
     IROperand slice_address = ir_operand_none();
-    if (base_is_string) {
+    int string_checked =
+        base_is_string && context->emit_runtime_checks &&
+        !context->emit_safety_checks && index_expression->array &&
+        (index_expression->array->type == AST_IDENTIFIER ||
+         index_expression->array->type == AST_MEMBER_ACCESS);
+    if (base_is_string && !string_checked) {
       lowered_base = ir_lower_expression(context, function,
                                          index_expression->array, &base) &&
                      ir_coerce_string_operand_to_cstring(
                          context, function, &base, expression->location);
-    } else if (base_is_slice) {
+    } else if (base_is_slice || string_checked) {
       lowered_base =
           ir_lower_lvalue_address(context, function, index_expression->array,
                                   &slice_address, NULL) &&
@@ -1446,7 +1451,7 @@ int ir_lower_lvalue_address(IRLoweringContext *context,
         ir_operand_destroy(&index);
         return 0;
       }
-      if (base_is_slice &&
+      if ((base_is_slice || string_checked) &&
           !ir_emit_slice_bounds_check(context, function, expression->location,
                                       &slice_address, &index)) {
         ir_operand_destroy(&base);

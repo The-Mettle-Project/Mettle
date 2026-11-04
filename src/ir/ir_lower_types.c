@@ -592,8 +592,13 @@ const char *ir_narrow_integer_result_type(Type *type, const char *op) {
   if (!type || !op) {
     return NULL;
   }
+  int is_division = strcmp(op, "/") == 0;
   if (strcmp(op, "+") != 0 && strcmp(op, "-") != 0 && strcmp(op, "*") != 0 &&
-      strcmp(op, "<<") != 0 && strcmp(op, "~") != 0) {
+      strcmp(op, "<<") != 0 && strcmp(op, "~") != 0 && !is_division) {
+    return NULL;
+  }
+  if (is_division && type->kind != TYPE_INT8 && type->kind != TYPE_INT16 &&
+      type->kind != TYPE_INT32) {
     return NULL;
   }
   switch (type->kind) {

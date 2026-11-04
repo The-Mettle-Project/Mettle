@@ -1,0 +1,11 @@
+import "std/io";
+import "std/mem";
+fn make(n: int32) -> int32* { var p: int32* = (int32*)malloc(16); p[0] = n; return p; }
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var p: int32* = make(argc);
+  free(p);
+  var q: int32* = (int32*)malloc(16);
+  q[0] = 5;
+  println("{p[0]}");
+  return 0;
+}

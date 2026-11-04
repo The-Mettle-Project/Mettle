@@ -471,6 +471,7 @@ typedef struct {
   int64_t size;
   uint64_t extent;
   int have_extent;
+  int about_free;
 } SafetyFailure;
 
 static void safety_report_and_trap(const SafetyFailure *failure,
@@ -483,12 +484,15 @@ static void safety_report_and_trap(const SafetyFailure *failure,
 
   safety_append(g_safety_message, capacity, &at, "Fatal error: ");
   safety_append(g_safety_message, capacity, &at, failure->headline);
-  safety_append(g_safety_message, capacity, &at, ": ");
-  safety_append_signed(g_safety_message, capacity, &at, failure->size);
-  safety_append(g_safety_message, capacity, &at, " bytes at offset ");
-  safety_append_signed(g_safety_message, capacity, &at, failure->offset);
+  if (!failure->about_free) {
+    safety_append(g_safety_message, capacity, &at, ": ");
+    safety_append_signed(g_safety_message, capacity, &at, failure->size);
+    safety_append(g_safety_message, capacity, &at, " bytes at offset ");
+    safety_append_signed(g_safety_message, capacity, &at, failure->offset);
+  }
   if (failure->have_extent) {
-    safety_append(g_safety_message, capacity, &at, " of a ");
+    safety_append(g_safety_message, capacity, &at,
+                  failure->about_free ? ": a " : " of a ");
     safety_append_unsigned(g_safety_message, capacity, &at, failure->extent);
     safety_append(g_safety_message, capacity, &at, " byte allocation");
   }
@@ -531,6 +535,7 @@ SAFETY_COLD static void safety_check_failed(const void *base, int64_t offset,
   failure.size = size;
   failure.extent = 0;
   failure.have_extent = 0;
+  failure.about_free = 0;
 
   if (!base) {
     failure.headline = "null pointer dereference";
@@ -547,7 +552,7 @@ SAFETY_COLD static void safety_check_failed(const void *base, int64_t offset,
   }
 
   failure.extent = region->size;
-  failure.have_extent = 1;
+  failure.have_extent = state != (uint32_t)SAFETY_STATE_DEAD;
   failure.headline = state == (uint32_t)SAFETY_STATE_DEAD
                          ? "use of memory after it was freed"
                          : "memory access outside its allocation";

@@ -2567,6 +2567,11 @@ static int ir_lower_binary_expression(IRLoweringContext *context,
     if (context->assume_no_signed_overflow && ir_narrow_type_is_signed(narrow)) {
       narrow = NULL;
     }
+    if (narrow && binary->operator && binary->operator[0] == '/' &&
+        binary->operator[1] == '\0' && right.kind == IR_OPERAND_INT &&
+        right.int_value != -1) {
+      narrow = NULL;
+    }
     if (narrow) {
       IROperand wrapped = ir_operand_none();
       if (!ir_make_temp_operand(context, &wrapped)) {

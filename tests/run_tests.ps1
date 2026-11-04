@@ -21377,6 +21377,12 @@ $issueRegressions = @(
   @{ Name = "issue_lambda_in_generic_and_reference_to_instance_release"; Entry = "tests/issues/issue_100.mettle"; Args = @("--release"); Expect = @("4 2.5 9 4 1.5 7") },
   @{ Name = "issue_module_imported_as_same_alias_twice_is_one_module"; Entry = "tests/issues/alias_twice/main.mettle"; Args = @(); Expect = @("counter=2") },
   @{ Name = "issue_selective_and_plain_import_share_globals"; Entry = "tests/issues/selective_plain/main.mettle"; Args = @(); Expect = @("len=6 count=2") },
+  @{ Name = "issue_string_index_is_bounds_checked"; Entry = "tests/issues/string_index_oob.mettle"; Args = @(); Expect = @("Slice index out of bounds") },
+  @{ Name = "issue_safe_use_after_free_message_has_no_zero_size"; Entry = "tests/issues/safe_use_after_free.mettle"; Args = @("--safe"); Expect = @("use of memory after it was freed: 4 bytes at offset 0 (line 9)") },
+  @{ Name = "issue_safe_double_free_message_names_the_allocation"; Entry = "tests/issues/safe_double_free.mettle"; Args = @("--safe"); Expect = @("free of memory after it was freed: a 16 byte allocation") },
+  @{ Name = "issue_int_min_divided_by_minus_one_wraps"; Entry = "tests/issues/int_min_division.mettle"; Args = @(); Expect = @("-2147483648 -2147483648 -2147483648 -2147483648 2147483647", "neg") },
+  @{ Name = "issue_int_min_divided_by_minus_one_wraps_release"; Entry = "tests/issues/int_min_division.mettle"; Args = @("--release"); Expect = @("-2147483648 -2147483648 -2147483648 -2147483648 2147483647", "neg") },
+  @{ Name = "issue_array_negative_index_traps"; Entry = "tests/issues/array_negative_index.mettle"; Args = @(); Expect = @("array index out of bounds") },
   @{ Name = "issue_driver_accepts_O0"; Command = @("--build", "-O0", "tests/issues/issue_073_074.mettle", "-o", ".tmp/issue_o0.exe"); Expect = @("Built executable") }
 )
 foreach ($case in $issueRegressions) {

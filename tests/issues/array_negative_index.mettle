@@ -1,0 +1,7 @@
+import "std/io";
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var a: int32[4] = [1, 2, 3, 4];
+  var i: int32 = argc - 3;
+  println("{a[i]}");
+  return 0;
+}

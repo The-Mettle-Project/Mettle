@@ -672,6 +672,35 @@ int ir_emit_bounds_check(IRLoweringContext *context,
     return 0;
   }
 
+  IROperand non_negative = ir_operand_none();
+  if (!ir_make_temp_operand(context, &non_negative)) {
+    free(trap_label);
+    free(ok_label);
+    ir_operand_destroy(&in_bounds);
+    return 0;
+  }
+  IRInstruction sign_compare = {0};
+  sign_compare.op = IR_OP_BINARY;
+  sign_compare.location = location;
+  sign_compare.dest = non_negative;
+  sign_compare.lhs = *index;
+  sign_compare.rhs = ir_operand_int(0);
+  sign_compare.text = ">=";
+  IRInstruction sign_branch = {0};
+  sign_branch.op = IR_OP_BRANCH_ZERO;
+  sign_branch.location = location;
+  sign_branch.lhs = non_negative;
+  sign_branch.text = trap_label;
+  if (!ir_emit(context, function, &sign_compare) ||
+      !ir_emit(context, function, &sign_branch)) {
+    free(trap_label);
+    free(ok_label);
+    ir_operand_destroy(&in_bounds);
+    ir_operand_destroy(&non_negative);
+    return 0;
+  }
+  ir_operand_destroy(&non_negative);
+
   IRInstruction jump = {0};
   jump.op = IR_OP_JUMP;
   jump.location = location;

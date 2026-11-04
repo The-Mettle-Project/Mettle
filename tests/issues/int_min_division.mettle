@@ -1,0 +1,13 @@
+import "std/io";
+fn f(v: int32) -> int32 { return v; }
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var m: int32 = -2147483647 - 1;
+  var k: int32 = -argc;
+  var big: int32 = 2147483647;
+  println("{m / k} {m * k} {big + argc} {-m} {m - argc}");
+  println("{f(m / k)} {f(big + argc)}");
+  if (m / k < 0) { println("neg"); } else { println("pos"); }
+  var t: int64 = (int64)(m / k);
+  println("{t}");
+  return 0;
+}

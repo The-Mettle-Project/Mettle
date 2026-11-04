@@ -247,7 +247,7 @@ void mettle_safety_free_identity(void *pointer, uint64_t identity) {
     SafetyFailure failure = {region.state == SAFETY_STATE_DEAD ?
         "free of memory after it was freed" : !region.heap ?
         "free of stack or global memory" : "free of an interior pointer",
-        0, 0, 0, region.size, 1};
+        0, 0, 0, region.size, region.size != 0, 1};
     safety_report_and_trap(&failure, __builtin_return_address(0), __builtin_frame_address(0));
   }
 }
