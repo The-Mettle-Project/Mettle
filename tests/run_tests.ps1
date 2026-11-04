@@ -3862,6 +3862,31 @@ foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_t
   }
 }
 
+# What the backend layout passes did, read from the final MIR. A fixture only
+# proves the answer is right, and a pass that stopped firing leaves it right.
+foreach ($layoutCase in @(
+    @{ Name = "threaded_tables"; Fn = "run_flag"; Pattern = "(?s)jmp_table.*jmp_table.*jmp_table"; Say = "the dispatch was not copied into its arms" },
+    @{ Name = "threaded_flag"; Fn = "run_flag"; Pattern = "mir_after_test"; Say = "the back edge still takes the loop test" },
+    @{ Name = "threaded_guard"; Fn = "run_flag"; Pattern = "cmpbr\s+\.+mir_wrap_stub"; Say = "the counter still sign extends on every op" },
+    @{ Name = "wrap_guard_fixture"; Fn = "counter_indexes_then_wraps"; Pattern = "cmpbr\s+\.+mir_wrap_stub"; Say = "the wrap fixture no longer reaches the guard" })) {
+  $total++
+  $layoutName = "layout_shape_$($layoutCase.Name)"
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "$layoutName.exe"
+    $env:METTLE_MIR_DUMP = $layoutCase.Fn
+    $dump = & $CompilerPath --build --release "tests/codegen/threaded_dispatch.mettle" -o $exePath 2>&1 | Out-String
+    Remove-Item Env:METTLE_MIR_DUMP
+    if ($dump -notmatch $layoutCase.Pattern) { throw $layoutCase.Say }
+    Write-CaseResult -Name $layoutName -Passed $true
+  }
+  catch {
+    Remove-Item Env:METTLE_MIR_DUMP -ErrorAction SilentlyContinue
+    $failed++
+    Write-CaseResult -Name $layoutName -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Which loads leave a loop, read from the IR after each pass. A fixture only
 # proves the answer is right, and a hoist that stopped firing leaves it right.
 foreach ($hoistCase in @(

@@ -621,6 +621,24 @@ static MirInst mir_label_inst(const char *name, int ir_index) {
   return label;
 }
 
+static int mir_temp_only_feeds(const MirFunction *fn, MirVregId temp,
+                               size_t def_at, size_t use_at) {
+  if (fn->vregs[temp].address_taken) {
+    return 0;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (i == def_at || in->op == MIR_NOP) {
+      continue;
+    }
+    if (i != use_at &&
+        (mir_inst_reads(in, temp) || mir_cfg_insn_def(in) == temp)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int mir_increment_extend_at(const MirFunction *fn, size_t at,
                                    size_t *ext_at) {
   const MirInst *add = &fn->insns[at];
@@ -628,9 +646,8 @@ static int mir_increment_extend_at(const MirFunction *fn, size_t at,
   const MirInst *ext;
   if ((add->op != MIR_ADD && add->op != MIR_SUB) || add->width != 8 ||
       add->dst.kind != MIR_OPK_VREG || add->a.kind != MIR_OPK_VREG ||
-      add->dst.vreg != add->a.vreg || add->b.kind != MIR_OPK_IMM ||
-      add->b.imm == 0 || add->b.imm > 0x7FFFFFFFLL ||
-      add->b.imm < -0x7FFFFFFFLL) {
+      add->b.kind != MIR_OPK_IMM || add->b.imm == 0 ||
+      add->b.imm > 0x7FFFFFFFLL || add->b.imm < -0x7FFFFFFFLL) {
     return 0;
   }
   while (next < fn->insn_count && fn->insns[next].op == MIR_NOP) {
@@ -641,8 +658,12 @@ static int mir_increment_extend_at(const MirFunction *fn, size_t at,
   }
   ext = &fn->insns[next];
   if (ext->op != MIR_MOVSX || ext->width != 4 || ext->dst.kind != MIR_OPK_VREG ||
-      ext->a.kind != MIR_OPK_VREG || ext->dst.vreg != add->dst.vreg ||
+      ext->a.kind != MIR_OPK_VREG || ext->dst.vreg != add->a.vreg ||
       ext->a.vreg != add->dst.vreg) {
+    return 0;
+  }
+  if (add->dst.vreg != add->a.vreg &&
+      !mir_temp_only_feeds(fn, add->dst.vreg, at, next)) {
     return 0;
   }
   *ext_at = next;
@@ -679,7 +700,7 @@ static int mir_counter_stays_canonical(const MirFunction *fn, MirVregId v) {
   }
   for (size_t i = 0; i < fn->insn_count; i++) {
     size_t ext_at = 0;
-    if (mir_increment_extend_at(fn, i, &ext_at) && fn->insns[i].dst.vreg == v) {
+    if (mir_increment_extend_at(fn, i, &ext_at) && fn->insns[i].a.vreg == v) {
       i = ext_at;
       continue;
     }
@@ -711,6 +732,7 @@ static int mir_guard_one_counter(MirFunction *fn, size_t add_at, size_t ext_at,
   const char *back = mir_fresh_label(fn, "wrap_back");
   const char *stub = mir_fresh_label(fn, "wrap_stub");
   int grows = (add.op == MIR_ADD) == (add.b.imm > 0);
+  MirVregId counter = add.a.vreg;
   MirInst guard;
   MirInst jump;
   MirInst moved = *ext;
@@ -719,10 +741,12 @@ static int mir_guard_one_counter(MirFunction *fn, size_t add_at, size_t ext_at,
   if (!back || !stub) {
     return 0;
   }
+  fn->insns[add_at].dst = mir_op_vreg(counter);
+  moved.a = mir_op_vreg(counter);
   memset(&guard, 0, sizeof(guard));
   guard.op = MIR_CMPBR;
   guard.dst = mir_op_label(stub);
-  guard.a = mir_op_vreg(add.dst.vreg);
+  guard.a = mir_op_vreg(counter);
   guard.b = mir_op_imm(grows ? 0x7FFFFFFFLL : -0x80000000LL);
   guard.width = 8;
   guard.cc = grows ? 0x8F : 0x8C;
@@ -757,7 +781,7 @@ void mir_guard_counter_wrap(MirFunction *fn) {
     if (cfg.blocks[cfg.block_of[i]].loop_depth > 0 &&
         mir_increment_extend_at(fn, i, &ext_at) &&
         cfg.block_of[ext_at] == cfg.block_of[i] &&
-        mir_counter_stays_canonical(fn, fn->insns[i].dst.vreg)) {
+        mir_counter_stays_canonical(fn, fn->insns[i].a.vreg)) {
       ok = mir_guard_one_counter(fn, i, ext_at, &list);
       i = ext_at;
     }
