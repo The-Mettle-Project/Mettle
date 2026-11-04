@@ -331,6 +331,19 @@ static const ErrorCodeDoc DOCS[] = {
      "Unsigned arithmetic is not checked. Wrapping is what unsigned types are\n"
      "reached for in a hash or a checksum, and a check there would refuse the\n"
      "programs that want it.\n"},
+    {"M0124", "A constant signed operation does not fit its type",
+     "An integer literal with no other context is `int32`, and arithmetic\n"
+     "on two of them happens in `int32`. When both operands are constants and\n"
+     "the exact result does not fit the type, the program gets the wrapped\n"
+     "value, whatever the destination is.\n"
+     "\n"
+     "Example:\n"
+     "    var big: int64 = 100000 * 100000;    // M0124: stores 1410065408\n"
+     "\n"
+     "Fix: widen one operand with a cast so the operation happens in the\n"
+     "wider type:\n"
+     "\n"
+     "    var big: int64 = (int64)100000 * 100000;\n"},
     {"R0001", "A rule gave no usable verdict",
      "A `@rule fn` ran while compiling and did not answer with a verdict the\n"
      "compiler could act on: it trapped, ran out of its step budget, used\n"

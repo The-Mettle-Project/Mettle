@@ -81,6 +81,7 @@ typedef struct {
   int handed_over;
   SourceLocation handover_loc;
   const char *handover_via;
+  const FunctionDeclaration *handover_fn;
   unsigned param_alias_mask;
 } MemLocal;
 
@@ -1136,16 +1137,94 @@ static void mem_check_task_capture(MemCtx *ctx, CallExpression *call,
         ctx->fn && ctx->fn->name ? ctx->fn->name : "this function");
   }
   if (held && held->is_pointer) {
+    MemFnSummary *entry_summary =
+        ctx->summaries ? mem_summary_find(ctx->summaries, entry) : NULL;
     held->handed_over = 1;
     held->handover_loc = loc;
     held->handover_via = entry;
+    held->handover_fn = entry_summary ? entry_summary->fn : NULL;
   }
+}
+
+#define MEM_SCAN_MAX_FUNCTIONS 16
+
+static int mem_function_mentions_member(const MemCtx *ctx, ASTNode *node,
+                                        const char *member,
+                                        const FunctionDeclaration **seen,
+                                        size_t *seen_count, int depth) {
+  if (!node || depth > 200) {
+    return 0;
+  }
+  if (node->type == AST_MEMBER_ACCESS && node->data) {
+    const MemberAccess *access = (const MemberAccess *)node->data;
+    if (access->member && strcmp(access->member, member) == 0) {
+      return 1;
+    }
+  }
+  if (node->type == AST_FUNCTION_CALL && node->data) {
+    const CallExpression *call = (const CallExpression *)node->data;
+    MemFnSummary *callee =
+        call->function_name && ctx->summaries
+            ? mem_summary_find(ctx->summaries, call->function_name)
+            : NULL;
+    if (callee && callee->fn && callee->fn->body) {
+      int known = 0;
+      for (size_t i = 0; i < *seen_count; i++) {
+        if (seen[i] == callee->fn) {
+          known = 1;
+        }
+      }
+      if (!known && *seen_count < MEM_SCAN_MAX_FUNCTIONS) {
+        seen[(*seen_count)++] = callee->fn;
+        if (mem_function_mentions_member(ctx, callee->fn->body, member, seen,
+                                         seen_count, depth + 1)) {
+          return 1;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (mem_function_mentions_member(ctx, node->children[i], member, seen,
+                                     seen_count, depth + 1)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int mem_task_never_names_field(const MemCtx *ctx, const MemLocal *root,
+                                      ASTNode *target) {
+  const FunctionDeclaration *seen[MEM_SCAN_MAX_FUNCTIONS];
+  size_t seen_count = 0;
+  ASTNode *access = mem_unwrap_cast(target);
+  if (!root->handover_fn || !root->handover_fn->body || !access ||
+      access->type != AST_MEMBER_ACCESS || !access->data) {
+    return 0;
+  }
+  const MemberAccess *member = (const MemberAccess *)access->data;
+  ASTNode *object = mem_unwrap_cast(member->object);
+  if (object && object->type == AST_UNARY_EXPRESSION && object->data) {
+    const UnaryExpression *deref = (const UnaryExpression *)object->data;
+    if (deref->operator && strcmp(deref->operator, "*") == 0) {
+      object = deref->operand;
+    }
+  }
+  if (!member->member || !object ||
+      mem_expr_as_local((MemCtx *)ctx, object) != root) {
+    return 0;
+  }
+  seen[seen_count++] = root->handover_fn;
+  return !mem_function_mentions_member(ctx, root->handover_fn->body,
+                                       member->member, seen, &seen_count, 0);
 }
 
 static void mem_check_handover_write(MemCtx *ctx, ASTNode *target,
                                      SourceLocation loc) {
   MemLocal *root = mem_addr_root_local(ctx, target);
   if (!root || !root->handed_over) {
+    return;
+  }
+  if (mem_task_never_names_field(ctx, root, target)) {
     return;
   }
   mem_error_late(ctx, "M0122", loc,
@@ -1164,6 +1243,42 @@ static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
     return;
   }
   long long value = 0;
+  if (strcmp(binary->operator, "+") == 0 || strcmp(binary->operator, "-") == 0 ||
+      strcmp(binary->operator, "*") == 0) {
+    long long left = 0;
+    long long product = 0;
+    Type *operand_type = binary->left ? binary->left->resolved_type : NULL;
+    int bits = 0;
+    if (operand_type) {
+      switch (operand_type->kind) {
+      case TYPE_INT8: bits = 8; break;
+      case TYPE_INT16: bits = 16; break;
+      case TYPE_INT32: bits = 32; break;
+      case TYPE_INT64: bits = 64; break;
+      default: break;
+      }
+    }
+    if (bits && mem_eval_constant(ctx, binary->left, &left) &&
+        mem_eval_constant(ctx, binary->right, &value)) {
+      int wide = binary->operator[0] == '+'
+                     ? __builtin_add_overflow(left, value, &product)
+                     : binary->operator[0] == '-'
+                           ? __builtin_sub_overflow(left, value, &product)
+                           : __builtin_mul_overflow(left, value, &product);
+      if (!wide && bits < 64) {
+        long long limit = 1LL << (bits - 1);
+        wide = product < -limit || product >= limit;
+      }
+      if (wide) {
+        mem_warn(ctx, "M0124", loc,
+                 "The constant `%lld %s %lld` does not fit `%s` and wraps; "
+                 "write one operand with a cast to a wider type, for example "
+                 "`(int64)%lld`",
+                 left, binary->operator, value, operand_type->name, left);
+      }
+    }
+    return;
+  }
   if (strcmp(binary->operator, "/") == 0 || strcmp(binary->operator, "%") == 0) {
     if (mem_eval_constant(ctx, binary->right, &value) &&
         value == 0) {

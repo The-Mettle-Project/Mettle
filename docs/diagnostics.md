@@ -114,6 +114,7 @@ Memory and range diagnostics:
 | M0121 | A task was handed a pointer into the frame that spawned it |
 | M0122 | A message was written after it was handed to a task |
 | M0123 | A signed operation left its type |
+| M0124 | A constant signed operation does not fit its type |
 
 [Memory safety](memory-safety.md) and [Borrow checker](borrow-checker.md)
 cover the M codes in context.

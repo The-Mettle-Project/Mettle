@@ -556,7 +556,7 @@ static int print_help_topic(const char *program_name, const char *argv0,
       strcmp(topic, "warnings") == 0) {
     printf("diagnostics - compile errors, warnings, and tooling output\n\n");
     printf("  Every diagnostic carries a stable code (E0001..E0007, "
-           "M0101..M0123, R0001..R0005,\n");
+           "M0101..M0124, R0001..R0005,\n");
     printf("  P0001..P0004, V0001, and more: mettle explain list), a source "
            "snippet\n");
     printf("  with the offending range underlined, and a help suggestion. The "

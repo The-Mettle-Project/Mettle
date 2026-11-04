@@ -7,10 +7,7 @@ export fn STD_INPUT_HANDLE() -> int32 { return -10; }
 export fn STD_OUTPUT_HANDLE() -> int32 { return -11; }
 export fn STD_ERROR_HANDLE() -> int32 { return -12; }
 
-export fn INFINITE() -> uint32 { return 0xFFFFFFFF; }
-export fn WAIT_OBJECT_0() -> uint32 { return 0; }
-export fn WAIT_TIMEOUT() -> uint32 { return 258; }
-export fn WAIT_FAILED() -> uint32 { return 0xFFFFFFFF; }
+import "std/wait_codes";
 
 export fn MB_OK() -> uint32 { return 0; }
 export fn MB_ICONINFORMATION() -> uint32 { return 64; }

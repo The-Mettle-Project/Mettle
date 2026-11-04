@@ -1,0 +1,11 @@
+import "std/thread";
+
+struct Srv { acceptor: int64; n: int32; }
+
+fn loop(arg: cstring) -> uint32 { var s: Srv* = (Srv*)arg; s->n = (int32)s->acceptor; return 0; }
+
+fn main() -> int32 {
+  var srv: Srv* = new Srv;
+  srv->acceptor = CreateThread((cstring)0, 0, loop, (cstring)srv, 0, (uint32*)0);
+  return 0;
+}

@@ -1,0 +1,7 @@
+import "std/io";
+fn main() -> int32 {
+  var big: int64 = 100000 * 100000;
+  var wide: int64 = (int64)100000 * 100000;
+  println("{big} {wide}");
+  return 0;
+}

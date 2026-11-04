@@ -1,0 +1,11 @@
+import "std/io";
+import "std/thread";
+import "std/win32";
+import "std/net_posix";
+import "std/thread_posix";
+
+fn main() -> int32 {
+  if (INFINITE() != WAIT_FAILED()) { return 1; }
+  println("ok");
+  return 0;
+}
