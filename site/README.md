@@ -34,7 +34,7 @@ drifted from the compiler.
 ## Deploying
 
 A workflow at [`.github/workflows/pages.yml`](../.github/workflows/pages.yml)
-publishes this folder on every push to `main` that touches `site/`.
+publishes this folder on every push to `master` that touches `site/`.
 
 One-time setup: **Settings → Pages → Source → "GitHub Actions"**. The next push
 (or a manual *Run workflow*) deploys it. The site then lives at
@@ -58,5 +58,5 @@ python3 -m http.server -d site 8080   # http://localhost:8080
 - The signature palette is the **steel tempering oxide sequence** (straw → amber →
   ember → plum → steel-blue) — the colours steel turns as it's heated and given its
   mettle. It's the `--temper` gradient; reuse it rather than inventing new accents.
-- The install command points at `install.sh` on `main`. Update the URL if the org or
+- The install command points at `install.sh` on `master`. Update the URL if the org or
   default branch changes.

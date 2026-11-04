@@ -175,7 +175,7 @@ main { padding-bottom: 72px; }
     </nav>
     <nav class="actions" aria-label="Site">
       <a href="#start">Install</a>
-      <a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/README.md">Docs</a>
+      <a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/README.md">Docs</a>
       <a href="https://github.com/The-Mettle-Project/Mettle">Source</a>
     </nav>
   </div>
@@ -196,19 +196,19 @@ main { padding-bottom: 72px; }
 <section class="wrap sec" id="language">
   <h2>Language</h2>
   <ul class="can">
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/declarations.md">Structs, methods and tagged enums</a></h3><p><code>match</code> requires a case for every variant, or a <code>default</code>.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/types.md">Generics and closures</a></h3><p><code>fn add_one&lt;T: Addable&gt;(v: T) -&gt; T</code> compiles to one copy per set of type arguments. <code>Fn(int32) -&gt; int32</code> captures by value, and <code>fn(int32) -&gt; int32</code> is a bare pointer.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/types.md">Slices and shaped views</a></h3><p><code>T[]</code> carries its length and <code>T[,]</code> its extents. <code>T[32, 32]</code> puts the shape in the type, and every index into it is proven.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/control-flow.md"><code>defer</code> and <code>errdefer</code></a></h3><p><code>defer</code> runs on every path out of a scope. <code>errdefer</code> runs only when the function returns an error.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/expressions.md">Interpolated strings</a></h3><p>Any expression fits in the braces: <code>"twice={n * 2}"</code>.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/standard-library.md">A standard library</a></h3><p>Files, sockets, HTTP, threads, processes, collections, hashing, encoding, arenas and allocators.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/declarations.md">Structs, methods and tagged enums</a></h3><p><code>match</code> requires a case for every variant, or a <code>default</code>.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/types.md">Generics and closures</a></h3><p><code>fn add_one&lt;T: Addable&gt;(v: T) -&gt; T</code> compiles to one copy per set of type arguments. <code>Fn(int32) -&gt; int32</code> captures by value, and <code>fn(int32) -&gt; int32</code> is a bare pointer.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/types.md">Slices and shaped views</a></h3><p><code>T[]</code> carries its length and <code>T[,]</code> its extents. <code>T[32, 32]</code> puts the shape in the type, and every index into it is proven.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/control-flow.md"><code>defer</code> and <code>errdefer</code></a></h3><p><code>defer</code> runs on every path out of a scope. <code>errdefer</code> runs only when the function returns an error.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/expressions.md">Interpolated strings</a></h3><p>Any expression fits in the braces: <code>"twice={n * 2}"</code>.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/standard-library.md">A standard library</a></h3><p>Files, sockets, HTTP, threads, processes, collections, hashing, encoding, arenas and allocators.</p></li>
   </ul>
 </section>
 
 <section class="wrap sec" id="compile-time">
   <h2>Compile time</h2>
   <ul class="can">
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/declarations.md">Generate declarations from your types</a></h3><p><code>comptime for</code> walks <code>typeof(T).fields</code>, a table's rows or a range, and emits functions and constants.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/declarations.md">Generate declarations from your types</a></h3><p><code>comptime for</code> walks <code>typeof(T).fields</code>, a table's rows or a range, and emits functions and constants.</p>
       <pre class="snip"><code data-code>struct Packet { id: int32; len: int16; flags: uint8; }
 
 comptime for f in typeof(Packet).fields {
@@ -218,8 +218,8 @@ comptime for f in typeof(Packet).fields {
 println("OFFSET_len = {OFFSET_len}");
 println("OFFSET_flags = {OFFSET_flags}");</code><span class="said dim">OFFSET_len = 4
 OFFSET_flags = 6</span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/control-flow.md">Read what was generated</a></h3><p><code>mettle expand</code> prints the whole program after expansion, as normal Mettle.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/testing.md">Test and trace without building</a></h3><p><code>mettle test</code> runs <code>@test</code> functions in the compiler's interpreter, with no codegen and no link. <code>mettle trace</code> prints the source with the values each line took.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/control-flow.md">Read what was generated</a></h3><p><code>mettle expand</code> prints the whole program after expansion, as normal Mettle.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/testing.md">Test and trace without building</a></h3><p><code>mettle test</code> runs <code>@test</code> functions in the compiler's interpreter, with no codegen and no link. <code>mettle trace</code> prints the source with the values each line took.</p>
       <pre class="snip">   1 | fn total(n: int32) -&gt; int32 {
    2 |   var sum: int32 = 0;                                &lt;- sum = 0
    3 |   for i in 0..n {                                    &lt;- i = 0, 1, 2, 3, ..., 4 (5x)
@@ -227,79 +227,79 @@ OFFSET_flags = 6</span></pre></li>
    5 |   }
    6 |   return sum;
 returns 6</pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/modules.md">Embed a file</a></h3><p><code>import_str</code> reads a file into a string at compile time.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/modules.md">Embed a file</a></h3><p><code>import_str</code> reads a file into a string at compile time.</p></li>
   </ul>
 </section>
 
 <section class="wrap sec" id="memory">
   <h2>Memory</h2>
   <ul class="can">
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/memory-safety.md">No lifetime annotations</a></h3><p>Ownership is inferred across calls. The compiler reports use after free, double free, leaks, dangling pointers and invalidated borrows at the line that does the damage.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/memory-safety.md">No lifetime annotations</a></h3><p>Ownership is inferred across calls. The compiler reports use after free, double free, leaks, dangling pointers and invalidated borrows at the line that does the damage.</p>
       <pre class="snip"><code data-code>var data: uint8* = malloc(n);
 free(data);
 println("checksum = {checksum(data, n)}");</code><span class="said warn">warning[M0101]: Use of `data` after it was freed (freed at line 17); this is use-after-free</span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/borrow-checker.md">Safe hand-offs to tasks</a></h3><p>Handing a task a pointer into the frame that spawned it, or writing through a pointer already handed to a task, is a compile error.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/memory-safety.md">Checked access on request</a></h3><p><code>--safe</code> checks every memory access not proven in bounds, and stays on under <code>--release</code>.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/heap-allocation.md">Manual memory</a></h3><p><code>malloc</code>, <code>new T[n]</code>, arenas and <code>std/alloc</code>. There is no garbage collector.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/borrow-checker.md">Safe hand-offs to tasks</a></h3><p>Handing a task a pointer into the frame that spawned it, or writing through a pointer already handed to a task, is a compile error.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/memory-safety.md">Checked access on request</a></h3><p><code>--safe</code> checks every memory access not proven in bounds, and stays on under <code>--release</code>.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/heap-allocation.md">Manual memory</a></h3><p><code>malloc</code>, <code>new T[n]</code>, arenas and <code>std/alloc</code>. There is no garbage collector.</p></li>
   </ul>
 </section>
 
 <section class="wrap sec" id="contracts">
   <h2>Contracts</h2>
   <ul class="can">
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/types.md">Types with predicates</a></h3><p>A conversion into a declared type is proven from guards, ranges and arithmetic, or the build stops.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/types.md">Types with predicates</a></h3><p>A conversion into a declared type is proven from guards, ranges and arithmetic, or the build stops.</p>
       <pre class="snip"><code data-code>type Percent = int32 where value &gt;= 0 &amp;&amp; value &lt;= 100;
 
 var a: Percent = 40;
 var b: Percent = argc * 2;</code><span class="said err">error[P0001]: cannot prove `value &gt;= 0` for `argc * 2`, which 'Percent' requires (its range here is -4294967296..4294967294)</span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/effects.md">Effects through the call graph</a></h3><p>Declare <code>with</code>, <code>forbids</code>, <code>requires</code> and <code>provides</code> where they matter. The compiler infers everything in between and proves it on every build.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/effects.md">Effects through the call graph</a></h3><p>Declare <code>with</code>, <code>forbids</code>, <code>requires</code> and <code>provides</code> where they matter. The compiler infers everything in between and proves it on every build.</p>
       <pre class="snip"><code data-code>fn log_line() { var p: int32* = malloc(64); free(p); }
 fn gain() { log_line(); }
 fn mix_audio() forbids alloc { gain(); }</code><span class="said err">error[F0001]: 'mix_audio' forbids 'alloc' but reaches it: mix_audio -&gt; gain -&gt; log_line</span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/effects.md">Races on globals</a></h3><p>Say where code runs with effects, and a global two threads write with nothing ordering them stops the build.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/types.md">Deadlines</a></h3><p><code>where cycles &lt; N</code> bounds a function's longest path on the target's cost model. Too slow or unbounded, and the build stops.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/effects.md">Races on globals</a></h3><p>Say where code runs with effects, and a global two threads write with nothing ordering them stops the build.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/types.md">Deadlines</a></h3><p><code>where cycles &lt; N</code> bounds a function's longest path on the target's cost model. Too slow or unbounded, and the build stops.</p>
       <pre class="snip"><span class="out"><span class="err">error[D0001]: 'tick' declares a deadline of 20 cycles, and its longest path costs 847 on this target</span></span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/declarations.md">Optimization contracts</a></h3><p><code>@simd!</code> requires a vectorized loop, <code>@inline!</code> an inlined call, <code>@noalloc</code> an allocation-free call graph and <code>@pure</code> no writes. The build stops at the site that broke it.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/declarations.md">Optimization contracts</a></h3><p><code>@simd!</code> requires a vectorized loop, <code>@inline!</code> an inlined call, <code>@noalloc</code> an allocation-free call graph and <code>@pure</code> no writes. The build stops at the site that broke it.</p>
       <pre class="snip"><span class="out"><span class="err">error: @simd! loop was not vectorized: the loop body branches on data (an `if` or `&amp;&amp;`/`||` per iteration); only straight-line loop bodies vectorize</span></span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/translation-validation.md">Reference twins</a></h3><p><code>reference</code> names a slower function. Every build runs both on generated inputs and stops when they disagree.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/translation-validation.md">Reference twins</a></h3><p><code>reference</code> names a slower function. Every build runs both on generated inputs and stops when they disagree.</p>
       <pre class="snip"><span class="out"><span class="err">error[T0001]: `abs_fast` and its reference `abs_slow` disagree: return value was -2147483648, is now 0; (input set 7) abs_fast(2147483648)</span></span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/compilation.md">Checks in the running program</a></h3><p><code>--check-proofs</code>, <code>--check-effects</code>, <code>--check-deadlines</code>, <code>--check-overflow</code> and <code>--check-tasks</code> trap when a claim fails at run time.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Checks in the running program</a></h3><p><code>--check-proofs</code>, <code>--check-effects</code>, <code>--check-deadlines</code>, <code>--check-overflow</code> and <code>--check-tasks</code> trap when a claim fails at run time.</p></li>
   </ul>
 </section>
 
 <section class="wrap sec" id="compiler">
   <h2>The compiler</h2>
   <ul class="can">
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/compilation.md">Ask what it decided</a></h3><p><code>--explain</code> reports every optimization decision, the reason for each refusal, and what the build took on trust. <code>mettle why</code> prints the chain behind an effect or a proven type.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Ask what it decided</a></h3><p><code>--explain</code> reports every optimization decision, the reason for each refusal, and what the build took on trust. <code>mettle why</code> prints the chain behind an effect or a proven type.</p>
       <pre class="snip"><span class="out">checksum (loop @ line 6): <span class="ok">vectorized -&gt; vpsadbw, 32-wide byte sum (AVX2)</span>
 main (loop @ line 15): <span class="warn">NOT vectorized  [store-only-fill]</span>
 beliefs: 10 things this build took on trust</span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/rules.md">Write your own rules</a></h3><p><code>@rule</code> reads the checked program, what codegen made of it, or a recorded run. It can stop the build, or propose a fix that <code>--fix</code> applies.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/rules.md">Write your own rules</a></h3><p><code>@rule</code> reads the checked program, what codegen made of it, or a recorded run. It can stop the build, or propose a fix that <code>--fix</code> applies.</p>
       <pre class="snip"><code data-code>@rule fn no_recursion(p: Program) -&gt; Verdict {
   for f in p.functions {
     if (f.module == "" &amp;&amp; f.is_recursive) {
       return verdict_fail(f.site, "this module forbids recursion");
   ⋯</code><span class="said err">error[R0002]: rule 'no_recursion' failed: this module forbids recursion</span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/rewrite-rules.md">Teach the optimizer</a></h3><p><code>rewrite</code> adds an identity from your own code. Both sides run on generated inputs first, and a rule that fails is refused with the input that broke it.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/rewrite-rules.md">Teach the optimizer</a></h3><p><code>rewrite</code> adds an identity from your own code. Both sides run on generated inputs first, and a rule that fails is refused with the input that broke it.</p>
       <pre class="snip"><span class="out"><span class="err">error: rewrite `drop_clamp` changes meaning: its `from` and `to` sides disagree
 counterexample (input set 6) drop_clamp(-1)
 divergence: return value was 0, is now -1</span></span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/translation-validation.md">Validate every pass</a></h3><p><code>--verify</code> runs each changed function before and after every pass on generated inputs, and reports a divergence with a counterexample.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/pgo.md">Profile-guided optimization</a></h3><p><code>--pgo</code> interprets <code>main</code> at compile time, with no training run. <code>--pgo-gen</code> and <code>--pgo-use</code> measure a real run.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/compilation.md">Read the assembly</a></h3><p><code>--annotate-asm</code> prints the emitted assembly with the decision behind each instruction, a cost model and a register map.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/ml-opt.md">A learned optimizer</a></h3><p>Experimental. <code>--ml-opt</code> runs a graph neural network over the IR after the classical passes. Each rewrite is re-executed and dropped if it diverges.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/compilation.md">Budgets for build time</a></h3><p><code>--rule-budget</code>, <code>--proof-budget</code> and <code>--effect-budget</code> fail the build when those passes spend too much.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/diagnostics.md">Diagnostics with evidence</a></h3><p>A diagnostic has a code, a caret and the evidence. <code>mettle explain</code> expands any code, and <code>--error-format=json</code> feeds your tools.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/translation-validation.md">Validate every pass</a></h3><p><code>--verify</code> runs each changed function before and after every pass on generated inputs, and reports a divergence with a counterexample.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/pgo.md">Profile-guided optimization</a></h3><p><code>--pgo</code> interprets <code>main</code> at compile time, with no training run. <code>--pgo-gen</code> and <code>--pgo-use</code> measure a real run.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Read the assembly</a></h3><p><code>--annotate-asm</code> prints the emitted assembly with the decision behind each instruction, a cost model and a register map.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/ml-opt.md">A learned optimizer</a></h3><p>Experimental. <code>--ml-opt</code> runs a graph neural network over the IR after the classical passes. Each rewrite is re-executed and dropped if it diverges.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Budgets for build time</a></h3><p><code>--rule-budget</code>, <code>--proof-budget</code> and <code>--effect-budget</code> fail the build when those passes spend too much.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/diagnostics.md">Diagnostics with evidence</a></h3><p>A diagnostic has a code, a caret and the evidence. <code>mettle explain</code> expands any code, and <code>--error-format=json</code> feeds your tools.</p></li>
   </ul>
 </section>
 
 <section class="wrap sec" id="machines">
   <h2>Machines</h2>
   <ul class="can">
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/compilation.md">Native code</a></h3><p>x86-64 on Windows, Linux and macOS. ARM64 on Linux and macOS.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/compilation.md">Vectorized loops</a></h3><p>The optimizer vectorizes loops to AVX2, and <code>--simd-report</code> says what each <code>@simd</code> loop became.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/declarations.md">Loops across cores</a></h3><p><code>@parallel</code> runs a loop on every core, gives integer accumulators one copy per thread, and refuses a loop it cannot split.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/gpu.md">GPU kernels</a></h3><p>A kernel is a Mettle function. It compiles to PTX, SPIR-V or Metal, and one <code>dispatch</code> launches it. <code>mettle test</code> runs a dispatched grid in the compiler's interpreter, with no GPU.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Native code</a></h3><p>x86-64 on Windows, Linux and macOS. ARM64 on Linux and macOS.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Vectorized loops</a></h3><p>The optimizer vectorizes loops to AVX2, and <code>--simd-report</code> says what each <code>@simd</code> loop became.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/declarations.md">Loops across cores</a></h3><p><code>@parallel</code> runs a loop on every core, gives integer accumulators one copy per thread, and refuses a loop it cannot split.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/gpu.md">GPU kernels</a></h3><p>A kernel is a Mettle function. It compiles to PTX, SPIR-V or Metal, and one <code>dispatch</code> launches it. <code>mettle test</code> runs a dispatched grid in the compiler's interpreter, with no GPU.</p>
       <pre class="snip"><code data-code>kernel(block = 256) vadd(a: float32*, b: float32*,
                          c: float32*, n: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
@@ -309,12 +309,12 @@ divergence: return value was 0, is now -1</span></span></pre></li>
 }
 
 dispatch vadd[work: n](da, db, dc, n);</code></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/gpu.md">Tensor cores and tiles</a></h3><p><code>tensor_mma</code> and register tiles are kernel operations, and inline PTX is there for anything else.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/runtime-model.md">Frame schedules</a></h3><p>A <code>const</code> table of phases, effects and threads. The compiler checks it and generates the dispatchers.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/bare-metal.md">Inline assembly</a></h3><p><code>asm</code> blocks are assembled by the compiler itself, with Mettle variables as operands.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/bare-metal.md">Bare metal and system calls</a></h3><p><code>@naked</code>, <code>@interrupt</code>, <code>volatile</code>, a chosen link address, flat images and 16-bit real mode. <code>syscall</code> asks the kernel directly, with no stub to link.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/bare-metal.md">Edit a target</a></h3><p><code>mettle target</code> prints a target as a Mettle value. Change its argument registers or cost model and build with <code>--target</code>.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/bare-metal.md">Invent a machine</a></h3><p>Describe an instruction set in a Mettle file. The compiler checks it, assembles your program for it, and runs it with <code>mettle emulate</code>.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/gpu.md">Tensor cores and tiles</a></h3><p><code>tensor_mma</code> and register tiles are kernel operations, and inline PTX is there for anything else.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/runtime-model.md">Frame schedules</a></h3><p>A <code>const</code> table of phases, effects and threads. The compiler checks it and generates the dispatchers.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/bare-metal.md">Inline assembly</a></h3><p><code>asm</code> blocks are assembled by the compiler itself, with Mettle variables as operands.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/bare-metal.md">Bare metal and system calls</a></h3><p><code>@naked</code>, <code>@interrupt</code>, <code>volatile</code>, a chosen link address, flat images and 16-bit real mode. <code>syscall</code> asks the kernel directly, with no stub to link.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/bare-metal.md">Edit a target</a></h3><p><code>mettle target</code> prints a target as a Mettle value. Change its argument registers or cost model and build with <code>--target</code>.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/bare-metal.md">Invent a machine</a></h3><p>Describe an instruction set in a Mettle file. The compiler checks it, assembles your program for it, and runs it with <code>mettle emulate</code>.</p>
       <pre class="snip"><code data-code>fn ins_add(a: int64, b: int64, c: int64) -&gt; int64 {
   REG[a] = REG[b] + REG[c];
   return -1;
@@ -331,30 +331,30 @@ r0 = 55</span></pre></li>
 <section class="wrap sec" id="running">
   <h2>Running programs</h2>
   <ul class="can">
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/live.md">Change a running program</a></h3><p><code>mettle live</code> turns every save into a patch: function bodies, signatures and struct layouts. Frames move to the new code, heap objects convert in place, <code>--live-undo</code> takes it back, and <code>--live-at-tick</code> lands a patch on the same frame in every running copy. Windows and Linux x64.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/live.md">Recover from a crash</a></h3><p>A fault waits for the save that fixes it, then the program continues from its last <code>quiesce</code>. In this recording the fix landed in 256 ms.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/live.md">Change a running program</a></h3><p><code>mettle live</code> turns every save into a patch: function bodies, signatures and struct layouts. Frames move to the new code, heap objects convert in place, <code>--live-undo</code> takes it back, and <code>--live-at-tick</code> lands a patch on the same frame in every running copy. Windows and Linux x64.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/live.md">Recover from a crash</a></h3><p>A fault waits for the save that fixes it, then the program continues from its last <code>quiesce</code>. In this recording the fix landed in 256 ms.</p>
       <pre class="snip"><span class="out"><span class="err"> 11.67  Fatal error: array index out of bounds (index 9001, length 64)</span>
 <span class="dim"> 11.67  [live] main stopped at the fault. Save a fix and it continues from its last quiesce point</span>
 <span class="ok"> 17.67  saved settle.mettle</span>
 <span class="dim"> 17.93  [live] main continues from its last quiesce point</span>
  17.93  record 1500000 held: merchant 9001 does not exist
  53.03  checksum 227638721867543</span></pre></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/compilation.md">Crash reports and debugging</a></h3><p>A linked executable names the exception, the function and the stack by default, and <code>-s</code> gets the exact statement. <code>-g</code> writes DWARF, and <code>--debug-hooks</code> instruments a build for the interactive debugger.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/compilation.md">Profilers</a></h3><p><code>--profile-runtime</code> times functions, <code>--profile-runtime-ops</code> counts op classes and <code>--profile-blocks</code> counts basic blocks.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/rules.md">Record a run</a></h3><p><code>--record-trace</code> writes down calls, allocations, frees and locks, and <code>mettle check-trace</code> holds the recording to your rules.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Crash reports and debugging</a></h3><p>A linked executable names the exception, the function and the stack by default, and <code>-s</code> gets the exact statement. <code>-g</code> writes DWARF, and <code>--debug-hooks</code> instruments a build for the interactive debugger.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Profilers</a></h3><p><code>--profile-runtime</code> times functions, <code>--profile-runtime-ops</code> counts op classes and <code>--profile-blocks</code> counts basic blocks.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/rules.md">Record a run</a></h3><p><code>--record-trace</code> writes down calls, allocations, frees and locks, and <code>mettle check-trace</code> holds the recording to your rules.</p></li>
   </ul>
 </section>
 
 <section class="wrap sec" id="toolchain">
   <h2>Toolchain</h2>
   <ul class="can">
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/ARCHITECTURE.md">One toolchain</a></h3><p>Frontend, optimizer, interpreter, code generators, assembler, linkers and runtime in one codebase, with no LLVM and no external assembler. Windows and Linux builds link with its own PE and ELF linkers.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/benchmarks/README.md">Close to C</a></h3><p>16 whole programs average 1.09&times; the run time of <code>clang -O3</code>, from 0.71&times; to 1.29&times;, with the same answers. Against <code>clang -O3 -march=native</code> the average is 1.13&times; and clang leads on all 16.</p>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/ARCHITECTURE.md">One toolchain</a></h3><p>Frontend, optimizer, interpreter, code generators, assembler, linkers and runtime in one codebase, with no LLVM and no external assembler. Windows and Linux builds link with its own PE and ELF linkers.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/benchmarks/README.md">Close to C</a></h3><p>16 whole programs average 1.09&times; the run time of <code>clang -O3</code>, from 0.71&times; to 1.29&times;, with the same answers. Against <code>clang -O3 -march=native</code> the average is 1.13&times; and clang leads on all 16.</p>
       <p class="small">clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. Under <code>-march=native</code>, clang's physics_grid returns a different checksum. <a href="https://github.com/The-Mettle-Project/Mettle#readme">All 16 programs</a>. Run them with <code>tools/benchmark/mc.ps1 -Suite 3</code>.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/benchmarks/README.md">Fast builds</a></h3><p>A generated 90,000-line file builds in 7.6&nbsp;s. clang takes 16.0&nbsp;s.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/runtime-model.md">Its own runtime</a></h3><p>No C runtime, garbage collector or scheduler on Windows and Linux. The safety, profiler and debug parts link only when you ask for them.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/c-interop.md">Call C, and be called</a></h3><p><code>extern</code> and <code>export</code>, with structs by value in both directions under the Windows x64 and System V rules. Bind a <code>.so</code>, or emit a <code>.so</code> or a DLL.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/embedding.md">Your own frontend</a></h3><p>Drive libmtlc's C API and your language gets the IR, the optimizers, code generation and the linkers.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/benchmarks/README.md">Fast builds</a></h3><p>A generated 90,000-line file builds in 7.6&nbsp;s. clang takes 16.0&nbsp;s.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/runtime-model.md">Its own runtime</a></h3><p>No C runtime, garbage collector or scheduler on Windows and Linux. The safety, profiler and debug parts link only when you ask for them.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/c-interop.md">Call C, and be called</a></h3><p><code>extern</code> and <code>export</code>, with structs by value in both directions under the Windows x64 and System V rules. Bind a <code>.so</code>, or emit a <code>.so</code> or a DLL.</p></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/embedding.md">Your own frontend</a></h3><p>Drive libmtlc's C API and your language gets the IR, the optimizers, code generation and the linkers.</p></li>
   </ul>
 </section>
 
@@ -382,9 +382,9 @@ r0 = 55</span></pre></li>
       <pre id="install-cmd"></pre>
     </div>
     <ul class="go">
-      <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/getting-started.md">Getting started</a></li>
-      <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/README.md">Documentation</a></li>
-      <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/main/docs/known-limitations.md">What does not work yet</a></li>
+      <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/getting-started.md">Getting started</a></li>
+      <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/README.md">Documentation</a></li>
+      <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/known-limitations.md">What does not work yet</a></li>
       <li><a href="https://github.com/The-Mettle-Project/Mettle">Source</a></li>
     </ul>
     <p class="fine">Developed by <a href="https://systm.co.za/">Systm</a>. Apache 2.0. Compiler output from mettle v0.17.0. Footage by <a href="https://www.pexels.com/video/falling-16296843/">Film Composite</a>, <a href="https://www.pexels.com/video/the-center-of-the-milky-way-galaxy-27254149/">Luz Calor Som</a>, <a href="https://www.pexels.com/video/dramatic-lava-flow-at-active-volcano-eruption-30401545/">Gylfi Gylfason</a> and <a href="https://www.pexels.com/video/dramatic-aerial-view-of-utah-s-rugged-canyons-34305686/">Alex Moliski</a>. Dither after <a href="https://motion-core.dev/docs/dithered-image">Motion Core</a>.</p>
@@ -693,8 +693,8 @@ void main() {
   watch(document.getElementById("end-video"), "300px 0px");
 
   var CMDS = {
-    linux: ["$ ", "curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.sh | sh"],
-    windows: ["PS> ", "irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex"]
+    linux: ["$ ", "curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/master/install.sh | sh"],
+    windows: ["PS> ", "irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/master/install.ps1 | iex"]
   };
   var installPre = document.getElementById("install-cmd");
   var osTabs = document.querySelectorAll(".install [data-os]");

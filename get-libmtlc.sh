@@ -1,7 +1,7 @@
 #!/bin/sh
 # libmtlc fetcher: get ONLY the backend (headers + static library), no driver.
 #
-#   curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/get-libmtlc.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/get-libmtlc.sh | sh
 #
 # Downloads the prebuilt libmtlc release for this platform and unpacks it into
 # ./libmtlc (include/ + lib/). That folder is everything a frontend links
@@ -110,5 +110,5 @@ Link a frontend with:
 Or, if a pkg-config file shipped:
   ${BOLD}cc \$(PKG_CONFIG_PATH=$DIR/lib/pkgconfig pkg-config --cflags --libs libmtlc) app.c${RESET}
 
-API reference: ${BLUE}https://github.com/$REPO/blob/main/docs/libmtlc/api.md${RESET}
+API reference: ${BLUE}https://github.com/$REPO/blob/master/docs/libmtlc/api.md${RESET}
 EOF

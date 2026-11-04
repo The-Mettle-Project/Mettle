@@ -1,6 +1,6 @@
 # libmtlc docs fetcher (Windows): download the docs/libmtlc reference set.
 #
-#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/get-libmtlc-docs.ps1 | iex
+#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/get-libmtlc-docs.ps1 | iex
 #
 # Downloads the API reference, IR model, type system, pipeline, and internals
 # docs (docs/libmtlc/*.md) via the GitHub Contents API and writes them into
@@ -8,7 +8,7 @@
 # haven't run get-libmtlc.ps1). One API call, no git required.
 #
 # Overrides (set before piping to iex, or use the script form with params):
-#   $env:LIBMTLC_VERSION   a specific tag/branch/commit (default: latest release tag, else main)
+#   $env:LIBMTLC_VERSION   a specific tag/branch/commit (default: latest release tag, else master)
 #   $env:LIBMTLC_DOCS_DIR  where to write the docs (default: .\libmtlc\docs or .\libmtlc-docs)
 [CmdletBinding()]
 param(
@@ -31,8 +31,8 @@ if (-not $Version) {
     $Version = $rel.tag_name
   } catch {}
   if (-not $Version) {
-    Write-Host "no published release found; using main" -ForegroundColor Yellow
-    $Version = "main"
+    Write-Host "no published release found; using master" -ForegroundColor Yellow
+    $Version = "master"
   }
 }
 

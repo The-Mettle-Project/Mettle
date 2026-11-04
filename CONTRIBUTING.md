@@ -187,7 +187,7 @@ binding may leave its type off where the line says it, and
 
 ## Submitting a pull request
 
-Branch off `main`. Pull requests land there.
+Branch off `master`. Pull requests land there.
 
 Keep the change focused and let unrelated cleanups go in their own pull request.
 Build clean under GCC and Clang on your platform, run `tests\run_tests.ps1` on

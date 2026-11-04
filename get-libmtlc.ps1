@@ -1,6 +1,6 @@
 # libmtlc fetcher (Windows): get ONLY the backend (headers + static library).
 #
-#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/get-libmtlc.ps1 | iex
+#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/get-libmtlc.ps1 | iex
 #
 # Downloads the prebuilt libmtlc release for Windows x64 and unpacks it into
 # .\libmtlc (include\ + lib\). That folder is everything a frontend links
@@ -74,4 +74,4 @@ Write-Host ""
 Write-Host "Link a frontend with:"
 Write-Host "  gcc -I$Dir\include app.c $Dir\lib\mtlc.lib -o app.exe -ldbghelp" -ForegroundColor White
 Write-Host ""
-Write-Host "API reference: https://github.com/$repo/blob/main/docs/libmtlc/api.md" -ForegroundColor Blue
+Write-Host "API reference: https://github.com/$repo/blob/master/docs/libmtlc/api.md" -ForegroundColor Blue

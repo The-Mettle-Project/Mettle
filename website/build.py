@@ -197,7 +197,7 @@ def main():
     version = run(REPO, [METTLE, "--version"])[0].split("\n")[0]
     facts = {
         "{{VERSION}}": version,
-        "{{DOCS}}": "https://github.com/The-Mettle-Project/Mettle/blob/main/docs/",
+        "{{DOCS}}": "https://github.com/The-Mettle-Project/Mettle/blob/master/docs/",
         "{{C_O3}}": c_o3,
         "{{C_NATIVE}}": c_native,
         "{{C_LOW}}": "%.2f" % min(ratios),

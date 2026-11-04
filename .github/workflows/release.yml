@@ -49,7 +49,7 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          if ([string]::IsNullOrWhiteSpace($tag) -or $tag -eq 'development' -or $tag -eq 'main') {
+          if ([string]::IsNullOrWhiteSpace($tag) -or $tag -eq 'development' -or $tag -eq 'master') {
             $tag = "${{ github.event.inputs.tag }}"
           }
           $out = "mettle-$tag-windows-x64"
@@ -71,7 +71,7 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          if ([string]::IsNullOrWhiteSpace($tag) -or $tag -eq 'development' -or $tag -eq 'main') {
+          if ([string]::IsNullOrWhiteSpace($tag) -or $tag -eq 'development' -or $tag -eq 'master') {
             $tag = "${{ github.event.inputs.tag }}"
           }
           .\tools\dist-libmtlc.ps1
@@ -91,7 +91,7 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          if ([string]::IsNullOrWhiteSpace($tag) -or $tag -eq 'development' -or $tag -eq 'main') {
+          if ([string]::IsNullOrWhiteSpace($tag) -or $tag -eq 'development' -or $tag -eq 'master') {
             $tag = "${{ github.event.inputs.tag }}"
           }
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
@@ -170,7 +170,7 @@ jobs:
       - name: Build compiler
         run: |
           tag="${{ github.ref_name }}"
-          if [ -z "$tag" ] || [ "$tag" = "development" ] || [ "$tag" = "main" ]; then
+          if [ -z "$tag" ] || [ "$tag" = "development" ] || [ "$tag" = "master" ]; then
             tag="${{ github.event.inputs.tag }}"
           fi
           make -j"$(nproc)" EXTRA_CFLAGS="-DMETTLE_VERSION_RAW=$tag"
@@ -189,7 +189,7 @@ jobs:
         shell: bash
         run: |
           tag="${{ github.ref_name }}"
-          if [ -z "$tag" ] || [ "$tag" = "development" ] || [ "$tag" = "main" ]; then
+          if [ -z "$tag" ] || [ "$tag" = "development" ] || [ "$tag" = "master" ]; then
             tag="${{ github.event.inputs.tag }}"
           fi
           out="mettle-$tag-linux-x64"
@@ -214,7 +214,7 @@ jobs:
         shell: bash
         run: |
           tag="${{ github.ref_name }}"
-          if [ -z "$tag" ] || [ "$tag" = "development" ] || [ "$tag" = "main" ]; then
+          if [ -z "$tag" ] || [ "$tag" = "development" ] || [ "$tag" = "master" ]; then
             tag="${{ github.event.inputs.tag }}"
           fi
           make dist-libmtlc

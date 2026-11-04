@@ -5,7 +5,7 @@ name: Deploy site to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "site/**"
       - "website/index.html"

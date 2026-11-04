@@ -10,7 +10,7 @@ name: CI
 
 on:
   push:
-    branches: [main, development]
+    branches: [master, development]
   pull_request:
   workflow_dispatch:
 
@@ -98,7 +98,7 @@ jobs:
           retention-days: 14
 
       - name: Track a breach of the default branch as an issue
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}

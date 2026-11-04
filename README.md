@@ -61,11 +61,11 @@ checksum (loop @ line 6): vectorized -> vpsadbw, 32-wide byte sum (AVX2)
 <img src="website/media/readme/try.jpg" width="100%" alt="Try it.">
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/master/install.sh | sh
 ```
 
 ```powershell
-irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/master/install.ps1 | iex
 ```
 
 These install v0.17.0. Live programs, rules, target descriptions and Metal are newer, so until the next release, build them from source with `make -j"$(nproc)"` on Linux or `.\build.bat` on Windows.

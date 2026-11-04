@@ -7,13 +7,13 @@ Install the compiler, build a program, and take a short tour of the language.
 Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/install.sh | sh
 ```
 
 Windows, in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/install.ps1 | iex
 ```
 
 It installs to `~/.mettle` or `%LOCALAPPDATA%\Mettle` and adds that to your

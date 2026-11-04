@@ -7,10 +7,10 @@
   and adds the compiler to your user PATH. No administrator rights required.
 
   One-liner:
-    irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/install.ps1 | iex
 
   Pin a version or change the location:
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/install.ps1))) -Version v0.13.0
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/install.ps1))) -Version v0.13.0
 
 .PARAMETER Version
   Release tag to install (default: latest).

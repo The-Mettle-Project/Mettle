@@ -1,7 +1,7 @@
 #!/bin/sh
 # Mettle installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/install.sh | sh
 #
 # Downloads the latest Mettle release for this platform, installs it under
 # ~/.mettle, and adds the compiler to your PATH. No root required.
