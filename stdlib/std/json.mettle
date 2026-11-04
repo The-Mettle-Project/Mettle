@@ -1,0 +1,1145 @@
+// JSON (RFC 8259): a pull reader, a tree, and a streaming writer.
+//
+// The reader allocates nothing and never copies the document: ask for the
+// next event and read the token it stands on. json_parse builds a tree of
+// JsonValue nodes in an Arena on top of it. JsonWriter writes JSON to a
+// StrBuf, and can hand finished chunks to a flush callback as it goes.
+//
+// The reader came from the registry's json 1.0.0 package.
+
+import "std/arena";
+import "std/strbuf";
+import "std/floatconv";
+import "std/core";
+import "std/conv";
+
+export const JSON_END = 0;
+export const JSON_OBJECT_START = 1;
+export const JSON_OBJECT_END = 2;
+export const JSON_ARRAY_START = 3;
+export const JSON_ARRAY_END = 4;
+export const JSON_KEY = 5;
+export const JSON_STRING = 6;
+export const JSON_NUMBER = 7;
+export const JSON_TRUE = 8;
+export const JSON_FALSE = 9;
+export const JSON_NULL = 10;
+export const JSON_ERROR = 11;
+export const JSON_MAX_DEPTH = 128;
+
+const WANT_VALUE = 0;
+const WANT_VALUE_OR_CLOSE = 1;
+const WANT_KEY_OR_CLOSE = 2;
+const WANT_KEY = 3;
+const WANT_SEPARATOR = 4;
+const WANT_NOTHING = 5;
+
+const IN_OBJECT = 1;
+const IN_ARRAY = 2;
+
+export struct JsonReader {
+  text: uint8*;
+  length: int64;
+  at: int64;
+  depth: int32;
+  stack: uint8[128];
+  state: int32;
+  event: int32;
+  start: int64;
+  stop: int64;
+}
+
+export fn json_begin(reader: JsonReader*, document: string) {
+  reader->text = (uint8*)document.chars;
+  reader->length = (int64)document.length;
+  reader->at = 0;
+  reader->depth = 0;
+  reader->state = WANT_VALUE;
+  reader->event = JSON_END;
+  reader->start = 0;
+  reader->stop = 0;
+}
+
+fn peek(reader: JsonReader*) -> int32 {
+  if (reader->at >= reader->length) {
+    return -1;
+  }
+  return (int32)reader->text[reader->at];
+}
+
+fn skip_space(reader: JsonReader*) {
+  var c: int32 = peek(reader);
+  while (c == 32 || c == 9 || c == 10 || c == 13) {
+    reader->at = reader->at + 1;
+    c = peek(reader);
+  }
+}
+
+fn fail(reader: JsonReader*) -> int32 {
+  reader->event = JSON_ERROR;
+  return JSON_ERROR;
+}
+
+fn hex_value(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) {
+    return c - 48;
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 87;
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 55;
+  }
+  return -1;
+}
+
+fn read_hex4(text: uint8*, at: int64, length: int64) -> int32 {
+  if (at + 4 > length) {
+    return -1;
+  }
+  var value: int32 = 0;
+  for i in 0..4 {
+    var digit: int32 = hex_value((int32)text[at + i]);
+    if (digit < 0) {
+      return -1;
+    }
+    value = value * 16 + digit;
+  }
+  return value;
+}
+
+fn scan_unicode_escape(reader: JsonReader*) -> bool {
+  var unit: int32 = read_hex4(reader->text, reader->at, reader->length);
+  if (unit < 0 || (unit >= 0xDC00 && unit <= 0xDFFF)) {
+    return false;
+  }
+  reader->at = reader->at + 4;
+  if (unit < 0xD800 || unit > 0xDBFF) {
+    return true;
+  }
+  if (peek(reader) != 92 || reader->at + 2 > reader->length ||
+      reader->text[reader->at + 1] != 117) {
+    return false;
+  }
+  var low: int32 = read_hex4(reader->text, reader->at + 2, reader->length);
+  if (low < 0xDC00 || low > 0xDFFF) {
+    return false;
+  }
+  reader->at = reader->at + 6;
+  return true;
+}
+
+fn scan_string(reader: JsonReader*) -> bool {
+  reader->at = reader->at + 1;
+  reader->start = reader->at;
+  while (true) {
+    var c: int32 = peek(reader);
+    if (c < 32) {
+      return false;
+    }
+    reader->at = reader->at + 1;
+    if (c == 34) {
+      reader->stop = reader->at - 1;
+      return true;
+    }
+    if (c == 92) {
+      var escape: int32 = peek(reader);
+      reader->at = reader->at + 1;
+      if (escape == 117) {
+        if (!scan_unicode_escape(reader)) {
+          return false;
+        }
+      } else if (escape != 34 && escape != 92 && escape != 47 && escape != 98 &&
+                 escape != 102 && escape != 110 && escape != 114 && escape != 116) {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+fn scan_digits(reader: JsonReader*) -> bool {
+  var c: int32 = peek(reader);
+  if (c < 48 || c > 57) {
+    return false;
+  }
+  while (c >= 48 && c <= 57) {
+    reader->at = reader->at + 1;
+    c = peek(reader);
+  }
+  return true;
+}
+
+fn scan_number(reader: JsonReader*) -> bool {
+  reader->start = reader->at;
+  if (peek(reader) == 45) {
+    reader->at = reader->at + 1;
+  }
+  if (peek(reader) == 48) {
+    reader->at = reader->at + 1;
+  } else if (!scan_digits(reader)) {
+    return false;
+  }
+  if (peek(reader) == 46) {
+    reader->at = reader->at + 1;
+    if (!scan_digits(reader)) {
+      return false;
+    }
+  }
+  var c: int32 = peek(reader);
+  if (c == 101 || c == 69) {
+    reader->at = reader->at + 1;
+    c = peek(reader);
+    if (c == 43 || c == 45) {
+      reader->at = reader->at + 1;
+    }
+    if (!scan_digits(reader)) {
+      return false;
+    }
+  }
+  reader->stop = reader->at;
+  return true;
+}
+
+fn scan_word(reader: JsonReader*, word: string) -> bool {
+  if (reader->at + (int64)word.length > reader->length) {
+    return false;
+  }
+  for i in 0..(int64)word.length {
+    if (reader->text[reader->at + i] != (uint8)word.chars[i]) {
+      return false;
+    }
+  }
+  reader->start = reader->at;
+  reader->at = reader->at + (int64)word.length;
+  reader->stop = reader->at;
+  return true;
+}
+
+fn after_value(reader: JsonReader*) {
+  if (reader->depth == 0) {
+    reader->state = WANT_NOTHING;
+  } else {
+    reader->state = WANT_SEPARATOR;
+  }
+}
+
+fn open_container(reader: JsonReader*, kind: int32, state: int32, event: int32) -> int32 {
+  if (reader->depth >= JSON_MAX_DEPTH) {
+    return fail(reader);
+  }
+  reader->stack[reader->depth] = (uint8)kind;
+  reader->depth = reader->depth + 1;
+  reader->at = reader->at + 1;
+  reader->state = state;
+  reader->event = event;
+  return event;
+}
+
+fn close_container(reader: JsonReader*, kind: int32, event: int32) -> int32 {
+  if (reader->depth == 0 || (int32)reader->stack[reader->depth - 1] != kind) {
+    return fail(reader);
+  }
+  reader->depth = reader->depth - 1;
+  reader->at = reader->at + 1;
+  after_value(reader);
+  reader->event = event;
+  return event;
+}
+
+fn finish_scalar(reader: JsonReader*, ok: bool, event: int32) -> int32 {
+  if (!ok) {
+    return fail(reader);
+  }
+  after_value(reader);
+  reader->event = event;
+  return event;
+}
+
+fn read_value(reader: JsonReader*) -> int32 {
+  var c: int32 = peek(reader);
+  switch (c) {
+    case 123: { return open_container(reader, IN_OBJECT, WANT_KEY_OR_CLOSE, JSON_OBJECT_START); }
+    case 91: { return open_container(reader, IN_ARRAY, WANT_VALUE_OR_CLOSE, JSON_ARRAY_START); }
+    case 34: { return finish_scalar(reader, scan_string(reader), JSON_STRING); }
+    case 116: { return finish_scalar(reader, scan_word(reader, "true"), JSON_TRUE); }
+    case 102: { return finish_scalar(reader, scan_word(reader, "false"), JSON_FALSE); }
+    case 110: { return finish_scalar(reader, scan_word(reader, "null"), JSON_NULL); }
+    default: { return finish_scalar(reader, scan_number(reader), JSON_NUMBER); }
+  }
+  return fail(reader);
+}
+
+fn read_key(reader: JsonReader*) -> int32 {
+  if (peek(reader) != 34 || !scan_string(reader)) {
+    return fail(reader);
+  }
+  skip_space(reader);
+  if (peek(reader) != 58) {
+    return fail(reader);
+  }
+  reader->at = reader->at + 1;
+  reader->state = WANT_VALUE;
+  reader->event = JSON_KEY;
+  return JSON_KEY;
+}
+
+fn read_separator(reader: JsonReader*) -> int32 {
+  var c: int32 = peek(reader);
+  if (c == 125) {
+    return close_container(reader, IN_OBJECT, JSON_OBJECT_END);
+  }
+  if (c == 93) {
+    return close_container(reader, IN_ARRAY, JSON_ARRAY_END);
+  }
+  if (c != 44) {
+    return fail(reader);
+  }
+  reader->at = reader->at + 1;
+  skip_space(reader);
+  if ((int32)reader->stack[reader->depth - 1] == IN_OBJECT) {
+    return read_key(reader);
+  }
+  return read_value(reader);
+}
+
+export fn json_next(reader: JsonReader*) -> int32 {
+  if (reader->event == JSON_ERROR) {
+    return JSON_ERROR;
+  }
+  skip_space(reader);
+  switch (reader->state) {
+    case 0: { return read_value(reader); }
+    case 1: {
+      if (peek(reader) == 93) {
+        return close_container(reader, IN_ARRAY, JSON_ARRAY_END);
+      }
+      return read_value(reader);
+    }
+    case 2: {
+      if (peek(reader) == 125) {
+        return close_container(reader, IN_OBJECT, JSON_OBJECT_END);
+      }
+      return read_key(reader);
+    }
+    case 3: { return read_key(reader); }
+    case 4: { return read_separator(reader); }
+    default: {
+      if (peek(reader) != -1) {
+        return fail(reader);
+      }
+      reader->event = JSON_END;
+      return JSON_END;
+    }
+  }
+  return fail(reader);
+}
+
+export fn json_error_offset(reader: JsonReader*) -> int64 {
+  return reader->at;
+}
+
+export fn json_skip(reader: JsonReader*) -> int32 {
+  if (reader->event != JSON_OBJECT_START && reader->event != JSON_ARRAY_START) {
+    return reader->event;
+  }
+  var floor: int32 = reader->depth - 1;
+  while (reader->depth > floor) {
+    if (json_next(reader) == JSON_ERROR) {
+      return JSON_ERROR;
+    }
+  }
+  return reader->event;
+}
+
+fn write_utf8(code: int32, out: uint8*) -> int64 {
+  if (code < 0x80) {
+    out[0] = (uint8)code;
+    return 1;
+  }
+  if (code < 0x800) {
+    out[0] = (uint8)(0xC0 | (code >> 6));
+    out[1] = (uint8)(0x80 | (code & 0x3F));
+    return 2;
+  }
+  if (code < 0x10000) {
+    out[0] = (uint8)(0xE0 | (code >> 12));
+    out[1] = (uint8)(0x80 | ((code >> 6) & 0x3F));
+    out[2] = (uint8)(0x80 | (code & 0x3F));
+    return 3;
+  }
+  out[0] = (uint8)(0xF0 | (code >> 18));
+  out[1] = (uint8)(0x80 | ((code >> 12) & 0x3F));
+  out[2] = (uint8)(0x80 | ((code >> 6) & 0x3F));
+  out[3] = (uint8)(0x80 | (code & 0x3F));
+  return 4;
+}
+
+fn simple_escape(c: int32) -> int32 {
+  switch (c) {
+    case 98: { return 8; }
+    case 102: { return 12; }
+    case 110: { return 10; }
+    case 114: { return 13; }
+    case 116: { return 9; }
+    default: { return c; }
+  }
+  return c;
+}
+
+fn decode_step(reader: JsonReader*, at: int64*, out: uint8*) -> int64 {
+  var c: int32 = (int32)reader->text[*at];
+  if (c != 92) {
+    out[0] = (uint8)c;
+    *at = *at + 1;
+    return 1;
+  }
+  var escape: int32 = (int32)reader->text[*at + 1];
+  if (escape != 117) {
+    out[0] = (uint8)simple_escape(escape);
+    *at = *at + 2;
+    return 1;
+  }
+  var unit: int32 = read_hex4(reader->text, *at + 2, reader->stop);
+  *at = *at + 6;
+  if (unit >= 0xD800 && unit <= 0xDBFF) {
+    var low: int32 = read_hex4(reader->text, *at + 2, reader->stop);
+    *at = *at + 6;
+    unit = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+  }
+  return write_utf8(unit, out);
+}
+
+export fn json_string_length(reader: JsonReader*) -> int64 {
+  var scratch: uint8[4];
+  var at: int64 = reader->start;
+  var total: int64 = 0;
+  while (at < reader->stop) {
+    total = total + decode_step(reader, &at, &scratch[0]);
+  }
+  return total;
+}
+
+export fn json_string_copy(reader: JsonReader*, out: uint8*, capacity: int64) -> int64 {
+  var scratch: uint8[4];
+  var at: int64 = reader->start;
+  var total: int64 = 0;
+  while (at < reader->stop) {
+    var count: int64 = decode_step(reader, &at, &scratch[0]);
+    if (total + count > capacity) {
+      return -1;
+    }
+    for i in 0..count {
+      out[total + i] = scratch[i];
+    }
+    total = total + count;
+  }
+  return total;
+}
+
+export fn json_text_is(reader: JsonReader*, text: string) -> bool {
+  var scratch: uint8[4];
+  var at: int64 = reader->start;
+  var seen: int64 = 0;
+  var length: int64 = (int64)text.length;
+  while (at < reader->stop) {
+    var count: int64 = decode_step(reader, &at, &scratch[0]);
+    if (seen + count > length) {
+      return false;
+    }
+    for i in 0..count {
+      if (scratch[i] != (uint8)text.chars[seen + i]) {
+        return false;
+      }
+    }
+    seen = seen + count;
+  }
+  return seen == length;
+}
+
+export fn json_read_int64(reader: JsonReader*, out: int64*) -> bool {
+  return i64_parse(reader->text + reader->start, reader->stop - reader->start, out);
+}
+
+export fn json_read_float64(reader: JsonReader*) -> float64 {
+  return f64_parse(reader->text + reader->start, reader->stop - reader->start);
+}
+
+// The raw text of the token the reader stands on: a number as written, or a
+// string or key without its quotes and with escapes left in.
+export fn json_token(reader: JsonReader*) -> string {
+  var s: string;
+  s.chars = reader->text + reader->start;
+  s.length = (uint64)(reader->stop - reader->start);
+  return s;
+}
+
+// ---- Tree -------------------------------------------------------------------
+
+export const JSON_KIND_NULL = 0;
+export const JSON_KIND_BOOL = 1;
+export const JSON_KIND_NUMBER = 2;
+export const JSON_KIND_STRING = 3;
+export const JSON_KIND_ARRAY = 4;
+export const JSON_KIND_OBJECT = 5;
+
+// One node. Children of an array or object hang off first, linked through
+// next, in document order:
+//   var c: JsonValue* = v->first;
+//   while (c != 0) { ...; c = c->next; }
+export struct JsonValue {
+  kind: int32;
+  boolean: bool;
+  text: string;      // a string's decoded text, or a number as written
+  key: string;       // the member name, when the parent is an object
+  count: int64;      // children of an array or object
+  first: JsonValue*;
+  last: JsonValue*;
+  next: JsonValue*;
+  arena: Arena*;     // where this node and its text live
+}
+
+export struct JsonError {
+  offset: int64;     // byte where the document went wrong
+  message: string;
+}
+
+fn json_node(arena: Arena*, kind: int32) -> JsonValue* {
+  var v: JsonValue* = (JsonValue*)arena_alloc_zeroed(arena, sizeof(JsonValue));
+  if (v == 0) { return v; }
+  v->kind = kind;
+  v->arena = arena;
+  return v;
+}
+
+fn json_copy_text(arena: Arena*, s: string) -> string {
+  var out: string;
+  var p: uint8* = (uint8*)arena_alloc(arena, (int64)s.length + 1);
+  if (p == 0) {
+    out.chars = (uint8*)0;
+    out.length = (uint64)0;
+    return out;
+  }
+  for i in 0..s.length { p[i] = s.chars[i]; }
+  p[(int64)s.length] = (uint8)0;
+  out.chars = p;
+  out.length = s.length;
+  return out;
+}
+
+// The reader's current string or key, decoded into the arena.
+fn json_decode_token(reader: JsonReader*, arena: Arena*, ok: bool*) -> string {
+  var out: string;
+  var n: int64 = json_string_length(reader);
+  var p: uint8* = (uint8*)arena_alloc(arena, n + 1);
+  if (p == 0) {
+    *ok = false;
+    return out;
+  }
+  json_string_copy(reader, p, n);
+  p[n] = (uint8)0;
+  out.chars = p;
+  out.length = (uint64)n;
+  return out;
+}
+
+fn json_append_child(parent: JsonValue*, child: JsonValue*) {
+  if (parent->last == 0) {
+    parent->first = child;
+  } else {
+    parent->last->next = child;
+  }
+  parent->last = child;
+  parent->count = parent->count + 1;
+}
+
+fn json_fail_at(offset: int64, message: string) -> Result<JsonValue*, JsonError> {
+  var e: JsonError;
+  e.offset = offset;
+  e.message = message;
+  return Err(e);
+}
+
+// Parses a whole document into a tree in arena. Strings are decoded and
+// copied; numbers keep their text, so int64 values stay exact. Duplicate
+// keys are kept; json_get finds the first.
+export fn json_parse(arena: Arena*, document: string) -> Result<JsonValue*, JsonError> {
+  var reader: JsonReader;
+  json_begin(&reader, document);
+  var stack: JsonValue*[128];
+  var depth: int32 = 0;
+  var root: JsonValue* = (JsonValue*)0;
+  var key: string;
+  var ok: bool = true;
+  var event: int32 = json_next(&reader);
+  while (event != JSON_END) {
+    if (event == JSON_ERROR) {
+      return json_fail_at(json_error_offset(&reader), "invalid JSON");
+    }
+    if (event == JSON_KEY) {
+      key = json_decode_token(&reader, arena, &ok);
+    } else if (event == JSON_OBJECT_END || event == JSON_ARRAY_END) {
+      depth = depth - 1;
+    } else {
+      var v: JsonValue* = (JsonValue*)0;
+      switch (event) {
+        case 1: { v = json_node(arena, JSON_KIND_OBJECT); }
+        case 3: { v = json_node(arena, JSON_KIND_ARRAY); }
+        case 6: {
+          v = json_node(arena, JSON_KIND_STRING);
+          if (v != 0) { v->text = json_decode_token(&reader, arena, &ok); }
+        }
+        case 7: {
+          v = json_node(arena, JSON_KIND_NUMBER);
+          if (v != 0) { v->text = json_copy_text(arena, json_token(&reader)); }
+        }
+        case 8: {
+          v = json_node(arena, JSON_KIND_BOOL);
+          if (v != 0) { v->boolean = true; }
+        }
+        case 9: { v = json_node(arena, JSON_KIND_BOOL); }
+        default: { v = json_node(arena, JSON_KIND_NULL); }
+      }
+      if (v == 0 || !ok) { return json_fail_at(reader.at, "out of memory"); }
+      if (depth == 0) {
+        root = v;
+      } else {
+        var parent: JsonValue* = stack[depth - 1];
+        if (parent->kind == JSON_KIND_OBJECT) { v->key = key; }
+        json_append_child(parent, v);
+      }
+      if (event == JSON_OBJECT_START || event == JSON_ARRAY_START) {
+        stack[depth] = v;
+        depth = depth + 1;
+      }
+    }
+    event = json_next(&reader);
+  }
+  if (root == 0) { return json_fail_at((int64)0, "empty document"); }
+  return Ok(root);
+}
+
+// ---- Reading the tree -------------------------------------------------------
+//
+// Every reader takes a null pointer and treats it as missing, so lookups
+// chain: json_int_or(json_get(json_get(cfg, "server"), "port"), 8080).
+
+export fn json_kind(v: JsonValue*) -> int32 {
+  if (v == 0) { return -1; }
+  return v->kind;
+}
+
+export fn json_len(v: JsonValue*) -> int64 {
+  if (v == 0) { return 0; }
+  return v->count;
+}
+
+// The first member named key, or null.
+export fn json_get(obj: JsonValue*, key: string) -> JsonValue* {
+  if (obj == 0 || obj->kind != JSON_KIND_OBJECT) { return (JsonValue*)0; }
+  var c: JsonValue* = obj->first;
+  while (c != 0) {
+    if (c->key == key) { return c; }
+    c = c->next;
+  }
+  return (JsonValue*)0;
+}
+
+export fn json_has(obj: JsonValue*, key: string) -> bool {
+  return json_get(obj, key) != 0;
+}
+
+// The element at index, or null.
+export fn json_at(arr: JsonValue*, index: int64) -> JsonValue* {
+  if (arr == 0 || arr->kind != JSON_KIND_ARRAY || index < 0) { return (JsonValue*)0; }
+  var c: JsonValue* = arr->first;
+  var i: int64 = 0;
+  while (c != 0 && i < index) {
+    c = c->next;
+    i = i + 1;
+  }
+  return c;
+}
+
+export fn json_is_null(v: JsonValue*) -> bool {
+  return v != 0 && v->kind == JSON_KIND_NULL;
+}
+
+// A number with no fraction or exponent that fits in int64.
+export fn json_int(v: JsonValue*) -> Option<int64> {
+  if (v == 0 || v->kind != JSON_KIND_NUMBER) { return None; }
+  var n: int64 = 0;
+  if (!i64_parse(v->text.chars, (int64)v->text.length, &n)) { return None; }
+  return Some(n);
+}
+
+// Any number, correctly rounded.
+export fn json_float(v: JsonValue*) -> Option<float64> {
+  if (v == 0 || v->kind != JSON_KIND_NUMBER) { return None; }
+  return Some(f64_parse(v->text.chars, (int64)v->text.length));
+}
+
+export fn json_bool(v: JsonValue*) -> Option<bool> {
+  if (v == 0 || v->kind != JSON_KIND_BOOL) { return None; }
+  return Some(v->boolean);
+}
+
+// A string's decoded text. The view lives as long as the arena.
+export fn json_str(v: JsonValue*) -> Option<string> {
+  if (v == 0 || v->kind != JSON_KIND_STRING) { return None; }
+  return Some(v->text);
+}
+
+export fn json_int_or(v: JsonValue*, fallback: int64) -> int64 {
+  match (json_int(v)) {
+    case Some(n): { return n; }
+    case None: { return fallback; }
+  }
+}
+
+export fn json_float_or(v: JsonValue*, fallback: float64) -> float64 {
+  match (json_float(v)) {
+    case Some(f): { return f; }
+    case None: { return fallback; }
+  }
+}
+
+export fn json_bool_or(v: JsonValue*, fallback: bool) -> bool {
+  if (v == 0 || v->kind != JSON_KIND_BOOL) { return fallback; }
+  return v->boolean;
+}
+
+export fn json_str_or(v: JsonValue*, fallback: string) -> string {
+  if (v == 0 || v->kind != JSON_KIND_STRING) { return fallback; }
+  return v->text;
+}
+
+fn json_pointer_digit(c: int32) -> bool {
+  return c >= 48 && c <= 57;
+}
+
+// RFC 6901 lookup: "" is v itself, "/a/0/b" walks member a, element 0,
+// member b. "~0" stands for "~" and "~1" for "/". Returns null when any
+// step is missing.
+export fn json_pointer(v: JsonValue*, path: string) -> JsonValue* {
+  var cur: JsonValue* = v;
+  var at: int64 = 0;
+  var n: int64 = (int64)path.length;
+  if (n == 0) { return cur; }
+  if ((int32)path[0] != 47) { return (JsonValue*)0; }
+  var part: uint8[256];
+  while (at < n && cur != 0) {
+    at = at + 1;   // past '/'
+    var len: int64 = 0;
+    while (at < n && (int32)path[at] != 47) {
+      var c: int32 = (int32)path[at];
+      if (c == 126 && at + 1 < n) {
+        var e: int32 = (int32)path[at + 1];
+        if (e == 48) { c = 126; } else if (e == 49) { c = 47; } else { return (JsonValue*)0; }
+        at = at + 1;
+      }
+      if (len >= 256) { return (JsonValue*)0; }
+      part[len] = (uint8)c;
+      len = len + 1;
+      at = at + 1;
+    }
+    var name: string;
+    name.chars = &part[0];
+    name.length = (uint64)len;
+    if (cur->kind == JSON_KIND_OBJECT) {
+      cur = json_get(cur, name);
+    } else if (cur->kind == JSON_KIND_ARRAY) {
+      if (len == 0 || (len > 1 && part[0] == (uint8)48)) { return (JsonValue*)0; }
+      var index: int64 = 0;
+      for i in 0..len {
+        if (!json_pointer_digit((int32)part[i])) { return (JsonValue*)0; }
+        index = index * 10 + (int64)((int32)part[i] - 48);
+      }
+      cur = json_at(cur, index);
+    } else {
+      return (JsonValue*)0;
+    }
+  }
+  return cur;
+}
+
+// ---- Building a tree --------------------------------------------------------
+//
+// The constructors return null when the arena is out of memory. Text is
+// copied into the arena.
+
+export fn json_new_null(arena: Arena*) -> JsonValue* { return json_node(arena, JSON_KIND_NULL); }
+export fn json_new_object(arena: Arena*) -> JsonValue* { return json_node(arena, JSON_KIND_OBJECT); }
+export fn json_new_array(arena: Arena*) -> JsonValue* { return json_node(arena, JSON_KIND_ARRAY); }
+
+export fn json_new_bool(arena: Arena*, b: bool) -> JsonValue* {
+  var v: JsonValue* = json_node(arena, JSON_KIND_BOOL);
+  if (v != 0) { v->boolean = b; }
+  return v;
+}
+
+export fn json_new_string(arena: Arena*, s: string) -> JsonValue* {
+  var v: JsonValue* = json_node(arena, JSON_KIND_STRING);
+  if (v != 0) { v->text = json_copy_text(arena, s); }
+  return v;
+}
+
+export fn json_new_int(arena: Arena*, n: int64) -> JsonValue* {
+  var buf: uint8[24];
+  var s: string = i64_to_str(n, &buf[0], (int64)24);
+  var v: JsonValue* = json_node(arena, JSON_KIND_NUMBER);
+  if (v != 0) { v->text = json_copy_text(arena, s); }
+  return v;
+}
+
+// NaN and infinities have no JSON form and become null.
+export fn json_new_float(arena: Arena*, f: float64) -> JsonValue* {
+  var buf: uint8[32];
+  var n: int64 = f64_format(f, &buf[0], (int64)32);
+  if (n < 0 || buf[0] == (uint8)78 || buf[0] == (uint8)105 || (buf[0] == (uint8)45 && buf[1] == (uint8)105)) {
+    return json_node(arena, JSON_KIND_NULL);
+  }
+  var s: string;
+  s.chars = &buf[0];
+  s.length = (uint64)n;
+  var v: JsonValue* = json_node(arena, JSON_KIND_NUMBER);
+  if (v != 0) { v->text = json_copy_text(arena, s); }
+  return v;
+}
+
+// Appends to an array. Returns false if arr is not an array or v is null.
+export fn json_push(arr: JsonValue*, v: JsonValue*) -> bool {
+  if (arr == 0 || v == 0 || arr->kind != JSON_KIND_ARRAY) { return false; }
+  v->next = (JsonValue*)0;
+  json_append_child(arr, v);
+  return true;
+}
+
+// Sets a member, replacing the first one with the same key in place, or
+// appending. Returns false if obj is not an object or v is null.
+export fn json_set(obj: JsonValue*, key: string, v: JsonValue*) -> bool {
+  if (obj == 0 || v == 0 || obj->kind != JSON_KIND_OBJECT) { return false; }
+  var prev: JsonValue* = (JsonValue*)0;
+  var c: JsonValue* = obj->first;
+  while (c != 0) {
+    if (c->key == key) {
+      v->key = c->key;
+      v->next = c->next;
+      if (prev == 0) { obj->first = v; } else { prev->next = v; }
+      if (obj->last == c) { obj->last = v; }
+      return true;
+    }
+    prev = c;
+    c = c->next;
+  }
+  v->key = json_copy_text(obj->arena, key);
+  v->next = (JsonValue*)0;
+  json_append_child(obj, v);
+  return true;
+}
+
+// Removes the first member named key. Returns false if there was none.
+export fn json_remove(obj: JsonValue*, key: string) -> bool {
+  if (obj == 0 || obj->kind != JSON_KIND_OBJECT) { return false; }
+  var prev: JsonValue* = (JsonValue*)0;
+  var c: JsonValue* = obj->first;
+  while (c != 0) {
+    if (c->key == key) {
+      if (prev == 0) { obj->first = c->next; } else { prev->next = c->next; }
+      if (obj->last == c) { obj->last = prev; }
+      obj->count = obj->count - 1;
+      return true;
+    }
+    prev = c;
+    c = c->next;
+  }
+  return false;
+}
+
+// ---- Writing ----------------------------------------------------------------
+
+// Appends s as a quoted JSON string. Quotes, backslashes and control bytes
+// are escaped; other bytes pass through as they are.
+export fn json_escape_into(b: StrBuf*, s: string) -> int32 {
+  var hex: string = "0123456789abcdef";
+  if (strbuf_append_byte(b, (uint8)34) == 0) { return 0; }
+  var run: int64 = 0;
+  var n: int64 = (int64)s.length;
+  for i in 0..n {
+    var c: int32 = (int32)s.chars[i];
+    if (c >= 32 && c != 34 && c != 92) { continue; }
+    if (i > run) {
+      if (strbuf_append_bytes(b, (cstring)(s.chars + run), i - run) == 0) { return 0; }
+    }
+    run = i + 1;
+    var esc: int32 = 0;
+    switch (c) {
+      case 34: { esc = 34; }
+      case 92: { esc = 92; }
+      case 8: { esc = 98; }
+      case 12: { esc = 102; }
+      case 10: { esc = 110; }
+      case 13: { esc = 114; }
+      case 9: { esc = 116; }
+      default: { }
+    }
+    if (strbuf_append_byte(b, (uint8)92) == 0) { return 0; }
+    if (esc != 0) {
+      if (strbuf_append_byte(b, (uint8)esc) == 0) { return 0; }
+    } else {
+      if (strbuf_append_cstr(b, "u00") == 0) { return 0; }
+      if (strbuf_append_byte(b, (uint8)hex[(int64)(c >> 4)]) == 0) { return 0; }
+      if (strbuf_append_byte(b, (uint8)hex[(int64)(c & 15)]) == 0) { return 0; }
+    }
+  }
+  if (n > run) {
+    if (strbuf_append_bytes(b, (cstring)(s.chars + run), n - run) == 0) { return 0; }
+  }
+  return strbuf_append_byte(b, (uint8)34);
+}
+
+// Writes JSON one piece at a time into a StrBuf and checks the order of the
+// calls: a key only inside an object, a value after each key, closes that
+// match their opens. A misplaced call marks the writer failed; check
+// json_writer_finish at the end.
+//
+// For streaming, json_writer_flush_to passes the buffered text to a callback
+// whenever it grows past a threshold, then empties the buffer.
+export struct JsonWriter {
+  out: StrBuf*;
+  indent: int32;          // spaces per level; 0 writes compact JSON
+  depth: int32;
+  kind: uint8[128];       // 1 object, 2 array, per open level
+  items: uint8[128];      // 1 once a level has a value
+  after_key: bool;
+  done: bool;
+  failed: bool;
+  has_flush: bool;
+  flush_at: int64;
+  flush: Fn(string) -> bool;
+}
+
+export fn json_writer_init(w: JsonWriter*, out: StrBuf*, indent: int32) {
+  w->out = out;
+  w->indent = indent;
+  w->depth = 0;
+  w->after_key = false;
+  w->done = false;
+  w->failed = out == 0;
+  w->has_flush = false;
+  w->flush_at = 0;
+}
+
+// Calls flush with the buffered text each time it reaches threshold bytes
+// after a value, and once more from json_writer_finish. A false return marks
+// the writer failed.
+export fn json_writer_flush_to(w: JsonWriter*, flush: Fn(string) -> bool, threshold: int64) {
+  w->flush = flush;
+  w->has_flush = true;
+  w->flush_at = threshold;
+}
+
+fn json_w_drain(w: JsonWriter*) {
+  if (!w->has_flush || w->out->len == 0) { return; }
+  var s: string;
+  s.chars = (uint8*)w->out->data;
+  s.length = (uint64)w->out->len;
+  var f: Fn(string) -> bool = w->flush;
+  if (!f(s)) { w->failed = true; }
+  w->out->len = 0;
+}
+
+fn json_w_newline(w: JsonWriter*) {
+  if (w->indent <= 0) { return; }
+  if (strbuf_append_byte(w->out, (uint8)10) == 0) { w->failed = true; }
+  for i in 0..((int64)w->depth * (int64)w->indent) {
+    if (strbuf_append_byte(w->out, (uint8)32) == 0) { w->failed = true; }
+  }
+}
+
+// Called before each value: checks the slot and writes any comma and indent.
+fn json_w_value_slot(w: JsonWriter*) -> bool {
+  if (w->failed) { return false; }
+  if (w->depth == 0) {
+    if (w->done) {
+      w->failed = true;
+      return false;
+    }
+    return true;
+  }
+  var level: int32 = w->depth - 1;
+  if (w->kind[level] == (uint8)1) {
+    if (!w->after_key) {
+      w->failed = true;
+      return false;
+    }
+    w->after_key = false;
+    return true;
+  }
+  if (w->items[level] != (uint8)0) {
+    if (strbuf_append_byte(w->out, (uint8)44) == 0) { w->failed = true; }
+  }
+  w->items[level] = (uint8)1;
+  json_w_newline(w);
+  return !w->failed;
+}
+
+fn json_w_value_done(w: JsonWriter*) {
+  if (w->depth == 0) { w->done = true; }
+  if (w->has_flush && w->out->len >= w->flush_at) { json_w_drain(w); }
+}
+
+fn json_w_put(w: JsonWriter*, s: string) {
+  if (strbuf_append_string(w->out, s) == 0) { w->failed = true; }
+}
+
+export fn json_key(w: JsonWriter*, key: string) {
+  if (w->failed) { return; }
+  if (w->depth == 0 || w->kind[w->depth - 1] != (uint8)1 || w->after_key) {
+    w->failed = true;
+    return;
+  }
+  var level: int32 = w->depth - 1;
+  if (w->items[level] != (uint8)0) {
+    if (strbuf_append_byte(w->out, (uint8)44) == 0) { w->failed = true; }
+  }
+  w->items[level] = (uint8)1;
+  json_w_newline(w);
+  if (json_escape_into(w->out, key) == 0) { w->failed = true; }
+  if (w->indent > 0) { json_w_put(w, ": "); } else { json_w_put(w, ":"); }
+  w->after_key = true;
+}
+
+fn json_w_open(w: JsonWriter*, kind: int32, c: int32) {
+  if (!json_w_value_slot(w)) { return; }
+  if (w->depth >= 128) {
+    w->failed = true;
+    return;
+  }
+  if (strbuf_append_byte(w->out, (uint8)c) == 0) { w->failed = true; }
+  w->kind[w->depth] = (uint8)kind;
+  w->items[w->depth] = (uint8)0;
+  w->depth = w->depth + 1;
+}
+
+fn json_w_close(w: JsonWriter*, kind: int32, c: int32) {
+  if (w->failed) { return; }
+  if (w->depth == 0 || w->kind[w->depth - 1] != (uint8)kind || w->after_key) {
+    w->failed = true;
+    return;
+  }
+  var had: bool = w->items[w->depth - 1] != (uint8)0;
+  w->depth = w->depth - 1;
+  if (had) { json_w_newline(w); }
+  if (strbuf_append_byte(w->out, (uint8)c) == 0) { w->failed = true; }
+  json_w_value_done(w);
+}
+
+export fn json_object_begin(w: JsonWriter*) { json_w_open(w, 1, 123); }
+export fn json_object_end(w: JsonWriter*) { json_w_close(w, 1, 125); }
+export fn json_array_begin(w: JsonWriter*) { json_w_open(w, 2, 91); }
+export fn json_array_end(w: JsonWriter*) { json_w_close(w, 2, 93); }
+
+export fn json_write_string(w: JsonWriter*, s: string) {
+  if (!json_w_value_slot(w)) { return; }
+  if (json_escape_into(w->out, s) == 0) { w->failed = true; }
+  json_w_value_done(w);
+}
+
+export fn json_write_int(w: JsonWriter*, n: int64) {
+  if (!json_w_value_slot(w)) { return; }
+  if (strbuf_append_int(w->out, n) == 0) { w->failed = true; }
+  json_w_value_done(w);
+}
+
+export fn json_write_uint(w: JsonWriter*, n: uint64) {
+  if (!json_w_value_slot(w)) { return; }
+  if (strbuf_append_uint(w->out, n) == 0) { w->failed = true; }
+  json_w_value_done(w);
+}
+
+// The shortest text that reads back to f. NaN and infinities become null.
+export fn json_write_float(w: JsonWriter*, f: float64) {
+  if (!json_w_value_slot(w)) { return; }
+  var buf: uint8[32];
+  var n: int64 = f64_format(f, &buf[0], (int64)32);
+  if (n < 0 || buf[0] == (uint8)78 || buf[0] == (uint8)105 || (buf[0] == (uint8)45 && buf[1] == (uint8)105)) {
+    json_w_put(w, "null");
+  } else if (strbuf_append_bytes(w->out, (cstring)&buf[0], n) == 0) {
+    w->failed = true;
+  }
+  json_w_value_done(w);
+}
+
+export fn json_write_bool(w: JsonWriter*, b: bool) {
+  if (!json_w_value_slot(w)) { return; }
+  if (b) { json_w_put(w, "true"); } else { json_w_put(w, "false"); }
+  json_w_value_done(w);
+}
+
+export fn json_write_null(w: JsonWriter*) {
+  if (!json_w_value_slot(w)) { return; }
+  json_w_put(w, "null");
+  json_w_value_done(w);
+}
+
+// Writes text that is already JSON, as one value. It is not checked.
+export fn json_write_raw(w: JsonWriter*, text: string) {
+  if (!json_w_value_slot(w)) { return; }
+  json_w_put(w, text);
+  json_w_value_done(w);
+}
+
+// Writes a whole tree.
+export fn json_write_value(w: JsonWriter*, v: JsonValue*) {
+  if (v == 0) {
+    w->failed = true;
+    return;
+  }
+  switch (v->kind) {
+    case 0: { json_write_null(w); }
+    case 1: { json_write_bool(w, v->boolean); }
+    case 2: { json_write_raw(w, v->text); }
+    case 3: { json_write_string(w, v->text); }
+    case 4: {
+      json_array_begin(w);
+      var c: JsonValue* = v->first;
+      while (c != 0) {
+        json_write_value(w, c);
+        c = c->next;
+      }
+      json_array_end(w);
+    }
+    default: {
+      json_object_begin(w);
+      var m: JsonValue* = v->first;
+      while (m != 0) {
+        json_key(w, m->key);
+        json_write_value(w, m);
+        m = m->next;
+      }
+      json_object_end(w);
+    }
+  }
+}
+
+// True when exactly one complete value was written and nothing failed.
+// Passes any text still buffered to the flush callback.
+export fn json_writer_finish(w: JsonWriter*) -> bool {
+  if (!w->failed && (w->depth != 0 || !w->done)) { w->failed = true; }
+  json_w_drain(w);
+  return !w->failed;
+}
+
+// The tree as JSON text in arena. indent 0 is compact. Returns an empty
+// string on failure.
+export fn json_stringify(arena: Arena*, v: JsonValue*, indent: int32) -> string {
+  var empty: string;
+  var b: StrBuf* = strbuf_new(arena, (int64)256);
+  if (b == 0) { return empty; }
+  var w: JsonWriter;
+  json_writer_init(&w, b, indent);
+  json_write_value(&w, v);
+  if (!json_writer_finish(&w)) { return empty; }
+  return strbuf_finish_string(b);
+}

@@ -1833,6 +1833,11 @@ $cases = @(
   # natively in both modes and under the compile-time interpreter.
   @{ Name = "views"; Path = "tests/test_views.mettle"; ShouldSucceed = $true },
   @{ Name = "views_release"; Path = "tests/test_views.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_json"; Path = "tests/test_std_json.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_json_release"; Path = "tests/test_std_json.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_json_interp"; Path = "tests/test_std_json_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
   @{ Name = "views_interp"; Path = "tests/test_views.mettle"; ShouldSucceed = $true
      Args = @("test")
      SkipBinaryCheck = $true

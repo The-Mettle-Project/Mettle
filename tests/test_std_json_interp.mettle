@@ -1,0 +1,24 @@
+// std/floatconv and std/json run in the compile-time interpreter.
+import "std/json";
+
+@test fn floats_format_in_the_interpreter() -> int32 {
+  var buf: uint8[400];
+  var n: int64 = f64_format(0.1 + 0.2, &buf[0], (int64)400);
+  if (n != (int64)19 || buf[18] != (uint8)52) { return 1; }
+  n = f64_format_fixed(1234.5678, 2, false, &buf[0], (int64)400);
+  if (n != (int64)7 || buf[6] != (uint8)55) { return 2; }
+  return 0;
+}
+
+@test fn json_parses_in_the_interpreter() -> int32 {
+  var arena: Arena* = arena_init((int64)0);
+  match (json_parse(arena, "{{\"a\": [1, 2, 3]}")) {
+    case Ok(v): {
+      if (json_int_or(json_at(json_get(v, "a"), 2), 0) != (int64)3) { return 1; }
+      if (json_stringify(arena, v, 0) != "{{\"a\":[1,2,3]}") { return 2; }
+    }
+    case Err(e): { return 3; }
+  }
+  arena_free(arena);
+  return 0;
+}

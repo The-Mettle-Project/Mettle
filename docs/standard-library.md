@@ -153,6 +153,92 @@ nonzero unused trailing bits. Empty input succeeds with a null destination and
 zero capacity. For nonempty output, the destination must be large enough and
 must not overlap the source. `Err` carries a static reason string.
 
+## std/floatconv
+
+Exact conversion between decimal text and `float64`. Both platforms, and it
+runs in the compile-time interpreter.
+
+| Function | Effect |
+|----------|--------|
+| `f64_parse(text: uint8*, length: int64) -> float64` | Nearest double to a decimal number, correctly rounded |
+| `i64_parse(text: uint8*, length: int64, out: int64*) -> bool` | An integer with no fraction or exponent that fits `int64` |
+| `f64_format(v: float64, buf: uint8*, cap: int64) -> int64` | Shortest text that reads back to `v`: `0.1`, `100`, `1e21`, `1.5e-7` |
+| `f64_format_plain(v, buf, cap) -> int64` | The same digits, never with an exponent |
+| `f64_format_fixed(v, decimals: int32, trim: bool, buf, cap) -> int64` | Rounded to `decimals` places, half to even on the exact value |
+
+The formatters write into `buf`, add a nul, and return the length, or -1 if
+`buf` is too small. They allocate nothing. `NaN`, `inf` and `-inf` are spelled
+out, and `-0` prints as `0`. `f64_format` uses an exponent only below `1e-6`
+and from `1e21` up, as JSON and JavaScript do. `F64_FORMAT_MAX` (32) bytes is
+always enough for it.
+
+## std/json
+
+RFC 8259 JSON: a pull reader, a tree, and a streaming writer. Both platforms,
+and it runs in the compile-time interpreter.
+
+The reader allocates nothing. `json_begin(&reader, text)` starts it, and
+`json_next(&reader) -> int32` returns the next event: `JSON_OBJECT_START`,
+`JSON_OBJECT_END`, `JSON_ARRAY_START`, `JSON_ARRAY_END`, `JSON_KEY`,
+`JSON_STRING`, `JSON_NUMBER`, `JSON_TRUE`, `JSON_FALSE`, `JSON_NULL`,
+`JSON_END` or `JSON_ERROR`. On the current token, `json_text_is`,
+`json_string_length` and `json_string_copy` decode escapes to UTF-8,
+`json_read_int64` and `json_read_float64` read numbers, `json_token` gives the
+raw text, and `json_skip` jumps past a container. `json_error_offset` gives the
+byte where a document went wrong. Nesting stops at 128 levels.
+
+`json_parse(arena: Arena*, text: string) -> Result<JsonValue*, JsonError>`
+builds a tree in an arena. A `JsonValue` has a `kind` (`JSON_KIND_NULL`,
+`_BOOL`, `_NUMBER`, `_STRING`, `_ARRAY`, `_OBJECT`), and the children of an
+array or object hang off `first`, linked by `next`, in document order. Numbers
+keep their text, so `int64` values stay exact. `JsonError` has the byte
+`offset` and a `message`.
+
+Every reader below takes a null pointer as missing, so lookups chain:
+`json_int_or(json_get(json_get(cfg, "server"), "port"), 8080)`.
+
+| Function | Effect |
+|----------|--------|
+| `json_get(obj, key) -> JsonValue*` | First member named `key`, or null |
+| `json_at(arr, index: int64) -> JsonValue*` | Element at `index`, or null |
+| `json_pointer(v, path: string) -> JsonValue*` | RFC 6901 lookup, `"/tags/2/name"` |
+| `json_kind(v) -> int32`, `json_len(v) -> int64`, `json_has(obj, key)`, `json_is_null(v)` | Shape |
+| `json_int(v) -> Option<int64>`, `json_float(v) -> Option<float64>`, `json_bool(v) -> Option<bool>`, `json_str(v) -> Option<string>` | Typed reads |
+| `json_int_or(v, fallback)`, `json_float_or`, `json_bool_or`, `json_str_or` | Typed reads with a default |
+
+To build a tree, use `json_new_null`, `json_new_bool`, `json_new_int`,
+`json_new_float`, `json_new_string`, `json_new_array` and `json_new_object`,
+which all take the arena first, then `json_push(arr, v)`, `json_set(obj, key,
+v)` (replaces the first member with that key) and `json_remove(obj, key)`.
+Text is copied into the arena. `json_stringify(arena, v, indent) -> string`
+writes a tree out; `indent` 0 is compact.
+
+`JsonWriter` writes JSON into a `StrBuf` one piece at a time:
+
+```mettle
+var w: JsonWriter;
+json_writer_init(&w, buf, 0);          // indent 0 is compact
+json_object_begin(&w);
+json_key(&w, "id");
+json_write_int(&w, 7);
+json_key(&w, "tags");
+json_array_begin(&w);
+json_write_string(&w, "a");
+json_array_end(&w);
+json_object_end(&w);
+if (!json_writer_finish(&w)) { /* a call was out of order */ }
+```
+
+The value writers are `json_write_string`, `json_write_int`,
+`json_write_uint`, `json_write_float` (shortest form; NaN and infinities become
+`null`), `json_write_bool`, `json_write_null`, `json_write_raw` (text that is
+already JSON) and `json_write_value` (a tree). The writer checks the order of
+the calls; `json_writer_finish` returns false if one was out of place or a
+container is still open. `json_writer_flush_to(&w, f: Fn(string) -> bool,
+threshold)` hands the buffered text to `f` each time it reaches `threshold`
+bytes, then empties the buffer, so a large document can go out as it is
+written. `json_escape_into(b: StrBuf*, s: string)` appends one quoted string.
+
 ## std/math
 
 Floating-point maths in Mettle source, no libm on the link line. Both

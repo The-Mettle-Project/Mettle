@@ -1,0 +1,232 @@
+// std/json and std/floatconv: reader, tree, writer, float text.
+import "std/json";
+import "std/mem";
+
+fn same(buf: uint8*, n: int64, want: string) -> bool {
+  if (n != (int64)want.length) { return false; }
+  for i in 0..n {
+    if ((int32)buf[i] != (int32)want[i]) { return false; }
+  }
+  return true;
+}
+
+fn fmt_is(v: float64, want: string) -> bool {
+  var buf: uint8[32];
+  return same(&buf[0], f64_format(v, &buf[0], (int64)32), want);
+}
+
+fn fixed_is(v: float64, places: int32, trim: bool, want: string) -> bool {
+  var buf: uint8[400];
+  return same(&buf[0], f64_format_fixed(v, places, trim, &buf[0], (int64)400), want);
+}
+
+fn bits(v: float64) -> uint64 {
+  var b: uint64 = *(uint64*)&v;
+  return b;
+}
+
+fn from_bits(b: uint64) -> float64 {
+  var v: float64 = *(float64*)&b;
+  return v;
+}
+
+fn parse_is(text: string, want: uint64) -> bool {
+  return bits(f64_parse(text.chars, (int64)text.length)) == want;
+}
+
+fn count_events(document: string) -> int32 {
+  var reader: JsonReader;
+  json_begin(&reader, document);
+  var total: int32 = 0;
+  var event: int32 = json_next(&reader);
+  while (event != JSON_END) {
+    if (event == JSON_ERROR) { return -1; }
+    total = total + 1;
+    event = json_next(&reader);
+  }
+  return total;
+}
+
+fn text_of(arena: Arena*, v: JsonValue*, indent: int32) -> string {
+  return json_stringify(arena, v, indent);
+}
+
+var g_flushed: int32 = 0;
+var g_flush_bytes: int64 = 0;
+
+fn main() -> int32 {
+  // ---- floatconv: parsing (from the registry package's tests) ----
+  if (!parse_is("0.1", (uint64)0x3FB999999999999A)) { return 1; }
+  if (!parse_is("1e23", (uint64)0x44B52D02C7E14AF6)) { return 2; }
+  if (!parse_is("2.2250738585072011e-308", (uint64)0x000FFFFFFFFFFFFF)) { return 3; }
+  if (!parse_is("5e-324", (uint64)1)) { return 4; }
+  var n: int64 = 0;
+  if (!i64_parse("-9223372036854775808".chars, (int64)20, &n) || n != (int64)(0 - (uint64)0x8000000000000000)) { return 5; }
+  if (i64_parse("9223372036854775808".chars, (int64)19, &n)) { return 6; }
+
+  // ---- floatconv: shortest form ----
+  if (!fmt_is(0.1, "0.1")) { return 10; }
+  if (!fmt_is(1.5, "1.5")) { return 11; }
+  if (!fmt_is(100.0, "100")) { return 12; }
+  if (!fmt_is(0.1 + 0.2, "0.30000000000000004")) { return 13; }
+  if (!fmt_is(1e21, "1e21")) { return 14; }
+  if (!fmt_is(1e20, "100000000000000000000")) { return 15; }
+  if (!fmt_is(1.5e-7, "1.5e-7")) { return 16; }
+  if (!fmt_is(0.000001, "0.000001")) { return 17; }
+  if (!fmt_is(from_bits((uint64)1), "5e-324")) { return 18; }
+  if (!fmt_is(from_bits((uint64)0x7FEFFFFFFFFFFFFF), "1.7976931348623157e308")) { return 19; }
+  if (!fmt_is(from_bits((uint64)0x8000000000000000), "0")) { return 20; }
+  if (!fmt_is(-2.5, "-2.5")) { return 21; }
+  if (!fmt_is(9007199254740992.0, "9007199254740992")) { return 22; }
+  if (!fmt_is(123456.789, "123456.789")) { return 23; }
+  if (!fmt_is(from_bits((uint64)0x7FF0000000000000), "inf")) { return 24; }
+  if (!fmt_is(from_bits((uint64)0xFFF0000000000000), "-inf")) { return 25; }
+  if (!fmt_is(from_bits((uint64)0x7FF8000000000000), "NaN")) { return 26; }
+  var pb: uint8[400];
+  if (!same(&pb[0], f64_format_plain(1e21, &pb[0], (int64)400), "1000000000000000000000")) { return 27; }
+  if (!same(&pb[0], f64_format_plain(1.5e-7, &pb[0], (int64)400), "0.00000015")) { return 28; }
+  var tiny: uint8[8];
+  if (f64_format(123456.789, &tiny[0], (int64)8) != (int64)-1) { return 29; }
+
+  // Random doubles read back to the same bits.
+  var seed: uint64 = (uint64)0x9E3779B97F4A7C15;
+  for i in 0..3000 {
+    seed = seed * (uint64)6364136223846793005 + (uint64)1442695040888963407;
+    var b: uint64 = seed;
+    if (((b >> 52) & (uint64)0x7FF) == (uint64)0x7FF) { continue; }
+    var buf: uint8[32];
+    var len: int64 = f64_format(from_bits(b), &buf[0], (int64)32);
+    if (len <= 0) { return 30; }
+    var back: uint64 = bits(f64_parse(&buf[0], len));
+    if (back != b && !(b == (uint64)0x8000000000000000 && back == (uint64)0)) { return 31; }
+  }
+
+  // ---- floatconv: fixed ----
+  if (!fixed_is(2.5, 0, false, "2")) { return 40; }
+  if (!fixed_is(3.5, 0, false, "4")) { return 41; }
+  if (!fixed_is(1.005, 2, false, "1.00")) { return 42; }
+  if (!fixed_is(1.005, 2, true, "1")) { return 43; }
+  if (!fixed_is(0.125, 2, false, "0.12")) { return 44; }
+  if (!fixed_is(-0.001, 2, false, "0.00")) { return 45; }
+  if (!fixed_is(99.999, 2, false, "100.00")) { return 46; }
+  if (!fixed_is(1234.5678, 3, false, "1234.568")) { return 47; }
+  if (!fixed_is(0.1, 20, false, "0.10000000000000000555")) { return 48; }
+  if (!fixed_is(-12.0, 1, true, "-12")) { return 49; }
+
+  // ---- reader ----
+  if (count_events("{{\"a\": [1, 2.5e3, true, false, null, \"x\"], \"b\": {{}}") != 14) { return 50; }
+  if (count_events("[1,]") != -1) { return 51; }
+  if (count_events("{{\"a\" 1}") != -1) { return 52; }
+  if (count_events("01") != -1) { return 53; }
+  if (count_events("[1] 2") != -1) { return 54; }
+
+  // ---- tree ----
+  var arena: Arena* = arena_init((int64)0);
+  if (arena == 0) { return 60; }
+  var doc: string = "{{\"name\": \"caf\\u00e9 \\\"x\\\"\", \"port\": 8080, \"big\": 9007199254740993, \"ratio\": 0.25, \"on\": true, \"none\": null, \"tags\": [\"a\", \"b\", {{\"c/d\": [10, 20]}]}";
+  var root: JsonValue* = (JsonValue*)0;
+  match (json_parse(arena, doc)) {
+    case Ok(v): { root = v; }
+    case Err(e): { return 61; }
+  }
+  if (json_kind(root) != JSON_KIND_OBJECT || json_len(root) != (int64)7) { return 62; }
+  var name: string = json_str_or(json_get(root, "name"), "");
+  if (name.length != (uint64)9 || name[3] != (char)0xC3 || name[4] != (char)0xA9 || name[6] != '"') { return 63; }
+  if (json_int_or(json_get(root, "port"), 0) != (int64)8080) { return 64; }
+  if (json_int_or(json_get(root, "big"), 0) != (int64)9007199254740993) { return 65; }
+  if (json_float_or(json_get(root, "ratio"), 0.0) != 0.25) { return 66; }
+  if (!json_bool_or(json_get(root, "on"), false)) { return 67; }
+  if (!json_is_null(json_get(root, "none")) || json_is_null(json_get(root, "missing"))) { return 68; }
+  if (json_int_or(json_get(root, "missing"), 7) != (int64)7) { return 69; }
+  if (json_int_or(json_get(root, "ratio"), -1) != (int64)-1) { return 70; }
+  if (json_str_or(json_at(json_get(root, "tags"), 1), "") != "b") { return 71; }
+  if (json_at(json_get(root, "tags"), 5) != 0) { return 72; }
+  if (json_int_or(json_pointer(root, "/tags/2/c~1d/1"), 0) != (int64)20) { return 73; }
+  if (json_pointer(root, "") != root || json_pointer(root, "/tags/01") != 0) { return 74; }
+  match (json_parse(arena, "{{\"a\": [1, 2}")) {
+    case Ok(v): { return 75; }
+    case Err(e): { if (e.offset != (int64)11) { return 76; } }
+  }
+
+  // ---- building and writing ----
+  // "line\nnext\t\"q\" \\ " plus a 0x01 byte.
+  var ctlbuf: uint8[32];
+  var ctl: string = "line\nnext\t\"q\" \\  ";
+  for i in 0..ctl.length { ctlbuf[i] = ctl.chars[i]; }
+  ctlbuf[(int64)ctl.length - 1] = (uint8)1;
+  ctl.chars = &ctlbuf[0];
+  var obj: JsonValue* = json_new_object(arena);
+  json_set(obj, "id", json_new_int(arena, (int64)-42));
+  json_set(obj, "msg", json_new_string(arena, ctl));
+  var arr: JsonValue* = json_new_array(arena);
+  json_push(arr, json_new_float(arena, 1.5));
+  json_push(arr, json_new_float(arena, from_bits((uint64)0x7FF8000000000000)));
+  json_push(arr, json_new_bool(arena, false));
+  json_push(arr, json_new_null(arena));
+  json_set(obj, "list", arr);
+  json_set(obj, "empty", json_new_object(arena));
+  json_set(obj, "id", json_new_int(arena, (int64)7));
+  if (json_len(obj) != (int64)4) { return 80; }
+  var compact: string = text_of(arena, obj, 0);
+  if (compact != "{{\"id\":7,\"msg\":\"line\\nnext\\t\\\"q\\\" \\\\ \\u0001\",\"list\":[1.5,null,false,null],\"empty\":{{}}") { return 81; }
+  if (!json_remove(obj, "msg") || json_remove(obj, "msg")) { return 82; }
+  var pretty: string = text_of(arena, obj, 2);
+  if (pretty != "{{\n  \"id\": 7,\n  \"list\": [\n    1.5,\n    null,\n    false,\n    null\n  ],\n  \"empty\": {{}\n}") { return 83; }
+
+  // The parsed tree writes back the same data.
+  var again: string = text_of(arena, root, 0);
+  match (json_parse(arena, again)) {
+    case Ok(v): { if (text_of(arena, v, 0) != again) { return 84; } }
+    case Err(e): { return 85; }
+  }
+
+  // Writer order checks.
+  var b: StrBuf* = strbuf_new(arena, (int64)0);
+  var w: JsonWriter;
+  json_writer_init(&w, b, 0);
+  json_object_begin(&w);
+  json_write_int(&w, (int64)1);           // value without a key
+  if (json_writer_finish(&w)) { return 90; }
+  var b2: StrBuf* = strbuf_new(arena, (int64)0);
+  json_writer_init(&w, b2, 0);
+  json_array_begin(&w);
+  json_object_end(&w);                    // wrong close
+  if (json_writer_finish(&w)) { return 91; }
+  var b3: StrBuf* = strbuf_new(arena, (int64)0);
+  json_writer_init(&w, b3, 0);
+  json_array_begin(&w);
+  if (json_writer_finish(&w)) { return 92; }  // left open
+  var b5: StrBuf* = strbuf_new(arena, (int64)0);
+  json_writer_init(&w, b5, 0);
+  json_write_int(&w, (int64)1);
+  json_write_int(&w, (int64)2);           // two top-level values
+  if (json_writer_finish(&w)) { return 93; }
+
+  // Streaming: chunks reach the callback and add up to the whole text.
+  var b4: StrBuf* = strbuf_new(arena, (int64)0);
+  json_writer_init(&w, b4, 0);
+  var pf: int32* = &g_flushed;
+  var pn: int64* = &g_flush_bytes;
+  json_writer_flush_to(&w, fn(s: string) -> bool {
+    *pf = *pf + 1;
+    *pn = *pn + (int64)s.length;
+    return true;
+  }, (int64)64);
+  json_array_begin(&w);
+  for i in 0..100 {
+    json_object_begin(&w);
+    json_key(&w, "i");
+    json_write_int(&w, (int64)i);
+    json_key(&w, "half");
+    json_write_float(&w, (float64)i / 2.0);
+    json_object_end(&w);
+  }
+  json_array_end(&w);
+  if (!json_writer_finish(&w)) { return 94; }
+  if (g_flushed < 10 || strbuf_len(b4) != (int64)0) { return 95; }
+  // [ + 100 objects + 99 commas + ]
+  if (g_flush_bytes < (int64)1500) { return 96; }
+
+  arena_free(arena);
+  return 0;
+}
