@@ -1,6 +1,6 @@
-// Mettle does not infer binding types: a `var` (or local `const`) with an
-// initializer but no explicit type annotation is a compile error.
+// A global `var` keeps its written type. Only a local binding may leave it off.
+var total = 5;
+
 fn main() -> int32 {
-  var x = 5;
-  return x;
+  return total;
 }

@@ -21,7 +21,7 @@
 <p class="lede">Reported by the compiler as an error or warning.</p>
 <pre><code>mettle explain E0004</code></pre>
 
-<p>A value of one type was used where a different type is required. Mettle never infers <code>var</code>/local <code>const</code> binding types, so both sides must line up.</p>
+<p>A value of one type was used where a different type is required. A written type does not bend to fit its value, so both sides must line up.</p>
 <h3>Example</h3>
 <pre><code>var x: int64 = &quot;hello&quot;;   // expected &#x27;int64&#x27;, found &#x27;string&#x27;</code></pre>
 <h3>Fixes</h3>

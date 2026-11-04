@@ -118,8 +118,9 @@ looked at what came out. Advice that fails that test never reaches you.</p>
   </li>
   <li>
     <b>Declare what you mean. Let the compiler work out what is safe.</b>
-    <p>Every <code>var</code> carries its type; nothing is inferred. The
-    compiler works out lifetimes, aliasing, and whether a loop can vectorize.
+    <p>Signatures and fields carry their types, and a local can leave its type
+    off where the line says it. The compiler works out lifetimes, aliasing, and
+    whether a loop can vectorize.
     Types are what you meant. The rest is a consequence.</p>
   </li>
 </ul>

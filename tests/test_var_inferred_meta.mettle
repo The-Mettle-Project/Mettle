@@ -1,0 +1,23 @@
+// A generator's declared return type is `Generated`, and a call to one yields
+// the generated function. The inferred binding takes the function's type.
+import "std/io";
+import "std/meta";
+
+@generate fn copy_of(f: FunctionInfo) -> Generated {
+  var name = "{f.name}__copy";
+  var rendered = render_function(f, name);
+  return rendered;
+}
+
+fn add(a: int32, b: int32) -> int32 {
+  var total = a + b;
+  return total;
+}
+
+fn main() -> int32 {
+  var copied = copy_of(add);
+  var exact: fn(int32, int32) -> int32 = copied;
+  var got = copied(1, 2);
+  var original = add(1, 2);
+  return got - original + exact(1, 1) - 2;
+}

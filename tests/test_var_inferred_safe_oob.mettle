@@ -1,0 +1,10 @@
+// --safe must catch this through an inferred pointer and an inferred index.
+fn main() -> int32 {
+  var row = new int32[4];
+  var first = &row[0];
+  var i = 3;
+  if (i != 0) {
+    i = i + 1;
+  }
+  return first[i];
+}

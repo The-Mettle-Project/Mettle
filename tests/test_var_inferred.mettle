@@ -1,0 +1,482 @@
+import "std/io";
+
+struct Point {
+  x: int64;
+  y: int64;
+
+  method sum() -> int64 {
+    var total = this.x + this.y;
+    var exact: int64* = &total;
+    return *exact;
+  }
+}
+
+struct Box<T> {
+  value: T;
+
+  method get() -> T {
+    var held = this.value;
+    return held;
+  }
+}
+
+enum Shape {
+  Circle(int32),
+  Square(int32)
+}
+
+enum Color {
+  Red,
+  Green
+}
+
+type Meters = float64 where value >= 0.0;
+
+trait Doubler {
+  fn twice(self: Self) -> int64;
+}
+
+impl Doubler for Point {
+  fn twice(self: Self) -> int64 {
+    return (self.x + self.y) * 2;
+  }
+}
+
+var g_count: int64 = 40;
+const G_LIMIT: int16 = 9;
+const G_BARE = 11;
+
+fn origin() -> Point {
+  var p: Point = { x: 1, y: 2 };
+  return p;
+}
+
+fn box_of<T>(value: T) -> Box<T> {
+  var b: Box<T> = { value: value };
+  return b;
+}
+
+fn same<T>(value: T) -> T {
+  var held = value;
+  var other = (T)held;
+  var exact: T* = &other;
+  return *exact;
+}
+
+fn unbox<T>(b: Box<T>*) -> T {
+  return b.value;
+}
+
+fn rewrap<T>(value: T) -> T {
+  var boxed = box_of(value);
+  var copy = boxed;
+  return unbox(&copy);
+}
+
+fn hand_off(cb: fn(int32) -> int32, v: int32) -> int32 {
+  return cb(v);
+}
+
+fn make_caller() -> fn(fn(int32) -> int32, int32) -> int32 {
+  return &hand_off;
+}
+
+fn increment(x: int32) -> int32 {
+  return x + 1;
+}
+
+fn wide(value: int16) -> int64 {
+  return value;
+}
+
+fn add(a: int32, b: int32) -> int32 {
+  return a + b;
+}
+
+fn size_of_value<T>(value: T) -> int64 {
+  return sizeof(T);
+}
+
+fn Point_scaled(p: Point, by: int64) -> int64 {
+  return p.x * by;
+}
+
+fn literals() -> int32 {
+  var small = 5;
+  var hex = 0xFF;
+  var unsigned32 = 0xFFFFFFFF;
+  var big = 5000000000;
+  var fraction = 1.5;
+  var letter = 'a';
+  var text = "bytes";
+  var yes = true;
+  var negative = -7;
+  var small_is: int32* = &small;
+  var hex_is: int32* = &hex;
+  var unsigned32_is: uint32* = &unsigned32;
+  var big_is: int64* = &big;
+  var fraction_is: float64* = &fraction;
+  var letter_is: char* = &letter;
+  var text_is: string* = &text;
+  var yes_is: bool* = &yes;
+  var negative_is: int32* = &negative;
+  var lowest = -9223372036854775808;
+  var lowest_is: int64* = &lowest;
+  var top = 18446744073709551615;
+  var top_is: uint64* = &top;
+  if (*lowest_is >= 0 || *top_is == 0) {
+    return 3;
+  }
+  if (*unsigned32_is != 4294967295 || *big_is != 5000000000 ||
+      *negative_is != -7 || *small_is != 5 || *hex_is != 255 ||
+      *fraction_is != 1.5 || *letter_is != 'a' || !*yes_is ||
+      (*text_is).length != 5) {
+    return 1;
+  }
+  small = 2147483647;
+  small = small + 1;
+  if (small != -2147483648) {
+    return 2;
+  }
+  return 0;
+}
+
+fn casts_and_new() -> int32 {
+  var narrow = (int8)44;
+  var wide_one = (int64)7;
+  var single = (float32)0.5;
+  var meters = (Meters)3.0;
+  var point = new Point;
+  var row = new int32[4];
+  point.x = 9;
+  row[3] = 11;
+  var through = point.x;
+  var cell = row[3];
+  var narrow_is: int8* = &narrow;
+  var wide_is: int64* = &wide_one;
+  var single_is: float32* = &single;
+  var meters_is: Meters* = &meters;
+  var point_is: Point** = &point;
+  var row_is: int32[] = row;
+  var through_is: int64* = &through;
+  var cell_is: int32* = &cell;
+  if (*narrow_is != 44 || *through_is != 9 || *cell_is != 11 || *wide_is != 7 ||
+      *single_is != (float32)0.5 || *meters_is != (Meters)3.0 ||
+      (*point_is).x != 9 || row_is[3] != 11) {
+    return 1;
+  }
+  return 0;
+}
+
+fn calls() -> int32 {
+  var p = origin();
+  var total = p.sum();
+  var scaled = p.scaled(10);
+  var widened = wide(3);
+  var picked = add(1, 2);
+  var added = add;
+  var called = added(2, 3);
+  var boxed = box_of(7);
+  var inner = boxed.value;
+  var opened = boxed.get();
+  var explicit = same<int64>(8);
+  var inferred_arg = same(inner);
+  var doubled = p.twice();
+  var p_is: Point* = &p;
+  var total_is: int64* = &total;
+  var scaled_is: int64* = &scaled;
+  var widened_is: int64* = &widened;
+  var picked_is: int32* = &picked;
+  var added_is: fn(int32, int32) -> int32 = added;
+  var inner_is: int32* = &inner;
+  var opened_is: int32* = &opened;
+  var explicit_is: int64* = &explicit;
+  var inferred_arg_is: int32* = &inferred_arg;
+  if (p_is.x != 1 || *total_is != 3 || *scaled_is != 10 || *widened_is != 3 ||
+      *picked_is != 3 || called != 5 || added_is(1, 1) != 2 || *inner_is != 7 ||
+      *opened_is != 7 || *explicit_is != 8 || *inferred_arg_is != 7 ||
+      doubled != 6) {
+    return 1;
+  }
+  return 0;
+}
+
+fn generics_read_inferred_bindings() -> int32 {
+  var wide_box = box_of((int64)7);
+  var unboxed = unbox(&wide_box);
+  var unboxed_is: int64* = &unboxed;
+  var rewrapped = rewrap((int16)3);
+  var rewrapped_is: int16* = &rewrapped;
+  if (*unboxed_is != 7 || *rewrapped_is != 3) {
+    return 2;
+  }
+  var caller = make_caller();
+  var caller_is: fn(fn(int32) -> int32, int32) -> int32 = caller;
+  if (caller_is(&increment, 41) != 42 || caller(&increment, 1) != 2) {
+    return 3;
+  }
+  var a = 5000000000;
+  var b = (int16)2;
+  var p = origin();
+  var f = 1.5;
+  var pointer = &a;
+  var field = p.x;
+  if (size_of_value(a) != 8 || size_of_value(b) != 2 ||
+      size_of_value(p) != 16 || size_of_value(f) != 8 ||
+      size_of_value(pointer) != 8 || size_of_value(field) != 8 ||
+      size_of_value(b < 3) != 1) {
+    return 1;
+  }
+  return 0;
+}
+
+fn places_and_operators() -> int32 {
+  var base: int64 = 10;
+  var copy = base;
+  var pointer = &base;
+  var through = *pointer;
+  var values: int16[3];
+  values[1] = 6;
+  var element = values[1];
+  var first = &values[0];
+  var next = first + 1;
+  var global_read = g_count;
+  var limit = G_LIMIT;
+  var next_int = copy + 1;
+  var from_left = 1 + copy;
+  var both = copy * through;
+  var mid = (copy + through) / 2;
+  var shifted = copy << 2;
+  var masked = copy & 255;
+  var inverted = ~copy;
+  var ok = copy < 20;
+  var neither = !ok;
+  var joined = "a" + "b";
+  var copy_is: int64* = &copy;
+  var pointer_is: int64** = &pointer;
+  var element_is: int16* = &element;
+  var next_is: int16** = &next;
+  var global_is: int64* = &global_read;
+  var limit_is: int16* = &limit;
+  var next_int_is: int64* = &next_int;
+  var from_left_is: int64* = &from_left;
+  var both_is: int64* = &both;
+  var mid_is: int64* = &mid;
+  var shifted_is: int64* = &shifted;
+  var masked_is: int64* = &masked;
+  var inverted_is: int64* = &inverted;
+  var ok_is: bool* = &ok;
+  var neither_is: bool* = &neither;
+  var joined_is: string* = &joined;
+  if (*copy_is != 10 || **pointer_is != 10 || *element_is != 6 ||
+      **next_is != 6 || *global_is != 40 || *limit_is != 9 ||
+      *next_int_is != 11 || *from_left_is != 11 || *both_is != 100 ||
+      *mid_is != 10 || *shifted_is != 40 || *masked_is != 10 ||
+      *inverted_is != -11 || !*ok_is || *neither_is ||
+      (*joined_is).length != 2) {
+    return 1;
+  }
+  return 0;
+}
+
+fn enums_and_match() -> int32 {
+  var shape: Shape = Circle(4);
+  var built = Square(3);
+  var color = Color.Green;
+  var measure = match (built) {
+    case Circle(r): r * 3
+    case Square(w): w * w
+  };
+  var other = match (shape) {
+    case Circle(r): r
+    case Square(w): w
+  };
+  var measure_is: int32* = &measure;
+  var built_is: Shape* = &built;
+  if (*measure_is != 9 || other != 4 || color != Color.Green ||
+      built_is == (Shape*)0) {
+    return 1;
+  }
+  var r = "outer";
+  match (shape) {
+    case Circle(r): {
+      var held = r;
+      var held_is: int32* = &held;
+      if (*held_is != 4) {
+        return 2;
+      }
+    }
+    case Square(w): {
+      return 3;
+    }
+  }
+  var still = r;
+  var still_is: string* = &still;
+  if ((*still_is).length != 5) {
+    return 4;
+  }
+  return 0;
+}
+
+fn names_after_a_block() -> int32 {
+  var p = origin();
+  {
+    var p = sizeof(int64);
+    var read = p;
+    var read_is: int64* = &read;
+    if (*read_is != 8) {
+      return 1;
+    }
+  }
+  var values = new int16[2];
+  values[1] = 5;
+  var seen = 0;
+  for value in values {
+    var held = value;
+    var held_is: int16* = &held;
+    seen = seen + *held_is;
+  }
+  if (p.twice() != 6 || seen != 5) {
+    return 2;
+  }
+  return 0;
+}
+
+fn closures() -> int32 {
+  var plain = fn(x: int32) -> int32 { return x + 1; };
+  var n = 3;
+  var stated = (int64)4;
+  var text = "four";
+  var from_call = origin();
+  var first_copy = n;
+  var text_length = text.length;
+  var first_letter = text[0];
+  var row = new int32[2];
+  var row_length = row.length;
+  var bare_global = G_BARE;
+  var one_less = stated + -1;
+  var capture = fn(x: int32) -> int64 {
+    if (text_length != 4 || first_letter != 'f' || row_length != 2 ||
+        bare_global != 11 || one_less != 3) {
+      return -1;
+    }
+    return x + n + stated + (int64)text.length + from_call.x + first_copy;
+  };
+  var result = capture(1);
+  var plain_is: fn(int32) -> int32 = plain;
+  var capture_is: Fn(int32) -> int64 = capture;
+  var result_is: int64* = &result;
+  if (plain_is(1) != 2 || capture_is(1) != 16 || *result_is != 16) {
+    return 1;
+  }
+  return 0;
+}
+
+fn scopes(flag: int32) -> int32 {
+  var first = 1;
+  if (flag != 0) {
+    var inner = (int64)2;
+    var inner_is: int64* = &inner;
+    if (*inner_is != 2) {
+      return 1;
+    }
+  }
+  {
+    var inner = "shadow";
+    var again = inner;
+    var again_is: string* = &again;
+    if ((*again_is).length != 6) {
+      return 2;
+    }
+  }
+  var shadowed: int64 = 8;
+  if (flag != 0) {
+    var shadowed = (int8)1;
+    var read = shadowed;
+    var read_is: int8* = &read;
+    if (*read_is != 1) {
+      return 3;
+    }
+  }
+  var read_outer = shadowed;
+  var read_outer_is: int64* = &read_outer;
+  var lambda_param = fn(shadowed: int8) -> int32 {
+    var read = shadowed;
+    var read_is: int8* = &read;
+    return *read_is + 1;
+  };
+  if (*read_outer_is != 8 || lambda_param((int8)1) != 2) {
+    return 4;
+  }
+  for (var i = 0; i < 3; i = i + 1) {
+    first = first + i;
+  }
+  if (first != 4) {
+    return 5;
+  }
+  return 0;
+}
+
+fn constants() -> int32 {
+  const COUNT = 4;
+  const SCALE = 2.5;
+  const NAME = "mettle";
+  const WIDE = (int64)3;
+  var count_is = COUNT;
+  var count_is_int32: int32* = &count_is;
+  var wide_is = WIDE;
+  var wide_is_int64: int64* = &wide_is;
+  if (*count_is_int32 != 4 || NAME.length != 6 || SCALE != 2.5 ||
+      *wide_is_int64 != 3) {
+    return 1;
+  }
+  return 0;
+}
+
+fn run() -> int32 {
+  var code = literals();
+  if (code != 0) {
+    return 100 + code;
+  }
+  code = casts_and_new();
+  if (code != 0) {
+    return 110 + code;
+  }
+  code = calls();
+  if (code != 0) {
+    return 120 + code;
+  }
+  code = generics_read_inferred_bindings();
+  if (code != 0) {
+    return 130 + code;
+  }
+  code = places_and_operators();
+  if (code != 0) {
+    return 140 + code;
+  }
+  code = enums_and_match();
+  if (code != 0) {
+    return 150 + code;
+  }
+  code = closures();
+  if (code != 0) {
+    return 160 + code;
+  }
+  code = scopes(1);
+  if (code != 0) {
+    return 170 + code;
+  }
+  code = constants();
+  if (code != 0) {
+    return 180 + code;
+  }
+  code = names_after_a_block();
+  if (code != 0) {
+    return 190 + code;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  return run();
+}

@@ -1,0 +1,12 @@
+// A bare constructor of a generic enum does not say which instance it builds.
+enum Option<T> {
+  Some(T),
+  None
+}
+
+fn main() -> int32 {
+  var wide: Option<int64> = Some((int64)1);
+  var bare = Some(5);
+  var empty = None;
+  return 0;
+}

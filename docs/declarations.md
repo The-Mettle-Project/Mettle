@@ -29,12 +29,18 @@ caller's value, pass a pointer.
 
 ## Variables
 
-`var` declares a local or a global. Every one carries a type:
+`var` declares a local or a global. A global always writes its type, and so does
+a local with no initializer. A local may leave its type off where the initializer
+says it:
 
 ```mettle
 var count: int64 = 0;
 var scratch: uint8[256];
+var total = (int64)0;
+var node = new Node;
 ```
+
+[Types](types.md#leaving-the-type-off) lists which initializers state a type.
 
 Every `var` is mutable. A local with no initializer starts zeroed, and so does
 an array or struct declared without one.
@@ -52,8 +58,8 @@ const NAME: string = "mettle";
 ```
 
 A global `const` holding a numeric or string literal may leave its type off,
-and it takes the literal's type. Everything else, including every local
-`const`, names its type. A float is a constant like any other:
+and it takes the literal's type. A local `const` follows the same rule as a
+local `var`. A float is a constant like any other:
 
 ```mettle
 const DS_PI = 3.14159265358979;

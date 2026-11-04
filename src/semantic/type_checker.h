@@ -207,7 +207,7 @@ int type_checker_is_discrete_type(Type *type);
 int type_checker_register_variant_constructor(TypeChecker *checker, Type *te,
                                               const char *enum_name,
                                               const char *variant_name,
-                                              size_t index);
+                                              size_t index, int from_generic);
 int type_checker_is_floating_type(Type *type);
 int type_checker_is_numeric_type(Type *type);
 

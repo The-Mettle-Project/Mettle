@@ -51,8 +51,8 @@ static const ErrorCodeDoc DOCS[] = {
      "at the previous declaration / the function definition in a note.\n"},
     {"E0004", "Type mismatch",
      "A value of one type was used where a different type is required.\n"
-     "Mettle never infers `var`/local `const` binding types, so both sides\n"
-     "must line up.\n"
+     "A written type does not bend to fit its value, so both sides must line\n"
+     "up.\n"
      "\n"
      "Example:\n"
      "    var x: int64 = \"hello\";   // expected 'int64', found 'string'\n"

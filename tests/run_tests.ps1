@@ -1462,7 +1462,21 @@ $cases = @(
   @{ Name = "err_decorator_after_export"; Path = "tests/err_decorator_after_export.mettle"; ShouldSucceed = $false; Pattern = "Decorators must precede 'export'" },
   @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
   @{ Name = "lambda"; Path = "tests/test_lambda.mettle"; ShouldSucceed = $true },
-  @{ Name = "err_var_inferred"; Path = "tests/err_var_inferred.mettle"; ShouldSucceed = $false; Pattern = "requires an explicit type" },
+  @{ Name = "err_var_inferred"; Path = "tests/err_var_inferred.mettle"; ShouldSucceed = $false; Pattern = "global variable 'total' requires an explicit type"; OutputMustNotMatch = @("Undefined variable") },
+  @{ Name = "err_var_inferred_promotion"; Path = "tests/err_var_inferred_promotion.mettle"; ShouldSucceed = $false; Pattern = "'int32 \* int64' gives 'int64' by promotion"; OutputMustMatch = @("write 'var total: int64 = \.\.\.'"); OutputMustNotMatch = @("Undefined variable") },
+  @{ Name = "err_var_inferred_float_literal"; Path = "tests/err_var_inferred_float_literal.mettle"; ShouldSucceed = $false; Pattern = "'float32 \* float64' gives 'float64' by promotion" },
+  @{ Name = "err_var_inferred_void"; Path = "tests/err_var_inferred_void.mettle"; ShouldSucceed = $false; Pattern = "'x' needs a written type: its initializer returns nothing" },
+  @{ Name = "err_var_inferred_aggregate"; Path = "tests/err_var_inferred_aggregate.mettle"; ShouldSucceed = $false; Pattern = "an aggregate literal takes the type of what it initializes" },
+  @{ Name = "err_var_inferred_capture"; Path = "tests/err_var_inferred_capture.mettle"; ShouldSucceed = $false; Pattern = "cannot capture 'side' in a closure" },
+  @{ Name = "err_var_inferred_constructor"; Path = "tests/err_var_inferred_constructor.mettle"; ShouldSucceed = $false; Pattern = "a bare 'Some' does not say which enum it builds"; OutputMustMatch = @("a bare 'None' does not say which enum it builds") },
+  @{ Name = "err_var_inferred_shared_variant"; Path = "tests/err_var_inferred_shared_variant.mettle"; ShouldSucceed = $false; Pattern = "a bare 'Hit' does not say which enum it builds" },
+  @{ Name = "var_inferred"; Path = "tests/test_var_inferred.mettle"; ShouldSucceed = $true },
+  @{ Name = "var_inferred_O"; Path = "tests/test_var_inferred.mettle"; ShouldSucceed = $true; Args = @("-O") },
+  @{ Name = "var_inferred_comptime"; Path = "tests/test_var_inferred_comptime.mettle"; ShouldSucceed = $true },
+  @{ Name = "var_inferred_meta"; Path = "tests/test_var_inferred_meta.mettle"; ShouldSucceed = $true },
+  @{ Name = "var_inferred_kernel"; Path = "tests/test_var_inferred_kernel.mettle"; ShouldSucceed = $true; Args = @("--emit-ptx") },
+  @{ Name = "var_inferred_interp"; Path = "tests/test_var_inferred_interp.mettle"; ShouldSucceed = $true; Args = @("test"); SkipBinaryCheck = $true; OutputMustMatch = @("1 passed"); OutputMustNotMatch = @("failed", "LEAKED") },
+  @{ Name = "warn_var_inferred_borrow"; Path = "tests/warn_var_inferred_borrow.mettle"; ShouldSucceed = $true; OutputMustMatch = @('Use of `held` after the scope of `storage` ended') },
   @{ Name = "closure_capture"; Path = "tests/test_closure_capture.mettle"; ShouldSucceed = $true },
   @{ Name = "closure_crossboundary"; Path = "tests/test_closure_crossboundary.mettle"; ShouldSucceed = $true },
   @{ Name = "closure_field"; Path = "tests/test_closure_field.mettle"; ShouldSucceed = $true },
@@ -4072,6 +4086,36 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "expand_shows_generated_declarations" -Passed $false -Reason $_.Exception.Message
+}
+
+# `mettle expand` prints what the compiler decided for an inferred binding, and
+# a --safe build traps through inferred bindings the same as written ones.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $out = & $CompilerPath expand "tests/test_var_inferred.mettle" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
+  foreach ($expected in @(
+      "var small: int32 = 5;",
+      "var unsigned32: uint32 = ",
+      "var big: int64 = ",
+      "var boxed: Box__int32 = ",
+      "var added: fn(int32,int32)->int32 = add;",
+      "var capture: Fn(int32)->int64 = ",
+      "const WIDE: int64 = (int64)3;")) {
+    if ($out -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in: $out" }
+  }
+  $safeExe = Join-Path $tmpDir "test_var_inferred_safe_oob.exe"
+  & $CompilerPath --build --safe --release "tests/test_var_inferred_safe_oob.mettle" -o $safeExe 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "--safe build failed" }
+  $safeOut = & $safeExe 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "the access ran to completion under --safe" }
+  if ($safeOut -notmatch "outside its allocation") { throw "trapped without naming the access: $safeOut" }
+  Write-CaseResult -Name "var_inferred_expand_and_safe" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "var_inferred_expand_and_safe" -Passed $false -Reason $_.Exception.Message
 }
 
 # `mettle expand` must show generated code as readable source, attributed to

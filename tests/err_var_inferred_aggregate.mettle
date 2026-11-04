@@ -1,0 +1,7 @@
+// A struct literal names its fields and not its type.
+struct Range { lo: int32; hi: int32; }
+
+fn main() -> int32 {
+  var r = { lo: 5, hi: 7 };
+  return r.lo;
+}

@@ -1,0 +1,15 @@
+// Borrow analysis reads an inferred pointer the same as a written one.
+fn dangling() -> int32 {
+  var held = (int32*)0;
+  {
+    var storage: int32[4];
+    storage[0] = 7;
+    var first = &storage[0];
+    held = first;
+  }
+  return held[0];
+}
+
+fn main() -> int32 {
+  return dangling();
+}

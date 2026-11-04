@@ -2407,35 +2407,13 @@ Type *type_checker_default_integer_literal_type(TypeChecker *checker,
     return checker ? checker->builtin_int32 : NULL;
   }
 
-  unsigned long long u_bitpat = (unsigned long long)literal->int_value;
-  unsigned char radix = literal->int_radix;
-  if (radix != 2u && radix != 16u) {
-    radix = 10u;
+  const char *name = ast_integer_literal_type_name(literal);
+  if (name[0] == 'u') {
+    return strcmp(name, "uint32") == 0 ? checker->builtin_uint32
+                                       : checker->builtin_uint64;
   }
-
-  if (radix == 10u) {
-    if (literal->int_value < 0) {
-      return checker->builtin_uint64;
-    }
-    if (literal->int_value >= INT32_MIN && literal->int_value <= INT32_MAX) {
-      return checker->builtin_int32;
-    }
-    if (u_bitpat <= (unsigned long long)INT64_MAX) {
-      return checker->builtin_int64;
-    }
-    return checker->builtin_uint64;
-  }
-
-  if (u_bitpat <= (unsigned long long)INT32_MAX) {
-    return checker->builtin_int32;
-  }
-  if (u_bitpat <= UINT32_MAX) {
-    return checker->builtin_uint32;
-  }
-  if (u_bitpat <= (unsigned long long)INT64_MAX) {
-    return checker->builtin_int64;
-  }
-  return checker->builtin_uint64;
+  return strcmp(name, "int32") == 0 ? checker->builtin_int32
+                                    : checker->builtin_int64;
 }
 
 Type *type_checker_canon_type(TypeChecker *checker, Type *type) {

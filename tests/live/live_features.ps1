@@ -698,6 +698,51 @@ if ($built.Code -ne 0) {
     Remove-Item -Force "$exe.live.watched" -ErrorAction SilentlyContinue
 }
 
+$inferredA = @'
+fn main() -> int32 {
+    var x = 0;
+    var step = 1;
+    var label = "kept";
+    var t: int64 = 0;
+    while (t < 2000) {
+        quiesce;
+        x = x + step;
+        println("old t={t} x={x} label={label}");
+        t = t + 1;
+        thread_sleep_ms((uint32)15);
+    }
+    return 0;
+}
+'@
+$inferredB = $inferredA.Replace('var x = 0;', 'var x: int32 = 0;').Replace('println("old t=', 'println("written t=')
+$inferredC = $inferredA.Replace('var x = 0;', 'var x = (int64)0;').Replace('println("old t=', 'println("wide t=')
+
+$name = "inferred_locals"
+Clear-Program $name
+$source = Join-Path $scratch "$name.mettle"
+$exe = Join-Path $scratch "$name$suffix"
+Write-Source $source $inferredA
+$built = Invoke-Mettle @("--build", "--live", $source, "-o", $exe)
+if ($built.Code -ne 0) {
+    Fail $name "build failed: $($built.Text)"
+} else {
+    $process = Start-Live $exe $name
+    $out = Join-Path $scratch "$name.out"
+    if (-not (Wait-For $out "old t=3 ")) { Fail $name "the program did not start" }
+    Write-Source $source $inferredB
+    Invoke-Mettle @("--live-patch", $exe, $source) | Out-Null
+    if (-not (Wait-For $out "written t=\d+ ")) { Fail $name "main never moved when the inferred type was written out" }
+    Write-Source $source $inferredC
+    Invoke-Mettle @("--live-patch", $exe, $source) | Out-Null
+    if (-not (Wait-For $out "wide t=\d+ ")) { Fail $name "main never moved when the initializer changed the type" }
+    Start-Sleep -Milliseconds 200
+    Stop-Live $process
+    $text = Read-Text $out
+    $gap = Get-Consecutive $text "x"
+    if ($gap) { Fail $name $gap }
+    if ($text -match "label=(?!kept)") { Fail $name "an inferred string lost its value: $text" }
+}
+
 foreach ($line in $failures) { "FAIL $line" }
 $scenarios = @(Select-String -Path $PSCommandPath -Pattern '^(\$name = "|Test-HeapLayout ")').Count
 "live features: $($scenarios - @($failures | ForEach-Object { ($_ -split ':')[0] } | Sort-Object -Unique).Count) of $scenarios scenarios passed"

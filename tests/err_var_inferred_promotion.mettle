@@ -1,0 +1,7 @@
+// Promotion picks the width of a mixed expression, so the line does not say it.
+fn main() -> int32 {
+  var a: int32 = 2;
+  var b: int64 = 3;
+  var total = a * b;
+  return (int32)total;
+}

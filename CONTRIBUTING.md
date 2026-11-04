@@ -181,9 +181,9 @@ Default to no comments. Add one only where the reason behind something is hard
 to see. Skip docstrings, skip comments that restate the code, and skip task
 references.
 
-Types are explicit. Every `var` and every local `const` states its type.
-Induction variables in a `for` over a range and global `const` are the
-exceptions.
+Signatures, struct fields, global `var`s and effects state their types. A local
+binding may leave its type off where the line says it, and
+[Types](docs/types.md#leaving-the-type-off) lists where that is.
 
 ## Submitting a pull request
 

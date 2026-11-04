@@ -1,0 +1,36 @@
+// A binding in a `comptime for` body infers per copy, so one source line can
+// take a different type each iteration. A compile-time const infers too.
+import "std/io";
+
+struct Packet {
+  kind: uint8;
+  seq: uint32;
+  payload: int64;
+}
+
+const PACKET_FIELDS = 3;
+
+fn main() -> int32 {
+  var total: int64 = 0;
+  var bytes: int64 = 0;
+  comptime for i in 0..PACKET_FIELDS {
+    var step = i;
+    var scaled = (int64)step;
+    total = total + scaled;
+  }
+  comptime for f in typeof(Packet).fields {
+    var size = f.type.size;
+    var offset = f.offset;
+    var named = f.name;
+    bytes = bytes + size + offset + (int64)named.length;
+  }
+  var packet: Packet;
+  packet.kind = (uint8)1;
+  const SELF = typeof(packet);
+  const SIZE = sizeof(Packet);
+  static_assert(SIZE == 16);
+  if (total != 3 || bytes != 1 + 0 + 4 + 4 + 3 + 8 + 8 + 4 + 7) {
+    return 1;
+  }
+  return 0;
+}

@@ -107,6 +107,7 @@ static ASTNode *ast_clone_var_declaration(ASTNode *clone, const ASTNode *node) {
   dst->is_exported = src->is_exported;
   dst->is_const = src->is_const;
   dst->structural_type = src->structural_type;
+  dst->type_is_inferred = src->type_is_inferred;
   dst->address_space = src->address_space;
   dst->link_name = ast_copy_string(src->link_name);
   dst->initializer =
@@ -1858,6 +1859,7 @@ ASTNode *ast_create_var_declaration(const char *name, const char *type_name,
   var_decl->address_space = AST_ADDRESS_SPACE_DEFAULT;
   var_decl->link_name = NULL;
   var_decl->composed_name = NULL;
+  var_decl->type_is_inferred = 0;
   node->data = var_decl;
 
   if (initializer) {
@@ -2539,6 +2541,23 @@ ASTNode *ast_create_identifier_with_scope(const char *name,
 ASTNode *ast_create_identifier(const char *name, SourceLocation location) {
   return ast_create_identifier_with_scope(name, AST_SCOPE_ID_UNRESOLVED,
                                           location);
+}
+
+const char *ast_integer_literal_type_name(const NumberLiteral *literal) {
+  unsigned long long bits = (unsigned long long)literal->int_value;
+  if (literal->int_radix == 2u || literal->int_radix == 16u) {
+    if (bits <= (unsigned long long)INT32_MAX) {
+      return "int32";
+    }
+    if (bits <= UINT32_MAX) {
+      return "uint32";
+    }
+    return bits <= (unsigned long long)INT64_MAX ? "int64" : "uint64";
+  }
+  if (literal->int_value < 0) {
+    return "uint64";
+  }
+  return literal->int_value <= INT32_MAX ? "int32" : "int64";
 }
 
 ASTNode *ast_create_number_literal(long long int_value,

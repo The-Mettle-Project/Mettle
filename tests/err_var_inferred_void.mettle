@@ -1,0 +1,7 @@
+fn nothing() {
+}
+
+fn main() -> int32 {
+  var x = nothing();
+  return 0;
+}

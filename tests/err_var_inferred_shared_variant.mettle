@@ -1,0 +1,8 @@
+// Two enums share a variant name, so the bare name does not pick one.
+enum Near { Hit(int32), Miss }
+enum Far { Hit(int64), Gone }
+
+fn main() -> int32 {
+  var bare = Hit(1);
+  return 0;
+}

@@ -1,0 +1,13 @@
+// A closure is built before types are checked. A match expression does not
+// state its type that early, so a captured binding has to write it.
+enum Shape { Circle(int32), Square(int32) }
+
+fn main() -> int32 {
+  var s: Shape = Square(3);
+  var side = match (s) {
+    case Circle(r): r
+    case Square(w): w
+  };
+  var f = fn() -> int32 { return side; };
+  return f();
+}

@@ -520,7 +520,7 @@ int type_checker_process_tagged_enum(TypeChecker *checker,
 
   for (size_t i = 0; i < enum_decl->variant_count; i++) {
     if (!type_checker_register_variant_constructor(
-            checker, te, enum_decl->name, enum_decl->variants[i].name, i)) {
+            checker, te, enum_decl->name, enum_decl->variants[i].name, i, 0)) {
       return 0;
     }
   }
@@ -538,6 +538,7 @@ static Symbol *type_checker_make_variant_constructor(Type *te,
   ctor->data.constructor.enum_type = te;
   ctor->data.constructor.tag_value = (int)index;
   ctor->data.constructor.payload_type = te->tagged_variant_payloads[index];
+  ctor->data.constructor.is_undecided = 0;
   ctor->is_initialized = 1;
   return ctor;
 }
@@ -545,7 +546,7 @@ static Symbol *type_checker_make_variant_constructor(Type *te,
 int type_checker_register_variant_constructor(TypeChecker *checker, Type *te,
                                               const char *enum_name,
                                               const char *variant_name,
-                                              size_t index) {
+                                              size_t index, int from_generic) {
   size_t qualified_len = strlen(enum_name) + 2 + strlen(variant_name) + 1;
   char *qualified = malloc(qualified_len);
   if (!qualified) {
@@ -561,13 +562,18 @@ int type_checker_register_variant_constructor(TypeChecker *checker, Type *te,
     symbol_table_insert(checker->symbol_table, ctor);
   }
   free(qualified);
-  if (!symbol_table_lookup(checker->symbol_table, variant_name)) {
+  Symbol *bare = symbol_table_lookup(checker->symbol_table, variant_name);
+  if (!bare) {
     Symbol *ctor =
         type_checker_make_variant_constructor(te, variant_name, index);
     if (!ctor) {
       return 0;
     }
+    ctor->data.constructor.is_undecided = from_generic;
     symbol_table_insert(checker->symbol_table, ctor);
+  } else if (bare->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR &&
+             (from_generic || bare->data.constructor.enum_type != te)) {
+    bare->data.constructor.is_undecided = 1;
   }
   return 1;
 }
@@ -743,7 +749,7 @@ Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
 
   for (size_t i = 0; i < tmpl->variant_count; i++) {
     if (!type_checker_register_variant_constructor(
-            checker, te, te->name, tmpl->variants[i].name, i)) {
+            checker, te, te->name, tmpl->variants[i].name, i, 1)) {
       type_destroy(te);
       return NULL;
     }
@@ -1341,6 +1347,238 @@ static int type_checker_check_address_space(TypeChecker *checker,
   return 1;
 }
 
+static int type_checker_is_number_literal(const ASTNode *node) {
+  if (node && node->type == AST_UNARY_EXPRESSION && node->data) {
+    const UnaryExpression *unary = (const UnaryExpression *)node->data;
+    if (unary->operator && strcmp(unary->operator, "-") == 0) {
+      node = unary->operand;
+    }
+  }
+  return node && node->type == AST_NUMBER_LITERAL && node->data &&
+         !((const NumberLiteral *)node->data)->is_char;
+}
+
+static const ASTNode *type_checker_find_promotion(const ASTNode *expression) {
+  if (!expression || !expression->data) {
+    return NULL;
+  }
+  if (expression->type == AST_UNARY_EXPRESSION) {
+    const UnaryExpression *unary = (const UnaryExpression *)expression->data;
+    int keeps_operand_type =
+        unary->operator && (strcmp(unary->operator, "-") == 0 ||
+                            strcmp(unary->operator, "+") == 0 ||
+                            strcmp(unary->operator, "~") == 0);
+    return keeps_operand_type ? type_checker_find_promotion(unary->operand)
+                              : NULL;
+  }
+  if (expression->type == AST_BINARY_EXPRESSION) {
+    const BinaryExpression *binary = (const BinaryExpression *)expression->data;
+    const char *op = binary->operator;
+    Type *left;
+    Type *right;
+    Type *result = expression->resolved_type;
+    const ASTNode *inner;
+    if (!op || strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 ||
+        strcmp(op, "<") == 0 || strcmp(op, ">") == 0 || strcmp(op, "<=") == 0 ||
+        strcmp(op, ">=") == 0 || strcmp(op, "&&") == 0 ||
+        strcmp(op, "||") == 0) {
+      return NULL;
+    }
+    inner = type_checker_find_promotion(binary->left);
+    if (inner) {
+      return inner;
+    }
+    inner = type_checker_find_promotion(binary->right);
+    if (inner) {
+      return inner;
+    }
+    left = binary->left ? binary->left->resolved_type : NULL;
+    right = binary->right ? binary->right->resolved_type : NULL;
+    if (!left || !right || !result) {
+      return expression;
+    }
+    if (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0) {
+      return type_checker_types_equal(result, left) ? NULL : expression;
+    }
+    if (type_checker_types_equal(left, right) ||
+        (left->kind == TYPE_POINTER && type_checker_is_integer_type(right)) ||
+        type_checker_is_number_literal(binary->right)) {
+      return type_checker_types_equal(result, left) ? NULL : expression;
+    }
+    if (right->kind == TYPE_POINTER && type_checker_is_integer_type(left)) {
+      return NULL;
+    }
+    if (type_checker_is_number_literal(binary->left)) {
+      return type_checker_types_equal(result, right) ? NULL : expression;
+    }
+    return expression;
+  }
+  return NULL;
+}
+
+static int type_checker_refuse_inferred_binding(TypeChecker *checker,
+                                                ASTNode *declaration,
+                                                VarDeclaration *var_decl,
+                                                const char *why,
+                                                const char *type_name) {
+  type_checker_set_error_at_location(
+      checker, declaration->location,
+      "'%s' needs a written type: %s; write '%s %s: %s = ...'", var_decl->name,
+      why, var_decl->is_const ? "const" : "var", var_decl->name, type_name);
+  return 0;
+}
+
+static int type_checker_append_type_text(const Type *type, char *text,
+                                         size_t capacity, size_t *used) {
+  if (*used >= capacity) {
+    return 0;
+  }
+  if (!type || type->kind != TYPE_FUNCTION_POINTER) {
+    const char *name = type ? type->name : "void";
+    if (!name) {
+      return 0;
+    }
+    *used += (size_t)snprintf(text + *used, capacity - *used, "%s", name);
+    return *used < capacity;
+  }
+  *used += (size_t)snprintf(text + *used, capacity - *used, "%s(",
+                            type->closure_env ? "Fn" : "fn");
+  for (size_t i = 0; i < type->fn_param_count; i++) {
+    if (*used >= capacity) {
+      return 0;
+    }
+    if (i > 0) {
+      *used += (size_t)snprintf(text + *used, capacity - *used, ",");
+    }
+    if (!type->fn_param_types[i] ||
+        !type_checker_append_type_text(type->fn_param_types[i], text, capacity,
+                                       used)) {
+      return 0;
+    }
+  }
+  if (*used >= capacity) {
+    return 0;
+  }
+  *used += (size_t)snprintf(text + *used, capacity - *used, ")->");
+  return type_checker_append_type_text(type->fn_return_type, text, capacity,
+                                       used);
+}
+
+static const char *type_checker_undecided_constructor(TypeChecker *checker,
+                                                      const ASTNode *initializer) {
+  const char *name = NULL;
+  const Symbol *symbol;
+  if (initializer->type == AST_FUNCTION_CALL && initializer->data) {
+    const CallExpression *call = (const CallExpression *)initializer->data;
+    name = call->object ? NULL : call->function_name;
+  } else if (initializer->type == AST_IDENTIFIER && initializer->data) {
+    name = ((const Identifier *)initializer->data)->name;
+  }
+  symbol = name ? symbol_table_lookup(checker->symbol_table, name) : NULL;
+  return symbol && symbol->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR &&
+                 symbol->data.constructor.is_undecided
+             ? name
+             : NULL;
+}
+
+static int type_checker_infer_binding_type(TypeChecker *checker,
+                                           ASTNode *declaration,
+                                           VarDeclaration *var_decl,
+                                           Type *init_type, Type **var_type_io) {
+  const ASTNode *promotion = type_checker_find_promotion(var_decl->initializer);
+  const char *constructor =
+      type_checker_undecided_constructor(checker, var_decl->initializer);
+  Type *named = NULL;
+  const char *written = init_type->name;
+  char signature[1024];
+  if (init_type->kind == TYPE_VOID) {
+    return type_checker_refuse_inferred_binding(
+        checker, declaration, var_decl, "its initializer returns nothing",
+        "<type>");
+  }
+  if (constructor) {
+    char why[256];
+    snprintf(why, sizeof(why),
+             "a bare '%s' does not say which enum it builds", constructor);
+    return type_checker_refuse_inferred_binding(checker, declaration, var_decl,
+                                                why, "<type>");
+  }
+  if (promotion) {
+    const BinaryExpression *binary = (const BinaryExpression *)promotion->data;
+    const char *result = promotion->resolved_type && promotion->resolved_type->name
+                             ? promotion->resolved_type->name
+                             : "?";
+    type_checker_set_error_at_location(
+        checker, promotion->location,
+        "'%s' needs a written type: '%s %s %s' gives '%s' by promotion, so the "
+        "line does not say it; write '%s %s: %s = ...'",
+        var_decl->name,
+        binary->left->resolved_type && binary->left->resolved_type->name
+            ? binary->left->resolved_type->name
+            : "?",
+        binary->operator,
+        binary->right->resolved_type && binary->right->resolved_type->name
+            ? binary->right->resolved_type->name
+            : "?",
+        result, var_decl->is_const ? "const" : "var", var_decl->name, result);
+    return 0;
+  }
+  if (init_type->kind == TYPE_FUNCTION_POINTER) {
+    size_t used = 0;
+    if (type_checker_append_type_text(init_type, signature, sizeof(signature),
+                                      &used)) {
+      written = signature;
+      named = type_checker_get_type_by_name(checker, signature);
+    }
+  } else if (init_type->name) {
+    named = type_checker_get_type_by_name(checker, init_type->name);
+    if (named && !type_checker_types_equal(named, init_type)) {
+      named = NULL;
+    }
+  }
+  if (!named) {
+    return type_checker_refuse_inferred_binding(
+        checker, declaration, var_decl,
+        "the type of its initializer has no name it could be written with",
+        "<type>");
+  }
+  if (var_decl->type_is_inferred && var_decl->type_name) {
+    Type *stated = type_checker_get_type_by_name(checker, var_decl->type_name);
+    if (!stated || !type_checker_types_equal(stated, named)) {
+      char why[512];
+      snprintf(why, sizeof(why),
+               "the generic and closure passes read its initializer as '%s' "
+               "and the type checker found '%s'",
+               var_decl->type_name, written);
+      return type_checker_refuse_inferred_binding(checker, declaration,
+                                                  var_decl, why, written);
+    }
+  }
+  var_decl->type_name = (char *)string_intern(written);
+  var_decl->type_is_inferred = 1;
+  *var_type_io = named;
+  return 1;
+}
+
+static int type_checker_settle_inferred_binding(
+    TypeChecker *checker, ASTNode *declaration, VarDeclaration *var_decl,
+    Scope *current_scope, Type *init_type, Type **var_type_io,
+    int *poisoned_io) {
+  if (*var_type_io || var_decl->structural_type || !current_scope ||
+      current_scope->type == SCOPE_GLOBAL) {
+    return 1;
+  }
+  if (!type_checker_infer_binding_type(checker, declaration, var_decl,
+                                       init_type, var_type_io)) {
+    *var_type_io = init_type;
+    *poisoned_io = 1;
+    return 1;
+  }
+  return !type_checker_is_tile(*var_type_io) ||
+         type_checker_check_address_space(checker, declaration, var_decl,
+                                          current_scope, var_type_io);
+}
+
 static int type_checker_check_variable_initializer(
     TypeChecker *checker, ASTNode *declaration,
     VarDeclaration *var_decl, Scope *current_scope, Type **var_type_io,
@@ -1377,6 +1615,12 @@ static int type_checker_check_variable_initializer(
       if (!var_type)
         return 0;
       poisoned = 1;
+    }
+    if (!poisoned &&
+        !type_checker_settle_inferred_binding(checker, declaration, var_decl,
+                                              current_scope, init_type,
+                                              &var_type, &poisoned)) {
+      return 0;
     }
     if (!poisoned && var_type) {
       if (init_type && init_type->kind == TYPE_FUNCTION_POINTER &&
@@ -1426,11 +1670,11 @@ static int type_checker_check_variable_initializer(
     } else {
       type_checker_set_error_at_location(
           checker, declaration->location,
-          "%s '%s' requires an explicit type: write '%s %s: <type> = ...' "
-          "(Mettle does not infer binding types)",
-          var_decl->is_const ? "constant" : "variable", var_decl->name,
-          var_decl->is_const ? "const" : "var", var_decl->name);
-      return 0;
+          "global variable '%s' requires an explicit type: write 'var %s: "
+          "<type> = ...' (only a local binding may leave it off)",
+          var_decl->name, var_decl->name);
+      var_type = init_type;
+      poisoned = 1;
     }
   } else if (!var_type) {
     type_checker_set_error_at_location(
@@ -1891,7 +2135,7 @@ static int type_checker_process_variable(TypeChecker *checker,
 
     Type *var_type = NULL;
 
-    if (var_decl->type_name) {
+    if (var_decl->type_name && !var_decl->type_is_inferred) {
       var_type = type_checker_get_type_by_name(checker, var_decl->type_name);
       if (!var_type) {
         type_checker_report_undefined_symbol(checker, declaration->location,

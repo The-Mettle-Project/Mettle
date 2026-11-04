@@ -234,6 +234,7 @@ typedef struct Symbol {
       Type *enum_type;
       int tag_value;
       Type *payload_type;
+      int is_undecided;
     } constructor;
   } data;
 } Symbol;

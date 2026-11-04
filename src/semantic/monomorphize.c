@@ -51,6 +51,9 @@ typedef struct {
   Instantiation *instances;
   size_t instance_count;
   Program *module;
+  ASTNode **decl_slots;
+  size_t decl_slot_count;
+  size_t decls_indexed;
 } MonoContext;
 
 static char *substitute_type_string(const char *type_str, char **param_names,
@@ -2087,15 +2090,8 @@ typedef struct {
 } MonoVarEnv;
 
 static int mono_env_add(MonoVarEnv *env, char *name, char *type_name) {
-  if (!env || !name || !type_name) {
+  if (!env || !name) {
     return 1;
-  }
-
-  for (size_t i = 0; i < env->count; i++) {
-    if (env->items[i].name && strcmp(env->items[i].name, name) == 0) {
-      env->items[i].type_name = type_name;
-      return 1;
-    }
   }
 
   if (env->count >= env->capacity) {
@@ -2115,18 +2111,29 @@ static int mono_env_add(MonoVarEnv *env, char *name, char *type_name) {
   return 1;
 }
 
-static const char *mono_env_lookup(MonoVarEnv *env, const char *name) {
+static const MonoVarBinding *mono_env_find(const MonoVarEnv *env,
+                                           const char *name) {
   if (!env || !name) {
     return NULL;
   }
 
   for (size_t i = env->count; i > 0; i--) {
     if (env->items[i - 1].name && strcmp(env->items[i - 1].name, name) == 0) {
-      return env->items[i - 1].type_name;
+      return &env->items[i - 1];
     }
   }
 
   return NULL;
+}
+
+static const char *mono_env_lookup(MonoVarEnv *env, const char *name) {
+  const MonoVarBinding *binding = mono_env_find(env, name);
+  return binding ? binding->type_name : NULL;
+}
+
+static int mono_node_opens_scope(const ASTNode *node) {
+  return node->type == AST_PROGRAM || node->type == AST_FOR_STATEMENT ||
+         node->type == AST_COMPTIME_FOR || node->type == AST_LAMBDA_EXPRESSION;
 }
 
 static TraitImpl *mono_find_impl_for_method(MonoContext *ctx,
@@ -2279,9 +2286,16 @@ static int mono_rewrite_trait_method_calls_in_node(MonoContext *ctx,
     return 1;
   }
 
-  for (size_t i = 0; i < node->child_count; i++) {
-    if (!mono_rewrite_trait_method_calls_in_node(ctx, node->children[i], env)) {
-      return 0;
+  {
+    size_t scope = env->count;
+    for (size_t i = 0; i < node->child_count; i++) {
+      if (!mono_rewrite_trait_method_calls_in_node(ctx, node->children[i],
+                                                   env)) {
+        return 0;
+      }
+    }
+    if (mono_node_opens_scope(node)) {
+      env->count = scope;
     }
   }
 
@@ -2502,31 +2516,578 @@ static int mono_match_type_text(const char *pattern, const char *actual,
   return result;
 }
 
-static char *mono_static_return_type_of_call(MonoContext *ctx,
-                                             ASTNode *expr) {
-  CallExpression *call = (CallExpression *)expr->data;
-  size_t i;
-  if (!call || !call->function_name || !ctx->module) {
+static const char *mono_decl_index_name(const ASTNode *decl) {
+  if (!decl || !decl->data) {
     return NULL;
   }
-  for (i = 0; i < ctx->module->declaration_count; i++) {
-    ASTNode *decl = ctx->module->declarations[i];
-    FunctionDeclaration *fd;
-    if (!decl || decl->type != AST_FUNCTION_DECLARATION) {
-      continue;
+  switch (decl->type) {
+  case AST_FUNCTION_DECLARATION:
+    return ((const FunctionDeclaration *)decl->data)->name;
+  case AST_STRUCT_DECLARATION:
+    return ((const StructDeclaration *)decl->data)->name;
+  case AST_VAR_DECLARATION:
+    return ((const VarDeclaration *)decl->data)->name;
+  default:
+    return NULL;
+  }
+}
+
+static void mono_decl_index_put(MonoContext *ctx, ASTNode *decl) {
+  const char *name = mono_decl_index_name(decl);
+  size_t mask = ctx->decl_slot_count - 1;
+  size_t slot;
+  if (!name) {
+    return;
+  }
+  slot = mettle_fnv1a_hash(name) & mask;
+  while (ctx->decl_slots[slot]) {
+    slot = (slot + 1) & mask;
+  }
+  ctx->decl_slots[slot] = decl;
+}
+
+static int mono_decl_index_sync(MonoContext *ctx) {
+  size_t count = ctx->module ? ctx->module->declaration_count : 0;
+  if (count == 0) {
+    return 0;
+  }
+  if (count * 2 > ctx->decl_slot_count) {
+    size_t slots = ctx->decl_slot_count ? ctx->decl_slot_count : 256;
+    ASTNode **grown;
+    while (count * 4 > slots) {
+      slots *= 2;
     }
-    fd = (FunctionDeclaration *)decl->data;
-    if (!fd || !fd->name || fd->type_param_count > 0 ||
-        strcmp(fd->name, call->function_name) != 0) {
-      continue;
+    grown = calloc(slots, sizeof(ASTNode *));
+    if (!grown) {
+      return 0;
     }
-    return fd->return_type ? mettle_strdup(fd->return_type) : NULL;
+    free(ctx->decl_slots);
+    ctx->decl_slots = grown;
+    ctx->decl_slot_count = slots;
+    ctx->decls_indexed = 0;
+  }
+  while (ctx->decls_indexed < count) {
+    mono_decl_index_put(ctx, ctx->module->declarations[ctx->decls_indexed++]);
+  }
+  return 1;
+}
+
+static ASTNode *mono_find_declaration(MonoContext *ctx, ASTNodeType type,
+                                      const char *name, size_t *cursor) {
+  size_t mask;
+  size_t slot;
+  if (!name || !mono_decl_index_sync(ctx)) {
+    return NULL;
+  }
+  mask = ctx->decl_slot_count - 1;
+  slot = *cursor ? *cursor : (mettle_fnv1a_hash(name) & mask) + 1;
+  for (slot -= 1; ctx->decl_slots[slot]; slot = (slot + 1) & mask) {
+    ASTNode *decl = ctx->decl_slots[slot];
+    if (decl->type == type && strcmp(mono_decl_index_name(decl), name) == 0) {
+      *cursor = ((slot + 1) & mask) + 1;
+      return decl;
+    }
   }
   return NULL;
 }
 
-static char *mono_static_type_of_element(MonoContext *ctx, ASTNode *expr,
-                                         MonoVarEnv *env);
+static char *mono_declared_return_text(const char *return_type) {
+  if (!return_type || strcmp(return_type, "void") == 0) {
+    return NULL;
+  }
+  return mettle_strdup(return_type);
+}
+
+static char *mono_function_return_text(MonoContext *ctx, const char *name) {
+  size_t cursor = 0;
+  ASTNode *decl;
+  char *found = NULL;
+  while ((decl = mono_find_declaration(ctx, AST_FUNCTION_DECLARATION, name,
+                                       &cursor)) != NULL) {
+    FunctionDeclaration *fd = (FunctionDeclaration *)decl->data;
+    char *returned = mono_declared_return_text(fd->return_type);
+    if (fd->type_param_count > 0 || fd->meta_role != META_ROLE_NONE ||
+        !returned || (found && strcmp(found, returned) != 0)) {
+      free(returned);
+      free(found);
+      return NULL;
+    }
+    free(found);
+    found = returned;
+  }
+  return found;
+}
+
+static int mono_is_word_char(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+
+static char *mono_substitute_written(const char *text, char **params,
+                                     char **args, size_t count) {
+  char *out = NULL;
+  for (int pass = 0; pass < 2; pass++) {
+    const char *p = text;
+    size_t used = 0;
+    while (*p) {
+      size_t run = 0;
+      const char *replacement = NULL;
+      size_t copied;
+      while (mono_is_word_char(p[run])) {
+        run++;
+      }
+      for (size_t i = 0; run > 0 && i < count && !replacement; i++) {
+        if (strlen(params[i]) == run && strncmp(p, params[i], run) == 0) {
+          replacement = args[i];
+        }
+      }
+      if (run == 0) {
+        run = 1;
+      }
+      copied = replacement ? strlen(replacement) : run;
+      if (out) {
+        memcpy(out + used, replacement ? replacement : p, copied);
+      }
+      used += copied;
+      p += run;
+    }
+    if (out) {
+      out[used] = '\0';
+    } else {
+      out = malloc(used + 1);
+      if (!out) {
+        return NULL;
+      }
+    }
+  }
+  return out;
+}
+
+static char *mono_written_form(MonoContext *ctx, char *text) {
+  size_t core = 0;
+  while (text && text[core] && text[core] != '*' && text[core] != '[') {
+    core++;
+  }
+  for (size_t i = 0; core > 0 && i < ctx->instance_count; i++) {
+    const Instantiation *instance = &ctx->instances[i];
+    char *written;
+    char *joined;
+    size_t size;
+    if (!instance->mangled_name || strlen(instance->mangled_name) != core ||
+        strncmp(instance->mangled_name, text, core) != 0) {
+      continue;
+    }
+    written = written_generic_name(instance->generic_name, instance->type_args,
+                                   instance->type_arg_count);
+    if (!written) {
+      return text;
+    }
+    size = strlen(written) + strlen(text + core) + 1;
+    joined = malloc(size);
+    if (joined) {
+      snprintf(joined, size, "%s%s", written, text + core);
+      free(text);
+      text = joined;
+    }
+    free(written);
+    return text;
+  }
+  return text;
+}
+
+static char *mono_generic_return_text(MonoContext *ctx, CallExpression *call) {
+  GenericDef *def = find_generic_def(ctx, call->function_name);
+  FunctionDeclaration *fd;
+  if (!def || def->is_struct || !def->node || call->type_arg_count == 0 ||
+      call->type_arg_count != def->type_param_count) {
+    return NULL;
+  }
+  fd = (FunctionDeclaration *)def->node->data;
+  if (!fd || !fd->return_type || strcmp(fd->return_type, "void") == 0) {
+    return NULL;
+  }
+  return mono_substitute_written(fd->return_type, def->type_params,
+                                 call->type_args, def->type_param_count);
+}
+
+static char *mono_without_pointer(const char *text) {
+  char *base = text ? mettle_strdup(text) : NULL;
+  size_t len = base ? strlen(base) : 0;
+  if (len > 0 && base[len - 1] == '*') {
+    base[len - 1] = '\0';
+  }
+  return base;
+}
+
+typedef struct {
+  StructDeclaration *sd;
+  GenericDef *def;
+  char **args;
+  size_t arg_count;
+  char *parsed_base;
+  char **parsed_args;
+} MonoStructView;
+
+static int mono_struct_view(MonoContext *ctx, const char *base,
+                            MonoStructView *view) {
+  size_t cursor = 0;
+  ASTNode *decl =
+      mono_find_declaration(ctx, AST_STRUCT_DECLARATION, base, &cursor);
+  memset(view, 0, sizeof(*view));
+  if (decl && ((StructDeclaration *)decl->data)->type_param_count == 0) {
+    view->sd = (StructDeclaration *)decl->data;
+    return 1;
+  }
+  if (parse_generic_type_name(base, &view->parsed_base, &view->parsed_args,
+                              &view->arg_count)) {
+    view->def = find_generic_def(ctx, view->parsed_base);
+    view->args = view->parsed_args;
+  } else {
+    for (size_t i = 0; i < ctx->instance_count; i++) {
+      if (ctx->instances[i].mangled_name &&
+          strcmp(ctx->instances[i].mangled_name, base) == 0) {
+        view->def = find_generic_def(ctx, ctx->instances[i].generic_name);
+        view->args = ctx->instances[i].type_args;
+        view->arg_count = ctx->instances[i].type_arg_count;
+        break;
+      }
+    }
+  }
+  if (view->def && view->def->is_struct && view->def->node &&
+      view->arg_count == view->def->type_param_count) {
+    view->sd = (StructDeclaration *)view->def->node->data;
+  }
+  return view->sd != NULL;
+}
+
+static void mono_struct_view_free(MonoStructView *view) {
+  for (size_t a = 0; view->parsed_args && a < view->arg_count; a++) {
+    free(view->parsed_args[a]);
+  }
+  free(view->parsed_args);
+  free(view->parsed_base);
+}
+
+static char *mono_struct_view_text(const MonoStructView *view,
+                                   const char *declared) {
+  if (!view->def) {
+    return mettle_strdup(declared);
+  }
+  return mono_substitute_written(declared, view->def->type_params, view->args,
+                                 view->arg_count);
+}
+
+static char *mono_method_return_text(MonoContext *ctx, const char *receiver,
+                                     const char *method) {
+  char *base = mono_without_pointer(receiver);
+  char *lifted = NULL;
+  char *found = NULL;
+  MonoStructView view;
+  size_t len;
+  if (!base) {
+    return NULL;
+  }
+  if (mono_struct_view(ctx, base, &view)) {
+    for (size_t m = 0; m < view.sd->method_count; m++) {
+      FunctionDeclaration *md = (FunctionDeclaration *)view.sd->methods[m]->data;
+      if (md && md->name && strcmp(md->name, method) == 0) {
+        found = md->return_type && strcmp(md->return_type, "void") != 0
+                    ? mono_struct_view_text(&view, md->return_type)
+                    : NULL;
+        mono_struct_view_free(&view);
+        free(base);
+        return found;
+      }
+    }
+  }
+  mono_struct_view_free(&view);
+  len = strlen(base) + strlen(method) + 2;
+  lifted = malloc(len);
+  if (lifted) {
+    snprintf(lifted, len, "%s_%s", base, method);
+    found = mono_function_return_text(ctx, lifted);
+    free(lifted);
+  }
+  free(base);
+  return found;
+}
+
+static char *mono_pointer_call_return_text(const char *type) {
+  int depth = 0;
+  if (!type ||
+      (strncmp(type, "fn(", 3) != 0 && strncmp(type, "Fn(", 3) != 0)) {
+    return NULL;
+  }
+  for (const char *p = type + 2; *p; p++) {
+    if (*p == '(') {
+      depth++;
+    } else if (*p == ')' && --depth == 0) {
+      p++;
+      while (*p == ' ') {
+        p++;
+      }
+      if (p[0] != '-' || p[1] != '>') {
+        return NULL;
+      }
+      p += 2;
+      while (*p == ' ') {
+        p++;
+      }
+      return mono_declared_return_text(p);
+    }
+  }
+  return NULL;
+}
+
+static char *mono_static_type_of(MonoContext *ctx, ASTNode *expr,
+                                 MonoVarEnv *env);
+
+static char *mono_static_return_type_of_call(MonoContext *ctx, ASTNode *expr,
+                                             MonoVarEnv *env) {
+  CallExpression *call = (CallExpression *)expr->data;
+  const MonoVarBinding *bound;
+  char *generic;
+  if (!call || !call->function_name || !ctx->module) {
+    return NULL;
+  }
+  if (call->object) {
+    char *receiver = mono_static_type_of(ctx, call->object, env);
+    char *returned =
+        mono_method_return_text(ctx, receiver, call->function_name);
+    free(receiver);
+    return returned;
+  }
+  bound = mono_env_find(env, call->function_name);
+  if (bound) {
+    return mono_pointer_call_return_text(bound->type_name);
+  }
+  generic = mono_generic_return_text(ctx, call);
+  return generic ? generic : mono_function_return_text(ctx, call->function_name);
+}
+
+static char *mono_field_type_text(MonoContext *ctx, const char *owner,
+                                  const char *field) {
+  char *base = mono_without_pointer(owner);
+  char *found = NULL;
+  MonoStructView view;
+  size_t base_len = base ? strlen(base) : 0;
+  if (!base) {
+    return NULL;
+  }
+  if (strcmp(field, "length") == 0 &&
+      (strcmp(base, "string") == 0 ||
+       (base_len > 2 && strcmp(base + base_len - 2, "[]") == 0))) {
+    found = mettle_strdup(strcmp(base, "string") == 0 ? "uint64" : "int64");
+    free(base);
+    return found;
+  }
+  if (mono_struct_view(ctx, base, &view)) {
+    for (size_t f = 0; f < view.sd->field_count; f++) {
+      if (view.sd->field_names[f] &&
+          strcmp(view.sd->field_names[f], field) == 0) {
+        found = mono_struct_view_text(&view, view.sd->field_types[f]);
+        break;
+      }
+    }
+  }
+  mono_struct_view_free(&view);
+  free(base);
+  return found;
+}
+
+static int mono_is_number_type(const char *type) {
+  static const char *const NUMBERS[] = {"int8",   "int16",  "int32",   "int64",
+                                        "uint8",  "uint16", "uint32",  "uint64",
+                                        "float32", "float64"};
+  for (size_t i = 0; i < sizeof(NUMBERS) / sizeof(NUMBERS[0]); i++) {
+    if (strcmp(type, NUMBERS[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int mono_is_int32_literal(const ASTNode *node) {
+  const NumberLiteral *literal = NULL;
+  if (node && node->type == AST_UNARY_EXPRESSION && node->data) {
+    const UnaryExpression *unary = (const UnaryExpression *)node->data;
+    if (unary->operator && strcmp(unary->operator, "-") == 0) {
+      node = unary->operand;
+    }
+  }
+  literal = node && node->type == AST_NUMBER_LITERAL
+                ? (const NumberLiteral *)node->data
+                : NULL;
+  return literal && !literal->is_float && !literal->is_char &&
+         strcmp(ast_integer_literal_type_name(literal), "int32") == 0;
+}
+
+static int mono_outranks_int32(const char *type) {
+  return strcmp(type, "int64") == 0 || strcmp(type, "uint64") == 0 ||
+         strcmp(type, "float32") == 0 || strcmp(type, "float64") == 0;
+}
+
+static int mono_is_integer_text(const char *type) {
+  return mono_is_number_type(type) && strncmp(type, "float", 5) != 0;
+}
+
+static char *mono_exact_binary_type(MonoContext *ctx, BinaryExpression *bin,
+                                    MonoVarEnv *env) {
+  const char *op = bin->operator;
+  int is_shift = strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0;
+  int is_bits = is_shift || strcmp(op, "&") == 0 || strcmp(op, "|") == 0 ||
+                strcmp(op, "^") == 0;
+  char *left;
+  char *right;
+  char *result = NULL;
+  if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 || strcmp(op, "<") == 0 ||
+      strcmp(op, ">") == 0 || strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0 ||
+      strcmp(op, "&&") == 0 || strcmp(op, "||") == 0) {
+    return mettle_strdup("bool");
+  }
+  left = mono_static_type_of(ctx, bin->left, env);
+  right = mono_static_type_of(ctx, bin->right, env);
+  if (left && right) {
+    size_t left_len = strlen(left);
+    if (is_shift) {
+      result = mono_is_integer_text(left) ? left : NULL;
+    } else if (strcmp(left, right) == 0) {
+      result = mono_is_number_type(left) ||
+                       (strcmp(left, "string") == 0 && strcmp(op, "+") == 0)
+                   ? left
+                   : NULL;
+    } else if (left_len > 0 && left[left_len - 1] == '*') {
+      result = (strcmp(op, "+") == 0 || strcmp(op, "-") == 0) &&
+                       mono_is_integer_text(right)
+                   ? left
+                   : NULL;
+    } else if (mono_is_int32_literal(bin->right)) {
+      result = mono_is_number_type(left) &&
+                       (is_bits || mono_outranks_int32(left) ||
+                        strcmp(left, "uint32") == 0)
+                   ? left
+                   : NULL;
+    } else if (mono_is_int32_literal(bin->left)) {
+      result = !is_bits && mono_outranks_int32(right) ? right : NULL;
+    }
+  }
+  if (result != left) {
+    free(left);
+  }
+  if (result != right) {
+    free(right);
+  }
+  return result;
+}
+
+static char *mono_exact_unary_type(MonoContext *ctx, UnaryExpression *un,
+                                   MonoVarEnv *env) {
+  char *inner;
+  size_t len;
+  if (strcmp(un->operator, "!") == 0) {
+    return mettle_strdup("bool");
+  }
+  inner = mono_static_type_of(ctx, un->operand, env);
+  len = inner ? strlen(inner) : 0;
+  if (len == 0) {
+    free(inner);
+    return NULL;
+  }
+  if (strcmp(un->operator, "&") == 0) {
+    char *text;
+    if (inner[len - 1] == ']') {
+      free(inner);
+      return NULL;
+    }
+    text = malloc(len + 2);
+    if (text) {
+      snprintf(text, len + 2, "%s*", inner);
+    }
+    free(inner);
+    return text;
+  }
+  if (strcmp(un->operator, "*") == 0) {
+    if (inner[len - 1] == '*') {
+      inner[len - 1] = '\0';
+      return inner;
+    }
+    free(inner);
+    return NULL;
+  }
+  if (mono_is_number_type(inner) &&
+      !(un->operand && un->operand->type == AST_NUMBER_LITERAL &&
+        strcmp(inner, "uint64") == 0)) {
+    return inner;
+  }
+  free(inner);
+  return NULL;
+}
+
+static char *mono_exact_index_type(MonoContext *ctx, ArrayIndexExpression *ix,
+                                   MonoVarEnv *env) {
+  char *base = mono_static_type_of(ctx, ix->array, env);
+  size_t len = base ? strlen(base) : 0;
+  if (base && strcmp(base, "string") == 0) {
+    free(base);
+    return mettle_strdup("char");
+  }
+  if (len > 0 && base[len - 1] == '*') {
+    base[len - 1] = '\0';
+    return base;
+  }
+  if (len > 0 && base[len - 1] == ']') {
+    char *open = strchr(base, '[');
+    if (open && open == strrchr(base, '[') && !strchr(open, ',')) {
+      *open = '\0';
+      return base;
+    }
+  }
+  free(base);
+  return NULL;
+}
+
+static char *mono_identifier_type(MonoContext *ctx, Identifier *id,
+                                  MonoVarEnv *env) {
+  const MonoVarBinding *bound = id ? mono_env_find(env, id->name) : NULL;
+  size_t cursor = 0;
+  ASTNode *global;
+  if (bound) {
+    return bound->type_name ? mettle_strdup(bound->type_name) : NULL;
+  }
+  if (!id || !id->name) {
+    return NULL;
+  }
+  if (strcmp(id->name, "true") == 0 || strcmp(id->name, "false") == 0) {
+    return mettle_strdup("bool");
+  }
+  global = mono_find_declaration(ctx, AST_VAR_DECLARATION, id->name, &cursor);
+  if (global) {
+    VarDeclaration *declared = (VarDeclaration *)global->data;
+    if (declared->type_name) {
+      return mettle_strdup(declared->type_name);
+    }
+    if (declared->initializer &&
+        (declared->initializer->type == AST_NUMBER_LITERAL ||
+         declared->initializer->type == AST_STRING_LITERAL)) {
+      return mono_static_type_of(ctx, declared->initializer, NULL);
+    }
+  }
+  return NULL;
+}
+
+static char *mono_new_expression_type(const NewExpression *ne) {
+  char *text;
+  size_t len;
+  if (!ne || !ne->type_name || ne->extent_count > 0) {
+    return NULL;
+  }
+  len = strlen(ne->type_name) + 3;
+  text = malloc(len);
+  if (text) {
+    snprintf(text, len, ne->count ? "%s[]" : "%s*", ne->type_name);
+  }
+  return text;
+}
 
 static char *mono_static_type_of(MonoContext *ctx, ASTNode *expr,
                                  MonoVarEnv *env) {
@@ -2542,122 +3103,56 @@ static char *mono_static_type_of(MonoContext *ctx, ASTNode *expr,
     if (lit->is_char) {
       return mettle_strdup("char");
     }
-    return mettle_strdup(lit->is_float ? "float64" : "int32");
+    return mettle_strdup(lit->is_float ? "float64"
+                                       : ast_integer_literal_type_name(lit));
   }
   case AST_STRING_LITERAL:
     return mettle_strdup("string");
-  case AST_IDENTIFIER: {
-    Identifier *id = (Identifier *)expr->data;
-    const char *bound = id ? mono_env_lookup(env, id->name) : NULL;
-    return bound ? mettle_strdup(bound) : NULL;
-  }
+  case AST_IDENTIFIER:
+    return mono_identifier_type(ctx, (Identifier *)expr->data, env);
   case AST_CAST_EXPRESSION: {
     CastExpression *cast = (CastExpression *)expr->data;
     return cast && cast->type_name ? mettle_strdup(cast->type_name) : NULL;
   }
-  case AST_NEW_EXPRESSION: {
-    NewExpression *ne = (NewExpression *)expr->data;
-    char *text;
-    size_t len;
-    if (!ne || !ne->type_name) {
-      return NULL;
-    }
-    len = strlen(ne->type_name) + 2;
-    text = malloc(len);
-    if (!text) {
-      return NULL;
-    }
-    snprintf(text, len, "%s*", ne->type_name);
-    return text;
+  case AST_NEW_EXPRESSION:
+    return mono_new_expression_type((NewExpression *)expr->data);
+  case AST_UNARY_EXPRESSION: {
+    UnaryExpression *un = (UnaryExpression *)expr->data;
+    return un && un->operator ? mono_exact_unary_type(ctx, un, env) : NULL;
   }
-  case AST_UNARY_EXPRESSION:
-  case AST_INDEX_EXPRESSION:
-    return mono_static_type_of_element(ctx, expr, env);
+  case AST_INDEX_EXPRESSION: {
+    ArrayIndexExpression *ix = (ArrayIndexExpression *)expr->data;
+    return ix ? mono_exact_index_type(ctx, ix, env) : NULL;
+  }
+  case AST_MEMBER_ACCESS: {
+    MemberAccess *member = (MemberAccess *)expr->data;
+    char *owner = member ? mono_static_type_of(ctx, member->object, env) : NULL;
+    char *field = owner ? mono_field_type_text(ctx, owner, member->member) : NULL;
+    free(owner);
+    return field;
+  }
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *bin = (BinaryExpression *)expr->data;
-    char *left;
-    if (!bin || !bin->operator) {
-      return NULL;
-    }
-    if (strcmp(bin->operator, "==") == 0 || strcmp(bin->operator, "!=") == 0 ||
-        strcmp(bin->operator, "<") == 0 || strcmp(bin->operator, ">") == 0 ||
-        strcmp(bin->operator, "<=") == 0 || strcmp(bin->operator, ">=") == 0 ||
-        strcmp(bin->operator, "&&") == 0 || strcmp(bin->operator, "||") == 0) {
-      return NULL;
-    }
-    left = mono_static_type_of(ctx, bin->left, env);
-    if (left) {
-      return left;
-    }
-    return mono_static_type_of(ctx, bin->right, env);
+    return bin && bin->operator ? mono_exact_binary_type(ctx, bin, env) : NULL;
   }
   case AST_FUNCTION_CALL:
-    return mono_static_return_type_of_call(ctx, expr);
+    return mono_static_return_type_of_call(ctx, expr, env);
   default:
     return NULL;
   }
 }
 
-static char *mono_static_type_of_element(MonoContext *ctx, ASTNode *expr,
-                                         MonoVarEnv *env) {
-  switch (expr->type) {
-  case AST_UNARY_EXPRESSION: {
-    UnaryExpression *un = (UnaryExpression *)expr->data;
-    char *inner;
-    if (!un || !un->operator) {
-      return NULL;
+static char *mono_argument_type_of(MonoContext *ctx, ASTNode *expr,
+                                   MonoVarEnv *env) {
+  char *type = mono_static_type_of(ctx, expr, env);
+  if (!type && expr && expr->type == AST_BINARY_EXPRESSION) {
+    BinaryExpression *bin = (BinaryExpression *)expr->data;
+    type = bin ? mono_argument_type_of(ctx, bin->left, env) : NULL;
+    if (!type && bin) {
+      type = mono_argument_type_of(ctx, bin->right, env);
     }
-    inner = mono_static_type_of(ctx, un->operand, env);
-    if (strcmp(un->operator, "&") == 0) {
-      char *text;
-      size_t len;
-      if (!inner) {
-        return NULL;
-      }
-      len = strlen(inner) + 2;
-      text = malloc(len);
-      if (text) {
-        snprintf(text, len, "%s*", inner);
-      }
-      free(inner);
-      return text;
-    }
-    if (strcmp(un->operator, "*") == 0) {
-      size_t len = inner ? strlen(inner) : 0;
-      if (len > 0 && inner[len - 1] == '*') {
-        inner[len - 1] = '\0';
-        return inner;
-      }
-      free(inner);
-      return NULL;
-    }
-    return inner;
   }
-  case AST_INDEX_EXPRESSION: {
-    ArrayIndexExpression *ix = (ArrayIndexExpression *)expr->data;
-    char *base = ix ? mono_static_type_of(ctx, ix->array, env) : NULL;
-    size_t len = base ? strlen(base) : 0;
-    if (!base || len == 0) {
-      free(base);
-      return NULL;
-    }
-    if (base[len - 1] == '*') {
-      base[len - 1] = '\0';
-      return base;
-    }
-    if (base[len - 1] == ']') {
-      char *open = strrchr(base, '[');
-      if (open) {
-        *open = '\0';
-        return base;
-      }
-    }
-    free(base);
-    return NULL;
-  }
-  default:
-    return NULL;
-  }
+  return type;
 }
 
 static long mono_literal_param_index(const GenericDef *def,
@@ -2726,7 +3221,8 @@ static int mono_infer_call_type_args(MonoContext *ctx, ASTNode *node,
       if ((literal_param >= 0) != (pass == 1)) {
         continue;
       }
-      actual = mono_static_type_of(ctx, call->arguments[i], env);
+      actual = mono_written_form(
+          ctx, mono_argument_type_of(ctx, call->arguments[i], env));
       if (!actual) {
         continue;
       }
@@ -2785,6 +3281,20 @@ done:
   return ok;
 }
 
+static void mono_state_binding_type(MonoContext *ctx, VarDeclaration *decl,
+                                    MonoVarEnv *env) {
+  char *stated;
+  if (decl->type_name || decl->structural_type || !decl->initializer) {
+    return;
+  }
+  stated = mono_static_type_of(ctx, decl->initializer, env);
+  if (stated) {
+    decl->type_name = (char *)string_intern(stated);
+    decl->type_is_inferred = 1;
+    free(stated);
+  }
+}
+
 static int mono_infer_type_args_in_node(MonoContext *ctx, ASTNode *node,
                                         MonoVarEnv *env) {
   size_t i;
@@ -2818,36 +3328,69 @@ static int mono_infer_type_args_in_node(MonoContext *ctx, ASTNode *node,
         !mono_infer_type_args_in_node(ctx, decl->initializer, env)) {
       return 0;
     }
-    if (decl && decl->name && decl->type_name &&
-        !mono_env_add(env, decl->name, decl->type_name)) {
-      return 0;
+    if (decl && decl->name) {
+      mono_state_binding_type(ctx, decl, env);
+      if (!mono_env_add(env, decl->name, decl->type_name)) {
+        return 0;
+      }
     }
     return 1;
   }
 
-  for (i = 0; i < node->child_count; i++) {
-    if (!mono_infer_type_args_in_node(ctx, node->children[i], env)) {
+  if (node->type == AST_MATCH_STATEMENT && node->data) {
+    MatchStatement *match = (MatchStatement *)node->data;
+    if (!mono_infer_type_args_in_node(ctx, match->expression, env)) {
       return 0;
+    }
+    for (i = 0; i < match->arm_count; i++) {
+      size_t scope = env->count;
+      if (!mono_env_add(env, match->arms[i].binding_name, NULL) ||
+          !mono_infer_type_args_in_node(ctx, match->arms[i].body, env)) {
+        return 0;
+      }
+      env->count = scope;
+    }
+    return 1;
+  }
+
+  {
+    size_t scope = env->count;
+    if (node->type == AST_COMPTIME_FOR && node->data &&
+        !mono_env_add(env, ((ComptimeForStatement *)node->data)->binding_name,
+                      NULL)) {
+      return 0;
+    }
+    if (node->type == AST_LAMBDA_EXPRESSION && node->data) {
+      FunctionDeclaration *lambda = (FunctionDeclaration *)node->data;
+      for (i = 0; i < lambda->parameter_count; i++) {
+        if (!mono_env_add(env, lambda->parameter_names[i],
+                          lambda->parameter_types[i])) {
+          return 0;
+        }
+      }
+    }
+    for (i = 0; i < node->child_count; i++) {
+      if (!mono_infer_type_args_in_node(ctx, node->children[i], env)) {
+        return 0;
+      }
+    }
+    if (mono_node_opens_scope(node)) {
+      env->count = scope;
     }
   }
   return 1;
 }
 
-static int mono_infer_type_args_in_function(MonoContext *ctx,
-                                            ASTNode *function) {
-  FunctionDeclaration *fn = NULL;
+static int mono_infer_type_args_in_body(MonoContext *ctx,
+                                        FunctionDeclaration *fn,
+                                        char *receiver) {
   MonoVarEnv env = {0};
   int ok = 1;
   size_t i;
 
-  if (!ctx || !function || function->type != AST_FUNCTION_DECLARATION) {
-    return 1;
+  if (receiver && !mono_env_add(&env, (char *)"this", receiver)) {
+    ok = 0;
   }
-  fn = (FunctionDeclaration *)function->data;
-  if (!fn || !fn->body || fn->type_param_count > 0) {
-    return 1;
-  }
-
   for (i = 0; i < fn->parameter_count && ok; i++) {
     if (!mono_env_add(&env, fn->parameter_names[i], fn->parameter_types[i])) {
       ok = 0;
@@ -2858,6 +3401,35 @@ static int mono_infer_type_args_in_function(MonoContext *ctx,
   }
   free(env.items);
   return ok;
+}
+
+static int mono_infer_type_args_in_function(MonoContext *ctx,
+                                            ASTNode *function) {
+  FunctionDeclaration *fn = NULL;
+
+  if (!ctx || !function) {
+    return 1;
+  }
+  if (function->type == AST_STRUCT_DECLARATION && function->data) {
+    StructDeclaration *sd = (StructDeclaration *)function->data;
+    for (size_t m = 0; sd->type_param_count == 0 && m < sd->method_count; m++) {
+      FunctionDeclaration *method = (FunctionDeclaration *)sd->methods[m]->data;
+      if (method && method->body &&
+          !mono_infer_type_args_in_body(ctx, method, sd->name)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+  if (function->type != AST_FUNCTION_DECLARATION) {
+    return 1;
+  }
+  fn = (FunctionDeclaration *)function->data;
+  if (!fn || !fn->body || fn->type_param_count > 0) {
+    return 1;
+  }
+
+  return mono_infer_type_args_in_body(ctx, fn, NULL);
 }
 
 static int mono_infer_type_args(MonoContext *ctx, ASTNode *program) {
@@ -3260,8 +3832,7 @@ static int mono_emit_instantiation(MonoContext *ctx, Program *prog,
   ast_add_child(program, mono_node);
 
   ctx->instances[index].emitted = 1;
-  if (mono_node->type == AST_FUNCTION_DECLARATION &&
-      !mono_infer_type_args_in_function(ctx, mono_node)) {
+  if (!mono_infer_type_args_in_function(ctx, mono_node)) {
     *success = 0;
     return 0;
   }
@@ -3486,8 +4057,9 @@ static void cc_emit_capturing(ASTNode *lambda, FunctionDeclaration *fd,
     if (!caps->types[i]) {
       char message[256];
       snprintf(message, sizeof(message),
-               "cannot capture '%s' in a closure: its type is inferred; add an "
-               "explicit type annotation to the variable",
+               "cannot capture '%s' in a closure: a closure is built before "
+               "types are checked, and its initializer does not state its type "
+               "that early; write the type on the variable",
                caps->names[i]);
       if (reporter)
         error_reporter_add_error(reporter, ERROR_SEMANTIC, lambda->location,
@@ -4606,6 +5178,7 @@ int monomorphize_revisit(ASTNode *whole, ErrorReporter *reporter) {
   for (size_t i = 0; i < kept; i++) {
     ast_add_child(whole, prog->declarations[i]);
   }
+  free(ctx.decl_slots);
   return !ctx.had_error;
 }
 
@@ -4692,13 +5265,13 @@ int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
     goto cleanup;
   }
 
-  if (ctx.def_count > 0) {
-    ctx.module = prog;
-    if (!mono_infer_type_args(&ctx, program)) {
-      success = 0;
-      goto cleanup;
-    }
+  ctx.module = prog;
+  if (!mono_infer_type_args(&ctx, program)) {
+    success = 0;
+    goto cleanup;
+  }
 
+  if (ctx.def_count > 0) {
     collect_type_instantiations(program, &ctx);
 
     size_t processed = 0;
@@ -4775,6 +5348,7 @@ int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
   prog->declaration_count = write_idx;
 
 cleanup:
+  free(ctx.decl_slots);
   for (size_t i = 0; i < ctx.trait_count; i++) {
     free(ctx.traits[i].name);
   }

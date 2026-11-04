@@ -83,10 +83,14 @@ backtrack, which was a real bug once.
 | `monomorphize.c` | One copy per set of generic type arguments |
 | `register_allocator.c` | Frontend-side allocation hints |
 
-Nothing is inferred about a binding's type, which removes a whole layer this
-stage would otherwise carry. What is inferred is analysis: the borrow and
-memory checks derive their facts and report only what they prove. There is no
-ownership syntax to write.
+A local binding may leave its type off. The type checker works it out from the
+initializer and writes it back onto the declaration, so every later pass reads
+it as written. Generics and closures run first and need some of those types
+early, so `monomorphize.c` fills in what the line states and the checker refuses
+any answer that differs from its own. No type crosses a function boundary, which
+removes a whole layer this stage would otherwise carry. The rest of what is
+inferred is analysis: the borrow and memory checks derive their facts and report
+only what they prove. There is no ownership syntax to write.
 
 Module-scope `comptime for` sits between two type sweeps: the written types are
 registered before it runs, and the declarations it generates are registered

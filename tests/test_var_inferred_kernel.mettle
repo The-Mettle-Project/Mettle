@@ -1,0 +1,16 @@
+// A kernel's locals infer the same way. `row` takes the view's row type.
+kernel(block = 32) scale_rows(v: float32[,], k: float32) {
+  var i = (int64)thread.x;
+  if (i < v.dims[0]) {
+    var row = v[i];
+    var scale = k;
+    for j in 0..row.length {
+      var was = row[j];
+      row[j] = was * scale;
+    }
+  }
+}
+
+fn main() -> int32 {
+  return 0;
+}

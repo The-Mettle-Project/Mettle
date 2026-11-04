@@ -1,22 +1,71 @@
 # Types
 
-Every binding in Mettle carries a written type. The compiler infers none of
-them. This page lists the types, their sizes, and the rules for moving a value
-from one type to another.
+A signature, a struct field and a global `var` carry a written type. A local
+binding may leave its type off where the line already says it. This page lists
+the types, their sizes, and the rules for moving a value from one type to
+another.
 
-## Nothing is inferred
+## Leaving the type off
 
-A `var` needs a type, and so does a local `const`:
+A local `var` or `const` takes its type from its initializer:
 
 ```mettle
-var count: int64 = 0;
-const LIMIT: int32 = 512;
+var count = 0;
+var total = (int64)0;
+var node = new Node;
+var rows = load_rows(path);
+const LIMIT = 512;
 ```
 
-Leaving the type off is an error, even when the initializer makes the type
-obvious. Two places relieve you of writing one, and both take the type from
-the surrounding structure: the counter of a range loop, `for i in 0..n`, and a
-global `const` holding an integer literal.
+`count` is `int32`, because that is what an integer literal is with no other
+context. Write the type when you want another width: `var count: int64 = 0;`.
+
+These initializers state a type:
+
+- A literal: `int32` (wider if the value does not fit), `float64`, `char`,
+  `string` or `bool`.
+- A cast, `new T` and `new T[n]`.
+- A call. The callee's declared return type is the answer, so a binding never
+  depends on the body of the function it calls.
+- A lambda, by its signature.
+- A place: another binding, a field, an element, `*p` or `&x`.
+- A comparison, `&&`, `||` or `!`, which are all `bool`.
+- Arithmetic whose operands share a type, as in `(lo + hi) / 2`. A number literal
+  beside a typed operand follows it when the result keeps that type, as in
+  `i + 1`.
+
+The compiler refuses the rest and names the type to write:
+
+```mettle
+var a: int32 = 2;
+var b: int64 = 3;
+var total = a * b;
+```
+
+```text
+error[E0003]: 'total' needs a written type: 'int32 * int64' gives 'int64' by promotion, so the line does not say it; write 'var total: int64 = ...'
+```
+
+The same goes for `half * 2.0` when `half` is `float32`, for `small + 1` when
+`small` is `int8`, and for `c - 'a'`: promotion picks each of those widths. Four
+other forms are refused:
+
+- A struct or array literal. `{ lo: 5, hi: 7 }` names fields and no type, so
+  write `var r: Range = { lo: 5, hi: 7 };`.
+- A bare constructor of a generic enum, or a variant name two enums share.
+  `Some(5)` does not say which `Option` it builds.
+- A call that returns nothing.
+- A global `var`.
+
+A closure is built before types are checked, so a binding it captures has to
+state its type that early. Literals, casts, `new`, calls, places and arithmetic
+do. A `match` expression, a builtin and a lambda do not, and capturing one asks
+you to write the type.
+
+An inferred binding behaves exactly like a written one from then on: the same
+checks, the same code. `mettle expand` prints the type the compiler chose. The
+counter of a range loop, `for i in 0..n`, keeps its own rule and takes the type
+from the loop.
 
 ## Sizes and alignment
 

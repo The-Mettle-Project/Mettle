@@ -129,6 +129,7 @@ typedef struct {
   int is_const;
   char *link_name;
   int structural_type;
+  int type_is_inferred;
   AstAddressSpace address_space;
   ASTNode *composed_name;
 } VarDeclaration;
@@ -637,6 +638,7 @@ ASTNode *ast_create_identifier(const char *name, SourceLocation location);
 ASTNode *ast_create_identifier_with_scope(const char *name,
                                           ASTScopeId scope_id,
                                           SourceLocation location);
+const char *ast_integer_literal_type_name(const NumberLiteral *literal);
 ASTNode *ast_create_number_literal(long long int_value,
                                    SourceLocation location,
                                    unsigned char int_radix);

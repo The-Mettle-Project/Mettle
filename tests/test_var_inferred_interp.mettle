@@ -1,0 +1,31 @@
+// `mettle test` runs this in the compile-time interpreter.
+struct Point { x: int64; y: int64; }
+
+fn make(a: int64) -> Point {
+  var p: Point = { x: a, y: a + 1 };
+  return p;
+}
+
+fn sum_to(n: int32) -> int32 {
+  var total = 0;
+  for (var i = 1; i <= n; i = i + 1) {
+    total = total + i;
+  }
+  return total;
+}
+
+@test fn inferred_in_the_interpreter() {
+  var p = make(4);
+  var y = p.y;
+  var s = sum_to(4);
+  var f = 1.5;
+  var name = "abc";
+  assert(y == 5);
+  assert(s == 10);
+  assert(f == 1.5);
+  assert(name.length == 3);
+}
+
+fn main() -> int32 {
+  return 0;
+}

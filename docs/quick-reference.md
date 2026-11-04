@@ -25,9 +25,10 @@ var scratch: uint8[256];
 const LIMIT: int32 = 512;
 ```
 
-Every one carries a type. A local with no initializer starts zeroed. At file
-scope, `const MAX = 100;` may leave the type off when it holds an integer
-literal.
+A local may leave its type off where the initializer says it, as in
+`var total = (int64)0;` or `var node = new Node;`. A local with no initializer
+writes its type and starts zeroed. At file scope, `const MAX = 100;` may leave
+the type off when it holds a literal, and a `var` always writes it.
 
 ## Interpolation
 

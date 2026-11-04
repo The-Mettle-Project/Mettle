@@ -99,7 +99,9 @@ The VS Code and Cursor extension, `mettle-syntax`, and the IntelliJ plugin,
 
 ## A short tour
 
-Nothing is inferred. Every `var` and every local `const` carries a type.
+A signature and a struct field always write their types. A local binding may
+leave its type off where the line says it, as in `var total = (int64)0;`.
+[Types](types.md#leaving-the-type-off) has the rules.
 
 ### Structs and methods
 
