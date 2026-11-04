@@ -77,20 +77,22 @@ export struct SyncCond {
 }
 
 // Unlocks m, waits for a signal or timeout_ms, and locks m again before it
-// returns. Returns false on timeout. Like every condition variable it can
-// also wake for no reason, so wait in a loop that re-checks the condition.
+// returns. Returns false on timeout. A signal that comes just as the wait
+// begins can wake a waiter that was not the one meant, so wait in a loop
+// that re-checks the condition.
 export fn sync_cond_wait_timeout(c: SyncCond*, m: SyncMutex*, timeout_ms: int64) -> bool {
   var deadline: int64 = sync_deadline(timeout_ms);
   var seen: int32 = sync_load(&c->seq);
   sync_mutex_unlock(m);
-  var woken: bool = true;
+  // Keep waiting until a signal moves seq on or the deadline passes. A
+  // platform wait can end a little early (Windows timers are coarse), and
+  // that alone must not count as a wake-up.
   var left: int64 = sync_left(deadline);
-  if (left == 0) {
-    woken = false;
-  } else {
+  while (left != 0 && sync_load(&c->seq) == seen) {
     sync_os_wait(&c->seq, seen, left);
-    if (sync_load(&c->seq) == seen && sync_left(deadline) == 0) { woken = false; }
+    left = sync_left(deadline);
   }
+  var woken: bool = sync_load(&c->seq) != seen;
   // Take the lock as contended: other waiters may be queued behind us.
   while (sync_xchg(&m->state, 2) != 0) {
     sync_os_wait(&m->state, 2, -1);
