@@ -212,6 +212,48 @@ rejects two live values in one register; `METTLE_REGALLOC_VERIFY=1` runs it,
 Loop rotation converts a top-testing loop to a bottom-testing one under three
 guards, the third being that the latch must be the only edge into the header.
 
+Layout runs in `mir_dispatch.c`, `mir_layout.c` and `mir_relax.c`.
+
+```mermaid
+flowchart TD
+  A[Sink partly dead loads] --> B[Thread known loop tests]
+  B --> C[Guard counter wrap]
+  C --> D[Register allocation]
+  D --> E[Copy dispatch into each arm]
+  E --> F[Place blocks]
+  F --> G[Rebuild live positions]
+  G --> H[Encode]
+  H --> I[Relax branches and pads]
+  I --> J[Cold divides and jump tables]
+```
+
+Before allocation, a load used on only some paths sinks into them. A loop test
+whose answer is known on a back edge is skipped, so `running = 0` jumps straight
+out. A 32-bit counter stays canonical with a range check on a never-taken branch,
+which takes a cycle off the path later work depends on.
+
+After allocation, every branch back to a jump table takes its own copy of the
+dispatch, so each arm owns an indirect jump. Blocks then form chains along their
+likeliest edges, from a static estimate of branch probability and block
+frequency, and cold blocks move away. Both run after allocation because a copied
+dispatch makes the loop irreducible, and the allocator needs natural loops for
+spill cost.
+
+Moving code after allocation invalidates the allocator's live positions, and the
+encoder picks scratch registers from them. `mir_cfg_refresh_live_positions`
+rebuilds them from exact liveness on the final order, and `METTLE_MIR_VERIFY=1`
+rejects a moved instruction outside its vreg's positions.
+
+The encoder notes each branch and alignment pad as it goes. `mir_relax.c` then
+shortens every branch that reaches, recomputes the pads against final offsets, and
+remaps every recorded offset. Real divides are emitted after that, out of line: a
+divide whose operands fit in 32 bits takes a mask and a shift when the divisor is
+a power of two, so that path has no taken branch.
+
+`METTLE_SKIP_PASS` names any of these: `mir_sink_partial_loads`,
+`mir_thread_known_tests`, `mir_guard_counter_wrap`, `mir_thread_dispatch`,
+`mir_place_blocks`, `mir_relax`.
+
 When MIR cannot take a function the build stops with a code generation error
 that names the function and the cause. `--explain` reports the same causes.
 
