@@ -48,8 +48,8 @@ static void build_records(Record *recs, int32_t count) {
     }
 }
 
-static int64_t sum_field0(const Record *recs, int32_t count) {
-    int64_t total = 0;
+static int64_t sum_field0(const Record *recs, int32_t count, int64_t seed) {
+    int64_t total = seed;
     for (int32_t i = 0; i < count; i++) {
         total += (int64_t)recs[i].f0;
     }
@@ -68,7 +68,7 @@ int main(void) {
 
     printf("Field-selective AoS walk: 1048576 records (32B), field 0 only\n");
 
-    int64_t check = sum_field0(pool, count);
+    int64_t check = sum_field0(pool, count, 0);
     printf("Checksum = %" PRId64 "\n", check);
 
     const int passes = 100;
@@ -77,7 +77,7 @@ int main(void) {
     uint64_t t0 = bench_time_us();
     int64_t bench_sum = 0;
     for (int p = 0; p < passes; p++) {
-        bench_sum += sum_field0(pool, count);
+        bench_sum += sum_field0(pool, count, (int64_t)p);
     }
     uint64_t elapsed_us = bench_time_us() - t0;
 

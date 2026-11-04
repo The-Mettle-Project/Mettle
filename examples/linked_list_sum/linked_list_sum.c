@@ -45,8 +45,8 @@ static void build_list(Node *nodes, int32_t *order, int32_t count) {
     nodes[order[count - 1]].next = -1;
 }
 
-static int64_t sum_chase(const Node *nodes, int32_t head) {
-    int64_t sum = 0;
+static int64_t sum_chase(const Node *nodes, int32_t head, int64_t seed) {
+    int64_t sum = seed;
     int32_t idx = head;
     while (idx >= 0) {
         sum += (int64_t)nodes[idx].value;
@@ -69,7 +69,7 @@ int main(void) {
 
     printf("Linked-list pointer chase: 65536 nodes\n");
 
-    int64_t check = sum_chase(nodes, head);
+    int64_t check = sum_chase(nodes, head, 0);
     printf("Checksum = %" PRId64 "\n", check);
 
     const int passes = 200;
@@ -78,7 +78,7 @@ int main(void) {
     uint64_t t0 = bench_time_us();
     int64_t bench_sum = 0;
     for (int p = 0; p < passes; p++) {
-        bench_sum += sum_chase(nodes, head);
+        bench_sum += sum_chase(nodes, head, (int64_t)p);
     }
     uint64_t elapsed_us = bench_time_us() - t0;
 

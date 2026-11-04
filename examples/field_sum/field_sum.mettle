@@ -35,8 +35,8 @@ fn build_records(pool: Rec[], count: int32) {
   }
 }
 
-fn sum_field0(pool: Rec[], count: int32) -> int64 {
-  var total: int64 = 0;
+fn sum_field0(pool: Rec[], count: int32, seed: int64) -> int64 {
+  var total: int64 = seed;
   var i: int32 = 0;
   while (i < count) {
     total = total + (int64)pool[i].f0;
@@ -53,7 +53,7 @@ fn main() -> int32 {
 
   println("Field-selective walk: 1048576 records (32B), field 0 only");
 
-  var check: int64 = sum_field0(pool, count);
+  var check: int64 = sum_field0(pool, count, 0);
   print("Checksum = ");
   println("{check}");
 
@@ -64,7 +64,7 @@ fn main() -> int32 {
   var bench_sum: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
-    bench_sum = bench_sum + sum_field0(pool, count);
+    bench_sum = bench_sum + sum_field0(pool, count, (int64)p);
     p = p + 1;
   }
   var elapsed_us: int64 = bench_time_us() - t0;

@@ -50,8 +50,8 @@ fn build_list(nodes: cstring, order: int32*, count: int32) {
   set_node_next(nodes, order[count - 1], -1);
 }
 
-fn sum_chase(nodes: cstring, head: int32) -> int64 {
-  var sum: int64 = 0;
+fn sum_chase(nodes: cstring, head: int32, seed: int64) -> int64 {
+  var sum: int64 = seed;
   var idx: int32 = head;
   while (idx >= 0) {
     sum = sum + (int64)node_value(nodes, idx);
@@ -74,7 +74,7 @@ fn main() -> int32 {
 
   println("Linked-list pointer chase: 65536 nodes");
 
-  var check: int64 = sum_chase(nodes, head);
+  var check: int64 = sum_chase(nodes, head, 0);
   print("Checksum = ");
   println("{check}");
 
@@ -85,7 +85,7 @@ fn main() -> int32 {
   var bench_sum: int64 = 0;
   var p: int32 = 0;
   while (p < passes) {
-    bench_sum = bench_sum + sum_chase(nodes, head);
+    bench_sum = bench_sum + sum_chase(nodes, head, (int64)p);
     p = p + 1;
   }
   var elapsed_us: int64 = bench_time_us() - t0;
