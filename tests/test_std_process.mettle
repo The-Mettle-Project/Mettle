@@ -1,0 +1,262 @@
+// std/process: spawn, wait, kill, output capture, stdin, cwd, env, timeouts
+// and signals as a descriptor. Linux only (it runs /bin/sh, /bin/cat and so on).
+import "std/process";
+import "std/strbuf";
+import "std/arena";
+import "std/conv";
+import "std/mem";
+
+fn text_is(b: StrBuf*, want: string) -> bool {
+  return strbuf_finish_string(b) == want;
+}
+
+// Reads a pipe to the end into b.
+fn slurp(fd: int64, b: StrBuf*) -> int64 {
+  var buf: uint8[4096];
+  while (true) {
+    var r: int64 = proc_read(fd, &buf[0], 4096);
+    if (r < 0) { return r; }
+    if (r == 0) { return 0; }
+    strbuf_append_bytes(b, (cstring)&buf[0], r);
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var arena: Arena* = arena_init(0);
+  var out: StrBuf* = strbuf_new(arena, 64);
+  var err: StrBuf* = strbuf_new(arena, 64);
+  var st: ProcStatus;
+  var o: ProcOptions;
+  var p: Proc;
+
+  // An exit code comes back as the code.
+  var a1: string[3] = ["/bin/sh", "-c", "exit 3"];
+  proc_options_init(&o, a1);
+  if (proc_spawn(&o, &p) != 0) { return 1; }
+  if (p.pid <= 0 || p.stdout_fd != -1) { return 2; }
+  if (proc_wait(&p, &st) != 0) { return 3; }
+  if (st.signaled != 0 || st.code != 3) { return 4; }
+  // A second wait gives the same answer, and the child is gone for try_wait.
+  if (proc_wait(&p, &st) != 0 || st.code != 3) { return 5; }
+  if (proc_try_wait(&p, &st) != 1 || st.code != 3) { return 6; }
+
+  // stdout through a pipe. The program is found by path.
+  var a2: string[2] = ["/bin/echo", "hello"];
+  proc_options_init(&o, a2);
+  o.stdout = PROC_PIPE;
+  if (proc_spawn(&o, &p) != 0) { return 7; }
+  if (p.stdout_fd < 0 || p.stdin_fd != -1) { return 8; }
+  out->len = 0;
+  if (slurp(p.stdout_fd, out) != 0) { return 9; }
+  if (!text_is(out, "hello\n")) { return 10; }
+  if (proc_wait(&p, &st) != 0 || st.code != 0) { return 11; }
+  proc_close(&p);
+
+  // PATH search: no slash in argv[0].
+  var a3: string[2] = ["echo", "found"];
+  out->len = 0;
+  err->len = 0;
+  if (proc_run(a3, "", out, err, (int64)5000, &st) != 0) { return 12; }
+  if (!text_is(out, "found\n") || st.code != 0) { return 13; }
+
+  // stderr is captured apart from stdout.
+  var a4: string[3] = ["/bin/sh", "-c", "echo to-out; echo to-err 1>&2; exit 2"];
+  out->len = 0;
+  err->len = 0;
+  if (proc_run(a4, "", out, err, (int64)5000, &st) != 0) { return 14; }
+  if (!text_is(out, "to-out\n") || !text_is(err, "to-err\n") || st.code != 2) { return 15; }
+
+  // PROC_TO_STDOUT puts stderr in the stdout pipe.
+  proc_options_init(&o, a4);
+  o.stdout = PROC_PIPE;
+  o.stderr = PROC_TO_STDOUT;
+  if (proc_spawn(&o, &p) != 0) { return 16; }
+  if (p.stderr_fd != -1) { return 17; }
+  out->len = 0;
+  slurp(p.stdout_fd, out);
+  proc_wait(&p, &st);
+  proc_close(&p);
+  if (!text_is(out, "to-out\nto-err\n")) { return 18; }
+
+  // PROC_NULL discards the output.
+  proc_options_init(&o, a4);
+  o.stdout = PROC_NULL;
+  o.stderr = PROC_NULL;
+  if (proc_spawn(&o, &p) != 0 || p.stdout_fd != -1) { return 19; }
+  proc_wait(&p, &st);
+  if (st.code != 2) { return 20; }
+
+  // stdin through /bin/cat.
+  var a5: string[1] = ["/bin/cat"];
+  out->len = 0;
+  err->len = 0;
+  if (proc_run(a5, "feed me", out, err, (int64)5000, &st) != 0) { return 21; }
+  if (!text_is(out, "feed me") || st.code != 0) { return 22; }
+
+  // Writing by hand: write, close stdin, read the echo.
+  proc_options_init(&o, a5);
+  o.stdin = PROC_PIPE;
+  o.stdout = PROC_PIPE;
+  if (proc_spawn(&o, &p) != 0) { return 23; }
+  var msg: string = "by hand";
+  if (proc_write(p.stdin_fd, msg.chars, 7) != 7) { return 24; }
+  proc_close_stdin(&p);
+  if (p.stdin_fd != -1) { return 25; }
+  out->len = 0;
+  slurp(p.stdout_fd, out);
+  proc_wait(&p, &st);
+  proc_close(&p);
+  if (!text_is(out, "by hand")) { return 26; }
+
+  // A program that does not exist gives -ENOENT, with nothing left running.
+  var a6: string[1] = ["/no/such/program"];
+  proc_options_init(&o, a6);
+  if (proc_spawn(&o, &p) != -(int64)PROC_ENOENT) { return 27; }
+  var a7: string[1] = ["no-such-program-anywhere"];
+  proc_options_init(&o, a7);
+  if (proc_spawn(&o, &p) != -(int64)PROC_ENOENT) { return 28; }
+  if (proc_run(a7, "", out, err, (int64)1000, &st) != -(int64)PROC_ENOENT) { return 29; }
+  // A file that is not executable gives -EACCES.
+  var a8: string[1] = ["/etc/passwd"];
+  proc_options_init(&o, a8);
+  if (proc_spawn(&o, &p) != -(int64)PROC_EACCES) { return 30; }
+  // An empty argv is invalid.
+  var none: string[] = { data: (string*)0, length: 0 };
+  proc_options_init(&o, none);
+  if (proc_spawn(&o, &p) != -(int64)PROC_EINVAL) { return 31; }
+
+  // A working directory.
+  var a9: string[1] = ["/bin/pwd"];
+  proc_options_init(&o, a9);
+  o.cwd = "/usr";
+  o.stdout = PROC_PIPE;
+  if (proc_spawn(&o, &p) != 0) { return 32; }
+  out->len = 0;
+  slurp(p.stdout_fd, out);
+  proc_wait(&p, &st);
+  proc_close(&p);
+  if (!text_is(out, "/usr\n")) { return 33; }
+  // A missing directory fails the spawn with its errno.
+  o.cwd = "/no/such/dir";
+  if (proc_spawn(&o, &p) != -(int64)PROC_ENOENT) { return 34; }
+
+  // An environment replaces the parent's; without one the child inherits.
+  var a10: string[3] = ["/bin/sh", "-c", "echo [$FOO][$BAR]"];
+  var env: string[2] = ["FOO=one", "BAR=two words"];
+  proc_options_init(&o, a10);
+  o.env = env;
+  o.has_env = 1;
+  o.stdout = PROC_PIPE;
+  if (proc_spawn(&o, &p) != 0) { return 35; }
+  out->len = 0;
+  slurp(p.stdout_fd, out);
+  proc_wait(&p, &st);
+  proc_close(&p);
+  if (!text_is(out, "[one][two words]\n")) { return 36; }
+  // Without an environment the child inherits ours; an empty one leaves it bare.
+  var a11: string[1] = ["/usr/bin/env"];
+  proc_options_init(&o, a11);
+  o.stdout = PROC_PIPE;
+  if (proc_spawn(&o, &p) != 0) { return 37; }
+  out->len = 0;
+  slurp(p.stdout_fd, out);
+  proc_wait(&p, &st);
+  proc_close(&p);
+  if (strbuf_len(out) == 0 || st.code != 0) { return 38; }
+  var empty_env: string[] = { data: (string*)0, length: 0 };
+  o.env = empty_env;
+  o.has_env = 1;
+  if (proc_spawn(&o, &p) != 0) { return 39; }
+  out->len = 0;
+  slurp(p.stdout_fd, out);
+  proc_wait(&p, &st);
+  proc_close(&p);
+  if (strbuf_len(out) != 0 || st.code != 0) { return 40; }
+
+  // kill with SIGTERM: the status says which signal.
+  var sleeper: string[2] = ["/bin/sleep", "5"];
+  proc_options_init(&o, sleeper);
+  if (proc_spawn(&o, &p) != 0) { return 41; }
+  if (proc_try_wait(&p, &st) != 0) { return 42; }
+  if (proc_kill(p.pid, PROC_SIGTERM) != 0) { return 43; }
+  if (proc_wait(&p, &st) != 0) { return 44; }
+  if (st.signaled != 1 || st.signal != PROC_SIGTERM) { return 45; }
+  // Once reaped, proc_send refuses, and the pid is gone.
+  if (proc_send(&p, PROC_SIGTERM) != -(int64)PROC_ESRCH) { return 46; }
+  if (proc_kill(p.pid, 0) != -(int64)PROC_ESRCH) { return 47; }
+
+  // wait_timeout times out, then the child is killed and reaped.
+  if (proc_spawn(&o, &p) != 0) { return 48; }
+  if (proc_wait_timeout(&p, (int64)100, &st) != 0) { return 49; }
+  if (proc_kill(p.pid, 0) != 0) { return 50; }
+  proc_send(&p, PROC_SIGKILL);
+  if (proc_wait_timeout(&p, (int64)5000, &st) != 1) { return 51; }
+  if (st.signaled != 1 || st.signal != PROC_SIGKILL) { return 52; }
+  // A finished child answers at once.
+  var quick: string[3] = ["/bin/sh", "-c", "exit 0"];
+  proc_options_init(&o, quick);
+  if (proc_spawn(&o, &p) != 0) { return 53; }
+  if (proc_wait_timeout(&p, (int64)5000, &st) != 1 || st.code != 0) { return 54; }
+
+  // proc_run kills a child that runs past the timeout.
+  out->len = 0;
+  err->len = 0;
+  var r: int64 = proc_run(sleeper, "", out, err, (int64)150, &st);
+  if (r != -(int64)PROC_ETIMEDOUT) { return 55; }
+  if (st.signaled != 1 || st.signal != PROC_SIGKILL) { return 56; }
+
+  // A big output on both streams does not deadlock.
+  var big: string[3] = ["/bin/sh", "-c", "head -c 1048576 /dev/zero; head -c 1048576 /dev/zero 1>&2"];
+  out->len = 0;
+  err->len = 0;
+  if (proc_run(big, "", out, err, (int64)20000, &st) != 0) { return 57; }
+  if (strbuf_len(out) != (int64)1048576 || strbuf_len(err) != (int64)1048576) { return 58; }
+  if (st.code != 0) { return 59; }
+
+  // 1 MB in through cat and 1 MB back out: both pipes stay busy.
+  var blob: uint8* = malloc((int64)1048576);
+  for i in 0..1048576 { blob[i] = (uint8)(97 + i % 26); }
+  var input: string = str_from_bytes((cstring)blob, (int64)1048576);
+  out->len = 0;
+  err->len = 0;
+  if (proc_run(a5, input, out, err, (int64)20000, &st) != 0) { return 60; }
+  if (strbuf_len(out) != (int64)1048576 || st.code != 0) { return 61; }
+  var same: bool = true;
+  for i in 0..1048576 {
+    if (out->data[i] != blob[i]) { same = false; }
+  }
+  if (!same) { return 62; }
+  // A child that never reads its stdin does not stall us when it exits.
+  var deaf: string[3] = ["/bin/sh", "-c", "exit 4"];
+  out->len = 0;
+  if (proc_run(deaf, input, out, err, (int64)20000, &st) != 0) { return 63; }
+  if (st.code != 4) { return 64; }
+  free(blob);
+
+  // Our own ids.
+  if (proc_pid() <= 0 || proc_parent_pid() <= 0) { return 65; }
+  var pidline: string[3] = ["/bin/sh", "-c", "echo $PPID"];
+  out->len = 0;
+  proc_run(pidline, "", out, err, (int64)5000, &st);
+  var want: string = "{proc_pid()}\n";
+  if (!text_is(out, want)) { return 66; }
+
+  // Signals as a descriptor: block SIGUSR1, send it to ourselves, read it.
+  var sfd: int64 = proc_signal_fd(PROC_SIGUSR1, PROC_SIGUSR2);
+  if (sfd < 0) { return 67; }
+  if (proc_kill(proc_pid(), PROC_SIGUSR1) != 0) { return 68; }
+  if (proc_signal_read(sfd) != PROC_SIGUSR1) { return 69; }
+  if (proc_kill(proc_pid(), PROC_SIGUSR2) != 0) { return 70; }
+  if (proc_signal_read(sfd) != PROC_SIGUSR2) { return 71; }
+  // A child does not inherit the blocked mask: SIGTERM-style default action works
+  // for it, and the descriptor is not passed on.
+  var sh: string[3] = ["/bin/sh", "-c", "kill -USR1 $$; sleep 1"];
+  proc_options_init(&o, sh);
+  if (proc_spawn(&o, &p) != 0) { return 72; }
+  proc_wait(&p, &st);
+  if (st.signaled != 1 || st.signal != PROC_SIGUSR1) { return 73; }
+  proc_signal_release(sfd, PROC_SIGUSR1, PROC_SIGUSR2);
+  arena_free(arena);
+  return 0;
+}
