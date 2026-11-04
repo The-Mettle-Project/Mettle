@@ -20,12 +20,9 @@ typedef struct {
   size_t boundary;
   size_t max_pad;
   size_t phase;
-  int is_loop;
   int stays_long;
   int has_target;
   size_t target;
-  size_t last_back_branch;
-  int has_back_branch;
 } MirRelaxItem;
 
 typedef struct {
@@ -34,13 +31,12 @@ typedef struct {
   size_t capacity;
   long long *delta;
   int disabled;
-  int place_loops;
 } MirRelax;
 
 int mir_relax_note_branch(MirRelax *r, size_t start, size_t length,
                           unsigned char cc, const char *label, size_t fixup);
 int mir_relax_note_pad(MirRelax *r, size_t start, size_t length, size_t boundary,
-                       size_t max_pad, int is_loop);
+                       size_t max_pad);
 int mir_relax_note_pin(MirRelax *r, size_t start, size_t phase);
 
 int mir_relax_apply(MirRelax *r, BinaryFunctionContext *ctx);

@@ -4581,7 +4581,7 @@ static int mir_encode_loop_alignment(MirEncodeState *st, char wanted) {
   }
   return binary_emit_align_code(&ctx->code, boundary, max_pad) &&
          mir_relax_note_pad(&st->relax, start, ctx->code.size - start, boundary,
-                            max_pad, wanted != 4);
+                            max_pad);
 }
 
 static int mir_encode_location_marker(MirFunction *fn, const MirInst *in) {
@@ -4611,7 +4611,6 @@ static int mir_encode_relax(MirEncodeState *st, size_t annot_base) {
   if (st->relax.disabled || ir_pass_name_is_skipped("mir_relax")) {
     return 1;
   }
-  st->relax.place_loops = !ir_pass_name_is_skipped("mir_place_loops");
   if (!mir_relax_apply(&st->relax, ctx)) {
     return enc_err(fn, "out of memory relaxing branches");
   }

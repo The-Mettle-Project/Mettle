@@ -6,8 +6,6 @@
 #define MIR_RELAX_SHORT_LENGTH 2u
 #define MIR_RELAX_MAX_ROUNDS 24
 #define MIR_RELAX_PIN_BOUNDARY 32u
-#define MIR_RELAX_LINE_SHIFT 6u
-#define MIR_RELAX_PLACED_LOOP_BYTES 128u
 
 static MirRelaxItem *mir_relax_push(MirRelax *r) {
   if (r->count == r->capacity) {
@@ -41,7 +39,7 @@ int mir_relax_note_branch(MirRelax *r, size_t start, size_t length,
 }
 
 int mir_relax_note_pad(MirRelax *r, size_t start, size_t length, size_t boundary,
-                       size_t max_pad, int is_loop) {
+                       size_t max_pad) {
   MirRelaxItem *it = mir_relax_push(r);
   if (!it) {
     return 0;
@@ -52,7 +50,6 @@ int mir_relax_note_pad(MirRelax *r, size_t start, size_t length, size_t boundary
   it->new_length = length;
   it->boundary = boundary;
   it->max_pad = max_pad;
-  it->is_loop = is_loop;
   return 1;
 }
 
@@ -89,73 +86,10 @@ size_t mir_relax_map(const MirRelax *r, size_t old_offset) {
                   r->delta[mir_relax_first_ending_after(r, old_offset)]);
 }
 
-static void mir_relax_link_back_branches(MirRelax *r) {
-  for (size_t i = 0; i < r->count; i++) {
-    MirRelaxItem *it = &r->items[i];
-    size_t j;
-    if (it->kind != MIR_RELAX_BRANCH || !it->has_target || it->target > it->start) {
-      continue;
-    }
-    j = mir_relax_first_ending_after(r, it->target);
-    while (j > 0 && r->items[j - 1].start + r->items[j - 1].old_length ==
-                        it->target) {
-      j--;
-    }
-    for (; j < i; j++) {
-      MirRelaxItem *pad = &r->items[j];
-      if (pad->start + pad->old_length != it->target) {
-        break;
-      }
-      if (pad->kind == MIR_RELAX_PAD && pad->is_loop) {
-        pad->has_back_branch = 1;
-        pad->last_back_branch = i;
-        break;
-      }
-    }
-  }
-}
-
 static size_t mir_relax_pad_length(size_t position, size_t boundary,
                                    size_t max_pad) {
   size_t pad = (boundary - (position & (boundary - 1u))) & (boundary - 1u);
   return pad > max_pad ? 0u : pad;
-}
-
-static size_t mir_relax_loop_bytes(const MirRelax *r, size_t pad) {
-  const MirRelaxItem *it = &r->items[pad];
-  const MirRelaxItem *last = &r->items[it->last_back_branch];
-  long long head =
-      (long long)it->start + r->delta[pad] + (long long)it->new_length;
-  long long end = (long long)last->start + r->delta[it->last_back_branch] +
-                  (long long)last->new_length;
-  return end > head ? (size_t)(end - head) : 0u;
-}
-
-static size_t mir_relax_lines(size_t head, size_t bytes) {
-  return ((head + bytes - 1u) >> MIR_RELAX_LINE_SHIFT) -
-         (head >> MIR_RELAX_LINE_SHIFT) + 1u;
-}
-
-static size_t mir_relax_loop_pad(const MirRelax *r, size_t index,
-                                 size_t position) {
-  const MirRelaxItem *it = &r->items[index];
-  size_t bytes;
-  size_t base;
-  if (!r->place_loops || !it->has_back_branch) {
-    return mir_relax_pad_length(position, it->boundary, it->max_pad);
-  }
-  bytes = mir_relax_loop_bytes(r, index);
-  if (bytes == 0 || bytes > MIR_RELAX_PLACED_LOOP_BYTES) {
-    return mir_relax_pad_length(position, it->boundary, it->max_pad);
-  }
-  base = (16u - (position & 15u)) & 15u;
-  for (size_t pad = base; pad < base + 64u; pad += 16u) {
-    if (mir_relax_lines(position + pad, bytes) ==
-        (bytes + (1u << MIR_RELAX_LINE_SHIFT) - 1u) >> MIR_RELAX_LINE_SHIFT) {
-      return pad;
-    }
-  }
-  return base;
 }
 
 static int mir_relax_lay_out(MirRelax *r, int frozen) {
@@ -170,9 +104,7 @@ static int mir_relax_lay_out(MirRelax *r, int frozen) {
     } else if (it->kind == MIR_RELAX_PIN) {
       length = (it->phase - position) & (MIR_RELAX_PIN_BOUNDARY - 1u);
     } else if (!frozen) {
-      length = it->is_loop
-                   ? mir_relax_loop_pad(r, i, position)
-                   : mir_relax_pad_length(position, it->boundary, it->max_pad);
+      length = mir_relax_pad_length(position, it->boundary, it->max_pad);
     }
     changed |= length != it->new_length;
     it->new_length = length;
@@ -349,7 +281,6 @@ int mir_relax_apply(MirRelax *r, BinaryFunctionContext *ctx) {
     return 0;
   }
   mir_relax_resolve_targets(r, ctx);
-  mir_relax_link_back_branches(r);
   mir_relax_settle(r);
   if (!mir_relax_rewrite_code(r, &ctx->code)) {
     return 0;
