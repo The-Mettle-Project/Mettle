@@ -3458,6 +3458,9 @@ typedef struct MtThread {
   int detached;
   void *stack;
   mt_size stack_size;
+  void *mapping;
+  mt_size mapping_size;
+  void *alt_stack;
   void *tls_mapping;
   mt_size tls_mapping_size;
   void *thread_pointer;
@@ -3478,9 +3481,45 @@ static int mt_futex(volatile int *address, int operation, int value,
                                         0));
 }
 
+#define MT_THREAD_GUARD_SIZE 4096u
+#define MT_THREAD_ALT_STACK_SIZE (64u * 1024u)
+
+static void *mt_thread_stack_map(MtThread *thread, mt_size size) {
+  size = (size + (MT_THREAD_GUARD_SIZE - 1u)) & ~(mt_size)(MT_THREAD_GUARD_SIZE - 1u);
+  mt_size total = MT_THREAD_GUARD_SIZE + size + MT_THREAD_ALT_STACK_SIZE;
+  void *base = mmap(MT_NULL, total, MT_PROT_READ | MT_PROT_WRITE,
+                    MT_MAP_PRIVATE | MT_MAP_ANONYMOUS, -1, 0);
+  if (base == (void *)-1) {
+    return MT_NULL;
+  }
+  mprotect(base, MT_THREAD_GUARD_SIZE, 0);
+  thread->mapping = base;
+  thread->mapping_size = total;
+  thread->stack = (mt_u8 *)base + MT_THREAD_GUARD_SIZE;
+  thread->stack_size = size;
+  thread->alt_stack = (mt_u8 *)thread->stack + size;
+  return thread->stack;
+}
+
+static void mt_thread_stack_unmap(MtThread *thread) {
+  if (thread->mapping) {
+    munmap(thread->mapping, thread->mapping_size);
+    thread->mapping = MT_NULL;
+    thread->stack = MT_NULL;
+  }
+}
+
 static void mt_thread_child(MtThread *thread) __attribute__((noreturn, used));
 
 static void mt_thread_child(MtThread *thread) {
+  if (thread->alt_stack) {
+    MtKernelStack alternate;
+    alternate.pointer = thread->alt_stack;
+    alternate.flags = 0;
+    alternate.padding = 0;
+    alternate.size = MT_THREAD_ALT_STACK_SIZE;
+    mt_syscall6(MT_SYS_SIGALTSTACK, (mt_i64)&alternate, 0, 0, 0, 0, 0);
+  }
   mt_stack_high = (mt_u8 *)thread->stack + thread->stack_size;
   thread->result = thread->pthread_start
                        ? thread->pthread_start(thread->argument)
@@ -3807,14 +3846,11 @@ mt_i64 mettle_thread_create(void *attributes, mt_u64 stack_size,
     return (mt_i64)thread;
   }
   MtThread *thread = (MtThread *)calloc(1, sizeof(MtThread));
-  void *stack = malloc(size);
-  if (!thread || !stack) {
+  if (!thread || !mt_thread_stack_map(thread, size)) {
     free(thread);
-    free(stack);
     return 0;
   }
-  thread->stack = stack;
-  thread->stack_size = size;
+  size = thread->stack_size;
   thread->start = start;
   thread->argument = argument;
   if (mt_tls_memory_size) {
@@ -3827,16 +3863,16 @@ mt_i64 mettle_thread_create(void *attributes, mt_u64 stack_size,
                                    thread->tls_mapping_size,
                                    &thread->thread_pointer)) {
       free(thread->tls_mapping);
-      free(stack);
+      mt_thread_stack_unmap(thread);
       free(thread);
       return 0;
     }
   }
-  mt_i64 tid = mt_clone_start((mt_u8 *)stack + size, MT_CLONE_FLAGS, thread,
-                              thread->thread_pointer);
+  mt_i64 tid = mt_clone_start((mt_u8 *)thread->stack + size, MT_CLONE_FLAGS,
+                              thread, thread->thread_pointer);
   if (tid < 0) {
     free(thread->tls_mapping);
-    free(stack);
+    mt_thread_stack_unmap(thread);
     free(thread);
     return 0;
   }
@@ -3864,14 +3900,10 @@ static mt_i64 mt_pthread_create(MtPthreadStart start, void *argument) {
     return (mt_i64)thread;
   }
   MtThread *thread = (MtThread *)calloc(1, sizeof(MtThread));
-  void *stack = malloc(MT_THREAD_STACK_SIZE);
-  if (!thread || !stack) {
+  if (!thread || !mt_thread_stack_map(thread, MT_THREAD_STACK_SIZE)) {
     free(thread);
-    free(stack);
     return 0;
   }
-  thread->stack = stack;
-  thread->stack_size = MT_THREAD_STACK_SIZE;
   thread->pthread_start = start;
   thread->argument = argument;
   if (mt_tls_memory_size) {
@@ -3883,17 +3915,17 @@ static mt_i64 mt_pthread_create(MtPthreadStart start, void *argument) {
                                    thread->tls_mapping_size,
                                    &thread->thread_pointer)) {
       free(thread->tls_mapping);
-      free(stack);
+      mt_thread_stack_unmap(thread);
       free(thread);
       return 0;
     }
   }
-  mt_i64 tid = mt_clone_start((mt_u8 *)stack + MT_THREAD_STACK_SIZE,
+  mt_i64 tid = mt_clone_start((mt_u8 *)thread->stack + thread->stack_size,
                               MT_CLONE_FLAGS, thread,
                               thread->thread_pointer);
   if (tid < 0) {
     free(thread->tls_mapping);
-    free(stack);
+    mt_thread_stack_unmap(thread);
     free(thread);
     return 0;
   }
@@ -3936,7 +3968,7 @@ int mettle_thread_close(mt_i64 handle) {
     thread->detached = 1;
     return 1;
   }
-  free(thread->stack);
+  mt_thread_stack_unmap(thread);
   free(thread->tls_mapping);
   free(thread);
   return 1;
