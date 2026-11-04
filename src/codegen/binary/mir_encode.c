@@ -4587,8 +4587,9 @@ static int mir_encode_loop_alignment(MirEncodeState *st, char wanted) {
 static int mir_encode_location_marker(MirFunction *fn, const MirInst *in) {
   const IRInstruction *src;
 
-  if (!fn->generator->generate_stack_trace_support || !fn->ir_function ||
-      in->ir_index < 0 ||
+  if ((!fn->generator->generate_stack_trace_support &&
+       !fn->generator->generate_debug_info) ||
+      !fn->ir_function || in->ir_index < 0 ||
       (size_t)in->ir_index >= fn->ir_function->instruction_count) {
     return 1;
   }

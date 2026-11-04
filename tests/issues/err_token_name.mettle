@@ -1,0 +1,4 @@
+fn main() -> int32 {
+  var xs: int32[2] = [1, 2];
+  return xs[0..1];
+}

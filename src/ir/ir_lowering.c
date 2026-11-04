@@ -462,6 +462,16 @@ int ir_emit(IRLoweringContext *context, IRFunction *function,
     stamped.expansion_note = context->current_expansion_note;
     instruction = &stamped;
   }
+  if (instruction && instruction->op == IR_OP_BRANCH_ZERO &&
+      instruction->lhs.kind == IR_OPERAND_FLOAT) {
+    IRInstruction folded = *instruction;
+    folded.lhs = ir_operand_int(instruction->lhs.float_value != 0.0);
+    if (!ir_function_append_instruction(function, &folded)) {
+      ir_set_error(context, "Out of memory while appending IR instruction");
+      return 0;
+    }
+    return 1;
+  }
   if (!ir_function_append_instruction(function, instruction)) {
     ir_set_error(context, "Out of memory while appending IR instruction");
     return 0;

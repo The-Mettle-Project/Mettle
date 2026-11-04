@@ -2,6 +2,7 @@
 
 #include "debug/debug_info.h"
 #include "runtime/crash_handler.h"
+#include "runtime/owned.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -53,8 +54,9 @@ int code_generator_binary_emit_runtime_location_marker(
   char *label = NULL;
 
   if (!generator || !context || !generator->debug_info ||
-      !generator->generate_stack_trace_support || source_line == 0 ||
-      !generator->current_function_name) {
+      (!generator->generate_stack_trace_support &&
+       !generator->generate_debug_info) ||
+      source_line == 0 || !generator->current_function_name) {
     return 1;
   }
 
@@ -638,20 +640,370 @@ static int binary_debug_append_section(BinaryEmitter *emitter, const char *name,
                                      buffer->size, NULL);
 }
 
+typedef struct {
+  size_t offset;
+  BinaryRelocationKind kind;
+  const char *symbol;
+  int64_t addend;
+} DwarfReloc;
+
+typedef struct {
+  BinaryCodeBuffer bytes;
+  DwarfReloc *relocs;
+  size_t reloc_count;
+  size_t reloc_capacity;
+} DwarfSection;
+
+static const char *const DWARF_ABBREV_SYMBOL = ".Lmettle_debug_abbrev";
+static const char *const DWARF_LINE_SYMBOL = ".Lmettle_debug_line";
+static const char *const DWARF_STR_SYMBOL = ".Lmettle_debug_str";
+static const char *const DWARF_RANGES_SYMBOL = ".Lmettle_debug_ranges";
+
+static int dwarf_note_reloc(DwarfSection *section, BinaryRelocationKind kind,
+                            const char *symbol, int64_t addend) {
+  if (section->reloc_count == section->reloc_capacity) {
+    size_t capacity = section->reloc_capacity ? section->reloc_capacity * 2 : 32;
+    DwarfReloc *grown =
+        (DwarfReloc *)realloc(section->relocs, capacity * sizeof(*grown));
+    if (!grown) {
+      return 0;
+    }
+    section->relocs = grown;
+    section->reloc_capacity = capacity;
+  }
+  section->relocs[section->reloc_count].offset = section->bytes.size;
+  section->relocs[section->reloc_count].kind = kind;
+  section->relocs[section->reloc_count].symbol = symbol;
+  section->relocs[section->reloc_count].addend = addend;
+  section->reloc_count++;
+  return 1;
+}
+
+static int dwarf_append_address(DwarfSection *section, const char *symbol) {
+  static const unsigned char zeros[8] = {0};
+  return dwarf_note_reloc(section, BINARY_RELOCATION_ADDR64, symbol, 0) &&
+         binary_code_buffer_append_bytes(&section->bytes, zeros, sizeof(zeros));
+}
+
+static int dwarf_append_section_offset(DwarfSection *section, const char *symbol,
+                                       uint32_t offset) {
+  return dwarf_note_reloc(section, BINARY_RELOCATION_SECTION_REL32, symbol,
+                          (int64_t)offset) &&
+         binary_debug_append_u32(&section->bytes, 0);
+}
+
+static int dwarf_append_string(DwarfSection *info, DwarfSection *strings,
+                               const char *text) {
+  uint32_t offset = (uint32_t)strings->bytes.size;
+  return binary_debug_append_cstring(&strings->bytes, text) &&
+         dwarf_append_section_offset(info, DWARF_STR_SYMBOL, offset);
+}
+
+static int dwarf_append_abbrev(BinaryCodeBuffer *abbrev, unsigned code,
+                               unsigned tag, int children,
+                               const unsigned char *attributes, size_t count) {
+  if (!binary_debug_append_uleb128(abbrev, code) ||
+      !binary_debug_append_uleb128(abbrev, tag) ||
+      !binary_code_buffer_append_u8(abbrev, children ? 1 : 0)) {
+    return 0;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (!binary_debug_append_uleb128(abbrev, attributes[i])) {
+      return 0;
+    }
+  }
+  return binary_debug_append_uleb128(abbrev, 0) &&
+         binary_debug_append_uleb128(abbrev, 0);
+}
+
+static const char *dwarf_unmangled_name(const char *name) {
+  while (strncmp(name, "__import_", 9) == 0) {
+    const char *hex = name + 9;
+    while ((*hex >= '0' && *hex <= '9') || (*hex >= 'a' && *hex <= 'f')) {
+      hex++;
+    }
+    if (hex == name + 9 || *hex != '_') {
+      break;
+    }
+    name = hex + 1;
+  }
+  return name;
+}
+
+typedef struct {
+  const char **names;
+  size_t count;
+  size_t capacity;
+} DwarfFiles;
+
+static size_t dwarf_file_index(DwarfFiles *files, const char *name) {
+  const char *wanted = name ? name : "";
+  for (size_t i = 0; i < files->count; i++) {
+    if (strcmp(files->names[i], wanted) == 0) {
+      return i + 1;
+    }
+  }
+  if (files->count == files->capacity) {
+    size_t capacity = files->capacity ? files->capacity * 2 : 16;
+    const char **grown =
+        (const char **)realloc(files->names, capacity * sizeof(*grown));
+    if (!grown) {
+      return 0;
+    }
+    files->names = grown;
+    files->capacity = capacity;
+  }
+  files->names[files->count++] = wanted;
+  return files->count;
+}
+
+static int dwarf_line_set_address(DwarfSection *program, const char *symbol) {
+  return binary_code_buffer_append_u8(&program->bytes, 0) &&
+         binary_debug_append_uleb128(&program->bytes, 9) &&
+         binary_code_buffer_append_u8(&program->bytes, 2) &&
+         dwarf_append_address(program, symbol);
+}
+
+static int dwarf_line_row(DwarfSection *program, DwarfFiles *files,
+                          size_t *file_state, long long *line_state,
+                          const char *symbol, const char *filename, size_t line,
+                          size_t column) {
+  size_t file = dwarf_file_index(files, filename);
+  if (file == 0 || !dwarf_line_set_address(program, symbol)) {
+    return 0;
+  }
+  if (file != *file_state) {
+    if (!binary_code_buffer_append_u8(&program->bytes, 4) ||
+        !binary_debug_append_uleb128(&program->bytes, file)) {
+      return 0;
+    }
+    *file_state = file;
+  }
+  if ((long long)line != *line_state) {
+    if (!binary_code_buffer_append_u8(&program->bytes, 3) ||
+        !binary_debug_append_sleb128(&program->bytes,
+                                     (long long)line - *line_state)) {
+      return 0;
+    }
+    *line_state = (long long)line;
+  }
+  return binary_code_buffer_append_u8(&program->bytes, 5) &&
+         binary_debug_append_uleb128(&program->bytes, column) &&
+         binary_code_buffer_append_u8(&program->bytes, 1);
+}
+
+static int dwarf_build_line_program(const DebugInfo *debug_info,
+                                    DwarfSection *program, DwarfFiles *files) {
+  size_t next_location = 0;
+
+  for (size_t f = 0; f < debug_info->runtime_function_count; f++) {
+    const RuntimeFunctionMapping *function = &debug_info->runtime_functions[f];
+    size_t file_state = 1;
+    long long line_state = 1;
+
+    if (!dwarf_line_row(program, files, &file_state, &line_state,
+                        function->start_label, function->filename,
+                        function->line, function->column)) {
+      return 0;
+    }
+    while (next_location < debug_info->runtime_location_count &&
+           strcmp(debug_info->runtime_locations[next_location].function_name,
+                  function->function_name) == 0) {
+      const RuntimeLocationMapping *location =
+          &debug_info->runtime_locations[next_location];
+      if (!dwarf_line_row(program, files, &file_state, &line_state,
+                          location->address_label, location->filename,
+                          location->line, location->column)) {
+        return 0;
+      }
+      next_location++;
+    }
+    if (!dwarf_line_set_address(program, function->end_label) ||
+        !binary_code_buffer_append_u8(&program->bytes, 0) ||
+        !binary_debug_append_uleb128(&program->bytes, 1) ||
+        !binary_code_buffer_append_u8(&program->bytes, 1)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int dwarf_build_line_section(const DwarfSection *program,
+                                    const DwarfFiles *files,
+                                    DwarfSection *line) {
+  static const unsigned char opcode_lengths[12] = {0, 1, 1, 1, 1, 0,
+                                                   0, 0, 1, 0, 0, 1};
+  BinaryCodeBuffer header = {0};
+  size_t base;
+  int ok = binary_code_buffer_append_u8(&header, 1) &&
+           binary_code_buffer_append_u8(&header, 1) &&
+           binary_code_buffer_append_u8(&header, 1) &&
+           binary_code_buffer_append_u8(&header, (unsigned char)-5) &&
+           binary_code_buffer_append_u8(&header, 14) &&
+           binary_code_buffer_append_u8(&header, 13) &&
+           binary_code_buffer_append_bytes(&header, opcode_lengths,
+                                           sizeof(opcode_lengths)) &&
+           binary_code_buffer_append_u8(&header, 0);
+  for (size_t i = 0; ok && i < files->count; i++) {
+    ok = binary_debug_append_cstring(&header, files->names[i]) &&
+         binary_debug_append_uleb128(&header, 0) &&
+         binary_debug_append_uleb128(&header, 0) &&
+         binary_debug_append_uleb128(&header, 0);
+  }
+  ok = ok && binary_code_buffer_append_u8(&header, 0);
+  ok = ok &&
+       binary_debug_append_u32(
+           &line->bytes,
+           (uint32_t)(2u + 4u + header.size + program->bytes.size)) &&
+       binary_debug_append_u16(&line->bytes, 4) &&
+       binary_debug_append_u32(&line->bytes, (uint32_t)header.size) &&
+       binary_code_buffer_append_bytes(&line->bytes, header.data, header.size);
+  base = line->bytes.size;
+  ok = ok && binary_code_buffer_append_bytes(&line->bytes, program->bytes.data,
+                                             program->bytes.size);
+  for (size_t r = 0; ok && r < program->reloc_count; r++) {
+    size_t saved = line->bytes.size;
+    line->bytes.size = base + program->relocs[r].offset;
+    ok = dwarf_note_reloc(line, program->relocs[r].kind,
+                          program->relocs[r].symbol, program->relocs[r].addend);
+    line->bytes.size = saved;
+  }
+  binary_code_buffer_destroy(&header);
+  return ok;
+}
+
+static int dwarf_build_ranges(const DebugInfo *debug_info, DwarfSection *ranges) {
+  static const unsigned char zeros[16] = {0};
+  for (size_t f = 0; f < debug_info->runtime_function_count; f++) {
+    const RuntimeFunctionMapping *function = &debug_info->runtime_functions[f];
+    if (!dwarf_append_address(ranges, function->start_label) ||
+        !dwarf_append_address(ranges, function->end_label)) {
+      return 0;
+    }
+  }
+  return binary_code_buffer_append_bytes(&ranges->bytes, zeros, sizeof(zeros));
+}
+
+static int dwarf_build_abbrev(BinaryCodeBuffer *abbrev) {
+  static const unsigned char unit[] = {0x25, 0x0e, 0x13, 0x05, 0x03, 0x0e,
+                                       0x1b, 0x0e, 0x11, 0x01, 0x55, 0x17,
+                                       0x10, 0x17};
+  static const unsigned char subprogram[] = {0x03, 0x0e, 0x6e, 0x0e, 0x3a, 0x0f,
+                                             0x3b, 0x0f, 0x11, 0x01, 0x12, 0x01,
+                                             0x40, 0x18, 0x3f, 0x19};
+  return dwarf_append_abbrev(abbrev, 1, 0x11, 1, unit, sizeof(unit)) &&
+         dwarf_append_abbrev(abbrev, 2, 0x2e, 0, subprogram,
+                             sizeof(subprogram)) &&
+         binary_debug_append_uleb128(abbrev, 0);
+}
+
+static int dwarf_build_info(const DebugInfo *debug_info, const char *source_name,
+                            const char *directory, DwarfFiles *files,
+                            DwarfSection *strings, DwarfSection *info) {
+  static const unsigned char zero_length[4] = {0};
+  static const unsigned char zero_address[8] = {0};
+
+  if (!binary_code_buffer_append_bytes(&info->bytes, zero_length,
+                                       sizeof(zero_length)) ||
+      !binary_debug_append_u16(&info->bytes, 4) ||
+      !dwarf_append_section_offset(info, DWARF_ABBREV_SYMBOL, 0) ||
+      !binary_code_buffer_append_u8(&info->bytes, 8) ||
+      !binary_debug_append_uleb128(&info->bytes, 1) ||
+      !dwarf_append_string(info, strings, "mettle") ||
+      !binary_debug_append_u16(&info->bytes, 0x000c) ||
+      !dwarf_append_string(info, strings, source_name) ||
+      !dwarf_append_string(info, strings, directory) ||
+      !binary_code_buffer_append_bytes(&info->bytes, zero_address,
+                                       sizeof(zero_address)) ||
+      !dwarf_append_section_offset(info, DWARF_RANGES_SYMBOL, 0) ||
+      !dwarf_append_section_offset(info, DWARF_LINE_SYMBOL, 0)) {
+    return 0;
+  }
+  for (size_t f = 0; f < debug_info->runtime_function_count; f++) {
+    const RuntimeFunctionMapping *function = &debug_info->runtime_functions[f];
+    size_t file = dwarf_file_index(files, function->filename);
+    if (file == 0 || !binary_debug_append_uleb128(&info->bytes, 2) ||
+        !dwarf_append_string(info, strings,
+                             dwarf_unmangled_name(function->function_name)) ||
+        !dwarf_append_string(info, strings, function->function_name) ||
+        !binary_debug_append_uleb128(&info->bytes, file) ||
+        !binary_debug_append_uleb128(&info->bytes, function->line) ||
+        !dwarf_append_address(info, function->start_label) ||
+        !dwarf_append_address(info, function->end_label) ||
+        !binary_debug_append_uleb128(&info->bytes, 1) ||
+        !binary_code_buffer_append_u8(&info->bytes, 0x9c)) {
+      return 0;
+    }
+  }
+  if (!binary_code_buffer_append_u8(&info->bytes, 0)) {
+    return 0;
+  }
+  {
+    uint32_t length = (uint32_t)(info->bytes.size - 4u);
+    memcpy(info->bytes.data, &length, sizeof(length));
+  }
+  return 1;
+}
+
+static int dwarf_build_frame(BinaryCodeBuffer *frame) {
+  BinaryCodeBuffer cie = {0};
+  int ok = binary_debug_append_u32(&cie, 0xffffffffu) &&
+           binary_code_buffer_append_u8(&cie, 1) &&
+           binary_code_buffer_append_u8(&cie, 0) &&
+           binary_debug_append_uleb128(&cie, 1) &&
+           binary_debug_append_sleb128(&cie, -8) &&
+           binary_debug_append_uleb128(&cie, 16) &&
+           binary_code_buffer_append_u8(&cie, 0x0c) &&
+           binary_debug_append_uleb128(&cie, 7) &&
+           binary_debug_append_uleb128(&cie, 8) &&
+           binary_code_buffer_append_u8(&cie, 0x90) &&
+           binary_debug_append_uleb128(&cie, 1);
+  while (ok && (cie.size % 4u) != 0u) {
+    ok = binary_code_buffer_append_u8(&cie, 0);
+  }
+  ok = ok && binary_debug_append_u32(frame, (uint32_t)cie.size) &&
+       binary_code_buffer_append_bytes(frame, cie.data, cie.size);
+  binary_code_buffer_destroy(&cie);
+  return ok;
+}
+
+static int dwarf_emit_section(BinaryEmitter *emitter, const char *name,
+                              const char *symbol, const DwarfSection *section) {
+  size_t index = binary_emitter_get_or_create_section(
+      emitter, name, BINARY_SECTION_DEBUG, 0, 1);
+  if (index == (size_t)-1 ||
+      !binary_emitter_append_bytes(emitter, index, section->bytes.data,
+                                   section->bytes.size, NULL)) {
+    return 0;
+  }
+  if (symbol &&
+      !binary_emitter_define_symbol(emitter, symbol, BINARY_SYMBOL_LOCAL, index,
+                                    0, 0)) {
+    return 0;
+  }
+  for (size_t r = 0; r < section->reloc_count; r++) {
+    const DwarfReloc *reloc = &section->relocs[r];
+    if (!binary_emitter_add_relocation(emitter, index, reloc->offset,
+                                       reloc->kind, reloc->symbol,
+                                       reloc->addend)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int code_generator_binary_emit_dwarf_debug_sections(CodeGenerator *generator) {
   BinaryEmitter *emitter = NULL;
   DebugInfo *debug_info = NULL;
-  BinaryCodeBuffer debug_abbrev = {0};
-  BinaryCodeBuffer debug_info_section = {0};
-  BinaryCodeBuffer debug_line = {0};
-  BinaryCodeBuffer debug_line_header = {0};
-  BinaryCodeBuffer debug_line_program = {0};
-  BinaryCodeBuffer debug_str = {0};
-  BinaryCodeBuffer debug_frame = {0};
-  BinaryCodeBuffer cie = {0};
-  uint32_t source_name_offset = 0;
-  uint32_t comp_dir_offset = 0;
-  uint32_t producer_offset = 0;
+  DwarfSection abbrev = {0};
+  DwarfSection info = {0};
+  DwarfSection line = {0};
+  DwarfSection program = {0};
+  DwarfSection ranges = {0};
+  DwarfSection strings = {0};
+  DwarfSection frame = {0};
+  DwarfFiles files = {0};
+  char directory[4096];
   const char *source_name = NULL;
   int ok = 0;
 
@@ -668,156 +1020,38 @@ int code_generator_binary_emit_dwarf_debug_sections(CodeGenerator *generator) {
 
   source_name = debug_info->source_filename ? debug_info->source_filename
                                             : "unknown.mettle";
-
-  source_name_offset = (uint32_t)debug_str.size;
-  if (!binary_debug_append_cstring(&debug_str, source_name)) goto cleanup;
-  comp_dir_offset = (uint32_t)debug_str.size;
-  if (!binary_debug_append_cstring(&debug_str, ".")) goto cleanup;
-  producer_offset = (uint32_t)debug_str.size;
-  if (!binary_debug_append_cstring(&debug_str, "mettle")) goto cleanup;
-
-  if (!binary_debug_append_uleb128(&debug_abbrev, 1) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x11) ||
-      !binary_code_buffer_append_u8(&debug_abbrev, 0) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x10) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x17) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x03) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x0e) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x1b) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x0e) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x25) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x0e) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x13) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0x05) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0) ||
-      !binary_debug_append_uleb128(&debug_abbrev, 0)) {
-    goto cleanup;
+  if (mettle_getcwd(directory, (int)sizeof(directory)) != 0) {
+    strcpy(directory, ".");
   }
 
-  {
-    BinaryCodeBuffer die = {0};
-    if (!binary_debug_append_u16(&debug_info_section, 4) ||
-        !binary_debug_append_u32(&debug_info_section, 0) ||
-        !binary_code_buffer_append_u8(&debug_info_section, 8) ||
-        !binary_debug_append_uleb128(&die, 1) ||
-        !binary_debug_append_u32(&die, 0) ||
-        !binary_debug_append_u32(&die, source_name_offset) ||
-        !binary_debug_append_u32(&die, comp_dir_offset) ||
-        !binary_debug_append_u32(&die, producer_offset) ||
-        !binary_debug_append_u16(&die, 0x000c) ||
-        !binary_code_buffer_append_u8(&die, 0)) {
-      binary_code_buffer_destroy(&die);
-      goto cleanup;
-    }
-    {
-      uint32_t unit_length = (uint32_t)(debug_info_section.size + die.size);
-      BinaryCodeBuffer prefixed = {0};
-      if (!binary_debug_append_u32(&prefixed, unit_length) ||
-          !binary_code_buffer_append_bytes(&prefixed, debug_info_section.data,
-                                           debug_info_section.size) ||
-          !binary_code_buffer_append_bytes(&prefixed, die.data, die.size)) {
-        binary_code_buffer_destroy(&die);
-        binary_code_buffer_destroy(&prefixed);
-        goto cleanup;
-      }
-      binary_code_buffer_destroy(&debug_info_section);
-      debug_info_section = prefixed;
-    }
-    binary_code_buffer_destroy(&die);
-  }
+  ok = dwarf_build_abbrev(&abbrev.bytes) &&
+       dwarf_build_line_program(debug_info, &program, &files) &&
+       dwarf_build_info(debug_info, source_name, directory, &files, &strings,
+                        &info) &&
+       dwarf_build_line_section(&program, &files, &line) &&
+       dwarf_build_ranges(debug_info, &ranges) &&
+       dwarf_build_frame(&frame.bytes) &&
+       dwarf_emit_section(emitter, ".debug_abbrev", DWARF_ABBREV_SYMBOL,
+                          &abbrev) &&
+       dwarf_emit_section(emitter, ".debug_info", NULL, &info) &&
+       dwarf_emit_section(emitter, ".debug_line", DWARF_LINE_SYMBOL, &line) &&
+       dwarf_emit_section(emitter, ".debug_ranges", DWARF_RANGES_SYMBOL,
+                          &ranges) &&
+       dwarf_emit_section(emitter, ".debug_str", DWARF_STR_SYMBOL, &strings) &&
+       dwarf_emit_section(emitter, ".debug_frame", NULL, &frame);
 
-  if (!binary_code_buffer_append_u8(&debug_line_header, 1) ||
-      !binary_code_buffer_append_u8(&debug_line_header, 1) ||
-      !binary_code_buffer_append_u8(&debug_line_header, 1) ||
-      !binary_code_buffer_append_u8(&debug_line_header, (unsigned char)-5) ||
-      !binary_code_buffer_append_u8(&debug_line_header, 14) ||
-      !binary_code_buffer_append_u8(&debug_line_header, 13)) {
-    goto cleanup;
-  }
-  {
-    static const unsigned char std_opcode_lengths[12] = {
-        0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1};
-    for (size_t i = 0; i < sizeof(std_opcode_lengths); i++) {
-      if (!binary_code_buffer_append_u8(&debug_line_header,
-                                        std_opcode_lengths[i])) {
-        goto cleanup;
-      }
-    }
-  }
-
-  if (!binary_code_buffer_append_u8(&debug_line_header, 0) ||
-      !binary_debug_append_cstring(&debug_line_header, source_name) ||
-      !binary_debug_append_uleb128(&debug_line_header, 0) ||
-      !binary_debug_append_uleb128(&debug_line_header, 0) ||
-      !binary_debug_append_uleb128(&debug_line_header, 0) ||
-      !binary_code_buffer_append_u8(&debug_line_header, 0)) {
-      goto cleanup;
-  }
-
-  if (!binary_code_buffer_append_u8(&debug_line_program, 0) ||
-      !binary_debug_append_uleb128(&debug_line_program, 1) ||
-      !binary_code_buffer_append_u8(&debug_line_program, 1)) {
-    goto cleanup;
-  }
-
-  {
-    uint32_t line_unit_length =
-        (uint32_t)(2u + 4u + debug_line_header.size + debug_line_program.size);
-    if (!binary_debug_append_u32(&debug_line, line_unit_length) ||
-        !binary_debug_append_u16(&debug_line, 4) ||
-        !binary_debug_append_u32(&debug_line,
-                                 (uint32_t)debug_line_header.size) ||
-        !binary_code_buffer_append_bytes(&debug_line, debug_line_header.data,
-                                         debug_line_header.size) ||
-        !binary_code_buffer_append_bytes(&debug_line, debug_line_program.data,
-                                         debug_line_program.size)) {
-      goto cleanup;
-    }
-  }
-
-  if (!binary_debug_append_u32(&cie, 0xffffffffu) ||
-      !binary_code_buffer_append_u8(&cie, 1) ||
-      !binary_code_buffer_append_u8(&cie, 0) ||
-      !binary_debug_append_uleb128(&cie, 1) ||
-      !binary_debug_append_sleb128(&cie, -8) ||
-      !binary_debug_append_uleb128(&cie, 16) ||
-      !binary_code_buffer_append_u8(&cie, 0x0c) ||
-      !binary_debug_append_uleb128(&cie, 7) ||
-      !binary_debug_append_uleb128(&cie, 8) ||
-      !binary_code_buffer_append_u8(&cie, 0x90) ||
-      !binary_debug_append_uleb128(&cie, 1)) {
-    goto cleanup;
-  }
-  while ((cie.size % 4u) != 0u) {
-    if (!binary_code_buffer_append_u8(&cie, 0)) goto cleanup;
-  }
-  if (!binary_debug_append_u32(&debug_frame, (uint32_t)cie.size) ||
-      !binary_code_buffer_append_bytes(&debug_frame, cie.data, cie.size)) {
-    goto cleanup;
-  }
-
-  if (!binary_debug_append_section(emitter, ".debug_abbrev", &debug_abbrev) ||
-      !binary_debug_append_section(emitter, ".debug_info", &debug_info_section) ||
-      !binary_debug_append_section(emitter, ".debug_line", &debug_line) ||
-      !binary_debug_append_section(emitter, ".debug_str", &debug_str) ||
-      !binary_debug_append_section(emitter, ".debug_frame", &debug_frame)) {
-    code_generator_binary_emitter_error(
-        generator, emitter, "Failed to emit DWARF debug sections");
-    goto cleanup;
-  }
-
-  ok = 1;
-
-cleanup:
-  binary_code_buffer_destroy(&debug_abbrev);
-  binary_code_buffer_destroy(&debug_info_section);
-  binary_code_buffer_destroy(&debug_line);
-  binary_code_buffer_destroy(&debug_line_header);
-  binary_code_buffer_destroy(&debug_line_program);
-  binary_code_buffer_destroy(&debug_str);
-  binary_code_buffer_destroy(&debug_frame);
-  binary_code_buffer_destroy(&cie);
+  binary_code_buffer_destroy(&abbrev.bytes);
+  binary_code_buffer_destroy(&info.bytes);
+  binary_code_buffer_destroy(&line.bytes);
+  binary_code_buffer_destroy(&program.bytes);
+  binary_code_buffer_destroy(&ranges.bytes);
+  binary_code_buffer_destroy(&strings.bytes);
+  binary_code_buffer_destroy(&frame.bytes);
+  free(info.relocs);
+  free(line.relocs);
+  free(program.relocs);
+  free(ranges.relocs);
+  free(files.names);
   if (!ok && !generator->has_error) {
     code_generator_set_error(generator,
                              "Out of memory while emitting DWARF sections");

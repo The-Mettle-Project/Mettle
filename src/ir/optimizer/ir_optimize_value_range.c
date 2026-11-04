@@ -655,24 +655,47 @@ static const IRInstruction *vr_counter_next_real(const IRFunction *fn,
   return NULL;
 }
 
-static int vr_counter_step_of(const IRFunction *fn, const IRInstruction *write,
+static const IRInstruction *vr_sole_writer(IRValueRangeCtx *ctx,
+                                           const IROperand *operand) {
+  const IRFunction *fn = ctx->function;
+  const IRInstruction *found = NULL;
+  size_t group = 0;
+
+  if (!operand->name) {
+    return NULL;
+  }
+  if (operand->kind == IR_OPERAND_TEMP) {
+    const IROperand *only =
+        ir_temp_value_map_lookup(&ctx->unique_def, operand->name);
+    return only && only->kind == IR_OPERAND_INT && only->int_value > 0
+               ? &fn->instructions[only->int_value - 1]
+               : NULL;
+  }
+  if (operand->kind != IR_OPERAND_SYMBOL || !vr_symbol_sites_ready(ctx) ||
+      !ir_name_index_find(&ctx->symbol_groups, operand->name, &group)) {
+    return NULL;
+  }
+  for (size_t p = ctx->symbol_group_start[group];
+       p < ctx->symbol_group_start[group + 1]; p++) {
+    const IRInstruction *in = &fn->instructions[ctx->symbol_sites[p]];
+    if (in->op == IR_OP_DECLARE_LOCAL ||
+        !ir_instruction_writes_destination(in)) {
+      continue;
+    }
+    if (found) {
+      return NULL;
+    }
+    found = in;
+  }
+  return found;
+}
+
+static int vr_counter_step_of(IRValueRangeCtx *ctx, const IRInstruction *write,
                               const char *symbol, long long *step) {
   const IRInstruction *add = write;
 
   if (write->op == IR_OP_ASSIGN) {
-    add = NULL;
-    for (size_t i = 0; i < fn->instruction_count; i++) {
-      const IRInstruction *in = &fn->instructions[i];
-      if (ir_instruction_writes_destination(in) &&
-          ir_operand_same(&in->dest, &write->lhs)) {
-        if (add && in->op != IR_OP_DECLARE_LOCAL) {
-          return 0;
-        }
-        if (in->op != IR_OP_DECLARE_LOCAL) {
-          add = in;
-        }
-      }
-    }
+    add = vr_sole_writer(ctx, &write->lhs);
   }
   if (!add || add->op != IR_OP_BINARY || !add->text ||
       strcmp(add->text, "+") != 0 || add->rhs.kind != IR_OPERAND_INT ||
@@ -684,7 +707,7 @@ static int vr_counter_step_of(const IRFunction *fn, const IRInstruction *write,
   return 1;
 }
 
-static int vr_counter_init_of(const IRFunction *fn, const IRInstruction *write,
+static int vr_counter_init_of(IRValueRangeCtx *ctx, const IRInstruction *write,
                               long long *init) {
   if (write->op != IR_OP_ASSIGN) {
     return 0;
@@ -693,17 +716,7 @@ static int vr_counter_init_of(const IRFunction *fn, const IRInstruction *write,
     *init = write->lhs.int_value;
     return 1;
   }
-  const IRInstruction *def = NULL;
-  for (size_t i = 0; i < fn->instruction_count; i++) {
-    const IRInstruction *in = &fn->instructions[i];
-    if (in->op != IR_OP_DECLARE_LOCAL && ir_instruction_writes_destination(in) &&
-        ir_operand_same(&in->dest, &write->lhs)) {
-      if (def) {
-        return 0;
-      }
-      def = in;
-    }
-  }
+  const IRInstruction *def = vr_sole_writer(ctx, &write->lhs);
   if (!def || def->op != IR_OP_ASSIGN || def->lhs.kind != IR_OPERAND_INT) {
     return 0;
   }
@@ -756,25 +769,27 @@ static int vr_counter_bounds_scan(IRValueRangeCtx *ctx, const char *symbol,
   long long init = 0;
   long long step = 0;
   long long limit = 0;
-  IROperand target = ir_operand_symbol(symbol);
+  size_t group = 0;
 
-  for (size_t i = 0; i < fn->instruction_count; i++) {
-    const IRInstruction *in = &fn->instructions[i];
+  if (!vr_symbol_sites_ready(ctx) ||
+      !ir_name_index_find(&ctx->symbol_groups, symbol, &group)) {
+    return 0;
+  }
+  for (size_t p = ctx->symbol_group_start[group];
+       p < ctx->symbol_group_start[group + 1]; p++) {
+    const IRInstruction *in = &fn->instructions[ctx->symbol_sites[p]];
     if (in->op == IR_OP_DECLARE_LOCAL ||
-        !ir_instruction_writes_destination(in) ||
-        !ir_operand_same(&in->dest, &target)) {
+        !ir_instruction_writes_destination(in)) {
       continue;
     }
     if (count == 2) {
-      ir_operand_destroy(&target);
       return 0;
     }
     writes[count++] = in;
   }
-  ir_operand_destroy(&target);
   if (count != 2 || vr_symbol_address_taken(ctx, symbol) ||
-      !vr_counter_init_of(fn, writes[0], &init) ||
-      !vr_counter_step_of(fn, writes[1], symbol, &step)) {
+      !vr_counter_init_of(ctx, writes[0], &init) ||
+      !vr_counter_step_of(ctx, writes[1], symbol, &step)) {
     return 0;
   }
   jump = vr_counter_next_real(fn, (size_t)(writes[1] - fn->instructions));

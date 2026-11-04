@@ -527,6 +527,12 @@ static int ir_lower_var_initializer(IRLoweringContext *context,
                            &value)) {
     return 0;
   }
+  if (!ir_normalize_to_bool(context, function, decl_type,
+                            declaration->initializer, &value,
+                            declaration->initializer->location)) {
+    ir_operand_destroy(&value);
+    return 0;
+  }
   if (ir_should_decay_array_to_address(decl_type,
                                        declaration->initializer) &&
       !ir_decay_array_operand_to_address(
@@ -780,6 +786,11 @@ static int ir_lower_named_assignment(IRLoweringContext *context,
   if (!decay_target && binding) {
     decay_target = ir_resolve_named_type(context, binding->type_text);
   }
+  if (!ir_normalize_to_bool(context, function, decay_target, assignment->value,
+                            value, assignment->value->location)) {
+    ir_operand_destroy(value);
+    return 0;
+  }
   if (ir_should_build_slice_from_array(decay_target, assignment->value) &&
       !ir_build_slice_operand_from_array(
           context, function, value, assignment->value->resolved_type,
@@ -961,6 +972,12 @@ static int ir_lower_assignment(IRLoweringContext *context, IRFunction *function,
     return 0;
   }
 
+  if (!ir_normalize_to_bool(context, function, target_type, assignment->value,
+                            &value, assignment->value->location)) {
+    ir_operand_destroy(&address);
+    ir_operand_destroy(&value);
+    return 0;
+  }
   if (ir_should_build_slice_from_array(target_type, assignment->value) &&
       !ir_build_slice_operand_from_array(
           context, function, &value, assignment->value->resolved_type,
@@ -1426,6 +1443,11 @@ static int ir_lower_return_statement(IRLoweringContext *context, IRFunction *fun
                                            ret->value->resolved_type,
                                            return_type,
                                            ret->value->location)) {
+      ir_operand_destroy(&value);
+      return 0;
+    }
+    if (!ir_normalize_to_bool(context, function, return_type, ret->value, &value,
+                              ret->value->location)) {
       ir_operand_destroy(&value);
       return 0;
     }

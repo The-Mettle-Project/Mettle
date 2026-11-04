@@ -3249,16 +3249,47 @@ static char *mono_argument_type_of(MonoContext *ctx, ASTNode *expr,
   return type;
 }
 
+static int mono_is_numeric_constant(const ASTNode *node, int *has_float) {
+  if (!node || !node->data) {
+    return 0;
+  }
+  if (node->type == AST_NUMBER_LITERAL) {
+    const NumberLiteral *literal = (const NumberLiteral *)node->data;
+    if (literal->is_char) {
+      return 0;
+    }
+    *has_float = *has_float || literal->is_float;
+    return 1;
+  }
+  if (node->type == AST_UNARY_EXPRESSION) {
+    const UnaryExpression *unary = (const UnaryExpression *)node->data;
+    return unary->operator &&
+           (strcmp(unary->operator, "-") == 0 ||
+            strcmp(unary->operator, "+") == 0 ||
+            strcmp(unary->operator, "~") == 0) &&
+           mono_is_numeric_constant(unary->operand, has_float);
+  }
+  if (node->type == AST_BINARY_EXPRESSION) {
+    const BinaryExpression *binary = (const BinaryExpression *)node->data;
+    static const char *const arithmetic[] = {"+", "-", "*",  "/",  "%",
+                                             "&", "|", "^", "<<", ">>"};
+    int known = 0;
+    for (size_t k = 0; binary->operator &&
+                       k < sizeof(arithmetic) / sizeof(arithmetic[0]);
+         k++) {
+      known = known || strcmp(binary->operator, arithmetic[k]) == 0;
+    }
+    return known && mono_is_numeric_constant(binary->left, has_float) &&
+           mono_is_numeric_constant(binary->right, has_float);
+  }
+  return 0;
+}
+
 static long mono_literal_param_index(const GenericDef *def,
                                      const char *parameter_type,
                                      const ASTNode *argument) {
-  const NumberLiteral *literal = NULL;
-  if (!argument || argument->type != AST_NUMBER_LITERAL ||
-      !argument->data) {
-    return -1;
-  }
-  literal = (const NumberLiteral *)argument->data;
-  if (literal->is_char) {
+  int has_float = 0;
+  if (!mono_is_numeric_constant(argument, &has_float)) {
     return -1;
   }
   for (size_t p = 0; p < def->type_param_count; p++) {
@@ -3270,11 +3301,14 @@ static long mono_literal_param_index(const GenericDef *def,
 }
 
 static int mono_literal_fits_type(const ASTNode *argument, const char *type) {
-  const NumberLiteral *literal = (const NumberLiteral *)argument->data;
+  int has_float = 0;
+  if (!mono_is_numeric_constant(argument, &has_float)) {
+    return 0;
+  }
   if (strncmp(type, "float", 5) == 0 || strncmp(type, "bfloat", 6) == 0) {
     return 1;
   }
-  return !literal->is_float &&
+  return !has_float &&
          (strncmp(type, "int", 3) == 0 || strncmp(type, "uint", 4) == 0);
 }
 

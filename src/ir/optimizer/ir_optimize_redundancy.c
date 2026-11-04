@@ -1135,35 +1135,43 @@ static int sel_condition_is_boolean(const IRFunction *function,
          strcmp(def->text, "==") == 0 || strcmp(def->text, "!=") == 0;
 }
 
-static int sel_label_index(const IRFunction *function, const char *label,
-                           size_t from, size_t *out) {
-  if (!label) {
-    return 0;
-  }
-  for (size_t i = from; i < function->instruction_count; i++) {
-    const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_LABEL && ins->text && strcmp(ins->text, label) == 0) {
-      *out = i;
-      return 1;
-    }
-  }
-  return 0;
-}
+typedef struct {
+  REMap at;
+  REMap references;
+} SelLabels;
 
-static int sel_label_referenced_elsewhere(const IRFunction *function,
-                                          const char *label, size_t except) {
+static int sel_labels_build(const IRFunction *function, SelLabels *labels) {
   for (size_t i = 0; i < function->instruction_count; i++) {
     const IRInstruction *ins = &function->instructions[i];
-    if (i == except) {
+    if (!ins->text) {
       continue;
     }
-    if ((ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
-         ins->op == IR_OP_BRANCH_EQ) &&
-        ins->text && strcmp(ins->text, label) == 0) {
-      return 1;
+    if (ins->op == IR_OP_LABEL) {
+      if (!re_map_set(&labels->at, ins->text, (long long)i + 1)) {
+        return 0;
+      }
+    } else if ((ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+                ins->op == IR_OP_BRANCH_EQ) &&
+               !re_map_add(&labels->references, ins->text, 1)) {
+      return 0;
     }
   }
-  return 0;
+  return 1;
+}
+
+static int sel_label_index(const SelLabels *labels, const char *label,
+                           size_t from, size_t *out) {
+  long long at = label ? re_map_get(&labels->at, label) : 0;
+  if (at <= 0 || (size_t)(at - 1) < from) {
+    return 0;
+  }
+  *out = (size_t)(at - 1);
+  return 1;
+}
+
+static int sel_label_referenced_elsewhere(const SelLabels *labels,
+                                          const char *label) {
+  return re_map_get(&labels->references, label) > 1;
 }
 
 static int sel_reads_temp(const IRInstruction *ins, const char *name) {
@@ -1210,8 +1218,8 @@ typedef struct {
   long long else_const;
 } SelMatch;
 
-static int sel_match_at(const IRFunction *function, size_t branch,
-                        SelMatch *out) {
+static int sel_match_at(const IRFunction *function, const SelLabels *labels,
+                        size_t branch, SelMatch *out) {
   const IRInstruction *br = &function->instructions[branch];
   const IRInstruction *tail;
   const IRInstruction *diff_a;
@@ -1229,8 +1237,8 @@ static int sel_match_at(const IRFunction *function, size_t branch,
   if (br->op != IR_OP_BRANCH_ZERO || !br->text) {
     return 0;
   }
-  if (!sel_label_index(function, br->text, branch + 1, &else_label) ||
-      sel_label_referenced_elsewhere(function, br->text, branch)) {
+  if (!sel_label_index(labels, br->text, branch + 1, &else_label) ||
+      sel_label_referenced_elsewhere(labels, br->text)) {
     return 0;
   }
   if (!sel_collect(function, branch + 1, else_label, &then_arm) ||
@@ -1241,7 +1249,7 @@ static int sel_match_at(const IRFunction *function, size_t branch,
   if (tail->op != IR_OP_JUMP || !tail->text) {
     return 0;
   }
-  if (!sel_label_index(function, tail->text, else_label + 1, &end_label)) {
+  if (!sel_label_index(labels, tail->text, else_label + 1, &end_label)) {
     return 0;
   }
   then_arm.count--;
@@ -1457,6 +1465,7 @@ static int sel_apply(IRFunction *function, const REDefs *defs, SelMatch *m,
 
 int ir_select_adjacent_field_pass(IRFunction *function, int *changed) {
   REDefs defs = {0};
+  SelLabels labels = {0};
   IRTempValueMap addr_taken;
 
   if (!function || function->instruction_count == 0) {
@@ -1468,13 +1477,13 @@ int ir_select_adjacent_field_pass(IRFunction *function, int *changed) {
   defs.function = function;
   defs.addr_taken = &addr_taken;
   if (ir_addr_taken_set_build(function, &addr_taken) &&
-      re_collect_defs(function, &defs)) {
+      re_collect_defs(function, &defs) && sel_labels_build(function, &labels)) {
     for (size_t i = 0; i < function->instruction_count; i++) {
       SelMatch match;
       if (function->instructions[i].op != IR_OP_BRANCH_ZERO) {
         continue;
       }
-      if (sel_match_at(function, i, &match)) {
+      if (sel_match_at(function, &labels, i, &match)) {
         if (sel_apply(function, &defs, &match, changed) != 0) {
           break;
         }
@@ -1483,6 +1492,8 @@ int ir_select_adjacent_field_pass(IRFunction *function, int *changed) {
     }
   }
 
+  re_map_destroy(&labels.at);
+  re_map_destroy(&labels.references);
   re_map_destroy(&defs.defs);
   re_map_destroy(&defs.def_at);
   ir_temp_value_map_destroy(&addr_taken);

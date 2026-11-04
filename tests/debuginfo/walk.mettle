@@ -1,0 +1,23 @@
+import "std/io";
+import "std/mem";
+
+struct Pt { x: int32; y: int32; }
+
+fn add(a: int32, b: int32) -> int32 {
+  var c: int32 = a + b;
+  return c * 2;
+}
+
+fn walk(n: int32) -> int32 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = t + add(i, 1);
+  }
+  return t;
+}
+
+fn main() -> int32 {
+  var total: int32 = walk(3);
+  println("{total}");
+  return 0;
+}

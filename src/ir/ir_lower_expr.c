@@ -945,6 +945,15 @@ static int ir_lower_call_arguments(IRLoweringContext *context, IRFunction *funct
     size_t typed = call_param_count;
     for (size_t i = 0; i < call->argument_count && i < typed; i++) {
       Type *ptype = call_param_types[i];
+      if (!ir_normalize_to_bool(context, function, ptype, call->arguments[i],
+                                &arguments[i], call->arguments[i]->location)) {
+        for (size_t j = 0; j < call->argument_count; j++) {
+          ir_operand_destroy(&arguments[j]);
+        }
+        free(arguments);
+        ir_operand_destroy(&destination);
+        return 0;
+      }
       if (ir_should_decay_array_to_address(ptype, call->arguments[i])) {
         if (!ir_decay_array_operand_to_address(
                 context, function, &arguments[i],
@@ -2934,11 +2943,14 @@ static int ir_lower_func_ptr_call(IRLoweringContext *context,
         ir_operand_destroy(&destination);
         return 0;
       }
-      if (ir_should_coerce_string_to_cstring(
-              context, func_type->fn_param_types[i], fp_call->arguments[i]) &&
-          !ir_coerce_string_operand_to_cstring(
-              context, function, &arguments[i],
-              fp_call->arguments[i]->location)) {
+      if (!ir_normalize_to_bool(context, function, func_type->fn_param_types[i],
+                                fp_call->arguments[i], &arguments[i],
+                                fp_call->arguments[i]->location) ||
+          (ir_should_coerce_string_to_cstring(
+               context, func_type->fn_param_types[i], fp_call->arguments[i]) &&
+           !ir_coerce_string_operand_to_cstring(
+               context, function, &arguments[i],
+               fp_call->arguments[i]->location))) {
         for (size_t j = 0; j < fp_call->argument_count; j++) {
           ir_operand_destroy(&arguments[j]);
         }
@@ -3884,6 +3896,16 @@ static int ir_lower_cast_expression(IRLoweringContext *context,
   IROperand operand = ir_operand_none();
   if (!ir_lower_expression(context, function, cast_operand, &operand)) {
     return 0;
+  }
+
+  if (cast_target && cast_target->kind == TYPE_BOOL) {
+    if (!ir_normalize_to_bool(context, function, cast_target, cast_operand,
+                              &operand, expression->location)) {
+      ir_operand_destroy(&operand);
+      return 0;
+    }
+    *out_value = operand;
+    return 1;
   }
 
   if (cast_target && ir_expression_is_string(context, cast_operand) &&

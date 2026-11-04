@@ -1,0 +1,18 @@
+import "std/io";
+import "std/meta";
+struct Cat { n: int32; }
+struct Dog { name: string; }
+@dyn trait Show {
+  fn show(self: Self) -> string;
+}
+impl Show for Cat { fn show(self: Self) -> string { return "cat{self.n}"; } }
+impl Show for Dog { fn show(self: Self) -> string { return "dog{self.name}"; } }
+fn main() -> int32 {
+  var c: Cat = { n: 3 };
+  var d: Dog = { name: "rex" };
+  var dc: Show__dyn = Show__from_Cat(&c);
+  var dd: Show__dyn = Show__from_Dog(&d);
+  println(dc.show());
+  println(dd.show());
+  return 0;
+}

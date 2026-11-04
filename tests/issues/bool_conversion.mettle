@@ -1,0 +1,81 @@
+import "std/io";
+
+struct B { f: bool; g: int32; }
+var g_b: bool = false;
+var g_lit: bool = 7;
+var fails: int32 = 0;
+
+fn ck(name: string, got: int64, want: int64) {
+  if (got != want) { println("FAIL {name}: got {got} want {want}"); fails = fails + 1; }
+}
+fn take(b: bool) -> int64 { return (int64)b; }
+fn ret_int(x: int32) -> bool { return x; }
+fn ret_lit() -> bool { return 9; }
+fn id_b(b: bool) -> bool { return b; }
+
+fn main() -> int32 {
+  var lit: bool = 5;
+  ck("literal", (int64)lit, 1);
+  var zero: bool = 0;
+  ck("zero", (int64)zero, 0);
+  var x: int32 = 256;
+  var from_int: bool = x;
+  ck("int var", (int64)from_int, 1);
+  var big: int64 = 0x100000000;
+  var from_big: bool = big;
+  ck("wide var", (int64)from_big, 1);
+  var neg: int32 = -1;
+  var from_neg: bool = neg;
+  ck("negative", (int64)from_neg, 1);
+  var byte: uint8 = 2;
+  var from_byte: bool = byte;
+  ck("byte var", (int64)from_byte, 1);
+  var assign: bool = false;
+  assign = x;
+  ck("assign var", (int64)assign, 1);
+  assign = 3;
+  ck("assign lit", (int64)assign, 1);
+  assign = 0;
+  ck("assign zero", (int64)assign, 0);
+  var s: B;
+  s.f = x;
+  ck("field", (int64)s.f, 1);
+  s.f = 4;
+  ck("field lit", (int64)s.f, 1);
+  var lit_s: B = { f: 6, g: 1 };
+  ck("struct literal", (int64)lit_s.f, 1);
+  var arr: bool[3];
+  arr[1] = x;
+  ck("element", (int64)arr[1], 1);
+  arr[2] = 8;
+  ck("element lit", (int64)arr[2], 1);
+  var arr_lit: bool[2] = [3, 0];
+  ck("array literal", (int64)arr_lit[0], 1);
+  g_b = x;
+  ck("global", (int64)g_b, 1);
+  ck("global init", (int64)g_lit, 1);
+  ck("arg", take(x), 1);
+  ck("arg lit", take(12), 1);
+  ck("ret", (int64)ret_int(1024), 1);
+  ck("ret lit", (int64)ret_lit(), 1);
+  ck("cast", (int64)(bool)x, 1);
+  ck("cast lit", (int64)(bool)5, 1);
+  ck("cast byte", (int64)(bool)byte, 1);
+  ck("cast wide", (int64)(bool)big, 1);
+  var fl: float64 = 0.5;
+  ck("cast float", (int64)(bool)fl, 1);
+  var ptr: int32* = &x;
+  ck("cast pointer", (int64)(bool)ptr, 1);
+  ck("to true", (int64)(lit == true), 1);
+  ck("id", (int64)id_b(x), 1);
+  var back: int32 = lit;
+  ck("to int", (int64)back, 1);
+  var count: int32 = 0;
+  if (lit) { count = count + 1; }
+  if (from_big) { count = count + 1; }
+  if (x) { count = count + 1; }
+  if (big) { count = count + 1; }
+  ck("conditions", (int64)count, 4);
+  println("{lit} {from_int} {zero} fails {fails}");
+  return fails;
+}

@@ -142,6 +142,11 @@ static int ir_emit_aggregate_runtime_stores(IRLoweringContext *context,
       ir_operand_destroy(&value);
       return 0;
     }
+    if (!ir_normalize_to_bool(context, function, element_type, entry->element,
+                              &value, entry->element->location)) {
+      ir_operand_destroy(&value);
+      return 0;
+    }
     if (ir_should_decay_array_to_address(element_type, entry->element) &&
         !ir_decay_array_operand_to_address(context, function, &value,
                                            entry->element->location)) {

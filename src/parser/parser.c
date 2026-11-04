@@ -258,7 +258,93 @@ static const char *const TOKEN_TYPE_NAMES[TOKEN_KIND_COUNT] = {
     [TOKEN_DIVIDE] = "'/'",
     [TOKEN_PERCENT] = "'%'",
     [TOKEN_DOT] = "'.'",
-    [TOKEN_NEWLINE] = "newline",
+    [TOKEN_DOT_DOT] = "'..'",
+    [TOKEN_AT] = "'@'",
+    [TOKEN_NOT] = "'!'",
+    [TOKEN_PLUS_EQUALS] = "'+='",
+    [TOKEN_MINUS_EQUALS] = "'-='",
+    [TOKEN_STAR_EQUALS] = "'*='",
+    [TOKEN_SLASH_EQUALS] = "'/='",
+    [TOKEN_PERCENT_EQUALS] = "'%='",
+    [TOKEN_AMP_EQUALS] = "'&='",
+    [TOKEN_PIPE_EQUALS] = "'|='",
+    [TOKEN_CARET_EQUALS] = "'^='",
+    [TOKEN_LSHIFT_EQUALS] = "'<<='",
+    [TOKEN_RSHIFT_EQUALS] = "'>>='",
+    [TOKEN_EQUALS_EQUALS] = "'=='",
+    [TOKEN_NOT_EQUALS] = "'!='",
+    [TOKEN_LESS_THAN] = "'<'",
+    [TOKEN_GREATER_THAN] = "'>'",
+    [TOKEN_LESS_EQUALS] = "'<='",
+    [TOKEN_GREATER_EQUALS] = "'>='",
+    [TOKEN_CONST] = "'const'",
+    [TOKEN_ENUM] = "'enum'",
+    [TOKEN_TRAIT] = "'trait'",
+    [TOKEN_IMPL] = "'impl'",
+    [TOKEN_WHERE] = "'where'",
+    [TOKEN_MATCH] = "'match'",
+    [TOKEN_KERNEL] = "'kernel'",
+    [TOKEN_DISPATCH] = "'dispatch'",
+    [TOKEN_INT8] = "'int8'",
+    [TOKEN_INT16] = "'int16'",
+    [TOKEN_INT32] = "'int32'",
+    [TOKEN_INT64] = "'int64'",
+    [TOKEN_UINT8] = "'uint8'",
+    [TOKEN_UINT16] = "'uint16'",
+    [TOKEN_UINT32] = "'uint32'",
+    [TOKEN_UINT64] = "'uint64'",
+    [TOKEN_FLOAT32] = "'float32'",
+    [TOKEN_FLOAT64] = "'float64'",
+    [TOKEN_STRING_TYPE] = "'string'",
+    [TOKEN_MOV] = "'mov'",
+    [TOKEN_ADD] = "'add'",
+    [TOKEN_SUB] = "'sub'",
+    [TOKEN_MUL] = "'mul'",
+    [TOKEN_DIV] = "'div'",
+    [TOKEN_IMUL] = "'imul'",
+    [TOKEN_IDIV] = "'idiv'",
+    [TOKEN_INC] = "'inc'",
+    [TOKEN_DEC] = "'dec'",
+    [TOKEN_CMP] = "'cmp'",
+    [TOKEN_JMP] = "'jmp'",
+    [TOKEN_JE] = "'je'",
+    [TOKEN_JNE] = "'jne'",
+    [TOKEN_JL] = "'jl'",
+    [TOKEN_JLE] = "'jle'",
+    [TOKEN_JG] = "'jg'",
+    [TOKEN_JGE] = "'jge'",
+    [TOKEN_CALL] = "'call'",
+    [TOKEN_RET] = "'ret'",
+    [TOKEN_PUSH] = "'push'",
+    [TOKEN_POP] = "'pop'",
+    [TOKEN_LEA] = "'lea'",
+    [TOKEN_NOP] = "'nop'",
+    [TOKEN_INT] = "'int'",
+    [TOKEN_SYSCALL] = "'syscall'",
+    [TOKEN_EAX] = "'eax'",
+    [TOKEN_EBX] = "'ebx'",
+    [TOKEN_ECX] = "'ecx'",
+    [TOKEN_EDX] = "'edx'",
+    [TOKEN_ESI] = "'esi'",
+    [TOKEN_EDI] = "'edi'",
+    [TOKEN_ESP] = "'esp'",
+    [TOKEN_EBP] = "'ebp'",
+    [TOKEN_RAX] = "'rax'",
+    [TOKEN_RBX] = "'rbx'",
+    [TOKEN_RCX] = "'rcx'",
+    [TOKEN_RDX] = "'rdx'",
+    [TOKEN_RSI] = "'rsi'",
+    [TOKEN_RDI] = "'rdi'",
+    [TOKEN_RSP] = "'rsp'",
+    [TOKEN_RBP] = "'rbp'",
+    [TOKEN_R8] = "'r8'",
+    [TOKEN_R9] = "'r9'",
+    [TOKEN_R10] = "'r10'",
+    [TOKEN_R11] = "'r11'",
+    [TOKEN_R12] = "'r12'",
+    [TOKEN_R13] = "'r13'",
+    [TOKEN_R14] = "'r14'",
+    [TOKEN_R15] = "'r15'",
     [TOKEN_ERROR] = "lexical error",
 };
 
@@ -4547,22 +4633,8 @@ static ASTNode *parser_parse_interpolated_string(Parser *parser,
     }
 
     size_t start = ++i;
-    int depth = 1;
-    int in_nested = 0;
-    while (i < length) {
-      if (value[i] == '"') {
-        in_nested = !in_nested;
-      } else if (in_nested) {
-        i++;
-        continue;
-      } else if (value[i] == '{') {
-        depth++;
-      } else if (value[i] == '}' && --depth == 0) {
-        break;
-      }
-      i++;
-    }
-    if (depth != 0) {
+    i = lexer_interpolation_end(value, length, start);
+    if (i >= length) {
       parser_set_error(parser,
                        "Unterminated '{' in string literal; write '{{' for a "
                        "literal brace");

@@ -1,0 +1,7 @@
+struct S { a: int32; b: int64; }
+fn main() -> int32 {
+  var x: S;
+  var y: S;
+  if (x == y) { return 1; }
+  return 0;
+}

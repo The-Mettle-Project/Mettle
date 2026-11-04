@@ -433,7 +433,10 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
       return 0;
     }
     size_t width = type->size ? type->size : 8;
-    aggregate_store_bits(at, (uint64_t)value.int_value, width);
+    aggregate_store_bits(
+        at, type->kind == TYPE_BOOL ? (uint64_t)(value.int_value != 0)
+                                    : (uint64_t)value.int_value,
+        width);
     return 1;
   }
 

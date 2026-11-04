@@ -21477,6 +21477,27 @@ else {
   }
 }
 
+if ($script:OnWindows) {
+  Skip-ElfOnly "elf_debug_info_reaches_the_program" "ELF-only: DWARF is the ELF target's debug format"
+}
+else {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $compilerFull = (Resolve-Path $CompilerPath).Path
+    $debugDir = Join-Path $tmpDir "debuginfo"
+    $debugOut = & sh "tests/debuginfo/elf_gdb_check.sh" $compilerFull $debugDir 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not $debugOut.Contains("debuginfo ok")) {
+      throw "tests/debuginfo/walk.mettle: $debugOut"
+    }
+    Write-CaseResult -Name "elf_debug_info_reaches_the_program" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "elf_debug_info_reaches_the_program" -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Reported bugs, each built and run, the output checked for what the program
 # should print. Entry is the file to build; Args are added to the build line.
 $issueRegressions = @(
@@ -21538,8 +21559,20 @@ $issueRegressions = @(
   @{ Name = "issue_assign_odd_size_aggregate_release"; Entry = "tests/issues/odd_aggregate.mettle"; Args = @("--release"); Expect = @("11 1 3 22 5 33 3 44 7 55", "11 5 7 22 9 33 7 44 11 55", "3 3 12 3 33", "32 40 42 1", "50 40", "99 52", "5 7 11 20", "16 16 30 36") },
   @{ Name = "issue_array_field_assignment"; Entry = "tests/issues/issue_160.mettle"; Args = @(); Expect = @("1 2 3 9 3", "1 5 6 1 4 7 7", "456 6 6") },
   @{ Name = "issue_odd_array_literal_on_aarch64"; Command = @("--target", "aarch64-macos", "tests/issues/issue_160.mettle", "-o", ".tmp/issue_160.o"); Expect = @("") },
+  @{ Name = "bool_conversion_normalizes"; Entry = "tests/issues/bool_conversion.mettle"; Args = @(); Expect = @("true true false fails 0") },
+  @{ Name = "bool_conversion_normalizes_release"; Entry = "tests/issues/bool_conversion.mettle"; Args = @("--release"); Expect = @("true true false fails 0") },
+  @{ Name = "interpolation_holds_any_expression"; Entry = "tests/issues/interpolation_quoting.mettle"; Args = @(); Expect = @("[ab2c] [}] [{] [""] [}] [{] [""] x [{}] [}}] [2] [2 {a}} 1]", "[a", "z] [7]") },
+  @{ Name = "dyn_method_returning_aggregate_release"; Entry = "tests/issues/dyn_returns_aggregate.mettle"; Args = @("--release"); Expect = @("cat3", "dogrex") },
+  @{ Name = "float_literal_as_condition"; Entry = "tests/issues/float_condition.mettle"; Args = @(); Expect = @("101001 3 7 false true true false") },
+  @{ Name = "float_literal_as_condition_release"; Entry = "tests/issues/float_condition.mettle"; Args = @("--release"); Expect = @("101001 3 7 false true true false") },
+  @{ Name = "aggregate_equality_is_an_error"; Command = @("--build", "tests/issues/err_compare_struct.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("compare the fields") },
+  @{ Name = "string_order_is_an_error"; Command = @("--build", "tests/issues/err_compare_string_order.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("str_compare") },
+  @{ Name = "parse_errors_name_every_token"; Command = @("--build", "tests/issues/err_token_name.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Expected ']', found '..'") },
+  @{ Name = "multiline_string_keeps_line_numbers"; Command = @("--build", "tests/issues/err_multiline_string_line.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("err_multiline_string_line.mettle:5:") },
   @{ Name = "issue_profile_runtime_skips_naked";Entry = "tests/issues/issue_162.mettle"; Args = @("--profile-runtime"); Expect = @("7") },
-  @{ Name = "issue_profile_blocks_skips_naked"; Entry = "tests/issues/issue_162.mettle"; Args = @("--profile-blocks"); Expect = @("7") },
+  @{ Name = "issue_global_uncached_across_calls"; Entry = "tests/issues/issue_179.mettle"; Args = @(); Expect = @("51 -280 6.75 28", "42 29 105 206", "24 1 3003 32", "2 3 4 3.75 3.0 5 12 6 13") },
+  @{ Name = "issue_global_uncached_across_calls_release"; Entry = "tests/issues/issue_179.mettle"; Args = @("--release"); Expect = @("51 -280 6.75 28", "42 29 105 206", "24 1 3003 32", "2 3 4 3.75 3.0 5 12 6 13") },
+  @{ Name = "issue_profile_blocks_skips_naked";Entry = "tests/issues/issue_162.mettle"; Args = @("--profile-blocks"); Expect = @("7") },
   @{ Name = "issue_volatile_loops_release"; Entry = "tests/issues/issue_170.mettle"; Args = @("--release"); Expect = @("8498579009051162534", "130 547 111", "33 8 2", "true 163 5 10", "1 1 28 4", "3 0 8", "20.0 9.0 9") },
   @{ Name = "issue_volatile_loops_debug"; Entry = "tests/issues/issue_170.mettle"; Args = @(); Expect = @("8498579009051162534", "130 547 111", "33 8 2", "true 163 5 10", "1 1 28 4", "3 0 8", "20.0 9.0 9") }
 )

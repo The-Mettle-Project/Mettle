@@ -749,6 +749,10 @@ static int ir_store_yield_value(IRLoweringContext *context, IRFunction *function
                                          value->location)) {
     goto done;
   }
+  if (!ir_normalize_to_bool(context, function, target, value, &operand,
+                            value->location)) {
+    goto done;
+  }
   if (ir_should_decay_array_to_address(target, value) &&
       !ir_decay_array_operand_to_address(context, function, &operand,
                                          value->location)) {

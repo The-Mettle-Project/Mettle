@@ -748,18 +748,106 @@ static Token lexer_lex_identifier_or_keyword(Lexer *lexer) {
   return token;
 }
 
+static size_t lexer_interp_skip_string(const char *text, size_t length,
+                                       size_t at);
+
+static size_t lexer_interp_skip_char(const char *text, size_t length,
+                                     size_t at) {
+  size_t next = at + 1;
+  if (next < length && text[next] == '\\') {
+    next++;
+  }
+  next++;
+  if (next < length && text[next] == '\'') {
+    return next + 1;
+  }
+  return at + 1;
+}
+
+size_t lexer_interpolation_end(const char *text, size_t length, size_t start) {
+  size_t at = start;
+  size_t depth = 1;
+
+  while (at < length) {
+    char c = text[at];
+    if (c == '"') {
+      at = lexer_interp_skip_string(text, length, at);
+      continue;
+    }
+    if (c == '\'') {
+      at = lexer_interp_skip_char(text, length, at);
+      continue;
+    }
+    if (c == '{') {
+      depth++;
+    } else if (c == '}' && --depth == 0) {
+      return at;
+    }
+    at++;
+  }
+  return length;
+}
+
+static size_t lexer_interp_skip_string(const char *text, size_t length,
+                                       size_t at) {
+  at++;
+  while (at < length && text[at] != '"') {
+    if (text[at] == '\\') {
+      at += 2;
+      continue;
+    }
+    if (text[at] == '{') {
+      if (at + 1 < length && text[at + 1] == '{') {
+        at += 2;
+        continue;
+      }
+      at = lexer_interpolation_end(text, length, at + 1);
+    }
+    at++;
+  }
+  return at < length ? at + 1 : length;
+}
+
 static int lexer_read_string_body(Lexer *lexer, char *buffer,
                                   size_t *buffer_pos_out,
                                   int interpolation_aware, int *bad_escape) {
   size_t buffer_pos = 0;
-  size_t depth = 0;
-  int in_nested = 0;
 
   while (lexer->position < lexer->length) {
     char c = lexer->source[lexer->position];
 
-    if (c == '"' && !(interpolation_aware && depth > 0)) {
+    if (c == '"') {
       break;
+    }
+
+    if (interpolation_aware && c == '{') {
+      size_t end;
+      if (lexer->position + 1 < lexer->length &&
+          lexer->source[lexer->position + 1] == '{') {
+        buffer[buffer_pos++] = '{';
+        buffer[buffer_pos++] = '{';
+        lexer->position += 2;
+        lexer->column += 2;
+        continue;
+      }
+      end = lexer_interpolation_end(lexer->source, lexer->length,
+                                    lexer->position + 1);
+      if (end >= lexer->length) {
+        lexer->position = lexer->length;
+        *buffer_pos_out = buffer_pos;
+        return 0;
+      }
+      while (lexer->position <= end) {
+        char raw = lexer->source[lexer->position];
+        buffer[buffer_pos++] = raw;
+        lexer->position++;
+        lexer->column++;
+        if (raw == '\n') {
+          lexer->line++;
+          lexer->column = 1;
+        }
+      }
+      continue;
     }
 
     if (c == '\\' && lexer->position + 1 < lexer->length) {
@@ -799,30 +887,13 @@ static int lexer_read_string_body(Lexer *lexer, char *buffer,
       continue;
     }
 
-    if (interpolation_aware) {
-      if (!in_nested && depth == 0 && c == '{' &&
-          lexer->position + 1 < lexer->length &&
-          lexer->source[lexer->position + 1] == '{') {
-        buffer[buffer_pos++] = '{';
-        buffer[buffer_pos++] = '{';
-        lexer->position += 2;
-        lexer->column += 2;
-        continue;
-      }
-      if (depth > 0 && c == '"') {
-        in_nested = !in_nested;
-      } else if (!in_nested) {
-        if (c == '{') {
-          depth++;
-        } else if (c == '}' && depth > 0) {
-          depth--;
-        }
-      }
-    }
-
     buffer[buffer_pos++] = c;
     lexer->position++;
     lexer->column++;
+    if (c == '\n') {
+      lexer->line++;
+      lexer->column = 1;
+    }
   }
 
   *buffer_pos_out = buffer_pos;
@@ -845,12 +916,14 @@ static Token lexer_lex_string_literal(Lexer *lexer) {
 
   size_t body_position = lexer->position;
   size_t body_column = lexer->column;
+  size_t body_line = lexer->line;
   size_t buffer_pos = 0;
   int bad_escape = 0;
 
   if (!lexer_read_string_body(lexer, buffer, &buffer_pos, 1, &bad_escape)) {
     lexer->position = body_position;
     lexer->column = body_column;
+    lexer->line = body_line;
     bad_escape = 0;
     lexer_read_string_body(lexer, buffer, &buffer_pos, 0, &bad_escape);
   }

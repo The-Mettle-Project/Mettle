@@ -1,4 +1,6 @@
 #include "schedule_expand.h"
+
+#define SCHEDULE_MAX_THREADS 1024
 #include "../lexer/lexer.h"
 #include "../parser/parser.h"
 #include <stdarg.h>
@@ -227,6 +229,14 @@ static int read_phase(ErrorReporter *reporter, ASTNode *row,
                    "phase '%s' runs on thread %lld, and a thread is numbered "
                    "from zero",
                    out->phase, out->thread);
+    return 0;
+  }
+  if (out->thread >= SCHEDULE_MAX_THREADS) {
+    schedule_error(reporter, out->location, "H0001",
+                   "number the threads from zero, without gaps",
+                   "phase '%s' runs on thread %lld, and a schedule holds at "
+                   "most %d threads",
+                   out->phase, out->thread, SCHEDULE_MAX_THREADS);
     return 0;
   }
   return 1;

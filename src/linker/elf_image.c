@@ -624,6 +624,44 @@ static int elf_image_emit_symbols(ElfImageBuffer *image,
   }
   written = 1u;
 
+  for (size_t o = 0u; o < resolution->object_count; o++) {
+    const LinkedInputObject *input = &resolution->objects[o];
+    for (symbol_index = 0u; symbol_index < input->symbol_count; symbol_index++) {
+      const LinkedObjectSymbol *symbol = &input->symbols[symbol_index];
+      uint16_t section_header_index = 0u;
+
+      if (!symbol->is_local || !symbol->is_defined || !symbol->name ||
+          !symbol->name[0] || symbol->name[0] == '.' ||
+          strncmp(symbol->name, "mettledbg_", 10u) == 0 ||
+          symbol->merged_section_index == LINKED_SECTION_INDEX_NONE ||
+          resolution->sections[symbol->merged_section_index].kind !=
+              LINK_SECTION_KIND_TEXT) {
+        continue;
+      }
+      for (i = 0u; i < part_count; i++) {
+        if (parts[i].merged_index == symbol->merged_section_index) {
+          section_header_index = parts[i].section_header_index;
+          break;
+        }
+      }
+      if (section_header_index == 0u) {
+        continue;
+      }
+      memset(entry, 0, sizeof(entry));
+      linker_write_u32(entry + 0, elf_image_strings_add(&strings, symbol->name));
+      entry[4] = (unsigned char)((STB_LOCAL << 4) | STT_NOTYPE);
+      elf_image_put_u16(entry + 6, section_header_index);
+      linker_write_u64(entry + 8, symbol->virtual_address);
+      if (!elf_image_buffer_write(image, offset + written * ELF_SYM_SIZE, entry,
+                                  sizeof(entry))) {
+        free(strings.data);
+        return 0;
+      }
+      written++;
+    }
+  }
+  *local_count_out = (uint32_t)written;
+
   for (symbol_index = 0u; symbol_index < resolution->symbol_count;
        symbol_index++) {
     const LinkedSymbol *symbol = &resolution->symbols[symbol_index];
@@ -662,7 +700,6 @@ static int elf_image_emit_symbols(ElfImageBuffer *image,
 
   *symtab_offset_out = offset;
   *symtab_size_out = (uint64_t)written * ELF_SYM_SIZE;
-  *local_count_out = 1u;
 
   offset = offset + (size_t)(*symtab_size_out);
   if (!elf_image_buffer_pad_to(image, offset) ||
@@ -734,6 +771,183 @@ static void elf_image_read_options(const ElfImageOptions *options,
   dynamic_options->image_base = *image_base;
 }
 
+#define ELF_IMAGE_DEBUG_NONE ((size_t)-1)
+#define ELF_IMAGE_MAX_DEBUG_SECTIONS 32u
+
+typedef struct {
+  char *name;
+  unsigned char *data;
+  size_t size;
+  size_t alignment;
+  uint64_t file_offset;
+  uint16_t section_header_index;
+} ElfImageDebugSection;
+
+typedef struct {
+  ElfImageDebugSection *items;
+  size_t count;
+  size_t capacity;
+} ElfImageDebugSections;
+
+static void elf_image_debug_free(ElfImageDebugSections *debug) {
+  for (size_t i = 0u; i < debug->count; i++) {
+    free(debug->items[i].name);
+    free(debug->items[i].data);
+  }
+  free(debug->items);
+  memset(debug, 0, sizeof(*debug));
+}
+
+static int elf_image_section_is_debug(const LinkSection *section) {
+  return section->is_metadata && section->name && section->raw_data &&
+         strncmp(section->name, ".debug", 6u) == 0;
+}
+
+static ElfImageDebugSection *elf_image_debug_section_for(
+    ElfImageDebugSections *debug, const char *name) {
+  for (size_t i = 0u; i < debug->count; i++) {
+    if (strcmp(debug->items[i].name, name) == 0) {
+      return &debug->items[i];
+    }
+  }
+  if (debug->count == ELF_IMAGE_MAX_DEBUG_SECTIONS) {
+    return NULL;
+  }
+  if (debug->count == debug->capacity) {
+    size_t grown_capacity = debug->capacity ? debug->capacity * 2u : 8u;
+    ElfImageDebugSection *grown = (ElfImageDebugSection *)realloc(
+        debug->items, grown_capacity * sizeof(*grown));
+    if (!grown) {
+      return NULL;
+    }
+    debug->items = grown;
+    debug->capacity = grown_capacity;
+  }
+  memset(&debug->items[debug->count], 0, sizeof(debug->items[0]));
+  debug->items[debug->count].name = mettle_strdup(name);
+  debug->items[debug->count].alignment = 1u;
+  return debug->items[debug->count].name ? &debug->items[debug->count++] : NULL;
+}
+
+static uint64_t elf_image_debug_target(const LinkResolution *resolution,
+                                       const LinkedInputObject *input,
+                                       const size_t *bases,
+                                       const LinkReloc *reloc) {
+  const LinkedObjectSymbol *symbol;
+  const LinkSymbol *raw;
+  const LinkedSymbol *global;
+
+  if (reloc->symbol_index >= input->symbol_count) {
+    return 0u;
+  }
+  symbol = &input->symbols[reloc->symbol_index];
+  raw = &input->object->symbols[reloc->symbol_index];
+  if (symbol->section_index >= 0 &&
+      (size_t)symbol->section_index < input->object->section_count &&
+      bases[symbol->section_index] != ELF_IMAGE_DEBUG_NONE) {
+    return (uint64_t)bases[symbol->section_index] + raw->value +
+           (uint64_t)reloc->addend;
+  }
+  if (symbol->is_defined &&
+      symbol->merged_section_index != LINKED_SECTION_INDEX_NONE) {
+    return symbol->virtual_address + (uint64_t)reloc->addend;
+  }
+  global = symbol->name ? link_resolution_find_symbol(resolution, symbol->name)
+                        : NULL;
+  if (global && global->is_defined &&
+      global->merged_section_index != LINKED_SECTION_INDEX_NONE) {
+    return global->virtual_address + (uint64_t)reloc->addend;
+  }
+  return 0u;
+}
+
+static int elf_image_debug_append_object(const LinkResolution *resolution,
+                                         const LinkedInputObject *input,
+                                         ElfImageDebugSections *debug) {
+  const LinkObject *object = input->object;
+  size_t *bases;
+  ElfImageDebugSection **outputs;
+  int ok = 1;
+
+  if (!object || object->section_count == 0u) {
+    return 1;
+  }
+  bases = (size_t *)malloc(object->section_count * sizeof(*bases));
+  outputs = (ElfImageDebugSection **)calloc(object->section_count,
+                                            sizeof(*outputs));
+  if (!bases || !outputs) {
+    free(bases);
+    free(outputs);
+    return 0;
+  }
+  for (size_t s = 0u; s < object->section_count; s++) {
+    bases[s] = ELF_IMAGE_DEBUG_NONE;
+  }
+  for (size_t s = 0u; ok && s < object->section_count; s++) {
+    const LinkSection *section = &object->sections[s];
+    ElfImageDebugSection *output;
+    unsigned char *grown;
+    size_t base;
+
+    if (!elf_image_section_is_debug(section)) {
+      continue;
+    }
+    output = elf_image_debug_section_for(debug, section->name);
+    if (!output) {
+      ok = 0;
+      break;
+    }
+    base = linker_align_up(output->size, section->alignment);
+    grown = (unsigned char *)realloc(output->data,
+                                     base + section->size_of_raw_data + 1u);
+    if (!grown) {
+      ok = 0;
+      break;
+    }
+    output->data = grown;
+    memset(output->data + output->size, 0, base - output->size);
+    memcpy(output->data + base, section->raw_data, section->size_of_raw_data);
+    output->size = base + section->size_of_raw_data;
+    if (section->alignment > output->alignment) {
+      output->alignment = section->alignment;
+    }
+    bases[s] = base;
+    outputs[s] = output;
+  }
+  for (size_t s = 0u; ok && s < object->section_count; s++) {
+    const LinkSection *section = &object->sections[s];
+    if (!outputs[s]) {
+      continue;
+    }
+    for (size_t r = 0u; r < section->relocation_count; r++) {
+      const LinkReloc *reloc = &section->relocations[r];
+      unsigned char *patch = outputs[s]->data + bases[s] + reloc->offset;
+      uint64_t value = elf_image_debug_target(resolution, input, bases, reloc);
+      if (reloc->kind == LINK_RELOC_ABS64 &&
+          reloc->offset + 8u <= section->size_of_raw_data) {
+        linker_write_u64(patch, value);
+      } else if (reloc->kind == LINK_RELOC_ABS32 &&
+                 reloc->offset + 4u <= section->size_of_raw_data) {
+        linker_write_u32(patch, (uint32_t)value);
+      }
+    }
+  }
+  free(bases);
+  free(outputs);
+  return ok;
+}
+
+static int elf_image_debug_collect(const LinkResolution *resolution,
+                                   ElfImageDebugSections *debug) {
+  for (size_t o = 0u; o < resolution->object_count; o++) {
+    if (!elf_image_debug_append_object(resolution, &resolution->objects[o],
+                                       debug)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 typedef struct {
   uint64_t symtab_offset;
   uint64_t symtab_size;
@@ -742,6 +956,7 @@ typedef struct {
   uint32_t local_symbol_count;
   uint16_t symtab_index;
   int emit_symbols;
+  const ElfImageDebugSections *debug;
 } ElfImageSymbolTables;
 
 static int elf_image_write_section_headers(
@@ -775,6 +990,7 @@ static int elf_image_write_section_headers(
   {
     uint32_t part_names[ELF_IMAGE_MAX_PARTS];
     uint32_t blob_names[ELF_DYNAMIC_BLOB_COUNT];
+    uint32_t debug_names[ELF_IMAGE_MAX_DEBUG_SECTIONS] = {0};
 
     memset(blob_names, 0, sizeof(blob_names));
     for (i = 0u; i < part_count; i++) {
@@ -790,6 +1006,11 @@ static int elf_image_write_section_headers(
     if (emit_symbols) {
       symtab_name = elf_image_strings_add(&shstrings, ".symtab");
       strtab_name = elf_image_strings_add(&shstrings, ".strtab");
+    }
+    for (i = 0u; i < tables->debug->count; i++) {
+      size_t at_name = elf_image_strings_add(&shstrings,
+                                             tables->debug->items[i].name);
+      debug_names[i] = (uint32_t)at_name;
     }
     shstrtab_name = elf_image_strings_add(&shstrings, ".shstrtab");
 
@@ -921,6 +1142,24 @@ static int elf_image_write_section_headers(
       }
     }
 
+    for (i = 0u; i < tables->debug->count; i++) {
+      const ElfImageDebugSection *section = &tables->debug->items[i];
+      size_t at = (size_t)section_header_offset +
+                  (size_t)section->section_header_index * ELF_SHDR_SIZE;
+
+      memset(shdr, 0, sizeof(shdr));
+      linker_write_u32(shdr + 0, debug_names[i]);
+      linker_write_u32(shdr + 4, SHT_PROGBITS);
+      linker_write_u64(shdr + 24, section->file_offset);
+      linker_write_u64(shdr + 32, section->size);
+      linker_write_u64(shdr + 48, section->alignment);
+      if (!elf_image_buffer_write(image, at, shdr, sizeof(shdr))) {
+        free(shstrings.data);
+        mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+        return 0;
+      }
+    }
+
     {
       size_t at = (size_t)section_header_offset + (size_t)shstrndx * ELF_SHDR_SIZE;
 
@@ -951,6 +1190,7 @@ int elf_image_emit_executable(LinkResolution *resolution,
   ElfDynamicPlan *plan = NULL;
   ElfDynamicOptions dynamic_options;
   LinkRelocationOptions relocation_options = {0};
+  ElfImageDebugSections debug_sections = {0};
   unsigned char ehdr[ELF_EHDR_SIZE];
   uint64_t image_base = 0x400000u;
   uint64_t page_size = 0x1000u;
@@ -1103,6 +1343,29 @@ int elf_image_emit_executable(LinkResolution *resolution,
     symtab_index = shnum;
     shnum = (uint16_t)(shnum + 2u);
   }
+  if (emit_symbols && !elf_image_debug_collect(resolution, &debug_sections)) {
+    elf_image_debug_free(&debug_sections);
+    elf_dynamic_plan_destroy(plan);
+    elf_image_buffer_free(&image);
+    mettle_set_error(error_message_out,
+                     "Out of memory while merging debug sections");
+    return 0;
+  }
+  for (i = 0u; i < debug_sections.count; i++) {
+    ElfImageDebugSection *section = &debug_sections.items[i];
+    section->file_offset = linker_align_up(image.size, section->alignment);
+    section->section_header_index = shnum;
+    shnum++;
+    if (!elf_image_buffer_pad_to(&image, (size_t)section->file_offset) ||
+        !elf_image_buffer_write(&image, (size_t)section->file_offset,
+                                section->data, section->size)) {
+      elf_image_debug_free(&debug_sections);
+      elf_dynamic_plan_destroy(plan);
+      elf_image_buffer_free(&image);
+      mettle_set_error(error_message_out, "Out of memory while emitting ELF");
+      return 0;
+    }
+  }
   shstrndx = shnum;
   shnum++;
 
@@ -1116,15 +1379,18 @@ int elf_image_emit_executable(LinkResolution *resolution,
     tables.local_symbol_count = local_symbol_count;
     tables.symtab_index = symtab_index;
     tables.emit_symbols = emit_symbols;
+    tables.debug = &debug_sections;
     if (!elf_image_write_section_headers(&image, parts, part_count, plan,
                                          &tables, shstrndx,
                                          &section_header_offset,
                                          error_message_out)) {
+      elf_image_debug_free(&debug_sections);
       elf_dynamic_plan_destroy(plan);
       elf_image_buffer_free(&image);
       return 0;
     }
   }
+  elf_image_debug_free(&debug_sections);
 
   memset(ehdr, 0, sizeof(ehdr));
   ehdr[0] = 0x7Fu;

@@ -4,5 +4,11 @@ fn main() -> int32 {
   var x: int64 = 1;
   var r: int64 = pick(x, 5);
   println("{r}");
+  var f: float64 = 1.0;
+  var a: int64 = pick(x, -5);
+  var b: int64 = pick(x, 2500 * 7);
+  var c: float64 = pick(f, -2);
+  var d: float64 = pick(f, 1.5 * 2.0);
+  println("{a} {b} {c} {d}");
   return 0;
 }

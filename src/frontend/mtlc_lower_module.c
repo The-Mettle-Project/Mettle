@@ -671,7 +671,9 @@ static void populate_scalar_initializer(IRProgram *program, TypeChecker *tc,
       double d = c.float_value;
       memcpy(&entry->init_bits, &d, sizeof(d));
     } else {
-      entry->init_bits = c.int_value;
+      entry->init_bits = entry->type && entry->type->kind == MTLC_TYPE_BOOL
+                             ? c.int_value != 0
+                             : c.int_value;
     }
   } else if (addressed) {
     entry->init_symbol_ref = (char *)addressed;

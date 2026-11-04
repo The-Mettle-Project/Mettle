@@ -40,6 +40,7 @@
 #define R_X86_64_64 1
 #define R_X86_64_PC32 2
 #define R_X86_64_PLT32 4
+#define R_X86_64_32 10
 
 #define R_AARCH64_ABS64 257
 #define R_AARCH64_ADR_PREL_PG_HI21 275
@@ -173,6 +174,10 @@ static int elf_map_relocation(BinaryTargetFormat target,
     return 1;
   case BINARY_RELOCATION_ADDR64:
     *type_out = R_X86_64_64;
+    *implicit_addend_out = 0;
+    return 1;
+  case BINARY_RELOCATION_SECTION_REL32:
+    *type_out = R_X86_64_32;
     *implicit_addend_out = 0;
     return 1;
   default:

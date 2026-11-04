@@ -6855,6 +6855,41 @@ const IRInstruction *ir_function_find_declaration(const IRFunction *function,
   return NULL;
 }
 
+static const IRFunction *g_ir_frozen_function;
+static const IRInstruction *g_ir_frozen_instructions;
+static size_t g_ir_frozen_count;
+
+void ir_function_freeze_declarations(const IRFunction *function) {
+  size_t slot;
+
+  g_ir_frozen_function = NULL;
+  if (!function || function->instruction_count < IR_DECLARATION_MAP_MIN_BODY) {
+    return;
+  }
+  for (size_t i = 0; i < IR_DECLARATION_MAP_SLOTS; i++) {
+    if (g_ir_declaration_maps[i].function == function) {
+      g_ir_declaration_maps[i].function = NULL;
+    }
+  }
+  slot = ir_declaration_map_build(function);
+  if (slot >= IR_DECLARATION_MAP_SLOTS) {
+    return;
+  }
+  g_ir_frozen_function = function;
+  g_ir_frozen_instructions = function->instructions;
+  g_ir_frozen_count = function->instruction_count;
+}
+
+const IRInstruction *ir_function_find_declaration_frozen(
+    const IRFunction *function, const char *symbol_name) {
+  if (function && symbol_name && function == g_ir_frozen_function &&
+      function->instructions == g_ir_frozen_instructions &&
+      function->instruction_count == g_ir_frozen_count) {
+    return ir_declaration_map_find(function, symbol_name, 0);
+  }
+  return ir_function_find_declaration(function, symbol_name, 0);
+}
+
 int ir_program_eliminate_dead_functions(IRProgram *program, int keep_exports) {
   IrFnNameTable table;
   unsigned char *live = NULL;

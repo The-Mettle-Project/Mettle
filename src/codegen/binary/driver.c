@@ -80,7 +80,8 @@ static int code_generator_binary_track_debug_range(
     CodeGenerator *generator, IRFunction *ir_function,
     BinaryFunctionContext *context) {
   if (!generator->debug_info || (!generator->generate_stack_trace_support &&
-                                 !generator->generate_crash_report)) {
+                                 !generator->generate_crash_report &&
+                                 !generator->generate_debug_info)) {
     return 1;
   }
   context->runtime_end_label =
@@ -375,6 +376,7 @@ int code_generator_emit_binary_function(CodeGenerator *generator,
                              ir_function->name);
     return 0;
   }
+  ir_function_freeze_declarations(ir_function);
 
   started = cg_time_begin();
   if (!code_generator_binary_prepare_function_context(generator, ir_function,

@@ -1742,17 +1742,13 @@ const MtlcType *code_generator_binary_indirect_callee_type(
     return NULL;
   }
   if (context && context->ir_function) {
-    const IRFunction *irf = context->ir_function;
-    for (size_t i = 0; i < irf->instruction_count; i++) {
-      const IRInstruction *in = &irf->instructions[i];
-      if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name && in->text &&
-          strcmp(in->dest.name, instruction->lhs.name) == 0) {
-        const MtlcType *t =
-            code_generator_binary_get_resolved_type(generator, in->text, 0);
-        if (t && t->kind == MTLC_TYPE_FUNCTION_POINTER) {
-          return t;
-        }
-        break;
+    const IRInstruction *in = ir_function_find_declaration_frozen(
+        context->ir_function, instruction->lhs.name);
+    if (in) {
+      const MtlcType *t =
+          code_generator_binary_get_resolved_type(generator, in->text, 0);
+      if (t && t->kind == MTLC_TYPE_FUNCTION_POINTER) {
+        return t;
       }
     }
   }

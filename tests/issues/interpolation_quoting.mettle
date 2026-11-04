@@ -1,0 +1,10 @@
+import "std/io";
+
+fn q(s: string) -> string { return s; }
+
+fn main() -> int32 {
+  var a: int32[2] = [1, 2];
+  println("[a{q("b{1+1}c")}] [{'}'}] [{'{'}] [{'"'}] [{q("}")}] [{q("{{")}] [{q("\"")}] x [{{}] [}}] [{ 1 + 1 }] [{a[1]} {{a}} {a[0]}]");
+  println("[a{'\n'}z] [{7}]");
+  return 0;
+}

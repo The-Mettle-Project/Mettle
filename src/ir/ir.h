@@ -627,6 +627,9 @@ void ir_gpu_call_graph_destroy(IRGpuCallGraph *graph);
 int ir_program_bind_device_asm(IRProgram *program, char **error);
 
 size_t ir_function_drop_dead_nops(IRFunction *function);
+void ir_function_freeze_declarations(const IRFunction *function);
+const IRInstruction *ir_function_find_declaration_frozen(
+    const IRFunction *function, const char *symbol_name);
 const IRInstruction *ir_function_find_declaration(const IRFunction *function,
                                                  const char *symbol_name,
                                                  int symbols_only);

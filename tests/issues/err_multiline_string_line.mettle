@@ -1,0 +1,6 @@
+fn main() -> int32 {
+  var s: string = "first
+second
+third";
+  return undefined_here;
+}

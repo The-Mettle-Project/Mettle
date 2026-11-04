@@ -309,7 +309,25 @@ typedef struct {
   const char **at;
   size_t at_count;
   const unsigned long long *dirty;
+  const char **uncached;
+  size_t uncached_mask;
 } MirGlobalWriteback;
+
+static int mir_global_is_uncached(const MirGlobalWriteback *wb,
+                                  const char *name) {
+  size_t slot;
+  if (!wb || !wb->uncached) {
+    return 0;
+  }
+  slot = (size_t)mettle_fnv1a_hash(name) & wb->uncached_mask;
+  while (wb->uncached[slot]) {
+    if (strcmp(wb->uncached[slot], name) == 0) {
+      return 1;
+    }
+    slot = (slot + 1) & wb->uncached_mask;
+  }
+  return 0;
+}
 
 static MirOperand mir_value_operand(MirFunction *fn, CodeGenerator *g,
                                     BinaryFunctionContext *ctx, MirNameMap *map,
@@ -543,7 +561,7 @@ static const MtlcType *mir_local_or_param_type(CodeGenerator *g,
   }
   {
     const IRInstruction *declaration =
-        ir_function_find_declaration(ir_function, name, 0);
+        ir_function_find_declaration_frozen(ir_function, name);
 
     if (declaration) {
       return code_generator_binary_get_resolved_type(g, declaration->text, 0);
@@ -854,19 +872,17 @@ static int mir_name_is_string_local(CodeGenerator *g, const IRFunction *irf,
   return t && !is_param && t->kind == MTLC_TYPE_STRING;
 }
 
+static const IRInstruction *mir_temp_first_def(const IRFunction *function,
+                                               const char *name);
+
 static int mir_temp_is_indirect_call_result(const IRFunction *irf,
                                             const IROperand *op) {
+  const IRInstruction *in;
   if (!irf || op->kind != IR_OPERAND_TEMP || !op->name) {
     return 0;
   }
-  for (size_t i = 0; i < irf->instruction_count; i++) {
-    const IRInstruction *in = &irf->instructions[i];
-    if (ir_operand_is_temp(&in->dest) &&
-        strcmp(in->dest.name, op->name) == 0) {
-      return in->op == IR_OP_CALL_INDIRECT && in->lhs.kind == IR_OPERAND_TEMP;
-    }
-  }
-  return 0;
+  in = mir_temp_first_def(irf, op->name);
+  return in && in->op == IR_OP_CALL_INDIRECT && in->lhs.kind == IR_OPERAND_TEMP;
 }
 
 static int mir_indirect_source_is_supported(CodeGenerator *g,
@@ -1699,7 +1715,7 @@ static int mir_call_is_supported(CodeGenerator *g,
     hidden = 1;
   }
   if (callee->data.function.parameter_count != in->argument_count) {
-    mir_call_trace("arity_mismatch");
+    mir_call_trace_named("arity_mismatch", in->text);
     return 0;
   }
   abi = code_generator_binary_active_abi();
@@ -2136,6 +2152,7 @@ static int mir_gate_select(CodeGenerator *generator,
   case IR_OP_ADDRESS_OF:
     if (mir_addressof_kind(generator, ir_function, in) ==
         MIR_ADDROF_UNSUPPORTED) {
+      mir_call_trace_named("addressof", in->lhs.name);
       return mir_trace_bail(ir_function, "addressof:unsupported");
     }
     if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
@@ -12226,7 +12243,8 @@ static void mir_sink_cold_exits(MirFunction *fn) {
 static int mir_emit_volatile_global_reads(MirFunction *fn, CodeGenerator *g,
                                           MirNameMap *map,
                                           const IRInstruction *in,
-                                          const MirAddrFold *fold) {
+                                          const MirAddrFold *fold,
+                                          const MirGlobalWriteback *wb) {
   const IROperand *reads[5];
   size_t count = 0;
   reads[count++] = &in->lhs;
@@ -12244,7 +12262,8 @@ static int mir_emit_volatile_global_reads(MirFunction *fn, CodeGenerator *g,
     const char *name = op->name;
     if (op->kind != IR_OPERAND_SYMBOL || !name ||
         (in->op == IR_OP_ADDRESS_OF && op == &in->lhs) ||
-        !mir_name_is_volatile_global_scalar(g, name)) {
+        (!mir_global_is_uncached(wb, name) &&
+         !mir_name_is_volatile_global_scalar(g, name))) {
       continue;
     }
     if (!mir_emit_global_reload_names(fn, g, map, &name, 1)) {
@@ -12256,11 +12275,13 @@ static int mir_emit_volatile_global_reads(MirFunction *fn, CodeGenerator *g,
 
 static int mir_emit_volatile_global_write(MirFunction *fn, CodeGenerator *g,
                                           MirNameMap *map,
-                                          const IRInstruction *in) {
+                                          const IRInstruction *in,
+                                          const MirGlobalWriteback *wb) {
   const char *name = in->dest.name;
   if (in->op == IR_OP_STORE || in->op == IR_OP_DECLARE_LOCAL ||
       in->dest.kind != IR_OPERAND_SYMBOL || !name ||
-      !mir_name_is_volatile_global_scalar(g, name)) {
+      (!mir_global_is_uncached(wb, name) &&
+       !mir_name_is_volatile_global_scalar(g, name))) {
     return 1;
   }
   return mir_emit_global_flush_names(fn, g, map, &name, 1);
@@ -12412,6 +12433,7 @@ static int mir_cache_global_operand(MirFunction *fn, CodeGenerator *generator,
     return 1;
   }
   if (op->kind != IR_OPERAND_SYMBOL || !op->name ||
+      mir_global_is_uncached(wb, op->name) ||
       mir_name_map_has(map, op->name) ||
       !mir_name_is_global_scalar(generator, op->name)) {
     return 1;
@@ -12446,6 +12468,7 @@ static int mir_cache_globals(MirFunction *fn, CodeGenerator *generator,
     const IRInstruction *in = &ir_function->instructions[i];
 
     if (ir_operand_is_symbol(&in->dest) &&
+        !mir_global_is_uncached(wb, in->dest.name) &&
         mir_name_is_global_scalar(generator, in->dest.name) &&
         !mir_name_list_has(wb->names, wb->count, in->dest.name) &&
         !mir_name_list_add(&wb->names, &wb->count, dirty_cap, in->dest.name)) {
@@ -12461,6 +12484,171 @@ static int mir_cache_globals(MirFunction *fn, CodeGenerator *generator,
       }
     }
   }
+  return 1;
+}
+
+#define MIR_GLOBAL_CACHE_MAX_DEPTH 6
+
+typedef struct {
+  const char *name;
+  unsigned long long weight;
+  int written;
+} MirGlobalUse;
+
+static unsigned long long *mir_instruction_loop_weights(
+    const IRFunction *ir_function) {
+  size_t n = ir_function->instruction_count;
+  size_t capacity = 16;
+  const char **labels;
+  size_t *at;
+  int *delta;
+  unsigned long long *weights;
+  int depth = 0;
+
+  while (capacity < n * 2 + 2) {
+    capacity *= 2;
+  }
+  labels = (const char **)calloc(capacity, sizeof(*labels));
+  at = (size_t *)calloc(capacity, sizeof(*at));
+  delta = (int *)calloc(n + 1, sizeof(*delta));
+  weights = (unsigned long long *)calloc(n + 1, sizeof(*weights));
+  if (!labels || !at || !delta || !weights) {
+    free(labels);
+    free(at);
+    free(delta);
+    free(weights);
+    return NULL;
+  }
+  for (size_t i = 0; i < n; i++) {
+    const IRInstruction *in = &ir_function->instructions[i];
+    if (in->op == IR_OP_LABEL && in->text) {
+      size_t slot = (size_t)mettle_fnv1a_hash(in->text) & (capacity - 1);
+      while (labels[slot]) {
+        slot = (slot + 1) & (capacity - 1);
+      }
+      labels[slot] = in->text;
+      at[slot] = i;
+    }
+  }
+  for (size_t i = 0; i < n; i++) {
+    const IRInstruction *in = &ir_function->instructions[i];
+    if ((in->op == IR_OP_JUMP || in->op == IR_OP_BRANCH_ZERO ||
+         in->op == IR_OP_BRANCH_EQ) &&
+        in->text) {
+      size_t slot = (size_t)mettle_fnv1a_hash(in->text) & (capacity - 1);
+      while (labels[slot] && strcmp(labels[slot], in->text) != 0) {
+        slot = (slot + 1) & (capacity - 1);
+      }
+      if (labels[slot] && at[slot] <= i) {
+        delta[at[slot]]++;
+        delta[i + 1]--;
+      }
+    }
+  }
+  for (size_t i = 0; i < n; i++) {
+    int clamped;
+    depth += delta[i];
+    clamped = depth > MIR_GLOBAL_CACHE_MAX_DEPTH ? MIR_GLOBAL_CACHE_MAX_DEPTH
+                                                 : depth;
+    weights[i] = 1ull << (clamped * 3);
+  }
+  free(labels);
+  free(at);
+  free(delta);
+  return weights;
+}
+
+static MirGlobalUse *mir_global_use_slot(MirGlobalUse *table, size_t mask,
+                                         const char *name) {
+  size_t slot = (size_t)mettle_fnv1a_hash(name) & mask;
+  while (table[slot].name && strcmp(table[slot].name, name) != 0) {
+    slot = (slot + 1) & mask;
+  }
+  table[slot].name = name;
+  return &table[slot];
+}
+
+static int mir_choose_uncached_globals(CodeGenerator *generator,
+                                       IRFunction *ir_function,
+                                       const MirNameMap *map,
+                                       MirGlobalWriteback *wb) {
+  size_t n = ir_function->instruction_count;
+  size_t capacity = 16;
+  size_t chosen = 0;
+  unsigned long long calls = 0;
+  unsigned long long writing_calls = 0;
+  unsigned long long *weights;
+  MirGlobalUse *uses;
+  const char **set;
+
+  for (size_t i = 0; i < n; i++) {
+    if (ir_function->instructions[i].op == IR_OP_INLINE_ASM) {
+      return 1;
+    }
+  }
+  while (capacity < n * 8 + 2) {
+    capacity *= 2;
+  }
+  weights = mir_instruction_loop_weights(ir_function);
+  uses = (MirGlobalUse *)calloc(capacity, sizeof(*uses));
+  if (!weights || !uses) {
+    free(weights);
+    free(uses);
+    return 0;
+  }
+  for (size_t i = 0; i < n; i++) {
+    const IRInstruction *in = &ir_function->instructions[i];
+    if (in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) {
+      calls += weights[i];
+      if (mir_call_may_write_globals(generator, ir_function, i, in)) {
+        writing_calls += weights[i];
+      }
+    }
+    for (int k = 0;; k++) {
+      const IROperand *op = mir_instruction_operand(in, k);
+      if (!op) {
+        break;
+      }
+      if (op->kind == IR_OPERAND_SYMBOL && op->name &&
+          !(in->op == IR_OP_ADDRESS_OF && op == &in->lhs) &&
+          !mir_name_map_has(map, op->name) &&
+          mir_name_is_global_scalar(generator, op->name)) {
+        MirGlobalUse *use = mir_global_use_slot(uses, capacity - 1, op->name);
+        use->weight += weights[i];
+        if (op == &in->dest && in->op != IR_OP_STORE) {
+          use->written = 1;
+        }
+      }
+    }
+  }
+  free(weights);
+  if (calls == 0) {
+    free(uses);
+    return 1;
+  }
+  set = (const char **)calloc(capacity, sizeof(*set));
+  if (!set) {
+    free(uses);
+    return 0;
+  }
+  for (size_t i = 0; i < capacity; i++) {
+    if (uses[i].name &&
+        uses[i].weight <= writing_calls + (uses[i].written ? calls : 0)) {
+      size_t slot = (size_t)mettle_fnv1a_hash(uses[i].name) & (capacity - 1);
+      while (set[slot]) {
+        slot = (slot + 1) & (capacity - 1);
+      }
+      set[slot] = uses[i].name;
+      chosen++;
+    }
+  }
+  free(uses);
+  if (chosen == 0) {
+    free(set);
+    return 1;
+  }
+  wb->uncached = set;
+  wb->uncached_mask = capacity - 1;
   return 1;
 }
 
@@ -12492,7 +12680,8 @@ static int mir_collect_aliased_globals(CodeGenerator *generator,
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     const IRInstruction *in = &ir_function->instructions[i];
     if (in->op != IR_OP_ADDRESS_OF || in->lhs.kind != IR_OPERAND_SYMBOL ||
-        !in->lhs.name || !mir_name_is_global_scalar(generator, in->lhs.name) ||
+        !in->lhs.name || mir_global_is_uncached(wb, in->lhs.name) ||
+        !mir_name_is_global_scalar(generator, in->lhs.name) ||
         !mir_name_map_has(map, in->lhs.name)) {
       continue;
     }
@@ -12625,7 +12814,7 @@ static int mir_lower_general(MirFunction *fn, CodeGenerator *generator,
     return 0;
   }
   if (!mir_lower_instruction(fn, generator, context, map, in, wb) ||
-      !mir_emit_volatile_global_write(fn, generator, map, in)) {
+      !mir_emit_volatile_global_write(fn, generator, map, in, wb)) {
     return 0;
   }
   if (is_call &&
@@ -12643,13 +12832,13 @@ static int mir_lower_at(MirFunction *fn, CodeGenerator *generator,
                         void **vr_oracle) {
   const IRInstruction *in = &ir_function->instructions[*at];
 
-  if (!mir_emit_volatile_global_reads(fn, generator, map, in, &folds[*at])) {
+  if (!mir_emit_volatile_global_reads(fn, generator, map, in, &folds[*at], wb)) {
     return 0;
   }
   if (folds[*at].valid) {
     return mir_lower_folded_access(fn, generator, context, map, in,
                                    &folds[*at]) &&
-           mir_emit_volatile_global_write(fn, generator, map, in);
+           mir_emit_volatile_global_write(fn, generator, map, in, wb);
   }
   if (mir_fuses_compare_branch(generator, ir_function, *at, fn->temp_uses)) {
     if (!mir_lower_compare_branch(fn, generator, context, map, ir_function, in,
@@ -12914,7 +13103,8 @@ int code_generator_binary_emit_function_via_mir(
     fn.incoming_arg_slots = slot_count;
   }
 
-  if (!mir_cache_globals(&fn, generator, ir_function, &map, &wb, &wb_cap,
+  if (!mir_choose_uncached_globals(generator, ir_function, &map, &wb) ||
+      !mir_cache_globals(&fn, generator, ir_function, &map, &wb, &wb_cap,
                          &wb_all_cap)) {
     goto oom;
   }
@@ -12997,6 +13187,7 @@ int code_generator_binary_emit_function_via_mir(
   free(wb.names);
   free(wb.all);
   free(wb.at);
+  free((void *)wb.uncached);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
   ir_value_range_oracle_destroy(vr_oracle);
@@ -13020,6 +13211,7 @@ oom:
   free(wb.names);
   free(wb.all);
   free(wb.at);
+  free((void *)wb.uncached);
   mir_name_map_destroy(&map);
   mir_function_destroy(&fn);
   ir_value_range_oracle_destroy(vr_oracle);

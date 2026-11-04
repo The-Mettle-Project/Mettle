@@ -1,0 +1,21 @@
+import "std/io";
+
+fn main() -> int32 {
+  var n: int32 = 0;
+  var f: float64 = 0.5;
+  if (1.5) { n = n + 1; }
+  if (0.0) { n = n + 10; }
+  while (0.0) { n = n + 100; }
+  var i: int32 = 0;
+  while (1.5) {
+    i = i + 1;
+    if (i == 3) { break; }
+  }
+  if (f && 2.5) { n = n + 1000; }
+  if (f && 0.0) { n = n + 10000; }
+  if (0.0 || f) { n = n + 100000; }
+  if (0.0 || 0.0) { n = n + 1000000; }
+  var v = if (1.5) 7 else 8;
+  println("{n} {i} {v} {!1.5} {!0.0} {1.5 && 2.5} {0.0 || 0.0}");
+  return 0;
+}

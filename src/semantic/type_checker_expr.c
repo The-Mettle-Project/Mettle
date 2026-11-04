@@ -4894,6 +4894,24 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
       return NULL;
     }
 
+    if (left_type->kind == TYPE_STRING && !is_equality) {
+      type_checker_set_error_at_location(
+          checker, location,
+          "Strings have == and != but no '%s': order them with str_compare "
+          "from std/conv",
+          op);
+      return NULL;
+    }
+    if (left_type->kind == TYPE_STRUCT || left_type->kind == TYPE_ARRAY ||
+        left_type->kind == TYPE_TAGGED_ENUM || left_type->kind == TYPE_SLICE) {
+      type_checker_set_error_at_location(
+          checker, location,
+          "Cannot compare '%s' with '%s': compare the fields or elements one "
+          "by one",
+          left_type->name, right_type->name);
+      return NULL;
+    }
+
     return checker->builtin_bool;
   }
 

@@ -186,6 +186,7 @@ typedef struct {
   TokenType last_significant;
 } Lexer;
 
+size_t lexer_interpolation_end(const char *text, size_t length, size_t start);
 Lexer *lexer_create(const char *source);
 void lexer_destroy(Lexer *lexer);
 Token lexer_next_token(Lexer *lexer);

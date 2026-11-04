@@ -24,6 +24,57 @@ int ir_should_coerce_string_to_cstring(IRLoweringContext *context,
          ir_expression_is_string(context, value_expression);
 }
 
+int ir_normalize_to_bool(IRLoweringContext *context, IRFunction *function,
+                         Type *target_type, ASTNode *value_expression,
+                         IROperand *value, SourceLocation location) {
+  Type *source;
+  IROperand destination = ir_operand_none();
+  IRInstruction compare = {0};
+  int ok;
+
+  if (!target_type || target_type->kind != TYPE_BOOL || !value_expression) {
+    return 1;
+  }
+  source = value_expression->resolved_type
+               ? value_expression->resolved_type
+               : ir_infer_expression_type(context, value_expression);
+  if (!source || source->kind == TYPE_BOOL ||
+      (!type_checker_is_integer_type(source) &&
+       source->kind != TYPE_CHAR && source->kind != TYPE_POINTER &&
+       source->kind != TYPE_ENUM && source->kind != TYPE_FLOAT32 &&
+       source->kind != TYPE_FLOAT64)) {
+    return 1;
+  }
+  if (value->kind == IR_OPERAND_INT) {
+    value->int_value = value->int_value != 0;
+    return 1;
+  }
+  if (!ir_make_temp_operand(context, &destination)) {
+    return 0;
+  }
+  compare.op = IR_OP_BINARY;
+  compare.location = location;
+  compare.dest = destination;
+  compare.lhs = *value;
+  compare.text = (char *)"!=";
+  if (source->kind == TYPE_FLOAT32 || source->kind == TYPE_FLOAT64) {
+    compare.is_float = 1;
+    compare.float_bits = source->kind == TYPE_FLOAT32 ? 32 : 64;
+    compare.rhs = ir_operand_float_sized(0.0, compare.float_bits);
+  } else {
+    compare.is_unsigned = 1;
+    compare.rhs = ir_operand_int(0);
+  }
+  ok = ir_emit(context, function, &compare);
+  if (!ok) {
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+  ir_operand_destroy(value);
+  *value = destination;
+  return 1;
+}
+
 int ir_should_decay_array_to_address(Type *target_type,
                                      ASTNode *value_expression) {
   return target_type && target_type->kind == TYPE_POINTER &&

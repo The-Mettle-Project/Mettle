@@ -696,6 +696,13 @@ int ir_devirtualize_known_tables_pass(IRFunction *function, int *changed) {
     if (!target) {
       continue;
     }
+    {
+      const IRFunction *callee =
+          ir_program_find_function(g_devirtualize_program, target);
+      if (!callee || callee->parameter_count != ins->argument_count) {
+        continue;
+      }
+    }
     ir_operand_destroy(&ins->lhs);
     ins->lhs = ir_operand_none();
     ins->op = IR_OP_CALL;

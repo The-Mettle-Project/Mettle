@@ -468,6 +468,10 @@ int ir_binary_expression_operation_float_bits(IRLoweringContext *context,
                                                     ASTNode *expression,
                                                     BinaryExpression *binary);
 
+int ir_normalize_to_bool(IRLoweringContext *context, IRFunction *function,
+                         Type *target_type, ASTNode *value_expression,
+                         IROperand *value, SourceLocation location);
+
 int ir_type_storage_size(Type *type);
 
 int ir_type_array_element_stride(Type *element_type);
