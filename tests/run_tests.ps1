@@ -1840,6 +1840,11 @@ $cases = @(
      SkipBinaryCheck = $true },
   @{ Name = "std_file"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true },
   @{ Name = "std_file_release"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_websocket"; Path = "tests/test_std_websocket.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_websocket_release"; Path = "tests/test_std_websocket.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_websocket_interp"; Path = "tests/test_std_websocket_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
   @{ Name = "views_interp"; Path = "tests/test_views.mettle"; ShouldSucceed = $true
      Args = @("test")
      SkipBinaryCheck = $true
@@ -3238,7 +3243,9 @@ $cases = @(
 if ($IsLinux) {
   $cases += @(
     @{ Name = "std_socket"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true },
-    @{ Name = "std_socket_release"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true; Args = @("--release") }
+    @{ Name = "std_socket_release"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_http"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_http_release"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true; Args = @("--release") }
   )
 }
 

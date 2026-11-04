@@ -1,0 +1,1246 @@
+// WebSocket (RFC 6455): the handshake, frames, close frames and messages.
+//
+// Pure protocol code. It reads and writes no socket and makes no OS call, so
+// a server or a client can drive it from any event loop. Bytes go in, and
+// events or bytes to send come out.
+//
+//   * Handshake: SHA-1 and base64 for Sec-WebSocket-Accept, a check of a
+//     client's upgrade request, the 101 response, the client's request, and a
+//     check of the server's answer.
+//   * Frames: an incremental header parser for either role, an in-place
+//     unmask that works on a payload that arrives in pieces, and writers.
+//   * Close frames: encode and parse, with the RFC's code and UTF-8 rules.
+//   * Messages: WsAssembler follows fragmentation, lets control frames
+//     interleave, caps the message size, and validates text as UTF-8 across
+//     fragment boundaries. ws_decode runs it all over a byte buffer.
+//
+// No extensions are negotiated, so the RSV bits must be zero. Every error that
+// the peer causes comes with the close code to answer with.
+
+import "std/core";
+import "std/strbuf";
+import "std/conv";
+import "std/encoding";
+
+// ---- opcodes, roles, close codes, result codes ----
+
+export const WS_OP_CONT = 0;
+export const WS_OP_TEXT = 1;
+export const WS_OP_BINARY = 2;
+export const WS_OP_CLOSE = 8;
+export const WS_OP_PING = 9;
+export const WS_OP_PONG = 10;
+
+// The role of the code that parses: a server parses frames from a client,
+// which must be masked. A client parses frames from a server, which must not.
+export const WS_ROLE_SERVER = 1;
+export const WS_ROLE_CLIENT = 2;
+
+export const WS_CLOSE_NORMAL = 1000;
+export const WS_CLOSE_GOING_AWAY = 1001;
+export const WS_CLOSE_PROTOCOL = 1002;
+export const WS_CLOSE_UNSUPPORTED = 1003;
+export const WS_CLOSE_NO_STATUS = 1005;     // never sent: "no code was given"
+export const WS_CLOSE_ABNORMAL = 1006;      // never sent: "no close frame came"
+export const WS_CLOSE_BAD_DATA = 1007;
+export const WS_CLOSE_POLICY = 1008;
+export const WS_CLOSE_TOO_BIG = 1009;
+export const WS_CLOSE_EXTENSION = 1010;
+export const WS_CLOSE_INTERNAL = 1011;
+export const WS_CLOSE_RESTART = 1012;
+export const WS_CLOSE_TRY_AGAIN = 1013;
+
+export const WS_MAX_HEADER = 14;            // 2 + 8 + 4 mask
+export const WS_MAX_CONTROL = 125;          // largest control payload
+export const WS_ACCEPT_LEN = 28;            // base64 of a SHA-1
+export const WS_KEY_LEN = 24;               // base64 of 16 random bytes
+export const WS_SHA1_LEN = 20;
+
+// Parse and decode results.
+export const WS_NEED_MORE = 0;
+export const WS_HEADER = 1;
+export const WS_ERROR = -1;
+
+// What ws_assembler_end and ws_decode report.
+export const WS_EV_NONE = 0;
+export const WS_EV_MESSAGE = 1;
+export const WS_EV_PING = 2;
+export const WS_EV_PONG = 3;
+export const WS_EV_CLOSE = 4;
+
+// Handshake results. ws_check_request answers 0 or the HTTP status to refuse
+// with. ws_check_response answers 0 or one of the negative codes.
+export const WS_UPGRADE_OK = 0;
+export const WS_HS_BAD_STATUS = -1;
+export const WS_HS_BAD_UPGRADE = -2;
+export const WS_HS_BAD_CONNECTION = -3;
+export const WS_HS_BAD_ACCEPT = -4;
+export const WS_HS_BAD_EXTENSION = -5;
+export const WS_HS_BAD_PROTOCOL = -6;
+
+const WS_GUID: string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+// ---- SHA-1 (RFC 3174) ----
+//
+// Only the handshake needs it. SHA-1 is broken for collision resistance: do
+// not use it for anything that needs a secure hash.
+
+fn ws_rol(x: uint32, n: int32) -> uint32 {
+  return (x << (uint32)n) | (x >> (uint32)(32 - n));
+}
+
+fn ws_be32(p: uint8*) -> uint32 {
+  return ((uint32)p[0] << (uint32)24) | ((uint32)p[1] << (uint32)16) |
+         ((uint32)p[2] << (uint32)8) | (uint32)p[3];
+}
+
+// One 64-byte block into h[0..5].
+fn ws_sha1_block(h: uint32*, block: uint8*) {
+  var w: uint32[80];
+  var t: int32 = 0;
+  while (t < 16) {
+    w[t] = ws_be32(block + (int64)(t * 4));
+    t = t + 1;
+  }
+  while (t < 80) {
+    w[t] = ws_rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
+    t = t + 1;
+  }
+  var a: uint32 = h[0];
+  var b: uint32 = h[1];
+  var c: uint32 = h[2];
+  var d: uint32 = h[3];
+  var e: uint32 = h[4];
+  t = 0;
+  while (t < 80) {
+    var f: uint32 = 0;
+    var k: uint32 = 0;
+    if (t < 20) {
+      f = (b & c) | ((~b) & d);
+      k = (uint32)0x5A827999;
+    } else if (t < 40) {
+      f = b ^ c ^ d;
+      k = (uint32)0x6ED9EBA1;
+    } else if (t < 60) {
+      f = (b & c) | (b & d) | (c & d);
+      k = (uint32)0x8F1BBCDC;
+    } else {
+      f = b ^ c ^ d;
+      k = (uint32)0xCA62C1D6;
+    }
+    var tmp: uint32 = ws_rol(a, 5) + f + e + k + w[t];
+    e = d;
+    d = c;
+    c = ws_rol(b, 30);
+    b = a;
+    a = tmp;
+    t = t + 1;
+  }
+  h[0] = h[0] + a;
+  h[1] = h[1] + b;
+  h[2] = h[2] + c;
+  h[3] = h[3] + d;
+  h[4] = h[4] + e;
+}
+
+// Hashes n bytes at p into out[0..20). Returns 0, or -1 for a bad argument.
+export fn ws_sha1(p: uint8*, n: int64, out: uint8*) -> int32 {
+  if (out == 0 || n < 0 || (p == 0 && n > 0)) { return -1; }
+  var h: uint32[5];
+  h[0] = (uint32)0x67452301;
+  h[1] = (uint32)0xEFCDAB89;
+  h[2] = (uint32)0x98BADCFE;
+  h[3] = (uint32)0x10325476;
+  h[4] = (uint32)0xC3D2E1F0;
+
+  var off: int64 = 0;
+  while (n - off >= 64) {
+    ws_sha1_block(&h[0], p + off);
+    off = off + 64;
+  }
+
+  // The tail: what is left, 0x80, zeros, then the bit count as a big-endian
+  // 64-bit number at the end of one or two blocks.
+  var tail: uint8[128];
+  var rest: int64 = n - off;
+  var i: int64 = 0;
+  while (i < rest) {
+    tail[i] = p[off + i];
+    i = i + 1;
+  }
+  tail[rest] = (uint8)0x80;
+  var blocks: int64 = 1;
+  if (rest >= 56) { blocks = 2; }
+  var bits: uint64 = (uint64)n * (uint64)8;
+  var end: int64 = blocks * 64;
+  i = 0;
+  while (i < 8) {
+    tail[end - 1 - i] = (uint8)((bits >> (uint64)(i * 8)) & (uint64)255);
+    i = i + 1;
+  }
+  ws_sha1_block(&h[0], &tail[0]);
+  if (blocks == 2) { ws_sha1_block(&h[0], &tail[64]); }
+
+  var j: int32 = 0;
+  while (j < 5) {
+    out[j * 4] = (uint8)((h[j] >> (uint32)24) & (uint32)255);
+    out[j * 4 + 1] = (uint8)((h[j] >> (uint32)16) & (uint32)255);
+    out[j * 4 + 2] = (uint8)((h[j] >> (uint32)8) & (uint32)255);
+    out[j * 4 + 3] = (uint8)(h[j] & (uint32)255);
+    j = j + 1;
+  }
+  return 0;
+}
+
+// ---- small text helpers ----
+
+fn ws_lower(c: int32) -> int32 {
+  if (c >= 65 && c <= 90) { return c + 32; }
+  return c;
+}
+
+fn ws_eq_nocase(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  var i: int64 = 0;
+  var n: int64 = (int64)a.length;
+  while (i < n) {
+    if (ws_lower((int32)a.chars[i]) != ws_lower((int32)b.chars[i])) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// The next comma-separated item of list at or after pos, trimmed, with empty
+// items skipped. Returns the position after it, or -1 when no item is left.
+fn ws_list_next(list: string, pos: int64, item: string*) -> int64 {
+  var n: int64 = (int64)list.length;
+  var at: int64 = pos;
+  while (at < n) {
+    var e: int64 = at;
+    while (e < n && list.chars[e] != (uint8)44) { e = e + 1; }
+    var one: string = str_trim(str_slice(list, at, e - at));
+    var next: int64 = e + 1;
+    if (e >= n) { next = n; }
+    if (one.length > 0) {
+      *item = one;
+      return next;
+    }
+    at = next;
+  }
+  return -1;
+}
+
+fn ws_list_contains(list: string, token: string, fold: bool) -> bool {
+  var at: int64 = 0;
+  var item: string;
+  at = ws_list_next(list, at, &item);
+  while (at >= 0) {
+    if (fold) {
+      if (ws_eq_nocase(item, token)) { return true; }
+    } else {
+      if (item == token) { return true; }
+    }
+    at = ws_list_next(list, at, &item);
+  }
+  return false;
+}
+
+// True when the comma-separated list has token, ignoring case. This is how
+// the Upgrade and Connection headers are read: "keep-alive, Upgrade" has
+// "upgrade".
+export fn ws_has_token(list: string, token: string) -> bool {
+  return ws_list_contains(list, token, true);
+}
+
+// No control bytes and no DEL, so a value cannot break out of its header line.
+fn ws_header_safe(s: string) -> bool {
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if ((c < 32 && c != 9) || c == 127) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// A header value with no spaces either: a host, a request target, a
+// subprotocol name.
+fn ws_word_safe(s: string) -> bool {
+  if (s.length == 0) { return false; }
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (c <= 32 || c == 127) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---- HTTP head text ----
+//
+// Just enough to read an upgrade request or a 101 response: header lookup by
+// name. The head is the text up to the blank line.
+
+// Finds the next header called name, at or after from (0 for the first).
+// Sets *value to its trimmed value and returns the position after the line,
+// or -1 when there is no further match. The first line is never a header.
+fn ws_header_find(head: string, name: string, from: int64, value: string*) -> int64 {
+  var n: int64 = (int64)head.length;
+  var pos: int64 = from;
+  if (from == 0) {
+    while (pos < n && head.chars[pos] != (uint8)10) { pos = pos + 1; }
+    pos = pos + 1;
+  }
+  while (pos < n) {
+    var e: int64 = pos;
+    while (e < n && head.chars[e] != (uint8)10) { e = e + 1; }
+    var next: int64 = e + 1;
+    if (e >= n) { next = n; }
+    var le: int64 = e;
+    if (le > pos && head.chars[le - 1] == (uint8)13) { le = le - 1; }
+    if (le == pos) { return -1; }
+    var c: int64 = pos;
+    while (c < le && head.chars[c] != (uint8)58) { c = c + 1; }
+    if (c < le && ws_eq_nocase(str_slice(head, pos, c - pos), name)) {
+      *value = str_trim(str_slice(head, c + 1, le - c - 1));
+      return next;
+    }
+    pos = next;
+  }
+  return -1;
+}
+
+// The trimmed value of the first header called name (case-insensitive), or an
+// empty string.
+export fn ws_header_value(head: string, name: string) -> string {
+  var v: string;
+  if (ws_header_find(head, name, 0, &v) < 0) { return str_slice(head, 0, 0); }
+  return v;
+}
+
+// True when any header called name has token in its comma list. A header may
+// repeat, as "Connection: keep-alive" then "Connection: Upgrade".
+export fn ws_head_has_token(head: string, name: string, token: string) -> bool {
+  var v: string;
+  var at: int64 = ws_header_find(head, name, 0, &v);
+  while (at >= 0) {
+    if (ws_list_contains(v, token, true)) { return true; }
+    at = ws_header_find(head, name, at, &v);
+  }
+  return false;
+}
+
+fn ws_header_count(head: string, name: string) -> int32 {
+  var v: string;
+  var count: int32 = 0;
+  var at: int64 = ws_header_find(head, name, 0, &v);
+  while (at >= 0) {
+    count = count + 1;
+    at = ws_header_find(head, name, at, &v);
+  }
+  return count;
+}
+
+// The status of a response head ("HTTP/1.1 101 ..."), or -1.
+export fn ws_status_code(head: string) -> int32 {
+  var n: int64 = (int64)head.length;
+  if (n < 12) { return -1; }
+  if (str_slice(head, 0, 7) != "HTTP/1.") { return -1; }
+  if (head.chars[8] != (uint8)32) { return -1; }
+  var code: int32 = 0;
+  var i: int64 = 9;
+  while (i < 12) {
+    var c: int32 = (int32)head.chars[i];
+    if (c < 48 || c > 57) { return -1; }
+    code = code * 10 + (c - 48);
+    i = i + 1;
+  }
+  if (n > 12 && head.chars[12] != (uint8)32 && head.chars[12] != (uint8)13) { return -1; }
+  return code;
+}
+
+// The index just past the first blank line ("\r\n\r\n") in buf, which is
+// where the body or the first frame starts, or -1 when the head is not all
+// here yet.
+export fn ws_find_head_end(buf: uint8*, n: int64) -> int64 {
+  var i: int64 = 3;
+  while (i < n) {
+    if (buf[i] == (uint8)10 && buf[i - 1] == (uint8)13 && buf[i - 2] == (uint8)10 &&
+        buf[i - 3] == (uint8)13) {
+      return i + 1;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// ---- handshake: keys ----
+
+// A client key is the base64 of 16 bytes: 24 characters ending in "==".
+export fn ws_key_valid(key: string) -> bool {
+  if (key.length != (uint64)WS_KEY_LEN) { return false; }
+  match (base64_decoded_len(key)) {
+    case Ok(size): { return size == 16; }
+    case Err(why): { return false; }
+  }
+  return false;
+}
+
+// Sec-WebSocket-Accept for a client key: base64(sha1(key + GUID)). It writes
+// WS_ACCEPT_LEN bytes to out and returns that, or -1 when the key is not
+// valid or cap is too small.
+export fn ws_accept_key(client_key: string, out: uint8*, cap: int64) -> int64 {
+  if (out == 0 || cap < (int64)WS_ACCEPT_LEN) { return -1; }
+  if (!ws_key_valid(client_key)) { return -1; }
+  var joined: uint8[64];
+  var i: int64 = 0;
+  while (i < (int64)WS_KEY_LEN) {
+    joined[i] = client_key.chars[i];
+    i = i + 1;
+  }
+  var j: int64 = 0;
+  while (j < (int64)WS_GUID.length) {
+    joined[i + j] = WS_GUID.chars[j];
+    j = j + 1;
+  }
+  var digest: uint8[20];
+  ws_sha1(&joined[0], i + j, &digest[0]);
+  var raw: string = str_from_bytes((cstring)&digest[0], 20);
+  match (base64_encode(raw, (cstring)out, cap)) {
+    case Ok(text): { return (int64)text.length; }
+    case Err(why): { return -1; }
+  }
+  return -1;
+}
+
+// Turns the 16 random bytes the caller drew into the Sec-WebSocket-Key text.
+// Writes WS_KEY_LEN bytes to out and returns that, or -1 when cap is short.
+export fn ws_client_key(key16: uint8*, out: uint8*, cap: int64) -> int64 {
+  if (key16 == 0 || out == 0 || cap < (int64)WS_KEY_LEN) { return -1; }
+  var raw: string = str_from_bytes((cstring)key16, 16);
+  match (base64_encode(raw, (cstring)out, cap)) {
+    case Ok(text): { return (int64)text.length; }
+    case Err(why): { return -1; }
+  }
+  return -1;
+}
+
+// ---- handshake: server side ----
+
+// Decides an upgrade request from its parts. Pass "" for a header that is
+// missing. Returns WS_UPGRADE_OK or the HTTP status to refuse with: 405 for a
+// method other than GET, 426 for a version other than 13, 400 for anything
+// else wrong.
+export fn ws_check_request(verb: string, upgrade: string, connection: string,
+                           key: string, version: string) -> int32 {
+  if (verb != "GET") { return 405; }
+  if (!ws_has_token(upgrade, "websocket")) { return 400; }
+  if (!ws_has_token(connection, "upgrade")) { return 400; }
+  if (!ws_key_valid(str_trim(key))) { return 400; }
+  if (str_trim(version) != "13") { return 426; }
+  return WS_UPGRADE_OK;
+}
+
+// The same decision from the request head text: the request line and the
+// headers. The request must be HTTP/1.1, and may carry only one key.
+export fn ws_check_request_head(head: string) -> int32 {
+  var n: int64 = (int64)head.length;
+  var e: int64 = 0;
+  while (e < n && head.chars[e] != (uint8)10) { e = e + 1; }
+  if (e > 0 && head.chars[e - 1] == (uint8)13) { e = e - 1; }
+  var line: string = str_slice(head, 0, e);
+  var sp: int64 = 0;
+  while (sp < (int64)line.length && line.chars[sp] != (uint8)32) { sp = sp + 1; }
+  if (str_slice(line, 0, sp) != "GET") { return 405; }
+  if (!str_ends_with(line, " HTTP/1.1")) { return 400; }
+  if (ws_header_count(head, "sec-websocket-key") != 1) { return 400; }
+  if (!ws_head_has_token(head, "upgrade", "websocket")) { return 400; }
+  if (!ws_head_has_token(head, "connection", "upgrade")) { return 400; }
+  if (!ws_key_valid(ws_header_value(head, "sec-websocket-key"))) { return 400; }
+  if (ws_header_value(head, "sec-websocket-version") != "13") { return 426; }
+  return WS_UPGRADE_OK;
+}
+
+// Picks the subprotocol for a server: the first one the client offered that
+// the server supports. Both are comma lists. The answer is a view into
+// offered, or an empty string when nothing matches. Names are case-sensitive.
+export fn ws_select_protocol(offered: string, supported: string) -> string {
+  var at: int64 = 0;
+  var item: string;
+  at = ws_list_next(offered, at, &item);
+  while (at >= 0) {
+    if (ws_list_contains(supported, item, false)) { return item; }
+    at = ws_list_next(offered, at, &item);
+  }
+  return str_slice(offered, 0, 0);
+}
+
+// Appends the "101 Switching Protocols" response for a request whose key has
+// been checked. protocol, when it is not empty, is sent back as the chosen
+// Sec-WebSocket-Protocol. Returns 1, or 0 when the key or protocol is not
+// valid or memory ran out (the buffer is left as it was).
+export fn ws_write_101(b: StrBuf*, client_key: string, protocol: string) -> int32 {
+  if (b == 0) { return 0; }
+  var accept: uint8[28];
+  if (ws_accept_key(client_key, &accept[0], 28) != (int64)WS_ACCEPT_LEN) { return 0; }
+  if (protocol.length > 0 && !ws_word_safe(protocol)) { return 0; }
+  var start: int64 = b->len;
+  var ok: int32 = 1;
+  ok = ok & strbuf_append_string(b, "HTTP/1.1 101 Switching Protocols\r\n");
+  ok = ok & strbuf_append_string(b, "Upgrade: websocket\r\n");
+  ok = ok & strbuf_append_string(b, "Connection: Upgrade\r\n");
+  ok = ok & strbuf_append_string(b, "Sec-WebSocket-Accept: ");
+  ok = ok & strbuf_append_bytes(b, (cstring)&accept[0], (int64)WS_ACCEPT_LEN);
+  ok = ok & strbuf_append_string(b, "\r\n");
+  if (protocol.length > 0) {
+    ok = ok & strbuf_append_string(b, "Sec-WebSocket-Protocol: ");
+    ok = ok & strbuf_append_string(b, protocol);
+    ok = ok & strbuf_append_string(b, "\r\n");
+  }
+  ok = ok & strbuf_append_string(b, "\r\n");
+  if (ok == 0) {
+    b->len = start;
+    return 0;
+  }
+  return 1;
+}
+
+// Appends a refusal for a status from ws_check_request: 400, 405 or 426. A
+// 426 tells the client the version that is spoken. The connection is closed
+// after it. Returns 1, or 0 for any other status.
+export fn ws_write_refusal(b: StrBuf*, status: int32) -> int32 {
+  if (b == 0) { return 0; }
+  var start: int64 = b->len;
+  var ok: int32 = 1;
+  if (status == 400) {
+    ok = ok & strbuf_append_string(b, "HTTP/1.1 400 Bad Request\r\n");
+  } else if (status == 405) {
+    ok = ok & strbuf_append_string(b, "HTTP/1.1 405 Method Not Allowed\r\n");
+    ok = ok & strbuf_append_string(b, "Allow: GET\r\n");
+  } else if (status == 426) {
+    ok = ok & strbuf_append_string(b, "HTTP/1.1 426 Upgrade Required\r\n");
+    ok = ok & strbuf_append_string(b, "Sec-WebSocket-Version: 13\r\n");
+  } else {
+    return 0;
+  }
+  ok = ok & strbuf_append_string(b, "Content-Length: 0\r\nConnection: close\r\n\r\n");
+  if (ok == 0) {
+    b->len = start;
+    return 0;
+  }
+  return 1;
+}
+
+// ---- handshake: client side ----
+
+// Appends the client's upgrade request. key16 is 16 random bytes that the
+// caller draws: the stdlib has no random source. host is the Host header
+// value ("example.com:8080"), path the request target ("/chat?room=1").
+// protocols is a comma list to offer, and origin is sent when it is not empty;
+// pass "" for either to leave it out. Keep the key16 bytes: the response is
+// checked against them. Returns 1, or 0 when an argument has a control byte
+// or a space where it must not, or memory ran out.
+export fn ws_write_request(b: StrBuf*, host: string, path: string, key16: uint8*,
+                           protocols: string, origin: string) -> int32 {
+  if (b == 0 || key16 == 0) { return 0; }
+  if (!ws_word_safe(host) || !ws_word_safe(path)) { return 0; }
+  if (path.chars[0] != (uint8)47) { return 0; }
+  if (!ws_header_safe(protocols) || !ws_header_safe(origin)) { return 0; }
+  var key: uint8[24];
+  if (ws_client_key(key16, &key[0], 24) != (int64)WS_KEY_LEN) { return 0; }
+  var start: int64 = b->len;
+  var ok: int32 = 1;
+  ok = ok & strbuf_append_string(b, "GET ");
+  ok = ok & strbuf_append_string(b, path);
+  ok = ok & strbuf_append_string(b, " HTTP/1.1\r\nHost: ");
+  ok = ok & strbuf_append_string(b, host);
+  ok = ok & strbuf_append_string(b, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n");
+  ok = ok & strbuf_append_string(b, "Sec-WebSocket-Key: ");
+  ok = ok & strbuf_append_bytes(b, (cstring)&key[0], (int64)WS_KEY_LEN);
+  ok = ok & strbuf_append_string(b, "\r\nSec-WebSocket-Version: 13\r\n");
+  if (protocols.length > 0) {
+    ok = ok & strbuf_append_string(b, "Sec-WebSocket-Protocol: ");
+    ok = ok & strbuf_append_string(b, protocols);
+    ok = ok & strbuf_append_string(b, "\r\n");
+  }
+  if (origin.length > 0) {
+    ok = ok & strbuf_append_string(b, "Origin: ");
+    ok = ok & strbuf_append_string(b, origin);
+    ok = ok & strbuf_append_string(b, "\r\n");
+  }
+  ok = ok & strbuf_append_string(b, "\r\n");
+  if (ok == 0) {
+    b->len = start;
+    return 0;
+  }
+  return 1;
+}
+
+// Checks the server's answer to ws_write_request. head is the response text
+// up to the blank line, client_key the 24 bytes ws_client_key made, and
+// offered the protocol list that was sent. Returns 0 when the upgrade is
+// good, or a WS_HS_ code. A subprotocol the client did not offer, or any
+// extension (none were offered), is refused. The chosen subprotocol is
+// ws_header_value(head, "sec-websocket-protocol").
+export fn ws_check_response(head: string, client_key: string, offered: string) -> int32 {
+  if (ws_status_code(head) != 101) { return WS_HS_BAD_STATUS; }
+  if (!ws_head_has_token(head, "upgrade", "websocket")) { return WS_HS_BAD_UPGRADE; }
+  if (!ws_head_has_token(head, "connection", "upgrade")) { return WS_HS_BAD_CONNECTION; }
+  var accept: uint8[28];
+  if (ws_accept_key(client_key, &accept[0], 28) != (int64)WS_ACCEPT_LEN) {
+    return WS_HS_BAD_ACCEPT;
+  }
+  var want: string = str_from_bytes((cstring)&accept[0], (int64)WS_ACCEPT_LEN);
+  if (ws_header_value(head, "sec-websocket-accept") != want) { return WS_HS_BAD_ACCEPT; }
+  if (ws_header_value(head, "sec-websocket-extensions").length > 0) {
+    return WS_HS_BAD_EXTENSION;
+  }
+  var chosen: string = ws_header_value(head, "sec-websocket-protocol");
+  if (chosen.length > 0 && !ws_list_contains(offered, chosen, false)) {
+    return WS_HS_BAD_PROTOCOL;
+  }
+  return 0;
+}
+
+// ---- streaming UTF-8 validation (RFC 3629) ----
+//
+// A text message may be cut anywhere, even inside a code point, so the state
+// is kept between calls. Overlong forms, surrogates and anything above
+// U+10FFFF are refused.
+
+export struct WsUtf8 {
+  need: int32;     // continuation bytes still to come
+  lo: int32;       // the range the next continuation byte may have
+  hi: int32;
+}
+
+export fn ws_utf8_reset(v: WsUtf8*) {
+  v->need = 0;
+  v->lo = 128;
+  v->hi = 191;
+}
+
+// Feeds n bytes. Returns false at the first bad byte. The state is then
+// meaningless until ws_utf8_reset.
+export fn ws_utf8_feed(v: WsUtf8*, p: uint8*, n: int64) -> bool {
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)p[i];
+    if (v->need > 0) {
+      if (c < v->lo || c > v->hi) { return false; }
+      v->need = v->need - 1;
+      v->lo = 128;
+      v->hi = 191;
+    } else if (c < 128) {
+      // ASCII
+    } else if (c >= 194 && c <= 223) {
+      v->need = 1;
+    } else if (c >= 224 && c <= 239) {
+      v->need = 2;
+      if (c == 224) { v->lo = 160; }    // no overlong three-byte form
+      if (c == 237) { v->hi = 159; }    // no surrogates
+    } else if (c >= 240 && c <= 244) {
+      v->need = 3;
+      if (c == 240) { v->lo = 144; }    // no overlong four-byte form
+      if (c == 244) { v->hi = 143; }    // nothing above U+10FFFF
+    } else {
+      return false;                     // a stray continuation, C0, C1, F5..FF
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// True when what was fed so far ends on a code point boundary.
+export fn ws_utf8_done(v: WsUtf8*) -> bool {
+  return v->need == 0;
+}
+
+// One call over a whole buffer.
+export fn ws_utf8_valid(p: uint8*, n: int64) -> bool {
+  var v: WsUtf8;
+  ws_utf8_reset(&v);
+  if (!ws_utf8_feed(&v, p, n)) { return false; }
+  return ws_utf8_done(&v);
+}
+
+// ---- frames ----
+
+fn ws_opcode_known(op: int32) -> bool {
+  if (op == WS_OP_CONT || op == WS_OP_TEXT || op == WS_OP_BINARY) { return true; }
+  return op == WS_OP_CLOSE || op == WS_OP_PING || op == WS_OP_PONG;
+}
+
+// One parsed frame header.
+export struct WsHeader {
+  fin: bool;
+  opcode: int32;
+  masked: bool;
+  mask: uint8[4];
+  payload_len: int64;
+  header_len: int64;       // bytes before the payload
+  error_code: int32;       // after WS_ERROR: the close code to answer with
+  error: string;           // after WS_ERROR: why
+}
+
+fn ws_header_fail(h: WsHeader*, code: int32, why: string) -> int32 {
+  h->error_code = code;
+  h->error = why;
+  return WS_ERROR;
+}
+
+// Reads one frame header from buf[0..n) as a server (WS_ROLE_SERVER) or a
+// client. It returns
+//
+//   WS_NEED_MORE   the header is not all here: keep the bytes, read more, call
+//                  again from the same start
+//   WS_HEADER      h is filled; the payload starts h->header_len bytes in
+//   WS_ERROR       a protocol error: h->error_code is the close code (1002, or
+//                  1009 for a frame past max_payload) and h->error says why
+//
+// The rules: RSV bits are zero, the opcode is known, a control frame has FIN
+// and at most 125 bytes, a frame from a client is masked and one from a server
+// is not, a 64-bit length has its top bit clear, and a length uses the fewest
+// bytes that can hold it (126 and 127 are not used for what fits in less).
+// max_payload bounds one data frame; 0 means no bound. An error shows up as
+// soon as the bytes that show it have arrived. Only the header is read: the
+// payload is not touched.
+export fn ws_parse_header(buf: uint8*, n: int64, role: int32, max_payload: int64,
+                          h: WsHeader*) -> int32 {
+  var blank: WsHeader;
+  *h = blank;
+  if (n < 1) { return WS_NEED_MORE; }
+  var b0: int32 = (int32)buf[0];
+  if ((b0 & 112) != 0) { return ws_header_fail(h, WS_CLOSE_PROTOCOL, "reserved bits set"); }
+  var op: int32 = b0 & 15;
+  if (!ws_opcode_known(op)) { return ws_header_fail(h, WS_CLOSE_PROTOCOL, "unknown opcode"); }
+  var control: bool = op >= 8;
+  var fin: bool = (b0 & 128) != 0;
+  if (control && !fin) {
+    return ws_header_fail(h, WS_CLOSE_PROTOCOL, "fragmented control frame");
+  }
+  if (n < 2) { return WS_NEED_MORE; }
+  var b1: int32 = (int32)buf[1];
+  var masked: bool = (b1 & 128) != 0;
+  if (role == WS_ROLE_SERVER && !masked) {
+    return ws_header_fail(h, WS_CLOSE_PROTOCOL, "frame from client is not masked");
+  }
+  if (role == WS_ROLE_CLIENT && masked) {
+    return ws_header_fail(h, WS_CLOSE_PROTOCOL, "frame from server is masked");
+  }
+  var len7: int32 = b1 & 127;
+  if (control && len7 > WS_MAX_CONTROL) {
+    return ws_header_fail(h, WS_CLOSE_PROTOCOL, "control frame too long");
+  }
+
+  var len: int64 = (int64)len7;
+  var pos: int64 = 2;
+  if (len7 == 126) {
+    if (n < 4) { return WS_NEED_MORE; }
+    len = ((int64)buf[2] << 8) | (int64)buf[3];
+    if (len < 126) { return ws_header_fail(h, WS_CLOSE_PROTOCOL, "length not minimal"); }
+    pos = 4;
+  } else if (len7 == 127) {
+    if (n < 10) { return WS_NEED_MORE; }
+    if ((buf[2] & (uint8)128) != (uint8)0) {
+      return ws_header_fail(h, WS_CLOSE_PROTOCOL, "length has its top bit set");
+    }
+    len = 0;
+    var i: int64 = 2;
+    while (i < 10) {
+      len = (len << 8) | (int64)buf[i];
+      i = i + 1;
+    }
+    if (len < 65536) { return ws_header_fail(h, WS_CLOSE_PROTOCOL, "length not minimal"); }
+    pos = 10;
+  }
+  if (!control && max_payload > 0 && len > max_payload) {
+    return ws_header_fail(h, WS_CLOSE_TOO_BIG, "frame too big");
+  }
+
+  if (masked) {
+    if (n < pos + 4) { return WS_NEED_MORE; }
+    h->mask[0] = buf[pos];
+    h->mask[1] = buf[pos + 1];
+    h->mask[2] = buf[pos + 2];
+    h->mask[3] = buf[pos + 3];
+    pos = pos + 4;
+  }
+  h->fin = fin;
+  h->opcode = op;
+  h->masked = masked;
+  h->payload_len = len;
+  h->header_len = pos;
+  return WS_HEADER;
+}
+
+// XORs n payload bytes with the 4-byte mask, in place. offset is the position
+// of data[0] within the whole payload, so a payload that arrives in pieces is
+// unmasked piece by piece: pass 0 for the first piece, then the bytes
+// handled so far. Masking and unmasking are the same operation.
+export fn ws_unmask(data: uint8*, n: int64, mask: uint8*, offset: int64) {
+  var i: int64 = 0;
+  var k: int64 = offset & 3;
+  while (i < n && k != 0) {
+    data[i] = (uint8)(data[i] ^ mask[k]);
+    k = (k + 1) & 3;
+    i = i + 1;
+  }
+  var m0: uint8 = mask[0];
+  var m1: uint8 = mask[1];
+  var m2: uint8 = mask[2];
+  var m3: uint8 = mask[3];
+  while (i + 4 <= n) {
+    data[i] = (uint8)(data[i] ^ m0);
+    data[i + 1] = (uint8)(data[i + 1] ^ m1);
+    data[i + 2] = (uint8)(data[i + 2] ^ m2);
+    data[i + 3] = (uint8)(data[i + 3] ^ m3);
+    i = i + 4;
+  }
+  k = 0;
+  while (i < n) {
+    data[i] = (uint8)(data[i] ^ mask[k]);
+    k = k + 1;
+    i = i + 1;
+  }
+}
+
+// Writes a frame header to out. mask is 0 for an unmasked frame (a server's),
+// or the four mask bytes (a client's, drawn by the caller). Returns the header
+// size, 2 to WS_MAX_HEADER, or -1 for an unknown opcode, a control frame that
+// is fragmented or has more than 125 bytes, a negative length, or a cap that
+// is too small.
+export fn ws_header_write(out: uint8*, cap: int64, fin: bool, opcode: int32,
+                          payload_len: int64, mask: uint8*) -> int64 {
+  if (out == 0 || payload_len < 0) { return -1; }
+  if (!ws_opcode_known(opcode)) { return -1; }
+  if (opcode >= 8 && (!fin || payload_len > (int64)WS_MAX_CONTROL)) { return -1; }
+  var size: int64 = 2;
+  if (payload_len >= 65536) {
+    size = 10;
+  } else if (payload_len >= 126) {
+    size = 4;
+  }
+  if (mask != 0) { size = size + 4; }
+  if (cap < size) { return -1; }
+
+  var b0: int32 = opcode;
+  if (fin) { b0 = b0 | 128; }
+  out[0] = (uint8)b0;
+  var mbit: int32 = 0;
+  if (mask != 0) { mbit = 128; }
+  var pos: int64 = 2;
+  if (payload_len < 126) {
+    out[1] = (uint8)(mbit | (int32)payload_len);
+  } else if (payload_len < 65536) {
+    out[1] = (uint8)(mbit | 126);
+    out[2] = (uint8)((payload_len >> 8) & 255);
+    out[3] = (uint8)(payload_len & 255);
+    pos = 4;
+  } else {
+    out[1] = (uint8)(mbit | 127);
+    var i: int64 = 0;
+    while (i < 8) {
+      out[9 - i] = (uint8)((payload_len >> (i * 8)) & 255);
+      i = i + 1;
+    }
+    pos = 10;
+  }
+  if (mask != 0) {
+    out[pos] = mask[0];
+    out[pos + 1] = mask[1];
+    out[pos + 2] = mask[2];
+    out[pos + 3] = mask[3];
+  }
+  return size;
+}
+
+// Appends one frame to b: the header, then the payload, masked with mask
+// unless mask is 0. For a fragmented message send the first piece with the
+// text or binary opcode and fin false, the rest with WS_OP_CONT, and fin true
+// on the last. Returns the bytes appended, or -1 when the header would be
+// refused (see ws_header_write) or memory ran out; b is then left as it was.
+export fn ws_write_frame(b: StrBuf*, fin: bool, opcode: int32, payload: uint8*, n: int64,
+                         mask: uint8*) -> int64 {
+  if (b == 0 || n < 0 || (payload == 0 && n > 0)) { return -1; }
+  var head: uint8[14];
+  var hn: int64 = ws_header_write(&head[0], 14, fin, opcode, n, mask);
+  if (hn < 0) { return -1; }
+  var start: int64 = b->len;
+  if (strbuf_append_bytes(b, (cstring)&head[0], hn) == 0 ||
+      strbuf_append_bytes(b, (cstring)payload, n) == 0) {
+    b->len = start;
+    return -1;
+  }
+  if (mask != 0 && n > 0) {
+    var data: uint8* = (uint8*)b->data;
+    ws_unmask(data + (start + hn), n, mask, 0);
+  }
+  return hn + n;
+}
+
+// A whole text message in one frame. The text must be valid UTF-8, or this
+// returns -1 and writes nothing.
+export fn ws_write_text(b: StrBuf*, text: string, mask: uint8*) -> int64 {
+  if (!ws_utf8_valid(text.chars, (int64)text.length)) { return -1; }
+  return ws_write_frame(b, true, WS_OP_TEXT, text.chars, (int64)text.length, mask);
+}
+
+// A whole binary message in one frame.
+export fn ws_write_binary(b: StrBuf*, data: uint8*, n: int64, mask: uint8*) -> int64 {
+  return ws_write_frame(b, true, WS_OP_BINARY, data, n, mask);
+}
+
+// A ping. At most 125 bytes of data.
+export fn ws_write_ping(b: StrBuf*, data: uint8*, n: int64, mask: uint8*) -> int64 {
+  return ws_write_frame(b, true, WS_OP_PING, data, n, mask);
+}
+
+// A pong. The answer to a ping carries the ping's data back.
+export fn ws_write_pong(b: StrBuf*, data: uint8*, n: int64, mask: uint8*) -> int64 {
+  return ws_write_frame(b, true, WS_OP_PONG, data, n, mask);
+}
+
+// ---- close frames ----
+
+// True for a code that may go on the wire (RFC 6455 section 7.4): 1000 to
+// 1003, 1007 to 1014, and the registered and private ranges 3000 to 4999.
+// 1004, 1005, 1006 and 1015 are reserved for local use, and 0 to 999 and 1016
+// to 2999 are not assigned.
+export fn ws_close_code_valid(code: int32) -> bool {
+  if (code >= 1000 && code <= 1003) { return true; }
+  if (code >= 1007 && code <= 1014) { return true; }
+  return code >= 3000 && code <= 4999;
+}
+
+// Builds a close payload: the code as two big-endian bytes, then the reason.
+// WS_CLOSE_NO_STATUS with an empty reason gives an empty payload. Returns the
+// payload size, or -1 for a code that may not be sent, a reason over 123 bytes
+// or not UTF-8, or a cap that is too small.
+export fn ws_close_encode(code: int32, reason: string, out: uint8*, cap: int64) -> int64 {
+  if (out == 0) { return -1; }
+  if (code == WS_CLOSE_NO_STATUS && reason.length == 0) { return 0; }
+  if (!ws_close_code_valid(code)) { return -1; }
+  var rn: int64 = (int64)reason.length;
+  if (rn > (int64)WS_MAX_CONTROL - 2) { return -1; }
+  if (cap < rn + 2) { return -1; }
+  if (!ws_utf8_valid(reason.chars, rn)) { return -1; }
+  out[0] = (uint8)((code >> 8) & 255);
+  out[1] = (uint8)(code & 255);
+  var i: int64 = 0;
+  while (i < rn) {
+    out[2 + i] = reason.chars[i];
+    i = i + 1;
+  }
+  return rn + 2;
+}
+
+// A parsed close payload.
+export struct WsClose {
+  code: int32;       // WS_CLOSE_NO_STATUS when the payload was empty
+  reason: string;    // a view into the payload
+}
+
+// Reads a close payload (already unmasked). Returns 0 when it is good, and
+// then out is filled. Otherwise it returns the close code to answer with:
+// 1002 for a one-byte payload or a code that may not be on the wire, and 1007
+// for a reason that is not UTF-8.
+export fn ws_close_parse(p: uint8*, n: int64, out: WsClose*) -> int32 {
+  out->code = WS_CLOSE_NO_STATUS;
+  out->reason = str_slice("", 0, 0);
+  if (n == 0) { return 0; }
+  if (n == 1 || p == 0) { return WS_CLOSE_PROTOCOL; }
+  var code: int32 = ((int32)p[0] << 8) | (int32)p[1];
+  if (!ws_close_code_valid(code)) { return WS_CLOSE_PROTOCOL; }
+  if (!ws_utf8_valid(p + 2, n - 2)) { return WS_CLOSE_BAD_DATA; }
+  out->code = code;
+  out->reason = str_from_bytes((cstring)(p + 2), n - 2);
+  return 0;
+}
+
+// A close frame with a code and a reason. Returns the bytes appended, or -1
+// as ws_close_encode and ws_write_frame do.
+export fn ws_write_close(b: StrBuf*, code: int32, reason: string, mask: uint8*) -> int64 {
+  var payload: uint8[125];
+  var n: int64 = ws_close_encode(code, reason, &payload[0], 125);
+  if (n < 0) { return -1; }
+  return ws_write_frame(b, true, WS_OP_CLOSE, &payload[0], n, mask);
+}
+
+// ---- messages ----
+//
+// WsAssembler takes frames in order and tells data frames from control
+// frames. It refuses a new data frame inside a fragmented message, and a
+// continuation with nothing to continue. Control frames may arrive between
+// fragments. It caps the size of a message, and checks text as UTF-8 as the
+// bytes come, so bad text fails at the bad byte, not at the end.
+//
+// There are two ways to drive it.
+//
+//   ws_decode(a, buf, n, &used) takes raw bytes and stops at each event. The
+//   message bytes collect in the sink, a StrBuf.
+//
+//   ws_assembler_begin / _feed / _end work one frame at a time, after your
+//   own ws_parse_header. With no sink, feed is how you see the payload.
+//
+// When something fails the assembler stays failed: error_code is the close
+// code to send and error says why.
+
+export struct WsAssembler {
+  role: int32;
+  max_message: int64;        // 0 means no limit
+  sink: StrBuf*;             // data bytes of the current message; may be 0
+
+  msg_type: int32;           // 0, or WS_OP_TEXT or WS_OP_BINARY while open
+  msg_len: int64;            // bytes of the open message, this frame included
+  utf8: WsUtf8;
+
+  in_frame: bool;
+  frame_op: int32;
+  frame_fin: bool;
+  frame_masked: bool;
+  frame_mask: uint8[4];
+  frame_len: int64;
+  frame_done: int64;         // payload bytes fed so far
+
+  control: uint8[125];       // payload of the current or last control frame
+  control_len: int64;
+
+  event: int32;              // set by ws_assembler_end
+  message_type: int32;       // after WS_EV_MESSAGE: WS_OP_TEXT or WS_OP_BINARY
+  message_len: int64;        // after WS_EV_MESSAGE: its size
+  close: WsClose;            // after WS_EV_CLOSE
+  closed: bool;              // a close frame has come: nothing may follow
+  failed: bool;
+  error_code: int32;
+  error: string;
+}
+
+// Starts an assembler. role is what this side is (WS_ROLE_SERVER or
+// WS_ROLE_CLIENT). max_message caps one message, 0 for no cap: it is also the
+// largest frame ws_decode accepts. sink collects the bytes of data messages
+// and may be 0 when you read the payload yourself with feed. It is emptied
+// when a message starts, so use the bytes of a message before the next
+// decode.
+export fn ws_assembler_init(a: WsAssembler*, role: int32, max_message: int64, sink: StrBuf*) {
+  var blank: WsAssembler;
+  *a = blank;
+  a->role = role;
+  a->max_message = max_message;
+  a->sink = sink;
+  ws_utf8_reset(&a->utf8);
+}
+
+fn ws_fail(a: WsAssembler*, code: int32, why: string) -> int32 {
+  a->failed = true;
+  a->error_code = code;
+  a->error = why;
+  return WS_ERROR;
+}
+
+// The payload bytes of the open frame still to be fed.
+export fn ws_assembler_remaining(a: WsAssembler*) -> int64 {
+  if (!a->in_frame) { return 0; }
+  return a->frame_len - a->frame_done;
+}
+
+// The bytes of the message ws_decode last reported, a view of the sink.
+export fn ws_assembler_message(a: WsAssembler*) -> string {
+  if (a->sink == 0) { return str_slice("", 0, 0); }
+  return strbuf_finish_string(a->sink);
+}
+
+// The payload of the ping, pong or close frame last reported.
+export fn ws_assembler_control(a: WsAssembler*) -> string {
+  return str_from_bytes((cstring)&a->control[0], a->control_len);
+}
+
+// A frame header arrived. Checks it against the state of the message and
+// opens the frame. Returns 0, or WS_ERROR.
+export fn ws_assembler_begin(a: WsAssembler*, h: WsHeader*) -> int32 {
+  if (a->failed) { return WS_ERROR; }
+  if (a->in_frame) { return ws_fail(a, WS_CLOSE_INTERNAL, "the open frame is not finished"); }
+  if (a->closed) { return ws_fail(a, WS_CLOSE_PROTOCOL, "frame after close"); }
+  var op: int32 = h->opcode;
+  if (!ws_opcode_known(op) || h->payload_len < 0) {
+    return ws_fail(a, WS_CLOSE_PROTOCOL, "bad frame header");
+  }
+  if (op >= 8) {
+    if (!h->fin) { return ws_fail(a, WS_CLOSE_PROTOCOL, "fragmented control frame"); }
+    if (h->payload_len > (int64)WS_MAX_CONTROL) {
+      return ws_fail(a, WS_CLOSE_PROTOCOL, "control frame too long");
+    }
+  } else {
+    var base: int64 = 0;
+    if (op == WS_OP_CONT) {
+      if (a->msg_type == 0) {
+        return ws_fail(a, WS_CLOSE_PROTOCOL, "continuation with nothing to continue");
+      }
+      base = a->msg_len;
+    } else if (a->msg_type != 0) {
+      return ws_fail(a, WS_CLOSE_PROTOCOL, "new message inside a fragmented one");
+    }
+    if (a->max_message > 0 && h->payload_len > a->max_message - base) {
+      return ws_fail(a, WS_CLOSE_TOO_BIG, "message too big");
+    }
+    if (op != WS_OP_CONT) {
+      a->msg_type = op;
+      ws_utf8_reset(&a->utf8);
+      if (a->sink != 0) { a->sink->len = 0; }
+    }
+    a->msg_len = base + h->payload_len;
+  }
+  a->in_frame = true;
+  a->frame_op = op;
+  a->frame_fin = h->fin;
+  a->frame_masked = h->masked;
+  a->frame_mask[0] = h->mask[0];
+  a->frame_mask[1] = h->mask[1];
+  a->frame_mask[2] = h->mask[2];
+  a->frame_mask[3] = h->mask[3];
+  a->frame_len = h->payload_len;
+  a->frame_done = 0;
+  a->event = WS_EV_NONE;
+  return 0;
+}
+
+// Payload bytes of the open frame, in order, in any number of pieces. They are
+// unmasked in place, so data holds the real bytes afterwards. A piece past
+// what remains is refused. Control payloads are kept in the assembler. Data
+// goes to the sink, and text is checked: invalid UTF-8 fails here with 1007.
+// Returns 0, or WS_ERROR.
+export fn ws_assembler_feed(a: WsAssembler*, data: uint8*, n: int64) -> int32 {
+  if (a->failed) { return WS_ERROR; }
+  if (!a->in_frame) { return ws_fail(a, WS_CLOSE_INTERNAL, "no frame is open"); }
+  if (n < 0 || n > a->frame_len - a->frame_done) {
+    return ws_fail(a, WS_CLOSE_INTERNAL, "more bytes than the frame holds");
+  }
+  if (n == 0) { return 0; }
+  if (a->frame_masked) { ws_unmask(data, n, &a->frame_mask[0], a->frame_done); }
+  if (a->frame_op >= 8) {
+    var i: int64 = 0;
+    while (i < n) {
+      a->control[a->frame_done + i] = data[i];
+      i = i + 1;
+    }
+  } else {
+    if (a->msg_type == WS_OP_TEXT && !ws_utf8_feed(&a->utf8, data, n)) {
+      return ws_fail(a, WS_CLOSE_BAD_DATA, "invalid UTF-8 in a text message");
+    }
+    if (a->sink != 0 && strbuf_append_bytes(a->sink, (cstring)data, n) == 0) {
+      return ws_fail(a, WS_CLOSE_INTERNAL, "out of memory");
+    }
+  }
+  a->frame_done = a->frame_done + n;
+  return 0;
+}
+
+// The open frame has all its bytes. Closes it and returns what it completed:
+// WS_EV_NONE for a fragment that is not the last, WS_EV_MESSAGE for a message
+// (message_type, message_len, and the sink), WS_EV_PING or WS_EV_PONG (read
+// ws_assembler_control), or WS_EV_CLOSE (the code and reason are in close).
+// A close payload that is not valid, or a text message that ends inside a
+// character, fails here. Returns WS_ERROR on failure.
+export fn ws_assembler_end(a: WsAssembler*) -> int32 {
+  if (a->failed) { return WS_ERROR; }
+  if (!a->in_frame) { return ws_fail(a, WS_CLOSE_INTERNAL, "no frame is open"); }
+  if (a->frame_done != a->frame_len) {
+    return ws_fail(a, WS_CLOSE_INTERNAL, "the frame is not complete");
+  }
+  a->in_frame = false;
+  a->event = WS_EV_NONE;
+  var op: int32 = a->frame_op;
+  if (op >= 8) {
+    a->control_len = a->frame_len;
+    if (op == WS_OP_PING) {
+      a->event = WS_EV_PING;
+    } else if (op == WS_OP_PONG) {
+      a->event = WS_EV_PONG;
+    } else {
+      var code: int32 = ws_close_parse(&a->control[0], a->control_len, &a->close);
+      if (code == WS_CLOSE_BAD_DATA) {
+        return ws_fail(a, code, "invalid UTF-8 in a close reason");
+      }
+      if (code != 0) { return ws_fail(a, code, "bad close frame"); }
+      a->closed = true;
+      a->event = WS_EV_CLOSE;
+    }
+  } else if (a->frame_fin) {
+    if (a->msg_type == WS_OP_TEXT && !ws_utf8_done(&a->utf8)) {
+      return ws_fail(a, WS_CLOSE_BAD_DATA, "a text message ends inside a character");
+    }
+    a->message_type = a->msg_type;
+    a->message_len = a->msg_len;
+    a->msg_type = 0;
+    a->msg_len = 0;
+    a->event = WS_EV_MESSAGE;
+  }
+  return a->event;
+}
+
+// Decodes raw bytes from buf[0..n). It stops at the first event and returns
+// it: WS_EV_MESSAGE, WS_EV_PING, WS_EV_PONG or WS_EV_CLOSE (see
+// ws_assembler_end). It returns WS_EV_NONE when it has used what it can and
+// wants more, and WS_ERROR on a protocol error. *used is how many bytes were
+// consumed. Call again with the bytes after those, plus new ones, until all
+// are used.
+//
+// A frame header is only consumed once it is whole, so keep the unused tail
+// and put it in front of the next read. Payload bytes are consumed as they
+// come, and unmasked in place in buf. Data messages need a sink: without one,
+// the first data frame fails with 1011.
+export fn ws_decode(a: WsAssembler*, buf: uint8*, n: int64, used: int64*) -> int32 {
+  var pos: int64 = 0;
+  *used = 0;
+  while (true) {
+    if (a->failed) {
+      *used = pos;
+      return WS_ERROR;
+    }
+    if (!a->in_frame) {
+      if (pos >= n) { break; }
+      var h: WsHeader;
+      var r: int32 = ws_parse_header(buf + pos, n - pos, a->role, a->max_message, &h);
+      if (r == WS_ERROR) {
+        ws_fail(a, h.error_code, h.error);
+        *used = pos;
+        return WS_ERROR;
+      }
+      if (r == WS_NEED_MORE) { break; }
+      if (h.opcode < 8 && a->sink == 0) {
+        ws_fail(a, WS_CLOSE_INTERNAL, "no sink for message bytes");
+        *used = pos;
+        return WS_ERROR;
+      }
+      if (ws_assembler_begin(a, &h) != 0) {
+        *used = pos;
+        return WS_ERROR;
+      }
+      pos = pos + h.header_len;
+    }
+    var take: int64 = n - pos;
+    var left: int64 = a->frame_len - a->frame_done;
+    if (take > left) { take = left; }
+    if (take > 0) {
+      if (ws_assembler_feed(a, buf + pos, take) != 0) {
+        *used = pos;
+        return WS_ERROR;
+      }
+      pos = pos + take;
+    }
+    if (a->frame_done < a->frame_len) { break; }
+    var ev: int32 = ws_assembler_end(a);
+    if (ev == WS_ERROR) {
+      *used = pos;
+      return WS_ERROR;
+    }
+    if (ev != WS_EV_NONE) {
+      *used = pos;
+      return ev;
+    }
+  }
+  *used = pos;
+  return WS_EV_NONE;
+}

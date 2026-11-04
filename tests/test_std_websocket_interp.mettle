@@ -1,0 +1,73 @@
+// std/websocket runs in the compile-time interpreter.
+import "std/websocket";
+
+@test fn websocket_accept_key_in_the_interpreter() -> int32 {
+  var out: uint8[28];
+  if (ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==", &out[0], 28) != (int64)28) { return 1; }
+  if (str_from_bytes((cstring)&out[0], 28) != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") { return 2; }
+  var d: uint8[20];
+  ws_sha1("abc".chars, (int64)3, &d[0]);
+  if (d[0] != (uint8)0xa9 || d[19] != (uint8)0x9d) { return 3; }
+  return 0;
+}
+
+@test fn websocket_frames_in_the_interpreter() -> int32 {
+  // The masked "Hello" from RFC 6455 section 5.7.
+  var wire: uint8[11] = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
+  var h: WsHeader;
+  if (ws_parse_header(&wire[0], (int64)11, WS_ROLE_SERVER, (int64)0, &h) != WS_HEADER) { return 1; }
+  if (h.payload_len != (int64)5 || h.header_len != (int64)6 || !h.masked) { return 2; }
+  ws_unmask(&wire[6], (int64)5, &h.mask[0], (int64)0);
+  if (str_from_bytes((cstring)&wire[6], 5) != "Hello") { return 3; }
+  // An unmasked frame to a server is a protocol error.
+  var bad: uint8[7] = [0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f];
+  if (ws_parse_header(&bad[0], (int64)7, WS_ROLE_SERVER, (int64)0, &h) != WS_ERROR) { return 4; }
+  if (h.error_code != 1002) { return 5; }
+  return 0;
+}
+
+@test fn websocket_messages_in_the_interpreter() -> int32 {
+  var arena: Arena* = arena_init((int64)0);
+  var sink: StrBuf* = strbuf_new(arena, (int64)32);
+  var wire: StrBuf* = strbuf_new(arena, (int64)32);
+  // A text message in two fragments, with a ping between them; the euro sign
+  // is split across the fragments.
+  var e1: uint8[1] = [0xE2];
+  var e2: uint8[2] = [0x82, 0xAC];
+  ws_write_frame(wire, false, WS_OP_TEXT, &e1[0], (int64)1, (uint8*)0);
+  ws_write_ping(wire, "hi".chars, (int64)2, (uint8*)0);
+  ws_write_frame(wire, true, WS_OP_CONT, &e2[0], (int64)2, (uint8*)0);
+  var a: WsAssembler;
+  ws_assembler_init(&a, WS_ROLE_CLIENT, (int64)0, sink);
+  var used: int64 = 0;
+  var at: int64 = 0;
+  var data: uint8* = (uint8*)wire->data;
+  if (ws_decode(&a, data + at, wire->len - at, &used) != WS_EV_PING) { return 1; }
+  if (ws_assembler_control(&a) != "hi") { return 2; }
+  at = at + used;
+  if (ws_decode(&a, data + at, wire->len - at, &used) != WS_EV_MESSAGE) { return 3; }
+  if (a.message_type != WS_OP_TEXT || a.message_len != (int64)3 || sink->len != (int64)3) { return 4; }
+  // The same text cut off is refused with 1007.
+  wire->len = 0;
+  ws_write_frame(wire, true, WS_OP_TEXT, &e1[0], (int64)1, (uint8*)0);
+  ws_assembler_init(&a, WS_ROLE_CLIENT, (int64)0, sink);
+  if (ws_decode(&a, (uint8*)wire->data, wire->len, &used) != WS_ERROR) { return 5; }
+  if (a.error_code != 1007) { return 6; }
+  arena_free(arena);
+  return 0;
+}
+
+@test fn websocket_handshake_writers_in_the_interpreter() -> int32 {
+  var arena: Arena* = arena_init((int64)0);
+  var b: StrBuf* = strbuf_new(arena, (int64)64);
+  var k: uint8[16];
+  for i in 0..16 { k[i] = (uint8)i; }
+  if (ws_write_request(b, "h", "/ws", &k[0], "", "") != 1) { return 1; }
+  var head: string = strbuf_finish_string(b);
+  if (ws_check_request_head(head) != 0) { return 2; }
+  var resp: StrBuf* = strbuf_new(arena, (int64)64);
+  if (ws_write_101(resp, ws_header_value(head, "sec-websocket-key"), "") != 1) { return 3; }
+  if (ws_check_response(strbuf_finish_string(resp), "AAECAwQFBgcICQoLDA0ODw==", "") != 0) { return 4; }
+  arena_free(arena);
+  return 0;
+}

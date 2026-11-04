@@ -667,8 +667,272 @@ The Winsock constants are functions: `AF_INET()`, `SOCK_STREAM()`,
 
 ## std/http
 
-`http_fetch_to_file(url: cstring, output_path: cstring) -> int32` downloads a
-URL to a file.
+HTTP/1.1 (RFC 9110, RFC 9112): head parsers, body framing, a chunked decoder,
+URLs and queries, writers, and a small blocking client. Importing it also
+brings in `std/socket`. `http_fetch_to_file(url, path)` is the older helper
+that runs `curl`; it is unchanged.
+
+The parsers work on a buffer you own. They allocate nothing, and every string
+they give back is a view into that buffer, so keep the buffer alive while you
+use the result.
+
+### Parsing a head
+
+`http_parse_request(buf: string, req: HttpRequest*) -> int64` and
+`http_parse_response(buf: string, res: HttpResponse*) -> int64` return the
+bytes of head used (through the blank line), `0` if the head is not complete
+yet, or a negative `HTTP_ERR_*`. After a `0`, read more bytes and call again.
+`req.verb`, `req.target`, `req.minor` (the 1 in `HTTP/1.1`) and `req.headers`
+(up to `HTTP_MAX_HEADERS`, 64, as `HttpHeader { name; value }` with the value
+already trimmed) are filled in. A response has `status`, `reason`, `minor` and
+the same headers. `head_len` is set too. The body starts at `buf[head_len]`.
+
+The parsers are strict, for untrusted input. They refuse:
+
+- a method that is not a token, a target with a space, a control byte or a
+  byte over 0x7E, and any version but `HTTP/1.0` and `HTTP/1.1`;
+- a header name that is not a token (so `Host : a` fails), and a header line
+  that starts with a space or tab (obsolete folding);
+- a bare CR or a bare LF, and NUL or other control bytes. Bare LF line ends
+  are not accepted. A bad byte fails at once, before the head is complete;
+- a head over `HTTP_MAX_HEAD` (64 KiB) and more than 64 headers;
+- `Content-Length` together with `Transfer-Encoding`, `Content-Length` values
+  that are not plain digits or that differ (repeated equal values are fine),
+  and a request whose `Transfer-Encoding` does not end in `chunked`, names it
+  twice, or is on HTTP/1.0 (a response with another last coding just runs
+  until close);
+- an HTTP/1.1 request without exactly one non-empty `Host`.
+
+`http_find_head_end(p: uint8*, n) -> int64` does the first scan alone. Every
+call scans from the start, so feed it large reads rather than single bytes.
+
+### Headers and body framing
+
+| Function | Effect |
+|----------|--------|
+| `http_header(h: HttpHeader*, count, name) -> Option<string>` | First header with that name, any case |
+| `http_header_find(h, count, name, from) -> int32` | Index of the next match at or after `from`, or -1 |
+| `http_header_has_token(value, token) -> bool` | Is `token` in a comma list such as `keep-alive, Upgrade` |
+| `http_header_list_has(h, count, name, token) -> bool` | The same across every header of that name |
+| `http_keep_alive(minor, h, count) -> bool` | Does the connection stay open: `Connection: close` and HTTP/1.0 rules |
+| `http_request_body_kind(req) -> HttpBody` | How the request body is framed |
+| `http_response_body_kind(res, head_request: bool) -> HttpBody` | The same for a response |
+
+`HttpBody` has a `kind` and a `length`. The kinds are `HTTP_BODY_NONE`,
+`HTTP_BODY_LENGTH` (`length` bytes), `HTTP_BODY_CHUNKED`, `HTTP_BODY_CLOSE`
+(read until the peer closes, responses only) and `HTTP_BODY_INVALID` (the
+headers contradict each other, and `length` is the `HTTP_ERR_*`). A response to
+HEAD, any 1xx, 204 and 304 has no body whatever the headers say. A request
+with neither header has none.
+
+### Chunked bodies
+
+```mettle
+var d: HttpChunkDecoder;
+var f: HttpChunkFeed;
+http_chunk_init(&d, 1048576);                 // body limit; 0 for none
+var status: int64 = http_chunk_feed(&d, src, n, dst, cap, &f);
+```
+
+`http_chunk_feed` takes `n` bytes of chunked framing and writes the body bytes
+it finds to `dst`. `f.consumed` and `f.produced` say how much of each was
+used. You can split the input anywhere, even inside a chunk size. The result is:
+
+- `HTTP_CHUNK_MORE`: all input was used, feed more.
+- `HTTP_CHUNK_DONE`: the body is complete. `f.consumed` stops at the end of
+  the trailers, so what follows belongs to the next message.
+- `HTTP_CHUNK_FULL`: `dst` is full. Use `f.produced` bytes, then call again
+  with the unused part of the input.
+- `HTTP_ERR_CHUNK` for a bad size, bad framing or a bare CR or LF, and
+  `HTTP_ERR_BODY_TOO_LARGE` over the limit. An error is final.
+
+`dst` may be the same buffer as `src`, which decodes in place. Chunk
+extensions and trailers are checked for control bytes and skipped.
+
+### URLs and queries
+
+`http_url_parse(url: string, out: HttpUrl*) -> int64` returns 0 or
+`HTTP_ERR_URL`. `HttpUrl` holds views: `scheme`, `userinfo`, `host` (no
+brackets for IPv6, and `ipv6` is 1), `port` (80 for http and ws, 443 for https
+and wss, if the URL has none), `path` (`"/"` if empty), `query`, `fragment`,
+and `tls`. Only those four schemes parse. The URL must be ASCII with no spaces
+or control bytes, and port 0 is refused.
+
+| Function | Effect |
+|----------|--------|
+| `http_percent_decode(src, dst: uint8*, cap, plus_is_space: bool) -> int64` | Decodes `%XX` into `dst`; the length, `HTTP_ERR_ESCAPE` or `HTTP_ERR_TOO_SMALL` |
+| `http_percent_encode(b: StrBuf*, s) -> int64` | Appends `s`, escaping all but letters, digits and `-._~` |
+| `http_query_find(query, name) -> Option<string>` | Raw value of the first parameter called `name`; the name is decoded before the match |
+| `http_query_get(query, name, dst, cap) -> int64` | The same, decoded (`+` is a space); `HTTP_ERR_ABSENT` if missing |
+| `http_query_next(query, &pos, &name, &value) -> bool` | Steps through the pairs; start with `pos = 0` |
+
+### Writers
+
+All write into a `StrBuf` and return the bytes appended or a negative error.
+Names must be tokens, and values and reason phrases must have no CR, LF, NUL or
+other control byte, so a caller cannot smuggle in a second header or message.
+The inputs are checked first, and on an error nothing is appended.
+
+| Function | Effect |
+|----------|--------|
+| `http_write_request_head(b, verb, target, h: HttpHeader*, n) -> int64` | `METHOD target HTTP/1.1`, the headers, a blank line. Adds no headers itself |
+| `http_write_response_head(b, status, reason, h, n) -> int64` | Status line and headers; an empty `reason` uses `http_status_text` |
+| `http_write_header(b, name, value) -> int64` | One header line |
+| `http_write_chunk(b, data: uint8*, n) -> int64` | One chunk; `n <= 0` writes nothing, since an empty chunk ends the body |
+| `http_write_last_chunk(b)`, `http_write_last_chunk_trailers(b, h, n)` | The end of a chunked body |
+| `http_status_text(code) -> string` | `"Not Found"` for 404; `"Unknown"` if not listed |
+| `http_valid_token(s)`, `http_valid_field_value(s)` | The checks the writers use |
+| `http_error_text(code) -> string` | A short message for any `HTTP_ERR_*` |
+
+### Client and server pieces
+
+`http_request(arena, verb, url, headers, nheaders, body, timeout_ms) ->
+Result<HttpClientResponse*, string>` makes one blocking request. Only `http://`
+works; `https://` gives the error `TLS is not supported yet`. It sends `Host`,
+`Content-Length` (for a body, or for POST, PUT and PATCH) and `Connection:
+close`, and reads the whole reply: `Content-Length`, chunked, or until close.
+1xx replies are skipped. Redirects are not followed. A `Host` header of yours
+replaces the default one; passing `Content-Length`, `Transfer-Encoding` or
+`Connection` is an error. `timeout_ms` covers connect, send and the whole
+reply (0 or less: no limit). A body over `HTTP_CLIENT_MAX_BODY` (64 MiB) fails.
+
+`HttpClientResponse` has `status`, `reason`, `headers`/`nheaders` and `body`,
+all in the arena. `http_get(arena, url, timeout_ms)` is the short form.
+
+```mettle
+match (http_get(arena, "http://127.0.0.1:8080/items?id=7", 3000)) {
+  case Ok(r): { println("{r->status} {r->body}"); }
+  case Err(e): { println("failed: {e}"); }
+}
+```
+
+`http_read_head(fd, buf, cap, have, timeout_ms, &head_end) -> int64` is for
+servers. It reads until `buf` holds a whole head and returns the bytes now in
+`buf`, with `head_end` set to where the head ends. `have` is how many bytes are
+already in `buf` (left over on a keep-alive connection, or 0). `timeout_ms` is
+for the whole head, so a client that trickles bytes cannot hold the connection.
+Then parse `buf[0..head_end]` with `http_parse_request`. It returns
+`HTTP_ERR_CLOSED`, `HTTP_ERR_TIMEOUT`, `HTTP_ERR_HEAD_TOO_LARGE` or a parse
+error for a bad byte. After an error, drop the connection.
+
+## std/websocket
+
+RFC 6455 WebSocket, as pure protocol code. It reads and writes no socket and
+makes no OS call, so a server or a client can drive it from any event loop.
+Linux, macOS and Windows, and it runs in the compile-time interpreter. No extensions are
+negotiated, so the RSV bits must be zero.
+
+Roles: `WS_ROLE_SERVER` parses frames from a client, which must be masked.
+`WS_ROLE_CLIENT` parses frames from a server, which must not be.
+
+### Handshake
+
+`ws_accept_key(client_key, out: uint8*, cap) -> int64` writes the
+Sec-WebSocket-Accept value (28 bytes) and returns its length, or -1 for an
+invalid key (it must decode to 16 bytes). It uses a private SHA-1, exported as
+`ws_sha1(p, n, out20)`. SHA-1 is here for the handshake only.
+
+Server side:
+
+| Function | Effect |
+|----------|--------|
+| `ws_check_request(verb, upgrade, connection, key, version) -> int32` | `WS_UPGRADE_OK` (0), or the status to refuse with: 405, 426 or 400. Pass `""` for a missing header |
+| `ws_check_request_head(head) -> int32` | The same, from the request text. Needs HTTP/1.1 and one key |
+| `ws_select_protocol(offered, supported) -> string` | The first offered subprotocol the server supports, or `""` |
+| `ws_write_101(buf: StrBuf*, client_key, protocol) -> int32` | Appends the 101 response. `protocol` may be `""`. Returns 1, or 0 and the buffer is unchanged |
+| `ws_write_refusal(buf, status) -> int32` | Appends a 400, 405 or 426 response (426 names version 13) |
+
+Client side. The stdlib has no random source, so you draw 16 random bytes and
+pass them in. Keep them: the answer is checked against them.
+
+| Function | Effect |
+|----------|--------|
+| `ws_client_key(key16: uint8*, out, cap) -> int64` | The 24-byte Sec-WebSocket-Key text |
+| `ws_write_request(buf, host, path, key16, protocols, origin) -> int32` | Appends the upgrade request. `protocols` and `origin` may be `""`. Refuses a control byte in a value, so a header cannot be injected |
+| `ws_check_response(head, client_key, offered) -> int32` | 0, or `WS_HS_BAD_STATUS`, `_UPGRADE`, `_CONNECTION`, `_ACCEPT`, `_EXTENSION` or `_PROTOCOL` |
+
+Helpers: `ws_find_head_end(buf, n)` gives the index past `\r\n\r\n`, or -1.
+`ws_header_value(head, name)`, `ws_head_has_token(head, name, token)`,
+`ws_has_token(list, token)` (case-insensitive, comma list) and
+`ws_status_code(head)` read a head.
+
+### Frames
+
+`ws_parse_header(buf, n, role, max_payload, &h) -> int32` reads one frame
+header from the front of `buf`. It returns `WS_NEED_MORE` (keep the bytes, read
+more, call again from the same start), `WS_HEADER` or `WS_ERROR`. `WsHeader`
+has `fin`, `opcode`, `masked`, `mask[4]`, `payload_len` and `header_len`. After
+`WS_ERROR`, `error_code` is the close code to answer with and `error` says why.
+
+It refuses: RSV bits set, unknown opcodes, a control frame that is fragmented
+or longer than 125 bytes, a wrong mask bit for the role, a 64-bit length with
+the top bit set, and a length that is not in its shortest form. Those are 1002.
+A data frame over `max_payload` (0 means no limit) is 1009. Errors show up as
+soon as the bytes that show them have arrived.
+
+`ws_unmask(data, n, mask, offset)` XORs in place. `offset` is where `data`
+sits in the payload, so a payload that arrives in pieces is unmasked piece by
+piece.
+
+`ws_header_write(out, cap, fin, opcode, len, mask) -> int64` writes a header
+(`mask` is 0 for none, else four bytes). The writers `ws_write_frame(buf, fin,
+opcode, payload, n, mask)`, `ws_write_text`, `ws_write_binary`, `ws_write_ping`
+and `ws_write_pong` append a whole frame to a `StrBuf` and mask the payload when
+`mask` is set. They return the bytes added, or -1 and the buffer is unchanged.
+`ws_write_text` refuses text that is not UTF-8. For a fragmented message, send
+the first piece with the text or binary opcode and `fin` false, then
+`WS_OP_CONT` pieces, with `fin` true on the last.
+
+### Close frames
+
+`ws_close_code_valid(code)` is true for 1000-1003, 1007-1014 and 3000-4999.
+`ws_close_encode(code, reason, out, cap)` builds a payload (reason up to 123
+bytes of UTF-8). `ws_close_parse(p, n, &close)` reads one and returns 0, or the
+code to answer with: 1002 for a one-byte payload or a bad code, 1007 for a
+reason that is not UTF-8. `WsClose` has `code` (1005 when empty) and `reason`.
+`ws_write_close(buf, code, reason, mask)` appends the frame.
+
+### Messages
+
+`WsAssembler` follows a stream of frames. It refuses a new data frame inside a
+fragmented message and a continuation with nothing to continue, lets control
+frames come between fragments, caps the size of a message, and checks text as
+UTF-8 as the bytes arrive, even when a character is split across fragments. It
+also refuses any frame after a close.
+
+```mettle
+var a: WsAssembler;
+ws_assembler_init(&a, WS_ROLE_SERVER, 1048576, sink);   // sink: a StrBuf*
+var used: int64 = 0;
+var ev: int32 = ws_decode(&a, buf, n, &used);
+```
+
+`ws_decode` stops at each event and returns it: `WS_EV_MESSAGE`,
+`WS_EV_PING`, `WS_EV_PONG` or `WS_EV_CLOSE`. It returns `WS_EV_NONE` when it
+needs more bytes, and `WS_ERROR` on a protocol error (`a.error_code` is the
+close code). `used` is how many bytes it took. Call it again with the bytes
+after those, until none are left. A header is taken only when it is whole, so
+keep the unused tail and put it in front of the next read. Payload bytes are
+unmasked in place in `buf`.
+
+The bytes of a data message collect in the sink, which is emptied when a
+message starts. After `WS_EV_MESSAGE`, read `ws_assembler_message(&a)` and
+`a.message_type` (`WS_OP_TEXT` or `WS_OP_BINARY`) before the next decode. After
+a ping or pong, `ws_assembler_control(&a)` has its data (answer a ping with a
+pong that carries it). After a close, `a.close` has the code and reason.
+
+To handle one frame at a time, use `ws_parse_header` and then
+`ws_assembler_begin(&a, &h)`, `ws_assembler_feed(&a, data, n)` for each piece
+and `ws_assembler_end(&a)`, which returns the event. With a null sink, `feed`
+is how you see the payload.
+
+`WsUtf8` is the streaming validator behind this: `ws_utf8_reset`,
+`ws_utf8_feed(&v, p, n)`, `ws_utf8_done(&v)`, and `ws_utf8_valid(p, n)` for one
+buffer. It refuses overlong forms, surrogates and anything past U+10FFFF.
+
+Not done: extensions such as permessage-deflate, and the connection state
+machine around the close handshake (sending your own close and waiting for the
+peer's). A caller does that with the pieces above.
 
 ## std/file
 

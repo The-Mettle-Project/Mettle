@@ -1,0 +1,1124 @@
+// std/http: head parsers, header helpers, body framing, chunked decoding,
+// URLs and queries, and the writers. The client and server pieces are tested
+// at the bottom against a loopback server.
+import "std/http";
+import "std/io";
+import "std/arena";
+import "std/strbuf";
+import "std/mem";
+import "std/core";
+import "std/socket";
+import "std/thread";
+import "std/conv";
+
+var g_fail: int32 = 0;
+
+// Records the first failed check. Check numbers are in source order.
+fn ck(n: int32, ok: bool) {
+  if (!ok && g_fail == 0) {
+    g_fail = n;
+    println("FAIL check {n}");
+  }
+}
+
+fn re(text: string) -> int64 {
+  var req: HttpRequest;
+  return http_parse_request(text, &req);
+}
+
+fn full(text: string) -> bool {
+  return re(text) == (int64)text.length;
+}
+
+fn rs(text: string) -> int64 {
+  var res: HttpResponse;
+  return http_parse_response(text, &res);
+}
+
+// A copy of text with the byte at index at replaced, for bytes a literal cannot hold.
+fn patched(text: string, at: int64, value: int32, dst: uint8*) -> string {
+  for i in 0..(int64)text.length { dst[i] = text.chars[i]; }
+  dst[at] = (uint8)value;
+  var s: string;
+  s.chars = dst;
+  s.length = text.length;
+  return s;
+}
+
+fn req_kind(text: string) -> HttpBody {
+  var req: HttpRequest;
+  var r: int64 = http_parse_request(text, &req);
+  var b: HttpBody;
+  if (r <= 0) {
+    b.kind = -1;
+    b.length = r;
+    return b;
+  }
+  return http_request_body_kind(&req);
+}
+
+fn res_kind(text: string, head: bool) -> HttpBody {
+  var res: HttpResponse;
+  var r: int64 = http_parse_response(text, &res);
+  var b: HttpBody;
+  if (r <= 0) {
+    b.kind = -1;
+    b.length = r;
+    return b;
+  }
+  return http_response_body_kind(&res, head);
+}
+
+// ---- chunked helpers ----
+
+var g_used: int64 = 0;
+
+// Feeds wire in pieces of step bytes. Returns the last status and sets
+// *got to the body bytes written to out, and g_used to the bytes consumed.
+fn chunk_run(wire: string, max_body: int64, step: int64, out: uint8*, cap: int64, got: int64*) -> int64 {
+  var d: HttpChunkDecoder;
+  http_chunk_init(&d, max_body);
+  var feed: HttpChunkFeed;
+  var off: int64 = 0;
+  var w: int64 = 0;
+  var status: int64 = HTTP_CHUNK_MORE;
+  var n: int64 = (int64)wire.length;
+  while (off < n && status == HTTP_CHUNK_MORE) {
+    var take: int64 = step;
+    if (take > n - off) { take = n - off; }
+    var sent: int64 = 0;
+    while (sent < take && (status == HTTP_CHUNK_MORE || status == HTTP_CHUNK_FULL)) {
+      status = http_chunk_feed(&d, wire.chars + off + sent, take - sent, out + w, cap - w, &feed);
+      sent = sent + feed.consumed;
+      w = w + feed.produced;
+      if (status == HTTP_CHUNK_FULL && feed.consumed == 0 && feed.produced == 0) { status = -99; }
+      if (status == HTTP_CHUNK_FULL) { status = HTTP_CHUNK_MORE; }
+      if (status == HTTP_CHUNK_DONE) { g_used = off + sent; }
+    }
+    off = off + take;
+  }
+  *got = w;
+  return status;
+}
+
+fn bytes_are(p: uint8*, n: int64, want: string) -> bool {
+  if (n != (int64)want.length) { return false; }
+  for i in 0..n {
+    if ((int32)p[i] != (int32)want[i]) { return false; }
+  }
+  return true;
+}
+
+// The same body decoded at every split point of the wire text, one byte at a
+// time, and whole. All must give the same status and body.
+fn chunk_everywhere(wire: string, want: string, status: int64) -> bool {
+  var out: uint8[256];
+  var got: int64 = 0;
+  var n: int64 = (int64)wire.length;
+  var r: int64 = chunk_run(wire, 0, n + 1, &out[0], 256, &got);
+  if (r != status || !bytes_are(&out[0], got, want)) { return false; }
+  var step: int64 = 1;
+  while (step <= n) {
+    r = chunk_run(wire, 0, step, &out[0], 256, &got);
+    if (r != status || !bytes_are(&out[0], got, want)) { return false; }
+    step = step + 1;
+  }
+  // two feeds split at every boundary
+  var k: int64 = 0;
+  while (k <= n) {
+    var d: HttpChunkDecoder;
+    http_chunk_init(&d, 0);
+    var f1: HttpChunkFeed;
+    var f2: HttpChunkFeed;
+    var r1: int64 = http_chunk_feed(&d, wire.chars, k, &out[0], 256, &f1);
+    var r2: int64 = r1;
+    var total: int64 = f1.produced;
+    if (r1 == HTTP_CHUNK_MORE) {
+      r2 = http_chunk_feed(&d, wire.chars + k, n - k, &out[total], 256 - total, &f2);
+      total = total + f2.produced;
+    }
+    if (r2 != status || !bytes_are(&out[0], total, want)) { return false; }
+    k = k + 1;
+  }
+  return true;
+}
+
+// ---- loopback server for the client tests ----
+
+var g_listen: int64 = 0;
+var g_seen: uint8[16384];          // what the server read, 1024 bytes per connection
+var g_seen_len: int64[16];
+var g_server_err: int32 = 0;
+const SERVED = 12;
+
+// What the server says for connection i. Cases 1, 7 are special in serve().
+fn reply_for(i: int32) -> string {
+  switch (i) {
+    case 0: { return "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-A: b\r\nSet-Cookie: 1\r\nSet-Cookie: 2\r\n\r\nhello"; }
+    case 2: { return "HTTP/1.0 200 OK\r\nServer: t\r\n\r\nstream until close"; }
+    case 3: { return "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\nno"; }
+    case 4: { return "HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n"; }
+    case 5: { return "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"; }
+    case 6: { return "HTTP/1.1 20 Nope\r\n\r\n"; }
+    case 8: { return "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-T: 1\r\n\r\n"; }
+    case 9: { return "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc"; }
+    case 10: { return "HTTP/1.1 204 No Content\r\nContent-Length: 50\r\n\r\n"; }
+    case 11: { return "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"; }
+    default: { return ""; }
+  }
+}
+
+fn send_str(fd: int64, s: string) {
+  sock_send_all(fd, s.chars, (int64)s.length);
+}
+
+fn serve(i: int32, fd: int64) {
+  var buf: uint8[2048];
+  var head_end: int64 = 0;
+  var have: int64 = http_read_head(fd, &buf[0], 2048, 0, 2000, &head_end);
+  if (have < 0) {
+    g_server_err = 200 + i;
+    return;
+  }
+  // read the rest of a body that has a Content-Length
+  var req: HttpRequest;
+  var v: string;
+  v.chars = &buf[0];
+  v.length = (uint64)head_end;
+  if (http_parse_request(v, &req) != head_end) {
+    g_server_err = 300 + i;
+    return;
+  }
+  var kind: HttpBody = http_request_body_kind(&req);
+  if (kind.kind == HTTP_BODY_LENGTH) {
+    while (have < head_end + kind.length) {
+      var r: int64 = sock_recv(fd, &buf[have], 2048 - have);
+      if (r <= 0) {
+        g_server_err = 400 + i;
+        return;
+      }
+      have = have + r;
+    }
+  }
+  var keep: int64 = have;
+  if (keep > 1024) { keep = 1024; }
+  for z in 0..keep { g_seen[(int64)i * 1024 + z] = buf[z]; }
+  g_seen_len[i] = keep;
+
+  if (i == 1) {
+    // a chunked reply that arrives in pieces, cut inside a chunk header
+    send_str(fd, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab");
+    thread_sleep_ms((uint32)30);
+    send_str(fd, "c\r\n4\r");
+    thread_sleep_ms((uint32)30);
+    send_str(fd, "\ndefg\r\n0\r\n\r\n");
+  } else if (i == 7) {
+    thread_sleep_ms((uint32)400);
+  } else {
+    send_str(fd, reply_for(i));
+  }
+}
+
+fn server_main(arg: cstring) -> uint32 {
+  var i: int32 = 0;
+  while (i < SERVED) {
+    var peer: NetAddr;
+    var fd: int64 = sock_accept(g_listen, &peer);
+    if (fd < 0) {
+      g_server_err = 100 + i;
+      return (uint32)1;
+    }
+    serve(i, fd);
+    sock_close(fd);
+    i = i + 1;
+  }
+  return (uint32)0;
+}
+
+fn seen_text(i: int32) -> string {
+  var s: string;
+  s.chars = &g_seen[(int64)i * 1024];
+  s.length = (uint64)g_seen_len[i];
+  return s;
+}
+
+fn url_for(a: Arena*, port: int32, path: string) -> string {
+  var sb: StrBuf* = strbuf_new(a, 64);
+  strbuf_append_cstr(sb, "http://127.0.0.1:");
+  strbuf_append_int(sb, (int64)port);
+  strbuf_append_string(sb, path);
+  return strbuf_finish_string(sb);
+}
+
+// The error text, or "" when the request worked.
+fn err_of(r: Result<HttpClientResponse*, string>) -> string {
+  match (r) {
+    case Ok(x): { return ""; }
+    case Err(e): { return e; }
+  }
+}
+
+fn resp_of(r: Result<HttpClientResponse*, string>) -> HttpClientResponse* {
+  match (r) {
+    case Ok(x): { return x; }
+    case Err(e): { return (HttpClientResponse*)0; }
+  }
+}
+
+fn main() -> int32 {
+  var buf: uint8[256];
+
+  // ---- request: good ----
+  var req: HttpRequest;
+  var text: string = "GET /a/b?x=1&y=2 HTTP/1.1\r\nHost: example.com\r\nAccept:  text/html , */*  \r\nX-Empty:\r\nx-dup: 1\r\nX-Dup: 2\r\n\r\nBODY";
+  var r: int64 = http_parse_request(text, &req);
+  ck(1, r == (int64)text.length - 4);
+  ck(2, req.head_len == r);
+  ck(3, req.verb == "GET");
+  ck(4, req.target == "/a/b?x=1&y=2");
+  ck(5, req.minor == 1);
+  ck(6, req.nheaders == 5);
+  ck(7, req.headers[0].name == "Host" && req.headers[0].value == "example.com");
+  ck(8, req.headers[1].value == "text/html , */*");
+  ck(9, req.headers[2].name == "X-Empty" && req.headers[2].value == "");
+  ck(10, req.headers[0].name.chars == text.chars + 27);      // zero-copy: a view into the buffer
+  ck(11, http_header_find(&req.headers[0], req.nheaders, "x-dup", 0) == 3);
+  ck(12, http_header_find(&req.headers[0], req.nheaders, "X-DUP", 4) == 4);
+  ck(13, http_header_find(&req.headers[0], req.nheaders, "x-dup", 5) == -1);
+  ck(14, http_header_find(&req.headers[0], req.nheaders, "nope", 0) == -1);
+  match (http_header(&req.headers[0], req.nheaders, "HOST")) {
+    case Some(v): { ck(15, v == "example.com"); }
+    case None: { ck(16, false); }
+  }
+  match (http_header(&req.headers[0], req.nheaders, "missing")) {
+    case Some(v): { ck(17, false); }
+    case None: { ck(18, true); }
+  }
+  // the head can be parsed from any longer buffer with the same result
+  ck(19, full("GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+  ck(20, full("POST /u HTTP/1.0\r\n\r\n"));
+  ck(21, full("OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n"));
+  ck(22, full("GET http://h/p HTTP/1.1\r\nHost: h\r\n\r\n"));
+  // every proper prefix of a head needs more bytes
+  var whole: string = "GET /p HTTP/1.1\r\nHost: a\r\nX: y\r\n\r\n";
+  var all_more: bool = true;
+  for cut in 0..(int64)whole.length {
+    var part: string;
+    part.chars = whole.chars;
+    part.length = (uint64)cut;
+    if (http_parse_request(part, &req) != 0) { all_more = false; }
+  }
+  ck(23, all_more);
+  ck(24, http_parse_request(whole, &req) == (int64)whole.length);
+
+  // ---- request: refused ----
+  ck(25, re(" GET / HTTP/1.1\r\nHost: a\r\n\r\n") == HTTP_ERR_METHOD);
+  ck(26, re("\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n") == HTTP_ERR_START_LINE);
+  ck(27, re("GE(T / HTTP/1.1\r\nHost: a\r\n\r\n") == HTTP_ERR_METHOD);
+  ck(28, re("G@T / HTTP/1.1\r\nHost: a\r\n\r\n") == HTTP_ERR_METHOD);
+  ck(29, re("GET\r\n\r\n") == HTTP_ERR_START_LINE);
+  ck(30, re("GET  / HTTP/1.1\r\nHost: a\r\n\r\n") == HTTP_ERR_TARGET);
+  ck(31, re("GET /a b HTTP/1.1\r\nHost: a\r\n\r\n") == HTTP_ERR_START_LINE);
+  ck(32, re("GET /a\tb HTTP/1.1\r\nHost: a\r\n\r\n") == HTTP_ERR_TARGET);
+  ck(33, re("GET / \r\nHost: a\r\n\r\n") == HTTP_ERR_START_LINE);
+  ck(34, re("GET /\r\nHost: a\r\n\r\n") == HTTP_ERR_START_LINE);
+  ck(35, re("GET / HTTP/2.0\r\nHost: a\r\n\r\n") == HTTP_ERR_VERSION);
+  ck(36, re("GET / HTTP/1.2\r\nHost: a\r\n\r\n") == HTTP_ERR_VERSION);
+  ck(37, re("GET / HTTP/1.11\r\nHost: a\r\n\r\n") == HTTP_ERR_VERSION);
+  ck(38, re("GET / HTTP/0.9\r\nHost: a\r\n\r\n") == HTTP_ERR_VERSION);
+  ck(39, re("GET / http/1.1\r\nHost: a\r\n\r\n") == HTTP_ERR_START_LINE);
+  ck(40, re("GET / HTTP/1.1 \r\nHost: a\r\n\r\n") == HTTP_ERR_VERSION);
+  ck(41, re("GET / HTTP/1.1\r\nHost a\r\n\r\n") == HTTP_ERR_HEADER);
+  ck(42, re("GET / HTTP/1.1\r\nHost : a\r\n\r\n") == HTTP_ERR_HEADER);
+  ck(43, re("GET / HTTP/1.1\r\nBad Name: x\r\nHost: a\r\n\r\n") == HTTP_ERR_HEADER);
+  ck(44, re("GET / HTTP/1.1\r\n: x\r\nHost: a\r\n\r\n") == HTTP_ERR_HEADER);
+  ck(45, re("GET / HTTP/1.1\r\nHost: a\r\n b\r\n\r\n") == HTTP_ERR_OBS_FOLD);
+  ck(46, re("GET / HTTP/1.1\r\nHost: a\r\n\tb\r\n\r\n") == HTTP_ERR_OBS_FOLD);
+  ck(47, re("GET / HTTP/1.1\r\n Host: a\r\n\r\n") == HTTP_ERR_OBS_FOLD);
+  ck(48, re("GET / HTTP/1.1\nHost: a\n\n") == HTTP_ERR_BARE_LF);
+  ck(49, re("GET / HTTP/1.1\r\nHost: a\n\r\n") == HTTP_ERR_BARE_LF);
+  ck(50, re("GET / HTTP/1.1\r\nHost: a\r\n\n") == HTTP_ERR_BARE_LF);
+  ck(51, re("GET / HTTP/1.1\r\nHost: a\rX: b\r\n\r\n") == HTTP_ERR_BARE_CR);
+  ck(52, re("GET / HTTP/1.1\r\nHost: a\r\r\n\r\n") == HTTP_ERR_BARE_CR);
+  ck(53, re("GET / HTTP/1.1\r\nHost: a\r\n\rX") == HTTP_ERR_BARE_CR);
+  ck(54, re("GET / HTTP/1.1\r\nHost: a\0b\r\n\r\n") == HTTP_ERR_NUL);
+  ck(55, re("GET /\0 HTTP/1.1\r\nHost: a\r\n\r\n") == HTTP_ERR_NUL);
+  ck(56, http_parse_request(patched("GET / HTTP/1.1\r\nHost: abc\r\n\r\n", 22, 1, &buf[0]), &req) == HTTP_ERR_CONTROL);
+  ck(57, http_parse_request(patched("GET / HTTP/1.1\r\nHost: abc\r\n\r\n", 22, 127, &buf[0]), &req) == HTTP_ERR_CONTROL);
+  ck(58, http_parse_request(patched("GET / HTTP/1.1\r\nHost: abc\r\n\r\n", 22, 200, &buf[0]), &req) > 0);   // obs-text in a value is allowed
+  ck(59, http_parse_request(patched("GET /abc HTTP/1.1\r\nHost: abc\r\n\r\n", 6, 200, &buf[0]), &req) == HTTP_ERR_TARGET);
+  // a bad byte is refused before the head is even complete
+  ck(60, re("GET / HTTP/1.1\r\nHost: a\0") == HTTP_ERR_NUL);
+  ck(61, re("GET / HTTP/1.1\nHo") == HTTP_ERR_BARE_LF);
+  ck(62, re("GET / HTTP/1.1\r\nHost: a\r\n\r") == 0);
+  ck(63, re("") == 0);
+  ck(64, re("G") == 0);
+
+  // ---- request: Host ----
+  ck(65, re("GET / HTTP/1.1\r\n\r\n") == HTTP_ERR_HOST);
+  ck(66, re("GET / HTTP/1.1\r\nHost:\r\n\r\n") == HTTP_ERR_HOST);
+  ck(67, re("GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n") == HTTP_ERR_HOST);
+  ck(68, re("GET / HTTP/1.1\r\nHost: a\r\nhost: b\r\n\r\n") == HTTP_ERR_HOST);
+  ck(69, re("GET / HTTP/1.0\r\nHost: a\r\n\r\n") > 0);
+
+  // ---- request: smuggling ----
+  ck(70, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n") == HTTP_ERR_LENGTH_CONFLICT);
+  ck(71, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n") == HTTP_ERR_LENGTH_CONFLICT);
+  ck(72, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n") == HTTP_ERR_LENGTH_CONFLICT);
+  ck(73, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(74, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5, 6\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(75, re("POST / HTTP/1.1\r\nHost: a\r\ncontent-length: 5\r\nCONTENT-LENGTH: 05\r\n\r\n") > 0);
+  ck(76, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n") > 0);
+  ck(77, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5, 5\r\n\r\n") > 0);
+  ck(78, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: +5\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(79, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(80, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5 5\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(81, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0x10\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(82, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length:\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(83, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5,\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(84, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1_0\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(85, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 9999999999999999999\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(86, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999999999999999\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(87, re("POST / HTTP/1.1\r\nHost: a\r\nContent-Length : 5\r\n\r\n") == HTTP_ERR_HEADER);
+  ck(88, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(89, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(90, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: identity\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(91, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: xchunked\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(92, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, chunked\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(93, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(94, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(95, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding:\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(96, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: ,\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(97, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding : chunked\r\n\r\n") == HTTP_ERR_HEADER);
+  ck(98, re("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(99, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n") > 0);
+  ck(100, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: Chunked\r\n\r\n") > 0);
+  ck(101, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n") > 0);
+  ck(102, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n") > 0);
+  ck(103, re("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked  \r\n\r\n") > 0);
+
+  // ---- request: limits ----
+  var arena: Arena* = arena_init(0);
+  var big: StrBuf* = strbuf_new(arena, 70000);
+  strbuf_append_cstr(big, "GET / HTTP/1.1\r\nHost: a\r\n");
+  for _k in 0..63 { strbuf_append_cstr(big, "X: 1\r\n"); }
+  strbuf_append_cstr(big, "\r\n");
+  ck(104, http_parse_request(strbuf_finish_string(big), &req) > 0 && req.nheaders == 64);
+  big->len = big->len - 2;
+  strbuf_append_cstr(big, "Y: 1\r\n\r\n");
+  ck(105, http_parse_request(strbuf_finish_string(big), &req) == HTTP_ERR_TOO_MANY_HEADERS);
+
+  // a head of exactly HTTP_MAX_HEAD bytes parses, one more byte does not
+  big->len = 0;
+  strbuf_append_cstr(big, "GET / HTTP/1.1\r\nHost: a\r\nX: ");
+  var fill: int64 = (int64)HTTP_MAX_HEAD - big->len - 4;
+  for _k in 0..fill { strbuf_append_byte(big, (uint8)97); }
+  strbuf_append_cstr(big, "\r\n\r\n");
+  ck(106, big->len == (int64)HTTP_MAX_HEAD);
+  ck(107, http_parse_request(strbuf_finish_string(big), &req) == (int64)HTTP_MAX_HEAD);
+  big->len = big->len - 4;
+  strbuf_append_cstr(big, "a\r\n\r\n");
+  ck(108, http_parse_request(strbuf_finish_string(big), &req) == HTTP_ERR_HEAD_TOO_LARGE);
+  // no blank line and over the limit
+  big->len = 0;
+  strbuf_append_cstr(big, "GET / HTTP/1.1\r\nHost: a\r\nX: ");
+  for _k in 0..70000 { strbuf_append_byte(big, (uint8)97); }
+  ck(109, http_parse_request(strbuf_finish_string(big), &req) == HTTP_ERR_HEAD_TOO_LARGE);
+  // and under the limit it just needs more
+  big->len = 0;
+  strbuf_append_cstr(big, "GET / HTTP/1.1\r\nHost: a\r\nX: ");
+  for _k in 0..1000 { strbuf_append_byte(big, (uint8)97); }
+  ck(110, http_parse_request(strbuf_finish_string(big), &req) == 0);
+
+  // ---- response: good ----
+  var res: HttpResponse;
+  var rtext: string = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nabcde";
+  r = http_parse_response(rtext, &res);
+  ck(111, r == (int64)rtext.length - 5);
+  ck(112, res.status == 404 && res.minor == 1 && res.reason == "Not Found" && res.nheaders == 2);
+  ck(113, res.head_len == r);
+  ck(114, res.headers[1].name == "Content-Length" && res.headers[1].value == "5");
+  ck(115, http_parse_response("HTTP/1.0 200 OK\r\n\r\n", &res) == 19 && res.minor == 0 && res.status == 200);
+  ck(116, http_parse_response("HTTP/1.1 204\r\nX: y\r\n\r\n", &res) > 0 && res.status == 204 && res.reason == "");
+  ck(117, http_parse_response("HTTP/1.1 204 \r\n\r\n", &res) > 0 && res.reason == "");
+  ck(118, http_parse_response("HTTP/1.1 200 OK is  fine\t!\r\n\r\n", &res) > 0 && res.reason == "OK is  fine\t!");
+  ck(119, http_parse_response("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\n", &res) == 25 && res.status == 100);
+  ck(120, http_parse_response("HTTP/1.1 599 x\r\n\r\n", &res) > 0 && res.status == 599);
+  ck(121, http_parse_response("HTTP/1.1 100 x\r\n\r\n", &res) > 0 && res.status == 100);
+  var partial_ok: bool = true;
+  for cut in 0..(int64)rtext.length - 5 {
+    var part: string;
+    part.chars = rtext.chars;
+    part.length = (uint64)cut;
+    if (http_parse_response(part, &res) != 0) { partial_ok = false; }
+  }
+  ck(122, partial_ok);
+
+  // ---- response: refused ----
+  ck(123, rs("HTTP/1.1 20 OK\r\n\r\n") == HTTP_ERR_STATUS);
+  ck(124, rs("HTTP/1.1 2000 OK\r\n\r\n") == HTTP_ERR_STATUS);
+  ck(125, rs("HTTP/1.1 099 x\r\n\r\n") == HTTP_ERR_STATUS);
+  ck(126, rs("HTTP/1.1 600 x\r\n\r\n") == HTTP_ERR_STATUS);
+  ck(127, rs("HTTP/1.1 2x0 x\r\n\r\n") == HTTP_ERR_STATUS);
+  ck(128, rs("HTTP/1.1  200 OK\r\n\r\n") == HTTP_ERR_STATUS);
+  ck(129, rs("HTTP/1.1 -20 OK\r\n\r\n") == HTTP_ERR_STATUS);
+  ck(130, rs("HTTP/2 200 OK\r\n\r\n") == HTTP_ERR_VERSION);
+  ck(131, rs("HTTP/1.2 200 OK\r\n\r\n") == HTTP_ERR_VERSION);
+  ck(132, rs("HTTP/1.1200 OK\r\n\r\n") == HTTP_ERR_START_LINE);
+  ck(133, rs("200 OK\r\n\r\n") == HTTP_ERR_START_LINE);
+  ck(134, rs("HTTP/1.1\r\n\r\n") == HTTP_ERR_START_LINE);
+  ck(135, rs("HTTP/1.1 200 OK\nX: y\n\n") == HTTP_ERR_BARE_LF);
+  ck(136, rs("HTTP/1.1 200 OK\r\nX: y\r\n z\r\n\r\n") == HTTP_ERR_OBS_FOLD);
+  ck(137, rs("HTTP/1.1 200 OK\r\nX y\r\n\r\n") == HTTP_ERR_HEADER);
+  ck(138, rs("HTTP/1.1 200 OK\r\nX: a\0b\r\n\r\n") == HTTP_ERR_NUL);
+  ck(139, rs("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n") == HTTP_ERR_LENGTH_CONFLICT);
+  ck(140, rs("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(141, rs("HTTP/1.1 200 OK\r\nContent-Length: five\r\n\r\n") == HTTP_ERR_CONTENT_LENGTH);
+  ck(142, rs("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n") == HTTP_ERR_TRANSFER_ENCODING);
+  ck(143, rs("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n") > 0);
+  ck(144, rs("HTTP/1.1 200 OK\r\n") == 0);
+  // a response needs no Host
+  ck(145, rs("HTTP/1.1 200 OK\r\nX: y\r\n\r\n") > 0);
+
+  // ---- body framing ----
+  ck(146, req_kind("GET / HTTP/1.1\r\nHost: a\r\n\r\n").kind == HTTP_BODY_NONE);
+  ck(147, req_kind("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 12\r\n\r\n").kind == HTTP_BODY_LENGTH);
+  ck(148, req_kind("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 12\r\n\r\n").length == 12);
+  ck(149, req_kind("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n").kind == HTTP_BODY_NONE);
+  ck(150, req_kind("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 7, 7\r\n\r\n").length == 7);
+  ck(151, req_kind("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n").kind == HTTP_BODY_CHUNKED);
+  ck(152, req_kind("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n").kind == -1);
+  ck(153, res_kind("HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n", false).kind == HTTP_BODY_LENGTH);
+  ck(154, res_kind("HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n", false).length == 12);
+  ck(155, res_kind("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false).kind == HTTP_BODY_NONE);
+  ck(156, res_kind("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", false).kind == HTTP_BODY_CHUNKED);
+  ck(157, res_kind("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", false).kind == HTTP_BODY_CHUNKED);
+  ck(158, res_kind("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", false).kind == HTTP_BODY_CLOSE);
+  ck(159, res_kind("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", false).kind == HTTP_BODY_CLOSE);
+  ck(160, res_kind("HTTP/1.1 200 OK\r\nServer: x\r\n\r\n", false).kind == HTTP_BODY_CLOSE);
+  ck(161, res_kind("HTTP/1.0 200 OK\r\n\r\n", false).kind == HTTP_BODY_CLOSE);
+  // HEAD, 1xx, 204 and 304 have no body, whatever the headers say
+  ck(162, res_kind("HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n", true).kind == HTTP_BODY_NONE);
+  ck(163, res_kind("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", true).kind == HTTP_BODY_NONE);
+  ck(164, res_kind("HTTP/1.1 204 No Content\r\nContent-Length: 12\r\n\r\n", false).kind == HTTP_BODY_NONE);
+  ck(165, res_kind("HTTP/1.1 204 No Content\r\n\r\n", false).kind == HTTP_BODY_NONE);
+  ck(166, res_kind("HTTP/1.1 304 Not Modified\r\nContent-Length: 12\r\n\r\n", false).kind == HTTP_BODY_NONE);
+  ck(167, res_kind("HTTP/1.1 100 Continue\r\nContent-Length: 12\r\n\r\n", false).kind == HTTP_BODY_NONE);
+  ck(168, res_kind("HTTP/1.1 101 Switching\r\n\r\n", false).kind == HTTP_BODY_NONE);
+  ck(169, res_kind("HTTP/1.1 199 x\r\n\r\n", false).kind == HTTP_BODY_NONE);
+  ck(170, res_kind("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n", false).kind == -1);
+  // the 0 in the ones above is a parse error; framing errors from the parser's own call are a code
+  var hand: HttpResponse;
+  hand.status = 200;
+  hand.nheaders = 2;
+  hand.headers[0].name = "Content-Length";
+  hand.headers[0].value = "3";
+  hand.headers[1].name = "content-length";
+  hand.headers[1].value = "4";
+  ck(171, http_response_body_kind(&hand, false).kind == HTTP_BODY_INVALID);
+  ck(172, http_response_body_kind(&hand, false).length == HTTP_ERR_CONTENT_LENGTH);
+
+  // ---- header helpers ----
+  ck(173, http_header_has_token("keep-alive, Upgrade", "upgrade"));
+  ck(174, http_header_has_token("keep-alive, Upgrade", "KEEP-ALIVE"));
+  ck(175, http_header_has_token("close", "close"));
+  ck(176, !http_header_has_token("closed", "close"));
+  ck(177, !http_header_has_token("close", "clos"));
+  ck(178, !http_header_has_token("", "close"));
+  ck(179, http_header_has_token(" , ,\tclose\t,", "close"));
+  ck(180, !http_header_has_token("a b", "a"));
+  ck(181, !http_header_has_token("x", ""));
+  var ka: HttpRequest;
+  http_parse_request("GET / HTTP/1.1\r\nHost: a\r\n\r\n", &ka);
+  ck(182, http_keep_alive(ka.minor, &ka.headers[0], ka.nheaders));
+  http_parse_request("GET / HTTP/1.1\r\nHost: a\r\nConnection: Close\r\n\r\n", &ka);
+  ck(183, !http_keep_alive(ka.minor, &ka.headers[0], ka.nheaders));
+  http_parse_request("GET / HTTP/1.1\r\nHost: a\r\nConnection: te\r\nConnection: x, close\r\n\r\n", &ka);
+  ck(184, !http_keep_alive(ka.minor, &ka.headers[0], ka.nheaders));
+  http_parse_request("GET / HTTP/1.0\r\n\r\n", &ka);
+  ck(185, !http_keep_alive(ka.minor, &ka.headers[0], ka.nheaders));
+  http_parse_request("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", &ka);
+  ck(186, http_keep_alive(ka.minor, &ka.headers[0], ka.nheaders));
+  ck(187, http_header_list_has(&ka.headers[0], ka.nheaders, "CONNECTION", "Keep-Alive"));
+
+  // ---- chunked decoder ----
+  var out: uint8[256];
+  var got: int64 = 0;
+  ck(188, chunk_everywhere("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", "hello world", HTTP_CHUNK_DONE));
+  ck(189, chunk_everywhere("0\r\n\r\n", "", HTTP_CHUNK_DONE));
+  ck(190, chunk_everywhere("A\r\n0123456789\r\na\r\nabcdefghij\r\n0\r\n\r\n", "0123456789abcdefghij", HTTP_CHUNK_DONE));
+  ck(191, chunk_everywhere("5;name=val;x\r\nhello\r\n0;done\r\n\r\n", "hello", HTTP_CHUNK_DONE));
+  ck(192, chunk_everywhere("5 ;x\r\nhello\r\n0 \r\n\r\n", "hello", HTTP_CHUNK_DONE));
+  ck(193, chunk_everywhere("3\r\nabc\r\n0\r\nX-Sum: 12\r\nTrailer-Two: yes\r\n\r\n", "abc", HTTP_CHUNK_DONE));
+  ck(194, chunk_everywhere("1\r\na\r\n1\r\nb\r\n1\r\nc\r\n0\r\n\r\n", "abc", HTTP_CHUNK_DONE));
+  ck(195, chunk_everywhere("00000003\r\nabc\r\n0000\r\n\r\n", "abc", HTTP_CHUNK_DONE));
+  // data that looks like framing is data
+  ck(196, chunk_everywhere("9\r\n0\r\n\r\n5\r\nx\r\n0\r\n\r\n", "0\r\n\r\n5\r\nx", HTTP_CHUNK_DONE));
+  // incomplete input stays MORE
+  ck(197, chunk_everywhere("5\r\nhello\r\n0\r\n", "hello", HTTP_CHUNK_MORE));
+  ck(198, chunk_everywhere("5\r\nhel", "hel", HTTP_CHUNK_MORE));
+  ck(199, chunk_everywhere("", "", HTTP_CHUNK_MORE));
+  // refused, at every split
+  ck(200, chunk_everywhere("g\r\nabc\r\n0\r\n\r\n", "", HTTP_ERR_CHUNK));
+  ck(201, chunk_everywhere("\r\nabc\r\n0\r\n\r\n", "", HTTP_ERR_CHUNK));
+  ck(202, chunk_everywhere("3\r\nabcXX0\r\n\r\n", "abc", HTTP_ERR_CHUNK));
+  ck(203, chunk_everywhere("3\r\nabc\rX0\r\n\r\n", "abc", HTTP_ERR_CHUNK));
+  ck(204, chunk_everywhere("3\nabc\r\n0\r\n\r\n", "", HTTP_ERR_CHUNK));
+  ck(205, chunk_everywhere("3\r\nabc\n0\r\n\r\n", "abc", HTTP_ERR_CHUNK));
+  ck(206, chunk_everywhere("3\rXabc\r\n0\r\n\r\n", "", HTTP_ERR_CHUNK));
+  ck(207, chunk_everywhere("-3\r\nabc\r\n", "", HTTP_ERR_CHUNK));
+  ck(208, chunk_everywhere("0x3\r\nabc\r\n", "", HTTP_ERR_CHUNK));
+  ck(209, chunk_everywhere("3;a\nb\r\nabc\r\n", "", HTTP_ERR_CHUNK));
+  ck(210, chunk_everywhere("0\r\n bad: trailer\r\n\r\n", "", HTTP_ERR_CHUNK));
+  ck(211, chunk_everywhere("0\r\nX: a\nb\r\n\r\n", "", HTTP_ERR_CHUNK));
+  ck(212, chunk_everywhere("0\r\n\r\r\n", "", HTTP_ERR_CHUNK));
+  ck(213, chunk_everywhere("FFFFFFFFFFFFFFFFFFFF\r\n", "", HTTP_ERR_BODY_TOO_LARGE));
+  ck(214, chunk_everywhere("0\r\nX: a\r\n", "", HTTP_CHUNK_MORE));
+  // a NUL in an extension, built from bytes
+  var ext: string = patched("3;abc\r\nabc\r\n0\r\n\r\n", 3, 0, &buf[0]);
+  ck(215, chunk_run(ext, 0, 100, &out[0], 256, &got) == HTTP_ERR_CHUNK);
+  ext = patched("3;abc\r\nabc\r\n0\r\n\r\n", 3, 1, &buf[0]);
+  ck(216, chunk_run(ext, 0, 100, &out[0], 256, &got) == HTTP_ERR_CHUNK);
+
+  // consumed stops at the end of the body; what follows is the next message
+  var piped: string = "3\r\nabc\r\n0\r\n\r\nGET / HTTP/1.1\r\n";
+  ck(217, chunk_run(piped, 0, 100, &out[0], 256, &got) == HTTP_CHUNK_DONE);
+  ck(218, g_used == 13 && got == 3);
+
+  // size limit
+  ck(219, chunk_run("6\r\nabcdef\r\n6\r\nghijkl\r\n0\r\n\r\n", 10, 100, &out[0], 256, &got) == HTTP_ERR_BODY_TOO_LARGE);
+  ck(220, chunk_run("6\r\nabcdef\r\n4\r\nghij\r\n0\r\n\r\n", 10, 100, &out[0], 256, &got) == HTTP_CHUNK_DONE);
+  ck(221, got == 10);
+  ck(222, chunk_run("B\r\nabcdefghijk\r\n0\r\n\r\n", 10, 100, &out[0], 256, &got) == HTTP_ERR_BODY_TOO_LARGE);
+  ck(223, chunk_run("7FFFFFFFFFFFFFFF\r\n", 1000, 100, &out[0], 256, &got) == HTTP_ERR_BODY_TOO_LARGE);
+  ck(224, chunk_run("7FFFFFFFFFFFFFFF\r\n", 0, 100, &out[0], 256, &got) == HTTP_CHUNK_MORE);
+
+  // an error is final
+  var dec: HttpChunkDecoder;
+  var fd: HttpChunkFeed;
+  http_chunk_init(&dec, 0);
+  ck(225, http_chunk_feed(&dec, "z".chars, 1, &out[0], 256, &fd) == HTTP_ERR_CHUNK);
+  ck(226, http_chunk_feed(&dec, "5\r\nhello\r\n".chars, 10, &out[0], 256, &fd) == HTTP_ERR_CHUNK);
+  ck(227, fd.consumed == 0 && fd.produced == 0);
+  // done stays done
+  http_chunk_init(&dec, 0);
+  ck(228, http_chunk_feed(&dec, "0\r\n\r\n".chars, 5, &out[0], 256, &fd) == HTTP_CHUNK_DONE);
+  ck(229, http_chunk_feed(&dec, "xyz".chars, 3, &out[0], 256, &fd) == HTTP_CHUNK_DONE);
+  ck(230, fd.consumed == 0);
+
+  // a small output buffer: FULL, then drain and feed the rest
+  var wire: string = "A\r\n0123456789\r\n5\r\nabcde\r\n0\r\n\r\n";
+  http_chunk_init(&dec, 0);
+  var off: int64 = 0;
+  var total: int64 = 0;
+  var small: uint8[4];
+  var collected: uint8[32];
+  var rc: int64 = HTTP_CHUNK_MORE;
+  var rounds: int32 = 0;
+  while (rc != HTTP_CHUNK_DONE && rounds < 100) {
+    rc = http_chunk_feed(&dec, wire.chars + off, (int64)wire.length - off, &small[0], 4, &fd);
+    for z in 0..fd.produced { collected[total + z] = small[z]; }
+    total = total + fd.produced;
+    off = off + fd.consumed;
+    rounds = rounds + 1;
+    if (rc < 0) { rounds = 1000; }
+  }
+  ck(231, rc == HTTP_CHUNK_DONE && total == 15 && bytes_are(&collected[0], total, "0123456789abcde"));
+  ck(232, off == (int64)wire.length);
+  // zero-size output buffer makes no progress on data but does not lose it
+  http_chunk_init(&dec, 0);
+  ck(233, http_chunk_feed(&dec, "3\r\nabc\r\n0\r\n\r\n".chars, 13, &small[0], 0, &fd) == HTTP_CHUNK_FULL);
+  ck(234, fd.consumed == 3 && fd.produced == 0);
+
+  // decoding in place: dst is src
+  var inplace: uint8[64];
+  var src_text: string = "5\r\nhello\r\n6\r\n world\r\n0\r\nT: 1\r\n\r\n";
+  for z in 0..(int64)src_text.length { inplace[z] = src_text.chars[z]; }
+  http_chunk_init(&dec, 0);
+  ck(235, http_chunk_feed(&dec, &inplace[0], (int64)src_text.length, &inplace[0], 64, &fd) == HTTP_CHUNK_DONE);
+  ck(236, bytes_are(&inplace[0], fd.produced, "hello world"));
+
+  // ---- URLs ----
+  var u: HttpUrl;
+  ck(237, http_url_parse("http://example.com/a/b?x=1&y=2#frag", &u) == 0);
+  ck(238, u.scheme == "http" && u.host == "example.com" && u.port == 80 && u.path == "/a/b");
+  ck(239, u.query == "x=1&y=2" && u.fragment == "frag" && u.tls == 0 && u.ipv6 == 0 && u.userinfo == "");
+  ck(240, http_url_parse("https://example.com", &u) == 0);
+  ck(241, u.port == 443 && u.tls == 1 && u.path == "/" && u.query == "" && u.fragment == "");
+  ck(242, http_url_parse("HTTP://Example.COM:8080/p", &u) == 0);
+  ck(243, u.scheme == "HTTP" && u.host == "Example.COM" && u.port == 8080 && u.path == "/p");
+  ck(244, http_url_parse("http://h:1/", &u) == 0 && u.port == 1);
+  ck(245, http_url_parse("http://h:65535/", &u) == 0 && u.port == 65535);
+  ck(246, http_url_parse("http://h:/x", &u) == 0 && u.port == 80 && u.path == "/x");
+  ck(247, http_url_parse("http://h?q=1", &u) == 0 && u.path == "/" && u.query == "q=1");
+  ck(248, http_url_parse("http://h#f", &u) == 0 && u.path == "/" && u.query == "" && u.fragment == "f");
+  ck(249, http_url_parse("http://h/p#a?b", &u) == 0 && u.path == "/p" && u.query == "" && u.fragment == "a?b");
+  ck(250, http_url_parse("http://h/p?a?b=c", &u) == 0 && u.query == "a?b=c");
+  ck(251, http_url_parse("http://h/p?", &u) == 0 && u.query == "");
+  ck(252, http_url_parse("http://h/a//b/", &u) == 0 && u.path == "/a//b/");
+  ck(253, http_url_parse("http://user:pw@h:81/p", &u) == 0 && u.userinfo == "user:pw" && u.host == "h" && u.port == 81);
+  ck(254, http_url_parse("http://a@b@h/p", &u) == 0 && u.userinfo == "a@b" && u.host == "h");
+  ck(255, http_url_parse("http://127.0.0.1:3000/x", &u) == 0 && u.host == "127.0.0.1" && u.port == 3000);
+  ck(256, http_url_parse("http://[::1]/", &u) == 0 && u.host == "::1" && u.ipv6 == 1 && u.port == 80);
+  ck(257, http_url_parse("http://[2001:db8::7]:9090/p?q", &u) == 0 && u.host == "2001:db8::7" && u.port == 9090 && u.query == "q");
+  ck(258, http_url_parse("https://[fe80::1%25eth0]/", &u) == 0 && u.host == "fe80::1%25eth0" && u.port == 443);
+  ck(259, http_url_parse("ws://h/s", &u) == 0 && u.port == 80 && u.tls == 0);
+  ck(260, http_url_parse("wss://h/s", &u) == 0 && u.port == 443 && u.tls == 1);
+  ck(261, http_url_parse("http://h/%7Ea%20b", &u) == 0 && u.path == "/%7Ea%20b");
+  // views point into the url text
+  var ut: string = "http://h.example/p?q=1";
+  ck(262, http_url_parse(ut, &u) == 0 && u.host.chars == ut.chars + 7 && u.query.chars == ut.chars + 19);
+  // refused
+  ck(263, http_url_parse("", &u) == HTTP_ERR_URL);
+  ck(264, http_url_parse("example.com/x", &u) == HTTP_ERR_URL);
+  ck(265, http_url_parse("//example.com/x", &u) == HTTP_ERR_URL);
+  ck(266, http_url_parse("/x", &u) == HTTP_ERR_URL);
+  ck(267, http_url_parse("http:/h/x", &u) == HTTP_ERR_URL);
+  ck(268, http_url_parse("http:", &u) == HTTP_ERR_URL);
+  ck(269, http_url_parse("http://", &u) == HTTP_ERR_URL);
+  ck(270, http_url_parse("http:///x", &u) == HTTP_ERR_URL);
+  ck(271, http_url_parse("ftp://h/x", &u) == HTTP_ERR_URL);
+  ck(272, http_url_parse("file:///x", &u) == HTTP_ERR_URL);
+  ck(273, http_url_parse("http://h:99999/", &u) == HTTP_ERR_URL);
+  ck(274, http_url_parse("http://h:65536/", &u) == HTTP_ERR_URL);
+  ck(275, http_url_parse("http://h:0/", &u) == HTTP_ERR_URL);
+  ck(276, http_url_parse("http://h:80a/", &u) == HTTP_ERR_URL);
+  ck(277, http_url_parse("http://h:-1/", &u) == HTTP_ERR_URL);
+  ck(278, http_url_parse("http://h:123456/", &u) == HTTP_ERR_URL);
+  ck(279, http_url_parse("http://h :80/", &u) == HTTP_ERR_URL);
+  ck(280, http_url_parse("http://h/a b", &u) == HTTP_ERR_URL);
+  ck(281, http_url_parse("http://h/a\r\nHost: evil", &u) == HTTP_ERR_URL);
+  ck(282, http_url_parse("http://h/\0", &u) == HTTP_ERR_URL);
+  ck(283, http_url_parse("http://h<x>/", &u) == HTTP_ERR_URL);
+  ck(284, http_url_parse("http://[::1/", &u) == HTTP_ERR_URL);
+  ck(285, http_url_parse("http://[]/", &u) == HTTP_ERR_URL);
+  ck(286, http_url_parse("http://[1.2.3.4]/", &u) == HTTP_ERR_URL);
+  ck(287, http_url_parse("http://[::1]x/", &u) == HTTP_ERR_URL);
+  ck(288, http_url_parse("http://[::1]:/", &u) == 0);
+  ck(289, http_url_parse("http://[g::1]/", &u) == HTTP_ERR_URL);
+  ck(290, http_url_parse("http://h]/", &u) == HTTP_ERR_URL);
+  ck(291, http_url_parse("1http://h/", &u) == HTTP_ERR_URL);
+  ck(292, http_url_parse("http://café/", &u) == HTTP_ERR_URL);
+
+  // ---- percent encoding and queries ----
+  var dbuf: uint8[64];
+  ck(293, http_percent_decode("a%20b%2Fc%2fd", &dbuf[0], 64, false) == 7 && bytes_are(&dbuf[0], 7, "a b/c/d"));
+  ck(294, http_percent_decode("a+b", &dbuf[0], 64, false) == 3 && bytes_are(&dbuf[0], 3, "a+b"));
+  ck(295, http_percent_decode("a+b", &dbuf[0], 64, true) == 3 && bytes_are(&dbuf[0], 3, "a b"));
+  ck(296, http_percent_decode("", &dbuf[0], 64, true) == 0);
+  ck(297, http_percent_decode("%41%42", &dbuf[0], 2, false) == 2 && bytes_are(&dbuf[0], 2, "AB"));
+  ck(298, http_percent_decode("%41%42", &dbuf[0], 1, false) == HTTP_ERR_TOO_SMALL);
+  ck(299, http_percent_decode("abc", &dbuf[0], 2, false) == HTTP_ERR_TOO_SMALL);
+  ck(300, http_percent_decode("%4", &dbuf[0], 64, false) == HTTP_ERR_ESCAPE);
+  ck(301, http_percent_decode("%", &dbuf[0], 64, false) == HTTP_ERR_ESCAPE);
+  ck(302, http_percent_decode("a%", &dbuf[0], 64, false) == HTTP_ERR_ESCAPE);
+  ck(303, http_percent_decode("%zz", &dbuf[0], 64, false) == HTTP_ERR_ESCAPE);
+  ck(304, http_percent_decode("%4g", &dbuf[0], 64, false) == HTTP_ERR_ESCAPE);
+  ck(305, http_percent_decode("%%41", &dbuf[0], 64, false) == HTTP_ERR_ESCAPE);
+  ck(306, http_percent_decode("%00", &dbuf[0], 64, false) == 1 && (int32)dbuf[0] == 0);
+  ck(307, http_percent_decode("%C3%A9", &dbuf[0], 64, false) == 2 && (int32)dbuf[0] == 195 && (int32)dbuf[1] == 169);
+  ck(308, http_percent_decode("%25", &dbuf[0], 64, false) == 1 && (int32)dbuf[0] == 37);
+
+  var qs: string = "a=1&b=hello%20world&c&&d=&e=x+y&f%6Fo=bar&a=2&g=%zz&h=%7B";
+  match (http_query_find(qs, "a")) {
+    case Some(v): { ck(309, v == "1"); }
+    case None: { ck(310, false); }
+  }
+  match (http_query_find(qs, "b")) {
+    case Some(v): { ck(311, v == "hello%20world"); }
+    case None: { ck(312, false); }
+  }
+  match (http_query_find(qs, "c")) {
+    case Some(v): { ck(313, v == ""); }
+    case None: { ck(314, false); }
+  }
+  match (http_query_find(qs, "d")) {
+    case Some(v): { ck(315, v == ""); }
+    case None: { ck(316, false); }
+  }
+  match (http_query_find(qs, "foo")) {
+    case Some(v): { ck(317, v == "bar"); }
+    case None: { ck(318, false); }
+  }
+  match (http_query_find(qs, "A")) {
+    case Some(v): { ck(319, false); }
+    case None: { ck(320, true); }
+  }
+  match (http_query_find(qs, "zzz")) {
+    case Some(v): { ck(321, false); }
+    case None: { ck(322, true); }
+  }
+  match (http_query_find("", "a")) {
+    case Some(v): { ck(323, false); }
+    case None: { ck(324, true); }
+  }
+  ck(325, http_query_get(qs, "b", &dbuf[0], 64) == 11 && bytes_are(&dbuf[0], 11, "hello world"));
+  ck(326, http_query_get(qs, "e", &dbuf[0], 64) == 3 && bytes_are(&dbuf[0], 3, "x y"));
+  ck(327, http_query_get(qs, "h", &dbuf[0], 64) == 1 && (int32)dbuf[0] == 123);
+  ck(328, http_query_get(qs, "d", &dbuf[0], 64) == 0);
+  ck(329, http_query_get(qs, "g", &dbuf[0], 64) == HTTP_ERR_ESCAPE);
+  ck(330, http_query_get(qs, "b", &dbuf[0], 4) == HTTP_ERR_TOO_SMALL);
+  ck(331, http_query_get(qs, "nope", &dbuf[0], 64) == HTTP_ERR_ABSENT);
+  // stepping through the pairs
+  var pos: int64 = 0;
+  var qk: string;
+  var qv: string;
+  var pairs: int32 = 0;
+  while (http_query_next(qs, &pos, &qk, &qv)) { pairs = pairs + 1; }
+  ck(332, pairs == 9);
+  pos = 0;
+  ck(333, http_query_next("x=1=2", &pos, &qk, &qv) && qk == "x" && qv == "1=2");
+  ck(334, !http_query_next("x=1=2", &pos, &qk, &qv));
+  pos = 0;
+  ck(335, !http_query_next("&&", &pos, &qk, &qv));
+  // encoding
+  var a2: Arena* = arena_init(0);
+  var eb: StrBuf* = strbuf_new(a2, 16);
+  ck(336, http_percent_encode(eb, "a b/c?d=é~-._Z9") == 28);
+  ck(337, strbuf_finish_string(eb) == "a%20b%2Fc%3Fd%3D%C3%A9~-._Z9");
+  eb->len = 0;
+  ck(338, http_percent_encode(eb, "") == 0);
+  http_percent_encode(eb, "\r\n %");
+  ck(339, strbuf_finish_string(eb) == "%0D%0A%20%25");
+  // encode then decode is the identity
+  eb->len = 0;
+  http_percent_encode(eb, "q=1&r=2 é/\t+");
+  ck(340, http_percent_decode(strbuf_finish_string(eb), &dbuf[0], 64, true) == 13 && bytes_are(&dbuf[0], 13, "q=1&r=2 é/\t+"));
+
+  // ---- writers ----
+  var wa: Arena* = arena_init(0);
+  var wb: StrBuf* = strbuf_new(wa, 8);
+  var hs: HttpHeader[3];
+  hs[0].name = "Host";
+  hs[0].value = "example.com";
+  hs[1].name = "Accept";
+  hs[1].value = "text/html";
+  hs[2].name = "X-Tab";
+  hs[2].value = "a\tb";
+  ck(341, http_write_request_head(wb, "GET", "/p?q=1", &hs[0], 3) == 73);
+  ck(342, strbuf_finish_string(wb) == "GET /p?q=1 HTTP/1.1\r\nHost: example.com\r\nAccept: text/html\r\nX-Tab: a\tb\r\n\r\n");
+  // what we write, we parse
+  var back: HttpRequest;
+  ck(343, http_parse_request(strbuf_finish_string(wb), &back) == strbuf_len(wb));
+  ck(344, back.verb == "GET" && back.target == "/p?q=1" && back.nheaders == 3 && back.headers[2].value == "a\tb");
+  wb->len = 0;
+  ck(345, http_write_request_head(wb, "POST", "/", &hs[0], 0) == 19);
+  ck(346, strbuf_finish_string(wb) == "POST / HTTP/1.1\r\n\r\n");
+
+  wb->len = 0;
+  ck(347, http_write_response_head(wb, 200, "", &hs[1], 1) > 0);
+  ck(348, strbuf_finish_string(wb) == "HTTP/1.1 200 OK\r\nAccept: text/html\r\n\r\n");
+  wb->len = 0;
+  ck(349, http_write_response_head(wb, 418, "I am a teapot", &hs[0], 0) > 0);
+  ck(350, strbuf_finish_string(wb) == "HTTP/1.1 418 I am a teapot\r\n\r\n");
+  var back_res: HttpResponse;
+  ck(351, http_parse_response(strbuf_finish_string(wb), &back_res) == strbuf_len(wb) && back_res.status == 418 && back_res.reason == "I am a teapot");
+  wb->len = 0;
+  ck(352, http_write_response_head(wb, 599, "", &hs[0], 0) > 0);
+  ck(353, strbuf_finish_string(wb) == "HTTP/1.1 599 Unknown\r\n\r\n");
+  // appends after what is there
+  ck(354, http_write_response_head(wb, 404, "", &hs[0], 0) > 0);
+  ck(355, strbuf_finish_string(wb) == "HTTP/1.1 599 Unknown\r\n\r\nHTTP/1.1 404 Not Found\r\n\r\n");
+
+  // injection is refused, and nothing is appended
+  var bad: HttpHeader[1];
+  wb->len = 0;
+  bad[0].name = "X";
+  bad[0].value = "a\r\nInjected: yes";
+  ck(356, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_VALUE && wb->len == 0);
+  ck(357, http_write_response_head(wb, 200, "", &bad[0], 1) == HTTP_ERR_VALUE && wb->len == 0);
+  bad[0].value = "a\nb";
+  ck(358, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_VALUE);
+  bad[0].value = "a\rb";
+  ck(359, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_VALUE);
+  bad[0].value = "a\0b";
+  ck(360, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_VALUE);
+  bad[0].value = patched("abc", 1, 1, &buf[0]);
+  ck(361, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_VALUE);
+  bad[0].value = patched("abc", 1, 127, &buf[0]);
+  ck(362, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_VALUE);
+  bad[0].value = "";
+  ck(363, http_write_request_head(wb, "GET", "/", &bad[0], 1) > 0);
+  wb->len = 0;
+  bad[0].value = "ok";
+  bad[0].name = "X Y";
+  ck(364, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_NAME);
+  bad[0].name = "X:Y";
+  ck(365, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_NAME);
+  bad[0].name = "X\r\nY";
+  ck(366, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_NAME);
+  bad[0].name = "";
+  ck(367, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_NAME);
+  bad[0].name = "X\0";
+  ck(368, http_write_request_head(wb, "GET", "/", &bad[0], 1) == HTTP_ERR_NAME);
+  ck(369, wb->len == 0);
+  // a bad header late in the list still leaves the buffer untouched
+  hs[2].value = "x\ny";
+  ck(370, http_write_request_head(wb, "GET", "/", &hs[0], 3) == HTTP_ERR_VALUE && wb->len == 0);
+  hs[2].value = "a\tb";
+  ck(371, http_write_request_head(wb, "GE T", "/", &hs[0], 0) == HTTP_ERR_METHOD);
+  ck(372, http_write_request_head(wb, "", "/", &hs[0], 0) == HTTP_ERR_METHOD);
+  ck(373, http_write_request_head(wb, "GET\r\nX: y", "/", &hs[0], 0) == HTTP_ERR_METHOD);
+  ck(374, http_write_request_head(wb, "GET", "", &hs[0], 0) == HTTP_ERR_TARGET);
+  ck(375, http_write_request_head(wb, "GET", "/a b", &hs[0], 0) == HTTP_ERR_TARGET);
+  ck(376, http_write_request_head(wb, "GET", "/a\r\nHost: evil", &hs[0], 0) == HTTP_ERR_TARGET);
+  ck(377, http_write_request_head(wb, "GET", "/é", &hs[0], 0) == HTTP_ERR_TARGET);
+  ck(378, http_write_response_head(wb, 99, "", &hs[0], 0) == HTTP_ERR_STATUS);
+  ck(379, http_write_response_head(wb, 600, "", &hs[0], 0) == HTTP_ERR_STATUS);
+  ck(380, http_write_response_head(wb, 200, "OK\r\nX: y", &hs[0], 0) == HTTP_ERR_VALUE);
+  ck(381, wb->len == 0);
+  // single header
+  ck(382, http_write_header(wb, "X-One", "1") == 10 && strbuf_finish_string(wb) == "X-One: 1\r\n");
+  ck(383, http_write_header(wb, "X-Two", "1\r\n") == HTTP_ERR_VALUE && wb->len == 10);
+  ck(384, http_write_header(wb, "X Two", "1") == HTTP_ERR_NAME && wb->len == 10);
+  ck(385, http_valid_token("Content-Type") && !http_valid_token("") && !http_valid_token("a b") && !http_valid_token("a:b"));
+  ck(386, http_valid_field_value("") && http_valid_field_value("a b\tc") && !http_valid_field_value("a\nb"));
+
+  // chunks
+  wb->len = 0;
+  var cb: uint8[8];
+  cb[0] = (uint8)104;
+  cb[1] = (uint8)105;
+  ck(387, http_write_chunk(wb, &cb[0], 2) == 7);
+  ck(388, http_write_chunk(wb, &cb[0], 0) == 0);
+  ck(389, http_write_chunk(wb, &cb[0], -5) == 0);
+  var tall: uint8[300];
+  for z in 0..300 { tall[z] = (uint8)65; }
+  ck(390, http_write_chunk(wb, &tall[0], 300) == 307);
+  ck(391, http_write_last_chunk(wb) == 5);
+  var cw: string = strbuf_finish_string(wb);
+  ck(392, bytes_are(cw.chars, 16, "2\r\nhi\r\n12c\r\nAAAA"));
+  ck(393, cw.chars[cw.length - 1] == (uint8)10 && cw.chars[cw.length - 5] == (uint8)48);
+  // what the writer writes, the decoder reads
+  var dec2: HttpChunkDecoder;
+  var fd2: HttpChunkFeed;
+  var outbuf: uint8[400];
+  http_chunk_init(&dec2, 0);
+  ck(394, http_chunk_feed(&dec2, cw.chars, (int64)cw.length, &outbuf[0], 400, &fd2) == HTTP_CHUNK_DONE);
+  ck(395, fd2.produced == 302 && fd2.consumed == (int64)cw.length && (int32)outbuf[0] == 104 && (int32)outbuf[301] == 65);
+  wb->len = 0;
+  var tr: HttpHeader[1];
+  tr[0].name = "X-Sum";
+  tr[0].value = "7";
+  ck(396, http_write_last_chunk_trailers(wb, &tr[0], 1) == 15);
+  ck(397, strbuf_finish_string(wb) == "0\r\nX-Sum: 7\r\n\r\n");
+  http_chunk_init(&dec2, 0);
+  ck(398, http_chunk_feed(&dec2, wb->data, wb->len, &outbuf[0], 400, &fd2) == HTTP_CHUNK_DONE);
+  tr[0].value = "7\r\n\r\nHTTP/1.1 200 OK";
+  wb->len = 0;
+  ck(399, http_write_last_chunk_trailers(wb, &tr[0], 1) == HTTP_ERR_VALUE && wb->len == 0);
+
+  // status text
+  ck(400, http_status_text(200) == "OK" && http_status_text(404) == "Not Found" && http_status_text(500) == "Internal Server Error");
+  ck(401, http_status_text(301) == "Moved Permanently" && http_status_text(204) == "No Content" && http_status_text(999) == "Unknown");
+  ck(402, http_error_text(HTTP_ERR_CHUNK) == "bad chunked framing" && http_error_text(0) == "ok" && http_error_text(-999) == "unknown error");
+
+
+  // ---- http_read_head over loopback, in one thread ----
+  var any: NetAddr = net_addr_loopback(NET_IPV4, 0);
+  var lfd: int64 = 0;
+  match (tcp_listen(&any, 16)) {
+    case Ok(fd): { lfd = fd; }
+    case Err(e): { lfd = -1; }
+  }
+  ck(403, lfd >= 0);
+  var bound: NetAddr;
+  sock_local_addr(lfd, &bound);
+  var cfd: int64 = 0;
+  match (tcp_connect("127.0.0.1", bound.port, (int64)2000)) {
+    case Ok(fd): { cfd = fd; }
+    case Err(e): { cfd = -1; }
+  }
+  var sfd: int64 = sock_accept(lfd, (NetAddr*)0);
+  ck(404, cfd >= 0 && sfd >= 0);
+  var rb: uint8[512];
+  var he: int64 = 0;
+  // head and the start of a body arrive together
+  var msg: string = "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\nab";
+  sock_send_all(cfd, msg.chars, (int64)msg.length);
+  var nbuf: int64 = http_read_head(sfd, &rb[0], 512, 0, 1000, &he);
+  ck(405, nbuf == (int64)msg.length && he == (int64)msg.length - 2);
+  ck(406, rb[he] == (uint8)97 && rb[he + 1] == (uint8)98);
+  // a head that comes in two pieces
+  var msg2: string = "GET /y HTTP/1.1\r\nHost: a\r\n\r\n";
+  sock_send_all(cfd, msg2.chars, 10);
+  sock_send_all(cfd, msg2.chars + 10, (int64)msg2.length - 10);
+  nbuf = http_read_head(sfd, &rb[0], 512, 0, 1000, &he);
+  ck(407, nbuf == (int64)msg2.length && he == (int64)msg2.length);
+  // leftover bytes that already hold a whole head need no read
+  for z in 0..(int64)msg2.length { rb[z] = msg2.chars[z]; }
+  nbuf = http_read_head(sfd, &rb[0], 512, (int64)msg2.length, 1000, &he);
+  ck(408, nbuf == (int64)msg2.length && he == (int64)msg2.length);
+  // a partial head times out
+  sock_send_all(cfd, "GET /z HT".chars, 9);
+  var t0: int64 = net_now_ms();
+  nbuf = http_read_head(sfd, &rb[0], 512, 0, 150, &he);
+  ck(409, nbuf == HTTP_ERR_TIMEOUT);
+  ck(410, net_now_ms() - t0 >= 100 && net_now_ms() - t0 < 2000);
+  // a trickle that never finishes is cut at the total deadline
+  nbuf = http_read_head(sfd, &rb[0], 512, 0, 100, &he);
+  ck(411, nbuf == HTTP_ERR_TIMEOUT);
+  // bytes read before an error are gone: the caller drops the connection
+  sock_send_all(cfd, msg2.chars, (int64)msg2.length);
+  nbuf = http_read_head(sfd, &rb[0], 512, 0, 1000, &he);
+  ck(412, nbuf == (int64)msg2.length && he == (int64)msg2.length);
+  // junk is refused early
+  sock_send_all(cfd, "GET / HTTP/1.1\nHo".chars, 17);
+  nbuf = http_read_head(sfd, &rb[0], 512, 0, 1000, &he);
+  ck(413, nbuf == HTTP_ERR_BARE_LF);
+  // too big for the buffer
+  var junk: uint8[600];
+  for z in 0..600 { junk[z] = (uint8)120; }
+  sock_send_all(cfd, "GET /".chars, 5);
+  sock_send_all(cfd, &junk[0], 600);
+  nbuf = http_read_head(sfd, &rb[0], 512, 0, 1000, &he);
+  ck(414, nbuf == HTTP_ERR_HEAD_TOO_LARGE);
+  // the peer closes in the middle of a head
+  sock_close(cfd);
+  nbuf = http_read_head(sfd, &rb[0], 512, 0, 1000, &he);
+  ck(415, nbuf == HTTP_ERR_HEAD_TOO_LARGE || nbuf == HTTP_ERR_CLOSED);
+  sock_close(sfd);
+  sock_close(lfd);
+
+  // clean close with nothing buffered
+  var l2: int64 = 0;
+  match (tcp_listen(&any, 4)) { case Ok(fd): { l2 = fd; } case Err(e): { l2 = -1; } }
+  sock_local_addr(l2, &bound);
+  match (tcp_connect("127.0.0.1", bound.port, (int64)2000)) { case Ok(fd): { cfd = fd; } case Err(e): { cfd = -1; } }
+  sfd = sock_accept(l2, (NetAddr*)0);
+  sock_send_all(cfd, "GET / HT".chars, 8);
+  sock_close(cfd);
+  nbuf = http_read_head(sfd, &rb[0], 512, 0, 1000, &he);
+  ck(416, nbuf == HTTP_ERR_CLOSED);
+  sock_close(sfd);
+  sock_close(l2);
+
+  // ---- the client: refusals that need no server ----
+  var ca: Arena* = arena_init(0);
+  ck(417, err_of(http_get(ca, "https://example.com/", 1000)) == "TLS is not supported yet");
+  ck(418, err_of(http_get(ca, "example.com/", 1000)) == "bad URL");
+  ck(419, err_of(http_get(ca, "ws://127.0.0.1/", 1000)) == "not an http URL");
+  ck(420, err_of(http_get(ca, "http://127.0.0.1/a b", 1000)) == "bad URL");
+  var inj: HttpHeader[1];
+  inj[0].name = "X";
+  inj[0].value = "a\r\nInjected: 1";
+  ck(421, err_of(http_request(ca, "GET", "http://127.0.0.1:9/", &inj[0], 1, "", 1000)) == "bad header value");
+  inj[0].name = "Content-Length";
+  inj[0].value = "5";
+  ck(422, err_of(http_request(ca, "GET", "http://127.0.0.1:9/", &inj[0], 1, "", 1000)) != "");
+  inj[0].name = "transfer-encoding";
+  ck(423, err_of(http_request(ca, "GET", "http://127.0.0.1:9/", &inj[0], 1, "", 1000)) != "");
+  inj[0].name = "Connection";
+  ck(424, err_of(http_request(ca, "GET", "http://127.0.0.1:9/", &inj[0], 1, "", 1000)) != "");
+  ck(425, err_of(http_request(ca, "GE T", "http://127.0.0.1:9/", (HttpHeader*)0, 0, "", 1000)) == "bad method");
+
+  // ---- the client against a loopback server ----
+  match (tcp_listen(&any, 16)) { case Ok(fd): { g_listen = fd; } case Err(e): { g_listen = -1; } }
+  ck(426, g_listen >= 0);
+  var sa: NetAddr;
+  sock_local_addr(g_listen, &sa);
+  var tid: uint32 = 0;
+  var th: int64 = CreateThread((cstring)0, (uint64)0, &server_main, (cstring)0, (uint32)0, &tid);
+  ck(427, th != 0);
+
+  // 0: Content-Length body, a query, headers with repeats
+  var rr: HttpClientResponse* = resp_of(http_get(ca, url_for(ca, sa.port, "/path?q=1&r=%20"), 3000));
+  ck(428, rr != (HttpClientResponse*)0);
+  ck(429, rr->status == 200 && rr->reason == "OK" && rr->body == "hello" && rr->nheaders == 4);
+  ck(430, rr->body.chars[5] == (uint8)0);
+  match (http_header(rr->headers, rr->nheaders, "x-a")) {
+    case Some(v): { ck(431, v == "b"); }
+    case None: { ck(432, false); }
+  }
+  ck(433, http_header_find(rr->headers, rr->nheaders, "set-cookie", 3) == 3 && http_header_find(rr->headers, rr->nheaders, "set-cookie", 0) == 2);
+  var sreq: HttpRequest;
+  ck(434, http_parse_request(seen_text(0), &sreq) > 0);
+  ck(435, sreq.verb == "GET" && sreq.target == "/path?q=1&r=%20" && sreq.minor == 1);
+  ck(436, sreq.nheaders == 2);
+  match (http_header(&sreq.headers[0], sreq.nheaders, "Host")) {
+    case Some(v): { ck(437, v == "127.0.0.1:{sa.port}"); }
+    case None: { ck(438, false); }
+  }
+  match (http_header(&sreq.headers[0], sreq.nheaders, "Connection")) {
+    case Some(v): { ck(439, v == "close"); }
+    case None: { ck(440, false); }
+  }
+
+  // 1: POST with a body, extra header; the reply is chunked and arrives in pieces
+  var ph: HttpHeader[2];
+  ph[0].name = "X-Custom";
+  ph[0].value = "yes";
+  ph[1].name = "Content-Type";
+  ph[1].value = "text/plain";
+  rr = resp_of(http_request(ca, "POST", url_for(ca, sa.port, "/submit"), &ph[0], 2, "ping", 3000));
+  ck(441, rr != (HttpClientResponse*)0 && rr->status == 200 && rr->body == "abcdefg");
+  ck(442, http_parse_request(seen_text(1), &sreq) > 0 && sreq.verb == "POST" && sreq.target == "/submit");
+  match (http_header(&sreq.headers[0], sreq.nheaders, "content-length")) {
+    case Some(v): { ck(443, v == "4"); }
+    case None: { ck(444, false); }
+  }
+  match (http_header(&sreq.headers[0], sreq.nheaders, "x-custom")) {
+    case Some(v): { ck(445, v == "yes"); }
+    case None: { ck(446, false); }
+  }
+  ck(447, seen_text(1).length == (uint64)sreq.head_len + 4 && seen_text(1).chars[sreq.head_len] == (uint8)112);
+
+  // 2: body runs until close
+  rr = resp_of(http_get(ca, url_for(ca, sa.port, "/"), 3000));
+  ck(448, rr != (HttpClientResponse*)0 && rr->status == 200 && rr->body == "stream until close");
+
+  // 3: interim 100 is skipped
+  rr = resp_of(http_get(ca, url_for(ca, sa.port, "/"), 3000));
+  ck(449, rr != (HttpClientResponse*)0 && rr->status == 404 && rr->reason == "Not Found" && rr->body == "no");
+
+  // 4: HEAD reads no body whatever Content-Length says
+  rr = resp_of(http_request(ca, "HEAD", url_for(ca, sa.port, "/"), (HttpHeader*)0, 0, "", 3000));
+  ck(450, rr != (HttpClientResponse*)0 && rr->status == 200 && rr->body.length == 0);
+  ck(451, http_parse_request(seen_text(4), &sreq) > 0 && sreq.verb == "HEAD" && sreq.nheaders == 2);
+
+  // 5: the server closes before the body is complete
+  ck(452, err_of(http_get(ca, url_for(ca, sa.port, "/"), 3000)) == "connection closed early");
+  // 6: a bad status line
+  ck(453, err_of(http_get(ca, url_for(ca, sa.port, "/"), 3000)) == "bad status code");
+  // 7: the server never answers
+  var t1: int64 = net_now_ms();
+  ck(454, err_of(http_get(ca, url_for(ca, sa.port, "/"), 100)) == "timed out");
+  ck(455, net_now_ms() - t1 < 380);
+  // 8: chunked after another coding, with an extension and trailers
+  rr = resp_of(http_get(ca, url_for(ca, sa.port, "/"), 3000));
+  ck(456, rr != (HttpClientResponse*)0 && rr->body == "hello world" && rr->nheaders == 1);
+  // 9: Content-Length together with Transfer-Encoding is refused
+  ck(457, err_of(http_get(ca, url_for(ca, sa.port, "/"), 3000)) == "Content-Length with Transfer-Encoding");
+  // 10: 204 has no body even with a Content-Length
+  rr = resp_of(http_get(ca, url_for(ca, sa.port, "/"), 3000));
+  ck(458, rr != (HttpClientResponse*)0 && rr->status == 204 && rr->body.length == 0);
+  // 11: a caller Host replaces the default one, and an empty POST still sends Content-Length: 0
+  var hh: HttpHeader[1];
+  hh[0].name = "host";
+  hh[0].value = "virtual.example";
+  rr = resp_of(http_request(ca, "POST", url_for(ca, sa.port, "/"), &hh[0], 1, "", 3000));
+  ck(459, rr != (HttpClientResponse*)0 && rr->status == 200 && rr->body.length == 0);
+  ck(460, http_parse_request(seen_text(11), &sreq) > 0 && sreq.nheaders == 3);
+  match (http_header(&sreq.headers[0], sreq.nheaders, "Host")) {
+    case Some(v): { ck(461, v == "virtual.example"); }
+    case None: { ck(462, false); }
+  }
+  match (http_header(&sreq.headers[0], sreq.nheaders, "Content-Length")) {
+    case Some(v): { ck(463, v == "0"); }
+    case None: { ck(464, false); }
+  }
+  thread_join_infinite(th);
+  ck(465, g_server_err == 0);
+  sock_close(g_listen);
+
+  // nobody listens any more
+  ck(466, str_starts_with(err_of(http_get(ca, url_for(ca, sa.port, "/"), 1000)), "connect failed: ") == 1);
+  arena_free(ca);
+
+  arena_free(wa);
+  arena_free(a2);
+  arena_free(arena);
+  // An exit code holds 8 bits; the failing check number is printed in full.
+  if (g_fail != 0) { return 1 + (g_fail - 1) % 255; }
+  return 0;
+}
