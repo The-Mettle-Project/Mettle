@@ -484,6 +484,19 @@ $cases = @(
     Expected      = "ok"
   },
   @{
+    Name          = "inline_scalar_param_index"
+    Path          = "tests/test_inline_scalar_param_index.mettle"
+    ShouldSucceed = $true
+    Expected      = "ok"
+  },
+  @{
+    Name          = "inline_scalar_param_index_release"
+    Path          = "tests/test_inline_scalar_param_index.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--emit-obj")
+    Expected      = "ok"
+  },
+  @{
     Name          = "naked_interrupt"
     Path          = "tests/test_naked_interrupt.mettle"
     ShouldSucceed = $true

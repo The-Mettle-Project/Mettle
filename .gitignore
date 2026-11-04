@@ -29,8 +29,7 @@ docs/linker-implementation-todo.md
 examples/tracy_demo/tracy_dir.local.bat
 .mettle/
 *.log
-.elfwork/*
-!.elfwork/build_and_test.sh
+.elfwork/
 __pycache__/
 *.pyc
 _tmp/
@@ -58,6 +57,7 @@ promotion/
 tools/discord-bot/
 examples/cad/
 .vs/
+.vscode/
 tests/profiler_test.mettle
 tests/parse_stress_test.mettle
 .idea/

@@ -1,7 +1,0 @@
-fn unused() -> int32 {
-  return ghost;
-}
-
-fn main() -> int32 {
-  return 0;
-}

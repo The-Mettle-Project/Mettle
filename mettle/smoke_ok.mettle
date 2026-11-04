@@ -1,6 +1,0 @@
-// Valid Mettle — use this to verify mettle-syntax compiler diagnostics are clean on save.
-// Expect no Problems when `mettle.linter.compilerEnabled` is true and `mettle` resolves.
-
-fn main() -> int32 {
-  return 0;
-}
