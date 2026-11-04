@@ -1,0 +1,43 @@
+// macOS terminals for std/term: tcgetattr and tcsetattr. Here struct
+// termios holds 8-byte flag words, so c_lflag is the 4th 64-bit word.
+
+extern fn term_c_tcgetattr(fd: int32, t: uint64*) -> int32 = "tcgetattr";
+extern fn term_c_tcsetattr(fd: int32, when: int32, t: uint64*) -> int32 = "tcsetattr";
+extern fn term_c_isatty(fd: int32) -> int32 = "isatty";
+extern fn term_c_read(fd: int32, buf: uint8*, n: uint64) -> int64 = "read";
+extern fn term_c_write(fd: int32, buf: uint8*, n: uint64) -> int64 = "write";
+extern fn term_c_errno() -> int32* = "__error";
+
+const ECHO = 8;
+
+export fn term_is_tty(fd: int64) -> bool {
+  return term_c_isatty((int32)fd) == 1;
+}
+
+// Turns echo on or off. Returns 1 or 0 for whether echo was on before, or a
+// negative error code (-25, ENOTTY, when fd is not a terminal).
+export fn term_set_echo(fd: int64, on: bool) -> int64 {
+  var t: uint64[16];
+  if (term_c_tcgetattr((int32)fd, &t[0]) != 0) { return -(int64)*term_c_errno(); }
+  var was: int64 = 0;
+  if ((t[3] & (uint64)ECHO) != (uint64)0) { was = 1; }
+  if (on) {
+    t[3] = t[3] | (uint64)ECHO;
+  } else {
+    t[3] = t[3] & ~(uint64)ECHO;
+  }
+  if (term_c_tcsetattr((int32)fd, 0, &t[0]) != 0) { return -(int64)*term_c_errno(); }   // TCSANOW
+  return was;
+}
+
+export fn term_os_read(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var r: int64 = term_c_read((int32)fd, buf, (uint64)n);
+  if (r < 0) { return -(int64)*term_c_errno(); }
+  return r;
+}
+
+export fn term_os_write(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var r: int64 = term_c_write((int32)fd, buf, (uint64)n);
+  if (r < 0) { return -(int64)*term_c_errno(); }
+  return r;
+}

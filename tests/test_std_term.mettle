@@ -1,0 +1,31 @@
+// std/term away from a terminal: a pipe is not a tty, echo changes are
+// refused, and term_read_secret still reads a piped line.
+import "std/term";
+import "std/process";
+import "std/strbuf";
+import "std/arena";
+import "process_test_os/linux" if linux;
+import "process_test_os/other" if macos;
+import "process_test_os/other" if windows;
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (PROC_TEST_RUNS == 0) { return 0; }
+  // Run again as a child with a pipe for stdin: the child reads its secret.
+  if (argc > 1) {
+    if (term_is_tty(0)) { return 10; }
+    if (term_set_echo(0, false) >= 0) { return 11; }
+    var buf: uint8[64];
+    var n: int64 = term_read_secret("", &buf[0], 64);
+    if (n != 6 || buf[0] != (uint8)104 || buf[5] != (uint8)50) { return 12; }   // "hunte2"
+    return 0;
+  }
+  var arena: Arena* = arena_init(0);
+  var out: StrBuf* = strbuf_new(arena, 64);
+  var err: StrBuf* = strbuf_new(arena, 64);
+  var self: string = str_from_cstr(argv[0]);
+  var args: string[2] = [self, "child"];
+  var st: ProcStatus;
+  if (proc_run(args, "hunte2\nrest\n", out, err, 5000, &st) != 0) { return 1; }
+  if (st.signaled != 0 || st.code != 0) { return 2 + st.code; }
+  return 0;
+}

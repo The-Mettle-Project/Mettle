@@ -1,3 +1,9 @@
+// Anonymous memory from the kernel. os_mem_* make raw system calls, so they
+// also work in a self-contained ELF, which has no libc to link. The libc
+// externs stay for callers that use them by name.
+
+import "std/linux_sys";
+
 export extern fn mmap(addr: cstring, length: int64, prot: int32, flags: int32, fd: int32, offset: int64) -> cstring = "mmap";
 export extern fn munmap(addr: cstring, length: int64) -> int32 = "munmap";
 export extern fn mprotect(addr: cstring, length: int64, prot: int32) -> int32 = "mprotect";
@@ -10,23 +16,24 @@ export fn os_mem_map(n: int64) -> cstring {
   if (n <= (int64)0) {
     return 0;
   }
-  var p: cstring = mmap(0, n, (int32)0x3, (int32)0x22, (int32)-1, (int64)0);
-  if ((int64)p == (int64)-1) {
+  // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
+  var r: int64 = syscall(LINUX_SYS_MMAP, 0, n, 3, 0x22, -1, 0);
+  if (r < 0 && r > -4096) {
     return 0;
   }
-  return p;
+  return (cstring)r;
 }
 
 export fn os_mem_unmap(p: cstring, n: int64) {
   if (p == 0 || n <= (int64)0) {
     return;
   }
-  munmap(p, n);
+  syscall(LINUX_SYS_MUNMAP, p, n);
 }
 
 export fn os_mem_protect_noaccess(p: cstring, n: int64) {
   if (p == 0 || n <= (int64)0) {
     return;
   }
-  mprotect(p, n, (int32)0);
+  syscall(LINUX_SYS_MPROTECT, p, n, 0);
 }

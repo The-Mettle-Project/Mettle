@@ -409,6 +409,9 @@ Pages from the operating system, under the heap. Both platforms, with a
 | `os_mem_unmap(p: cstring, n: int64)` | Unmap |
 | `os_mem_protect_noaccess(p: cstring, n: int64)` | Make a range unreadable |
 
+On Linux these make raw system calls, so they also work in a self-contained
+ELF (`--emit-arm64`), which links no libc.
+
 ## std/thread
 
 Threads, mutexes, and atomics. Both platforms, with a `.linux` half and a
@@ -602,6 +605,20 @@ On Linux no libc is linked, so the runtime keeps the environment: it reads the
 block the kernel passed in, and keeps changes in a table of its own. The
 arguments come from `/proc/self/cmdline` on Linux, `_NSGetArgv` on macOS, and
 `GetCommandLineA` on Windows, split with the MSVCRT rules (at most 256).
+
+## std/term
+
+Terminal basics, for prompts. Linux, macOS and Windows. fd 0 is standard
+input, 1 output and 2 error.
+
+| Function | Effect |
+|----------|--------|
+| `term_is_tty(fd) -> bool` | Is `fd` a terminal (a console on Windows) |
+| `term_set_echo(fd, on: bool) -> int64` | Turn echo on or off. Returns 1 or 0 for whether it was on before, or a negative code when `fd` is not a terminal |
+| `term_read_secret(prompt, buf, cap) -> int64` | Write `prompt` to standard error, read one line from standard input with echo off, and turn echo back on. Returns the length, without the line ending |
+
+When standard input is a pipe or a file, `term_read_secret` reads the line as
+it is, so scripts can feed a password in.
 
 ## std/socket
 

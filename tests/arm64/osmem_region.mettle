@@ -1,0 +1,17 @@
+// std/osmem maps memory with raw system calls, and memory_region and
+// memory_region_end are runtime stubs, so both work in a self-contained
+// AArch64 ELF. Writes 41 into a fresh page, reads it back plus one -> 42.
+import "std/mem";
+import "std/osmem";
+
+fn main() -> int64 {
+  var p: cstring = os_mem_map(65536);
+  if (p == 0) { return 1; }
+  memory_region(p, 65536);
+  var q: int64* = (int64*)p;
+  q[100] = 41;
+  var v: int64 = q[100] + 1;
+  memory_region_end(p);
+  os_mem_unmap(p, 65536);
+  return v;
+}

@@ -3258,7 +3258,8 @@ if ($IsLinux) {
     @{ Name = "std_process"; Path = "tests/test_std_process.mettle"; ShouldSucceed = $true },
     @{ Name = "std_process_release"; Path = "tests/test_std_process.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_sys"; Path = "tests/test_std_sys.mettle"; ShouldSucceed = $true },
-    @{ Name = "std_sys_release"; Path = "tests/test_std_sys.mettle"; ShouldSucceed = $true; Args = @("--release") }
+    @{ Name = "std_sys_release"; Path = "tests/test_std_sys.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_term"; Path = "tests/test_std_term.mettle"; ShouldSucceed = $true }
   )
 }
 
