@@ -422,6 +422,7 @@ int mir_encode(MirFunction *fn);
 
 int mir_rewrite_string_concat_calls(IRFunction *ir_function);
 
+void mir_fold_shared_address(MirFunction *fn);
 void mir_sink_partial_loads(MirFunction *fn);
 void mir_guard_counter_wrap(MirFunction *fn);
 void mir_thread_known_tests(MirFunction *fn);

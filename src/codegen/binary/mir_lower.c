@@ -12721,6 +12721,7 @@ static const MirPass MIR_PASSES[] = {
     {"mir_elide_guarded_sext", 1, mir_elide_guarded_sext},
     {"mir_fold_widening_of_canonical", 1, mir_fold_widening_of_canonical},
     {"mir_fold_address_offsets", 1, mir_fold_address_offsets},
+    {"mir_fold_shared_address", 1, mir_fold_shared_address},
     {"mir_fold_index_scale", 1, mir_fold_index_scale},
     {"mir_cse_loads", 1, mir_cse_loads},
     {"mir_slp_pair_f64", 1, mir_slp_pair_f64},

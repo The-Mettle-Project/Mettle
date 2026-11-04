@@ -331,6 +331,273 @@ void mir_sink_partial_loads(MirFunction *fn) {
   }
 }
 
+static int mir_shared_address_use_ok(const MirInst *in, MirVregId t) {
+  if (in->b.kind == MIR_OPK_VREG && in->b.vreg == t) {
+    return 0;
+  }
+  if (in->b.kind == MIR_OPK_MEM &&
+      (in->b.mem.base == t || in->b.mem.index == t)) {
+    return 0;
+  }
+  if (in->op != MIR_MOV || in->is_float) {
+    return 0;
+  }
+  if (in->a.kind == MIR_OPK_MEM && in->dst.kind == MIR_OPK_VREG) {
+    return in->a.mem.base == t && in->a.mem.index == MIR_VREG_NONE &&
+           !in->a.mem.phys_base_valid && !in->a.mem.frame_home_valid;
+  }
+  if (in->dst.kind == MIR_OPK_MEM) {
+    return in->dst.mem.base == t && in->dst.mem.index == MIR_VREG_NONE &&
+           !in->dst.mem.phys_base_valid && !in->dst.mem.frame_home_valid &&
+           !(in->a.kind == MIR_OPK_VREG && in->a.vreg == t);
+  }
+  return 0;
+}
+
+static int mir_shared_address_uses(const MirFunction *fn, MirVregId t,
+                                   int *count) {
+  *count = 0;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op == MIR_NOP || !mir_inst_reads(in, t)) {
+      continue;
+    }
+    if (!mir_shared_address_use_ok(in, t)) {
+      return 0;
+    }
+    (*count)++;
+  }
+  return *count > 0;
+}
+
+static int mir_source_survives(const MirFunction *fn, const MirCfg *cfg,
+                               size_t def_at, MirVregId t, MirVregId s) {
+  int home = cfg->block_of[def_at];
+  for (int i = (int)def_at + 1; i < cfg->blocks[home].end; i++) {
+    if (mir_cfg_insn_def(&fn->insns[i]) == s) {
+      return 0;
+    }
+  }
+  for (size_t b = 0; b < cfg->block_count; b++) {
+    if (!mir_cfg_is_live_in(cfg, b, t)) {
+      continue;
+    }
+    for (int i = cfg->blocks[b].start; i < cfg->blocks[b].end; i++) {
+      if (mir_cfg_insn_def(&fn->insns[i]) == s) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static int mir_vreg_is_scaled_product(const MirFunction *fn, MirVregId v,
+                                      size_t before) {
+  for (size_t i = before; i > 0; i--) {
+    const MirInst *in = &fn->insns[i - 1];
+    if (mir_cfg_insn_def(in) == v) {
+      return in->op == MIR_IMUL && in->b.kind == MIR_OPK_IMM;
+    }
+    if (in->op == MIR_LABEL) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+static void mir_point_uses_at_pair(MirFunction *fn, MirVregId t, MirVregId base,
+                                   MirVregId index) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirInst *in = &fn->insns[i];
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+    MirOperand *op = NULL;
+    if (in->a.kind == MIR_OPK_MEM && in->a.mem.base == t) {
+      op = &in->a;
+    } else if (in->dst.kind == MIR_OPK_MEM && in->dst.mem.base == t) {
+      op = &in->dst;
+    }
+    if (op) {
+      op->mem.base = base;
+      op->mem.index = index;
+      op->mem.scale = 1;
+    }
+  }
+}
+
+static int mir_shared_address_candidate(const MirFunction *fn, const MirInst *in,
+                                        const int *defs) {
+  return in->op == MIR_ADD && !in->is_float && in->width == 8 &&
+         in->dst.kind == MIR_OPK_VREG && in->a.kind == MIR_OPK_VREG &&
+         in->b.kind == MIR_OPK_VREG && in->dst.vreg != in->a.vreg &&
+         in->dst.vreg != in->b.vreg && defs[in->dst.vreg] == 1 &&
+         !fn->vregs[in->dst.vreg].address_taken &&
+         fn->vregs[in->a.vreg].rclass == MIR_RC_GP &&
+         fn->vregs[in->b.vreg].rclass == MIR_RC_GP;
+}
+
+static size_t mir_named_copy_of_address(const MirFunction *fn, const MirCfg *cfg,
+                                        size_t add_at, const int *defs) {
+  const MirInst *add = &fn->insns[add_at];
+  MirVregId t = add->dst.vreg;
+  size_t copy_at = 0;
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
+    if (in->op == MIR_NOP || !mir_inst_reads(in, t)) {
+      continue;
+    }
+    if (copy_at != 0 || in->op != MIR_MOV || in->is_float || in->width != 8 ||
+        in->dst.kind != MIR_OPK_VREG || in->a.kind != MIR_OPK_VREG ||
+        in->a.vreg != t || defs[in->dst.vreg] != 1 ||
+        fn->vregs[in->dst.vreg].address_taken) {
+      return 0;
+    }
+    copy_at = i;
+  }
+  if (copy_at <= add_at || cfg->block_of[copy_at] != cfg->block_of[add_at]) {
+    return 0;
+  }
+  for (size_t i = add_at + 1; i < copy_at; i++) {
+    MirVregId d = mir_cfg_insn_def(&fn->insns[i]);
+    if (d == add->a.vreg || d == add->b.vreg) {
+      return 0;
+    }
+  }
+  return copy_at;
+}
+
+static void mir_fold_one_shared_address(MirFunction *fn, const MirCfg *cfg,
+                                        size_t at, const int *defs) {
+  MirInst *add = &fn->insns[at];
+  size_t copy_at = mir_named_copy_of_address(fn, cfg, at, defs);
+  size_t def_at = copy_at ? copy_at : at;
+  MirVregId t = copy_at ? fn->insns[copy_at].dst.vreg : add->dst.vreg;
+  MirVregId base = add->a.vreg;
+  MirVregId index = add->b.vreg;
+  int uses = 0;
+  if (t == base || t == index || !mir_shared_address_uses(fn, t, &uses) ||
+      !mir_source_survives(fn, cfg, def_at, t, base) ||
+      !mir_source_survives(fn, cfg, def_at, t, index)) {
+    return;
+  }
+  if (mir_vreg_is_scaled_product(fn, base, at) &&
+      !mir_vreg_is_scaled_product(fn, index, at)) {
+    MirVregId swap = base;
+    base = index;
+    index = swap;
+  }
+  mir_point_uses_at_pair(fn, t, base, index);
+  if (copy_at) {
+    mir_make_nop(&fn->insns[copy_at]);
+  }
+  mir_make_nop(add);
+}
+
+static void mir_replace_reads(MirFunction *fn, MirVregId from, MirVregId to) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirInst *in = &fn->insns[i];
+    MirOperand *ops[3] = {&in->a, &in->b, &in->dst};
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+    for (int k = 0; k < 3; k++) {
+      MirOperand *op = ops[k];
+      if (op->kind == MIR_OPK_VREG && op->vreg == from && k != 2) {
+        op->vreg = to;
+      } else if (op->kind == MIR_OPK_MEM) {
+        if (op->mem.base == from) {
+          op->mem.base = to;
+        }
+        if (op->mem.index == from) {
+          op->mem.index = to;
+        }
+      }
+    }
+  }
+}
+
+static int mir_copy_follows_its_add(const MirFunction *fn, size_t copy_at,
+                                    MirVregId t, MirVregId copy) {
+  for (size_t back = 1; back <= 16 && back <= copy_at; back++) {
+    const MirInst *in = &fn->insns[copy_at - back];
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+    if (in->op == MIR_LABEL || mir_op_has(in->op, MIR_OPF_LABEL_BRANCH) ||
+        in->op == MIR_JMP_TABLE || mir_inst_reads(in, copy)) {
+      return 0;
+    }
+    if (mir_cfg_insn_def(in) == t) {
+      return in->op == MIR_ADD && !in->is_float && in->width == 8 &&
+             in->a.kind == MIR_OPK_VREG && in->b.kind == MIR_OPK_VREG;
+    }
+  }
+  return 0;
+}
+
+static void mir_forward_address_copies(MirFunction *fn, int *defs) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirInst *in = &fn->insns[i];
+    if (in->op != MIR_MOV || in->is_float || in->width != 8 ||
+        in->dst.kind != MIR_OPK_VREG || in->a.kind != MIR_OPK_VREG ||
+        in->dst.vreg == in->a.vreg || defs[in->dst.vreg] != 1 ||
+        defs[in->a.vreg] != 1 || fn->vregs[in->dst.vreg].address_taken ||
+        fn->vregs[in->a.vreg].address_taken ||
+        fn->vregs[in->dst.vreg].rclass != MIR_RC_GP) {
+      continue;
+    }
+    MirVregId copy = in->dst.vreg;
+    MirVregId t = in->a.vreg;
+    int is_param = 0;
+    for (size_t p = 0; p < fn->param_count; p++) {
+      is_param |= fn->params[p].vreg == copy ||
+                  fn->params[p].sysv_storage == copy;
+    }
+    if (is_param || !mir_copy_follows_its_add(fn, i, t, copy)) {
+      continue;
+    }
+    mir_make_nop(in);
+    mir_replace_reads(fn, copy, t);
+    defs[copy] = 0;
+  }
+}
+
+void mir_fold_shared_address(MirFunction *fn) {
+  MirCfg cfg;
+  int *defs;
+  int any = 0;
+  if (!fn || fn->insn_count < 3 || fn->vreg_count == 0) {
+    return;
+  }
+  defs = (int *)calloc(fn->vreg_count, sizeof(int));
+  if (!defs) {
+    fn->has_error = 1;
+    return;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirVregId d = mir_cfg_insn_def(&fn->insns[i]);
+    if (d >= 0 && (size_t)d < fn->vreg_count) {
+      defs[d]++;
+    }
+  }
+  mir_forward_address_copies(fn, defs);
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    any |= mir_shared_address_candidate(fn, &fn->insns[i], defs);
+  }
+  if (any && mir_cfg_build(&cfg, fn)) {
+    int budget = 64;
+    for (size_t i = 0; budget > 0 && i < fn->insn_count; i++) {
+      if (mir_shared_address_candidate(fn, &fn->insns[i], defs)) {
+        mir_fold_one_shared_address(fn, &cfg, i, defs);
+        budget--;
+      }
+    }
+    mir_cfg_free(&cfg);
+  }
+  free(defs);
+}
+
 static char *mir_fresh_label(MirFunction *fn, const char *prefix) {
   static unsigned long long counter = 0;
   char *name = (char *)malloc(48);
