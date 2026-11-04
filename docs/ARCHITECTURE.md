@@ -229,8 +229,10 @@ flowchart TD
 
 Before allocation, a load used on only some paths sinks into them. A loop test
 whose answer is known on a back edge is skipped, so `running = 0` jumps straight
-out. A 32-bit counter stays canonical with a range check on a never-taken branch,
-which takes a cycle off the path later work depends on.
+out. A 32-bit counter in the same loop as a jump table stays canonical with a range
+check on a never-taken branch, which takes a cycle off the path an interpreter's
+every op depends on. Other loops keep the sign extension, since the check adds 10
+bytes and few of them hang off their counter.
 
 After allocation, every branch back to a jump table takes its own copy of the
 dispatch, so each arm owns an indirect jump. Blocks then form chains along their
