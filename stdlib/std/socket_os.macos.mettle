@@ -31,7 +31,14 @@ extern fn sock_c_setsockopt(fd: int32, level: int32, name: int32, v: uint8*, len
 extern fn sock_c_getsockopt(fd: int32, level: int32, name: int32, v: uint8*, len: uint32*) -> int32 = "getsockopt";
 extern fn sock_c_getsockname(fd: int32, addr: uint8*, len: uint32*) -> int32 = "getsockname";
 extern fn sock_c_getpeername(fd: int32, addr: uint8*, len: uint32*) -> int32 = "getpeername";
-extern fn sock_c_fcntl(fd: int32, cmd: int32, arg: int32) -> int32 = "fcntl";
+// fcntl is variadic. x86-64 reads its third argument from the third register,
+// arm64 from the first stack slot. Passing it as both the 3rd and the 9th
+// argument puts it in both places, since the 9th goes to the stack.
+extern fn sock_c_fcntl_v(fd: int32, cmd: int32, a3: int64, a4: int64, a5: int64, a6: int64, a7: int64, a8: int64, a9: int64) -> int32 = "fcntl";
+
+fn sock_c_fcntl(fd: int32, cmd: int32, arg: int32) -> int32 {
+  return sock_c_fcntl_v(fd, cmd, (int64)arg, 0, 0, 0, 0, 0, (int64)arg);
+}
 extern fn sock_c_poll(fds: uint8*, n: uint32, timeout: int32) -> int32 = "poll";
 
 const AF_INET = 2;
