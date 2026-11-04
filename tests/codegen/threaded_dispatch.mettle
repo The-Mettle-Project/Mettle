@@ -343,7 +343,7 @@ fn build_sum(ops: Op*) {
   while (i < n) {
     var v: int64 = p[i];
     i += 1;
-    if ((int32)(v & 1) == 1) {
+    if ((i & 1) == 0) {
       total += v;
     }
   }
@@ -702,7 +702,7 @@ fn main() -> int32 {
     cells[i] = (int64)(i * 3 + 1);
     i += 1;
   }
-  fails += check("index_change", load_across_index_change(cells, 8), 40);
+  fails += check("index_change", load_across_index_change(cells, 8), 52);
   fails += check_counters_and_divides(cells);
 
   var bytes: int8* = malloc(4);
