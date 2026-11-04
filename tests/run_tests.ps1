@@ -1679,7 +1679,7 @@ $cases = @(
   @{ Name = "err_global_init_address_arith"; Path = "tests/err_global_init_address_arith.mettle"; ShouldSucceed = $false
      Pattern = "a global's initializer must be known at compile time"
      OutputMustNotMatch = @("internal compiler error") },
-  @{ Name = "err_import_guard_bad_platform"; Path = "tests/err_import_guard_bad_platform.mettle"; ShouldSucceed = $false; Pattern = "Import guard platform must be 'windows', 'linux', 'macos' or 'posix'" },
+  @{ Name = "err_import_guard_bad_platform"; Path = "tests/err_import_guard_bad_platform.mettle"; ShouldSucceed = $false; Pattern = "Import guard must be 'windows', 'linux', 'macos', 'posix', 'x86_64' or 'aarch64'" },
   @{ Name = "block_comment"; Path = "tests/test_block_comment.mettle"; ShouldSucceed = $true },
   @{ Name = "compound_assign"; Path = "tests/test_compound_assign.mettle"; ShouldSucceed = $true },
   @{ Name = "compound_assign_for"; Path = "tests/test_compound_assign_for.mettle"; ShouldSucceed = $true },

@@ -3754,8 +3754,11 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
   }
 }
 
-static int import_platform_matches(const char *guard, int target_is_elf,
-                                   int target_is_macos, int target_is_arm64) {
+static int import_platform_matches(const char *guard,
+                                   const ImportResolverOptions *options) {
+  int target_is_elf = options && options->target_is_elf;
+  int target_is_macos = options && options->target_is_macos;
+  int target_is_arm64 = options && options->target_is_arm64;
   if (!guard) {
     return 1;
   }
@@ -3815,11 +3818,8 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
     if (decl->type == AST_IMPORT) {
       ImportDeclaration *import_decl = (ImportDeclaration *)decl->data;
 
-      if (!import_platform_matches(
-              import_decl->platform_guard,
-              ctx && ctx->options && ctx->options->target_is_elf,
-              ctx && ctx->options && ctx->options->target_is_macos,
-              ctx && ctx->options && ctx->options->target_is_arm64)) {
+      if (!import_platform_matches(import_decl->platform_guard,
+                                   ctx ? ctx->options : NULL)) {
         ast_destroy_node(decl);
         continue;
       }
