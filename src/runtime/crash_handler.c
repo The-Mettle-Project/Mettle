@@ -390,6 +390,15 @@ static int64_t (*g_live_resume_point)(int64_t stack) = NULL;
 static int64_t (*g_live_recover_wait)(int64_t slot) = NULL;
 static void (*g_live_resume_jump)(int64_t slot) = NULL;
 
+/* With quiet recovery on, a crash that the recovery hook handles prints no
+   report: the hook runs first, and the report is written only if it declines.
+   A supervisor that restarts crashed workers (alph) wants this, since the
+   report costs more than the restart. Off by default, so `mettle live` still
+   shows the report before it waits for a fix. */
+static int g_crash_quiet_recovery = 0;
+
+void mettle_crash_set_quiet_recovery(int32_t on) { g_crash_quiet_recovery = on != 0; }
+
 void mettle_crash_set_live_recovery(int64_t point, int64_t wait, int64_t jump) {
   g_live_resume_point = (int64_t (*)(int64_t))(uintptr_t)point;
   g_live_recover_wait = (int64_t (*)(int64_t))(uintptr_t)wait;
@@ -743,6 +752,33 @@ static void mettle_crash_terminate_with_code(UINT exit_code) {
   TerminateProcess(process, exit_code);
 }
 
+/* Resumes at the live recovery point if the hook takes the crash. Returns 1
+   when the context was rewritten to resume there. */
+static int mettle_crash_win_try_resume(EXCEPTION_POINTERS *exception_info) {
+  const EXCEPTION_RECORD *record = exception_info->ExceptionRecord;
+  const CONTEXT *context = exception_info->ContextRecord;
+  if (record->ExceptionCode != EXCEPTION_STACK_OVERFLOW && context) {
+    int64_t *slot = mettle_crash_live_resume_slot((uintptr_t)context->Rsp);
+    if (slot && g_live_recover_wait((int64_t)(uintptr_t)slot)) {
+      CONTEXT *resume = exception_info->ContextRecord;
+      resume->Rbx = (DWORD64)slot[0];
+      resume->Rbp = (DWORD64)slot[1];
+      resume->Rdi = (DWORD64)slot[2];
+      resume->Rsi = (DWORD64)slot[3];
+      resume->R12 = (DWORD64)slot[4];
+      resume->R13 = (DWORD64)slot[5];
+      resume->R14 = (DWORD64)slot[6];
+      resume->R15 = (DWORD64)slot[7];
+      resume->Rsp = (DWORD64)slot[8];
+      resume->Rip = (DWORD64)slot[9];
+      resume->Rax = 1;
+      memcpy(&resume->Xmm6, &slot[16], 16u * 10u);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static LONG WINAPI
 mettle_crash_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
   if (!exception_info || !exception_info->ExceptionRecord) {
@@ -759,6 +795,15 @@ mettle_crash_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
 
   if (!mettle_crash_handler_enter()) {
     mettle_crash_terminate_with_code(1);
+  }
+
+  int tried_resume = 0;
+  if (g_crash_quiet_recovery) {
+    tried_resume = 1;
+    if (mettle_crash_win_try_resume(exception_info)) {
+      mettle_crash_handler_leave();
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
   }
 
   const EXCEPTION_RECORD *record = exception_info->ExceptionRecord;
@@ -832,25 +877,9 @@ mettle_crash_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
   }
 
   mettle_crash_print_trace_from_frame(program_counter, frame_pointer);
-  if (record->ExceptionCode != EXCEPTION_STACK_OVERFLOW && context) {
-    int64_t *slot = mettle_crash_live_resume_slot((uintptr_t)context->Rsp);
-    if (slot && g_live_recover_wait((int64_t)(uintptr_t)slot)) {
-      CONTEXT *resume = exception_info->ContextRecord;
-      resume->Rbx = (DWORD64)slot[0];
-      resume->Rbp = (DWORD64)slot[1];
-      resume->Rdi = (DWORD64)slot[2];
-      resume->Rsi = (DWORD64)slot[3];
-      resume->R12 = (DWORD64)slot[4];
-      resume->R13 = (DWORD64)slot[5];
-      resume->R14 = (DWORD64)slot[6];
-      resume->R15 = (DWORD64)slot[7];
-      resume->Rsp = (DWORD64)slot[8];
-      resume->Rip = (DWORD64)slot[9];
-      resume->Rax = 1;
-      memcpy(&resume->Xmm6, &slot[16], 16u * 10u);
-      mettle_crash_handler_leave();
-      return EXCEPTION_CONTINUE_EXECUTION;
-    }
+  if (!tried_resume && mettle_crash_win_try_resume(exception_info)) {
+    mettle_crash_handler_leave();
+    return EXCEPTION_CONTINUE_EXECUTION;
   }
   mettle_crash_terminate_with_code(1);
   return EXCEPTION_EXECUTE_HANDLER;
@@ -944,10 +973,49 @@ static void mettle_crash_extract_fault_context(void *ucontext_raw,
 #endif
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+/* Resumes at the live recovery point if the hook takes the crash. Returns 1
+   when the machine context was rewritten to resume there. */
+static int mettle_crash_posix_try_resume(void *ucontext_raw) {
+  if (ucontext_raw) {
+    int64_t *slot = mettle_crash_live_resume_slot(
+        (uintptr_t)((ucontext_t *)ucontext_raw)->uc_mcontext.gregs[REG_RSP]);
+    if (slot && g_live_recover_wait((int64_t)(uintptr_t)slot)) {
+      ucontext_t *uc = (ucontext_t *)ucontext_raw;
+      uc->uc_mcontext.gregs[REG_RBX] = (greg_t)slot[0];
+      uc->uc_mcontext.gregs[REG_RBP] = (greg_t)slot[1];
+      uc->uc_mcontext.gregs[REG_R12] = (greg_t)slot[4];
+      uc->uc_mcontext.gregs[REG_R13] = (greg_t)slot[5];
+      uc->uc_mcontext.gregs[REG_R14] = (greg_t)slot[6];
+      uc->uc_mcontext.gregs[REG_R15] = (greg_t)slot[7];
+      uc->uc_mcontext.gregs[REG_RSP] = (greg_t)slot[8];
+      uc->uc_mcontext.gregs[REG_RIP] = (greg_t)slot[9];
+      uc->uc_mcontext.gregs[REG_RAX] = 1;
+      return 1;
+    }
+  }
+  return 0;
+}
+#else
+static int mettle_crash_posix_try_resume(void *ucontext_raw) {
+  (void)ucontext_raw;
+  return 0;
+}
+#endif
+
 static void mettle_crash_crash_signal_handler(int signo, siginfo_t *info,
                                               void *ucontext_raw) {
   if (!mettle_crash_handler_enter()) {
     mettle_crash_terminate_with_code(128 + signo);
+  }
+
+  int tried_resume = 0;
+  if (g_crash_quiet_recovery) {
+    tried_resume = 1;
+    if (mettle_crash_posix_try_resume(ucontext_raw)) {
+      mettle_crash_handler_leave();
+      return;
+    }
   }
 
   mettle_crash_write_stderr("Unhandled runtime signal ");
@@ -980,26 +1048,10 @@ static void mettle_crash_crash_signal_handler(int signo, siginfo_t *info,
         "Stack trace unavailable (no machine context for this platform)\n");
   }
 
-#if defined(__linux__) && defined(__x86_64__)
-  if (ucontext_raw) {
-    int64_t *slot = mettle_crash_live_resume_slot(
-        (uintptr_t)((ucontext_t *)ucontext_raw)->uc_mcontext.gregs[REG_RSP]);
-    if (slot && g_live_recover_wait((int64_t)(uintptr_t)slot)) {
-      ucontext_t *uc = (ucontext_t *)ucontext_raw;
-      uc->uc_mcontext.gregs[REG_RBX] = (greg_t)slot[0];
-      uc->uc_mcontext.gregs[REG_RBP] = (greg_t)slot[1];
-      uc->uc_mcontext.gregs[REG_R12] = (greg_t)slot[4];
-      uc->uc_mcontext.gregs[REG_R13] = (greg_t)slot[5];
-      uc->uc_mcontext.gregs[REG_R14] = (greg_t)slot[6];
-      uc->uc_mcontext.gregs[REG_R15] = (greg_t)slot[7];
-      uc->uc_mcontext.gregs[REG_RSP] = (greg_t)slot[8];
-      uc->uc_mcontext.gregs[REG_RIP] = (greg_t)slot[9];
-      uc->uc_mcontext.gregs[REG_RAX] = 1;
-      mettle_crash_handler_leave();
-      return;
-    }
+  if (!tried_resume && mettle_crash_posix_try_resume(ucontext_raw)) {
+    mettle_crash_handler_leave();
+    return;
   }
-#endif
 
   mettle_crash_terminate_with_code(128 + signo);
 }
@@ -1094,13 +1146,24 @@ static void mettle_crash_trap_impl(uint32_t kind, const char *message,
     return;
   }
 
+  int tried_resume = 0;
+  if (g_crash_quiet_recovery && g_live_resume_jump) {
+    tried_resume = 1;
+    int64_t *quiet_slot =
+        mettle_crash_live_resume_slot((uintptr_t)__builtin_frame_address(0));
+    if (quiet_slot && g_live_recover_wait((int64_t)(uintptr_t)quiet_slot)) {
+      mettle_crash_handler_leave();
+      g_live_resume_jump((int64_t)(uintptr_t)quiet_slot);
+    }
+  }
+
   mettle_crash_write_trap_report((uintptr_t)program_counter, kind, message, arg0,
                                  arg1);
   if (program_counter || frame_pointer) {
     mettle_crash_print_trace_from_frame((uintptr_t)program_counter,
                                         (uintptr_t)frame_pointer);
   }
-  if (g_live_resume_jump) {
+  if (!tried_resume && g_live_resume_jump) {
     int64_t *slot =
         mettle_crash_live_resume_slot((uintptr_t)__builtin_frame_address(0));
     if (slot && g_live_recover_wait((int64_t)(uintptr_t)slot)) {
