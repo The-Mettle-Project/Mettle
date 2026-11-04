@@ -658,12 +658,12 @@ static int mir_increment_extend_at(const MirFunction *fn, size_t at,
   }
   ext = &fn->insns[next];
   if (ext->op != MIR_MOVSX || ext->width != 4 || ext->dst.kind != MIR_OPK_VREG ||
-      ext->a.kind != MIR_OPK_VREG || ext->dst.vreg != add->a.vreg ||
-      ext->a.vreg != add->dst.vreg) {
+      ext->a.kind != MIR_OPK_VREG || ext->a.vreg != add->dst.vreg) {
     return 0;
   }
-  if (add->dst.vreg != add->a.vreg &&
-      !mir_temp_only_feeds(fn, add->dst.vreg, at, next)) {
+  if (ext->dst.vreg != add->dst.vreg &&
+      (ext->dst.vreg != add->a.vreg ||
+       !mir_temp_only_feeds(fn, add->dst.vreg, at, next))) {
     return 0;
   }
   *ext_at = next;
@@ -689,27 +689,51 @@ static int mir_def_is_canonical_int32(const MirInst *in) {
   return 0;
 }
 
-static int mir_counter_stays_canonical(const MirFunction *fn, MirVregId v) {
-  for (size_t p = 0; p < fn->param_count; p++) {
-    if (fn->params[p].vreg == v || fn->params[p].sysv_storage == v) {
-      return 0;
-    }
-  }
-  if (fn->vregs[v].address_taken || fn->vregs[v].rclass != MIR_RC_GP) {
-    return 0;
-  }
+static int mir_canonical_sweep(const MirFunction *fn, unsigned char *canonical) {
+  int changed = 0;
   for (size_t i = 0; i < fn->insn_count; i++) {
+    const MirInst *in = &fn->insns[i];
     size_t ext_at = 0;
-    if (mir_increment_extend_at(fn, i, &ext_at) && fn->insns[i].a.vreg == v) {
+    MirVregId d;
+    int ok;
+    if (mir_increment_extend_at(fn, i, &ext_at)) {
       i = ext_at;
       continue;
     }
-    if (mir_cfg_insn_def(&fn->insns[i]) == v &&
-        !mir_def_is_canonical_int32(&fn->insns[i])) {
-      return 0;
+    d = mir_cfg_insn_def(in);
+    if (d < 0 || (size_t)d >= fn->vreg_count || !canonical[d]) {
+      continue;
+    }
+    ok = mir_def_is_canonical_int32(in) ||
+         (in->op == MIR_MOV && !in->is_float && in->width == 8 &&
+          in->a.kind == MIR_OPK_VREG && canonical[in->a.vreg]);
+    if (!ok) {
+      canonical[d] = 0;
+      changed = 1;
     }
   }
-  return 1;
+  return changed;
+}
+
+static unsigned char *mir_canonical_int32_vregs(const MirFunction *fn) {
+  unsigned char *canonical = (unsigned char *)malloc(fn->vreg_count);
+  if (!canonical) {
+    return NULL;
+  }
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    canonical[v] = fn->vregs[v].rclass == MIR_RC_GP && !fn->vregs[v].address_taken;
+  }
+  for (size_t p = 0; p < fn->param_count; p++) {
+    if (fn->params[p].vreg >= 0) {
+      canonical[fn->params[p].vreg] = 0;
+    }
+    if (fn->params[p].sysv_storage >= 0) {
+      canonical[fn->params[p].sysv_storage] = 0;
+    }
+  }
+  while (mir_canonical_sweep(fn, canonical)) {
+  }
+  return canonical;
 }
 
 static int mir_function_ends_closed(const MirFunction *fn) {
@@ -732,7 +756,7 @@ static int mir_guard_one_counter(MirFunction *fn, size_t add_at, size_t ext_at,
   const char *back = mir_fresh_label(fn, "wrap_back");
   const char *stub = mir_fresh_label(fn, "wrap_stub");
   int grows = (add.op == MIR_ADD) == (add.b.imm > 0);
-  MirVregId counter = add.a.vreg;
+  MirVregId counter = ext->dst.vreg;
   MirInst guard;
   MirInst jump;
   MirInst moved = *ext;
@@ -769,11 +793,18 @@ void mir_guard_counter_wrap(MirFunction *fn) {
   MirCfg cfg;
   MirInsertions list = {0};
   int ok = 1;
+  unsigned char *canonical;
   if (!fn || fn->insn_count < 3 || fn->vreg_count == 0 ||
       !mir_function_ends_closed(fn)) {
     return;
   }
+  canonical = mir_canonical_int32_vregs(fn);
+  if (!canonical) {
+    fn->has_error = 1;
+    return;
+  }
   if (!mir_cfg_build(&cfg, fn)) {
+    free(canonical);
     return;
   }
   for (size_t i = 0; ok && i < fn->insn_count; i++) {
@@ -781,12 +812,14 @@ void mir_guard_counter_wrap(MirFunction *fn) {
     if (cfg.blocks[cfg.block_of[i]].loop_depth > 0 &&
         mir_increment_extend_at(fn, i, &ext_at) &&
         cfg.block_of[ext_at] == cfg.block_of[i] &&
-        mir_counter_stays_canonical(fn, fn->insns[i].a.vreg)) {
+        canonical[fn->insns[i].a.vreg] &&
+        !fn->vregs[fn->insns[ext_at].dst.vreg].address_taken) {
       ok = mir_guard_one_counter(fn, i, ext_at, &list);
       i = ext_at;
     }
   }
   mir_cfg_free(&cfg);
+  free(canonical);
   if (ok && list.count > 0) {
     ok = mir_insertions_apply(fn, &list);
   }
