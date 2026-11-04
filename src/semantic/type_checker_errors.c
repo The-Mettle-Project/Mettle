@@ -485,7 +485,20 @@ void type_checker_report_undefined_symbol(TypeChecker *checker,
     char suggestion[256];
     char *closest = symbol_table_suggest_similar(checker->symbol_table,
                                                  symbol_name, NULL, 0);
-    if (closest) {
+    int from_core = strncmp(symbol_name, "Result<", 7) == 0 ||
+                    strncmp(symbol_name, "Option<", 7) == 0 ||
+                    strcmp(symbol_name, "Result") == 0 ||
+                    strcmp(symbol_name, "Option") == 0 ||
+                    strcmp(symbol_name, "Ok") == 0 ||
+                    strcmp(symbol_name, "Err") == 0 ||
+                    strcmp(symbol_name, "Some") == 0 ||
+                    strcmp(symbol_name, "None") == 0;
+    if (from_core) {
+      free(closest);
+      snprintf(suggestion, sizeof(suggestion),
+               "'%s' comes from std/core: add `import \"std/core\";`",
+               symbol_name);
+    } else if (closest) {
       snprintf(suggestion, sizeof(suggestion),
                "did you mean '%s'? (or declare '%s' before using it)", closest,
                symbol_name);

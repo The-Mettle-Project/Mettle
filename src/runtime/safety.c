@@ -552,7 +552,7 @@ SAFETY_COLD static void safety_check_failed(const void *base, int64_t offset,
   }
 
   failure.extent = region->size;
-  failure.have_extent = state != (uint32_t)SAFETY_STATE_DEAD;
+  failure.have_extent = region->size != 0;
   failure.headline = state == (uint32_t)SAFETY_STATE_DEAD
                          ? "use of memory after it was freed"
                          : "memory access outside its allocation";
