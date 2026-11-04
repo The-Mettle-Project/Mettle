@@ -5,6 +5,9 @@ import "std/strbuf";
 import "std/arena";
 import "std/conv";
 import "std/mem";
+import "process_test_os/linux" if linux;
+import "process_test_os/other" if macos;
+import "process_test_os/other" if windows;
 
 fn text_is(b: StrBuf*, want: string) -> bool {
   return strbuf_finish_string(b) == want;
@@ -23,6 +26,8 @@ fn slurp(fd: int64, b: StrBuf*) -> int64 {
 }
 
 fn main() -> int32 {
+  // The checks use /bin/sh and other Linux tools.
+  if (PROC_TEST_RUNS == 0) { return 0; }
   var arena: Arena* = arena_init(0);
   var out: StrBuf* = strbuf_new(arena, 64);
   var err: StrBuf* = strbuf_new(arena, 64);
