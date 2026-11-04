@@ -1366,7 +1366,26 @@ static int ir_lower_return_statement(IRLoweringContext *context, IRFunction *fun
   ReturnStatement *ret = (ReturnStatement *)statement->data;
   IROperand value = ir_operand_none();
   if (ret && ret->value) {
-    if (ret->value_count > 1
+    if (ret->value_count <= 1 && ret->value->type == AST_AGGREGATE_LITERAL &&
+        ret->value->resolved_type) {
+      Type *literal_type = ret->value->resolved_type;
+      char *home = ir_new_label_name(context, "ret_literal");
+      if (!home ||
+          !ir_emit_local_declaration(context, function, home,
+                                     literal_type->name,
+                                     ret->value->location) ||
+          !ir_emit_aggregate_literal_copy_to_symbol(
+              context, function, home, ret->value, literal_type,
+              ret->value->location)) {
+        free(home);
+        return 0;
+      }
+      value = ir_operand_symbol(home);
+      free(home);
+      if (!value.name) {
+        return 0;
+      }
+    } else if (ret->value_count > 1
             ? !ir_lower_multi_return_value(context, function, ret, &value,
                                            statement->location)
             : !ir_lower_expression(context, function, ret->value, &value)) {

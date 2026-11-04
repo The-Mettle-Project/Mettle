@@ -2941,6 +2941,13 @@ static int ir_lower_func_ptr_call(IRLoweringContext *context,
         ir_operand_destroy(&destination);
         return 0;
       }
+      Type *ptype = func_type->fn_param_types[i];
+      if (ptype && (ptype->kind == TYPE_FLOAT32 ||
+                    ptype->kind == TYPE_FLOAT64 ||
+                    ptype->kind == TYPE_FLOAT16 ||
+                    ptype->kind == TYPE_BFLOAT16)) {
+        ir_operand_apply_float_bits(&arguments[i], ir_type_float_bits(ptype));
+      }
     }
   }
 

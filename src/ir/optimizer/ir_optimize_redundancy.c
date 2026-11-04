@@ -2544,6 +2544,17 @@ static void re_promote_collect_sites(const IRFunction *function,
     }
   }
 
+  for (size_t i = latch + 1; i < function->instruction_count && viable; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    size_t target = 0;
+    if ((ins->op == IR_OP_JUMP || ins->op == IR_OP_BRANCH_ZERO ||
+         ins->op == IR_OP_BRANCH_EQ) &&
+        ins->text && re_label_index_of(function, ins->text, &target) &&
+        target >= header && target <= latch) {
+      viable = 0;
+    }
+  }
+
   out->load_count = load_count;
   out->store_count = store_count;
   out->exit_count = exit_count;

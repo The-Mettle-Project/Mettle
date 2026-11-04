@@ -185,6 +185,41 @@ static int ir_try_coalesce_unsigned_load_cast(IRFunction *function,
   return 1;
 }
 
+static int ir_symbol_is_function_local(const IRFunction *function,
+                                       const char *name) {
+  for (size_t i = 0; i < function->parameter_count; i++) {
+    if (function->parameter_names[i] &&
+        strcmp(function->parameter_names[i], name) == 0) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op == IR_OP_DECLARE_LOCAL &&
+        instruction->dest.kind == IR_OPERAND_SYMBOL && instruction->dest.name &&
+        strcmp(instruction->dest.name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_call_result_is_aggregate(const IRInstruction *producer) {
+  if ((producer->op != IR_OP_CALL && producer->op != IR_OP_CALL_INDIRECT) ||
+      !producer->value_type) {
+    return 0;
+  }
+  switch (producer->value_type->kind) {
+  case MTLC_TYPE_STRING:
+  case MTLC_TYPE_ARRAY:
+  case MTLC_TYPE_STRUCT:
+  case MTLC_TYPE_TAGGED_ENUM:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 int ir_coalesce_single_use_temp_assign_pass(IRFunction *function,
                                                    int *changed) {
   if (!function) {
@@ -229,6 +264,13 @@ int ir_coalesce_single_use_temp_assign_pass(IRFunction *function,
     if (!producer || !ir_instruction_writes_destination(producer) ||
         producer->dest.kind != IR_OPERAND_TEMP || !producer->dest.name ||
         !ir_operand_names_match(&producer->dest, &assign_instruction->lhs)) {
+      continue;
+    }
+
+    if (ir_call_result_is_aggregate(producer) &&
+        assign_instruction->dest.kind == IR_OPERAND_SYMBOL &&
+        assign_instruction->dest.name &&
+        !ir_symbol_is_function_local(function, assign_instruction->dest.name)) {
       continue;
     }
 
