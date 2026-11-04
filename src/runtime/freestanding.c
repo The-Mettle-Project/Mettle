@@ -2264,6 +2264,9 @@ typedef struct MtElfProgramHeader {
 #define MT_PT_TLS 7
 
 static void *mt_tls_template;
+static MtElfProgramHeader *mt_elf_headers;
+static mt_u64 mt_elf_header_size;
+static mt_u64 mt_elf_header_count;
 static mt_size mt_tls_file_size;
 static mt_size mt_tls_memory_size;
 static mt_size mt_tls_alignment;
@@ -2354,6 +2357,9 @@ static int mt_initialize_initial_tls(mt_i64 argc, char **argv) {
     auxiliary += 2;
   }
   if (!headers || header_size < sizeof(MtElfProgramHeader)) return 1;
+  mt_elf_headers = headers;
+  mt_elf_header_size = header_size;
+  mt_elf_header_count = header_count;
 
   for (mt_u64 i = 0; i < header_count; i++) {
     MtElfProgramHeader *header = (MtElfProgramHeader *)
@@ -3448,6 +3454,7 @@ typedef mt_u64 (*MtPthreadStart)(void *);
 
 typedef struct MtThread {
   volatile int tid;
+  volatile int os_tid;
   int detached;
   void *stack;
   mt_size stack_size;
@@ -3481,6 +3488,256 @@ static void mt_thread_child(MtThread *thread) {
   mt_syscall6(MT_SYS_EXIT, 0, 0, 0, 0, 0, 0);
   for (;;) {
   }
+}
+
+#define MT_PT_DYNAMIC 2
+#define MT_PT_PHDR 6
+#define MT_DT_NULL 0
+#define MT_DT_HASH 4
+#define MT_DT_STRTAB 5
+#define MT_DT_SYMTAB 6
+#define MT_DT_DEBUG 21
+#define MT_DT_GNU_HASH 0x6ffffef5
+#define MT_DT_VERSYM 0x6ffffff0
+
+typedef struct MtElfDyn {
+  mt_i64 tag;
+  mt_u64 value;
+} MtElfDyn;
+
+typedef struct MtElfSym {
+  mt_u32 name;
+  mt_u8 info;
+  mt_u8 other;
+  mt_u16 section;
+  mt_u64 value;
+  mt_u64 size;
+} MtElfSym;
+
+typedef struct MtLinkMap {
+  mt_u64 base;
+  const char *name;
+  MtElfDyn *dynamic;
+  struct MtLinkMap *next;
+  struct MtLinkMap *previous;
+} MtLinkMap;
+
+typedef struct MtRDebug {
+  int version;
+  MtLinkMap *map;
+} MtRDebug;
+
+typedef int (*MtGlibcPthreadCreate)(mt_u64 *, const void *,
+                                    void *(*)(void *), void *);
+typedef int (*MtGlibcPthreadDetach)(mt_u64);
+typedef int (*MtGlibcAttrInit)(void *);
+typedef int (*MtGlibcAttrSetStackSize)(void *, mt_size);
+typedef int (*MtGlibcAttrDestroy)(void *);
+
+static volatile int mt_glibc_state;
+static MtGlibcPthreadCreate mt_glibc_pthread_create;
+static MtGlibcPthreadDetach mt_glibc_pthread_detach;
+static MtGlibcAttrInit mt_glibc_attr_init;
+static MtGlibcAttrSetStackSize mt_glibc_attr_setstacksize;
+static MtGlibcAttrDestroy mt_glibc_attr_destroy;
+
+static int mt_cstr_equal(const char *a, const char *b) {
+  while (*a && *a == *b) {
+    a++;
+    b++;
+  }
+  return *a == *b;
+}
+
+static int mt_cstr_contains(const char *text, const char *part) {
+  if (!text) return 0;
+  for (; *text; text++) {
+    const char *t = text;
+    const char *p = part;
+    while (*p && *t == *p) {
+      t++;
+      p++;
+    }
+    if (!*p) return 1;
+  }
+  return 0;
+}
+
+static mt_u64 mt_dyn_address(const MtLinkMap *map, mt_u64 value) {
+  return value < map->base ? value + map->base : value;
+}
+
+static int mt_glibc_symbol_ok(const MtElfSym *symbol, const mt_u16 *versions,
+                              mt_u32 index) {
+  if (symbol->section == 0 || symbol->value == 0) return 0;
+  if ((symbol->info & 0xf) != 2 && (symbol->info & 0xf) != 10) return 0;
+  if (versions && (versions[index] & 0x8000u)) return 0;
+  return 1;
+}
+
+static void *mt_glibc_lookup(const MtLinkMap *map, const char *wanted) {
+  const MtElfSym *symbols = MT_NULL;
+  const char *strings = MT_NULL;
+  const mt_u32 *gnu_hash = MT_NULL;
+  const mt_u32 *sysv_hash = MT_NULL;
+  const mt_u16 *versions = MT_NULL;
+  for (const MtElfDyn *d = map->dynamic; d->tag != MT_DT_NULL; d++) {
+    if (d->tag == MT_DT_SYMTAB) {
+      symbols = (const MtElfSym *)mt_dyn_address(map, d->value);
+    } else if (d->tag == MT_DT_STRTAB) {
+      strings = (const char *)mt_dyn_address(map, d->value);
+    } else if (d->tag == MT_DT_GNU_HASH) {
+      gnu_hash = (const mt_u32 *)mt_dyn_address(map, d->value);
+    } else if (d->tag == MT_DT_HASH) {
+      sysv_hash = (const mt_u32 *)mt_dyn_address(map, d->value);
+    } else if (d->tag == MT_DT_VERSYM) {
+      versions = (const mt_u16 *)mt_dyn_address(map, d->value);
+    }
+  }
+  if (!symbols || !strings) return MT_NULL;
+  if (gnu_hash) {
+    mt_u32 bucket_count = gnu_hash[0];
+    mt_u32 symbol_offset = gnu_hash[1];
+    mt_u32 bloom_size = gnu_hash[2];
+    const mt_u32 *buckets = gnu_hash + 4 + bloom_size * 2u;
+    const mt_u32 *chain = buckets + bucket_count;
+    mt_u32 hash = 5381u;
+    for (const char *c = wanted; *c; c++) {
+      hash = hash * 33u + (mt_u8)*c;
+    }
+    if (bucket_count == 0) return MT_NULL;
+    mt_u32 index = buckets[hash % bucket_count];
+    if (index < symbol_offset) return MT_NULL;
+    for (;; index++) {
+      mt_u32 entry = chain[index - symbol_offset];
+      if ((entry | 1u) == (hash | 1u) &&
+          mt_cstr_equal(strings + symbols[index].name, wanted) &&
+          mt_glibc_symbol_ok(&symbols[index], versions, index)) {
+        return (void *)(map->base + symbols[index].value);
+      }
+      if (entry & 1u) break;
+    }
+    return MT_NULL;
+  }
+  if (sysv_hash) {
+    mt_u32 bucket_count = sysv_hash[0];
+    const mt_u32 *buckets = sysv_hash + 2;
+    const mt_u32 *chain = buckets + bucket_count;
+    mt_u32 hash = 0;
+    for (const char *c = wanted; *c; c++) {
+      hash = (hash << 4) + (mt_u8)*c;
+      mt_u32 high = hash & 0xf0000000u;
+      if (high) hash ^= high >> 24;
+      hash &= ~high;
+    }
+    if (bucket_count == 0) return MT_NULL;
+    for (mt_u32 index = buckets[hash % bucket_count]; index;
+         index = chain[index]) {
+      if (mt_cstr_equal(strings + symbols[index].name, wanted) &&
+          mt_glibc_symbol_ok(&symbols[index], versions, index)) {
+        return (void *)(map->base + symbols[index].value);
+      }
+    }
+  }
+  return MT_NULL;
+}
+
+static const MtLinkMap *mt_glibc_find_libc(void) {
+  if (!mt_elf_headers) return MT_NULL;
+  mt_u64 bias = 0;
+  const MtElfDyn *dynamic = MT_NULL;
+  for (mt_u64 i = 0; i < mt_elf_header_count; i++) {
+    const MtElfProgramHeader *header = (const MtElfProgramHeader *)
+        ((const mt_u8 *)mt_elf_headers + i * mt_elf_header_size);
+    if (header->type == MT_PT_PHDR) {
+      bias = (mt_u64)mt_elf_headers - header->virtual_address;
+    }
+  }
+  for (mt_u64 i = 0; i < mt_elf_header_count; i++) {
+    const MtElfProgramHeader *header = (const MtElfProgramHeader *)
+        ((const mt_u8 *)mt_elf_headers + i * mt_elf_header_size);
+    if (header->type == MT_PT_DYNAMIC) {
+      dynamic = (const MtElfDyn *)(bias + header->virtual_address);
+    }
+  }
+  if (!dynamic) return MT_NULL;
+  const MtRDebug *debug = MT_NULL;
+  for (const MtElfDyn *d = dynamic; d->tag != MT_DT_NULL; d++) {
+    if (d->tag == MT_DT_DEBUG) debug = (const MtRDebug *)d->value;
+  }
+  if (!debug) return MT_NULL;
+  for (const MtLinkMap *map = debug->map; map; map = map->next) {
+    if (mt_cstr_contains(map->name, "libc.so.6")) return map;
+  }
+  return MT_NULL;
+}
+
+static int mt_glibc_threads(void) {
+  int state = __atomic_load_n(&mt_glibc_state, __ATOMIC_ACQUIRE);
+  if (state) return state == 1;
+  const MtLinkMap *libc = mt_glibc_find_libc();
+  if (libc) {
+    mt_glibc_pthread_create =
+        (MtGlibcPthreadCreate)mt_glibc_lookup(libc, "pthread_create");
+    mt_glibc_pthread_detach =
+        (MtGlibcPthreadDetach)mt_glibc_lookup(libc, "pthread_detach");
+    mt_glibc_attr_init =
+        (MtGlibcAttrInit)mt_glibc_lookup(libc, "pthread_attr_init");
+    mt_glibc_attr_setstacksize = (MtGlibcAttrSetStackSize)mt_glibc_lookup(
+        libc, "pthread_attr_setstacksize");
+    mt_glibc_attr_destroy =
+        (MtGlibcAttrDestroy)mt_glibc_lookup(libc, "pthread_attr_destroy");
+  }
+  state = (libc && mt_glibc_pthread_create && mt_glibc_pthread_detach &&
+           mt_glibc_attr_init && mt_glibc_attr_setstacksize &&
+           mt_glibc_attr_destroy)
+              ? 1
+              : 2;
+  __atomic_store_n(&mt_glibc_state, state, __ATOMIC_RELEASE);
+  return state == 1;
+}
+
+static void *mt_glibc_thread_entry(void *raw) {
+  MtThread *thread = (MtThread *)raw;
+  mt_stack_high = __builtin_frame_address(0);
+  __atomic_store_n(&thread->os_tid,
+                   (int)mt_sys_result(
+                       mt_syscall6(MT_SYS_GETTID, 0, 0, 0, 0, 0, 0)),
+                   __ATOMIC_RELEASE);
+  mt_futex(&thread->os_tid, MT_FUTEX_WAKE, 0x7fffffff, MT_NULL);
+  thread->result = thread->pthread_start
+                       ? thread->pthread_start(thread->argument)
+                       : (mt_u64)thread->start(thread->argument);
+  __atomic_store_n(&thread->tid, 0, __ATOMIC_RELEASE);
+  mt_futex(&thread->tid, MT_FUTEX_WAKE, 0x7fffffff, MT_NULL);
+  return MT_NULL;
+}
+
+static int mt_glibc_thread_start(MtThread *thread, mt_size stack_size,
+                                 mt_u32 *thread_id) {
+  mt_u64 attributes[16];
+  mt_u64 handle = 0;
+  thread->tid = 1;
+  thread->os_tid = 0;
+  if (mt_glibc_attr_init(attributes) != 0) return 0;
+  (void)mt_glibc_attr_setstacksize(attributes, stack_size);
+  int created =
+      mt_glibc_pthread_create(&handle, attributes, mt_glibc_thread_entry,
+                              thread);
+  (void)mt_glibc_attr_destroy(attributes);
+  if (created != 0) return 0;
+  (void)mt_glibc_pthread_detach(handle);
+  if (thread_id) {
+    for (;;) {
+      int os_tid = __atomic_load_n(&thread->os_tid, __ATOMIC_ACQUIRE);
+      if (os_tid != 0) {
+        *thread_id = (mt_u32)os_tid;
+        break;
+      }
+      mt_futex(&thread->os_tid, MT_FUTEX_WAIT, 0, MT_NULL);
+    }
+  }
+  return 1;
 }
 
 #if defined(__x86_64__)
@@ -3536,6 +3793,19 @@ mt_i64 mettle_thread_create(void *attributes, mt_u64 stack_size,
   if (size < 65536) {
     size = 65536;
   }
+  if (mt_glibc_threads()) {
+    MtThread *thread = (MtThread *)calloc(1, sizeof(MtThread));
+    if (!thread) {
+      return 0;
+    }
+    thread->start = start;
+    thread->argument = argument;
+    if (!mt_glibc_thread_start(thread, size, thread_id)) {
+      free(thread);
+      return 0;
+    }
+    return (mt_i64)thread;
+  }
   MtThread *thread = (MtThread *)calloc(1, sizeof(MtThread));
   void *stack = malloc(size);
   if (!thread || !stack) {
@@ -3579,6 +3849,19 @@ mt_i64 mettle_thread_create(void *attributes, mt_u64 stack_size,
 static mt_i64 mt_pthread_create(MtPthreadStart start, void *argument) {
   if (!start) {
     return 0;
+  }
+  if (mt_glibc_threads()) {
+    MtThread *thread = (MtThread *)calloc(1, sizeof(MtThread));
+    if (!thread) {
+      return 0;
+    }
+    thread->pthread_start = start;
+    thread->argument = argument;
+    if (!mt_glibc_thread_start(thread, MT_THREAD_STACK_SIZE, MT_NULL)) {
+      free(thread);
+      return 0;
+    }
+    return (mt_i64)thread;
   }
   MtThread *thread = (MtThread *)calloc(1, sizeof(MtThread));
   void *stack = malloc(MT_THREAD_STACK_SIZE);

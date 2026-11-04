@@ -1,0 +1,67 @@
+import "std/io";
+import "std/thread";
+
+extern fn c_strtol(text: cstring, end: cstring*, base: int32) -> int64 = "strtol";
+extern fn c_errno_location() -> int32* = "__errno_location";
+extern fn c_getrandom(buffer: uint8*, length: uint64, flags: uint32) -> int64 = "getrandom";
+extern fn c_opendir(path: cstring) -> cstring = "opendir";
+extern fn c_closedir(directory: cstring) -> int32 = "closedir";
+
+struct GlibcSlot {
+  ok: int32;
+  bad: int32;
+}
+
+var g_slots: GlibcSlot[4];
+
+fn glibc_round() -> bool {
+  var big: string = "99999999999999999999";
+  var errno: int32* = c_errno_location();
+  *errno = 0;
+  var value: int64 = c_strtol((cstring)big.chars, 0, 10);
+  if (value != 9223372036854775807 || *errno != 34) { return false; }
+  var random: uint8[32];
+  if (c_getrandom(&random[0], (uint64)32, (uint32)0) != 32) { return false; }
+  var root: string = "/";
+  var directory: cstring = c_opendir((cstring)root.chars);
+  if (directory == 0) { return false; }
+  if (c_closedir(directory) != 0) { return false; }
+  return true;
+}
+
+fn glibc_worker(arg: cstring) -> uint32 {
+  var slot: GlibcSlot* = (GlibcSlot*)arg;
+  for i in 0..500 {
+    if (glibc_round()) { slot->ok = slot->ok + 1; } else { slot->bad = slot->bad + 1; }
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  if (!glibc_round()) {
+    println("THREADS GLIBC FAIL: main thread");
+    return 1;
+  }
+  var handles: int64[4];
+  for i in 0..4 {
+    handles[i] = CreateThread(0, (uint64)0, &glibc_worker, (cstring)(&g_slots[i]), (uint32)0, 0);
+    if (handles[i] == 0) {
+      println("THREADS GLIBC FAIL: create");
+      return 1;
+    }
+  }
+  var ok: int32 = 0;
+  var bad: int32 = 0;
+  for i in 0..4 {
+    thread_join_infinite(handles[i]);
+    thread_close(handles[i]);
+    ok = ok + g_slots[i].ok;
+    bad = bad + g_slots[i].bad;
+  }
+  if (ok != 2000 || bad != 0) {
+    println("THREADS GLIBC FAIL: ok {ok}, bad {bad}");
+    return 1;
+  }
+  println("THREADS GLIBC OK");
+  return 0;
+}

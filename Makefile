@@ -304,6 +304,9 @@ test: $(TARGET) bundle-runtime
 	$(TARGET) --build -s tests/test_runtime_null_deref_check.mettle \
 		-o $(BINDIR)/owned-crash-test
 	@$(BINDIR)/owned-crash-test >/dev/null 2>&1; test $$? -eq 1
+	$(TARGET) --build -l:libc.so.6 tests/test_threads_glibc.mettle \
+		-o $(BINDIR)/glibc-threads-test
+	@$(BINDIR)/glibc-threads-test
 	$(TARGET) --build -s tests/concurrent_crash_recovery.mettle \
 		-o $(BINDIR)/owned-concurrent-crash-test
 	@$(BINDIR)/owned-concurrent-crash-test 2>/dev/null
