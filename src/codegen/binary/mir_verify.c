@@ -331,6 +331,36 @@ static int mir_shape_operand_assigned(MirShape *st, size_t at,
   return 1;
 }
 
+static int mir_shape_position_covers(MirShape *st, size_t at, MirVregId v) {
+  const MirVreg *vr;
+  if (v == MIR_VREG_NONE || !mir_shape_vreg_ok(st->fn, v)) {
+    return 1;
+  }
+  vr = &st->fn->vregs[v];
+  if (at < (size_t)(vr->live_start < 0 ? 0 : vr->live_start) ||
+      vr->live_end < 0 || at > (size_t)vr->live_end) {
+    return mir_shape_fail(st, at, "code moved outside its vreg's live positions",
+                          v);
+  }
+  return 1;
+}
+
+static int mir_shape_moved_positions(MirShape *st, size_t at) {
+  const MirInst *in = &st->fn->insns[at];
+  MirVregId uses[6];
+  int n;
+  if (!st->fn->code_moved_after_allocation) {
+    return 1;
+  }
+  n = mir_cfg_insn_uses(in, uses);
+  for (int k = 0; k < n; k++) {
+    if (!mir_shape_position_covers(st, at, uses[k])) {
+      return 0;
+    }
+  }
+  return mir_shape_position_covers(st, at, mir_cfg_insn_def(in));
+}
+
 int mir_verify_structure(MirFunction *fn, const char *stage, int allocated) {
   MirShape st;
   int ok = 1;
@@ -368,7 +398,8 @@ int mir_verify_structure(MirFunction *fn, const char *stage, int allocated) {
     if (ok && allocated) {
       ok = mir_shape_operand_assigned(&st, i, &in->dst) &&
            mir_shape_operand_assigned(&st, i, &in->a) &&
-           mir_shape_operand_assigned(&st, i, &in->b);
+           mir_shape_operand_assigned(&st, i, &in->b) &&
+           mir_shape_moved_positions(&st, i);
     }
   }
   free(st.labels);

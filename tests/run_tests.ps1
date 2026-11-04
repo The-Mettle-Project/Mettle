@@ -3887,6 +3887,29 @@ foreach ($layoutCase in @(
   }
 }
 
+# Code moved after register allocation must leave live positions that still
+# cover it, or a scratch register can land on a live value. A miscompile from
+# this shows up only under spill pressure, so the verifier checks it directly.
+foreach ($movedPath in @("tests/codegen/threaded_dispatch.mettle", "tests/codegen/moved_code_keeps_live_registers.mettle")) {
+  $total++
+  $movedName = "layout_positions_$([System.IO.Path]::GetFileNameWithoutExtension($movedPath))"
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "$movedName.exe"
+    $env:METTLE_MIR_VERIFY = "1"
+    $verifyOut = & $CompilerPath --build --release $movedPath -o $exePath 2>&1 | Out-String
+    $verifyExit = $LASTEXITCODE
+    Remove-Item Env:METTLE_MIR_VERIFY
+    if ($verifyExit -ne 0) { throw "verifier refused moved code: $verifyOut" }
+    Write-CaseResult -Name $movedName -Passed $true
+  }
+  catch {
+    Remove-Item Env:METTLE_MIR_VERIFY -ErrorAction SilentlyContinue
+    $failed++
+    Write-CaseResult -Name $movedName -Passed $false -Reason $_.Exception.Message
+  }
+}
+
 # Which loads leave a loop, read from the IR after each pass. A fixture only
 # proves the answer is right, and a hoist that stopped firing leaves it right.
 foreach ($hoistCase in @(
