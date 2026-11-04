@@ -1,6 +1,6 @@
 // Staged code swaps, applied only at a quiesce point.
 //
-// This is a runtime component written in Mettle. V.3.3 asks that the runtime
+// This is a runtime component written in Mettle. Section 10 of the ideology asks that the runtime
 // be legible: readable as source, steppable in the same debugger, visible in
 // the same profiler, reporting through the same diagnostics. A component
 // written in C is none of those things to a Mettle programmer, so the newest

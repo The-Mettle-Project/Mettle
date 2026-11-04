@@ -166,9 +166,9 @@ hot path reaches codegen with the register allocator. The optimization
 contracts the compiler ships are the built-in special case of this.
 
 The image is a snapshot, and it is the whole of what crosses the line. There is
-no IR in it, no pass state, no allocator, no scheduler. III.3 is why: a rule
-sees what a programmer at that point in the pipeline would see, and libmtlc
-stays free to change how it got there. Reading the snapshot costs the program
+no IR in it, no pass state, no allocator, no scheduler. Nothing reaches those
+from Mettle yet, and [the ideology](ideology.md#5-the-compiler-is-open) says
+they should. Reading the snapshot costs the program
 nothing at run time, because a rule never links.
 
 ## Rules over what the program does with memory

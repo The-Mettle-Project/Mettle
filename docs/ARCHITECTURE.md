@@ -328,6 +328,6 @@ debugging needs no gdb, no PDB, and no DWARF consumer.
 
 ## See also
 
-- [Ideology](ideology.md), for why these choices rather than others
+- [What is wrong with systems programming](ideology.md), for why these choices
 - [libmtlc internals](libmtlc/internals.md), for extending the backend
 - [Mettle and libmtlc](mettle-and-libmtlc.md), for the boundary

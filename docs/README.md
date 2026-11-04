@@ -100,8 +100,8 @@ A second, non-Mettle frontend that exercises the whole public API lives in
 
 ## Design
 
-- [Ideology](ideology.md): the rules the language holds itself to, and what
-  each one costs.
+- [What is wrong with systems programming](ideology.md): what Mettle is, and the
+  rules a proposal has to pass.
 - [Architecture](ARCHITECTURE.md): the pipeline, subsystem by subsystem.
 - [Benchmarks](benchmarks/README.md): the suites, how they are measured, and
   how to regenerate them.

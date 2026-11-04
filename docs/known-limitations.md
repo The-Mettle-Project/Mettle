@@ -79,8 +79,9 @@ self-consistent and calls nothing built with another.
 A described machine is one a program is written for and run on. It is not one
 the compiler's backend can be aimed at: the register allocator does not
 schedule around a described instruction, and a rewrite rule cannot map IR onto
-one. Both would mean handing out the allocator and the emitters, which III.3
-keeps private, and that is the next mountain rather than this one.
+one. Both need the allocator and the emitters open to Mettle, which
+[the ideology](ideology.md#5-the-compiler-is-open) calls for and nothing builds
+yet.
 
 An operand occupies exactly one byte, so an immediate is 0 to 255 and a
 program larger than that has to build wider values out of instructions.
@@ -551,7 +552,8 @@ and not an omission.
 
 Two pointers cannot be declared disjoint, and they are not going to be: a
 declaration the compiler acts on and cannot check is a proof, annotated, which
-I.4 refuses. What the compiler does instead is emit a test. Where multi-store
+[the ideology](ideology.md#8-types-and-proofs)
+refuses. What the compiler does instead is emit a test. Where multi-store
 fission cannot prove the regions distinct, the loop is kept and a run-time
 overlap test is put in front of the kernels; where it can, no test is emitted
 at all. So a proof deletes a test rather than deciding whether the

@@ -1,9 +1,9 @@
 # Register tiles, numerics contracts, contract-safe tuning
 
 Three features, in order. Each is useful without the next. Every choice below
-is measured against `docs/ideology.md`: I.1 (the compiler asserts only what it
-proved), I.2 (reuse the interpreter), I.4 (intent is written, proofs are
-inferred), VII (refusals).
+is measured against `docs/ideology.md`: section 7 (the compiler asserts only what
+it proved), section 11 (reuse the interpreter), section 8 (intent is written,
+proofs are inferred).
 
 ## A. Register tiles
 

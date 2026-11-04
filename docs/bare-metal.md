@@ -412,9 +412,10 @@ built.
 
 What this does not do is aim the compiler's backend at a described machine.
 The register allocator does not schedule around a described instruction, and a
-rewrite rule cannot map IR onto one, because both would mean handing out the
-allocator and the emitters. III.3 is the reason, the same one that keeps pass
-ordering private, and [known limitations](known-limitations.md) says so.
+rewrite rule cannot map IR onto one, because both need the allocator and the
+emitters open to Mettle. [The ideology](ideology.md#5-the-compiler-is-open) calls
+for that and nothing builds it yet, and
+[known limitations](known-limitations.md) says so.
 
 ## What is proven, and on which machine
 
@@ -437,12 +438,11 @@ proven on an emulator and not on silicon, and the GPU backends are proven
 well-formed and not executed. Both are stated here rather than left for a
 reader to discover, because a gate that skips quietly is the same as no gate.
 
-And the machinery stays the compiler's. The emitters, the register allocator
-and the pass ordering are libmtlc's, and no description reaches them: a
-description says what a machine has, and the emitter decides what to do about
-it. III.3 in [the ideology](ideology.md) is the reason, and it is the same
-reason a metaprogram never sees pass ordering. Everything above is what
-handing out the description bought while keeping that line.
+The machinery is out of a description's reach. The emitters, the register
+allocator and the pass ordering are libmtlc's today: a description says what a
+machine has, and the emitter decides what to do about it.
+[The ideology](ideology.md#5-the-compiler-is-open) calls for opening them to
+Mettle, and nothing builds that yet.
 
 ## A chosen link address
 

@@ -11,7 +11,7 @@
 // rather than pointers. Equal length and equal bytes: a view with no bytes
 // equals another with no bytes whatever either pointer holds.
 //
-// Written in Mettle for the reason every runtime component should be (V.3.3):
+// Written in Mettle for the reason every runtime component should be (ideology, section 10):
 // it reads as source, steps in the same debugger and appears in the same
 // profiler. It touches no operating system, so nothing here needs a binding
 // that does not exist yet.
