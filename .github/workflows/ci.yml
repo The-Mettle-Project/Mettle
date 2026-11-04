@@ -248,15 +248,15 @@ jobs:
         env:
           REGISTRY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          base_args=""
+          base_args=()
           case "$REGISTRY_BASE" in
             ""|0000000000000000000000000000000000000000) ;;
             *)
               git fetch --depth=1 origin "$REGISTRY_BASE"
-              base_args="--base FETCH_HEAD"
+              base_args=(--base FETCH_HEAD)
               ;;
           esac
-          python3 website/registry.py check --compiler ./bin/mettle $base_args
+          python3 website/registry.py check --compiler ./bin/mettle "${base_args[@]}"
 
       - name: Native ELF backend tests
         run: bash tools/test-elf-native.sh
