@@ -17,7 +17,7 @@ onwards: the optimizers, code generation, and native PE and ELF linking.
 
 The boundary between them is real and the build enforces it. `make libmtlc`
 archives the backend on its own, and the build fails when a frontend symbol has
-leaked into it. [Mettle and libmtlc](docs/mettle-and-libmtlc.md) draws the line
+leaked into it. [Mettle and libmtlc](../docs/mettle-and-libmtlc.md) draws the line
 in full.
 
 ## Ground rules
@@ -183,7 +183,7 @@ references.
 
 Signatures, struct fields, global `var`s and effects state their types. A local
 binding may leave its type off where the line says it, and
-[Types](docs/types.md#leaving-the-type-off) lists where that is.
+[Types](../docs/types.md#leaving-the-type-off) lists where that is.
 
 ## Submitting a pull request
 
@@ -215,4 +215,4 @@ a page of this guide made no sense.
 ## License
 
 By contributing you agree that your contributions are licensed under Apache 2.0,
-the same license as the project. See [LICENSE](LICENSE).
+the same license as the project. See [LICENSE](../LICENSE).

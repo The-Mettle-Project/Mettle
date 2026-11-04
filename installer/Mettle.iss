@@ -75,7 +75,7 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=out
 OutputBaseFilename=Mettle-Setup
-SetupIconFile=..\mettle.ico
+SetupIconFile=art\mettle.ico
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
 DisableFinishedPage=no
@@ -101,7 +101,7 @@ Name: "associate"; Description: "Associate &.mettle files with Mettle"; GroupDes
 [Files]
 Source: "..\bin\mettle.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "mettle-build.bat"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "..\mettle.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "art\mettle.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\stdlib\*"; DestDir: "{app}\stdlib"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\bin\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs

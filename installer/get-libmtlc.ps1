@@ -1,6 +1,6 @@
 # libmtlc fetcher (Windows): get ONLY the backend (headers + static library).
 #
-#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/get-libmtlc.ps1 | iex
+#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/installer/get-libmtlc.ps1 | iex
 #
 # Downloads the prebuilt libmtlc release for Windows x64 and unpacks it into
 # .\libmtlc (include\ + lib\). That folder is everything a frontend links

@@ -21,9 +21,9 @@ from PIL import Image, ImageDraw, ImageFont
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OUT = os.path.join(HERE, "art")
-MARK_SVG = os.path.join(ROOT, "mettle.svg")
+MARK_SVG = os.path.join(OUT, "mettle.svg")
 
-# The site's palette (site/index.html :root).
+# The site's palette (website/pages/index.html :root).
 PAPER = (0xF2, 0xEB, 0xD8)
 PAPER_3 = (0xE6, 0xDA, 0xBD)
 INK = (0x21, 0x1C, 0x14)

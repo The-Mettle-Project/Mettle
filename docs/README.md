@@ -108,5 +108,5 @@ A second, non-Mettle frontend that exercises the whole public API lives in
 
 ## Contributing
 
-[CONTRIBUTING.md](../CONTRIBUTING.md) has the build and test workflow, and the
+[CONTRIBUTING.md](../.github/CONTRIBUTING.md) has the build and test workflow, and the
 rules that keep the backend frontend-agnostic.

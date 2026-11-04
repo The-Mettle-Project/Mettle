@@ -1,7 +1,7 @@
 #!/bin/sh
 # libmtlc fetcher: get ONLY the backend (headers + static library), no driver.
 #
-#   curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/get-libmtlc.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/installer/get-libmtlc.sh | sh
 #
 # Downloads the prebuilt libmtlc release for this platform and unpacks it into
 # ./libmtlc (include/ + lib/). That folder is everything a frontend links

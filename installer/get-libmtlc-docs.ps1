@@ -1,6 +1,6 @@
 # libmtlc docs fetcher (Windows): download the docs/libmtlc reference set.
 #
-#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/get-libmtlc-docs.ps1 | iex
+#   irm https://raw.githubusercontent.com/suidvandiewereld/Mettle/master/installer/get-libmtlc-docs.ps1 | iex
 #
 # Downloads the API reference, IR model, type system, pipeline, and internals
 # docs (docs/libmtlc/*.md) via the GitHub Contents API and writes them into

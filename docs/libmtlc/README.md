@@ -9,9 +9,9 @@ NVIDIA PTX, SPIR-V), and its own PE linker on Windows. A frontend links
 running binary.
 
 It ships as its own release asset, `libmtlc-<tag>-<target>`, holding the
-headers, the archive, and the freestanding runtime object. `get-libmtlc.sh` and
-`get-libmtlc.ps1` fetch it, and `make install-libmtlc` installs it with a
-pkg-config file. Sharing a repository with the Mettle frontend changed how the
+headers, the archive, and the freestanding runtime object.
+`installer/get-libmtlc.sh` and `installer/get-libmtlc.ps1` fetch it, and
+`make install-libmtlc` installs it with a pkg-config file. Sharing a repository with the Mettle frontend changed how the
 backend is developed, not how it is consumed; see
 [Is libmtlc still a separate artifact?](../mettle-and-libmtlc.md#is-libmtlc-still-a-separate-artifact)
 for what the merge did and did not change, including why the API version
