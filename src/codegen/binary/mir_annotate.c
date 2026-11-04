@@ -1467,6 +1467,20 @@ void mir_annotate_record_synthetic(const char *label, const char *decision,
   r->ports = "";
 }
 
+void mir_annotate_relocate(size_t (*map)(void *, size_t), void *map_arg,
+                           size_t base, const unsigned char *code) {
+  if (!g.enabled || !g.cur) return;
+  for (size_t i = 0; i < g.cur->insn_count; i++) {
+    AnnotInsn *r = &g.cur->insns[i];
+    size_t start = map(map_arg, base + r->off);
+    size_t end = map(map_arg, base + r->off + r->len);
+    r->off = start - base;
+    r->len = end - start;
+    free(r->bytes);
+    r->bytes = bytes_to_hex(code + start, r->len);
+  }
+}
+
 static int find_label_rec(const AnnotFunc *f, const char *name) {
   if (!name) return -1;
   for (size_t i = 0; i < f->insn_count; i++)

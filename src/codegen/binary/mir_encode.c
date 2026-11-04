@@ -3,6 +3,8 @@
 
 long long mir_encode_last_spills = 0;
 #include "codegen/binary/mir_annotate.h"
+#include "codegen/binary/mir_relax.h"
+#include "ir/ir_optimize.h"
 #include "codegen/binary/simd_internal.h"
 #include "codegen/code_generator_internal.h"
 #include "common.h"
@@ -3127,6 +3129,7 @@ typedef struct {
   size_t pending_table_count;
   size_t pending_table_capacity;
   MirColdDivides cold_divides;
+  MirRelax relax;
   char epilogue_label[64];
   int epilogue_defined;
   int epilogue_referenced;
@@ -3134,6 +3137,20 @@ typedef struct {
 } MirEncodeState;
 
 typedef int (*MirEncodeHandler)(MirEncodeState *st, const MirInst *in);
+
+static int mir_emit_label_branch(MirEncodeState *st, unsigned char cc,
+                                 const char *label) {
+  BinaryFunctionContext *ctx = st->fn->context;
+  size_t start = ctx->code.size;
+  size_t fixup = ctx->label_fixups.count;
+  size_t off = 0;
+  int placed = cc ? binary_emit_jcc_placeholder(&ctx->code, cc, &off)
+                  : binary_emit_jmp_placeholder(&ctx->code, &off);
+  return placed &&
+         binary_label_fixup_table_add(&ctx->label_fixups, label, off) &&
+         mir_relax_note_branch(&st->relax, start, ctx->code.size - start, cc,
+                               label, fixup);
+}
 
 /* Every return but the last jumps forward into the final copy, so the shared
    epilogue is a taken forward branch and never a backward one. */
@@ -3146,10 +3163,7 @@ static int mir_encode_return(MirEncodeState *st, const MirInst *in) {
     return mir_emit_epilogue(fn);
   }
   if (!mir_ret_is_last(fn, st->index)) {
-    size_t off = 0;
-    if (!binary_emit_jmp_placeholder(&ctx->code, &off) ||
-        !binary_label_fixup_table_add(&ctx->label_fixups, st->epilogue_label,
-                                      off)) {
+    if (!mir_emit_label_branch(st, 0, st->epilogue_label)) {
       return enc_err(fn, "out of memory in shared epilogue jump");
     }
     st->epilogue_referenced = 1;
@@ -3437,9 +3451,7 @@ static int mir_encode_float_compare(MirEncodeState *st, const MirInst *in) {
       int cmp = (in->width == 4)
                     ? binary_emit_ucomiss_xmm_xmm(&ctx->code, av, bv)
                     : binary_emit_ucomisd_xmm_xmm(&ctx->code, av, bv);
-      size_t off = 0;
-      if (!cmp || !binary_emit_jcc_placeholder(&ctx->code, in->cc, &off) ||
-          !binary_label_fixup_table_add(&ctx->label_fixups, in->dst.sym, off)) {
+      if (!cmp || !mir_emit_label_branch(st, in->cc, in->dst.sym)) {
         ok = enc_err(fn, "out of memory in fcmpbr");
       }
       break;
@@ -3469,9 +3481,7 @@ static int mir_encode_branch(MirEncodeState *st, const MirInst *in) {
       if (mir_jump_is_fallthrough(fn, i)) {
         break;
       }
-      size_t off = 0;
-      if (!binary_emit_jmp_placeholder(&ctx->code, &off) ||
-          !binary_label_fixup_table_add(&ctx->label_fixups, in->dst.sym, off)) {
+      if (!mir_emit_label_branch(st, 0, in->dst.sym)) {
         ok = enc_err(fn, "out of memory in jmp");
       }
       break;
@@ -3483,9 +3493,7 @@ static int mir_encode_branch(MirEncodeState *st, const MirInst *in) {
         ok = enc_err(fn, "out of memory in branch test");
         break;
       }
-      size_t off = 0;
-      if (!binary_emit_jcc_placeholder(&ctx->code, in->cc, &off) ||
-          !binary_label_fixup_table_add(&ctx->label_fixups, in->dst.sym, off)) {
+      if (!mir_emit_label_branch(st, in->cc, in->dst.sym)) {
         ok = enc_err(fn, "out of memory in branch");
       }
       break;
@@ -4099,11 +4107,7 @@ static int mir_cmpbr_reuses_flags(MirEncodeState *st, const MirInst *in) {
 }
 
 static int mir_cmpbr_emit_branch(MirEncodeState *st, const MirInst *in) {
-  BinaryFunctionContext *ctx = st->fn->context;
-  size_t off = 0;
-
-  if (!binary_emit_jcc_placeholder(&ctx->code, in->cc, &off) ||
-      !binary_label_fixup_table_add(&ctx->label_fixups, in->dst.sym, off)) {
+  if (!mir_emit_label_branch(st, in->cc, in->dst.sym)) {
     return enc_err(st->fn, "out of memory in cmpbr");
   }
   return 1;
@@ -4559,20 +4563,23 @@ static char *mir_scan_loop_alignment(const MirFunction *fn) {
   return align_label;
 }
 
-static int mir_encode_loop_alignment(MirFunction *fn, char wanted) {
-  BinaryFunctionContext *ctx = fn->context;
+static int mir_encode_loop_alignment(MirEncodeState *st, char wanted) {
+  BinaryFunctionContext *ctx = st->fn->context;
+  size_t start = ctx->code.size;
+  size_t boundary = BINARY_LOOP_ALIGN;
+  size_t max_pad = BINARY_LOOP_ALIGN_MAX_PAD;
 
   if (wanted == 4) {
-    return binary_emit_align_code(&ctx->code, BINARY_JUMP_TARGET_ALIGN,
-                                  BINARY_JUMP_TARGET_ALIGN - 1);
+    boundary = BINARY_JUMP_TARGET_ALIGN;
+    max_pad = BINARY_JUMP_TARGET_ALIGN - 1;
+  } else if (wanted == 2 || wanted == 3) {
+    ctx->wants_wide_loop_alignment = 1;
+    boundary = BINARY_LOOP_ALIGN_BIG;
+    max_pad = BINARY_LOOP_ALIGN_BIG_MAX_PAD;
   }
-  if (wanted != 2 && wanted != 3) {
-    return binary_emit_align_code(&ctx->code, BINARY_LOOP_ALIGN,
-                                  BINARY_LOOP_ALIGN_MAX_PAD);
-  }
-  ctx->wants_wide_loop_alignment = 1;
-  return binary_emit_align_code(&ctx->code, BINARY_LOOP_ALIGN_BIG,
-                                BINARY_LOOP_ALIGN_BIG_MAX_PAD);
+  return binary_emit_align_code(&ctx->code, boundary, max_pad) &&
+         mir_relax_note_pad(&st->relax, start, ctx->code.size - start, boundary,
+                            max_pad, wanted != 4);
 }
 
 static int mir_encode_location_marker(MirFunction *fn, const MirInst *in) {
@@ -4590,6 +4597,37 @@ static int mir_encode_location_marker(MirFunction *fn, const MirInst *in) {
   return code_generator_binary_emit_runtime_location_marker(
       fn->generator, fn->context, src->location.line, src->location.column,
       code_generator_runtime_filename(fn->generator, src->location.filename));
+}
+
+static size_t mir_relax_map_for_annotation(void *relax, size_t old_offset) {
+  return mir_relax_map((const MirRelax *)relax, old_offset);
+}
+
+static int mir_encode_relax(MirEncodeState *st, size_t annot_base) {
+  MirFunction *fn = st->fn;
+  BinaryFunctionContext *ctx = fn->context;
+  if (st->relax.disabled || ir_pass_name_is_skipped("mir_relax")) {
+    return 1;
+  }
+  if (!mir_relax_apply(&st->relax, ctx)) {
+    return enc_err(fn, "out of memory relaxing branches");
+  }
+  for (size_t k = 0; k < st->cold_divides.count; k++) {
+    MirColdDivide *cold = &st->cold_divides.items[k];
+    cold->to_wide = mir_relax_map(&st->relax, cold->to_wide);
+    cold->to_narrow = mir_relax_map(&st->relax, cold->to_narrow);
+    cold->to_narrow_zero = mir_relax_map(&st->relax, cold->to_narrow_zero);
+    cold->done = mir_relax_map(&st->relax, cold->done);
+  }
+  for (size_t t = 0; t < st->pending_table_count; t++) {
+    st->pending_tables[t].lea_off =
+        mir_relax_map(&st->relax, st->pending_tables[t].lea_off);
+  }
+  if (mir_annotate_enabled()) {
+    mir_annotate_relocate(mir_relax_map_for_annotation, &st->relax, annot_base,
+                          ctx->code.data);
+  }
+  return 1;
 }
 
 static int mir_encode_cold_divides(MirEncodeState *st) {
@@ -4715,7 +4753,7 @@ int mir_encode(MirFunction *fn) {
     st.index = i;
     home_fwd_note_boundary(in->op);
     if (in->op == MIR_LABEL && align_label && align_label[i] &&
-        !mir_encode_loop_alignment(fn, align_label[i])) {
+        !mir_encode_loop_alignment(&st, align_label[i])) {
       ok = 0;
       break;
     }
@@ -4723,6 +4761,12 @@ int mir_encode(MirFunction *fn) {
       ok = 0;
       break;
     }
+    if (mir_op_is_inline_kernel(in->op) &&
+        !mir_relax_note_pin(&st.relax, ctx->code.size, ctx->code.size & 31u)) {
+      ok = 0;
+      break;
+    }
+    st.relax.disabled |= in->op == MIR_INLINE_ASM;
     ok = mir_encode_instruction(&st, in);
     if (annot && ok && ctx->code.size > annot_off) {
       mir_annotate_record(fn, in, (int)i, annot_off - annot_base,
@@ -4740,15 +4784,18 @@ int mir_encode(MirFunction *fn) {
          mir_emit_epilogue(fn);
   }
   mir_enc_name_map_free(&st.branch_targets);
-  if (!ok || !mir_encode_cold_divides(&st) || !mir_encode_jump_tables(&st)) {
+  if (!ok || !mir_encode_relax(&st, annot_base) ||
+      !mir_encode_cold_divides(&st) || !mir_encode_jump_tables(&st)) {
     free((void *)st.vreg_uses);
     free(st.pending_tables);
     free(st.cold_divides.items);
+    mir_relax_free(&st.relax);
     return 0;
   }
   free((void *)st.vreg_uses);
   free(st.pending_tables);
   free(st.cold_divides.items);
+  mir_relax_free(&st.relax);
   return code_generator_binary_resolve_fixups(fn->generator, ctx,
                                               ctx->code.size);
 }

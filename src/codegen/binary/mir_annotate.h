@@ -34,6 +34,9 @@ void mir_annotate_record_synthetic(const char *label, const char *decision,
                                    size_t byte_off, size_t byte_len,
                                    const unsigned char *bytes);
 
+void mir_annotate_relocate(size_t (*map)(void *, size_t), void *map_arg,
+                           size_t base, const unsigned char *code);
+
 void mir_annotate_note_backend(const char *backend, const char *reason);
 
 void mir_annotate_record_ir(const IRFunction *ir_fn, int ir_index,
