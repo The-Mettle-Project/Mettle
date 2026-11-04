@@ -1466,7 +1466,7 @@ $cases = @(
   @{ Name = "err_var_inferred_promotion"; Path = "tests/err_var_inferred_promotion.mettle"; ShouldSucceed = $false; Pattern = "'int32 \* int64' gives 'int64' by promotion"; OutputMustMatch = @("write 'var total: int64 = \.\.\.'"); OutputMustNotMatch = @("Undefined variable") },
   @{ Name = "err_var_inferred_float_literal"; Path = "tests/err_var_inferred_float_literal.mettle"; ShouldSucceed = $false; Pattern = "'float32 \* float64' gives 'float64' by promotion" },
   @{ Name = "err_var_inferred_void"; Path = "tests/err_var_inferred_void.mettle"; ShouldSucceed = $false; Pattern = "'x' needs a written type: its initializer returns nothing" },
-  @{ Name = "err_var_inferred_aggregate"; Path = "tests/err_var_inferred_aggregate.mettle"; ShouldSucceed = $false; Pattern = "an aggregate literal takes the type of what it initializes" },
+  @{ Name = "err_var_inferred_aggregate"; Path = "tests/err_var_inferred_aggregate.mettle"; ShouldSucceed = $false; Pattern = "an aggregate literal takes the type of what it initializes"; OutputMustNotMatch = @("Undefined variable") },
   @{ Name = "err_var_inferred_capture"; Path = "tests/err_var_inferred_capture.mettle"; ShouldSucceed = $false; Pattern = "cannot capture 'side' in a closure" },
   @{ Name = "err_var_inferred_constructor"; Path = "tests/err_var_inferred_constructor.mettle"; ShouldSucceed = $false; Pattern = "a bare 'Some' does not say which enum it builds"; OutputMustMatch = @("a bare 'None' does not say which enum it builds") },
   @{ Name = "err_var_inferred_shared_variant"; Path = "tests/err_var_inferred_shared_variant.mettle"; ShouldSucceed = $false; Pattern = "a bare 'Hit' does not say which enum it builds" },

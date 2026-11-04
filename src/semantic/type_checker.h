@@ -47,6 +47,9 @@ typedef struct {
   int defer_unresolved_comptime;
   char *error_message;
   ErrorReporter *error_reporter;
+  const char *failed_bindings[64];
+  size_t failed_binding_count;
+  const void *failed_bindings_owner;
   struct TypeCheckerGuard *guards;
   size_t guard_count;
   size_t guard_capacity;

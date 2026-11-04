@@ -411,6 +411,16 @@ void type_checker_report_undefined_symbol(TypeChecker *checker,
   if (!checker || !symbol_name || !symbol_type)
     return;
 
+  if (checker->current_function &&
+      checker->failed_bindings_owner == checker->current_function) {
+    for (size_t i = 0; i < checker->failed_binding_count; i++) {
+      if (strcmp(checker->failed_bindings[i], symbol_name) == 0) {
+        checker->has_error = 1;
+        return;
+      }
+    }
+  }
+
   char error_msg[512];
   snprintf(error_msg, sizeof(error_msg), "Undefined %s '%s'", symbol_type,
            symbol_name);

@@ -1560,6 +1560,18 @@ static int type_checker_infer_binding_type(TypeChecker *checker,
   return 1;
 }
 
+static void type_checker_note_failed_binding(TypeChecker *checker,
+                                             const char *name) {
+  if (checker->failed_bindings_owner != checker->current_function) {
+    checker->failed_bindings_owner = checker->current_function;
+    checker->failed_binding_count = 0;
+  }
+  if (checker->failed_binding_count < sizeof(checker->failed_bindings) /
+                                           sizeof(checker->failed_bindings[0])) {
+    checker->failed_bindings[checker->failed_binding_count++] = name;
+  }
+}
+
 static int type_checker_settle_inferred_binding(
     TypeChecker *checker, ASTNode *declaration, VarDeclaration *var_decl,
     Scope *current_scope, Type *init_type, Type **var_type_io,
@@ -1612,8 +1624,10 @@ static int type_checker_check_variable_initializer(
             var_decl->name);
       }
       checker->has_error = 1;
-      if (!var_type)
+      if (!var_type) {
+        type_checker_note_failed_binding(checker, var_decl->name);
         return 0;
+      }
       poisoned = 1;
     }
     if (!poisoned &&
