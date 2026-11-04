@@ -422,6 +422,11 @@ int mir_encode(MirFunction *fn);
 
 int mir_rewrite_string_concat_calls(IRFunction *ir_function);
 
+void mir_sink_partial_loads(MirFunction *fn);
+void mir_guard_counter_wrap(MirFunction *fn);
+void mir_thread_known_tests(MirFunction *fn);
+void mir_thread_dispatch(MirFunction *fn);
+
 int code_generator_binary_emit_function_via_mir(
     CodeGenerator *generator,
     IRFunction *ir_function, BinaryFunctionContext *context);

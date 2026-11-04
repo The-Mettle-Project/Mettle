@@ -230,8 +230,16 @@ static int mir_cfg_build_edges(MirCfg *cfg) {
   for (size_t b = 0; ok && b < cfg->block_count; b++) {
     ok = mir_cfg_link_block(cfg, &map, b);
   }
-  free(map.slots);
+  cfg->label_slots = map.slots;
+  cfg->label_mask = map.mask;
   return ok;
+}
+
+int mir_cfg_label_insn(const MirCfg *cfg, const char *name) {
+  MirCfgLabelMap map;
+  map.slots = cfg->label_slots;
+  map.mask = cfg->label_mask;
+  return mir_cfg_label_find(cfg->fn, &map, name);
 }
 
 static int mir_cfg_build_rpo(MirCfg *cfg) {
@@ -475,6 +483,14 @@ static int mir_cfg_sparse_find(const MirCfgSparse *set, unsigned word) {
 static int mir_cfg_sparse_get(const MirCfgSparse *set, size_t v) {
   int at = mir_cfg_sparse_find(set, (unsigned)(v >> 6));
   return at >= 0 && ((set->bits[at] >> (v & 63)) & 1ull);
+}
+
+int mir_cfg_is_live_in(const MirCfg *cfg, size_t block, MirVregId v) {
+  return v >= 0 && mir_cfg_sparse_get(&cfg->live_in[block], (size_t)v);
+}
+
+int mir_cfg_is_live_out(const MirCfg *cfg, size_t block, MirVregId v) {
+  return v >= 0 && mir_cfg_sparse_get(&cfg->live_out[block], (size_t)v);
 }
 
 static int mir_cfg_sparse_equal(const MirCfgSparse *set, const unsigned *idx,
@@ -760,6 +776,7 @@ void mir_cfg_free(MirCfg *cfg) {
   free(cfg->scratch_idx);
   free(cfg->scratch_bits);
   free(cfg->insn_depth);
+  free(cfg->label_slots);
   memset(cfg, 0, sizeof(*cfg));
 }
 

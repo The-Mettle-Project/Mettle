@@ -677,9 +677,64 @@ static int encode_imul(MirFunction *fn, const MirInst *in) {
   return store_from(fn, &in->dst, SCRATCH_A);
 }
 
-static int encode_div(MirFunction *fn, const MirInst *in) {
+typedef struct {
+  const MirInst *in;
+  size_t to_wide;
+  size_t to_narrow;
+  size_t to_narrow_zero;
+  size_t done;
+  BinaryGpRegister divisor;
+} MirColdDivide;
+
+typedef struct {
+  MirColdDivide *items;
+  size_t count;
+  size_t capacity;
+} MirColdDivides;
+
+static int mir_divide_reads_remainder(const MirFunction *fn, const MirInst *in) {
+  size_t at = (size_t)(in - fn->insns) + 1u;
+  if (in->cc) {
+    return 1;
+  }
+  while (at < fn->insn_count && fn->insns[at].op == MIR_NOP) {
+    at++;
+  }
+  return at < fn->insn_count && fn->insns[at].op == MIR_MOV &&
+         fn->insns[at].a.kind == MIR_OPK_PHYS &&
+         fn->insns[at].a.phys == BINARY_GP_RDX;
+}
+
+static int emit_power_of_two_divide(MirFunction *fn, const MirInst *in,
+                                    BinaryGpRegister divisor,
+                                    MirColdDivide *cold) {
+  BinaryCodeBuffer *code = &fn->context->code;
+  if (!binary_emit_lea32_reg_mem(code, SCRATCH_A, divisor, -1) ||
+      !binary_emit_alu_reg_reg32(code, 0x85, divisor, SCRATCH_A) ||
+      !wcs_jcc(code, 0x85, &cold->to_narrow) ||
+      !binary_emit_alu_reg_reg32(code, 0x85, divisor, divisor) ||
+      !wcs_jcc(code, 0x84, &cold->to_narrow_zero)) {
+    return 0;
+  }
+  if (mir_divide_reads_remainder(fn, in) &&
+      (!binary_emit_mov_reg_reg32(code, BINARY_GP_RDX, BINARY_GP_RAX) ||
+       !binary_emit_alu_reg_reg32(code, 0x21, BINARY_GP_RDX, SCRATCH_A))) {
+    return 0;
+  }
+  if (in->cc) {
+    return 1;
+  }
+  return binary_emit_mov_reg_reg(code, SCRATCH_A, BINARY_GP_RCX) &&
+         wcs_bsf_reg_reg32(code, BINARY_GP_RCX, divisor) &&
+         binary_emit_shift_reg_cl_32(code, 5, BINARY_GP_RAX) &&
+         binary_emit_mov_reg_reg(code, BINARY_GP_RCX, SCRATCH_A);
+}
+
+static int encode_div(MirFunction *fn, const MirInst *in,
+                      MirColdDivides *colds) {
   BinaryCodeBuffer *code = &fn->context->code;
   int rok;
+  MirColdDivide cold;
   BinaryGpRegister divisor = value_reg(fn, &in->b, SCRATCH_B, &rok);
   if (!rok) {
     return 0;
@@ -693,37 +748,61 @@ static int encode_div(MirFunction *fn, const MirInst *in) {
   if (!materialize_into(fn, &in->a, BINARY_GP_RAX)) {
     return 0;
   }
-  size_t to_wide = 0;
-  size_t to_done = 0;
+  memset(&cold, 0, sizeof(cold));
+  cold.in = in;
+  cold.divisor = divisor;
   if (!binary_emit_mov_reg_reg(code, SCRATCH_A, BINARY_GP_RAX) ||
       !binary_emit_alu_reg_reg(code, 0x09, SCRATCH_A, divisor) ||
       !binary_emit_shift_reg_imm8(code, 5, SCRATCH_A, 32) ||
-      !wcs_jcc(code, 0x85, &to_wide) ||
-      !binary_emit_xor_reg_reg32(code, BINARY_GP_RDX) ||
-      !binary_emit_unary_reg32(code, 6, divisor) ||
-      !wcs_jcc(code, 0, &to_done) || !wcs_patch_here(code, to_wide)) {
+      !wcs_jcc(code, 0x85, &cold.to_wide) ||
+      !emit_power_of_two_divide(fn, in, divisor, &cold)) {
     return enc_err(fn, "out of memory in narrow divide");
   }
-  if (in->is_unsigned) {
-    if (!binary_emit_xor_reg_reg32(code, BINARY_GP_RDX) ||
-        !binary_emit_div_reg(code, divisor)) {
-      return enc_err(fn, "out of memory in div");
+  cold.done = code->size;
+  if (colds->count == colds->capacity) {
+    size_t capacity = colds->capacity ? colds->capacity * 2u : 8u;
+    MirColdDivide *grown =
+        (MirColdDivide *)realloc(colds->items, capacity * sizeof(MirColdDivide));
+    if (!grown) {
+      return enc_err(fn, "out of memory in narrow divide");
     }
-  } else {
-    int needs_guard = !(in->b.kind == MIR_OPK_IMM && in->b.imm != -1);
-    if (needs_guard) {
-      if (!binary_emit_idiv_wrapping(code, divisor)) {
-        return enc_err(fn, "out of memory in idiv");
-      }
-    } else if (!binary_emit_cqo(code) || !binary_emit_idiv_reg(code, divisor)) {
-      return enc_err(fn, "out of memory in idiv");
-    }
+    colds->items = grown;
+    colds->capacity = capacity;
   }
-  if (!wcs_patch_here(code, to_done)) {
-    return enc_err(fn, "out of memory in narrow divide");
-  }
+  colds->items[colds->count++] = cold;
   BinaryGpRegister result = in->cc ? BINARY_GP_RDX : BINARY_GP_RAX;
   return store_from(fn, &in->dst, result);
+}
+
+static int emit_cold_wide_divide(MirFunction *fn, const MirColdDivide *cold) {
+  BinaryCodeBuffer *code = &fn->context->code;
+  const MirInst *in = cold->in;
+  if (in->is_unsigned) {
+    return binary_emit_xor_reg_reg32(code, BINARY_GP_RDX) &&
+           binary_emit_div_reg(code, cold->divisor);
+  }
+  if (!(in->b.kind == MIR_OPK_IMM && in->b.imm != -1)) {
+    return binary_emit_idiv_wrapping(code, cold->divisor);
+  }
+  return binary_emit_cqo(code) && binary_emit_idiv_reg(code, cold->divisor);
+}
+
+static int emit_cold_divide(MirFunction *fn, const MirColdDivide *cold) {
+  BinaryCodeBuffer *code = &fn->context->code;
+  size_t back_narrow = 0;
+  size_t back_wide = 0;
+  if (!wcs_patch_here(code, cold->to_narrow) ||
+      !wcs_patch_here(code, cold->to_narrow_zero) ||
+      !binary_emit_xor_reg_reg32(code, BINARY_GP_RDX) ||
+      !binary_emit_unary_reg32(code, 6, cold->divisor) ||
+      !wcs_jcc(code, 0, &back_narrow) || !wcs_patch_here(code, cold->to_wide) ||
+      !emit_cold_wide_divide(fn, cold) || !wcs_jcc(code, 0, &back_wide)) {
+    return 0;
+  }
+  return binary_function_context_patch_rel32(fn->context, back_narrow,
+                                             cold->done) &&
+         binary_function_context_patch_rel32(fn->context, back_wide,
+                                             cold->done);
 }
 
 static int encode_mulhi(MirFunction *fn, const MirInst *in) {
@@ -3031,6 +3110,7 @@ static int mir_jump_is_fallthrough(const MirFunction *fn, size_t index) {
 
 typedef struct {
   size_t lea_off;
+  size_t table_off;
   const MirJumpTable *table;
 } MirPendingTable;
 
@@ -3043,8 +3123,10 @@ typedef struct {
   const int *vreg_uses;
   size_t fused_mask_test;
   size_t prev_cmpbr;
-  MirPendingTable pending_tables[MIR_MAX_JUMP_TABLES];
+  MirPendingTable *pending_tables;
   size_t pending_table_count;
+  size_t pending_table_capacity;
+  MirColdDivides cold_divides;
   char epilogue_label[64];
   int epilogue_defined;
   int epilogue_referenced;
@@ -3164,7 +3246,7 @@ static int mir_encode_divide_shift(MirEncodeState *st, const MirInst *in) {
   (void)i;
   switch (in->op) {
     case MIR_IDIV:
-      ok = encode_div(fn, in);
+      ok = encode_div(fn, in, &st->cold_divides);
       break;
     case MIR_MULHI:
       ok = encode_mulhi(fn, in);
@@ -4274,6 +4356,21 @@ static int mir_encode_compare_branch(MirEncodeState *st, const MirInst *in) {
   return ok;
 }
 
+static int mir_pending_tables_reserve(MirEncodeState *st) {
+  if (st->pending_table_count == st->pending_table_capacity) {
+    size_t capacity =
+        st->pending_table_capacity ? st->pending_table_capacity * 2u : 16u;
+    MirPendingTable *grown = (MirPendingTable *)realloc(
+        st->pending_tables, capacity * sizeof(MirPendingTable));
+    if (!grown) {
+      return 0;
+    }
+    st->pending_tables = grown;
+    st->pending_table_capacity = capacity;
+  }
+  return 1;
+}
+
 static int mir_encode_jump_table(MirEncodeState *st, const MirInst *in) {
   MirFunction *fn = st->fn;
   BinaryFunctionContext *ctx = fn->context;
@@ -4288,7 +4385,7 @@ static int mir_encode_jump_table(MirEncodeState *st, const MirInst *in) {
       int rok;
       BinaryGpRegister idx;
       size_t lea_off = 0;
-      if (!tbl || st->pending_table_count >= MIR_MAX_JUMP_TABLES) {
+      if (!tbl || !mir_pending_tables_reserve(st)) {
         ok = enc_err(fn, "jump table without a target list");
         break;
       }
@@ -4420,7 +4517,8 @@ static char *mir_scan_loop_alignment(const MirFunction *fn) {
         in->op != MIR_BT && in->op != MIR_FCMPBR) {
       continue;
     }
-    if (in->dst.kind != MIR_OPK_LABEL || !in->dst.sym) {
+    if (in->dst.kind != MIR_OPK_LABEL || !in->dst.sym ||
+        strncmp(in->dst.sym, ".mir_wrap_", 10) == 0) {
       continue;
     }
     if (labels.names) {
@@ -4494,6 +4592,18 @@ static int mir_encode_location_marker(MirFunction *fn, const MirInst *in) {
       code_generator_runtime_filename(fn->generator, src->location.filename));
 }
 
+static int mir_encode_cold_divides(MirEncodeState *st) {
+  MirFunction *fn = st->fn;
+  for (size_t k = 0; k < st->cold_divides.count; k++) {
+    const MirColdDivide *cold = &st->cold_divides.items[k];
+    if (!mir_encode_location_marker(fn, cold->in) ||
+        !emit_cold_divide(fn, cold)) {
+      return enc_err(fn, "out of memory in cold divide");
+    }
+  }
+  return 1;
+}
+
 static int mir_encode_jump_tables(MirEncodeState *st) {
   MirFunction *fn = st->fn;
   BinaryFunctionContext *ctx = fn->context;
@@ -4501,6 +4611,22 @@ static int mir_encode_jump_tables(MirEncodeState *st) {
   for (size_t t = 0; t < st->pending_table_count; t++) {
     const MirJumpTable *tbl = st->pending_tables[t].table;
     size_t table_off;
+    int emitted = 0;
+
+    for (size_t earlier = 0; !emitted && earlier < t; earlier++) {
+      if (st->pending_tables[earlier].table == tbl) {
+        emitted = 1;
+        table_off = st->pending_tables[earlier].table_off;
+        st->pending_tables[t].table_off = table_off;
+        if (!binary_function_context_patch_rel32(
+                ctx, st->pending_tables[t].lea_off, table_off)) {
+          return enc_err(fn, "jump table out of range");
+        }
+      }
+    }
+    if (emitted) {
+      continue;
+    }
 
     while ((ctx->code.size & 3u) != 0u) {
       if (!binary_code_buffer_append_u8(&ctx->code, 0xCC)) {
@@ -4508,6 +4634,7 @@ static int mir_encode_jump_tables(MirEncodeState *st) {
       }
     }
     table_off = ctx->code.size;
+    st->pending_tables[t].table_off = table_off;
     if (!binary_function_context_patch_rel32(ctx, st->pending_tables[t].lea_off,
                                              table_off)) {
       return enc_err(fn, "jump table out of range");
@@ -4613,11 +4740,15 @@ int mir_encode(MirFunction *fn) {
          mir_emit_epilogue(fn);
   }
   mir_enc_name_map_free(&st.branch_targets);
-  if (!ok || !mir_encode_jump_tables(&st)) {
+  if (!ok || !mir_encode_cold_divides(&st) || !mir_encode_jump_tables(&st)) {
     free((void *)st.vreg_uses);
+    free(st.pending_tables);
+    free(st.cold_divides.items);
     return 0;
   }
   free((void *)st.vreg_uses);
+  free(st.pending_tables);
+  free(st.cold_divides.items);
   return code_generator_binary_resolve_fixups(fn->generator, ctx,
                                               ctx->code.size);
 }

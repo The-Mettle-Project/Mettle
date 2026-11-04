@@ -1,0 +1,552 @@
+import "std/io";
+import "std/mem";
+
+struct Op {
+  code: int32;
+  a: int32;
+  b: int32;
+  c: int32;
+  imm: int64;
+}
+
+struct Holder {
+  ops: Op*;
+  limit: int32;
+}
+
+var global_running: int32 = 1;
+
+@noinline fn poke(flag: int32*, value: int32) { *flag = value; }
+
+fn put(ops: Op*, at: int32, code: int32, a: int32, b: int32, c: int32, imm: int64) {
+  ops[at].code = code;
+  ops[at].a = a;
+  ops[at].b = b;
+  ops[at].c = c;
+  ops[at].imm = imm;
+}
+
+fn build_sum(ops: Op*) {
+  put(ops, 0, 1, 0, 0, 0, 0);
+  put(ops, 1, 1, 1, 0, 0, 0);
+  put(ops, 2, 1, 2, 0, 0, 1);
+  put(ops, 3, 1, 3, 0, 0, 1000);
+  put(ops, 4, 3, 0, 0, 1, 0);
+  put(ops, 5, 5, 4, 0, 0, 0);
+  put(ops, 6, 7, 5, 4, 3, 0);
+  put(ops, 7, 3, 0, 0, 5, 0);
+  put(ops, 8, 3, 1, 1, 2, 0);
+  put(ops, 9, 8, 6, 1, 3, 0);
+  put(ops, 10, 12, 6, 0, 0, 4);
+  put(ops, 11, 13, 7, 0, 0, 8);
+  put(ops, 12, 14, 8, 7, 0, 0);
+  put(ops, 13, 9, 9, 8, 7, 0);
+  put(ops, 14, 11, 9, 0, 0, 16);
+  put(ops, 15, 15, 8, 8, 0, 1000000);
+  put(ops, 16, 4, 8, 8, 2, 0);
+  put(ops, 17, 6, 8, 8, 2, 0);
+  put(ops, 18, 10, 0, 0, 0, 20);
+  put(ops, 19, 15, 8, 8, 0, 7777);
+  put(ops, 20, 16, 10, 8, 2, 0);
+  put(ops, 21, 2, 11, 8, 0, 0);
+  put(ops, 22, 0, 0, 0, 0, 0);
+}
+
+@noinline fn run_flag(h: Holder*, reg: int64*, mem: int64*, steps_out: int64*) -> int64 {
+  var pc: int32 = 0;
+  var steps: int64 = 0;
+  var running: int32 = 1;
+  while (running != 0) {
+    var op: int32 = h->ops[pc].code;
+    var a: int32 = h->ops[pc].a;
+    var b: int32 = h->ops[pc].b;
+    var c: int32 = h->ops[pc].c;
+    var imm: int64 = h->ops[pc].imm;
+    pc += 1;
+    steps += 1;
+    switch (op) {
+      case 0:
+        running = 0;
+        break;
+      case 1:
+        reg[a] = imm;
+        break;
+      case 2:
+        reg[a] = reg[b];
+        break;
+      case 3:
+        reg[a] = reg[b] + reg[c];
+        break;
+      case 4:
+        reg[a] = reg[b] - reg[c];
+        break;
+      case 5:
+        reg[a] = reg[b] * reg[b];
+        break;
+      case 6:
+        reg[a] = reg[b] / reg[c];
+        break;
+      case 7:
+        reg[a] = reg[b] % reg[c];
+        break;
+      case 8:
+        if (reg[b] < reg[c]) {
+          reg[a] = 1;
+        } else {
+          reg[a] = 0;
+        }
+        break;
+      case 9:
+        if (reg[b] == reg[c]) {
+          reg[a] = 1;
+        } else {
+          reg[a] = 0;
+        }
+        break;
+      case 10:
+        pc = (int32)imm;
+        break;
+      case 11:
+        if (reg[a] == 0) {
+          pc = (int32)imm;
+        }
+        break;
+      case 12:
+        if (reg[a] != 0) {
+          pc = (int32)imm;
+        }
+        break;
+      case 13:
+        reg[a] = mem[(int32)reg[b] & 255];
+        break;
+      case 14:
+        mem[(int32)reg[a] & 255] = reg[b];
+        break;
+      case 15:
+        reg[a] = reg[b] + imm;
+        break;
+      case 16:
+        if (reg[b] > reg[c]) {
+          reg[a] = 1;
+        } else {
+          reg[a] = 0;
+        }
+        break;
+      default:
+        running = 0;
+        break;
+    }
+  }
+  *steps_out = steps;
+  return reg[0] * 31 + reg[8] * 7 + reg[10] + reg[11];
+}
+
+@noinline fn state_machine(text: uint8*, n: int32) -> int64 {
+  var state: int32 = 0;
+  var i: int32 = 0;
+  var tokens: int64 = 0;
+  var value: int64 = 0;
+  while (state != 6) {
+    var ch: int32 = 0;
+    if (i < n) {
+      ch = (int32)text[i];
+    }
+    i += 1;
+    switch (state) {
+      case 0:
+        if (ch == 0) {
+          state = 6;
+        } else if (ch == 32) {
+          state = 0;
+        } else {
+          value = (int64)ch;
+          state = 1;
+        }
+        break;
+      case 1:
+        if (ch == 0) {
+          tokens = tokens * 131 + value;
+          state = 6;
+        } else if (ch == 32) {
+          state = 2;
+        } else {
+          value = value * 17 + (int64)ch;
+        }
+        break;
+      case 2:
+        tokens = tokens * 131 + value;
+        value = 0;
+        state = 3;
+        i -= 1;
+        break;
+      case 3:
+        state = 4;
+        i -= 1;
+        break;
+      case 4:
+        state = 5;
+        i -= 1;
+        break;
+      case 5:
+        state = 0;
+        i -= 1;
+        break;
+      default:
+        state = 6;
+        break;
+    }
+  }
+  return tokens;
+}
+
+@noinline fn flag_rearmed(n: int32) -> int64 {
+  var alive: int32 = 1;
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (alive != 0) {
+    switch (i & 7) {
+      case 0:
+        total += 1;
+        break;
+      case 1:
+        alive = 0;
+        total += 2;
+        alive = 1;
+        break;
+      case 2:
+        total += 3;
+        break;
+      case 3:
+        alive = 0;
+        if (i < n) {
+          alive = 1;
+        }
+        break;
+      case 4:
+        total *= 2;
+        break;
+      case 5:
+        alive = 0;
+        if (i < n) {
+          alive = 7;
+        }
+        break;
+      case 6:
+        total -= 1;
+        break;
+      default:
+        total ^= 5;
+        break;
+    }
+    i += 1;
+  }
+  return total * 100 + (int64)i;
+}
+
+@noinline fn flag_through_pointer(n: int32) -> int64 {
+  var alive: int32 = 1;
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (alive != 0) {
+    switch (i & 3) {
+      case 0:
+        total += 1;
+        break;
+      case 1:
+        if (i >= n) {
+          poke(&alive, 0);
+        }
+        break;
+      case 2:
+        total += 5;
+        break;
+      case 3:
+        total *= 3;
+        break;
+      case 4:
+        total = 0;
+        break;
+      default:
+        total = -1;
+        break;
+    }
+    total &= 65535;
+    i += 1;
+  }
+  return total * 1000 + (int64)i;
+}
+
+@noinline fn flag_global(n: int32) -> int64 {
+  var total: int64 = 0;
+  var i: int32 = 0;
+  global_running = 1;
+  while (global_running != 0) {
+    switch (i & 3) {
+      case 0:
+        total += 2;
+        break;
+      case 1:
+        if (i >= n) {
+          global_running = 0;
+        }
+        break;
+      case 2:
+        total += 7;
+        break;
+      case 3:
+        total ^= 3;
+        break;
+      case 4:
+        total = 0;
+        break;
+      default:
+        total = -1;
+        break;
+    }
+    i += 1;
+  }
+  return total * 1000 + (int64)i;
+}
+
+@noinline fn flag_compare(n: int32) -> int64 {
+  var mode: int32 = 3;
+  var total: int64 = 0;
+  var i: int32 = 0;
+  while (mode < 9) {
+    if (i == n) {
+      mode = 20;
+    } else if (i == 5) {
+      mode = 8;
+    }
+    total += (int64)mode;
+    i += 1;
+  }
+  return total * 100 + (int64)i;
+}
+
+@noinline fn load_before_store(p: int64*, k: int32) -> int64 {
+  var before: int64 = p[0];
+  var other: int64 = p[1];
+  p[0] = 900;
+  if (k == 1) {
+    return before + 1;
+  }
+  if (k == 2) {
+    return other + 2;
+  }
+  return p[0];
+}
+
+@noinline fn load_across_index_change(p: int64*, n: int32) -> int64 {
+  var i: int32 = 0;
+  var total: int64 = 0;
+  while (i < n) {
+    var v: int64 = p[i];
+    i += 1;
+    if ((int32)(v & 1) == 1) {
+      total += v;
+    }
+  }
+  return total;
+}
+
+@noinline fn narrow_loads_in_arms(p: int8*, q: uint16*, k: int32) -> int64 {
+  var s: int8 = p[0];
+  var u: uint16 = q[0];
+  var t: int8 = p[1];
+  switch (k) {
+    case 0:
+      return (int64)s;
+    case 1:
+      return (int64)u;
+    case 2:
+      return (int64)t;
+    case 3:
+      p[0] = 5;
+      return (int64)s + (int64)p[0];
+    case 4:
+      return (int64)u + (int64)t;
+    default:
+      return 0;
+  }
+}
+
+@noinline fn arm_store_then_load(p: int64*, k: int32) -> int64 {
+  var v: int64 = p[2];
+  switch (k) {
+    case 0:
+      p[2] = v + 1;
+      return v;
+    case 1:
+      p[2] = 44;
+      return v + p[2];
+    case 2:
+      return p[2];
+    case 3:
+      return 3;
+    case 4:
+      return v * 2;
+    default:
+      return -v;
+  }
+}
+
+@noinline fn shared_arms(codes: int32*, n: int32) -> int64 {
+  var i: int32 = 0;
+  var total: int64 = 0;
+  while (i < n) {
+    var c: int32 = codes[i];
+    var w: int32 = codes[i + 1];
+    i += 2;
+    switch (c) {
+      case 0:
+      case 1:
+      case 2:
+        total += (int64)w;
+        break;
+      case 3:
+        continue;
+      case 4:
+        total *= (int64)w;
+        break;
+      case 5:
+        if (w > 100) {
+          break;
+        }
+        total -= (int64)w;
+        break;
+      case 6:
+        total = 0;
+        continue;
+      case 7:
+        i += 2;
+        continue;
+      default:
+        return total + 100000;
+    }
+    total += 1;
+  }
+  return total;
+}
+
+fn check(name: cstring, got: int64, want: int64) -> int32 {
+  if (got != want) {
+    println("{name}: got {got} want {want}");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var fails: int32 = 0;
+  var ops: Op* = malloc(64 * sizeof(Op));
+  var reg: int64* = malloc(16 * 8);
+  var mem: int64* = malloc(256 * 8);
+  var i: int32 = 0;
+  while (i < 16) {
+    reg[i] = 0;
+    i += 1;
+  }
+  i = 0;
+  while (i < 256) {
+    mem[i] = 0;
+    i += 1;
+  }
+  build_sum(ops);
+  var h: Holder;
+  h.ops = ops;
+  h.limit = 23;
+  var steps: int64 = 0;
+  var r: int64 = run_flag(&h, reg, mem, &steps);
+  fails += check("run_flag", r, 38480433);
+  fails += check("run_flag_steps", steps, 7015);
+
+  put(ops, 0, 1, 0, 0, 0, 5);
+  put(ops, 1, 99, 0, 0, 0, 0);
+  r = run_flag(&h, reg, mem, &steps);
+  fails += check("run_default", steps, 2);
+
+  var text: uint8* = (uint8*)"go  threaded dispatch now";
+  fails += check("state_machine", state_machine(text, 25), 868596259149583);
+  fails += check("flag_rearmed", flag_rearmed(40), 32044);
+  fails += check("flag_pointer", flag_through_pointer(30), 59041034);
+  fails += check("flag_global", flag_global(30), 66034);
+  fails += check("flag_compare", flag_compare(50), 39551);
+
+  var cells: int64* = malloc(8 * 8);
+  cells[0] = 11;
+  cells[1] = 22;
+  fails += check("load_store_1", load_before_store(cells, 1), 12);
+  cells[0] = 11;
+  fails += check("load_store_2", load_before_store(cells, 2), 24);
+  cells[0] = 11;
+  fails += check("load_store_3", load_before_store(cells, 3), 900);
+
+  i = 0;
+  while (i < 8) {
+    cells[i] = (int64)(i * 3 + 1);
+    i += 1;
+  }
+  fails += check("index_change", load_across_index_change(cells, 8), 40);
+
+  var bytes: int8* = malloc(4);
+  var words: uint16* = malloc(4);
+  bytes[0] = -3;
+  bytes[1] = 100;
+  words[0] = 65000;
+  fails += check("narrow_0", narrow_loads_in_arms(bytes, words, 0), -3);
+  fails += check("narrow_1", narrow_loads_in_arms(bytes, words, 1), 65000);
+  fails += check("narrow_2", narrow_loads_in_arms(bytes, words, 2), 100);
+  fails += check("narrow_3", narrow_loads_in_arms(bytes, words, 3), 2);
+  bytes[0] = -3;
+  fails += check("narrow_4", narrow_loads_in_arms(bytes, words, 4), 65100);
+
+  cells[2] = 10;
+  fails += check("arm_store_0", arm_store_then_load(cells, 0), 10);
+  fails += check("arm_store_0b", cells[2], 11);
+  fails += check("arm_store_1", arm_store_then_load(cells, 1), 55);
+  fails += check("arm_store_2", arm_store_then_load(cells, 2), 44);
+  fails += check("arm_store_3", arm_store_then_load(cells, 3), 3);
+  fails += check("arm_store_4", arm_store_then_load(cells, 4), 88);
+  fails += check("arm_store_5", arm_store_then_load(cells, 5), -44);
+
+  var codes: int32* = malloc(64 * 4);
+  codes[0] = 0;
+  codes[1] = 5;
+  codes[2] = 1;
+  codes[3] = 6;
+  codes[4] = 2;
+  codes[5] = 7;
+  codes[6] = 4;
+  codes[7] = 2;
+  codes[8] = 5;
+  codes[9] = 3;
+  codes[10] = 5;
+  codes[11] = 200;
+  codes[12] = 3;
+  codes[13] = 9;
+  codes[14] = 7;
+  codes[15] = 0;
+  codes[16] = 0;
+  codes[17] = 1000;
+  codes[18] = 6;
+  codes[19] = 0;
+  codes[20] = 2;
+  codes[21] = 9;
+  codes[22] = 8;
+  codes[23] = 0;
+  fails += check("shared_arms", shared_arms(codes, 22), 10);
+  fails += check("shared_arms_default", shared_arms(codes, 24), 100010);
+
+  free(ops);
+  free(reg);
+  free(mem);
+  free(cells);
+  free(bytes);
+  free(words);
+  free(codes);
+  if (fails == 0) {
+    println("ok");
+  }
+  return fails;
+}

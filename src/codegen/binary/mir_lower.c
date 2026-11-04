@@ -9389,6 +9389,45 @@ static void mir_root_local_addresses(MirFunction *fn) {
   }
 }
 
+static int mir_mem_has_scalable_index(const MirOperand *op, MirVregId idx) {
+  return op->kind == MIR_OPK_MEM && op->mem.index == idx && op->mem.scale == 1 &&
+         !op->mem.phys_base_valid && op->mem.base != MIR_VREG_NONE &&
+         op->mem.base != idx;
+}
+
+static int mir_scale_every_index_use(MirFunction *fn, MirVregId idx, int uses,
+                                     int scale) {
+  int found = 0;
+  for (size_t u = 0; u < fn->insn_count; u++) {
+    const MirInst *in = &fn->insns[u];
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+    found += mir_mem_has_scalable_index(&in->a, idx);
+    found += mir_mem_has_scalable_index(&in->b, idx);
+    found += mir_mem_has_scalable_index(&in->dst, idx);
+  }
+  if (found != uses) {
+    return 0;
+  }
+  for (size_t u = 0; u < fn->insn_count; u++) {
+    MirInst *in = &fn->insns[u];
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+    if (mir_mem_has_scalable_index(&in->a, idx)) {
+      in->a.mem.scale = scale;
+    }
+    if (mir_mem_has_scalable_index(&in->b, idx)) {
+      in->b.mem.scale = scale;
+    }
+    if (mir_mem_has_scalable_index(&in->dst, idx)) {
+      in->dst.mem.scale = scale;
+    }
+  }
+  return 1;
+}
+
 static void mir_fold_index_scale(MirFunction *fn) {
   int *uses = NULL;
   int *defs = NULL;
@@ -9415,11 +9454,17 @@ static void mir_fold_index_scale(MirFunction *fn) {
     }
     idx = mul->dst.vreg;
     source = mul->a.vreg;
-    if (idx == source || uses[idx] != 1 || defs[idx] != 1 ||
+    if (idx == source || uses[idx] < 1 || defs[idx] != 1 ||
         fn->vregs[idx].address_taken) {
       continue;
     }
     if (!mir_index_scale_split(mul->b.imm, &scale, &rest)) {
+      continue;
+    }
+    if (uses[idx] > 1) {
+      if (mir_scale_every_index_use(fn, idx, uses[idx], scale)) {
+        mul->b.imm = rest;
+      }
       continue;
     }
     for (u = i + 1; u < fn->insn_count; u++) {
@@ -12680,11 +12725,14 @@ static const MirPass MIR_PASSES[] = {
     {"mir_cse_loads", 1, mir_cse_loads},
     {"mir_slp_pair_f64", 1, mir_slp_pair_f64},
     {"mir_build_jump_tables", 1, mir_build_jump_tables},
+    {"mir_sink_partial_loads", 1, mir_sink_partial_loads},
+    {"mir_thread_known_tests", 1, mir_thread_known_tests},
     {"mir_rotate_loops", 1, mir_rotate_loops},
     {"mir_thread_branch_over_jump", 1, mir_thread_branch_over_jump},
     {"mir_fuse_bit_test_branch", 1, mir_fuse_bit_test_branch},
     {"mir_place_const_pool", 0, mir_place_const_pool},
     {"mir_sink_cold_exits", 1, mir_sink_cold_exits},
+    {"mir_guard_counter_wrap", 1, mir_guard_counter_wrap},
 };
 
 static int mir_run_passes(MirFunction *fn) {
@@ -12838,6 +12886,13 @@ int code_generator_binary_emit_function_via_mir(
     goto oom;
   }
   mir_root_local_addresses(&fn);
+  if (!ir_pass_name_is_skipped("mir_thread_dispatch")) {
+    mettle_compiler_ctx_set_pass_name("mir_thread_dispatch");
+    mir_thread_dispatch(&fn);
+    if (fn.has_error) {
+      goto oom;
+    }
+  }
   mir_maybe_dump_function(&fn, ir_function);
   if (mir_verify_enabled() && !mir_verify_structure(&fn, "mir_regalloc", 1)) {
     goto oom;

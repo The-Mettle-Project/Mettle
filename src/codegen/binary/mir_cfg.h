@@ -45,10 +45,16 @@ typedef struct {
   unsigned *scratch_idx;
   unsigned long long *scratch_bits;
   unsigned char *insn_depth;
+  size_t *label_slots;
+  size_t label_mask;
 } MirCfg;
 
 int mir_cfg_build(MirCfg *cfg, const MirFunction *fn);
 void mir_cfg_free(MirCfg *cfg);
+
+int mir_cfg_label_insn(const MirCfg *cfg, const char *name);
+int mir_cfg_is_live_in(const MirCfg *cfg, size_t block, MirVregId v);
+int mir_cfg_is_live_out(const MirCfg *cfg, size_t block, MirVregId v);
 
 int mir_cfg_insn_uses(const MirInst *in, MirVregId *out);
 MirVregId mir_cfg_insn_def(const MirInst *in);
