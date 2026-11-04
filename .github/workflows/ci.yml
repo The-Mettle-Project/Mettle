@@ -231,7 +231,7 @@ jobs:
       - name: Runtime C harness
         run: make test CC=${{ matrix.cc }}
 
-      # site/explain/ is generated from the help tables in
+      # website/pages/explain/ is generated from the help tables in
       # src/error/error_explain.c. A code whose prose changed without the
       # pages being regenerated would leave the site telling a different
       # story from the terminal, so the gate is here rather than in review.

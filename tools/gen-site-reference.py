@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate site/explain/ from the compiler's own help tables.
+"""Generate website/pages/explain/ from the compiler's own help tables.
 
 The prose for every diagnostic and every optimizer decision code lives in
 src/error/error_explain.c and is what `mettle explain <CODE>` prints. This
@@ -23,7 +23,7 @@ import sys
 BASE_URL = "https://suidvandiewereld.github.io/Mettle"
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_DIR = os.path.join(ROOT, "site", "explain")
+OUT_DIR = os.path.join(ROOT, "website", "pages", "explain")
 
 GROUP_ORDER = [
     ("diagnostic", "Compile diagnostics",
@@ -340,11 +340,11 @@ def main():
             if extra.endswith(".html"):
                 stale.append(extra + " (orphan)")
         if stale:
-            print("site/explain/ is stale; run tools/gen-site-reference.py")
+            print("website/pages/explain/ is stale; run tools/gen-site-reference.py")
             for name in stale:
                 print("  " + name)
             return 1
-        print(f"site/explain/ is up to date ({len(files)} pages)")
+        print(f"website/pages/explain/ is up to date ({len(files)} pages)")
         return 0
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -355,7 +355,7 @@ def main():
         with open(os.path.join(OUT_DIR, name), "w", encoding="utf-8",
                   newline="") as fh:
             fh.write(content)
-    print(f"wrote {len(files)} pages to site/explain/")
+    print(f"wrote {len(files)} pages to website/pages/explain/")
     return 0
 
 

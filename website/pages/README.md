@@ -5,7 +5,7 @@ no build step, no dependencies. Fonts load from Google Fonts; everything else
 (the emblem, the favicon, all styling) is inline or in this folder.
 
 ```
-site/
+website/pages/
   index.html                 the landing page
   internals.html             the pipeline tour
   reading-diagnostics.html   anatomy of a diagnostic
@@ -18,8 +18,8 @@ site/
 
 ## The generated reference
 
-`site/explain/` is written by
-[`tools/gen-site-reference.py`](../tools/gen-site-reference.py) from the help
+`website/pages/explain/` is written by
+[`tools/gen-site-reference.py`](../../tools/gen-site-reference.py) from the help
 tables in `src/error/error_explain.c` -- the same text `mettle explain <CODE>`
 prints in the terminal. Never edit those pages by hand; edit the table and
 regenerate:
@@ -33,8 +33,8 @@ drifted from the compiler.
 
 ## Deploying
 
-A workflow at [`.github/workflows/pages.yml`](../.github/workflows/pages.yml)
-publishes this folder on every push to `master` that touches `site/`.
+A workflow at [`.github/workflows/pages.yml`](../../.github/workflows/pages.yml)
+publishes this folder on every push to `master` that touches it.
 
 One-time setup: **Settings → Pages → Source → "GitHub Actions"**. The next push
 (or a manual *Run workflow*) deploys it. The site then lives at
@@ -46,7 +46,7 @@ One-time setup: **Settings → Pages → Source → "GitHub Actions"**. The next
 Serve the folder, so the relative links between pages resolve:
 
 ```sh
-python3 -m http.server -d site 8080   # http://localhost:8080
+python3 -m http.server -d website/pages 8080   # http://localhost:8080
 ```
 
 ## Notes for editors

@@ -1,13 +1,13 @@
 name: Deploy site to GitHub Pages
 
-# Publishes site/ to GitHub Pages, with website/index.html and its media as the landing page.
+# Publishes website/pages/ to GitHub Pages, with website/index.html and its media as the landing page.
 # One-time setup: repo Settings → Pages → Source → "GitHub Actions".
 
 on:
   push:
     branches: [master]
     paths:
-      - "site/**"
+      - "website/pages/**"
       - "website/index.html"
       - "website/media/**"
       - "tools/gen-site-reference.py"
@@ -34,10 +34,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/configure-pages@v6
-      - name: Lay the landing page over site/
+      - name: Lay the landing page over website/pages/
         run: |
           mkdir -p _site/media
-          cp -r site/. _site/
+          cp -r website/pages/. _site/
           cp website/index.html _site/index.html
           cp website/media/hero.mp4 website/media/canyon.mp4 website/media/canyon-poster.jpg website/media/og.jpg _site/media/
       - uses: actions/upload-pages-artifact@v4
