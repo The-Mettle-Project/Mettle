@@ -1,0 +1,423 @@
+// std/fs: stat, directory listing, mkdir, remove, symbolic links, realpath,
+// cwd and the temp directory, on a fresh tree under the temp directory. Linux
+// only (the checks lean on its error codes). A failing check
+// prints its number and returns it (mod 255) as the exit code.
+import "std/fs";
+import "std/path";
+import "std/file";
+import "std/time";
+import "std/process";
+import "std/io";
+import "process_test_os/linux" if linux;
+import "process_test_os/other" if macos;
+import "process_test_os/other" if windows;
+
+var g_n: int32 = 0;
+
+// Counts the check, so a failure can say which one it was.
+fn ck(ok: bool) -> bool {
+  g_n = g_n + 1;
+  return ok;
+}
+
+fn view(buf: uint8*, n: int64) -> string {
+  var s: string;
+  s.chars = buf;
+  s.length = (uint64)n;
+  return s;
+}
+
+// base + "/" + rel, cleaned, in buf. The result is a view of buf.
+fn at(base: string, rel: string, buf: uint8*) -> string {
+  var n: int64 = path_join(base, rel, buf, 1024);
+  if (n < 0) { n = 0; }
+  return view(buf, n);
+}
+
+// base + tail as they are, with no cleaning.
+fn cat(base: string, tail: string, buf: uint8*) -> string {
+  var n: int64 = (int64)base.length;
+  var m: int64 = (int64)tail.length;
+  for i in 0..n { buf[i] = base.chars[i]; }
+  for i in 0..m { buf[n + i] = tail.chars[i]; }
+  return view(buf, n + m);
+}
+
+// Writes content to a new or existing file.
+fn mk(p: string, content: string) -> bool {
+  var fd: int64 = file_open(p, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return false; }
+  var n: int64 = (int64)content.length;
+  var w: int64 = 0;
+  if (n > 0) { w = file_write_at(fd, content.chars, n, 0); }
+  file_close(fd);
+  return w == n;
+}
+
+fn abs64(v: int64) -> int64 {
+  if (v < 0) { return -v; }
+  return v;
+}
+
+// The index of a name in the root directory, or -1.
+fn root_index(name: string) -> int32 {
+  if (name == "a.txt") { return 0; }
+  if (name == "sub") { return 1; }
+  if (name == "link") { return 2; }
+  if (name == "dirlink") { return 3; }
+  if (name == "escape") { return 4; }
+  if (name == "many") { return 5; }
+  return -1;
+}
+
+// The kind each root entry must have.
+fn root_kind(i: int32) -> int32 {
+  if (i == 0) { return FS_FILE; }
+  if (i == 1 || i == 5) { return FS_DIR; }
+  return FS_SYMLINK;
+}
+
+// The number in a name like "f042".
+fn name_number(name: string) -> int32 {
+  if (name.length != (uint64)4 || name.chars[0] != (uint8)102) { return -1; }
+  var v: int32 = 0;
+  for i in 1..4 {
+    var c: int32 = (int32)name.chars[i];
+    if (c < 48 || c > 57) { return -1; }
+    v = v * 10 + (c - 48);
+  }
+  return v;
+}
+
+fn run(root: string, outside: string) -> int32 {
+  var pa: uint8[1024];
+  var pb: uint8[1024];
+  var pc: uint8[1024];
+  var st: FsStat;
+  var now: int64 = time_unix_ns();
+  var minute: int64 = (int64)60 * 1000000000;
+
+  // Start from nothing. Removing what is not there is fine.
+  if (!ck(fs_remove_all(root) == 0)) { return g_n; }
+  if (!ck(fs_remove_all(outside) == 0)) { return g_n; }
+  if (!ck(!fs_exists(root) && !fs_is_dir(root) && !fs_is_file(root))) { return g_n; }
+  if (!ck(fs_stat(root, &st) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_lstat(root, &st) == -(int64)FS_ENOENT)) { return g_n; }
+
+  // mkdir, and mkdir on what exists.
+  if (!ck(fs_mkdir(root, 493) == 0)) { return g_n; }
+  if (!ck(fs_mkdir(root, 493) == -(int64)FS_EEXIST)) { return g_n; }
+  if (!ck(fs_mkdir(at(root, "no/parent", &pa[0]), 493) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_exists(root) && fs_is_dir(root) && !fs_is_file(root))) { return g_n; }
+  if (!ck(fs_stat(root, &st) == 0 && st.kind == FS_DIR)) { return g_n; }
+  if (!ck((st.mode & 448) == 448)) { return g_n; }
+  if (!ck(abs64(now - st.mtime_ns) < minute && abs64(now - st.ctime_ns) < minute)) { return g_n; }
+
+  // mkdir_all makes parents, and is fine on an existing directory.
+  if (!ck(fs_mkdir_all(at(root, "sub/deep/nested", &pa[0]), 493) == 0)) { return g_n; }
+  if (!ck(fs_mkdir_all(at(root, "sub/deep/nested", &pa[0]), 493) == 0)) { return g_n; }
+  if (!ck(fs_mkdir_all(at(root, "sub/deep", &pa[0]), 493) == 0)) { return g_n; }
+  if (!ck(fs_mkdir_all(root, 493) == 0)) { return g_n; }
+  if (!ck(fs_is_dir(at(root, "sub/deep/nested", &pa[0])))) { return g_n; }
+  // Repeated and trailing slashes do not matter.
+  if (!ck(fs_mkdir_all(cat(root, "//x//y/", &pb[0]), 493) == 0 && fs_is_dir(at(root, "x/y", &pa[0])))) { return g_n; }
+  if (!ck(fs_rmdir(at(root, "x/y", &pa[0])) == 0 && fs_rmdir(at(root, "x", &pa[0])) == 0)) { return g_n; }
+  // mkdir_all through a file fails with ENOTDIR, and so does mkdir_all of one.
+  if (!ck(mk(at(root, "a.txt", &pa[0]), "hello"))) { return g_n; }
+  if (!ck(fs_mkdir_all(at(root, "a.txt", &pa[0]), 493) == -(int64)FS_ENOTDIR)) { return g_n; }
+  if (!ck(fs_mkdir_all(at(root, "a.txt/x/y", &pa[0]), 493) == -(int64)FS_ENOTDIR)) { return g_n; }
+  if (!ck(fs_mkdir_all("", 493) < 0)) { return g_n; }
+
+  // stat of a file: kind, size, permissions, times.
+  if (!ck(mk(at(root, "sub/b.txt", &pa[0]), "abc"))) { return g_n; }
+  if (!ck(mk(at(root, "sub/deep/empty", &pa[0]), ""))) { return g_n; }
+  if (!ck(fs_stat(at(root, "a.txt", &pa[0]), &st) == 0)) { return g_n; }
+  if (!ck(st.kind == FS_FILE && st.size == 5)) { return g_n; }
+  if (!ck((st.mode & 256) != 0 && st.mode <= 0xFFF)) { return g_n; }
+  if (!ck(abs64(now - st.mtime_ns) < minute)) { return g_n; }
+  if (!ck(abs64(now - st.atime_ns) < minute && abs64(now - st.ctime_ns) < minute)) { return g_n; }
+  if (!ck(fs_stat(at(root, "sub/deep/empty", &pa[0]), &st) == 0 && st.kind == FS_FILE && st.size == 0)) { return g_n; }
+  if (!ck(fs_is_file(at(root, "a.txt", &pa[0])) && !fs_is_dir(at(root, "a.txt", &pa[0])))) { return g_n; }
+  // A rewrite moves the size and the time.
+  if (!ck(mk(at(root, "a.txt", &pa[0]), "hello, world"))) { return g_n; }
+  if (!ck(fs_stat(at(root, "a.txt", &pa[0]), &st) == 0 && st.size == 12)) { return g_n; }
+  // Paths through a file are ENOTDIR; long ones are refused.
+  if (!ck(fs_stat(at(root, "a.txt/x", &pa[0]), &st) == -(int64)FS_ENOTDIR)) { return g_n; }
+  var long: uint8[5000];
+  for i in 0..5000 { long[i] = (uint8)97; }
+  if (!ck(fs_stat(view(&long[0], 5000), &st) == -(int64)FS_ENAMETOOLONG)) { return g_n; }
+  if (!ck(fs_mkdir(view(&long[0], 4096), 493) == -(int64)FS_ENAMETOOLONG)) { return g_n; }
+
+  // mode on a new directory.
+  if (!ck(fs_mkdir(at(root, "private", &pa[0]), 448) == 0)) { return g_n; }   // 0700
+  if (!ck(fs_stat(at(root, "private", &pa[0]), &st) == 0 && (st.mode & 63) == 0 && (st.mode & 448) == 448)) { return g_n; }
+  if (!ck(fs_rmdir(at(root, "private", &pa[0])) == 0)) { return g_n; }
+
+  // Symbolic links: the link stores its text, stat follows, lstat does not.
+  if (!ck(fs_symlink("sub/b.txt", at(root, "link", &pa[0])) == 0)) { return g_n; }
+  if (!ck(fs_symlink("sub/b.txt", at(root, "link", &pa[0])) == -(int64)FS_EEXIST)) { return g_n; }
+  if (!ck(fs_symlink("sub", at(root, "dirlink", &pa[0])) == 0)) { return g_n; }
+  if (!ck(fs_symlink(outside, at(root, "escape", &pa[0])) == 0)) { return g_n; }
+  var tb: uint8[64];
+  var rn: int64 = fs_readlink(at(root, "link", &pa[0]), &tb[0], 64);
+  if (!ck(rn == 9 && view(&tb[0], rn) == "sub/b.txt" && tb[9] == (uint8)0)) { return g_n; }
+  if (!ck(fs_readlink(at(root, "link", &pa[0]), &tb[0], 10) == 9)) { return g_n; }
+  if (!ck(fs_readlink(at(root, "link", &pa[0]), &tb[0], 9) == -(int64)FS_ERANGE)) { return g_n; }
+  if (!ck(fs_readlink(at(root, "link", &pa[0]), &tb[0], 0) == -(int64)FS_ERANGE)) { return g_n; }
+  if (!ck(fs_readlink(at(root, "a.txt", &pa[0]), &tb[0], 64) == -(int64)FS_EINVAL)) { return g_n; }
+  if (!ck(fs_readlink(at(root, "missing", &pa[0]), &tb[0], 64) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_lstat(at(root, "link", &pa[0]), &st) == 0 && st.kind == FS_SYMLINK && st.size == 9)) { return g_n; }
+  if (!ck(fs_stat(at(root, "link", &pa[0]), &st) == 0 && st.kind == FS_FILE && st.size == 3)) { return g_n; }
+  if (!ck(fs_stat(at(root, "dirlink", &pa[0]), &st) == 0 && st.kind == FS_DIR)) { return g_n; }
+  if (!ck(fs_lstat(at(root, "dirlink", &pa[0]), &st) == 0 && st.kind == FS_SYMLINK)) { return g_n; }
+  if (!ck(fs_is_file(at(root, "link", &pa[0])) && fs_is_dir(at(root, "dirlink", &pa[0])))) { return g_n; }
+  // A link through a link directory reaches the real file.
+  if (!ck(fs_stat(at(root, "dirlink/b.txt", &pa[0]), &st) == 0 && st.size == 3)) { return g_n; }
+  // A link to nothing: lstat sees it, stat and exists do not.
+  if (!ck(fs_symlink("nowhere", at(root, "dangling", &pa[0])) == 0)) { return g_n; }
+  if (!ck(!fs_exists(at(root, "dangling", &pa[0])))) { return g_n; }
+  if (!ck(fs_stat(at(root, "dangling", &pa[0]), &st) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_lstat(at(root, "dangling", &pa[0]), &st) == 0 && st.kind == FS_SYMLINK)) { return g_n; }
+  if (!ck(fs_remove(at(root, "dangling", &pa[0])) == 0)) { return g_n; }
+  if (!ck(fs_lstat(at(root, "dangling", &pa[0]), &st) == -(int64)FS_ENOENT)) { return g_n; }
+  // Something that is neither file, directory nor link.
+  if (!ck(fs_stat("/dev/null", &st) == 0 && st.kind == FS_OTHER)) { return g_n; }
+
+  // The outside tree that "escape" points at.
+  if (!ck(fs_mkdir(outside, 493) == 0)) { return g_n; }
+  if (!ck(mk(at(outside, "keep.txt", &pa[0]), "keep"))) { return g_n; }
+  if (!ck(fs_mkdir(at(outside, "keepdir", &pa[0]), 493) == 0)) { return g_n; }
+  if (!ck(fs_stat(at(root, "escape/keep.txt", &pa[0]), &st) == 0 && st.size == 4)) { return g_n; }
+
+  // A directory with enough entries to need several reads.
+  if (!ck(fs_mkdir(at(root, "many", &pa[0]), 493) == 0)) { return g_n; }
+  var fname: uint8[8];
+  for i in 0..300 {
+    fname[0] = (uint8)102;
+    fname[1] = (uint8)(48 + i / 100);
+    fname[2] = (uint8)(48 + (i / 10) % 10);
+    fname[3] = (uint8)(48 + i % 10);
+    var rel: uint8[16];
+    var prefix: string = "many/";
+    for j in 0..5 { rel[j] = prefix.chars[j]; }
+    for j in 0..4 { rel[5 + j] = fname[j]; }
+    if (!mk(at(root, view(&rel[0], 9), &pa[0]), "x")) { return 1000; }
+  }
+
+  // List the root: every entry once, with the right kind.
+  var d: FsDir;
+  var e: FsDirEntry;
+  if (!ck(fs_dir_open(root, &d) == 0)) { return g_n; }
+  var seen: int32 = 0;
+  var count: int32 = 0;
+  var problems: int32 = 0;
+  while (true) {
+    var more: int64 = fs_dir_next(&d, &e);
+    if (more < 0) { problems = problems + 1; break; }
+    if (more == 0) { break; }
+    count = count + 1;
+    var idx: int32 = root_index(e.name);
+    if (idx < 0) {
+      problems = problems + 1;
+    } else {
+      if ((seen & (1 << idx)) != 0) { problems = problems + 1; }       // twice
+      seen = seen | (1 << idx);
+      if (e.kind != root_kind(idx)) { problems = problems + 1; }
+    }
+  }
+  if (!ck(fs_dir_next(&d, &e) == 0)) { return g_n; }   // still the end
+  if (!ck(fs_dir_close(&d) == 0)) { return g_n; }
+  if (!ck(problems == 0 && count == 6 && seen == 63)) { return g_n; }
+
+  // List the big directory: 300 distinct files, none missing.
+  if (!ck(fs_dir_open(at(root, "many", &pa[0]), &d) == 0)) { return g_n; }
+  var present: uint8[300];
+  count = 0;
+  problems = 0;
+  while (true) {
+    var more2: int64 = fs_dir_next(&d, &e);
+    if (more2 < 0) { problems = problems + 1; break; }
+    if (more2 == 0) { break; }
+    count = count + 1;
+    var num: int32 = name_number(e.name);
+    if (num < 0 || num >= 300 || e.kind != FS_FILE || present[num] != (uint8)0) {
+      problems = problems + 1;
+    } else {
+      present[num] = (uint8)1;
+    }
+  }
+  fs_dir_close(&d);
+  if (!ck(problems == 0 && count == 300)) { return g_n; }
+
+  // An empty directory, a file, and a missing path.
+  if (!ck(fs_dir_open(at(root, "sub/deep/nested", &pa[0]), &d) == 0)) { return g_n; }
+  if (!ck(fs_dir_next(&d, &e) == 0)) { return g_n; }
+  fs_dir_close(&d);
+  if (!ck(fs_dir_open(at(root, "a.txt", &pa[0]), &d) == -(int64)FS_ENOTDIR)) { return g_n; }
+  if (!ck(fs_dir_open(at(root, "missing", &pa[0]), &d) == -(int64)FS_ENOENT)) { return g_n; }
+  // Opening a link to a directory lists the directory.
+  if (!ck(fs_dir_open(at(root, "dirlink", &pa[0]), &d) == 0)) { return g_n; }
+  count = 0;
+  while (fs_dir_next(&d, &e) == 1) { count = count + 1; }
+  fs_dir_close(&d);
+  if (!ck(count == 2)) { return g_n; }   // b.txt and deep
+
+  // realpath resolves links and "..", and the result is absolute.
+  var rb: uint8[1024];
+  var rr: uint8[1024];
+  var rlen: int64 = fs_realpath(root, &rb[0], 1024);
+  if (!ck(rlen > 0 && path_is_abs(view(&rb[0], rlen)) && rb[rlen] == (uint8)0)) { return g_n; }
+  var real_root: string = view(&rb[0], rlen);
+  var want: uint8[1024];
+  var wl: int64 = path_join(real_root, "sub/b.txt", &want[0], 1024);
+  var got: int64 = fs_realpath(at(root, "link", &pa[0]), &rr[0], 1024);
+  if (!ck(got == wl && view(&rr[0], got) == view(&want[0], wl))) { return g_n; }
+  got = fs_realpath(at(root, "dirlink/deep/../b.txt", &pa[0]), &rr[0], 1024);
+  if (!ck(got == wl && view(&rr[0], got) == view(&want[0], wl))) { return g_n; }
+  got = fs_realpath(at(root, "sub/./deep/../b.txt", &pa[0]), &rr[0], 1024);
+  if (!ck(got == wl && view(&rr[0], got) == view(&want[0], wl))) { return g_n; }
+  if (!ck(fs_realpath(at(root, "missing", &pa[0]), &rr[0], 1024) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_realpath(at(root, "link", &pa[0]), &rr[0], wl) == -(int64)FS_ERANGE)) { return g_n; }
+  if (!ck(fs_realpath(at(root, "link", &pa[0]), &rr[0], wl + 1) == wl)) { return g_n; }
+  if (!ck(fs_realpath(at(root, "link", &pa[0]), &rr[0], 0) == -(int64)FS_ERANGE)) { return g_n; }
+
+  // getcwd and chdir round-trip. Go back before anything can fail.
+  var cwd0: uint8[1024];
+  var cl: int64 = fs_getcwd(&cwd0[0], 1024);
+  if (!ck(cl > 0 && cwd0[0] == (uint8)47 && cwd0[cl] == (uint8)0)) { return g_n; }
+  if (!ck(fs_getcwd(&tb[0], 2) == -(int64)FS_ERANGE)) { return g_n; }
+  if (!ck(fs_chdir(at(root, "missing", &pa[0])) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_chdir(at(root, "a.txt", &pa[0])) == -(int64)FS_ENOTDIR)) { return g_n; }
+  if (!ck(fs_chdir(root) == 0)) { return g_n; }
+  var cwd1: uint8[1024];
+  var c1: int64 = fs_getcwd(&cwd1[0], 1024);
+  var inside_ok: bool = c1 == rlen && view(&cwd1[0], c1) == real_root;
+  var rel_ok: bool = fs_stat("a.txt", &st) == 0 && st.size == 12 && fs_is_dir("sub/deep") && fs_exists("link");
+  var rel_ok2: bool = fs_realpath("sub/../link", &rr[0], 1024) == wl && view(&rr[0], wl) == view(&want[0], wl);
+  var back: int64 = fs_chdir(view(&cwd0[0], cl));
+  var cwd2: uint8[1024];
+  var c2: int64 = fs_getcwd(&cwd2[0], 1024);
+  if (!ck(back == 0 && c2 == cl && view(&cwd2[0], c2) == view(&cwd0[0], cl))) { return g_n; }
+  if (!ck(inside_ok)) { return g_n; }
+  if (!ck(rel_ok)) { return g_n; }
+  if (!ck(rel_ok2)) { return g_n; }
+
+  // The temp directory.
+  var tmp: uint8[1024];
+  var tl: int64 = fs_temp_dir(&tmp[0], 1024);
+  if (!ck(tl > 0 && tmp[tl] == (uint8)0 && fs_is_dir(view(&tmp[0], tl)))) { return g_n; }
+  if (!ck(fs_temp_dir(&tmp[0], tl) == -(int64)FS_ERANGE)) { return g_n; }
+  if (!ck(fs_temp_dir(&tmp[0], tl + 1) == tl)) { return g_n; }
+  if (!ck(fs_temp_dir(&tmp[0], 0) == -(int64)FS_ERANGE)) { return g_n; }
+
+  // remove and rmdir are strict about what they take.
+  if (!ck(fs_rmdir(at(root, "sub", &pa[0])) == -(int64)FS_ENOTEMPTY)) { return g_n; }
+  if (!ck(fs_rmdir(at(root, "a.txt", &pa[0])) == -(int64)FS_ENOTDIR)) { return g_n; }
+  if (!ck(fs_remove(at(root, "sub/deep/nested", &pa[0])) < 0)) { return g_n; }   // a directory
+  if (!ck(fs_rmdir(at(root, "sub/deep/nested", &pa[0])) == 0)) { return g_n; }
+  if (!ck(fs_rmdir(at(root, "sub/deep/nested", &pa[0])) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_remove(at(root, "sub/deep/empty", &pa[0])) == 0)) { return g_n; }
+  if (!ck(fs_remove(at(root, "sub/deep/empty", &pa[0])) == -(int64)FS_ENOENT)) { return g_n; }
+  // remove takes a link itself and leaves the target.
+  if (!ck(fs_remove(at(root, "link", &pa[0])) == 0)) { return g_n; }
+  if (!ck(fs_exists(at(root, "sub/b.txt", &pa[0])) && !fs_exists(at(root, "link", &pa[0])))) { return g_n; }
+  if (!ck(fs_symlink("sub/b.txt", at(root, "link", &pa[0])) == 0)) { return g_n; }
+
+  // remove_all refuses names that could mean the wrong thing.
+  if (!ck(fs_remove_all("") == -(int64)FS_EINVAL)) { return g_n; }
+  if (!ck(fs_remove_all("/") == -(int64)FS_EINVAL)) { return g_n; }
+  if (!ck(fs_remove_all("//") == -(int64)FS_EINVAL)) { return g_n; }
+  if (!ck(fs_remove_all(".") == -(int64)FS_EINVAL)) { return g_n; }
+  if (!ck(fs_remove_all("..") == -(int64)FS_EINVAL)) { return g_n; }
+  if (!ck(fs_remove_all("./") == -(int64)FS_EINVAL)) { return g_n; }
+  if (!ck(fs_remove_all(cat(root, "/sub/..", &pa[0])) == -(int64)FS_EINVAL)) { return g_n; }
+  if (!ck(fs_remove_all("x/.") == -(int64)FS_EINVAL)) { return g_n; }
+  if (!ck(fs_is_dir(root) && fs_is_file(at(root, "a.txt", &pa[0])))) { return g_n; }
+  // A link to a directory goes alone, with or without a trailing slash.
+  if (!ck(fs_remove_all(at(root, "dirlink", &pa[0])) == 0)) { return g_n; }
+  if (!ck(fs_lstat(at(root, "dirlink", &pa[0]), &st) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_is_dir(at(root, "sub", &pa[0])) && fs_is_file(at(root, "sub/b.txt", &pa[0])))) { return g_n; }
+  if (!ck(fs_symlink("sub", at(root, "dirlink", &pa[0])) == 0)) { return g_n; }
+  if (!ck(fs_remove_all(cat(root, "/dirlink///", &pc[0])) == 0)) { return g_n; }
+  if (!ck(fs_lstat(at(root, "dirlink", &pa[0]), &st) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_is_dir(at(root, "sub", &pa[0])) && fs_is_file(at(root, "sub/b.txt", &pa[0])))) { return g_n; }
+  // A file goes too.
+  if (!ck(mk(at(root, "tmpfile", &pa[0]), "z") && fs_remove_all(at(root, "tmpfile", &pa[0])) == 0 && !fs_exists(at(root, "tmpfile", &pa[0])))) { return g_n; }
+
+  // A deep tree.
+  var deep: uint8[1024];
+  var dl: int64 = (int64)root.length;
+  for i in 0..dl { deep[i] = root.chars[i]; }
+  for _lvl in 0..200 {
+    deep[dl] = (uint8)47;
+    deep[dl + 1] = (uint8)116;
+    dl = dl + 2;
+  }
+  if (!ck(fs_mkdir_all(view(&deep[0], dl), 493) == 0)) { return g_n; }
+  if (!ck(mk(at(view(&deep[0], dl), "bottom", &pa[0]), "x"))) { return g_n; }
+  if (!ck(fs_remove_all(at(root, "t", &pb[0])) == 0 && !fs_exists(at(root, "t", &pb[0])))) { return g_n; }
+
+  // The big one: remove the whole tree. The link that points outside it is
+  // removed, and the outside tree is untouched.
+  if (!ck(fs_remove_all(root) == 0)) { return g_n; }
+  if (!ck(!fs_exists(root) && fs_lstat(root, &st) == -(int64)FS_ENOENT)) { return g_n; }
+  if (!ck(fs_is_dir(outside))) { return g_n; }
+  if (!ck(fs_stat(at(outside, "keep.txt", &pa[0]), &st) == 0 && st.size == 4)) { return g_n; }
+  if (!ck(fs_is_dir(at(outside, "keepdir", &pa[0])))) { return g_n; }
+  if (!ck(fs_remove_all(root) == 0)) { return g_n; }   // again: nothing there
+  if (!ck(fs_remove_all(outside) == 0 && !fs_exists(outside))) { return g_n; }
+
+  return 0;
+}
+
+fn main() -> int32 {
+  // The checks use /tmp and POSIX permissions; elsewhere this only builds.
+  if (PROC_TEST_RUNS == 0) { return 0; }
+  var tmp: uint8[512];
+  var tl: int64 = fs_temp_dir(&tmp[0], 512);
+  if (tl <= 0) {
+    println("std/fs: no temp directory");
+    return 250;
+  }
+  var pid: int64 = proc_pid();
+  var name: uint8[64];
+  var prefix: string = "mettle_fs_test_";
+  var nl: int64 = 0;
+  for i in 0..15 { name[i] = prefix.chars[i]; }
+  nl = 15;
+  var digits: uint8[24];
+  var nd: int64 = 0;
+  var v: int64 = pid;
+  if (v == 0) {
+    digits[0] = (uint8)48;
+    nd = 1;
+  }
+  while (v > 0) {
+    digits[nd] = (uint8)(48 + v % 10);
+    nd = nd + 1;
+    v = v / 10;
+  }
+  while (nd > 0) {
+    nd = nd - 1;
+    name[nl] = digits[nd];
+    nl = nl + 1;
+  }
+  var rootb: uint8[1024];
+  var outb: uint8[1024];
+  var rl: int64 = path_join(view(&tmp[0], tl), view(&name[0], nl), &rootb[0], 1024);
+  name[nl] = (uint8)95;   // the outside tree is mettle_fs_test_<pid>_out
+  name[nl + 1] = (uint8)111;
+  name[nl + 2] = (uint8)117;
+  name[nl + 3] = (uint8)116;
+  var ol: int64 = path_join(view(&tmp[0], tl), view(&name[0], nl + 4), &outb[0], 1024);
+  var root: string = view(&rootb[0], rl);
+  var outside: string = view(&outb[0], ol);
+  var r: int32 = run(root, outside);
+  fs_remove_all(root);
+  fs_remove_all(outside);
+  if (r != 0) {
+    println("std/fs check {r} failed");
+    return r % 255;
+  }
+  return 0;
+}

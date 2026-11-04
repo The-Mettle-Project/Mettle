@@ -1,0 +1,9 @@
+// macOS libc entry points whose struct layout depends on the CPU. Intel Macs keep the old 32-bit-inode struct stat and struct dirent under the plain names; the $INODE64 symbols give the layout the stdlib reads.
+// std/macos_abi picks this file by target.
+
+export extern fn macos_c_stat(path: uint8*, st: uint8*) -> int32 = "stat$INODE64";
+export extern fn macos_c_lstat(path: uint8*, st: uint8*) -> int32 = "lstat$INODE64";
+export extern fn macos_c_fstat(fd: int32, st: uint8*) -> int32 = "fstat$INODE64";
+export extern fn macos_c_opendir(path: uint8*) -> uint8* = "opendir$INODE64";
+export extern fn macos_c_fdopendir(fd: int32) -> uint8* = "fdopendir$INODE64";
+export extern fn macos_c_readdir(dir: uint8*) -> uint8* = "readdir$INODE64";

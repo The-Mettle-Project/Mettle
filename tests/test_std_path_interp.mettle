@@ -1,0 +1,235 @@
+// std/path: join, clean, base, dir, ext, stem and is_abs. The module is pure,
+// so the same checks run natively and under `mettle test`:
+//   bin/mettle test tests/test_std_path_interp.mettle
+//   bin/mettle --build tests/test_std_path_interp.mettle -o x && ./x
+// A failing check prints its number and returns it (mod 255) as the exit code.
+import "std/io";
+import "std/path";
+
+var g_n: int32 = 0;
+
+// Counts the check, so a failure can say which one it was.
+fn ck(ok: bool) -> bool {
+  g_n = g_n + 1;
+  return ok;
+}
+
+// A view of the first n bytes of buf.
+fn view(buf: uint8*, n: int64) -> string {
+  var s: string;
+  s.chars = buf;
+  s.length = (uint64)n;
+  return s;
+}
+
+fn clean_is(p: string, want: string) -> bool {
+  var buf: uint8[64];
+  var n: int64 = path_clean(p, &buf[0], 64);
+  if (n < 0) { return false; }
+  if (buf[n] != (uint8)0) { return false; }
+  return view(&buf[0], n) == want;
+}
+
+fn join_is(a: string, b: string, want: string) -> bool {
+  var buf: uint8[64];
+  var n: int64 = path_join(a, b, &buf[0], 64);
+  if (n < 0) { return false; }
+  if (buf[n] != (uint8)0) { return false; }
+  return view(&buf[0], n) == want;
+}
+
+fn run_checks() -> int32 {
+  // Clean: the cases from Go's path package.
+  if (!ck(clean_is("", "."))) { return g_n; }
+  if (!ck(clean_is("abc", "abc"))) { return g_n; }
+  if (!ck(clean_is("abc/def", "abc/def"))) { return g_n; }
+  if (!ck(clean_is("a/b/c", "a/b/c"))) { return g_n; }
+  if (!ck(clean_is(".", "."))) { return g_n; }
+  if (!ck(clean_is("..", ".."))) { return g_n; }
+  if (!ck(clean_is("../..", "../.."))) { return g_n; }
+  if (!ck(clean_is("../../abc", "../../abc"))) { return g_n; }
+  if (!ck(clean_is("/abc", "/abc"))) { return g_n; }
+  if (!ck(clean_is("/", "/"))) { return g_n; }
+  if (!ck(clean_is("abc/", "abc"))) { return g_n; }
+  if (!ck(clean_is("abc/def/", "abc/def"))) { return g_n; }
+  if (!ck(clean_is("a/b/c/", "a/b/c"))) { return g_n; }
+  if (!ck(clean_is("./", "."))) { return g_n; }
+  if (!ck(clean_is("../", ".."))) { return g_n; }
+  if (!ck(clean_is("../../", "../.."))) { return g_n; }
+  if (!ck(clean_is("/abc/", "/abc"))) { return g_n; }
+  if (!ck(clean_is("abc//def//ghi", "abc/def/ghi"))) { return g_n; }
+  if (!ck(clean_is("//abc", "/abc"))) { return g_n; }
+  if (!ck(clean_is("///abc", "/abc"))) { return g_n; }
+  if (!ck(clean_is("//abc//", "/abc"))) { return g_n; }
+  if (!ck(clean_is("abc//", "abc"))) { return g_n; }
+  if (!ck(clean_is("abc/./def", "abc/def"))) { return g_n; }
+  if (!ck(clean_is("/./abc/def", "/abc/def"))) { return g_n; }
+  if (!ck(clean_is("abc/.", "abc"))) { return g_n; }
+  if (!ck(clean_is("abc/def/ghi/../jkl", "abc/def/jkl"))) { return g_n; }
+  if (!ck(clean_is("abc/def/../ghi/../jkl", "abc/jkl"))) { return g_n; }
+  if (!ck(clean_is("abc/def/..", "abc"))) { return g_n; }
+  if (!ck(clean_is("abc/def/../..", "."))) { return g_n; }
+  if (!ck(clean_is("/abc/def/../..", "/"))) { return g_n; }
+  if (!ck(clean_is("abc/def/../../..", ".."))) { return g_n; }
+  if (!ck(clean_is("/abc/def/../../..", "/"))) { return g_n; }
+  if (!ck(clean_is("abc/def/../../../ghi/jkl/../../..", "../.."))) { return g_n; }
+  if (!ck(clean_is("/../abc", "/abc"))) { return g_n; }
+  if (!ck(clean_is("a/../b:/../../c", "../c"))) { return g_n; }
+  // A name that only starts or ends like "." or ".." is an ordinary name.
+  if (!ck(clean_is("...", "..."))) { return g_n; }
+  if (!ck(clean_is(".../a", ".../a"))) { return g_n; }
+  if (!ck(clean_is("a/..b", "a/..b"))) { return g_n; }
+  if (!ck(clean_is("a/b..", "a/b.."))) { return g_n; }
+  if (!ck(clean_is("a/.hidden/../b", "a/b"))) { return g_n; }
+  if (!ck(clean_is("../a/..", ".."))) { return g_n; }
+  if (!ck(clean_is("a/../..", ".."))) { return g_n; }
+  if (!ck(clean_is("a/./b/./c/.", "a/b/c"))) { return g_n; }
+  if (!ck(clean_is("//", "/"))) { return g_n; }
+  if (!ck(clean_is("/.", "/"))) { return g_n; }
+  if (!ck(clean_is("/..", "/"))) { return g_n; }
+  if (!ck(clean_is("./a", "a"))) { return g_n; }
+  if (!ck(clean_is("./../a", "../a"))) { return g_n; }
+  // A backslash is an ordinary byte.
+  if (!ck(clean_is("a\\b/../c", "c"))) { return g_n; }
+
+  // Clean can work in place.
+  var inplace: uint8[16] = [97, 47, 47, 98, 47, 46, 47, 46, 46, 47, 99, 0, 0, 0, 0, 0];   // "a//b/./../c"
+  var ip: string = view(&inplace[0], 11);
+  var ipn: int64 = path_clean(ip, &inplace[0], 16);
+  if (!ck(ipn == 3 && view(&inplace[0], ipn) == "a/c")) { return g_n; }
+
+  // Join.
+  if (!ck(join_is("a", "b", "a/b"))) { return g_n; }
+  if (!ck(join_is("a/", "b", "a/b"))) { return g_n; }
+  if (!ck(join_is("a", "/b", "a/b"))) { return g_n; }
+  if (!ck(join_is("a/", "/b", "a/b"))) { return g_n; }
+  if (!ck(join_is("/", "a", "/a"))) { return g_n; }
+  if (!ck(join_is("", "a", "a"))) { return g_n; }
+  if (!ck(join_is("a", "", "a"))) { return g_n; }
+  if (!ck(join_is("", "", ""))) { return g_n; }
+  if (!ck(join_is("", "/a/", "/a"))) { return g_n; }
+  if (!ck(join_is("a/b", "../c", "a/c"))) { return g_n; }
+  if (!ck(join_is("a", "../../c", "../c"))) { return g_n; }
+  if (!ck(join_is("/a", "../../c", "/c"))) { return g_n; }
+  if (!ck(join_is("a/b/", "./c/./d", "a/b/c/d"))) { return g_n; }
+  if (!ck(join_is(".", "a", "a"))) { return g_n; }
+  if (!ck(join_is("a", ".", "a"))) { return g_n; }
+  if (!ck(join_is("a", "..", "."))) { return g_n; }
+  if (!ck(join_is("/usr", "local//bin", "/usr/local/bin"))) { return g_n; }
+
+  // Buffers that are too small. The result is cleared, never half-written
+  // past the end.
+  var small: uint8[4];
+  var guard: uint8[8] = [9, 9, 9, 9, 9, 9, 9, 9];
+  if (!ck(path_join("ab", "cd", &small[0], 4) == -(int64)PATH_ERANGE)) { return g_n; }
+  if (!ck(path_join("a", "cd", &small[0], 4) == -(int64)PATH_ERANGE)) { return g_n; }
+  if (!ck(path_join("a", "c", &small[0], 4) == 3 && small[3] == (uint8)0)) { return g_n; }
+  if (!ck(path_clean("abc", &small[0], 4) == 3 && small[3] == (uint8)0)) { return g_n; }
+  if (!ck(path_clean("abcd", &small[0], 4) == -(int64)PATH_ERANGE)) { return g_n; }
+  if (!ck(path_clean("", &small[0], 1) == -(int64)PATH_ERANGE)) { return g_n; }
+  if (!ck(path_clean("", &small[0], 2) == 1 && small[0] == (uint8)46 && small[1] == (uint8)0)) { return g_n; }
+  if (!ck(path_clean("a", &small[0], 0) == -(int64)PATH_ERANGE)) { return g_n; }
+  if (!ck(path_clean("/a", &small[0], 2) == -(int64)PATH_ERANGE)) { return g_n; }
+  if (!ck(path_clean("/", &small[0], 2) == 1)) { return g_n; }
+  if (!ck(path_clean("../..", &small[0], 5) == -(int64)PATH_ERANGE)) { return g_n; }
+  if (!ck(guard[0] == (uint8)9)) { return g_n; }
+
+  // Base.
+  if (!ck(path_base("") == ".")) { return g_n; }
+  if (!ck(path_base("/") == "/")) { return g_n; }
+  if (!ck(path_base("///") == "/")) { return g_n; }
+  if (!ck(path_base("a") == "a")) { return g_n; }
+  if (!ck(path_base("a/b") == "b")) { return g_n; }
+  if (!ck(path_base("a/b/") == "b")) { return g_n; }
+  if (!ck(path_base("a/b//") == "b")) { return g_n; }
+  if (!ck(path_base("/a") == "a")) { return g_n; }
+  if (!ck(path_base("/a/b.txt") == "b.txt")) { return g_n; }
+  if (!ck(path_base("a//b") == "b")) { return g_n; }
+  if (!ck(path_base(".") == ".")) { return g_n; }
+  if (!ck(path_base("a/..") == "..")) { return g_n; }
+
+  // Dir.
+  if (!ck(path_dir("") == ".")) { return g_n; }
+  if (!ck(path_dir("a") == ".")) { return g_n; }
+  if (!ck(path_dir("/") == "/")) { return g_n; }
+  if (!ck(path_dir("///") == "/")) { return g_n; }
+  if (!ck(path_dir("/a") == "/")) { return g_n; }
+  if (!ck(path_dir("//a") == "/")) { return g_n; }
+  if (!ck(path_dir("a/b") == "a")) { return g_n; }
+  if (!ck(path_dir("a/b/c") == "a/b")) { return g_n; }
+  if (!ck(path_dir("/a/b/c") == "/a/b")) { return g_n; }
+  if (!ck(path_dir("a/b/") == "a/b")) { return g_n; }
+  if (!ck(path_dir("a//b") == "a")) { return g_n; }
+  if (!ck(path_dir("a//b//c") == "a//b")) { return g_n; }
+  if (!ck(path_dir("./a") == ".")) { return g_n; }
+  if (!ck(path_dir("../a") == "..")) { return g_n; }
+
+  // Ext and stem.
+  if (!ck(path_ext("") == "")) { return g_n; }
+  if (!ck(path_ext("a") == "")) { return g_n; }
+  if (!ck(path_ext("a.txt") == ".txt")) { return g_n; }
+  if (!ck(path_ext("a/b.txt") == ".txt")) { return g_n; }
+  if (!ck(path_ext("a.b/c") == "")) { return g_n; }
+  if (!ck(path_ext("a.tar.gz") == ".gz")) { return g_n; }
+  if (!ck(path_ext("a/b.tar.gz") == ".gz")) { return g_n; }
+  if (!ck(path_ext("a.") == ".")) { return g_n; }
+  if (!ck(path_ext(".bashrc") == "")) { return g_n; }
+  if (!ck(path_ext("dir/.bashrc") == "")) { return g_n; }
+  if (!ck(path_ext(".bashrc.bak") == ".bak")) { return g_n; }
+  if (!ck(path_ext(".") == "")) { return g_n; }
+  if (!ck(path_ext("..") == "")) { return g_n; }
+  if (!ck(path_ext("a/.") == "")) { return g_n; }
+  if (!ck(path_ext("file.txt/") == ".txt")) { return g_n; }
+  if (!ck(path_ext("/") == "")) { return g_n; }
+  if (!ck(path_stem("") == "")) { return g_n; }
+  if (!ck(path_stem("/") == "")) { return g_n; }
+  if (!ck(path_stem("a") == "a")) { return g_n; }
+  if (!ck(path_stem("a.txt") == "a")) { return g_n; }
+  if (!ck(path_stem("a/b.txt") == "b")) { return g_n; }
+  if (!ck(path_stem("a.tar.gz") == "a.tar")) { return g_n; }
+  if (!ck(path_stem("a.") == "a")) { return g_n; }
+  if (!ck(path_stem(".bashrc") == ".bashrc")) { return g_n; }
+  if (!ck(path_stem("dir.d/") == "dir")) { return g_n; }
+  if (!ck(path_stem("..") == "..")) { return g_n; }
+  if (!ck(path_stem("x/y/") == "y")) { return g_n; }
+
+  // Is absolute.
+  if (!ck(path_is_abs("/"))) { return g_n; }
+  if (!ck(path_is_abs("/a/b"))) { return g_n; }
+  if (!ck(!path_is_abs(""))) { return g_n; }
+  if (!ck(!path_is_abs("a/b"))) { return g_n; }
+  if (!ck(!path_is_abs("./a"))) { return g_n; }
+  if (!ck(!path_is_abs("C:/a"))) { return g_n; }
+
+  // A view stays inside the string it came from.
+  var whole: string = "dir/sub/file.txt";
+  var b: string = path_base(whole);
+  if (!ck(b.length == (uint64)8 && b.chars == whole.chars + 8)) { return g_n; }
+  var d: string = path_dir(whole);
+  if (!ck(d.length == (uint64)7 && d.chars == whole.chars)) { return g_n; }
+  var e: string = path_ext(whole);
+  if (!ck(e.length == (uint64)4 && e.chars == whole.chars + 12)) { return g_n; }
+  var st: string = path_stem(whole);
+  if (!ck(st.length == (uint64)4 && st.chars == whole.chars + 8)) { return g_n; }
+
+  // Pieces recombine.
+  var rebuilt: uint8[64];
+  var rn: int64 = path_join(path_dir(whole), path_base(whole), &rebuilt[0], 64);
+  if (!ck(rn == 16 && view(&rebuilt[0], rn) == whole)) { return g_n; }
+  return 0;
+}
+
+@test fn path_checks() -> int32 {
+  var r: int32 = run_checks();
+  assert_eq(r, 0);
+  return r;
+}
+
+fn main() -> int32 {
+  var r: int32 = run_checks();
+  if (r != 0) {
+    println("std/path check {r} failed");
+    return r % 255;
+  }
+  return 0;
+}

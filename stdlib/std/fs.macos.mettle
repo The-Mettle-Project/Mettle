@@ -1,0 +1,459 @@
+// macOS filesystem calls for std/fs, through libc: file information,
+// directory listing, and creating, removing and finding paths. Every call
+// returns 0, a length, or a negative error code (-errno; macOS numbers, so
+// compare with the FS_E constants). Paths are strings copied into a
+// NUL-terminated 4096-byte buffer, so a longer path fails with
+// -FS_ENAMETOOLONG. Names are relative to the current directory unless they
+// start with a slash.
+//
+// The struct stat and struct dirent layouts here are the 64-bit-inode ones
+// that arm64 uses. They have not been run on an Intel Mac, where libc keeps
+// the older layouts behind the plain names (std/file has the same limit).
+//
+// Things to know:
+//   - fs_stat follows symbolic links, fs_lstat does not.
+//   - fs_dir_next gives a view of the entry name that is valid until the
+//     next call. Nothing is allocated.
+//   - fs_remove_all never follows a symbolic link. A link is removed, never
+//     the thing it points to.
+//   - fs_realpath is libc's realpath.
+
+import "std/conv";
+
+export const FS_FILE = 1;      // a regular file
+export const FS_DIR = 2;       // a directory
+export const FS_SYMLINK = 3;   // a symbolic link (only from fs_lstat or a listing)
+export const FS_OTHER = 4;     // a device, pipe, socket or anything else
+
+export const FS_ENOENT = 2;
+export const FS_EACCES = 13;
+export const FS_EEXIST = 17;
+export const FS_ENOTDIR = 20;
+export const FS_EINVAL = 22;
+export const FS_ERANGE = 34;         // the buffer is too small
+export const FS_ENAMETOOLONG = 63;
+export const FS_ENOTEMPTY = 66;
+export const FS_ELOOP = 62;
+
+// What fs_stat finds. mode holds the permission bits (the low 12, including
+// setuid, setgid and sticky). Times are nanoseconds since 1970-01-01 UTC.
+export struct FsStat {
+  kind: int32;       // FS_FILE, FS_DIR, FS_SYMLINK or FS_OTHER
+  mode: int32;
+  size: int64;
+  mtime_ns: int64;   // last change of the contents
+  atime_ns: int64;   // last access
+  ctime_ns: int64;   // last change of the file's metadata
+}
+
+// An open directory. Make one with fs_dir_open, read it with fs_dir_next and
+// finish with fs_dir_close.
+export struct FsDir {
+  handle: uint8*;   // libc's DIR*
+}
+
+// One entry of a directory.
+export struct FsDirEntry {
+  name: string;   // a view into the FsDir; valid until the next fs_dir_next
+  kind: int32;    // FS_FILE, FS_DIR, FS_SYMLINK or FS_OTHER
+}
+
+import "std/macos_abi";
+
+extern fn fs_c_errno() -> int32* = "__error";
+extern fn fs_c_fstatat(fd: int32, path: uint8*, st: uint8*, flag: int32) -> int32 = "fstatat";
+extern fn fs_c_closedir(dir: uint8*) -> int32 = "closedir";
+extern fn fs_c_dirfd(dir: uint8*) -> int32 = "dirfd";
+// openat is variadic. x86-64 reads the variadic argument from the fourth
+// register, arm64 from the first stack slot; the unused mode argument is
+// passed in both places, as std/file does for open.
+extern fn fs_c_openat_v(fd: int32, path: uint8*, flags: int32, a4: int64, a5: int64, a6: int64, a7: int64, a8: int64, a9: int64) -> int32 = "openat";
+extern fn fs_c_close(fd: int32) -> int32 = "close";
+extern fn fs_c_mkdir(path: uint8*, mode: int32) -> int32 = "mkdir";
+extern fn fs_c_rmdir(path: uint8*) -> int32 = "rmdir";
+extern fn fs_c_unlink(path: uint8*) -> int32 = "unlink";
+extern fn fs_c_unlinkat(fd: int32, path: uint8*, flag: int32) -> int32 = "unlinkat";
+extern fn fs_c_symlink(target: uint8*, link: uint8*) -> int32 = "symlink";
+extern fn fs_c_readlink(path: uint8*, buf: uint8*, n: int64) -> int64 = "readlink";
+extern fn fs_c_getcwd(buf: uint8*, n: int64) -> uint8* = "getcwd";
+extern fn fs_c_chdir(path: uint8*) -> int32 = "chdir";
+extern fn fs_c_realpath(path: uint8*, out: uint8*) -> uint8* = "realpath";
+extern fn fs_c_getenv(name: cstring) -> cstring = "getenv";
+
+const FS_AT_FDCWD = -2;
+const FS_AT_SYMLINK_NOFOLLOW = 0x20;
+const FS_AT_REMOVEDIR = 0x80;
+const FS_O_NOFOLLOW = 0x100;
+const FS_O_DIRECTORY = 0x100000;
+const FS_O_CLOEXEC = 0x1000000;
+const FS_MAX_DEPTH = 256;   // how deep fs_remove_all goes
+
+// The result of a libc call that returns -1 on failure: the count, or -errno.
+fn fs_ret(r: int64) -> int64 {
+  if (r < 0) { return -(int64)*fs_c_errno(); }
+  return r;
+}
+
+// -errno, for a call that failed.
+fn fs_fail() -> int64 { return -(int64)*fs_c_errno(); }
+
+// Copies a path into buf with a NUL. Returns false if it does not fit.
+fn fs_cpath(path: string, buf: uint8*) -> bool {
+  if (path.length >= (uint64)4096) { return false; }
+  for i in 0..path.length { buf[i] = (uint8)path[i]; }
+  buf[(int64)path.length] = (uint8)0;
+  return true;
+}
+
+// Length of a NUL-terminated string.
+fn fs_cstrlen(p: uint8*) -> int64 {
+  var n: int64 = 0;
+  while (p[n] != (uint8)0) { n = n + 1; }
+  return n;
+}
+
+// Seconds and nanoseconds as nanoseconds.
+fn fs_ns(sec: int64, nsec: int64) -> int64 {
+  return sec * (int64)1000000000 + nsec;
+}
+
+// The FS_ kind for the file type bits of a mode.
+fn fs_kind_of_mode(mode: int32) -> int32 {
+  var t: int32 = mode & 0xF000;
+  if (t == 0x8000) { return FS_FILE; }
+  if (t == 0x4000) { return FS_DIR; }
+  if (t == 0xA000) { return FS_SYMLINK; }
+  return FS_OTHER;
+}
+
+// st_mode is a 16-bit field at byte 4 of struct stat.
+fn fs_st_mode(st: uint8*) -> int32 {
+  return (int32)*(uint16*)(st + 4);
+}
+
+// Fills an FsStat from a struct stat (st_atimespec at 32, st_mtimespec at 48,
+// st_ctimespec at 64, st_size at 96).
+fn fs_fill(st: uint8*, out: FsStat*) {
+  var mode: int32 = fs_st_mode(st);
+  out->kind = fs_kind_of_mode(mode);
+  out->mode = mode & 0xFFF;
+  out->size = *(int64*)(st + 96);
+  out->atime_ns = fs_ns(*(int64*)(st + 32), *(int64*)(st + 40));
+  out->mtime_ns = fs_ns(*(int64*)(st + 48), *(int64*)(st + 56));
+  out->ctime_ns = fs_ns(*(int64*)(st + 64), *(int64*)(st + 72));
+}
+
+// Describes path, following symbolic links. Returns 0 or -errno; a link to
+// nothing gives -FS_ENOENT.
+export fn fs_stat(path: string, out: FsStat*) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  var st: int64[18];   // struct stat is 144 bytes
+  if (macos_c_stat(&cp[0], (uint8*)&st[0]) < 0) { return fs_fail(); }
+  fs_fill((uint8*)&st[0], out);
+  return 0;
+}
+
+// Like fs_stat, but describes a symbolic link itself.
+export fn fs_lstat(path: string, out: FsStat*) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  var st: int64[18];
+  if (macos_c_lstat(&cp[0], (uint8*)&st[0]) < 0) { return fs_fail(); }
+  fs_fill((uint8*)&st[0], out);
+  return 0;
+}
+
+// True if path exists, following links, so a dangling link is false.
+export fn fs_exists(path: string) -> bool {
+  var st: FsStat;
+  return fs_stat(path, &st) == 0;
+}
+
+export fn fs_is_dir(path: string) -> bool {
+  var st: FsStat;
+  return fs_stat(path, &st) == 0 && st.kind == FS_DIR;
+}
+
+export fn fs_is_file(path: string) -> bool {
+  var st: FsStat;
+  return fs_stat(path, &st) == 0 && st.kind == FS_FILE;
+}
+
+// Opens a directory for reading. Returns 0 or -errno; -FS_ENOTDIR if path is
+// not a directory.
+export fn fs_dir_open(path: string, d: FsDir*) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  var h: uint8* = macos_c_opendir(&cp[0]);
+  if (h == (uint8*)0) { return fs_fail(); }
+  d->handle = h;
+  return 0;
+}
+
+// Reads the next entry, skipping "." and "..". Returns 1 and fills e, 0 at
+// the end of the directory, or -errno. The order is the file system's. If
+// the file system does not say what an entry is, it is looked up with an
+// lstat. e->name stays valid until the next call on d.
+export fn fs_dir_next(d: FsDir*, e: FsDirEntry*) -> int64 {
+  while (true) {
+    *fs_c_errno() = 0;   // readdir returns 0 for both the end and an error
+    var rec: uint8* = macos_c_readdir(d->handle);
+    if (rec == (uint8*)0) {
+      var err: int32 = *fs_c_errno();
+      if (err != 0) { return -(int64)err; }
+      return 0;
+    }
+    // struct dirent: ino u64, seekoff u64, reclen u16, namlen u16, type u8, name.
+    var n: int64 = (int64)*(uint16*)(rec + 18);
+    var dtype: int32 = (int32)rec[20];
+    var name: uint8* = rec + 21;
+    if (name[0] == (uint8)46 && (n == 1 || (n == 2 && name[1] == (uint8)46))) { continue; }
+    var kind: int32 = FS_OTHER;
+    if (dtype == 8) {
+      kind = FS_FILE;
+    } else if (dtype == 4) {
+      kind = FS_DIR;
+    } else if (dtype == 10) {
+      kind = FS_SYMLINK;
+    } else if (dtype == 0) {
+      // DT_UNKNOWN: ask the file system.
+      var st: int64[18];
+      var r: int32 = fs_c_fstatat(fs_c_dirfd(d->handle), name, (uint8*)&st[0], FS_AT_SYMLINK_NOFOLLOW);
+      if (r < 0 && *fs_c_errno() == FS_ENOENT) { continue; }   // removed since it was listed
+      if (r == 0) { kind = fs_kind_of_mode(fs_st_mode((uint8*)&st[0])); }
+    }
+    e->name = str_from_bytes((cstring)name, n);
+    e->kind = kind;
+    return 1;
+  }
+  return 0;
+}
+
+// Closes a directory opened by fs_dir_open.
+export fn fs_dir_close(d: FsDir*) -> int64 {
+  var r: int64 = fs_ret((int64)fs_c_closedir(d->handle));
+  d->handle = (uint8*)0;
+  return r;
+}
+
+// Makes one directory. mode is the permission bits, such as 0755, which is
+// 493 (Mettle has no octal literals); the process umask is applied. Fails
+// with -FS_EEXIST if path exists.
+export fn fs_mkdir(path: string, mode: int32) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  return fs_ret((int64)fs_c_mkdir(&cp[0], mode));
+}
+
+// Makes path and any missing parents, like mkdir -p. It is fine if path is
+// already a directory; if it is something else, the result is
+// -FS_ENOTDIR. mode applies to every directory it makes.
+export fn fs_mkdir_all(path: string, mode: int32) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  var n: int64 = (int64)path.length;
+  var i: int64 = 1;
+  while (i < n) {
+    // Each prefix that ends before a slash, skipping runs of slashes.
+    if (cp[i] == (uint8)47 && cp[i - 1] != (uint8)47) {
+      cp[i] = (uint8)0;
+      var pr: int64 = fs_ret((int64)fs_c_mkdir(&cp[0], mode));
+      cp[i] = (uint8)47;
+      if (pr < 0 && pr != -(int64)FS_EEXIST) { return pr; }
+    }
+    i = i + 1;
+  }
+  var r: int64 = fs_ret((int64)fs_c_mkdir(&cp[0], mode));
+  if (r == -(int64)FS_EEXIST) {
+    if (fs_is_dir(path)) { return 0; }
+    return -(int64)FS_ENOTDIR;
+  }
+  return r;
+}
+
+// Removes an empty directory.
+export fn fs_rmdir(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  return fs_ret((int64)fs_c_rmdir(&cp[0]));
+}
+
+// Removes a file or a symbolic link (the link, not its target). A directory
+// gives an error; use fs_rmdir or fs_remove_all.
+export fn fs_remove(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  return fs_ret((int64)fs_c_unlink(&cp[0]));
+}
+
+// Removes the entry called name inside the directory dirfd, and everything
+// below it. Symbolic links are unlinked, never followed. Works by descriptor,
+// so path length does not matter. depth counts the levels below the first.
+fn fs_rm_at(dirfd: int32, name: uint8*, depth: int32) -> int64 {
+  var st: int64[18];
+  if (fs_c_fstatat(dirfd, name, (uint8*)&st[0], FS_AT_SYMLINK_NOFOLLOW) < 0) {
+    var e0: int64 = fs_fail();
+    if (e0 == -(int64)FS_ENOENT) { return 0; }
+    return e0;
+  }
+  if (fs_kind_of_mode(fs_st_mode((uint8*)&st[0])) != FS_DIR) {
+    if (fs_c_unlinkat(dirfd, name, 0) < 0) {
+      var e1: int64 = fs_fail();
+      if (e1 == -(int64)FS_ENOENT) { return 0; }
+      return e1;
+    }
+    return 0;
+  }
+  if (depth >= FS_MAX_DEPTH) { return -(int64)FS_ELOOP; }
+  // A directory can lose entries while we read it, and some file systems then
+  // skip entries. So read, remove, and try the rmdir; if it says the
+  // directory is not empty, go round again.
+  for _pass in 0..4 {
+    // O_NOFOLLOW makes a link swapped in since the lstat fail with ELOOP
+    // instead of being followed.
+    var fd: int32 = fs_c_openat_v(dirfd, name, FS_O_DIRECTORY | FS_O_NOFOLLOW | FS_O_CLOEXEC, 0, 0, 0, 0, 0, 0);
+    if (fd < 0) {
+      var e2: int64 = fs_fail();
+      if (e2 == -(int64)FS_ENOENT) { return 0; }
+      return e2;
+    }
+    var dir: uint8* = macos_c_fdopendir(fd);
+    if (dir == (uint8*)0) {
+      var e3: int64 = fs_fail();
+      fs_c_close(fd);
+      return e3;
+    }
+    var sub: FsDir;
+    sub.handle = dir;
+    var ent: FsDirEntry;
+    var r: int64 = 0;
+    while (true) {
+      var more: int64 = fs_dir_next(&sub, &ent);
+      if (more < 0) {
+        fs_c_closedir(dir);
+        return more;
+      }
+      if (more == 0) { break; }
+      if (ent.kind == FS_DIR) {
+        r = fs_rm_at(fd, ent.name.chars, depth + 1);
+      } else {
+        r = 0;
+        if (fs_c_unlinkat(fd, ent.name.chars, 0) < 0) {
+          r = fs_fail();
+          if (r == -(int64)FS_ENOENT) { r = 0; }
+        }
+      }
+      if (r < 0) {
+        fs_c_closedir(dir);
+        return r;
+      }
+    }
+    fs_c_closedir(dir);
+    if (fs_c_unlinkat(dirfd, name, FS_AT_REMOVEDIR) == 0) { return 0; }
+    r = fs_fail();
+    if (r == -(int64)FS_ENOENT) { return 0; }
+    if (r != -(int64)FS_ENOTEMPTY && r != -(int64)FS_EEXIST) { return r; }
+  }
+  return -(int64)FS_ENOTEMPTY;
+}
+
+// Removes path and everything below it, like rm -rf. A path that does not
+// exist is fine (the result is 0).
+//
+// It never follows a symbolic link. If path itself is a link, the link is
+// removed and its target is left alone; links inside a directory are removed
+// the same way, so the tree it deletes is only what lies under path. A
+// trailing slash is ignored, so "link/" is the link, not its target.
+//
+// It refuses "", "/", ".", ".." and anything ending in "/." or "/..", with
+// -FS_EINVAL. A tree more than 256 levels deep fails with -FS_ELOOP. It stops
+// at the first error, and what it already removed stays removed.
+export fn fs_remove_all(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  var n: int64 = (int64)path.length;
+  while (n > 1 && cp[n - 1] == (uint8)47) { n = n - 1; }
+  cp[n] = (uint8)0;
+  // The last element must be a real name.
+  var s: int64 = n;
+  while (s > 0 && cp[s - 1] != (uint8)47) { s = s - 1; }
+  var last: int64 = n - s;
+  if (last == 0) { return -(int64)FS_EINVAL; }
+  if (last == 1 && cp[s] == (uint8)46) { return -(int64)FS_EINVAL; }
+  if (last == 2 && cp[s] == (uint8)46 && cp[s + 1] == (uint8)46) { return -(int64)FS_EINVAL; }
+  return fs_rm_at(FS_AT_FDCWD, &cp[0], 0);
+}
+
+// Makes a symbolic link at link that holds target. The target is stored as
+// given and need not exist.
+export fn fs_symlink(target: string, link: string) -> int64 {
+  var a: uint8[4096];
+  var b: uint8[4096];
+  if (!fs_cpath(target, &a[0]) || !fs_cpath(link, &b[0])) { return -(int64)FS_ENAMETOOLONG; }
+  return fs_ret((int64)fs_c_symlink(&a[0], &b[0]));
+}
+
+// Writes the target of the symbolic link at path into buf, with a NUL after
+// it, and returns its length. -FS_ERANGE if buf (cap bytes) cannot hold the
+// target and the NUL; -FS_EINVAL if path is not a link.
+export fn fs_readlink(path: string, buf: uint8*, cap: int64) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  if (cap < 1) { return -(int64)FS_ERANGE; }
+  var r: int64 = fs_ret(fs_c_readlink(&cp[0], buf, cap));
+  if (r < 0) { return r; }
+  // libc cuts the text off without saying so. A full buffer might have been
+  // cut, and has no room for the NUL anyway.
+  if (r >= cap) { return -(int64)FS_ERANGE; }
+  buf[r] = (uint8)0;
+  return r;
+}
+
+// Writes the absolute path of path into buf with every symbolic link
+// resolved, and returns its length. The path must exist. -FS_ERANGE if buf
+// does not have room for the result and a NUL.
+export fn fs_realpath(path: string, buf: uint8*, cap: int64) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  if (cap < 1) { return -(int64)FS_ERANGE; }
+  var out: uint8[4096];   // realpath wants a PATH_MAX buffer
+  if (fs_c_realpath(&cp[0], &out[0]) == (uint8*)0) { return fs_fail(); }
+  var n: int64 = fs_cstrlen(&out[0]);
+  if (n + 1 > cap) { return -(int64)FS_ERANGE; }
+  for i in 0..n { buf[i] = out[i]; }
+  buf[n] = (uint8)0;
+  return n;
+}
+
+// Writes the current directory into buf with a NUL and returns its length.
+// -FS_ERANGE if it does not fit.
+export fn fs_getcwd(buf: uint8*, cap: int64) -> int64 {
+  if (cap < 1) { return -(int64)FS_ERANGE; }
+  if (fs_c_getcwd(buf, cap) == (uint8*)0) { return fs_fail(); }
+  return fs_cstrlen(buf);
+}
+
+// Changes the current directory of the whole process.
+export fn fs_chdir(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  return fs_ret((int64)fs_c_chdir(&cp[0]));
+}
+
+// Writes the directory for temporary files into buf with a NUL and returns
+// its length: $TMPDIR if it is set and not empty, else /tmp. It does not
+// check that the directory exists.
+export fn fs_temp_dir(buf: uint8*, cap: int64) -> int64 {
+  var t: string = "/tmp";
+  var env: cstring = fs_c_getenv("TMPDIR");
+  if (env != 0) {
+    var e: string = str_from_cstr(env);
+    if (e.length > (uint64)0) { t = e; }
+  }
+  var n: int64 = (int64)t.length;
+  if (n + 1 > cap) { return -(int64)FS_ERANGE; }
+  for i in 0..n { buf[i] = t.chars[i]; }
+  buf[n] = (uint8)0;
+  return n;
+}

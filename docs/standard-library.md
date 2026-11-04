@@ -1251,6 +1251,118 @@ with `file_truncate` first. `file_map_sync(&m)` writes a shared map's changes
 to the file; on Windows it does not wait for the device, so call `file_sync`
 as well. `file_unmap(&m)` releases it, and a second call does nothing.
 
+## std/fs
+
+Information about paths, and directories: stat, listing, make and remove,
+symbolic links, the current directory and the temp directory. Linux, macOS and
+Windows. Every call returns 0, a length, or a negative error code
+(`-FS_ENOENT`, `-FS_EACCES`, `-FS_EEXIST`, `-FS_ENOTDIR`, `-FS_EINVAL`,
+`-FS_ERANGE`, `-FS_ENAMETOOLONG`, `-FS_ENOTEMPTY`, `-FS_ELOOP`). The codes are
+`errno` on Linux and macOS and `GetLastError()` on Windows, so compare with the
+constants, not with numbers. On Linux the calls are raw system calls.
+
+Paths are strings. Each is copied into a NUL-terminated 4096-byte buffer, and a
+longer one fails with `-FS_ENAMETOOLONG`. Calls that return text write it into
+a `buf` and `cap` you give, put a NUL after it, and return its length. If it
+does not fit, they return `-FS_ERANGE`. `mode` arguments are permission bits.
+Mettle has no octal literals, so write 0755 as `493`.
+
+**Stat.** `fs_stat(path, &st: FsStat) -> int64` follows symbolic links.
+`fs_lstat` describes a link itself. `FsStat` has `kind` (`FS_FILE`, `FS_DIR`,
+`FS_SYMLINK` or `FS_OTHER`), `size`, `mode` (the low 12 permission bits; 0 on
+Windows), and `mtime_ns`, `atime_ns` and `ctime_ns` (Unix nanoseconds).
+`fs_exists`, `fs_is_dir` and `fs_is_file` return `bool` and follow links, so a
+dangling link does not exist.
+
+**Listing.** A listing allocates nothing.
+
+```mettle
+var d: FsDir;
+var e: FsDirEntry;
+if (fs_dir_open("src", &d) == 0) {
+  while (fs_dir_next(&d, &e) == 1) {
+    println("{e.name}");
+  }
+  fs_dir_close(&d);
+}
+```
+
+`fs_dir_next` returns 1 and fills `e`, 0 at the end, or a negative error. It
+skips `.` and `..`, and the order is the file system's. `e.name` is a view
+into the `FsDir`, valid until the next call. `e.kind` says what the entry is;
+when the file system does not say, the call asks with an lstat. A link shows
+as `FS_SYMLINK`. On Linux an `FsDir` holds a 4 KB read buffer.
+
+| Function | Effect |
+|----------|--------|
+| `fs_mkdir(path, mode)` | Make one directory. `-FS_EEXIST` if it exists |
+| `fs_mkdir_all(path, mode)` | Make a path and its parents, like `mkdir -p`. An existing directory is fine; an existing file gives `-FS_ENOTDIR` |
+| `fs_rmdir(path)` | Remove an empty directory |
+| `fs_remove(path)` | Remove a file or a link (the link, not its target) |
+| `fs_remove_all(path)` | Remove a tree, like `rm -rf` |
+| `fs_symlink(target, link)` | Make a link. The target need not exist |
+| `fs_readlink(path, buf, cap)` | The text of a link. `-FS_EINVAL` if it is not a link |
+| `fs_realpath(path, buf, cap)` | The absolute path with links resolved. The path must exist |
+| `fs_getcwd(buf, cap)`, `fs_chdir(path)` | Read or change the current directory of the whole process |
+| `fs_temp_dir(buf, cap)` | `$TMPDIR` if it is set and not empty, else `/tmp`. On Windows, `GetTempPathA` |
+
+**`fs_remove_all` and links.** It never follows a symbolic link. A link is
+unlinked, and what it points to is left alone. This holds for `path` itself and
+for every link inside the tree. A trailing slash is ignored, so `"link/"` names
+the link. It removes a path that does not exist without an error. It refuses
+`""`, `/`, `.`, `..`, and any path ending in `/.` or `/..`, with
+`-FS_EINVAL`. It stops at the first error; what it already removed stays
+removed. A tree deeper than 256 levels fails with `-FS_ELOOP`. On Linux and
+macOS it works by directory descriptor, and it checks that each directory it
+opens is the one it looked at, so a link swapped in during the run is not
+entered.
+
+**`fs_realpath`.** On Linux it opens the path with `O_PATH` and reads
+`/proc/self/fd/N`, so it needs `/proc`. macOS uses `realpath`. Windows uses
+`GetFinalPathNameByHandleA`, and the result has backslashes.
+
+**Windows.** `mode` is ignored and `FsStat.mode` is 0. A "path not found"
+error is reported as `-FS_ENOENT`. Making a symbolic link needs the privilege
+for it (Developer Mode, or an administrator) and fails with an access error
+without it. Junctions show as plain directories. `fs_remove` clears the
+read-only attribute of a file it cannot delete, like `unlink`. Paths that come
+back have backslashes. This code is built but has not been run.
+
+**macOS.** The calls go through libc. On an Intel Mac, `stat`, `lstat`,
+`fstat`, `opendir`, `fdopendir` and `readdir` are taken under their
+`$INODE64` names (from `std/macos_abi`), which give the same layouts as on
+Apple silicon. This code is built but has not been run.
+
+## std/path
+
+Path text helpers. Pure: no system calls, the same everywhere, and they run
+under `mettle test`. The separator is `/`; a backslash is an ordinary byte.
+
+| Function | Effect |
+|----------|--------|
+| `path_join(a, b, buf, cap) -> int64` | Join with a slash and clean. Empty parts are skipped, and a `b` that starts with `/` does not reset the path: `path_join("a", "/b")` is `a/b` |
+| `path_clean(p, buf, cap) -> int64` | Clean a path, with the rules of Go's `path.Clean` |
+| `path_base(p) -> string` | The last element. `""` gives `.`, and only slashes gives `/` |
+| `path_dir(p) -> string` | Everything before the last element |
+| `path_ext(p) -> string` | The extension with its dot, or `""` |
+| `path_stem(p) -> string` | The last element without its extension |
+| `path_is_abs(p) -> bool` | True if `p` starts with `/` |
+
+`path_join` and `path_clean` write into `buf` with a NUL and return the length,
+or `-PATH_ERANGE` if the result and NUL do not fit. Cleaning collapses
+repeated slashes, drops `.`, resolves `..` against the element before it, drops
+a `..` that would climb above a leading `/`, and keeps leading `..` in a
+relative path. A trailing slash goes, and an empty result is `.`.
+`path_join("", "")` is `""`.
+
+`path_base`, `path_dir`, `path_ext` and `path_stem` return views into `p`.
+Nothing is copied, so keep `p` alive while you use them. A trailing slash is
+ignored by `path_base`, `path_ext` and `path_stem`. `path_dir` follows Go: it
+cuts at the last slash, so `a/b/` gives `a/b`; it removes the slashes at the
+cut but does not clean the rest, so `a//b/c` gives `a//b`. Run `path_clean` on
+it if you need that. A dot at the start of a name is part of the name:
+`path_ext(".bashrc")` is `""`, and `path_ext("a.tar.gz")` is `.gz`.
+
 ## std/dir
 
 Paths and directories. Windows.

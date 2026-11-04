@@ -17,6 +17,8 @@ export const FILE_EEXIST = 17;
 export const FILE_EWOULDBLOCK = 35;
 export const FILE_EINTR = 4;
 
+import "std/macos_abi";
+
 extern fn file_c_errno() -> int32* = "__error";
 // open and fcntl are variadic. x86-64 reads the variadic argument from the
 // third register, arm64 from the first stack slot; passing it as both the
@@ -28,7 +30,6 @@ extern fn file_c_pread(fd: int32, buf: uint8*, n: int64, off: int64) -> int64 = 
 extern fn file_c_pwrite(fd: int32, buf: uint8*, n: int64, off: int64) -> int64 = "pwrite";
 extern fn file_c_fsync(fd: int32) -> int32 = "fsync";
 extern fn file_c_ftruncate(fd: int32, size: int64) -> int32 = "ftruncate";
-extern fn file_c_fstat(fd: int32, st: uint8*) -> int32 = "fstat";
 extern fn file_c_rename(from: uint8*, to: uint8*) -> int32 = "rename";
 extern fn file_c_unlink(path: uint8*) -> int32 = "unlink";
 extern fn file_c_flock(fd: int32, op: int32) -> int32 = "flock";
@@ -93,7 +94,7 @@ export fn file_truncate(fd: int64, size: int64) -> int64 {
 
 export fn file_size(fd: int64) -> int64 {
   var st: int64[18];   // struct stat is 144 bytes; st_size is at 96
-  var r: int64 = file_ret((int64)file_c_fstat((int32)fd, (uint8*)&st[0]));
+  var r: int64 = file_ret((int64)macos_c_fstat((int32)fd, (uint8*)&st[0]));
   if (r < 0) { return r; }
   return st[12];
 }
