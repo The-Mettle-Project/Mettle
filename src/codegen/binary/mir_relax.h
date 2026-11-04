@@ -34,6 +34,7 @@ typedef struct {
   size_t capacity;
   long long *delta;
   int disabled;
+  int place_loops;
 } MirRelax;
 
 int mir_relax_note_branch(MirRelax *r, size_t start, size_t length,

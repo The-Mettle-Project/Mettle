@@ -6,6 +6,8 @@
 #define MIR_RELAX_SHORT_LENGTH 2u
 #define MIR_RELAX_MAX_ROUNDS 24
 #define MIR_RELAX_PIN_BOUNDARY 32u
+#define MIR_RELAX_LINE_SHIFT 6u
+#define MIR_RELAX_PLACED_LOOP_BYTES 128u
 
 static MirRelaxItem *mir_relax_push(MirRelax *r) {
   if (r->count == r->capacity) {
@@ -119,6 +121,43 @@ static size_t mir_relax_pad_length(size_t position, size_t boundary,
   return pad > max_pad ? 0u : pad;
 }
 
+static size_t mir_relax_loop_bytes(const MirRelax *r, size_t pad) {
+  const MirRelaxItem *it = &r->items[pad];
+  const MirRelaxItem *last = &r->items[it->last_back_branch];
+  long long head =
+      (long long)it->start + r->delta[pad] + (long long)it->new_length;
+  long long end = (long long)last->start + r->delta[it->last_back_branch] +
+                  (long long)last->new_length;
+  return end > head ? (size_t)(end - head) : 0u;
+}
+
+static size_t mir_relax_lines(size_t head, size_t bytes) {
+  return ((head + bytes - 1u) >> MIR_RELAX_LINE_SHIFT) -
+         (head >> MIR_RELAX_LINE_SHIFT) + 1u;
+}
+
+static size_t mir_relax_loop_pad(const MirRelax *r, size_t index,
+                                 size_t position) {
+  const MirRelaxItem *it = &r->items[index];
+  size_t bytes;
+  size_t base;
+  if (!r->place_loops || !it->has_back_branch) {
+    return mir_relax_pad_length(position, it->boundary, it->max_pad);
+  }
+  bytes = mir_relax_loop_bytes(r, index);
+  if (bytes == 0 || bytes > MIR_RELAX_PLACED_LOOP_BYTES) {
+    return mir_relax_pad_length(position, it->boundary, it->max_pad);
+  }
+  base = (16u - (position & 15u)) & 15u;
+  for (size_t pad = base; pad < base + 64u; pad += 16u) {
+    if (mir_relax_lines(position + pad, bytes) ==
+        (bytes + (1u << MIR_RELAX_LINE_SHIFT) - 1u) >> MIR_RELAX_LINE_SHIFT) {
+      return pad;
+    }
+  }
+  return base;
+}
+
 static int mir_relax_lay_out(MirRelax *r, int frozen) {
   long long delta = 0;
   int changed = 0;
@@ -131,7 +170,9 @@ static int mir_relax_lay_out(MirRelax *r, int frozen) {
     } else if (it->kind == MIR_RELAX_PIN) {
       length = (it->phase - position) & (MIR_RELAX_PIN_BOUNDARY - 1u);
     } else if (!frozen) {
-      length = mir_relax_pad_length(position, it->boundary, it->max_pad);
+      length = it->is_loop
+                   ? mir_relax_loop_pad(r, i, position)
+                   : mir_relax_pad_length(position, it->boundary, it->max_pad);
     }
     changed |= length != it->new_length;
     it->new_length = length;

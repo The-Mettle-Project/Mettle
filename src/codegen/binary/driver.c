@@ -157,7 +157,7 @@ static size_t binary_function_text_section(
              coff ? ".text$%s" : ".text.%s", ir_function->name);
     text_name = granular_name;
     if (coff && context->wants_wide_loop_alignment) {
-      characteristics = 0x60000020u | 0x00600000u;
+      characteristics = 0x60000020u | 0x00700000u;
     }
   }
   return binary_emitter_get_or_create_section(emitter, text_name,
@@ -318,7 +318,7 @@ static int binary_append_function(CodeGenerator *generator,
     if (!binary_append_live_entry(generator, emitter, ir_function,
                                   text_section, body_name,
                                   context->wants_wide_loop_alignment
-                                      ? (size_t)BINARY_LOOP_ALIGN_BIG
+                                      ? (size_t)BINARY_FUNCTION_LINE_ALIGN
                                       : (size_t)BINARY_TEXT_SECTION_ALIGNMENT,
                                   context->code.size)) {
       return 0;
@@ -326,7 +326,7 @@ static int binary_append_function(CodeGenerator *generator,
   }
   if (!binary_emitter_align_section(emitter, text_section,
                                     context->wants_wide_loop_alignment
-                                        ? (int)BINARY_LOOP_ALIGN_BIG
+                                        ? (int)BINARY_FUNCTION_LINE_ALIGN
                                         : BINARY_TEXT_SECTION_ALIGNMENT,
                                     0x90)) {
     return code_generator_binary_emitter_error(generator, emitter,
