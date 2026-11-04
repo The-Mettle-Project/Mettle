@@ -1,0 +1,2 @@
+import "lib/api" as mb;
+export fn project() { mb.bump(); }

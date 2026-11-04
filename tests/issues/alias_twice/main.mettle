@@ -1,0 +1,4 @@
+import "std/io";
+import "lib/api" as mb;
+import "user.mettle";
+fn main() -> int32 { project(); var n: int32 = mb.bump(); println("counter={n}"); return 0; }

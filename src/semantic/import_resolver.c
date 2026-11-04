@@ -2419,7 +2419,15 @@ const char *import_resolver_module_for_file(const char *resolved_path) {
   return NULL;
 }
 
+static char **g_namespaced_modules = NULL;
+static size_t g_namespaced_module_count = 0;
+static size_t g_namespaced_module_capacity = 0;
+
 static void import_path_cache_reset(void) {
+  free_string_array(g_namespaced_modules, g_namespaced_module_count);
+  g_namespaced_modules = NULL;
+  g_namespaced_module_count = 0;
+  g_namespaced_module_capacity = 0;
   for (size_t i = 0; i < g_import_path_cache_count; i++) {
     free(g_import_path_cache[i].key);
     free(g_import_path_cache[i].value);
@@ -4273,6 +4281,25 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
             }
           }
 
+          int repeated_alias = 0;
+          if (import_succeeded && import_decl->namespace_alias) {
+            size_t key_length =
+                strlen(full_path) + strlen(import_decl->namespace_alias) + 2;
+            char *key = malloc(key_length);
+            if (key) {
+              snprintf(key, key_length, "%s|%s", full_path,
+                       import_decl->namespace_alias);
+              if (path_set_contains(g_namespaced_modules,
+                                    g_namespaced_module_count, key)) {
+                repeated_alias = 1;
+              } else {
+                path_set_add(&g_namespaced_modules, &g_namespaced_module_count,
+                             &g_namespaced_module_capacity, key);
+              }
+              free(key);
+            }
+          }
+
           for (size_t j = 0; j < imported_prog_data->declaration_count; j++) {
             ASTNode *imp_decl = imported_prog_data->declarations[j];
             int include_decl = import_succeeded ? include_all : 0;
@@ -4280,7 +4307,7 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
               include_decl = include_flags[j];
             }
 
-            if (include_decl) {
+            if (include_decl && !repeated_alias) {
               ADD_DECL(imp_decl);
             } else {
               ast_destroy_node(imp_decl);

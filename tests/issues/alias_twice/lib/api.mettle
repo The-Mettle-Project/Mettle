@@ -1,0 +1,2 @@
+var counter: int32 = 0;
+export fn bump() -> int32 { counter = counter + 1; return counter; }

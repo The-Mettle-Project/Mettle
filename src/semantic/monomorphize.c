@@ -1273,6 +1273,35 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
                               ctx);
     }
     break;
+  case AST_LAMBDA_EXPRESSION: {
+    FunctionDeclaration *lambda = (FunctionDeclaration *)node->data;
+    if (lambda) {
+      for (size_t i = 0; i < lambda->parameter_count; i++) {
+        char *new_type =
+            lambda->parameter_types[i]
+                ? substitute_type_string(lambda->parameter_types[i],
+                                         param_names, arg_names, count, ctx)
+                : NULL;
+        if (new_type) {
+          mettle_free_string(lambda->parameter_types[i]);
+          lambda->parameter_types[i] = new_type;
+        }
+      }
+      if (lambda->return_type) {
+        char *new_type = substitute_type_string(
+            lambda->return_type, param_names, arg_names, count, ctx);
+        if (new_type) {
+          mettle_free_string(lambda->return_type);
+          lambda->return_type = new_type;
+        }
+      }
+    }
+    for (size_t i = 0; i < node->child_count; i++) {
+      substitute_types_in_ast(node->children[i], param_names, arg_names, count,
+                              ctx);
+    }
+    break;
+  }
   default:
     break;
   }
@@ -1720,6 +1749,22 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
       free(ce->type_args);
       ce->type_args = NULL;
       ce->type_arg_count = 0;
+    }
+    if (ce && ce->is_function_reference && ce->function_name &&
+        ce->argument_count == 0) {
+      ASTNode *identifier =
+          ast_create_identifier(ce->function_name, node->location);
+      if (identifier && identifier->data) {
+        node->type = AST_IDENTIFIER;
+        node->data = identifier->data;
+        node->child_count = 0;
+        free(identifier);
+        free(ce);
+        break;
+      }
+      if (identifier) {
+        ast_destroy_node(identifier);
+      }
     }
     if (ce) {
       for (size_t i = 0; i < ce->argument_count; i++)

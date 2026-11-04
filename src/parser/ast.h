@@ -314,6 +314,7 @@ typedef struct {
   ASTNode *object;
   char **type_args;
   size_t type_arg_count;
+  int is_function_reference;
   char *written_name;
   int is_indirect_call;
   struct Type *callee_closure_env;

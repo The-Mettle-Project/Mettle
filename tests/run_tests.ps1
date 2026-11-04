@@ -21373,6 +21373,9 @@ $issueRegressions = @(
   @{ Name = "issue_stack_trace_flag_on_freestanding_target"; Command = @("-s", "--target", "x86_64-none", "--emit-flat", ".tmp/issue_boot.bin", "--image-base", "0x100000", "tests/issues/boot_s.mettle"); Expect = @("Wrote flat image") },
   @{ Name = "issue_hand_off_allows_write_to_field_task_never_names"; Command = @("--build", "tests/issues/issue_086.mettle", "-o", ".tmp/issue_086.exe"); Expect = @("Built executable") },
   @{ Name = "issue_hand_off_refuses_write_to_field_task_reads"; Command = @("--build", "tests/issues/err_issue_086.mettle", "-o", ".tmp/issue_086.exe"); Expect = @("M0122") },
+  @{ Name = "issue_lambda_in_generic_and_reference_to_instance"; Entry = "tests/issues/issue_100.mettle"; Args = @(); Expect = @("4 2.5 9 4 1.5 7") },
+  @{ Name = "issue_lambda_in_generic_and_reference_to_instance_release"; Entry = "tests/issues/issue_100.mettle"; Args = @("--release"); Expect = @("4 2.5 9 4 1.5 7") },
+  @{ Name = "issue_module_imported_as_same_alias_twice_is_one_module"; Entry = "tests/issues/alias_twice/main.mettle"; Args = @(); Expect = @("counter=2") },
   @{ Name = "issue_driver_accepts_O0"; Command = @("--build", "-O0", "tests/issues/issue_073_074.mettle", "-o", ".tmp/issue_o0.exe"); Expect = @("Built executable") }
 )
 foreach ($case in $issueRegressions) {

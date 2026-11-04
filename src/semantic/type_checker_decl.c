@@ -1640,11 +1640,14 @@ static int type_checker_check_variable_initializer(
       if (init_type && init_type->kind == TYPE_FUNCTION_POINTER &&
           init_type->closure_env &&
           !(var_type->kind == TYPE_FUNCTION_POINTER && var_type->closure_env)) {
+        char var_type_room[160];
         type_checker_set_error_at_location(
             checker, var_decl->initializer->location,
             "a capturing closure cannot be stored in a plain function-pointer "
             "type '%s'; declare '%s' with a closure type 'Fn(...)' instead",
-            var_type->name, var_decl->name);
+            type_checker_spell_type(var_type, var_type_room,
+                                    sizeof(var_type_room)),
+            var_decl->name);
         poisoned = 1;
       }
       else if (type_is_comptime_only(init_type) &&

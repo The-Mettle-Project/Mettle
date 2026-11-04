@@ -1,0 +1,26 @@
+import "std/io";
+
+fn apply<T>(v: T) -> T {
+  var f: fn(T) -> T = fn(x: T) -> T { return x; };
+  return f(v);
+}
+
+fn keep<T>(v: T, fallback: T) -> T {
+  var k: T = fallback;
+  var f: Fn(T) -> T = fn(x: T) -> T { return k; };
+  return f(v);
+}
+
+fn id<T>(x: T) -> T { return x; }
+
+fn twice<T>(f: fn(T) -> T, v: T) -> T { return f(f(v)); }
+
+fn main() -> int32 {
+  var a: int64 = apply<int64>(4);
+  var b: float64 = apply<float64>(2.5);
+  var c: int32 = keep<int32>(1, 9);
+  var g: fn(int64) -> int64 = &id<int64>;
+  var h: fn(float64) -> float64 = &id<float64>;
+  println("{a} {b} {c} {g(4)} {h(1.5)} {twice(&id<int32>, 7)}");
+  return 0;
+}

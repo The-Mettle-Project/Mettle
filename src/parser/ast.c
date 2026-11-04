@@ -375,6 +375,7 @@ static ASTNode *ast_clone_function_call(ASTNode *clone, const ASTNode *node) {
   dst->task_capture_argument = src->task_capture_argument;
   dst->task_entry_name = src->task_entry_name;
   dst->type_arg_count = src->type_arg_count;
+  dst->is_function_reference = src->is_function_reference;
   dst->written_name = ast_intern_string(src->written_name);
   dst->is_indirect_call = src->is_indirect_call;
   dst->callee_closure_env = src->callee_closure_env;
@@ -2283,6 +2284,7 @@ ASTNode *ast_create_call_expression(const char *function_name,
   call_expr->object = NULL;
   call_expr->type_args = NULL;
   call_expr->type_arg_count = 0;
+  call_expr->is_function_reference = 0;
   call_expr->written_name = NULL;
   call_expr->is_indirect_call = 0;
   call_expr->callee_closure_env = NULL;
@@ -2779,6 +2781,7 @@ ASTNode *ast_create_method_call(ASTNode *object, const char *method_name,
   call_expr->object = object;
   call_expr->type_args = NULL;
   call_expr->type_arg_count = 0;
+  call_expr->is_function_reference = 0;
   call_expr->written_name = NULL;
   call_expr->is_indirect_call = 0;
   call_expr->callee_closure_env = NULL;

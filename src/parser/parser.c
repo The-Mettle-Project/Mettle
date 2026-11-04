@@ -4834,6 +4834,11 @@ ASTNode *parser_parse_cast_expression(Parser *parser) {
   return cast_expr;
 }
 
+static int parser_try_parse_generic_call_type_args(Parser *parser,
+                                                   char ***out_type_args,
+                                                   size_t *out_type_arg_count,
+                                                   int bare_ok);
+
 ASTNode *parser_parse_unary_expression(Parser *parser) {
   if (!parser)
     return NULL;
@@ -4865,6 +4870,31 @@ ASTNode *parser_parse_unary_expression(Parser *parser) {
       return NULL;
     }
 
+    if (operator && strcmp(operator, "&") == 0 &&
+        operand->type == AST_IDENTIFIER &&
+        parser->current_token.type == TOKEN_LESS_THAN) {
+      char **reference_type_args = NULL;
+      size_t reference_type_arg_count = 0;
+      if (parser_try_parse_generic_call_type_args(
+              parser, &reference_type_args, &reference_type_arg_count, 1)) {
+        Identifier *name = (Identifier *)operand->data;
+        ASTNode *reference =
+            ast_create_call_expression(name->name, NULL, 0, operand->location);
+        if (reference && reference->data) {
+          CallExpression *call = (CallExpression *)reference->data;
+          call->type_args = reference_type_args;
+          call->type_arg_count = reference_type_arg_count;
+          call->is_function_reference = 1;
+          ast_destroy_node(operand);
+          operand = reference;
+        } else {
+          for (size_t i = 0; i < reference_type_arg_count; i++)
+            free(reference_type_args[i]);
+          free(reference_type_args);
+        }
+      }
+    }
+
     return ast_create_unary_expression(operator, operand, location);
   }
 
@@ -4873,7 +4903,8 @@ ASTNode *parser_parse_unary_expression(Parser *parser) {
 
 static int parser_try_parse_generic_call_type_args(Parser *parser,
                                                    char ***out_type_args,
-                                                   size_t *out_type_arg_count) {
+                                                   size_t *out_type_arg_count,
+                                                   int bare_ok) {
   *out_type_args = NULL;
   *out_type_arg_count = 0;
 
@@ -4912,7 +4943,7 @@ static int parser_try_parse_generic_call_type_args(Parser *parser,
   }
 
   if (success && parser_consume_type_arg_close(parser)) {
-    if (parser->current_token.type == TOKEN_LPAREN) {
+    if (bare_ok || parser->current_token.type == TOKEN_LPAREN) {
       *out_type_args = type_args;
       *out_type_arg_count = type_arg_count;
       parser->error_reporter = saved.error_reporter;
@@ -4988,7 +5019,7 @@ ASTNode *parser_parse_postfix_expression(Parser *parser) {
       char **call_type_args = NULL;
       size_t call_type_arg_count = 0;
       if (parser_try_parse_generic_call_type_args(parser, &call_type_args,
-                                                  &call_type_arg_count)) {
+                                                  &call_type_arg_count, 0)) {
         parser_advance(parser);
         const char *saved_group = parser->group_context;
         parser->group_context = "argument list";
