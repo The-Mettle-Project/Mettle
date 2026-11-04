@@ -780,6 +780,62 @@ void mir_cfg_free(MirCfg *cfg) {
   memset(cfg, 0, sizeof(*cfg));
 }
 
+static void mir_cfg_extend_position(MirFunction *fn, MirVregId v, int at) {
+  MirVreg *vr;
+  if (v < 0 || (size_t)v >= fn->vreg_count) {
+    return;
+  }
+  vr = &fn->vregs[v];
+  if (vr->live_start == MIR_LIVE_NONE || at < vr->live_start) {
+    vr->live_start = at;
+  }
+  if (at > vr->live_end) {
+    vr->live_end = at;
+  }
+}
+
+static void mir_cfg_extend_over_set(MirFunction *fn, const MirCfgSparse *set,
+                                    int at) {
+  for (unsigned k = 0; k < set->count; k++) {
+    unsigned long long bits = set->bits[k];
+    for (int bit = 0; bits != 0 && bit < 64; bit++) {
+      if ((bits >> bit) & 1ull) {
+        mir_cfg_extend_position(fn, (MirVregId)(set->idx[k] * 64u + (unsigned)bit),
+                                at);
+      }
+    }
+  }
+}
+
+int mir_cfg_refresh_live_positions(MirFunction *fn) {
+  MirCfg cfg;
+  if (!mir_cfg_build(&cfg, fn)) {
+    return 0;
+  }
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    fn->vregs[v].live_start = MIR_LIVE_NONE;
+    fn->vregs[v].live_end = MIR_LIVE_NONE;
+  }
+  for (size_t p = 0; p < fn->param_count; p++) {
+    mir_cfg_extend_position(fn, fn->params[p].vreg, 0);
+    mir_cfg_extend_position(fn, fn->params[p].sysv_storage, 0);
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirVregId ids[6];
+    int n = mir_cfg_insn_uses(&fn->insns[i], ids);
+    for (int k = 0; k < n; k++) {
+      mir_cfg_extend_position(fn, ids[k], (int)i);
+    }
+    mir_cfg_extend_position(fn, mir_cfg_insn_def(&fn->insns[i]), (int)i);
+  }
+  for (size_t b = 0; b < cfg.block_count; b++) {
+    mir_cfg_extend_over_set(fn, &cfg.live_in[b], cfg.blocks[b].start);
+    mir_cfg_extend_over_set(fn, &cfg.live_out[b], cfg.blocks[b].end - 1);
+  }
+  mir_cfg_free(&cfg);
+  return 1;
+}
+
 int mir_cfg_build(MirCfg *cfg, const MirFunction *fn) {
   memset(cfg, 0, sizeof(*cfg));
   cfg->fn = fn;

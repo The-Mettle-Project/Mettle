@@ -19675,6 +19675,8 @@ $runFixtures = @(
      What = "a character literal, a string index, a `for c in s` walk, char interpolation, or a std/conv classifier answered wrong" },
   @{ Name = "array_decay"; Path = "tests/codegen/array_decay.mettle"
      What = "an array reached a pointer as its first eight bytes instead of its address, or an array-to-array copy took the address instead of the bytes" },
+  @{ Name = "moved_code_keeps_live_registers"; Path = "tests/codegen/moved_code_keeps_live_registers.mettle"
+     What = "code moved after register allocation picked a live register as scratch" },
   @{ Name = "threaded_dispatch"; Path = "tests/codegen/threaded_dispatch.mettle"
      What = "a sunk load, a threaded loop test or a duplicated dispatch answered wrong" },
   @{ Name = "abi_mixed_args"; Path = "tests/codegen/abi_mixed_args.mettle"

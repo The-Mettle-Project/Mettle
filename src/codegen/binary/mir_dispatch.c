@@ -1379,6 +1379,7 @@ void mir_thread_dispatch(MirFunction *fn) {
   fn->insns = th.out;
   fn->insn_count = th.count;
   fn->insn_capacity = th.capacity;
+  fn->code_moved_after_allocation = 1;
   free(fn->label_slots);
   fn->label_slots = NULL;
   fn->label_slot_capacity = 0;

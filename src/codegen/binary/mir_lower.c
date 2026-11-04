@@ -12894,6 +12894,16 @@ int code_generator_binary_emit_function_via_mir(
       goto oom;
     }
   }
+  if (!ir_pass_name_is_skipped("mir_place_blocks")) {
+    mettle_compiler_ctx_set_pass_name("mir_place_blocks");
+    mir_place_blocks(&fn);
+    if (fn.has_error) {
+      goto oom;
+    }
+  }
+  if (fn.code_moved_after_allocation && !mir_cfg_refresh_live_positions(&fn)) {
+    goto oom;
+  }
   mir_maybe_dump_function(&fn, ir_function);
   if (mir_verify_enabled() && !mir_verify_structure(&fn, "mir_regalloc", 1)) {
     goto oom;

@@ -322,6 +322,8 @@ typedef struct {
   size_t *label_slots;
   size_t label_slot_capacity;
   size_t label_slot_insns;
+
+  int code_moved_after_allocation;
 } MirFunction;
 
 #define MIR_PARAM_SLOTS (2 * MIR_MAX_PARAMS + 1)
@@ -427,6 +429,8 @@ void mir_sink_partial_loads(MirFunction *fn);
 void mir_guard_counter_wrap(MirFunction *fn);
 void mir_thread_known_tests(MirFunction *fn);
 void mir_thread_dispatch(MirFunction *fn);
+void mir_place_blocks(MirFunction *fn);
+int mir_cfg_refresh_live_positions(MirFunction *fn);
 
 int code_generator_binary_emit_function_via_mir(
     CodeGenerator *generator,

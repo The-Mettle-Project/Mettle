@@ -1,0 +1,84 @@
+import "std/io";
+import "std/mem";
+
+const LEN: int32 = 512;
+
+fn fill(data: int32*, seed: int32) {
+  var i: int32 = 0;
+  while (i < LEN) {
+    data[i] = (i * 1103515245 + seed + 12345) % 65536;
+    i = i + 1;
+  }
+}
+
+fn quicksort(data: int32*, lo: int32, hi: int32) {
+  if (lo >= hi) {
+    return;
+  }
+  var pivot: int32 = data[hi];
+  var i: int32 = lo - 1;
+  var j: int32 = lo;
+  while (j < hi) {
+    if (data[j] < pivot) {
+      i = i + 1;
+      var tmp: int32 = data[i];
+      data[i] = data[j];
+      data[j] = tmp;
+    }
+    j = j + 1;
+  }
+  var tmp2: int32 = data[i + 1];
+  data[i + 1] = data[hi];
+  data[hi] = tmp2;
+  quicksort(data, lo, i);
+  quicksort(data, i + 2, hi);
+}
+
+fn is_sorted(data: int32*, len: int32) -> int32 {
+  var i: int32 = 1;
+  while (i < len) {
+    if (data[i - 1] > data[i]) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn sum_array(data: int32*, len: int32) -> int64 {
+  var sum: int64 = 0;
+  var i: int32 = 0;
+  while (i < len) {
+    sum = sum + (int64)data[i];
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn main() -> int32 {
+  var data: int32[512];
+  var scratch: int32[512];
+  fill(&data[0], 42);
+  var want: int64 = sum_array(&data[0], LEN);
+  var pass: int32 = 0;
+  while (pass < 8) {
+    memcpy((cstring)&scratch[0], (cstring)&data[0], (int64)LEN * 4);
+    quicksort(&scratch[0], 0, LEN - 1);
+    if (is_sorted(&scratch[0], LEN) == 0) {
+      println("pass {pass} did not sort");
+      return 1;
+    }
+    if (sum_array(&scratch[0], LEN) != want) {
+      println("pass {pass} lost an element");
+      return 2;
+    }
+    pass = pass + 1;
+  }
+  memcpy((cstring)&scratch[0], (cstring)&data[0], (int64)LEN * 4);
+  quicksort(&scratch[0], 0, LEN - 1);
+  if (is_sorted(&scratch[0], LEN) == 0) {
+    return 3;
+  }
+  println("ok");
+  return 0;
+}
