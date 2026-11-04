@@ -1916,6 +1916,45 @@ static int re_load_is_hoistable(const IRFunction *function, const REDefs *defs,
       prefix_end, body_prefix_end, entry_end, runs_at_least_once);
 }
 
+static int re_load_repeats(const IRFunction *function, const REDefs *defs,
+                           const IRInstruction *first, const REAddr *addr,
+                           const IRInstruction *other) {
+  REAddr other_addr = {0};
+  if (other == first || other->op != IR_OP_LOAD || other->is_volatile ||
+      other->dest.kind != IR_OPERAND_TEMP || !other->dest.name ||
+      other->rhs.kind != IR_OPERAND_INT ||
+      other->rhs.int_value != first->rhs.int_value ||
+      other->is_float != first->is_float ||
+      other->float_bits != first->float_bits ||
+      other->is_unsigned != first->is_unsigned ||
+      other->alias_class != first->alias_class ||
+      re_def_count(defs, IR_OPERAND_TEMP, other->dest.name) != 1) {
+    return 0;
+  }
+  re_resolve_addr(function, defs, &other->lhs, &other_addr, 0);
+  return other_addr.valid && other_addr.name && other_addr.portable &&
+         other_addr.is_address_of == addr->is_address_of &&
+         other_addr.kind == addr->kind && other_addr.offset == addr->offset &&
+         strcmp(other_addr.name, addr->name) == 0;
+}
+
+static void re_merge_repeated_loads(IRFunction *function, const REDefs *defs,
+                                    size_t header, size_t index, size_t latch,
+                                    const REAddr *addr) {
+  const IRInstruction *first = &function->instructions[index];
+  if (first->dest.kind != IR_OPERAND_TEMP) {
+    return;
+  }
+  for (size_t i = header + 1; i < latch; i++) {
+    IRInstruction *other = &function->instructions[i];
+    if (!re_load_repeats(function, defs, first, addr, other)) {
+      continue;
+    }
+    ir_rename_temp_reads(function, other->dest.name, first->dest.name);
+    ir_instruction_make_nop(other);
+  }
+}
+
 static int re_emit_hoist(IRFunction *function, size_t header, size_t index,
                          const REAddr *addr, const char *addr_name,
                          int *changed) {
@@ -2009,6 +2048,8 @@ static int re_emit_hoist(IRFunction *function, size_t header, size_t index,
    word_freq start losing hoists they were paying for. */
 #define RE_HOIST_MAX_NESTED_LIVE_IN 6
 
+#define RE_HOIST_MANY_NAMES_MIN_LOADS 4
+
 typedef struct {
   const char *names[RE_PRESSURE_MAX_NAMES];
   size_t count;
@@ -2032,23 +2073,15 @@ static int re_name_set_add(RENameSet *set, const char *name) {
   return 1;
 }
 
-static int re_name_set_has(const RENameSet *set, const char *name) {
-  if (!name) {
-    return 0;
-  }
-  for (size_t i = 0; i < set->count; i++) {
-    if (set->names[i] == name || strcmp(set->names[i], name) == 0) {
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static void re_pressure_note_read(RENameSet *set, const IROperand *op) {
+static void re_pressure_note_read(RENameSet *read, RENameSet *live_in,
+                                  const REMap *written, const IROperand *op) {
   if (!op || (op->kind != IR_OPERAND_TEMP && op->kind != IR_OPERAND_SYMBOL)) {
     return;
   }
-  re_name_set_add(set, op->name);
+  re_name_set_add(read, op->name);
+  if (!re_map_get(written, op->name)) {
+    re_name_set_add(live_in, op->name);
+  }
 }
 
 /* Everything the loop reads without writing has to sit somewhere for the whole
@@ -2062,7 +2095,14 @@ static void re_pressure_note_read(RENameSet *set, const IROperand *op) {
    a different price from a hoist out of an innermost loop, so it gets a
    different budget. */
 static size_t re_loop_live_in_count(const IRFunction *function, size_t header,
-                                    size_t latch);
+                                    size_t latch, int *many_names);
+
+static size_t re_nested_pressure(const IRFunction *function, size_t header,
+                                 size_t latch) {
+  int many_names = 0;
+  size_t count = re_loop_live_in_count(function, header, latch, &many_names);
+  return many_names ? RE_PRESSURE_MAX_NAMES : count;
+}
 
 /* The register a hoist takes is not contended where the hoist happens, it is
    contended in the innermost loop it is held across. Ask that loop how full it
@@ -2081,7 +2121,7 @@ static size_t re_max_nested_live_in(const IRFunction *function, size_t header,
     if (!inner_latch || inner_latch <= i || inner_latch > latch) {
       continue;
     }
-    count = re_loop_live_in_count(function, i, inner_latch);
+    count = re_nested_pressure(function, i, inner_latch);
     if (count > worst) {
       worst = count;
     }
@@ -2090,49 +2130,100 @@ static size_t re_max_nested_live_in(const IRFunction *function, size_t header,
 }
 
 static size_t re_loop_live_in_count(const IRFunction *function, size_t header,
-                                    size_t latch) {
-  RENameSet written = {{0}, 0, 0};
+                                    size_t latch, int *many_names) {
+  REMap written = {0};
+  RENameSet read = {{0}, 0, 0};
   RENameSet live_in = {{0}, 0, 0};
 
+  *many_names = 1;
   for (size_t i = header; i < latch; i++) {
     const IRInstruction *in = &function->instructions[i];
-    if (!ir_instruction_writes_destination(in)) {
+    if (!ir_instruction_writes_destination(in) ||
+        (in->dest.kind != IR_OPERAND_TEMP &&
+         in->dest.kind != IR_OPERAND_SYMBOL) ||
+        !in->dest.name) {
       continue;
     }
-    if (in->dest.kind == IR_OPERAND_TEMP || in->dest.kind == IR_OPERAND_SYMBOL) {
-      re_name_set_add(&written, in->dest.name);
+    if (!re_map_add(&written, in->dest.name, 1)) {
+      re_map_destroy(&written);
+      return RE_PRESSURE_MAX_NAMES;
     }
-  }
-  if (written.overflowed) {
-    return RE_PRESSURE_MAX_NAMES;
   }
 
   for (size_t i = header; i < latch; i++) {
     const IRInstruction *in = &function->instructions[i];
-    re_pressure_note_read(&live_in, &in->lhs);
-    re_pressure_note_read(&live_in, &in->rhs);
+    re_pressure_note_read(&read, &live_in, &written, &in->lhs);
+    re_pressure_note_read(&read, &live_in, &written, &in->rhs);
     for (size_t a = 0; a < in->argument_count; a++) {
-      re_pressure_note_read(&live_in, &in->arguments[a]);
+      re_pressure_note_read(&read, &live_in, &written, &in->arguments[a]);
     }
     if (in->op == IR_OP_STORE) {
-      re_pressure_note_read(&live_in, &in->dest);
+      re_pressure_note_read(&read, &live_in, &written, &in->dest);
     }
   }
-  if (live_in.overflowed) {
-    return RE_PRESSURE_MAX_NAMES;
-  }
-
-  {
-    size_t live = 0;
-    for (size_t i = 0; i < live_in.count; i++) {
-      if (!re_name_set_has(&written, live_in.names[i])) {
-        live++;
-      }
-    }
-    return live;
-  }
+  *many_names = written.count > RE_PRESSURE_MAX_NAMES || read.overflowed;
+  re_map_destroy(&written);
+  return live_in.overflowed ? RE_PRESSURE_MAX_NAMES : live_in.count;
 }
 
+
+static int re_full_nested_loops_load_it(const IRFunction *function,
+                                        const REDefs *defs, size_t header,
+                                        size_t latch, const IRInstruction *load,
+                                        const REAddr *addr) {
+  for (size_t i = header + 1; i < latch; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    size_t inner_latch;
+    int repeated = 0;
+    if (in->op != IR_OP_LABEL || !re_label_is_loop_header(in->text)) {
+      continue;
+    }
+    inner_latch = re_loop_latch(function, i);
+    if (!inner_latch || inner_latch <= i || inner_latch > latch ||
+        re_nested_pressure(function, i, inner_latch) <
+            RE_HOIST_MAX_NESTED_LIVE_IN) {
+      continue;
+    }
+    for (size_t k = i + 1; k < inner_latch && !repeated; k++) {
+      repeated = &function->instructions[k] == load ||
+                 re_load_repeats(function, defs, load, addr,
+                                 &function->instructions[k]);
+    }
+    if (!repeated) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static size_t re_load_repeat_count(const IRFunction *function,
+                                   const REDefs *defs, size_t header,
+                                   size_t latch, const IRInstruction *load,
+                                   const REAddr *addr) {
+  size_t count = 1;
+  for (size_t i = header + 1; i < latch; i++) {
+    count += re_load_repeats(function, defs, load, addr,
+                             &function->instructions[i]) != 0;
+  }
+  return count;
+}
+
+static int re_hoist_pays(const IRFunction *function, const REDefs *defs,
+                         size_t header, size_t latch, size_t body_prefix_end,
+                         const IRInstruction *load, const REAddr *addr,
+                         int many_names, int nested_full) {
+  if (many_names &&
+      (re_hoist_descriptor_loads_only ||
+       load >= &function->instructions[body_prefix_end] ||
+       re_load_repeat_count(function, defs, header, latch, load, addr) <
+           RE_HOIST_MANY_NAMES_MIN_LOADS)) {
+    return 0;
+  }
+  return !nested_full ||
+         (!re_hoist_descriptor_loads_only &&
+          re_full_nested_loops_load_it(function, defs, header, latch, load,
+                                       addr));
+}
 
 static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
                                  const IRTempValueMap *addr_taken,
@@ -2148,6 +2239,8 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
     size_t prefix_end;
     size_t body_prefix_end;
     int runs_at_least_once;
+    int many_names = 0;
+    int nested_full;
 
     if (label->op != IR_OP_LABEL || !re_label_is_loop_header(label->text)) {
       continue;
@@ -2163,13 +2256,13 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
       continue;
     }
 
-    if (re_loop_live_in_count(function, header, latch) >=
-            RE_HOIST_MAX_LOOP_LIVE_IN ||
-        re_max_nested_live_in(function, header, latch) >=
-            RE_HOIST_MAX_NESTED_LIVE_IN) {
+    if (re_loop_live_in_count(function, header, latch, &many_names) >=
+        RE_HOIST_MAX_LOOP_LIVE_IN) {
       re_kills_destroy(&writes);
       continue;
     }
+    nested_full = re_max_nested_live_in(function, header, latch) >=
+                  RE_HOIST_MAX_NESTED_LIVE_IN;
 
     prefix_end = re_straight_line_end(function, header + 1, latch, latch);
 
@@ -2184,8 +2277,14 @@ static int re_try_hoist_one_load(IRFunction *function, const REDefs *defs_in,
       int hoisted;
       if (!re_load_is_hoistable(function, &defs, &writes, header, i, latch,
                                 prefix_end, body_prefix_end, entry_end,
-                                runs_at_least_once, &addr)) {
+                                runs_at_least_once, &addr) ||
+          !re_hoist_pays(function, &defs, header, latch, body_prefix_end,
+                         &function->instructions[i], &addr, many_names,
+                         nested_full)) {
         continue;
+      }
+      if (!re_hoist_descriptor_loads_only) {
+        re_merge_repeated_loads(function, &defs, header, i, latch, &addr);
       }
       snprintf(addr_name, sizeof(addr_name), "__licm_%d", counter++);
       hoisted = re_emit_hoist(function, header, i, &addr, addr_name, changed);

@@ -160,20 +160,34 @@ xychart-beta
 Stepping a reference with `r = r + 1` stays scalar, and so does stepping a plain
 `int32*`, at the same speed.
 
-A reference held in memory costs more than one in a local. It cannot split into
-words, so each access does more address arithmetic, and no pass hoists a load
-through a pointer parameter. `physics_grid` reaches its particles through
-`w->live[i]`, and prints the same hash in all three forms:
+A reference held in memory cannot split into words, so its words load from memory
+and `hoist_invariant_loads` moves them out of the loop. A load moves when no store
+in the loop can reach it and something proves the address is good: an access that
+already reached that far, or a first iteration that always runs and always gets
+there. `hoist_held_column_bases` then moves `base + index * stride` and
+`count * stride` behind those loads. Each region adds its offset to the same column
+base, so a loop through one region holds one register in place of three.
+
+In a loop of more than 64 names, a load moves only when it runs every iteration
+and the loop reads that address at least four times. Below that a held register
+costs more than the reloads it saves: `word_freq` spills `t` itself if its probe
+loop keeps four fields in registers. A loop that may run zero times keeps a load
+it has no other proof for, so `w->items[k]` in `collide` still reloads. Copying the
+loop's test in front of the load took 4.8% off a 4096-element loop and added 0.33%
+to Suite 3, so that loop stays as it is.
+
+`physics_grid` reaches its particles through `w->live[i]`, and prints the same hash
+in all three forms. Pinned, minimum of 15 interleaved runs:
 
 ```mermaid
 xychart-beta
   title "physics_grid, microseconds for 2 passes"
   x-axis ["plain struct", "@hot_cold in slices", "@hot_cold through T* fields"]
-  bar [23956, 24320, 26742]
+  bar [23571, 23821, 23715]
 ```
 
 A field of type `T*` costs 24 bytes in place of 8. Chasing 65536 shuffled nodes
-200 times takes 154820 us with thin pointers in a plain struct and 162462 us with
+200 times takes 149727 us with thin pointers in a plain struct and 155241 us with
 references under `@hot_cold(key, next)`.
 
 ## Allocation

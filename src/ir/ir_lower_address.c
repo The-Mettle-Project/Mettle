@@ -2062,16 +2062,7 @@ static int ir_column_region_address(IRLoweringContext *context,
     }
     ir_operand_destroy(&offset);
   }
-  if (region_base.kind == IR_OPERAND_INT && region_base.int_value == 0) {
-    column = ir_clone_operand_local(&access->base);
-  } else {
-    if (!ir_emit_binary_temp(context, function, "+", &access->base, &region_base,
-                             location, &column)) {
-      return 0;
-    }
-    ir_column_mark_last(function, 2);
-  }
-  ir_operand_destroy(&region_base);
+  column = ir_clone_operand_local(&access->base);
   if (split) {
     IROperand held_scaled = ir_operand_none();
     IROperand from_held = ir_operand_none();
@@ -2089,6 +2080,17 @@ static int ir_column_region_address(IRLoweringContext *context,
     ir_operand_destroy(&column);
     column = from_held;
   }
+  if (region_base.kind != IR_OPERAND_INT || region_base.int_value != 0) {
+    IROperand in_region = ir_operand_none();
+    if (!ir_emit_binary_temp(context, function, "+", &column, &region_base,
+                             location, &in_region)) {
+      return 0;
+    }
+    ir_column_mark_last(function, 2);
+    ir_operand_destroy(&column);
+    column = in_region;
+  }
+  ir_operand_destroy(&region_base);
   if (!ir_emit_binary_temp(context, function, "+", &column, &scaled, location,
                            out)) {
     return 0;

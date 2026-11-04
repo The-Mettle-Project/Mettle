@@ -458,6 +458,9 @@ int ir_float_divide_by_power_of_two_pass(IRFunction *function, int *changed);
 int ir_widen_byte_pack_pass(IRFunction *function, int *changed);
 int ir_widen_subword_load_cast_pass(IRFunction *function, int *changed);
 int ir_hoist_invariant_loads_pass(IRFunction *function, int *changed);
+int ir_hoist_held_column_bases_pass(IRFunction *function, int *changed);
+void ir_rename_temp_reads(IRFunction *function, const char *temp,
+                          const char *other);
 int ir_promote_loop_memory_pass(IRFunction *function, int *changed);
 int ir_forward_stored_values_pass(IRFunction *function, int *changed);
 size_t ir_inline_cleaned_instruction_count(const IRFunction *function);

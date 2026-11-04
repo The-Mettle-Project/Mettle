@@ -278,35 +278,45 @@ static int ir_hoist_symbol_is_global(const IRFunction *function,
          ir_function_local_declared_type(function, sym) == NULL;
 }
 
+static void ir_rename_read_slot(IROperand *slot, const char *temp,
+                                const char *name, IROperandKind kind) {
+  int float_bits;
+  if (!slot || !ir_operand_is_temp_named(slot, temp)) {
+    return;
+  }
+  float_bits = slot->float_bits;
+  ir_operand_destroy(slot);
+  *slot = kind == IR_OPERAND_SYMBOL ? ir_operand_symbol(name)
+                                    : ir_operand_temp(name);
+  slot->float_bits = float_bits;
+}
+
+static void ir_rename_reads_in_range(IRFunction *function, size_t lo, size_t hi,
+                                     const char *temp, const char *name,
+                                     IROperandKind kind) {
+  for (size_t i = lo; i < hi; i++) {
+    IRInstruction *ins = &function->instructions[i];
+    ir_rename_read_slot(&ins->lhs, temp, name, kind);
+    ir_rename_read_slot(&ins->rhs, temp, name, kind);
+    if (ins->op == IR_OP_STORE) {
+      ir_rename_read_slot(&ins->dest, temp, name, kind);
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      ir_rename_read_slot(&ins->arguments[a], temp, name, kind);
+    }
+  }
+}
+
+void ir_rename_temp_reads(IRFunction *function, const char *temp,
+                          const char *other) {
+  ir_rename_reads_in_range(function, 0, function->instruction_count, temp, other,
+                           IR_OPERAND_TEMP);
+}
+
 static void ir_hoist_rename_temp_reads(IRFunction *function, size_t lo,
                                        size_t hi, const char *temp,
                                        const char *sym) {
-  for (size_t i = lo; i < hi; i++) {
-    IRInstruction *ins = &function->instructions[i];
-    IROperand *slots[3];
-    slots[0] = &ins->lhs;
-    slots[1] = &ins->rhs;
-    slots[2] = (ins->op == IR_OP_STORE) ? &ins->dest : NULL;
-    for (int k = 0; k < 3; k++) {
-      if (!slots[k] || !ir_operand_is_temp_named(slots[k], temp)) {
-        continue;
-      }
-      {
-        int float_bits = slots[k]->float_bits;
-        ir_operand_destroy(slots[k]);
-        *slots[k] = ir_operand_symbol(sym);
-        slots[k]->float_bits = float_bits;
-      }
-    }
-    for (size_t a = 0; a < ins->argument_count; a++) {
-      if (ir_operand_is_temp_named(&ins->arguments[a], temp)) {
-        int float_bits = ins->arguments[a].float_bits;
-        ir_operand_destroy(&ins->arguments[a]);
-        ins->arguments[a] = ir_operand_symbol(sym);
-        ins->arguments[a].float_bits = float_bits;
-      }
-    }
-  }
+  ir_rename_reads_in_range(function, lo, hi, temp, sym, IR_OPERAND_SYMBOL);
 }
 
 static int ir_hoist_temp_escapes(const IRFunction *function, size_t lo,
@@ -1466,6 +1476,102 @@ int ir_hoist_invariant_arith_pass(IRFunction *function, int *changed) {
   }
   return 1;
 }
+
+static int ir_column_base_operands_invariant(const IRFunction *function,
+                                             size_t header, size_t latch,
+                                             const IRInstruction *ins,
+                                             int loop_calls) {
+  const IROperand *slots[2] = {&ins->lhs, &ins->rhs};
+  for (int k = 0; k < 2; k++) {
+    const char *name = NULL;
+    if (!ir_licm_operand_named(slots[k], &name)) {
+      if (slots[k]->kind != IR_OPERAND_NONE && slots[k]->kind != IR_OPERAND_INT) {
+        return 0;
+      }
+      continue;
+    }
+    if (ir_licm_written_in(function, header + 1, latch, name) ||
+        (slots[k]->kind == IR_OPERAND_SYMBOL &&
+         (ir_symbol_address_taken(function, name) ||
+          (loop_calls && ir_licm_symbol_is_global(function, name))))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ir_column_base_has_one_def(const IRFunction *function,
+                                      const IRInstruction *ins) {
+  return ins->column_base && ins->op == IR_OP_BINARY && !ins->is_volatile &&
+         ins->dest.kind == IR_OPERAND_TEMP && ins->dest.name &&
+         ir_licm_def_count(function, 0, function->instruction_count,
+                           ins->dest.name) == 1;
+}
+
+static void ir_merge_repeated_column_base(IRFunction *function, size_t at,
+                                          size_t latch) {
+  for (size_t i = at + 1; i < latch; i++) {
+    IRInstruction *other = &function->instructions[i];
+    const IRInstruction *first = &function->instructions[at];
+    if (!ir_column_base_has_one_def(function, other) || !other->text ||
+        strcmp(other->text, first->text) != 0 ||
+        !ir_operand_equals(&other->lhs, &first->lhs) ||
+        !ir_operand_equals(&other->rhs, &first->rhs)) {
+      continue;
+    }
+    ir_rename_temp_reads(function, other->dest.name, first->dest.name);
+    ir_instruction_make_nop(other);
+  }
+}
+
+int ir_hoist_held_column_bases_pass(IRFunction *function, int *changed) {
+  if (!function || function->instruction_count == 0) {
+    return 1;
+  }
+  for (size_t header = 0; header < function->instruction_count; header++) {
+    const IRInstruction *label = &function->instructions[header];
+    size_t latch;
+    int loop_calls;
+    if (label->op != IR_OP_LABEL ||
+        !ir_cleanup_label_is_loop_header(label->text)) {
+      continue;
+    }
+    latch = ir_cleanup_loop_latch(function, header, label->text);
+    if (!latch || header == 0 ||
+        ir_cleanup_op_leaves_block(ir_cleanup_op_before(function, header))) {
+      continue;
+    }
+    loop_calls = ir_licm_loop_has_call(function, header + 1, latch);
+    for (size_t i = header + 1; i < latch; i++) {
+      IRInstruction moved = {0};
+      if (!ir_column_base_has_one_def(function, &function->instructions[i]) ||
+          !function->instructions[i].text ||
+          !ir_column_base_operands_invariant(function, header, latch,
+                                             &function->instructions[i],
+                                             loop_calls)) {
+        continue;
+      }
+      ir_merge_repeated_column_base(function, i, latch);
+      if (!ir_clone_instruction_plain(&function->instructions[i], &moved)) {
+        return 0;
+      }
+      ir_instruction_make_nop(&function->instructions[i]);
+      if (!ir_function_insert_instruction(function, header, &moved)) {
+        ir_instruction_destroy_storage(&moved);
+        return 0;
+      }
+      ir_instruction_destroy_storage(&moved);
+      header++;
+      i++;
+      latch++;
+      if (changed) {
+        *changed = 1;
+      }
+    }
+  }
+  return 1;
+}
+
 #define IR_ROW_MAX_CONSUMERS 8
 
 typedef struct {

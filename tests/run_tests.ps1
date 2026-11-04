@@ -3770,7 +3770,7 @@ catch {
 
 # Layouts and generators written in Mettle: every access goes through the data a
 # metafunction returned, and every generated function runs, at every level.
-foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn", "test_meta_generated_source", "test_meta_grad_struct", "test_meta_optimized", "test_element_reference")) {
+foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_tagged", "test_layout_allocator", "test_meta_generate", "test_meta_grad", "test_meta_dyn", "test_meta_generated_source", "test_meta_grad_struct", "test_meta_optimized", "test_element_reference", "test_element_held_in_struct")) {
   foreach ($layoutMode in @(@(), @("-O"), @("--release"))) {
     $total++
     $layoutName = "$($layoutCase)_$(($layoutMode -join '') -replace '-','')"
@@ -3787,6 +3787,44 @@ foreach ($layoutCase in @("test_layout_soa", "test_layout_edges", "test_layout_t
       $failed++
       Write-CaseResult -Name $layoutName -Passed $false -Reason $_.Exception.Message
     }
+  }
+}
+
+# Which loads leave a loop, read from the IR after each pass. A fixture only
+# proves the answer is right, and a hoist that stopped firing leaves it right.
+foreach ($hoistCase in @(
+    @{ Path = "tests/codegen/hoist_through_parameter.mettle"; Fn = "big_constant_loop"; Hoists = $true },
+    @{ Path = "tests/codegen/hoist_through_parameter.mettle"; Fn = "nested_loads"; Hoists = $true },
+    @{ Path = "tests/codegen/hoist_through_parameter.mettle"; Fn = "short_loop"; Hoists = $false },
+    @{ Path = "tests/codegen/hoist_through_parameter.mettle"; Fn = "arm_only"; Hoists = $false },
+    @{ Path = "tests/codegen/hoist_through_parameter.mettle"; Fn = "big_arm_only"; Hoists = $false },
+    @{ Path = "tests/codegen/hoist_through_parameter.mettle"; Fn = "big_few_loads"; Hoists = $false },
+    @{ Path = "tests/codegen/hoist_through_parameter.mettle"; Fn = "swaps_midway"; Hoists = $false },
+    @{ Path = "tests/codegen/hoist_through_parameter.mettle"; Fn = "swaps_through_slot"; Hoists = $false },
+    @{ Path = "tests/codegen/hoist_through_parameter.mettle"; Fn = "scale_moves"; Hoists = $false },
+    @{ Path = "tests/test_element_held_in_struct.mettle"; Fn = "step_all"; Hoists = $true; Columns = $true },
+    @{ Path = "tests/test_element_held_in_struct.mettle"; Fn = "retargets"; Hoists = $false },
+    @{ Path = "tests/test_element_held_in_struct.mettle"; Fn = "advances"; Hoists = $false })) {
+  $total++
+  $hoistName = "hoist_shape_$($hoistCase.Fn)"
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "$hoistName.exe"
+    $env:METTLE_DUMP_IR_PASSES = $hoistCase.Fn
+    $dump = & $CompilerPath --build --release $hoistCase.Path -o $exePath 2>&1 | Out-String
+    Remove-Item Env:METTLE_DUMP_IR_PASSES
+    if (($dump -match "after pass=hoist_invariant_loads") -ne $hoistCase.Hoists) {
+      throw "$($hoistCase.Fn) should $(if ($hoistCase.Hoists) { 'hoist a load' } else { 'keep its loads in the loop' })"
+    }
+    if ($hoistCase.Columns -and $dump -notmatch "after pass=hoist_held_column_bases") {
+      throw "$($hoistCase.Fn) kept its column bases in the loop"
+    }
+    Write-CaseResult -Name $hoistName -Passed $true
+  }
+  catch {
+    Remove-Item Env:METTLE_DUMP_IR_PASSES -ErrorAction SilentlyContinue
+    $failed++
+    Write-CaseResult -Name $hoistName -Passed $false -Reason $_.Exception.Message
   }
 }
 
@@ -19253,6 +19291,8 @@ $runFixtures = @(
      What = "a shadowing var shared the slot of the one it shadows" },
   @{ Name = "local_shadows_global"; Path = "tests/codegen/local_shadows_global.mettle"
      What = "a local took the type of a global or function that shares its name" },
+  @{ Name = "hoist_through_parameter"; Path = "tests/codegen/hoist_through_parameter.mettle"
+     What = "a load through a pointer parameter moved out of a loop read memory the loop never touched, or a value the loop changed" },
   @{ Name = "conversion_surface"; Path = "tests/codegen/conversion_surface.mettle"
      What = "a cast, a named rounding, or a literal read at its destination's width answered wrong" },
   @{ Name = "increment_narrow_agrees"; Path = "tests/codegen/increment_narrow_agrees.mettle"

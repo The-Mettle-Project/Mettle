@@ -1,0 +1,182 @@
+import "std/io";
+import "std/layout";
+
+const COUNT: int32 = 16;
+
+@hot_cold(x, y) struct Particle {
+  x: float64;
+  y: float64;
+  vx: float64;
+  vy: float64;
+}
+
+struct World {
+  live: Particle*;
+  other: Particle*;
+  hits: int64;
+}
+
+fn fill(a: Particle[], scale: float64) {
+  for i in 0..a.length {
+    a[i].x = (float64)i * scale;
+    a[i].y = (float64)i * scale + 0.5;
+    a[i].vx = (float64)i + 100.0;
+    a[i].vy = (float64)i + 200.0;
+  }
+}
+
+fn step_all(w: World*) -> float64 {
+  var total: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < COUNT) {
+    w->live[i].x = w->live[i].x + w->live[i].vx;
+    w->live[i].y = w->live[i].y + w->live[i].vy;
+    if (w->live[i].x > 1000.0) {
+      w->live[i].x = 1000.0;
+      w->live[i].vx = -w->live[i].vx;
+    }
+    if (w->live[i].y > 1000.0) {
+      w->live[i].y = 1000.0;
+      w->live[i].vy = -w->live[i].vy;
+    }
+    total = total + w->live[i].x + w->live[i].y + w->live[i].vx + w->live[i].vy;
+    i += 1;
+  }
+  return total;
+}
+
+fn sum_x(w: World*, n: int32) -> float64 {
+  var total: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < n) {
+    total = total + w->live[i].x;
+    w->live[i].vx = total;
+    i += 1;
+  }
+  return total;
+}
+
+fn retargets(w: World*, at: int32) -> float64 {
+  var total: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < 8) {
+    total = total + w->live[i].x + w->live[i].vx;
+    if (i == at) {
+      w->live = w->other;
+    }
+    i += 1;
+  }
+  return total;
+}
+
+fn advances(w: World*) -> float64 {
+  var total: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < 6) {
+    total = total + w->live[0].x + w->live[0].vy;
+    w->live = w->live + 1;
+    i += 1;
+  }
+  return total;
+}
+
+fn nested(w: World*, lens: int32*) -> float64 {
+  var total: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < 4) {
+    total = total + w->live[i].y;
+    var k: int32 = 0;
+    while (k < lens[i]) {
+      total = total + w->live[k].x * w->live[k].vy;
+      w->hits = w->hits + 1;
+      k += 1;
+    }
+    i += 1;
+  }
+  return total;
+}
+
+fn step_all_expected(a: Particle[], offset: int32) -> float64 {
+  var total: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < COUNT) {
+    var at: int32 = i + offset;
+    var x: float64 = a[at].x + a[at].vx;
+    var y: float64 = a[at].y + a[at].vy;
+    var vx: float64 = a[at].vx;
+    var vy: float64 = a[at].vy;
+    if (x > 1000.0) {
+      x = 1000.0;
+      vx = -vx;
+    }
+    if (y > 1000.0) {
+      y = 1000.0;
+      vy = -vy;
+    }
+    total = total + x + y + vx + vy;
+    i += 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var a: Particle[] = new Particle[32];
+  var b: Particle[] = new Particle[32];
+  fill(a, 1.0);
+  fill(b, 10.0);
+
+  var w: World;
+  w.live = &a[5];
+  w.other = &b[2];
+  w.hits = 0;
+
+  var want: float64 = step_all_expected(a, 5);
+  if (step_all(&w) != want) { return 1; }
+  if (a[5].x != 5.0 + 105.0) { return 2; }
+  if (a[6].vy != 206.0) { return 3; }
+
+  fill(a, 1.0);
+  w.live = &a[5];
+  var nowhere: World* = 0;
+  if (sum_x(nowhere, 0) != 0.0) { return 4; }
+  if (sum_x(&w, 3) != 5.0 + 6.0 + 7.0) { return 5; }
+  if (a[6].vx != 11.0) { return 6; }
+
+  fill(a, 1.0);
+  w.live = &a[1];
+  var before: float64 = 1.0 + 101.0 + 2.0 + 102.0;
+  var after: float64 = 0.0;
+  var i: int32 = 2;
+  while (i < 8) {
+    after = after + b[i + 2].x + b[i + 2].vx;
+    i += 1;
+  }
+  if (retargets(&w, 1) != before + after) { return 7; }
+
+  fill(a, 1.0);
+  w.live = &a[3];
+  var walked: float64 = 0.0;
+  i = 0;
+  while (i < 6) {
+    walked = walked + a[3 + i].x + a[3 + i].vy;
+    i += 1;
+  }
+  if (advances(&w) != walked) { return 8; }
+  if (w.live != &a[9]) { return 9; }
+
+  fill(a, 1.0);
+  w.live = &a[2];
+  w.hits = 0;
+  var lens: int32[4];
+  lens[0] = 0;
+  lens[1] = 2;
+  lens[2] = 0;
+  lens[3] = 1;
+  var want_nested: float64 = a[2].y + a[3].y + a[4].y + a[5].y;
+  want_nested = want_nested + a[2].x * a[2].vy + a[3].x * a[3].vy + a[2].x * a[2].vy;
+  if (nested(&w, &lens[0]) != want_nested) { return 10; }
+  if (w.hits != 3) { return 11; }
+
+  println("element_held_in_struct ok");
+  return 0;
+}
