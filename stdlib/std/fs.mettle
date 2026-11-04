@@ -1,0 +1,636 @@
+// Windows filesystem calls for std/fs, through Kernel32 (this is the plain
+// std/fs; Linux and macOS have fs.linux.mettle and fs.macos.mettle): file
+// information, directory listing, and creating, removing and finding paths.
+// Every call returns 0, a length, or a negative Win32 error code
+// (-GetLastError()); compare with the FS_E constants. Paths are strings
+// copied into a NUL-terminated 4096-byte buffer, so a longer path fails with
+// -FS_ENAMETOOLONG. Both '/' and '\' work as separators in the paths you
+// pass in. Paths that come out (fs_readlink, fs_realpath, fs_getcwd,
+// fs_temp_dir) use backslashes.
+//
+// Differences from the POSIX versions:
+//   - FsStat.mode is always 0. Windows has no permission bits here.
+//   - fs_symlink needs the right to make links (an administrator, or
+//     Developer Mode) and fails with -FS_EACCES-style errors without it. Links
+//     to directories are made as directory links. A relative target is
+//     resolved from the directory that holds the link.
+//   - Directory junctions and other reparse points that are not symbolic
+//     links show up as plain directories or files. fs_remove_all removes a
+//     directory junction or directory link without entering it.
+//   - A "path not found" error (3) is reported as -FS_ENOENT, as POSIX does.
+//   - fs_remove clears the read-only attribute of a file it cannot delete
+//     and tries again, so it behaves like unlink.
+//   - fs_mkdir ignores mode.
+//   - This file has not been run; it was only compiled.
+
+import "std/conv";
+
+export const FS_FILE = 1;      // a regular file
+export const FS_DIR = 2;       // a directory
+export const FS_SYMLINK = 3;   // a symbolic link (only from fs_lstat or a listing)
+export const FS_OTHER = 4;     // anything else (not used on Windows)
+
+export const FS_ENOENT = 2;           // ERROR_FILE_NOT_FOUND
+export const FS_EACCES = 5;           // ERROR_ACCESS_DENIED
+export const FS_EEXIST = 183;         // ERROR_ALREADY_EXISTS
+export const FS_ENOTDIR = 267;        // ERROR_DIRECTORY
+export const FS_EINVAL = 87;          // ERROR_INVALID_PARAMETER
+export const FS_ERANGE = 122;         // ERROR_INSUFFICIENT_BUFFER
+export const FS_ENAMETOOLONG = 206;   // ERROR_FILENAME_EXCED_RANGE
+export const FS_ENOTEMPTY = 145;      // ERROR_DIR_NOT_EMPTY
+export const FS_ELOOP = 1921;         // ERROR_CANT_RESOLVE_FILENAME
+
+// What fs_stat finds. mode is always 0 on Windows. Times are nanoseconds since
+// 1970-01-01 UTC.
+export struct FsStat {
+  kind: int32;       // FS_FILE, FS_DIR or FS_SYMLINK
+  mode: int32;
+  size: int64;
+  mtime_ns: int64;   // last write
+  atime_ns: int64;   // last access
+  ctime_ns: int64;   // creation time (Windows has no change time here)
+}
+
+// An open directory. Make one with fs_dir_open, read it with fs_dir_next and
+// finish with fs_dir_close. It holds a WIN32_FIND_DATAA, so it is about 340
+// bytes.
+export struct FsDir {
+  handle: int64;     // the FindFirstFile handle, or -1
+  first: int32;      // 1 while data holds an entry not yet given out
+  done: int32;       // 1 once the listing has ended
+  data: int64[40];   // WIN32_FIND_DATAA, 320 bytes
+}
+
+// One entry of a directory.
+export struct FsDirEntry {
+  name: string;   // a view into the FsDir; valid until the next fs_dir_next
+  kind: int32;    // FS_FILE, FS_DIR or FS_SYMLINK
+}
+
+extern fn fs_w_error() -> uint32 = "GetLastError";
+extern fn fs_w_get_attr(path: uint8*) -> uint32 = "GetFileAttributesA";
+extern fn fs_w_get_attr_ex(path: uint8*, level: int32, info: uint8*) -> int32 = "GetFileAttributesExA";
+extern fn fs_w_set_attr(path: uint8*, attrs: uint32) -> int32 = "SetFileAttributesA";
+extern fn fs_w_create(path: uint8*, access: uint32, share: uint32, sec: uint8*, disposition: uint32, flags: uint32, template: int64) -> int64 = "CreateFileA";
+extern fn fs_w_close(h: int64) -> int32 = "CloseHandle";
+extern fn fs_w_handle_info(h: int64, info: uint8*) -> int32 = "GetFileInformationByHandle";
+extern fn fs_w_find_first(path: uint8*, data: uint8*) -> int64 = "FindFirstFileA";
+extern fn fs_w_find_next(h: int64, data: uint8*) -> int32 = "FindNextFileA";
+extern fn fs_w_find_close(h: int64) -> int32 = "FindClose";
+extern fn fs_w_mkdir(path: uint8*, sec: uint8*) -> int32 = "CreateDirectoryA";
+extern fn fs_w_rmdir(path: uint8*) -> int32 = "RemoveDirectoryA";
+extern fn fs_w_delete(path: uint8*) -> int32 = "DeleteFileA";
+extern fn fs_w_getcwd(n: uint32, buf: uint8*) -> uint32 = "GetCurrentDirectoryA";
+extern fn fs_w_chdir(path: uint8*) -> int32 = "SetCurrentDirectoryA";
+extern fn fs_w_final_path(h: int64, buf: uint8*, n: uint32, flags: uint32) -> uint32 = "GetFinalPathNameByHandleA";
+extern fn fs_w_temp(n: uint32, buf: uint8*) -> uint32 = "GetTempPathA";
+// CreateSymbolicLinkA returns a BOOLEAN, one byte.
+extern fn fs_w_symlink(link: uint8*, target: uint8*, flags: uint32) -> uint8 = "CreateSymbolicLinkA";
+extern fn fs_w_ioctl(h: int64, code: uint32, inbuf: uint8*, inlen: uint32, outbuf: uint8*, outlen: uint32, ret: uint32*, ov: uint8*) -> int32 = "DeviceIoControl";
+extern fn fs_w_wide_to_utf8(cp: uint32, flags: uint32, wide: uint8*, wlen: int32, out: uint8*, outlen: int32, defchar: uint8*, used: int32*) -> int32 = "WideCharToMultiByte";
+
+const FS_ATTR_READONLY = 0x1;
+const FS_ATTR_DIRECTORY = 0x10;
+const FS_ATTR_REPARSE = 0x400;
+const FS_BACKUP_SEMANTICS = 0x02000000;   // lets CreateFile open a directory
+const FS_OPEN_REPARSE_POINT = 0x00200000;   // open the link, not what it points to
+const FS_MAX_DEPTH = 256;   // how deep fs_remove_all goes
+const FS_EPOCH_TICKS: int64 = 116444736000000000;   // 1601 to 1970, in 100 ns
+
+// -GetLastError(). "Path not found" is reported as "file not found".
+fn fs_fail() -> int64 {
+  var e: int64 = (int64)fs_w_error();
+  if (e == 3) { e = (int64)FS_ENOENT; }
+  return -e;
+}
+
+// Copies a path into buf with a NUL. Returns false if it does not fit.
+fn fs_cpath(path: string, buf: uint8*) -> bool {
+  if (path.length >= (uint64)4096) { return false; }
+  for i in 0..path.length { buf[i] = (uint8)path[i]; }
+  buf[(int64)path.length] = (uint8)0;
+  return true;
+}
+
+fn fs_is_sep(c: uint8) -> bool {
+  return c == (uint8)47 || c == (uint8)92;
+}
+
+// A size for a Windows call that takes a DWORD.
+fn fs_clamp(n: int64) -> uint32 {
+  if (n > (int64)0x7FFFFFFF) { return (uint32)0x7FFFFFFF; }
+  return (uint32)n;
+}
+
+fn fs_cstrlen(p: uint8*) -> int64 {
+  var n: int64 = 0;
+  while (p[n] != (uint8)0) { n = n + 1; }
+  return n;
+}
+
+// A FILETIME (two 32-bit halves, 100 ns ticks since 1601) as Unix nanoseconds.
+fn fs_ft_ns(p: uint8*) -> int64 {
+  var lo: int64 = (int64)*(uint32*)p;
+  var hi: int64 = (int64)*(uint32*)(p + 4);
+  return (((hi << 32) | lo) - FS_EPOCH_TICKS) * 100;
+}
+
+fn fs_is_symlink_tag(tag: uint32) -> bool {
+  return tag == (uint32)0xA000000C;   // IO_REPARSE_TAG_SYMLINK
+}
+
+// The reparse tag of the link or other reparse point at path, or 0. It does
+// not follow the link: FindFirstFile returns the entry itself.
+fn fs_reparse_tag(cp: uint8*) -> uint32 {
+  var data: int64[40];
+  var h: int64 = fs_w_find_first(cp, (uint8*)&data[0]);
+  if (h == -1) { return (uint32)0; }
+  fs_w_find_close(h);
+  return *(uint32*)((uint8*)&data[0] + 36);   // dwReserved0
+}
+
+// Fills an FsStat. info holds attributes at 0, creation time at 4, access
+// time at 12, write time at 20, and the size's high and low halves at
+// size_at and size_at + 4. link says the entry is a symbolic link.
+fn fs_fill(info: uint8*, size_at: int64, link: bool, out: FsStat*) {
+  var attrs: int32 = (int32)*(uint32*)info;
+  out->kind = FS_FILE;
+  if ((attrs & FS_ATTR_DIRECTORY) != 0) { out->kind = FS_DIR; }
+  if (link) { out->kind = FS_SYMLINK; }
+  out->mode = 0;
+  var hi: int64 = (int64)*(uint32*)(info + size_at);
+  var lo: int64 = (int64)*(uint32*)(info + size_at + 4);
+  out->size = (hi << 32) | lo;
+  out->ctime_ns = fs_ft_ns(info + 4);
+  out->atime_ns = fs_ft_ns(info + 12);
+  out->mtime_ns = fs_ft_ns(info + 20);
+}
+
+// Describes path, following symbolic links. Returns 0 or -errno-style; a link
+// to nothing gives -FS_ENOENT.
+export fn fs_stat(path: string, out: FsStat*) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  // Open with no access at all, which reads attributes and follows links.
+  var h: int64 = fs_w_create(&cp[0], (uint32)0, (uint32)7, (uint8*)0, (uint32)3, (uint32)FS_BACKUP_SEMANTICS, 0);
+  if (h == -1) { return fs_fail(); }
+  var info: int64[8];   // BY_HANDLE_FILE_INFORMATION is 52 bytes
+  if (fs_w_handle_info(h, (uint8*)&info[0]) == 0) {
+    var e: int64 = fs_fail();
+    fs_w_close(h);
+    return e;
+  }
+  fs_w_close(h);
+  fs_fill((uint8*)&info[0], 32, false, out);
+  return 0;
+}
+
+// Like fs_stat, but describes a symbolic link itself.
+export fn fs_lstat(path: string, out: FsStat*) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  var info: int64[5];   // WIN32_FILE_ATTRIBUTE_DATA is 36 bytes
+  if (fs_w_get_attr_ex(&cp[0], 0, (uint8*)&info[0]) == 0) { return fs_fail(); }
+  var link: bool = false;
+  var ip: uint8* = (uint8*)&info[0];
+  if ((((int32)*(uint32*)ip) & FS_ATTR_REPARSE) != 0) {
+    link = fs_is_symlink_tag(fs_reparse_tag(&cp[0]));
+  }
+  fs_fill(ip, 28, link, out);
+  return 0;
+}
+
+// True if path exists, following links, so a dangling link is false.
+export fn fs_exists(path: string) -> bool {
+  var st: FsStat;
+  return fs_stat(path, &st) == 0;
+}
+
+export fn fs_is_dir(path: string) -> bool {
+  var st: FsStat;
+  return fs_stat(path, &st) == 0 && st.kind == FS_DIR;
+}
+
+export fn fs_is_file(path: string) -> bool {
+  var st: FsStat;
+  return fs_stat(path, &st) == 0 && st.kind == FS_FILE;
+}
+
+// Opens a directory for reading. Returns 0 or an error; -FS_ENOTDIR if path
+// is not a directory.
+export fn fs_dir_open(path: string, d: FsDir*) -> int64 {
+  var cp: uint8[4096];
+  if (path.length + (uint64)2 >= (uint64)4096) { return -(int64)FS_ENAMETOOLONG; }
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  var attrs: uint32 = fs_w_get_attr(&cp[0]);
+  if (attrs == (uint32)0xFFFFFFFF) { return fs_fail(); }
+  if ((((int32)attrs) & FS_ATTR_DIRECTORY) == 0) { return -(int64)FS_ENOTDIR; }
+  // The search pattern is the directory plus "\*".
+  var n: int64 = (int64)path.length;
+  if (n > 0 && !fs_is_sep(cp[n - 1])) {
+    cp[n] = (uint8)92;
+    n = n + 1;
+  }
+  cp[n] = (uint8)42;
+  cp[n + 1] = (uint8)0;
+  d->first = 0;
+  d->done = 0;
+  d->handle = fs_w_find_first(&cp[0], (uint8*)&d->data[0]);
+  if (d->handle == -1) {
+    var e: int64 = (int64)fs_w_error();
+    // The root of a drive has no "." entry, so an empty one finds nothing.
+    if (e == 2) {
+      d->done = 1;
+      return 0;
+    }
+    return fs_fail();
+  }
+  d->first = 1;
+  return 0;
+}
+
+// Reads the next entry, skipping "." and "..". Returns 1 and fills e, 0 at
+// the end of the directory, or an error. The order is the file system's.
+// e->name stays valid until the next call on d.
+export fn fs_dir_next(d: FsDir*, e: FsDirEntry*) -> int64 {
+  var data: uint8* = (uint8*)&d->data[0];
+  while (true) {
+    if (d->done != 0) { return 0; }
+    if (d->first != 0) {
+      d->first = 0;
+    } else {
+      if (fs_w_find_next(d->handle, data) == 0) {
+        var err: uint32 = fs_w_error();
+        d->done = 1;
+        if (err == (uint32)18) { return 0; }   // ERROR_NO_MORE_FILES
+        return -(int64)err;
+      }
+    }
+    // WIN32_FIND_DATAA: attributes at 0, reparse tag at 36, name at 44.
+    var name: uint8* = data + 44;
+    var n: int64 = fs_cstrlen(name);
+    if (name[0] == (uint8)46 && (n == 1 || (n == 2 && name[1] == (uint8)46))) { continue; }
+    var attrs: int32 = (int32)*(uint32*)data;
+    var kind: int32 = FS_FILE;
+    if ((attrs & FS_ATTR_DIRECTORY) != 0) { kind = FS_DIR; }
+    if ((attrs & FS_ATTR_REPARSE) != 0 && fs_is_symlink_tag(*(uint32*)(data + 36))) { kind = FS_SYMLINK; }
+    e->name = str_from_bytes((cstring)name, n);
+    e->kind = kind;
+    return 1;
+  }
+  return 0;
+}
+
+// Closes a directory opened by fs_dir_open.
+export fn fs_dir_close(d: FsDir*) -> int64 {
+  var r: int64 = 0;
+  if (d->handle != -1) {
+    if (fs_w_find_close(d->handle) == 0) { r = fs_fail(); }
+  }
+  d->handle = -1;
+  d->done = 1;
+  return r;
+}
+
+// Makes one directory. mode is ignored on Windows. Fails with -FS_EEXIST if
+// path exists.
+export fn fs_mkdir(path: string, mode: int32) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  if (fs_w_mkdir(&cp[0], (uint8*)0) == 0) { return fs_fail(); }
+  return 0;
+}
+
+// Makes path and any missing parents, like mkdir -p. It is fine if path is
+// already a directory; if it is something else, the result is
+// -FS_ENOTDIR. mode is ignored.
+export fn fs_mkdir_all(path: string, mode: int32) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  var n: int64 = (int64)path.length;
+  var i: int64 = 1;
+  while (i < n) {
+    // Each prefix that ends before a separator, skipping runs of them.
+    if (fs_is_sep(cp[i]) && !fs_is_sep(cp[i - 1])) {
+      var saved: uint8 = cp[i];
+      cp[i] = (uint8)0;
+      if (fs_w_mkdir(&cp[0], (uint8*)0) == 0) {
+        var pe: int64 = fs_fail();
+        // A prefix such as "C:" cannot be made but is fine if it is there.
+        var attrs: uint32 = fs_w_get_attr(&cp[0]);
+        var is_dir: bool = attrs != (uint32)0xFFFFFFFF && (((int32)attrs) & FS_ATTR_DIRECTORY) != 0;
+        if (!is_dir) {
+          cp[i] = saved;
+          return pe;
+        }
+      }
+      cp[i] = saved;
+    }
+    i = i + 1;
+  }
+  if (fs_w_mkdir(&cp[0], (uint8*)0) == 0) {
+    var e: int64 = fs_fail();
+    if (fs_is_dir(path)) { return 0; }
+    if (e == -(int64)FS_EEXIST) { return -(int64)FS_ENOTDIR; }
+    return e;
+  }
+  return 0;
+}
+
+// Removes an empty directory (or a directory link, without touching what it
+// points to).
+export fn fs_rmdir(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  if (fs_w_rmdir(&cp[0]) == 0) { return fs_fail(); }
+  return 0;
+}
+
+// Deletes the file or link at the NUL-terminated cp. A directory link goes
+// through RemoveDirectory; a read-only file loses its read-only attribute
+// first.
+fn fs_remove_cp(cp: uint8*) -> int64 {
+  if (fs_w_delete(cp) != 0) { return 0; }
+  var e: int64 = fs_fail();
+  if (e != -(int64)FS_EACCES) { return e; }
+  var attrs: uint32 = fs_w_get_attr(cp);
+  if (attrs == (uint32)0xFFFFFFFF) { return e; }
+  var a: int32 = (int32)attrs;
+  if ((a & FS_ATTR_DIRECTORY) != 0) {
+    // A link to a directory is removed like a directory. A real one is not
+    // ours to remove here.
+    if ((a & FS_ATTR_REPARSE) == 0) { return e; }
+    if (fs_w_rmdir(cp) != 0) { return 0; }
+    return fs_fail();
+  }
+  if ((a & FS_ATTR_READONLY) != 0) {
+    if (fs_w_set_attr(cp, (uint32)(a & ~FS_ATTR_READONLY)) != 0) {
+      if (fs_w_delete(cp) != 0) { return 0; }
+      var e2: int64 = fs_fail();
+      fs_w_set_attr(cp, attrs);   // put it back
+      return e2;
+    }
+  }
+  return e;
+}
+
+// Removes a file or a symbolic link (the link, not its target). A directory
+// gives an error; use fs_rmdir or fs_remove_all.
+export fn fs_remove(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  return fs_remove_cp(&cp[0]);
+}
+
+// Removes the file, link or directory tree at the NUL-terminated path in
+// buf, which has len bytes and room for 4096. Symbolic links and junctions
+// are removed, never entered. The children's paths are built in the same
+// buffer, past len, so a level costs little stack. depth counts the levels
+// below the first.
+fn fs_rm_path(buf: uint8*, len: int64, depth: int32) -> int64 {
+  var attrs: uint32 = fs_w_get_attr(buf);
+  if (attrs == (uint32)0xFFFFFFFF) {
+    var e0: int64 = fs_fail();
+    if (e0 == -(int64)FS_ENOENT) { return 0; }
+    return e0;
+  }
+  var a: int32 = (int32)attrs;
+  var real_dir: bool = (a & FS_ATTR_DIRECTORY) != 0 && (a & FS_ATTR_REPARSE) == 0;
+  if (!real_dir) {
+    var rf: int64 = fs_remove_cp(buf);
+    if (rf == -(int64)FS_ENOENT) { return 0; }
+    return rf;
+  }
+  if (depth >= FS_MAX_DEPTH) { return -(int64)FS_ELOOP; }
+  if (len + 3 >= (int64)4096) { return -(int64)FS_ENAMETOOLONG; }
+  // Where a child's name goes: after the path and a separator.
+  var blen: int64 = len;
+  if (!fs_is_sep(buf[len - 1])) { blen = len + 1; }
+  // A directory can lose entries while we read it, and some file systems then
+  // skip entries. So read, remove, and try the rmdir; if it says the
+  // directory is not empty, go round again.
+  for _pass in 0..4 {
+    var data: int64[40];   // WIN32_FIND_DATAA
+    buf[len] = (uint8)92;   // the search pattern is "<path>\*"
+    buf[blen] = (uint8)42;
+    buf[blen + 1] = (uint8)0;
+    var h: int64 = fs_w_find_first(buf, (uint8*)&data[0]);
+    if (h != -1) {
+      var more: bool = true;
+      while (more) {
+        var name: uint8* = (uint8*)&data[0] + 44;
+        var n: int64 = fs_cstrlen(name);
+        var dots: bool = name[0] == (uint8)46 && (n == 1 || (n == 2 && name[1] == (uint8)46));
+        if (!dots) {
+          if (blen + n + 1 >= (int64)4096) {
+            fs_w_find_close(h);
+            buf[len] = (uint8)0;
+            return -(int64)FS_ENAMETOOLONG;
+          }
+          buf[len] = (uint8)92;
+          for i in 0..n { buf[blen + i] = name[i]; }
+          buf[blen + n] = (uint8)0;
+          var rc: int64 = fs_rm_path(buf, blen + n, depth + 1);
+          if (rc < 0) {
+            fs_w_find_close(h);
+            buf[len] = (uint8)0;
+            return rc;
+          }
+        }
+        if (fs_w_find_next(h, (uint8*)&data[0]) == 0) { more = false; }
+      }
+      fs_w_find_close(h);
+    }
+    buf[len] = (uint8)0;
+    if (fs_w_rmdir(buf) != 0) { return 0; }
+    var e: int64 = fs_fail();
+    if (e == -(int64)FS_ENOENT) { return 0; }
+    if (e == -(int64)FS_EACCES && (a & FS_ATTR_READONLY) != 0) {
+      fs_w_set_attr(buf, (uint32)(a & ~FS_ATTR_READONLY));
+      if (fs_w_rmdir(buf) != 0) { return 0; }
+      e = fs_fail();
+    }
+    if (e != -(int64)FS_ENOTEMPTY) { return e; }
+  }
+  return -(int64)FS_ENOTEMPTY;
+}
+
+// Removes path and everything below it, like rm -rf. A path that does not
+// exist is fine (the result is 0).
+//
+// It never follows a symbolic link. If path itself is a link, the link is
+// removed and its target is left alone; links and junctions inside a
+// directory are removed the same way, so the tree it deletes is only what
+// lies under path. A trailing separator is ignored.
+//
+// It refuses "", a drive such as "C:" or "C:\", a lone separator, ".", ".."
+// and anything ending in "\." or "\..", with -FS_EINVAL. A tree more than 256
+// levels deep fails with -FS_ELOOP. It stops at the first error, and what it
+// already removed stays removed.
+export fn fs_remove_all(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  var n: int64 = (int64)path.length;
+  while (n > 1 && fs_is_sep(cp[n - 1])) { n = n - 1; }
+  cp[n] = (uint8)0;
+  var s: int64 = n;
+  while (s > 0 && !fs_is_sep(cp[s - 1])) { s = s - 1; }
+  var last: int64 = n - s;
+  if (last == 0) { return -(int64)FS_EINVAL; }
+  if (last == 1 && cp[s] == (uint8)46) { return -(int64)FS_EINVAL; }
+  if (last == 2 && cp[s] == (uint8)46 && cp[s + 1] == (uint8)46) { return -(int64)FS_EINVAL; }
+  if (last == 2 && cp[s + 1] == (uint8)58) { return -(int64)FS_EINVAL; }   // "C:"
+  return fs_rm_path(&cp[0], n, 0);
+}
+
+// Makes a symbolic link at link that holds target. The target is stored with
+// backslashes. A target that is a directory makes a directory link. Without
+// the privilege to make links this fails with an access error.
+export fn fs_symlink(target: string, link: string) -> int64 {
+  var a: uint8[4096];
+  var b: uint8[4096];
+  if (!fs_cpath(target, &a[0]) || !fs_cpath(link, &b[0])) { return -(int64)FS_ENAMETOOLONG; }
+  // Windows wants backslashes in the stored target.
+  var tn: int64 = (int64)target.length;
+  for i in 0..tn {
+    if (a[i] == (uint8)47) { a[i] = (uint8)92; }
+  }
+  // Is the target a directory? A relative one is looked up next to the link.
+  var probe: uint8[4096];
+  var ln: int64 = (int64)link.length;
+  var dirend: int64 = ln;
+  while (dirend > 0 && !fs_is_sep(b[dirend - 1])) { dirend = dirend - 1; }
+  var absolute: bool = tn > 0 && (fs_is_sep(a[0]) || (tn > 1 && a[1] == (uint8)58));
+  var pn: int64 = 0;
+  if (!absolute) {
+    for i in 0..dirend { probe[i] = b[i]; }
+    pn = dirend;
+  }
+  if (pn + tn >= (int64)4096) { return -(int64)FS_ENAMETOOLONG; }
+  for i in 0..tn { probe[pn + i] = a[i]; }
+  probe[pn + tn] = (uint8)0;
+  var flags: uint32 = 0;
+  var attrs: uint32 = fs_w_get_attr(&probe[0]);
+  if (attrs != (uint32)0xFFFFFFFF && (((int32)attrs) & FS_ATTR_DIRECTORY) != 0) { flags = (uint32)1; }   // SYMBOLIC_LINK_FLAG_DIRECTORY
+  // SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE (2) lets Developer Mode make
+  // links without elevation. Older systems reject it, so try again without.
+  if (fs_w_symlink(&b[0], &a[0], flags | (uint32)2) != (uint8)0) { return 0; }
+  if (fs_w_error() == (uint32)87) {
+    if (fs_w_symlink(&b[0], &a[0], flags) != (uint8)0) { return 0; }
+  }
+  return fs_fail();
+}
+
+// Writes the target of the symbolic link at path into buf, with a NUL after
+// it, and returns its length. The target is as stored: usually with
+// backslashes. -FS_ERANGE if buf (cap bytes) cannot hold the target and the
+// NUL; -FS_EINVAL if path is not a symbolic link.
+export fn fs_readlink(path: string, buf: uint8*, cap: int64) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  if (cap < 1) { return -(int64)FS_ERANGE; }
+  var h: int64 = fs_w_create(&cp[0], (uint32)0, (uint32)7, (uint8*)0, (uint32)3, (uint32)(FS_BACKUP_SEMANTICS | FS_OPEN_REPARSE_POINT), 0);
+  if (h == -1) { return fs_fail(); }
+  var rd: int64[2048];   // REPARSE_DATA_BUFFER, up to 16 KB
+  var got: uint32 = 0;
+  // FSCTL_GET_REPARSE_POINT
+  if (fs_w_ioctl(h, (uint32)0x000900A8, (uint8*)0, (uint32)0, (uint8*)&rd[0], (uint32)16384, &got, (uint8*)0) == 0) {
+    var e: int64 = fs_fail();
+    fs_w_close(h);
+    if (e == -(int64)4390) { return -(int64)FS_EINVAL; }   // ERROR_NOT_A_REPARSE_POINT
+    return e;
+  }
+  fs_w_close(h);
+  var rp: uint8* = (uint8*)&rd[0];
+  if (!fs_is_symlink_tag(*(uint32*)rp)) { return -(int64)FS_EINVAL; }
+  // SymbolicLinkReparseBuffer: substitute name offset and length at 8 and
+  // 10, print name offset and length at 12 and 14, flags at 16, names from 20.
+  var off: int64 = (int64)*(uint16*)(rp + 12);
+  var bytes: int64 = (int64)*(uint16*)(rp + 14);
+  if (bytes == 0) {
+    off = (int64)*(uint16*)(rp + 8);
+    bytes = (int64)*(uint16*)(rp + 10);
+  }
+  var text: uint8* = rp + 20 + off;
+  var wchars: int64 = bytes / 2;
+  if (wchars == 0) {
+    buf[0] = (uint8)0;
+    return 0;
+  }
+  var w: int32 = fs_w_wide_to_utf8((uint32)65001, (uint32)0, text, (int32)wchars, buf, (int32)(cap - 1), (uint8*)0, (int32*)0);
+  if (w <= 0) {
+    if (fs_w_error() == (uint32)122) { return -(int64)FS_ERANGE; }
+    return fs_fail();
+  }
+  buf[(int64)w] = (uint8)0;
+  return (int64)w;
+}
+
+// Writes the absolute path of path into buf with every symbolic link
+// resolved, and returns its length. The path must exist. The result has
+// backslashes, and no "\\?\" prefix unless it is a long path. -FS_ERANGE if
+// buf does not have room for the result and a NUL.
+export fn fs_realpath(path: string, buf: uint8*, cap: int64) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  if (cap < 1) { return -(int64)FS_ERANGE; }
+  var h: int64 = fs_w_create(&cp[0], (uint32)0, (uint32)7, (uint8*)0, (uint32)3, (uint32)FS_BACKUP_SEMANTICS, 0);
+  if (h == -1) { return fs_fail(); }
+  var out: uint8[4096];
+  var n: int64 = (int64)fs_w_final_path(h, &out[0], (uint32)4095, (uint32)0);   // drive-letter path
+  if (n == 0) {
+    var e: int64 = fs_fail();
+    fs_w_close(h);
+    return e;
+  }
+  fs_w_close(h);
+  if (n >= (int64)4095) { return -(int64)FS_ENAMETOOLONG; }
+  // The answer starts with \\?\ ; take that off. A \\?\UNC\ path becomes \\.
+  var from: int64 = 0;
+  if (n >= 4 && out[0] == (uint8)92 && out[1] == (uint8)92 && out[2] == (uint8)63 && out[3] == (uint8)92) {
+    from = 4;
+    if (n >= 8 && out[4] == (uint8)85 && out[5] == (uint8)78 && out[6] == (uint8)67 && out[7] == (uint8)92) {
+      from = 6;
+      out[6] = (uint8)92;
+      out[7] = (uint8)92;
+    }
+  }
+  var len: int64 = n - from;
+  if (len + 1 > cap) { return -(int64)FS_ERANGE; }
+  for i in 0..len { buf[i] = out[from + i]; }
+  buf[len] = (uint8)0;
+  return len;
+}
+
+// Writes the current directory into buf with a NUL and returns its length.
+// -FS_ERANGE if it does not fit.
+export fn fs_getcwd(buf: uint8*, cap: int64) -> int64 {
+  if (cap < 1) { return -(int64)FS_ERANGE; }
+  var r: int64 = (int64)fs_w_getcwd(fs_clamp(cap), buf);
+  if (r == 0) { return fs_fail(); }
+  if (r >= cap) { return -(int64)FS_ERANGE; }   // r is the size it needed
+  return r;
+}
+
+// Changes the current directory of the whole process.
+export fn fs_chdir(path: string) -> int64 {
+  var cp: uint8[4096];
+  if (!fs_cpath(path, &cp[0])) { return -(int64)FS_ENAMETOOLONG; }
+  if (fs_w_chdir(&cp[0]) == 0) { return fs_fail(); }
+  return 0;
+}
+
+// Writes the directory for temporary files into buf with a NUL and returns
+// its length. Windows decides: TMP, then TEMP, then USERPROFILE, then the
+// Windows directory. The trailing backslash is dropped, except on a drive
+// root. It does not check that the directory exists.
+export fn fs_temp_dir(buf: uint8*, cap: int64) -> int64 {
+  if (cap < 1) { return -(int64)FS_ERANGE; }
+  var r: int64 = (int64)fs_w_temp(fs_clamp(cap), buf);
+  if (r == 0) { return fs_fail(); }
+  if (r >= cap) { return -(int64)FS_ERANGE; }
+  var n: int64 = r;
+  if (n > 1 && fs_is_sep(buf[n - 1]) && !(n == 3 && buf[1] == (uint8)58)) { n = n - 1; }
+  buf[n] = (uint8)0;
+  return n;
+}

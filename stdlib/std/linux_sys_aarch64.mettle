@@ -53,3 +53,28 @@ export const LINUX_SYS_EXIT_GROUP = 94;
 export const LINUX_SYS_SIGNALFD4 = 74;
 export const LINUX_SYS_DUP3 = 24;
 export const LINUX_SYS_PIPE2 = 59;
+
+// Files, directories, memory maps and randomness.
+export const LINUX_SYS_MMAP = 222;
+export const LINUX_SYS_MUNMAP = 215;
+export const LINUX_SYS_MSYNC = 227;
+export const LINUX_SYS_MADVISE = 233;
+export const LINUX_SYS_GETCWD = 17;
+export const LINUX_SYS_FCHDIR = 50;
+export const LINUX_SYS_GETDENTS64 = 61;
+export const LINUX_SYS_MKDIRAT = 34;
+export const LINUX_SYS_NEWFSTATAT = 79;
+export const LINUX_SYS_SYMLINKAT = 36;
+export const LINUX_SYS_READLINKAT = 78;
+export const LINUX_SYS_GETRANDOM = 278;
+
+// struct stat field offsets (bytes), from the generic layout.
+export const LINUX_STAT_SIZE = 128;
+export const LINUX_STAT_MODE_AT = 16;
+export const LINUX_STAT_SIZE_AT = 48;
+export const LINUX_STAT_ATIME_AT = 72;
+export const LINUX_STAT_MTIME_AT = 88;
+export const LINUX_STAT_CTIME_AT = 104;
+
+export const LINUX_SYS_MPROTECT = 226;
+export const LINUX_SYS_IOCTL = 29;

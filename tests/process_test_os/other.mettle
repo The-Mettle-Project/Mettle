@@ -1,0 +1,3 @@
+// test_std_process needs Linux tools and has not been run here; it only
+// checks that it builds.
+export const PROC_TEST_RUNS = 0;

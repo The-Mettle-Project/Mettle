@@ -1,0 +1,40 @@
+// Linux terminals for std/term: the TCGETS and TCSETS ioctls, which take the
+// kernel's struct termios (4 flag words, then the line and control chars).
+
+import "std/linux_sys";
+
+const TCGETS = 0x5401;
+const TCSETS = 0x5402;
+const LFLAG_AT = 3;   // c_lflag is the 4th 32-bit word
+const ECHO = 8;
+
+export fn term_is_tty(fd: int64) -> bool {
+  var t: uint32[16];
+  return syscall(LINUX_SYS_IOCTL, fd, TCGETS, &t[0]) == 0;
+}
+
+// Turns echo on or off. Returns 1 or 0 for whether echo was on before, or a
+// negative error code (-25, ENOTTY, when fd is not a terminal).
+export fn term_set_echo(fd: int64, on: bool) -> int64 {
+  var t: uint32[16];
+  var r: int64 = syscall(LINUX_SYS_IOCTL, fd, TCGETS, &t[0]);
+  if (r < 0) { return r; }
+  var was: int64 = 0;
+  if ((t[LFLAG_AT] & (uint32)ECHO) != (uint32)0) { was = 1; }
+  if (on) {
+    t[LFLAG_AT] = t[LFLAG_AT] | (uint32)ECHO;
+  } else {
+    t[LFLAG_AT] = t[LFLAG_AT] & ~(uint32)ECHO;
+  }
+  r = syscall(LINUX_SYS_IOCTL, fd, TCSETS, &t[0]);
+  if (r < 0) { return r; }
+  return was;
+}
+
+export fn term_os_read(fd: int64, buf: uint8*, n: int64) -> int64 {
+  return syscall(LINUX_SYS_READ, fd, buf, n);
+}
+
+export fn term_os_write(fd: int64, buf: uint8*, n: int64) -> int64 {
+  return syscall(LINUX_SYS_WRITE, fd, buf, n);
+}

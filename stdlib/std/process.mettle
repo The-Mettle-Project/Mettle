@@ -1,5 +1,712 @@
+// Processes on Windows, through Kernel32 (this is the plain std/process;
+// Linux and macOS have process.linux.mettle and process.macos.mettle):
+// spawn a program, wait for it, kill it and capture its output.
+//
+// Every call that can fail returns 0, a count or a flag, or a negative Win32
+// error code (-GetLastError()). A pipe end is a HANDLE held in an int64.
+//
+// Differences from the POSIX versions:
+//   - There are no signals. proc_kill ends the process at once whatever the
+//     signal is (signal 0 only checks that it is alive), and a process that
+//     was ended that way reports exit code 1, not "killed by a signal". A
+//     status is never "signaled".
+//   - proc_signal_fd and proc_signal_read are not supported: they return
+//     -PROC_ENOSYS.
+//   - Standard streams set to PROC_INHERIT are shared only if the parent's
+//     own handles are inheritable, which console and redirected handles are.
+//   - proc_communicate feeds stdin from a helper thread and checks the output
+//     pipes every millisecond.
+//
+// exit, rand and srand are here because std/prelude takes them from this
+// module; every platform file exports them.
+
+import "std/mem";
+import "std/strbuf";
+
 @noreturn export extern fn exit(code: int32) = "exit";
 
 export extern fn rand() -> int32 = "rand";
 
 export extern fn srand(seed: int32) = "srand";
+
+extern fn proc_w_error() -> uint32 = "GetLastError";
+extern fn proc_w_create_process(app: uint8*, cmd: uint8*, psa: uint8*, tsa: uint8*, inherit: int32, flags: uint32, env: uint8*, dir: uint8*, si: uint8*, pi: uint8*) -> int32 = "CreateProcessA";
+extern fn proc_w_create_pipe(rd: int64*, wr: int64*, sa: uint8*, size: uint32) -> int32 = "CreatePipe";
+extern fn proc_w_set_inherit(h: int64, mask: uint32, flags: uint32) -> int32 = "SetHandleInformation";
+extern fn proc_w_close(h: int64) -> int32 = "CloseHandle";
+extern fn proc_w_wait(h: int64, ms: uint32) -> uint32 = "WaitForSingleObject";
+extern fn proc_w_exit_code(h: int64, code: uint32*) -> int32 = "GetExitCodeProcess";
+extern fn proc_w_terminate(h: int64, code: uint32) -> int32 = "TerminateProcess";
+extern fn proc_w_open(access: uint32, inherit: int32, pid: uint32) -> int64 = "OpenProcess";
+extern fn proc_w_getpid() -> uint32 = "GetCurrentProcessId";
+extern fn proc_w_std(which: int32) -> int64 = "GetStdHandle";
+extern fn proc_w_create_file(path: uint8*, access: uint32, share: uint32, sa: uint8*, disposition: uint32, attrs: uint32, template: int64) -> int64 = "CreateFileA";
+extern fn proc_w_read(h: int64, buf: uint8*, n: uint32, got: uint32*, ov: uint8*) -> int32 = "ReadFile";
+extern fn proc_w_write(h: int64, buf: uint8*, n: uint32, put: uint32*, ov: uint8*) -> int32 = "WriteFile";
+extern fn proc_w_peek(h: int64, buf: uint8*, n: uint32, got: uint32*, avail: uint32*, left: uint32*) -> int32 = "PeekNamedPipe";
+extern fn proc_w_sleep(ms: uint32) = "Sleep";
+extern fn proc_w_tick() -> uint64 = "GetTickCount64";
+extern fn proc_w_create_thread(sa: uint8*, stack: uint64, start: int64, arg: uint8*, flags: uint32, id: uint32*) -> int64 = "CreateThread";
+extern fn proc_w_snapshot(flags: uint32, pid: uint32) -> int64 = "CreateToolhelp32Snapshot";
+extern fn proc_w_first(snap: int64, entry: uint8*) -> int32 = "Process32First";
+extern fn proc_w_next(snap: int64, entry: uint8*) -> int32 = "Process32Next";
+
+// What a child does with each of its standard streams.
+export const PROC_INHERIT = 0;     // share the parent's
+export const PROC_PIPE = 1;        // a pipe; the parent gets the other end
+export const PROC_NULL = 2;        // NUL
+export const PROC_TO_STDOUT = 3;   // stderr only: the same place as stdout
+
+// Signal numbers, with the usual Unix values so code can be shared. Windows
+// only ends the process (see the top of the file).
+export const PROC_SIGHUP = 1;
+export const PROC_SIGINT = 2;
+export const PROC_SIGKILL = 9;
+export const PROC_SIGUSR1 = 10;
+export const PROC_SIGUSR2 = 12;
+export const PROC_SIGPIPE = 13;
+export const PROC_SIGTERM = 15;
+export const PROC_SIGCHLD = 17;
+
+// Win32 error codes under the names the POSIX files use.
+export const PROC_ENOENT = 2;       // ERROR_FILE_NOT_FOUND
+export const PROC_ESRCH = 87;       // ERROR_INVALID_PARAMETER
+export const PROC_EINTR = 995;      // ERROR_OPERATION_ABORTED
+export const PROC_E2BIG = 206;      // ERROR_FILENAME_EXCED_RANGE
+export const PROC_ECHILD = 128;     // ERROR_WAIT_NO_CHILDREN
+export const PROC_EAGAIN = 232;     // ERROR_NO_DATA
+export const PROC_ENOMEM = 8;       // ERROR_NOT_ENOUGH_MEMORY
+export const PROC_EACCES = 5;       // ERROR_ACCESS_DENIED
+export const PROC_EINVAL = 87;      // ERROR_INVALID_PARAMETER
+export const PROC_EPIPE = 109;      // ERROR_BROKEN_PIPE
+export const PROC_ENOSYS = 120;     // ERROR_CALL_NOT_IMPLEMENTED
+export const PROC_ETIMEDOUT = 1460; // ERROR_TIMEOUT
+
+// How a process ended. On Windows signaled is always 0.
+export struct ProcStatus {
+  signaled: int32;   // 1 if a signal killed it, 0 if it exited
+  code: int32;       // the exit code, when signaled is 0
+  signal: int32;     // the signal number, when signaled is 1
+}
+
+export struct ProcOptions {
+  argv: string[];    // argv[0] is the program; Windows searches PATH and adds .exe
+  env: string[];     // "NAME=value" entries, used only when has_env is 1
+  has_env: int32;    // 0: inherit the parent's environment, 1: use env alone
+  cwd: string;       // the child's working directory; empty keeps the parent's
+  stdin: int32;      // PROC_INHERIT, PROC_PIPE or PROC_NULL
+  stdout: int32;     // PROC_INHERIT, PROC_PIPE or PROC_NULL
+  stderr: int32;     // the same, or PROC_TO_STDOUT
+}
+
+// A running (or finished) child. The pipe fields hold the parent's ends of
+// any PROC_PIPE streams, or -1.
+export struct Proc {
+  pid: int64;
+  stdin_fd: int64;    // write here to feed the child
+  stdout_fd: int64;   // read the child's output here
+  stderr_fd: int64;
+  done: int32;        // 1 once the child has been reaped
+  status: ProcStatus; // valid when done is 1
+  handle: int64;      // the process HANDLE, until done (internal)
+}
+
+// Sets the stream modes to PROC_INHERIT, no environment and no directory.
+export fn proc_options_init(o: ProcOptions*, argv: string[]) {
+  var blank: ProcOptions;
+  *o = blank;
+  o->argv = argv;
+}
+
+fn proc_fail() -> int64 { return -(int64)proc_w_error(); }
+
+fn proc_close_fd(h: int64) {
+  if (h >= 0) { proc_w_close(h); }
+}
+
+// ---- the command line ------------------------------------------------------
+
+// Writes one argument, quoted by the rules MSVCRT and CommandLineToArgvW
+// read back: an argument with a space, tab, newline or quote (or an empty
+// one) goes in double quotes; backslashes in front of a quote are doubled and
+// the quote gets a backslash; backslashes at the end are doubled. Returns the
+// bytes written, with no NUL.
+@noinline fn proc_quote(dst: uint8*, s: string) -> int64 {
+  var src: uint8* = s.chars;
+  var n: int64 = (int64)s.length;
+  var plain: bool = n > 0;
+  for i in 0..n {
+    var c: int32 = (int32)src[i];
+    if (c == 32 || c == 9 || c == 10 || c == 11 || c == 34) { plain = false; }
+  }
+  var w: int64 = 0;
+  if (plain) {
+    for i in 0..n {
+      dst[w] = src[i];
+      w = w + 1;
+    }
+    return w;
+  }
+  dst[w] = (uint8)34;
+  w = w + 1;
+  var slashes: int64 = 0;
+  for i in 0..n {
+    var c: int32 = (int32)src[i];
+    if (c == 92) {
+      slashes = slashes + 1;
+    } else if (c == 34) {
+      for j in 0..(slashes * 2 + 1) {
+        dst[w] = (uint8)92;
+        w = w + 1;
+      }
+      dst[w] = (uint8)34;
+      w = w + 1;
+      slashes = 0;
+    } else {
+      for j in 0..slashes {
+        dst[w] = (uint8)92;
+        w = w + 1;
+      }
+      slashes = 0;
+      dst[w] = src[i];
+      w = w + 1;
+    }
+  }
+  for j in 0..(slashes * 2) {
+    dst[w] = (uint8)92;
+    w = w + 1;
+  }
+  dst[w] = (uint8)34;
+  w = w + 1;
+  return w;
+}
+
+// Copies s into dst with a NUL. Returns the bytes used.
+@noinline fn proc_put(dst: uint8*, s: string) -> int64 {
+  var src: uint8* = s.chars;
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = src[i];
+    i = i + 1;
+  }
+  dst[n] = (uint8)0;
+  return n + 1;
+}
+
+// ---- streams ---------------------------------------------------------------
+
+// A SECURITY_ATTRIBUTES that makes the handle inheritable.
+fn proc_sa(sa: uint8*) {
+  for i in 0..24 { sa[i] = (uint8)0; }
+  *(uint32*)sa = (uint32)24;
+  *(int32*)(sa + 16) = 1;
+}
+
+// A pipe whose child end is inheritable and whose parent end is not.
+// child_reads is 1 for stdin.
+fn proc_make_pipe(child_reads: int32, child_end: int64*, parent_end: int64*) -> int64 {
+  var sa: uint8[24];
+  proc_sa(&sa[0]);
+  var rd: int64 = 0;
+  var wr: int64 = 0;
+  if (proc_w_create_pipe(&rd, &wr, &sa[0], (uint32)0) == 0) { return proc_fail(); }
+  var mine: int64 = rd;
+  var theirs: int64 = wr;
+  if (child_reads != 0) {
+    mine = wr;
+    theirs = rd;
+  }
+  // HANDLE_FLAG_INHERIT = 1: clear it on our end.
+  if (proc_w_set_inherit(mine, (uint32)1, (uint32)0) == 0) {
+    var e: int64 = proc_fail();
+    proc_w_close(rd);
+    proc_w_close(wr);
+    return e;
+  }
+  *child_end = theirs;
+  *parent_end = mine;
+  return 0;
+}
+
+// Opens NUL for reading and writing, inheritable.
+fn proc_open_nul(out: int64*) -> int64 {
+  var sa: uint8[24];
+  proc_sa(&sa[0]);
+  var path: string = "NUL";
+  var h: int64 = proc_w_create_file(path.chars, (uint32)0xC0000000, (uint32)3, &sa[0], (uint32)3, (uint32)0, 0);
+  if (h == -1) { return proc_fail(); }
+  *out = h;
+  return 0;
+}
+
+struct ProcFds {
+  nul: int64;
+  c_in: int64; c_out: int64; c_err: int64;   // the child's ends
+  p_in: int64; p_out: int64; p_err: int64;   // the parent's ends
+}
+
+fn proc_fds_init(f: ProcFds*) {
+  f->nul = -1;
+  f->c_in = -1; f->c_out = -1; f->c_err = -1;
+  f->p_in = -1; f->p_out = -1; f->p_err = -1;
+}
+
+fn proc_fds_close_child_side(f: ProcFds*) {
+  if (f->c_in != f->nul) { proc_close_fd(f->c_in); }
+  if (f->c_out != f->nul) { proc_close_fd(f->c_out); }
+  if (f->c_err != f->nul) { proc_close_fd(f->c_err); }
+  proc_close_fd(f->nul);
+  f->c_in = -1; f->c_out = -1; f->c_err = -1; f->nul = -1;
+}
+
+fn proc_fds_close_parent_side(f: ProcFds*) {
+  proc_close_fd(f->p_in);
+  proc_close_fd(f->p_out);
+  proc_close_fd(f->p_err);
+  f->p_in = -1; f->p_out = -1; f->p_err = -1;
+}
+
+// Sets up one stream. Does nothing for PROC_INHERIT.
+fn proc_stdio(mode: int32, child_reads: int32, f: ProcFds*, child_end: int64*, parent_end: int64*) -> int64 {
+  if (mode == PROC_INHERIT) { return 0; }
+  if (mode == PROC_PIPE) { return proc_make_pipe(child_reads, child_end, parent_end); }
+  if (mode == PROC_NULL) {
+    if (f->nul < 0) {
+      var r: int64 = proc_open_nul(&f->nul);
+      if (r < 0) {
+        f->nul = -1;
+        return r;
+      }
+    }
+    *child_end = f->nul;
+    return 0;
+  }
+  return -PROC_EINVAL;
+}
+
+// ---- spawn and wait --------------------------------------------------------
+
+// Starts a program. Returns 0 and fills out, or -(Win32 error); a program
+// that cannot be found gives -PROC_ENOENT.
+export fn proc_spawn(opts: ProcOptions*, out: Proc*) -> int64 {
+  var none: Proc;
+  *out = none;
+  out->stdin_fd = -1;
+  out->stdout_fd = -1;
+  out->stderr_fd = -1;
+  if (opts->stdin == PROC_TO_STDOUT || opts->stdout == PROC_TO_STDOUT) { return -PROC_EINVAL; }
+  var nargs: int64 = (int64)opts->argv.length;
+  if (nargs == 0) { return -PROC_EINVAL; }
+  if (opts->argv[0].length == 0) { return -PROC_ENOENT; }
+
+  // The command line: every argument quoted, joined by spaces.
+  var cmd_cap: int64 = 1;
+  for i in 0..nargs { cmd_cap = cmd_cap + (int64)opts->argv[i].length * 2 + 3; }
+  var cmd: uint8* = malloc(cmd_cap);
+  if (cmd == (uint8*)0) { return -PROC_ENOMEM; }
+  var w: int64 = 0;
+  for i in 0..nargs {
+    if (i > 0) {
+      cmd[w] = (uint8)32;
+      w = w + 1;
+    }
+    w = w + proc_quote(cmd + w, opts->argv[i]);
+  }
+  cmd[w] = (uint8)0;
+
+  // The environment block: "A=1\0B=2\0\0".
+  var envblock: uint8* = (uint8*)0;
+  if (opts->has_env != 0) {
+    var env_cap: int64 = 2;
+    for i in 0..(int64)opts->env.length { env_cap = env_cap + (int64)opts->env[i].length + 1; }
+    envblock = malloc(env_cap);
+    if (envblock == (uint8*)0) {
+      free(cmd);
+      return -PROC_ENOMEM;
+    }
+    var at: int64 = 0;
+    for i in 0..(int64)opts->env.length { at = at + proc_put(envblock + at, opts->env[i]); }
+    envblock[at] = (uint8)0;
+    envblock[at + 1] = (uint8)0;
+  }
+
+  // The working directory.
+  var dir: uint8* = (uint8*)0;
+  if (opts->cwd.length > 0) {
+    dir = malloc((int64)opts->cwd.length + 1);
+    if (dir == (uint8*)0) {
+      free(cmd);
+      if (envblock != (uint8*)0) { free(envblock); }
+      return -PROC_ENOMEM;
+    }
+    proc_put(dir, opts->cwd);
+  }
+
+  var f: ProcFds;
+  proc_fds_init(&f);
+  var r: int64 = proc_stdio(opts->stdin, 1, &f, &f.c_in, &f.p_in);
+  if (r >= 0) { r = proc_stdio(opts->stdout, 0, &f, &f.c_out, &f.p_out); }
+  if (r >= 0 && opts->stderr != PROC_TO_STDOUT) { r = proc_stdio(opts->stderr, 0, &f, &f.c_err, &f.p_err); }
+
+  if (r >= 0) {
+    // STARTUPINFOA is 104 bytes: dwFlags at 60, the three handles at 80, 88, 96.
+    var si: uint8[104];
+    for i in 0..104 { si[i] = (uint8)0; }
+    *(uint32*)&si[0] = (uint32)104;
+    *(uint32*)&si[60] = (uint32)0x100;   // STARTF_USESTDHANDLES
+    var h_in: int64 = f.c_in;
+    var h_out: int64 = f.c_out;
+    var h_err: int64 = f.c_err;
+    if (h_in < 0) { h_in = proc_w_std(-10); }
+    if (h_out < 0) { h_out = proc_w_std(-11); }
+    if (opts->stderr == PROC_TO_STDOUT) {
+      h_err = h_out;
+    } else if (h_err < 0) {
+      h_err = proc_w_std(-12);
+    }
+    // No handle (0) or an invalid one (-1) means the child gets none.
+    if (h_in == -1) { h_in = 0; }
+    if (h_out == -1) { h_out = 0; }
+    if (h_err == -1) { h_err = 0; }
+    *(int64*)&si[80] = h_in;
+    *(int64*)&si[88] = h_out;
+    *(int64*)&si[96] = h_err;
+
+    // PROCESS_INFORMATION is 24 bytes: process handle, thread handle, ids.
+    var pi: uint8[24];
+    for i in 0..24 { pi[i] = (uint8)0; }
+    if (proc_w_create_process((uint8*)0, cmd, (uint8*)0, (uint8*)0, 1, (uint32)0, envblock, dir, &si[0], &pi[0]) == 0) {
+      r = proc_fail();
+    } else {
+      out->handle = *(int64*)&pi[0];
+      out->pid = (int64)*(uint32*)&pi[16];
+      proc_w_close(*(int64*)&pi[8]);
+    }
+  }
+  free(cmd);
+  if (envblock != (uint8*)0) { free(envblock); }
+  if (dir != (uint8*)0) { free(dir); }
+  proc_fds_close_child_side(&f);
+  if (r < 0) {
+    proc_fds_close_parent_side(&f);
+    return r;
+  }
+  out->stdin_fd = f.p_in;
+  out->stdout_fd = f.p_out;
+  out->stderr_fd = f.p_err;
+  return 0;
+}
+
+// Reads the exit code of a finished process and closes its handle.
+fn proc_finish(p: Proc*) -> int64 {
+  var code: uint32 = 0;
+  if (proc_w_exit_code(p->handle, &code) == 0) { return proc_fail(); }
+  var blank: ProcStatus;
+  p->status = blank;
+  p->status.code = (int32)code;
+  p->done = 1;
+  proc_w_close(p->handle);
+  p->handle = 0;
+  return 0;
+}
+
+// Checks without blocking. Returns 1 and fills st if the child has ended
+// (st may be 0), 0 if it is still running, or a negative error.
+export fn proc_try_wait(p: Proc*, st: ProcStatus*) -> int64 {
+  if (p->done == 0) {
+    var w: uint32 = proc_w_wait(p->handle, (uint32)0);
+    if (w == (uint32)0x102) { return 0; }       // WAIT_TIMEOUT
+    if (w != (uint32)0) { return proc_fail(); }
+    var r: int64 = proc_finish(p);
+    if (r < 0) { return r; }
+  }
+  if (st != (ProcStatus*)0) { *st = p->status; }
+  return 1;
+}
+
+// Waits for the child to end. Returns 0 and fills st (st may be 0), or a
+// negative error.
+export fn proc_wait(p: Proc*, st: ProcStatus*) -> int64 {
+  if (p->done == 0) {
+    var w: uint32 = proc_w_wait(p->handle, (uint32)0xFFFFFFFF);
+    if (w != (uint32)0) { return proc_fail(); }
+    var r: int64 = proc_finish(p);
+    if (r < 0) { return r; }
+  }
+  if (st != (ProcStatus*)0) { *st = p->status; }
+  return 0;
+}
+
+// Waits for the child for at most ms milliseconds (negative waits forever).
+// Returns 1 and fills st if it ended, 0 on timeout, or a negative error. The
+// child is not killed on timeout.
+export fn proc_wait_timeout(p: Proc*, ms: int64, st: ProcStatus*) -> int64 {
+  if (p->done == 0) {
+    if (ms < 0) {
+      var r: int64 = proc_wait(p, st);
+      if (r < 0) { return r; }
+      return 1;
+    }
+    var wait: int64 = ms;
+    if (wait > (int64)0xFFFFFFFE) { wait = (int64)0xFFFFFFFE; }
+    var w: uint32 = proc_w_wait(p->handle, (uint32)wait);
+    if (w == (uint32)0x102) { return 0; }
+    if (w != (uint32)0) { return proc_fail(); }
+    var r: int64 = proc_finish(p);
+    if (r < 0) { return r; }
+  }
+  if (st != (ProcStatus*)0) { *st = p->status; }
+  return 1;
+}
+
+// ---- kill, ids -------------------------------------------------------------
+
+// Ends the process with this id at once, whatever the signal (it ends with
+// exit code 1). Signal 0 only checks that the process exists and is running.
+export fn proc_kill(pid: int64, sig: int32) -> int64 {
+  var access: uint32 = (uint32)1;                 // PROCESS_TERMINATE
+  if (sig == 0) { access = (uint32)0x100400; }    // QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+  var h: int64 = proc_w_open(access, 0, (uint32)pid);
+  if (h == 0) { return proc_fail(); }
+  var r: int64 = 0;
+  if (sig == 0) {
+    if (proc_w_wait(h, (uint32)0) != (uint32)0x102) { r = -PROC_ESRCH; }
+  } else if (proc_w_terminate(h, (uint32)1) == 0) {
+    r = proc_fail();
+  }
+  proc_w_close(h);
+  return r;
+}
+
+// Ends a child, unless it has already been reaped: that gives -PROC_ESRCH.
+export fn proc_send(p: Proc*, sig: int32) -> int64 {
+  if (p->done != 0) { return -PROC_ESRCH; }
+  if (sig == 0) {
+    if (proc_w_wait(p->handle, (uint32)0) != (uint32)0x102) { return -PROC_ESRCH; }
+    return 0;
+  }
+  if (proc_w_terminate(p->handle, (uint32)1) == 0) { return proc_fail(); }
+  return 0;
+}
+
+export fn proc_pid() -> int64 { return (int64)proc_w_getpid(); }
+
+// The parent's id, from a snapshot of the process list. -PROC_ENOENT if the
+// parent entry cannot be found.
+export fn proc_parent_pid() -> int64 {
+  var snap: int64 = proc_w_snapshot((uint32)2, (uint32)0);   // TH32CS_SNAPPROCESS
+  if (snap == -1) { return proc_fail(); }
+  // PROCESSENTRY32 is 304 bytes: dwSize at 0, th32ProcessID at 8, th32ParentProcessID at 32.
+  var entry: int64[38];
+  for i in 0..38 { entry[i] = 0; }
+  *(uint32*)&entry[0] = (uint32)304;
+  var me: uint32 = proc_w_getpid();
+  var found: int64 = -PROC_ENOENT;
+  var ok: int32 = proc_w_first(snap, (uint8*)&entry[0]);
+  while (ok != 0) {
+    if (*(uint32*)((uint8*)&entry[0] + 8) == me) {
+      found = (int64)*(uint32*)((uint8*)&entry[0] + 32);
+      break;
+    }
+    ok = proc_w_next(snap, (uint8*)&entry[0]);
+  }
+  proc_w_close(snap);
+  return found;
+}
+
+// ---- pipes -----------------------------------------------------------------
+
+// Closes the parent's end of the child's stdin, so the child sees end of file.
+export fn proc_close_stdin(p: Proc*) {
+  proc_close_fd(p->stdin_fd);
+  p->stdin_fd = -1;
+}
+
+// Closes whatever pipe ends are still open.
+export fn proc_close(p: Proc*) {
+  proc_close_fd(p->stdin_fd);
+  proc_close_fd(p->stdout_fd);
+  proc_close_fd(p->stderr_fd);
+  p->stdin_fd = -1;
+  p->stdout_fd = -1;
+  p->stderr_fd = -1;
+}
+
+// One read from a pipe: the count, 0 at end of file (the child closed its
+// end), or a negative error.
+export fn proc_read(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var want: int64 = n;
+  if (want > (int64)0x7FFFFFFF) { want = (int64)0x7FFFFFFF; }
+  var got: uint32 = 0;
+  if (proc_w_read(fd, buf, (uint32)want, &got, (uint8*)0) == 0) {
+    var e: uint32 = proc_w_error();
+    if (e == (uint32)PROC_EPIPE) { return 0; }
+    return -(int64)e;
+  }
+  return (int64)got;
+}
+
+// One write to a pipe: the count written, or -PROC_EPIPE when the child has
+// closed its end.
+export fn proc_write(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var want: int64 = n;
+  if (want > (int64)0x7FFFFFFF) { want = (int64)0x7FFFFFFF; }
+  var put: uint32 = 0;
+  if (proc_w_write(fd, buf, (uint32)want, &put, (uint8*)0) == 0) { return proc_fail(); }
+  return (int64)put;
+}
+
+// ---- capture ---------------------------------------------------------------
+
+// What the stdin writer thread works from.
+struct ProcFeed {
+  h: int64;
+  buf: uint8*;
+  n: int64;
+}
+
+// The writer thread: sends everything, closes the pipe so the child sees end
+// of file, and frees its own arguments. It stops early if the child closes
+// its end.
+fn proc_feed_thread(arg: uint8*) -> uint32 {
+  var feed: ProcFeed* = (ProcFeed*)arg;
+  var sent: int64 = 0;
+  while (sent < feed->n) {
+    var r: int64 = proc_write(feed->h, feed->buf + sent, feed->n - sent);
+    if (r <= 0) { break; }
+    sent = sent + r;
+  }
+  proc_w_close(feed->h);
+  free(feed);
+  return (uint32)0;
+}
+
+// Moves what is waiting in a pipe into b without blocking. Returns 1 if it
+// did something (data, or the end of the pipe), else 0.
+fn proc_drain(fdp: int64*, b: StrBuf*, buf: uint8*) -> int32 {
+  var avail: uint32 = 0;
+  if (proc_w_peek(*fdp, (uint8*)0, (uint32)0, (uint32*)0, &avail, (uint32*)0) == 0) {
+    proc_w_close(*fdp);      // broken pipe: the child and its helpers are done
+    *fdp = -1;
+    return 1;
+  }
+  if (avail == (uint32)0) { return 0; }
+  var want: int64 = (int64)avail;
+  if (want > 65536) { want = 65536; }
+  var r: int64 = proc_read(*fdp, buf, want);
+  if (r > 0) {
+    if (b != (StrBuf*)0) { strbuf_append_bytes(b, (cstring)buf, r); }
+    return 1;
+  }
+  proc_w_close(*fdp);
+  *fdp = -1;
+  return 1;
+}
+
+fn proc_now_ms() -> int64 { return (int64)proc_w_tick(); }
+
+// Feeds stdin_text to the child's stdin and collects its stdout and stderr
+// into out and err (either may be 0 to discard). Only the pipes that exist
+// are used. Stdin is closed once the text is sent. After timeout_ms
+// (negative: no limit) the child is ended and reaped, and the call returns
+// -PROC_ETIMEDOUT. Otherwise it waits for the child and returns 0. st gets
+// the final status. All the pipe ends are closed on return.
+export fn proc_communicate(p: Proc*, stdin_text: string, out: StrBuf*, err: StrBuf*, timeout_ms: int64, st: ProcStatus*) -> int64 {
+  var buf: uint8* = malloc(65536);
+  if (buf == (uint8*)0) { return -PROC_ENOMEM; }
+  var deadline: int64 = 0;
+  if (timeout_ms >= 0) { deadline = proc_now_ms() + timeout_ms; }
+  var writer: int64 = 0;
+  if (p->stdin_fd >= 0) {
+    if (stdin_text.length == 0) {
+      proc_close_stdin(p);
+    } else {
+      // The thread owns the pipe and the feed block from here.
+      var feed: ProcFeed* = (ProcFeed*)malloc((int64)sizeof(ProcFeed));
+      if (feed != (ProcFeed*)0) {
+        feed->h = p->stdin_fd;
+        feed->buf = stdin_text.chars;
+        feed->n = (int64)stdin_text.length;
+        writer = proc_w_create_thread((uint8*)0, (uint64)0, (int64)&proc_feed_thread, (uint8*)feed, (uint32)0, (uint32*)0);
+        if (writer == 0) { free(feed); }
+      }
+      if (writer == 0) {
+        proc_close_stdin(p);
+      } else {
+        p->stdin_fd = -1;
+      }
+    }
+  }
+
+  var timed_out: bool = false;
+  while (p->stdout_fd >= 0 || p->stderr_fd >= 0) {
+    var moved: int32 = 0;
+    if (p->stdout_fd >= 0) { moved = moved + proc_drain(&p->stdout_fd, out, buf); }
+    if (p->stderr_fd >= 0) { moved = moved + proc_drain(&p->stderr_fd, err, buf); }
+    if (moved == 0) {
+      if (timeout_ms >= 0 && proc_now_ms() >= deadline) {
+        timed_out = true;
+        break;
+      }
+      proc_w_sleep((uint32)1);
+    }
+  }
+  free(buf);
+
+  var rc: int64 = 0;
+  if (!timed_out) {
+    var left: int64 = -1;
+    if (timeout_ms >= 0) {
+      left = deadline - proc_now_ms();
+      if (left < 0) { left = 0; }
+    }
+    var r: int64 = proc_wait_timeout(p, left, st);
+    if (r < 0) { rc = r; }
+    if (r == 0) { timed_out = true; }
+  }
+  if (timed_out || rc < 0) {
+    proc_send(p, PROC_SIGKILL);
+    proc_wait(p, st);
+  }
+  proc_close(p);
+  if (writer != 0) {
+    // The pipe is broken now, so the writer ends; it reads stdin_text, so wait for it.
+    proc_w_wait(writer, (uint32)0xFFFFFFFF);
+    proc_w_close(writer);
+  }
+  if (timed_out) { return -PROC_ETIMEDOUT; }
+  return rc;
+}
+
+// Runs a program to completion with stdin fed from stdin_text and stdout and
+// stderr captured into out and err (see proc_communicate). Returns 0, a
+// spawn error (-PROC_ENOENT ...), or -PROC_ETIMEDOUT after the child was
+// ended. st gets the exit status.
+export fn proc_run(argv: string[], stdin_text: string, out: StrBuf*, err: StrBuf*, timeout_ms: int64, st: ProcStatus*) -> int64 {
+  var o: ProcOptions;
+  proc_options_init(&o, argv);
+  o.stdin = PROC_PIPE;
+  o.stdout = PROC_PIPE;
+  o.stderr = PROC_PIPE;
+  var p: Proc;
+  var r: int64 = proc_spawn(&o, &p);
+  if (r < 0) { return r; }
+  return proc_communicate(&p, stdin_text, out, err, timeout_ms, st);
+}
+
+// ---- signals ---------------------------------------------------------------
+
+// Not supported on Windows: returns -PROC_ENOSYS.
+export fn proc_signal_fd(signals: int32[..]) -> int64 {
+  return -PROC_ENOSYS;
+}
+
+// Not supported on Windows: returns -PROC_ENOSYS.
+export fn proc_signal_read(fd: int64) -> int32 {
+  return -PROC_ENOSYS;
+}
+
+// Nothing to release on Windows.
+export fn proc_signal_release(fd: int64, signals: int32[..]) {
+}

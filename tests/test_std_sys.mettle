@@ -1,0 +1,123 @@
+// std/random, std/env and file mapping in std/file. Linux runs the checks;
+// elsewhere it only checks that it builds.
+import "std/random";
+import "std/env";
+import "std/file";
+import "std/io";
+import "process_test_os/linux" if linux;
+import "process_test_os/other" if macos;
+import "process_test_os/other" if windows;
+
+fn check(ok: bool, id: int32) -> int32 {
+  if (!ok) {
+    println("test_std_sys: check {id} failed");
+    return id;
+  }
+  return 0;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (PROC_TEST_RUNS == 0) { return 0; }
+
+  // ---- random ----
+  var a: uint8[64];
+  var b: uint8[64];
+  if (random_bytes(&a[0], 64) != 0 || random_bytes(&b[0], 64) != 0) { return check(false, 1); }
+  var same: int32 = 0;
+  for i in 0..64 {
+    if (a[i] == b[i]) { same = same + 1; }
+  }
+  if (same > 16) { return check(false, 2); }   // two random blocks agree on ~1/256 of bytes
+  var big: uint8[100000];
+  if (random_bytes(&big[0], 100000) != 0) { return check(false, 3); }
+  var seen: int32[256];
+  for i in 0..100000 { seen[(int64)big[i]] = seen[(int64)big[i]] + 1; }
+  for i in 0..256 {
+    if (seen[i] < 250 || seen[i] > 550) { return check(false, 4); }   // ~390 each
+  }
+  var hits: int32[10];
+  for i in 0..10000 {
+    var v: uint64 = random_below((uint64)10);
+    if (v >= (uint64)10) { return check(false, 5); }
+    hits[(int64)v] = hits[(int64)v] + 1;
+  }
+  for i in 0..10 {
+    if (hits[i] < 800 || hits[i] > 1200) { return check(false, 6); }
+  }
+  for i in 0..1000 {
+    var r: int64 = random_range(-3, 3);
+    if (r < -3 || r > 3) { return check(false, 7); }
+    var f: float64 = random_float64();
+    if (f < 0.0 || f >= 1.0) { return check(false, 8); }
+  }
+  if (random_below((uint64)0) != (uint64)0 || random_range(5, 5) != 5) { return check(false, 9); }
+
+  // ---- environment ----
+  match (env_get("PATH")) {
+    case Some(p): { if (p.length == (uint64)0) { return check(false, 10); } }
+    case None: { return check(false, 11); }
+  }
+  if (env_has("TEST_STD_SYS_UNSET_NAME")) { return check(false, 12); }
+  if (env_get_or("TEST_STD_SYS_UNSET_NAME", "dflt") != "dflt") { return check(false, 13); }
+  if (env_set("TEST_STD_SYS_VAR", "one two") != 0) { return check(false, 14); }
+  if (env_get_or("TEST_STD_SYS_VAR", "") != "one two") { return check(false, 15); }
+  env_set("TEST_STD_SYS_VAR", "three");
+  if (env_get_or("TEST_STD_SYS_VAR", "") != "three") { return check(false, 16); }
+  if (env_set("BAD=NAME", "x") != -22 || env_set("", "x") != -22) { return check(false, 17); }
+  var lb: uint8[4096];
+  var ln: int64 = env_list(&lb[0], 4096, "TEST_STD_SYS_");
+  if (str_eq_bytes(&lb[0], ln, "TEST_STD_SYS_VAR=three\n") == false) { return check(false, 18); }
+
+  // ---- arguments: the same as main's ----
+  var args: string[16];
+  var n: int32 = env_args(&args[0], 16);
+  if (n != argc || n < 1) { return check(false, 19); }
+  for i in 0..n {
+    if (i >= 16) { break; }
+    var k: int64 = 0;
+    while (argv[i][k] != (uint8)0) { k = k + 1; }
+    if ((int64)args[i].length != k) { return check(false, 20); }
+    for j in 0..k {
+      if ((uint8)args[i][j] != argv[i][j]) { return check(false, 21); }
+    }
+  }
+
+  // ---- file mapping ----
+  var path: string = "test_std_sys_map.tmp";
+  file_remove(path);
+  var fd: int64 = file_open(path, FILE_READ | FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return check(false, 30); }
+  // 200 KiB, so an offset past 64 KiB checks the alignment.
+  if (file_truncate(fd, 204800) != 0) { return check(false, 31); }
+  var msg: string = "mapped";
+  file_write_at(fd, msg.chars, 6, 70000);
+  var m: FileMap;
+  if (file_map(fd, 70000, 1000, FILE_MAP_READ | FILE_MAP_WRITE, &m) != 0) { return check(false, 32); }
+  if (m.length != 1000 || m.data[0] != (uint8)109 || m.data[5] != (uint8)100) { return check(false, 33); }
+  // A write through the map reaches the file.
+  m.data[0] = (uint8)77;
+  if (file_map_sync(&m) != 0) { return check(false, 34); }
+  var back: uint8[8];
+  file_read_at(fd, &back[0], 6, 70000);
+  if (back[0] != (uint8)77 || back[1] != (uint8)97) { return check(false, 35); }
+  if (file_unmap(&m) != 0 || file_unmap(&m) != 0) { return check(false, 36); }
+  // A private map's writes stay in this process.
+  var pm: FileMap;
+  if (file_map(fd, 0, 204800, FILE_MAP_READ | FILE_MAP_WRITE | FILE_MAP_PRIVATE, &pm) != 0) { return check(false, 37); }
+  pm.data[70000] = (uint8)88;
+  file_read_at(fd, &back[0], 1, 70000);
+  if (back[0] != (uint8)77 || pm.data[70001] != (uint8)97) { return check(false, 38); }
+  file_unmap(&pm);
+  if (file_map(fd, 0, 0, FILE_MAP_READ, &pm) == 0) { return check(false, 39); }
+  file_close(fd);
+  file_remove(path);
+  return 0;
+}
+
+fn str_eq_bytes(p: uint8*, n: int64, want: string) -> bool {
+  if (n != (int64)want.length) { return false; }
+  for i in 0..n {
+    if (p[i] != (uint8)want[i]) { return false; }
+  }
+  return true;
+}

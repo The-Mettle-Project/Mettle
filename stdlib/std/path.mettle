@@ -1,0 +1,194 @@
+// Path text helpers. Pure: no operating system calls, the same on every
+// platform, and they run under `mettle test`. The separator is '/'. A
+// backslash is an ordinary byte here.
+//
+// path_base, path_dir, path_ext and path_stem return views into the string
+// you gave them. Nothing is copied or allocated, so keep the original alive
+// while you use the view. path_join and path_clean write into a buffer you
+// supply and return its length, or -PATH_ERANGE when the result and its NUL
+// do not fit.
+//
+// The cleaning rules are those of Go's path.Clean.
+
+export const PATH_ERANGE = 34;   // the buffer is too small
+
+// Byte i of the text a + "/" + b. With joined false the text is just a.
+fn path_byte(a: string, b: string, la: int64, i: int64) -> int32 {
+  if (i < la) { return (int32)a.chars[i]; }
+  if (i == la) { return 47; }
+  return (int32)b.chars[i - la - 1];
+}
+
+// Adds c to buf at w, keeping one byte free for the NUL. False if full.
+fn path_put(buf: uint8*, cap: int64, w: int64*, c: int32) -> bool {
+  if (*w + 1 >= cap) { return false; }
+  buf[*w] = (uint8)c;
+  *w = *w + 1;
+  return true;
+}
+
+// Cleans the text a (or a + "/" + b when joined) into buf. The output is
+// never longer than the input, except that an empty input becomes ".". The
+// write position never passes the read position, so buf may overlap a.
+fn path_clean_core(a: string, b: string, joined: bool, buf: uint8*, cap: int64) -> int64 {
+  if (cap < 1) { return -(int64)PATH_ERANGE; }
+  var la: int64 = (int64)a.length;
+  var n: int64 = la;
+  if (joined) { n = la + 1 + (int64)b.length; }
+  var rooted: bool = n > 0 && path_byte(a, b, la, 0) == 47;
+  var w: int64 = 0;
+  var r: int64 = 0;
+  var dotdot: int64 = 0;      // output length that ".." may not erase
+  if (rooted) {
+    if (!path_put(buf, cap, &w, 47)) { buf[0] = (uint8)0; return -(int64)PATH_ERANGE; }
+    r = 1;
+    dotdot = 1;
+  }
+  while (r < n) {
+    var c: int32 = path_byte(a, b, la, r);
+    var next: int32 = 0;
+    if (r + 1 < n) { next = path_byte(a, b, la, r + 1); }
+    var third: int32 = 0;
+    if (r + 2 < n) { third = path_byte(a, b, la, r + 2); }
+    var ok: bool = true;
+    if (c == 47) {
+      r = r + 1;                                     // an empty element
+    } else if (c == 46 && (r + 1 == n || next == 47)) {
+      r = r + 1;                                     // "."
+    } else if (c == 46 && next == 46 && (r + 2 == n || third == 47)) {
+      r = r + 2;                                     // ".."
+      if (w > dotdot) {
+        w = w - 1;                                   // drop the last element
+        while (w > dotdot && buf[w] != (uint8)47) { w = w - 1; }
+      } else if (!rooted) {
+        if (w > 0) { ok = path_put(buf, cap, &w, 47); }
+        if (ok) { ok = path_put(buf, cap, &w, 46); }
+        if (ok) { ok = path_put(buf, cap, &w, 46); }
+        dotdot = w;
+      }
+    } else {
+      if ((rooted && w != 1) || (!rooted && w != 0)) { ok = path_put(buf, cap, &w, 47); }
+      while (ok && r < n) {
+        var d: int32 = path_byte(a, b, la, r);
+        if (d == 47) { break; }
+        ok = path_put(buf, cap, &w, d);
+        r = r + 1;
+      }
+    }
+    if (!ok) { buf[0] = (uint8)0; return -(int64)PATH_ERANGE; }
+  }
+  if (w == 0) {
+    if (!path_put(buf, cap, &w, 46)) { buf[0] = (uint8)0; return -(int64)PATH_ERANGE; }
+  }
+  buf[w] = (uint8)0;
+  return w;
+}
+
+// Writes the cleaned form of p into buf and returns its length. Cleaning
+// collapses repeated slashes, drops ".", resolves ".." against the element
+// before it, and drops a ".." that would climb above a leading "/". A
+// relative path keeps its leading ".." elements. The result has no trailing
+// slash unless it is the root, and an empty path becomes ".".
+export fn path_clean(p: string, buf: uint8*, cap: int64) -> int64 {
+  return path_clean_core(p, p, false, buf, cap);
+}
+
+// Joins a and b with a slash and cleans the result into buf. An empty a or b
+// is skipped, so joining two empty paths gives "". A b that starts with "/"
+// does not reset the path, as it does in some languages: join("a", "/b") is
+// "a/b".
+export fn path_join(a: string, b: string, buf: uint8*, cap: int64) -> int64 {
+  if (a.length == (uint64)0 && b.length == (uint64)0) {
+    if (cap < 1) { return -(int64)PATH_ERANGE; }
+    buf[0] = (uint8)0;
+    return 0;
+  }
+  if (a.length == (uint64)0) { return path_clean_core(b, b, false, buf, cap); }
+  if (b.length == (uint64)0) { return path_clean_core(a, a, false, buf, cap); }
+  return path_clean_core(a, b, true, buf, cap);
+}
+
+// True if p starts with a slash.
+export fn path_is_abs(p: string) -> bool {
+  return p.length > (uint64)0 && p.chars[0] == (uint8)47;
+}
+
+// The part of p from start up to end, as a view.
+fn path_view(p: string, start: int64, end: int64) -> string {
+  var out: string;
+  out.chars = p.chars + start;
+  out.length = (uint64)(end - start);
+  return out;
+}
+
+// Finds the last element of p, ignoring trailing slashes. *start and *end
+// bound it; they are equal when p is empty or only slashes.
+fn path_last(p: string, start: int64*, end: int64*) {
+  var e: int64 = (int64)p.length;
+  while (e > 0 && p.chars[e - 1] == (uint8)47) { e = e - 1; }
+  var s: int64 = e;
+  while (s > 0 && p.chars[s - 1] != (uint8)47) { s = s - 1; }
+  *start = s;
+  *end = e;
+}
+
+// The last element of p, ignoring trailing slashes. An empty path gives "."
+// and a path of only slashes gives "/".
+export fn path_base(p: string) -> string {
+  if (p.length == (uint64)0) { return "."; }
+  var s: int64 = 0;
+  var e: int64 = 0;
+  path_last(p, &s, &e);
+  if (e == 0) { return path_view(p, 0, 1); }
+  return path_view(p, s, e);
+}
+
+// Everything before the last element, without the slashes that separated
+// them. "a/b/c" gives "a/b", "/a" gives "/", and "a" gives ".". Unlike
+// path_clean it leaves the rest alone: "a//b/c" gives "a//b". Run path_clean
+// on the result if you need that. Following Go, a trailing slash counts as an
+// empty last element, so "a/b/" gives "a/b".
+export fn path_dir(p: string) -> string {
+  var i: int64 = (int64)p.length - 1;
+  while (i >= 0 && p.chars[i] != (uint8)47) { i = i - 1; }
+  if (i < 0) { return "."; }
+  var e: int64 = i + 1;
+  while (e > 0 && p.chars[e - 1] == (uint8)47) { e = e - 1; }
+  if (e == 0) { return path_view(p, 0, 1); }
+  return path_view(p, 0, e);
+}
+
+// Where the extension of the element [s, e) starts, or -1. A dot at the very
+// start of the element is part of the name, so ".bashrc" has none, and "." and
+// ".." have none.
+fn path_dot(p: string, s: int64, e: int64) -> int64 {
+  if (e - s == 1 && p.chars[s] == (uint8)46) { return -1; }
+  if (e - s == 2 && p.chars[s] == (uint8)46 && p.chars[s + 1] == (uint8)46) { return -1; }
+  var d: int64 = e - 1;
+  while (d > s) {
+    if (p.chars[d] == (uint8)46) { return d; }
+    d = d - 1;
+  }
+  return -1;
+}
+
+// The extension of the last element, with its dot: "a/b.tar.gz" gives ".gz".
+// It is "" when there is none. A trailing slash is ignored.
+export fn path_ext(p: string) -> string {
+  var s: int64 = 0;
+  var e: int64 = 0;
+  path_last(p, &s, &e);
+  var d: int64 = path_dot(p, s, e);
+  if (d < 0) { return path_view(p, e, e); }
+  return path_view(p, d, e);
+}
+
+// The last element without its extension: "a/b.tar.gz" gives "b.tar".
+export fn path_stem(p: string) -> string {
+  var s: int64 = 0;
+  var e: int64 = 0;
+  path_last(p, &s, &e);
+  var d: int64 = path_dot(p, s, e);
+  if (d < 0) { return path_view(p, s, e); }
+  return path_view(p, s, d);
+}

@@ -1,0 +1,51 @@
+// Windows consoles for std/term. fd 0, 1 and 2 name the standard input,
+// output and error handles; echo is the console's ENABLE_ECHO_INPUT mode.
+
+extern fn term_w_std_handle(which: uint32) -> int64 = "GetStdHandle";
+extern fn term_w_get_mode(h: int64, mode: uint32*) -> int32 = "GetConsoleMode";
+extern fn term_w_set_mode(h: int64, mode: uint32) -> int32 = "SetConsoleMode";
+extern fn term_w_read(h: int64, buf: uint8*, n: uint32, got: uint32*, ov: uint8*) -> int32 = "ReadFile";
+extern fn term_w_write(h: int64, buf: uint8*, n: uint32, put: uint32*, ov: uint8*) -> int32 = "WriteFile";
+extern fn term_w_error() -> uint32 = "GetLastError";
+
+const ENABLE_ECHO_INPUT = 4;
+
+fn term_handle(fd: int64) -> int64 {
+  // STD_INPUT_HANDLE is -10, STD_OUTPUT_HANDLE -11, STD_ERROR_HANDLE -12.
+  if (fd >= 0 && fd <= 2) { return term_w_std_handle((uint32)(-10 - (int32)fd)); }
+  return fd;
+}
+
+export fn term_is_tty(fd: int64) -> bool {
+  var mode: uint32 = 0;
+  return term_w_get_mode(term_handle(fd), &mode) != 0;
+}
+
+// Turns echo on or off. Returns 1 or 0 for whether echo was on before, or a
+// negative error code when fd is not a console.
+export fn term_set_echo(fd: int64, on: bool) -> int64 {
+  var h: int64 = term_handle(fd);
+  var mode: uint32 = 0;
+  if (term_w_get_mode(h, &mode) == 0) { return -(int64)term_w_error(); }
+  var was: int64 = 0;
+  if ((mode & (uint32)ENABLE_ECHO_INPUT) != (uint32)0) { was = 1; }
+  if (on) {
+    mode = mode | (uint32)ENABLE_ECHO_INPUT;
+  } else {
+    mode = mode & ~(uint32)ENABLE_ECHO_INPUT;
+  }
+  if (term_w_set_mode(h, mode) == 0) { return -(int64)term_w_error(); }
+  return was;
+}
+
+export fn term_os_read(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var got: uint32 = 0;
+  if (term_w_read(term_handle(fd), buf, (uint32)n, &got, (uint8*)0) == 0) { return -(int64)term_w_error(); }
+  return (int64)got;
+}
+
+export fn term_os_write(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var put: uint32 = 0;
+  if (term_w_write(term_handle(fd), buf, (uint32)n, &put, (uint8*)0) == 0) { return -(int64)term_w_error(); }
+  return (int64)put;
+}

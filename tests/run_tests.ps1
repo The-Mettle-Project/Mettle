@@ -1851,6 +1851,11 @@ $cases = @(
   @{ Name = "std_file"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true },
   @{ Name = "std_file_release"; Path = "tests/test_std_file.mettle"; ShouldSucceed = $true; Args = @("--release") },
   @{ Name = "import_guard_arch"; Path = "tests/test_import_guard_arch.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_path"; Path = "tests/test_std_path_interp.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_path_release"; Path = "tests/test_std_path_interp.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_path_interp"; Path = "tests/test_std_path_interp.mettle"; ShouldSucceed = $true
+     Args = @("test")
+     SkipBinaryCheck = $true },
   @{ Name = "std_http2"; Path = "tests/test_std_http2.mettle"; ShouldSucceed = $true },
   @{ Name = "std_http2_release"; Path = "tests/test_std_http2.mettle"; ShouldSucceed = $true; Args = @("--release") },
   @{ Name = "std_http2_interp"; Path = "tests/test_std_http2_interp.mettle"; ShouldSucceed = $true
@@ -3264,7 +3269,14 @@ if ($IsLinux) {
     @{ Name = "std_http_release"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_sync"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true },
     @{ Name = "std_sync_release"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true; Args = @("--release") },
-    @{ Name = "mutex_timeout_deadline"; Path = "tests/test_mutex_timeout_deadline.mettle"; ShouldSucceed = $true }
+    @{ Name = "mutex_timeout_deadline"; Path = "tests/test_mutex_timeout_deadline.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_process"; Path = "tests/test_std_process.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_process_release"; Path = "tests/test_std_process.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_sys"; Path = "tests/test_std_sys.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_sys_release"; Path = "tests/test_std_sys.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_term"; Path = "tests/test_std_term.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_fs"; Path = "tests/test_std_fs.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_fs_release"; Path = "tests/test_std_fs.mettle"; ShouldSucceed = $true; Args = @("--release") }
   )
 }
 

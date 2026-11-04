@@ -1,0 +1,16 @@
+// Linux randomness for std/random: the getrandom system call, which reads
+// the kernel's pool and blocks only until it is first seeded at boot.
+
+import "std/linux_sys";
+
+// Fills buf with n random bytes. Returns 0, or a negative error code.
+export fn random_os_fill(buf: uint8*, n: int64) -> int64 {
+  var done: int64 = 0;
+  while (done < n) {
+    var r: int64 = syscall(LINUX_SYS_GETRANDOM, buf + done, n - done, 0);
+    if (r == -4) { continue; }   // EINTR
+    if (r < 0) { return r; }
+    done = done + r;
+  }
+  return 0;
+}
