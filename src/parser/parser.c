@@ -7819,6 +7819,19 @@ static int parser_expect_open_brace_after(Parser *parser, const char *group) {
   return 0;
 }
 
+static int parser_expect_subject_body(Parser *parser, const char *keyword,
+                                      int subject_is_bare) {
+  parser_skip_newlines(parser);
+  if (subject_is_bare && parser->current_token.type != TOKEN_LBRACE) {
+    char message[PARSER_ERROR_BUF_SIZE];
+    snprintf(message, sizeof(message),
+             "Expected '(' after '%s', or a subject and then '{'", keyword);
+    parser_set_error(parser, message);
+    return 0;
+  }
+  return parser_expect(parser, TOKEN_LBRACE);
+}
+
 static ASTNode *parser_parse_if_arm(Parser *parser, int as_value,
                                     int needs_block, const char *group) {
   if (needs_block && !parser_expect_open_brace_after(parser, group)) {
@@ -8956,8 +8969,7 @@ static ASTNode *parser_parse_switch_core(Parser *parser, int as_value) {
     return NULL;
   }
 
-  parser_skip_newlines(parser);
-  if (!parser_expect(parser, TOKEN_LBRACE)) {
+  if (!parser_expect_subject_body(parser, "switch", subject_needs_block)) {
     ast_destroy_node(expression);
     return NULL;
   }
@@ -9135,8 +9147,7 @@ static ASTNode *parser_parse_match_core(Parser *parser, int is_expression) {
       parser_parse_condition(parser, "subject of 'match'", &subject_needs_block);
   if (!expr)
     return NULL;
-  parser_skip_newlines(parser);
-  if (!parser_expect(parser, TOKEN_LBRACE)) {
+  if (!parser_expect_subject_body(parser, "match", subject_needs_block)) {
     ast_destroy_node(expr);
     return NULL;
   }
