@@ -53,10 +53,11 @@ elements, unknown field names, and repeated field names are errors.
 ## What ran what
 
 [Bare metal](bare-metal.md) carries one table of every machine claim, what
-actually ran it, and where the evidence stops: AArch64 is proven on a
-user-mode emulator and not on silicon, the GPU backends are proven well-formed
-and not executed, and the 16-bit image is proven by its bytes and not by a
-boot. Read that table before quoting any of them.
+actually ran it, and where the evidence stops. The full AArch64 fixture set runs
+on a user-mode emulator, and a smaller set runs on ARM hardware. The suite checks
+PTX and SPIR-V for form and runs neither. Metal kernels have run on an M4 Pro.
+The 16-bit image is proven by its bytes and not by a boot. Read that table before
+quoting any of them.
 
 ## Described calling conventions
 
@@ -469,11 +470,11 @@ rule. `--profile-runtime` is the built-in alternative.
 
 ## macOS and Metal
 
-None of the Mac path has run on Apple hardware yet: the Mach-O link through
-`cc`, the hosted runtime's Apple branches, the Darwin Makefile, and the
-Objective-C calls that drive Metal. The `macos` CI job runs them on GitHub's
-Apple silicon runners and does not yet gate a merge. What is checked without
-a Mac is listed in [macOS and Metal](macos.md#what-has-run-where).
+The `macos` CI job runs the Mach-O link through `cc`, the hosted runtime's Apple
+branches and the Darwin Makefile on GitHub's Apple silicon runners, and does not
+yet gate a merge. Those runners have no Metal 3 device, so the job compiles
+kernels and runs none. Kernels have run on an M4 Pro. The full list is in
+[macOS and Metal](macos.md#what-has-run-where).
 
 On x86-64 macOS, Mettle code cannot read a variable that lives in a dynamic
 library; it can call the library's functions. A Mac program cannot link

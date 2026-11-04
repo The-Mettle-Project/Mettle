@@ -338,13 +338,13 @@ r0 = 55</span></pre></li>
   <h2>Running programs</h2>
   <ul class="can">
     <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/live.md">Change a running program</a></h3><p><code>mettle live</code> turns every save into a patch: function bodies, signatures and struct layouts. Frames move to the new code, heap objects convert in place, <code>--live-undo</code> takes it back, and <code>--live-at-tick</code> lands a patch on the same frame in every running copy. Windows and Linux x64.</p></li>
-    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/live.md">Recover from a crash</a></h3><p>A fault waits for the save that fixes it, then the program continues from its last <code>quiesce</code>. In this recording the fix landed in 256 ms.</p>
-      <pre class="snip"><span class="out"><span class="err"> 11.67  Fatal error: array index out of bounds (index 9001, length 64)</span>
-<span class="dim"> 11.67  [live] main stopped at the fault. Save a fix and it continues from its last quiesce point</span>
-<span class="ok"> 17.67  saved settle.mettle</span>
-<span class="dim"> 17.93  [live] main continues from its last quiesce point</span>
- 17.93  record 1500000 held: merchant 9001 does not exist
- 53.03  checksum 227638721867543</span></pre></li>
+    <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/live.md">Recover from a crash</a></h3><p>A fault waits for the save that fixes it, then the program continues from its last <code>quiesce</code>. In this recording the fix landed in 223 ms.</p>
+      <pre class="snip"><span class="out"><span class="err"> 11.66  Fatal error: array index out of bounds (index 9001, length 64)</span>
+<span class="dim"> 11.66  [live] main stopped at the fault. Save a fix and it continues from its last quiesce point</span>
+<span class="ok"> 17.66  saved settle.mettle</span>
+<span class="dim"> 17.89  [live] main continues from its last quiesce point</span>
+ 17.89  record 1500000 held: merchant 9001 does not exist
+ 52.99  checksum 227638721867543</span></pre></li>
     <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Crash reports and debugging</a></h3><p>A linked executable names the exception, the function and the stack by default, and <code>-s</code> gets the exact statement. <code>-g</code> writes DWARF, and <code>--debug-hooks</code> instruments a build for the interactive debugger.</p></li>
     <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/compilation.md">Profilers</a></h3><p><code>--profile-runtime</code> times functions, <code>--profile-runtime-ops</code> counts op classes and <code>--profile-blocks</code> counts basic blocks.</p></li>
     <li><h3><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/rules.md">Record a run</a></h3><p><code>--record-trace</code> writes down calls, allocations, frees and locks, and <code>mettle check-trace</code> holds the recording to your rules.</p></li>
@@ -394,7 +394,7 @@ r0 = 55</span></pre></li>
       <li><a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/known-limitations.md">What does not work yet</a></li>
       <li><a href="https://github.com/The-Mettle-Project/Mettle">Source</a></li>
     </ul>
-    <p class="fine">Developed by <a href="https://systm.co.za/">Systm</a>. Apache 2.0. Compiler output from mettle v0.17.0. Footage by <a href="https://www.pexels.com/video/falling-16296843/">Film Composite</a>, <a href="https://www.pexels.com/video/the-center-of-the-milky-way-galaxy-27254149/">Luz Calor Som</a>, <a href="https://www.pexels.com/video/dramatic-lava-flow-at-active-volcano-eruption-30401545/">Gylfi Gylfason</a> and <a href="https://www.pexels.com/video/dramatic-aerial-view-of-utah-s-rugged-canyons-34305686/">Alex Moliski</a>. Dither after <a href="https://motion-core.dev/docs/dithered-image">Motion Core</a>.</p>
+    <p class="fine">Developed by <a href="https://systm.co.za/">Systm</a>. Apache 2.0. Compiler output from mettle v0.18.0. Footage by <a href="https://www.pexels.com/video/falling-16296843/">Film Composite</a>, <a href="https://www.pexels.com/video/the-center-of-the-milky-way-galaxy-27254149/">Luz Calor Som</a>, <a href="https://www.pexels.com/video/dramatic-lava-flow-at-active-volcano-eruption-30401545/">Gylfi Gylfason</a> and <a href="https://www.pexels.com/video/dramatic-aerial-view-of-utah-s-rugged-canyons-34305686/">Alex Moliski</a>. Dither after <a href="https://motion-core.dev/docs/dithered-image">Motion Core</a>.</p>
   </div>
 </footer>
 

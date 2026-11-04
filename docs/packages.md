@@ -122,7 +122,7 @@ version = 1.0.0
 description = One line on what it does
 license = MIT
 source = https://github.com/you/mylib
-compiler = 0.17.0
+compiler = 0.18.0
 require = sha256 1.0.0
 ```
 

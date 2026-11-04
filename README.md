@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/master/in
 irm https://raw.githubusercontent.com/The-Mettle-Project/Mettle/master/install.ps1 | iex
 ```
 
-These install v0.17.0. Live programs, rules, target descriptions and Metal are newer, so until the next release, build them from source with `make -j"$(nproc)"` on Linux or `.\build.bat` on Windows.
+These install v0.18.0. To build from source, run `make -j"$(nproc)"` on Linux or `.\build.bat` on Windows.
 
 [Getting started](docs/getting-started.md) | [Documentation](docs/README.md) | [What does not work yet](docs/known-limitations.md) | [Contributing](.github/CONTRIBUTING.md)
 
