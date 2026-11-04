@@ -1,0 +1,34 @@
+// macOS clocks for std/time. CLOCK_REALTIME is 0 and CLOCK_MONOTONIC is 6.
+
+extern fn time_os_clock_gettime(clk_id: int32, ts: int64*) -> int32 = "clock_gettime";
+extern fn time_os_nanosleep(req: int64*, rem: int64*) -> int32 = "nanosleep";
+
+fn time_os_read(clk_id: int32) -> int64 {
+  var ts: int64[2];
+  if (time_os_clock_gettime(clk_id, &ts[0]) != 0) { return (int64)0; }
+  return ts[0] * (int64)1000000000 + ts[1];
+}
+
+// Nanoseconds since 1970-01-01 00:00:00 UTC.
+export fn time_unix_ns() -> int64 {
+  return time_os_read(0);
+}
+
+// Nanoseconds on a clock that never jumps. Only differences mean anything.
+export fn time_mono_ns() -> int64 {
+  return time_os_read(6);
+}
+
+// Sleeps at least ns nanoseconds, resuming after a signal.
+export fn time_sleep_ns(ns: int64) {
+  if (ns <= (int64)0) { return; }
+  var req: int64[2];
+  var rem: int64[2];
+  req[0] = ns / (int64)1000000000;
+  req[1] = ns % (int64)1000000000;
+  while (time_os_nanosleep(&req[0], &rem[0]) != 0) {
+    if (rem[0] <= (int64)0 && rem[1] <= (int64)0) { return; }
+    req[0] = rem[0];
+    req[1] = rem[1];
+  }
+}
