@@ -1,0 +1,8 @@
+fn leak() -> int32* {
+  var x: int32 = 1;
+  if (x > 0) { &x } else { 0 }
+}
+
+fn main() -> int32 {
+  return 0;
+}

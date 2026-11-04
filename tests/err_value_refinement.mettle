@@ -1,0 +1,7 @@
+type Positive = int32 where value > 0;
+
+fn main() -> int32 {
+  var n: int32 = 1;
+  var p: Positive = if (n > 0) { -1 } else { 2 };
+  return (int32)p;
+}

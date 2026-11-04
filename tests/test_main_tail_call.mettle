@@ -1,0 +1,7 @@
+fn status() -> int32 {
+  return 7;
+}
+
+fn main() -> int32 {
+  status()
+}

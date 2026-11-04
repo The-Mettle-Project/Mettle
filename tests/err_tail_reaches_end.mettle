@@ -1,0 +1,9 @@
+fn nothing() { }
+
+fn pick(n: int32) -> int32 {
+  if (n > 0) { 1 } else { nothing(); }
+}
+
+fn main() -> int32 {
+  return pick(1);
+}

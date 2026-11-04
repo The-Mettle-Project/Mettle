@@ -572,6 +572,7 @@ static MemLocal *mem_addr_root_local(MemCtx *ctx, ASTNode *expr) {
 }
 
 static void mem_walk_expr(MemCtx *ctx, ASTNode *expr);
+static void mem_walk_statement(MemCtx *ctx, ASTNode *statement);
 
 static void mem_check_null_deref(MemCtx *ctx, ASTNode *pointer_expr,
                                  SourceLocation loc) {
@@ -1386,7 +1387,8 @@ static int mem_ast_contains_exit(ASTNode *node) {
   }
   if (node->type == AST_BREAK_STATEMENT ||
       node->type == AST_CONTINUE_STATEMENT ||
-      node->type == AST_RETURN_STATEMENT) {
+      node->type == AST_RETURN_STATEMENT ||
+      node->type == AST_YIELD_STATEMENT) {
     return 1;
   }
   switch (node->type) {
@@ -1836,6 +1838,13 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
       if (local && local->is_pointer) {
         local->escaped = 1;
       }
+    }
+    return;
+  }
+  case AST_VALUE_SCOPE: {
+    ValueScope *scope = (ValueScope *)expr->data;
+    if (scope) {
+      mem_walk_statement(ctx, scope->body);
     }
     return;
   }
@@ -2307,6 +2316,21 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
   }
   case AST_RETURN_STATEMENT:
     mem_walk_return(ctx, statement);
+    return;
+  case AST_YIELD_STATEMENT: {
+    YieldStatement *yield = (YieldStatement *)statement->data;
+    if (yield && yield->value) {
+      mem_walk_expr(ctx, yield->value);
+      MemLocal *source = mem_expr_as_local(ctx, yield->value);
+      if (source && source->is_pointer) {
+        source->escaped = 1;
+        mem_collect_param_store(ctx, source);
+      }
+    }
+    return;
+  }
+  case AST_VALUE_SCOPE:
+    mem_walk_expr(ctx, statement);
     return;
   case AST_IF_STATEMENT: {
     IfStatement *if_stmt = (IfStatement *)statement->data;

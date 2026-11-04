@@ -1,0 +1,6 @@
+fn main() -> int32 {
+  var a: int32 = 1;
+  var b: int64 = 2;
+  var x = if (a > 0) { a } else { b };
+  return (int32)x;
+}

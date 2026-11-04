@@ -32,6 +32,12 @@ typedef struct {
   int expression_depth;
   ASTNode *extra_declarations[2];
   size_t extra_declaration_count;
+  int next_value_scope;
+  const char **active_labels;
+  size_t active_label_count;
+  int loop_else_blocked;
+  int bare_value_arm;
+  int in_case_label;
 } Parser;
 
 #define PARSER_MAX_EXPRESSION_DEPTH 4096

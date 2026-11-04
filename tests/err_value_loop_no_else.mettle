@@ -1,0 +1,5 @@
+fn main() -> int32 {
+  var n: int32 = 1;
+  var x = while (n > 0) { break 3; };
+  return x;
+}

@@ -489,6 +489,34 @@ static int ir_zero_fill_is_dead(IRLoweringContext *context, const char *name,
 static int ir_lower_gpu_launch(IRLoweringContext *context,
                                IRFunction *function, ASTNode *statement);
 
+int ir_store_named_local_value(IRLoweringContext *context, IRFunction *function,
+                               const char *local_name, Type *local_type,
+                               IROperand *value, SourceLocation location) {
+  if (ir_try_emit_aggregate_symbol_memcpy(context, function, local_name, value,
+                                          local_type, location)) {
+    return 1;
+  }
+  if (ir_small_float_local(context, function, local_name, local_name,
+                           local_type)) {
+    return ir_emit_small_float_home_store(context, function, local_name,
+                                          local_type, value, location);
+  }
+  IRInstruction assign = {0};
+  assign.op = IR_OP_ASSIGN;
+  assign.location = location;
+  assign.dest = ir_operand_symbol(local_name);
+  assign.lhs = *value;
+  ir_assign_apply_float_bits(&assign, &assign.lhs,
+                             ir_named_type_float_bits(context, local_type->name));
+  if (!assign.dest.name) {
+    ir_set_error(context, "Out of memory while storing a value");
+    return 0;
+  }
+  int ok = ir_emit(context, function, &assign);
+  ir_operand_destroy(&assign.dest);
+  return ok;
+}
+
 static int ir_lower_var_initializer(IRLoweringContext *context,
                                     IRFunction *function,
                                     VarDeclaration *declaration,
@@ -1593,7 +1621,12 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
       !ir_lower_live_mark(context, function, 1, statement->location)) {
     return 0;
   }
+  IRDeferScope *saved_defers = context->current_defers;
+  if (defers) {
+    context->current_defers = defers;
+  }
   ok = ir_lower_statement_unmarked(context, function, statement, defers);
+  context->current_defers = saved_defers;
   if (ok && marked) {
     ok = ir_lower_live_mark(context, function, 0, statement->location);
   }
@@ -1706,17 +1739,18 @@ static int ir_lower_statement_unmarked(IRLoweringContext *context,
   case AST_SWITCH_STATEMENT:
     return ir_lower_switch_statement(context, function, statement, defers);
 
-  case AST_MATCH_STATEMENT: {
-    MatchStatement *m = (MatchStatement *)statement->data;
-    if (m && m->is_expression) {
-      IROperand discarded = ir_operand_none();
-      int r = ir_lower_match_expression(context, function, statement,
-                                        &discarded);
-      ir_operand_destroy(&discarded);
-      return r;
-    }
+  case AST_MATCH_STATEMENT:
     return ir_lower_match_statement(context, function, statement, defers);
+
+  case AST_VALUE_SCOPE: {
+    IROperand discarded = ir_operand_none();
+    int lowered = ir_lower_value_scope(context, function, statement, &discarded);
+    ir_operand_destroy(&discarded);
+    return lowered;
   }
+
+  case AST_YIELD_STATEMENT:
+    return ir_lower_yield_statement(context, function, statement, defers);
 
   case AST_FALLTHROUGH_STATEMENT:
     return ir_lower_fallthrough_statement(context, function, statement, defers);

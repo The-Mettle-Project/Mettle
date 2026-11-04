@@ -1356,6 +1356,20 @@ static int rewrite_branch_names(ASTNode *node, const NameRewrite *rewrites,
                               bindings, binding_count, scope, 1);
   }
 
+  case AST_VALUE_SCOPE: {
+    ValueScope *value_scope = (ValueScope *)node->data;
+    return !value_scope || !value_scope->body ||
+           rewrite_node_names(value_scope->body, rewrites, rewrite_count,
+                              bindings, binding_count, scope, 1);
+  }
+
+  case AST_YIELD_STATEMENT: {
+    YieldStatement *yield = (YieldStatement *)node->data;
+    return !yield || !yield->value ||
+           rewrite_node_names(yield->value, rewrites, rewrite_count, bindings,
+                              binding_count, scope, 1);
+  }
+
   case AST_INLINE_ASM: {
     InlineAsm *asm_block = (InlineAsm *)node->data;
     char *rewritten = NULL;
@@ -3118,6 +3132,20 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     }
     return;
   }
+  case AST_VALUE_SCOPE: {
+    ValueScope *value_scope = (ValueScope *)node->data;
+    if (value_scope) {
+      collect_dependency_names(value_scope->body, names, count, capacity);
+    }
+    return;
+  }
+  case AST_YIELD_STATEMENT: {
+    YieldStatement *yield = (YieldStatement *)node->data;
+    if (yield) {
+      collect_dependency_names(yield->value, names, count, capacity);
+    }
+    return;
+  }
   case AST_DEFER_STATEMENT:
   case AST_ERRDEFER_STATEMENT: {
     DeferStatement *defer = (DeferStatement *)node->data;
@@ -3764,6 +3792,22 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
                                       current_file_path, had_error);
         }
       }
+    }
+    break;
+  }
+  case AST_VALUE_SCOPE: {
+    ValueScope *value_scope = (ValueScope *)node->data;
+    if (value_scope && value_scope->body) {
+      process_import_strs_in_node(ctx, value_scope->body, current_file_path,
+                                  had_error);
+    }
+    break;
+  }
+  case AST_YIELD_STATEMENT: {
+    YieldStatement *yield = (YieldStatement *)node->data;
+    if (yield && yield->value) {
+      process_import_strs_in_node(ctx, yield->value, current_file_path,
+                                  had_error);
     }
     break;
   }

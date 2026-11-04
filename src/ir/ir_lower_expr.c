@@ -25,6 +25,7 @@ int ir_lower_statement_or_expression(IRLoweringContext *context,
   case AST_ERRDEFER_STATEMENT:
   case AST_INLINE_ASM:
   case AST_PROGRAM:
+  case AST_YIELD_STATEMENT:
     return ir_lower_statement_with_defers(context, function, node, NULL);
   default: {
     IROperand ignored = ir_operand_none();
@@ -3248,6 +3249,29 @@ static int ir_lower_closure_adapt(IRLoweringContext *context, IRFunction *functi
     return 1;
 }
 
+static int ir_pin_identifier_read(IRLoweringContext *context,
+                                  IRFunction *function, ASTNode *expression,
+                                  IROperand *out_value) {
+  Type *type = expression->resolved_type;
+  if (type->kind == TYPE_ARRAY || type->kind == TYPE_FUNCTION_POINTER ||
+      type_is_comptime_only(type) || !type->name) {
+    return 1;
+  }
+  char *pinned = ir_new_label_name(context, "read");
+  if (!pinned ||
+      !ir_emit_local_declaration(context, function, pinned, type->name,
+                                 expression->location) ||
+      !ir_store_named_local_value(context, function, pinned, type, out_value,
+                                  expression->location)) {
+    free(pinned);
+    return 0;
+  }
+  ir_operand_destroy(out_value);
+  *out_value = ir_operand_symbol(pinned);
+  free(pinned);
+  return out_value->name != NULL;
+}
+
 static int ir_lower_identifier_value(IRLoweringContext *context, IRFunction *function,
                                      ASTNode *expression, IROperand *out_value) {
     Identifier *identifier = (Identifier *)expression->data;
@@ -3297,6 +3321,10 @@ static int ir_lower_identifier_value(IRLoweringContext *context, IRFunction *fun
     if (!out_value->name) {
       ir_set_error(context, "Out of memory while lowering identifier");
       return 0;
+    }
+    if (context->pin_identifier_reads && expression->resolved_type &&
+        ir_local_binding_find(context, identifier->name)) {
+      return ir_pin_identifier_read(context, function, expression, out_value);
     }
     return 1;
 }
@@ -3428,7 +3456,7 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
        expression->type == AST_LAMBDA_EXPRESSION ||
        expression->type == AST_CLOSURE_ADAPT_EXPRESSION ||
        expression->type == AST_NEW_EXPRESSION ||
-       expression->type == AST_MATCH_STATEMENT)) {
+       expression->type == AST_VALUE_SCOPE)) {
     context->address_width_depth = 0;
   }
   lowered = ir_lower_expression_inner(context, function, expression, out_value);
@@ -3563,9 +3591,8 @@ static int ir_lower_expression_inner(IRLoweringContext *context,
     return ir_lower_func_ptr_call(context, function, expression,
                                   out_value);
 
-  case AST_MATCH_STATEMENT:
-    return ir_lower_match_expression(context, function, expression,
-                                     out_value);
+  case AST_VALUE_SCOPE:
+    return ir_lower_value_scope(context, function, expression, out_value);
 
   default:
     ir_set_error(context, "Unsupported expression type in pure IR lowering");

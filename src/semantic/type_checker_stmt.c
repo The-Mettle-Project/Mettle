@@ -1358,6 +1358,11 @@ static int type_checker_check_while(TypeChecker *checker, ASTNode *statement) {
     return 1;
 }
 
+static int type_checker_check_implicit_call(TypeChecker *checker,
+                                            ASTNode *statement,
+                                            ReturnStatement *ret,
+                                            Type *return_type);
+
 static int type_checker_check_return(TypeChecker *checker, ASTNode *statement) {
     ReturnStatement *ret_stmt = (ReturnStatement *)statement->data;
     size_t return_count = ret_stmt
@@ -1370,6 +1375,11 @@ static int type_checker_check_return(TypeChecker *checker, ASTNode *statement) {
                                    ? checker->current_function->data.function
                                          .return_type
                                    : NULL;
+      if (ret_stmt->implicit_tail == RETURN_TAIL_CALL ||
+          ret_stmt->implicit_tail == RETURN_TAIL_MAIN_CALL) {
+        return type_checker_check_implicit_call(checker, statement, ret_stmt,
+                                                func_return_type);
+      }
       FunctionDeclaration *function_decl =
           checker->current_function_decl &&
                   checker->current_function_decl->type == AST_FUNCTION_DECLARATION
@@ -1555,7 +1565,55 @@ static int type_checker_check_break(TypeChecker *checker, ASTNode *statement) {
           "'break %s' has no matching labeled loop", brk->target_label);
       return 0;
     }
+    if (brk && brk->value) {
+      if (brk->value->type == AST_IDENTIFIER && brk->value->data &&
+          !brk->target_label) {
+        const Identifier *id = (const Identifier *)brk->value->data;
+        if (!symbol_table_lookup(checker->symbol_table, id->name)) {
+          type_checker_set_error_at_location(
+              checker, statement->location,
+              "'break %s' has no matching labeled loop", id->name);
+          return 0;
+        }
+      }
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "This 'break' carries a value, but the loop's value goes nowhere: "
+          "use the loop as an expression, or write the value last in a "
+          "function that returns it");
+      return 0;
+    }
     return 1;
+}
+
+static int type_checker_check_implicit_call(TypeChecker *checker,
+                                            ASTNode *statement,
+                                            ReturnStatement *ret,
+                                            Type *return_type) {
+  ASTNode *value = ret->value;
+  Type *found = type_checker_infer_type(checker, value);
+  if (!found) {
+    return 0;
+  }
+  if (type_checker_reject_comptime_escape(checker, value->location, found)) {
+    return 0;
+  }
+  int fits = found->kind != TYPE_VOID && return_type &&
+             (type_checker_takes_null(return_type, value) ||
+              type_checker_is_assignable_from(checker, return_type, found,
+                                              value));
+  if (fits && ret->implicit_tail == RETURN_TAIL_CALL) {
+    type_checker_note_return_range(checker, value);
+    return 1;
+  }
+  if (fits) {
+    error_reporter_add_warning(
+        checker->error_reporter, ERROR_SEMANTIC, value->location,
+        "main drops the value of its last call; write 'return' to make it the "
+        "exit status, or add ';' to say it is dropped");
+  }
+  ast_unwrap_implicit_return(statement);
+  return 1;
 }
 
 static int type_checker_check_continue(TypeChecker *checker, ASTNode *statement) {
@@ -1624,12 +1682,14 @@ static int type_checker_check_statement_body(TypeChecker *checker,
   case AST_SWITCH_STATEMENT:
     return type_checker_check_switch_statement(checker, statement);
 
-  case AST_MATCH_STATEMENT: {
-    MatchStatement *m = (MatchStatement *)statement->data;
-    if (m && m->is_expression)
-      return type_checker_check_match_expression(checker, statement) != NULL;
+  case AST_MATCH_STATEMENT:
     return type_checker_check_match_statement(checker, statement);
-  }
+
+  case AST_VALUE_SCOPE:
+    return type_checker_check_value_scope_statement(checker, statement);
+
+  case AST_YIELD_STATEMENT:
+    return type_checker_check_yield(checker, statement);
 
   case AST_QUIESCE_STATEMENT:
     return 1;
@@ -1707,8 +1767,11 @@ static int type_checker_check_statement_body(TypeChecker *checker,
       break;
     }
     char message[256];
-    snprintf(message, sizeof(message), "This %s is not a statement: %s", shape,
-             why);
+    snprintf(message, sizeof(message), "This %s is not a statement: %s%s", shape,
+             why,
+             checker->value_frame_count > 0
+                 ? "; to make it the value here, write it last with no ';'"
+                 : "");
     type_checker_set_error_at_location(checker, statement->location, message);
     if (checker->error_reporter)
       error_reporter_set_last_label(

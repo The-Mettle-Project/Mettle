@@ -21,6 +21,14 @@ typedef struct {
 } IRControlFrame;
 
 typedef struct {
+  int scope_id;
+  const char *result_name;
+  Type *result_type;
+  const char *end_label;
+  IRDeferScope *defers;
+} IRValueFrame;
+
+typedef struct {
   const char *name;
   const char *ir_name;
   const char *type_text;
@@ -64,6 +72,11 @@ typedef struct {
   size_t block_statement_count;
   size_t block_statement_index;
   int address_width_depth;
+  IRDeferScope *current_defers;
+  IRValueFrame *value_frames;
+  size_t value_frame_count;
+  size_t value_frame_capacity;
+  int pin_identifier_reads;
 } IRLoweringContext;
 
 int ir_lower_index_expression(IRLoweringContext *context, IRFunction *function,
@@ -224,10 +237,15 @@ int ir_lower_match_statement(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *statement,
                                     IRDeferScope *defers);
 
-int ir_lower_match_expression(IRLoweringContext *context,
-                                     IRFunction *function,
-                                     ASTNode *expression,
-                                     IROperand *out_value);
+int ir_lower_value_scope(IRLoweringContext *context, IRFunction *function,
+                         ASTNode *expression, IROperand *out_value);
+
+int ir_lower_yield_statement(IRLoweringContext *context, IRFunction *function,
+                             ASTNode *statement, IRDeferScope *defers);
+
+int ir_store_named_local_value(IRLoweringContext *context, IRFunction *function,
+                               const char *local_name, Type *local_type,
+                               IROperand *value, SourceLocation location);
 
 int ir_emit_tagged_enum_construct(IRLoweringContext *context,
                                          IRFunction *function,

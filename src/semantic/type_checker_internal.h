@@ -352,8 +352,23 @@ Type *type_checker_instantiate_generic_enum(TypeChecker *checker,
 int type_checker_check_match_statement(TypeChecker *checker,
                                                ASTNode *statement);
 
-Type *type_checker_check_match_expression(TypeChecker *checker,
-                                                 ASTNode *expression);
+typedef struct TypeCheckerValueFrame {
+  int scope_id;
+  ValueScopeKind kind;
+  Type *target;
+  Type *result;
+  ASTNode *first_value;
+  int saw_value;
+  int saw_empty;
+} TypeCheckerValueFrame;
+
+Type *type_checker_check_value_scope(TypeChecker *checker, ASTNode *expression);
+int type_checker_check_value_scope_statement(TypeChecker *checker,
+                                             ASTNode *statement);
+int type_checker_check_yield(TypeChecker *checker, ASTNode *statement);
+int type_checker_flow_completes(TypeChecker *checker, const ASTNode *node);
+ASTNode *type_checker_pick_constant_value(TypeChecker *checker,
+                                          ASTNode *initializer);
 
 int type_checker_check_if_statement(TypeChecker *checker,
                                            ASTNode *statement);

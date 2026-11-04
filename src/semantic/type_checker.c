@@ -59,6 +59,9 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
   checker->tracked_scope_depth = 0;
   checker->tracked_buffer_extents = NULL;
   checker->aggregate_target_type = NULL;
+  checker->value_frames = NULL;
+  checker->value_frame_count = 0;
+  checker->value_frame_capacity = 0;
   checker->aggregate_requires_constant = 0;
   checker->module_program = NULL;
   checker->struct_placeholders = NULL;
@@ -158,6 +161,7 @@ void type_checker_destroy(TypeChecker *checker) {
     type_checker_movement_index_drop(checker);
   }
   if (checker) {
+    free(checker->value_frames);
     free(checker->guards);
     free(checker->refine_failure);
     free(checker->effect_failure);
@@ -370,6 +374,7 @@ int type_checker_register_function_signature(TypeChecker *checker,
   func_symbol->data.function.is_variadic = func_decl->is_variadic;
   func_symbol->is_kernel = func_decl->is_kernel;
   func_symbol->is_rule = func_decl->is_rule || func_decl->meta_role;
+  func_symbol->is_noreturn = func_decl->is_noreturn;
   func_symbol->is_meta = func_decl->meta_role != META_ROLE_NONE;
   func_symbol->kernel_block[0] = func_decl->kernel_block[0];
   func_symbol->kernel_block[1] = func_decl->kernel_block[1];

@@ -4623,17 +4623,15 @@ static Type *type_checker_infer_match(TypeChecker *checker,
                                   int *handled) {
   *handled = 1;
   switch (expression->type) {
-  case AST_MATCH_STATEMENT: {
-    MatchStatement *m = (MatchStatement *)expression->data;
-    if (!m || !m->is_expression) {
-      type_checker_set_error_at_location(
-          checker, expression->location,
-          "statement-form 'match' does not yield a value; use "
-          "'match (x) { case A: v, default: w }' expression form");
-      return NULL;
-    }
-    return type_checker_check_match_expression(checker, expression);
-  }
+  case AST_VALUE_SCOPE:
+    return type_checker_check_value_scope(checker, expression);
+
+  case AST_MATCH_STATEMENT:
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "statement-form 'match' does not yield a value; use "
+        "'match (x) { case A: v, default: w }' expression form");
+    return NULL;
 
   default:
     *handled = 0;
@@ -4644,6 +4642,15 @@ static Type *type_checker_infer_match(TypeChecker *checker,
 
 Type *type_checker_infer_type_internal(TypeChecker *checker,
                                        ASTNode *expression) {
+  if (checker->aggregate_target_type &&
+      (expression->type == AST_BINARY_EXPRESSION ||
+       expression->type == AST_UNARY_EXPRESSION ||
+       expression->type == AST_CAST_EXPRESSION ||
+       expression->type == AST_MEMBER_ACCESS ||
+       expression->type == AST_INDEX_EXPRESSION) &&
+      type_checker_ast_contains_node_type(expression, AST_VALUE_SCOPE)) {
+    checker->aggregate_target_type = NULL;
+  }
   static Type *(*const INFERRERS[])(TypeChecker *, ASTNode *, int *) = {
       type_checker_infer_literal,
       type_checker_infer_identifier,

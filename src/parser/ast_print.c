@@ -13,6 +13,28 @@ typedef struct {
 
 static void print_statement(AstPrinter *printer, const ASTNode *node);
 static void print_expression(AstPrinter *printer, const ASTNode *node);
+static void print_block(AstPrinter *printer, const ASTNode *node);
+
+static void print_value_scope(AstPrinter *printer, const ValueScope *scope) {
+  if (!scope || !scope->body) {
+    fputs("{ }", printer->out);
+    return;
+  }
+  if (scope->label) {
+    fprintf(printer->out, "%s: ", scope->label);
+  }
+  const Program *block = scope->body->type == AST_PROGRAM
+                             ? (const Program *)scope->body->data
+                             : NULL;
+  if (scope->kind == VALUE_SCOPE_LOOP && block &&
+      block->declaration_count == 2) {
+    print_statement(printer, block->declarations[0]);
+    fputs("else", printer->out);
+    print_block(printer, block->declarations[1]);
+    return;
+  }
+  print_statement(printer, scope->body);
+}
 
 static void print_indent(AstPrinter *printer) {
   for (int i = 0; i < printer->depth; i++) {
@@ -194,6 +216,9 @@ static void print_expression(AstPrinter *printer, const ASTNode *node) {
     print_new_expression(printer, (const NewExpression *)node->data);
     break;
   }
+  case AST_VALUE_SCOPE:
+    print_value_scope(printer, (const ValueScope *)node->data);
+    break;
   case AST_FUNCTION_CALL: {
     const CallExpression *call = (const CallExpression *)node->data;
     if (!call) {
@@ -426,6 +451,34 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
     print_indent(printer);
     fputs("break;\n", printer->out);
     break;
+
+  case AST_VALUE_SCOPE:
+    print_indent(printer);
+    print_value_scope(printer, (const ValueScope *)node->data);
+    fputc('\n', printer->out);
+    break;
+
+  case AST_YIELD_STATEMENT: {
+    const YieldStatement *yield = (const YieldStatement *)node->data;
+    print_indent(printer);
+    if (yield && yield->from_break) {
+      fputs("break", printer->out);
+      if (yield->label) {
+        fprintf(printer->out, " %s", yield->label);
+      }
+      if (yield->value) {
+        fputc(' ', printer->out);
+        print_expression(printer, yield->value);
+      }
+      fputs(";\n", printer->out);
+      break;
+    }
+    if (yield && yield->value) {
+      print_expression(printer, yield->value);
+    }
+    fputc('\n', printer->out);
+    break;
+  }
 
   case AST_CONTINUE_STATEMENT:
     print_indent(printer);

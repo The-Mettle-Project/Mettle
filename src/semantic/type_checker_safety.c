@@ -1841,6 +1841,7 @@ int type_checker_statement_guarantees_termination(ASTNode *statement) {
   case AST_RETURN_STATEMENT:
   case AST_BREAK_STATEMENT:
   case AST_CONTINUE_STATEMENT:
+  case AST_YIELD_STATEMENT:
     return 1;
   case AST_QUIESCE_STATEMENT:
     return 0;

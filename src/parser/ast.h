@@ -55,6 +55,8 @@ typedef enum {
   AST_AGGREGATE_LITERAL,
   AST_COMPTIME_FOR,
   AST_FALLTHROUGH_STATEMENT,
+  AST_VALUE_SCOPE,
+  AST_YIELD_STATEMENT,
   AST_NODE_TYPE_COUNT
 } ASTNodeType;
 
@@ -164,6 +166,8 @@ typedef struct {
   char *explain_code;
   char *explain_text;
   int is_noalloc;
+  int is_noreturn;
+  int tail_must_yield;
   int is_test;
   int is_swappable;
   int is_naked;
@@ -262,8 +266,30 @@ typedef struct {
   ASTNode *expression;
   MatchArm *arms;
   size_t arm_count;
-  int is_expression;
 } MatchStatement;
+
+typedef enum {
+  VALUE_SCOPE_BLOCK = 0,
+  VALUE_SCOPE_IF,
+  VALUE_SCOPE_MATCH,
+  VALUE_SCOPE_SWITCH,
+  VALUE_SCOPE_LOOP
+} ValueScopeKind;
+
+typedef struct {
+  ASTNode *body;
+  int scope_id;
+  ValueScopeKind kind;
+  char *label;
+  int tail_pending;
+} ValueScope;
+
+typedef struct {
+  ASTNode *value;
+  int scope_id;
+  char *label;
+  int from_break;
+} YieldStatement;
 
 typedef struct {
   char *name;
@@ -290,6 +316,7 @@ typedef struct {
 typedef struct {
   ASTNode **declarations;
   size_t declaration_count;
+  int tail_open;
 } Program;
 
 typedef enum {
@@ -559,10 +586,19 @@ typedef struct {
   ASTNode *value;
   ASTNode **values;
   size_t value_count;
+  int implicit_tail;
 } ReturnStatement;
+
+enum {
+  RETURN_WRITTEN = 0,
+  RETURN_TAIL_VALUE,
+  RETURN_TAIL_CALL,
+  RETURN_TAIL_MAIN_CALL
+};
 
 typedef struct {
   char *target_label;
+  ASTNode *value;
 } LoopControlStatement;
 
 typedef struct {
@@ -705,7 +741,18 @@ ASTNode *ast_create_errdefer_statement(ASTNode *statement,
                                        SourceLocation location);
 ASTNode *ast_create_match_statement(ASTNode *expression, MatchArm *arms,
                                     size_t arm_count, SourceLocation location);
-ASTNode *ast_create_match_expression(ASTNode *expression, MatchArm *arms,
-                                     size_t arm_count, SourceLocation location);
+ASTNode *ast_create_value_scope(ASTNode *body, int scope_id,
+                                ValueScopeKind kind, const char *label,
+                                SourceLocation location);
+ASTNode *ast_create_yield_statement(ASTNode *value, int scope_id,
+                                    SourceLocation location);
+int ast_convert_break_to_yield(ASTNode *node, int scope_id);
+ASTNode *ast_create_implicit_return(ASTNode *value, int implicit_tail,
+                                    SourceLocation location);
+ASTNode *ast_create_break_with_value(const char *label, ASTNode *value,
+                                     SourceLocation location);
+void ast_replace_child(ASTNode *parent, ASTNode *old_child,
+                       ASTNode *new_child);
+void ast_unwrap_implicit_return(ASTNode *node);
 
 #endif

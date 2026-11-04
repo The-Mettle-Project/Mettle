@@ -639,335 +639,170 @@ cleanup:
   return ok;
 }
 
-int ir_lower_match_expression(IRLoweringContext *context,
-                                     IRFunction *function,
-                                     ASTNode *expression,
-                                     IROperand *out_value) {
-  MatchStatement *match = NULL;
-  Type *subject_type = NULL;
-  Type *result_type = NULL;
-  IROperand subject_value = ir_operand_none();
-  IROperand subject_address = ir_operand_none();
-  IROperand tag_value = ir_operand_none();
-  char *owned_subject_name = NULL;
-  const char *subject_name = NULL;
+static IRValueFrame *ir_value_frame_push(IRLoweringContext *context) {
+  if (context->value_frame_count == context->value_frame_capacity) {
+    size_t grown =
+        context->value_frame_capacity ? context->value_frame_capacity * 2 : 8;
+    IRValueFrame *frames =
+        realloc(context->value_frames, grown * sizeof(IRValueFrame));
+    if (!frames) {
+      ir_set_error(context, "Out of memory while lowering a value");
+      return NULL;
+    }
+    context->value_frames = frames;
+    context->value_frame_capacity = grown;
+  }
+  return &context->value_frames[context->value_frame_count++];
+}
+
+int ir_lower_value_scope(IRLoweringContext *context, IRFunction *function,
+                         ASTNode *expression, IROperand *out_value) {
+  ValueScope *scope = (ValueScope *)expression->data;
+  Type *result_type = expression->resolved_type;
+  int has_value = result_type && result_type->kind != TYPE_VOID;
   char *result_name = NULL;
-  char *end_label = NULL;
-  char **arm_labels = NULL;
-  char *default_label = NULL;
-  int bound_scope = 0;
+  char *end_label = ir_new_label_name(context, "value_end");
+  ASTNode **saved_statements = context->block_statements;
+  size_t saved_count = context->block_statement_count;
+  size_t saved_index = context->block_statement_index;
   int ok = 0;
 
-  if (!context || !function || !expression || !out_value ||
-      expression->type != AST_MATCH_STATEMENT) {
-    return 0;
+  if (!scope || !scope->body || !end_label) {
+    ir_set_error(context, "Malformed value expression");
+    goto done;
   }
-
-  match = (MatchStatement *)expression->data;
-  if (!match || !match->expression || !match->is_expression) {
-    ir_set_error(context, "Malformed match expression");
-    return 0;
-  }
-
-  subject_type = ir_infer_expression_type(context, match->expression);
-  if (!subject_type || subject_type->kind != TYPE_TAGGED_ENUM ||
-      !subject_type->name) {
-    ir_set_error(context, "IR match lowering requires a tagged-enum subject");
-    return 0;
-  }
-
-  result_type = ir_infer_expression_type(context, expression);
-  if (!result_type || !result_type->name) {
-    ir_set_error(context, "Could not determine match expression result type");
-    return 0;
-  }
-
-  if (!ir_lower_expression(context, function, match->expression,
-                           &subject_value)) {
-    return 0;
-  }
-
-  result_name = ir_new_label_name(context, "match_result");
-  if (!result_name ||
-      !ir_emit_local_declaration(context, function, result_name,
-                                 result_type->name, expression->location)) {
-    ir_set_error(context, "Out of memory while allocating match result");
-    goto cleanup;
-  }
-
-  if (subject_value.kind == IR_OPERAND_SYMBOL && subject_value.name) {
-    subject_name = subject_value.name;
-  } else {
-    owned_subject_name = ir_new_label_name(context, "match_subject");
-    if (!owned_subject_name) {
-      ir_set_error(context,
-                   "Out of memory while allocating match subject storage");
-      goto cleanup;
+  if (has_value) {
+    char signature[1024];
+    size_t used = 0;
+    const char *written = result_type->name;
+    if (result_type->kind == TYPE_FUNCTION_POINTER &&
+        type_checker_append_type_text(result_type, signature, sizeof(signature),
+                                      &used)) {
+      written = signature;
     }
-    if (!ir_emit_local_declaration(context, function, owned_subject_name,
-                                   subject_type->name,
-                                   expression->location) ||
-        !ir_emit_symbol_assignment(context, function, owned_subject_name,
-                                   &subject_value, expression->location)) {
-      goto cleanup;
-    }
-    subject_name = owned_subject_name;
-  }
-
-  if (!ir_emit_address_of_symbol(context, function, subject_name,
-                                 match->expression->location,
-                                 &subject_address)) {
-    goto cleanup;
-  }
-
-  if (!ir_make_temp_operand(context, &tag_value)) {
-    goto cleanup;
-  }
-
-  {
-    IRInstruction load_tag = {0};
-    load_tag.op = IR_OP_LOAD;
-    load_tag.location = match->expression->location;
-    load_tag.dest = tag_value;
-    load_tag.lhs = subject_address;
-    load_tag.rhs = ir_operand_int(4);
-    if (!ir_emit(context, function, &load_tag)) {
-      goto cleanup;
+    result_name = ir_new_label_name(context, "value_result");
+    if (!result_name ||
+        !ir_emit_local_declaration(context, function, result_name, written,
+                                   expression->location)) {
+      ir_set_error(context, "Out of memory while allocating a value");
+      goto done;
     }
   }
 
-  end_label = ir_new_label_name(context, "match_end");
-  if (!end_label) {
-    ir_set_error(context, "Out of memory while allocating match labels");
-    goto cleanup;
+  IRValueFrame *frame = ir_value_frame_push(context);
+  if (!frame) {
+    goto done;
   }
+  frame->scope_id = scope->scope_id;
+  frame->result_name = result_name;
+  frame->result_type = has_value ? result_type : NULL;
+  frame->end_label = end_label;
+  frame->defers = context->current_defers;
 
-  if (match->arm_count > 0) {
-    arm_labels = calloc(match->arm_count, sizeof(char *));
-    if (!arm_labels) {
-      ir_set_error(context, "Out of memory while allocating match labels");
-      goto cleanup;
-    }
-    for (size_t i = 0; i < match->arm_count; i++) {
-      arm_labels[i] = ir_new_label_name(context, "match_arm");
-      if (!arm_labels[i]) {
-        ir_set_error(context, "Out of memory while allocating match labels");
-        goto cleanup;
-      }
-      if (match->arms[i].is_default) {
-        default_label = arm_labels[i];
-      }
-    }
+  ok = ir_lower_statement_with_defers(context, function, scope->body,
+                                      context->current_defers);
+  context->value_frame_count--;
+  context->block_statements = saved_statements;
+  context->block_statement_count = saved_count;
+  context->block_statement_index = saved_index;
+  if (!ok) {
+    goto done;
   }
-  if (!default_label) {
-    default_label = end_label;
-  }
-
-  for (size_t i = 0; i < match->arm_count; i++) {
-    MatchArm *arm = &match->arms[i];
-    int variant_idx = -1;
-
-    if (!arm || arm->is_default) {
-      continue;
-    }
-
-    for (size_t v = 0; v < subject_type->tagged_variant_count; v++) {
-      if (subject_type->tagged_variant_names[v] &&
-          strcmp(subject_type->tagged_variant_names[v], arm->variant_name) ==
-              0) {
-        variant_idx = (int)v;
-        break;
-      }
-    }
-
-    if (variant_idx < 0) {
-      ir_set_error(context, "Unknown tagged-enum variant '%s' in match",
-                   arm->variant_name ? arm->variant_name : "<unnamed>");
-      goto cleanup;
-    }
-
-    IRInstruction cmp = {0};
-    cmp.op = IR_OP_BRANCH_EQ;
-    cmp.location = expression->location;
-    cmp.lhs = tag_value;
-    cmp.rhs = ir_operand_int(
-        (long long)subject_type->tagged_variant_tags[variant_idx]);
-    cmp.text = arm_labels[i];
-    if (!ir_emit(context, function, &cmp)) {
-      goto cleanup;
+  ok = ir_emit_label_instruction(context, function, end_label,
+                                 expression->location);
+  if (ok && has_value && out_value &&
+      ir_small_float_local(context, function, result_name, result_name,
+                           result_type)) {
+    ok = ir_emit_small_float_home_load(context, function, result_name,
+                                       result_type, expression->location,
+                                       out_value);
+  } else if (ok && has_value && out_value) {
+    *out_value = ir_operand_symbol(result_name);
+    if (!out_value->name) {
+      ir_set_error(context, "Out of memory while finishing a value");
+      ok = 0;
     }
   }
 
-  if (!ir_emit_jump_instruction(context, function, default_label,
-                                expression->location)) {
-    goto cleanup;
-  }
-
-  for (size_t i = 0; i < match->arm_count; i++) {
-    MatchArm *arm = &match->arms[i];
-    int variant_idx = -1;
-    IROperand arm_value = ir_operand_none();
-
-    if (!arm) {
-      continue;
-    }
-
-    if (!ir_emit_label_instruction(context, function, arm_labels[i],
-                                   arm->body ? arm->body->location
-                                             : expression->location)) {
-      goto cleanup;
-    }
-
-    if (!arm->is_default) {
-      for (size_t v = 0; v < subject_type->tagged_variant_count; v++) {
-        if (subject_type->tagged_variant_names[v] &&
-            strcmp(subject_type->tagged_variant_names[v], arm->variant_name) ==
-                0) {
-          variant_idx = (int)v;
-          break;
-        }
-      }
-    }
-
-    ir_local_scope_enter(context);
-    bound_scope = 1;
-    if (arm->binding_name && variant_idx >= 0) {
-      Type *payload_type = subject_type->tagged_variant_payloads[variant_idx];
-      int payload_size = 0;
-      IROperand payload_address = ir_operand_none();
-      const char *bound_name = NULL;
-
-      if (!payload_type || !payload_type->name) {
-        ir_set_error(context, "Match binding '%s' has no payload to bind",
-                     arm->binding_name);
-        goto cleanup;
-      }
-
-      bound_name =
-          ir_local_bind(context, arm->binding_name, payload_type->name);
-      payload_size = (payload_type->size > 0)
-                         ? (int)payload_type->size
-                         : ir_type_storage_size(payload_type);
-      if (!ir_emit_local_declaration(context, function, bound_name,
-                                     payload_type->name,
-                                     expression->location) ||
-          !ir_emit_address_with_offset(context, function, &subject_address,
-                                       subject_type->tagged_data_offset,
-                                       expression->location,
-                                       &payload_address)) {
-        ir_operand_destroy(&payload_address);
-        goto cleanup;
-      }
-
-      if (payload_size > 8) {
-        IROperand binding_address = ir_operand_none();
-        IRInstruction copy = {0};
-
-        if (!ir_emit_address_of_symbol(context, function, bound_name,
-                                       expression->location,
-                                       &binding_address)) {
-          ir_operand_destroy(&payload_address);
-          goto cleanup;
-        }
-
-        copy.op = IR_OP_STORE;
-        copy.location = expression->location;
-        copy.dest = binding_address;
-        copy.lhs = payload_address;
-        copy.rhs = ir_operand_int(payload_size);
-        if (!ir_emit(context, function, &copy)) {
-          ir_operand_destroy(&binding_address);
-          ir_operand_destroy(&payload_address);
-          goto cleanup;
-        }
-
-        ir_operand_destroy(&binding_address);
-      } else {
-        IROperand payload_value = ir_operand_none();
-        IRInstruction load = {0};
-
-        if (!ir_make_temp_operand(context, &payload_value)) {
-          ir_operand_destroy(&payload_address);
-          goto cleanup;
-        }
-
-        load.op = IR_OP_LOAD;
-        load.location = expression->location;
-        load.dest = payload_value;
-        load.lhs = payload_address;
-        load.rhs = ir_operand_int(payload_size);
-        ir_load_apply_float_type(&load, payload_type);
-        ir_load_apply_unsigned(&load, payload_type);
-        ir_access_apply_alias_class(&load, payload_type);
-        payload_value.float_bits = load.dest.float_bits;
-        if (!ir_emit(context, function, &load) ||
-            !ir_emit_symbol_assignment(context, function, bound_name,
-                                       &payload_value,
-                                       expression->location)) {
-          ir_operand_destroy(&payload_value);
-          ir_operand_destroy(&payload_address);
-          goto cleanup;
-        }
-
-        ir_operand_destroy(&payload_value);
-      }
-
-      ir_operand_destroy(&payload_address);
-    }
-
-    if (!arm->body) {
-      ir_set_error(context, "match arm has no value expression");
-      goto cleanup;
-    }
-
-    if (!ir_lower_expression(context, function, arm->body, &arm_value)) {
-      goto cleanup;
-    }
-    if (!ir_emit_symbol_assignment(context, function, result_name, &arm_value,
-                                   arm->body->location)) {
-      ir_operand_destroy(&arm_value);
-      goto cleanup;
-    }
-    ir_operand_destroy(&arm_value);
-
-    ir_local_scope_leave(context);
-    bound_scope = 0;
-
-    if (!ir_emit_jump_instruction(context, function, end_label,
-                                  expression->location)) {
-      goto cleanup;
-    }
-  }
-
-  if (!ir_emit_label_instruction(context, function, end_label,
-                                 expression->location)) {
-    goto cleanup;
-  }
-
-  *out_value = ir_operand_symbol(result_name);
-  if (!out_value->name) {
-    ir_set_error(context, "Out of memory while finalizing match expression");
-    goto cleanup;
-  }
-  ok = 1;
-
-cleanup:
-  if (bound_scope) {
-    ir_local_scope_leave(context);
-  }
-  if (arm_labels) {
-    for (size_t i = 0; i < match->arm_count; i++) {
-      free(arm_labels[i]);
-    }
-    free(arm_labels);
-  }
-  free(end_label);
+done:
   free(result_name);
-  free(owned_subject_name);
-  ir_operand_destroy(&tag_value);
-  ir_operand_destroy(&subject_address);
-  ir_operand_destroy(&subject_value);
+  free(end_label);
   return ok;
+}
+
+static int ir_store_yield_value(IRLoweringContext *context, IRFunction *function,
+                                const IRValueFrame *frame, ASTNode *value) {
+  IROperand operand = ir_operand_none();
+  Type *target = frame->result_type;
+  int ok = 0;
+  if (value->type == AST_AGGREGATE_LITERAL && value->resolved_type) {
+    return ir_emit_aggregate_literal_copy_to_symbol(
+        context, function, frame->result_name, value, value->resolved_type,
+        value->location);
+  }
+  if (!ir_lower_expression(context, function, value, &operand)) {
+    return 0;
+  }
+  if (ir_should_build_slice_from_array(target, value) &&
+      !ir_build_slice_operand_from_array(context, function, &operand,
+                                         value->resolved_type, target,
+                                         value->location)) {
+    goto done;
+  }
+  if (ir_should_decay_array_to_address(target, value) &&
+      !ir_decay_array_operand_to_address(context, function, &operand,
+                                         value->location)) {
+    goto done;
+  }
+  if (ir_should_coerce_string_to_cstring(context, target, value) &&
+      !ir_coerce_string_operand_to_cstring(context, function, &operand,
+                                           value->location)) {
+    goto done;
+  }
+  ok = ir_store_named_local_value(context, function, frame->result_name, target,
+                                  &operand, value->location);
+done:
+  ir_operand_destroy(&operand);
+  return ok;
+}
+
+int ir_lower_yield_statement(IRLoweringContext *context, IRFunction *function,
+                             ASTNode *statement, IRDeferScope *defers) {
+  YieldStatement *yield = (YieldStatement *)statement->data;
+  const IRValueFrame *frame = NULL;
+  for (size_t i = context->value_frame_count; yield && i > 0; i--) {
+    if (context->value_frames[i - 1].scope_id == yield->scope_id) {
+      frame = &context->value_frames[i - 1];
+      break;
+    }
+  }
+  if (!frame) {
+    ir_set_error(context, "A value has no scope to go to");
+    return 0;
+  }
+  if (yield->value) {
+    int discards = !frame->result_name ||
+                   (yield->value->resolved_type &&
+                    yield->value->resolved_type->kind == TYPE_VOID);
+    size_t frame_index = (size_t)(frame - context->value_frames);
+    if (discards) {
+      IROperand ignored = ir_operand_none();
+      int lowered =
+          ir_lower_expression(context, function, yield->value, &ignored);
+      ir_operand_destroy(&ignored);
+      if (!lowered) {
+        return 0;
+      }
+    } else if (!ir_store_yield_value(context, function, frame, yield->value)) {
+      return 0;
+    }
+    frame = &context->value_frames[frame_index];
+  }
+  if (!ir_emit_defers_until_scope(context, function, defers, frame->defers)) {
+    return 0;
+  }
+  return ir_emit_jump_instruction(context, function, frame->end_label,
+                                  statement->location);
 }
 
 int ir_emit_tagged_enum_construct(IRLoweringContext *context,
@@ -1039,9 +874,31 @@ int ir_emit_tagged_enum_construct(IRLoweringContext *context,
     IROperand payload_source = ir_operand_none();
     char *payload_temp_name = NULL;
 
-    if (!ir_lower_expression(context, function, payload_arg,
-                             &payload_value) ||
-        !ir_emit_address_with_offset(context, function, &enum_address,
+    if (payload_arg->type == AST_AGGREGATE_LITERAL &&
+        payload_arg->resolved_type) {
+      char *home = ir_new_label_name(context, "tagged_literal");
+      if (!home ||
+          !ir_emit_local_declaration(context, function, home,
+                                     payload_arg->resolved_type->name,
+                                     location) ||
+          !ir_emit_aggregate_literal_copy_to_symbol(
+              context, function, home, payload_arg, payload_arg->resolved_type,
+              location)) {
+        free(home);
+        ir_operand_destroy(&enum_address);
+        free(local_name);
+        return 0;
+      }
+      payload_value = ir_operand_symbol(home);
+      free(home);
+    } else if (!ir_lower_expression(context, function, payload_arg,
+                                    &payload_value)) {
+      ir_operand_destroy(&enum_address);
+      free(local_name);
+      return 0;
+    }
+
+    if (!ir_emit_address_with_offset(context, function, &enum_address,
                                      enum_type->tagged_data_offset,
                                      location, &payload_address)) {
       ir_operand_destroy(&payload_address);

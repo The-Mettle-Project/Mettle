@@ -1428,7 +1428,7 @@ static int type_checker_refuse_inferred_binding(TypeChecker *checker,
   return 0;
 }
 
-static int type_checker_append_type_text(const Type *type, char *text,
+int type_checker_append_type_text(const Type *type, char *text,
                                          size_t capacity, size_t *used) {
   if (*used >= capacity) {
     return 0;
@@ -1597,13 +1597,24 @@ static int type_checker_check_variable_initializer(
     int *poisoned_io) {
   Type *var_type = *var_type_io;
   int poisoned = *poisoned_io;
+  if (var_decl->initializer && var_decl->initializer->type == AST_VALUE_SCOPE &&
+      (var_decl->is_const ||
+       (current_scope && current_scope->type == SCOPE_GLOBAL))) {
+    ASTNode *picked =
+        type_checker_pick_constant_value(checker, var_decl->initializer);
+    if (picked) {
+      ast_replace_child(declaration, var_decl->initializer, picked);
+      var_decl->initializer = picked;
+    }
+  }
   if (var_decl->initializer) {
     size_t reports_before =
         checker->error_reporter ? checker->error_reporter->count : 0;
     checker->aggregate_target_type =
         var_decl->initializer->type == AST_AGGREGATE_LITERAL ||
                 var_decl->initializer->type == AST_FUNCTION_CALL ||
-                var_decl->initializer->type == AST_IDENTIFIER
+                var_decl->initializer->type == AST_IDENTIFIER ||
+                var_decl->initializer->type == AST_VALUE_SCOPE
             ? var_type
             : NULL;
     checker->aggregate_requires_constant =
@@ -2445,6 +2456,19 @@ static int type_checker_check_function_body(
 
   if (func_decl->body &&
       !type_checker_check_function_memory(checker, declaration)) {
+    type_checker_init_tracker_reset(checker);
+    symbol_table_exit_scope(checker->symbol_table);
+    return 0;
+  }
+
+  if (func_decl->body && func_decl->tail_must_yield && return_type &&
+      return_type->kind != TYPE_VOID &&
+      type_checker_flow_completes(checker, func_decl->body)) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Function '%s' can reach its end without a value; end each path with "
+        "an expression and no ';', or with 'return'",
+        func_decl->name ? func_decl->name : "<lambda>");
     type_checker_init_tracker_reset(checker);
     symbol_table_exit_scope(checker->symbol_table);
     return 0;

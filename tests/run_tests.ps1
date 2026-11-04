@@ -1473,6 +1473,16 @@ $cases = @(
   @{ Name = "err_decorator_conflict"; Path = "tests/err_decorator_conflict.mettle"; ShouldSucceed = $false; Pattern = "mutually exclusive" },
   @{ Name = "err_decorator_on_struct"; Path = "tests/err_decorator_on_struct.mettle"; ShouldSucceed = $false; Pattern = "may only precede a function declaration" },
   @{ Name = "err_decorator_after_export"; Path = "tests/err_decorator_after_export.mettle"; ShouldSucceed = $false; Pattern = "Decorators must precede 'export'" },
+  @{ Name = "err_value_if_no_else"; Path = "tests/err_value_if_no_else.mettle"; ShouldSucceed = $false; Pattern = "An 'if' used as a value needs an 'else'" },
+  @{ Name = "err_value_branch_dropped"; Path = "tests/err_value_branch_dropped.mettle"; ShouldSucceed = $false; Pattern = "write it last with no ';'" },
+  @{ Name = "err_value_branch_types"; Path = "tests/err_value_branch_types.mettle"; ShouldSucceed = $false; Pattern = "give different types, 'int32' and 'int64'" },
+  @{ Name = "err_value_path_empty"; Path = "tests/err_value_path_empty.mettle"; ShouldSucceed = $false; Pattern = "can finish without giving a value" },
+  @{ Name = "err_value_switch_no_default"; Path = "tests/err_value_switch_no_default.mettle"; ShouldSucceed = $false; Pattern = "A 'switch' used as a value needs a 'default'" },
+  @{ Name = "err_value_loop_no_else"; Path = "tests/err_value_loop_no_else.mettle"; ShouldSucceed = $false; Pattern = "This loop can finish without giving a value" },
+  @{ Name = "err_break_value_nowhere"; Path = "tests/err_break_value_nowhere.mettle"; ShouldSucceed = $false; Pattern = "the loop's value goes nowhere" },
+  @{ Name = "err_tail_reaches_end"; Path = "tests/err_tail_reaches_end.mettle"; ShouldSucceed = $false; Pattern = "can reach its end without a value" },
+  @{ Name = "err_value_refinement"; Path = "tests/err_value_refinement.mettle"; ShouldSucceed = $false; Pattern = "cannot prove" },
+  @{ Name = "err_value_pointer_to_local"; Path = "tests/err_value_pointer_to_local.mettle"; ShouldSucceed = $false; Pattern = "Returning the address of stack local" },
   @{ Name = "const_top_level"; Path = "tests/test_const_top_level.mettle"; ShouldSucceed = $true },
   @{ Name = "lambda"; Path = "tests/test_lambda.mettle"; ShouldSucceed = $true },
   @{ Name = "err_var_inferred"; Path = "tests/err_var_inferred.mettle"; ShouldSucceed = $false; Pattern = "global variable 'total' requires an explicit type"; OutputMustNotMatch = @("Undefined variable") },
@@ -12682,6 +12692,50 @@ foreach ($deferMode in @("debug", "release")) {
     $failed++
     Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
   }
+}
+
+foreach ($valueMode in @("debug", "optimized", "release", "safe")) {
+  $total++
+  $caseName = "value_control_flow_$valueMode"
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "$caseName.exe"
+    $extraArgs = @()
+    if ($valueMode -eq "optimized") { $extraArgs = @("-O") }
+    if ($valueMode -eq "release") { $extraArgs = @("--release") }
+    if ($valueMode -eq "safe") { $extraArgs = @("--safe") }
+    $buildOut = & $CompilerPath --build --linker internal @extraArgs tests/test_value_control_flow.mettle -o $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "value control flow build failed ($valueMode): $buildOut"
+    }
+    $runOut = ((& $exePath 2>&1 | Out-String) -replace "`r`n", "`n").TrimEnd()
+    if ($runOut -ne "done") {
+      throw "value control flow mismatch ($valueMode):`n$runOut"
+    }
+    Write-CaseResult -Name $caseName -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $exePath = Join-Path $tmpDir "main_tail_call.exe"
+  $buildOut = & $CompilerPath --build --linker internal tests/test_main_tail_call.mettle -o $exePath 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "main tail call build failed: $buildOut" }
+  if ($buildOut -notmatch "main drops the value of its last call") {
+    throw "main tail call did not warn: $buildOut"
+  }
+  & $exePath | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "main's last call changed the exit status to $LASTEXITCODE" }
+  Write-CaseResult -Name "main_tail_call_keeps_exit_status" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "main_tail_call_keeps_exit_status" -Passed $false -Reason $_.Exception.Message
 }
 
 # Whole-struct assignment must copy every byte, not just the first machine word.

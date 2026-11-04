@@ -122,6 +122,9 @@ typedef struct {
   struct TrackedBufferExtent *tracked_buffer_extents;
   Type *aggregate_target_type;
   int aggregate_requires_constant;
+  struct TypeCheckerValueFrame *value_frames;
+  size_t value_frame_count;
+  size_t value_frame_capacity;
   struct ASTNode *module_program;
   int device_module;
   Type **struct_placeholders;
@@ -201,6 +204,8 @@ int type_checker_register_generated_types(TypeChecker *checker,
                                           struct ASTNode *program);
 Type *type_checker_infer_type(TypeChecker *checker, ASTNode *expression);
 int type_checker_are_compatible(Type *type1, Type *type2);
+int type_checker_append_type_text(const Type *type, char *text, size_t capacity,
+                                  size_t *used);
 
 void type_checker_init_builtin_types(TypeChecker *checker);
 Type *type_checker_get_type_by_name(TypeChecker *checker, const char *name);

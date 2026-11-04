@@ -1268,6 +1268,8 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
     break;
   }
   case AST_GPU_LAUNCH:
+  case AST_VALUE_SCOPE:
+  case AST_YIELD_STATEMENT:
     for (size_t i = 0; i < node->child_count; i++) {
       substitute_types_in_ast(node->children[i], param_names, arg_names, count,
                               ctx);
@@ -1620,6 +1622,8 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
     break;
   }
   case AST_GPU_LAUNCH:
+  case AST_VALUE_SCOPE:
+  case AST_YIELD_STATEMENT:
     for (size_t i = 0; i < node->child_count; i++) {
       collect_type_instantiations(node->children[i], ctx);
     }
@@ -1955,6 +1959,8 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
     break;
   }
   case AST_GPU_LAUNCH:
+  case AST_VALUE_SCOPE:
+  case AST_YIELD_STATEMENT:
     for (size_t i = 0; i < node->child_count; i++) {
       rewrite_generic_references(node->children[i], ctx);
     }
@@ -3134,10 +3140,53 @@ static char *mono_new_expression_type(const NewExpression *ne) {
   return text;
 }
 
+static int mono_value_scope_agreed_type(MonoContext *ctx, ASTNode *node,
+                                        int scope_id, MonoVarEnv *env,
+                                        char **agreed) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION) {
+    return 1;
+  }
+  if (node->type == AST_YIELD_STATEMENT && node->data) {
+    YieldStatement *yield = (YieldStatement *)node->data;
+    if (yield->scope_id == scope_id && yield->value) {
+      char *type = mono_static_type_of(ctx, yield->value, env);
+      if (!type) {
+        return 0;
+      }
+      if (*agreed && strcmp(*agreed, type) != 0) {
+        free(type);
+        return 0;
+      }
+      if (*agreed) {
+        free(type);
+      } else {
+        *agreed = type;
+      }
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (!mono_value_scope_agreed_type(ctx, node->children[i], scope_id, env,
+                                      agreed)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static char *mono_static_type_of(MonoContext *ctx, ASTNode *expr,
                                  MonoVarEnv *env) {
   if (!expr) {
     return NULL;
+  }
+  if (expr->type == AST_VALUE_SCOPE && expr->data) {
+    ValueScope *scope = (ValueScope *)expr->data;
+    char *agreed = NULL;
+    if (!mono_value_scope_agreed_type(ctx, scope->body, scope->scope_id, env,
+                                      &agreed)) {
+      free(agreed);
+      return NULL;
+    }
+    return agreed;
   }
   switch (expr->type) {
   case AST_NUMBER_LITERAL: {
@@ -4903,6 +4952,46 @@ static const char *adapt_assignment_target_type(const Assignment *assign,
   return adapt_expression_type(assign->target, locals, prog);
 }
 
+static void adapt_wrap_value(ASTNode **slot, ASTNode *owner,
+                             const char *dest_type_str, ASTNode **top_decls,
+                             size_t top_count, AdaptCache *cache,
+                             ASTNode *program, Program *prog, int *had_error);
+
+static void adapt_wrap_yields(ASTNode *node, int scope_id,
+                              const char *dest_type_str, ASTNode **top_decls,
+                              size_t top_count, AdaptCache *cache,
+                              ASTNode *program, Program *prog, int *had_error) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION) {
+    return;
+  }
+  if (node->type == AST_YIELD_STATEMENT && node->data) {
+    YieldStatement *yield = (YieldStatement *)node->data;
+    if (yield->scope_id == scope_id && yield->value) {
+      adapt_wrap_value(&yield->value, node, dest_type_str, top_decls, top_count,
+                       cache, program, prog, had_error);
+      return;
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    adapt_wrap_yields(node->children[i], scope_id, dest_type_str, top_decls,
+                      top_count, cache, program, prog, had_error);
+  }
+}
+
+static void adapt_wrap_value(ASTNode **slot, ASTNode *owner,
+                             const char *dest_type_str, ASTNode **top_decls,
+                             size_t top_count, AdaptCache *cache,
+                             ASTNode *program, Program *prog, int *had_error) {
+  if (slot && *slot && (*slot)->type == AST_VALUE_SCOPE && (*slot)->data) {
+    ValueScope *scope = (ValueScope *)(*slot)->data;
+    adapt_wrap_yields(scope->body, scope->scope_id, dest_type_str, top_decls,
+                      top_count, cache, program, prog, had_error);
+    return;
+  }
+  adapt_wrap_if_needed(slot, owner, dest_type_str, top_decls, top_count, cache,
+                       program, prog, had_error);
+}
+
 static void adapt_walk(ASTNode *node, const char *current_return_type,
                        ASTNode **top_decls, size_t top_count,
                        AdaptCache *cache, ASTNode *program, Program *prog,
@@ -4914,14 +5003,14 @@ static void adapt_walk(ASTNode *node, const char *current_return_type,
   if (node->type == AST_VAR_DECLARATION) {
     VarDeclaration *vd = (VarDeclaration *)node->data;
     if (vd && vd->initializer) {
-      adapt_wrap_if_needed(&vd->initializer, node, vd->type_name, top_decls,
-                           top_count, cache, program, prog, had_error);
+      adapt_wrap_value(&vd->initializer, node, vd->type_name, top_decls,
+                       top_count, cache, program, prog, had_error);
     }
   } else if (node->type == AST_RETURN_STATEMENT) {
     ReturnStatement *rs = (ReturnStatement *)node->data;
     if (rs && rs->value) {
-      adapt_wrap_if_needed(&rs->value, node, current_return_type, top_decls,
-                           top_count, cache, program, prog, had_error);
+      adapt_wrap_value(&rs->value, node, current_return_type, top_decls,
+                       top_count, cache, program, prog, had_error);
       if (rs->values && rs->value_count > 0) {
         rs->values[0] = rs->value;
       }
@@ -4929,10 +5018,9 @@ static void adapt_walk(ASTNode *node, const char *current_return_type,
   } else if (node->type == AST_ASSIGNMENT) {
     Assignment *assign = (Assignment *)node->data;
     if (assign && assign->value) {
-      adapt_wrap_if_needed(
-          &assign->value, node,
-          adapt_assignment_target_type(assign, locals, prog), top_decls,
-          top_count, cache, program, prog, had_error);
+      adapt_wrap_value(&assign->value, node,
+                       adapt_assignment_target_type(assign, locals, prog),
+                       top_decls, top_count, cache, program, prog, had_error);
     }
   } else if (node->type == AST_FUNCTION_CALL) {
     CallExpression *call = (CallExpression *)node->data;
@@ -4942,9 +5030,9 @@ static void adapt_walk(ASTNode *node, const char *current_return_type,
                               (long long)call->argument_count);
       if (fd) {
         for (size_t a = 0; a < call->argument_count; a++) {
-          adapt_wrap_if_needed(&call->arguments[a], node,
-                               fd->parameter_types[a], top_decls, top_count,
-                               cache, program, prog, had_error);
+          adapt_wrap_value(&call->arguments[a], node, fd->parameter_types[a],
+                           top_decls, top_count, cache, program, prog,
+                           had_error);
         }
       }
     }

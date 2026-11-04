@@ -1,4 +1,4 @@
-export extern fn exit(code: int32) = "exit";
+@noreturn export extern fn exit(code: int32) = "exit";
 
 export extern fn rand() -> int32 = "rand";
 

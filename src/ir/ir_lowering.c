@@ -9,6 +9,7 @@ static void ir_lowering_free_control_stack(IRLoweringContext *context) {
     free(context->control_stack[j].user_label);
   }
   free(context->control_stack);
+  free(context->value_frames);
   context->control_stack = NULL;
   context->control_count = 0;
 }
@@ -186,6 +187,24 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   return ir_program;
 }
 
+static int ir_value_scope_writes_locals(const ASTNode *node, int inside_scope) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION) {
+    return 0;
+  }
+  if (inside_scope && node->type == AST_ASSIGNMENT) {
+    return 1;
+  }
+  if (node->type == AST_VALUE_SCOPE) {
+    inside_scope = 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (ir_value_scope_writes_locals(node->children[i], inside_scope)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 IRFunction *ir_lower_function(IRLoweringContext *context,
                                      ASTNode *declaration) {
   if (!declaration || declaration->type != AST_FUNCTION_DECLARATION) {
@@ -312,6 +331,10 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   free(entry_label);
 
   IRDeferScope defers = {0};
+  context->current_defers = &defers;
+  context->value_frame_count = 0;
+  context->pin_identifier_reads =
+      ir_value_scope_writes_locals(function_data->body, 0);
   if (function_data->body &&
       !ir_lower_statement_with_defers(context, function, function_data->body,
                                       &defers)) {

@@ -83,6 +83,7 @@ static ASTNode *ast_clone_program(ASTNode *clone, const ASTNode *node) {
   }
   dst->declaration_count = src ? src->declaration_count : 0;
   dst->declarations = NULL;
+  dst->tail_open = src ? src->tail_open : 0;
   if (dst->declaration_count > 0) {
     dst->declarations = malloc(dst->declaration_count * sizeof(ASTNode *));
     for (size_t i = 0; i < dst->declaration_count; i++) {
@@ -190,6 +191,8 @@ static ASTNode *ast_clone_method_declaration(ASTNode *clone, const ASTNode *node
   dst->explain_text =
       src->explain_text ? ast_copy_string(src->explain_text) : NULL;
   dst->is_noalloc = src->is_noalloc;
+  dst->is_noreturn = src->is_noreturn;
+  dst->tail_must_yield = src->tail_must_yield;
   dst->is_test = src->is_test;
   dst->numerics_contract = src->numerics_contract
                                ? ast_copy_string(src->numerics_contract)
@@ -833,6 +836,7 @@ static ASTNode *ast_clone_return_statement(ASTNode *clone, const ASTNode *node) 
     }
     dst->value = NULL;
     dst->values = NULL;
+    dst->implicit_tail = src->implicit_tail;
     dst->value_count = src->value_count ? src->value_count
                                         : (src->value ? 1 : 0);
     if (dst->value_count > 0) {
@@ -1097,8 +1101,49 @@ static ASTNode *ast_clone_break_statement(ASTNode *clone, const ASTNode *node) {
       return NULL;
     }
     dst->target_label = ast_copy_string(src->target_label);
+    dst->value = src->value ? ast_clone_node(src->value) : NULL;
+    if (dst->value) {
+      ast_add_child(clone, dst->value);
+    }
     clone->data = dst;
   }
+  return clone;
+}
+
+static ASTNode *ast_clone_value_scope(ASTNode *clone, const ASTNode *node) {
+  const ValueScope *src = (const ValueScope *)node->data;
+  ValueScope *dst = malloc(sizeof(ValueScope));
+  if (!dst) {
+    free(clone);
+    return NULL;
+  }
+  dst->scope_id = src->scope_id;
+  dst->kind = src->kind;
+  dst->tail_pending = src->tail_pending;
+  dst->label = ast_copy_string(src->label);
+  dst->body = src->body ? ast_clone_node(src->body) : NULL;
+  if (dst->body) {
+    ast_add_child(clone, dst->body);
+  }
+  clone->data = dst;
+  return clone;
+}
+
+static ASTNode *ast_clone_yield_statement(ASTNode *clone, const ASTNode *node) {
+  const YieldStatement *src = (const YieldStatement *)node->data;
+  YieldStatement *dst = malloc(sizeof(YieldStatement));
+  if (!dst) {
+    free(clone);
+    return NULL;
+  }
+  dst->scope_id = src->scope_id;
+  dst->from_break = src->from_break;
+  dst->label = ast_copy_string(src->label);
+  dst->value = src->value ? ast_clone_node(src->value) : NULL;
+  if (dst->value) {
+    ast_add_child(clone, dst->value);
+  }
+  clone->data = dst;
   return clone;
 }
 
@@ -1159,7 +1204,6 @@ static ASTNode *ast_clone_match_statement(ASTNode *clone, const ASTNode *node) {
     free(clone);
     return NULL;
   }
-  dst->is_expression = src ? src->is_expression : 0;
   dst->arm_count = src ? src->arm_count : 0;
   dst->arms = NULL;
   dst->expression =
@@ -1236,6 +1280,8 @@ static const AstCloneHandler AST_CLONE_HANDLERS[AST_NODE_TYPE_COUNT] = {
     [AST_CONTINUE_STATEMENT] = ast_clone_break_statement,
     [AST_ENUM_DECLARATION] = ast_clone_enum_declaration,
     [AST_MATCH_STATEMENT] = ast_clone_match_statement,
+    [AST_VALUE_SCOPE] = ast_clone_value_scope,
+    [AST_YIELD_STATEMENT] = ast_clone_yield_statement,
 };
 
 ASTNode *ast_clone_node(ASTNode *node) {
@@ -1661,6 +1707,22 @@ void ast_destroy_node(ASTNode *node) {
     }
     break;
   }
+  case AST_VALUE_SCOPE: {
+    ValueScope *scope = (ValueScope *)node->data;
+    if (scope) {
+      ast_free_string(scope->label);
+      free(scope);
+    }
+    break;
+  }
+  case AST_YIELD_STATEMENT: {
+    YieldStatement *yield = (YieldStatement *)node->data;
+    if (yield) {
+      ast_free_string(yield->label);
+      free(yield);
+    }
+    break;
+  }
   case AST_CASE_CLAUSE: {
     CaseClause *case_clause = (CaseClause *)node->data;
     if (case_clause) {
@@ -1775,9 +1837,118 @@ ASTNode *ast_create_program() {
 
   program->declarations = NULL;
   program->declaration_count = 0;
+  program->tail_open = 0;
   node->data = program;
 
   return node;
+}
+
+ASTNode *ast_create_value_scope(ASTNode *body, int scope_id,
+                                ValueScopeKind kind, const char *label,
+                                SourceLocation location) {
+  ASTNode *node = ast_create_node(AST_VALUE_SCOPE, location);
+  ValueScope *scope = malloc(sizeof(ValueScope));
+  if (!node || !scope) {
+    free(node);
+    free(scope);
+    return NULL;
+  }
+  scope->body = body;
+  scope->scope_id = scope_id;
+  scope->kind = kind;
+  scope->label = ast_copy_string(label);
+  scope->tail_pending = 0;
+  node->data = scope;
+  if (body) {
+    ast_add_child(node, body);
+  }
+  return node;
+}
+
+ASTNode *ast_create_yield_statement(ASTNode *value, int scope_id,
+                                    SourceLocation location) {
+  ASTNode *node = ast_create_node(AST_YIELD_STATEMENT, location);
+  YieldStatement *yield = malloc(sizeof(YieldStatement));
+  if (!node || !yield) {
+    free(node);
+    free(yield);
+    return NULL;
+  }
+  yield->value = value;
+  yield->scope_id = scope_id;
+  yield->label = NULL;
+  yield->from_break = 0;
+  node->data = yield;
+  if (value) {
+    ast_add_child(node, value);
+  }
+  return node;
+}
+
+int ast_convert_break_to_yield(ASTNode *node, int scope_id) {
+  LoopControlStatement *ctrl = (LoopControlStatement *)node->data;
+  YieldStatement *yield = malloc(sizeof(YieldStatement));
+  if (!yield) {
+    return 0;
+  }
+  yield->value = ctrl ? ctrl->value : NULL;
+  yield->scope_id = scope_id;
+  yield->label = ctrl ? ctrl->target_label : NULL;
+  yield->from_break = 1;
+  free(ctrl);
+  node->type = AST_YIELD_STATEMENT;
+  node->data = yield;
+  return 1;
+}
+
+ASTNode *ast_create_implicit_return(ASTNode *value, int implicit_tail,
+                                    SourceLocation location) {
+  ASTNode *node = ast_create_node(AST_RETURN_STATEMENT, location);
+  ReturnStatement *ret = malloc(sizeof(ReturnStatement));
+  ASTNode **values = malloc(sizeof(ASTNode *));
+  if (!node || !ret || !values) {
+    free(node);
+    free(ret);
+    free(values);
+    return NULL;
+  }
+  values[0] = value;
+  ret->value = value;
+  ret->values = values;
+  ret->value_count = 1;
+  ret->implicit_tail = implicit_tail;
+  node->data = ret;
+  ast_add_child(node, value);
+  return node;
+}
+
+void ast_replace_child(ASTNode *parent, ASTNode *old_child,
+                       ASTNode *new_child) {
+  for (size_t i = 0; i < parent->child_count; i++) {
+    if (parent->children[i] == old_child) {
+      parent->children[i] = new_child;
+    }
+  }
+}
+
+void ast_unwrap_implicit_return(ASTNode *node) {
+  ReturnStatement *ret = (ReturnStatement *)node->data;
+  ASTNode *value = ret->value;
+  free(ret->values);
+  free(ret);
+  free(node->children);
+  node->type = value->type;
+  node->location = value->location;
+  node->data = value->data;
+  node->children = value->children;
+  node->child_count = value->child_count;
+  node->child_capacity = value->child_capacity;
+  node->child_capacity_owner = value->child_capacity_owner;
+  node->resolved_type = value->resolved_type;
+  node->proven_refinement = value->proven_refinement;
+  node->proven_predicate = value->proven_predicate;
+  node->proven_binding = value->proven_binding;
+  free(value);
 }
 
 ASTNode *ast_create_import_declaration(const char *module_name,
@@ -1913,6 +2084,8 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->explain_code = NULL;
   func_decl->explain_text = NULL;
   func_decl->is_noalloc = 0;
+  func_decl->is_noreturn = 0;
+  func_decl->tail_must_yield = 0;
   func_decl->is_test = 0;
   func_decl->numerics_contract = NULL;
   func_decl->is_swappable = 0;
@@ -2100,9 +2273,9 @@ ASTNode *ast_create_enum_declaration(const char *name, EnumVariant *variants,
   return node;
 }
 
-static ASTNode *ast_create_match_node(ASTNode *expression, MatchArm *arms,
-                                      size_t arm_count, int is_expression,
-                                      SourceLocation location) {
+ASTNode *ast_create_match_statement(ASTNode *expression, MatchArm *arms,
+                                    size_t arm_count,
+                                    SourceLocation location) {
   ASTNode *node = ast_create_node(AST_MATCH_STATEMENT, location);
   if (!node)
     return NULL;
@@ -2113,7 +2286,6 @@ static ASTNode *ast_create_match_node(ASTNode *expression, MatchArm *arms,
     return NULL;
   }
 
-  match->is_expression = is_expression;
   match->expression = expression;
   if (expression)
     ast_add_child(node, expression);
@@ -2140,18 +2312,6 @@ static ASTNode *ast_create_match_node(ASTNode *expression, MatchArm *arms,
 
   node->data = match;
   return node;
-}
-
-ASTNode *ast_create_match_statement(ASTNode *expression, MatchArm *arms,
-                                    size_t arm_count,
-                                    SourceLocation location) {
-  return ast_create_match_node(expression, arms, arm_count, 0, location);
-}
-
-ASTNode *ast_create_match_expression(ASTNode *expression, MatchArm *arms,
-                                     size_t arm_count,
-                                     SourceLocation location) {
-  return ast_create_match_node(expression, arms, arm_count, 1, location);
 }
 
 ASTNode *ast_create_effect_declaration(const char *name,
@@ -3289,7 +3449,18 @@ ASTNode *ast_create_labeled_break_statement(const char *label,
     return NULL;
   }
   data->target_label = ast_copy_string(label);
+  data->value = NULL;
   node->data = data;
+  return node;
+}
+
+ASTNode *ast_create_break_with_value(const char *label, ASTNode *value,
+                                     SourceLocation location) {
+  ASTNode *node = ast_create_labeled_break_statement(label, location);
+  if (node && value) {
+    ((LoopControlStatement *)node->data)->value = value;
+    ast_add_child(node, value);
+  }
   return node;
 }
 
@@ -3304,6 +3475,7 @@ ASTNode *ast_create_labeled_continue_statement(const char *label,
     return NULL;
   }
   data->target_label = ast_copy_string(label);
+  data->value = NULL;
   node->data = data;
   return node;
 }

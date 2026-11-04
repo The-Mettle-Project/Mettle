@@ -1,0 +1,5 @@
+fn main() -> int32 {
+  var n: int32 = 1;
+  var x = if (n > 0) { 1; } else { 2; };
+  return x;
+}

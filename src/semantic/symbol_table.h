@@ -187,6 +187,7 @@ typedef struct Symbol {
   MtlcAddressSpace address_space;
   int is_builtin;
   int is_rule;
+  int is_noreturn;
   int is_meta;
   int is_kernel;
   int kernel_block[3];

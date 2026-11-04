@@ -1,0 +1,382 @@
+import "std/io";
+import "std/core";
+import "std/mem";
+
+struct Point { x: int32; y: int32; }
+struct Wide { a: int64; b: int64; c: int64; }
+
+enum Shape {
+  Circle(float64),
+  Square(int32),
+  Rect(Point),
+  Empty
+}
+
+var g_log: int32 = 0;
+
+fn note(n: int32) -> int32 {
+  g_log = g_log * 10 + n;
+  return n;
+}
+
+fn check(name: string, got: int64, want: int64) {
+  if (got != want) {
+    println("FAIL {name}: got {got}, want {want}");
+  }
+}
+
+fn abs_tail(x: int32) -> int32 {
+  if (x < 0) { -x } else { x }
+}
+
+fn sign_chain(x: int32) -> int32 {
+  if (x < 0) {
+    -1
+  } else if (x == 0) {
+    0
+  } else {
+    1
+  }
+}
+
+fn square_body(x: int32) -> int32 = x * x;
+
+fn add_tail(a: int32, b: int32) -> int32 { a + b }
+
+fn area(s: Shape) -> float64 {
+  match (s) {
+    case Circle(r): 3.0 * r * r,
+    case Square(w): (float64)(w * w),
+    case Rect(p): (float64)(p.x * p.y),
+    case Empty: 0.0,
+  }
+}
+
+fn area_blocks(s: Shape) -> float64 {
+  match s {
+    case Circle(r): {
+      var d = r + r;
+      d * r * 1.5
+    }
+    case Square(w): { (float64)(w * w) }
+    default: { return -1.0; }
+  }
+}
+
+fn name_of(code: int32) -> string {
+  switch (code) {
+    case 1: "one",
+    case 2:
+    case 3: "two or three",
+    case 4..6: { "four to six" }
+    default: "many",
+  }
+}
+
+fn early_tail(x: int32) -> int32 {
+  if (x > 100) {
+    return 100;
+  }
+  x + 1
+}
+
+fn find_first(xs: int32[], want: int32) -> int64 {
+  for i: int64 in 0..xs.length {
+    if (xs[i] == want) {
+      break i;
+    }
+  } else {
+    -1
+  }
+}
+
+fn half(n: int32) -> Result<int32, string> {
+  if (n % 2 != 0) { Err("odd") } else { Ok(n / 2) }
+}
+
+fn quarter(n: int32) -> Result<int32, string> {
+  var h = match (half(n)) {
+    case Ok(v): v,
+    case Err(e): return Err(e),
+  };
+  half(h)
+}
+
+fn make_point(flag: int32) -> Point {
+  if (flag != 0) { { x: 1, y: 2 } } else { { x: 3, y: 4 } }
+}
+
+fn make_new() -> Point* { new Point }
+
+fn id<T>(v: T) -> T { v }
+
+fn pick<T>(flag: int32, a: T, b: T) -> T {
+  if (flag != 0) { a } else { b }
+}
+
+fn deferred_order(flag: int32) -> int32 {
+  defer note(9);
+  var v = if (flag != 0) {
+    defer note(7);
+    note(1)
+  } else {
+    return note(2);
+  };
+  note(3) + v
+}
+
+fn loop_with_break(limit: int32) -> int32 {
+  var total = 0;
+  for i in 0..10 {
+    var step = if (i >= limit) { break; } else { i * 2 };
+    total += step;
+  }
+  total
+}
+
+fn loop_with_continue() -> int32 {
+  var total = 0;
+  for i in 0..6 {
+    var step = if (i % 2 == 0) { continue; } else { i };
+    total += step;
+  }
+  total
+}
+
+fn left_to_right() -> int32 {
+  var x = 1;
+  var y = x + if (x == 1) { x = 10; 5 } else { 6 };
+  y * 100 + x
+}
+
+fn call_order(a: int32, b: int32, c: int32) -> int32 { a * 100 + b * 10 + c }
+
+fn args_in_order() -> int32 {
+  var x = 1;
+  call_order(x, { x = 2; x }, x)
+}
+
+fn labeled_block(n: int32) -> int32 {
+  var r = found: {
+    if (n < 0) { break found -1; }
+    if (n == 0) { break found 0; }
+    n * 2
+  };
+  r + 1
+}
+
+fn nested_labels() -> int32 {
+  var hit = outer: for i in 0..5 {
+    for j in 0..5 {
+      if (i * j == 6) { break outer i * 10 + j; }
+    }
+  } else {
+    -1
+  };
+  hit
+}
+
+fn while_value() -> int32 {
+  var n = 0;
+  var r = while (true) {
+    n += 1;
+    if (n * n > 50) { break n; }
+  };
+  r
+}
+
+fn for_else_statement(limit: int32) -> int32 {
+  var seen = 0;
+  for i in 0..3 {
+    if (i == limit) { seen = 100; break; }
+  } else {
+    seen = 7;
+  }
+  seen
+}
+
+fn no_parens(a: int32, b: int32) -> int32 {
+  var total = 0;
+  if a > b {
+    total = 1;
+  } else if a == b {
+    total = 2;
+  } else {
+    total = 3;
+  }
+  while total < 5 {
+    total += 1;
+  }
+  switch total {
+    case 5: { total = total * 2; }
+    default: { total = 0; }
+  }
+  total
+}
+
+fn mixed_parens(a: int32, b: int32) -> int32 {
+  if (a > 0) && (b > 0) { 1 } else { 0 }
+}
+
+fn allman(a: int32) -> int32
+{
+  if (a > 0)
+  {
+    return 1;
+  }
+  else
+  {
+    return 0;
+  }
+}
+
+fn dangling_else(a: int32, n: int32) -> int32 {
+  var r = 0;
+  if (a > 0) while (r < n) { r += 1; } else { r = 50; }
+  return r;
+}
+
+fn semi_is_statement(a: int32) -> int32 {
+  if (a > 0) {
+    return 5;
+  }
+  note(4);
+  return 6;
+}
+
+@noreturn fn die(code: int32) {
+  while (true) { note(code); return; }
+}
+
+fn uses_noreturn(a: int32) -> int32 {
+  var v = if (a > 0) { a } else { die(1); };
+  v + 1
+}
+
+fn uses_noreturn_bare(s: Result<int32, string>) -> int32 {
+  match (s) {
+    case Ok(v): v,
+    case Err(e): die(2),
+  }
+}
+
+fn main() -> int32 {
+  check("abs_tail", abs_tail(-4), 4);
+  check("abs_tail2", abs_tail(4), 4);
+  check("sign", sign_chain(-9) * 100 + sign_chain(0) * 10 + sign_chain(9), -99);
+  check("square", square_body(7), 49);
+  check("add", add_tail(2, 3), 5);
+  check("area", (int64)area(Shape.Square(3)), 9);
+  check("area2", (int64)area(Shape.Rect({ x: 2, y: 5 })), 10);
+  check("area3", (int64)area_blocks(Shape.Circle(2.0)), 12);
+  check("area4", (int64)area_blocks(Shape.Empty), -1);
+  check("early", early_tail(500) + early_tail(5), 106);
+
+  var ternary = if (g_log == 0) 11 else 22;
+  check("bare arms", ternary, 11);
+  var nested = 1 + if (ternary > 5) { if (ternary > 10) { 100 } else { 200 } } else { 300 };
+  check("nested", nested, 101);
+  var as_arg = add_tail(if (nested > 0) { 1 } else { 2 }, match (Shape.Empty) { case Empty: 40, default: 50 });
+  check("in args", as_arg, 41);
+  var block_value = { var t = 6; t * t };
+  check("block", block_value, 36);
+
+  var wide: int64 = if (nested > 0) { 1 } else { 5000000000 };
+  check("wide target", wide, 1);
+  var narrow: int8 = if (nested > 0) { 100 } else { -100 };
+  check("narrow target", narrow, 100);
+  var unsigned_byte: uint8 = if (nested > 0) { 200 } else { 0 };
+  check("unsigned target", unsigned_byte, 200);
+  var small: int16 = -7;
+  var promoted: int64 = if (nested > 0) { small } else { 0 };
+  check("sign extends", promoted, -7);
+  var literal_first = if (nested < 0) { 3 } else { wide };
+  check("literal first", literal_first, 1);
+  var f32: float32 = if (nested > 0) { 1.5 } else { 2.5 };
+  check("float32", (int64)(f32 * 2.0), 3);
+  var f64 = if (nested > 0) { 2.25 } else { 0.0 };
+  check("float64", (int64)(f64 * 4.0), 9);
+  var half16: float16 = (float16)1.5;
+  var f16 = if (nested > 0) { half16 } else { half16 };
+  check("float16", (int64)((float64)f16 * 2.0), 3);
+  var half_b: bfloat16 = (bfloat16)1.5;
+  var fb = if (nested > 0) { half_b } else { half_b };
+  check("bfloat16", (int64)((float64)fb * 2.0), 3);
+  var flag = if (nested > 0) { 1 > 0 } else { 1 < 0 };
+  check("bool", if (flag) 1 else 0, 1);
+  var ch = if (nested > 0) { 'x' } else { 'y' };
+  check("char", (int64)ch, 120);
+
+  var p = make_point(1);
+  check("struct", p.x * 10 + p.y, 12);
+  var q = if (nested < 0) { p } else { make_point(0) };
+  check("struct2", q.x * 10 + q.y, 34);
+  var lit: Point = if (nested > 0) { { x: 8, y: 9 } } else { p };
+  check("struct literal", lit.x * 10 + lit.y, 89);
+  var w: Wide = { a: 1, b: 2, c: 3 };
+  var w2 = if (nested > 0) { w } else { w };
+  check("wide struct", w2.a + w2.b * 10 + w2.c * 100, 321);
+  check("member of value", (if (nested > 0) { w } else { w }).c, 3);
+
+  var s = if (nested > 0) { "yes" } else { "no" };
+  check("string", (int64)s.length, 3);
+  var msg = "v={if (nested > 0) { 1 } else { 2 }}";
+  check("interpolated", (int64)msg.length, 3);
+  check("switch", (int64)(name_of(1).length * 1000 + name_of(3).length * 10), 3120);
+  check("switch range", (int64)name_of(5).length, 11);
+  check("switch default", (int64)name_of(50).length, 4);
+
+  var arr: int32[3] = [5, 6, 7];
+  var arr2 = if (nested > 0) { arr } else { arr };
+  check("array", arr2[2], 7);
+  var slice: int32[] = if (nested > 0) { arr } else { arr };
+  check("slice", slice[1] + slice.length, 9);
+  check("for else found", find_first(arr, 6), 1);
+  check("for else missing", find_first(arr, 60), -1);
+
+  var ptr: Point* = if (nested > 0) { &p } else { 0 };
+  check("pointer", ptr->y, 2);
+  var nothing: Point* = if (nested < 0) { &p } else { 0 };
+  check("null pointer", if (nothing == 0) 1 else 0, 1);
+  var made = make_new();
+  check("new", made->x, 0);
+  free(made);
+
+  check("ok", match (quarter(8)) { case Ok(v): v, case Err(e): -1 }, 2);
+  check("err", match (quarter(6)) { case Ok(v): v, case Err(e): -1 }, -1);
+  check("generic", id(if (nested > 0) { 5 } else { 6 }), 5);
+  check("generic body", pick(1, 7, 8) + pick(0, 7, 8), 15);
+
+  g_log = 0;
+  check("defer value", deferred_order(1), 4);
+  check("defer order", g_log, 1739);
+  g_log = 0;
+  check("defer return", deferred_order(0), 2);
+  check("defer return order", g_log, 29);
+
+  check("break", loop_with_break(3), 6);
+  check("continue", loop_with_continue(), 9);
+  check("left to right", left_to_right(), 610);
+  check("arg order", args_in_order(), 122);
+  check("label", labeled_block(-3) + labeled_block(0) * 10 + labeled_block(4) * 100, 910);
+  check("nested label", nested_labels(), 23);
+  check("while value", while_value(), 8);
+  check("for else stmt", for_else_statement(9) + for_else_statement(1) * 10, 1007);
+  check("no parens", no_parens(2, 1) + no_parens(1, 1) * 100, 1010);
+  check("mixed parens", mixed_parens(1, 1) * 10 + mixed_parens(0, 1), 10);
+  check("allman", allman(1), 1);
+  check("dangling else", dangling_else(1, 3) * 100 + dangling_else(0, 3), 350);
+  check("semi", semi_is_statement(0), 6);
+  check("noreturn", uses_noreturn(4), 5);
+  check("noreturn bare", uses_noreturn_bare(Ok(6)), 6);
+
+  var f: Fn(int32) -> int32 = fn(x: int32) -> int32 { x + nested };
+  check("closure tail", f(1), 102);
+  var g: Fn(int32) -> int32 = fn(x: int32) -> int32 = x * nested;
+  check("closure body", g(2), 202);
+  var cl: Fn(int32) -> int32 = if (nested > 0) { f } else { g };
+  check("closure value", cl(0), 101);
+
+  println("done");
+  return 0;
+}
