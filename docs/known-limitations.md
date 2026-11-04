@@ -170,10 +170,6 @@ declaration names under rules the compiler checks.
 `ident(...)` composes a declaration's name, not a type. A generated type can be
 named where it is used, and not from inside the iteration that generated it.
 
-A `comptime for` reflects on the types the program wrote. Module-scope
-expansion runs after those are registered and before the generated ones are, so
-`typeof(GeneratedStruct).fields` reports an unknown type.
-
 The binding cannot appear where a type goes. `f.type` answers `f.type.size` and
 `f.type.kind`, and cannot be written as a parameter, return, or field type.
 
@@ -582,6 +578,24 @@ only confirm the static proof: purity is proven by refusing every operation
 that could write, so no Mettle program can pass the check and then write, and
 the watch is proven live by `--check-purity-fault`, which corrupts the analysis
 on purpose so the watch has something real to catch.
+
+## Metaprogramming
+
+A `T*` for a type with several regions is 24 bytes, so a struct holding one is
+16 bytes larger than the same struct holding a thin pointer.
+
+A live patch that turns `T` into columns reads a thin pointer into a global or a
+stack array as a reference to one lone value. Pointers into heap arrays convert
+correctly.
+
+`grad` refuses `inline_asm`, a tagged enum at its root, and an array of a
+multi-region type inside a by-value struct. Its generated rule probes slices of
+three elements, so a function that needs more fails its own rule with `R0001`.
+
+Reflection refuses a `matmul` kernel by name under `@generate(optimized)`.
+
+A function too large for the allocator's graph keeps the built-in linear scan
+when `@regalloc` is set.
 
 ## See also
 

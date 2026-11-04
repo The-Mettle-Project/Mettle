@@ -173,8 +173,7 @@ site that defeated it.
 
 ### Passes worth naming
 
-`sroa` splits struct locals into register-promotable scalars. `layout_factor`
-re-maps provably private allocations into a compact layout.
+`sroa` splits struct locals into register-promotable scalars.
 `null_check_licm` hoists a null check out of a loop. `prefetch_indirect`
 inserts prefetches ahead of an indirect access. `egraph_simplify` is an
 e-class pilot, inert unless `METTLE_EGRAPH=1`.

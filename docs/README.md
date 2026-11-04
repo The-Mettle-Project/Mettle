@@ -43,6 +43,8 @@ frontend can drive instead. The documentation is organized the same way.
   when.
 - [Runtime model](runtime-model.md): what an emitted program assumes of the OS, and a frame written down as data.
 - [Live programs](live.md): `mettle live` changes a running program on every save.
+- [Metaprogramming](metaprogramming.md): layouts, generators, optimizer passes and
+  register allocation written in Mettle.
 - [Bare metal](bare-metal.md): inline assembly, `volatile`, `@naked` and
   `@interrupt`, cross-compilation, a described calling convention, a described
   instruction set, a chosen link address, 16-bit code, and one table of what
