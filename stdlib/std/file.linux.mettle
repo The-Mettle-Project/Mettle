@@ -1,5 +1,8 @@
-// Linux file calls for std/file, through raw x86-64 system calls. Every call
+// Linux file calls for std/file, through raw system calls (x86-64 or AArch64,
+// numbers from std/linux_sys). Every call
 // returns a count, size or descriptor, or a negative error code (-errno).
+
+import "std/linux_sys";
 
 export const FILE_READ = 1;       // open for reading
 export const FILE_WRITE = 2;      // open for writing
@@ -17,17 +20,6 @@ export const FILE_EEXIST = 17;
 export const FILE_EWOULDBLOCK = 11;
 export const FILE_EINTR = 4;
 
-const SYS_CLOSE = 3;
-const SYS_FSTAT = 5;
-const SYS_PREAD64 = 17;
-const SYS_PWRITE64 = 18;
-const SYS_FLOCK = 73;
-const SYS_FSYNC = 74;
-const SYS_FDATASYNC = 75;
-const SYS_FTRUNCATE = 77;
-const SYS_RENAME = 82;
-const SYS_UNLINK = 87;
-const SYS_OPENAT = 257;
 
 // Copies a path into buf with a NUL. Returns false if it does not fit.
 fn file_cpath(path: string, buf: uint8*) -> bool {
@@ -52,35 +44,35 @@ export fn file_open(path: string, flags: int32) -> int64 {
   if ((flags & FILE_NEW) != 0) { o = o | 0x80; }
   if ((flags & FILE_TRUNCATE) != 0) { o = o | 0x200; }
   if ((flags & FILE_APPEND) != 0) { o = o | 0x400; }
-  return syscall(SYS_OPENAT, -100, &cp[0], o, 420);   // AT_FDCWD, 0644
+  return syscall(LINUX_SYS_OPENAT, -100, &cp[0], o, 420);   // AT_FDCWD, 0644
 }
 
-export fn file_close(fd: int64) -> int64 { return syscall(SYS_CLOSE, fd); }
+export fn file_close(fd: int64) -> int64 { return syscall(LINUX_SYS_CLOSE, fd); }
 
 // Reads up to n bytes at offset, leaving the file position alone. 0 means
 // end of file.
 export fn file_read_at(fd: int64, buf: uint8*, n: int64, offset: int64) -> int64 {
-  return syscall(SYS_PREAD64, fd, buf, n, offset);
+  return syscall(LINUX_SYS_PREAD64, fd, buf, n, offset);
 }
 
 // Writes up to n bytes at offset, leaving the file position alone.
 export fn file_write_at(fd: int64, buf: uint8*, n: int64, offset: int64) -> int64 {
-  return syscall(SYS_PWRITE64, fd, buf, n, offset);
+  return syscall(LINUX_SYS_PWRITE64, fd, buf, n, offset);
 }
 
 // Flushes data and metadata to the device.
-export fn file_sync(fd: int64) -> int64 { return syscall(SYS_FSYNC, fd); }
+export fn file_sync(fd: int64) -> int64 { return syscall(LINUX_SYS_FSYNC, fd); }
 
 // Flushes data, and only the metadata needed to read it back.
-export fn file_sync_data(fd: int64) -> int64 { return syscall(SYS_FDATASYNC, fd); }
+export fn file_sync_data(fd: int64) -> int64 { return syscall(LINUX_SYS_FDATASYNC, fd); }
 
 export fn file_truncate(fd: int64, size: int64) -> int64 {
-  return syscall(SYS_FTRUNCATE, fd, size);
+  return syscall(LINUX_SYS_FTRUNCATE, fd, size);
 }
 
 export fn file_size(fd: int64) -> int64 {
   var st: int64[18];   // struct stat is 144 bytes; st_size is at 48
-  var r: int64 = syscall(SYS_FSTAT, fd, &st[0]);
+  var r: int64 = syscall(LINUX_SYS_FSTAT, fd, &st[0]);
   if (r < 0) { return r; }
   return st[6];
 }
@@ -90,13 +82,13 @@ export fn file_rename(from: string, to: string) -> int64 {
   var a: uint8[4096];
   var b: uint8[4096];
   if (!file_cpath(from, &a[0]) || !file_cpath(to, &b[0])) { return -36; }
-  return syscall(SYS_RENAME, &a[0], &b[0]);
+  return syscall(LINUX_SYS_RENAMEAT, -100, &a[0], -100, &b[0]);   // AT_FDCWD
 }
 
 export fn file_remove(path: string) -> int64 {
   var cp: uint8[4096];
   if (!file_cpath(path, &cp[0])) { return -36; }
-  return syscall(SYS_UNLINK, &cp[0]);
+  return syscall(LINUX_SYS_UNLINKAT, -100, &cp[0], 0);
 }
 
 // Takes an advisory lock on the whole file: FILE_LOCK_SHARED or
@@ -106,7 +98,7 @@ export fn file_lock(fd: int64, kind: int32, wait: bool) -> int64 {
   var op: int64 = 1;
   if (kind == FILE_LOCK_EXCLUSIVE) { op = 2; }
   if (!wait) { op = op | 4; }
-  return syscall(SYS_FLOCK, fd, op);
+  return syscall(LINUX_SYS_FLOCK, fd, op);
 }
 
-export fn file_unlock(fd: int64) -> int64 { return syscall(SYS_FLOCK, fd, 8); }
+export fn file_unlock(fd: int64) -> int64 { return syscall(LINUX_SYS_FLOCK, fd, 8); }

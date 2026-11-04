@@ -1,0 +1,39 @@
+// Linux system call numbers for AArch64 (the generic table). std/linux_sys
+// picks this file or linux_sys_x86_64 by target; both export the same names.
+
+export const LINUX_SYS_CLOSE = 57;
+export const LINUX_SYS_FSTAT = 80;
+export const LINUX_SYS_PREAD64 = 67;
+export const LINUX_SYS_PWRITE64 = 68;
+export const LINUX_SYS_GETPID = 172;
+export const LINUX_SYS_SOCKET = 198;
+export const LINUX_SYS_CONNECT = 203;
+export const LINUX_SYS_SENDTO = 206;
+export const LINUX_SYS_RECVFROM = 207;
+export const LINUX_SYS_SHUTDOWN = 210;
+export const LINUX_SYS_BIND = 200;
+export const LINUX_SYS_LISTEN = 201;
+export const LINUX_SYS_GETSOCKNAME = 204;
+export const LINUX_SYS_GETPEERNAME = 205;
+export const LINUX_SYS_SETSOCKOPT = 208;
+export const LINUX_SYS_GETSOCKOPT = 209;
+export const LINUX_SYS_KILL = 129;
+export const LINUX_SYS_FCNTL = 25;
+export const LINUX_SYS_FLOCK = 32;
+export const LINUX_SYS_FSYNC = 82;
+export const LINUX_SYS_FDATASYNC = 83;
+export const LINUX_SYS_FTRUNCATE = 46;
+export const LINUX_SYS_FUTEX = 98;
+export const LINUX_SYS_CLOCK_GETTIME = 113;
+export const LINUX_SYS_EPOLL_CTL = 21;
+export const LINUX_SYS_OPENAT = 56;
+export const LINUX_SYS_UNLINKAT = 35;
+export const LINUX_SYS_RENAMEAT = 38;
+export const LINUX_SYS_PPOLL = 73;
+export const LINUX_SYS_EPOLL_PWAIT = 22;
+export const LINUX_SYS_ACCEPT4 = 242;
+export const LINUX_SYS_EPOLL_CREATE1 = 20;
+
+// struct epoll_event has natural alignment on AArch64: the data starts at 8.
+export const LINUX_EPOLL_EVENT_SIZE = 16;
+export const LINUX_EPOLL_DATA_AT = 8;

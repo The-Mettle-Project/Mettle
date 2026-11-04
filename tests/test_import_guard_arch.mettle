@@ -1,0 +1,9 @@
+// The x86_64 and aarch64 import guards take exactly one of the two files:
+// both would be a duplicate GUARD_ARCH, neither an undefined one.
+import "import_guard_arch/x86_64" if x86_64;
+import "import_guard_arch/aarch64" if aarch64;
+
+fn main() -> int32 {
+  if (GUARD_ARCH == 1 || GUARD_ARCH == 2) { return 0; }
+  return 1;
+}

@@ -1,0 +1,39 @@
+// Linux system call numbers for x86-64. std/linux_sys picks this file or
+// linux_sys_aarch64 by target; both export the same names.
+
+export const LINUX_SYS_CLOSE = 3;
+export const LINUX_SYS_FSTAT = 5;
+export const LINUX_SYS_PREAD64 = 17;
+export const LINUX_SYS_PWRITE64 = 18;
+export const LINUX_SYS_GETPID = 39;
+export const LINUX_SYS_SOCKET = 41;
+export const LINUX_SYS_CONNECT = 42;
+export const LINUX_SYS_SENDTO = 44;
+export const LINUX_SYS_RECVFROM = 45;
+export const LINUX_SYS_SHUTDOWN = 48;
+export const LINUX_SYS_BIND = 49;
+export const LINUX_SYS_LISTEN = 50;
+export const LINUX_SYS_GETSOCKNAME = 51;
+export const LINUX_SYS_GETPEERNAME = 52;
+export const LINUX_SYS_SETSOCKOPT = 54;
+export const LINUX_SYS_GETSOCKOPT = 55;
+export const LINUX_SYS_KILL = 62;
+export const LINUX_SYS_FCNTL = 72;
+export const LINUX_SYS_FLOCK = 73;
+export const LINUX_SYS_FSYNC = 74;
+export const LINUX_SYS_FDATASYNC = 75;
+export const LINUX_SYS_FTRUNCATE = 77;
+export const LINUX_SYS_FUTEX = 202;
+export const LINUX_SYS_CLOCK_GETTIME = 228;
+export const LINUX_SYS_EPOLL_CTL = 233;
+export const LINUX_SYS_OPENAT = 257;
+export const LINUX_SYS_UNLINKAT = 263;
+export const LINUX_SYS_RENAMEAT = 264;
+export const LINUX_SYS_PPOLL = 271;
+export const LINUX_SYS_EPOLL_PWAIT = 281;
+export const LINUX_SYS_ACCEPT4 = 288;
+export const LINUX_SYS_EPOLL_CREATE1 = 291;
+
+// struct epoll_event is packed on x86-64: 4 bytes of events, then the data.
+export const LINUX_EPOLL_EVENT_SIZE = 12;
+export const LINUX_EPOLL_DATA_AT = 4;

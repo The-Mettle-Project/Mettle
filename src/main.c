@@ -6967,6 +6967,10 @@ static int compile_stage_imports(CompileContext *ctx) {
       (options && (options->emit_arm64 || options->emit_arm64_obj)) ||
       host_target_is_posix();
   import_options.target_is_macos = host_target_is_macho();
+  import_options.target_is_arm64 =
+      (options && (options->emit_arm64 || options->emit_arm64_obj)) ||
+      mtlc_target()->format == BINARY_TARGET_FORMAT_ELF_ARM64 ||
+      mtlc_target()->format == BINARY_TARGET_FORMAT_MACHO_ARM64;
   import_options.gpu_provider_metal =
       options && (options->gpu_provider == 2 ||
                   (options->gpu_provider == 0 && host_target_is_macho()));

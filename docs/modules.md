@@ -57,6 +57,14 @@ macOS. An import for another platform is dropped before the path is resolved,
 so that file need not exist on this machine. Guards work on all three import
 forms.
 
+Two more guards pick a CPU: `x86_64` and `aarch64`. They are for data that
+differs by architecture, such as Linux system call numbers:
+
+```mettle
+import "std/linux_sys_x86_64" if x86_64;
+import "std/linux_sys_aarch64" if aarch64;
+```
+
 A `std/` import without an extension picks the platform's file when one
 exists: `std/io.linux.mettle` on Linux, and on macOS `std/io.macos.mettle`
 first, then the Linux file. With the Metal GPU provider (the default on
