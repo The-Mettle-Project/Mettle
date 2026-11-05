@@ -619,7 +619,7 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
     if (lhs.kind == IR_OPERAND_STRING) {
       IROperand args[2] = {destination,
                            ir_operand_int((long long)ir_operand_string_length(&lhs) + 1)};
-      int seeded = origin_call(origins, location, "mettle_safety_string_identity",
+      int seeded = origin_call(origins, location, "mettle_safety_string_contents",
                                args, 2, NULL);
       ir_operand_destroy(&destination);
       if (!seeded) goto done;

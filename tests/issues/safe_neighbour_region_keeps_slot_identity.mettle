@@ -1,0 +1,15 @@
+import "std/io";
+struct S { a: string; n: int32; b: string; }
+fn mk(a: string, n: int32, b: string) -> S { var s: S; s.a = a; s.n = n; s.b = b; return s; }
+fn twice(s: string) -> string { return s + s; }
+fn sum(s: string) -> int64 { var t: int64 = 0; for i in 0..s.length { t = t * 7 + (int64)s[i]; } return t; }
+fn inout(s: S*) { s->a = s->b + "!"; s->n = s->n + 1; }
+@noinline fn body2() {
+  var t11: S = mk("b", 52, "ya");
+  inout(&t11);
+  var s15: string = "c0" + "bb";
+  var s16: string = "<{1}>";
+  var s17: string = twice((if (true) { "a0" } else { s15 }));
+  var r: int64 = sum(s16);
+}
+fn main() -> int32 { body2(); println("ok"); return 0; }

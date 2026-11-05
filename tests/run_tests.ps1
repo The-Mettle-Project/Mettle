@@ -21648,6 +21648,7 @@ $issueRegressions = @(
   @{ Name = "safe_release_rule_helper"; Command = @("--safe", "--release", "--build", "tests/test_rule_machine_fail.mettle", "-o", ".tmp/issue_rule_fail.exe"); Expect = @("MACHINE_RULE_MARKER_XYZ") },
   @{ Name = "safe_release_simd_contract_stays_scalar"; Entry = "tests/test_vloop_general.mettle"; Args = @("--safe", "--release"); Expect = @() },
   @{ Name = "safe_release_parallel_runs_on_one_thread"; Entry = "tests/test_parallel_loop.mettle"; Args = @("--safe", "--release"); Expect = @() },
+  @{ Name = "safe_neighbour_region_keeps_slot_identity"; Entry = "tests/issues/safe_neighbour_region_keeps_slot_identity.mettle"; Args = @("--safe"); Expect = @("ok") },
   @{ Name = "parse_errors_name_every_token"; Command = @("--build", "tests/issues/err_token_name.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Expected ']', found '..'") },
   @{ Name = "multiline_string_keeps_line_numbers"; Command = @("--build", "tests/issues/err_multiline_string_line.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("err_multiline_string_line.mettle:5:") },
   @{ Name = "issue_profile_runtime_skips_naked";Entry = "tests/issues/issue_162.mettle"; Args = @("--profile-runtime"); Expect = @("7") },

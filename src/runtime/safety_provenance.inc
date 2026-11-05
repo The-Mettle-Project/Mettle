@@ -87,7 +87,10 @@ static size_t safety_value_bucket(uintptr_t address) {
 static uint64_t safety_owner_identity(uintptr_t address) {
   uint32_t id = safety_lookup(address);
   SafetyRegion *region = id >= SAFETY_ID_FIRST ? safety_region(id) : NULL;
-  return region ? region->identity : 0;
+  return region && address >= region->start &&
+                 address - region->start < region->size
+             ? region->identity
+             : 0;
 }
 
 static SafetyValue *safety_value_find(uintptr_t address) {
