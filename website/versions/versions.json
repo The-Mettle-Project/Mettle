@@ -1,0 +1,242 @@
+[
+  {
+    "version": "0.18.0",
+    "date": "2026-11-05",
+    "previous": "0.17.0",
+    "commits": 617,
+    "notes": "0.18.0.md",
+    "claim": "Build rules, layouts, optimizer passes and the register allocator are now Mettle code you write.",
+    "chart": {
+      "title": "The gap to clang went from 18% to 4%.",
+      "caption": "Suite 3, 16 whole programs, each against its own C twin under clang -O3 on the same machine, best of 15 pinned runs. Same answers on all 16.",
+      "before": "0.17.0",
+      "after": "0.18.0",
+      "rows": [
+        {
+          "name": "json_parse",
+          "before": 1.623,
+          "after": 1.154
+        },
+        {
+          "name": "interp_ast",
+          "before": 1.171,
+          "after": 1.219
+        },
+        {
+          "name": "word_freq",
+          "before": 1.216,
+          "after": 1.1
+        },
+        {
+          "name": "huffman",
+          "before": 1.05,
+          "after": 1.004
+        },
+        {
+          "name": "lz77",
+          "before": 1.158,
+          "after": 1.101
+        },
+        {
+          "name": "astar_grid",
+          "before": 1.148,
+          "after": 1.141
+        },
+        {
+          "name": "regex_match",
+          "before": 1.013,
+          "after": 0.961
+        },
+        {
+          "name": "physics_grid",
+          "before": 1.226,
+          "after": 1.277
+        },
+        {
+          "name": "btree_index",
+          "before": 1.205,
+          "after": 1.151
+        },
+        {
+          "name": "bytecode_vm",
+          "before": 0.645,
+          "after": 0.419
+        },
+        {
+          "name": "sudoku_solve",
+          "before": 1.333,
+          "after": 0.74
+        },
+        {
+          "name": "voxel_trace",
+          "before": 1.172,
+          "after": 1.072
+        },
+        {
+          "name": "diff_lcs",
+          "before": 1.256,
+          "after": 1.313
+        },
+        {
+          "name": "csv_query",
+          "before": 1.231,
+          "after": 1.045
+        },
+        {
+          "name": "mark_sweep",
+          "before": 1.176,
+          "after": 1.128
+        },
+        {
+          "name": "link_resolve",
+          "before": 1.562,
+          "after": 1.225
+        }
+      ]
+    }
+  },
+  {
+    "version": "0.17.0",
+    "date": "2026-09-01",
+    "commits": 70,
+    "previous": "0.16.3"
+  },
+  {
+    "version": "0.16.3",
+    "date": "2026-08-19",
+    "commits": 29,
+    "previous": "0.16.2"
+  },
+  {
+    "version": "0.16.2",
+    "date": "2026-08-18",
+    "commits": 7,
+    "previous": "0.16.1"
+  },
+  {
+    "version": "0.16.1",
+    "date": "2026-08-17",
+    "commits": 14,
+    "previous": "0.16.0"
+  },
+  {
+    "version": "0.16.0",
+    "date": "2026-08-17",
+    "commits": 250,
+    "previous": "0.15.1"
+  },
+  {
+    "version": "0.15.1",
+    "date": "2026-07-31",
+    "commits": 1,
+    "previous": "0.15.0"
+  },
+  {
+    "version": "0.15.0",
+    "date": "2026-07-31",
+    "commits": 2,
+    "previous": "0.14.2"
+  },
+  {
+    "version": "0.14.2",
+    "date": "2026-07-30",
+    "commits": 1,
+    "previous": "0.14.1"
+  },
+  {
+    "version": "0.14.1",
+    "date": "2026-07-30",
+    "commits": 1,
+    "previous": "0.14.0"
+  },
+  {
+    "version": "0.14.0",
+    "date": "2026-07-30",
+    "commits": 8,
+    "previous": "0.13.0"
+  },
+  {
+    "version": "0.13.0",
+    "date": "2026-07-06",
+    "commits": 38,
+    "previous": "0.12.0"
+  },
+  {
+    "version": "0.12.0",
+    "date": "2026-06-24",
+    "commits": 5,
+    "previous": "0.11.0"
+  },
+  {
+    "version": "0.11.0",
+    "date": "2026-06-12",
+    "commits": 21,
+    "previous": "0.10.0"
+  },
+  {
+    "version": "0.10.0",
+    "date": "2026-06-10",
+    "commits": 69,
+    "previous": "0.9.1"
+  },
+  {
+    "version": "0.9.1",
+    "date": "2026-05-27",
+    "commits": 2,
+    "previous": "0.9.0"
+  },
+  {
+    "version": "0.9.0",
+    "date": "2026-05-27",
+    "commits": 13,
+    "previous": "0.8.0"
+  },
+  {
+    "version": "0.8.0",
+    "date": "2026-05-25",
+    "commits": 38,
+    "previous": "0.7.1"
+  },
+  {
+    "version": "0.7.1",
+    "date": "2026-05-21",
+    "commits": 18,
+    "previous": "0.7.0"
+  },
+  {
+    "version": "0.7.0",
+    "date": "2026-05-18",
+    "commits": 14,
+    "previous": "0.6.0"
+  },
+  {
+    "version": "0.6.0",
+    "date": "2026-03-06",
+    "commits": 5,
+    "previous": "0.5.0"
+  },
+  {
+    "version": "0.5.0",
+    "date": "2026-03-05",
+    "commits": 15,
+    "previous": "0.4.0"
+  },
+  {
+    "version": "0.4.0",
+    "date": "2026-03-01",
+    "commits": 26,
+    "previous": "0.3.0"
+  },
+  {
+    "version": "0.3.0",
+    "date": "2026-02-27",
+    "commits": 5,
+    "previous": "0.2.0"
+  },
+  {
+    "version": "0.2.0",
+    "date": "2026-02-26",
+    "commits": 43,
+    "previous": null
+  }
+]

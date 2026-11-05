@@ -13,6 +13,8 @@ on:
       - "website/media/**"
       - "website/registry/**"
       - "website/registry.py"
+      - "website/versions/**"
+      - "website/versions.py"
       - "website/fonts/**"
       - "tools/gen-site-reference.py"
       - "src/error/error_explain.c"
@@ -46,6 +48,8 @@ jobs:
           cp website/media/hero.mp4 website/media/canyon.mp4 website/media/canyon-poster.jpg website/media/og.jpg _site/media/
       - name: Build the package registry
         run: python3 website/registry.py build --out _site/registry
+      - name: Build the versions pages
+        run: python3 website/versions.py --out _site/versions
       - uses: actions/upload-pages-artifact@v4
         with:
           path: _site

@@ -9,8 +9,7 @@
     "uniform vec2 scale;",
     "uniform vec2 offset;",
     "uniform vec4 fade;",
-    "uniform vec4 clearing[4];",
-    "uniform float density;",
+    "uniform vec2 rise;",
     "void main() {",
     "  vec2 cell = floor(gl_FragCoord.xy);",
     "  vec2 uv = (cell + 0.5) / res;",
@@ -18,18 +17,14 @@
     "  float lum = dot(picture, vec3(0.299, 0.587, 0.114));",
     "  vec3 ink = clamp((vec3(lum) + (picture - lum) * 1.25) * 0.95 * pow(max(lum, 0.05), -0.38), 0.0, 1.0);",
     "  float shaped = pow(lum, 0.62);",
-    "  shaped *= smoothstep(0.0, fade.x, uv.y) * (1.0 - smoothstep(1.0 - fade.y, 1.0, uv.y)) * smoothstep(fade.z, fade.w, uv.x);",
-    "  for (int i = 0; i < 4; i++) {",
-    "    vec2 gap = max(max(clearing[i].xy - gl_FragCoord.xy, gl_FragCoord.xy - clearing[i].zw), vec2(0.0));",
-    "    shaped *= smoothstep(2.0 * density, 76.0 * density, length(gap));",
-    "  }",
+    "  shaped *= smoothstep(rise.x, rise.y, uv.y) * (1.0 - smoothstep(1.0 - fade.y, 1.0, uv.y)) * smoothstep(fade.z, fade.w, uv.x);",
     "  float limit = texture2D(map, (mod(cell, 8.0) + 0.5) / 8.0).r;",
     "  vec3 ground = vec3(23.0, 24.0, 26.0) / 255.0;",
     "  gl_FragColor = vec4(mix(ground, ink, step(limit + 0.034, shaped)), 1.0);",
     "}"
   ].join("\n");
 
-  function halftone(host, words) {
+  function halftone(host) {
     var source = host.getAttribute("data-image");
     var fade = host.getAttribute("data-fade").split(" ").map(Number);
     var focus = parseFloat(host.getAttribute("data-focus") || "0.5");
@@ -84,17 +79,20 @@
 
     var picture = 16 / 9;
     var ready = false;
-    function mark(density) {
-      var box = canvas.getBoundingClientRect();
-      var rects = new Float32Array(16).fill(-100000);
-      words.forEach(function (word, i) {
+    var words = host.classList.contains("sky") ? [].slice.call(host.querySelectorAll(".wrap > *")) : [];
+    function textTop(box) {
+      var top = box.bottom;
+      words.forEach(function (word) {
         var r = word.getBoundingClientRect();
-        rects[i * 4] = (r.left - box.left) * density;
-        rects[i * 4 + 1] = canvas.height - (r.bottom - box.top) * density;
-        rects[i * 4 + 2] = (r.right - box.left) * density;
-        rects[i * 4 + 3] = canvas.height - (r.top - box.top) * density;
+        if (r.height > 2 && r.top < top) top = r.top;
       });
-      gl.uniform4fv(uni("clearing"), rects);
+      return top;
+    }
+    function settle() {
+      var box = canvas.getBoundingClientRect();
+      if (!box.height) return;
+      var base = words.length ? Math.max(0, (box.bottom - textTop(box) + 28) / box.height) : 0;
+      gl.uniform2f(uni("rise"), base, base + fade[0]);
     }
     function fit() {
       var density = Math.min(window.devicePixelRatio || 1, 2);
@@ -110,8 +108,7 @@
       gl.uniform2f(uni("res"), w, h);
       gl.uniform2f(uni("scale"), sx, sy);
       gl.uniform2f(uni("offset"), (1 - sx) / 2, (1 - sy) * focus);
-      gl.uniform1f(uni("density"), density);
-      mark(density);
+      settle();
     }
     function draw() {
       if (ready) gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -125,18 +122,11 @@
       draw();
     };
     image.src = source;
-    if (words.length) {
-      window.addEventListener("scroll", function () {
-        if (canvas.getBoundingClientRect().bottom < 0) return;
-        mark(Math.min(window.devicePixelRatio || 1, 2));
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(function () {
+        settle();
         draw();
-      }, { passive: true });
-      if (document.fonts && document.fonts.ready) {
-        document.fonts.ready.then(function () {
-          fit();
-          draw();
-        });
-      }
+      });
     }
     if (window.ResizeObserver) {
       new ResizeObserver(function () {
@@ -146,17 +136,37 @@
     }
   }
 
-  var navWords = [document.querySelector(".brand")].concat([].slice.call(document.querySelectorAll(".top nav a")));
   var sky = document.querySelector(".sky");
-  if (sky) halftone(sky, navWords);
+  if (sky) halftone(sky);
   var end = document.querySelector(".end");
-  if (end) halftone(end, []);
+  if (end) halftone(end);
 
   var bar = document.querySelector(".top");
   if (sky && "IntersectionObserver" in window) {
     new IntersectionObserver(function (entries) {
       bar.classList.toggle("past", !entries[0].isIntersecting);
     }, { rootMargin: "-" + bar.offsetHeight + "px 0px 0px 0px" }).observe(sky);
+  }
+
+  var tocLinks = [].slice.call(document.querySelectorAll(".toc ol a"));
+  if (tocLinks.length && "IntersectionObserver" in window) {
+    var reading = null;
+    var mark = function (id) {
+      if (id === reading) return;
+      reading = id;
+      tocLinks.forEach(function (link) {
+        if (link.getAttribute("href") === "#" + id) link.setAttribute("aria-current", "location");
+        else link.removeAttribute("aria-current");
+      });
+    };
+    var visible = {};
+    var watched = tocLinks.map(function (link) { return document.getElementById(link.getAttribute("href").slice(1)); }).filter(Boolean);
+    var spy = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) { visible[entry.target.id] = entry.isIntersecting; });
+      var first = watched.filter(function (section) { return visible[section.id]; })[0];
+      if (first) mark(first.id);
+    }, { rootMargin: "-20% 0px -55% 0px" });
+    watched.forEach(function (section) { spy.observe(section); });
   }
 
   var filter = document.getElementById("filter");

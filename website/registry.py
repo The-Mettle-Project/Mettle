@@ -489,10 +489,27 @@ def footer(up):
 </footer>"""
 
 
+def site_nav(site, current):
+    links = [("packages", f"{site}registry/", "Packages"), ("versions", f"{site}versions/", "Versions")]
+    mark = ' aria-current="page"'
+    items = "".join(
+        f'\n      <a href="{href}"{mark if key == current else ""}>{label}</a>'
+        for key, href, label in links
+    )
+    return f"""<header class="top">
+  <div class="wrap">
+    <a class="brand" href="{site}" aria-label="Mettle, home">{EMBLEM} Mettle</a>
+    <nav aria-label="Site">{items}
+      <a href="{REPOSITORY}/blob/master/docs/README.md">Docs</a>
+      <a href="{REPOSITORY}">Source</a>
+    </nav>
+  </div>
+</header>"""
+
+
 def page(title, description, depth, hero, body, current=False):
     up = "../" * depth
     site = up + "../"
-    mark = ' aria-current="page"' if current else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -508,16 +525,7 @@ def page(title, description, depth, hero, body, current=False):
 <link rel="icon" href="{up}assets/emblem.svg">
 </head>
 <body>
-<header class="top">
-  <div class="wrap">
-    <a class="brand" href="{site}" aria-label="Mettle, home">{EMBLEM} Mettle</a>
-    <nav aria-label="Site">
-      <a href="{up}"{mark}>Packages</a>
-      <a href="{REPOSITORY}/blob/master/docs/README.md">Docs</a>
-      <a href="{REPOSITORY}">Source</a>
-    </nav>
-  </div>
-</header>
+{site_nav(site, "packages" if current else "")}
 {hero}
 <main>
 {body}
@@ -567,7 +575,7 @@ def index_page(registry):
     count = len(registry)
     noun = "package" if count == 1 else "packages"
     rows = "\n".join(index_row(name, versions) for name, versions in registry.items())
-    hero = f"""<div class="sky" data-image="assets/ridge.jpg" data-fade="0.42 0.17 -1 0" data-focus="0.9">
+    hero = f"""<div class="sky" data-image="assets/ridge.jpg" data-fade="0.3 0.17 -1 0" data-focus="0.9">
   <div class="wrap">
     <h1 class="hide">Mettle packages</h1>
     <label class="find"><span class="hide">Find a package by name, description or function</span><input id="filter" type="search" placeholder="Find a package" autocomplete="off" spellcheck="false"></label>
@@ -662,7 +670,7 @@ def package_page(registry, name):
         sections.append(("Readme", f'<div class="readme">{rendered}</div>'))
     sections.append(("Versions", version_rows(name, versions)))
     content = "\n".join(f"<section><h2>{title}</h2>{html_text}</section>" for title, html_text in sections)
-    hero = f"""<div class="sky low" data-image="../assets/ridge.jpg" data-fade="0.62 0.17 -1 0" data-focus="0.9">
+    hero = f"""<div class="sky low" data-image="../assets/ridge.jpg" data-fade="0.3 0.17 -1 0" data-focus="0.9">
   <div class="wrap">
     <h1>{name}</h1>
     <p class="what">{text_escape(manifest['description'])}</p>

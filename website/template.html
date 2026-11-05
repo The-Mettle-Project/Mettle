@@ -69,7 +69,9 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outlin
 .wrap { max-width: 1400px; margin: 0 auto; padding-left: 40px; padding-right: 40px; }
 
 .top { position: sticky; top: 0; z-index: 10; margin-bottom: calc(-1 * var(--bar)); }
+.top::before { content: ""; position: absolute; left: 0; right: 0; top: 0; z-index: -1; height: calc(var(--bar) + 64px); pointer-events: none; background: linear-gradient(to bottom, rgba(23, 24, 26, 0.94), rgba(23, 24, 26, 0.78) 46%, rgba(23, 24, 26, 0)); }
 .past { background: var(--bg); box-shadow: 0 1px 0 var(--faint); }
+.past::before { display: none; }
 .top .wrap { display: flex; align-items: center; gap: 36px; height: var(--bar); }
 .brand { display: inline-flex; align-items: center; gap: 10px; flex: none; color: #fff; text-decoration: none; font-size: 20px; }
 .brand svg { width: 24px; height: 24px; fill: currentColor; }
@@ -181,6 +183,7 @@ main { padding-bottom: 72px; }
     <nav class="actions" aria-label="Site">
       <a href="#start">Install</a>
       <a href="registry/">Packages</a>
+      <a href="versions/">Versions</a>
       <a href="https://github.com/The-Mettle-Project/Mettle/blob/master/docs/README.md">Docs</a>
       <a href="https://github.com/The-Mettle-Project/Mettle">Source</a>
     </nav>
@@ -390,7 +393,6 @@ uniform vec2 res;
 uniform vec2 scale;
 uniform vec2 offset;
 uniform vec4 fade;
-uniform vec4 clearing[4];
 uniform float density;
 void main() {
   float size = 1.0;
@@ -408,16 +410,12 @@ void main() {
   vec3 ink = clamp((vec3(lum) + (picture - lum) * 1.25) * 0.95 * pow(max(lum, 0.05), -0.38), 0.0, 1.0);
   float shaped = pow(lum, 0.62) * (1.0 + 0.25 * band);
   shaped *= smoothstep(0.0, fade.x, uv.y) * (1.0 - smoothstep(1.0 - fade.y, 1.0, uv.y)) * smoothstep(fade.z, fade.w, uv.x);
-  for (int i = 0; i < 4; i++) {
-    vec2 gap = max(max(clearing[i].xy - gl_FragCoord.xy, gl_FragCoord.xy - clearing[i].zw), vec2(0.0));
-    shaped *= smoothstep(2.0 * density, 76.0 * density, length(gap));
-  }
   float limit = texture2D(map, (mod(cell, 8.0) + 0.5) / 8.0).r;
   vec3 ground = vec3(23.0, 24.0, 26.0) / 255.0;
   gl_FragColor = vec4(mix(ground, ink, step(limit + 0.034, shaped)), 1.0);
 }`;
 
-  function dither(video, fadeBottom, fadeTop, sideFrom, sideTo, words, cuts) {
+  function dither(video, fadeBottom, fadeTop, sideFrom, sideTo, cuts) {
     var host = video.parentNode;
     var canvas = document.createElement("canvas");
     var gl = canvas.getContext("webgl", { alpha: false, antialias: false });
@@ -493,35 +491,9 @@ void main() {
       gl.uniform2f(uni("scale"), sx, sy);
       gl.uniform2f(uni("offset"), (1 - sx) / 2, (1 - sy) / 2);
       gl.uniform1f(uni("density"), density);
-      mark(density);
-    }
-    function mark(density) {
-      var box = canvas.getBoundingClientRect();
-      var rects = new Float32Array(16).fill(-100000);
-      words.forEach(function (word, i) {
-        var r = word.getBoundingClientRect();
-        rects[i * 4] = (r.left - box.left) * density;
-        rects[i * 4 + 1] = canvas.height - (r.bottom - box.top) * density;
-        rects[i * 4 + 2] = (r.right - box.left) * density;
-        rects[i * 4 + 3] = canvas.height - (r.top - box.top) * density;
-      });
-      gl.uniform4fv(uni("clearing"), rects);
     }
     function draw() {
       if (ready) gl.drawArrays(gl.TRIANGLES, 0, 3);
-    }
-    if (words.length) {
-      window.addEventListener("scroll", function () {
-        if (canvas.getBoundingClientRect().bottom < 0) return;
-        mark(Math.min(window.devicePixelRatio || 1, 2));
-        draw();
-      }, { passive: true });
-      if (document.fonts && document.fonts.ready) {
-        document.fonts.ready.then(function () {
-          fit();
-          draw();
-        });
-      }
     }
     function take(source, width, height) {
       try {
@@ -610,8 +582,7 @@ void main() {
     }
   }
 
-  var navWords = [document.querySelector(".brand")].concat([].slice.call(document.querySelectorAll(".actions a")));
-  dither(document.getElementById("sky-video"), 0.38, 0.17, -1, 0, navWords, [10.41, 18.41]);
+  dither(document.getElementById("sky-video"), 0.38, 0.17, -1, 0, [10.41, 18.41]);
 
   if ("IntersectionObserver" in window) {
     var bar = document.querySelector(".top");
@@ -628,7 +599,7 @@ void main() {
     document.querySelectorAll(".sec").forEach(function (section) { sectionSeen.observe(section); });
   }
 
-  dither(document.getElementById("end-video"), 0.14, 0.4, 0.3, 0.82, [], []);
+  dither(document.getElementById("end-video"), 0.14, 0.4, 0.3, 0.82, []);
 
   function watch(video, margin) {
     if (still) {
