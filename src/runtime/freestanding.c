@@ -3440,7 +3440,19 @@ static void mt_heap_thread_exit(void) {
 #endif
 }
 
+static mt_u64 *mt_heap_take_linked(int class_index);
+
+/* Clears the free-list links, so a fresh block reads as zero. */
 static mt_u64 *mt_heap_take(int class_index) {
+  mt_u64 *base = mt_heap_take_linked(class_index);
+  if (base) {
+    base[2] = 0;
+    base[3] = 0;
+  }
+  return base;
+}
+
+static mt_u64 *mt_heap_take_linked(int class_index) {
   mt_u32 count;
 #if MT_HEAP_CACHED
   if (class_index < MT_HEAP_CACHED) {
@@ -6663,7 +6675,9 @@ int sscanf(const char *input, const char *format, ...) {
 }
 
 void mettle_alloc_report(void) {
+#if !defined(_WIN32)
   mt_heap_thread_exit();
+#endif
   fprintf(stderr, "Owned runtime heap: %llu allocations, %llu frees\n",
           (unsigned long long)__atomic_load_n(&mt_allocation_count,
                                               __ATOMIC_RELAXED),

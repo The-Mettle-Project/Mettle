@@ -14,7 +14,6 @@ fn syscall_unix_ns() -> int64 {
 fn main() -> int32 {
   var reads: int32 = 1000000;
   var last: int64 = time_mono_ns();
-  var start: int64 = last;
   for i in 0..reads {
     var now: int64 = time_mono_ns();
     if (now < last) {
@@ -23,8 +22,6 @@ fn main() -> int32 {
     }
     last = now;
   }
-  var per_call: int64 = (last - start) / (int64)reads;
-  println("test_clock_fast: {per_call} ns per call");
 
   var before: int64 = syscall_unix_ns();
   var wall: int64 = time_unix_ns();

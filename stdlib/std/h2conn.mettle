@@ -515,7 +515,7 @@ export fn h2c_new(is_server: bool, cfg: H2cConfig*) -> H2c* {
   c->arena = arena;
   c->harena = arena_init(0);
   c->is_server = is_server;
-  c->cfg = *cfg;
+  memcpy((uint8*)&c->cfg, (uint8*)cfg, sizeof(H2cConfig));   // a struct copy here trips a debug codegen bug
   var k: H2cConfig* = &c->cfg;
   k->max_streams = h2c_min(h2c_max(k->max_streams, 1), 100000);
   k->max_concurrent_streams = h2c_min(h2c_max(k->max_concurrent_streams, 1), k->max_streams);
