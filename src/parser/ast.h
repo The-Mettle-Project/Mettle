@@ -133,7 +133,7 @@ typedef struct {
   char *link_name;
   int structural_type;
   int type_is_inferred;
-  const char *capture_type;
+  char *capture_type;
   AstAddressSpace address_space;
   ASTNode *composed_name;
 } VarDeclaration;
