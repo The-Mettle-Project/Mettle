@@ -748,7 +748,7 @@ fn main() -> int32 {
     var t: int64 = 0;
     while (t < 2000) {
         quiesce;
-        println("old t={t}");
+        println("old t={t} quiet=1");
         t = t + 1;
         thread_sleep_ms((uint32)15);
     }
