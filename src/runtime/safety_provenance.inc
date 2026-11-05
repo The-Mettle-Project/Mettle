@@ -433,9 +433,11 @@ void mettle_safety_buffer_check(void *pointer, int64_t size, uint32_t kind,
   mettle_safety_check_identity(pointer, 0, size, kind, line, identity);
 }
 
+#define SAFETY_PACKET_MIN_CAPACITY 240u
 typedef struct SafetyPacket {
   struct SafetyPacket *next;
   size_t size;
+  size_t capacity;
   unsigned char data[];
 } SafetyPacket;
 
@@ -452,14 +454,24 @@ typedef struct SafetyCall {
 typedef struct {
   SafetyCall *current;
   SafetyCall *spare;
+  SafetyPacket *spare_packets;
 } SafetyCalls;
 
-static void safety_packets_clear(SafetyCall *frame) {
+static void safety_packets_clear(SafetyCall *frame, SafetyCalls *calls) {
   while (frame->packets) {
     SafetyPacket *packet = frame->packets;
     frame->packets = packet->next;
     mettle_safety_value_clear(packet->data, packet->size);
-    safety_unmap(packet, sizeof(*packet) + packet->size);
+    packet->next = calls->spare_packets;
+    calls->spare_packets = packet;
+  }
+}
+
+static void safety_packets_release(SafetyCalls *calls) {
+  while (calls->spare_packets) {
+    SafetyPacket *packet = calls->spare_packets;
+    calls->spare_packets = packet->next;
+    safety_unmap(packet, sizeof(*packet) + packet->capacity);
   }
 }
 
@@ -473,11 +485,12 @@ static void NTAPI safety_calls_destroy(void *value) {
     SafetyCall *frame = lists[i];
     while (frame) {
       SafetyCall *previous = frame->previous;
-      safety_packets_clear(frame);
+      safety_packets_clear(frame, calls);
       safety_unmap(frame, frame->bytes);
       frame = previous;
     }
   }
+  safety_packets_release(calls);
   safety_unmap(calls, sizeof(*calls));
 }
 static SafetyCalls *safety_calls(void) {
@@ -567,8 +580,20 @@ void mettle_safety_call_return(void *call, uint64_t identity) {
 static SafetyPacket *safety_packet_capture(SafetyCall *frame, const void *source, uint64_t size) {
   if (size > SIZE_MAX - sizeof(SafetyPacket))
     safety_internal_failure("Fatal error: aggregate safety metadata size overflow");
-  SafetyPacket *packet = safety_map(sizeof(*packet) + (size_t)size);
-  if (!packet) safety_internal_failure("Fatal error: unable to allocate aggregate safety metadata");
+  SafetyCalls *calls = safety_calls();
+  SafetyPacket **link = &calls->spare_packets;
+  while (*link && (*link)->capacity < (size_t)size) link = &(*link)->next;
+  SafetyPacket *packet = *link;
+  if (packet) {
+    *link = packet->next;
+  } else {
+    size_t capacity = (size_t)size < SAFETY_PACKET_MIN_CAPACITY
+                          ? SAFETY_PACKET_MIN_CAPACITY
+                          : (size_t)size;
+    packet = safety_map(sizeof(*packet) + capacity);
+    if (!packet) safety_internal_failure("Fatal error: unable to allocate aggregate safety metadata");
+    packet->capacity = capacity;
+  }
   packet->size = (size_t)size;
   packet->next = frame->packets;
   frame->packets = packet;
@@ -667,7 +692,7 @@ uint64_t mettle_safety_call_pop(void *call) {
   if (!frame || calls->current != frame)
     safety_internal_failure("Fatal error: mismatched pointer safety call frame");
   uint64_t result = frame->result;
-  safety_packets_clear(frame);
+  safety_packets_clear(frame, calls);
   calls->current = frame->previous;
   frame->previous = calls->spare;
   calls->spare = frame;

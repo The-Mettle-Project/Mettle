@@ -3423,7 +3423,7 @@ static int ii_extern_string_runtime(IRInterpMachine *machine, const char *name,
       text_length = (size_t)snprintf(text, sizeof text, "nan");
     } else {
       const char *sign = "";
-      if (value < 0.0) {
+      if (signbit(value)) {
         sign = "-";
         value = 0.0 - value;
       }
@@ -5817,6 +5817,9 @@ static int ii_op_store(IRInterpMachine *machine, IIFrame *frame,
     }
     source_buffer = ii_addr_to_buffer(machine, (unsigned long long)value.i,
                                       size, &source_offset);
+    if (size < 8) {
+      is_aggregate_source = 1;
+    }
     if (source_buffer && (is_aggregate_source || source_buffer->escaped_local)) {
       long long dest_offset = 0;
       IIBuffer *dest_buffer =

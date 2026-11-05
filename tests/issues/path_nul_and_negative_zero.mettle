@@ -1,0 +1,40 @@
+import "std/io";
+import "std/conv";
+import "std/fs";
+import "std/file";
+import "std/netaddr";
+
+fn show_ip(s: string) {
+  match (net_addr_parse(s)) {
+    case Ok(v): {
+      var b: uint8[80];
+      var n: int64 = net_addr_format_ip(v, &b[0], 80);
+      println("{str_from_bytes(&b[0], n)}");
+    }
+    case Err(e): { println("bad"); }
+  }
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var dir: string = "pnz_dir";
+  fs_remove_all(dir);
+  fs_mkdir(dir, 493);
+  var bytes: uint8[16];
+  for i in 0..dir.length { bytes[i] = (uint8)dir[i]; }
+  bytes[7] = 0;
+  bytes[8] = 120;
+  var hidden: string = str_from_bytes(&bytes[0], 9);
+  println("{fs_exists(dir)} {fs_exists(hidden)} {fs_is_dir(hidden)} {file_open(hidden, FILE_READ) < 0} {fs_remove_all(hidden) < 0} {fs_exists(dir)}");
+  fs_remove_all(dir);
+
+  var one: float64 = (float64)argc;
+  var zero: float64 = one - one;
+  var neg: float64 = zero * -1.0;
+  var small: float32 = (float32)neg;
+  println("{zero} {neg} {small} {1.0 / neg} {neg == zero}");
+
+  show_ip("::ffff:1.2.3.4");
+  show_ip("::ffff:0:1");
+  show_ip("2001:db8::1");
+  return 0;
+}

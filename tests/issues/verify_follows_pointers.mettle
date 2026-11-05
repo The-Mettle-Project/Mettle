@@ -1,0 +1,30 @@
+import "std/io";
+import "std/mem";
+
+struct Rec { p: uint8*; n: int64; }
+
+var g_seen: int64[4];
+
+@noinline fn short_lived(k: int64) -> int64 {
+  var held: uint8*[4];
+  for i in 0..4 {
+    held[i] = (uint8*)malloc(48);
+    g_seen[i] = (int64)held[i];
+  }
+  for i in 0..4 { free(held[i]); }
+  return k + 1;
+}
+
+@noinline fn fill(out: Rec*, k: int64) {
+  var extra: uint8* = (uint8*)malloc(16);
+  extra[0] = (uint8)k;
+  out->p = extra;
+  out->n = 1;
+}
+
+fn main() -> int32 {
+  var r: Rec;
+  fill(&r, 7);
+  println("{short_lived(1)} {r.p[0]} {r.n}");
+  return 0;
+}

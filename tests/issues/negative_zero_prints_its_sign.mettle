@@ -1,0 +1,8 @@
+fn zero_text(x: float64) -> string {
+  return "{x * -1.0}";
+}
+
+@test fn negative_zero_prints_its_sign() {
+  assert(zero_text(0.0) == "-0.0");
+  assert(zero_text(-2.5) == "2.5");
+}

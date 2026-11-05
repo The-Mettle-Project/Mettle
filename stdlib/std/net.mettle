@@ -11,6 +11,7 @@ export fn SOCK_DGRAM() -> int32  { return 2; }
 export fn IPPROTO_TCP() -> int32 { return 6; }
 export fn IPPROTO_UDP() -> int32 { return 17; }
 export fn SOL_SOCKET() -> int32 { return 0xFFFF; }
+export fn MSG_NOSIGNAL() -> int32 { return 0; }
 export fn SO_REUSEADDR() -> int32 { return 4; }
 export fn SD_RECEIVE() -> int32 { return 0; }
 export fn SD_SEND() -> int32 { return 1; }

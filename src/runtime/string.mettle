@@ -219,7 +219,7 @@ export fn mettle_string_from_f64(bits: int64) -> string {
         return mettle_string_own(buf, mettle_string_put_text(buf, 0, "nan"));
     }
     var v: float64 = value;
-    if (v < 0.0) {
+    if (bits < 0) {
         buf[at] = (uint8)45;
         at = at + 1;
         v = 0.0 - v;

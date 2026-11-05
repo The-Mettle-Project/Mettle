@@ -21723,8 +21723,14 @@ $issueRegressions = @(
   @{ Name = "safe_threads_realloc_keeps_other_blocks"; Entry = "tests/test_malloc_threads.mettle"; Args = @("--safe"); Refuse = @("Fatal error"); Expect = @("malloc_threads: ok") },
   @{ Name = "safe_threads_realloc_keeps_other_blocks_release"; Entry = "tests/test_malloc_threads.mettle"; Args = @("--safe", "--release"); Refuse = @("Fatal error"); Expect = @("malloc_threads: ok") },
   @{ Name = "safe_h2conn_reads_in_bounds"; Entry = "tests/test_std_h2conn.mettle"; Args = @("--safe"); Refuse = @("Fatal error"); Expect = @("all ok") },
+  @{ Name = "parameter_clamped_to_zero"; Entry = "tests/issues/parameter_clamped_to_zero.mettle"; Args = @(); Expect = @("0 3 5 1", "-1 -1 2 103 3", "[] 0 [he]") },
+  @{ Name = "parameter_clamped_to_zero_release"; Entry = "tests/issues/parameter_clamped_to_zero.mettle"; Args = @("--release"); Expect = @("0 3 5 1", "-1 -1 2 103 3", "[] 0 [he]") },
+  @{ Name = "parameter_clamped_to_zero_O"; Entry = "tests/issues/parameter_clamped_to_zero.mettle"; Args = @("-O"); Expect = @("0 3 5 1", "-1 -1 2 103 3", "[] 0 [he]") },
+  @{ Name = "path_nul_and_negative_zero"; Entry = "tests/issues/path_nul_and_negative_zero.mettle"; Args = @(); Expect = @("true false false true true true", "0.0 -0.0 -0.0 -inf true", "::ffff:1.2.3.4", "::ffff:0.0.0.1", "2001:db8::1") },
+  @{ Name = "path_nul_and_negative_zero_release"; Entry = "tests/issues/path_nul_and_negative_zero.mettle"; Args = @("--release"); Expect = @("true false false true true true", "0.0 -0.0 -0.0 -inf true", "::ffff:1.2.3.4", "::ffff:0.0.0.1", "2001:db8::1") },
+  @{ Name = "negative_zero_in_the_interpreter"; Command = @("test", "tests/issues/negative_zero_prints_its_sign.mettle"); Expect = @("1 passed") },
   @{ Name = "random_range_extremes"; Entry = "tests/issues/random_range_extremes.mettle"; Args = @("--check-overflow"); Refuse = @("Fatal error"); Expect = @("bad 0") },
-  @{ Name = "verify_follows_pointers"; Command = @("--verify", "--build", "tests/test_malloc_threads.mettle", "-o", ".tmp/issue_verify.exe"); Refuse = @("MISCOMPILE"); Expect = @("Built executable") }
+  @{ Name = "verify_follows_pointers"; Command = @("--verify", "--build", "tests/issues/verify_follows_pointers.mettle", "-o", ".tmp/issue_verify.exe"); Refuse = @("MISCOMPILE"); Expect = @("Built executable") }
 )
 foreach ($case in $issueRegressions) {
   $total++

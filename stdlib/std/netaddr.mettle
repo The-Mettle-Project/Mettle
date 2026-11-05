@@ -340,6 +340,18 @@ fn net_put_ip(a: NetAddr*, buf: uint8*, cap: int64, at: int64*) -> bool {
   }
   var w: int32[8];
   for k in 0..8 { w[k] = ((int32)a->ip[k * 2] << 8) | (int32)a->ip[k * 2 + 1]; }
+  // RFC 5952 section 5: an IPv4-mapped address ends in dotted decimal.
+  if (w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 0 && w[4] == 0 && w[5] == 0xFFFF) {
+    var head: string = "::ffff:";
+    for c in 0..head.length {
+      if (!net_put(buf, cap, at, (int32)head[c])) { return false; }
+    }
+    for q in 12..16 {
+      if (q > 12 && !net_put(buf, cap, at, 46)) { return false; }
+      if (!net_put_dec(buf, cap, at, (int64)a->ip[q])) { return false; }
+    }
+    return true;
+  }
   // RFC 5952: the longest run of two or more zero words becomes "::".
   var best: int32 = -1;
   var best_len: int32 = 1;

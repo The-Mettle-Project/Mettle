@@ -100,7 +100,10 @@ fn fs_fail() -> int64 { return -(int64)*fs_c_errno(); }
 // Copies a path into buf with a NUL. Returns false if it does not fit.
 fn fs_cpath(path: string, buf: uint8*) -> bool {
   if (path.length >= (uint64)4096) { return false; }
-  for i in 0..path.length { buf[i] = (uint8)path[i]; }
+  for i in 0..path.length {
+    if ((int32)path[i] == 0) { return false; }
+    buf[i] = (uint8)path[i];
+  }
   buf[(int64)path.length] = (uint8)0;
   return true;
 }
