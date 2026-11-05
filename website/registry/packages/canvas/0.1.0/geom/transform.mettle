@@ -1,0 +1,116 @@
+// CanvasTransform: a 2D affine matrix, the same as SVG's matrix(a b c d e f):
+//   x' = a*x + c*y + e
+//   y' = b*x + d*y + f
+
+import "../core/base";
+
+export struct CanvasTransform { a: float32; b: float32; c: float32; d: float32; e: float32; f: float32; }
+
+export struct CanvasPoint { x: float32; y: float32; }
+
+export struct CanvasRect { x0: float32; y0: float32; x1: float32; y1: float32; }
+
+export fn canvas_matrix(a: float32, b: float32, c: float32, d: float32, e: float32, f: float32) -> CanvasTransform {
+  var m: CanvasTransform;
+  m.a = a; m.b = b; m.c = c; m.d = d; m.e = e; m.f = f;
+  return m;
+}
+
+export fn canvas_identity() -> CanvasTransform { return canvas_matrix(1.0, 0.0, 0.0, 1.0, 0.0, 0.0); }
+
+export fn canvas_translation(tx: float32, ty: float32) -> CanvasTransform {
+  return canvas_matrix(1.0, 0.0, 0.0, 1.0, tx, ty);
+}
+
+export fn canvas_scaling(sx: float32, sy: float32) -> CanvasTransform {
+  return canvas_matrix(sx, 0.0, 0.0, sy, 0.0, 0.0);
+}
+
+/// A rotation by angle radians (clockwise on screen, where y points down).
+export fn canvas_rotation(angle: float32) -> CanvasTransform {
+  var s: float32 = canvas_sin(angle);
+  var c: float32 = canvas_cos(angle);
+  return canvas_matrix(c, s, -s, c, 0.0, 0.0);
+}
+
+/// A skew by ax radians along x and ay radians along y.
+export fn canvas_skewing(ax: float32, ay: float32) -> CanvasTransform {
+  return canvas_matrix(1.0, canvas_tan(ay), canvas_tan(ax), 1.0, 0.0, 0.0);
+}
+
+/// m * n: the transform that applies n first, then m.
+export fn canvas_t_mul(m: CanvasTransform, n: CanvasTransform) -> CanvasTransform {
+  var r: CanvasTransform;
+  r.a = m.a * n.a + m.c * n.b;
+  r.b = m.b * n.a + m.d * n.b;
+  r.c = m.a * n.c + m.c * n.d;
+  r.d = m.b * n.c + m.d * n.d;
+  r.e = m.a * n.e + m.c * n.f + m.e;
+  r.f = m.b * n.e + m.d * n.f + m.f;
+  return r;
+}
+
+/// The inverse of m. Returns false (and identity) when m cannot be inverted.
+export fn canvas_t_invert(m: CanvasTransform, out: CanvasTransform*) -> bool {
+  var det: float64 = (float64)m.a * (float64)m.d - (float64)m.b * (float64)m.c;
+  if (det == 0.0 || !canvas_finite((float32)det)) {
+    *out = canvas_identity();
+    return false;
+  }
+  var k: float64 = 1.0 / det;
+  var r: CanvasTransform;
+  r.a = (float32)((float64)m.d * k);
+  r.b = (float32)(-(float64)m.b * k);
+  r.c = (float32)(-(float64)m.c * k);
+  r.d = (float32)((float64)m.a * k);
+  r.e = (float32)(((float64)m.c * (float64)m.f - (float64)m.d * (float64)m.e) * k);
+  r.f = (float32)(((float64)m.b * (float64)m.e - (float64)m.a * (float64)m.f) * k);
+  if (!canvas_finite(r.a) || !canvas_finite(r.b) || !canvas_finite(r.c) || !canvas_finite(r.d) || !canvas_finite(r.e) || !canvas_finite(r.f)) {
+    *out = canvas_identity();
+    return false;
+  }
+  *out = r;
+  return true;
+}
+
+/// Maps a point.
+export fn canvas_t_point(m: CanvasTransform, x: float32, y: float32) -> CanvasPoint {
+  var p: CanvasPoint;
+  p.x = m.a * x + m.c * y + m.e;
+  p.y = m.b * x + m.d * y + m.f;
+  return p;
+}
+
+export fn canvas_t_is_identity(m: CanvasTransform) -> bool {
+  return m.a == 1.0 && m.b == 0.0 && m.c == 0.0 && m.d == 1.0 && m.e == 0.0 && m.f == 0.0;
+}
+
+/// The largest factor by which m stretches a length (its largest singular value).
+export fn canvas_t_max_scale(m: CanvasTransform) -> float32 {
+  var p: float32 = m.a * m.a + m.b * m.b;
+  var q: float32 = m.c * m.c + m.d * m.d;
+  var r: float32 = m.a * m.c + m.b * m.d;
+  var h: float32 = 0.5 * (p + q);
+  var dd: float32 = 0.5 * (p - q);
+  var v: float32 = h + canvas_sqrt(dd * dd + r * r);
+  return canvas_sqrt(v);
+}
+
+/// The average scale, sqrt(|det|), used for hairlines and tolerances.
+export fn canvas_t_mean_scale(m: CanvasTransform) -> float32 {
+  return canvas_sqrt(canvas_absf(m.a * m.d - m.b * m.c));
+}
+
+/// An empty rect (x0 > x1) that any point will grow.
+export fn canvas_rect_empty() -> CanvasRect {
+  var r: CanvasRect;
+  r.x0 = 3.0e38; r.y0 = 3.0e38; r.x1 = -3.0e38; r.y1 = -3.0e38;
+  return r;
+}
+
+export fn canvas_rect_add(r: CanvasRect*, x: float32, y: float32) {
+  if (x < r->x0) { r->x0 = x; }
+  if (y < r->y0) { r->y0 = y; }
+  if (x > r->x1) { r->x1 = x; }
+  if (y > r->y1) { r->y1 = y; }
+}

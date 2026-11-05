@@ -1,0 +1,135 @@
+// log/filter: per-target level filters, written like RUST_LOG.
+//
+//   "info"                         everything at INFO and above
+//   "warn,net=debug,net/http=trace" WARN by default, more for net
+//   "db=off"                       nothing from db
+//   "alph"                         a target alone means every level
+//
+// Directives are split on commas. Each is LEVEL, TARGET or TARGET=LEVEL.
+// A directive matches a target that equals it or starts with it followed by
+// '/', '.' or ':', so "net" covers "net/http" and "net::tcp" but not
+// "network". The longest matching directive wins, as in env_logger.
+import "std/mem";
+import "level";
+
+export struct LogDirective {
+  target: string;
+  level: int32;
+}
+
+export struct LogFilter {
+  text: uint8*;          // owned copy of the spec; directive targets point here
+  dirs: LogDirective*;
+  n: int32;
+  default_level: int32;
+  floor: int32;          // the lowest level any target lets through
+  bad: int32;            // directives that could not be read (they are skipped)
+}
+
+fn log__space(c: uint8) -> bool {
+  return c == (uint8)32 || c == (uint8)9 || c == (uint8)10 || c == (uint8)13;
+}
+
+fn log__view(p: uint8*, n: int64) -> string {
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+// Reads spec into f. Unreadable directives are counted in f->bad and
+// skipped; the rest still apply. An empty spec means INFO.
+export fn log_filter_parse(spec: string, f: LogFilter*) {
+  var n: int64 = (int64)spec.length;
+  f->text = (uint8*)malloc(n + 1);
+  f->n = 0;
+  f->bad = 0;
+  f->default_level = LOG_INFO;
+  f->dirs = (LogDirective*)0;
+  if (f->text == 0) { f->floor = LOG_INFO; return; }
+  memcpy(f->text, spec.chars, n);
+  var parts: int64 = 1;
+  for i in 0..n { if (spec[i] == ',') { parts = parts + 1; } }
+  f->dirs = (LogDirective*)malloc(parts * sizeof(LogDirective));
+  if (f->dirs == 0) { f->floor = LOG_INFO; return; }
+  var t: uint8* = f->text;
+  var pos: int64 = 0;
+  while (pos <= n) {
+    var end: int64 = pos;
+    while (end < n && t[end] != (uint8)44) { end = end + 1; }
+    var a: int64 = pos;
+    var b: int64 = end;
+    while (a < b && log__space(t[a])) { a = a + 1; }
+    while (b > a && log__space(t[b - 1])) { b = b - 1; }
+    if (b > a) {
+      var eq: int64 = a;
+      while (eq < b && t[eq] != (uint8)61) { eq = eq + 1; }
+      if (eq < b) {
+        var ta: int64 = a;
+        var tb: int64 = eq;
+        while (tb > ta && log__space(t[tb - 1])) { tb = tb - 1; }
+        var la: int64 = eq + 1;
+        while (la < b && log__space(t[la])) { la = la + 1; }
+        var lv: int32 = log_level_parse(log__view(t + la, b - la));
+        if (lv < 0 || tb == ta) {
+          f->bad = f->bad + 1;
+        } else {
+          f->dirs[f->n].target = log__view(t + ta, tb - ta);
+          f->dirs[f->n].level = lv;
+          f->n = f->n + 1;
+        }
+      } else {
+        var word: string = log__view(t + a, b - a);
+        var lv2: int32 = log_level_parse(word);
+        if (lv2 >= 0) {
+          f->default_level = lv2;
+        } else {
+          f->dirs[f->n].target = word;
+          f->dirs[f->n].level = LOG_TRACE;
+          f->n = f->n + 1;
+        }
+      }
+    }
+    pos = end + 1;
+  }
+  var lo: int32 = f->default_level;
+  for i in 0..f->n {
+    if (f->dirs[i].level < lo) { lo = f->dirs[i].level; }
+  }
+  f->floor = lo;
+}
+
+export fn log_filter_free(f: LogFilter*) {
+  if (f->text != 0) { free(f->text); }
+  if (f->dirs != 0) { free(f->dirs); }
+  f->text = (uint8*)0;
+  f->dirs = (LogDirective*)0;
+  f->n = 0;
+}
+
+// True when directive d covers target: empty, equal, or a prefix that ends
+// at a separator.
+export fn log_target_matches(d: string, target: string) -> bool {
+  if (d.length == 0) { return true; }
+  if (d.length > target.length) { return false; }
+  for i in 0..d.length {
+    if (d[i] != target[i]) { return false; }
+  }
+  if (d.length == target.length) { return true; }
+  var c: char = target[d.length];
+  return c == '/' || c == '.' || c == ':';
+}
+
+// The lowest level that passes for target.
+export fn log_filter_level(f: LogFilter*, target: string) -> int32 {
+  var best: int64 = -1;
+  var lv: int32 = f->default_level;
+  for i in 0..f->n {
+    var d: string = f->dirs[i].target;
+    if ((int64)d.length > best && log_target_matches(d, target)) {
+      best = (int64)d.length;
+      lv = f->dirs[i].level;
+    }
+  }
+  return lv;
+}

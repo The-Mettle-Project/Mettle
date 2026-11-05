@@ -1,0 +1,273 @@
+// Streaming DEFLATE, zlib and gzip: feed input in pieces of any size and get
+// output as it is ready. Each feed appends to `out`; you may use and clear
+// `out` between calls.
+//
+//   var e: PressDeflateEnc;
+//   press_deflate_enc_init(&e, PRESS_FMT_GZIP, 6);
+//   press_deflate_enc_feed(&e, chunk, n, &out);   // as many times as needed
+//   press_deflate_enc_finish(&e, &out);
+//   press_deflate_enc_free(&e);
+//
+//   var d: PressDeflateDec;
+//   press_deflate_dec_init(&d, PRESS_FMT_AUTO);
+//   press_deflate_dec_feed(&d, chunk, n, &out);   // as many times as needed
+//   rc = press_deflate_dec_finish(&d);            // PRESS_E_TRUNC if cut short
+//   press_deflate_dec_free(&d);
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "../check/crc32";
+import "../check/adler32";
+import "inflate";
+import "deflate";
+import "wrap";
+
+/// A streaming encoder. Zero it or call press_deflate_enc_init first.
+export struct PressDeflateEnc {
+  c: PdfDeflate*;
+  format: int32;
+  level: int32;
+  started: bool;
+  done: bool;
+  check: uint32;
+  total: int64;
+}
+
+/// Starts an encoder for PRESS_FMT_RAW, PRESS_FMT_ZLIB or PRESS_FMT_GZIP at
+/// level 0 to 9 (-1 for 6).
+export fn press_deflate_enc_init(e: PressDeflateEnc*, format: int32, level: int32) -> int32 {
+  if (e == 0) { return PRESS_E_ARG; }
+  memset(e, 0, sizeof(PressDeflateEnc));
+  var lv: int32 = level;
+  if (lv == -1) { lv = 6; }
+  if (format < 0 || format > 2 || lv < 0 || lv > 9) { return PRESS_E_ARG; }
+  e->format = format;
+  e->level = lv;
+  e->check = 0;
+  if (format == PRESS_FMT_ZLIB) { e->check = 1; }
+  e->c = new PdfDeflate;
+  if (e->c == 0) { return PRESS_E_MEM; }
+  var rc: int32 = pdf_deflate_init(e->c, lv, 0);
+  if (rc == PRESS_OK) { rc = pdf_deflate_stream(e->c); }
+  if (rc != PRESS_OK) { press_deflate_enc_free(e); }
+  return rc;
+}
+
+fn pdf_enc_start(e: PressDeflateEnc*, out: PressBuf*) -> int32 {
+  if (e->started) { return PRESS_OK; }
+  var rc: int32 = PRESS_OK;
+  if (e->format == PRESS_FMT_ZLIB) {
+    rc = press_buf_push(out, 120);
+    if (rc == PRESS_OK) { rc = press_buf_push(out, pdf_zlib_flg(e->level)); }
+  } else if (e->format == PRESS_FMT_GZIP) {
+    rc = pdf_gzip_head(e->level, out);
+  }
+  if (rc == PRESS_OK) { e->started = true; }
+  return rc;
+}
+
+/// Adds n bytes of input. Compressed output is appended to out as it is made.
+export fn press_deflate_enc_feed(e: PressDeflateEnc*, p: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (e == 0 || e->c == 0 || out == 0 || n < 0 || (p == 0 && n > 0)) { return PRESS_E_ARG; }
+  if (e->done) { return PRESS_E_STATE; }
+  var rc: int32 = pdf_enc_start(e, out);
+  if (rc != PRESS_OK) { return rc; }
+  if (e->format == PRESS_FMT_ZLIB) { e->check = press_adler32(e->check, p, n); }
+  if (e->format == PRESS_FMT_GZIP) { e->check = press_crc32(e->check, p, n); }
+  e->total = e->total + n;
+  return pdf_deflate_feed(e->c, p, n, out);
+}
+
+/// Writes out everything fed so far, so a reader can decode all of it now
+/// (like zlib's Z_SYNC_FLUSH). Costs a few bytes; use it between messages.
+export fn press_deflate_enc_flush(e: PressDeflateEnc*, out: PressBuf*) -> int32 {
+  if (e == 0 || e->c == 0 || out == 0) { return PRESS_E_ARG; }
+  if (e->done) { return PRESS_E_STATE; }
+  var rc: int32 = pdf_enc_start(e, out);
+  if (rc != PRESS_OK) { return rc; }
+  return pdf_deflate_drain(e->c, false, out);
+}
+
+/// Ends the stream: writes the rest of the data and the trailer.
+export fn press_deflate_enc_finish(e: PressDeflateEnc*, out: PressBuf*) -> int32 {
+  if (e == 0 || e->c == 0 || out == 0) { return PRESS_E_ARG; }
+  if (e->done) { return PRESS_E_STATE; }
+  var rc: int32 = pdf_enc_start(e, out);
+  if (rc == PRESS_OK) { rc = pdf_deflate_drain(e->c, true, out); }
+  if (rc != PRESS_OK) { return rc; }
+  if (e->format == PRESS_FMT_ZLIB) {
+    var v: uint32 = e->check;
+    rc = press_buf_reserve(out, 4);
+    if (rc != PRESS_OK) { return rc; }
+    var o: uint8* = out->data + out->len;
+    o[0] = (uint8)(v >> 24);
+    o[1] = (uint8)(v >> 16);
+    o[2] = (uint8)(v >> 8);
+    o[3] = (uint8)v;
+    out->len = out->len + 4;
+  } else if (e->format == PRESS_FMT_GZIP) {
+    rc = press_buf_put32(out, e->check);
+    if (rc == PRESS_OK) { rc = press_buf_put32(out, (uint32)e->total); }
+    if (rc != PRESS_OK) { return rc; }
+  }
+  e->done = true;
+  return PRESS_OK;
+}
+
+/// Frees the encoder's memory. Safe to call more than once.
+export fn press_deflate_enc_free(e: PressDeflateEnc*) {
+  if (e == 0) { return; }
+  if (e->c != 0) {
+    pdf_deflate_free(e->c);
+    free(e->c);
+    e->c = (PdfDeflate*)0;
+  }
+}
+
+const PDF_P_HEAD: int32 = 0;
+const PDF_P_BODY: int32 = 1;
+const PDF_P_TAIL: int32 = 2;
+const PDF_P_DONE: int32 = 3;
+
+/// A streaming decoder. Zero it or call press_deflate_dec_init first.
+export struct PressDeflateDec {
+  st: PdfInflate*;
+  format: int32;
+  phase: int32;
+  members: int32;
+  pend: PressBuf;     // input not used yet
+  hist: PressBuf;     // recent output, for matches that reach back
+  check: uint32;
+  size: int64;
+}
+
+/// Starts a decoder for PRESS_FMT_RAW, PRESS_FMT_ZLIB, PRESS_FMT_GZIP or
+/// PRESS_FMT_AUTO (zlib or gzip, told apart by the first bytes).
+export fn press_deflate_dec_init(d: PressDeflateDec*, format: int32) -> int32 {
+  if (d == 0) { return PRESS_E_ARG; }
+  memset(d, 0, sizeof(PressDeflateDec));
+  if (format < 0 || format > 3) { return PRESS_E_ARG; }
+  d->format = format;
+  d->st = new PdfInflate;
+  if (d->st == 0) { return PRESS_E_MEM; }
+  pdf_inflate_reset(d->st);
+  if (format == PRESS_FMT_RAW) { d->phase = PDF_P_BODY; }
+  return PRESS_OK;
+}
+
+fn pdf_dec_drop(d: PressDeflateDec*, k: int64) {
+  if (k <= 0) { return; }
+  memmove(d->pend.data, d->pend.data + k, d->pend.len - k);
+  d->pend.len = d->pend.len - k;
+}
+
+fn pdf_dec_head(d: PressDeflateDec*) -> int32 {
+  var p: uint8* = d->pend.data;
+  var n: int64 = d->pend.len;
+  if (d->format == PRESS_FMT_GZIP && d->members > 0) {
+    var z: int64 = 0;
+    while (z < n && p[z] == 0) { z = z + 1; }
+    pdf_dec_drop(d, z);
+    p = d->pend.data;
+    n = d->pend.len;
+    if (n == 0) { return PDF_MORE; }
+  }
+  if (d->format == PRESS_FMT_AUTO) {
+    if (n < 2) { return PDF_MORE; }
+    if (p[0] == 31 && p[1] == 139) { d->format = PRESS_FMT_GZIP; } else { d->format = PRESS_FMT_ZLIB; }
+  }
+  var h: int32 = 0;
+  if (d->format == PRESS_FMT_ZLIB) { h = pdf_zlib_header(p, n); d->check = 1; }
+  else { h = pdf_gzip_header(p, n); d->check = 0; }
+  if (h < 0 || h == PDF_MORE) { return h; }
+  pdf_dec_drop(d, (int64)h);
+  d->size = 0;
+  pdf_inflate_reset(d->st);
+  d->phase = PDF_P_BODY;
+  return PRESS_OK;
+}
+
+fn pdf_dec_body(d: PressDeflateDec*, out: PressBuf*) -> int32 {
+  d->hist.limit = 0;
+  if (out->limit > 0) {
+    var room: int64 = out->limit - out->len;
+    if (room < 0) { room = 0; }
+    d->hist.limit = d->hist.len + room;
+    if (d->hist.limit == 0) { d->hist.limit = 1; }
+  }
+  var before: int64 = d->hist.len;
+  var used: int64 = 0;
+  var rc: int32 = pdf_inflate_run(d->st, d->pend.data, d->pend.len, &used, &d->hist, 0);
+  var made: int64 = d->hist.len - before;
+  if (made > 0) {
+    var r2: int32 = press_buf_append(out, d->hist.data + before, made);
+    if (r2 != PRESS_OK) { return r2; }
+    if (d->format == PRESS_FMT_ZLIB) { d->check = press_adler32(d->check, d->hist.data + before, made); }
+    if (d->format == PRESS_FMT_GZIP) { d->check = press_crc32(d->check, d->hist.data + before, made); }
+    d->size = d->size + made;
+  }
+  pdf_dec_drop(d, used);
+  // Keep only the last 32 KiB of history once it grows.
+  if (d->hist.len > 262144) {
+    memmove(d->hist.data, d->hist.data + d->hist.len - 32768, 32768);
+    d->hist.len = 32768;
+  }
+  if (rc == PRESS_OK) {
+    if (d->format == PRESS_FMT_RAW) { d->phase = PDF_P_DONE; } else { d->phase = PDF_P_TAIL; }
+  }
+  return rc;
+}
+
+fn pdf_dec_tail(d: PressDeflateDec*) -> int32 {
+  var p: uint8* = d->pend.data;
+  if (d->format == PRESS_FMT_ZLIB) {
+    if (d->pend.len < 4) { return PDF_MORE; }
+    var v: uint32 = ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+    if (v != d->check) { return PRESS_E_CHECK; }
+    pdf_dec_drop(d, 4);
+    d->phase = PDF_P_DONE;
+    return PRESS_OK;
+  }
+  if (d->pend.len < 8) { return PDF_MORE; }
+  if (press_rd32(p) != d->check || press_rd32(p + 4) != (uint32)d->size) { return PRESS_E_CHECK; }
+  pdf_dec_drop(d, 8);
+  d->members = d->members + 1;
+  d->hist.len = 0;
+  d->phase = PDF_P_HEAD;
+  return PRESS_OK;
+}
+
+/// Adds n bytes of compressed input. Decoded output is appended to out.
+/// Input after the end of a raw or zlib stream is ignored.
+export fn press_deflate_dec_feed(d: PressDeflateDec*, p: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (d == 0 || d->st == 0 || out == 0 || n < 0 || (p == 0 && n > 0)) { return PRESS_E_ARG; }
+  if (d->phase == PDF_P_DONE) { return PRESS_OK; }
+  var rc: int32 = press_buf_append(&d->pend, p, n);
+  if (rc != PRESS_OK) { return rc; }
+  while (d->phase != PDF_P_DONE) {
+    if (d->phase == PDF_P_HEAD) { rc = pdf_dec_head(d); }
+    else if (d->phase == PDF_P_BODY) { rc = pdf_dec_body(d, out); }
+    else { rc = pdf_dec_tail(d); }
+    if (rc == PDF_MORE) { return PRESS_OK; }
+    if (rc != PRESS_OK) { return rc; }
+  }
+  return PRESS_OK;
+}
+
+/// Call after the last feed. PRESS_OK if the input ended at the end of a
+/// complete stream, PRESS_E_TRUNC if it was cut short.
+export fn press_deflate_dec_finish(d: PressDeflateDec*) -> int32 {
+  if (d == 0 || d->st == 0) { return PRESS_E_ARG; }
+  if (d->phase == PDF_P_DONE) { return PRESS_OK; }
+  if (d->phase == PDF_P_HEAD && d->members > 0 && d->pend.len == 0) { return PRESS_OK; }
+  return PRESS_E_TRUNC;
+}
+
+/// Frees the decoder's memory. Safe to call more than once.
+export fn press_deflate_dec_free(d: PressDeflateDec*) {
+  if (d == 0) { return; }
+  if (d->st != 0) { free(d->st); d->st = (PdfInflate*)0; }
+  press_buf_free(&d->pend);
+  press_buf_free(&d->hist);
+}

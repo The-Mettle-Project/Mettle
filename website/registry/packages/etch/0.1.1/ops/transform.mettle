@@ -1,0 +1,120 @@
+// Flips, rotations, crops and fills.
+
+import "std/mem";
+import "../core/status";
+import "../core/image";
+
+/// Flips an image top to bottom in place. OpenGL wants rows bottom first,
+/// so call this before uploading if your texture coordinates expect it.
+export fn etch_flip_v(img: EtchImage*) -> int32 {
+  if (img == 0 || img->data == 0) { return ETCH_E_ARG; }
+  var rb: int64 = etch_image_row_bytes(img);
+  var tmp: uint8* = (uint8*)malloc(rb);
+  if (tmp == 0) { return ETCH_E_MEM; }
+  var top: int64 = 0;
+  var bot: int64 = (int64)img->height - 1;
+  while (top < bot) {
+    var a: uint8* = img->data + top * img->stride;
+    var b: uint8* = img->data + bot * img->stride;
+    memcpy(tmp, a, rb);
+    memcpy(a, b, rb);
+    memcpy(b, tmp, rb);
+    top = top + 1;
+    bot = bot - 1;
+  }
+  free(tmp);
+  return ETCH_OK;
+}
+
+/// Flips an image left to right in place.
+export fn etch_flip_h(img: EtchImage*) -> int32 {
+  if (img == 0 || img->data == 0) { return ETCH_E_ARG; }
+  var bpp: int64 = (int64)etch_format_bpp(img->format);
+  var w: int64 = (int64)img->width;
+  var t: uint8[16];
+  for y in 0..img->height {
+    var row: uint8* = img->data + (int64)y * img->stride;
+    var l: int64 = 0;
+    var r: int64 = w - 1;
+    while (l < r) {
+      var a: uint8* = row + l * bpp;
+      var b: uint8* = row + r * bpp;
+      for k in 0..bpp { t[k] = a[k]; a[k] = b[k]; b[k] = t[k]; }
+      l = l + 1;
+      r = r - 1;
+    }
+  }
+  return ETCH_OK;
+}
+
+/// Makes a new image rotated clockwise by 90, 180 or 270 degrees.
+export fn etch_rotate(src: EtchImage*, degrees: int32, out: EtchImage*) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0) { return ETCH_E_ARG; }
+  var d: int32 = ((degrees % 360) + 360) % 360;
+  if (d != 0 && d != 90 && d != 180 && d != 270) { return ETCH_E_ARG; }
+  var w: int32 = src->width;
+  var h: int32 = src->height;
+  var ow: int32 = w;
+  var oh: int32 = h;
+  if (d == 90 || d == 270) { ow = h; oh = w; }
+  var tmp: EtchImage;
+  var rc: int32 = etch_image_alloc(&tmp, ow, oh, src->format);
+  if (rc != ETCH_OK) { return rc; }
+  var bpp: int64 = (int64)etch_format_bpp(src->format);
+  for y in 0..h {
+    var s: uint8* = src->data + (int64)y * src->stride;
+    for x in 0..w {
+      var nx: int64 = (int64)x;
+      var ny: int64 = (int64)y;
+      if (d == 90) { nx = (int64)(h - 1 - y); ny = (int64)x; }
+      else if (d == 180) { nx = (int64)(w - 1 - x); ny = (int64)(h - 1 - y); }
+      else if (d == 270) { nx = (int64)y; ny = (int64)(w - 1 - x); }
+      memcpy(tmp.data + ny * tmp.stride + nx * bpp, s + (int64)x * bpp, bpp);
+    }
+  }
+  *out = tmp;
+  return ETCH_OK;
+}
+
+/// Makes a new image from the rectangle x, y, w, h of src (clipped).
+export fn etch_crop(src: EtchImage*, x: int32, y: int32, w: int32, h: int32, out: EtchImage*) -> int32 {
+  var v: EtchImage;
+  var rc: int32 = etch_image_view(src, x, y, w, h, &v);
+  if (rc != ETCH_OK) { return rc; }
+  return etch_image_copy(&v, out);
+}
+
+/// Sets every pixel to the bytes of one pixel at `px` (etch_format_bpp bytes).
+export fn etch_fill(img: EtchImage*, px: uint8*) -> int32 {
+  if (img == 0 || img->data == 0 || px == 0) { return ETCH_E_ARG; }
+  var bpp: int64 = (int64)etch_format_bpp(img->format);
+  for y in 0..img->height {
+    var row: uint8* = img->data + (int64)y * img->stride;
+    for x in 0..img->width { memcpy(row + (int64)x * bpp, px, bpp); }
+  }
+  return ETCH_OK;
+}
+
+/// Copies src onto dst with its top-left corner at x, y. Both must have the
+/// same format. Parts outside dst are skipped. No blending.
+export fn etch_blit(dst: EtchImage*, src: EtchImage*, x: int32, y: int32) -> int32 {
+  if (dst == 0 || src == 0 || dst->data == 0 || src->data == 0) { return ETCH_E_ARG; }
+  if (dst->format != src->format) { return ETCH_E_ARG; }
+  var bpp: int64 = (int64)etch_format_bpp(src->format);
+  var sx: int32 = 0;
+  var sy: int32 = 0;
+  var dx: int32 = x;
+  var dy: int32 = y;
+  if (dx < 0) { sx = -dx; dx = 0; }
+  if (dy < 0) { sy = -dy; dy = 0; }
+  var w: int32 = src->width - sx;
+  var h: int32 = src->height - sy;
+  if (dx + w > dst->width) { w = dst->width - dx; }
+  if (dy + h > dst->height) { h = dst->height - dy; }
+  if (w <= 0 || h <= 0) { return ETCH_OK; }
+  for r in 0..h {
+    memcpy(dst->data + (int64)(dy + r) * dst->stride + (int64)dx * bpp,
+           src->data + (int64)(sy + r) * src->stride + (int64)sx * bpp, (int64)w * bpp);
+  }
+  return ETCH_OK;
+}

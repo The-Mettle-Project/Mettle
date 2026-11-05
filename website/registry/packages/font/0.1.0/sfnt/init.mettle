@@ -1,0 +1,151 @@
+// Opening fonts: single fonts (TrueType or CFF) and collections (TTC/OTC).
+// Spec: OpenType "Font file" (table directory and TTC header), head, hhea,
+// maxp, OS/2 and post.
+
+import "face";
+import "cmap";
+import "font/outline/cff";
+
+const TAG_TTCF: uint32 = 0x74746366;
+const TAG_OTTO: uint32 = 0x4F54544F;
+const TAG_TRUE: uint32 = 0x74727565;
+
+fn is_sfnt(v: uint32) -> bool {
+  return v == 0x00010000 || v == TAG_OTTO || v == TAG_TRUE;
+}
+
+/// Number of faces in the font bytes: 1 for a single font, n for a
+/// collection, 0 when the bytes are not a font.
+export fn font_count(data: uint8*, len: int64) -> int32 {
+  var f: FontFace;
+  f.data = data;
+  f.len = len;
+  var v: uint32 = font_u32(&f, 0);
+  if (is_sfnt(v)) { return 1; }
+  if (v == TAG_TTCF) {
+    var n: int64 = (int64)font_u32(&f, 8);
+    if (n > (len - 12) / 4) { return 0; }
+    return (int32)n;
+  }
+  return 0;
+}
+
+/// Opens face `index` (0 for a single font) from the font bytes, which must
+/// stay alive while the face is used. Returns FONT_OK or a FONT_E_* code.
+export fn font_init(f: FontFace*, data: uint8*, len: int64, index: int32) -> int32 {
+  var zero: FontFace;
+  *f = zero;
+  f->data = data;
+  f->len = len;
+  f->index = index;
+  if (data == 0 || len < 12) { return FONT_E_FORMAT; }
+  var v: uint32 = font_u32(f, 0);
+  if (v == TAG_TTCF) {
+    var n: int64 = (int64)font_u32(f, 8);
+    if (index < 0 || (int64)index >= n) { return FONT_E_INDEX; }
+    f->dir = (int64)font_u32(f, 12 + (int64)index * 4);
+    if (f->dir <= 0 || f->dir + 12 > len) { return FONT_E_FORMAT; }
+    v = font_u32(f, f->dir);
+  } else if (index != 0) {
+    return FONT_E_INDEX;
+  }
+  if (!is_sfnt(v)) { return FONT_E_FORMAT; }
+
+  var ln: int64 = 0;
+  f->head = font_find_table(f, FONT_TAG_HEAD, &ln);
+  if (ln < 54) { return FONT_E_MISSING; }
+  f->hhea = font_find_table(f, FONT_TAG_HHEA, &ln);
+  if (ln < 36) { return FONT_E_MISSING; }
+  f->maxp = font_find_table(f, FONT_TAG_MAXP, &ln);
+  if (ln < 6) { return FONT_E_MISSING; }
+  f->hmtx = font_find_table(f, FONT_TAG_HMTX, &f->hmtx_len);
+  f->cmap = font_find_table(f, FONT_TAG_CMAP, &f->cmap_len);
+  f->loca = font_find_table(f, FONT_TAG_LOCA, &f->loca_len);
+  f->glyf = font_find_table(f, FONT_TAG_GLYF, &f->glyf_len);
+  f->kern = font_find_table(f, FONT_TAG_KERN, &f->kern_len);
+  f->gpos = font_find_table(f, FONT_TAG_GPOS, &f->gpos_len);
+  f->gsub = font_find_table(f, FONT_TAG_GSUB, &f->gsub_len);
+  f->gdef = font_find_table(f, FONT_TAG_GDEF, &f->gdef_len);
+  f->name = font_find_table(f, FONT_TAG_NAME, &f->name_len);
+  f->cff_off = font_find_table(f, FONT_TAG_CFF, &f->cff_len);
+  f->vhea = font_find_table(f, FONT_TAG_VHEA, &ln);
+  if (ln < 36) { f->vhea = 0; }
+  f->vmtx = font_find_table(f, FONT_TAG_VMTX, &f->vmtx_len);
+  var os2_len: int64 = 0;
+  f->os2 = font_find_table(f, FONT_TAG_OS2, &os2_len);
+  var post_len: int64 = 0;
+  f->post = font_find_table(f, FONT_TAG_POST, &post_len);
+  if (f->hmtx == 0) { return FONT_E_MISSING; }
+
+  // head
+  f->upem = (int32)font_u16(f, f->head + 18);
+  if (f->upem < 16 || f->upem > 16384) { return FONT_E_MISSING; }
+  f->x_min = font_i16(f, f->head + 36);
+  f->y_min = font_i16(f, f->head + 38);
+  f->x_max = font_i16(f, f->head + 40);
+  f->y_max = font_i16(f, f->head + 42);
+  f->loc_format = font_i16(f, f->head + 50);
+
+  // maxp, hhea, hmtx
+  f->num_glyphs = (int32)font_u16(f, f->maxp + 4);
+  if (f->num_glyphs == 0) { return FONT_E_MISSING; }
+  f->ascent = font_i16(f, f->hhea + 4);
+  f->descent = font_i16(f, f->hhea + 6);
+  f->line_gap = font_i16(f, f->hhea + 8);
+  f->num_hmetrics = (int32)font_u16(f, f->hhea + 34);
+  if (f->num_hmetrics == 0 || (int64)f->num_hmetrics * 4 > f->hmtx_len) { return FONT_E_MISSING; }
+  if (f->num_hmetrics > f->num_glyphs) { f->num_hmetrics = f->num_glyphs; }
+  if (f->vhea != 0 && f->vmtx != 0) {
+    f->num_vmetrics = (int32)font_u16(f, f->vhea + 34);
+    if ((int64)f->num_vmetrics * 4 > f->vmtx_len) { f->num_vmetrics = 0; }
+    if (f->num_vmetrics > f->num_glyphs) { f->num_vmetrics = f->num_glyphs; }
+  }
+
+  // OS/2, with fallbacks for fonts that lack it.
+  f->typo_ascent = f->ascent;
+  f->typo_descent = f->descent;
+  f->typo_line_gap = f->line_gap;
+  f->win_ascent = f->ascent;
+  f->win_descent = -f->descent;
+  f->cap_height = (f->upem * 7) / 10;
+  f->x_height = f->upem / 2;
+  f->strike_thick = f->upem / 20;
+  f->strike_pos = f->upem / 4;
+  f->weight = 400;
+  if (f->os2 != 0 && os2_len >= 78) {
+    var o: int64 = f->os2;
+    f->weight = (int32)font_u16(f, o + 4);
+    f->strike_thick = font_i16(f, o + 26);
+    f->strike_pos = font_i16(f, o + 28);
+    f->use_typo = (font_u16(f, o + 62) & 0x80) != 0;
+    f->typo_ascent = font_i16(f, o + 68);
+    f->typo_descent = font_i16(f, o + 70);
+    f->typo_line_gap = font_i16(f, o + 72);
+    f->win_ascent = (int32)font_u16(f, o + 74);
+    f->win_descent = (int32)font_u16(f, o + 76);
+    if (font_u16(f, o) >= 2 && os2_len >= 90) {
+      f->x_height = font_i16(f, o + 86);
+      f->cap_height = font_i16(f, o + 88);
+    }
+  }
+
+  // post
+  f->underline_pos = -f->upem / 10;
+  f->underline_thick = f->upem / 20;
+  if (f->post != 0 && post_len >= 32) {
+    f->italic_angle = (float32)(int32)font_u32(f, f->post + 4) / 65536.0;
+    f->underline_pos = font_i16(f, f->post + 8);
+    f->underline_thick = font_i16(f, f->post + 10);
+    f->mono = font_u32(f, f->post + 12) != 0;
+  }
+
+  // Outlines
+  if (f->glyf != 0 && f->loca != 0) {
+    f->outline = FONT_OUTLINE_GLYF;
+  } else if (f->cff_off != 0) {
+    if (font_cff_init(f)) { f->outline = FONT_OUTLINE_CFF; }
+  }
+
+  font_cmap_select(f);
+  return FONT_OK;
+}

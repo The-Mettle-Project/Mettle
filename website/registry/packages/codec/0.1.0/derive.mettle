@@ -1,0 +1,346 @@
+// @codec_derive: MessagePack and JSON for a Mettle struct, written by the
+// compiler from the struct's fields.
+//
+//   import "codec/derive";
+//   @codec_derive struct Config {
+//     name: string;
+//     port: int32;
+//     tags: CodecList<string>;
+//   }
+//
+// gives
+//   Config_mp_write(v: Config*, b: CodecBuf*)          a map from field name to value
+//   Config_mp_read(v: Config*, r: CodecReader*) -> bool  keys in any order; unknown keys skipped
+//   Config_json_write(v: Config*, w: CodecJson*)       an object
+//
+// Field types: int8..int64, uint8..uint64, float32, float64, bool, char,
+// string, another @codec_derive struct, a pointer to one (nil when 0),
+// CodecList<T> and T[N] of any of these. Strings read back as views into the
+// input. Reading checks integer ranges and nesting depth. The build also gets
+// a rule that writes a zero value and reads it back, so a broken mapping
+// stops the build.
+import "std/meta";
+import "codec/core/status";
+import "codec/core/list";
+import "codec/core/buf";
+import "codec/core/reader";
+import "codec/msgpack/write";
+import "codec/msgpack/read";
+import "codec/json/write";
+
+// Kinds of field type the generator knows.
+const DK_INT = 1;
+const DK_UINT = 2;
+const DK_F32 = 3;
+const DK_F64 = 4;
+const DK_BOOL = 5;
+const DK_STR = 6;
+const DK_CHAR = 7;
+const DK_STRUCT = 8;
+const DK_PTR = 9;
+const DK_LIST = 10;
+const DK_ARRAY = 11;
+
+fn dk_starts(s: string, p: string) -> bool {
+  if (s.length < p.length) { return false; }
+  for i in 0..p.length {
+    if (s.chars[i] != p.chars[i]) { return false; }
+  }
+  return true;
+}
+
+fn dk_sub(s: string, from: int64, to: int64) -> string {
+  var out: string;
+  out.chars = s.chars + from;
+  out.length = (uint64)(to - from);
+  return out;
+}
+
+// Field types from other modules come qualified ("codec/core/list.CodecList__string");
+// generated code uses the plain name, which imports make visible.
+fn dk_norm(t: string) -> string {
+  var i: int64 = (int64)t.length - 1;
+  while (i >= 0 && t.chars[i] != 46) { i = i - 1; }
+  if (i < 0) { return t; }
+  return dk_sub(t, i + 1, (int64)t.length);
+}
+
+fn dk_kind(t: string) -> int32 {
+  if (t == "int8" || t == "int16" || t == "int32" || t == "int64") { return DK_INT; }
+  if (t == "uint8" || t == "uint16" || t == "uint32" || t == "uint64") { return DK_UINT; }
+  if (t == "float32") { return DK_F32; }
+  if (t == "float64") { return DK_F64; }
+  if (t == "bool") { return DK_BOOL; }
+  if (t == "string") { return DK_STR; }
+  if (t == "char") { return DK_CHAR; }
+  if (dk_starts(t, "CodecList__")) { return DK_LIST; }
+  var n: int64 = (int64)t.length;
+  if (n > 0 && t.chars[n - 1] == 93) {
+    if (n > 2 && t.chars[n - 2] == 91) { return 0; }   // slices T[] are not supported
+    return DK_ARRAY;
+  }
+  if (n > 0 && t.chars[n - 1] == 42) {
+    var inner: int32 = dk_kind(dk_sub(t, 0, n - 1));
+    if (inner == DK_STRUCT) { return DK_PTR; }
+    return 0;
+  }
+  for i in 0..t.length {
+    var c: int32 = (int32)t.chars[i];
+    var ok: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
+    if (!ok) { return 0; }
+  }
+  return DK_STRUCT;
+}
+
+// For T[N]: T and N.
+fn dk_array_elem(t: string) -> string {
+  var i: int64 = (int64)t.length - 1;
+  while (i > 0 && t.chars[i] != 91) { i = i - 1; }
+  return dk_sub(t, 0, i);
+}
+
+fn dk_array_len(t: string) -> string {
+  var i: int64 = (int64)t.length - 1;
+  while (i > 0 && t.chars[i] != 91) { i = i - 1; }
+  return dk_sub(t, i + 1, (int64)t.length - 1);
+}
+
+fn dk_list_elem(t: string) -> string {
+  return dk_sub(t, 11, (int64)t.length);
+}
+
+fn dk_supported(t: string) -> bool {
+  var k: int32 = dk_kind(t);
+  if (k == 0) { return false; }
+  if (k == DK_LIST) { return dk_supported_elem(dk_list_elem(t)); }
+  if (k == DK_ARRAY) { return dk_supported_elem(dk_array_elem(t)); }
+  return true;
+}
+
+fn dk_supported_elem(t: string) -> bool {
+  var k: int32 = dk_kind(t);
+  return k != 0 && k != DK_LIST && k != DK_ARRAY;
+}
+
+// Code writing value expression `v` of type t as MessagePack.
+fn dk_mp_put(out: Text*, t: string, v: string, ind: string) {
+  var k: int32 = dk_kind(t);
+  switch (k) {
+    case 1: { text_add(out, ind + "codec_mp_int(b, (int64){v});\n"); }
+    case 2: { text_add(out, ind + "codec_mp_uint(b, (uint64){v});\n"); }
+    case 3: { text_add(out, ind + "codec_mp_float32(b, {v});\n"); }
+    case 4: { text_add(out, ind + "codec_mp_float64(b, {v});\n"); }
+    case 5: { text_add(out, ind + "codec_mp_bool(b, {v});\n"); }
+    case 6: { text_add(out, ind + "codec_mp_str(b, {v});\n"); }
+    case 7: { text_add(out, ind + "codec_mp_int(b, (int64){v});\n"); }
+    case 8: { text_add(out, ind + "{t}_mp_write(&{v}, b);\n"); }
+    case 9: {
+      var s: string = dk_sub(t, 0, (int64)t.length - 1);
+      text_add(out, ind + "if ({v} == 0) {{ codec_mp_nil(b); } else {{ {s}_mp_write({v}, b); }\n");
+    }
+    case 10: {
+      text_add(out, ind + "codec_mp_array(b, {v}.len);\n");
+      text_add(out, ind + "for i in 0..{v}.len {{\n");
+      dk_mp_put(out, dk_list_elem(t), v + ".data[i]", ind + "  ");
+      text_add(out, ind + "}\n");
+    }
+    case 11: {
+      var n: string = dk_array_len(t);
+      text_add(out, ind + "codec_mp_array(b, {n});\n");
+      text_add(out, ind + "for i in 0..{n} {{\n");
+      dk_mp_put(out, dk_array_elem(t), v + "[i]", ind + "  ");
+      text_add(out, ind + "}\n");
+    }
+    default: { }
+  }
+}
+
+fn dk_int_range(t: string, lo: string*, hi: string*) -> bool {
+  if (t == "int8") { *lo = "-128"; *hi = "127"; return true; }
+  if (t == "int16") { *lo = "-32768"; *hi = "32767"; return true; }
+  if (t == "int32" || t == "char") { *lo = "-2147483648"; *hi = "2147483647"; return true; }
+  if (t == "uint8") { *hi = "255"; return true; }
+  if (t == "uint16") { *hi = "65535"; return true; }
+  if (t == "uint32") { *hi = "4294967295"; return true; }
+  return false;
+}
+
+// Code reading into lvalue `v` of type t. `tmp` keeps local names apart.
+fn dk_mp_get(out: Text*, t: string, v: string, ind: string, tmp: string) {
+  var k: int32 = dk_kind(t);
+  var lo: string = "";
+  var hi: string = "";
+  switch (k) {
+    case 1: {
+      if (dk_int_range(t, &lo, &hi)) {
+        text_add(out, ind + "var {tmp}: int64 = codec_mp_read_int(r);\n");
+        text_add(out, ind + "if ({tmp} < {lo} || {tmp} > {hi}) {{ codec_rd_fail(r, CODEC_ERR_TYPE); return false; }\n");
+        text_add(out, ind + "{v} = ({t}){tmp};\n");
+      } else {
+        text_add(out, ind + "{v} = codec_mp_read_int(r);\n");
+      }
+    }
+    case 2: {
+      if (dk_int_range(t, &lo, &hi)) {
+        text_add(out, ind + "var {tmp}: uint64 = codec_mp_read_uint(r);\n");
+        text_add(out, ind + "if ({tmp} > {hi}) {{ codec_rd_fail(r, CODEC_ERR_TYPE); return false; }\n");
+        text_add(out, ind + "{v} = ({t}){tmp};\n");
+      } else {
+        text_add(out, ind + "{v} = codec_mp_read_uint(r);\n");
+      }
+    }
+    case 3: { text_add(out, ind + "{v} = (float32)codec_mp_read_float(r);\n"); }
+    case 4: { text_add(out, ind + "{v} = codec_mp_read_float(r);\n"); }
+    case 5: { text_add(out, ind + "{v} = codec_mp_read_bool(r);\n"); }
+    case 6: { text_add(out, ind + "{v} = codec_mp_read_str(r);\n"); }
+    case 7: {
+      text_add(out, ind + "var {tmp}: int64 = codec_mp_read_int(r);\n");
+      text_add(out, ind + "if ({tmp} < -128 || {tmp} > 255) {{ codec_rd_fail(r, CODEC_ERR_TYPE); return false; }\n");
+      text_add(out, ind + "{v} = (char){tmp};\n");
+    }
+    case 8: { text_add(out, ind + "if (!{t}_mp_read_depth(&{v}, r, depth - 1)) {{ return false; }\n"); }
+    case 9: {
+      var s: string = dk_sub(t, 0, (int64)t.length - 1);
+      text_add(out, ind + "if (!codec_mp_read_nil(r)) {{\n");
+      text_add(out, ind + "  if ({v} == 0) {{ {v} = new {s}; }\n");
+      text_add(out, ind + "  if ({v} == 0) {{ codec_rd_fail(r, CODEC_ERR_NOMEM); return false; }\n");
+      text_add(out, ind + "  if (!{s}_mp_read_depth({v}, r, depth - 1)) {{ return false; }\n");
+      text_add(out, ind + "}\n");
+    }
+    case 10: {
+      var e: string = dk_list_elem(t);
+      text_add(out, ind + "var {tmp}: int64 = codec_mp_read_array(r);\n");
+      text_add(out, ind + "if (r->err != CODEC_OK) {{ return false; }\n");
+      text_add(out, ind + "if (!codec_list_reserve<{e}>(&{v}, {v}.len + {tmp})) {{ codec_rd_fail(r, CODEC_ERR_NOMEM); return false; }\n");
+      text_add(out, ind + "for i in 0..{tmp} {{\n");
+      text_add(out, ind + "  var {tmp}_e: {e};\n");
+      dk_mp_get(out, e, tmp + "_e", ind + "  ", tmp + "_x");
+      text_add(out, ind + "  if (r->err != CODEC_OK) {{ return false; }\n");
+      text_add(out, ind + "  codec_list_push<{e}>(&{v}, {tmp}_e);\n");
+      text_add(out, ind + "}\n");
+    }
+    case 11: {
+      var n: string = dk_array_len(t);
+      text_add(out, ind + "if (codec_mp_read_array(r) != {n}) {{ codec_rd_fail(r, CODEC_ERR_TYPE); return false; }\n");
+      text_add(out, ind + "for i in 0..{n} {{\n");
+      dk_mp_get(out, dk_array_elem(t), v + "[i]", ind + "  ", tmp + "_x");
+      text_add(out, ind + "  if (r->err != CODEC_OK) {{ return false; }\n");
+      text_add(out, ind + "}\n");
+    }
+    default: { }
+  }
+}
+
+fn dk_json_put(out: Text*, t: string, v: string, ind: string) {
+  var k: int32 = dk_kind(t);
+  switch (k) {
+    case 1: { text_add(out, ind + "codec_json_int(w, (int64){v});\n"); }
+    case 2: { text_add(out, ind + "codec_json_uint(w, (uint64){v});\n"); }
+    case 3: { text_add(out, ind + "codec_json_float32(w, {v});\n"); }
+    case 4: { text_add(out, ind + "codec_json_float(w, {v});\n"); }
+    case 5: { text_add(out, ind + "codec_json_bool(w, {v});\n"); }
+    case 6: { text_add(out, ind + "codec_json_string(w, {v});\n"); }
+    case 7: { text_add(out, ind + "codec_json_int(w, (int64){v});\n"); }
+    case 8: { text_add(out, ind + "{t}_json_write(&{v}, w);\n"); }
+    case 9: {
+      var s: string = dk_sub(t, 0, (int64)t.length - 1);
+      text_add(out, ind + "if ({v} == 0) {{ codec_json_null(w); } else {{ {s}_json_write({v}, w); }\n");
+    }
+    case 10: {
+      text_add(out, ind + "codec_json_array(w);\n");
+      text_add(out, ind + "for i in 0..{v}.len {{\n");
+      dk_json_put(out, dk_list_elem(t), v + ".data[i]", ind + "  ");
+      text_add(out, ind + "}\n");
+      text_add(out, ind + "codec_json_end(w);\n");
+    }
+    case 11: {
+      var n: string = dk_array_len(t);
+      text_add(out, ind + "codec_json_array(w);\n");
+      text_add(out, ind + "for i in 0..{n} {{\n");
+      dk_json_put(out, dk_array_elem(t), v + "[i]", ind + "  ");
+      text_add(out, ind + "}\n");
+      text_add(out, ind + "codec_json_end(w);\n");
+    }
+    default: { }
+  }
+}
+
+@generate export fn codec_derive(t: TypeInfo) -> Generated {
+  var name: string = t.name;
+  for f in t.fields {
+    if (!dk_supported(dk_norm(f.type_name))) {
+      return refuse("@codec_derive: field '{f.name}' of {name} has type {f.type_name}, which Codec cannot map");
+    }
+  }
+  var nf: int64 = 0;
+  for f in t.fields { nf = nf + 1; }
+  var out: Text;
+
+  text_add(&out, "// MessagePack: a map from field name to value.\n");
+  text_add(&out, "export fn {name}_mp_write(v: {name}*, b: CodecBuf*) {{\n");
+  text_add(&out, "  codec_mp_map(b, {nf});\n");
+  for f in t.fields {
+    text_add(&out, "  codec_mp_str(b, \"{f.name}\");\n");
+    dk_mp_put(&out, dk_norm(f.type_name), "v->" + f.name, "  ");
+  }
+  text_add(&out, "}\n\n");
+
+  text_add(&out, "export fn {name}_mp_read_depth(v: {name}*, r: CodecReader*, depth: int32) -> bool {{\n");
+  text_add(&out, "  if (depth <= 0) {{ codec_rd_fail(r, CODEC_ERR_DEPTH); return false; }\n");
+  text_add(&out, "  var n: int64 = codec_mp_read_map(r);\n");
+  text_add(&out, "  for k in 0..n {{\n");
+  text_add(&out, "    var key: string = codec_mp_read_str(r);\n");
+  text_add(&out, "    if (r->err != CODEC_OK) {{ return false; }\n");
+  var first: bool = true;
+  for f in t.fields {
+    var kw: string = "} else if";
+    if (first) { kw = "if"; }
+    first = false;
+    text_add(&out, "    {kw} (key == \"{f.name}\") {{\n");
+    dk_mp_get(&out, dk_norm(f.type_name), "v->" + f.name, "      ", "t_" + f.name);
+  }
+  if (first) {
+    text_add(&out, "    if (!codec_mp_skip(r, depth)) {{ return false; }\n");
+  } else {
+    text_add(&out, "    } else {{\n");
+    text_add(&out, "      if (!codec_mp_skip(r, depth)) {{ return false; }\n");
+    text_add(&out, "    }\n");
+  }
+  text_add(&out, "    if (r->err != CODEC_OK) {{ return false; }\n");
+  text_add(&out, "  }\n");
+  text_add(&out, "  return r->err == CODEC_OK;\n");
+  text_add(&out, "}\n\n");
+
+  text_add(&out, "// Reads a map written by {name}_mp_write (keys in any order, unknown keys\n");
+  text_add(&out, "// skipped) into v. Strings in v point into the input.\n");
+  text_add(&out, "export fn {name}_mp_read(v: {name}*, r: CodecReader*) -> bool {{\n");
+  text_add(&out, "  return {name}_mp_read_depth(v, r, CODEC_MP_DEPTH);\n");
+  text_add(&out, "}\n\n");
+
+  text_add(&out, "// JSON: an object with one member per field.\n");
+  text_add(&out, "export fn {name}_json_write(v: {name}*, w: CodecJson*) {{\n");
+  text_add(&out, "  codec_json_object(w);\n");
+  for f in t.fields {
+    text_add(&out, "  codec_json_key(w, \"{f.name}\");\n");
+    dk_json_put(&out, dk_norm(f.type_name), "v->" + f.name, "  ");
+  }
+  text_add(&out, "  codec_json_end(w);\n");
+  text_add(&out, "}\n\n");
+
+  // Checked while compiling: a zero value reads back as written.
+  text_add(&out, "@rule fn {name}__codec_round_trip(p: Program) -> Verdict {{\n");
+  text_add(&out, "  var mem: uint8[4096];\n");
+  text_add(&out, "  var b: CodecBuf;\n");
+  text_add(&out, "  codec_buf_fixed(&b, &mem[0], 4096);\n");
+  text_add(&out, "  var v: {name};\n");
+  text_add(&out, "  {name}_mp_write(&v, &b);\n");
+  text_add(&out, "  var r: CodecReader;\n");
+  text_add(&out, "  codec_rd_init(&r, b.data, b.len);\n");
+  text_add(&out, "  var back: {name};\n");
+  text_add(&out, "  if (b.err != CODEC_OK || !{name}_mp_read(&back, &r) || !codec_rd_done(&r)) {{\n");
+  text_add(&out, "    return verdict_fail(function_site(p, \"{name}_mp_read\"), \"@codec_derive: {name} does not read back what it writes\");\n");
+  text_add(&out, "  }\n");
+  text_add(&out, "  return verdict_pass();\n");
+  text_add(&out, "}\n");
+  return generated(text_done(&out));
+}

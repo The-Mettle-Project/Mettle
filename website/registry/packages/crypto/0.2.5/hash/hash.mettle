@@ -1,0 +1,430 @@
+// Hashes: SHA-256, SHA-384, SHA-512 (FIPS 180-4, sha2) and BLAKE2b (RFC 7693, blake2b),
+// all pure Mettle.
+//
+// Each has a one-shot form (cr_sha256, cr_sha384, cr_sha512, cr_blake2b) and a streaming
+// form for files and streams: cr_<hash>_init, _update (any number of times)
+// and _final, on a caller-owned CrSha256State, CrSha384State, CrSha512State or
+// CrBlake2bState. _final always wipes the state.
+//
+// None of these is a password hash (use cr_pwhash_str) or a MAC (use
+// cr_hmac_* or keyed BLAKE2b).
+
+import "crypto/core/status";
+import "crypto/core/types";
+import "crypto/core/util";
+import "crypto/hash/blake2b";
+import "crypto/hash/sha2";
+
+/// Smallest BLAKE2b output length cr_blake2b accepts (a hash shorter than this is too weak to be useful).
+/// in: - 
+/// returns: 16
+/// owns: nothing
+/// thread: constant
+/// example: cr_blake2b(&o[0], CR_BLAKE2B_MIN, m, n, 0, 0);
+export const CR_BLAKE2B_MIN: int64 = 16;
+/// Largest BLAKE2b output and key length (the RFC 7693 maximum).
+/// in: -
+/// returns: 64
+/// owns: nothing
+/// thread: constant
+/// example: var o: uint8[64]; cr_blake2b(&o[0], CR_BLAKE2B_MAX, m, n, 0, 0);
+export const CR_BLAKE2B_MAX: int64 = 64;
+/// Smallest non-empty BLAKE2b key (shorter keys are too weak to be useful).
+/// in: -
+/// returns: 16
+/// owns: nothing
+/// thread: constant
+/// example: cr_blake2b(&o[0], 32, m, n, &k[0], CR_BLAKE2B_KEY_MIN);
+export const CR_BLAKE2B_KEY_MIN: int64 = 16;
+
+// A valid address for zero-length inputs, so the hash code never sees a null
+// pointer.
+var g_cr_hash_empty: uint8[1];
+
+fn cr_hash_in(p: uint8*, n: int64) -> uint8* {
+  if (p == 0 || n == 0) { return &g_cr_hash_empty[0]; }
+  return p;
+}
+
+/// Computes SHA-256 of n bytes (FIPS 180-4).
+/// in: out; msg readable for n bytes (may be 0 when n == 0); n >= 0
+/// returns: CR_OK; CR_E_ARG (null out, null msg with n > 0, n < 0). On error
+///   out is not written
+/// owns: nothing; the caller owns out and msg
+/// thread: any thread (no shared state)
+/// example: var d: CrSha256; cr_sha256(&d, s.chars, (int64)s.length);
+export fn cr_sha256(out: CrSha256*, msg: uint8*, n: int64) -> int32 {
+  if (out == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  var s: CrxSha256;
+  crx_sha256_init(&s);
+  crx_sha256_update(&s, msg, n);
+  crx_sha256_final(&s, &out->b[0]);
+  return CR_OK;
+}
+
+/// Computes SHA-384 of n bytes (FIPS 180-4).
+/// in: out; msg readable for n bytes (may be 0 when n == 0); n >= 0
+/// returns: CR_OK; CR_E_ARG (null out, null msg with n > 0, n < 0). On error
+///   out is not written
+/// owns: nothing; the caller owns out and msg
+/// thread: any thread (no shared state)
+/// example: var d: CrSha384; cr_sha384(&d, s.chars, (int64)s.length);
+export fn cr_sha384(out: CrSha384*, msg: uint8*, n: int64) -> int32 {
+  if (out == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  var s: CrxSha384;
+  crx_sha384_init(&s);
+  crx_sha384_update(&s, msg, n);
+  crx_sha384_final(&s, &out->b[0]);
+  return CR_OK;
+}
+
+/// Computes SHA-512 of n bytes (FIPS 180-4).
+/// in: out; msg readable for n bytes (may be 0 when n == 0); n >= 0
+/// returns: CR_OK; CR_E_ARG (null out, null msg with n > 0, n < 0). On error
+///   out is not written
+/// owns: nothing; the caller owns out and msg
+/// thread: any thread (no shared state)
+/// example: var d: CrSha512; cr_sha512(&d, s.chars, (int64)s.length);
+export fn cr_sha512(out: CrSha512*, msg: uint8*, n: int64) -> int32 {
+  if (out == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  var s: CrxSha512;
+  crx_sha512_init(&s);
+  crx_sha512_update(&s, msg, n);
+  crx_sha512_final(&s, &out->b[0]);
+  return CR_OK;
+}
+
+/// Computes BLAKE2b (RFC 7693), optionally
+/// keyed (then it is a MAC/PRF), with a chosen output length.
+/// in: out writable for outlen bytes, outlen in [16, 64];
+///   msg readable for n bytes (0 allowed when n == 0), n >= 0;
+///   key readable for keylen bytes, keylen 0 (unkeyed; key may be 0) or in
+///   [16, 64]
+/// returns: CR_OK; CR_E_ARG for any length outside those ranges or a null
+///   pointer with a non-zero length. On error out is not written
+/// owns: nothing; the caller owns out, msg and key (wipe the key yourself)
+/// thread: any thread (no shared state)
+/// example: var d: uint8[32]; cr_blake2b(&d[0], 32, s.chars, (int64)s.length, 0, 0);
+export fn cr_blake2b(out: uint8*, outlen: int64, msg: uint8*, n: int64, key: uint8*, keylen: int64) -> int32 {
+  if (out == 0 || outlen < CR_BLAKE2B_MIN || outlen > CR_BLAKE2B_MAX) { return CR_E_ARG; }
+  if (n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  if (keylen != 0) {
+    if (key == 0 || keylen < CR_BLAKE2B_KEY_MIN || keylen > CR_BLAKE2B_MAX) { return CR_E_ARG; }
+  }
+  var s: CrxBlake2b;
+  var kp: uint8* = 0;
+  if (keylen > 0) { kp = key; }
+  crx_blake2b_init(&s, outlen, kp, keylen);
+  crx_blake2b_update(&s, msg, n);
+  crx_blake2b_final(&s, out);
+  return CR_OK;
+}
+
+// Sizes of the streaming states, for wiping them whole (no padding: all
+// fields are 8-byte aligned).
+
+/// Streaming SHA-256 state. Treat as opaque: only cr_sha256_init, _update and
+/// _final touch it. The caller provides the memory.
+/// in: -
+/// returns: -
+/// owns: the caller owns the state; _final wipes it; to abandon a hash early
+///   wipe it with cr_wipe((uint8*)st, (int64)sizeof(CrSha256State))
+/// thread: any thread (no shared state); one thread per state
+/// example: var st: CrSha256State; cr_sha256_init(&st);
+export struct CrSha256State {
+  s: CrxSha256;
+}
+
+/// Streaming SHA-384 state. Treat as opaque: only cr_sha384_init, _update and
+/// _final touch it. The caller provides the memory.
+/// in: -
+/// returns: -
+/// owns: the caller owns the state; _final wipes it; to abandon a hash early
+///   wipe it with cr_wipe((uint8*)st, (int64)sizeof(CrSha384State))
+/// thread: any thread (no shared state); one thread per state
+/// example: var st: CrSha384State; cr_sha384_init(&st);
+export struct CrSha384State {
+  s: CrxSha384;
+}
+
+/// Streaming SHA-512 state. Treat as opaque: only cr_sha512_init, _update and
+/// _final touch it. The caller provides the memory.
+/// in: -
+/// returns: -
+/// owns: the caller owns the state; _final wipes it; to abandon a hash early
+///   wipe it with cr_wipe((uint8*)st, (int64)sizeof(CrSha512State))
+/// thread: any thread (no shared state); one thread per state
+/// example: var st: CrSha512State; cr_sha512_init(&st);
+export struct CrSha512State {
+  s: CrxSha512;
+}
+
+/// Streaming BLAKE2b state. Treat as opaque: only cr_blake2b_init, _update and
+/// _final touch it. The caller provides the memory.
+/// in: -
+/// returns: -
+/// owns: the caller owns the state; _final wipes it; to abandon a hash early
+///   wipe it with cr_wipe((uint8*)st, (int64)sizeof(CrBlake2bState)). A keyed state holds the key: wipe or
+///   finish it
+/// thread: any thread (no shared state); one thread per state
+/// example: var st: CrBlake2bState; cr_blake2b_init(&st, 32, 0, 0);
+export struct CrBlake2bState {
+  s: CrxBlake2b;
+}
+
+/// Starts a streaming SHA-256 hash (FIPS 180-4). Feed data with
+/// cr_sha256_update, finish with cr_sha256_final.
+/// in: st writable state
+/// returns: CR_OK; CR_E_ARG (null st)
+/// owns: the caller owns st; _final wipes it, or abandon it with
+///   cr_wipe((uint8*)st, (int64)sizeof(CrSha256State))
+/// thread: any thread (no shared state)
+/// example: var st: CrSha256State; cr_sha256_init(&st);
+export fn cr_sha256_init(st: CrSha256State*) -> int32 {
+  if (st == 0) { return CR_E_ARG; }
+  crx_sha256_init(&st->s);
+  return CR_OK;
+}
+
+/// Feeds n bytes into a streaming SHA-256 hash. Any split of the input gives
+/// the same digest as cr_sha256 over the whole.
+/// in: st initialised by cr_sha256_init; msg readable for n bytes (may be 0
+///   when n == 0); n >= 0
+/// returns: CR_OK; CR_E_ARG (null st, null msg with n > 0, n < 0). On error
+///   the state is unchanged
+/// owns: the caller owns st and msg
+/// thread: any thread (no shared state)
+/// example: cr_sha256_update(&st, buf, (int64)got);
+export fn cr_sha256_update(st: CrSha256State*, msg: uint8*, n: int64) -> int32 {
+  if (st == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  crx_sha256_update(&st->s, cr_hash_in(msg, n), n);
+  return CR_OK;
+}
+
+/// Finishes a streaming SHA-256 hash and writes the digest. Always wipes st,
+/// also on error.
+/// in: st initialised by cr_sha256_init; out writable
+/// returns: CR_OK; CR_E_ARG (null st or out). With a null out and a non-null
+///   st the state is wiped and nothing is written
+/// owns: the caller owns st and out; st is wiped
+/// thread: any thread (no shared state)
+/// example: var d: CrSha256; cr_sha256_final(&st, &d);
+export fn cr_sha256_final(st: CrSha256State*, out: CrSha256*) -> int32 {
+  if (st == 0) { return CR_E_ARG; }
+  if (out == 0) {
+    cr_wipe((uint8*)st, (int64)sizeof(CrSha256State));
+    return CR_E_ARG;
+  }
+  crx_sha256_final(&st->s, &out->b[0]);
+  return CR_OK;
+}
+
+/// Starts a streaming SHA-384 hash (FIPS 180-4). Feed data with
+/// cr_sha384_update, finish with cr_sha384_final.
+/// in: st writable state
+/// returns: CR_OK; CR_E_ARG (null st)
+/// owns: the caller owns st; _final wipes it, or abandon it with
+///   cr_wipe((uint8*)st, (int64)sizeof(CrSha384State))
+/// thread: any thread (no shared state)
+/// example: var st: CrSha384State; cr_sha384_init(&st);
+export fn cr_sha384_init(st: CrSha384State*) -> int32 {
+  if (st == 0) { return CR_E_ARG; }
+  crx_sha384_init(&st->s);
+  return CR_OK;
+}
+
+/// Feeds n bytes into a streaming SHA-384 hash. Any split of the input gives
+/// the same digest as cr_sha384 over the whole.
+/// in: st initialised by cr_sha384_init; msg readable for n bytes (may be 0
+///   when n == 0); n >= 0
+/// returns: CR_OK; CR_E_ARG (null st, null msg with n > 0, n < 0). On error
+///   the state is unchanged
+/// owns: the caller owns st and msg
+/// thread: any thread (no shared state)
+/// example: cr_sha384_update(&st, buf, (int64)got);
+export fn cr_sha384_update(st: CrSha384State*, msg: uint8*, n: int64) -> int32 {
+  if (st == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  crx_sha384_update(&st->s, cr_hash_in(msg, n), n);
+  return CR_OK;
+}
+
+/// Finishes a streaming SHA-384 hash and writes the digest. Always wipes st,
+/// also on error.
+/// in: st initialised by cr_sha384_init; out writable
+/// returns: CR_OK; CR_E_ARG (null st or out). With a null out and a non-null
+///   st the state is wiped and nothing is written
+/// owns: the caller owns st and out; st is wiped
+/// thread: any thread (no shared state)
+/// example: var d: CrSha384; cr_sha384_final(&st, &d);
+export fn cr_sha384_final(st: CrSha384State*, out: CrSha384*) -> int32 {
+  if (st == 0) { return CR_E_ARG; }
+  if (out == 0) {
+    cr_wipe((uint8*)st, (int64)sizeof(CrSha384State));
+    return CR_E_ARG;
+  }
+  crx_sha384_final(&st->s, &out->b[0]);
+  return CR_OK;
+}
+
+/// Starts a streaming SHA-512 hash (FIPS 180-4). Feed data with
+/// cr_sha512_update, finish with cr_sha512_final.
+/// in: st writable state
+/// returns: CR_OK; CR_E_ARG (null st)
+/// owns: the caller owns st; _final wipes it, or abandon it with
+///   cr_wipe((uint8*)st, (int64)sizeof(CrSha512State))
+/// thread: any thread (no shared state)
+/// example: var st: CrSha512State; cr_sha512_init(&st);
+export fn cr_sha512_init(st: CrSha512State*) -> int32 {
+  if (st == 0) { return CR_E_ARG; }
+  crx_sha512_init(&st->s);
+  return CR_OK;
+}
+
+/// Feeds n bytes into a streaming SHA-512 hash. Any split of the input gives
+/// the same digest as cr_sha512 over the whole.
+/// in: st initialised by cr_sha512_init; msg readable for n bytes (may be 0
+///   when n == 0); n >= 0
+/// returns: CR_OK; CR_E_ARG (null st, null msg with n > 0, n < 0). On error
+///   the state is unchanged
+/// owns: the caller owns st and msg
+/// thread: any thread (no shared state)
+/// example: cr_sha512_update(&st, buf, (int64)got);
+export fn cr_sha512_update(st: CrSha512State*, msg: uint8*, n: int64) -> int32 {
+  if (st == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  crx_sha512_update(&st->s, cr_hash_in(msg, n), n);
+  return CR_OK;
+}
+
+/// Finishes a streaming SHA-512 hash and writes the digest. Always wipes st,
+/// also on error.
+/// in: st initialised by cr_sha512_init; out writable
+/// returns: CR_OK; CR_E_ARG (null st or out). With a null out and a non-null
+///   st the state is wiped and nothing is written
+/// owns: the caller owns st and out; st is wiped
+/// thread: any thread (no shared state)
+/// example: var d: CrSha512; cr_sha512_final(&st, &d);
+export fn cr_sha512_final(st: CrSha512State*, out: CrSha512*) -> int32 {
+  if (st == 0) { return CR_E_ARG; }
+  if (out == 0) {
+    cr_wipe((uint8*)st, (int64)sizeof(CrSha512State));
+    return CR_E_ARG;
+  }
+  crx_sha512_final(&st->s, &out->b[0]);
+  return CR_OK;
+}
+
+/// Starts a streaming BLAKE2b hash (RFC 7693), optionally keyed, with a
+/// chosen output length. Same length rules as cr_blake2b.
+/// in: st writable state; outlen in [16, 64]; key readable for keylen bytes,
+///   keylen 0 (unkeyed; key may be 0) or in [16, 64]
+/// returns: CR_OK; CR_E_ARG (null st, outlen or keylen out of range, null key
+///   with keylen > 0). On error st is wiped so a later _final fails too
+/// owns: the caller owns st and key (wipe the key yourself); st holds a copy
+///   of the key until _final wipes it, or abandon it with cr_wipe((uint8*)st, (int64)sizeof(CrBlake2bState))
+/// thread: any thread (no shared state)
+/// example: var st: CrBlake2bState; cr_blake2b_init(&st, 32, 0, 0);
+export fn cr_blake2b_init(st: CrBlake2bState*, outlen: int64, key: uint8*, keylen: int64) -> int32 {
+  if (st == 0) { return CR_E_ARG; }
+  var bad: bool = false;
+  if (outlen < CR_BLAKE2B_MIN || outlen > CR_BLAKE2B_MAX) { bad = true; }
+  if (keylen != 0) {
+    if (key == 0 || keylen < CR_BLAKE2B_KEY_MIN || keylen > CR_BLAKE2B_MAX) { bad = true; }
+  }
+  if (bad) {
+    cr_wipe((uint8*)st, (int64)sizeof(CrBlake2bState));
+    return CR_E_ARG;
+  }
+  var kp: uint8* = 0;
+  if (keylen > 0) { kp = key; }
+  crx_blake2b_init(&st->s, outlen, kp, keylen);
+  return CR_OK;
+}
+
+/// Feeds n bytes into a streaming BLAKE2b hash. Any split of the input gives
+/// the same digest as cr_blake2b over the whole.
+/// in: st initialised by cr_blake2b_init; msg readable for n bytes (may be 0
+///   when n == 0); n >= 0
+/// returns: CR_OK; CR_E_ARG (null st, null msg with n > 0, n < 0). On error
+///   the state is unchanged
+/// owns: the caller owns st and msg
+/// thread: any thread (no shared state)
+/// example: cr_blake2b_update(&st, buf, (int64)got);
+export fn cr_blake2b_update(st: CrBlake2bState*, msg: uint8*, n: int64) -> int32 {
+  if (st == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  crx_blake2b_update(&st->s, cr_hash_in(msg, n), n);
+  return CR_OK;
+}
+
+/// Finishes a streaming BLAKE2b hash and writes the digest. Always wipes st,
+/// also on error.
+/// in: st initialised by cr_blake2b_init; out writable for outlen bytes;
+///   outlen equal to the outlen given to cr_blake2b_init
+/// returns: CR_OK; CR_E_ARG (null st or out, outlen different from the init
+///   outlen). On error st is wiped and out is not written
+/// owns: the caller owns st and out; st is wiped
+/// thread: any thread (no shared state)
+/// example: var d: uint8[32]; cr_blake2b_final(&st, &d[0], 32);
+export fn cr_blake2b_final(st: CrBlake2bState*, out: uint8*, outlen: int64) -> int32 {
+  if (st == 0) { return CR_E_ARG; }
+  if (out == 0 || outlen != st->s.outlen) {
+    cr_wipe((uint8*)st, (int64)sizeof(CrBlake2bState));
+    return CR_E_ARG;
+  }
+  crx_blake2b_final(&st->s, out);
+  return CR_OK;
+}
+
+/// CR_HASH_SHA256: names SHA-256 for functions that take a hash choice (ECDSA, RSA).
+/// in: -
+/// returns: 1
+/// owns: nothing
+/// thread: constant
+/// example: cr_p256_ecdsa_verify(&sig[0], sl, m, n, CR_HASH_SHA256, &pk[0], 65)
+export const CR_HASH_SHA256: int32 = 1;
+/// CR_HASH_SHA384: names SHA-384 for functions that take a hash choice (ECDSA, RSA).
+/// in: -
+/// returns: 2
+/// owns: nothing
+/// thread: constant
+/// example: cr_rsa_verify_pss(&sig[0], sl, m, n, CR_HASH_SHA384, mod, ml, e, el)
+export const CR_HASH_SHA384: int32 = 2;
+/// CR_HASH_SHA512: names SHA-512 for functions that take a hash choice (ECDSA, RSA).
+/// in: -
+/// returns: 3
+/// owns: nothing
+/// thread: constant
+/// example: cr_rsa_verify_pkcs1(&sig[0], sl, m, n, CR_HASH_SHA512, mod, ml, e, el)
+export const CR_HASH_SHA512: int32 = 3;
+
+/// internal: digest length in bytes for a CR_HASH_* id, or 0 for an unknown id.
+export fn crx_hash_len(id: int32) -> int64 {
+  if (id == CR_HASH_SHA256) { return 32; }
+  if (id == CR_HASH_SHA384) { return 48; }
+  if (id == CR_HASH_SHA512) { return 64; }
+  return 0;
+}
+
+/// internal: hashes msg with the CR_HASH_* id into out (64 bytes of room);
+/// returns the digest length, or 0 for an unknown id or bad arguments.
+export fn crx_hash_msg(out: uint8*, id: int32, msg: uint8*, n: int64) -> int64 {
+  if (out == 0 || n < 0 || (msg == 0 && n > 0)) { return 0; }
+  if (id == CR_HASH_SHA256) {
+    var d: CrSha256;
+    if (cr_sha256(&d, msg, n) != CR_OK) { return 0; }
+    for i in 0..32 { out[i] = d.b[i]; }
+    return 32;
+  }
+  if (id == CR_HASH_SHA384) {
+    var d: CrSha384;
+    if (cr_sha384(&d, msg, n) != CR_OK) { return 0; }
+    for i in 0..48 { out[i] = d.b[i]; }
+    return 48;
+  }
+  if (id == CR_HASH_SHA512) {
+    var d: CrSha512;
+    if (cr_sha512(&d, msg, n) != CR_OK) { return 0; }
+    for i in 0..64 { out[i] = d.b[i]; }
+    return 64;
+  }
+  return 0;
+}

@@ -1,0 +1,270 @@
+// log/logger: loggers, the global filter and the calls that log.
+//
+//   var lg: LogLogger* = log_logger("net/http");
+//   log_info(lg, "connected", log_str("peer", addr), log_int("port", 443));
+//   if (log_on(lg, LOG_DEBUG)) { ... costly work for a debug record ... }
+//
+// The first log call sets things up from the environment unless log_init
+// or log_add_sink came first: METTLE_LOG is the filter (default "info"),
+// METTLE_LOG_FORMAT picks text, logfmt or json, and records go to stderr.
+//
+// Cost when a level is off: one compare against a global floor (the most
+// verbose level any target allows) and, past that, one compare against the
+// logger's cached level. Each logger caches its level until the filter
+// changes. Field arguments are still built, so put costly ones behind
+// log_on.
+import "std/mem";
+import "std/env";
+import "std/time";
+import "std/thread";
+import "codec/core/buf";
+import "level";
+import "field";
+import "filter";
+import "format";
+import "sink";
+
+export const LOG_MAX_SINKS = 16;
+
+export struct LogLogger {
+  target: string;     // owned
+  min: int32;         // cached filter level for target
+  gen: int32;         // g_log_gen when min was worked out; 0 means never
+  ctx: LogField*;     // owned, from log_with
+  n_ctx: int32;
+}
+
+// Every level passes the floor until setup has run, so the first call
+// reaches the slow path and sets things up.
+var g_log_floor: int32 = 0;
+var g_log_gen: int32 = 0;
+var g_log_filter: LogFilter* = (LogFilter*)0;
+var g_log_sinks: LogSink*[16];
+var g_log_nsinks: int32 = 0;
+var g_log_setup: int32 = 0;        // 0 none, 1 running, 2 done
+var g_log_root: LogLogger* = (LogLogger*)0;
+
+fn log__copy_str(s: string) -> string {
+  var out: string;
+  out.chars = (uint8*)malloc((int64)s.length + 1);
+  if (out.chars == 0) { return out; }
+  memcpy(out.chars, s.chars, (int64)s.length);
+  out.chars[s.length] = (uint8)0;
+  out.length = s.length;
+  return out;
+}
+
+// ---- setup ------------------------------------------------------------------
+
+fn log__default_sink() -> LogSink* {
+  var name: string = env_get_or("METTLE_LOG_FORMAT", "text");
+  var kind: int32 = LOG_FMT_TEXT;
+  if (name == "json") { kind = LOG_FMT_JSON; }
+  if (name == "logfmt") { kind = LOG_FMT_LOGFMT; }
+  return log_sink_stderr(kind, 0);
+}
+
+fn log__install_filter(spec: string) {
+  var f: LogFilter* = new LogFilter;
+  log_filter_parse(spec, f);
+  // The old filter is kept: another thread may still be reading it.
+  g_log_filter = f;
+  log__add(&g_log_gen, 1);
+  if (log__load(&g_log_gen) == 0) { log__add(&g_log_gen, 1); }
+  log__store(&g_log_floor, f->floor);
+}
+
+// Runs setup once. withenv: read METTLE_LOG and add the stderr sink if no
+// sink was added yet.
+fn log__setup() {
+  if (log__load(&g_log_setup) == 2) { return; }
+  if (atomic_compare_exchange_i32(&g_log_setup, 1, 0) != 0) {
+    while (log__load(&g_log_setup) != 2) { time_sleep_us(50); }
+    return;
+  }
+  if (g_log_filter == 0) {
+    log__install_filter(env_get_or("METTLE_LOG", "info"));
+  }
+  if (log__load(&g_log_nsinks) == 0) {
+    g_log_sinks[0] = log__default_sink();
+    log__store(&g_log_nsinks, 1);
+  }
+  log__store(&g_log_setup, 2);
+}
+
+// Sets up logging from the environment now (it also happens on first use).
+export fn log_init() {
+  log__setup();
+}
+
+// Replaces the filter. Returns how many directives could not be read
+// (those are skipped). Safe while other threads log.
+export fn log_set_filter(spec: string) -> int32 {
+  log__install_filter(spec);
+  return g_log_filter->bad;
+}
+
+// Adds a sink. The first sink added before setup replaces the default
+// stderr sink. Returns false when all LOG_MAX_SINKS are in use.
+export fn log_add_sink(s: LogSink*) -> bool {
+  if (s == 0) { return false; }
+  if (log__load(&g_log_setup) != 2) {
+    if (atomic_compare_exchange_i32(&g_log_setup, 1, 0) == 0) {
+      if (g_log_filter == 0) { log__install_filter(env_get_or("METTLE_LOG", "info")); }
+      log__store(&g_log_setup, 2);
+    } else {
+      log__setup();
+    }
+  }
+  var n: int32 = log__load(&g_log_nsinks);
+  if (n >= LOG_MAX_SINKS) { return false; }
+  g_log_sinks[n] = s;
+  log__store(&g_log_nsinks, n + 1);
+  return true;
+}
+
+// Waits until async sinks have written everything logged so far.
+export fn log_flush() {
+  var n: int32 = log__load(&g_log_nsinks);
+  for i in 0..n { log_sink_flush(g_log_sinks[i], -1); }
+}
+
+// Flushes and closes every sink. Logging afterwards goes nowhere; call it
+// last, after other threads have stopped logging.
+export fn log_shutdown() {
+  var n: int32 = atomic_exchange_i32(&g_log_nsinks, 0);
+  for i in 0..n { log_sink_close(g_log_sinks[i]); }
+}
+
+// ---- loggers ----------------------------------------------------------------
+
+// A logger for target (copied). Make one per module and keep it; loggers
+// are never freed.
+export fn log_logger(target: string) -> LogLogger* {
+  var lg: LogLogger* = new LogLogger;
+  lg->target = log__copy_str(target);
+  return lg;
+}
+
+// The logger with no target.
+export fn log_root() -> LogLogger* {
+  if (g_log_root == 0) { g_log_root = log_logger(""); }
+  return g_log_root;
+}
+
+// A child of lg that adds fields to every record, like slog's With and
+// zap's With. The fields' keys and string values are copied.
+export fn log_with(lg: LogLogger*, fields: LogField[..]) -> LogLogger* {
+  var c: LogLogger* = log_logger(lg->target);
+  var n: int32 = lg->n_ctx + (int32)fields.length;
+  c->ctx = (LogField*)malloc((int64)n * sizeof(LogField));
+  if (c->ctx == 0) { return c; }
+  for i in 0..lg->n_ctx { c->ctx[i] = lg->ctx[i]; }
+  for i in 0..fields.length {
+    var f: LogField = fields[i];
+    f.key = log__copy_str(f.key);
+    if (f.val.kind == LOG_STR) { f.val.s = log__copy_str(f.val.s); }
+    c->ctx[lg->n_ctx + (int32)i] = f;
+  }
+  c->n_ctx = n;
+  return c;
+}
+
+@noinline fn log__on_slow(lg: LogLogger*, level: int32) -> bool {
+  if (log__load(&g_log_setup) != 2) { log__setup(); }
+  var g: int32 = log__load(&g_log_gen);
+  if (lg->gen != g) {
+    lg->min = log_filter_level(g_log_filter, lg->target);
+    lg->gen = g;
+  }
+  return level >= lg->min;
+}
+
+// True when a record at level from lg would be kept.
+@inline export fn log_on(lg: LogLogger*, level: int32) -> bool {
+  if (level < g_log_floor) { return false; }
+  if (lg->gen == g_log_gen && g_log_setup == 2) { return level >= lg->min; }
+  return log__on_slow(lg, level);
+}
+
+// ---- emitting ---------------------------------------------------------------
+
+fn log__dispatch(s: LogSink*, r: LogRecord*) {
+  if (r->level < s->level) { return; }
+  if (s->on_record != 0) {
+    s->on_record(s->ctx, r);
+    return;
+  }
+  var mem: uint8[768];   // locals are zeroed, so keep this small
+  var b: CodecBuf;
+  codec_buf_fixed(&b, &mem[0], 768);
+  log_format(&s->fmt, r, &b);
+  var heap: bool = false;
+  if (b.err != 0) {
+    codec_buf_init(&b, 8192);
+    log_format(&s->fmt, r, &b);
+    heap = true;
+    if (b.err != 0) { codec_buf_free(&b); return; }
+  }
+  if (s->queue != 0) {
+    log__queue_push(s, b.data, b.len, r->level);
+  } else {
+    s->write(s->ctx, b.data, b.len);
+  }
+  if (heap) { codec_buf_free(&b); }
+}
+
+// Sends a record to every sink, skipping the filter (the caller checked).
+// fields may be 0 when n is 0. telemetry's TmKV arrays can be passed with a
+// cast: the layouts match.
+export fn log_emit(lg: LogLogger*, level: int32, msg: string, fields: LogField*, n: int32) {
+  var r: LogRecord;
+  r.level = level;
+  r.target = lg->target;
+  r.msg = msg;
+  r.ctx = lg->ctx;
+  r.n_ctx = lg->n_ctx;
+  r.fields = fields;
+  r.n_fields = n;
+  r.time_ns = time_unix_ns();
+  r.thread = GetCurrentThreadId();
+  var ns: int32 = log__load(&g_log_nsinks);
+  for i in 0..ns { log__dispatch(g_log_sinks[i], &r); }
+  if (level >= LOG_FATAL) { log_flush(); }
+}
+
+export fn log_at(lg: LogLogger*, level: int32, msg: string, fields: LogField[..]) {
+  if (!log_on(lg, level)) { return; }
+  log_emit(lg, level, msg, fields.data, (int32)fields.length);
+}
+
+export fn log_trace(lg: LogLogger*, msg: string, fields: LogField[..]) {
+  if (!log_on(lg, LOG_TRACE)) { return; }
+  log_emit(lg, LOG_TRACE, msg, fields.data, (int32)fields.length);
+}
+
+export fn log_debug(lg: LogLogger*, msg: string, fields: LogField[..]) {
+  if (!log_on(lg, LOG_DEBUG)) { return; }
+  log_emit(lg, LOG_DEBUG, msg, fields.data, (int32)fields.length);
+}
+
+export fn log_info(lg: LogLogger*, msg: string, fields: LogField[..]) {
+  if (!log_on(lg, LOG_INFO)) { return; }
+  log_emit(lg, LOG_INFO, msg, fields.data, (int32)fields.length);
+}
+
+export fn log_warn(lg: LogLogger*, msg: string, fields: LogField[..]) {
+  if (!log_on(lg, LOG_WARN)) { return; }
+  log_emit(lg, LOG_WARN, msg, fields.data, (int32)fields.length);
+}
+
+export fn log_error(lg: LogLogger*, msg: string, fields: LogField[..]) {
+  if (!log_on(lg, LOG_ERROR)) { return; }
+  log_emit(lg, LOG_ERROR, msg, fields.data, (int32)fields.length);
+}
+
+// Logs at FATAL and waits for async sinks to write it. It does not exit.
+export fn log_fatal(lg: LogLogger*, msg: string, fields: LogField[..]) {
+  if (!log_on(lg, LOG_FATAL)) { return; }
+  log_emit(lg, LOG_FATAL, msg, fields.data, (int32)fields.length);
+}

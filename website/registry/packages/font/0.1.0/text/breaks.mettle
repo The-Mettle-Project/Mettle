@@ -1,0 +1,318 @@
+// Line break opportunities, following Unicode Standard Annex #14 (the Unicode
+// Line Breaking Algorithm), rules LB2 to LB31.
+//
+// The text is walked once, item by item. An item is one base code point
+// together with the combining marks and zero width joiners that follow it
+// (rule LB9), so rules see a sequence of items instead of raw code points.
+// Between two items we run the rules in order and the first one that applies
+// decides. Rules that need to look back ("OP SP*", "NU (SY | IS)*") keep a
+// small flag in LbState. Rules that need to look ahead decode one or two more
+// items.
+//
+// Bad UTF-8 bytes decode to U+FFFD (see core/utf8).
+
+import "font/core/utf8";
+import "linebreak_data";
+
+export const FONT_BREAK_NO: uint8 = 0;
+export const FONT_BREAK_ALLOWED: uint8 = 1;
+export const FONT_BREAK_MANDATORY: uint8 = 2;
+
+const AL: int32 = FONT_LB_AL;
+const AK: int32 = FONT_LB_AK;
+const AP: int32 = FONT_LB_AP;
+const AS: int32 = FONT_LB_AS;
+const B2: int32 = FONT_LB_B2;
+const BA: int32 = FONT_LB_BA;
+const BB: int32 = FONT_LB_BB;
+const BK: int32 = FONT_LB_BK;
+const CB: int32 = FONT_LB_CB;
+const CL: int32 = FONT_LB_CL;
+const CM: int32 = FONT_LB_CM;
+const CP: int32 = FONT_LB_CP;
+const CR: int32 = FONT_LB_CR;
+const EB: int32 = FONT_LB_EB;
+const EM: int32 = FONT_LB_EM;
+const EX: int32 = FONT_LB_EX;
+const GL: int32 = FONT_LB_GL;
+const H2: int32 = FONT_LB_H2;
+const H3: int32 = FONT_LB_H3;
+const HH: int32 = FONT_LB_HH;
+const HL: int32 = FONT_LB_HL;
+const HY: int32 = FONT_LB_HY;
+const ID: int32 = FONT_LB_ID;
+const IN: int32 = FONT_LB_IN;
+const IS: int32 = FONT_LB_IS;
+const JL: int32 = FONT_LB_JL;
+const JT: int32 = FONT_LB_JT;
+const JV: int32 = FONT_LB_JV;
+const LF: int32 = FONT_LB_LF;
+const NL: int32 = FONT_LB_NL;
+const NS: int32 = FONT_LB_NS;
+const NU: int32 = FONT_LB_NU;
+const OP: int32 = FONT_LB_OP;
+const PO: int32 = FONT_LB_PO;
+const PR: int32 = FONT_LB_PR;
+const QU: int32 = FONT_LB_QU;
+const RI: int32 = FONT_LB_RI;
+const SP: int32 = FONT_LB_SP;
+const SY: int32 = FONT_LB_SY;
+const VF: int32 = FONT_LB_VF;
+const VI: int32 = FONT_LB_VI;
+const WJ: int32 = FONT_LB_WJ;
+const ZW: int32 = FONT_LB_ZW;
+const ZWJ: int32 = FONT_LB_ZWJ;
+// Quotation marks with General_Category Pi and Pf.
+const QU_PI: int32 = FONT_LB_QU_PI;
+const QU_PF: int32 = FONT_LB_QU_PF;
+
+const NONE: int32 = -1;         // before the first item, or after the last
+const DOTTED_CIRCLE: uint32 = 0x25CC;
+
+struct LbItem {
+  cls: int32;       // class of the base, after LB1 and LB10
+  ea: bool;         // base is East Asian Fullwidth, Wide or Halfwidth
+  pict: bool;       // base is Extended_Pictographic and unassigned
+  dc: bool;         // base is U+25CC DOTTED CIRCLE
+  zwj: bool;        // the last code point of the item is a ZWJ
+  end: int64;       // byte offset just after the item
+}
+
+struct LbState {
+  cur_cls: int32;   // the item before the break position (NONE at start)
+  cur_ea: bool;
+  cur_pict: bool;
+  cur_dc: bool;
+  cur_zwj: bool;
+  pred_ok: bool;    // the item before cur is at sot or is not East Asian
+  zw_sp: bool;      // ZW SP* ends here (LB8)
+  op_sp: bool;      // OP SP* ends here (LB14)
+  pi_sp: bool;      // initial quote, then SP*, ends here (LB15a)
+  clcp_sp: bool;    // (CL | CP) SP* ends here (LB16)
+  b2_sp: bool;      // B2 SP* ends here (LB17)
+  hy_start: bool;   // a hyphen that starts a word ends here (LB20a)
+  hl_hy: bool;      // HL (HY | HH) ends here (LB21a)
+  akvi: bool;       // (AK | dotted circle | AS) VI ends here (LB28a)
+  nu: int32;        // 1: NU (SY | IS)*   2: the same followed by CL or CP (LB25)
+  ri: int32;        // number of RI items ending here (LB30a)
+}
+
+// Reads the item that starts at s[pos]. Needs pos < n.
+fn lb_item(s: uint8*, n: int64, pos: int64, it: LbItem*) {
+  var used: int64 = 0;
+  var cp: uint32 = font_utf8_decode(s, n, pos, &used);
+  var v: int32 = font_lb_value(cp);
+  var cls: int32 = v & FONT_LB_CLASS_MASK;
+  it->ea = (v & FONT_LB_FLAG_EA) != 0;
+  it->pict = (v & FONT_LB_FLAG_PICT_CN) != 0;
+  it->dc = cp == DOTTED_CIRCLE;
+  it->zwj = cls == ZWJ;
+  var at: int64 = pos + used;
+  if (cls == CM || cls == ZWJ) {
+    // LB10: a mark with nothing to attach to acts like the letter A.
+    cls = AL;
+    it->ea = false;
+    it->pict = false;
+    it->dc = false;
+  }
+  // LB9: marks and joiners join the base before them, unless it is a break,
+  // a space or a zero width space.
+  if (cls != BK && cls != CR && cls != LF && cls != NL && cls != SP && cls != ZW) {
+    while (at < n) {
+      var u: int64 = 0;
+      var c2: uint32 = font_utf8_decode(s, n, at, &u);
+      var k: int32 = font_lb_value(c2) & FONT_LB_CLASS_MASK;
+      if (k != CM && k != ZWJ) { break; }
+      it->zwj = k == ZWJ;
+      at = at + u;
+    }
+  }
+  it->cls = cls;
+  it->end = at;
+}
+
+// True when class c is one of the classes that start a line in LB15a.
+fn lb_before_initial_quote(c: int32) -> bool {
+  return c == NONE || c == BK || c == CR || c == LF || c == NL || c == OP
+    || c == QU || c == QU_PI || c == QU_PF || c == GL || c == SP || c == ZW;
+}
+
+// Makes `it` the item before the next break position and updates the flags.
+fn lb_push(st: LbState*, it: LbItem*) {
+  var pred: int32 = st->cur_cls;
+  var c: int32 = it->cls;
+  if (c == ZW) { st->zw_sp = true; } else if (c != SP) { st->zw_sp = false; }
+  if (c == OP) { st->op_sp = true; } else if (c != SP) { st->op_sp = false; }
+  if (c == QU_PI) { st->pi_sp = lb_before_initial_quote(pred); }
+  else if (c != SP) { st->pi_sp = false; }
+  if (c == CL || c == CP) { st->clcp_sp = true; } else if (c != SP) { st->clcp_sp = false; }
+  if (c == B2) { st->b2_sp = true; } else if (c != SP) { st->b2_sp = false; }
+  var hy: bool = c == HY || c == HH;
+  st->hy_start = hy && (pred == NONE || pred == BK || pred == CR || pred == LF || pred == NL
+    || pred == SP || pred == ZW || pred == CB || pred == GL);
+  st->hl_hy = hy && pred == HL;
+  st->akvi = c == VI && (pred == AK || st->cur_dc || pred == AS);
+  if (c == NU) { st->nu = 1; }
+  else if (c == SY || c == IS) { if (st->nu != 1) { st->nu = 0; } }
+  else if (c == CL || c == CP) { if (st->nu == 1) { st->nu = 2; } else { st->nu = 0; } }
+  else { st->nu = 0; }
+  if (c == RI) { st->ri = st->ri + 1; } else { st->ri = 0; }
+  st->pred_ok = pred == NONE || !st->cur_ea;
+  st->cur_cls = c;
+  st->cur_ea = it->ea;
+  st->cur_pict = it->pict;
+  st->cur_dc = it->dc;
+  st->cur_zwj = it->zwj;
+}
+
+// The break status between the item in `st` and the next item `nx`.
+// a1c and a2c are the classes of the two items after nx (NONE at the end of
+// the text) and a1ea tells whether the first of them is East Asian. They are
+// only filled in when a rule below can ask for them.
+fn lb_rule(st: LbState*, nx: LbItem*, a1c: int32, a1ea: bool, a2c: int32) -> uint8 {
+  var pc: int32 = st->cur_cls;
+  var nc: int32 = nx->cls;
+  var no: uint8 = FONT_BREAK_NO;
+
+  // LB4, LB5: hard breaks.
+  if (pc == BK) { return FONT_BREAK_MANDATORY; }
+  if (pc == CR) {
+    if (nc == LF) { return no; }
+    return FONT_BREAK_MANDATORY;
+  }
+  if (pc == LF || pc == NL) { return FONT_BREAK_MANDATORY; }
+  // LB6, LB7: no break before a hard break, a space or a zero width space.
+  if (nc == BK || nc == CR || nc == LF || nc == NL) { return no; }
+  if (nc == SP || nc == ZW) { return no; }
+  // LB8: break after a zero width space, even through spaces.
+  if (st->zw_sp) { return FONT_BREAK_ALLOWED; }
+  // LB8a: no break after a zero width joiner.
+  if (st->cur_zwj) { return no; }
+  // LB11, LB12, LB12a: word joiner and no-break space.
+  if (nc == WJ || pc == WJ) { return no; }
+  if (pc == GL) { return no; }
+  if (nc == GL && pc != SP && pc != HY && pc != HH) { return no; }
+  // LB13, LB14: closing marks, and nothing after an opening bracket.
+  if (nc == CL || nc == CP || nc == EX || nc == SY) { return no; }
+  if (st->op_sp) { return no; }
+  // LB15a: nothing after an initial quote at the start of a line or word.
+  if (st->pi_sp) { return no; }
+  // LB15b: nothing before a final quote that ends a line or word.
+  if (nc == QU_PF) {
+    if (a1c == NONE || a1c == SP || a1c == GL || a1c == WJ || a1c == CL || a1c == QU
+      || a1c == QU_PI || a1c == QU_PF || a1c == CP || a1c == EX || a1c == IS || a1c == SY
+      || a1c == BK || a1c == CR || a1c == LF || a1c == NL || a1c == ZW) { return no; }
+  }
+  // LB15c, LB15d: a decimal mark after a space may start a line.
+  if (pc == SP && nc == IS && a1c == NU) { return FONT_BREAK_ALLOWED; }
+  if (nc == IS) { return no; }
+  // LB16, LB17: closing marks and dashes see through spaces.
+  if (st->clcp_sp && nc == NS) { return no; }
+  if (st->b2_sp && nc == B2) { return no; }
+  // LB18: break after spaces.
+  if (pc == SP) { return FONT_BREAK_ALLOWED; }
+  // LB19, LB19a: quotation marks.
+  var n_qu: bool = nc == QU || nc == QU_PI || nc == QU_PF;
+  var p_qu: bool = pc == QU || pc == QU_PI || pc == QU_PF;
+  if (nc == QU || nc == QU_PF) { return no; }
+  if (pc == QU || pc == QU_PI) { return no; }
+  if (n_qu && !st->cur_ea) { return no; }
+  if (n_qu && (a1c == NONE || !a1ea)) { return no; }
+  if (p_qu && !nx->ea) { return no; }
+  if (p_qu && st->pred_ok) { return no; }
+  // LB20, LB20a: conditional breaks, and a hyphen at the start of a word.
+  if (nc == CB || pc == CB) { return FONT_BREAK_ALLOWED; }
+  if (st->hy_start && (nc == AL || nc == HL)) { return no; }
+  // LB21, LB21a, LB21b: hyphens, non-starters, and Hebrew.
+  if (nc == BA || nc == HH || nc == HY || nc == NS || pc == BB) { return no; }
+  if (st->hl_hy && nc != HL) { return no; }
+  if (pc == SY && nc == HL) { return no; }
+  // LB22: ellipsis.
+  if (nc == IN) { return no; }
+  // LB23, LB23a, LB24: letters, digits, prefixes and postfixes.
+  if ((pc == AL || pc == HL) && nc == NU) { return no; }
+  if (pc == NU && (nc == AL || nc == HL)) { return no; }
+  if (pc == PR && (nc == ID || nc == EB || nc == EM)) { return no; }
+  if ((pc == ID || pc == EB || pc == EM) && nc == PO) { return no; }
+  if ((pc == PR || pc == PO) && (nc == AL || nc == HL)) { return no; }
+  if ((pc == AL || pc == HL) && (nc == PR || nc == PO)) { return no; }
+  // LB25: numbers.
+  if (st->nu >= 1 && (nc == PO || nc == PR)) { return no; }
+  if (st->nu == 1 && nc == NU) { return no; }
+  if (pc == PO || pc == PR) {
+    if (nc == NU) { return no; }
+    if (nc == OP && a1c == NU) { return no; }
+    if (nc == OP && a1c == IS && a2c == NU) { return no; }
+  }
+  if ((pc == HY || pc == IS) && nc == NU) { return no; }
+  // LB26, LB27: Korean syllable blocks.
+  if (pc == JL && (nc == JL || nc == JV || nc == H2 || nc == H3)) { return no; }
+  if ((pc == JV || pc == H2) && (nc == JV || nc == JT)) { return no; }
+  if ((pc == JT || pc == H3) && nc == JT) { return no; }
+  if ((pc == JL || pc == JV || pc == JT || pc == H2 || pc == H3) && nc == PO) { return no; }
+  if (pc == PR && (nc == JL || nc == JV || nc == JT || nc == H2 || nc == H3)) { return no; }
+  // LB28: letters.
+  if ((pc == AL || pc == HL) && (nc == AL || nc == HL)) { return no; }
+  // LB28a: orthographic syllables of Brahmic scripts.
+  var p_a: bool = pc == AK || st->cur_dc || pc == AS;
+  var n_a: bool = nc == AK || nx->dc || nc == AS;
+  if (pc == AP && n_a) { return no; }
+  if (p_a && (nc == VF || nc == VI)) { return no; }
+  if (st->akvi && (nc == AK || nx->dc)) { return no; }
+  if (p_a && n_a && a1c == VF) { return no; }
+  // LB29: numeric punctuation and letters.
+  if (pc == IS && (nc == AL || nc == HL)) { return no; }
+  // LB30: letters and numbers next to brackets, unless East Asian.
+  if ((pc == AL || pc == HL || pc == NU) && nc == OP && !nx->ea) { return no; }
+  if (pc == CP && !st->cur_ea && (nc == AL || nc == HL || nc == NU)) { return no; }
+  // LB30a: regional indicators pair up.
+  if (pc == RI && nc == RI && (st->ri & 1) == 1) { return no; }
+  // LB30b: emoji bases and modifiers.
+  if ((pc == EB || st->cur_pict) && nc == EM) { return no; }
+  // LB31: break everywhere else.
+  return FONT_BREAK_ALLOWED;
+}
+
+/// Finds line break opportunities in the UTF-8 text s[0..n]. Writes n + 1
+/// bytes to out: out[i] is the status of the position just before byte i, one
+/// of FONT_BREAK_NO, FONT_BREAK_ALLOWED and FONT_BREAK_MANDATORY. Positions
+/// that are not the start of a code point are FONT_BREAK_NO. out[0] is
+/// FONT_BREAK_NO (LB2) and out[n] is FONT_BREAK_MANDATORY (LB3); for an empty
+/// text out[0] is FONT_BREAK_MANDATORY. Bad bytes count as U+FFFD.
+export fn font_line_breaks(s: uint8*, n: int64, out: uint8*) {
+  if (n < 0) { return; }
+  for i: int64 in 0..n { out[i] = FONT_BREAK_NO; }
+  out[n] = FONT_BREAK_MANDATORY;
+  if (n == 0) { return; }
+  var st: LbState;
+  st.cur_cls = NONE;
+  var cur: LbItem;
+  var nx: LbItem;
+  var a1: LbItem;
+  var a2: LbItem;
+  lb_item(s, n, 0, &cur);
+  lb_push(&st, &cur);
+  var pos: int64 = cur.end;
+  while (pos < n) {
+    lb_item(s, n, pos, &nx);
+    // Look ahead only for the rules that need it.
+    var a1c: int32 = NONE;
+    var a1ea: bool = false;
+    var a2c: int32 = NONE;
+    var nc: int32 = nx.cls;
+    var wants: bool = nc == QU || nc == QU_PI || nc == QU_PF || nc == IS || nc == OP
+      || nc == AK || nc == AS || nx.dc;
+    if (wants && nx.end < n) {
+      lb_item(s, n, nx.end, &a1);
+      a1c = a1.cls;
+      a1ea = a1.ea;
+      if (nc == OP && a1c == IS && a1.end < n) {
+        lb_item(s, n, a1.end, &a2);
+        a2c = a2.cls;
+      }
+    }
+    out[pos] = lb_rule(&st, &nx, a1c, a1ea, a2c);
+    lb_push(&st, &nx);
+    pos = nx.end;
+  }
+}

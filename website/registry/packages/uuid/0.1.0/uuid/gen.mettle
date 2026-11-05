@@ -1,0 +1,384 @@
+// gen: making UUIDs of every RFC 9562 version.
+//
+//   v1  time (100 ns since 1582-10-15) + clock sequence + node   section 5.1
+//   v3  MD5 of namespace + name                                  section 5.3
+//   v4  random                                                    section 5.4
+//   v5  SHA-1 of namespace + name                                 section 5.5
+//   v6  v1 with the time bits reordered so it sorts by time       section 5.6
+//   v7  Unix milliseconds + random, sorts by time                 section 5.7
+//   v8  your own 122 bits                                         section 5.8
+//
+// The *_from builders take every field and are pure, for tests and for
+// callers who bring their own clock. The plain calls read the clock and
+// std/random and are safe to call from many threads.
+
+import "std/core";
+import "std/random";
+import "std/time";
+import "std/sync";
+import "core";
+import "crypto/crypto";
+
+// 100 ns intervals between 1582-10-15 and 1970-01-01.
+const UG_GREGORIAN_OFFSET: uint64 = 0x01B21DD213814000;
+
+// ---- Namespaces (RFC 9562 section 6.6) -----------------------------------
+
+export fn uuid_ns_dns() -> Uuid { return uuid_from_u64((uint64)0x6ba7b8109dad11d1, (uint64)0x80b400c04fd430c8); }
+export fn uuid_ns_url() -> Uuid { return uuid_from_u64((uint64)0x6ba7b8119dad11d1, (uint64)0x80b400c04fd430c8); }
+export fn uuid_ns_oid() -> Uuid { return uuid_from_u64((uint64)0x6ba7b8129dad11d1, (uint64)0x80b400c04fd430c8); }
+export fn uuid_ns_x500() -> Uuid { return uuid_from_u64((uint64)0x6ba7b8149dad11d1, (uint64)0x80b400c04fd430c8); }
+
+// ---- v3 and v5 ------------------------------------------------------------
+
+fn ug_named(ns: Uuid, p: uint8*, n: int64, sha1: bool, version: int32) -> Uuid {
+  var u: Uuid;
+  if (sha1) {
+    var st: CrSha1State;
+    var d: CrSha1;
+    cr_sha1_init(&st);
+    cr_sha1_update(&st, &ns.b[0], 16);
+    cr_sha1_update(&st, p, n);
+    cr_sha1_final(&st, &d);
+    u = uuid_from_bytes(&d.b[0]);
+  } else {
+    var st5: CrMd5State;
+    var d5: CrMd5;
+    cr_md5_init(&st5);
+    cr_md5_update(&st5, &ns.b[0], 16);
+    cr_md5_update(&st5, p, n);
+    cr_md5_final(&st5, &d5);
+    u = uuid_from_bytes(&d5.b[0]);
+  }
+  uuid_set_version(&u, version);
+  return u;
+}
+
+// Version 3: MD5 of the namespace's 16 bytes followed by the name's bytes.
+export fn uuid_v3_bytes(ns: Uuid, p: uint8*, n: int64) -> Uuid {
+  return ug_named(ns, p, n, false, 3);
+}
+
+export fn uuid_v3(ns: Uuid, name: string) -> Uuid {
+  return ug_named(ns, (uint8*)name.chars, (int64)name.length, false, 3);
+}
+
+// Version 5: SHA-1, otherwise the same as version 3. Prefer it to v3.
+export fn uuid_v5_bytes(ns: Uuid, p: uint8*, n: int64) -> Uuid {
+  return ug_named(ns, p, n, true, 5);
+}
+
+export fn uuid_v5(ns: Uuid, name: string) -> Uuid {
+  return ug_named(ns, (uint8*)name.chars, (int64)name.length, true, 5);
+}
+
+// ---- v4 --------------------------------------------------------------------
+
+// Random bytes are read from the OS 256 at a time and handed out 16 at a
+// time, which saves a system call per UUID (Go's google/uuid does the same
+// with its rand pool). The lock keeps threads from sharing bytes.
+var ug_pool: uint8[256];
+var ug_pool_at: int64 = 256;
+var ug_pool_lock: SyncMutex;
+
+fn ug_random16(out: uint8*) {
+  sync_mutex_lock(&ug_pool_lock);
+  if (ug_pool_at >= 256) {
+    if (random_bytes(&ug_pool[0], 256) != 0) {
+      sync_mutex_unlock(&ug_pool_lock);
+      // The OS gave no randomness: stop, as std/random does.
+      var v: uint64 = random_u64();
+      for i in 0..8 { out[i] = (uint8)(v >> (uint64)(8 * i)); }
+      v = random_u64();
+      for i in 0..8 { out[i + 8] = (uint8)(v >> (uint64)(8 * i)); }
+      return;
+    }
+    ug_pool_at = 0;
+  }
+  for i in 0..16 {
+    out[i] = ug_pool[ug_pool_at + (int64)i];
+    ug_pool[ug_pool_at + (int64)i] = 0;
+  }
+  ug_pool_at = ug_pool_at + 16;
+  sync_mutex_unlock(&ug_pool_lock);
+}
+
+// 64 random bits from the pool.
+fn ug_rand64() -> uint64 {
+  var r: uint8[16];
+  ug_random16(&r[0]);
+  var v: uint64 = 0;
+  for i in 0..8 { v = (v << (uint64)8) | (uint64)r[i]; }
+  return v;
+}
+
+// Version 4 from 16 bytes you supply: version and variant bits are set over
+// them.
+export fn uuid_v4_from(p: uint8*) -> Uuid {
+  var u: Uuid = uuid_from_bytes(p);
+  uuid_set_version(&u, 4);
+  return u;
+}
+
+// A random version 4 UUID: 122 random bits from the OS.
+export fn uuid_v4() -> Uuid {
+  var r: uint8[16];
+  ug_random16(&r[0]);
+  return uuid_v4_from(&r[0]);
+}
+
+// Fills out[0..n] with random v4 UUIDs using one read from the OS.
+// Returns false (and fills nothing) if the OS gives no randomness.
+export fn uuid_v4_fill(out: Uuid*, n: int64) -> bool {
+  if (n <= 0) { return true; }
+  if (random_bytes((uint8*)out, n * 16) != 0) { return false; }
+  for i in 0..n { uuid_set_version(&out[i], 4); }
+  return true;
+}
+
+// ---- v1 and v6 -------------------------------------------------------------
+
+// Version 1 from its fields: ticks is the count of 100 ns intervals since
+// 1582-10-15 (60 bits), clock_seq is 14 bits and node is 6 bytes.
+export fn uuid_v1_from(ticks: uint64, clock_seq: uint16, node: uint8*) -> Uuid {
+  var t: uint64 = ticks & (uint64)0x0FFFFFFFFFFFFFFF;
+  var u: Uuid;
+  var low: uint64 = t & (uint64)0xFFFFFFFF;
+  var mid: uint64 = (t >> (uint64)32) & (uint64)0xFFFF;
+  var high: uint64 = t >> (uint64)48;
+  u.b[0] = (uint8)(low >> (uint64)24);
+  u.b[1] = (uint8)(low >> (uint64)16);
+  u.b[2] = (uint8)(low >> (uint64)8);
+  u.b[3] = (uint8)low;
+  u.b[4] = (uint8)(mid >> (uint64)8);
+  u.b[5] = (uint8)mid;
+  u.b[6] = (uint8)(high >> (uint64)8);
+  u.b[7] = (uint8)high;
+  u.b[8] = (uint8)(clock_seq >> (uint16)8);
+  u.b[9] = (uint8)clock_seq;
+  for i in 0..6 { u.b[i + 10] = node[i]; }
+  uuid_set_version(&u, 1);
+  return u;
+}
+
+// Version 6 from the same fields as version 1. The 60-bit time is stored
+// high bits first, so v6 values sort by time.
+export fn uuid_v6_from(ticks: uint64, clock_seq: uint16, node: uint8*) -> Uuid {
+  var t: uint64 = ticks & (uint64)0x0FFFFFFFFFFFFFFF;
+  var u: Uuid;
+  var top: uint64 = t >> (uint64)12;
+  for i in 0..6 { u.b[i] = (uint8)(top >> (uint64)(40 - 8 * i)); }
+  u.b[6] = (uint8)((t >> (uint64)8) & (uint64)15);
+  u.b[7] = (uint8)t;
+  u.b[8] = (uint8)(clock_seq >> (uint16)8);
+  u.b[9] = (uint8)clock_seq;
+  for i in 0..6 { u.b[i + 10] = node[i]; }
+  uuid_set_version(&u, 6);
+  return u;
+}
+
+// The clock shared by v1 and v6. The node is random with the multicast bit
+// set, as RFC 9562 section 6.10 asks when no MAC address is used, so it can
+// never clash with a real one. Two calls in the same 100 ns tick, or a
+// clock that steps back, get the last tick plus one: values stay unique and
+// in order.
+var ug_clock_lock: SyncMutex;
+var ug_clock_ready: bool = false;
+var ug_last_ticks: uint64 = 0;
+var ug_clock_seq: uint16 = 0;
+var ug_node: uint8[6];
+
+fn ug_clock_setup() {
+  var r: uint8[16];
+  ug_random16(&r[0]);
+  for i in 0..6 { ug_node[i] = r[i]; }
+  ug_node[0] = ug_node[0] | (uint8)1;
+  ug_clock_seq = (uint16)((((uint32)r[6] << (uint32)8) | (uint32)r[7]) & (uint32)0x3FFF);
+  ug_clock_ready = true;
+}
+
+// Uses this 6-byte node (say, a MAC address) for v1 and v6 from now on.
+export fn uuid_set_node(node: uint8*) {
+  sync_mutex_lock(&ug_clock_lock);
+  if (!ug_clock_ready) { ug_clock_setup(); }
+  for i in 0..6 { ug_node[i] = node[i]; }
+  sync_mutex_unlock(&ug_clock_lock);
+}
+
+// The current time as v1 ticks: 100 ns intervals since 1582-10-15.
+export fn uuid_now_ticks() -> uint64 {
+  return (uint64)(time_unix_ns() / 100) + UG_GREGORIAN_OFFSET;
+}
+
+fn ug_clock_next(ticks: uint64*, seq: uint16*, node: uint8*) {
+  var now: uint64 = uuid_now_ticks();
+  sync_mutex_lock(&ug_clock_lock);
+  if (!ug_clock_ready) { ug_clock_setup(); }
+  if (now <= ug_last_ticks) { now = ug_last_ticks + 1; }
+  ug_last_ticks = now;
+  *ticks = now;
+  *seq = ug_clock_seq;
+  for i in 0..6 { node[i] = ug_node[i]; }
+  sync_mutex_unlock(&ug_clock_lock);
+}
+
+export fn uuid_v1() -> Uuid {
+  var t: uint64 = 0;
+  var s: uint16 = 0;
+  var node: uint8[6];
+  ug_clock_next(&t, &s, &node[0]);
+  return uuid_v1_from(t, s, &node[0]);
+}
+
+export fn uuid_v6() -> Uuid {
+  var t: uint64 = 0;
+  var s: uint16 = 0;
+  var node: uint8[6];
+  ug_clock_next(&t, &s, &node[0]);
+  return uuid_v6_from(t, s, &node[0]);
+}
+
+// ---- v7 --------------------------------------------------------------------
+
+// Version 7 from its fields: 48-bit Unix milliseconds, 12 bits rand_a and
+// 62 bits rand_b (extra high bits are dropped).
+export fn uuid_v7_from(unix_ms: uint64, rand_a: uint16, rand_b: uint64) -> Uuid {
+  var u: Uuid;
+  for i in 0..6 { u.b[i] = (uint8)(unix_ms >> (uint64)(40 - 8 * i)); }
+  u.b[6] = (uint8)((rand_a >> (uint16)8) & (uint16)15);
+  u.b[7] = (uint8)rand_a;
+  for i in 0..8 { u.b[i + 8] = (uint8)(rand_b >> (uint64)(56 - 8 * i)); }
+  uuid_set_version(&u, 7);
+  return u;
+}
+
+// A v7 generator. Inside one millisecond it counts up, so every value it
+// gives is larger than the one before (RFC 9562 section 6.2, method 1 with
+// a 42-bit counter in rand_a and the top of rand_b, as Rust's uuid crate
+// does). Each new millisecond seeds the counter with 41 random bits, so the
+// values are still hard to guess. If the counter runs out the generator
+// moves to the next millisecond, and a clock that steps back is ignored
+// until it passes the last time used. Zero-initialised is ready to use.
+export struct UuidV7Gen {
+  last_ms: uint64;
+  counter: uint64;
+}
+
+const UG_COUNTER_MAX: uint64 = 0x3FFFFFFFFFF; // 42 bits
+
+fn ug_seed() -> uint64 {
+  return ug_rand64() & (uint64)0x1FFFFFFFFFF; // 41 bits: room to count
+}
+
+// The next v7 value from g, for the time unix_ms. Not locked: give each
+// thread its own generator, or use uuid_v7().
+export fn uuid_v7_next(g: UuidV7Gen*, unix_ms: uint64) -> Uuid {
+  if (unix_ms > g->last_ms) {
+    g->last_ms = unix_ms;
+    g->counter = ug_seed();
+  } else {
+    g->counter = g->counter + 1;
+    if (g->counter > UG_COUNTER_MAX) {
+      g->last_ms = g->last_ms + 1;
+      g->counter = ug_seed();
+    }
+  }
+  var tail: uint64 = ug_rand64() & (uint64)0xFFFFFFFF;
+  var rand_a: uint16 = (uint16)(g->counter >> (uint64)30);
+  var rand_b: uint64 = ((g->counter & (uint64)0x3FFFFFFF) << (uint64)32) | tail;
+  return uuid_v7_from(g->last_ms, rand_a, rand_b);
+}
+
+var ug_v7: UuidV7Gen;
+var ug_v7_lock: SyncMutex;
+
+// A v7 UUID for now. Values from this process only ever go up.
+export fn uuid_v7() -> Uuid {
+  var ms: uint64 = (uint64)time_unix_ms();
+  sync_mutex_lock(&ug_v7_lock);
+  var u: Uuid = uuid_v7_next(&ug_v7, ms);
+  sync_mutex_unlock(&ug_v7_lock);
+  return u;
+}
+
+// A v7 UUID for a given time with 74 fresh random bits and no ordering
+// promise inside the millisecond.
+export fn uuid_v7_at(unix_ms: uint64) -> Uuid {
+  var r: uint8[16];
+  ug_random16(&r[0]);
+  var u: Uuid = uuid_from_bytes(&r[0]);
+  for i in 0..6 { u.b[i] = (uint8)(unix_ms >> (uint64)(40 - 8 * i)); }
+  uuid_set_version(&u, 7);
+  return u;
+}
+
+// ---- v8 --------------------------------------------------------------------
+
+// Version 8: your 16 bytes with the version and variant bits set over them.
+// What the other 122 bits mean is up to you (RFC 9562 section 5.8).
+export fn uuid_v8(p: uint8*) -> Uuid {
+  var u: Uuid = uuid_from_bytes(p);
+  uuid_set_version(&u, 8);
+  return u;
+}
+
+// ---- Reading fields back ---------------------------------------------------
+
+// The 60-bit time of a v1 or v6 UUID, in 100 ns intervals since 1582-10-15.
+// False for other versions.
+export fn uuid_ticks(u: Uuid, out: uint64*) -> bool {
+  var v: int32 = uuid_version(u);
+  if (uuid_variant(u) != UUID_VARIANT_RFC) { return false; }
+  var hi: uint64 = uuid_hi(u);
+  if (v == 1) {
+    var low: uint64 = hi >> (uint64)32;
+    var mid: uint64 = (hi >> (uint64)16) & (uint64)0xFFFF;
+    var high: uint64 = hi & (uint64)0x0FFF;
+    *out = (high << (uint64)48) | (mid << (uint64)32) | low;
+    return true;
+  }
+  if (v == 6) {
+    *out = ((hi >> (uint64)16) << (uint64)12) | (hi & (uint64)0x0FFF);
+    return true;
+  }
+  return false;
+}
+
+// Unix milliseconds of a v1, v6 or v7 UUID (v1 and v6 rounded down, times
+// before 1970 give false). False for other versions.
+export fn uuid_unix_ms(u: Uuid, out: uint64*) -> bool {
+  if (uuid_variant(u) != UUID_VARIANT_RFC) { return false; }
+  if (uuid_version(u) == 7) {
+    *out = uuid_hi(u) >> (uint64)16;
+    return true;
+  }
+  var t: uint64 = 0;
+  if (!uuid_ticks(u, &t)) { return false; }
+  if (t < UG_GREGORIAN_OFFSET) { return false; }
+  *out = (t - UG_GREGORIAN_OFFSET) / (uint64)10000;
+  return true;
+}
+
+// The 14-bit clock sequence of a v1 or v6 UUID.
+export fn uuid_clock_seq(u: Uuid) -> uint16 {
+  return (uint16)((((uint32)u.b[8] << (uint32)8) | (uint32)u.b[9]) & (uint32)0x3FFF);
+}
+
+// The 6-byte node of a v1 or v6 UUID.
+export fn uuid_node(u: Uuid, out: uint8*) {
+  for i in 0..6 { out[i] = u.b[i + 10]; }
+}
+
+// Converts a v1 UUID to the v6 UUID with the same fields (RFC 9562 section
+// 5.6), or back. Other versions are returned unchanged.
+export fn uuid_v1_to_v6(u: Uuid) -> Uuid {
+  var t: uint64 = 0;
+  if (uuid_version(u) != 1 || !uuid_ticks(u, &t)) { return u; }
+  return uuid_v6_from(t, (uint16)(((uint32)u.b[8] << (uint32)8) | (uint32)u.b[9]), &u.b[10]);
+}
+
+export fn uuid_v6_to_v1(u: Uuid) -> Uuid {
+  var t: uint64 = 0;
+  if (uuid_version(u) != 6 || !uuid_ticks(u, &t)) { return u; }
+  return uuid_v1_from(t, (uint16)(((uint32)u.b[8] << (uint32)8) | (uint32)u.b[9]), &u.b[10]);
+}

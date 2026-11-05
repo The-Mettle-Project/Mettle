@@ -1,0 +1,296 @@
+// Disks: mounted file systems from /proc/self/mounts with sizes from
+// statfs(2), skipping the virtual ones that /proc/filesystems marks "nodev"
+// (as psutil does); block-device I/O from /proc/diskstats (the kernel's
+// Documentation/admin-guide/iostats.rst). Sectors there are always 512 bytes.
+import "std/mem";
+import "std/time";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+import "arch_x86_64.mettle" if x86_64;
+import "arch_aarch64.mettle" if aarch64;
+
+// What is kept about one block device between refreshes.
+struct SysinfoLxBlk {
+  key: uint64;              // hash of the name
+  partition: int32;         // -1 unknown, 0, 1
+  reads: int64;
+  writes: int64;
+  rsec: int64;
+  wsec: int64;
+  io_ms: int64;
+}
+
+export struct SysinfoLxDisk {
+  pools: SysinfoLxPools;
+  fd_mounts: int64;
+  fd_stats: int64;
+  nodev: SysinfoLxBuf;      // "\n"-joined names of nodev file systems
+  fs_cap: int32;
+  dev_cap: int32;
+  prev: SysinfoLxBlk*;
+  n_prev: int32;
+  prev_cap: int32;
+  next: SysinfoLxBlk*;
+  next_cap: int32;
+  prev_ns: int64;
+}
+
+// FNV-1a, to match device names between refreshes.
+export fn sysinfo_lx_hash(s: string) -> uint64 {
+  var h: uint64 = (uint64)14695981039346656037;
+  for k in 0..s.length {
+    h = h ^ (uint64)(uint8)s[k];
+    h = h * (uint64)1099511628211;
+  }
+  return h;
+}
+
+// Copies a mounts field into the pool, turning \040-style octal escapes
+// back into bytes.
+export fn sysinfo_lx_unescape(pool: SysinfoLxPool*, t: string) -> string {
+  var has: bool = false;
+  for k in 0..t.length { if (t[k] == '\\') { has = true; } }
+  if (!has) { return sysinfo_lx_pool_add(pool, t); }
+  var tmp: uint8[512];
+  var n: int64 = 0;
+  var k: int64 = 0;
+  var len: int64 = (int64)t.length;
+  while (k < len && n < 512) {
+    var c: uint8 = (uint8)t[k];
+    if (c == (uint8)92 && k + 3 < len) {
+      var a: int32 = (int32)t[k + 1] - 48;
+      var b: int32 = (int32)t[k + 2] - 48;
+      var d: int32 = (int32)t[k + 3] - 48;
+      if (a >= 0 && a < 8 && b >= 0 && b < 8 && d >= 0 && d < 8) {
+        tmp[n] = (uint8)(a * 64 + b * 8 + d);
+        n = n + 1;
+        k = k + 4;
+        continue;
+      }
+    }
+    tmp[n] = c;
+    n = n + 1;
+    k = k + 1;
+  }
+  return sysinfo_lx_pool_add_bytes(pool, &tmp[0], n);
+}
+
+// True when fstype is listed as nodev in the /proc/filesystems text.
+export fn sysinfo_lx_is_nodev(fstext: string, fstype: string) -> bool {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(fstext);
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, "nodev")) {
+      s.i = s.i + 5;
+      var name: string = sysinfo_lx_word(&s);
+      if (sysinfo_lx_eq(name, fstype)) { return true; }
+    }
+    sysinfo_lx_next_line(&s);
+  }
+  return false;
+}
+
+// True when the comma-separated options include "ro".
+export fn sysinfo_lx_opts_ro(opts: string) -> bool {
+  var a: int64 = 0;
+  var len: int64 = (int64)opts.length;
+  for k in 0..(len + 1) {
+    if (k == len || opts[k] == ',') {
+      if (k - a == 2 && opts[a] == 'r' && opts[a + 1] == 'o') { return true; }
+      a = k + 1;
+    }
+  }
+  return false;
+}
+
+fn sysinfo_lx_fs_slot(st: SysinfoLxDisk*, out: SysinfoDisk*, i: int32) -> SysinfoFs* {
+  if (i >= st->fs_cap || out->fs == 0) {
+    var c: int32 = st->fs_cap;
+    out->fs = (SysinfoFs*)sysinfo_lx_grow((uint8*)out->fs, &c, i + 1, sizeof(SysinfoFs));
+    st->fs_cap = c;
+  }
+  return &out->fs[i];
+}
+
+// Fills sizes with statfs(2). Leaves them at -1 when the call fails.
+fn sysinfo_lx_statfs(f: SysinfoFs*) {
+  var path: uint8[4097];
+  var n: int64 = (int64)f->mount.length;
+  if (n > 4096) { return; }
+  memcpy(&path[0], f->mount.chars, n);
+  path[n] = (uint8)0;
+  // struct statfs on 64-bit Linux: type, bsize, blocks, bfree, bavail,
+  // files, ffree, fsid, namelen, frsize, flags, spare[4]; all 8 bytes.
+  var b: int64[16];
+  var r: int64 = syscall(SYSINFO_LX_SYS_STATFS, &path[0], &b[0]);
+  if (r != 0) { return; }
+  var unit: int64 = b[9];
+  if (unit <= 0) { unit = b[1]; }
+  f->total = b[2] * unit;
+  f->free = b[3] * unit;
+  f->avail = b[4] * unit;
+  f->used = f->total - f->free;
+  if (f->used + f->avail > 0) { f->used_pct = (float64)f->used * 100.0 / (float64)(f->used + f->avail); }
+  else { f->used_pct = 0.0; }
+  f->inodes_total = b[5];
+  f->inodes_free = b[6];
+  f->inodes_used = b[5] - b[6];
+  if ((b[10] & 1) != 0) { f->read_only = true; }   // ST_RDONLY
+}
+
+// Parses mounts text into out->fs, keeping real file systems only.
+export fn sysinfo_lx_disk_parse_mounts(st: SysinfoLxDisk*, out: SysinfoDisk*, pool: SysinfoLxPool*, text: string, fstext: string, live: bool) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  var n: int32 = 0;
+  while (!sysinfo_lx_end(&s)) {
+    var dev: string = sysinfo_lx_word(&s);
+    var mnt: string = sysinfo_lx_word(&s);
+    var typ: string = sysinfo_lx_word(&s);
+    var opts: string = sysinfo_lx_word(&s);
+    sysinfo_lx_next_line(&s);
+    if (typ.length == (uint64)0) { continue; }
+    // psutil's rule: drop nodev types, but keep zfs, which says nodev.
+    if (sysinfo_lx_is_nodev(fstext, typ) && !sysinfo_lx_eq(typ, "zfs")) { continue; }
+    var f: SysinfoFs* = sysinfo_lx_fs_slot(st, out, n);
+    var blank: SysinfoFs;
+    *f = blank;
+    f->device = sysinfo_lx_unescape(pool, dev);
+    f->mount = sysinfo_lx_unescape(pool, mnt);
+    f->fstype = sysinfo_lx_pool_add(pool, typ);
+    f->options = sysinfo_lx_pool_add(pool, opts);
+    f->read_only = sysinfo_lx_opts_ro(opts);
+    f->total = -1; f->used = -1; f->free = -1; f->avail = -1; f->used_pct = -1.0;
+    f->inodes_total = -1; f->inodes_used = -1; f->inodes_free = -1;
+    if (live) { sysinfo_lx_statfs(f); }
+    n = n + 1;
+  }
+  out->n_fs = n;
+}
+
+fn sysinfo_lx_dev_slot(st: SysinfoLxDisk*, out: SysinfoDisk*, i: int32) -> SysinfoBlock* {
+  if (i >= st->dev_cap || out->dev == 0) {
+    var c: int32 = st->dev_cap;
+    out->dev = (SysinfoBlock*)sysinfo_lx_grow((uint8*)out->dev, &c, i + 1, sizeof(SysinfoBlock));
+    st->dev_cap = c;
+  }
+  return &out->dev[i];
+}
+
+fn sysinfo_lx_find_prev(st: SysinfoLxDisk*, key: uint64, hint: int32) -> SysinfoLxBlk* {
+  if (hint < st->n_prev && st->prev[hint].key == key) { return &st->prev[hint]; }
+  for k in 0..st->n_prev { if (st->prev[k].key == key) { return &st->prev[k]; } }
+  return (SysinfoLxBlk*)0;
+}
+
+// Parses /proc/diskstats text. Devices that never did any I/O are left out.
+export fn sysinfo_lx_disk_parse_stats(st: SysinfoLxDisk*, c: SysinfoLxCtx*, out: SysinfoDisk*, pool: SysinfoLxPool*, text: string, secs: float64) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  var n: int32 = 0;
+  while (!sysinfo_lx_end(&s)) {
+    sysinfo_lx_u64(&s);
+    sysinfo_lx_u64(&s);
+    var name: string = sysinfo_lx_word(&s);
+    var reads: int64 = sysinfo_lx_i64(&s);
+    sysinfo_lx_i64(&s);
+    var rsec: int64 = sysinfo_lx_i64(&s);
+    sysinfo_lx_i64(&s);
+    var writes: int64 = sysinfo_lx_i64(&s);
+    sysinfo_lx_i64(&s);
+    var wsec: int64 = sysinfo_lx_i64(&s);
+    sysinfo_lx_i64(&s);
+    sysinfo_lx_i64(&s);
+    var io_ms: int64 = sysinfo_lx_i64(&s);
+    sysinfo_lx_next_line(&s);
+    if (name.length == (uint64)0 || (reads == 0 && writes == 0)) { continue; }
+    var key: uint64 = sysinfo_lx_hash(name);
+    var old: SysinfoLxBlk* = sysinfo_lx_find_prev(st, key, n);
+    var cap: int32 = st->next_cap;
+    st->next = (SysinfoLxBlk*)sysinfo_lx_grow((uint8*)st->next, &cap, n + 1, sizeof(SysinfoLxBlk));
+    st->next_cap = cap;
+    var nx: SysinfoLxBlk* = &st->next[n];
+    nx->key = key;
+    nx->reads = reads; nx->writes = writes; nx->rsec = rsec; nx->wsec = wsec; nx->io_ms = io_ms;
+    nx->partition = -1;
+    if (old != 0) { nx->partition = old->partition; }
+    if (nx->partition < 0) {
+      var p: SysinfoLxPath;
+      sysinfo_lx_path_at(&p, c->root, "/sys/class/block/");
+      sysinfo_lx_path_add(&p, name);
+      sysinfo_lx_path_add(&p, "/partition");
+      nx->partition = 0;
+      if (sysinfo_lx_fs_exists(sysinfo_lx_path_str(&p))) { nx->partition = 1; }
+    }
+    var d: SysinfoBlock* = sysinfo_lx_dev_slot(st, out, n);
+    d->name = sysinfo_lx_pool_add(pool, name);
+    d->partition = nx->partition == 1;
+    d->reads = reads;
+    d->writes = writes;
+    d->read_bytes = rsec * 512;
+    d->write_bytes = wsec * 512;
+    d->read_bps = 0.0; d->write_bps = 0.0; d->read_iops = 0.0; d->write_iops = 0.0; d->busy_pct = 0.0;
+    if (old != 0) {
+      d->read_bps = sysinfo_lx_rate(rsec, old->rsec, secs) * 512.0;
+      d->write_bps = sysinfo_lx_rate(wsec, old->wsec, secs) * 512.0;
+      d->read_iops = sysinfo_lx_rate(reads, old->reads, secs);
+      d->write_iops = sysinfo_lx_rate(writes, old->writes, secs);
+      d->busy_pct = sysinfo_lx_rate(io_ms, old->io_ms, secs) / 10.0;
+      if (d->busy_pct > 100.0) { d->busy_pct = 100.0; }
+    }
+    n = n + 1;
+  }
+  out->n_dev = n;
+  // the new counters become the old ones
+  var t: SysinfoLxBlk* = st->prev;
+  var tc: int32 = st->prev_cap;
+  st->prev = st->next;
+  st->prev_cap = st->next_cap;
+  st->next = t;
+  st->next_cap = tc;
+  st->n_prev = n;
+}
+
+export fn sysinfo_lx_disk_init(st: SysinfoLxDisk*, c: SysinfoLxCtx*, out: SysinfoDisk*) -> int32 {
+  var p: SysinfoLxPath;
+  st->fd_mounts = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/self/mounts"));
+  if (st->fd_mounts < 0) { st->fd_mounts = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/mounts")); }
+  st->fd_stats = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/diskstats"));
+  sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &p, "/proc/filesystems"), &st->nodev);
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_disk_refresh(st: SysinfoLxDisk*, c: SysinfoLxCtx*, out: SysinfoDisk*) -> int32 {
+  var status: int32 = SYSINFO_OK;
+  var pool: SysinfoLxPool* = sysinfo_lx_pools_next(&st->pools);
+  var n: int64 = sysinfo_lx_fd_slurp(st->fd_mounts, &c->buf);
+  if (n > 0) {
+    sysinfo_lx_disk_parse_mounts(st, out, pool, sysinfo_lx_view(c->buf.p, n), sysinfo_lx_view(st->nodev.p, st->nodev.n), c->live);
+  } else {
+    out->n_fs = 0;
+    status = SYSINFO_E_IO;
+  }
+  n = sysinfo_lx_fd_slurp(st->fd_stats, &c->buf);
+  var t: int64 = time_mono_ns();
+  var secs: float64 = (float64)(t - st->prev_ns) / 1000000000.0;
+  st->prev_ns = t;
+  if (n > 0) {
+    sysinfo_lx_disk_parse_stats(st, c, out, pool, sysinfo_lx_view(c->buf.p, n), secs);
+  } else {
+    out->n_dev = 0;
+    status = SYSINFO_E_IO;
+  }
+  out->status = status;
+  return status;
+}
+
+export fn sysinfo_lx_disk_free(st: SysinfoLxDisk*, out: SysinfoDisk*) {
+  sysinfo_lx_close(st->fd_mounts);
+  sysinfo_lx_close(st->fd_stats);
+  sysinfo_lx_buf_free(&st->nodev);
+  sysinfo_lx_pools_free(&st->pools);
+  if (st->prev != 0) { free(st->prev); }
+  if (st->next != 0) { free(st->next); }
+  if (out->fs != 0) { free(out->fs); }
+  if (out->dev != 0) { free(out->dev); }
+  out->fs = (SysinfoFs*)0;
+  out->dev = (SysinfoBlock*)0;
+}

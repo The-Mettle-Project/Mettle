@@ -1,0 +1,465 @@
+// JSON writer (RFC 8259). Each call appends one value, key or bracket to a
+// CodecBuf, with commas (and, if asked, newlines and indents) put in for you.
+// Strings are escaped as they are copied, 8 bytes at a time when nothing in
+// them needs escaping. Numbers use the shortest digits that read back exactly.
+//
+//   var b: CodecBuf;  codec_buf_init(&b, 256);
+//   var w: CodecJson; codec_json_init(&w, &b);
+//   codec_json_object(&w);
+//   codec_json_key(&w, "id");  codec_json_int(&w, 7);
+//   codec_json_end(&w);
+//   if (codec_json_finish(&w) != CODEC_OK) { ... }   // b holds {"id":7}
+//
+// Mistakes such as a value where a key belongs, or end() with nothing open,
+// set CODEC_ERR_STATE. Errors are sticky; check codec_json_finish once.
+import "std/mem";
+import "codec/core/status";
+import "codec/core/varint";
+import "codec/core/utf8";
+import "codec/core/buf";
+import "codec/json/float";
+
+export const CODEC_JSON_MAX_DEPTH = 256;
+
+// Flags for codec_json_init_flags.
+export const CODEC_JSON_ASCII = 1;        // write non-ASCII as \uXXXX escapes
+export const CODEC_JSON_LOSSY_UTF8 = 2;   // replace invalid UTF-8 with U+FFFD instead of failing
+export const CODEC_JSON_ESCAPE_SLASH = 4; // write / as \/ (safe inside an HTML <script>)
+export const CODEC_JSON_NAN_ERROR = 8;    // NaN and infinity are an error instead of null
+
+// Bits of one nesting level in `levels`.
+const LV_OBJECT = 1;   // an object (else an array)
+const LV_ITEMS = 2;    // has at least one member already
+const LV_KEY = 4;      // a key was written; its value comes next
+
+export struct CodecJson {
+  out: CodecBuf*;
+  flags: int32;
+  indent: int32;       // spaces per level; 0 writes compact JSON
+  depth: int32;
+  done: bool;          // a complete top-level value has been written
+  err: int32;
+  levels: uint8[256];
+}
+
+export fn codec_json_init_flags(w: CodecJson*, out: CodecBuf*, flags: int32) {
+  w->out = out;
+  w->flags = flags;
+  w->indent = 0;
+  w->depth = 0;
+  w->done = false;
+  w->err = CODEC_OK;
+}
+
+export fn codec_json_init(w: CodecJson*, out: CodecBuf*) {
+  codec_json_init_flags(w, out, 0);
+}
+
+// Pretty output: a newline before each member and `spaces` per level.
+export fn codec_json_pretty(w: CodecJson*, spaces: int32) {
+  w->indent = spaces;
+}
+
+fn codec_json_fail(w: CodecJson*, err: int32) {
+  if (w->err == CODEC_OK) { w->err = err; }
+}
+
+// Checks the buffer state and that everything opened was closed. Returns
+// CODEC_OK or the first error.
+export fn codec_json_finish(w: CodecJson*) -> int32 {
+  if (w->err == CODEC_OK && w->out->err != CODEC_OK) { w->err = w->out->err; }
+  if (w->err == CODEC_OK && (w->depth != 0 || !w->done)) { w->err = CODEC_ERR_STATE; }
+  return w->err;
+}
+
+fn codec_json_newline(w: CodecJson*, depth: int32) {
+  var n: int64 = (int64)depth * (int64)w->indent;
+  var p: uint8* = codec_buf_reserve(w->out, n + 1);
+  if (p == 0) { return; }
+  p[0] = (uint8)10;
+  mem_fill((cstring)(p + 1), 32, n);
+  w->out->len = w->out->len + n + 1;
+}
+
+// Called before every value: writes the comma or colon spacing it needs and
+// checks the value is allowed here. Returns false when it is not.
+fn codec_json_before_value(w: CodecJson*) -> bool {
+  if (w->err != CODEC_OK) { return false; }
+  if (w->depth == 0) {
+    if (w->done) {
+      codec_json_fail(w, CODEC_ERR_STATE);
+      return false;
+    }
+    return true;
+  }
+  var lv: int32 = (int32)w->levels[w->depth - 1];
+  if ((lv & LV_OBJECT) != 0) {
+    if ((lv & LV_KEY) == 0) {
+      codec_json_fail(w, CODEC_ERR_STATE);  // a value with no key
+      return false;
+    }
+    w->levels[w->depth - 1] = (uint8)((lv & ~LV_KEY) | LV_ITEMS);
+    return true;
+  }
+  if ((lv & LV_ITEMS) != 0) { codec_buf_byte(w->out, (uint8)44); }
+  if (w->indent > 0) { codec_json_newline(w, w->depth); }
+  w->levels[w->depth - 1] = (uint8)(lv | LV_ITEMS);
+  return true;
+}
+
+fn codec_json_after_value(w: CodecJson*) {
+  if (w->depth == 0) { w->done = true; }
+}
+
+fn codec_json_open(w: CodecJson*, ch: uint8, kind: int32) {
+  if (!codec_json_before_value(w)) { return; }
+  if (w->depth >= CODEC_JSON_MAX_DEPTH) {
+    codec_json_fail(w, CODEC_ERR_DEPTH);
+    return;
+  }
+  codec_buf_byte(w->out, ch);
+  w->levels[w->depth] = (uint8)kind;
+  w->depth = w->depth + 1;
+}
+
+export fn codec_json_object(w: CodecJson*) {
+  codec_json_open(w, (uint8)123, LV_OBJECT);
+}
+
+export fn codec_json_array(w: CodecJson*) {
+  codec_json_open(w, (uint8)91, 0);
+}
+
+// Closes the innermost object or array.
+export fn codec_json_end(w: CodecJson*) {
+  if (w->err != CODEC_OK) { return; }
+  if (w->depth == 0) {
+    codec_json_fail(w, CODEC_ERR_STATE);
+    return;
+  }
+  var lv: int32 = (int32)w->levels[w->depth - 1];
+  if ((lv & LV_KEY) != 0) {
+    codec_json_fail(w, CODEC_ERR_STATE);  // a key with no value
+    return;
+  }
+  w->depth = w->depth - 1;
+  if (w->indent > 0 && (lv & LV_ITEMS) != 0) { codec_json_newline(w, w->depth); }
+  if ((lv & LV_OBJECT) != 0) {
+    codec_buf_byte(w->out, (uint8)125);
+  } else {
+    codec_buf_byte(w->out, (uint8)93);
+  }
+  codec_json_after_value(w);
+}
+
+// True if any of the 8 bytes in x needs escaping: below 0x20, '"', '\\', or
+// 0x80 and up (checked as UTF-8 on the slow path).
+@inline fn codec_json_word_special(x: uint64) -> bool {
+  var ones: uint64 = 0x0101010101010101;
+  var high: uint64 = 0x8080808080808080;
+  var ctrl: uint64 = (x - ones * 0x20) & ~x;
+  var q: uint64 = x ^ (ones * 0x22);
+  var bs: uint64 = x ^ (ones * 0x5c);
+  var hq: uint64 = (q - ones) & ~q;
+  var hb: uint64 = (bs - ones) & ~bs;
+  return ((ctrl | hq | hb | x) & high) != 0;
+}
+
+const CODEC_HEX: string = "0123456789abcdef";
+
+fn codec_json_u_escape(b: CodecBuf*, cp: int32) {
+  var p: uint8* = codec_buf_reserve(b, 6);
+  if (p == 0) { return; }
+  p[0] = (uint8)92;
+  p[1] = (uint8)117;
+  p[2] = CODEC_HEX.chars[(cp >> 12) & 15];
+  p[3] = CODEC_HEX.chars[(cp >> 8) & 15];
+  p[4] = CODEC_HEX.chars[(cp >> 4) & 15];
+  p[5] = CODEC_HEX.chars[cp & 15];
+  b->len = b->len + 6;
+}
+
+// Length of the valid UTF-8 sequence at s[i..n), or 0 if it is not valid.
+fn codec_utf8_seq(s: uint8*, i: int64, n: int64) -> int64 {
+  var c: int32 = (int32)s[i];
+  var need: int64 = 0;
+  if (c >= 0xc2 && c < 0xe0) { need = 2; }
+  if (c >= 0xe0 && c < 0xf0) { need = 3; }
+  if (c >= 0xf0 && c < 0xf5) { need = 4; }
+  if (need == 0 || i + need > n) { return 0; }
+  if (!codec_utf8_valid(s + i, need)) { return 0; }
+  return need;
+}
+
+fn codec_utf8_decode(s: uint8*, len: int64) -> int32 {
+  var c: int32 = (int32)s[0];
+  if (len == 2) { return ((c & 0x1f) << 6) | ((int32)s[1] & 0x3f); }
+  if (len == 3) { return ((c & 0x0f) << 12) | (((int32)s[1] & 0x3f) << 6) | ((int32)s[2] & 0x3f); }
+  return ((c & 0x07) << 18) | (((int32)s[1] & 0x3f) << 12) | (((int32)s[2] & 0x3f) << 6) | ((int32)s[3] & 0x3f);
+}
+
+// The common case: a short string with nothing to escape, copied in one go.
+// Returns false (writing nothing) if the string needs the full path.
+@inline fn codec_json_quoted_plain(w: CodecJson*, s: uint8*, n: int64) -> bool {
+  if (n > 256) { return false; }
+  var i: int64 = 0;
+  while (i + 8 <= n) {
+    if (codec_json_word_special(codec_get_le64(s + i))) { return false; }
+    i = i + 8;
+  }
+  while (i < n) {
+    var c: int32 = (int32)s[i];
+    if (c < 0x20 || c == 34 || c == 92 || c >= 0x80 || (c == 47 && (w->flags & CODEC_JSON_ESCAPE_SLASH) != 0)) { return false; }
+    i = i + 1;
+  }
+  var p: uint8* = codec_buf_reserve(w->out, n + 2);
+  if (p == 0) { return true; }
+  p[0] = (uint8)34;
+  memcpy(p + 1, s, n);
+  p[n + 1] = (uint8)34;
+  w->out->len = w->out->len + n + 2;
+  return true;
+}
+
+// Writes s as a quoted, escaped JSON string.
+fn codec_json_quoted(w: CodecJson*, s: uint8*, n: int64) {
+  if (codec_json_quoted_plain(w, s, n)) { return; }
+  var b: CodecBuf* = w->out;
+  codec_buf_byte(b, (uint8)34);
+  var run: int64 = 0;     // start of the bytes not yet copied
+  var i: int64 = 0;
+  while (i < n) {
+    // Skip 8 plain bytes at a time.
+    while (i + 8 <= n && !codec_json_word_special(codec_get_le64(s + i))) { i = i + 8; }
+    if (i >= n) { break; }
+    var c: int32 = (int32)s[i];
+    if (c >= 0x20 && c != 34 && c != 92 && c < 0x80 && !(c == 47 && (w->flags & CODEC_JSON_ESCAPE_SLASH) != 0)) {
+      i = i + 1;
+      continue;
+    }
+    if (c >= 0x80) {
+      var len: int64 = codec_utf8_seq(s, i, n);
+      if (len > 0 && (w->flags & CODEC_JSON_ASCII) == 0) {
+        i = i + len;
+        continue;
+      }
+      codec_buf_bytes(b, s + run, i - run);
+      if (len == 0) {
+        if ((w->flags & CODEC_JSON_LOSSY_UTF8) == 0) {
+          codec_json_fail(w, CODEC_ERR_UTF8);
+          return;
+        }
+        if ((w->flags & CODEC_JSON_ASCII) != 0) {
+          codec_json_u_escape(b, 0xfffd);
+        } else {
+          codec_buf_byte(b, (uint8)0xef);
+          codec_buf_byte(b, (uint8)0xbf);
+          codec_buf_byte(b, (uint8)0xbd);
+        }
+        i = i + 1;
+      } else {
+        var cp: int32 = codec_utf8_decode(s + i, len);
+        if (cp >= 0x10000) {
+          cp = cp - 0x10000;
+          codec_json_u_escape(b, 0xd800 + (cp >> 10));
+          codec_json_u_escape(b, 0xdc00 + (cp & 0x3ff));
+        } else {
+          codec_json_u_escape(b, cp);
+        }
+        i = i + len;
+      }
+      run = i;
+      continue;
+    }
+    codec_buf_bytes(b, s + run, i - run);
+    var esc: int32 = 0;
+    switch (c) {
+      case 34: { esc = 34; }
+      case 92: { esc = 92; }
+      case 47: { esc = 47; }
+      case 8: { esc = 98; }
+      case 12: { esc = 102; }
+      case 10: { esc = 110; }
+      case 13: { esc = 114; }
+      case 9: { esc = 116; }
+      default: { }
+    }
+    if (esc != 0) {
+      codec_buf_byte(b, (uint8)92);
+      codec_buf_byte(b, (uint8)esc);
+    } else {
+      codec_json_u_escape(b, c);
+    }
+    i = i + 1;
+    run = i;
+  }
+  codec_buf_bytes(b, s + run, n - run);
+  codec_buf_byte(b, (uint8)34);
+}
+
+// An object member name. The value goes next.
+export fn codec_json_key(w: CodecJson*, k: string) {
+  if (w->err != CODEC_OK) { return; }
+  if (w->depth == 0) {
+    codec_json_fail(w, CODEC_ERR_STATE);
+    return;
+  }
+  var lv: int32 = (int32)w->levels[w->depth - 1];
+  if ((lv & LV_OBJECT) == 0 || (lv & LV_KEY) != 0) {
+    codec_json_fail(w, CODEC_ERR_STATE);
+    return;
+  }
+  if ((lv & LV_ITEMS) != 0) { codec_buf_byte(w->out, (uint8)44); }
+  if (w->indent > 0) { codec_json_newline(w, w->depth); }
+  codec_json_quoted(w, k.chars, (int64)k.length);
+  codec_buf_byte(w->out, (uint8)58);
+  if (w->indent > 0) { codec_buf_byte(w->out, (uint8)32); }
+  w->levels[w->depth - 1] = (uint8)(lv | LV_KEY);
+}
+
+export fn codec_json_string(w: CodecJson*, s: string) {
+  if (!codec_json_before_value(w)) { return; }
+  codec_json_quoted(w, s.chars, (int64)s.length);
+  codec_json_after_value(w);
+}
+
+export fn codec_json_bytes_as_string(w: CodecJson*, p: uint8*, n: int64) {
+  if (!codec_json_before_value(w)) { return; }
+  codec_json_quoted(w, p, n);
+  codec_json_after_value(w);
+}
+
+export fn codec_json_null(w: CodecJson*) {
+  if (!codec_json_before_value(w)) { return; }
+  codec_buf_string(w->out, "null");
+  codec_json_after_value(w);
+}
+
+export fn codec_json_bool(w: CodecJson*, v: bool) {
+  if (!codec_json_before_value(w)) { return; }
+  if (v) { codec_buf_string(w->out, "true"); } else { codec_buf_string(w->out, "false"); }
+  codec_json_after_value(w);
+}
+
+// Two digits at a time, as fast integer printers do.
+const CODEC_DIGITS2: string = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+
+// Writes v in decimal at p; returns the length (1 to 20).
+export fn codec_format_u64(v: uint64, p: uint8*) -> int32 {
+  var tmp: uint8[24];
+  var i: int32 = 24;
+  while (v >= 100) {
+    var r: int64 = (int64)(v % 100) * 2;
+    v = v / 100;
+    i = i - 2;
+    tmp[i] = CODEC_DIGITS2.chars[r];
+    tmp[i + 1] = CODEC_DIGITS2.chars[r + 1];
+  }
+  if (v >= 10) {
+    var r2: int64 = (int64)v * 2;
+    i = i - 2;
+    tmp[i] = CODEC_DIGITS2.chars[r2];
+    tmp[i + 1] = CODEC_DIGITS2.chars[r2 + 1];
+  } else {
+    i = i - 1;
+    tmp[i] = (uint8)(48 + (int32)v);
+  }
+  var n: int32 = 24 - i;
+  for k in 0..n { p[k] = tmp[i + k]; }
+  return n;
+}
+
+export fn codec_format_i64(v: int64, p: uint8*) -> int32 {
+  if (v < 0) {
+    p[0] = (uint8)45;
+    return 1 + codec_format_u64((uint64)0 - (uint64)v, p + 1);
+  }
+  return codec_format_u64((uint64)v, p);
+}
+
+export fn codec_json_int(w: CodecJson*, v: int64) {
+  if (!codec_json_before_value(w)) { return; }
+  var p: uint8* = codec_buf_reserve(w->out, 21);
+  if (p == 0) { return; }
+  w->out->len = w->out->len + (int64)codec_format_i64(v, p);
+  codec_json_after_value(w);
+}
+
+export fn codec_json_uint(w: CodecJson*, v: uint64) {
+  if (!codec_json_before_value(w)) { return; }
+  var p: uint8* = codec_buf_reserve(w->out, 21);
+  if (p == 0) { return; }
+  w->out->len = w->out->len + (int64)codec_format_u64(v, p);
+  codec_json_after_value(w);
+}
+
+fn codec_json_not_finite(w: CodecJson*) {
+  if ((w->flags & CODEC_JSON_NAN_ERROR) != 0) {
+    codec_json_fail(w, CODEC_ERR_INVALID);
+    return;
+  }
+  codec_buf_string(w->out, "null");
+  codec_json_after_value(w);
+}
+
+// A float64 in its shortest exact form. NaN and the infinities have no JSON
+// form: they are written as null, or are an error with CODEC_JSON_NAN_ERROR.
+export fn codec_json_float(w: CodecJson*, v: float64) {
+  if (!codec_json_before_value(w)) { return; }
+  var p: uint8* = codec_buf_reserve(w->out, 32);
+  if (p == 0) { return; }
+  var n: int32 = codec_format_f64(v, p);
+  if (n == 0) {
+    codec_json_not_finite(w);
+    return;
+  }
+  w->out->len = w->out->len + (int64)n;
+  codec_json_after_value(w);
+}
+
+// A float32 in the shortest form that reads back as the same float32.
+export fn codec_json_float32(w: CodecJson*, v: float32) {
+  if (!codec_json_before_value(w)) { return; }
+  var p: uint8* = codec_buf_reserve(w->out, 32);
+  if (p == 0) { return; }
+  var n: int32 = codec_format_f32(v, p);
+  if (n == 0) {
+    codec_json_not_finite(w);
+    return;
+  }
+  w->out->len = w->out->len + (int64)n;
+  codec_json_after_value(w);
+}
+
+// Copies text that is already valid JSON (a value) as it is. Not checked.
+export fn codec_json_raw(w: CodecJson*, text: string) {
+  if (!codec_json_before_value(w)) { return; }
+  codec_buf_string(w->out, text);
+  codec_json_after_value(w);
+}
+
+// Shorthands for one object member.
+export fn codec_json_field_string(w: CodecJson*, k: string, v: string) {
+  codec_json_key(w, k);
+  codec_json_string(w, v);
+}
+export fn codec_json_field_int(w: CodecJson*, k: string, v: int64) {
+  codec_json_key(w, k);
+  codec_json_int(w, v);
+}
+export fn codec_json_field_uint(w: CodecJson*, k: string, v: uint64) {
+  codec_json_key(w, k);
+  codec_json_uint(w, v);
+}
+export fn codec_json_field_float(w: CodecJson*, k: string, v: float64) {
+  codec_json_key(w, k);
+  codec_json_float(w, v);
+}
+export fn codec_json_field_bool(w: CodecJson*, k: string, v: bool) {
+  codec_json_key(w, k);
+  codec_json_bool(w, v);
+}
+export fn codec_json_field_null(w: CodecJson*, k: string) {
+  codec_json_key(w, k);
+  codec_json_null(w);
+}

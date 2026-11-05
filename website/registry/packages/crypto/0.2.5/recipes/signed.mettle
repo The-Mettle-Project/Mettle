@@ -1,0 +1,377 @@
+// Signed values, pure Mettle: "value.SIG", a readable value with an
+// HMAC-SHA256 tag (RFC 2104).
+//   SIG = base64url, no padding (always 43 chars), of
+//   HMAC-SHA256(key, le64(len(purpose)) || purpose || value)
+// where le64 is the purpose length as 8 bytes, little endian. The purpose
+// ("remember", "unsubscribe") separates uses: a value signed for one purpose
+// does not verify for another. The value stays readable by anyone; only key
+// holders can produce a valid tag. The format is byte-compatible with the
+// session library's signed values (same formula).
+//
+// Verification tries every key it is given (no early exit), compares tags
+// with cr_equal, and reports which key matched, so keys can be rotated:
+// sign with keys[0], accept keys[0..n-1], re-sign when key_index > 0.
+
+import "std/conv";
+import "crypto/core/status";
+import "crypto/core/types";
+import "crypto/core/util";
+import "crypto/mac/mac";
+import "crypto/core/encode";
+
+/// CR_SIGNED_EXTRA: the bytes cr_signed_sign adds to a value: '.' plus the
+/// 43-character tag.
+/// in: -
+/// returns: 44
+/// owns: nothing
+/// thread: constant
+/// example: var cap: int64 = (int64)v.length + CR_SIGNED_EXTRA;
+export const CR_SIGNED_EXTRA: int64 = 44;
+/// CR_SIGNED_MAX_KEYS: the most keys cr_signed_verify accepts.
+/// in: -
+/// returns: 8
+/// owns: nothing
+/// thread: constant
+/// example: if (nkeys > CR_SIGNED_MAX_KEYS) { ... }
+export const CR_SIGNED_MAX_KEYS: int32 = 8;
+
+// Streaming HMAC over le64(len(purpose)) || purpose || value. The purpose
+// length must already be checked (1..255) by the caller.
+fn cr_signed_tag(out: CrHmacSha256*, key: CrKey32*, purpose: string, value: uint8*, vlen: int64) -> int32 {
+  var lb: uint8[8];
+  var n: int64 = (int64)purpose.length;
+  var i: int32 = 0;
+  while (i < 8) {
+    lb[i] = (uint8)(n & 255);
+    n = n >> 8;
+    i = i + 1;
+  }
+  var st: CrHmacSha256State;
+  var rc: int32 = cr_hmac_sha256_init(&st, &key->b[0], 32);
+  if (rc != CR_OK) { return rc; }
+  rc = cr_hmac_sha256_update(&st, &lb[0], 8);
+  if (rc == CR_OK) { rc = cr_hmac_sha256_update(&st, purpose.chars, (int64)purpose.length); }
+  if (rc == CR_OK) { rc = cr_hmac_sha256_update(&st, value, vlen); }
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha256_state_bytes(&st), 256);
+    return rc;
+  }
+  return cr_hmac_sha256_final(&st, out);
+}
+
+/// Signs a value for a purpose: writes "value.SIG" (the value, a '.', and the
+/// 43-character base64url tag of HMAC-SHA256(key, le64(len(purpose)) ||
+/// purpose || value)). There is no nul terminator. The value is not
+/// encrypted: anyone can read it.
+/// in: out writable for out_cap >= value.length + CR_SIGNED_EXTRA bytes, and
+///   not overlapping value; out_len; key (a CrKey32, 32+ random bytes);
+///   purpose, 1..255 bytes; value, any bytes (may be empty)
+/// returns: CR_OK and *out_len = value.length + 44; CR_E_ARG (null out_len,
+///   out or key; purpose length outside 1..255); CR_E_SPACE if out_cap is
+///   too small (nothing written). On error *out_len = 0
+/// owns: nothing; the caller owns out, the tag and encode buffers are wiped
+/// thread: any thread (no shared state)
+/// example: var buf: uint8[128]; var n: int64; cr_signed_sign(&buf[0], 128, &n, &k, "remember", "user:42");
+export fn cr_signed_sign(out: uint8*, out_cap: int64, out_len: int64*, key: CrKey32*, purpose: string, value: string) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || key == 0) { return CR_E_ARG; }
+  if (purpose.length < (uint64)1 || purpose.length > (uint64)255) { return CR_E_ARG; }
+  var vlen: int64 = (int64)value.length;
+  if (out_cap < vlen + CR_SIGNED_EXTRA) { return CR_E_SPACE; }
+  var tag: CrHmacSha256;
+  var enc: uint8[44];
+  var el: int64 = 0;
+  var rc: int32 = cr_signed_tag(&tag, key, purpose, value.chars, vlen);
+  if (rc == CR_OK) {
+    rc = cr_base64url_encode(&enc[0], 44, &el, &tag.b[0], 32);
+  }
+  cr_wipe(&tag.b[0], 32);
+  if (rc != CR_OK) {
+    cr_wipe(&enc[0], 44);
+    return rc;
+  }
+  if (el != 43) {
+    cr_wipe(&enc[0], 44);
+    return CR_E_INTERNAL;
+  }
+  var i: int64 = 0;
+  while (i < vlen) {
+    out[i] = value.chars[i];
+    i = i + 1;
+  }
+  out[vlen] = 46;
+  i = 0;
+  while (i < 43) {
+    out[vlen + 1 + i] = enc[i];
+    i = i + 1;
+  }
+  cr_wipe(&enc[0], 44);
+  *out_len = vlen + CR_SIGNED_EXTRA;
+  return CR_OK;
+}
+
+/// Verifies a "value.SIG" string against up to 8 keys for a purpose and
+/// returns the value. keys[0] is the current key; keys[1..] are older keys
+/// still accepted during rotation. The tag is recomputed with every key (no
+/// early exit) and compared in constant time; the lowest matching index is
+/// reported. Everything malformed fails closed with CR_E_VERIFY: too short,
+/// no '.' before the 43-character tag, a tag that is not canonical
+/// base64url of 32 bytes, or no key matching.
+/// in: out_value; key_index (may be 0); keys readable for nkeys CrKey32,
+///   1..CR_SIGNED_MAX_KEYS of them; purpose, 1..255 bytes, the same as when
+///   signing; signed_value
+/// returns: CR_OK with *out_value the value and *key_index the matching key
+///   (key_index > 0 means the value was signed with an older key: re-sign it
+///   with keys[0]); CR_E_ARG (null out_value or keys, nkeys outside
+///   1..8, purpose length outside 1..255); CR_E_VERIFY. On error *out_value = "" and *key_index = -1
+/// owns: *out_value borrows signed_value (a view into it, not a copy; do not
+///   free it, and keep signed_value alive while it is used)
+/// thread: any thread (no shared state)
+/// example: var v: string; var ki: int32; if (cr_signed_verify(&v, &ki, &keys[0], 2, "remember", cookie) == CR_OK) { ... }
+export fn cr_signed_verify(out_value: string*, key_index: int32*, keys: CrKey32*, nkeys: int32, purpose: string, signed_value: string) -> int32 {
+  if (out_value == 0) { return CR_E_ARG; }
+  *out_value = "";
+  if (key_index != 0) { *key_index = -1; }
+  if (keys == 0 || nkeys < 1 || nkeys > CR_SIGNED_MAX_KEYS) { return CR_E_ARG; }
+  if (purpose.length < (uint64)1 || purpose.length > (uint64)255) { return CR_E_ARG; }
+  var total: int64 = (int64)signed_value.length;
+  if (total < CR_SIGNED_EXTRA) { return CR_E_VERIFY; }
+  var vlen: int64 = total - CR_SIGNED_EXTRA;
+  if (signed_value.chars[vlen] != 46) { return CR_E_VERIFY; }
+  var want: uint8[32];
+  var wl: int64 = 0;
+  var rc: int32 = cr_base64url_decode(&want[0], 32, &wl, &signed_value.chars[vlen + 1], 43);
+  if (rc != CR_OK) {
+    cr_wipe(&want[0], 32);
+    if (rc == CR_E_DECODE) { return CR_E_VERIFY; }
+    return rc;
+  }
+  if (wl != 32) {
+    cr_wipe(&want[0], 32);
+    return CR_E_VERIFY;
+  }
+  var found: int32 = -1;
+  var got: CrHmacSha256;
+  var i: int32 = 0;
+  while (i < nkeys) {
+    rc = cr_signed_tag(&got, &keys[i], purpose, signed_value.chars, vlen);
+    if (rc != CR_OK) {
+      cr_wipe(&got.b[0], 32);
+      cr_wipe(&want[0], 32);
+      return rc;
+    }
+    if (cr_equal(&got.b[0], &want[0], 32) && found < 0) { found = i; }
+    cr_wipe(&got.b[0], 32);
+    i = i + 1;
+  }
+  cr_wipe(&want[0], 32);
+  if (found < 0) { return CR_E_VERIFY; }
+  *out_value = str_from_bytes((cstring)signed_value.chars, vlen);
+  if (key_index != 0) { *key_index = found; }
+  return CR_OK;
+}
+
+/// CR_SIGNED_UNTIL_EXTRA: the bytes cr_signed_sign_until adds to a value:
+/// '.', 16 hex digits of the expiry, '.', and the 43-character tag.
+/// in: -
+/// returns: 61
+/// owns: nothing
+/// thread: constant
+/// example: var cap: int64 = (int64)v.length + CR_SIGNED_UNTIL_EXTRA;
+export const CR_SIGNED_UNTIL_EXTRA: int64 = 61;
+
+// Writes n (>= 0) as 8 little-endian bytes.
+fn cr_signed_le64(dst: uint8*, n: int64) {
+  var x: int64 = n;
+  var i: int32 = 0;
+  while (i < 8) {
+    dst[i] = (uint8)(x & 255);
+    x = x >> 8;
+    i = i + 1;
+  }
+}
+
+// Streaming HMAC for the expiring form:
+//   "cryptex/signed-until/v1" || le64(len(purpose)) || purpose || le64(expires) || value
+// The fixed prefix keeps this input disjoint from the plain form, whose input
+// starts with a length byte (1..255) followed by a zero byte. The purpose
+// length (1..255) and expires (>= 0) must already be checked by the caller.
+fn cr_signed_until_tag(out: CrHmacSha256*, key: CrKey32*, purpose: string, expires: int64, value: uint8*, vlen: int64) -> int32 {
+  var dom: string = "cryptex/signed-until/v1";
+  var lp: uint8[8];
+  var le: uint8[8];
+  cr_signed_le64(&lp[0], (int64)purpose.length);
+  cr_signed_le64(&le[0], expires);
+  var st: CrHmacSha256State;
+  var rc: int32 = cr_hmac_sha256_init(&st, &key->b[0], 32);
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha256_state_bytes(&st), 256);
+    return rc;
+  }
+  rc = cr_hmac_sha256_update(&st, dom.chars, 23);
+  if (rc == CR_OK) { rc = cr_hmac_sha256_update(&st, &lp[0], 8); }
+  if (rc == CR_OK) { rc = cr_hmac_sha256_update(&st, purpose.chars, (int64)purpose.length); }
+  if (rc == CR_OK) { rc = cr_hmac_sha256_update(&st, &le[0], 8); }
+  if (rc == CR_OK) { rc = cr_hmac_sha256_update(&st, value, vlen); }
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha256_state_bytes(&st), 256);
+    return rc;
+  }
+  return cr_hmac_sha256_final(&st, out);
+}
+
+/// Signs a value with an expiry time: writes "value.EXP.SIG" (the value, a
+/// '.', EXP, a '.', and the 43-character base64url tag SIG). EXP is exactly
+/// 16 lowercase hex digits of the expiry as an unsigned 64-bit big-endian
+/// number (Unix seconds; the caller picks the clock). SIG is the tag of
+/// HMAC-SHA256(key, "cryptex/signed-until/v1" || le64(len(purpose)) ||
+/// purpose || le64(expires) || value), which is domain-separated from the
+/// plain cr_signed_sign form: a value from one form never verifies as the
+/// other. There is no nul terminator. The value is not encrypted: anyone can
+/// read it and the expiry.
+/// in: out writable for out_cap >= value.length + CR_SIGNED_UNTIL_EXTRA bytes,
+///   and not overlapping value; out_len; key (a CrKey32, 32+ random bytes);
+///   purpose, 1..255 bytes; value, any bytes (may be empty); expires, the
+///   absolute expiry time, >= 0
+/// returns: CR_OK and *out_len = value.length + 61; CR_E_ARG (null out_len,
+///   out or key; purpose length outside 1..255; expires < 0); CR_E_SPACE if
+///   out_cap is too small (nothing written). On error *out_len = 0
+/// owns: nothing; the caller owns out, the tag and encode buffers are wiped
+/// thread: any thread (no shared state)
+/// example: var buf: uint8[128]; var n: int64; cr_signed_sign_until(&buf[0], 128, &n, &k, "confirm-email", "user:42", now + 3600);
+export fn cr_signed_sign_until(out: uint8*, out_cap: int64, out_len: int64*, key: CrKey32*, purpose: string, value: string, expires: int64) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || key == 0) { return CR_E_ARG; }
+  if (purpose.length < (uint64)1 || purpose.length > (uint64)255) { return CR_E_ARG; }
+  if (expires < 0) { return CR_E_ARG; }
+  var vlen: int64 = (int64)value.length;
+  if (out_cap < vlen + CR_SIGNED_UNTIL_EXTRA) { return CR_E_SPACE; }
+  var tag: CrHmacSha256;
+  var enc: uint8[44];
+  var el: int64 = 0;
+  var rc: int32 = cr_signed_until_tag(&tag, key, purpose, expires, value.chars, vlen);
+  if (rc == CR_OK) {
+    rc = cr_base64url_encode(&enc[0], 44, &el, &tag.b[0], 32);
+  }
+  cr_wipe(&tag.b[0], 32);
+  if (rc != CR_OK) {
+    cr_wipe(&enc[0], 44);
+    return rc;
+  }
+  if (el != 43) {
+    cr_wipe(&enc[0], 44);
+    return CR_E_INTERNAL;
+  }
+  var i: int64 = 0;
+  while (i < vlen) {
+    out[i] = value.chars[i];
+    i = i + 1;
+  }
+  out[vlen] = 46;
+  var x: int64 = expires;
+  var d: int32 = 15;
+  while (d >= 0) {
+    var nib: int32 = (int32)((x >> (int64)(4 * d)) & 15);
+    if (nib < 10) {
+      out[vlen + 1 + (int64)(15 - d)] = (uint8)(48 + nib);
+    } else {
+      out[vlen + 1 + (int64)(15 - d)] = (uint8)(87 + nib);
+    }
+    d = d - 1;
+  }
+  out[vlen + 17] = 46;
+  i = 0;
+  while (i < 43) {
+    out[vlen + 18 + i] = enc[i];
+    i = i + 1;
+  }
+  cr_wipe(&enc[0], 44);
+  *out_len = vlen + CR_SIGNED_UNTIL_EXTRA;
+  return CR_OK;
+}
+
+/// Verifies a "value.EXP.SIG" string against up to 8 keys for a purpose, then
+/// checks the expiry, and returns the value. keys[0] is the current key;
+/// keys[1..] are older keys still accepted during rotation. The tag is
+/// recomputed with every key (no early exit) and compared in constant time;
+/// the lowest matching index is reported. Everything malformed fails closed
+/// with CR_E_VERIFY: too short, a '.' missing before EXP or before the
+/// 43-character tag, an EXP that is not exactly 16 lowercase hex digits
+/// (uppercase is rejected: the encoding is canonical) or has its top bit set,
+/// a tag that is not canonical base64url of 32 bytes, or no key matching.
+/// The expiry is checked only after a key matched, so an unauthenticated
+/// value never reports CR_E_EXPIRED. expires is an absolute time bound by the
+/// MAC: a verifier cannot extend it, and changing EXP invalidates the tag.
+/// Pass the current time (the same clock used when signing) as now.
+/// in: out_value; key_index (may be 0); keys readable for nkeys CrKey32,
+///   1..CR_SIGNED_MAX_KEYS of them; purpose, 1..255 bytes, the same as when
+///   signing; signed_value; now, the current time in the signer's units
+///   (Unix seconds)
+/// returns: CR_OK with *out_value the value and *key_index the matching key
+///   (key_index > 0 means the value was signed with an older key: re-sign it
+///   with keys[0]), when now < expires; CR_E_EXPIRED when authentic but
+///   now >= expires; CR_E_ARG (null out_value or keys, nkeys outside
+///   1..8, purpose length outside 1..255); CR_E_VERIFY. On any error *out_value = "" and *key_index = -1
+/// owns: *out_value borrows signed_value (a view into it, not a copy; do not
+///   free it, and keep signed_value alive while it is used)
+/// thread: any thread (no shared state)
+/// example: var v: string; var ki: int32; if (cr_signed_verify_until(&v, &ki, &keys[0], 2, "confirm-email", token, now) == CR_OK) { ... }
+export fn cr_signed_verify_until(out_value: string*, key_index: int32*, keys: CrKey32*, nkeys: int32, purpose: string, signed_value: string, now: int64) -> int32 {
+  if (out_value == 0) { return CR_E_ARG; }
+  *out_value = "";
+  if (key_index != 0) { *key_index = -1; }
+  if (keys == 0 || nkeys < 1 || nkeys > CR_SIGNED_MAX_KEYS) { return CR_E_ARG; }
+  if (purpose.length < (uint64)1 || purpose.length > (uint64)255) { return CR_E_ARG; }
+  var total: int64 = (int64)signed_value.length;
+  if (total < CR_SIGNED_UNTIL_EXTRA) { return CR_E_VERIFY; }
+  var vlen: int64 = total - CR_SIGNED_UNTIL_EXTRA;
+  if (signed_value.chars[vlen] != 46) { return CR_E_VERIFY; }
+  if (signed_value.chars[vlen + 17] != 46) { return CR_E_VERIFY; }
+  var exp: uint64 = (uint64)0;
+  var j: int64 = 0;
+  while (j < 16) {
+    var c: uint8 = signed_value.chars[vlen + 1 + j];
+    var dv: int32 = -1;
+    if (c >= 48 && c <= 57) { dv = (int32)c - 48; }
+    if (c >= 97 && c <= 102) { dv = (int32)c - 87; }
+    if (dv < 0) { return CR_E_VERIFY; }
+    exp = exp * (uint64)16 + (uint64)dv;
+    j = j + 1;
+  }
+  if ((exp >> (uint64)63) != (uint64)0) { return CR_E_VERIFY; }
+  var expires: int64 = (int64)exp;
+  var want: uint8[32];
+  var wl: int64 = 0;
+  var rc: int32 = cr_base64url_decode(&want[0], 32, &wl, &signed_value.chars[vlen + 18], 43);
+  if (rc != CR_OK) {
+    cr_wipe(&want[0], 32);
+    if (rc == CR_E_DECODE) { return CR_E_VERIFY; }
+    return rc;
+  }
+  if (wl != 32) {
+    cr_wipe(&want[0], 32);
+    return CR_E_VERIFY;
+  }
+  var found: int32 = -1;
+  var got: CrHmacSha256;
+  var i: int32 = 0;
+  while (i < nkeys) {
+    rc = cr_signed_until_tag(&got, &keys[i], purpose, expires, signed_value.chars, vlen);
+    if (rc != CR_OK) {
+      cr_wipe(&got.b[0], 32);
+      cr_wipe(&want[0], 32);
+      return rc;
+    }
+    if (cr_equal(&got.b[0], &want[0], 32) && found < 0) { found = i; }
+    cr_wipe(&got.b[0], 32);
+    i = i + 1;
+  }
+  cr_wipe(&want[0], 32);
+  if (found < 0) { return CR_E_VERIFY; }
+  if (now >= expires) { return CR_E_EXPIRED; }
+  *out_value = str_from_bytes((cstring)signed_value.chars, vlen);
+  if (key_index != 0) { *key_index = found; }
+  return CR_OK;
+}

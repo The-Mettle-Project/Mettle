@@ -1,0 +1,296 @@
+// Help and usage text, built from the spec. The layout follows clap and
+// cobra: a usage line, then Commands, Arguments and Options in aligned
+// columns, wrapped to the terminal width.
+
+import "std/core";
+import "std/env";
+import "types";
+import "out";
+import "value";
+import "error";
+import "parse";
+
+fn width_of(a: Args*) -> int64 {
+  var w: int64 = (int64)a->width;
+  if (w <= 0) {
+    w = 80;
+    match (env_get("COLUMNS")) {
+      case Some(v): {
+        match (args_parse_int(v)) {
+          case Ok(n): { w = n; }
+          case Err(e): { }
+        }
+      }
+      case None: { }
+    }
+  }
+  if (w < 40) { w = 40; }
+  if (w > 200) { w = 200; }
+  return w;
+}
+
+fn default_metavar(o: ArgsOpt*) -> string {
+  if (o->metavar.length > (uint64)0) { return o->metavar; }
+  if (o->kind == ARGS_INT || o->kind == ARGS_UINT) { return "N"; }
+  if (o->kind == ARGS_FLOAT) { return "NUM"; }
+  return "VALUE";
+}
+
+fn visible_opt(a: Args*, i: int32, cmd: int32) -> bool {
+  return !a->opts[i].hidden && args_opt_in_scope(a, i, cmd)
+      && (a->opts[i].short_name != (uint8)0 || a->opts[i].long_name.length > (uint64)0);
+}
+
+fn takes_value(kind: int32) -> bool {
+  return kind == ARGS_INT || kind == ARGS_UINT || kind == ARGS_FLOAT || kind == ARGS_STR
+      || kind == ARGS_CHOICE || kind == ARGS_LIST || kind == ARGS_CUSTOM;
+}
+
+// "-j, --jobs <N>" and its width.
+fn opt_left(o: ArgsOpt*, w: ArgsOut*) {
+  if (o->short_name != (uint8)0) {
+    args_out_byte(w, 45);
+    args_out_byte(w, (int32)o->short_name);
+    if (o->long_name.length > (uint64)0) { args_out_str(w, ", "); }
+  } else {
+    args_out_str(w, "    ");
+  }
+  if (o->long_name.length > (uint64)0) {
+    args_out_str(w, "--");
+    args_out_str(w, o->long_name);
+  }
+  if (takes_value(o->kind)) {
+    args_out_str(w, " <");
+    args_out_str(w, default_metavar(o));
+    args_out_byte(w, 62);
+    if (o->kind == ARGS_LIST) { args_out_str(w, "..."); }
+  }
+}
+
+fn opt_left_len(o: ArgsOpt*) -> int64 {
+  var w: ArgsOut;
+  var b: uint8[1];
+  args_out_buf(&w, &b[0], 0);
+  opt_left(o, &w);
+  return w.len;
+}
+
+fn pos_left(p: ArgsPos*, w: ArgsOut*) {
+  if (!p->required) { args_out_byte(w, 91); }
+  args_out_str(w, p->name);
+  if (p->rest) { args_out_str(w, "..."); }
+  if (!p->required) { args_out_byte(w, 93); }
+}
+
+fn pos_left_len(p: ArgsPos*) -> int64 {
+  var n: int64 = (int64)p->name.length;
+  if (!p->required) { n = n + 2; }
+  if (p->rest) { n = n + 3; }
+  return n;
+}
+
+// Writes text from column `col`, wrapping at `width` and indenting new
+// lines by `indent`. Returns the column it ends on.
+fn wrap(w: ArgsOut*, text: string, col: int64, indent: int64, width: int64) -> int64 {
+  var c: int64 = col;
+  var i: int64 = 0;
+  var n: int64 = (int64)text.length;
+  while (i < n) {
+    if ((int32)text.chars[i] == 10) {
+      args_out_byte(w, 10);
+      args_out_spaces(w, indent);
+      c = indent;
+      i = i + 1;
+      continue;
+    }
+    if ((int32)text.chars[i] == 32) { i = i + 1; continue; }
+    var j: int64 = i;
+    while (j < n && (int32)text.chars[j] != 32 && (int32)text.chars[j] != 10) { j = j + 1; }
+    var wl: int64 = j - i;
+    var gap: int64 = 1;
+    if (c == indent || c == col && i == 0) { gap = 0; }
+    if (c + gap + wl > width && c > indent) {
+      args_out_byte(w, 10);
+      args_out_spaces(w, indent);
+      c = indent;
+      gap = 0;
+    }
+    if (gap == 1) { args_out_byte(w, 32); }
+    var word: string;
+    word.chars = text.chars + i;
+    word.length = (uint64)wl;
+    args_out_str(w, word);
+    c = c + gap + wl;
+    i = j;
+  }
+  return c;
+}
+
+// The extra notes after an option's help: default, choices, env.
+fn opt_notes(o: ArgsOpt*, w: ArgsOut*) {
+  if (o->has_def && o->kind != ARGS_FLAG) {
+    args_out_str(w, " [default: ");
+    if (o->kind == ARGS_INT) { args_out_int(w, o->def_int); }
+    else if (o->kind == ARGS_UINT) { args_out_uint(w, (uint64)o->def_int); }
+    else if (o->kind == ARGS_FLOAT) { args_out_float(w, o->def_float); }
+    else if (o->kind == ARGS_CHOICE) { args_out_str(w, o->choices[o->def_int]); }
+    else { args_out_str(w, o->def_str); }
+    args_out_byte(w, 93);
+  }
+  if (o->kind == ARGS_CHOICE) {
+    args_out_str(w, " [possible values: ");
+    for i in 0..o->nchoices {
+      if (i > 0) { args_out_str(w, ", "); }
+      args_out_str(w, o->choices[i]);
+    }
+    args_out_byte(w, 93);
+  }
+  if (o->env.length > (uint64)0) {
+    args_out_str(w, " [env: ");
+    args_out_str(w, o->env);
+    args_out_byte(w, 93);
+  }
+  if (o->required) { args_out_str(w, " [required]"); }
+}
+
+// A row: two spaces, the left part padded to `col`, then wrapped help.
+fn row_start(w: ArgsOut*, left_len: int64, col: int64) -> int64 {
+  if (left_len + 2 > col - 2) {
+    args_out_byte(w, 10);
+    args_out_spaces(w, col);
+  } else {
+    args_out_spaces(w, col - 2 - left_len);
+  }
+  return col;
+}
+
+// The usage line for command cmd: "prog sub [OPTIONS] FILE [COMMAND]".
+export fn args_write_usage(a: Args*, cmd: int32, w: ArgsOut*) {
+  args_write_cmd_path(a, cmd, w);
+  var any_opt: bool = false;
+  for i in 0..a->nopts { if (visible_opt(a, i, cmd)) { any_opt = true; } }
+  if (any_opt) { args_out_str(w, " [OPTIONS]"); }
+  for i in 0..a->npos {
+    var p: ArgsPos* = &a->pos[i];
+    if (p->cmd != cmd) { continue; }
+    args_out_byte(w, 32);
+    pos_left(p, w);
+  }
+  if (args_has_subs(a, cmd)) {
+    if (a->cmds[cmd].need_sub) { args_out_str(w, " <COMMAND>"); }
+    else { args_out_str(w, " [COMMAND]"); }
+  }
+}
+
+// The full help page for command cmd.
+export fn args_write_help(a: Args*, cmd: int32, w: ArgsOut*) {
+  var width: int64 = width_of(a);
+  var c: ArgsCmd* = &a->cmds[cmd];
+  if (c->help.length > (uint64)0) {
+    wrap(w, c->help, 0, 0, width);
+    args_out_str(w, "\n\n");
+  }
+  args_out_str(w, "Usage: ");
+  args_write_usage(a, cmd, w);
+  args_out_byte(w, 10);
+  if (c->about.length > (uint64)0) {
+    args_out_byte(w, 10);
+    wrap(w, c->about, 0, 0, width);
+    args_out_byte(w, 10);
+  }
+  // Column for help text: the widest left part, at most 32.
+  var left: int64 = 0;
+  for i in 1..a->ncmds {
+    if (a->cmds[i].parent == cmd && !a->cmds[i].hidden && (int64)a->cmds[i].name.length > left) {
+      left = (int64)a->cmds[i].name.length;
+    }
+  }
+  for i in 0..a->npos {
+    if (a->pos[i].cmd == cmd && pos_left_len(&a->pos[i]) > left) { left = pos_left_len(&a->pos[i]); }
+  }
+  for i in 0..a->nopts {
+    if (visible_opt(a, i, cmd) && opt_left_len(&a->opts[i]) > left) { left = opt_left_len(&a->opts[i]); }
+  }
+  if (left > 30) { left = 30; }
+  var col: int64 = left + 4;
+  if (args_has_subs(a, cmd)) {
+    args_out_str(w, "\nCommands:\n");
+    for i in 1..a->ncmds {
+      var s: ArgsCmd* = &a->cmds[i];
+      if (s->parent != cmd || s->hidden) { continue; }
+      args_out_str(w, "  ");
+      args_out_str(w, s->name);
+      var at: int64 = row_start(w, (int64)s->name.length, col);
+      at = wrap(w, s->help, at, col, width);
+      if (s->aliases.length > (uint64)0) {
+        args_out_str(w, " [aliases: ");
+        args_out_str(w, s->aliases);
+        args_out_byte(w, 93);
+      }
+      args_out_byte(w, 10);
+    }
+    if (args_find_cmd(a, cmd, "help") < 0) {
+      args_out_str(w, "  help");
+      row_start(w, 4, col);
+      args_out_str(w, "print help for a command\n");
+    }
+  }
+  var any_pos: bool = false;
+  for i in 0..a->npos { if (a->pos[i].cmd == cmd) { any_pos = true; } }
+  if (any_pos) {
+    args_out_str(w, "\nArguments:\n");
+    for i in 0..a->npos {
+      var p: ArgsPos* = &a->pos[i];
+      if (p->cmd != cmd) { continue; }
+      args_out_str(w, "  ");
+      pos_left(p, w);
+      var at: int64 = row_start(w, pos_left_len(p), col);
+      wrap(w, p->help, at, col, width);
+      args_out_byte(w, 10);
+    }
+  }
+  var any_opt: bool = false;
+  for i in 0..a->nopts { if (visible_opt(a, i, cmd)) { any_opt = true; } }
+  if (any_opt) {
+    args_out_str(w, "\nOptions:\n");
+    for i in 0..a->nopts {
+      if (!visible_opt(a, i, cmd)) { continue; }
+      var o: ArgsOpt* = &a->opts[i];
+      args_out_str(w, "  ");
+      opt_left(o, w);
+      var at: int64 = row_start(w, opt_left_len(o), col);
+      // Help text and notes are wrapped together.
+      var nb: uint8[512];
+      var nw: ArgsOut;
+      args_out_buf(&nw, &nb[0], 512);
+      args_out_str(&nw, o->help);
+      opt_notes(o, &nw);
+      wrap(w, args_out_text(&nw), at, col, width);
+      args_out_byte(w, 10);
+    }
+  }
+}
+
+// "NAME VERSION"
+export fn args_write_version(a: Args*, w: ArgsOut*) {
+  args_out_str(w, a->name);
+  if (a->version.length > (uint64)0) {
+    args_out_byte(w, 32);
+    args_out_str(w, a->version);
+  }
+}
+
+// Help for cmd into buf; returns the length it needs (it may be more than cap).
+export fn args_help(a: Args*, cmd: int32, buf: uint8*, cap: int64) -> int64 {
+  var w: ArgsOut;
+  args_out_buf(&w, buf, cap);
+  args_write_help(a, cmd, &w);
+  return w.len;
+}
+
+export fn args_usage(a: Args*, cmd: int32, buf: uint8*, cap: int64) -> int64 {
+  var w: ArgsOut;
+  args_out_buf(&w, buf, cap);
+  args_write_usage(a, cmd, &w);
+  return w.len;
+}

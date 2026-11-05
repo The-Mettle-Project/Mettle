@@ -1,0 +1,1126 @@
+// Big integers on 31-bit words, constant time for the secret values they
+// hold. Internal: P-256 key exchange uses it, and ECDSA scalars, P-384 and RSA
+// are meant to build on it.
+//
+// Ported from BearSSL (src/int/i31_*.c), Copyright (c) 2016 Thomas Pornin,
+// MIT license; see NOTICE.
+//
+// An integer is an array of uint32 words. Word 0 is the encoded bit length:
+// for a value of N bits it holds ((N / 31) << 5) + (N % 31), the form that
+// keeps the word count (encoded + 31) >> 5 cheap to compute. Words 1 and up
+// hold the value, 31 bits each (the top bit of every word is 0), least
+// significant word first. Every length (modulus size, word count, byte
+// count) is public; the words themselves may be secret, and no branch, index
+// or loop bound depends on them. As in BearSSL, the moduli are public too.
+//
+// Where BearSSL returns a uint32 truth value, the result is exactly 1 or 0.
+
+import "crypto/core/util";
+
+const CRX_I31_MASK: uint32 = 0x7FFFFFFF;
+
+// ---------------------------------------------------------------------------
+// Constant-time helpers (the macros of BearSSL's inner.h). Truth values are
+// uint32 1 or 0.
+
+/// internal: not(ctl) for a truth value: 1 - ctl.
+@inline export fn crx_ct_not(ctl: uint32) -> uint32 {
+  return ctl ^ 1;
+}
+
+/// internal: y when ctl is 0, x when ctl is 1; ctl is a truth value.
+@inline export fn crx_ct_mux(ctl: uint32, x: uint32, y: uint32) -> uint32 {
+  return y ^ (((uint32)0 - ctl) & (x ^ y));
+}
+
+/// internal: 1 if x == y, else 0.
+@inline export fn crx_ct_eq(x: uint32, y: uint32) -> uint32 {
+  var q: uint32 = x ^ y;
+  return crx_ct_not((q | ((uint32)0 - q)) >> 31);
+}
+
+/// internal: 1 if x != y, else 0.
+@inline export fn crx_ct_neq(x: uint32, y: uint32) -> uint32 {
+  var q: uint32 = x ^ y;
+  return (q | ((uint32)0 - q)) >> 31;
+}
+
+/// internal: 1 if x > y (unsigned), else 0.
+@inline export fn crx_ct_gt(x: uint32, y: uint32) -> uint32 {
+  // If both operands are below 2^31, the top bit of y - x is set exactly when
+  // x > y. If only one is >= 2^31, the answer is the top bit of x. If both
+  // are, subtracting 2^31 from both gives the first case, and y - x is
+  // unchanged by that.
+  var z: uint32 = y - x;
+  return (z ^ ((x ^ y) & (x ^ z))) >> 31;
+}
+
+/// internal: 1 if x >= y (unsigned), else 0.
+@inline export fn crx_ct_ge(x: uint32, y: uint32) -> uint32 {
+  return crx_ct_not(crx_ct_gt(y, x));
+}
+
+/// internal: 1 if x < y (unsigned), else 0.
+@inline export fn crx_ct_lt(x: uint32, y: uint32) -> uint32 {
+  return crx_ct_gt(y, x);
+}
+
+/// internal: -1, 0 or 1 as x is lower than, equal to, or greater than y.
+@inline export fn crx_ct_cmp(x: uint32, y: uint32) -> int32 {
+  return (int32)crx_ct_gt(x, y) | ((int32)0 - (int32)crx_ct_gt(y, x));
+}
+
+/// internal: 1 if x == 0, else 0; the operand is signed.
+@inline export fn crx_ct_eq0(x: int32) -> uint32 {
+  var q: uint32 = (uint32)x;
+  return (~(q | ((uint32)0 - q))) >> 31;
+}
+
+/// internal: the bit length of x, 0 to 32.
+export fn crx_ct_bit_length32(v: uint32) -> uint32 {
+  var x: uint32 = v;
+  var k: uint32 = crx_ct_neq(x, 0);
+  var c: uint32 = crx_ct_gt(x, 0xFFFF);
+  x = crx_ct_mux(c, x >> 16, x);
+  k = k + (c << 4);
+  c = crx_ct_gt(x, 0x00FF);
+  x = crx_ct_mux(c, x >> 8, x);
+  k = k + (c << 3);
+  c = crx_ct_gt(x, 0x000F);
+  x = crx_ct_mux(c, x >> 4, x);
+  k = k + (c << 2);
+  c = crx_ct_gt(x, 0x0003);
+  x = crx_ct_mux(c, x >> 2, x);
+  k = k + (c << 1);
+  k = k + crx_ct_gt(x, 0x0001);
+  return k;
+}
+
+/// internal: copies n words from src to dst if and only if ctl is 1; dst and
+/// src may be the same array but must not partly overlap.
+export fn crx_ct_ccopy(ctl: uint32, dst: uint32*, src: uint32*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = crx_ct_mux(ctl, src[i], dst[i]);
+    i = i + 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 64 by 32 bit division (BearSSL src/int/i32_div32.c).
+
+/// internal: divides the 64-bit value hi:lo by d, in constant time. The
+/// quotient is returned (it must fit on 32 bits, so hi <= d), the remainder
+/// is written to r.
+export fn crx_divrem(hi_in: uint32, lo_in: uint32, d: uint32, r: uint32*) -> uint32 {
+  var hi: uint32 = hi_in;
+  var lo: uint32 = lo_in;
+  var q: uint32 = 0;
+  var ch: uint32 = crx_ct_eq(hi, d);
+  hi = crx_ct_mux(ch, 0, hi);
+  var k: int32 = 31;
+  while (k > 0) {
+    var j: int32 = 32 - k;
+    var w: uint32 = (hi << j) | (lo >> k);
+    var ctl: uint32 = crx_ct_ge(w, d) | (hi >> k);
+    var hi2: uint32 = (w - d) >> j;
+    var lo2: uint32 = lo - (d << k);
+    hi = crx_ct_mux(ctl, hi2, hi);
+    lo = crx_ct_mux(ctl, lo2, lo);
+    q = q | (ctl << k);
+    k = k - 1;
+  }
+  var cf: uint32 = crx_ct_ge(lo, d) | hi;
+  q = q | cf;
+  *r = crx_ct_mux(cf, lo - d, lo);
+  return q;
+}
+
+/// internal: the quotient of the 64-bit value hi:lo by d (hi <= d).
+export fn crx_div(hi: uint32, lo: uint32, d: uint32) -> uint32 {
+  var r: uint32 = 0;
+  return crx_divrem(hi, lo, d, &r);
+}
+
+/// internal: the remainder of the 64-bit value hi:lo by d (hi <= d).
+export fn crx_rem(hi: uint32, lo: uint32, d: uint32) -> uint32 {
+  var r: uint32 = 0;
+  crx_divrem(hi, lo, d, &r);
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Basic operations.
+
+/// internal: sets x to zero with the given encoded bit length.
+export fn crx_i31_zero(x: uint32*, bit_len: uint32) {
+  x[0] = bit_len;
+  var n: uint32 = (bit_len + 31) >> 5;
+  var i: uint32 = 1;
+  while (i <= n) {
+    x[i] = 0;
+    i = i + 1;
+  }
+}
+
+/// internal: the bit length of the xlen words at x (without a header word),
+/// as a plain number of bits, in constant time.
+export fn crx_i31_bit_length(x: uint32*, xlen_in: uint32) -> uint32 {
+  var tw: uint32 = 0;
+  var twk: uint32 = 0;
+  var xlen: uint32 = xlen_in;
+  while (xlen > 0) {
+    xlen = xlen - 1;
+    var c: uint32 = crx_ct_eq(tw, 0);
+    var w: uint32 = x[xlen];
+    tw = crx_ct_mux(c, w, tw);
+    twk = crx_ct_mux(c, xlen, twk);
+  }
+  return (twk << 5) + crx_ct_bit_length32(tw);
+}
+
+/// internal: decodes len big-endian bytes into x; x must have room for the
+/// header and (len * 8 + 30) / 31 words. The encoded bit length is the
+/// actual one of the value.
+export fn crx_i31_decode(x: uint32*, src: uint8*, len: int64) {
+  var u: int64 = len;
+  var v: int32 = 1;
+  var acc: uint32 = 0;
+  var acc_len: int32 = 0;
+  while (u > 0) {
+    u = u - 1;
+    var b: uint32 = (uint32)src[u];
+    acc = acc | (b << acc_len);
+    acc_len = acc_len + 8;
+    if (acc_len >= 31) {
+      x[v] = acc & CRX_I31_MASK;
+      v = v + 1;
+      acc_len = acc_len - 31;
+      acc = b >> (8 - acc_len);
+    }
+  }
+  if (acc_len != 0) {
+    x[v] = acc;
+    v = v + 1;
+  }
+  x[0] = crx_i31_bit_length(&x[1], (uint32)(v - 1));
+}
+
+/// internal: decodes len big-endian bytes into x, which takes the size of m;
+/// returns 1 if the value is lower than m, else 0. If the value is not lower
+/// than m, x is set to zero. The time depends on len and on m's size only.
+export fn crx_i31_decode_mod(x: uint32*, src: uint8*, len: int64, m: uint32*) -> uint32 {
+  // Two passes: the first one finds whether the value fits, the second one
+  // does the write.
+  //
+  // During the first pass, r holds the comparison so far:
+  //   0x00000000  equal to the modulus
+  //   0x00000001  greater than the modulus
+  //   0xFFFFFFFF  lower than the modulus
+  // Bytes are taken from the least significant end, so each new comparison
+  // replaces the previous one unless it yields 0 (equal).
+  //
+  // During the second pass, r is 0xFFFFFFFF (value fits) or 0.
+  //
+  // Extra virtual zero bytes cover the whole modulus, plus 4 more so that no
+  // accumulated partial word remains at the end.
+  var mlen: uint32 = (m[0] + 31) >> 5;
+  var tlen: int64 = (int64)(mlen << 2);
+  if (tlen < len) {
+    tlen = len;
+  }
+  tlen = tlen + 4;
+  var r: uint32 = 0;
+  var pass: int32 = 0;
+  while (pass < 2) {
+    var v: uint32 = 1;
+    var acc: uint32 = 0;
+    var acc_len: int32 = 0;
+    var u: int64 = 0;
+    while (u < tlen) {
+      var b: uint32 = 0;
+      if (u < len) {
+        b = (uint32)src[len - 1 - u];
+      }
+      acc = acc | (b << acc_len);
+      acc_len = acc_len + 8;
+      if (acc_len >= 31) {
+        var xw: uint32 = acc & CRX_I31_MASK;
+        acc_len = acc_len - 31;
+        acc = b >> (8 - acc_len);
+        if (v <= mlen) {
+          if (pass != 0) {
+            x[v] = r & xw;
+          } else {
+            var cc: uint32 = (uint32)crx_ct_cmp(xw, m[v]);
+            r = crx_ct_mux(crx_ct_eq(cc, 0), r, cc);
+          }
+        } else {
+          if (pass == 0) {
+            r = crx_ct_mux(crx_ct_eq(xw, 0), r, 1);
+          }
+        }
+        v = v + 1;
+      }
+      u = u + 1;
+    }
+    // End of the first pass: r is 0, 1 or -1; map 0 and 1 to 0 and keep -1.
+    // End of the second pass: r is 0 or -1, left untouched by the same map.
+    r = r >> 1;
+    r = r | (r << 1);
+    pass = pass + 1;
+  }
+  x[0] = m[0];
+  return r & 1;
+}
+
+/// internal: decodes len big-endian bytes into x and reduces the value
+/// modulo m (any length of input). x takes the size of m.
+export fn crx_i31_decode_reduce(x: uint32*, src: uint8*, len: int64, m: uint32*) {
+  var m_ebitlen: uint32 = m[0];
+  // An invalid (null) modulus.
+  if (m_ebitlen == 0) {
+    x[0] = 0;
+    return;
+  }
+  crx_i31_zero(x, m_ebitlen);
+
+  // First decode directly as many bytes as possible; this needs the actual
+  // bit length of the modulus.
+  var m_rbitlen: uint32 = m_ebitlen >> 5;
+  m_rbitlen = (m_ebitlen & 31) + (m_rbitlen << 5) - m_rbitlen;
+  var mblen: int64 = (int64)((m_rbitlen + 7) >> 3);
+  var k: int64 = mblen - 1;
+  if (k >= len) {
+    crx_i31_decode(x, src, len);
+    x[0] = m_ebitlen;
+    return;
+  }
+  crx_i31_decode(x, src, k);
+  x[0] = m_ebitlen;
+
+  // Input the remaining bytes, as 31-bit words.
+  var acc: uint32 = 0;
+  var acc_len: int32 = 0;
+  while (k < len) {
+    var v: uint32 = (uint32)src[k];
+    k = k + 1;
+    if (acc_len >= 23) {
+      acc_len = acc_len - 23;
+      acc = acc << (8 - acc_len);
+      acc = acc | (v >> acc_len);
+      crx_i31_muladd_small(x, acc, m);
+      acc = v & ((uint32)0xFF >> (8 - acc_len));
+    } else {
+      acc = (acc << 8) | v;
+      acc_len = acc_len + 8;
+    }
+  }
+
+  // Some bits may be left; shift to inject them as a full 31-bit word.
+  if (acc_len != 0) {
+    acc = (acc | (x[1] << acc_len)) & CRX_I31_MASK;
+    crx_i31_rshift(x, 31 - acc_len);
+    crx_i31_muladd_small(x, acc, m);
+  }
+}
+
+/// internal: encodes x as len big-endian bytes (high bytes dropped if x is
+/// longer, zero-padded if shorter).
+export fn crx_i31_encode(dst: uint8*, len: int64, x: uint32*) {
+  var xlen: uint32 = (x[0] + 31) >> 5;
+  if (xlen == 0) {
+    var z: int64 = 0;
+    while (z < len) {
+      dst[z] = 0;
+      z = z + 1;
+    }
+    return;
+  }
+  var pos: int64 = len;
+  var rem: int64 = len;
+  var k: uint32 = 1;
+  var acc: uint32 = 0;
+  var acc_len: uint32 = 0;
+  while (rem != 0) {
+    var w: uint32 = 0;
+    if (k <= xlen) {
+      w = x[k];
+    }
+    k = k + 1;
+    if (acc_len == 0) {
+      acc = w;
+      acc_len = 31;
+    } else {
+      var zw: uint32 = acc | (w << acc_len);
+      acc_len = acc_len - 1;
+      acc = w >> (31 - acc_len);
+      if (rem >= 4) {
+        pos = pos - 4;
+        rem = rem - 4;
+        dst[pos] = (uint8)(zw >> 24);
+        dst[pos + 1] = (uint8)(zw >> 16);
+        dst[pos + 2] = (uint8)(zw >> 8);
+        dst[pos + 3] = (uint8)zw;
+      } else {
+        if (rem >= 3) {
+          dst[pos - 3] = (uint8)(zw >> 16);
+        }
+        if (rem >= 2) {
+          dst[pos - 2] = (uint8)(zw >> 8);
+        }
+        dst[pos - 1] = (uint8)zw;
+        return;
+      }
+    }
+  }
+}
+
+/// internal: a = a + b if ctl is 1 (a unchanged if 0); the carry out of the
+/// top word is returned. a and b have the same encoded bit length.
+export fn crx_i31_add(a: uint32*, b: uint32*, ctl: uint32) -> uint32 {
+  var cc: uint32 = 0;
+  var m: uint32 = (a[0] + 63) >> 5;
+  var u: uint32 = 1;
+  while (u < m) {
+    var aw: uint32 = a[u];
+    var bw: uint32 = b[u];
+    var naw: uint32 = aw + bw + cc;
+    cc = naw >> 31;
+    a[u] = crx_ct_mux(ctl, naw & CRX_I31_MASK, aw);
+    u = u + 1;
+  }
+  return cc;
+}
+
+/// internal: a = a - b if ctl is 1 (a unchanged if 0); the borrow out of the
+/// top word is returned. a and b have the same encoded bit length.
+export fn crx_i31_sub(a: uint32*, b: uint32*, ctl: uint32) -> uint32 {
+  var cc: uint32 = 0;
+  var m: uint32 = (a[0] + 63) >> 5;
+  var u: uint32 = 1;
+  while (u < m) {
+    var aw: uint32 = a[u];
+    var bw: uint32 = b[u];
+    var naw: uint32 = aw - bw - cc;
+    cc = naw >> 31;
+    a[u] = crx_ct_mux(ctl, naw & CRX_I31_MASK, aw);
+    u = u + 1;
+  }
+  return cc;
+}
+
+/// internal: 1 if x is zero, else 0.
+export fn crx_i31_iszero(x: uint32*) -> uint32 {
+  var z: uint32 = 0;
+  var u: uint32 = (x[0] + 31) >> 5;
+  while (u > 0) {
+    z = z | x[u];
+    u = u - 1;
+  }
+  return (~(z | ((uint32)0 - z))) >> 31;
+}
+
+/// internal: -1/x mod 2^31 for an odd x; 0 for an even x.
+export fn crx_i31_ninv31(x: uint32) -> uint32 {
+  var y: uint32 = 2 - x;
+  y = y * (2 - y * x);
+  y = y * (2 - y * x);
+  y = y * (2 - y * x);
+  y = y * (2 - y * x);
+  return crx_ct_mux(x & 1, (uint32)0 - y, 0) & CRX_I31_MASK;
+}
+
+/// internal: x = x >> count, for a count lower than 31 (it need not be
+/// secret; x is the value).
+export fn crx_i31_rshift(x: uint32*, count: int32) {
+  var len: uint32 = (x[0] + 31) >> 5;
+  if (len == 0) {
+    return;
+  }
+  var r: uint32 = x[1] >> count;
+  var u: uint32 = 2;
+  while (u <= len) {
+    var w: uint32 = x[u];
+    x[u - 1] = ((w << (31 - count)) | r) & CRX_I31_MASK;
+    r = w >> count;
+    u = u + 1;
+  }
+  x[len] = r;
+}
+
+// ---------------------------------------------------------------------------
+// Multiplication and reduction.
+
+/// internal: x = (x * 2^31 + z) mod m, for a 31-bit z and a modulus m of at
+/// least one bit; x is lower than m on input. The modulus size is public.
+export fn crx_i31_muladd_small(x: uint32*, z: uint32, m: uint32*) {
+  var m_bitlen: uint32 = m[0];
+  // The test is on the modulus bit length, which is accepted to leak.
+  if (m_bitlen == 0) {
+    return;
+  }
+  if (m_bitlen <= 31) {
+    var hi1: uint32 = x[1] >> 1;
+    var lo1: uint32 = (x[1] << 31) | z;
+    x[1] = crx_rem(hi1, lo1, m[1]);
+    return;
+  }
+  var mlen: uint32 = (m_bitlen + 31) >> 5;
+  var mblr: uint32 = m_bitlen & 31;
+
+  // Principle: the quotient (x * 2^31 + z) / m is estimated by a 64/32
+  // division of the high words.
+  //
+  // Let w = 2^31 and
+  //   a = (w * a0 + a1) * w^N + a2
+  //   b = b0 * w^N + b2
+  // with 0 <= a0, a1 < w, 0 <= a2, b2 < w^N, w/2 <= b0 < w and a < w * b
+  // (so that the quotient q = a / b fits one word). If
+  //   a0 * w + a1 = b0 * u + v   (0 <= v < b0)
+  // then 0 <= u <= w and u - 2 <= q <= u.
+  var hi: uint32 = x[mlen];
+  var a0: uint32 = 0;
+  var a1: uint32 = 0;
+  var b0: uint32 = 0;
+  var i: uint32 = 0;
+  if (mblr == 0) {
+    a0 = x[mlen];
+    // Shift x[1..mlen-1] up by one word, then x[1] = z.
+    i = mlen;
+    while (i >= 2) {
+      x[i] = x[i - 1];
+      i = i - 1;
+    }
+    x[1] = z;
+    a1 = x[mlen];
+    b0 = m[mlen];
+  } else {
+    a0 = ((x[mlen] << (31 - mblr)) | (x[mlen - 1] >> mblr)) & CRX_I31_MASK;
+    i = mlen;
+    while (i >= 2) {
+      x[i] = x[i - 1];
+      i = i - 1;
+    }
+    x[1] = z;
+    a1 = ((x[mlen] << (31 - mblr)) | (x[mlen - 1] >> mblr)) & CRX_I31_MASK;
+    b0 = ((m[mlen] << (31 - mblr)) | (m[mlen - 1] >> mblr)) & CRX_I31_MASK;
+  }
+
+  // Estimate q from the quotient g returned by the division:
+  //  - if a0 == b0 then g == 0 and q = 0x7FFFFFFF;
+  //  - otherwise q = 0 if g == 0, and q = g - 1 if not.
+  // The true quotient is then q - 1, q or q + 1. a0, a1 and b0 are 31-bit
+  // words, so the division parameters are adjusted.
+  var g: uint32 = crx_div(a0 >> 1, a1 | (a0 << 31), b0);
+  var q: uint32 = crx_ct_mux(crx_ct_eq(a0, b0), CRX_I31_MASK, crx_ct_mux(crx_ct_eq(g, 0), 0, g - 1));
+
+  // Subtract q * m from x (with the extra high word hi). q may be off by one
+  // either way, so m may have to be added or subtracted afterwards. tb is 1
+  // at the end if the result is not lower than the modulus (not counting hi
+  // or the carry).
+  var cc: uint32 = 0;
+  var tb: uint32 = 1;
+  var u: uint32 = 1;
+  while (u <= mlen) {
+    var mw: uint32 = m[u];
+    var zl: uint64 = (uint64)mw * (uint64)q + (uint64)cc;
+    cc = (uint32)(zl >> 31);
+    var zw: uint32 = (uint32)zl & CRX_I31_MASK;
+    var xw: uint32 = x[u];
+    var nxw: uint32 = xw - zw;
+    cc = cc + (nxw >> 31);
+    nxw = nxw & CRX_I31_MASK;
+    x[u] = nxw;
+    tb = crx_ct_mux(crx_ct_eq(nxw, mw), tb, crx_ct_gt(nxw, mw));
+    u = u + 1;
+  }
+
+  // If q was underestimated, either cc < hi (an extra bit beyond the top
+  // word) or cc == hi and tb is 1 (no extra bit, but the result is not lower
+  // than the modulus): subtract m once. If it was overestimated, cc > hi (a
+  // negative result): add m once.
+  var over: uint32 = crx_ct_gt(cc, hi);
+  var under: uint32 = (~over) & (tb | crx_ct_lt(cc, hi));
+  crx_i31_add(x, m, over);
+  crx_i31_sub(x, m, under);
+}
+
+/// internal: x = a mod m, for any a (the header sizes are public). x takes
+/// the size of m.
+export fn crx_i31_reduce(x: uint32*, a: uint32*, m: uint32*) {
+  var m_bitlen: uint32 = m[0];
+  var mlen: uint32 = (m_bitlen + 31) >> 5;
+  x[0] = m_bitlen;
+  if (m_bitlen == 0) {
+    return;
+  }
+  // A shorter source is copied, the upper words zeroed.
+  var a_bitlen: uint32 = a[0];
+  var alen: uint32 = (a_bitlen + 31) >> 5;
+  var u: uint32 = 0;
+  if (a_bitlen < m_bitlen) {
+    u = 0;
+    while (u < alen) {
+      x[1 + u] = a[1 + u];
+      u = u + 1;
+    }
+    u = alen;
+    while (u < mlen) {
+      x[u + 1] = 0;
+      u = u + 1;
+    }
+    return;
+  }
+  // Otherwise copy mlen - 1 words and input the rest one by one.
+  u = 0;
+  while (u + 1 < mlen) {
+    x[1 + u] = a[2 + (alen - mlen) + u];
+    u = u + 1;
+  }
+  x[mlen] = 0;
+  u = 1 + alen - mlen;
+  while (u > 0) {
+    crx_i31_muladd_small(x, a[u], m);
+    u = u - 1;
+  }
+}
+
+/// internal: d = d + a * b, where d has the size of the sum of the sizes of
+/// a and b (d[0] is set to the encoded bit length of a * b).
+export fn crx_i31_mulacc(d: uint32*, a: uint32*, b: uint32*) {
+  var alen: uint32 = (a[0] + 31) >> 5;
+  var blen: uint32 = (b[0] + 31) >> 5;
+
+  // The encoded bit lengths are added with some extra care.
+  var dl: uint32 = (a[0] & 31) + (b[0] & 31);
+  var dh: uint32 = (a[0] >> 5) + (b[0] >> 5);
+  d[0] = (dh << 5) + dl + ((~(dl - 31)) >> 31);
+
+  var u: uint32 = 0;
+  while (u < blen) {
+    var f: uint32 = b[1 + u];
+    var cc: uint64 = 0;
+    var v: uint32 = 0;
+    while (v < alen) {
+      var z: uint64 = (uint64)d[1 + u + v] + (uint64)f * (uint64)a[1 + v] + cc;
+      cc = z >> 31;
+      d[1 + u + v] = (uint32)z & CRX_I31_MASK;
+      v = v + 1;
+    }
+    d[1 + u + alen] = (uint32)cc;
+    u = u + 1;
+  }
+}
+
+/// internal: d = x * y / 2^(31 * words of m) mod m (Montgomery product); x and
+/// y are lower than m, m is odd, m0i = crx_i31_ninv31(m[1]). d must not be
+/// the same array as x, y or m.
+export fn crx_i31_montymul(d: uint32*, x: uint32*, y: uint32*, m: uint32*, m0i: uint32) {
+  // Each outer iteration computes d = (d + xu * y + f * m) / 2^31, with
+  // xu <= 2^31 - 1 and f <= 2^31 - 1. If d <= 2 * m - 1 on input, then
+  //   2 * m - 1 + 2 * (2^31 - 1) * m <= 2^32 * m - 1
+  // and the new d is lower than 2 * m. d is held on 31-bit words plus an
+  // extra word dh, which is 0 or 1.
+  var len: uint32 = (m[0] + 31) >> 5;
+  crx_i31_zero(d, m[0]);
+  var dh: uint32 = 0;
+  var u: uint32 = 0;
+  while (u < len) {
+    // The carry of each step fits 32 bits:
+    //   (2^31 - 1) + 2 * (2^31 - 1)^2 + (2^32 - 1) = 2^63 - 2^31.
+    var xu: uint32 = x[u + 1];
+    var f: uint32 = ((d[1] + ((xu * y[1]) & CRX_I31_MASK)) * m0i) & CRX_I31_MASK;
+    var r: uint64 = 0;
+    var v: uint32 = 0;
+    while (v < len) {
+      var z: uint64 = (uint64)d[v + 1] + (uint64)xu * (uint64)y[v + 1] + (uint64)f * (uint64)m[v + 1] + r;
+      r = z >> 31;
+      d[v] = (uint32)z & CRX_I31_MASK;
+      v = v + 1;
+    }
+    // The new dh is 0 or 1, so the sum of the old dh and the carry fits 32
+    // bits.
+    dh = dh + (uint32)r;
+    d[len] = dh & CRX_I31_MASK;
+    dh = dh >> 31;
+    u = u + 1;
+  }
+  // The loop overwrote the bit length.
+  d[0] = m[0];
+  // d may still be at least m, and dh may be nonzero.
+  crx_i31_sub(d, m, crx_ct_neq(dh, 0) | crx_ct_not(crx_i31_sub(d, m, 0)));
+}
+
+/// internal: converts x (lower than m) to Montgomery form: x = x * R mod m
+/// with R = 2^(31 * words of m).
+export fn crx_i31_to_monty(x: uint32*, m: uint32*) {
+  var k: uint32 = (m[0] + 31) >> 5;
+  while (k > 0) {
+    crx_i31_muladd_small(x, 0, m);
+    k = k - 1;
+  }
+}
+
+/// internal: converts x from Montgomery form back to a plain value.
+export fn crx_i31_from_monty(x: uint32*, m: uint32*, m0i: uint32) {
+  var len: uint32 = (m[0] + 31) >> 5;
+  var u: uint32 = 0;
+  while (u < len) {
+    var f: uint32 = ((x[1] * m0i)) & CRX_I31_MASK;
+    var cc: uint64 = 0;
+    var v: uint32 = 0;
+    while (v < len) {
+      var z: uint64 = (uint64)x[v + 1] + (uint64)f * (uint64)m[v + 1] + cc;
+      cc = z >> 31;
+      if (v != 0) {
+        x[v] = (uint32)z & CRX_I31_MASK;
+      }
+      v = v + 1;
+    }
+    x[len] = (uint32)cc;
+    u = u + 1;
+  }
+  // An extra subtraction may be needed, only if x is at least m: the first
+  // call computes the carry, the second one subtracts only if it is 0.
+  crx_i31_sub(x, m, crx_ct_not(crx_i31_sub(x, m, 0)));
+}
+
+/// internal: x = x ^ e mod m, e given as elen big-endian bytes (secret),
+/// square-and-multiply with a constant-time selection. m is odd, m0i =
+/// crx_i31_ninv31(m[1]); t1 and t2 are temporaries of the size of m (header
+/// included, rounded up to an even word count). x is lower than m on input.
+export fn crx_i31_modpow(x: uint32*, e: uint8*, elen: int64, m: uint32*, m0i: uint32, t1: uint32*, t2: uint32*) {
+  // The number of words of m, header included.
+  var mlen: int64 = (int64)((m[0] + 63) >> 5);
+  // t1 is in Montgomery form and holds x, x^2, x^4, x^8...; the result is
+  // accumulated, in plain form, in x; t2 is the destination of each
+  // multiplication. No conversion out of Montgomery form is needed.
+  var i: int64 = 0;
+  while (i < mlen) {
+    t1[i] = x[i];
+    i = i + 1;
+  }
+  crx_i31_to_monty(t1, m);
+  crx_i31_zero(x, m[0]);
+  x[1] = 1;
+  var k: int64 = 0;
+  var total: int64 = elen << 3;
+  while (k < total) {
+    var ctl: uint32 = ((uint32)e[elen - 1 - (k >> 3)] >> (uint32)(k & 7)) & 1;
+    crx_i31_montymul(t2, x, t1, m, m0i);
+    crx_ct_ccopy(ctl, x, t2, mlen);
+    crx_i31_montymul(t2, t1, t1, m, m0i);
+    i = 0;
+    while (i < mlen) {
+      t1[i] = t2[i];
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+}
+
+/// internal: x = x ^ e mod m like crx_i31_modpow, with a window of up to 5
+/// bits: faster, and the window is looked up in constant time. tmp is a work
+/// area of twlen words, at least twice the (even-rounded) word count of m
+/// including its header; a larger area allows a larger window. Returns 1, or
+/// 0 if twlen is too small (x is then untouched).
+export fn crx_i31_modpow_opt(x: uint32*, e_in: uint8*, elen_in: int64, m: uint32*, m0i: uint32, tmp: uint32*, twlen: int64) -> uint32 {
+  // Modulus size in words, header included; mlenw is the exact count, mwlen
+  // is rounded up to even.
+  var mlenw: int64 = (int64)((m[0] + 63) >> 5);
+  var mwlen: int64 = mlenw + (mlenw & 1);
+  var t1: uint32* = &tmp[0];
+  var t2: uint32* = &tmp[mwlen];
+
+  // Window size, 5 bits at most. A 1-bit window needs two temporaries only;
+  // a window of k bits needs 2^k + 1.
+  if (twlen < (mwlen << 1)) {
+    return 0;
+  }
+  var win_len: int32 = 5;
+  while (win_len > 1) {
+    if ((((int64)1 << win_len) + 1) * mwlen <= twlen) {
+      break;
+    }
+    win_len = win_len - 1;
+  }
+
+  // Everything is in Montgomery form.
+  crx_i31_to_monty(x, m);
+
+  // Window contents: with a 1-bit window t2 is x; otherwise t2[0] is left
+  // alone and t2[k] is set to x^k (k >= 1).
+  var i: int64 = 0;
+  var u: int64 = 0;
+  var v: int64 = 0;
+  var base: int64 = 0;
+  if (win_len == 1) {
+    i = 0;
+    while (i < mlenw) {
+      t2[i] = x[i];
+      i = i + 1;
+    }
+  } else {
+    base = mwlen;
+    i = 0;
+    while (i < mlenw) {
+      t2[base + i] = x[i];
+      i = i + 1;
+    }
+    u = 2;
+    while (u < ((int64)1 << win_len)) {
+      crx_i31_montymul(&t2[base + mwlen], &t2[base], x, m, m0i);
+      base = base + mwlen;
+      u = u + 1;
+    }
+  }
+
+  // x = 1 in Montgomery form: set the high word to 1, then one word-sized
+  // shift.
+  crx_i31_zero(x, m[0]);
+  x[(m[0] + 31) >> 5] = 1;
+  crx_i31_muladd_small(x, 0, m);
+
+  // Process the exponent bits from the most significant; acc_len bits are
+  // held in acc.
+  var ei: int64 = 0;
+  var elen: int64 = elen_in;
+  var acc: uint32 = 0;
+  var acc_len: int32 = 0;
+  while (acc_len > 0 || elen > 0) {
+    var k: int32 = win_len;
+    if (acc_len < win_len) {
+      if (elen > 0) {
+        acc = (acc << 8) | (uint32)e_in[ei];
+        ei = ei + 1;
+        elen = elen - 1;
+        acc_len = acc_len + 8;
+      } else {
+        k = acc_len;
+      }
+    }
+    var bits: uint32 = (acc >> (acc_len - k)) & (((uint32)1 << k) - 1);
+    acc_len = acc_len - k;
+
+    // k squarings.
+    var c: int32 = 0;
+    while (c < k) {
+      crx_i31_montymul(t1, x, x, m, m0i);
+      i = 0;
+      while (i < mlenw) {
+        x[i] = t1[i];
+        i = i + 1;
+      }
+      c = c + 1;
+    }
+
+    // Window lookup: set t2 to the value for these bits (assumed nonzero).
+    // With a 1-bit window t2 is already set; otherwise the lookup runs over
+    // every entry.
+    if (win_len > 1) {
+      crx_i31_zero(t2, m[0]);
+      base = mwlen;
+      u = 1;
+      while (u < ((int64)1 << k)) {
+        var mask: uint32 = (uint32)0 - crx_ct_eq((uint32)u, bits);
+        v = 1;
+        while (v < mwlen) {
+          t2[v] = t2[v] | (mask & t2[base + v]);
+          v = v + 1;
+        }
+        base = base + mwlen;
+        u = u + 1;
+      }
+    }
+
+    // Multiply by the looked-up value; keep the product only if the bits
+    // are not all zero.
+    crx_i31_montymul(t1, x, t2, m, m0i);
+    crx_ct_ccopy(crx_ct_neq(bits, 0), x, t1, mlenw);
+  }
+
+  // Back from Montgomery form.
+  crx_i31_from_monty(x, m, m0i);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Modular division. The integers here have a custom format without the usual
+// header word: 31-bit words in 32-bit slots, least significant first, with
+// the length in words given explicitly. A value may be negative (two's
+// complement), and the top word may use a 32nd bit.
+
+// a = -a if ctl is 1, else unchanged; len words of 31 bits.
+fn crx_i31_cond_negate(a: uint32*, len: uint32, ctl: uint32) {
+  var cc: uint32 = ctl;
+  var xm: uint32 = ((uint32)0 - ctl) >> 1;
+  var k: uint32 = 0;
+  while (k < len) {
+    var aw: uint32 = a[k];
+    aw = (aw ^ xm) + cc;
+    a[k] = aw & CRX_I31_MASK;
+    cc = aw >> 31;
+    k = k + 1;
+  }
+}
+
+// Finishes a modular reduction. If neg is 1 then -m <= a < 0; if neg is 0
+// then 0 <= a < 2 * m (and then the top word of a may use 32 bits). m is odd.
+fn crx_i31_finish_mod(a: uint32*, len: uint32, m: uint32*, neg: uint32) {
+  // First pass: compare a (taken as nonnegative) with m. If the last word
+  // uses the extra bit, subtracting m must give a value below 2^31, since
+  // a < 2 * m.
+  var cc: uint32 = 0;
+  var k: uint32 = 0;
+  while (k < len) {
+    var aw: uint32 = a[k];
+    var mw: uint32 = m[k];
+    cc = (aw - mw - cc) >> 31;
+    k = k + 1;
+  }
+  // Now:
+  //   neg = 1: add m, whatever cc is;
+  //   neg = 0 and cc = 0: subtract m;
+  //   neg = 0 and cc = 1: nothing.
+  var xm: uint32 = ((uint32)0 - neg) >> 1;
+  var ym: uint32 = (uint32)0 - (neg | (1 - cc));
+  cc = neg;
+  k = 0;
+  while (k < len) {
+    var aw: uint32 = a[k];
+    var mw: uint32 = (m[k] ^ xm) & ym;
+    aw = aw - mw - cc;
+    a[k] = aw & CRX_I31_MASK;
+    cc = aw >> 31;
+    k = k + 1;
+  }
+}
+
+// a = (a * pa + b * pb) / 2^31 and b = (a * qa + b * qb) / 2^31, the
+// division being exact; a negative result is negated. The result is the
+// combination of two bits: bit 0 if a had to be negated, bit 1 if b had to be.
+// The factors are at most 2^31 in absolute value; a and b are nonnegative and
+// their top word has no 32nd bit.
+fn crx_i31_co_reduce(a: uint32*, b: uint32*, len: uint32, pa: int64, pb: int64, qa: int64, qb: int64) -> uint32 {
+  var k: uint32 = 0;
+  var cca: int64 = 0;
+  var ccb: int64 = 0;
+  var m32: uint64 = (uint64)1 << 32;
+  while (k < len) {
+    // |pa|, |pb| <= 2^31, 0 <= wa, wb <= 2^31 - 1 and |cca| <= 2^32 - 1, so
+    // |za| <= (2^31 - 1) * 2^32 + 2^32 - 1 = 2^63 - 1, and the new carries
+    // satisfy |cca|, |ccb| <= 2^32 - 1.
+    var wa: uint32 = a[k];
+    var wb: uint32 = b[k];
+    var za: uint64 = (uint64)wa * (uint64)pa + (uint64)wb * (uint64)pb + (uint64)cca;
+    var zb: uint64 = (uint64)wa * (uint64)qa + (uint64)wb * (uint64)qb + (uint64)ccb;
+    if (k > 0) {
+      a[k - 1] = (uint32)(za & (uint64)CRX_I31_MASK);
+      b[k - 1] = (uint32)(zb & (uint64)CRX_I31_MASK);
+    }
+    // Signed right shift by 31 with a sign extension of the 33-bit result.
+    var tta: uint64 = za >> 31;
+    var ttb: uint64 = zb >> 31;
+    tta = (tta ^ m32) - m32;
+    ttb = (ttb ^ m32) - m32;
+    cca = (int64)tta;
+    ccb = (int64)ttb;
+    k = k + 1;
+  }
+  a[len - 1] = (uint32)cca;
+  b[len - 1] = (uint32)ccb;
+
+  var nega: uint32 = (uint32)((uint64)cca >> 63);
+  var negb: uint32 = (uint32)((uint64)ccb >> 63);
+  crx_i31_cond_negate(a, len, nega);
+  crx_i31_cond_negate(b, len, negb);
+  return nega | (negb << 1);
+}
+
+// a = (a * pa + b * pb) / 2^31 mod m and b = (a * qa + b * qb) / 2^31 mod m;
+// m0i = -1/m[0] mod 2^31. Same limits on the factors and the sources as
+// crx_i31_co_reduce.
+fn crx_i31_co_reduce_mod(a: uint32*, b: uint32*, len: uint32, pa: int64, pb: int64, qa: int64, qb: int64, m: uint32*, m0i: uint32) {
+  var cca: int64 = 0;
+  var ccb: int64 = 0;
+  var fa: uint32 = ((a[0] * (uint32)pa + b[0] * (uint32)pb) * m0i) & CRX_I31_MASK;
+  var fb: uint32 = ((a[0] * (uint32)qa + b[0] * (uint32)qb) * m0i) & CRX_I31_MASK;
+  var m32: uint64 = (uint64)1 << 32;
+  var k: uint32 = 0;
+  while (k < len) {
+    // The carries cca and ccb always fit 33 bits in absolute value.
+    var wa: uint32 = a[k];
+    var wb: uint32 = b[k];
+    var za: uint64 = (uint64)wa * (uint64)pa + (uint64)wb * (uint64)pb + (uint64)m[k] * (uint64)fa + (uint64)cca;
+    var zb: uint64 = (uint64)wa * (uint64)qa + (uint64)wb * (uint64)qb + (uint64)m[k] * (uint64)fb + (uint64)ccb;
+    if (k > 0) {
+      a[k - 1] = (uint32)za & CRX_I31_MASK;
+      b[k - 1] = (uint32)zb & CRX_I31_MASK;
+    }
+    var tta: uint64 = za >> 31;
+    var ttb: uint64 = zb >> 31;
+    tta = (tta ^ m32) - m32;
+    ttb = (ttb ^ m32) - m32;
+    cca = (int64)tta;
+    ccb = (int64)ttb;
+    k = k + 1;
+  }
+  a[len - 1] = (uint32)cca;
+  b[len - 1] = (uint32)ccb;
+
+  // Now -m <= a < 2 * m and -m <= b < 2 * m (a Montgomery reduction); the
+  // top word may have a 32nd bit set. m may have to be added or subtracted.
+  crx_i31_finish_mod(a, len, m, (uint32)((uint64)cca >> 63));
+  crx_i31_finish_mod(b, len, m, (uint32)((uint64)ccb >> 63));
+}
+
+/// internal: x = x / y mod m, for an odd modulus m (m0i = crx_i31_ninv31(m[1])
+/// ); y is invertible modulo m for a correct result. t is a temporary of 3
+/// times the word count of m (without the header). Returns 1 if y is
+/// invertible (the result is correct), else 0 (x is then not meaningful).
+/// x, y and m have the same size.
+export fn crx_i31_moddiv(x: uint32*, y: uint32*, m: uint32*, m0i: uint32, t: uint32*) -> uint32 {
+  // The algorithm is an extended binary GCD. It keeps four values a, b, u
+  // and v with the invariants
+  //   a * x = y * u mod m
+  //   b * x = y * v mod m
+  // starting from a = y, b = m, u = x, v = 0, and steps:
+  //   - a even: a = a / 2 and u = u / 2 mod m;
+  //   - else b even: b = b / 2 and v = v / 2 mod m;
+  //   - else a > b: a = (a - b) / 2 and u = (u - v) / 2 mod m;
+  //   - else b = (b - a) / 2 and v = (v - u) / 2 mod m.
+  // It stops when a = b, both equal to GCD(y, m); the division succeeds if
+  // that is 1, and the result is u (or v, they are equal).
+  //
+  // Each step shrinks a or b by at least a bit, so 2k - 2 steps are enough
+  // for a k-bit modulus. The decisions only depend on the top and the low
+  // bits of a and b, so each loop iteration below uses the two top words and
+  // the low words of a and b to compute factors pa, pb, qa and qb such that
+  //   a' = (a * pa + b * pb) / 2^31
+  //   b' = (a * qa + b * qb) / 2^31
+  // (exact divisions). The choice is slightly off at times and needs a
+  // correction (if a' < 0, pa and pb are negated), but a and b together
+  // shrink by at least 30 bits per iteration.
+  var len: uint32 = (m[0] + 31) >> 5;
+  var a: uint32* = &t[0];
+  var b: uint32* = &t[len];
+  var u: uint32* = &x[1];
+  var v: uint32* = &t[2 * len];
+  var k: uint32 = 0;
+  while (k < len) {
+    a[k] = y[k + 1];
+    b[k] = m[k + 1];
+    v[k] = 0;
+    k = k + 1;
+  }
+
+  var num: uint32 = ((m[0] - (m[0] >> 5)) << 1) + 30;
+  while (num >= 30) {
+    // Top words of a and b: if j is the highest index with a[j] or b[j]
+    // nonzero (j >= 1), then (a[j] << 31) + a[j - 1], and the same for b. If
+    // a and b are down to a word each, use a[0] and b[0].
+    var c0: uint32 = 0xFFFFFFFF;
+    var c1: uint32 = 0xFFFFFFFF;
+    var a0: uint32 = 0;
+    var a1: uint32 = 0;
+    var b0: uint32 = 0;
+    var b1: uint32 = 0;
+    var j: uint32 = len;
+    while (j > 0) {
+      j = j - 1;
+      var aw: uint32 = a[j];
+      var bw: uint32 = b[j];
+      a0 = a0 ^ ((a0 ^ aw) & c0);
+      a1 = a1 ^ ((a1 ^ aw) & c1);
+      b0 = b0 ^ ((b0 ^ bw) & c0);
+      b1 = b1 ^ ((b1 ^ bw) & c1);
+      c1 = c0;
+      c0 = c0 & ((((aw | bw) + 0x7FFFFFFF) >> 31) - 1);
+    }
+
+    // If c1 = 0, two words were taken for a and b. If c1 != 0 and c0 = 0,
+    // one word was; c1 != 0 and c0 != 0 would mean both integers are zero.
+    a1 = a1 | (a0 & c1);
+    a0 = a0 & (~c1);
+    b1 = b1 | (b0 & c1);
+    b0 = b0 & (~c1);
+    var a_hi: uint64 = ((uint64)a0 << 31) + (uint64)a1;
+    var b_hi: uint64 = ((uint64)b0 << 31) + (uint64)b1;
+    var a_lo: uint32 = a[0];
+    var b_lo: uint32 = b[0];
+
+    // Reduction factors: a' = a * pa + b * pb and b' = a * qa + b * qb, both
+    // multiples of 2^31 and only slightly larger than a and b.
+    var pa: int64 = 1;
+    var pb: int64 = 0;
+    var qa: int64 = 0;
+    var qb: int64 = 1;
+    var i: int32 = 0;
+    while (i < 31) {
+      // At each iteration:
+      //   a = (a - b) / 2 if a odd, b odd, a_hi > b_hi
+      //   b = (b - a) / 2 if a odd, b odd, a_hi <= b_hi
+      //   a = a / 2 if a even
+      //   b = b / 2 if a odd, b even
+      // a_lo and b_lo are multiplied by 2 at each iteration, so a division
+      // by 2 is a non-multiplication.
+
+      // r = 1 if a_hi > b_hi (a 64-bit GT).
+      var rz: uint64 = b_hi - a_hi;
+      var r: uint32 = (uint32)((rz ^ ((a_hi ^ b_hi) & (a_hi ^ rz))) >> 63);
+
+      // cAB: b is subtracted from a; cBA: a is subtracted from b; cA: a is
+      // divided by 2. cAB and cBA are never both 1; if a is not divided by
+      // 2, b is.
+      var oa: uint32 = (a_lo >> i) & 1;
+      var ob: uint32 = (b_lo >> i) & 1;
+      var cAB: uint32 = oa & ob & r;
+      var cBA: uint32 = oa & ob & crx_ct_not(r);
+      var cA: uint32 = cAB | crx_ct_not(oa);
+
+      // Conditional subtractions.
+      a_lo = a_lo - (b_lo & ((uint32)0 - cAB));
+      a_hi = a_hi - (b_hi & ((uint64)0 - (uint64)cAB));
+      pa = pa - (qa & ((int64)0 - (int64)cAB));
+      pb = pb - (qb & ((int64)0 - (int64)cAB));
+      b_lo = b_lo - (a_lo & ((uint32)0 - cBA));
+      b_hi = b_hi - (a_hi & ((uint64)0 - (uint64)cBA));
+      qa = qa - (pa & ((int64)0 - (int64)cBA));
+      qb = qb - (pb & ((int64)0 - (int64)cBA));
+
+      // Shifting.
+      a_lo = a_lo + (a_lo & (cA - 1));
+      pa = pa + (pa & ((int64)cA - 1));
+      pb = pb + (pb & ((int64)cA - 1));
+      a_hi = a_hi ^ ((a_hi ^ (a_hi >> 1)) & ((uint64)0 - (uint64)cA));
+      b_lo = b_lo + (b_lo & ((uint32)0 - cA));
+      qa = qa + (qa & ((int64)0 - (int64)cA));
+      qb = qb + (qb & ((int64)0 - (int64)cA));
+      b_hi = b_hi ^ ((b_hi ^ (b_hi >> 1)) & ((uint64)cA - 1));
+      i = i + 1;
+    }
+
+    // Replace a and b with a' and b'.
+    var rr: uint32 = crx_i31_co_reduce(a, b, len, pa, pb, qa, qb);
+    pa = pa - pa * (int64)((rr & 1) << 1);
+    pb = pb - pb * (int64)((rr & 1) << 1);
+    qa = qa - qa * (int64)(rr & 2);
+    qb = qb - qb * (int64)(rr & 2);
+    crx_i31_co_reduce_mod(u, v, len, pa, pb, qa, qb, &m[1], m0i);
+    num = num - 30;
+  }
+
+  // Now one of the arrays is 0 and the other holds the GCD. If a is 0 then u
+  // is 0 too and v holds the result. It is correct if and only if the GCD
+  // is 1.
+  var rg: uint32 = (a[0] | b[0]) ^ 1;
+  u[0] = u[0] | v[0];
+  k = 1;
+  while (k < len) {
+    rg = rg | a[k] | b[k];
+    u[k] = u[k] | v[k];
+    k = k + 1;
+  }
+  return crx_ct_eq0((int32)rg);
+}

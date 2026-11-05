@@ -1,0 +1,554 @@
+// log/sink: where records go.
+//
+// A sink has a level, a format and a writer. The writer gets whole records
+// as bytes: one call per record when the sink is synchronous, and batches
+// from a background thread once log_sink_async has been called on it.
+//
+// Writers here: stdout/stderr, files with size or daily rotation, an
+// in-memory buffer (for tests), local syslog, journald, and a callback that
+// gets the record itself instead of bytes.
+import "std/mem";
+import "std/env";
+import "std/term";
+import "std/file";
+import "std/time";
+import "std/sync";
+import "std/thread";
+import "codec/core/buf";
+import "level";
+import "field";
+import "format";
+import "unix.linux.mettle" if linux;
+import "unix.other.mettle" if windows;
+import "unix.other.mettle" if macos;
+
+// Queue policies for log_sink_async.
+export const LOG_BLOCK = 0;   // a full queue makes the caller wait
+export const LOG_DROP = 1;    // a full queue drops records below ERROR and counts them
+
+export struct LogSlot {
+  ready: int32;
+  len: int64;
+  cap: int64;
+  data: uint8*;
+}
+
+export struct LogQueue {
+  slots: LogSlot*;
+  mask: int32;
+  policy: int32;
+  tail: int32;          // claims made by producers
+  head: int32;          // next slot the writer reads (writer only)
+  done: int32;          // records written so far
+  dropped: int32;       // records dropped since the last report
+  stop: int32;
+  spaces: SyncSem;
+  items: SyncSem;
+  mu: SyncMutex;
+  cv: SyncCond;
+  batch: CodecBuf;
+  sink: LogSink*;
+}
+
+export struct LogSink {
+  level: int32;
+  fmt: LogFormat;
+  write: fn(rawptr, uint8*, int64) -> int64 with alloc, syscall;
+  ctx: rawptr;
+  on_record: fn(rawptr, LogRecord*) -> int32 with alloc, syscall;   // set: gets records, not bytes
+  packet: bool;                                 // each record is one datagram: never batch
+  queue: LogQueue*;
+  thread: int64;                                // writer thread of an async sink
+  closer: fn(rawptr) -> int32 with alloc, syscall;
+}
+
+// ---- atomics (std/thread has 32-bit ones) ----------------------------------
+
+export fn log__load(p: int32*) -> int32 { return atomic_compare_exchange_i32(p, 0, 0); }
+export fn log__store(p: int32*, v: int32) { atomic_exchange_i32(p, v); }
+export fn log__add(p: int32*, d: int32) -> int32 {
+  var c: int32 = log__load(p);
+  while (true) {
+    var seen: int32 = atomic_compare_exchange_i32(p, c + d, c);
+    if (seen == c) { return c + d; }
+    c = seen;
+  }
+  return c;
+}
+
+// ---- making sinks -----------------------------------------------------------
+
+export fn log_sink_new(kind: int32, flags: int32) -> LogSink* {
+  var s: LogSink* = new LogSink;
+  s->level = LOG_TRACE;
+  s->fmt.kind = kind;
+  s->fmt.flags = flags;
+  s->fmt.facility = LOG_FAC_USER;
+  s->fmt.pid = log__pid();
+  return s;
+}
+
+// Records below level are skipped by this sink (the filter still applies).
+export fn log_sink_level(s: LogSink*, level: int32) { s->level = level; }
+
+// ---- stdout and stderr ------------------------------------------------------
+
+fn log__fd_write(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  var fd: int64 = (int64)ctx;
+  var off: int64 = 0;
+  while (off < n) {
+    var k: int64 = term_os_write(fd, p + off, n - off);
+    if (k <= 0) { return k; }
+    off = off + k;
+  }
+  return off;
+}
+
+// Whether to colour output to fd: METTLE_LOG_STYLE=always|never|auto, then
+// NO_COLOR (no-color.org) and CLICOLOR_FORCE, then TERM=dumb, then whether
+// fd is a terminal.
+export fn log_color_auto(fd: int64) -> bool {
+  var style: string = env_get_or("METTLE_LOG_STYLE", "auto");
+  if (style == "always") { return true; }
+  if (style == "never") { return false; }
+  if (env_get_or("NO_COLOR", "").length > 0) { return false; }
+  var force: string = env_get_or("CLICOLOR_FORCE", "");
+  if (force.length > 0 && force != "0") { return true; }
+  if (env_get_or("TERM", "") == "dumb") { return false; }
+  return term_is_tty(fd);
+}
+
+// Writes to an open descriptor (1 for stdout, 2 for stderr). One write
+// call per record, so lines from different threads never mix.
+export fn log_sink_fd(fd: int64, kind: int32, flags: int32) -> LogSink* {
+  var s: LogSink* = log_sink_new(kind, flags);
+  s->write = &log__fd_write;
+  s->ctx = (rawptr)fd;
+  return s;
+}
+
+// Human text on stderr, coloured when log_color_auto(2) says so.
+export fn log_sink_stderr(kind: int32, flags: int32) -> LogSink* {
+  var f: int32 = flags;
+  if (kind == LOG_FMT_TEXT && log_color_auto(2)) { f = f | LOG_COLOR; }
+  return log_sink_fd(2, kind, f);
+}
+
+// ---- files ------------------------------------------------------------------
+
+export struct LogFile {
+  path: string;        // owned
+  fd: int64;
+  size: int64;
+  max_bytes: int64;    // 0: no size limit
+  keep: int32;         // rotated files kept: path.1 .. path.keep
+  daily: bool;
+  day: int64;          // days since 1970 of the current file (daily)
+  failed: int64;       // write errors
+  mu: SyncMutex;
+}
+
+fn log__copy(s: string) -> string {
+  var out: string;
+  out.chars = (uint8*)malloc((int64)s.length + 1);
+  if (out.chars == 0) { return out; }
+  memcpy(out.chars, s.chars, (int64)s.length);
+  out.chars[s.length] = (uint8)0;
+  out.length = s.length;
+  return out;
+}
+
+fn log__open_file(f: LogFile*, truncate: bool) -> bool {
+  var flags: int32 = FILE_WRITE | FILE_CREATE | FILE_APPEND;
+  if (truncate) { flags = flags | FILE_TRUNCATE; }
+  f->fd = file_open(f->path, flags);
+  if (f->fd < 0) { return false; }
+  f->size = file_size(f->fd);
+  if (f->size < 0) { f->size = 0; }
+  return true;
+}
+
+fn log__today() -> int64 {
+  return time_floor_div(time_unix_ns(), TIME_DAY);
+}
+
+// path.N, as a new string.
+fn log__numbered(path: string, n: int32) -> string {
+  return path + ".{n}";
+}
+
+// Size rotation in the logrotate / spdlog style: path.keep is removed,
+// path.i becomes path.(i+1), path becomes path.1, and a new path starts.
+fn log__rotate_size(f: LogFile*) {
+  file_close(f->fd);
+  f->fd = -1;
+  if (f->keep > 0) {
+    var last: string = log__numbered(f->path, f->keep);
+    file_remove(last);
+    free(last.chars);
+    var i: int32 = f->keep - 1;
+    while (i >= 1) {
+      var from: string = log__numbered(f->path, i);
+      var to: string = log__numbered(f->path, i + 1);
+      file_rename(from, to);
+      free(from.chars);
+      free(to.chars);
+      i = i - 1;
+    }
+    var one: string = log__numbered(f->path, 1);
+    file_rename(f->path, one);
+    free(one.chars);
+  }
+  log__open_file(f, true);
+}
+
+// Daily rotation: path becomes path.YYYY-MM-DD for the day that ended.
+fn log__rotate_day(f: LogFile*, today: int64) {
+  file_close(f->fd);
+  f->fd = -1;
+  var tb: uint8[16];
+  var n: int64 = time_format_date(time_utc(f->day * TIME_DAY), &tb[0], 16);
+  if (n > 0) {
+    var d: string;
+    d.chars = &tb[0];
+    d.length = (uint64)n;
+    var to: string = f->path + "." + d;
+    file_rename(f->path, to);
+    free(to.chars);
+  }
+  f->day = today;
+  log__open_file(f, true);
+}
+
+fn log__file_write(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  var f: LogFile* = (LogFile*)ctx;
+  sync_mutex_lock(&f->mu);
+  if (f->daily) {
+    var today: int64 = log__today();
+    if (today != f->day) { log__rotate_day(f, today); }
+  }
+  if (f->max_bytes > 0 && f->size > 0 && f->size + n > f->max_bytes && f->fd >= 0) {
+    log__rotate_size(f);
+  }
+  if (f->fd < 0 && !log__open_file(f, false)) {
+    f->failed = f->failed + 1;
+    sync_mutex_unlock(&f->mu);
+    return -1;
+  }
+  var off: int64 = 0;
+  while (off < n) {
+    var k: int64 = file_write_at(f->fd, p + off, n - off, f->size);
+    if (k <= 0) { f->failed = f->failed + 1; break; }
+    off = off + k;
+    f->size = f->size + k;
+  }
+  sync_mutex_unlock(&f->mu);
+  return off;
+}
+
+fn log__file_close(ctx: rawptr) -> int32 {
+  var f: LogFile* = (LogFile*)ctx;
+  sync_mutex_lock(&f->mu);
+  if (f->fd >= 0) { file_close(f->fd); }
+  f->fd = -1;
+  sync_mutex_unlock(&f->mu);
+  return 0;
+}
+
+fn log__file_sink(path: string, kind: int32, flags: int32) -> LogSink* {
+  var f: LogFile* = new LogFile;
+  f->path = log__copy(path);
+  f->fd = -1;
+  if (!log__open_file(f, false)) {
+    free(f->path.chars);
+    free(f);
+    return (LogSink*)0;
+  }
+  var s: LogSink* = log_sink_new(kind, flags);
+  s->write = &log__file_write;
+  s->closer = &log__file_close;
+  s->ctx = (rawptr)f;
+  return s;
+}
+
+// Appends to path. When a record would take the file past max_bytes, the
+// file is rotated, keeping keep old files (path.1 is the newest). max_bytes
+// 0 never rotates. Returns 0 if the file cannot be opened.
+export fn log_sink_file(path: string, kind: int32, flags: int32, max_bytes: int64, keep: int32) -> LogSink* {
+  var s: LogSink* = log__file_sink(path, kind, flags);
+  if (s == 0) { return s; }
+  var f: LogFile* = (LogFile*)s->ctx;
+  f->max_bytes = max_bytes;
+  f->keep = keep;
+  return s;
+}
+
+// Appends to path and starts a new file at each UTC midnight; the old one
+// is renamed path.YYYY-MM-DD. Old days are never deleted by the logger.
+export fn log_sink_file_daily(path: string, kind: int32, flags: int32) -> LogSink* {
+  var s: LogSink* = log__file_sink(path, kind, flags);
+  if (s == 0) { return s; }
+  var f: LogFile* = (LogFile*)s->ctx;
+  f->daily = true;
+  f->day = log__today();
+  return s;
+}
+
+// ---- memory (for tests) -----------------------------------------------------
+
+export struct LogMem {
+  buf: CodecBuf;
+  mu: SyncMutex;
+}
+
+fn log__mem_write(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  var m: LogMem* = (LogMem*)ctx;
+  sync_mutex_lock(&m->mu);
+  codec_buf_bytes(&m->buf, p, n);
+  sync_mutex_unlock(&m->mu);
+  return n;
+}
+
+// Keeps every record in memory; read them with log_sink_text.
+export fn log_sink_memory(kind: int32, flags: int32) -> LogSink* {
+  var m: LogMem* = new LogMem;
+  codec_buf_init(&m->buf, 1024);
+  var s: LogSink* = log_sink_new(kind, flags);
+  s->write = &log__mem_write;
+  s->ctx = (rawptr)m;
+  return s;
+}
+
+// Everything a memory sink holds, as a view (valid until the next record).
+export fn log_sink_text(s: LogSink*) -> string {
+  var m: LogMem* = (LogMem*)s->ctx;
+  return codec_buf_view(&m->buf);
+}
+
+export fn log_sink_clear(s: LogSink*) {
+  var m: LogMem* = (LogMem*)s->ctx;
+  sync_mutex_lock(&m->mu);
+  codec_buf_clear(&m->buf);
+  sync_mutex_unlock(&m->mu);
+}
+
+// ---- local sockets: syslog and journald -------------------------------------
+
+export struct LogUnix {
+  fd: int64;
+  path: string;        // owned
+  failed: int64;
+}
+
+fn log__unix_write(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  var u: LogUnix* = (LogUnix*)ctx;
+  var k: int64 = log__unix_send(u->fd, u->path, p, n);
+  if (k < 0) { u->failed = u->failed + 1; }
+  return k;
+}
+
+fn log__unix_closer(ctx: rawptr) -> int32 {
+  var u: LogUnix* = (LogUnix*)ctx;
+  if (u->fd >= 0) { log__unix_close(u->fd); }
+  u->fd = -1;
+  return 0;
+}
+
+// Sends each record as one datagram to the Unix socket at path.
+export fn log_sink_unix(path: string, kind: int32, tag: string) -> LogSink* {
+  var u: LogUnix* = new LogUnix;
+  u->fd = log__unix_open();
+  if (u->fd < 0) { free(u); return (LogSink*)0; }
+  u->path = log__copy(path);
+  var s: LogSink* = log_sink_new(kind, 0);
+  s->fmt.tag = log__copy(tag);
+  s->write = &log__unix_write;
+  s->closer = &log__unix_closer;
+  s->ctx = (rawptr)u;
+  s->packet = true;
+  return s;
+}
+
+// The local syslog daemon on /dev/log. facility is a LOG_FAC_* number.
+export fn log_sink_syslog(tag: string, facility: int32) -> LogSink* {
+  var s: LogSink* = log_sink_unix("/dev/log", LOG_FMT_SYSLOG, tag);
+  if (s != 0) { s->fmt.facility = facility; }
+  return s;
+}
+
+// systemd-journald's native socket. Fields keep their names (upper-cased).
+export fn log_sink_journal(tag: string) -> LogSink* {
+  return log_sink_unix("/run/systemd/journal/socket", LOG_FMT_JOURNAL, tag);
+}
+
+// ---- callback ---------------------------------------------------------------
+
+// Calls cb with each record, unformatted, on the logging thread. The record
+// and everything in it are borrowed for the call.
+export fn log_sink_callback(cb: fn(rawptr, LogRecord*) -> int32 with alloc, syscall, ctx: rawptr) -> LogSink* {
+  var s: LogSink* = log_sink_new(LOG_FMT_TEXT, 0);
+  s->on_record = cb;
+  s->ctx = ctx;
+  return s;
+}
+
+// ---- async queue ------------------------------------------------------------
+//
+// A bounded multi-producer queue of formatted records with one writer
+// thread. Producers format on their own thread, take a free slot with a
+// semaphore and an atomic counter, copy the bytes in and mark the slot
+// ready; no lock is held. The writer drains every ready slot, joins them
+// into one write (unless the sink sends datagrams), and reports dropped
+// records with a WARN record of its own.
+
+fn log__queue_flush_batch(s: LogSink*, q: LogQueue*) {
+  if (q->batch.len > 0) {
+    s->write(s->ctx, q->batch.data, q->batch.len);
+    codec_buf_clear(&q->batch);
+  }
+}
+
+fn log__queue_report_drops(s: LogSink*, q: LogQueue*) {
+  var d: int32 = atomic_exchange_i32(&q->dropped, 0);
+  if (d == 0) { return; }
+  var f: LogField = log_int("dropped", (int64)d);
+  var r: LogRecord;
+  r.level = LOG_WARN;
+  r.target = "log";
+  r.msg = "queue full, records dropped";
+  r.fields = &f;
+  r.n_fields = 1;
+  r.time_ns = time_unix_ns();
+  r.thread = GetCurrentThreadId();
+  var b: CodecBuf;
+  codec_buf_init(&b, 256);
+  log_format(&s->fmt, &r, &b);
+  if (b.err == 0) { s->write(s->ctx, b.data, b.len); }
+  codec_buf_free(&b);
+}
+
+fn log__queue_main(arg: cstring) -> uint32 {
+  var q: LogQueue* = (LogQueue*)arg;
+  var s: LogSink* = q->sink;
+  while (true) {
+    if (!sync_sem_acquire_timeout(&q->items, 100)) {
+      if (log__load(&q->stop) != 0) { break; }
+      log__queue_report_drops(s, q);
+      continue;
+    }
+    var count: int32 = 1;
+    while (count < 1024 && sync_sem_try_acquire(&q->items)) { count = count + 1; }
+    for k in 0..count {
+      var slot: LogSlot* = &q->slots[q->head & q->mask];
+      while (log__load(&slot->ready) == 0) { time_sleep_us(20); }
+      if (s->packet) {
+        s->write(s->ctx, slot->data, slot->len);
+      } else {
+        if (q->batch.len + slot->len > 65536) { log__queue_flush_batch(s, q); }
+        codec_buf_bytes(&q->batch, slot->data, slot->len);
+      }
+      log__store(&slot->ready, 0);
+      q->head = q->head + 1;
+      sync_sem_release(&q->spaces);
+    }
+    log__queue_flush_batch(s, q);
+    log__queue_report_drops(s, q);
+    log__add(&q->done, count);
+    sync_mutex_lock(&q->mu);
+    sync_cond_broadcast(&q->cv);
+    sync_mutex_unlock(&q->mu);
+  }
+  return 0;
+}
+
+// Moves the sink's writing to a background thread with a queue of capacity
+// records (rounded up to a power of two). policy is LOG_BLOCK or LOG_DROP;
+// with LOG_DROP, ERROR and FATAL records still wait rather than be lost.
+// Call before the sink is added. Returns false if it could not start.
+export fn log_sink_async(s: LogSink*, capacity: int32, policy: int32) -> bool {
+  if (s->queue != 0 || s->on_record != 0) { return false; }
+  var cap: int32 = 16;
+  while (cap < capacity && cap < 1048576) { cap = cap * 2; }
+  var q: LogQueue* = new LogQueue;
+  q->slots = (LogSlot*)calloc((int64)cap, sizeof(LogSlot));
+  if (q->slots == 0) { free(q); return false; }
+  q->mask = cap - 1;
+  q->policy = policy;
+  q->spaces.count = cap;
+  codec_buf_init(&q->batch, 65536);
+  q->sink = s;
+  var h: int64 = CreateThread(0, 0, &log__queue_main, (cstring)q, 0, 0);
+  if (h == 0) { return false; }   // q is not freed: the call may still hold it
+  s->thread = h;
+  s->queue = q;
+  return true;
+}
+
+// Records dropped by a LOG_DROP queue and not yet reported.
+export fn log_sink_dropped(s: LogSink*) -> int32 {
+  if (s->queue == 0) { return 0; }
+  return log__load(&s->queue->dropped);
+}
+
+export fn log__queue_push(s: LogSink*, p: uint8*, n: int64, level: int32) {
+  var q: LogQueue* = s->queue;
+  if (!sync_sem_try_acquire(&q->spaces)) {
+    if (q->policy == LOG_DROP && level < LOG_ERROR) {
+      log__add(&q->dropped, 1);
+      return;
+    }
+    sync_sem_acquire(&q->spaces);
+  }
+  var t: int32 = log__add(&q->tail, 1) - 1;
+  var slot: LogSlot* = &q->slots[t & q->mask];
+  if (slot->cap < n) {
+    var c: int64 = 256;
+    while (c < n) { c = c * 2; }
+    var d: uint8* = (uint8*)realloc(slot->data, c);
+    if (d != 0) {
+      slot->data = d;
+      slot->cap = c;
+    }
+  }
+  var len: int64 = n;
+  if (len > slot->cap) { len = 0; }    // out of memory: the record is lost
+  if (len > 0) { memcpy(slot->data, p, len); }
+  slot->len = len;
+  log__store(&slot->ready, 1);
+  sync_sem_release(&q->items);
+}
+
+// Waits until every record queued before this call has been written, or
+// timeout_ms passes (negative waits forever). True when drained.
+export fn log_sink_flush(s: LogSink*, timeout_ms: int64) -> bool {
+  var q: LogQueue* = s->queue;
+  if (q == 0) { return true; }
+  var target: int32 = log__load(&q->tail);
+  var deadline: int64 = time_mono_ms() + timeout_ms;
+  sync_mutex_lock(&q->mu);
+  while (log__load(&q->done) - target < 0) {
+    var wait: int64 = 50;
+    if (timeout_ms >= 0) {
+      var left: int64 = deadline - time_mono_ms();
+      if (left <= 0) { sync_mutex_unlock(&q->mu); return false; }
+      if (left < wait) { wait = left; }
+    }
+    sync_cond_wait_timeout(&q->cv, &q->mu, wait);
+  }
+  sync_mutex_unlock(&q->mu);
+  return true;
+}
+
+// Flushes, stops the writer thread and closes the writer. The sink must
+// already be out of use.
+export fn log_sink_close(s: LogSink*) {
+  var q: LogQueue* = s->queue;
+  if (q != 0) {
+    log_sink_flush(s, 5000);
+    log__store(&q->stop, 1);       // the writer sees it within 100 ms
+    thread_join_infinite(s->thread);
+    thread_close(s->thread);
+    log__queue_report_drops(s, q);
+  }
+  if (s->closer != 0) { s->closer(s->ctx); }
+}

@@ -1,0 +1,114 @@
+// Sealed messages, pure Mettle: XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha
+// on RFC 8439) with the nonce carried inside the output, so callers never
+// handle nonces.
+//
+// Layout of a sealed message: nonce (24 bytes) || ciphertext || tag (16 bytes).
+// The nonce's first byte is the format version (CR_SEAL_VERSION, 1); the
+// other 23 bytes are fresh randomness for every call (184 bits, far beyond
+// any birthday bound). Because the version is part of the nonce, it is
+// authenticated: changing it fails the tag. cr_open rejects any other version
+// as CR_E_VERIFY, so a later format can take version 2. Opening fails closed:
+// on any failure no plaintext is released.
+
+import "crypto/core/status";
+import "crypto/core/types";
+import "crypto/core/util";
+import "crypto/cipher/aead";
+
+/// Bytes a sealed message adds to the plaintext: 24-byte nonce + 16-byte tag.
+/// in: -
+/// returns: 40
+/// owns: nothing
+/// thread: constant
+/// example: var cap: int64 = mlen + CR_SEAL_OVERHEAD;
+export const CR_SEAL_OVERHEAD: int64 = 40;
+
+/// The format version cr_seal writes into the first byte of the nonce, and
+/// the only one cr_open accepts.
+/// in: -
+/// returns: 1
+/// owns: nothing
+/// thread: constant
+/// example: if (box[0] != (uint8)CR_SEAL_VERSION) { not_a_sealed_message(); }
+export const CR_SEAL_VERSION: int32 = 1;
+
+/// Encrypts and authenticates msg under key with a fresh nonce (version
+/// byte + 23 random bytes), and
+/// authenticates (does not encrypt) ad. Output is nonce || ciphertext || tag.
+/// in: out writable for out_cap bytes, out_cap >= mlen + CR_SEAL_OVERHEAD
+///   (out must not overlap msg); out_len, where the sealed length goes;
+///   msg/mlen the plaintext; ad/adlen associated data, authenticated but not
+///   encrypted (0, 0 for none); key
+/// returns: CR_OK and *out_len = mlen + 40; CR_E_ARG (null out/key/out_len,
+///   negative length or capacity, null msg with mlen > 0, null ad with
+///   adlen > 0); CR_E_SPACE if out_cap is too small (nothing written,
+///   *out_len = 0); CR_E_INTERNAL if the kernel random source fails. On every
+///   failure *out_len = 0, and once writing has started the first out_cap
+///   bytes of out are wiped
+/// owns: nothing; the caller owns every buffer and must wipe key and
+///   plaintext when done
+/// thread: any thread (no shared state)
+/// example: cr_seal(&box[0], 128, &blen, m.chars, (int64)m.length, 0, 0, &k);
+export fn cr_seal(out: uint8*, out_cap: int64, out_len: int64*, msg: uint8*, mlen: int64, ad: uint8*, adlen: int64, key: CrKey32*) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || key == 0) { return CR_E_ARG; }
+  if (mlen < 0 || adlen < 0 || out_cap < 0) { return CR_E_ARG; }
+  if ((msg == 0 && mlen > 0) || (ad == 0 && adlen > 0)) { return CR_E_ARG; }
+  if (out_cap - CR_SEAL_OVERHEAD < mlen) { return CR_E_SPACE; }
+  var nonce: CrNonce24;
+  var rc: int32 = cr_aead_nonce(&nonce);
+  if (rc != CR_OK) { return rc; }
+  nonce.b[0] = (uint8)CR_SEAL_VERSION;
+  var i: int64 = 0;
+  while (i < 24) {
+    out[i] = nonce.b[i];
+    i = i + 1;
+  }
+  var clen: int64 = 0;
+  rc = cr_aead_encrypt(&out[24], out_cap - 24, &clen, msg, mlen, ad, adlen, &nonce, key);
+  if (rc != CR_OK) {
+    cr_wipe(out, out_cap);
+    *out_len = 0;
+    return rc;
+  }
+  *out_len = mlen + CR_SEAL_OVERHEAD;
+  return CR_OK;
+}
+
+/// Verifies and decrypts a message produced by cr_seal with the same key and
+/// ad. Fails closed: on every failure *out_len = 0 and out's first out_cap
+/// bytes are wiped.
+/// in: out writable for out_cap bytes, out_cap >= slen - CR_SEAL_OVERHEAD
+///   (out must not overlap sealed); out_len; sealed/slen the sealed message
+///   (nonce || ciphertext || tag); ad/adlen the same associated data given
+///   to cr_seal (0, 0 for none); key
+/// returns: CR_OK and *out_len = slen - 40; CR_E_VERIFY if authentication
+///   fails (wrong key or ad, tampered nonce, ciphertext or tag, slen < 40,
+///   a version other than CR_SEAL_VERSION);
+///   CR_E_SPACE if out_cap < slen - 40; CR_E_ARG (null out/key/sealed/
+///   out_len, negative length or capacity, null ad with adlen > 0)
+/// owns: nothing; the caller owns every buffer and must wipe key and the
+///   plaintext when done
+/// thread: any thread (no shared state)
+/// example: if (cr_open(&pt[0], 128, &plen, &box[0], blen, 0, 0, &k) != CR_OK) { reject(); }
+export fn cr_open(out: uint8*, out_cap: int64, out_len: int64*, sealed: uint8*, slen: int64, ad: uint8*, adlen: int64, key: CrKey32*) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || out_cap < 0) { return CR_E_ARG; }
+  if (sealed == 0 || key == 0 || slen < 0 || adlen < 0 || (ad == 0 && adlen > 0)) {
+    cr_wipe(out, out_cap);
+    return CR_E_ARG;
+  }
+  if (slen < CR_SEAL_OVERHEAD || sealed[0] != (uint8)CR_SEAL_VERSION) {
+    cr_wipe(out, out_cap);
+    return CR_E_VERIFY;
+  }
+  var nonce: CrNonce24;
+  var i: int64 = 0;
+  while (i < 24) {
+    nonce.b[i] = sealed[i];
+    i = i + 1;
+  }
+  return cr_aead_decrypt(out, out_cap, out_len, &sealed[24], slen - 24, ad, adlen, &nonce, key);
+}

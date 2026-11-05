@@ -1,0 +1,927 @@
+// Parser: pattern text -> HIR.
+//
+// The syntax is the one of Rust's regex crate (itself close to RE2): Perl
+// classes, Unicode properties, nested classes with &&, -- and ~~, named
+// groups, inline flags and counted repetition. Backreferences and
+// look-around are refused, because they cannot run in linear time.
+//
+// Like RE2, the parser applies flags as it goes, so the HIR needs no flags.
+
+import "std/mem";
+import "regex/core/vec";
+import "regex/hir/class";
+import "regex/hir/hir";
+import "regex/unicode/ucd";
+
+// Public compile flags.
+export const REGEX_ICASE = 1;       // (?i) case-insensitive
+export const REGEX_MULTILINE = 2;   // (?m) ^ and $ match at line ends
+export const REGEX_DOTALL = 4;      // (?s) . matches \n
+export const REGEX_UNGREEDY = 8;    // (?U) swap greedy and lazy
+export const REGEX_NO_UNICODE = 16; // (?-u) ASCII classes, . and \xFF match bytes
+export const REGEX_VERBOSE = 32;    // (?x) ignore spaces and # comments
+export const REGEX_CRLF = 64;       // (?R) \r\n line ends for ^, $ and .
+export const REGEX_BYTES = 128;     // empty matches may split a UTF-8 sequence
+
+// Parser flag bits: like the public ones, but bit 16 means Unicode is ON.
+const FI = 1;
+const FM = 2;
+const FS = 4;
+const FU = 8;
+const FUNI = 16;
+const FX = 32;
+const FR = 64;
+
+struct RxParser {
+  pat: string;
+  pos: int64;
+  h: RxHir*;
+  flags: int32;
+  err: RegexError*;
+  depth: int32;
+  ok: bool;
+}
+
+// Result of parsing one escape.
+const E_LIT = 1;
+const E_CLASS = 2;
+const E_LOOK = 3;
+
+struct RxEsc {
+  kind: int32;
+  cp: uint32;
+  isbyte: bool;
+  cls: RxClass;
+  bytecls: bool;
+}
+
+fn fail(p: RxParser*, off: int64, code: int32, msg: string) -> int32 {
+  if (p->ok) {
+    p->ok = false;
+    p->err->code = code;
+    p->err->offset = off;
+    p->err->msg = msg;
+  }
+  return -1;
+}
+
+fn at_end(p: RxParser*) -> bool {
+  return p->pos >= (int64)p->pat.length;
+}
+
+fn peek(p: RxParser*) -> int32 {
+  if (p->pos >= (int64)p->pat.length) { return -1; }
+  return (int32)p->pat.chars[p->pos];
+}
+
+fn peek_at(p: RxParser*, k: int64) -> int32 {
+  if (p->pos + k >= (int64)p->pat.length) { return -1; }
+  return (int32)p->pat.chars[p->pos + k];
+}
+
+fn uni(p: RxParser*) -> bool {
+  return (p->flags & FUNI) != 0;
+}
+
+// Decodes one UTF-8 code point at the cursor and moves past it.
+// Returns -1 (and sets the error) for invalid UTF-8.
+fn next_cp(p: RxParser*) -> int64 {
+  var s: uint8* = p->pat.chars;
+  var n: int64 = (int64)p->pat.length;
+  var i: int64 = p->pos;
+  var b0: int64 = (int64)s[i];
+  if (b0 < 0x80) { p->pos = i + 1; return b0; }
+  var need: int64 = 0;
+  var cp: int64 = 0;
+  var min: int64 = 0;
+  if (b0 >= 0xC2 && b0 <= 0xDF) { need = 1; cp = b0 & 0x1F; min = 0x80; }
+  else if (b0 >= 0xE0 && b0 <= 0xEF) { need = 2; cp = b0 & 0x0F; min = 0x800; }
+  else if (b0 >= 0xF0 && b0 <= 0xF4) { need = 3; cp = b0 & 0x07; min = 0x10000; }
+  else { fail(p, i, REGEX_E_SYNTAX, "pattern is not valid UTF-8"); return -1; }
+  if (i + need >= n + 1) { fail(p, i, REGEX_E_SYNTAX, "pattern is not valid UTF-8"); return -1; }
+  for k in 1..need + 1 {
+    var b: int64 = (int64)s[i + k];
+    if ((b & 0xC0) != 0x80) { fail(p, i, REGEX_E_SYNTAX, "pattern is not valid UTF-8"); return -1; }
+    cp = (cp << 6) | (b & 0x3F);
+  }
+  if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+    fail(p, i, REGEX_E_SYNTAX, "pattern is not valid UTF-8");
+    return -1;
+  }
+  p->pos = i + need + 1;
+  return cp;
+}
+
+fn is_ws(c: int32) -> bool {
+  return c == 32 || (c >= 9 && c <= 13);
+}
+
+// In verbose mode, skips white space and # comments.
+fn skip_ws(p: RxParser*) {
+  if ((p->flags & FX) == 0) { return; }
+  while (!at_end(p)) {
+    var c: int32 = peek(p);
+    if (is_ws(c)) { p->pos = p->pos + 1; }
+    else if (c == 35) {
+      while (!at_end(p) && peek(p) != 10) { p->pos = p->pos + 1; }
+    } else { return; }
+  }
+}
+
+fn is_digit(c: int32) -> bool { return c >= 48 && c <= 57; }
+
+fn is_alnum(c: int32) -> bool {
+  return is_digit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+fn hex_val(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  return -1;
+}
+
+fn add_look(p: RxParser*, k: int32) -> int32 {
+  p->h->looks = p->h->looks | ((uint32)1 << (uint32)k);
+  return rx_hir_node(p->h, RX_H_LOOK, k, 0, 0, -1);
+}
+
+// ---- classes ----
+
+fn cls_ascii_word(c: RxClass*) {
+  rx_cls_add(c, 48, 57);
+  rx_cls_add(c, 65, 90);
+  rx_cls_add(c, 95, 95);
+  rx_cls_add(c, 97, 122);
+}
+
+fn cls_ascii_space(c: RxClass*) {
+  rx_cls_add(c, 9, 13);
+  rx_cls_add(c, 32, 32);
+}
+
+fn add_named(c: RxClass*, name: string) {
+  var idx: int32 = rx_ucd_find(name);
+  if (idx >= 0) { rx_cls_add_ucd(c, idx); }
+}
+
+// Perl class \d \s \w (lower case letter `k`), Unicode or ASCII.
+fn perl_class(p: RxParser*, k: int32, c: RxClass*) {
+  if (uni(p)) {
+    if (k == 100) { add_named(c, "perldigit"); }
+    else if (k == 115) { add_named(c, "perlspace"); }
+    else { add_named(c, "perlword"); }
+  } else {
+    if (k == 100) { rx_cls_add(c, 48, 57); }
+    else if (k == 115) { cls_ascii_space(c); }
+    else { cls_ascii_word(c); }
+  }
+  rx_cls_canon(c);
+}
+
+fn max_cp(p: RxParser*) -> uint32 {
+  if (uni(p)) { return RX_MAX_CP; }
+  return 255;
+}
+
+// Loose matching (UAX #44 LM3): drop spaces, '_' and '-', lower-case
+// ASCII, and drop a leading "is".
+fn loose(s: uint8*, n: int64) -> string {
+  var out: uint8* = (uint8*)malloc(n + 8);
+  var w: int64 = 0;
+  for i in 0..n {
+    var c: int32 = (int32)s[i];
+    if (c == 32 || c == 95 || c == 45 || (c >= 9 && c <= 13)) { continue; }
+    if (c >= 65 && c <= 90) { c = c + 32; }
+    out[w] = (uint8)c;
+    w = w + 1;
+  }
+  if (w > 2 && out[0] == 105 && out[1] == 115) {
+    for i in 2..w { out[i - 2] = out[i]; }
+    w = w - 2;
+  }
+  var r: string;
+  r.chars = out;
+  r.length = (uint64)w;
+  return r;
+}
+
+// Looks up prefix + name in the tables; -1 if absent.
+fn find_with(prefix: string, name: string) -> int32 {
+  var full: string = prefix + name;
+  var r: int32 = rx_ucd_find(full);
+  free(full.chars);
+  return r;
+}
+
+// Resolves a Unicode property query (the text inside \p{...}) into c, in
+// the order Rust uses: special names, binary properties, general
+// categories, then scripts. Returns false if unknown.
+fn unicode_prop(p: RxParser*, body: uint8*, n: int64, c: RxClass*) -> bool {
+  var eq: int64 = -1;
+  var negate_value: bool = false;
+  for i in 0..n {
+    if (body[i] == 61 || body[i] == 58) {
+      eq = i;
+      if (body[i] == 61 && i > 0 && body[i - 1] == 33) { negate_value = true; }
+      break;
+    }
+  }
+  var found: int32 = -1;
+  if (eq >= 0) {
+    var kn: int64 = eq;
+    if (negate_value) { kn = eq - 1; }
+    var key: string = loose(body, kn);
+    var val: string = loose(body + eq + 1, n - eq - 1);
+    if (key == "gc" || key == "generalcategory") { found = find_with("gc=", val); }
+    else if (key == "sc" || key == "script") { found = find_with("sc=", val); }
+    else if (key == "scx" || key == "scriptextensions") { found = find_with("scx=", val); }
+    else if (key == "gcb" || key == "graphemeclusterbreak") { found = find_with("gcb=", val); }
+    else if (key == "wb" || key == "wordbreak") { found = find_with("wb=", val); }
+    else if (key == "sb" || key == "sentencebreak") { found = find_with("sb=", val); }
+    free(key.chars);
+    free(val.chars);
+  } else {
+    var name: string = loose(body, n);
+    if (name == "any" || name == "ascii" || name == "assigned") {
+      found = rx_ucd_find(name);
+    }
+    if (found < 0 && !(name == "cf" || name == "sc" || name == "lc")) {
+      // A bare name is a binary property only when it is not a category or
+      // script spelling (those sets live under "gc=" and "sc=").
+      var idx: int32 = rx_ucd_find(name);
+      if (idx >= 0 && idx != find_with("gc=", name) && idx != find_with("sc=", name)) { found = idx; }
+    }
+    if (found < 0) { found = find_with("gc=", name); }
+    if (found < 0) { found = find_with("sc=", name); }
+    free(name.chars);
+  }
+  if (found < 0) { return false; }
+  rx_cls_add_ucd(c, found);
+  rx_cls_canon(c);
+  if (negate_value) { rx_cls_negate(c, RX_MAX_CP); }
+  return true;
+}
+
+// POSIX class name at the cursor ("[:alpha:]"). Returns false if it is not one.
+fn posix_class(p: RxParser*, c: RxClass*) -> bool {
+  var s: uint8* = p->pat.chars;
+  var n: int64 = (int64)p->pat.length;
+  var i: int64 = p->pos + 2;
+  var neg: bool = false;
+  if (i < n && s[i] == 94) { neg = true; i = i + 1; }
+  var start: int64 = i;
+  while (i < n && s[i] >= 97 && s[i] <= 122) { i = i + 1; }
+  if (i + 1 >= n || s[i] != 58 || s[i + 1] != 93) { return false; }
+  var name: string;
+  name.chars = s + start;
+  name.length = (uint64)(i - start);
+  var t: RxClass;
+  if (name == "alnum") { rx_cls_add(&t, 48, 57); rx_cls_add(&t, 65, 90); rx_cls_add(&t, 97, 122); }
+  else if (name == "alpha") { rx_cls_add(&t, 65, 90); rx_cls_add(&t, 97, 122); }
+  else if (name == "ascii") { rx_cls_add(&t, 0, 127); }
+  else if (name == "blank") { rx_cls_add(&t, 9, 9); rx_cls_add(&t, 32, 32); }
+  else if (name == "cntrl") { rx_cls_add(&t, 0, 31); rx_cls_add(&t, 127, 127); }
+  else if (name == "digit") { rx_cls_add(&t, 48, 57); }
+  else if (name == "graph") { rx_cls_add(&t, 33, 126); }
+  else if (name == "lower") { rx_cls_add(&t, 97, 122); }
+  else if (name == "print") { rx_cls_add(&t, 32, 126); }
+  else if (name == "punct") { rx_cls_add(&t, 33, 47); rx_cls_add(&t, 58, 64); rx_cls_add(&t, 91, 96); rx_cls_add(&t, 123, 126); }
+  else if (name == "space") { cls_ascii_space(&t); }
+  else if (name == "upper") { rx_cls_add(&t, 65, 90); }
+  else if (name == "word") { cls_ascii_word(&t); }
+  else if (name == "xdigit") { rx_cls_add(&t, 48, 57); rx_cls_add(&t, 65, 70); rx_cls_add(&t, 97, 102); }
+  else { return false; }
+  rx_cls_canon(&t);
+  if (neg) { rx_cls_negate(&t, max_cp(p)); }
+  rx_cls_union(c, &t);
+  rx_cls_free(&t);
+  p->pos = i + 2;
+  return true;
+}
+
+// Reads hex digits for \x, \u or \U. `fixed` is the digit count without
+// braces.
+fn parse_hex(p: RxParser*, start: int64, fixed: int32, e: RxEsc*) -> bool {
+  var v: int64 = 0;
+  var braced: bool = false;
+  if (peek(p) == 123) {
+    braced = true;
+    p->pos = p->pos + 1;
+    var nd: int32 = 0;
+    while (!at_end(p) && peek(p) != 125) {
+      var d: int32 = hex_val(peek(p));
+      if (d < 0) { fail(p, p->pos, REGEX_E_SYNTAX, "invalid hex digit"); return false; }
+      if (nd >= 8) { fail(p, start, REGEX_E_SYNTAX, "too many hex digits"); return false; }
+      v = v * 16 + (int64)d;
+      nd = nd + 1;
+      p->pos = p->pos + 1;
+    }
+    if (at_end(p)) { fail(p, start, REGEX_E_SYNTAX, "unclosed hex escape"); return false; }
+    if (nd == 0) { fail(p, start, REGEX_E_SYNTAX, "empty hex escape"); return false; }
+    p->pos = p->pos + 1;
+  } else {
+    for k in 0..fixed {
+      var d: int32 = hex_val(peek(p));
+      if (d < 0) { fail(p, start, REGEX_E_SYNTAX, "invalid hex escape"); return false; }
+      v = v * 16 + (int64)d;
+      p->pos = p->pos + 1;
+    }
+  }
+  if (!uni(p) && v >= 0x80 && v <= 0xFF) {
+    e->kind = E_LIT;
+    e->cp = (uint32)v;
+    e->isbyte = true;
+    return true;
+  }
+  if (v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) {
+    fail(p, start, REGEX_E_SYNTAX, "escape is not a valid code point");
+    return false;
+  }
+  e->kind = E_LIT;
+  e->cp = (uint32)v;
+  e->isbyte = false;
+  return true;
+}
+
+// Parses the escape at the cursor (which is on the backslash).
+fn parse_escape(p: RxParser*, in_class: bool, e: RxEsc*) -> bool {
+  var start: int64 = p->pos;
+  p->pos = p->pos + 1;
+  if (at_end(p)) { fail(p, start, REGEX_E_SYNTAX, "incomplete escape at end of pattern"); return false; }
+  var c: int32 = peek(p);
+  e->isbyte = false;
+  e->bytecls = !uni(p);
+  if (c >= 128) {
+    fail(p, start, REGEX_E_SYNTAX, "unrecognized escape");
+    return false;
+  }
+  p->pos = p->pos + 1;
+  e->kind = E_LIT;
+  switch (c) {
+    case 97: { e->cp = 7; return true; }     // \a
+    case 102: { e->cp = 12; return true; }   // \f
+    case 116: { e->cp = 9; return true; }    // \t
+    case 110: { e->cp = 10; return true; }   // \n
+    case 114: { e->cp = 13; return true; }   // \r
+    case 118: { e->cp = 11; return true; }   // \v
+    case 120: { return parse_hex(p, start, 2, e); }  // \x
+    case 117: { return parse_hex(p, start, 4, e); }  // \u
+    case 85: { return parse_hex(p, start, 8, e); }   // \U
+    case 100:
+    case 115:
+    case 119: {
+      e->kind = E_CLASS;
+      perl_class(p, c, &e->cls);
+      return true;
+    }
+    case 68:
+    case 83:
+    case 87: {
+      e->kind = E_CLASS;
+      perl_class(p, c + 32, &e->cls);
+      rx_cls_negate(&e->cls, max_cp(p));
+      return true;
+    }
+    case 112:
+    case 80: {
+      if (!uni(p)) {
+        fail(p, start, REGEX_E_SYNTAX, "Unicode classes need Unicode mode");
+        return false;
+      }
+      var neg: bool = c == 80;
+      var body: uint8* = p->pat.chars + p->pos;
+      var n: int64 = 0;
+      if (peek(p) == 123) {
+        p->pos = p->pos + 1;
+        if (peek(p) == 94) { neg = !neg; p->pos = p->pos + 1; }
+        body = p->pat.chars + p->pos;
+        while (!at_end(p) && peek(p) != 125) { p->pos = p->pos + 1; n = n + 1; }
+        if (at_end(p)) { fail(p, start, REGEX_E_SYNTAX, "unclosed Unicode class"); return false; }
+        p->pos = p->pos + 1;
+      } else {
+        if (at_end(p)) { fail(p, start, REGEX_E_SYNTAX, "incomplete Unicode class"); return false; }
+        n = 1;
+        p->pos = p->pos + 1;
+      }
+      e->kind = E_CLASS;
+      if (!unicode_prop(p, body, n, &e->cls)) {
+        fail(p, start, REGEX_E_SYNTAX, "unknown Unicode property");
+        return false;
+      }
+      if (neg) { rx_cls_negate(&e->cls, RX_MAX_CP); }
+      return true;
+    }
+    default: { }
+  }
+  // Assertions.
+  if (c == 65 || c == 122 || c == 98 || c == 66 || c == 60 || c == 62) {
+    if (in_class) {
+      if (c == 60 || c == 62) { e->cp = (uint32)c; return true; }
+      fail(p, start, REGEX_E_SYNTAX, "assertion not allowed in a class");
+      return false;
+    }
+    e->kind = E_LOOK;
+    var u: bool = uni(p);
+    if (c == 65) { e->cp = (uint32)RX_LOOK_START_TEXT; return true; }
+    if (c == 122) { e->cp = (uint32)RX_LOOK_END_TEXT; return true; }
+    if (c == 66) {
+      if (u) { e->cp = (uint32)RX_LOOK_NOT_WORD_U; } else { e->cp = (uint32)RX_LOOK_NOT_WORD_A; }
+      return true;
+    }
+    if (c == 60) {
+      if (u) { e->cp = (uint32)RX_LOOK_WSTART_U; } else { e->cp = (uint32)RX_LOOK_WSTART_A; }
+      return true;
+    }
+    if (c == 62) {
+      if (u) { e->cp = (uint32)RX_LOOK_WEND_U; } else { e->cp = (uint32)RX_LOOK_WEND_A; }
+      return true;
+    }
+    // \b, maybe \b{start} and friends.
+    if (peek(p) == 123) {
+      var q: int64 = p->pos + 1;
+      var s: uint8* = p->pat.chars;
+      var n2: int64 = (int64)p->pat.length;
+      while (q < n2 && s[q] != 125) { q = q + 1; }
+      if (q < n2) {
+        var w: string;
+  w.chars = s + p->pos + 1;
+  w.length = (uint64)(q - p->pos - 1);
+        var k: int32 = 0;
+        if (w == "start") { k = RX_LOOK_WSTART_A; }
+        else if (w == "end") { k = RX_LOOK_WEND_A; }
+        else if (w == "start-half") { k = RX_LOOK_WSTART_HALF_A; }
+        else if (w == "end-half") { k = RX_LOOK_WEND_HALF_A; }
+        if (k != 0) {
+          if (u) { k = k + 2; }
+          e->cp = (uint32)k;
+          p->pos = q + 1;
+          return true;
+        }
+        // Not a known name: treat "{" as the start of a repetition (\b{2}).
+        var allnum: bool = q > p->pos + 1;
+        for i in p->pos + 1..q {
+          if (!is_digit((int32)s[i]) && s[i] != 44 && s[i] != 32) { allnum = false; }
+        }
+        if (!allnum) {
+          fail(p, start, REGEX_E_SYNTAX, "unknown word boundary kind");
+          return false;
+        }
+      }
+    }
+    if (u) { e->cp = (uint32)RX_LOOK_WORD_U; } else { e->cp = (uint32)RX_LOOK_WORD_A; }
+    return true;
+  }
+  if (is_digit(c)) {
+    fail(p, start, REGEX_E_UNSUPPORTED, "backreferences are not supported");
+    return false;
+  }
+  if (!is_alnum(c)) {
+    e->cp = (uint32)c;
+    return true;
+  }
+  fail(p, start, REGEX_E_SYNTAX, "unrecognized escape");
+  return false;
+}
+
+// Folds a class for (?i), using Unicode or ASCII rules.
+fn fold_class(p: RxParser*, c: RxClass*) {
+  if ((p->flags & FI) == 0) { return; }
+  if (uni(p)) { rx_cls_fold(c); } else { rx_cls_fold_ascii(c); }
+}
+
+
+// One char of a class item: a literal or an escape that is a literal.
+// Returns 0 for a char (in *cp), 1 if the item was a class merged into c,
+// -1 on error.
+fn class_atom(p: RxParser*, c: RxClass*, cp: uint32*) -> int32 {
+  var ch: int32 = peek(p);
+  if (ch == 92) {
+    var e: RxEsc;
+    if (!parse_escape(p, true, &e)) { return -1; }
+    if (e.kind == E_CLASS) {
+      fold_class(p, &e.cls);
+      rx_cls_union(c, &e.cls);
+      rx_cls_free(&e.cls);
+      return 1;
+    }
+    *cp = e.cp;
+    return 0;
+  }
+  var start: int64 = p->pos;
+  var v: int64 = next_cp(p);
+  if (v < 0) { return -1; }
+  if (!uni(p) && v >= 128) {
+    fail(p, start, REGEX_E_SYNTAX, "non-ASCII character in a class without Unicode mode");
+    return -1;
+  }
+  *cp = (uint32)v;
+  return 0;
+}
+
+// A union of items up to ']' or a set operator.
+fn class_union(p: RxParser*, c: RxClass*, first: bool) -> bool {
+  var at_first: bool = first;
+  while (true) {
+    if ((p->flags & FX) != 0) {
+      while (!at_end(p) && is_ws(peek(p))) { p->pos = p->pos + 1; }
+    }
+    if (at_end(p)) { return true; }
+    var ch: int32 = peek(p);
+    if (ch == 93 && !at_first) { return true; }
+    if (!at_first || ch != 93) {
+      var n1: int32 = peek_at(p, 1);
+      if ((ch == 38 && n1 == 38) || (ch == 126 && n1 == 126)) { return true; }
+      if (ch == 45 && n1 == 45) { return true; }
+    }
+    at_first = false;
+    if (ch == 91) {
+      if (peek_at(p, 1) == 58 && posix_class(p, c)) { continue; }
+      var sub: RxClass;
+      if (!parse_bracket(p, &sub)) { rx_cls_free(&sub); return false; }
+      rx_cls_union(c, &sub);
+      rx_cls_free(&sub);
+      continue;
+    }
+    var start: int64 = p->pos;
+    var lo: uint32 = 0;
+    var r: int32 = class_atom(p, c, &lo);
+    if (r < 0) { return false; }
+    if (r == 1) { continue; }
+    if (peek(p) == 45 && peek_at(p, 1) != 93 && peek_at(p, 1) != -1 && peek_at(p, 1) != 45) {
+      p->pos = p->pos + 1;
+      var hi: uint32 = 0;
+      var t: RxClass;
+      var r2: int32 = class_atom(p, &t, &hi);
+      rx_cls_free(&t);
+      if (r2 < 0) { return false; }
+      if (r2 == 1) { fail(p, start, REGEX_E_SYNTAX, "a class cannot end a range"); return false; }
+      if (hi < lo) { fail(p, start, REGEX_E_SYNTAX, "range is out of order"); return false; }
+      var t2: RxClass;
+      rx_cls_add(&t2, lo, hi);
+      fold_class(p, &t2);
+      rx_cls_union(c, &t2);
+      rx_cls_free(&t2);
+    } else {
+      var t3: RxClass;
+      rx_cls_add(&t3, lo, lo);
+      fold_class(p, &t3);
+      rx_cls_union(c, &t3);
+      rx_cls_free(&t3);
+    }
+  }
+  return true;
+}
+
+// Parses "[...]" at the cursor into out.
+fn parse_bracket(p: RxParser*, out: RxClass*) -> bool {
+  var start: int64 = p->pos;
+  p->depth = p->depth + 1;
+  if (p->depth > RX_NEST_LIMIT) { fail(p, start, REGEX_E_NEST, "classes nest too deeply"); return false; }
+  p->pos = p->pos + 1;
+  var neg: bool = false;
+  if (peek(p) == 94) { neg = true; p->pos = p->pos + 1; }
+  if (!class_union(p, out, true)) { return false; }
+  while (true) {
+    if (at_end(p)) { fail(p, start, REGEX_E_SYNTAX, "unclosed character class"); return false; }
+    var ch: int32 = peek(p);
+    if (ch == 93) { break; }
+    var op: int32 = ch;
+    p->pos = p->pos + 2;
+    var rhs: RxClass;
+    if (!class_union(p, &rhs, false)) { rx_cls_free(&rhs); return false; }
+    rx_cls_canon(out);
+    rx_cls_canon(&rhs);
+    if (op == 38) { rx_cls_intersect(out, &rhs); }
+    else if (op == 45) { rx_cls_diff(out, &rhs); }
+    else { rx_cls_symdiff(out, &rhs); }
+    rx_cls_free(&rhs);
+  }
+  p->pos = p->pos + 1;
+  rx_cls_canon(out);
+  fold_class(p, out);
+  if (neg) { rx_cls_negate(out, max_cp(p)); }
+  p->depth = p->depth - 1;
+  return true;
+}
+
+// ---- atoms ----
+
+fn lit_node(p: RxParser*, cp: uint32, isbyte: bool) -> int32 {
+  if ((p->flags & FI) != 0) {
+    var c: RxClass;
+    rx_cls_add(&c, cp, cp);
+    if (isbyte || !uni(p)) { rx_cls_fold_ascii(&c); } else { rx_cls_fold(&c); }
+    if (rx_cls_size(&c) > 1) {
+      return rx_hir_class(p->h, &c, isbyte);
+    }
+    rx_cls_free(&c);
+  }
+  var f: int32 = 0;
+  if (isbyte) { f = 1; }
+  return rx_hir_node(p->h, RX_H_LIT, (int32)cp, 0, f, -1);
+}
+
+fn dot_node(p: RxParser*) -> int32 {
+  var c: RxClass;
+  if (uni(p)) { rx_cls_add(&c, 0, RX_MAX_CP); } else { rx_cls_add(&c, 0, 255); }
+  if ((p->flags & FS) == 0) {
+    var nl: RxClass;
+    rx_cls_add(&nl, 10, 10);
+    if ((p->flags & FR) != 0) { rx_cls_add(&nl, 13, 13); }
+    rx_cls_canon(&nl);
+    rx_cls_diff(&c, &nl);
+    rx_cls_free(&nl);
+  }
+  return rx_hir_class(p->h, &c, !uni(p));
+}
+
+
+fn valid_name_char(c: int32, first: bool) -> bool {
+  if (c == 95 || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) { return true; }
+  if (c >= 128) { return true; }
+  if (first) { return false; }
+  return is_digit(c) || c == 46 || c == 91 || c == 93;
+}
+
+fn parse_group(p: RxParser*) -> int32 {
+  var start: int64 = p->pos;
+  p->pos = p->pos + 1;
+  var saved: int32 = p->flags;
+  var name: string = "";
+  var capture: bool = true;
+  if (peek(p) == 63) {
+    p->pos = p->pos + 1;
+    var c: int32 = peek(p);
+    var c1: int32 = peek_at(p, 1);
+    if (c == 61 || c == 33 || (c == 60 && (c1 == 61 || c1 == 33))) {
+      return fail(p, start, REGEX_E_UNSUPPORTED, "look-around is not supported");
+    }
+    if (c == 80 && (c1 == 61 || c1 == 62)) {
+      return fail(p, start, REGEX_E_UNSUPPORTED, "backreferences are not supported");
+    }
+    if (c == 60 || (c == 80 && c1 == 60)) {
+      if (c == 80) { p->pos = p->pos + 1; }
+      p->pos = p->pos + 1;
+      var ns: int64 = p->pos;
+      var first: bool = true;
+      while (!at_end(p) && peek(p) != 62) {
+        if (!valid_name_char(peek(p), first)) {
+          return fail(p, p->pos, REGEX_E_SYNTAX, "invalid character in group name");
+        }
+        first = false;
+        p->pos = p->pos + 1;
+      }
+      if (at_end(p)) { return fail(p, start, REGEX_E_SYNTAX, "unclosed group name"); }
+      var nlen: int64 = p->pos - ns;
+      if (nlen == 0) { return fail(p, start, REGEX_E_SYNTAX, "empty group name"); }
+      var raw: string;
+  raw.chars = p->pat.chars + ns;
+  raw.length = (uint64)nlen;
+      for i in 1..p->h->names.len {
+        if (p->h->names.data[i] == raw) {
+          return fail(p, ns, REGEX_E_SYNTAX, "duplicate group name");
+        }
+      }
+      var copy: uint8* = (uint8*)malloc(nlen + 1);
+      memcpy(copy, raw.chars, nlen);
+      copy[nlen] = 0;
+      name.chars = copy;
+      name.length = (uint64)nlen;
+      p->pos = p->pos + 1;
+    } else {
+      // Flags: (?flags) or (?flags:...)
+      var f: int32 = p->flags;
+      var neg: bool = false;
+      var any: bool = false;
+      var seen: int32 = 0;
+      var after_neg: bool = false;
+      while (true) {
+        if (at_end(p)) { return fail(p, start, REGEX_E_SYNTAX, "unclosed group"); }
+        var ch: int32 = peek(p);
+        if (ch == 41 || ch == 58) { break; }
+        var bit: int32 = 0;
+        if (ch == 105) { bit = FI; }
+        else if (ch == 109) { bit = FM; }
+        else if (ch == 115) { bit = FS; }
+        else if (ch == 85) { bit = FU; }
+        else if (ch == 117) { bit = FUNI; }
+        else if (ch == 120) { bit = FX; }
+        else if (ch == 82) { bit = FR; }
+        else if (ch == 45) {
+          if (neg) { return fail(p, p->pos, REGEX_E_SYNTAX, "repeated flag negation"); }
+          neg = true;
+          after_neg = true;
+          p->pos = p->pos + 1;
+          continue;
+        } else {
+          return fail(p, p->pos, REGEX_E_SYNTAX, "unrecognized flag");
+        }
+        if ((seen & bit) != 0) { return fail(p, p->pos, REGEX_E_SYNTAX, "duplicate flag"); }
+        seen = seen | bit;
+        any = true;
+        after_neg = false;
+        if (neg) { f = f & ~bit; } else { f = f | bit; }
+        p->pos = p->pos + 1;
+      }
+      if (after_neg) { return fail(p, p->pos, REGEX_E_SYNTAX, "flag negation without a flag"); }
+      var close: int32 = peek(p);
+      p->pos = p->pos + 1;
+      if (close == 41) {
+        if (!any) { return fail(p, start, REGEX_E_SYNTAX, "empty flag group"); }
+        p->flags = f;
+        return -2;
+      }
+      p->flags = f;
+      capture = false;
+    }
+  }
+  p->depth = p->depth + 1;
+  if (p->depth > RX_NEST_LIMIT) { return fail(p, start, REGEX_E_NEST, "groups nest too deeply"); }
+  var idx: int32 = 0;
+  if (capture) {
+    rx_vpush(&p->h->names, name);
+    idx = (int32)(p->h->names.len - 1);
+  }
+  var body: int32 = parse_alt(p);
+  if (body < 0) { return -1; }
+  if (peek(p) != 41) { return fail(p, start, REGEX_E_SYNTAX, "unclosed group"); }
+  p->pos = p->pos + 1;
+  p->depth = p->depth - 1;
+  p->flags = saved;
+  if (!capture) { return body; }
+  return rx_hir_node(p->h, RX_H_CAPTURE, idx, 0, 0, body);
+}
+
+fn parse_atom(p: RxParser*) -> int32 {
+  var c: int32 = peek(p);
+  var start: int64 = p->pos;
+  if (c == 40) { return parse_group(p); }
+  if (c == 91) {
+    var cls: RxClass;
+    if (!parse_bracket(p, &cls)) { rx_cls_free(&cls); return -1; }
+    return rx_hir_class(p->h, &cls, !uni(p));
+  }
+  if (c == 46) { p->pos = p->pos + 1; return dot_node(p); }
+  if (c == 94) {
+    p->pos = p->pos + 1;
+    if ((p->flags & FM) == 0) { return add_look(p, RX_LOOK_START_TEXT); }
+    if ((p->flags & FR) != 0) { return add_look(p, RX_LOOK_START_CRLF); }
+    return add_look(p, RX_LOOK_START_LF);
+  }
+  if (c == 36) {
+    p->pos = p->pos + 1;
+    if ((p->flags & FM) == 0) { return add_look(p, RX_LOOK_END_TEXT); }
+    if ((p->flags & FR) != 0) { return add_look(p, RX_LOOK_END_CRLF); }
+    return add_look(p, RX_LOOK_END_LF);
+  }
+  if (c == 42 || c == 43 || c == 63 || c == 123) {
+    return fail(p, start, REGEX_E_SYNTAX, "repetition operator without anything to repeat");
+  }
+  if (c == 92) {
+    var e: RxEsc;
+    if (!parse_escape(p, false, &e)) { return -1; }
+    if (e.kind == E_LOOK) { return add_look(p, (int32)e.cp); }
+    if (e.kind == E_CLASS) {
+      fold_class(p, &e.cls);
+      return rx_hir_class(p->h, &e.cls, e.bytecls);
+    }
+    return lit_node(p, e.cp, e.isbyte);
+  }
+  var v: int64 = next_cp(p);
+  if (v < 0) { return -1; }
+  return lit_node(p, (uint32)v, false);
+}
+
+// Reads a decimal number; -1 if there is none, -2 if too big.
+fn parse_num(p: RxParser*) -> int64 {
+  if (!is_digit(peek(p))) { return -1; }
+  var v: int64 = 0;
+  while (is_digit(peek(p))) {
+    v = v * 10 + (int64)(peek(p) - 48);
+    if (v > (int64)RX_REPEAT_LIMIT) { v = (int64)RX_REPEAT_LIMIT + 1; }
+    p->pos = p->pos + 1;
+  }
+  return v;
+}
+
+fn skip_spaces(p: RxParser*) {
+  while (peek(p) == 32) { p->pos = p->pos + 1; }
+}
+
+fn parse_quant(p: RxParser*, atom: int32) -> int32 {
+  var a: int32 = atom;
+  while (true) {
+    skip_ws(p);
+    var c: int32 = peek(p);
+    var start: int64 = p->pos;
+    var lo: int64 = 0;
+    var hi: int64 = -1;
+    if (c == 42) { p->pos = p->pos + 1; }
+    else if (c == 43) { lo = 1; p->pos = p->pos + 1; }
+    else if (c == 63) { hi = 1; p->pos = p->pos + 1; }
+    else if (c == 123) {
+      p->pos = p->pos + 1;
+      skip_spaces(p);
+      lo = parse_num(p);
+      if (lo == -1) {
+        if (at_end(p)) { return fail(p, start, REGEX_E_SYNTAX, "unclosed counted repetition"); }
+        return fail(p, start, REGEX_E_SYNTAX, "invalid counted repetition");
+      }
+      skip_spaces(p);
+      hi = lo;
+      if (peek(p) == 44) {
+        p->pos = p->pos + 1;
+        skip_spaces(p);
+        hi = parse_num(p);
+        skip_spaces(p);
+      }
+      if (peek(p) != 125) {
+        if (at_end(p)) { return fail(p, start, REGEX_E_SYNTAX, "unclosed counted repetition"); }
+        return fail(p, start, REGEX_E_SYNTAX, "invalid counted repetition");
+      }
+      p->pos = p->pos + 1;
+      if (lo > (int64)RX_REPEAT_LIMIT || hi > (int64)RX_REPEAT_LIMIT) {
+        return fail(p, start, REGEX_E_SIZE, "repetition count is too big");
+      }
+      if (hi >= 0 && hi < lo) {
+        return fail(p, start, REGEX_E_SYNTAX, "repetition range is out of order");
+      }
+    } else {
+      return a;
+    }
+    var greedy: int32 = 1;
+    if (peek(p) == 63) { greedy = 0; p->pos = p->pos + 1; }
+    if ((p->flags & FU) != 0) { greedy = 1 - greedy; }
+    p->depth = p->depth + 1;
+    if (p->depth > RX_NEST_LIMIT) { return fail(p, start, REGEX_E_NEST, "repetitions nest too deeply"); }
+    a = rx_hir_node(p->h, RX_H_REPEAT, (int32)lo, (int32)hi, greedy, a);
+  }
+  return a;
+}
+
+fn parse_concat(p: RxParser*) -> int32 {
+  var head: int32 = -1;
+  var tail: int32 = -1;
+  var count: int32 = 0;
+  var depth0: int32 = p->depth;
+  while (true) {
+    skip_ws(p);
+    var c: int32 = peek(p);
+    if (c < 0 || c == 124 || c == 41) { break; }
+    var a: int32 = parse_atom(p);
+    if (a == -1) { return -1; }
+    if (a == -2) { continue; }
+    var d: int32 = p->depth;
+    a = parse_quant(p, a);
+    p->depth = d;
+    if (a < 0) { return -1; }
+    if (head < 0) { head = a; } else { p->h->nodes.data[tail].next = a; }
+    tail = a;
+    count = count + 1;
+  }
+  p->depth = depth0;
+  if (count == 0) { return rx_hir_node(p->h, RX_H_EMPTY, 0, 0, 0, -1); }
+  if (count == 1) { return head; }
+  return rx_hir_node(p->h, RX_H_CONCAT, count, 0, 0, head);
+}
+
+fn parse_alt(p: RxParser*) -> int32 {
+  var first: int32 = parse_concat(p);
+  if (first < 0) { return -1; }
+  if (peek(p) != 124) { return first; }
+  var tail: int32 = first;
+  var count: int32 = 1;
+  while (peek(p) == 124) {
+    p->pos = p->pos + 1;
+    var b: int32 = parse_concat(p);
+    if (b < 0) { return -1; }
+    p->h->nodes.data[tail].next = b;
+    tail = b;
+    count = count + 1;
+  }
+  return rx_hir_node(p->h, RX_H_ALT, count, 0, 0, first);
+}
+
+/// Parses pat with public flags (REGEX_*) into h. On failure fills err and
+/// returns false.
+export fn rx_parse(pat: string, flags: int32, h: RxHir*, err: RegexError*) -> bool {
+  var p: RxParser;
+  p.pat = pat;
+  p.pos = 0;
+  p.h = h;
+  p.flags = (flags & 0x6F) | FUNI;
+  if ((flags & REGEX_NO_UNICODE) != 0) { p.flags = p.flags & ~FUNI; }
+  p.err = err;
+  p.depth = 0;
+  p.ok = true;
+  rx_vpush(&h->names, "");
+  var root: int32 = parse_alt(&p);
+  if (root >= 0 && !at_end(&p)) {
+    // Only ')' can stop the top level early.
+    fail(&p, p.pos, REGEX_E_SYNTAX, "unopened group");
+  }
+  if (!p.ok) { return false; }
+  h->root = root;
+  return true;
+}

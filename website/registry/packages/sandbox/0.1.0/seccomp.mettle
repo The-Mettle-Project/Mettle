@@ -1,0 +1,309 @@
+// Seccomp-bpf filters: decide, for each system call, whether the process may
+// make it.
+//
+// Build a filter from a default action and a list of per-call rules, then
+// load it into the current process (or give it to a sandbox policy, which
+// loads it in the child just before exec). The usual shape is an allow-list:
+// default SANDBOX_SC_ERRNO(EPERM) or SANDBOX_SC_KILL, then allow the calls
+// the program needs.
+//
+// The compiled program follows the layout used by libseccomp and Chromium:
+//   1. check the CPU architecture in seccomp_data; a mismatch kills the
+//      process, so a filter for x86-64 cannot be skipped through another ABI;
+//   2. on x86-64, kill any x32 call (number with bit 30 set);
+//   3. a binary search on the call number. Neighbouring numbers with the
+//      same action are merged into one range first (as Chromium's BPF
+//      compiler does), so a long allow-list costs a few comparisons and
+//      stays far below the kernel's 4096-instruction limit.
+// The kernel interface is described in the Linux seccomp_filter documentation
+// (Documentation/userspace-api/seccomp_filter.rst).
+
+import "sys.mettle";
+import "caps.mettle";
+import "std/mem";
+
+export const SANDBOX_SC_KILL: uint32 = 0x80000000;    // kill the whole process
+export const SANDBOX_SC_TRAP: uint32 = 0x00030000;    // send SIGSYS
+export const SANDBOX_SC_LOG: uint32 = 0x7ffc0000;     // allow, and write an audit log line
+export const SANDBOX_SC_ALLOW: uint32 = 0x7fff0000;   // allow
+
+// Fail the call with errno e (1..4095) instead of running it.
+export fn SANDBOX_SC_ERRNO(e: int32) -> uint32 {
+  return (uint32)0x00050000 | ((uint32)e & 0xfff);
+}
+
+const BPF_LD_W_ABS = 0x20;
+const BPF_JEQ_K = 0x15;
+const BPF_JGE_K = 0x35;
+const BPF_JA = 0x05;
+const BPF_RET_K = 0x06;
+const BPF_MAXINSNS = 4096;
+const SECCOMP_SET_MODE_FILTER = 1;
+const SC_DATA_NR = 0;
+const SC_DATA_ARCH = 4;
+
+export struct SandboxBpf { code: uint16; jt: uint8; jf: uint8; k: uint32; }
+struct SbxFprog { len: uint16; pad1: uint16; pad2: uint32; filter: SandboxBpf*; }
+struct SbxScRule { nr: int64; action: uint32; }
+
+// A filter being built. Fill it with the functions below; free it with
+// sandbox_seccomp_free.
+export struct SandboxSeccomp {
+  default_action: uint32;
+  rules: SbxScRule*;
+  nrules: int64;
+  cap: int64;
+  prog: SandboxBpf*;    // set by sandbox_seccomp_compile
+  prog_len: int64;
+  failed: int64;        // first error seen while adding rules, or 0
+}
+
+export fn sandbox_seccomp_init(f: SandboxSeccomp*, default_action: uint32) {
+  var blank: SandboxSeccomp;
+  *f = blank;
+  f->default_action = default_action;
+}
+
+export fn sandbox_seccomp_free(f: SandboxSeccomp*) {
+  if (f->rules != (SbxScRule*)0) { free(f->rules); }
+  if (f->prog != (SandboxBpf*)0) { free(f->prog); }
+  var d: uint32 = f->default_action;
+  sandbox_seccomp_init(f, d);
+}
+
+// Adds a rule for one call number. A later rule for the same number replaces
+// an earlier one. Returns 0 or -errno.
+export fn sandbox_seccomp_rule(f: SandboxSeccomp*, nr: int64, action: uint32) -> int64 {
+  if (nr < 0 || nr >= 0x40000000) {
+    if (f->failed == 0) { f->failed = -SANDBOX_EINVAL; }
+    return -SANDBOX_EINVAL;
+  }
+  for i in 0..f->nrules {
+    if (f->rules[i].nr == nr) { f->rules[i].action = action; return 0; }
+  }
+  if (f->nrules == f->cap) {
+    var nc: int64 = 64;
+    if (f->cap > 0) { nc = f->cap * 2; }
+    var p: SbxScRule* = (SbxScRule*)realloc(f->rules, nc * sizeof(SbxScRule));
+    if (p == (SbxScRule*)0) {
+      if (f->failed == 0) { f->failed = -SANDBOX_ENOMEM; }
+      return -SANDBOX_ENOMEM;
+    }
+    f->rules = p;
+    f->cap = nc;
+  }
+  f->rules[f->nrules].nr = nr;
+  f->rules[f->nrules].action = action;
+  f->nrules = f->nrules + 1;
+  return 0;
+}
+
+// Adds a rule by call name. A name this CPU does not have (for example
+// "open" on AArch64) is skipped and returns 1; otherwise 0 or -errno.
+export fn sandbox_seccomp_rule_name(f: SandboxSeccomp*, name: string, action: uint32) -> int64 {
+  var nr: int64 = sandbox_syscall_number(name);
+  if (nr < 0) { return 1; }
+  return sandbox_seccomp_rule(f, nr, action);
+}
+
+// Allows every named call. Names this CPU lacks are skipped. Returns 0 or -errno.
+export fn sandbox_seccomp_allow(f: SandboxSeccomp*, names: string[..]) -> int64 {
+  for n in names {
+    var r: int64 = sandbox_seccomp_rule_name(f, n, SANDBOX_SC_ALLOW);
+    if (r < 0) { return r; }
+  }
+  return 0;
+}
+
+// Gives every named call the same action (for a deny-list). Returns 0 or -errno.
+export fn sandbox_seccomp_set(f: SandboxSeccomp*, action: uint32, names: string[..]) -> int64 {
+  for n in names {
+    var r: int64 = sandbox_seccomp_rule_name(f, n, action);
+    if (r < 0) { return r; }
+  }
+  return 0;
+}
+
+// Allows the calls a plain single-process program needs to run, read and
+// write files it already may open, use memory and threads, and exit. No
+// sockets, no mounts, no ptrace, no namespace or kernel-module calls.
+export fn sandbox_seccomp_allow_basic(f: SandboxSeccomp*) -> int64 {
+  return sandbox_seccomp_allow(f,
+    "read", "write", "readv", "writev", "pread64", "pwrite64", "lseek", "close",
+    "open", "openat", "openat2", "creat", "stat", "fstat", "lstat", "newfstatat", "statx",
+    "access", "faccessat", "faccessat2", "readlink", "readlinkat", "getcwd", "chdir", "fchdir",
+    "getdents64", "mkdir", "mkdirat", "unlink", "unlinkat", "rename", "renameat", "renameat2",
+    "ftruncate", "fsync", "fdatasync", "fcntl", "ioctl", "flock", "umask",
+    "dup", "dup2", "dup3", "pipe", "pipe2", "poll", "ppoll", "select", "pselect6",
+    "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait", "eventfd2",
+    "mmap", "munmap", "mprotect", "mremap", "madvise", "brk",
+    "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sigaltstack",
+    "futex", "set_tid_address", "set_robust_list", "rseq", "arch_prctl",
+    "sched_yield", "sched_getaffinity", "nanosleep", "clock_nanosleep",
+    "clock_gettime", "clock_getres", "gettimeofday", "getrandom",
+    "getpid", "gettid", "getppid", "getuid", "geteuid", "getgid", "getegid", "getgroups",
+    "uname", "prlimit64", "getrlimit", "sysinfo",
+    "execve", "wait4", "exit", "exit_group");
+}
+
+// Allows the extra calls needed to start threads and child processes.
+export fn sandbox_seccomp_allow_process(f: SandboxSeccomp*) -> int64 {
+  return sandbox_seccomp_allow(f, "clone", "clone3", "fork", "vfork", "execveat",
+    "kill", "tgkill", "waitid", "setsid", "setpgid", "getpgid", "getsid");
+}
+
+fn sbx_sc_sort(r: SbxScRule*, n: int64) {
+  // Insertion sort: rule lists are short and this runs once.
+  for i in 1..n {
+    var x: SbxScRule = r[i];
+    var j: int64 = i - 1;
+    while (j >= 0 && r[j].nr > x.nr) {
+      r[j + 1] = r[j];
+      j = j - 1;
+    }
+    r[j + 1] = x;
+  }
+}
+
+struct SbxEmit { p: SandboxBpf*; n: int64; cap: int64; err: int64; }
+
+fn sbx_emit(e: SbxEmit*, code: int32, jt: int64, jf: int64, k: uint32) -> int64 {
+  if (e->n >= e->cap) { e->err = -SANDBOX_E2BIG; return e->n; }
+  if (jt < 0 || jt > 255 || jf < 0 || jf > 255) { e->err = -SANDBOX_E2BIG; return e->n; }
+  e->p[e->n].code = (uint16)code;
+  e->p[e->n].jt = (uint8)jt;
+  e->p[e->n].jf = (uint8)jf;
+  e->p[e->n].k = k;
+  e->n = e->n + 1;
+  return e->n - 1;
+}
+
+// A run of call numbers [lo, next range's lo) that share one action.
+struct SbxScRange { lo: uint32; action: uint32; }
+
+// Emits a search over ranges [a, b). The accumulator holds the call number,
+// which is known to be at least ranges[a].lo. Every path ends in a return.
+fn sbx_sc_tree(e: SbxEmit*, g: SbxScRange*, a: int64, b: int64) {
+  if (b - a == 1) {
+    sbx_emit(e, BPF_RET_K, 0, 0, g[a].action);
+    return;
+  }
+  var mid: int64 = a + (b - a) / 2;
+  // nr >= g[mid].lo: fall through to the jump into the upper half;
+  // otherwise skip that jump and go on with the lower half.
+  sbx_emit(e, BPF_JGE_K, 0, 1, g[mid].lo);
+  var ja: int64 = sbx_emit(e, BPF_JA, 0, 0, 0);
+  sbx_sc_tree(e, g, a, mid);
+  if (e->err == 0) { e->p[ja].k = (uint32)(e->n - ja - 1); }
+  sbx_sc_tree(e, g, mid, b);
+}
+
+// Merges the sorted rules and the gaps between them (which get the default)
+// into ranges. Returns the count; g needs room for 2 * nrules + 1.
+fn sbx_sc_ranges(f: SandboxSeccomp*, g: SbxScRange*) -> int64 {
+  var n: int64 = 0;
+  var next: int64 = 0;   // first number not yet covered
+  for i in 0..f->nrules {
+    var nr: int64 = f->rules[i].nr;
+    if (nr > next && (n == 0 || g[n - 1].action != f->default_action)) {
+      g[n].lo = (uint32)next;
+      g[n].action = f->default_action;
+      n = n + 1;
+    }
+    if (n == 0 || g[n - 1].action != f->rules[i].action) {
+      g[n].lo = (uint32)nr;
+      g[n].action = f->rules[i].action;
+      n = n + 1;
+    }
+    next = nr + 1;
+  }
+  if (n == 0 || g[n - 1].action != f->default_action) {
+    g[n].lo = (uint32)next;
+    g[n].action = f->default_action;
+    n = n + 1;
+  }
+  return n;
+}
+
+// Turns the rules into a BPF program (kept in f->prog). Returns 0 or -errno;
+// -SANDBOX_E2BIG if it would pass the kernel's 4096-instruction limit.
+export fn sandbox_seccomp_compile(f: SandboxSeccomp*) -> int64 {
+  if (f->failed != 0) { return f->failed; }
+  if (f->prog != (SandboxBpf*)0) { free(f->prog); f->prog = (SandboxBpf*)0; f->prog_len = 0; }
+  var e: SbxEmit;
+  e.cap = BPF_MAXINSNS;
+  e.p = (SandboxBpf*)malloc(e.cap * sizeof(SandboxBpf));
+  if (e.p == (SandboxBpf*)0) { return -SANDBOX_ENOMEM; }
+  sbx_sc_sort(f->rules, f->nrules);
+
+  sbx_emit(&e, BPF_LD_W_ABS, 0, 0, SC_DATA_ARCH);
+  sbx_emit(&e, BPF_JEQ_K, 1, 0, SBX_AUDIT_ARCH);
+  sbx_emit(&e, BPF_RET_K, 0, 0, SANDBOX_SC_KILL);
+  sbx_emit(&e, BPF_LD_W_ABS, 0, 0, SC_DATA_NR);
+  if (SBX_HAS_X32 != 0) {
+    sbx_emit(&e, BPF_JGE_K, 0, 1, 0x40000000);
+    sbx_emit(&e, BPF_RET_K, 0, 0, SANDBOX_SC_KILL);
+  }
+  var g: SbxScRange* = (SbxScRange*)malloc((2 * f->nrules + 1) * sizeof(SbxScRange));
+  if (g == (SbxScRange*)0) { free(e.p); return -SANDBOX_ENOMEM; }
+  var ng: int64 = sbx_sc_ranges(f, g);
+  sbx_sc_tree(&e, g, 0, ng);
+  free(g);
+  if (e.err != 0) {
+    free(e.p);
+    return e.err;
+  }
+  f->prog = e.p;
+  f->prog_len = e.n;
+  return 0;
+}
+
+// Runs the compiled program the way the kernel would, for one call number on
+// this CPU. Returns the action. Used by the tests and handy for checking a
+// policy without loading it.
+export fn sandbox_seccomp_eval(f: SandboxSeccomp*, nr: int64) -> uint32 {
+  var acc: uint32 = 0;
+  var pc: int64 = 0;
+  while (pc >= 0 && pc < f->prog_len) {
+    var i: SandboxBpf = f->prog[pc];
+    pc = pc + 1;
+    switch ((int32)i.code) {
+      case BPF_LD_W_ABS: {
+        acc = (uint32)nr;
+        if (i.k == SC_DATA_ARCH) { acc = SBX_AUDIT_ARCH; }
+      }
+      case BPF_JEQ_K: {
+        if (acc == i.k) { pc = pc + (int64)i.jt; } else { pc = pc + (int64)i.jf; }
+      }
+      case BPF_JGE_K: {
+        if (acc >= i.k) { pc = pc + (int64)i.jt; } else { pc = pc + (int64)i.jf; }
+      }
+      case BPF_JA: { pc = pc + (int64)i.k; }
+      case BPF_RET_K: { return i.k; }
+      default: { return SANDBOX_SC_KILL; }
+    }
+  }
+  return SANDBOX_SC_KILL;
+}
+
+// Loads the compiled program into the current process. Sets no_new_privs
+// first, which the kernel requires of unprivileged callers. A loaded filter
+// cannot be removed, and it is inherited by children and kept across exec.
+// Returns 0 or -errno.
+export fn sandbox_seccomp_load(f: SandboxSeccomp*) -> int64 {
+  if (f->prog == (SandboxBpf*)0) {
+    var r: int64 = sandbox_seccomp_compile(f);
+    if (r < 0) { return r; }
+  }
+  return sbx_seccomp_install(f->prog, f->prog_len);
+}
+
+// The no-allocation part of loading, for a freshly cloned child.
+export fn sbx_seccomp_install(prog: SandboxBpf*, len: int64) -> int64 {
+  var r: int64 = sandbox_no_new_privs();
+  if (r < 0) { return r; }
+  var fp: SbxFprog;
+  fp.len = (uint16)len;
+  fp.filter = prog;
+  return syscall(SBX_NR_SECCOMP, SECCOMP_SET_MODE_FILTER, 0, &fp);
+}

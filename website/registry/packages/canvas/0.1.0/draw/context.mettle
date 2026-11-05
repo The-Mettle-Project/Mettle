@@ -1,0 +1,409 @@
+// CanvasContext: draws onto a pixmap with a current transform and clip,
+// kept on a save/restore stack like the HTML canvas.
+//
+//   var ctx: CanvasContext;
+//   canvas_init(&ctx, &pm);
+//   var paint: CanvasPaint = canvas_paint_hex(0x3366ccff);
+//   canvas_fill_path(&ctx, &path, &paint, CANVAS_NONZERO);
+//   canvas_free(&ctx);
+
+import "std/mem";
+import "../core/base";
+import "../core/color";
+import "../core/pixmap";
+import "../geom/transform";
+import "../geom/path";
+import "../geom/flatten";
+import "../geom/stroke";
+import "../geom/dash";
+import "../raster/coverage";
+import "../paint/paint";
+import "../paint/pattern";
+import "../paint/gradient";
+import "blit";
+
+struct State {
+  m: CanvasTransform;
+  mask: uint8*;        // clip coverage (width * height bytes), or 0 for none
+  mask_owned: bool;    // this level made the mask and frees it
+  x0: int32; y0: int32; x1: int32; y1: int32;   // the clip box in pixels
+}
+
+export struct CanvasContext {
+  pm: CanvasPixmap*;
+  states: State*;
+  nstates: int32;
+  cap_states: int32;
+  tol: float32;
+  poly: CanvasPoly;
+  poly2: CanvasPoly;
+  outline: CanvasPoly;
+  raster: CanvasRaster;
+  stroker: CanvasStroker;
+  blit: CanvasBlit;
+  tmp: CanvasPath;
+}
+
+/// Starts drawing on pm, with no transform and no clip.
+export fn canvas_init(ctx: CanvasContext*, pm: CanvasPixmap*) -> int32 {
+  memset(ctx, 0, sizeof(CanvasContext));
+  if (pm == 0 || pm->data == 0) { return CANVAS_E_ARG; }
+  ctx->pm = pm;
+  ctx->states = (State*)calloc(8, sizeof(State));
+  if (ctx->states == 0) { return CANVAS_E_MEM; }
+  ctx->cap_states = 8;
+  ctx->nstates = 1;
+  var s: State* = ctx->states;
+  s->m = canvas_identity();
+  s->x1 = pm->width;
+  s->y1 = pm->height;
+  ctx->tol = 0.1;
+  return CANVAS_OK;
+}
+
+/// Frees everything the context holds (not the pixmap).
+export fn canvas_free(ctx: CanvasContext*) {
+  if (ctx->states != 0) {
+    for i in 0..ctx->nstates {
+      if (ctx->states[i].mask_owned && ctx->states[i].mask != 0) { free(ctx->states[i].mask); }
+    }
+    free(ctx->states);
+  }
+  canvas_poly_free(&ctx->poly);
+  canvas_poly_free(&ctx->poly2);
+  canvas_poly_free(&ctx->outline);
+  canvas_raster_free(&ctx->raster);
+  canvas_stroker_free(&ctx->stroker);
+  canvas_blit_free(&ctx->blit);
+  canvas_path_free(&ctx->tmp);
+  memset(ctx, 0, sizeof(CanvasContext));
+}
+
+fn top(ctx: CanvasContext*) -> State* { return ctx->states + (ctx->nstates - 1); }
+
+/// Pushes a copy of the transform and clip.
+export fn canvas_save(ctx: CanvasContext*) -> int32 {
+  if (ctx->states == 0) { return CANVAS_E_ARG; }
+  if (ctx->nstates >= ctx->cap_states) {
+    var nc: int32 = ctx->cap_states * 2;
+    var p: State* = (State*)realloc(ctx->states, (int64)nc * sizeof(State));
+    if (p == 0) { return CANVAS_E_MEM; }
+    ctx->states = p;
+    ctx->cap_states = nc;
+  }
+  ctx->states[ctx->nstates] = ctx->states[ctx->nstates - 1];
+  ctx->states[ctx->nstates].mask_owned = false;
+  ctx->nstates = ctx->nstates + 1;
+  return CANVAS_OK;
+}
+
+/// Pops back to the last save. Does nothing with no save left.
+export fn canvas_restore(ctx: CanvasContext*) {
+  if (ctx->states == 0 || ctx->nstates <= 1) { return; }
+  var s: State* = top(ctx);
+  if (s->mask_owned && s->mask != 0) { free(s->mask); }
+  ctx->nstates = ctx->nstates - 1;
+}
+
+/// How many saves are open.
+export fn canvas_save_count(ctx: CanvasContext*) -> int32 { return ctx->nstates - 1; }
+
+export fn canvas_get_transform(ctx: CanvasContext*) -> CanvasTransform { return top(ctx)->m; }
+export fn canvas_set_transform(ctx: CanvasContext*, m: CanvasTransform) { top(ctx)->m = m; }
+
+/// Multiplies the current transform by m (m applies first).
+export fn canvas_transform(ctx: CanvasContext*, m: CanvasTransform) {
+  var s: State* = top(ctx);
+  s->m = canvas_t_mul(s->m, m);
+}
+
+export fn canvas_translate(ctx: CanvasContext*, tx: float32, ty: float32) { canvas_transform(ctx, canvas_translation(tx, ty)); }
+export fn canvas_scale(ctx: CanvasContext*, sx: float32, sy: float32) { canvas_transform(ctx, canvas_scaling(sx, sy)); }
+export fn canvas_rotate(ctx: CanvasContext*, angle: float32) { canvas_transform(ctx, canvas_rotation(angle)); }
+
+/// The flattening tolerance in device pixels (0.1 by default). Smaller
+/// is smoother and slower.
+export fn canvas_set_tolerance(ctx: CanvasContext*, tol: float32) {
+  if (tol > 0.001 && tol < 100.0) { ctx->tol = tol; }
+}
+
+// The device box of poly ctx->poly, cut to the clip box. False when empty.
+fn draw_box(ctx: CanvasContext*, q: CanvasPoly*, bx0: int32*, by0: int32*, bx1: int32*, by1: int32*) -> bool {
+  var s: State* = top(ctx);
+  if (q->n == 0) { return false; }
+  var r: CanvasRect = canvas_rect_empty();
+  for i in 0..q->n {
+    var x: float32 = q->xy[i * 2];
+    var y: float32 = q->xy[i * 2 + 1];
+    if (!canvas_finite(x) || !canvas_finite(y)) { return false; }
+    canvas_rect_add(&r, x, y);
+  }
+  var x0: float32 = canvas_maxf(r.x0, (float32)s->x0);
+  var y0: float32 = canvas_maxf(r.y0, (float32)s->y0);
+  var x1: float32 = canvas_minf(r.x1, (float32)s->x1);
+  var y1: float32 = canvas_minf(r.y1, (float32)s->y1);
+  if (!(x0 < x1) || !(y0 < y1)) { return false; }
+  *bx0 = canvas_floor_i(x0);
+  *by0 = canvas_floor_i(y0);
+  *bx1 = canvas_ceil_i(x1);
+  *by1 = canvas_ceil_i(y1);
+  return true;
+}
+
+// Fills the device-space poly q with paint p.
+fn fill_poly(ctx: CanvasContext*, q: CanvasPoly*, p: CanvasPaint*, rule: int32) -> int32 {
+  var s: State* = top(ctx);
+  var bx0: int32 = 0; var by0: int32 = 0; var bx1: int32 = 0; var by1: int32 = 0;
+  if (!draw_box(ctx, q, &bx0, &by0, &bx1, &by1)) { return CANVAS_OK; }
+  if (!canvas_blit_setup(&ctx->blit, ctx->pm, s->mask, p, s->m)) {
+    if (ctx->blit.colors == 0) { return CANVAS_E_MEM; }
+    return CANVAS_OK;
+  }
+  canvas_raster_edges(&ctx->raster, q, bx0, by0, bx1, by1);
+  if (!canvas_raster_fill(&ctx->raster, bx0, by0, bx1, by1, rule, p->anti_alias, &canvas_blit_span, (rawptr)&ctx->blit)) {
+    return CANVAS_E_MEM;
+  }
+  return CANVAS_OK;
+}
+
+/// Fills a path with a fill rule (CANVAS_NONZERO or CANVAS_EVENODD).
+export fn canvas_fill_path(ctx: CanvasContext*, path: CanvasPath*, p: CanvasPaint*, rule: int32) -> int32 {
+  if (ctx->pm == 0 || path == 0 || p == 0) { return CANVAS_E_ARG; }
+  if (!canvas_flatten(path, top(ctx)->m, ctx->tol, &ctx->poly)) {
+    if (ctx->poly.failed) { return CANVAS_E_MEM; }
+    return CANVAS_OK;
+  }
+  return fill_poly(ctx, &ctx->poly, p, rule);
+}
+
+// The stroke outline of path in device space, in ctx->outline.
+fn outline(ctx: CanvasContext*, path: CanvasPath*, st: CanvasStroke*) -> int32 {
+  var m: CanvasTransform = top(ctx)->m;
+  var w: float32 = st->width;
+  if (!canvas_finite(w) || w < 0.0) { return CANVAS_E_ARG; }
+  canvas_poly_reset(&ctx->outline);
+  var hair: bool = w == 0.0;
+  var scale: float32 = canvas_t_max_scale(m);
+  if (!(scale > 0.0) || !canvas_finite(scale)) { return CANVAS_OK; }
+  // hairlines: one device pixel wide, stroked in device space
+  var src: CanvasTransform = canvas_identity();
+  var tol: float32 = ctx->tol / scale;
+  var dk: float32 = 1.0;
+  if (hair) { src = m; tol = ctx->tol; w = 1.0; dk = canvas_t_mean_scale(m); }
+  var dashed: bool = canvas_dash_ok(st->dashes, st->ndashes);
+  // dash lengths are measured along the polyline, which is a little shorter
+  // than the curve; a finer polyline keeps dash ends in place
+  var ftol: float32 = tol;
+  if (dashed) { ftol = tol * 0.1; }
+  if (!canvas_flatten(path, src, ftol, &ctx->poly)) {
+    if (ctx->poly.failed) { return CANVAS_E_MEM; }
+    return CANVAS_OK;
+  }
+  var q: CanvasPoly* = &ctx->poly;
+  if (dashed) {
+    // dashes need only be made near the clip box, in the space dashing
+    // happens in (user space, or device space for hairlines)
+    var s: State* = top(ctx);
+    var cull: CanvasRect = canvas_rect_empty();
+    var mg: float32 = w * 0.5 * canvas_maxf(st->miter_limit, 1.5) + 2.0;
+    var inv: CanvasTransform = canvas_identity();
+    var use_cull: bool = true;
+    if (!hair) { use_cull = canvas_t_invert(m, &inv); }
+    var cx0: float32 = (float32)s->x0 - 2.0; var cy0: float32 = (float32)s->y0 - 2.0;
+    var cx1: float32 = (float32)s->x1 + 2.0; var cy1: float32 = (float32)s->y1 + 2.0;
+    var c0: CanvasPoint = canvas_t_point(inv, cx0, cy0);
+    var c1: CanvasPoint = canvas_t_point(inv, cx1, cy0);
+    var c2: CanvasPoint = canvas_t_point(inv, cx0, cy1);
+    var c3: CanvasPoint = canvas_t_point(inv, cx1, cy1);
+    canvas_rect_add(&cull, c0.x, c0.y);
+    canvas_rect_add(&cull, c1.x, c1.y);
+    canvas_rect_add(&cull, c2.x, c2.y);
+    canvas_rect_add(&cull, c3.x, c3.y);
+    cull.x0 = cull.x0 - mg; cull.y0 = cull.y0 - mg;
+    cull.x1 = cull.x1 + mg; cull.y1 = cull.y1 + mg;
+    var cp: CanvasRect* = &cull;
+    if (!use_cull) { cp = (CanvasRect*)0; }
+    if (!canvas_dash_poly(&ctx->poly, st->dashes, st->ndashes, st->dash_offset, dk, cp, &ctx->poly2)) {
+      if (ctx->poly2.failed) { return CANVAS_E_MEM; }
+      return CANVAS_E_LIMIT;    // more than a million dashes
+    }
+    q = &ctx->poly2;
+  }
+  if (!canvas_stroke_poly(&ctx->stroker, q, st, w, tol, &ctx->outline)) {
+    if (ctx->outline.n > CANVAS_MAX_OUTLINE) { canvas_poly_reset(&ctx->outline); return CANVAS_E_LIMIT; }
+    return CANVAS_E_MEM;
+  }
+  if (!hair) {
+    var o: CanvasPoly* = &ctx->outline;
+    for i in 0..o->n {
+      var pt: CanvasPoint = canvas_t_point(m, o->xy[i * 2], o->xy[i * 2 + 1]);
+      o->xy[i * 2] = pt.x;
+      o->xy[i * 2 + 1] = pt.y;
+    }
+  }
+  return CANVAS_OK;
+}
+
+/// Strokes a path.
+export fn canvas_stroke_path(ctx: CanvasContext*, path: CanvasPath*, st: CanvasStroke*, p: CanvasPaint*) -> int32 {
+  if (ctx->pm == 0 || path == 0 || st == 0 || p == 0) { return CANVAS_E_ARG; }
+  var rc: int32 = outline(ctx, path, st);
+  if (rc != CANVAS_OK) { return rc; }
+  return fill_poly(ctx, &ctx->outline, p, CANVAS_NONZERO);
+}
+
+/// The outline of a stroke as a path (user space), for hit testing or
+/// further work. dst is cleared first.
+export fn canvas_stroke_to_path(path: CanvasPath*, st: CanvasStroke*, tol: float32, dst: CanvasPath*) -> int32 {
+  var q: CanvasPoly;
+  var q2: CanvasPoly;
+  var o: CanvasPoly;
+  var k: CanvasStroker;
+  memset(&q, 0, sizeof(CanvasPoly));
+  memset(&q2, 0, sizeof(CanvasPoly));
+  memset(&o, 0, sizeof(CanvasPoly));
+  memset(&k, 0, sizeof(CanvasStroker));
+  canvas_path_reset(dst);
+  var rc: int32 = CANVAS_OK;
+  if (canvas_flatten(path, canvas_identity(), tol, &q)) {
+    var src: CanvasPoly* = &q;
+    if (canvas_dash_ok(st->dashes, st->ndashes)) {
+      if (canvas_dash_poly(&q, st->dashes, st->ndashes, st->dash_offset, 1.0, (CanvasRect*)0, &q2)) { src = &q2; }
+    }
+    if (!canvas_stroke_poly(&k, src, st, st->width, tol, &o)) { rc = CANVAS_E_MEM; }
+    for c in 0..o.nconts {
+      var ct: CanvasContour* = o.conts + c;
+      if (ct->count < 2) { continue; }
+      for i in 0..ct->count {
+        var x: float32 = o.xy[(ct->start + i) * 2];
+        var y: float32 = o.xy[(ct->start + i) * 2 + 1];
+        if (i == 0) { canvas_move_to(dst, x, y); } else { canvas_line_to(dst, x, y); }
+      }
+      canvas_close(dst);
+    }
+  }
+  canvas_poly_free(&q);
+  canvas_poly_free(&q2);
+  canvas_poly_free(&o);
+  canvas_stroker_free(&k);
+  return rc;
+}
+
+/// Fills a rectangle.
+export fn canvas_fill_rect(ctx: CanvasContext*, x: float32, y: float32, w: float32, h: float32, p: CanvasPaint*) -> int32 {
+  canvas_path_reset(&ctx->tmp);
+  canvas_rect(&ctx->tmp, x, y, w, h);
+  return canvas_fill_path(ctx, &ctx->tmp, p, CANVAS_NONZERO);
+}
+
+/// Strokes a rectangle.
+export fn canvas_stroke_rect(ctx: CanvasContext*, x: float32, y: float32, w: float32, h: float32, st: CanvasStroke*, p: CanvasPaint*) -> int32 {
+  canvas_path_reset(&ctx->tmp);
+  canvas_rect(&ctx->tmp, x, y, w, h);
+  return canvas_stroke_path(ctx, &ctx->tmp, st, p);
+}
+
+/// Sets every pixel to c, ignoring transform and clip.
+export fn canvas_clear(ctx: CanvasContext*, c: CanvasColor) {
+  canvas_pixmap_fill(ctx->pm, c);
+}
+
+/// Draws pixmap src with its top-left corner at (x, y) in user space.
+/// paint gives opacity, blend mode and anti-aliasing; its color is unused.
+/// Sampling is nearest when src lands on whole pixels, else bilinear.
+export fn canvas_draw_pixmap(ctx: CanvasContext*, src: CanvasPixmap*, x: float32, y: float32, p: CanvasPaint*) -> int32 {
+  if (src == 0 || src->data == 0 || p == 0) { return CANVAS_E_ARG; }
+  var pt: CanvasPattern;
+  canvas_pattern(&pt, src);
+  pt.spread_x = CANVAS_DECAL;
+  pt.spread_y = CANVAS_DECAL;
+  pt.m = canvas_translation(x, y);
+  var full: CanvasTransform = canvas_t_mul(top(ctx)->m, pt.m);
+  if (full.a == 1.0 && full.b == 0.0 && full.c == 0.0 && full.d == 1.0 &&
+      full.e == canvas_floorf(full.e) && full.f == canvas_floorf(full.f)) {
+    pt.filter = CANVAS_NEAREST;
+  }
+  var pp: CanvasPaint = *p;
+  pp.gradient = (CanvasGradient*)0;
+  pp.pattern = &pt;
+  canvas_path_reset(&ctx->tmp);
+  canvas_rect(&ctx->tmp, x, y, (float32)src->width, (float32)src->height);
+  return canvas_fill_path(ctx, &ctx->tmp, &pp, CANVAS_NONZERO);
+}
+
+// Makes the top level own a mask it can write.
+fn own_mask(ctx: CanvasContext*) -> uint8* {
+  var s: State* = top(ctx);
+  var n: int64 = (int64)ctx->pm->width * (int64)ctx->pm->height;
+  var m: uint8* = (uint8*)calloc(n, 1);
+  return m;
+}
+
+/// Intersects the clip with a path (anti-aliased by the rule's coverage).
+export fn canvas_clip_path(ctx: CanvasContext*, path: CanvasPath*, rule: int32) -> int32 {
+  if (ctx->pm == 0 || path == 0) { return CANVAS_E_ARG; }
+  var s: State* = top(ctx);
+  var ok: bool = canvas_flatten(path, s->m, ctx->tol, &ctx->poly);
+  if (!ok && ctx->poly.failed) { return CANVAS_E_MEM; }
+  var bx0: int32 = 0; var by0: int32 = 0; var bx1: int32 = 0; var by1: int32 = 0;
+  if (!ok || !draw_box(ctx, &ctx->poly, &bx0, &by0, &bx1, &by1)) {
+    // nothing is left inside the clip
+    s->x1 = s->x0;
+    s->y1 = s->y0;
+    return CANVAS_OK;
+  }
+  var nm: uint8* = own_mask(ctx);
+  if (nm == 0) { return CANVAS_E_MEM; }
+  var sink: CanvasMaskSink;
+  sink.dst = nm;
+  sink.old = s->mask;
+  sink.stride = (int64)ctx->pm->width;
+  canvas_raster_edges(&ctx->raster, &ctx->poly, bx0, by0, bx1, by1);
+  if (!canvas_raster_fill(&ctx->raster, bx0, by0, bx1, by1, rule, true, &canvas_mask_span, (rawptr)&sink)) {
+    free(nm);
+    return CANVAS_E_MEM;
+  }
+  if (s->mask_owned && s->mask != 0) { free(s->mask); }
+  s->mask = nm;
+  s->mask_owned = true;
+  s->x0 = bx0; s->y0 = by0; s->x1 = bx1; s->y1 = by1;
+  return CANVAS_OK;
+}
+
+/// Intersects the clip with a rectangle in user space. A rectangle that
+/// lands on whole device pixels only narrows the clip box (no mask).
+export fn canvas_clip_rect(ctx: CanvasContext*, x: float32, y: float32, w: float32, h: float32) -> int32 {
+  var s: State* = top(ctx);
+  var m: CanvasTransform = s->m;
+  if (m.b == 0.0 && m.c == 0.0) {
+    var a: CanvasPoint = canvas_t_point(m, x, y);
+    var b: CanvasPoint = canvas_t_point(m, x + w, y + h);
+    var x0: float32 = canvas_minf(a.x, b.x); var x1: float32 = canvas_maxf(a.x, b.x);
+    var y0: float32 = canvas_minf(a.y, b.y); var y1: float32 = canvas_maxf(a.y, b.y);
+    if (canvas_finite(x0) && canvas_finite(x1) && canvas_finite(y0) && canvas_finite(y1) &&
+        x0 == canvas_floorf(x0) && x1 == canvas_floorf(x1) && y0 == canvas_floorf(y0) && y1 == canvas_floorf(y1)) {
+      var ix0: int32 = canvas_maxi(s->x0, (int32)canvas_maxf(x0, -1.0));
+      var iy0: int32 = canvas_maxi(s->y0, (int32)canvas_maxf(y0, -1.0));
+      var ix1: int32 = canvas_mini(s->x1, (int32)canvas_minf(x1, 40000.0));
+      var iy1: int32 = canvas_mini(s->y1, (int32)canvas_minf(y1, 40000.0));
+      if (ix1 < ix0) { ix1 = ix0; }
+      if (iy1 < iy0) { iy1 = iy0; }
+      s->x0 = ix0; s->y0 = iy0; s->x1 = ix1; s->y1 = iy1;
+      return CANVAS_OK;
+    }
+  }
+  canvas_path_reset(&ctx->tmp);
+  canvas_rect(&ctx->tmp, x, y, w, h);
+  return canvas_clip_path(ctx, &ctx->tmp, CANVAS_NONZERO);
+}
+
+/// Removes the clip of the current level (saved levels keep theirs).
+export fn canvas_reset_clip(ctx: CanvasContext*) {
+  var s: State* = top(ctx);
+  if (s->mask_owned && s->mask != 0) { free(s->mask); }
+  s->mask = (uint8*)0;
+  s->mask_owned = false;
+  s->x0 = 0; s->y0 = 0;
+  s->x1 = ctx->pm->width;
+  s->y1 = ctx->pm->height;
+}

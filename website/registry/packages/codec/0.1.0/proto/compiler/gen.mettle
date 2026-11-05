@@ -1,0 +1,875 @@
+// The generator: Mettle code for every message, enum and service in a
+// parsed and resolved CodecPbcSet. One output file per .proto file.
+//
+// For a message M it writes:
+//   struct M                      fields, has_ flags, oneof cases, unknown fields
+//   M_encode(m, w)                appends m to a CodecRev (back to front)
+//   M_serialize(m, w) -> string   empties w, encodes, returns the bytes
+//   M_read(m, r, depth, group)    merges fields from a reader
+//   M_decode(m, data) -> int32    merges from bytes; CODEC_OK or an error
+//   M_check(m) -> bool            proto2 required fields are all set
+//   M_init(m)                     zero, then proto2 default values
+//   M_free(m)                     frees what decoding allocated
+// and for each service method, the gRPC path and framing helpers.
+import "std/mem";
+import "codec/core/list";
+import "codec/core/buf";
+import "codec/proto/compiler/desc";
+
+struct CodecPbcGen {
+  set: CodecPbcSet*;
+  out: CodecBuf;
+  needs_check: CodecList<bool>;
+}
+
+fn ln(g: CodecPbcGen*, s: string) {
+  codec_buf_string(&g->out, s);
+  codec_buf_byte(&g->out, (uint8)10);
+}
+
+const CODEC_PBC_KEYWORDS: string = " asm barrier break case const continue default defer dispatch else enum errdefer export extern fn for if impl import import_str kernel match method new private return struct switch this trait var where while workgroup int8 int16 int32 int64 uint8 uint16 uint32 uint64 float32 float64 string bool char cstring rawptr void true false comptime volatile in sizeof typeof textof type effect with global shared local constant layout align ";
+
+// A field name that is not a Mettle keyword: `type` stays, `default` becomes `default_`.
+fn codec_pbc_ident_name(name: string) -> string {
+  var probe: string = " " + name + " ";
+  var n: int64 = (int64)CODEC_PBC_KEYWORDS.length - (int64)probe.length;
+  var i: int64 = 0;
+  while (i <= n) {
+    var same: bool = true;
+    for k in 0..probe.length {
+      if (CODEC_PBC_KEYWORDS.chars[i + (int64)k] != probe.chars[k]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) { return name + "_"; }
+    i = i + 1;
+  }
+  return name;
+}
+
+fn codec_pbc_fname(f: CodecPbcField*) -> string {
+  return codec_pbc_ident_name(f->name);
+}
+
+fn codec_pbc_scalar_type(kind: int32) -> string {
+  switch (kind) {
+    case 1: { return "float64"; }
+    case 2: { return "float32"; }
+    case 3: { return "int64"; }
+    case 4: { return "uint64"; }
+    case 5: { return "int32"; }
+    case 6: { return "uint64"; }
+    case 7: { return "uint32"; }
+    case 8: { return "bool"; }
+    case 9: { return "string"; }
+    case 12: { return "string"; }
+    case 13: { return "uint32"; }
+    case 14: { return "int32"; }
+    case 15: { return "int32"; }
+    case 16: { return "int64"; }
+    case 17: { return "int32"; }
+    case 18: { return "int64"; }
+    default: { }
+  }
+  return "?";
+}
+
+fn codec_pbc_is_msg(f: CodecPbcField*) -> bool {
+  return f->kind == CODEC_PBT_MESSAGE || f->kind == CODEC_PBT_GROUP;
+}
+
+fn codec_pbc_ref_name(g: CodecPbcGen*, f: CodecPbcField*) -> string {
+  if (codec_pbc_is_msg(f)) { return g->set->messages.data[f->ref].mettle; }
+  return g->set->enums.data[f->ref].mettle;
+}
+
+// Wire type of one value of this kind (groups: start group).
+fn codec_pbc_wire_of(kind: int32) -> int32 {
+  switch (kind) {
+    case 1: { return 1; }
+    case 6: { return 1; }
+    case 16: { return 1; }
+    case 2: { return 5; }
+    case 7: { return 5; }
+    case 15: { return 5; }
+    case 9: { return 2; }
+    case 11: { return 2; }
+    case 12: { return 2; }
+    case 10: { return 3; }
+    default: { }
+  }
+  return 0;
+}
+
+fn codec_pbc_packable(kind: int32) -> bool {
+  return kind != CODEC_PBT_STRING && kind != CODEC_PBT_BYTES && kind != CODEC_PBT_MESSAGE && kind != CODEC_PBT_GROUP;
+}
+
+fn codec_pbc_packed(m: CodecPbcMessage*, f: CodecPbcField*) -> bool {
+  if (f->label != CODEC_PBL_REPEATED || !codec_pbc_packable(f->kind)) { return false; }
+  if (f->packed == 1) { return true; }
+  return f->packed == -1 && m->syntax == 3;
+}
+
+fn codec_pbc_tag(number: int32, wire: int32) -> string {
+  var t: int64 = ((int64)number << 3) | (int64)wire;
+  return "{t}";
+}
+
+// The expression that reads one value of a scalar kind from `r`.
+fn codec_pbc_read_expr(kind: int32, r: string) -> string {
+  switch (kind) {
+    case 1: { return "codec_pb_read_double({r})"; }
+    case 2: { return "codec_pb_read_float({r})"; }
+    case 3: { return "codec_pb_read_int64({r})"; }
+    case 4: { return "codec_pb_read_uint64({r})"; }
+    case 5: { return "codec_pb_read_int32({r})"; }
+    case 6: { return "codec_pb_read_fixed64({r})"; }
+    case 7: { return "codec_pb_read_fixed32({r})"; }
+    case 8: { return "codec_pb_read_bool({r})"; }
+    case 9: { return "codec_pb_read_bytes({r})"; }
+    case 12: { return "codec_pb_read_bytes({r})"; }
+    case 13: { return "codec_pb_read_uint32({r})"; }
+    case 14: { return "codec_pb_read_int32({r})"; }
+    case 15: { return "(int32)codec_pb_read_fixed32({r})"; }
+    case 16: { return "(int64)codec_pb_read_fixed64({r})"; }
+    case 17: { return "codec_pb_read_sint32({r})"; }
+    case 18: { return "codec_pb_read_sint64({r})"; }
+    default: { }
+  }
+  return "?";
+}
+
+// A statement writing field `n` with value `v` (tag included).
+fn codec_pbc_put_stmt(kind: int32, n: int32, v: string) -> string {
+  switch (kind) {
+    case 1: { return "codec_pb_put_double(w, {n}, {v});"; }
+    case 2: { return "codec_pb_put_float(w, {n}, {v});"; }
+    case 3: { return "codec_pb_put_int64(w, {n}, {v});"; }
+    case 4: { return "codec_pb_put_uint64(w, {n}, {v});"; }
+    case 5: { return "codec_pb_put_int32(w, {n}, {v});"; }
+    case 6: { return "codec_pb_put_fixed64(w, {n}, {v});"; }
+    case 7: { return "codec_pb_put_fixed32(w, {n}, {v});"; }
+    case 8: { return "codec_pb_put_bool(w, {n}, {v});"; }
+    case 9: { return "codec_pb_put_bytes(w, {n}, {v});"; }
+    case 12: { return "codec_pb_put_bytes(w, {n}, {v});"; }
+    case 13: { return "codec_pb_put_uint32(w, {n}, {v});"; }
+    case 14: { return "codec_pb_put_int32(w, {n}, {v});"; }
+    case 15: { return "codec_pb_put_fixed32(w, {n}, (uint32){v});"; }
+    case 16: { return "codec_pb_put_fixed64(w, {n}, (uint64){v});"; }
+    case 17: { return "codec_pb_put_sint32(w, {n}, {v});"; }
+    case 18: { return "codec_pb_put_sint64(w, {n}, {v});"; }
+    default: { }
+  }
+  return "?";
+}
+
+// A statement writing one packed value v, without a tag.
+fn codec_pbc_raw_stmt(kind: int32, v: string) -> string {
+  switch (kind) {
+    case 1: { return "codec_rev_le64(w, codec_f64_bits({v}));"; }
+    case 2: { return "codec_rev_le32(w, codec_f32_bits({v}));"; }
+    case 3: { return "codec_rev_varint(w, (uint64){v});"; }
+    case 4: { return "codec_rev_varint(w, {v});"; }
+    case 5: { return "codec_rev_varint(w, (uint64)(int64){v});"; }
+    case 6: { return "codec_rev_le64(w, {v});"; }
+    case 7: { return "codec_rev_le32(w, {v});"; }
+    case 8: { return "if ({v}) {{ codec_rev_byte(w, (uint8)1); } else {{ codec_rev_byte(w, (uint8)0); }"; }
+    case 13: { return "codec_rev_varint(w, (uint64){v});"; }
+    case 14: { return "codec_rev_varint(w, (uint64)(int64){v});"; }
+    case 15: { return "codec_rev_le32(w, (uint32){v});"; }
+    case 16: { return "codec_rev_le64(w, (uint64){v});"; }
+    case 17: { return "codec_rev_varint(w, (uint64)codec_zigzag32({v}));"; }
+    case 18: { return "codec_rev_varint(w, codec_zigzag64({v}));"; }
+    default: { }
+  }
+  return "?";
+}
+
+// The "is not the default" test for a proto3 field without presence.
+fn codec_pbc_nonzero(kind: int32, v: string) -> string {
+  switch (kind) {
+    case 1: { return "codec_f64_bits({v}) != 0"; }
+    case 2: { return "codec_f32_bits({v}) != 0"; }
+    case 8: { return "{v}"; }
+    case 9: { return "{v}.length != 0"; }
+    case 12: { return "{v}.length != 0"; }
+    default: { }
+  }
+  return "{v} != 0";
+}
+
+fn codec_pbc_oneof_case(g: CodecPbcGen*, m: CodecPbcMessage*, f: CodecPbcField*) -> string {
+  var o: CodecPbcOneof* = &m->oneofs.data[f->oneof];
+  return "m->" + codec_pbc_ident_name(o->name) + "_case";
+}
+
+fn codec_pbc_real_oneof(m: CodecPbcMessage*, f: CodecPbcField*) -> bool {
+  return f->oneof >= 0 && !m->oneofs.data[f->oneof].synthetic;
+}
+
+// ---- struct and constants ------------------------------------------------------
+
+fn codec_pbc_gen_struct(g: CodecPbcGen*, mi: int32) {
+  var m: CodecPbcMessage* = codec_pbc_msg(g->set, mi);
+  var name: string = m->mettle;
+  ln(g, "");
+  ln(g, "// {m->full}");
+  ln(g, "export struct {name} {{");
+  for i in 0..m->fields.len {
+    var f: CodecPbcField* = &m->fields.data[i];
+    var fname: string = codec_pbc_fname(f);
+    var t: string = "";
+    if (codec_pbc_is_msg(f)) {
+      t = codec_pbc_ref_name(g, f);
+      if (f->label != CODEC_PBL_REPEATED) { t = t + "*"; }
+    } else {
+      t = codec_pbc_scalar_type(f->kind);
+    }
+    if (f->label == CODEC_PBL_REPEATED) { t = "CodecList<" + t + ">"; }
+    if (f->presence && !codec_pbc_is_msg(f) && f->label != CODEC_PBL_REPEATED) {
+      ln(g, "  has_{f->name}: bool;");
+    }
+    ln(g, "  {fname}: {t};");
+  }
+  for k in 0..m->oneofs.len {
+    var o: CodecPbcOneof* = &m->oneofs.data[k];
+    if (!o->synthetic) {
+      var oname: string = codec_pbc_ident_name(o->name);
+      ln(g, "  {oname}_case: int32;   // field number of the member that is set, 0 if none");
+    }
+  }
+  ln(g, "  _unknown: CodecList<string>;   // fields this code does not know, kept as raw bytes");
+  ln(g, "}");
+  for i in 0..m->fields.len {
+    var f: CodecPbcField* = &m->fields.data[i];
+    ln(g, "export const {name}_FIELD_{f->name}: int32 = {f->number};");
+  }
+}
+
+fn codec_pbc_gen_enum(g: CodecPbcGen*, ei: int32) {
+  var e: CodecPbcEnum* = codec_pbc_enum(g->set, ei);
+  var name: string = e->mettle;
+  ln(g, "");
+  ln(g, "// {e->full}");
+  for i in 0..e->values.len {
+    var v: CodecPbcEnumValue* = &e->values.data[i];
+    ln(g, "export const {name}_{v->name}: int32 = {v->number};");
+  }
+  ln(g, "");
+  ln(g, "export fn {name}_valid(v: int32) -> bool {{");
+  ln(g, "  switch (v) {{");
+  for i in 0..e->values.len {
+    var dup: bool = false;
+    for j in 0..i {
+      if (e->values.data[j].number == e->values.data[i].number) { dup = true; }
+    }
+    if (!dup) { ln(g, "    case {e->values.data[i].number}: {{ return true; }"); }
+  }
+  ln(g, "    default: {{ }");
+  ln(g, "  }");
+  ln(g, "  return false;");
+  ln(g, "}");
+  ln(g, "");
+  ln(g, "export fn {name}_name(v: int32) -> string {{");
+  ln(g, "  switch (v) {{");
+  for i in 0..e->values.len {
+    var dup2: bool = false;
+    for j in 0..i {
+      if (e->values.data[j].number == e->values.data[i].number) { dup2 = true; }
+    }
+    if (!dup2) { ln(g, "    case {e->values.data[i].number}: {{ return \"{e->values.data[i].name}\"; }"); }
+  }
+  ln(g, "    default: {{ }");
+  ln(g, "  }");
+  ln(g, "  return \"\";");
+  ln(g, "}");
+}
+
+// ---- encode ---------------------------------------------------------------------
+
+fn codec_pbc_gen_encode(g: CodecPbcGen*, mi: int32) {
+  var m: CodecPbcMessage* = codec_pbc_msg(g->set, mi);
+  var name: string = m->mettle;
+  ln(g, "");
+  ln(g, "export fn {name}_encode(m: {name}*, w: CodecRev*) {{");
+  ln(g, "  codec_pb_put_unknown(w, &m->_unknown);");
+  // Fields go in by number, so write them highest number first.
+  var n: int64 = m->fields.len;
+  var order: int64* = (int64*)malloc((n + 1) * 8);
+  for i in 0..n { order[i] = i; }
+  for i in 0..n {
+    for j in (i + 1)..n {
+      if (m->fields.data[order[j]].number > m->fields.data[order[i]].number) {
+        var t: int64 = order[i];
+        order[i] = order[j];
+        order[j] = t;
+      }
+    }
+  }
+  for oi in 0..n {
+    var f: CodecPbcField* = &m->fields.data[order[oi]];
+    var fname: string = codec_pbc_fname(f);
+    var v: string = "m->" + fname;
+    var num: int32 = f->number;
+    if (f->label == CODEC_PBL_REPEATED) {
+      ln(g, "  if ({v}.len > 0) {{");
+      if (codec_pbc_packed(m, f)) {
+        ln(g, "    var mk: int64 = codec_rev_len(w);");
+        ln(g, "    var i: int64 = {v}.len - 1;");
+        ln(g, "    while (i >= 0) {{");
+        ln(g, "      " + codec_pbc_raw_stmt(f->kind, v + ".data[i]"));
+        ln(g, "      i = i - 1;");
+        ln(g, "    }");
+        ln(g, "    codec_pb_put_len(w, {num}, mk);");
+      } else {
+        ln(g, "    var i: int64 = {v}.len - 1;");
+        ln(g, "    while (i >= 0) {{");
+        if (f->kind == CODEC_PBT_MESSAGE) {
+          var tn: string = codec_pbc_ref_name(g, f);
+          ln(g, "      var mk: int64 = codec_rev_len(w);");
+          ln(g, "      {tn}_encode(&{v}.data[i], w);");
+          ln(g, "      codec_pb_put_len(w, {num}, mk);");
+        } else if (f->kind == CODEC_PBT_GROUP) {
+          var tg: string = codec_pbc_ref_name(g, f);
+          ln(g, "      codec_pb_put_tag(w, {num}, CODEC_PB_EGROUP);");
+          ln(g, "      {tg}_encode(&{v}.data[i], w);");
+          ln(g, "      codec_pb_put_tag(w, {num}, CODEC_PB_SGROUP);");
+        } else {
+          ln(g, "      " + codec_pbc_put_stmt(f->kind, num, v + ".data[i]"));
+        }
+        ln(g, "      i = i - 1;");
+        ln(g, "    }");
+      }
+      ln(g, "  }");
+      continue;
+    }
+    var cond: string = "";
+    if (codec_pbc_is_msg(f)) {
+      cond = "{v} != 0";
+      if (m->map_entry) { cond = "true"; }
+    } else if (m->map_entry) {
+      cond = "true";
+    } else if (f->presence) {
+      cond = "m->has_{f->name}";
+    } else if (codec_pbc_real_oneof(m, f)) {
+      cond = "true";
+    } else {
+      cond = codec_pbc_nonzero(f->kind, v);
+    }
+    if (codec_pbc_real_oneof(m, f)) {
+      cond = codec_pbc_oneof_case(g, m, f) + " == {num} && " + cond;
+    }
+    ln(g, "  if ({cond}) {{");
+    if (f->kind == CODEC_PBT_MESSAGE) {
+      var tm: string = codec_pbc_ref_name(g, f);
+      ln(g, "    var mk: int64 = codec_rev_len(w);");
+      if (m->map_entry) {
+        ln(g, "    if ({v} != 0) {{ {tm}_encode({v}, w); }");
+      } else {
+        ln(g, "    {tm}_encode({v}, w);");
+      }
+      ln(g, "    codec_pb_put_len(w, {num}, mk);");
+    } else if (f->kind == CODEC_PBT_GROUP) {
+      var tg2: string = codec_pbc_ref_name(g, f);
+      ln(g, "    codec_pb_put_tag(w, {num}, CODEC_PB_EGROUP);");
+      ln(g, "    {tg2}_encode({v}, w);");
+      ln(g, "    codec_pb_put_tag(w, {num}, CODEC_PB_SGROUP);");
+    } else {
+      ln(g, "    " + codec_pbc_put_stmt(f->kind, num, v));
+    }
+    ln(g, "  }");
+  }
+  free(order);
+  ln(g, "}");
+  ln(g, "");
+  ln(g, "// Encodes m into w (emptied first) and returns the bytes, a view into w.");
+  ln(g, "export fn {name}_serialize(m: {name}*, w: CodecRev*) -> string {{");
+  ln(g, "  codec_rev_clear(w);");
+  ln(g, "  {name}_encode(m, w);");
+  ln(g, "  return codec_rev_view(w);");
+  ln(g, "}");
+}
+
+// ---- decode ---------------------------------------------------------------------
+
+fn codec_pbc_gen_utf8(g: CodecPbcGen*, m: CodecPbcMessage*, f: CodecPbcField*, v: string, indent: string) {
+  if (f->kind == CODEC_PBT_STRING && m->syntax == 3) {
+    ln(g, indent + "if (!codec_utf8_valid_string({v})) {{");
+    ln(g, indent + "  codec_rd_fail(r, CODEC_ERR_UTF8);");
+    ln(g, indent + "  return false;");
+    ln(g, indent + "}");
+  }
+}
+
+fn codec_pbc_closed_enum(g: CodecPbcGen*, f: CodecPbcField*) -> bool {
+  return f->kind == CODEC_PBT_ENUM && g->set->enums.data[f->ref].closed;
+}
+
+// Statements that keep the field just read as an unknown field.
+fn codec_pbc_gen_keep(g: CodecPbcGen*, indent: string) {
+  ln(g, indent + "var kept: string;");
+  ln(g, indent + "kept.chars = r->data + start;");
+  ln(g, indent + "kept.length = (uint64)(r->pos - start);");
+  ln(g, indent + "if (!codec_list_push(&m->_unknown, kept)) {{ codec_rd_fail(r, CODEC_ERR_NOMEM); return false; }");
+}
+
+fn codec_pbc_gen_sub_message(g: CodecPbcGen*, m: CodecPbcMessage*, f: CodecPbcField*, v: string) {
+  var tn: string = codec_pbc_ref_name(g, f);
+  var num: int32 = f->number;
+  var group: bool = f->kind == CODEC_PBT_GROUP;
+  var wire: int32 = 2;
+  if (group) { wire = 3; }
+  ln(g, "      case " + codec_pbc_tag(num, wire) + ": {{");
+  var reader: string = "r";
+  if (!group) {
+    ln(g, "        var sub: CodecReader;");
+    ln(g, "        if (!codec_pb_read_sub(r, &sub)) {{ return false; }");
+    reader = "&sub";
+  }
+  var end: string = "0";
+  if (group) { end = "{num}"; }
+  if (f->label == CODEC_PBL_REPEATED) {
+    ln(g, "        var item: {tn};");
+    ln(g, "        if (!codec_list_push(&{v}, item)) {{ codec_rd_fail(r, CODEC_ERR_NOMEM); return false; }");
+    ln(g, "        var last: int64 = {v}.len - 1;");
+    ln(g, "        if (!{tn}_read(&{v}.data[last], {reader}, depth - 1, {end})) {{");
+    if (!group) { ln(g, "          codec_rd_fail(r, sub.err);"); }
+    ln(g, "          return false;");
+    ln(g, "        }");
+    var em: CodecPbcMessage* = codec_pbc_msg(g->set, f->ref);
+    if (em->map_entry) {
+      // A key seen before: the new entry replaces the old one.
+      ln(g, "        var j: int64 = 0;");
+      ln(g, "        while (j < last) {{");
+      ln(g, "          if ({v}.data[j].key == {v}.data[last].key) {{");
+      ln(g, "            {tn}_free(&{v}.data[j]);");
+      ln(g, "            {v}.data[j] = {v}.data[last];");
+      ln(g, "            {v}.len = last;");
+      ln(g, "            break;");
+      ln(g, "          }");
+      ln(g, "          j = j + 1;");
+      ln(g, "        }");
+    }
+  } else {
+    if (codec_pbc_real_oneof(m, f)) {
+      var cs: string = codec_pbc_oneof_case(g, m, f);
+      ln(g, "        if ({cs} != {num} && {v} != 0) {{");
+      ln(g, "          {tn}_free({v});");
+      ln(g, "          free({v});");
+      ln(g, "          {v} = ({tn}*)0;");
+      ln(g, "        }");
+      ln(g, "        {cs} = {num};");
+    }
+    ln(g, "        if ({v} == 0) {{");
+    ln(g, "          {v} = new {tn};");
+    ln(g, "          if ({v} == 0) {{ codec_rd_fail(r, CODEC_ERR_NOMEM); return false; }");
+    ln(g, "        }");
+    ln(g, "        if (!{tn}_read({v}, {reader}, depth - 1, {end})) {{");
+    if (!group) { ln(g, "          codec_rd_fail(r, sub.err);"); }
+    ln(g, "          return false;");
+    ln(g, "        }");
+  }
+  ln(g, "      }");
+}
+
+fn codec_pbc_gen_read(g: CodecPbcGen*, mi: int32) {
+  var m: CodecPbcMessage* = codec_pbc_msg(g->set, mi);
+  var name: string = m->mettle;
+  ln(g, "");
+  ln(g, "// Merges fields from r into m. `group` is the field number of the group");
+  ln(g, "// being read (0 for a whole message): its end tag stops the read.");
+  ln(g, "export fn {name}_read(m: {name}*, r: CodecReader*, depth: int32, group: int32) -> bool {{");
+  ln(g, "  if (depth <= 0) {{");
+  ln(g, "    codec_rd_fail(r, CODEC_ERR_DEPTH);");
+  ln(g, "    return false;");
+  ln(g, "  }");
+  ln(g, "  while (r->pos < r->len) {{");
+  ln(g, "    var start: int64 = r->pos;");
+  ln(g, "    var tag: uint64 = codec_pb_read_tag(r);");
+  ln(g, "    if (tag == 0) {{ return false; }");
+  ln(g, "    switch ((int64)tag) {{");
+  for i in 0..m->fields.len {
+    var f: CodecPbcField* = &m->fields.data[i];
+    var fname: string = codec_pbc_fname(f);
+    var v: string = "m->" + fname;
+    var num: int32 = f->number;
+    if (codec_pbc_is_msg(f)) {
+      codec_pbc_gen_sub_message(g, m, f, v);
+      continue;
+    }
+    var rd: string = codec_pbc_read_expr(f->kind, "r");
+    var wire: int32 = codec_pbc_wire_of(f->kind);
+    if (f->label == CODEC_PBL_REPEATED) {
+      var et: string = codec_pbc_scalar_type(f->kind);
+      ln(g, "      case " + codec_pbc_tag(num, wire) + ": {{");
+      ln(g, "        var x: {et} = {rd};");
+      codec_pbc_gen_utf8(g, m, f, "x", "        ");
+      if (codec_pbc_closed_enum(g, f)) {
+        var en: string = g->set->enums.data[f->ref].mettle;
+        ln(g, "        if (!{en}_valid(x)) {{");
+        codec_pbc_gen_keep(g, "          ");
+        ln(g, "          continue;");
+        ln(g, "        }");
+      }
+      ln(g, "        if (!codec_list_push(&{v}, x)) {{ codec_rd_fail(r, CODEC_ERR_NOMEM); return false; }");
+      ln(g, "      }");
+      if (codec_pbc_packable(f->kind)) {
+        // Packed form; accepted whatever the field's own packing is.
+        ln(g, "      case " + codec_pbc_tag(num, 2) + ": {{");
+        ln(g, "        var sub: CodecReader;");
+        ln(g, "        if (!codec_pb_read_sub(r, &sub)) {{ return false; }");
+        if (wire == 1) { ln(g, "        codec_list_reserve(&{v}, {v}.len + sub.len / 8);"); }
+        if (wire == 5) { ln(g, "        codec_list_reserve(&{v}, {v}.len + sub.len / 4);"); }
+        ln(g, "        while (sub.pos < sub.len) {{");
+        var rd2: string = codec_pbc_read_expr(f->kind, "&sub");
+        ln(g, "          var y: {et} = {rd2};");
+        if (codec_pbc_closed_enum(g, f)) {
+          var en2: string = g->set->enums.data[f->ref].mettle;
+          ln(g, "          if (!{en2}_valid(y)) {{ continue; }   // unknown values in a packed proto2 enum are dropped");
+        }
+        ln(g, "          if (!codec_list_push(&{v}, y)) {{ codec_rd_fail(r, CODEC_ERR_NOMEM); return false; }");
+        ln(g, "        }");
+        ln(g, "        if (sub.err != CODEC_OK) {{");
+        ln(g, "          codec_rd_fail(r, sub.err);");
+        ln(g, "          return false;");
+        ln(g, "        }");
+        ln(g, "      }");
+      }
+      continue;
+    }
+    ln(g, "      case " + codec_pbc_tag(num, wire) + ": {{");
+    if (codec_pbc_closed_enum(g, f)) {
+      var en3: string = g->set->enums.data[f->ref].mettle;
+      ln(g, "        var x: int32 = {rd};");
+      ln(g, "        if (!{en3}_valid(x)) {{");
+      codec_pbc_gen_keep(g, "          ");
+      ln(g, "          continue;");
+      ln(g, "        }");
+      ln(g, "        {v} = x;");
+    } else {
+      ln(g, "        {v} = {rd};");
+      codec_pbc_gen_utf8(g, m, f, v, "        ");
+    }
+    if (f->presence) { ln(g, "        m->has_{f->name} = true;"); }
+    if (codec_pbc_real_oneof(m, f)) {
+      var cs: string = codec_pbc_oneof_case(g, m, f);
+      ln(g, "        {cs} = {num};");
+    }
+    ln(g, "      }");
+  }
+  ln(g, "      default: {{");
+  ln(g, "        if ((tag & 7) == 4) {{");
+  ln(g, "          if ((int32)(tag >> 3) == group) {{ return true; }");
+  ln(g, "          codec_rd_fail(r, CODEC_ERR_INVALID);");
+  ln(g, "          return false;");
+  ln(g, "        }");
+  ln(g, "        if (!codec_pb_keep_unknown(r, tag, start, depth, &m->_unknown)) {{ return false; }");
+  ln(g, "      }");
+  ln(g, "    }");
+  ln(g, "    if (r->err != CODEC_OK) {{ return false; }");
+  ln(g, "  }");
+  ln(g, "  if (group != 0) {{");
+  ln(g, "    codec_rd_fail(r, CODEC_ERR_TRUNCATED);");
+  ln(g, "    return false;");
+  ln(g, "  }");
+  ln(g, "  return r->err == CODEC_OK;");
+  ln(g, "}");
+  ln(g, "");
+  ln(g, "// Merges the message in `data` into m. Strings and bytes in m point into");
+  ln(g, "// `data`, so keep it alive while m is in use. Returns CODEC_OK or an error.");
+  ln(g, "export fn {name}_decode(m: {name}*, data: string) -> int32 {{");
+  ln(g, "  var r: CodecReader;");
+  ln(g, "  codec_rd_init_string(&r, data);");
+  ln(g, "  if (!{name}_read(m, &r, CODEC_PB_DEPTH, 0)) {{");
+  ln(g, "    if (r.err == CODEC_OK) {{ return CODEC_ERR_INVALID; }");
+  ln(g, "    return r.err;");
+  ln(g, "  }");
+  ln(g, "  if (!{name}_check(m)) {{ return CODEC_ERR_MISSING; }");
+  ln(g, "  return CODEC_OK;");
+  ln(g, "}");
+}
+
+// ---- check, init, free -------------------------------------------------------------
+
+fn codec_pbc_gen_check(g: CodecPbcGen*, mi: int32) {
+  var m: CodecPbcMessage* = codec_pbc_msg(g->set, mi);
+  var name: string = m->mettle;
+  ln(g, "");
+  ln(g, "// True when every proto2 required field, here and in nested messages, is set.");
+  ln(g, "export fn {name}_check(m: {name}*) -> bool {{");
+  for i in 0..m->fields.len {
+    var f: CodecPbcField* = &m->fields.data[i];
+    var v: string = "m->" + codec_pbc_fname(f);
+    if (f->label == CODEC_PBL_REQUIRED) {
+      if (codec_pbc_is_msg(f)) {
+        ln(g, "  if ({v} == 0) {{ return false; }");
+      } else {
+        ln(g, "  if (!m->has_{f->name}) {{ return false; }");
+      }
+    }
+    if (codec_pbc_is_msg(f) && g->needs_check.data[f->ref]) {
+      var tn: string = codec_pbc_ref_name(g, f);
+      if (f->label == CODEC_PBL_REPEATED) {
+        ln(g, "  for i in 0..{v}.len {{");
+        ln(g, "    if (!{tn}_check(&{v}.data[i])) {{ return false; }");
+        ln(g, "  }");
+      } else {
+        ln(g, "  if ({v} != 0 && !{tn}_check({v})) {{ return false; }");
+      }
+    }
+  }
+  ln(g, "  return true;");
+  ln(g, "}");
+}
+
+// A Mettle literal for a proto2 default value. Returns "" if there is none.
+fn codec_pbc_default_literal(g: CodecPbcGen*, f: CodecPbcField*) -> string {
+  var d: string = f->default_text;
+  if (f->kind == CODEC_PBT_STRING || f->kind == CODEC_PBT_BYTES) {
+    var b: CodecBuf;
+    codec_buf_init(&b, (int64)d.length + 8);
+    codec_buf_byte(&b, (uint8)34);
+    for i in 0..d.length {
+      var c: int32 = (int32)d.chars[i];
+      if (c == 34 || c == 92) {
+        codec_buf_byte(&b, (uint8)92);
+        codec_buf_byte(&b, (uint8)c);
+      } else if (c == 123) {
+        codec_buf_string(&b, "{{");
+      } else if (c == 10) {
+        codec_buf_string(&b, "\\n");
+      } else if (c == 9) {
+        codec_buf_string(&b, "\\t");
+      } else if (c == 13) {
+        codec_buf_string(&b, "\\r");
+      } else if (c == 0) {
+        codec_buf_string(&b, "\\0");
+      } else {
+        codec_buf_byte(&b, (uint8)c);
+      }
+    }
+    codec_buf_byte(&b, (uint8)34);
+    return codec_buf_take(&b);
+  }
+  if (f->kind == CODEC_PBT_ENUM) {
+    return g->set->enums.data[f->ref].mettle + "_" + d;
+  }
+  if (f->kind == CODEC_PBT_DOUBLE || f->kind == CODEC_PBT_FLOAT) {
+    var fn_name: string = "codec_bits_f64";
+    var bits_inf: string = "0x7ff0000000000000";
+    var bits_ninf: string = "0xfff0000000000000";
+    var bits_nan: string = "0x7ff8000000000000";
+    if (f->kind == CODEC_PBT_FLOAT) {
+      fn_name = "codec_bits_f32";
+      bits_inf = "(uint32)0x7f800000";
+      bits_ninf = "(uint32)0xff800000";
+      bits_nan = "(uint32)0x7fc00000";
+    }
+    if (d == "inf") { return fn_name + "(" + bits_inf + ")"; }
+    if (d == "-inf") { return fn_name + "(" + bits_ninf + ")"; }
+    if (d == "nan" || d == "-nan") { return fn_name + "(" + bits_nan + ")"; }
+    // Make sure it reads as a float literal.
+    var has_dot: bool = false;
+    for i in 0..d.length {
+      if (d.chars[i] == 46 || d.chars[i] == 101 || d.chars[i] == 69) { has_dot = true; }
+    }
+    if (!has_dot) { return d + ".0"; }
+    return d;
+  }
+  var t: string = codec_pbc_scalar_type(f->kind);
+  return "(" + t + ")" + d;
+}
+
+fn codec_pbc_gen_init_free(g: CodecPbcGen*, mi: int32) {
+  var m: CodecPbcMessage* = codec_pbc_msg(g->set, mi);
+  var name: string = m->mettle;
+  ln(g, "");
+  ln(g, "// Zeroes m and sets proto2 default values (has_ flags stay false).");
+  ln(g, "export fn {name}_init(m: {name}*) {{");
+  ln(g, "  mem_zero((cstring)m, sizeof({name}));");
+  for i in 0..m->fields.len {
+    var f: CodecPbcField* = &m->fields.data[i];
+    if (f->has_default && f->label != CODEC_PBL_REPEATED) {
+      var lit: string = codec_pbc_default_literal(g, f);
+      ln(g, "  m->" + codec_pbc_fname(f) + " = " + lit + ";");
+    }
+  }
+  ln(g, "}");
+  ln(g, "");
+  ln(g, "// Frees the memory decoding allocated in m (nested messages and lists).");
+  ln(g, "// Strings point into the decoded input and are not freed.");
+  ln(g, "export fn {name}_free(m: {name}*) {{");
+  for i in 0..m->fields.len {
+    var f: CodecPbcField* = &m->fields.data[i];
+    var v: string = "m->" + codec_pbc_fname(f);
+    if (codec_pbc_is_msg(f)) {
+      var tn: string = codec_pbc_ref_name(g, f);
+      if (f->label == CODEC_PBL_REPEATED) {
+        ln(g, "  for i in 0..{v}.len {{ {tn}_free(&{v}.data[i]); }");
+        ln(g, "  codec_list_free(&{v});");
+      } else {
+        ln(g, "  if ({v} != 0) {{");
+        ln(g, "    {tn}_free({v});");
+        ln(g, "    free({v});");
+        ln(g, "    {v} = ({tn}*)0;");
+        ln(g, "  }");
+      }
+    } else if (f->label == CODEC_PBL_REPEATED) {
+      ln(g, "  codec_list_free(&{v});");
+    }
+  }
+  ln(g, "  codec_list_free(&m->_unknown);");
+  ln(g, "}");
+}
+
+// ---- gRPC ---------------------------------------------------------------------------
+
+fn codec_pbc_gen_service(g: CodecPbcGen*, si: int64) {
+  var s: CodecPbcService* = &g->set->services.data[si];
+  for k in 0..s->methods.len {
+    var md: CodecPbcMethod* = &s->methods.data[k];
+    var base: string = s->mettle + "_" + md->name;
+    var tin: string = g->set->messages.data[md->in_ref].mettle;
+    var tout: string = g->set->messages.data[md->out_ref].mettle;
+    var kind: string = "unary";
+    if (md->client_stream && md->server_stream) { kind = "bidirectional streaming"; }
+    if (md->client_stream && !md->server_stream) { kind = "client streaming"; }
+    if (!md->client_stream && md->server_stream) { kind = "server streaming"; }
+    ln(g, "");
+    ln(g, "// rpc {s->full}.{md->name}: {tin} -> {tout} ({kind})");
+    ln(g, "export const {base}_PATH: string = \"/{s->full}/{md->name}\";");
+    ln(g, "");
+    ln(g, "// Client side: a request as one gRPC message (5-byte prefix and body) in w.");
+    ln(g, "export fn {base}_frame_request(req: {tin}*, w: CodecRev*) -> string {{");
+    ln(g, "  codec_rev_clear(w);");
+    ln(g, "  {tin}_encode(req, w);");
+    ln(g, "  codec_grpc_frame(w, 0);");
+    ln(g, "  return codec_rev_view(w);");
+    ln(g, "}");
+    ln(g, "");
+    ln(g, "export fn {base}_read_response(msg: H2GrpcMessage*, out: {tout}*) -> int32 {{");
+    ln(g, "  if (msg->compressed) {{ return CODEC_ERR_INVALID; }");
+    ln(g, "  return {tout}_decode(out, codec_grpc_payload(msg));");
+    ln(g, "}");
+    ln(g, "");
+    ln(g, "// Server side.");
+    ln(g, "export fn {base}_read_request(msg: H2GrpcMessage*, req: {tin}*) -> int32 {{");
+    ln(g, "  if (msg->compressed) {{ return CODEC_ERR_INVALID; }");
+    ln(g, "  return {tin}_decode(req, codec_grpc_payload(msg));");
+    ln(g, "}");
+    ln(g, "");
+    ln(g, "export fn {base}_frame_response(resp: {tout}*, w: CodecRev*) -> string {{");
+    ln(g, "  codec_rev_clear(w);");
+    ln(g, "  {tout}_encode(resp, w);");
+    ln(g, "  codec_grpc_frame(w, 0);");
+    ln(g, "  return codec_rev_view(w);");
+    ln(g, "}");
+  }
+}
+
+// ---- files --------------------------------------------------------------------------
+
+// The output name for a .proto import name: "a/b.proto" -> "a/b_pb.mettle".
+export fn codec_pbc_out_name(path: string) -> string {
+  var n: int64 = (int64)path.length;
+  var s: string = path;
+  if (n > 6) {
+    var tail: string;
+    tail.chars = path.chars + n - 6;
+    tail.length = (uint64)6;
+    if (tail == ".proto") {
+      s.length = (uint64)(n - 6);
+    }
+  }
+  return s + "_pb.mettle";
+}
+
+fn codec_pbc_depth(path: string) -> int32 {
+  var d: int32 = 0;
+  for i in 0..path.length {
+    if (path.chars[i] == 47) { d = d + 1; }
+  }
+  return d;
+}
+
+// Works out which messages need a _check that looks inside them.
+fn codec_pbc_mark_checks(g: CodecPbcGen*) {
+  var n: int64 = g->set->messages.len;
+  for i in 0..n {
+    var req: bool = false;
+    var m: CodecPbcMessage* = &g->set->messages.data[i];
+    for k in 0..m->fields.len {
+      if (m->fields.data[k].label == CODEC_PBL_REQUIRED) { req = true; }
+    }
+    codec_list_push(&g->needs_check, req);
+  }
+  var changed: bool = true;
+  while (changed) {
+    changed = false;
+    for i in 0..n {
+      if (g->needs_check.data[i]) { continue; }
+      var m2: CodecPbcMessage* = &g->set->messages.data[i];
+      for k in 0..m2->fields.len {
+        var f: CodecPbcField* = &m2->fields.data[k];
+        if (codec_pbc_is_msg(f) && g->needs_check.data[f->ref]) {
+          g->needs_check.data[i] = true;
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+}
+
+// Generates the Mettle source for file number `fi`. `runtime` is the import
+// prefix for Codec itself (normally "codec").
+export fn codec_pbc_generate(set: CodecPbcSet*, fi: int32, runtime: string) -> string {
+  var g: CodecPbcGen;
+  g.set = set;
+  codec_buf_init(&g.out, 4096);
+  codec_pbc_mark_checks(&g);
+  var file: CodecPbcFile* = &set->files.data[fi];
+  var has_service: bool = false;
+  for s in 0..set->services.len {
+    if (set->services.data[s].file == fi) { has_service = true; }
+  }
+  ln(&g, "// Generated by codec-protoc from {file->path}. Do not edit.");
+  ln(&g, "import \"std/mem\";");
+  ln(&g, "import \"{runtime}/core/status\";");
+  ln(&g, "import \"{runtime}/core/varint\";");
+  ln(&g, "import \"{runtime}/core/list\";");
+  ln(&g, "import \"{runtime}/core/rev\";");
+  ln(&g, "import \"{runtime}/core/reader\";");
+  ln(&g, "import \"{runtime}/core/utf8\";");
+  ln(&g, "import \"{runtime}/proto/wire\";");
+  if (has_service) {
+    ln(&g, "import \"std/http2\";");
+    ln(&g, "import \"{runtime}/proto/grpc\";");
+  }
+  var up: string = "";
+  var depth: int32 = codec_pbc_depth(file->path);
+  for d in 0..depth { up = up + "../"; }
+  for k in 0..file->imports.len {
+    var other: string = codec_pbc_out_name(file->imports.data[k]);
+    other.length = other.length - 7;   // without ".mettle"
+    ln(&g, "import \"" + up + other + "\";");
+  }
+  for e in 0..set->enums.len {
+    if (set->enums.data[e].file == fi) { codec_pbc_gen_enum(&g, (int32)e); }
+  }
+  for i in 0..set->messages.len {
+    if (set->messages.data[i].file != fi) { continue; }
+    codec_pbc_gen_struct(&g, (int32)i);
+    codec_pbc_gen_encode(&g, (int32)i);
+    codec_pbc_gen_read(&g, (int32)i);
+    codec_pbc_gen_check(&g, (int32)i);
+    codec_pbc_gen_init_free(&g, (int32)i);
+  }
+  for s in 0..set->services.len {
+    if (set->services.data[s].file == fi) { codec_pbc_gen_service(&g, s); }
+  }
+  codec_list_free(&g.needs_check);
+  return codec_buf_take(&g.out);
+}

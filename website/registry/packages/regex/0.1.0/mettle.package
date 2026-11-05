@@ -1,0 +1,6 @@
+name = regex
+version = 0.1.0
+description = Linear-time regular expressions in pure Mettle
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Regex
+compiler = 0.18.0

@@ -1,0 +1,1188 @@
+// NIST P-256 (secp256r1) key pairs and ECDH, in pure Mettle, constant time
+// in the secret scalar: the "m31" implementation of BearSSL, with field
+// elements as nine 30-bit limbs, Jacobian points, a 2-bit window for
+// arbitrary points and a 4-bit window over a precomputed table for the
+// generator. Standards: FIPS 186-5 (the curve and key pairs), SEC 1 v2
+// (point encoding).
+//
+// Ported from BearSSL (ec_p256_m31.c, ec_secp256r1.c), Copyright (c) 2017
+// Thomas Pornin, MIT license; see NOTICE.
+//
+// A public key is the uncompressed point 0x04 || X || Y (65 bytes, X and Y
+// big-endian). A secret key is the scalar d, 32 bytes big-endian, with
+// 1 <= d <= n-1. The ECDH result is the X coordinate of d * Q, as 32 bytes;
+// it is not a key, so run it through a KDF (cr_hkdf_sha256 or
+// cr_hkdf_sha384) before using it.
+
+import "crypto/core/status";
+import "crypto/core/types";
+import "crypto/core/util";
+import "crypto/ecc/i31";
+
+/// Size in bytes of a P-256 public key: the uncompressed point 0x04 || X || Y.
+/// in: -
+/// returns: 65
+/// owns: nothing
+/// thread: constant
+/// example: var pk: uint8[65]; cr_p256_keypair(&pk[0], CR_P256_PUBLIC_BYTES, &sk);
+export const CR_P256_PUBLIC_BYTES: int64 = 65;
+
+/// CrP256Secret: A P-256 secret key, the scalar d as 32 big-endian bytes with
+/// 1 <= d <= n-1 (n is the group order).
+/// in: - (zeroed when declared: `var x: CrP256Secret;`)
+/// returns: -
+/// owns: secret: wipe with cr_wipe(&sk.b[0], 32) when done
+/// thread: any thread (no shared state)
+/// example: var sk: CrP256Secret; cr_p256_keypair(&pk[0], 65, &sk);
+export struct CrP256Secret {
+  b: uint8[32];
+}
+
+const CRX_P256_M30: uint32 = 0x3FFFFFFF;
+const CRX_P256_M30W: uint64 = 0x3FFFFFFF;
+
+// Base field modulus p = 2^256 - 2^224 + 2^192 + 2^96 - 1, in 30-bit limbs.
+var g_crx_p256_f: uint32[9] = [
+  0x3FFFFFFF, 0x3FFFFFFF, 0x3FFFFFFF, 0x0000003F, 0x00000000,
+  0x00000000, 0x00001000, 0x3FFFC000, 0x0000FFFF
+];
+
+// The b coefficient of the curve equation y^2 = x^3 - 3x + b, in 30-bit limbs.
+var g_crx_p256_b: uint32[9] = [
+  0x27D2604B, 0x2F38F0F8, 0x053B0F63, 0x0741AC33, 0x1886BC65,
+  0x2EF555DA, 0x293E7B3E, 0x0D762A8E, 0x00005AC6
+];
+
+// The group order n.
+var g_crx_p256_n: uint8[32] = [
+  0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84,
+  0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51
+];
+
+// Precomputed window: k * G for k = 1 to 15, G the generator. Each entry is
+// the X and Y coordinates, nine 30-bit limbs each (little-endian order), so
+// entry k starts at 18 * (k - 1).
+var g_crx_p256_gwin: uint32[270] = [
+  0x1898C296, 0x1284E517, 0x1EB33A0F, 0x00DF604B, 0x2440F277, 0x339B958E, 0x04247F8B, 0x347CB84B, 0x00006B17,
+  0x37BF51F5, 0x2ED901A0, 0x3315ECEC, 0x338CD5DA, 0x0F9E162B, 0x1FAD29F0, 0x27F9B8EE, 0x10B8BF86, 0x00004FE3,
+  0x07669978, 0x182D23F1, 0x3F21B35A, 0x225A789D, 0x351AC3C0, 0x08E00C12, 0x34F7E8A5, 0x1EC62340, 0x00007CF2,
+  0x227873D1, 0x3812DE74, 0x0E982299, 0x1F6B798F, 0x3430DBBA, 0x366B1A7D, 0x2D040293, 0x154436E3, 0x00000777,
+  0x06E7FD6C, 0x2D05986F, 0x3ADA985F, 0x31ADC87B, 0x0BF165E6, 0x1FBE5475, 0x30A44C8F, 0x3934698C, 0x00005ECB,
+  0x227D5032, 0x29E6C49E, 0x04FB83D9, 0x0AAC0D8E, 0x24A2ECD8, 0x2C1B3869, 0x0FF7E374, 0x19031266, 0x00008734,
+  0x2B030852, 0x024C0911, 0x05596EF5, 0x07F8B6DE, 0x262BD003, 0x3779967B, 0x08FBBA02, 0x128D4CB4, 0x0000E253,
+  0x184ED8C6, 0x310B08FC, 0x30EE0055, 0x3F25B0FC, 0x062D764E, 0x3FB97F6A, 0x33CC719D, 0x15D69318, 0x0000E0F1,
+  0x03D033ED, 0x05552837, 0x35BE5242, 0x2320BF47, 0x268FDFEF, 0x13215821, 0x140D2D78, 0x02DE9454, 0x00005159,
+  0x3DA16DA4, 0x0742ED13, 0x0D80888D, 0x004BC035, 0x0A79260D, 0x06FCDAFE, 0x2727D8AE, 0x1F6A2412, 0x0000E0C1,
+  0x3C2291A9, 0x1AC2ABA4, 0x3B215B4C, 0x131D037A, 0x17DDE302, 0x0C90B2E2, 0x0602C92D, 0x05CA9DA9, 0x0000B01A,
+  0x0FC77FE2, 0x35F1214E, 0x07E16BDF, 0x003DDC07, 0x2703791C, 0x3038B7EE, 0x3DAD56FE, 0x041D0C8D, 0x0000E85C,
+  0x3187B2A3, 0x0018A1C0, 0x00FEF5B3, 0x3E7E2E2A, 0x01FB607E, 0x2CC199F0, 0x37B4625B, 0x0EDBE82F, 0x00008E53,
+  0x01F400B4, 0x15786A1B, 0x3041B21C, 0x31CD8CF2, 0x35900053, 0x1A7E0E9B, 0x318366D0, 0x076F780C, 0x000073EB,
+  0x1B6FB393, 0x13767707, 0x3CE97DBB, 0x348E2603, 0x354CADC1, 0x09D0B4EA, 0x1B053404, 0x1DE76FBA, 0x000062D9,
+  0x0F09957E, 0x295029A8, 0x3E76A78D, 0x3B547DAE, 0x27CEE0A2, 0x0575DC45, 0x1D8244FF, 0x332F647A, 0x0000AD5A,
+  0x10949EE0, 0x1E7A292E, 0x06DF8B3D, 0x02B2E30B, 0x31F8729E, 0x24E35475, 0x30B71878, 0x35EDBFB7, 0x0000EA68,
+  0x0DD048FA, 0x21688929, 0x0DE823FE, 0x1C53FAA9, 0x0EA0C84D, 0x052A592A, 0x1FCE7870, 0x11325CB2, 0x00002A27,
+  0x04C5723F, 0x30D81A50, 0x048306E4, 0x329B11C7, 0x223FB545, 0x085347A8, 0x2993E591, 0x1B5ACA8E, 0x0000CEF6,
+  0x04AF0773, 0x28D2EEA9, 0x2751EEEC, 0x037B4A7F, 0x3B4C1059, 0x08F37674, 0x2AE906E1, 0x18A88A6A, 0x00008786,
+  0x34BC21D1, 0x0CCE474D, 0x15048BF4, 0x1D0BB409, 0x021CDA16, 0x20DE76C3, 0x34C59063, 0x04EDE20E, 0x00003ED1,
+  0x282A3740, 0x0BE3BBF3, 0x29889DAE, 0x03413697, 0x34C68A09, 0x210EBE93, 0x0C8A224C, 0x0826B331, 0x00009099,
+  0x0624E3C4, 0x140317BA, 0x2F82C99D, 0x260C0A2C, 0x25D55179, 0x194DCC83, 0x3D95E462, 0x356F6A05, 0x0000741D,
+  0x0D4481D3, 0x2657FC8B, 0x1BA5CA71, 0x3AE44B0D, 0x07B1548E, 0x0E0D5522, 0x05FDC567, 0x2D1AA70E, 0x00000770,
+  0x06072C01, 0x23857675, 0x1EAD58A9, 0x0B8A12D9, 0x1EE2FC79, 0x0177CB61, 0x0495A618, 0x20DEB82B, 0x0000177C,
+  0x2FC7BFD8, 0x310EEF8B, 0x1FB4DF39, 0x3B8530E8, 0x0F4E7226, 0x0246B6D0, 0x2A558A24, 0x163353AF, 0x000063BB,
+  0x24D2920B, 0x1C249DCC, 0x2069C5E5, 0x09AB2F9E, 0x36DF3CF1, 0x1991FD0C, 0x062B97A7, 0x1E80070E, 0x000054E7,
+  0x20D0B375, 0x2E9F20BD, 0x35090081, 0x1C7A9DDC, 0x22E7C371, 0x087E3016, 0x03175421, 0x3C6ECA7D, 0x0000F599,
+  0x259B9D5F, 0x0D9A318F, 0x23A0EF16, 0x00EBE4B7, 0x088265AE, 0x2CDE2666, 0x2BAE7ADF, 0x1371A5C6, 0x0000F045,
+  0x0D034F36, 0x1F967378, 0x1B5FA3F4, 0x0EC8739D, 0x1643E62A, 0x1653947E, 0x22D1F4E6, 0x0FB8D64B, 0x0000B5B9
+];
+
+/// internal: writes the group order n of P-256 (32 bytes, big-endian) to out.
+export fn crx_p256_order(out: uint8*) {
+  for i in 0..32 {
+    out[i] = g_crx_p256_n[i];
+  }
+}
+
+// Arithmetic right shift of a 32-bit pattern read as signed.
+@inline fn crx_p256_arsh(x: uint32, n: int32) -> uint32 {
+  return (uint32)(((int32)x) >> n);
+}
+
+// Arithmetic right shift of a 64-bit pattern read as signed.
+@inline fn crx_p256_arshw(x: uint64, n: int32) -> uint64 {
+  return (uint64)(((int64)x) >> n);
+}
+
+// Wipes n 32-bit words.
+@inline fn crx_p256_wipe32(p: uint32*, n: int64) {
+  cr_wipe((uint8*)p, n * 4);
+}
+
+// Wipes n 64-bit words.
+@inline fn crx_p256_wipe64(p: uint64*, n: int64) {
+  cr_wipe((uint8*)p, n * 8);
+}
+
+// Converts an integer from unsigned big-endian bytes to 30-bit words in
+// little-endian order. The final partial word is returned (not stored).
+fn crx_p256_be8_to_le30(dst: uint32*, src: uint8*, len: int64) -> uint32 {
+  var acc: uint32 = 0;
+  var acc_len: int32 = 0;
+  var pos: int64 = len;
+  var out: int32 = 0;
+  while (pos > 0) {
+    pos = pos - 1;
+    var b: uint32 = (uint32)src[pos];
+    if (acc_len < 22) {
+      acc = acc | (b << acc_len);
+      acc_len = acc_len + 8;
+    } else {
+      dst[out] = (acc | (b << acc_len)) & CRX_P256_M30;
+      out = out + 1;
+      acc = b >> (30 - acc_len);
+      acc_len = acc_len - 22;
+    }
+  }
+  return acc;
+}
+
+// Converts an integer from 30-bit words (little-endian order) to unsigned
+// big-endian bytes; all len destination bytes are written.
+fn crx_p256_le30_to_be8(dst: uint8*, len: int64, src: uint32*) {
+  var acc: uint32 = 0;
+  var acc_len: int32 = 0;
+  var pos: int64 = len;
+  var si: int32 = 0;
+  while (pos > 0) {
+    pos = pos - 1;
+    if (acc_len < 8) {
+      var w: uint32 = src[si];
+      si = si + 1;
+      dst[pos] = (uint8)(acc | (w << acc_len));
+      acc = w >> (8 - acc_len);
+      acc_len = acc_len + 22;
+    } else {
+      dst[pos] = (uint8)acc;
+      acc = acc >> 8;
+      acc_len = acc_len - 8;
+    }
+  }
+}
+
+// Multiplies two integers of nine 30-bit words (values up to 2^270 - 1); the
+// result is 18 words of 30 bits. The largest intermediate is
+// 9 * (2^30 - 1)^2 + 9663676406 = 10376293531797946367 < 9663676407 * 2^30,
+// so adding nine products of 30-bit words with a carry of at most 9663676406
+// fits 64 bits and yields a carry of at most 9663676406.
+fn crx_p256_mul9(d: uint32*, a: uint32*, b: uint32*) {
+  var t: uint64[17];
+  t[0] = (uint64)a[0] * (uint64)b[0];
+  t[1] = (uint64)a[0] * (uint64)b[1]
+    + (uint64)a[1] * (uint64)b[0];
+  t[2] = (uint64)a[0] * (uint64)b[2]
+    + (uint64)a[1] * (uint64)b[1]
+    + (uint64)a[2] * (uint64)b[0];
+  t[3] = (uint64)a[0] * (uint64)b[3]
+    + (uint64)a[1] * (uint64)b[2]
+    + (uint64)a[2] * (uint64)b[1]
+    + (uint64)a[3] * (uint64)b[0];
+  t[4] = (uint64)a[0] * (uint64)b[4]
+    + (uint64)a[1] * (uint64)b[3]
+    + (uint64)a[2] * (uint64)b[2]
+    + (uint64)a[3] * (uint64)b[1]
+    + (uint64)a[4] * (uint64)b[0];
+  t[5] = (uint64)a[0] * (uint64)b[5]
+    + (uint64)a[1] * (uint64)b[4]
+    + (uint64)a[2] * (uint64)b[3]
+    + (uint64)a[3] * (uint64)b[2]
+    + (uint64)a[4] * (uint64)b[1]
+    + (uint64)a[5] * (uint64)b[0];
+  t[6] = (uint64)a[0] * (uint64)b[6]
+    + (uint64)a[1] * (uint64)b[5]
+    + (uint64)a[2] * (uint64)b[4]
+    + (uint64)a[3] * (uint64)b[3]
+    + (uint64)a[4] * (uint64)b[2]
+    + (uint64)a[5] * (uint64)b[1]
+    + (uint64)a[6] * (uint64)b[0];
+  t[7] = (uint64)a[0] * (uint64)b[7]
+    + (uint64)a[1] * (uint64)b[6]
+    + (uint64)a[2] * (uint64)b[5]
+    + (uint64)a[3] * (uint64)b[4]
+    + (uint64)a[4] * (uint64)b[3]
+    + (uint64)a[5] * (uint64)b[2]
+    + (uint64)a[6] * (uint64)b[1]
+    + (uint64)a[7] * (uint64)b[0];
+  t[8] = (uint64)a[0] * (uint64)b[8]
+    + (uint64)a[1] * (uint64)b[7]
+    + (uint64)a[2] * (uint64)b[6]
+    + (uint64)a[3] * (uint64)b[5]
+    + (uint64)a[4] * (uint64)b[4]
+    + (uint64)a[5] * (uint64)b[3]
+    + (uint64)a[6] * (uint64)b[2]
+    + (uint64)a[7] * (uint64)b[1]
+    + (uint64)a[8] * (uint64)b[0];
+  t[9] = (uint64)a[1] * (uint64)b[8]
+    + (uint64)a[2] * (uint64)b[7]
+    + (uint64)a[3] * (uint64)b[6]
+    + (uint64)a[4] * (uint64)b[5]
+    + (uint64)a[5] * (uint64)b[4]
+    + (uint64)a[6] * (uint64)b[3]
+    + (uint64)a[7] * (uint64)b[2]
+    + (uint64)a[8] * (uint64)b[1];
+  t[10] = (uint64)a[2] * (uint64)b[8]
+    + (uint64)a[3] * (uint64)b[7]
+    + (uint64)a[4] * (uint64)b[6]
+    + (uint64)a[5] * (uint64)b[5]
+    + (uint64)a[6] * (uint64)b[4]
+    + (uint64)a[7] * (uint64)b[3]
+    + (uint64)a[8] * (uint64)b[2];
+  t[11] = (uint64)a[3] * (uint64)b[8]
+    + (uint64)a[4] * (uint64)b[7]
+    + (uint64)a[5] * (uint64)b[6]
+    + (uint64)a[6] * (uint64)b[5]
+    + (uint64)a[7] * (uint64)b[4]
+    + (uint64)a[8] * (uint64)b[3];
+  t[12] = (uint64)a[4] * (uint64)b[8]
+    + (uint64)a[5] * (uint64)b[7]
+    + (uint64)a[6] * (uint64)b[6]
+    + (uint64)a[7] * (uint64)b[5]
+    + (uint64)a[8] * (uint64)b[4];
+  t[13] = (uint64)a[5] * (uint64)b[8]
+    + (uint64)a[6] * (uint64)b[7]
+    + (uint64)a[7] * (uint64)b[6]
+    + (uint64)a[8] * (uint64)b[5];
+  t[14] = (uint64)a[6] * (uint64)b[8]
+    + (uint64)a[7] * (uint64)b[7]
+    + (uint64)a[8] * (uint64)b[6];
+  t[15] = (uint64)a[7] * (uint64)b[8]
+    + (uint64)a[8] * (uint64)b[7];
+  t[16] = (uint64)a[8] * (uint64)b[8];
+
+  // Carry propagation.
+  var cc: uint64 = 0;
+  for i in 0..17 {
+    var w: uint64 = t[i] + cc;
+    d[i] = (uint32)w & CRX_P256_M30;
+    cc = w >> 30;
+  }
+  d[17] = (uint32)cc;
+  crx_p256_wipe64(&t[0], 17);
+}
+
+// Squares an integer of nine 30-bit words; the result is 18 words of 30 bits.
+fn crx_p256_square9(d: uint32*, a: uint32*) {
+  var t: uint64[17];
+  t[0] = (uint64)a[0] * (uint64)a[0];
+  t[1] = (((uint64)a[0] * (uint64)a[1]) << 1);
+  t[2] = (uint64)a[1] * (uint64)a[1]
+    + (((uint64)a[0] * (uint64)a[2]) << 1);
+  t[3] = (((uint64)a[0] * (uint64)a[3]
+    + (uint64)a[1] * (uint64)a[2]) << 1);
+  t[4] = (uint64)a[2] * (uint64)a[2]
+    + (((uint64)a[0] * (uint64)a[4]
+    + (uint64)a[1] * (uint64)a[3]) << 1);
+  t[5] = (((uint64)a[0] * (uint64)a[5]
+    + (uint64)a[1] * (uint64)a[4]
+    + (uint64)a[2] * (uint64)a[3]) << 1);
+  t[6] = (uint64)a[3] * (uint64)a[3]
+    + (((uint64)a[0] * (uint64)a[6]
+    + (uint64)a[1] * (uint64)a[5]
+    + (uint64)a[2] * (uint64)a[4]) << 1);
+  t[7] = (((uint64)a[0] * (uint64)a[7]
+    + (uint64)a[1] * (uint64)a[6]
+    + (uint64)a[2] * (uint64)a[5]
+    + (uint64)a[3] * (uint64)a[4]) << 1);
+  t[8] = (uint64)a[4] * (uint64)a[4]
+    + (((uint64)a[0] * (uint64)a[8]
+    + (uint64)a[1] * (uint64)a[7]
+    + (uint64)a[2] * (uint64)a[6]
+    + (uint64)a[3] * (uint64)a[5]) << 1);
+  t[9] = (((uint64)a[1] * (uint64)a[8]
+    + (uint64)a[2] * (uint64)a[7]
+    + (uint64)a[3] * (uint64)a[6]
+    + (uint64)a[4] * (uint64)a[5]) << 1);
+  t[10] = (uint64)a[5] * (uint64)a[5]
+    + (((uint64)a[2] * (uint64)a[8]
+    + (uint64)a[3] * (uint64)a[7]
+    + (uint64)a[4] * (uint64)a[6]) << 1);
+  t[11] = (((uint64)a[3] * (uint64)a[8]
+    + (uint64)a[4] * (uint64)a[7]
+    + (uint64)a[5] * (uint64)a[6]) << 1);
+  t[12] = (uint64)a[6] * (uint64)a[6]
+    + (((uint64)a[4] * (uint64)a[8]
+    + (uint64)a[5] * (uint64)a[7]) << 1);
+  t[13] = (((uint64)a[5] * (uint64)a[8]
+    + (uint64)a[6] * (uint64)a[7]) << 1);
+  t[14] = (uint64)a[7] * (uint64)a[7]
+    + (((uint64)a[6] * (uint64)a[8]) << 1);
+  t[15] = (((uint64)a[7] * (uint64)a[8]) << 1);
+  t[16] = (uint64)a[8] * (uint64)a[8];
+
+  // Carry propagation.
+  var cc: uint64 = 0;
+  for i in 0..17 {
+    var w: uint64 = t[i] + cc;
+    d[i] = (uint32)w & CRX_P256_M30;
+    cc = w >> 30;
+  }
+  d[17] = (uint32)cc;
+  crx_p256_wipe64(&t[0], 17);
+}
+
+// Addition in the field. The sources must fit 257 bits; the result is lower
+// than twice the modulus.
+fn crx_p256_add_f(d: uint32*, a: uint32*, b: uint32*) {
+  var w: uint32 = 0;
+  var cc: uint32 = 0;
+  var i: int32 = 0;
+  while (i < 9) {
+    w = a[i] + b[i] + cc;
+    d[i] = w & CRX_P256_M30;
+    cc = w >> 30;
+    i = i + 1;
+  }
+  w = w >> 16;
+  d[8] = d[8] & 0xFFFF;
+  d[3] = d[3] - (w << 6);
+  d[6] = d[6] - (w << 12);
+  d[7] = d[7] + (w << 14);
+  cc = w;
+  i = 0;
+  while (i < 9) {
+    w = d[i] + cc;
+    d[i] = w & CRX_P256_M30;
+    cc = crx_p256_arsh(w, 30);
+    i = i + 1;
+  }
+}
+
+// Subtraction in the field. The sources must be lower than twice the
+// modulus; so is the result.
+fn crx_p256_sub_f(d: uint32*, a: uint32*, b: uint32*) {
+  // Computes a - b + 2 * p, so that the result is positive.
+  var w: uint32 = a[0] - b[0] - 0x00002;
+  d[0] = w & CRX_P256_M30;
+  w = a[1] - b[1] + crx_p256_arsh(w, 30);
+  d[1] = w & CRX_P256_M30;
+  w = a[2] - b[2] + crx_p256_arsh(w, 30);
+  d[2] = w & CRX_P256_M30;
+  w = a[3] - b[3] + crx_p256_arsh(w, 30) + 0x00080;
+  d[3] = w & CRX_P256_M30;
+  w = a[4] - b[4] + crx_p256_arsh(w, 30);
+  d[4] = w & CRX_P256_M30;
+  w = a[5] - b[5] + crx_p256_arsh(w, 30);
+  d[5] = w & CRX_P256_M30;
+  w = a[6] - b[6] + crx_p256_arsh(w, 30) + 0x02000;
+  d[6] = w & CRX_P256_M30;
+  w = a[7] - b[7] + crx_p256_arsh(w, 30) - 0x08000;
+  d[7] = w & CRX_P256_M30;
+  w = a[8] - b[8] + crx_p256_arsh(w, 30) + 0x20000;
+  d[8] = w & 0xFFFF;
+  w = w >> 16;
+  d[8] = d[8] & 0xFFFF;
+  d[3] = d[3] - (w << 6);
+  d[6] = d[6] - (w << 12);
+  d[7] = d[7] + (w << 14);
+  var cc: uint32 = w;
+  var i: int32 = 0;
+  while (i < 9) {
+    w = d[i] + cc;
+    d[i] = w & CRX_P256_M30;
+    cc = crx_p256_arsh(w, 30);
+    i = i + 1;
+  }
+}
+
+// Modular reduction of an 18-word product t into d (nine words, lower than
+// twice the modulus). Each high word is added or subtracted where needed.
+//
+// The modulus is p = 2^256 - 2^224 + 2^192 + 2^96 - 1, so
+//   2^256 = 2^224 - 2^192 - 2^96 + 1 mod p
+// and a word x at bit offset n >= 256 is replaced by
+//   x * 2^(n-32) - x * 2^(n-64) - x * 2^(n-160) + x * 2^(n-256).
+// 64-bit intermediate words let the carries accumulate until the final
+// propagation.
+fn crx_p256_reduce18(d: uint32*, t: uint32*) {
+  var s: uint64[18];
+  var i: int32 = 0;
+  while (i < 18) {
+    s[i] = (uint64)t[i];
+    i = i + 1;
+  }
+  i = 17;
+  while (i >= 9) {
+    var y: uint64 = s[i];
+    s[i - 1] = s[i - 1] + crx_p256_arshw(y, 2);
+    s[i - 2] = s[i - 2] + ((y << 28) & CRX_P256_M30W);
+    s[i - 2] = s[i - 2] - crx_p256_arshw(y, 4);
+    s[i - 3] = s[i - 3] - ((y << 26) & CRX_P256_M30W);
+    s[i - 5] = s[i - 5] - crx_p256_arshw(y, 10);
+    s[i - 6] = s[i - 6] - ((y << 20) & CRX_P256_M30W);
+    s[i - 8] = s[i - 8] + crx_p256_arshw(y, 16);
+    s[i - 9] = s[i - 9] + ((y << 14) & CRX_P256_M30W);
+    i = i - 1;
+  }
+
+  // The carry propagation must be signed, and the result may come out
+  // negative. The loop above ran nine times, adding at most one extra word
+  // (in absolute value) to each word, so the top word fits 39 bits and the
+  // carry below fits 9 bits.
+  var cc: uint64 = 0;
+  var x: uint64 = 0;
+  i = 0;
+  while (i < 9) {
+    x = s[i] + cc;
+    d[i] = (uint32)x & CRX_P256_M30;
+    cc = crx_p256_arshw(x, 30);
+    i = i + 1;
+  }
+
+  // The nine words fit 30 bits each, with an extra (signed) carry of a few
+  // bits. The next two lines cut d to 256 bits and leave the carry beyond
+  // 2^256 in cc, whose significant length is under 24 bits, so 32-bit
+  // operations suffice from here on.
+  cc = crx_p256_arshw(x, 16);
+  d[8] = d[8] & 0xFFFF;
+
+  // One more round of reduction, for cc * 2^256: add
+  // cc * (2^224 - 2^192 - 2^96 + 1) to the nonnegative 256-bit value. If cc
+  // is negative the result could come out negative, so the modulus is added
+  // once in that case; propagating a negative carry gives a value below the
+  // modulus, so the final result stays under twice the modulus.
+  var z: uint32 = (uint32)cc;
+  d[3] = d[3] - (z << 6);
+  d[6] = d[6] - ((z << 12) & CRX_P256_M30);
+  d[7] = d[7] - crx_p256_arsh(z, 18);
+  d[7] = d[7] + ((z << 14) & CRX_P256_M30);
+  d[8] = d[8] + crx_p256_arsh(z, 16);
+  var c: uint32 = z >> 31;
+  d[0] = d[0] - c;
+  d[3] = d[3] + (c << 6);
+  d[6] = d[6] + (c << 12);
+  d[7] = d[7] - (c << 14);
+  d[8] = d[8] + (c << 16);
+  i = 0;
+  while (i < 9) {
+    var w: uint32 = d[i] + z;
+    d[i] = w & CRX_P256_M30;
+    z = crx_p256_arsh(w, 30);
+    i = i + 1;
+  }
+  crx_p256_wipe64(&s[0], 18);
+}
+
+// Multiplication in the field. The sources must be lower than twice the
+// modulus.
+fn crx_p256_mul_f(d: uint32*, a: uint32*, b: uint32*) {
+  var t: uint32[18];
+  crx_p256_mul9(&t[0], a, b);
+  crx_p256_reduce18(d, &t[0]);
+  crx_p256_wipe32(&t[0], 18);
+}
+
+// Squaring in the field. The source must be lower than twice the modulus.
+fn crx_p256_square_f(d: uint32*, a: uint32*) {
+  var t: uint32[18];
+  crx_p256_square9(&t[0], a);
+  crx_p256_reduce18(d, &t[0]);
+  crx_p256_wipe32(&t[0], 18);
+}
+
+// Final reduction in the field. The source must be lower than twice the
+// modulus. If it is not lower than the modulus, the modulus is subtracted and
+// 1 is returned; otherwise d is left alone and 0 is returned.
+fn crx_p256_reduce_final_f(d: uint32*) -> uint32 {
+  var t: uint32[9];
+  var cc: uint32 = 0;
+  var i: int32 = 0;
+  while (i < 9) {
+    var w: uint32 = d[i] - g_crx_p256_f[i] - cc;
+    cc = w >> 31;
+    t[i] = w & CRX_P256_M30;
+    i = i + 1;
+  }
+  cc = cc ^ 1;
+  crx_ct_ccopy(cc, d, &t[0], 9);
+  crx_p256_wipe32(&t[0], 9);
+  return cc;
+}
+
+// Jacobian coordinates of a P-256 point: the affine coordinates are
+// X = x / z^2 and Y = y / z^3, and z = 0 for the point at infinity, so each
+// point has many representations. The coordinates are nine 30-bit limbs each,
+// possibly above the modulus but always below twice the modulus.
+struct CrxP256Jac {
+  x: uint32[9];
+  y: uint32[9];
+  z: uint32[9];
+}
+
+// Wipes a point.
+@inline fn crx_p256_wipe_pt(P: CrxP256Jac*) {
+  crx_p256_wipe32(&P->x[0], 27);
+}
+
+// Converts a point to affine coordinates. For the point at infinity all three
+// coordinates are set to 0; otherwise z is set to 1 and x, y are the affine
+// X, Y, lower than the modulus.
+fn crx_p256_to_affine(P: CrxP256Jac*) {
+  var t1: uint32[9];
+  var t2: uint32[9];
+  var i: int32 = 0;
+
+  // 1/z is z^(p-2), with p - 2 = 2^256 - 2^224 + 2^192 + 2^96 - 3. Its bits
+  // from the high end are: 32 ones, 31 zeros, 1 one, 96 zeros, 94 ones, 1
+  // zero, 1 one. So z^(2^31 - 1) is computed first. If z = 0 (the point at
+  // infinity) the exponentiation yields 0, which gives the expected result
+  // of all three coordinates 0.
+  //
+  // A plain square-and-multiply for z^(2^31 - 1); an addition chain would
+  // save about two dozen multiplications at the price of more code and
+  // buffers.
+  i = 0;
+  while (i < 9) {
+    t1[i] = P->z[i];
+    i = i + 1;
+  }
+  i = 0;
+  while (i < 30) {
+    crx_p256_square_f(&t1[0], &t1[0]);
+    crx_p256_mul_f(&t1[0], &t1[0], &P->z[0]);
+    i = i + 1;
+  }
+
+  // Square-and-multiply: a few multiplications set bits to 1, by the
+  // original z for one bit and by t1 for 31 bits. The loop counter is
+  // public.
+  i = 0;
+  while (i < 9) {
+    t2[i] = P->z[i];
+    i = i + 1;
+  }
+  i = 1;
+  while (i < 256) {
+    crx_p256_square_f(&t2[0], &t2[0]);
+    if (i == 31 || i == 190 || i == 221 || i == 252) {
+      crx_p256_mul_f(&t2[0], &t2[0], &t1[0]);
+    }
+    if (i == 63 || i == 253 || i == 255) {
+      crx_p256_mul_f(&t2[0], &t2[0], &P->z[0]);
+    }
+    i = i + 1;
+  }
+
+  // With 1/z known, x is multiplied by 1/z^2 and y by 1/z^3.
+  crx_p256_mul_f(&t1[0], &t2[0], &t2[0]);
+  crx_p256_mul_f(&P->x[0], &t1[0], &P->x[0]);
+  crx_p256_mul_f(&t1[0], &t1[0], &t2[0]);
+  crx_p256_mul_f(&P->y[0], &t1[0], &P->y[0]);
+  crx_p256_reduce_final_f(&P->x[0]);
+  crx_p256_reduce_final_f(&P->y[0]);
+
+  // z times 1/z: 0 if z = 0, else 1.
+  crx_p256_mul_f(&P->z[0], &P->z[0], &t2[0]);
+  crx_p256_reduce_final_f(&P->z[0]);
+  crx_p256_wipe32(&t1[0], 9);
+  crx_p256_wipe32(&t2[0], 9);
+}
+
+// Doubles a point. Works for all valid points, the point at infinity
+// included.
+fn crx_p256_double(Q: CrxP256Jac*) {
+  // The formulas are:
+  //   s = 4 * x * y^2
+  //   m = 3 * (x + z^2) * (x - z^2)
+  //   x' = m^2 - 2 * s
+  //   y' = m * (s - x') - 8 * y^4
+  //   z' = 2 * y * z
+  // They work for points of order 2 and for the point at infinity too: if
+  // y = 0 then z' = 0 (there is no such point on P-256 anyway), and if
+  // z = 0 then z' = 0.
+  var t1: uint32[9];
+  var t2: uint32[9];
+  var t3: uint32[9];
+  var t4: uint32[9];
+
+  // z^2 in t1.
+  crx_p256_square_f(&t1[0], &Q->z[0]);
+
+  // x + z^2 in t2 and x - z^2 in t1.
+  crx_p256_add_f(&t2[0], &Q->x[0], &t1[0]);
+  crx_p256_sub_f(&t1[0], &Q->x[0], &t1[0]);
+
+  // 3 * (x + z^2) * (x - z^2) in t1.
+  crx_p256_mul_f(&t3[0], &t1[0], &t2[0]);
+  crx_p256_add_f(&t1[0], &t3[0], &t3[0]);
+  crx_p256_add_f(&t1[0], &t3[0], &t1[0]);
+
+  // 4 * x * y^2 in t2 and 2 * y^2 in t3.
+  crx_p256_square_f(&t3[0], &Q->y[0]);
+  crx_p256_add_f(&t3[0], &t3[0], &t3[0]);
+  crx_p256_mul_f(&t2[0], &Q->x[0], &t3[0]);
+  crx_p256_add_f(&t2[0], &t2[0], &t2[0]);
+
+  // x' = m^2 - 2 * s.
+  crx_p256_square_f(&Q->x[0], &t1[0]);
+  crx_p256_sub_f(&Q->x[0], &Q->x[0], &t2[0]);
+  crx_p256_sub_f(&Q->x[0], &Q->x[0], &t2[0]);
+
+  // z' = 2 * y * z.
+  crx_p256_mul_f(&t4[0], &Q->y[0], &Q->z[0]);
+  crx_p256_add_f(&Q->z[0], &t4[0], &t4[0]);
+
+  // y' = m * (s - x') - 8 * y^4; 2 * y^2 is already in t3.
+  crx_p256_sub_f(&t2[0], &t2[0], &Q->x[0]);
+  crx_p256_mul_f(&Q->y[0], &t1[0], &t2[0]);
+  crx_p256_square_f(&t4[0], &t3[0]);
+  crx_p256_add_f(&t4[0], &t4[0], &t4[0]);
+  crx_p256_sub_f(&Q->y[0], &Q->y[0], &t4[0]);
+  crx_p256_wipe32(&t1[0], 9);
+  crx_p256_wipe32(&t2[0], 9);
+  crx_p256_wipe32(&t3[0], 9);
+  crx_p256_wipe32(&t4[0], 9);
+}
+
+// Adds point P2 to point P1.
+//
+// The result is wrong in these cases, and P1 is then set to the point at
+// infinity: P1 = 0 but P2 != 0, P1 != 0 but P2 = 0, and P1 = P2.
+//
+// The returned value is 0 if P1 and P2 have the same Y coordinate, if
+// P1 = P2 = 0, or if the Y coordinate of one is 0 and the other is the point
+// at infinity. The last case cannot happen with valid points: a point with
+// Y = 0 has order 2 and there is none on P-256.
+//
+// So for P1 != 0 and P2 != 0 on input, the caller can apply: if the result
+// is not the point at infinity, it is correct; otherwise, if the returned
+// value is 1, P1 + P2 = 0 and the result is right; otherwise P1 = P2 and a
+// doubling should have been done.
+fn crx_p256_add(P1: CrxP256Jac*, P2: CrxP256Jac*) -> uint32 {
+  // The formulas are:
+  //   u1 = x1 * z2^2
+  //   u2 = x2 * z1^2
+  //   s1 = y1 * z2^3
+  //   s2 = y2 * z1^3
+  //   h = u2 - u1
+  //   r = s2 - s1
+  //   x3 = r^2 - h^3 - 2 * u1 * h^2
+  //   y3 = r * (u1 * h^2 - x3) - s1 * h^3
+  //   z3 = h * z1 * z2
+  var t1: uint32[9];
+  var t2: uint32[9];
+  var t3: uint32[9];
+  var t4: uint32[9];
+  var t5: uint32[9];
+  var t6: uint32[9];
+  var t7: uint32[9];
+  var ret: uint32 = 0;
+  var i: int32 = 0;
+
+  // u1 = x1 * z2^2 (in t1) and s1 = y1 * z2^3 (in t3).
+  crx_p256_square_f(&t3[0], &P2->z[0]);
+  crx_p256_mul_f(&t1[0], &P1->x[0], &t3[0]);
+  crx_p256_mul_f(&t4[0], &P2->z[0], &t3[0]);
+  crx_p256_mul_f(&t3[0], &P1->y[0], &t4[0]);
+
+  // u2 = x2 * z1^2 (in t2) and s2 = y2 * z1^3 (in t4).
+  crx_p256_square_f(&t4[0], &P1->z[0]);
+  crx_p256_mul_f(&t2[0], &P2->x[0], &t4[0]);
+  crx_p256_mul_f(&t5[0], &P1->z[0], &t4[0]);
+  crx_p256_mul_f(&t4[0], &P2->y[0], &t5[0]);
+
+  // h = u2 - u1 (in t2) and r = s2 - s1 (in t4). r is reduced further to
+  // test it for zero.
+  crx_p256_sub_f(&t2[0], &t2[0], &t1[0]);
+  crx_p256_sub_f(&t4[0], &t4[0], &t3[0]);
+  crx_p256_reduce_final_f(&t4[0]);
+  i = 0;
+  while (i < 9) {
+    ret = ret | t4[i];
+    i = i + 1;
+  }
+  ret = (ret | ((uint32)0 - ret)) >> 31;
+
+  // u1 * h^2 (in t6) and h^3 (in t5).
+  crx_p256_square_f(&t7[0], &t2[0]);
+  crx_p256_mul_f(&t6[0], &t1[0], &t7[0]);
+  crx_p256_mul_f(&t5[0], &t7[0], &t2[0]);
+
+  // x3 = r^2 - h^3 - 2 * u1 * h^2.
+  crx_p256_square_f(&P1->x[0], &t4[0]);
+  crx_p256_sub_f(&P1->x[0], &P1->x[0], &t5[0]);
+  crx_p256_sub_f(&P1->x[0], &P1->x[0], &t6[0]);
+  crx_p256_sub_f(&P1->x[0], &P1->x[0], &t6[0]);
+
+  // y3 = r * (u1 * h^2 - x3) - s1 * h^3.
+  crx_p256_sub_f(&t6[0], &t6[0], &P1->x[0]);
+  crx_p256_mul_f(&P1->y[0], &t4[0], &t6[0]);
+  crx_p256_mul_f(&t1[0], &t5[0], &t3[0]);
+  crx_p256_sub_f(&P1->y[0], &P1->y[0], &t1[0]);
+
+  // z3 = h * z1 * z2.
+  crx_p256_mul_f(&t1[0], &P1->z[0], &P2->z[0]);
+  crx_p256_mul_f(&P1->z[0], &t1[0], &t2[0]);
+
+  crx_p256_wipe32(&t1[0], 9);
+  crx_p256_wipe32(&t2[0], 9);
+  crx_p256_wipe32(&t3[0], 9);
+  crx_p256_wipe32(&t4[0], 9);
+  crx_p256_wipe32(&t5[0], 9);
+  crx_p256_wipe32(&t6[0], 9);
+  crx_p256_wipe32(&t7[0], 9);
+  return ret;
+}
+
+// Adds point P2 to point P1, for a nonzero P2 in affine coordinates (z = 1).
+//
+// The result is wrong in these cases, and P1 is then set to the point at
+// infinity: P1 = 0, and P1 = P2.
+//
+// The returned value is 0 if P1 and P2 have the same Y coordinate, or if the
+// Y coordinate of P2 is 0 and P1 is the point at infinity (not possible with
+// valid points: there is no point of order 2 on P-256).
+//
+// So for P1 != 0 on input, the caller can apply: if the result is not the
+// point at infinity, it is correct; otherwise, if the returned value is 1,
+// P1 + P2 = 0 and the result is right; otherwise P1 = P2 and a doubling
+// should have been done.
+fn crx_p256_add_mixed(P1: CrxP256Jac*, P2: CrxP256Jac*) -> uint32 {
+  // The formulas are:
+  //   u1 = x1
+  //   u2 = x2 * z1^2
+  //   s1 = y1
+  //   s2 = y2 * z1^3
+  //   h = u2 - u1
+  //   r = s2 - s1
+  //   x3 = r^2 - h^3 - 2 * u1 * h^2
+  //   y3 = r * (u1 * h^2 - x3) - s1 * h^3
+  //   z3 = h * z1
+  var t1: uint32[9];
+  var t2: uint32[9];
+  var t3: uint32[9];
+  var t4: uint32[9];
+  var t5: uint32[9];
+  var t6: uint32[9];
+  var t7: uint32[9];
+  var ret: uint32 = 0;
+  var i: int32 = 0;
+
+  // u1 = x1 (in t1) and s1 = y1 (in t3).
+  i = 0;
+  while (i < 9) {
+    t1[i] = P1->x[i];
+    t3[i] = P1->y[i];
+    i = i + 1;
+  }
+
+  // u2 = x2 * z1^2 (in t2) and s2 = y2 * z1^3 (in t4).
+  crx_p256_square_f(&t4[0], &P1->z[0]);
+  crx_p256_mul_f(&t2[0], &P2->x[0], &t4[0]);
+  crx_p256_mul_f(&t5[0], &P1->z[0], &t4[0]);
+  crx_p256_mul_f(&t4[0], &P2->y[0], &t5[0]);
+
+  // h = u2 - u1 (in t2) and r = s2 - s1 (in t4). r is reduced further to
+  // test it for zero.
+  crx_p256_sub_f(&t2[0], &t2[0], &t1[0]);
+  crx_p256_sub_f(&t4[0], &t4[0], &t3[0]);
+  crx_p256_reduce_final_f(&t4[0]);
+  i = 0;
+  while (i < 9) {
+    ret = ret | t4[i];
+    i = i + 1;
+  }
+  ret = (ret | ((uint32)0 - ret)) >> 31;
+
+  // u1 * h^2 (in t6) and h^3 (in t5).
+  crx_p256_square_f(&t7[0], &t2[0]);
+  crx_p256_mul_f(&t6[0], &t1[0], &t7[0]);
+  crx_p256_mul_f(&t5[0], &t7[0], &t2[0]);
+
+  // x3 = r^2 - h^3 - 2 * u1 * h^2.
+  crx_p256_square_f(&P1->x[0], &t4[0]);
+  crx_p256_sub_f(&P1->x[0], &P1->x[0], &t5[0]);
+  crx_p256_sub_f(&P1->x[0], &P1->x[0], &t6[0]);
+  crx_p256_sub_f(&P1->x[0], &P1->x[0], &t6[0]);
+
+  // y3 = r * (u1 * h^2 - x3) - s1 * h^3.
+  crx_p256_sub_f(&t6[0], &t6[0], &P1->x[0]);
+  crx_p256_mul_f(&P1->y[0], &t4[0], &t6[0]);
+  crx_p256_mul_f(&t1[0], &t5[0], &t3[0]);
+  crx_p256_sub_f(&P1->y[0], &P1->y[0], &t1[0]);
+
+  // z3 = h * z1.
+  crx_p256_mul_f(&P1->z[0], &P1->z[0], &t2[0]);
+
+  crx_p256_wipe32(&t1[0], 9);
+  crx_p256_wipe32(&t2[0], 9);
+  crx_p256_wipe32(&t3[0], 9);
+  crx_p256_wipe32(&t4[0], 9);
+  crx_p256_wipe32(&t5[0], 9);
+  crx_p256_wipe32(&t6[0], 9);
+  crx_p256_wipe32(&t7[0], 9);
+  return ret;
+}
+
+// Decodes a P-256 point (0x04 || X || Y, 65 bytes); the point at infinity is
+// not supported. Returns 1 if the point is valid (coordinates below the
+// modulus, on the curve), else 0.
+fn crx_p256_decode(P: CrxP256Jac*, src: uint8*, len: int64) -> uint32 {
+  var tx: uint32[9];
+  var ty: uint32[9];
+  var t1: uint32[9];
+  var t2: uint32[9];
+  var i: int32 = 0;
+  if (len != 65) {
+    return 0;
+  }
+
+  // The first byte must be 0x04 (uncompressed form). The "hybrid" form (0x06
+  // or 0x07, with the low bit of Y) is not accepted: RFC 5480 (section 2.2)
+  // forbids it.
+  var bad: uint32 = crx_ct_neq((uint32)src[0], 0x04);
+
+  // Decode the coordinates and check that both are lower than the modulus.
+  tx[8] = crx_p256_be8_to_le30(&tx[0], &src[1], 32);
+  ty[8] = crx_p256_be8_to_le30(&ty[0], &src[33], 32);
+  bad = bad | crx_p256_reduce_final_f(&tx[0]);
+  bad = bad | crx_p256_reduce_final_f(&ty[0]);
+
+  // The curve equation: y^2 = x^3 - 3x + b.
+  crx_p256_square_f(&t1[0], &tx[0]);
+  crx_p256_mul_f(&t1[0], &tx[0], &t1[0]);
+  crx_p256_square_f(&t2[0], &ty[0]);
+  crx_p256_sub_f(&t1[0], &t1[0], &tx[0]);
+  crx_p256_sub_f(&t1[0], &t1[0], &tx[0]);
+  crx_p256_sub_f(&t1[0], &t1[0], &tx[0]);
+  crx_p256_add_f(&t1[0], &t1[0], &g_crx_p256_b[0]);
+  crx_p256_sub_f(&t1[0], &t1[0], &t2[0]);
+  crx_p256_reduce_final_f(&t1[0]);
+  i = 0;
+  while (i < 9) {
+    bad = bad | t1[i];
+    i = i + 1;
+  }
+
+  // Copy the coordinates into the point.
+  i = 0;
+  while (i < 9) {
+    P->x[i] = tx[i];
+    P->y[i] = ty[i];
+    P->z[i] = 0;
+    i = i + 1;
+  }
+  P->z[0] = 1;
+  return crx_ct_eq(bad, 0);
+}
+
+// Encodes a point as 0x04 || X || Y. The point must be valid, in affine
+// coordinates and not the point at infinity.
+fn crx_p256_encode(dst: uint8*, P: CrxP256Jac*) {
+  dst[0] = 0x04;
+  crx_p256_le30_to_be8(&dst[1], 32, &P->x[0]);
+  crx_p256_le30_to_be8(&dst[33], 32, &P->y[0]);
+}
+
+// Multiplies a point by an integer, given as xlen big-endian bytes, assumed
+// below the group order. The base point must not be the point at infinity.
+fn crx_p256_mul_pt(P: CrxP256Jac*, x: uint8*, xlen: int64) {
+  // qz is a flag that is 1 as long as the accumulator is the point at
+  // infinity. A 2-bit window handles the multiplier bits by pairs; the
+  // precomputed window is the two points P2 and P3.
+  var P2: CrxP256Jac = *P;
+  crx_p256_double(&P2);
+  var P3: CrxP256Jac = *P;
+  crx_p256_add(&P3, &P2);
+
+  // Start with Q = 0 and process the multiplier bits 2 by 2.
+  var Q: CrxP256Jac;
+  var T: CrxP256Jac;
+  var U: CrxP256Jac;
+  var qz: uint32 = 1;
+  var n: int64 = 0;
+  while (n < xlen) {
+    var k: int32 = 6;
+    while (k >= 0) {
+      crx_p256_double(&Q);
+      crx_p256_double(&Q);
+      T = *P;
+      U = Q;
+      var bits: uint32 = ((uint32)x[n] >> k) & 3;
+      var bnz: uint32 = crx_ct_neq(bits, 0);
+      crx_ct_ccopy(crx_ct_eq(bits, 2), &T.x[0], &P2.x[0], 27);
+      crx_ct_ccopy(crx_ct_eq(bits, 3), &T.x[0], &P3.x[0], 27);
+      crx_p256_add(&U, &T);
+      crx_ct_ccopy(bnz & qz, &Q.x[0], &T.x[0], 27);
+      crx_ct_ccopy(bnz & crx_ct_not(qz), &Q.x[0], &U.x[0], 27);
+      qz = qz & crx_ct_not(bnz);
+      k = k - 2;
+    }
+    n = n + 1;
+  }
+  *P = Q;
+  crx_p256_wipe_pt(&P2);
+  crx_p256_wipe_pt(&P3);
+  crx_p256_wipe_pt(&Q);
+  crx_p256_wipe_pt(&T);
+  crx_p256_wipe_pt(&U);
+}
+
+// Looks up an entry of the generator window by index (1 to 15), in constant
+// time; the result is the affine point, with z = 1. Any other index gives
+// x = y = 0.
+fn crx_p256_lookup_gwin(T: CrxP256Jac*, idx: uint32) {
+  var xy: uint32[18];
+  var k: uint32 = 0;
+  while (k < 15) {
+    var m: uint32 = (uint32)0 - crx_ct_eq(idx, k + 1);
+    var u: uint32 = 0;
+    while (u < 18) {
+      xy[u] = xy[u] | (m & g_crx_p256_gwin[k * 18 + u]);
+      u = u + 1;
+    }
+    k = k + 1;
+  }
+  var i: int32 = 0;
+  while (i < 9) {
+    T->x[i] = xy[i];
+    T->y[i] = xy[9 + i];
+    T->z[i] = 0;
+    i = i + 1;
+  }
+  T->z[0] = 1;
+  crx_p256_wipe32(&xy[0], 18);
+}
+
+// Multiplies the generator by an integer (xlen big-endian bytes), assumed
+// nonzero and below the group order.
+fn crx_p256_mulgen_pt(P: CrxP256Jac*, x: uint8*, xlen: int64) {
+  // qz is a flag that is 1 as long as the accumulator is the point at
+  // infinity. A 4-bit window handles the multiplier bits by groups of four;
+  // the window is constant data in affine coordinates, read with a
+  // constant-time lookup.
+  var Q: CrxP256Jac;
+  var T: CrxP256Jac;
+  var U: CrxP256Jac;
+  var qz: uint32 = 1;
+  var n: int64 = 0;
+  while (n < xlen) {
+    var bx: uint32 = (uint32)x[n];
+    var k: int32 = 0;
+    while (k < 2) {
+      crx_p256_double(&Q);
+      crx_p256_double(&Q);
+      crx_p256_double(&Q);
+      crx_p256_double(&Q);
+      var bits: uint32 = (bx >> 4) & 0x0F;
+      var bnz: uint32 = crx_ct_neq(bits, 0);
+      crx_p256_lookup_gwin(&T, bits);
+      U = Q;
+      crx_p256_add_mixed(&U, &T);
+      crx_ct_ccopy(bnz & qz, &Q.x[0], &T.x[0], 27);
+      crx_ct_ccopy(bnz & crx_ct_not(qz), &Q.x[0], &U.x[0], 27);
+      qz = qz & crx_ct_not(bnz);
+      bx = bx << 4;
+      k = k + 1;
+    }
+    n = n + 1;
+  }
+  *P = Q;
+  crx_p256_wipe_pt(&Q);
+  crx_p256_wipe_pt(&T);
+  crx_p256_wipe_pt(&U);
+}
+
+/// internal: multiplies the P-256 generator by the integer x (xlen
+/// big-endian bytes, nonzero and below the group order) and writes the
+/// result as the 65-byte point 0x04 || X || Y; returns 65. Constant time in
+/// x.
+export fn crx_p256_mulgen(r: uint8*, x: uint8*, xlen: int64) -> int64 {
+  var P: CrxP256Jac;
+  crx_p256_mulgen_pt(&P, x, xlen);
+  crx_p256_to_affine(&P);
+  crx_p256_encode(r, &P);
+  crx_p256_wipe_pt(&P);
+  return 65;
+}
+
+/// internal: multiplies the point g (glen = 65 bytes, 0x04 || X || Y) by the
+/// integer x (xlen big-endian bytes, below the group order), in place.
+/// Returns 1 if g was a valid point, else 0 (the output is then not
+/// meaningful). Constant time in x.
+export fn crx_p256_mul(g: uint8*, glen: int64, x: uint8*, xlen: int64) -> uint32 {
+  if (glen != 65) {
+    return 0;
+  }
+  var P: CrxP256Jac;
+  var r: uint32 = crx_p256_decode(&P, g, glen);
+  crx_p256_mul_pt(&P, x, xlen);
+  crx_p256_to_affine(&P);
+  crx_p256_encode(g, &P);
+  crx_p256_wipe_pt(&P);
+  return r;
+}
+
+/// internal: computes x * A + y * B for the points A and B (len = 65 bytes
+/// each, 0x04 || X || Y) and the integers x, y (big-endian, below the group
+/// order); B may be null, meaning the generator. The result replaces A.
+/// Returns 1 on success, 0 if a point is invalid or the sum is the point at
+/// infinity. Constant time in x and y.
+export fn crx_p256_muladd(a: uint8*, b: uint8*, len: int64, x: uint8*, xlen: int64, y: uint8*, ylen: int64) -> uint32 {
+  if (len != 65) {
+    return 0;
+  }
+  var P: CrxP256Jac;
+  var Q: CrxP256Jac;
+  var r: uint32 = crx_p256_decode(&P, a, len);
+  crx_p256_mul_pt(&P, x, xlen);
+  if (b == 0) {
+    crx_p256_mulgen_pt(&Q, y, ylen);
+  } else {
+    r = r & crx_p256_decode(&Q, b, len);
+    crx_p256_mul_pt(&Q, y, ylen);
+  }
+
+  // The final addition fails if both points are equal.
+  var t: uint32 = crx_p256_add(&P, &Q);
+  crx_p256_reduce_final_f(&P.z[0]);
+  var z: uint32 = 0;
+  var i: int32 = 0;
+  while (i < 9) {
+    z = z | P.z[i];
+    i = i + 1;
+  }
+  z = crx_ct_eq(z, 0);
+  crx_p256_double(&Q);
+
+  // If z is 1, either P + Q = 0 (t = 1) or P = Q (t = 0):
+  //   z = 0, t = 0   return P (normal addition)
+  //   z = 0, t = 1   return P (normal addition)
+  //   z = 1, t = 0   return Q (the doubling case)
+  //   z = 1, t = 1   report an error (P + Q = 0)
+  crx_ct_ccopy(z & crx_ct_not(t), &P.x[0], &Q.x[0], 27);
+  crx_p256_to_affine(&P);
+  crx_p256_encode(a, &P);
+  r = r & crx_ct_not(z & t);
+  crx_p256_wipe_pt(&P);
+  crx_p256_wipe_pt(&Q);
+  return r;
+}
+
+// 1 if the 32-byte big-endian scalar d is in [1, n-1], else 0; the time does
+// not depend on d.
+fn crx_p256_scalar_ok(d: uint8*) -> uint32 {
+  // Borrow of d - n: 1 exactly when d < n.
+  var borrow: uint32 = 0;
+  var any: uint32 = 0;
+  var i: int32 = 31;
+  while (i >= 0) {
+    borrow = ((uint32)d[i] - (uint32)g_crx_p256_n[i] - borrow) >> 31;
+    any = any | (uint32)d[i];
+    i = i - 1;
+  }
+  return borrow & crx_ct_neq(any, 0);
+}
+
+// pk = 0x04 || X || Y of the scalar d (valid, checked by the caller).
+fn crx_p256_public(pk: uint8*, d: uint8*) {
+  crx_p256_mulgen(pk, d, 32);
+}
+
+/// Generates a P-256 key pair: a uniformly random secret scalar in
+/// [1, n-1] (rejection sampling on 32 random bytes) and its public key, the
+/// uncompressed point 0x04 || X || Y.
+/// in: pk, writable for pk_cap bytes, pk_cap >= 65 (CR_P256_PUBLIC_BYTES); sk
+/// returns: CR_OK; CR_E_ARG (null pointer or negative pk_cap); CR_E_SPACE if
+///   pk_cap < 65 (nothing is written); CR_E_INTERNAL if the kernel random
+///   source fails (sk is wiped)
+/// owns: sk is secret caller memory: cr_wipe(&sk.b[0], 32) when done; pk is public
+/// thread: any thread (no shared state)
+/// example: var pk: uint8[65]; var sk: CrP256Secret; cr_p256_keypair(&pk[0], 65, &sk);
+export fn cr_p256_keypair(pk: uint8*, pk_cap: int64, sk: CrP256Secret*) -> int32 {
+  if (pk == 0 || sk == 0 || pk_cap < 0) { return CR_E_ARG; }
+  if (pk_cap < 65) { return CR_E_SPACE; }
+  // A random 256-bit value is outside [1, n-1] with probability about 2^-32,
+  // so the bound below is never reached with a working random source.
+  var tries: int32 = 0;
+  while (tries < 64) {
+    if (cr_random_bytes(&sk->b[0], 32) != CR_OK) {
+      cr_wipe(&sk->b[0], 32);
+      return CR_E_INTERNAL;
+    }
+    if (crx_p256_scalar_ok(&sk->b[0]) == 1) {
+      crx_p256_public(pk, &sk->b[0]);
+      return CR_OK;
+    }
+    tries = tries + 1;
+  }
+  cr_wipe(&sk->b[0], 32);
+  return CR_E_INTERNAL;
+}
+
+/// Computes the public key of a P-256 secret scalar: the uncompressed point
+/// 0x04 || X || Y of d * G.
+/// in: pk, writable for pk_cap bytes, pk_cap >= 65 (CR_P256_PUBLIC_BYTES); sk
+/// returns: CR_OK; CR_E_ARG (null pointer or negative pk_cap); CR_E_SPACE if
+///   pk_cap < 65 (nothing is written); CR_E_KEY if the scalar is 0 or not
+///   lower than the group order n (the first 65 bytes of pk are wiped)
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: if (cr_p256_public_from_secret(&pk[0], 65, &sk) != CR_OK) { reject(); }
+export fn cr_p256_public_from_secret(pk: uint8*, pk_cap: int64, sk: CrP256Secret*) -> int32 {
+  if (pk == 0 || sk == 0 || pk_cap < 0) { return CR_E_ARG; }
+  if (pk_cap < 65) { return CR_E_SPACE; }
+  if (crx_p256_scalar_ok(&sk->b[0]) == 0) {
+    cr_wipe(pk, 65);
+    return CR_E_KEY;
+  }
+  crx_p256_public(pk, &sk->b[0]);
+  return CR_OK;
+}
+
+/// Computes the raw ECDH shared secret of P-256: the X coordinate of the
+/// point sk * peer, as 32 big-endian bytes. This is not a key: feed it into
+/// a KDF (cr_hkdf_sha256 or cr_hkdf_sha384) with both public keys and a
+/// context string. The peer key is validated: it must be exactly 65 bytes,
+/// 0x04 || X || Y, with X and Y lower than the field prime and the point on
+/// the curve (the curve has prime order, so there are no small subgroups).
+/// in: shared; sk, our secret key; peer, readable for peer_len bytes
+/// returns: CR_OK; CR_E_ARG (null pointer, negative peer_len); CR_E_KEY if
+///   peer is not a valid public key (wrong length or format, coordinates out
+///   of range, not on the curve) or sk is 0 or not lower than n (shared is
+///   wiped)
+/// owns: shared is secret caller memory: cr_wipe(&shared.b[0], 32) when done
+/// thread: any thread (no shared state)
+/// example: var z: CrKey32; if (cr_p256_ecdh(&z, &sk, &peer[0], 65) != CR_OK) { reject(); }
+export fn cr_p256_ecdh(shared: CrKey32*, sk: CrP256Secret*, peer: uint8*, peer_len: int64) -> int32 {
+  if (shared == 0) { return CR_E_ARG; }
+  cr_wipe(&shared->b[0], 32);
+  if (sk == 0 || peer_len < 0) { return CR_E_ARG; }
+  if (peer == 0 && peer_len > 0) { return CR_E_ARG; }
+  if (peer_len != 65) { return CR_E_KEY; }
+
+  var P: CrxP256Jac;
+  var ok: uint32 = crx_p256_decode(&P, peer, 65);
+  var sok: uint32 = crx_p256_scalar_ok(&sk->b[0]);
+  if (ok == 0 || sok == 0) {
+    crx_p256_wipe_pt(&P);
+    return CR_E_KEY;
+  }
+  crx_p256_mul_pt(&P, &sk->b[0], 32);
+  crx_p256_to_affine(&P);
+
+  // The result cannot be the point at infinity for a valid point and a
+  // scalar in [1, n-1]; refuse it all the same.
+  var zacc: uint32 = 0;
+  var i: int32 = 0;
+  while (i < 9) {
+    zacc = zacc | P.z[i];
+    i = i + 1;
+  }
+  if (zacc == 0) {
+    crx_p256_wipe_pt(&P);
+    return CR_E_KEY;
+  }
+  crx_p256_le30_to_be8(&shared->b[0], 32, &P.x[0]);
+  crx_p256_wipe_pt(&P);
+  return CR_OK;
+}

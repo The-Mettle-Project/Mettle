@@ -1,0 +1,126 @@
+// Memory: /proc/meminfo for sizes and /proc/vmstat for swap traffic
+// (proc(5)). "used" is total minus MemAvailable, as free(1) and btop show
+// it; "cached" is Cached plus SReclaimable, as free(1) counts it.
+import "std/time";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+
+export struct SysinfoLxMem {
+  fd_meminfo: int64;
+  fd_vmstat: int64;
+  prev_in: int64;
+  prev_out: int64;
+  prev_ns: int64;
+  have_prev: bool;
+}
+
+fn sysinfo_lx_pct(part: int64, whole: int64) -> float64 {
+  if (whole <= 0 || part < 0) { return -1.0; }
+  return (float64)part * 100.0 / (float64)whole;
+}
+
+// Fills the sizes from /proc/meminfo text.
+export fn sysinfo_lx_mem_parse(out: SysinfoMem*, text: string) {
+  var total: int64 = -1;
+  var free_b: int64 = -1;
+  var avail: int64 = -1;
+  var buffers: int64 = -1;
+  var cached: int64 = -1;
+  var srecl: int64 = 0;
+  var shmem: int64 = -1;
+  var st: int64 = -1;
+  var sf: int64 = -1;
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  while (!sysinfo_lx_end(&s)) {
+    var key: string = sysinfo_lx_word(&s);
+    var v: int64 = (int64)sysinfo_lx_u64(&s) * 1024;
+    if (sysinfo_lx_eq(key, "MemTotal:")) { total = v; }
+    else if (sysinfo_lx_eq(key, "MemFree:")) { free_b = v; }
+    else if (sysinfo_lx_eq(key, "MemAvailable:")) { avail = v; }
+    else if (sysinfo_lx_eq(key, "Buffers:")) { buffers = v; }
+    else if (sysinfo_lx_eq(key, "Cached:")) { cached = v; }
+    else if (sysinfo_lx_eq(key, "SReclaimable:")) { srecl = v; }
+    else if (sysinfo_lx_eq(key, "Shmem:")) { shmem = v; }
+    else if (sysinfo_lx_eq(key, "SwapTotal:")) { st = v; }
+    else if (sysinfo_lx_eq(key, "SwapFree:")) { sf = v; }
+    sysinfo_lx_next_line(&s);
+  }
+  // Kernels before 3.14 have no MemAvailable: estimate it as free(1) did.
+  if (avail < 0 && free_b >= 0) {
+    avail = free_b;
+    if (buffers > 0) { avail = avail + buffers; }
+    if (cached > 0) { avail = avail + cached; }
+  }
+  if (avail > total && total >= 0) { avail = total; }
+  out->total = total;
+  out->free = free_b;
+  out->available = avail;
+  out->buffers = buffers;
+  out->cached = cached;
+  if (cached >= 0) { out->cached = cached + srecl; }
+  out->shared = shmem;
+  out->used = -1;
+  if (total >= 0 && avail >= 0) { out->used = total - avail; }
+  out->used_pct = sysinfo_lx_pct(out->used, total);
+  out->swap_total = st;
+  out->swap_free = sf;
+  out->swap_used = -1;
+  if (st >= 0 && sf >= 0) { out->swap_used = st - sf; }
+  out->swap_used_pct = 0.0;
+  if (st > 0) { out->swap_used_pct = sysinfo_lx_pct(out->swap_used, st); }
+}
+
+// Swap traffic from /proc/vmstat text: pages in and out since boot.
+export fn sysinfo_lx_vmstat_swap(text: string, pin: int64*, pout: int64*) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  *pin = -1;
+  *pout = -1;
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, "pswpin ")) { s.i = s.i + 7; *pin = sysinfo_lx_i64(&s); }
+    else if (sysinfo_lx_at(&s, "pswpout ")) { s.i = s.i + 8; *pout = sysinfo_lx_i64(&s); }
+    sysinfo_lx_next_line(&s);
+  }
+}
+
+export fn sysinfo_lx_mem_init(st: SysinfoLxMem*, c: SysinfoLxCtx*, out: SysinfoMem*) -> int32 {
+  var p: SysinfoLxPath;
+  st->fd_meminfo = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/meminfo"));
+  st->fd_vmstat = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/vmstat"));
+  if (st->fd_meminfo < 0) { out->status = SYSINFO_E_IO; return SYSINFO_E_IO; }
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_mem_refresh(st: SysinfoLxMem*, c: SysinfoLxCtx*, out: SysinfoMem*) -> int32 {
+  var n: int64 = sysinfo_lx_fd_slurp(st->fd_meminfo, &c->buf);
+  if (n <= 0) { out->status = SYSINFO_E_IO; return SYSINFO_E_IO; }
+  sysinfo_lx_mem_parse(out, sysinfo_lx_view(c->buf.p, n));
+  if (out->total > 0) { c->mem_total = out->total; }
+  out->swap_in_s = -1.0;
+  out->swap_out_s = -1.0;
+  n = sysinfo_lx_fd_slurp(st->fd_vmstat, &c->buf);
+  if (n > 0) {
+    var pin: int64 = 0;
+    var pout: int64 = 0;
+    sysinfo_lx_vmstat_swap(sysinfo_lx_view(c->buf.p, n), &pin, &pout);
+    var t: int64 = time_mono_ns();
+    var secs: float64 = (float64)(t - st->prev_ns) / 1000000000.0;
+    out->swap_in_s = 0.0;
+    out->swap_out_s = 0.0;
+    if (st->have_prev && pin >= 0 && pout >= 0) {
+      out->swap_in_s = sysinfo_lx_rate(pin, st->prev_in, secs) * (float64)c->page_size;
+      out->swap_out_s = sysinfo_lx_rate(pout, st->prev_out, secs) * (float64)c->page_size;
+    }
+    st->prev_in = pin;
+    st->prev_out = pout;
+    st->prev_ns = t;
+    st->have_prev = true;
+  }
+  out->status = SYSINFO_OK;
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_mem_free(st: SysinfoLxMem*) {
+  sysinfo_lx_close(st->fd_meminfo);
+  sysinfo_lx_close(st->fd_vmstat);
+}

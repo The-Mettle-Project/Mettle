@@ -1,0 +1,26 @@
+// AArch64 stand-in for aes_hw_x86_64.mettle: there is no hardware AES-GCM
+// path on this target, so crx_aes_hw_available says no and gcm.mettle never
+// calls the other functions. They exist so the same code compiles everywhere.
+
+/// internal: 0, always: no hardware AES on this target.
+export fn crx_aes_hw_available() -> uint32 {
+  return 0;
+}
+
+/// internal: never called; returns 0.
+export fn crx_aes_hw_expand(rk: uint8*, key: uint8*, keylen: int64) -> uint32 {
+  return 0;
+}
+
+/// internal: never called.
+export fn crx_aes_hw_encrypt_block(rk: uint8*, rounds: uint32, in16: uint8*, out16: uint8*) {
+}
+
+/// internal: never called; returns ctr.
+export fn crx_aes_hw_ctr_xor(rk: uint8*, rounds: uint32, iv: uint8*, ctr: uint32, src: uint8*, dst: uint8*, len: int64) -> uint32 {
+  return ctr;
+}
+
+/// internal: never called.
+export fn crx_ghash_hw(y: uint8*, h: uint8*, data: uint8*, len: int64) {
+}

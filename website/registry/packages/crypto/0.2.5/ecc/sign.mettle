@@ -1,0 +1,77 @@
+// Signatures: Ed25519 (RFC 8032 section 5.1), in pure Mettle, detached form.
+// The secret key is 64 bytes: the RFC 8032 32-byte private key
+// (the seed) followed by the public key.
+
+import "crypto/core/status";
+import "crypto/core/types";
+import "crypto/core/util";
+import "crypto/ecc/curve25519";
+
+var g_cr_sign_empty: uint8[1];
+
+fn cr_sign_ptr(p: uint8*, n: int64) -> uint8* {
+  if (p == 0 || n == 0) { return &g_cr_sign_empty[0]; }
+  return p;
+}
+
+/// Generates a random Ed25519 key pair (a random seed).
+/// in: pk, sk
+/// returns: CR_OK; CR_E_ARG (null pointer); CR_E_INTERNAL if the kernel random
+///   source fails
+/// owns: sk is secret caller memory: cr_wipe(&sk.b[0], 64) when done
+/// thread: any thread (no shared state)
+/// example: var pk: CrEd25519Public; var sk: CrEd25519Secret; cr_ed25519_keypair(&pk, &sk);
+export fn cr_ed25519_keypair(pk: CrEd25519Public*, sk: CrEd25519Secret*) -> int32 {
+  if (pk == 0 || sk == 0) { return CR_E_ARG; }
+  var seed: uint8[32];
+  if (cr_random_bytes(&seed[0], 32) != CR_OK) {
+    cr_wipe(&seed[0], 32);
+    return CR_E_INTERNAL;
+  }
+  crx_ed25519_seed_keypair(&pk->b[0], &sk->b[0], &seed[0]);
+  cr_wipe(&seed[0], 32);
+  return CR_OK;
+}
+
+/// Derives the Ed25519 key pair of a 32-byte seed (the RFC 8032 private key)
+/// deterministically.
+/// in: pk, sk; seed
+/// returns: CR_OK; CR_E_ARG (null pointer)
+/// owns: seed and sk are secret caller memory: wipe both when done
+/// thread: any thread (no shared state)
+/// example: cr_ed25519_seed_keypair(&pk, &sk, &seed);
+export fn cr_ed25519_seed_keypair(pk: CrEd25519Public*, sk: CrEd25519Secret*, seed: CrSeed32*) -> int32 {
+  if (pk == 0 || sk == 0 || seed == 0) { return CR_E_ARG; }
+  crx_ed25519_seed_keypair(&pk->b[0], &sk->b[0], &seed->b[0]);
+  return CR_OK;
+}
+
+/// Signs msg, producing a detached 64-byte signature.
+/// Ed25519 is deterministic: the same key and message give the same
+/// signature.
+/// in: sig; msg/n (0 allowed when n == 0); sk
+/// returns: CR_OK; CR_E_ARG (null sig/sk, null msg with n > 0, n < 0). On
+///   error sig is zeroed
+/// owns: nothing; the caller owns sk and must wipe it when done
+/// thread: any thread (no shared state)
+/// example: var sig: CrEd25519Sig; cr_ed25519_sign(&sig, m.chars, (int64)m.length, &sk);
+export fn cr_ed25519_sign(sig: CrEd25519Sig*, msg: uint8*, n: int64, sk: CrEd25519Secret*) -> int32 {
+  if (sig == 0) { return CR_E_ARG; }
+  cr_wipe(&sig->b[0], 64);
+  if (sk == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  crx_ed25519_sign(&sig->b[0], cr_sign_ptr(msg, n), n, &sk->b[0]);
+  return CR_OK;
+}
+
+/// Verifies a detached Ed25519 signature (rejecting a non-canonical S, and
+/// non-canonical or small-order keys and R).
+/// in: sig; msg/n; pk, the signer's public key
+/// returns: true only if sig is a valid signature of exactly these n bytes
+///   under pk; false otherwise and for every argument error (fails closed)
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: if (!cr_ed25519_verify(&sig, m.chars, (int64)m.length, &pk)) { reject(); }
+export fn cr_ed25519_verify(sig: CrEd25519Sig*, msg: uint8*, n: int64, pk: CrEd25519Public*) -> bool {
+  if (sig == 0 || pk == 0 || n < 0 || (msg == 0 && n > 0)) { return false; }
+  return crx_ed25519_verify(&sig->b[0], cr_sign_ptr(msg, n), n, &pk->b[0]);
+}

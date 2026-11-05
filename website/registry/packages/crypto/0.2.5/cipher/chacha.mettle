@@ -1,0 +1,188 @@
+// ChaCha20 (RFC 8439 sections 2.1 to 2.4) and HChaCha20
+// (draft-irtf-cfrg-xchacha-03 section 2.2), in pure Mettle. Internal: the
+// public entry point is cr_aead_* in aead.mettle.
+//
+// Constant time: the only branches and loop bounds depend on public lengths,
+// the public block counter and the CPU type; the state words are secret.
+// Long inputs go through the SIMD code in chacha_hw_x86_64.mettle when the
+// CPU has SSSE3 or AVX2; the output is the same byte for byte.
+
+import "crypto/core/util";
+import "crypto/cipher/chacha_hw_x86_64" if x86_64;
+import "crypto/cipher/chacha_hw_aarch64" if aarch64;
+
+var g_crx_chacha_lvl: uint32 = 0;
+
+fn crx_chacha_level() -> uint32 {
+  var l: uint32 = g_crx_chacha_lvl;
+  if (l == 0) {
+    l = crx_chacha_hw_level() + (uint32)1;
+    g_crx_chacha_lvl = l;
+  }
+  return l - (uint32)1;
+}
+
+/// internal: loads 4 bytes as a little-endian uint32.
+export fn crx_ld32(p: uint8*) -> uint32 {
+  return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
+
+/// internal: stores a uint32 as 4 little-endian bytes.
+export fn crx_st32(p: uint8*, v: uint32) {
+  p[0] = (uint8)(v & (uint32)0xff);
+  p[1] = (uint8)((v >> 8) & (uint32)0xff);
+  p[2] = (uint8)((v >> 16) & (uint32)0xff);
+  p[3] = (uint8)((v >> 24) & (uint32)0xff);
+}
+
+fn crx_chacha_qr(x: uint32*, a: int32, b: int32, c: int32, d: int32) {
+  var xa: uint32 = x[a];
+  var xb: uint32 = x[b];
+  var xc: uint32 = x[c];
+  var xd: uint32 = x[d];
+  xa = xa + xb; xd = xd ^ xa; xd = (xd << 16) | (xd >> 16);
+  xc = xc + xd; xb = xb ^ xc; xb = (xb << 12) | (xb >> 20);
+  xa = xa + xb; xd = xd ^ xa; xd = (xd << 8) | (xd >> 24);
+  xc = xc + xd; xb = xb ^ xc; xb = (xb << 7) | (xb >> 25);
+  x[a] = xa;
+  x[b] = xb;
+  x[c] = xc;
+  x[d] = xd;
+}
+
+// 20 rounds (10 column rounds interleaved with 10 diagonal rounds) in place.
+fn crx_chacha_rounds(x: uint32*) {
+  var i: int32 = 0;
+  while (i < 10) {
+    crx_chacha_qr(x, 0, 4, 8, 12);
+    crx_chacha_qr(x, 1, 5, 9, 13);
+    crx_chacha_qr(x, 2, 6, 10, 14);
+    crx_chacha_qr(x, 3, 7, 11, 15);
+    crx_chacha_qr(x, 0, 5, 10, 15);
+    crx_chacha_qr(x, 1, 6, 11, 12);
+    crx_chacha_qr(x, 2, 7, 8, 13);
+    crx_chacha_qr(x, 3, 4, 9, 14);
+    i = i + 1;
+  }
+}
+
+/// internal: the ChaCha20 block function (RFC 8439 2.3): 64 keystream bytes
+/// for a 32-byte key, a 32-bit block counter and a 12-byte nonce.
+export fn crx_chacha20_block(key: uint8*, counter: uint32, nonce12: uint8*, out: uint8*) {
+  var s: uint32[16];
+  var w: uint32[16];
+  s[0] = (uint32)0x61707865;
+  s[1] = (uint32)0x3320646e;
+  s[2] = (uint32)0x79622d32;
+  s[3] = (uint32)0x6b206574;
+  var i: int32 = 0;
+  while (i < 8) {
+    s[4 + i] = crx_ld32(&key[i * 4]);
+    i = i + 1;
+  }
+  s[12] = counter;
+  s[13] = crx_ld32(&nonce12[0]);
+  s[14] = crx_ld32(&nonce12[4]);
+  s[15] = crx_ld32(&nonce12[8]);
+  i = 0;
+  while (i < 16) {
+    w[i] = s[i];
+    i = i + 1;
+  }
+  crx_chacha_rounds(&w[0]);
+  i = 0;
+  while (i < 16) {
+    crx_st32(&out[i * 4], w[i] + s[i]);
+    i = i + 1;
+  }
+  cr_wipe((uint8*)&s[0], 64);
+  cr_wipe((uint8*)&w[0], 64);
+}
+
+/// internal: ChaCha20 encryption/decryption (RFC 8439 2.4): XORs n bytes of
+/// inp with the keystream starting at block `counter`. out may equal inp.
+export fn crx_chacha20_xor(out: uint8*, inp: uint8*, n: int64, key: uint8*, nonce12: uint8*, counter: uint32) {
+  var ks: uint8[64];
+  var ctr: uint32 = counter;
+  var pos: int64 = 0;
+  if (n >= 128) {
+    var lvl: uint32 = crx_chacha_level();
+    if (lvl != 0) {
+      var st: uint32[16];
+      st[0] = (uint32)0x61707865;
+      st[1] = (uint32)0x3320646e;
+      st[2] = (uint32)0x79622d32;
+      st[3] = (uint32)0x6b206574;
+      var k: int32 = 0;
+      while (k < 8) {
+        st[4 + k] = crx_ld32(&key[k * 4]);
+        k = k + 1;
+      }
+      st[12] = ctr;
+      st[13] = crx_ld32(&nonce12[0]);
+      st[14] = crx_ld32(&nonce12[4]);
+      st[15] = crx_ld32(&nonce12[8]);
+      var nb: int64 = n >> 6;
+      if (lvl == 2) {
+        var n8: int64 = nb & ~(int64)7;
+        crx_chacha_avx2x8_blocks(&st[0], inp, out, n8);
+        pos = n8 << 6;
+        ctr = ctr + (uint32)n8;
+        nb = nb - n8;
+        st[12] = ctr;
+        var n4: int64 = nb & ~(int64)3;
+        crx_chacha_avx2_blocks(&st[0], &inp[pos], &out[pos], n4);
+        pos = pos + (n4 << 6);
+        ctr = ctr + (uint32)n4;
+        nb = nb - n4;
+      }
+      var n2: int64 = nb & ~(int64)1;
+      st[12] = ctr;
+      crx_chacha_ssse3_blocks(&st[0], &inp[pos], &out[pos], n2);
+      pos = pos + (n2 << 6);
+      ctr = ctr + (uint32)n2;
+      cr_wipe((uint8*)&st[0], 64);
+    }
+  }
+  while (pos < n) {
+    crx_chacha20_block(key, ctr, nonce12, &ks[0]);
+    var take: int64 = n - pos;
+    if (take > 64) { take = 64; }
+    var i: int64 = 0;
+    while (i < take) {
+      out[pos + i] = inp[pos + i] ^ ks[i];
+      i = i + 1;
+    }
+    pos = pos + take;
+    ctr = ctr + (uint32)1;
+  }
+  cr_wipe(&ks[0], 64);
+}
+
+/// internal: HChaCha20 (draft-irtf-cfrg-xchacha-03 2.2): derives a 32-byte
+/// subkey from a 32-byte key and the first 16 bytes of an XChaCha20 nonce.
+export fn crx_hchacha20(out: uint8*, key: uint8*, nonce16: uint8*) {
+  var x: uint32[16];
+  x[0] = (uint32)0x61707865;
+  x[1] = (uint32)0x3320646e;
+  x[2] = (uint32)0x79622d32;
+  x[3] = (uint32)0x6b206574;
+  var i: int32 = 0;
+  while (i < 8) {
+    x[4 + i] = crx_ld32(&key[i * 4]);
+    i = i + 1;
+  }
+  i = 0;
+  while (i < 4) {
+    x[12 + i] = crx_ld32(&nonce16[i * 4]);
+    i = i + 1;
+  }
+  crx_chacha_rounds(&x[0]);
+  i = 0;
+  while (i < 4) {
+    crx_st32(&out[i * 4], x[i]);
+    crx_st32(&out[16 + i * 4], x[12 + i]);
+    i = i + 1;
+  }
+  cr_wipe((uint8*)&x[0], 64);
+}

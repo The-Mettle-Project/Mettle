@@ -1,0 +1,238 @@
+// Protocol Buffers wire format: the helpers generated code calls.
+// Spec: https://protobuf.dev/programming-guides/encoding/
+//
+// Encoding writes back to front into a CodecRev, so generated encoders call
+// these for the last field first. Decoding reads from a CodecReader; strings
+// and bytes come back as views into the input.
+import "codec/core/status";
+import "codec/core/varint";
+import "codec/core/rev";
+import "codec/core/reader";
+import "codec/core/list";
+
+// Wire types.
+export const CODEC_PB_VARINT = 0;
+export const CODEC_PB_I64 = 1;
+export const CODEC_PB_LEN = 2;
+export const CODEC_PB_SGROUP = 3;
+export const CODEC_PB_EGROUP = 4;
+export const CODEC_PB_I32 = 5;
+
+// Nesting limit for decoding, as in the reference implementations.
+export const CODEC_PB_DEPTH = 100;
+
+// Largest field number allowed.
+export const CODEC_PB_MAX_FIELD = 536870911;
+
+@inline export fn codec_pb_tag(field: int32, wire: int32) -> uint64 {
+  return ((uint64)(uint32)field << 3) | (uint64)wire;
+}
+
+// ---- Encoding (back to front) -------------------------------------------------
+
+@inline export fn codec_pb_put_tag(w: CodecRev*, field: int32, wire: int32) {
+  codec_rev_varint(w, codec_pb_tag(field, wire));
+}
+
+// int32 and enum: negative values are sign-extended to 10 bytes.
+@inline export fn codec_pb_put_int32(w: CodecRev*, field: int32, v: int32) {
+  codec_rev_varint(w, (uint64)(int64)v);
+  codec_pb_put_tag(w, field, CODEC_PB_VARINT);
+}
+@inline export fn codec_pb_put_int64(w: CodecRev*, field: int32, v: int64) {
+  codec_rev_varint(w, (uint64)v);
+  codec_pb_put_tag(w, field, CODEC_PB_VARINT);
+}
+@inline export fn codec_pb_put_uint32(w: CodecRev*, field: int32, v: uint32) {
+  codec_rev_varint(w, (uint64)v);
+  codec_pb_put_tag(w, field, CODEC_PB_VARINT);
+}
+@inline export fn codec_pb_put_uint64(w: CodecRev*, field: int32, v: uint64) {
+  codec_rev_varint(w, v);
+  codec_pb_put_tag(w, field, CODEC_PB_VARINT);
+}
+@inline export fn codec_pb_put_sint32(w: CodecRev*, field: int32, v: int32) {
+  codec_rev_varint(w, (uint64)codec_zigzag32(v));
+  codec_pb_put_tag(w, field, CODEC_PB_VARINT);
+}
+@inline export fn codec_pb_put_sint64(w: CodecRev*, field: int32, v: int64) {
+  codec_rev_varint(w, codec_zigzag64(v));
+  codec_pb_put_tag(w, field, CODEC_PB_VARINT);
+}
+@inline export fn codec_pb_put_bool(w: CodecRev*, field: int32, v: bool) {
+  var b: uint8 = 0;
+  if (v) { b = 1; }
+  codec_rev_byte(w, b);
+  codec_pb_put_tag(w, field, CODEC_PB_VARINT);
+}
+@inline export fn codec_pb_put_fixed32(w: CodecRev*, field: int32, v: uint32) {
+  codec_rev_le32(w, v);
+  codec_pb_put_tag(w, field, CODEC_PB_I32);
+}
+@inline export fn codec_pb_put_fixed64(w: CodecRev*, field: int32, v: uint64) {
+  codec_rev_le64(w, v);
+  codec_pb_put_tag(w, field, CODEC_PB_I64);
+}
+@inline export fn codec_pb_put_float(w: CodecRev*, field: int32, v: float32) {
+  codec_rev_le32(w, codec_f32_bits(v));
+  codec_pb_put_tag(w, field, CODEC_PB_I32);
+}
+@inline export fn codec_pb_put_double(w: CodecRev*, field: int32, v: float64) {
+  codec_rev_le64(w, codec_f64_bits(v));
+  codec_pb_put_tag(w, field, CODEC_PB_I64);
+}
+// string and bytes.
+@inline export fn codec_pb_put_bytes(w: CodecRev*, field: int32, v: string) {
+  codec_rev_string(w, v);
+  codec_rev_varint(w, (uint64)v.length);
+  codec_pb_put_tag(w, field, CODEC_PB_LEN);
+}
+
+// Ends a length-delimited field whose body was written after `mark` was taken
+// with codec_rev_len: writes the length and the tag in front of the body.
+@inline export fn codec_pb_put_len(w: CodecRev*, field: int32, mark: int64) {
+  codec_rev_varint(w, (uint64)(codec_rev_len(w) - mark));
+  codec_pb_put_tag(w, field, CODEC_PB_LEN);
+}
+
+// Packed repeated fields: the values (last first), then length and tag.
+// Generated code writes the values; these are for the common scalar types.
+export fn codec_pb_put_packed_varint(w: CodecRev*, field: int32, v: uint64*, n: int64) {
+  if (n == 0) { return; }
+  var mark: int64 = codec_rev_len(w);
+  var i: int64 = n - 1;
+  while (i >= 0) {
+    codec_rev_varint(w, v[i]);
+    i = i - 1;
+  }
+  codec_pb_put_len(w, field, mark);
+}
+
+// ---- Decoding -----------------------------------------------------------------
+
+// Reads the next tag. Returns 0 at the end of input or on an error (check
+// r->err). Field number 0 or a wire type above 5 is CODEC_ERR_INVALID.
+@inline export fn codec_pb_read_tag(r: CodecReader*) -> uint64 {
+  if (r->pos >= r->len) { return (uint64)0; }
+  var t: uint64 = codec_rd_varint(r);
+  if (r->err != CODEC_OK) { return (uint64)0; }
+  if ((t >> 3) == 0 || (t & 7) > 5 || t > 0xffffffff) {
+    codec_rd_fail(r, CODEC_ERR_INVALID);
+    return (uint64)0;
+  }
+  return t;
+}
+
+@inline export fn codec_pb_field(tag: uint64) -> int32 { return (int32)(tag >> 3); }
+@inline export fn codec_pb_wire(tag: uint64) -> int32 { return (int32)(tag & 7); }
+
+// Reads a length prefix and points `sub` at that many bytes, then moves r
+// past them. Used for nested messages, packed fields and map entries.
+@inline export fn codec_pb_read_sub(r: CodecReader*, sub: CodecReader*) -> bool {
+  var n: uint64 = codec_rd_varint(r);
+  if (r->err != CODEC_OK) { return false; }
+  if (n > (uint64)(r->len - r->pos)) {
+    codec_rd_fail(r, CODEC_ERR_TRUNCATED);
+    return false;
+  }
+  codec_rd_init(sub, r->data + r->pos, (int64)n);
+  r->pos = r->pos + (int64)n;
+  return true;
+}
+
+// A string or bytes value as a view into the input.
+@inline export fn codec_pb_read_bytes(r: CodecReader*) -> string {
+  var empty: string;
+  var n: uint64 = codec_rd_varint(r);
+  if (r->err != CODEC_OK) { return empty; }
+  if (n > (uint64)(r->len - r->pos)) {
+    codec_rd_fail(r, CODEC_ERR_TRUNCATED);
+    return empty;
+  }
+  return codec_rd_string(r, (int64)n);
+}
+
+@inline export fn codec_pb_read_int32(r: CodecReader*) -> int32 { return (int32)codec_rd_varint(r); }
+@inline export fn codec_pb_read_int64(r: CodecReader*) -> int64 { return (int64)codec_rd_varint(r); }
+@inline export fn codec_pb_read_uint32(r: CodecReader*) -> uint32 { return (uint32)codec_rd_varint(r); }
+@inline export fn codec_pb_read_uint64(r: CodecReader*) -> uint64 { return codec_rd_varint(r); }
+@inline export fn codec_pb_read_sint32(r: CodecReader*) -> int32 { return codec_unzigzag32((uint32)codec_rd_varint(r)); }
+@inline export fn codec_pb_read_sint64(r: CodecReader*) -> int64 { return codec_unzigzag64(codec_rd_varint(r)); }
+@inline export fn codec_pb_read_bool(r: CodecReader*) -> bool { return codec_rd_varint(r) != 0; }
+@inline export fn codec_pb_read_fixed32(r: CodecReader*) -> uint32 { return codec_rd_le32(r); }
+@inline export fn codec_pb_read_fixed64(r: CodecReader*) -> uint64 { return codec_rd_le64(r); }
+@inline export fn codec_pb_read_float(r: CodecReader*) -> float32 { return codec_bits_f32(codec_rd_le32(r)); }
+@inline export fn codec_pb_read_double(r: CodecReader*) -> float64 { return codec_bits_f64(codec_rd_le64(r)); }
+
+// Skips the value of a field whose tag was just read. Groups are skipped
+// through to their matching end tag, with nesting limited by depth.
+export fn codec_pb_skip(r: CodecReader*, tag: uint64, depth: int32) -> bool {
+  switch (codec_pb_wire(tag)) {
+    case 0: { codec_rd_varint(r); }
+    case 1: { codec_rd_skip(r, 8); }
+    case 2: {
+      var n: uint64 = codec_rd_varint(r);
+      if (r->err == CODEC_OK && n > (uint64)(r->len - r->pos)) {
+        codec_rd_fail(r, CODEC_ERR_TRUNCATED);
+      } else {
+        codec_rd_skip(r, (int64)n);
+      }
+    }
+    case 3: {
+      if (depth <= 0) {
+        codec_rd_fail(r, CODEC_ERR_DEPTH);
+        return false;
+      }
+      while (true) {
+        var t: uint64 = codec_pb_read_tag(r);
+        if (t == 0) {
+          if (r->err == CODEC_OK) { codec_rd_fail(r, CODEC_ERR_TRUNCATED); }
+          return false;
+        }
+        if (codec_pb_wire(t) == CODEC_PB_EGROUP) {
+          if (codec_pb_field(t) != codec_pb_field(tag)) {
+            codec_rd_fail(r, CODEC_ERR_INVALID);
+            return false;
+          }
+          return true;
+        }
+        if (!codec_pb_skip(r, t, depth - 1)) { return false; }
+      }
+    }
+    case 4: {
+      // An end-group tag with no group open.
+      codec_rd_fail(r, CODEC_ERR_INVALID);
+      return false;
+    }
+    case 5: { codec_rd_skip(r, 4); }
+    default: {
+      codec_rd_fail(r, CODEC_ERR_INVALID);
+      return false;
+    }
+  }
+  return r->err == CODEC_OK;
+}
+
+// Skips an unknown field and keeps its raw bytes (tag included) in `keep`,
+// so they can be written back out unchanged. `start` is the position of the
+// tag. Each kept span is a view into the input.
+export fn codec_pb_keep_unknown(r: CodecReader*, tag: uint64, start: int64, depth: int32, keep: CodecList<string>*) -> bool {
+  if (!codec_pb_skip(r, tag, depth)) { return false; }
+  var s: string;
+  s.chars = r->data + start;
+  s.length = (uint64)(r->pos - start);
+  if (!codec_list_push(keep, s)) {
+    codec_rd_fail(r, CODEC_ERR_NOMEM);
+    return false;
+  }
+  return true;
+}
+
+// Writes kept unknown fields back out (they go after the known fields).
+export fn codec_pb_put_unknown(w: CodecRev*, keep: CodecList<string>*) {
+  var i: int64 = keep->len - 1;
+  while (i >= 0) {
+    codec_rev_string(w, keep->data[i]);
+    i = i - 1;
+  }
+}

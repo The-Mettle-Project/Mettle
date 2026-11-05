@@ -1,0 +1,450 @@
+// Huffman coding of zstd literals: table descriptions, decoding of one or
+// four streams, and the encoder side (code lengths, table, streams).
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "common";
+import "fse";
+
+/// A Huffman decode table: cell = symbol | (code length << 8), indexed by
+/// the next `log` bits of the stream.
+export struct PzsHufD {
+  log: int32;
+  t: uint16[2048];
+}
+
+// Decodes FSE-compressed Huffman weights. Returns the number of weights or
+// a negative status.
+fn read_fse_weights(p: uint8*, n: int64, w: uint8*) -> int32 {
+  var norm: int16[16];
+  var log: int32 = 0;
+  var used: int64 = pzs_fse_read_ncount(p, n, &norm[0], 12, 6, &log);
+  if (used < 0) { return (int32)used; }
+  var dt: PzsSeqD[64];
+  var rc: int32 = pzs_fse_build_dt(&dt[0], &norm[0], 13, log, PZS_K_PLAIN);
+  if (rc != PRESS_OK) { return rc; }
+  var r: PzsBitR;
+  rc = pzs_br_init(&r, p + used, n - used);
+  if (rc != PRESS_OK) { return rc; }
+  var s1: int64 = (int64)pzs_br_read(&r, (int64)log);
+  var s2: int64 = (int64)pzs_br_read(&r, (int64)log);
+  if (pzs_br_reload(&r) == 3) { return PRESS_E_DATA; }
+  var k: int32 = 0;
+  while (true) {
+    if (k > 253) { return PRESS_E_DATA; }
+    w[k] = (uint8)dt[s1].base;
+    k = k + 1;
+    s1 = (int64)dt[s1].next + (int64)pzs_br_read(&r, (int64)dt[s1].nbits);
+    if (pzs_br_reload(&r) == 3) {
+      w[k] = (uint8)dt[s2].base;
+      k = k + 1;
+      break;
+    }
+    if (k > 253) { return PRESS_E_DATA; }
+    w[k] = (uint8)dt[s2].base;
+    k = k + 1;
+    s2 = (int64)dt[s2].next + (int64)pzs_br_read(&r, (int64)dt[s2].nbits);
+    if (pzs_br_reload(&r) == 3) {
+      w[k] = (uint8)dt[s1].base;
+      k = k + 1;
+      break;
+    }
+  }
+  return k;
+}
+
+/// Reads a Huffman tree description from p[0 .. n] and builds the decode
+/// table. Returns the bytes used or a negative status.
+export fn pzs_huf_read_table(h: PzsHufD*, p: uint8*, n: int64) -> int64 {
+  if (n < 1) { return (int64)PRESS_E_DATA; }
+  var w: uint8[256];
+  var hb: int32 = (int32)p[0];
+  var nw: int32 = 0;
+  var used: int64 = 0;
+  if (hb >= 128) {
+    nw = hb - 127;
+    used = 1 + (int64)((nw + 1) / 2);
+    if (used > n) { return (int64)PRESS_E_DATA; }
+    for i in 0..nw {
+      var b: int32 = (int32)p[1 + i / 2];
+      if ((i & 1) == 0) { w[i] = (uint8)(b >> 4); } else { w[i] = (uint8)(b & 15); }
+    }
+  } else {
+    used = 1 + (int64)hb;
+    if (used > n) { return (int64)PRESS_E_DATA; }
+    nw = read_fse_weights(p + 1, (int64)hb, &w[0]);
+    if (nw < 0) { return (int64)nw; }
+  }
+  // The weight of the last symbol is implied by the others.
+  var rank: int32[13];
+  for i in 0..13 { rank[i] = 0; }
+  var total: int32 = 0;
+  for i in 0..nw {
+    var x: int32 = (int32)w[i];
+    if (x > 11) { return (int64)PRESS_E_DATA; }
+    rank[x] = rank[x] + 1;
+    if (x > 0) { total = total + (1 << (x - 1)); }
+  }
+  if (total == 0) { return (int64)PRESS_E_DATA; }
+  var maxBits: int32 = pzs_hb32((uint32)total) + 1;
+  if (maxBits > 11) { return (int64)PRESS_E_DATA; }
+  var rest: int32 = (1 << maxBits) - total;
+  if ((rest & (rest - 1)) != 0) { return (int64)PRESS_E_DATA; }
+  var lastW: int32 = pzs_hb32((uint32)rest) + 1;
+  w[nw] = (uint8)lastW;
+  rank[lastW] = rank[lastW] + 1;
+  nw = nw + 1;
+  if (rank[1] < 2 || (rank[1] & 1) != 0) { return (int64)PRESS_E_DATA; }
+  // Longer codes (lower weights) take the low table cells.
+  var start: int32[13];
+  var pos: int32 = 0;
+  for x in 1..(maxBits + 1) {
+    start[x] = pos;
+    pos = pos + (rank[x] << (x - 1));
+  }
+  for s in 0..nw {
+    var x: int32 = (int32)w[s];
+    if (x == 0) { continue; }
+    var len: int32 = 1 << (x - 1);
+    var cell: uint16 = (uint16)(s | ((maxBits + 1 - x) << 8));
+    var at: int32 = start[x];
+    for j in 0..len { h->t[at + j] = cell; }
+    start[x] = at + len;
+  }
+  h->log = maxBits;
+  return used;
+}
+
+@inline fn huf_sym(t: uint16*, log: int64, r: PzsBitR*) -> uint8 {
+  var e: uint32 = (uint32)t[pzs_br_peek(r, log)];
+  r->n = r->n + (int64)(e >> 8);
+  return (uint8)e;
+}
+
+// Decodes dst[at .. end] from one stream, one symbol per reload.
+fn huf_tail(t: uint16*, log: int64, r: PzsBitR*, dst: uint8*, at: int64, end: int64) -> int32 {
+  var k: int64 = at;
+  while (k < end) {
+    if (pzs_br_reload(r) == 3) { return PRESS_E_DATA; }
+    dst[k] = huf_sym(t, log, r);
+    k = k + 1;
+  }
+  pzs_br_reload(r);
+  if (!pzs_br_done(r)) { return PRESS_E_DATA; }
+  return PRESS_OK;
+}
+
+/// Decodes `cnt` literals from a single Huffman stream.
+export fn pzs_huf_dec1(h: PzsHufD*, p: uint8*, n: int64, dst: uint8*, cnt: int64) -> int32 {
+  var r: PzsBitR;
+  var rc: int32 = pzs_br_init(&r, p, n);
+  if (rc != PRESS_OK) { return rc; }
+  var t: uint16* = &h->t[0];
+  var log: int64 = (int64)h->log;
+  var k: int64 = 0;
+  while (k + 4 <= cnt && pzs_br_reload(&r) == 0) {
+    dst[k] = huf_sym(t, log, &r);
+    dst[k + 1] = huf_sym(t, log, &r);
+    dst[k + 2] = huf_sym(t, log, &r);
+    dst[k + 3] = huf_sym(t, log, &r);
+    k = k + 4;
+  }
+  return huf_tail(t, log, &r, dst, k, cnt);
+}
+
+/// Decodes `cnt` literals from four Huffman streams with a jump table.
+export fn pzs_huf_dec4(h: PzsHufD*, p: uint8*, n: int64, dst: uint8*, cnt: int64) -> int32 {
+  if (n < 10) { return PRESS_E_DATA; }
+  var l1: int64 = (int64)press_rd16(p);
+  var l2: int64 = (int64)press_rd16(p + 2);
+  var l3: int64 = (int64)press_rd16(p + 4);
+  var l4: int64 = n - 6 - l1 - l2 - l3;
+  if (l4 < 1) { return PRESS_E_DATA; }
+  var seg: int64 = (cnt + 3) / 4;
+  if (seg * 3 > cnt) { return PRESS_E_DATA; }
+  var r1: PzsBitR;
+  var r2: PzsBitR;
+  var r3: PzsBitR;
+  var r4: PzsBitR;
+  var q: uint8* = p + 6;
+  if (pzs_br_init(&r1, q, l1) != PRESS_OK) { return PRESS_E_DATA; }
+  if (pzs_br_init(&r2, q + l1, l2) != PRESS_OK) { return PRESS_E_DATA; }
+  if (pzs_br_init(&r3, q + l1 + l2, l3) != PRESS_OK) { return PRESS_E_DATA; }
+  if (pzs_br_init(&r4, q + l1 + l2 + l3, l4) != PRESS_OK) { return PRESS_E_DATA; }
+  var t: uint16* = &h->t[0];
+  var log: int64 = (int64)h->log;
+  var d1: uint8* = dst;
+  var d2: uint8* = dst + seg;
+  var d3: uint8* = dst + seg * 2;
+  var d4: uint8* = dst + seg * 3;
+  var k: int64 = 0;
+  var last: int64 = cnt - seg * 3;
+  while (k + 4 <= last && (pzs_br_reload(&r1) | pzs_br_reload(&r2) | pzs_br_reload(&r3) | pzs_br_reload(&r4)) == 0) {
+    d1[k] = huf_sym(t, log, &r1);
+    d2[k] = huf_sym(t, log, &r2);
+    d3[k] = huf_sym(t, log, &r3);
+    d4[k] = huf_sym(t, log, &r4);
+    d1[k + 1] = huf_sym(t, log, &r1);
+    d2[k + 1] = huf_sym(t, log, &r2);
+    d3[k + 1] = huf_sym(t, log, &r3);
+    d4[k + 1] = huf_sym(t, log, &r4);
+    d1[k + 2] = huf_sym(t, log, &r1);
+    d2[k + 2] = huf_sym(t, log, &r2);
+    d3[k + 2] = huf_sym(t, log, &r3);
+    d4[k + 2] = huf_sym(t, log, &r4);
+    d1[k + 3] = huf_sym(t, log, &r1);
+    d2[k + 3] = huf_sym(t, log, &r2);
+    d3[k + 3] = huf_sym(t, log, &r3);
+    d4[k + 3] = huf_sym(t, log, &r4);
+    k = k + 4;
+  }
+  if (huf_tail(t, log, &r1, d1, k, seg) != PRESS_OK) { return PRESS_E_DATA; }
+  if (huf_tail(t, log, &r2, d2, k, seg) != PRESS_OK) { return PRESS_E_DATA; }
+  if (huf_tail(t, log, &r3, d3, k, seg) != PRESS_OK) { return PRESS_E_DATA; }
+  return huf_tail(t, log, &r4, d4, k, last);
+}
+
+// ---------------------------------------------------------------------------
+// Encoding side.
+
+/// A Huffman encode table: code length and code per byte value.
+export struct PzsHufC {
+  len: uint8[256];
+  code: uint16[256];
+  maxBits: int32;
+  nsym: int32;     // last used symbol + 1
+}
+
+/// Builds code lengths (at most `limit` bits) and codes from counts.
+/// Needs at least two used symbols. Returns false if it cannot.
+export fn pzs_huf_build(hc: PzsHufC*, count: uint32*, limit: int32) -> bool {
+  var order: int32[256];
+  var m: int32 = 0;
+  var last: int32 = 0;
+  for s in 0..256 {
+    hc->len[s] = 0;
+    if (count[s] > 0) { order[m] = s; m = m + 1; last = s; }
+  }
+  if (m < 2) { return false; }
+  hc->nsym = last + 1;
+  // Sort by count, smallest first (insertion sort, at most 256 items).
+  for i in 1..m {
+    var v: int32 = order[i];
+    var j: int32 = i - 1;
+    while (j >= 0 && count[order[j]] > count[v]) { order[j + 1] = order[j]; j = j - 1; }
+    order[j + 1] = v;
+  }
+  // Two-queue Huffman: nodes 0..m-1 are leaves, m.. are inner nodes.
+  var wt: uint64[512];
+  var parent: int32[512];
+  var depth: int32[512];
+  for i in 0..m { wt[i] = (uint64)count[order[i]]; }
+  var li: int32 = 0;
+  var ni: int32 = m;
+  var nn: int32 = m;
+  for _k in 0..(m - 1) {
+    var a: int32 = 0;
+    if (li < m && (ni >= nn || wt[li] <= wt[ni])) { a = li; li = li + 1; } else { a = ni; ni = ni + 1; }
+    var b: int32 = 0;
+    if (li < m && (ni >= nn || wt[li] <= wt[ni])) { b = li; li = li + 1; } else { b = ni; ni = ni + 1; }
+    wt[nn] = wt[a] + wt[b];
+    parent[a] = nn;
+    parent[b] = nn;
+    nn = nn + 1;
+  }
+  var root: int32 = nn - 1;
+  depth[root] = 0;
+  var i: int32 = root - 1;
+  while (i >= 0) { depth[i] = depth[parent[i]] + 1; i = i - 1; }
+  // Count lengths, clamp to the limit, then repair the Kraft sum.
+  var bl: int64[64];
+  for x in 0..64 { bl[x] = 0; }
+  for x in 0..m {
+    var d: int32 = depth[x];
+    if (d > limit) { d = limit; }
+    bl[d] = bl[d] + 1;
+  }
+  var kraft: int64 = 0 - ((int64)1 << (int64)limit);
+  for x in 1..(limit + 1) { kraft = kraft + (bl[x] << (int64)(limit - x)); }
+  var guard: int32 = 0;
+  while (kraft > 0 && guard < 100000) {
+    var l: int32 = limit - 1;
+    while (l > 0 && bl[l] == 0) { l = l - 1; }
+    if (l == 0) { return false; }
+    bl[l] = bl[l] - 1;
+    bl[l + 1] = bl[l + 1] + 1;
+    kraft = kraft - ((int64)1 << (int64)(limit - l - 1));
+    guard = guard + 1;
+  }
+  while (kraft < 0 && guard < 100000) {
+    var l: int32 = limit;
+    while (l >= 2 && (bl[l] == 0 || ((int64)1 << (int64)(limit - l)) > 0 - kraft)) { l = l - 1; }
+    if (l < 2) { return false; }
+    bl[l] = bl[l] - 1;
+    bl[l - 1] = bl[l - 1] + 1;
+    kraft = kraft + ((int64)1 << (int64)(limit - l));
+    guard = guard + 1;
+  }
+  if (kraft != 0) { return false; }
+  // Rarest symbols get the longest codes.
+  var maxBits: int32 = limit;
+  while (maxBits > 0 && bl[maxBits] == 0) { maxBits = maxBits - 1; }
+  var at: int32 = 0;
+  var l2: int32 = maxBits;
+  while (l2 >= 1) {
+    for _j in 0..bl[l2] { hc->len[order[at]] = (uint8)l2; at = at + 1; }
+    l2 = l2 - 1;
+  }
+  hc->maxBits = maxBits;
+  pzs_huf_codes(hc);
+  return true;
+}
+
+/// Assigns codes from lengths the same way the decoder lays out its table.
+export fn pzs_huf_codes(hc: PzsHufC*) {
+  var mb: int32 = hc->maxBits;
+  var rank: int32[13];
+  for x in 0..13 { rank[x] = 0; }
+  for s in 0..hc->nsym {
+    if (hc->len[s] > 0) {
+      var w: int32 = mb + 1 - (int32)hc->len[s];
+      rank[w] = rank[w] + 1;
+    }
+  }
+  var start: int32[13];
+  var pos: int32 = 0;
+  for w in 1..(mb + 1) { start[w] = pos; pos = pos + (rank[w] << (w - 1)); }
+  for s in 0..hc->nsym {
+    if (hc->len[s] == 0) { hc->code[s] = 0; continue; }
+    var w: int32 = mb + 1 - (int32)hc->len[s];
+    hc->code[s] = (uint16)(start[w] >> (w - 1));
+    start[w] = start[w] + (1 << (w - 1));
+  }
+}
+
+/// Bits needed to code count[] with this table, or -1 if a used symbol
+/// has no code.
+export fn pzs_huf_cost(hc: PzsHufC*, count: uint32*) -> int64 {
+  var bits: int64 = 0;
+  for s in 0..256 {
+    if (count[s] == 0) { continue; }
+    if (s >= hc->nsym || hc->len[s] == 0) { return -1; }
+    bits = bits + (int64)count[s] * (int64)hc->len[s];
+  }
+  return bits;
+}
+
+// FSE-compresses the weights w[0 .. n]. Returns the size or -1.
+fn write_fse_weights(dst: uint8*, w: uint8*, n: int32) -> int64 {
+  if (n < 2) { return -1; }
+  var cnt: uint32[16];
+  for x in 0..16 { cnt[x] = 0; }
+  var maxW: int32 = 0;
+  for i in 0..n {
+    cnt[w[i]] = cnt[w[i]] + 1;
+    if ((int32)w[i] > maxW) { maxW = (int32)w[i]; }
+  }
+  var distinct: int32 = 0;
+  for x in 0..16 { if (cnt[x] > 0) { distinct = distinct + 1; } }
+  if (distinct < 2) { return -1; }
+  var nsym: int32 = maxW + 1;
+  var log: int32 = pzs_fse_pick_log(6, (int64)n, nsym);
+  var norm: int16[16];
+  pzs_fse_normalize(&norm[0], &cnt[0], nsym, (int64)n, log);
+  var ct: PzsFseC;
+  pzs_fse_build_ct(&ct, &norm[0], nsym, log);
+  var hs: int64 = pzs_fse_write_ncount(dst, &norm[0], nsym, log);
+  var bw: PzsBitW;
+  pzs_bw_init(&bw, dst + hs, 160);
+  var s1: uint32 = 0;
+  var s2: uint32 = 0;
+  var k: int32 = n;
+  if ((n & 1) != 0) {
+    s1 = pzs_fse_init_state(&ct, (int32)w[k - 1]);
+    s2 = pzs_fse_init_state(&ct, (int32)w[k - 2]);
+    k = k - 2;
+    k = k - 1;
+    pzs_fse_encode(&bw, &ct, &s1, (int32)w[k]);
+    pzs_bw_flush(&bw);
+  } else {
+    s2 = pzs_fse_init_state(&ct, (int32)w[k - 1]);
+    s1 = pzs_fse_init_state(&ct, (int32)w[k - 2]);
+    k = k - 2;
+  }
+  while (k > 0) {
+    pzs_fse_encode(&bw, &ct, &s2, (int32)w[k - 1]);
+    pzs_fse_encode(&bw, &ct, &s1, (int32)w[k - 2]);
+    k = k - 2;
+    pzs_bw_flush(&bw);
+  }
+  pzs_bw_add(&bw, (uint64)s2, (int64)log);
+  pzs_bw_add(&bw, (uint64)s1, (int64)log);
+  var sz: int64 = pzs_bw_close(&bw);
+  if (sz < 0) { return -1; }
+  return hs + sz;
+}
+
+/// Writes the tree description for hc into dst (needs 256 bytes). Returns
+/// its size, or -1 when the weights cannot be described.
+export fn pzs_huf_write_table(hc: PzsHufC*, dst: uint8*) -> int64 {
+  var w: uint8[256];
+  var n: int32 = hc->nsym - 1;
+  for s in 0..n {
+    if (hc->len[s] == 0) { w[s] = 0; } else { w[s] = (uint8)(hc->maxBits + 1 - (int32)hc->len[s]); }
+  }
+  var tmp: uint8[256];
+  var fs: int64 = write_fse_weights(&tmp[1], &w[0], n);
+  if (fs > 0 && fs < 128 && (n > 128 || fs < (int64)((n + 1) / 2))) {
+    dst[0] = (uint8)fs;
+    memcpy(dst + 1, &tmp[1], fs);
+    return fs + 1;
+  }
+  if (n > 128) { return -1; }
+  dst[0] = (uint8)(127 + n);
+  var i: int32 = 0;
+  while (i < n) {
+    var hi: int32 = (int32)w[i];
+    var lo: int32 = 0;
+    if (i + 1 < n) { lo = (int32)w[i + 1]; }
+    dst[1 + i / 2] = (uint8)((hi << 4) | lo);
+    i = i + 2;
+  }
+  return 1 + (int64)((n + 1) / 2);
+}
+
+// Encodes src[0 .. n] as one stream. Returns its size or -1.
+fn enc_stream(hc: PzsHufC*, src: uint8*, n: int64, dst: uint8*, cap: int64) -> int64 {
+  var bw: PzsBitW;
+  pzs_bw_init(&bw, dst, cap);
+  var k: int64 = n;
+  while (k > 0) {
+    k = k - 1;
+    var s: int32 = (int32)src[k];
+    pzs_bw_add(&bw, (uint64)hc->code[s], (int64)hc->len[s]);
+    if ((k & 3) == 0) { pzs_bw_flush(&bw); }
+  }
+  return pzs_bw_close(&bw);
+}
+
+/// Encodes src[0 .. n] with one stream, or four streams and a jump table.
+/// Returns the size or -1 when it does not fit in cap bytes.
+export fn pzs_huf_encode(hc: PzsHufC*, src: uint8*, n: int64, dst: uint8*, cap: int64, four: bool) -> int64 {
+  if (!four) { return enc_stream(hc, src, n, dst, cap); }
+  if (cap < 16) { return -1; }
+  var seg: int64 = (n + 3) / 4;
+  var at: int64 = 6;
+  for j in 0..4 {
+    var a: int64 = (int64)j * seg;
+    var b: int64 = a + seg;
+    if (j == 3) { b = n; }
+    var sz: int64 = enc_stream(hc, src + a, b - a, dst + at, cap - at);
+    if (sz < 0) { return -1; }
+    if (j < 3) {
+      if (sz > 65535) { return -1; }
+      press_wr16(dst + (int64)j * 2, (uint32)sz);
+    }
+    at = at + sz;
+  }
+  return at;
+}

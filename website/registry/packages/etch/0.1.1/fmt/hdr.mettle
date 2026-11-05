@@ -1,0 +1,211 @@
+// Radiance HDR (.hdr, RGBE). Decodes flat and run-length scanlines, in the
+// usual -Y +X orientation, to RGBF (linear float). Encodes RGBF with
+// run-length scanlines.
+
+import "std/math" as math;
+import "std/mem";
+import "../core/status";
+import "../core/image";
+import "../core/buf";
+import "../ops/convert";
+import "common";
+
+/// True when the bytes start like a Radiance file.
+export fn etch_hdr_is(p: uint8*, n: int64) -> bool {
+  if (n < 6 || p[0] != '#' || p[1] != '?') { return false; }
+  var a: bool = n >= 10 && p[2] == 'R' && p[3] == 'A' && p[4] == 'D' && p[5] == 'I' && p[6] == 'A' && p[7] == 'N' && p[8] == 'C' && p[9] == 'E';
+  var b: bool = p[2] == 'R' && p[3] == 'G' && p[4] == 'B' && p[5] == 'E';
+  return a || b;
+}
+
+fn line_is(p: uint8*, n: int64, s: int64, e: int64, w: string) -> bool {
+  if (e - s < (int64)w.length) { return false; }
+  for i in 0..w.length { if (p[s + (int64)i] != w.chars[i]) { return false; } }
+  return true;
+}
+
+fn rgbe_to(r: uint8*, o: float32*) {
+  if (r[3] == 0) { o[0] = 0.0; o[1] = 0.0; o[2] = 0.0; return; }
+  var f: float64 = math.ldexp(1.0, (int32)r[3] - 136);
+  o[0] = (float32)((float64)r[0] * f);
+  o[1] = (float32)((float64)r[1] * f);
+  o[2] = (float32)((float64)r[2] * f);
+}
+
+/// Decodes a Radiance HDR file into RGBF.
+export fn etch_hdr_decode(p: uint8*, n: int64, out: EtchImage*, o: EtchOpts*) -> int32 {
+  if (p == 0 || out == 0 || n < 0) { return ETCH_E_ARG; }
+  if (!etch_hdr_is(p, n)) { return ETCH_E_DATA; }
+  var pos: int64 = 0;
+  var fmt_ok: bool = true;
+  // header lines until an empty one
+  while (true) {
+    var s: int64 = pos;
+    while (pos < n && p[pos] != '\n') { pos = pos + 1; }
+    if (pos >= n) { return ETCH_E_TRUNC; }
+    var e: int64 = pos;
+    pos = pos + 1;
+    if (e == s) { break; }
+    if (line_is(p, n, s, e, "FORMAT=")) {
+      fmt_ok = line_is(p, n, s, e, "FORMAT=32-bit_rle_rgbe") || line_is(p, n, s, e, "FORMAT=32-bit_rle_xyze");
+    }
+  }
+  if (!fmt_ok) { return ETCH_E_UNSUPPORTED; }
+  // resolution line: -Y H +X W
+  if (pos + 3 > n || p[pos] != '-' || p[pos + 1] != 'Y' || p[pos + 2] != ' ') { return ETCH_E_UNSUPPORTED; }
+  pos = pos + 3;
+  var h: int64 = 0;
+  while (pos < n && p[pos] >= '0' && p[pos] <= '9' && h < 100000000) { h = h * 10 + (int64)(p[pos] - '0'); pos = pos + 1; }
+  if (pos + 4 > n || p[pos] != ' ' || p[pos + 1] != '+' || p[pos + 2] != 'X' || p[pos + 3] != ' ') { return ETCH_E_UNSUPPORTED; }
+  pos = pos + 4;
+  var w: int64 = 0;
+  while (pos < n && p[pos] >= '0' && p[pos] <= '9' && w < 100000000) { w = w * 10 + (int64)(p[pos] - '0'); pos = pos + 1; }
+  if (pos >= n || p[pos] != '\n') { return ETCH_E_DATA; }
+  pos = pos + 1;
+  var img: EtchImage;
+  var rc: int32 = etch_alloc_checked(&img, w, h, ETCH_RGBF, o);
+  if (rc != ETCH_OK) { return rc; }
+  var line: uint8* = (uint8*)malloc(w * 4);
+  if (line == 0) { etch_image_free(&img); return ETCH_E_MEM; }
+  rc = ETCH_OK;
+  for y in 0..h {
+    var d: float32* = (float32*)(img.data + y * img.stride);
+    if (pos + 4 > n) { rc = ETCH_E_TRUNC; break; }
+    var rle: bool = w >= 8 && w < 32768 && p[pos] == 2 && p[pos + 1] == 2 && (p[pos + 2] & 128) == 0;
+    if (rle) {
+      if (((int64)p[pos + 2] << 8 | (int64)p[pos + 3]) != w) { rc = ETCH_E_DATA; break; }
+      pos = pos + 4;
+      for c in 0..4 {
+        var x: int64 = 0;
+        while (x < w) {
+          if (pos >= n) { rc = ETCH_E_TRUNC; break; }
+          var cnt: int64 = (int64)p[pos];
+          pos = pos + 1;
+          if (cnt > 128) {
+            cnt = cnt - 128;
+            if (x + cnt > w || pos >= n) { rc = ETCH_E_DATA; break; }
+            var v: uint8 = p[pos];
+            pos = pos + 1;
+            for k in 0..cnt { line[(x + k) * 4 + c] = v; }
+          } else {
+            if (cnt == 0 || x + cnt > w || pos + cnt > n) { rc = ETCH_E_DATA; break; }
+            for k in 0..cnt { line[(x + k) * 4 + c] = p[pos + k]; }
+            pos = pos + cnt;
+          }
+          x = x + cnt;
+        }
+        if (rc != ETCH_OK) { break; }
+      }
+      if (rc != ETCH_OK) { break; }
+    } else {
+      // flat pixels, with the old (1, 1, 1, count) repeat code
+      var x: int64 = 0;
+      var shift: int32 = 0;
+      while (x < w) {
+        if (pos + 4 > n) { rc = ETCH_E_TRUNC; break; }
+        if (p[pos] == 1 && p[pos + 1] == 1 && p[pos + 2] == 1 && x > 0) {
+          var cnt: int64 = (int64)p[pos + 3] << (int64)shift;
+          pos = pos + 4;
+          if (x + cnt > w) { cnt = w - x; }
+          for k in 0..cnt { memcpy(line + (x + k) * 4, line + (x - 1) * 4, 4); }
+          x = x + cnt;
+          shift = shift + 8;
+          if (shift > 24) { shift = 24; }
+          continue;
+        }
+        shift = 0;
+        memcpy(line + x * 4, p + pos, 4);
+        pos = pos + 4;
+        x = x + 1;
+      }
+      if (rc != ETCH_OK) { break; }
+    }
+    for x in 0..w { rgbe_to(line + x * 4, d + x * 3); }
+  }
+  free(line);
+  if (rc != ETCH_OK) { etch_image_free(&img); return rc; }
+  *out = img;
+  return etch_finish(out, o);
+}
+
+fn to_rgbe(r: float32, g: float32, b: float32, q: uint8*) {
+  var v: float64 = (float64)r;
+  if ((float64)g > v) { v = (float64)g; }
+  if ((float64)b > v) { v = (float64)b; }
+  if (v < 1e-32) { q[0] = 0; q[1] = 0; q[2] = 0; q[3] = 0; return; }
+  var e: int32 = 0;
+  var m: float64 = math.frexp(v, &e);
+  var s: float64 = m * 256.0 / v;
+  var rr: float64 = (float64)r * s;
+  var gg: float64 = (float64)g * s;
+  var bb: float64 = (float64)b * s;
+  if (rr < 0.0) { rr = 0.0; }
+  if (gg < 0.0) { gg = 0.0; }
+  if (bb < 0.0) { bb = 0.0; }
+  q[0] = (uint8)(int32)rr;
+  q[1] = (uint8)(int32)gg;
+  q[2] = (uint8)(int32)bb;
+  q[3] = (uint8)(e + 128);
+}
+
+/// Encodes an image as Radiance HDR. Formats other than RGBF are converted
+/// (8 and 16-bit values become 0..1).
+export fn etch_hdr_encode(src: EtchImage*, out: EtchBuf*) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0) { return ETCH_E_ARG; }
+  var img: EtchImage = *src;
+  var conv: bool = false;
+  if (src->format != ETCH_RGBF) {
+    var rc0: int32 = etch_convert(src, ETCH_RGBF, &img);
+    if (rc0 != ETCH_OK) { return rc0; }
+    conv = true;
+  }
+  var w: int64 = (int64)img.width;
+  var h: int64 = (int64)img.height;
+  var hdr: string = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {h} +X {w}\n";
+  var rc: int32 = etch_buf_append(out, hdr.chars, (int64)hdr.length);
+  free(hdr.chars);
+  var line: uint8* = (uint8*)malloc(w * 4);
+  if (line == 0) { rc = ETCH_E_MEM; }
+  for y in 0..h {
+    if (rc != ETCH_OK) { break; }
+    var s: float32* = (float32*)(img.data + y * img.stride);
+    for x in 0..w { to_rgbe(s[x * 3], s[x * 3 + 1], s[x * 3 + 2], line + x * 4); }
+    rc = etch_buf_reserve(out, w * 5 + 8);
+    if (rc != ETCH_OK) { break; }
+    if (w < 8 || w >= 32768) {
+      etch_buf_append(out, line, w * 4);
+      continue;
+    }
+    etch_buf_push(out, 2);
+    etch_buf_push(out, 2);
+    etch_buf_push(out, (int32)(w >> 8));
+    etch_buf_push(out, (int32)(w & 255));
+    for c in 0..4 {
+      var x: int64 = 0;
+      while (x < w) {
+        // a run of at least 4 equal bytes is worth a run code
+        var run: int64 = 1;
+        while (x + run < w && run < 127 && line[(x + run) * 4 + c] == line[x * 4 + c]) { run = run + 1; }
+        if (run >= 4) {
+          etch_buf_push(out, (int32)(128 + run));
+          etch_buf_push(out, (int32)line[x * 4 + c]);
+          x = x + run;
+          continue;
+        }
+        var lit: int64 = 0;
+        while (x + lit < w && lit < 128) {
+          var r2: int64 = 1;
+          while (x + lit + r2 < w && r2 < 4 && line[(x + lit + r2) * 4 + c] == line[(x + lit) * 4 + c]) { r2 = r2 + 1; }
+          if (r2 >= 4) { break; }
+          lit = lit + 1;
+        }
+        etch_buf_push(out, (int32)lit);
+        for k in 0..lit { etch_buf_push(out, (int32)line[(x + k) * 4 + c]); }
+        x = x + lit;
+      }
+    }
+  }
+  if (line != 0) { free(line); }
+  if (conv) { etch_image_free(&img); }
+  return rc;
+}

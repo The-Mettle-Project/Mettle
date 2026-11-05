@@ -1,0 +1,516 @@
+// LZ4 frame format (the .lz4 file format), one-shot and streaming.
+//
+//   One shot:
+//     press_lz4_compress(src, n, 1, &out);
+//     press_lz4_decompress(out.data, out.len, &back);
+//
+//   Streaming:
+//     var e: PressLz4Enc;
+//     press_lz4_enc_init(&e, 1);
+//     press_lz4_enc_feed(&e, p, n, &out);     // as often as you like
+//     press_lz4_enc_finish(&e, &out);
+//     press_lz4_enc_free(&e);
+//
+//     var d: PressLz4Dec;
+//     press_lz4_dec_init(&d);
+//     press_lz4_dec_feed(&d, p, n, &out);     // input may be cut anywhere
+//     press_lz4_dec_finish(&d);               // PRESS_OK only at a frame end
+//     press_lz4_dec_free(&d);
+//
+// The encoder writes independent blocks of up to 4 MiB with a content
+// checksum. The decoder takes anything the format allows: every block size,
+// linked or independent blocks, block checksums, a content size, stored
+// blocks, skippable frames, frames back to back and the legacy frame format.
+// Frames that need a dictionary give PRESS_E_UNSUPPORTED.
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "../check/xxhash";
+import "emit";
+import "block";
+
+const PLZ_MAGIC: uint32 = 0x184D2204;
+const PLZ_MAGIC_LEGACY: uint32 = 0x184C2102;
+const PLZ_MAGIC_SKIP: uint32 = 0x184D2A50;
+const PLZ_BLOCK_STORED: uint32 = 0x80000000;
+const PLZ_ENC_BLOCK: int64 = 4194304;      // streaming encoder block size
+const PLZ_LEGACY_BLOCK: int64 = 8388608;   // legacy frame block size
+const PLZ_WINDOW: int64 = 65536;
+
+// Header checksum: the second byte of the xxh32 of the descriptor.
+fn plz_hdr_check(desc: uint8*, n: int64) -> uint8 {
+  return (uint8)((press_xxh32(desc, n, 0) >> 8) & 255);
+}
+
+// Writes magic, flags, block size code, optional content size and the
+// header checksum. size < 0 means "do not store a content size".
+fn plz_write_header(out: PressBuf*, bd_id: int32, size: int64) -> int32 {
+  var h: uint8[16];
+  var p: uint8* = &h[0];
+  press_wr32(p, PLZ_MAGIC);
+  var n: int64 = 6;
+  var flg: int32 = 0x64;                    // version 1, independent blocks, content checksum
+  if (size >= 0) { flg = flg | 0x08; }
+  p[4] = (uint8)flg;
+  p[5] = (uint8)(bd_id << 4);
+  if (size >= 0) {
+    press_wr64(p + 6, (uint64)size);
+    n = 14;
+  }
+  p[n] = plz_hdr_check(p + 4, n - 4);
+  return press_buf_append(out, p, n + 1);
+}
+
+fn plz_write_end(out: PressBuf*, sum: uint32) -> int32 {
+  var rc: int32 = press_buf_put32(out, 0);
+  if (rc != PRESS_OK) { return rc; }
+  return press_buf_put32(out, sum);
+}
+
+fn plz_level(level: int32) -> int32 {
+  if (level < 1) { return 1; }
+  if (level > 12) { return 12; }
+  return level;
+}
+
+/// Compresses n bytes into one LZ4 frame and appends it to out. Level 1 is
+/// fast, 2..12 search harder; 0 or less means 1.
+export fn press_lz4_compress(src: uint8*, n: int64, level: int32, out: PressBuf*) -> int32 {
+  if (n < 0 || out == 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var lv: int32 = plz_level(level);
+  // The smallest block size that holds the whole input, at most 4 MiB.
+  var id: int32 = 4;
+  var bsize: int64 = 65536;
+  while (id < 7 && bsize < n) { id = id + 1; bsize = bsize * 4; }
+  // Make room for the whole frame at once (not a problem if the limit says no).
+  press_buf_reserve(out, press_lz4_block_bound(n) + 24 * (n / bsize + 1) + 64);
+  var rc: int32 = plz_write_header(out, id, n);
+  var pos: int64 = 0;
+  while (rc == PRESS_OK && pos < n) {
+    var len: int64 = n - pos;
+    if (len > bsize) { len = bsize; }
+    rc = plz_enc_block(src + pos, len, lv, out, 1);
+    pos = pos + len;
+  }
+  if (rc != PRESS_OK) { return rc; }
+  return plz_write_end(out, press_xxh32(src, n, 0));
+}
+
+/// Streaming encoder state. Call press_lz4_enc_init before use.
+export struct PressLz4Enc {
+  level: int32;
+  state: int32;     // 0 new, 1 header written, 2 finished
+  buf: uint8*;      // input waiting for a full block
+  used: int64;
+  cap: int64;
+  sum: PressXxh32;
+}
+
+/// Starts a streaming encoder at the given level.
+export fn press_lz4_enc_init(e: PressLz4Enc*, level: int32) -> int32 {
+  if (e == 0) { return PRESS_E_ARG; }
+  memset(e, 0, sizeof(PressLz4Enc));
+  e->level = plz_level(level);
+  press_xxh32_init(&e->sum, 0);
+  return PRESS_OK;
+}
+
+/// Releases the encoder's memory.
+export fn press_lz4_enc_free(e: PressLz4Enc*) {
+  if (e->buf != 0) { free(e->buf); }
+  e->buf = (uint8*)0;
+  e->used = 0;
+  e->cap = 0;
+  e->state = 2;
+}
+
+fn plz_enc_start(e: PressLz4Enc*, out: PressBuf*) -> int32 {
+  if (e->state == 2) { return PRESS_E_STATE; }
+  if (e->state == 1) { return PRESS_OK; }
+  var rc: int32 = plz_write_header(out, 7, -1);
+  if (rc == PRESS_OK) { e->state = 1; }
+  return rc;
+}
+
+/// Adds n bytes of input. Finished blocks are appended to out.
+export fn press_lz4_enc_feed(e: PressLz4Enc*, p: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (e == 0 || out == 0 || n < 0 || (p == 0 && n > 0)) { return PRESS_E_ARG; }
+  var rc: int32 = plz_enc_start(e, out);
+  if (rc != PRESS_OK) { return rc; }
+  press_xxh32_update(&e->sum, p, n);
+  var pos: int64 = 0;
+  while (pos < n) {
+    if (e->used == 0 && n - pos >= PLZ_ENC_BLOCK) {
+      rc = plz_enc_block(p + pos, PLZ_ENC_BLOCK, e->level, out, 1);
+      if (rc != PRESS_OK) { return rc; }
+      pos = pos + PLZ_ENC_BLOCK;
+      continue;
+    }
+    var take: int64 = PLZ_ENC_BLOCK - e->used;
+    if (take > n - pos) { take = n - pos; }
+    if (e->used + take > e->cap) {
+      var ncap: int64 = e->cap * 2;
+      if (ncap < 65536) { ncap = 65536; }
+      if (ncap < e->used + take) { ncap = e->used + take; }
+      if (ncap > PLZ_ENC_BLOCK) { ncap = PLZ_ENC_BLOCK; }
+      var nb: uint8* = (uint8*)realloc(e->buf, ncap);
+      if (nb == 0) { return PRESS_E_MEM; }
+      e->buf = nb;
+      e->cap = ncap;
+    }
+    memcpy(e->buf + e->used, p + pos, take);
+    e->used = e->used + take;
+    pos = pos + take;
+    if (e->used == PLZ_ENC_BLOCK) {
+      rc = plz_enc_block(e->buf, e->used, e->level, out, 1);
+      e->used = 0;
+      if (rc != PRESS_OK) { return rc; }
+    }
+  }
+  return PRESS_OK;
+}
+
+/// Writes the last block, the end mark and the content checksum.
+export fn press_lz4_enc_finish(e: PressLz4Enc*, out: PressBuf*) -> int32 {
+  if (e == 0 || out == 0) { return PRESS_E_ARG; }
+  var rc: int32 = plz_enc_start(e, out);
+  if (rc != PRESS_OK) { return rc; }
+  if (e->used > 0) {
+    rc = plz_enc_block(e->buf, e->used, e->level, out, 1);
+    e->used = 0;
+    if (rc != PRESS_OK) { return rc; }
+  }
+  e->state = 2;
+  return plz_write_end(out, press_xxh32_digest(&e->sum));
+}
+
+// ---------------------------------------------------------------- decoder
+
+const PLZ_S_MAGIC: int32 = 0;     // wait for a 4-byte magic number
+const PLZ_S_HDR1: int32 = 1;      // flags and block size code
+const PLZ_S_HDR2: int32 = 2;      // content size, dictionary id, header checksum
+const PLZ_S_BSIZE: int32 = 3;     // block size word
+const PLZ_S_BDATA: int32 = 4;     // block bytes (and checksum)
+const PLZ_S_TRAIL: int32 = 5;     // content checksum
+const PLZ_S_SKSIZE: int32 = 6;    // size of a skippable frame
+const PLZ_S_SKIP: int32 = 7;      // skipping its bytes
+const PLZ_S_LSIZE: int32 = 8;     // legacy frame: block size
+const PLZ_S_LDATA: int32 = 9;     // legacy frame: block bytes
+const PLZ_S_ERROR: int32 = 10;    // an earlier call failed
+
+/// Streaming decoder state. Call press_lz4_dec_init before use.
+export struct PressLz4Dec {
+  state: int32;
+  direct: int32;      // 1: decode straight into the caller's buffer (one shot)
+  err: int32;         // the sticky error
+  flg: int32;
+  bd: int32;
+  linked: int32;
+  bchk: int32;        // blocks have checksums
+  cchk: int32;        // content checksum present
+  stored: int32;      // the current block is stored
+  csize_set: int32;
+  need: int64;        // bytes the current state wants
+  have: int64;        // bytes collected so far in acc
+  skip: int64;
+  blockmax: int64;
+  bsize: int64;
+  csize: int64;       // content size from the header
+  produced: int64;    // bytes this frame has produced
+  frame_start: int64; // out->len when the frame began (direct mode)
+  frames: int64;      // frames completed
+  hint: int64;        // one shot: the input length, for sizing the output
+  acc: PressBuf;
+  win: PressBuf;      // history plus the block being decoded (stream mode)
+  sum: PressXxh32;
+}
+
+fn plz_dec_setup(d: PressLz4Dec*, direct: int32) {
+  memset(d, 0, sizeof(PressLz4Dec));
+  d->direct = direct;
+  d->state = PLZ_S_MAGIC;
+  d->need = 4;
+}
+
+/// Starts a streaming decoder.
+export fn press_lz4_dec_init(d: PressLz4Dec*) -> int32 {
+  if (d == 0) { return PRESS_E_ARG; }
+  plz_dec_setup(d, 0);
+  return PRESS_OK;
+}
+
+/// Releases the decoder's memory.
+export fn press_lz4_dec_free(d: PressLz4Dec*) {
+  press_buf_free(&d->acc);
+  press_buf_free(&d->win);
+}
+
+fn plz_is_magic(m: uint32) -> bool {
+  return m == PLZ_MAGIC || m == PLZ_MAGIC_LEGACY || (m & 0xFFFFFFF0) == PLZ_MAGIC_SKIP;
+}
+
+fn plz_frame_done(d: PressLz4Dec*) -> int32 {
+  if (d->csize_set != 0 && d->produced != d->csize) { return PRESS_E_DATA; }
+  d->frames = d->frames + 1;
+  d->state = PLZ_S_MAGIC;
+  d->need = 4;
+  return PRESS_OK;
+}
+
+// Handles the header bytes after the magic: flags and block size code.
+fn plz_step_hdr1(d: PressLz4Dec*, b: uint8*) -> int32 {
+  var flg: int32 = b[0];
+  var bd: int32 = b[1];
+  if ((flg >> 6) != 1 || (flg & 2) != 0) { return PRESS_E_DATA; }
+  if ((bd & 0x8F) != 0 || ((bd >> 4) & 7) < 4) { return PRESS_E_DATA; }
+  d->flg = flg;
+  d->bd = bd;
+  d->linked = 1 - ((flg >> 5) & 1);
+  d->bchk = (flg >> 4) & 1;
+  d->cchk = (flg >> 2) & 1;
+  d->csize_set = (flg >> 3) & 1;
+  d->blockmax = (int64)1 << (uint64)(16 + 2 * (((bd >> 4) & 7) - 4));
+  var more: int64 = 1;
+  if (d->csize_set != 0) { more = more + 8; }
+  if ((flg & 1) != 0) { more = more + 4; }
+  d->state = PLZ_S_HDR2;
+  d->need = more;
+  return PRESS_OK;
+}
+
+fn plz_step_hdr2(d: PressLz4Dec*, b: uint8*, n: int64, out: PressBuf*) -> int32 {
+  var desc: uint8[16];
+  var q: uint8* = &desc[0];
+  q[0] = (uint8)d->flg;
+  q[1] = (uint8)d->bd;
+  memcpy(q + 2, b, n);
+  if (plz_hdr_check(q, n + 1) != q[n + 1]) { return PRESS_E_CHECK; }
+  if ((d->flg & 1) != 0) { return PRESS_E_UNSUPPORTED; }
+  d->csize = 0;
+  if (d->csize_set != 0) {
+    var v: uint64 = press_rd64(b);
+    if (v > 0x7FFFFFFFFFFFFFFF) { return PRESS_E_DATA; }
+    d->csize = (int64)v;
+    // One shot: make room for the whole output in one step, when the claim
+    // is believable (nothing expands more than 255 times).
+    if (d->direct != 0 && d->csize <= d->hint * 255 && d->csize < 0x80000000) {
+      press_buf_reserve(out, d->csize + 16);
+    }
+  }
+  d->produced = 0;
+  d->win.len = 0;
+  press_xxh32_init(&d->sum, 0);
+  d->state = PLZ_S_BSIZE;
+  d->need = 4;
+  return PRESS_OK;
+}
+
+// Decodes (or copies) one block's bytes and appends the result to out.
+fn plz_dec_block(d: PressLz4Dec*, b: uint8*, n: int64, out: PressBuf*) -> int32 {
+  var before: int64 = out->len;
+  var rc: int32 = PRESS_OK;
+  var want: int64 = n * 255 + 64;
+  if (want > d->blockmax) { want = d->blockmax; }
+  if (d->csize_set != 0 && d->csize - d->produced < want) { want = d->csize - d->produced; }
+  if (want < 0) { want = 0; }
+  if (d->direct != 0) {
+    if (d->stored != 0) {
+      rc = press_buf_append(out, b, n);
+    } else {
+      var hist: int64 = 0;
+      if (d->linked != 0) { hist = out->len - d->frame_start; }
+      rc = plz_decode_into(b, n, out, want, PRESS_E_DATA, hist);
+    }
+  } else {
+    var w: PressBuf* = &d->win;
+    var h: int64 = w->len;
+    if (d->stored != 0) {
+      rc = press_buf_append(w, b, n);
+    } else {
+      rc = plz_decode_into(b, n, w, want, PRESS_E_DATA, h);
+    }
+    if (rc == PRESS_OK) { rc = press_buf_append(out, w->data + h, w->len - h); }
+    if (rc == PRESS_OK) {
+      // Keep the last 64 KiB as history for linked blocks.
+      if (d->linked == 0) {
+        w->len = 0;
+      } else if (w->len > PLZ_WINDOW) {
+        memmove(w->data, w->data + (w->len - PLZ_WINDOW), PLZ_WINDOW);
+        w->len = PLZ_WINDOW;
+      }
+    }
+  }
+  if (rc != PRESS_OK) { return rc; }
+  var got: int64 = out->len - before;
+  d->produced = d->produced + got;
+  if (d->csize_set != 0 && d->produced > d->csize) { return PRESS_E_DATA; }
+  if (d->cchk != 0) { press_xxh32_update(&d->sum, out->data + before, got); }
+  return PRESS_OK;
+}
+
+// Runs one state step on `n` bytes at b.
+fn plz_step(d: PressLz4Dec*, b: uint8*, n: int64, out: PressBuf*) -> int32 {
+  switch (d->state) {
+    case 0: {
+      var m: uint32 = press_rd32(b);
+      if (m == PLZ_MAGIC) {
+        d->state = PLZ_S_HDR1;
+        d->need = 2;
+      } else if (m == PLZ_MAGIC_LEGACY) {
+        d->state = PLZ_S_LSIZE;
+        d->need = 4;
+        d->linked = 0;
+        d->bchk = 0;
+        d->cchk = 0;
+        d->csize_set = 0;
+        d->stored = 0;
+        d->blockmax = PLZ_LEGACY_BLOCK;
+        d->produced = 0;
+        d->win.len = 0;
+      } else if ((m & 0xFFFFFFF0) == PLZ_MAGIC_SKIP) {
+        d->state = PLZ_S_SKSIZE;
+        d->need = 4;
+      } else {
+        return PRESS_E_DATA;
+      }
+      d->frame_start = out->len;
+      return PRESS_OK;
+    }
+    case 1: { return plz_step_hdr1(d, b); }
+    case 2: { return plz_step_hdr2(d, b, n, out); }
+    case 3: {
+      var v: uint32 = press_rd32(b);
+      if (v == 0) {
+        if (d->cchk != 0) {
+          d->state = PLZ_S_TRAIL;
+          d->need = 4;
+          return PRESS_OK;
+        }
+        return plz_frame_done(d);
+      }
+      d->stored = 0;
+      if ((v & PLZ_BLOCK_STORED) != 0) { d->stored = 1; }
+      d->bsize = (int64)(v & 0x7FFFFFFF);
+      if (d->bsize > d->blockmax) { return PRESS_E_DATA; }
+      d->state = PLZ_S_BDATA;
+      d->need = d->bsize;
+      if (d->bchk != 0) { d->need = d->need + 4; }
+      return PRESS_OK;
+    }
+    case 4: {
+      if (d->bchk != 0) {
+        if (press_xxh32(b, d->bsize, 0) != press_rd32(b + d->bsize)) { return PRESS_E_CHECK; }
+      }
+      var rc: int32 = plz_dec_block(d, b, d->bsize, out);
+      d->state = PLZ_S_BSIZE;
+      d->need = 4;
+      return rc;
+    }
+    case 5: {
+      if (press_xxh32_digest(&d->sum) != press_rd32(b)) { return PRESS_E_CHECK; }
+      return plz_frame_done(d);
+    }
+    case 6: {
+      d->skip = (int64)press_rd32(b);
+      d->frames = d->frames + 1;
+      if (d->skip == 0) {
+        d->state = PLZ_S_MAGIC;
+        d->need = 4;
+      } else {
+        d->state = PLZ_S_SKIP;
+      }
+      return PRESS_OK;
+    }
+    case 8: {
+      var v: uint32 = press_rd32(b);
+      if (plz_is_magic(v)) {
+        d->frames = d->frames + 1;
+        d->state = PLZ_S_MAGIC;
+        d->need = 4;
+        return plz_step(d, b, 4, out);
+      }
+      d->bsize = (int64)v;
+      if (d->bsize == 0 || d->bsize > press_lz4_block_bound(PLZ_LEGACY_BLOCK)) { return PRESS_E_DATA; }
+      d->state = PLZ_S_LDATA;
+      d->need = d->bsize;
+      return PRESS_OK;
+    }
+    case 9: {
+      var rc: int32 = plz_dec_block(d, b, d->bsize, out);
+      d->state = PLZ_S_LSIZE;
+      d->need = 4;
+      return rc;
+    }
+    default: { }
+  }
+  return PRESS_E_STATE;
+}
+
+/// Gives the decoder n more input bytes (split anywhere). Decoded bytes are
+/// appended to out.
+export fn press_lz4_dec_feed(d: PressLz4Dec*, p: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (d == 0 || out == 0 || n < 0 || (p == 0 && n > 0)) { return PRESS_E_ARG; }
+  if (d->state == PLZ_S_ERROR) { return d->err; }
+  var pos: int64 = 0;
+  var rc: int32 = PRESS_OK;
+  while (pos < n && rc == PRESS_OK) {
+    if (d->state == PLZ_S_SKIP) {
+      var s: int64 = n - pos;
+      if (s > d->skip) { s = d->skip; }
+      pos = pos + s;
+      d->skip = d->skip - s;
+      if (d->skip == 0) {
+        d->state = PLZ_S_MAGIC;
+        d->need = 4;
+      }
+      continue;
+    }
+    if (d->have == 0 && n - pos >= d->need) {
+      var k: int64 = d->need;
+      rc = plz_step(d, p + pos, k, out);
+      pos = pos + k;
+    } else {
+      var take: int64 = d->need - d->have;
+      if (take > n - pos) { take = n - pos; }
+      rc = press_buf_append(&d->acc, p + pos, take);
+      pos = pos + take;
+      d->have = d->have + take;
+      if (rc == PRESS_OK && d->have == d->need) {
+        var k2: int64 = d->have;
+        d->have = 0;
+        d->acc.len = 0;
+        rc = plz_step(d, d->acc.data, k2, out);
+      }
+    }
+  }
+  if (rc != PRESS_OK) {
+    d->state = PLZ_S_ERROR;
+    d->err = rc;
+  }
+  return rc;
+}
+
+/// Ends the input. Returns PRESS_OK only when it stopped at the end of a
+/// frame, and PRESS_E_TRUNC when it stopped inside one (or had no frame).
+export fn press_lz4_dec_finish(d: PressLz4Dec*) -> int32 {
+  if (d == 0) { return PRESS_E_ARG; }
+  if (d->state == PLZ_S_ERROR) { return d->err; }
+  if (d->have != 0) { return PRESS_E_TRUNC; }
+  if (d->state == PLZ_S_MAGIC && d->frames > 0) { return PRESS_OK; }
+  if (d->state == PLZ_S_LSIZE) { return PRESS_OK; }     // a legacy frame ends with the input
+  return PRESS_E_TRUNC;
+}
+
+/// Decompresses every LZ4 frame in src and appends the bytes to out.
+/// Set out->limit first when the input is not trusted.
+export fn press_lz4_decompress(src: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (n < 0 || out == 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var d: PressLz4Dec;
+  plz_dec_setup(&d, 1);
+  d.hint = n;
+  var rc: int32 = press_lz4_dec_feed(&d, src, n, out);
+  if (rc == PRESS_OK) { rc = press_lz4_dec_finish(&d); }
+  press_lz4_dec_free(&d);
+  return rc;
+}

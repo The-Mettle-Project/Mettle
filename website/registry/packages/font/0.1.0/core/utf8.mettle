@@ -1,0 +1,97 @@
+// UTF-8 decoding (RFC 3629, Unicode chapter 3.9).
+//
+// Bad bytes never stop decoding. Each maximal ill-formed subsequence turns
+// into one U+FFFD, which is the "substitution of maximal subparts" practice
+// in Unicode chapter 3.9 (also used by the WHATWG Encoding standard).
+
+export const FONT_REPLACEMENT: uint32 = 0xFFFD;
+
+/// Decodes one code point starting at s[i]. Writes the number of bytes used
+/// (at least 1 when i < n) to *used. Ill-formed input gives U+FFFD.
+export fn font_utf8_decode(s: uint8*, n: int64, i: int64, used: int64*) -> uint32 {
+  if (i >= n) { *used = 0; return FONT_REPLACEMENT; }
+  var b0: uint32 = (uint32)s[i];
+  *used = 1;
+  if (b0 < 0x80) { return b0; }
+  var need: int64 = 0;
+  var cp: uint32 = 0;
+  var lo: uint32 = 0x80;
+  var hi: uint32 = 0xBF;
+  if (b0 >= 0xC2 && b0 <= 0xDF) { need = 1; cp = b0 & 0x1F; }
+  else if (b0 >= 0xE0 && b0 <= 0xEF) {
+    need = 2; cp = b0 & 0x0F;
+    if (b0 == 0xE0) { lo = 0xA0; }
+    if (b0 == 0xED) { hi = 0x9F; }
+  } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+    need = 3; cp = b0 & 0x07;
+    if (b0 == 0xF0) { lo = 0x90; }
+    if (b0 == 0xF4) { hi = 0x8F; }
+  } else {
+    return FONT_REPLACEMENT;
+  }
+  var k: int64 = 1;
+  while (k <= need) {
+    if (i + k >= n) { *used = k; return FONT_REPLACEMENT; }
+    var b: uint32 = (uint32)s[i + k];
+    if (b < lo || b > hi) { *used = k; return FONT_REPLACEMENT; }
+    lo = 0x80;
+    hi = 0xBF;
+    cp = (cp << 6) | (b & 0x3F);
+    k = k + 1;
+  }
+  *used = need + 1;
+  return cp;
+}
+
+/// True when s[0..n] is well-formed UTF-8.
+export fn font_utf8_valid(s: uint8*, n: int64) -> bool {
+  var i: int64 = 0;
+  var used: int64 = 0;
+  while (i < n) {
+    if (s[i] < (uint8)0x80) { i = i + 1; continue; }
+    var cp: uint32 = font_utf8_decode(s, n, i, &used);
+    if (cp == FONT_REPLACEMENT) {
+      // A real U+FFFD is EF BF BD; anything else that decoded to it was bad.
+      if (used != 3 || s[i] != (uint8)0xEF || s[i + 1] != (uint8)0xBF || s[i + 2] != (uint8)0xBD) { return false; }
+    }
+    i = i + used;
+  }
+  return true;
+}
+
+/// Number of code points in s[0..n] (each bad sequence counts as one).
+export fn font_utf8_count(s: uint8*, n: int64) -> int64 {
+  var i: int64 = 0;
+  var c: int64 = 0;
+  var used: int64 = 0;
+  while (i < n) {
+    font_utf8_decode(s, n, i, &used);
+    i = i + used;
+    c = c + 1;
+  }
+  return c;
+}
+
+/// Writes cp as UTF-8 into out (room for 4 bytes). Returns the byte count.
+/// Surrogates and values past U+10FFFF are written as U+FFFD.
+export fn font_utf8_encode(cp: uint32, out: uint8*) -> int32 {
+  var c: uint32 = cp;
+  if ((c >= 0xD800 && c <= 0xDFFF) || c > 0x10FFFF) { c = FONT_REPLACEMENT; }
+  if (c < 0x80) { out[0] = (uint8)c; return 1; }
+  if (c < 0x800) {
+    out[0] = (uint8)(0xC0 | (c >> 6));
+    out[1] = (uint8)(0x80 | (c & 0x3F));
+    return 2;
+  }
+  if (c < 0x10000) {
+    out[0] = (uint8)(0xE0 | (c >> 12));
+    out[1] = (uint8)(0x80 | ((c >> 6) & 0x3F));
+    out[2] = (uint8)(0x80 | (c & 0x3F));
+    return 3;
+  }
+  out[0] = (uint8)(0xF0 | (c >> 18));
+  out[1] = (uint8)(0x80 | ((c >> 12) & 0x3F));
+  out[2] = (uint8)(0x80 | ((c >> 6) & 0x3F));
+  out[3] = (uint8)(0x80 | (c & 0x3F));
+  return 4;
+}

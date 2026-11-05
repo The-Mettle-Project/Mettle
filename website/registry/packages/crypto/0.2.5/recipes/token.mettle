@@ -1,0 +1,400 @@
+// Machine tokens and human codes, pure Mettle (SHA-256 per FIPS 180-4 and
+// HMAC-SHA256 per RFC 2104). They look alike (random characters from an
+// alphabet) but they are different things and are stored differently.
+//
+// WHY two kinds. A machine token (API key, session id, reset link) is long and
+// random: at least 128 bits, so it is stored at rest as plain SHA-256
+// (cr_token_hash); a leaked digest of 128 random bits cannot be brute-forced.
+// A code (a recovery code) is short and typed by a person, about 50 bits for
+// 10 characters. SHA-256 of a ~50-bit code is brute-forceable from a leaked
+// database, and Argon2id would need one slow hash per stored code on every
+// attempt (a submitted code carries no user id to pick the right row). So
+// codes are stored as HMAC-SHA256 under a server pepper kept outside the
+// database (cr_code_hash): a leaked database alone is useless, and a lookup
+// by tag is a single equality query.
+//
+// Tokens use base62 or Crockford base32. There is deliberately no base64url
+// alphabet: its '-' and '_' make the boundary of a "prefix_" ambiguous and
+// break double-click selection. Characters are drawn uniformly with
+// cr_random_u32_below (unbiased). Entropy per
+// character is log2(62) = 5.954 bits (base62) and 5 bits (base32); see
+// cr_token_bits.
+//
+// Everything is written with a terminating nul (so it can go straight to C);
+// the reported length excludes it.
+
+import "crypto/core/status";
+import "crypto/core/types";
+import "crypto/core/util";
+import "crypto/hash/hash";
+import "crypto/mac/mac";
+
+const CR_TOK_A62: string = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const CR_TOK_A32: string = "0123456789abcdefghjkmnpqrstvwxyz";
+const CR_CODE_CONTEXT: string = "cryptex/code/v1";
+
+/// Alphabet selector: base62, 0-9 A-Z a-z (5.954 bits per character).
+/// in: -
+/// returns: 1
+/// owns: nothing
+/// thread: constant
+/// example: cr_token_new(&t[0], 64, &n, "mtlr_", CR_TOKEN_BASE62, 40);
+export const CR_TOKEN_BASE62: int32 = 1;
+/// Alphabet selector: Crockford base32, lowercase, without i l o u (5 bits
+/// per character).
+/// in: -
+/// returns: 2
+/// owns: nothing
+/// thread: constant
+/// example: cr_token_new(&t[0], 32, &n, "", CR_TOKEN_BASE32, 26);
+export const CR_TOKEN_BASE32: int32 = 2;
+/// Fewest bits of entropy a token may have (base62 needs 22 characters,
+/// base32 26).
+/// in: -
+/// returns: 128
+/// owns: nothing
+/// thread: constant
+/// example: if (cr_token_bits(CR_TOKEN_BASE62, 22) >= CR_TOKEN_MIN_BITS) { ok(); }
+export const CR_TOKEN_MIN_BITS: int64 = 128;
+/// Most random characters a token may have.
+/// in: -
+/// returns: 256
+/// owns: nothing
+/// thread: constant
+/// example: var t: uint8[300]; cr_token_new(&t[0], 300, &n, "", CR_TOKEN_BASE62, CR_TOKEN_MAX_CHARS);
+export const CR_TOKEN_MAX_CHARS: int64 = 256;
+/// Longest prefix, in bytes.
+/// in: -
+/// returns: 32
+/// owns: nothing
+/// thread: constant
+/// example: var cap: int64 = CR_TOKEN_MAX_PREFIX + CR_TOKEN_MAX_CHARS + 1;
+export const CR_TOKEN_MAX_PREFIX: int64 = 32;
+/// Fewest random characters a code may have (8 characters is 40 bits; 10 or
+/// more is recommended).
+/// in: -
+/// returns: 8
+/// owns: nothing
+/// thread: constant
+/// example: cr_code_new(&c[0], 16, &n, CR_CODE_MIN_CHARS, 0);
+export const CR_CODE_MIN_CHARS: int64 = 8;
+/// Most random characters a code may have.
+/// in: -
+/// returns: 32
+/// owns: nothing
+/// thread: constant
+/// example: var c: uint8[40]; cr_code_new(&c[0], 40, &n, CR_CODE_MAX_CHARS, 0);
+export const CR_CODE_MAX_CHARS: int64 = 32;
+
+// The alphabet text for a selector; "" for an unknown selector.
+fn cr_tok_alpha(a: int32) -> string {
+  if (a == CR_TOKEN_BASE62) { return CR_TOK_A62; }
+  if (a == CR_TOKEN_BASE32) { return CR_TOK_A32; }
+  return "";
+}
+
+// A prefix is at most 32 bytes of [A-Za-z0-9_-].
+fn cr_tok_prefix_ok(p: string) -> bool {
+  if ((int64)p.length > CR_TOKEN_MAX_PREFIX) { return false; }
+  var i: int64 = 0;
+  while (i < (int64)p.length) {
+    var c: uint8 = p.chars[i];
+    var ok: bool = false;
+    if (c >= 48 && c <= 57) { ok = true; }
+    if (c >= 65 && c <= 90) { ok = true; }
+    if (c >= 97 && c <= 122) { ok = true; }
+    if (c == 95 || c == 45) { ok = true; }
+    if (!ok) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn cr_tok_in_alpha(c: uint8, a: string) -> bool {
+  var i: int64 = 0;
+  while (i < (int64)a.length) {
+    if (a.chars[i] == c) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// Is nchars a valid random-part length for a token: at most 256 and at least
+// 128 bits in this alphabet (an unknown alphabet gives bits -1: not valid).
+fn cr_tok_nchars_ok(alphabet: int32, nchars: int64) -> bool {
+  if (nchars > CR_TOKEN_MAX_CHARS) { return false; }
+  return cr_token_bits(alphabet, nchars) >= CR_TOKEN_MIN_BITS;
+}
+
+/// Generates a random token: prefix, then nchars characters each picked
+/// uniformly from the alphabet (no modulo bias), then a nul. A bearer token
+/// needs at least 128 bits of entropy (CR_TOKEN_MIN_BITS): base62 >= 22
+/// characters, base32 >= 26 (see cr_token_bits).
+/// in: out writable for out_cap >= prefix.length + nchars + 1 bytes; out_len;
+///   prefix, at most 32 bytes of [A-Za-z0-9_-] (may be empty); alphabet, one
+///   of CR_TOKEN_BASE62 / CR_TOKEN_BASE32; nchars <= 256 with
+///   cr_token_bits(alphabet, nchars) >= 128
+/// returns: CR_OK and *out_len = prefix.length + nchars (the nul is not
+///   counted); CR_E_ARG (null out or out_len, bad prefix, unknown alphabet,
+///   nchars too small for 128 bits or above 256); CR_E_SPACE if out_cap is
+///   too small (nothing written); CR_E_INTERNAL if the kernel random source
+///   fails (out, out_cap bytes, is wiped). On error *out_len = 0
+/// owns: nothing; the caller owns out
+/// thread: any thread (no shared state)
+/// example: var t: uint8[64]; var n: int64; cr_token_new(&t[0], 64, &n, "mtlr_", CR_TOKEN_BASE62, 40);  // registry API token
+export fn cr_token_new(out: uint8*, out_cap: int64, out_len: int64*, prefix: string, alphabet: int32, nchars: int64) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0) { return CR_E_ARG; }
+  var alpha: string = cr_tok_alpha(alphabet);
+  if (alpha.length == 0) { return CR_E_ARG; }
+  if (!cr_tok_nchars_ok(alphabet, nchars)) { return CR_E_ARG; }
+  if (!cr_tok_prefix_ok(prefix)) { return CR_E_ARG; }
+  var plen: int64 = (int64)prefix.length;
+  if (out_cap < plen + nchars + 1) { return CR_E_SPACE; }
+  var i: int64 = 0;
+  while (i < plen) {
+    out[i] = prefix.chars[i];
+    i = i + 1;
+  }
+  var k: int64 = 0;
+  while (k < nchars) {
+    var idx: uint32 = 0;
+    var rc: int32 = cr_random_u32_below((uint32)alpha.length, &idx);
+    if (rc != CR_OK) {
+      cr_wipe(out, out_cap);
+      return rc;
+    }
+    out[plen + k] = alpha.chars[(int64)idx];
+    k = k + 1;
+  }
+  out[plen + nchars] = 0;
+  *out_len = plen + nchars;
+  return CR_OK;
+}
+
+/// Checks the format of a token: its length is prefix.length + nchars, it
+/// starts with prefix, and every following byte is in the alphabet. Use it to
+/// reject malformed input before any store lookup; it is not a secret
+/// comparison.
+/// in: tok, prefix; alphabet, one of the CR_TOKEN_* selectors; nchars <= 256
+///   with cr_token_bits(alphabet, nchars) >= 128
+/// returns: true if the token has the format; false otherwise, including for
+///   an unknown alphabet or an nchars that cr_token_new would refuse
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: if (!cr_token_check(header, "mtlr_", CR_TOKEN_BASE62, 40)) { reject(); }
+export fn cr_token_check(tok: string, prefix: string, alphabet: int32, nchars: int64) -> bool {
+  var alpha: string = cr_tok_alpha(alphabet);
+  if (alpha.length == 0) { return false; }
+  if (!cr_tok_nchars_ok(alphabet, nchars)) { return false; }
+  var plen: int64 = (int64)prefix.length;
+  if ((int64)tok.length != plen + nchars) { return false; }
+  var i: int64 = 0;
+  while (i < plen) {
+    if (tok.chars[i] != prefix.chars[i]) { return false; }
+    i = i + 1;
+  }
+  while (i < plen + nchars) {
+    if (!cr_tok_in_alpha(tok.chars[i], alpha)) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Entropy of a random part in whole bits, rounded down: base62
+/// nchars * 5954 / 1000 (log2 62 = 5.954), base32 5 * nchars. Any size from
+/// 1 to 256 characters can be asked, so callers can compute what a length
+/// gives before choosing it.
+/// in: alphabet, one of the CR_TOKEN_* selectors; nchars in 1..256
+/// returns: the bits, or -1 for an unknown alphabet or nchars outside 1..256
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: cr_token_bits(CR_TOKEN_BASE62, 22) == 130
+export fn cr_token_bits(alphabet: int32, nchars: int64) -> int64 {
+  if (nchars < 1 || nchars > CR_TOKEN_MAX_CHARS) { return -1; }
+  if (alphabet == CR_TOKEN_BASE62) { return nchars * 5954 / 1000; }
+  if (alphabet == CR_TOKEN_BASE32) { return 5 * nchars; }
+  return -1;
+}
+
+/// SHA-256 of the whole token text (prefix included), for storing tokens at
+/// rest. ONLY for high-entropy tokens (>= 128 bits, see cr_token_bits): a
+/// leaked SHA-256 of such a token cannot be brute-forced. Low-entropy codes,
+/// such as 10-character recovery codes (~50 bits), must NOT be stored this
+/// way: store them with cr_code_hash instead, because a leaked SHA-256 of a
+/// ~50-bit code is brute-forceable.
+/// in: out; tok, the token text
+/// returns: CR_OK; CR_E_ARG for a null out. On error out is not written
+/// owns: nothing; the caller owns out
+/// thread: any thread (no shared state)
+/// example: var d: CrSha256; cr_token_hash(&d, tok);  // store d, not tok
+export fn cr_token_hash(out: CrSha256*, tok: string) -> int32 {
+  if (out == 0) { return CR_E_ARG; }
+  return cr_sha256(out, tok.chars, (int64)tok.length);
+}
+
+/// Generates a random human code (a recovery code): nchars characters from the
+/// Crockford base32 lowercase alphabet "0123456789abcdefghjkmnpqrstvwxyz"
+/// (uniform, no modulo bias), with a '-' between every `group` characters when
+/// group > 0, then a nul. For example nchars 10 and group 5 give "xxxxx-yyyyy".
+/// 10 or more characters are recommended (50 bits). The code is a secret
+/// until used: show it once, store only cr_code_hash of it.
+/// in: out writable for out_cap >= total + 1 bytes, where total = nchars +
+///   (nchars - 1) / group dashes (no dashes when group == 0); out_len;
+///   nchars in 8..32; group 0 (no dashes) or in 2..16
+/// returns: CR_OK and *out_len = total (the nul is not counted); CR_E_ARG
+///   (null out or out_len, nchars outside 8..32, group < 0, group == 1,
+///   group > 16); CR_E_SPACE if out_cap < total + 1 (nothing written);
+///   CR_E_INTERNAL if the kernel random source fails (out, out_cap bytes, is
+///   wiped). On error *out_len = 0
+/// owns: nothing; the caller owns out and must cr_wipe it when done
+/// thread: any thread (no shared state)
+/// example: var c: uint8[16]; var n: int64; cr_code_new(&c[0], 16, &n, 10, 5);  // "k3f9a-7mx2q"
+export fn cr_code_new(out: uint8*, out_cap: int64, out_len: int64*, nchars: int64, group: int64) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0) { return CR_E_ARG; }
+  if (nchars < CR_CODE_MIN_CHARS || nchars > CR_CODE_MAX_CHARS) { return CR_E_ARG; }
+  if (group < 0 || group == 1 || group > 16) { return CR_E_ARG; }
+  var dashes: int64 = 0;
+  if (group > 0) { dashes = (nchars - 1) / group; }
+  var total: int64 = nchars + dashes;
+  if (out_cap < total + 1) { return CR_E_SPACE; }
+  var pos: int64 = 0;
+  var k: int64 = 0;
+  while (k < nchars) {
+    if (group > 0 && k > 0 && k % group == 0) {
+      out[pos] = 45;
+      pos = pos + 1;
+    }
+    var idx: uint32 = 0;
+    var rc: int32 = cr_random_u32_below((uint32)CR_TOK_A32.length, &idx);
+    if (rc != CR_OK) {
+      cr_wipe(out, out_cap);
+      return rc;
+    }
+    out[pos] = CR_TOK_A32.chars[(int64)idx];
+    pos = pos + 1;
+    k = k + 1;
+  }
+  out[pos] = 0;
+  *out_len = total;
+  return CR_OK;
+}
+
+// Maps one typed byte to its canonical code character: -1 for a byte to skip
+// ('-' and ' '), -2 for a byte that cannot be part of a code, otherwise the
+// canonical byte. ASCII A-Z becomes lowercase, then i and l become 1 and o
+// becomes 0; everything else must be in the alphabet (so u is refused).
+fn cr_code_canon(c0: uint8) -> int32 {
+  var c: int32 = (int32)c0;
+  if (c == 45 || c == 32) { return -1; }
+  if (c >= 65 && c <= 90) { c = c + 32; }
+  if (c == 105 || c == 108) { c = 49; }
+  if (c == 111) { c = 48; }
+  if (!cr_tok_in_alpha((uint8)c, CR_TOK_A32)) { return -2; }
+  return c;
+}
+
+/// Turns what a person typed into the canonical code: skips '-' and ' ',
+/// turns ASCII A-Z into lowercase, then reads i and l as 1 and o as 0 (the
+/// Crockford rules); every other byte, u included, must be in the alphabet
+/// "0123456789abcdefghjkmnpqrstvwxyz". The result is followed by a nul.
+/// in: out writable for out_cap >= normalized length + 1 bytes; out_len;
+///   input, the typed text
+/// returns: CR_OK and *out_len = the normalized length (8..32, the nul is not
+///   counted); CR_E_ARG (null out or out_len); CR_E_DECODE for a byte outside
+///   the rules or a normalized length outside 8..32; CR_E_SPACE if the
+///   normalized length + 1 > out_cap. On CR_E_DECODE and CR_E_SPACE out
+///   (out_cap bytes) is wiped; on every error *out_len = 0
+/// owns: nothing; the caller owns out (a code is a secret, wipe it when done)
+/// thread: any thread (no shared state)
+/// example: var c: uint8[40]; var n: int64; cr_code_normalize(&c[0], 40, &n, "ABCDE-I2345");  // "abcde12345"
+export fn cr_code_normalize(out: uint8*, out_cap: int64, out_len: int64*, input: string) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0) { return CR_E_ARG; }
+  // First pass: validate and count, so nothing is written for bad input.
+  var n: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)input.length) {
+    var m: int32 = cr_code_canon(input.chars[i]);
+    if (m == -2) {
+      cr_wipe(out, out_cap);
+      return CR_E_DECODE;
+    }
+    if (m >= 0) { n = n + 1; }
+    i = i + 1;
+  }
+  if (n < CR_CODE_MIN_CHARS || n > CR_CODE_MAX_CHARS) {
+    cr_wipe(out, out_cap);
+    return CR_E_DECODE;
+  }
+  if (n + 1 > out_cap) {
+    cr_wipe(out, out_cap);
+    return CR_E_SPACE;
+  }
+  var pos: int64 = 0;
+  i = 0;
+  while (i < (int64)input.length) {
+    var m: int32 = cr_code_canon(input.chars[i]);
+    if (m >= 0) {
+      out[pos] = (uint8)m;
+      pos = pos + 1;
+    }
+    i = i + 1;
+  }
+  out[pos] = 0;
+  *out_len = n;
+  return CR_OK;
+}
+
+/// Hashes a human code for storage: out = HMAC-SHA256(pepper,
+/// "cryptex/code/v1" || normalized code), where the code is first normalized
+/// with cr_code_normalize (case, dashes, spaces and look-alike letters do not
+/// matter) and the 15-byte context string has no nul. This, not a plain
+/// SHA-256, is how recovery codes are stored: a code has only ~50 bits (10
+/// characters), so SHA-256 of it is brute-forceable from a leaked database.
+/// The pepper is a 32-byte server secret kept outside the database (config or
+/// environment) and never stored next to the tags. Store the tag; look a
+/// submitted code up by its tag (an equality lookup is fine, because the tag
+/// is useless without the pepper); delete the row once the code is used. 10 or
+/// more characters are recommended (50 bits).
+/// in: out; pepper, the 32-byte server secret; code, the code as typed
+/// returns: CR_OK; CR_E_ARG (null out or pepper); CR_E_DECODE (cr_code_normalize
+///   refuses the code). On error out is wiped
+/// owns: nothing; the caller owns out and pepper. The local buffer holding the
+///   normalized code and the HMAC state are wiped
+/// thread: any thread (no shared state)
+/// example: var tag: CrHmacSha256; cr_code_hash(&tag, &pepper, typed);  // WHERE tag = ?
+export fn cr_code_hash(out: CrHmacSha256*, pepper: CrKey32*, code: string) -> int32 {
+  if (out == 0 || pepper == 0) { return CR_E_ARG; }
+  var buf: uint8[33];
+  var n: int64 = 0;
+  var rc: int32 = cr_code_normalize(&buf[0], 33, &n, code);
+  if (rc != CR_OK) {
+    cr_wipe(&buf[0], 33);
+    cr_wipe(&out->b[0], 32);
+    return rc;
+  }
+  var st: CrHmacSha256State;
+  rc = cr_hmac_sha256_init(&st, &pepper->b[0], 32);
+  if (rc != CR_OK) {
+    cr_wipe(&buf[0], 33);
+    cr_wipe(&out->b[0], 32);
+    return rc;
+  }
+  rc = cr_hmac_sha256_update(&st, CR_CODE_CONTEXT.chars, (int64)CR_CODE_CONTEXT.length);
+  if (rc == CR_OK) { rc = cr_hmac_sha256_update(&st, &buf[0], n); }
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha256_state_bytes(&st), 256);
+    cr_wipe(&buf[0], 33);
+    cr_wipe(&out->b[0], 32);
+    return rc;
+  }
+  rc = cr_hmac_sha256_final(&st, out);
+  cr_wipe(&buf[0], 33);
+  if (rc != CR_OK) { cr_wipe(&out->b[0], 32); }
+  return rc;
+}

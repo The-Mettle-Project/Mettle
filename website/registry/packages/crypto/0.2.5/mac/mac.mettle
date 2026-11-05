@@ -1,0 +1,453 @@
+// HMAC-SHA256, HMAC-SHA384 and HMAC-SHA512 (RFC 2104, FIPS 198-1) with keys
+// of any length, in pure Mettle on top of sha2. The state keeps two running hashes
+// (inner, outer) that were primed with the key pads, so no key copy stays
+// around. Verification is constant time (cr_equal).
+
+import "crypto/core/status";
+import "crypto/core/types";
+import "crypto/core/util";
+import "crypto/hash/sha2";
+
+/// CrHmacSha256State: an incremental HMAC-SHA256 computation. Use one state
+/// per computation (held in caller
+/// memory; 256 bytes reserved, the inner and outer hash contexts use
+/// 224).
+/// in: - (initialize with cr_hmac_sha256_init before use)
+/// returns: -
+/// owns: secret (it holds key-derived hash contexts): cr_hmac_sha256_final wipes it;
+///   if you abandon a computation, call cr_wipe(cr_hmac_sha256_state_bytes(&st), 256)
+/// thread: any thread (no shared state)
+/// example: var st: CrHmacSha256State; cr_hmac_sha256_init(&st, k, klen);
+export struct CrHmacSha256State {
+  st: uint64[32];
+}
+
+// The layout inside CrHmacSha256State.st (uint64-aligned storage).
+struct CrxHmac256 {
+  inner: CrxSha256;
+  outer: CrxSha256;
+}
+
+/// Gives the address of a state's storage, for cr_wipe.
+/// in: st
+/// returns: a pointer to its 256 bytes (0 if st is 0)
+/// owns: the pointer borrows st; it is caller memory
+/// thread: any thread (no shared state)
+/// example: cr_wipe(cr_hmac_sha256_state_bytes(&st), 256);
+export fn cr_hmac_sha256_state_bytes(st: CrHmacSha256State*) -> uint8* {
+  if (st == 0) { return 0; }
+  return (uint8*)&st->st[0];
+}
+
+/// Starts an HMAC-SHA256 computation (RFC 2104 / FIPS 198-1) with a key of
+/// any length (longer than the block size it is hashed, as RFC 2104 says).
+/// in: st; key readable for keylen bytes, keylen >= 0 (32+ random bytes
+///   recommended; key may be 0 only when keylen == 0)
+/// returns: CR_OK; CR_E_ARG (null st, null key with keylen > 0,
+///   keylen < 0)
+/// owns: st stays the caller's; the key is absorbed into st's hash contexts,
+///   so the caller may wipe its key right away
+/// thread: any thread (no shared state)
+/// example: var st: CrHmacSha256State; cr_hmac_sha256_init(&st, &k[0], 32);
+export fn cr_hmac_sha256_init(st: CrHmacSha256State*, key: uint8*, keylen: int64) -> int32 {
+  if (st == 0 || keylen < 0 || (key == 0 && keylen > 0)) { return CR_E_ARG; }
+  cr_wipe(cr_hmac_sha256_state_bytes(st), 256);
+  var m: CrxHmac256* = (CrxHmac256*)&st->st[0];
+  // The key, zero-padded to the block size (hashed first when longer).
+  var kb: uint8[64];
+  if (keylen > 64) {
+    var kh: CrxSha256;
+    crx_sha256_init(&kh);
+    crx_sha256_update(&kh, key, keylen);
+    crx_sha256_final(&kh, &kb[0]);
+  } else {
+    var i: int64 = 0;
+    while (i < keylen) {
+      kb[i] = key[i];
+      i = i + 1;
+    }
+  }
+  var pad: uint8[64];
+  for i in 0..64 {
+    pad[i] = kb[i] ^ 54;
+  }
+  crx_sha256_init(&m->inner);
+  crx_sha256_update(&m->inner, &pad[0], 64);
+  for i in 0..64 {
+    pad[i] = kb[i] ^ 92;
+  }
+  crx_sha256_init(&m->outer);
+  crx_sha256_update(&m->outer, &pad[0], 64);
+  cr_wipe(&kb[0], 64);
+  cr_wipe(&pad[0], 64);
+  return CR_OK;
+}
+
+/// Feeds n more message bytes into an HMAC-SHA256 computation.
+/// in: st from cr_hmac_sha256_init; msg readable for n bytes; n >= 0
+/// returns: CR_OK; CR_E_ARG (null st, null msg with n > 0, n < 0)
+/// owns: nothing new
+/// thread: any thread (no shared state)
+/// example: cr_hmac_sha256_update(&st, part.chars, (int64)part.length);
+export fn cr_hmac_sha256_update(st: CrHmacSha256State*, msg: uint8*, n: int64) -> int32 {
+  if (st == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  if (n == 0) { return CR_OK; }
+  var m: CrxHmac256* = (CrxHmac256*)&st->st[0];
+  crx_sha256_update(&m->inner, msg, n);
+  return CR_OK;
+}
+
+/// Finishes an HMAC-SHA256 computation, writes the tag and wipes the state.
+/// in: st from cr_hmac_sha256_init; out
+/// returns: CR_OK; CR_E_ARG (null st or out)
+/// owns: st is wiped (start again with cr_hmac_sha256_init to reuse it)
+/// thread: any thread (no shared state)
+/// example: var t: CrHmacSha256; cr_hmac_sha256_final(&st, &t);
+export fn cr_hmac_sha256_final(st: CrHmacSha256State*, out: CrHmacSha256*) -> int32 {
+  if (st == 0 || out == 0) { return CR_E_ARG; }
+  var m: CrxHmac256* = (CrxHmac256*)&st->st[0];
+  var ih: uint8[32];
+  crx_sha256_final(&m->inner, &ih[0]);
+  crx_sha256_update(&m->outer, &ih[0], 32);
+  crx_sha256_final(&m->outer, &out->b[0]);
+  cr_wipe(&ih[0], 32);
+  cr_wipe(cr_hmac_sha256_state_bytes(st), 256);
+  return CR_OK;
+}
+
+/// Computes HMAC-SHA256(key, msg) in one call (init + update + final), for a
+/// key of any length.
+/// in: out; key/keylen as cr_hmac_sha256_init; msg/n as cr_hmac_sha256_update
+/// returns: CR_OK; CR_E_ARG. On error out is left zeroed
+/// owns: nothing; the temporary state is wiped
+/// thread: any thread (no shared state)
+/// example: var t: CrHmacSha256; cr_hmac_sha256(&t, &k[0], 32, m.chars, (int64)m.length);
+export fn cr_hmac_sha256(out: CrHmacSha256*, key: uint8*, keylen: int64, msg: uint8*, n: int64) -> int32 {
+  if (out == 0) { return CR_E_ARG; }
+  cr_wipe(&out->b[0], 32);
+  var st: CrHmacSha256State;
+  var rc: int32 = cr_hmac_sha256_init(&st, key, keylen);
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha256_state_bytes(&st), 256);
+    return rc;
+  }
+  rc = cr_hmac_sha256_update(&st, msg, n);
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha256_state_bytes(&st), 256);
+    return rc;
+  }
+  return cr_hmac_sha256_final(&st, out);
+}
+
+/// Checks an HMAC-SHA256 tag in constant time: recomputes the tag and compares
+/// with cr_equal.
+/// in: tag, the received tag; key/keylen and msg/n as cr_hmac_sha256
+/// returns: true only if the tag is valid; false for a wrong tag and for
+///   every error (fails closed)
+/// owns: nothing; the recomputed tag is wiped
+/// thread: any thread (no shared state)
+/// example: if (!cr_hmac_sha256_verify(&t, &k[0], 32, m.chars, (int64)m.length)) { reject(); }
+export fn cr_hmac_sha256_verify(tag: CrHmacSha256*, key: uint8*, keylen: int64, msg: uint8*, n: int64) -> bool {
+  if (tag == 0) { return false; }
+  var want: CrHmacSha256;
+  if (cr_hmac_sha256(&want, key, keylen, msg, n) != CR_OK) { return false; }
+  var ok: bool = cr_equal(&want.b[0], &tag->b[0], 32);
+  cr_wipe(&want.b[0], 32);
+  return ok;
+}
+
+/// CrHmacSha384State: an incremental HMAC-SHA384 computation. Use one state
+/// per computation (held in caller
+/// memory; 512 bytes reserved, the inner and outer hash contexts use
+/// 416).
+/// in: - (initialize with cr_hmac_sha384_init before use)
+/// returns: -
+/// owns: secret (it holds key-derived hash contexts): cr_hmac_sha384_final wipes it;
+///   if you abandon a computation, call cr_wipe(cr_hmac_sha384_state_bytes(&st), 512)
+/// thread: any thread (no shared state)
+/// example: var st: CrHmacSha384State; cr_hmac_sha384_init(&st, k, klen);
+export struct CrHmacSha384State {
+  st: uint64[64];
+}
+
+// The layout inside CrHmacSha384State.st (uint64-aligned storage).
+struct CrxHmac384 {
+  inner: CrxSha384;
+  outer: CrxSha384;
+}
+
+/// Gives the address of a state's storage, for cr_wipe.
+/// in: st
+/// returns: a pointer to its 512 bytes (0 if st is 0)
+/// owns: the pointer borrows st; it is caller memory
+/// thread: any thread (no shared state)
+/// example: cr_wipe(cr_hmac_sha384_state_bytes(&st), 512);
+export fn cr_hmac_sha384_state_bytes(st: CrHmacSha384State*) -> uint8* {
+  if (st == 0) { return 0; }
+  return (uint8*)&st->st[0];
+}
+
+/// Starts an HMAC-SHA384 computation (RFC 2104 / FIPS 198-1) with a key of
+/// any length (longer than the block size it is hashed, as RFC 2104 says).
+/// in: st; key readable for keylen bytes, keylen >= 0 (32+ random bytes
+///   recommended; key may be 0 only when keylen == 0)
+/// returns: CR_OK; CR_E_ARG (null st, null key with keylen > 0,
+///   keylen < 0)
+/// owns: st stays the caller's; the key is absorbed into st's hash contexts,
+///   so the caller may wipe its key right away
+/// thread: any thread (no shared state)
+/// example: var st: CrHmacSha384State; cr_hmac_sha384_init(&st, &k[0], 32);
+export fn cr_hmac_sha384_init(st: CrHmacSha384State*, key: uint8*, keylen: int64) -> int32 {
+  if (st == 0 || keylen < 0 || (key == 0 && keylen > 0)) { return CR_E_ARG; }
+  cr_wipe(cr_hmac_sha384_state_bytes(st), 512);
+  var m: CrxHmac384* = (CrxHmac384*)&st->st[0];
+  // The key, zero-padded to the block size (hashed first when longer).
+  var kb: uint8[128];
+  if (keylen > 128) {
+    var kh: CrxSha384;
+    crx_sha384_init(&kh);
+    crx_sha384_update(&kh, key, keylen);
+    crx_sha384_final(&kh, &kb[0]);
+  } else {
+    var i: int64 = 0;
+    while (i < keylen) {
+      kb[i] = key[i];
+      i = i + 1;
+    }
+  }
+  var pad: uint8[128];
+  for i in 0..128 {
+    pad[i] = kb[i] ^ 54;
+  }
+  crx_sha384_init(&m->inner);
+  crx_sha384_update(&m->inner, &pad[0], 128);
+  for i in 0..128 {
+    pad[i] = kb[i] ^ 92;
+  }
+  crx_sha384_init(&m->outer);
+  crx_sha384_update(&m->outer, &pad[0], 128);
+  cr_wipe(&kb[0], 128);
+  cr_wipe(&pad[0], 128);
+  return CR_OK;
+}
+
+/// Feeds n more message bytes into an HMAC-SHA384 computation.
+/// in: st from cr_hmac_sha384_init; msg readable for n bytes; n >= 0
+/// returns: CR_OK; CR_E_ARG (null st, null msg with n > 0, n < 0)
+/// owns: nothing new
+/// thread: any thread (no shared state)
+/// example: cr_hmac_sha384_update(&st, part.chars, (int64)part.length);
+export fn cr_hmac_sha384_update(st: CrHmacSha384State*, msg: uint8*, n: int64) -> int32 {
+  if (st == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  if (n == 0) { return CR_OK; }
+  var m: CrxHmac384* = (CrxHmac384*)&st->st[0];
+  crx_sha384_update(&m->inner, msg, n);
+  return CR_OK;
+}
+
+/// Finishes an HMAC-SHA384 computation, writes the tag and wipes the state.
+/// in: st from cr_hmac_sha384_init; out
+/// returns: CR_OK; CR_E_ARG (null st or out)
+/// owns: st is wiped (start again with cr_hmac_sha384_init to reuse it)
+/// thread: any thread (no shared state)
+/// example: var t: CrHmacSha384; cr_hmac_sha384_final(&st, &t);
+export fn cr_hmac_sha384_final(st: CrHmacSha384State*, out: CrHmacSha384*) -> int32 {
+  if (st == 0 || out == 0) { return CR_E_ARG; }
+  var m: CrxHmac384* = (CrxHmac384*)&st->st[0];
+  var ih: uint8[48];
+  crx_sha384_final(&m->inner, &ih[0]);
+  crx_sha384_update(&m->outer, &ih[0], 48);
+  crx_sha384_final(&m->outer, &out->b[0]);
+  cr_wipe(&ih[0], 48);
+  cr_wipe(cr_hmac_sha384_state_bytes(st), 512);
+  return CR_OK;
+}
+
+/// Computes HMAC-SHA384(key, msg) in one call (init + update + final), for a
+/// key of any length.
+/// in: out; key/keylen as cr_hmac_sha384_init; msg/n as cr_hmac_sha384_update
+/// returns: CR_OK; CR_E_ARG. On error out is left zeroed
+/// owns: nothing; the temporary state is wiped
+/// thread: any thread (no shared state)
+/// example: var t: CrHmacSha384; cr_hmac_sha384(&t, &k[0], 32, m.chars, (int64)m.length);
+export fn cr_hmac_sha384(out: CrHmacSha384*, key: uint8*, keylen: int64, msg: uint8*, n: int64) -> int32 {
+  if (out == 0) { return CR_E_ARG; }
+  cr_wipe(&out->b[0], 48);
+  var st: CrHmacSha384State;
+  var rc: int32 = cr_hmac_sha384_init(&st, key, keylen);
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha384_state_bytes(&st), 512);
+    return rc;
+  }
+  rc = cr_hmac_sha384_update(&st, msg, n);
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha384_state_bytes(&st), 512);
+    return rc;
+  }
+  return cr_hmac_sha384_final(&st, out);
+}
+
+/// Checks an HMAC-SHA384 tag in constant time: recomputes the tag and compares
+/// with cr_equal.
+/// in: tag, the received tag; key/keylen and msg/n as cr_hmac_sha384
+/// returns: true only if the tag is valid; false for a wrong tag and for
+///   every error (fails closed)
+/// owns: nothing; the recomputed tag is wiped
+/// thread: any thread (no shared state)
+/// example: if (!cr_hmac_sha384_verify(&t, &k[0], 32, m.chars, (int64)m.length)) { reject(); }
+export fn cr_hmac_sha384_verify(tag: CrHmacSha384*, key: uint8*, keylen: int64, msg: uint8*, n: int64) -> bool {
+  if (tag == 0) { return false; }
+  var want: CrHmacSha384;
+  if (cr_hmac_sha384(&want, key, keylen, msg, n) != CR_OK) { return false; }
+  var ok: bool = cr_equal(&want.b[0], &tag->b[0], 48);
+  cr_wipe(&want.b[0], 48);
+  return ok;
+}
+
+/// CrHmacSha512State: an incremental HMAC-SHA512 computation. Use one state
+/// per computation (held in caller
+/// memory; 512 bytes reserved, the inner and outer hash contexts use
+/// 416).
+/// in: - (initialize with cr_hmac_sha512_init before use)
+/// returns: -
+/// owns: secret (it holds key-derived hash contexts): cr_hmac_sha512_final wipes it;
+///   if you abandon a computation, call cr_wipe(cr_hmac_sha512_state_bytes(&st), 512)
+/// thread: any thread (no shared state)
+/// example: var st: CrHmacSha512State; cr_hmac_sha512_init(&st, k, klen);
+export struct CrHmacSha512State {
+  st: uint64[64];
+}
+
+// The layout inside CrHmacSha512State.st (uint64-aligned storage).
+struct CrxHmac512 {
+  inner: CrxSha512;
+  outer: CrxSha512;
+}
+
+/// Gives the address of a state's storage, for cr_wipe.
+/// in: st
+/// returns: a pointer to its 512 bytes (0 if st is 0)
+/// owns: the pointer borrows st; it is caller memory
+/// thread: any thread (no shared state)
+/// example: cr_wipe(cr_hmac_sha512_state_bytes(&st), 512);
+export fn cr_hmac_sha512_state_bytes(st: CrHmacSha512State*) -> uint8* {
+  if (st == 0) { return 0; }
+  return (uint8*)&st->st[0];
+}
+
+/// Starts an HMAC-SHA512 computation (RFC 2104 / FIPS 198-1) with a key of
+/// any length (longer than the block size it is hashed, as RFC 2104 says).
+/// in: st; key readable for keylen bytes, keylen >= 0 (32+ random bytes
+///   recommended; key may be 0 only when keylen == 0)
+/// returns: CR_OK; CR_E_ARG (null st, null key with keylen > 0,
+///   keylen < 0)
+/// owns: st stays the caller's; the key is absorbed into st's hash contexts,
+///   so the caller may wipe its key right away
+/// thread: any thread (no shared state)
+/// example: var st: CrHmacSha512State; cr_hmac_sha512_init(&st, &k[0], 32);
+export fn cr_hmac_sha512_init(st: CrHmacSha512State*, key: uint8*, keylen: int64) -> int32 {
+  if (st == 0 || keylen < 0 || (key == 0 && keylen > 0)) { return CR_E_ARG; }
+  cr_wipe(cr_hmac_sha512_state_bytes(st), 512);
+  var m: CrxHmac512* = (CrxHmac512*)&st->st[0];
+  // The key, zero-padded to the block size (hashed first when longer).
+  var kb: uint8[128];
+  if (keylen > 128) {
+    var kh: CrxSha512;
+    crx_sha512_init(&kh);
+    crx_sha512_update(&kh, key, keylen);
+    crx_sha512_final(&kh, &kb[0]);
+  } else {
+    var i: int64 = 0;
+    while (i < keylen) {
+      kb[i] = key[i];
+      i = i + 1;
+    }
+  }
+  var pad: uint8[128];
+  for i in 0..128 {
+    pad[i] = kb[i] ^ 54;
+  }
+  crx_sha512_init(&m->inner);
+  crx_sha512_update(&m->inner, &pad[0], 128);
+  for i in 0..128 {
+    pad[i] = kb[i] ^ 92;
+  }
+  crx_sha512_init(&m->outer);
+  crx_sha512_update(&m->outer, &pad[0], 128);
+  cr_wipe(&kb[0], 128);
+  cr_wipe(&pad[0], 128);
+  return CR_OK;
+}
+
+/// Feeds n more message bytes into an HMAC-SHA512 computation.
+/// in: st from cr_hmac_sha512_init; msg readable for n bytes; n >= 0
+/// returns: CR_OK; CR_E_ARG (null st, null msg with n > 0, n < 0)
+/// owns: nothing new
+/// thread: any thread (no shared state)
+/// example: cr_hmac_sha512_update(&st, part.chars, (int64)part.length);
+export fn cr_hmac_sha512_update(st: CrHmacSha512State*, msg: uint8*, n: int64) -> int32 {
+  if (st == 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  if (n == 0) { return CR_OK; }
+  var m: CrxHmac512* = (CrxHmac512*)&st->st[0];
+  crx_sha512_update(&m->inner, msg, n);
+  return CR_OK;
+}
+
+/// Finishes an HMAC-SHA512 computation, writes the tag and wipes the state.
+/// in: st from cr_hmac_sha512_init; out
+/// returns: CR_OK; CR_E_ARG (null st or out)
+/// owns: st is wiped (start again with cr_hmac_sha512_init to reuse it)
+/// thread: any thread (no shared state)
+/// example: var t: CrHmacSha512; cr_hmac_sha512_final(&st, &t);
+export fn cr_hmac_sha512_final(st: CrHmacSha512State*, out: CrHmacSha512*) -> int32 {
+  if (st == 0 || out == 0) { return CR_E_ARG; }
+  var m: CrxHmac512* = (CrxHmac512*)&st->st[0];
+  var ih: uint8[64];
+  crx_sha512_final(&m->inner, &ih[0]);
+  crx_sha512_update(&m->outer, &ih[0], 64);
+  crx_sha512_final(&m->outer, &out->b[0]);
+  cr_wipe(&ih[0], 64);
+  cr_wipe(cr_hmac_sha512_state_bytes(st), 512);
+  return CR_OK;
+}
+
+/// Computes HMAC-SHA512(key, msg) in one call (init + update + final), for a
+/// key of any length.
+/// in: out; key/keylen as cr_hmac_sha512_init; msg/n as cr_hmac_sha512_update
+/// returns: CR_OK; CR_E_ARG. On error out is left zeroed
+/// owns: nothing; the temporary state is wiped
+/// thread: any thread (no shared state)
+/// example: var t: CrHmacSha512; cr_hmac_sha512(&t, &k[0], 32, m.chars, (int64)m.length);
+export fn cr_hmac_sha512(out: CrHmacSha512*, key: uint8*, keylen: int64, msg: uint8*, n: int64) -> int32 {
+  if (out == 0) { return CR_E_ARG; }
+  cr_wipe(&out->b[0], 64);
+  var st: CrHmacSha512State;
+  var rc: int32 = cr_hmac_sha512_init(&st, key, keylen);
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha512_state_bytes(&st), 512);
+    return rc;
+  }
+  rc = cr_hmac_sha512_update(&st, msg, n);
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha512_state_bytes(&st), 512);
+    return rc;
+  }
+  return cr_hmac_sha512_final(&st, out);
+}
+
+/// Checks an HMAC-SHA512 tag in constant time: recomputes the tag and compares
+/// with cr_equal.
+/// in: tag, the received tag; key/keylen and msg/n as cr_hmac_sha512
+/// returns: true only if the tag is valid; false for a wrong tag and for
+///   every error (fails closed)
+/// owns: nothing; the recomputed tag is wiped
+/// thread: any thread (no shared state)
+/// example: if (!cr_hmac_sha512_verify(&t, &k[0], 32, m.chars, (int64)m.length)) { reject(); }
+export fn cr_hmac_sha512_verify(tag: CrHmacSha512*, key: uint8*, keylen: int64, msg: uint8*, n: int64) -> bool {
+  if (tag == 0) { return false; }
+  var want: CrHmacSha512;
+  if (cr_hmac_sha512(&want, key, keylen, msg, n) != CR_OK) { return false; }
+  var ok: bool = cr_equal(&want.b[0], &tag->b[0], 64);
+  cr_wipe(&want.b[0], 64);
+  return ok;
+}

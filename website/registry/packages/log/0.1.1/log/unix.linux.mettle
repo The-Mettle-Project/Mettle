@@ -1,0 +1,28 @@
+// log/unix (Linux): datagrams to a local socket, for syslog (/dev/log) and
+// journald (/run/systemd/journal/socket). Raw system calls; no libc.
+import "std/linux_sys";
+
+export fn log__unix_open() -> int64 {
+  // AF_UNIX = 1, SOCK_DGRAM = 2, SOCK_CLOEXEC = 0x80000
+  return syscall(LINUX_SYS_SOCKET, 1, 2 | 0x80000, 0);
+}
+
+// Sends one datagram to the socket at path. Returns bytes sent or -errno.
+export fn log__unix_send(fd: int64, path: string, buf: uint8*, n: int64) -> int64 {
+  var addr: uint8[112];
+  if (path.length > 107) { return -22; }
+  addr[0] = (uint8)1;
+  addr[1] = (uint8)0;
+  for i in 0..path.length { addr[2 + i] = (uint8)path[i]; }
+  addr[2 + path.length] = (uint8)0;
+  var len: int64 = 3 + (int64)path.length;
+  return syscall(LINUX_SYS_SENDTO, fd, buf, n, 0, &addr[0], len);
+}
+
+export fn log__unix_close(fd: int64) {
+  syscall(LINUX_SYS_CLOSE, fd);
+}
+
+export fn log__pid() -> int64 {
+  return syscall(LINUX_SYS_GETPID);
+}

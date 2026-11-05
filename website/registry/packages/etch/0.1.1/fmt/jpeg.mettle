@@ -1,0 +1,972 @@
+// JPEG decoder: baseline and extended (SOF0, SOF1) and progressive (SOF2)
+// Huffman JPEGs, 8-bit samples, gray, YCbCr, RGB, CMYK and YCCK, any
+// sampling factors, restart markers.
+//
+// The math follows libjpeg's defaults (the "islow" integer IDCT, fancy
+// chroma upsampling, its fixed-point YCbCr to RGB), so the pixels match
+// djpeg closely. Gray files give GRAY8, everything else RGB8.
+//
+// Not supported: arithmetic coding, 12-bit samples, lossless and
+// hierarchical JPEG (all rare). They give ETCH_E_UNSUPPORTED.
+
+import "std/mem";
+import "../core/status";
+import "../core/image";
+import "common";
+
+/// True when the bytes start with a JPEG SOI marker.
+export fn etch_jpeg_is(p: uint8*, n: int64) -> bool {
+  return n >= 3 && p[0] == 255 && p[1] == 216 && p[2] == 255;
+}
+
+// Natural order of the zigzag positions, with guard entries past 63.
+const DEZIG: int32[80] = [
+  0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+  12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+  35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+  58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+  63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63];
+
+const FAST_BITS: int32 = 9;
+
+struct JHuff {
+  fast: uint8[512];      // symbol slot for the first 9 bits, 255 = slow path
+  code: uint16[256];
+  values: uint8[256];
+  size: uint8[257];
+  maxcode: uint32[18];
+  delta: int32[17];
+  ok: bool;
+}
+
+struct JComp {
+  id: int32;
+  h: int32;
+  v: int32;
+  tq: int32;
+  hd: int32;            // DC table
+  ha: int32;            // AC table
+  dc_pred: int32;
+  bw: int32;            // blocks across and down, padded to whole MCUs
+  bh: int32;
+  cw: int32;            // samples across and down that are real
+  ch: int32;
+  plane: uint8*;        // bw*8 x bh*8 samples
+  coef: int16*;         // progressive only: 64 per block
+}
+
+struct Jpg {
+  p: uint8*;
+  n: int64;
+  pos: int64;
+  // bit reader
+  buf: uint32;
+  bits: int32;
+  nomore: bool;
+  marker: int32;        // marker met inside entropy data, or -1
+  hdc: JHuff[4];
+  hac: JHuff[4];
+  q: int32[256];        // 4 tables, natural order
+  qok: int32[4];
+  comps: JComp[4];
+  nc: int32;
+  w: int32;
+  h: int32;
+  hmax: int32;
+  vmax: int32;
+  mcux: int32;
+  mcuy: int32;
+  progressive: bool;
+  restart: int32;
+  // current scan
+  order: int32[4];
+  ns: int32;
+  ss: int32;
+  se: int32;
+  ah: int32;
+  al: int32;
+  eobrun: int32;
+  adobe: bool;
+  transform: int32;     // Adobe color transform: 0 none, 1 YCbCr, 2 YCCK
+  jfif: bool;
+  sof: bool;
+}
+
+fn jfree(j: Jpg*) {
+  for i in 0..4 {
+    if (j->comps[i].plane != 0) { free(j->comps[i].plane); j->comps[i].plane = (uint8*)0; }
+    if (j->comps[i].coef != 0) { free(j->comps[i].coef); j->comps[i].coef = (int16*)0; }
+  }
+}
+
+fn build_huff(t: JHuff*, counts: uint8*, syms: uint8*, total: int32) -> bool {
+  var k: int32 = 0;
+  for i in 0..16 {
+    for jj in 0..(int32)counts[i] {
+      if (k >= 256) { return false; }
+      t->size[k] = (uint8)(i + 1);
+      k = k + 1;
+    }
+  }
+  t->size[k] = 0;
+  var code: int32 = 0;
+  k = 0;
+  for jb in 1..17 {
+    t->delta[jb] = k - code;
+    if ((int32)t->size[k] == jb) {
+      while ((int32)t->size[k] == jb) {
+        t->code[k] = (uint16)code;
+        code = code + 1;
+        k = k + 1;
+      }
+      if (code - 1 >= (1 << jb)) { return false; }
+    }
+    t->maxcode[jb] = (uint32)code << (uint32)(16 - jb);
+    code = code << 1;
+  }
+  t->maxcode[17] = 0xffffffff;
+  for i in 0..512 { t->fast[i] = 255; }
+  for i in 0..k {
+    var s: int32 = (int32)t->size[i];
+    if (s <= FAST_BITS) {
+      var c: int32 = (int32)t->code[i] << (FAST_BITS - s);
+      var m: int32 = 1 << (FAST_BITS - s);
+      for jj in 0..m { t->fast[c + jj] = (uint8)i; }
+    }
+  }
+  for i in 0..total { t->values[i] = syms[i]; }
+  t->ok = true;
+  return true;
+}
+
+// ---- bit reader ----
+
+fn grow(j: Jpg*) {
+  while (j->bits <= 24) {
+    var b: uint32 = 0;
+    if (!j->nomore) {
+      if (j->pos < j->n) { b = (uint32)j->p[j->pos]; j->pos = j->pos + 1; }
+      else { j->nomore = true; }
+      if (b == 255) {
+        var c: int32 = 0;
+        if (j->pos < j->n) { c = (int32)j->p[j->pos]; j->pos = j->pos + 1; }
+        while (c == 255 && j->pos < j->n) { c = (int32)j->p[j->pos]; j->pos = j->pos + 1; }
+        if (c != 0) { j->marker = c; j->nomore = true; return; }
+      }
+    }
+    j->buf = j->buf | (b << (uint32)(24 - j->bits));
+    j->bits = j->bits + 8;
+  }
+}
+
+fn hdecode(j: Jpg*, t: JHuff*) -> int32 {
+  if (j->bits < 16) { grow(j); }
+  var c: int32 = (int32)(j->buf >> (uint32)(32 - FAST_BITS));
+  var k: int32 = (int32)t->fast[c];
+  if (k < 255) {
+    var s: int32 = (int32)t->size[k];
+    if (s > j->bits) { return -1; }
+    j->buf = j->buf << (uint32)s;
+    j->bits = j->bits - s;
+    return (int32)t->values[k];
+  }
+  var temp: uint32 = j->buf >> 16;
+  k = FAST_BITS + 1;
+  while (k < 17 && temp >= t->maxcode[k]) { k = k + 1; }
+  if (k == 17) { j->bits = 0; return -1; }
+  if (k > j->bits) { return -1; }
+  var mask: uint32 = ((uint32)1 << (uint32)k) - 1;
+  var idx: int32 = (int32)((j->buf >> (uint32)(32 - k)) & mask) + t->delta[k];
+  if (idx < 0 || idx > 255) { return -1; }
+  j->bits = j->bits - k;
+  j->buf = j->buf << (uint32)k;
+  return (int32)t->values[idx];
+}
+
+fn getbits(j: Jpg*, n: int32) -> int32 {
+  if (n == 0) { return 0; }
+  if (j->bits < n) { grow(j); }
+  var v: uint32 = j->buf >> (uint32)(32 - n);
+  j->buf = j->buf << (uint32)n;
+  j->bits = j->bits - n;
+  return (int32)v;
+}
+
+fn getbit(j: Jpg*) -> int32 {
+  if (j->bits < 1) { grow(j); }
+  var v: uint32 = j->buf >> 31;
+  j->buf = j->buf << 1;
+  j->bits = j->bits - 1;
+  return (int32)v;
+}
+
+// Reads n bits as a signed coefficient (JPEG's "extend").
+fn receive(j: Jpg*, n: int32) -> int32 {
+  if (n == 0) { return 0; }
+  if (n > 16) { return 0; }
+  var v: int32 = getbits(j, n);
+  if (v < (1 << (n - 1))) { v = v - (1 << n) + 1; }
+  return v;
+}
+
+fn reset_bits(j: Jpg*) {
+  j->buf = 0;
+  j->bits = 0;
+  j->nomore = false;
+  j->marker = -1;
+  for i in 0..4 { j->comps[i].dc_pred = 0; }
+  j->eobrun = 0;
+}
+
+// ---- IDCT (libjpeg's jidctint, "islow") ----
+
+fn idct_block(inp: int32*, out: uint8*, stride: int64) {
+  var ws: int32[64];
+  for c in 0..8 {
+    var i: int32* = inp + c;
+    if (i[8] == 0 && i[16] == 0 && i[24] == 0 && i[32] == 0 && i[40] == 0 && i[48] == 0 && i[56] == 0) {
+      var dc: int32 = i[0] << 2;
+      for r in 0..8 { ws[r * 8 + c] = dc; }
+      continue;
+    }
+    var z2: int64 = (int64)i[16];
+    var z3: int64 = (int64)i[48];
+    var z1: int64 = (z2 + z3) * 4433;
+    var tmp2: int64 = z1 + z3 * -15137;
+    var tmp3: int64 = z1 + z2 * 6270;
+    z2 = (int64)i[0];
+    z3 = (int64)i[32];
+    var tmp0: int64 = (z2 + z3) << 13;
+    var tmp1: int64 = (z2 - z3) << 13;
+    var tmp10: int64 = tmp0 + tmp3;
+    var tmp13: int64 = tmp0 - tmp3;
+    var tmp11: int64 = tmp1 + tmp2;
+    var tmp12: int64 = tmp1 - tmp2;
+    tmp0 = (int64)i[56];
+    tmp1 = (int64)i[40];
+    tmp2 = (int64)i[24];
+    tmp3 = (int64)i[8];
+    z1 = tmp0 + tmp3;
+    z2 = tmp1 + tmp2;
+    z3 = tmp0 + tmp2;
+    var z4: int64 = tmp1 + tmp3;
+    var z5: int64 = (z3 + z4) * 9633;
+    tmp0 = tmp0 * 2446;
+    tmp1 = tmp1 * 16819;
+    tmp2 = tmp2 * 25172;
+    tmp3 = tmp3 * 12299;
+    z1 = z1 * -7373;
+    z2 = z2 * -20995;
+    z3 = z3 * -16069 + z5;
+    z4 = z4 * -3196 + z5;
+    tmp0 = tmp0 + z1 + z3;
+    tmp1 = tmp1 + z2 + z4;
+    tmp2 = tmp2 + z2 + z3;
+    tmp3 = tmp3 + z1 + z4;
+    var rnd: int64 = 1024;   // 1 << (13 - 2 - 1)
+    ws[c] = (int32)((tmp10 + tmp3 + rnd) >> 11);
+    ws[56 + c] = (int32)((tmp10 - tmp3 + rnd) >> 11);
+    ws[8 + c] = (int32)((tmp11 + tmp2 + rnd) >> 11);
+    ws[48 + c] = (int32)((tmp11 - tmp2 + rnd) >> 11);
+    ws[16 + c] = (int32)((tmp12 + tmp1 + rnd) >> 11);
+    ws[40 + c] = (int32)((tmp12 - tmp1 + rnd) >> 11);
+    ws[24 + c] = (int32)((tmp13 + tmp0 + rnd) >> 11);
+    ws[32 + c] = (int32)((tmp13 - tmp0 + rnd) >> 11);
+  }
+  for r in 0..8 {
+    var w: int32* = &ws[0] + r * 8;
+    var o: uint8* = out + (int64)r * stride;
+    var z2: int64 = (int64)w[2];
+    var z3: int64 = (int64)w[6];
+    var z1: int64 = (z2 + z3) * 4433;
+    var tmp2: int64 = z1 + z3 * -15137;
+    var tmp3: int64 = z1 + z2 * 6270;
+    var tmp0: int64 = ((int64)w[0] + (int64)w[4]) << 13;
+    var tmp1: int64 = ((int64)w[0] - (int64)w[4]) << 13;
+    var tmp10: int64 = tmp0 + tmp3;
+    var tmp13: int64 = tmp0 - tmp3;
+    var tmp11: int64 = tmp1 + tmp2;
+    var tmp12: int64 = tmp1 - tmp2;
+    tmp0 = (int64)w[7];
+    tmp1 = (int64)w[5];
+    tmp2 = (int64)w[3];
+    tmp3 = (int64)w[1];
+    z1 = tmp0 + tmp3;
+    z2 = tmp1 + tmp2;
+    z3 = tmp0 + tmp2;
+    var z4: int64 = tmp1 + tmp3;
+    var z5: int64 = (z3 + z4) * 9633;
+    tmp0 = tmp0 * 2446;
+    tmp1 = tmp1 * 16819;
+    tmp2 = tmp2 * 25172;
+    tmp3 = tmp3 * 12299;
+    z1 = z1 * -7373;
+    z2 = z2 * -20995;
+    z3 = z3 * -16069 + z5;
+    z4 = z4 * -3196 + z5;
+    tmp0 = tmp0 + z1 + z3;
+    tmp1 = tmp1 + z2 + z4;
+    tmp2 = tmp2 + z2 + z3;
+    tmp3 = tmp3 + z1 + z4;
+    // descale by 13 + 2 + 3, add 128, clamp
+    var rnd: int64 = (int64)1 << 17;
+    var v: int64[8];
+    v[0] = (tmp10 + tmp3 + rnd) >> 18;
+    v[7] = (tmp10 - tmp3 + rnd) >> 18;
+    v[1] = (tmp11 + tmp2 + rnd) >> 18;
+    v[6] = (tmp11 - tmp2 + rnd) >> 18;
+    v[2] = (tmp12 + tmp1 + rnd) >> 18;
+    v[5] = (tmp12 - tmp1 + rnd) >> 18;
+    v[3] = (tmp13 + tmp0 + rnd) >> 18;
+    v[4] = (tmp13 - tmp0 + rnd) >> 18;
+    for k in 0..8 {
+      var x: int64 = v[k] + 128;
+      if (x < 0) { x = 0; }
+      if (x > 255) { x = 255; }
+      o[k] = (uint8)x;
+    }
+  }
+}
+
+// ---- markers ----
+
+fn rd16(j: Jpg*) -> int32 {
+  if (j->pos + 2 > j->n) { j->pos = j->n; return -1; }
+  var v: int32 = ((int32)j->p[j->pos] << 8) | (int32)j->p[j->pos + 1];
+  j->pos = j->pos + 2;
+  return v;
+}
+
+// Next marker code, skipping junk between segments. -1 at the end.
+fn next_marker(j: Jpg*) -> int32 {
+  while (j->pos < j->n) {
+    if (j->p[j->pos] != 255) { j->pos = j->pos + 1; continue; }
+    while (j->pos < j->n && j->p[j->pos] == 255) { j->pos = j->pos + 1; }
+    if (j->pos >= j->n) { return -1; }
+    var m: int32 = (int32)j->p[j->pos];
+    j->pos = j->pos + 1;
+    if (m != 0) { return m; }
+  }
+  return -1;
+}
+
+fn read_dqt(j: Jpg*, end: int64) -> int32 {
+  while (j->pos < end) {
+    var pq: int32 = (int32)j->p[j->pos] >> 4;
+    var tq: int32 = (int32)j->p[j->pos] & 15;
+    j->pos = j->pos + 1;
+    if (tq > 3 || pq > 1) { return ETCH_E_DATA; }
+    var need: int64 = 64;
+    if (pq == 1) { need = 128; }
+    if (j->pos + need > end) { return ETCH_E_DATA; }
+    for k in 0..64 {
+      var v: int32 = 0;
+      if (pq == 0) { v = (int32)j->p[j->pos + k]; }
+      else { v = ((int32)j->p[j->pos + k * 2] << 8) | (int32)j->p[j->pos + k * 2 + 1]; }
+      j->q[tq * 64 + DEZIG[k]] = v;
+    }
+    j->qok[tq] = 1;
+    j->pos = j->pos + need;
+  }
+  return ETCH_OK;
+}
+
+fn read_dht(j: Jpg*, end: int64) -> int32 {
+  while (j->pos < end) {
+    if (j->pos + 17 > end) { return ETCH_E_DATA; }
+    var tc: int32 = (int32)j->p[j->pos] >> 4;
+    var th: int32 = (int32)j->p[j->pos] & 15;
+    if (tc > 1 || th > 3) { return ETCH_E_DATA; }
+    var counts: uint8* = j->p + j->pos + 1;
+    var total: int32 = 0;
+    for i in 0..16 { total = total + (int32)counts[i]; }
+    if (total > 256) { return ETCH_E_DATA; }
+    j->pos = j->pos + 17;
+    if (j->pos + (int64)total > end) { return ETCH_E_DATA; }
+    var t: JHuff* = &j->hdc[th];
+    if (tc == 1) { t = &j->hac[th]; }
+    if (!build_huff(t, counts, j->p + j->pos, total)) { return ETCH_E_DATA; }
+    j->pos = j->pos + (int64)total;
+  }
+  return ETCH_OK;
+}
+
+fn read_sof(j: Jpg*, end: int64, o: EtchOpts*) -> int32 {
+  if (j->sof) { return ETCH_E_DATA; }
+  if (j->pos + 6 > end) { return ETCH_E_DATA; }
+  var prec: int32 = (int32)j->p[j->pos];
+  if (prec != 8) { return ETCH_E_UNSUPPORTED; }
+  j->h = ((int32)j->p[j->pos + 1] << 8) | (int32)j->p[j->pos + 2];
+  j->w = ((int32)j->p[j->pos + 3] << 8) | (int32)j->p[j->pos + 4];
+  j->nc = (int32)j->p[j->pos + 5];
+  j->pos = j->pos + 6;
+  if (j->w == 0) { return ETCH_E_DATA; }
+  if (j->h == 0) { return ETCH_E_UNSUPPORTED; }    // height from a DNL marker
+  if (j->nc != 1 && j->nc != 3 && j->nc != 4) { return ETCH_E_UNSUPPORTED; }
+  if (j->pos + (int64)j->nc * 3 > end) { return ETCH_E_DATA; }
+  var fmt: int32 = ETCH_RGB8;
+  if (j->nc == 1) { fmt = ETCH_GRAY8; }
+  var rc: int32 = etch_check_size((int64)j->w, (int64)j->h, fmt, etch_opts_limits(o));
+  if (rc != ETCH_OK) { return rc; }
+  j->hmax = 1;
+  j->vmax = 1;
+  for i in 0..j->nc {
+    var c: JComp* = &j->comps[i];
+    c->id = (int32)j->p[j->pos];
+    c->h = (int32)j->p[j->pos + 1] >> 4;
+    c->v = (int32)j->p[j->pos + 1] & 15;
+    c->tq = (int32)j->p[j->pos + 2];
+    j->pos = j->pos + 3;
+    if (c->h < 1 || c->h > 4 || c->v < 1 || c->v > 4 || c->tq > 3) { return ETCH_E_DATA; }
+    if (c->h > j->hmax) { j->hmax = c->h; }
+    if (c->v > j->vmax) { j->vmax = c->v; }
+  }
+  j->mcux = (j->w + j->hmax * 8 - 1) / (j->hmax * 8);
+  j->mcuy = (j->h + j->vmax * 8 - 1) / (j->vmax * 8);
+  // The planes, padded to whole MCUs.
+  var budget: int64 = 0;
+  for i in 0..j->nc {
+    var c: JComp* = &j->comps[i];
+    c->bw = j->mcux * c->h;
+    c->bh = j->mcuy * c->v;
+    c->cw = (j->w * c->h + j->hmax - 1) / j->hmax;
+    c->ch = (j->h * c->v + j->vmax - 1) / j->vmax;
+    var sz: int64 = (int64)c->bw * (int64)c->bh * 64;
+    budget = budget + sz;
+    if (j->progressive) { budget = budget + sz * 2; }
+  }
+  var lim: EtchLimits* = etch_opts_limits(o);
+  if (lim->max_bytes > 0 && budget > lim->max_bytes * 4) { return ETCH_E_LIMIT; }
+  for i in 0..j->nc {
+    var c: JComp* = &j->comps[i];
+    var sz: int64 = (int64)c->bw * (int64)c->bh * 64;
+    c->plane = (uint8*)calloc(sz, 1);
+    if (c->plane == 0) { return ETCH_E_MEM; }
+    if (j->progressive) {
+      c->coef = (int16*)calloc(sz, 2);
+      if (c->coef == 0) { return ETCH_E_MEM; }
+    }
+  }
+  j->sof = true;
+  return ETCH_OK;
+}
+
+fn read_sos(j: Jpg*, end: int64) -> int32 {
+  if (!j->sof) { return ETCH_E_DATA; }
+  if (j->pos >= end) { return ETCH_E_DATA; }
+  j->ns = (int32)j->p[j->pos];
+  j->pos = j->pos + 1;
+  if (j->ns < 1 || j->ns > 4 || j->ns > j->nc) { return ETCH_E_DATA; }
+  if (j->pos + (int64)j->ns * 2 + 3 > end) { return ETCH_E_DATA; }
+  for i in 0..j->ns {
+    var id: int32 = (int32)j->p[j->pos];
+    var tables: int32 = (int32)j->p[j->pos + 1];
+    j->pos = j->pos + 2;
+    var found: int32 = -1;
+    for k in 0..j->nc { if (j->comps[k].id == id) { found = k; } }
+    if (found < 0) { return ETCH_E_DATA; }
+    j->order[i] = found;
+    j->comps[found].hd = tables >> 4;
+    j->comps[found].ha = tables & 15;
+    if (j->comps[found].hd > 3 || j->comps[found].ha > 3) { return ETCH_E_DATA; }
+  }
+  j->ss = (int32)j->p[j->pos];
+  j->se = (int32)j->p[j->pos + 1];
+  j->ah = (int32)j->p[j->pos + 2] >> 4;
+  j->al = (int32)j->p[j->pos + 2] & 15;
+  j->pos = j->pos + 3;
+  if (j->progressive) {
+    if (j->ss > 63 || j->se > 63 || j->ss > j->se || j->ah > 13 || j->al > 13) { return ETCH_E_DATA; }
+    if (j->ss == 0 && j->se != 0) { return ETCH_E_DATA; }
+    if (j->ss != 0 && j->ns != 1) { return ETCH_E_DATA; }
+  } else {
+    if (j->ss != 0 || j->se != 63 || j->ah != 0 || j->al != 0) { return ETCH_E_DATA; }
+  }
+  return ETCH_OK;
+}
+
+// ---- entropy-coded data ----
+
+fn decode_block(j: Jpg*, c: JComp*, blk: int32*) -> bool {
+  for i in 0..64 { blk[i] = 0; }
+  var hd: JHuff* = &j->hdc[c->hd];
+  var ha: JHuff* = &j->hac[c->ha];
+  if (!hd->ok || !ha->ok) { return false; }
+  var qt: int32* = &j->q[0] + (int64)c->tq * 64;
+  var t: int32 = hdecode(j, hd);
+  if (t < 0 || t > 16) { return false; }
+  var diff: int32 = receive(j, t);
+  var dc: int32 = c->dc_pred + diff;
+  c->dc_pred = dc;
+  blk[0] = dc * qt[0];
+  var k: int32 = 1;
+  while (k < 64) {
+    var rs: int32 = hdecode(j, ha);
+    if (rs < 0) { return false; }
+    var s: int32 = rs & 15;
+    var r: int32 = rs >> 4;
+    if (s == 0) {
+      if (rs != 240) { break; }
+      k = k + 16;
+    } else {
+      k = k + r;
+      if (k > 63) { return false; }
+      var z: int32 = DEZIG[k];
+      k = k + 1;
+      blk[z] = receive(j, s) * qt[z];
+    }
+  }
+  return true;
+}
+
+fn prog_dc(j: Jpg*, c: JComp*, co: int16*) -> bool {
+  if (j->ah == 0) {
+    var hd: JHuff* = &j->hdc[c->hd];
+    if (!hd->ok) { return false; }
+    var t: int32 = hdecode(j, hd);
+    if (t < 0 || t > 16) { return false; }
+    var diff: int32 = receive(j, t);
+    var dc: int32 = c->dc_pred + diff;
+    c->dc_pred = dc;
+    co[0] = (int16)(dc * (1 << j->al));
+  } else {
+    if (getbit(j) != 0) { co[0] = (int16)((int32)co[0] + (1 << j->al)); }
+  }
+  return true;
+}
+
+fn prog_ac(j: Jpg*, c: JComp*, co: int16*) -> bool {
+  var ha: JHuff* = &j->hac[c->ha];
+  if (!ha->ok) { return false; }
+  if (j->ah == 0) {
+    if (j->eobrun > 0) { j->eobrun = j->eobrun - 1; return true; }
+    var k: int32 = j->ss;
+    while (k <= j->se) {
+      var rs: int32 = hdecode(j, ha);
+      if (rs < 0) { return false; }
+      var s: int32 = rs & 15;
+      var r: int32 = rs >> 4;
+      if (s == 0) {
+        if (r < 15) {
+          j->eobrun = (1 << r) - 1;
+          if (r > 0) { j->eobrun = j->eobrun + getbits(j, r); }
+          break;
+        }
+        k = k + 16;
+      } else {
+        k = k + r;
+        if (k > 63) { return false; }
+        co[DEZIG[k]] = (int16)(receive(j, s) * (1 << j->al));
+        k = k + 1;
+      }
+    }
+    return true;
+  }
+  // refinement
+  var bit: int32 = 1 << j->al;
+  if (j->eobrun > 0) {
+    j->eobrun = j->eobrun - 1;
+    for k in j->ss..(j->se + 1) {
+      var z: int32 = DEZIG[k];
+      var v: int32 = (int32)co[z];
+      if (v != 0 && getbit(j) != 0 && (v & bit) == 0) {
+        if (v > 0) { co[z] = (int16)(v + bit); } else { co[z] = (int16)(v - bit); }
+      }
+    }
+    return true;
+  }
+  var k: int32 = j->ss;
+  while (k <= j->se) {
+    var rs: int32 = hdecode(j, ha);
+    if (rs < 0) { return false; }
+    var s: int32 = rs & 15;
+    var r: int32 = rs >> 4;
+    if (s == 0) {
+      if (r < 15) {
+        j->eobrun = (1 << r) - 1;
+        if (r > 0) { j->eobrun = j->eobrun + getbits(j, r); }
+        r = 64;
+      }
+    } else {
+      if (s != 1) { return false; }
+      if (getbit(j) != 0) { s = bit; } else { s = -bit; }
+    }
+    while (k <= j->se) {
+      var z: int32 = DEZIG[k];
+      k = k + 1;
+      var v: int32 = (int32)co[z];
+      if (v != 0) {
+        if (getbit(j) != 0 && (v & bit) == 0) {
+          if (v > 0) { co[z] = (int16)(v + bit); } else { co[z] = (int16)(v - bit); }
+        }
+      } else {
+        if (r == 0) { co[z] = (int16)s; break; }
+        r = r - 1;
+      }
+    }
+  }
+  return true;
+}
+
+// Handles a restart interval boundary. False when the data is broken.
+fn do_restart(j: Jpg*) -> bool {
+  if (j->bits < 24) { grow(j); }
+  if (j->marker < 208 || j->marker > 215) { return false; }
+  reset_bits(j);
+  return true;
+}
+
+fn one_block(j: Jpg*, c: JComp*, bx: int32, by: int32, blk: int32*) -> bool {
+  if (bx >= c->bw || by >= c->bh) { return true; }
+  if (!j->progressive) {
+    if (!decode_block(j, c, blk)) { return false; }
+    var stride: int64 = (int64)c->bw * 8;
+    idct_block(blk, c->plane + (int64)by * 8 * stride + (int64)bx * 8, stride);
+    return true;
+  }
+  var co: int16* = c->coef + ((int64)by * (int64)c->bw + (int64)bx) * 64;
+  if (j->ss == 0) { return prog_dc(j, c, co); }
+  return prog_ac(j, c, co);
+}
+
+fn decode_scan(j: Jpg*) -> int32 {
+  reset_bits(j);
+  var blk: int32[64];
+  var left: int32 = j->restart;
+  if (j->ns == 1) {
+    // Non-interleaved: the component's own blocks, in raster order.
+    var c: JComp* = &j->comps[j->order[0]];
+    var w: int32 = (c->cw + 7) / 8;
+    var h: int32 = (c->ch + 7) / 8;
+    for by in 0..h {
+      for bx in 0..w {
+        if (!one_block(j, c, bx, by, &blk[0])) { return ETCH_E_DATA; }
+        if (j->restart > 0) {
+          left = left - 1;
+          if (left == 0) {
+            left = j->restart;
+            if (!(bx == w - 1 && by == h - 1) && !do_restart(j)) { return ETCH_OK; }
+          }
+        }
+      }
+    }
+    return ETCH_OK;
+  }
+  for my in 0..j->mcuy {
+    for mx in 0..j->mcux {
+      for ci in 0..j->ns {
+        var c: JComp* = &j->comps[j->order[ci]];
+        for yy in 0..c->v {
+          for xx in 0..c->h {
+            if (!one_block(j, c, mx * c->h + xx, my * c->v + yy, &blk[0])) { return ETCH_E_DATA; }
+          }
+        }
+      }
+      if (j->restart > 0) {
+        left = left - 1;
+        if (left == 0) {
+          left = j->restart;
+          if (!(mx == j->mcux - 1 && my == j->mcuy - 1) && !do_restart(j)) { return ETCH_OK; }
+        }
+      }
+    }
+  }
+  return ETCH_OK;
+}
+
+// Progressive: dequantize and IDCT every block once all scans are in.
+fn finish_progressive(j: Jpg*) {
+  var blk: int32[64];
+  for i in 0..j->nc {
+    var c: JComp* = &j->comps[i];
+    var qt: int32* = &j->q[0] + (int64)c->tq * 64;
+    var stride: int64 = (int64)c->bw * 8;
+    for by in 0..c->bh {
+      for bx in 0..c->bw {
+        var co: int16* = c->coef + ((int64)by * (int64)c->bw + (int64)bx) * 64;
+        for k in 0..64 { blk[k] = (int32)co[k] * qt[k]; }
+        idct_block(&blk[0], c->plane + (int64)by * 8 * stride + (int64)bx * 8, stride);
+      }
+    }
+  }
+}
+
+// ---- upsampling and color ----
+
+fn clamp8(v: int32) -> uint8 {
+  if (v < 0) { return 0; }
+  if (v > 255) { return 255; }
+  return (uint8)v;
+}
+
+// One full-width row y of component c into out (j->w samples), using
+// libjpeg's "fancy" triangle filters for 2x factors.
+fn upsample_row(j: Jpg*, c: JComp*, y: int32, out: uint8*, tmp: uint8*) {
+  var stride: int64 = (int64)c->bw * 8;
+  var fh: int32 = j->hmax / c->h;
+  var fv: int32 = j->vmax / c->v;
+  var exact: bool = j->hmax % c->h == 0 && j->vmax % c->v == 0;
+  var cw: int64 = (int64)c->cw;
+  var w: int64 = (int64)j->w;
+  if (exact && fh == 1 && fv == 1) {
+    memcpy(out, c->plane + (int64)y * stride, w);
+    return;
+  }
+  if (!exact || fh > 2 || fv > 2) {
+    // plain replication
+    var sy: int64 = (int64)y * (int64)c->v / (int64)j->vmax;
+    var row: uint8* = c->plane + sy * stride;
+    for x in 0..w { out[x] = row[x * (int64)c->h / (int64)j->hmax]; }
+    return;
+  }
+  // Vertical step: a row of column sums (x3 near + far), or the row itself.
+  var sy: int32 = y / fv;
+  var src: uint8* = c->plane + (int64)sy * stride;
+  if (fv == 2) {
+    var other: int32 = sy - 1;
+    var bias: int32 = 1;
+    if ((y & 1) == 1) { other = sy + 1; bias = 2; }
+    if (other < 0) { other = 0; }
+    if (other > c->ch - 1) { other = c->ch - 1; }
+    var far: uint8* = c->plane + (int64)other * stride;
+    if (fh == 1) {
+      for x in 0..w { out[x] = (uint8)(((int32)src[x] * 3 + (int32)far[x] + bias) >> 2); }
+      return;
+    }
+    // h2v2
+    var sums: int32* = (int32*)tmp;
+    for x in 0..cw { sums[x] = (int32)src[x] * 3 + (int32)far[x]; }
+    if (cw == 1) {
+      var v1: uint8 = (uint8)((sums[0] * 4 + 8) >> 4);
+      for x in 0..w { out[x] = v1; }
+      return;
+    }
+    out[0] = (uint8)((sums[0] * 4 + 8) >> 4);
+    if (w > 1) { out[1] = (uint8)((sums[0] * 3 + sums[1] + 7) >> 4); }
+    for x in 1..(cw - 1) {
+      var t: int32 = sums[x] * 3;
+      if (x * 2 < w) { out[x * 2] = (uint8)((t + sums[x - 1] + 8) >> 4); }
+      if (x * 2 + 1 < w) { out[x * 2 + 1] = (uint8)((t + sums[x + 1] + 7) >> 4); }
+    }
+    var l: int64 = cw - 1;
+    if (l * 2 < w) { out[l * 2] = (uint8)((sums[l] * 3 + sums[l - 1] + 8) >> 4); }
+    if (l * 2 + 1 < w) { out[l * 2 + 1] = (uint8)((sums[l] * 4 + 7) >> 4); }
+    return;
+  }
+  // h2v1
+  if (cw == 1) {
+    for x in 0..w { out[x] = src[0]; }
+    return;
+  }
+  out[0] = src[0];
+  if (w > 1) { out[1] = (uint8)(((int32)src[0] * 3 + (int32)src[1] + 2) >> 2); }
+  for x in 1..(cw - 1) {
+    var t: int32 = (int32)src[x] * 3;
+    if (x * 2 < w) { out[x * 2] = (uint8)((t + (int32)src[x - 1] + 1) >> 2); }
+    if (x * 2 + 1 < w) { out[x * 2 + 1] = (uint8)((t + (int32)src[x + 1] + 2) >> 2); }
+  }
+  var l: int64 = cw - 1;
+  if (l * 2 < w) { out[l * 2] = (uint8)(((int32)src[l] * 3 + (int32)src[l - 1] + 1) >> 2); }
+  if (l * 2 + 1 < w) { out[l * 2 + 1] = src[l]; }
+}
+
+fn output(j: Jpg*, img: EtchImage*) -> int32 {
+  var w: int64 = (int64)j->w;
+  var rows: uint8* = (uint8*)malloc(w * 4 + 64);
+  var tmp: uint8* = (uint8*)malloc((int64)j->comps[0].bw * 8 * 4 + (int64)j->comps[1].bw * 32 + (int64)j->comps[2].bw * 32 + (int64)j->comps[3].bw * 32 + 64);
+  if (rows == 0 || tmp == 0) {
+    if (rows != 0) { free(rows); }
+    if (tmp != 0) { free(tmp); }
+    return ETCH_E_MEM;
+  }
+  // fixed-point YCbCr to RGB, as libjpeg's jdcolor.c
+  var crr: int32[256];
+  var cbb: int32[256];
+  var crg: int32[256];
+  var cbg: int32[256];
+  for i in 0..256 {
+    var x: int64 = (int64)i - 128;
+    crr[i] = (int32)((91881 * x + 32768) >> 16);
+    cbb[i] = (int32)((116130 * x + 32768) >> 16);
+    crg[i] = (int32)(-46802 * x);
+    cbg[i] = (int32)(-22554 * x + 32768);
+  }
+  var rgb_ids: bool = j->nc == 3 && j->comps[0].id == 'R' && j->comps[1].id == 'G' && j->comps[2].id == 'B';
+  var is_rgb: bool = j->nc == 3 && ((j->adobe && j->transform == 0) || rgb_ids);
+  for y in 0..j->h {
+    for ci in 0..j->nc { upsample_row(j, &j->comps[ci], y, rows + (int64)ci * w, tmp); }
+    var d: uint8* = img->data + (int64)y * img->stride;
+    var c0: uint8* = rows;
+    var c1: uint8* = rows + w;
+    var c2: uint8* = rows + w * 2;
+    var c3: uint8* = rows + w * 3;
+    if (j->nc == 1) {
+      memcpy(d, c0, w);
+    } else if (is_rgb) {
+      for x in 0..w { d[x * 3] = c0[x]; d[x * 3 + 1] = c1[x]; d[x * 3 + 2] = c2[x]; }
+    } else if (j->nc == 3) {
+      for x in 0..w {
+        var yy: int32 = (int32)c0[x];
+        var cb: int32 = (int32)c1[x];
+        var cr: int32 = (int32)c2[x];
+        d[x * 3] = clamp8(yy + crr[cr]);
+        d[x * 3 + 1] = clamp8(yy + ((cbg[cb] + crg[cr]) >> 16));
+        d[x * 3 + 2] = clamp8(yy + cbb[cb]);
+      }
+    } else {
+      // CMYK or YCCK. Adobe files store CMYK inverted, so 255 is no ink.
+      var ycck: bool = j->adobe && j->transform == 2;
+      for x in 0..w {
+        var cc: int32 = (int32)c0[x];
+        var mm: int32 = (int32)c1[x];
+        var yv: int32 = (int32)c2[x];
+        var k: int32 = (int32)c3[x];
+        if (ycck) {
+          var yy: int32 = cc;
+          var cb: int32 = mm;
+          var cr: int32 = yv;
+          cc = 255 - (int32)clamp8(yy + crr[cr]);
+          mm = 255 - (int32)clamp8(yy + ((cbg[cb] + crg[cr]) >> 16));
+          yv = 255 - (int32)clamp8(yy + cbb[cb]);
+        }
+        if (!j->adobe) { cc = 255 - cc; mm = 255 - mm; yv = 255 - yv; k = 255 - k; }
+        var t: int32 = cc * k + 128;
+        d[x * 3] = (uint8)((t + (t >> 8)) >> 8);
+        t = mm * k + 128;
+        d[x * 3 + 1] = (uint8)((t + (t >> 8)) >> 8);
+        t = yv * k + 128;
+        d[x * 3 + 2] = (uint8)((t + (t >> 8)) >> 8);
+      }
+    }
+  }
+  free(rows);
+  free(tmp);
+  return ETCH_OK;
+}
+
+/// Basic facts from a JPEG's frame header, without decoding.
+export struct EtchJpegInfo {
+  width: int32;
+  height: int32;
+  components: int32;
+  progressive: bool;
+  format: int32;       // ETCH_GRAY8 or ETCH_RGB8
+}
+
+fn jpeg_run(p: uint8*, n: int64, j: Jpg*, img: EtchImage*, o: EtchOpts*, info_only: bool) -> int32 {
+  memset(j, 0, sizeof(Jpg));
+  if (p == 0 || n < 0) { return ETCH_E_ARG; }
+  if (!etch_jpeg_is(p, n)) { return ETCH_E_DATA; }
+  j->p = p;
+  j->n = n;
+  j->pos = 2;
+  j->marker = -1;
+  var scans: int32 = 0;
+  var m: int32 = next_marker(j);
+  while (true) {
+    if (m < 0) { break; }
+    if (m == 217) { break; }                          // EOI
+    if (m >= 208 && m <= 215) { m = next_marker(j); continue; }   // stray RSTn
+    if (m == 1) { m = next_marker(j); continue; }
+    var len: int32 = rd16(j);
+    if (len < 2) { return ETCH_E_TRUNC; }
+    var end: int64 = j->pos + (int64)len - 2;
+    if (end > n) { return ETCH_E_TRUNC; }
+    var rc: int32 = ETCH_OK;
+    if (m == 192 || m == 193 || m == 194) {
+      j->progressive = m == 194;
+      if (info_only) {
+        if (j->pos + 6 > end) { return ETCH_E_DATA; }
+        j->h = ((int32)p[j->pos + 1] << 8) | (int32)p[j->pos + 2];
+        j->w = ((int32)p[j->pos + 3] << 8) | (int32)p[j->pos + 4];
+        j->nc = (int32)p[j->pos + 5];
+        return ETCH_OK;
+      }
+      rc = read_sof(j, end, o);
+    } else if (m == 195 || (m >= 197 && m <= 207 && m != 200 && m != 204)) {
+      return ETCH_E_UNSUPPORTED;                       // lossless, hierarchical, arithmetic
+    } else if (m == 196) {
+      rc = read_dht(j, end);
+    } else if (m == 219) {
+      rc = read_dqt(j, end);
+    } else if (m == 221) {
+      if (len != 4) { return ETCH_E_DATA; }
+      j->restart = ((int32)p[j->pos] << 8) | (int32)p[j->pos + 1];
+    } else if (m == 238) {
+      // APP14 "Adobe"
+      if (len >= 14 && p[j->pos] == 'A' && p[j->pos + 1] == 'd' && p[j->pos + 2] == 'o' && p[j->pos + 3] == 'b' && p[j->pos + 4] == 'e') {
+        j->adobe = true;
+        j->transform = (int32)p[j->pos + 11];
+      }
+    } else if (m == 218) {
+      rc = read_sos(j, end);
+      if (rc != ETCH_OK) { return rc; }
+      j->pos = end;
+      for i in 0..j->ns {
+        var c: JComp* = &j->comps[j->order[i]];
+        if (j->qok[c->tq] == 0) { return ETCH_E_DATA; }
+      }
+      rc = decode_scan(j);
+      if (rc != ETCH_OK) { return rc; }
+      scans = scans + 1;
+      if (j->marker >= 0 && !(j->marker >= 208 && j->marker <= 215)) {
+        m = j->marker;
+      } else {
+        m = next_marker(j);
+      }
+      if (!j->progressive) {
+        // Baseline: all components in one scan is the common case; later
+        // scans fill in the rest.
+      }
+      continue;
+    }
+    if (rc != ETCH_OK) { return rc; }
+    j->pos = end;
+    m = next_marker(j);
+  }
+  if (!j->sof) { return ETCH_E_DATA; }
+  if (scans == 0) { return ETCH_E_TRUNC; }
+  if (j->progressive) { finish_progressive(j); }
+  var fmt: int32 = ETCH_RGB8;
+  if (j->nc == 1) { fmt = ETCH_GRAY8; }
+  var rc2: int32 = etch_image_alloc(img, j->w, j->h, fmt);
+  if (rc2 != ETCH_OK) { return rc2; }
+  rc2 = output(j, img);
+  if (rc2 != ETCH_OK) { etch_image_free(img); }
+  return rc2;
+}
+
+/// Reads a JPEG's size and kind without decoding it.
+export fn etch_jpeg_info(p: uint8*, n: int64, info: EtchJpegInfo*) -> int32 {
+  if (info == 0) { return ETCH_E_ARG; }
+  var j: Jpg* = new Jpg;
+  if (j == 0) { return ETCH_E_MEM; }
+  var img: EtchImage;
+  var rc: int32 = jpeg_run(p, n, j, &img, (EtchOpts*)0, true);
+  if (rc == ETCH_OK && j->w == 0) { rc = ETCH_E_DATA; }
+  if (rc == ETCH_OK) {
+    info->width = j->w;
+    info->height = j->h;
+    info->components = j->nc;
+    info->progressive = j->progressive;
+    info->format = ETCH_RGB8;
+    if (j->nc == 1) { info->format = ETCH_GRAY8; }
+  }
+  jfree(j);
+  free(j);
+  return rc;
+}
+
+/// Decodes a JPEG file into GRAY8 or RGB8.
+export fn etch_jpeg_decode(p: uint8*, n: int64, out: EtchImage*, o: EtchOpts*) -> int32 {
+  if (out == 0) { return ETCH_E_ARG; }
+  var j: Jpg* = new Jpg;
+  if (j == 0) { return ETCH_E_MEM; }
+  var img: EtchImage;
+  var rc: int32 = jpeg_run(p, n, j, &img, o, false);
+  jfree(j);
+  free(j);
+  if (rc != ETCH_OK) { return rc; }
+  *out = img;
+  return etch_finish(out, o);
+}

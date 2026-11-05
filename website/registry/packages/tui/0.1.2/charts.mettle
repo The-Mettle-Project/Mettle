@@ -1,0 +1,307 @@
+// Charts: gauges, btop-style meters, sparklines, a braille canvas and line
+// graphs. Bars use the eighth blocks U+2581-U+2588 (up) and U+2589-U+258F
+// (left), and the canvas uses braille patterns U+2800-U+28FF, 2 by 4 dots
+// per cell, as drawille, ratatui and btop do.
+
+import "std/mem";
+import "types";
+import "buf";
+import "color";
+import "width";
+
+fn tui_clamp01(v: float64) -> float64 {
+  if (v != v) { return 0.0; }   // NaN
+  if (v < 0.0) { return 0.0; }
+  if (v > 1.0) { return 1.0; }
+  return v;
+}
+
+// A horizontal gauge filled to ratio (0 to 1) with eighth-cell precision,
+// with an optional label centred on it. fill is the bar colour, empty the
+// colour of the rest; label_fg is the label's text colour.
+export fn tui_gauge(b: TuiBuf*, r: TuiRect, ratio: float64, label: string, fill: uint32, empty: uint32, label_fg: uint32) {
+  if (r.w <= 0 || r.h <= 0) { return; }
+  var eighths: int64 = (int64)(tui_clamp01(ratio) * (float64)r.w * 8.0 + 0.5);
+  var full: int32 = (int32)(eighths / 8);
+  var part: int32 = (int32)(eighths % 8);
+  var full_st: TuiStyle = tui_style(fill, fill, (uint16)0);
+  var empty_st: TuiStyle = tui_style(empty, empty, (uint16)0);
+  var part_st: TuiStyle = tui_style(fill, empty, (uint16)0);
+  for y in r.y..r.y + r.h {
+    for i in 0..r.w {
+      if (i < full) {
+        tui_buf_set_cp(b, r.x + i, y, 32, full_st);
+      } else if (i == full && part > 0) {
+        tui_buf_set_cp(b, r.x + i, y, 0x2590 - part, part_st);   // U+258F (1/8) .. U+2589 (7/8)
+      } else {
+        tui_buf_set_cp(b, r.x + i, y, 32, empty_st);
+      }
+    }
+  }
+  if (label.length == (uint64)0) { return; }
+  var lw: int32 = tui_str_width(label);
+  if (lw > r.w) { lw = r.w; }
+  var lx: int32 = r.x + (r.w - lw) / 2;
+  var ly: int32 = r.y + r.h / 2;
+  var used: int32 = tui_put_clip(b, lx, ly, label, lw, tui_style_fg(label_fg));
+  for i in 0..used {
+    var c: TuiCell* = tui_buf_cell(b, lx + i, ly);
+    if (c == 0) { continue; }
+    var bg: uint32 = empty;
+    if (lx + i - r.x < full) { bg = fill; }
+    c->style.bg = bg;
+  }
+}
+
+// A one-row meter like btop's: ratio of the cells hold a mark, each coloured
+// by its place along the gradient stops; the rest hold the mark in
+// empty_fg. mark 0 means U+25A0 (black square).
+export fn tui_meter(b: TuiBuf*, r: TuiRect, ratio: float64, stops: uint32[], empty_fg: uint32, mark: int32) {
+  if (r.w <= 0 || r.h <= 0) { return; }
+  if (mark == 0) { mark = 0x25A0; }
+  var on: int32 = (int32)(tui_clamp01(ratio) * (float64)r.w + 0.5);
+  for i in 0..r.w {
+    var c: uint32 = empty_fg;
+    if (i < on) {
+      var t: int32 = 0;
+      if (r.w > 1) { t = i * 1000 / (r.w - 1); }
+      c = tui_gradient(stops, t);
+    }
+    tui_buf_set_cp(b, r.x + i, r.y, mark, tui_style_fg(c));
+  }
+}
+
+fn tui_scale(v: float64, lo: float64, hi: float64) -> float64 {
+  if (hi <= lo) { return 0.0; }
+  return tui_clamp01((v - lo) / (hi - lo));
+}
+
+fn tui_auto_max(values: float64[]) -> float64 {
+  var m: float64 = 0.0;
+  for v in values { if (v > m) { m = v; } }
+  if (m <= 0.0) { m = 1.0; }
+  return m;
+}
+
+// Vertical bars, newest value at the right, one value per column, r.h rows
+// tall with eighth-cell steps. max <= 0 means the largest value. With
+// stops, rows are coloured along the gradient from bottom to top;
+// otherwise fg is used.
+export fn tui_sparkline(b: TuiBuf*, r: TuiRect, values: float64[], max: float64, fg: uint32, stops: uint32[]) {
+  if (r.w <= 0 || r.h <= 0) { return; }
+  if (max <= 0.0) { max = tui_auto_max(values); }
+  var n: int32 = (int32)values.length;
+  var cols: int32 = n;
+  if (cols > r.w) { cols = r.w; }
+  for k in 0..cols {
+    var v: float64 = values[n - cols + k];
+    var x: int32 = r.x + r.w - cols + k;
+    var h8: int32 = (int32)(tui_scale(v, 0.0, max) * (float64)(r.h * 8) + 0.5);
+    for row in 0..r.h {
+      var y: int32 = r.y + r.h - 1 - row;
+      var lvl: int32 = h8 - row * 8;
+      if (lvl <= 0) { continue; }
+      if (lvl > 8) { lvl = 8; }
+      var c: uint32 = fg;
+      if (stops.length > (uint64)0) {
+        var t: int32 = 0;
+        if (r.h > 1) { t = row * 1000 / (r.h - 1); }
+        c = tui_gradient(stops, t);
+      }
+      tui_buf_set_cp(b, x, y, 0x2580 + lvl, tui_style_fg(c));
+    }
+  }
+}
+
+// A canvas of braille dots: 2 across and 4 down per cell, with one colour
+// per cell (the last dot drawn in a cell sets it).
+export struct TuiCanvas {
+  cw: int32;        // size in cells
+  ch: int32;
+  bits: uint8*;
+  colors: uint32*;
+}
+
+export fn tui_canvas_new(cw: int32, ch: int32) -> TuiCanvas* {
+  var c: TuiCanvas* = new TuiCanvas;
+  if (cw < 0) { cw = 0; }
+  if (ch < 0) { ch = 0; }
+  c->cw = cw;
+  c->ch = ch;
+  var n: int64 = (int64)cw * (int64)ch;
+  if (n < 1) { n = 1; }
+  c->bits = (uint8*)calloc(n, 1);
+  c->colors = (uint32*)calloc(n, 4);
+  return c;
+}
+
+export fn tui_canvas_free(c: TuiCanvas*) {
+  if (c == 0) { return; }
+  free(c->bits);
+  free(c->colors);
+  free(c);
+}
+
+export fn tui_canvas_clear(c: TuiCanvas*) {
+  var n: int64 = (int64)c->cw * (int64)c->ch;
+  memset(c->bits, 0, n);
+  memset(c->colors, 0, n * 4);
+}
+
+// Dot size of the canvas.
+export fn tui_canvas_w(c: TuiCanvas*) -> int32 { return c->cw * 2; }
+export fn tui_canvas_h(c: TuiCanvas*) -> int32 { return c->ch * 4; }
+
+const TUI_DOTS: uint8[8] = [0x01, 0x08, 0x02, 0x10, 0x04, 0x20, 0x40, 0x80];
+
+// Sets the dot at (x, y), from the top-left. Off-canvas dots are ignored.
+export fn tui_canvas_dot(c: TuiCanvas*, x: int32, y: int32, color: uint32) {
+  if (x < 0 || y < 0 || x >= c->cw * 2 || y >= c->ch * 4) { return; }
+  var i: int64 = (int64)(y / 4) * (int64)c->cw + (int64)(x / 2);
+  c->bits[i] = c->bits[i] | TUI_DOTS[(y % 4) * 2 + (x % 2)];
+  c->colors[i] = color;
+}
+
+fn tui_abs(v: int32) -> int32 { if (v < 0) { return 0 - v; } return v; }
+
+// A straight line of dots (Bresenham).
+export fn tui_canvas_line(c: TuiCanvas*, x0: int32, y0: int32, x1: int32, y1: int32, color: uint32) {
+  var dx: int32 = tui_abs(x1 - x0);
+  var dy: int32 = 0 - tui_abs(y1 - y0);
+  var sx: int32 = 1;
+  if (x0 > x1) { sx = -1; }
+  var sy: int32 = 1;
+  if (y0 > y1) { sy = -1; }
+  var err: int32 = dx + dy;
+  var steps: int32 = 0;
+  while (steps < 100000) {
+    tui_canvas_dot(c, x0, y0, color);
+    if (x0 == x1 && y0 == y1) { break; }
+    var e2: int32 = 2 * err;
+    if (e2 >= dy) { err = err + dy; x0 = x0 + sx; }
+    if (e2 <= dx) { err = err + dx; y0 = y0 + sy; }
+    steps = steps + 1;
+  }
+}
+
+// Draws the canvas into b with its top-left cell at (x, y). Empty cells are
+// left as they are.
+export fn tui_canvas_draw(b: TuiBuf*, c: TuiCanvas*, x: int32, y: int32, bg: uint32) {
+  for cy in 0..c->ch {
+    for cx in 0..c->cw {
+      var i: int64 = (int64)cy * (int64)c->cw + (int64)cx;
+      if (c->bits[i] == (uint8)0) { continue; }
+      tui_buf_set_cp(b, x + cx, y + cy, 0x2800 + (int32)c->bits[i], tui_style(c->colors[i], bg, (uint16)0));
+    }
+  }
+}
+
+// Graph modes.
+export const TUI_GRAPH_BRAILLE = 0;   // lines of braille dots
+export const TUI_GRAPH_BLOCK = 1;     // filled bars of eighth blocks
+export const TUI_GRAPH_FILL = 2;      // add to BRAILLE: fill below the line
+
+// One line on a graph. With stops, dots are coloured by height along the
+// gradient (bottom to top), as btop does; otherwise color is used.
+export struct TuiSeries {
+  values: float64[];
+  color: uint32;
+  stops: uint32[];
+}
+
+export fn tui_series(values: float64[], color: uint32) -> TuiSeries {
+  var s: TuiSeries;
+  s.values = values;
+  s.color = color;
+  return s;
+}
+
+fn tui_series_color(s: TuiSeries, t: int32) -> uint32 {
+  if (s.stops.length > (uint64)0) { return tui_gradient(s.stops, t); }
+  return s.color;
+}
+
+// A graph of one or more series over r, newest value at the right, scaled
+// from lo (bottom) to hi (top). In braille mode each dot column is one
+// value and points are joined by lines; in block mode each cell column is
+// one value. Later series draw over earlier ones.
+export fn tui_graph(b: TuiBuf*, r: TuiRect, series: TuiSeries[], lo: float64, hi: float64, mode: int32) {
+  if (r.w <= 0 || r.h <= 0) { return; }
+  if ((mode & TUI_GRAPH_BLOCK) != 0) {
+    for s in series { tui_graph_blocks(b, r, s, lo, hi); }
+    return;
+  }
+  var cv: TuiCanvas* = tui_canvas_new(r.w, r.h);
+  defer tui_canvas_free(cv);
+  var dw: int32 = r.w * 2;
+  var dh: int32 = r.h * 4;
+  var fill: bool = (mode & TUI_GRAPH_FILL) != 0;
+  // The colour of each dot row, worked out once per series.
+  var rowc: uint32* = (uint32*)malloc((int64)dh * 4);
+  defer free(rowc);
+  for s in series {
+    for y in 0..dh { rowc[y] = tui_series_color(s, (dh - 1 - y) * 1000 / tui_max1(dh - 1)); }
+    var n: int32 = (int32)s.values.length;
+    var cols: int32 = n;
+    if (cols > dw) { cols = dw; }
+    var px: int32 = -1;
+    var py: int32 = 0;
+    for k in 0..cols {
+      var v: float64 = s.values[n - cols + k];
+      var x: int32 = dw - cols + k;
+      var y: int32 = dh - 1 - (int32)(tui_scale(v, lo, hi) * (float64)(dh - 1) + 0.5);
+      if (fill) {
+        for yy in y..dh {
+          tui_canvas_dot(cv, x, yy, rowc[yy]);
+        }
+      } else if (px >= 0) {
+        tui_graph_join(cv, s, px, py, x, y, rowc);
+      } else {
+        tui_canvas_dot(cv, x, y, rowc[y]);
+      }
+      px = x;
+      py = y;
+    }
+  }
+  tui_canvas_draw(b, cv, r.x, r.y, TUI_DEFAULT);
+}
+
+fn tui_max1(v: int32) -> int32 { if (v < 1) { return 1; } return v; }
+
+// Joins two neighbouring points, colouring each dot by its own height.
+fn tui_graph_join(cv: TuiCanvas*, s: TuiSeries, x0: int32, y0: int32, x1: int32, y1: int32, rowc: uint32*) {
+  if (s.stops.length == (uint64)0) {
+    tui_canvas_line(cv, x0, y0, x1, y1, s.color);
+    return;
+  }
+  // Vertical runs: half the climb in each column, like btop's graphs.
+  var mid: int32 = (y0 + y1) / 2;
+  tui_graph_run(cv, x0, y0, mid, rowc);
+  tui_graph_run(cv, x1, mid, y1, rowc);
+}
+
+fn tui_graph_run(cv: TuiCanvas*, x: int32, ya: int32, yb: int32, rowc: uint32*) {
+  var a: int32 = ya;
+  var e: int32 = yb;
+  if (a > e) { a = yb; e = ya; }
+  for y in a..e + 1 { tui_canvas_dot(cv, x, y, rowc[y]); }
+}
+
+fn tui_graph_blocks(b: TuiBuf*, r: TuiRect, s: TuiSeries, lo: float64, hi: float64) {
+  var n: int32 = (int32)s.values.length;
+  var cols: int32 = n;
+  if (cols > r.w) { cols = r.w; }
+  for k in 0..cols {
+    var v: float64 = s.values[n - cols + k];
+    var x: int32 = r.x + r.w - cols + k;
+    var h8: int32 = (int32)(tui_scale(v, lo, hi) * (float64)(r.h * 8) + 0.5);
+    for row in 0..r.h {
+      var lvl: int32 = h8 - row * 8;
+      if (lvl <= 0) { continue; }
+      if (lvl > 8) { lvl = 8; }
+      var t: int32 = 0;
+      if (r.h > 1) { t = row * 1000 / (r.h - 1); }
+      tui_buf_set_cp(b, x, r.y + r.h - 1 - row, 0x2580 + lvl, tui_style_fg(tui_series_color(s, t)));
+    }
+  }
+}

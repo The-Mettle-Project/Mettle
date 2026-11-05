@@ -1,0 +1,18 @@
+// sandbox: run untrusted or semi-trusted programs with limits.
+//
+// Import this file to get the whole library:
+//   sandbox/spawn    policies, sandbox_spawn, sandbox_wait
+//   sandbox/mount    the sandbox's own root: read-only binds, tmpfs, /proc, /dev
+//   sandbox/seccomp  system call filters
+//   sandbox/landlock file and TCP port access rules
+//   sandbox/caps     capabilities and no_new_privs
+//   sandbox/rlimit   resource limits
+//   sandbox/sys      error codes and system call numbers
+
+import "sys.mettle";
+import "rlimit.mettle";
+import "caps.mettle";
+import "seccomp.mettle";
+import "mount.mettle";
+import "landlock.mettle";
+import "spawn.mettle";

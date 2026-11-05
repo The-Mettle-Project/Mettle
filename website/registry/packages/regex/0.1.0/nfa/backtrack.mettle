@@ -1,0 +1,130 @@
+// Bounded backtracker: finds capture groups for an anchored search over a
+// short span. It explores threads depth-first in priority order, so the
+// first match it reaches is the leftmost-first one, and it remembers every
+// (state, position) pair it has visited, so it never does the same work
+// twice: time and memory are bounded by states * span length. This is the
+// technique of Rust's regex-automata BoundedBacktracker (and RE2's
+// BitState).
+
+import "std/mem";
+import "regex/core/vec";
+import "regex/nfa/nfa";
+import "regex/nfa/look";
+
+/// Most visited bits the backtracker may use (larger spans use the PikeVM).
+export const RX_BT_MAX_BITS = 2097152;
+
+struct RxBtFrame {
+  id: int32;      // state, or -1 to restore a slot
+  slot: int32;
+  at: int64;      // position, or the slot's old value
+}
+
+export struct RxBacktrack {
+  bits: uint64*;
+  nwords: int64;
+  stack: RxVec<RxBtFrame>;
+}
+
+export fn rx_bt_free(bt: RxBacktrack*) {
+  if (bt->bits != 0) { free(bt->bits); }
+  bt->bits = (uint64*)0;
+  bt->nwords = 0;
+  rx_vfree(&bt->stack);
+}
+
+/// True when a search over `len` bytes fits the backtracker's budget.
+export fn rx_bt_fits(nfa: RxNfa*, len: int64) -> bool {
+  return nfa->st.len * (len + 1) <= (int64)RX_BT_MAX_BITS;
+}
+
+/// Anchored search at `start`, ending at or before `end`. Fills slots[0..ns].
+export fn rx_bt_search(bt: RxBacktrack*, nfa: RxNfa*, h: uint8*, n: int64, start: int64, end: int64, slots: int64*, ns: int64) -> bool {
+  var span: int64 = end - start + 1;
+  var nbits: int64 = nfa->st.len * span;
+  var words: int64 = (nbits + 63) / 64;
+  if (words > bt->nwords) {
+    if (bt->bits != 0) { free(bt->bits); }
+    bt->bits = (uint64*)malloc(8 * words);
+    bt->nwords = words;
+  }
+  memset(bt->bits, 0, 8 * words);
+  for i in 0..ns { slots[i] = -1; }
+  var st: RxState* = nfa->st.data;
+  var tr: RxTrans* = nfa->tr.data;
+  bt->stack.len = 0;
+  var f0: RxBtFrame = { id: nfa->start, slot: 0, at: start };
+  rx_vpush(&bt->stack, f0);
+  while (bt->stack.len > 0) {
+    bt->stack.len = bt->stack.len - 1;
+    var f: RxBtFrame = bt->stack.data[bt->stack.len];
+    if (f.id < 0) {
+      slots[f.slot] = f.at;
+      continue;
+    }
+    var id: int32 = f.id;
+    var at: int64 = f.at;
+    while (true) {
+      var bit: int64 = (int64)id * span + (at - start);
+      var w: uint64 = bt->bits[bit >> 6];
+      var mask: uint64 = (uint64)1 << (uint64)(bit & 63);
+      if ((w & mask) != 0) { break; }
+      bt->bits[bit >> 6] = w | mask;
+      var s: RxState = st[id];
+      var k: int32 = s.kind;
+      if (k == RX_S_RANGE) {
+        if (at < end && (int32)h[at] >= s.lo && (int32)h[at] <= s.hi) {
+          id = s.next;
+          at = at + 1;
+          continue;
+        }
+        break;
+      }
+      if (k == RX_S_SPARSE) {
+        if (at >= end) { break; }
+        var b: int32 = (int32)h[at];
+        var first: int32 = -1;
+        // Push later matching transitions (lowest priority first), follow the first.
+        var t: int32 = s.hi - 1;
+        while (t >= 0) {
+          var x: RxTrans = tr[(int64)s.lo + (int64)t];
+          if (b >= x.lo && b <= x.hi) {
+            if (first >= 0) {
+              var alt: RxBtFrame = { id: first, slot: 0, at: at + 1 };
+              rx_vpush(&bt->stack, alt);
+            }
+            first = x.next;
+          }
+          t = t - 1;
+        }
+        if (first < 0) { break; }
+        id = first;
+        at = at + 1;
+        continue;
+      }
+      if (k == RX_S_SPLIT) {
+        var af: RxBtFrame = { id: s.alt, slot: 0, at: at };
+        rx_vpush(&bt->stack, af);
+        id = s.next;
+        continue;
+      }
+      if (k == RX_S_EMPTY) { id = s.next; continue; }
+      if (k == RX_S_LOOK) {
+        if (rx_look_at(s.lo, h, n, at)) { id = s.next; continue; }
+        break;
+      }
+      if (k == RX_S_CAPTURE) {
+        if ((int64)s.lo < ns) {
+          var rf: RxBtFrame = { id: -1, slot: s.lo, at: slots[s.lo] };
+          rx_vpush(&bt->stack, rf);
+          slots[s.lo] = at;
+        }
+        id = s.next;
+        continue;
+      }
+      if (k == RX_S_MATCH) { return true; }
+      break;
+    }
+  }
+  return false;
+}

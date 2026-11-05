@@ -1,0 +1,371 @@
+// GIF decoder: GIF87a and GIF89a, global and local palettes, transparency,
+// interlacing and animation (disposal methods, NETSCAPE loop count).
+// Frames come out composed onto the full canvas as RGBA8.
+
+import "std/mem";
+import "../core/status";
+import "../core/image";
+import "../core/anim";
+import "common";
+
+/// True when the bytes start like a GIF file.
+export fn etch_gif_is(p: uint8*, n: int64) -> bool {
+  return n >= 13 && p[0] == 'G' && p[1] == 'I' && p[2] == 'F' && p[3] == '8' &&
+    (p[4] == '7' || p[4] == '9') && p[5] == 'a';
+}
+
+// Reads a run of data sub-blocks as one bit stream, LSB first.
+struct GBits {
+  p: uint8*;
+  n: int64;
+  pos: int64;     // next byte in the file
+  left: int64;    // bytes left in the current sub-block
+  acc: uint32;
+  nacc: int32;
+  done: bool;     // reached the 0 terminator
+}
+
+fn gb_byte(b: GBits*) -> int32 {
+  if (b->done) { return -1; }
+  if (b->left == 0) {
+    if (b->pos >= b->n) { b->done = true; return -1; }
+    b->left = (int64)b->p[b->pos];
+    b->pos = b->pos + 1;
+    if (b->left == 0) { b->done = true; return -1; }
+  }
+  if (b->pos >= b->n) { b->done = true; return -1; }
+  var v: int32 = (int32)b->p[b->pos];
+  b->pos = b->pos + 1;
+  b->left = b->left - 1;
+  return v;
+}
+
+fn gb_code(b: GBits*, size: int32) -> int32 {
+  while (b->nacc < size) {
+    var v: int32 = gb_byte(b);
+    if (v < 0) { return -1; }
+    b->acc = b->acc | ((uint32)v << (uint32)b->nacc);
+    b->nacc = b->nacc + 8;
+  }
+  var c: int32 = (int32)(b->acc & (((uint32)1 << (uint32)size) - 1));
+  b->acc = b->acc >> (uint32)size;
+  b->nacc = b->nacc - size;
+  return c;
+}
+
+// Skips the rest of a sub-block run (after the image data or an extension).
+fn gb_finish(b: GBits*) {
+  b->pos = b->pos + b->left;
+  b->left = 0;
+  if (b->done) { return; }
+  while (b->pos < b->n) {
+    var len: int64 = (int64)b->p[b->pos];
+    b->pos = b->pos + 1;
+    if (len == 0) { break; }
+    b->pos = b->pos + len;
+  }
+  if (b->pos > b->n) { b->pos = b->n; }
+}
+
+fn skip_blocks(p: uint8*, n: int64, pos: int64) -> int64 {
+  var i: int64 = pos;
+  while (i < n) {
+    var len: int64 = (int64)p[i];
+    i = i + 1;
+    if (len == 0) { return i; }
+    i = i + len;
+  }
+  return n;
+}
+
+// LZW-decodes w*h palette indices into px. Returns false only when the
+// stream is unusable; a short stream leaves the rest at index 0.
+fn lzw(b: GBits*, mincode: int32, px: uint8*, total: int64) -> bool {
+  if (mincode < 2 || mincode > 11) { return false; }
+  var prefix: int16* = (int16*)malloc(4096 * 2);
+  var suffix: uint8* = (uint8*)malloc(4096);
+  var first: uint8* = (uint8*)malloc(4096);
+  var stack: uint8* = (uint8*)malloc(4097);
+  if (prefix == 0 || suffix == 0 || first == 0 || stack == 0) {
+    if (prefix != 0) { free(prefix); }
+    if (suffix != 0) { free(suffix); }
+    if (first != 0) { free(first); }
+    if (stack != 0) { free(stack); }
+    return false;
+  }
+  var clear: int32 = 1 << mincode;
+  var endc: int32 = clear + 1;
+  for i in 0..clear { prefix[i] = -1; suffix[i] = (uint8)i; first[i] = (uint8)i; }
+  var avail: int32 = clear + 2;
+  var size: int32 = mincode + 1;
+  var old: int32 = -1;
+  var out: int64 = 0;
+  var ok: bool = true;
+  while (out < total) {
+    var code: int32 = gb_code(b, size);
+    if (code < 0 || code == endc) { break; }
+    if (code == clear) {
+      avail = clear + 2;
+      size = mincode + 1;
+      old = -1;
+      continue;
+    }
+    if (old < 0) {
+      if (code >= clear) { ok = false; break; }
+      px[out] = (uint8)code;
+      out = out + 1;
+      old = code;
+      continue;
+    }
+    var in_code: int32 = code;
+    var sp: int32 = 0;
+    if (code >= avail) {
+      if (code > avail) { ok = false; break; }
+      stack[sp] = first[old];
+      sp = sp + 1;
+      code = old;
+    }
+    while (code >= clear) {
+      if (sp >= 4096) { break; }
+      stack[sp] = suffix[code];
+      sp = sp + 1;
+      code = (int32)prefix[code];
+      if (code < 0) { break; }
+    }
+    if (code < 0 || sp >= 4096) { ok = false; break; }
+    stack[sp] = (uint8)code;
+    sp = sp + 1;
+    var fc: uint8 = (uint8)code;
+    while (sp > 0 && out < total) {
+      sp = sp - 1;
+      px[out] = stack[sp];
+      out = out + 1;
+    }
+    if (avail < 4096) {
+      prefix[avail] = (int16)old;
+      suffix[avail] = fc;
+      first[avail] = first[old];
+      avail = avail + 1;
+      if (avail == (1 << size) && size < 12) { size = size + 1; }
+    }
+    old = in_code;
+  }
+  free(prefix);
+  free(suffix);
+  free(first);
+  free(stack);
+  return ok || out > 0;
+}
+
+fn gif_run(p: uint8*, n: int64, a: EtchAnim*, o: EtchOpts*, first_only: bool) -> int32 {
+  memset(a, 0, sizeof(EtchAnim));
+  if (p == 0 || n < 0) { return ETCH_E_ARG; }
+  if (n < 13) { return ETCH_E_TRUNC; }
+  if (!etch_gif_is(p, n)) { return ETCH_E_DATA; }
+  var sw: int64 = (int64)p[6] | ((int64)p[7] << 8);
+  var sh: int64 = (int64)p[8] | ((int64)p[9] << 8);
+  var flags: int32 = (int32)p[10];
+
+  var pos: int64 = 13;
+  var gpal: uint8[768];
+  var gsize: int32 = 0;
+  if ((flags & 128) != 0) {
+    gsize = 2 << (flags & 7);
+    if (pos + (int64)gsize * 3 > n) { return ETCH_E_TRUNC; }
+    memcpy(&gpal[0], p + pos, (int64)gsize * 3);
+    pos = pos + (int64)gsize * 3;
+  }
+  // Some files give a zero screen size; the first frame decides then.
+  var canvas: EtchImage;
+  var have_canvas: bool = false;
+  var prev: EtchImage;
+  var have_prev: bool = false;
+  var rc: int32 = ETCH_OK;
+  var delay: int32 = 0;
+  var trans: int32 = -1;
+  var dispose: int32 = 0;
+  // the last frame's rectangle and disposal, applied before the next frame
+  var ldisp: int32 = 0;
+  var lx: int64 = 0;
+  var ly: int64 = 0;
+  var lw: int64 = 0;
+  var lh: int64 = 0;
+  a->loops = 1;
+  while (pos < n && rc == ETCH_OK) {
+    var tag: int32 = (int32)p[pos];
+    pos = pos + 1;
+    if (tag == 59) { break; }                 // trailer
+    if (tag == 33) {
+      if (pos >= n) { break; }
+      var label: int32 = (int32)p[pos];
+      pos = pos + 1;
+      if (label == 249 && pos + 6 <= n && p[pos] >= 4) {
+        var pk: int32 = (int32)p[pos + 1];
+        dispose = (pk >> 2) & 7;
+        delay = ((int32)p[pos + 2] | ((int32)p[pos + 3] << 8)) * 10;
+        trans = -1;
+        if ((pk & 1) != 0) { trans = (int32)p[pos + 4]; }
+      } else if (label == 255 && pos + 16 <= n && p[pos] == 11 &&
+                 p[pos + 1] == 'N' && p[pos + 2] == 'E' && p[pos + 3] == 'T' && p[pos + 4] == 'S' &&
+                 p[pos + 12] == 3 && p[pos + 13] == 1) {
+        // the file stores repeats after the first play; 0 means forever
+        var rep: int32 = (int32)p[pos + 14] | ((int32)p[pos + 15] << 8);
+        a->loops = 0;
+        if (rep > 0) { a->loops = rep + 1; }
+      }
+      pos = skip_blocks(p, n, pos);
+      continue;
+    }
+    if (tag != 44) {
+      if (a->count > 0) { break; }            // junk after good frames
+      rc = ETCH_E_DATA;
+      break;
+    }
+    if (pos + 9 > n) { rc = ETCH_E_TRUNC; break; }
+    var fx: int64 = (int64)p[pos] | ((int64)p[pos + 1] << 8);
+    var fy: int64 = (int64)p[pos + 2] | ((int64)p[pos + 3] << 8);
+    var fw: int64 = (int64)p[pos + 4] | ((int64)p[pos + 5] << 8);
+    var fh: int64 = (int64)p[pos + 6] | ((int64)p[pos + 7] << 8);
+    var ff: int32 = (int32)p[pos + 8];
+    pos = pos + 9;
+    var pal: uint8* = &gpal[0];
+    var psize: int32 = gsize;
+    var lpal: uint8[768];
+    if ((ff & 128) != 0) {
+      psize = 2 << (ff & 7);
+      if (pos + (int64)psize * 3 > n) { rc = ETCH_E_TRUNC; break; }
+      memcpy(&lpal[0], p + pos, (int64)psize * 3);
+      pal = &lpal[0];
+      pos = pos + (int64)psize * 3;
+    }
+    if (!have_canvas) {
+      if (sw == 0 || sh == 0) { sw = fx + fw; sh = fy + fh; }
+      rc = etch_check_size(sw, sh, ETCH_RGBA8, etch_opts_limits(o));
+      if (rc != ETCH_OK) { break; }
+      rc = etch_image_new(&canvas, (int32)sw, (int32)sh, ETCH_RGBA8);
+      if (rc != ETCH_OK) { break; }
+      have_canvas = true;
+      a->width = (int32)sw;
+      a->height = (int32)sh;
+    }
+    if (pos >= n) { rc = ETCH_E_TRUNC; break; }
+    var mincode: int32 = (int32)p[pos];
+    pos = pos + 1;
+    var total: int64 = fw * fh;
+    var px: uint8* = (uint8*)0;
+    var bits: GBits;
+    memset(&bits, 0, sizeof(GBits));
+    bits.p = p;
+    bits.n = n;
+    bits.pos = pos;
+    if (total > 0) {
+      var lim: EtchLimits* = etch_opts_limits(o);
+      if (lim->max_pixels > 0 && total > lim->max_pixels) { rc = ETCH_E_LIMIT; break; }
+      px = (uint8*)calloc(total, 1);
+      if (px == 0) { rc = ETCH_E_MEM; break; }
+      if (!lzw(&bits, mincode, px, total)) { free(px); rc = ETCH_E_DATA; break; }
+    }
+    gb_finish(&bits);
+    pos = bits.pos;
+    // Undo the previous frame as its disposal says.
+    if (a->count > 0) {
+      if (ldisp == 2) {
+        for r in ly..(ly + lh) {
+          if (r >= sh) { break; }
+          var x1: int64 = lx + lw;
+          if (x1 > sw) { x1 = sw; }
+          if (x1 > lx) { memset(canvas.data + r * canvas.stride + lx * 4, 0, (x1 - lx) * 4); }
+        }
+      } else if (ldisp == 3 && have_prev) {
+        memcpy(canvas.data, prev.data, canvas.stride * sh);
+      }
+    }
+    if (dispose == 3) {
+      if (!have_prev) {
+        rc = etch_image_alloc(&prev, (int32)sw, (int32)sh, ETCH_RGBA8);
+        if (rc != ETCH_OK) { if (px != 0) { free(px); } break; }
+        have_prev = true;
+      }
+      memcpy(prev.data, canvas.data, canvas.stride * sh);
+    }
+    // Draw the frame.
+    if (px != 0) {
+      var interlaced: bool = (ff & 64) != 0;
+      var row: int64 = 0;
+      var pass: int32 = 0;
+      var step: int64 = 8;
+      for r in 0..fh {
+        var dy: int64 = r;
+        if (interlaced) {
+          dy = row;
+          row = row + step;
+          while (row >= fh && pass < 3) {
+            pass = pass + 1;
+            if (pass == 1) { row = 4; step = 8; }
+            else if (pass == 2) { row = 2; step = 4; }
+            else { row = 1; step = 2; }
+          }
+        }
+        var cy: int64 = fy + dy;
+        if (cy >= sh) { continue; }
+        var src: uint8* = px + r * fw;
+        var d: uint8* = canvas.data + cy * canvas.stride;
+        for x in 0..fw {
+          var cx: int64 = fx + x;
+          if (cx >= sw) { break; }
+          var idx: int32 = (int32)src[x];
+          if (idx == trans) { continue; }
+          var q: uint8* = d + cx * 4;
+          if (idx < psize) {
+            q[0] = pal[idx * 3]; q[1] = pal[idx * 3 + 1]; q[2] = pal[idx * 3 + 2];
+          } else {
+            q[0] = 0; q[1] = 0; q[2] = 0;
+          }
+          q[3] = 255;
+        }
+      }
+      free(px);
+    }
+    var shot: EtchImage;
+    rc = etch_image_copy(&canvas, &shot);
+    if (rc != ETCH_OK) { break; }
+    if (o != 0 && o->want != 0) {
+      rc = etch_finish(&shot, o);
+      if (rc != ETCH_OK) { break; }
+    }
+    rc = etch_anim_push(a, &shot, delay);
+    if (rc != ETCH_OK) { etch_image_free(&shot); break; }
+    ldisp = dispose;
+    lx = fx; ly = fy; lw = fw; lh = fh;
+    delay = 0;
+    trans = -1;
+    dispose = 0;
+    if (first_only) { break; }
+  }
+  if (have_canvas) { etch_image_free(&canvas); }
+  if (have_prev) { etch_image_free(&prev); }
+  if (rc == ETCH_OK && a->count == 0) { rc = ETCH_E_DATA; }
+  if (rc != ETCH_OK) {
+    if (a->count > 0 && (rc == ETCH_E_TRUNC || rc == ETCH_E_DATA)) { return ETCH_OK; }   // keep the frames that decoded
+    etch_anim_free(a);
+  }
+  return rc;
+}
+
+/// Decodes every frame of a GIF.
+export fn etch_gif_decode_anim(p: uint8*, n: int64, a: EtchAnim*, o: EtchOpts*) -> int32 {
+  if (a == 0) { return ETCH_E_ARG; }
+  return gif_run(p, n, a, o, false);
+}
+
+/// Decodes the first frame of a GIF as RGBA8.
+export fn etch_gif_decode(p: uint8*, n: int64, out: EtchImage*, o: EtchOpts*) -> int32 {
+  if (out == 0) { return ETCH_E_ARG; }
+  var a: EtchAnim;
+  var rc: int32 = gif_run(p, n, &a, o, true);
+  if (rc != ETCH_OK) { return rc; }
+  *out = a.frames[0].img;
+  a.count = 0;
+  etch_anim_free(&a);
+  return ETCH_OK;
+}

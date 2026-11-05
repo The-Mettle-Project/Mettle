@@ -1,0 +1,203 @@
+// Platform-independent helpers over the process list: find, children,
+// filter and sort. They read SysinfoProcs only, so they work the same on
+// every backend.
+import "std/mem";
+import "types.mettle";
+
+// Sort keys for sysinfo_proc_sort.
+export const SYSINFO_SORT_PID = 0;
+export const SYSINFO_SORT_NAME = 1;
+export const SYSINFO_SORT_CPU = 2;
+export const SYSINFO_SORT_MEM = 3;
+export const SYSINFO_SORT_USER = 4;
+export const SYSINFO_SORT_THREADS = 5;
+export const SYSINFO_SORT_START = 6;
+export const SYSINFO_SORT_IO = 7;      // read plus write per second
+
+// What sysinfo_proc_filter keeps. Zeroed means "keep everything"; set
+// uid, ppid and state to -1/0 to ignore them.
+export struct SysinfoProcFilter {
+  text: string;             // in the name or command line, any case; "" = any
+  uid: int32;               // -1 = any
+  ppid: int32;              // -1 = any
+  state: uint8;             // 0 = any
+  min_cpu_pct: float64;     // keep processes at or above this
+  min_rss: int64;           // bytes
+}
+
+// A filter that keeps everything.
+export fn sysinfo_proc_filter_init(f: SysinfoProcFilter*) {
+  var blank: SysinfoProcFilter;
+  *f = blank;
+  f->uid = -1;
+  f->ppid = -1;
+}
+
+// The index of pid in the list, or -1.
+export fn sysinfo_proc_index(p: SysinfoProcs*, pid: int32) -> int32 {
+  var lo: int32 = 0;
+  var hi: int32 = p->n - 1;
+  while (lo <= hi) {
+    var mid: int32 = (lo + hi) / 2;
+    if (p->list[mid].pid == pid) { return mid; }
+    if (p->list[mid].pid < pid) { lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return -1;
+}
+
+// The process with this pid, or 0.
+export fn sysinfo_proc_find(p: SysinfoProcs*, pid: int32) -> SysinfoProc* {
+  var i: int32 = sysinfo_proc_index(p, pid);
+  if (i < 0) { return (SysinfoProc*)0; }
+  return &p->list[i];
+}
+
+// Writes the indexes of pid's direct children into out (at most max).
+// Returns how many children there are, which may be more than max.
+export fn sysinfo_proc_children(p: SysinfoProcs*, pid: int32, out: int32*, max: int32) -> int32 {
+  var i: int32 = sysinfo_proc_index(p, pid);
+  if (i < 0) { return 0; }
+  var n: int32 = 0;
+  var c: int32 = p->list[i].first_child;
+  while (c >= 0) {
+    if (n < max) { out[n] = c; }
+    n = n + 1;
+    c = p->list[c].next_sibling;
+  }
+  return n;
+}
+
+// Writes the indexes of every descendant of pid, depth first, into out.
+// Returns the count, which may be more than max.
+export fn sysinfo_proc_descendants(p: SysinfoProcs*, pid: int32, out: int32*, max: int32) -> int32 {
+  var root: int32 = sysinfo_proc_index(p, pid);
+  if (root < 0) { return 0; }
+  var n: int32 = 0;
+  var cur: int32 = p->list[root].first_child;
+  while (cur >= 0) {
+    if (n < max) { out[n] = cur; }
+    n = n + 1;
+    if (p->list[cur].first_child >= 0) { cur = p->list[cur].first_child; continue; }
+    // up until a sibling is found, stopping at the root
+    while (cur >= 0 && cur != root && p->list[cur].next_sibling < 0) { cur = p->list[cur].parent; }
+    if (cur < 0 || cur == root) { break; }
+    cur = p->list[cur].next_sibling;
+  }
+  return n;
+}
+
+fn sysinfo_lower(c: uint8) -> uint8 {
+  if (c >= (uint8)65 && c <= (uint8)90) { return c + (uint8)32; }
+  return c;
+}
+
+// True when needle occurs in hay, ignoring ASCII case.
+export fn sysinfo_contains_nocase(hay: string, needle: string) -> bool {
+  var n: int64 = (int64)needle.length;
+  var h: int64 = (int64)hay.length;
+  if (n == 0) { return true; }
+  var i: int64 = 0;
+  while (i + n <= h) {
+    var k: int64 = 0;
+    while (k < n && sysinfo_lower((uint8)hay[i + k]) == sysinfo_lower((uint8)needle[k])) { k = k + 1; }
+    if (k == n) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// Writes the indexes of the processes that pass f into out (at most max),
+// in pid order. Returns how many pass, which may be more than max.
+export fn sysinfo_proc_filter(p: SysinfoProcs*, f: SysinfoProcFilter*, out: int32*, max: int32) -> int32 {
+  var n: int32 = 0;
+  for i in 0..p->n {
+    var q: SysinfoProc* = &p->list[i];
+    if (f->uid >= 0 && q->uid != f->uid) { continue; }
+    if (f->ppid >= 0 && q->ppid != f->ppid) { continue; }
+    if (f->state != (uint8)0 && q->state != f->state) { continue; }
+    if (q->cpu_pct < f->min_cpu_pct) { continue; }
+    if (q->rss < f->min_rss) { continue; }
+    if (f->text.length > (uint64)0 && !sysinfo_contains_nocase(q->name, f->text) && !sysinfo_contains_nocase(q->cmdline, f->text)) { continue; }
+    if (n < max) { out[n] = i; }
+    n = n + 1;
+  }
+  return n;
+}
+
+fn sysinfo_strcmp(a: string, b: string) -> int32 {
+  var n: uint64 = a.length;
+  if (b.length < n) { n = b.length; }
+  for k in 0..n {
+    var x: uint8 = sysinfo_lower((uint8)a[k]);
+    var y: uint8 = sysinfo_lower((uint8)b[k]);
+    if (x < y) { return -1; }
+    if (x > y) { return 1; }
+  }
+  if (a.length < b.length) { return -1; }
+  if (a.length > b.length) { return 1; }
+  return 0;
+}
+
+fn sysinfo_fcmp(a: float64, b: float64) -> int32 {
+  if (a < b) { return -1; }
+  if (a > b) { return 1; }
+  return 0;
+}
+
+fn sysinfo_proc_cmp(a: SysinfoProc*, b: SysinfoProc*, key: int32) -> int32 {
+  var r: int32 = 0;
+  switch (key) {
+    case 1: { r = sysinfo_strcmp(a->name, b->name); }
+    case 2: { r = sysinfo_fcmp(a->cpu_pct, b->cpu_pct); }
+    case 3: { r = sysinfo_fcmp((float64)a->rss, (float64)b->rss); }
+    case 4: { r = sysinfo_strcmp(a->user, b->user); }
+    case 5: { r = sysinfo_fcmp((float64)a->threads, (float64)b->threads); }
+    case 6: { r = sysinfo_fcmp((float64)a->start_ticks, (float64)b->start_ticks); }
+    case 7: { r = sysinfo_fcmp(a->io_read_bps + a->io_write_bps, b->io_read_bps + b->io_write_bps); }
+    default: { r = 0; }
+  }
+  return r;
+}
+
+// Sorts idx[0..n] (indexes into the list) by key; ties keep pid order
+// (the sort is stable). descending reverses the key but not the ties.
+// With n == 0 nothing happens; to sort everything, fill idx with 0..p->n.
+export fn sysinfo_proc_sort(p: SysinfoProcs*, idx: int32*, n: int32, key: int32, descending: bool) -> int32 {
+  if (n <= 1) { return SYSINFO_OK; }
+  for i in 0..n { if (idx[i] < 0 || idx[i] >= p->n) { return SYSINFO_E_INVALID; } }
+  var tmp: int32* = (int32*)malloc((int64)n * 4);
+  if (tmp == 0) { return SYSINFO_E_NOMEM; }
+  // bottom-up merge sort
+  var src: int32* = idx;
+  var dst: int32* = tmp;
+  var width: int32 = 1;
+  while (width < n) {
+    var lo: int32 = 0;
+    while (lo < n) {
+      var mid: int32 = lo + width;
+      if (mid > n) { mid = n; }
+      var hi: int32 = lo + 2 * width;
+      if (hi > n) { hi = n; }
+      var a: int32 = lo;
+      var b: int32 = mid;
+      var k: int32 = lo;
+      while (a < mid && b < hi) {
+        var c: int32 = sysinfo_proc_cmp(&p->list[src[b]], &p->list[src[a]], key);
+        if (descending) { c = -c; }
+        if (c < 0 || (c == 0 && src[b] < src[a])) { dst[k] = src[b]; b = b + 1; }
+        else { dst[k] = src[a]; a = a + 1; }
+        k = k + 1;
+      }
+      while (a < mid) { dst[k] = src[a]; a = a + 1; k = k + 1; }
+      while (b < hi) { dst[k] = src[b]; b = b + 1; k = k + 1; }
+      lo = hi;
+    }
+    var t: int32* = src;
+    src = dst;
+    dst = t;
+    width = width * 2;
+  }
+  if (src != idx) { memcpy(idx, src, (int64)n * 4); }
+  free(tmp);
+  return SYSINFO_OK;
+}

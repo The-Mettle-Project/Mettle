@@ -1,0 +1,7 @@
+name = uuid
+version = 0.1.0
+description = RFC 9562 UUIDs for Mettle: versions 1 to 8, nil and max, fast parse and format, and ULID
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Uuid
+compiler = 0.18.0
+require = crypto 0.2.5

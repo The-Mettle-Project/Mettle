@@ -1,0 +1,623 @@
+// regex: regular expressions for Mettle, matched in linear time.
+//
+//   import "regex/regex";
+//
+//   match (regex_new("(?P<year>\\d{4})-(?P<month>\\d{2})")) {
+//     case Ok(re): {
+//       var m: RegexMatch;
+//       if (regex_find(re, "on 2024-05-17", &m)) { ... m.start, m.end ... }
+//       regex_free(re);
+//     }
+//     case Err(e): { println("bad pattern at {e.offset}: {e.msg}"); }
+//   }
+//
+// Haystacks are byte strings. Patterns use the syntax of Rust's regex crate
+// (see docs/syntax.md). Matching never backtracks: the cost is linear in
+// the haystack length.
+//
+// How a search runs (the "meta" strategy, after Rust's regex-automata):
+//   1. a pattern that is one plain literal is found with memmem/memchr;
+//   2. otherwise a literal prefilter skips to candidate starts, the forward
+//      lazy DFA finds where the leftmost-first match ends and the reverse
+//      lazy DFA finds where it starts;
+//   3. capture groups come from the PikeVM, run only over the match;
+//   4. if a DFA gives up (cache thrashing, Unicode \b on non-ASCII text)
+//      the PikeVM does the whole search.
+//
+// A Regex keeps search caches inside it, so one Regex must not be used by
+// two threads at the same time. Compile one per thread instead.
+
+import "std/mem";
+import "std/core";
+import "regex/core/vec";
+import "regex/hir/hir";
+import "regex/syntax/parse";
+import "regex/nfa/nfa";
+import "regex/nfa/pikevm";
+import "regex/nfa/backtrack";
+import "regex/dfa/lazy";
+import "regex/literal/prefilter";
+import "regex/unicode/ucd";
+
+/// Internal switches for testing one engine at a time.
+export const RX_ONLY_PIKEVM = 0x100000;   // never use the DFAs
+export const RX_NO_PREFILTER = 0x200000;  // never use the literal prefilter
+
+/// Default limits (bytes): compiled program size and each DFA cache.
+export const REGEX_SIZE_LIMIT = 10485760;
+export const REGEX_DFA_LIMIT = 2097152;
+
+export struct Regex {
+  hir: RxHir;
+  nfa: RxNfa;
+  rnfa: RxNfa;
+  fdfa: RxDfa;
+  rdfa: RxDfa;
+  use_dfa: bool;
+  pike: RxPike;
+  bt: RxBacktrack;
+  pf: RxPrefilter;
+  flags: int32;
+  utf8: bool;
+  can_empty: bool;
+  ngroups: int32;
+  slots: int64*;
+}
+
+/// A match: bytes h[start..end].
+export struct RegexMatch {
+  start: int64;
+  end: int64;
+}
+
+/// Capture group positions from regex_captures. Make one with
+/// regex_captures_new and free it with regex_captures_free.
+export struct RegexCaptures {
+  slots: int64*;   // 2 per group; -1 when the group did not take part
+  n: int32;        // number of groups, group 0 included
+}
+
+/// Iterator over successive non-overlapping matches.
+export struct RegexIter {
+  re: Regex*;
+  h: string;
+  pos: int64;
+  last_end: int64;   // -1 before the first match
+  done: bool;
+}
+
+/// All matches, from regex_find_all.
+export struct RegexMatches {
+  data: RegexMatch*;
+  len: int64;
+}
+
+/// Pieces of a haystack (views into it), from regex_split.
+export struct RegexPieces {
+  data: string*;
+  len: int64;
+}
+
+/// Compiles pattern with default flags.
+export fn regex_new(pattern: string) -> Result<Regex*, RegexError> {
+  return regex_new_with(pattern, 0);
+}
+
+/// Compiles pattern with REGEX_* flags (or-ed together).
+export fn regex_new_with(pattern: string, flags: int32) -> Result<Regex*, RegexError> {
+  return regex_new_limits(pattern, flags, REGEX_SIZE_LIMIT, REGEX_DFA_LIMIT);
+}
+
+/// Like regex_new_with, with explicit limits: size_limit bounds the
+/// compiled program and dfa_limit each of the two DFA caches (bytes).
+export fn regex_new_limits(pattern: string, flags: int32, size_limit: int64, dfa_limit: int64) -> Result<Regex*, RegexError> {
+  var re: Regex* = new Regex;
+  var err: RegexError = { code: 0, offset: 0, msg: "" };
+  if (!rx_parse(pattern, flags, &re->hir, &err)) {
+    rx_hir_free(&re->hir);
+    free(re);
+    return Err(err);
+  }
+  if (!rx_nfa_build(&re->hir, &re->nfa, false, true, size_limit)) {
+    rx_hir_free(&re->hir);
+    rx_nfa_free(&re->nfa);
+    free(re);
+    err.code = REGEX_E_SIZE;
+    err.offset = 0;
+    err.msg = "compiled pattern is too big";
+    return Err(err);
+  }
+  re->use_dfa = (flags & RX_ONLY_PIKEVM) == 0 && rx_nfa_build(&re->hir, &re->rnfa, true, false, size_limit);
+  if (re->use_dfa) {
+    rx_dfa_init(&re->fdfa, &re->nfa, true, dfa_limit);
+    rx_dfa_init(&re->rdfa, &re->rnfa, false, dfa_limit);
+  }
+  if ((flags & RX_NO_PREFILTER) == 0) { rx_pf_build(&re->hir, &re->pf); }
+  re->flags = flags;
+  re->utf8 = (flags & REGEX_BYTES) == 0;
+  re->can_empty = rx_can_be_empty(&re->hir, re->hir.root);
+  re->ngroups = (int32)re->hir.names.len;
+  re->slots = (int64*)malloc(16 * (int64)re->ngroups + 16);
+  return Ok(re);
+}
+
+/// Frees a compiled pattern.
+export fn regex_free(re: Regex*) {
+  if (re == 0) { return; }
+  if (re->use_dfa) {
+    rx_dfa_free(&re->fdfa);
+    rx_dfa_free(&re->rdfa);
+  }
+  rx_nfa_free(&re->nfa);
+  rx_nfa_free(&re->rnfa);
+  rx_pike_free(&re->pike);
+  rx_bt_free(&re->bt);
+  rx_pf_free(&re->pf);
+  rx_hir_free(&re->hir);
+  free(re->slots);
+  free(re);
+}
+
+// ---- core search ----
+
+fn is_boundary(h: string, i: int64) -> bool {
+  if (i <= 0 || i >= (int64)h.length) { return true; }
+  return (h.chars[i] & 0xC0) != 0x80;
+}
+
+// One search in h[start..end] without the UTF-8 empty-match rule.
+fn raw_find(re: Regex*, h: string, start: int64, end: int64, anchored: bool, m: RegexMatch*) -> bool {
+  var n: int64 = (int64)h.length;
+  var p: uint8* = h.chars;
+  if (re->pf.exact && !anchored) {
+    var at: int64 = rx_pf_find(&re->pf, p, start, end);
+    if (at < 0) { return false; }
+    var len: int64 = 1;
+    if (re->pf.kind == RX_PF_MEMMEM) { len = re->pf.nlen; }
+    m->start = at;
+    m->end = at + len;
+    return true;
+  }
+  if (re->use_dfa) {
+    var e: int64 = rx_dfa_fwd(&re->fdfa, p, n, start, end, anchored, false, &re->pf);
+    if (e == RX_DFA_NONE) { return false; }
+    if (e >= 0) {
+      if (anchored) {
+        m->start = start;
+        m->end = e;
+        return true;
+      }
+      var s: int64 = rx_dfa_rev(&re->rdfa, p, n, start, e);
+      if (s >= 0) {
+        m->start = s;
+        m->end = e;
+        return true;
+      }
+    }
+  }
+  rx_pike_setup(&re->pike, &re->nfa, 2);
+  if (!rx_pike_search(&re->pike, p, n, start, end, anchored, false, &re->pf, re->slots)) { return false; }
+  m->start = re->slots[0];
+  m->end = re->slots[1];
+  return true;
+}
+
+// A search that, in UTF-8 mode, skips empty matches inside a code point.
+fn find_in(re: Regex*, h: string, start: int64, end: int64, anchored: bool, m: RegexMatch*) -> bool {
+  var at: int64 = start;
+  while (true) {
+    if (at > end) { return false; }
+    if (!raw_find(re, h, at, end, anchored, m)) { return false; }
+    if (!re->utf8 || m->start != m->end || is_boundary(h, m->end)) { return true; }
+    if (anchored) { return false; }
+    at = m->end + 1;
+  }
+  return false;
+}
+
+/// True when the pattern matches anywhere in h.
+export fn regex_is_match(re: Regex*, h: string) -> bool {
+  var n: int64 = (int64)h.length;
+  if (re->utf8 && re->can_empty) {
+    // Empty matches inside a code point do not count, so use find.
+    var m: RegexMatch;
+    return find_in(re, h, 0, n, false, &m);
+  }
+  if (re->pf.exact) { return rx_pf_find(&re->pf, h.chars, 0, n) >= 0; }
+  if (re->use_dfa) {
+    var e: int64 = rx_dfa_fwd(&re->fdfa, h.chars, n, 0, n, false, true, &re->pf);
+    if (e == RX_DFA_NONE) { return false; }
+    if (e >= 0) { return true; }
+  }
+  rx_pike_setup(&re->pike, &re->nfa, 0);
+  return rx_pike_search(&re->pike, h.chars, n, 0, n, false, true, &re->pf, re->slots);
+}
+
+/// Finds the leftmost-first match in h.
+export fn regex_find(re: Regex*, h: string, m: RegexMatch*) -> bool {
+  return find_in(re, h, 0, (int64)h.length, false, m);
+}
+
+/// Finds the first match that starts at or after byte `start`. Assertions
+/// such as ^ and \b still see the bytes before `start`.
+export fn regex_find_at(re: Regex*, h: string, start: int64, m: RegexMatch*) -> bool {
+  return find_in(re, h, start, (int64)h.length, false, m);
+}
+
+/// Finds a match inside h[start..end] only (assertions see all of h).
+/// anchored requires the match to start exactly at `start`.
+export fn regex_find_in(re: Regex*, h: string, start: int64, end: int64, anchored: bool, m: RegexMatch*) -> bool {
+  if (start < 0 || end > (int64)h.length || start > end) { return false; }
+  return find_in(re, h, start, end, anchored, m);
+}
+
+// ---- captures ----
+
+/// Makes a RegexCaptures sized for re.
+export fn regex_captures_new(re: Regex*) -> RegexCaptures {
+  var c: RegexCaptures;
+  c.n = re->ngroups;
+  c.slots = (int64*)malloc(16 * (int64)c.n + 16);
+  for i in 0..(int64)c.n * 2 { c.slots[i] = -1; }
+  return c;
+}
+
+export fn regex_captures_free(c: RegexCaptures*) {
+  if (c->slots != 0) { free(c->slots); }
+  c->slots = (int64*)0;
+  c->n = 0;
+}
+
+fn caps_in(re: Regex*, h: string, start: int64, end: int64, anchored: bool, c: RegexCaptures*) -> bool {
+  for i in 0..(int64)c->n * 2 { c->slots[i] = -1; }
+  var m: RegexMatch;
+  if (!find_in(re, h, start, end, anchored, &m)) { return false; }
+  if (re->ngroups <= 1) {
+    c->slots[0] = m.start;
+    c->slots[1] = m.end;
+    return true;
+  }
+  // Find the groups by searching again over just the match: with the
+  // bounded backtracker when the span is short, else with the PikeVM.
+  var n: int64 = (int64)h.length;
+  var ns: int64 = (int64)re->ngroups * 2;
+  var got: bool = false;
+  if ((re->flags & RX_ONLY_PIKEVM) == 0 && rx_bt_fits(&re->nfa, m.end - m.start)) {
+    got = rx_bt_search(&re->bt, &re->nfa, h.chars, n, m.start, m.end, re->slots, ns);
+  } else {
+    rx_pike_setup(&re->pike, &re->nfa, re->ngroups * 2);
+    got = rx_pike_search(&re->pike, h.chars, n, m.start, m.end, true, false, (RxPrefilter*)0, re->slots);
+  }
+  if (!got) {
+    c->slots[0] = m.start;
+    c->slots[1] = m.end;
+    return true;
+  }
+  var k: int64 = (int64)re->ngroups * 2;
+  if (k > (int64)c->n * 2) { k = (int64)c->n * 2; }
+  for i in 0..k { c->slots[i] = re->slots[i]; }
+  return true;
+}
+
+/// Finds the leftmost-first match and fills every capture group.
+export fn regex_captures(re: Regex*, h: string, c: RegexCaptures*) -> bool {
+  return caps_in(re, h, 0, (int64)h.length, false, c);
+}
+
+/// Like regex_captures, for a match starting at or after `start`.
+export fn regex_captures_at(re: Regex*, h: string, start: int64, c: RegexCaptures*) -> bool {
+  return caps_in(re, h, start, (int64)h.length, false, c);
+}
+
+/// Like regex_find_in, filling capture groups.
+export fn regex_captures_in(re: Regex*, h: string, start: int64, end: int64, anchored: bool, c: RegexCaptures*) -> bool {
+  if (start < 0 || end > (int64)h.length || start > end) { return false; }
+  return caps_in(re, h, start, end, anchored, c);
+}
+
+/// Group i of the last regex_captures call. False if it did not take part.
+export fn regex_group(c: RegexCaptures*, i: int32, m: RegexMatch*) -> bool {
+  if (i < 0 || i >= c->n) { return false; }
+  var s: int64 = c->slots[(int64)i * 2];
+  var e: int64 = c->slots[(int64)i * 2 + 1];
+  if (s < 0 || e < 0) { return false; }
+  m->start = s;
+  m->end = e;
+  return true;
+}
+
+/// Group i as a view into h ("" when it did not take part).
+export fn regex_group_str(c: RegexCaptures*, h: string, i: int32) -> string {
+  var m: RegexMatch;
+  var r: string = "";
+  if (!regex_group(c, i, &m)) { return r; }
+  r.chars = h.chars + m.start;
+  r.length = (uint64)(m.end - m.start);
+  return r;
+}
+
+/// Number of groups, including group 0 (the whole match).
+export fn regex_group_count(re: Regex*) -> int32 {
+  return re->ngroups;
+}
+
+/// Index of the group called name, or -1.
+export fn regex_group_index(re: Regex*, name: string) -> int32 {
+  for i in 1..re->hir.names.len {
+    if (re->hir.names.data[i].length > 0 && re->hir.names.data[i] == name) { return (int32)i; }
+  }
+  return -1;
+}
+
+/// Name of group i ("" for unnamed groups).
+export fn regex_group_name(re: Regex*, i: int32) -> string {
+  if (i < 0 || (int64)i >= re->hir.names.len) { return ""; }
+  return re->hir.names.data[i];
+}
+
+// ---- iteration ----
+
+/// Starts iterating over the matches of re in h.
+export fn regex_iter(re: Regex*, h: string) -> RegexIter {
+  var it: RegexIter;
+  it.re = re;
+  it.h = h;
+  it.pos = 0;
+  it.last_end = -1;
+  it.done = false;
+  return it;
+}
+
+// Next match for the iterator, with Rust's rule for empty matches: an empty
+// match right where the previous match ended is skipped.
+fn iter_find(it: RegexIter*, m: RegexMatch*) -> bool {
+  if (it->done) { return false; }
+  var n: int64 = (int64)it->h.length;
+  if (it->pos > n || !find_in(it->re, it->h, it->pos, n, false, m)) {
+    it->done = true;
+    return false;
+  }
+  if (m->start == m->end && m->end == it->last_end) {
+    if (it->pos >= n || !find_in(it->re, it->h, it->pos + 1, n, false, m)) {
+      it->done = true;
+      return false;
+    }
+  }
+  it->pos = m->end;
+  it->last_end = m->end;
+  return true;
+}
+
+/// Gives the next match. False when there are no more.
+export fn regex_next(it: RegexIter*, m: RegexMatch*) -> bool {
+  return iter_find(it, m);
+}
+
+/// Gives the next match with its capture groups.
+export fn regex_next_captures(it: RegexIter*, c: RegexCaptures*) -> bool {
+  var m: RegexMatch;
+  if (!iter_find(it, &m)) { return false; }
+  var n: int64 = (int64)it->h.length;
+  if (!caps_in(it->re, it->h, m.start, n, true, c)) {
+    for i in 0..(int64)c->n * 2 { c->slots[i] = -1; }
+    c->slots[0] = m.start;
+    c->slots[1] = m.end;
+  }
+  return true;
+}
+
+/// Every non-overlapping match. Free with regex_matches_free.
+export fn regex_find_all(re: Regex*, h: string) -> RegexMatches {
+  var v: RxVec<RegexMatch>;
+  var it: RegexIter = regex_iter(re, h);
+  var m: RegexMatch;
+  while (iter_find(&it, &m)) { rx_vpush(&v, m); }
+  var r: RegexMatches;
+  r.data = v.data;
+  r.len = v.len;
+  return r;
+}
+
+export fn regex_matches_free(ms: RegexMatches*) {
+  if (ms->data != 0) { free(ms->data); }
+  ms->data = (RegexMatch*)0;
+  ms->len = 0;
+}
+
+/// Number of non-overlapping matches.
+export fn regex_count(re: Regex*, h: string) -> int64 {
+  var it: RegexIter = regex_iter(re, h);
+  var m: RegexMatch;
+  var k: int64 = 0;
+  while (iter_find(&it, &m)) { k = k + 1; }
+  return k;
+}
+
+// ---- replace ----
+
+struct RxBuf {
+  v: RxVec<uint8>;
+}
+
+fn buf_add(b: RxBuf*, p: uint8*, n: int64) {
+  if (n <= 0) { return; }
+  rx_vreserve(&b->v, b->v.len + n);
+  memcpy(b->v.data + b->v.len, p, n);
+  b->v.len = b->v.len + n;
+}
+
+fn buf_string(b: RxBuf*) -> string {
+  rx_vreserve(&b->v, b->v.len + 1);
+  b->v.data[b->v.len] = 0;
+  var s: string = "";
+  s.chars = b->v.data;
+  s.length = (uint64)b->v.len;
+  return s;
+}
+
+fn name_char(c: int32) -> bool {
+  return c == 95 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+// Appends the group named or numbered by rep[s..e].
+fn add_group(re: Regex*, b: RxBuf*, h: string, c: RegexCaptures*, rep: string, s: int64, e: int64) {
+  var digits: bool = true;
+  var num: int64 = 0;
+  for i in s..e {
+    var d: int32 = (int32)rep.chars[i];
+    if (d < 48 || d > 57) { digits = false; } else if (num < 100000) { num = num * 10 + (int64)(d - 48); }
+  }
+  var idx: int32 = -1;
+  if (digits) {
+    if (num < (int64)c->n) { idx = (int32)num; }
+  } else {
+    var nm: string = "";
+    nm.chars = rep.chars + s;
+    nm.length = (uint64)(e - s);
+    idx = regex_group_index(re, nm);
+  }
+  var m: RegexMatch;
+  if (idx >= 0 && regex_group(c, idx, &m)) { buf_add(b, h.chars + m.start, m.end - m.start); }
+}
+
+/// Appends rep with $1, $name, ${name} and $$ expanded (Rust's rules).
+fn expand(re: Regex*, b: RxBuf*, h: string, c: RegexCaptures*, rep: string) {
+  var n: int64 = (int64)rep.length;
+  var i: int64 = 0;
+  while (i < n) {
+    var ch: int32 = (int32)rep.chars[i];
+    if (ch != 36) {
+      var j: int64 = i;
+      while (j < n && rep.chars[j] != 36) { j = j + 1; }
+      buf_add(b, rep.chars + i, j - i);
+      i = j;
+      continue;
+    }
+    if (i + 1 < n && rep.chars[i + 1] == 36) {
+      buf_add(b, rep.chars + i, 1);
+      i = i + 2;
+      continue;
+    }
+    if (i + 1 < n && rep.chars[i + 1] == 123) {
+      var k: int64 = i + 2;
+      while (k < n && rep.chars[k] != 125) { k = k + 1; }
+      if (k < n && k > i + 2) {
+        add_group(re, b, h, c, rep, i + 2, k);
+        i = k + 1;
+        continue;
+      }
+      buf_add(b, rep.chars + i, 1);
+      i = i + 1;
+      continue;
+    }
+    var k2: int64 = i + 1;
+    while (k2 < n && name_char((int32)rep.chars[k2])) { k2 = k2 + 1; }
+    if (k2 == i + 1) {
+      buf_add(b, rep.chars + i, 1);
+      i = i + 1;
+      continue;
+    }
+    add_group(re, b, h, c, rep, i + 1, k2);
+    i = k2;
+  }
+}
+
+/// Replaces up to `limit` matches (0 = all) with rep. The result is a new
+/// string; free its .chars.
+export fn regex_replacen(re: Regex*, h: string, limit: int64, rep: string) -> string {
+  var b: RxBuf;
+  var plain: bool = true;
+  for i in 0..(int64)rep.length { if (rep.chars[i] == 36) { plain = false; } }
+  var it: RegexIter = regex_iter(re, h);
+  var c: RegexCaptures = regex_captures_new(re);
+  var last: int64 = 0;
+  var count: int64 = 0;
+  while (limit == 0 || count < limit) {
+    var m: RegexMatch;
+    if (plain) {
+      if (!iter_find(&it, &m)) { break; }
+    } else {
+      if (!regex_next_captures(&it, &c)) { break; }
+      m.start = c.slots[0];
+      m.end = c.slots[1];
+    }
+    buf_add(&b, h.chars + last, m.start - last);
+    if (plain) { buf_add(&b, rep.chars, (int64)rep.length); } else { expand(re, &b, h, &c, rep); }
+    last = m.end;
+    count = count + 1;
+  }
+  buf_add(&b, h.chars + last, (int64)h.length - last);
+  regex_captures_free(&c);
+  return buf_string(&b);
+}
+
+/// Replaces the first match.
+export fn regex_replace(re: Regex*, h: string, rep: string) -> string {
+  return regex_replacen(re, h, 1, rep);
+}
+
+/// Replaces every match.
+export fn regex_replace_all(re: Regex*, h: string, rep: string) -> string {
+  return regex_replacen(re, h, 0, rep);
+}
+
+// ---- split ----
+
+/// Splits h at each match into at most `limit` pieces (0 = no limit).
+/// Pieces are views into h; free the list with regex_pieces_free.
+export fn regex_splitn(re: Regex*, h: string, limit: int64) -> RegexPieces {
+  var v: RxVec<string>;
+  var it: RegexIter = regex_iter(re, h);
+  var last: int64 = 0;
+  var n: int64 = (int64)h.length;
+  while (limit == 0 || v.len + 1 < limit) {
+    var m: RegexMatch;
+    if (!iter_find(&it, &m)) { break; }
+    var s: string = "";
+    s.chars = h.chars + last;
+    s.length = (uint64)(m.start - last);
+    rx_vpush(&v, s);
+    last = m.end;
+  }
+  var t: string = "";
+  t.chars = h.chars + last;
+  t.length = (uint64)(n - last);
+  rx_vpush(&v, t);
+  var r: RegexPieces;
+  r.data = v.data;
+  r.len = v.len;
+  return r;
+}
+
+/// Splits h at every match.
+export fn regex_split(re: Regex*, h: string) -> RegexPieces {
+  return regex_splitn(re, h, 0);
+}
+
+export fn regex_pieces_free(p: RegexPieces*) {
+  if (p->data != 0) { free(p->data); }
+  p->data = (string*)0;
+  p->len = 0;
+}
+
+// ---- helpers ----
+
+/// Escapes every meta character in s so it matches literally. Free .chars.
+export fn regex_escape(s: string) -> string {
+  var b: RxBuf;
+  var bs: uint8 = 92;
+  for i in 0..(int64)s.length {
+    var c: int32 = (int32)s.chars[i];
+    var meta: bool = c == 92 || c == 46 || c == 43 || c == 42 || c == 63 || c == 40 || c == 41 ||
+      c == 124 || c == 91 || c == 93 || c == 123 || c == 125 || c == 94 || c == 36 || c == 35 ||
+      c == 38 || c == 45 || c == 126;
+    if (meta) { buf_add(&b, &bs, 1); }
+    buf_add(&b, s.chars + i, 1);
+  }
+  return buf_string(&b);
+}
+
+/// The Unicode version of the built-in tables, like "15.1.0".
+export fn regex_unicode_version() -> string {
+  return rx_ucd_version();
+}

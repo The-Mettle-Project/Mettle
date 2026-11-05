@@ -1,0 +1,43 @@
+// CodecList<T>: a growable array. Generated protobuf code uses it for repeated
+// fields. It starts empty with no memory; the zero value is ready to use.
+import "std/mem";
+import "codec/core/status";
+
+export struct CodecList<T> {
+  data: T*;
+  len: int64;
+  cap: int64;
+}
+
+// Makes room for at least `need` items in total. Returns false when memory
+// runs out; the list is unchanged then.
+export fn codec_list_reserve<T>(l: CodecList<T>*, need: int64) -> bool {
+  if (need <= l->cap) { return true; }
+  var nc: int64 = l->cap * 2;
+  if (nc < 4) { nc = 4; }
+  if (nc < need) { nc = need; }
+  var p: T* = (T*)realloc(l->data, nc * sizeof(T));
+  if (p == 0) { return false; }
+  l->data = p;
+  l->cap = nc;
+  return true;
+}
+
+// Appends v. Returns false when memory runs out.
+@inline export fn codec_list_push<T>(l: CodecList<T>*, v: T) -> bool {
+  if (l->len == l->cap) {
+    if (!codec_list_reserve(l, l->len + 1)) { return false; }
+  }
+  l->data[l->len] = v;
+  l->len = l->len + 1;
+  return true;
+}
+
+// Frees the items array and empties the list. It does not free what the
+// items point to.
+export fn codec_list_free<T>(l: CodecList<T>*) {
+  if (l->data != 0) { free(l->data); }
+  l->data = (T*)0;
+  l->len = 0;
+  l->cap = 0;
+}

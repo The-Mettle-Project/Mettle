@@ -1,0 +1,12 @@
+// AArch64 stand-in for sha256_hw_x86_64.mettle: no hardware SHA-256 path on
+// this target yet, so crx_sha256_hw_available says no and sha2.mettle never
+// calls crx_sha256_hw_blocks. It exists so the same code compiles everywhere.
+
+/// internal: 0, always: no hardware SHA-256 on this target yet.
+export fn crx_sha256_hw_available() -> uint32 {
+  return 0;
+}
+
+/// internal: never called.
+export fn crx_sha256_hw_blocks(h: uint32*, data: uint8*, nblocks: int64, k: uint32*) {
+}

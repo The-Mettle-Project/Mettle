@@ -1,0 +1,6 @@
+name = semver
+version = 0.1.0
+description = Semantic Versioning 2.0.0 for Mettle: parse, compare, ranges and best-match selection
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Semver
+compiler = 0.18.0

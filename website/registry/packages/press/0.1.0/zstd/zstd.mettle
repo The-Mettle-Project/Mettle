@@ -1,0 +1,35 @@
+// Zstandard (RFC 8878) for Press: one-shot and streaming compression and
+// decompression. Dictionaries are not supported.
+//
+//   var out: PressBuf;
+//   press_zstd_compress(p, n, 3, &out);        // level 1..19, 0 = 3
+//   press_zstd_decompress(q, m, &out2);
+
+import "../core/status";
+import "../core/buf";
+import "common";
+import "dec";
+import "dstream";
+import "enc";
+
+/// The largest window the decoder accepts unless told otherwise (128 MiB).
+export const PRESS_ZSTD_WINDOW_MAX: int64 = 134217728;
+
+/// Decompresses every frame in src[0 .. n] and appends the output to out.
+/// Frames whose window is above PRESS_ZSTD_WINDOW_MAX give PRESS_E_LIMIT.
+export fn press_zstd_decompress(src: uint8*, n: int64, out: PressBuf*) -> int32 {
+  return pzs_decompress(src, n, out, PRESS_ZSTD_WINDOW_MAX);
+}
+
+/// Like press_zstd_decompress with a chosen window limit in bytes.
+export fn press_zstd_decompress_ex(src: uint8*, n: int64, out: PressBuf*, window_max: int64) -> int32 {
+  return pzs_decompress(src, n, out, window_max);
+}
+
+/// Compresses src[0 .. n] as one frame at the level and appends it to out.
+/// Levels run 1 (fastest) to 19 (smallest; 20 to 22 use bigger windows).
+/// Level 0 means 3 and negative levels mean 1. The frame records the
+/// content size and an XXH64 checksum.
+export fn press_zstd_compress(src: uint8*, n: int64, level: int32, out: PressBuf*) -> int32 {
+  return pzs_compress(src, n, level, out);
+}

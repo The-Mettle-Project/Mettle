@@ -1,0 +1,195 @@
+// Typed values: text to bool, int64, uint64 and float64.
+//
+// Integers follow Go's strconv.ParseInt with base 0: an optional sign,
+// then decimal, or 0x / 0o / 0b for hex, octal and binary. Floats follow
+// the decimal form of IEEE 754 text: digits, an optional fraction and
+// exponent, plus inf, infinity and nan.
+
+import "std/core";
+
+fn lower(c: int32) -> int32 {
+  if (c >= 65 && c <= 90) { return c + 32; }
+  return c;
+}
+
+// Case-insensitive ASCII compare.
+export fn args_eq_fold(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  for i in 0..a.length {
+    if (lower((int32)a.chars[i]) != lower((int32)b.chars[i])) { return false; }
+  }
+  return true;
+}
+
+// true: 1 t true yes y on; false: 0 f false no n off (any case).
+export fn args_parse_bool(s: string) -> Result<bool, string> {
+  if (args_eq_fold(s, "1") || args_eq_fold(s, "t") || args_eq_fold(s, "true")
+      || args_eq_fold(s, "yes") || args_eq_fold(s, "y") || args_eq_fold(s, "on")) {
+    return Ok(true);
+  }
+  if (args_eq_fold(s, "0") || args_eq_fold(s, "f") || args_eq_fold(s, "false")
+      || args_eq_fold(s, "no") || args_eq_fold(s, "n") || args_eq_fold(s, "off")) {
+    return Ok(false);
+  }
+  return Err("expected true or false");
+}
+
+fn digit_val(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  var l: int32 = lower(c);
+  if (l >= 97 && l <= 122) { return l - 97 + 10; }
+  return 99;
+}
+
+// Digits after any sign. Writes the magnitude to *out; returns "" or why not.
+fn parse_mag(s: string, start: int64, out: uint64*) -> string {
+  var i: int64 = start;
+  var n: int64 = (int64)s.length;
+  var base: uint64 = 10;
+  if (i + 1 < n && (int32)s.chars[i] == 48) {
+    var p: int32 = lower((int32)s.chars[i + 1]);
+    if (p == 120) { base = 16; i = i + 2; }
+    else if (p == 111) { base = 8; i = i + 2; }
+    else if (p == 98) { base = 2; i = i + 2; }
+  }
+  if (i >= n) { return "no digits"; }
+  var v: uint64 = 0;
+  var max: uint64 = (uint64)0 - (uint64)1;
+  while (i < n) {
+    var d: int32 = digit_val((int32)s.chars[i]);
+    if ((uint64)d >= base) {
+      if (base == (uint64)10) { return "not a number"; }
+      return "bad digit for this base";
+    }
+    if (v > (max - (uint64)d) / base) { return "too large"; }
+    v = v * base + (uint64)d;
+    i = i + 1;
+  }
+  *out = v;
+  return "";
+}
+
+export fn args_parse_int(s: string) -> Result<int64, string> {
+  if (s.length == (uint64)0) { return Err("empty"); }
+  var neg: bool = false;
+  var i: int64 = 0;
+  var c: int32 = (int32)s.chars[0];
+  if (c == 43 || c == 45) { neg = c == 45; i = 1; }
+  var mag: uint64 = 0;
+  var why: string = parse_mag(s, i, &mag);
+  if (why.length > (uint64)0) { return Err(why); }
+  var limit: uint64 = (uint64)1 << 63;
+  if (neg) {
+    if (mag > limit) { return Err("too small for int64"); }
+    return Ok((int64)((uint64)0 - mag));
+  }
+  if (mag >= limit) { return Err("too large for int64"); }
+  return Ok((int64)mag);
+}
+
+export fn args_parse_uint(s: string) -> Result<uint64, string> {
+  if (s.length == (uint64)0) { return Err("empty"); }
+  var i: int64 = 0;
+  var c: int32 = (int32)s.chars[0];
+  if (c == 45) { return Err("must not be negative"); }
+  if (c == 43) { i = 1; }
+  var mag: uint64 = 0;
+  var why: string = parse_mag(s, i, &mag);
+  if (why.length > (uint64)0) { return Err(why); }
+  return Ok(mag);
+}
+
+fn pow10(e: int32) -> float64 {
+  var r: float64 = 1.0;
+  var b: float64 = 10.0;
+  var k: int32 = e;
+  while (k > 0) {
+    if ((k & 1) == 1) { r = r * b; }
+    b = b * b;
+    k = k >> 1;
+  }
+  return r;
+}
+
+// Decimal text to float64. Up to 19 significant digits are kept. When the
+// digits fit in 53 bits and the power of ten is at most 22 the result is
+// exact (Clinger's fast path); otherwise it can be off by a few units in the
+// last place.
+export fn args_parse_float(s: string) -> Result<float64, string> {
+  var n: int64 = (int64)s.length;
+  if (n == 0) { return Err("empty"); }
+  var i: int64 = 0;
+  var neg: bool = false;
+  var c: int32 = (int32)s.chars[0];
+  if (c == 43 || c == 45) { neg = c == 45; i = 1; }
+  var rest: string;
+  rest.chars = s.chars + i;
+  rest.length = (uint64)(n - i);
+  var zero: float64 = 0.0;
+  if (args_eq_fold(rest, "inf") || args_eq_fold(rest, "infinity")) {
+    var inf: float64 = 1.0 / zero;
+    if (neg) { return Ok(0.0 - inf); }
+    return Ok(inf);
+  }
+  if (args_eq_fold(rest, "nan")) { return Ok(zero / zero); }
+  var mant: uint64 = 0;
+  var ndig: int32 = 0;      // significant digits kept
+  var exp10: int32 = 0;
+  var any: bool = false;
+  var seen_dot: bool = false;
+  while (i < n) {
+    c = (int32)s.chars[i];
+    if (c == 46) {
+      if (seen_dot) { return Err("not a number"); }
+      seen_dot = true;
+    } else if (c >= 48 && c <= 57) {
+      any = true;
+      if (ndig < 19) {
+        if (mant != (uint64)0 || c != 48) {
+          mant = mant * (uint64)10 + (uint64)(c - 48);
+          ndig = ndig + 1;
+        }
+        if (seen_dot) { exp10 = exp10 - 1; }
+      } else if (!seen_dot) {
+        exp10 = exp10 + 1;   // digit dropped from the whole part
+      }
+    } else {
+      break;
+    }
+    i = i + 1;
+  }
+  if (!any) { return Err("not a number"); }
+  if (i < n) {
+    c = (int32)s.chars[i];
+    if (c != 101 && c != 69) { return Err("not a number"); }
+    i = i + 1;
+    var eneg: bool = false;
+    if (i < n && ((int32)s.chars[i] == 43 || (int32)s.chars[i] == 45)) {
+      eneg = (int32)s.chars[i] == 45;
+      i = i + 1;
+    }
+    if (i >= n) { return Err("exponent has no digits"); }
+    var e: int32 = 0;
+    while (i < n) {
+      c = (int32)s.chars[i];
+      if (c < 48 || c > 57) { return Err("not a number"); }
+      if (e < 100000) { e = e * 10 + (c - 48); }
+      i = i + 1;
+    }
+    if (eneg) { exp10 = exp10 - e; } else { exp10 = exp10 + e; }
+  }
+  var v: float64 = 0.0;
+  if (mant != (uint64)0) {
+    v = (float64)mant;
+    if (exp10 > 0) {
+      if (exp10 > 400) { v = 1.0 / zero; }
+      else { v = v * pow10(exp10); }
+    } else if (exp10 < 0) {
+      if (exp10 < -400) { v = 0.0; }
+      else if (exp10 < -300) { v = v / pow10(300); v = v / pow10(0 - exp10 - 300); }
+      else { v = v / pow10(0 - exp10); }
+    }
+  }
+  if (neg) { v = 0.0 - v; }
+  return Ok(v);
+}

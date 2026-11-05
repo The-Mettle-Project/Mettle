@@ -1,0 +1,54 @@
+// Small shared pieces: a growable array, the error type and limits.
+//
+// Internal names start with rx_ / Rx / RX_. Public names start with
+// regex_ / Regex / REGEX_.
+
+import "std/mem";
+
+/// A growable array. A zeroed RxVec is empty and ready to use.
+export struct RxVec<T> {
+  data: T*;
+  len: int64;
+  cap: int64;
+}
+
+/// Makes room for at least `want` items in total.
+export fn rx_vreserve<T>(v: RxVec<T>*, want: int64) {
+  if (want <= v->cap) { return; }
+  var nc: int64 = v->cap * 2;
+  if (nc < 8) { nc = 8; }
+  if (nc < want) { nc = want; }
+  v->data = (T*)realloc(v->data, sizeof(T) * nc);
+  v->cap = nc;
+}
+
+/// Appends one item.
+export fn rx_vpush<T>(v: RxVec<T>*, x: T) {
+  if (v->len == v->cap) { rx_vreserve(v, v->len + 1); }
+  v->data[v->len] = x;
+  v->len = v->len + 1;
+}
+
+/// Frees the memory and leaves the array empty.
+export fn rx_vfree<T>(v: RxVec<T>*) {
+  if (v->data != 0) { free(v->data); }
+  v->data = (T*)0;
+  v->len = 0;
+  v->cap = 0;
+}
+
+/// What went wrong when a pattern did not compile.
+export struct RegexError {
+  code: int32;     // one of REGEX_E_*
+  offset: int64;   // byte offset in the pattern where the problem is
+  msg: string;     // short plain-English message (a static string)
+}
+
+export const REGEX_E_SYNTAX = 1;    // the pattern is not valid
+export const REGEX_E_UNSUPPORTED = 2; // valid elsewhere, not here (backreferences, look-around)
+export const REGEX_E_SIZE = 3;      // the compiled program would be too big
+export const REGEX_E_NEST = 4;      // groups or repetitions nest too deeply
+
+/// Limits that keep a hostile pattern from using unbounded memory.
+export const RX_NEST_LIMIT = 250;
+export const RX_REPEAT_LIMIT = 100000;

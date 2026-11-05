@@ -1,0 +1,107 @@
+// codec_protoc: compiles .proto files to Mettle.
+//
+//   codec_protoc [-I DIR]... [--out DIR] [--prefix NAME] [--runtime PATH] FILE.proto...
+//
+// FILE names are import paths, found in the -I directories (default "."),
+// just as protoc takes them. Every file they import is generated too.
+// The output for a/b.proto is OUT/a/b_pb.mettle.
+import "std/io";
+import "std/mem";
+import "std/file";
+import "std/fs";
+import "codec/core/list";
+import "codec/proto/compiler/desc";
+import "codec/proto/compiler/resolve";
+import "codec/proto/compiler/gen";
+
+fn usage() -> int32 {
+  print_err("usage: codec_protoc [-I DIR]... [--out DIR] [--prefix NAME] [--runtime PATH] FILE.proto...\n");
+  return 2;
+}
+
+fn write_file(path: string, text: string) -> bool {
+  // Make the parent directory.
+  var i: int64 = (int64)path.length - 1;
+  while (i > 0 && path.chars[i] != 47) { i = i - 1; }
+  if (i > 0) {
+    var dir: string = path;
+    dir.length = (uint64)i;
+    fs_mkdir_all(dir, 493);
+  }
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return false; }
+  var done: int64 = 0;
+  var n: int64 = (int64)text.length;
+  while (done < n) {
+    var k: int64 = file_write_at(fd, text.chars + done, n - done, done);
+    if (k <= 0) {
+      file_close(fd);
+      return false;
+    }
+    done = done + k;
+  }
+  file_close(fd);
+  return true;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var set: CodecPbcSet;
+  set.prefix = "";
+  var out: string = ".";
+  var runtime: string = "codec";
+  var names: CodecList<string>;
+  var i: int32 = 1;
+  while (i < argc) {
+    var a: string = str_of(argv[i]);
+    if ((a == "-I" || a == "--out" || a == "--prefix" || a == "--runtime") && i + 1 < argc) {
+      var v: string = str_of(argv[i + 1]);
+      if (a == "-I") { codec_list_push(&set.include, v); }
+      if (a == "--out") { out = v; }
+      if (a == "--prefix") { set.prefix = v; }
+      if (a == "--runtime") { runtime = v; }
+      i = i + 2;
+      continue;
+    }
+    if (a.length > 2 && a.chars[0] == 45 && a.chars[1] == 73) {
+      var dir: string;
+      dir.chars = a.chars + 2;
+      dir.length = a.length - 2;
+      codec_list_push(&set.include, dir);
+    } else if (a.length > 0 && a.chars[0] == 45) {
+      return usage();
+    } else {
+      codec_list_push(&names, a);
+    }
+    i = i + 1;
+  }
+  if (names.len == 0) { return usage(); }
+  if (set.include.len == 0) { codec_list_push(&set.include, "."); }
+  for k in 0..names.len {
+    if (codec_pbc_load(&set, names.data[k]) < 0) {
+      print_err(set.error + "\n");
+      return 1;
+    }
+  }
+  if (!codec_pbc_resolve(&set)) {
+    print_err(set.error + "\n");
+    return 1;
+  }
+  for f in 0..set.files.len {
+    var text: string = codec_pbc_generate(&set, (int32)f, runtime);
+    var path: string = out + "/" + codec_pbc_out_name(set.files.data[f].path);
+    if (!write_file(path, text)) {
+      print_err("cannot write " + path + "\n");
+      return 1;
+    }
+  }
+  return 0;
+}
+
+fn str_of(c: cstring) -> string {
+  var s: string;
+  s.chars = (uint8*)c;
+  var n: int64 = 0;
+  while (s.chars[n] != 0) { n = n + 1; }
+  s.length = (uint64)n;
+  return s;
+}

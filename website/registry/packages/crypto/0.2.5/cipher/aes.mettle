@@ -1,0 +1,575 @@
+// AES (FIPS 197) in pure Mettle, constant time and without lookup tables:
+// the bitsliced 64-bit implementation of BearSSL, four blocks at a time.
+// Internal: the public entry point is cr_aes_gcm_* in gcm.mettle.
+//
+// Ported from BearSSL (aes_ct64.c, aes_ct64_enc.c, aes_ct64_ctr.c),
+// Copyright (c) 2016 Thomas Pornin, MIT license; see NOTICE.
+//
+// The S-box is the Boyar-Peralta circuit made of XOR, AND and NOT on 64-bit
+// words, so no table is read and no index or branch depends on the key or
+// the data. The only indexes and loop bounds are public: round counts, round
+// numbers and block counters. Unlike BearSSL, which keeps the compact key
+// and expands it on every call, the expanded round keys
+// (crx_aes_skey_expand) are computed once and kept by the caller.
+
+import "crypto/core/util";
+import "crypto/cipher/chacha";
+
+// Round constants of the key schedule; indexed by a public counter.
+var g_crx_aes_rcon: uint32[10] = [
+  (uint32)0x01, (uint32)0x02, (uint32)0x04, (uint32)0x08, (uint32)0x10,
+  (uint32)0x20, (uint32)0x40, (uint32)0x80, (uint32)0x1b, (uint32)0x36
+];
+
+// Byte-swaps a 32-bit word (br_swap32).
+@inline fn crx_aes_swap32(x: uint32) -> uint32 {
+  var y: uint32 = ((x & (uint32)0x00FF00FF) << 8) | ((x >> 8) & (uint32)0x00FF00FF);
+  return (y << 16) | (y >> 16);
+}
+
+/// internal: the AES S-box on eight bitsliced 64-bit words, q[0] the low
+/// bit plane to q[7] the high one (Boyar-Peralta circuit, in place).
+export fn crx_aes_bitslice_sbox(q: uint64*) {
+  // This S-box is a straightforward translation of the circuit described by
+  // Boyar and Peralta in "A new combinational logic minimization technique
+  // with applications to cryptology" (https://eprint.iacr.org/2009/191.pdf).
+  // The x* (input) and s* (output) variables are numbered in reverse order
+  // (x0 is the high bit, x7 the low bit).
+  var x0: uint64 = q[7];
+  var x1: uint64 = q[6];
+  var x2: uint64 = q[5];
+  var x3: uint64 = q[4];
+  var x4: uint64 = q[3];
+  var x5: uint64 = q[2];
+  var x6: uint64 = q[1];
+  var x7: uint64 = q[0];
+
+  // Top linear transformation.
+  var y14: uint64 = x3 ^ x5;
+  var y13: uint64 = x0 ^ x6;
+  var y9: uint64 = x0 ^ x3;
+  var y8: uint64 = x0 ^ x5;
+  var t0: uint64 = x1 ^ x2;
+  var y1: uint64 = t0 ^ x7;
+  var y4: uint64 = y1 ^ x3;
+  var y12: uint64 = y13 ^ y14;
+  var y2: uint64 = y1 ^ x0;
+  var y5: uint64 = y1 ^ x6;
+  var y3: uint64 = y5 ^ y8;
+  var t1: uint64 = x4 ^ y12;
+  var y15: uint64 = t1 ^ x5;
+  var y20: uint64 = t1 ^ x1;
+  var y6: uint64 = y15 ^ x7;
+  var y10: uint64 = y15 ^ t0;
+  var y11: uint64 = y20 ^ y9;
+  var y7: uint64 = x7 ^ y11;
+  var y17: uint64 = y10 ^ y11;
+  var y19: uint64 = y10 ^ y8;
+  var y16: uint64 = t0 ^ y11;
+  var y21: uint64 = y13 ^ y16;
+  var y18: uint64 = x0 ^ y16;
+
+  // Non-linear section.
+  var t2: uint64 = y12 & y15;
+  var t3: uint64 = y3 & y6;
+  var t4: uint64 = t3 ^ t2;
+  var t5: uint64 = y4 & x7;
+  var t6: uint64 = t5 ^ t2;
+  var t7: uint64 = y13 & y16;
+  var t8: uint64 = y5 & y1;
+  var t9: uint64 = t8 ^ t7;
+  var t10: uint64 = y2 & y7;
+  var t11: uint64 = t10 ^ t7;
+  var t12: uint64 = y9 & y11;
+  var t13: uint64 = y14 & y17;
+  var t14: uint64 = t13 ^ t12;
+  var t15: uint64 = y8 & y10;
+  var t16: uint64 = t15 ^ t12;
+  var t17: uint64 = t4 ^ t14;
+  var t18: uint64 = t6 ^ t16;
+  var t19: uint64 = t9 ^ t14;
+  var t20: uint64 = t11 ^ t16;
+  var t21: uint64 = t17 ^ y20;
+  var t22: uint64 = t18 ^ y19;
+  var t23: uint64 = t19 ^ y21;
+  var t24: uint64 = t20 ^ y18;
+
+  var t25: uint64 = t21 ^ t22;
+  var t26: uint64 = t21 & t23;
+  var t27: uint64 = t24 ^ t26;
+  var t28: uint64 = t25 & t27;
+  var t29: uint64 = t28 ^ t22;
+  var t30: uint64 = t23 ^ t24;
+  var t31: uint64 = t22 ^ t26;
+  var t32: uint64 = t31 & t30;
+  var t33: uint64 = t32 ^ t24;
+  var t34: uint64 = t23 ^ t33;
+  var t35: uint64 = t27 ^ t33;
+  var t36: uint64 = t24 & t35;
+  var t37: uint64 = t36 ^ t34;
+  var t38: uint64 = t27 ^ t36;
+  var t39: uint64 = t29 & t38;
+  var t40: uint64 = t25 ^ t39;
+
+  var t41: uint64 = t40 ^ t37;
+  var t42: uint64 = t29 ^ t33;
+  var t43: uint64 = t29 ^ t40;
+  var t44: uint64 = t33 ^ t37;
+  var t45: uint64 = t42 ^ t41;
+  var z0: uint64 = t44 & y15;
+  var z1: uint64 = t37 & y6;
+  var z2: uint64 = t33 & x7;
+  var z3: uint64 = t43 & y16;
+  var z4: uint64 = t40 & y1;
+  var z5: uint64 = t29 & y7;
+  var z6: uint64 = t42 & y11;
+  var z7: uint64 = t45 & y17;
+  var z8: uint64 = t41 & y10;
+  var z9: uint64 = t44 & y12;
+  var z10: uint64 = t37 & y3;
+  var z11: uint64 = t33 & y4;
+  var z12: uint64 = t43 & y13;
+  var z13: uint64 = t40 & y5;
+  var z14: uint64 = t29 & y2;
+  var z15: uint64 = t42 & y9;
+  var z16: uint64 = t45 & y14;
+  var z17: uint64 = t41 & y8;
+
+  // Bottom linear transformation.
+  var t46: uint64 = z15 ^ z16;
+  var t47: uint64 = z10 ^ z11;
+  var t48: uint64 = z5 ^ z13;
+  var t49: uint64 = z9 ^ z10;
+  var t50: uint64 = z2 ^ z12;
+  var t51: uint64 = z2 ^ z5;
+  var t52: uint64 = z7 ^ z8;
+  var t53: uint64 = z0 ^ z3;
+  var t54: uint64 = z6 ^ z7;
+  var t55: uint64 = z16 ^ z17;
+  var t56: uint64 = z12 ^ t48;
+  var t57: uint64 = t50 ^ t53;
+  var t58: uint64 = z4 ^ t46;
+  var t59: uint64 = z3 ^ t54;
+  var t60: uint64 = t46 ^ t57;
+  var t61: uint64 = z14 ^ t57;
+  var t62: uint64 = t52 ^ t58;
+  var t63: uint64 = t49 ^ t58;
+  var t64: uint64 = z4 ^ t59;
+  var t65: uint64 = t61 ^ t62;
+  var t66: uint64 = z1 ^ t63;
+  var s0: uint64 = t59 ^ t63;
+  var s6: uint64 = t56 ^ ~t62;
+  var s7: uint64 = t48 ^ ~t60;
+  var t67: uint64 = t64 ^ t65;
+  var s3: uint64 = t53 ^ t66;
+  var s4: uint64 = t51 ^ t66;
+  var s5: uint64 = t47 ^ t65;
+  var s1: uint64 = t64 ^ ~s3;
+  var s2: uint64 = t55 ^ ~t67;
+
+  q[7] = s0;
+  q[6] = s1;
+  q[5] = s2;
+  q[4] = s3;
+  q[3] = s4;
+  q[2] = s5;
+  q[1] = s6;
+  q[0] = s7;
+}
+
+// The three steps of the bit-matrix transposition: swap2/swap4/swap8 exchange
+// the odd bit groups of q[i] with the even bit groups of q[j], for groups of
+// 1, 2 and 4 bits.
+@inline fn crx_aes_swap2(q: uint64*, i: int32, j: int32) {
+  var a: uint64 = q[i];
+  var b: uint64 = q[j];
+  q[i] = (a & (uint64)0x5555555555555555) | ((b & (uint64)0x5555555555555555) << 1);
+  q[j] = ((a & (uint64)0xAAAAAAAAAAAAAAAA) >> 1) | (b & (uint64)0xAAAAAAAAAAAAAAAA);
+}
+
+@inline fn crx_aes_swap4(q: uint64*, i: int32, j: int32) {
+  var a: uint64 = q[i];
+  var b: uint64 = q[j];
+  q[i] = (a & (uint64)0x3333333333333333) | ((b & (uint64)0x3333333333333333) << 2);
+  q[j] = ((a & (uint64)0xCCCCCCCCCCCCCCCC) >> 2) | (b & (uint64)0xCCCCCCCCCCCCCCCC);
+}
+
+@inline fn crx_aes_swap8(q: uint64*, i: int32, j: int32) {
+  var a: uint64 = q[i];
+  var b: uint64 = q[j];
+  q[i] = (a & (uint64)0x0F0F0F0F0F0F0F0F) | ((b & (uint64)0x0F0F0F0F0F0F0F0F) << 4);
+  q[j] = ((a & (uint64)0xF0F0F0F0F0F0F0F0) >> 4) | (b & (uint64)0xF0F0F0F0F0F0F0F0);
+}
+
+/// internal: transposes the 8x8 bit matrix held in q[0..8) (its own inverse):
+/// converts between the interleaved and the bitsliced representation.
+export fn crx_aes_ortho(q: uint64*) {
+  crx_aes_swap2(q, 0, 1);
+  crx_aes_swap2(q, 2, 3);
+  crx_aes_swap2(q, 4, 5);
+  crx_aes_swap2(q, 6, 7);
+
+  crx_aes_swap4(q, 0, 2);
+  crx_aes_swap4(q, 1, 3);
+  crx_aes_swap4(q, 4, 6);
+  crx_aes_swap4(q, 5, 7);
+
+  crx_aes_swap8(q, 0, 4);
+  crx_aes_swap8(q, 1, 5);
+  crx_aes_swap8(q, 2, 6);
+  crx_aes_swap8(q, 3, 7);
+}
+
+/// internal: spreads two 16-byte blocks' worth of little-endian words
+/// w[0..4) into *q0 and *q1 (bytes of the same column end up 16 bits apart).
+export fn crx_aes_interleave_in(q0: uint64*, q1: uint64*, w: uint32*) {
+  var x0: uint64 = (uint64)w[0];
+  var x1: uint64 = (uint64)w[1];
+  var x2: uint64 = (uint64)w[2];
+  var x3: uint64 = (uint64)w[3];
+  x0 = x0 | (x0 << 16);
+  x1 = x1 | (x1 << 16);
+  x2 = x2 | (x2 << 16);
+  x3 = x3 | (x3 << 16);
+  x0 = x0 & (uint64)0x0000FFFF0000FFFF;
+  x1 = x1 & (uint64)0x0000FFFF0000FFFF;
+  x2 = x2 & (uint64)0x0000FFFF0000FFFF;
+  x3 = x3 & (uint64)0x0000FFFF0000FFFF;
+  x0 = x0 | (x0 << 8);
+  x1 = x1 | (x1 << 8);
+  x2 = x2 | (x2 << 8);
+  x3 = x3 | (x3 << 8);
+  x0 = x0 & (uint64)0x00FF00FF00FF00FF;
+  x1 = x1 & (uint64)0x00FF00FF00FF00FF;
+  x2 = x2 & (uint64)0x00FF00FF00FF00FF;
+  x3 = x3 & (uint64)0x00FF00FF00FF00FF;
+  *q0 = x0 | (x2 << 8);
+  *q1 = x1 | (x3 << 8);
+}
+
+/// internal: the inverse of crx_aes_interleave_in.
+export fn crx_aes_interleave_out(w: uint32*, q0: uint64, q1: uint64) {
+  var x0: uint64 = q0 & (uint64)0x00FF00FF00FF00FF;
+  var x1: uint64 = q1 & (uint64)0x00FF00FF00FF00FF;
+  var x2: uint64 = (q0 >> 8) & (uint64)0x00FF00FF00FF00FF;
+  var x3: uint64 = (q1 >> 8) & (uint64)0x00FF00FF00FF00FF;
+  x0 = x0 | (x0 >> 8);
+  x1 = x1 | (x1 >> 8);
+  x2 = x2 | (x2 >> 8);
+  x3 = x3 | (x3 >> 8);
+  x0 = x0 & (uint64)0x0000FFFF0000FFFF;
+  x1 = x1 & (uint64)0x0000FFFF0000FFFF;
+  x2 = x2 & (uint64)0x0000FFFF0000FFFF;
+  x3 = x3 & (uint64)0x0000FFFF0000FFFF;
+  w[0] = (uint32)x0 | (uint32)(x0 >> 16);
+  w[1] = (uint32)x1 | (uint32)(x1 >> 16);
+  w[2] = (uint32)x2 | (uint32)(x2 >> 16);
+  w[3] = (uint32)x3 | (uint32)(x3 >> 16);
+}
+
+// SubWord of the key schedule: the S-box applied to the four bytes of x.
+fn crx_aes_sub_word(x: uint32) -> uint32 {
+  var q: uint64[8];
+  var i: int32 = 0;
+  while (i < 8) {
+    q[i] = 0;
+    i = i + 1;
+  }
+  q[0] = (uint64)x;
+  crx_aes_ortho(&q[0]);
+  crx_aes_bitslice_sbox(&q[0]);
+  crx_aes_ortho(&q[0]);
+  var r: uint32 = (uint32)q[0];
+  cr_wipe((uint8*)&q[0], 64);
+  return r;
+}
+
+/// internal: computes the compact (bit-compressed) round keys of a 16-,
+/// 24- or 32-byte key into comp_skey, which holds 2 * (rounds + 1) words
+/// (at most 30).
+/// in: comp_skey writable for 30 words; key readable for key_len bytes
+/// returns: the number of rounds (10, 12 or 14), or 0 for any other key_len
+export fn crx_aes_keysched(comp_skey: uint64*, key: uint8*, key_len: int64) -> uint32 {
+  var num_rounds: int32 = 0;
+  if (key_len == 16) {
+    num_rounds = 10;
+  } else if (key_len == 24) {
+    num_rounds = 12;
+  } else if (key_len == 32) {
+    num_rounds = 14;
+  } else {
+    return 0;
+  }
+  var skey: uint32[60];
+  var nk: int32 = (int32)(key_len >> 2);
+  var nkf: int32 = (num_rounds + 1) << 2;
+  var i: int32 = 0;
+  while (i < nk) {
+    skey[i] = crx_ld32(&key[i * 4]);
+    i = i + 1;
+  }
+  var tmp: uint32 = skey[nk - 1];
+  var j: int32 = 0;
+  var k: int32 = 0;
+  i = nk;
+  while (i < nkf) {
+    if (j == 0) {
+      tmp = (tmp << 24) | (tmp >> 8);
+      tmp = crx_aes_sub_word(tmp) ^ g_crx_aes_rcon[k];
+    } else if (nk > 6 && j == 4) {
+      tmp = crx_aes_sub_word(tmp);
+    }
+    tmp = tmp ^ skey[i - nk];
+    skey[i] = tmp;
+    j = j + 1;
+    if (j == nk) {
+      j = 0;
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+
+  var q: uint64[8];
+  i = 0;
+  j = 0;
+  while (i < nkf) {
+    crx_aes_interleave_in(&q[0], &q[4], &skey[i]);
+    q[1] = q[0];
+    q[2] = q[0];
+    q[3] = q[0];
+    q[5] = q[4];
+    q[6] = q[4];
+    q[7] = q[4];
+    crx_aes_ortho(&q[0]);
+    comp_skey[j] = (q[0] & (uint64)0x1111111111111111)
+      | (q[1] & (uint64)0x2222222222222222)
+      | (q[2] & (uint64)0x4444444444444444)
+      | (q[3] & (uint64)0x8888888888888888);
+    comp_skey[j + 1] = (q[4] & (uint64)0x1111111111111111)
+      | (q[5] & (uint64)0x2222222222222222)
+      | (q[6] & (uint64)0x4444444444444444)
+      | (q[7] & (uint64)0x8888888888888888);
+    i = i + 4;
+    j = j + 2;
+  }
+  cr_wipe((uint8*)&skey[0], 240);
+  cr_wipe((uint8*)&q[0], 64);
+  tmp = 0;
+  return (uint32)num_rounds;
+}
+
+/// internal: expands the compact round keys of crx_aes_keysched into the
+/// bitsliced form the rounds use: 8 words per round key, 8 * (rounds + 1)
+/// words (at most 120).
+/// in: skey writable for 8 * (num_rounds + 1) words; comp_skey from
+///   crx_aes_keysched
+export fn crx_aes_skey_expand(skey: uint64*, num_rounds: uint32, comp_skey: uint64*) {
+  var n: int32 = (int32)((num_rounds + (uint32)1) << 1);
+  var u: int32 = 0;
+  var v: int32 = 0;
+  while (u < n) {
+    var x0: uint64 = comp_skey[u];
+    var x1: uint64 = x0;
+    var x2: uint64 = x0;
+    var x3: uint64 = x0;
+    x0 = x0 & (uint64)0x1111111111111111;
+    x1 = x1 & (uint64)0x2222222222222222;
+    x2 = x2 & (uint64)0x4444444444444444;
+    x3 = x3 & (uint64)0x8888888888888888;
+    x1 = x1 >> 1;
+    x2 = x2 >> 2;
+    x3 = x3 >> 3;
+    skey[v] = (x0 << 4) - x0;
+    skey[v + 1] = (x1 << 4) - x1;
+    skey[v + 2] = (x2 << 4) - x2;
+    skey[v + 3] = (x3 << 4) - x3;
+    u = u + 1;
+    v = v + 4;
+  }
+}
+
+@inline fn crx_aes_add_round_key(q: uint64*, sk: uint64*) {
+  q[0] = q[0] ^ sk[0];
+  q[1] = q[1] ^ sk[1];
+  q[2] = q[2] ^ sk[2];
+  q[3] = q[3] ^ sk[3];
+  q[4] = q[4] ^ sk[4];
+  q[5] = q[5] ^ sk[5];
+  q[6] = q[6] ^ sk[6];
+  q[7] = q[7] ^ sk[7];
+}
+
+@inline fn crx_aes_shift_rows(q: uint64*) {
+  var i: int32 = 0;
+  while (i < 8) {
+    var x: uint64 = q[i];
+    q[i] = (x & (uint64)0x000000000000FFFF)
+      | ((x & (uint64)0x00000000FFF00000) >> 4)
+      | ((x & (uint64)0x00000000000F0000) << 12)
+      | ((x & (uint64)0x0000FF0000000000) >> 8)
+      | ((x & (uint64)0x000000FF00000000) << 8)
+      | ((x & (uint64)0xF000000000000000) >> 12)
+      | ((x & (uint64)0x0FFF000000000000) << 4);
+    i = i + 1;
+  }
+}
+
+@inline fn crx_aes_rotr32(x: uint64) -> uint64 {
+  return (x << 32) | (x >> 32);
+}
+
+@inline fn crx_aes_mix_columns(q: uint64*) {
+  var q0: uint64 = q[0];
+  var q1: uint64 = q[1];
+  var q2: uint64 = q[2];
+  var q3: uint64 = q[3];
+  var q4: uint64 = q[4];
+  var q5: uint64 = q[5];
+  var q6: uint64 = q[6];
+  var q7: uint64 = q[7];
+  var r0: uint64 = (q0 >> 16) | (q0 << 48);
+  var r1: uint64 = (q1 >> 16) | (q1 << 48);
+  var r2: uint64 = (q2 >> 16) | (q2 << 48);
+  var r3: uint64 = (q3 >> 16) | (q3 << 48);
+  var r4: uint64 = (q4 >> 16) | (q4 << 48);
+  var r5: uint64 = (q5 >> 16) | (q5 << 48);
+  var r6: uint64 = (q6 >> 16) | (q6 << 48);
+  var r7: uint64 = (q7 >> 16) | (q7 << 48);
+
+  q[0] = q7 ^ r7 ^ r0 ^ crx_aes_rotr32(q0 ^ r0);
+  q[1] = q0 ^ r0 ^ q7 ^ r7 ^ r1 ^ crx_aes_rotr32(q1 ^ r1);
+  q[2] = q1 ^ r1 ^ r2 ^ crx_aes_rotr32(q2 ^ r2);
+  q[3] = q2 ^ r2 ^ q7 ^ r7 ^ r3 ^ crx_aes_rotr32(q3 ^ r3);
+  q[4] = q3 ^ r3 ^ q7 ^ r7 ^ r4 ^ crx_aes_rotr32(q4 ^ r4);
+  q[5] = q4 ^ r4 ^ r5 ^ crx_aes_rotr32(q5 ^ r5);
+  q[6] = q5 ^ r5 ^ r6 ^ crx_aes_rotr32(q6 ^ r6);
+  q[7] = q6 ^ r6 ^ r7 ^ crx_aes_rotr32(q7 ^ r7);
+}
+
+/// internal: encrypts the eight bitsliced words q (four blocks) in place
+/// with the expanded round keys skey.
+/// in: q from crx_aes_ortho of interleaved blocks; skey from
+///   crx_aes_skey_expand; num_rounds 10, 12 or 14
+export fn crx_aes_bitslice_encrypt(num_rounds: uint32, skey: uint64*, q: uint64*) {
+  crx_aes_add_round_key(q, skey);
+  var u: int32 = 1;
+  var nr: int32 = (int32)num_rounds;
+  while (u < nr) {
+    crx_aes_bitslice_sbox(q);
+    crx_aes_shift_rows(q);
+    crx_aes_mix_columns(q);
+    crx_aes_add_round_key(q, &skey[u << 3]);
+    u = u + 1;
+  }
+  crx_aes_bitslice_sbox(q);
+  crx_aes_shift_rows(q);
+  crx_aes_add_round_key(q, &skey[nr << 3]);
+}
+
+/// internal: encrypts one 16-byte block (ECB, FIPS 197) with the expanded
+/// round keys; the other three lanes of the bitsliced batch carry zeros.
+/// in: skey/num_rounds as for crx_aes_bitslice_encrypt; src and dst 16 bytes
+///   (dst may equal src)
+export fn crx_aes_encrypt_block(skey: uint64*, num_rounds: uint32, dst: uint8*, src: uint8*) {
+  var q: uint64[8];
+  var w: uint32[4];
+  var i: int32 = 0;
+  while (i < 8) {
+    q[i] = 0;
+    i = i + 1;
+  }
+  while (i < 12) {
+    w[i - 8] = crx_ld32(&src[(i - 8) * 4]);
+    i = i + 1;
+  }
+  crx_aes_interleave_in(&q[0], &q[4], &w[0]);
+  crx_aes_ortho(&q[0]);
+  crx_aes_bitslice_encrypt(num_rounds, skey, &q[0]);
+  crx_aes_ortho(&q[0]);
+  crx_aes_interleave_out(&w[0], q[0], q[4]);
+  i = 0;
+  while (i < 4) {
+    crx_st32(&dst[i * 4], w[i]);
+    i = i + 1;
+  }
+  cr_wipe((uint8*)&q[0], 64);
+  cr_wipe((uint8*)&w[0], 16);
+}
+
+/// internal: AES-CTR keystream XOR, four blocks at a time, as GCM uses it:
+/// the counter block is iv[0..12) followed by the 32-bit big-endian counter
+/// cc, cc + 1, ... (wrapping modulo 2^32). dst[i] = src[i] xor keystream[i]
+/// for i < len; len need not be a multiple of 16.
+/// in: skey/num_rounds as for crx_aes_bitslice_encrypt; iv 12 bytes; dst
+///   and src readable/writable for len bytes (dst may equal src, no other
+///   overlap); len >= 0
+/// returns: the counter after the last block started
+export fn crx_aes_ctr_xor(skey: uint64*, num_rounds: uint32, iv: uint8*, cc: uint32, dst: uint8*, src: uint8*, len: int64) -> uint32 {
+  var ivw: uint32[16];
+  var q: uint64[8];
+  var w: uint32[16];
+  var tmp: uint8[64];
+  var i: int32 = 0;
+  while (i < 3) {
+    ivw[i] = crx_ld32(&iv[i * 4]);
+    ivw[4 + i] = ivw[i];
+    ivw[8 + i] = ivw[i];
+    ivw[12 + i] = ivw[i];
+    i = i + 1;
+  }
+  var pos: int64 = 0;
+  var left: int64 = len;
+  var ctr: uint32 = cc;
+  while (left > 0) {
+    i = 0;
+    while (i < 16) {
+      w[i] = ivw[i];
+      i = i + 1;
+    }
+    w[3] = crx_aes_swap32(ctr);
+    w[7] = crx_aes_swap32(ctr + (uint32)1);
+    w[11] = crx_aes_swap32(ctr + (uint32)2);
+    w[15] = crx_aes_swap32(ctr + (uint32)3);
+    i = 0;
+    while (i < 4) {
+      crx_aes_interleave_in(&q[i], &q[i + 4], &w[i << 2]);
+      i = i + 1;
+    }
+    crx_aes_ortho(&q[0]);
+    crx_aes_bitslice_encrypt(num_rounds, skey, &q[0]);
+    crx_aes_ortho(&q[0]);
+    i = 0;
+    while (i < 4) {
+      crx_aes_interleave_out(&w[i << 2], q[i], q[i + 4]);
+      i = i + 1;
+    }
+    if (left >= 64) {
+      i = 0;
+      while (i < 16) {
+        crx_st32(&dst[pos + (int64)(i * 4)], crx_ld32(&src[pos + (int64)(i * 4)]) ^ w[i]);
+        i = i + 1;
+      }
+      pos = pos + 64;
+      left = left - 64;
+      ctr = ctr + (uint32)4;
+    } else {
+      i = 0;
+      while (i < 16) {
+        crx_st32(&tmp[i * 4], w[i]);
+        i = i + 1;
+      }
+      var b: int32 = 0;
+      while ((int64)b < left) {
+        dst[pos + (int64)b] = src[pos + (int64)b] ^ tmp[b];
+        b = b + 1;
+      }
+      ctr = ctr + (uint32)(left >> 4);
+      left = 0;
+    }
+  }
+  cr_wipe((uint8*)&ivw[0], 64);
+  cr_wipe((uint8*)&q[0], 64);
+  cr_wipe((uint8*)&w[0], 64);
+  cr_wipe(&tmp[0], 64);
+  return ctr;
+}

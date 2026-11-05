@@ -1,0 +1,678 @@
+// NIST P-384 (secp384r1) key pairs and ECDH, in pure Mettle, constant time in
+// the secret scalar: the generic prime-curve code of BearSSL on 31-bit big
+// integers, with Jacobian points in Montgomery form, the doubling and addition
+// formulas written as straight sequences of modular operations, and a 2-bit
+// window for point multiplication. Standards: FIPS 186-5 (the curve and key
+// pairs), SEC 1 v2 (point encoding).
+//
+// Ported from BearSSL (ec_prime_i31.c, ec_secp384r1.c), Copyright (c) 2016
+// Thomas Pornin, MIT license; see NOTICE.
+//
+// A public key is the uncompressed point 0x04 || X || Y (97 bytes, X and Y
+// big-endian). A secret key is the scalar d, 48 bytes big-endian, with
+// 1 <= d <= n-1. The ECDH result is the X coordinate of d * Q, as 48 bytes;
+// it is not a key, so run it through a KDF (cr_hkdf_sha384) before using it.
+
+import "crypto/core/status";
+import "crypto/core/types";
+import "crypto/core/util";
+import "crypto/ecc/i31";
+
+/// Size in bytes of a P-384 public key: the uncompressed point 0x04 || X || Y.
+/// in: -
+/// returns: 97
+/// owns: nothing
+/// thread: constant
+/// example: var pk: uint8[97]; cr_p384_keypair(&pk[0], CR_P384_PUBLIC_BYTES, &sk);
+export const CR_P384_PUBLIC_BYTES: int64 = 97;
+
+/// CrP384Secret: A P-384 secret key, the scalar d as 48 big-endian bytes with
+/// 1 <= d <= n-1 (n is the group order).
+/// in: - (zeroed when declared: `var x: CrP384Secret;`)
+/// returns: -
+/// owns: secret: wipe with cr_wipe(&sk.b[0], 48) when done
+/// thread: any thread (no shared state)
+/// example: var sk: CrP384Secret; cr_p384_keypair(&pk[0], 97, &sk);
+export struct CrP384Secret {
+  b: uint8[48];
+}
+
+// Words of one i31 register: the header and thirteen data words (the field
+// modulus has 384 bits, encoded bit length 396); sixteen leaves slack.
+const CRX_P384_W: int32 = 16;
+
+// The field modulus p = 2^384 - 2^128 - 2^96 + 2^32 - 1 as an i31 integer.
+// -1/p mod 2^31 is 1.
+const CRX_P384_P0I: uint32 = 1;
+var g_crx_p384_p: uint32[14] = [
+  0x0000018C,
+  0x7FFFFFFF, 0x00000001, 0x00000000, 0x7FFFFFF8,
+  0x7FFFFFEF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF,
+  0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF,
+  0x00000FFF
+];
+
+// R^2 mod p, with R = 2^(31 * 13).
+var g_crx_p384_r2: uint32[14] = [
+  0x0000018C,
+  0x00000000, 0x00000080, 0x7FFFFE00, 0x000001FF,
+  0x00000800, 0x00000000, 0x7FFFE000, 0x00001FFF,
+  0x00008000, 0x00008000, 0x00000000, 0x00000000,
+  0x00000000
+];
+
+// The b coefficient of the curve equation y^2 = x^3 - 3x + b, times R mod p
+// (Montgomery form).
+var g_crx_p384_b: uint32[14] = [
+  0x0000018C,
+  0x6E666840, 0x070D0392, 0x5D810231, 0x7651D50C,
+  0x17E218D6, 0x1B192002, 0x44EFE441, 0x3A524E2B,
+  0x2719BA5F, 0x41F02209, 0x36C5643E, 0x5813EFFE,
+  0x000008A5
+];
+
+// The group order n.
+var g_crx_p384_n: uint8[48] = [
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xC7, 0x63, 0x4D, 0x81, 0xF4, 0x37, 0x2D, 0xDF,
+  0x58, 0x1A, 0x0D, 0xB2, 0x48, 0xB0, 0xA7, 0x7A,
+  0xEC, 0xEC, 0x19, 0x6A, 0xCC, 0xC5, 0x29, 0x73
+];
+
+// The generator G, as the uncompressed point 0x04 || X || Y.
+var g_crx_p384_g: uint8[97] = [
+  0x04, 0xAA, 0x87, 0xCA, 0x22, 0xBE, 0x8B, 0x05,
+  0x37, 0x8E, 0xB1, 0xC7, 0x1E, 0xF3, 0x20, 0xAD,
+  0x74, 0x6E, 0x1D, 0x3B, 0x62, 0x8B, 0xA7, 0x9B,
+  0x98, 0x59, 0xF7, 0x41, 0xE0, 0x82, 0x54, 0x2A,
+  0x38, 0x55, 0x02, 0xF2, 0x5D, 0xBF, 0x55, 0x29,
+  0x6C, 0x3A, 0x54, 0x5E, 0x38, 0x72, 0x76, 0x0A,
+  0xB7, 0x36, 0x17, 0xDE, 0x4A, 0x96, 0x26, 0x2C,
+  0x6F, 0x5D, 0x9E, 0x98, 0xBF, 0x92, 0x92, 0xDC,
+  0x29, 0xF8, 0xF4, 0x1D, 0xBD, 0x28, 0x9A, 0x14,
+  0x7C, 0xE9, 0xDA, 0x31, 0x13, 0xB5, 0xF0, 0xB8,
+  0xC0, 0x0A, 0x60, 0xB1, 0xCE, 0x1D, 0x7E, 0x81,
+  0x9D, 0x7A, 0x43, 0x1D, 0x7C, 0x90, 0xEA, 0x0E,
+  0x5F
+];
+
+/// internal: writes the group order n of P-384 (48 bytes, big-endian) to out.
+export fn crx_p384_order(out: uint8*) {
+  for i in 0..48 {
+    out[i] = g_crx_p384_n[i];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The register machine of BearSSL's ec_prime_i31.c, as plain functions over a
+// file of 13 registers (t, 16 words each). The operations are:
+//   mset(d, a)      d = a
+//   madd(d, a)      d = d + a mod p
+//   msub(d, a)      d = d - a mod p
+//   mmul(d, a, b)   d = a * b / R mod p (Montgomery); d differs from a and b
+//   minv(d, a, b)   d = 1/d mod p (a and b are scratch registers)
+//   nz(d)           1 if d is not zero, else 0
+// Registers 0 to 2 hold the first operand (x, y, z), 3 to 5 the second, 6 to
+// 12 are temporaries.
+
+const R_P1X: int32 = 0;
+const R_P1Y: int32 = 1;
+const R_P1Z: int32 = 2;
+const R_P2X: int32 = 3;
+const R_P2Y: int32 = 4;
+const R_P2Z: int32 = 5;
+const R_T1: int32 = 6;
+const R_T2: int32 = 7;
+const R_T3: int32 = 8;
+const R_T4: int32 = 9;
+const R_T5: int32 = 10;
+const R_T6: int32 = 11;
+const R_T7: int32 = 12;
+
+fn crx_p384_mset(t: uint32*, d: int32, a: int32) {
+  var i: int32 = 0;
+  while (i < 16) {
+    t[d * 16 + i] = t[a * 16 + i];
+    i = i + 1;
+  }
+}
+
+fn crx_p384_madd(t: uint32*, d: int32, a: int32) {
+  var ctl: uint32 = crx_i31_add(&t[d * 16], &t[a * 16], 1);
+  ctl = ctl | crx_ct_not(crx_i31_sub(&t[d * 16], &g_crx_p384_p[0], 0));
+  crx_i31_sub(&t[d * 16], &g_crx_p384_p[0], ctl);
+}
+
+fn crx_p384_msub(t: uint32*, d: int32, a: int32) {
+  crx_i31_add(&t[d * 16], &g_crx_p384_p[0], crx_i31_sub(&t[d * 16], &t[a * 16], 1));
+}
+
+fn crx_p384_mmul(t: uint32*, d: int32, a: int32, b: int32) {
+  crx_i31_montymul(&t[d * 16], &t[a * 16], &t[b * 16], &g_crx_p384_p[0], CRX_P384_P0I);
+}
+
+// d = 1/d, by exponentiation to p - 2 (the exponent is public); 0 stays 0.
+fn crx_p384_minv(t: uint32*, d: int32, a: int32, b: int32) {
+  var tp: uint8[48];
+  crx_i31_encode(&tp[0], 48, &g_crx_p384_p[0]);
+  tp[47] = tp[47] - 2;
+  crx_i31_modpow(&t[d * 16], &tp[0], 48, &g_crx_p384_p[0], CRX_P384_P0I, &t[a * 16], &t[b * 16]);
+}
+
+fn crx_p384_nz(t: uint32*, d: int32) -> uint32 {
+  return crx_ct_not(crx_i31_iszero(&t[d * 16]));
+}
+
+// Doubling formulas:
+//   s = 4*x*y^2
+//   m = 3*(x + z^2)*(x - z^2)
+//   x' = m^2 - 2*s
+//   y' = m*(s - x') - 8*y^4
+//   z' = 2*y*z
+// If y = 0 (order 2, which this curve does not have) or z = 0 (infinity), the
+// result is infinity (z' = 0), as it should; the code works for all points.
+// Cost: 8 multiplications.
+fn crx_p384_code_double(t: uint32*) {
+  // z^2 (in t1).
+  crx_p384_mmul(t, R_T1, R_P1Z, R_P1Z);
+  // x - z^2 (in t2), then x + z^2 (in t1).
+  crx_p384_mset(t, R_T2, R_P1X);
+  crx_p384_msub(t, R_T2, R_T1);
+  crx_p384_madd(t, R_T1, R_P1X);
+  // m = 3*(x + z^2)*(x - z^2) (in t1).
+  crx_p384_mmul(t, R_T3, R_T1, R_T2);
+  crx_p384_mset(t, R_T1, R_T3);
+  crx_p384_madd(t, R_T1, R_T3);
+  crx_p384_madd(t, R_T1, R_T3);
+  // s = 4*x*y^2 (in t2) and 2*y^2 (in t3).
+  crx_p384_mmul(t, R_T3, R_P1Y, R_P1Y);
+  crx_p384_madd(t, R_T3, R_T3);
+  crx_p384_mmul(t, R_T2, R_P1X, R_T3);
+  crx_p384_madd(t, R_T2, R_T2);
+  // x' = m^2 - 2*s.
+  crx_p384_mmul(t, R_P1X, R_T1, R_T1);
+  crx_p384_msub(t, R_P1X, R_T2);
+  crx_p384_msub(t, R_P1X, R_T2);
+  // z' = 2*y*z.
+  crx_p384_mmul(t, R_T4, R_P1Y, R_P1Z);
+  crx_p384_mset(t, R_P1Z, R_T4);
+  crx_p384_madd(t, R_P1Z, R_T4);
+  // y' = m*(s - x') - 8*y^4; 2*y^2 is already in t3.
+  crx_p384_msub(t, R_T2, R_P1X);
+  crx_p384_mmul(t, R_P1Y, R_T1, R_T2);
+  crx_p384_mmul(t, R_T4, R_T3, R_T3);
+  crx_p384_msub(t, R_P1Y, R_T4);
+  crx_p384_msub(t, R_P1Y, R_T4);
+}
+
+// Addition formulas:
+//   u1 = x1 * z2^2
+//   u2 = x2 * z1^2
+//   s1 = y1 * z2^3
+//   s2 = y2 * z1^3
+//   h = u2 - u1
+//   r = s2 - s1
+//   x3 = r^2 - h^3 - 2 * u1 * h^2
+//   y3 = r * (u1 * h^2 - x3) - s1 * h^3
+//   z3 = h * z1 * z2
+// These do not handle P1 = infinity, P2 = infinity, or P1 = P2 (all give
+// z3 = 0, or a wrong point), and the other cases are right. The returned flag
+// is 0 when r = 0, which is how P1 = P2 is told from P1 + P2 = infinity by the
+// callers: the result is infinity either way, and the flag is 1 only for
+// P1 + P2 = infinity (assuming both inputs are finite).
+// Cost: 16 multiplications.
+fn crx_p384_code_add(t: uint32*) -> uint32 {
+  var r: uint32 = 1;
+  // u1 = x1*z2^2 (in t1) and s1 = y1*z2^3 (in t3).
+  crx_p384_mmul(t, R_T3, R_P2Z, R_P2Z);
+  crx_p384_mmul(t, R_T1, R_P1X, R_T3);
+  crx_p384_mmul(t, R_T4, R_P2Z, R_T3);
+  crx_p384_mmul(t, R_T3, R_P1Y, R_T4);
+  // u2 = x2*z1^2 (in t2) and s2 = y2*z1^3 (in t4).
+  crx_p384_mmul(t, R_T4, R_P1Z, R_P1Z);
+  crx_p384_mmul(t, R_T2, R_P2X, R_T4);
+  crx_p384_mmul(t, R_T5, R_P1Z, R_T4);
+  crx_p384_mmul(t, R_T4, R_P2Y, R_T5);
+  // h = u2 - u1 (in t2) and r = s2 - s1 (in t4).
+  crx_p384_msub(t, R_T2, R_T1);
+  crx_p384_msub(t, R_T4, R_T3);
+  // The flag is cleared when r = 0.
+  r = r & crx_p384_nz(t, R_T4);
+  // u1*h^2 (in t6) and h^3 (in t5).
+  crx_p384_mmul(t, R_T7, R_T2, R_T2);
+  crx_p384_mmul(t, R_T6, R_T1, R_T7);
+  crx_p384_mmul(t, R_T5, R_T7, R_T2);
+  // x3 = r^2 - h^3 - 2*u1*h^2.
+  crx_p384_mmul(t, R_P1X, R_T4, R_T4);
+  crx_p384_msub(t, R_P1X, R_T5);
+  crx_p384_msub(t, R_P1X, R_T6);
+  crx_p384_msub(t, R_P1X, R_T6);
+  // y3 = r*(u1*h^2 - x3) - s1*h^3.
+  crx_p384_msub(t, R_T6, R_P1X);
+  crx_p384_mmul(t, R_P1Y, R_T4, R_T6);
+  crx_p384_mmul(t, R_T1, R_T5, R_T3);
+  crx_p384_msub(t, R_P1Y, R_T1);
+  // z3 = h*z1*z2.
+  crx_p384_mmul(t, R_T1, R_P1Z, R_P2Z);
+  crx_p384_mmul(t, R_P1Z, R_T1, R_T2);
+  return r;
+}
+
+// Curve check. The coordinates x and y are freshly decoded in P1 (plain, not
+// Montgomery); P2x, P2y and P2z are R^2, b*R and 1. Returns 1 when
+// y^2 != x^3 - 3x + b (the point is NOT on the curve), 0 when it is; z is set
+// to 1 in Montgomery form.
+fn crx_p384_code_check(t: uint32*) -> uint32 {
+  var r: uint32 = 1;
+  // x and y to Montgomery form.
+  crx_p384_mmul(t, R_T1, R_P1X, R_P2X);
+  crx_p384_mmul(t, R_T2, R_P1Y, R_P2X);
+  crx_p384_mset(t, R_P1X, R_T1);
+  crx_p384_mset(t, R_P1Y, R_T2);
+  // x^3 in t1.
+  crx_p384_mmul(t, R_T2, R_P1X, R_P1X);
+  crx_p384_mmul(t, R_T1, R_P1X, R_T2);
+  // Subtract 3*x from t1.
+  crx_p384_msub(t, R_T1, R_P1X);
+  crx_p384_msub(t, R_T1, R_P1X);
+  crx_p384_msub(t, R_T1, R_P1X);
+  // Add b.
+  crx_p384_madd(t, R_T1, R_P2Y);
+  // y^2 in t2.
+  crx_p384_mmul(t, R_T2, R_P1Y, R_P1Y);
+  // The two sides must match.
+  crx_p384_msub(t, R_T1, R_T2);
+  r = r & crx_p384_nz(t, R_T1);
+  // z = 1 (Montgomery form).
+  crx_p384_mmul(t, R_P1Z, R_P2X, R_P2Z);
+  return r;
+}
+
+// Conversion to affine coordinates. P2z is set to 1 (plain).
+fn crx_p384_code_affine(t: uint32*) {
+  // z*R in t1.
+  crx_p384_mset(t, R_T1, R_P1Z);
+  // z^3 in t2.
+  crx_p384_mmul(t, R_T2, R_P1Z, R_P1Z);
+  crx_p384_mmul(t, R_T3, R_P1Z, R_T2);
+  crx_p384_mmul(t, R_T2, R_T3, R_P2Z);
+  // 1/z^3 in t2.
+  crx_p384_minv(t, R_T2, R_T3, R_T4);
+  // y.
+  crx_p384_mset(t, R_T3, R_P1Y);
+  crx_p384_mmul(t, R_P1Y, R_T2, R_T3);
+  // 1/z^2 in t3.
+  crx_p384_mmul(t, R_T3, R_T2, R_T1);
+  // x.
+  crx_p384_mset(t, R_T2, R_P1X);
+  crx_p384_mmul(t, R_P1X, R_T2, R_T3);
+}
+
+// ---------------------------------------------------------------------------
+// Points.
+
+// A point in Jacobian coordinates: three values x, y, z of 16 words each, in
+// Montgomery form; the affine coordinates are X = x / z^2 and Y = y / z^3,
+// and z = 0 for the point at infinity.
+struct CrxP384Jac {
+  c: uint32[48];
+}
+
+// Wipes a point.
+@inline fn crx_p384_wipe_pt(P: CrxP384Jac*) {
+  cr_wipe((uint8*)&P->c[0], 192);
+}
+
+// Wipes a register file.
+@inline fn crx_p384_wipe_regs(t: uint32*) {
+  cr_wipe((uint8*)t, 832);
+}
+
+// x = 1 (plain), with the header of p.
+fn crx_p384_set_one(x: uint32*) {
+  var i: int32 = 0;
+  while (i < 16) {
+    x[i] = 0;
+    i = i + 1;
+  }
+  x[0] = g_crx_p384_p[0];
+  x[1] = 1;
+}
+
+// The point at infinity: z = 0 (all three coordinates zero, with headers).
+fn crx_p384_point_zero(P: CrxP384Jac*) {
+  var i: int32 = 0;
+  while (i < 48) {
+    P->c[i] = 0;
+    i = i + 1;
+  }
+  P->c[0] = g_crx_p384_p[0];
+  P->c[16] = g_crx_p384_p[0];
+  P->c[32] = g_crx_p384_p[0];
+}
+
+fn crx_p384_double(P: CrxP384Jac*) {
+  var t: uint32[208];
+  var i: int32 = 0;
+  while (i < 48) {
+    t[i] = P->c[i];
+    i = i + 1;
+  }
+  crx_p384_code_double(&t[0]);
+  i = 0;
+  while (i < 48) {
+    P->c[i] = t[i];
+    i = i + 1;
+  }
+  crx_p384_wipe_regs(&t[0]);
+}
+
+// P1 = P1 + P2; returns the flag of the addition code (0 when r = 0).
+fn crx_p384_add(P1: CrxP384Jac*, P2: CrxP384Jac*) -> uint32 {
+  var t: uint32[208];
+  var i: int32 = 0;
+  while (i < 48) {
+    t[i] = P1->c[i];
+    t[48 + i] = P2->c[i];
+    i = i + 1;
+  }
+  var r: uint32 = crx_p384_code_add(&t[0]);
+  i = 0;
+  while (i < 48) {
+    P1->c[i] = t[i];
+    i = i + 1;
+  }
+  crx_p384_wipe_regs(&t[0]);
+  return r;
+}
+
+// Multiplies a point by an integer, given as xlen big-endian bytes, assumed
+// below the group order. The base point must not be the point at infinity.
+fn crx_p384_mul_pt(P: CrxP384Jac*, x: uint8*, xlen: int64) {
+  // A double-and-add ladder with a 2-bit window: one addition per two
+  // doublings, the addend chosen among P, 2P, 3P in constant time. Two
+  // doublings and one addition are always done. The addition code cannot
+  // take the point at infinity as an operand, which is the start of the
+  // ladder, so the flag qz (1 while the accumulator is infinity) selects
+  // between the addend itself and the sum.
+  var P2: CrxP384Jac = *P;
+  crx_p384_double(&P2);
+  var P3: CrxP384Jac = *P;
+  crx_p384_add(&P3, &P2);
+
+  var Q: CrxP384Jac;
+  var T: CrxP384Jac;
+  var U: CrxP384Jac;
+  crx_p384_point_zero(&Q);
+  var qz: uint32 = 1;
+  var n: int64 = 0;
+  while (n < xlen) {
+    var k: int32 = 6;
+    while (k >= 0) {
+      crx_p384_double(&Q);
+      crx_p384_double(&Q);
+      T = *P;
+      U = Q;
+      var bits: uint32 = ((uint32)x[n] >> k) & 3;
+      var bnz: uint32 = crx_ct_neq(bits, 0);
+      crx_ct_ccopy(crx_ct_eq(bits, 2), &T.c[0], &P2.c[0], 48);
+      crx_ct_ccopy(crx_ct_eq(bits, 3), &T.c[0], &P3.c[0], 48);
+      crx_p384_add(&U, &T);
+      crx_ct_ccopy(bnz & qz, &Q.c[0], &T.c[0], 48);
+      crx_ct_ccopy(bnz & crx_ct_not(qz), &Q.c[0], &U.c[0], 48);
+      qz = qz & crx_ct_not(bnz);
+      k = k - 2;
+    }
+    n = n + 1;
+  }
+  *P = Q;
+  crx_p384_wipe_pt(&P2);
+  crx_p384_wipe_pt(&P3);
+  crx_p384_wipe_pt(&Q);
+  crx_p384_wipe_pt(&T);
+  crx_p384_wipe_pt(&U);
+}
+
+// Decodes a point (0x04 || X || Y, 97 bytes) into Jacobian coordinates; the
+// point at infinity is not supported. Returns 1 if the point is valid
+// (uncompressed form, coordinates below the modulus, on the curve), else 0;
+// the coordinates are well-formed field elements either way. The hybrid and
+// compressed forms are not accepted (RFC 5480, section 2.2 forbids the first).
+fn crx_p384_decode(P: CrxP384Jac*, src: uint8*, len: int64) -> uint32 {
+  crx_p384_point_zero(P);
+  if (len != 97) {
+    return 0;
+  }
+  var r: uint32 = crx_i31_decode_mod(&P->c[0], &src[1], 48, &g_crx_p384_p[0]);
+  r = r & crx_i31_decode_mod(&P->c[16], &src[49], 48, &g_crx_p384_p[0]);
+  r = r & crx_ct_eq((uint32)src[0], 0x04);
+
+  // Convert the coordinates and check that the point is valid: P2 holds R^2,
+  // b*R and 1.
+  var t: uint32[208];
+  var i: int32 = 0;
+  while (i < 48) {
+    t[i] = P->c[i];
+    i = i + 1;
+  }
+  i = 0;
+  while (i < 14) {
+    t[48 + i] = g_crx_p384_r2[i];
+    t[64 + i] = g_crx_p384_b[i];
+    i = i + 1;
+  }
+  crx_p384_set_one(&t[80]);
+  var bad: uint32 = crx_p384_code_check(&t[0]);
+  i = 0;
+  while (i < 48) {
+    P->c[i] = t[i];
+    i = i + 1;
+  }
+  crx_p384_wipe_regs(&t[0]);
+  return r & crx_ct_not(bad);
+}
+
+// Encodes a point as 0x04 || X || Y (97 bytes). The point must be valid; for
+// the point at infinity the result is all zeros after the 0x04.
+fn crx_p384_encode(dst: uint8*, P: CrxP384Jac*) {
+  var t: uint32[208];
+  var i: int32 = 0;
+  while (i < 48) {
+    t[i] = P->c[i];
+    i = i + 1;
+  }
+  crx_p384_set_one(&t[80]);
+  crx_p384_code_affine(&t[0]);
+  dst[0] = 0x04;
+  crx_i31_encode(&dst[1], 48, &t[0]);
+  crx_i31_encode(&dst[49], 48, &t[16]);
+  crx_p384_wipe_regs(&t[0]);
+}
+
+/// internal: multiplies the point g (glen = 97 bytes, 0x04 || X || Y) by the
+/// integer x (xlen big-endian bytes, below the group order), in place.
+/// Returns 1 if g was a valid point, else 0 (the output is then not
+/// meaningful). Constant time in x.
+export fn crx_p384_mul(g: uint8*, glen: int64, x: uint8*, xlen: int64) -> uint32 {
+  if (glen != 97) {
+    return 0;
+  }
+  var P: CrxP384Jac;
+  var r: uint32 = crx_p384_decode(&P, g, glen);
+  crx_p384_mul_pt(&P, x, xlen);
+  crx_p384_encode(g, &P);
+  crx_p384_wipe_pt(&P);
+  return r;
+}
+
+/// internal: multiplies the P-384 generator by the integer x (xlen
+/// big-endian bytes, nonzero and below the group order) and writes the
+/// result as the 97-byte point 0x04 || X || Y; returns 97. Constant time in
+/// x.
+export fn crx_p384_mulgen(r: uint8*, x: uint8*, xlen: int64) -> int64 {
+  for i in 0..97 {
+    r[i] = g_crx_p384_g[i];
+  }
+  crx_p384_mul(r, 97, x, xlen);
+  return 97;
+}
+
+/// internal: computes x * A + y * B for the points A and B (len = 97 bytes
+/// each, 0x04 || X || Y) and the integers x, y (big-endian, nonzero and below
+/// the group order); B may be null, meaning the generator. The result
+/// replaces A. Returns 1 on success, 0 if a point is invalid or the sum is
+/// the point at infinity. Constant time in x and y.
+export fn crx_p384_muladd(a: uint8*, b: uint8*, len: int64, x: uint8*, xlen: int64, y: uint8*, ylen: int64) -> uint32 {
+  if (len != 97) {
+    return 0;
+  }
+  // Two independent point multiplications, as in BearSSL.
+  var P: CrxP384Jac;
+  var Q: CrxP384Jac;
+  var r: uint32 = crx_p384_decode(&P, a, len);
+  if (b == 0) {
+    r = r & crx_p384_decode(&Q, &g_crx_p384_g[0], len);
+  } else {
+    r = r & crx_p384_decode(&Q, b, len);
+  }
+  crx_p384_mul_pt(&P, x, xlen);
+  crx_p384_mul_pt(&Q, y, ylen);
+
+  // P + Q. The base points are finite and the multipliers are nonzero and
+  // below the order, so P and Q are finite, which leaves two cases: P = Q
+  // (the doubling formula is needed) and P + Q = infinity (an error).
+  var t: uint32 = crx_p384_add(&P, &Q);
+  crx_p384_double(&Q);
+  var z: uint32 = crx_i31_iszero(&P.c[32]);
+
+  // If z is 1, either P + Q = 0 (t = 1) or P = Q (t = 0):
+  //   z = 0, t = 0   return P (normal addition)
+  //   z = 0, t = 1   return P (normal addition)
+  //   z = 1, t = 0   return Q (the doubling case)
+  //   z = 1, t = 1   report an error (P + Q = 0)
+  crx_ct_ccopy(z & crx_ct_not(t), &P.c[0], &Q.c[0], 48);
+  crx_p384_encode(a, &P);
+  r = r & crx_ct_not(z & t);
+  crx_p384_wipe_pt(&P);
+  crx_p384_wipe_pt(&Q);
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Key pairs and ECDH.
+
+// 1 if the 48-byte big-endian scalar d is in [1, n-1], else 0; the time does
+// not depend on d.
+fn crx_p384_scalar_ok(d: uint8*) -> uint32 {
+  // Borrow of d - n: 1 exactly when d < n.
+  var borrow: uint32 = 0;
+  var any: uint32 = 0;
+  var i: int32 = 47;
+  while (i >= 0) {
+    borrow = ((uint32)d[i] - (uint32)g_crx_p384_n[i] - borrow) >> 31;
+    any = any | (uint32)d[i];
+    i = i - 1;
+  }
+  return borrow & crx_ct_neq(any, 0);
+}
+
+/// Generates a P-384 key pair: a uniformly random secret scalar in
+/// [1, n-1] (rejection sampling on 48 random bytes) and its public key, the
+/// uncompressed point 0x04 || X || Y.
+/// in: pk, writable for pk_cap bytes, pk_cap >= 97 (CR_P384_PUBLIC_BYTES); sk
+/// returns: CR_OK; CR_E_ARG (null pointer or negative pk_cap); CR_E_SPACE if
+///   pk_cap < 97 (nothing is written); CR_E_INTERNAL if the kernel random
+///   source fails (sk is wiped)
+/// owns: sk is secret caller memory: cr_wipe(&sk.b[0], 48) when done; pk is public
+/// thread: any thread (no shared state)
+/// example: var pk: uint8[97]; var sk: CrP384Secret; cr_p384_keypair(&pk[0], 97, &sk);
+export fn cr_p384_keypair(pk: uint8*, pk_cap: int64, sk: CrP384Secret*) -> int32 {
+  if (pk == 0 || sk == 0 || pk_cap < 0) { return CR_E_ARG; }
+  if (pk_cap < 97) { return CR_E_SPACE; }
+  // A random 384-bit value is outside [1, n-1] with probability about 2^-190,
+  // so the bound below is never reached with a working random source.
+  var tries: int32 = 0;
+  while (tries < 64) {
+    if (cr_random_bytes(&sk->b[0], 48) != CR_OK) {
+      cr_wipe(&sk->b[0], 48);
+      return CR_E_INTERNAL;
+    }
+    if (crx_p384_scalar_ok(&sk->b[0]) == 1) {
+      crx_p384_mulgen(pk, &sk->b[0], 48);
+      return CR_OK;
+    }
+    tries = tries + 1;
+  }
+  cr_wipe(&sk->b[0], 48);
+  return CR_E_INTERNAL;
+}
+
+/// Computes the public key of a P-384 secret scalar: the uncompressed point
+/// 0x04 || X || Y of d * G.
+/// in: pk, writable for pk_cap bytes, pk_cap >= 97 (CR_P384_PUBLIC_BYTES); sk
+/// returns: CR_OK; CR_E_ARG (null pointer or negative pk_cap); CR_E_SPACE if
+///   pk_cap < 97 (nothing is written); CR_E_KEY if the scalar is 0 or not
+///   lower than the group order n (the first 97 bytes of pk are wiped)
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: if (cr_p384_public_from_secret(&pk[0], 97, &sk) != CR_OK) { reject(); }
+export fn cr_p384_public_from_secret(pk: uint8*, pk_cap: int64, sk: CrP384Secret*) -> int32 {
+  if (pk == 0 || sk == 0 || pk_cap < 0) { return CR_E_ARG; }
+  if (pk_cap < 97) { return CR_E_SPACE; }
+  if (crx_p384_scalar_ok(&sk->b[0]) == 0) {
+    cr_wipe(pk, 97);
+    return CR_E_KEY;
+  }
+  crx_p384_mulgen(pk, &sk->b[0], 48);
+  return CR_OK;
+}
+
+/// Computes the raw ECDH shared secret of P-384: the X coordinate of the
+/// point sk * peer, as 48 big-endian bytes. This is not a key: feed it into
+/// a KDF (cr_hkdf_sha384) with both public keys and a context string. The
+/// peer key is validated: it must be exactly 97 bytes, 0x04 || X || Y, with
+/// X and Y lower than the field prime and the point on the curve (the curve
+/// has prime order, so there are no small subgroups).
+/// in: shared, writable for shared_cap bytes, shared_cap >= 48; sk, our
+///   secret key; peer, readable for peer_len bytes
+/// returns: CR_OK; CR_E_ARG (null pointer, negative shared_cap or peer_len);
+///   CR_E_SPACE if shared_cap < 48 (nothing is written); CR_E_KEY if peer is
+///   not a valid public key (wrong length or format, coordinates out of
+///   range, not on the curve) or sk is 0 or not lower than n (the first 48
+///   bytes of shared are wiped)
+/// owns: shared is secret caller memory: cr_wipe(shared, 48) when done
+/// thread: any thread (no shared state)
+/// example: var z: uint8[48]; if (cr_p384_ecdh(&z[0], 48, &sk, &peer[0], 97) != CR_OK) { reject(); }
+export fn cr_p384_ecdh(shared: uint8*, shared_cap: int64, sk: CrP384Secret*, peer: uint8*, peer_len: int64) -> int32 {
+  if (shared == 0 || sk == 0 || shared_cap < 0 || peer_len < 0) { return CR_E_ARG; }
+  if (peer == 0 && peer_len > 0) { return CR_E_ARG; }
+  if (shared_cap < 48) { return CR_E_SPACE; }
+  cr_wipe(shared, 48);
+  if (peer_len != 97) { return CR_E_KEY; }
+
+  var P: CrxP384Jac;
+  var ok: uint32 = crx_p384_decode(&P, peer, 97);
+  var sok: uint32 = crx_p384_scalar_ok(&sk->b[0]);
+  if (ok == 0 || sok == 0) {
+    crx_p384_wipe_pt(&P);
+    return CR_E_KEY;
+  }
+  crx_p384_mul_pt(&P, &sk->b[0], 48);
+
+  // The result cannot be the point at infinity for a valid point and a
+  // scalar in [1, n-1]; refuse it all the same.
+  if (crx_i31_iszero(&P.c[32]) == 1) {
+    crx_p384_wipe_pt(&P);
+    return CR_E_KEY;
+  }
+  var enc: uint8[97];
+  crx_p384_encode(&enc[0], &P);
+  for i in 0..48 {
+    shared[i] = enc[1 + i];
+  }
+  cr_wipe(&enc[0], 97);
+  crx_p384_wipe_pt(&P);
+  return CR_OK;
+}

@@ -1,0 +1,412 @@
+// The parser: argv words to values.
+//
+// Syntax follows the POSIX Utility Syntax Guidelines (IEEE Std 1003.1-2017,
+// XBD 12.2) with the GNU long-option extensions of getopt_long:
+//   -a -b       short flags         -ab       the same, combined
+//   -o FILE     short with a value  -oFILE    the same, joined (-o=FILE too)
+//   --out FILE  long with a value   --out=FILE
+//   --          everything after it is positional
+//   -           a positional (often "stdin")
+// Options and positionals may be mixed unless args_set_posix is on.
+//
+// A word starting with '-' is not taken as an option's value, except a
+// negative number or a lone "-"; write --opt=-x for such values (clap and
+// argparse do the same). A negative number is a positional when no short
+// option of the command is a digit (argparse's rule).
+
+import "std/core";
+import "std/env";
+import "types";
+import "value";
+import "error";
+
+fn sub(s: string, from: int64) -> string {
+  var r: string;
+  r.chars = s.chars + from;
+  r.length = s.length - (uint64)from;
+  return r;
+}
+
+fn fail(a: Args*, code: int32, opt: int32, token: string) -> int32 {
+  a->err = code;
+  a->err_opt = opt;
+  a->err_token = token;
+  return code;
+}
+
+fn takes_value(kind: int32) -> bool {
+  return kind == ARGS_INT || kind == ARGS_UINT || kind == ARGS_FLOAT || kind == ARGS_STR
+      || kind == ARGS_CHOICE || kind == ARGS_LIST || kind == ARGS_CUSTOM;
+}
+
+fn is_negative_number(s: string) -> bool {
+  if (s.length < (uint64)2 || (int32)s.chars[0] != 45) { return false; }
+  match (args_parse_float(s)) {
+    case Ok(v): { return true; }
+    case Err(e): { return false; }
+  }
+}
+
+// Does the command have a short option that is a digit (-1, -2 ...)?
+fn has_digit_short(a: Args*) -> bool {
+  for i in 0..a->nopts {
+    var c: int32 = (int32)a->opts[i].short_name;
+    if (c >= 48 && c <= 57 && args_opt_in_scope(a, i, a->cmd)) { return true; }
+  }
+  return false;
+}
+
+// Can word w be the value of an option?
+fn value_word(a: Args*, w: string) -> bool {
+  if (w.length < (uint64)2 || (int32)w.chars[0] != 45) { return true; }
+  return is_negative_number(w) && !has_digit_short(a);
+}
+
+// Store text into option i. Returns ARGS_OK or an error code.
+fn apply(a: Args*, i: int32, text: string, token: string) -> int32 {
+  var o: ArgsOpt* = &a->opts[i];
+  switch (o->kind) {
+    case 1: {
+      match (args_parse_bool(text)) {
+        case Ok(b): { *(bool*)o->dest = b; }
+        case Err(e): { a->err_detail = e; return fail(a, ARGS_E_BAD_VALUE, i, text); }
+      }
+    }
+    case 2: {
+      match (args_parse_int(text)) {
+        case Ok(v): { *(int64*)o->dest = v; }
+        case Err(e): { a->err_detail = e; return fail(a, ARGS_E_BAD_VALUE, i, text); }
+      }
+    }
+    case 3: {
+      match (args_parse_int(text)) {
+        case Ok(v): { *(int64*)o->dest = v; }
+        case Err(e): { a->err_detail = e; return fail(a, ARGS_E_BAD_VALUE, i, text); }
+      }
+    }
+    case 4: {
+      match (args_parse_uint(text)) {
+        case Ok(v): { *(uint64*)o->dest = v; }
+        case Err(e): { a->err_detail = e; return fail(a, ARGS_E_BAD_VALUE, i, text); }
+      }
+    }
+    case 5: {
+      match (args_parse_float(text)) {
+        case Ok(v): { *(float64*)o->dest = v; }
+        case Err(e): { a->err_detail = e; return fail(a, ARGS_E_BAD_VALUE, i, text); }
+      }
+    }
+    case 6: { *(string*)o->dest = text; }
+    case 7: {
+      var found: int32 = -1;
+      for k in 0..o->nchoices {
+        if (o->choices[k] == text) { found = k; }
+      }
+      if (found < 0) {
+        a->err_detail = "";
+        return fail(a, ARGS_E_BAD_VALUE, i, text);
+      }
+      *(int32*)o->dest = found;
+    }
+    case 8: {
+      var n: int32 = *o->count_out;
+      if (n >= o->cap) { return fail(a, ARGS_E_FULL, i, token); }
+      var d: string* = (string*)o->dest;
+      d[n] = text;
+      *o->count_out = n + 1;
+    }
+    case 9: {
+      var f: fn(string, rawptr) -> int32 = o->parse_fn;
+      if (f(text, o->dest) != 0) {
+        a->err_detail = "";
+        return fail(a, ARGS_E_BAD_VALUE, i, text);
+      }
+    }
+    default: { }
+  }
+  return ARGS_OK;
+}
+
+// An option given with no value: flags, counts, help, version.
+fn apply_bare(a: Args*, i: int32) -> int32 {
+  var o: ArgsOpt* = &a->opts[i];
+  if (o->kind == ARGS_FLAG) { *(bool*)o->dest = true; }
+  else if (o->kind == ARGS_COUNT) { var p: int64* = (int64*)o->dest; *p = *p + 1; }
+  else if (o->kind == ARGS_HELP) { return ARGS_SHOW_HELP; }
+  else if (o->kind == ARGS_VERSION) { return ARGS_SHOW_VERSION; }
+  return ARGS_OK;
+}
+
+fn find_long(a: Args*, name: string, token: string, out: int32*) -> int32 {
+  for i in 0..a->nopts {
+    if (a->opts[i].long_name.length > (uint64)0 && a->opts[i].long_name == name
+        && args_opt_in_scope(a, i, a->cmd)) {
+      *out = i;
+      return ARGS_OK;
+    }
+  }
+  if (a->abbrev && name.length > (uint64)0) {
+    var hit: int32 = -1;
+    var hits: int32 = 0;
+    for i in 0..a->nopts {
+      var ln: string = a->opts[i].long_name;
+      if (ln.length <= name.length || !args_opt_in_scope(a, i, a->cmd)) { continue; }
+      var same: bool = true;
+      for k in 0..name.length { if (ln.chars[k] != name.chars[k]) { same = false; break; } }
+      if (same) { hit = i; hits = hits + 1; }
+    }
+    if (hits == 1) { *out = hit; return ARGS_OK; }
+    if (hits > 1) { return fail(a, ARGS_E_AMBIGUOUS, -1, token); }
+  }
+  return fail(a, ARGS_E_UNKNOWN, -1, token);
+}
+
+fn find_short(a: Args*, c: int32) -> int32 {
+  for i in 0..a->nopts {
+    if ((int32)a->opts[i].short_name == c && args_opt_in_scope(a, i, a->cmd)) { return i; }
+  }
+  return -1;
+}
+
+fn word_in(names: string, w: string) -> bool {
+  var start: int64 = 0;
+  var n: int64 = (int64)names.length;
+  var i: int64 = 0;
+  while (i <= n) {
+    if (i == n || (int32)names.chars[i] == 32) {
+      if (i - start == (int64)w.length && i > start) {
+        var same: bool = true;
+        for k in 0..w.length { if (names.chars[start + (int64)k] != w.chars[k]) { same = false; break; } }
+        if (same) { return true; }
+      }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+// The subcommand of cmd named w (or with w as an alias), or -1.
+export fn args_find_cmd(a: Args*, cmd: int32, w: string) -> int32 {
+  for i in 1..a->ncmds {
+    var c: ArgsCmd* = &a->cmds[i];
+    if (c->parent != cmd) { continue; }
+    if (c->name == w || word_in(c->aliases, w)) { return i; }
+  }
+  return -1;
+}
+
+export fn args_has_subs(a: Args*, cmd: int32) -> bool {
+  for i in 1..a->ncmds { if (a->cmds[i].parent == cmd) { return true; } }
+  return false;
+}
+
+fn has_pos(a: Args*, cmd: int32) -> bool {
+  for i in 0..a->npos { if (a->pos[i].cmd == cmd) { return true; } }
+  return false;
+}
+
+// The n-th positional of cmd, or -1.
+fn nth_pos(a: Args*, cmd: int32, n: int32) -> int32 {
+  var k: int32 = 0;
+  for i in 0..a->npos {
+    if (a->pos[i].cmd != cmd) { continue; }
+    if (k == n || a->pos[i].rest && k <= n) { return i; }
+    k = k + 1;
+  }
+  return -1;
+}
+
+fn reset(a: Args*) {
+  a->cmd = 0;
+  a->err = 0;
+  a->err_opt = -1;
+  a->err_pos = -1;
+  a->err_token = "";
+  a->err_detail = "";
+  a->msg_len = 0;
+  for i in 0..a->nopts {
+    a->opts[i].seen = 0;
+    a->opts[i].from_env = false;
+    if (a->opts[i].kind == ARGS_LIST) { *a->opts[i].count_out = 0; }
+  }
+  for i in 0..a->npos {
+    a->pos[i].seen = 0;
+    if (a->pos[i].rest) { *a->pos[i].count_out = 0; }
+  }
+}
+
+// Parse the words after the program name. Returns ARGS_OK, ARGS_SHOW_HELP,
+// ARGS_SHOW_VERSION, or an error code (args_error_text explains it).
+// a->cmd is the subcommand that was chosen (0 for the root).
+// Parsing the same Args again starts over: list and rest counts go back
+// to 0, while other values from the last run stay in the caller's variables.
+export fn args_parse(a: Args*, words: string[]) -> int32 {
+  reset(a);
+  if (a->spec_err.length > (uint64)0) { return fail(a, ARGS_E_SPEC, -1, ""); }
+  var n: int64 = (int64)words.length;
+  var only_pos: bool = false;
+  var npos: int32 = 0;          // positionals taken in the current command
+  var i: int64 = 0;
+  while (i < n) {
+    var w: string = words[i];
+    i = i + 1;
+    var dash: bool = !only_pos && w.length >= (uint64)2 && (int32)w.chars[0] == 45;
+    if (dash && w.length == (uint64)2 && (int32)w.chars[1] == 45) {
+      only_pos = true;
+      continue;
+    }
+    if (dash && (int32)w.chars[1] == 45) {
+      // --name or --name=value
+      var body: string = sub(w, 2);
+      var name: string = body;
+      var has_eq: bool = false;
+      var val: string = "";
+      for k in 0..body.length {
+        if ((int32)body.chars[k] == 61) {
+          name.length = (uint64)k;
+          val = sub(body, (int64)k + 1);
+          has_eq = true;
+          break;
+        }
+      }
+      var oi: int32 = -1;
+      var r: int32 = find_long(a, name, w, &oi);
+      if (r != ARGS_OK) { return r; }
+      var o: ArgsOpt* = &a->opts[oi];
+      o->seen = o->seen + 1;
+      if (takes_value(o->kind)) {
+        if (!has_eq) {
+          if (i >= n || !value_word(a, words[i])) { return fail(a, ARGS_E_NO_VALUE, oi, w); }
+          val = words[i];
+          i = i + 1;
+        }
+        r = apply(a, oi, val, w);
+        if (r != ARGS_OK) { return r; }
+      } else if (has_eq) {
+        if (o->kind != ARGS_FLAG) { return fail(a, ARGS_E_EXTRA_VALUE, oi, w); }
+        r = apply(a, oi, val, w);
+        if (r != ARGS_OK) { return r; }
+      } else {
+        r = apply_bare(a, oi);
+        if (r != ARGS_OK) { return r; }
+      }
+      continue;
+    }
+    if (dash && !(is_negative_number(w) && !has_digit_short(a))) {
+      // -abc, -oVALUE, -o VALUE
+      var j: int64 = 1;
+      var len: int64 = (int64)w.length;
+      while (j < len) {
+        var c: int32 = (int32)w.chars[j];
+        var oi: int32 = find_short(a, c);
+        if (oi < 0) {
+          // show it as "-x", even from inside a cluster
+          a->short_tok[0] = (uint8)45;
+          a->short_tok[1] = (uint8)c;
+          var t: string;
+          t.chars = &a->short_tok[0];
+          t.length = 2;
+          return fail(a, ARGS_E_UNKNOWN, -1, t);
+        }
+        var o: ArgsOpt* = &a->opts[oi];
+        o->seen = o->seen + 1;
+        j = j + 1;
+        if (takes_value(o->kind)) {
+          var val: string;
+          if (j < len) {
+            if ((int32)w.chars[j] == 61) { j = j + 1; }
+            val = sub(w, j);
+          } else {
+            if (i >= n || !value_word(a, words[i])) { return fail(a, ARGS_E_NO_VALUE, oi, w); }
+            val = words[i];
+            i = i + 1;
+          }
+          var r: int32 = apply(a, oi, val, w);
+          if (r != ARGS_OK) { return r; }
+          break;
+        }
+        var r2: int32 = apply_bare(a, oi);
+        if (r2 != ARGS_OK) { return r2; }
+      }
+      continue;
+    }
+    // A positional word, or a subcommand.
+    if (!only_pos && npos == 0 && args_has_subs(a, a->cmd)) {
+      var sc: int32 = args_find_cmd(a, a->cmd, w);
+      if (sc > 0) {
+        a->cmd = sc;
+        continue;
+      }
+      if (w == "help" && args_find_cmd(a, a->cmd, "help") < 0) {
+        // "prog help sub ..." shows the help for that command.
+        while (i < n) {
+          var hc: int32 = args_find_cmd(a, a->cmd, words[i]);
+          if (hc < 0) { return fail(a, ARGS_E_UNKNOWN_CMD, -1, words[i]); }
+          a->cmd = hc;
+          i = i + 1;
+        }
+        return ARGS_SHOW_HELP;
+      }
+      if (!has_pos(a, a->cmd)) { return fail(a, ARGS_E_UNKNOWN_CMD, -1, w); }
+    }
+    var pi: int32 = nth_pos(a, a->cmd, npos);
+    if (pi < 0) { return fail(a, ARGS_E_TOO_MANY, -1, w); }
+    var p: ArgsPos* = &a->pos[pi];
+    if (p->rest) {
+      if (*p->count_out >= p->cap) { a->err_pos = pi; return fail(a, ARGS_E_FULL, -1, w); }
+      p->dest[*p->count_out] = w;
+      *p->count_out = *p->count_out + 1;
+    } else {
+      *p->dest = w;
+    }
+    p->seen = p->seen + 1;
+    npos = npos + 1;
+    if (a->posix) { only_pos = true; }
+  }
+  return args_finish(a);
+}
+
+// After the words: environment fallbacks, then required checks.
+fn args_finish(a: Args*) -> int32 {
+  if (a->cmds[a->cmd].need_sub) { return fail(a, ARGS_E_NEED_CMD, -1, ""); }
+  for i in 0..a->nopts {
+    var o: ArgsOpt* = &a->opts[i];
+    if (o->seen > 0 || o->env.length == (uint64)0) { continue; }
+    if (!args_is_ancestor(a, o->cmd, a->cmd)) { continue; }
+    match (env_get(o->env)) {
+      case Some(v): {
+        o->from_env = true;
+        var r: int32 = apply(a, i, v, v);
+        if (r != ARGS_OK) { return r; }
+      }
+      case None: { }
+    }
+  }
+  for i in 0..a->nopts {
+    var o: ArgsOpt* = &a->opts[i];
+    if (o->required && o->seen == 0 && !o->from_env && args_is_ancestor(a, o->cmd, a->cmd)) {
+      return fail(a, ARGS_E_MISSING, i, "");
+    }
+  }
+  for i in 0..a->npos {
+    var p: ArgsPos* = &a->pos[i];
+    if (p->cmd == a->cmd && p->required && p->seen == 0) {
+      a->err_pos = i;
+      return fail(a, ARGS_E_MISSING_POS, -1, "");
+    }
+  }
+  return ARGS_OK;
+}
+
+// How many times option i was given on the command line.
+export fn args_seen(a: Args*, opt: int32) -> int32 {
+  if (opt < 0 || opt >= a->nopts) { return 0; }
+  return a->opts[opt].seen;
+}
+
+// Was option i set, on the command line or from its environment variable?
+export fn args_is_set(a: Args*, opt: int32) -> bool {
+  if (opt < 0 || opt >= a->nopts) { return false; }
+  return a->opts[opt].seen > 0 || a->opts[opt].from_env;
+}

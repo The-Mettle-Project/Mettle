@@ -1,0 +1,161 @@
+// System: host name, OS release, kernel, architecture, uptime, boot time,
+// load averages and logged-in users.
+//   /proc/sys/kernel/{hostname,ostype,osrelease,arch}, /etc/os-release
+//   (os-release(5)), /proc/uptime, /proc/loadavg, /run/utmp (utmp(5)).
+import "std/mem";
+import "std/fs";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+import "arch_x86_64.mettle" if x86_64;
+import "arch_aarch64.mettle" if aarch64;
+
+export struct SysinfoLxSystem {
+  perm: SysinfoLxPool;     // strings that never change
+  pools: SysinfoLxPools;   // the host name
+  fd_uptime: int64;
+  fd_loadavg: int64;
+  fd_hostname: int64;
+}
+
+// One value of os-release text: KEY=value, KEY="value" or KEY='value'.
+// Returns an empty view when the key is missing.
+export fn sysinfo_lx_osrel_value(text: string, key: string) -> string {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, key) && s.i + (int64)key.length < s.n && s.p[s.i + (int64)key.length] == (uint8)61) {
+      s.i = s.i + (int64)key.length + 1;
+      var v: string = sysinfo_lx_trim(sysinfo_lx_line(&s));
+      var n: int64 = (int64)v.length;
+      if (n >= 2 && (v[0] == '"' || v[0] == '\'') && v[n - 1] == v[0]) {
+        return sysinfo_lx_view(v.chars + 1, n - 2);
+      }
+      return v;
+    }
+    sysinfo_lx_next_line(&s);
+  }
+  return sysinfo_lx_view(s.p, 0);
+}
+
+// Fills uptime, load and task counts from /proc/uptime and /proc/loadavg text.
+export fn sysinfo_lx_system_parse_uptime(out: SysinfoSystem*, text: string) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  if (s.n > 0) { out->uptime_s = sysinfo_lx_f64(&s); }
+}
+
+export fn sysinfo_lx_system_parse_loadavg(out: SysinfoSystem*, text: string) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  if (s.n == 0) { return; }
+  out->load1 = sysinfo_lx_f64(&s);
+  out->load5 = sysinfo_lx_f64(&s);
+  out->load15 = sysinfo_lx_f64(&s);
+  out->procs_running = (int32)sysinfo_lx_u64(&s);
+  sysinfo_lx_eat(&s, (uint8)47);
+  out->procs_total = (int32)sysinfo_lx_u64(&s);
+}
+
+// Counts USER_PROCESS records in utmp data (384-byte records on 64-bit
+// glibc systems; ut_type is the first 16-bit field).
+export fn sysinfo_lx_utmp_users(p: uint8*, n: int64) -> int32 {
+  var users: int32 = 0;
+  var k: int64 = 0;
+  while (k + 384 <= n) {
+    var t: int16 = *((int16*)(p + k));
+    if (t == (int16)7) { users = users + 1; }
+    k = k + 384;
+  }
+  return users;
+}
+
+// Counts logind sessions in /run/systemd/sessions, for systems that no
+// longer keep utmp. Service-manager and background sessions are left out,
+// which matches what who(1) lists. Returns -1 when the folder is missing.
+fn sysinfo_lx_logind_users(c: SysinfoLxCtx*) -> int32 {
+  var dir: SysinfoLxPath;
+  sysinfo_lx_path_at(&dir, c->root, "/run/systemd/sessions");
+  var d: FsDir;
+  var e: FsDirEntry;
+  if (fs_dir_open(sysinfo_lx_path_str(&dir), &d) != 0) { return -1; }
+  var users: int32 = 0;
+  var p: SysinfoLxPath;
+  while (fs_dir_next(&d, &e) == 1) {
+    if (e.kind != FS_FILE || sysinfo_lx_ends(e.name, ".ref")) { continue; }
+    p = dir;
+    sysinfo_lx_path_add(&p, "/");
+    sysinfo_lx_path_add(&p, e.name);
+    var n: int64 = sysinfo_lx_slurp(sysinfo_lx_path_str(&p), &c->buf2);
+    if (n <= 0) { continue; }
+    var cls: string = sysinfo_lx_osrel_value(sysinfo_lx_view(c->buf2.p, n), "CLASS");
+    if (sysinfo_lx_starts(cls, "manager") || sysinfo_lx_starts(cls, "background") || sysinfo_lx_eq(cls, "none")) { continue; }
+    users = users + 1;
+  }
+  fs_dir_close(&d);
+  return users;
+}
+
+fn sysinfo_lx_system_small(c: SysinfoLxCtx*, pool: SysinfoLxPool*, rest: string) -> string {
+  var tmp: uint8[256];
+  var p: SysinfoLxPath;
+  var n: int64 = sysinfo_lx_read_small(sysinfo_lx_ctx_path(c, &p, rest), &tmp[0], 256);
+  return sysinfo_lx_pool_add_bytes(pool, &tmp[0], n);
+}
+
+fn sysinfo_lx_system_static(st: SysinfoLxSystem*, c: SysinfoLxCtx*, out: SysinfoSystem*) {
+  var pool: SysinfoLxPool* = &st->perm;
+  out->kernel_name = sysinfo_lx_system_small(c, pool, "/proc/sys/kernel/ostype");
+  if (out->kernel_name.length == (uint64)0) { out->kernel_name = "Linux"; }
+  out->kernel_version = sysinfo_lx_system_small(c, pool, "/proc/sys/kernel/osrelease");
+  out->arch = sysinfo_lx_system_small(c, pool, "/proc/sys/kernel/arch");
+  if (out->arch.length == (uint64)0) { out->arch = SYSINFO_LX_ARCH; }
+  var p: SysinfoLxPath;
+  var n: int64 = sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &p, "/etc/os-release"), &c->buf);
+  if (n <= 0) { n = sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &p, "/usr/lib/os-release"), &c->buf); }
+  var t: string = sysinfo_lx_view(c->buf.p, n);
+  out->os_name = sysinfo_lx_pool_add(pool, sysinfo_lx_osrel_value(t, "NAME"));
+  if (out->os_name.length == (uint64)0) { out->os_name = "Linux"; }
+  out->os_version = sysinfo_lx_pool_add(pool, sysinfo_lx_osrel_value(t, "VERSION_ID"));
+  out->os_id = sysinfo_lx_pool_add(pool, sysinfo_lx_osrel_value(t, "ID"));
+  if (out->os_id.length == (uint64)0) { out->os_id = "linux"; }
+  out->os_pretty = sysinfo_lx_pool_add(pool, sysinfo_lx_osrel_value(t, "PRETTY_NAME"));
+  if (out->os_pretty.length == (uint64)0) { out->os_pretty = out->os_name; }
+}
+
+export fn sysinfo_lx_system_init(st: SysinfoLxSystem*, c: SysinfoLxCtx*, out: SysinfoSystem*) -> int32 {
+  var p: SysinfoLxPath;
+  st->fd_uptime = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/uptime"));
+  st->fd_loadavg = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/loadavg"));
+  st->fd_hostname = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/sys/kernel/hostname"));
+  sysinfo_lx_system_static(st, c, out);
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_system_refresh(st: SysinfoLxSystem*, c: SysinfoLxCtx*, out: SysinfoSystem*) -> int32 {
+  var status: int32 = SYSINFO_OK;
+  var tmp: uint8[256];
+  // The host name can change, so it is read every time into the other pool.
+  var n: int64 = sysinfo_lx_fd_small(st->fd_hostname, &tmp[0], 256);
+  var pool: SysinfoLxPool* = sysinfo_lx_pools_next(&st->pools);
+  out->hostname = sysinfo_lx_pool_add_bytes(pool, &tmp[0], n);
+  n = sysinfo_lx_fd_small(st->fd_uptime, &tmp[0], 256);
+  if (n > 0) { sysinfo_lx_system_parse_uptime(out, sysinfo_lx_view(&tmp[0], n)); }
+  else { out->uptime_s = -1.0; status = SYSINFO_E_IO; }
+  out->boot_time = c->boot_time;
+  n = sysinfo_lx_fd_small(st->fd_loadavg, &tmp[0], 256);
+  if (n > 0) { sysinfo_lx_system_parse_loadavg(out, sysinfo_lx_view(&tmp[0], n)); }
+  else { out->load1 = -1.0; out->load5 = -1.0; out->load15 = -1.0; status = SYSINFO_E_IO; }
+  var p: SysinfoLxPath;
+  n = sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &p, "/run/utmp"), &c->buf);
+  if (n < 0) { n = sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &p, "/var/run/utmp"), &c->buf); }
+  if (n >= 0) { out->users = sysinfo_lx_utmp_users(c->buf.p, n); }
+  else { out->users = sysinfo_lx_logind_users(c); }
+  out->status = status;
+  return status;
+}
+
+export fn sysinfo_lx_system_free(st: SysinfoLxSystem*) {
+  sysinfo_lx_close(st->fd_uptime);
+  sysinfo_lx_close(st->fd_loadavg);
+  sysinfo_lx_close(st->fd_hostname);
+  sysinfo_lx_pools_free(&st->pools);
+  sysinfo_lx_pool_free(&st->perm);
+}

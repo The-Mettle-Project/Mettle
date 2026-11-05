@@ -1,0 +1,277 @@
+// Match finders. Each one parses the block b[s .. end] into sequences in
+// the context's store. Matches never start before `low` (the window start)
+// and never run past `end`.
+//
+//   fast:  one hash table, skips ahead faster in data that does not match
+//   dfast: a long (8 byte) and a short hash table
+//   lazy:  hash chains with greedy, lazy or two-step lazy choice
+
+import "std/mem";
+import "../core/buf";
+import "common";
+import "ectx";
+
+@inline fn lowest(e: PzsEnc*, end: int64) -> int64 {
+  var low: int64 = end - e->window;
+  if (low < 0) { low = 0; }
+  return low;
+}
+
+@inline fn rep_ok(e: PzsEnc*, ip: int64, r: uint32, low: int64) -> bool {
+  var rr: int64 = (int64)r;
+  return rr > 0 && ip - rr >= low && press_rd32(e->b + ip) == press_rd32(e->b + ip - rr);
+}
+
+// After a match ends at ip, takes any matches at the second repeat offset.
+// Returns the new ip (also the new anchor).
+fn imm_rep(e: PzsEnc*, ip0: int64, ilimit: int64, end: int64, low: int64) -> int64 {
+  var ip: int64 = ip0;
+  // The test sits in the loop header: a release-build bug drops a
+  // `break` taken on a value that the loop body changes afterwards.
+  while (ip <= ilimit && rep_ok(e, ip, e->srep[1], low)) {
+    var r1: uint32 = e->srep[1];
+    var ml: int64 = pzs_count(e->b, ip + 4, ip + 4 - (int64)r1, end) + 4;
+    pzs_store(e, ip, 0, (int64)r1, ml);
+    ip = ip + ml;
+  }
+  return ip;
+}
+
+/// Fast single hash table parser (levels 1 and 2).
+export fn pzs_fast(e: PzsEnc*, s: int64, end: int64) {
+  var b: uint8* = e->b;
+  var ht: uint32* = e->ht;
+  var hlog: int32 = e->hlog;
+  var mls: int32 = e->mml;
+  var low: int64 = lowest(e, end);
+  var ip: int64 = s;
+  var anchor: int64 = s;
+  if (ip == 0) { ip = 1; }
+  var ilimit: int64 = end - 8;
+  while (ip < ilimit) {
+    var h: uint64 = pzs_hash(b + ip, mls, hlog);
+    var cand: int64 = (int64)ht[h];
+    ht[h] = (uint32)ip;
+    var start: int64 = ip;
+    var ml: int64 = 0;
+    var r0: uint32 = e->srep[0];
+    if (rep_ok(e, ip + 1, r0, low)) {
+      start = ip + 1;
+      ml = pzs_count(b, start + 4, start + 4 - (int64)r0, end) + 4;
+      pzs_store(e, anchor, start - anchor, (int64)r0, ml);
+    } else if (cand >= low && cand < ip && press_rd32(b + cand) == press_rd32(b + ip)) {
+      ml = pzs_count(b, ip + 4, cand + 4, end) + 4;
+      var c: int64 = cand;
+      while (start > anchor && c > low && b[start - 1] == b[c - 1]) { start = start - 1; c = c - 1; ml = ml + 1; }
+      pzs_store(e, anchor, start - anchor, ip - cand, ml);
+    } else {
+      ip = ip + ((ip - anchor) >> 6) + 1;
+      continue;
+    }
+    ip = start + ml;
+    anchor = ip;
+    if (ip <= ilimit) {
+      ht[pzs_hash(b + start + 2, mls, hlog)] = (uint32)(start + 2);
+      ht[pzs_hash(b + ip - 2, mls, hlog)] = (uint32)(ip - 2);
+      ip = imm_rep(e, ip, ilimit, end, low);
+      anchor = ip;
+    }
+  }
+  pzs_store_last(e, anchor, end);
+}
+
+/// Double hash table parser (levels 3 and 4).
+export fn pzs_dfast(e: PzsEnc*, s: int64, end: int64) {
+  var b: uint8* = e->b;
+  var hl: uint32* = e->ht;
+  var hs: uint32* = e->ht2;
+  var hlog: int32 = e->hlog;
+  var slog: int32 = e->clog;
+  var mls: int32 = e->mml;
+  var low: int64 = lowest(e, end);
+  var ip: int64 = s;
+  var anchor: int64 = s;
+  if (ip == 0) { ip = 1; }
+  var ilimit: int64 = end - 8;
+  while (ip < ilimit) {
+    var h8: uint64 = pzs_hash(b + ip, 8, hlog);
+    var h4: uint64 = pzs_hash(b + ip, mls, slog);
+    var cl: int64 = (int64)hl[h8];
+    var cs: int64 = (int64)hs[h4];
+    hl[h8] = (uint32)ip;
+    hs[h4] = (uint32)ip;
+    var start: int64 = ip;
+    var ml: int64 = 0;
+    var off: int64 = 0;
+    var r0: uint32 = e->srep[0];
+    if (rep_ok(e, ip + 1, r0, low)) {
+      start = ip + 1;
+      ml = pzs_count(b, start + 4, start + 4 - (int64)r0, end) + 4;
+      pzs_store(e, anchor, start - anchor, (int64)r0, ml);
+    } else {
+      var cand: int64 = -1;
+      if (cl >= low && cl < ip && press_rd64(b + cl) == press_rd64(b + ip)) {
+        ml = pzs_count(b, ip + 8, cl + 8, end) + 8;
+        cand = cl;
+      } else if (cs >= low && cs < ip && press_rd32(b + cs) == press_rd32(b + ip)) {
+        var h8b: uint64 = pzs_hash(b + ip + 1, 8, hlog);
+        var c3: int64 = (int64)hl[h8b];
+        hl[h8b] = (uint32)(ip + 1);
+        if (c3 >= low && c3 < ip + 1 && press_rd64(b + c3) == press_rd64(b + ip + 1)) {
+          start = ip + 1;
+          ml = pzs_count(b, start + 8, c3 + 8, end) + 8;
+          cand = c3;
+        } else {
+          ml = pzs_count(b, ip + 4, cs + 4, end) + 4;
+          cand = cs;
+        }
+      } else {
+        ip = ip + ((ip - anchor) >> 7) + 1;
+        continue;
+      }
+      off = start - cand;
+      var c: int64 = cand;
+      while (start > anchor && c > low && b[start - 1] == b[c - 1]) { start = start - 1; c = c - 1; ml = ml + 1; }
+      pzs_store(e, anchor, start - anchor, off, ml);
+    }
+    ip = start + ml;
+    anchor = ip;
+    if (ip <= ilimit) {
+      var i2: int64 = start + 2;
+      hl[pzs_hash(b + i2, 8, hlog)] = (uint32)i2;
+      hs[pzs_hash(b + i2, mls, slog)] = (uint32)i2;
+      hl[pzs_hash(b + ip - 2, 8, hlog)] = (uint32)(ip - 2);
+      hs[pzs_hash(b + ip - 1, mls, slog)] = (uint32)(ip - 1);
+      ip = imm_rep(e, ip, ilimit, end, low);
+      anchor = ip;
+    }
+  }
+  pzs_store_last(e, anchor, end);
+}
+
+/// Adds positions next_up .. target-1 to the hash chains.
+@inline export fn pzs_chain_insert(e: PzsEnc*, target: int64) {
+  var b: uint8* = e->b;
+  var i: int64 = e->next_up;
+  var cm: int64 = e->csize - 1;
+  while (i < target) {
+    var h: uint64 = pzs_hash(b + i, e->mml, e->hlog);
+    e->ct[i & cm] = e->ht[h];
+    e->ht[h] = (uint32)i;
+    i = i + 1;
+  }
+  if (target > e->next_up) { e->next_up = target; }
+}
+
+/// Finds the longest match at ip on the hash chain. Sets *off and returns
+/// the length (0 when shorter than 4).
+export fn pzs_chain_search(e: PzsEnc*, ip: int64, end: int64, low: int64, off: int64*) -> int64 {
+  pzs_chain_insert(e, ip + 1);
+  var b: uint8* = e->b;
+  var cm: int64 = e->csize - 1;
+  var minChain: int64 = ip - e->csize;
+  if (minChain < low) { minChain = low; }
+  var cand: int64 = (int64)e->ct[ip & cm];
+  var tries: int32 = 1 << e->slog;
+  var best: int64 = 3;
+  var limit: int64 = end - ip;
+  var tl: int64 = (int64)e->tlen;
+  if (tl < 8) { tl = 8; }
+  var w: uint32 = press_rd32(b + ip);
+  while (cand >= minChain && cand < ip && tries > 0) {
+    tries = tries - 1;
+    if (b[cand + best] == b[ip + best] && press_rd32(b + cand) == w) {
+      var len: int64 = pzs_count(b, ip + 4, cand + 4, end) + 4;
+      if (len > best) {
+        best = len;
+        *off = ip - cand;
+        if (len >= limit || len >= tl * 8) { break; }
+      }
+    }
+    if (best >= limit) { break; }
+    cand = (int64)e->ct[cand & cm];
+  }
+  if (best < 4) { return 0; }
+  return best;
+}
+
+/// Hash chain parser with lazy matching. depth 0 is greedy, 1 checks the
+/// next position, 2 checks the next two.
+export fn pzs_lazy(e: PzsEnc*, s: int64, end: int64, depth: int32) {
+  var b: uint8* = e->b;
+  var low: int64 = lowest(e, end);
+  var ip: int64 = s;
+  var anchor: int64 = s;
+  if (ip == 0) { ip = 1; }
+  var ilimit: int64 = end - 8;
+  if (e->next_up < low) { e->next_up = low; }
+  while (ip < ilimit) {
+    var ml: int64 = 0;
+    var off: int64 = 0;
+    var start: int64 = ip + 1;
+    var isrep: bool = false;
+    var r0: uint32 = e->srep[0];
+    if (rep_ok(e, ip + 1, r0, low)) {
+      ml = pzs_count(b, ip + 5, ip + 5 - (int64)r0, end) + 4;
+      off = (int64)r0;
+      isrep = true;
+    }
+    if (!(isrep && depth == 0)) {
+      var o2: int64 = 0;
+      var ml2: int64 = pzs_chain_search(e, ip, end, low, &o2);
+      if (ml2 > ml) { ml = ml2; off = o2; start = ip; isrep = false; }
+    }
+    if (ml < 4) {
+      ip = ip + ((ip - anchor) >> 8) + 1;
+      continue;
+    }
+    if (depth >= 1) {
+      while (ip < ilimit) {
+        ip = ip + 1;
+        var oc: int64 = off + 3;
+        if (isrep) { oc = 1; }
+        if (rep_ok(e, ip, r0, low)) {
+          var mr: int64 = pzs_count(b, ip + 4, ip + 4 - (int64)r0, end) + 4;
+          if (mr * 3 > ml * 3 - (int64)pzs_hb32((uint32)oc) + 1) {
+            ml = mr; off = (int64)r0; start = ip; isrep = true; oc = 1;
+          }
+        }
+        var o3: int64 = 0;
+        var m3: int64 = pzs_chain_search(e, ip, end, low, &o3);
+        if (m3 >= 4 && m3 * 4 - (int64)pzs_hb32((uint32)(o3 + 3)) > ml * 4 - (int64)pzs_hb32((uint32)oc) + 4) {
+          ml = m3; off = o3; start = ip; isrep = false;
+          continue;
+        }
+        if (depth == 2 && ip < ilimit) {
+          ip = ip + 1;
+          if (isrep) { oc = 1; } else { oc = off + 3; }
+          if (rep_ok(e, ip, r0, low)) {
+            var mr2: int64 = pzs_count(b, ip + 4, ip + 4 - (int64)r0, end) + 4;
+            if (mr2 * 4 > ml * 4 - (int64)pzs_hb32((uint32)oc) + 1) {
+              ml = mr2; off = (int64)r0; start = ip; isrep = true; oc = 1;
+            }
+          }
+          var o4: int64 = 0;
+          var m4: int64 = pzs_chain_search(e, ip, end, low, &o4);
+          if (m4 >= 4 && m4 * 4 - (int64)pzs_hb32((uint32)(o4 + 3)) > ml * 4 - (int64)pzs_hb32((uint32)oc) + 7) {
+            ml = m4; off = o4; start = ip; isrep = false;
+            continue;
+          }
+        }
+        break;
+      }
+    }
+    if (!isrep) {
+      while (start > anchor && start - off > low && b[start - 1] == b[start - 1 - off]) {
+        start = start - 1;
+        ml = ml + 1;
+      }
+    }
+    pzs_store(e, anchor, start - anchor, off, ml);
+    ip = start + ml;
+    anchor = ip;
+    ip = imm_rep(e, ip, ilimit, end, low);
+    anchor = ip;
+  }
+  pzs_store_last(e, anchor, end);
+}

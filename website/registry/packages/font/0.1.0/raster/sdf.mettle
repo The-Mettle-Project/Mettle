@@ -1,0 +1,505 @@
+// Signed distance fields: single-channel SDF and multi-channel MSDF.
+//
+// MSDF follows msdfgen (Viktor Chlumsky, MIT licence): edges are coloured
+// so that each corner joins edges of different colours (edgeColoringSimple
+// with a 3 radian angle threshold), each channel stores the signed
+// pseudo-distance to the nearest edge of its colour, the sign is then
+// checked against the real non-zero fill, and pixels whose channels clash
+// with a neighbour are set to their median (msdfErrorCorrection).
+//
+// Differences from msdfgen: curves are cut into short lines (no piece
+// strays more than 1/100 pixel) and distances are measured to those lines,
+// so there is no cubic equation solving. Pseudo-distance at an edge's two
+// ends uses the end tangents, as msdfgen does.
+//
+// Pixel values: 128 is the outline, larger is inside. A distance of
+// `spread` pixels reaches 0 (outside) or 255 (inside).
+
+import "std/mem";
+import "std/math";
+import "font/core/vec";
+import "font/sfnt/face";
+import "font/outline/path";
+import "font/outline/outline";
+import "raster";
+
+// One short straight piece of an edge, in pixel space (y down).
+struct Seg { ax: float32; ay: float32; bx: float32; by: float32; edge: int32; }
+
+// One original outline edge: its pieces, colour and end tangents.
+struct Edge {
+  first: int32; count: int32;   // pieces
+  color: int32;                 // bit 1 red, 2 green, 4 blue
+  contour: int32;
+  sdx: float32; sdy: float32;   // unit direction at the start
+  edx: float32; edy: float32;   // unit direction at the end
+  sx: float32; sy: float32;     // start point
+  ex: float32; ey: float32;     // end point
+  bx0: float32; by0: float32; bx1: float32; by1: float32;   // box of the pieces
+}
+
+struct Shape {
+  segs: FontVec<Seg>;
+  edges: FontVec<Edge>;
+  cstart: FontVec<int32>;       // first edge of each contour
+}
+
+fn unit(dx: float32, dy: float32, ox: float32*, oy: float32*) {
+  var l: float32 = (float32)sqrt((float64)(dx * dx + dy * dy));
+  if (l < 0.000001) { *ox = 0.0; *oy = 0.0; return; }
+  *ox = dx / l; *oy = dy / l;
+}
+
+fn add_edge(s: Shape*, pts: float32*, n: int32, contour: int32) {
+  // pts holds n + 1 points (x, y) along the edge.
+  var e: Edge;
+  e.first = (int32)s->segs.len;
+  e.contour = contour;
+  e.color = 7;
+  for i in 0..n {
+    var sg: Seg;
+    sg.ax = pts[i * 2]; sg.ay = pts[i * 2 + 1];
+    sg.bx = pts[i * 2 + 2]; sg.by = pts[i * 2 + 3];
+    sg.edge = (int32)s->edges.len;
+    if (sg.ax != sg.bx || sg.ay != sg.by) { font_vec_push<Seg>(&s->segs, sg); }
+  }
+  e.count = (int32)s->segs.len - e.first;
+  if (e.count == 0) { return; }
+  var f: Seg = s->segs.data[e.first];
+  var l: Seg = s->segs.data[e.first + e.count - 1];
+  e.bx0 = f.ax; e.by0 = f.ay; e.bx1 = f.ax; e.by1 = f.ay;
+  for k in e.first..e.first + e.count {
+    var q: Seg* = &s->segs.data[(int64)k];
+    e.bx0 = f32_min(e.bx0, f32_min(q->ax, q->bx)); e.bx1 = f32_max(e.bx1, f32_max(q->ax, q->bx));
+    e.by0 = f32_min(e.by0, f32_min(q->ay, q->by)); e.by1 = f32_max(e.by1, f32_max(q->ay, q->by));
+  }
+  e.sx = f.ax; e.sy = f.ay; e.ex = l.bx; e.ey = l.by;
+  unit(f.bx - f.ax, f.by - f.ay, &e.sdx, &e.sdy);
+  unit(l.bx - l.ax, l.by - l.ay, &e.edx, &e.edy);
+  font_vec_push<Edge>(&s->edges, e);
+}
+
+fn pieces(m: float64, degree: float64) -> int32 {
+  var n: int32 = (int32)ceil(sqrt(degree * (degree - 1.0) / 8.0 * m / 0.01));
+  if (n < 1) { n = 1; }
+  if (n > 200) { n = 200; }
+  return n;
+}
+
+// Builds edges from the path, transformed into pixel space.
+fn build(s: Shape*, p: FontPath*, sx: float32, sy: float32, tx: float32, ty: float32) {
+  var buf: float32[402];
+  var k: int64 = 0;
+  var cx: float32 = 0.0; var cy: float32 = 0.0;
+  var contour: int32 = -1;
+  for i: int64 in 0..p->cmds.len {
+    var c: uint8 = p->cmds.data[i];
+    var np: int64 = font_path_cmd_points(c);
+    if (k + np * 2 > p->pts.len) { return; }
+    var q: float32* = p->pts.data + k;
+    k = k + np * 2;
+    if (c == FONT_CLOSE) { continue; }
+    var x0: float32 = 0.0; var y0: float32 = 0.0;
+    if (np > 0) { x0 = q[0] * sx + tx; y0 = ty - q[1] * sy; }
+    if (c == FONT_MOVE) {
+      contour = contour + 1;
+      font_vec_push<int32>(&s->cstart, (int32)s->edges.len);
+      cx = x0; cy = y0;
+      continue;
+    }
+    if (contour < 0) { continue; }
+    buf[0] = cx; buf[1] = cy;
+    var n: int32 = 1;
+    if (c == FONT_LINE) {
+      buf[2] = x0; buf[3] = y0;
+      cx = x0; cy = y0;
+    } else if (c == FONT_QUAD) {
+      var x1: float32 = q[2] * sx + tx; var y1: float32 = ty - q[3] * sy;
+      var ddx: float64 = (float64)(cx - 2.0 * x0 + x1);
+      var ddy: float64 = (float64)(cy - 2.0 * y0 + y1);
+      n = pieces(sqrt(ddx * ddx + ddy * ddy), 2.0);
+      for j in 1..n + 1 {
+        var t: float32 = (float32)j / (float32)n;
+        var mt: float32 = 1.0 - t;
+        buf[j * 2] = mt * mt * cx + 2.0 * mt * t * x0 + t * t * x1;
+        buf[j * 2 + 1] = mt * mt * cy + 2.0 * mt * t * y0 + t * t * y1;
+      }
+      cx = x1; cy = y1;
+    } else {
+      var x1: float32 = q[2] * sx + tx; var y1: float32 = ty - q[3] * sy;
+      var x2: float32 = q[4] * sx + tx; var y2: float32 = ty - q[5] * sy;
+      var ax: float64 = (float64)(cx - 2.0 * x0 + x1); var ay: float64 = (float64)(cy - 2.0 * y0 + y1);
+      var bx: float64 = (float64)(x0 - 2.0 * x1 + x2); var by: float64 = (float64)(y0 - 2.0 * y1 + y2);
+      n = pieces(fmax(sqrt(ax * ax + ay * ay), sqrt(bx * bx + by * by)), 3.0);
+      for j in 1..n + 1 {
+        var t: float32 = (float32)j / (float32)n;
+        var mt: float32 = 1.0 - t;
+        buf[j * 2] = mt * mt * mt * cx + 3.0 * mt * mt * t * x0 + 3.0 * mt * t * t * x1 + t * t * t * x2;
+        buf[j * 2 + 1] = mt * mt * mt * cy + 3.0 * mt * mt * t * y0 + 3.0 * mt * t * t * y1 + t * t * t * y2;
+      }
+      cx = x2; cy = y2;
+    }
+    add_edge(s, &buf[0], n, contour);
+  }
+}
+
+// ---- Edge colouring (msdfgen edgeColoringSimple) ----
+
+const CYAN: int32 = 6;
+const MAGENTA: int32 = 5;
+const YELLOW: int32 = 3;
+const WHITE: int32 = 7;
+
+fn is_corner(ax: float32, ay: float32, bx: float32, by: float32) -> bool {
+  var dot: float32 = ax * bx + ay * by;
+  var cross: float32 = ax * by - ay * bx;
+  if (cross < 0.0) { cross = -cross; }
+  return dot <= 0.0 || cross > 0.14112;   // sin(3 radians)
+}
+
+fn switch_color(c: int32, seed: uint64*, banned: int32) -> int32 {
+  var combined: int32 = c & banned;
+  if (combined == 1 || combined == 2 || combined == 4) { return combined ^ WHITE; }
+  if (c == 0 || c == WHITE) {
+    var start: int32 = (int32)(*seed % 3);
+    *seed = *seed / 3;
+    if (start == 0) { return CYAN; }
+    if (start == 1) { return MAGENTA; }
+    return YELLOW;
+  }
+  var shifted: int32 = c << (1 + (int32)(*seed & 1));
+  *seed = *seed >> 1;
+  return (shifted | (shifted >> 3)) & WHITE;
+}
+
+fn color_edges(s: Shape*) {
+  var seed: uint64 = 0;
+  var nc: int64 = s->cstart.len;
+  for c: int64 in 0..nc {
+    var a: int64 = (int64)s->cstart.data[c];
+    var b: int64 = s->edges.len;
+    if (c + 1 < nc) { b = (int64)s->cstart.data[c + 1]; }
+    var n: int64 = b - a;
+    if (n <= 0) { continue; }
+    // Find corners: a corner sits at the start of edge i.
+    var corners: FontVec<int64>;
+    for i: int64 in 0..n {
+      var prev: Edge* = &s->edges.data[a + (i + n - 1) % n];
+      var cur: Edge* = &s->edges.data[a + i];
+      if (is_corner(prev->edx, prev->edy, cur->sdx, cur->sdy)) { font_vec_push<int64>(&corners, i); }
+    }
+    if (corners.len == 0) {
+      for i: int64 in 0..n { s->edges.data[a + i].color = WHITE; }
+    } else if (corners.len == 1) {
+      // Teardrop: spread three colours over the contour.
+      var colors: int32[3];
+      colors[0] = switch_color(WHITE, &seed, 0);
+      colors[1] = WHITE;
+      colors[2] = switch_color(colors[0], &seed, 0);
+      var corner: int64 = corners.data[0];
+      if (n >= 3) {
+        for i: int64 in 0..n {
+          var idx: int64 = (int64)(3 + 2.875 * (float64)i / (float64)(n - 1) - 1.4375 + 0.5) - 2;
+          if (idx < 0) { idx = 0; }
+          if (idx > 2) { idx = 2; }
+          s->edges.data[a + (corner + i) % n].color = colors[idx];
+        }
+      } else {
+        // One or two edges: msdfgen splits them; we colour them apart.
+        for i: int64 in 0..n { s->edges.data[a + (corner + i) % n].color = colors[(i * 2) % 3]; }
+      }
+    } else {
+      var spline: int64 = 0;
+      var start: int64 = corners.data[0];
+      var m: int64 = corners.len;
+      var color: int32 = switch_color(WHITE, &seed, 0);
+      var initial: int32 = color;
+      for i: int64 in 0..n {
+        var idx: int64 = (start + i) % n;
+        if (spline + 1 < m && corners.data[spline + 1] == idx) {
+          spline = spline + 1;
+          var banned: int32 = 0;
+          if (spline == m - 1) { banned = initial; }
+          color = switch_color(color, &seed, banned);
+        }
+        s->edges.data[a + idx].color = color;
+      }
+    }
+    font_vec_free<int64>(&corners);
+  }
+}
+
+// ---- Distances ----
+
+// Distance from (px, py) to segment sg; writes the nearest parameter t.
+fn seg_dist2(sg: Seg*, px: float32, py: float32, t: float32*) -> float32 {
+  var dx: float32 = sg->bx - sg->ax;
+  var dy: float32 = sg->by - sg->ay;
+  var l2: float32 = dx * dx + dy * dy;
+  var u: float32 = 0.0;
+  if (l2 > 0.0) { u = ((px - sg->ax) * dx + (py - sg->ay) * dy) / l2; }
+  *t = u;
+  if (u < 0.0) { u = 0.0; }
+  if (u > 1.0) { u = 1.0; }
+  var qx: float32 = sg->ax + dx * u - px;
+  var qy: float32 = sg->ay + dy * u - py;
+  return qx * qx + qy * qy;
+}
+
+// Non-zero winding at (px, py) from the pieces (ray to the right).
+fn winding(s: Shape*, px: float32, py: float32) -> int32 {
+  var w: int32 = 0;
+  for i: int64 in 0..s->segs.len {
+    var sg: Seg* = &s->segs.data[i];
+    if ((sg->ay <= py) != (sg->by <= py)) {
+      var x: float32 = sg->ax + (py - sg->ay) * (sg->bx - sg->ax) / (sg->by - sg->ay);
+      if (x > px) {
+        if (sg->by > sg->ay) { w = w + 1; } else { w = w - 1; }
+      }
+    }
+  }
+  return w;
+}
+
+fn median3(a: float32, b: float32, c: float32) -> float32 {
+  return f32_max(f32_min(a, b), f32_min(f32_max(a, b), c));
+}
+
+fn to_byte(v: float32) -> uint8 {
+  var x: float32 = v * 255.0 + 0.5;
+  if (x < 0.0) { x = 0.0; }
+  if (x > 255.0) { x = 255.0; }
+  return (uint8)x;
+}
+
+// Signed pseudo-distance to edge e for point p: the plain distance, unless
+// the nearest point is an end of the edge and p lies beyond it, in which
+// case the distance to the end's tangent line is used when closer.
+fn pseudo(s: Shape*, e: Edge*, px: float32, py: float32, dist: float32*, ortho: float32*) {
+  var best: float32 = 1.0e30;
+  var bi: int64 = 0;
+  var bt: float32 = 0.0;
+  for k in 0..e->count {
+    var t: float32 = 0.0;
+    var d2: float32 = seg_dist2(&s->segs.data[(int64)e->first + (int64)k], px, py, &t);
+    if (d2 < best) { best = d2; bi = (int64)k; bt = t; }
+  }
+  var sg: Seg* = &s->segs.data[(int64)e->first + bi];
+  var dx: float32 = sg->bx - sg->ax;
+  var dy: float32 = sg->by - sg->ay;
+  var ux: float32 = 0.0; var uy: float32 = 0.0;
+  unit(dx, dy, &ux, &uy);
+  var tc: float32 = bt;
+  if (tc < 0.0) { tc = 0.0; }
+  if (tc > 1.0) { tc = 1.0; }
+  var qx: float32 = sg->ax + dx * tc;
+  var qy: float32 = sg->ay + dy * tc;
+  var cross: float32 = ux * (py - qy) - uy * (px - qx);
+  var d: float32 = (float32)sqrt((float64)best);
+  // msdfgen breaks ties between edges by how square-on the point is.
+  var vx: float32 = 0.0; var vy: float32 = 0.0;
+  unit(px - qx, py - qy, &vx, &vy);
+  var o: float32 = ux * vy - uy * vx;
+  if (o < 0.0) { o = -o; }
+  *ortho = o;
+  var sign: float32 = 1.0;
+  if (cross < 0.0) { sign = -1.0; }
+  *dist = d * sign;
+  if (bi == 0 && bt < 0.0) {
+    var ps: float32 = e->sdx * (py - e->sy) - e->sdy * (px - e->sx);
+    if (f32_abs(ps) <= d) { *dist = ps; }
+  } else if (bi == (int64)e->count - 1 && bt > 1.0) {
+    var pe: float32 = e->edx * (py - e->ey) - e->edy * (px - e->ex);
+    if (f32_abs(pe) <= d) { *dist = pe; }
+  }
+}
+
+// Total signed area of the shape (orientation of its outer contours).
+fn area_sign(s: Shape*) -> float32 {
+  var a: float32 = 0.0;
+  for i: int64 in 0..s->segs.len {
+    var sg: Seg* = &s->segs.data[i];
+    a = a + sg->ax * sg->by - sg->bx * sg->ay;
+  }
+  if (a < 0.0) { return -1.0; }
+  return 1.0;
+}
+
+fn free_shape(s: Shape*) {
+  font_vec_free<Seg>(&s->segs);
+  font_vec_free<Edge>(&s->edges);
+  font_vec_free<int32>(&s->cstart);
+}
+
+// Sets up the output bitmap with `spread` pixels of padding.
+fn setup(p: FontPath*, sx: float32, sy: float32, shift_x: float32, shift_y: float32, spread: float32, ch: int32, out: FontBitmap*, s: Shape*) -> bool {
+  out->w = 0; out->h = 0; out->x = 0; out->y = 0; out->ch = ch; out->data = (uint8*)0;
+  var bx0: float32 = 0.0; var by0: float32 = 0.0; var bx1: float32 = 0.0; var by1: float32 = 0.0;
+  if (!font_path_bounds(p, &bx0, &by0, &bx1, &by1)) { return false; }
+  var pad: int32 = (int32)ceil((float64)spread);
+  var ix0: int32 = (int32)floor((float64)(bx0 * sx + shift_x)) - pad;
+  var iy0: int32 = (int32)floor((float64)(shift_y - by1 * sy)) - pad;
+  var ix1: int32 = (int32)ceil((float64)(bx1 * sx + shift_x)) + pad;
+  var iy1: int32 = (int32)ceil((float64)(shift_y - by0 * sy)) + pad;
+  var w: int32 = ix1 - ix0;
+  var h: int32 = iy1 - iy0;
+  if (w <= 0 || h <= 0 || (int64)w * (int64)h > (int64)1 << 24) { return false; }
+  out->data = (uint8*)malloc((int64)w * (int64)h * (int64)ch);
+  if (out->data == 0) { return false; }
+  out->w = w; out->h = h; out->x = ix0; out->y = iy0;
+  build(s, p, sx, sy, shift_x - (float32)ix0, shift_y - (float32)iy0);
+  return true;
+}
+
+/// Single-channel signed distance field of a path. The bitmap gets
+/// `spread` pixels of padding on each side. Returns false for an empty
+/// path or when out of memory.
+export fn font_path_sdf(p: FontPath*, sx: float32, sy: float32, shift_x: float32, shift_y: float32, spread: float32, out: FontBitmap*) -> bool {
+  var s: Shape;
+  if (spread <= 0.0 || !setup(p, sx, sy, shift_x, shift_y, spread, 1, out, &s)) { free_shape(&s); return false; }
+  for y in 0..out->h {
+    for x in 0..out->w {
+      var px: float32 = (float32)x + 0.5;
+      var py: float32 = (float32)y + 0.5;
+      var best: float32 = 1.0e30;
+      for i: int64 in 0..s.segs.len {
+        var sg: Seg* = &s.segs.data[i];
+        // Skip pieces whose box is farther than the best so far.
+        var lx: float32 = f32_min(sg->ax, sg->bx) - px;
+        var hx: float32 = px - f32_max(sg->ax, sg->bx);
+        var ly: float32 = f32_min(sg->ay, sg->by) - py;
+        var hy: float32 = py - f32_max(sg->ay, sg->by);
+        var gx: float32 = f32_max(f32_max(lx, hx), 0.0);
+        var gy: float32 = f32_max(f32_max(ly, hy), 0.0);
+        if (gx * gx + gy * gy >= best) { continue; }
+        var t: float32 = 0.0;
+        var d2: float32 = seg_dist2(sg, px, py, &t);
+        if (d2 < best) { best = d2; }
+      }
+      var d: float32 = (float32)sqrt((float64)best);
+      if (winding(&s, px, py) == 0) { d = -d; }
+      out->data[y * out->w + x] = to_byte(0.5 + 0.5 * d / spread);
+    }
+  }
+  free_shape(&s);
+  return true;
+}
+
+/// Multi-channel signed distance field (RGB, 3 bytes per pixel) of a path,
+/// for sharp corners when scaled up. Sample it in a shader with
+/// median(r, g, b). Padding and values as for font_path_sdf.
+export fn font_path_msdf(p: FontPath*, sx: float32, sy: float32, shift_x: float32, shift_y: float32, spread: float32, out: FontBitmap*) -> bool {
+  var s: Shape;
+  if (spread <= 0.0 || !setup(p, sx, sy, shift_x, shift_y, spread, 3, out, &s)) { free_shape(&s); return false; }
+  color_edges(&s);
+  var orient: float32 = area_sign(&s);
+  var n: int64 = (int64)out->w * (int64)out->h;
+  var v: float32* = (float32*)malloc(n * 3 * 4);
+  if (v == 0) { free_shape(&s); font_bitmap_free(out); return false; }
+  for y in 0..out->h {
+    for x in 0..out->w {
+      var px: float32 = (float32)x + 0.5;
+      var py: float32 = (float32)y + 0.5;
+      var bd: float32[3];
+      var bo: float32[3];
+      var bv: float32[3];
+      for c in 0..3 { bd[c] = 1.0e30; bo[c] = 0.0; bv[c] = -1.0e30; }
+      for e: int64 in 0..s.edges.len {
+        var ed: Edge* = &s.edges.data[e];
+        // Skip an edge whose box is farther than every channel it could win.
+        var worst: float32 = 0.0;
+        for c in 0..3 { if ((ed->color & (1 << c)) != 0 && bd[c] > worst) { worst = bd[c]; } }
+        var gx: float32 = f32_max(f32_max(ed->bx0 - px, px - ed->bx1), 0.0);
+        var gy: float32 = f32_max(f32_max(ed->by0 - py, py - ed->by1), 0.0);
+        if (gx * gx + gy * gy > (worst + 0.001) * (worst + 0.001)) { continue; }
+        var d: float32 = 0.0;
+        var o: float32 = 0.0;
+        // True distance decides the nearest edge; the pseudo-distance is
+        // what gets stored.
+        pseudo(&s, ed, px, py, &d, &o);
+        var true_d: float32 = 1.0e30;
+        for k in 0..ed->count {
+          var t: float32 = 0.0;
+          var d2: float32 = seg_dist2(&s.segs.data[(int64)ed->first + (int64)k], px, py, &t);
+          if (d2 < true_d) { true_d = d2; }
+        }
+        true_d = (float32)sqrt((float64)true_d);
+        for c in 0..3 {
+          if ((ed->color & (1 << c)) == 0) { continue; }
+          if (true_d < bd[c] - 0.0001 || (f32_abs(true_d - bd[c]) <= 0.0001 && o > bo[c])) {
+            bd[c] = true_d; bo[c] = o; bv[c] = d * orient;
+          }
+        }
+      }
+      var idx: int64 = ((int64)y * (int64)out->w + (int64)x) * 3;
+      for c in 0..3 { v[idx + (int64)c] = 0.5 + 0.5 * bv[c] / spread; }
+      // The median must agree with the real fill; flip when it does not.
+      var inside: bool = winding(&s, px, py) != 0;
+      var med: float32 = median3(v[idx], v[idx + 1], v[idx + 2]);
+      if ((med > 0.5) != inside) {
+        for c in 0..3 { v[idx + (int64)c] = 1.0 - v[idx + (int64)c]; }
+      }
+    }
+  }
+  // Clash correction (msdfErrorCorrection).
+  var thr: float32 = 1.001 / (2.0 * spread);
+  var w: int64 = (int64)out->w;
+  var h: int64 = (int64)out->h;
+  var clash: uint8* = (uint8*)alloc_zeroed(n);
+  for y: int64 in 0..h {
+    for x: int64 in 0..w {
+      var a: float32* = v + (y * w + x) * 3;
+      var hit: bool = false;
+      if (x > 0 && clashes(a, v + (y * w + x - 1) * 3, thr)) { hit = true; }
+      if (x < w - 1 && clashes(a, v + (y * w + x + 1) * 3, thr)) { hit = true; }
+      if (y > 0 && clashes(a, v + ((y - 1) * w + x) * 3, thr)) { hit = true; }
+      if (y < h - 1 && clashes(a, v + ((y + 1) * w + x) * 3, thr)) { hit = true; }
+      if (hit) { clash[y * w + x] = 1; }
+    }
+  }
+  for i: int64 in 0..n {
+    if (clash[i] != (uint8)0) {
+      var m: float32 = median3(v[i * 3], v[i * 3 + 1], v[i * 3 + 2]);
+      v[i * 3] = m; v[i * 3 + 1] = m; v[i * 3 + 2] = m;
+    }
+    out->data[i * 3] = to_byte(v[i * 3]);
+    out->data[i * 3 + 1] = to_byte(v[i * 3 + 1]);
+    out->data[i * 3 + 2] = to_byte(v[i * 3 + 2]);
+  }
+  free(clash);
+  free(v);
+  free_shape(&s);
+  return true;
+}
+
+// msdfgen detectClash: channels of neighbours that disagree by more than
+// the threshold in two channels.
+fn clashes(a: float32*, b: float32*, thr: float32) -> bool {
+  var a0: float32 = a[0]; var a1: float32 = a[1]; var a2: float32 = a[2];
+  var b0: float32 = b[0]; var b1: float32 = b[1]; var b2: float32 = b[2];
+  var t: float32 = 0.0;
+  if (f32_abs(b0 - a0) < f32_abs(b1 - a1)) { t = a0; a0 = a1; a1 = t; t = b0; b0 = b1; b1 = t; }
+  if (f32_abs(b1 - a1) < f32_abs(b2 - a2)) {
+    t = a1; a1 = a2; a2 = t; t = b1; b1 = b2; b2 = t;
+    if (f32_abs(b0 - a0) < f32_abs(b1 - a1)) { t = a0; a0 = a1; a1 = t; t = b0; b0 = b1; b1 = t; }
+  }
+  return f32_abs(b1 - a1) >= thr && !(b0 == b1 && b0 == b2) && f32_abs(a2 - 0.5) >= f32_abs(b2 - 0.5);
+}
+
+/// SDF of glyph g at `px` pixels per em with `spread` pixels of range.
+export fn font_glyph_sdf(f: FontFace*, g: int32, px: float32, spread: float32, out: FontBitmap*) -> bool {
+  var p: FontPath;
+  var s: float32 = px / (float32)f->upem;
+  var ok: bool = font_glyph_path(f, g, &p) && font_path_sdf(&p, s, s, 0.0, 0.0, spread, out);
+  font_path_free(&p);
+  return ok;
+}
+
+/// MSDF of glyph g at `px` pixels per em with `spread` pixels of range.
+export fn font_glyph_msdf(f: FontFace*, g: int32, px: float32, spread: float32, out: FontBitmap*) -> bool {
+  var p: FontPath;
+  var s: float32 = px / (float32)f->upem;
+  var ok: bool = font_glyph_path(f, g, &p) && font_path_msdf(&p, s, s, 0.0, 0.0, spread, out);
+  font_path_free(&p);
+  return ok;
+}

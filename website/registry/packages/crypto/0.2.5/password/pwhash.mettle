@@ -1,0 +1,438 @@
+// Password hashing: Argon2id (RFC 9106), pure Mettle (argon2.mettle).
+//
+// The output is the self-describing string
+//   $argon2id$v=19$m=65536,t=2,p=1$<salt b64>$<hash b64>
+// It carries the algorithm, costs and a fresh random 16-byte salt, so store
+// it as is (it fits in 127 bytes) and nothing else. Salt and hash are
+// standard base64 (A-Z a-z 0-9 + /) without padding.
+
+import "std/conv";
+import "crypto/core/status";
+import "crypto/core/types";
+import "crypto/core/util";
+import "crypto/password/argon2";
+
+/// Preset for online logins: Argon2id t=2 passes, m=64 MiB. About 0.1-0.5 s
+/// and 64 MiB of RAM per hash on a desktop core; the right default for web
+/// logins.
+/// in: -
+/// returns: 1
+/// owns: nothing
+/// thread: constant
+/// example: cr_pwhash_str(&h, pw.chars, (int64)pw.length, CR_PW_INTERACTIVE);
+export const CR_PW_INTERACTIVE: int32 = 1;
+/// Preset with a higher margin: Argon2id t=3, m=256 MiB. Roughly 1-2 s per
+/// hash.
+/// in: -
+/// returns: 2
+/// owns: nothing
+/// thread: constant
+/// example: cr_pwhash_str(&h, pw.chars, (int64)pw.length, CR_PW_MODERATE);
+export const CR_PW_MODERATE: int32 = 2;
+/// Preset for rarely used, high-value secrets (key files, vault unlock):
+/// Argon2id t=4, m=1 GiB. Several seconds and 1 GiB of RAM per hash; never
+/// use it on a server that hashes on request.
+/// in: -
+/// returns: 3
+/// owns: nothing
+/// thread: constant
+/// example: cr_pwhash_str(&h, pw.chars, (int64)pw.length, CR_PW_SENSITIVE);
+export const CR_PW_SENSITIVE: int32 = 3;
+
+// Preset costs: passes, and memory in bytes.
+const PW_INTERACTIVE_OPS: uint64 = 2;
+const PW_INTERACTIVE_MEM: uint64 = 67108864;
+const PW_MODERATE_OPS: uint64 = 3;
+const PW_MODERATE_MEM: uint64 = 268435456;
+const PW_SENSITIVE_OPS: uint64 = 4;
+const PW_SENSITIVE_MEM: uint64 = 1073741824;
+
+// Limits on what a stored string may ask a verifier to do (the string is
+// attacker-controlled input): at most 4 GiB of memory and 64 passes.
+const PW_MAX_M_KIB: uint64 = 4194304;
+const PW_MAX_T: uint64 = 64;
+
+/// Reads the Argon2id costs of a preset.
+/// in: preset, one of CR_PW_*; ops and mem, where the costs go (passes, and
+///   memory in bytes)
+/// returns: CR_OK; CR_E_ARG for an unknown preset or a null out-param
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: var t: uint64; var m: uint64; cr_pwhash_preset_limits(CR_PW_MODERATE, &t, &m);
+export fn cr_pwhash_preset_limits(preset: int32, ops: uint64*, mem: uint64*) -> int32 {
+  if (ops == 0 || mem == 0) { return CR_E_ARG; }
+  if (preset == CR_PW_INTERACTIVE) {
+    *ops = PW_INTERACTIVE_OPS;
+    *mem = PW_INTERACTIVE_MEM;
+    return CR_OK;
+  }
+  if (preset == CR_PW_MODERATE) {
+    *ops = PW_MODERATE_OPS;
+    *mem = PW_MODERATE_MEM;
+    return CR_OK;
+  }
+  if (preset == CR_PW_SENSITIVE) {
+    *ops = PW_SENSITIVE_OPS;
+    *mem = PW_SENSITIVE_MEM;
+    return CR_OK;
+  }
+  return CR_E_ARG;
+}
+
+// ---- standard base64 (RFC 4648 section 4), no padding -------------------
+
+// All-ones (-1) if lo <= c <= hi, else 0. Arithmetic only.
+fn pw_in(c: int32, lo: int32, hi: int32) -> int32 {
+  return ~((c - lo) >> 31) & ((c - hi - 1) >> 31);
+}
+
+// All-ones if x >= k, else 0 (small values).
+fn pw_ge(x: int32, k: int32) -> int32 {
+  return ~((x - k) >> 31);
+}
+
+// Character for a 6-bit value x in 0..63: A-Z a-z 0-9 + /.
+fn pw_b64_char(x: int32) -> uint8 {
+  var c: int32 = x + 65;
+  c = c + (pw_ge(x, 26) & 6);
+  c = c + (pw_ge(x, 52) & -75);
+  c = c + (pw_ge(x, 62) & -15);
+  c = c + (pw_ge(x, 63) & 3);
+  return (uint8)c;
+}
+
+// Value of character c; *bad gets all-ones OR-ed in when c is outside the
+// alphabet.
+fn pw_b64_val(c: int32, bad: int32*) -> int32 {
+  var up: int32 = pw_in(c, 65, 90);
+  var lo: int32 = pw_in(c, 97, 122);
+  var dg: int32 = pw_in(c, 48, 57);
+  var pl: int32 = pw_in(c, 43, 43);
+  var sl: int32 = pw_in(c, 47, 47);
+  *bad = *bad | ~(up | lo | dg | pl | sl);
+  return (up & (c - 65)) | (lo & (c - 71)) | (dg & (c + 4)) | (pl & 62) | (sl & 63);
+}
+
+// Encodes n bytes; returns the text length (4n/3 rounded up, no padding).
+fn pw_b64_enc(out: uint8*, inp: uint8*, n: int64) -> int64 {
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i + 3 <= n) {
+    var x: int32 = ((int32)inp[i] << 16) | ((int32)inp[i + 1] << 8) | (int32)inp[i + 2];
+    out[o] = pw_b64_char((x >> 18) & 63);
+    out[o + 1] = pw_b64_char((x >> 12) & 63);
+    out[o + 2] = pw_b64_char((x >> 6) & 63);
+    out[o + 3] = pw_b64_char(x & 63);
+    o = o + 4;
+    i = i + 3;
+  }
+  var left: int64 = n - i;
+  if (left == 1) {
+    var x: int32 = (int32)inp[i] << 16;
+    out[o] = pw_b64_char((x >> 18) & 63);
+    out[o + 1] = pw_b64_char((x >> 12) & 63);
+    o = o + 2;
+  }
+  if (left == 2) {
+    var x: int32 = ((int32)inp[i] << 16) | ((int32)inp[i + 1] << 8);
+    out[o] = pw_b64_char((x >> 18) & 63);
+    out[o + 1] = pw_b64_char((x >> 12) & 63);
+    out[o + 2] = pw_b64_char((x >> 6) & 63);
+    o = o + 3;
+  }
+  return o;
+}
+
+// Decodes n characters strictly (no padding, no length 4k+1, zero trailing
+// bits) into out (cap bytes). Returns the byte count, or -1.
+fn pw_b64_dec(out: uint8*, cap: int64, s: uint8*, n: int64) -> int64 {
+  if (n % 4 == 1) { return -1; }
+  var bad: int32 = 0;
+  var acc: int32 = 0;
+  var bits: int32 = 0;
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = pw_b64_val((int32)s[i], &bad);
+    acc = ((acc << 6) | (v & 63)) & 0xffff;
+    bits = bits + 6;
+    if (bits >= 8) {
+      bits = bits - 8;
+      if (o >= cap) { return -1; }
+      out[o] = (uint8)((acc >> bits) & 255);
+      o = o + 1;
+    }
+    i = i + 1;
+  }
+  if (bad != 0) { return -1; }
+  if ((acc & ((1 << bits) - 1)) != 0) { return -1; }
+  return o;
+}
+
+// ---- the string form ------------------------------------------------------
+
+// Appends a literal at out[pos]; returns the new position.
+fn pw_put(out: uint8*, pos: int64, lit: string) -> int64 {
+  var i: int64 = 0;
+  while (i < (int64)lit.length) {
+    out[pos + i] = lit.chars[i];
+    i = i + 1;
+  }
+  return pos + (int64)lit.length;
+}
+
+// Appends v in decimal; returns the new position.
+fn pw_put_dec(out: uint8*, pos: int64, v: uint64) -> int64 {
+  var tmp: uint8[20];
+  var n: int64 = 0;
+  var x: uint64 = v;
+  while (true) {
+    tmp[n] = (uint8)(48 + (int64)(x % 10));
+    n = n + 1;
+    x = x / 10;
+    if (x == 0) { break; }
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    out[pos + i] = tmp[n - 1 - i];
+    i = i + 1;
+  }
+  return pos + n;
+}
+
+// A parsed Argon2id string. Everything in it is already range-checked.
+struct PwParsed {
+  m: uint64;
+  t: uint64;
+  salt: uint8[64];
+  saltlen: int64;
+  hash: uint8[64];
+  hashlen: int64;
+}
+
+// Consumes the literal lit at *pos.
+fn pw_lit(s: uint8*, n: int64, pos: int64*, lit: string) -> bool {
+  var p: int64 = *pos;
+  if (p + (int64)lit.length > n) { return false; }
+  var i: int64 = 0;
+  while (i < (int64)lit.length) {
+    if (s[p + i] != lit.chars[i]) { return false; }
+    i = i + 1;
+  }
+  *pos = p + (int64)lit.length;
+  return true;
+}
+
+// Consumes a decimal number of 1..10 digits without a leading zero.
+fn pw_dec(s: uint8*, n: int64, pos: int64*, out: uint64*) -> bool {
+  var p: int64 = *pos;
+  var v: uint64 = 0;
+  var digits: int64 = 0;
+  while (p < n && s[p] >= 48 && s[p] <= 57) {
+    v = v * 10 + (uint64)(s[p] - 48);
+    digits = digits + 1;
+    p = p + 1;
+    if (digits > 10) { return false; }
+  }
+  if (digits == 0) { return false; }
+  if (digits > 1 && s[*pos] == 48) { return false; }
+  *out = v;
+  *pos = p;
+  return true;
+}
+
+// Strictly parses "$argon2id$v=19$m=<m>,t=<t>,p=1$<salt>$<hash>" with
+// standard base64 and bounded costs: 8 <= m <= 4194304, 1 <= t <= 64, salt
+// 8..64 bytes, hash 16..64 bytes. Anything else is false.
+fn pw_parse(h: CrPwHash*, o: PwParsed*) -> bool {
+  var s: uint8* = &h->b[0];
+  var n: int64 = 0;
+  while (n < 128 && s[n] != 0) { n = n + 1; }
+  if (n >= 128) { return false; }
+  var pos: int64 = 0;
+  var p: uint64 = 0;
+  if (!pw_lit(s, n, &pos, "$argon2id$v=19$m=")) { return false; }
+  if (!pw_dec(s, n, &pos, &o->m)) { return false; }
+  if (!pw_lit(s, n, &pos, ",t=")) { return false; }
+  if (!pw_dec(s, n, &pos, &o->t)) { return false; }
+  if (!pw_lit(s, n, &pos, ",p=")) { return false; }
+  if (!pw_dec(s, n, &pos, &p)) { return false; }
+  if (!pw_lit(s, n, &pos, "$")) { return false; }
+  if (p != 1) { return false; }
+  if (o->m < 8 || o->m > PW_MAX_M_KIB) { return false; }
+  if (o->t < 1 || o->t > PW_MAX_T) { return false; }
+  var e: int64 = pos;
+  while (e < n && s[e] != 36) { e = e + 1; }
+  if (e >= n) { return false; }
+  o->saltlen = pw_b64_dec(&o->salt[0], 64, &s[pos], e - pos);
+  if (o->saltlen < 8) { return false; }
+  pos = e + 1;
+  o->hashlen = pw_b64_dec(&o->hash[0], 64, &s[pos], n - pos);
+  if (o->hashlen < 16) { return false; }
+  return true;
+}
+
+var g_cr_pw_empty: uint8[1];
+
+/// Hashes a password with Argon2id and a fresh random salt.
+/// in: out; pw readable for n bytes (any bytes; 0 allowed when n == 0),
+///   n >= 0; preset, one of CR_PW_INTERACTIVE / MODERATE / SENSITIVE
+/// returns: CR_OK; CR_E_ARG (null out, null pw with n > 0, n < 0, n above
+///   4294967295, unknown preset); CR_E_INTERNAL if the random source fails
+///   or Argon2id could not allocate its memory. On error out is all zeros
+/// owns: nothing; the working memory is mapped, wiped and unmapped inside
+///   the call (never the Mettle heap). The caller should wipe the plaintext
+///   password after the call
+/// thread: any thread (no shared state). Blocks for the preset's time
+/// example: var h: CrPwHash; if (cr_pwhash_str(&h, pw.chars, (int64)pw.length, CR_PW_INTERACTIVE) == CR_OK) { store(cr_pwhash_text(&h)); }
+export fn cr_pwhash_str(out: CrPwHash*, pw: uint8*, n: int64, preset: int32) -> int32 {
+  if (out == 0) { return CR_E_ARG; }
+  cr_wipe(&out->b[0], 128);
+  if (n < 0 || (pw == 0 && n > 0)) { return CR_E_ARG; }
+  var ops: uint64 = 0;
+  var mem: uint64 = 0;
+  if (cr_pwhash_preset_limits(preset, &ops, &mem) != CR_OK) { return CR_E_ARG; }
+  var p: uint8* = pw;
+  if (n == 0) { p = &g_cr_pw_empty[0]; }
+  var salt: uint8[16];
+  var hash: uint8[32];
+  var rc: int32 = cr_random_bytes(&salt[0], 16);
+  if (rc != CR_OK) { return CR_E_INTERNAL; }
+  var m_kib: uint32 = (uint32)(mem / 1024);
+  rc = crx_argon2id(&hash[0], 32, p, n, &salt[0], 16, (uint32)ops, m_kib);
+  if (rc != CR_OK) {
+    cr_wipe(&salt[0], 16);
+    cr_wipe(&hash[0], 32);
+    return rc;
+  }
+  var pos: int64 = 0;
+  pos = pw_put(&out->b[0], pos, "$argon2id$v=19$m=");
+  pos = pw_put_dec(&out->b[0], pos, (uint64)m_kib);
+  pos = pw_put(&out->b[0], pos, ",t=");
+  pos = pw_put_dec(&out->b[0], pos, ops);
+  pos = pw_put(&out->b[0], pos, ",p=1$");
+  pos = pos + pw_b64_enc(&out->b[pos], &salt[0], 16);
+  pos = pw_put(&out->b[0], pos, "$");
+  pos = pos + pw_b64_enc(&out->b[pos], &hash[0], 32);
+  out->b[pos] = 0;
+  cr_wipe(&salt[0], 16);
+  cr_wipe(&hash[0], 32);
+  return CR_OK;
+}
+
+// A CrPwHash is usable only if it is nul-terminated inside its 128 bytes.
+fn cr_pw_terminated(h: CrPwHash*) -> bool {
+  var i: int32 = 0;
+  while (i < 128) {
+    if (h->b[i] == 0) { return i > 0; }
+    i = i + 1;
+  }
+  return false;
+}
+
+/// Checks a password against a stored hash: recomputes Argon2id with the
+/// costs, salt and hash length stored in the string and compares in constant
+/// time. Accepts only the form cr_pwhash_str writes ($argon2id, v=19, p=1,
+/// standard base64 without padding, salt 8..64 bytes, hash 16..64 bytes) and
+/// refuses strings that ask for more than m = 4 GiB or t = 64 passes, so an
+/// attacker-supplied string cannot make a server do unbounded work. Use
+/// cr_pwhash_needs_rehash afterwards to upgrade.
+/// in: h, a hash from cr_pwhash_str or cr_pwhash_from_text; pw/n the
+///   candidate password
+/// returns: true only if the password matches; false for a wrong password,
+///   a malformed, out-of-range or unterminated hash, any argument error, or
+///   an allocation failure inside Argon2id (fails closed)
+/// owns: nothing
+/// thread: any thread (no shared state). Takes as long as the hash's own costs
+/// example: if (cr_pwhash_verify(&h, pw.chars, (int64)pw.length)) { login(); }
+export fn cr_pwhash_verify(h: CrPwHash*, pw: uint8*, n: int64) -> bool {
+  if (h == 0 || n < 0 || (pw == 0 && n > 0)) { return false; }
+  if (!cr_pw_terminated(h)) { return false; }
+  var pr: PwParsed;
+  if (!pw_parse(h, &pr)) { return false; }
+  var p: uint8* = pw;
+  if (n == 0) { p = &g_cr_pw_empty[0]; }
+  var got: uint8[64];
+  var ok: bool = false;
+  var rc: int32 = crx_argon2id(&got[0], pr.hashlen, p, n, &pr.salt[0], pr.saltlen, (uint32)pr.t, (uint32)pr.m);
+  if (rc == CR_OK) {
+    ok = cr_equal(&got[0], &pr.hash[0], pr.hashlen);
+  }
+  cr_wipe(&got[0], 64);
+  cr_wipe(&pr.hash[0], 64);
+  cr_wipe(&pr.salt[0], 64);
+  return ok;
+}
+
+/// Tells whether a stored hash should be replaced: it is not Argon2id as
+/// cr_pwhash_str writes it, or its costs, salt length or hash length differ
+/// from the preset's. Call it after a successful cr_pwhash_verify and, when
+/// true, store cr_pwhash_str of the same password.
+/// in: h; preset, one of CR_PW_*
+/// returns: false only if h is a well-formed Argon2id string with exactly
+///   the preset's costs (v=19, p=1, 16-byte salt, 32-byte hash); true
+///   otherwise (including malformed hashes and argument errors, so a caller
+///   that rehashes is never left on old costs)
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: if (cr_pwhash_needs_rehash(&h, CR_PW_INTERACTIVE)) { rehash(); }
+export fn cr_pwhash_needs_rehash(h: CrPwHash*, preset: int32) -> bool {
+  if (h == 0 || !cr_pw_terminated(h)) { return true; }
+  var ops: uint64 = 0;
+  var mem: uint64 = 0;
+  if (cr_pwhash_preset_limits(preset, &ops, &mem) != CR_OK) { return true; }
+  var pr: PwParsed;
+  if (!pw_parse(h, &pr)) { return true; }
+  var same: bool = pr.m == mem / 1024 && pr.t == ops && pr.saltlen == 16 && pr.hashlen == 32;
+  cr_wipe(&pr.hash[0], 64);
+  cr_wipe(&pr.salt[0], 64);
+  return !same;
+}
+
+/// Views a hash as text for storage (without the terminating nul).
+/// in: h
+/// returns: a string view of h's bytes up to the nul; empty if h is 0 or
+///   unterminated
+/// owns: the view borrows h (caller memory); copy it before h goes away
+/// thread: any thread (no shared state)
+/// example: db_put(user, cr_pwhash_text(&h));
+export fn cr_pwhash_text(h: CrPwHash*) -> string {
+  if (h == 0 || !cr_pw_terminated(h)) { return str_from_bytes((cstring)0, 0); }
+  var n: int64 = 0;
+  while (h->b[n] != 0) { n = n + 1; }
+  return str_from_bytes((cstring)&h->b[0], n);
+}
+
+/// Loads a stored hash string into a CrPwHash. Only the shape is checked
+/// here (length 8..127, no nul bytes, "$argon2" prefix); cr_pwhash_verify
+/// parses the rest.
+/// in: out; text, the string cr_pwhash_text gave you
+/// returns: CR_OK; CR_E_ARG (null out); CR_E_DECODE if text cannot be an
+///   Argon2 string. On error out is all zeros
+/// owns: text is copied; the caller keeps ownership of it
+/// thread: any thread (no shared state)
+/// example: var h: CrPwHash; if (cr_pwhash_from_text(&h, row.hash) == CR_OK) { ... }
+export fn cr_pwhash_from_text(out: CrPwHash*, text: string) -> int32 {
+  if (out == 0) { return CR_E_ARG; }
+  cr_wipe(&out->b[0], 128);
+  var n: int64 = (int64)text.length;
+  if (n < 8 || n > 127) { return CR_E_DECODE; }
+  var prefix: string = "$argon2";
+  var i: int64 = 0;
+  while (i < 7) {
+    if (text.chars[i] != prefix.chars[i]) { return CR_E_DECODE; }
+    i = i + 1;
+  }
+  i = 0;
+  while (i < n) {
+    var c: uint8 = text.chars[i];
+    if (c == 0) {
+      cr_wipe(&out->b[0], 128);
+      return CR_E_DECODE;
+    }
+    out->b[i] = c;
+    i = i + 1;
+  }
+  out->b[n] = 0;
+  return CR_OK;
+}

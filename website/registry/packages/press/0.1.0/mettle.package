@@ -1,0 +1,6 @@
+name = press
+version = 0.1.0
+description = Fast compression in pure Mettle: DEFLATE, zlib, gzip, Zstandard, LZ4, CRC32, Adler-32, xxHash
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Press
+compiler = 0.18.0

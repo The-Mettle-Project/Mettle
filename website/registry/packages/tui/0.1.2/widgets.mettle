@@ -1,0 +1,271 @@
+// Widgets that draw text: blocks with borders and titles, text with wrap
+// and alignment, styled spans, scroll lists, tables and scrollbars. Each
+// draws into a buffer inside a rectangle and never outside it.
+
+import "std/mem";
+import "std/conv";
+import "types";
+import "buf";
+import "width";
+import "layout";
+
+export const TUI_BORDER_NONE = 0;
+export const TUI_BORDER_PLAIN = 1;
+export const TUI_BORDER_ROUNDED = 2;
+export const TUI_BORDER_DOUBLE = 3;
+export const TUI_BORDER_THICK = 4;
+
+export const TUI_LEFT = 0;
+export const TUI_CENTER = 1;
+export const TUI_RIGHT = 2;
+
+// Corners and lines for each border: top-left, top-right, bottom-left,
+// bottom-right, horizontal, vertical (Unicode box drawing, U+2500 block).
+const TUI_BOX: int32[30] = [
+  0x250C, 0x2510, 0x2514, 0x2518, 0x2500, 0x2502,
+  0x256D, 0x256E, 0x2570, 0x256F, 0x2500, 0x2502,
+  0x2554, 0x2557, 0x255A, 0x255D, 0x2550, 0x2551,
+  0x250F, 0x2513, 0x2517, 0x251B, 0x2501, 0x2503,
+  0x250C, 0x2510, 0x2514, 0x2518, 0x2500, 0x2502
+];
+
+// Draws a border around r and returns the space inside it.
+export fn tui_border(b: TuiBuf*, r: TuiRect, kind: int32, st: TuiStyle) -> TuiRect {
+  if (kind <= TUI_BORDER_NONE || kind > TUI_BORDER_THICK) { return r; }
+  if (r.w < 2 || r.h < 2) { return tui_rect(r.x, r.y, 0, 0); }
+  var k: int32 = (kind - 1) * 6;
+  var x1: int32 = r.x + r.w - 1;
+  var y1: int32 = r.y + r.h - 1;
+  for x in r.x + 1..x1 {
+    tui_buf_set_cp(b, x, r.y, TUI_BOX[k + 4], st);
+    tui_buf_set_cp(b, x, y1, TUI_BOX[k + 4], st);
+  }
+  for y in r.y + 1..y1 {
+    tui_buf_set_cp(b, r.x, y, TUI_BOX[k + 5], st);
+    tui_buf_set_cp(b, x1, y, TUI_BOX[k + 5], st);
+  }
+  tui_buf_set_cp(b, r.x, r.y, TUI_BOX[k], st);
+  tui_buf_set_cp(b, x1, r.y, TUI_BOX[k + 1], st);
+  tui_buf_set_cp(b, r.x, y1, TUI_BOX[k + 2], st);
+  tui_buf_set_cp(b, x1, y1, TUI_BOX[k + 3], st);
+  return tui_inset(r, 1);
+}
+
+// Puts a label on the top (bottom = false) or bottom edge of a bordered
+// rectangle, aligned left, centre or right, one cell in from the corners.
+export fn tui_border_label(b: TuiBuf*, r: TuiRect, text: string, align: int32, bottom: bool, st: TuiStyle) {
+  var room: int32 = r.w - 2;
+  if (room <= 0 || r.h < 1) { return; }
+  var w: int32 = tui_str_width(text);
+  if (w > room) { w = room; }
+  var x: int32 = r.x + 1;
+  if (align == TUI_CENTER) { x = r.x + 1 + (room - w) / 2; }
+  if (align == TUI_RIGHT) { x = r.x + 1 + room - w; }
+  var y: int32 = r.y;
+  if (bottom) { y = r.y + r.h - 1; }
+  tui_put_clip(b, x, y, text, w, st);
+}
+
+// A bordered box with a title on the top left. Returns the inside.
+export fn tui_block(b: TuiBuf*, r: TuiRect, kind: int32, st: TuiStyle, title: string, title_st: TuiStyle) -> TuiRect {
+  var inner: TuiRect = tui_border(b, r, kind, st);
+  if (title.length > (uint64)0) { tui_border_label(b, r, title, TUI_LEFT, false, title_st); }
+  return inner;
+}
+
+// One line of text in a w-column slot, aligned, clipped.
+export fn tui_text_line(b: TuiBuf*, x: int32, y: int32, w: int32, s: string, st: TuiStyle, align: int32) -> int32 {
+  if (w <= 0) { return 0; }
+  var sw: int32 = tui_str_width(s);
+  var dx: int32 = 0;
+  if (sw < w) {
+    if (align == TUI_CENTER) { dx = (w - sw) / 2; }
+    if (align == TUI_RIGHT) { dx = w - sw; }
+  }
+  return tui_put_clip(b, x + dx, y, s, w - dx, st);
+}
+
+fn tui_bytes_view(s: string, a: int64, n: int64) -> string {
+  return str_from_bytes((cstring)(s.chars + a), n);
+}
+
+// Text in r. "\n" starts a new line. With wrap, long lines break at spaces
+// (or anywhere, for a word longer than the width). Returns the lines used,
+// counting from skip lines into the text (for scrolling).
+export fn tui_text(b: TuiBuf*, r: TuiRect, s: string, st: TuiStyle, align: int32, wrap: bool) -> int32 {
+  return tui_text_scroll(b, r, s, st, align, wrap, 0);
+}
+
+export fn tui_text_scroll(b: TuiBuf*, r: TuiRect, s: string, st: TuiStyle, align: int32, wrap: bool, skip: int32) -> int32 {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  var line: int32 = 0;
+  if (r.w <= 0) { return 0; }
+  while (i <= n) {
+    // Find the end of this hard line.
+    var e: int64 = i;
+    while (e < n && s[e] != '\n') { e = e + 1; }
+    var ls: int64 = i;
+    while (true) {
+      // Take as many characters as fit in r.w columns.
+      var cols: int32 = 0;
+      var j: int64 = ls;
+      var last_space: int64 = -1;
+      while (j < e) {
+        var cp: int32 = 0;
+        var len: int64 = tui_utf8_next(s.chars, n, j, &cp);
+        var cw: int32 = tui_cp_width(cp);
+        if (cw < 0) { cw = 0; }
+        if (cols + cw > r.w) { break; }
+        if (cp == 32) { last_space = j; }
+        cols = cols + cw;
+        j = j + len;
+      }
+      var cut: int64 = j;
+      var next: int64 = j;
+      if (j < e && wrap) {
+        if (last_space > ls) { cut = last_space; next = last_space + 1; }
+        if (cut == ls) { cut = j; next = j; }
+        if (next == ls) {
+          // Nothing fits (a character wider than the box): skip one.
+          var cp2: int32 = 0;
+          next = ls + tui_utf8_next(s.chars, n, ls, &cp2);
+          cut = next;
+        }
+      }
+      if (line >= skip && line - skip < r.h) {
+        tui_text_line(b, r.x, r.y + line - skip, r.w, tui_bytes_view(s, ls, cut - ls), st, align);
+      }
+      line = line + 1;
+      if (!wrap || next >= e) { break; }
+      ls = next;
+    }
+    i = e + 1;
+    if (e >= n) { break; }
+  }
+  return line;
+}
+
+// A run of text with its own style, for lines that mix styles.
+export struct TuiSpan {
+  text: string;
+  style: TuiStyle;
+}
+
+export fn tui_span(text: string, st: TuiStyle) -> TuiSpan {
+  var s: TuiSpan = { text: text, style: st };
+  return s;
+}
+
+// Spans one after another on a line, clipped to w columns. Returns columns.
+export fn tui_spans(b: TuiBuf*, x: int32, y: int32, w: int32, spans: TuiSpan[]) -> int32 {
+  var col: int32 = 0;
+  for sp in spans {
+    if (col >= w) { break; }
+    col = col + tui_put_clip(b, x + col, y, sp.text, w - col, sp.style);
+  }
+  return col;
+}
+
+// Where a scroll list or table is: the selected row (-1 for none) and the
+// first row shown. Keep one per widget between frames.
+export struct TuiScroll {
+  selected: int32;
+  offset: int32;
+}
+
+// Moves the offset so the selected row shows in `visible` rows.
+export fn tui_scroll_fit(s: TuiScroll*, count: int32, visible: int32) {
+  if (count <= 0) { s->selected = -1; s->offset = 0; return; }
+  if (s->selected >= count) { s->selected = count - 1; }
+  if (visible < 1) { visible = 1; }
+  if (s->selected >= 0) {
+    if (s->selected < s->offset) { s->offset = s->selected; }
+    if (s->selected >= s->offset + visible) { s->offset = s->selected - visible + 1; }
+  }
+  if (s->offset > count - visible) { s->offset = count - visible; }
+  if (s->offset < 0) { s->offset = 0; }
+}
+
+// Moves the selection by delta rows (negative is up), within 0..count-1.
+export fn tui_scroll_move(s: TuiScroll*, delta: int32, count: int32) {
+  if (count <= 0) { s->selected = -1; return; }
+  var v: int32 = s->selected + delta;
+  if (s->selected < 0) { v = 0; }
+  if (v < 0) { v = 0; }
+  if (v >= count) { v = count - 1; }
+  s->selected = v;
+}
+
+fn tui_row_fill(b: TuiBuf*, x: int32, y: int32, w: int32, st: TuiStyle) {
+  for i in 0..w { tui_buf_set_cp(b, x + i, y, 32, st); }
+}
+
+// A scrolling list of items; the selected one is drawn in sel_st across
+// the whole row.
+export fn tui_list(b: TuiBuf*, r: TuiRect, items: string[], s: TuiScroll*, st: TuiStyle, sel_st: TuiStyle) {
+  var count: int32 = (int32)items.length;
+  tui_scroll_fit(s, count, r.h);
+  for row in 0..r.h {
+    var i: int32 = s->offset + row;
+    if (i >= count) { break; }
+    var use: TuiStyle = st;
+    if (i == s->selected) {
+      use = sel_st;
+      tui_row_fill(b, r.x, r.y + row, r.w, use);
+    }
+    tui_put_clip(b, r.x, r.y + row, items[i], r.w, use);
+  }
+}
+
+// A vertical scrollbar in the one-column rectangle r: a track and a thumb
+// sized by how much of the content shows.
+export fn tui_scrollbar(b: TuiBuf*, r: TuiRect, total: int32, offset: int32, visible: int32, track_st: TuiStyle, thumb_st: TuiStyle) {
+  if (r.h <= 0 || r.w <= 0) { return; }
+  for y in 0..r.h { tui_buf_set_cp(b, r.x, r.y + y, 0x2502, track_st); }
+  if (total <= visible || total <= 0) { return; }
+  var size: int32 = (int32)((int64)r.h * (int64)visible / (int64)total);
+  if (size < 1) { size = 1; }
+  var top: int32 = (int32)((int64)(r.h - size) * (int64)offset / (int64)(total - visible));
+  if (top < 0) { top = 0; }
+  if (top + size > r.h) { top = r.h - size; }
+  for y in top..top + size { tui_buf_set_cp(b, r.x, r.y + y, 0x2588, thumb_st); }
+}
+
+// A table: a header row, then rows of cells (row-major: cells[row * ncols
+// + col], ncols = headers.length). Column widths come from tui_split with a
+// one-cell gap. aligns gives TUI_LEFT/CENTER/RIGHT per column (empty: all
+// left). The selected row is drawn in sel_st.
+export fn tui_table(b: TuiBuf*, r: TuiRect, headers: string[], cells: string[], widths: TuiLen[], aligns: int32[], s: TuiScroll*, head_st: TuiStyle, st: TuiStyle, sel_st: TuiStyle) {
+  var ncols: int32 = (int32)headers.length;
+  if (ncols == 0 || r.h <= 0) { return; }
+  if (ncols > 64) { ncols = 64; }
+  var cols: TuiRect[64];
+  tui_split(r, TUI_COLS, widths, 1, &cols[0]);
+  var nw: int32 = (int32)widths.length;
+  for c in 0..ncols {
+    if (c >= nw) { break; }
+    var al: int32 = TUI_LEFT;
+    if (c < (int32)aligns.length) { al = aligns[c]; }
+    tui_text_line(b, cols[c].x, r.y, cols[c].w, headers[c], head_st, al);
+  }
+  var nrows: int32 = (int32)((int64)cells.length / (int64)ncols);
+  var body: int32 = r.h - 1;
+  tui_scroll_fit(s, nrows, body);
+  for row in 0..body {
+    var i: int32 = s->offset + row;
+    if (i >= nrows) { break; }
+    var y: int32 = r.y + 1 + row;
+    var use: TuiStyle = st;
+    if (i == s->selected) {
+      use = sel_st;
+      tui_row_fill(b, r.x, y, r.w, use);
+    }
+    for c in 0..ncols {
+      if (c >= nw) { break; }
+      var al: int32 = TUI_LEFT;
+      if (c < (int32)aligns.length) { al = aligns[c]; }
+      tui_text_line(b, cols[c].x, y, cols[c].w, cells[(int64)i * (int64)ncols + (int64)c], use, al);
+    }
+  }
+}

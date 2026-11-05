@@ -1,0 +1,147 @@
+// GHASH (NIST SP 800-38D section 6.4) in pure Mettle, constant time: the
+// 64-bit carry-less multiplication of BearSSL built from integer multiplies
+// with masked operands, so no table is read and no index or branch depends
+// on the data. Internal: the public entry point is cr_aes_gcm_* in gcm.mettle.
+//
+// Ported from BearSSL (ghash_ctmul64.c), Copyright (c) 2016 Thomas Pornin,
+// MIT license; see NOTICE.
+
+import "crypto/core/util";
+
+// A 128-bit block is held as two 64-bit words. The carry-less product of two
+// words is computed with integer multiplications on operands masked to every
+// fourth bit: the carries of a column (at most 15 partial products in any
+// column that fits in 64 bits) stay inside the three masked-off positions
+// above it. The products of the bit-reversed words give the high half of the
+// 128-bit product, since reversal commutes with carry-less multiplication.
+
+/// internal: loads 8 bytes as a big-endian uint64.
+export fn crx_ld64be(p: uint8*) -> uint64 {
+  return ((uint64)p[0] << 56) | ((uint64)p[1] << 48) | ((uint64)p[2] << 40) | ((uint64)p[3] << 32)
+    | ((uint64)p[4] << 24) | ((uint64)p[5] << 16) | ((uint64)p[6] << 8) | (uint64)p[7];
+}
+
+/// internal: stores a uint64 as 8 big-endian bytes.
+export fn crx_st64be(p: uint8*, v: uint64) {
+  p[0] = (uint8)(v >> 56);
+  p[1] = (uint8)(v >> 48);
+  p[2] = (uint8)(v >> 40);
+  p[3] = (uint8)(v >> 32);
+  p[4] = (uint8)(v >> 24);
+  p[5] = (uint8)(v >> 16);
+  p[6] = (uint8)(v >> 8);
+  p[7] = (uint8)v;
+}
+
+// Binary multiplication of x and y with the carries masked off: the low 64
+// bits of the carry-less product.
+@inline fn crx_ghash_bmul64(x: uint64, y: uint64) -> uint64 {
+  var x0: uint64 = x & (uint64)0x1111111111111111;
+  var x1: uint64 = x & (uint64)0x2222222222222222;
+  var x2: uint64 = x & (uint64)0x4444444444444444;
+  var x3: uint64 = x & (uint64)0x8888888888888888;
+  var y0: uint64 = y & (uint64)0x1111111111111111;
+  var y1: uint64 = y & (uint64)0x2222222222222222;
+  var y2: uint64 = y & (uint64)0x4444444444444444;
+  var y3: uint64 = y & (uint64)0x8888888888888888;
+  var z0: uint64 = (x0 * y0) ^ (x1 * y3) ^ (x2 * y2) ^ (x3 * y1);
+  var z1: uint64 = (x0 * y1) ^ (x1 * y0) ^ (x2 * y3) ^ (x3 * y2);
+  var z2: uint64 = (x0 * y2) ^ (x1 * y1) ^ (x2 * y0) ^ (x3 * y3);
+  var z3: uint64 = (x0 * y3) ^ (x1 * y2) ^ (x2 * y1) ^ (x3 * y0);
+  z0 = z0 & (uint64)0x1111111111111111;
+  z1 = z1 & (uint64)0x2222222222222222;
+  z2 = z2 & (uint64)0x4444444444444444;
+  z3 = z3 & (uint64)0x8888888888888888;
+  return z0 | z1 | z2 | z3;
+}
+
+// Reverses the order of the 64 bits of x.
+@inline fn crx_ghash_rev64(v: uint64) -> uint64 {
+  var x: uint64 = v;
+  x = ((x & (uint64)0x5555555555555555) << 1) | ((x >> 1) & (uint64)0x5555555555555555);
+  x = ((x & (uint64)0x3333333333333333) << 2) | ((x >> 2) & (uint64)0x3333333333333333);
+  x = ((x & (uint64)0x0F0F0F0F0F0F0F0F) << 4) | ((x >> 4) & (uint64)0x0F0F0F0F0F0F0F0F);
+  x = ((x & (uint64)0x00FF00FF00FF00FF) << 8) | ((x >> 8) & (uint64)0x00FF00FF00FF00FF);
+  x = ((x & (uint64)0x0000FFFF0000FFFF) << 16) | ((x >> 16) & (uint64)0x0000FFFF0000FFFF);
+  return (x << 32) | (x >> 32);
+}
+
+/// internal: GHASH update: for each 16-byte block X of data (a final partial
+/// block is padded with zeros), y = (y xor X) * h in GF(2^128). Continuing
+/// across calls is exact when every call but the last has a length that is a
+/// multiple of 16.
+/// in: y 16 bytes, the running state (all zero to start), updated in place;
+///   h 16 bytes, the hash key; data readable for len bytes; len >= 0
+export fn crx_ghash_ctmul64(y: uint8*, h: uint8*, data: uint8*, len: int64) {
+  var tmp: uint8[16];
+  var y1: uint64 = crx_ld64be(y);
+  var y0: uint64 = crx_ld64be(&y[8]);
+  var h1: uint64 = crx_ld64be(h);
+  var h0: uint64 = crx_ld64be(&h[8]);
+  var h0r: uint64 = crx_ghash_rev64(h0);
+  var h1r: uint64 = crx_ghash_rev64(h1);
+  var h2: uint64 = h0 ^ h1;
+  var h2r: uint64 = h0r ^ h1r;
+  var pos: int64 = 0;
+  var left: int64 = len;
+  while (left > 0) {
+    var src: uint8* = &data[pos];
+    if (left >= 16) {
+      pos = pos + 16;
+      left = left - 16;
+    } else {
+      var i: int32 = 0;
+      while (i < 16) {
+        tmp[i] = 0;
+        i = i + 1;
+      }
+      i = 0;
+      while ((int64)i < left) {
+        tmp[i] = data[pos + (int64)i];
+        i = i + 1;
+      }
+      src = &tmp[0];
+      left = 0;
+    }
+    y1 = y1 ^ crx_ld64be(src);
+    y0 = y0 ^ crx_ld64be(&src[8]);
+
+    var y0r: uint64 = crx_ghash_rev64(y0);
+    var y1r: uint64 = crx_ghash_rev64(y1);
+    var y2: uint64 = y0 ^ y1;
+    var y2r: uint64 = y0r ^ y1r;
+
+    var z0: uint64 = crx_ghash_bmul64(y0, h0);
+    var z1: uint64 = crx_ghash_bmul64(y1, h1);
+    var z2: uint64 = crx_ghash_bmul64(y2, h2);
+    var z0h: uint64 = crx_ghash_bmul64(y0r, h0r);
+    var z1h: uint64 = crx_ghash_bmul64(y1r, h1r);
+    var z2h: uint64 = crx_ghash_bmul64(y2r, h2r);
+    z2 = z2 ^ z0 ^ z1;
+    z2h = z2h ^ z0h ^ z1h;
+    z0h = crx_ghash_rev64(z0h) >> 1;
+    z1h = crx_ghash_rev64(z1h) >> 1;
+    z2h = crx_ghash_rev64(z2h) >> 1;
+
+    var v0: uint64 = z0;
+    var v1: uint64 = z0h ^ z2;
+    var v2: uint64 = z1 ^ z2h;
+    var v3: uint64 = z1h;
+
+    v3 = (v3 << 1) | (v2 >> 63);
+    v2 = (v2 << 1) | (v1 >> 63);
+    v1 = (v1 << 1) | (v0 >> 63);
+    v0 = v0 << 1;
+
+    v2 = v2 ^ v0 ^ (v0 >> 1) ^ (v0 >> 2) ^ (v0 >> 7);
+    v1 = v1 ^ (v0 << 63) ^ (v0 << 62) ^ (v0 << 57);
+    v3 = v3 ^ v1 ^ (v1 >> 1) ^ (v1 >> 2) ^ (v1 >> 7);
+    v2 = v2 ^ (v1 << 63) ^ (v1 << 62) ^ (v1 << 57);
+
+    y0 = v2;
+    y1 = v3;
+  }
+  crx_st64be(y, y1);
+  crx_st64be(&y[8], y0);
+  cr_wipe(&tmp[0], 16);
+}

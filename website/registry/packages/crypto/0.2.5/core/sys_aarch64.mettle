@@ -1,0 +1,11 @@
+/// internal: getrandom(2) system call number on Linux AArch64.
+export const CRX_SYS_GETRANDOM: int64 = 278;
+/// internal: mmap(2) system call number on Linux AArch64.
+export const CRX_SYS_MMAP: int64 = 222;
+/// internal: munmap(2) system call number on Linux AArch64.
+export const CRX_SYS_MUNMAP: int64 = 215;
+
+/// internal: no memory-safety runtime on self-contained AArch64 builds, so nothing to record.
+export fn crx_region_begin(p: uint8*, n: int64) { }
+/// internal: see crx_region_begin.
+export fn crx_region_end(p: uint8*) { }

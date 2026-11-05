@@ -1,0 +1,153 @@
+// Shared low-level pieces: system call numbers for the target CPU, error
+// codes, flags, and small helpers that only make system calls.
+//
+// The helpers here are safe to call in a freshly cloned child before exec:
+// they never allocate.
+
+import "sys_x86_64.mettle" if x86_64;
+import "sys_aarch64.mettle" if aarch64;
+import "std/mem";
+
+// Error codes. Every sandbox call returns 0 or a count, or one of these negated.
+export const SANDBOX_EPERM = 1;
+export const SANDBOX_ENOENT = 2;
+export const SANDBOX_ESRCH = 3;
+export const SANDBOX_EINTR = 4;
+export const SANDBOX_E2BIG = 7;
+export const SANDBOX_EBADF = 9;
+export const SANDBOX_ECHILD = 10;
+export const SANDBOX_EAGAIN = 11;
+export const SANDBOX_ENOMEM = 12;
+export const SANDBOX_EACCES = 13;
+export const SANDBOX_EBUSY = 16;
+export const SANDBOX_EEXIST = 17;
+export const SANDBOX_ENOTDIR = 20;
+export const SANDBOX_EINVAL = 22;
+export const SANDBOX_ENOSPC = 28;
+export const SANDBOX_ENOSYS = 38;
+export const SANDBOX_EOPNOTSUPP = 95;
+
+export const SBX_AT_FDCWD = -100;
+export const SBX_O_RDONLY = 0;
+export const SBX_O_WRONLY = 1;
+export const SBX_O_RDWR = 2;
+export const SBX_O_CREAT = 0x40;
+export const SBX_O_TRUNC = 0x200;
+export const SBX_O_CLOEXEC = 0x80000;
+export const SBX_O_PATH = 0x200000;
+
+// Length of a nul-terminated byte string.
+export fn sbx_strlen(p: uint8*) -> int64 {
+  var n: int64 = 0;
+  while (p[n] != 0) { n = n + 1; }
+  return n;
+}
+
+// A heap copy of s with a trailing nul. Free it with free().
+export fn sbx_cstr(s: string) -> uint8* {
+  var n: int64 = (int64)s.length;
+  var p: uint8* = (uint8*)malloc(n + 1);
+  if (p == (uint8*)0) { return p; }
+  if (n > 0) { memcpy(p, s.chars, n); }
+  p[n] = 0;
+  return p;
+}
+
+export fn sbx_close(fd: int64) {
+  if (fd >= 0) { syscall(SBX_NR_CLOSE, fd); }
+}
+
+// Writes n bytes to an existing file such as /proc/self/uid_map, in one write.
+// Returns 0 or -errno.
+export fn sbx_write_file(path: uint8*, data: uint8*, n: int64) -> int64 {
+  var fd: int64 = syscall(SBX_NR_OPENAT, SBX_AT_FDCWD, path, SBX_O_WRONLY | SBX_O_CLOEXEC, 0);
+  if (fd < 0) { return fd; }
+  var r: int64 = -SANDBOX_EINTR;
+  while (r == -SANDBOX_EINTR) { r = syscall(SBX_NR_WRITE, fd, data, n); }
+  sbx_close(fd);
+  if (r < 0) { return r; }
+  if (r != n) { return -SANDBOX_EIO_SHORT; }
+  return 0;
+}
+const SANDBOX_EIO_SHORT = 5;
+
+// Reads up to cap-1 bytes of a small file and adds a nul. Returns the count or -errno.
+export fn sbx_read_file(path: uint8*, buf: uint8*, cap: int64) -> int64 {
+  var fd: int64 = syscall(SBX_NR_OPENAT, SBX_AT_FDCWD, path, SBX_O_RDONLY | SBX_O_CLOEXEC, 0);
+  if (fd < 0) { return fd; }
+  var n: int64 = 0;
+  while (n < cap - 1) {
+    var r: int64 = syscall(SBX_NR_READ, fd, buf + n, cap - 1 - n);
+    if (r == -SANDBOX_EINTR) { continue; }
+    if (r < 0) { sbx_close(fd); return r; }
+    if (r == 0) { break; }
+    n = n + r;
+  }
+  sbx_close(fd);
+  buf[n] = 0;
+  return n;
+}
+
+// Makes a directory and any missing parents. path must be writable: the
+// slashes are cut and put back in place. Returns 0 or -errno.
+export fn sbx_mkdir_p(path: uint8*, mode: int64) -> int64 {
+  var n: int64 = sbx_strlen(path);
+  var i: int64 = 1;
+  while (i <= n) {
+    if (i == n || path[i] == '/') {
+      var keep: uint8 = path[i];
+      path[i] = 0;
+      var r: int64 = syscall(SBX_NR_MKDIRAT, SBX_AT_FDCWD, path, mode);
+      path[i] = keep;
+      if (r < 0 && r != -SANDBOX_EEXIST) { return r; }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Creates an empty file if nothing is there yet (a bind-mount target for a file).
+export fn sbx_touch(path: uint8*) -> int64 {
+  var fd: int64 = syscall(SBX_NR_OPENAT, SBX_AT_FDCWD, path, SBX_O_WRONLY | SBX_O_CREAT | SBX_O_CLOEXEC, 0x1a4);
+  if (fd < 0) { return fd; }
+  sbx_close(fd);
+  return 0;
+}
+
+// 1 if path names a directory, 0 if something else, or -errno.
+export fn sbx_is_dir(path: uint8*) -> int64 {
+  var fd: int64 = syscall(SBX_NR_OPENAT, SBX_AT_FDCWD, path, SBX_O_PATH | SBX_O_DIRECTORY | SBX_O_CLOEXEC, 0);
+  if (fd >= 0) { sbx_close(fd); return 1; }
+  if (fd == -SANDBOX_ENOTDIR) { return 0; }
+  return fd;
+}
+
+// Formats v in decimal at p. Returns the number of bytes written (at most 20).
+export fn sbx_fmt_uint(p: uint8*, v: uint64) -> int64 {
+  var tmp: uint8[24];
+  var n: int64 = 0;
+  if (v == 0) { tmp[0] = '0'; n = 1; }
+  while (v > 0) { tmp[n] = (uint8)(48 + (v % 10)); v = v / 10; n = n + 1; }
+  for i in 0..n { p[i] = tmp[n - 1 - i]; }
+  return n;
+}
+
+// The system call number for a name such as "openat", or -1 if this CPU has none.
+export fn sandbox_syscall_number(name: string) -> int64 {
+  var t: string = SBX_SYSCALL_NAMES;
+  var n: int64 = (int64)t.length;
+  var m: int64 = (int64)name.length;
+  if (m == 0) { return -1; }
+  var i: int64 = 0;
+  while (i < n) {
+    var j: int64 = i;
+    while (j < n && t.chars[j] != ' ') { j = j + 1; }
+    var hit: bool = j - i == m && memcmp(t.chars + i, name.chars, m) == 0;
+    var v: int64 = 0;
+    j = j + 1;
+    while (j < n && t.chars[j] != '\n') { v = v * 10 + (int64)(t.chars[j] - 48); j = j + 1; }
+    if (hit) { return v; }
+    i = j + 1;
+  }
+  return -1;
+}

@@ -1,0 +1,38 @@
+// FontVec<T>: a small growable array used across the library.
+
+import "std/mem";
+
+export struct FontVec<T> { data: T*; len: int64; cap: int64; }
+
+/// Makes room for at least n elements. Returns false when memory runs out.
+export fn font_vec_reserve<T>(v: FontVec<T>*, n: int64) -> bool {
+  if (n <= v->cap) { return true; }
+  var nc: int64 = v->cap * 2;
+  if (nc < 16) { nc = 16; }
+  while (nc < n) { nc = nc * 2; }
+  var fresh: T[] = new T[nc];
+  if (fresh.data == 0) { return false; }
+  for i: int64 in 0..v->len { fresh.data[i] = v->data[i]; }
+  if (v->data != 0) { free((rawptr)v->data); }
+  v->data = fresh.data;
+  v->cap = nc;
+  return true;
+}
+
+/// Appends one element. Returns false when memory runs out.
+export fn font_vec_push<T>(v: FontVec<T>*, x: T) -> bool {
+  if (v->len >= v->cap) {
+    if (!font_vec_reserve<T>(v, v->len + 1)) { return false; }
+  }
+  v->data[v->len] = x;
+  v->len = v->len + 1;
+  return true;
+}
+
+/// Frees the memory and leaves the array empty.
+export fn font_vec_free<T>(v: FontVec<T>*) {
+  if (v->data != 0) { free((rawptr)v->data); }
+  v->data = (T*)0;
+  v->len = 0;
+  v->cap = 0;
+}

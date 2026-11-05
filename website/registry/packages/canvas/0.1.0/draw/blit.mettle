@@ -1,0 +1,399 @@
+// The blitter: turns coverage spans from the rasteriser into pixels. For
+// each span it shades source colors (solid, gradient or pattern), then
+// blends them onto the pixmap through the coverage and clip mask:
+// result = lerp(dst, blend(src, dst), coverage), as Skia does. Source-over
+// runs in 8-bit integer math; other modes in floats.
+
+import "std/mem";
+import "../core/base";
+import "../core/color";
+import "../core/pixmap";
+import "../geom/transform";
+import "../paint/gradient";
+import "../paint/pattern";
+import "../paint/blend";
+import "../paint/paint";
+
+const K_SOLID: int32 = 0;
+const K_PATTERN: int32 = 4;
+const K_NONE: int32 = 5;
+
+export struct CanvasBlit {
+  pm: CanvasPixmap*;
+  mask: uint8*;          // clip coverage, one byte a pixel, or 0
+  mask_stride: int64;
+  kind: int32;
+  solid: uint32;
+  lut: uint32*;
+  g: CanvasGradient*;
+  pat: CanvasPattern*;
+  op8: uint32;
+  inv: CanvasTransform;  // device to shader space
+  blend: int32;
+  colors: uint32*;
+  cap_colors: int64;
+  // linear: t = la * x + lb * y + lc
+  la: float32; lb: float32; lc: float32;
+  // radial
+  ra: float32; rcdx: float32; rcdy: float32; rdr: float32;
+}
+
+export fn canvas_blit_free(b: CanvasBlit*) {
+  if (b->colors != 0) { free(b->colors); }
+  b->colors = (uint32*)0;
+  b->cap_colors = 0;
+}
+
+/// Sets up the blitter for paint p drawn under transform m. Returns false
+/// when nothing will be drawn (or memory ran out).
+export fn canvas_blit_setup(b: CanvasBlit*, pm: CanvasPixmap*, mask: uint8*, p: CanvasPaint*, m: CanvasTransform) -> bool {
+  b->pm = pm;
+  b->mask = mask;
+  b->mask_stride = (int64)pm->width;
+  b->blend = p->blend;
+  if (b->blend < 0 || b->blend >= CANVAS_BLEND_COUNT) { b->blend = CANVAS_SRC_OVER; }
+  if (b->blend == CANVAS_DST) { return false; }
+  var op: float32 = canvas_clampf(p->opacity, 0.0, 1.0);
+  if (!canvas_finite(p->opacity)) { op = 0.0; }
+  b->op8 = (uint32)(op * 255.0 + 0.5);
+  if ((int64)pm->width > b->cap_colors) {
+    if (b->colors != 0) { free(b->colors); }
+    b->colors = (uint32*)malloc((int64)pm->width * 4);
+    if (b->colors == 0) { b->cap_colors = 0; return false; }
+    b->cap_colors = (int64)pm->width;
+  }
+  b->kind = K_SOLID;
+  b->solid = canvas_color_pack(p->color, op);
+  if (p->gradient != 0) {
+    var g: CanvasGradient* = p->gradient;
+    b->g = g;
+    if (g->nstops == 0) { b->kind = K_NONE; b->solid = 0; }
+    else {
+      b->lut = canvas_gradient_lut(g, op);
+      if (b->lut == 0) { return false; }
+      var full: CanvasTransform = canvas_t_mul(m, g->m);
+      if (!canvas_t_invert(full, &b->inv)) { return false; }
+      b->kind = g->kind;
+      if (g->nstops == 1) { b->kind = K_SOLID; b->solid = b->lut[0]; }
+      if (g->kind == CANVAS_LINEAR) {
+        var dx: float32 = g->x1 - g->x0;
+        var dy: float32 = g->y1 - g->y0;
+        var l2: float32 = dx * dx + dy * dy;
+        if (!(l2 > 0.0)) {
+          b->kind = K_SOLID; b->solid = b->lut[CANVAS_LUT_SIZE - 1];
+        } else {
+          var iv: CanvasTransform = b->inv;
+          b->la = (iv.a * dx + iv.b * dy) / l2;
+          b->lb = (iv.c * dx + iv.d * dy) / l2;
+          b->lc = ((iv.e - g->x0) * dx + (iv.f - g->y0) * dy) / l2;
+        }
+      } else if (g->kind == CANVAS_RADIAL) {
+        b->rcdx = g->x1 - g->x0;
+        b->rcdy = g->y1 - g->y0;
+        b->rdr = g->r1 - g->r0;
+        b->ra = b->rcdx * b->rcdx + b->rcdy * b->rcdy - b->rdr * b->rdr;
+        if (b->rcdx == 0.0 && b->rcdy == 0.0 && b->rdr == 0.0) {
+          b->kind = K_SOLID; b->solid = b->lut[CANVAS_LUT_SIZE - 1];
+        }
+      }
+    }
+  } else if (p->pattern != 0) {
+    var pt: CanvasPattern* = p->pattern;
+    if (pt->pm == 0 || pt->pm->data == 0 || pt->pm->width <= 0 || pt->pm->height <= 0) { return false; }
+    b->pat = pt;
+    var full2: CanvasTransform = canvas_t_mul(m, pt->m);
+    if (!canvas_t_invert(full2, &b->inv)) { return false; }
+    b->kind = K_PATTERN;
+  }
+  if (b->kind == K_SOLID && b->solid == 0 && b->blend == CANVAS_SRC_OVER) { return false; }
+  return true;
+}
+
+@inline fn lut_at(b: CanvasBlit*, t: float32) -> uint32 {
+  var u: float32 = t;
+  var sp: int32 = b->g->spread;
+  if (sp == CANVAS_PAD) {
+    if (u < 0.0) { u = 0.0; }
+    if (u > 1.0) { u = 1.0; }
+  } else {
+    u = canvas_spread_t(t, sp);
+  }
+  var i: int32 = (int32)(u * (float32)(CANVAS_LUT_SIZE - 1) + 0.5);
+  return b->lut[i];
+}
+
+// Packed lane math: each of the 4 bytes of p times k / 255.
+@inline fn scale4(p: uint32, k: uint32) -> uint32 {
+  var rb: uint32 = (p & 0x00ff00ff) * k + 0x00800080;
+  rb = (((rb >> 8) & 0x00ff00ff) + rb) >> 8;
+  var ag: uint32 = ((p >> 8) & 0x00ff00ff) * k + 0x00800080;
+  ag = (((ag >> 8) & 0x00ff00ff) + ag) & 0xff00ff00;
+  return (rb & 0x00ff00ff) | ag;
+}
+
+fn fetch(pm: CanvasPixmap*, x: int32, y: int32) -> uint32 {
+  var v: uint32 = canvas_pixmap_row(pm, y)[x];
+  if (pm->order == CANVAS_BGRA) { v = canvas_swap_rb(v); }
+  return v;
+}
+
+@inline fn lerp8(a: uint32, b: uint32, w: uint32) -> uint32 {
+  // a + (b - a) * w / 256 per byte, w in 0..256
+  var arb: uint32 = a & 0x00ff00ff;
+  var aag: uint32 = (a >> 8) & 0x00ff00ff;
+  var brb: uint32 = b & 0x00ff00ff;
+  var bag: uint32 = (b >> 8) & 0x00ff00ff;
+  var rb: uint32 = ((arb * (256 - w) + brb * w) >> 8) & 0x00ff00ff;
+  var ag: uint32 = ((aag * (256 - w) + bag * w)) & 0xff00ff00;
+  return rb | ag;
+}
+
+fn sample(b: CanvasBlit*, gx: float32, gy: float32) -> uint32 {
+  var pt: CanvasPattern* = b->pat;
+  var pm: CanvasPixmap* = pt->pm;
+  var w: int32 = pm->width;
+  var h: int32 = pm->height;
+  if (!canvas_finite(gx) || !canvas_finite(gy) || gx < -1.0e8 || gx > 1.0e8 || gy < -1.0e8 || gy > 1.0e8) { return 0; }
+  if (pt->filter == CANVAS_NEAREST) {
+    var ix: int32 = canvas_wrap_index(canvas_floor_i(gx), w, pt->spread_x);
+    var iy: int32 = canvas_wrap_index(canvas_floor_i(gy), h, pt->spread_y);
+    if (ix < 0 || iy < 0) { return 0; }
+    return fetch(pm, ix, iy);
+  }
+  var u: float32 = gx - 0.5;
+  var v: float32 = gy - 0.5;
+  var x0: int32 = canvas_floor_i(u);
+  var y0: int32 = canvas_floor_i(v);
+  var fx: uint32 = (uint32)((u - (float32)x0) * 256.0);
+  var fy: uint32 = (uint32)((v - (float32)y0) * 256.0);
+  if (fx > 256) { fx = 256; }
+  if (fy > 256) { fy = 256; }
+  var xa: int32 = canvas_wrap_index(x0, w, pt->spread_x);
+  var xb: int32 = canvas_wrap_index(x0 + 1, w, pt->spread_x);
+  var ya: int32 = canvas_wrap_index(y0, h, pt->spread_y);
+  var yb: int32 = canvas_wrap_index(y0 + 1, h, pt->spread_y);
+  var c00: uint32 = 0; var c10: uint32 = 0; var c01: uint32 = 0; var c11: uint32 = 0;
+  if (ya >= 0) {
+    if (xa >= 0) { c00 = fetch(pm, xa, ya); }
+    if (xb >= 0) { c10 = fetch(pm, xb, ya); }
+  }
+  if (yb >= 0) {
+    if (xa >= 0) { c01 = fetch(pm, xa, yb); }
+    if (xb >= 0) { c11 = fetch(pm, xb, yb); }
+  }
+  var top: uint32 = lerp8(c00, c10, fx);
+  var bot: uint32 = lerp8(c01, c11, fx);
+  return lerp8(top, bot, fy);
+}
+
+// Shades n source colors for pixels x .. x + n - 1 of row y.
+fn shade(b: CanvasBlit*, x: int32, y: int32, n: int32) {
+  var out: uint32* = b->colors;
+  var px: float32 = (float32)x + 0.5;
+  var py: float32 = (float32)y + 0.5;
+  if (b->kind == CANVAS_LINEAR) {
+    var t: float32 = b->la * px + b->lb * py + b->lc;
+    if (b->g->spread == CANVAS_PAD) {
+      var k: float32 = (float32)(CANVAS_LUT_SIZE - 1);
+      var u: float32 = t * k + 0.5;
+      var du: float32 = b->la * k;
+      var top: float32 = k + 0.5;
+      var lut: uint32* = b->lut;
+      for i in 0..n {
+        var v: float32 = u;
+        if (v < 0.0) { v = 0.0; }
+        if (v > top) { v = top; }
+        out[i] = lut[(int32)v];
+        u = u + du;
+      }
+      return;
+    }
+    for i in 0..n {
+      out[i] = lut_at(b, t);
+      t = t + b->la;
+    }
+    return;
+  }
+  var iv: CanvasTransform = b->inv;
+  var gx: float32 = iv.a * px + iv.c * py + iv.e;
+  var gy: float32 = iv.b * px + iv.d * py + iv.f;
+  if (b->kind == CANVAS_RADIAL) {
+    var g: CanvasGradient* = b->g;
+    var a: float32 = b->ra;
+    var guess: float32 = 0.0;
+    var lin: bool = canvas_absf(a) < 1.0e-6 * (b->rcdx * b->rcdx + b->rcdy * b->rcdy + b->rdr * b->rdr);
+    for i in 0..n {
+      var pdx: float32 = gx - g->x0;
+      var pdy: float32 = gy - g->y0;
+      var bb: float32 = pdx * b->rcdx + pdy * b->rcdy + g->r0 * b->rdr;
+      var c: float32 = pdx * pdx + pdy * pdy - g->r0 * g->r0;
+      var col: uint32 = 0;
+      if (!lin) {
+        var disc0: float32 = bb * bb - a * c;
+        if (!(disc0 >= 0.0)) { guess = 0.0; }
+        if (disc0 >= 0.0) {
+          // the larger root first: with a > 0 it is (bb + sq) / a
+          // the root changes little from pixel to pixel, so two Newton
+          // steps from the last one are enough; start fresh when far off
+          var sq0: float32 = 0.0;
+          var q0: float32 = 0.0;
+          if (guess > 0.0) { q0 = disc0 / (guess * guess); }
+          if (q0 > 0.6 && q0 < 1.6) {
+            sq0 = 0.5 * (guess + disc0 / guess);
+            sq0 = 0.5 * (sq0 + disc0 / sq0);
+          } else {
+            sq0 = canvas_sqrt(disc0);
+          }
+          guess = sq0;
+          var hi0: float32 = (bb + sq0) / a;
+          var lo0: float32 = (bb - sq0) / a;
+          if (a < 0.0) { var tt: float32 = hi0; hi0 = lo0; lo0 = tt; }
+          if (g->r0 + hi0 * b->rdr >= 0.0) { col = lut_at(b, hi0); }
+          else if (g->r0 + lo0 * b->rdr >= 0.0) { col = lut_at(b, lo0); }
+        }
+      } else {
+        if (bb != 0.0) {
+          var w: float32 = c / (2.0 * bb);
+          if (g->r0 + w * b->rdr >= 0.0) { col = lut_at(b, w); }
+        }
+      }
+      out[i] = col;
+      gx = gx + iv.a;
+      gy = gy + iv.b;
+    }
+    return;
+  }
+  if (b->kind == CANVAS_SWEEP) {
+    var g2: CanvasGradient* = b->g;
+    var a0: float32 = g2->angle / CANVAS_TAU;
+    for i in 0..n {
+      var t: float32 = canvas_turns(gy - g2->y0, gx - g2->x0) - a0;
+      t = t - (float32)canvas_floor_i(t);
+      out[i] = lut_at(b, t);
+      gx = gx + iv.a;
+      gy = gy + iv.b;
+    }
+    return;
+  }
+  if (b->kind == K_PATTERN) {
+    var op: uint32 = b->op8;
+    for i in 0..n {
+      var s: uint32 = sample(b, gx, gy);
+      if (op != 255) { s = scale4(s, op); }
+      out[i] = s;
+      gx = gx + iv.a;
+      gy = gy + iv.b;
+    }
+    return;
+  }
+  for i in 0..n { out[i] = b->solid; }
+}
+
+@inline fn unpack(p: uint32, f: float32*) {
+  var k: float32 = 1.0 / 255.0;
+  f[0] = (float32)(p & 255) * k;
+  f[1] = (float32)((p >> 8) & 255) * k;
+  f[2] = (float32)((p >> 16) & 255) * k;
+  f[3] = (float32)(p >> 24) * k;
+}
+
+/// The span sink given to the rasteriser.
+export fn canvas_blit_span(ctx: rawptr, y: int32, x: int32, n: int32, cov: uint8*) {
+  var b: CanvasBlit* = (CanvasBlit*)ctx;
+  var pm: CanvasPixmap* = b->pm;
+  var row: uint32* = canvas_pixmap_row(pm, y) + x;
+  var mrow: uint8* = (uint8*)0;
+  if (b->mask != 0) { mrow = b->mask + (int64)y * b->mask_stride + (int64)x; }
+  var bgra: bool = pm->order == CANVAS_BGRA;
+  var solid: bool = b->kind == K_SOLID || b->kind == K_NONE;
+  if (!solid) { shade(b, x, y, n); }
+  var src: uint32 = b->solid;
+  if (bgra) { src = canvas_swap_rb(src); }
+  if (b->blend == CANVAS_SRC_OVER && solid && mrow == 0) {
+    // the common case: one color, no clip mask
+    var sa0: uint32 = src >> 24;
+    var i0: int32 = 0;
+    while (i0 < n) {
+      var c0: uint32 = (uint32)cov[i0];
+      if (c0 == 255) {
+        // a run of full coverage
+        var j0: int32 = i0;
+        while (j0 < n && cov[j0] == 255) { j0 = j0 + 1; }
+        if (sa0 == 255) {
+          while (i0 < j0) { row[i0] = src; i0 = i0 + 1; }
+        } else {
+          var inv0: uint32 = 255 - sa0;
+          while (i0 < j0) { row[i0] = src + scale4(row[i0], inv0); i0 = i0 + 1; }
+        }
+        continue;
+      }
+      if (c0 != 0) {
+        var s0: uint32 = scale4(src, c0);
+        row[i0] = s0 + scale4(row[i0], (uint32)255 - (s0 >> 24));
+      }
+      i0 = i0 + 1;
+    }
+    return;
+  }
+  if (b->blend == CANVAS_SRC_OVER) {
+    for i in 0..n {
+      var c: uint32 = (uint32)cov[i];
+      if (mrow != 0) { c = canvas_div255(c * (uint32)mrow[i]); }
+      if (c == 0) { continue; }
+      var s: uint32 = src;
+      if (!solid) {
+        s = b->colors[i];
+        if (bgra) { s = canvas_swap_rb(s); }
+      }
+      if (c != 255) { s = scale4(s, c); }
+      var sa: uint32 = s >> 24;
+      if (sa == 0) { continue; }
+      if (sa == 255) { row[i] = s; continue; }
+      row[i] = s + scale4(row[i], 255 - sa);
+    }
+    return;
+  }
+  var sf: float32[4];
+  var df: float32[4];
+  var of: float32[4];
+  for i in 0..n {
+    var c2: uint32 = (uint32)cov[i];
+    if (mrow != 0) { c2 = canvas_div255(c2 * (uint32)mrow[i]); }
+    if (c2 == 0) { continue; }
+    var s2: uint32 = b->solid;
+    if (!solid) { s2 = b->colors[i]; }
+    var d: uint32 = row[i];
+    if (bgra) { d = canvas_swap_rb(d); }
+    if (b->blend == CANVAS_PLUS && c2 != 255) {
+      // plus clamps, so coverage scales the source first (W3C
+      // Compositing: shape multiplies source alpha before compositing)
+      s2 = scale4(s2, c2);
+      c2 = 255;
+    }
+    unpack(s2, &sf[0]);
+    unpack(d, &df[0]);
+    canvas_blend_px(b->blend, &sf[0], &df[0], &of[0]);
+    if (c2 != 255) {
+      var k: float32 = (float32)c2 / 255.0;
+      for j in 0..4 { of[j] = df[j] + (of[j] - df[j]) * k; }
+    }
+    var r: uint32 = canvas_pm_pack(of[0], of[1], of[2], of[3]);
+    if (bgra) { r = canvas_swap_rb(r); }
+    row[i] = r;
+  }
+}
+
+/// A span sink that multiplies coverage into a clip mask (ctx is a
+/// CanvasMaskSink).
+export struct CanvasMaskSink { dst: uint8*; old: uint8*; stride: int64; }
+
+export fn canvas_mask_span(ctx: rawptr, y: int32, x: int32, n: int32, cov: uint8*) {
+  var m: CanvasMaskSink* = (CanvasMaskSink*)ctx;
+  var d: uint8* = m->dst + (int64)y * m->stride + (int64)x;
+  if (m->old == 0) {
+    for i in 0..n { d[i] = cov[i]; }
+    return;
+  }
+  var o: uint8* = m->old + (int64)y * m->stride + (int64)x;
+  for i in 0..n { d[i] = (uint8)canvas_div255((uint32)cov[i] * (uint32)o[i]); }
+}

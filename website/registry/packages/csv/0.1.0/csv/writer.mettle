@@ -1,0 +1,384 @@
+// The writer. It quotes exactly when the reader needs it to get the same
+// fields back: a field is quoted when it holds the delimiter, the quote,
+// the escape byte, CR, LF or the record terminator, when it starts with the
+// comment byte or (with skip_initial_space) a space, and when it is the only
+// field of a record and empty, so the record does not read as a blank line.
+// These are the rules of Python's csv.writer and Rust's csv crate.
+
+import "std/mem";
+import "std/file";
+import "std/conv";
+import "dialect";
+import "error";
+import "num";
+import "reader";
+
+const SINK_MEM = 0;
+const SINK_FD = 1;
+const SINK_FN = 2;
+
+const FLUSH_AT = 65536;
+const LO: uint64 = 0x0101010101010101;
+const HI: uint64 = 0x8080808080808080;
+const LT14: uint64 = 0x0E0E0E0E0E0E0E0E;
+
+export struct CsvWriter {
+  d: CsvDialect;
+  buf: uint8*;
+  len: int64;
+  cap: int64;
+  sink: int32;
+  fd: int64;
+  fd_off: int64;
+  own_fd: bool;
+  write_fn: Fn(uint8*, int64) -> int64;
+  nf: int32;          // fields written in the current record
+  last_bare_empty: bool;
+  records: int64;
+  failed: bool;
+  err: CsvError;
+  special: uint8[256];  // 1 for bytes that force quoting
+  kd: uint64;           // delimiter, quote and escape (or terminator) in every byte
+  kq: uint64;
+  ke: uint64;
+}
+
+fn writer_new(d: CsvDialect, sink: int32) -> CsvWriter* {
+  var w: CsvWriter* = new CsvWriter;
+  if (w == 0) { return w; }
+  w->d = d;
+  w->sink = sink;
+  w->cap = 4096;
+  w->special[13] = (uint8)1;
+  w->special[10] = (uint8)1;
+  w->special[(int64)d.delimiter] = (uint8)1;
+  if (d.quote != (uint8)0) { w->special[(int64)d.quote] = (uint8)1; }
+  if (d.escape != (uint8)0) { w->special[(int64)d.escape] = (uint8)1; }
+  if (d.terminator != (uint8)CSV_TERM_ANY) { w->special[(int64)d.terminator] = (uint8)1; }
+  var q: uint8 = d.quote;
+  if (q == (uint8)0) { q = d.delimiter; }
+  var e: uint8 = d.escape;
+  if (e == (uint8)0) { e = d.terminator; }
+  if (e == (uint8)0) { e = d.delimiter; }
+  w->kd = (uint64)d.delimiter * LO;
+  w->kq = (uint64)q * LO;
+  w->ke = (uint64)e * LO;
+  w->buf = (uint8*)malloc(w->cap);
+  if (w->buf == 0) {
+    free(w);
+    return (CsvWriter*)0;
+  }
+  return w;
+}
+
+// A writer that keeps everything in memory; see csv_writer_bytes.
+export fn csv_writer_new(d: CsvDialect) -> CsvWriter* {
+  return writer_new(d, SINK_MEM);
+}
+
+// A writer to an open file descriptor, from its offset 0 onward. The
+// descriptor stays yours.
+export fn csv_writer_to_fd(fd: int64, d: CsvDialect) -> CsvWriter* {
+  var w: CsvWriter* = writer_new(d, SINK_FD);
+  if (w != 0) { w->fd = fd; }
+  return w;
+}
+
+// Creates (or empties) a file and writes to it. Returns 0 if it cannot be
+// created. csv_writer_close flushes and closes it.
+export fn csv_writer_create(path: string, d: CsvDialect) -> CsvWriter* {
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return (CsvWriter*)0; }
+  var w: CsvWriter* = csv_writer_to_fd(fd, d);
+  if (w == 0) {
+    file_close(fd);
+    return w;
+  }
+  w->own_fd = true;
+  return w;
+}
+
+// A writer that hands bytes to a function: write(buf, n) must take all n
+// bytes and return n, or a negative number on failure.
+export fn csv_writer_to_fn(write: Fn(uint8*, int64) -> int64, d: CsvDialect) -> CsvWriter* {
+  var w: CsvWriter* = writer_new(d, SINK_FN);
+  if (w != 0) { w->write_fn = write; }
+  return w;
+}
+
+fn fail(w: CsvWriter*) -> bool {
+  w->failed = true;
+  w->err.kind = CSV_ERR_IO;
+  w->err.record = w->records + 1;
+  return false;
+}
+
+fn grow(w: CsvWriter*, extra: int64) -> bool {
+  if (w->len + extra <= w->cap) { return true; }
+  var nc: int64 = w->cap * 2;
+  while (nc < w->len + extra) { nc = nc * 2; }
+  var nb: uint8* = (uint8*)realloc(w->buf, nc);
+  if (nb == 0) { return fail(w); }
+  w->buf = nb;
+  w->cap = nc;
+  return true;
+}
+
+// Sends buffered bytes to the file or function. A memory writer keeps them.
+export fn csv_writer_flush(w: CsvWriter*) -> bool {
+  if (w->failed) { return false; }
+  if (w->sink == SINK_MEM || w->len == 0) { return true; }
+  var at: int64 = 0;
+  while (at < w->len) {
+    var k: int64 = 0;
+    if (w->sink == SINK_FD) {
+      k = file_write_at(w->fd, w->buf + at, w->len - at, w->fd_off);
+      if (k > 0) { w->fd_off = w->fd_off + k; }
+    } else {
+      var f: Fn(uint8*, int64) -> int64 = w->write_fn;
+      k = f(w->buf + at, w->len - at);
+    }
+    if (k <= 0) { return fail(w); }
+    at = at + k;
+  }
+  w->len = 0;
+  return true;
+}
+
+@inline fn put(w: CsvWriter*, c: uint8) -> bool {
+  if (w->len == w->cap && !grow(w, 1)) { return false; }
+  w->buf[w->len] = c;
+  w->len = w->len + 1;
+  return true;
+}
+
+@inline fn put_bytes(w: CsvWriter*, p: uint8*, n: int64) -> bool {
+  if (n <= 0) { return true; }
+  if (w->len + n > w->cap && !grow(w, n)) { return false; }
+  var dst: uint8* = w->buf + w->len;
+  if (n <= 16) {
+    for i in 0..n { dst[i] = p[i]; }
+  } else {
+    memcpy(dst, p, n);
+  }
+  w->len = w->len + n;
+  return true;
+}
+
+@inline fn needs_quotes(w: CsvWriter*, s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  var d: CsvDialect* = &w->d;
+  if (n == 0) { return false; }
+  if (d->comment != (uint8)0 && w->nf == 1 && s.chars[0] == d->comment) { return true; }
+  if (d->skip_initial_space && s.chars[0] == (uint8)' ') { return true; }
+  var tbl: uint8* = &w->special[0];
+  var p: uint8* = s.chars;
+  var i: int64 = 0;
+  // Eight bytes at a time: a word with no delimiter, quote, escape or byte
+  // below 14 is skipped whole; any other word is checked byte by byte.
+  var kd: uint64 = w->kd;
+  var kq: uint64 = w->kq;
+  var ke: uint64 = w->ke;
+  while (i + 8 <= n) {
+    var x: uint64 = *(uint64*)(p + i);
+    var td: uint64 = x ^ kd;
+    var tq: uint64 = x ^ kq;
+    var te: uint64 = x ^ ke;
+    var hm: uint64 = (((td - LO) & ~td) | ((tq - LO) & ~tq) | ((te - LO) & ~te) | ((x - LT14) & ~x)) & HI;
+    if (hm != 0) {
+      for j in 0..8 {
+        if (tbl[(int64)p[i + j]] != (uint8)0) { return true; }
+      }
+    }
+    i = i + 8;
+  }
+  while (i < n) {
+    if (tbl[(int64)p[i]] != (uint8)0) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn write_quoted(w: CsvWriter*, s: string) -> bool {
+  var d: CsvDialect* = &w->d;
+  var q: uint8 = d->quote;
+  if (!put(w, q)) { return false; }
+  var n: int64 = (int64)s.length;
+  var run: int64 = 0;
+  for i in 0..n {
+    var c: uint8 = s.chars[i];
+    if (c == q || (d->escape != (uint8)0 && c == d->escape)) {
+      if (!put_bytes(w, s.chars + run, i - run)) { return false; }
+      if (c == q && (d->double_quote || d->escape == (uint8)0)) {
+        if (!put(w, q)) { return false; }
+      } else {
+        if (!put(w, d->escape)) { return false; }
+      }
+      run = i;
+    }
+  }
+  if (!put_bytes(w, s.chars + run, n - run)) { return false; }
+  return put(w, q);
+}
+
+// Writes with the escape byte before each special byte, for when quoting
+// is off.
+fn write_escaped(w: CsvWriter*, s: string) -> bool {
+  var d: CsvDialect* = &w->d;
+  var e: uint8 = d->escape;
+  var n: int64 = (int64)s.length;
+  var run: int64 = 0;
+  for i in 0..n {
+    var c: uint8 = s.chars[i];
+    var special: bool = c == d->delimiter || c == e || c == (uint8)13 || c == (uint8)10 ||
+      (d->quote != (uint8)0 && c == d->quote) ||
+      (d->terminator != (uint8)CSV_TERM_ANY && c == d->terminator);
+    if (i == 0 && d->skip_initial_space && c == (uint8)' ') { special = true; }
+    if (i == 0 && w->nf == 1 && d->comment != (uint8)0 && c == d->comment) { special = true; }
+    if (special) {
+      if (!put_bytes(w, s.chars + run, i - run)) { return false; }
+      if (!put(w, e)) { return false; }
+      run = i;
+    }
+  }
+  return put_bytes(w, s.chars + run, n - run);
+}
+
+@inline fn write_one(w: CsvWriter*, s: string, numeric: bool) -> bool {
+  if (w->failed) { return false; }
+  if (w->nf > 0 && !put(w, w->d.delimiter)) { return false; }
+  w->nf = w->nf + 1;
+  w->last_bare_empty = false;
+  var style: int32 = w->d.quote_style;
+  if (w->d.quote == (uint8)0 || style == CSV_QUOTE_NEVER) {
+    if (w->d.escape != (uint8)0) { return write_escaped(w, s); }
+    return put_bytes(w, s.chars, (int64)s.length);
+  }
+  var quote: bool = false;
+  if (style == CSV_QUOTE_ALL) {
+    quote = true;
+  } else if (style == CSV_QUOTE_NON_NUMERIC && !numeric) {
+    quote = true;
+  } else {
+    quote = needs_quotes(w, s);
+  }
+  if (quote) { return write_quoted(w, s); }
+  w->last_bare_empty = s.length == 0;
+  return put_bytes(w, s.chars, (int64)s.length);
+}
+
+// Writes one field of the current record.
+export fn csv_write_field(w: CsvWriter*, s: string) -> bool {
+  return write_one(w, s, false);
+}
+
+// Writes a field holding text that is already a number, so
+// CSV_QUOTE_NON_NUMERIC leaves it bare.
+export fn csv_write_number_text(w: CsvWriter*, s: string) -> bool {
+  return write_one(w, s, true);
+}
+
+export fn csv_write_i64(w: CsvWriter*, v: int64) -> bool {
+  var b: uint8[24];
+  return write_one(w, i64_to_str(v, &b[0], 24), true);
+}
+
+export fn csv_write_u64(w: CsvWriter*, v: uint64) -> bool {
+  var b: uint8[24];
+  var at: int64 = 24;
+  if (v == 0) {
+    at = 23;
+    b[23] = (uint8)'0';
+  }
+  while (v != 0) {
+    at = at - 1;
+    b[at] = (uint8)'0' + (uint8)(v % 10);
+    v = v / 10;
+  }
+  return write_one(w, str_from_bytes((cstring)&b[at], 24 - at), true);
+}
+
+// Shortest text that reads back to the same value (Python repr style).
+export fn csv_write_f64(w: CsvWriter*, v: float64) -> bool {
+  var b: uint8[40];
+  var n: int32 = csv_format_f64(v, &b[0]);
+  return write_one(w, str_from_bytes((cstring)&b[0], (int64)n), true);
+}
+
+export fn csv_write_f32(w: CsvWriter*, v: float32) -> bool {
+  var b: uint8[40];
+  var n: int32 = csv_format_f32(v, &b[0]);
+  return write_one(w, str_from_bytes((cstring)&b[0], (int64)n), true);
+}
+
+// Writes true or false.
+export fn csv_write_bool(w: CsvWriter*, v: bool) -> bool {
+  if (v) { return write_one(w, "true", false); }
+  return write_one(w, "false", false);
+}
+
+// Ends the current record with the dialect's line end.
+export fn csv_write_end(w: CsvWriter*) -> bool {
+  if (w->failed) { return false; }
+  if (w->nf == 1 && w->last_bare_empty) {
+    // A lone empty field would read back as a blank line: write "".
+    if (!put(w, w->d.quote) || !put(w, w->d.quote)) { return false; }
+  }
+  w->nf = 0;
+  w->records = w->records + 1;
+  var ok: bool = true;
+  if (w->d.terminator != (uint8)CSV_TERM_ANY) {
+    ok = put(w, w->d.terminator);
+  } else if (w->d.line_end == CSV_EOL_LF) {
+    ok = put(w, (uint8)10);
+  } else if (w->d.line_end == CSV_EOL_CR) {
+    ok = put(w, (uint8)13);
+  } else {
+    ok = put(w, (uint8)13) && put(w, (uint8)10);
+  }
+  if (!ok) { return false; }
+  if (w->sink != SINK_MEM && w->len >= FLUSH_AT) { return csv_writer_flush(w); }
+  return true;
+}
+
+// Writes a whole record: csv_write_row(w, "a", "b", "c").
+export fn csv_write_row(w: CsvWriter*, fields: string[..]) -> bool {
+  for f in fields {
+    if (!csv_write_field(w, f)) { return false; }
+  }
+  return csv_write_end(w);
+}
+
+// Writes a record read by a CsvReader.
+export fn csv_write_record(w: CsvWriter*, rec: CsvRecord*) -> bool {
+  for i in 0..rec->n {
+    if (!csv_write_field(w, rec->fields[i])) { return false; }
+  }
+  return csv_write_end(w);
+}
+
+// Everything written so far that has not been flushed. For a memory writer
+// that is the whole output. The view is valid until the next write.
+export fn csv_writer_bytes(w: CsvWriter*) -> string {
+  return str_from_bytes((cstring)w->buf, w->len);
+}
+
+export fn csv_writer_error(w: CsvWriter*) -> CsvError {
+  return w->err;
+}
+
+export fn csv_writer_free(w: CsvWriter*) {
+  if (w == 0) { return; }
+  if (w->own_fd) { file_close(w->fd); }
+  free(w->buf);
+  free(w);
+}
+
+// Flushes, closes a file opened by csv_writer_create, and frees the writer.
+// Returns false if anything failed along the way.
+export fn csv_writer_close(w: CsvWriter*) -> bool {
+  if (w == 0) { return false; }
+  var ok: bool = csv_writer_flush(w) && !w->failed;
+  csv_writer_free(w);
+  return ok;
+}

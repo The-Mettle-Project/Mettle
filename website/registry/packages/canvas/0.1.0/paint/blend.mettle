@@ -1,0 +1,202 @@
+// Blend modes from W3C Compositing and Blending Level 1: the Porter-Duff
+// operators, the separable modes and the non-separable (hue, saturation,
+// color, luminosity). Colors are premultiplied floats 0 to 1.
+
+import "../core/base";
+
+export const CANVAS_SRC_OVER: int32 = 0;
+export const CANVAS_CLEAR: int32 = 1;
+export const CANVAS_SRC: int32 = 2;
+export const CANVAS_DST: int32 = 3;
+export const CANVAS_DST_OVER: int32 = 4;
+export const CANVAS_SRC_IN: int32 = 5;
+export const CANVAS_DST_IN: int32 = 6;
+export const CANVAS_SRC_OUT: int32 = 7;
+export const CANVAS_DST_OUT: int32 = 8;
+export const CANVAS_SRC_ATOP: int32 = 9;
+export const CANVAS_DST_ATOP: int32 = 10;
+export const CANVAS_XOR: int32 = 11;
+export const CANVAS_PLUS: int32 = 12;
+export const CANVAS_MULTIPLY: int32 = 13;
+export const CANVAS_SCREEN: int32 = 14;
+export const CANVAS_OVERLAY: int32 = 15;
+export const CANVAS_DARKEN: int32 = 16;
+export const CANVAS_LIGHTEN: int32 = 17;
+export const CANVAS_COLOR_DODGE: int32 = 18;
+export const CANVAS_COLOR_BURN: int32 = 19;
+export const CANVAS_HARD_LIGHT: int32 = 20;
+export const CANVAS_SOFT_LIGHT: int32 = 21;
+export const CANVAS_DIFFERENCE: int32 = 22;
+export const CANVAS_EXCLUSION: int32 = 23;
+export const CANVAS_HUE: int32 = 24;
+export const CANVAS_SATURATION: int32 = 25;
+export const CANVAS_COLOR: int32 = 26;
+export const CANVAS_LUMINOSITY: int32 = 27;
+export const CANVAS_BLEND_COUNT: int32 = 28;
+
+/// The CSS name of a blend mode ("source-over", "multiply", ...).
+export fn canvas_blend_name(mode: int32) -> string {
+  if (mode == CANVAS_SRC_OVER) { return "source-over"; }
+  if (mode == CANVAS_CLEAR) { return "clear"; }
+  if (mode == CANVAS_SRC) { return "copy"; }
+  if (mode == CANVAS_DST) { return "destination"; }
+  if (mode == CANVAS_DST_OVER) { return "destination-over"; }
+  if (mode == CANVAS_SRC_IN) { return "source-in"; }
+  if (mode == CANVAS_DST_IN) { return "destination-in"; }
+  if (mode == CANVAS_SRC_OUT) { return "source-out"; }
+  if (mode == CANVAS_DST_OUT) { return "destination-out"; }
+  if (mode == CANVAS_SRC_ATOP) { return "source-atop"; }
+  if (mode == CANVAS_DST_ATOP) { return "destination-atop"; }
+  if (mode == CANVAS_XOR) { return "xor"; }
+  if (mode == CANVAS_PLUS) { return "lighter"; }
+  if (mode == CANVAS_MULTIPLY) { return "multiply"; }
+  if (mode == CANVAS_SCREEN) { return "screen"; }
+  if (mode == CANVAS_OVERLAY) { return "overlay"; }
+  if (mode == CANVAS_DARKEN) { return "darken"; }
+  if (mode == CANVAS_LIGHTEN) { return "lighten"; }
+  if (mode == CANVAS_COLOR_DODGE) { return "color-dodge"; }
+  if (mode == CANVAS_COLOR_BURN) { return "color-burn"; }
+  if (mode == CANVAS_HARD_LIGHT) { return "hard-light"; }
+  if (mode == CANVAS_SOFT_LIGHT) { return "soft-light"; }
+  if (mode == CANVAS_DIFFERENCE) { return "difference"; }
+  if (mode == CANVAS_EXCLUSION) { return "exclusion"; }
+  if (mode == CANVAS_HUE) { return "hue"; }
+  if (mode == CANVAS_SATURATION) { return "saturation"; }
+  if (mode == CANVAS_COLOR) { return "color"; }
+  if (mode == CANVAS_LUMINOSITY) { return "luminosity"; }
+  return "";
+}
+
+/// The blend mode with a CSS name, or -1.
+export fn canvas_blend_by_name(name: string) -> int32 {
+  for i in 0..CANVAS_BLEND_COUNT {
+    if (canvas_blend_name(i) == name) { return i; }
+  }
+  return -1;
+}
+
+// Separable blend function B(cb, cs) on straight colors.
+fn sep(mode: int32, cb: float32, cs: float32) -> float32 {
+  if (mode == CANVAS_MULTIPLY) { return cb * cs; }
+  if (mode == CANVAS_SCREEN) { return cb + cs - cb * cs; }
+  if (mode == CANVAS_OVERLAY) { return sep(CANVAS_HARD_LIGHT, cs, cb); }
+  if (mode == CANVAS_DARKEN) { return canvas_minf(cb, cs); }
+  if (mode == CANVAS_LIGHTEN) { return canvas_maxf(cb, cs); }
+  if (mode == CANVAS_COLOR_DODGE) {
+    if (cb <= 0.0) { return 0.0; }
+    if (cs >= 1.0) { return 1.0; }
+    return canvas_minf(1.0, cb / (1.0 - cs));
+  }
+  if (mode == CANVAS_COLOR_BURN) {
+    if (cb >= 1.0) { return 1.0; }
+    if (cs <= 0.0) { return 0.0; }
+    return 1.0 - canvas_minf(1.0, (1.0 - cb) / cs);
+  }
+  if (mode == CANVAS_HARD_LIGHT) {
+    if (cs <= 0.5) { return cb * 2.0 * cs; }
+    var s2: float32 = 2.0 * cs - 1.0;
+    return cb + s2 - cb * s2;
+  }
+  if (mode == CANVAS_SOFT_LIGHT) {
+    if (cs <= 0.5) { return cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb); }
+    var dd: float32 = 0.0;
+    if (cb <= 0.25) { dd = ((16.0 * cb - 12.0) * cb + 4.0) * cb; }
+    else { dd = canvas_fsqrt(cb); }
+    return cb + (2.0 * cs - 1.0) * (dd - cb);
+  }
+  if (mode == CANVAS_DIFFERENCE) { return canvas_absf(cb - cs); }
+  if (mode == CANVAS_EXCLUSION) { return cb + cs - 2.0 * cb * cs; }
+  return cs;
+}
+
+@inline fn lum(r: float32, g: float32, b: float32) -> float32 { return 0.3 * r + 0.59 * g + 0.11 * b; }
+
+// ClipColor and SetLum from the spec, in place on c[0..3].
+fn set_lum(c: float32*, l: float32) {
+  var d: float32 = l - lum(c[0], c[1], c[2]);
+  c[0] = c[0] + d; c[1] = c[1] + d; c[2] = c[2] + d;
+  var ll: float32 = lum(c[0], c[1], c[2]);
+  var n: float32 = canvas_minf(c[0], canvas_minf(c[1], c[2]));
+  var x: float32 = canvas_maxf(c[0], canvas_maxf(c[1], c[2]));
+  if (n < 0.0) {
+    var k: float32 = ll - n;
+    for i in 0..3 { if (k > 0.0) { c[i] = ll + (c[i] - ll) * ll / k; } else { c[i] = ll; } }
+  }
+  if (x > 1.0) {
+    var k2: float32 = x - ll;
+    for i in 0..3 { if (k2 > 0.0) { c[i] = ll + (c[i] - ll) * (1.0 - ll) / k2; } else { c[i] = ll; } }
+  }
+}
+
+@inline fn sat(r: float32, g: float32, b: float32) -> float32 {
+  return canvas_maxf(r, canvas_maxf(g, b)) - canvas_minf(r, canvas_minf(g, b));
+}
+
+// SetSat from the spec, in place.
+fn set_sat(c: float32*, s: float32) {
+  var mx: float32 = canvas_maxf(c[0], canvas_maxf(c[1], c[2]));
+  var mn: float32 = canvas_minf(c[0], canvas_minf(c[1], c[2]));
+  var range: float32 = mx - mn;
+  for i in 0..3 {
+    if (range > 0.0) { c[i] = (c[i] - mn) * s / range; } else { c[i] = 0.0; }
+  }
+}
+
+/// Blends premultiplied source s onto destination d with mode, into o.
+/// Each is 4 floats r, g, b, a.
+export fn canvas_blend_px(mode: int32, s: float32*, d: float32*, o: float32*) {
+  var sa: float32 = s[3];
+  var da: float32 = d[3];
+  if (mode <= CANVAS_PLUS) {
+    var fa: float32 = 0.0;
+    var fb: float32 = 0.0;
+    if (mode == CANVAS_SRC_OVER) { fa = 1.0; fb = 1.0 - sa; }
+    else if (mode == CANVAS_SRC) { fa = 1.0; }
+    else if (mode == CANVAS_DST) { fb = 1.0; }
+    else if (mode == CANVAS_DST_OVER) { fa = 1.0 - da; fb = 1.0; }
+    else if (mode == CANVAS_SRC_IN) { fa = da; }
+    else if (mode == CANVAS_DST_IN) { fb = sa; }
+    else if (mode == CANVAS_SRC_OUT) { fa = 1.0 - da; }
+    else if (mode == CANVAS_DST_OUT) { fb = 1.0 - sa; }
+    else if (mode == CANVAS_SRC_ATOP) { fa = da; fb = 1.0 - sa; }
+    else if (mode == CANVAS_DST_ATOP) { fa = 1.0 - da; fb = sa; }
+    else if (mode == CANVAS_XOR) { fa = 1.0 - da; fb = 1.0 - sa; }
+    else if (mode == CANVAS_PLUS) { fa = 1.0; fb = 1.0; }
+    for i in 0..4 { o[i] = canvas_minf(s[i] * fa + d[i] * fb, 1.0); }
+    return;
+  }
+  var ao: float32 = sa + da - sa * da;
+  // straight colors
+  var cs: float32[3];
+  var cb: float32[3];
+  for i in 0..3 {
+    cs[i] = 0.0; cb[i] = 0.0;
+    if (sa > 0.0) { cs[i] = canvas_minf(s[i] / sa, 1.0); }
+    if (da > 0.0) { cb[i] = canvas_minf(d[i] / da, 1.0); }
+  }
+  var bl: float32[3];
+  if (mode < CANVAS_HUE) {
+    for i in 0..3 { bl[i] = sep(mode, cb[i], cs[i]); }
+  } else {
+    if (mode == CANVAS_HUE) {
+      bl[0] = cs[0]; bl[1] = cs[1]; bl[2] = cs[2];
+      set_sat(&bl[0], sat(cb[0], cb[1], cb[2]));
+      set_lum(&bl[0], lum(cb[0], cb[1], cb[2]));
+    } else if (mode == CANVAS_SATURATION) {
+      bl[0] = cb[0]; bl[1] = cb[1]; bl[2] = cb[2];
+      set_sat(&bl[0], sat(cs[0], cs[1], cs[2]));
+      set_lum(&bl[0], lum(cb[0], cb[1], cb[2]));
+    } else if (mode == CANVAS_COLOR) {
+      bl[0] = cs[0]; bl[1] = cs[1]; bl[2] = cs[2];
+      set_lum(&bl[0], lum(cb[0], cb[1], cb[2]));
+    } else {
+      bl[0] = cb[0]; bl[1] = cb[1]; bl[2] = cb[2];
+      set_lum(&bl[0], lum(cs[0], cs[1], cs[2]));
+    }
+  }
+  for i in 0..3 {
+    var v: float32 = (1.0 - da) * s[i] + (1.0 - sa) * d[i] + sa * da * bl[i];
+    o[i] = canvas_clampf(v, 0.0, ao);
+  }
+  o[3] = ao;
+}

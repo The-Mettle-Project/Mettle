@@ -1,0 +1,710 @@
+// Policies and starting a program inside a sandbox.
+//
+// A SandboxPolicy says what the child may see and do. sandbox_policy_init
+// gives secure defaults, and the builder functions relax or tighten them:
+//
+//   - every namespace is new: user, mount, PID, network, IPC, UTS, cgroup.
+//     The child cannot see host processes, has no network but a loopback
+//     device, and its hostname is "sandbox";
+//   - the child's uid and gid stay what they are outside (mapped into the
+//     new user namespace), with no supplementary groups;
+//   - all capabilities are dropped and no_new_privs is set;
+//   - the environment is empty except PATH;
+//   - descriptors other than 0, 1 and 2 are closed at exec;
+//   - the child gets a new session (no access to the controlling terminal)
+//     and is killed if the parent dies.
+//
+// The child is made with clone and new namespaces, then sets itself up in a
+// fixed order before exec, the same order as bubblewrap and nsjail:
+//   user id maps, hostname, loopback, mounts and new root, PID-1 init,
+//   rlimits, session and descriptors, capabilities, no_new_privs,
+//   Landlock, seccomp last, then exec.
+// If any step fails the child reports the step and errno through a
+// close-on-exec pipe and exits; sandbox_spawn then returns -errno and names
+// the step in SandboxChild.failed_step.
+//
+// The parent must be single-threaded when it calls sandbox_spawn: the kernel
+// refuses a new user namespace for a multi-threaded process.
+
+import "sys.mettle";
+import "rlimit.mettle";
+import "caps.mettle";
+import "seccomp.mettle";
+import "mount.mettle";
+import "landlock.mettle";
+import "std/mem";
+
+export const SANDBOX_NS_MOUNT: int64 = 0x00020000;
+export const SANDBOX_NS_CGROUP: int64 = 0x02000000;
+export const SANDBOX_NS_UTS: int64 = 0x04000000;
+export const SANDBOX_NS_IPC: int64 = 0x08000000;
+export const SANDBOX_NS_USER: int64 = 0x10000000;
+export const SANDBOX_NS_PID: int64 = 0x20000000;
+export const SANDBOX_NS_NET: int64 = 0x40000000;
+export const SANDBOX_NS_ALL: int64 = 0x7e020000;
+
+// What a child does with each standard stream.
+export const SANDBOX_IO_INHERIT = 0;   // share the parent's
+export const SANDBOX_IO_PIPE = 1;      // a pipe; the parent gets the other end
+export const SANDBOX_IO_NULL = 2;      // /dev/null
+
+// The setup steps, as reported in SandboxChild.failed_step.
+export const SANDBOX_STEP_NONE = 0;
+export const SANDBOX_STEP_CLONE = 1;
+export const SANDBOX_STEP_PARENT = 2;
+export const SANDBOX_STEP_ID_MAP = 3;
+export const SANDBOX_STEP_HOSTNAME = 4;
+export const SANDBOX_STEP_LOOPBACK = 5;
+export const SANDBOX_STEP_MOUNT = 6;
+export const SANDBOX_STEP_INIT = 7;
+export const SANDBOX_STEP_RLIMIT = 8;
+export const SANDBOX_STEP_STDIO = 10;
+export const SANDBOX_STEP_CAPS = 11;
+export const SANDBOX_STEP_NO_NEW_PRIVS = 12;
+export const SANDBOX_STEP_SECCOMP = 13;
+export const SANDBOX_STEP_EXEC = 14;
+export const SANDBOX_STEP_LANDLOCK = 15;
+
+const SBX_MAX_RLIMITS = 16;
+const SBX_SIGCHLD = 17;
+const SBX_SIGKILL = 9;
+const SBX_MS_REC = 0x4000;
+const SBX_MS_PRIVATE = 0x40000;
+const SBX_CLOSE_RANGE_CLOEXEC = 4;
+const SBX_DEFAULT_PATH: string = "PATH=/usr/local/bin:/usr/bin:/bin";
+
+export struct SandboxPolicy {
+  ns: int64;              // SANDBOX_NS_* flags for the new namespaces
+  uid: int64;             // uid inside, or -1 for the same as outside
+  gid: int64;
+  hostname: string;
+  loopback: int32;        // 1: bring lo up in a new network namespace
+  env: string*;           // "NAME=value" entries
+  nenv: int64;
+  capenv: int64;
+  cwd: string;            // working directory inside; empty means "/"
+  rl_res: int32[16];
+  rl_soft: uint64[16];
+  rl_hard: uint64[16];
+  nrl: int32;
+  caps_keep: uint64;      // capabilities the program keeps (bit n = cap n)
+  seccomp: SandboxSeccomp*;
+  landlock: SandboxLandlock*;
+  die_with_parent: int32;
+  new_session: int32;
+  stdin_mode: int32;
+  stdout_mode: int32;
+  stderr_mode: int32;
+  mounts: SandboxMounts;
+  err: int64;             // first builder error; sandbox_spawn returns it
+}
+
+// A started sandbox. The pipe fields hold the parent's ends of any
+// SANDBOX_IO_PIPE streams, or -1.
+export struct SandboxChild {
+  pid: int64;
+  stdin_fd: int64;
+  stdout_fd: int64;
+  stderr_fd: int64;
+  failed_step: int32;     // when sandbox_spawn fails: the SANDBOX_STEP_* that failed
+  done: int32;
+}
+
+// How a sandboxed program ended.
+export struct SandboxStatus {
+  signaled: int32;   // 1 if a signal killed it
+  code: int32;       // exit code when signaled is 0
+  signal: int32;     // the signal when signaled is 1
+}
+
+// ---- building a policy -----------------------------------------------------
+
+export fn sandbox_policy_init(p: SandboxPolicy*) {
+  var blank: SandboxPolicy;
+  *p = blank;
+  p->ns = SANDBOX_NS_ALL;
+  p->uid = -1;
+  p->gid = -1;
+  p->hostname = "sandbox";
+  p->loopback = 1;
+  p->die_with_parent = 1;
+  p->new_session = 1;
+  sandbox_mounts_init(&p->mounts);
+}
+
+export fn sandbox_policy_free(p: SandboxPolicy*) {
+  if (p->env != (string*)0) { free(p->env); }
+  sandbox_mounts_free(&p->mounts);
+  sandbox_policy_init(p);
+}
+
+fn sbx_policy_fail(p: SandboxPolicy*, e: int64) -> int64 {
+  if (p->err == 0) { p->err = e; }
+  return e;
+}
+
+// Keeps the parent's namespace of these kinds instead of making a new one,
+// for example SANDBOX_NS_NET to give the program the host network.
+export fn sandbox_policy_share(p: SandboxPolicy*, ns: int64) {
+  p->ns = p->ns & ~ns;
+}
+
+// The uid and gid the program sees (for example 0, 0 to look like root
+// inside its user namespace, which gives no power outside it).
+export fn sandbox_policy_ids(p: SandboxPolicy*, uid: int64, gid: int64) {
+  p->uid = uid;
+  p->gid = gid;
+}
+
+export fn sandbox_policy_hostname(p: SandboxPolicy*, name: string) {
+  p->hostname = name;
+}
+
+// Adds one "NAME=value" environment entry. The first call replaces the
+// default PATH, so include a PATH entry if the program needs one.
+export fn sandbox_policy_env(p: SandboxPolicy*, entry: string) -> int64 {
+  if (p->nenv == p->capenv) {
+    var nc: int64 = 8;
+    if (p->capenv > 0) { nc = p->capenv * 2; }
+    var e: string* = (string*)realloc(p->env, nc * sizeof(string));
+    if (e == (string*)0) { return sbx_policy_fail(p, -SANDBOX_ENOMEM); }
+    p->env = e;
+    p->capenv = nc;
+  }
+  p->env[p->nenv] = entry;
+  p->nenv = p->nenv + 1;
+  return 0;
+}
+
+export fn sandbox_policy_cwd(p: SandboxPolicy*, dir: string) {
+  p->cwd = dir;
+}
+
+// Sets an rlimit for the program (SANDBOX_RLIMIT_*). Returns 0 or -errno.
+export fn sandbox_policy_rlimit(p: SandboxPolicy*, resource: int32, soft: uint64, hard: uint64) -> int64 {
+  if (resource < 0 || resource >= SANDBOX_RLIMIT_COUNT || soft > hard) { return sbx_policy_fail(p, -SANDBOX_EINVAL); }
+  for i in 0..p->nrl {
+    if (p->rl_res[i] == resource) { p->rl_soft[i] = soft; p->rl_hard[i] = hard; return 0; }
+  }
+  if (p->nrl >= SBX_MAX_RLIMITS) { return sbx_policy_fail(p, -SANDBOX_E2BIG); }
+  p->rl_res[p->nrl] = resource;
+  p->rl_soft[p->nrl] = soft;
+  p->rl_hard[p->nrl] = hard;
+  p->nrl = p->nrl + 1;
+  return 0;
+}
+
+// Capabilities the program keeps inside its namespaces (default none).
+export fn sandbox_policy_keep_caps(p: SandboxPolicy*, mask: uint64) {
+  p->caps_keep = mask;
+}
+
+// A seccomp filter loaded just before exec. The policy keeps a pointer:
+// the filter must live until sandbox_spawn returns.
+export fn sandbox_policy_seccomp(p: SandboxPolicy*, f: SandboxSeccomp*) {
+  p->seccomp = f;
+}
+
+export fn sandbox_policy_stdio(p: SandboxPolicy*, stdin_mode: int32, stdout_mode: int32, stderr_mode: int32) {
+  p->stdin_mode = stdin_mode;
+  p->stdout_mode = stdout_mode;
+  p->stderr_mode = stderr_mode;
+}
+
+// A Landlock ruleset applied just before seccomp, after the new root is in
+// place (so its paths are the ones the program sees). The policy keeps a
+// pointer: the ruleset must live until sandbox_spawn returns.
+export fn sandbox_policy_landlock(p: SandboxPolicy*, l: SandboxLandlock*) {
+  p->landlock = l;
+}
+
+// ---- what the child gets, prepared before clone -----------------------------
+
+struct SbxExec {
+  flags: int64;
+  map_users: int32;
+  uid_map: uint8[48];
+  uid_map_len: int64;
+  gid_map: uint8[48];
+  gid_map_len: int64;
+  hostname: uint8*;
+  hostname_len: int64;
+  loopback: int32;
+  argv: uint8**;
+  envp: uint8**;
+  paths: uint8**;
+  cwd: uint8*;
+  nrl: int32;
+  rl_res: int32[16];
+  rl_soft: uint64[16];
+  rl_hard: uint64[16];
+  caps_keep: uint64;
+  prog: SandboxBpf*;
+  prog_len: int64;
+  ll: SbxLandlockPlan;
+  die_with_parent: int32;
+  new_session: int32;
+  parent_pid: int64;
+  in_fd: int64;
+  out_fd: int64;
+  err_fd: int64;
+  errw: int64;
+  errv: int64;
+  mounts: SbxMountPlan;
+}
+
+fn sbx_map_line(dst: uint8*, inner: uint64, outer: uint64) -> int64 {
+  var n: int64 = sbx_fmt_uint(dst, inner);
+  dst[n] = ' ';
+  n = n + 1;
+  n = n + sbx_fmt_uint(dst + n, outer);
+  dst[n] = ' ';
+  dst[n + 1] = '1';
+  dst[n + 2] = '\n';
+  return n + 3;
+}
+
+fn sbx_has_slash(s: string) -> bool {
+  for c in s { if (c == '/') { return true; } }
+  return false;
+}
+
+// The PATH value from the child's environment entries.
+fn sbx_child_path(envp: uint8**) -> uint8* {
+  var i: int64 = 0;
+  while (envp[i] != (uint8*)0) {
+    var e: uint8* = envp[i];
+    if (e[0] == 'P' && e[1] == 'A' && e[2] == 'T' && e[3] == 'H' && e[4] == '=') { return e + 5; }
+    i = i + 1;
+  }
+  return (uint8*)0;
+}
+
+fn sbx_free_list(l: uint8**) {
+  if (l == (uint8**)0) { return; }
+  var i: int64 = 0;
+  while (l[i] != (uint8*)0) { free(l[i]); i = i + 1; }
+  free(l);
+}
+
+fn sbx_exec_free(x: SbxExec*) {
+  sbx_free_list(x->argv);
+  sbx_free_list(x->envp);
+  sbx_free_list(x->paths);
+  if (x->hostname != (uint8*)0) { free(x->hostname); }
+  if (x->cwd != (uint8*)0) { free(x->cwd); }
+  sbx_mount_plan_free(&x->mounts);
+  sbx_landlock_plan_free(&x->ll);
+}
+
+fn sbx_list_new(n: int64) -> uint8** {
+  return (uint8**)calloc(n + 1, 8);
+}
+
+// Builds the execve candidates: argv[0] itself, or argv[0] under each PATH entry.
+fn sbx_prep_paths(x: SbxExec*, prog: string) -> int64 {
+  if (sbx_has_slash(prog)) {
+    x->paths = sbx_list_new(1);
+    if (x->paths == (uint8**)0) { return -SANDBOX_ENOMEM; }
+    x->paths[0] = sbx_cstr(prog);
+    if (x->paths[0] == (uint8*)0) { return -SANDBOX_ENOMEM; }
+    return 0;
+  }
+  var path: uint8* = sbx_child_path(x->envp);
+  if (path == (uint8*)0) { return -SANDBOX_ENOENT; }
+  var plen: int64 = sbx_strlen(path);
+  var count: int64 = 1;
+  for i in 0..plen { if (path[i] == ':') { count = count + 1; } }
+  x->paths = sbx_list_new(count);
+  if (x->paths == (uint8**)0) { return -SANDBOX_ENOMEM; }
+  var m: int64 = (int64)prog.length;
+  var k: int64 = 0;
+  var start: int64 = 0;
+  for i in 0..=plen {
+    if (i == plen || path[i] == ':') {
+      var dl: int64 = i - start;
+      if (dl > 0) {
+        var c: uint8* = (uint8*)malloc(dl + m + 2);
+        if (c == (uint8*)0) { return -SANDBOX_ENOMEM; }
+        memcpy(c, path + start, dl);
+        c[dl] = '/';
+        memcpy(c + dl + 1, prog.chars, m);
+        c[dl + 1 + m] = 0;
+        x->paths[k] = c;
+        k = k + 1;
+      }
+      start = i + 1;
+    }
+  }
+  if (k == 0) { return -SANDBOX_ENOENT; }
+  return 0;
+}
+
+fn sbx_prep(p: SandboxPolicy*, argv: string[], x: SbxExec*) -> int64 {
+  var blank: SbxExec;
+  *x = blank;
+  x->in_fd = -1;
+  x->out_fd = -1;
+  x->err_fd = -1;
+  x->errw = -1;
+  if (p->err != 0) { return p->err; }
+  if (argv.length == 0 || argv[0].length == 0) { return -SANDBOX_EINVAL; }
+  if ((p->ns & ~SANDBOX_NS_ALL) != 0) { return -SANDBOX_EINVAL; }
+  x->flags = p->ns;
+
+  if ((p->ns & SANDBOX_NS_USER) != 0) {
+    x->map_users = 1;
+    var ou: uint64 = (uint64)syscall(SBX_NR_GETUID);
+    var og: uint64 = (uint64)syscall(SBX_NR_GETGID);
+    var iu: uint64 = ou;
+    var ig: uint64 = og;
+    if (p->uid >= 0) { iu = (uint64)p->uid; }
+    if (p->gid >= 0) { ig = (uint64)p->gid; }
+    x->uid_map_len = sbx_map_line(&x->uid_map[0], iu, ou);
+    x->gid_map_len = sbx_map_line(&x->gid_map[0], ig, og);
+  } else if (p->uid >= 0 || p->gid >= 0) {
+    return -SANDBOX_EINVAL;   // id mapping needs a user namespace
+  }
+  if ((p->ns & SANDBOX_NS_UTS) != 0 && p->hostname.length > 0) {
+    if (p->hostname.length > 64) { return -SANDBOX_EINVAL; }
+    x->hostname = sbx_cstr(p->hostname);
+    if (x->hostname == (uint8*)0) { return -SANDBOX_ENOMEM; }
+    x->hostname_len = (int64)p->hostname.length;
+  }
+  if ((p->ns & SANDBOX_NS_NET) != 0) { x->loopback = p->loopback; }
+
+  var na: int64 = (int64)argv.length;
+  x->argv = sbx_list_new(na);
+  if (x->argv == (uint8**)0) { return -SANDBOX_ENOMEM; }
+  for i in 0..na {
+    x->argv[i] = sbx_cstr(argv[i]);
+    if (x->argv[i] == (uint8*)0) { return -SANDBOX_ENOMEM; }
+  }
+  var ne: int64 = p->nenv;
+  if (ne == 0) { ne = 1; }
+  x->envp = sbx_list_new(ne);
+  if (x->envp == (uint8**)0) { return -SANDBOX_ENOMEM; }
+  for i in 0..ne {
+    var entry: string = SBX_DEFAULT_PATH;
+    if (p->nenv > 0) { entry = p->env[i]; }
+    x->envp[i] = sbx_cstr(entry);
+    if (x->envp[i] == (uint8*)0) { return -SANDBOX_ENOMEM; }
+  }
+  var r: int64 = sbx_prep_paths(x, argv[0]);
+  if (r < 0) { return r; }
+  var cwd: string = p->cwd;
+  if (cwd.length == 0) { cwd = "/"; }
+  x->cwd = sbx_cstr(cwd);
+  if (x->cwd == (uint8*)0) { return -SANDBOX_ENOMEM; }
+
+  x->nrl = p->nrl;
+  for i in 0..p->nrl {
+    x->rl_res[i] = p->rl_res[i];
+    x->rl_soft[i] = p->rl_soft[i];
+    x->rl_hard[i] = p->rl_hard[i];
+  }
+  x->caps_keep = p->caps_keep;
+  if (p->seccomp != (SandboxSeccomp*)0) {
+    r = sandbox_seccomp_compile(p->seccomp);
+    if (r < 0) { return r; }
+    x->prog = p->seccomp->prog;
+    x->prog_len = p->seccomp->prog_len;
+  }
+  if (p->landlock != (SandboxLandlock*)0) {
+    r = sbx_landlock_plan(p->landlock, &x->ll);
+    if (r < 0) { return r; }
+    if (x->ll.active == 0 && p->landlock->strict != 0) { return -SANDBOX_EOPNOTSUPP; }
+  }
+  x->die_with_parent = p->die_with_parent;
+  x->new_session = p->new_session;
+  x->parent_pid = syscall(SBX_NR_GETPID);
+  if (p->mounts.n > 0 && (p->ns & SANDBOX_NS_MOUNT) == 0) { return -SANDBOX_EINVAL; }
+  return sbx_mount_plan(&p->mounts, (p->ns & SANDBOX_NS_PID) != 0, &x->mounts);
+}
+
+// ---- the child (only system calls from here; never returns) ----------------
+
+@noinline fn sbx_die(x: SbxExec*, step: int32, err: int64) {
+  x->errv = ((int64)step << 32) | (err & 0xffffffff);
+  syscall(SBX_NR_WRITE, x->errw, &x->errv, 8);
+  while (true) { syscall(SBX_NR_EXIT_GROUP, 127); }
+}
+
+fn sbx_check(x: SbxExec*, step: int32, r: int64) {
+  if (r < 0) { sbx_die(x, step, -r); }
+}
+
+// Brings the loopback device up in a new network namespace (SIOCSIFFLAGS).
+fn sbx_loopback_up() -> int64 {
+  var fd: int64 = syscall(SBX_NR_SOCKET, 2, 2 | SBX_O_CLOEXEC, 0);   // AF_INET, SOCK_DGRAM
+  if (fd < 0) { return fd; }
+  var ifr: uint8[40];
+  for i in 0..40 { ifr[i] = 0; }
+  ifr[0] = 'l';
+  ifr[1] = 'o';
+  var r: int64 = syscall(SBX_NR_IOCTL, fd, 0x8913, &ifr[0]);          // SIOCGIFFLAGS
+  if (r >= 0) {
+    ifr[16] = ifr[16] | 1;                                            // IFF_UP
+    r = syscall(SBX_NR_IOCTL, fd, 0x8914, &ifr[0]);                   // SIOCSIFFLAGS
+  }
+  sbx_close(fd);
+  return r;
+}
+
+// Marks every descriptor from 3 up close-on-exec.
+fn sbx_cloexec_rest() -> int64 {
+  var r: int64 = syscall(SBX_NR_CLOSE_RANGE, 3, 0xffffffff, SBX_CLOSE_RANGE_CLOEXEC);
+  if (r == 0) { return 0; }
+  // Kernels before 5.11: walk the descriptor table.
+  for fd in 3..65536 { syscall(SBX_NR_FCNTL, (int64)fd, 2, 1); }   // F_SETFD, FD_CLOEXEC
+  return 0;
+}
+
+fn sbx_decode(raw: int32, st: SandboxStatus*) {
+  var blank: SandboxStatus;
+  *st = blank;
+  if ((raw & 0x7f) == 0) {
+    st->code = (raw >> 8) & 0xff;
+  } else {
+    st->signaled = 1;
+    st->signal = raw & 0x7f;
+  }
+}
+
+// PID 1 of the new PID namespace: reaps orphans and exits with the program's
+// status. When it exits, the kernel kills everything left in the namespace.
+fn sbx_init(x: SbxExec*, main_pid: int64) {
+  sbx_close(x->errw);
+  while (true) {
+    var raw: int32 = 0;
+    var r: int64 = syscall(SBX_NR_WAIT4, -1, &raw, 0x40000000, 0);   // __WALL
+    if (r == main_pid) {
+      var st: SandboxStatus;
+      sbx_decode(raw, &st);
+      var code: int64 = (int64)st.code;
+      if (st.signaled != 0) { code = 128 + (int64)st.signal; }
+      while (true) { syscall(SBX_NR_EXIT_GROUP, code); }
+    }
+    if (r == -SANDBOX_ECHILD) {
+      while (true) { syscall(SBX_NR_EXIT_GROUP, 1); }
+    }
+  }
+}
+
+// The last steps, in the process that will exec the program.
+fn sbx_child_final(x: SbxExec*) {
+  for i in 0..x->nrl {
+    sbx_check(x, SANDBOX_STEP_RLIMIT, sandbox_rlimit_set(x->rl_res[i], x->rl_soft[i], x->rl_hard[i]));
+  }
+  if (x->new_session != 0) { sbx_check(x, SANDBOX_STEP_STDIO, syscall(SBX_NR_SETSID)); }
+  if (x->in_fd >= 0) { sbx_check(x, SANDBOX_STEP_STDIO, syscall(SBX_NR_DUP3, x->in_fd, 0, 0)); }
+  if (x->out_fd >= 0) { sbx_check(x, SANDBOX_STEP_STDIO, syscall(SBX_NR_DUP3, x->out_fd, 1, 0)); }
+  if (x->err_fd >= 0) { sbx_check(x, SANDBOX_STEP_STDIO, syscall(SBX_NR_DUP3, x->err_fd, 2, 0)); }
+  sbx_cloexec_rest();
+  sbx_check(x, SANDBOX_STEP_STDIO, syscall(SBX_NR_CHDIR, x->cwd));
+  sbx_check(x, SANDBOX_STEP_CAPS, sandbox_caps_drop(x->caps_keep));
+  sbx_check(x, SANDBOX_STEP_NO_NEW_PRIVS, sandbox_no_new_privs());
+  sbx_check(x, SANDBOX_STEP_LANDLOCK, sbx_landlock_apply(&x->ll));
+  if (x->prog != (SandboxBpf*)0) {
+    sbx_check(x, SANDBOX_STEP_SECCOMP, sbx_seccomp_install(x->prog, x->prog_len));
+  }
+  // Like execvp: skip ENOENT and ENOTDIR, remember EACCES, stop on anything else.
+  var err: int64 = SANDBOX_ENOENT;
+  var i: int64 = 0;
+  while (x->paths[i] != (uint8*)0) {
+    var e: int64 = -syscall(SBX_NR_EXECVE, x->paths[i], x->argv, x->envp);
+    if (e != SANDBOX_ENOENT && e != SANDBOX_ENOTDIR) {
+      err = e;
+      if (e != SANDBOX_EACCES) { break; }
+    }
+    i = i + 1;
+  }
+  sbx_die(x, SANDBOX_STEP_EXEC, err);
+}
+
+@noinline fn sbx_child(x: SbxExec*) {
+  var empty: int64 = 0;
+  syscall(SBX_NR_RT_SIGPROCMASK, 2, &empty, 0, 8);   // SIG_SETMASK: start with no signals blocked
+  if (x->die_with_parent != 0) {
+    sbx_check(x, SANDBOX_STEP_PARENT, sbx_parent_death_signal(SBX_SIGKILL));
+    // The parent may have died before the signal was armed.
+    if ((x->flags & SANDBOX_NS_PID) == 0 && syscall(SBX_NR_GETPPID) != x->parent_pid) {
+      sbx_die(x, SANDBOX_STEP_PARENT, SANDBOX_ESRCH);
+    }
+  }
+  if (x->map_users != 0) {
+    var deny: string = "deny";
+    var sg: string = "/proc/self/setgroups";
+    var um: string = "/proc/self/uid_map";
+    var gm: string = "/proc/self/gid_map";
+    sbx_check(x, SANDBOX_STEP_ID_MAP, sbx_write_file(sg.chars, deny.chars, 4));
+    sbx_check(x, SANDBOX_STEP_ID_MAP, sbx_write_file(um.chars, &x->uid_map[0], x->uid_map_len));
+    sbx_check(x, SANDBOX_STEP_ID_MAP, sbx_write_file(gm.chars, &x->gid_map[0], x->gid_map_len));
+  }
+  if (x->hostname != (uint8*)0) {
+    sbx_check(x, SANDBOX_STEP_HOSTNAME, syscall(SBX_NR_SETHOSTNAME, x->hostname, x->hostname_len));
+  }
+  if (x->loopback != 0) { sbx_check(x, SANDBOX_STEP_LOOPBACK, sbx_loopback_up()); }
+  if ((x->flags & SANDBOX_NS_MOUNT) != 0) {
+    // Nothing done here leaks back to the host's mounts.
+    var root: string = "/";
+    sbx_check(x, SANDBOX_STEP_MOUNT, syscall(SBX_NR_MOUNT, 0, root.chars, 0, SBX_MS_REC | SBX_MS_PRIVATE, 0));
+    sbx_check(x, SANDBOX_STEP_MOUNT, sbx_mount_apply(&x->mounts));
+  }
+  if ((x->flags & SANDBOX_NS_PID) != 0) {
+    var pid: int64 = syscall(SBX_NR_CLONE, SBX_SIGCHLD, 0, 0, 0, 0);
+    sbx_check(x, SANDBOX_STEP_INIT, pid);
+    if (pid > 0) { sbx_init(x, pid); }
+    sbx_check(x, SANDBOX_STEP_INIT, sbx_parent_death_signal(SBX_SIGKILL));
+  }
+  sbx_child_final(x);
+}
+
+// ---- spawn and wait --------------------------------------------------------
+
+fn sbx_pipe(rd: int64*, wr: int64*) -> int64 {
+  var fds: int32[2];
+  var r: int64 = syscall(SBX_NR_PIPE2, &fds[0], SBX_O_CLOEXEC);
+  if (r < 0) { return r; }
+  *rd = (int64)fds[0];
+  *wr = (int64)fds[1];
+  return 0;
+}
+
+struct SbxFds { c_in: int64; c_out: int64; c_err: int64; p_in: int64; p_out: int64; p_err: int64; nul: int64; er: int64; ew: int64; }
+
+fn sbx_fds_close(f: SbxFds*, child_side: bool, parent_side: bool) {
+  if (child_side) {
+    sbx_close(f->c_in); sbx_close(f->c_out); sbx_close(f->c_err); sbx_close(f->nul); sbx_close(f->ew);
+    f->c_in = -1; f->c_out = -1; f->c_err = -1; f->nul = -1; f->ew = -1;
+  }
+  if (parent_side) {
+    sbx_close(f->p_in); sbx_close(f->p_out); sbx_close(f->p_err); sbx_close(f->er);
+    f->p_in = -1; f->p_out = -1; f->p_err = -1; f->er = -1;
+  }
+}
+
+fn sbx_stdio(mode: int32, child_reads: bool, f: SbxFds*, child_end: int64*, parent_end: int64*) -> int64 {
+  if (mode == SANDBOX_IO_INHERIT) { return 0; }
+  if (mode == SANDBOX_IO_PIPE) {
+    var rd: int64 = -1;
+    var wr: int64 = -1;
+    var r: int64 = sbx_pipe(&rd, &wr);
+    if (r < 0) { return r; }
+    if (child_reads) { *child_end = rd; *parent_end = wr; } else { *child_end = wr; *parent_end = rd; }
+    return 0;
+  }
+  if (mode == SANDBOX_IO_NULL) {
+    if (f->nul < 0) {
+      var path: string = "/dev/null";
+      f->nul = syscall(SBX_NR_OPENAT, SBX_AT_FDCWD, path.chars, SBX_O_RDWR | SBX_O_CLOEXEC, 0);
+      if (f->nul < 0) { var e: int64 = f->nul; f->nul = -1; return e; }
+    }
+    var d: int64 = syscall(SBX_NR_FCNTL, f->nul, 1030, 3);   // F_DUPFD_CLOEXEC
+    if (d < 0) { return d; }
+    *child_end = d;
+    return 0;
+  }
+  return -SANDBOX_EINVAL;
+}
+
+// Starts argv[0] inside the sandbox the policy describes. Returns 0 and fills
+// out, or -errno with out->failed_step naming the step that failed.
+export fn sandbox_spawn(p: SandboxPolicy*, argv: string[], out: SandboxChild*) -> int64 {
+  var none: SandboxChild;
+  *out = none;
+  out->pid = -1;
+  out->stdin_fd = -1;
+  out->stdout_fd = -1;
+  out->stderr_fd = -1;
+
+  var x: SbxExec;
+  var r: int64 = sbx_prep(p, argv, &x);
+  if (r < 0) {
+    sbx_exec_free(&x);
+    return r;
+  }
+  var f: SbxFds = { c_in: -1, c_out: -1, c_err: -1, p_in: -1, p_out: -1, p_err: -1, nul: -1, er: -1, ew: -1 };
+  r = sbx_stdio(p->stdin_mode, true, &f, &f.c_in, &f.p_in);
+  if (r >= 0) { r = sbx_stdio(p->stdout_mode, false, &f, &f.c_out, &f.p_out); }
+  if (r >= 0) { r = sbx_stdio(p->stderr_mode, false, &f, &f.c_err, &f.p_err); }
+  if (r >= 0) { r = sbx_pipe(&f.er, &f.ew); }
+  if (r < 0) {
+    sbx_fds_close(&f, true, true);
+    sbx_exec_free(&x);
+    return r;
+  }
+  x.in_fd = f.c_in;
+  x.out_fd = f.c_out;
+  x.err_fd = f.c_err;
+  x.errw = f.ew;
+
+  var pid: int64 = syscall(SBX_NR_CLONE, x.flags | SBX_SIGCHLD, 0, 0, 0, 0);
+  if (pid == 0) { sbx_child(&x); }
+  sbx_exec_free(&x);
+  sbx_fds_close(&f, true, false);
+  if (pid < 0) {
+    sbx_fds_close(&f, false, true);
+    out->failed_step = SANDBOX_STEP_CLONE;
+    return pid;
+  }
+
+  // The pipe closes at a successful exec, so the read gives 0 bytes. A
+  // failed step writes 8 bytes first.
+  var report: int64 = 0;
+  var n: int64 = -SANDBOX_EINTR;
+  while (n == -SANDBOX_EINTR) { n = syscall(SBX_NR_READ, f.er, &report, 8); }
+  if (n == 8) {
+    var raw: int32 = 0;
+    var w: int64 = -SANDBOX_EINTR;
+    while (w == -SANDBOX_EINTR) { w = syscall(SBX_NR_WAIT4, pid, &raw, 0, 0); }
+    sbx_fds_close(&f, false, true);
+    out->failed_step = (int32)(report >> 32);
+    var e: int64 = report & 0xffffffff;
+    if (e == 0) { e = SANDBOX_EINVAL; }
+    return -e;
+  }
+  sbx_close(f.er);
+  out->pid = pid;
+  out->stdin_fd = f.p_in;
+  out->stdout_fd = f.p_out;
+  out->stderr_fd = f.p_err;
+  return 0;
+}
+
+// Waits for the sandbox to end. With a PID namespace the status is the
+// program's (a signal death shows as exit code 128 + signal). Returns 0 or -errno.
+export fn sandbox_wait(c: SandboxChild*, st: SandboxStatus*) -> int64 {
+  if (c->pid <= 0 || c->done != 0) { return -SANDBOX_ECHILD; }
+  var raw: int32 = 0;
+  var r: int64 = -SANDBOX_EINTR;
+  while (r == -SANDBOX_EINTR) { r = syscall(SBX_NR_WAIT4, c->pid, &raw, 0, 0); }
+  if (r < 0) { return r; }
+  c->done = 1;
+  sbx_decode(raw, st);
+  return 0;
+}
+
+// Kills the sandbox and everything in it (SIGKILL to its first process,
+// which ends the whole PID namespace).
+export fn sandbox_kill(c: SandboxChild*) -> int64 {
+  if (c->pid <= 0 || c->done != 0) { return -SANDBOX_ESRCH; }
+  return syscall(SBX_NR_KILL, c->pid, SBX_SIGKILL);
+}
+
+// Closes the parent's pipe ends.
+export fn sandbox_close(c: SandboxChild*) {
+  sbx_close(c->stdin_fd);
+  sbx_close(c->stdout_fd);
+  sbx_close(c->stderr_fd);
+  c->stdin_fd = -1;
+  c->stdout_fd = -1;
+  c->stderr_fd = -1;
+}
+
+// Reads from one of the child's pipes. Returns the count (0 at end) or -errno.
+export fn sandbox_read(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var r: int64 = -SANDBOX_EINTR;
+  while (r == -SANDBOX_EINTR) { r = syscall(SBX_NR_READ, fd, buf, n); }
+  return r;
+}

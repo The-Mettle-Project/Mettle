@@ -1,0 +1,18 @@
+// semver: Semantic Versioning 2.0.0 for Mettle, in pure Mettle.
+//
+//   import "semver/semver";
+//
+// This file re-exports every module below. All exported names start with
+// semver_, Semver or SEMVER_.
+//
+//   semver/version  SemverVersion; strict, loose and coerce parsers
+//   semver/compare  precedence, sorting order, formatting, bumps
+//   semver/range    comparators, ranges, satisfies, best match
+//   semver/npm      npm range syntax (node-semver)
+//   semver/cargo    Cargo requirement syntax (the semver crate)
+
+import "semver/version";
+import "semver/compare";
+import "semver/range";
+import "semver/npm";
+import "semver/cargo";

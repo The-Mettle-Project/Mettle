@@ -1,0 +1,8 @@
+// LZ4 blocks and frames. Import this one file to get all of it:
+//
+//   import "press/lz4/lz4";
+//
+// It has no exports of its own; it re-exports the modules below.
+
+import "block";
+import "frame";

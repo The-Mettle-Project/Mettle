@@ -1,0 +1,460 @@
+// The sandbox's own file system view.
+//
+// With at least one mount in the list, the child gets a new, empty root on
+// tmpfs and sees only what the list puts there. The steps follow bubblewrap:
+//   1. mount a tmpfs on /tmp (inside the child's private mount namespace)
+//      and pivot_root into it, so the host's root is at /oldroot;
+//   2. mount a second tmpfs at /newroot, the future root;
+//   3. carry out the list: bind host paths from /oldroot into /newroot,
+//      read-only by default, and add tmpfs, /proc, /dev, directories and
+//      symlinks;
+//   4. make /newroot itself read-only, detach /oldroot, and pivot_root into
+//      /newroot, so nothing of the host stays reachable.
+// Read-only binds use mount_setattr with AT_RECURSIVE (Linux 5.12) so mounts
+// below the bound path are read-only too; older kernels fall back to a bind
+// remount of the top mount only.
+
+import "sys.mettle";
+import "std/mem";
+import "std/conv";
+
+const MS_RDONLY = 1;
+const MS_NOSUID = 2;
+const MS_NODEV = 4;
+const MS_NOEXEC = 8;
+const MS_REMOUNT = 32;
+const MS_NOATIME = 1024;
+const MS_NODIRATIME = 2048;
+const MS_BIND = 4096;
+const MS_REC = 0x4000;
+const MS_RELATIME = 0x200000;
+const ST_RELATIME = 4096;
+const MNT_DETACH = 2;
+const AT_RECURSIVE = 0x8000;
+const MOUNT_ATTR_RDONLY = 1;
+const MOUNT_ATTR_NOSUID = 2;
+const MOUNT_ATTR_NODEV = 4;
+const STATFS_FLAGS_AT = 80;   // f_flags in struct statfs, on x86-64 and AArch64
+
+const SBX_M_BIND = 1;
+const SBX_M_TMPFS = 2;
+const SBX_M_PROC = 3;
+const SBX_M_DEV = 4;
+const SBX_M_DIR = 5;
+const SBX_M_SYMLINK = 6;
+
+// The steps the child carries out, prepared by sbx_mount_plan.
+const SBX_P_MKDIR = 1;
+const SBX_P_BIND = 2;
+const SBX_P_MOUNT = 3;
+const SBX_P_SYMLINK = 4;
+
+struct SbxMountReq { kind: int32; src: string; dest: string; ro: int32; size: uint64; }
+
+// The mount list of a policy.
+export struct SandboxMounts {
+  reqs: SbxMountReq*;
+  n: int64;
+  cap: int64;
+  err: int64;
+}
+
+export struct SbxMop {
+  kind: int32;
+  a: uint8*;       // source or symlink target, or 0
+  b: uint8*;       // destination (writable: mkdir_p cuts it)
+  fstype: uint8*;  // for SBX_P_MOUNT
+  data: uint8*;    // mount options, or 0
+  flags: int64;
+  ro: int32;
+}
+
+export struct SbxMountPlan {
+  ops: SbxMop*;
+  n: int64;
+  cap: int64;
+  strs: uint8**;   // every string the ops point at, for freeing
+  nstrs: int64;
+  capstrs: int64;
+}
+
+export fn sandbox_mounts_init(m: SandboxMounts*) {
+  var blank: SandboxMounts;
+  *m = blank;
+}
+
+export fn sandbox_mounts_free(m: SandboxMounts*) {
+  if (m->reqs != (SbxMountReq*)0) { free(m->reqs); }
+  sandbox_mounts_init(m);
+}
+
+// An absolute path with no "." or ".." parts and no empty parts.
+fn sbx_path_ok(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n == 0 || n > 4000 || s[0] != '/') { return false; }
+  var start: int64 = 1;
+  for i in 1..=n {
+    if (i == n || s[i] == '/') {
+      var len: int64 = i - start;
+      if (len == 0 && i != n) { return false; }
+      if (len == 1 && s[start] == '.') { return false; }
+      if (len == 2 && s[start] == '.' && s[start + 1] == '.') { return false; }
+      start = i + 1;
+    } else if (s[i] == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn sbx_mounts_add(m: SandboxMounts*, kind: int32, src: string, dest: string, ro: int32, size: uint64) -> int64 {
+  var ok: bool = sbx_path_ok(dest);
+  if (kind == SBX_M_BIND) { ok = ok && sbx_path_ok(src); }
+  if (kind == SBX_M_SYMLINK) { ok = ok && src.length > 0 && src.length < 4000; }
+  if (!ok) {
+    if (m->err == 0) { m->err = -SANDBOX_EINVAL; }
+    return -SANDBOX_EINVAL;
+  }
+  if (m->n == m->cap) {
+    var nc: int64 = 16;
+    if (m->cap > 0) { nc = m->cap * 2; }
+    var r: SbxMountReq* = (SbxMountReq*)realloc(m->reqs, nc * sizeof(SbxMountReq));
+    if (r == (SbxMountReq*)0) {
+      if (m->err == 0) { m->err = -SANDBOX_ENOMEM; }
+      return -SANDBOX_ENOMEM;
+    }
+    m->reqs = r;
+    m->cap = nc;
+  }
+  var q: SbxMountReq = { kind: kind, src: src, dest: dest, ro: ro, size: size };
+  m->reqs[m->n] = q;
+  m->n = m->n + 1;
+  return 0;
+}
+
+// Shows host path src at dest inside the sandbox, read-only.
+export fn sandbox_mount_ro(m: SandboxMounts*, src: string, dest: string) -> int64 {
+  return sbx_mounts_add(m, SBX_M_BIND, src, dest, 1, 0);
+}
+
+// Shows host path src at dest inside the sandbox, writable. Changes reach
+// the host, so give only paths the program may change.
+export fn sandbox_mount_rw(m: SandboxMounts*, src: string, dest: string) -> int64 {
+  return sbx_mounts_add(m, SBX_M_BIND, src, dest, 0, 0);
+}
+
+// A private, empty, writable tmpfs at dest; size_bytes 0 means the kernel
+// default (half of RAM). It disappears with the sandbox.
+export fn sandbox_mount_tmpfs(m: SandboxMounts*, dest: string, size_bytes: uint64) -> int64 {
+  return sbx_mounts_add(m, SBX_M_TMPFS, "", dest, 0, size_bytes);
+}
+
+// A /proc for the sandbox's own PID namespace. Needs SANDBOX_NS_PID.
+export fn sandbox_mount_proc(m: SandboxMounts*, dest: string) -> int64 {
+  return sbx_mounts_add(m, SBX_M_PROC, "", dest, 0, 0);
+}
+
+// A minimal /dev: null, zero, full, random, urandom, tty, and the fd,
+// stdin, stdout and stderr links. No disks, no other devices.
+export fn sandbox_mount_dev(m: SandboxMounts*, dest: string) -> int64 {
+  return sbx_mounts_add(m, SBX_M_DEV, "", dest, 0, 0);
+}
+
+// An empty directory (in the read-only root unless something is mounted on it).
+export fn sandbox_mount_dir(m: SandboxMounts*, dest: string) -> int64 {
+  return sbx_mounts_add(m, SBX_M_DIR, "", dest, 0, 0);
+}
+
+// A symlink at dest that points to target (for example "usr/bin" at /bin).
+export fn sandbox_mount_symlink(m: SandboxMounts*, target: string, dest: string) -> int64 {
+  return sbx_mounts_add(m, SBX_M_SYMLINK, target, dest, 0, 0);
+}
+
+// The usual read-only system directories for running host programs: /usr,
+// and /bin, /sbin, /lib, /lib64 and /etc when they exist, plus /proc, /dev
+// and a private /tmp.
+export fn sandbox_mount_system(m: SandboxMounts*) -> int64 {
+  var r: int64 = sandbox_mount_ro(m, "/usr", "/usr");
+  var dirs: string[5] = ["/bin", "/sbin", "/lib", "/lib64", "/etc"];
+  for i in 0..5 {
+    var d: string = dirs[i];
+    var c: uint8* = sbx_cstr(d);
+    if (c == (uint8*)0) { return -SANDBOX_ENOMEM; }
+    var buf: uint8[64];
+    // A merged-/usr system has these as symlinks: copy the link, else bind.
+    var ln: int64 = syscall(SBX_NR_READLINKAT, SBX_AT_FDCWD, c, &buf[0], 63);
+    var there: int64 = sbx_is_dir(c);
+    free(c);
+    if (ln > 0) {
+      // A heap copy: the policy keeps the string, so it lives as long as the program.
+      var t: uint8* = (uint8*)malloc(ln + 1);
+      if (t == (uint8*)0) { return -SANDBOX_ENOMEM; }
+      memcpy(t, &buf[0], ln);
+      t[ln] = 0;
+      var target: string = str_from_bytes((cstring)t, ln);
+      if (r == 0) { r = sandbox_mount_symlink(m, target, d); }
+    } else if (there == 1) {
+      if (r == 0) { r = sandbox_mount_ro(m, d, d); }
+    }
+  }
+  if (r == 0) { r = sandbox_mount_proc(m, "/proc"); }
+  if (r == 0) { r = sandbox_mount_dev(m, "/dev"); }
+  if (r == 0) { r = sandbox_mount_tmpfs(m, "/tmp", 0); }
+  return r;
+}
+
+// ---- turning the list into child steps (parent side) -------------------------
+
+fn sbx_plan_str(pl: SbxMountPlan*, prefix: string, s: string) -> uint8* {
+  if (pl->nstrs == pl->capstrs) {
+    var nc: int64 = 32;
+    if (pl->capstrs > 0) { nc = pl->capstrs * 2; }
+    var ns: uint8** = (uint8**)realloc(pl->strs, nc * 8);
+    if (ns == (uint8**)0) { return (uint8*)0; }
+    pl->strs = ns;
+    pl->capstrs = nc;
+  }
+  var a: int64 = (int64)prefix.length;
+  var b: int64 = (int64)s.length;
+  var p: uint8* = (uint8*)malloc(a + b + 1);
+  if (p == (uint8*)0) { return p; }
+  if (a > 0) { memcpy(p, prefix.chars, a); }
+  if (b > 0) { memcpy(p + a, s.chars, b); }
+  p[a + b] = 0;
+  pl->strs[pl->nstrs] = p;
+  pl->nstrs = pl->nstrs + 1;
+  return p;
+}
+
+fn sbx_plan_op(pl: SbxMountPlan*, kind: int32, a: uint8*, b: uint8*, fstype: uint8*, data: uint8*, flags: int64, ro: int32) -> int64 {
+  if (b == (uint8*)0) { return -SANDBOX_ENOMEM; }
+  if (pl->n == pl->cap) {
+    var nc: int64 = 32;
+    if (pl->cap > 0) { nc = pl->cap * 2; }
+    var no: SbxMop* = (SbxMop*)realloc(pl->ops, nc * sizeof(SbxMop));
+    if (no == (SbxMop*)0) { return -SANDBOX_ENOMEM; }
+    pl->ops = no;
+    pl->cap = nc;
+  }
+  var op: SbxMop = { kind: kind, a: a, b: b, fstype: fstype, data: data, flags: flags, ro: ro };
+  pl->ops[pl->n] = op;
+  pl->n = pl->n + 1;
+  return 0;
+}
+
+fn sbx_plan_mount(pl: SbxMountPlan*, fstype: string, dest: string, data: string, flags: int64) -> int64 {
+  var d: uint8* = sbx_plan_str(pl, "/newroot", dest);
+  var r: int64 = sbx_plan_op(pl, SBX_P_MKDIR, (uint8*)0, d, (uint8*)0, (uint8*)0, 0, 0);
+  if (r < 0) { return r; }
+  var t: uint8* = sbx_plan_str(pl, "", fstype);
+  var o: uint8* = (uint8*)0;
+  if (data.length > 0) { o = sbx_plan_str(pl, "", data); }
+  if (t == (uint8*)0) { return -SANDBOX_ENOMEM; }
+  return sbx_plan_op(pl, SBX_P_MOUNT, t, sbx_plan_str(pl, "/newroot", dest), t, o, flags, 0);
+}
+
+fn sbx_plan_bind(pl: SbxMountPlan*, src: string, dest: string, ro: int32) -> int64 {
+  var s: uint8* = sbx_plan_str(pl, "/oldroot", src);
+  if (s == (uint8*)0) { return -SANDBOX_ENOMEM; }
+  return sbx_plan_op(pl, SBX_P_BIND, s, sbx_plan_str(pl, "/newroot", dest), (uint8*)0, (uint8*)0, 0, ro);
+}
+
+fn sbx_plan_symlink(pl: SbxMountPlan*, target: string, dest: string) -> int64 {
+  var t: uint8* = sbx_plan_str(pl, "", target);
+  if (t == (uint8*)0) { return -SANDBOX_ENOMEM; }
+  return sbx_plan_op(pl, SBX_P_SYMLINK, t, sbx_plan_str(pl, "/newroot", dest), (uint8*)0, (uint8*)0, 0, 0);
+}
+
+fn sbx_join(a: string, b: string) -> string {
+  return a + b;
+}
+
+fn sbx_plan_dev(pl: SbxMountPlan*, dest: string) -> int64 {
+  var r: int64 = sbx_plan_mount(pl, "tmpfs", dest, "mode=0755", MS_NOSUID | MS_NOEXEC);
+  var nodes: string[6] = ["/null", "/zero", "/full", "/random", "/urandom", "/tty"];
+  for i in 0..6 {
+    if (r == 0) {
+      var src: string = sbx_join("/dev", nodes[i]);
+      var dst: string = sbx_join(dest, nodes[i]);
+      r = sbx_plan_bind(pl, src, dst, 0);
+      free(src.chars);
+      free(dst.chars);
+    }
+  }
+  var links: string[4] = ["/fd", "/stdin", "/stdout", "/stderr"];
+  var targets: string[4] = ["/proc/self/fd", "/proc/self/fd/0", "/proc/self/fd/1", "/proc/self/fd/2"];
+  for i in 0..4 {
+    if (r == 0) {
+      var dl: string = sbx_join(dest, links[i]);
+      r = sbx_plan_symlink(pl, targets[i], dl);
+      free(dl.chars);
+    }
+  }
+  if (r == 0) {
+    var shm: string = sbx_join(dest, "/shm");
+    r = sbx_plan_mount(pl, "tmpfs", shm, "mode=1777", MS_NOSUID | MS_NODEV | MS_NOEXEC);
+    free(shm.chars);
+  }
+  return r;
+}
+
+fn sbx_size_opt(size: uint64) -> string {
+  var buf: uint8[32];
+  var n: int64 = sbx_fmt_uint(&buf[0], size);
+  var num: string = str_from_bytes((cstring)&buf[0], n);
+  var o: string = "mode=0755,size=" + num;
+  free(num.chars);
+  return o;
+}
+
+export fn sbx_mount_plan_free(pl: SbxMountPlan*) {
+  for i in 0..pl->nstrs { free(pl->strs[i]); }
+  if (pl->strs != (uint8**)0) { free(pl->strs); }
+  if (pl->ops != (SbxMop*)0) { free(pl->ops); }
+  var blank: SbxMountPlan;
+  *pl = blank;
+}
+
+// Expands the list into the steps the child carries out. Returns 0 or -errno.
+export fn sbx_mount_plan(m: SandboxMounts*, have_pid_ns: bool, pl: SbxMountPlan*) -> int64 {
+  var blank: SbxMountPlan;
+  *pl = blank;
+  if (m->err != 0) { return m->err; }
+  var r: int64 = 0;
+  for i in 0..m->n {
+    if (r != 0) { break; }
+    var q: SbxMountReq = m->reqs[i];
+    switch (q.kind) {
+      case SBX_M_BIND: { r = sbx_plan_bind(pl, q.src, q.dest, q.ro); }
+      case SBX_M_TMPFS: {
+        if (q.size > 0) {
+          var o: string = sbx_size_opt(q.size);
+          r = sbx_plan_mount(pl, "tmpfs", q.dest, o, MS_NOSUID | MS_NODEV);
+          free(o.chars);
+        } else {
+          r = sbx_plan_mount(pl, "tmpfs", q.dest, "mode=0755", MS_NOSUID | MS_NODEV);
+        }
+      }
+      case SBX_M_PROC: {
+        if (!have_pid_ns) { return -SANDBOX_EINVAL; }   // would show the host's processes
+        r = sbx_plan_mount(pl, "proc", q.dest, "", MS_NOSUID | MS_NODEV | MS_NOEXEC);
+      }
+      case SBX_M_DEV: { r = sbx_plan_dev(pl, q.dest); }
+      case SBX_M_DIR: {
+        r = sbx_plan_op(pl, SBX_P_MKDIR, (uint8*)0, sbx_plan_str(pl, "/newroot", q.dest), (uint8*)0, (uint8*)0, 0, 0);
+      }
+      case SBX_M_SYMLINK: { r = sbx_plan_symlink(pl, q.src, q.dest); }
+      default: { r = -SANDBOX_EINVAL; }
+    }
+  }
+  return r;
+}
+
+// ---- the child side (system calls only) ------------------------------------
+
+struct SbxMountAttr { attr_set: uint64; attr_clr: uint64; propagation: uint64; userns_fd: uint64; }
+
+// Makes the bind mount at path read-only (and nosuid, nodev), with every
+// mount below it.
+fn sbx_make_ro(path: uint8*) -> int64 {
+  var a: SbxMountAttr;
+  a.attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
+  var r: int64 = syscall(SBX_NR_MOUNT_SETATTR, SBX_AT_FDCWD, path, AT_RECURSIVE, &a, 32);
+  if (r != -SANDBOX_ENOSYS) { return r; }
+  // Old kernel: remount the top mount, keeping the flags the kernel locks.
+  var st: uint8[128];
+  r = syscall(SBX_NR_STATFS, path, &st[0]);
+  if (r < 0) { return r; }
+  var have: int64 = *(int64*)(&st[0] + STATFS_FLAGS_AT);
+  var keep: int64 = have & (MS_NOEXEC | MS_NOATIME | MS_NODIRATIME);
+  if ((have & ST_RELATIME) != 0) { keep = keep | MS_RELATIME; }
+  var flags: int64 = MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | keep;
+  return syscall(SBX_NR_MOUNT, 0, path, 0, flags, 0);
+}
+
+// The parent directory part of path, cut in place; returns the byte it
+// replaced so the caller can put it back.
+fn sbx_cut_parent(path: uint8*, at: int64*) -> uint8 {
+  var n: int64 = sbx_strlen(path);
+  var i: int64 = n - 1;
+  while (i > 0 && path[i] != '/') { i = i - 1; }
+  *at = i;
+  var c: uint8 = path[i];
+  if (i > 0) { path[i] = 0; }
+  return c;
+}
+
+fn sbx_mkdir_parent(path: uint8*) -> int64 {
+  var at: int64 = 0;
+  var c: uint8 = sbx_cut_parent(path, &at);
+  var r: int64 = 0;
+  if (at > 0) { r = sbx_mkdir_p(path, 0x1ed); }
+  path[at] = c;
+  return r;
+}
+
+fn sbx_do_op(op: SbxMop*) -> int64 {
+  var r: int64 = 0;
+  switch (op->kind) {
+    case SBX_P_MKDIR: { r = sbx_mkdir_p(op->b, 0x1ed); }
+    case SBX_P_MOUNT: { r = syscall(SBX_NR_MOUNT, op->fstype, op->b, op->fstype, op->flags, op->data); }
+    case SBX_P_BIND: {
+      var d: int64 = sbx_is_dir(op->a);
+      if (d < 0) { return d; }
+      if (d == 1) {
+        r = sbx_mkdir_p(op->b, 0x1ed);
+      } else {
+        r = sbx_mkdir_parent(op->b);
+        if (r == 0) { r = sbx_touch(op->b); }
+      }
+      if (r == 0) { r = syscall(SBX_NR_MOUNT, op->a, op->b, 0, MS_BIND | MS_REC, 0); }
+      if (r == 0 && op->ro != 0) { r = sbx_make_ro(op->b); }
+    }
+    case SBX_P_SYMLINK: {
+      r = sbx_mkdir_parent(op->b);
+      if (r == 0) { r = syscall(SBX_NR_SYMLINKAT, op->a, SBX_AT_FDCWD, op->b); }
+    }
+    default: { r = -SANDBOX_EINVAL; }
+  }
+  return r;
+}
+
+// Builds the new root from the plan and moves into it. Does nothing for an
+// empty plan. Runs in the child, inside its private mount namespace.
+export fn sbx_mount_apply(pl: SbxMountPlan*) -> int64 {
+  if (pl->n == 0) { return 0; }
+  var tmp: string = "/tmp";
+  var tmpfs: string = "tmpfs";
+  var mode: string = "mode=0755";
+  var newroot: string = "newroot";
+  var oldroot: string = "oldroot";
+  var put_old: string = "/tmp/oldroot";
+  var nr_abs: string = "/newroot";
+  var or_abs: string = "/oldroot";
+  var slash: string = "/";
+  var dot: string = ".";
+
+  var r: int64 = syscall(SBX_NR_MOUNT, tmpfs.chars, tmp.chars, tmpfs.chars, MS_NOSUID | MS_NODEV, mode.chars);
+  if (r < 0) { return r; }
+  r = syscall(SBX_NR_CHDIR, tmp.chars);
+  if (r == 0) { r = syscall(SBX_NR_MKDIRAT, SBX_AT_FDCWD, newroot.chars, 0x1ed); }
+  if (r == 0) { r = syscall(SBX_NR_MKDIRAT, SBX_AT_FDCWD, oldroot.chars, 0x1ed); }
+  if (r == 0) { r = syscall(SBX_NR_PIVOT_ROOT, tmp.chars, put_old.chars); }
+  if (r == 0) { r = syscall(SBX_NR_CHDIR, slash.chars); }
+  if (r == 0) { r = syscall(SBX_NR_MOUNT, tmpfs.chars, nr_abs.chars, tmpfs.chars, MS_NOSUID | MS_NODEV, mode.chars); }
+  if (r < 0) { return r; }
+
+  for i in 0..pl->n {
+    r = sbx_do_op(&pl->ops[i]);
+    if (r < 0) { return r; }
+  }
+
+  // The root itself is read-only; writable places are the tmpfs and rw binds.
+  r = syscall(SBX_NR_MOUNT, 0, nr_abs.chars, 0, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV, 0);
+  if (r == 0) { r = syscall(SBX_NR_UMOUNT2, or_abs.chars, MNT_DETACH); }
+  if (r == 0) { r = syscall(SBX_NR_CHDIR, nr_abs.chars); }
+  if (r == 0) { r = syscall(SBX_NR_PIVOT_ROOT, dot.chars, dot.chars); }
+  if (r == 0) { r = syscall(SBX_NR_UMOUNT2, dot.chars, MNT_DETACH); }
+  if (r == 0) { r = syscall(SBX_NR_CHDIR, slash.chars); }
+  return r;
+}

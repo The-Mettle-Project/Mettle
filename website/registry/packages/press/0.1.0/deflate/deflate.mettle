@@ -1,0 +1,749 @@
+// DEFLATE encoder (RFC 1951), levels 0 to 9.
+//
+//   level 0     stored blocks, no compression
+//   levels 1-3  greedy matching: take the first good match
+//   levels 4-9  lazy matching: before taking a match, check whether the next
+//               position has a longer one; higher levels search further
+//
+// Matches are found with hash chains over 4-byte prefixes. Each block's
+// symbols are counted as they are made; when a block is full the encoder
+// builds Huffman codes for it and writes whichever of a dynamic, fixed or
+// stored block is smallest.
+//
+// One PdfDeflate does both the one-shot functions (the input buffer is used
+// in place) and the streaming encoder (input is copied into a window that
+// slides along, keeping the last 32 KiB for matches).
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "tables";
+import "huff";
+
+const PDF_WSIZE: int64 = 32768;
+const PDF_WMASK: int64 = 32767;
+const PDF_MAX_MATCH: int64 = 258;
+const PDF_MIN_MATCH: int64 = 4;          // the hash covers 4 bytes, so matches start at 4
+const PDF_LOOKAHEAD: int64 = 262;       // bytes kept past the work end, for match search
+const PDF_H3_BITS: int64 = 14;
+const PDF_H3_SIZE: int64 = 16384;
+const PDF_FAR3: int64 = 4096;          // length-3 matches farther than this cost more than literals
+const PDF_MAX_ITEMS: int64 = 40000;     // symbols per block
+
+struct PdfLevel {
+  chain: int64;   // most chain links followed per search
+  nice: int64;    // stop searching at a match this long
+  lazy: int64;    // do not look for a better match after one this long
+  good: int64;    // search less after a match this long
+  greedy: bool;
+}
+
+fn pdf_level(level: int32) -> PdfLevel {
+  var p: PdfLevel;
+  p.greedy = false;
+  switch (level) {
+    case 1: { p.chain = 2;    p.nice = 16;  p.lazy = 0;   p.good = 0;  p.greedy = true; }
+    case 2: { p.chain = 6;    p.nice = 32;  p.lazy = 0;   p.good = 0;  p.greedy = true; }
+    case 3: { p.chain = 12;   p.nice = 48;  p.lazy = 0;   p.good = 0;  p.greedy = true; }
+    case 4: { p.chain = 12;   p.nice = 32;  p.lazy = 12;  p.good = 8; }
+    case 5: { p.chain = 24;   p.nice = 64;  p.lazy = 32;  p.good = 16; }
+    case 6: { p.chain = 64;   p.nice = 128; p.lazy = 64;  p.good = 16; }
+    case 7: { p.chain = 160;  p.nice = 160; p.lazy = 128; p.good = 32; }
+    case 8: { p.chain = 600;  p.nice = 258; p.lazy = 258; p.good = 32; }
+    default: { p.chain = 2400; p.nice = 258; p.lazy = 258; p.good = 64; }
+  }
+  return p;
+}
+
+export struct PdfDeflate {
+  level: int32;
+  lv: PdfLevel;
+  // The window: win[0 .. wlen) holds input; positions below pos are done.
+  win: uint8*;
+  wlen: int64;
+  wcap: int64;
+  owns_win: bool;
+  pos: int64;
+  bstart: int64;          // where the current block's input starts
+  hbits: int64;
+  head: int32*;           // newest position for each hash, or -1
+  prev: int32*;           // older position with the same hash, by pos & 32767
+  h3: int32*;             // newest position for each 3-byte hash (lazy levels)
+  cand3: int64;           // what h3 held for the position inserted last
+  // Lazy matching state carried across calls.
+  has_prev: bool;
+  prev_len: int64;
+  prev_dist: int64;
+  // The current block.
+  items: uint32*;         // literal byte, or (distance << 9) | length
+  nitems: int64;
+  llfreq: uint32[288];
+  dfreq: uint32[32];
+  // Block splitting: counts of a few kinds of symbol, for the whole block
+  // so far (obs) and for the newest stretch (nobs).
+  obs: uint32[10];
+  nobs: uint32[10];
+  nobs_total: int64;
+  nnew_total: int64;
+  // Bits written but not yet a whole byte.
+  bb: uint64;
+  bc: int64;
+}
+
+/// Sets up an encoder. size_hint is the input size when known (0 if not);
+/// it picks a smaller hash table for small inputs.
+export fn pdf_deflate_init(c: PdfDeflate*, level: int32, size_hint: int64) -> int32 {
+  memset(c, 0, sizeof(PdfDeflate));
+  if (level < 0 || level > 9) { return PRESS_E_ARG; }
+  c->level = level;
+  c->lv = pdf_level(level);
+  c->hbits = 15;
+  if (size_hint > 0) {
+    var hb: int64 = 10;
+    while (hb < 15 && ((int64)1 << (uint64)hb) < size_hint) { hb = hb + 1; }
+    c->hbits = hb;
+  }
+  c->items = (uint32*)malloc(PDF_MAX_ITEMS * 4);
+  if (level > 0) {
+    var hn: int64 = (int64)1 << (uint64)c->hbits;
+    c->head = (int32*)malloc(hn * 4);
+    c->prev = (int32*)malloc(PDF_WSIZE * 4);
+    if (c->head == 0 || c->prev == 0) { return PRESS_E_MEM; }
+    memset(c->head, 255, hn * 4);
+    if (!c->lv.greedy) {
+      c->h3 = (int32*)malloc(PDF_H3_SIZE * 4);
+      if (c->h3 == 0) { return PRESS_E_MEM; }
+      memset(c->h3, 255, PDF_H3_SIZE * 4);
+    }
+  }
+  if (c->items == 0) { return PRESS_E_MEM; }
+  return PRESS_OK;
+}
+
+export fn pdf_deflate_free(c: PdfDeflate*) {
+  if (c->items != 0) { free(c->items); }
+  if (c->head != 0) { free(c->head); }
+  if (c->prev != 0) { free(c->prev); }
+  if (c->h3 != 0) { free(c->h3); }
+  if (c->owns_win && c->win != 0) { free(c->win); }
+  c->items = (uint32*)0;
+  c->head = (int32*)0;
+  c->prev = (int32*)0;
+  c->h3 = (int32*)0;
+  c->win = (uint8*)0;
+}
+
+// ---- bit output ----
+
+// Bits go into c->bb and are stored 8 bytes at a time. The caller reserves
+// room first, including 8 bytes of slack.
+@inline fn pdf_put(c: PdfDeflate*, o: uint8*, op: int64*, v: uint64, n: int64) -> void {
+  c->bb = c->bb | (v << (uint64)c->bc);
+  c->bc = c->bc + n;
+  if (c->bc >= 32) {
+    press_wr64(o + *op, c->bb);
+    var k: int64 = c->bc >> 3;
+    *op = *op + k;
+    c->bb = c->bb >> (uint64)(k * 8);
+    c->bc = c->bc - k * 8;
+  }
+}
+
+// Writes the pending whole bytes and pads the last partial byte with zeros.
+fn pdf_align(c: PdfDeflate*, o: uint8*, op: int64*) {
+  while (c->bc > 0) {
+    o[*op] = (uint8)(c->bb & 255);
+    *op = *op + 1;
+    c->bb = c->bb >> 8;
+    c->bc = c->bc - 8;
+  }
+  c->bb = 0;
+  c->bc = 0;
+}
+
+// ---- block output ----
+
+struct PdfCodes {
+  lllen: uint8[288];
+  llcode: uint16[288];
+  dlen: uint8[32];
+  dcode: uint16[32];
+  // The dynamic header: code-length symbols with their extra bits.
+  pre: uint16[320];
+  npre: int64;
+  prelen: uint8[19];
+  precode: uint16[19];
+  hlit: int64;
+  hdist: int64;
+  hclen: int64;
+}
+
+fn pdf_pre_push(k: PdfCodes*, sym: int64, extra: int64, pf: uint32*) {
+  k->pre[k->npre] = (uint16)(sym | (extra << 8));
+  k->npre = k->npre + 1;
+  pf[sym] = pf[sym] + 1;
+}
+
+// Builds the dynamic header for the current lengths. Returns its size in bits.
+fn pdf_build_header(k: PdfCodes*) -> int64 {
+  k->hlit = 286;
+  while (k->hlit > 257 && k->lllen[k->hlit - 1] == 0) { k->hlit = k->hlit - 1; }
+  k->hdist = 30;
+  while (k->hdist > 1 && k->dlen[k->hdist - 1] == 0) { k->hdist = k->hdist - 1; }
+  var all: uint8[320];
+  for i in 0..k->hlit { all[i] = k->lllen[i]; }
+  for i in 0..k->hdist { all[k->hlit + i] = k->dlen[i]; }
+  var total: int64 = k->hlit + k->hdist;
+  var pf: uint32[19];
+  k->npre = 0;
+  var i: int64 = 0;
+  while (i < total) {
+    var l: int64 = (int64)all[i];
+    var run: int64 = 1;
+    while (i + run < total && (int64)all[i + run] == l) { run = run + 1; }
+    i = i + run;
+    if (l == 0) {
+      while (run >= 11) {
+        var r: int64 = run;
+        if (r > 138) { r = 138; }
+        pdf_pre_push(k, 18, r - 11, &pf[0]);
+        run = run - r;
+      }
+      if (run >= 3) { pdf_pre_push(k, 17, run - 3, &pf[0]); run = 0; }
+    } else {
+      pdf_pre_push(k, l, 0, &pf[0]);
+      run = run - 1;
+      while (run >= 3) {
+        var r2: int64 = run;
+        if (r2 > 6) { r2 = 6; }
+        pdf_pre_push(k, 16, r2 - 3, &pf[0]);
+        run = run - r2;
+      }
+    }
+    while (run > 0) { pdf_pre_push(k, l, 0, &pf[0]); run = run - 1; }
+  }
+  pdf_make_lens(&pf[0], 19, 7, &k->prelen[0]);
+  pdf_make_codes(&k->prelen[0], 19, &k->precode[0]);
+  k->hclen = 19;
+  while (k->hclen > 4 && k->prelen[PDF_CL_ORDER[k->hclen - 1]] == 0) { k->hclen = k->hclen - 1; }
+  var bits: int64 = 14 + 3 * k->hclen;
+  for s in 0..19 { bits = bits + (int64)pf[s] * (int64)k->prelen[s]; }
+  bits = bits + (int64)pf[16] * 2 + (int64)pf[17] * 3 + (int64)pf[18] * 7;
+  return bits;
+}
+
+fn pdf_write_header(c: PdfDeflate*, k: PdfCodes*, o: uint8*, op: int64*) {
+  pdf_put(c, o, op, (uint64)(k->hlit - 257), 5);
+  pdf_put(c, o, op, (uint64)(k->hdist - 1), 5);
+  pdf_put(c, o, op, (uint64)(k->hclen - 4), 4);
+  for i in 0..k->hclen { pdf_put(c, o, op, (uint64)k->prelen[PDF_CL_ORDER[i]], 3); }
+  for i in 0..k->npre {
+    var v: int64 = (int64)k->pre[i];
+    var sym: int64 = v & 255;
+    pdf_put(c, o, op, (uint64)k->precode[sym], (int64)k->prelen[sym]);
+    if (sym == 16) { pdf_put(c, o, op, (uint64)(v >> 8), 2); }
+    else if (sym == 17) { pdf_put(c, o, op, (uint64)(v >> 8), 3); }
+    else if (sym == 18) { pdf_put(c, o, op, (uint64)(v >> 8), 7); }
+  }
+}
+
+fn pdf_write_items(c: PdfDeflate*, k: PdfCodes*, o: uint8*, op: int64*) {
+  var items: uint32* = c->items;
+  for i in 0..c->nitems {
+    var it: uint32 = items[i];
+    var dist: int64 = (int64)(it >> 9);
+    if (dist == 0) {
+      pdf_put(c, o, op, (uint64)k->llcode[(int64)it], (int64)k->lllen[(int64)it]);
+    } else {
+      var len: int64 = (int64)(it & 511);
+      var ls: int64 = (int64)PDF_LEN_SYM[len];
+      pdf_put(c, o, op, (uint64)k->llcode[257 + ls], (int64)k->lllen[257 + ls]);
+      pdf_put(c, o, op, (uint64)(len - (int64)PDF_LEN_BASE[ls]), (int64)PDF_LEN_EXTRA[ls]);
+      var dc: int64 = pdf_dist_code(dist);
+      pdf_put(c, o, op, (uint64)k->dcode[dc], (int64)k->dlen[dc]);
+      pdf_put(c, o, op, (uint64)(dist - (int64)PDF_DIST_BASE[dc]), (int64)PDF_DIST_EXTRA[dc]);
+    }
+  }
+  pdf_put(c, o, op, (uint64)k->llcode[256], (int64)k->lllen[256]);
+}
+
+fn pdf_fixed_codes(k: PdfCodes*) {
+  for i in 0..144 { k->lllen[i] = 8; }
+  for i in 144..256 { k->lllen[i] = 9; }
+  for i in 256..280 { k->lllen[i] = 7; }
+  for i in 280..288 { k->lllen[i] = 8; }
+  for i in 0..32 { k->dlen[i] = 5; }
+  pdf_make_codes(&k->lllen[0], 288, &k->llcode[0]);
+  pdf_make_codes(&k->dlen[0], 32, &k->dcode[0]);
+}
+
+// Bits for the block's symbols under the given lengths (without header).
+fn pdf_data_bits(c: PdfDeflate*, lllen: uint8*, dlen: uint8*) -> int64 {
+  var bits: int64 = 0;
+  for s in 0..286 { bits = bits + (int64)c->llfreq[s] * (int64)lllen[s]; }
+  for s in 0..30 { bits = bits + (int64)c->dfreq[s] * (int64)dlen[s]; }
+  return bits;
+}
+
+fn pdf_extra_bits(c: PdfDeflate*) -> int64 {
+  var bits: int64 = 0;
+  for s in 0..29 { bits = bits + (int64)c->llfreq[257 + s] * (int64)PDF_LEN_EXTRA[s]; }
+  for s in 0..30 { bits = bits + (int64)c->dfreq[s] * (int64)PDF_DIST_EXTRA[s]; }
+  return bits;
+}
+
+// Writes stored blocks for win[from .. to).
+fn pdf_write_stored(c: PdfDeflate*, from: int64, to: int64, last: bool, o: uint8*, op: int64*) {
+  var p: int64 = from;
+  var first: bool = true;
+  while (first || p < to) {
+    first = false;
+    var n: int64 = to - p;
+    if (n > 65535) { n = 65535; }
+    var fin: uint64 = 0;
+    if (last && p + n == to) { fin = 1; }
+    pdf_put(c, o, op, fin, 3);
+    pdf_align(c, o, op);
+    press_wr16(o + *op, (uint32)n);
+    press_wr16(o + *op + 2, (uint32)(65535 - n));
+    *op = *op + 4;
+    if (n > 0) { memcpy(o + *op, c->win + p, n); }
+    *op = *op + n;
+    p = p + n;
+  }
+}
+
+/// Ends the current block (input win[bstart .. pos)) and writes it as the
+/// smallest of dynamic, fixed or stored.
+export fn pdf_flush_block(c: PdfDeflate*, last: bool, out: PressBuf*) -> int32 {
+  c->llfreq[256] = c->llfreq[256] + 1;
+  var k: PdfCodes* = new PdfCodes;
+  if (k == 0) { return PRESS_E_MEM; }
+  // A position held back by lazy matching belongs to the next block.
+  var bend: int64 = c->pos;
+  if (c->has_prev) { bend = bend - 1; }
+  var raw: int64 = bend - c->bstart;
+  var extra: int64 = pdf_extra_bits(c);
+  pdf_make_lens(&c->llfreq[0], 286, 15, &k->lllen[0]);
+  pdf_make_lens(&c->dfreq[0], 30, 15, &k->dlen[0]);
+  var dyn: int64 = 3 + pdf_build_header(k) + pdf_data_bits(c, &k->lllen[0], &k->dlen[0]) + extra;
+  var f: PdfCodes* = new PdfCodes;
+  if (f == 0) { free(k); return PRESS_E_MEM; }
+  pdf_fixed_codes(f);
+  var fix: int64 = 3 + pdf_data_bits(c, &f->lllen[0], &f->dlen[0]) + extra;
+  var nst: int64 = raw / 65535 + 1;
+  var sto: int64 = (raw + nst * 5) * 8 + 7;
+  var kind: int32 = 2;
+  var best: int64 = dyn;
+  if (fix <= best) { kind = 1; best = fix; }
+  if (sto < best) { kind = 0; best = sto; }
+  var rc: int32 = press_buf_reserve(out, best / 8 + 32);
+  if (rc != PRESS_OK) { free(k); free(f); return rc; }
+  var o: uint8* = out->data;
+  var op: int64 = out->len;
+  var fin: uint64 = 0;
+  if (last) { fin = 1; }
+  if (kind == 0) {
+    pdf_write_stored(c, c->bstart, bend, last, o, &op);
+  } else if (kind == 1) {
+    pdf_put(c, o, &op, fin | 2, 3);
+    pdf_make_codes(&f->lllen[0], 288, &f->llcode[0]);
+    pdf_write_items(c, f, o, &op);
+  } else {
+    pdf_put(c, o, &op, fin | 4, 3);
+    pdf_make_codes(&k->lllen[0], 286, &k->llcode[0]);
+    pdf_make_codes(&k->dlen[0], 30, &k->dcode[0]);
+    pdf_write_header(c, k, o, &op);
+    pdf_write_items(c, k, o, &op);
+  }
+  if (last) { pdf_align(c, o, &op); }
+  out->len = op;
+  free(k);
+  free(f);
+  c->nitems = 0;
+  memset(&c->llfreq[0], 0, 288 * 4);
+  memset(&c->dfreq[0], 0, 32 * 4);
+  memset(&c->obs[0], 0, 40);
+  memset(&c->nobs[0], 0, 40);
+  c->nobs_total = 0;
+  c->nnew_total = 0;
+  c->bstart = bend;
+  return PRESS_OK;
+}
+
+/// Writes an empty stored block, so all output so far can be decoded
+/// (zlib's Z_SYNC_FLUSH).
+export fn pdf_sync_mark(c: PdfDeflate*, out: PressBuf*) -> int32 {
+  var rc: int32 = press_buf_reserve(out, 32);
+  if (rc != PRESS_OK) { return rc; }
+  var op: int64 = out->len;
+  pdf_put(c, out->data, &op, 0, 3);
+  pdf_align(c, out->data, &op);
+  press_wr32(out->data + op, 0xFFFF0000);
+  out->len = op + 4;
+  return PRESS_OK;
+}
+
+// ---- matching ----
+
+@inline fn pdf_hash(w: uint8*, p: int64, hb: int64) -> int64 {
+  return (int64)((press_rd32(w + p) * 0x9E3779B1) >> (uint32)(32 - hb));
+}
+
+@inline fn pdf_insert(c: PdfDeflate*, p: int64) {
+  var h: int64 = pdf_hash(c->win, p, c->hbits);
+  c->prev[p & PDF_WMASK] = c->head[h];
+  c->head[h] = (int32)p;
+  if (c->h3 != 0) {
+    var k: int64 = (int64)(((press_rd32(c->win + p) & 16777215) * 0x9E3779B1) >> (uint32)(32 - PDF_H3_BITS));
+    c->cand3 = (int64)c->h3[k];
+    c->h3[k] = (int32)p;
+  }
+}
+
+// Length of the common prefix of w[a..] and w[b..], at most max.
+@inline fn pdf_match_len(w: uint8*, a: int64, b: int64, max: int64) -> int64 {
+  var n: int64 = 0;
+  while (n + 8 <= max) {
+    var x: uint64 = press_rd64(w + a + n) ^ press_rd64(w + b + n);
+    if (x != 0) { return n + (press_ctz64(x) >> 3); }
+    n = n + 8;
+  }
+  while (n < max && w[a + n] == w[b + n]) { n = n + 1; }
+  return n;
+}
+
+struct PdfMatch { len: int64; dist: int64; }
+
+// Searches the hash chain at p (already inserted) for a match longer than
+// best. Returns length 0 if none.
+fn pdf_find(c: PdfDeflate*, p: int64, best_in: int64, chain_in: int64) -> PdfMatch {
+  var m: PdfMatch;
+  m.len = 0;
+  m.dist = 0;
+  var w: uint8* = c->win;
+  var max: int64 = c->wlen - p;
+  if (max > PDF_MAX_MATCH) { max = PDF_MAX_MATCH; }
+  if (max < PDF_MIN_MATCH) { return m; }
+  var best: int64 = best_in;
+  if (best < PDF_MIN_MATCH - 1) { best = PDF_MIN_MATCH - 1; }
+  if (best >= max) { return m; }
+  var limit: int64 = p - PDF_WSIZE;
+  var cur: int64 = (int64)c->prev[p & PDF_WMASK];
+  var chain: int64 = chain_in;
+  var nice: int64 = c->lv.nice;
+  if (nice > max) { nice = max; }
+  var first: uint32 = press_rd32(w + p);
+  while (cur > limit && cur >= 0 && chain > 0) {
+    chain = chain - 1;
+    if (w[cur + best] == w[p + best] && press_rd32(w + cur) == first) {
+      var l: int64 = 4 + pdf_match_len(w, cur + 4, p + 4, max - 4);
+      if (l > best) {
+        best = l;
+        m.len = l;
+        m.dist = p - cur;
+        if (l >= nice) { break; }
+      }
+    }
+    cur = (int64)c->prev[cur & PDF_WMASK];
+  }
+  // No 4-byte match: try the newest position with the same first 3 bytes.
+  if (m.len == 0 && best_in < 3 && c->h3 != 0) {
+    var q: int64 = c->cand3;
+    if (q >= 0 && p - q <= PDF_FAR3 && w[q] == w[p] && w[q + 1] == w[p + 1] && w[q + 2] == w[p + 2]) {
+      m.len = 3;
+      m.dist = p - q;
+    }
+  }
+  return m;
+}
+
+// Decides whether to end the block here: true when the newest 512 symbols
+// look different enough from the rest of the block that new Huffman codes
+// would pay for a new header.
+fn pdf_split_check(c: PdfDeflate*, p: int64) -> bool {
+  var blen: int64 = p - c->bstart;
+  var split: bool = false;
+  if (c->nobs_total > 0 && blen >= 6000) {
+    var total: uint64 = 0;
+    var no: uint64 = (uint64)c->nobs_total;
+    var nn: uint64 = (uint64)c->nnew_total;
+    for i in 0..10 {
+      var want: uint64 = (uint64)c->obs[i] * nn;
+      var got: uint64 = (uint64)c->nobs[i] * no;
+      if (got > want) { total = total + (got - want); } else { total = total + (want - got); }
+    }
+    var items: uint64 = no + nn;
+    var cutoff: uint64 = nn * 200 / 512 * no;
+    if (blen < 10000 && items < 8192) { cutoff = cutoff + cutoff * (8192 - items) / 8192; }
+    if (total + (uint64)(blen / 4096) * no >= cutoff) { split = true; }
+  }
+  if (!split) {
+    for i in 0..10 {
+      c->obs[i] = c->obs[i] + c->nobs[i];
+      c->nobs[i] = 0;
+    }
+    c->nobs_total = c->nobs_total + c->nnew_total;
+    c->nnew_total = 0;
+  }
+  return split;
+}
+
+@inline fn pdf_lit(c: PdfDeflate*, v: uint8) {
+  var k: int64 = (int64)(((v >> 5) & 6) | (v & 1));
+  c->nobs[k] = c->nobs[k] + 1;
+  c->nnew_total = c->nnew_total + 1;
+  c->items[c->nitems] = (uint32)v;
+  c->nitems = c->nitems + 1;
+  c->llfreq[(int64)v] = c->llfreq[(int64)v] + 1;
+}
+
+@inline fn pdf_match(c: PdfDeflate*, len: int64, dist: int64) {
+  var k: int64 = 8;
+  if (len >= 9) { k = 9; }
+  c->nobs[k] = c->nobs[k] + 1;
+  c->nnew_total = c->nnew_total + 1;
+  c->items[c->nitems] = (uint32)((dist << 9) | len);
+  c->nitems = c->nitems + 1;
+  var ls: int64 = 257 + (int64)PDF_LEN_SYM[len];
+  c->llfreq[ls] = c->llfreq[ls] + 1;
+  var dc: int64 = pdf_dist_code(dist);
+  c->dfreq[dc] = c->dfreq[dc] + 1;
+}
+
+// Greedy parse of win[pos .. end).
+fn pdf_greedy(c: PdfDeflate*, end: int64, out: PressBuf*) -> int32 {
+  var w: uint8* = c->win;
+  var hlim: int64 = c->wlen - 3;   // last position with 4 bytes to hash
+  var chain: int64 = c->lv.chain;
+  var p: int64 = c->pos;
+  while (p < end) {
+    if (c->nitems >= PDF_MAX_ITEMS - 2 || (c->nnew_total >= 512 && pdf_split_check(c, p))) {
+      c->pos = p;
+      var rc: int32 = pdf_flush_block(c, false, out);
+      if (rc != PRESS_OK) { return rc; }
+    }
+    if (p >= hlim) {
+      pdf_lit(c, w[p]);
+      p = p + 1;
+      continue;
+    }
+    pdf_insert(c, p);
+    var m: PdfMatch = pdf_find(c, p, 0, chain);
+    if (m.len >= PDF_MIN_MATCH) {
+      pdf_match(c, m.len, m.dist);
+      // Insert a few positions inside short matches; long ones are skipped
+      // for speed.
+      if (m.len <= 16) {
+        var q: int64 = p + 1;
+        var qe: int64 = p + m.len;
+        if (qe > hlim) { qe = hlim; }
+        while (q < qe) { pdf_insert(c, q); q = q + 1; }
+      }
+      p = p + m.len;
+    } else {
+      pdf_lit(c, w[p]);
+      p = p + 1;
+    }
+  }
+  c->pos = p;
+  return PRESS_OK;
+}
+
+// Lazy parse of win[pos .. end): a match is held back one step to see if
+// the next position does better.
+fn pdf_lazy(c: PdfDeflate*, end: int64, out: PressBuf*) -> int32 {
+  var w: uint8* = c->win;
+  var hlim: int64 = c->wlen - 3;
+  var p: int64 = c->pos;
+  while (p < end) {
+    if (c->nitems >= PDF_MAX_ITEMS - 2 || (c->nnew_total >= 512 && pdf_split_check(c, p))) {
+      c->pos = p;
+      var rc: int32 = pdf_flush_block(c, false, out);
+      if (rc != PRESS_OK) { return rc; }
+    }
+    var cur: PdfMatch;
+    cur.len = 0;
+    cur.dist = 0;
+    if (p < hlim) {
+      pdf_insert(c, p);
+      if (!c->has_prev || c->prev_len < c->lv.lazy) {
+        var chain: int64 = c->lv.chain;
+        if (c->has_prev && c->prev_len >= c->lv.good) { chain = chain >> 2; }
+        var beat: int64 = 0;
+        if (c->has_prev) { beat = c->prev_len; }
+        cur = pdf_find(c, p, beat, chain);
+      }
+    }
+    if (c->has_prev && c->prev_len >= 3 && c->prev_len >= cur.len) {
+      // The held match wins: it started at p - 1.
+      pdf_match(c, c->prev_len, c->prev_dist);
+      var q: int64 = p + 1;
+      var qe: int64 = p - 1 + c->prev_len;
+      if (qe > hlim) { qe = hlim; }
+      while (q < qe) { pdf_insert(c, q); q = q + 1; }
+      p = p - 1 + c->prev_len;
+      c->has_prev = false;
+      c->prev_len = 0;
+    } else {
+      if (c->has_prev) { pdf_lit(c, w[p - 1]); }
+      c->has_prev = true;
+      c->prev_len = cur.len;
+      c->prev_dist = cur.dist;
+      p = p + 1;
+    }
+  }
+  c->pos = p;
+  return PRESS_OK;
+}
+
+/// Compresses win[pos .. end). With `last`, also ends the stream.
+export fn pdf_deflate_work(c: PdfDeflate*, end: int64, last: bool, out: PressBuf*) -> int32 {
+  var rc: int32 = PRESS_OK;
+  if (c->level == 0) {
+    var wrote_last: bool = false;
+    while (c->pos < end) {
+      var n: int64 = end - c->pos;
+      if (n > 65535 * 4) { n = 65535 * 4; }
+      c->pos = c->pos + n;
+      rc = press_buf_reserve(out, n + n / 65535 * 5 + 32);
+      if (rc != PRESS_OK) { return rc; }
+      var op: int64 = out->len;
+      pdf_write_stored(c, c->bstart, c->pos, last && c->pos == end, out->data, &op);
+      out->len = op;
+      c->bstart = c->pos;
+      if (last && c->pos == end) { wrote_last = true; }
+    }
+    if (last && !wrote_last) {
+      rc = press_buf_reserve(out, 32);
+      if (rc != PRESS_OK) { return rc; }
+      var op2: int64 = out->len;
+      pdf_write_stored(c, 0, 0, true, out->data, &op2);
+      out->len = op2;
+    }
+    return PRESS_OK;
+  }
+  if (c->lv.greedy) { rc = pdf_greedy(c, end, out); } else { rc = pdf_lazy(c, end, out); }
+  if (rc != PRESS_OK) { return rc; }
+  if (last) {
+    if (c->has_prev) {
+      pdf_lit(c, c->win[c->pos - 1]);
+      c->has_prev = false;
+    }
+    rc = pdf_flush_block(c, true, out);
+  }
+  return rc;
+}
+
+// ---- streaming input ----
+
+const PDF_WCAP: int64 = 262144;   // window buffer size; slides by multiples of 32 KiB
+
+/// Turns an initialised encoder into a streaming one with its own window.
+export fn pdf_deflate_stream(c: PdfDeflate*) -> int32 {
+  c->win = (uint8*)malloc(PDF_WCAP);
+  if (c->win == 0) { return PRESS_E_MEM; }
+  c->owns_win = true;
+  c->wcap = PDF_WCAP;
+  return PRESS_OK;
+}
+
+// Moves the window down, keeping at least 32 KiB before pos. The shift is a
+// multiple of 32 KiB, so chain slots (pos & 32767) stay where they are.
+fn pdf_slide(c: PdfDeflate*, out: PressBuf*) -> int32 {
+  var shift: int64 = ((c->pos - PDF_WSIZE) / PDF_WSIZE) * PDF_WSIZE;
+  if (c->has_prev) { shift = ((c->pos - 1 - PDF_WSIZE) / PDF_WSIZE) * PDF_WSIZE; }
+  if (shift <= 0) { return PRESS_OK; }
+  if (c->bstart < shift) {
+    var rc: int32 = pdf_flush_block(c, false, out);
+    if (rc != PRESS_OK) { return rc; }
+  }
+  memmove(c->win, c->win + shift, c->wlen - shift);
+  c->wlen = c->wlen - shift;
+  c->pos = c->pos - shift;
+  c->bstart = c->bstart - shift;
+  if (c->level > 0) {
+    var hn: int64 = (int64)1 << (uint64)c->hbits;
+    var s32: int32 = (int32)shift;
+    for i in 0..hn {
+      var v: int32 = c->head[i] - s32;
+      if (v < 0) { v = -1; }
+      c->head[i] = v;
+    }
+    for i in 0..PDF_WSIZE {
+      var v2: int32 = c->prev[i] - s32;
+      if (v2 < 0) { v2 = -1; }
+      c->prev[i] = v2;
+    }
+    if (c->h3 != 0) {
+      for i in 0..PDF_H3_SIZE {
+        var v3: int32 = c->h3[i] - s32;
+        if (v3 < 0) { v3 = -1; }
+        c->h3[i] = v3;
+      }
+    }
+  }
+  return PRESS_OK;
+}
+
+/// Adds input to a streaming encoder, compressing whenever the window fills.
+export fn pdf_deflate_feed(c: PdfDeflate*, p: uint8*, n: int64, out: PressBuf*) -> int32 {
+  var i: int64 = 0;
+  while (i < n) {
+    var k: int64 = c->wcap - c->wlen;
+    if (k > n - i) { k = n - i; }
+    memcpy(c->win + c->wlen, p + i, k);
+    c->wlen = c->wlen + k;
+    i = i + k;
+    if (c->wlen == c->wcap) {
+      var rc: int32 = pdf_deflate_work(c, c->wlen - PDF_LOOKAHEAD, false, out);
+      if (rc == PRESS_OK) { rc = pdf_slide(c, out); }
+      if (rc != PRESS_OK) { return rc; }
+    }
+  }
+  return PRESS_OK;
+}
+
+/// Compresses everything buffered. With `last` the stream ends; without
+/// it, a sync mark follows so the output so far can be decoded.
+export fn pdf_deflate_drain(c: PdfDeflate*, last: bool, out: PressBuf*) -> int32 {
+  var rc: int32 = pdf_deflate_work(c, c->wlen, last, out);
+  if (rc != PRESS_OK || last) { return rc; }
+  if (c->has_prev) {
+    pdf_lit(c, c->win[c->pos - 1]);
+    c->has_prev = false;
+  }
+  if (c->level > 0) {
+    rc = pdf_flush_block(c, false, out);
+    if (rc != PRESS_OK) { return rc; }
+  }
+  return pdf_sync_mark(c, out);
+}
+
+/// Compresses n bytes to raw DEFLATE (no wrapper), appending to out.
+/// Levels 0 (store) to 9 (smallest); -1 means the default, 6.
+export fn press_deflate_compress(src: uint8*, n: int64, level: int32, out: PressBuf*) -> int32 {
+  if (out == 0 || n < 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var lv: int32 = level;
+  if (lv == -1) { lv = 6; }
+  var c: PdfDeflate* = new PdfDeflate;
+  if (c == 0) { return PRESS_E_MEM; }
+  var rc: int32 = pdf_deflate_init(c, lv, n);
+  var start: int64 = out->len;
+  if (rc == PRESS_OK) {
+    if (n < ((int64)1 << 30)) {
+      // Positions are 32-bit, so only inputs under 1 GiB are used in place.
+      c->win = src;
+      c->wlen = n;
+      rc = pdf_deflate_work(c, n, true, out);
+    } else {
+      rc = pdf_deflate_stream(c);
+      if (rc == PRESS_OK) { rc = pdf_deflate_feed(c, src, n, out); }
+      if (rc == PRESS_OK) { rc = pdf_deflate_drain(c, true, out); }
+    }
+  }
+  pdf_deflate_free(c);
+  free(c);
+  if (rc != PRESS_OK) { out->len = start; }
+  return rc;
+}

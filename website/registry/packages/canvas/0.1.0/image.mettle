@@ -1,0 +1,4 @@
+// canvas/image: everything in canvas/canvas, plus loading and saving
+// pixmaps as image files (PNG and the rest) with Etch.
+import "canvas/canvas";
+import "canvas/io/image";

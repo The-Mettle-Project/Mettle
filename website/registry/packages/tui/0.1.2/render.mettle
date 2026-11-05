@@ -1,0 +1,230 @@
+// Turning a frame into control sequences. Only cells that differ from the
+// last frame are written (the double-buffer diff of ratatui and tcell), the
+// cursor moves the shortest way, and style changes are sent as one SGR.
+// Sequences follow ECMA-48 (CUP, CUF, SGR, ED) and xterm (38;2 / 38;5
+// colours, DEC private modes).
+
+import "std/mem";
+import "std/conv";
+import "types";
+import "color";
+
+// A growable byte buffer for terminal output.
+export struct TuiOut {
+  data: uint8*;
+  len: int64;
+  cap: int64;
+}
+
+export fn tui_out_new() -> TuiOut* {
+  var o: TuiOut* = new TuiOut;
+  o->cap = 4096;
+  o->data = (uint8*)malloc(o->cap);
+  return o;
+}
+
+export fn tui_out_free(o: TuiOut*) {
+  if (o == 0) { return; }
+  free(o->data);
+  free(o);
+}
+
+fn tui_out_room(o: TuiOut*, n: int64) {
+  if (o->len + n <= o->cap) { return; }
+  var c: int64 = o->cap * 2;
+  while (c < o->len + n) { c = c * 2; }
+  o->data = (uint8*)realloc(o->data, c);
+  o->cap = c;
+}
+
+export fn tui_out_bytes(o: TuiOut*, p: uint8*, n: int64) {
+  tui_out_room(o, n);
+  memcpy(o->data + o->len, p, n);
+  o->len = o->len + n;
+}
+
+export fn tui_out_str(o: TuiOut*, s: string) {
+  tui_out_bytes(o, s.chars, (int64)s.length);
+}
+
+export fn tui_out_byte(o: TuiOut*, b: int32) {
+  tui_out_room(o, 1);
+  o->data[o->len] = (uint8)b;
+  o->len = o->len + 1;
+}
+
+export fn tui_out_int(o: TuiOut*, v: int32) {
+  if (v < 0) { tui_out_byte(o, 45); v = 0 - v; }
+  var tmp: uint8[12];
+  var n: int32 = 0;
+  if (v == 0) { tmp[0] = (uint8)48; n = 1; }
+  while (v > 0) { tmp[n] = (uint8)(48 + v % 10); v = v / 10; n = n + 1; }
+  tui_out_room(o, (int64)n);
+  while (n > 0) { n = n - 1; o->data[o->len] = tmp[n]; o->len = o->len + 1; }
+}
+
+export fn tui_out_text(o: TuiOut*) -> string {
+  return str_from_bytes((cstring)o->data, o->len);
+}
+
+export fn tui_out_reset(o: TuiOut*) { o->len = 0; }
+
+// What the terminal is known to be in, between frames.
+export struct TuiPen {
+  x: int32;         // cursor, -1 when unknown
+  y: int32;
+  style: TuiStyle;  // current SGR, already brought down to the depth
+  known: bool;      // false until the first SGR reset
+  depth: int32;
+}
+
+export fn tui_pen_reset(p: TuiPen*, depth: int32) {
+  p->x = -1;
+  p->y = -1;
+  var st: TuiStyle;
+  p->style = st;
+  p->known = false;
+  p->depth = depth;
+}
+
+fn tui_sgr_color(o: TuiOut*, c: uint32, bg: bool) {
+  var kind: uint32 = tui_color_kind(c);
+  if (kind == TUI_KIND_RGB) {
+    if (bg) { tui_out_str(o, "48;2;"); } else { tui_out_str(o, "38;2;"); }
+    tui_out_int(o, tui_color_r(c)); tui_out_byte(o, 59);
+    tui_out_int(o, tui_color_g(c)); tui_out_byte(o, 59);
+    tui_out_int(o, tui_color_b(c));
+    return;
+  }
+  if (kind == TUI_KIND_INDEX) {
+    var i: int32 = (int32)(c & (uint32)255);
+    var base: int32 = 30;
+    if (bg) { base = 40; }
+    if (i < 8) { tui_out_int(o, base + i); return; }
+    if (i < 16) { tui_out_int(o, base + 60 + i - 8); return; }
+    if (bg) { tui_out_str(o, "48;5;"); } else { tui_out_str(o, "38;5;"); }
+    tui_out_int(o, i);
+    return;
+  }
+  if (bg) { tui_out_str(o, "49"); } else { tui_out_str(o, "39"); }
+}
+
+const TUI_ATTR_CODES: int32[7] = [1, 2, 3, 4, 5, 7, 9];
+
+fn tui_sep(o: TuiOut*, first: bool*) {
+  if (!*first) { tui_out_byte(o, 59); }
+  *first = false;
+}
+
+// Moves the terminal from the pen's style to want with one SGR.
+export fn tui_sgr_to(o: TuiOut*, p: TuiPen*, want_in: TuiStyle) {
+  var want: TuiStyle = want_in;
+  want.fg = tui_color_for(want.fg, p->depth);
+  want.bg = tui_color_for(want.bg, p->depth);
+  if (p->known && tui_style_eq(p->style, want)) { return; }
+  tui_csi(o);
+  var first: bool = true;
+  var cur: TuiStyle = p->style;
+  var dropped: bool = (cur.attrs & ~want.attrs) != (uint16)0;
+  if (!p->known || dropped) {
+    tui_out_byte(o, 48);   // "0": reset everything
+    first = false;
+    var blank: TuiStyle;
+    cur = blank;
+  }
+  for i in 0..7 {
+    var bit: uint16 = (uint16)(1 << i);
+    if ((want.attrs & bit) != (uint16)0 && (cur.attrs & bit) == (uint16)0) {
+      tui_sep(o, &first);
+      tui_out_int(o, TUI_ATTR_CODES[i]);
+    }
+  }
+  if (want.fg != cur.fg) { tui_sep(o, &first); tui_sgr_color(o, want.fg, false); }
+  if (want.bg != cur.bg) { tui_sep(o, &first); tui_sgr_color(o, want.bg, true); }
+  tui_out_byte(o, 109);   // 'm'
+  p->style = want;
+  p->known = true;
+}
+
+// ESC [ (Mettle strings have no \x escape, so it is written as bytes).
+export fn tui_csi(o: TuiOut*) { tui_out_byte(o, 27); tui_out_byte(o, 91); }
+
+export fn tui_move(o: TuiOut*, p: TuiPen*, x: int32, y: int32) {
+  if (p->x == x && p->y == y) { return; }
+  if (p->y == y && p->x >= 0 && x > p->x && x - p->x <= 4) {
+    tui_csi(o);
+    if (x - p->x > 1) { tui_out_int(o, x - p->x); }
+    tui_out_byte(o, 67);   // CUF
+  } else if (x == 0 && p->y >= 0 && y == p->y + 1) {
+    tui_out_byte(o, 13); tui_out_byte(o, 10);   // CR LF (no scroll: not the last row)
+  } else {
+    tui_csi(o);
+    tui_out_int(o, y + 1);
+    tui_out_byte(o, 59);
+    tui_out_int(o, x + 1);
+    tui_out_byte(o, 72);   // CUP
+  }
+  p->x = x;
+  p->y = y;
+}
+
+fn tui_cell_eq(a: TuiCell*, b: TuiCell*) -> bool {
+  if (a->len != b->len || a->width != b->width) { return false; }
+  if (!tui_style_eq(a->style, b->style)) { return false; }
+  for k in 0..(int32)a->len {
+    if (a->text[k] != b->text[k]) { return false; }
+  }
+  return true;
+}
+
+// Writes what changed from front to back, then makes front equal back.
+// Both buffers must be the same size. Returns the number of cells written.
+export fn tui_render_diff(o: TuiOut*, p: TuiPen*, front: TuiBuf*, back: TuiBuf*) -> int32 {
+  var count: int32 = 0;
+  var w: int32 = back->w;
+  for y in 0..back->h {
+    var x: int32 = 0;
+    while (x < w) {
+      var i: int64 = (int64)y * (int64)w + (int64)x;
+      var bc: TuiCell* = &back->cells[i];
+      var fc: TuiCell* = &front->cells[i];
+      if (bc->width == (uint8)0) {
+        // The right half of a wide character. If it differs the left half is
+        // rewritten below; on its own it is a stray, so draw a space.
+        if (!tui_cell_eq(bc, fc)) {
+          var left_wide: bool = x > 0 && back->cells[i - 1].width == (uint8)2;
+          if (!left_wide) {
+            tui_move(o, p, x, y);
+            tui_sgr_to(o, p, bc->style);
+            tui_out_byte(o, 32);
+            p->x = p->x + 1;
+            count = count + 1;
+          }
+          *fc = *bc;
+        }
+        x = x + 1;
+        continue;
+      }
+      var cw: int32 = (int32)bc->width;
+      var same: bool = tui_cell_eq(bc, fc);
+      if (same && cw == 2 && x + 1 < w) { same = tui_cell_eq(&back->cells[i + 1], &front->cells[i + 1]); }
+      if (!same) {
+        tui_move(o, p, x, y);
+        tui_sgr_to(o, p, bc->style);
+        if (bc->len == (uint8)0) {
+          tui_out_byte(o, 32);
+        } else {
+          tui_out_bytes(o, &bc->text[0], (int64)bc->len);
+        }
+        *fc = *bc;
+        if (cw == 2 && x + 1 < w) { front->cells[i + 1] = back->cells[i + 1]; }
+        p->x = p->x + cw;
+        // After the last column the cursor waits to wrap: treat it as unknown.
+        if (p->x >= w) { p->x = -1; p->y = -1; }
+        count = count + 1;
+      }
+      x = x + cw;
+    }
+  }
+  return count;
+}

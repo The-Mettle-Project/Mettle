@@ -1,0 +1,6 @@
+name = crypto
+version = 0.2.5
+description = Misuse-resistant crypto in pure Mettle: SHA-2, BLAKE2b, HMAC, Argon2id, XChaCha20-Poly1305, X25519, Ed25519, TOTP, hex/base64url, signed values, tokens, seal/open
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Cryptex
+compiler = 0.18.0

@@ -1,0 +1,298 @@
+// Landlock: limit which files and TCP ports a process may use, without
+// privileges.
+//
+// A SandboxLandlock lists what is allowed: rights on paths (a right on a
+// directory covers everything below it) and rights on TCP ports. Everything
+// the ruleset "handles" and no rule allows is refused, even where file
+// permissions or the mount list would allow it. sandbox_landlock_init
+// handles every right the running kernel knows, so the default is
+// deny-everything.
+//
+// Kernels differ in what Landlock supports (ABI 1 in Linux 5.13, network
+// rules from ABI 4 in 6.7, scopes from ABI 6 in 6.12). Like rust-landlock's
+// best-effort mode, rights the kernel lacks are left out of both the
+// ruleset and the rules, so one policy works everywhere and is as strict as
+// the kernel allows. Set strict to 1 to fail with -SANDBOX_EOPNOTSUPP
+// instead. Without Landlock at all, sandbox_landlock_restrict returns
+// -SANDBOX_EOPNOTSUPP unless strict is 0, when it does nothing.
+//
+// The kernel interface is described in the Linux Landlock documentation
+// (Documentation/userspace-api/landlock.rst) and landlock(7).
+
+import "sys.mettle";
+import "caps.mettle";
+import "std/mem";
+
+// File system rights.
+export const SANDBOX_LL_EXECUTE: uint64 = 1;
+export const SANDBOX_LL_WRITE_FILE: uint64 = 2;
+export const SANDBOX_LL_READ_FILE: uint64 = 4;
+export const SANDBOX_LL_READ_DIR: uint64 = 8;
+export const SANDBOX_LL_REMOVE_DIR: uint64 = 16;
+export const SANDBOX_LL_REMOVE_FILE: uint64 = 32;
+export const SANDBOX_LL_MAKE_CHAR: uint64 = 64;
+export const SANDBOX_LL_MAKE_DIR: uint64 = 128;
+export const SANDBOX_LL_MAKE_REG: uint64 = 256;
+export const SANDBOX_LL_MAKE_SOCK: uint64 = 512;
+export const SANDBOX_LL_MAKE_FIFO: uint64 = 1024;
+export const SANDBOX_LL_MAKE_BLOCK: uint64 = 2048;
+export const SANDBOX_LL_MAKE_SYM: uint64 = 4096;
+export const SANDBOX_LL_REFER: uint64 = 8192;        // ABI 2: rename and link across directories
+export const SANDBOX_LL_TRUNCATE: uint64 = 16384;    // ABI 3
+export const SANDBOX_LL_IOCTL_DEV: uint64 = 32768;   // ABI 5: ioctl on device files
+
+// Handy groups.
+export const SANDBOX_LL_READ: uint64 = 12;              // READ_FILE | READ_DIR
+export const SANDBOX_LL_READ_EXEC: uint64 = 13;         // READ | EXECUTE
+export const SANDBOX_LL_WRITE: uint64 = 0x7ff2;         // write, truncate, make, remove, refer (no devices)
+export const SANDBOX_LL_ALL: uint64 = 0xffff;
+
+// Network rights (ABI 4).
+export const SANDBOX_LL_BIND_TCP: uint64 = 1;
+export const SANDBOX_LL_CONNECT_TCP: uint64 = 2;
+
+// Scopes (ABI 6): refuse these across the sandbox boundary.
+export const SANDBOX_LL_SCOPE_ABSTRACT_UNIX: uint64 = 1;
+export const SANDBOX_LL_SCOPE_SIGNAL: uint64 = 2;
+
+const LL_FILE_RIGHTS: uint64 = 0xc007;   // the rights that make sense on a file, not a directory
+const LL_RULE_PATH_BENEATH = 1;
+const LL_RULE_NET_PORT = 2;
+const LL_CREATE_RULESET_VERSION = 1;
+const LL_MAX_RULES = 1024;
+
+struct SbxLlRule { is_port: int32; path: string; port: uint64; access: uint64; }
+
+export struct SandboxLandlock {
+  handled_fs: uint64;     // file rights the ruleset controls
+  handled_net: uint64;    // network rights the ruleset controls
+  scoped: uint64;         // SANDBOX_LL_SCOPE_* flags
+  strict: int32;          // 1: fail where the kernel lacks a feature
+  rules: SbxLlRule*;
+  n: int64;
+  cap: int64;
+  err: int64;
+}
+
+// The Landlock ABI version of the running kernel, or 0 if it has none (or
+// it is turned off).
+export fn sandbox_landlock_abi() -> int64 {
+  var r: int64 = syscall(SBX_NR_LANDLOCK_CREATE_RULESET, 0, 0, LL_CREATE_RULESET_VERSION);
+  if (r < 0) { return 0; }
+  return r;
+}
+
+// The file rights a kernel with this ABI understands.
+fn sbx_ll_fs_mask(abi: int64) -> uint64 {
+  if (abi <= 0) { return 0; }
+  if (abi == 1) { return 0x1fff; }
+  if (abi == 2) { return 0x3fff; }
+  if (abi <= 4) { return 0x7fff; }
+  return 0xffff;
+}
+
+fn sbx_ll_net_mask(abi: int64) -> uint64 {
+  if (abi >= 4) { return 3; }
+  return 0;
+}
+
+fn sbx_ll_scope_mask(abi: int64) -> uint64 {
+  if (abi >= 6) { return 3; }
+  return 0;
+}
+
+// Starts a ruleset that refuses every file and TCP right, and abstract unix
+// sockets and signals that leave the sandbox, until rules allow them.
+export fn sandbox_landlock_init(l: SandboxLandlock*) {
+  var blank: SandboxLandlock;
+  *l = blank;
+  l->handled_fs = SANDBOX_LL_ALL;
+  l->handled_net = SANDBOX_LL_BIND_TCP | SANDBOX_LL_CONNECT_TCP;
+  l->scoped = SANDBOX_LL_SCOPE_ABSTRACT_UNIX | SANDBOX_LL_SCOPE_SIGNAL;
+}
+
+export fn sandbox_landlock_free(l: SandboxLandlock*) {
+  if (l->rules != (SbxLlRule*)0) { free(l->rules); }
+  sandbox_landlock_init(l);
+}
+
+fn sbx_ll_add(l: SandboxLandlock*, r: SbxLlRule) -> int64 {
+  if (l->n >= LL_MAX_RULES) {
+    if (l->err == 0) { l->err = -SANDBOX_E2BIG; }
+    return -SANDBOX_E2BIG;
+  }
+  if (l->n == l->cap) {
+    var nc: int64 = 16;
+    if (l->cap > 0) { nc = l->cap * 2; }
+    var p: SbxLlRule* = (SbxLlRule*)realloc(l->rules, nc * sizeof(SbxLlRule));
+    if (p == (SbxLlRule*)0) {
+      if (l->err == 0) { l->err = -SANDBOX_ENOMEM; }
+      return -SANDBOX_ENOMEM;
+    }
+    l->rules = p;
+    l->cap = nc;
+  }
+  l->rules[l->n] = r;
+  l->n = l->n + 1;
+  return 0;
+}
+
+// Allows access (SANDBOX_LL_* file rights) on path and everything below it.
+// The path is opened when the ruleset is applied; inside a sandbox that is
+// after the new root is in place, so give paths as the program sees them.
+// A path that does not exist then is skipped (it grants nothing).
+export fn sandbox_landlock_allow_path(l: SandboxLandlock*, path: string, access: uint64) -> int64 {
+  if (path.length == 0 || path.length > 4000 || access == 0 || (access & ~SANDBOX_LL_ALL) != 0) {
+    if (l->err == 0) { l->err = -SANDBOX_EINVAL; }
+    return -SANDBOX_EINVAL;
+  }
+  var r: SbxLlRule = { is_port: 0, path: path, port: 0, access: access };
+  return sbx_ll_add(l, r);
+}
+
+// Allows binding or connecting (SANDBOX_LL_BIND_TCP, SANDBOX_LL_CONNECT_TCP)
+// on one TCP port.
+export fn sandbox_landlock_allow_port(l: SandboxLandlock*, port: int64, access: uint64) -> int64 {
+  if (port < 0 || port > 65535 || access == 0 || (access & ~(uint64)3) != 0) {
+    if (l->err == 0) { l->err = -SANDBOX_EINVAL; }
+    return -SANDBOX_EINVAL;
+  }
+  var r: SbxLlRule = { is_port: 1, path: "", port: (uint64)port, access: access };
+  return sbx_ll_add(l, r);
+}
+
+// Read and execute access to the usual system directories, for running host
+// programs: /usr, /bin, /sbin, /lib, /lib64 and /etc, and read and write on
+// /dev/null, /dev/zero, /dev/urandom and /dev/random.
+export fn sandbox_landlock_allow_system(l: SandboxLandlock*) -> int64 {
+  var dirs: string[6] = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"];
+  var r: int64 = 0;
+  for i in 0..6 {
+    if (r == 0) { r = sandbox_landlock_allow_path(l, dirs[i], SANDBOX_LL_READ_EXEC); }
+  }
+  var devs: string[4] = ["/dev/null", "/dev/zero", "/dev/urandom", "/dev/random"];
+  for i in 0..4 {
+    if (r == 0) { r = sandbox_landlock_allow_path(l, devs[i], SANDBOX_LL_READ_FILE | SANDBOX_LL_WRITE_FILE); }
+  }
+  return r;
+}
+
+// ---- prepared form, applied without allocating ------------------------------
+
+struct SbxLlAttr { handled_fs: uint64; handled_net: uint64; scoped: uint64; }
+struct SbxLlPathAttr { access: uint64; parent_fd: int32; pad: int32; }   // kernel reads 12 bytes
+struct SbxLlPortAttr { access: uint64; port: uint64; }
+
+export struct SbxLlPrep { is_port: int32; path: uint8*; port: uint64; access: uint64; }
+
+// What the child needs to apply a ruleset: kernel-ready values and C strings.
+export struct SbxLandlockPlan {
+  active: int32;          // 0: nothing to apply
+  attr: SbxLlAttr;
+  attr_size: int64;
+  rules: SbxLlPrep*;
+  n: int64;
+}
+
+export fn sbx_landlock_plan_free(pl: SbxLandlockPlan*) {
+  for i in 0..pl->n {
+    if (pl->rules[i].path != (uint8*)0) { free(pl->rules[i].path); }
+  }
+  if (pl->rules != (SbxLlPrep*)0) { free(pl->rules); }
+  var blank: SbxLandlockPlan;
+  *pl = blank;
+}
+
+// Checks the ruleset against the running kernel and prepares it. Returns 0
+// or -errno.
+export fn sbx_landlock_plan(l: SandboxLandlock*, pl: SbxLandlockPlan*) -> int64 {
+  var blank: SbxLandlockPlan;
+  *pl = blank;
+  if (l->err != 0) { return l->err; }
+  var abi: int64 = sandbox_landlock_abi();
+  var fs: uint64 = l->handled_fs & sbx_ll_fs_mask(abi);
+  var net: uint64 = l->handled_net & sbx_ll_net_mask(abi);
+  var sc: uint64 = l->scoped & sbx_ll_scope_mask(abi);
+  if (l->strict != 0 && (fs != l->handled_fs || net != l->handled_net || sc != l->scoped)) {
+    return -SANDBOX_EOPNOTSUPP;
+  }
+  if (fs == 0 && net == 0 && sc == 0) { return 0; }   // nothing the kernel can enforce
+  pl->attr.handled_fs = fs;
+  pl->attr.handled_net = net;
+  pl->attr.scoped = sc;
+  pl->attr_size = 8;
+  if (abi >= 4) { pl->attr_size = 16; }
+  if (abi >= 6) { pl->attr_size = 24; }
+  if (l->n > 0) {
+    pl->rules = (SbxLlPrep*)calloc(l->n, sizeof(SbxLlPrep));
+    if (pl->rules == (SbxLlPrep*)0) { return -SANDBOX_ENOMEM; }
+  }
+  for i in 0..l->n {
+    var q: SbxLlRule = l->rules[i];
+    var p: SbxLlPrep;
+    p.is_port = q.is_port;
+    if (q.is_port != 0) {
+      p.access = q.access & net;
+      p.port = q.port;
+    } else {
+      p.access = q.access & fs;
+      p.path = sbx_cstr(q.path);
+      if (p.path == (uint8*)0) { return -SANDBOX_ENOMEM; }
+    }
+    if (l->strict != 0 && p.access != q.access) {
+      if (p.path != (uint8*)0) { free(p.path); }
+      return -SANDBOX_EOPNOTSUPP;
+    }
+    pl->rules[pl->n] = p;
+    pl->n = pl->n + 1;
+  }
+  pl->active = 1;
+  return 0;
+}
+
+// Applies a prepared ruleset to the current process. Uses only system calls.
+// Returns 0 or -errno.
+export fn sbx_landlock_apply(pl: SbxLandlockPlan*) -> int64 {
+  if (pl->active == 0) { return 0; }
+  var fd: int64 = syscall(SBX_NR_LANDLOCK_CREATE_RULESET, &pl->attr, pl->attr_size, 0);
+  if (fd < 0) { return fd; }
+  for i in 0..pl->n {
+    var q: SbxLlPrep* = &pl->rules[i];
+    if (q->access == 0) { continue; }
+    var r: int64 = 0;
+    if (q->is_port != 0) {
+      var pa: SbxLlPortAttr = { access: q->access, port: q->port };
+      r = syscall(SBX_NR_LANDLOCK_ADD_RULE, fd, LL_RULE_NET_PORT, &pa, 0);
+    } else {
+      var pfd: int64 = syscall(SBX_NR_OPENAT, SBX_AT_FDCWD, q->path, SBX_O_PATH | SBX_O_CLOEXEC, 0);
+      if (pfd == -SANDBOX_ENOENT) { continue; }
+      if (pfd < 0) { sbx_close(fd); return pfd; }
+      var access: uint64 = q->access;
+      var dir: int64 = syscall(SBX_NR_OPENAT, SBX_AT_FDCWD, q->path, SBX_O_PATH | SBX_O_DIRECTORY | SBX_O_CLOEXEC, 0);
+      if (dir >= 0) { sbx_close(dir); } else { access = access & LL_FILE_RIGHTS; }
+      if (access != 0) {
+        var at: SbxLlPathAttr = { access: access, parent_fd: (int32)pfd, pad: 0 };
+        r = syscall(SBX_NR_LANDLOCK_ADD_RULE, fd, LL_RULE_PATH_BENEATH, &at, 0);
+      }
+      sbx_close(pfd);
+    }
+    if (r < 0) { sbx_close(fd); return r; }
+  }
+  var r2: int64 = sandbox_no_new_privs();
+  if (r2 == 0) { r2 = syscall(SBX_NR_LANDLOCK_RESTRICT_SELF, fd, 0); }
+  sbx_close(fd);
+  return r2;
+}
+
+// Restricts the current process (and every process it starts later) to
+// what the ruleset allows. Sets no_new_privs first. It cannot be undone.
+// Returns 0, or -SANDBOX_EOPNOTSUPP when strict is 1 and the kernel lacks
+// something, or -errno.
+export fn sandbox_landlock_restrict(l: SandboxLandlock*) -> int64 {
+  var pl: SbxLandlockPlan;
+  var r: int64 = sbx_landlock_plan(l, &pl);
+  if (r == 0 && pl.active == 0 && l->strict != 0) { r = -SANDBOX_EOPNOTSUPP; }
+  if (r == 0) { r = sbx_landlock_apply(&pl); }
+  sbx_landlock_plan_free(&pl);
+  return r;
+}

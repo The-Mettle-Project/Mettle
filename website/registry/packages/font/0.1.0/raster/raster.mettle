@@ -1,0 +1,303 @@
+// Anti-aliased glyph rasterising.
+//
+// This is the signed-area accumulation method from font-rs (Raph Levien),
+// also used by fontdue: every line segment adds its exact signed area
+// coverage into a float buffer, and one running sum over the buffer gives
+// each pixel's coverage. Curves are flattened into lines first (the same
+// subdivision counts as font-rs). Coverage is the absolute value of the
+// winding area, clamped to 1, which matches the non-zero rule for the
+// non-overlapping contours fonts use.
+//
+// Curves are cut into n straight pieces with n from Wang's formula
+// (n = sqrt(d(d-1)/8 * M / tol) for degree d, M the largest second
+// difference of the control points), so no piece strays more than TOL
+// pixels from the true curve. font-rs uses a looser count (about 0.14 px).
+
+import "std/mem";
+import "std/math";
+import "font/sfnt/face";
+import "font/outline/path";
+import "font/outline/outline";
+
+const TOL: float32 = 0.02;   // most a flattened curve may stray, in pixels
+
+/// An 8-bit coverage bitmap. (x, y) is where the top-left pixel sits
+/// relative to the glyph origin, in pixels, y down: draw the bitmap at
+/// (pen_x + x, baseline_y + y).
+export struct FontBitmap {
+  w: int32;
+  h: int32;
+  x: int32;
+  y: int32;
+  ch: int32;      // bytes per pixel: 1 (coverage or SDF) or 3 (MSDF, RGB)
+  data: uint8*;   // w * h * ch bytes, row by row
+}
+
+/// Frees the bitmap's pixels.
+export fn font_bitmap_free(b: FontBitmap*) {
+  if (b->data != 0) { free(b->data); }
+  b->data = (uint8*)0;
+  b->w = 0;
+  b->h = 0;
+}
+
+// Rasteriser state: the accumulation buffer and the transform.
+struct Ras {
+  a: float32*;
+  w: int64;
+  h: int64;
+  sx: float32; sy: float32;
+  tx: float32; ty: float32;
+}
+
+fn clampx(r: Ras*, x: float32) -> float32 {
+  if (x < 0.0) { return 0.0; }
+  var wf: float32 = (float32)r->w;
+  if (x > wf) { return wf; }
+  return x;
+}
+
+// Adds the signed area of the line (x0,y0)-(x1,y1), in pixel space.
+fn ras_line(r: Ras*, ax: float32, ay: float32, bx: float32, by: float32) {
+  if (ay == by) { return; }
+  var dir: float32 = 1.0;
+  var x0: float32 = ax; var y0: float32 = ay;
+  var x1: float32 = bx; var y1: float32 = by;
+  if (ay > by) { dir = -1.0; x0 = bx; y0 = by; x1 = ax; y1 = ay; }
+  var hf: float32 = (float32)r->h;
+  if (y1 <= 0.0 || y0 >= hf) { return; }
+  var dxdy: float32 = (x1 - x0) / (y1 - y0);
+  var x: float32 = x0;
+  if (y0 < 0.0) { x = x - y0 * dxdy; }
+  var ys: int64 = 0;
+  if (y0 > 0.0) { ys = (int64)y0; }
+  var ye: int64 = (int64)f32_ceil(y1);
+  if (ye > r->h) { ye = r->h; }
+  var w: int64 = r->w;
+  var a: float32* = r->a;
+  var y: int64 = ys;
+  while (y < ye) {
+    var row: int64 = y * w;
+    var top: float32 = (float32)y;
+    if (top < y0) { top = y0; }
+    var bot: float32 = (float32)(y + 1);
+    if (bot > y1) { bot = y1; }
+    var dy: float32 = bot - top;
+    var xnext: float32 = x + dxdy * dy;
+    var d: float32 = dy * dir;
+    var xa: float32 = clampx(r, x);
+    var xb: float32 = clampx(r, xnext);
+    var lo: float32 = xa; var hi: float32 = xb;
+    if (xb < xa) { lo = xb; hi = xa; }
+    var lof: float32 = f32_floor(lo);
+    var loi: int64 = (int64)lof;
+    var hic: float32 = f32_ceil(hi);
+    var hii: int64 = (int64)hic;
+    if (hii <= loi + 1) {
+      // The segment stays inside one pixel column on this row.
+      var xmf: float32 = 0.5 * (xa + xb) - lof;
+      a[row + loi] = a[row + loi] + d - d * xmf;
+      a[row + loi + 1] = a[row + loi + 1] + d * xmf;
+    } else {
+      var s: float32 = 1.0 / (hi - lo);
+      var x0f: float32 = lo - lof;
+      var a0: float32 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+      var x1f: float32 = hi - hic + 1.0;
+      var am: float32 = 0.5 * s * x1f * x1f;
+      a[row + loi] = a[row + loi] + d * a0;
+      if (hii == loi + 2) {
+        a[row + loi + 1] = a[row + loi + 1] + d * (1.0 - a0 - am);
+      } else {
+        var a1: float32 = s * (1.5 - x0f);
+        a[row + loi + 1] = a[row + loi + 1] + d * (a1 - a0);
+        var xi: int64 = loi + 2;
+        while (xi < hii - 1) { a[row + xi] = a[row + xi] + d * s; xi = xi + 1; }
+        var a2: float32 = a1 + (float32)(hii - loi - 3) * s;
+        a[row + hii - 1] = a[row + hii - 1] + d * (1.0 - a2 - am);
+      }
+      a[row + hii] = a[row + hii] + d * am;
+    }
+    x = xnext;
+    y = y + 1;
+  }
+}
+
+fn f32_floor(x: float32) -> float32 { return (float32)floor((float64)x); }
+fn f32_ceil(x: float32) -> float32 { return (float32)ceil((float64)x); }
+
+fn ras_quad(r: Ras*, x0: float32, y0: float32, x1: float32, y1: float32, x2: float32, y2: float32) {
+  var ddx: float32 = x0 - 2.0 * x1 + x2;
+  var ddy: float32 = y0 - 2.0 * y1 + y2;
+  var m: float64 = sqrt((float64)(ddx * ddx + ddy * ddy));
+  var n: int64 = (int64)ceil(sqrt(0.25 * m / (float64)TOL));
+  if (n < 1) { n = 1; }
+  if (n > 256) { n = 256; }
+  var px: float32 = x0;
+  var py: float32 = y0;
+  var dt: float32 = 1.0 / (float32)n;
+  for i: int64 in 1..n + 1 {
+    var t: float32 = (float32)i * dt;
+    var mt: float32 = 1.0 - t;
+    var qx: float32 = mt * mt * x0 + 2.0 * mt * t * x1 + t * t * x2;
+    var qy: float32 = mt * mt * y0 + 2.0 * mt * t * y1 + t * t * y2;
+    ras_line(r, px, py, qx, qy);
+    px = qx; py = qy;
+  }
+}
+
+fn ras_cubic(r: Ras*, x0: float32, y0: float32, x1: float32, y1: float32, x2: float32, y2: float32, x3: float32, y3: float32) {
+  var ax: float32 = x0 - 2.0 * x1 + x2;
+  var ay: float32 = y0 - 2.0 * y1 + y2;
+  var bx: float32 = x1 - 2.0 * x2 + x3;
+  var by: float32 = y1 - 2.0 * y2 + y3;
+  var dd: float32 = ax * ax + ay * ay;
+  var d2: float32 = bx * bx + by * by;
+  if (d2 > dd) { dd = d2; }
+  var n: int64 = (int64)ceil(sqrt(0.75 * sqrt((float64)dd) / (float64)TOL));
+  if (n < 1) { n = 1; }
+  if (n > 256) { n = 256; }
+  var px: float32 = x0;
+  var py: float32 = y0;
+  var dt: float32 = 1.0 / (float32)n;
+  for i: int64 in 1..n + 1 {
+    var t: float32 = (float32)i * dt;
+    var mt: float32 = 1.0 - t;
+    var c0: float32 = mt * mt * mt;
+    var c1: float32 = 3.0 * mt * mt * t;
+    var c2: float32 = 3.0 * mt * t * t;
+    var c3: float32 = t * t * t;
+    var qx: float32 = c0 * x0 + c1 * x1 + c2 * x2 + c3 * x3;
+    var qy: float32 = c0 * y0 + c1 * y1 + c2 * y2 + c3 * y3;
+    ras_line(r, px, py, qx, qy);
+    px = qx; py = qy;
+  }
+}
+
+fn ras_path(r: Ras*, p: FontPath*) {
+  var k: int64 = 0;
+  var cx: float32 = 0.0; var cy: float32 = 0.0;   // current point (pixels)
+  var sx: float32 = 0.0; var sy: float32 = 0.0;   // contour start (pixels)
+  var pts: float32* = p->pts.data;
+  for i: int64 in 0..p->cmds.len {
+    var c: uint8 = p->cmds.data[i];
+    if (c == FONT_CLOSE) {
+      ras_line(r, cx, cy, sx, sy);
+      cx = sx; cy = sy;
+      continue;
+    }
+    var np: int64 = font_path_cmd_points(c);
+    if (k + np * 2 > p->pts.len) { return; }
+    var x0: float32 = pts[k] * r->sx + r->tx;
+    var y0: float32 = r->ty - pts[k + 1] * r->sy;
+    if (c == FONT_MOVE) {
+      ras_line(r, cx, cy, sx, sy);   // close the previous contour if left open
+      cx = x0; cy = y0; sx = x0; sy = y0;
+    } else if (c == FONT_LINE) {
+      ras_line(r, cx, cy, x0, y0);
+      cx = x0; cy = y0;
+    } else if (c == FONT_QUAD) {
+      var x1: float32 = pts[k + 2] * r->sx + r->tx;
+      var y1: float32 = r->ty - pts[k + 3] * r->sy;
+      ras_quad(r, cx, cy, x0, y0, x1, y1);
+      cx = x1; cy = y1;
+    } else {
+      var x1: float32 = pts[k + 2] * r->sx + r->tx;
+      var y1: float32 = r->ty - pts[k + 3] * r->sy;
+      var x2: float32 = pts[k + 4] * r->sx + r->tx;
+      var y2: float32 = r->ty - pts[k + 5] * r->sy;
+      ras_cubic(r, cx, cy, x0, y0, x1, y1, x2, y2);
+      cx = x2; cy = y2;
+    }
+    k = k + np * 2;
+  }
+  ras_line(r, cx, cy, sx, sy);
+}
+
+/// Rasterises a path into caller memory. A font-unit point (x, y) lands at
+/// pixel (x * sx + tx, ty - y * sy), y down. out is w x h with `stride`
+/// bytes per row; coverage is written over whatever was there. Returns
+/// false when memory runs out.
+export fn font_raster_path(p: FontPath*, sx: float32, sy: float32, tx: float32, ty: float32,
+                           out: uint8*, w: int32, h: int32, stride: int32) -> bool {
+  if (w <= 0 || h <= 0) { return true; }
+  var r: Ras;
+  r.w = (int64)w;
+  r.h = (int64)h;
+  var n: int64 = r.w * r.h + r.w + 4;
+  r.a = (float32*)alloc_zeroed(n * 4);
+  if (r.a == 0) { return false; }
+  r.sx = sx; r.sy = sy; r.tx = tx; r.ty = ty;
+  ras_path(&r, p);
+  var acc: float32 = 0.0;
+  for y: int64 in 0..r.h {
+    var row: uint8* = out + y * (int64)stride;
+    var src: float32* = r.a + y * r.w;
+    for x: int64 in 0..r.w {
+      acc = acc + src[x];
+      var v: float32 = acc;
+      if (v < 0.0) { v = -v; }
+      if (v > 1.0) { v = 1.0; }
+      row[x] = (uint8)(v * 255.0 + 0.5);
+    }
+  }
+  free(r.a);
+  return true;
+}
+
+/// Pixel box (y down) that glyph g covers at scale (sx, sy) with a sub-pixel
+/// shift. False for a glyph with no outline.
+export fn font_glyph_pixel_box(f: FontFace*, g: int32, sx: float32, sy: float32, shift_x: float32, shift_y: float32,
+                               x0: int32*, y0: int32*, x1: int32*, y1: int32*) -> bool {
+  var p: FontPath;
+  var ok: bool = font_glyph_path(f, g, &p);
+  var bx0: float32 = 0.0; var by0: float32 = 0.0; var bx1: float32 = 0.0; var by1: float32 = 0.0;
+  ok = ok && font_path_bounds(&p, &bx0, &by0, &bx1, &by1);
+  font_path_free(&p);
+  *x0 = 0; *y0 = 0; *x1 = 0; *y1 = 0;
+  if (!ok) { return false; }
+  *x0 = (int32)floor((float64)(bx0 * sx + shift_x));
+  *y0 = (int32)floor((float64)(shift_y - by1 * sy));
+  *x1 = (int32)ceil((float64)(bx1 * sx + shift_x));
+  *y1 = (int32)ceil((float64)(shift_y - by0 * sy));
+  return true;
+}
+
+/// Rasterises a path into a new bitmap sized to fit it. (sx, sy) scale font
+/// units to pixels; (shift_x, shift_y) move the result by a fraction of a
+/// pixel. Returns false when out of memory; an empty path gives a 0 x 0
+/// bitmap and true.
+export fn font_path_bitmap(p: FontPath*, sx: float32, sy: float32, shift_x: float32, shift_y: float32, out: FontBitmap*) -> bool {
+  out->w = 0; out->h = 0; out->x = 0; out->y = 0;
+  out->data = (uint8*)0;
+  var bx0: float32 = 0.0; var by0: float32 = 0.0; var bx1: float32 = 0.0; var by1: float32 = 0.0;
+  if (!font_path_bounds(p, &bx0, &by0, &bx1, &by1)) { return true; }
+  var ix0: int32 = (int32)floor((float64)(bx0 * sx + shift_x));
+  var iy0: int32 = (int32)floor((float64)(shift_y - by1 * sy));
+  var ix1: int32 = (int32)ceil((float64)(bx1 * sx + shift_x));
+  var iy1: int32 = (int32)ceil((float64)(shift_y - by0 * sy));
+  var w: int32 = ix1 - ix0;
+  var h: int32 = iy1 - iy0;
+  if (w <= 0 || h <= 0) { return true; }
+  if ((int64)w * (int64)h > (int64)1 << 28) { return false; }
+  out->data = (uint8*)malloc((int64)w * (int64)h);
+  if (out->data == 0) { return false; }
+  out->w = w; out->h = h; out->x = ix0; out->y = iy0; out->ch = 1;
+  return font_raster_path(p, sx, sy, shift_x - (float32)ix0, shift_y - (float32)iy0, out->data, w, h, w);
+}
+
+/// Rasterises glyph g at `px` pixels per em. False on damaged glyph data or
+/// out of memory; a blank glyph (space) gives a 0 x 0 bitmap and true.
+export fn font_glyph_bitmap(f: FontFace*, g: int32, px: float32, out: FontBitmap*) -> bool {
+  var s: float32 = px / (float32)f->upem;
+  return font_glyph_bitmap_scaled(f, g, s, s, 0.0, 0.0, out);
+}
+
+/// Rasterises glyph g with separate x and y scales and a sub-pixel shift.
+export fn font_glyph_bitmap_scaled(f: FontFace*, g: int32, sx: float32, sy: float32, shift_x: float32, shift_y: float32, out: FontBitmap*) -> bool {
+  var p: FontPath;
+  out->w = 0; out->h = 0; out->x = 0; out->y = 0; out->data = (uint8*)0;
+  if (!font_glyph_path(f, g, &p)) { font_path_free(&p); return false; }
+  var ok: bool = font_path_bitmap(&p, sx, sy, shift_x, shift_y, out);
+  font_path_free(&p);
+  return ok;
+}

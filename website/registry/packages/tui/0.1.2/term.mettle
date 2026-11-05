@@ -1,0 +1,120 @@
+// The terminal: raw mode, the window size and signals come from std/term;
+// opening /dev/tty, reading, writing and waiting (ppoll) from std/linux.
+// SIGWINCH, SIGINT, SIGTERM and SIGHUP are read from a signal descriptor in
+// the same ppoll as the keyboard, so there is no signal handler.
+
+import "std/term";
+import "std/linux";
+
+export struct TuiTerm {
+  in_fd: int64;
+  out_fd: int64;
+  own_fd: bool;    // in_fd came from opening /dev/tty
+  sig_fd: int64;
+  raw: bool;
+}
+
+// Opens the controlling terminal. Returns 0 on success or -errno.
+export fn tui_term_open(t: TuiTerm*) -> int64 {
+  t->sig_fd = -1;
+  var path: uint8[9] = [47, 100, 101, 118, 47, 116, 116, 121, 0];   // "/dev/tty"
+  var fd: int64 = linux_openat(-100, &path[0], 2 | 0x80000, 0);   // O_RDWR | O_CLOEXEC
+  if (fd >= 0) {
+    t->in_fd = fd;
+    t->out_fd = fd;
+    t->own_fd = true;
+  } else {
+    t->in_fd = 0;
+    t->out_fd = 1;
+  }
+  if (!term_is_tty(t->in_fd)) { return -25; }   // ENOTTY
+  return 0;
+}
+
+export fn tui_term_raw(t: TuiTerm*) -> int64 {
+  var r: int64 = term_raw_begin(t->in_fd);
+  if (r == 0) { t->raw = true; }
+  return r;
+}
+
+export fn tui_term_signals(t: TuiTerm*) -> int64 {
+  var fd: int64 = term_signal_fd(TERM_SIGWINCH, TERM_SIGINT, TERM_SIGTERM, TERM_SIGHUP);
+  if (fd < 0) { return fd; }
+  t->sig_fd = fd;
+  return 0;
+}
+
+export fn tui_term_close(t: TuiTerm*) {
+  if (t->raw) {
+    term_raw_end(t->in_fd);
+    t->raw = false;
+  }
+  if (t->sig_fd >= 0) {
+    term_signal_end(t->sig_fd, TERM_SIGWINCH, TERM_SIGINT, TERM_SIGTERM, TERM_SIGHUP);
+    t->sig_fd = -1;
+  }
+  if (t->own_fd) {
+    linux_close(t->in_fd);
+    t->own_fd = false;
+  }
+}
+
+// The window size in cells; 0 if unknown.
+export fn tui_term_size(t: TuiTerm*, w: int32*, h: int32*) {
+  *w = 0;
+  *h = 0;
+  if (term_size(t->out_fd, w, h) < 0) { *w = 0; *h = 0; }
+}
+
+// Writes all n bytes, retrying on EINTR and short writes.
+export fn tui_term_write(t: TuiTerm*, p: uint8*, n: int64) {
+  var done: int64 = 0;
+  while (done < n) {
+    var r: int64 = linux_write(t->out_fd, p + done, n - done);
+    if (r == -4 || r == -11) { continue; }   // EINTR, EAGAIN
+    if (r <= 0) { return; }
+    done = done + r;
+  }
+}
+
+// Waits up to timeout_ms (-1: for good) for input or a signal.
+// Sets *got_in and *got_sig; returns <0 on error, 0 on timeout.
+export fn tui_term_wait(t: TuiTerm*, timeout_ms: int64, got_in: bool*, got_sig: bool*) -> int64 {
+  var fds: LinuxPollFd[2];
+  fds[0].fd = (int32)t->in_fd;
+  fds[0].events = (int16)1;   // POLLIN
+  fds[0].revents = (int16)0;
+  fds[1].fd = (int32)t->sig_fd;
+  fds[1].events = (int16)1;
+  fds[1].revents = (int16)0;
+  var nf: int64 = 1;
+  if (t->sig_fd >= 0) { nf = 2; }
+  var ts: int64[2];
+  var tp: int64* = (int64*)0;
+  if (timeout_ms >= 0) {
+    ts[0] = timeout_ms / 1000;
+    ts[1] = (timeout_ms % 1000) * 1000000;
+    tp = &ts[0];
+  }
+  *got_in = false;
+  *got_sig = false;
+  var r: int64 = linux_ppoll(&fds[0], nf, tp);
+  if (r == -4) { return 0; }
+  if (r <= 0) { return r; }
+  *got_in = fds[0].revents != (int16)0;
+  if (nf == 2) { *got_sig = fds[1].revents != (int16)0; }
+  return r;
+}
+
+export fn tui_term_read(t: TuiTerm*, p: uint8*, n: int64) -> int64 {
+  return linux_read(t->in_fd, p, n);
+}
+
+// One pending signal number (call only when the descriptor is readable),
+// or 0.
+export fn tui_term_next_signal(t: TuiTerm*) -> int32 {
+  if (t->sig_fd < 0) { return 0; }
+  var s: int32 = term_signal_next(t->sig_fd);
+  if (s < 0) { return 0; }
+  return s;
+}

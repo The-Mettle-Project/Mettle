@@ -1,0 +1,296 @@
+// Zstandard encoder front end: blocks, frames, one-shot and streaming.
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "../check/xxhash";
+import "common";
+import "ectx";
+import "match";
+import "opt";
+import "eblock";
+
+// Creates a context for the level. src_size is the input size or -1.
+fn enc_new(level: int32, src_size: int64) -> PzsEnc* {
+  var e: PzsEnc* = new PzsEnc;
+  if (e == 0) { return (PzsEnc*)0; }
+  pzs_enc_params(e, level, src_size);
+  e->fcs = src_size;
+  if (pzs_enc_alloc(e) != PRESS_OK) {
+    pzs_enc_delete(e);
+    return (PzsEnc*)0;
+  }
+  return e;
+}
+
+fn write_header(e: PzsEnc*, out: PressBuf*) -> int32 {
+  var h: uint8[18];
+  press_wr32(&h[0], PZS_MAGIC);
+  var n: int64 = 5;
+  var fcs: int64 = e->fcs;
+  var single: bool = fcs >= 0 && fcs <= e->window;
+  var ff: int32 = 0;
+  if (fcs >= 0) {
+    if (fcs < 256 && single) { ff = 0; }
+    else if (fcs < 65536 + 256 && fcs >= 256) { ff = 1; }
+    else if (fcs <= 0xFFFFFFFF) { ff = 2; }
+    else { ff = 3; }
+  }
+  var fd: int32 = (ff << 6) | 4;
+  if (single) { fd = fd | 32; }
+  h[4] = (uint8)fd;
+  if (!single) { h[5] = (uint8)((e->wlog - 10) << 3); n = 6; }
+  if (fcs >= 0) {
+    if (ff == 0) { h[n] = (uint8)fcs; n = n + 1; }
+    else if (ff == 1) { press_wr16(&h[n], (uint32)(fcs - 256)); n = n + 2; }
+    else if (ff == 2) { press_wr32(&h[n], (uint32)fcs); n = n + 4; }
+    else { press_wr64(&h[n], (uint64)fcs); n = n + 8; }
+  }
+  e->started = true;
+  return press_buf_append(out, &h[0], n);
+}
+
+fn block_header(out: PressBuf*, last: bool, typ: int64, size: int64) -> int32 {
+  var h: uint8[4];
+  var v: int64 = (typ << 1) | (size << 3);
+  if (last) { v = v | 1; }
+  h[0] = (uint8)v;
+  h[1] = (uint8)(v >> 8);
+  h[2] = (uint8)(v >> 16);
+  return press_buf_append(out, &h[0], 3);
+}
+
+fn all_same(p: uint8*, n: int64) -> bool {
+  if (n < 1) { return false; }
+  var v: uint64 = (uint64)p[0] * (uint64)0x0101010101010101;
+  var k: int64 = 0;
+  while (k + 8 <= n) {
+    if (press_rd64(p + k) != v) { return false; }
+    k = k + 8;
+  }
+  while (k < n) {
+    if (p[k] != p[0]) { return false; }
+    k = k + 1;
+  }
+  return true;
+}
+
+// Parses b[s .. end] into the sequence store with the level's strategy.
+fn parse_block(e: PzsEnc*, s: int64, end: int64) {
+  e->nlit = 0;
+  e->nseq = 0;
+  e->srep[0] = e->rep[0];
+  e->srep[1] = e->rep[1];
+  e->srep[2] = e->rep[2];
+  if (end - s < 16) { pzs_store_last(e, s, end); return; }
+  switch (e->strat) {
+    case 1: { pzs_fast(e, s, end); }
+    case 2: { pzs_dfast(e, s, end); }
+    case 3: { pzs_lazy(e, s, end, 0); }
+    case 4: { pzs_lazy(e, s, end, 1); }
+    case 5: { pzs_lazy(e, s, end, 2); }
+    default: { pzs_opt(e, s, end); }
+  }
+}
+
+/// Compresses b[s .. end] (at most 128 KiB) as one block and appends it.
+export fn pzs_enc_block(e: PzsEnc*, s: int64, end: int64, last: bool, out: PressBuf*) -> int32 {
+  var n: int64 = end - s;
+  var src: uint8* = e->b + s;
+  if (n > 8 && all_same(src, n)) {
+    var rc0: int32 = block_header(out, last, 1, n);
+    if (rc0 != PRESS_OK) { return rc0; }
+    if (e->next_up < end) { e->next_up = end; }
+    return press_buf_push(out, src[0]);
+  }
+  var cs: int64 = -1;
+  if (n > 16) {
+    parse_block(e, s, end);
+    cs = pzs_enc_body(e, e->scratch, e->scap);
+  }
+  var rc: int32 = PRESS_OK;
+  if (cs > 0 && cs < n) {
+    rc = block_header(out, last, 2, cs);
+    if (rc != PRESS_OK) { return rc; }
+    pzs_enc_commit(e);
+    return press_buf_append(out, e->scratch, cs);
+  }
+  rc = block_header(out, last, 0, n);
+  if (rc != PRESS_OK) { return rc; }
+  return press_buf_append(out, src, n);
+}
+
+fn enc_direct(e: PzsEnc*, src: uint8*, n: int64, out: PressBuf*) -> int32 {
+  e->b = src;
+  e->blen = n;
+  e->bcap = n;
+  e->own = false;
+  var rc: int32 = write_header(e, out);
+  if (rc != PRESS_OK) { return rc; }
+  if (n == 0) {
+    rc = block_header(out, true, 0, 0);
+  }
+  var s: int64 = 0;
+  while (s < n && rc == PRESS_OK) {
+    var end: int64 = s + PZS_BLOCK_MAX;
+    if (end > n) { end = n; }
+    rc = pzs_enc_block(e, s, end, end == n, out);
+    s = end;
+  }
+  if (rc != PRESS_OK) { return rc; }
+  return press_buf_put32(out, (uint32)press_xxh64(src, n, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Streaming.
+
+/// Streaming encoder state. Set up with press_zstd_enc_init.
+export struct PressZstdEnc {
+  e: PzsEnc*;
+  err: int32;
+  done: bool;
+}
+
+// Drops old history so more input fits; table entries move with it.
+fn slide(e: PzsEnc*) {
+  var keep_from: int64 = e->pos - e->window;
+  if (keep_from <= 0) { return; }
+  memmove(e->b, e->b + keep_from, e->blen - keep_from);
+  e->blen = e->blen - keep_from;
+  e->pos = e->pos - keep_from;
+  var d: uint32 = (uint32)keep_from;
+  pzs_rebase(e->ht, e->hsize, d);
+  pzs_rebase(e->ht2, e->h2size, d);
+  pzs_rebase(e->ct, e->csize, d);
+  e->next_up = e->next_up - keep_from;
+  if (e->next_up < 0) { e->next_up = 0; }
+}
+
+/// Subtracts d from every table entry, clamping at zero.
+export fn pzs_rebase(t: uint32*, n: int64, d: uint32) {
+  if (t == 0) { return; }
+  for i in 0..n {
+    var v: uint32 = t[i];
+    if (v < d) { t[i] = 0; } else { t[i] = v - d; }
+  }
+}
+
+fn stream_new(z: PressZstdEnc*, level: int32, fcs: int64) -> int32 {
+  z->err = PRESS_OK;
+  z->done = false;
+  z->e = enc_new(level, fcs);
+  if (z->e == 0) { return PRESS_E_MEM; }
+  var e: PzsEnc* = z->e;
+  e->fcs = -1;
+  e->own = true;
+  e->bcap = e->window * 2 + PZS_BLOCK_MAX * 4;
+  e->b = (uint8*)malloc(e->bcap);
+  if (e->b == 0) { pzs_enc_delete(e); z->e = (PzsEnc*)0; return PRESS_E_MEM; }
+  press_xxh64_init(&e->xx, 0);
+  return PRESS_OK;
+}
+
+/// Prepares a streaming encoder for the level (as press_zstd_compress).
+/// Free it with press_zstd_enc_free.
+export fn press_zstd_enc_init(z: PressZstdEnc*, level: int32) -> int32 {
+  if (z == 0) { return PRESS_E_ARG; }
+  return stream_new(z, level, -1);
+}
+
+/// Frees the encoder's memory.
+export fn press_zstd_enc_free(z: PressZstdEnc*) {
+  if (z == 0) { return; }
+  pzs_enc_delete(z->e);
+  z->e = (PzsEnc*)0;
+}
+
+fn feed(z: PressZstdEnc*, p: uint8*, n: int64, out: PressBuf*) -> int32 {
+  var e: PzsEnc* = z->e;
+  var rc: int32 = PRESS_OK;
+  if (!e->started) {
+    rc = write_header(e, out);
+    if (rc != PRESS_OK) { return rc; }
+  }
+  press_xxh64_update(&e->xx, p, n);
+  var at: int64 = 0;
+  while (at < n) {
+    if (e->blen == e->bcap) { slide(e); }
+    var take: int64 = e->bcap - e->blen;
+    if (take > n - at) { take = n - at; }
+    memcpy(e->b + e->blen, p + at, take);
+    e->blen = e->blen + take;
+    at = at + take;
+    while (e->blen - e->pos > PZS_BLOCK_MAX) {
+      rc = pzs_enc_block(e, e->pos, e->pos + PZS_BLOCK_MAX, false, out);
+      if (rc != PRESS_OK) { return rc; }
+      e->pos = e->pos + PZS_BLOCK_MAX;
+    }
+  }
+  return PRESS_OK;
+}
+
+/// Compresses n more bytes, appending any finished output to out.
+export fn press_zstd_enc_feed(z: PressZstdEnc*, p: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (z == 0 || z->e == 0 || z->done) { return PRESS_E_STATE; }
+  if (n < 0 || out == 0 || (p == 0 && n > 0)) { return PRESS_E_ARG; }
+  if (z->err != PRESS_OK) { return z->err; }
+  var rc: int32 = feed(z, p, n, out);
+  if (rc != PRESS_OK) { z->err = rc; }
+  return rc;
+}
+
+fn finish(z: PressZstdEnc*, out: PressBuf*) -> int32 {
+  var e: PzsEnc* = z->e;
+  var rc: int32 = PRESS_OK;
+  if (!e->started) {
+    rc = write_header(e, out);
+    if (rc != PRESS_OK) { return rc; }
+  }
+  rc = pzs_enc_block(e, e->pos, e->blen, true, out);
+  if (rc != PRESS_OK) { return rc; }
+  e->pos = e->blen;
+  return press_buf_put32(out, (uint32)press_xxh64_digest(&e->xx));
+}
+
+/// Ends the frame: compresses what is left and writes the checksum.
+export fn press_zstd_enc_finish(z: PressZstdEnc*, out: PressBuf*) -> int32 {
+  if (z == 0 || z->e == 0 || z->done) { return PRESS_E_STATE; }
+  if (out == 0) { return PRESS_E_ARG; }
+  if (z->err != PRESS_OK) { return z->err; }
+  var rc: int32 = finish(z, out);
+  if (rc != PRESS_OK) { z->err = rc; return rc; }
+  z->done = true;
+  return PRESS_OK;
+}
+
+/// One-shot compression of src[0 .. n] at the level, appended to out.
+export fn pzs_compress(src: uint8*, n: int64, level: int32, out: PressBuf*) -> int32 {
+  if (n < 0 || out == 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var keep: int64 = out->len;
+  var rc: int32 = PRESS_OK;
+  if (n <= (int64)1 << 31) {
+    var e: PzsEnc* = enc_new(level, n);
+    if (e == 0) { return PRESS_E_MEM; }
+    rc = enc_direct(e, src, n, out);
+    pzs_enc_delete(e);
+  } else {
+    // Very large inputs go through the streaming path, which keeps only
+    // the window in memory, with the content size still in the header.
+    var z: PressZstdEnc;
+    rc = stream_new(&z, level, n);
+    if (rc == PRESS_OK) {
+      z.e->fcs = n;
+      var at: int64 = 0;
+      while (at < n && rc == PRESS_OK) {
+        var t: int64 = n - at;
+        if (t > 1048576) { t = 1048576; }
+        rc = feed(&z, src + at, t, out);
+        at = at + t;
+      }
+      if (rc == PRESS_OK) { rc = finish(&z, out); }
+      press_zstd_enc_free(&z);
+    }
+  }
+  if (rc != PRESS_OK) { out->len = keep; }
+  return rc;
+}

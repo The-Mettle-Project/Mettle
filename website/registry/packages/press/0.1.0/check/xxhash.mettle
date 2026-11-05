@@ -1,0 +1,255 @@
+// xxHash: XXH32 (used by LZ4 frames) and XXH64 (used by zstd frames).
+//
+//   var h: uint32 = press_xxh32(p, n, 0);       // one shot, seed 0
+//   var s: PressXxh64;                          // streaming
+//   press_xxh64_init(&s, 0);
+//   press_xxh64_update(&s, p, n);
+//   var d: uint64 = press_xxh64_digest(&s);
+
+import "std/mem";
+import "../core/buf";
+
+const PX32_1: uint32 = 2654435761;
+const PX32_2: uint32 = 2246822519;
+const PX32_3: uint32 = 3266489917;
+const PX32_4: uint32 = 668265263;
+const PX32_5: uint32 = 374761393;
+
+const PX64_1: uint64 = 0x9E3779B185EBCA87;
+const PX64_2: uint64 = 0xC2B2AE3D27D4EB4F;
+const PX64_3: uint64 = 0x165667B19E3779F9;
+const PX64_4: uint64 = 0x85EBCA77C2B2AE63;
+const PX64_5: uint64 = 0x27D4EB2F165667C5;
+
+@inline fn px_rotl32(x: uint32, r: uint32) -> uint32 { return (x << r) | (x >> (32 - r)); }
+@inline fn px_rotl64(x: uint64, r: uint64) -> uint64 { return (x << r) | (x >> (64 - r)); }
+
+@inline fn px32_round(acc: uint32, v: uint32) -> uint32 {
+  return px_rotl32(acc + v * PX32_2, 13) * PX32_1;
+}
+
+@inline fn px64_round(acc: uint64, v: uint64) -> uint64 {
+  return px_rotl64(acc + v * PX64_2, 31) * PX64_1;
+}
+
+@inline fn px64_merge(acc: uint64, v: uint64) -> uint64 {
+  var x: uint64 = acc ^ px64_round(0, v);
+  return x * PX64_1 + PX64_4;
+}
+
+fn px32_tail(h0: uint32, p: uint8*, n: int64) -> uint32 {
+  var h: uint32 = h0;
+  var i: int64 = 0;
+  while (i + 4 <= n) {
+    h = px_rotl32(h + press_rd32(p + i) * PX32_3, 17) * PX32_4;
+    i = i + 4;
+  }
+  while (i < n) {
+    h = px_rotl32(h + (uint32)p[i] * PX32_5, 11) * PX32_1;
+    i = i + 1;
+  }
+  h = h ^ (h >> 15);
+  h = h * PX32_2;
+  h = h ^ (h >> 13);
+  h = h * PX32_3;
+  h = h ^ (h >> 16);
+  return h;
+}
+
+fn px64_tail(h0: uint64, p: uint8*, n: int64) -> uint64 {
+  var h: uint64 = h0;
+  var i: int64 = 0;
+  while (i + 8 <= n) {
+    h = h ^ px64_round(0, press_rd64(p + i));
+    h = px_rotl64(h, 27) * PX64_1 + PX64_4;
+    i = i + 8;
+  }
+  if (i + 4 <= n) {
+    h = h ^ ((uint64)press_rd32(p + i) * PX64_1);
+    h = px_rotl64(h, 23) * PX64_2 + PX64_3;
+    i = i + 4;
+  }
+  while (i < n) {
+    h = h ^ ((uint64)p[i] * PX64_5);
+    h = px_rotl64(h, 11) * PX64_1;
+    i = i + 1;
+  }
+  h = h ^ (h >> 33);
+  h = h * PX64_2;
+  h = h ^ (h >> 29);
+  h = h * PX64_3;
+  h = h ^ (h >> 32);
+  return h;
+}
+
+/// XXH32 of n bytes with the given seed.
+export fn press_xxh32(p: uint8*, n: int64, seed: uint32) -> uint32 {
+  var h: uint32 = 0;
+  var i: int64 = 0;
+  if (n >= 16) {
+    var v1: uint32 = seed + PX32_1 + PX32_2;
+    var v2: uint32 = seed + PX32_2;
+    var v3: uint32 = seed;
+    var v4: uint32 = seed - PX32_1;
+    while (i + 16 <= n) {
+      v1 = px32_round(v1, press_rd32(p + i));
+      v2 = px32_round(v2, press_rd32(p + i + 4));
+      v3 = px32_round(v3, press_rd32(p + i + 8));
+      v4 = px32_round(v4, press_rd32(p + i + 12));
+      i = i + 16;
+    }
+    h = px_rotl32(v1, 1) + px_rotl32(v2, 7) + px_rotl32(v3, 12) + px_rotl32(v4, 18);
+  } else {
+    h = seed + PX32_5;
+  }
+  h = h + (uint32)n;
+  return px32_tail(h, p + i, n - i);
+}
+
+/// XXH64 of n bytes with the given seed.
+export fn press_xxh64(p: uint8*, n: int64, seed: uint64) -> uint64 {
+  var h: uint64 = 0;
+  var i: int64 = 0;
+  if (n >= 32) {
+    var v1: uint64 = seed + PX64_1 + PX64_2;
+    var v2: uint64 = seed + PX64_2;
+    var v3: uint64 = seed;
+    var v4: uint64 = seed - PX64_1;
+    while (i + 32 <= n) {
+      v1 = px64_round(v1, press_rd64(p + i));
+      v2 = px64_round(v2, press_rd64(p + i + 8));
+      v3 = px64_round(v3, press_rd64(p + i + 16));
+      v4 = px64_round(v4, press_rd64(p + i + 24));
+      i = i + 32;
+    }
+    h = px_rotl64(v1, 1) + px_rotl64(v2, 7) + px_rotl64(v3, 12) + px_rotl64(v4, 18);
+    h = px64_merge(h, v1);
+    h = px64_merge(h, v2);
+    h = px64_merge(h, v3);
+    h = px64_merge(h, v4);
+  } else {
+    h = seed + PX64_5;
+  }
+  h = h + (uint64)n;
+  return px64_tail(h, p + i, n - i);
+}
+
+/// Streaming XXH32 state. Zero it or call press_xxh32_init before use.
+export struct PressXxh32 {
+  v1: uint32; v2: uint32; v3: uint32; v4: uint32;
+  seed: uint32;
+  total: int64;
+  mem: uint8[16];
+  used: int64;
+}
+
+export fn press_xxh32_init(s: PressXxh32*, seed: uint32) {
+  memset(s, 0, sizeof(PressXxh32));
+  s->seed = seed;
+  s->v1 = seed + PX32_1 + PX32_2;
+  s->v2 = seed + PX32_2;
+  s->v3 = seed;
+  s->v4 = seed - PX32_1;
+}
+
+fn px32_stripe(s: PressXxh32*, q: uint8*) {
+  s->v1 = px32_round(s->v1, press_rd32(q));
+  s->v2 = px32_round(s->v2, press_rd32(q + 4));
+  s->v3 = px32_round(s->v3, press_rd32(q + 8));
+  s->v4 = px32_round(s->v4, press_rd32(q + 12));
+}
+
+export fn press_xxh32_update(s: PressXxh32*, p: uint8*, n: int64) {
+  if (n <= 0) { return; }
+  s->total = s->total + n;
+  var i: int64 = 0;
+  if (s->used > 0) {
+    while (s->used < 16 && i < n) { s->mem[s->used] = p[i]; s->used = s->used + 1; i = i + 1; }
+    if (s->used < 16) { return; }
+    px32_stripe(s, &s->mem[0]);
+    s->used = 0;
+  }
+  var v1: uint32 = s->v1; var v2: uint32 = s->v2; var v3: uint32 = s->v3; var v4: uint32 = s->v4;
+  while (i + 16 <= n) {
+    v1 = px32_round(v1, press_rd32(p + i));
+    v2 = px32_round(v2, press_rd32(p + i + 4));
+    v3 = px32_round(v3, press_rd32(p + i + 8));
+    v4 = px32_round(v4, press_rd32(p + i + 12));
+    i = i + 16;
+  }
+  s->v1 = v1; s->v2 = v2; s->v3 = v3; s->v4 = v4;
+  while (i < n) { s->mem[s->used] = p[i]; s->used = s->used + 1; i = i + 1; }
+}
+
+export fn press_xxh32_digest(s: PressXxh32*) -> uint32 {
+  var h: uint32 = 0;
+  if (s->total >= 16) {
+    h = px_rotl32(s->v1, 1) + px_rotl32(s->v2, 7) + px_rotl32(s->v3, 12) + px_rotl32(s->v4, 18);
+  } else {
+    h = s->seed + PX32_5;
+  }
+  h = h + (uint32)s->total;
+  return px32_tail(h, &s->mem[0], s->used);
+}
+
+/// Streaming XXH64 state. Zero it or call press_xxh64_init before use.
+export struct PressXxh64 {
+  v1: uint64; v2: uint64; v3: uint64; v4: uint64;
+  seed: uint64;
+  total: int64;
+  mem: uint8[32];
+  used: int64;
+}
+
+export fn press_xxh64_init(s: PressXxh64*, seed: uint64) {
+  memset(s, 0, sizeof(PressXxh64));
+  s->seed = seed;
+  s->v1 = seed + PX64_1 + PX64_2;
+  s->v2 = seed + PX64_2;
+  s->v3 = seed;
+  s->v4 = seed - PX64_1;
+}
+
+fn px64_stripe(s: PressXxh64*, q: uint8*) {
+  s->v1 = px64_round(s->v1, press_rd64(q));
+  s->v2 = px64_round(s->v2, press_rd64(q + 8));
+  s->v3 = px64_round(s->v3, press_rd64(q + 16));
+  s->v4 = px64_round(s->v4, press_rd64(q + 24));
+}
+
+export fn press_xxh64_update(s: PressXxh64*, p: uint8*, n: int64) {
+  if (n <= 0) { return; }
+  s->total = s->total + n;
+  var i: int64 = 0;
+  if (s->used > 0) {
+    while (s->used < 32 && i < n) { s->mem[s->used] = p[i]; s->used = s->used + 1; i = i + 1; }
+    if (s->used < 32) { return; }
+    px64_stripe(s, &s->mem[0]);
+    s->used = 0;
+  }
+  var v1: uint64 = s->v1; var v2: uint64 = s->v2; var v3: uint64 = s->v3; var v4: uint64 = s->v4;
+  while (i + 32 <= n) {
+    v1 = px64_round(v1, press_rd64(p + i));
+    v2 = px64_round(v2, press_rd64(p + i + 8));
+    v3 = px64_round(v3, press_rd64(p + i + 16));
+    v4 = px64_round(v4, press_rd64(p + i + 24));
+    i = i + 32;
+  }
+  s->v1 = v1; s->v2 = v2; s->v3 = v3; s->v4 = v4;
+  while (i < n) { s->mem[s->used] = p[i]; s->used = s->used + 1; i = i + 1; }
+}
+
+export fn press_xxh64_digest(s: PressXxh64*) -> uint64 {
+  var h: uint64 = 0;
+  if (s->total >= 32) {
+    h = px_rotl64(s->v1, 1) + px_rotl64(s->v2, 7) + px_rotl64(s->v3, 12) + px_rotl64(s->v4, 18);
+    h = px64_merge(h, s->v1);
+    h = px64_merge(h, s->v2);
+    h = px64_merge(h, s->v3);
+    h = px64_merge(h, s->v4);
+  } else {
+    h = s->seed + PX64_5;
+  }
+  h = h + (uint64)s->total;
+  return px64_tail(h, &s->mem[0], s->used);
+}

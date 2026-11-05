@@ -1,0 +1,253 @@
+// Error messages and "did you mean" suggestions.
+//
+// Suggestions follow cobra: a name within edit distance 2 of what was
+// typed, or one that starts with it. The distance is Levenshtein's, worked
+// out with one row of 64 cells, so it never allocates.
+
+import "types";
+import "out";
+
+// Levenshtein distance, capped: names longer than 63 bytes give 99.
+export fn args_edit_distance(x: string, y: string) -> int32 {
+  if (x.length > (uint64)63 || y.length > (uint64)63) { return 99; }
+  var row: int32[64];
+  var m: int32 = (int32)y.length;
+  for j in 0..=m { row[j] = j; }
+  for i in 1..=(int32)x.length {
+    var diag: int32 = row[0];
+    row[0] = i;
+    for j in 1..=m {
+      var up: int32 = row[j];
+      var cost: int32 = 1;
+      if (x.chars[i - 1] == y.chars[j - 1]) { cost = 0; }
+      var best: int32 = diag + cost;
+      if (up + 1 < best) { best = up + 1; }
+      if (row[j - 1] + 1 < best) { best = row[j - 1] + 1; }
+      row[j] = best;
+      diag = up;
+    }
+  }
+  return row[m];
+}
+
+fn starts_with(s: string, p: string) -> bool {
+  if (p.length == (uint64)0 || p.length > s.length) { return false; }
+  for i in 0..p.length { if (s.chars[i] != p.chars[i]) { return false; } }
+  return true;
+}
+
+// How good a suggestion `cand` is for `typed`: lower is better, -1 = none.
+export fn args_suggest_score(typed: string, cand: string) -> int32 {
+  if (cand.length == (uint64)0) { return -1; }
+  var d: int32 = args_edit_distance(typed, cand);
+  if (d <= 2) { return d; }
+  if (starts_with(cand, typed)) { return 3; }
+  return -1;
+}
+
+// The display name of an option: --long, else -s.
+export fn args_opt_name(o: ArgsOpt*, w: ArgsOut*) {
+  if (o->long_name.length > (uint64)0) {
+    args_out_str(w, "--");
+    args_out_str(w, o->long_name);
+  } else {
+    args_out_byte(w, 45);
+    args_out_byte(w, (int32)o->short_name);
+  }
+}
+
+fn quote(w: ArgsOut*, s: string) {
+  args_out_byte(w, 39);
+  args_out_str(w, s);
+  args_out_byte(w, 39);
+}
+
+fn quote_opt(w: ArgsOut*, o: ArgsOpt*) {
+  args_out_byte(w, 39);
+  args_opt_name(o, w);
+  args_out_byte(w, 39);
+}
+
+// The best long option name in scope for a mistyped --name.
+fn suggest_opt(a: Args*, typed: string) -> int32 {
+  var best: int32 = -1;
+  var best_score: int32 = 99;
+  for i in 0..a->nopts {
+    var o: ArgsOpt* = &a->opts[i];
+    if (o->hidden || !args_opt_in_scope(a, i, a->cmd)) { continue; }
+    var sc: int32 = args_suggest_score(typed, o->long_name);
+    if (sc >= 0 && sc < best_score) { best = i; best_score = sc; }
+  }
+  return best;
+}
+
+fn suggest_cmd(a: Args*, typed: string) -> int32 {
+  var best: int32 = -1;
+  var best_score: int32 = 99;
+  for i in 1..a->ncmds {
+    var c: ArgsCmd* = &a->cmds[i];
+    if (c->parent != a->cmd || c->hidden) { continue; }
+    var sc: int32 = args_suggest_score(typed, c->name);
+    if (sc >= 0 && sc < best_score) { best = i; best_score = sc; }
+  }
+  return best;
+}
+
+// Is option i accepted while command cmd is active? Its own command's
+// options are, and so are a parent's global options.
+export fn args_opt_in_scope(a: Args*, i: int32, cmd: int32) -> bool {
+  var o: ArgsOpt* = &a->opts[i];
+  if (o->cmd == cmd) { return true; }
+  if (!o->global) { return false; }
+  var k: int32 = a->cmds[cmd].parent;
+  while (k >= 0) {
+    if (k == o->cmd) { return true; }
+    k = a->cmds[k].parent;
+  }
+  return false;
+}
+
+// Writes the message for the current error into w (no trailing newline).
+export fn args_write_error(a: Args*, w: ArgsOut*) {
+  var o: ArgsOpt* = (ArgsOpt*)0;
+  if (a->err_opt >= 0) { o = &a->opts[a->err_opt]; }
+  switch (a->err) {
+    case 10: {
+      args_out_str(w, "unknown option ");
+      quote(w, a->err_token);
+      var t: string = a->err_token;
+      if (t.length > (uint64)2 && (int32)t.chars[1] == 45) {
+        var typed: string;
+        typed.chars = t.chars + 2;
+        typed.length = t.length - (uint64)2;
+        var s: int32 = suggest_opt(a, typed);
+        if (s >= 0) {
+          args_out_str(w, " (did you mean ");
+          quote_opt(w, &a->opts[s]);
+          args_out_str(w, "?)");
+        }
+      }
+    }
+    case 11: {
+      args_out_str(w, "option ");
+      quote_opt(w, o);
+      args_out_str(w, " needs a value");
+    }
+    case 12: {
+      args_out_str(w, "invalid value ");
+      quote(w, a->err_token);
+      args_out_str(w, " for ");
+      if (o != 0) { quote_opt(w, o); } else if (a->err_pos >= 0) { quote(w, a->pos[a->err_pos].name); }
+      if (o != 0 && o->from_env) {
+        args_out_str(w, " (from $");
+        args_out_str(w, o->env);
+        args_out_str(w, ")");
+      }
+      if (a->err_detail.length > (uint64)0) {
+        args_out_str(w, ": ");
+        args_out_str(w, a->err_detail);
+      }
+      if (o != 0 && o->kind == ARGS_CHOICE) {
+        args_out_str(w, " (choose from ");
+        for i in 0..o->nchoices {
+          if (i > 0) { args_out_str(w, ", "); }
+          args_out_str(w, o->choices[i]);
+        }
+        args_out_str(w, ")");
+      }
+    }
+    case 13: {
+      args_out_str(w, "option ");
+      quote_opt(w, o);
+      args_out_str(w, " does not take a value");
+    }
+    case 14: {
+      args_out_str(w, "missing required option ");
+      quote_opt(w, o);
+    }
+    case 15: {
+      args_out_str(w, "missing required argument ");
+      quote(w, a->pos[a->err_pos].name);
+    }
+    case 16: {
+      args_out_str(w, "unexpected argument ");
+      quote(w, a->err_token);
+    }
+    case 17: {
+      args_out_str(w, "too many values");
+      if (o != 0) {
+        args_out_str(w, " for ");
+        quote_opt(w, o);
+        args_out_str(w, " (at most ");
+        args_out_int(w, (int64)o->cap);
+        args_out_str(w, ")");
+      } else if (a->err_pos >= 0) {
+        args_out_str(w, " for ");
+        quote(w, a->pos[a->err_pos].name);
+        args_out_str(w, " (at most ");
+        args_out_int(w, (int64)a->pos[a->err_pos].cap);
+        args_out_str(w, ")");
+      }
+    }
+    case 18: {
+      args_out_str(w, "unknown command ");
+      quote(w, a->err_token);
+      var s: int32 = suggest_cmd(a, a->err_token);
+      if (s >= 0) {
+        args_out_str(w, " (did you mean ");
+        quote(w, a->cmds[s].name);
+        args_out_str(w, "?)");
+      }
+    }
+    case 19: {
+      args_write_cmd_path(a, a->cmd, w);
+      args_out_str(w, " needs a command");
+    }
+    case 20: {
+      args_out_str(w, "option ");
+      quote(w, a->err_token);
+      args_out_str(w, " is ambiguous: ");
+      var first: bool = true;
+      var pre: string;
+      pre.chars = a->err_token.chars + 2;
+      pre.length = a->err_token.length - (uint64)2;
+      for i in 0..a->nopts {
+        var p: ArgsOpt* = &a->opts[i];
+        if (p->hidden || !args_opt_in_scope(a, i, a->cmd)) { continue; }
+        if (!starts_with(p->long_name, pre)) { continue; }
+        if (!first) { args_out_str(w, ", "); }
+        args_opt_name(p, w);
+        first = false;
+      }
+    }
+    case 21: {
+      args_out_str(w, "bad argument spec: ");
+      args_out_str(w, a->spec_err);
+    }
+    default: { }
+  }
+}
+
+// "prog sub subsub" for command c.
+export fn args_write_cmd_path(a: Args*, c: int32, w: ArgsOut*) {
+  var chain: int32[64];
+  var n: int32 = 0;
+  var k: int32 = c;
+  while (k >= 0 && n < 64) { chain[n] = k; n = n + 1; k = a->cmds[k].parent; }
+  args_out_str(w, a->name);
+  var i: int32 = n - 2;
+  while (i >= 0) {
+    args_out_byte(w, 32);
+    args_out_str(w, a->cmds[chain[i]].name);
+    i = i - 1;
+  }
+}
+
+// The error message as text, kept in the parser. Empty when no error.
+export fn args_error_text(a: Args*) -> string {
+  var w: ArgsOut;
+  args_out_buf(&w, &a->msg[0], (int64)ARGS_MSG_CAP);
+  if (a->err >= 10) { args_write_error(a, &w); }
+  a->msg_len = (int32)w.used;
+  return args_out_text(&w);
+}

@@ -1,0 +1,79 @@
+// sysinfo: system information for Mettle programs.
+//
+//   var s: Sysinfo;
+//   sysinfo_open(&s, SYSINFO_ALL);
+//   time_sleep_ms(1000);
+//   sysinfo_refresh(&s, SYSINFO_ALL);
+//   println("{s.cpu.total.busy}% of {s.cpu.logical} CPUs");
+//   sysinfo_close(&s);
+//
+// The public types are in sysinfo/types. Every operating-system detail is
+// in a backend under sysinfo/os/; only Linux is implemented so far, and the
+// other platforms return SYSINFO_E_UNSUPPORTED.
+import "std/mem";
+import "sysinfo/types.mettle";
+import "sysinfo/os/linux/backend.mettle" if linux;
+import "sysinfo/os/none.mettle" if windows;
+import "sysinfo/os/none.mettle" if macos;
+import "sysinfo/procs.mettle";
+
+export const SYSINFO_VERSION: string = "0.1.1";
+
+// Opens a sampler for the sections in `what` (SYSINFO_* flags, plus any
+// extras such as SYSINFO_PROC_IO) and takes a first sample. Rates and
+// percentages need two samples, so they read 0 until the next refresh.
+export fn sysinfo_open(s: Sysinfo*, what: uint32) -> int32 {
+  return sysinfo_open_at(s, what, "");
+}
+
+// Like sysinfo_open, but reads /proc, /sys, /etc and /run under `root`
+// instead of /. Tests use it with a fake tree. With a root set, nothing
+// is asked of the kernel directly (no statfs, netlink or nvidia-smi).
+export fn sysinfo_open_at(s: Sysinfo*, what: uint32, root: string) -> int32 {
+  if (s == 0) { return SYSINFO_E_INVALID; }
+  var blank: Sysinfo;
+  *s = blank;
+  s->what = what;
+  var r: int32 = sysinfo_os_open(s, what, root);
+  if (r != SYSINFO_OK) { return r; }
+  return sysinfo_os_refresh(s, what);
+}
+
+// Takes a new sample of the sections in `what`. A section not opened yet is
+// set up first. Returns SYSINFO_OK, or the first error met; the other
+// sections are still refreshed, and each section's `status` says how it went.
+export fn sysinfo_refresh(s: Sysinfo*, what: uint32) -> int32 {
+  if (s == 0) { return SYSINFO_E_INVALID; }
+  if (s->os == 0) { return SYSINFO_E_NOTOPEN; }
+  s->what = s->what | what;
+  return sysinfo_os_refresh(s, what);
+}
+
+// Releases everything. The Sysinfo can be opened again afterwards.
+export fn sysinfo_close(s: Sysinfo*) {
+  if (s == 0 || s->os == 0) { return; }
+  sysinfo_os_close(s);
+  var blank: Sysinfo;
+  *s = blank;
+}
+
+// Sends a signal to a process (SIGTERM is 15, SIGKILL is 9).
+export fn sysinfo_signal(pid: int32, sig: int32) -> int32 {
+  if (pid <= 0 || sig < 0) { return SYSINFO_E_INVALID; }
+  return sysinfo_os_signal((int64)pid, sig);
+}
+
+// A short English description of a status code.
+export fn sysinfo_strerror(code: int32) -> string {
+  switch (code) {
+    case 0: { return "ok"; }
+    case -1: { return "not supported on this platform"; }
+    case -2: { return "invalid argument"; }
+    case -3: { return "out of memory"; }
+    case -4: { return "could not read the source"; }
+    case -5: { return "not found"; }
+    case -6: { return "permission denied"; }
+    case -7: { return "not open"; }
+    default: { return "unknown error"; }
+  }
+}

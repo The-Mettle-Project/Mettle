@@ -1,0 +1,208 @@
+// text: parsing and formatting.
+//
+// Accepted forms (RFC 9562 section 4, RFC 9562's URN, Microsoft's braces),
+// any mix of upper and lower case hex:
+//
+//   67e55044-10b1-426f-9247-bb680e5fe0c8          hyphenated, 36 chars
+//   67e5504410b1426f9247bb680e5fe0c8              simple, 32 chars
+//   {67e55044-10b1-426f-9247-bb680e5fe0c8}        braced, 38 chars
+//   urn:uuid:67e55044-10b1-426f-9247-bb680e5fe0c8 URN, 45 chars ("urn:uuid:" in any case)
+//
+// Nothing else is accepted: no spaces, no partial hyphens, no braces on the
+// simple form. The form is known from the length alone, so the parser does
+// fixed-offset table lookups with no searching, the same plan as Rust's
+// uuid crate. Errors never read past the input.
+
+import "std/core";
+import "std/mem";
+import "std/conv";
+import "core";
+
+export const UUID_FMT_HYPHENATED: int32 = 0;
+export const UUID_FMT_SIMPLE: int32 = 1;
+export const UUID_FMT_URN: int32 = 2;
+export const UUID_FMT_BRACED: int32 = 3;
+
+// Why a parse failed: the byte offset of the problem and a short message.
+export struct UuidError {
+  at: int64;
+  why: string;
+}
+
+// Hex digit value for each byte, or 255 for anything that is not hex.
+const UT_HEX: uint8[256] = [
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255, 255, 255, 255, 255, 255,
+  255, 10, 11, 12, 13, 14, 15, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 10, 11, 12, 13, 14, 15, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255
+];
+
+// Where each of the 16 bytes starts in the hyphenated form.
+const UT_POS: int64[16] = [0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34];
+
+const UT_LOWER: string = "0123456789abcdef";
+const UT_UPPER: string = "0123456789ABCDEF";
+
+fn ut_fail(e: UuidError*, at: int64, why: string) -> bool {
+  e->at = at;
+  e->why = why;
+  return false;
+}
+
+// Decodes 32 hex digits from p. With hyph set, p is the 36-char form and
+// hyphens must sit at 8, 13, 18 and 23. All 16 bytes are decoded first and
+// the bad-digit flags ORed together, so a valid input takes no branches in
+// the loop; only a failed parse goes back to find where.
+fn ut_decode(p: uint8*, hyph: bool, base: int64, out: Uuid*, e: UuidError*) -> bool {
+  if (hyph) {
+    if (p[8] != (uint8)'-') { return ut_fail(e, base + 8, "expected '-'"); }
+    if (p[13] != (uint8)'-') { return ut_fail(e, base + 13, "expected '-'"); }
+    if (p[18] != (uint8)'-') { return ut_fail(e, base + 18, "expected '-'"); }
+    if (p[23] != (uint8)'-') { return ut_fail(e, base + 23, "expected '-'"); }
+  }
+  var bad: uint8 = 0;
+  for i in 0..16 {
+    var at: int64 = (int64)i * 2;
+    if (hyph) { at = UT_POS[i]; }
+    var h: uint8 = UT_HEX[p[at]];
+    var l: uint8 = UT_HEX[p[at + 1]];
+    bad = bad | h | l;
+    out->b[i] = (uint8)((h << (uint8)4) | (l & (uint8)15));
+  }
+  if ((bad & (uint8)0xF0) == (uint8)0) { return true; }
+  var n: int64 = 32;
+  if (hyph) { n = 36; }
+  for k in 0..n {
+    var c: uint8 = p[k];
+    if (hyph && (k == 8 || k == 13 || k == 18 || k == 23)) { continue; }
+    if (UT_HEX[c] == (uint8)255) { return ut_fail(e, base + (int64)k, "expected a hex digit"); }
+  }
+  return ut_fail(e, base, "expected a hex digit");
+}
+
+fn ut_lower(c: uint8) -> uint8 {
+  if (c >= (uint8)'A' && c <= (uint8)'Z') { return c + (uint8)32; }
+  return c;
+}
+
+// Parses any accepted form into *out. On failure fills *e and returns false;
+// *out is then unspecified.
+export fn uuid_parse_into(s: string, out: Uuid*, e: UuidError*) -> bool {
+  var n: int64 = (int64)s.length;
+  var p: uint8* = (uint8*)s.chars;
+  if (n == 36) { return ut_decode(p, true, 0, out, e); }
+  if (n == 32) { return ut_decode(p, false, 0, out, e); }
+  if (n == 38) {
+    if (p[0] != (uint8)'{') { return ut_fail(e, 0, "expected '{{'"); }
+    if (p[37] != (uint8)'}') { return ut_fail(e, 37, "expected '}'"); }
+    return ut_decode(p + 1, true, 1, out, e);
+  }
+  if (n == 45) {
+    var pre: string = "urn:uuid:";
+    for i in 0..9 {
+      if (ut_lower(p[i]) != (uint8)pre[i]) { return ut_fail(e, (int64)i, "expected 'urn:uuid:'"); }
+    }
+    return ut_decode(p + 9, true, 9, out, e);
+  }
+  return ut_fail(e, 0, "wrong length: a UUID is 32, 36, 38 or 45 characters");
+}
+
+// Parses, returning false on any error.
+export fn uuid_try_parse(s: string, out: Uuid*) -> bool {
+  var e: UuidError;
+  return uuid_parse_into(s, out, &e);
+}
+
+export fn uuid_parse(s: string) -> Result<Uuid, UuidError> {
+  var u: Uuid;
+  var e: UuidError;
+  if (uuid_parse_into(s, &u, &e)) { return Ok(u); }
+  return Err(e);
+}
+
+export fn uuid_valid(s: string) -> bool {
+  var u: Uuid;
+  return uuid_try_parse(s, &u);
+}
+
+// Parses, or gives the nil UUID when s is not a UUID.
+export fn uuid_parse_or_nil(s: string) -> Uuid {
+  var u: Uuid;
+  if (uuid_try_parse(s, &u)) { return u; }
+  return uuid_nil();
+}
+
+// Parses exactly 16 raw bytes; false if n is not 16.
+export fn uuid_from_slice(p: uint8*, n: int64, out: Uuid*) -> bool {
+  if (n != 16) { return false; }
+  *out = uuid_from_bytes(p);
+  return true;
+}
+
+// The length uuid_encode writes for a format: 36, 32, 45 or 38.
+export fn uuid_encoded_len(format: int32) -> int64 {
+  if (format == UUID_FMT_SIMPLE) { return 32; }
+  if (format == UUID_FMT_URN) { return 45; }
+  if (format == UUID_FMT_BRACED) { return 38; }
+  return 36;
+}
+
+// Writes u into buf in the given format, lower case unless upper is set.
+// buf needs uuid_encoded_len(format) bytes; no terminating zero is added.
+// Returns the number of bytes written. Like the parser it works at fixed
+// offsets from a table, with no branches per digit.
+export fn uuid_encode(u: Uuid, format: int32, upper: bool, buf: uint8*) -> int64 {
+  var digits: string = UT_LOWER;
+  if (upper) { digits = UT_UPPER; }
+  var o: int64 = 0;
+  if (format == UUID_FMT_URN) {
+    var pre: string = "urn:uuid:";
+    for i in 0..9 { buf[i] = (uint8)pre[i]; }
+    o = 9;
+  } else if (format == UUID_FMT_BRACED) {
+    buf[0] = (uint8)'{';
+    o = 1;
+  }
+  var hyph: bool = format != UUID_FMT_SIMPLE;
+  for i in 0..16 {
+    var at: int64 = o + (int64)i * 2;
+    if (hyph) { at = o + UT_POS[i]; }
+    buf[at] = (uint8)digits[(int64)(u.b[i] >> (uint8)4)];
+    buf[at + 1] = (uint8)digits[(int64)(u.b[i] & (uint8)15)];
+  }
+  if (hyph) {
+    buf[o + 8] = (uint8)'-';
+    buf[o + 13] = (uint8)'-';
+    buf[o + 18] = (uint8)'-';
+    buf[o + 23] = (uint8)'-';
+  }
+  var n: int64 = uuid_encoded_len(format);
+  if (format == UUID_FMT_BRACED) { buf[37] = (uint8)'}'; }
+  return n;
+}
+
+// A new string in the given format. The caller owns it (free its chars).
+export fn uuid_format(u: Uuid, format: int32, upper: bool) -> string {
+  var n: int64 = uuid_encoded_len(format);
+  var buf: uint8* = (uint8*)malloc(n + 1);
+  uuid_encode(u, format, upper, buf);
+  buf[n] = 0;
+  return str_from_bytes((cstring)buf, n);
+}
+
+// The usual lower-case hyphenated form, as a new string.
+export fn uuid_to_string(u: Uuid) -> string {
+  return uuid_format(u, UUID_FMT_HYPHENATED, false);
+}

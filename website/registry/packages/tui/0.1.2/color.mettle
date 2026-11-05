@@ -1,0 +1,200 @@
+// Colours: making them, mixing them, and bringing true colour down to the
+// 256 or 16 colours a terminal can show.
+
+import "std/core";
+import "std/env";
+import "types";
+
+// What the terminal can show.
+export const TUI_DEPTH_16 = 1;
+export const TUI_DEPTH_256 = 2;
+export const TUI_DEPTH_TRUE = 3;
+
+// The 16 basic colours (ECMA-48 SGR 30-37 and xterm's bright 90-97).
+export const TUI_BLACK: uint32 = 0x01000000;
+export const TUI_RED: uint32 = 0x01000001;
+export const TUI_GREEN: uint32 = 0x01000002;
+export const TUI_YELLOW: uint32 = 0x01000003;
+export const TUI_BLUE: uint32 = 0x01000004;
+export const TUI_MAGENTA: uint32 = 0x01000005;
+export const TUI_CYAN: uint32 = 0x01000006;
+export const TUI_WHITE: uint32 = 0x01000007;
+export const TUI_BRIGHT_BLACK: uint32 = 0x01000008;
+export const TUI_BRIGHT_RED: uint32 = 0x01000009;
+export const TUI_BRIGHT_GREEN: uint32 = 0x0100000A;
+export const TUI_BRIGHT_YELLOW: uint32 = 0x0100000B;
+export const TUI_BRIGHT_BLUE: uint32 = 0x0100000C;
+export const TUI_BRIGHT_MAGENTA: uint32 = 0x0100000D;
+export const TUI_BRIGHT_CYAN: uint32 = 0x0100000E;
+export const TUI_BRIGHT_WHITE: uint32 = 0x0100000F;
+
+export fn tui_rgb(r: int32, g: int32, b: int32) -> uint32 {
+  return TUI_KIND_RGB | ((uint32)(r & 255) << 16) | ((uint32)(g & 255) << 8) | (uint32)(b & 255);
+}
+
+// 0xRRGGBB to a colour.
+export fn tui_hex(v: uint32) -> uint32 {
+  return TUI_KIND_RGB | (v & (uint32)0xFFFFFF);
+}
+
+export fn tui_index(i: int32) -> uint32 {
+  return TUI_KIND_INDEX | (uint32)(i & 255);
+}
+
+export fn tui_color_kind(c: uint32) -> uint32 { return c & (uint32)0xFF000000; }
+export fn tui_color_r(c: uint32) -> int32 { return (int32)((c >> 16) & (uint32)255); }
+export fn tui_color_g(c: uint32) -> int32 { return (int32)((c >> 8) & (uint32)255); }
+export fn tui_color_b(c: uint32) -> int32 { return (int32)(c & (uint32)255); }
+
+// The xterm palette as RGB, for mixing and for downgrading.
+const TUI_BASE16: uint32[16] = [
+  0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
+  0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF
+];
+
+const TUI_CUBE: int32[6] = [0, 95, 135, 175, 215, 255];
+
+export fn tui_index_rgb(i: int32) -> uint32 {
+  i = i & 255;
+  if (i < 16) { return TUI_KIND_RGB | TUI_BASE16[i]; }
+  if (i >= 232) {
+    var v: int32 = 8 + 10 * (i - 232);
+    return tui_rgb(v, v, v);
+  }
+  var k: int32 = i - 16;
+  return tui_rgb(TUI_CUBE[k / 36], TUI_CUBE[(k / 6) % 6], TUI_CUBE[k % 6]);
+}
+
+fn tui_dist(r1: int32, g1: int32, b1: int32, r2: int32, g2: int32, b2: int32) -> int32 {
+  // Weighted distance ("redmean"), close to how eyes judge colour.
+  var rm: int32 = (r1 + r2) / 2;
+  var dr: int32 = r1 - r2;
+  var dg: int32 = g1 - g2;
+  var db: int32 = b1 - b2;
+  return (((512 + rm) * dr * dr) >> 8) + 4 * dg * dg + (((767 - rm) * db * db) >> 8);
+}
+
+fn tui_cube_step(v: int32) -> int32 {
+  if (v < 48) { return 0; }
+  if (v < 115) { return 1; }
+  return (v - 35) / 40;
+}
+
+// The nearest xterm 256 colour: the best of the 6x6x6 cube and the grey
+// ramp, the method tmux uses (colour_find_rgb).
+export fn tui_rgb_to_256(c: uint32) -> int32 {
+  var r: int32 = tui_color_r(c);
+  var g: int32 = tui_color_g(c);
+  var b: int32 = tui_color_b(c);
+  var qr: int32 = tui_cube_step(r);
+  var qg: int32 = tui_cube_step(g);
+  var qb: int32 = tui_cube_step(b);
+  var cr: int32 = TUI_CUBE[qr];
+  var cg: int32 = TUI_CUBE[qg];
+  var cb: int32 = TUI_CUBE[qb];
+  if (cr == r && cg == g && cb == b) { return 16 + 36 * qr + 6 * qg + qb; }
+  var avg: int32 = (r + g + b) / 3;
+  var gi: int32 = 0;
+  if (avg > 238) { gi = 23; } else { gi = (avg - 3) / 10; }
+  if (gi < 0) { gi = 0; }
+  var gv: int32 = 8 + 10 * gi;
+  if (tui_dist(cr, cg, cb, r, g, b) <= tui_dist(gv, gv, gv, r, g, b)) {
+    return 16 + 36 * qr + 6 * qg + qb;
+  }
+  return 232 + gi;
+}
+
+// The nearest of the 16 basic colours.
+export fn tui_rgb_to_16(c: uint32) -> int32 {
+  var r: int32 = tui_color_r(c);
+  var g: int32 = tui_color_g(c);
+  var b: int32 = tui_color_b(c);
+  var best: int32 = 0;
+  var bd: int32 = 0x7FFFFFFF;
+  for i in 0..16 {
+    var p: uint32 = TUI_BASE16[i];
+    var d: int32 = tui_dist((int32)(p >> 16), (int32)((p >> 8) & (uint32)255), (int32)(p & (uint32)255), r, g, b);
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+// Brings a colour down to what the terminal can show.
+export fn tui_color_for(c: uint32, depth: int32) -> uint32 {
+  var kind: uint32 = tui_color_kind(c);
+  if (kind == TUI_KIND_RGB) {
+    if (depth >= TUI_DEPTH_TRUE) { return c; }
+    if (depth == TUI_DEPTH_256) { return tui_index(tui_rgb_to_256(c)); }
+    return tui_index(tui_rgb_to_16(c));
+  }
+  if (kind == TUI_KIND_INDEX && depth < TUI_DEPTH_256) {
+    var i: int32 = (int32)(c & (uint32)255);
+    if (i >= 16) { return tui_index(tui_rgb_to_16(tui_index_rgb(i))); }
+  }
+  return c;
+}
+
+// Mixes a and b: t = 0 gives a, t = 1000 gives b.
+export fn tui_mix(a: uint32, b: uint32, t: int32) -> uint32 {
+  if (t <= 0) { return a; }
+  if (t >= 1000) { return b; }
+  if (tui_color_kind(a) == TUI_KIND_INDEX) { a = tui_index_rgb((int32)(a & (uint32)255)); }
+  if (tui_color_kind(b) == TUI_KIND_INDEX) { b = tui_index_rgb((int32)(b & (uint32)255)); }
+  if (tui_color_kind(a) != TUI_KIND_RGB || tui_color_kind(b) != TUI_KIND_RGB) {
+    if (t < 500) { return a; }
+    return b;
+  }
+  var r: int32 = tui_color_r(a) + (tui_color_r(b) - tui_color_r(a)) * t / 1000;
+  var g: int32 = tui_color_g(a) + (tui_color_g(b) - tui_color_g(a)) * t / 1000;
+  var bl: int32 = tui_color_b(a) + (tui_color_b(b) - tui_color_b(a)) * t / 1000;
+  return tui_rgb(r, g, bl);
+}
+
+// A colour along a gradient of stops, for t in 0..1000.
+export fn tui_gradient(stops: uint32[], t: int32) -> uint32 {
+  var n: int32 = (int32)stops.length;
+  if (n == 0) { return TUI_DEFAULT; }
+  if (n == 1 || t <= 0) { return stops[0]; }
+  if (t >= 1000) { return stops[n - 1]; }
+  var pos: int32 = t * (n - 1);
+  var seg: int32 = pos / 1000;
+  var rem: int32 = pos % 1000;
+  return tui_mix(stops[seg], stops[seg + 1], rem);
+}
+
+fn tui_contains(s: string, part: string) -> bool {
+  var n: int64 = (int64)s.length;
+  var m: int64 = (int64)part.length;
+  if (m == 0) { return true; }
+  var i: int64 = 0;
+  while (i + m <= n) {
+    var ok: bool = true;
+    for k: int64 in 0..m {
+      if (s[i + k] != part[k]) { ok = false; break; }
+    }
+    if (ok) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// What the terminal supports, from the environment: COLORTERM=truecolor or
+// 24bit means true colour, a TERM with "256color" means 256, else 16.
+// NO_COLOR is not handled here; see tui_set_depth.
+export fn tui_detect_depth() -> int32 {
+  var ct: string = env_get_or("COLORTERM", "");
+  if (ct == "truecolor" || ct == "24bit") { return TUI_DEPTH_TRUE; }
+  var term: string = env_get_or("TERM", "");
+  if (tui_contains(term, "direct") || tui_contains(term, "truecolor")) { return TUI_DEPTH_TRUE; }
+  if (tui_contains(term, "256")) { return TUI_DEPTH_256; }
+  if (term == "xterm-kitty" || term == "alacritty" || term == "foot" || term == "wezterm") {
+    return TUI_DEPTH_TRUE;
+  }
+  return TUI_DEPTH_16;
+}
+
+// An empty list of colours, for "no gradient" arguments.
+export fn tui_no_stops() -> uint32[] {
+  var s: uint32[] = { data: (uint32*)0, length: 0 };
+  return s;
+}

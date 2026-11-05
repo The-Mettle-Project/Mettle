@@ -1,0 +1,374 @@
+// MessagePack reader. Values are read one at a time from a CodecReader;
+// strings, binary and extension data come back as views into the input, with
+// no copy. Array and map headers give a count, and the items follow.
+//
+// Safety: every length is checked against the bytes left, an array or map
+// cannot claim more items than there are bytes left, and codec_mp_skip and
+// codec_mp_check walk nesting with an explicit stack and a depth limit, so no
+// input can crash the reader or make it recurse.
+import "codec/core/status";
+import "codec/core/varint";
+import "codec/core/reader";
+
+export const CODEC_MP_NIL = 1;
+export const CODEC_MP_BOOL = 2;
+export const CODEC_MP_INT = 3;      // fits in int64: `i` (also in `u` when >= 0)
+export const CODEC_MP_UINT = 4;     // above the int64 range: `u`
+export const CODEC_MP_FLOAT32 = 5;  // `f` (widened)
+export const CODEC_MP_FLOAT64 = 6;  // `f`
+export const CODEC_MP_STR = 7;      // `data`
+export const CODEC_MP_BIN = 8;      // `data`
+export const CODEC_MP_ARRAY = 9;    // `n` items follow
+export const CODEC_MP_MAP = 10;     // `n` key/value pairs follow
+export const CODEC_MP_EXT = 11;     // `ext_type` and `data`
+
+// Nesting limit codec_mp_skip and codec_mp_check use unless told otherwise.
+export const CODEC_MP_DEPTH = 512;
+
+export struct CodecMpValue {
+  kind: int32;
+  b: bool;
+  i: int64;
+  u: uint64;
+  f: float64;
+  data: string;    // view into the input
+  n: int64;        // items for arrays, pairs for maps, bytes for str/bin/ext
+  ext_type: int32;
+}
+
+fn codec_mp_blob(r: CodecReader*, v: CodecMpValue*, kind: int32, n: int64) -> bool {
+  v->kind = kind;
+  v->n = n;
+  v->data = codec_rd_string(r, n);
+  return r->err == CODEC_OK;
+}
+
+fn codec_mp_container(r: CodecReader*, v: CodecMpValue*, kind: int32, n: int64) -> bool {
+  v->kind = kind;
+  v->n = n;
+  // Each item takes at least one byte, so a count past what is left is a lie.
+  var items: int64 = n;
+  if (kind == CODEC_MP_MAP) { items = n * 2; }
+  if (items > codec_rd_left(r)) {
+    codec_rd_fail(r, CODEC_ERR_LIMIT);
+    return false;
+  }
+  return true;
+}
+
+fn codec_mp_ext_value(r: CodecReader*, v: CodecMpValue*, n: int64) -> bool {
+  var t: uint8 = codec_rd_u8(r);
+  v->ext_type = (int32)(int8)t;
+  return codec_mp_blob(r, v, CODEC_MP_EXT, n);
+}
+
+fn codec_mp_set_int(v: CodecMpValue*, x: int64) -> bool {
+  v->kind = CODEC_MP_INT;
+  v->i = x;
+  v->u = (uint64)x;
+  return true;
+}
+
+// Reads the next value or header into v. Returns false at the end of input or
+// on an error; r->err tells which (CODEC_OK at a clean end).
+export fn codec_mp_read(r: CodecReader*, v: CodecMpValue*) -> bool {
+  if (r->pos >= r->len) {
+    v->kind = 0;
+    return false;
+  }
+  var c: int32 = (int32)r->data[r->pos];
+  r->pos = r->pos + 1;
+  if (c < 0x80) { return codec_mp_set_int(v, (int64)c); }
+  if (c >= 0xe0) { return codec_mp_set_int(v, (int64)(c - 256)); }
+  if (c < 0x90) { return codec_mp_container(r, v, CODEC_MP_MAP, (int64)(c & 15)); }
+  if (c < 0xa0) { return codec_mp_container(r, v, CODEC_MP_ARRAY, (int64)(c & 15)); }
+  if (c < 0xc0) { return codec_mp_blob(r, v, CODEC_MP_STR, (int64)(c & 31)); }
+  switch (c) {
+    case 0xc0: { v->kind = CODEC_MP_NIL; return true; }
+    case 0xc2: { v->kind = CODEC_MP_BOOL; v->b = false; return true; }
+    case 0xc3: { v->kind = CODEC_MP_BOOL; v->b = true; return true; }
+    case 0xc4: { return codec_mp_blob(r, v, CODEC_MP_BIN, (int64)codec_rd_u8(r)); }
+    case 0xc5: { return codec_mp_blob(r, v, CODEC_MP_BIN, (int64)codec_rd_be16(r)); }
+    case 0xc6: { return codec_mp_blob(r, v, CODEC_MP_BIN, (int64)codec_rd_be32(r)); }
+    case 0xc7: { return codec_mp_ext_value(r, v, (int64)codec_rd_u8(r)); }
+    case 0xc8: { return codec_mp_ext_value(r, v, (int64)codec_rd_be16(r)); }
+    case 0xc9: { return codec_mp_ext_value(r, v, (int64)codec_rd_be32(r)); }
+    case 0xca: {
+      v->kind = CODEC_MP_FLOAT32;
+      v->f = (float64)codec_bits_f32(codec_rd_be32(r));
+      return r->err == CODEC_OK;
+    }
+    case 0xcb: {
+      v->kind = CODEC_MP_FLOAT64;
+      v->f = codec_bits_f64(codec_rd_be64(r));
+      return r->err == CODEC_OK;
+    }
+    case 0xcc: { codec_mp_set_int(v, (int64)codec_rd_u8(r)); return r->err == CODEC_OK; }
+    case 0xcd: { codec_mp_set_int(v, (int64)codec_rd_be16(r)); return r->err == CODEC_OK; }
+    case 0xce: { codec_mp_set_int(v, (int64)codec_rd_be32(r)); return r->err == CODEC_OK; }
+    case 0xcf: {
+      var u: uint64 = codec_rd_be64(r);
+      if (u > 0x7fffffffffffffff) {
+        v->kind = CODEC_MP_UINT;
+        v->u = u;
+        v->i = 0;
+      } else {
+        codec_mp_set_int(v, (int64)u);
+      }
+      return r->err == CODEC_OK;
+    }
+    case 0xd0: { codec_mp_set_int(v, (int64)(int8)codec_rd_u8(r)); return r->err == CODEC_OK; }
+    case 0xd1: { codec_mp_set_int(v, (int64)(int16)codec_rd_be16(r)); return r->err == CODEC_OK; }
+    case 0xd2: { codec_mp_set_int(v, (int64)(int32)codec_rd_be32(r)); return r->err == CODEC_OK; }
+    case 0xd3: { codec_mp_set_int(v, (int64)codec_rd_be64(r)); return r->err == CODEC_OK; }
+    case 0xd4: { return codec_mp_ext_value(r, v, 1); }
+    case 0xd5: { return codec_mp_ext_value(r, v, 2); }
+    case 0xd6: { return codec_mp_ext_value(r, v, 4); }
+    case 0xd7: { return codec_mp_ext_value(r, v, 8); }
+    case 0xd8: { return codec_mp_ext_value(r, v, 16); }
+    case 0xd9: { return codec_mp_blob(r, v, CODEC_MP_STR, (int64)codec_rd_u8(r)); }
+    case 0xda: { return codec_mp_blob(r, v, CODEC_MP_STR, (int64)codec_rd_be16(r)); }
+    case 0xdb: { return codec_mp_blob(r, v, CODEC_MP_STR, (int64)codec_rd_be32(r)); }
+    case 0xdc: { return codec_mp_container(r, v, CODEC_MP_ARRAY, (int64)codec_rd_be16(r)); }
+    case 0xdd: { return codec_mp_container(r, v, CODEC_MP_ARRAY, (int64)codec_rd_be32(r)); }
+    case 0xde: { return codec_mp_container(r, v, CODEC_MP_MAP, (int64)codec_rd_be16(r)); }
+    case 0xdf: { return codec_mp_container(r, v, CODEC_MP_MAP, (int64)codec_rd_be32(r)); }
+    default: { }
+  }
+  // 0xc1 is never used.
+  codec_rd_fail(r, CODEC_ERR_INVALID);
+  return false;
+}
+
+// The kind of the next value without reading it, or 0 at the end.
+export fn codec_mp_peek(r: CodecReader*) -> int32 {
+  if (r->pos >= r->len) { return 0; }
+  var save: int64 = r->pos;
+  var v: CodecMpValue;
+  var ok: bool = codec_mp_read(r, &v);
+  if (r->err != CODEC_OK) { return 0; }
+  r->pos = save;
+  if (!ok) { return 0; }
+  return v.kind;
+}
+
+// Typed reads. Each reads one value; a value of another kind fails the reader
+// with CODEC_ERR_TYPE and returns zero.
+
+fn codec_mp_want(r: CodecReader*, v: CodecMpValue*, kind: int32) -> bool {
+  if (!codec_mp_read(r, v)) {
+    if (r->err == CODEC_OK) { codec_rd_fail(r, CODEC_ERR_TRUNCATED); }
+    return false;
+  }
+  if (v->kind != kind) {
+    codec_rd_fail(r, CODEC_ERR_TYPE);
+    return false;
+  }
+  return true;
+}
+
+// Reads nil if it is next and returns true; otherwise reads nothing.
+export fn codec_mp_read_nil(r: CodecReader*) -> bool {
+  if (r->pos < r->len && r->data[r->pos] == 0xc0) {
+    r->pos = r->pos + 1;
+    return true;
+  }
+  return false;
+}
+
+export fn codec_mp_read_bool(r: CodecReader*) -> bool {
+  var v: CodecMpValue;
+  if (!codec_mp_want(r, &v, CODEC_MP_BOOL)) { return false; }
+  return v.b;
+}
+
+export fn codec_mp_read_int(r: CodecReader*) -> int64 {
+  // Fast path: a fixint.
+  if (r->pos < r->len) {
+    var c: int32 = (int32)r->data[r->pos];
+    if (c < 0x80 || c >= 0xe0) {
+      r->pos = r->pos + 1;
+      if (c >= 0xe0) { return (int64)(c - 256); }
+      return (int64)c;
+    }
+  }
+  var v: CodecMpValue;
+  if (!codec_mp_want(r, &v, CODEC_MP_INT)) { return 0; }
+  return v.i;
+}
+
+export fn codec_mp_read_uint(r: CodecReader*) -> uint64 {
+  var v: CodecMpValue;
+  if (!codec_mp_read(r, &v)) {
+    if (r->err == CODEC_OK) { codec_rd_fail(r, CODEC_ERR_TRUNCATED); }
+    return (uint64)0;
+  }
+  if (v.kind == CODEC_MP_UINT || (v.kind == CODEC_MP_INT && v.i >= 0)) { return v.u; }
+  codec_rd_fail(r, CODEC_ERR_TYPE);
+  return (uint64)0;
+}
+
+// Reads a float32, float64 or integer as a float64.
+export fn codec_mp_read_float(r: CodecReader*) -> float64 {
+  var v: CodecMpValue;
+  if (!codec_mp_read(r, &v)) {
+    if (r->err == CODEC_OK) { codec_rd_fail(r, CODEC_ERR_TRUNCATED); }
+    return 0.0;
+  }
+  if (v.kind == CODEC_MP_FLOAT64 || v.kind == CODEC_MP_FLOAT32) { return v.f; }
+  if (v.kind == CODEC_MP_INT) { return (float64)v.i; }
+  if (v.kind == CODEC_MP_UINT) { return (float64)v.u; }
+  codec_rd_fail(r, CODEC_ERR_TYPE);
+  return 0.0;
+}
+
+// A string as a view into the input. It is not checked for UTF-8; use
+// codec_utf8_valid_string when that matters.
+export fn codec_mp_read_str(r: CodecReader*) -> string {
+  var empty: string;
+  // Fast path: a fixstr that is all there.
+  if (r->pos < r->len) {
+    var c: int32 = (int32)r->data[r->pos];
+    if (c >= 0xa0 && c < 0xc0) {
+      var n: int64 = (int64)(c & 31);
+      if (n < r->len - r->pos) {
+        var s: string;
+        s.chars = r->data + r->pos + 1;
+        s.length = (uint64)n;
+        r->pos = r->pos + 1 + n;
+        return s;
+      }
+    }
+  }
+  var v: CodecMpValue;
+  if (!codec_mp_want(r, &v, CODEC_MP_STR)) { return empty; }
+  return v.data;
+}
+
+export fn codec_mp_read_bin(r: CodecReader*) -> string {
+  var v: CodecMpValue;
+  var empty: string;
+  if (!codec_mp_want(r, &v, CODEC_MP_BIN)) { return empty; }
+  return v.data;
+}
+
+// An array header: the number of items that follow.
+export fn codec_mp_read_array(r: CodecReader*) -> int64 {
+  if (r->pos < r->len) {
+    var c: int32 = (int32)r->data[r->pos];
+    if (c >= 0x90 && c < 0xa0 && (int64)(c & 15) < r->len - r->pos) {
+      r->pos = r->pos + 1;
+      return (int64)(c & 15);
+    }
+  }
+  var v: CodecMpValue;
+  if (!codec_mp_want(r, &v, CODEC_MP_ARRAY)) { return 0; }
+  return v.n;
+}
+
+// A map header: the number of key/value pairs that follow.
+export fn codec_mp_read_map(r: CodecReader*) -> int64 {
+  if (r->pos < r->len) {
+    var c: int32 = (int32)r->data[r->pos];
+    if (c >= 0x80 && c < 0x90 && (int64)(c & 15) * 2 < r->len - r->pos) {
+      r->pos = r->pos + 1;
+      return (int64)(c & 15);
+    }
+  }
+  var v: CodecMpValue;
+  if (!codec_mp_want(r, &v, CODEC_MP_MAP)) { return 0; }
+  return v.n;
+}
+
+// An extension: its type goes to *ext_type, its data comes back as a view.
+export fn codec_mp_read_ext(r: CodecReader*, ext_type: int32*) -> string {
+  var v: CodecMpValue;
+  var empty: string;
+  if (!codec_mp_want(r, &v, CODEC_MP_EXT)) { return empty; }
+  *ext_type = v.ext_type;
+  return v.data;
+}
+
+// Decodes timestamp extension data (type -1) of 4, 8 or 12 bytes. Returns
+// false if the size is wrong or nanoseconds are out of range.
+export fn codec_mp_timestamp_of(data: string, sec: int64*, nsec: int64*) -> bool {
+  var p: uint8* = data.chars;
+  if (data.length == 4) {
+    *sec = (int64)codec_get_be32(p);
+    *nsec = 0;
+    return true;
+  }
+  if (data.length == 8) {
+    var x: uint64 = codec_get_be64(p);
+    var ns: int64 = (int64)(x >> 34);
+    if (ns > 999999999) { return false; }
+    *nsec = ns;
+    *sec = (int64)(x & 0x3ffffffff);
+    return true;
+  }
+  if (data.length == 12) {
+    var ns2: int64 = (int64)codec_get_be32(p);
+    if (ns2 > 999999999) { return false; }
+    *nsec = ns2;
+    *sec = (int64)codec_get_be64(p + 4);
+    return true;
+  }
+  return false;
+}
+
+export fn codec_mp_read_timestamp(r: CodecReader*, sec: int64*, nsec: int64*) -> bool {
+  var t: int32 = 0;
+  var d: string = codec_mp_read_ext(r, &t);
+  if (r->err != CODEC_OK) { return false; }
+  if (t != -1 || !codec_mp_timestamp_of(d, sec, nsec)) {
+    codec_rd_fail(r, CODEC_ERR_TYPE);
+    return false;
+  }
+  return true;
+}
+
+// Skips one whole value, nested items included. Fails with CODEC_ERR_DEPTH
+// past max_depth levels (512 at most). Works with a counter, not recursion.
+export fn codec_mp_skip(r: CodecReader*, max_depth: int32) -> bool {
+  var stack: int64[512];
+  var depth: int32 = 0;
+  var pending: int64 = 1;     // values still to read at this level
+  var v: CodecMpValue;
+  while (true) {
+    if (pending == 0) {
+      if (depth == 0) { return true; }
+      depth = depth - 1;
+      pending = stack[depth];
+      continue;
+    }
+    if (!codec_mp_read(r, &v)) {
+      if (r->err == CODEC_OK) { codec_rd_fail(r, CODEC_ERR_TRUNCATED); }
+      return false;
+    }
+    pending = pending - 1;
+    if (v.kind == CODEC_MP_ARRAY || v.kind == CODEC_MP_MAP) {
+      var items: int64 = v.n;
+      if (v.kind == CODEC_MP_MAP) { items = v.n * 2; }
+      if (items > 0) {
+        if (depth >= max_depth || depth >= 512) {
+          codec_rd_fail(r, CODEC_ERR_DEPTH);
+          return false;
+        }
+        stack[depth] = pending;
+        depth = depth + 1;
+        pending = items;
+      }
+    }
+  }
+  return false;
+}
+
+// Checks that data holds exactly one well-formed value, nesting at most
+// max_depth (at most 512) levels. Returns CODEC_OK or the error code.
+export fn codec_mp_check(data: uint8*, n: int64, max_depth: int32) -> int32 {
+  var r: CodecReader;
+  codec_rd_init(&r, data, n);
+  if (!codec_mp_skip(&r, max_depth)) { return r.err; }
+  if (!codec_rd_done(&r)) { return CODEC_ERR_INVALID; }
+  return CODEC_OK;
+}
