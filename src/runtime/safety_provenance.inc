@@ -323,6 +323,21 @@ uint64_t mettle_safety_string_identity(const void *record, uint64_t size) {
   return identity;
 }
 
+// The runtime's own string builders allocate behind the tracker's back. The
+// compiler calls this on each result, where the record sits.
+void mettle_safety_string_owned(void *record) {
+  const void *data = record ? *(const void *const *)record : NULL;
+  if (!data) return;
+  mettle_safety_register((void *)data, ((const uint64_t *)record)[1] + 1);
+  mettle_safety_value_store(record, (uint64_t)(uintptr_t)data,
+                            mettle_safety_identity(data), sizeof(void *));
+}
+
+void mettle_safety_string_release(void *record) {
+  const void *data = record ? *(const void *const *)record : NULL;
+  if (data) mettle_safety_unregister((void *)data);
+}
+
 void mettle_safety_global_pointer(void *slot, uint64_t mode, uint64_t size) {
   if (mode == 3) {
     mettle_safety_string_identity(slot, size);

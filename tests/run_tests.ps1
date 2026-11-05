@@ -8263,7 +8263,7 @@ catch {
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
-  foreach ($fixture in @("test_safe_region_module", "test_safe_hash_index")) {
+  foreach ($fixture in @("test_safe_region_module", "test_safe_hash_index", "test_safe_string_concat")) {
     foreach ($mode in @(@(), @("--safe"), @("--safe", "--release"))) {
       $trackExe = Join-Path $tmpDir "$fixture.exe"
       $trackBuild = & $CompilerPath --build @mode "tests/$fixture.mettle" -o $trackExe 2>&1 | Out-String
