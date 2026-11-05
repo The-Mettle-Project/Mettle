@@ -281,6 +281,33 @@ static int origin_return(SafetyOrigins *origins, SourceLocation location,
   return ok;
 }
 
+static const char *origin_address_source(const SafetyOrigins *origins,
+                                         const IROperand *value) {
+  if (!value->name || value->kind != IR_OPERAND_TEMP) return NULL;
+  for (size_t i = origins->out.count; i-- > 0;) {
+    const IRInstruction *in = &origins->out.items[i];
+    if (in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
+        !strcmp(in->dest.name, value->name)) {
+      return in->op == IR_OP_ADDRESS_OF && in->lhs.kind == IR_OPERAND_SYMBOL
+                 ? in->lhs.name : NULL;
+    }
+  }
+  return NULL;
+}
+
+static size_t origin_symbol_size(SafetyOrigins *origins, const char *name) {
+  for (size_t i = origins->out.count; i-- > 0;) {
+    const IRInstruction *in = &origins->out.items[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name &&
+        !strcmp(in->dest.name, name)) {
+      MtlcType *type = in->value_type ? in->value_type
+                                      : ir_program_lookup_type(origins->program, in->text);
+      return type ? type->size : 0;
+    }
+  }
+  return 0;
+}
+
 static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
                               const IROperand *entry) {
   if (in->op == IR_OP_SAFETY_CHECK) {
@@ -307,6 +334,8 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
   IROperand left = ir_operand_none(), right = ir_operand_none();
   IROperand frame = ir_operand_none();
   IROperand memory_result = ir_operand_none();
+  IROperand hidden_return = ir_operand_none();
+  size_t hidden_return_size = 0;
   int ok = 0;
   int call = in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT;
   if (call && in->text && (strcmp(in->text, "mettle_safety_check") == 0 ||
@@ -366,25 +395,49 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
       ir_operand_destroy(&name);
       if (!addressed) goto done;
     } else if (!ir_operand_clone(&lhs, &callee)) goto done;
+    if (in->op == IR_OP_CALL_INDIRECT && in->argument_count > 0) {
+      const char *slot = origin_address_source(origins, &in->arguments[0]);
+      if (slot && strstr(slot, "agg_ret")) {
+        hidden_return_size = origin_symbol_size(origins, slot);
+        if (hidden_return_size &&
+            !ir_operand_clone(&in->arguments[0], &hidden_return)) {
+          ir_operand_destroy(&callee);
+          goto done;
+        }
+      }
+    }
+    size_t hidden = hidden_return_size ? 1 : 0;
     frame = origin_fresh();
-    IROperand args[2] = {callee, ir_operand_int((long long)in->argument_count)};
+    IROperand args[2] = {callee, ir_operand_int((long long)(in->argument_count - hidden))};
     int pushed = origin_call(origins, location, "mettle_safety_call_push", args, 2, &frame);
     ir_operand_destroy(&callee);
     if (!pushed) goto done;
-    for (size_t a = 0; a < in->argument_count; a++) {
+    for (size_t a = hidden; a < in->argument_count; a++) {
       size_t size = origin_aggregate_size(origins, &in->arguments[a]);
+      size_t slot_index = a - hidden;
       if (size) {
         IROperand address = ir_operand_none();
         if (!origin_address(origins, location, &in->arguments[a], &address)) goto done;
-        IROperand args[4] = {frame, ir_operand_int((long long)a), address, ir_operand_int((long long)size)};
+        IROperand args[4] = {frame, ir_operand_int((long long)slot_index), address, ir_operand_int((long long)size)};
         int passed = origin_call(origins, location, "mettle_safety_call_arg_copy", args, 4, NULL);
         ir_operand_destroy(&address);
         if (!passed) goto done;
         continue;
       }
+      if (in->op == IR_OP_CALL_INDIRECT) {
+        const char *source = origin_address_source(origins, &in->arguments[a]);
+        size_t by_value = source && strstr(source, "agg_arg")
+                              ? origin_symbol_size(origins, source) : 0;
+        if (by_value) {
+          IROperand args[4] = {frame, ir_operand_int((long long)slot_index),
+                               in->arguments[a], ir_operand_int((long long)by_value)};
+          if (!origin_call(origins, location, "mettle_safety_call_arg_copy", args, 4, NULL)) goto done;
+          continue;
+        }
+      }
       IROperand token = ir_operand_none();
       if (!origin_get(origins, location, &in->arguments[a], &token)) goto done;
-      IROperand arg[3] = {frame, ir_operand_int((long long)a), token};
+      IROperand arg[3] = {frame, ir_operand_int((long long)slot_index), token};
       int passed = origin_call(origins, location, "mettle_safety_call_arg", arg, 3, NULL);
       ir_operand_destroy(&token);
       if (!passed) goto done;
@@ -489,6 +542,9 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
       int passed = origin_call(origins, location, "mettle_safety_call_result_copy", args, 3, NULL);
       ir_operand_destroy(&address);
       if (!passed) goto done;
+    } else if (hidden_return_size) {
+      IROperand args[3] = {frame, hidden_return, ir_operand_int((long long)hidden_return_size)};
+      if (!origin_call(origins, location, "mettle_safety_call_result_copy", args, 3, NULL)) goto done;
     }
     IROperand ignored = origin_fresh();
     ok = origin_call(origins, location, "mettle_safety_call_pop", &frame, 1,
@@ -568,6 +624,7 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
   ok = 1;
 done:
   ir_operand_destroy(&memory_result);
+  ir_operand_destroy(&hidden_return);
   ir_operand_destroy(&left);
   ir_operand_destroy(&right);
   ir_operand_destroy(&frame);

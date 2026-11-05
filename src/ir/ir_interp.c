@@ -5604,6 +5604,48 @@ static int ii_op_new(IRInterpMachine *machine, IIFrame *frame,
   return 1;
 }
 
+static int ii_store_hidden_return(IRInterpMachine *machine,
+                                  const IRFunction *callee,
+                                  const IRInterpValue *slot,
+                                  IRInterpValue *result) {
+  const IRModuleSymbol *sym = callee->name ? ii_symbol(machine, callee->name) : NULL;
+  const MtlcType *type = sym ? sym->return_type : NULL;
+  long long size = type ? (long long)type->size : 0;
+  unsigned long long to = (unsigned long long)ii_as_int(slot);
+  unsigned long long from = (unsigned long long)ii_as_int(result);
+  long long to_off = 0;
+  long long from_off = 0;
+  IIBuffer *dbuf;
+  IIBuffer *sbuf;
+  unsigned char inline_bytes[8];
+  if (size <= 0) {
+    *result = *slot;
+    return 1;
+  }
+  dbuf = ii_addr_to_buffer(machine, to, size, &to_off);
+  sbuf = ii_addr_to_buffer(machine, from, size, &from_off);
+  if (!dbuf) {
+    ii_fail(machine, IR_INTERP_TRAP, "hidden return slot out of bounds");
+    return 0;
+  }
+  if (sbuf) {
+    memmove(dbuf->data + to_off, sbuf->data + from_off, (size_t)size);
+    if (dbuf->init_map && sbuf->init_map) {
+      memmove(dbuf->init_map + to_off, sbuf->init_map + from_off, (size_t)size);
+    } else {
+      ii_mark_bytes(dbuf, to_off, size, 1);
+    }
+  } else if (ii_aggregate_value_is_bytes(machine, result, size, inline_bytes)) {
+    memcpy(dbuf->data + to_off, inline_bytes, (size_t)size);
+    ii_mark_bytes(dbuf, to_off, size, 1);
+  } else {
+    ii_fail(machine, IR_INTERP_TRAP, "returned aggregate out of bounds / after free");
+    return 0;
+  }
+  *result = *slot;
+  return 1;
+}
+
 static int ii_op_call_indirect(IRInterpMachine *machine, IIFrame *frame,
                                 const IRInstruction *insn) {
   IRInterpValue target;
@@ -5637,13 +5679,18 @@ static int ii_op_call_indirect(IRInterpMachine *machine, IIFrame *frame,
       machine, (unsigned long long)ii_as_int(&target), &extern_name);
   IRInterpValue call_result = ii_int_value(0);
   if (callee && callee->instruction_count > 0) {
+    size_t lead = call_arg_count == callee->parameter_count + 1 ? 1 : 0;
     if (callee->name &&
-        !ii_copy_aggregate_args(machine, frame, callee->name, call_args,
-                                call_arg_count)) {
+        !ii_copy_aggregate_args(machine, frame, callee->name, call_args + lead,
+                                call_arg_count - lead)) {
       return 0;
     }
-    if (!ii_exec_function(machine, callee, call_args, call_arg_count,
-                          &call_result)) {
+    if (!ii_exec_function(machine, callee, call_args + lead,
+                          call_arg_count - lead, &call_result)) {
+      return 0;
+    }
+    if (lead && !ii_store_hidden_return(machine, callee, &call_args[0],
+                                        &call_result)) {
       return 0;
     }
   } else if (extern_name) {

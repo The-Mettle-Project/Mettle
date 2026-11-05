@@ -1,0 +1,60 @@
+import "std/io";
+struct S { a: int32; s: string; b: float64; c: uint8[3]; }
+struct S3 { a: int8; b: int8; c: int8; }
+struct S16 { a: int64; b: int64; }
+var fails: int32 = 0;
+var g_value: S;
+var g_array: S[3];
+enum W { Hold(S), Other(int32), Nothing }
+fn make() -> S { var r: S; r.a = 7; r.s = "hey"; r.b = 1.5; r.c[1] = (uint8)9; return r; }
+fn ok(v: S) -> int32 { if (v.a == 7 && v.s == "hey" && v.b == 1.5 && v.c[1] == (uint8)9) { return 0; } return 1; }
+fn pass(v: S) -> S { return v; }
+fn pass_after(a: int32, b: float64, v: S, c: int8) -> S { return v; }
+fn through_local(v: S) -> S { var l: S = v; var m: S; m = l; return m; }
+fn through_ptr(p: S*) -> S { var l: S = *p; return l; }
+fn store_ptr(p: S*, v: S) { *p = v; }
+fn store_elem(p: S*, i: int32, v: S) { p[i] = v; }
+fn wrap(v: S) -> W { return Hold(v); }
+fn unwrap(w: W) -> S { var d: S; match (w) { case Hold(v): { return v; } case Other(o): { fails = 1; } case Nothing: { fails = 2; } } return d; }
+fn pair() -> (S, int32) { return (make(), 5); }
+fn id<T>(x: T) -> T { return x; }
+fn sel(c: bool, a: S, b: S) -> S { if (c) { return a; } return b; }
+fn val_if(c: bool, a: S) -> S { var d: S; var r: S = if c { a } else { d }; return r; }
+fn val_match(k: int32, a: S) -> S { var d: S; return switch (k) { case 1: a, default: d, }; }
+fn recurse(n: int32, v: S) -> S { if (n == 0) { return v; } return recurse(n - 1, v); }
+fn deferred(v: S, out: S*) -> S { defer { *out = v; } return v; }
+struct Box { pre: uint8; v: S; post: uint8; }
+fn boxed(v: S) -> Box { var b: Box; b.pre = (uint8)11; b.v = v; b.post = (uint8)22; return b; }
+fn indirect(f: fn(S) -> S, v: S) -> S { return f(v); }
+fn closed(v: S) -> Fn() -> S { return fn() -> S { return v; }; }
+fn lam(v: S) -> S { var f: Fn(S) -> S = fn(x: S) -> S { return x; }; return f(v); }
+fn tiny(v: S3) -> S3 { return v; }
+fn itiny(f: fn(S3) -> S3, v: S3) -> S3 { return f(v); }
+
+@test fn t_direct() -> int32 { var a = make(); return ok(a); }
+@test fn t_pass() -> int32 { var a = make(); return ok(pass(a)); }
+@test fn t_pass2() -> int32 { var a = make(); return ok(pass(pass(a))); }
+@test fn t_after() -> int32 { var a = make(); return ok(pass_after(1, 1.5, a, (int8)2)); }
+@test fn t_local() -> int32 { var a = make(); return ok(through_local(a)); }
+@test fn t_ptr() -> int32 { var a = make(); return ok(through_ptr(&a)); }
+@test fn t_store() -> int32 { var a = make(); var b: S; store_ptr(&b, a); return ok(b); }
+@test fn t_elem() -> int32 { var a = make(); var arr: S[4]; store_elem(&arr[0], 2, a); arr[3] = arr[2]; return ok(arr[3]); }
+@test fn t_global() -> int32 { var a = make(); g_value = a; var c = g_value; return ok(g_value) + ok(c); }
+@test fn t_garray() -> int32 { g_array[1] = make(); g_array[2] = g_array[1]; return ok(g_array[2]); }
+@test fn t_enum() -> int32 { var a = make(); return ok(unwrap(wrap(a))); }
+@test fn t_enumarr() -> int32 { var a = make(); var w: W[2]; w[1] = wrap(a); return ok(unwrap(w[1])); }
+@test fn t_tuple() -> int32 { var pa: S; var pn: int32 = 0; (pa, pn) = pair(); return ok(pa) + pn - 5; }
+@test fn t_generic() -> int32 { var a = make(); return ok(id(a)); }
+@test fn t_sel() -> int32 { var a = make(); var d: S; return ok(sel(true, a, d)); }
+@test fn t_valif() -> int32 { var a = make(); return ok(val_if(true, a)); }
+@test fn t_valmatch() -> int32 { var a = make(); return ok(val_match(1, a)); }
+@test fn t_recurse() -> int32 { var a = make(); return ok(recurse(3, a)); }
+@test fn t_defer() -> int32 { var a = make(); var de: S; var dr = deferred(a, &de); return ok(dr) + ok(de); }
+@test fn t_box() -> int32 { var a = make(); var bx = boxed(a); return ok(bx.v) + (int32)bx.pre - 11 + (int32)bx.post - 22; }
+@test fn t_boxarr() -> int32 { var a = make(); var bxs: Box[2]; bxs[0] = boxed(a); bxs[1].pre = (uint8)11; bxs[1].v = bxs[0].v; bxs[1].post = bxs[0].post; return ok(bxs[1].v); }
+@test fn t_indirect() -> int32 { var a = make(); return ok(indirect(pass, a)); }
+@test fn t_closure() -> int32 { var a = make(); var cl = closed(a); return ok(cl()); }
+@test fn t_lambda() -> int32 { var a = make(); return ok(lam(a)); }
+@test fn t_tiny() -> int32 { var v: S3; v.b = (int8)3; var r: S3 = tiny(v); return (int32)r.b - 3; }
+@test fn t_itiny() -> int32 { var v: S3; v.b = (int8)3; var r: S3 = itiny(tiny, v); return (int32)r.b - 3; }
+fn main() -> int32 { return 0; }

@@ -11,69 +11,208 @@ typedef struct {
   size_t count;
 } SafetyPlainStorage;
 
-static const IRInstruction *safety_plain_definition(const IRFunction *fn,
-                                                   const IROperand *value) {
-  const IRInstruction *found = NULL;
-  if ((value->kind != IR_OPERAND_TEMP && value->kind != IR_OPERAND_SYMBOL) ||
-      !value->name) return NULL;
-  for (size_t i = 0; i < fn->instruction_count; i++) {
+typedef struct {
+  const char *name;
+  int kind;
+  int first_def;
+  int def_count;
+  SafetyPlainArray *array;
+  int root_known;
+  SafetyPlainArray *root;
+} SafetyPlainName;
+
+typedef struct {
+  const IRFunction *fn;
+  SafetyPlainName *names;
+  size_t mask;
+  int *next_def;
+} SafetyPlainIndex;
+
+static SafetyPlainIndex *g_safety_plain_index = NULL;
+static size_t g_safety_plain_index_size = 0;
+
+static void safety_plain_index_drop(void) {
+  for (size_t w = 0; w < g_safety_plain_index_size; w++) {
+    SafetyPlainIndex *index = &g_safety_plain_index[w];
+    for (size_t n = 0; index->names && n <= index->mask; n++) {
+      free((char *)index->names[n].name);
+    }
+    free(index->names);
+    free(index->next_def);
+  }
+  free(g_safety_plain_index);
+  g_safety_plain_index = NULL;
+  g_safety_plain_index_size = 0;
+}
+
+static SafetyPlainName *safety_plain_name_slot(const SafetyPlainIndex *index,
+                                               int kind, const char *name) {
+  size_t at = mettle_fnv1a_hash(name) & index->mask;
+  while (index->names[at].name &&
+         !(index->names[at].kind == kind && !strcmp(index->names[at].name, name))) {
+    at = (at + 1) & index->mask;
+  }
+  return &index->names[at];
+}
+
+static const SafetyPlainIndex *safety_plain_index_of(SafetyPlainStorage *state,
+                                                     const IRFunction *fn) {
+  SafetyPlainIndex *index;
+  size_t size = 16;
+  size_t arrays_here = 0;
+  if (!g_safety_plain_index) {
+    size_t ways = 16;
+    while (ways < (state->program->function_count + 1) * 2) ways *= 2;
+    g_safety_plain_index = calloc(ways, sizeof(*g_safety_plain_index));
+    if (!g_safety_plain_index) return NULL;
+    g_safety_plain_index_size = ways;
+  }
+  {
+    size_t at = (((uintptr_t)fn) >> 4) & (g_safety_plain_index_size - 1);
+    while (g_safety_plain_index[at].fn && g_safety_plain_index[at].fn != fn) {
+      at = (at + 1) & (g_safety_plain_index_size - 1);
+    }
+    index = &g_safety_plain_index[at];
+  }
+  if (index->fn == fn) return index;
+  for (size_t a = 0; a < state->count; a++) arrays_here += state->arrays[a].scope == fn;
+  while (size < (fn->instruction_count + fn->parameter_count + arrays_here + 1) * 2) size *= 2;
+  index->names = calloc(size, sizeof(*index->names));
+  index->next_def = malloc((fn->instruction_count + 1) * sizeof(*index->next_def));
+  if (!index->names || !index->next_def) {
+    free(index->names);
+    free(index->next_def);
+    memset(index, 0, sizeof(*index));
+    return NULL;
+  }
+  index->mask = size - 1;
+  for (size_t i = fn->instruction_count; i-- > 0;) {
     const IRInstruction *in = &fn->instructions[i];
-    if (in->op != IR_OP_DECLARE_LOCAL && ir_instruction_writes_destination(in) &&
-        safety_operand_same(&in->dest, value)) {
-      if (found) return NULL;
-      found = in;
+    if (in->op == IR_OP_DECLARE_LOCAL || !ir_instruction_writes_destination(in) ||
+        !in->dest.name || (in->dest.kind != IR_OPERAND_TEMP &&
+                           in->dest.kind != IR_OPERAND_SYMBOL)) continue;
+    SafetyPlainName *slot = safety_plain_name_slot(index, in->dest.kind, in->dest.name);
+    if (!slot->name) {
+      slot->name = mettle_strdup(in->dest.name);
+      slot->kind = in->dest.kind;
+      slot->first_def = -1;
+    }
+    index->next_def[i] = slot->first_def;
+    slot->first_def = (int)i;
+    slot->def_count++;
+  }
+  for (size_t a = 0; a < state->count; a++) {
+    const IROperand *root = state->arrays[a].root;
+    if (state->arrays[a].scope != fn || !root || !root->name) continue;
+    SafetyPlainName *slot = safety_plain_name_slot(index, root->kind, root->name);
+    if (!slot->name) {
+      slot->name = mettle_strdup(root->name);
+      slot->kind = root->kind;
+      slot->first_def = -1;
+    }
+    if (!slot->array) slot->array = &state->arrays[a];
+  }
+  index->fn = fn;
+  return index;
+}
+
+static const SafetyPlainName *safety_plain_lookup(SafetyPlainStorage *state,
+                                                  const IRFunction *fn,
+                                                  const IROperand *value,
+                                                  const SafetyPlainIndex **out) {
+  const SafetyPlainIndex *index = safety_plain_index_of(state, fn);
+  const SafetyPlainName *slot;
+  *out = index;
+  if (!index || !value->name ||
+      (value->kind != IR_OPERAND_TEMP && value->kind != IR_OPERAND_SYMBOL)) {
+    return NULL;
+  }
+  slot = safety_plain_name_slot(index, value->kind, value->name);
+  return slot->name ? slot : NULL;
+}
+
+static const IRInstruction *safety_plain_definition(SafetyPlainStorage *state,
+                                                   const IRFunction *fn,
+                                                   const IROperand *value) {
+  const SafetyPlainIndex *index = NULL;
+  const SafetyPlainName *slot = safety_plain_lookup(state, fn, value, &index);
+  if (!slot || slot->def_count != 1) return NULL;
+  return &fn->instructions[slot->first_def];
+}
+
+static SafetyPlainArray *safety_plain_root(SafetyPlainStorage *state,
+    const IRFunction *fn, const IROperand *value, int depth);
+
+static SafetyPlainArray *safety_plain_parameter_root(SafetyPlainStorage *state,
+    const IRFunction *fn, const IROperand *value, size_t p, int depth) {
+  const IRModuleSymbol *decl = ir_program_lookup_symbol(state->program, fn->name);
+  if (decl && decl->is_exported) return NULL;
+  for (size_t s = 0; s < state->program->module_symbol_count; s++) {
+    const IRModuleSymbol *symbol = &state->program->module_symbols[s];
+    if (symbol->init_symbol_ref && !strcmp(symbol->init_symbol_ref, fn->name))
+      return NULL;
+    for (size_t r = 0; r < symbol->init_reloc_count; r++)
+      if (symbol->init_relocs[r].symbol &&
+          !strcmp(symbol->init_relocs[r].symbol, fn->name)) return NULL;
+  }
+  SafetyPlainArray *result = NULL;
+  for (size_t f = 0; f < state->program->function_count; f++) {
+    const IRFunction *caller = state->program->functions[f];
+    for (size_t i = 0; i < caller->instruction_count; i++) {
+      const IRInstruction *call = &caller->instructions[i];
+      if (call->op == IR_OP_ADDRESS_OF && call->lhs.name &&
+          !strcmp(call->lhs.name, fn->name) &&
+          (!call->dest.name || strncmp(call->dest.name, ".safe", 5))) return NULL;
+      if (call->op != IR_OP_CALL || !call->text || strcmp(call->text, fn->name))
+        continue;
+      if (p >= call->argument_count) return NULL;
+      SafetyPlainArray *argument = safety_plain_root(state, caller,
+          &call->arguments[p], depth + 1);
+      if (!argument || (result && result != argument)) return NULL;
+      result = argument;
     }
   }
-  return found;
+  (void)value;
+  return result;
 }
 
 static SafetyPlainArray *safety_plain_root(SafetyPlainStorage *state,
     const IRFunction *fn, const IROperand *value, int depth) {
+  const SafetyPlainIndex *index = NULL;
+  const SafetyPlainName *known = NULL;
   if (depth > 32) return NULL;
-  for (size_t a = 0; a < state->count; a++)
-    if (state->arrays[a].scope == fn && state->arrays[a].root &&
-        safety_operand_same(state->arrays[a].root, value)) return &state->arrays[a];
+  known = safety_plain_lookup(state, fn, value, &index);
+  if (known && known->array) return known->array;
   if (value->kind == IR_OPERAND_SYMBOL && value->name) {
     for (size_t p = 0; p < fn->parameter_count; p++) {
       if (strcmp(fn->parameter_names[p], value->name)) continue;
-      for (size_t i = 0; i < fn->instruction_count; i++)
-        if (ir_instruction_writes_destination(&fn->instructions[i]) &&
-            safety_operand_same(&fn->instructions[i].dest, value)) return NULL;
-      const IRModuleSymbol *decl = ir_program_lookup_symbol(state->program, fn->name);
-      if (decl && decl->is_exported) return NULL;
-      for (size_t s = 0; s < state->program->module_symbol_count; s++) {
-        const IRModuleSymbol *symbol = &state->program->module_symbols[s];
-        if (symbol->init_symbol_ref && !strcmp(symbol->init_symbol_ref, fn->name))
-          return NULL;
-        for (size_t r = 0; r < symbol->init_reloc_count; r++)
-          if (symbol->init_relocs[r].symbol &&
-              !strcmp(symbol->init_relocs[r].symbol, fn->name)) return NULL;
-      }
-      SafetyPlainArray *result = NULL;
-      for (size_t f = 0; f < state->program->function_count; f++) {
-        const IRFunction *caller = state->program->functions[f];
-        for (size_t i = 0; i < caller->instruction_count; i++) {
-          const IRInstruction *call = &caller->instructions[i];
-          if (call->op == IR_OP_ADDRESS_OF && call->lhs.name &&
-              !strcmp(call->lhs.name, fn->name) &&
-              (!call->dest.name || strncmp(call->dest.name, ".safe", 5))) return NULL;
-          if (call->op != IR_OP_CALL || !call->text || strcmp(call->text, fn->name))
-            continue;
-          if (p >= call->argument_count) return NULL;
-          SafetyPlainArray *argument = safety_plain_root(state, caller,
-              &call->arguments[p], depth + 1);
-          if (!argument || (result && result != argument)) return NULL;
-          result = argument;
+      if (known && known->def_count > 0) return NULL;
+      {
+        SafetyPlainName *slot = index ? safety_plain_name_slot(index, value->kind,
+                                                               value->name)
+                                      : NULL;
+        SafetyPlainArray *found;
+        if (slot && slot->name && slot->root_known) return slot->root;
+        found = safety_plain_parameter_root(state, fn, value, p, depth);
+        if (slot && !slot->name) {
+          slot->name = mettle_strdup(value->name);
+          slot->kind = value->kind;
+          slot->first_def = -1;
         }
+        if (slot) {
+          slot->root_known = 1;
+          slot->root = found;
+        }
+        return found;
       }
-      return result;
+      const IRModuleSymbol *decl = ir_program_lookup_symbol(state->program, fn->name);
     }
     if (!ir_function_find_declaration(fn, value->name, 1))
       for (size_t a = 0; a < state->count; a++)
         if (state->arrays[a].symbol &&
             !strcmp(value->name, state->arrays[a].symbol->name)) return &state->arrays[a];
   }
-  const IRInstruction *in = safety_plain_definition(fn, value);
+  const IRInstruction *in = safety_plain_definition(state, fn, value);
   if (!in) return NULL;
   if (in->op == IR_OP_ADDRESS_OF && in->lhs.kind == IR_OPERAND_SYMBOL)
     return safety_plain_root(state, fn, &in->lhs, depth + 1);
@@ -108,14 +247,14 @@ static int safety_plain_literal_bytes(SafetyPlainStorage *state,
     const IRFunction *fn, const IROperand *value, int depth) {
   if (!value || depth > 32) return 0;
   if (value->kind == IR_OPERAND_STRING) return 1;
-  const IRInstruction *in = safety_plain_definition(fn, value);
+  const IRInstruction *in = safety_plain_definition(state, fn, value);
   if (!in) return 0;
   if (in->op == IR_OP_ASSIGN || in->op == IR_OP_CAST ||
       (in->op == IR_OP_BINARY && in->text && !strcmp(in->text, "+")))
     return safety_plain_literal_bytes(state, fn, &in->lhs, depth + 1);
   if (in->op != IR_OP_LOAD || in->rhs.kind != IR_OPERAND_INT ||
       in->rhs.int_value != 8 || in->lhs.kind != IR_OPERAND_SYMBOL) return 0;
-  const IRInstruction *source = safety_plain_definition(fn, &in->lhs);
+  const IRInstruction *source = safety_plain_definition(state, fn, &in->lhs);
   if (source) return source->op == IR_OP_ASSIGN &&
       source->lhs.kind == IR_OPERAND_STRING;
   const IRModuleSymbol *symbol =
@@ -148,7 +287,7 @@ static int safety_plain_allowed_use(SafetyPlainStorage *state,
     const IRInstruction *in, int position) {
   if (safety_plain_reads_value_only(in)) return 1;
   if (in->op == IR_OP_ADDRESS_OF) return position == 1 &&
-      safety_plain_definition(fn, &in->dest) == in;
+      safety_plain_definition(state, fn, &in->dest) == in;
   if (in->op == IR_OP_SAFETY_CHECK) return position == 3;
   if (in->op == IR_OP_LOAD) return position == 1;
   if (in->op == IR_OP_STORE) return position == 0 &&
@@ -156,7 +295,7 @@ static int safety_plain_allowed_use(SafetyPlainStorage *state,
       in->rhs.int_value <= 8;
   if ((in->op == IR_OP_ASSIGN || in->op == IR_OP_CAST ||
        (in->op == IR_OP_BINARY && in->text && !strcmp(in->text, "+"))) &&
-      position == 1) return safety_plain_definition(fn, &in->dest) == in;
+      position == 1) return safety_plain_definition(state, fn, &in->dest) == in;
   if (in->op != IR_OP_CALL || !in->text || position < 3) return 0;
   IRFunction *callee = ir_program_find_function(state->program, in->text);
   if (callee && (size_t)(position - 3) < callee->parameter_count) {
@@ -199,11 +338,10 @@ static int safety_plain_tainted(SafetyPlainStorage *state,
     if (safety_operand_same(path[i], value)) return 0;
   path[depth] = value;
   int found = 0;
-  for (size_t i = 0; i < fn->instruction_count; i++) {
-    const IRInstruction *in = &fn->instructions[i];
-    if (!ir_instruction_writes_destination(in) ||
-        !safety_operand_same(&in->dest, value) || in->op == IR_OP_DECLARE_LOCAL)
-      continue;
+  const SafetyPlainIndex *index = NULL;
+  const SafetyPlainName *defs = safety_plain_lookup(state, fn, value, &index);
+  for (int at = defs ? defs->first_def : -1; at >= 0; at = index->next_def[at]) {
+    const IRInstruction *in = &fn->instructions[at];
     found = 1;
     if (in->op == IR_OP_ASSIGN) {
       if (safety_plain_tainted(state, fn, &in->lhs, path, depth + 1)) return 1;
@@ -232,17 +370,85 @@ static int safety_plain_read_intrinsic(const IRInstruction *in) {
        !strcmp(in->text, "mettle_safety_subtract_identity"));
 }
 
-static int safety_plain_value_used(const IRFunction *fn, const IROperand *value) {
+typedef struct {
+  const char *name;
+  int kind;
+  int uses;
+  int writes;
+} SafetyPlainCount;
+
+static SafetyPlainCount *safety_plain_count_slot(SafetyPlainCount *table, size_t mask,
+                                                 const IROperand *value) {
+  size_t at;
+  if (!value->name ||
+      (value->kind != IR_OPERAND_TEMP && value->kind != IR_OPERAND_SYMBOL)) {
+    return NULL;
+  }
+  at = mettle_fnv1a_hash(value->name) & mask;
+  while (table[at].name && !(table[at].kind == (int)value->kind &&
+                             !strcmp(table[at].name, value->name))) {
+    at = (at + 1) & mask;
+  }
+  if (!table[at].name) {
+    table[at].name = mettle_strdup(value->name);
+    table[at].kind = value->kind;
+  }
+  return &table[at];
+}
+
+static void safety_plain_count_reads(SafetyPlainCount *table, size_t mask,
+                                     const IRInstruction *in, int delta) {
+  const IROperand *fixed[3] = {&in->lhs, &in->rhs,
+                               in->op == IR_OP_STORE ? &in->dest : NULL};
+  for (int k = 0; k < 3; k++) {
+    SafetyPlainCount *slot =
+        fixed[k] ? safety_plain_count_slot(table, mask, fixed[k]) : NULL;
+    if (slot) slot->uses += delta;
+  }
+  for (size_t a = 0; a < in->argument_count; a++) {
+    SafetyPlainCount *slot = safety_plain_count_slot(table, mask, &in->arguments[a]);
+    if (slot) slot->uses += delta;
+  }
+}
+
+static int safety_plain_drop_dead_origins(IRFunction *fn) {
+  size_t size = 16;
+  while (size < (fn->instruction_count + 1) * 8) size *= 2;
+  SafetyPlainCount *table = calloc(size, sizeof(*table));
+  size_t mask = size - 1;
+  int changed;
+  if (!table) return 0;
   for (size_t i = 0; i < fn->instruction_count; i++) {
     const IRInstruction *in = &fn->instructions[i];
     if (in->op == IR_OP_NOP) continue;
-    if (safety_operand_same(&in->lhs, value) ||
-        safety_operand_same(&in->rhs, value) ||
-        (in->op == IR_OP_STORE && safety_operand_same(&in->dest, value))) return 1;
-    for (size_t a = 0; a < in->argument_count; a++)
-      if (safety_operand_same(&in->arguments[a], value)) return 1;
+    safety_plain_count_reads(table, mask, in, 1);
+    if (in->op != IR_OP_DECLARE_LOCAL && ir_instruction_writes_destination(in)) {
+      SafetyPlainCount *slot = safety_plain_count_slot(table, mask, &in->dest);
+      if (slot) slot->writes++;
+    }
   }
-  return 0;
+  do {
+    changed = 0;
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      IRInstruction *in = &fn->instructions[i];
+      SafetyPlainCount *slot;
+      if (!in->dest.name || strncmp(in->dest.name, ".safe", 5)) continue;
+      if (in->op != IR_OP_ASSIGN && in->op != IR_OP_DECLARE_LOCAL &&
+          !safety_plain_read_intrinsic(in)) continue;
+      slot = safety_plain_count_slot(table, mask, &in->dest);
+      if (!slot || slot->uses != 0 ||
+          (in->op == IR_OP_DECLARE_LOCAL && slot->writes != 0)) continue;
+      safety_plain_count_reads(table, mask, in, -1);
+      if (in->op != IR_OP_DECLARE_LOCAL) slot->writes--;
+      ir_instruction_make_nop(in);
+      changed = 1;
+    }
+  } while (changed);
+  for (size_t n = 0; n < size; n++) {
+    free((char *)table[n].name);
+  }
+  free(table);
+  return 1;
 }
 
 static int safety_fold_identity_arithmetic(IRFunction *fn) {
@@ -317,20 +523,21 @@ static int safety_simplify_plain_storage(IRProgram *program) {
           (!strcmp(in->text, "malloc") || !strcmp(in->text, "calloc") ||
            !strcmp(in->text, "mettle_heap_alloc") ||
            !strcmp(in->text, "mettle_heap_calloc")) &&
-          safety_plain_definition(fn, &in->dest) == in;
+          safety_plain_definition(&state, fn, &in->dest) == in;
       if (local || allocation) {
         state.arrays[state.count].scope = fn;
         state.arrays[state.count++].root = &in->dest;
       }
     }
   }
+  safety_plain_index_drop();
   for (size_t f = 0; f < program->function_count; f++) {
     const IRFunction *fn = program->functions[f];
     for (size_t i = 0; i < fn->instruction_count; i++) {
       const IRInstruction *in = &fn->instructions[i];
       if (in->op == IR_OP_INLINE_ASM) {
         safety_trace("plain storage analysis keeps origins around assembly", in->location.line);
-        free(state.arrays);
+        safety_plain_index_drop(); free(state.arrays);
         return 1;
       }
       const IROperand *values[3] = {&in->dest, &in->lhs, &in->rhs};
@@ -410,7 +617,7 @@ static int safety_simplify_plain_storage(IRProgram *program) {
       SafetyPlainArray *array = safety_plain_root(&state, fn, &in->arguments[0], 0);
       if (!array || array->rejected) continue;
       IROperand dest = ir_operand_none();
-      if (load && !ir_operand_clone(&in->dest, &dest)) { free(state.arrays); return 0; }
+      if (load && !ir_operand_clone(&in->dest, &dest)) { safety_plain_index_drop(); free(state.arrays); return 0; }
       ir_instruction_make_nop(in);
       if (load) {
         in->op = IR_OP_ASSIGN;
@@ -424,7 +631,7 @@ static int safety_simplify_plain_storage(IRProgram *program) {
       if (!safety_plain_read_intrinsic(in) ||
           safety_plain_tainted(&state, fn, &in->dest, path, 0)) continue;
       IROperand dest = ir_operand_none();
-      if (!ir_operand_clone(&in->dest, &dest)) { free(state.arrays); return 0; }
+      if (!ir_operand_clone(&in->dest, &dest)) { safety_plain_index_drop(); free(state.arrays); return 0; }
       ir_instruction_make_nop(in);
       in->op = IR_OP_ASSIGN;
       in->dest = dest;
@@ -444,34 +651,16 @@ static int safety_simplify_plain_storage(IRProgram *program) {
       }
     }
     if (safety_fold_identity_arithmetic(fn) < 0) {
-      free(state.arrays);
+      safety_plain_index_drop(); free(state.arrays);
       return 0;
     }
+    safety_plain_index_drop();
 
-    do {
-      changed = 0;
-      for (size_t i = 0; i < fn->instruction_count; i++) {
-        IRInstruction *in = &fn->instructions[i];
-        if (!in->dest.name || strncmp(in->dest.name, ".safe", 5)) continue;
-        if (in->op != IR_OP_ASSIGN && in->op != IR_OP_DECLARE_LOCAL &&
-            !safety_plain_read_intrinsic(in)) continue;
-        if (in->op == IR_OP_DECLARE_LOCAL) {
-          int written = 0;
-          for (size_t w = 0; w < fn->instruction_count; w++)
-            if (w != i && ir_instruction_writes_destination(&fn->instructions[w]) &&
-                safety_operand_same(&fn->instructions[w].dest, &in->dest)) {
-              written = 1;
-              break;
-            }
-          if (written) continue;
-        }
-        if (!safety_plain_value_used(fn, &in->dest)) {
-          ir_instruction_make_nop(in);
-          changed = 1;
-        }
-      }
-    } while (changed);
+    if (!safety_plain_drop_dead_origins(fn)) {
+      safety_plain_index_drop(); free(state.arrays);
+      return 0;
+    }
   }
-  free(state.arrays);
+  safety_plain_index_drop(); free(state.arrays);
   return 1;
 }

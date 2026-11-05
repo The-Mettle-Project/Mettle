@@ -208,7 +208,7 @@ int ir_trace_record_instrument(IRProgram *program, size_t *out_sites) {
   register_helper(program, "mettle_trace_flush", 0, 0);
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *fn = program->functions[i];
-    if (!fn) {
+    if (!fn || fn->is_naked) {
       continue;
     }
     if (!instrument_one(fn, &sites)) {

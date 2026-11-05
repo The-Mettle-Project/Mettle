@@ -1,5 +1,7 @@
 #include "ir_lowering_internal.h"
 
+#include <limits.h>
+
 void ir_local_scope_enter(IRLoweringContext *context) {
   if (context) {
     context->local_scope_depth++;
@@ -508,6 +510,47 @@ int ir_emit_overflow_check_narrow(IRLoweringContext *context,
   }
 }
 
+static int ir_emit_check_binary(IRLoweringContext *context, IRFunction *function,
+                                SourceLocation location, const IROperand *dest,
+                                const char *op, const IROperand *left,
+                                const IROperand *right) {
+  IRInstruction in = {0};
+  int ok;
+  in.op = IR_OP_BINARY;
+  in.location = location;
+  in.dest = *dest;
+  in.lhs = ir_operand_copy(left);
+  in.rhs = ir_operand_copy(right);
+  in.text = (char *)op;
+  ok = ir_emit(context, function, &in);
+  ir_operand_destroy(&in.lhs);
+  ir_operand_destroy(&in.rhs);
+  return ok;
+}
+
+static int ir_emit_check_binary_int(IRLoweringContext *context,
+                                    IRFunction *function,
+                                    SourceLocation location,
+                                    const IROperand *dest, const char *op,
+                                    const IROperand *left, long long right) {
+  IROperand constant = ir_operand_int(right);
+  return ir_emit_check_binary(context, function, location, dest, op, left,
+                              &constant);
+}
+
+static int ir_emit_check_branch_zero(IRLoweringContext *context,
+                                     IRFunction *function,
+                                     SourceLocation location,
+                                     const IROperand *condition,
+                                     const char *label) {
+  IRInstruction in = {0};
+  in.op = IR_OP_BRANCH_ZERO;
+  in.location = location;
+  in.lhs = *condition;
+  in.text = (char *)label;
+  return ir_emit(context, function, &in);
+}
+
 int ir_emit_overflow_check_wide(IRLoweringContext *context,
                                 IRFunction *function, SourceLocation location,
                                 const IROperand *result, const IROperand *left,
@@ -533,30 +576,41 @@ int ir_emit_overflow_check_wide(IRLoweringContext *context,
     return 0;
   }
   if (multiply) {
-    one.op = IR_OP_BINARY;
-    one.location = location;
-    one.dest = a;
-    one.lhs = ir_operand_copy(left);
-    one.rhs = ir_operand_int(0);
-    one.text = "==";
-    two.op = IR_OP_BINARY;
-    two.location = location;
-    two.dest = b;
-    two.lhs = ir_operand_copy(result);
-    two.rhs = ir_operand_copy(left);
-    two.text = "/";
-    three.op = IR_OP_BINARY;
-    three.location = location;
-    three.dest = c;
-    three.lhs = b;
-    three.rhs = ir_operand_copy(right);
-    three.text = "==";
-    test.op = IR_OP_BINARY;
-    test.location = location;
-    test.dest = holds;
-    test.lhs = a;
-    test.rhs = c;
-    test.text = "|";
+    IROperand zero_left = ir_operand_none();
+    IROperand minus_one_left = ir_operand_none();
+    char *done = ir_new_label_name(context, "mul_check_done");
+    int ok = done && ir_make_temp_operand(context, &zero_left) &&
+             ir_make_temp_operand(context, &minus_one_left) &&
+             ir_emit_check_binary(context, function, location, &holds, "==",
+                                  left, left) &&
+             ir_emit_check_binary_int(context, function, location, &zero_left,
+                                      "!=", left, 0) &&
+             ir_emit_check_branch_zero(context, function, location, &zero_left,
+                                       done) &&
+             ir_emit_check_binary_int(context, function, location,
+                                      &minus_one_left, "!=", left, -1) &&
+             ir_emit_check_binary_int(context, function, location, &holds, "!=",
+                                      right, LLONG_MIN) &&
+             ir_emit_check_branch_zero(context, function, location,
+                                       &minus_one_left, done) &&
+             ir_emit_check_binary(context, function, location, &b, "/", result,
+                                  left) &&
+             ir_emit_check_binary(context, function, location, &holds, "==", &b,
+                                  right) &&
+             ir_emit_label_instruction(context, function, done, location);
+    free(done);
+    ir_operand_destroy(&zero_left);
+    ir_operand_destroy(&minus_one_left);
+    if (!ok) {
+      ir_operand_destroy(&holds);
+      return 0;
+    }
+    snprintf(message, sizeof(message),
+             "Fatal error: signed '%s' overflowed %s", op,
+             type_name ? type_name : "its type");
+    ok = ir_emit_overflow_trap(context, function, location, &holds, message);
+    ir_operand_destroy(&holds);
+    return ok;
   } else {
     int adding = strcmp(op, "+") == 0;
     one.op = IR_OP_BINARY;

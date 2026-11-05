@@ -246,7 +246,9 @@ void mettle_safety_value_clear(void *destination, uint64_t size) {
 
 void mettle_safety_free_identity(void *pointer, uint64_t identity) {
   if (!pointer) return;
-  if (identity == SAFETY_IDENTITY_MIXED) identity = mettle_safety_identity(pointer);
+  if (identity == SAFETY_IDENTITY_MIXED || !identity) {
+    identity = mettle_safety_identity(pointer);
+  }
   if (!identity) {
     safety_internal_failure("Fatal error: free has no tracked allocation identity");
   }

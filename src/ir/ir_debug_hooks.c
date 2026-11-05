@@ -10,7 +10,8 @@ static size_t g_dbg_temp_counter = 0;
 
 static int ir_dbg_should_instrument(const IRFunction *function) {
   const char *name = NULL;
-  if (!function || !function->name || function->instruction_count == 0) {
+  if (!function || !function->name || function->instruction_count == 0 ||
+      function->is_naked) {
     return 0;
   }
   name = function->name;
