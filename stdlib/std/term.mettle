@@ -1,7 +1,42 @@
-// Terminal basics: is a descriptor a terminal, and turning echo off for a
-// password prompt. fd 0 is standard input, 1 output, 2 error.
+// Terminals: is a descriptor a terminal, echo off for a password prompt, raw
+// mode, the window size, and terminal signals as a descriptor. fd 0 is
+// standard input, 1 output, 2 error.
+//
+// term_raw_begin(fd) saves the terminal's settings and turns on raw mode:
+// bytes arrive one at a time, with no echo, line editing, Ctrl-C signal or
+// output translation. term_raw_end(fd) puts the saved settings back. Both
+// return 0 or a negative error code. On Windows raw mode also turns on VT
+// input, so keys arrive as the same escape sequences as on a POSIX terminal.
+//
+// term_size(fd, &cols, &rows) reads the window size in character cells, and
+// returns 0 or a negative error code.
 
 import "std/term_os";
+import "std/process";
+
+export const TERM_SIGHUP = 1;
+export const TERM_SIGTERM = 15;
+export const TERM_SIGWINCH = 28;
+
+// Blocks the given signals (for example TERM_SIGWINCH, TERM_SIGINT and
+// TERM_SIGTERM) and returns a descriptor that becomes readable when one
+// arrives; poll it with the terminal input. Call it before starting threads.
+// Returns the descriptor or a negative error code; Windows has no signals
+// and returns -ENOSYS.
+export fn term_signal_fd(signals: int32[..]) -> int64 {
+  return proc_signal_fd(signals);
+}
+
+// Returns the next signal number from the descriptor, waiting for one, or a
+// negative error code.
+export fn term_signal_next(fd: int64) -> int32 {
+  return proc_signal_read(fd);
+}
+
+// Closes the descriptor and unblocks the same signals.
+export fn term_signal_end(fd: int64, signals: int32[..]) {
+  proc_signal_release(fd, signals);
+}
 
 // Writes prompt to standard error, reads one line from standard input with
 // echo off, and turns echo back on. The line goes into buf without its line

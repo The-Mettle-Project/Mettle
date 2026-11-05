@@ -438,6 +438,9 @@ Each wrapper returns the kernel's raw result: a count or value, or `-errno`.
 | `linux_lseek(fd, offset, whence) -> int64` | `lseek` |
 | `linux_getpid()`, `linux_gettid() -> int64` | `getpid`, `gettid` |
 | `linux_kill(pid, sig) -> int64` | `kill` |
+| `linux_ioctl(fd, req, arg: rawptr) -> int64` | `ioctl` |
+| `linux_rt_sigprocmask(how, set: uint64*, old: uint64*) -> int64` | `rt_sigprocmask`; signal n is bit n-1, and `set` or `old` may be 0 |
+| `linux_signalfd(fd, mask: uint64*, flags) -> int64` | `signalfd4`; `fd` is -1 for a new descriptor |
 | `linux_sched_yield() -> int64` | `sched_yield` |
 | `linux_futex_wait(word: int32*, expected: int32, timeout: int64*) -> int64` | `futex` wait, process-private; `timeout` is `{sec, nsec}` or `(int64*)0` |
 | `linux_futex_wake(word: int32*, count: int32) -> int64` | `futex` wake; returns how many woke |
@@ -451,7 +454,8 @@ Each wrapper returns the kernel's raw result: a count or value, or `-errno`.
 
 `LinuxPollFd` has `fd: int32`, `events: int16` and `revents: int16`. The
 module also exports the flags these calls take: `LINUX_AT_FDCWD`,
-`LINUX_O_*`, `LINUX_PROT_*`, `LINUX_MAP_*`, `LINUX_CLOCK_*`, `LINUX_POLL*` and
+`LINUX_O_*`, `LINUX_PROT_*`, `LINUX_MAP_*`, `LINUX_CLOCK_*`, `LINUX_POLL*`,
+`LINUX_SIG_BLOCK`, `LINUX_SIG_UNBLOCK`, `LINUX_SIG_SETMASK`, `LINUX_SFD_*` and
 a few errno values (`LINUX_EAGAIN`, `LINUX_EINTR`, `LINUX_ETIMEDOUT`).
 
 ## std/thread
@@ -650,14 +654,20 @@ arguments come from `/proc/self/cmdline` on Linux, `_NSGetArgv` on macOS, and
 
 ## std/term
 
-Terminal basics, for prompts. Linux, macOS and Windows. fd 0 is standard
-input, 1 output and 2 error.
+Terminals: prompts, raw mode, the window size and terminal signals. Linux,
+macOS and Windows. fd 0 is standard input, 1 output and 2 error.
 
 | Function | Effect |
 |----------|--------|
 | `term_is_tty(fd) -> bool` | Is `fd` a terminal (a console on Windows) |
 | `term_set_echo(fd, on: bool) -> int64` | Turn echo on or off. Returns 1 or 0 for whether it was on before, or a negative code when `fd` is not a terminal |
 | `term_read_secret(prompt, buf, cap) -> int64` | Write `prompt` to standard error, read one line from standard input with echo off, and turn echo back on. Returns the length, without the line ending |
+| `term_raw_begin(fd) -> int64` | Save the terminal's settings and turn on raw mode. 0, or a negative code |
+| `term_raw_end(fd) -> int64` | Put back the settings `term_raw_begin` saved. 0, or a negative code |
+| `term_size(fd, cols: int32*, rows: int32*) -> int64` | The window size in character cells. 0, or a negative code |
+| `term_signal_fd(signals: int32...) -> int64` | Block the signals and return a descriptor that becomes readable when one arrives |
+| `term_signal_next(fd) -> int32` | Wait for the next signal on the descriptor and return its number |
+| `term_signal_end(fd, signals: int32...)` | Close the descriptor and unblock the signals |
 
 When standard input is a pipe or a file, `term_read_secret` reads the line as
 it is, so scripts can feed a password in.
@@ -667,6 +677,22 @@ and handles Backspace itself. Ctrl-C and Ctrl-\ end the prompt: the terminal
 is put back first, and then the program gets SIGINT or SIGQUIT, as it would
 have. So a program that stops on Ctrl-C does not leave echo off. A program
 that catches the signal (for example with `proc_signal_fd`) gets -4 back.
+
+Raw mode is what a full-screen program wants: each key arrives as soon as it
+is pressed, with no echo, no line editing, and no signal for Ctrl-C (it comes
+as byte 3). Output is not translated, so write `\r\n` to start a new line.
+Calling `term_raw_begin` again keeps the first saved settings, and
+`term_raw_end` without raw mode on does nothing. On Windows raw mode also
+turns on VT input, so keys arrive as the same escape sequences as on a POSIX
+terminal, and `term_size(0, ...)` asks standard output, since only an output
+handle has a size.
+
+`term_signal_fd` is `proc_signal_fd` from std/process: signalfd on Linux and
+a pipe written by a signal handler on macOS. Use it for `TERM_SIGWINCH` (the
+window changed size), `TERM_SIGINT`, `TERM_SIGTERM` and `TERM_SIGHUP`, and
+poll it next to the terminal input. Call it before starting threads. Windows
+has no signals, so it returns -ENOSYS there; read the console size again
+instead.
 
 ## std/dl
 
