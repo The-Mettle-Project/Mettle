@@ -36,7 +36,7 @@ int ir_operand_clone(const IROperand *source, IROperand *out) {
     if (!source->name) {
       return 0;
     }
-    out->name = mettle_strdup(source->name);
+    out->name = ir_name_share(source->name);
     if (!out->name) {
       *out = ir_operand_none();
       return 0;
@@ -733,8 +733,9 @@ static int ir_temp_value_map_find_with(const IRTempValueMap *map,
     if (map->ix[b] != IR_TVM_TOMB) {
       size_t slot = (size_t)map->ix[b] - 1;
       if (slot < map->count && map->items[slot].name &&
-          map->items[slot].name[0] == name[0] &&
-          strcmp(map->items[slot].name, name) == 0) {
+          (map->items[slot].name == name ||
+           (map->items[slot].name[0] == name[0] &&
+            strcmp(map->items[slot].name, name) == 0))) {
         return (int)slot;
       }
     }
@@ -832,7 +833,7 @@ void ir_temp_value_map_remove(IRTempValueMap *map, const char *name) {
   size_t idx = (size_t)index;
   ir_tvm_index_erase(map, map->items[idx].name, idx);
   ir_tvm_vsym_note_value(map, &map->items[idx].value, -1);
-  free(map->items[idx].name);
+  mettle_free_string(map->items[idx].name);
   ir_operand_destroy(&map->items[idx].value);
 
   size_t last = map->count - 1;
@@ -877,10 +878,10 @@ int ir_temp_value_map_set(IRTempValueMap *map, const char *name,
     map->capacity = new_capacity;
   }
 
-  char *name_copy = mettle_strdup(name);
+  char *name_copy = ir_name_share(name);
   IROperand cloned = ir_operand_none();
   if (!name_copy || !ir_operand_clone(value, &cloned)) {
-    free(name_copy);
+    mettle_free_string(name_copy);
     ir_operand_destroy(&cloned);
     return 0;
   }
@@ -1089,7 +1090,7 @@ void ir_temp_value_map_clear(IRTempValueMap *map) {
   }
 
   for (size_t i = 0; i < map->count; i++) {
-    free(map->items[i].name);
+    mettle_free_string(map->items[i].name);
     ir_operand_destroy(&map->items[i].value);
   }
   map->count = 0;
@@ -2131,8 +2132,10 @@ static int ir_temp_use_map_find_with(const IRTempUseMap *map, const char *name,
   size_t h = hash & mask;
   while (map->hash[h] != 0) {
     size_t idx = map->hash[h] - 1;
-    if (map->items[idx].name && map->items[idx].name[0] == name[0] &&
-        strcmp(map->items[idx].name, name) == 0) {
+    if (map->items[idx].name &&
+        (map->items[idx].name == name ||
+         (map->items[idx].name[0] == name[0] &&
+          strcmp(map->items[idx].name, name) == 0))) {
       return (int)idx;
     }
     h = (h + 1) & mask;
@@ -2175,7 +2178,7 @@ static int ir_temp_use_map_add(IRTempUseMap *map, const char *name) {
     return 0;
   }
 
-  char *name_copy = mettle_strdup(name);
+  char *name_copy = ir_name_share(name);
   if (!name_copy) {
     return 0;
   }
@@ -2217,7 +2220,7 @@ void ir_temp_use_map_destroy(IRTempUseMap *map) {
   }
 
   for (size_t i = 0; i < map->count; i++) {
-    free(map->items[i].name);
+    mettle_free_string(map->items[i].name);
   }
   free(map->items);
   free(map->hash);
@@ -2469,46 +2472,41 @@ void ir_name_index_destroy(IRNameIndex *index) {
   index->capacity = 0;
 }
 
-static int ir_op_reads_destination(IROpcode op) {
-  static const IROpcode kOps[] = {
-      IR_OP_STORE, IR_OP_MEMCPY_INLINE, IR_OP_SIMD_COPY,
-      IR_OP_COUNT_WORD_STARTS, IR_OP_SIMD_SUM_I32, IR_OP_SIMD_SUM_U8,
-      IR_OP_SIMD_BYTE_MAP, IR_OP_SIMD_FILL, IR_OP_SIMD_MATMUL_N32,
-      IR_OP_SIMD_INSERTION_SORT_I32, IR_OP_SIMD_DOT_I32, IR_OP_SIMD_DOT_I8,
-      IR_OP_SIMD_SLP_MAC_I32, IR_OP_SIMD_SLP_MAC_I8, IR_OP_SIMD_SCALE_I32,
-      IR_OP_SIMD_CLAMP_I32, IR_OP_SIMD_REVERSE_COPY_I32,
-      IR_OP_LOWER_BOUND_I32, IR_OP_PREFIX_SUM_I32, IR_OP_SIMD_MINMAX_I32,
-      IR_OP_SIMD_SUM_F64, IR_OP_SIMD_SUM_F32, IR_OP_SIMD_DOT_F64,
-      IR_OP_SIMD_DOT_F32, IR_OP_SIMD_AFFINE_MAP_F64,
-      IR_OP_SIMD_AFFINE_MAP_F32, IR_OP_SIMD_EXP_F32, IR_OP_SIMD_SILU_F32,
-      IR_OP_SIMD_I2F_REDUCE_F64, IR_OP_SIMD_VLOOP_F64, IR_OP_SIMD_VLOOP_I32,
-      IR_OP_SIMD_FIND, IR_OP_SIMD_OUTER_LANE_F64
-  };
+enum { IR_TEMP_READS_SIDES = 1, IR_TEMP_READS_DESTINATION = 2 };
 
-  for (size_t i = 0; i < sizeof(kOps) / sizeof(kOps[0]); i++) {
-    if (kOps[i] == op) {
-      return 1;
-    }
-  }
-  return 0;
+static const unsigned char g_ir_op_temp_reads[IR_OP_KIND_COUNT] = {
+    [IR_OP_STORE] = 3, [IR_OP_MEMCPY_INLINE] = 3, [IR_OP_SIMD_COPY] = 3,
+    [IR_OP_COUNT_WORD_STARTS] = 3, [IR_OP_SIMD_SUM_I32] = 3,
+    [IR_OP_SIMD_SUM_U8] = 3, [IR_OP_SIMD_BYTE_MAP] = 3, [IR_OP_SIMD_FILL] = 3,
+    [IR_OP_SIMD_MATMUL_N32] = 3, [IR_OP_SIMD_INSERTION_SORT_I32] = 3,
+    [IR_OP_SIMD_DOT_I32] = 3, [IR_OP_SIMD_DOT_I8] = 3,
+    [IR_OP_SIMD_SLP_MAC_I32] = 3, [IR_OP_SIMD_SLP_MAC_I8] = 3,
+    [IR_OP_SIMD_SCALE_I32] = 3, [IR_OP_SIMD_CLAMP_I32] = 3,
+    [IR_OP_SIMD_REVERSE_COPY_I32] = 3, [IR_OP_LOWER_BOUND_I32] = 3,
+    [IR_OP_PREFIX_SUM_I32] = 3, [IR_OP_SIMD_MINMAX_I32] = 3,
+    [IR_OP_SIMD_SUM_F64] = 3, [IR_OP_SIMD_SUM_F32] = 3,
+    [IR_OP_SIMD_DOT_F64] = 3, [IR_OP_SIMD_DOT_F32] = 3,
+    [IR_OP_SIMD_AFFINE_MAP_F64] = 3, [IR_OP_SIMD_AFFINE_MAP_F32] = 3,
+    [IR_OP_SIMD_EXP_F32] = 3, [IR_OP_SIMD_SILU_F32] = 3,
+    [IR_OP_SIMD_I2F_REDUCE_F64] = 3, [IR_OP_SIMD_VLOOP_F64] = 3,
+    [IR_OP_SIMD_VLOOP_I32] = 3, [IR_OP_SIMD_FIND] = 3,
+    [IR_OP_SIMD_OUTER_LANE_F64] = 3, [IR_OP_ASSIGN] = 1,
+    [IR_OP_ADDRESS_OF] = 1, [IR_OP_LOAD] = 1, [IR_OP_BINARY] = 1,
+    [IR_OP_UNARY] = 1, [IR_OP_CAST] = 1, [IR_OP_NEW] = 1,
+    [IR_OP_BRANCH_ZERO] = 1, [IR_OP_BRANCH_EQ] = 1, [IR_OP_CALL] = 1,
+    [IR_OP_CALL_INDIRECT] = 1, [IR_OP_PREFETCH] = 1, [IR_OP_RETURN] = 1,
+    [IR_OP_SELECT] = 1};
+
+static int ir_op_temp_reads(IROpcode op, int which) {
+  return (unsigned)op < IR_OP_KIND_COUNT && (g_ir_op_temp_reads[op] & which);
+}
+
+static int ir_op_reads_destination(IROpcode op) {
+  return ir_op_temp_reads(op, IR_TEMP_READS_DESTINATION);
 }
 
 static int ir_op_reads_side_operands(IROpcode op) {
-  static const IROpcode kOps[] = {
-      IR_OP_ASSIGN, IR_OP_ADDRESS_OF, IR_OP_LOAD, IR_OP_BINARY, IR_OP_UNARY,
-      IR_OP_CAST, IR_OP_NEW, IR_OP_BRANCH_ZERO, IR_OP_BRANCH_EQ, IR_OP_CALL,
-      IR_OP_CALL_INDIRECT, IR_OP_PREFETCH, IR_OP_RETURN, IR_OP_SELECT
-  };
-
-  if (ir_op_reads_destination(op)) {
-    return 1;
-  }
-  for (size_t i = 0; i < sizeof(kOps) / sizeof(kOps[0]); i++) {
-    if (kOps[i] == op) {
-      return 1;
-    }
-  }
-  return 0;
+  return ir_op_temp_reads(op, IR_TEMP_READS_SIDES);
 }
 
 int ir_collect_instruction_temp_uses(IRTempUseMap *uses,

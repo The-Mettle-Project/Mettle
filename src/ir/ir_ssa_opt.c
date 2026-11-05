@@ -617,7 +617,9 @@ int ir_ssa_sabotage_pass(IRFunction *function, int *changed) {
       }
     }
   }
-  (void)scrambled;
+  if (changed) {
+    *changed = scrambled != 0;
+  }
   return 1;
 }
 

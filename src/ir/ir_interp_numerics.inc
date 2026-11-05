@@ -491,43 +491,41 @@ static int ii_exec_pure(IRInterpMachine *machine, IIFrame *frame,
 #define II_SYM_MERGE_MAX 32
 
 static int ii_sym_merge_branch(IRInterpMachine *machine, IIFrame *frame,
-                               IRFunction *fn, size_t pc,
-                               const IRInstruction *insn, NumTerm cond,
+                               IRFunction *fn, size_t pc, NumTerm cond,
                                int taken_when_zero, size_t *next_pc) {
-  const IILabel *label = insn->text ? ii_find_label(frame, insn->text) : NULL;
+  int label = frame->targets[pc];
   size_t skip, then_begin = pc + 1, then_end, else_begin = 0, else_end = 0,
                end;
   IIVar *vars[II_SYM_MERGE_MAX];
   IRInterpValue before[II_SYM_MERGE_MAX], yes[II_SYM_MERGE_MAX],
       no[II_SYM_MERGE_MAX];
   size_t count = 0;
-  if (!label || label->index <= pc) {
+  if (label < 0 || (size_t)label <= pc) {
     return 0;
   }
-  skip = label->index;
+  skip = (size_t)label;
   then_end = skip;
   end = skip;
   for (size_t i = pc + 1; i < skip; i++) {
     const IRInstruction *step = &fn->instructions[i];
-    const IILabel *join;
     if (step->op != IR_OP_JUMP) {
       continue;
     }
-    join = step->text ? ii_find_label(frame, step->text) : NULL;
+    int join = frame->targets[i];
     for (size_t k = i + 1; k < skip; k++) {
       if (fn->instructions[k].op != IR_OP_LABEL) {
         return 0;
       }
     }
-    if (!join || join->index < skip) {
+    if (join < 0 || (size_t)join < skip) {
       return 0;
     }
     then_end = i;
-    if (join->index > skip) {
+    if ((size_t)join > skip) {
       else_begin = skip + 1;
-      else_end = join->index;
+      else_end = (size_t)join;
     }
-    end = join->index;
+    end = (size_t)join;
     break;
   }
   for (size_t i = then_begin; i < then_end; i++) {

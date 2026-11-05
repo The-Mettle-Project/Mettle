@@ -79,6 +79,7 @@ typedef struct {
   IIVar *vars;
   size_t count;
   size_t capacity;
+  unsigned grows;
 } IIEnv;
 
 #define II_GPU_MAX_SHARED 32
@@ -194,10 +195,21 @@ typedef struct {
   size_t base_effects;
 } IIGpuGrid;
 
+typedef struct {
+  const IRFunction *fn;
+  const IRInstruction *instructions;
+  size_t count;
+  int *target;
+} IIJumpTable;
+
 struct IRInterpMachine {
   IRProgram *program;
   const char *override_name;
   IRFunction *override_fn;
+
+  IIJumpTable *jump_tables;
+  size_t jump_table_capacity;
+  size_t jump_table_count;
 
   IIBuffer *buffers;
   size_t buffer_count;
@@ -300,7 +312,7 @@ static IIVar *ii_env_slot(IIEnv *env, const char *key) {
   size_t mask = env->capacity - 1;
   size_t i = ii_hash(key) & mask;
   while (env->vars[i].key) {
-    if (strcmp(env->vars[i].key, key) == 0) {
+    if (env->vars[i].key == key || strcmp(env->vars[i].key, key) == 0) {
       return &env->vars[i];
     }
     i = (i + 1) & mask;
@@ -319,6 +331,7 @@ static int ii_env_grow(IIEnv *env) {
   env->vars = grown;
   env->capacity = new_capacity;
   env->count = 0;
+  env->grows++;
   for (size_t i = 0; i < old_capacity; i++) {
     if (old[i].key) {
       IIVar *slot = ii_env_slot(env, old[i].key);
@@ -388,6 +401,10 @@ void ir_interp_destroy(IRInterpMachine *machine) {
     free(machine->effect_frames[i].provides);
   }
   free(machine->effect_frames);
+  for (size_t i = 0; i < machine->jump_table_capacity; i++) {
+    free(machine->jump_tables[i].target);
+  }
+  free(machine->jump_tables);
   ii_env_free(&machine->globals);
   free(machine);
 }
@@ -858,14 +875,11 @@ static int ii_write_f32(IRInterpMachine *m, unsigned long long a, float v) {
 }
 
 typedef struct {
-  const char *label;
-  size_t index;
-} IILabel;
-
-typedef struct {
   IIEnv env;
-  IILabel *labels;
-  size_t label_count;
+  const int *targets;
+  unsigned *by_id;
+  size_t id_limit;
+  unsigned by_id_grows;
   IRFunction *fn;
   size_t *owned;
   size_t owned_count;
@@ -886,13 +900,145 @@ static int ii_frame_own(IIFrame *frame, size_t index) {
   return 1;
 }
 
-static const IILabel *ii_find_label(const IIFrame *frame, const char *name) {
-  for (size_t i = 0; i < frame->label_count; i++) {
-    if (strcmp(frame->labels[i].label, name) == 0) {
-      return &frame->labels[i];
+static unsigned *ii_frame_id_slot(IIFrame *frame, const IROperand *operand) {
+  uint32_t id = operand->value_id;
+  if (!frame->by_id || id == IR_VALUE_ID_NONE || id >= frame->id_limit) {
+    return NULL;
+  }
+  if (frame->by_id_grows != frame->env.grows) {
+    memset(frame->by_id, 0, frame->id_limit * sizeof(*frame->by_id));
+    frame->by_id_grows = frame->env.grows;
+  }
+  return &frame->by_id[id];
+}
+
+static void ii_frame_note_var(IIFrame *frame, unsigned *slot, IIVar *var) {
+  if (slot && var) {
+    *slot = (unsigned)(var - frame->env.vars) + 1;
+  }
+}
+
+static IIVar *ii_frame_var_find(IIFrame *frame, const IROperand *operand) {
+  unsigned *slot = ii_frame_id_slot(frame, operand);
+  if (slot && *slot) {
+    return &frame->env.vars[*slot - 1];
+  }
+  IIVar *var = ii_env_find(&frame->env, operand->name);
+  ii_frame_note_var(frame, slot, var);
+  return var;
+}
+
+static IIVar *ii_frame_var_upsert(IIFrame *frame, const IROperand *operand) {
+  IIVar *var = ii_env_upsert(&frame->env, operand->name);
+  ii_frame_note_var(frame, ii_frame_id_slot(frame, operand), var);
+  return var;
+}
+
+static int ii_is_jump(const IRInstruction *insn) {
+  return insn->text && (insn->op == IR_OP_JUMP || insn->op == IR_OP_BRANCH_ZERO ||
+                        insn->op == IR_OP_BRANCH_EQ);
+}
+
+static size_t ii_label_probe(const IRFunction *fn, const size_t *slots,
+                             size_t mask, const char *text) {
+  size_t at = ii_hash(text) & mask;
+  while (slots[at] && strcmp(fn->instructions[slots[at] - 1].text, text) != 0) {
+    at = (at + 1) & mask;
+  }
+  return at;
+}
+
+static int *ii_build_jump_targets(const IRFunction *fn) {
+  size_t labels = 0;
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    labels += fn->instructions[i].op == IR_OP_LABEL && fn->instructions[i].text;
+  }
+  size_t capacity = 16;
+  while (capacity < labels * 2 + 2) {
+    capacity *= 2;
+  }
+  size_t *slots = (size_t *)calloc(capacity, sizeof(size_t));
+  int *target = (int *)malloc((fn->instruction_count + 1) * sizeof(int));
+  if (!slots || !target) {
+    free(slots);
+    free(target);
+    return NULL;
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *insn = &fn->instructions[i];
+    if (insn->op == IR_OP_LABEL && insn->text) {
+      size_t at = ii_label_probe(fn, slots, capacity - 1, insn->text);
+      if (!slots[at]) {
+        slots[at] = i + 1;
+      }
     }
   }
-  return NULL;
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *insn = &fn->instructions[i];
+    target[i] = -1;
+    if (ii_is_jump(insn)) {
+      size_t at = ii_label_probe(fn, slots, capacity - 1, insn->text);
+      target[i] = slots[at] ? (int)(slots[at] - 1) : -1;
+    }
+  }
+  free(slots);
+  return target;
+}
+
+static IIJumpTable *ii_jump_table_slot(IIJumpTable *tables, size_t capacity,
+                                       const IRFunction *fn) {
+  size_t mask = capacity - 1;
+  size_t at = ((uintptr_t)fn >> 4) & mask;
+  while (tables[at].fn && tables[at].fn != fn) {
+    at = (at + 1) & mask;
+  }
+  return &tables[at];
+}
+
+static int ii_jump_tables_grow(IRInterpMachine *machine) {
+  if ((machine->jump_table_count + 1) * 2 <= machine->jump_table_capacity) {
+    return 1;
+  }
+  size_t capacity = machine->jump_table_capacity ? machine->jump_table_capacity * 2 : 32;
+  IIJumpTable *tables = (IIJumpTable *)calloc(capacity, sizeof(IIJumpTable));
+  if (!tables) {
+    return 0;
+  }
+  for (size_t i = 0; i < machine->jump_table_capacity; i++) {
+    if (machine->jump_tables[i].fn) {
+      *ii_jump_table_slot(tables, capacity, machine->jump_tables[i].fn) =
+          machine->jump_tables[i];
+    }
+  }
+  free(machine->jump_tables);
+  machine->jump_tables = tables;
+  machine->jump_table_capacity = capacity;
+  return 1;
+}
+
+static const int *ii_jump_targets(IRInterpMachine *machine, const IRFunction *fn) {
+  if (!ii_jump_tables_grow(machine)) {
+    return NULL;
+  }
+  IIJumpTable *table =
+      ii_jump_table_slot(machine->jump_tables, machine->jump_table_capacity, fn);
+  if (table->fn == fn && table->instructions == fn->instructions &&
+      table->count == fn->instruction_count) {
+    return table->target;
+  }
+  if (!table->fn) {
+    machine->jump_table_count++;
+  }
+  free(table->target);
+  table->fn = fn;
+  table->instructions = fn->instructions;
+  table->count = fn->instruction_count;
+  table->target = ii_build_jump_targets(fn);
+  if (!table->target || !ir_function_number_values((IRFunction *)fn)) {
+    table->instructions = NULL;
+    return NULL;
+  }
+  return table->target;
 }
 
 static int ii_parse_local_type(const char *text, int *elem_size, long long *count,
@@ -1524,12 +1670,12 @@ static unsigned long long ii_global_storage(IRInterpMachine *machine,
 
 static IIVar *ii_resolve(IRInterpMachine *machine, IIFrame *frame,
                          const IROperand *operand) {
-  IIVar *var = ii_env_find(&frame->env, operand->name);
+  IIVar *var = ii_frame_var_find(frame, operand);
   if (var) {
     return var;
   }
   if (operand->kind == IR_OPERAND_TEMP) {
-    IIVar *fresh = ii_env_upsert(&frame->env, operand->name);
+    IIVar *fresh = ii_frame_var_upsert(frame, operand);
     if (fresh) {
       fresh->value = ii_poison_value();
     }
@@ -5534,9 +5680,10 @@ static int ii_op_call(IRInterpMachine *machine, IIFrame *frame,
       return ii_store_dest(machine, frame, &insn->dest, &call_result);
     }
   }
-  MtlcIntrinsic intrinsic = insn->intrinsic != MTLC_INTRINSIC_NONE
-                                ? insn->intrinsic
-                                : ir_intrinsic_from_name(insn->text);
+  MtlcIntrinsic intrinsic =
+      insn->intrinsic != MTLC_INTRINSIC_NONE || callee || !machine->gpu.active
+          ? insn->intrinsic
+          : ir_intrinsic_from_name(insn->text);
   if (!callee && machine->gpu.active && intrinsic != MTLC_INTRINSIC_NONE) {
     int handled = 0;
     if (!ii_gpu_device_call(machine, intrinsic, call_args, call_arg_count,
@@ -6172,7 +6319,7 @@ static int ii_op_declare_local(IRInterpMachine *machine, IIFrame *frame,
     ii_fail(machine, IR_INTERP_UNSUPPORTED, "local declaration form");
     return 0;
   }
-  var = ii_env_upsert(&frame->env, insn->dest.name);
+  var = ii_frame_var_upsert(frame, &insn->dest);
   if (!var) {
     ii_fail(machine, IR_INTERP_TRAP, "out of memory");
     return 0;
@@ -6212,30 +6359,25 @@ static int ii_op_declare_local(IRInterpMachine *machine, IIFrame *frame,
 
 static int ii_build_label_table(IRInterpMachine *machine, IIFrame *frame,
                                  IRFunction *fn) {
-  size_t label_capacity = 8;
-  frame->labels = (IILabel *)malloc(label_capacity * sizeof(IILabel));
-  if (!frame->labels) {
+  frame->targets = ii_jump_targets(machine, fn);
+  frame->id_limit = fn->values.count + 1;
+  frame->by_id = (unsigned *)calloc(frame->id_limit, sizeof(*frame->by_id));
+  if (!frame->targets || !frame->by_id) {
     ii_fail(machine, IR_INTERP_TRAP, "out of memory");
     return 0;
   }
-  for (size_t i = 0; i < fn->instruction_count; i++) {
-    const IRInstruction *insn = &fn->instructions[i];
-    if (insn->op == IR_OP_LABEL && insn->text) {
-      if (frame->label_count >= label_capacity) {
-        label_capacity *= 2;
-        IILabel *grown =
-            (IILabel *)realloc(frame->labels, label_capacity * sizeof(IILabel));
-        if (!grown) {
-          ii_fail(machine, IR_INTERP_TRAP, "out of memory");
-          return 0;
-        }
-        frame->labels = grown;
-      }
-      frame->labels[frame->label_count].label = insn->text;
-      frame->labels[frame->label_count].index = i;
-      frame->label_count++;
-    }
+  frame->by_id_grows = frame->env.grows;
+  return 1;
+}
+
+static int ii_jump_target(IRInterpMachine *machine, const IIFrame *frame,
+                          size_t pc, const char *what, size_t *next) {
+  int target = frame->targets[pc];
+  if (target < 0) {
+    ii_fail(machine, IR_INTERP_TRAP, what);
+    return 0;
   }
+  *next = (size_t)target;
   return 1;
 }
 
@@ -6452,7 +6594,7 @@ static void ii_close_frame(IRInterpMachine *machine, IIFrame *frame,
     ii_reclaim_buffer(machine, index);
   }
   free(frame->owned);
-  free(frame->labels);
+  free(frame->by_id);
   ii_env_free(&frame->env);
 }
 
@@ -6554,12 +6696,9 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
       break;
 
     case IR_OP_JUMP: {
-      const IILabel *label = insn->text ? ii_find_label(&frame, insn->text) : NULL;
-      if (!label) {
-        ii_fail(machine, IR_INTERP_TRAP, "jump to unknown label");
+      if (!ii_jump_target(machine, &frame, pc, "jump to unknown label", &pc)) {
         goto done;
       }
-      pc = label->index;
       break;
     }
 
@@ -6580,8 +6719,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         } else {
           truth = ii_sym_truth(machine, cond.term);
         }
-        merged = ii_sym_merge_branch(machine, &frame, fn, pc, insn, truth, 1,
-                                     &next);
+        merged = ii_sym_merge_branch(machine, &frame, fn, pc, truth, 1, &next);
         if (merged < 0) {
           goto done;
         }
@@ -6600,12 +6738,9 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         machine->branched_on_undefined = 1;
       }
       if (v == 0) {
-        const IILabel *label = insn->text ? ii_find_label(&frame, insn->text) : NULL;
-        if (!label) {
-          ii_fail(machine, IR_INTERP_TRAP, "branch to unknown label");
+        if (!ii_jump_target(machine, &frame, pc, "branch to unknown label", &pc)) {
           goto done;
         }
-        pc = label->index;
       } else {
         pc++;
       }
@@ -6634,12 +6769,9 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         machine->branched_on_undefined = 1;
       }
       if (equal) {
-        const IILabel *label = insn->text ? ii_find_label(&frame, insn->text) : NULL;
-        if (!label) {
-          ii_fail(machine, IR_INTERP_TRAP, "branch to unknown label");
+        if (!ii_jump_target(machine, &frame, pc, "branch to unknown label", &pc)) {
           goto done;
         }
-        pc = label->index;
       } else {
         pc++;
       }

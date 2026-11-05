@@ -572,7 +572,8 @@ static int ir_ssa_ensure_block_labels(IRFunction *function, int *changed) {
 }
 
 static void ir_ssa_audit_declarations(IRFunction *function, const char *stage) {
-  if (!getenv("METTLE_IR_SSA_DEBUG")) {
+  static MettleEnvOnce debug;
+  if (!mettle_env_once(&debug, "METTLE_IR_SSA_DEBUG")) {
     return;
   }
   IRValueTable declared;
@@ -1092,7 +1093,8 @@ int ir_promote_scalar_locals_pass(IRFunction *function, int *changed) {
       function, blocks, block_count, &candidates, &sites, grown, phi_origin);
 
   ir_ssa_phi_sites_destroy(&sites);
-  if (getenv("METTLE_IR_SSA_DEBUG")) {
+  static MettleEnvOnce debug;
+  if (mettle_env_once(&debug, "METTLE_IR_SSA_DEBUG")) {
     size_t tiled = 0;
     for (size_t b = 0; b < block_count; b++) {
       tiled += blocks[b].instruction_count;

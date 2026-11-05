@@ -359,14 +359,19 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
 
   IRVerifySnapshot *verify_snapshot = ir_verify_snapshot_take(function);
 
-  ir_function_number_values(function);
+  static MettleEnvOnce cache_audit;
+  static MettleEnvOnce cfg_audit;
+  ir_function_number_values_if_stale(function);
   const size_t structure_before = ir_structure_snapshot(function);
   const uint64_t fingerprint_before =
-      getenv("METTLE_CACHE_AUDIT") ? ir_function_fingerprint(function) : 0;
+      mettle_env_once(&cache_audit, "METTLE_CACHE_AUDIT")
+          ? ir_function_fingerprint(function)
+          : 0;
   const uint64_t generation_before = function->generation;
   const uint64_t cfg_fingerprint_before =
-      getenv("METTLE_CFG_AUDIT") ? ir_function_structure_fingerprint(function)
-                                 : 0;
+      mettle_env_once(&cfg_audit, "METTLE_CFG_AUDIT")
+          ? ir_function_structure_fingerprint(function)
+          : 0;
   const uint64_t structure_generation_before = function->structure_generation;
 
   mettle_compiler_ctx_set_pass_name(pass->name);
@@ -393,13 +398,16 @@ static int ir_run_named_pass(IRFunction *function, const IROptNamedPass *pass,
   }
   ir_value_maybe_sabotage(function, pass->name);
   ir_value_check_after_pass(function, pass->name);
-  ir_function_number_values(function);
+  ir_function_number_values_if_stale(function);
   ir_structure_maybe_sabotage(function, pass->name);
   ir_structure_check_after_pass(function, pass->name, structure_before);
-  {
+  if (function->generation != generation_before) {
     int repaired = 0;
     ir_repair_phis(function, &repaired);
-    ir_function_number_values(function);
+    if (repaired) {
+      ir_function_touch(function);
+      ir_function_number_values_if_stale(function);
+    }
   }
   ir_phi_check_after_pass(function, pass->name);
   ir_analysis_self_check(function);

@@ -8,18 +8,28 @@
 #include <stdint.h>
 
 typedef struct StringInternEntry {
-  char *value;
+  const char *value;
   size_t length;
+  size_t hash;
   struct StringInternEntry *next;
-  struct StringInternEntry *ptr_next;
 } StringInternEntry;
 
+typedef struct {
+  char *base;
+  size_t capacity;
+} StringInternSlab;
+
 #define STRING_INTERN_INITIAL_BUCKETS 4096u
+#define STRING_INTERN_SLAB_BYTES ((size_t)1 << 20)
 
 static StringInternEntry **g_string_intern_buckets = NULL;
-static StringInternEntry **g_string_intern_ptr_buckets = NULL;
 static size_t g_string_intern_bucket_count = 0;
 static size_t g_string_intern_entry_count = 0;
+static StringInternSlab *g_string_intern_slabs = NULL;
+static size_t g_string_intern_slab_count = 0;
+static size_t g_string_intern_slab_capacity = 0;
+static char *g_string_intern_cursor = NULL;
+static size_t g_string_intern_room = 0;
 
 static void token_set_lexeme(Token *token, const char *data, size_t length) {
   if (!token) {
@@ -54,25 +64,59 @@ static void token_set_single_char_value(Token *token, char c) {
 }
 
 static int string_intern_init(void) {
-  if (g_string_intern_buckets && g_string_intern_ptr_buckets) {
+  if (g_string_intern_buckets) {
     return 1;
   }
 
   g_string_intern_buckets =
       calloc(STRING_INTERN_INITIAL_BUCKETS, sizeof(StringInternEntry *));
-  g_string_intern_ptr_buckets =
-      calloc(STRING_INTERN_INITIAL_BUCKETS, sizeof(StringInternEntry *));
-  if (!g_string_intern_buckets || !g_string_intern_ptr_buckets) {
-    free(g_string_intern_buckets);
-    free(g_string_intern_ptr_buckets);
-    g_string_intern_buckets = NULL;
-    g_string_intern_ptr_buckets = NULL;
+  if (!g_string_intern_buckets) {
     return 0;
   }
   g_string_intern_bucket_count = STRING_INTERN_INITIAL_BUCKETS;
   g_string_intern_entry_count = 0;
 
   return 1;
+}
+
+static int string_intern_add_slab(size_t need) {
+  size_t capacity = need > STRING_INTERN_SLAB_BYTES ? need : STRING_INTERN_SLAB_BYTES;
+  if (g_string_intern_slab_count == g_string_intern_slab_capacity) {
+    size_t grown = g_string_intern_slab_capacity ? g_string_intern_slab_capacity * 2 : 16;
+    StringInternSlab *slabs =
+        realloc(g_string_intern_slabs, grown * sizeof(StringInternSlab));
+    if (!slabs) {
+      return 0;
+    }
+    g_string_intern_slabs = slabs;
+    g_string_intern_slab_capacity = grown;
+  }
+  char *base = malloc(capacity);
+  if (!base) {
+    return 0;
+  }
+  size_t at = g_string_intern_slab_count;
+  while (at > 0 && g_string_intern_slabs[at - 1].base > base) {
+    g_string_intern_slabs[at] = g_string_intern_slabs[at - 1];
+    at--;
+  }
+  g_string_intern_slabs[at].base = base;
+  g_string_intern_slabs[at].capacity = capacity;
+  g_string_intern_slab_count++;
+  g_string_intern_cursor = base;
+  g_string_intern_room = capacity;
+  return 1;
+}
+
+static void *string_intern_alloc(size_t size) {
+  size = (size + 7u) & ~(size_t)7u;
+  if (size > g_string_intern_room && !string_intern_add_slab(size)) {
+    return NULL;
+  }
+  void *at = g_string_intern_cursor;
+  g_string_intern_cursor += size;
+  g_string_intern_room -= size;
+  return at;
 }
 
 static size_t string_intern_hash_bytes(const char *value, size_t length) {
@@ -84,14 +128,6 @@ static size_t string_intern_hash_bytes(const char *value, size_t length) {
   return hash;
 }
 
-static size_t string_intern_hash_ptr(const void *ptr) {
-  uintptr_t value = (uintptr_t)ptr;
-  value ^= value >> 33;
-  value *= (uintptr_t)0xff51afd7ed558ccdULL;
-  value ^= value >> 33;
-  return (size_t)value;
-}
-
 static void string_intern_maybe_grow(void) {
   if (g_string_intern_entry_count <= (g_string_intern_bucket_count * 3) / 4) {
     return;
@@ -100,10 +136,7 @@ static void string_intern_maybe_grow(void) {
   size_t new_count = g_string_intern_bucket_count * 2;
   StringInternEntry **new_content =
       calloc(new_count, sizeof(StringInternEntry *));
-  StringInternEntry **new_ptr = calloc(new_count, sizeof(StringInternEntry *));
-  if (!new_content || !new_ptr) {
-    free(new_content);
-    free(new_ptr);
+  if (!new_content) {
     return;
   }
 
@@ -111,24 +144,15 @@ static void string_intern_maybe_grow(void) {
     StringInternEntry *entry = g_string_intern_buckets[i];
     while (entry) {
       StringInternEntry *next = entry->next;
-
-      size_t cb =
-          string_intern_hash_bytes(entry->value, entry->length) & (new_count - 1);
+      size_t cb = entry->hash & (new_count - 1);
       entry->next = new_content[cb];
       new_content[cb] = entry;
-
-      size_t pb = string_intern_hash_ptr(entry->value) & (new_count - 1);
-      entry->ptr_next = new_ptr[pb];
-      new_ptr[pb] = entry;
-
       entry = next;
     }
   }
 
   free(g_string_intern_buckets);
-  free(g_string_intern_ptr_buckets);
   g_string_intern_buckets = new_content;
-  g_string_intern_ptr_buckets = new_ptr;
   g_string_intern_bucket_count = new_count;
 }
 
@@ -145,34 +169,26 @@ const char *string_intern_n(const char *value, size_t length) {
   size_t bucket = hash & (g_string_intern_bucket_count - 1);
   StringInternEntry *entry = g_string_intern_buckets[bucket];
   while (entry) {
-    if (entry->length == length && memcmp(entry->value, value, length) == 0) {
+    if (entry->hash == hash && entry->length == length &&
+        memcmp(entry->value, value, length) == 0) {
       return entry->value;
     }
     entry = entry->next;
   }
 
-  char *copy = malloc(length + 1);
+  entry = string_intern_alloc(sizeof(StringInternEntry));
+  char *copy = entry ? string_intern_alloc(length + 1) : NULL;
   if (!copy) {
     return NULL;
   }
   memcpy(copy, value, length);
   copy[length] = '\0';
 
-  entry = malloc(sizeof(StringInternEntry));
-  if (!entry) {
-    free(copy);
-    return NULL;
-  }
-
   entry->value = copy;
   entry->length = length;
+  entry->hash = hash;
   entry->next = g_string_intern_buckets[bucket];
   g_string_intern_buckets[bucket] = entry;
-
-  size_t ptr_bucket =
-      string_intern_hash_ptr(copy) & (g_string_intern_bucket_count - 1);
-  entry->ptr_next = g_string_intern_ptr_buckets[ptr_bucket];
-  g_string_intern_ptr_buckets[ptr_bucket] = entry;
 
   g_string_intern_entry_count++;
   string_intern_maybe_grow();
@@ -188,43 +204,35 @@ const char *string_intern(const char *value) {
 }
 
 int string_is_interned(const char *value) {
-  if (!value || !g_string_intern_ptr_buckets) {
+  size_t low = 0;
+  size_t high = g_string_intern_slab_count;
+  if (!value) {
     return 0;
   }
-
-  size_t ptr_bucket =
-      string_intern_hash_ptr(value) & (g_string_intern_bucket_count - 1);
-  StringInternEntry *entry = g_string_intern_ptr_buckets[ptr_bucket];
-  while (entry) {
-    if (entry->value == value) {
-      return 1;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (g_string_intern_slabs[mid].base <= value) {
+      low = mid + 1;
+    } else {
+      high = mid;
     }
-    entry = entry->ptr_next;
   }
-
-  return 0;
+  return low > 0 && value < g_string_intern_slabs[low - 1].base +
+                                g_string_intern_slabs[low - 1].capacity;
 }
 
 void string_intern_clear(void) {
-  if (!g_string_intern_buckets) {
-    return;
+  for (size_t i = 0; i < g_string_intern_slab_count; i++) {
+    free(g_string_intern_slabs[i].base);
   }
-
-  for (size_t i = 0; i < g_string_intern_bucket_count; i++) {
-    StringInternEntry *entry = g_string_intern_buckets[i];
-    while (entry) {
-      StringInternEntry *next = entry->next;
-      free(entry->value);
-      free(entry);
-      entry = next;
-    }
-    g_string_intern_buckets[i] = NULL;
-  }
-
+  free(g_string_intern_slabs);
   free(g_string_intern_buckets);
-  free(g_string_intern_ptr_buckets);
+  g_string_intern_slabs = NULL;
+  g_string_intern_slab_count = 0;
+  g_string_intern_slab_capacity = 0;
+  g_string_intern_cursor = NULL;
+  g_string_intern_room = 0;
   g_string_intern_buckets = NULL;
-  g_string_intern_ptr_buckets = NULL;
   g_string_intern_bucket_count = 0;
   g_string_intern_entry_count = 0;
 }

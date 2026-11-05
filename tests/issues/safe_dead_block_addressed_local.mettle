@@ -1,0 +1,17 @@
+import "std/io"
+
+@noinline fn store(q: int8*, v: int8) {
+  q[0] = v;
+}
+
+fn main() -> int32 {
+  var seed: int8 = 1;
+  var total: int32 = 5;
+  for i: int64 in 0..0 {
+    var kept: int8 = seed;
+    store(&kept, kept);
+    total = total + (int32)kept;
+  }
+  println("{total}");
+  return 0;
+}

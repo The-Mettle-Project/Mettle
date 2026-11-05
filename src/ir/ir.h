@@ -309,6 +309,8 @@ typedef struct {
   IRValueTable values;
   uint64_t generation;
   uint64_t structure_generation;
+  uint64_t numbered_generation;
+  size_t numbered_instruction_count;
   void *analysis;
   int is_inline;
   int is_inline_contract;
@@ -529,7 +531,9 @@ int ir_operand_is_symbol(const IROperand *operand);
 int ir_operand_is_value(const IROperand *operand);
 uint32_t ir_function_value_id(IRFunction *function, const IROperand *operand);
 const char *ir_function_value_name(const IRFunction *function, uint32_t id);
+char *ir_name_share(const char *name);
 int ir_function_number_values(IRFunction *function);
+int ir_function_number_values_if_stale(IRFunction *function);
 int ir_function_values_agree(const IRFunction *function, char *why,
                              size_t why_capacity);
 int ir_function_values_audit(const IRFunction *function, char *why,

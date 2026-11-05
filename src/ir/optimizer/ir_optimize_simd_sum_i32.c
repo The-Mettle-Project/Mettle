@@ -117,16 +117,13 @@ int ir_label_is_while_header(const char *label) {
   if (!label) {
     return 0;
   }
-  if (strncmp(label, "ir_while_", 9) == 0) {
+  if (strncmp(label, "ir_while_", 9) == 0 ||
+      strncmp(label, "ir_for_cond_", 12) == 0) {
     return 1;
   }
-  if (strstr(label, "_lbl_ir_while_") != NULL) {
-    return 1;
-  }
-  if (strncmp(label, "ir_for_cond_", 12) == 0) {
-    return 1;
-  }
-  return strstr(label, "_lbl_ir_for_cond_") != NULL;
+  const char *inlined = strstr(label, "_lbl_ir_");
+  return inlined && (strncmp(inlined + 8, "while_", 6) == 0 ||
+                     strncmp(inlined + 8, "for_cond_", 9) == 0);
 }
 
 int ir_fused_loop_exit_is_adjacent(const IRFunction *function,

@@ -126,6 +126,9 @@ typedef struct {
   size_t value_frame_count;
   size_t value_frame_capacity;
   struct ASTNode *module_program;
+  struct ASTNode *kernel_scan_program;
+  size_t kernel_scan_declarations;
+  int kernel_scan_found;
   int device_module;
   Type **struct_placeholders;
   size_t struct_placeholder_count;

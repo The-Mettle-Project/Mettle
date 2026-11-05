@@ -1,0 +1,89 @@
+import "std/io"
+
+@inline fn to_u32(x: float64) -> uint32 {
+  if (x >= 0.0 && x <= 4294967295.0) {
+    return (uint32)x;
+  }
+  return 0;
+}
+
+struct Small {
+  f0: uint16;
+  f1: uint16;
+}
+
+struct Wide {
+  f0: float32;
+  f1: float32;
+  f2: float32;
+  f3: int32;
+}
+
+struct Mixed {
+  f0: float32;
+  f1: uint32;
+}
+
+@noinline fn fold(s: Small) -> float32 {
+  return (((float64)(s.f0)) - (((float64)(s.f1)) * (3.0)));
+}
+
+fn make(p0: float64, p1: int32) -> Mixed {
+  var r: Mixed;
+  r.f0 = ((float32)(1.0));
+  r.f1 = ((uint32)0 - (uint32)4294967294);
+  return r;
+}
+
+@noinline fn run(n: int64, x: int16) -> int16 {
+  var m1: uint8 = (uint8)0;
+  var m2: int64 = (int64)(-9223372036854775808);
+  var m3: uint8 = (uint8)6;
+  var m4: float64 = (7.0);
+  if (m2 < (m2 | m2)) {
+  }
+  switch (((int64)(((-m2) - ((int64)255 + m2)))) & (int64)7) {
+    case 0: {
+      var s10: Wide;
+      s10.f1 = ((float32)(0.0));
+      s10.f2 = ((float32)(0.0));
+      s10.f3 = (int32)0;
+      s10.f0 = (((float32)(0.10000000149011612)) + ((float32)(0.5)));
+      s10.f2 = s10.f0;
+      if ((-(uint8)16) < (m3 * m3)) {
+        var i26: int64 = 2;
+        while (i26 < 10) {
+        }
+      }
+    }
+    case 4: {
+      if (to_u32(m4) >= ((uint32)4294967290 - (uint32)3105582211)) {
+      }
+    }
+    case 5: {
+      switch (((uint8)((((m3 << (uint8)7) - m1) * m1))) & (uint8)7) {
+        case 6: {
+        }
+      }
+    }
+    case 6: {
+      var i13: int64 = 1;
+      while (i13 < 10) {
+      }
+      var s14: Mixed;
+      s14 = make(m4, ((int32)((int16)32767)));
+      if ((i13 <= m2) || ((int8)(-83) <= (int8)(-6))) {
+        for i15: int64 in 3..5 {
+        }
+      }
+    }
+  }
+  if (((uint16)54597 + (uint16)37212) < (uint16)38469) {
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  println("{run(1, 2)}");
+  return 0;
+}

@@ -417,6 +417,9 @@ void binary_emitter_reset(BinaryEmitter *emitter) {
   }
 
   emitter->section_count = 0;
+  free(emitter->section_index_buckets);
+  emitter->section_index_buckets = NULL;
+  emitter->section_index_bucket_count = 0;
   emitter->symbol_count = 0;
   emitter->relocation_count = 0;
   free(emitter->symbol_index_buckets);
@@ -438,6 +441,63 @@ void binary_emitter_destroy(BinaryEmitter *emitter) {
   free(emitter);
 }
 
+static size_t binary_section_name_hash(const char *name) {
+  size_t hash = (size_t)1469598103934665603ULL;
+  for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+    hash ^= (size_t)*p;
+    hash *= (size_t)1099511628211ULL;
+  }
+  return hash;
+}
+
+static size_t binary_emitter_find_section_index(const BinaryEmitter *emitter,
+                                                const char *name) {
+  if (emitter->section_index_bucket_count == 0) {
+    return BINARY_SECTION_INDEX_NONE;
+  }
+  size_t mask = emitter->section_index_bucket_count - 1;
+  for (size_t at = binary_section_name_hash(name) & mask;
+       emitter->section_index_buckets[at]; at = (at + 1) & mask) {
+    size_t index = emitter->section_index_buckets[at] - 1;
+    if (strcmp(emitter->sections[index].name, name) == 0) {
+      return index;
+    }
+  }
+  return BINARY_SECTION_INDEX_NONE;
+}
+
+static void binary_emitter_place_section_index(BinaryEmitter *emitter,
+                                               size_t index) {
+  size_t mask = emitter->section_index_bucket_count - 1;
+  size_t at = binary_section_name_hash(emitter->sections[index].name) & mask;
+  while (emitter->section_index_buckets[at]) {
+    at = (at + 1) & mask;
+  }
+  emitter->section_index_buckets[at] = index + 1;
+}
+
+static int binary_emitter_grow_section_index(BinaryEmitter *emitter,
+                                             size_t count) {
+  if (count * 2 <= emitter->section_index_bucket_count) {
+    return 1;
+  }
+  size_t buckets = emitter->section_index_bucket_count
+                       ? emitter->section_index_bucket_count * 2
+                       : 64;
+  size_t *grown = calloc(buckets, sizeof(size_t));
+  if (!grown) {
+    binary_emitter_set_error(emitter, "Out of memory while indexing sections");
+    return 0;
+  }
+  free(emitter->section_index_buckets);
+  emitter->section_index_buckets = grown;
+  emitter->section_index_bucket_count = buckets;
+  for (size_t i = 0; i < emitter->section_count; i++) {
+    binary_emitter_place_section_index(emitter, i);
+  }
+  return 1;
+}
+
 size_t binary_emitter_get_or_create_section(BinaryEmitter *emitter,
                                             const char *name,
                                             BinarySectionKind kind,
@@ -447,20 +507,20 @@ size_t binary_emitter_get_or_create_section(BinaryEmitter *emitter,
     return BINARY_SECTION_INDEX_NONE;
   }
 
-  for (size_t i = 0; i < emitter->section_count; i++) {
-    if (emitter->sections[i].name &&
-        strcmp(emitter->sections[i].name, name) == 0) {
-      if (alignment > emitter->sections[i].alignment) {
-        emitter->sections[i].alignment = alignment;
-      }
-      if (characteristics != 0) {
-        emitter->sections[i].characteristics = characteristics;
-      }
-      return i;
+  size_t found = binary_emitter_find_section_index(emitter, name);
+  if (found != BINARY_SECTION_INDEX_NONE) {
+    BinarySection *existing = &emitter->sections[found];
+    if (alignment > existing->alignment) {
+      existing->alignment = alignment;
     }
+    if (characteristics != 0) {
+      existing->characteristics = characteristics;
+    }
+    return found;
   }
 
-  if (!binary_emitter_reserve_sections(emitter, emitter->section_count + 1)) {
+  if (!binary_emitter_reserve_sections(emitter, emitter->section_count + 1) ||
+      !binary_emitter_grow_section_index(emitter, emitter->section_count + 1)) {
     return BINARY_SECTION_INDEX_NONE;
   }
 
@@ -477,6 +537,7 @@ size_t binary_emitter_get_or_create_section(BinaryEmitter *emitter,
   section->characteristics = characteristics;
   section->alignment = alignment ? alignment : 1;
 
+  binary_emitter_place_section_index(emitter, emitter->section_count);
   emitter->section_count++;
   return emitter->section_count - 1;
 }

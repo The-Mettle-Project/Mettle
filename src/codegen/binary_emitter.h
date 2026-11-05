@@ -74,6 +74,8 @@ typedef struct {
   BinarySection *sections;
   size_t section_count;
   size_t section_capacity;
+  size_t *section_index_buckets;
+  size_t section_index_bucket_count;
   BinarySymbol *symbols;
   size_t symbol_count;
   size_t symbol_capacity;

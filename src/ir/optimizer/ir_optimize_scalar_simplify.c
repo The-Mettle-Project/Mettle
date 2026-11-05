@@ -1071,23 +1071,23 @@ static int ir_cp_visit(IRFunction *function, IRCopyPropState *state, size_t at,
   return ir_cp_leave_block(state, instruction, at, forward_only, flow_changed);
 }
 
-static int ir_cp_flow_pass(IRFunction *function, IRCopyPropState *state,
-                           int rewrite, int *flow_changed,
-                           int *round_changed) {
-  int forward_only;
-
-  ir_temp_value_map_clear(&state->map);
-  ir_temp_value_map_clear(&state->symbol_map);
+static int ir_cp_prepare_round(IRFunction *function, IRCopyPropState *state,
+                               int *forward_only) {
   ir_temp_value_map_clear(&state->temp_last_use);
   ir_temp_value_map_clear(&state->sym_last_use);
   ir_temp_value_map_clear(&state->label_index);
-  if (!ir_cp_index_labels(function, state)) {
+  if (!ir_cp_reset_label_flow(state) || !ir_cp_index_labels(function, state)) {
     return 0;
   }
-  forward_only = ir_cp_all_edges_forward(function, state);
-  if (!ir_cp_note_uses(function, state)) {
-    return 0;
-  }
+  *forward_only = ir_cp_all_edges_forward(function, state);
+  return ir_cp_note_uses(function, state);
+}
+
+static int ir_cp_flow_pass(IRFunction *function, IRCopyPropState *state,
+                           int rewrite, int forward_only, int *flow_changed,
+                           int *round_changed) {
+  ir_temp_value_map_clear(&state->map);
+  ir_temp_value_map_clear(&state->symbol_map);
   for (size_t i = 0; i < function->instruction_count; i++) {
     if (!ir_cp_visit(function, state, i, rewrite, forward_only, flow_changed,
                      round_changed)) {
@@ -1099,17 +1099,18 @@ static int ir_cp_flow_pass(IRFunction *function, IRCopyPropState *state,
 
 static int ir_cp_round(IRFunction *function, IRCopyPropState *state,
                        int *round_changed) {
-  int flow_settled = 0;
+  int forward_only = 0;
 
   *round_changed = 0;
-  if (!ir_cp_reset_label_flow(state)) {
+  if (!ir_cp_prepare_round(function, state, &forward_only)) {
     return 0;
   }
+  int flow_settled = forward_only;
   for (int iteration = 0; iteration < 12; iteration++) {
     int flow_changed = 0;
     const int rewrite = flow_settled;
 
-    if (!ir_cp_flow_pass(function, state, rewrite, &flow_changed,
+    if (!ir_cp_flow_pass(function, state, rewrite, forward_only, &flow_changed,
                          round_changed)) {
       return 0;
     }
@@ -2099,6 +2100,57 @@ int ir_remove_empty_conditional_diamonds_pass(IRFunction *function,
   return 1;
 }
 
+static int ir_note_symbol_name(IRNameMap *names, const IROperand *operand) {
+  return !ir_operand_is_symbol(operand) ||
+         ir_name_map_add(names, operand->name, operand->name);
+}
+
+static int ir_note_symbol_names(IRNameMap *names, const IRInstruction *in) {
+  if (!ir_note_symbol_name(names, &in->dest) ||
+      !ir_note_symbol_name(names, &in->lhs) ||
+      !ir_note_symbol_name(names, &in->rhs)) {
+    return 0;
+  }
+  for (size_t a = 0; a < in->argument_count; a++) {
+    if (!ir_note_symbol_name(names, &in->arguments[a])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ir_is_symbol_declaration(const IRInstruction *in) {
+  return in->op == IR_OP_DECLARE_LOCAL && ir_operand_is_symbol(&in->dest);
+}
+
+static int ir_keep_declarations_still_named(const IRFunction *function,
+                                            unsigned char *reachable) {
+  int any_dead = 0;
+  for (size_t i = 0; i < function->instruction_count && !any_dead; i++) {
+    any_dead = !reachable[i] && ir_is_symbol_declaration(&function->instructions[i]);
+  }
+  if (!any_dead) {
+    return 1;
+  }
+  IRNameMap names = {0};
+  int ok = 1;
+  for (size_t i = 0; i < function->instruction_count && ok; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (reachable[i] && !ir_is_symbol_declaration(in)) {
+      ok = ir_note_symbol_names(&names, in);
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count && ok; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (!reachable[i] && ir_is_symbol_declaration(in) &&
+        ir_name_map_lookup(&names, in->dest.name)) {
+      reachable[i] = 1;
+    }
+  }
+  ir_name_map_destroy(&names);
+  return ok;
+}
+
 int ir_eliminate_unreachable_blocks_pass(IRFunction *function,
                                                 int *changed) {
   if (!function) {
@@ -2157,6 +2209,13 @@ int ir_eliminate_unreachable_blocks_pass(IRFunction *function,
         return 0;
       }
     }
+  }
+
+  if (!ir_keep_declarations_still_named(function, reachable_instructions)) {
+    ir_index_vector_destroy(&worklist);
+    free(reachable_blocks);
+    free(reachable_instructions);
+    return 0;
   }
 
   int local_changed = 0;
@@ -2690,31 +2749,40 @@ int ir_eliminate_unreachable_straightline_pass(IRFunction *function,
     return 0;
   }
 
+  unsigned char *live = malloc(function->instruction_count + 1);
+  if (!live) {
+    return 0;
+  }
+
   int reachable = 1;
-
   for (size_t i = 0; i < function->instruction_count; i++) {
-    IRInstruction *instruction = &function->instructions[i];
-
+    const IRInstruction *instruction = &function->instructions[i];
     if (instruction->op == IR_OP_LABEL) {
       reachable = 1;
-      continue;
     }
-
-    if (!reachable) {
-      if (instruction->op != IR_OP_NOP) {
-        ir_instruction_make_nop(instruction);
-        if (changed) {
-          *changed = 1;
-        }
-      }
-      continue;
-    }
-
-    if (instruction->op == IR_OP_JUMP || instruction->op == IR_OP_RETURN) {
+    live[i] = (unsigned char)reachable;
+    if (reachable &&
+        (instruction->op == IR_OP_JUMP || instruction->op == IR_OP_RETURN)) {
       reachable = 0;
     }
   }
 
+  if (!ir_keep_declarations_still_named(function, live)) {
+    free(live);
+    return 0;
+  }
+
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+    if (!live[i] && instruction->op != IR_OP_NOP) {
+      ir_instruction_make_nop(instruction);
+      if (changed) {
+        *changed = 1;
+      }
+    }
+  }
+
+  free(live);
   return 1;
 }
 

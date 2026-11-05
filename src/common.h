@@ -33,8 +33,14 @@ typedef ptrdiff_t ssize_t;
 #define METTLE_FNV1A_OFFSET_BASIS ((size_t)1469598103934665603ULL)
 #define METTLE_FNV1A_PRIME        ((size_t)1099511628211ULL)
 
+typedef struct {
+  int read;
+  const char *value;
+} MettleEnvOnce;
+
 char *mettle_strdup(const char *text);
 size_t mettle_fnv1a_hash(const char *str);
+const char *mettle_env_once(MettleEnvOnce *once, const char *name);
 void mettle_set_error(char **dest, const char *fmt, ...);
 void mettle_free_string(char *str);
 void mettle_free_string_array(char **values, size_t count);

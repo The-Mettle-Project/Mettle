@@ -15,6 +15,12 @@ typedef struct {
   IRInstructionVector out;
   int return_prepared;
   int any_naked;
+  unsigned *index;
+  size_t index_capacity;
+  IRNameMap addressed;
+  int addressed_ready;
+  size_t *typed;
+  size_t typed_capacity;
 } SafetyOrigins;
 
 static int origin_callee_is_naked(const SafetyOrigins *origins, const char *name) {
@@ -44,12 +50,85 @@ static int origin_call(SafetyOrigins *origins, SourceLocation location,
 
 static SafetyOrigin *origin_find(SafetyOrigins *origins, const IROperand *value) {
   if (!value || !value->name ||
-      (value->kind != IR_OPERAND_TEMP && value->kind != IR_OPERAND_SYMBOL)) return NULL;
-  for (size_t i = 0; i < origins->count; i++) {
-    if (origins->items[i].value.kind == value->kind &&
-        strcmp(origins->items[i].value.name, value->name) == 0) return &origins->items[i];
+      (value->kind != IR_OPERAND_TEMP && value->kind != IR_OPERAND_SYMBOL) ||
+      origins->index_capacity == 0) return NULL;
+  size_t mask = origins->index_capacity - 1;
+  for (size_t at = mettle_fnv1a_hash(value->name) & mask; origins->index[at];
+       at = (at + 1) & mask) {
+    SafetyOrigin *origin = &origins->items[origins->index[at] - 1];
+    if (origin->value.kind == value->kind &&
+        strcmp(origin->value.name, value->name) == 0) return origin;
   }
   return NULL;
+}
+
+static void origin_index_place(SafetyOrigins *origins, size_t item) {
+  size_t mask = origins->index_capacity - 1;
+  size_t at = mettle_fnv1a_hash(origins->items[item].value.name) & mask;
+  while (origins->index[at]) at = (at + 1) & mask;
+  origins->index[at] = (unsigned)(item + 1);
+}
+
+static int origin_index_add(SafetyOrigins *origins, size_t item) {
+  if ((item + 1) * 2 > origins->index_capacity) {
+    size_t capacity = origins->index_capacity ? origins->index_capacity * 2 : 128;
+    unsigned *index = calloc(capacity, sizeof(*index));
+    if (!index) return 0;
+    free(origins->index);
+    origins->index = index;
+    origins->index_capacity = capacity;
+    for (size_t i = 0; i < item; i++) origin_index_place(origins, i);
+  }
+  origin_index_place(origins, item);
+  return 1;
+}
+
+static int origin_typed_dest_at(const IRInstruction *in) {
+  return in->dest.name && in->op != IR_OP_STORE && in->value_type &&
+         (in->dest.kind == IR_OPERAND_TEMP || in->dest.kind == IR_OPERAND_SYMBOL);
+}
+
+static size_t *origin_typed_dest_slot(SafetyOrigins *origins, const IROperand *value) {
+  const IRInstruction *instructions = origins->function->instructions;
+  size_t mask = origins->typed_capacity - 1;
+  size_t at = mettle_fnv1a_hash(value->name) & mask;
+  while (origins->typed[at]) {
+    const IRInstruction *held = &instructions[origins->typed[at] - 1];
+    if (held->dest.kind == value->kind && !strcmp(held->dest.name, value->name)) break;
+    at = (at + 1) & mask;
+  }
+  return &origins->typed[at];
+}
+
+static MtlcType *origin_typed_dest_type(SafetyOrigins *origins, const IROperand *value) {
+  const IRFunction *function = origins->function;
+  if (!origins->typed) {
+    size_t capacity = 16;
+    while (capacity < function->instruction_count * 2 + 2) capacity *= 2;
+    origins->typed = calloc(capacity, sizeof(*origins->typed));
+    if (!origins->typed) return NULL;
+    origins->typed_capacity = capacity;
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *in = &function->instructions[i];
+      if (!origin_typed_dest_at(in)) continue;
+      size_t *slot = origin_typed_dest_slot(origins, &in->dest);
+      if (!*slot) *slot = i + 1;
+    }
+  }
+  size_t found = *origin_typed_dest_slot(origins, value);
+  return found ? function->instructions[found - 1].value_type : NULL;
+}
+
+static int origin_name_is_addressed(SafetyOrigins *origins, const char *name) {
+  if (!origins->addressed_ready) {
+    for (size_t i = 0; i < origins->function->instruction_count; i++) {
+      const IRInstruction *in = &origins->function->instructions[i];
+      if (in->op == IR_OP_ADDRESS_OF && ir_operand_is_symbol(&in->lhs) &&
+          !ir_name_map_add(&origins->addressed, in->lhs.name, in->lhs.name)) return 1;
+    }
+    origins->addressed_ready = 1;
+  }
+  return ir_name_map_lookup(&origins->addressed, name) != NULL;
 }
 
 static MtlcType *origin_symbol_type(SafetyOrigins *origins, const char *name) {
@@ -76,7 +155,8 @@ static int origin_add(SafetyOrigins *origins, const IROperand *value) {
   }
   SafetyOrigin *origin = &origins->items[origins->count++];
   memset(origin, 0, sizeof(*origin));
-  if (!ir_operand_clone(value, &origin->value)) return 0;
+  if (!ir_operand_clone(value, &origin->value) ||
+      !origin_index_add(origins, origins->count - 1)) return 0;
   char name[64];
   snprintf(name, sizeof(name), ".safe_identity_%u", g_safety_next_id++);
   origin->identity = ir_operand_symbol(name);
@@ -89,23 +169,12 @@ static int origin_add(SafetyOrigins *origins, const IROperand *value) {
         type->kind != MTLC_TYPE_STRING && type->kind != MTLC_TYPE_TAGGED_ENUM) {
       origin->memory_size = type->size;
       const IRModuleSymbol *symbol = ir_program_lookup_symbol(origins->program, value->name);
-      origin->memory = symbol && symbol->kind == IR_MODSYM_VARIABLE;
-      for (size_t i = 0; i < origins->function->instruction_count; i++) {
-        const IRInstruction *in = &origins->function->instructions[i];
-        if (in->op == IR_OP_ADDRESS_OF && in->lhs.kind == IR_OPERAND_SYMBOL &&
-            in->lhs.name && strcmp(in->lhs.name, value->name) == 0) origin->memory = 1;
-      }
+      origin->memory = (symbol && symbol->kind == IR_MODSYM_VARIABLE) ||
+          origin_name_is_addressed(origins, value->name);
     }
   }
   if (!origin->type) {
-    for (size_t i = 0; i < origins->function->instruction_count; i++) {
-      const IRInstruction *in = &origins->function->instructions[i];
-      if (in->dest.kind == value->kind && in->dest.name &&
-          !strcmp(in->dest.name, value->name) && in->op != IR_OP_STORE && in->value_type) {
-        origin->type = in->value_type;
-        break;
-      }
-    }
+    origin->type = origin_typed_dest_type(origins, value);
   }
   return 1;
 }
@@ -927,6 +996,9 @@ done:
     ir_operand_destroy(&origins.items[i].identity);
   }
   free(origins.items);
+  free(origins.index);
+  free(origins.typed);
+  ir_name_map_destroy(&origins.addressed);
   ir_instruction_vector_destroy(&origins.out);
   return ok;
 }
@@ -1011,7 +1083,7 @@ static int safety_wrap_allocator_address(IRProgram *program, char **reference) {
       ir_function_destroy(wrapper); free(replacement); return 0;
     }
   }
-  free(*reference);
+  mettle_free_string(*reference);
   *reference = replacement;
   return 1;
 }

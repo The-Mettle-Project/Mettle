@@ -1,5 +1,6 @@
 #include "ir_analysis.h"
 
+#include "../common.h"
 #include "ir.h"
 
 #include <stdio.h>
@@ -1192,7 +1193,8 @@ static const size_t *ir_function_dominance_frontier_fwd(IRFunction *function,
                                                         size_t *count_out);
 
 size_t ir_analysis_self_check(IRFunction *function) {
-  const char *setting = getenv("METTLE_DOM_CROSSCHECK");
+  static MettleEnvOnce crosscheck;
+  const char *setting = mettle_env_once(&crosscheck, "METTLE_DOM_CROSSCHECK");
   if (!setting || !*setting) {
     return 0;
   }

@@ -13,6 +13,13 @@ static char *ir_intern_name(const char *name) {
   return mettle_strdup(name);
 }
 
+char *ir_name_share(const char *name) {
+  if (!name) {
+    return NULL;
+  }
+  return (char *)(string_is_interned(name) ? name : string_intern(name));
+}
+
 typedef struct {
   const char *name;
   MtlcIntrinsic intrinsic;
@@ -788,14 +795,14 @@ IROperand ir_operand_none(void) {
 IROperand ir_operand_temp(const char *name) {
   IROperand operand = ir_operand_none();
   operand.kind = IR_OPERAND_TEMP;
-  operand.name = ir_intern_name(name);
+  operand.name = ir_name_share(name);
   return operand;
 }
 
 IROperand ir_operand_symbol(const char *name) {
   IROperand operand = ir_operand_none();
   operand.kind = IR_OPERAND_SYMBOL;
-  operand.name = ir_intern_name(name);
+  operand.name = ir_name_share(name);
   return operand;
 }
 
@@ -859,7 +866,7 @@ size_t ir_operand_string_length(const IROperand *operand) {
 IROperand ir_operand_label(const char *name) {
   IROperand operand = ir_operand_none();
   operand.kind = IR_OPERAND_LABEL;
-  operand.name = ir_intern_name(name);
+  operand.name = ir_name_share(name);
   return operand;
 }
 
@@ -6660,6 +6667,7 @@ static struct {
   size_t instruction_count;
   IRDeclarationBucket *buckets;
   size_t bucket_count;
+  size_t bucket_capacity;
 } g_ir_declaration_maps[IR_DECLARATION_MAP_SLOTS];
 static size_t g_ir_declaration_map_next;
 
@@ -6688,7 +6696,7 @@ static size_t ir_declaration_map_build(const IRFunction *function) {
   while (want < (declarations + 1) * 4) {
     want *= 2;
   }
-  if (g_ir_declaration_maps[slot].bucket_count < want) {
+  if (g_ir_declaration_maps[slot].bucket_capacity < want) {
     IRDeclarationBucket *grown =
         realloc(g_ir_declaration_maps[slot].buckets,
                 want * sizeof(IRDeclarationBucket));
@@ -6697,9 +6705,9 @@ static size_t ir_declaration_map_build(const IRFunction *function) {
       return IR_DECLARATION_MAP_SLOTS;
     }
     g_ir_declaration_maps[slot].buckets = grown;
-    g_ir_declaration_maps[slot].bucket_count = want;
+    g_ir_declaration_maps[slot].bucket_capacity = want;
   }
-  want = g_ir_declaration_maps[slot].bucket_count;
+  g_ir_declaration_maps[slot].bucket_count = want;
   memset(g_ir_declaration_maps[slot].buckets, 0,
          want * sizeof(IRDeclarationBucket));
 

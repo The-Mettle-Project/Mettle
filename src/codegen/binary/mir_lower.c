@@ -9639,89 +9639,127 @@ static int mir_inst_reads_vreg(const MirInst *in, MirVregId v) {
   return 0;
 }
 
-static int mir_operand_reads_vreg_outside_mem_base(const MirOperand *op,
-                                                   MirVregId v) {
-  if (op->kind == MIR_OPK_VREG) {
-    return op->vreg == v;
+typedef struct {
+  int *touches;
+  int *base_head;
+  int *base_next;
+} MirLocalAddressIndex;
+
+static MirOperand *mir_inst_operand_at(MirInst *in, int k) {
+  return k == 0 ? &in->a : k == 1 ? &in->b : &in->dst;
+}
+
+static int mir_operand_touched_vreg(const MirOperand *op) {
+  return op->kind == MIR_OPK_VREG ? op->vreg
+         : op->kind == MIR_OPK_MEM ? op->mem.index
+                                   : MIR_VREG_NONE;
+}
+
+static void mir_inst_note_touches(const MirFunction *fn, MirInst *in,
+                                  int *touches, int by) {
+  for (int k = 0; k < 3; k++) {
+    int v = mir_operand_touched_vreg(mir_inst_operand_at(in, k));
+    if (v >= 0 && (size_t)v < fn->vreg_count) {
+      touches[v] += by;
+    }
   }
-  if (op->kind == MIR_OPK_MEM) {
-    return op->mem.index == v;
+}
+
+static int mir_local_address_index_build(MirFunction *fn,
+                                         MirLocalAddressIndex *index) {
+  index->touches = calloc(fn->vreg_count, sizeof(int));
+  index->base_head = malloc(fn->vreg_count * sizeof(int));
+  index->base_next = malloc(fn->insn_count * 3 * sizeof(int));
+  if (!index->touches || !index->base_head || !index->base_next) {
+    return 0;
+  }
+  for (size_t v = 0; v < fn->vreg_count; v++) {
+    index->base_head[v] = -1;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirInst *in = &fn->insns[i];
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+    mir_inst_note_touches(fn, in, index->touches, 1);
+    for (int k = 0; k < 3; k++) {
+      const MirOperand *op = mir_inst_operand_at(in, k);
+      if (op->kind == MIR_OPK_MEM && op->mem.base >= 0 &&
+          (size_t)op->mem.base < fn->vreg_count) {
+        int entry = (int)(i * 3) + k;
+        index->base_next[entry] = index->base_head[op->mem.base];
+        index->base_head[op->mem.base] = entry;
+      }
+    }
+  }
+  return 1;
+}
+
+static int mir_rehome_address_bases(MirFunction *fn,
+                                    const MirLocalAddressIndex *index,
+                                    size_t lea_at, MirVregId addr,
+                                    MirVregId local) {
+  int folded = 0;
+  for (int entry = index->base_head[addr]; entry >= 0;
+       entry = index->base_next[entry]) {
+    size_t at = (size_t)entry / 3;
+    MirInst *in = &fn->insns[at];
+    MirOperand *op = mir_inst_operand_at(in, entry % 3);
+    if (at == lea_at || in->op == MIR_NOP || op->kind != MIR_OPK_MEM ||
+        op->mem.base != addr || op->mem.phys_base_valid ||
+        op->mem.frame_home_valid) {
+      continue;
+    }
+    op->mem.base = MIR_VREG_NONE;
+    op->mem.frame_home_valid = 1;
+    op->mem.frame_home = local;
+    folded = 1;
+  }
+  return folded;
+}
+
+static int mir_any_local_address(const MirFunction *fn) {
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    if (fn->insns[i].op == MIR_LEA_LOCAL) {
+      return 1;
+    }
   }
   return 0;
 }
 
 static void mir_root_local_addresses(MirFunction *fn) {
-  size_t i;
-  if (!fn || fn->insn_count == 0 || fn->vreg_count == 0) {
+  if (!fn || fn->insn_count == 0 || fn->vreg_count == 0 ||
+      !mir_any_local_address(fn)) {
     return;
   }
-  for (i = 0; i < fn->insn_count; i++) {
-    MirInst *lea = &fn->insns[i];
-    MirVregId addr;
-    MirVregId local;
-    size_t u;
-    int usable = 1;
-    int folded = 0;
-    if (lea->op != MIR_LEA_LOCAL || lea->dst.kind != MIR_OPK_VREG ||
-        lea->a.kind != MIR_OPK_VREG) {
-      continue;
-    }
-    addr = lea->dst.vreg;
-    local = lea->a.vreg;
-    if ((size_t)local >= fn->vreg_count || fn->vregs[local].in_register ||
-        fn->vregs[addr].address_taken) {
-      continue;
-    }
-    for (u = 0; u < fn->insn_count && usable; u++) {
-      const MirInst *in = &fn->insns[u];
-      const MirOperand *ops[3];
-      int k;
-      if (u == i || in->op == MIR_NOP) {
+  MirLocalAddressIndex index = {0};
+  if (mir_local_address_index_build(fn, &index)) {
+    for (size_t i = 0; i < fn->insn_count; i++) {
+      MirInst *lea = &fn->insns[i];
+      if (lea->op != MIR_LEA_LOCAL || lea->dst.kind != MIR_OPK_VREG ||
+          lea->a.kind != MIR_OPK_VREG) {
         continue;
       }
-      if (in->dst.kind == MIR_OPK_VREG && in->dst.vreg == addr) {
-        usable = 0;
-        break;
-      }
-      ops[0] = &in->a;
-      ops[1] = &in->b;
-      ops[2] = &in->dst;
-      for (k = 0; k < 3; k++) {
-        if (mir_operand_reads_vreg_outside_mem_base(ops[k], addr)) {
-          usable = 0;
-          break;
-        }
-      }
-    }
-    if (!usable) {
-      continue;
-    }
-    for (u = 0; u < fn->insn_count; u++) {
-      MirInst *in = &fn->insns[u];
-      MirOperand *ops[3];
-      int k;
-      if (u == i || in->op == MIR_NOP) {
+      MirVregId addr = lea->dst.vreg;
+      MirVregId local = lea->a.vreg;
+      if ((size_t)local >= fn->vreg_count || fn->vregs[local].in_register ||
+          fn->vregs[addr].address_taken) {
         continue;
       }
-      ops[0] = &in->a;
-      ops[1] = &in->b;
-      ops[2] = &in->dst;
-      for (k = 0; k < 3; k++) {
-        MirOperand *op = ops[k];
-        if (op->kind != MIR_OPK_MEM || op->mem.base != addr ||
-            op->mem.phys_base_valid || op->mem.frame_home_valid) {
-          continue;
-        }
-        op->mem.base = MIR_VREG_NONE;
-        op->mem.frame_home_valid = 1;
-        op->mem.frame_home = local;
-        folded = 1;
+      int own = 0;
+      for (int k = 0; k < 3; k++) {
+        own += mir_operand_touched_vreg(mir_inst_operand_at(lea, k)) == addr;
       }
-    }
-    if (folded) {
-      lea->op = MIR_NOP;
+      if (index.touches[addr] == own &&
+          mir_rehome_address_bases(fn, &index, i, addr, local)) {
+        mir_inst_note_touches(fn, lea, index.touches, -1);
+        lea->op = MIR_NOP;
+      }
     }
   }
+  free(index.touches);
+  free(index.base_head);
+  free(index.base_next);
 }
 
 static int mir_mem_has_scalable_index(const MirOperand *op, MirVregId idx) {
@@ -9730,19 +9768,42 @@ static int mir_mem_has_scalable_index(const MirOperand *op, MirVregId idx) {
          op->mem.base != idx;
 }
 
-static int mir_scale_every_index_use(MirFunction *fn, MirVregId idx, int uses,
-                                     int scale) {
+static int mir_inst_read_count(const MirInst *in, MirVregId v) {
+  int count = 0;
+  for (int k = 0; k < 3; k++) {
+    const MirOperand *op = k == 0 ? &in->a : k == 1 ? &in->b : &in->dst;
+    MirVregId r[2];
+    if (k == 2 && op->kind == MIR_OPK_VREG) {
+      continue;
+    }
+    mir_operand_reads_pair(op, r);
+    count += (r[0] == v) + (r[1] == v);
+  }
+  return count;
+}
+
+static int mir_index_uses_all_scalable(const MirFunction *fn, MirVregId idx,
+                                       int uses, size_t from) {
   int found = 0;
-  for (size_t u = 0; u < fn->insn_count; u++) {
-    const MirInst *in = &fn->insns[u];
+  for (size_t n = 0; n < fn->insn_count && found < uses; n++) {
+    const MirInst *in = &fn->insns[(from + n) % fn->insn_count];
     if (in->op == MIR_NOP) {
       continue;
     }
-    found += mir_mem_has_scalable_index(&in->a, idx);
-    found += mir_mem_has_scalable_index(&in->b, idx);
-    found += mir_mem_has_scalable_index(&in->dst, idx);
+    int scalable = mir_mem_has_scalable_index(&in->a, idx) +
+                   mir_mem_has_scalable_index(&in->b, idx) +
+                   mir_mem_has_scalable_index(&in->dst, idx);
+    if (mir_inst_read_count(in, idx) > scalable) {
+      return 0;
+    }
+    found += scalable;
   }
-  if (found != uses) {
+  return found == uses;
+}
+
+static int mir_scale_every_index_use(MirFunction *fn, MirVregId idx, int uses,
+                                     int scale, size_t from) {
+  if (!mir_index_uses_all_scalable(fn, idx, uses, from)) {
     return 0;
   }
   for (size_t u = 0; u < fn->insn_count; u++) {
@@ -9797,7 +9858,7 @@ static void mir_fold_index_scale(MirFunction *fn) {
       continue;
     }
     if (uses[idx] > 1) {
-      if (mir_scale_every_index_use(fn, idx, uses[idx], scale)) {
+      if (mir_scale_every_index_use(fn, idx, uses[idx], scale, i)) {
         mul->b.imm = rest;
       }
       continue;
@@ -10872,7 +10933,8 @@ static void mir_slp_pair_f64(MirFunction *fn) {
     }
 
     int changed = 0;
-    int dbg = getenv("METTLE_SLP_TRACE") != NULL;
+    static MettleEnvOnce slp_trace;
+    int dbg = mettle_env_once(&slp_trace, "METTLE_SLP_TRACE") != NULL;
     for (size_t i = 0; i + 1 < fn->insn_count && !changed; i++) {
       const MirInst *a = &fn->insns[i];
       if (!mir_slp_is_f64_store(a)) {

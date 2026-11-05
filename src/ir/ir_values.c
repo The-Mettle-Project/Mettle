@@ -1,5 +1,6 @@
 #include "ir_values.h"
 
+#include "../common.h"
 #include "../compiler/compiler_crash.h"
 #include "ir.h"
 
@@ -38,7 +39,7 @@ void ir_value_table_clear(IRValueTable *table) {
     return;
   }
   for (size_t i = 0; i < table->count; i++) {
-    free(table->entries[i].name);
+    mettle_free_string(table->entries[i].name);
   }
   free(table->entries);
   free(table->buckets);
@@ -78,7 +79,8 @@ uint32_t ir_value_table_lookup(const IRValueTable *table, unsigned char kind,
   while (table->buckets[slot]) {
     const uint32_t id = table->buckets[slot];
     const IRValueEntry *entry = &table->entries[id - 1];
-    if (entry->kind == kind && entry->name && strcmp(entry->name, name) == 0) {
+    if (entry->kind == kind && entry->name &&
+        (entry->name == name || strcmp(entry->name, name) == 0)) {
       return id;
     }
     slot = (slot + 1) & mask;
@@ -100,12 +102,10 @@ static uint32_t ir_value_table_add(IRValueTable *table, unsigned char kind,
     table->capacity = capacity;
   }
 
-  const size_t length = strlen(name);
-  char *stored = (char *)malloc(length + 1);
+  char *stored = ir_name_share(name);
   if (!stored) {
     return IR_VALUE_ID_NONE;
   }
-  memcpy(stored, name, length + 1);
 
   IRValueEntry *entry = &table->entries[table->count];
   entry->name = stored;
@@ -121,7 +121,7 @@ static uint32_t ir_value_table_add(IRValueTable *table, unsigned char kind,
         table->bucket_count ? table->bucket_count * 2 : IR_VALUE_TABLE_MIN_BUCKETS;
     if (!ir_value_table_rehash(table, bucket_count)) {
       table->count--;
-      free(stored);
+      mettle_free_string(stored);
       return IR_VALUE_ID_NONE;
     }
     return id;
@@ -242,7 +242,8 @@ void ir_value_maybe_sabotage(IRFunction *function, const char *pass_name) {
   if (g_value_sabotage_fired || !function || !pass_name) {
     return;
   }
-  const char *spec = getenv("METTLE_VALUE_IDS_BREAK");
+  static MettleEnvOnce break_spec;
+  const char *spec = mettle_env_once(&break_spec, "METTLE_VALUE_IDS_BREAK");
   if (!spec || !*spec) {
     return;
   }
@@ -262,7 +263,7 @@ void ir_value_maybe_sabotage(IRFunction *function, const char *pass_name) {
     }
     memcpy(renamed, dest->name, length);
     memcpy(renamed + length, "_sabotage", 10);
-    free(dest->name);
+    mettle_free_string(dest->name);
     dest->name = renamed;
     g_value_sabotage_fired = 1;
     return;
@@ -421,7 +422,8 @@ size_t ir_silent_structure_count(void) { return g_silent_structure; }
 void ir_check_silent_structure(const IRFunction *function,
                                const char *pass_name, uint64_t before,
                                uint64_t structure_before) {
-  if (!getenv("METTLE_CFG_AUDIT") || !function) {
+  static MettleEnvOnce audit;
+  if (!mettle_env_once(&audit, "METTLE_CFG_AUDIT") || !function) {
     return;
   }
   const uint64_t after = ir_function_structure_fingerprint(function);
@@ -444,7 +446,8 @@ size_t ir_silent_mutation_count(void) { return g_silent_mutations; }
 
 void ir_check_silent_mutation(const IRFunction *function, const char *pass_name,
                               uint64_t before, uint64_t generation_before) {
-  if (!getenv("METTLE_CACHE_AUDIT") || !function) {
+  static MettleEnvOnce audit;
+  if (!mettle_env_once(&audit, "METTLE_CACHE_AUDIT") || !function) {
     return;
   }
   const uint64_t after = ir_function_fingerprint(function);
@@ -562,7 +565,8 @@ int ir_function_number_values(IRFunction *function) {
         const IRValueEntry *carried =
             &function->values.entries[operand->value_id - 1];
         if (carried->kind == (unsigned char)operand->kind && carried->name &&
-            strcmp(carried->name, operand->name) == 0) {
+            (carried->name == operand->name ||
+             strcmp(carried->name, operand->name) == 0)) {
           continue;
         }
       }
@@ -574,6 +578,23 @@ int ir_function_number_values(IRFunction *function) {
       operand->value_id = id;
     }
   }
+  return 1;
+}
+
+int ir_function_number_values_if_stale(IRFunction *function) {
+  if (!function) {
+    return 0;
+  }
+  if (function->numbered_generation == function->generation &&
+      function->numbered_instruction_count == function->instruction_count &&
+      function->generation != 0) {
+    return 1;
+  }
+  if (!ir_function_number_values(function)) {
+    return 0;
+  }
+  function->numbered_generation = function->generation;
+  function->numbered_instruction_count = function->instruction_count;
   return 1;
 }
 

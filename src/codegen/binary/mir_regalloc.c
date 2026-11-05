@@ -1438,7 +1438,8 @@ static void mir_ra_facts_at(MirRaFacts *facts, MirRaScan *scan,
   if (live_gp > facts->max_live_gp) {
     facts->max_live_gp = live_gp;
     facts->max_live_at = i;
-    if (getenv("METTLE_RA_LIVE_DUMP")) {
+    static MettleEnvOnce live_dump;
+    if (mettle_env_once(&live_dump, "METTLE_RA_LIVE_DUMP")) {
       fprintf(stderr, "RA-LIVE\t%s\tinsn=%zu\tgp=%d:", mir_ra_trace_name(), i,
               live_gp);
       for (size_t w = 0; w < facts->cfg.words; w++) {
@@ -2679,7 +2680,8 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
     mir_color_state_free(&st);
     return 0;
   }
-  if (getenv("METTLE_RA_COALESCE_CHECK")) {
+  static MettleEnvOnce coalesce_check;
+  if (mettle_env_once(&coalesce_check, "METTLE_RA_COALESCE_CHECK")) {
     mir_color_check_merged_graph(&st, gp_leaf_pool, gp_leaf_n, gp_cross_pool,
                                  gp_cross_n, allow_rbp);
   }

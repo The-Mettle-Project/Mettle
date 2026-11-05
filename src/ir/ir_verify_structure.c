@@ -232,7 +232,8 @@ void ir_structure_maybe_sabotage(IRFunction *function, const char *pass_name) {
   if (g_structure_sabotage_fired || !function || !pass_name) {
     return;
   }
-  const char *spec = getenv("METTLE_IR_STRUCT_BREAK");
+  static MettleEnvOnce break_spec;
+  const char *spec = mettle_env_once(&break_spec, "METTLE_IR_STRUCT_BREAK");
   if (!spec || !*spec) {
     return;
   }
@@ -490,7 +491,8 @@ static void ir_phi_check_declarations(IRFunction *function,
 }
 
 void ir_phi_check_after_pass(IRFunction *function, const char *pass_name) {
-  if (!getenv("METTLE_PHI_AUDIT") || !function) {
+  static MettleEnvOnce audit;
+  if (!mettle_env_once(&audit, "METTLE_PHI_AUDIT") || !function) {
     return;
   }
   ir_phi_check_declarations(function, pass_name);

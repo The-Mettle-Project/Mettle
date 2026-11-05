@@ -94,6 +94,14 @@ size_t mettle_fnv1a_hash(const char *str) {
   return hash;
 }
 
+const char *mettle_env_once(MettleEnvOnce *once, const char *name) {
+  if (!once->read) {
+    once->value = getenv(name);
+    once->read = 1;
+  }
+  return once->value;
+}
+
 void mettle_set_error(char **dest, const char *fmt, ...) {
   char buffer[512];
   va_list args;

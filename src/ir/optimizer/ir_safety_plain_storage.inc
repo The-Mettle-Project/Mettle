@@ -9,6 +9,7 @@ typedef struct {
   IRProgram *program;
   SafetyPlainArray *arrays;
   size_t count;
+  unsigned taint_epoch;
 } SafetyPlainStorage;
 
 typedef struct {
@@ -26,6 +27,8 @@ typedef struct {
   SafetyPlainName *names;
   size_t mask;
   int *next_def;
+  unsigned char *tainted;
+  unsigned tainted_epoch;
 } SafetyPlainIndex;
 
 static SafetyPlainIndex *g_safety_plain_index = NULL;
@@ -39,6 +42,7 @@ static void safety_plain_index_drop(void) {
     }
     free(index->names);
     free(index->next_def);
+    free(index->tainted);
   }
   free(g_safety_plain_index);
   g_safety_plain_index = NULL;
@@ -330,37 +334,117 @@ static int safety_plain_allowed_use(SafetyPlainStorage *state,
          !strcmp(in->text, "mettle_safety_span_identity");
 }
 
-static int safety_plain_tainted(SafetyPlainStorage *state,
-    const IRFunction *fn, const IROperand *value,
-    const IROperand **path, int depth) {
-  if (value->kind == IR_OPERAND_INT) return value->int_value != 0;
-  if (!value->name || depth == 64) return 1;
-  for (int i = 0; i < depth; i++)
-    if (safety_operand_same(path[i], value)) return 0;
-  path[depth] = value;
-  int found = 0;
-  const SafetyPlainIndex *index = NULL;
-  const SafetyPlainName *defs = safety_plain_lookup(state, fn, value, &index);
-  for (int at = defs ? defs->first_def : -1; at >= 0; at = index->next_def[at]) {
-    const IRInstruction *in = &fn->instructions[at];
-    found = 1;
-    if (in->op == IR_OP_ASSIGN) {
-      if (safety_plain_tainted(state, fn, &in->lhs, path, depth + 1)) return 1;
-    } else if (in->op == IR_OP_CALL && in->text &&
-               !strcmp(in->text, "mettle_safety_value_load") &&
-               in->argument_count == 3) {
-      SafetyPlainArray *array = safety_plain_root(state, fn, &in->arguments[0], 0);
-      if (!array || array->rejected) return 1;
-    } else if (in->op == IR_OP_CALL && in->text &&
-               (!strcmp(in->text, "mettle_safety_merge_identity") ||
-                !strcmp(in->text, "mettle_safety_subtract_identity")) &&
-               in->argument_count == 2) {
-      if (safety_plain_tainted(state, fn, &in->arguments[0], path, depth + 1) ||
-          safety_plain_tainted(state, fn, &in->arguments[1], path, depth + 1))
-        return 1;
-    } else return 1;
+enum { SAFETY_TAINT_CLEAN, SAFETY_TAINT_SET, SAFETY_TAINT_EDGE };
+
+typedef struct {
+  unsigned char *tainted;
+  int *head;
+  int *next;
+  size_t *to;
+  size_t edges;
+  size_t *stack;
+  size_t depth;
+} SafetyTaintGraph;
+
+static int safety_plain_operand_taint(const SafetyPlainIndex *index,
+    const IROperand *value, size_t *slot) {
+  if (value->kind == IR_OPERAND_INT)
+    return value->int_value != 0 ? SAFETY_TAINT_SET : SAFETY_TAINT_CLEAN;
+  if (!value->name ||
+      (value->kind != IR_OPERAND_TEMP && value->kind != IR_OPERAND_SYMBOL))
+    return SAFETY_TAINT_SET;
+  const SafetyPlainName *name = safety_plain_name_slot(index, value->kind, value->name);
+  if (!name->name || name->first_def < 0) return SAFETY_TAINT_SET;
+  *slot = (size_t)(name - index->names);
+  return SAFETY_TAINT_EDGE;
+}
+
+static void safety_taint_mark(SafetyTaintGraph *graph, size_t slot) {
+  if (graph->tainted[slot]) return;
+  graph->tainted[slot] = 1;
+  graph->stack[graph->depth++] = slot;
+}
+
+static void safety_taint_operand(SafetyTaintGraph *graph,
+    const SafetyPlainIndex *index, const IROperand *value, size_t node) {
+  size_t from = 0;
+  int kind = safety_plain_operand_taint(index, value, &from);
+  if (kind == SAFETY_TAINT_SET) {
+    safety_taint_mark(graph, node);
+  } else if (kind == SAFETY_TAINT_EDGE) {
+    graph->to[graph->edges] = node;
+    graph->next[graph->edges] = graph->head[from];
+    graph->head[from] = (int)graph->edges++;
   }
-  return !found;
+}
+
+static void safety_taint_definition(SafetyPlainStorage *state, const IRFunction *fn,
+    SafetyTaintGraph *graph, const SafetyPlainIndex *index,
+    const IRInstruction *in, size_t node) {
+  if (in->op == IR_OP_ASSIGN) {
+    safety_taint_operand(graph, index, &in->lhs, node);
+  } else if (in->op == IR_OP_CALL && in->text &&
+             !strcmp(in->text, "mettle_safety_value_load") &&
+             in->argument_count == 3) {
+    SafetyPlainArray *array = safety_plain_root(state, fn, &in->arguments[0], 0);
+    if (!array || array->rejected) safety_taint_mark(graph, node);
+  } else if (in->op == IR_OP_CALL && in->text &&
+             (!strcmp(in->text, "mettle_safety_merge_identity") ||
+              !strcmp(in->text, "mettle_safety_subtract_identity")) &&
+             in->argument_count == 2) {
+    safety_taint_operand(graph, index, &in->arguments[0], node);
+    safety_taint_operand(graph, index, &in->arguments[1], node);
+  } else {
+    safety_taint_mark(graph, node);
+  }
+}
+
+static int safety_plain_solve_taint(SafetyPlainStorage *state, const IRFunction *fn,
+    SafetyPlainIndex *index) {
+  size_t slots = index->mask + 1;
+  size_t edge_room = fn->instruction_count * 2 + 1;
+  SafetyTaintGraph graph = {0};
+  if (!index->tainted) index->tainted = malloc(slots);
+  graph.tainted = index->tainted;
+  graph.head = malloc(slots * sizeof(*graph.head));
+  graph.next = malloc(edge_room * sizeof(*graph.next));
+  graph.to = malloc(edge_room * sizeof(*graph.to));
+  graph.stack = malloc(slots * sizeof(*graph.stack));
+  int ok = graph.tainted && graph.head && graph.next && graph.to && graph.stack;
+  if (ok) {
+    memset(graph.tainted, 0, slots);
+    for (size_t s = 0; s < slots; s++) graph.head[s] = -1;
+    for (size_t s = 0; s < slots; s++) {
+      const SafetyPlainName *name = &index->names[s];
+      if (!name->name) continue;
+      if (name->first_def < 0) safety_taint_mark(&graph, s);
+      for (int at = name->first_def; at >= 0; at = index->next_def[at])
+        safety_taint_definition(state, fn, &graph, index, &fn->instructions[at], s);
+    }
+    while (graph.depth) {
+      size_t from = graph.stack[--graph.depth];
+      for (int e = graph.head[from]; e >= 0; e = graph.next[e])
+        safety_taint_mark(&graph, graph.to[e]);
+    }
+    index->tainted_epoch = state->taint_epoch + 1;
+  }
+  free(graph.head);
+  free(graph.next);
+  free(graph.to);
+  free(graph.stack);
+  return ok;
+}
+
+static int safety_plain_value_tainted(SafetyPlainStorage *state,
+    const IRFunction *fn, const IROperand *value) {
+  if (value->kind == IR_OPERAND_INT) return value->int_value != 0;
+  SafetyPlainIndex *index = (SafetyPlainIndex *)safety_plain_index_of(state, fn);
+  if (!index) return 1;
+  if (index->tainted_epoch != state->taint_epoch + 1 &&
+      !safety_plain_solve_taint(state, fn, index)) return 1;
+  size_t slot = 0;
+  int kind = safety_plain_operand_taint(index, value, &slot);
+  return kind == SAFETY_TAINT_EDGE ? index->tainted[slot] : kind == SAFETY_TAINT_SET;
 }
 
 static int safety_plain_read_intrinsic(const IRInstruction *in) {
@@ -583,10 +667,10 @@ static int safety_simplify_plain_storage(IRProgram *program) {
             strcmp(in->text, "mettle_safety_value_store") || in->argument_count != 4)
           continue;
         SafetyPlainArray *array = safety_plain_root(&state, fn, &in->arguments[0], 0);
-        const IROperand *path[64];
         if (array && !array->rejected &&
-            safety_plain_tainted(&state, fn, &in->arguments[2], path, 0)) {
+            safety_plain_value_tainted(&state, fn, &in->arguments[2])) {
           array->rejected = 1;
+          state.taint_epoch++;
           changed = 1;
         }
       }
@@ -602,6 +686,7 @@ static int safety_simplify_plain_storage(IRProgram *program) {
             fprintf(stderr, "safety: plain storage copy source in %s can hold origins\n",
                     fn->name ? fn->name : "?");
           array->rejected = 1;
+          state.taint_epoch++;
           changed = 1;
         }
       }
@@ -628,9 +713,8 @@ static int safety_simplify_plain_storage(IRProgram *program) {
     }
     for (size_t i = 0; i < fn->instruction_count; i++) {
       IRInstruction *in = &fn->instructions[i];
-      const IROperand *path[64];
       if (!safety_plain_read_intrinsic(in) ||
-          safety_plain_tainted(&state, fn, &in->dest, path, 0)) continue;
+          safety_plain_value_tainted(&state, fn, &in->dest)) continue;
       IROperand dest = ir_operand_none();
       if (!ir_operand_clone(&in->dest, &dest)) { safety_plain_index_drop(); free(state.arrays); return 0; }
       ir_instruction_make_nop(in);
@@ -643,9 +727,8 @@ static int safety_simplify_plain_storage(IRProgram *program) {
       for (size_t a = 0; a < in->argument_count + 2; a++) {
         IROperand *value = a == 0 ? &in->lhs : a == 1 ? &in->rhs :
                                                     &in->arguments[a - 2];
-        const IROperand *path[64];
         if (value->name && !strncmp(value->name, ".safe_identity_", 15) &&
-            !safety_plain_tainted(&state, fn, value, path, 0)) {
+            !safety_plain_value_tainted(&state, fn, value)) {
           ir_operand_destroy(value);
           *value = ir_operand_int(0);
         }

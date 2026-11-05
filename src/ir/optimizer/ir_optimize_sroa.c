@@ -1118,6 +1118,14 @@ static void ir_sroa_note_piece_read(IRSroaHash *reads, const IROperand *operand)
   }
 }
 
+static int ir_sroa_write_can_drop(const IRInstruction *in) {
+  if (in->op == IR_OP_DECLARE_LOCAL || (in->op == IR_OP_LOAD && !in->is_volatile)) {
+    return 1;
+  }
+  return in->op != IR_OP_ADDRESS_OF &&
+         ir_instruction_is_trivially_dead_if_dest_unused(in);
+}
+
 static void ir_sroa_drop_unread_pieces(IRFunction *function) {
   for (int removed = 1; removed;) {
     IRSroaHash reads = {0};
@@ -1127,7 +1135,7 @@ static void ir_sroa_drop_unread_pieces(IRFunction *function) {
     }
     for (size_t i = 0; i < function->instruction_count; i++) {
       const IRInstruction *in = &function->instructions[i];
-      if (in->op == IR_OP_ADDRESS_OF || in->op == IR_OP_STORE) {
+      if (!ir_sroa_write_can_drop(in)) {
         ir_sroa_note_piece_read(&reads, &in->dest);
       }
       ir_sroa_note_piece_read(&reads, &in->lhs);
@@ -1147,10 +1155,7 @@ static void ir_sroa_drop_unread_pieces(IRFunction *function) {
           ir_sroa_hash_get(&reads, in->dest.name)) {
         continue;
       }
-      if (in->op == IR_OP_DECLARE_LOCAL || in->op == IR_OP_ASSIGN ||
-          (in->op == IR_OP_LOAD && !in->is_volatile)) {
-        unread[i] = 1;
-      }
+      unread[i] = 1;
     }
     free(reads.ents);
     for (size_t i = 0; i < function->instruction_count; i++) {

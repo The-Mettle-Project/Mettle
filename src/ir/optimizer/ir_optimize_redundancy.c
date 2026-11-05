@@ -1,4 +1,5 @@
 
+#include "../../common.h"
 #include "ir_optimize_internal.h"
 
 #define RE_MAX_ADDR_DEPTH 8
@@ -2430,7 +2431,8 @@ static int re_promote_classify_access(const IRFunction *function,
                          ins->alias_class};
     int hits = re_kill_hits(function, &probe, region_base, region->offset,
                             size, seed_class);
-    if (getenv("METTLE_PROM_TRACE")) {
+    static MettleEnvOnce trace;
+    if (mettle_env_once(&trace, "METTLE_PROM_TRACE")) {
       fprintf(stderr,
               "[probe] %s @%zu %s cls=%u seed=%u distinct=%d base=%s "
               "region=%s hits=%d line=%zu:%zu\n",
@@ -3191,7 +3193,8 @@ int ir_promote_loop_memory_pass(IRFunction *function, int *changed) {
   if (!function || function->instruction_count == 0) {
     return 1;
   }
-  if (getenv("METTLE_PROM_TRACE")) {
+  static MettleEnvOnce trace;
+  if (mettle_env_once(&trace, "METTLE_PROM_TRACE")) {
     for (size_t i = 0; i < function->instruction_count; i++) {
       const IRInstruction *ins = &function->instructions[i];
       if (ins->op != IR_OP_LOAD && ins->op != IR_OP_STORE) {
@@ -4860,7 +4863,8 @@ int ir_forward_stored_values_pass(IRFunction *function, int *changed) {
     }
   }
 
-  if (getenv("METTLE_FWD_TRACE")) {
+  static MettleEnvOnce trace;
+  if (mettle_env_once(&trace, "METTLE_FWD_TRACE")) {
     fprintf(stderr, "[fwd] %s: ok=%d converged=%d blocks=%zu\n",
             function->name ? function->name : "?", ok, converged, block_count);
   }

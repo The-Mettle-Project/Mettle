@@ -213,17 +213,23 @@ int type_checker_module_has_kernel(TypeChecker *checker) {
   if (!program) {
     return 0;
   }
-  for (size_t i = 0; i < program->declaration_count; i++) {
+  if (checker->kernel_scan_program == module &&
+      checker->kernel_scan_declarations == program->declaration_count) {
+    return checker->kernel_scan_found;
+  }
+  int found = 0;
+  for (size_t i = 0; i < program->declaration_count && !found; i++) {
     ASTNode *declaration = program->declarations[i];
     FunctionDeclaration *function =
         declaration && declaration->type == AST_FUNCTION_DECLARATION
             ? (FunctionDeclaration *)declaration->data
             : NULL;
-    if (function && function->is_kernel) {
-      return 1;
-    }
+    found = function && function->is_kernel;
   }
-  return 0;
+  checker->kernel_scan_program = module;
+  checker->kernel_scan_declarations = program->declaration_count;
+  checker->kernel_scan_found = found;
+  return found;
 }
 
 const char *type_checker_device_space_word(unsigned char space) {

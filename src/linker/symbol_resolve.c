@@ -169,64 +169,49 @@ static int link_section_reserve_contributions(LinkedSection *section,
   return 1;
 }
 
-static size_t link_estimate_section_size(const LinkObject *object,
-                                         size_t section_index) {
-  const LinkSection *section = NULL;
-  size_t size = 0;
-  size_t i = 0;
-  int saw_symbol = 0;
+typedef struct {
+  size_t aux_length;
+  size_t symbol_end;
+} LinkSectionSizeHint;
 
-  if (!object || section_index >= object->section_count) {
-    return 0u;
+static LinkSectionSizeHint *link_section_size_hints(const LinkObject *object) {
+  LinkSectionSizeHint *hints =
+      calloc(object->section_count ? object->section_count : 1u, sizeof(*hints));
+  if (!hints) {
+    return NULL;
   }
-
-  section = &object->sections[section_index];
-  for (i = 0; i < object->symbol_count; i++) {
+  for (size_t i = 0; i < object->symbol_count; i++) {
     const LinkSymbol *symbol = &object->symbols[i];
-
-    if (symbol->is_auxiliary || symbol->aux_section_length == 0u ||
-        !symbol->name) {
+    if (symbol->is_auxiliary || symbol->section_index < 0 ||
+        (size_t)symbol->section_index >= object->section_count) {
       continue;
     }
-    if (symbol->is_external ||
-        symbol->section_index != (int64_t)section_index) {
-      continue;
+    LinkSectionSizeHint *hint = &hints[symbol->section_index];
+    const size_t end = (size_t)symbol->value + 1u;
+    if (end > hint->symbol_end) {
+      hint->symbol_end = end;
     }
-    if (strcmp(symbol->name, section->name) != 0) {
-      continue;
-    }
-    if (symbol->aux_section_length != 0u) {
-      return (size_t)symbol->aux_section_length;
+    if (hint->aux_length == 0u && symbol->aux_section_length != 0u &&
+        symbol->name && !symbol->is_external &&
+        strcmp(symbol->name, object->sections[symbol->section_index].name) == 0) {
+      hint->aux_length = (size_t)symbol->aux_section_length;
     }
   }
+  return hints;
+}
 
-  size = section->size_of_raw_data;
+static size_t link_estimate_section_size(const LinkSection *section,
+                                         const LinkSectionSizeHint *hint) {
+  if (hint->aux_length != 0u) {
+    return hint->aux_length;
+  }
+  size_t size = section->size_of_raw_data;
   if (section->virtual_size > size) {
     size = section->virtual_size;
   }
-  if (section->kind != LINK_SECTION_KIND_BSS) {
-    return size;
+  if (section->kind == LINK_SECTION_KIND_BSS && hint->symbol_end > size) {
+    size = hint->symbol_end;
   }
-
-  for (i = 0; i < object->symbol_count; i++) {
-    const LinkSymbol *symbol = &object->symbols[i];
-    size_t end = 0;
-
-    if (symbol->is_auxiliary ||
-        symbol->section_index != (int64_t)section_index) {
-      continue;
-    }
-    saw_symbol = 1;
-    end = (size_t)symbol->value + 1u;
-    if (end > size) {
-      size = end;
-    }
-  }
-
-  if (size == 0u && saw_symbol) {
-    size = 1u;
-  }
-
   return size;
 }
 
@@ -609,10 +594,14 @@ static int link_resolution_merge_sections(LinkResolution *resolution,
     input->section_merged_offsets = calloc(section_count, sizeof(size_t));
     input->section_merged_sizes = calloc(section_count, sizeof(size_t));
     input->section_alignments = calloc(section_count, sizeof(size_t));
+    LinkSectionSizeHint *size_hints =
+        input->object ? link_section_size_hints(input->object) : NULL;
     if ((!input->section_merged_indices && section_count != 0u) ||
         (!input->section_merged_offsets && section_count != 0u) ||
         (!input->section_merged_sizes && section_count != 0u) ||
-        (!input->section_alignments && section_count != 0u)) {
+        (!input->section_alignments && section_count != 0u) ||
+        (input->object && !size_hints)) {
+      free(size_hints);
       mettle_set_error(error_message_out,
                                 "Out of memory while mapping object sections");
       return 0;
@@ -639,11 +628,13 @@ static int link_resolution_merge_sections(LinkResolution *resolution,
         merged->alignment = alignment;
       }
 
-      contribution_size = link_estimate_section_size(input->object, section_index);
+      contribution_size =
+          link_estimate_section_size(section, &size_hints[section_index]);
       start = linker_align_up(merged->virtual_size, alignment);
 
       if (!link_section_reserve_contributions(merged, merged->contribution_count + 1u,
                                               error_message_out)) {
+        free(size_hints);
         return 0;
       }
 
@@ -651,6 +642,7 @@ static int link_resolution_merge_sections(LinkResolution *resolution,
           section->size_of_raw_data != 0u) {
         if (!link_section_reserve_data(merged, start + section->size_of_raw_data,
                                        error_message_out)) {
+          free(size_hints);
           return 0;
         }
         if (start > merged->size) {
@@ -681,6 +673,7 @@ static int link_resolution_merge_sections(LinkResolution *resolution,
       input->section_merged_sizes[section_index] = contribution_size;
       input->section_alignments[section_index] = alignment;
     }
+    free(size_hints);
   }
 
   return 1;
