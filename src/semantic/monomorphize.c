@@ -5111,7 +5111,7 @@ static int c_abi_type_is_aggregate(const char *type) {
 }
 
 static int c_abi_function_needs_thunk(const FunctionDeclaration *fd) {
-  if (!fd || !(fd->is_exported || fd->is_extern || !fd->body) ||
+  if (!fd || fd->is_kernel || !(fd->is_exported || fd->is_extern || !fd->body) ||
       fd->return_type_count > 1) {
     return 0;
   }
