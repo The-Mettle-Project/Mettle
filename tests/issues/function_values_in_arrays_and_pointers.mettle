@@ -1,0 +1,26 @@
+import "std/io";
+import "std/mem";
+
+fn add1(x: int64) -> int64 { return x + 1; }
+fn mul3(x: int64) -> int64 { return x * 3; }
+
+struct Slot { f: Fn(int64) -> int64; }
+
+fn main() -> int32 {
+  var t: (Fn(int64) -> int64)[2];
+  t[0] = &add1;
+  t[1] = &add1;
+  var u: (Fn(int64) -> int64)[2];
+  u[0] = &mul3;
+  u[1] = &mul3;
+  var before: int64 = t[1](10);
+  memcpy((void*)&t[0], (void*)&u[0], 16);
+  var f: Fn(int64) -> int64 = t[1];
+  var p: (Fn(int64) -> int64)* = &t[0];
+  *p = &add1;
+  var slots: Slot[2];
+  slots[1].f = &mul3;
+  slots[0].f = &add1;
+  println("{before} {f(10)} {t[0](5)} {t[1](5)} {slots[0].f(7)} {slots[1].f(7)}");
+  return 0;
+}

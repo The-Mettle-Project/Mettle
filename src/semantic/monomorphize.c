@@ -4985,6 +4985,39 @@ static const char *adapt_field_type(Program *prog, const char *struct_type,
   return NULL;
 }
 
+static const char *adapt_ungroup(const char *type, size_t length) {
+  int depth = 0;
+  if (length < 2 || type[0] != '(' || type[length - 1] != ')') {
+    return string_intern_n(type, length);
+  }
+  for (size_t i = 0; i < length; i++) {
+    depth += type[i] == '(' ? 1 : type[i] == ')' ? -1 : 0;
+    if (depth == 0 && i + 1 < length) {
+      return string_intern_n(type, length);
+    }
+  }
+  return string_intern_n(type + 1, length - 2);
+}
+
+static const char *adapt_element_type(const char *type, int deref) {
+  size_t length = type ? strlen(type) : 0;
+  if (length == 0) {
+    return NULL;
+  }
+  if (type[length - 1] == '*') {
+    return adapt_ungroup(type, length - 1);
+  }
+  if (deref || type[length - 1] != ']') {
+    return NULL;
+  }
+  for (size_t i = length; i-- > 0;) {
+    if (type[i] == '[') {
+      return i > 0 ? adapt_ungroup(type, i) : NULL;
+    }
+  }
+  return NULL;
+}
+
 static const char *adapt_expression_type(ASTNode *node,
                                          const AdaptLocals *locals,
                                          Program *prog) {
@@ -4998,12 +5031,15 @@ static const char *adapt_expression_type(ASTNode *node,
   }
   case AST_INDEX_EXPRESSION: {
     ArrayIndexExpression *index = (ArrayIndexExpression *)node->data;
-    return index ? adapt_expression_type(index->array, locals, prog) : NULL;
+    return index ? adapt_element_type(
+                       adapt_expression_type(index->array, locals, prog), 0)
+                 : NULL;
   }
   case AST_UNARY_EXPRESSION: {
     UnaryExpression *unary = (UnaryExpression *)node->data;
     if (unary && unary->operator&& strcmp(unary->operator, "*") == 0) {
-      return adapt_expression_type(unary->operand, locals, prog);
+      return adapt_element_type(
+          adapt_expression_type(unary->operand, locals, prog), 1);
     }
     return NULL;
   }

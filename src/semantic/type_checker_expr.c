@@ -2948,14 +2948,16 @@ static Type *type_checker_infer_address_of(TypeChecker *checker,
   char *pointer_name;
   operand_space = type_checker_lvalue_device_space(checker, unop->operand);
   space_word = type_checker_device_space_word(operand_space);
-  pointer_name_len = strlen(operand_name) + strlen(space_word) + 2;
+  int grouped = operand_type->kind == TYPE_FUNCTION_POINTER;
+  pointer_name_len = strlen(operand_name) + strlen(space_word) + 4;
   pointer_name = malloc(pointer_name_len);
   if (!pointer_name) {
     type_checker_set_error_at_location(checker, expression->location,
                                        "Memory allocation failed");
     return NULL;
   }
-  snprintf(pointer_name, pointer_name_len, "%s%s*", operand_name, space_word);
+  snprintf(pointer_name, pointer_name_len, grouped ? "(%s)%s*" : "%s%s*",
+           operand_name, space_word);
 
   Type *pointer_type = type_checker_get_type_by_name(checker, pointer_name);
   free(pointer_name);

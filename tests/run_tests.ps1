@@ -21729,6 +21729,8 @@ $issueRegressions = @(
   @{ Name = "memcpy_into_local_is_a_write"; Entry = "tests/issues/memcpy_into_local_is_a_write.mettle"; Args = @(); Expect = @("4653144502051863213 1078984704 77 78 15021") },
   @{ Name = "memcpy_into_local_is_a_write_release"; Entry = "tests/issues/memcpy_into_local_is_a_write.mettle"; Args = @("--release"); Expect = @("4653144502051863213 1078984704 77 78 15021") },
   @{ Name = "memcpy_into_local_is_a_write_opt"; Entry = "tests/issues/memcpy_into_local_is_a_write.mettle"; Args = @("-O"); Expect = @("4653144502051863213 1078984704 77 78 15021") },
+  @{ Name = "function_values_in_arrays_and_pointers"; Entry = "tests/issues/function_values_in_arrays_and_pointers.mettle"; Args = @(); Expect = @("11 30 6 15 8 21") },
+  @{ Name = "function_values_in_arrays_and_pointers_release"; Entry = "tests/issues/function_values_in_arrays_and_pointers.mettle"; Args = @("--release"); Expect = @("11 30 6 15 8 21") },
   @{ Name = "interp_recycles_freed_buffers"; Command = @("test", "tests/issues/interp_recycles_freed_buffers.mettle"); Expect = @("2 passed") },
   @{ Name = "test_fn_called_from_main"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @(); Expect = @("0 0") },
   @{ Name = "test_fn_called_from_main_release"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @("--release"); Expect = @("0 0") },
