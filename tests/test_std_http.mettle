@@ -995,7 +995,7 @@ fn main() -> int32 {
 
   // ---- the client: refusals that need no server ----
   var ca: Arena* = arena_init(0);
-  ck(417, err_of(http_get(ca, "https://example.com/", 1000)) == "TLS is not supported yet");
+  ck(417, err_of(http_get(ca, "https://example.com/", 1000)) == "https needs a TLS stream: use http_request_on");
   ck(418, err_of(http_get(ca, "example.com/", 1000)) == "bad URL");
   ck(419, err_of(http_get(ca, "ws://127.0.0.1/", 1000)) == "not an http URL");
   ck(420, err_of(http_get(ca, "http://127.0.0.1/a b", 1000)) == "bad URL");
