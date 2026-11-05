@@ -1248,6 +1248,59 @@ static int mem_type_is_unsigned_integer(const Type *type) {
                   type->kind == TYPE_UINT32 || type->kind == TYPE_UINT64);
 }
 
+static int mem_signed_bits(const Type *type) {
+  switch (type ? type->kind : TYPE_VOID) {
+  case TYPE_INT8: return 8;
+  case TYPE_INT16: return 16;
+  case TYPE_INT32: return 32;
+  case TYPE_INT64: return 64;
+  default: return 0;
+  }
+}
+
+static void mem_check_const_wrap(MemCtx *ctx, BinaryExpression *binary,
+                                 Type *result_type, SourceLocation loc) {
+  long long left = 0;
+  long long value = 0;
+  long long product = 0;
+  Type *operand_type =
+      result_type ? result_type
+                  : (binary->left ? binary->left->resolved_type : NULL);
+  if (mem_type_is_unsigned_integer(binary->left ? binary->left->resolved_type
+                                                : NULL) ||
+      mem_type_is_unsigned_integer(binary->right ? binary->right->resolved_type
+                                                 : NULL)) {
+    return;
+  }
+  int bits = mem_signed_bits(operand_type);
+  if (!bits || !mem_eval_constant(ctx, binary->left, &left) ||
+      !mem_eval_constant(ctx, binary->right, &value)) {
+    return;
+  }
+  int wide = binary->operator[0] == '+'
+                 ? __builtin_add_overflow(left, value, &product)
+                 : binary->operator[0] == '-'
+                       ? __builtin_sub_overflow(left, value, &product)
+                       : __builtin_mul_overflow(left, value, &product);
+  if (!wide && bits < 64) {
+    long long limit = 1LL << (bits - 1);
+    wide = product < -limit || product >= limit;
+  }
+  if (wide && bits == 64) {
+    mem_warn(ctx, "M0124", loc,
+             "The constant `%lld %s %lld` does not fit `%s` and wraps; no "
+             "wider integer exists, so write it in `uint64` if the wrap is "
+             "intended",
+             left, binary->operator, value, operand_type->name);
+  } else if (wide) {
+    mem_warn(ctx, "M0124", loc,
+             "The constant `%lld %s %lld` does not fit `%s` and wraps; write "
+             "one operand with a cast to a wider type, for example "
+             "`(int64)%lld`",
+             left, binary->operator, value, operand_type->name, left);
+  }
+}
+
 static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
                                        Type *result_type, SourceLocation loc) {
   if (ctx->mode != MEM_MODE_LOCAL || !binary->operator) {
@@ -1256,52 +1309,7 @@ static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
   long long value = 0;
   if (strcmp(binary->operator, "+") == 0 || strcmp(binary->operator, "-") == 0 ||
       strcmp(binary->operator, "*") == 0) {
-    long long left = 0;
-    long long product = 0;
-    Type *operand_type =
-        result_type ? result_type
-                    : (binary->left ? binary->left->resolved_type : NULL);
-    int bits = 0;
-    if (mem_type_is_unsigned_integer(binary->left ? binary->left->resolved_type
-                                                  : NULL) ||
-        mem_type_is_unsigned_integer(binary->right ? binary->right->resolved_type
-                                                   : NULL)) {
-      operand_type = NULL;
-    }
-    if (operand_type) {
-      switch (operand_type->kind) {
-      case TYPE_INT8: bits = 8; break;
-      case TYPE_INT16: bits = 16; break;
-      case TYPE_INT32: bits = 32; break;
-      case TYPE_INT64: bits = 64; break;
-      default: break;
-      }
-    }
-    if (bits && mem_eval_constant(ctx, binary->left, &left) &&
-        mem_eval_constant(ctx, binary->right, &value)) {
-      int wide = binary->operator[0] == '+'
-                     ? __builtin_add_overflow(left, value, &product)
-                     : binary->operator[0] == '-'
-                           ? __builtin_sub_overflow(left, value, &product)
-                           : __builtin_mul_overflow(left, value, &product);
-      if (!wide && bits < 64) {
-        long long limit = 1LL << (bits - 1);
-        wide = product < -limit || product >= limit;
-      }
-      if (wide && bits == 64) {
-        mem_warn(ctx, "M0124", loc,
-                 "The constant `%lld %s %lld` does not fit `%s` and wraps; no "
-                 "wider integer exists, so write it in `uint64` if the wrap "
-                 "is intended",
-                 left, binary->operator, value, operand_type->name);
-      } else if (wide) {
-        mem_warn(ctx, "M0124", loc,
-                 "The constant `%lld %s %lld` does not fit `%s` and wraps; "
-                 "write one operand with a cast to a wider type, for example "
-                 "`(int64)%lld`",
-                 left, binary->operator, value, operand_type->name, left);
-      }
-    }
+    mem_check_const_wrap(ctx, binary, result_type, loc);
     return;
   }
   if (strcmp(binary->operator, "/") == 0 || strcmp(binary->operator, "%") == 0) {

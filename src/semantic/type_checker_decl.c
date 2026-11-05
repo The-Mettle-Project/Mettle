@@ -2361,6 +2361,46 @@ static Symbol *type_checker_build_function_symbol(
   return func_symbol;
 }
 
+static int type_checker_function_result_missing(
+    TypeChecker *checker, ASTNode *declaration,
+    FunctionDeclaration *func_decl, Type *return_type) {
+  int returns = 0;
+  if (!func_decl->body || !return_type || return_type->kind == TYPE_VOID) {
+    return 0;
+  }
+  if (func_decl->tail_must_yield &&
+      type_checker_flow_completes(checker, func_decl->body)) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Function '%s' can reach its end without a value; end each path with "
+        "an expression and no ';', or with 'return'",
+        func_decl->name ? func_decl->name : "<lambda>");
+    return 1;
+  }
+  if (func_decl->is_naked || strcmp(func_decl->name, "main") == 0) {
+    return 0;
+  }
+  returns = type_checker_ast_contains_node_type(func_decl->body,
+                                                AST_RETURN_STATEMENT);
+  if (returns && type_checker_flow_completes(checker, func_decl->body)) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Function '%s' can reach its end without returning a '%s'; end the "
+        "last path with 'return' or with an expression and no ';'",
+        func_decl->name, return_type->name);
+    return 1;
+  }
+  if (!returns) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "Function '%s' has non-void return type '%s' but contains no return "
+        "statement",
+        func_decl->name, return_type->name);
+    return 1;
+  }
+  return 0;
+}
+
 static int type_checker_check_function_body(
     TypeChecker *checker, ASTNode *declaration,
     FunctionDeclaration *func_decl, Type *return_type) {
@@ -2463,45 +2503,8 @@ static int type_checker_check_function_body(
     return 0;
   }
 
-  if (func_decl->body && func_decl->tail_must_yield && return_type &&
-      return_type->kind != TYPE_VOID &&
-      type_checker_flow_completes(checker, func_decl->body)) {
-    type_checker_set_error_at_location(
-        checker, declaration->location,
-        "Function '%s' can reach its end without a value; end each path with "
-        "an expression and no ';', or with 'return'",
-        func_decl->name ? func_decl->name : "<lambda>");
-    type_checker_init_tracker_reset(checker);
-    symbol_table_exit_scope(checker->symbol_table);
-    return 0;
-  }
-
-  if (func_decl->body && return_type &&
-      return_type->kind != TYPE_VOID && !func_decl->is_naked &&
-      strcmp(func_decl->name, "main") != 0 &&
-      type_checker_ast_contains_node_type(func_decl->body,
-                                          AST_RETURN_STATEMENT) &&
-      type_checker_flow_completes(checker, func_decl->body)) {
-    type_checker_set_error_at_location(
-        checker, declaration->location,
-        "Function '%s' can reach its end without returning a '%s'; end the "
-        "last path with 'return' or with an expression and no ';'",
-        func_decl->name, return_type->name);
-    type_checker_init_tracker_reset(checker);
-    symbol_table_exit_scope(checker->symbol_table);
-    return 0;
-  }
-
-  if (func_decl->body && return_type &&
-      return_type->kind != TYPE_VOID && !func_decl->is_naked &&
-      strcmp(func_decl->name, "main") != 0 &&
-      !type_checker_ast_contains_node_type(func_decl->body,
-                                           AST_RETURN_STATEMENT)) {
-    type_checker_set_error_at_location(
-        checker, declaration->location,
-        "Function '%s' has non-void return type '%s' but contains no return "
-        "statement",
-        func_decl->name, return_type->name);
+  if (type_checker_function_result_missing(checker, declaration, func_decl,
+                                           return_type)) {
     type_checker_init_tracker_reset(checker);
     symbol_table_exit_scope(checker->symbol_table);
     return 0;

@@ -453,52 +453,13 @@ static void ir_declare_string_free_helper(IRLoweringContext *context) {
   ir_program_add_symbol(context->program, &entry);
 }
 
-int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node) {
-  Type *type = NULL;
-  if (!context || !node || !context->type_checker) {
+static int ir_interpolated_value_is_owned(IRLoweringContext *context,
+                                          ASTNode *argument) {
+  Type *type = type_checker_infer_type(context->type_checker, argument);
+  if (!type) {
     return 0;
   }
-  if (node->type == AST_BINARY_EXPRESSION) {
-    BinaryExpression *binary = (BinaryExpression *)node->data;
-    if (!binary || !binary->operator || strcmp(binary->operator, "+") != 0) {
-      return 0;
-    }
-    type = ir_infer_expression_type(context, node);
-    return type && type->kind == TYPE_STRING;
-  }
-  if (node->type != AST_FUNCTION_CALL) {
-    return 0;
-  }
-  {
-    CallExpression *call = (CallExpression *)node->data;
-    if (call && call->function_name && !call->object &&
-        !call->is_indirect_call &&
-        strcmp(call->function_name, "__mtl_interp") != 0 &&
-        type_checker_callee_returns_fresh(context->type_checker,
-                                          call->function_name)) {
-      return 1;
-    }
-    if (call && call->function_name && call->arguments && !call->object &&
-        !call->is_indirect_call &&
-        strcmp(call->function_name, "__mtl_interp") != 0) {
-      for (size_t i = 0; i < call->argument_count; i++) {
-        if (type_checker_callee_hands_back(context->type_checker,
-                                           call->function_name, i)) {
-          return ir_string_temp_is_owned(context, call->arguments[i]);
-        }
-      }
-      return 0;
-    }
-    if (!call || !call->function_name ||
-        strcmp(call->function_name, "__mtl_interp") != 0 ||
-        call->argument_count != 1 || !call->arguments) {
-      return 0;
-    }
-    type = type_checker_infer_type(context->type_checker, call->arguments[0]);
-    if (!type) {
-      return 0;
-    }
-    switch (type->kind) {
+  switch (type->kind) {
     case TYPE_STRING:
     case TYPE_BOOL:
       return 0;
@@ -519,7 +480,46 @@ int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node) {
     default:
       return 0;
     }
+}
+
+static int ir_call_string_is_owned(IRLoweringContext *context,
+                                   CallExpression *call) {
+  if (!call || !call->function_name || call->object ||
+      call->is_indirect_call) {
+    return 0;
   }
+  if (strcmp(call->function_name, "__mtl_interp") == 0) {
+    return call->argument_count == 1 && call->arguments &&
+           ir_interpolated_value_is_owned(context, call->arguments[0]);
+  }
+  if (type_checker_callee_returns_fresh(context->type_checker,
+                                        call->function_name)) {
+    return 1;
+  }
+  for (size_t i = 0; call->arguments && i < call->argument_count; i++) {
+    if (type_checker_callee_hands_back(context->type_checker,
+                                       call->function_name, i)) {
+      return ir_string_temp_is_owned(context, call->arguments[i]);
+    }
+  }
+  return 0;
+}
+
+int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node) {
+  Type *type = NULL;
+  if (!context || !node || !context->type_checker) {
+    return 0;
+  }
+  if (node->type == AST_BINARY_EXPRESSION) {
+    BinaryExpression *binary = (BinaryExpression *)node->data;
+    if (!binary || !binary->operator || strcmp(binary->operator, "+") != 0) {
+      return 0;
+    }
+    type = ir_infer_expression_type(context, node);
+    return type && type->kind == TYPE_STRING;
+  }
+  return node->type == AST_FUNCTION_CALL &&
+         ir_call_string_is_owned(context, (CallExpression *)node->data);
 }
 
 int ir_emit_string_free(IRLoweringContext *context, IRFunction *function,
