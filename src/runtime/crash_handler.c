@@ -892,7 +892,12 @@ mettle_crash_vectored_exception_filter(EXCEPTION_POINTERS *exception_info) {
   }
   uintptr_t address =
       (uintptr_t)exception_info->ExceptionRecord->ExceptionAddress;
-  if (g_runtime_image_end != 0 &&
+  const EXCEPTION_RECORD *record = exception_info->ExceptionRecord;
+  int jumped_to_bad_address =
+      record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+      record->NumberParameters >= 2 &&
+      (uintptr_t)record->ExceptionInformation[1] == address;
+  if (!jumped_to_bad_address && g_runtime_image_end != 0 &&
       (address < g_runtime_image_start || address >= g_runtime_image_end) &&
       !mettle_crash_address_is_live_code(address)) {
     return EXCEPTION_CONTINUE_SEARCH;

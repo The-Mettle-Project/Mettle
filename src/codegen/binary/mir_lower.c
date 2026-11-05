@@ -1737,6 +1737,36 @@ static int mir_call_is_supported(CodeGenerator *g,
   return 1;
 }
 
+int mir_materialize_constant_callees(IRFunction *ir_function) {
+  if (!ir_function) {
+    return 1;
+  }
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    IRInstruction *in = &ir_function->instructions[i];
+    IRInstruction assign = {0};
+    char name[64];
+    if (in->op != IR_OP_CALL_INDIRECT || in->lhs.kind != IR_OPERAND_INT) {
+      continue;
+    }
+    snprintf(name, sizeof(name), ".callee_%zu", i);
+    assign.op = IR_OP_ASSIGN;
+    assign.location = in->location;
+    assign.dest = ir_operand_temp(name);
+    assign.lhs = in->lhs;
+    if (!assign.dest.name ||
+        !ir_function_insert_instruction(ir_function, i, &assign)) {
+      return 0;
+    }
+    i++;
+    in = &ir_function->instructions[i];
+    in->lhs = ir_operand_temp(name);
+    if (!in->lhs.name) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int mir_route_global_call_results(CodeGenerator *generator,
                                   IRFunction *ir_function) {
   static unsigned counter;

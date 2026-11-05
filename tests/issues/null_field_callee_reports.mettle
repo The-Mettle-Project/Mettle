@@ -1,0 +1,10 @@
+import "std/io";
+
+struct Holder { run: fn(string) -> int64; }
+
+fn main() -> int32 {
+  var holder: Holder;
+  println("start");
+  println("{holder.run("x")}");
+  return 0;
+}

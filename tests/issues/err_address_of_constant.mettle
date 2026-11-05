@@ -1,0 +1,6 @@
+const K: int32 = 3;
+
+fn main() -> int32 {
+  var p: int32* = &K;
+  return *p;
+}

@@ -1,0 +1,6 @@
+extern fn exit2(code: int32) -> int32[4] = "exit";
+
+fn main() -> int32 {
+  exit2(0);
+  return 0;
+}

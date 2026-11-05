@@ -422,6 +422,7 @@ static inline int mir_fsetcc_unordered_cc(unsigned char cc) {
 
 int mir_encode(MirFunction *fn);
 
+int mir_materialize_constant_callees(IRFunction *ir_function);
 int mir_route_global_call_results(CodeGenerator *generator,
                                   IRFunction *ir_function);
 

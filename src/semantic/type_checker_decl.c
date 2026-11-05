@@ -2531,6 +2531,25 @@ static Type *type_checker_function_return_type(
   } else {
     return_type = checker->builtin_void;
   }
+  if (func_decl->name && strcmp(func_decl->name, "main") == 0 &&
+      !func_decl->is_extern && return_type->kind != TYPE_VOID &&
+      return_type->kind != TYPE_BOOL &&
+      !type_checker_is_integer_type(return_type)) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "'main' returns the exit status, so it cannot return '%s': declare it "
+        "'-> int32' or with no result",
+        return_type->name ? return_type->name : "this type");
+    return 0;
+  }
+  if (func_decl->is_extern && return_type->kind == TYPE_ARRAY) {
+    type_checker_set_error_at_location(
+        checker, declaration->location,
+        "extern '%s' returns the array '%s', and the C ABI has no array "
+        "result: return a struct holding it or a pointer",
+        func_decl->name, return_type->name ? return_type->name : "");
+    return 0;
+  }
   if (func_decl->is_kernel && return_type->kind != TYPE_VOID) {
     type_checker_set_error_at_location(
         checker, declaration->location,

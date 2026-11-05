@@ -2917,6 +2917,19 @@ static Type *type_checker_infer_address_of(TypeChecker *checker,
                                           operand_type)) {
     return NULL;
   }
+  if (unop->operand->type == AST_IDENTIFIER) {
+    Identifier *id = (Identifier *)unop->operand->data;
+    Symbol *sym = id && id->name ? type_checker_resolve_identifier(checker, id)
+                                 : NULL;
+    if (sym && sym->kind == SYMBOL_CONSTANT) {
+      type_checker_set_error_at_location(
+          checker, unop->operand->location,
+          "'%s' is a constant and has no address: copy it into a variable "
+          "first",
+          id->name);
+      return NULL;
+    }
+  }
   if (type_checker_is_tile(operand_type)) {
     return type_checker_tile_unary(checker, "&", operand_type,
                                    expression->location);
