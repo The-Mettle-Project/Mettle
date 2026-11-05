@@ -921,9 +921,12 @@ static int ir_string_statement_keeps_local(IRLoweringContext *context,
   }
   case AST_ASSIGNMENT: {
     const Assignment *assignment = (const Assignment *)node->data;
-    if (assignment->target_count > 0 ||
-        (assignment->variable_name &&
-         strcmp(assignment->variable_name, name) == 0)) {
+    if (assignment->target_count == 0 && assignment->variable_name &&
+        strcmp(assignment->variable_name, name) == 0) {
+      return ir_string_temp_is_owned(context, assignment->value) &&
+             ir_string_expression_keeps_local(context, assignment->value, name);
+    }
+    if (assignment->target_count > 0) {
       return 0;
     }
     return ir_string_expression_keeps_local(context, assignment->target, name) &&
@@ -977,7 +980,27 @@ static int ir_string_statement_keeps_local(IRLoweringContext *context,
   }
 }
 
+static int ir_statement_assigns_local(const ASTNode *node, const char *name) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_ASSIGNMENT && node->data) {
+    const Assignment *assignment = (const Assignment *)node->data;
+    if (assignment->target_count == 0 && assignment->variable_name &&
+        strcmp(assignment->variable_name, name) == 0) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (ir_statement_assigns_local(node->children[i], name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int ir_schedule_string_local_release(IRLoweringContext *context,
+                                            IRFunction *function,
                                             ASTNode *statement,
                                             IRDeferScope *defers) {
   const VarDeclaration *declaration = (const VarDeclaration *)statement->data;
@@ -993,14 +1016,31 @@ static int ir_schedule_string_local_release(IRLoweringContext *context,
   type = declaration->initializer->resolved_type
              ? declaration->initializer->resolved_type
              : ir_infer_expression_type(context, declaration->initializer);
-  if (!type || type->kind != TYPE_STRING ||
-      !ir_string_temp_is_owned(context, declaration->initializer)) {
+  int owned = type && type->kind == TYPE_STRING &&
+              ir_string_temp_is_owned(context, declaration->initializer);
+  int literal = type && type->kind == TYPE_STRING &&
+                declaration->initializer->type == AST_STRING_LITERAL;
+  if (!owned && !literal) {
     return 1;
   }
+  int reassigned = 0;
   for (size_t i = index + 1; i < context->block_statement_count; i++) {
     if (!ir_string_statement_keeps_local(context, context->block_statements[i],
                                          declaration->name)) {
       return 1;
+    }
+    reassigned = reassigned || ir_statement_assigns_local(
+                                   context->block_statements[i],
+                                   declaration->name);
+  }
+  if (!owned) {
+    if (!reassigned) {
+      return 1;
+    }
+    if (!ir_emit_string_copy_into(context, function,
+                                  ir_local_ir_name(context, declaration->name),
+                                  type, statement->location)) {
+      return 0;
     }
   }
   if (!ir_defer_stack_push_string_release(
@@ -1008,6 +1048,13 @@ static int ir_schedule_string_local_release(IRLoweringContext *context,
           ir_local_ir_name(context, declaration->name))) {
     ir_set_error(context, "Out of memory while releasing a string local");
     return 0;
+  }
+  {
+    IRLocalBinding *binding =
+        (IRLocalBinding *)ir_local_binding_find(context, declaration->name);
+    if (binding) {
+      binding->owns_string = 1;
+    }
   }
   return 1;
 }
@@ -1053,6 +1100,16 @@ static int ir_lower_named_assignment(IRLoweringContext *context,
           context, function, value, assignment->value->location)) {
     ir_operand_destroy(value);
     return 0;
+  }
+  if (binding && binding->owns_string) {
+    IROperand old = ir_operand_symbol(target_name);
+    int released =
+        ir_emit_string_free(context, function, &old, statement->location);
+    ir_operand_destroy(&old);
+    if (!released) {
+      ir_operand_destroy(value);
+      return 0;
+    }
   }
   if (ir_try_emit_aggregate_symbol_memcpy(
           context, function, target_name, value,
@@ -1903,7 +1960,7 @@ static int ir_lower_scheduled_var_declaration(IRLoweringContext *context,
                                               ASTNode *statement,
                                               IRDeferScope *defers) {
   return ir_lower_var_declaration(context, function, statement) &&
-         ir_schedule_string_local_release(context, statement, defers);
+         ir_schedule_string_local_release(context, function, statement, defers);
 }
 
 static int ir_lower_statement_unmarked(IRLoweringContext *context,

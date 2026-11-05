@@ -1,0 +1,41 @@
+import "std/io";
+
+extern fn mettle_alloc_report() = "mettle_alloc_report";
+
+var g_kept: string = "";
+
+fn label(i: int64) -> string { return "x{i}"; }
+
+fn nested(n: int64) -> string {
+  if (n == 0) { return "r{n}"; }
+  return nested(n - 1);
+}
+
+fn keep(s: string) -> string {
+  g_kept = s;
+  return s + "";
+}
+
+fn measure(s: string) -> int64 { return (int64)s.length; }
+
+
+fn churn(rounds: int64) -> int64 {
+  var total: int64 = 0;
+  for i in 0..rounds {
+    var a: string = label(i);
+    var b: string = label(i) + "!";
+    total = total + measure(label(i)) + (int64)a.length + (int64)b.length;
+    var c: string = nested(2);
+    c = c + label(i);
+    total = total + (int64)c.length;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var total: int64 = churn(300);
+  var held: string = keep(label(7));
+  mettle_alloc_report();
+  println("{total} {held} {g_kept}");
+  return 0;
+}

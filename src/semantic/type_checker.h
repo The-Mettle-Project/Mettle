@@ -164,7 +164,11 @@ typedef struct TypeCheckerBorrowFact {
   unsigned frees;
   unsigned handed_back;
   unsigned stores_elsewhere;
+  int returns_fresh;
 } TypeCheckerBorrowFact;
+
+int type_checker_callee_returns_fresh(const TypeChecker *checker,
+                                      const char *callee);
 
 int type_checker_callee_borrows(const TypeChecker *checker, const char *callee,
                                 size_t index);

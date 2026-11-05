@@ -1,0 +1,33 @@
+import "std/io";
+
+extern fn mettle_alloc_report() = "mettle_alloc_report";
+
+fn grow(rounds: int64) -> int64 {
+  var total: int64 = 0;
+  for i in 0..rounds {
+    var s: string = "k";
+    s = s + "-" + s;
+    if (i > 3) { s = s + "!"; }
+    s += "{i}";
+    total = total + (int64)s.length;
+  }
+  return total;
+}
+
+fn grow_from_owned(rounds: int64) -> int64 {
+  var total: int64 = 0;
+  for i in 0..rounds {
+    var s: string = "n{i}";
+    s = s + s;
+    total = total + (int64)s.length;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var a: int64 = grow(500);
+  var b: int64 = grow_from_owned(500);
+  mettle_alloc_report();
+  println("{a} {b}");
+  return 0;
+}

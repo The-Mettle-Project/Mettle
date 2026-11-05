@@ -2636,6 +2636,103 @@ static int mem_collect_summary(TypeChecker *checker, ASTNode *decl,
          summary->returns_fresh != before.returns_fresh;
 }
 
+static int mem_fn_may_return_fresh(const ASTNode *decl) {
+  const FunctionDeclaration *fn =
+      decl && decl->type == AST_FUNCTION_DECLARATION
+          ? (const FunctionDeclaration *)decl->data
+          : NULL;
+  return fn && fn->body && fn->return_type &&
+         strcmp(fn->return_type, "string") == 0 && !fn->is_extern;
+}
+
+static int mem_string_expr_is_fresh(const TypeChecker *checker,
+                                    const ASTNode *expr) {
+  if (!expr) {
+    return 0;
+  }
+  if (expr->type == AST_BINARY_EXPRESSION && expr->data) {
+    const BinaryExpression *binary = (const BinaryExpression *)expr->data;
+    return binary->operator && strcmp(binary->operator, "+") == 0 &&
+           expr->resolved_type && expr->resolved_type->kind == TYPE_STRING;
+  }
+  if (expr->type != AST_FUNCTION_CALL || !expr->data) {
+    return 0;
+  }
+  const CallExpression *call = (const CallExpression *)expr->data;
+  if (!call->function_name || call->object || call->is_indirect_call) {
+    return 0;
+  }
+  if (strcmp(call->function_name, "__mtl_interp") == 0) {
+    const Type *type = call->argument_count == 1 && call->arguments &&
+                               call->arguments[0]
+                           ? call->arguments[0]->resolved_type
+                           : NULL;
+    if (!type) {
+      return 0;
+    }
+    switch (type->kind) {
+    case TYPE_CHAR:
+    case TYPE_INT8:
+    case TYPE_INT16:
+    case TYPE_INT32:
+    case TYPE_INT64:
+    case TYPE_UINT8:
+    case TYPE_UINT16:
+    case TYPE_UINT32:
+    case TYPE_UINT64:
+    case TYPE_FLOAT32:
+    case TYPE_FLOAT64:
+      return 1;
+    default:
+      return 0;
+    }
+  }
+  return type_checker_callee_returns_fresh(checker, call->function_name);
+}
+
+static int mem_returns_are_fresh(const TypeChecker *checker,
+                                 const ASTNode *node, int *seen) {
+  if (!node || node->type == AST_LAMBDA_EXPRESSION) {
+    return 1;
+  }
+  if (node->type == AST_RETURN_STATEMENT) {
+    const ReturnStatement *ret = (const ReturnStatement *)node->data;
+    *seen = 1;
+    if (!ret || ret->value_count > 1 ||
+        !mem_string_expr_is_fresh(checker, ret->value)) {
+      return 0;
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (!mem_returns_are_fresh(checker, node->children[i], seen)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void mem_settle_returns_fresh(TypeChecker *checker, ASTNode **decls,
+                                     size_t count) {
+  int changed = 1;
+  while (changed) {
+    changed = 0;
+    size_t k = 0;
+    for (size_t i = 0; i < count; i++) {
+      if (!decls[i]) {
+        continue;
+      }
+      TypeCheckerBorrowFact *fact = &checker->borrow_facts[k++];
+      const FunctionDeclaration *fn = (const FunctionDeclaration *)decls[i]->data;
+      int seen = 0;
+      if (fact->returns_fresh &&
+          (!mem_returns_are_fresh(checker, fn->body, &seen) || !seen)) {
+        fact->returns_fresh = 0;
+        changed = 1;
+      }
+    }
+  }
+}
+
 int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
   if (!checker || !checker->error_reporter || !program ||
       program->type != AST_PROGRAM || checker->has_error) {
@@ -2722,8 +2819,11 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
               : 0u;
       checker->borrow_facts[checker->borrow_fact_count].stores_elsewhere =
           items[i].stores_elsewhere;
+      checker->borrow_facts[checker->borrow_fact_count].returns_fresh =
+          mem_fn_may_return_fresh(decls[i]);
       checker->borrow_fact_count++;
     }
+    mem_settle_returns_fresh(checker, decls, table.count);
   }
 
   for (size_t i = 0; i < table.count; i++) {
@@ -2768,6 +2868,20 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
   free(items);
   free(decls);
   return !checker->has_error;
+}
+
+int type_checker_callee_returns_fresh(const TypeChecker *checker,
+                                      const char *callee) {
+  if (!checker || !callee) {
+    return 0;
+  }
+  for (size_t i = 0; i < checker->borrow_fact_count; i++) {
+    if (checker->borrow_facts[i].name &&
+        strcmp(checker->borrow_facts[i].name, callee) == 0) {
+      return checker->borrow_facts[i].returns_fresh;
+    }
+  }
+  return 0;
 }
 
 int type_checker_callee_hands_back(const TypeChecker *checker,

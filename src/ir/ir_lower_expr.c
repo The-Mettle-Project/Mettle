@@ -471,6 +471,13 @@ int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node) {
   }
   {
     CallExpression *call = (CallExpression *)node->data;
+    if (call && call->function_name && !call->object &&
+        !call->is_indirect_call &&
+        strcmp(call->function_name, "__mtl_interp") != 0 &&
+        type_checker_callee_returns_fresh(context->type_checker,
+                                          call->function_name)) {
+      return 1;
+    }
     if (call && call->function_name && call->arguments && !call->object &&
         !call->is_indirect_call &&
         strcmp(call->function_name, "__mtl_interp") != 0) {
@@ -530,6 +537,48 @@ int ir_emit_string_free(IRLoweringContext *context, IRFunction *function,
   call.arguments = argument;
   call.argument_count = 1;
   return ir_emit(context, function, &call);
+}
+
+int ir_emit_string_copy_into(IRLoweringContext *context, IRFunction *function,
+                             const char *symbol, Type *frontend_type,
+                             SourceLocation location) {
+  IROperand copy = ir_operand_none();
+  IROperand call_args[2];
+  MtlcType *call_types[2];
+  MtlcType *string_type = mtlc_type_from_frontend(frontend_type);
+  IRInstruction call = {0};
+  IRInstruction assign = {0};
+  int ok;
+  if (!ir_make_temp_operand(context, &copy)) {
+    return 0;
+  }
+  call_args[0] = ir_operand_symbol(symbol);
+  call_args[1] = ir_operand_string("");
+  call_types[0] = string_type;
+  call_types[1] = string_type;
+  call.op = IR_OP_CALL;
+  call.location = location;
+  call.dest = copy;
+  call.text = "mettle_string_concat";
+  call.arguments = call_args;
+  call.argument_types = call_types;
+  call.argument_count = 2;
+  call.value_type = string_type;
+  call.allocates = 1;
+  ir_declare_string_concat_helper(context);
+  ok = ir_emit(context, function, &call);
+  ir_operand_destroy(&call_args[0]);
+  ir_operand_destroy(&call_args[1]);
+  if (ok) {
+    assign.op = IR_OP_ASSIGN;
+    assign.location = location;
+    assign.dest = ir_operand_symbol(symbol);
+    assign.lhs = copy;
+    ok = ir_emit(context, function, &assign);
+    ir_operand_destroy(&assign.dest);
+  }
+  ir_operand_destroy(&copy);
+  return ok;
 }
 
 static int ir_task_argument_is_repeatable(ASTNode *node) {
