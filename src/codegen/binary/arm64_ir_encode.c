@@ -2290,6 +2290,22 @@ static int encode_arithmetic_instruction(const Arm64Scope *scope,
   return 1;
 }
 
+static int encode_string_concat_instruction(const Arm64Scope *scope,
+                                            const IRInstruction *in) {
+  if (!binary_is_string_concat(in)) {
+    return 0;
+  }
+  if (!scope->object && !scope->fns) {
+    arm64_fail(scope->e, "string concatenation in '%s' needs the runtime "
+                         "kernel, which this path does not provide",
+               scope->fn->name);
+    return 1;
+  }
+  emit_string_concat(scope->e, scope->slots, scope->ag, scope->object,
+                     scope->prog, scope->fns, in);
+  return 1;
+}
+
 static int encode_call_instruction(const Arm64Scope *scope,
                                  const IRInstruction *in) {
   Arm64Emit *e = scope->e;
@@ -2327,16 +2343,6 @@ static int encode_call_instruction(const Arm64Scope *scope,
   (void)sret_size;
   switch (in->op) {
   case IR_OP_CALL: {
-    if (binary_is_string_concat(in)) {
-      if (!object && !fns) {
-        arm64_fail(e, "string concatenation in '%s' needs the runtime "
-                      "kernel, which this path does not provide",
-                   fn->name);
-        break;
-      }
-      emit_string_concat(e, slots, ag, object, prog, fns, in);
-      break;
-    }
     if (!fns || !in->text) {
       arm64_fail(e, in->text
                         ? "'%s' calls '%s', but this path lowers one function"
@@ -2596,6 +2602,7 @@ static void encode_instruction(const Arm64Scope *scope,
       encode_cast_instruction(scope, in) ||
       encode_memory_instruction(scope, in) ||
       encode_arithmetic_instruction(scope, in) ||
+      encode_string_concat_instruction(scope, in) ||
       encode_call_instruction(scope, in) ||
       encode_runtime_instruction(scope, in)) {
     return;

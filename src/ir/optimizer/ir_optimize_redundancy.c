@@ -4614,6 +4614,39 @@ static int fwd_address_is_current(const IRBasicBlock *block, size_t at,
   return 0;
 }
 
+static int fwd_transfer_store(FwdCtx *ctx, const IRBasicBlock *block, size_t i,
+                              IRInstruction *ins, FwdSet *set) {
+  char wbase[RE_NAME_MAX + 1];
+  long long woff = 0;
+  long long wsize = RE_MEM_WHOLE;
+  unsigned wtype = IR_ALIAS_CLASS_NONE;
+  REAddr written;
+  memset(&written, 0, sizeof(written));
+  re_instruction_write_region(ctx->function, ctx->defs, ctx->addr_taken, ins,
+                              wbase, sizeof(wbase), &woff, &wsize, &wtype);
+  re_resolve_addr(ctx->function, ctx->defs, &ins->dest, &written, 0);
+  if (!fwd_address_is_current(block, i, &ins->dest, &written)) {
+    wbase[0] = '\0';
+  }
+  fwd_kill_region(set, ctx->function, wbase[0] ? wbase : NULL, woff, wsize,
+                  wtype);
+  if (!ins->is_volatile && !ins->is_float && wbase[0] &&
+      ins->rhs.kind == IR_OPERAND_INT && ins->rhs.int_value > 0 &&
+      ins->rhs.int_value <= 8 && fwd_value_is_trackable(ctx, &ins->lhs)) {
+    FwdFact fact;
+    memset(&fact, 0, sizeof(fact));
+    fact.base = wbase;
+    fact.off = woff;
+    fact.size = wsize;
+    fact.alias_class = ins->alias_class;
+    fact.value = ins->lhs;
+    if (!fwd_set_add(set, &fact)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int fwd_transfer(FwdCtx *ctx, const IRBasicBlock *block, FwdSet *set,
                         int rewrite) {
   for (size_t i = 0; i < block->instruction_count; i++) {
@@ -4627,31 +4660,8 @@ static int fwd_transfer(FwdCtx *ctx, const IRBasicBlock *block, FwdSet *set,
     }
 
     if (ins->op == IR_OP_STORE) {
-      REAddr written;
-      memset(&written, 0, sizeof(written));
-      re_instruction_write_region(ctx->function, ctx->defs, ctx->addr_taken,
-                                  ins, wbase, sizeof(wbase), &woff, &wsize,
-                                  &wtype);
-      re_resolve_addr(ctx->function, ctx->defs, &ins->dest, &written, 0);
-      if (!fwd_address_is_current(block, i, &ins->dest, &written)) {
-        wbase[0] = '\0';
-      }
-      fwd_kill_region(set, ctx->function, wbase[0] ? wbase : NULL, woff, wsize,
-                      wtype);
-      if (!ins->is_volatile && !ins->is_float && wbase[0] &&
-          ins->rhs.kind == IR_OPERAND_INT && ins->rhs.int_value > 0 &&
-          ins->rhs.int_value <= 8 &&
-          fwd_value_is_trackable(ctx, &ins->lhs)) {
-        FwdFact fact;
-        memset(&fact, 0, sizeof(fact));
-        fact.base = wbase;
-        fact.off = woff;
-        fact.size = wsize;
-        fact.alias_class = ins->alias_class;
-        fact.value = ins->lhs;
-        if (!fwd_set_add(set, &fact)) {
-          return 0;
-        }
+      if (!fwd_transfer_store(ctx, block, i, ins, set)) {
+        return 0;
       }
       continue;
     }

@@ -347,6 +347,11 @@ int ir_lower_switch_statement(IRLoweringContext *context,
   return 1;
 }
 
+static int ir_payload_moves_by_address(long long payload_size) {
+  return payload_size > 8 || payload_size == 3 || payload_size == 5 ||
+         payload_size == 6 || payload_size == 7;
+}
+
 int ir_lower_match_statement(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *statement,
                                     IRDeferScope *defers) {
@@ -545,8 +550,7 @@ int ir_lower_match_statement(IRLoweringContext *context,
         goto cleanup;
       }
 
-      if (payload_size > 8 || payload_size == 3 || payload_size == 5 ||
-          payload_size == 6 || payload_size == 7) {
+      if (ir_payload_moves_by_address(payload_size)) {
         IROperand binding_address = ir_operand_none();
         IRInstruction copy = {0};
 
@@ -913,8 +917,7 @@ int ir_emit_tagged_enum_construct(IRLoweringContext *context,
       return 0;
     }
 
-    if (payload_size > 8 || payload_size == 3 || payload_size == 5 ||
-        payload_size == 6 || payload_size == 7) {
+    if (ir_payload_moves_by_address(payload_size)) {
       payload_temp_name = ir_new_label_name(context, "tagged_payload");
       if (!payload_temp_name ||
           !ir_emit_local_declaration(context, function, payload_temp_name,
@@ -963,8 +966,7 @@ int ir_emit_tagged_enum_construct(IRLoweringContext *context,
     }
 
     free(payload_temp_name);
-    if (payload_size > 8 || payload_size == 3 || payload_size == 5 ||
-        payload_size == 6 || payload_size == 7) {
+    if (ir_payload_moves_by_address(payload_size)) {
       ir_operand_destroy(&payload_source);
     }
     ir_operand_destroy(&payload_address);

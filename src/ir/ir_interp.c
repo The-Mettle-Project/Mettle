@@ -3315,36 +3315,42 @@ static int ii_extern_runtime_check(IRInterpMachine *machine, const char *name,
   return II_EXTERN_UNHANDLED;
 }
 
+static int ii_string_concat_call(IRInterpMachine *machine,
+                                 const IRInterpValue *args,
+                                 IRInterpValue *result) {
+  const unsigned char *left_bytes = NULL, *right_bytes = NULL;
+  size_t left_length = 0, right_length = 0;
+  if (!ii_read_string(machine, (unsigned long long)ii_as_int(&args[0]),
+                      &left_bytes, &left_length) ||
+      !ii_read_string(machine, (unsigned long long)ii_as_int(&args[1]),
+                      &right_bytes, &right_length) ||
+      left_length > (size_t)II_MAX_BUFFER_SIZE - right_length) {
+    ii_fail(machine, IR_INTERP_TRAP, "string concat operand");
+    return -1;
+  }
+  char *joined = malloc(left_length + right_length + 1);
+  if (!joined) {
+    ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+    return -1;
+  }
+  memcpy(joined, left_bytes, left_length);
+  memcpy(joined + left_length, right_bytes, right_length);
+  unsigned long long record =
+      ii_make_string(machine, joined, left_length + right_length);
+  free(joined);
+  if (!record) {
+    ii_fail(machine, IR_INTERP_TRAP, "string concat storage");
+    return -1;
+  }
+  *result = ii_int_value((long long)record);
+  return 1;
+}
+
 static int ii_extern_string_runtime(IRInterpMachine *machine, const char *name,
                         const IRInterpValue *args, size_t arg_count,
                         IRInterpValue *result) {
   if (strcmp(name, "mettle_string_concat") == 0 && arg_count == 2) {
-    const unsigned char *left_bytes = NULL, *right_bytes = NULL;
-    size_t left_length = 0, right_length = 0;
-    if (!ii_read_string(machine, (unsigned long long)ii_as_int(&args[0]),
-                        &left_bytes, &left_length) ||
-        !ii_read_string(machine, (unsigned long long)ii_as_int(&args[1]),
-                        &right_bytes, &right_length) ||
-        left_length > (size_t)II_MAX_BUFFER_SIZE - right_length) {
-      ii_fail(machine, IR_INTERP_TRAP, "string concat operand");
-      return -1;
-    }
-    char *joined = malloc(left_length + right_length + 1);
-    if (!joined) {
-      ii_fail(machine, IR_INTERP_TRAP, "out of memory");
-      return -1;
-    }
-    memcpy(joined, left_bytes, left_length);
-    memcpy(joined + left_length, right_bytes, right_length);
-    unsigned long long record =
-        ii_make_string(machine, joined, left_length + right_length);
-    free(joined);
-    if (!record) {
-      ii_fail(machine, IR_INTERP_TRAP, "string concat storage");
-      return -1;
-    }
-    *result = ii_int_value((long long)record);
-    return 1;
+    return ii_string_concat_call(machine, args, result);
   }
   if (strcmp(name, "mettle_string_eq") == 0 && arg_count == 2) {
     const unsigned char *left_bytes = NULL, *right_bytes = NULL;
@@ -6440,6 +6446,29 @@ static void ii_close_frame(IRInterpMachine *machine, IIFrame *frame,
   ii_env_free(&frame->env);
 }
 
+static unsigned long long ii_late_local_token(IRInterpMachine *machine,
+                                              IIFrame *frame, IRFunction *fn,
+                                              const char *name) {
+  char detail[160];
+  for (size_t d = 0; d < fn->instruction_count; d++) {
+    const IRInstruction *declared = &fn->instructions[d];
+    if (declared->op != IR_OP_DECLARE_LOCAL || !declared->dest.name ||
+        strcmp(declared->dest.name, name) != 0) {
+      continue;
+    }
+    if (!ii_op_declare_local(machine, frame, fn, declared)) {
+      return 0;
+    }
+    IIVar *var = ii_env_find(&frame->env, name);
+    return var ? (unsigned long long)var->value.i : 0;
+  }
+  if (machine->status == IR_INTERP_OK) {
+    snprintf(detail, sizeof(detail), "address-of global '%s'", name);
+    ii_fail(machine, IR_INTERP_UNSUPPORTED, detail);
+  }
+  return 0;
+}
+
 static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
                             const IRInterpValue *args, size_t arg_count,
                             IRInterpValue *result) {
@@ -6636,25 +6665,10 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         if (!token) {
           token = ii_global_storage(machine, insn->lhs.name);
         }
-        for (size_t d = 0; !token && d < fn->instruction_count; d++) {
-          const IRInstruction *declared = &fn->instructions[d];
-          if (declared->op != IR_OP_DECLARE_LOCAL || !declared->dest.name ||
-              strcmp(declared->dest.name, insn->lhs.name) != 0) {
-            continue;
-          }
-          if (!ii_op_declare_local(machine, &frame, fn, declared)) {
-            goto done;
-          }
-          var = ii_env_find(&frame.env, insn->lhs.name);
-          token = var ? (unsigned long long)var->value.i : 0;
+        if (!token) {
+          token = ii_late_local_token(machine, &frame, fn, insn->lhs.name);
         }
         if (!token) {
-          if (machine->status == IR_INTERP_OK) {
-            char detail[160];
-            snprintf(detail, sizeof(detail), "address-of global '%s'",
-                     insn->lhs.name);
-            ii_fail(machine, IR_INTERP_UNSUPPORTED, detail);
-          }
           goto done;
         }
         base = (long long)token;

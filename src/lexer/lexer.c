@@ -440,6 +440,46 @@ static Token lexer_lex_octal_number(Lexer *lexer) {
   return token;
 }
 
+static int lexer_reject_leading_zero(Lexer *lexer, size_t start, Token *token) {
+  size_t run = lexer->position - start;
+  if (lexer->source[start] != '0' || run <= 1) {
+    return 0;
+  }
+  for (size_t i = 0; i < run; i++) {
+    if (!isdigit((unsigned char)lexer->source[start + i])) {
+      return 0;
+    }
+  }
+  char message[160];
+  int shown = run > 40 ? 40 : (int)run;
+  int digits = shown;
+  const char *rest = &lexer->source[start];
+  while (digits > 1 && *rest == '0') {
+    rest++;
+    digits--;
+  }
+  int octal = 1;
+  for (int i = 0; i < shown; i++) {
+    if (lexer->source[start + i] > '7') {
+      octal = 0;
+    }
+  }
+  if (octal) {
+    snprintf(message, sizeof(message),
+             "An integer literal cannot start with 0: write 0o%.*s for "
+             "octal or %.*s for decimal",
+             digits, rest, digits, rest);
+  } else {
+    snprintf(message, sizeof(message),
+             "An integer literal cannot start with 0: write %.*s", digits,
+             rest);
+  }
+  token->type = TOKEN_ERROR;
+  token->value = strdup(message);
+  lexer_set_error(lexer, token->value);
+  return 1;
+}
+
 static Token lexer_lex_number(Lexer *lexer) {
   Token token = {TOKEN_EOF, NULL, {NULL, 0}, lexer->line, lexer->column, 0};
   size_t start = lexer->position;
@@ -517,41 +557,7 @@ static Token lexer_lex_number(Lexer *lexer) {
       }
     }
 
-    size_t run = lexer->position - start;
-    int all_digits = 1;
-    for (size_t i = 0; i < run; i++) {
-      if (!isdigit((unsigned char)lexer->source[start + i])) {
-        all_digits = 0;
-      }
-    }
-    if (current == '0' && run > 1 && all_digits) {
-      char message[160];
-      int shown = run > 40 ? 40 : (int)run;
-      int digits = shown;
-      const char *rest = &lexer->source[start];
-      while (digits > 1 && *rest == '0') {
-        rest++;
-        digits--;
-      }
-      int octal = 1;
-      for (int i = 0; i < shown; i++) {
-        if (lexer->source[start + i] > '7') {
-          octal = 0;
-        }
-      }
-      if (octal) {
-        snprintf(message, sizeof(message),
-                 "An integer literal cannot start with 0: write 0o%.*s for "
-                 "octal or %.*s for decimal",
-                 digits, rest, digits, rest);
-      } else {
-        snprintf(message, sizeof(message),
-                 "An integer literal cannot start with 0: write %.*s", digits,
-                 rest);
-      }
-      token.type = TOKEN_ERROR;
-      token.value = strdup(message);
-      lexer_set_error(lexer, token.value);
+    if (lexer_reject_leading_zero(lexer, start, &token)) {
       return token;
     }
   }

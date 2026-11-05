@@ -701,6 +701,42 @@ static int ir_lower_zeroed_scalar_local(IRLoweringContext *context,
   return ok;
 }
 
+static void ir_note_declared_type_facts(const VarDeclaration *declaration,
+                                        Type *decl_type) {
+  double bound_lo = 0.0;
+  double bound_hi = 0.0;
+  double bound_err = 0.0;
+  if (!declaration->type_name || !decl_type) {
+    return;
+  }
+  if (type_checker_float_bound(decl_type, &bound_lo, &bound_hi, &bound_err)) {
+    ir_declare_float_bound(string_intern(declaration->type_name), bound_lo,
+                           bound_hi);
+  }
+  if (type_checker_type_excludes_zero(decl_type)) {
+    ir_declare_nonzero_type(string_intern(declaration->type_name));
+  }
+}
+
+static int ir_lower_zero_unset_local(IRLoweringContext *context,
+                                     IRFunction *function, ASTNode *statement,
+                                     VarDeclaration *declaration,
+                                     Type *decl_type, const char *local_name) {
+  if (declaration->initializer || !decl_type ||
+      declaration->address_space != AST_ADDRESS_SPACE_DEFAULT ||
+      function->is_kernel) {
+    return 1;
+  }
+  if (decl_type->kind == TYPE_ARRAY || decl_type->kind == TYPE_STRUCT ||
+      decl_type->kind == TYPE_SLICE || decl_type->kind == TYPE_STRING) {
+    return ir_lower_zeroed_aggregate_local(context, function, statement,
+                                           decl_type, local_name,
+                                           declaration->name);
+  }
+  return ir_lower_zeroed_scalar_local(context, function, statement, declaration,
+                                      decl_type, local_name);
+}
+
 static int ir_lower_var_declaration(IRLoweringContext *context, IRFunction *function,
                                    ASTNode *statement) {
   VarDeclaration *declaration = (VarDeclaration *)statement->data;
@@ -740,21 +776,7 @@ static int ir_lower_var_declaration(IRLoweringContext *context, IRFunction *func
   local.location = statement->location;
   local.dest = ir_operand_symbol(local_name);
   local.text = (char *)ir_backend_type_name(declaration->type_name);
-  {
-    double bound_lo = 0.0;
-    double bound_hi = 0.0;
-    double bound_err = 0.0;
-    if (declaration->type_name && decl_type &&
-        type_checker_float_bound(decl_type, &bound_lo, &bound_hi,
-                                 &bound_err)) {
-      ir_declare_float_bound(string_intern(declaration->type_name), bound_lo,
-                             bound_hi);
-    }
-    if (declaration->type_name && decl_type &&
-        type_checker_type_excludes_zero(decl_type)) {
-      ir_declare_nonzero_type(string_intern(declaration->type_name));
-    }
-  }
+  ir_note_declared_type_facts(declaration, decl_type);
   local.value_type = mtlc_type_from_frontend(decl_type);
   if (declaration->address_space != AST_ADDRESS_SPACE_DEFAULT &&
       !ir_lower_address_space_local(context, declaration, decl_type, &local)) {
@@ -776,22 +798,8 @@ static int ir_lower_var_declaration(IRLoweringContext *context, IRFunction *func
   }
   ir_operand_destroy(&local.dest);
 
-  if (!declaration->initializer && decl_type &&
-      (decl_type->kind == TYPE_ARRAY || decl_type->kind == TYPE_STRUCT ||
-       decl_type->kind == TYPE_SLICE || decl_type->kind == TYPE_STRING) &&
-      declaration->address_space == AST_ADDRESS_SPACE_DEFAULT &&
-      !function->is_kernel &&
-      !ir_lower_zeroed_aggregate_local(context, function, statement, decl_type,
-                                       local_name, declaration->name)) {
-    return 0;
-  }
-  if (!declaration->initializer && decl_type &&
-      decl_type->kind != TYPE_ARRAY && decl_type->kind != TYPE_STRUCT &&
-      decl_type->kind != TYPE_SLICE && decl_type->kind != TYPE_STRING &&
-      declaration->address_space == AST_ADDRESS_SPACE_DEFAULT &&
-      !function->is_kernel &&
-      !ir_lower_zeroed_scalar_local(context, function, statement, declaration,
-                                    decl_type, local_name)) {
+  if (!ir_lower_zero_unset_local(context, function, statement, declaration,
+                                 decl_type, local_name)) {
     return 0;
   }
 
@@ -1890,6 +1898,14 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
   return ok;
 }
 
+static int ir_lower_scheduled_var_declaration(IRLoweringContext *context,
+                                              IRFunction *function,
+                                              ASTNode *statement,
+                                              IRDeferScope *defers) {
+  return ir_lower_var_declaration(context, function, statement) &&
+         ir_schedule_string_local_release(context, statement, defers);
+}
+
 static int ir_lower_statement_unmarked(IRLoweringContext *context,
                                        IRFunction *function,
                                        ASTNode *statement,
@@ -1918,8 +1934,8 @@ static int ir_lower_statement_unmarked(IRLoweringContext *context,
   }
 
   case AST_VAR_DECLARATION:
-    return ir_lower_var_declaration(context, function, statement) &&
-           ir_schedule_string_local_release(context, statement, defers);
+    return ir_lower_scheduled_var_declaration(context, function, statement,
+                                              defers);
 
   case AST_ASSIGNMENT:
     return ir_lower_assignment(context, function, statement);

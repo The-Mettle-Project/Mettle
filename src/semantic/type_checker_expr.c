@@ -4728,6 +4728,34 @@ static int type_checker_report_call_without_parens(TypeChecker *checker,
   return 1;
 }
 
+static Type *type_checker_comparison_result(TypeChecker *checker,
+                                            SourceLocation location,
+                                            const char *op, int is_equality,
+                                            BinaryExpression *binop,
+                                            Type *left_type, Type *right_type) {
+  type_checker_warn_mixed_sign_compare(checker, location, op, binop->left,
+                                       left_type, binop->right, right_type);
+
+  if (left_type->kind == TYPE_STRING && !is_equality) {
+    type_checker_set_error_at_location(
+        checker, location,
+        "Strings have == and != but no '%s': order them with str_compare "
+        "from std/conv",
+        op);
+    return NULL;
+  }
+  if (left_type->kind == TYPE_STRUCT || left_type->kind == TYPE_ARRAY ||
+      left_type->kind == TYPE_TAGGED_ENUM || left_type->kind == TYPE_SLICE) {
+    type_checker_set_error_at_location(
+        checker, location,
+        "Cannot compare '%s' with '%s': compare the fields or elements one "
+        "by one",
+        left_type->name, right_type->name);
+    return NULL;
+  }
+  return checker->builtin_bool;
+}
+
 Type *type_checker_check_binary_expression(TypeChecker *checker,
                                            BinaryExpression *binop,
                                            SourceLocation location) {
@@ -4910,28 +4938,8 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
       return NULL;
     }
 
-    type_checker_warn_mixed_sign_compare(checker, location, op, binop->left,
-                                         left_type, binop->right, right_type);
-
-    if (left_type->kind == TYPE_STRING && !is_equality) {
-      type_checker_set_error_at_location(
-          checker, location,
-          "Strings have == and != but no '%s': order them with str_compare "
-          "from std/conv",
-          op);
-      return NULL;
-    }
-    if (left_type->kind == TYPE_STRUCT || left_type->kind == TYPE_ARRAY ||
-        left_type->kind == TYPE_TAGGED_ENUM || left_type->kind == TYPE_SLICE) {
-      type_checker_set_error_at_location(
-          checker, location,
-          "Cannot compare '%s' with '%s': compare the fields or elements one "
-          "by one",
-          left_type->name, right_type->name);
-      return NULL;
-    }
-
-    return checker->builtin_bool;
+    return type_checker_comparison_result(checker, location, op, is_equality,
+                                          binop, left_type, right_type);
   }
 
   if (strcmp(op, "&&") == 0 || strcmp(op, "||") == 0) {

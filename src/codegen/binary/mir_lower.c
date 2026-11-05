@@ -6455,6 +6455,34 @@ static int mir_emit_copy_pair(MirFunction *fn, MirVregId to, MirVregId from,
                    8, 0, 0);
 }
 
+static int mir_emit_copy_16_to_32(MirFunction *fn, MirVregId to, MirVregId from,
+                                  MirVregId count) {
+  MirVregId q0, q1, q2, q3;
+  return mir_emit_copy_load(fn, &q0, from, MIR_VREG_NONE, 0, 8) &&
+         mir_emit_copy_load(fn, &q1, from, MIR_VREG_NONE, 8, 8) &&
+         mir_emit_copy_load(fn, &q2, from, count, -16, 8) &&
+         mir_emit_copy_load(fn, &q3, from, count, -8, 8) &&
+         mir_emit_copy_store(fn, q0, to, MIR_VREG_NONE, 0, 8) &&
+         mir_emit_copy_store(fn, q1, to, MIR_VREG_NONE, 8, 8) &&
+         mir_emit_copy_store(fn, q2, to, count, -16, 8) &&
+         mir_emit_copy_store(fn, q3, to, count, -8, 8);
+}
+
+static int mir_emit_copy_by_call(MirFunction *fn, const BinaryAbi *abi,
+                                 MirVregId to, MirVregId from, MirVregId count) {
+  return mir_emit1(fn, MIR_MOV,
+                   mir_op_phys(abi->int_param_registers[0], MIR_RC_GP),
+                   mir_op_vreg(to), mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_MOV,
+                   mir_op_phys(abi->int_param_registers[1], MIR_RC_GP),
+                   mir_op_vreg(from), mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_MOV,
+                   mir_op_phys(abi->int_param_registers[2], MIR_RC_GP),
+                   mir_op_vreg(count), mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_REP_MOVSB, mir_op_symbol("memcpy"), mir_op_none(),
+                   mir_op_none(), 8, 0, 0);
+}
+
 static int mir_emit_runtime_sized_copy(MirFunction *fn, MirVregId to,
                                        MirVregId from, MirVregId count) {
   const BinaryAbi *abi = code_generator_binary_active_abi();
@@ -6464,7 +6492,7 @@ static int mir_emit_runtime_sized_copy(MirFunction *fn, MirVregId to,
   const char *under4 = mir_new_copy_label(fn);
   const char *end = mir_new_copy_label(fn);
   MirVregId half = mir_new_vreg(fn, MIR_RC_GP, 8);
-  MirVregId b0, b1, b2, q0, q1, q2, q3;
+  MirVregId b0, b1, b2;
 
   if (!wide || !huge || !under8 || !under4 || !end || half == MIR_VREG_NONE ||
       !abi || abi->int_param_count < 3) {
@@ -6498,29 +6526,12 @@ static int mir_emit_runtime_sized_copy(MirFunction *fn, MirVregId to,
                    mir_op_none(), 8, 0, 0) &&
          mir_emit1(fn, MIR_CMPBR, mir_op_label(huge), mir_op_vreg(count),
                    mir_op_imm(32), 8, 1, 0x87) &&
-         mir_emit_copy_load(fn, &q0, from, MIR_VREG_NONE, 0, 8) &&
-         mir_emit_copy_load(fn, &q1, from, MIR_VREG_NONE, 8, 8) &&
-         mir_emit_copy_load(fn, &q2, from, count, -16, 8) &&
-         mir_emit_copy_load(fn, &q3, from, count, -8, 8) &&
-         mir_emit_copy_store(fn, q0, to, MIR_VREG_NONE, 0, 8) &&
-         mir_emit_copy_store(fn, q1, to, MIR_VREG_NONE, 8, 8) &&
-         mir_emit_copy_store(fn, q2, to, count, -16, 8) &&
-         mir_emit_copy_store(fn, q3, to, count, -8, 8) &&
+         mir_emit_copy_16_to_32(fn, to, from, count) &&
          mir_emit1(fn, MIR_JMP, mir_op_label(end), mir_op_none(), mir_op_none(),
                    8, 0, 0) &&
          mir_emit1(fn, MIR_LABEL, mir_op_label(huge), mir_op_none(),
                    mir_op_none(), 8, 0, 0) &&
-         mir_emit1(fn, MIR_MOV,
-                   mir_op_phys(abi->int_param_registers[0], MIR_RC_GP),
-                   mir_op_vreg(to), mir_op_none(), 8, 0, 0) &&
-         mir_emit1(fn, MIR_MOV,
-                   mir_op_phys(abi->int_param_registers[1], MIR_RC_GP),
-                   mir_op_vreg(from), mir_op_none(), 8, 0, 0) &&
-         mir_emit1(fn, MIR_MOV,
-                   mir_op_phys(abi->int_param_registers[2], MIR_RC_GP),
-                   mir_op_vreg(count), mir_op_none(), 8, 0, 0) &&
-         mir_emit1(fn, MIR_REP_MOVSB, mir_op_symbol("memcpy"), mir_op_none(),
-                   mir_op_none(), 8, 0, 0) &&
+         mir_emit_copy_by_call(fn, abi, to, from, count) &&
          mir_emit1(fn, MIR_LABEL, mir_op_label(end), mir_op_none(),
                    mir_op_none(), 8, 0, 0);
 }

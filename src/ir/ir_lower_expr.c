@@ -2497,6 +2497,37 @@ static int ir_widen_unsigned_compare_operand(IRLoweringContext *context,
   return emitted;
 }
 
+static int ir_widen_compare_operands(IRLoweringContext *context,
+                                     IRFunction *function, ASTNode *expression,
+                                     BinaryExpression *binary, IROperand *left,
+                                     IROperand *right) {
+  if (!ir_binary_operator_is_comparison(binary->operator)) {
+    return 1;
+  }
+  return ir_widen_unsigned_compare_operand(context, function, expression,
+                                           binary->left, binary->right, left,
+                                           right) &&
+         ir_widen_unsigned_compare_operand(context, function, expression,
+                                           binary->right, binary->left, right,
+                                           left);
+}
+
+static int ir_binary_operation_is_unsigned(IRLoweringContext *context,
+                                           BinaryExpression *binary,
+                                           const IROperand *left,
+                                           const IROperand *right) {
+  Type *left_type = ir_infer_expression_type(context, binary->left);
+  Type *right_type = ir_infer_expression_type(context, binary->right);
+  if (!ir_type_is_unsigned_integer(left_type) &&
+      !ir_type_is_unsigned_integer(right_type)) {
+    return 0;
+  }
+  return !ir_binary_operator_is_comparison(binary->operator) ||
+         type_checker_compare_is_unsigned(left_type, right_type) ||
+         (left->kind == IR_OPERAND_INT && left->int_value >= 0) ||
+         (right->kind == IR_OPERAND_INT && right->int_value >= 0);
+}
+
 static int ir_lower_binary_expression(IRLoweringContext *context,
                        IRFunction *function, ASTNode *expression,
                        IROperand *out_value) {
@@ -2581,13 +2612,8 @@ static int ir_lower_binary_expression(IRLoweringContext *context,
     }
   }
 
-  if (ir_binary_operator_is_comparison(binary->operator) &&
-      (!ir_widen_unsigned_compare_operand(context, function, expression,
-                                          binary->left, binary->right, &left,
-                                          &right) ||
-       !ir_widen_unsigned_compare_operand(context, function, expression,
-                                          binary->right, binary->left, &right,
-                                          &left))) {
+  if (!ir_widen_compare_operands(context, function, expression, binary, &left,
+                                 &right)) {
     ir_operand_destroy(&left);
     ir_operand_destroy(&right);
     return 0;
@@ -2608,19 +2634,7 @@ static int ir_lower_binary_expression(IRLoweringContext *context,
   instruction.rhs = right;
   instruction.text = binary->operator;
   instruction.is_unsigned =
-      ir_type_is_unsigned_integer(
-          ir_infer_expression_type(context, binary->left)) ||
-      ir_type_is_unsigned_integer(
-          ir_infer_expression_type(context, binary->right));
-  if (instruction.is_unsigned &&
-      ir_binary_operator_is_comparison(binary->operator) &&
-      !type_checker_compare_is_unsigned(
-          ir_infer_expression_type(context, binary->left),
-          ir_infer_expression_type(context, binary->right)) &&
-      !(left.kind == IR_OPERAND_INT && left.int_value >= 0) &&
-      !(right.kind == IR_OPERAND_INT && right.int_value >= 0)) {
-    instruction.is_unsigned = 0;
-  }
+      ir_binary_operation_is_unsigned(context, binary, &left, &right);
   int operation_float_bits = ir_binary_expression_operation_float_bits(
       context, expression, binary);
   instruction.is_float = operation_float_bits != 0;
@@ -2956,6 +2970,18 @@ static int ir_lower_closure_call(IRLoweringContext *context,
   return 1;
 }
 
+static int ir_coerce_func_ptr_argument(IRLoweringContext *context,
+                                       IRFunction *function, Type *param_type,
+                                       ASTNode *argument, IROperand *value) {
+  if (!ir_normalize_to_bool(context, function, param_type, argument, value,
+                            argument->location)) {
+    return 0;
+  }
+  return !ir_should_coerce_string_to_cstring(context, param_type, argument) ||
+         ir_coerce_string_operand_to_cstring(context, function, value,
+                                             argument->location);
+}
+
 static int ir_lower_func_ptr_call(IRLoweringContext *context,
                        IRFunction *function, ASTNode *expression,
                        IROperand *out_value) {
@@ -3021,14 +3047,9 @@ static int ir_lower_func_ptr_call(IRLoweringContext *context,
         ir_operand_destroy(&destination);
         return 0;
       }
-      if (!ir_normalize_to_bool(context, function, func_type->fn_param_types[i],
-                                fp_call->arguments[i], &arguments[i],
-                                fp_call->arguments[i]->location) ||
-          (ir_should_coerce_string_to_cstring(
-               context, func_type->fn_param_types[i], fp_call->arguments[i]) &&
-           !ir_coerce_string_operand_to_cstring(
-               context, function, &arguments[i],
-               fp_call->arguments[i]->location))) {
+      if (!ir_coerce_func_ptr_argument(context, function,
+                                       func_type->fn_param_types[i],
+                                       fp_call->arguments[i], &arguments[i])) {
         for (size_t j = 0; j < fp_call->argument_count; j++) {
           ir_operand_destroy(&arguments[j]);
         }
