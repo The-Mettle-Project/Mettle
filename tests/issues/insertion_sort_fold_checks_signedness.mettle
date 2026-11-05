@@ -1,0 +1,86 @@
+import "std/io";
+import "std/mem";
+@noinline fn sort_desc(data: int32*, len: int32) {
+  var i: int32 = 1;
+  var cur: int32* = data + 1;
+  while (i < len) {
+    var key: int32 = *cur;
+    var scan: int32* = cur;
+    var j: int32 = i - 1;
+    while (j >= 0) {
+      var prev: int32* = scan - 1;
+      var current: int32 = *prev;
+      if (current >= key) {
+        break;
+      }
+      *scan = current;
+      scan = prev;
+      j = j - 1;
+    }
+    *scan = key;
+    cur = cur + 1;
+    i = i + 1;
+  }
+}
+@noinline fn sort_u(data: uint32*, len: int32) {
+  var i: int32 = 1;
+  var cur: uint32* = data + 1;
+  while (i < len) {
+    var key: uint32 = *cur;
+    var scan: uint32* = cur;
+    var j: int32 = i - 1;
+    while (j >= 0) {
+      var prev: uint32* = scan - 1;
+      var current: uint32 = *prev;
+      if (current <= key) {
+        break;
+      }
+      *scan = current;
+      scan = prev;
+      j = j - 1;
+    }
+    *scan = key;
+    cur = cur + 1;
+    i = i + 1;
+  }
+}
+@noinline fn sort_half(data: int32*, len: int32) {
+  var i: int32 = 1;
+  var cur: int32* = data + 1;
+  while (i < len) {
+    var key: int32 = *cur;
+    var scan: int32* = cur;
+    var j: int32 = i - 1;
+    while (j >= 1) {
+      var prev: int32* = scan - 1;
+      var current: int32 = *prev;
+      if (current <= key) {
+        break;
+      }
+      *scan = current;
+      scan = prev;
+      j = j - 1;
+    }
+    *scan = key;
+    cur = cur + 1;
+    i = i + 1;
+  }
+}
+fn main() -> int32 {
+  var a: int32* = (int32*)malloc(4 * 64);
+  var u: uint32* = (uint32*)malloc(4 * 64);
+  var h: int64 = 0;
+  for n in 0..40 {
+    for i in 0..n { a[i] = (int32)((i * 37 + n * 11) % 29) - 14; }
+    sort_desc(a, (int32)n);
+    for i in 0..n { h = h * 31 + (int64)a[i]; }
+    for i in 0..n { u[i] = (uint32)((i * 37 + n * 11) % 29) * (uint32)300000000; }
+    sort_u(u, (int32)n);
+    for i in 0..n { h = h * 31 + (int64)u[i]; }
+    for i in 0..n { a[i] = (int32)((i * 37 + n * 11) % 29) - 14; }
+    sort_half(a, (int32)n);
+    for i in 0..n { h = h * 31 + (int64)a[i]; }
+  }
+  println("{h}");
+  return 0;
+}

@@ -1269,6 +1269,19 @@ static int ir_dot_bases_are_arrays(const IRFunction *function,
          ir_symbol_is_sum_array_base(function, b_symbol);
 }
 
+static int ir_dot_base_holds_int32(const IRFunction *function,
+                                   const char *symbol) {
+  const char *type = ir_function_local_declared_type(function, symbol);
+  for (size_t p = 0; !type && p < function->parameter_count; p++) {
+    if (function->parameter_names && function->parameter_names[p] &&
+        function->parameter_types &&
+        strcmp(function->parameter_names[p], symbol) == 0) {
+      type = function->parameter_types[p];
+    }
+  }
+  return type && strcmp(type, "int32*") == 0;
+}
+
 static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index,
                                        int *changed) {
   IRCountedLoop loop;
@@ -1288,7 +1301,10 @@ static int ir_try_vectorize_dot_i32_at(IRFunction *function, size_t header_index
                         &a_unsigned, &b_unsigned, &sum_symbol) ||
       !sum_symbol || !a_symbol || !b_symbol ||
       !ir_dot_bases_are_arrays(function, sum_symbol, "int64", a_symbol,
-                               b_symbol)) {
+                               b_symbol) ||
+      a_unsigned || b_unsigned ||
+      !ir_dot_base_holds_int32(function, a_symbol) ||
+      !ir_dot_base_holds_int32(function, b_symbol)) {
     ir_operand_destroy(&loop.len);
     return 1;
   }

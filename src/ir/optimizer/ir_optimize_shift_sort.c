@@ -138,6 +138,7 @@ static int ir_match_shift_loop_at(const IRFunction *function, size_t header_inde
     out->dst = dst;
     out->src = src;
     out->key = key;
+    out->val = val;
     out->cmp_op = cmp->text;
     out->stride = stride;
     out->elem_size = elem_size;
@@ -175,6 +176,17 @@ int ir_detect_shift_loops_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+static int ir_shift_loop_sorts_signed_i32(const IRFunction *function,
+                                          const IRShiftLoopMatch *match) {
+  const char *val_type = ir_function_local_declared_type(function, match->val);
+  const char *key_type = ir_function_local_declared_type(function, match->key);
+  return match->elem_size == 4 &&
+         ir_i32_shift_stride_is_element_step(match->stride, match->elem_size) &&
+         match->cmp_op && strcmp(match->cmp_op, "<=") == 0 && val_type &&
+         key_type && strcmp(val_type, "int32") == 0 &&
+         strcmp(key_type, "int32") == 0;
+}
+
 static int ir_function_has_shift_loop_match(const IRFunction *function) {
   if (!function) {
     return 0;
@@ -183,8 +195,7 @@ static int ir_function_has_shift_loop_match(const IRFunction *function) {
     IRShiftLoopMatch match;
     if (function->instructions[i].op == IR_OP_LABEL &&
         ir_match_shift_loop_at(function, i, &match) &&
-        ir_i32_shift_stride_is_element_step(match.stride, match.elem_size) &&
-        match.cmp_op && strcmp(match.cmp_op, "<=") == 0) {
+        ir_shift_loop_sorts_signed_i32(function, &match)) {
       return 1;
     }
   }
@@ -240,8 +251,7 @@ static int ir_try_vectorize_insertion_sort_loop_at(IRFunction *function,
     }
     if (function->instructions[i].op == IR_OP_LABEL &&
         ir_match_shift_loop_at(function, i, &inner) &&
-        ir_i32_shift_stride_is_element_step(inner.stride, inner.elem_size) &&
-        inner.cmp_op && strcmp(inner.cmp_op, "<=") == 0) {
+        ir_shift_loop_sorts_signed_i32(function, &inner)) {
       inner_header = i;
     }
     if (function->instructions[i].op == IR_OP_JUMP &&

@@ -1,0 +1,25 @@
+import "std/io";
+import "std/mem";
+
+@noinline fn dot_u(a: uint32*, b: uint32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  for i in 0..n { s = s + (int64)a[i] * (int64)b[i]; }
+  return s;
+}
+
+@noinline fn dot_s(a: int32*, b: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  for i in 0..n { s = s + (int64)a[i] * (int64)b[i]; }
+  return s;
+}
+
+fn main() -> int32 {
+  var a: uint32* = (uint32*)malloc(4 * 64);
+  var b: uint32* = (uint32*)malloc(4 * 64);
+  for i in 0..64 {
+    a[i] = (uint32)i * (uint32)70000000;
+    b[i] = (uint32)(64 - i) * (uint32)3;
+  }
+  println("{dot_u(a, b, 64)} {dot_s((int32*)a, (int32*)b, 64)}");
+  return 0;
+}

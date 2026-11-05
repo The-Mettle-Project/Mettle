@@ -219,6 +219,7 @@ typedef struct {
   const char *dst;
   const char *src;
   const char *key;
+  const char *val;
   const char *cmp_op;
   long long stride;
   int elem_size;
