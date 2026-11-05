@@ -58,7 +58,9 @@ test adds ... ok
 ```
 
 Tests are stripped from a normal build, so `@test` functions cost nothing in
-the program you ship.
+the program you ship. A test that other code calls stays in the build as an
+ordinary function, and a failed `assert` or `assert_eq` in it stops the
+program with `Fatal error: assert_eq failed in test 'name' at line N`.
 
 ## Tracing a function
 

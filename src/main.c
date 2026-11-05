@@ -7161,8 +7161,112 @@ static int compile_stage_expand_passes(CompileContext *ctx) {
   return 0;
 }
 
+typedef struct {
+  const char **names;
+  size_t *owners;
+  size_t slots;
+} TestNameTable;
+
+static FunctionDeclaration *program_test_function(ASTNode *decl) {
+  FunctionDeclaration *fd =
+      decl && decl->type == AST_FUNCTION_DECLARATION && decl->data
+          ? (FunctionDeclaration *)decl->data
+          : NULL;
+  return fd && fd->is_test ? fd : NULL;
+}
+
+static size_t test_name_find(const TestNameTable *table, const char *name) {
+  size_t at = mettle_fnv1a_hash(name) & (table->slots - 1);
+  while (table->names[at]) {
+    if (strcmp(table->names[at], name) == 0) {
+      return at;
+    }
+    at = (at + 1) & (table->slots - 1);
+  }
+  return at;
+}
+
+static void test_names_mark(const ASTNode *node, const TestNameTable *table,
+                            unsigned char *keep, int *grew) {
+  const char *name = NULL;
+  if (!node) {
+    return;
+  }
+  if (node->type == AST_FUNCTION_CALL && node->data &&
+      !((const CallExpression *)node->data)->object) {
+    name = ((const CallExpression *)node->data)->function_name;
+  } else if (node->type == AST_IDENTIFIER && node->data) {
+    name = ((const Identifier *)node->data)->name;
+  }
+  if (name) {
+    size_t at = test_name_find(table, name);
+    if (table->names[at] && !keep[table->owners[at]]) {
+      keep[table->owners[at]] = 1;
+      *grew = 1;
+    }
+  }
+  for (size_t c = 0; c < node->child_count; c++) {
+    test_names_mark(node->children[c], table, keep, grew);
+  }
+}
+
+static unsigned char *program_tests_called(Program *prog_data) {
+  size_t count = prog_data->declaration_count;
+  unsigned char *keep = (unsigned char *)calloc(count ? count : 1, 1);
+  unsigned char *walked = (unsigned char *)calloc(count ? count : 1, 1);
+  TestNameTable table = {NULL, NULL, 16};
+  size_t tests = 0;
+  int grew = 1;
+  if (!keep || !walked) {
+    free(keep);
+    free(walked);
+    return NULL;
+  }
+  for (size_t i = 0; i < count; i++) {
+    FunctionDeclaration *fd = program_test_function(prog_data->declarations[i]);
+    keep[i] = fd ? 0 : 1;
+    tests += fd && fd->name ? 1 : 0;
+  }
+  while (table.slots < tests * 2) {
+    table.slots *= 2;
+  }
+  table.names = (const char **)calloc(table.slots, sizeof(char *));
+  table.owners = (size_t *)calloc(table.slots, sizeof(size_t));
+  if (!table.names || !table.owners) {
+    free(table.names);
+    free(table.owners);
+    free(walked);
+    for (size_t i = 0; i < count; i++) {
+      keep[i] = 1;
+    }
+    return keep;
+  }
+  for (size_t i = 0; i < count; i++) {
+    FunctionDeclaration *fd = program_test_function(prog_data->declarations[i]);
+    if (fd && fd->name) {
+      size_t at = test_name_find(&table, fd->name);
+      table.names[at] = fd->name;
+      table.owners[at] = i;
+    }
+  }
+  while (tests && grew) {
+    grew = 0;
+    for (size_t i = 0; i < count; i++) {
+      if (keep[i] && !walked[i]) {
+        walked[i] = 1;
+        test_names_mark(prog_data->declarations[i], &table, keep, &grew);
+      }
+    }
+  }
+  free(table.names);
+  free(table.owners);
+  free(walked);
+  return keep;
+}
+
 static int compile_stage_drop_tests(CompileContext *ctx) {
   Program *prog_data = NULL;
+  unsigned char *keep = NULL;
   size_t kept = 0;
   size_t i = 0;
   if (ctx->options->test_mode) {
@@ -7172,12 +7276,13 @@ static int compile_stage_drop_tests(CompileContext *ctx) {
   if (!prog_data) {
     return COMPILE_CONTINUE;
   }
+  keep = program_tests_called(prog_data);
   for (i = 0; i < prog_data->declaration_count; i++) {
     ASTNode *decl = prog_data->declarations[i];
-    FunctionDeclaration *fd =
-        decl && decl->type == AST_FUNCTION_DECLARATION && decl->data
-            ? (FunctionDeclaration *)decl->data
-            : NULL;
+    FunctionDeclaration *fd = program_test_function(decl);
+    if (fd && keep && keep[i]) {
+      fd->is_test = 0;
+    }
     if (fd && fd->is_test) {
       size_t child_kept = 0;
       for (size_t c = 0; c < ctx->program->child_count; c++) {
@@ -7193,6 +7298,7 @@ static int compile_stage_drop_tests(CompileContext *ctx) {
     prog_data->declarations[kept++] = decl;
   }
   prog_data->declaration_count = kept;
+  free(keep);
   return COMPILE_CONTINUE;
 }
 

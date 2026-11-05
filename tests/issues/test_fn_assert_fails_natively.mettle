@@ -1,0 +1,11 @@
+import "std/io";
+
+@test fn wrong_sum() -> int32 {
+  assert_eq(2 + 2, 5);
+  return 0;
+}
+
+fn main() -> int32 {
+  println("before");
+  return wrong_sum();
+}

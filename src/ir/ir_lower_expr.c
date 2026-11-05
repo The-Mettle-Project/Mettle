@@ -1619,6 +1619,89 @@ static int ir_lower_builtin_call(IRLoweringContext *context, IRFunction *functio
   return ir_lower_device_call(context, function, expression, out_value, call, callee_symbol);
 }
 
+static int ir_call_is_native_assert(IRLoweringContext *context,
+                                    const IRFunction *function,
+                                    const CallExpression *call) {
+  Symbol *symbol;
+  if (function->is_test || call->object ||
+      !((strcmp(call->function_name, "assert") == 0 &&
+         call->argument_count == 1) ||
+        (strcmp(call->function_name, "assert_eq") == 0 &&
+         call->argument_count == 2))) {
+    return 0;
+  }
+  symbol = symbol_table_lookup(context->symbol_table, call->function_name);
+  return symbol && symbol->is_builtin;
+}
+
+static int ir_lower_native_assert(IRLoweringContext *context,
+                                  IRFunction *function, ASTNode *expression,
+                                  const CallExpression *call,
+                                  IROperand *out_value) {
+  IROperand holds = ir_operand_none();
+  char message[256];
+  char *trap_label;
+  char *ok_label;
+  int ok;
+  if (call->argument_count == 2) {
+    BinaryExpression same = {call->arguments[0], call->arguments[1],
+                             (char *)"=="};
+    ASTNode node;
+    memset(&node, 0, sizeof(node));
+    node.type = AST_BINARY_EXPRESSION;
+    node.location = expression->location;
+    node.data = &same;
+    ok = ir_lower_expression(context, function, &node, &holds);
+  } else {
+    ok = ir_lower_expression(context, function, call->arguments[0], &holds);
+  }
+  if (!ok) {
+    return 0;
+  }
+  snprintf(message, sizeof(message),
+           "Fatal error: %s failed in test '%s' at line %d",
+           call->function_name, function->name ? function->name : "?",
+           (int)expression->location.line);
+  trap_label = ir_new_label_name(context, "assert_failed");
+  ok_label = ir_new_label_name(context, "assert_held");
+  if (!trap_label || !ok_label) {
+    free(trap_label);
+    free(ok_label);
+    ir_operand_destroy(&holds);
+    ir_set_error(context, "Out of memory while lowering an assertion");
+    return 0;
+  }
+  IRInstruction branch = {0};
+  branch.op = IR_OP_BRANCH_ZERO;
+  branch.location = expression->location;
+  branch.lhs = holds;
+  branch.text = trap_label;
+  IRInstruction jump = {0};
+  jump.op = IR_OP_JUMP;
+  jump.location = expression->location;
+  jump.text = ok_label;
+  IRInstruction trap = {0};
+  trap.op = IR_OP_LABEL;
+  trap.location = expression->location;
+  trap.text = trap_label;
+  IRInstruction held = {0};
+  held.op = IR_OP_LABEL;
+  held.location = expression->location;
+  held.text = ok_label;
+  ok = ir_emit(context, function, &branch) && ir_emit(context, function, &jump) &&
+       ir_emit(context, function, &trap) &&
+       ir_emit_runtime_trap_ex(context, function, expression->location, 0u,
+                               message, NULL, NULL) &&
+       ir_emit(context, function, &held);
+  ir_operand_destroy(&holds);
+  free(trap_label);
+  free(ok_label);
+  if (ok && out_value) {
+    *out_value = ir_operand_none();
+  }
+  return ok;
+}
+
 int ir_lower_call_expression(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *expression,
                                     IROperand *out_value) {
@@ -1627,6 +1710,11 @@ int ir_lower_call_expression(IRLoweringContext *context,
   if (!call || !call->function_name) {
     ir_set_error(context, "Malformed call expression");
     return 0;
+  }
+
+  if (ir_call_is_native_assert(context, function, call)) {
+    return ir_lower_native_assert(context, function, expression, call,
+                                  out_value);
   }
 
   if (context->emit_task_checks &&
