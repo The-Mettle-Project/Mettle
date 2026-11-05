@@ -1,0 +1,17 @@
+import "std/io";
+
+@naked fn nk_id(p: int64) -> int64 {
+  asm {
+    mov rax, rcx
+    ret
+  }
+}
+
+fn plain(a: int64) -> int64 forbids asm {
+  return a + 1;
+}
+
+fn main() -> int32 {
+  println("{plain(4)} {nk_id(9)}");
+  return 0;
+}

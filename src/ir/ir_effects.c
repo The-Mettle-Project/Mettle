@@ -1371,7 +1371,7 @@ static int instrument_function(Ctx *ctx, EFn *efn) {
   int syscall_bit = effect_bit(ctx, "syscall");
   int framed = fn->effects_with_count || fn->effects_forbids_count ||
                fn->effects_requires_count || fn->effects_provides_count;
-  if (fn->instruction_count == 0) {
+  if (fn->instruction_count == 0 || fn->is_naked) {
     return 1;
   }
   for (size_t i = fn->instruction_count; i > 0; i--) {

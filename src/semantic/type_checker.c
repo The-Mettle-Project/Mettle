@@ -775,7 +775,9 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
     if (decl && decl->type == AST_FUNCTION_DECLARATION) {
       ComptimeDeclScope expansion;
       type_checker_enter_expansion_decl(checker, decl, &expansion);
-      type_checker_register_function_signature(checker, decl);
+      if (!type_checker_register_function_signature(checker, decl)) {
+        ok = 0;
+      }
       type_checker_leave_expansion_decl(checker, &expansion);
     }
   }

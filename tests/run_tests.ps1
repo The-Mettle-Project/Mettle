@@ -21729,6 +21729,8 @@ $issueRegressions = @(
   @{ Name = "path_nul_and_negative_zero"; Entry = "tests/issues/path_nul_and_negative_zero.mettle"; Args = @(); Expect = @("true false false true true true", "0.0 -0.0 -0.0 -inf true", "::ffff:1.2.3.4", "::ffff:0.0.0.1", "2001:db8::1") },
   @{ Name = "path_nul_and_negative_zero_release"; Entry = "tests/issues/path_nul_and_negative_zero.mettle"; Args = @("--release"); Expect = @("true false false true true true", "0.0 -0.0 -0.0 -inf true", "::ffff:1.2.3.4", "::ffff:0.0.0.1", "2001:db8::1") },
   @{ Name = "negative_zero_in_the_interpreter"; Command = @("test", "tests/issues/negative_zero_prints_its_sign.mettle"); Expect = @("1 passed") },
+  @{ Name = "naked_skips_effect_checks"; Command = @("--verify", "--build", "tests/issues/naked_with_effect_checks.mettle", "-o", ".tmp/issue_naked_verify.exe"); Refuse = @("is ``@naked``"); Expect = @("Built executable") },
+  @{ Name = "signature_error_stops_the_build"; Command = @("--build", "tests/issues/err_with_none_on_body.mettle", "-o", ".tmp/issue_err.exe"); Refuse = @("Built executable"); Expect = @("stands alone") },
   @{ Name = "random_range_extremes"; Entry = "tests/issues/random_range_extremes.mettle"; Args = @("--check-overflow"); Refuse = @("Fatal error"); Expect = @("bad 0") },
   @{ Name = "verify_follows_pointers"; Command = @("--verify", "--build", "tests/issues/verify_follows_pointers.mettle", "-o", ".tmp/issue_verify.exe"); Refuse = @("MISCOMPILE"); Expect = @("Built executable") }
 )

@@ -1,0 +1,2 @@
+fn pure_add(a: int64) -> int64 with none { return a + 1; }
+fn main() -> int32 { return (int32)pure_add(4) - 5; }
