@@ -1,0 +1,9 @@
+import "std/io";
+
+fn main() -> int32 {
+  var low: int64 = (int64)(0 - (uint64)0x8000000000000000);
+  var mask: uint64 = (uint64)0 - 1;
+  var signed: int64 = 9223372036854775807 * 2;
+  println("{low} {mask} {signed}");
+  return 0;
+}

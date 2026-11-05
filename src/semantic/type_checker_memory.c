@@ -1243,8 +1243,13 @@ static void mem_check_handover_write(MemCtx *ctx, ASTNode *target,
   root->handed_over = 0;
 }
 
+static int mem_type_is_unsigned_integer(const Type *type) {
+  return type && (type->kind == TYPE_UINT8 || type->kind == TYPE_UINT16 ||
+                  type->kind == TYPE_UINT32 || type->kind == TYPE_UINT64);
+}
+
 static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
-                                       SourceLocation loc) {
+                                       Type *result_type, SourceLocation loc) {
   if (ctx->mode != MEM_MODE_LOCAL || !binary->operator) {
     return;
   }
@@ -1253,8 +1258,16 @@ static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
       strcmp(binary->operator, "*") == 0) {
     long long left = 0;
     long long product = 0;
-    Type *operand_type = binary->left ? binary->left->resolved_type : NULL;
+    Type *operand_type =
+        result_type ? result_type
+                    : (binary->left ? binary->left->resolved_type : NULL);
     int bits = 0;
+    if (mem_type_is_unsigned_integer(binary->left ? binary->left->resolved_type
+                                                  : NULL) ||
+        mem_type_is_unsigned_integer(binary->right ? binary->right->resolved_type
+                                                   : NULL)) {
+      operand_type = NULL;
+    }
     if (operand_type) {
       switch (operand_type->kind) {
       case TYPE_INT8: bits = 8; break;
@@ -1275,7 +1288,13 @@ static void mem_check_const_arithmetic(MemCtx *ctx, BinaryExpression *binary,
         long long limit = 1LL << (bits - 1);
         wide = product < -limit || product >= limit;
       }
-      if (wide) {
+      if (wide && bits == 64) {
+        mem_warn(ctx, "M0124", loc,
+                 "The constant `%lld %s %lld` does not fit `%s` and wraps; no "
+                 "wider integer exists, so write it in `uint64` if the wrap "
+                 "is intended",
+                 left, binary->operator, value, operand_type->name);
+      } else if (wide) {
         mem_warn(ctx, "M0124", loc,
                  "The constant `%lld %s %lld` does not fit `%s` and wraps; "
                  "write one operand with a cast to a wider type, for example "
@@ -1781,7 +1800,8 @@ static void mem_walk_expr(MemCtx *ctx, ASTNode *expr) {
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *binary = (BinaryExpression *)expr->data;
     if (binary) {
-      mem_check_const_arithmetic(ctx, binary, expr->location);
+      mem_check_const_arithmetic(ctx, binary, expr->resolved_type,
+                                 expr->location);
       mem_walk_expr(ctx, binary->left);
       mem_walk_expr(ctx, binary->right);
     }

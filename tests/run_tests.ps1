@@ -21579,6 +21579,7 @@ $issueRegressions = @(
   @{ Name = "issue_string_temp_outlives_call_through_view_alias_literal"; Entry = "tests/issues/issue_093_094.mettle"; Args = @(); Expect = @("[hello] 17", "[hello world] 11", "[hello world] 11") },
   @{ Name = "issue_dyn_impl_for_private_struct"; Entry = "tests/issues/dyn_private/main.mettle"; Args = @(); Expect = @("9") },
   @{ Name = "issue_stdlib_modules_import_together"; Entry = "tests/issues/issue_076.mettle"; Args = @(); Expect = @("ok") },
+  @{ Name = "unsigned_constant_no_wrap_warning"; Command = @("--build", "tests/issues/unsigned_constant_no_wrap_warning.mettle", "-o", ".tmp/issue_unsigned_wrap.exe"); Refuse = @("does not fit ``int32``", "0 - -9223372036854775808"); Expect = @("does not fit ``int64`` and wraps; no wider integer exists") },
   @{ Name = "issue_constant_wrap_warns"; Command = @("--build", "tests/issues/constant_wrap.mettle", "-o", ".tmp/issue_wrap.exe"); Expect = @("M0124", "100000 * 100000") },
   @{ Name = "issue_constant_widened_by_cast_is_exact"; Entry = "tests/issues/constant_wrap.mettle"; Args = @(); Expect = @("1410065408 10000000000") },
   @{ Name = "issue_stack_trace_flag_on_freestanding_target"; Command = @("-s", "--target", "x86_64-none", "--emit-flat", ".tmp/issue_boot.bin", "--image-base", "0x100000", "tests/issues/boot_s.mettle"); Expect = @("Wrote flat image") },
