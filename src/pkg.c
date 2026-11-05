@@ -626,6 +626,35 @@ static int pkg_parse_need(const char *where, char *value, PkgNeeds *needs) {
   return 1;
 }
 
+static int pkg_platforms_valid(const char *value) {
+  static const char *known[] = {"linux", "macos", "windows"};
+  char seen[3] = {0, 0, 0};
+  int count = 0;
+  const char *word = value;
+  while (*word) {
+    size_t length = 0;
+    int found = 0;
+    while (word[length] && word[length] != ' ' && word[length] != '\t') {
+      length++;
+    }
+    for (int i = 0; i < 3; i++) {
+      if (length == strlen(known[i]) && strncmp(word, known[i], length) == 0 && !seen[i]) {
+        seen[i] = 1;
+        found = 1;
+      }
+    }
+    if (!found) {
+      return 0;
+    }
+    count++;
+    word += length;
+    while (*word == ' ' || *word == '\t') {
+      word++;
+    }
+  }
+  return count > 0;
+}
+
 static int pkg_manifest_field(PkgManifest *manifest, const char *where,
                               const char *key, char *value) {
   if (strcmp(key, "name") == 0) {
@@ -654,6 +683,11 @@ static int pkg_manifest_field(PkgManifest *manifest, const char *where,
                       value);
     }
     manifest->compiler = pkg_copy(value);
+  } else if (strcmp(key, "platforms") == 0) {
+    if (!pkg_platforms_valid(value)) {
+      return pkg_fail("%s: platforms is a list of linux, macos and windows",
+                      where);
+    }
   } else if (strcmp(key, "require") == 0) {
     return pkg_parse_need(where, value, &manifest->needs);
   } else {

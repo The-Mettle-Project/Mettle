@@ -127,7 +127,9 @@ require = sha256 1.0.0
 ```
 
 `name`, `version`, `description` and `license` are required. `compiler` is the oldest
-mettle the package works with. Names are lower case letters, digits and underscores,
+mettle the package works with. `platforms` names the systems a package builds on, from
+`linux`, `macos` and `windows`, as in `platforms = linux windows`. Leave it out when
+it builds on all three. The registry check only compiles a package on its platforms. Names are lower case letters, digits and underscores,
 starting with a letter.
 
 A package holds source. Paths use letters, digits, `_`, `-`, `.` and `+`. Files whose
