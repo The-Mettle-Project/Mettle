@@ -743,6 +743,47 @@ if ($built.Code -ne 0) {
     if ($text -match "label=(?!kept)") { Fail $name "an inferred string lost its value: $text" }
 }
 
+$quietA = @'
+fn main() -> int32 {
+    var t: int64 = 0;
+    while (t < 2000) {
+        quiesce;
+        println("old t={t}");
+        t = t + 1;
+        thread_sleep_ms((uint32)15);
+    }
+    return 0;
+}
+'@
+$quietB = $quietA.Replace('println("old t=', 'println("new t=')
+
+# METTLE_LIVE_QUIET hides the apply, undo and move lines; a refusal still prints.
+$name = "quiet"
+Clear-Program $name
+$source = Join-Path $scratch "$name.mettle"
+$exe = Join-Path $scratch "$name$suffix"
+Write-Source $source $quietA
+$built = Invoke-Mettle @("--build", "--live", $source, "-o", $exe)
+if ($built.Code -ne 0) {
+    Fail $name "build failed: $($built.Text)"
+} else {
+    $env:METTLE_LIVE_QUIET = "1"
+    $process = Start-Live $exe $name
+    Remove-Item Env:METTLE_LIVE_QUIET
+    $out = Join-Path $scratch "$name.out"
+    $err = Join-Path $scratch "$name.err"
+    if (-not (Wait-For $out "old t=3 ")) { Fail $name "the program did not start" }
+    Write-Source $source $quietB
+    Invoke-Mettle @("--live-patch", $exe, $source) | Out-Null
+    if (-not (Wait-For $out "new t=\d+ ")) { Fail $name "main never moved to the new code" }
+    Invoke-Mettle @("--live-undo", $exe) | Out-Null
+    if (-not (Wait-For $out "new t=\d+ [^\n]*\n(.*\n)*old t=")) { Fail $name "undo never returned to the old code" }
+    [System.IO.File]::WriteAllBytes((Join-Path "$exe.live.d" "000003.mpatch"), (New-Object byte[] 200))
+    if (-not (Wait-For $err "patch 3 refused")) { Fail $name "the refusal was not printed: $(Read-Text $err)" }
+    Stop-Live $process
+    if ((Read-Text $err) -match "patch 1:|undoes|moves to the current code") { Fail $name "quiet mode still printed: $(Read-Text $err)" }
+}
+
 foreach ($line in $failures) { "FAIL $line" }
 $scenarios = @(Select-String -Path $PSCommandPath -Pattern '^(\$name = "|Test-HeapLayout ")').Count
 "live features: $($scenarios - @($failures | ForEach-Object { ($_ -split ':')[0] } | Sort-Object -Unique).Count) of $scenarios scenarios passed"

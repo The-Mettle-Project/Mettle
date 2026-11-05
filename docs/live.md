@@ -135,6 +135,19 @@ their old storage, with the values they have now. Frames move back to the old
 code the same way they moved forward. Undo can be repeated back to the
 original build.
 
+## Quiet output
+
+The program prints a `[live]` line on stderr for every patch, undo and frame
+move. Set `METTLE_LIVE_QUIET` to anything but empty or `0` to leave those
+lines out, for a tool that patches on every keystroke:
+
+```bash
+METTLE_LIVE_QUIET=1 ./game
+```
+
+Refusals, faults and the notes about variables that start over still print.
+The variable is read once, when the program takes its first patch.
+
 ## Threads
 
 Patches apply on the thread that reaches `quiesce;`, with every other thread

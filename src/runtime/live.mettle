@@ -22,6 +22,7 @@ export var mettle_live_arena: uint8[1048576];
 var mettle_live_path: uint8[1100];
 var mettle_live_path_length: int64 = 0;
 var mettle_live_ready: int64 = 0;
+var mettle_live_quiet: int64 = 0;
 var mettle_live_next: int64 = 1;
 var mettle_live_last_probe: uint64 = 0;
 var mettle_live_held_tick: int64 = 0;
@@ -104,6 +105,15 @@ fn mettle_live_send(length: int64) {
     mettle_live_message[length] = (uint8)10;
     mettle_live_port_write(&mettle_live_message[0], length + 1);
     mettle_live_port_unlock(&mettle_live_message_lock);
+}
+
+// For the routine apply, undo and move lines; refusals and faults always print.
+fn mettle_live_send_patch(length: int64) {
+    if (mettle_live_quiet != 0) {
+        mettle_live_port_unlock(&mettle_live_message_lock);
+        return;
+    }
+    mettle_live_send(length);
 }
 
 fn mettle_live_refuse(index: int64, reason: string) {
@@ -831,7 +841,7 @@ fn mettle_live_undo(index: int64, target: int64) -> int64 {
     at = mettle_live_number(at, index);
     at = mettle_live_text(at, " undoes patch ");
     at = mettle_live_number(at, target);
-    mettle_live_send(at);
+    mettle_live_send_patch(at);
     return 1;
 }
 
@@ -1101,7 +1111,7 @@ fn mettle_live_apply(index: int64, buffer: int64, size: int64) -> int64 {
             at = mettle_live_text(at, " heap objects converted");
         }
     }
-    mettle_live_send(at);
+    mettle_live_send_patch(at);
     return 1;
 }
 
@@ -1125,6 +1135,7 @@ fn mettle_live_queued_behind() -> int64 {
 fn mettle_live_poll() {
     if (mettle_live_ready == 0) {
         mettle_live_ready = 2;
+        mettle_live_quiet = mettle_live_port_quiet();
         if (mettle_live_prepare_path() != 0) {
             mettle_live_ready = 1;
         }
@@ -1323,7 +1334,7 @@ export fn mettle_live_frame_moved(flag: int64, table: string, key: int64, owner:
     var at: int64 = mettle_live_text(0, "[live] ");
     at = mettle_live_text(at, owner);
     at = mettle_live_text(at, " moves to the current code");
-    mettle_live_send(at);
+    mettle_live_send_patch(at);
     return 1;
 }
 
