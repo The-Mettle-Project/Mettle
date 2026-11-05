@@ -21720,6 +21720,8 @@ $issueRegressions = @(
   @{ Name = "popcount_buffer_fuse_checks_the_body_opt"; Entry = "tests/issues/popcount_buffer_fuse_checks_the_body.mettle"; Args = @("-O"); Expect = @("16936 454 261 261") },
   @{ Name = "word_count_fold_checks_the_body"; Entry = "tests/issues/word_count_fold_checks_the_body.mettle"; Args = @(); Expect = @("9 6007 20 6") },
   @{ Name = "word_count_fold_checks_the_body_release"; Entry = "tests/issues/word_count_fold_checks_the_body.mettle"; Args = @("--release"); Expect = @("9 6007 20 6") },
+  @{ Name = "simd_kernels_stay_in_bounds"; Entry = "tests/issues/simd_kernels_stay_in_bounds.mettle"; Args = @(); Expect = @("5307900274032702030 0 544298947873657325") },
+  @{ Name = "simd_kernels_stay_in_bounds_release"; Entry = "tests/issues/simd_kernels_stay_in_bounds.mettle"; Args = @("--release"); Expect = @("5307900274032702030 0 544298947873657325") },
   @{ Name = "interp_recycles_freed_buffers"; Command = @("test", "tests/issues/interp_recycles_freed_buffers.mettle"); Expect = @("2 passed") },
   @{ Name = "test_fn_called_from_main"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @(); Expect = @("0 0") },
   @{ Name = "test_fn_called_from_main_release"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @("--release"); Expect = @("0 0") },

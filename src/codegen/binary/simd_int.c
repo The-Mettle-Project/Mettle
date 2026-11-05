@@ -1068,6 +1068,7 @@ int code_generator_binary_emit_simd_reverse_copy_i32(
   size_t j_done = 0;
   size_t j_vec = 0;
   size_t j_scalar = 0;
+  size_t j_short = 0;
 
   if (!generator || !context || !instruction ||
       instruction->argument_count < 1) {
@@ -1110,7 +1111,7 @@ int code_generator_binary_emit_simd_reverse_copy_i32(
   if (!binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R8) ||
       !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R9, BINARY_GP_RDX) ||
       !wcs_cmp_reg_imm32(b, BINARY_GP_R9, 64) ||
-      !wcs_jcc(b, 0x82 , &j_scalar) ||
+      !wcs_jcc(b, 0x82 , &j_short) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_RCX) ||
       !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R9, BINARY_GP_R10) ||
       !wcs_cmp_reg_imm32(b, BINARY_GP_R9, 60) ||
@@ -1141,7 +1142,7 @@ int code_generator_binary_emit_simd_reverse_copy_i32(
     }
   }
 
-  if (!wcs_patch_here(b, j_scalar) ||
+  if (!wcs_patch_here(b, j_scalar) || !wcs_patch_here(b, j_short) ||
       !binary_emit_mov_reg_mem32(b, BINARY_GP_R9, BINARY_GP_RCX, 0) ||
       !binary_emit_mov_mem_reg32(b, BINARY_GP_RDX, 0, BINARY_GP_R9) ||
       !binary_emit_movsxd_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R9) ||
@@ -1683,6 +1684,7 @@ int code_generator_binary_emit_prefix_sum_i32(
 
   {
     size_t j_novec = 0;
+    size_t j_too_close = 0;
     size_t j_dist_ok = 0;
     size_t vec_top = 0;
     if (!binary_emit_mov_reg_reg(b, BINARY_GP_R10, BINARY_GP_RDX) ||
@@ -1690,7 +1692,7 @@ int code_generator_binary_emit_prefix_sum_i32(
         !binary_emit_test_reg_reg(b, BINARY_GP_R10) ||
         !wcs_jcc(b, 0x84 , &j_dist_ok) ||
         !binary_emit_cmp_reg_imm32(b, BINARY_GP_R10, 16) ||
-        !wcs_jcc(b, 0x82 , &j_novec)) {
+        !wcs_jcc(b, 0x82 , &j_too_close)) {
       return 0;
     }
     if (!wcs_patch_here(b, j_dist_ok) ||
@@ -1742,7 +1744,7 @@ int code_generator_binary_emit_prefix_sum_i32(
         !wcs_avx_vzeroupper(b)) {
       return 0;
     }
-    if (!wcs_patch_here(b, j_novec)) {
+    if (!wcs_patch_here(b, j_novec) || !wcs_patch_here(b, j_too_close)) {
       return 0;
     }
   }

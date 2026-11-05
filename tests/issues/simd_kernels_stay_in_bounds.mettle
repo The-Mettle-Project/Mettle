@@ -1,0 +1,45 @@
+import "std/io";
+import "std/mem";
+
+@noinline fn reverse_copy(src: int32*, dst: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = src[n - 1 - i];
+    dst[i] = v;
+    s = s + (int64)v;
+    i = i + 1;
+  }
+  return s;
+}
+
+@noinline fn prefix_sum(src: int32*, dst: int32*, n: int64) -> int64 {
+  var sum: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    sum = sum + (int64)src[i];
+    dst[i] = (int32)sum;
+    i = i + 1;
+  }
+  return sum;
+}
+
+fn main() -> int32 {
+  var src: int32* = (int32*)malloc(4 * 128);
+  var dst: int32* = (int32*)malloc(4 * 128);
+  var h: int64 = 0;
+  var spilled: int64 = 0;
+  for n in 0..41 {
+    for i in 0..128 { src[i] = (int32)(i * 7 % 23) - 5; dst[i] = -777; }
+    h = h * 31 + reverse_copy(src, dst, (int64)n);
+    for i in n..128 { if (dst[i] != -777) { spilled = spilled + 1; } }
+    for i in 0..n { h = h * 7 + (int64)dst[i]; }
+  }
+  var near: int64 = 0;
+  for d in 0..6 {
+    for i in 0..128 { src[i] = 1; }
+    near = near * 1000 + prefix_sum(src, src + d, 20);
+  }
+  println("{h} {spilled} {near}");
+  return 0;
+}
