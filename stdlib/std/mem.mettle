@@ -2,6 +2,7 @@ export extern fn malloc(size: int64) -> rawptr = "malloc";
 export extern fn calloc(count: int64, size: int64) -> rawptr = "calloc";
 export extern fn realloc(ptr: rawptr, size: int64) -> rawptr = "realloc";
 export extern fn free(ptr: rawptr) = "free";
+export extern fn malloc_trim(pad: int64) -> int32 = "malloc_trim";
 export extern fn memset(ptr: rawptr, value: int32, size: int64) -> rawptr = "memset";
 export extern fn memcpy(dest: rawptr, src: rawptr, size: int64) -> rawptr = "memcpy";
 export extern fn memmove(dest: rawptr, src: rawptr, size: int64) -> rawptr = "memmove";

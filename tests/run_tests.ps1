@@ -19914,6 +19914,8 @@ $runFixtures = @(
      What = "a codegen check failed" },
   @{ Name = "heap_new"; Path = "tests/codegen/heap_new.mettle"
      What = "a codegen check failed" },
+  @{ Name = "heap_spans"; Path = "tests/codegen/heap_spans.mettle"
+     What = "the heap lost data across size classes, realloc, a trim or a free on another thread" },
   @{ Name = "global_arrays"; Path = "tests/codegen/global_arrays.mettle"
      What = "a codegen check failed" },
   @{ Name = "strings"; Path = "tests/codegen/strings.mettle"

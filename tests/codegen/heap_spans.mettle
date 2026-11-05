@@ -1,0 +1,199 @@
+import "std/mem";
+import "std/thread";
+
+const SIZES = 16;
+const HANDOFF = 60000;
+
+var handoff: uint8** = (uint8**)0;
+var handoff_broken: int32 = 0;
+
+fn size_at(i: int64) -> int64 {
+  var sizes: int64[16] = [1, 15, 16, 17, 100, 1000, 4095, 4096, 4097, 8192, 20000, 65536, 131072, 131073, 300000, 5000000];
+  return sizes[i];
+}
+
+fn fill(p: uint8*, size: int64, salt: int64) {
+  for (var j: int64 = 0; j < size; j++) {
+    p[j] = (uint8)((j * 31 + salt) & 255);
+  }
+}
+
+fn intact(p: uint8*, size: int64, salt: int64) -> bool {
+  for (var j: int64 = 0; j < size; j++) {
+    if (p[j] != (uint8)((j * 31 + salt) & 255)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn every_class() -> int32 {
+  var blocks: uint8*[16];
+  for (var i: int64 = 0; i < SIZES; i++) {
+    blocks[i] = (uint8*)malloc(size_at(i));
+    fill(blocks[i], size_at(i), i);
+  }
+  for (var i: int64 = 0; i < SIZES; i++) {
+    if (!intact(blocks[i], size_at(i), i)) {
+      return 10;
+    }
+  }
+  for (var i: int64 = 0; i < SIZES; i += 2) {
+    free((rawptr)blocks[i]);
+  }
+  for (var i: int64 = 1; i < SIZES; i += 2) {
+    if (!intact(blocks[i], size_at(i), i)) {
+      return 11;
+    }
+    free((rawptr)blocks[i]);
+  }
+  return 0;
+}
+
+fn realloc_chain() -> int32 {
+  var size: int64 = 1;
+  var p = (uint8*)malloc(size);
+  p[0] = (uint8)7;
+  while (size < 2097152) {
+    var grown = size * 2 + 3;
+    p = (uint8*)realloc((rawptr)p, grown);
+    for (var j: int64 = size; j < grown; j++) {
+      p[j] = (uint8)((j * 31 + 7) & 255);
+    }
+    if (p[0] != (uint8)7) {
+      return 20;
+    }
+    for (var j: int64 = 1; j < size; j++) {
+      if (p[j] != (uint8)((j * 31 + 7) & 255)) {
+        return 21;
+      }
+    }
+    size = grown;
+  }
+  p = (uint8*)realloc((rawptr)p, 10);
+  for (var j: int64 = 1; j < 10; j++) {
+    if (p[j] != (uint8)((j * 31 + 7) & 255)) {
+      return 22;
+    }
+  }
+  free((rawptr)p);
+  return 0;
+}
+
+fn calloc_after_reuse() -> int32 {
+  var slots = (uint8**)malloc(2000 * 8);
+  for (var round: int64 = 0; round < 2; round++) {
+    for (var i: int64 = 0; i < 2000; i++) {
+      slots[i] = (uint8*)malloc(16 << (i % 14));
+      memset((rawptr)slots[i], 171, 16 << (i % 14));
+    }
+    for (var i: int64 = 0; i < 2000; i++) {
+      free((rawptr)slots[i]);
+    }
+    if (round == 1) {
+      malloc_trim(0);
+    }
+    for (var i: int64 = 0; i < 2000; i++) {
+      var size: int64 = 16 << (i % 14);
+      var p = (uint8*)calloc(1, size);
+      for (var j: int64 = 0; j < size; j += 7) {
+        if (p[j] != (uint8)0) {
+          return 30;
+        }
+      }
+      slots[i] = p;
+    }
+    for (var i: int64 = 0; i < 2000; i++) {
+      free((rawptr)slots[i]);
+    }
+  }
+  free((rawptr)slots);
+  return 0;
+}
+
+fn survivors_keep_data() -> int32 {
+  var count: int64 = 100000;
+  var slots = (int64**)malloc(count * 8);
+  for (var i: int64 = 0; i < count; i++) {
+    var p = (int64*)malloc(16 + (i % 6) * 16);
+    p[0] = i * 3 + 1;
+    p[1] = i ^ 1234567;
+    slots[i] = p;
+  }
+  for (var i: int64 = 0; i < count; i++) {
+    if (i % 97 != 0) {
+      free((rawptr)slots[i]);
+    }
+  }
+  malloc_trim(0);
+  for (var i: int64 = 0; i < count; i += 97) {
+    if (slots[i][0] != i * 3 + 1 || slots[i][1] != (i ^ 1234567)) {
+      return 41;
+    }
+  }
+  for (var i: int64 = 0; i < count; i++) {
+    if (i % 97 != 0) {
+      var p = (int64*)malloc(16 + (i % 6) * 16);
+      p[0] = i * 3 + 1;
+      p[1] = i ^ 1234567;
+      slots[i] = p;
+    }
+  }
+  for (var i: int64 = 0; i < count; i++) {
+    if (slots[i][0] != i * 3 + 1 || slots[i][1] != (i ^ 1234567)) {
+      return 42;
+    }
+    free((rawptr)slots[i]);
+  }
+  free((rawptr)slots);
+  return 0;
+}
+
+fn release_handoff(arg: cstring) -> uint32 {
+  for (var i: int64 = 0; i < HANDOFF; i++) {
+    if (handoff[i][0] != (uint8)(i & 255)) {
+      handoff_broken = 1;
+    }
+    free((rawptr)handoff[i]);
+  }
+  return 0;
+}
+
+fn freed_on_another_thread() -> int32 {
+  handoff = (uint8**)malloc(HANDOFF * 8);
+  for (var i: int64 = 0; i < HANDOFF; i++) {
+    handoff[i] = (uint8*)malloc(8 + i % 3000);
+    handoff[i][0] = (uint8)(i & 255);
+  }
+  var id: uint32 = 0;
+  var thread = CreateThread((cstring)0, 0, release_handoff, (cstring)0, 0, &id);
+  thread_join_infinite(thread);
+  thread_close(thread);
+  if (handoff_broken != 0) {
+    return 51;
+  }
+  for (var i: int64 = 0; i < HANDOFF; i++) {
+    handoff[i] = (uint8*)malloc(8 + i % 3000);
+    fill(handoff[i], 8, i);
+  }
+  for (var i: int64 = 0; i < HANDOFF; i++) {
+    if (!intact(handoff[i], 8, i)) {
+      return 50;
+    }
+    free((rawptr)handoff[i]);
+  }
+  free((rawptr)handoff);
+  return 0;
+}
+
+fn main() -> int32 {
+  var status = every_class();
+  if (status != 0) { return status; }
+  status = realloc_chain();
+  if (status != 0) { return status; }
+  status = calloc_after_reuse();
+  if (status != 0) { return status; }
+  status = survivors_keep_data();
+  if (status != 0) { return status; }
+  return freed_on_another_thread();
+}

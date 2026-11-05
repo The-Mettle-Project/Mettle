@@ -18,7 +18,7 @@ path and each basic service that generated code needs.
 | Entry | `mettle_start` | `_start` |
 | Arguments | `GetCommandLineA` parser | Initial process stack |
 | Exit | `ExitProcess` | `exit` system call |
-| Heap | Process heap APIs | Anonymous memory maps |
+| Heap | `VirtualAlloc` range, committed and decommitted by page | Anonymous memory maps, returned with `madvise` |
 | Files and console | Kernel32 file APIs | File system calls |
 | Threads | Kernel32 thread and wait APIs | `clone` and `futex` |
 | Thread-local state | Fiber local storage | Owned TLS image and thread pointer |

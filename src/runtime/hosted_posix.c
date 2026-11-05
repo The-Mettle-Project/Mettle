@@ -147,6 +147,21 @@ int mt_hosted_unmap(void *address, unsigned long long bytes) {
   return munmap(address, (size_t)bytes);
 }
 
+unsigned long long mt_hosted_page_size(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  return page > 0 ? (unsigned long long)page : 65536u;
+}
+
+int mt_hosted_purge(void *address, unsigned long long bytes) {
+#if defined(__linux__)
+  return madvise(address, (size_t)bytes, MADV_DONTNEED);
+#else
+  void *mapping = mmap(address, (size_t)bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+  return mapping == MAP_FAILED ? -1 : 0;
+#endif
+}
+
 static long long mt_hosted_copy_path(char *buffer, unsigned long long size,
                                      const char *text) {
   size_t length = strlen(text);

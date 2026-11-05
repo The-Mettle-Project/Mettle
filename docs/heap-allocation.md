@@ -442,8 +442,35 @@ shared default heap, for when you want it without carrying a handle.
 
 ## Where the memory comes from
 
-On Windows the runtime asks the process heap. On Linux it maps anonymous pages
-and manages the blocks itself, because a Linux build links no libc.
+On Windows the runtime reserves one range of address space and commits pages
+from it. On Linux it maps anonymous memory, because a Linux build links no
+libc. The same allocator runs on both.
+
+A request up to 4 KiB is rounded up to a power of two, from 16 bytes. From
+there to 128 KiB it is rounded up to whole 4 KiB pages. Blocks of one size
+share a span: one page for blocks smaller than a page, one block for anything
+a page or larger. Blocks up to 4 KiB pass through a small cache, one per
+thread on Linux and one per group of threads on Windows, so most calls touch
+no shared lock. A request over 128 KiB gets its own pages from the system and
+gives them back on `free`.
+
+When every block in a span is free, the span goes idle, and idle spans are
+reused first. A span idle for 10 seconds goes back to the system, through
+`MADV_DONTNEED` on Linux and a decommit on Windows. A program's footprint
+follows what it used in the last few seconds and falls after a burst.
+
+```mermaid
+stateDiagram-v2
+  [*] --> InUse: first block handed out
+  InUse --> Idle: last block freed
+  Idle --> InUse: reused
+  Idle --> Returned: idle for 10 s, or malloc_trim
+  Returned --> InUse: reused, pages fault back in
+```
+
+`METTLE_HEAP_DECAY_MS` sets the idle time in milliseconds, and 0 returns a
+span as soon as it goes idle. `malloc_trim(0)` from `std/mem` returns every
+idle span at once and gives 1 when it released any.
 
 `--native-heap` routes `new` and the `malloc` family through
 [`std/alloc`](standard-library.md) in place of the runtime's own path.

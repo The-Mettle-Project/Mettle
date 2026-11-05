@@ -25,6 +25,8 @@ int mt_hosted_open(const char *path, int mt_flags, int mode);
 int mt_hosted_is_directory(const char *path);
 void *mt_hosted_map(unsigned long long bytes);
 int mt_hosted_unmap(void *address, unsigned long long bytes);
+int mt_hosted_purge(void *address, unsigned long long bytes);
+unsigned long long mt_hosted_page_size(void);
 long long mt_hosted_executable_path(char *buffer, unsigned long long size);
 int mt_hosted_monotonic(long long *timespec_value);
 

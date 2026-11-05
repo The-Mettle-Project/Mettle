@@ -81,6 +81,252 @@ static __thread int mt_errno_value;
 static volatile mt_u64 mt_allocation_count;
 static volatile mt_u64 mt_free_count;
 
+#define MT_HEAP_SMALL_CLASSES 9
+#define MT_HEAP_GRANULE_SHIFT 12
+#define MT_HEAP_GRANULES 32
+#define MT_HEAP_CLASS_LIMIT (MT_HEAP_SMALL_CLASSES + MT_HEAP_GRANULES - 1)
+#define MT_HEAP_POOLS (MT_HEAP_GRANULES + 1)
+#define MT_HEAP_DECAY_MS 10000u
+#define MT_HEAP_PURGE_STEP ((mt_size)2 << 20)
+#define MT_HEAP_PURGE_SPANS 512
+#define MT_HEAP_CHECK_EVERY 256u
+#define MT_BLOCK_NEXT(base) (*(mt_u64 **)(base))
+
+enum {
+  MT_SPAN_FRESH,
+  MT_SPAN_FULL,
+  MT_SPAN_PARTIAL,
+  MT_SPAN_DIRTY,
+  MT_SPAN_PURGING,
+  MT_SPAN_PURGED
+};
+
+typedef struct MtHeapSpan MtHeapSpan;
+struct MtHeapSpan {
+  mt_u64 *batches;
+  MtHeapSpan *next;
+  MtHeapSpan *prev;
+  mt_u64 idle_since;
+  mt_u32 carved;
+  mt_u32 free_count;
+  mt_u32 capacity;
+  mt_u16 lead;
+  mt_u16 units;
+  mt_u8 class_index;
+  mt_u8 state;
+};
+
+typedef struct MtHeapList {
+  MtHeapSpan *head;
+  MtHeapSpan *tail;
+} MtHeapList;
+
+static void mt_heap_list_remove(MtHeapList *list, MtHeapSpan *span) {
+  if (span->prev) {
+    span->prev->next = span->next;
+  } else {
+    list->head = span->next;
+  }
+  if (span->next) {
+    span->next->prev = span->prev;
+  } else {
+    list->tail = span->prev;
+  }
+  span->next = MT_NULL;
+  span->prev = MT_NULL;
+}
+
+static void mt_heap_list_append(MtHeapList *list, MtHeapSpan *span) {
+  span->next = MT_NULL;
+  span->prev = list->tail;
+  if (list->tail) {
+    list->tail->next = span;
+  } else {
+    list->head = span;
+  }
+  list->tail = span;
+}
+
+static void mt_heap_list_prepend(MtHeapList *list, MtHeapSpan *span) {
+  span->prev = MT_NULL;
+  span->next = list->head;
+  if (list->head) {
+    list->head->prev = span;
+  } else {
+    list->tail = span;
+  }
+  list->head = span;
+}
+
+static int mt_heap_pool_of(mt_u32 units) { return (int)units; }
+
+static inline __attribute__((always_inline)) mt_size
+mt_heap_class_bytes(int class_index) {
+  return class_index < MT_HEAP_SMALL_CLASSES
+             ? (mt_size)16 << class_index
+             : (mt_size)(class_index - MT_HEAP_SMALL_CLASSES + 2)
+                   << MT_HEAP_GRANULE_SHIFT;
+}
+
+static inline __attribute__((always_inline)) int
+mt_heap_class_for(mt_size size) {
+  if (size <= 16) {
+    return 0;
+  }
+  if (size <= ((mt_size)1 << MT_HEAP_GRANULE_SHIFT)) {
+    return 60 - __builtin_clzll((mt_u64)size - 1);
+  }
+  return MT_HEAP_SMALL_CLASSES - 2 +
+         (int)((size + ((mt_size)1 << MT_HEAP_GRANULE_SHIFT) - 1) >>
+               MT_HEAP_GRANULE_SHIFT);
+}
+
+typedef struct MtHeapPools {
+  MtHeapList partial[MT_HEAP_CLASS_LIMIT];
+  MtHeapList dirty[MT_HEAP_POOLS];
+  MtHeapList purged[MT_HEAP_POOLS];
+  mt_u64 decay_ms;
+  mt_u32 dirty_units;
+  mt_u32 operations;
+  int purge_pending;
+  int unit_shift;
+} MtHeapPools;
+
+static mt_u64 mt_heap_decay_from(const char *text) {
+  mt_u64 value = 0;
+  if (!text || *text < '0' || *text > '9') {
+    return MT_HEAP_DECAY_MS;
+  }
+  while (*text >= '0' && *text <= '9' && value < 1000000000000ull) {
+    value = value * 10 + (mt_u64)(*text++ - '0');
+  }
+  return value;
+}
+
+static mt_u32 mt_heap_span_units(const MtHeapPools *pools, int class_index) {
+  mt_size unit = (mt_size)1 << pools->unit_shift;
+  return (mt_u32)((mt_heap_class_bytes(class_index) + unit - 1) >>
+                  pools->unit_shift);
+}
+
+static MtHeapSpan *mt_heap_reuse(MtHeapPools *pools, mt_u32 units) {
+  int pool = mt_heap_pool_of(units);
+  MtHeapSpan *span = pools->dirty[pool].head;
+  if (span) {
+    mt_heap_list_remove(&pools->dirty[pool], span);
+    pools->dirty_units -= units;
+  } else if ((span = pools->purged[pool].head)) {
+    mt_heap_list_remove(&pools->purged[pool], span);
+  }
+  return span;
+}
+
+static void mt_heap_open(MtHeapPools *pools, MtHeapSpan *span, int class_index,
+                         mt_u32 capacity) {
+  span->class_index = (mt_u8)class_index;
+  span->capacity = capacity;
+  span->carved = 0;
+  span->free_count = 0;
+  span->batches = MT_NULL;
+  span->idle_since = 0;
+  span->state = MT_SPAN_PARTIAL;
+  mt_heap_list_append(&pools->partial[class_index], span);
+}
+
+static void mt_heap_taken(MtHeapPools *pools, MtHeapSpan *span) {
+  if (!span->batches && span->carved == span->capacity) {
+    mt_heap_list_remove(&pools->partial[span->class_index], span);
+    span->state = MT_SPAN_FULL;
+  }
+}
+
+static int mt_heap_given(MtHeapPools *pools, MtHeapSpan *span) {
+  MtHeapList *partial = &pools->partial[span->class_index];
+  if (span->free_count == span->carved) {
+    if (span->state == MT_SPAN_FULL && !partial->head) {
+      span->state = MT_SPAN_PARTIAL;
+      mt_heap_list_append(partial, span);
+      return 0;
+    }
+    if (span->state == MT_SPAN_PARTIAL && partial->head == span &&
+        partial->tail == span) {
+      return 0;
+    }
+    if (span->state == MT_SPAN_PARTIAL) {
+      mt_heap_list_remove(partial, span);
+    }
+    span->batches = MT_NULL;
+    span->carved = 0;
+    span->free_count = 0;
+    span->idle_since = 0;
+    span->state = MT_SPAN_DIRTY;
+    mt_heap_list_prepend(&pools->dirty[mt_heap_pool_of(span->units)], span);
+    pools->dirty_units += span->units;
+    return 1;
+  }
+  if (span->state == MT_SPAN_FULL) {
+    span->state = MT_SPAN_PARTIAL;
+    mt_heap_list_append(partial, span);
+  }
+  return 0;
+}
+
+static int mt_heap_tick(MtHeapPools *pools) {
+  return pools->dirty_units &&
+         (pools->purge_pending || !pools->decay_ms ||
+          ++pools->operations % MT_HEAP_CHECK_EVERY == 0);
+}
+
+static int mt_heap_collect(MtHeapPools *pools, mt_u64 now, int force,
+                           MtHeapSpan **taken) {
+  MtHeapSpan *span;
+  mt_size bytes = 0;
+  int count = 0;
+  for (int pool = 1; pool < MT_HEAP_POOLS; pool++) {
+    MtHeapList *dirty = &pools->dirty[pool];
+    for (span = dirty->head; span && !span->idle_since; span = span->next) {
+      span->idle_since = now;
+    }
+    while ((span = dirty->tail) &&
+           (force || span->idle_since + pools->decay_ms <= now) &&
+           bytes < MT_HEAP_PURGE_STEP && count < MT_HEAP_PURGE_SPANS) {
+      mt_heap_list_remove(dirty, span);
+      span->state = MT_SPAN_PURGING;
+      taken[count++] = span;
+      bytes += (mt_size)span->units << pools->unit_shift;
+      pools->dirty_units -= span->units;
+    }
+  }
+  pools->purge_pending =
+      bytes >= MT_HEAP_PURGE_STEP || count == MT_HEAP_PURGE_SPANS;
+  return count;
+}
+
+static void mt_heap_sort_spans(MtHeapSpan **spans, int count) {
+  static const int gaps[] = {132, 57, 23, 10, 4, 1};
+  for (int g = 0; g < (int)(sizeof(gaps) / sizeof(gaps[0])); g++) {
+    int gap = gaps[g];
+    for (int i = gap; i < count; i++) {
+      MtHeapSpan *span = spans[i];
+      int j = i;
+      while (j >= gap && (mt_size)spans[j - gap] > (mt_size)span) {
+        spans[j] = spans[j - gap];
+        j -= gap;
+      }
+      spans[j] = span;
+    }
+  }
+}
+
+static void mt_heap_file_purged(MtHeapPools *pools, MtHeapSpan **taken,
+                                int count) {
+  for (int i = 0; i < count; i++) {
+    MtHeapSpan *span = taken[i];
+    span->state = MT_SPAN_PURGED;
+    mt_heap_list_prepend(&pools->purged[mt_heap_pool_of(span->units)], span);
+  }
+}
+
 void *stdin = &mt_stdin_file;
 void *stdout = &mt_stdout_file;
 void *stderr = &mt_stderr_file;
@@ -486,6 +732,7 @@ static unsigned long long mt_environment_append_entry(
 #define MT_HEAP_ZERO_MEMORY 0x00000008u
 #define MT_MEM_COMMIT 0x00001000u
 #define MT_MEM_RESERVE 0x00002000u
+#define MT_MEM_DECOMMIT 0x00004000u
 #define MT_PAGE_READWRITE 0x00000004u
 #define MT_STD_INPUT_HANDLE ((mt_u32)-10)
 #define MT_STD_OUTPUT_HANDLE ((mt_u32)-11)
@@ -555,6 +802,7 @@ typedef struct MtFindData {
 
 MT_DLLIMPORT void *VirtualAlloc(void *address, mt_size size, mt_u32 type,
                                mt_u32 protect);
+MT_DLLIMPORT int VirtualFree(void *address, mt_size size, mt_u32 type);
 MT_DLLIMPORT void *GetProcessHeap(void);
 MT_DLLIMPORT void *HeapAlloc(void *heap, mt_u32 flags, mt_size bytes);
 MT_DLLIMPORT void *HeapReAlloc(void *heap, mt_u32 flags, void *memory,
@@ -1011,119 +1259,116 @@ static void *mt_windows_std_handle(MtFile *file) {
   return GetStdHandle(which);
 }
 
-#define MT_WIN_SUBCHUNK 65536u
-#define MT_WIN_COMMIT_GRANULE (1024u * 1024u)
-#define MT_WIN_ARENA_BYTES (1024u * 1024u * 1024u)
-#define MT_WIN_SUBCHUNK_COUNT (MT_WIN_ARENA_BYTES / MT_WIN_SUBCHUNK)
-#define MT_WIN_CLASS_COUNT 11
-#define MT_WIN_LARGE_MIN 16384u
-#define MT_WIN_CLASS_BYTES(c) ((mt_size)16 << (c))
+#define MT_WIN_ARENA_BYTES ((mt_size)1024u * 1024u * 1024u)
+#define MT_WIN_UNIT_SHIFT 12
+#define MT_WIN_UNIT_COUNT (MT_WIN_ARENA_BYTES >> MT_WIN_UNIT_SHIFT)
+#define MT_WIN_COMMIT_GRANULE ((mt_size)1024u * 1024u)
+#define MT_WIN_TABLE_GRANULE ((mt_size)65536u)
+#define MT_WIN_LARGE_MIN 131072u
+#define MT_WIN_CACHED MT_HEAP_SMALL_CLASSES
 
-static unsigned char mt_win_subchunk_class[MT_WIN_SUBCHUNK_COUNT];
+#define MT_WIN_SHARDS 64
+
+typedef struct MtWinBin {
+  mt_u64 *head;
+  char *bump;
+  mt_u32 count;
+  mt_u32 bump_left;
+} MtWinBin;
+
+typedef struct __attribute__((aligned(64))) MtWinShard {
+  volatile int lock;
+  mt_u32 owner;
+  mt_u64 allocs;
+  mt_u64 frees;
+  MtWinBin bins[MT_WIN_CACHED];
+} MtWinShard;
+
+static MtWinShard mt_win_shards[MT_WIN_SHARDS];
+static const mt_u8 mt_win_batch[MT_WIN_CACHED] = {64, 64, 64, 64, 64,
+                                                  32, 16, 8,  4};
+static mt_u8 *mt_win_unit_class;
+static MtHeapSpan *mt_win_spans;
 static char *mt_win_arena_base;
 static char *mt_win_arena_end;
-static char *mt_win_subchunk_next;
-static char *mt_win_committed_end;
-static void *mt_win_free_list[MT_WIN_CLASS_COUNT];
-static char *mt_win_bump[MT_WIN_CLASS_COUNT];
-static mt_size mt_win_bump_left[MT_WIN_CLASS_COUNT];
+static mt_size mt_win_committed;
+static mt_size mt_win_table_committed;
+static mt_u32 mt_win_next_unit;
+static MtHeapPools mt_win_pools = {.unit_shift = MT_WIN_UNIT_SHIFT};
 static volatile int mt_win_heap_lock;
 static int mt_win_arena_unavailable;
 
-static int mt_win_class_of(mt_size size) {
-  if (size <= 16) {
-    return 0;
-  }
-  return 60 - __builtin_clzll((mt_u64)size - 1);
-}
-
-__attribute__((noinline)) static void mt_win_heap_lock_contended(void) {
-  while (__atomic_exchange_n(&mt_win_heap_lock, 1, __ATOMIC_ACQUIRE)) {
+__attribute__((noinline)) static void mt_win_lock_contended(volatile int *lock) {
+  while (__atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE)) {
 #if defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
 #endif
   }
 }
 
-static void mt_win_heap_acquire(void) {
-  if (__atomic_exchange_n(&mt_win_heap_lock, 1, __ATOMIC_ACQUIRE)) {
-    mt_win_heap_lock_contended();
+static inline __attribute__((always_inline)) void
+mt_win_lock(volatile int *lock) {
+  if (__atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE)) {
+    mt_win_lock_contended(lock);
   }
 }
 
-static void mt_win_heap_release(void) {
-  __atomic_store_n(&mt_win_heap_lock, 0, __ATOMIC_RELEASE);
+static inline __attribute__((always_inline)) void
+mt_win_unlock(volatile int *lock) {
+  __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
 }
 
-__attribute__((noinline)) static char *mt_win_take_subchunk(mt_size count) {
-  mt_size span = count * MT_WIN_SUBCHUNK;
-  char *chunk;
+static void mt_win_heap_acquire(void) { mt_win_lock(&mt_win_heap_lock); }
 
-  if (!mt_win_arena_base) {
-    char *base;
+static void mt_win_heap_release(void) { mt_win_unlock(&mt_win_heap_lock); }
 
-    if (mt_win_arena_unavailable) {
-      return MT_NULL;
-    }
-    base = (char *)VirtualAlloc(MT_NULL, MT_WIN_ARENA_BYTES, MT_MEM_RESERVE,
-                                MT_PAGE_READWRITE);
-    if (!base) {
-      mt_win_arena_unavailable = 1;
-      return MT_NULL;
-    }
-    mt_win_arena_base = base;
-    mt_win_arena_end = base + MT_WIN_ARENA_BYTES;
-    mt_win_subchunk_next = base;
-    mt_win_committed_end = base;
+static void mt_win_adopt(MtWinShard *shard, mt_u32 thread_id);
+
+static inline __attribute__((always_inline)) MtWinShard *mt_win_shard(void) {
+  mt_u32 thread_id;
+  MtWinShard *shard;
+#if defined(__x86_64__)
+  __asm__("movl %%gs:0x48, %0" : "=r"(thread_id));
+#else
+  thread_id = GetCurrentThreadId();
+#endif
+  shard = &mt_win_shards[(thread_id >> 2) & (MT_WIN_SHARDS - 1)];
+  if (shard->owner != thread_id) {
+    mt_win_adopt(shard, thread_id);
   }
-
-  while (mt_win_subchunk_next + span > mt_win_committed_end) {
-    mt_size want = span > MT_WIN_COMMIT_GRANULE ? span : MT_WIN_COMMIT_GRANULE;
-
-    if (mt_win_committed_end + want > mt_win_arena_end) {
-      want = (mt_size)(mt_win_arena_end - mt_win_committed_end);
-    }
-    if (want < span ||
-        !VirtualAlloc(mt_win_committed_end, want, MT_MEM_COMMIT,
-                      MT_PAGE_READWRITE)) {
-      return MT_NULL;
-    }
-    mt_win_committed_end += want;
-  }
-
-  chunk = mt_win_subchunk_next;
-  mt_win_subchunk_next += span;
-  return chunk;
+  return shard;
 }
 
-static void *mt_win_carve(int class_index) {
-  mt_size block = MT_WIN_CLASS_BYTES(class_index);
-  char *result;
-
-  if (mt_win_bump_left[class_index] < block) {
-    mt_size count = (block * 16 + MT_WIN_SUBCHUNK - 1) / MT_WIN_SUBCHUNK;
-    mt_size index;
-    char *chunk;
-
-    if (count == 0) {
-      count = 1;
-    }
-    chunk = mt_win_take_subchunk(count);
-    if (!chunk) {
-      return MT_NULL;
-    }
-    index = (mt_size)(chunk - mt_win_arena_base) / MT_WIN_SUBCHUNK;
-    for (mt_size i = 0; i < count; i++) {
-      mt_win_subchunk_class[index + i] = (unsigned char)class_index;
-    }
-    mt_win_bump[class_index] = chunk;
-    mt_win_bump_left[class_index] = count * MT_WIN_SUBCHUNK;
+static int mt_win_arena_ready(void) {
+  char *base;
+  if (mt_win_arena_base) {
+    return 1;
   }
-
-  result = mt_win_bump[class_index];
-  mt_win_bump[class_index] = result + block;
-  mt_win_bump_left[class_index] -= block;
-  return result;
+  if (mt_win_arena_unavailable) {
+    return 0;
+  }
+  base = (char *)VirtualAlloc(MT_NULL, MT_WIN_ARENA_BYTES, MT_MEM_RESERVE,
+                              MT_PAGE_READWRITE);
+  mt_win_spans = (MtHeapSpan *)VirtualAlloc(
+      MT_NULL, MT_WIN_UNIT_COUNT * sizeof(MtHeapSpan), MT_MEM_RESERVE,
+      MT_PAGE_READWRITE);
+  mt_win_unit_class = (mt_u8 *)VirtualAlloc(MT_NULL, MT_WIN_UNIT_COUNT,
+                                            MT_MEM_RESERVE | MT_MEM_COMMIT,
+                                            MT_PAGE_READWRITE);
+  if (!base || !mt_win_spans || !mt_win_unit_class) {
+    mt_win_arena_unavailable = 1;
+    return 0;
+  }
+  {
+    char decay[24];
+    mt_u32 length =
+        GetEnvironmentVariableA("METTLE_HEAP_DECAY_MS", decay, sizeof(decay));
+    mt_win_pools.decay_ms = mt_heap_decay_from(
+        length && length < sizeof(decay) ? decay : MT_NULL);
+  }
+  mt_win_arena_base = base;
+  mt_win_arena_end = base + MT_WIN_ARENA_BYTES;
+  return 1;
 }
 
 static int mt_win_owns(const void *memory) {
@@ -1131,15 +1376,275 @@ static int mt_win_owns(const void *memory) {
          (const char *)memory < mt_win_arena_end;
 }
 
-static int mt_win_class_at(const void *memory) {
-  return (int)mt_win_subchunk_class[(mt_size)((const char *)memory -
-                                              mt_win_arena_base) /
-                                    MT_WIN_SUBCHUNK];
+static MtHeapSpan *mt_win_span_of(const void *memory) {
+  mt_size unit = (mt_size)((const char *)memory - mt_win_arena_base) >>
+                 MT_WIN_UNIT_SHIFT;
+  return &mt_win_spans[unit - mt_win_spans[unit].lead];
+}
+
+static char *mt_win_span_base(MtHeapSpan *span) {
+  return mt_win_arena_base + ((mt_size)(span - mt_win_spans) << MT_WIN_UNIT_SHIFT);
+}
+
+static mt_size mt_win_unit_of(const void *memory) {
+  return (mt_size)((const char *)memory - mt_win_arena_base) >>
+         MT_WIN_UNIT_SHIFT;
+}
+
+static int mt_win_grow(mt_u32 units) {
+  mt_size table = (mt_size)(mt_win_next_unit + units) * sizeof(MtHeapSpan);
+  mt_size arena = (mt_size)(mt_win_next_unit + units) << MT_WIN_UNIT_SHIFT;
+  while (mt_win_table_committed < table) {
+    if (!VirtualAlloc((char *)mt_win_spans + mt_win_table_committed,
+                      MT_WIN_TABLE_GRANULE, MT_MEM_COMMIT, MT_PAGE_READWRITE)) {
+      return 0;
+    }
+    mt_win_table_committed += MT_WIN_TABLE_GRANULE;
+  }
+  while (mt_win_committed < arena) {
+    if (!VirtualAlloc(mt_win_arena_base + mt_win_committed,
+                      MT_WIN_COMMIT_GRANULE, MT_MEM_COMMIT, MT_PAGE_READWRITE)) {
+      return 0;
+    }
+    mt_win_committed += MT_WIN_COMMIT_GRANULE;
+  }
+  return 1;
+}
+
+static MtHeapSpan *mt_win_new_span(int class_index) {
+  mt_u32 units = mt_heap_span_units(&mt_win_pools, class_index);
+  MtHeapSpan *span = mt_heap_reuse(&mt_win_pools, units);
+  if (span && span->state == MT_SPAN_PURGED &&
+      !VirtualAlloc(mt_win_span_base(span), (mt_size)units << MT_WIN_UNIT_SHIFT,
+                    MT_MEM_COMMIT, MT_PAGE_READWRITE)) {
+    mt_heap_list_prepend(&mt_win_pools.purged[mt_heap_pool_of(units)], span);
+    return MT_NULL;
+  }
+  if (!span) {
+    if (!mt_win_arena_ready() || mt_win_next_unit + units > MT_WIN_UNIT_COUNT ||
+        !mt_win_grow(units)) {
+      return MT_NULL;
+    }
+    span = &mt_win_spans[mt_win_next_unit];
+    for (mt_u32 i = 0; i < units; i++) {
+      span[i].lead = (mt_u16)i;
+    }
+    span->units = (mt_u16)units;
+    mt_win_next_unit += units;
+  }
+  mt_heap_open(&mt_win_pools, span, class_index,
+               (mt_u32)(((mt_size)units << MT_WIN_UNIT_SHIFT) /
+                        mt_heap_class_bytes(class_index)));
+  mt_win_unit_class[span - mt_win_spans] = (mt_u8)class_index;
+  return span;
+}
+
+__attribute__((noinline)) static int mt_win_purge(int force) {
+  MtHeapSpan *taken[MT_HEAP_PURGE_SPANS];
+  mt_u64 now = GetTickCount64() + 1u;
+  int count;
+
+  mt_win_heap_acquire();
+  count = mt_heap_collect(&mt_win_pools, now, force, taken);
+  mt_win_heap_release();
+  if (!count) {
+    return 0;
+  }
+  mt_heap_sort_spans(taken, count);
+  for (int i = 0; i < count;) {
+    char *start = mt_win_span_base(taken[i]);
+    mt_size bytes = (mt_size)taken[i]->units << MT_WIN_UNIT_SHIFT;
+    for (i++; i < count && mt_win_span_base(taken[i]) == start + bytes; i++) {
+      bytes += (mt_size)taken[i]->units << MT_WIN_UNIT_SHIFT;
+    }
+    VirtualFree(start, bytes, MT_MEM_DECOMMIT);
+  }
+  mt_win_heap_acquire();
+  mt_heap_file_purged(&mt_win_pools, taken, count);
+  mt_win_heap_release();
+  return count;
+}
+
+static mt_u64 *mt_win_take(int class_index) {
+  MtHeapSpan *span = mt_win_pools.partial[class_index].head;
+  mt_u64 *block;
+  if (!span && !(span = mt_win_new_span(class_index))) {
+    return MT_NULL;
+  }
+  if (span->batches) {
+    block = span->batches;
+    span->batches = MT_BLOCK_NEXT(block);
+    span->free_count--;
+  } else {
+    block = (mt_u64 *)(mt_win_span_base(span) +
+                       (mt_size)span->carved * mt_heap_class_bytes(class_index));
+    span->carved++;
+  }
+  mt_heap_taken(&mt_win_pools, span);
+  return block;
+}
+
+static void mt_win_return(mt_u64 *block) {
+  MtHeapSpan *span = mt_win_span_of(block);
+  MT_BLOCK_NEXT(block) = span->batches;
+  span->batches = block;
+  span->free_count++;
+  (void)mt_heap_given(&mt_win_pools, span);
+}
+
+static void mt_win_spill(MtWinBin *bin, mt_u32 count) {
+  while (count && bin->head) {
+    mt_u64 *head = bin->head;
+    mt_size unit = mt_win_unit_of(head);
+    MtHeapSpan *span = &mt_win_spans[unit];
+    mt_u64 *tail = head;
+    mt_u64 *next;
+    mt_u32 run = 1;
+    while (run < count && (next = MT_BLOCK_NEXT(tail)) &&
+           mt_win_unit_of(next) == unit) {
+      tail = next;
+      run++;
+    }
+    bin->head = MT_BLOCK_NEXT(tail);
+    bin->count -= run;
+    count -= run;
+    MT_BLOCK_NEXT(tail) = span->batches;
+    span->batches = head;
+    span->free_count += run;
+    (void)mt_heap_given(&mt_win_pools, span);
+  }
+}
+
+static void mt_win_fill(MtWinBin *bin, int class_index) {
+  mt_u32 want = mt_win_batch[class_index];
+  MtHeapSpan *span = mt_win_pools.partial[class_index].head;
+  if (!span && !(span = mt_win_new_span(class_index))) {
+    return;
+  }
+  if (span->batches) {
+    mt_u64 *head = span->batches;
+    mt_u32 take = span->free_count;
+    if (take >= 2 * want) {
+      mt_u64 *last = head;
+      take = want;
+      for (mt_u32 i = 1; i < take; i++) {
+        last = MT_BLOCK_NEXT(last);
+      }
+      span->batches = MT_BLOCK_NEXT(last);
+      MT_BLOCK_NEXT(last) = MT_NULL;
+    } else {
+      span->batches = MT_NULL;
+    }
+    span->free_count -= take;
+    bin->head = head;
+    bin->count = take;
+  } else {
+    mt_u32 take = span->capacity - span->carved;
+    if (take > want) {
+      take = want;
+    }
+    bin->bump = mt_win_span_base(span) +
+                (mt_size)span->carved * mt_heap_class_bytes(class_index);
+    bin->bump_left = take;
+    span->carved += take;
+  }
+  mt_heap_taken(&mt_win_pools, span);
+}
+
+static void mt_win_unbump(MtWinBin *bin, int class_index) {
+  mt_size bytes = mt_heap_class_bytes(class_index);
+  while (bin->bump_left) {
+    MT_BLOCK_NEXT((mt_u64 *)bin->bump) = bin->head;
+    bin->head = (mt_u64 *)bin->bump;
+    bin->count++;
+    bin->bump += bytes;
+    bin->bump_left--;
+  }
+}
+
+static mt_u64 *mt_win_cached(MtWinShard *shard, int class_index, int *check) {
+  MtWinBin *bin = &shard->bins[class_index];
+  mt_u64 *block = bin->head;
+  if (!block && !bin->bump_left) {
+    mt_win_heap_acquire();
+    mt_win_fill(bin, class_index);
+    *check = mt_heap_tick(&mt_win_pools);
+    mt_win_heap_release();
+    block = bin->head;
+  }
+  if (block) {
+    bin->head = MT_BLOCK_NEXT(block);
+    bin->count--;
+  } else if (bin->bump_left) {
+    block = (mt_u64 *)bin->bump;
+    bin->bump += mt_heap_class_bytes(class_index);
+    bin->bump_left--;
+  } else {
+    return MT_NULL;
+  }
+  shard->allocs++;
+  return block;
+}
+
+static void mt_win_flush(MtWinShard *shard) {
+  mt_win_lock(&shard->lock);
+  mt_win_heap_acquire();
+  for (int c = 0; c < MT_WIN_CACHED; c++) {
+    mt_win_unbump(&shard->bins[c], c);
+    mt_win_spill(&shard->bins[c], shard->bins[c].count);
+  }
+  mt_win_heap_release();
+  mt_win_unlock(&shard->lock);
+}
+
+static mt_u32 mt_win_fls_index = 0xffffffffu;
+
+static void mt_win_thread_done(void *value) {
+  if (value) {
+    mt_win_flush((MtWinShard *)value);
+  }
+}
+
+__attribute__((noinline)) static void mt_win_adopt(MtWinShard *shard,
+                                                   mt_u32 thread_id) {
+  shard->owner = thread_id;
+  if (mt_win_fls_index == 0xffffffffu) {
+    mt_win_heap_acquire();
+    if (mt_win_fls_index == 0xffffffffu) {
+      mt_win_fls_index = FlsAlloc(mt_win_thread_done);
+    }
+    mt_win_heap_release();
+  }
+  if (mt_win_fls_index != 0xffffffffu && !FlsGetValue(mt_win_fls_index)) {
+    FlsSetValue(mt_win_fls_index, shard);
+  }
+}
+
+int malloc_trim(mt_size pad) {
+  int released = 0;
+  (void)pad;
+  for (int s = 0; s < MT_WIN_SHARDS; s++) {
+    mt_win_flush(&mt_win_shards[s]);
+  }
+  while (mt_win_purge(1)) {
+    released = 1;
+  }
+  return released;
+}
+
+static void mt_win_heap_totals(mt_u64 *allocs, mt_u64 *frees) {
+  *allocs = mt_allocation_count;
+  *frees = mt_free_count;
+  for (int s = 0; s < MT_WIN_SHARDS; s++) {
+    *allocs += mt_win_shards[s].allocs;
+    *frees += mt_win_shards[s].frees;
+  }
 }
 
 void *malloc(mt_size size) {
   void *memory;
   int class_index;
+  int check = 0;
 
   if (size == 0) {
     size = 1;
@@ -1152,18 +1657,24 @@ void *malloc(mt_size size) {
     return memory;
   }
 
-  class_index = mt_win_class_of(size);
-  mt_win_heap_acquire();
-  memory = mt_win_free_list[class_index];
-  if (memory) {
-    mt_win_free_list[class_index] = *(void **)memory;
+  class_index = mt_heap_class_for(size);
+  if (class_index < MT_WIN_CACHED) {
+    MtWinShard *shard = mt_win_shard();
+    mt_win_lock(&shard->lock);
+    memory = mt_win_cached(shard, class_index, &check);
+    mt_win_unlock(&shard->lock);
   } else {
-    memory = mt_win_carve(class_index);
+    mt_win_heap_acquire();
+    memory = mt_win_take(class_index);
+    check = mt_heap_tick(&mt_win_pools);
+    if (memory) {
+      mt_allocation_count++;
+    }
+    mt_win_heap_release();
   }
-  if (memory) {
-    mt_allocation_count++;
+  if (check) {
+    (void)mt_win_purge(0);
   }
-  mt_win_heap_release();
   if (!memory) {
     memory = HeapAlloc(GetProcessHeap(), 0, size);
     if (memory) {
@@ -1204,13 +1715,33 @@ void free(void *memory) {
     return;
   }
   if (mt_win_owns(memory)) {
-    int class_index = mt_win_class_at(memory);
+    int class_index = mt_win_unit_class[mt_win_unit_of(memory)];
+    int check = 0;
 
-    mt_win_heap_acquire();
-    *(void **)memory = mt_win_free_list[class_index];
-    mt_win_free_list[class_index] = memory;
-    mt_free_count++;
-    mt_win_heap_release();
+    if (class_index < MT_WIN_CACHED) {
+      MtWinShard *shard = mt_win_shard();
+      MtWinBin *bin = &shard->bins[class_index];
+      mt_win_lock(&shard->lock);
+      MT_BLOCK_NEXT((mt_u64 *)memory) = bin->head;
+      bin->head = (mt_u64 *)memory;
+      shard->frees++;
+      if (++bin->count >= 2u * mt_win_batch[class_index]) {
+        mt_win_heap_acquire();
+        mt_win_spill(bin, mt_win_batch[class_index]);
+        check = mt_heap_tick(&mt_win_pools);
+        mt_win_heap_release();
+      }
+      mt_win_unlock(&shard->lock);
+    } else {
+      mt_win_heap_acquire();
+      mt_win_return((mt_u64 *)memory);
+      check = mt_heap_tick(&mt_win_pools);
+      mt_free_count++;
+      mt_win_heap_release();
+    }
+    if (check) {
+      (void)mt_win_purge(0);
+    }
     return;
   }
   mt_free_count++;
@@ -1232,7 +1763,8 @@ void *realloc(void *memory, mt_size size) {
     }
   }
   if (mt_win_owns(memory)) {
-    mt_size held = MT_WIN_CLASS_BYTES(mt_win_class_at(memory));
+    mt_size held =
+        mt_heap_class_bytes(mt_win_unit_class[mt_win_unit_of(memory)]);
     void *replacement;
 
     if (size <= held) {
@@ -2072,6 +2604,7 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #define MT_SYS_PRLIMIT64 302
 #define MT_SYS_MPROTECT 10
 #define MT_SYS_MUNMAP 11
+#define MT_SYS_MADVISE 28
 #define MT_SYS_SCHED_YIELD 24
 #define MT_SYS_NANOSLEEP 35
 #define MT_SYS_SOCKET 41
@@ -2158,6 +2691,7 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #define MT_SYS_SHUTDOWN 210
 #define MT_SYS_MUNMAP 215
 #define MT_SYS_MMAP 222
+#define MT_SYS_MADVISE 233
 #define MT_SYS_PRLIMIT64 261
 #define MT_SYS_MPROTECT 226
 #define MT_SYS_CLONE 220
@@ -2263,7 +2797,10 @@ typedef struct MtElfProgramHeader {
 #define MT_AT_PHDR 3
 #define MT_AT_PHENT 4
 #define MT_AT_PHNUM 5
+#define MT_AT_PAGESZ 6
 #define MT_PT_TLS 7
+
+static mt_u64 mt_page_bytes;
 
 static void *mt_tls_template;
 static MtElfProgramHeader *mt_elf_headers;
@@ -2349,7 +2886,9 @@ static int mt_initialize_initial_tls(mt_i64 argc, char **argv) {
   mt_u64 header_count = 0;
 
   while (auxiliary[0]) {
-    if (auxiliary[0] == MT_AT_PHDR) {
+    if (auxiliary[0] == MT_AT_PAGESZ) {
+      mt_page_bytes = auxiliary[1];
+    } else if (auxiliary[0] == MT_AT_PHDR) {
       headers = (MtElfProgramHeader *)auxiliary[1];
     } else if (auxiliary[0] == MT_AT_PHENT) {
       header_size = auxiliary[1];
@@ -3222,26 +3761,38 @@ int mprotect(void *address, mt_size length, int protection) {
 }
 #endif
 
-#define MT_HEAP_HEADER 16
-#define MT_HEAP_CLASS_COUNT 11
-#define MT_HEAP_LARGE_MIN 16384
-#define MT_HEAP_CHUNK_MIN (256u * 1024u)
-#define MT_HEAP_CHUNK_MAX (8u * 1024u * 1024u)
-#define MT_HEAP_CLASS_BYTES(c) ((mt_size)16 << (c))
+#define MT_HEAP_CLASS_COUNT MT_HEAP_CLASS_LIMIT
+#define MT_HEAP_LARGE_MIN ((mt_size)131072)
 #define MT_HEAP_COUNT_STEP 256
+#define MT_HEAP_REGION_SHIFT 22
+#define MT_HEAP_REGION ((mt_size)1 << MT_HEAP_REGION_SHIFT)
+#define MT_HEAP_REGION_SLOTS 1024u
+#define MT_HEAP_SEGMENTS 8
+#define MT_HEAP_MAP_ROOT 2048u
+#define MT_HEAP_MAP_LEAF_SHIFT 15
+#define MT_HEAP_IN_REGION 1u
+#define MT_HEAP_POINTER_MASK 0xFFFFFFFFFFFFull
+#define MT_MADV_DONTNEED 4
 
-/* A block is a 16-byte header (class tag, size) and the user bytes. A free
-   block keeps the next free block in its first user word. */
-#define MT_BLOCK_NEXT(base) (*(mt_u64 **)((base) + 2))
-#define MT_BATCH_NEXT(base) (*(mt_u64 **)((base) + 3))
+#define MT_HEAP_UNIT_IDLE 0xFFu
+#define MT_HEAP_UNIT_TAIL 0x80u
+#if defined(__x86_64__)
+#define MT_HEAP_UNIT_SHIFT 12
+#else
+#define MT_HEAP_UNIT_SHIFT (mt_heap_pools.unit_shift)
+#endif
 
-/* The shared heap is a stack of batches per class. A batch is a chain of
-   free blocks; its first block holds the chain length in header word 1 and
-   the next batch in its second user word. */
-static mt_u64 *mt_heap_batches[MT_HEAP_CLASS_COUNT];
-static char *mt_heap_bump;
-static mt_size mt_heap_bump_left;
-static mt_size mt_heap_chunk_size;
+typedef struct MtHeapRegion {
+  mt_u8 unit_class[MT_HEAP_REGION_SLOTS];
+  MtHeapSpan spans[MT_HEAP_REGION_SLOTS];
+} MtHeapRegion;
+
+static MtHeapPools mt_heap_pools;
+static MtHeapRegion *mt_heap_region;
+static mt_u32 mt_heap_region_next;
+static mt_u32 mt_heap_region_units;
+static mt_u32 mt_heap_region_first;
+static mt_u64 *mt_heap_map_root[MT_HEAP_MAP_ROOT];
 static volatile int mt_heap_lock;
 
 #if defined(MT_HOSTED) || defined(MT_SHARED_RUNTIME)
@@ -3260,13 +3811,6 @@ static __thread mt_u32 mt_heap_frees_local;
 static const mt_u8 mt_heap_batch_size[MT_HEAP_CACHED] = {64, 64, 64, 64, 64,
                                                           32, 16, 8,  4};
 #endif
-
-static int mt_heap_class_of(mt_size size) {
-  if (size <= 16) {
-    return 0;
-  }
-  return 60 - __builtin_clzll((mt_u64)size - 1);
-}
 
 __attribute__((noinline)) static void mt_heap_lock_contended(void) {
   int spins = 0;
@@ -3293,7 +3837,7 @@ static void mt_heap_release(void) {
 }
 
 /* Counts are kept per thread and added to the totals every 256 calls. */
-static void mt_heap_count_alloc(void) {
+static inline __attribute__((always_inline)) void mt_heap_count_alloc(void) {
 #if MT_HEAP_CACHED
   if (++mt_heap_allocs_local == MT_HEAP_COUNT_STEP) {
     mt_heap_allocs_local = 0;
@@ -3305,7 +3849,7 @@ static void mt_heap_count_alloc(void) {
 #endif
 }
 
-static void mt_heap_count_free(void) {
+static inline __attribute__((always_inline)) void mt_heap_count_free(void) {
 #if MT_HEAP_CACHED
   if (++mt_heap_frees_local == MT_HEAP_COUNT_STEP) {
     mt_heap_frees_local = 0;
@@ -3326,69 +3870,333 @@ __attribute__((noinline)) static void *mt_heap_map(mt_size bytes) {
 #endif
 }
 
-__attribute__((noinline)) static int mt_heap_refill(void) {
-  mt_size want = mt_heap_chunk_size ? mt_heap_chunk_size * 2
-                                    : (mt_size)MT_HEAP_CHUNK_MIN;
-  char *chunk;
-  if (want > MT_HEAP_CHUNK_MAX) {
-    want = MT_HEAP_CHUNK_MAX;
+static void mt_heap_unmap(void *address, mt_size bytes) {
+#if defined(MT_HOSTED)
+  (void)mt_hosted_unmap(address, bytes);
+#else
+  (void)munmap(address, bytes);
+#endif
+}
+
+static void mt_heap_purge_range(void *address, mt_size bytes) {
+#if defined(MT_HOSTED)
+  (void)mt_hosted_purge(address, bytes);
+#else
+  (void)mt_syscall6(MT_SYS_MADVISE, (mt_i64)address, (mt_i64)bytes,
+                    MT_MADV_DONTNEED, 0, 0, 0);
+#endif
+}
+
+static mt_u64 mt_heap_now_ms(void) {
+  mt_i64 now[2] = {0, 0};
+#if defined(MT_HOSTED)
+  (void)mt_hosted_monotonic(now);
+#else
+  (void)mt_clock_read(1, now);
+#endif
+  return (mt_u64)now[0] * 1000u + (mt_u64)now[1] / 1000000u + 1u;
+}
+
+static int mt_heap_page_shift(void) {
+#if defined(__x86_64__)
+  mt_u64 bytes = 4096u;
+#elif defined(MT_HOSTED)
+  mt_u64 bytes = mt_hosted_page_size();
+#else
+  mt_u64 bytes = mt_page_bytes ? mt_page_bytes : 65536u;
+#endif
+  int shift = 12;
+  while (shift < 16 && ((mt_u64)1 << shift) < bytes) {
+    shift++;
   }
-  chunk = (char *)mt_heap_map(want);
-  if (!chunk) {
+  return shift;
+}
+
+static mt_u64 *mt_heap_batch_next(const mt_u64 *head) {
+  return (mt_u64 *)(mt_size)(head[1] & MT_HEAP_POINTER_MASK);
+}
+
+static mt_u32 mt_heap_batch_count(const mt_u64 *head) {
+  return (mt_u32)(head[1] >> 48);
+}
+
+static void mt_heap_batch_set(mt_u64 *head, const mt_u64 *next, mt_u32 count) {
+  head[1] = (mt_u64)(mt_size)next | ((mt_u64)count << 48);
+}
+
+static mt_u64 mt_heap_owner(const void *memory) {
+  mt_size chunk = (mt_size)memory >> MT_HEAP_REGION_SHIFT;
+  mt_size top = chunk >> MT_HEAP_MAP_LEAF_SHIFT;
+  mt_u64 *leaf;
+  if (top >= MT_HEAP_MAP_ROOT) {
     return 0;
   }
-  mt_heap_bump = chunk;
-  mt_heap_bump_left = want;
-  mt_heap_chunk_size = want;
+  leaf = __atomic_load_n(&mt_heap_map_root[top], __ATOMIC_ACQUIRE);
+  return leaf ? leaf[chunk & ((1u << MT_HEAP_MAP_LEAF_SHIFT) - 1)] : 0;
+}
+
+static int mt_heap_own(const void *memory, mt_u64 value) {
+  mt_size chunk = (mt_size)memory >> MT_HEAP_REGION_SHIFT;
+  mt_size top = chunk >> MT_HEAP_MAP_LEAF_SHIFT;
+  mt_u64 *leaf;
+  if (top >= MT_HEAP_MAP_ROOT) {
+    return 0;
+  }
+  leaf = mt_heap_map_root[top];
+  if (!leaf) {
+    leaf = (mt_u64 *)mt_heap_map(sizeof(mt_u64) << MT_HEAP_MAP_LEAF_SHIFT);
+    if (!leaf) {
+      return 0;
+    }
+    __atomic_store_n(&mt_heap_map_root[top], leaf, __ATOMIC_RELEASE);
+  }
+  leaf[chunk & ((1u << MT_HEAP_MAP_LEAF_SHIFT) - 1)] = value;
   return 1;
 }
 
-/* Takes a chain of free blocks of one class from the shared heap: a whole
-   batch if there is one, else up to `want` blocks cut from the bump chunk. */
+static MtHeapSpan *mt_heap_span_of(const void *memory) {
+  mt_size address = (mt_size)memory;
+  MtHeapRegion *region = (MtHeapRegion *)(address & ~(MT_HEAP_REGION - 1));
+  mt_size unit = (address & (MT_HEAP_REGION - 1)) >> mt_heap_pools.unit_shift;
+  return &region->spans[region->spans[unit].lead];
+}
+
+static char *mt_heap_span_base(MtHeapSpan *span) {
+  mt_size region = (mt_size)span & ~(MT_HEAP_REGION - 1);
+  mt_size unit = (mt_size)(span - ((MtHeapRegion *)region)->spans);
+  return (char *)region + (unit << mt_heap_pools.unit_shift);
+}
+
+__attribute__((noinline)) static MtHeapRegion *mt_heap_new_region(void) {
+  char *mapping = (char *)mt_heap_map(2 * MT_HEAP_REGION);
+  char *aligned;
+  mt_size head;
+  if (!mapping) {
+    return MT_NULL;
+  }
+  aligned = (char *)(((mt_size)mapping + MT_HEAP_REGION - 1) &
+                     ~(MT_HEAP_REGION - 1));
+  head = (mt_size)(aligned - mapping);
+  if (head) {
+    mt_heap_unmap(mapping, head);
+  }
+  mt_heap_unmap(aligned + MT_HEAP_REGION, MT_HEAP_REGION - head);
+  if (!mt_heap_own(aligned, MT_HEAP_IN_REGION)) {
+    mt_heap_unmap(aligned, MT_HEAP_REGION);
+    return MT_NULL;
+  }
+  memset(aligned, MT_HEAP_UNIT_IDLE, MT_HEAP_REGION_SLOTS);
+  return (MtHeapRegion *)aligned;
+}
+
+static MT_NORETURN void mt_heap_bad_free(void);
+
+static void mt_heap_mark(MtHeapSpan *span, mt_u32 tag) {
+  MtHeapRegion *region =
+      (MtHeapRegion *)((mt_size)span & ~(MT_HEAP_REGION - 1));
+  mt_size lead = (mt_size)(span - region->spans);
+  region->unit_class[lead] = (mt_u8)tag;
+  for (mt_u32 i = 1; i < span->units; i++) {
+    region->unit_class[lead + i] =
+        (mt_u8)(tag == MT_HEAP_UNIT_IDLE ? tag : tag | MT_HEAP_UNIT_TAIL);
+  }
+}
+
+static inline __attribute__((always_inline)) int
+mt_heap_small_class(const void *memory) {
+  mt_size offset = (mt_size)memory & (MT_HEAP_REGION - 1);
+  const MtHeapRegion *region;
+  mt_size inner;
+  mt_u32 tag;
+  if (!offset) {
+    return -1;
+  }
+  region = (const MtHeapRegion *)((const char *)memory - offset);
+  tag = region->unit_class[offset >> MT_HEAP_UNIT_SHIFT];
+  inner = offset & (((mt_size)1 << MT_HEAP_UNIT_SHIFT) - 1);
+  if (tag >= MT_HEAP_CLASS_COUNT ||
+      (tag < MT_HEAP_SMALL_CLASSES
+           ? (inner & (((mt_size)16 << tag) - 1)) != 0
+           : inner && inner % mt_heap_class_bytes((int)tag) != 0)) {
+    mt_heap_bad_free();
+  }
+  return (int)tag;
+}
+
+static MtHeapSpan *mt_heap_new_span(int class_index) {
+  mt_u32 units;
+  MtHeapSpan *span;
+  if (!mt_heap_pools.unit_shift) {
+    int shift = mt_heap_page_shift();
+    mt_heap_pools.decay_ms = mt_heap_decay_from(getenv("METTLE_HEAP_DECAY_MS"));
+    mt_heap_pools.unit_shift = shift;
+    mt_heap_region_units = (mt_u32)(MT_HEAP_REGION >> shift);
+    mt_heap_region_first =
+        (mt_u32)((sizeof(MtHeapRegion) + ((mt_size)1 << shift) - 1) >> shift);
+  }
+  units = mt_heap_span_units(&mt_heap_pools, class_index);
+  span = mt_heap_reuse(&mt_heap_pools, units);
+  if (!span) {
+    if (!mt_heap_region || mt_heap_region_next + units > mt_heap_region_units) {
+      MtHeapRegion *region = mt_heap_new_region();
+      if (!region) {
+        return MT_NULL;
+      }
+      mt_heap_region = region;
+      mt_heap_region_next = mt_heap_region_first;
+    }
+    span = &mt_heap_region->spans[mt_heap_region_next];
+    for (mt_u32 i = 0; i < units; i++) {
+      span[i].lead = (mt_u16)mt_heap_region_next;
+    }
+    span->units = (mt_u16)units;
+    mt_heap_region_next += units;
+  }
+  mt_heap_open(&mt_heap_pools, span, class_index,
+               (mt_u32)(((mt_size)units << mt_heap_pools.unit_shift) /
+                        mt_heap_class_bytes(class_index)));
+  mt_heap_mark(span, (mt_u32)class_index);
+  return span;
+}
+
+__attribute__((noinline)) static int mt_heap_purge(int force) {
+  MtHeapSpan *taken[MT_HEAP_PURGE_SPANS];
+  mt_u64 now = mt_heap_now_ms();
+  int shift = mt_heap_pools.unit_shift;
+  int count;
+
+  mt_heap_acquire();
+  count = mt_heap_collect(&mt_heap_pools, now, force, taken);
+  mt_heap_release();
+  if (!count) {
+    return 0;
+  }
+  mt_heap_sort_spans(taken, count);
+  for (int i = 0; i < count;) {
+    char *start = mt_heap_span_base(taken[i]);
+    mt_size bytes = (mt_size)taken[i]->units << shift;
+    for (i++; i < count && mt_heap_span_base(taken[i]) == start + bytes; i++) {
+      bytes += (mt_size)taken[i]->units << shift;
+    }
+    mt_heap_purge_range(start, bytes);
+  }
+  mt_heap_acquire();
+  mt_heap_file_purged(&mt_heap_pools, taken, count);
+  mt_heap_release();
+  return count;
+}
+
 __attribute__((noinline)) static mt_u64 *mt_heap_fetch(int class_index,
                                                        mt_u32 want,
                                                        mt_u32 *count_out) {
-  mt_size block_bytes = MT_HEAP_CLASS_BYTES(class_index) + MT_HEAP_HEADER;
-  mt_u64 *base;
-  mt_size count;
+  mt_size block_bytes = mt_heap_class_bytes(class_index);
+  mt_u64 *heads[MT_HEAP_SEGMENTS];
+  mt_u32 counts[MT_HEAP_SEGMENTS];
+  int fresh[MT_HEAP_SEGMENTS];
+  int segments = 0;
+  mt_u32 total = 0;
+  int check;
 
   mt_heap_acquire();
-  base = mt_heap_batches[class_index];
-  if (base) {
-    mt_heap_batches[class_index] = MT_BATCH_NEXT(base);
-    mt_heap_release();
-    *count_out = (mt_u32)base[1];
-    return base;
+  while (total < want && segments < MT_HEAP_SEGMENTS) {
+    MtHeapSpan *span = mt_heap_pools.partial[class_index].head;
+    mt_u64 *base;
+    mt_u32 count;
+    if (!span && !(span = mt_heap_new_span(class_index))) {
+      break;
+    }
+    base = span->batches;
+    fresh[segments] = !base;
+    if (base) {
+      count = mt_heap_batch_count(base);
+      span->batches = mt_heap_batch_next(base);
+      if (total + count >= 2 * want) {
+        mt_u64 *last = base;
+        mt_u64 *rest;
+        mt_u32 take = want - total;
+        for (mt_u32 i = 1; i < take; i++) {
+          last = MT_BLOCK_NEXT(last);
+        }
+        rest = MT_BLOCK_NEXT(last);
+        MT_BLOCK_NEXT(last) = MT_NULL;
+        mt_heap_batch_set(rest, span->batches, count - take);
+        span->batches = rest;
+        count = take;
+      }
+      span->free_count -= count;
+    } else {
+      count = span->capacity - span->carved;
+      if (count > want - total) {
+        count = want - total;
+      }
+      base = (mt_u64 *)(mt_heap_span_base(span) +
+                        (mt_size)span->carved * block_bytes);
+      span->carved += count;
+    }
+    mt_heap_taken(&mt_heap_pools, span);
+    heads[segments] = base;
+    counts[segments] = count;
+    segments++;
+    total += count;
   }
-  if (mt_heap_bump_left < block_bytes && !mt_heap_refill()) {
-    mt_heap_release();
-    return MT_NULL;
-  }
-  count = mt_heap_bump_left / block_bytes;
-  if (count > want) {
-    count = want;
-  }
-  base = (mt_u64 *)mt_heap_bump;
-  mt_heap_bump += count * block_bytes;
-  mt_heap_bump_left -= count * block_bytes;
+  check = mt_heap_tick(&mt_heap_pools);
   mt_heap_release();
-  for (mt_size i = 0; i + 1 < count; i++) {
-    mt_u64 *block = (mt_u64 *)((char *)base + i * block_bytes);
-    MT_BLOCK_NEXT(block) = (mt_u64 *)((char *)block + block_bytes);
+  for (int s = 0; s < segments; s++) {
+    mt_u64 *tail = heads[s];
+    for (mt_u32 i = 1; i < counts[s]; i++) {
+      if (fresh[s]) {
+        MT_BLOCK_NEXT(tail) = (mt_u64 *)((char *)tail + block_bytes);
+      }
+      tail = MT_BLOCK_NEXT(tail);
+    }
+    MT_BLOCK_NEXT(tail) = s + 1 < segments ? heads[s + 1] : MT_NULL;
   }
-  MT_BLOCK_NEXT((mt_u64 *)((char *)base + (count - 1) * block_bytes)) =
-      MT_NULL;
-  *count_out = (mt_u32)count;
-  return base;
+  if (check) {
+    (void)mt_heap_purge(0);
+  }
+  *count_out = total;
+  return segments ? heads[0] : MT_NULL;
 }
 
-/* Gives a chain of `count` free blocks back to the shared heap. */
-static void mt_heap_push(int class_index, mt_u64 *head, mt_u32 count) {
-  head[1] = count;
-  mt_heap_acquire();
-  MT_BATCH_NEXT(head) = mt_heap_batches[class_index];
-  mt_heap_batches[class_index] = head;
-  mt_heap_release();
+static void mt_heap_push(mt_u64 *head) {
+  MtHeapSpan *spans[MT_HEAP_SEGMENTS];
+  mt_u64 *heads[MT_HEAP_SEGMENTS];
+  mt_u32 counts[MT_HEAP_SEGMENTS];
+  int check = 0;
+  while (head) {
+    int groups = 0;
+    while (head && groups < MT_HEAP_SEGMENTS) {
+      MtHeapSpan *span = mt_heap_span_of(head);
+      mt_u64 *tail = head;
+      mt_u64 *next;
+      mt_u32 count = 1;
+      while ((next = MT_BLOCK_NEXT(tail)) && mt_heap_span_of(next) == span) {
+        tail = next;
+        count++;
+      }
+      MT_BLOCK_NEXT(tail) = MT_NULL;
+      spans[groups] = span;
+      heads[groups] = head;
+      counts[groups] = count;
+      groups++;
+      head = next;
+    }
+    mt_heap_acquire();
+    for (int g = 0; g < groups; g++) {
+      MtHeapSpan *span = spans[g];
+      mt_heap_batch_set(heads[g], span->batches, counts[g]);
+      span->batches = heads[g];
+      span->free_count += counts[g];
+      if (mt_heap_given(&mt_heap_pools, span)) {
+        mt_heap_mark(span, MT_HEAP_UNIT_IDLE);
+      }
+    }
+    check |= mt_heap_tick(&mt_heap_pools);
+    mt_heap_release();
+  }
+  if (check) {
+    (void)mt_heap_purge(0);
+  }
 }
 
 #if MT_HEAP_CACHED
@@ -3404,7 +4212,6 @@ __attribute__((noinline)) static mt_u64 *mt_heap_cache_fill(int class_index) {
   return base;
 }
 
-/* The bin is full: the newest batch-size blocks go back to the shared heap. */
 __attribute__((noinline)) static void mt_heap_cache_spill(int class_index) {
   MtHeapBin *bin = &mt_heap_bins[class_index];
   mt_u32 batch = mt_heap_batch_size[class_index];
@@ -3416,22 +4223,36 @@ __attribute__((noinline)) static void mt_heap_cache_spill(int class_index) {
   bin->head = MT_BLOCK_NEXT(tail);
   bin->count -= batch;
   MT_BLOCK_NEXT(tail) = MT_NULL;
-  mt_heap_push(class_index, head, batch);
+  mt_heap_push(head);
 }
 #endif
 
-/* Called as a runtime thread ends: its cached blocks go back to the shared
-   heap and its counts into the totals. */
-static void mt_heap_thread_exit(void) {
+static void mt_heap_flush_bins(void) {
 #if MT_HEAP_CACHED
   for (int c = 0; c < MT_HEAP_CACHED; c++) {
     MtHeapBin *bin = &mt_heap_bins[c];
     if (bin->head) {
-      mt_heap_push(c, bin->head, bin->count);
+      mt_heap_push(bin->head);
       bin->head = MT_NULL;
       bin->count = 0;
     }
   }
+#endif
+}
+
+int malloc_trim(mt_size pad) {
+  int released = 0;
+  (void)pad;
+  mt_heap_flush_bins();
+  while (mt_heap_purge(1)) {
+    released = 1;
+  }
+  return released;
+}
+
+static void mt_heap_thread_exit(void) {
+  mt_heap_flush_bins();
+#if MT_HEAP_CACHED
   __atomic_fetch_add(&mt_allocation_count, mt_heap_allocs_local,
                      __ATOMIC_RELAXED);
   __atomic_fetch_add(&mt_free_count, mt_heap_frees_local, __ATOMIC_RELAXED);
@@ -3440,19 +4261,21 @@ static void mt_heap_thread_exit(void) {
 #endif
 }
 
-static mt_u64 *mt_heap_take_linked(int class_index);
+static inline __attribute__((always_inline)) mt_u64 *
+mt_heap_take_linked(int class_index);
 
-/* Clears the free-list links, so a fresh block reads as zero. */
-static mt_u64 *mt_heap_take(int class_index) {
+static inline __attribute__((always_inline)) mt_u64 *
+mt_heap_take(int class_index) {
   mt_u64 *base = mt_heap_take_linked(class_index);
   if (base) {
-    base[2] = 0;
-    base[3] = 0;
+    base[0] = 0;
+    base[1] = 0;
   }
   return base;
 }
 
-static mt_u64 *mt_heap_take_linked(int class_index) {
+static inline __attribute__((always_inline)) mt_u64 *
+mt_heap_take_linked(int class_index) {
   mt_u32 count;
 #if MT_HEAP_CACHED
   if (class_index < MT_HEAP_CACHED) {
@@ -3469,7 +4292,8 @@ static mt_u64 *mt_heap_take_linked(int class_index) {
   return mt_heap_fetch(class_index, 1, &count);
 }
 
-static void mt_heap_give(mt_u64 *base, int class_index) {
+static inline __attribute__((always_inline)) void
+mt_heap_give(mt_u64 *base, int class_index) {
 #if MT_HEAP_CACHED
   if (class_index < MT_HEAP_CACHED) {
     MtHeapBin *bin = &mt_heap_bins[class_index];
@@ -3481,35 +4305,58 @@ static void mt_heap_give(mt_u64 *base, int class_index) {
     return;
   }
 #endif
+  (void)class_index;
   MT_BLOCK_NEXT(base) = MT_NULL;
-  mt_heap_push(class_index, base, 1);
+  mt_heap_push(base);
+}
+
+__attribute__((noinline)) static void *mt_heap_large(mt_size size) {
+  mt_size page = (mt_size)1 << mt_heap_page_shift();
+  mt_size bytes;
+  char *mapping;
+  char *aligned;
+  mt_size head;
+  int owned;
+
+  if (size > MT_SIZE_MAX - 2 * MT_HEAP_REGION) {
+    return MT_NULL;
+  }
+  bytes = (size + page - 1) & ~(page - 1);
+  mapping = (char *)mt_heap_map(bytes + MT_HEAP_REGION);
+  if (!mapping) {
+    return MT_NULL;
+  }
+  aligned = (char *)(((mt_size)mapping + MT_HEAP_REGION - 1) &
+                     ~(MT_HEAP_REGION - 1));
+  head = (mt_size)(aligned - mapping);
+  if (head) {
+    mt_heap_unmap(mapping, head);
+  }
+  if (head < MT_HEAP_REGION) {
+    mt_heap_unmap(aligned + bytes, MT_HEAP_REGION - head);
+  }
+  mt_heap_acquire();
+  owned = mt_heap_own(aligned, bytes);
+  mt_heap_release();
+  if (!owned) {
+    mt_heap_unmap(aligned, bytes);
+    return MT_NULL;
+  }
+  mt_heap_count_alloc();
+  return aligned;
 }
 
 void *malloc(mt_size size) {
   mt_u64 *base;
-  mt_u64 tag;
 
-  if (size == 0) {
-    size = 1;
-  }
   if (size > MT_HEAP_LARGE_MIN) {
-    if (size > MT_SIZE_MAX - MT_HEAP_HEADER) {
-      return MT_NULL;
-    }
-    tag = (mt_u64)size + MT_HEAP_HEADER;
-    base = (mt_u64 *)mt_heap_map((mt_size)tag);
-  } else {
-    int class_index = mt_heap_class_of(size);
-    tag = (mt_u64)(class_index + 1);
-    base = mt_heap_take(class_index);
+    return mt_heap_large(size);
   }
-  if (!base) {
-    return MT_NULL;
+  base = mt_heap_take(mt_heap_class_for(size));
+  if (base) {
+    mt_heap_count_alloc();
   }
-  base[0] = tag;
-  base[1] = size;
-  mt_heap_count_alloc();
-  return base + 2;
+  return base;
 }
 
 void *calloc(mt_size count, mt_size size) {
@@ -3517,8 +4364,11 @@ void *calloc(mt_size count, mt_size size) {
     return MT_NULL;
   }
   mt_size total = count * size;
+  if (total > MT_HEAP_LARGE_MIN) {
+    return mt_heap_large(total);
+  }
   void *memory = malloc(total);
-  if (memory && total) {
+  if (memory && total > 16) {
     memset(memory, 0, total);
   }
   return memory;
@@ -3531,6 +4381,14 @@ static MT_NORETURN void mt_heap_bad_free(void) {
   abort();
 }
 
+static mt_u64 mt_heap_large_owner(const void *memory) {
+  mt_u64 owner = mt_heap_owner(memory);
+  if (owner <= MT_HEAP_IN_REGION || ((mt_size)memory & (MT_HEAP_REGION - 1))) {
+    mt_heap_bad_free();
+  }
+  return owner;
+}
+
 void free(void *memory) {
   if (!memory) {
     return;
@@ -3538,21 +4396,18 @@ void free(void *memory) {
   if (mt_live_forget_hook && mt_live_forget_hook(memory)) {
     return;
   }
-  mt_u64 *base = (mt_u64 *)memory - 2;
-  if (base[0] == 0 ||
-      (base[0] > MT_HEAP_CLASS_COUNT && base[0] != base[1] + MT_HEAP_HEADER)) {
-    mt_heap_bad_free();
-  }
-  mt_heap_count_free();
-  if (base[0] > MT_HEAP_CLASS_COUNT) {
-#if defined(MT_HOSTED)
-    mt_hosted_unmap(base, base[0]);
-#else
-    munmap(base, base[0]);
-#endif
+  int class_index = mt_heap_small_class(memory);
+  if (class_index >= 0) {
+    mt_heap_count_free();
+    mt_heap_give((mt_u64 *)memory, class_index);
     return;
   }
-  mt_heap_give(base, (int)base[0] - 1);
+  mt_u64 bytes = mt_heap_large_owner(memory);
+  mt_heap_count_free();
+  mt_heap_acquire();
+  (void)mt_heap_own(memory, 0);
+  mt_heap_release();
+  mt_heap_unmap(memory, (mt_size)bytes);
 }
 
 void *realloc(void *memory, mt_size size) {
@@ -3569,12 +4424,18 @@ void *realloc(void *memory, mt_size size) {
       return regrown;
     }
   }
-  mt_u64 *base = (mt_u64 *)memory - 2;
-  mt_size old_size = base[1];
-  if (base[0] <= MT_HEAP_CLASS_COUNT &&
-      size <= MT_HEAP_CLASS_BYTES(base[0] - 1)) {
-    base[1] = size;
-    return memory;
+  mt_size old_size;
+  int class_index = mt_heap_small_class(memory);
+  if (class_index >= 0) {
+    old_size = mt_heap_class_bytes(class_index);
+    if (size <= old_size) {
+      return memory;
+    }
+  } else {
+    old_size = (mt_size)mt_heap_large_owner(memory);
+    if (size <= old_size && size > MT_HEAP_LARGE_MIN) {
+      return memory;
+    }
   }
   void *replacement = malloc(size);
   if (!replacement) {
@@ -6675,14 +7536,17 @@ int sscanf(const char *input, const char *format, ...) {
 }
 
 void mettle_alloc_report(void) {
-#if !defined(_WIN32)
+  mt_u64 allocs;
+  mt_u64 frees;
+#if defined(_WIN32)
+  mt_win_heap_totals(&allocs, &frees);
+#else
   mt_heap_thread_exit();
+  allocs = __atomic_load_n(&mt_allocation_count, __ATOMIC_RELAXED);
+  frees = __atomic_load_n(&mt_free_count, __ATOMIC_RELAXED);
 #endif
   fprintf(stderr, "Owned runtime heap: %llu allocations, %llu frees\n",
-          (unsigned long long)__atomic_load_n(&mt_allocation_count,
-                                              __ATOMIC_RELAXED),
-          (unsigned long long)__atomic_load_n(&mt_free_count,
-                                              __ATOMIC_RELAXED));
+          (unsigned long long)allocs, (unsigned long long)frees);
 }
 
 static mt_u64 mt_random_state = 0x9e3779b97f4a7c15ULL;

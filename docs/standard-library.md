@@ -223,6 +223,7 @@ Raw memory moves. Both platforms.
 | `mem_find_byte(p: cstring, value: int32, n: int64) -> int64` | Offset or -1 |
 | `alloc_zeroed(n: int64) -> rawptr` | Allocate and zero |
 | `buf_dup(src: rawptr, len: int64) -> rawptr` | Allocate a copy |
+| `malloc_trim(pad: int64) -> int32` | Return idle heap pages to the system now; 1 when any went back |
 
 `mem_copy` requires that the ranges do not overlap; reach for `mem_move` when
 they might.
