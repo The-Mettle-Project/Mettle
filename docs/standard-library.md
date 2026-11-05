@@ -89,7 +89,8 @@ Building a `string`:
 
 | Function | Effect |
 |----------|--------|
-| `str_from_bytes(p: cstring, n: int64) -> string` | View n bytes |
+| `str_from_bytes(p: cstring, n: int64) -> string` | View n bytes. Not a copy: it dangles once `p` is gone |
+| `str_dup(s: string) -> string` | Heap copy with a NUL after it; free it with `free(copy.chars)` |
 | `str_from_cstr(s: cstring) -> string` | View up to the nul |
 | `str_slice(s: string, start: int64, len: int64) -> string` | A sub-view |
 
