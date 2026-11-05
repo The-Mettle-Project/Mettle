@@ -621,6 +621,7 @@ int64_t mettle_safety_span(const void *base) {
 void mettle_safety_check_affine(const void *base, int64_t offset, int64_t length,
     uint32_t kind, uint32_t line, uint64_t identity, int64_t width, int64_t step) {
   if (length <= 0) return;
+  identity = safety_resolve_identity(base, identity);
   if (!identity || width <= 0 || step <= 0) {
     mettle_safety_check_identity(base, offset, width, kind, line, identity);
     return;

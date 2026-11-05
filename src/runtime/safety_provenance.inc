@@ -15,6 +15,13 @@ static SafetyRegion safety_identity_snapshot(uint64_t identity) {
   return result;
 }
 
+// Two different identities met in one value, as in a table pointer plus an
+// index hashed from another pointer. Which one is the base is unknown, so
+// the address decides.
+static uint64_t safety_resolve_identity(const void *base, uint64_t identity) {
+  return identity == UINT64_MAX ? mettle_safety_identity(base) : identity;
+}
+
 // A pointer with no identity may still sit in memory the program named with
 // memory_region, in any module. Only those regions answer by address.
 static uint64_t safety_foreign_identity(const void *base) {
@@ -28,6 +35,7 @@ void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size
                                   uint64_t identity) {
   (void)kind;
   SafetyRegion region = {0};
+  identity = safety_resolve_identity(base, identity);
   if (!identity) identity = safety_foreign_identity(base);
   if (!identity) {
     if (size <= 0 || safety_allocator_depth()) return;
@@ -50,6 +58,7 @@ void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size
 }
 
 int64_t mettle_safety_span_identity(const void *base, uint64_t identity) {
+  identity = safety_resolve_identity(base, identity);
   if (!identity) identity = safety_foreign_identity(base);
   if (!identity) return 0;
   SafetyRegion region = safety_identity_snapshot(identity);
@@ -249,6 +258,7 @@ void mettle_safety_value_clear(void *destination, uint64_t size) {
 
 void mettle_safety_free_identity(void *pointer, uint64_t identity) {
   if (!pointer) return;
+  identity = safety_resolve_identity(pointer, identity);
   if (!identity) {
     safety_internal_failure("Fatal error: free has no tracked allocation identity");
   }
