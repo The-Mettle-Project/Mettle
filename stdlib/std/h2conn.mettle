@@ -1,33 +1,12 @@
-// HTTP/2 connection layer, client or server, on top of std/http2 and std/hpack.
-//
-// The core never blocks and never touches a socket. The caller moves bytes:
-//   - bytes read from the transport go in with h2c_feed (or h2c_input_space and
-//     h2c_input_commit);
-//   - h2c_next_event hands out what happened, one event at a time;
-//   - frames to send queue in an output buffer. h2c_pending_output shows it and
-//     h2c_output_consumed drops what the transport took.
-// h2c_pump, h2c_call and h2c_serve are blocking helpers over a NetStream; a TLS
-// stream from another library plugs in the same way. h2c with prior knowledge
-// needs nothing more than the connection: the client queues the preface itself.
-//
-// Streams are named by their id. h2c_open_stream makes a client stream; a
-// server sees a new stream as an H2C_EV_HEADERS event with new_stream set.
-//
-// Lifetimes: header strings, DATA bytes and GOAWAY debug text in an event are
-// valid until the next h2c_next_event, h2c_feed, h2c_input_space or h2c_pump
-// call. Copy what you keep. A pointer from h2c_pending_output is valid until
-// the next call that queues a frame.
-//
-// Memory is bounded. Input is one frame deep, queued output has a hard cap, a
-// peer can have at most max_concurrent_streams streams open, and header
-// blocks are capped by max_header_list_size.
+// HTTP/2 client and server connections over std/http2 and std/hpack.
+// The core never blocks: feed it bytes (h2c_feed), take events (h2c_next_event),
+// and send what h2c_pending_output holds. h2c_pump, h2c_call and h2c_serve are
+// blocking helpers over a NetStream. Event strings live until the next call.
 
 import "std/http2";
 import "std/hpack";
 import "std/socket";
 import "std/arena";
-
-// ---- Results ------------------------------------------------------------------
 
 export const H2C_OK = 0;
 export const H2C_ERR_CLOSED = -1;        // the connection failed or ended
@@ -44,11 +23,8 @@ export const H2C_ERR_TIMEOUT = -11;
 export const H2C_ERR_IO = -12;           // transport error or end of stream
 export const H2C_ERR_PROTOCOL = -13;     // the connection failed
 
-// h2c_pump returns this at end of stream; other negative values are the
-// transport's -NET_E* codes.
+// h2c_pump returns this at end of stream.
 export const H2C_PUMP_EOF = -1;
-
-// ---- Events -------------------------------------------------------------------
 
 export const H2C_EV_NONE = 0;
 export const H2C_EV_SETTINGS = 1;       // the peer's SETTINGS are applied
@@ -86,8 +62,6 @@ export struct H2cEvent {
   count: int64;              // SLOT_FREE: streams finished since the last event
 }
 
-// ---- Configuration ------------------------------------------------------------
-
 export struct H2cConfig {
   max_concurrent_streams: int64;   // streams the peer may have open on us
   max_streams: int64;              // hard cap on open streams per side
@@ -111,8 +85,6 @@ export fn h2c_config_default(cfg: H2cConfig*) {
   cfg->max_output = 1048576;
   cfg->manual_flow = false;
 }
-
-// ---- Connection state ---------------------------------------------------------
 
 export struct H2cStream {
   id: int32;
@@ -204,8 +176,6 @@ export struct H2c {
 const H2C_NOTE_WRITABLE = 1;
 const H2C_NOTE_UNPROCESSED = 2;
 
-// ---- Small helpers ------------------------------------------------------------
-
 fn h2c_min(a: int64, b: int64) -> int64 {
   if (a < b) { return a; }
   return b;
@@ -251,8 +221,6 @@ fn h2c_view(p: uint8*, n: int64) -> string {
   s.length = (uint64)n;
   return s;
 }
-
-// ---- Output queue -------------------------------------------------------------
 
 // Room for n more bytes at the tail, compacting first if needed. Null if the
 // queue cannot hold them.
@@ -318,8 +286,6 @@ fn h2c_queue_settings_ack(c: H2c*) {
   if (p == (uint8*)0) { return; }
   c->out_tail = c->out_tail + h2_build_settings_ack(p, 9);
 }
-
-// ---- Streams ------------------------------------------------------------------
 
 fn h2c_bucket(c: H2c*, id: int32) -> int64 {
   return ((int64)id >> 1) & (c->nbuckets - 1);
@@ -431,8 +397,6 @@ fn h2c_wake_all(c: H2c*) {
   }
 }
 
-// ---- Receive-window refills ---------------------------------------------------
-
 // The application is done with n DATA bytes: announce them once enough add up.
 fn h2c_credit(c: H2c*, s: H2cStream*, n: int64) {
   if (n <= 0) { return; }
@@ -452,8 +416,6 @@ fn h2c_credit(c: H2c*, s: H2cStream*, n: int64) {
   }
 }
 
-// ---- Header rules (RFC 9113 section 8) ----------------------------------------
-
 const H2C_KIND_REQUEST = 0;
 const H2C_KIND_RESPONSE = 1;
 const H2C_KIND_TRAILERS = 2;
@@ -466,9 +428,7 @@ fn h2c_plain(s: string) -> bool {
   return true;
 }
 
-// Checks a header list: lowercase names, pseudo-headers first and only the
-// ones the kind allows, the required ones present, no connection-specific
-// headers, and `te` only as "trailers".
+// Checks a header list against RFC 9113 section 8.
 fn h2c_headers_ok(list: HpackHeader*, n: int64, kind: int32) -> bool {
   var verb: string = "";
   var have_method: bool = false;
@@ -529,8 +489,6 @@ export fn h2c_find_header(list: HpackHeader*, n: int64, name: string, out: strin
   return false;
 }
 
-// ---- Creating a connection ----------------------------------------------------
-
 fn h2c_settings_differ(c: H2c*, list: H2Setting*) -> int64 {
   var d: H2Settings;
   h2_settings_defaults(&d);
@@ -545,9 +503,7 @@ fn h2c_settings_differ(c: H2c*, list: H2Setting*) -> int64 {
   return n;
 }
 
-// Makes a connection. A client queues the preface, its SETTINGS and any
-// connection window increase; a server queues its SETTINGS. Returns null if
-// memory runs out. Free it with h2c_free.
+// Makes a connection. Returns null if memory runs out.
 export fn h2c_new(is_server: bool, cfg: H2cConfig*) -> H2c* {
   var arena: Arena* = arena_init(0);
   if (arena == (Arena*)0) { return (H2c*)0; }
@@ -627,8 +583,6 @@ export fn h2c_free(c: H2c*) {
   arena_free(c->arena);
 }
 
-// ---- Output and input plumbing ------------------------------------------------
-
 // Bytes waiting for the transport. Sets *p to the first one.
 export fn h2c_pending_output(c: H2c*, p: uint8**) -> int64 {
   *p = c->out_buf + c->out_head;
@@ -659,8 +613,7 @@ fn h2c_apply_drop(c: H2c*) {
 }
 
 // Free space at the end of the input buffer, for reading straight into it.
-// Call h2c_input_commit with the count read. Returns 0 when the buffer is full;
-// drain events first.
+// Returns 0 when the buffer is full.
 export fn h2c_input_space(c: H2c*, p: uint8**) -> int64 {
   h2c_apply_drop(c);
   if (c->in_start > 0) {
@@ -677,8 +630,7 @@ export fn h2c_input_commit(c: H2c*, n: int64) {
 }
 
 // Gives the connection bytes read from the transport. Returns how many it
-// took. That is less than n only when the buffer is full: call h2c_next_event
-// until it returns 0, then feed the rest. Negative when the connection is dead.
+// took.
 export fn h2c_feed(c: H2c*, bytes: uint8*, n: int64) -> int64 {
   if (c->dead) { return H2C_ERR_CLOSED; }
   var p: uint8* = (uint8*)0;
@@ -697,8 +649,6 @@ export fn h2c_eof(c: H2c*) {
   c->fail_code = H2_NO_ERROR;
   c->fail_text = "";
 }
-
-// ---- Sending ------------------------------------------------------------------
 
 // Streams we can open right now.
 export fn h2c_stream_slots(c: H2c*) -> int64 {
@@ -719,7 +669,7 @@ export fn h2c_stream_writable(c: H2c*, id: int32) -> int64 {
 }
 
 // Encodes the list and queues HEADERS and as many CONTINUATIONs as the peer's
-// frame size needs. Nothing changes if it returns an error.
+// frame size needs.
 fn h2c_send_block(c: H2c*, id: int32, list: HpackHeader*, n: int64, end_stream: bool) -> int32 {
   var bound: int64 = 64;
   var total: int64 = 0;
@@ -767,8 +717,7 @@ fn h2c_send_block(c: H2c*, id: int32, list: HpackHeader*, n: int64, end_stream: 
 }
 
 // Opens a client stream and sends its request headers. Returns the stream id,
-// or a negative error: H2C_ERR_NO_SLOT at the peer's concurrent stream limit
-// (wait for H2C_EV_SLOT_FREE), H2C_ERR_GOAWAY after a GOAWAY either way.
+// or a negative error (H2C_ERR_NO_SLOT at the stream limit).
 export fn h2c_open_stream(c: H2c*, list: HpackHeader*, n: int64, end_stream: bool) -> int32 {
   if (c->dead) { return H2C_ERR_CLOSED; }
   if (c->is_server) { return H2C_ERR_STATE; }
@@ -790,9 +739,7 @@ export fn h2c_open_stream(c: H2c*, list: HpackHeader*, n: int64, end_stream: boo
   return id;
 }
 
-// Sends a stream's header block. A server uses it for the response headers
-// (a trailers-only response is one call with end_stream). Once the headers
-// have gone out, a second call sends trailers and always ends the stream.
+// Sends a stream's header block.
 export fn h2c_send_headers(c: H2c*, id: int32, list: HpackHeader*, n: int64, end_stream: bool) -> int32 {
   if (c->dead) { return H2C_ERR_CLOSED; }
   var s: H2cStream* = h2c_find(c, id);
@@ -817,9 +764,7 @@ export fn h2c_send_headers(c: H2c*, id: int32, list: HpackHeader*, n: int64, end
 }
 
 // Queues up to n bytes of DATA, as much as both flow-control windows and the
-// output queue allow. Returns the bytes taken, which may be less than n or 0;
-// resend the rest after H2C_EV_WRITABLE. end_stream takes effect only with the
-// last byte. Negative on error.
+// output queue allow. Negative on error.
 export fn h2c_send_data(c: H2c*, id: int32, data: uint8*, n: int64, end_stream: bool) -> int64 {
   if (c->dead) { return H2C_ERR_CLOSED; }
   var s: H2cStream* = h2c_find(c, id);
@@ -874,16 +819,13 @@ export fn h2c_reset_stream(c: H2c*, id: int32, error_code: int64) -> int32 {
   return H2C_OK;
 }
 
-// The application used n DATA bytes of this stream; refill the peer's windows.
-// Only does anything with manual_flow set. Call it for a stream that has gone
-// away too, so the connection window gets its bytes back.
+// The application used n DATA bytes of this stream (manual_flow only).
 export fn h2c_consumed(c: H2c*, id: int32, n: int64) {
   if (!c->cfg.manual_flow || c->dead) { return; }
   h2c_credit(c, h2c_find(c, id), n);
 }
 
-// Sends a PING with 8 bytes of data. The reply is an H2C_EV_PING_ACK event
-// with the same bytes and the round trip time.
+// Sends a PING with 8 bytes of data.
 export fn h2c_ping(c: H2c*, data: uint8*) -> int32 {
   if (c->dead) { return H2C_ERR_CLOSED; }
   var slot: int32 = -1;
@@ -901,8 +843,7 @@ export fn h2c_ping(c: H2c*, data: uint8*) -> int32 {
   return H2C_OK;
 }
 
-// Sends GOAWAY. last_stream_id below 0 means the highest stream accepted so
-// far; send H2_MAX_STREAM_ID first for a graceful shutdown, then the real value.
+// Sends GOAWAY.
 export fn h2c_goaway(c: H2c*, last_stream_id: int32, error_code: int64, debug: string) -> int32 {
   if (c->dead) { return H2C_ERR_CLOSED; }
   var last: int32 = last_stream_id;
@@ -918,8 +859,6 @@ export fn h2c_goaway(c: H2c*, last_stream_id: int32, error_code: int64, debug: s
   c->goaway_sent_last = last;
   return H2C_OK;
 }
-
-// ---- Queries ------------------------------------------------------------------
 
 export fn h2c_peer_settings(c: H2c*) -> H2Settings* {
   return &c->peer;
@@ -953,7 +892,7 @@ export fn h2c_is_dead(c: H2c*) -> bool {
 }
 
 // True when a GOAWAY went either way, no streams are left, and the output is
-// flushed: the transport can be closed.
+// flushed.
 export fn h2c_is_done(c: H2c*) -> bool {
   if (c->dead) { return h2c_out_used(c) == 0; }
   return (c->goaway_sent || c->goaway_recv) && c->n_local + c->n_peer == 0 && h2c_out_used(c) == 0;
@@ -964,10 +903,7 @@ export fn h2c_goaway_received(c: H2c*, last_stream_id: int32*) -> bool {
   return c->goaway_recv;
 }
 
-// ---- Receiving ----------------------------------------------------------------
-
-// Resets a stream because of a fault on the stream: queues RST_STREAM and
-// drops it. If the application knew the stream, reports H2C_EV_RESET.
+// Resets a stream because of a fault on the stream.
 fn h2c_stream_error(c: H2c*, id: int32, code: int64, ev: H2cEvent*) -> int32 {
   h2c_queue_rst(c, id, code);
   h2c_recent_add(c, id);
@@ -982,9 +918,7 @@ fn h2c_stream_error(c: H2c*, id: int32, code: int64, ev: H2cEvent*) -> int32 {
   return H2C_EV_RESET;
 }
 
-// A frame for a stream that is not in the table and is not idle: late frames
-// for a stream we reset are dropped; for any other closed stream the answer is
-// RST_STREAM.
+// A frame for a stream that is closed.
 fn h2c_closed_stream_frame(c: H2c*, id: int32) {
   if (c->goaway_sent && id > c->goaway_sent_last && !h2c_is_local_id(c, id)) { return; }
   if (h2c_recent_has(c, id)) { return; }
@@ -1356,8 +1290,7 @@ fn h2c_dispatch(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
   }
 }
 
-// Queued notices first: streams that can send again, streams that a GOAWAY
-// left unprocessed. Returns an event kind or 0.
+// Queued notices first: Returns an event kind or 0.
 fn h2c_next_note(c: H2c*, ev: H2cEvent*) -> int32 {
   while (c->note_len > 0) {
     var n: H2cNote = c->notes[c->note_head];
@@ -1388,9 +1321,8 @@ fn h2c_next_note(c: H2c*, ev: H2cEvent*) -> int32 {
   return 0;
 }
 
-// The next event, or 0 when there is none and more input is needed. Returns the
-// event's kind (H2C_EV_*) and fills *ev. Event data is valid until the next
-// call to this, h2c_feed, h2c_input_space or h2c_pump.
+// The next event, or 0 when there is none and more input is needed. Returns
+// the event's kind (H2C_EV_*) and fills *ev.
 export fn h2c_next_event(c: H2c*, ev: H2cEvent*) -> int32 {
   var blank: H2cEvent;
   *ev = blank;
@@ -1433,8 +1365,6 @@ export fn h2c_next_event(c: H2c*, ev: H2cEvent*) -> int32 {
   return 0;
 }
 
-// ---- Blocking helpers over a NetStream ----------------------------------------
-
 // Writes all queued output to the stream. Returns 0 or a negative error.
 export fn h2c_flush(c: H2c*, ns: NetStream*) -> int64 {
   while (h2c_wants_write(c)) {
@@ -1448,9 +1378,7 @@ export fn h2c_flush(c: H2c*, ns: NetStream*) -> int64 {
 }
 
 // Sends what is queued, then waits up to timeout_ms (-1 forever) for the
-// transport to have bytes and feeds them in. Returns the bytes read, 0 on
-// timeout, H2C_PUMP_EOF at end of stream, or a negative -NET_E* code. Call
-// h2c_next_event until it returns 0 before pumping again.
+// transport to have bytes and feeds them in.
 export fn h2c_pump(c: H2c*, ns: NetStream*, timeout_ms: int64) -> int64 {
   var f: int64 = h2c_flush(c, ns);
   if (f < 0) { return f; }
@@ -1471,8 +1399,6 @@ export fn h2c_pump(c: H2c*, ns: NetStream*, timeout_ms: int64) -> int64 {
   h2c_input_commit(c, r);
   return r;
 }
-
-// ---- Blocking client call -----------------------------------------------------
 
 // A finished response. Everything lives in the arena given to h2c_call.
 export struct H2cResponse {
@@ -1514,8 +1440,8 @@ fn h2c_left(deadline: int64, timeout_ms: int64) -> int64 {
   return left;
 }
 
-// Waits for the next event, pumping the transport as needed. Returns the kind,
-// or a negative H2C_ERR_*.
+// Waits for the next event, pumping the transport as needed. Returns the
+// kind, or a negative H2C_ERR_*.
 fn h2c_wait_event(c: H2c*, ns: NetStream*, ev: H2cEvent*, deadline: int64, timeout_ms: int64) -> int32 {
   while (true) {
     var k: int32 = h2c_next_event(c, ev);
@@ -1532,12 +1458,7 @@ fn h2c_wait_event(c: H2c*, ns: NetStream*, ev: H2cEvent*, deadline: int64, timeo
   return H2C_ERR_IO;
 }
 
-// One request and its whole response on a connection nobody else is using:
-// opens a stream, sends the headers and body (honouring flow control), and
-// reads headers, body and trailers up to the end of the stream. A body over
-// max_body bytes fails with H2C_ERR_TOO_LARGE. Returns 0, H2C_ERR_RESET (see
-// out->reset_code), H2C_ERR_GOAWAY if the server never processed the stream,
-// H2C_ERR_TIMEOUT, H2C_ERR_IO, or H2C_ERR_PROTOCOL.
+// One request and its whole response, on a connection nothing else uses.
 export fn h2c_call(c: H2c*, ns: NetStream*, arena: Arena*, list: HpackHeader*, n: int64, body: uint8*, body_len: int64, max_body: int64, timeout_ms: int64, out: H2cResponse*) -> int32 {
   var blank: H2cResponse;
   *out = blank;
@@ -1621,8 +1542,6 @@ export fn h2c_call(c: H2c*, ns: NetStream*, arena: Arena*, list: HpackHeader*, n
   return H2C_ERR_IO;
 }
 
-// ---- Blocking server loop -----------------------------------------------------
-
 export struct H2cRequest {
   stream_id: int32;
   headers: HpackHeader*;
@@ -1633,9 +1552,7 @@ export struct H2cRequest {
   trailer_count: int64;
 }
 
-// What a handler fills in. The headers must include :status. Trailers are
-// sent after the body when trailer_count is above 0. All of it may live in the
-// arena the handler is given.
+// What a handler fills in.
 export struct H2cReply {
   headers: HpackHeader*;
   header_count: int64;
@@ -1727,10 +1644,7 @@ fn h2c_serve_cleanup(c: H2c*) {
 
 // Serves a server connection until the peer closes it (returns 0), the
 // connection fails (H2C_ERR_PROTOCOL), or nothing arrives for timeout_ms
-// (H2C_ERR_TIMEOUT). Each request is read whole, up to max_body bytes (more
-// resets the stream), then handler runs and its reply is sent; the handler
-// returning non-zero resets the stream. One request is handled at a time, but
-// many can be in flight. The handler's arena is freed after the reply is sent.
+// (H2C_ERR_TIMEOUT).
 export fn h2c_serve(c: H2c*, ns: NetStream*, handler: fn(rawptr, H2cRequest*, H2cReply*, Arena*) -> int32, user: rawptr, max_body: int64, timeout_ms: int64) -> int32 {
   var ev: H2cEvent;
   var result: int32 = 0;
