@@ -21718,6 +21718,8 @@ $issueRegressions = @(
   @{ Name = "popcount_buffer_fuse_checks_the_body"; Entry = "tests/issues/popcount_buffer_fuse_checks_the_body.mettle"; Args = @(); Expect = @("16936 454 261 261") },
   @{ Name = "popcount_buffer_fuse_checks_the_body_release"; Entry = "tests/issues/popcount_buffer_fuse_checks_the_body.mettle"; Args = @("--release"); Expect = @("16936 454 261 261") },
   @{ Name = "popcount_buffer_fuse_checks_the_body_opt"; Entry = "tests/issues/popcount_buffer_fuse_checks_the_body.mettle"; Args = @("-O"); Expect = @("16936 454 261 261") },
+  @{ Name = "word_count_fold_checks_the_body"; Entry = "tests/issues/word_count_fold_checks_the_body.mettle"; Args = @(); Expect = @("9 6007 20 6") },
+  @{ Name = "word_count_fold_checks_the_body_release"; Entry = "tests/issues/word_count_fold_checks_the_body.mettle"; Args = @("--release"); Expect = @("9 6007 20 6") },
   @{ Name = "interp_recycles_freed_buffers"; Command = @("test", "tests/issues/interp_recycles_freed_buffers.mettle"); Expect = @("2 passed") },
   @{ Name = "test_fn_called_from_main"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @(); Expect = @("0 0") },
   @{ Name = "test_fn_called_from_main_release"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @("--release"); Expect = @("0 0") },

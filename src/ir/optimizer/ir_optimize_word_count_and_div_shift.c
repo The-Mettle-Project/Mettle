@@ -285,6 +285,251 @@ static int ir_try_match_word_count_state_updates(
   return 1;
 }
 
+enum { IR_WC_TEMPS = 64, IR_WC_STEP_LIMIT = 512 };
+
+typedef struct {
+  const IRFunction *function;
+  size_t first;
+  size_t last;
+  const char *iv;
+  const char *buf;
+  const char *ch;
+  const char *in_word;
+  const char *count;
+  long long sym[4];
+  const char *temp_name[IR_WC_TEMPS];
+  long long temp_value[IR_WC_TEMPS];
+  size_t temp_count;
+  long long loaded;
+} IRWordCountEval;
+
+static int ir_wc_symbol_slot(const IRWordCountEval *e, const char *name) {
+  const char *names[4] = {e->iv, e->ch, e->in_word, e->count};
+  for (int s = 0; s < 4; s++) {
+    if (name && names[s] && strcmp(name, names[s]) == 0) {
+      return s;
+    }
+  }
+  return -1;
+}
+
+static int ir_wc_read(const IRWordCountEval *e, const IROperand *op,
+                      long long *out) {
+  if (op->kind == IR_OPERAND_INT) {
+    *out = op->int_value;
+    return 1;
+  }
+  if (op->kind == IR_OPERAND_SYMBOL) {
+    int slot = ir_wc_symbol_slot(e, op->name);
+    if (slot >= 0) {
+      *out = e->sym[slot];
+      return 1;
+    }
+    if (op->name && e->buf && strcmp(op->name, e->buf) == 0) {
+      *out = 0;
+      return 1;
+    }
+    return 0;
+  }
+  if (op->kind == IR_OPERAND_TEMP && op->name) {
+    for (size_t t = e->temp_count; t > 0; t--) {
+      if (strcmp(e->temp_name[t - 1], op->name) == 0) {
+        *out = e->temp_value[t - 1];
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int ir_wc_write(IRWordCountEval *e, const IROperand *op, long long value) {
+  if (op->kind == IR_OPERAND_SYMBOL) {
+    int slot = ir_wc_symbol_slot(e, op->name);
+    if (slot < 0) {
+      return 0;
+    }
+    e->sym[slot] = value;
+    return 1;
+  }
+  if (op->kind != IR_OPERAND_TEMP || !op->name || e->temp_count >= IR_WC_TEMPS) {
+    return 0;
+  }
+  e->temp_name[e->temp_count] = op->name;
+  e->temp_value[e->temp_count] = value;
+  e->temp_count++;
+  return 1;
+}
+
+static int ir_wc_cast(const char *text, long long value, long long *out) {
+  static const struct { const char *name; int bits; int is_signed; } kinds[] = {
+      {"uint8", 8, 0},   {"uint16", 16, 0}, {"uint32", 32, 0}, {"uint64", 64, 0},
+      {"int8", 8, 1},    {"int16", 16, 1},  {"int32", 32, 1},  {"int64", 64, 1},
+      {"char", 8, 0},    {"bool", 1, 0}};
+  for (size_t k = 0; text && k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+    if (!strstr(text, kinds[k].name)) {
+      continue;
+    }
+    int bits = kinds[k].bits;
+    if (bits == 1) {
+      *out = value != 0;
+    } else if (bits == 64) {
+      *out = value;
+    } else {
+      unsigned long long mask = (1ULL << bits) - 1;
+      unsigned long long low = (unsigned long long)value & mask;
+      *out = kinds[k].is_signed && (low >> (bits - 1))
+                 ? (long long)(low | ~mask)
+                 : (long long)low;
+    }
+    return 1;
+  }
+  return 0;
+}
+
+static int ir_wc_binary(const char *op, long long a, long long b, long long *out) {
+  static const char *ops[] = {"+", "-", "&", "|", "^", "==", "!=", "<", "<=", ">", ">="};
+  int which = -1;
+  for (int k = 0; op && k < (int)(sizeof(ops) / sizeof(ops[0])); k++) {
+    if (strcmp(op, ops[k]) == 0) {
+      which = k;
+    }
+  }
+  switch (which) {
+  case 0: *out = (long long)((unsigned long long)a + (unsigned long long)b); return 1;
+  case 1: *out = (long long)((unsigned long long)a - (unsigned long long)b); return 1;
+  case 2: *out = a & b; return 1;
+  case 3: *out = a | b; return 1;
+  case 4: *out = a ^ b; return 1;
+  case 5: *out = a == b; return 1;
+  case 6: *out = a != b; return 1;
+  case 7: *out = a < b; return 1;
+  case 8: *out = a <= b; return 1;
+  case 9: *out = a > b; return 1;
+  case 10: *out = a >= b; return 1;
+  default: return 0;
+  }
+}
+
+static int ir_wc_find_label(const IRWordCountEval *e, const char *label,
+                            size_t *out) {
+  for (size_t i = e->first; label && i < e->last; i++) {
+    const IRInstruction *in = &e->function->instructions[i];
+    if (in->op == IR_OP_LABEL && in->text && strcmp(in->text, label) == 0) {
+      *out = i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_wc_exec_value(IRWordCountEval *e, const IRInstruction *in) {
+  long long a = 0;
+  long long b = 0;
+  long long r = 0;
+  switch (in->op) {
+  case IR_OP_ASSIGN:
+    return ir_wc_read(e, &in->lhs, &r) && ir_wc_write(e, &in->dest, r);
+  case IR_OP_CAST:
+    return !in->is_float && ir_wc_read(e, &in->lhs, &a) &&
+           ir_wc_cast(in->text, a, &r) && ir_wc_write(e, &in->dest, r);
+  case IR_OP_BINARY:
+    return !in->is_float && ir_wc_read(e, &in->lhs, &a) &&
+           ir_wc_read(e, &in->rhs, &b) && ir_wc_binary(in->text, a, b, &r) &&
+           ir_wc_write(e, &in->dest, r);
+  case IR_OP_LOAD:
+    return in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value == 1 &&
+           ir_wc_read(e, &in->lhs, &a) && ir_wc_write(e, &in->dest, e->loaded);
+  default:
+    return 0;
+  }
+}
+
+static int ir_wc_run(IRWordCountEval *e) {
+  size_t pc = e->first;
+  e->temp_count = 0;
+  for (int steps = 0; steps < IR_WC_STEP_LIMIT; steps++) {
+    if (pc >= e->last) {
+      return 1;
+    }
+    const IRInstruction *in = &e->function->instructions[pc];
+    long long a = 0;
+    long long b = 0;
+    pc++;
+    if (in->op == IR_OP_NOP || in->op == IR_OP_LABEL ||
+        in->op == IR_OP_DECLARE_LOCAL) {
+      continue;
+    }
+    if (in->op == IR_OP_JUMP) {
+      if (!ir_wc_find_label(e, in->text, &pc)) {
+        return 0;
+      }
+      continue;
+    }
+    if (in->op == IR_OP_BRANCH_ZERO || in->op == IR_OP_BRANCH_EQ) {
+      int taken = 0;
+      if (!ir_wc_read(e, &in->lhs, &a)) {
+        return 0;
+      }
+      if (in->op == IR_OP_BRANCH_EQ) {
+        if (!ir_wc_read(e, &in->rhs, &b)) {
+          return 0;
+        }
+        taken = a == b;
+      } else {
+        taken = a == 0;
+      }
+      if (taken && !ir_wc_find_label(e, in->text, &pc)) {
+        return 0;
+      }
+      continue;
+    }
+    if (!ir_wc_exec_value(e, in)) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+static int ir_word_count_body_is_exact(const IRFunction *function, size_t first,
+                                       size_t last, const char *iv,
+                                       const char *buf, const char *ch,
+                                       const char *in_word, const char *count) {
+  IRWordCountEval e;
+  memset(&e, 0, sizeof(e));
+  e.function = function;
+  e.first = first;
+  e.last = last;
+  e.iv = iv;
+  e.buf = buf;
+  e.ch = ch;
+  e.in_word = in_word;
+  e.count = count;
+  for (size_t i = first; i < last; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (ir_instruction_writes_destination(in) && ir_operand_is_symbol(&in->dest) &&
+        ir_wc_symbol_slot(&e, in->dest.name) < 0) {
+      return 0;
+    }
+  }
+  for (int byte = 0; byte < 256; byte++) {
+    int space = byte == 32 || byte == 9 || byte == 10 || byte == 13;
+    for (int sign = 0; sign < 2; sign++) {
+      for (int state = 0; state < 2; state++) {
+        e.loaded = sign && byte > 127 ? byte - 256 : byte;
+        e.sym[0] = 5;
+        e.sym[1] = 0;
+        e.sym[2] = state;
+        e.sym[3] = 100;
+        if (!ir_wc_run(&e) || e.sym[0] != 6 || e.sym[2] != (space ? 0 : 1) ||
+            e.sym[3] != 100 + (!space && state == 0)) {
+          return 0;
+        }
+      }
+    }
+  }
+  return 1;
+}
+
 int ir_try_parse_direct_unit_increment(const IRInstruction *instruction,
                                               const char *iv_symbol) {
   return instruction && instruction->op == IR_OP_BINARY &&
@@ -397,7 +642,10 @@ static int ir_try_vectorize_word_count_at(IRFunction *function,
 
   if (ir_symbol_read_after(function, jump_index + 1, iv_symbol) ||
       ir_symbol_read_after(function, jump_index + 1, in_word_symbol) ||
-      ir_symbol_read_after(function, jump_index + 1, char_symbol)) {
+      ir_symbol_read_after(function, jump_index + 1, char_symbol) ||
+      !ir_word_count_body_is_exact(function, branch_index + 1, jump_index,
+                                   iv_symbol, buf_symbol, char_symbol,
+                                   in_word_symbol, count_symbol)) {
     return 1;
   }
 
