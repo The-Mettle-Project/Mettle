@@ -78,7 +78,10 @@ uint64_t mettle_safety_subtract_identity(uint64_t a, uint64_t b) {
   return a && b ? 0 : a ? a : b;
 }
 
-#define SAFETY_VALUE_BUCKETS 4096u
+#define SAFETY_VALUE_FIRST_BUCKETS 4096u
+#define SAFETY_VALUE_LINE_SHIFT 4u
+#define SAFETY_VALUE_LOAD 8u
+#define SAFETY_VALUE_COPY_INLINE 64u
 typedef struct SafetyValue {
   uintptr_t address;
   uint64_t value;
@@ -86,7 +89,9 @@ typedef struct SafetyValue {
   uint64_t owner;
   struct SafetyValue *next;
 } SafetyValue;
-static SafetyValue *g_safety_values[SAFETY_VALUE_BUCKETS];
+static SafetyValue *g_safety_value_first_table[SAFETY_VALUE_FIRST_BUCKETS];
+static SafetyValue **g_safety_values = g_safety_value_first_table;
+static size_t g_safety_value_buckets = SAFETY_VALUE_FIRST_BUCKETS;
 static SafetyValue *g_safety_value_free;
 static size_t g_safety_value_count;
 typedef struct SafetyValueBlock {
@@ -94,8 +99,66 @@ typedef struct SafetyValueBlock {
 } SafetyValueBlock;
 static SafetyValueBlock *g_safety_value_blocks;
 
+static size_t safety_value_line_bucket(uintptr_t line, size_t buckets) {
+  uint64_t mixed = (uint64_t)line * UINT64_C(0x9E3779B97F4A7C15);
+  return (size_t)(mixed >> 20) & (buckets - 1);
+}
+
 static size_t safety_value_bucket(uintptr_t address) {
-  return (size_t)((address >> 3) ^ (address >> 17)) & (SAFETY_VALUE_BUCKETS - 1);
+  return safety_value_line_bucket(address >> SAFETY_VALUE_LINE_SHIFT,
+                                  g_safety_value_buckets);
+}
+
+static void safety_values_grow(void) {
+  size_t buckets = g_safety_value_buckets * 4;
+  SafetyValue **table = (SafetyValue **)safety_map(buckets * sizeof(SafetyValue *));
+  if (!table) return;
+  for (size_t i = 0; i < g_safety_value_buckets; i++) {
+    SafetyValue *entry = g_safety_values[i];
+    while (entry) {
+      SafetyValue *next = entry->next;
+      size_t bucket = safety_value_line_bucket(entry->address >> SAFETY_VALUE_LINE_SHIFT, buckets);
+      entry->next = table[bucket];
+      table[bucket] = entry;
+      entry = next;
+    }
+  }
+  if (g_safety_values != g_safety_value_first_table)
+    safety_unmap(g_safety_values, g_safety_value_buckets * sizeof(SafetyValue *));
+  g_safety_values = table;
+  g_safety_value_buckets = buckets;
+}
+
+typedef int (*SafetyValueVisit)(SafetyValue **link, SafetyValue *entry, void *state);
+
+static void safety_values_visit_bucket(size_t bucket, uintptr_t address, uint64_t size,
+                                       uintptr_t line, int match_line,
+                                       SafetyValueVisit visit, void *state) {
+  SafetyValue **link = &g_safety_values[bucket];
+  while (*link) {
+    SafetyValue *entry = *link;
+    int wanted = entry->address >= address && entry->address - address < size &&
+                 (!match_line || entry->address >> SAFETY_VALUE_LINE_SHIFT == line);
+    if (!wanted || !visit(link, entry, state)) link = &entry->next;
+  }
+}
+
+static void safety_values_visit_range(uintptr_t address, uint64_t size,
+                                      SafetyValueVisit visit, void *state) {
+  if (!size || !g_safety_value_count) return;
+  uintptr_t last = size - 1 > UINTPTR_MAX - address ? UINTPTR_MAX : address + (uintptr_t)(size - 1);
+  uintptr_t first_line = address >> SAFETY_VALUE_LINE_SHIFT;
+  uintptr_t last_line = last >> SAFETY_VALUE_LINE_SHIFT;
+  if (last_line - first_line >= g_safety_value_buckets) {
+    for (size_t bucket = 0; bucket < g_safety_value_buckets; bucket++)
+      safety_values_visit_bucket(bucket, address, size, 0, 0, visit, state);
+    return;
+  }
+  for (uintptr_t line = first_line;; line++) {
+    size_t bucket = safety_value_line_bucket(line, g_safety_value_buckets);
+    safety_values_visit_bucket(bucket, address, size, line, 1, visit, state);
+    if (line == last_line) break;
+  }
 }
 
 static uint64_t safety_owner_identity(uintptr_t address) {
@@ -117,6 +180,8 @@ static int safety_value_set(uintptr_t address, uint64_t value, uint64_t identity
   SafetyValue *entry = safety_value_find(address);
   if (!entry) {
     if (!identity) return 1;
+    if (g_safety_value_count >= g_safety_value_buckets * SAFETY_VALUE_LOAD)
+      safety_values_grow();
     if (!g_safety_value_free) {
       size_t count = (4096 - sizeof(SafetyValueBlock)) / sizeof(SafetyValue);
       SafetyValueBlock *page = (SafetyValueBlock *)safety_map(4096);
@@ -174,20 +239,17 @@ void mettle_safety_value_store(void *slot, uint64_t value, uint64_t identity,
   if (!ok) safety_internal_failure("Fatal error: unable to allocate pointer safety metadata");
 }
 
+static int safety_value_visit_clear(SafetyValue **link, SafetyValue *entry, void *state) {
+  (void)state;
+  *link = entry->next;
+  entry->next = g_safety_value_free;
+  g_safety_value_free = entry;
+  g_safety_value_count--;
+  return 1;
+}
+
 static void safety_values_clear_locked(uintptr_t address, uint64_t size) {
-  if (!g_safety_value_count) return;
-  for (size_t bucket = 0; bucket < SAFETY_VALUE_BUCKETS; bucket++) {
-    SafetyValue **link = &g_safety_values[bucket];
-    while (*link) {
-      SafetyValue *entry = *link;
-      int overlaps = entry->address >= address && entry->address - address < size;
-      if (!overlaps) { link = &entry->next; continue; }
-      *link = entry->next;
-      entry->next = g_safety_value_free;
-      g_safety_value_free = entry;
-      g_safety_value_count--;
-    }
-  }
+  safety_values_visit_range(address, size, safety_value_visit_clear, NULL);
 }
 
 static void safety_values_reset_locked(void) {
@@ -196,22 +258,48 @@ static void safety_values_reset_locked(void) {
     g_safety_value_blocks = page->next;
     safety_unmap(page, 4096);
   }
-  for (size_t i = 0; i < SAFETY_VALUE_BUCKETS; i++) g_safety_values[i] = NULL;
+  if (g_safety_values != g_safety_value_first_table)
+    safety_unmap(g_safety_values, g_safety_value_buckets * sizeof(SafetyValue *));
+  g_safety_values = g_safety_value_first_table;
+  g_safety_value_buckets = SAFETY_VALUE_FIRST_BUCKETS;
+  for (size_t i = 0; i < SAFETY_VALUE_FIRST_BUCKETS; i++) g_safety_values[i] = NULL;
   g_safety_value_free = NULL;
   g_safety_value_count = 0;
+}
+
+typedef struct {
+  uint64_t old_identity;
+  uint64_t owner;
+} SafetyValueReown;
+
+static int safety_value_visit_reown(SafetyValue **link, SafetyValue *entry, void *state) {
+  (void)link;
+  SafetyValueReown *reown = (SafetyValueReown *)state;
+  if (entry->owner == reown->old_identity) entry->owner = reown->owner;
+  return 0;
 }
 
 static void safety_values_reown(void *pointer, uint64_t size, uint64_t old_identity) {
   safety_lock();
   uintptr_t address = (uintptr_t)pointer;
-  uint64_t owner = safety_owner_identity(address);
-  for (size_t bucket = 0; bucket < SAFETY_VALUE_BUCKETS; bucket++) {
-    for (SafetyValue *entry = g_safety_values[bucket]; entry; entry = entry->next) {
-      if (entry->owner == old_identity && entry->address >= address &&
-          entry->address - address < size) entry->owner = owner;
-    }
-  }
+  SafetyValueReown reown = {old_identity, safety_owner_identity(address)};
+  safety_values_visit_range(address, size, safety_value_visit_reown, &reown);
   safety_unlock();
+}
+
+typedef struct {
+  SafetyValue *copy;
+  size_t count;
+} SafetyValueCapture;
+
+static int safety_value_visit_capture(SafetyValue **link, SafetyValue *entry, void *state) {
+  (void)link;
+  SafetyValueCapture *capture = (SafetyValueCapture *)state;
+  if (entry->identity && entry->owner == safety_owner_identity(entry->address)) {
+    if (capture->copy) capture->copy[capture->count] = *entry;
+    capture->count++;
+  }
+  return 0;
 }
 
 void mettle_safety_value_copy(void *destination, const void *source, uint64_t size) {
@@ -220,27 +308,19 @@ void mettle_safety_value_copy(void *destination, const void *source, uint64_t si
   if (size - 1 > UINTPTR_MAX - dst || size - 1 > UINTPTR_MAX - src)
     safety_internal_failure("Fatal error: pointer metadata copy range overflow");
   safety_lock();
-  size_t count = 0;
-  for (size_t bucket = 0; bucket < SAFETY_VALUE_BUCKETS; bucket++) {
-    for (SafetyValue *entry = g_safety_values[bucket]; entry; entry = entry->next) {
-      if (entry->identity && entry->address >= src &&
-          entry->address - src < size &&
-          entry->owner == safety_owner_identity(entry->address)) count++;
-    }
-  }
-  SafetyValue *copy = count ? (SafetyValue *)safety_map(count * sizeof(*copy)) : NULL;
+  SafetyValueCapture capture = {NULL, 0};
+  safety_values_visit_range(src, size, safety_value_visit_capture, &capture);
+  size_t count = capture.count;
+  SafetyValue inline_copy[SAFETY_VALUE_COPY_INLINE];
+  SafetyValue *copy = !count ? NULL : count <= SAFETY_VALUE_COPY_INLINE ? inline_copy :
+      (SafetyValue *)safety_map(count * sizeof(*copy));
   if (count && !copy) {
     safety_unlock();
     safety_internal_failure("Fatal error: unable to copy pointer safety metadata");
   }
-  size_t next = 0;
-  for (size_t bucket = 0; bucket < SAFETY_VALUE_BUCKETS; bucket++) {
-    for (SafetyValue *entry = g_safety_values[bucket]; entry; entry = entry->next) {
-      if (entry->identity && entry->address >= src &&
-          entry->address - src < size &&
-          entry->owner == safety_owner_identity(entry->address)) copy[next++] = *entry;
-    }
-  }
+  capture.copy = copy;
+  capture.count = 0;
+  safety_values_visit_range(src, size, safety_value_visit_capture, &capture);
   safety_values_clear_locked(dst, size);
   int ok = 1;
   for (size_t i = 0; i < count; i++) {
@@ -250,7 +330,7 @@ void mettle_safety_value_copy(void *destination, const void *source, uint64_t si
     }
   }
   safety_unlock();
-  safety_unmap(copy, count * sizeof(*copy));
+  if (copy != inline_copy) safety_unmap(copy, count * sizeof(*copy));
   if (!ok) safety_internal_failure("Fatal error: unable to store copied pointer safety metadata");
 }
 

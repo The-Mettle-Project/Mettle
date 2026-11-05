@@ -1,8 +1,11 @@
 import "std/mem";
-import "std/alloc";
 
 fn arena_default_chunk_size() -> int64 {
   return (int64)65536;
+}
+
+fn arena_first_default_chunk() -> int64 {
+  return (int64)4048;
 }
 
 fn arena_default_alignment() -> int64 {
@@ -21,10 +24,10 @@ export struct Arena {
   head: ArenaChunk*;
   free_list: ArenaChunk*;
   chunk_size: int64;
+  next_chunk_cap: int64;
   next_chunk_id: int64;
   total_used: int64;
   total_cap: int64;
-  heap: MemHeap*;
 }
 
 export struct ArenaSave {
@@ -39,44 +42,27 @@ export struct ArenaStats {
   free_chunk_count: int32;
 }
 
-fn arena_chunk_bytes() -> int64 {
-  return (int64)40;
+fn arena_chunk_header() -> int64 {
+  return (int64)48;
 }
 
-fn arena_bytes() -> int64 {
-  return (int64)56;
-}
-
-fn arena_chunk_new(h: MemHeap*, cap: int64, id: int64) -> ArenaChunk* {
-  if (h == 0 || cap <= (int64)0) {
+fn arena_chunk_new(a: Arena*, cap: int64) -> ArenaChunk* {
+  if (cap <= (int64)0) {
     return 0;
   }
-  var raw: cstring = mem_calloc(h, (int64)1, arena_chunk_bytes());
+  var raw: cstring = malloc(arena_chunk_header() + cap);
   if (raw == 0) {
     return 0;
   }
   var ch: ArenaChunk* = (ArenaChunk*)raw;
-  ch->base = mem_alloc(h, cap);
-  if (ch->base == 0) {
-    mem_free(h, (cstring)ch);
-    return 0;
-  }
+  ch->base = raw + arena_chunk_header();
   ch->next = 0;
   ch->used = (int64)0;
   ch->cap = cap;
-  ch->id = id;
+  ch->id = a->next_chunk_id;
+  a->next_chunk_id = a->next_chunk_id + (int64)1;
+  a->total_cap = a->total_cap + cap;
   return ch;
-}
-
-fn arena_chunk_destroy(h: MemHeap*, ch: ArenaChunk*) {
-  if (ch == 0) {
-    return;
-  }
-  if (ch->base != 0) {
-    mem_free(h, ch->base);
-    ch->base = 0;
-  }
-  mem_free(h, (cstring)ch);
 }
 
 fn arena_pop_free_chunk(a: Arena*, min_cap: int64) -> ArenaChunk* {
@@ -112,23 +98,18 @@ fn arena_push_free_chunk(a: Arena*, ch: ArenaChunk*) {
 }
 
 export fn arena_init(default_chunk_size: int64) -> Arena* {
-  var heap: MemHeap* = mem_heap_create();
-  if (heap == 0) {
+  var a: Arena* = (Arena*)malloc(sizeof(Arena));
+  if (a == 0) {
     return 0;
   }
-  var raw: cstring = mem_calloc(heap, (int64)1, arena_bytes());
-  if (raw == 0) {
-    mem_heap_destroy(heap);
-    return 0;
-  }
-  var a: Arena* = (Arena*)raw;
-  a->heap = heap;
   a->head = 0;
   a->free_list = 0;
   if (default_chunk_size <= (int64)0) {
     a->chunk_size = arena_default_chunk_size();
+    a->next_chunk_cap = arena_first_default_chunk();
   } else {
     a->chunk_size = default_chunk_size;
+    a->next_chunk_cap = default_chunk_size;
   }
   a->next_chunk_id = (int64)1;
   a->total_used = (int64)0;
@@ -143,13 +124,23 @@ fn arena_align_up(value: int64, align: int64) -> int64 {
   return (value + (align - (int64)1)) & ~(align - (int64)1);
 }
 
-fn arena_install_chunk(a: Arena*, ch: ArenaChunk*) {
-  if (a == 0 || ch == 0) {
-    return;
+fn arena_next_chunk(a: Arena*, need: int64) -> ArenaChunk* {
+  var ch: ArenaChunk* = arena_pop_free_chunk(a, need);
+  if (ch != 0) {
+    return ch;
   }
-  ch->next = a->head;
-  a->head = ch;
-  a->total_cap = a->total_cap + ch->cap;
+  var cap: int64 = a->next_chunk_cap;
+  if (cap < need) {
+    cap = need;
+  }
+  ch = arena_chunk_new(a, cap);
+  if (ch != 0 && a->next_chunk_cap < a->chunk_size) {
+    a->next_chunk_cap = a->next_chunk_cap * (int64)2;
+    if (a->next_chunk_cap > a->chunk_size) {
+      a->next_chunk_cap = a->chunk_size;
+    }
+  }
+  return ch;
 }
 
 export fn arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> rawptr {
@@ -162,54 +153,30 @@ export fn arena_alloc_aligned(a: Arena*, n: int64, align: int64) -> rawptr {
     effective_align = arena_default_alignment();
   }
 
-  if (n > a->chunk_size) {
-    var dedicated_cap: int64 = n + effective_align;
-    var dedicated: ArenaChunk* = arena_chunk_new(a->heap, dedicated_cap, a->next_chunk_id);
-    if (dedicated == 0) {
-      return 0;
-    }
-    a->next_chunk_id = a->next_chunk_id + (int64)1;
-    var d_base: int64 = (int64)dedicated->base;
-    var d_aligned: int64 = arena_align_up(d_base, effective_align);
-    var d_off: int64 = d_aligned - d_base;
-    dedicated->used = d_off + n;
-    a->total_used = a->total_used + dedicated->used;
-    arena_install_chunk(a, dedicated);
-    return (cstring)d_aligned;
-  }
-
   if (a->head != 0) {
     var base_addr: int64 = (int64)a->head->base;
     var raw_pos: int64 = base_addr + a->head->used;
     var aligned_pos: int64 = arena_align_up(raw_pos, effective_align);
     var new_used: int64 = (aligned_pos - base_addr) + n;
     if (new_used <= a->head->cap) {
-      var delta: int64 = new_used - a->head->used;
+      a->total_used = a->total_used + (new_used - a->head->used);
       a->head->used = new_used;
-      a->total_used = a->total_used + delta;
-      return (cstring)aligned_pos;
+      return a->head->base + (aligned_pos - base_addr);
     }
   }
 
-  var reused: ArenaChunk* = arena_pop_free_chunk(a, a->chunk_size);
-  if (reused != 0) {
-    arena_install_chunk(a, reused);
-  } else {
-    var fresh: ArenaChunk* = arena_chunk_new(a->heap, a->chunk_size, a->next_chunk_id);
-    if (fresh == 0) {
-      return 0;
-    }
-    a->next_chunk_id = a->next_chunk_id + (int64)1;
-    arena_install_chunk(a, fresh);
+  var ch: ArenaChunk* = arena_next_chunk(a, n + effective_align);
+  if (ch == 0) {
+    return 0;
   }
+  ch->next = a->head;
+  a->head = ch;
 
-  var base2: int64 = (int64)a->head->base;
-  var raw2: int64 = base2 + a->head->used;
-  var aligned2: int64 = arena_align_up(raw2, effective_align);
-  var new_used2: int64 = (aligned2 - base2) + n;
-  a->head->used = new_used2;
-  a->total_used = a->total_used + new_used2;
-  return (cstring)aligned2;
+  var base2: int64 = (int64)ch->base;
+  var aligned2: int64 = arena_align_up(base2, effective_align);
+  ch->used = (aligned2 - base2) + n;
+  a->total_used = a->total_used + ch->used;
+  return ch->base + (aligned2 - base2);
 }
 
 export fn arena_alloc(a: Arena*, n: int64) -> rawptr {
@@ -273,18 +240,17 @@ export fn arena_free(a: Arena*) {
   if (a == 0) {
     return;
   }
-  var heap: MemHeap* = a->heap;
   while (a->head != 0) {
     var next_active: ArenaChunk* = a->head->next;
-    arena_chunk_destroy(heap, a->head);
+    free(a->head);
     a->head = next_active;
   }
   while (a->free_list != 0) {
     var next_free: ArenaChunk* = a->free_list->next;
-    arena_chunk_destroy(heap, a->free_list);
+    free(a->free_list);
     a->free_list = next_free;
   }
-  mem_heap_destroy(heap);
+  free(a);
 }
 
 export fn arena_stats(a: Arena*) -> ArenaStats {

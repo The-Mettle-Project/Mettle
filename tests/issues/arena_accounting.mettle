@@ -1,0 +1,28 @@
+import "std/io";
+import "std/arena";
+
+fn main() -> int32 {
+  var a: Arena* = arena_init(64);
+  var p: int64 = (int64)arena_alloc_aligned(a, 64, 4096);
+  var q: int64 = (int64)arena_alloc_aligned(a, 8, 4096);
+  println("{p & 4095} {q & 4095} {q - p >= 64 || p - q >= 8}");
+  arena_reset(a);
+  var cap: int64 = arena_stats(a).total_cap;
+  arena_alloc(a, 32);
+  arena_reset(a);
+  arena_alloc(a, 32);
+  println("{arena_stats(a).total_cap == cap} {arena_stats(a).total_used}");
+  arena_free(a);
+
+  var d: Arena* = arena_init(0);
+  var first: uint8* = arena_alloc(d, 16);
+  first[0] = 7;
+  var big: uint8* = arena_alloc(d, 40000);
+  big[39999] = 9;
+  var huge: uint8* = arena_alloc(d, 200000);
+  huge[199999] = 11;
+  var s: ArenaStats = arena_stats(d);
+  println("{first[0]} {big[39999]} {huge[199999]} {s.chunk_count} {s.total_used >= 240016}");
+  arena_free(d);
+  return 0;
+}

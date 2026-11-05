@@ -1,0 +1,43 @@
+import "std/io";
+
+var g_sink: int64 = 0;
+
+@noinline fn touch(a: int64) -> int64 {
+  g_sink = g_sink + a;
+  return g_sink;
+}
+
+@noinline fn classify(n: int64, c: int32, d: int32, e: int32) -> int32 {
+  var a0: int64 = touch(n + 1);
+  var a1: int64 = touch(n + 2);
+  var a2: int64 = touch(n + 3);
+  var a3: int64 = touch(n + 4);
+  var a4: int64 = touch(n + 5);
+  var a5: int64 = touch(n + 6);
+  var a6: int64 = touch(n + 7);
+  var a7: int64 = touch(n + 8);
+  var a8: int64 = touch(n + 9);
+  var a9: int64 = touch(n + 10);
+  var hit: int32 = 0;
+  if (c == 37 || c == 16 || c == 41 || c == 9 || c == 35 || c == 44 || c == 45 || c == 11 || c == 42) {
+    hit = 1;
+  }
+  if (d == 3 || d == 17 || d == 33 || d == 34 || d == 61) {
+    hit = hit + 2;
+  }
+  if (e == 7 || e == 8 || e == 40 || e == 50) {
+    hit = hit + 4;
+  }
+  var sum: int64 = a0 + a1 * 3 + a2 * 5 + a3 * 7 + a4 * 11 + a5 * 13 + a6 * 17 + a7 * 19 + a8 * 23 + a9 * 29;
+  return hit + (int32)(touch(sum) & 0);
+}
+
+fn main() -> int32 {
+  var s: int64 = 0;
+  for i: int32 in -3..70 {
+    s = s * 5 + (int64)classify((int64)i, i, 70 - i, i + 5);
+    s = s ^ (s >> 13);
+  }
+  println("{s}");
+  return 0;
+}

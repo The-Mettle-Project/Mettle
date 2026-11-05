@@ -1101,11 +1101,18 @@ static void mir_test_drop_dead_constants(MirFunction *fn, MirVregId v) {
   if (!mir_cfg_build(&cfg, fn)) {
     return;
   }
+  size_t defs = 0;
+  int read = 0;
   for (size_t i = 0; i < fn->insn_count; i++) {
+    defs += mir_cfg_insn_def(&fn->insns[i]) == v;
+    read |= mir_inst_reads(&fn->insns[i], v);
+  }
+  for (size_t i = 0; i < fn->insn_count && (defs > 1 || !read); i++) {
     MirInst *in = &fn->insns[i];
     if (in->op == MIR_MOV && in->dst.kind == MIR_OPK_VREG && in->dst.vreg == v &&
         in->a.kind == MIR_OPK_IMM && mir_def_is_dead(fn, &cfg, i, v)) {
       mir_make_nop(in);
+      defs--;
     }
   }
   mir_cfg_free(&cfg);

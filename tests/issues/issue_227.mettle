@@ -1,0 +1,13 @@
+import "std/io";
+import "std/mem";
+
+fn copy_of(name: string) -> cstring {
+  return cstr(name, &malloc);
+}
+
+fn main() -> int32 {
+  var fixed: cstring = cstr("abc", &malloc);
+  var made: cstring = copy_of("x{1 + 1}y");
+  println("{(int32)fixed[1]} {(int32)made[1]}");
+  return 0;
+}

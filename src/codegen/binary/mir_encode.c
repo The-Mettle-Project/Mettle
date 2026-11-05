@@ -4331,8 +4331,11 @@ static int mir_encode_compare_branch(MirEncodeState *st, const MirInst *in) {
   int ok;
 
   if (in->op == MIR_BT) {
-    BinaryGpRegister base = (BinaryGpRegister)fn->vregs[in->a.vreg].phys;
-    BinaryGpRegister offset = (BinaryGpRegister)fn->vregs[in->b.vreg].phys;
+    BinaryGpRegister base = value_reg(fn, &in->a, SCRATCH_A, &rok);
+    BinaryGpRegister offset = rok ? value_reg(fn, &in->b, SCRATCH_B, &rok) : SCRATCH_B;
+    if (!rok) {
+      return 0;
+    }
     if (!binary_emit_bt_reg_reg(&fn->context->code, base, offset)) {
       return enc_err(fn, "out of memory in bit test");
     }

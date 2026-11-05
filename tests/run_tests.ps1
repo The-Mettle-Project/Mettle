@@ -21707,7 +21707,14 @@ $issueRegressions = @(
   @{ Name = "issue_global_uncached_across_calls_release"; Entry = "tests/issues/issue_179.mettle"; Args = @("--release"); Expect = @("51 -280 6.75 28", "42 29 105 206", "24 1 3003 32", "2 3 4 3.75 3.0 5 12 6 13") },
   @{ Name = "issue_profile_blocks_skips_naked";Entry = "tests/issues/issue_162.mettle"; Args = @("--profile-blocks"); Expect = @("7") },
   @{ Name = "issue_volatile_loops_release"; Entry = "tests/issues/issue_170.mettle"; Args = @("--release"); Expect = @("8498579009051162534", "130 547 111", "33 8 2", "true 163 5 10", "1 1 28 4", "3 0 8", "20.0 9.0 9") },
-  @{ Name = "issue_volatile_loops_debug"; Entry = "tests/issues/issue_170.mettle"; Args = @(); Expect = @("8498579009051162534", "130 547 111", "33 8 2", "true 163 5 10", "1 1 28 4", "3 0 8", "20.0 9.0 9") }
+  @{ Name = "issue_volatile_loops_debug"; Entry = "tests/issues/issue_170.mettle"; Args = @(); Expect = @("8498579009051162534", "130 547 111", "33 8 2", "true 163 5 10", "1 1 28 4", "3 0 8", "20.0 9.0 9") },
+  @{ Name = "issue_cstr_at_run_time"; Entry = "tests/issues/issue_227.mettle"; Args = @(); Expect = @("98 50") },
+  @{ Name = "issue_cstr_at_run_time_aarch64"; Command = @("--target", "aarch64-linux", "--emit-obj", "tests/issues/issue_227.mettle", "-o", ".tmp/issue_227.o"); Expect = @(""); Refuse = @("never bound", "no body") },
+  @{ Name = "arena_accounting"; Entry = "tests/issues/arena_accounting.mettle"; Args = @(); Expect = @("0 0 true", "true 32", "7 9 11 3 true") },
+  @{ Name = "arena_accounting_release"; Entry = "tests/issues/arena_accounting.mettle"; Args = @("--release"); Expect = @("0 0 true", "true 32", "7 9 11 3 true") },
+  @{ Name = "arena_accounting_safe"; Entry = "tests/issues/arena_accounting.mettle"; Args = @("--safe"); Expect = @("0 0 true", "true 32", "7 9 11 3 true") },
+  @{ Name = "spilled_bit_test_count"; Entry = "tests/issues/spilled_bit_test.mettle"; Args = @("--release"); Expect = @("7525625126660281377") },
+  @{ Name = "spilled_bit_test_count_safe"; Entry = "tests/issues/spilled_bit_test.mettle"; Args = @("--safe", "--release"); Expect = @("7525625126660281377") }
 )
 foreach ($case in $issueRegressions) {
   $total++

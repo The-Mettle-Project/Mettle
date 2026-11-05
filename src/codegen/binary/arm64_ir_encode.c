@@ -3971,8 +3971,7 @@ int arm64_ir_write_object(const IRProgram *prog, const char *path, char *error,
     const IRModuleSymbol *symbol =
         module_function(prog, function ? function->name : NULL);
     if (!function || function->is_kernel ||
-        (symbol && (symbol->is_extern || !symbol->has_body)) ||
-        strcmp(function->name, "cstr") == 0) {
+        (symbol && (symbol->is_extern || !symbol->has_body))) {
       continue;
     }
     size_t start = arm64_here(&code);
@@ -3988,6 +3987,12 @@ int arm64_ir_write_object(const IRProgram *prog, const char *path, char *error,
             start, arm64_here(&code) - start)) {
       arm64_fail(&code, "could not define the symbol for '%s'", link_name);
       break;
+    }
+  }
+  for (int i = 0; !code.error && i < functions.count; i++) {
+    if (!code.label_bound[functions.ids[i]]) {
+      arm64_fail(&code, "a call targets '%s', which this object has no body for",
+                 functions.names[i]);
     }
   }
   if (code.error || !arm64_emit_finalize(&code)) {
