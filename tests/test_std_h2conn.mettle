@@ -1,0 +1,1310 @@
+// std/h2conn: a client and a server connection driven against each other in
+// memory, then a client and server over loopback sockets.
+import "std/h2conn";
+import "std/socket";
+import "std/thread";
+import "std/arena";
+import "std/io";
+
+const REC_MAX = 1024;
+const HTEXT_MAX = 262144;
+const DBUF_MAX = 600000;
+
+const FLAG_NEW = 1;
+const FLAG_PEER = 2;
+const FLAG_UNPROC = 4;
+
+struct Rec {
+  kind: int32;
+  id: int32;
+  end: bool;
+  flags: int32;
+  len: int64;
+  code: int64;
+  count: int64;
+  last: int32;
+  hoff: int64;
+  hlen: int64;
+  hcount: int64;
+  doff: int64;
+  user: rawptr;
+  ping0: int64;
+  rtt: int64;
+  window: int64;
+}
+
+// One end of a connection with a log of everything its events reported.
+struct Side {
+  c: H2c*;
+  rec: Rec*;
+  n: int64;
+  htext: uint8*;
+  hlen: int64;
+  dbuf: uint8*;
+  dlen: int64;
+}
+
+var g_c: Side;
+var g_s: Side;
+var g_step: int64 = 0;
+
+fn side_clear(s: Side*) {
+  s->n = 0;
+  s->hlen = 0;
+  s->dlen = 0;
+}
+
+fn side_init(s: Side*, c: H2c*) {
+  if (s->rec == (Rec*)0) {
+    s->rec = (Rec*)malloc(REC_MAX * (int64)sizeof(Rec));
+    s->htext = (uint8*)malloc(HTEXT_MAX);
+    s->dbuf = (uint8*)malloc(DBUF_MAX);
+  }
+  s->c = c;
+  side_clear(s);
+}
+
+fn put_str(s: Side*, v: string) {
+  if (s->hlen + (int64)v.length + 1 > HTEXT_MAX) { return; }
+  for i in 0..(int64)v.length { s->htext[s->hlen + i] = v.chars[i]; }
+  s->htext[s->hlen + (int64)v.length] = (uint8)0;
+  s->hlen = s->hlen + (int64)v.length + 1;
+}
+
+// Drains every event into the log. Returns how many there were.
+fn side_drain(s: Side*) -> int64 {
+  var ev: H2cEvent;
+  var got: int64 = 0;
+  while (true) {
+    var k: int32 = h2c_next_event(s->c, &ev);
+    if (k == 0) { break; }
+    got = got + 1;
+    if (s->n >= REC_MAX) { continue; }
+    var r: Rec* = &s->rec[s->n];
+    s->n = s->n + 1;
+    var blank: Rec;
+    *r = blank;
+    r->kind = k;
+    r->id = ev.stream_id;
+    r->end = ev.end_stream;
+    if (ev.new_stream) { r->flags = r->flags | FLAG_NEW; }
+    if (ev.by_peer) { r->flags = r->flags | FLAG_PEER; }
+    if (ev.unprocessed) { r->flags = r->flags | FLAG_UNPROC; }
+    r->len = ev.length;
+    r->code = ev.error_code;
+    r->count = ev.count;
+    r->last = ev.last_stream_id;
+    r->user = ev.user;
+    r->rtt = ev.rtt_ms;
+    r->window = ev.window;
+    for i in 0..8 { r->ping0 = r->ping0 * 256 + (int64)ev.ping[i]; }
+    if (k == H2C_EV_HEADERS || k == H2C_EV_TRAILERS) {
+      r->hoff = s->hlen;
+      r->hcount = ev.header_count;
+      for i in 0..ev.header_count {
+        put_str(s, ev.headers[i].name);
+        put_str(s, ev.headers[i].value);
+      }
+      r->hlen = s->hlen - r->hoff;
+    }
+    if (k == H2C_EV_DATA && ev.length > 0 && s->dlen + ev.length <= DBUF_MAX) {
+      r->doff = s->dlen;
+      for i in 0..ev.length { s->dbuf[s->dlen + i] = ev.data[i]; }
+      s->dlen = s->dlen + ev.length;
+    }
+  }
+  return got;
+}
+
+fn rec_count(s: Side*, kind: int32) -> int64 {
+  var n: int64 = 0;
+  for i in 0..s->n {
+    if (s->rec[i].kind == kind) { n = n + 1; }
+  }
+  return n;
+}
+
+// Index of the first record of this kind for this stream (id 0 matches any), or -1.
+fn rec_find(s: Side*, kind: int32, id: int32) -> int64 {
+  for i in 0..s->n {
+    if (s->rec[i].kind == kind && (id == 0 || s->rec[i].id == id)) { return i; }
+  }
+  return -1;
+}
+
+// The value of a header in a HEADERS or TRAILERS record.
+fn rec_hdr(s: Side*, idx: int64, name: string, out: string*) -> bool {
+  if (idx < 0) { return false; }
+  var at: int64 = s->rec[idx].hoff;
+  var stop: int64 = at + s->rec[idx].hlen;
+  while (at < stop) {
+    var nm: string;
+    nm.chars = s->htext + at;
+    nm.length = 0;
+    while (s->htext[at + (int64)nm.length] != (uint8)0) { nm.length = nm.length + 1; }
+    at = at + (int64)nm.length + 1;
+    var v: string;
+    v.chars = s->htext + at;
+    v.length = 0;
+    while (s->htext[at + (int64)v.length] != (uint8)0) { v.length = v.length + 1; }
+    at = at + (int64)v.length + 1;
+    if (nm == name) {
+      *out = v;
+      return true;
+    }
+  }
+  return false;
+}
+
+fn hdr_is(s: Side*, idx: int64, name: string, want: string) -> bool {
+  var v: string;
+  if (!rec_hdr(s, idx, name, &v)) { return false; }
+  return v == want;
+}
+
+// Moves one side's queued output into the other, draining the receiver so its
+// input buffer never fills. Returns the bytes moved.
+fn xfer(from: Side*, to: Side*) -> int64 {
+  var moved: int64 = 0;
+  while (true) {
+    var p: uint8* = (uint8*)0;
+    var n: int64 = h2c_pending_output(from->c, &p);
+    if (n == 0) { break; }
+    if (g_step > 0 && n > g_step) { n = g_step; }
+    var k: int64 = h2c_feed(to->c, p, n);
+    if (k < 0) { k = n; }
+    h2c_output_consumed(from->c, k);
+    moved = moved + k;
+    side_drain(to);
+    if (k == 0) { break; }
+  }
+  return moved;
+}
+
+// Runs both directions until nothing more moves.
+fn settle() {
+  for round in 0..200 {
+    var m: int64 = xfer(&g_c, &g_s) + xfer(&g_s, &g_c);
+    var e: int64 = side_drain(&g_c) + side_drain(&g_s);
+    if (m == 0 && e == 0) { break; }
+  }
+}
+
+fn pair_new(cc: H2cConfig*, sc: H2cConfig*) {
+  side_init(&g_c, h2c_new(false, cc));
+  side_init(&g_s, h2c_new(true, sc));
+}
+
+fn pair_free() {
+  h2c_free(g_c.c);
+  h2c_free(g_s.c);
+}
+
+// A connected pair with the SETTINGS exchange done and the logs cleared.
+fn pair_up(cc: H2cConfig*, sc: H2cConfig*) {
+  pair_new(cc, sc);
+  settle();
+  side_clear(&g_c);
+  side_clear(&g_s);
+}
+
+fn cfg_default() -> H2cConfig {
+  var c: H2cConfig;
+  h2c_config_default(&c);
+  return c;
+}
+
+// ---- Frame scanning helpers -----------------------------------------------------
+
+fn scan_count(p: uint8*, n: int64, type: int32) -> int64 {
+  var at: int64 = 0;
+  var cnt: int64 = 0;
+  while (at + 9 <= n) {
+    var h: H2FrameHeader = h2_frame_header_read(p + at);
+    if (h.type == type) { cnt = cnt + 1; }
+    at = at + 9 + h.length;
+  }
+  return cnt;
+}
+
+fn scan_max_len(p: uint8*, n: int64, type: int32) -> int64 {
+  var at: int64 = 0;
+  var best: int64 = 0;
+  while (at + 9 <= n) {
+    var h: H2FrameHeader = h2_frame_header_read(p + at);
+    if (h.type == type && h.length > best) { best = h.length; }
+    at = at + 9 + h.length;
+  }
+  return best;
+}
+
+// The error code of the first RST_STREAM or GOAWAY in the output, or -1.
+fn scan_code(p: uint8*, n: int64, type: int32) -> int64 {
+  var at: int64 = 0;
+  while (at + 9 <= n) {
+    var h: H2FrameHeader = h2_frame_header_read(p + at);
+    if (h.type == type) {
+      if (type == H2_FRAME_GOAWAY) { return ((int64)p[at + 9 + 4] << 24) | ((int64)p[at + 9 + 5] << 16) | ((int64)p[at + 9 + 6] << 8) | (int64)p[at + 9 + 7]; }
+      return ((int64)p[at + 9] << 24) | ((int64)p[at + 9 + 1] << 16) | ((int64)p[at + 9 + 2] << 8) | (int64)p[at + 9 + 3];
+    }
+    at = at + 9 + h.length;
+  }
+  return -1;
+}
+
+fn out_count(s: Side*, type: int32) -> int64 {
+  var p: uint8* = (uint8*)0;
+  var n: int64 = h2c_pending_output(s->c, &p);
+  return scan_count(p, n, type);
+}
+
+fn out_code(s: Side*, type: int32) -> int64 {
+  var p: uint8* = (uint8*)0;
+  var n: int64 = h2c_pending_output(s->c, &p);
+  return scan_code(p, n, type);
+}
+
+fn out_drop(s: Side*) {
+  var p: uint8* = (uint8*)0;
+  var n: int64 = h2c_pending_output(s->c, &p);
+  h2c_output_consumed(s->c, n);
+}
+
+// ---- Header lists and payloads --------------------------------------------------
+
+fn hl(h: HpackHeader*, i: int32, name: string, value: string) {
+  h[i].name = name;
+  h[i].value = value;
+  h[i].never_index = false;
+}
+
+fn req_headers(h: HpackHeader*) -> int64 {
+  hl(h, 0, ":method", "POST");
+  hl(h, 1, ":scheme", "http");
+  hl(h, 2, ":path", "/svc/Method");
+  hl(h, 3, ":authority", "localhost");
+  hl(h, 4, "content-type", "application/grpc");
+  hl(h, 5, "te", "trailers");
+  return 6;
+}
+
+fn resp_headers(h: HpackHeader*) -> int64 {
+  hl(h, 0, ":status", "200");
+  hl(h, 1, "content-type", "application/grpc");
+  return 2;
+}
+
+fn trailer_headers(h: HpackHeader*) -> int64 {
+  hl(h, 0, "grpc-status", "0");
+  hl(h, 1, "grpc-message", "ok");
+  return 2;
+}
+
+fn fill_pattern(b: uint8*, n: int64) {
+  for i in 0..n { b[i] = (uint8)((i * 7 + i / 251) & 255); }
+}
+
+fn pattern_ok(b: uint8*, n: int64) -> bool {
+  for i in 0..n {
+    if ((int32)b[i] != (int32)((i * 7 + i / 251) & 255)) { return false; }
+  }
+  return true;
+}
+
+fn str_bytes(s: string) -> uint8* {
+  return s.chars;
+}
+
+// ---- Tests ------------------------------------------------------------------------
+
+fn t_handshake() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  sc.max_concurrent_streams = 77;
+  sc.initial_window = 100000;
+  sc.conn_window = 200000;
+  sc.max_frame_size = 32768;
+  sc.max_header_list_size = 20000;
+  pair_new(&cc, &sc);
+  // The client sends the preface and SETTINGS; the server SETTINGS.
+  var p: uint8* = (uint8*)0;
+  var n: int64 = h2c_pending_output(g_c.c, &p);
+  if (n < 24 + 9) { return 101; }
+  if (!(p[0] == (uint8)80 && p[1] == (uint8)82)) { return 102; }
+  settle();
+  if (rec_count(&g_c, H2C_EV_SETTINGS) != 1 || rec_count(&g_s, H2C_EV_SETTINGS) != 1) { return 103; }
+  if (rec_count(&g_c, H2C_EV_SETTINGS_ACK) != 1 || rec_count(&g_s, H2C_EV_SETTINGS_ACK) != 1) { return 104; }
+  var ps: H2Settings* = h2c_peer_settings(g_c.c);
+  if (ps->max_concurrent_streams != 77 || ps->initial_window_size != 100000) { return 105; }
+  if (ps->max_frame_size != 32768 || ps->max_header_list_size != 20000) { return 106; }
+  if (h2c_peer_settings(g_s.c)->enable_push != 0) { return 107; }
+  if (h2c_stream_slots(g_c.c) != 77) { return 108; }
+  if (h2c_stream_slots(g_s.c) != 0) { return 109; }
+  if (h2c_is_dead(g_c.c) || h2c_is_dead(g_s.c)) { return 110; }
+  pair_free();
+  return 0;
+}
+
+fn t_unary() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  var id: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  if (id != 1) { return 201; }
+  if (h2c_send_data(g_c.c, id, str_bytes("hello"), 5, true) != 5) { return 202; }
+  settle();
+  var hi: int64 = rec_find(&g_s, H2C_EV_HEADERS, 1);
+  if (hi < 0 || (g_s.rec[hi].flags & FLAG_NEW) == 0 || g_s.rec[hi].end) { return 203; }
+  if (!hdr_is(&g_s, hi, ":path", "/svc/Method") || !hdr_is(&g_s, hi, "te", "trailers")) { return 204; }
+  if (!hdr_is(&g_s, hi, "content-type", "application/grpc") || !hdr_is(&g_s, hi, ":authority", "localhost")) { return 205; }
+  var di: int64 = rec_find(&g_s, H2C_EV_DATA, 1);
+  if (di < 0 || g_s.rec[di].len != 5 || !g_s.rec[di].end || g_s.dlen != 5) { return 206; }
+  if (g_s.dbuf[0] != (uint8)104 || g_s.dbuf[4] != (uint8)111) { return 207; }
+
+  // Bad response headers are refused and change nothing.
+  var rs: HpackHeader[8];
+  hl(&rs[0], 0, ":status", "200");
+  hl(&rs[0], 1, "Content-Type", "x");
+  if (h2c_send_headers(g_s.c, 1, &rs[0], 2, false) != H2C_ERR_BAD_HEADER) { return 208; }
+  hl(&rs[0], 1, "connection", "close");
+  if (h2c_send_headers(g_s.c, 1, &rs[0], 2, false) != H2C_ERR_BAD_HEADER) { return 209; }
+  hl(&rs[0], 1, "te", "gzip");
+  if (h2c_send_headers(g_s.c, 1, &rs[0], 2, false) != H2C_ERR_BAD_HEADER) { return 210; }
+  if (h2c_send_headers(g_s.c, 1, &rs[0], 0, false) != H2C_ERR_BAD_HEADER) { return 211; }
+  if (h2c_send_data(g_s.c, 1, str_bytes("x"), 1, false) != H2C_ERR_STATE) { return 212; }
+
+  var nrs: int64 = resp_headers(&rs[0]);
+  if (h2c_send_headers(g_s.c, 1, &rs[0], nrs, false) != 0) { return 213; }
+  if (h2c_send_headers(g_s.c, 1, &rs[0], nrs, false) != 0) {
+    // A second block is trailers, and trailers may not hold pseudo-headers.
+  } else {
+    return 214;
+  }
+  if (h2c_send_data(g_s.c, 1, str_bytes("world"), 5, false) != 5) { return 215; }
+  var tr: HpackHeader[4];
+  var ntr: int64 = trailer_headers(&tr[0]);
+  if (h2c_send_headers(g_s.c, 1, &tr[0], ntr, false) != 0) { return 216; }
+  if (h2c_send_data(g_s.c, 1, str_bytes("late"), 4, false) >= 0) { return 217; }
+  settle();
+  var ch: int64 = rec_find(&g_c, H2C_EV_HEADERS, 1);
+  if (ch < 0 || g_c.rec[ch].end || (g_c.rec[ch].flags & FLAG_NEW) != 0) { return 218; }
+  if (!hdr_is(&g_c, ch, ":status", "200")) { return 219; }
+  var cd: int64 = rec_find(&g_c, H2C_EV_DATA, 1);
+  if (cd < 0 || g_c.rec[cd].len != 5 || g_c.rec[cd].end || g_c.dbuf[0] != (uint8)119) { return 220; }
+  var ct: int64 = rec_find(&g_c, H2C_EV_TRAILERS, 1);
+  if (ct < 0 || !g_c.rec[ct].end || !hdr_is(&g_c, ct, "grpc-status", "0") || !hdr_is(&g_c, ct, "grpc-message", "ok")) { return 221; }
+  if (ch > cd || cd > ct) { return 222; }
+  if (rec_count(&g_c, H2C_EV_SLOT_FREE) != 1 || rec_count(&g_s, H2C_EV_SLOT_FREE) != 1) { return 223; }
+  if (h2c_open_count(g_c.c) != 0 || h2c_open_count(g_s.c) != 0) { return 224; }
+  if (h2c_send_data(g_c.c, 1, str_bytes("x"), 1, false) != H2C_ERR_NO_STREAM) { return 225; }
+  pair_free();
+  return 0;
+}
+
+fn t_trailers_only() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  // A request with no body ends the stream with its HEADERS.
+  var id: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, true);
+  settle();
+  var hi: int64 = rec_find(&g_s, H2C_EV_HEADERS, id);
+  if (hi < 0 || !g_s.rec[hi].end) { return 301; }
+  if (rec_count(&g_s, H2C_EV_DATA) != 0) { return 302; }
+  // One HEADERS frame with END_STREAM answers it.
+  var rs: HpackHeader[4];
+  hl(&rs[0], 0, ":status", "200");
+  hl(&rs[0], 1, "grpc-status", "12");
+  hl(&rs[0], 2, "grpc-message", "unimplemented");
+  if (h2c_send_headers(g_s.c, id, &rs[0], 3, true) != 0) { return 303; }
+  if (out_count(&g_s, H2_FRAME_HEADERS) != 1) { return 304; }
+  settle();
+  var ch: int64 = rec_find(&g_c, H2C_EV_HEADERS, id);
+  if (ch < 0 || !g_c.rec[ch].end || !hdr_is(&g_c, ch, "grpc-status", "12")) { return 305; }
+  if (rec_count(&g_c, H2C_EV_TRAILERS) != 0 || rec_count(&g_c, H2C_EV_DATA) != 0) { return 306; }
+  if (h2c_open_count(g_c.c) != 0 || h2c_open_count(g_s.c) != 0) { return 307; }
+  pair_free();
+  return 0;
+}
+
+fn t_flow_control() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  var id: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var big: uint8* = (uint8*)malloc(100000);
+  fill_pattern(big, 100000);
+  // The window holds 65535 bytes; the call takes that much and stops.
+  var k: int64 = h2c_send_data(g_c.c, id, big, 100000, true);
+  if (k != 65535) { return 401; }
+  if (h2c_stream_writable(g_c.c, id) != 0) { return 402; }
+  var sent: int64 = k;
+  for round in 0..100 {
+    settle();
+    if (sent >= 100000) { break; }
+    var w: int64 = h2c_send_data(g_c.c, id, big + sent, 100000 - sent, true);
+    if (w < 0) { return 403; }
+    sent = sent + w;
+  }
+  settle();
+  if (sent != 100000) { return 404; }
+  if (rec_count(&g_c, H2C_EV_WRITABLE) < 1) { return 405; }
+  if (g_s.dlen != 100000 || !pattern_ok(g_s.dbuf, 100000)) { return 406; }
+  var last: int64 = g_s.n - 1;
+  while (last >= 0 && g_s.rec[last].kind != H2C_EV_DATA) { last = last - 1; }
+  if (last < 0 || !g_s.rec[last].end) { return 407; }
+  free(big);
+  pair_free();
+  return 0;
+}
+
+fn t_manual_flow() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  sc.manual_flow = true;
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  var a: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var b: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var buf: uint8* = (uint8*)malloc(70000);
+  fill_pattern(buf, 70000);
+  if (h2c_send_data(g_c.c, a, buf, 65535, false) != 65535) { return 411; }
+  settle();
+  if (g_s.dlen != 65535) { return 412; }
+  // The server has not consumed anything, so the connection window is empty:
+  // neither stream can send, though stream b has a full window of its own.
+  if (h2c_send_data(g_c.c, a, buf, 1000, false) != 0) { return 413; }
+  if (h2c_send_data(g_c.c, b, buf, 1000, false) != 0) { return 414; }
+  settle();
+  if (rec_count(&g_c, H2C_EV_WRITABLE) != 0) { return 415; }
+  // Consuming the bytes sends WINDOW_UPDATE for the stream and the connection.
+  h2c_consumed(g_s.c, a, 65535);
+  settle();
+  if (rec_count(&g_c, H2C_EV_WRITABLE) != 2) { return 416; }
+  if (h2c_send_data(g_c.c, a, buf, 1000, false) != 1000) { return 417; }
+  if (h2c_send_data(g_c.c, b, buf, 1000, false) != 1000) { return 418; }
+  settle();
+  // A reset stream's bytes still go back to the connection window.
+  h2c_reset_stream(g_s.c, a, H2_CANCEL);
+  h2c_consumed(g_s.c, a, 1000);
+  h2c_consumed(g_s.c, b, 1000);
+  settle();
+  free(buf);
+  pair_free();
+  return 0;
+}
+
+fn t_output_backpressure() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  cc.max_output = 65536;
+  var sc: H2cConfig = cfg_default();
+  sc.initial_window = 1048576;
+  sc.conn_window = 1048576;
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  var id: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var big: uint8* = (uint8*)malloc(200000);
+  fill_pattern(big, 200000);
+  var k: int64 = h2c_send_data(g_c.c, id, big, 200000, true);
+  if (k <= 0 || k >= 200000) { return 421; }
+  var sent: int64 = k;
+  var pend: uint8* = (uint8*)0;
+  if (h2c_pending_output(g_c.c, &pend) > 65536) { return 422; }
+  for round in 0..100 {
+    settle();
+    if (sent >= 200000) { break; }
+    var w: int64 = h2c_send_data(g_c.c, id, big + sent, 200000 - sent, true);
+    if (w < 0) { return 423; }
+    sent = sent + w;
+  }
+  if (sent != 200000 || g_s.dlen != 200000 || !pattern_ok(g_s.dbuf, 200000)) { return 424; }
+  if (rec_count(&g_c, H2C_EV_WRITABLE) < 2) { return 425; }
+  free(big);
+  pair_free();
+  return 0;
+}
+
+fn t_continuation() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  req_headers(&rq[0]);
+  // A 30000 byte value of punctuation and digits does not compress below one frame.
+  var val: uint8* = (uint8*)malloc(30001);
+  var seed: int64 = 99;
+  for i in 0..30000 {
+    seed = (seed * 1103515245 + 12345) & 2147483647;
+    val[i] = (uint8)(33 + (int32)((seed >> 8) % 90));
+  }
+  val[30000] = (uint8)0;
+  var big: string;
+  big.chars = val;
+  big.length = 30000;
+  hl(&rq[0], 6, "x-big", big);
+  var id: int32 = h2c_open_stream(g_c.c, &rq[0], 7, true);
+  if (id != 1) { return 501; }
+  var p: uint8* = (uint8*)0;
+  var n: int64 = h2c_pending_output(g_c.c, &p);
+  if (scan_count(p, n, H2_FRAME_HEADERS) != 1 || scan_count(p, n, H2_FRAME_CONTINUATION) < 1) { return 502; }
+  if (scan_max_len(p, n, H2_FRAME_HEADERS) > 16384 || scan_max_len(p, n, H2_FRAME_CONTINUATION) > 16384) { return 503; }
+  settle();
+  var hi: int64 = rec_find(&g_s, H2C_EV_HEADERS, 1);
+  if (hi < 0 || !g_s.rec[hi].end || g_s.rec[hi].hcount != 7) { return 504; }
+  var got: string;
+  if (!rec_hdr(&g_s, hi, "x-big", &got) || got.length != 30000) { return 505; }
+  for i in 0..30000 {
+    if (got.chars[i] != val[i]) { return 506; }
+  }
+  // A second request reuses the table and still decodes.
+  var id2: int32 = h2c_open_stream(g_c.c, &rq[0], 7, true);
+  settle();
+  if (rec_find(&g_s, H2C_EV_HEADERS, id2) < 0) { return 507; }
+  // A list over the peer's limit is refused before anything is sent.
+  var huge: uint8* = (uint8*)malloc(70000);
+  for i in 0..70000 { huge[i] = (uint8)97; }
+  big.chars = huge;
+  big.length = 70000;
+  hl(&rq[0], 6, "x-big", big);
+  if (h2c_open_stream(g_c.c, &rq[0], 7, true) != H2C_ERR_TOO_LARGE) { return 508; }
+  if (h2c_open_count(g_c.c) != 2 || out_count(&g_c, H2_FRAME_HEADERS) != 0) { return 509; }
+  free(huge);
+  free(val);
+  pair_free();
+  return 0;
+}
+
+fn t_header_limit_enforced() -> int32 {
+  // The client opens a stream before it has seen the server's small limit.
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  sc.max_header_list_size = 1024;
+  pair_new(&cc, &sc);
+  var rq: HpackHeader[8];
+  req_headers(&rq[0]);
+  var val: uint8* = (uint8*)malloc(5000);
+  for i in 0..5000 { val[i] = (uint8)(48 + (i % 10)); }
+  var big: string;
+  big.chars = val;
+  big.length = 5000;
+  hl(&rq[0], 6, "x-big", big);
+  if (h2c_open_stream(g_c.c, &rq[0], 7, true) != 1) { return 511; }
+  settle();
+  if (!h2c_is_dead(g_s.c) || h2c_error(g_s.c) != H2_ENHANCE_YOUR_CALM) { return 512; }
+  var cl: int64 = rec_find(&g_s, H2C_EV_CLOSED, 0);
+  if (cl < 0 || g_s.rec[cl].code != H2_ENHANCE_YOUR_CALM) { return 513; }
+  var gi: int64 = rec_find(&g_c, H2C_EV_GOAWAY, 0);
+  if (gi < 0 || g_c.rec[gi].code != H2_ENHANCE_YOUR_CALM) { return 514; }
+  free(val);
+  pair_free();
+  return 0;
+}
+
+fn t_reset() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  // The client cancels.
+  var a: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  settle();
+  var marker: int32 = 5;
+  h2c_stream_set_user(g_s.c, a, (rawptr)&marker);
+  if (h2c_stream_user(g_s.c, a) != (rawptr)&marker) { return 601; }
+  if (h2c_reset_stream(g_c.c, a, H2_CANCEL) != 0) { return 602; }
+  if (h2c_reset_stream(g_c.c, a, H2_CANCEL) != H2C_ERR_NO_STREAM) { return 603; }
+  settle();
+  var ri: int64 = rec_find(&g_s, H2C_EV_RESET, a);
+  if (ri < 0 || g_s.rec[ri].code != H2_CANCEL || (g_s.rec[ri].flags & FLAG_PEER) == 0) { return 604; }
+  if (g_s.rec[ri].user != (rawptr)&marker) { return 605; }
+  if (h2c_send_data(g_s.c, a, str_bytes("x"), 1, false) != H2C_ERR_NO_STREAM) { return 606; }
+  if (h2c_open_count(g_s.c) != 0 || h2c_open_count(g_c.c) != 0) { return 607; }
+  if (rec_count(&g_s, H2C_EV_SLOT_FREE) < 1) { return 608; }
+  // The server resets.
+  side_clear(&g_c);
+  var b: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  settle();
+  if (h2c_reset_stream(g_s.c, b, H2_INTERNAL_ERROR) != 0) { return 609; }
+  settle();
+  var rc: int64 = rec_find(&g_c, H2C_EV_RESET, b);
+  if (rc < 0 || g_c.rec[rc].code != H2_INTERNAL_ERROR || (g_c.rec[rc].flags & FLAG_PEER) == 0) { return 610; }
+  // Frames that cross a reset are dropped quietly.
+  side_clear(&g_c);
+  side_clear(&g_s);
+  var c: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  settle();
+  var rs: HpackHeader[4];
+  var nrs: int64 = resp_headers(&rs[0]);
+  h2c_send_headers(g_s.c, c, &rs[0], nrs, false);
+  h2c_send_data(g_s.c, c, str_bytes("late"), 4, false);
+  h2c_reset_stream(g_c.c, c, H2_CANCEL);
+  xfer(&g_s, &g_c);
+  side_drain(&g_c);
+  if (rec_count(&g_c, H2C_EV_HEADERS) != 0 || rec_count(&g_c, H2C_EV_DATA) != 0) { return 611; }
+  if (h2c_is_dead(g_c.c) || out_count(&g_c, H2_FRAME_RST_STREAM) != 1) { return 612; }
+  settle();
+  if (h2c_is_dead(g_s.c) || rec_find(&g_s, H2C_EV_RESET, c) < 0) { return 613; }
+  pair_free();
+  return 0;
+}
+
+fn t_goaway() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  var s1: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var s3: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  xfer(&g_c, &g_s);
+  side_drain(&g_s);
+  if (rec_count(&g_s, H2C_EV_HEADERS) != 2) { return 701; }
+  var s5: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  if (s1 != 1 || s3 != 3 || s5 != 5) { return 702; }
+  if (h2c_goaway(g_s.c, -1, H2_NO_ERROR, "bye") != 0) { return 703; }
+  // The server never sees stream 5 as a call.
+  xfer(&g_c, &g_s);
+  side_drain(&g_s);
+  if (rec_count(&g_s, H2C_EV_HEADERS) != 2 || h2c_open_count(g_s.c) != 2) { return 704; }
+  xfer(&g_s, &g_c);
+  side_drain(&g_c);
+  var gi: int64 = rec_find(&g_c, H2C_EV_GOAWAY, 0);
+  if (gi < 0 || g_c.rec[gi].last != 3 || g_c.rec[gi].code != H2_NO_ERROR) { return 705; }
+  var ri: int64 = rec_find(&g_c, H2C_EV_RESET, 0);
+  if (ri < 0 || g_c.rec[ri].id != 5 || (g_c.rec[ri].flags & FLAG_UNPROC) == 0 || g_c.rec[ri].code != H2_REFUSED_STREAM) { return 706; }
+  if (rec_count(&g_c, H2C_EV_RESET) != 1) { return 707; }
+  var last: int32 = 0;
+  if (!h2c_goaway_received(g_c.c, &last) || last != 3) { return 708; }
+  if (h2c_open_stream(g_c.c, &rq[0], nrq, true) != H2C_ERR_GOAWAY) { return 709; }
+  if (h2c_stream_slots(g_c.c) != 0) { return 710; }
+  // Streams 1 and 3 still finish.
+  var rs: HpackHeader[4];
+  hl(&rs[0], 0, ":status", "200");
+  hl(&rs[0], 1, "grpc-status", "0");
+  if (h2c_send_headers(g_s.c, 1, &rs[0], 2, true) != 0) { return 711; }
+  if (h2c_send_headers(g_s.c, 3, &rs[0], 2, true) != 0) { return 712; }
+  h2c_send_data(g_c.c, 1, (uint8*)0, 0, true);
+  h2c_send_data(g_c.c, 3, (uint8*)0, 0, true);
+  settle();
+  if (h2c_open_count(g_c.c) != 0 || h2c_open_count(g_s.c) != 0) { return 713; }
+  if (!h2c_is_done(g_c.c) || !h2c_is_done(g_s.c)) { return 714; }
+  if (h2c_goaway(g_s.c, 99, H2_NO_ERROR, "") != H2C_ERR_STATE) { return 715; }
+  pair_free();
+
+  // A graceful shutdown: the first GOAWAY allows everything, the second narrows it.
+  pair_up(&cc, &sc);
+  h2c_goaway(g_s.c, H2_MAX_STREAM_ID, H2_NO_ERROR, "");
+  settle();
+  gi = rec_find(&g_c, H2C_EV_GOAWAY, 0);
+  if (gi < 0 || g_c.rec[gi].last != H2_MAX_STREAM_ID) { return 716; }
+  if (rec_count(&g_c, H2C_EV_RESET) != 0) { return 717; }
+  pair_free();
+  return 0;
+}
+
+fn t_ping() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  pair_up(&cc, &sc);
+  var data: uint8[8];
+  for i in 0..8 { data[i] = (uint8)(i + 1); }
+  if (h2c_ping(g_c.c, &data[0]) != 0) { return 801; }
+  settle();
+  var pi: int64 = rec_find(&g_s, H2C_EV_PING, 0);
+  if (pi < 0 || g_s.rec[pi].ping0 != 72623859790382856) { return 802; }
+  var ai: int64 = rec_find(&g_c, H2C_EV_PING_ACK, 0);
+  if (ai < 0 || g_c.rec[ai].ping0 != 72623859790382856 || g_c.rec[ai].rtt < 0 || g_c.rec[ai].rtt > 5000) { return 803; }
+  // Eight pings can be out at once.
+  for i in 0..8 {
+    data[0] = (uint8)(100 + i);
+    if (h2c_ping(g_c.c, &data[0]) != 0) { return 804; }
+  }
+  data[0] = (uint8)200;
+  if (h2c_ping(g_c.c, &data[0]) != H2C_ERR_NO_SLOT) { return 805; }
+  settle();
+  if (rec_count(&g_c, H2C_EV_PING_ACK) != 9) { return 806; }
+  if (h2c_ping(g_c.c, &data[0]) != 0) { return 807; }
+  // The server can ping too.
+  if (h2c_ping(g_s.c, &data[0]) != 0) { return 808; }
+  settle();
+  if (rec_count(&g_s, H2C_EV_PING_ACK) != 1) { return 809; }
+  pair_free();
+  return 0;
+}
+
+fn t_slots() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  sc.max_concurrent_streams = 2;
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  if (h2c_stream_slots(g_c.c) != 2) { return 901; }
+  var a: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var b: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  if (a != 1 || b != 3) { return 902; }
+  if (h2c_open_stream(g_c.c, &rq[0], nrq, false) != H2C_ERR_NO_SLOT) { return 903; }
+  if (h2c_stream_slots(g_c.c) != 0) { return 904; }
+  settle();
+  var rs: HpackHeader[4];
+  hl(&rs[0], 0, ":status", "200");
+  hl(&rs[0], 1, "grpc-status", "0");
+  h2c_send_headers(g_s.c, a, &rs[0], 2, true);
+  h2c_send_data(g_c.c, a, (uint8*)0, 0, true);
+  if (h2c_open_stream(g_c.c, &rq[0], nrq, false) != H2C_ERR_NO_SLOT) { return 905; }
+  settle();
+  if (rec_count(&g_c, H2C_EV_SLOT_FREE) < 1) { return 906; }
+  if (h2c_stream_slots(g_c.c) != 1) { return 907; }
+  var c: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  if (c != 5) { return 908; }
+  pair_free();
+
+  // A peer that ignores the limit has its extra streams refused.
+  sc = cfg_default();
+  sc.max_streams = 2;
+  pair_new(&cc, &sc);
+  var x: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var y: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var z: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  if (x != 1 || y != 3 || z != 5) { return 909; }
+  settle();
+  if (rec_count(&g_s, H2C_EV_HEADERS) != 2) { return 910; }
+  var ri: int64 = rec_find(&g_c, H2C_EV_RESET, z);
+  if (ri < 0 || g_c.rec[ri].code != H2_REFUSED_STREAM || (g_c.rec[ri].flags & FLAG_PEER) == 0) { return 911; }
+  pair_free();
+
+  // Many streams at once.
+  sc = cfg_default();
+  pair_up(&cc, &sc);
+  var sum: int64 = 0;
+  for i in 0..50 {
+    var id: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, true);
+    if (id < 0) { return 912; }
+    sum = sum + (int64)id;
+  }
+  settle();
+  if (rec_count(&g_s, H2C_EV_HEADERS) != 50 || h2c_open_count(g_s.c) != 50) { return 913; }
+  for i in 0..g_s.n {
+    if (g_s.rec[i].kind == H2C_EV_HEADERS) {
+      if (h2c_send_headers(g_s.c, g_s.rec[i].id, &rs[0], 2, true) != 0) { return 914; }
+    }
+  }
+  settle();
+  var got: int64 = 0;
+  var freed: int64 = 0;
+  for i in 0..g_c.n {
+    if (g_c.rec[i].kind == H2C_EV_HEADERS && g_c.rec[i].end) { got = got + (int64)g_c.rec[i].id; }
+    if (g_c.rec[i].kind == H2C_EV_SLOT_FREE) { freed = freed + g_c.rec[i].count; }
+  }
+  if (got != sum || freed != 50 || h2c_open_count(g_c.c) != 0) { return 915; }
+  pair_free();
+  return 0;
+}
+
+fn t_limits() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  sc.max_frame_size = 32768;
+  sc.initial_window = 1048576;
+  sc.conn_window = 1048576;
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  var id: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var big: uint8* = (uint8*)malloc(70000);
+  fill_pattern(big, 70000);
+  if (h2c_send_data(g_c.c, id, big, 70000, true) != 70000) { return 1001; }
+  var p: uint8* = (uint8*)0;
+  var n: int64 = h2c_pending_output(g_c.c, &p);
+  if (scan_max_len(p, n, H2_FRAME_DATA) != 32768 || scan_count(p, n, H2_FRAME_DATA) != 3) { return 1002; }
+  settle();
+  if (g_s.dlen != 70000 || !pattern_ok(g_s.dbuf, 70000)) { return 1003; }
+  free(big);
+  pair_free();
+
+  // A small initial window caps the first send.
+  sc = cfg_default();
+  sc.initial_window = 1000;
+  pair_up(&cc, &sc);
+  id = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  var buf: uint8[3000];
+  if (h2c_send_data(g_c.c, id, &buf[0], 3000, false) != 1000) { return 1004; }
+  settle();
+  pair_free();
+  return 0;
+}
+
+// ---- Raw frames from a hand-made peer ------------------------------------------
+
+var g_arena: Arena* = (Arena*)0;
+
+fn raw_feed(s: Side*, buf: uint8*, n: int64) {
+  h2c_feed(s->c, buf, n);
+  side_drain(s);
+}
+
+// A fresh server that has been given the preface and an empty SETTINGS.
+fn raw_server_start(cfg: H2cConfig*) {
+  side_init(&g_s, h2c_new(true, cfg));
+  var buf: uint8[64];
+  for i in 0..24 { buf[i] = H2_PREFACE.chars[i]; }
+  var w: int64 = h2_build_settings(&buf[24], 40, (H2Setting*)0, 0);
+  raw_feed(&g_s, &buf[0], 24 + w);
+  out_drop(&g_s);
+  side_clear(&g_s);
+}
+
+// A fresh client that has been given an empty SETTINGS.
+fn raw_client_start(cfg: H2cConfig*) {
+  side_init(&g_c, h2c_new(false, cfg));
+  var buf: uint8[32];
+  var w: int64 = h2_build_settings(&buf[0], 32, (H2Setting*)0, 0);
+  raw_feed(&g_c, &buf[0], w);
+  out_drop(&g_c);
+  side_clear(&g_c);
+}
+
+fn raw_headers(buf: uint8*, cap: int64, id: int32, list: HpackHeader*, n: int64, end_stream: bool, enc: HpackEncoder*) -> int64 {
+  var blk: uint8[2048];
+  var o: HpackOut;
+  hpack_out_init(&o, &blk[0], 2048);
+  hpack_encode_block(enc, &o, list, n);
+  return h2_build_headers(buf, cap, id, &blk[0], o.len, end_stream, true, -1, (H2Priority*)0);
+}
+
+fn raw_data(s: Side*, id: int32, n: int64, pad: int32) {
+  var buf: uint8[600];
+  var w: int64 = h2_build_data(&buf[0], 600, id, &buf[300], n, false, pad);
+  raw_feed(s, &buf[0], w);
+}
+
+fn t_errors() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  var buf: uint8[200];
+
+  // A bad preface closes the connection with GOAWAY.
+  side_init(&g_s, h2c_new(true, &sc));
+  out_drop(&g_s);
+  var junk: string = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+  raw_feed(&g_s, junk.chars, (int64)junk.length);
+  var ci: int64 = rec_find(&g_s, H2C_EV_CLOSED, 0);
+  if (ci < 0 || g_s.rec[ci].code != H2_PROTOCOL_ERROR || !h2c_is_dead(g_s.c)) { return 1101; }
+  if (out_count(&g_s, H2_FRAME_GOAWAY) != 1 || out_code(&g_s, H2_FRAME_GOAWAY) != H2_PROTOCOL_ERROR) { return 1102; }
+  if (h2c_feed(g_s.c, junk.chars, 4) >= 0) { return 1103; }
+  var evx: H2cEvent;
+  if (h2c_next_event(g_s.c, &evx) != 0) { return 1104; }
+  h2c_free(g_s.c);
+
+  // The first frame after the preface must be SETTINGS.
+  side_init(&g_s, h2c_new(true, &sc));
+  out_drop(&g_s);
+  for i in 0..24 { buf[i] = H2_PREFACE.chars[i]; }
+  var data8: uint8[8];
+  var w: int64 = h2_build_ping(&buf[24], 100, &data8[0], false);
+  raw_feed(&g_s, &buf[0], 24 + w);
+  if (!h2c_is_dead(g_s.c) || h2c_error(g_s.c) != H2_PROTOCOL_ERROR) { return 1105; }
+  h2c_free(g_s.c);
+
+  // Frames on a closed stream get RST_STREAM; on an idle stream they end the connection.
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  pair_up(&cc, &sc);
+  var id: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, true);
+  settle();
+  var rs: HpackHeader[4];
+  hl(&rs[0], 0, ":status", "200");
+  hl(&rs[0], 1, "grpc-status", "0");
+  h2c_send_headers(g_s.c, id, &rs[0], 2, true);
+  settle();
+  if (h2c_open_count(g_s.c) != 0) { return 1106; }
+  raw_data(&g_s, id, 1, -1);
+  if (h2c_is_dead(g_s.c) || out_count(&g_s, H2_FRAME_RST_STREAM) != 1 || out_code(&g_s, H2_FRAME_RST_STREAM) != H2_STREAM_CLOSED) { return 1107; }
+  raw_data(&g_s, id, 1, -1);
+  if (out_count(&g_s, H2_FRAME_RST_STREAM) != 1) { return 1108; }
+  raw_data(&g_s, 99, 1, -1);
+  if (!h2c_is_dead(g_s.c) || h2c_error(g_s.c) != H2_PROTOCOL_ERROR) { return 1109; }
+  pair_free();
+
+  // DATA after the peer ended its side is a stream error, and the app hears of it.
+  pair_up(&cc, &sc);
+  id = h2c_open_stream(g_c.c, &rq[0], nrq, true);
+  settle();
+  raw_data(&g_s, id, 3, -1);
+  var ri: int64 = rec_find(&g_s, H2C_EV_RESET, id);
+  if (ri < 0 || g_s.rec[ri].code != H2_STREAM_CLOSED || (g_s.rec[ri].flags & FLAG_PEER) != 0) { return 1110; }
+  if (h2c_is_dead(g_s.c) || out_code(&g_s, H2_FRAME_RST_STREAM) != H2_STREAM_CLOSED) { return 1111; }
+  // RST_STREAM and WINDOW_UPDATE on an idle stream.
+  w = h2_build_window_update(&buf[0], 100, 7, 10);
+  raw_feed(&g_s, &buf[0], w);
+  if (!h2c_is_dead(g_s.c)) { return 1112; }
+  pair_free();
+
+  pair_up(&cc, &sc);
+  w = h2_build_rst_stream(&buf[0], 100, 9, H2_CANCEL);
+  raw_feed(&g_s, &buf[0], w);
+  if (!h2c_is_dead(g_s.c)) { return 1113; }
+  pair_free();
+
+  // A WINDOW_UPDATE past 2^31-1 is a flow-control error; a zero one is a protocol error.
+  pair_up(&cc, &sc);
+  w = h2_build_window_update(&buf[0], 100, 0, (int64)H2_MAX_WINDOW);
+  raw_feed(&g_s, &buf[0], w);
+  if (!h2c_is_dead(g_s.c) || h2c_error(g_s.c) != H2_FLOW_CONTROL_ERROR) { return 1114; }
+  pair_free();
+
+  pair_up(&cc, &sc);
+  id = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  settle();
+  var h: H2FrameHeader;
+  h.length = 4;
+  h.type = H2_FRAME_WINDOW_UPDATE;
+  h.flags = 0;
+  h.stream_id = id;
+  h2_frame_header_write(h, &buf[0]);
+  for i in 0..4 { buf[9 + i] = (uint8)0; }
+  raw_feed(&g_s, &buf[0], 13);
+  ri = rec_find(&g_s, H2C_EV_RESET, id);
+  if (ri < 0 || g_s.rec[ri].code != H2_PROTOCOL_ERROR || h2c_is_dead(g_s.c)) { return 1115; }
+  h.stream_id = 0;
+  h2_frame_header_write(h, &buf[0]);
+  raw_feed(&g_s, &buf[0], 13);
+  if (!h2c_is_dead(g_s.c) || h2c_error(g_s.c) != H2_PROTOCOL_ERROR) { return 1116; }
+  pair_free();
+
+  // A peer that sends past the connection window.
+  sc.manual_flow = true;
+  pair_up(&cc, &sc);
+  id = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  settle();
+  var big: uint8* = (uint8*)calloc(1, 16400);
+  for i in 0..4 {
+    w = h2_build_data(big + 0, 16400, id, big + 100, 16384, false, -1);
+    h2c_feed(g_s.c, big, w);
+    side_drain(&g_s);
+  }
+  if (!h2c_is_dead(g_s.c) || h2c_error(g_s.c) != H2_FLOW_CONTROL_ERROR) { return 1117; }
+  free(big);
+  pair_free();
+  sc = cfg_default();
+
+  // PUSH_PROMISE is refused.
+  pair_up(&cc, &sc);
+  id = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  settle();
+  w = h2_build_push_promise(&buf[0], 100, id, 2, &buf[100], 0, true, -1);
+  raw_feed(&g_c, &buf[0], w);
+  if (!h2c_is_dead(g_c.c) || h2c_error(g_c.c) != H2_PROTOCOL_ERROR) { return 1118; }
+  pair_free();
+
+  // The transport ends.
+  pair_up(&cc, &sc);
+  h2c_eof(g_c.c);
+  side_drain(&g_c);
+  ci = rec_find(&g_c, H2C_EV_CLOSED, 0);
+  if (ci < 0 || g_c.rec[ci].code != 0 || !h2c_is_dead(g_c.c)) { return 1119; }
+  if (h2c_open_stream(g_c.c, &rq[0], nrq, true) != H2C_ERR_CLOSED) { return 1120; }
+  pair_free();
+  return 0;
+}
+
+fn t_header_rules() -> int32 {
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  var enc: HpackEncoder;
+  var buf: uint8[3000];
+  var list: HpackHeader[8];
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  if (g_arena == (Arena*)0) { g_arena = arena_init(0); }
+
+  // A client receiving bad response headers resets the stream.
+  raw_client_start(&cc);
+  hpack_encoder_init(&enc, g_arena, 4096, false);
+  var id: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  hl(&list[0], 0, "content-type", "application/grpc");
+  var w: int64 = raw_headers(&buf[0], 3000, id, &list[0], 1, false, &enc);
+  raw_feed(&g_c, &buf[0], w);
+  var ri: int64 = rec_find(&g_c, H2C_EV_RESET, id);
+  if (ri < 0 || g_c.rec[ri].code != H2_PROTOCOL_ERROR || (g_c.rec[ri].flags & FLAG_PEER) != 0) { return 1201; }
+  if (h2c_is_dead(g_c.c)) { return 1202; }
+  h2c_free(g_c.c);
+
+  raw_client_start(&cc);
+  hpack_encoder_init(&enc, g_arena, 4096, false);
+  id = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  hl(&list[0], 0, ":status", "200");
+  hl(&list[0], 1, "Content-Type", "x");
+  w = raw_headers(&buf[0], 3000, id, &list[0], 2, false, &enc);
+  raw_feed(&g_c, &buf[0], w);
+  if (rec_find(&g_c, H2C_EV_RESET, id) < 0 || rec_count(&g_c, H2C_EV_HEADERS) != 0) { return 1203; }
+  h2c_free(g_c.c);
+
+  // Good headers pass; trailers without END_STREAM do not.
+  raw_client_start(&cc);
+  hpack_encoder_init(&enc, g_arena, 4096, false);
+  id = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  hl(&list[0], 0, ":status", "200");
+  w = raw_headers(&buf[0], 3000, id, &list[0], 1, false, &enc);
+  raw_feed(&g_c, &buf[0], w);
+  if (rec_find(&g_c, H2C_EV_HEADERS, id) < 0) { return 1204; }
+  hl(&list[0], 0, "grpc-status", "0");
+  w = raw_headers(&buf[0], 3000, id, &list[0], 1, false, &enc);
+  raw_feed(&g_c, &buf[0], w);
+  if (rec_find(&g_c, H2C_EV_RESET, id) < 0 || rec_count(&g_c, H2C_EV_TRAILERS) != 0) { return 1205; }
+  h2c_free(g_c.c);
+
+  // A server receiving bad request headers refuses the stream, without an event.
+  raw_server_start(&sc);
+  hpack_encoder_init(&enc, g_arena, 4096, false);
+  hl(&list[0], 0, ":method", "POST");
+  hl(&list[0], 1, ":scheme", "http");
+  w = raw_headers(&buf[0], 3000, 1, &list[0], 2, false, &enc);
+  raw_feed(&g_s, &buf[0], w);
+  if (rec_count(&g_s, H2C_EV_HEADERS) != 0 || out_code(&g_s, H2_FRAME_RST_STREAM) != H2_PROTOCOL_ERROR) { return 1206; }
+  if (h2c_is_dead(g_s.c)) { return 1207; }
+  out_drop(&g_s);
+  hl(&list[2], 2, ":path", "/a");
+  hl(&list[3], 3, "connection", "close");
+  w = raw_headers(&buf[0], 3000, 3, &list[0], 4, false, &enc);
+  raw_feed(&g_s, &buf[0], w);
+  if (rec_count(&g_s, H2C_EV_HEADERS) != 0 || out_count(&g_s, H2_FRAME_RST_STREAM) != 1) { return 1208; }
+  out_drop(&g_s);
+  w = raw_headers(&buf[0], 3000, 5, &rq[0], nrq, false, &enc);
+  raw_feed(&g_s, &buf[0], w);
+  var hi: int64 = rec_find(&g_s, H2C_EV_HEADERS, 5);
+  if (hi < 0 || !hdr_is(&g_s, hi, "te", "trailers")) { return 1209; }
+  // Stream ids must grow: an old id is a closed stream, not a new one.
+  w = raw_headers(&buf[0], 3000, 3, &rq[0], nrq, false, &enc);
+  raw_feed(&g_s, &buf[0], w);
+  if (rec_count(&g_s, H2C_EV_HEADERS) != 1) { return 1210; }
+  h2c_free(g_s.c);
+
+  // Padded DATA reaches the application without its padding.
+  pair_up(&cc, &sc);
+  id = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  settle();
+  hl(&list[0], 0, ":status", "200");
+  h2c_send_headers(g_s.c, id, &list[0], 1, false);
+  settle();
+  raw_data(&g_c, id, 3, 10);
+  var di: int64 = rec_find(&g_c, H2C_EV_DATA, id);
+  if (di < 0 || g_c.rec[di].len != 3) { return 1211; }
+  pair_free();
+  return 0;
+}
+
+fn t_flood() -> int32 {
+  // A peer that sends PINGs and never reads the answers hits the output cap.
+  var sc: H2cConfig = cfg_default();
+  sc.max_output = 65536;
+  raw_server_start(&sc);
+  var buf: uint8[2000];
+  var data8: uint8[8];
+  var w: int64 = 0;
+  for i in 0..100 { w = w + h2_build_ping(&buf[i * 17], 17, &data8[0], false); }
+  for round in 0..100 {
+    raw_feed(&g_s, &buf[0], w);
+    side_clear(&g_s);
+    if (h2c_is_dead(g_s.c)) { break; }
+  }
+  if (!h2c_is_dead(g_s.c) || h2c_error(g_s.c) != H2_ENHANCE_YOUR_CALM) { return 1301; }
+  h2c_free(g_s.c);
+  return 0;
+}
+
+fn t_small_pieces() -> int32 {
+  // The same exchange with every transfer one byte long.
+  var cc: H2cConfig = cfg_default();
+  var sc: H2cConfig = cfg_default();
+  g_step = 1;
+  pair_up(&cc, &sc);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  var id: int32 = h2c_open_stream(g_c.c, &rq[0], nrq, false);
+  h2c_send_data(g_c.c, id, str_bytes("hello"), 5, true);
+  settle();
+  var rs: HpackHeader[4];
+  var nrs: int64 = resp_headers(&rs[0]);
+  h2c_send_headers(g_s.c, id, &rs[0], nrs, false);
+  h2c_send_data(g_s.c, id, str_bytes("world"), 5, false);
+  var tr: HpackHeader[4];
+  var ntr: int64 = trailer_headers(&tr[0]);
+  h2c_send_headers(g_s.c, id, &tr[0], ntr, true);
+  settle();
+  g_step = 0;
+  if (g_s.dlen != 5 || g_c.dlen != 5) { return 1401; }
+  if (rec_count(&g_c, H2C_EV_TRAILERS) != 1 || rec_count(&g_s, H2C_EV_HEADERS) != 1) { return 1402; }
+  pair_free();
+  return 0;
+}
+
+// ---- Loopback sockets -----------------------------------------------------------------
+
+var g_listen: int64 = -1;
+var g_srv_rc: int32 = -99;
+var g_handled: int32 = 0;
+
+fn echo_handler(user: rawptr, rq: H2cRequest*, rp: H2cReply*, a: Arena*) -> int32 {
+  g_handled = g_handled + 1;
+  var h: HpackHeader* = (HpackHeader*)arena_alloc(a, 2 * (int64)sizeof(HpackHeader));
+  hl(h, 0, ":status", "200");
+  hl(h, 1, "content-type", "application/grpc");
+  rp->headers = h;
+  rp->header_count = 2;
+  rp->body = rq->body;
+  rp->body_len = rq->body_len;
+  var t: HpackHeader* = (HpackHeader*)arena_alloc(a, 2 * (int64)sizeof(HpackHeader));
+  var path: string = "";
+  h2c_find_header(rq->headers, rq->header_count, ":path", &path);
+  hl(t, 0, "grpc-status", "0");
+  hl(t, 1, "x-path", path);
+  rp->trailers = t;
+  rp->trailer_count = 2;
+  return 0;
+}
+
+fn server(arg: cstring) -> uint32 {
+  var fd: int64 = sock_accept(g_listen, (NetAddr*)0);
+  if (fd < 0) { return (uint32)1; }
+  var ns: NetStream = net_stream_socket(fd);
+  var cfg: H2cConfig = cfg_default();
+  var c: H2c* = h2c_new(true, &cfg);
+  g_srv_rc = h2c_serve(c, &ns, &echo_handler, (rawptr)0, 1000000, 5000);
+  h2c_free(c);
+  net_stream_close(&ns);
+  return (uint32)0;
+}
+
+fn t_loopback() -> int32 {
+  var any: NetAddr = net_addr_loopback(NET_IPV4, 0);
+  match (tcp_listen(&any, 4)) {
+    case Ok(fd): { g_listen = fd; }
+    case Err(e): { return 1501; }
+  }
+  var sa: NetAddr;
+  sock_local_addr(g_listen, &sa);
+  var tid: uint32 = 0;
+  var th: int64 = CreateThread((cstring)0, (uint64)0, &server, (cstring)0, (uint32)0, &tid);
+  var fd: int64 = tcp_connect_addr(&sa, 2000);
+  if (fd < 0) { return 1502; }
+  var ns: NetStream = net_stream_socket(fd);
+  var cfg: H2cConfig = cfg_default();
+  var c: H2c* = h2c_new(false, &cfg);
+  var arena: Arena* = arena_init(0);
+  var rq: HpackHeader[8];
+  var nrq: int64 = req_headers(&rq[0]);
+  var out: H2cResponse;
+  var v: string;
+
+  // A small call.
+  var rc: int32 = h2c_call(c, &ns, arena, &rq[0], nrq, str_bytes("ping"), 4, 1000000, 3000, &out);
+  if (rc != 0) { println("call 1: {rc}"); return 1503; }
+  if (out.body_len != 4 || out.body[0] != (uint8)112) { return 1504; }
+  if (!h2c_find_header(out.headers, out.header_count, ":status", &v) || v != "200") { return 1505; }
+  if (!h2c_find_header(out.trailers, out.trailer_count, "grpc-status", &v) || v != "0") { return 1506; }
+  if (!h2c_find_header(out.trailers, out.trailer_count, "x-path", &v) || v != "/svc/Method") { return 1507; }
+
+  // No body at all.
+  rc = h2c_call(c, &ns, arena, &rq[0], nrq, (uint8*)0, 0, 1000000, 3000, &out);
+  if (rc != 0 || out.body_len != 0 || out.trailer_count != 2) { return 1508; }
+
+  // A body far over the windows, both ways.
+  var big: uint8* = (uint8*)malloc(300000);
+  fill_pattern(big, 300000);
+  rc = h2c_call(c, &ns, arena, &rq[0], nrq, big, 300000, 1000000, 5000, &out);
+  if (rc != 0) { println("call 3: {rc}"); return 1509; }
+  if (out.body_len != 300000 || !pattern_ok(out.body, 300000)) { return 1510; }
+
+  // A response over the caller's limit resets the stream; the connection goes on.
+  rc = h2c_call(c, &ns, arena, &rq[0], nrq, big, 100000, 50000, 5000, &out);
+  if (rc != H2C_ERR_TOO_LARGE) { return 1511; }
+  rc = h2c_call(c, &ns, arena, &rq[0], nrq, str_bytes("again"), 5, 1000000, 3000, &out);
+  if (rc != 0 || out.body_len != 5) { return 1512; }
+
+  // PING over the live connection.
+  var data8: uint8[8];
+  for i in 0..8 { data8[i] = (uint8)(9 - i); }
+  h2c_ping(c, &data8[0]);
+  var ev: H2cEvent;
+  var acked: bool = false;
+  for round in 0..50 {
+    var k: int32 = h2c_next_event(c, &ev);
+    if (k == H2C_EV_PING_ACK) {
+      acked = true;
+      break;
+    }
+    if (k == 0) {
+      var pr: int64 = h2c_pump(c, &ns, 2000);
+      if (pr < 0) { break; }
+    }
+  }
+  if (!acked || ev.ping[0] != (uint8)9) { return 1513; }
+
+  net_stream_close(&ns);
+  thread_join_infinite(th);
+  if (g_srv_rc != 0) { println("server: {g_srv_rc}"); return 1514; }
+  if (g_handled != 5) { return 1515; }
+  free(big);
+  h2c_free(c);
+  arena_free(arena);
+  sock_close(g_listen);
+  return 0;
+}
+
+fn fail(name: string, r: int32) -> int32 {
+  println("FAIL {name}: check {r}");
+  var code: int32 = r % 255;
+  if (code == 0) { code = 255; }
+  return code;
+}
+
+fn main() -> int32 {
+  var r: int32 = t_handshake();
+  if (r != 0) { return fail("handshake", r); }
+  r = t_unary();
+  if (r != 0) { return fail("unary", r); }
+  r = t_trailers_only();
+  if (r != 0) { return fail("trailers_only", r); }
+  r = t_flow_control();
+  if (r != 0) { return fail("flow_control", r); }
+  r = t_manual_flow();
+  if (r != 0) { return fail("manual_flow", r); }
+  r = t_output_backpressure();
+  if (r != 0) { return fail("output_backpressure", r); }
+  r = t_continuation();
+  if (r != 0) { return fail("continuation", r); }
+  r = t_header_limit_enforced();
+  if (r != 0) { return fail("header_limit", r); }
+  r = t_reset();
+  if (r != 0) { return fail("reset", r); }
+  r = t_goaway();
+  if (r != 0) { return fail("goaway", r); }
+  r = t_ping();
+  if (r != 0) { return fail("ping", r); }
+  r = t_slots();
+  if (r != 0) { return fail("slots", r); }
+  r = t_limits();
+  if (r != 0) { return fail("limits", r); }
+  r = t_errors();
+  if (r != 0) { return fail("errors", r); }
+  r = t_header_rules();
+  if (r != 0) { return fail("header_rules", r); }
+  r = t_flood();
+  if (r != 0) { return fail("flood", r); }
+  r = t_small_pieces();
+  if (r != 0) { return fail("small_pieces", r); }
+  r = t_loopback();
+  if (r != 0) { return fail("loopback", r); }
+  println("all ok");
+  return 0;
+}
