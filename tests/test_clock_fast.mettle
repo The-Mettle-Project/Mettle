@@ -1,0 +1,39 @@
+// Linux: the runtime's clock_gettime goes through the vDSO. The monotonic
+// clock never steps back, the wall clock agrees with a direct system call, and
+// the cost per call is printed (not checked, since machines differ).
+import "std/time";
+import "std/io";
+import "std/linux_sys";
+
+fn syscall_unix_ns() -> int64 {
+  var ts: int64[2];
+  if (syscall(LINUX_SYS_CLOCK_GETTIME, 0, &ts[0]) < 0) { return (int64)0; }
+  return ts[0] * (int64)1000000000 + ts[1];
+}
+
+fn main() -> int32 {
+  var reads: int32 = 1000000;
+  var last: int64 = time_mono_ns();
+  var start: int64 = last;
+  for i in 0..reads {
+    var now: int64 = time_mono_ns();
+    if (now < last) {
+      println("test_clock_fast: monotonic time went backwards at read {i}");
+      return 1;
+    }
+    last = now;
+  }
+  var per_call: int64 = (last - start) / (int64)reads;
+  println("test_clock_fast: {per_call} ns per call");
+
+  var before: int64 = syscall_unix_ns();
+  var wall: int64 = time_unix_ns();
+  var after: int64 = syscall_unix_ns();
+  var slack: int64 = (int64)5000000;
+  if (before == (int64)0 || after == (int64)0) { return 2; }
+  if (wall < before - slack || wall > after + slack) {
+    println("test_clock_fast: wall clock {wall} outside {before} .. {after}");
+    return 3;
+  }
+  return 0;
+}

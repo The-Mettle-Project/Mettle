@@ -1936,6 +1936,7 @@ mt_hosted_initialize(int argc, char **argv, char **envp) {
 
 static int mt_initialize_initial_tls(mt_i64 argc, char **argv);
 static int mt_thread_pointer_installed(void);
+static void mt_vdso_init(mt_i64 argc, char **argv);
 #if defined(MTLC_HOST_PREFIX_H)
 static void mt_raise_stack_limit(void);
 #endif
@@ -1949,6 +1950,7 @@ void mettle_rt_startup(mt_i64 argc, char **argv) {
     _exit(127);
   }
   mt_environment = argv + argc + 1;
+  mt_vdso_init(argc, argv);
   if (mt_thread_pointer_installed()) {
     mt_stack_high = (void *)argv;
   }
@@ -2381,6 +2383,179 @@ static int mt_initialize_initial_tls(mt_i64 argc, char **argv) {
     return mt_install_thread_pointer((void *)result, mapping_size);
   }
   return 1;
+}
+
+#define MT_AT_SYSINFO_EHDR 33
+#define MT_PT_LOAD 1
+#define MT_PT_DYNAMIC 2
+#define MT_PT_PHDR 6
+#define MT_DT_NULL 0
+#define MT_DT_HASH 4
+#define MT_DT_STRTAB 5
+#define MT_DT_SYMTAB 6
+#define MT_DT_DEBUG 21
+#define MT_DT_GNU_HASH 0x6ffffef5
+#define MT_DT_VERSYM 0x6ffffff0
+#define MT_DT_VERDEF 0x6ffffffc
+#define MT_STT_FUNC 2
+
+#if defined(__aarch64__)
+#define MT_VDSO_CLOCK_NAME "__kernel_clock_gettime"
+#define MT_VDSO_CLOCK_VERSION "LINUX_2.6.39"
+#else
+#define MT_VDSO_CLOCK_NAME "__vdso_clock_gettime"
+#define MT_VDSO_CLOCK_VERSION "LINUX_2.6"
+#endif
+
+typedef struct MtElfDyn {
+  mt_i64 tag;
+  mt_u64 value;
+} MtElfDyn;
+
+typedef struct MtElfSym {
+  mt_u32 name;
+  mt_u8 info;
+  mt_u8 other;
+  mt_u16 section;
+  mt_u64 value;
+  mt_u64 size;
+} MtElfSym;
+
+typedef struct MtElfVerdef {
+  mt_u16 version;
+  mt_u16 flags;
+  mt_u16 index;
+  mt_u16 count;
+  mt_u32 hash;
+  mt_u32 aux;
+  mt_u32 next;
+} MtElfVerdef;
+
+typedef struct MtElfVerdaux {
+  mt_u32 name;
+  mt_u32 next;
+} MtElfVerdaux;
+
+static int (*mt_vdso_clock_gettime)(int, void *);
+
+static int mt_vdso_version_is(const MtElfVerdef *definition, mt_u32 index,
+                              const char *strings, const char *version) {
+  for (;;) {
+    if (!(definition->flags & 1) && definition->index == index) {
+      const MtElfVerdaux *aux =
+          (const MtElfVerdaux *)((const mt_u8 *)definition + definition->aux);
+      return strcmp(strings + aux->name, version) == 0;
+    }
+    if (!definition->next) return 0;
+    definition = (const MtElfVerdef *)((const mt_u8 *)definition +
+                                       definition->next);
+  }
+}
+
+/* Finds a function in the vDSO image by name and version, or returns null. */
+static void *mt_vdso_find(const mt_u8 *image, const char *name,
+                          const char *version) {
+  if (image[0] != 0x7f || image[1] != 'E' || image[2] != 'L' ||
+      image[3] != 'F' || image[4] != 2) {
+    return MT_NULL;
+  }
+  mt_u64 header_offset = *(const mt_u64 *)(image + 32);
+  mt_u64 header_size = *(const mt_u16 *)(image + 54);
+  mt_u64 header_count = *(const mt_u16 *)(image + 56);
+  if (header_size < sizeof(MtElfProgramHeader)) return MT_NULL;
+
+  const MtElfDyn *dynamic = MT_NULL;
+  mt_u64 bias = 0;
+  int have_load = 0;
+  for (mt_u64 i = 0; i < header_count; i++) {
+    const MtElfProgramHeader *header = (const MtElfProgramHeader *)
+        (image + header_offset + i * header_size);
+    if (header->type == MT_PT_LOAD && !have_load) {
+      have_load = 1;
+      bias = (mt_u64)image + header->offset - header->virtual_address;
+    } else if (header->type == MT_PT_DYNAMIC) {
+      dynamic = (const MtElfDyn *)(image + header->offset);
+    }
+  }
+  if (!have_load || !dynamic) return MT_NULL;
+
+  const MtElfSym *symbols = MT_NULL;
+  const char *strings = MT_NULL;
+  const mt_u32 *hash = MT_NULL;
+  const mt_u32 *gnu_hash = MT_NULL;
+  const mt_u16 *versions = MT_NULL;
+  const MtElfVerdef *definitions = MT_NULL;
+  for (const MtElfDyn *entry = dynamic; entry->tag != 0; entry++) {
+    void *address = (void *)(bias + entry->value);
+    if (entry->tag == MT_DT_SYMTAB) symbols = (const MtElfSym *)address;
+    else if (entry->tag == MT_DT_STRTAB) strings = (const char *)address;
+    else if (entry->tag == MT_DT_HASH) hash = (const mt_u32 *)address;
+    else if (entry->tag == MT_DT_GNU_HASH) gnu_hash = (const mt_u32 *)address;
+    else if (entry->tag == MT_DT_VERSYM) versions = (const mt_u16 *)address;
+    else if (entry->tag == MT_DT_VERDEF) {
+      definitions = (const MtElfVerdef *)address;
+    }
+  }
+  if (!symbols || !strings || (!hash && !gnu_hash)) return MT_NULL;
+
+  /* The symbol table has no length field; take it from the hash table. */
+  mt_u32 count = 0;
+  if (hash) {
+    count = hash[1];
+  } else {
+    mt_u32 bucket_count = gnu_hash[0];
+    mt_u32 first = gnu_hash[1];
+    const mt_u32 *buckets = (const mt_u32 *)((const mt_u8 *)gnu_hash + 16 +
+                                             (mt_u64)gnu_hash[2] * 8);
+    const mt_u32 *chain = buckets + bucket_count;
+    mt_u32 last = 0;
+    for (mt_u32 i = 0; i < bucket_count; i++) {
+      if (buckets[i] > last) last = buckets[i];
+    }
+    if (last < first) {
+      count = first;
+    } else {
+      while (!(chain[last - first] & 1)) last++;
+      count = last + 1;
+    }
+  }
+
+  for (mt_u32 i = 0; i < count; i++) {
+    const MtElfSym *symbol = &symbols[i];
+    if (symbol->section == 0 || (symbol->info & 0xf) != MT_STT_FUNC) continue;
+    if (strcmp(strings + symbol->name, name) != 0) continue;
+    if (versions && definitions &&
+        !mt_vdso_version_is(definitions, versions[i] & 0x7fff, strings,
+                            version)) {
+      continue;
+    }
+    return (void *)(bias + symbol->value);
+  }
+  return MT_NULL;
+}
+
+static void mt_vdso_init(mt_i64 argc, char **argv) {
+  char **environment = argv + argc + 1;
+  while (*environment) environment++;
+  const mt_u8 *image = MT_NULL;
+  for (mt_u64 *auxiliary = (mt_u64 *)(environment + 1); auxiliary[0];
+       auxiliary += 2) {
+    if (auxiliary[0] == MT_AT_SYSINFO_EHDR) image = (const mt_u8 *)auxiliary[1];
+  }
+  if (image) {
+    mt_vdso_clock_gettime = (int (*)(int, void *))mt_vdso_find(
+        image, MT_VDSO_CLOCK_NAME, MT_VDSO_CLOCK_VERSION);
+  }
+}
+
+/* Reads through the vDSO; on any error, redoes it as a real call. */
+static int mt_clock_read(int clock_id, void *timespec_value) {
+  if (mt_vdso_clock_gettime && mt_vdso_clock_gettime(clock_id,
+                                                      timespec_value) == 0) {
+    return 0;
+  }
+  return (int)mt_sys_result(mt_syscall6(MT_SYS_CLOCK_GETTIME, clock_id,
+                                        (mt_i64)timespec_value, 0, 0, 0, 0));
 }
 
 typedef struct MtKernelSigaction {
@@ -2893,8 +3068,7 @@ int mettle_dir_list_md_files(const char *root, char *paths, mt_i32 capacity,
 int gettimeofday(void *time_value, void *timezone_value) {
   mt_i64 timespec_value[2] = {0, 0};
   (void)timezone_value;
-  if (mt_sys_result(mt_syscall6(MT_SYS_CLOCK_GETTIME, 0,
-                                (mt_i64)timespec_value, 0, 0, 0, 0)) < 0) {
+  if (mt_clock_read(0, timespec_value) < 0) {
     return -1;
   }
   ((mt_i64 *)time_value)[0] = timespec_value[0];
@@ -3580,8 +3754,7 @@ int shutdown(int fd, int how) {
 }
 
 int clock_gettime(int clock_id, void *timespec_value) {
-  return (int)mt_sys_result(mt_syscall6(MT_SYS_CLOCK_GETTIME, clock_id,
-                                        (mt_i64)timespec_value, 0, 0, 0, 0));
+  return mt_clock_read(clock_id, timespec_value);
 }
 
 int nanosleep(const void *request, void *remaining) {
@@ -3689,30 +3862,6 @@ static void mt_thread_child(MtThread *thread) {
   for (;;) {
   }
 }
-
-#define MT_PT_DYNAMIC 2
-#define MT_PT_PHDR 6
-#define MT_DT_NULL 0
-#define MT_DT_HASH 4
-#define MT_DT_STRTAB 5
-#define MT_DT_SYMTAB 6
-#define MT_DT_DEBUG 21
-#define MT_DT_GNU_HASH 0x6ffffef5
-#define MT_DT_VERSYM 0x6ffffff0
-
-typedef struct MtElfDyn {
-  mt_i64 tag;
-  mt_u64 value;
-} MtElfDyn;
-
-typedef struct MtElfSym {
-  mt_u32 name;
-  mt_u8 info;
-  mt_u8 other;
-  mt_u16 section;
-  mt_u64 value;
-  mt_u64 size;
-} MtElfSym;
 
 typedef struct MtLinkMap {
   mt_u64 base;
